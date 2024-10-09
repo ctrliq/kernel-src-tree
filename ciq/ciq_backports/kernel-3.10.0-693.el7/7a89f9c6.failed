@@ -1,0 +1,320 @@
+xprtrdma: Honor ->send_request API contract
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 7a89f9c626e337ba6528d8a2829b228c933877fb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/7a89f9c6.failed
+
+Commit c93c62231cf5 ("xprtrdma: Disconnect on registration failure")
+added a disconnect for some RPC marshaling failures. This is needed
+only in a handful of cases, but it was triggering for simple stuff
+like temporary resource shortages. Try to straighten this out.
+
+Fix up the lower layers so they don't return -ENOMEM or other error
+codes that the RPC client's FSM doesn't explicitly recognize.
+
+Also fix up the places in the send_request path that do want a
+disconnect. For example, when ib_post_send or ib_post_recv fail,
+this is a sign that there is a send or receive queue resource
+miscalculation. That should be rare, and is a sign of a software
+bug. But xprtrdma can recover: disconnect to reset the transport and
+start over.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Tested-by: Steve Wise <swise@opengridcomputing.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 7a89f9c626e337ba6528d8a2829b228c933877fb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/fmr_ops.c
+#	net/sunrpc/xprtrdma/frwr_ops.c
+diff --cc net/sunrpc/xprtrdma/fmr_ops.c
+index ecde1e1b320a,aae4c372a40f..000000000000
+--- a/net/sunrpc/xprtrdma/fmr_ops.c
++++ b/net/sunrpc/xprtrdma/fmr_ops.c
+@@@ -185,16 -214,12 +185,24 @@@ fmr_op_map(struct rpcrdma_xprt *r_xprt
+  
+  	mw = seg1->rl_mw;
+  	seg1->rl_mw = NULL;
+++<<<<<<< HEAD
+ +	if (!mw) {
+ +		mw = rpcrdma_get_mw(r_xprt);
+ +		if (!mw)
+ +			return -ENOMEM;
+ +	} else {
+ +		/* this is a retransmit; generate a fresh rkey */
+ +		rc = __fmr_unmap(mw);
+ +		if (rc)
+ +			return rc;
+ +	}
+++=======
++ 	if (mw)
++ 		rpcrdma_defer_mr_recovery(mw);
++ 	mw = rpcrdma_get_mw(r_xprt);
++ 	if (!mw)
++ 		return -ENOBUFS;
+++>>>>>>> 7a89f9c626e3 (xprtrdma: Honor ->send_request API contract)
+  
+  	pageoff = offset_in_page(seg1->mr_offset);
+  	seg1->mr_offset -= pageoff;	/* start of page */
+@@@ -220,29 -259,24 +228,46 @@@
+  		goto out_maperr;
+  
+  	seg1->rl_mw = mw;
+ -	seg1->mr_rkey = mw->fmr.fm_mr->rkey;
+ -	seg1->mr_base = dma_pages[0] + pageoff;
+ -	seg1->mr_nsegs = mw->mw_nents;
+ +	seg1->mr_rkey = mw->fmr.fmr->rkey;
+ +	seg1->mr_base = seg1->mr_dma + pageoff;
+ +	seg1->mr_nsegs = i;
+  	seg1->mr_len = len;
+++<<<<<<< HEAD
+ +	return i;
+ +
+ +out_maperr:
+ +	dprintk("RPC:       %s: ib_map_phys_fmr %u@0x%llx+%i (%d) status %i\n",
+ +		__func__, len, (unsigned long long)seg1->mr_dma,
+ +		pageoff, i, rc);
+ +	while (i--)
+ +		rpcrdma_unmap_one(device, --seg);
+ +	return rc;
+++=======
++ 	return mw->mw_nents;
++ 
++ out_dmamap_err:
++ 	pr_err("rpcrdma: failed to dma map sg %p sg_nents %u\n",
++ 	       mw->mw_sg, mw->mw_nents);
++ 	rpcrdma_defer_mr_recovery(mw);
++ 	return -EIO;
++ 
++ out_maperr:
++ 	pr_err("rpcrdma: ib_map_phys_fmr %u@0x%llx+%i (%d) status %i\n",
++ 	       len, (unsigned long long)dma_pages[0],
++ 	       pageoff, mw->mw_nents, rc);
++ 	rpcrdma_defer_mr_recovery(mw);
++ 	return -EIO;
+++>>>>>>> 7a89f9c626e3 (xprtrdma: Honor ->send_request API contract)
+ +}
+ +
+ +static void
+ +__fmr_dma_unmap(struct rpcrdma_xprt *r_xprt, struct rpcrdma_mr_seg *seg)
+ +{
+ +	struct ib_device *device = r_xprt->rx_ia.ri_device;
+ +	int nsegs = seg->mr_nsegs;
+ +
+ +	while (nsegs--)
+ +		rpcrdma_unmap_one(device, seg++);
+  }
+  
+  /* Invalidate all memory regions that were registered for "req".
+diff --cc net/sunrpc/xprtrdma/frwr_ops.c
+index 144dce124c80,d7613db9185d..000000000000
+--- a/net/sunrpc/xprtrdma/frwr_ops.c
++++ b/net/sunrpc/xprtrdma/frwr_ops.c
+@@@ -384,10 -379,10 +384,10 @@@ frwr_op_map(struct rpcrdma_xprt *r_xprt
+  	seg1->rl_mw = NULL;
+  	do {
+  		if (mw)
+ -			rpcrdma_defer_mr_recovery(mw);
+ +			__frwr_queue_recovery(mw);
+  		mw = rpcrdma_get_mw(r_xprt);
+  		if (!mw)
+- 			return -ENOMEM;
++ 			return -ENOBUFS;
+  	} while (mw->frmr.fr_state != FRMR_IS_INVALID);
+  	frmr = &mw->frmr;
+  	frmr->fr_state = FRMR_IS_VALID;
+@@@ -459,16 -447,27 +459,37 @@@
+  	seg1->rl_mw = mw;
+  	seg1->mr_rkey = mr->rkey;
+  	seg1->mr_base = mr->iova;
+ -	seg1->mr_nsegs = mw->mw_nents;
+ +	seg1->mr_nsegs = frmr->sg_nents;
+  	seg1->mr_len = mr->length;
+  
+++<<<<<<< HEAD
+ +	return frmr->sg_nents;
+ +
+ +out_senderr:
+ +	dprintk("RPC:       %s: ib_post_send status %i\n", __func__, rc);
+ +	ib_dma_unmap_sg(device, frmr->sg, dma_nents, direction);
+ +	__frwr_queue_recovery(mw);
+ +	return rc;
+++=======
++ 	return mw->mw_nents;
++ 
++ out_dmamap_err:
++ 	pr_err("rpcrdma: failed to dma map sg %p sg_nents %u\n",
++ 	       mw->mw_sg, mw->mw_nents);
++ 	rpcrdma_defer_mr_recovery(mw);
++ 	return -EIO;
++ 
++ out_mapmr_err:
++ 	pr_err("rpcrdma: failed to map mr %p (%u/%u)\n",
++ 	       frmr->fr_mr, n, mw->mw_nents);
++ 	rpcrdma_defer_mr_recovery(mw);
++ 	return -EIO;
++ 
++ out_senderr:
++ 	pr_err("rpcrdma: FRMR registration ib_post_send returned %i\n", rc);
++ 	rpcrdma_defer_mr_recovery(mw);
++ 	return -ENOTCONN;
+++>>>>>>> 7a89f9c626e3 (xprtrdma: Honor ->send_request API contract)
+  }
+  
+  static struct ib_send_wr *
+@@@ -583,6 -566,28 +604,31 @@@ unmap
+  	}
+  
+  	req->rl_nchunks = 0;
+++<<<<<<< HEAD
+++=======
++ 	return;
++ 
++ reset_mrs:
++ 	pr_err("rpcrdma: FRMR invalidate ib_post_send returned %i\n", rc);
++ 	rdma_disconnect(ia->ri_id);
++ 
++ 	/* Find and reset the MRs in the LOCAL_INV WRs that did not
++ 	 * get posted. This is synchronous, and slow.
++ 	 */
++ 	for (i = 0, nchunks = req->rl_nchunks; nchunks; nchunks--) {
++ 		seg = &req->rl_segments[i];
++ 		mw = seg->rl_mw;
++ 		f = &mw->frmr;
++ 
++ 		if (mw->frmr.fr_mr->rkey == bad_wr->ex.invalidate_rkey) {
++ 			__frwr_reset_mr(ia, mw);
++ 			bad_wr = bad_wr->next;
++ 		}
++ 
++ 		i += seg->mr_nsegs;
++ 	}
++ 	goto unmap;
+++>>>>>>> 7a89f9c626e3 (xprtrdma: Honor ->send_request API contract)
+  }
+  
+  /* Use a slow, safe mechanism to invalidate all memory regions
+* Unmerged path net/sunrpc/xprtrdma/fmr_ops.c
+* Unmerged path net/sunrpc/xprtrdma/frwr_ops.c
+diff --git a/net/sunrpc/xprtrdma/rpc_rdma.c b/net/sunrpc/xprtrdma/rpc_rdma.c
+index d2719e1b5171..80c439e873d9 100644
+--- a/net/sunrpc/xprtrdma/rpc_rdma.c
++++ b/net/sunrpc/xprtrdma/rpc_rdma.c
+@@ -251,7 +251,7 @@ rpcrdma_convert_iovs(struct xdr_buf *xdrbuf, unsigned int pos,
+ 			/* alloc the pagelist for receiving buffer */
+ 			ppages[p] = alloc_page(GFP_ATOMIC);
+ 			if (!ppages[p])
+-				return -ENOMEM;
++				return -EAGAIN;
+ 		}
+ 		seg[n].mr_page = ppages[p];
+ 		seg[n].mr_offset = (void *)(unsigned long) page_base;
+diff --git a/net/sunrpc/xprtrdma/transport.c b/net/sunrpc/xprtrdma/transport.c
+index 99d2e5b72726..fa87d2ae4ee8 100644
+--- a/net/sunrpc/xprtrdma/transport.c
++++ b/net/sunrpc/xprtrdma/transport.c
+@@ -558,7 +558,6 @@ out_sendbuf:
+ 
+ out_fail:
+ 	rpcrdma_buffer_put(req);
+-	r_xprt->rx_stats.failed_marshal_count++;
+ 	return NULL;
+ }
+ 
+@@ -590,8 +589,19 @@ xprt_rdma_free(void *buffer)
+ 	rpcrdma_buffer_put(req);
+ }
+ 
+-/*
++/**
++ * xprt_rdma_send_request - marshal and send an RPC request
++ * @task: RPC task with an RPC message in rq_snd_buf
++ *
++ * Return values:
++ *        0:	The request has been sent
++ * ENOTCONN:	Caller needs to invoke connect logic then call again
++ *  ENOBUFS:	Call again later to send the request
++ *      EIO:	A permanent error occurred. The request was not sent,
++ *		and don't try it again
++ *
+  * send_request invokes the meat of RPC RDMA. It must do the following:
++ *
+  *  1.  Marshal the RPC request into an RPC RDMA request, which means
+  *	putting a header in front of data, and creating IOVs for RDMA
+  *	from those in the request.
+@@ -600,7 +610,6 @@ xprt_rdma_free(void *buffer)
+  *	the request (rpcrdma_ep_post).
+  *  4.  No partial sends are possible in the RPC-RDMA protocol (as in UDP).
+  */
+-
+ static int
+ xprt_rdma_send_request(struct rpc_task *task)
+ {
+@@ -630,11 +639,12 @@ xprt_rdma_send_request(struct rpc_task *task)
+ 	return 0;
+ 
+ failed_marshal:
+-	r_xprt->rx_stats.failed_marshal_count++;
+ 	dprintk("RPC:       %s: rpcrdma_marshal_req failed, status %i\n",
+ 		__func__, rc);
+ 	if (rc == -EIO)
+-		return -EIO;
++		r_xprt->rx_stats.failed_marshal_count++;
++	if (rc != -ENOTCONN)
++		return rc;
+ drop_connection:
+ 	xprt_disconnect_done(xprt);
+ 	return -ENOTCONN;	/* implies disconnect */
+diff --git a/net/sunrpc/xprtrdma/verbs.c b/net/sunrpc/xprtrdma/verbs.c
+index 852c524a0dd0..02b619cc34b2 100644
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@ -1140,7 +1140,7 @@ rpcrdma_ep_post(struct rpcrdma_ia *ia,
+ 	if (rep) {
+ 		rc = rpcrdma_ep_post_recv(ia, ep, rep);
+ 		if (rc)
+-			goto out;
++			return rc;
+ 		req->rl_reply = NULL;
+ 	}
+ 
+@@ -1165,10 +1165,12 @@ rpcrdma_ep_post(struct rpcrdma_ia *ia,
+ 
+ 	rc = ib_post_send(ia->ri_id->qp, &send_wr, &send_wr_fail);
+ 	if (rc)
+-		dprintk("RPC:       %s: ib_post_send returned %i\n", __func__,
+-			rc);
+-out:
+-	return rc;
++		goto out_postsend_err;
++	return 0;
++
++out_postsend_err:
++	pr_err("rpcrdma: RDMA Send ib_post_send returned %i\n", rc);
++	return -ENOTCONN;
+ }
+ 
+ /*
+@@ -1193,11 +1195,13 @@ rpcrdma_ep_post_recv(struct rpcrdma_ia *ia,
+ 				   DMA_BIDIRECTIONAL);
+ 
+ 	rc = ib_post_recv(ia->ri_id->qp, &recv_wr, &recv_wr_fail);
+-
+ 	if (rc)
+-		dprintk("RPC:       %s: ib_post_recv returned %i\n", __func__,
+-			rc);
+-	return rc;
++		goto out_postrecv;
++	return 0;
++
++out_postrecv:
++	pr_err("rpcrdma: ib_post_recv returned %i\n", rc);
++	return -ENOTCONN;
+ }
+ 
+ /**
