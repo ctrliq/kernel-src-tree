@@ -1,0 +1,144 @@
+KVM: PPC: Book3S HV: Introduce kvmppc_passthru_irqmap
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Suresh Warrier <warrier@linux.vnet.ibm.com>
+commit 8daaafc88b46fb3af952e92d7c2816a8950e1363
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8daaafc8.failed
+
+This patch introduces an IRQ mapping structure, the
+kvmppc_passthru_irqmap structure that is to be used
+to map the real hardware IRQ in the host with the virtual
+hardware IRQ (gsi) that is injected into a guest by KVM for
+passthrough adapters.
+
+Currently, we assume a separate IRQ mapping structure for
+each guest. Each kvmppc_passthru_irqmap has a mapping arrays,
+containing all defined real<->virtual IRQs.
+
+[paulus@ozlabs.org - removed irq_chip field from struct
+ kvmppc_passthru_irqmap; changed parameter for
+ kvmppc_get_passthru_irqmap from struct kvm_vcpu * to struct
+ kvm *, removed small cached array.]
+
+	Signed-off-by: Suresh Warrier <warrier@linux.vnet.ibm.com>
+	Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+(cherry picked from commit 8daaafc88b46fb3af952e92d7c2816a8950e1363)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/kvm_ppc.h
+diff --cc arch/powerpc/include/asm/kvm_ppc.h
+index 4af3129ec8aa,4ca2ba36a860..000000000000
+--- a/arch/powerpc/include/asm/kvm_ppc.h
++++ b/arch/powerpc/include/asm/kvm_ppc.h
+@@@ -437,6 -457,18 +437,21 @@@ static inline int kvmppc_xics_enabled(s
+  {
+  	return vcpu->arch.irq_type == KVMPPC_IRQ_XICS;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static inline struct kvmppc_passthru_irqmap *kvmppc_get_passthru_irqmap(
++ 				struct kvm *kvm)
++ {
++ 	if (kvm)
++ 		return kvm->arch.pimap;
++ 	return NULL;
++ }
++ 
++ extern void kvmppc_alloc_host_rm_ops(void);
++ extern void kvmppc_free_host_rm_ops(void);
++ extern void kvmppc_free_pimap(struct kvm *kvm);
+++>>>>>>> 8daaafc88b46 (KVM: PPC: Book3S HV: Introduce kvmppc_passthru_irqmap)
+  extern void kvmppc_xics_free_icp(struct kvm_vcpu *vcpu);
+  extern int kvmppc_xics_create_icp(struct kvm_vcpu *vcpu, unsigned long server);
+  extern int kvm_vm_ioctl_xics_irq(struct kvm *kvm, struct kvm_irq_level *args);
+@@@ -445,7 -477,15 +460,16 @@@ extern u64 kvmppc_xics_get_icp(struct k
+  extern int kvmppc_xics_set_icp(struct kvm_vcpu *vcpu, u64 icpval);
+  extern int kvmppc_xics_connect_vcpu(struct kvm_device *dev,
+  			struct kvm_vcpu *vcpu, u32 cpu);
+ -extern void kvmppc_xics_ipi_action(void);
+ -extern int h_ipi_redirect;
+  #else
+++<<<<<<< HEAD
+++=======
++ static inline struct kvmppc_passthru_irqmap *kvmppc_get_passthru_irqmap(
++ 				struct kvm *kvm)
++ 	{ return NULL; }
++ static inline void kvmppc_alloc_host_rm_ops(void) {};
++ static inline void kvmppc_free_host_rm_ops(void) {};
++ static inline void kvmppc_free_pimap(struct kvm *kvm) {};
+++>>>>>>> 8daaafc88b46 (KVM: PPC: Book3S HV: Introduce kvmppc_passthru_irqmap)
+  static inline int kvmppc_xics_enabled(struct kvm_vcpu *vcpu)
+  	{ return 0; }
+  static inline void kvmppc_xics_free_icp(struct kvm_vcpu *vcpu) { }
+diff --git a/arch/powerpc/include/asm/kvm_host.h b/arch/powerpc/include/asm/kvm_host.h
+index 8841a038084f..32f8334a0c28 100644
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -192,6 +192,8 @@ struct kvmppc_spapr_tce_table {
+ struct kvmppc_xics;
+ struct kvmppc_icp;
+ 
++struct kvmppc_passthru_irqmap;
++
+ /*
+  * The reverse mapping array has one entry for each HPTE,
+  * which stores the guest's view of the second word of the HPTE
+@@ -262,6 +264,7 @@ struct kvm_arch {
+ #endif
+ #ifdef CONFIG_KVM_XICS
+ 	struct kvmppc_xics *xics;
++	struct kvmppc_passthru_irqmap *pimap;
+ #endif
+ 	struct kvmppc_ops *kvm_ops;
+ #ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
+@@ -392,6 +395,20 @@ struct kvmhv_tb_accumulator {
+ 	u64	tb_max;		/* max time */
+ };
+ 
++#ifdef CONFIG_PPC_BOOK3S_64
++struct kvmppc_irq_map {
++	u32	r_hwirq;
++	u32	v_hwirq;
++	struct irq_desc *desc;
++};
++
++#define	KVMPPC_PIRQ_MAPPED	1024
++struct kvmppc_passthru_irqmap {
++	int n_mapped;
++	struct kvmppc_irq_map mapped[KVMPPC_PIRQ_MAPPED];
++};
++#endif
++
+ # ifdef CONFIG_PPC_FSL_BOOK3E
+ #define KVMPPC_BOOKE_IAC_NUM	2
+ #define KVMPPC_BOOKE_DAC_NUM	2
+* Unmerged path arch/powerpc/include/asm/kvm_ppc.h
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index 32dd0caea96b..dbbb6d416eec 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -3144,6 +3144,19 @@ static int kvmppc_core_check_processor_compat_hv(void)
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_KVM_XICS
++
++void kvmppc_free_pimap(struct kvm *kvm)
++{
++	kfree(kvm->arch.pimap);
++}
++
++struct kvmppc_passthru_irqmap *kvmppc_alloc_pimap(void)
++{
++	return kzalloc(sizeof(struct kvmppc_passthru_irqmap), GFP_KERNEL);
++}
++#endif
++
+ static long kvm_arch_vm_ioctl_hv(struct file *filp,
+ 				 unsigned int ioctl, unsigned long arg)
+ {
