@@ -1,0 +1,1583 @@
+target: Remove enum transport_lunflags_table
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [target] Remove enum transport_lunflags_table (Maurizio Lombardi) [1366062]
+Rebuild_FUZZ: 90.00%
+commit-author Andy Grover <agrover@redhat.com>
+commit 03a68b44faff1b3eef5424952044747c9c555f0e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/03a68b44.failed
+
+se_dev_entry.lun_flags and se_lun.lun_access are only used for keeping
+track of read-write vs. read-only state. Since this is an either/or thing
+we can represent it as bool, and remove the unneeded enum
+transport_lunflags_table, which is left over from when there were more
+flags.
+
+Change code that uses this enum to just use true/false, and make it clear
+through variable and param names that true means read-only, false means
+read-write.
+
+	Signed-off-by: Andy Grover <agrover@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 03a68b44faff1b3eef5424952044747c9c555f0e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_device.c
+#	drivers/target/target_core_fabric_configfs.c
+#	drivers/target/target_core_internal.h
+#	drivers/target/target_core_spc.c
+#	drivers/target/target_core_tpg.c
+#	include/target/target_core_base.h
+diff --cc drivers/target/target_core_device.c
+index 1e65ea95d7f2,a4046ca6e60d..000000000000
+--- a/drivers/target/target_core_device.c
++++ b/drivers/target/target_core_device.c
+@@@ -95,8 -84,19 +95,22 @@@ transport_lookup_cmd_lun(struct se_cmd 
+  
+  		percpu_ref_get(&se_lun->lun_ref);
+  		se_cmd->lun_ref_active = true;
+++<<<<<<< HEAD
+++=======
++ 
++ 		if ((se_cmd->data_direction == DMA_TO_DEVICE) &&
++ 		    deve->lun_access_ro) {
++ 			pr_err("TARGET_CORE[%s]: Detected WRITE_PROTECTED LUN"
++ 				" Access for 0x%08llx\n",
++ 				se_cmd->se_tfo->get_fabric_name(),
++ 				unpacked_lun);
++ 			rcu_read_unlock();
++ 			ret = TCM_WRITE_PROTECTED;
++ 			goto ref_dev;
++ 		}
+++>>>>>>> 03a68b44faff (target: Remove enum transport_lunflags_table)
+  	}
+ -	rcu_read_unlock();
+ +	spin_unlock_irqrestore(&se_sess->se_node_acl->device_list_lock, flags);
+  
+  	if (!se_lun) {
+  		/*
+@@@ -185,9 -191,24 +199,27 @@@ int transport_lookup_tmr_lun(struct se_
+  }
+  EXPORT_SYMBOL(transport_lookup_tmr_lun);
+  
+++<<<<<<< HEAD
+++=======
++ bool target_lun_is_rdonly(struct se_cmd *cmd)
++ {
++ 	struct se_session *se_sess = cmd->se_sess;
++ 	struct se_dev_entry *deve;
++ 	bool ret;
++ 
++ 	rcu_read_lock();
++ 	deve = target_nacl_find_deve(se_sess->se_node_acl, cmd->orig_fe_lun);
++ 	ret = deve && deve->lun_access_ro;
++ 	rcu_read_unlock();
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL(target_lun_is_rdonly);
++ 
+++>>>>>>> 03a68b44faff (target: Remove enum transport_lunflags_table)
+  /*
+   * This function is called from core_scsi3_emulate_pro_register_and_move()
+ - * and core_scsi3_decode_spec_i_port(), and will increment &deve->pr_kref
+ + * and core_scsi3_decode_spec_i_port(), and will increment &deve->pr_ref_count
+   * when a matching rtpi is found.
+   */
+  struct se_dev_entry *core_get_se_deve_from_rtpi(
+@@@ -274,119 -257,151 +306,221 @@@ int core_free_device_list_for_node
+  }
+  
+  void core_update_device_list_access(
+++<<<<<<< HEAD
+ +	u32 mapped_lun,
+ +	u32 lun_access,
+++=======
++ 	u64 mapped_lun,
++ 	bool lun_access_ro,
+++>>>>>>> 03a68b44faff (target: Remove enum transport_lunflags_table)
+  	struct se_node_acl *nacl)
+  {
+  	struct se_dev_entry *deve;
+  
+ -	mutex_lock(&nacl->lun_entry_mutex);
+ -	deve = target_nacl_find_deve(nacl, mapped_lun);
+ -	if (deve)
+ -		deve->lun_access_ro = lun_access_ro;
+ -	mutex_unlock(&nacl->lun_entry_mutex);
+++<<<<<<< HEAD
+ +	spin_lock_irq(&nacl->device_list_lock);
+ +	deve = nacl->device_list[mapped_lun];
+ +	if (lun_access & TRANSPORT_LUNFLAGS_READ_WRITE) {
+ +		deve->lun_flags &= ~TRANSPORT_LUNFLAGS_READ_ONLY;
+ +		deve->lun_flags |= TRANSPORT_LUNFLAGS_READ_WRITE;
+ +	} else {
+ +		deve->lun_flags &= ~TRANSPORT_LUNFLAGS_READ_WRITE;
+ +		deve->lun_flags |= TRANSPORT_LUNFLAGS_READ_ONLY;
+ +	}
+ +	spin_unlock_irq(&nacl->device_list_lock);
+  }
+  
+ -/*
+ - * Called with rcu_read_lock or nacl->device_list_lock held.
+ +/*      core_enable_device_list_for_node():
+ + *
+ + *
+   */
+ -struct se_dev_entry *target_nacl_find_deve(struct se_node_acl *nacl, u64 mapped_lun)
+ +int core_enable_device_list_for_node(
+ +	struct se_lun *lun,
+ +	struct se_lun_acl *lun_acl,
+ +	u32 mapped_lun,
+ +	u32 lun_access,
+ +	struct se_node_acl *nacl,
+ +	struct se_portal_group *tpg)
+  {
+ +	struct se_port *port = lun->lun_sep;
+  	struct se_dev_entry *deve;
+  
+ -	hlist_for_each_entry_rcu(deve, &nacl->lun_entry_hlist, link)
+ -		if (deve->mapped_lun == mapped_lun)
+ -			return deve;
+ +	spin_lock_irq(&nacl->device_list_lock);
+  
+ -	return NULL;
+ -}
+ -EXPORT_SYMBOL(target_nacl_find_deve);
+ +	deve = nacl->device_list[mapped_lun];
+  
+ -void target_pr_kref_release(struct kref *kref)
+ -{
+ -	struct se_dev_entry *deve = container_of(kref, struct se_dev_entry,
+ -						 pr_kref);
+ -	complete(&deve->pr_comp);
+ -}
+ +	/*
+ +	 * Check if the call is handling demo mode -> explicit LUN ACL
+ +	 * transition.  This transition must be for the same struct se_lun
+ +	 * + mapped_lun that was setup in demo mode..
+ +	 */
+ +	if (deve->lun_flags & TRANSPORT_LUNFLAGS_INITIATOR_ACCESS) {
+ +		if (deve->se_lun_acl != NULL) {
+ +			pr_err("struct se_dev_entry->se_lun_acl"
+ +			       " already set for demo mode -> explicit"
+ +			       " LUN ACL transition\n");
+ +			spin_unlock_irq(&nacl->device_list_lock);
+ +			return -EINVAL;
+ +		}
+ +		if (deve->se_lun != lun) {
+ +			pr_err("struct se_dev_entry->se_lun does"
+ +			       " match passed struct se_lun for demo mode"
+ +			       " -> explicit LUN ACL transition\n");
+ +			spin_unlock_irq(&nacl->device_list_lock);
+ +			return -EINVAL;
+ +		}
+ +		deve->se_lun_acl = lun_acl;
+ +
+ +		if (lun_access & TRANSPORT_LUNFLAGS_READ_WRITE) {
+ +			deve->lun_flags &= ~TRANSPORT_LUNFLAGS_READ_ONLY;
+ +			deve->lun_flags |= TRANSPORT_LUNFLAGS_READ_WRITE;
+ +		} else {
+ +			deve->lun_flags &= ~TRANSPORT_LUNFLAGS_READ_WRITE;
+ +			deve->lun_flags |= TRANSPORT_LUNFLAGS_READ_ONLY;
+ +		}
+  
+ -static void
+ -target_luns_data_has_changed(struct se_node_acl *nacl, struct se_dev_entry *new,
+ -			     bool skip_new)
+ -{
+ -	struct se_dev_entry *tmp;
+ +		spin_unlock_irq(&nacl->device_list_lock);
+ +		return 0;
+ +	}
+  
+ -	rcu_read_lock();
+ -	hlist_for_each_entry_rcu(tmp, &nacl->lun_entry_hlist, link) {
+ -		if (skip_new && tmp == new)
+ -			continue;
+ -		core_scsi3_ua_allocate(tmp, 0x3F,
+ -				       ASCQ_3FH_REPORTED_LUNS_DATA_HAS_CHANGED);
+ +	deve->se_lun = lun;
+ +	deve->se_lun_acl = lun_acl;
+ +	deve->mapped_lun = mapped_lun;
+ +	deve->lun_flags |= TRANSPORT_LUNFLAGS_INITIATOR_ACCESS;
+ +
+ +	if (lun_access & TRANSPORT_LUNFLAGS_READ_WRITE) {
+ +		deve->lun_flags &= ~TRANSPORT_LUNFLAGS_READ_ONLY;
+ +		deve->lun_flags |= TRANSPORT_LUNFLAGS_READ_WRITE;
+ +	} else {
+ +		deve->lun_flags &= ~TRANSPORT_LUNFLAGS_READ_WRITE;
+ +		deve->lun_flags |= TRANSPORT_LUNFLAGS_READ_ONLY;
+  	}
+ -	rcu_read_unlock();
+ +
+ +	deve->creation_time = get_jiffies_64();
+ +	deve->attach_count++;
+ +	spin_unlock_irq(&nacl->device_list_lock);
+ +
+ +	spin_lock_bh(&port->sep_alua_lock);
+ +	list_add_tail(&deve->alua_port_list, &port->sep_alua_list);
+ +	spin_unlock_bh(&port->sep_alua_lock);
+ +
+ +	return 0;
+++=======
+++	mutex_lock(&nacl->lun_entry_mutex);
+++	deve = target_nacl_find_deve(nacl, mapped_lun);
+++	if (deve)
+++		deve->lun_access_ro = lun_access_ro;
+++	mutex_unlock(&nacl->lun_entry_mutex);
+++>>>>>>> 03a68b44faff (target: Remove enum transport_lunflags_table)
+  }
+  
+ -int core_enable_device_list_for_node(
+ +/*      core_disable_device_list_for_node():
+ + *
+ + *
+ + */
+ +int core_disable_device_list_for_node(
+  	struct se_lun *lun,
+  	struct se_lun_acl *lun_acl,
+++<<<<<<< HEAD
+ +	u32 mapped_lun,
+ +	u32 lun_access,
+++=======
++ 	u64 mapped_lun,
++ 	bool lun_access_ro,
+++>>>>>>> 03a68b44faff (target: Remove enum transport_lunflags_table)
+  	struct se_node_acl *nacl,
+  	struct se_portal_group *tpg)
+  {
+ -	struct se_dev_entry *orig, *new;
+ +	struct se_port *port = lun->lun_sep;
+ +	struct se_dev_entry *deve = nacl->device_list[mapped_lun];
+  
+++<<<<<<< HEAD
+++=======
++ 	new = kzalloc(sizeof(*new), GFP_KERNEL);
++ 	if (!new) {
++ 		pr_err("Unable to allocate se_dev_entry memory\n");
++ 		return -ENOMEM;
++ 	}
++ 
++ 	atomic_set(&new->ua_count, 0);
++ 	spin_lock_init(&new->ua_lock);
++ 	INIT_LIST_HEAD(&new->ua_list);
++ 	INIT_LIST_HEAD(&new->lun_link);
++ 
++ 	new->mapped_lun = mapped_lun;
++ 	kref_init(&new->pr_kref);
++ 	init_completion(&new->pr_comp);
++ 
++ 	new->lun_access_ro = lun_access_ro;
++ 	new->creation_time = get_jiffies_64();
++ 	new->attach_count++;
++ 
++ 	mutex_lock(&nacl->lun_entry_mutex);
++ 	orig = target_nacl_find_deve(nacl, mapped_lun);
++ 	if (orig && orig->se_lun) {
++ 		struct se_lun *orig_lun = rcu_dereference_check(orig->se_lun,
++ 					lockdep_is_held(&nacl->lun_entry_mutex));
++ 
++ 		if (orig_lun != lun) {
++ 			pr_err("Existing orig->se_lun doesn't match new lun"
++ 			       " for dynamic -> explicit NodeACL conversion:"
++ 				" %s\n", nacl->initiatorname);
++ 			mutex_unlock(&nacl->lun_entry_mutex);
++ 			kfree(new);
++ 			return -EINVAL;
++ 		}
++ 		BUG_ON(orig->se_lun_acl != NULL);
++ 
++ 		rcu_assign_pointer(new->se_lun, lun);
++ 		rcu_assign_pointer(new->se_lun_acl, lun_acl);
++ 		hlist_del_rcu(&orig->link);
++ 		hlist_add_head_rcu(&new->link, &nacl->lun_entry_hlist);
++ 		mutex_unlock(&nacl->lun_entry_mutex);
++ 
++ 		spin_lock(&lun->lun_deve_lock);
++ 		list_del(&orig->lun_link);
++ 		list_add_tail(&new->lun_link, &lun->lun_deve_list);
++ 		spin_unlock(&lun->lun_deve_lock);
++ 
++ 		kref_put(&orig->pr_kref, target_pr_kref_release);
++ 		wait_for_completion(&orig->pr_comp);
++ 
++ 		target_luns_data_has_changed(nacl, new, true);
++ 		kfree_rcu(orig, rcu_head);
++ 		return 0;
++ 	}
++ 
++ 	rcu_assign_pointer(new->se_lun, lun);
++ 	rcu_assign_pointer(new->se_lun_acl, lun_acl);
++ 	hlist_add_head_rcu(&new->link, &nacl->lun_entry_hlist);
++ 	mutex_unlock(&nacl->lun_entry_mutex);
++ 
++ 	spin_lock(&lun->lun_deve_lock);
++ 	list_add_tail(&new->lun_link, &lun->lun_deve_list);
++ 	spin_unlock(&lun->lun_deve_lock);
++ 
++ 	target_luns_data_has_changed(nacl, new, true);
++ 	return 0;
++ }
++ 
++ /*
++  *	Called with se_node_acl->lun_entry_mutex held.
++  */
++ void core_disable_device_list_for_node(
++ 	struct se_lun *lun,
++ 	struct se_dev_entry *orig,
++ 	struct se_node_acl *nacl,
++ 	struct se_portal_group *tpg)
++ {
++ 	/*
++ 	 * rcu_dereference_raw protected by se_lun->lun_group symlink
++ 	 * reference to se_device->dev_group.
++ 	 */
++ 	struct se_device *dev = rcu_dereference_raw(lun->lun_se_dev);
+++>>>>>>> 03a68b44faff (target: Remove enum transport_lunflags_table)
+  	/*
+  	 * If the MappedLUN entry is being disabled, the entry in
+ -	 * lun->lun_deve_list must be removed now before clearing the
+ +	 * port->sep_alua_list must be removed now before clearing the
+  	 * struct se_dev_entry pointers below as logic in
+  	 * core_alua_do_transition_tg_pt() depends on these being present.
+  	 *
+@@@ -397,30 -412,33 +531,52 @@@
+  	 * NodeACL context specific PR metadata for demo-mode
+  	 * MappedLUN *deve will be released below..
+  	 */
+ -	spin_lock(&lun->lun_deve_lock);
+ -	list_del(&orig->lun_link);
+ -	spin_unlock(&lun->lun_deve_lock);
+ +	spin_lock_bh(&port->sep_alua_lock);
+ +	list_del(&deve->alua_port_list);
+ +	spin_unlock_bh(&port->sep_alua_lock);
+  	/*
+ -	 * Disable struct se_dev_entry LUN ACL mapping
+ +	 * Wait for any in process SPEC_I_PT=1 or REGISTER_AND_MOVE
+ +	 * PR operation to complete.
+  	 */
+ -	core_scsi3_ua_release_all(orig);
+ +	while (atomic_read(&deve->pr_ref_count) != 0)
+ +		cpu_relax();
+  
+ +	spin_lock_irq(&nacl->device_list_lock);
+ +	/*
+ +	 * Disable struct se_dev_entry LUN ACL mapping
+ +	 */
+ +	core_scsi3_ua_release_all(deve);
+ +	deve->se_lun = NULL;
+ +	deve->se_lun_acl = NULL;
+ +	deve->lun_flags = 0;
+ +	deve->creation_time = 0;
+ +	deve->attach_count--;
+ +	spin_unlock_irq(&nacl->device_list_lock);
+ +
+++<<<<<<< HEAD
+ +	core_scsi3_free_pr_reg_from_nacl(lun->lun_se_dev, nacl);
+ +	return 0;
+++=======
++ 	hlist_del_rcu(&orig->link);
++ 	clear_bit(DEF_PR_REG_ACTIVE, &orig->deve_flags);
++ 	orig->lun_access_ro = false;
++ 	orig->creation_time = 0;
++ 	orig->attach_count--;
++ 	/*
++ 	 * Before firing off RCU callback, wait for any in process SPEC_I_PT=1
++ 	 * or REGISTER_AND_MOVE PR operation to complete.
++ 	 */
++ 	kref_put(&orig->pr_kref, target_pr_kref_release);
++ 	wait_for_completion(&orig->pr_comp);
++ 
++ 	rcu_assign_pointer(orig->se_lun, NULL);
++ 	rcu_assign_pointer(orig->se_lun_acl, NULL);
++ 
++ 	kfree_rcu(orig, rcu_head);
++ 
++ 	core_scsi3_free_pr_reg_from_nacl(dev, nacl);
++ 	target_luns_data_has_changed(nacl, NULL, false);
+++>>>>>>> 03a68b44faff (target: Remove enum transport_lunflags_table)
+  }
+  
+  /*      core_clear_lun_from_tpg():
+@@@ -651,556 -540,18 +807,560 @@@ static u32 se_dev_align_max_sectors(u3
+  	return aligned_max_sectors;
+  }
+  
+ -int core_dev_add_lun(
+ +bool se_dev_check_wce(struct se_device *dev)
+ +{
+ +	bool wce = false;
+ +
+ +	if (dev->transport->get_write_cache)
+ +		wce = dev->transport->get_write_cache(dev);
+ +	else if (dev->dev_attrib.emulate_write_cache > 0)
+ +		wce = true;
+ +
+ +	return wce;
+ +}
+ +
+ +int se_dev_set_max_unmap_lba_count(
+ +	struct se_device *dev,
+ +	u32 max_unmap_lba_count)
+ +{
+ +	dev->dev_attrib.max_unmap_lba_count = max_unmap_lba_count;
+ +	pr_debug("dev[%p]: Set max_unmap_lba_count: %u\n",
+ +			dev, dev->dev_attrib.max_unmap_lba_count);
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(se_dev_set_max_unmap_lba_count);
+ +
+ +int se_dev_set_max_unmap_block_desc_count(
+ +	struct se_device *dev,
+ +	u32 max_unmap_block_desc_count)
+ +{
+ +	dev->dev_attrib.max_unmap_block_desc_count =
+ +		max_unmap_block_desc_count;
+ +	pr_debug("dev[%p]: Set max_unmap_block_desc_count: %u\n",
+ +			dev, dev->dev_attrib.max_unmap_block_desc_count);
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(se_dev_set_max_unmap_block_desc_count);
+ +
+ +int se_dev_set_unmap_granularity(
+ +	struct se_device *dev,
+ +	u32 unmap_granularity)
+ +{
+ +	dev->dev_attrib.unmap_granularity = unmap_granularity;
+ +	pr_debug("dev[%p]: Set unmap_granularity: %u\n",
+ +			dev, dev->dev_attrib.unmap_granularity);
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(se_dev_set_unmap_granularity);
+ +
+ +int se_dev_set_unmap_granularity_alignment(
+ +	struct se_device *dev,
+ +	u32 unmap_granularity_alignment)
+ +{
+ +	dev->dev_attrib.unmap_granularity_alignment = unmap_granularity_alignment;
+ +	pr_debug("dev[%p]: Set unmap_granularity_alignment: %u\n",
+ +			dev, dev->dev_attrib.unmap_granularity_alignment);
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(se_dev_set_unmap_granularity_alignment);
+ +
+ +int se_dev_set_max_write_same_len(
+ +	struct se_device *dev,
+ +	u32 max_write_same_len)
+ +{
+ +	dev->dev_attrib.max_write_same_len = max_write_same_len;
+ +	pr_debug("dev[%p]: Set max_write_same_len: %u\n",
+ +			dev, dev->dev_attrib.max_write_same_len);
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(se_dev_set_max_write_same_len);
+ +
+ +static void dev_set_t10_wwn_model_alias(struct se_device *dev)
+ +{
+ +	const char *configname;
+ +
+ +	configname = config_item_name(&dev->dev_group.cg_item);
+ +	if (strlen(configname) >= 16) {
+ +		pr_warn("dev[%p]: Backstore name '%s' is too long for "
+ +			"INQUIRY_MODEL, truncating to 16 bytes\n", dev,
+ +			configname);
+ +	}
+ +	snprintf(&dev->t10_wwn.model[0], 16, "%s", configname);
+ +}
+ +
+ +int se_dev_set_emulate_model_alias(struct se_device *dev, int flag)
+ +{
+ +	if (dev->export_count) {
+ +		pr_err("dev[%p]: Unable to change model alias"
+ +			" while export_count is %d\n",
+ +			dev, dev->export_count);
+ +			return -EINVAL;
+ +	}
+ +
+ +	if (flag != 0 && flag != 1) {
+ +		pr_err("Illegal value %d\n", flag);
+ +		return -EINVAL;
+ +	}
+ +
+ +	if (flag) {
+ +		dev_set_t10_wwn_model_alias(dev);
+ +	} else {
+ +		strncpy(&dev->t10_wwn.model[0],
+ +			dev->transport->inquiry_prod, 16);
+ +	}
+ +	dev->dev_attrib.emulate_model_alias = flag;
+ +
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(se_dev_set_emulate_model_alias);
+ +
+ +int se_dev_set_emulate_dpo(struct se_device *dev, int flag)
+ +{
+ +	if (flag != 0 && flag != 1) {
+ +		pr_err("Illegal value %d\n", flag);
+ +		return -EINVAL;
+ +	}
+ +
+ +	if (flag) {
+ +		pr_err("dpo_emulated not supported\n");
+ +		return -EINVAL;
+ +	}
+ +
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(se_dev_set_emulate_dpo);
+ +
+ +int se_dev_set_emulate_fua_write(struct se_device *dev, int flag)
+ +{
+ +	if (flag != 0 && flag != 1) {
+ +		pr_err("Illegal value %d\n", flag);
+ +		return -EINVAL;
+ +	}
+ +	if (flag &&
+ +	    dev->transport->get_write_cache) {
+ +		pr_warn("emulate_fua_write not supported for this device, ignoring\n");
+ +		return 0;
+ +	}
+ +	if (dev->export_count) {
+ +		pr_err("emulate_fua_write cannot be changed with active"
+ +		       " exports: %d\n", dev->export_count);
+ +		return -EINVAL;
+ +	}
+ +	dev->dev_attrib.emulate_fua_write = flag;
+ +	pr_debug("dev[%p]: SE Device Forced Unit Access WRITEs: %d\n",
+ +			dev, dev->dev_attrib.emulate_fua_write);
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(se_dev_set_emulate_fua_write);
+ +
+ +int se_dev_set_emulate_fua_read(struct se_device *dev, int flag)
+ +{
+ +	if (flag != 0 && flag != 1) {
+ +		pr_err("Illegal value %d\n", flag);
+ +		return -EINVAL;
+ +	}
+ +
+ +	if (flag) {
+ +		pr_err("ua read emulated not supported\n");
+ +		return -EINVAL;
+ +	}
+ +
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(se_dev_set_emulate_fua_read);
+ +
+ +int se_dev_set_emulate_write_cache(struct se_device *dev, int flag)
+ +{
+ +	if (flag != 0 && flag != 1) {
+ +		pr_err("Illegal value %d\n", flag);
+ +		return -EINVAL;
+ +	}
+ +	if (flag &&
+ +	    dev->transport->get_write_cache) {
+ +		pr_err("emulate_write_cache not supported for this device\n");
+ +		return -EINVAL;
+ +	}
+ +	if (dev->export_count) {
+ +		pr_err("emulate_write_cache cannot be changed with active"
+ +		       " exports: %d\n", dev->export_count);
+ +		return -EINVAL;
+ +	}
+ +	dev->dev_attrib.emulate_write_cache = flag;
+ +	pr_debug("dev[%p]: SE Device WRITE_CACHE_EMULATION flag: %d\n",
+ +			dev, dev->dev_attrib.emulate_write_cache);
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(se_dev_set_emulate_write_cache);
+ +
+ +int se_dev_set_emulate_ua_intlck_ctrl(struct se_device *dev, int flag)
+ +{
+ +	if ((flag != 0) && (flag != 1) && (flag != 2)) {
+ +		pr_err("Illegal value %d\n", flag);
+ +		return -EINVAL;
+ +	}
+ +
+ +	if (dev->export_count) {
+ +		pr_err("dev[%p]: Unable to change SE Device"
+ +			" UA_INTRLCK_CTRL while export_count is %d\n",
+ +			dev, dev->export_count);
+ +		return -EINVAL;
+ +	}
+ +	dev->dev_attrib.emulate_ua_intlck_ctrl = flag;
+ +	pr_debug("dev[%p]: SE Device UA_INTRLCK_CTRL flag: %d\n",
+ +		dev, dev->dev_attrib.emulate_ua_intlck_ctrl);
+ +
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(se_dev_set_emulate_ua_intlck_ctrl);
+ +
+ +int se_dev_set_emulate_tas(struct se_device *dev, int flag)
+ +{
+ +	if ((flag != 0) && (flag != 1)) {
+ +		pr_err("Illegal value %d\n", flag);
+ +		return -EINVAL;
+ +	}
+ +
+ +	if (dev->export_count) {
+ +		pr_err("dev[%p]: Unable to change SE Device TAS while"
+ +			" export_count is %d\n",
+ +			dev, dev->export_count);
+ +		return -EINVAL;
+ +	}
+ +	dev->dev_attrib.emulate_tas = flag;
+ +	pr_debug("dev[%p]: SE Device TASK_ABORTED status bit: %s\n",
+ +		dev, (dev->dev_attrib.emulate_tas) ? "Enabled" : "Disabled");
+ +
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(se_dev_set_emulate_tas);
+ +
+ +int se_dev_set_emulate_tpu(struct se_device *dev, int flag)
+ +{
+ +	if ((flag != 0) && (flag != 1)) {
+ +		pr_err("Illegal value %d\n", flag);
+ +		return -EINVAL;
+ +	}
+ +	/*
+ +	 * We expect this value to be non-zero when generic Block Layer
+ +	 * Discard supported is detected iblock_create_virtdevice().
+ +	 */
+ +	if (flag && !dev->dev_attrib.max_unmap_block_desc_count) {
+ +		pr_err("Generic Block Discard not supported\n");
+ +		return -ENOSYS;
+ +	}
+ +
+ +	dev->dev_attrib.emulate_tpu = flag;
+ +	pr_debug("dev[%p]: SE Device Thin Provisioning UNMAP bit: %d\n",
+ +				dev, flag);
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(se_dev_set_emulate_tpu);
+ +
+ +int se_dev_set_emulate_tpws(struct se_device *dev, int flag)
+ +{
+ +	if ((flag != 0) && (flag != 1)) {
+ +		pr_err("Illegal value %d\n", flag);
+ +		return -EINVAL;
+ +	}
+ +	/*
+ +	 * We expect this value to be non-zero when generic Block Layer
+ +	 * Discard supported is detected iblock_create_virtdevice().
+ +	 */
+ +	if (flag && !dev->dev_attrib.max_unmap_block_desc_count) {
+ +		pr_err("Generic Block Discard not supported\n");
+ +		return -ENOSYS;
+ +	}
+ +
+ +	dev->dev_attrib.emulate_tpws = flag;
+ +	pr_debug("dev[%p]: SE Device Thin Provisioning WRITE_SAME: %d\n",
+ +				dev, flag);
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(se_dev_set_emulate_tpws);
+ +
+ +int se_dev_set_emulate_caw(struct se_device *dev, int flag)
+ +{
+ +	if (flag != 0 && flag != 1) {
+ +		pr_err("Illegal value %d\n", flag);
+ +		return -EINVAL;
+ +	}
+ +	dev->dev_attrib.emulate_caw = flag;
+ +	pr_debug("dev[%p]: SE Device CompareAndWrite (AtomicTestandSet): %d\n",
+ +		 dev, flag);
+ +
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(se_dev_set_emulate_caw);
+ +
+ +int se_dev_set_emulate_3pc(struct se_device *dev, int flag)
+ +{
+ +	if (flag != 0 && flag != 1) {
+ +		pr_err("Illegal value %d\n", flag);
+ +		return -EINVAL;
+ +	}
+ +	dev->dev_attrib.emulate_3pc = flag;
+ +	pr_debug("dev[%p]: SE Device 3rd Party Copy (EXTENDED_COPY): %d\n",
+ +		dev, flag);
+ +
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(se_dev_set_emulate_3pc);
+ +
+ +int se_dev_set_pi_prot_type(struct se_device *dev, int flag)
+ +{
+ +	int rc, old_prot = dev->dev_attrib.pi_prot_type;
+ +
+ +	if (flag != 0 && flag != 1 && flag != 2 && flag != 3) {
+ +		pr_err("Illegal value %d for pi_prot_type\n", flag);
+ +		return -EINVAL;
+ +	}
+ +	if (flag == 2) {
+ +		pr_err("DIF TYPE2 protection currently not supported\n");
+ +		return -ENOSYS;
+ +	}
+ +	if (dev->dev_attrib.hw_pi_prot_type) {
+ +		pr_warn("DIF protection enabled on underlying hardware,"
+ +			" ignoring\n");
+ +		return 0;
+ +	}
+ +	if (!dev->transport->init_prot || !dev->transport->free_prot) {
+ +		/* 0 is only allowed value for non-supporting backends */
+ +		if (flag == 0)
+ +			return 0;
+ +
+ +		pr_err("DIF protection not supported by backend: %s\n",
+ +		       dev->transport->name);
+ +		return -ENOSYS;
+ +	}
+ +	if (!(dev->dev_flags & DF_CONFIGURED)) {
+ +		pr_err("DIF protection requires device to be configured\n");
+ +		return -ENODEV;
+ +	}
+ +	if (dev->export_count) {
+ +		pr_err("dev[%p]: Unable to change SE Device PROT type while"
+ +		       " export_count is %d\n", dev, dev->export_count);
+ +		return -EINVAL;
+ +	}
+ +
+ +	dev->dev_attrib.pi_prot_type = flag;
+ +
+ +	if (flag && !old_prot) {
+ +		rc = dev->transport->init_prot(dev);
+ +		if (rc) {
+ +			dev->dev_attrib.pi_prot_type = old_prot;
+ +			return rc;
+ +		}
+ +
+ +	} else if (!flag && old_prot) {
+ +		dev->transport->free_prot(dev);
+ +	}
+ +	pr_debug("dev[%p]: SE Device Protection Type: %d\n", dev, flag);
+ +
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(se_dev_set_pi_prot_type);
+ +
+ +int se_dev_set_pi_prot_format(struct se_device *dev, int flag)
+ +{
+ +	int rc;
+ +
+++<<<<<<< HEAD
+ +	if (!flag)
+ +		return 0;
+ +
+ +	if (flag != 1) {
+ +		pr_err("Illegal value %d for pi_prot_format\n", flag);
+ +		return -EINVAL;
+ +	}
+ +	if (!dev->transport->format_prot) {
+ +		pr_err("DIF protection format not supported by backend %s\n",
+ +		       dev->transport->name);
+ +		return -ENOSYS;
+ +	}
+ +	if (!(dev->dev_flags & DF_CONFIGURED)) {
+ +		pr_err("DIF protection format requires device to be configured\n");
+ +		return -ENODEV;
+ +	}
+ +	if (dev->export_count) {
+ +		pr_err("dev[%p]: Unable to format SE Device PROT type while"
+ +		       " export_count is %d\n", dev, dev->export_count);
+ +		return -EINVAL;
+ +	}
+ +
+ +	rc = dev->transport->format_prot(dev);
+ +	if (rc)
+ +		return rc;
+ +
+ +	pr_debug("dev[%p]: SE Device Protection Format complete\n", dev);
+ +
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(se_dev_set_pi_prot_format);
+ +
+ +int se_dev_set_enforce_pr_isids(struct se_device *dev, int flag)
+ +{
+ +	if ((flag != 0) && (flag != 1)) {
+ +		pr_err("Illegal value %d\n", flag);
+ +		return -EINVAL;
+ +	}
+ +	dev->dev_attrib.enforce_pr_isids = flag;
+ +	pr_debug("dev[%p]: SE Device enforce_pr_isids bit: %s\n", dev,
+ +		(dev->dev_attrib.enforce_pr_isids) ? "Enabled" : "Disabled");
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(se_dev_set_enforce_pr_isids);
+ +
+ +int se_dev_set_force_pr_aptpl(struct se_device *dev, int flag)
+ +{
+ +	if ((flag != 0) && (flag != 1)) {
+ +		printk(KERN_ERR "Illegal value %d\n", flag);
+ +		return -EINVAL;
+ +	}
+ +	if (dev->export_count) {
+ +		pr_err("dev[%p]: Unable to set force_pr_aptpl while"
+ +		       " export_count is %d\n", dev, dev->export_count);
+ +		return -EINVAL;
+ +	}
+ +
+ +	dev->dev_attrib.force_pr_aptpl = flag;
+ +	pr_debug("dev[%p]: SE Device force_pr_aptpl: %d\n", dev, flag);
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(se_dev_set_force_pr_aptpl);
+ +
+ +int se_dev_set_is_nonrot(struct se_device *dev, int flag)
+ +{
+ +	if ((flag != 0) && (flag != 1)) {
+ +		printk(KERN_ERR "Illegal value %d\n", flag);
+ +		return -EINVAL;
+ +	}
+ +	dev->dev_attrib.is_nonrot = flag;
+ +	pr_debug("dev[%p]: SE Device is_nonrot bit: %d\n",
+ +	       dev, flag);
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(se_dev_set_is_nonrot);
+ +
+ +int se_dev_set_emulate_rest_reord(struct se_device *dev, int flag)
+ +{
+ +	if (flag != 0) {
+ +		printk(KERN_ERR "dev[%p]: SE Device emulation of restricted"
+ +			" reordering not implemented\n", dev);
+ +		return -ENOSYS;
+ +	}
+ +	dev->dev_attrib.emulate_rest_reord = flag;
+ +	pr_debug("dev[%p]: SE Device emulate_rest_reord: %d\n", dev, flag);
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(se_dev_set_emulate_rest_reord);
+ +
+ +/*
+ + * Note, this can only be called on unexported SE Device Object.
+ + */
+ +int se_dev_set_queue_depth(struct se_device *dev, u32 queue_depth)
+ +{
+ +	if (dev->export_count) {
+ +		pr_err("dev[%p]: Unable to change SE Device TCQ while"
+ +			" export_count is %d\n",
+ +			dev, dev->export_count);
+ +		return -EINVAL;
+ +	}
+ +	if (!queue_depth) {
+ +		pr_err("dev[%p]: Illegal ZERO value for queue"
+ +			"_depth\n", dev);
+ +		return -EINVAL;
+ +	}
+ +
+ +	if (queue_depth > dev->dev_attrib.queue_depth) {
+ +		if (queue_depth > dev->dev_attrib.hw_queue_depth) {
+ +			pr_err("dev[%p]: Passed queue_depth:"
+ +				" %u exceeds TCM/SE_Device MAX"
+ +				" TCQ: %u\n", dev, queue_depth,
+ +				dev->dev_attrib.hw_queue_depth);
+ +			return -EINVAL;
+ +		}
+ +	}
+ +	dev->dev_attrib.queue_depth = dev->queue_depth = queue_depth;
+ +	pr_debug("dev[%p]: SE Device TCQ Depth changed to: %u\n",
+ +			dev, queue_depth);
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(se_dev_set_queue_depth);
+ +
+ +int se_dev_set_optimal_sectors(struct se_device *dev, u32 optimal_sectors)
+ +{
+ +	if (dev->export_count) {
+ +		pr_err("dev[%p]: Unable to change SE Device"
+ +			" optimal_sectors while export_count is %d\n",
+ +			dev, dev->export_count);
+ +		return -EINVAL;
+ +	}
+ +	if (optimal_sectors > dev->dev_attrib.hw_max_sectors) {
+ +		pr_err("dev[%p]: Passed optimal_sectors %u cannot be"
+ +			" greater than hw_max_sectors: %u\n", dev,
+ +			optimal_sectors, dev->dev_attrib.hw_max_sectors);
+ +		return -EINVAL;
+ +	}
+ +
+ +	dev->dev_attrib.optimal_sectors = optimal_sectors;
+ +	pr_debug("dev[%p]: SE Device optimal_sectors changed to %u\n",
+ +			dev, optimal_sectors);
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(se_dev_set_optimal_sectors);
+ +
+ +int se_dev_set_block_size(struct se_device *dev, u32 block_size)
+ +{
+ +	if (dev->export_count) {
+ +		pr_err("dev[%p]: Unable to change SE Device block_size"
+ +			" while export_count is %d\n",
+ +			dev, dev->export_count);
+ +		return -EINVAL;
+ +	}
+ +
+ +	if ((block_size != 512) &&
+ +	    (block_size != 1024) &&
+ +	    (block_size != 2048) &&
+ +	    (block_size != 4096)) {
+ +		pr_err("dev[%p]: Illegal value for block_device: %u"
+ +			" for SE device, must be 512, 1024, 2048 or 4096\n",
+ +			dev, block_size);
+ +		return -EINVAL;
+ +	}
+ +
+ +	dev->dev_attrib.block_size = block_size;
+ +	pr_debug("dev[%p]: SE Device block_size changed to %u\n",
+ +			dev, block_size);
+ +
+ +	if (dev->dev_attrib.max_bytes_per_io)
+ +		dev->dev_attrib.hw_max_sectors =
+ +			dev->dev_attrib.max_bytes_per_io / block_size;
+ +
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(se_dev_set_block_size);
+ +
+ +struct se_lun *core_dev_add_lun(
+  	struct se_portal_group *tpg,
+  	struct se_device *dev,
+ -	struct se_lun *lun)
+ +	u32 unpacked_lun)
+  {
+ +	struct se_lun *lun;
+  	int rc;
+  
+ +	lun = core_tpg_alloc_lun(tpg, unpacked_lun);
+ +	if (IS_ERR(lun))
+ +		return lun;
+ +
+ +	rc = core_tpg_add_lun(tpg, lun,
+ +				TRANSPORT_LUNFLAGS_READ_WRITE, dev);
+++=======
++ 	rc = core_tpg_add_lun(tpg, lun, false, dev);
+++>>>>>>> 03a68b44faff (target: Remove enum transport_lunflags_table)
+  	if (rc < 0)
+ -		return rc;
+ +		return ERR_PTR(rc);
+  
+ -	pr_debug("%s_TPG[%u]_LUN[%llu] - Activated %s Logical Unit from"
+ +	pr_debug("%s_TPG[%u]_LUN[%u] - Activated %s Logical Unit from"
+  		" CORE HBA: %u\n", tpg->se_tpg_tfo->get_fabric_name(),
+  		tpg->se_tpg_tfo->tpg_get_tag(tpg), lun->unpacked_lun,
+  		tpg->se_tpg_tfo->get_fabric_name(), dev->se_hba->hba_id);
+@@@ -1337,22 -622,16 +1497,27 @@@ struct se_lun_acl *core_dev_init_initia
+  int core_dev_add_initiator_node_lun_acl(
+  	struct se_portal_group *tpg,
+  	struct se_lun_acl *lacl,
+++<<<<<<< HEAD
+ +	u32 unpacked_lun,
+ +	u32 lun_access)
+++=======
++ 	struct se_lun *lun,
++ 	bool lun_access_ro)
+++>>>>>>> 03a68b44faff (target: Remove enum transport_lunflags_table)
+  {
+ -	struct se_node_acl *nacl = lacl->se_lun_nacl;
+ -	/*
+ -	 * rcu_dereference_raw protected by se_lun->lun_group symlink
+ -	 * reference to se_device->dev_group.
+ -	 */
+ -	struct se_device *dev = rcu_dereference_raw(lun->lun_se_dev);
+ +	struct se_lun *lun;
+ +	struct se_node_acl *nacl;
+  
+ +	lun = core_dev_get_lun(tpg, unpacked_lun);
+ +	if (!lun) {
+ +		pr_err("%s Logical Unit Number: %u is not active on"
+ +			" Target Portal Group: %hu, ignoring request.\n",
+ +			tpg->se_tpg_tfo->get_fabric_name(), unpacked_lun,
+ +			tpg->se_tpg_tfo->tpg_get_tag(tpg));
+ +		return -EINVAL;
+ +	}
+ +
+ +	nacl = lacl->se_lun_nacl;
+  	if (!nacl)
+  		return -EINVAL;
+  
+@@@ -1363,19 -641,14 +1527,25 @@@
+  	lacl->se_lun = lun;
+  
+  	if (core_enable_device_list_for_node(lun, lacl, lacl->mapped_lun,
+- 			lun_access, nacl, tpg) < 0)
++ 			lun_access_ro, nacl, tpg) < 0)
+  		return -EINVAL;
+  
+ -	pr_debug("%s_TPG[%hu]_LUN[%llu->%llu] - Added %s ACL for "
+ +	spin_lock(&lun->lun_acl_lock);
+ +	list_add_tail(&lacl->lacl_list, &lun->lun_acl_list);
+ +	atomic_inc_mb(&lun->lun_acl_count);
+ +	spin_unlock(&lun->lun_acl_lock);
+ +
+ +	pr_debug("%s_TPG[%hu]_LUN[%u->%u] - Added %s ACL for "
+  		" InitiatorNode: %s\n", tpg->se_tpg_tfo->get_fabric_name(),
+++<<<<<<< HEAD
+ +		tpg->se_tpg_tfo->tpg_get_tag(tpg), unpacked_lun, lacl->mapped_lun,
+ +		(lun_access & TRANSPORT_LUNFLAGS_READ_WRITE) ? "RW" : "RO",
+ +		lacl->initiatorname);
+++=======
++ 		tpg->se_tpg_tfo->tpg_get_tag(tpg), lun->unpacked_lun, lacl->mapped_lun,
++ 		lun_access_ro ? "RO" : "RW",
++ 		nacl->initiatorname);
+++>>>>>>> 03a68b44faff (target: Remove enum transport_lunflags_table)
+  	/*
+  	 * Check to see if there are any existing persistent reservation APTPL
+  	 * pre-registrations that need to be enabled for this LUN ACL..
+diff --cc drivers/target/target_core_fabric_configfs.c
+index 0c3f90130b7d,8cc68be71230..000000000000
+--- a/drivers/target/target_core_fabric_configfs.c
++++ b/drivers/target/target_core_fabric_configfs.c
+@@@ -69,7 -78,7 +69,11 @@@ static int target_fabric_mappedlun_link
+  			struct se_lun_acl, se_lun_group);
+  	struct se_portal_group *se_tpg;
+  	struct config_item *nacl_ci, *tpg_ci, *tpg_ci_s, *wwn_ci, *wwn_ci_s;
+++<<<<<<< HEAD
+ +	int ret = 0, lun_access;
+++=======
++ 	bool lun_access_ro;
+++>>>>>>> 03a68b44faff (target: Remove enum transport_lunflags_table)
+  
+  	if (lun->lun_link_magic != SE_LUN_LINK_MAGIC) {
+  		pr_err("Bad lun->lun_link_magic, not a valid lun_ci pointer:"
+@@@ -107,106 -115,87 +111,133 @@@
+  	}
+  	/*
+  	 * If this struct se_node_acl was dynamically generated with
+- 	 * tpg_1/attrib/generate_node_acls=1, use the existing deve->lun_flags,
+- 	 * which be will write protected (READ-ONLY) when
++ 	 * tpg_1/attrib/generate_node_acls=1, use the existing
++ 	 * deve->lun_access_ro value, which will be true when
+  	 * tpg_1/attrib/demo_mode_write_protect=1
+  	 */
+++<<<<<<< HEAD
+ +	spin_lock_irq(&lacl->se_lun_nacl->device_list_lock);
+ +	deve = lacl->se_lun_nacl->device_list[lacl->mapped_lun];
+ +	if (deve->lun_flags & TRANSPORT_LUNFLAGS_INITIATOR_ACCESS)
+ +		lun_access = deve->lun_flags;
+++=======
++ 	rcu_read_lock();
++ 	deve = target_nacl_find_deve(lacl->se_lun_nacl, lacl->mapped_lun);
++ 	if (deve)
++ 		lun_access_ro = deve->lun_access_ro;
+++>>>>>>> 03a68b44faff (target: Remove enum transport_lunflags_table)
+  	else
+- 		lun_access =
++ 		lun_access_ro =
+  			(se_tpg->se_tpg_tfo->tpg_check_prod_mode_write_protect(
+++<<<<<<< HEAD
+ +				se_tpg)) ? TRANSPORT_LUNFLAGS_READ_ONLY :
+ +					   TRANSPORT_LUNFLAGS_READ_WRITE;
+ +	spin_unlock_irq(&lacl->se_lun_nacl->device_list_lock);
+++=======
++ 				se_tpg)) ? true : false;
++ 	rcu_read_unlock();
+++>>>>>>> 03a68b44faff (target: Remove enum transport_lunflags_table)
+  	/*
+  	 * Determine the actual mapped LUN value user wants..
+  	 *
+  	 * This value is what the SCSI Initiator actually sees the
+ -	 * $FABRIC/$WWPN/$TPGT/lun/lun_* as on their SCSI Initiator Ports.
+ +	 * iscsi/$IQN/$TPGT/lun/lun_* as on their SCSI Initiator Ports.
+  	 */
+++<<<<<<< HEAD
+ +	ret = core_dev_add_initiator_node_lun_acl(se_tpg, lacl,
+ +			lun->unpacked_lun, lun_access);
+ +
+ +	return (ret < 0) ? -EINVAL : 0;
+++=======
++ 	return core_dev_add_initiator_node_lun_acl(se_tpg, lacl, lun, lun_access_ro);
+++>>>>>>> 03a68b44faff (target: Remove enum transport_lunflags_table)
+  }
+  
+  static int target_fabric_mappedlun_unlink(
+  	struct config_item *lun_acl_ci,
+  	struct config_item *lun_ci)
+  {
+ +	struct se_lun *lun;
+  	struct se_lun_acl *lacl = container_of(to_config_group(lun_acl_ci),
+  			struct se_lun_acl, se_lun_group);
+ -	struct se_lun *lun = container_of(to_config_group(lun_ci),
+ -			struct se_lun, lun_group);
+ +	struct se_node_acl *nacl = lacl->se_lun_nacl;
+ +	struct se_dev_entry *deve = nacl->device_list[lacl->mapped_lun];
+ +	struct se_portal_group *se_tpg;
+ +	/*
+ +	 * Determine if the underlying MappedLUN has already been released..
+ +	 */
+ +	if (!deve->se_lun)
+ +		return 0;
+  
+ -	return core_dev_del_initiator_node_lun_acl(lun, lacl);
+ -}
+ +	lun = container_of(to_config_group(lun_ci), struct se_lun, lun_group);
+ +	se_tpg = lun->lun_sep->sep_tpg;
+  
+ -static struct se_lun_acl *item_to_lun_acl(struct config_item *item)
+ -{
+ -	return container_of(to_config_group(item), struct se_lun_acl,
+ -			se_lun_group);
+ +	core_dev_del_initiator_node_lun_acl(se_tpg, lun, lacl);
+ +	return 0;
+  }
+  
+ -static ssize_t target_fabric_mappedlun_write_protect_show(
+ -		struct config_item *item, char *page)
+ +CONFIGFS_EATTR_STRUCT(target_fabric_mappedlun, se_lun_acl);
+ +#define TCM_MAPPEDLUN_ATTR(_name, _mode)				\
+ +static struct target_fabric_mappedlun_attribute target_fabric_mappedlun_##_name = \
+ +	__CONFIGFS_EATTR(_name, _mode,					\
+ +	target_fabric_mappedlun_show_##_name,				\
+ +	target_fabric_mappedlun_store_##_name);
+ +
+ +static ssize_t target_fabric_mappedlun_show_write_protect(
+ +	struct se_lun_acl *lacl,
+ +	char *page)
+  {
+ -	struct se_lun_acl *lacl = item_to_lun_acl(item);
+  	struct se_node_acl *se_nacl = lacl->se_lun_nacl;
+  	struct se_dev_entry *deve;
+ -	ssize_t len = 0;
+ -
+ +	ssize_t len;
+ +
+++<<<<<<< HEAD
+ +	spin_lock_irq(&se_nacl->device_list_lock);
+ +	deve = se_nacl->device_list[lacl->mapped_lun];
+ +	len = sprintf(page, "%d\n",
+ +			(deve->lun_flags & TRANSPORT_LUNFLAGS_READ_ONLY) ?
+ +			1 : 0);
+ +	spin_unlock_irq(&se_nacl->device_list_lock);
+++=======
++ 	rcu_read_lock();
++ 	deve = target_nacl_find_deve(se_nacl, lacl->mapped_lun);
++ 	if (deve) {
++ 		len = sprintf(page, "%d\n", deve->lun_access_ro);
++ 	}
++ 	rcu_read_unlock();
+++>>>>>>> 03a68b44faff (target: Remove enum transport_lunflags_table)
+  
+  	return len;
+  }
+  
+ -static ssize_t target_fabric_mappedlun_write_protect_store(
+ -		struct config_item *item, const char *page, size_t count)
+ +static ssize_t target_fabric_mappedlun_store_write_protect(
+ +	struct se_lun_acl *lacl,
+ +	const char *page,
+ +	size_t count)
+  {
+ -	struct se_lun_acl *lacl = item_to_lun_acl(item);
+  	struct se_node_acl *se_nacl = lacl->se_lun_nacl;
+  	struct se_portal_group *se_tpg = se_nacl->se_tpg;
+- 	unsigned long op;
++ 	unsigned long wp;
+  	int ret;
+  
+- 	ret = kstrtoul(page, 0, &op);
++ 	ret = kstrtoul(page, 0, &wp);
+  	if (ret)
+  		return ret;
+  
+- 	if ((op != 1) && (op != 0))
++ 	if ((wp != 1) && (wp != 0))
+  		return -EINVAL;
+  
+- 	core_update_device_list_access(lacl->mapped_lun, (op) ?
+- 			TRANSPORT_LUNFLAGS_READ_ONLY :
+- 			TRANSPORT_LUNFLAGS_READ_WRITE,
+- 			lacl->se_lun_nacl);
++ 	/* wp=1 means lun_access_ro=true */
++ 	core_update_device_list_access(lacl->mapped_lun, wp, lacl->se_lun_nacl);
+  
+  	pr_debug("%s_ConfigFS: Changed Initiator ACL: %s"
+ -		" Mapped LUN: %llu Write Protect bit to %s\n",
+ +		" Mapped LUN: %u Write Protect bit to %s\n",
+  		se_tpg->se_tpg_tfo->get_fabric_name(),
+++<<<<<<< HEAD
+ +		lacl->initiatorname, lacl->mapped_lun, (op) ? "ON" : "OFF");
+++=======
++ 		se_nacl->initiatorname, lacl->mapped_lun, (wp) ? "ON" : "OFF");
+++>>>>>>> 03a68b44faff (target: Remove enum transport_lunflags_table)
+  
+  	return count;
+  
+diff --cc drivers/target/target_core_internal.h
+index 874a9bc988d8,040cf5202e54..000000000000
+--- a/drivers/target/target_core_internal.h
++++ b/drivers/target/target_core_internal.h
+@@@ -11,28 -55,27 +11,43 @@@ extern struct configfs_subsystem *targe
+  extern struct mutex g_device_mutex;
+  extern struct list_head g_device_list;
+  
+ -int	core_alloc_rtpi(struct se_lun *lun, struct se_device *dev);
+  struct se_dev_entry *core_get_se_deve_from_rtpi(struct se_node_acl *, u16);
+ -void	target_pr_kref_release(struct kref *);
+ -void	core_free_device_list_for_node(struct se_node_acl *,
+ +int	core_free_device_list_for_node(struct se_node_acl *,
+  		struct se_portal_group *);
+++<<<<<<< HEAD
+ +void	core_update_device_list_access(u32, u32, struct se_node_acl *);
+ +int	core_enable_device_list_for_node(struct se_lun *, struct se_lun_acl *,
+ +		u32, u32, struct se_node_acl *, struct se_portal_group *);
+ +int	core_disable_device_list_for_node(struct se_lun *, struct se_lun_acl *,
+ +		u32, u32, struct se_node_acl *, struct se_portal_group *);
+++=======
++ void	core_update_device_list_access(u64, bool, struct se_node_acl *);
++ struct se_dev_entry *target_nacl_find_deve(struct se_node_acl *, u64);
++ int	core_enable_device_list_for_node(struct se_lun *, struct se_lun_acl *,
++ 		u64, bool, struct se_node_acl *, struct se_portal_group *);
++ void	core_disable_device_list_for_node(struct se_lun *, struct se_dev_entry *,
++ 		struct se_node_acl *, struct se_portal_group *);
+++>>>>>>> 03a68b44faff (target: Remove enum transport_lunflags_table)
+  void	core_clear_lun_from_tpg(struct se_lun *, struct se_portal_group *);
+ -int	core_dev_add_lun(struct se_portal_group *, struct se_device *,
+ -		struct se_lun *lun);
+ +int	core_dev_export(struct se_device *, struct se_portal_group *,
+ +		struct se_lun *);
+ +void	core_dev_unexport(struct se_device *, struct se_portal_group *,
+ +		struct se_lun *);
+ +struct se_lun *core_dev_add_lun(struct se_portal_group *, struct se_device *, u32);
+  void	core_dev_del_lun(struct se_portal_group *, struct se_lun *);
+ +struct se_lun *core_get_lun_from_tpg(struct se_portal_group *, u32);
+  struct se_lun_acl *core_dev_init_initiator_node_lun_acl(struct se_portal_group *,
+ -		struct se_node_acl *, u64, int *);
+ +		struct se_node_acl *, u32, int *);
+  int	core_dev_add_initiator_node_lun_acl(struct se_portal_group *,
+++<<<<<<< HEAD
+ +		struct se_lun_acl *, u32, u32);
+ +int	core_dev_del_initiator_node_lun_acl(struct se_portal_group *,
+ +		struct se_lun *, struct se_lun_acl *);
+++=======
++ 		struct se_lun_acl *, struct se_lun *lun, bool);
++ int	core_dev_del_initiator_node_lun_acl(struct se_lun *,
++ 		struct se_lun_acl *);
+++>>>>>>> 03a68b44faff (target: Remove enum transport_lunflags_table)
+  void	core_dev_free_initiator_node_lun_acl(struct se_portal_group *,
+  		struct se_lun_acl *lacl);
+  int	core_dev_setup_virtual_lun0(void);
+@@@ -56,12 -114,16 +71,12 @@@ extern struct se_device *g_lun0_dev
+  
+  struct se_node_acl *__core_tpg_get_initiator_node_acl(struct se_portal_group *tpg,
+  		const char *);
+ -void	core_tpg_add_node_to_devs(struct se_node_acl *, struct se_portal_group *,
+ -				  struct se_lun *);
+ +void	core_tpg_add_node_to_devs(struct se_node_acl *, struct se_portal_group *);
+  void	core_tpg_wait_for_nacl_pr_ref(struct se_node_acl *);
+ -struct se_lun *core_tpg_alloc_lun(struct se_portal_group *, u64);
+ +struct se_lun *core_tpg_alloc_lun(struct se_portal_group *, u32);
+  int	core_tpg_add_lun(struct se_portal_group *, struct se_lun *,
+- 		u32, struct se_device *);
++ 		bool, struct se_device *);
+  void core_tpg_remove_lun(struct se_portal_group *, struct se_lun *);
+ -struct se_node_acl *core_tpg_add_initiator_node_acl(struct se_portal_group *tpg,
+ -		const char *initiatorname);
+ -void core_tpg_del_initiator_node_acl(struct se_node_acl *acl);
+  
+  /* target_core_transport.c */
+  extern struct kmem_cache *se_tmr_req_cache;
+diff --cc drivers/target/target_core_spc.c
+index 819803d44776,2a91ed3ef380..000000000000
+--- a/drivers/target/target_core_spc.c
++++ b/drivers/target/target_core_spc.c
+@@@ -1002,13 -1007,15 +1002,17 @@@ static sense_reason_t spc_emulate_modes
+  	length = ten ? 3 : 2;
+  
+  	/* DEVICE-SPECIFIC PARAMETER */
+++<<<<<<< HEAD
+ +	if ((cmd->se_lun->lun_access & TRANSPORT_LUNFLAGS_READ_ONLY) ||
+ +	    (cmd->se_deve &&
+ +	     (cmd->se_deve->lun_flags & TRANSPORT_LUNFLAGS_READ_ONLY)))
+++=======
++ 	if (cmd->se_lun->lun_access_ro || target_lun_is_rdonly(cmd))
+++>>>>>>> 03a68b44faff (target: Remove enum transport_lunflags_table)
+  		spc_modesense_write_protect(&buf[length], type);
+  
+ -	/*
+ -	 * SBC only allows us to enable FUA and DPO together.  Fortunately
+ -	 * DPO is explicitly specified as a hint, so a noop is a perfectly
+ -	 * valid implementation.
+ -	 */
+ -	if (target_check_fua(dev))
+ +	if ((se_dev_check_wce(dev)) &&
+ +	    (dev->dev_attrib.emulate_fua_write > 0))
+  		spc_modesense_dpofua(&buf[length], type);
+  
+  	++length;
+diff --cc drivers/target/target_core_tpg.c
+index 0696de9553d3,ddf046080dc3..000000000000
+--- a/drivers/target/target_core_tpg.c
++++ b/drivers/target/target_core_tpg.c
+@@@ -125,10 -118,10 +125,14 @@@ EXPORT_SYMBOL(core_tpg_get_initiator_no
+   */
+  void core_tpg_add_node_to_devs(
+  	struct se_node_acl *acl,
+ -	struct se_portal_group *tpg,
+ -	struct se_lun *lun_orig)
+ +	struct se_portal_group *tpg)
+  {
+++<<<<<<< HEAD
+ +	int i = 0;
+ +	u32 lun_access = 0;
+++=======
++ 	bool lun_access_ro = true;
+++>>>>>>> 03a68b44faff (target: Remove enum transport_lunflags_table)
+  	struct se_lun *lun;
+  	struct se_device *dev;
+  
+@@@ -153,20 -144,19 +157,23 @@@
+  			 * demo mode.
+  			 */
+  			if (dev->transport->get_device_type(dev) == TYPE_DISK)
+- 				lun_access = TRANSPORT_LUNFLAGS_READ_ONLY;
++ 				lun_access_ro = true;
+  			else
+- 				lun_access = TRANSPORT_LUNFLAGS_READ_WRITE;
++ 				lun_access_ro = false;
+  		}
+  
+ -		pr_debug("TARGET_CORE[%s]->TPG[%u]_LUN[%llu] - Adding %s"
+ +		pr_debug("TARGET_CORE[%s]->TPG[%u]_LUN[%u] - Adding %s"
+  			" access for LUN in Demo Mode\n",
+  			tpg->se_tpg_tfo->get_fabric_name(),
+  			tpg->se_tpg_tfo->tpg_get_tag(tpg), lun->unpacked_lun,
+- 			(lun_access == TRANSPORT_LUNFLAGS_READ_WRITE) ?
+- 			"READ-WRITE" : "READ-ONLY");
++ 			lun_access_ro ? "READ-ONLY" : "READ-WRITE");
+  
+  		core_enable_device_list_for_node(lun, NULL, lun->unpacked_lun,
+++<<<<<<< HEAD
+ +				lun_access, acl, tpg);
+++=======
++ 						 lun_access_ro, acl, tpg);
+++>>>>>>> 03a68b44faff (target: Remove enum transport_lunflags_table)
+  		/*
+  		 * Check to see if there are any existing persistent reservation
+  		 * APTPL pre-registrations that need to be enabled for this dynamic
+@@@ -710,15 -511,20 +717,28 @@@ int core_tpg_register
+  	INIT_LIST_HEAD(&se_tpg->acl_node_list);
+  	INIT_LIST_HEAD(&se_tpg->se_tpg_node);
+  	INIT_LIST_HEAD(&se_tpg->tpg_sess_list);
+ +	spin_lock_init(&se_tpg->acl_node_lock);
+  	spin_lock_init(&se_tpg->session_lock);
+ -	mutex_init(&se_tpg->tpg_lun_mutex);
+ -	mutex_init(&se_tpg->acl_node_mutex);
+ -
+ +	spin_lock_init(&se_tpg->tpg_lun_lock);
+ +
+++<<<<<<< HEAD
+ +	if (se_tpg->se_tpg_type == TRANSPORT_TPG_TYPE_NORMAL) {
+ +		if (core_tpg_setup_virtual_lun0(se_tpg) < 0) {
+ +			array_free(se_tpg->tpg_lun_list,
+ +				   TRANSPORT_MAX_LUNS_PER_TPG);
+ +			return -ENOMEM;
+++=======
++ 	if (se_tpg->proto_id >= 0) {
++ 		se_tpg->tpg_virt_lun0 = core_tpg_alloc_lun(se_tpg, 0);
++ 		if (IS_ERR(se_tpg->tpg_virt_lun0))
++ 			return PTR_ERR(se_tpg->tpg_virt_lun0);
++ 
++ 		ret = core_tpg_add_lun(se_tpg, se_tpg->tpg_virt_lun0,
++ 				true, g_lun0_dev);
++ 		if (ret < 0) {
++ 			kfree(se_tpg->tpg_virt_lun0);
++ 			return ret;
+++>>>>>>> 03a68b44faff (target: Remove enum transport_lunflags_table)
+  		}
+  	}
+  
+@@@ -823,20 -623,39 +843,43 @@@ int core_tpg_add_lun
+  	ret = percpu_ref_init(&lun->lun_ref, core_tpg_lun_ref_release, 0,
+  			      GFP_KERNEL);
+  	if (ret < 0)
+ -		goto out;
+ +		return ret;
+  
+ -	ret = core_alloc_rtpi(lun, dev);
+ -	if (ret)
+ -		goto out_kill_ref;
+ +	ret = core_dev_export(dev, tpg, lun);
+ +	if (ret < 0) {
+ +		percpu_ref_exit(&lun->lun_ref);
+ +		return ret;
+ +	}
+  
+++<<<<<<< HEAD
+ +	spin_lock(&tpg->tpg_lun_lock);
+ +	lun->lun_access = lun_access;
+ +	lun->lun_status = TRANSPORT_LUN_STATUS_ACTIVE;
+ +	spin_unlock(&tpg->tpg_lun_lock);
+++=======
++ 	if (!(dev->transport->transport_flags & TRANSPORT_FLAG_PASSTHROUGH) &&
++ 	    !(dev->se_hba->hba_flags & HBA_FLAGS_INTERNAL_USE))
++ 		target_attach_tg_pt_gp(lun, dev->t10_alua.default_tg_pt_gp);
++ 
++ 	mutex_lock(&tpg->tpg_lun_mutex);
++ 
++ 	spin_lock(&dev->se_port_lock);
++ 	lun->lun_index = dev->dev_index;
++ 	rcu_assign_pointer(lun->lun_se_dev, dev);
++ 	dev->export_count++;
++ 	list_add_tail(&lun->lun_dev_link, &dev->dev_sep_list);
++ 	spin_unlock(&dev->se_port_lock);
++ 
++ 	if (dev->dev_flags & DF_READ_ONLY)
++ 		lun->lun_access_ro = true;
++ 	else
++ 		lun->lun_access_ro = lun_access_ro;
++ 	if (!(dev->se_hba->hba_flags & HBA_FLAGS_INTERNAL_USE))
++ 		hlist_add_head_rcu(&lun->link, &tpg->tpg_lun_hlist);
++ 	mutex_unlock(&tpg->tpg_lun_mutex);
+++>>>>>>> 03a68b44faff (target: Remove enum transport_lunflags_table)
+  
+  	return 0;
+ -
+ -out_kill_ref:
+ -	percpu_ref_exit(&lun->lun_ref);
+ -out:
+ -	return ret;
+  }
+  
+  void core_tpg_remove_lun(
+diff --cc include/target/target_core_base.h
+index 6a27f0cf6579,fca03b993bec..000000000000
+--- a/include/target/target_core_base.h
++++ b/include/target/target_core_base.h
+@@@ -168,18 -139,11 +168,21 @@@ enum se_cmd_flags_table 
+  	SCF_PASSTHROUGH_SG_TO_MEM_NOALLOC = 0x00020000,
+  	SCF_COMPARE_AND_WRITE		= 0x00080000,
+  	SCF_COMPARE_AND_WRITE_POST	= 0x00100000,
+ -	SCF_PASSTHROUGH_PROT_SG_TO_MEM_NOALLOC = 0x00200000,
+ -	SCF_ACK_KREF			= 0x00400000,
+ -	SCF_USE_CPUID			= 0x00800000,
+ +	SCF_CMD_XCOPY_PASSTHROUGH	= 0x00200000,
+ +	SCF_PASSTHROUGH_PROT_SG_TO_MEM_NOALLOC = 0x00400000,
+ +};
+ +
+++<<<<<<< HEAD
+ +/* struct se_dev_entry->lun_flags and struct se_lun->lun_access */
+ +enum transport_lunflags_table {
+ +	TRANSPORT_LUNFLAGS_NO_ACCESS		= 0x00,
+ +	TRANSPORT_LUNFLAGS_INITIATOR_ACCESS	= 0x01,
+ +	TRANSPORT_LUNFLAGS_READ_ONLY		= 0x02,
+ +	TRANSPORT_LUNFLAGS_READ_WRITE		= 0x04,
+  };
+  
+++=======
+++>>>>>>> 03a68b44faff (target: Remove enum transport_lunflags_table)
+  /*
+   * Used by transport_send_check_condition_and_sense()
+   * to signal which ASC/ASCQ sense payload should be built.
+@@@ -646,24 -628,28 +649,31 @@@ struct se_lun_acl 
+  };
+  
+  struct se_dev_entry {
+++<<<<<<< HEAD
+ +	bool			def_pr_registered;
+ +	/* See transport_lunflags_table */
+ +	u32			lun_flags;
+ +	u32			mapped_lun;
+ +	u32			total_cmds;
+ +	u64			pr_res_key;
+ +	u64			creation_time;
+++=======
++ 	u64			mapped_lun;
++ 	u64			pr_res_key;
++ 	u64			creation_time;
++ 	bool			lun_access_ro;
+++>>>>>>> 03a68b44faff (target: Remove enum transport_lunflags_table)
+  	u32			attach_count;
+ -	atomic_long_t		total_cmds;
+ -	atomic_long_t		read_bytes;
+ -	atomic_long_t		write_bytes;
+ +	u64			read_bytes;
+ +	u64			write_bytes;
+  	atomic_t		ua_count;
+  	/* Used for PR SPEC_I_PT=1 and REGISTER_AND_MOVE */
+ -	struct kref		pr_kref;
+ -	struct completion	pr_comp;
+ -	struct se_lun_acl __rcu	*se_lun_acl;
+ +	atomic_t		pr_ref_count;
+ +	struct se_lun_acl	*se_lun_acl;
+  	spinlock_t		ua_lock;
+ -	struct se_lun __rcu	*se_lun;
+ -#define DEF_PR_REG_ACTIVE		1
+ -	unsigned long		deve_flags;
+ +	struct se_lun		*se_lun;
+  	struct list_head	alua_port_list;
+ -	struct list_head	lun_link;
+  	struct list_head	ua_list;
+ -	struct hlist_node	link;
+ -	struct rcu_head		rcu_head;
+  };
+  
+  struct se_dev_attrib {
+@@@ -708,21 -695,40 +718,29 @@@ struct se_port_stat_grps 
+  	struct config_group scsi_transport_group;
+  };
+  
+ -struct scsi_port_stats {
+ -	atomic_long_t	cmd_pdus;
+ -	atomic_long_t	tx_data_octets;
+ -	atomic_long_t	rx_data_octets;
+ -};
+ -
+  struct se_lun {
+ -	u64			unpacked_lun;
+  #define SE_LUN_LINK_MAGIC			0xffff7771
+  	u32			lun_link_magic;
+++<<<<<<< HEAD
+ +	/* See transport_lun_status_table */
+ +	enum transport_lun_status_table lun_status;
+ +	u32			lun_access;
+ +	u32			lun_flags;
+ +	u32			unpacked_lun;
+++=======
++ 	bool			lun_access_ro;
++ 	u32			lun_index;
++ 
++ 	/* RELATIVE TARGET PORT IDENTIFER */
++ 	u16			lun_rtpi;
+++>>>>>>> 03a68b44faff (target: Remove enum transport_lunflags_table)
+  	atomic_t		lun_acl_count;
+ -	struct se_device __rcu	*lun_se_dev;
+ -
+ -	struct list_head	lun_deve_list;
+ -	spinlock_t		lun_deve_lock;
+ -
+ -	/* ALUA state */
+ -	int			lun_tg_pt_secondary_stat;
+ -	int			lun_tg_pt_secondary_write_md;
+ -	atomic_t		lun_tg_pt_secondary_offline;
+ -	struct mutex		lun_tg_pt_md_mutex;
+ -
+ -	/* ALUA target port group linkage */
+ -	struct list_head	lun_tg_pt_gp_link;
+ -	struct t10_alua_tg_pt_gp *lun_tg_pt_gp;
+ -	spinlock_t		lun_tg_pt_gp_lock;
+ -
+ -	struct se_portal_group	*lun_tpg;
+ -	struct scsi_port_stats	lun_stats;
+ +	spinlock_t		lun_acl_lock;
+ +	spinlock_t		lun_sep_lock;
+ +	struct completion	lun_shutdown_comp;
+ +	struct list_head	lun_acl_list;
+ +	struct se_device	*lun_se_dev;
+ +	struct se_port		*lun_sep;
+  	struct config_group	lun_group;
+  	struct se_port_stat_grps port_stat_grps;
+  	struct completion	lun_ref_comp;
+* Unmerged path drivers/target/target_core_device.c
+* Unmerged path drivers/target/target_core_fabric_configfs.c
+* Unmerged path drivers/target/target_core_internal.h
+* Unmerged path drivers/target/target_core_spc.c
+* Unmerged path drivers/target/target_core_tpg.c
+* Unmerged path include/target/target_core_base.h
