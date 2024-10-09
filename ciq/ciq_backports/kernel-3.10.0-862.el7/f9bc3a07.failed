@@ -1,0 +1,281 @@
+dax: add tracepoint to dax_writeback_one()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Ross Zwisler <ross.zwisler@linux.intel.com>
+commit f9bc3a07539bc80b4da9ff2f5d6c13d5c7a4f073
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/f9bc3a07.failed
+
+Add a tracepoint to dax_writeback_one(), following the same logging
+conventions as the rest of DAX.
+
+Here is an example range writeback which ends up flushing one PMD and
+one PTE:
+
+  test-1265  [003] ....
+   496.615250: dax_writeback_range: dev 259:0 ino 0x1003 pgoff 0x0-0x7ffffffffffff
+
+  test-1265  [003] ....
+   496.616263: dax_writeback_one: dev 259:0 ino 0x1003 pgoff 0x0 pglen 0x200
+
+  test-1265  [003] ....
+   496.616270: dax_writeback_one: dev 259:0 ino 0x1003 pgoff 0x305 pglen 0x1
+
+  test-1265  [003] ....
+   496.616272: dax_writeback_range_done: dev 259:0 ino 0x1003 pgoff 0x0-0x7ffffffffffff
+
+[akpm@linux-foundation.org: struct blk_dax_ctl has disappeared]
+Link: http://lkml.kernel.org/r/20170221195116.13278-6-ross.zwisler@linux.intel.com
+	Signed-off-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Matthew Wilcox <mawilcox@microsoft.com>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit f9bc3a07539bc80b4da9ff2f5d6c13d5c7a4f073)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+#	include/trace/events/fs_dax.h
+diff --cc fs/dax.c
+index 1dfecdfb6245,9bec30e06211..000000000000
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@@ -673,69 -653,184 +673,116 @@@ static void *dax_insert_mapping_entry(s
+  		if (mapping->a_ops->freepage)
+  			mapping->a_ops->freepage(entry);
+  		unlock_page(entry);
+ -		put_page(entry);
+ +		page_cache_release(entry);
+  	}
+  	return new_entry;
+ -}
+  
+ -static inline unsigned long
+ -pgoff_address(pgoff_t pgoff, struct vm_area_struct *vma)
+ -{
+ -	unsigned long address;
+ -
+ -	address = vma->vm_start + ((pgoff - vma->vm_pgoff) << PAGE_SHIFT);
+ -	VM_BUG_ON_VMA(address < vma->vm_start || address >= vma->vm_end, vma);
+ -	return address;
+  }
+  
+ -/* Walk all mappings of a given index of a file and writeprotect them */
+ -static void dax_mapping_entry_mkclean(struct address_space *mapping,
+ -				      pgoff_t index, unsigned long pfn)
+ +static int dax_writeback_one(struct block_device *bdev,
+ +		struct address_space *mapping, pgoff_t index, void *entry)
+  {
+ -	struct vm_area_struct *vma;
+ -	pte_t pte, *ptep = NULL;
+ -	pmd_t *pmdp = NULL;
+ -	spinlock_t *ptl;
+ -	bool changed;
+ -
+ -	i_mmap_lock_read(mapping);
+ -	vma_interval_tree_foreach(vma, &mapping->i_mmap, index, index) {
+ -		unsigned long address;
+ -
+ -		cond_resched();
+ -
+ -		if (!(vma->vm_flags & VM_SHARED))
+ -			continue;
+ +	struct radix_tree_root *page_tree = &mapping->page_tree;
+ +	int type = RADIX_DAX_TYPE(entry);
+ +	struct radix_tree_node *node;
+ +	struct blk_dax_ctl dax;
+ +	void **slot;
+ +	int ret = 0;
+  
+ -		address = pgoff_address(index, vma);
+ -		changed = false;
+ -		if (follow_pte_pmd(vma->vm_mm, address, &ptep, &pmdp, &ptl))
+ -			continue;
+ +	spin_lock_irq(&mapping->tree_lock);
+ +	/*
+ +	 * Regular page slots are stabilized by the page lock even
+ +	 * without the tree itself locked.  These unlocked entries
+ +	 * need verification under the tree lock.
+ +	 */
+ +	if (!__radix_tree_lookup(page_tree, index, &node, &slot))
+ +		goto unlock;
+ +	if (*slot != entry)
+ +		goto unlock;
+  
+ -		if (pmdp) {
+ -#ifdef CONFIG_FS_DAX_PMD
+ -			pmd_t pmd;
+ -
+ -			if (pfn != pmd_pfn(*pmdp))
+ -				goto unlock_pmd;
+ -			if (!pmd_dirty(*pmdp) && !pmd_write(*pmdp))
+ -				goto unlock_pmd;
+ -
+ -			flush_cache_page(vma, address, pfn);
+ -			pmd = pmdp_huge_clear_flush(vma, address, pmdp);
+ -			pmd = pmd_wrprotect(pmd);
+ -			pmd = pmd_mkclean(pmd);
+ -			set_pmd_at(vma->vm_mm, address, pmdp, pmd);
+ -			changed = true;
+ -unlock_pmd:
+ -			spin_unlock(ptl);
+ -#endif
+ -		} else {
+ -			if (pfn != pte_pfn(*ptep))
+ -				goto unlock_pte;
+ -			if (!pte_dirty(*ptep) && !pte_write(*ptep))
+ -				goto unlock_pte;
+ -
+ -			flush_cache_page(vma, address, pfn);
+ -			pte = ptep_clear_flush(vma, address, ptep);
+ -			pte = pte_wrprotect(pte);
+ -			pte = pte_mkclean(pte);
+ -			set_pte_at(vma->vm_mm, address, ptep, pte);
+ -			changed = true;
+ -unlock_pte:
+ -			pte_unmap_unlock(ptep, ptl);
+ -		}
+ +	/* another fsync thread may have already written back this entry */
+ +	if (!radix_tree_tag_get(page_tree, index, PAGECACHE_TAG_TOWRITE))
+ +		goto unlock;
+  
+ -		if (changed)
+ -			mmu_notifier_invalidate_page(vma->vm_mm, address);
+ +	if (WARN_ON_ONCE(type != RADIX_DAX_PTE && type != RADIX_DAX_PMD)) {
+ +		ret = -EIO;
+ +		goto unlock;
+  	}
+ -	i_mmap_unlock_read(mapping);
+ -}
+  
+ -static int dax_writeback_one(struct block_device *bdev,
+ -		struct dax_device *dax_dev, struct address_space *mapping,
+ -		pgoff_t index, void *entry)
+ -{
+ -	struct radix_tree_root *page_tree = &mapping->page_tree;
+ -	void *entry2, **slot, *kaddr;
+ -	long ret = 0, id;
+ -	sector_t sector;
+ -	pgoff_t pgoff;
+ -	size_t size;
+ -	pfn_t pfn;
+ +	dax.sector = RADIX_DAX_SECTOR(entry);
+ +	dax.size = (type == RADIX_DAX_PMD ? PMD_SIZE : PAGE_SIZE);
+ +	spin_unlock_irq(&mapping->tree_lock);
+  
+  	/*
+ -	 * A page got tagged dirty in DAX mapping? Something is seriously
+ -	 * wrong.
+ +	 * We cannot hold tree_lock while calling dax_map_atomic() because it
+ +	 * eventually calls cond_resched().
+  	 */
+ -	if (WARN_ON(!radix_tree_exceptional_entry(entry)))
+ -		return -EIO;
+ +	ret = dax_map_atomic(bdev, &dax);
+ +	if (ret < 0)
+ +		return ret;
+  
+ -	spin_lock_irq(&mapping->tree_lock);
+ -	entry2 = get_unlocked_mapping_entry(mapping, index, &slot);
+ -	/* Entry got punched out / reallocated? */
+ -	if (!entry2 || !radix_tree_exceptional_entry(entry2))
+ -		goto put_unlocked;
+ -	/*
+ -	 * Entry got reallocated elsewhere? No need to writeback. We have to
+ -	 * compare sectors as we must not bail out due to difference in lockbit
+ -	 * or entry type.
+ -	 */
+ -	if (dax_radix_sector(entry2) != dax_radix_sector(entry))
+ -		goto put_unlocked;
+ -	if (WARN_ON_ONCE(dax_is_empty_entry(entry) ||
+ -				dax_is_zero_entry(entry))) {
+ +	if (WARN_ON_ONCE(ret < dax.size)) {
+  		ret = -EIO;
+ -		goto put_unlocked;
+ +		goto unmap;
+  	}
+  
+ -	/* Another fsync thread may have already written back this entry */
+ -	if (!radix_tree_tag_get(page_tree, index, PAGECACHE_TAG_TOWRITE))
+ -		goto put_unlocked;
+ -	/* Lock the entry to serialize with page faults */
+ -	entry = lock_slot(mapping, slot);
+ -	/*
+ -	 * We can clear the tag now but we have to be careful so that concurrent
+ -	 * dax_writeback_one() calls for the same index cannot finish before we
+ -	 * actually flush the caches. This is achieved as the calls will look
+ -	 * at the entry only under tree_lock and once they do that they will
+ -	 * see the entry locked and wait for it to unlock.
+ -	 */
+ +	wb_cache_pmem(dax.addr, dax.size);
+ +
+ +	spin_lock_irq(&mapping->tree_lock);
+  	radix_tree_tag_clear(page_tree, index, PAGECACHE_TAG_TOWRITE);
+  	spin_unlock_irq(&mapping->tree_lock);
+++<<<<<<< HEAD
+ + unmap:
+ +	dax_unmap_atomic(bdev, &dax);
+++=======
++ 
++ 	/*
++ 	 * Even if dax_writeback_mapping_range() was given a wbc->range_start
++ 	 * in the middle of a PMD, the 'index' we are given will be aligned to
++ 	 * the start index of the PMD, as will the sector we pull from
++ 	 * 'entry'.  This allows us to flush for PMD_SIZE and not have to
++ 	 * worry about partial PMD writebacks.
++ 	 */
++ 	sector = dax_radix_sector(entry);
++ 	size = PAGE_SIZE << dax_radix_order(entry);
++ 
++ 	id = dax_read_lock();
++ 	ret = bdev_dax_pgoff(bdev, sector, size, &pgoff);
++ 	if (ret)
++ 		goto dax_unlock;
++ 
++ 	/*
++ 	 * dax_direct_access() may sleep, so cannot hold tree_lock over
++ 	 * its invocation.
++ 	 */
++ 	ret = dax_direct_access(dax_dev, pgoff, size / PAGE_SIZE, &kaddr, &pfn);
++ 	if (ret < 0)
++ 		goto dax_unlock;
++ 
++ 	if (WARN_ON_ONCE(ret < size / PAGE_SIZE)) {
++ 		ret = -EIO;
++ 		goto dax_unlock;
++ 	}
++ 
++ 	dax_mapping_entry_mkclean(mapping, index, pfn_t_to_pfn(pfn));
++ 	wb_cache_pmem(kaddr, size);
++ 	/*
++ 	 * After we have flushed the cache, we can clear the dirty tag. There
++ 	 * cannot be new dirty data in the pfn after the flush has completed as
++ 	 * the pfn mappings are writeprotected and fault waits for mapping
++ 	 * entry lock.
++ 	 */
++ 	spin_lock_irq(&mapping->tree_lock);
++ 	radix_tree_tag_clear(page_tree, index, PAGECACHE_TAG_DIRTY);
++ 	spin_unlock_irq(&mapping->tree_lock);
++ 	trace_dax_writeback_one(mapping->host, index, size >> PAGE_SHIFT);
++  dax_unlock:
++ 	dax_read_unlock(id);
++ 	put_locked_mapping_entry(mapping, index, entry);
+++>>>>>>> f9bc3a07539b (dax: add tracepoint to dax_writeback_one())
+  	return ret;
+  
+ - put_unlocked:
+ -	put_unlocked_mapping_entry(mapping, index, entry2);
+ + unlock:
+  	spin_unlock_irq(&mapping->tree_lock);
+  	return ret;
+  }
+* Unmerged path include/trace/events/fs_dax.h
+* Unmerged path fs/dax.c
+* Unmerged path include/trace/events/fs_dax.h
