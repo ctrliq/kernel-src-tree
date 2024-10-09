@@ -1,0 +1,198 @@
+bpf: fix panic in prog load calls cleanup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit 7d1982b4e335c1b184406b7566f6041bfe313c35
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/7d1982b4.failed
+
+While testing I found that when hitting error path in bpf_prog_load()
+where we jump to free_used_maps and prog contained BPF to BPF calls
+that were JITed earlier, then we never clean up the bpf_prog_kallsyms_add()
+done under jit_subprogs(). Add proper API to make BPF kallsyms deletion
+more clear and fix that.
+
+Fixes: 1c2a088a6626 ("bpf: x64: add JIT support for multi-function programs")
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Martin KaFai Lau <kafai@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit 7d1982b4e335c1b184406b7566f6041bfe313c35)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/filter.h
+#	kernel/bpf/syscall.c
+diff --cc include/linux/filter.h
+index e2bb1b37f012,297c56fa9cee..000000000000
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@@ -673,17 -912,115 +673,80 @@@ static inline bool ebpf_jit_enabled(voi
+  	return false;
+  }
+  
+ -static inline bool bpf_prog_ebpf_jited(const struct bpf_prog *fp)
+ -{
+ -	return false;
+ -}
+ -
+ -static inline void bpf_jit_free(struct bpf_prog *fp)
+ +static inline void bpf_jit_compile(struct sk_filter *fp)
+  {
+ -	bpf_prog_unlock_free(fp);
+  }
+ -
+ -static inline bool bpf_jit_kallsyms_enabled(void)
+ -{
+ -	return false;
+ -}
+ -
+ -static inline const char *
+ -__bpf_address_lookup(unsigned long addr, unsigned long *size,
+ -		     unsigned long *off, char *sym)
+ -{
+ -	return NULL;
+ -}
+ -
+ -static inline bool is_bpf_text_address(unsigned long addr)
+ -{
+ -	return false;
+ -}
+ -
+ -static inline int bpf_get_kallsym(unsigned int symnum, unsigned long *value,
+ -				  char *type, char *sym)
+ -{
+ -	return -ERANGE;
+ -}
+ -
+ -static inline const char *
+ -bpf_address_lookup(unsigned long addr, unsigned long *size,
+ -		   unsigned long *off, char **modname, char *sym)
+ +static inline void bpf_jit_free(struct sk_filter *fp)
+  {
+ -	return NULL;
+  }
+ +#define SK_RUN_FILTER(FILTER, SKB) sk_run_filter(SKB, FILTER->insns)
+ +#endif
+  
+ -static inline void bpf_prog_kallsyms_add(struct bpf_prog *fp)
+ -{
+ -}
+ -
+ -static inline void bpf_prog_kallsyms_del(struct bpf_prog *fp)
+ -{
+ -}
+ -#endif /* CONFIG_BPF_JIT */
+ -
+++<<<<<<< HEAD
+ +void *trace_bpf_internal_load_pointer_neg_helper(const struct sk_buff *skb,
+ +						 int k, unsigned int size);
+++=======
++ void bpf_prog_kallsyms_del_subprogs(struct bpf_prog *fp);
++ void bpf_prog_kallsyms_del_all(struct bpf_prog *fp);
++ 
++ #define BPF_ANC		BIT(15)
++ 
++ static inline bool bpf_needs_clear_a(const struct sock_filter *first)
++ {
++ 	switch (first->code) {
++ 	case BPF_RET | BPF_K:
++ 	case BPF_LD | BPF_W | BPF_LEN:
++ 		return false;
++ 
++ 	case BPF_LD | BPF_W | BPF_ABS:
++ 	case BPF_LD | BPF_H | BPF_ABS:
++ 	case BPF_LD | BPF_B | BPF_ABS:
++ 		if (first->k == SKF_AD_OFF + SKF_AD_ALU_XOR_X)
++ 			return true;
++ 		return false;
++ 
++ 	default:
++ 		return true;
++ 	}
++ }
++ 
++ static inline u16 bpf_anc_helper(const struct sock_filter *ftest)
++ {
++ 	BUG_ON(ftest->code & BPF_ANC);
++ 
++ 	switch (ftest->code) {
++ 	case BPF_LD | BPF_W | BPF_ABS:
++ 	case BPF_LD | BPF_H | BPF_ABS:
++ 	case BPF_LD | BPF_B | BPF_ABS:
++ #define BPF_ANCILLARY(CODE)	case SKF_AD_OFF + SKF_AD_##CODE:	\
++ 				return BPF_ANC | SKF_AD_##CODE
++ 		switch (ftest->k) {
++ 		BPF_ANCILLARY(PROTOCOL);
++ 		BPF_ANCILLARY(PKTTYPE);
++ 		BPF_ANCILLARY(IFINDEX);
++ 		BPF_ANCILLARY(NLATTR);
++ 		BPF_ANCILLARY(NLATTR_NEST);
++ 		BPF_ANCILLARY(MARK);
++ 		BPF_ANCILLARY(QUEUE);
++ 		BPF_ANCILLARY(HATYPE);
++ 		BPF_ANCILLARY(RXHASH);
++ 		BPF_ANCILLARY(CPU);
++ 		BPF_ANCILLARY(ALU_XOR_X);
++ 		BPF_ANCILLARY(VLAN_TAG);
++ 		BPF_ANCILLARY(VLAN_TAG_PRESENT);
++ 		BPF_ANCILLARY(PAY_OFFSET);
++ 		BPF_ANCILLARY(RANDOM);
++ 		BPF_ANCILLARY(VLAN_TPID);
++ 		}
++ 		/* Fallthrough. */
++ 	default:
++ 		return ftest->code;
++ 	}
++ }
++ 
++ void *bpf_internal_load_pointer_neg_helper(const struct sk_buff *skb,
++ 					   int k, unsigned int size);
+++>>>>>>> 7d1982b4e335 (bpf: fix panic in prog load calls cleanup)
+  
+  static inline void *bpf_load_pointer(const struct sk_buff *skb, int k,
+  				     unsigned int size, void *buffer)
+diff --cc kernel/bpf/syscall.c
+index f8f3ed8bef67,0f62692fe635..000000000000
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@@ -953,6 -1036,8 +953,11 @@@ static void __bpf_prog_put(struct bpf_p
+  	if (atomic_dec_and_test(&prog->aux->refcnt)) {
+  		/* bpf_prog_free_id() must be called first */
+  		bpf_prog_free_id(prog, do_idr_lock);
+++<<<<<<< HEAD
+++=======
++ 		bpf_prog_kallsyms_del_all(prog);
++ 
+++>>>>>>> 7d1982b4e335 (bpf: fix panic in prog load calls cleanup)
+  		call_rcu(&prog->aux->rcu, __bpf_prog_put_rcu);
+  	}
+  }
+* Unmerged path include/linux/filter.h
+diff --git a/kernel/bpf/core.c b/kernel/bpf/core.c
+index 5dc2bfa97a1b..c04e9d1744fe 100644
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -350,6 +350,20 @@ struct bpf_prog *bpf_patch_insn_single(struct bpf_prog *prog, u32 off,
+ 	return prog_adj;
+ }
+ 
++void bpf_prog_kallsyms_del_subprogs(struct bpf_prog *fp)
++{
++	int i;
++
++	for (i = 0; i < fp->aux->func_cnt; i++)
++		bpf_prog_kallsyms_del(fp->aux->func[i]);
++}
++
++void bpf_prog_kallsyms_del_all(struct bpf_prog *fp)
++{
++	bpf_prog_kallsyms_del_subprogs(fp);
++	bpf_prog_kallsyms_del(fp);
++}
++
+ #ifdef CONFIG_BPF_JIT
+ /* All BPF JIT sysctl knobs here. */
+ int bpf_jit_enable   __read_mostly = IS_BUILTIN(CONFIG_BPF_JIT_ALWAYS_ON);
+* Unmerged path kernel/bpf/syscall.c
