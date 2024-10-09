@@ -1,0 +1,144 @@
+fq_codel: add batch ability to fq_codel_drop()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] sched: fq_codel: add batch ability to fq_codel_drop() (Ivan Vecera) [1382040]
+Rebuild_FUZZ: 92.93%
+commit-author Eric Dumazet <edumazet@google.com>
+commit 9d18562a227874289fda8ca5d117d8f503f1dcca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/9d18562a.failed
+
+In presence of inelastic flows and stress, we can call
+fq_codel_drop() for every packet entering fq_codel qdisc.
+
+fq_codel_drop() is quite expensive, as it does a linear scan
+of 4 KB of memory to find a fat flow.
+Once found, it drops the oldest packet of this flow.
+
+Instead of dropping a single packet, try to drop 50% of the backlog
+of this fat flow, with a configurable limit of 64 packets per round.
+
+TCA_FQ_CODEL_DROP_BATCH_SIZE is the new attribute to make this
+limit configurable.
+
+With this strategy the 4 KB search is amortized to a single cache line
+per drop [1], so fq_codel_drop() no longer appears at the top of kernel
+profile in presence of few inelastic flows.
+
+[1] Assuming a 64byte cache line, and 1024 buckets
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Reported-by: Dave Taht <dave.taht@gmail.com>
+	Cc: Jonathan Morton <chromatix99@gmail.com>
+	Acked-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Acked-by: Dave Taht
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9d18562a227874289fda8ca5d117d8f503f1dcca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/pkt_sched.h
+#	net/sched/sch_fq_codel.c
+diff --cc include/uapi/linux/pkt_sched.h
+index 918b7796073f,a11afecd4482..000000000000
+--- a/include/uapi/linux/pkt_sched.h
++++ b/include/uapi/linux/pkt_sched.h
+@@@ -711,6 -717,8 +711,11 @@@ enum 
+  	TCA_FQ_CODEL_ECN,
+  	TCA_FQ_CODEL_FLOWS,
+  	TCA_FQ_CODEL_QUANTUM,
+++<<<<<<< HEAD
+++=======
++ 	TCA_FQ_CODEL_CE_THRESHOLD,
++ 	TCA_FQ_CODEL_DROP_BATCH_SIZE,
+++>>>>>>> 9d18562a2278 (fq_codel: add batch ability to fq_codel_drop())
+  	__TCA_FQ_CODEL_MAX
+  };
+  
+diff --cc net/sched/sch_fq_codel.c
+index 83003ceba79a,e7b42b0d5145..000000000000
+--- a/net/sched/sch_fq_codel.c
++++ b/net/sched/sch_fq_codel.c
+@@@ -180,7 -190,7 +193,11 @@@ static unsigned int fq_codel_qdisc_drop
+  static int fq_codel_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+  {
+  	struct fq_codel_sched_data *q = qdisc_priv(sch);
+++<<<<<<< HEAD
+ +	unsigned int idx;
+++=======
++ 	unsigned int idx, prev_backlog, prev_qlen;
+++>>>>>>> 9d18562a2278 (fq_codel: add batch ability to fq_codel_drop())
+  	struct fq_codel_flow *flow;
+  	int uninitialized_var(ret);
+  
+@@@ -208,16 -218,23 +225,36 @@@
+  	if (++sch->q.qlen <= sch->limit)
+  		return NET_XMIT_SUCCESS;
+  
+++<<<<<<< HEAD
+ +	q->drop_overlimit++;
+ +	/* Return Congestion Notification only if we dropped a packet
+ +	 * from this flow.
+ +	 */
+ +	if (fq_codel_drop(sch) == idx)
+ +		return NET_XMIT_CN;
+ +
+ +	/* As we dropped a packet, better let upper stack know this */
+ +	qdisc_tree_decrease_qlen(sch, 1);
+ +	return NET_XMIT_SUCCESS;
+++=======
++ 	prev_backlog = sch->qstats.backlog;
++ 	prev_qlen = sch->q.qlen;
++ 
++ 	/* fq_codel_drop() is quite expensive, as it performs a linear search
++ 	 * in q->backlogs[] to find a fat flow.
++ 	 * So instead of dropping a single packet, drop half of its backlog
++ 	 * with a 64 packets limit to not add a too big cpu spike here.
++ 	 */
++ 	ret = fq_codel_drop(sch, q->drop_batch_size);
++ 
++ 	q->drop_overlimit += prev_qlen - sch->q.qlen;
++ 
++ 	/* As we dropped packet(s), better let upper stack know this */
++ 	qdisc_tree_reduce_backlog(sch, prev_qlen - sch->q.qlen,
++ 				  prev_backlog - sch->qstats.backlog);
++ 
++ 	return ret == idx ? NET_XMIT_CN : NET_XMIT_SUCCESS;
+++>>>>>>> 9d18562a2278 (fq_codel: add batch ability to fq_codel_drop())
+  }
+  
+  /* This is the specific function called from codel_dequeue()
+@@@ -322,6 -353,8 +359,11 @@@ static const struct nla_policy fq_codel
+  	[TCA_FQ_CODEL_ECN]	= { .type = NLA_U32 },
+  	[TCA_FQ_CODEL_FLOWS]	= { .type = NLA_U32 },
+  	[TCA_FQ_CODEL_QUANTUM]	= { .type = NLA_U32 },
+++<<<<<<< HEAD
+++=======
++ 	[TCA_FQ_CODEL_CE_THRESHOLD] = { .type = NLA_U32 },
++ 	[TCA_FQ_CODEL_DROP_BATCH_SIZE] = { .type = NLA_U32 },
+++>>>>>>> 9d18562a2278 (fq_codel: add batch ability to fq_codel_drop())
+  };
+  
+  static int fq_codel_change(struct Qdisc *sch, struct nlattr *opt)
+@@@ -415,13 -454,15 +460,14 @@@ static int fq_codel_init(struct Qdisc *
+  
+  	sch->limit = 10*1024;
+  	q->flows_cnt = 1024;
++ 	q->drop_batch_size = 64;
+  	q->quantum = psched_mtu(qdisc_dev(sch));
+ -	q->perturbation = prandom_u32();
+ +	q->perturbation = net_random();
+  	INIT_LIST_HEAD(&q->new_flows);
+  	INIT_LIST_HEAD(&q->old_flows);
+ -	codel_params_init(&q->cparams);
+ +	codel_params_init(&q->cparams, sch);
+  	codel_stats_init(&q->cstats);
+  	q->cparams.ecn = true;
+ -	q->cparams.mtu = psched_mtu(qdisc_dev(sch));
+  
+  	if (opt) {
+  		int err = fq_codel_change(sch, opt);
+* Unmerged path include/uapi/linux/pkt_sched.h
+* Unmerged path net/sched/sch_fq_codel.c
