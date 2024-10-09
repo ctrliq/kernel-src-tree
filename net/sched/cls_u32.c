@@ -1015,9 +1015,9 @@ static int u32_change(struct net *net, struct sk_buff *in_skb,
 errhw:
 #ifdef CONFIG_CLS_U32_MARK
 	free_percpu(n->pcpu_success);
+errout:
 #endif
 
-errout:
 #ifdef CONFIG_CLS_U32_PERF
 	free_percpu(n->pf);
 #endif
