@@ -1984,7 +1984,7 @@ static int init_idle_threads(int ncpu)
 	if (!idle_threads)
 		return -ENOMEM;
 
-	idle_max_cpu = ncpu - 1;
+	idle_max_cpu = ncpu;
 
 	/* allocate the actual thread struct if needed */
 	for (i = 0; i < ncpu; ++i) {
@@ -2005,7 +2005,7 @@ static void free_idle_threads(void)
 	if (idle_threads == NULL)
 		return;
 
-	for (i = 0; i <= idle_max_cpu; ++i) {
+	for (i = 0; i < idle_max_cpu; ++i) {
 		if ((idle_threads[i]))
 			thread__delete(idle_threads[i]);
 	}
@@ -2028,8 +2028,7 @@ static struct thread *get_idle_thread(int cpu)
 			return NULL;
 
 		idle_threads = (struct thread **) p;
-		i = idle_max_cpu ? idle_max_cpu + 1 : 0;
-		for (; i < j; ++i)
+		for (i = idle_max_cpu; i < j; ++i)
 			idle_threads[i] = NULL;
 
 		idle_max_cpu = j;
@@ -2469,7 +2468,7 @@ static void timehist_print_summary(struct perf_sched *sched,
 		return;
 
 	printf("\nIdle stats:\n");
-	for (i = 0; i <= idle_max_cpu; ++i) {
+	for (i = 0; i < idle_max_cpu; ++i) {
 		t = idle_threads[i];
 		if (!t)
 			continue;
