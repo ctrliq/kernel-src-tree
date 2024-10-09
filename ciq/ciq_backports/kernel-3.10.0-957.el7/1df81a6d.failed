@@ -1,0 +1,161 @@
+PCI: shpchp: Request SHPC control via _OSC when adding host bridge
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [pci] shpchp: Request SHPC control via _OSC when adding host bridge (Jarod Wilson) [1495223]
+Rebuild_FUZZ: 96.06%
+commit-author Mika Westerberg <mika.westerberg@linux.intel.com>
+commit 1df81a6d6e01ff3f351c614c5bc35b49847e1dc5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/1df81a6d.failed
+
+The SHPC driver now must be builtin (it cannot be a module).  If it is
+present, request SHPC control immediately when adding the ACPI host bridge.
+This is similar to how we handle native PCIe hotplug via pciehp.
+
+	Suggested-by: Bjorn Helgaas <bhelgaas@google.com>
+	Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+[bhelgaas: split to separate patch]
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+	Reviewed-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 1df81a6d6e01ff3f351c614c5bc35b49847e1dc5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/pci_root.c
+#	drivers/pci/probe.c
+#	include/linux/pci.h
+diff --cc drivers/acpi/pci_root.c
+index 6aac47a89714,d9b8407ce4e8..000000000000
+--- a/drivers/acpi/pci_root.c
++++ b/drivers/acpi/pci_root.c
+@@@ -856,9 -903,19 +859,22 @@@ struct pci_bus *acpi_pci_root_create(st
+  	if (!bus)
+  		goto out_release_info;
+  
+++<<<<<<< HEAD
+++=======
++ 	host_bridge = to_pci_host_bridge(bus->bridge);
++ 	if (!(root->osc_control_set & OSC_PCI_EXPRESS_NATIVE_HP_CONTROL))
++ 		host_bridge->native_pcie_hotplug = 0;
++ 	if (!(root->osc_control_set & OSC_PCI_SHPC_NATIVE_HP_CONTROL))
++ 		host_bridge->native_shpc_hotplug = 0;
++ 	if (!(root->osc_control_set & OSC_PCI_EXPRESS_AER_CONTROL))
++ 		host_bridge->native_aer = 0;
++ 	if (!(root->osc_control_set & OSC_PCI_EXPRESS_PME_CONTROL))
++ 		host_bridge->native_pme = 0;
++ 
+++>>>>>>> 1df81a6d6e01 (PCI: shpchp: Request SHPC control via _OSC when adding host bridge)
+  	pci_scan_child_bus(bus);
+ -	pci_set_host_bridge_release(host_bridge, acpi_pci_root_release_info,
+ -				    info);
+ +	pci_set_host_bridge_release(to_pci_host_bridge(bus->bridge),
+ +				    acpi_pci_root_release_info, info);
+  	if (node != NUMA_NO_NODE)
+  		dev_printk(KERN_DEBUG, &bus->dev, "on NUMA node %d\n", node);
+  	return bus;
+diff --cc drivers/pci/probe.c
+index 60cc4d4c4ea4,91712b2ee2c6..000000000000
+--- a/drivers/pci/probe.c
++++ b/drivers/pci/probe.c
+@@@ -557,7 -526,58 +557,60 @@@ static void pci_release_host_bridge_dev
+  
+  	if (bridge->release_fn)
+  		bridge->release_fn(bridge);
+ -}
+  
+++<<<<<<< HEAD
+++=======
++ static void pci_release_host_bridge_dev(struct device *dev)
++ {
++ 	devm_pci_release_host_bridge_dev(dev);
++ 	pci_free_host_bridge(to_pci_host_bridge(dev));
++ }
++ 
++ struct pci_host_bridge *pci_alloc_host_bridge(size_t priv)
++ {
++ 	struct pci_host_bridge *bridge;
++ 
++ 	bridge = kzalloc(sizeof(*bridge) + priv, GFP_KERNEL);
++ 	if (!bridge)
++ 		return NULL;
++ 
++ 	INIT_LIST_HEAD(&bridge->windows);
++ 	bridge->dev.release = pci_release_host_bridge_dev;
++ 
++ 	/*
++ 	 * We assume we can manage these PCIe features.  Some systems may
++ 	 * reserve these for use by the platform itself, e.g., an ACPI BIOS
++ 	 * may implement its own AER handling and use _OSC to prevent the
++ 	 * OS from interfering.
++ 	 */
++ 	bridge->native_aer = 1;
++ 	bridge->native_pcie_hotplug = 1;
++ 	bridge->native_shpc_hotplug = 1;
++ 	bridge->native_pme = 1;
++ 
++ 	return bridge;
++ }
++ EXPORT_SYMBOL(pci_alloc_host_bridge);
++ 
++ struct pci_host_bridge *devm_pci_alloc_host_bridge(struct device *dev,
++ 						   size_t priv)
++ {
++ 	struct pci_host_bridge *bridge;
++ 
++ 	bridge = devm_kzalloc(dev, sizeof(*bridge) + priv, GFP_KERNEL);
++ 	if (!bridge)
++ 		return NULL;
++ 
++ 	INIT_LIST_HEAD(&bridge->windows);
++ 	bridge->dev.release = devm_pci_release_host_bridge_dev;
++ 
++ 	return bridge;
++ }
++ EXPORT_SYMBOL(devm_pci_alloc_host_bridge);
++ 
++ void pci_free_host_bridge(struct pci_host_bridge *bridge)
++ {
+++>>>>>>> 1df81a6d6e01 (PCI: shpchp: Request SHPC control via _OSC when adding host bridge)
+  	pci_free_resource_list(&bridge->windows);
+  
+  	kfree(bridge);
+diff --cc include/linux/pci.h
+index 2d20a9a169fc,a4968cdb5f33..000000000000
+--- a/include/linux/pci.h
++++ b/include/linux/pci.h
+@@@ -437,12 -460,23 +437,23 @@@ static inline int pci_channel_offline(s
+  }
+  
+  struct pci_host_bridge {
+ -	struct device	dev;
+ -	struct pci_bus	*bus;		/* Root bus */
+ -	struct pci_ops	*ops;
+ -	void		*sysdata;
+ -	int		busnr;
+ +	struct device dev;
+ +	struct pci_bus *bus;		/* root bus */
+  	struct list_head windows;	/* resource_entry */
+ -	u8 (*swizzle_irq)(struct pci_dev *, u8 *); /* Platform IRQ swizzler */
+ -	int (*map_irq)(const struct pci_dev *, u8, u8);
+  	void (*release_fn)(struct pci_host_bridge *);
+++<<<<<<< HEAD
+ +	void *release_data;
+ +	unsigned int ignore_reset_delay:1;	/* for entire hierarchy */
+++=======
++ 	void		*release_data;
++ 	struct msi_controller *msi;
++ 	unsigned int	ignore_reset_delay:1;	/* For entire hierarchy */
++ 	unsigned int	no_ext_tags:1;		/* No Extended Tags */
++ 	unsigned int	native_aer:1;		/* OS may use PCIe AER */
++ 	unsigned int	native_pcie_hotplug:1;	/* OS may use PCIe hotplug */
++ 	unsigned int	native_shpc_hotplug:1;	/* OS may use SHPC hotplug */
++ 	unsigned int	native_pme:1;		/* OS may use PCIe PME */
+++>>>>>>> 1df81a6d6e01 (PCI: shpchp: Request SHPC control via _OSC when adding host bridge)
+  	/* Resource alignment requirements */
+  	resource_size_t (*align_resource)(struct pci_dev *dev,
+  			const struct resource *res,
+* Unmerged path drivers/acpi/pci_root.c
+* Unmerged path drivers/pci/probe.c
+* Unmerged path include/linux/pci.h
