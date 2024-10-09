@@ -1,0 +1,346 @@
+IB/ipoib: Move init code to ndo_init
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jason Gunthorpe <jgg@mellanox.com>
+commit eaeb398425089cb3c8edc81a406109db94b2705c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/eaeb3984.failed
+
+Now that we have a proper ndo_uninit, move code that naturally pairs
+with the ndo_uninit into ndo_init. This allows the netdev core to natually
+handle ordering.
+
+This fixes the situation where register_netdev can fail before calling
+ndo_init, in which case it wouldn't call ndo_uninit either.
+
+Also move a bunch of duplicated init code that is shared between child
+and parent for clarity. Now the child and parent register functions look
+very similar.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+(cherry picked from commit eaeb398425089cb3c8edc81a406109db94b2705c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/ipoib/ipoib.h
+#	drivers/infiniband/ulp/ipoib/ipoib_main.c
+#	drivers/infiniband/ulp/ipoib/ipoib_vlan.c
+diff --cc drivers/infiniband/ulp/ipoib/ipoib.h
+index 072bd9d297b1,02ad1a60dc80..000000000000
+--- a/drivers/infiniband/ulp/ipoib/ipoib.h
++++ b/drivers/infiniband/ulp/ipoib/ipoib.h
+@@@ -509,9 -508,6 +509,12 @@@ void ipoib_ib_dev_down(struct net_devic
+  int ipoib_ib_dev_stop_default(struct net_device *dev);
+  void ipoib_pkey_dev_check_presence(struct net_device *dev);
+  
+++<<<<<<< HEAD
+ +int ipoib_dev_init(struct net_device *dev, struct ib_device *ca, int port);
+ +void ipoib_dev_cleanup(struct net_device *dev);
+ +
+++=======
+++>>>>>>> eaeb39842508 (IB/ipoib: Move init code to ndo_init)
+  void ipoib_mcast_join_task(struct work_struct *work);
+  void ipoib_mcast_carrier_on_task(struct work_struct *work);
+  void ipoib_mcast_send(struct net_device *dev, u8 *daddr, struct sk_buff *skb);
+diff --cc drivers/infiniband/ulp/ipoib/ipoib_main.c
+index 2f3832daed34,67ab52eec3e9..000000000000
+--- a/drivers/infiniband/ulp/ipoib/ipoib_main.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+@@@ -1818,7 -1809,135 +1816,139 @@@ out
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +void ipoib_dev_cleanup(struct net_device *dev)
+++=======
++ /*
++  * This must be called before doing an unregister_netdev on a parent device to
++  * shutdown the IB event handler.
++  */
++ static void ipoib_parent_unregister_pre(struct net_device *ndev)
++ {
++ 	struct ipoib_dev_priv *priv = ipoib_priv(ndev);
++ 
++ 	/*
++ 	 * ipoib_set_mac checks netif_running before pushing work, clearing
++ 	 * running ensures the it will not add more work.
++ 	 */
++ 	rtnl_lock();
++ 	dev_change_flags(priv->dev, priv->dev->flags & ~IFF_UP);
++ 	rtnl_unlock();
++ 
++ 	/* ipoib_event() cannot be running once this returns */
++ 	ib_unregister_event_handler(&priv->event_handler);
++ 
++ 	/*
++ 	 * Work on the queue grabs the rtnl lock, so this cannot be done while
++ 	 * also holding it.
++ 	 */
++ 	flush_workqueue(ipoib_workqueue);
++ }
++ 
++ static void ipoib_set_dev_features(struct ipoib_dev_priv *priv)
++ {
++ 	priv->hca_caps = priv->ca->attrs.device_cap_flags;
++ 
++ 	if (priv->hca_caps & IB_DEVICE_UD_IP_CSUM) {
++ 		priv->dev->hw_features |= NETIF_F_IP_CSUM | NETIF_F_RXCSUM;
++ 
++ 		if (priv->hca_caps & IB_DEVICE_UD_TSO)
++ 			priv->dev->hw_features |= NETIF_F_TSO;
++ 
++ 		priv->dev->features |= priv->dev->hw_features;
++ 	}
++ }
++ 
++ static int ipoib_parent_init(struct net_device *ndev)
++ {
++ 	struct ipoib_dev_priv *priv = ipoib_priv(ndev);
++ 	struct ib_port_attr attr;
++ 	int result;
++ 
++ 	result = ib_query_port(priv->ca, priv->port, &attr);
++ 	if (result) {
++ 		pr_warn("%s: ib_query_port %d failed\n", priv->ca->name,
++ 			priv->port);
++ 		return result;
++ 	}
++ 	priv->max_ib_mtu = ib_mtu_enum_to_int(attr.max_mtu);
++ 
++ 	result = ib_query_pkey(priv->ca, priv->port, 0, &priv->pkey);
++ 	if (result) {
++ 		pr_warn("%s: ib_query_pkey port %d failed (ret = %d)\n",
++ 			priv->ca->name, priv->port, result);
++ 		return result;
++ 	}
++ 
++ 	result = rdma_query_gid(priv->ca, priv->port, 0, &priv->local_gid);
++ 	if (result) {
++ 		pr_warn("%s: rdma_query_gid port %d failed (ret = %d)\n",
++ 			priv->ca->name, priv->port, result);
++ 		return result;
++ 	}
++ 	memcpy(priv->dev->dev_addr + 4, priv->local_gid.raw,
++ 	       sizeof(union ib_gid));
++ 
++ 	SET_NETDEV_DEV(priv->dev, priv->ca->dev.parent);
++ 	priv->dev->dev_id = priv->port - 1;
++ 
++ 	return 0;
++ }
++ 
++ static void ipoib_child_init(struct net_device *ndev)
++ {
++ 	struct ipoib_dev_priv *priv = ipoib_priv(ndev);
++ 	struct ipoib_dev_priv *ppriv = ipoib_priv(priv->parent);
++ 
++ 	priv->max_ib_mtu = ppriv->max_ib_mtu;
++ 	set_bit(IPOIB_FLAG_SUBINTERFACE, &priv->flags);
++ 	memcpy(priv->dev->dev_addr, ppriv->dev->dev_addr, INFINIBAND_ALEN);
++ 	memcpy(&priv->local_gid, &ppriv->local_gid, sizeof(priv->local_gid));
++ }
++ 
++ static int ipoib_ndo_init(struct net_device *ndev)
++ {
++ 	struct ipoib_dev_priv *priv = ipoib_priv(ndev);
++ 	int rc;
++ 
++ 	if (priv->parent) {
++ 		ipoib_child_init(ndev);
++ 	} else {
++ 		rc = ipoib_parent_init(ndev);
++ 		if (rc)
++ 			return rc;
++ 	}
++ 
++ 	/* MTU will be reset when mcast join happens */
++ 	ndev->mtu = IPOIB_UD_MTU(priv->max_ib_mtu);
++ 	priv->mcast_mtu = priv->admin_mtu = ndev->mtu;
++ 	ndev->max_mtu = IPOIB_CM_MTU;
++ 
++ 	ndev->neigh_priv_len = sizeof(struct ipoib_neigh);
++ 
++ 	/*
++ 	 * Set the full membership bit, so that we join the right
++ 	 * broadcast group, etc.
++ 	 */
++ 	priv->pkey |= 0x8000;
++ 
++ 	ndev->broadcast[8] = priv->pkey >> 8;
++ 	ndev->broadcast[9] = priv->pkey & 0xff;
++ 	set_bit(IPOIB_FLAG_DEV_ADDR_SET, &priv->flags);
++ 
++ 	ipoib_set_dev_features(priv);
++ 
++ 	rc = ipoib_dev_init(ndev);
++ 	if (rc) {
++ 		pr_warn("%s: failed to initialize device: %s port %d (ret = %d)\n",
++ 			priv->ca->name, priv->dev->name, priv->port, rc);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void ipoib_ndo_uninit(struct net_device *dev)
+++>>>>>>> eaeb39842508 (IB/ipoib: Move init code to ndo_init)
+  {
+  	struct ipoib_dev_priv *priv = ipoib_priv(dev), *cpriv, *tcpriv;
+  	LIST_HEAD(head);
+@@@ -1890,11 -2009,11 +2020,16 @@@ static const struct header_ops ipoib_he
+  };
+  
+  static const struct net_device_ops ipoib_netdev_ops_pf = {
+++<<<<<<< HEAD
+ +	.ndo_size		 = sizeof(struct net_device_ops),
+ +	.ndo_uninit		 = ipoib_uninit,
+++=======
++ 	.ndo_init		 = ipoib_ndo_init,
++ 	.ndo_uninit		 = ipoib_ndo_uninit,
+++>>>>>>> eaeb39842508 (IB/ipoib: Move init code to ndo_init)
+  	.ndo_open		 = ipoib_open,
+  	.ndo_stop		 = ipoib_stop,
+ -	.ndo_change_mtu		 = ipoib_change_mtu,
+ +	.ndo_change_mtu_rh74	 = ipoib_change_mtu,
+  	.ndo_fix_features	 = ipoib_fix_features,
+  	.ndo_start_xmit		 = ipoib_start_xmit,
+  	.ndo_tx_timeout		 = ipoib_timeout,
+@@@ -1910,10 -2029,11 +2045,15 @@@
+  };
+  
+  static const struct net_device_ops ipoib_netdev_ops_vf = {
+++<<<<<<< HEAD
+ +	.ndo_uninit		 = ipoib_uninit,
+++=======
++ 	.ndo_init		 = ipoib_ndo_init,
++ 	.ndo_uninit		 = ipoib_ndo_uninit,
+++>>>>>>> eaeb39842508 (IB/ipoib: Move init code to ndo_init)
+  	.ndo_open		 = ipoib_open,
+  	.ndo_stop		 = ipoib_stop,
+ -	.ndo_change_mtu		 = ipoib_change_mtu,
+ +	.ndo_change_mtu_rh74	 = ipoib_change_mtu,
+  	.ndo_fix_features	 = ipoib_fix_features,
+  	.ndo_start_xmit	 	 = ipoib_start_xmit,
+  	.ndo_tx_timeout		 = ipoib_timeout,
+@@@ -2246,60 -2347,7 +2368,64 @@@ static struct net_device *ipoib_add_por
+  	priv = ipoib_intf_alloc(hca, port, format);
+  	if (!priv) {
+  		pr_warn("%s, %d: ipoib_intf_alloc failed\n", hca->name, port);
+++<<<<<<< HEAD
+ +		goto alloc_mem_failed;
+ +	}
+ +
+ +	SET_NETDEV_DEV(priv->dev, hca->dev.parent);
+ +	priv->dev->dev_id = port - 1;
+ +
+ +	result = ib_query_port(hca, port, &attr);
+ +	if (result) {
+ +		pr_warn("%s: ib_query_port %d failed\n", hca->name, port);
+ +		goto device_init_failed;
+ +	}
+ +
+ +	priv->max_ib_mtu = ib_mtu_enum_to_int(attr.max_mtu);
+ +
+ +	/* MTU will be reset when mcast join happens */
+ +	priv->dev->mtu  = IPOIB_UD_MTU(priv->max_ib_mtu);
+ +	priv->mcast_mtu  = priv->admin_mtu = priv->dev->mtu;
+ +
+ +	priv->dev->neigh_priv_len = sizeof(struct ipoib_neigh);
+ +
+ +	result = ib_query_pkey(hca, port, 0, &priv->pkey);
+ +	if (result) {
+ +		pr_warn("%s: ib_query_pkey port %d failed (ret = %d)\n",
+ +			hca->name, port, result);
+ +		goto device_init_failed;
+ +	}
+ +
+ +	ipoib_set_dev_features(priv, hca);
+ +
+ +	/*
+ +	 * Set the full membership bit, so that we join the right
+ +	 * broadcast group, etc.
+ +	 */
+ +	priv->pkey |= 0x8000;
+ +
+ +	priv->dev->broadcast[8] = priv->pkey >> 8;
+ +	priv->dev->broadcast[9] = priv->pkey & 0xff;
+ +
+ +	result = ib_query_gid(hca, port, 0, &priv->local_gid, NULL);
+ +	if (result) {
+ +		pr_warn("%s: ib_query_gid port %d failed (ret = %d)\n",
+ +			hca->name, port, result);
+ +		goto device_init_failed;
+ +	}
+ +
+ +	memcpy(priv->dev->dev_addr + 4, priv->local_gid.raw,
+ +	       sizeof(union ib_gid));
+ +	set_bit(IPOIB_FLAG_DEV_ADDR_SET, &priv->flags);
+ +
+ +	result = ipoib_dev_init(priv->dev, hca, port);
+ +	if (result) {
+ +		pr_warn("%s: failed to initialize port %d (ret = %d)\n",
+ +			hca->name, port, result);
+ +		goto device_init_failed;
+++=======
++ 		return ERR_PTR(-ENOMEM);
+++>>>>>>> eaeb39842508 (IB/ipoib: Move init code to ndo_init)
+  	}
+  
+  	INIT_IB_EVENT_HANDLER(&priv->event_handler,
+diff --cc drivers/infiniband/ulp/ipoib/ipoib_vlan.c
+index 0c8d87a40f23,3103729a73fd..000000000000
+--- a/drivers/infiniband/ulp/ipoib/ipoib_vlan.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_vlan.c
+@@@ -82,7 -62,7 +61,11 @@@ int __ipoib_vlan_add(struct ipoib_dev_p
+  	result = register_netdevice(priv->dev);
+  	if (result) {
+  		ipoib_warn(priv, "failed to initialize; error %i", result);
+++<<<<<<< HEAD
+ +		goto register_failed;
+++=======
++ 		return result;
+++>>>>>>> eaeb39842508 (IB/ipoib: Move init code to ndo_init)
+  	}
+  
+  	/* RTNL childs don't need proprietary sysfs entries */
+@@@ -104,14 -83,8 +86,17 @@@
+  	return 0;
+  
+  sysfs_failed:
+- 	result = -ENOMEM;
+  	unregister_netdevice(priv->dev);
+++<<<<<<< HEAD
+ +
+ +register_failed:
+ +	ipoib_dev_cleanup(priv->dev);
+ +
+ +err:
+ +	return result;
+++=======
++ 	return -ENOMEM;
+++>>>>>>> eaeb39842508 (IB/ipoib: Move init code to ndo_init)
+  }
+  
+  int ipoib_vlan_add(struct net_device *pdev, unsigned short pkey)
+* Unmerged path drivers/infiniband/ulp/ipoib/ipoib.h
+* Unmerged path drivers/infiniband/ulp/ipoib/ipoib_main.c
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_netlink.c b/drivers/infiniband/ulp/ipoib/ipoib_netlink.c
+index 28884781311b..025372e09d73 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_netlink.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_netlink.c
+@@ -123,12 +123,6 @@ static int ipoib_new_child_link(struct net *src_net, struct net_device *dev,
+ 	if (child_pkey == 0 || child_pkey == 0x8000)
+ 		return -EINVAL;
+ 
+-	/*
+-	 * Set the full membership bit, so that we join the right
+-	 * broadcast group, etc.
+-	 */
+-	child_pkey |= 0x8000;
+-
+ 	err = __ipoib_vlan_add(ppriv, ipoib_priv(dev),
+ 			       child_pkey, IPOIB_RTNL_CHILD);
+ 
+* Unmerged path drivers/infiniband/ulp/ipoib/ipoib_vlan.c
