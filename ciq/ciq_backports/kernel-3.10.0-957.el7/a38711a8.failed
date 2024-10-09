@@ -1,0 +1,77 @@
+usbip: auto retry for concurrent attach
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Nobuo Iwata <nobuo.iwata@fujixerox.co.jp>
+commit a38711a88b7e3fd0c0d292a35693e0f608263759
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/a38711a8.failed
+
+This patch adds recovery from false busy state on concurrent attach
+operation.
+
+The procedure of attach operation is as below.
+1) Find an unused port in /sys/devices/platform/vhci_hcd/status.
+(userspace)
+2) Request attach found port to driver through
+/sys/devices/platform/vhci_hcd/attach. (userspace)
+3) Lock table, reserve requested port and unlock table. (vhci driver)
+
+Attaching more than one remote devices concurrently, same unused port
+number will be found in step-1. Then one request will succeed and
+others will fail even though there are some unused ports.
+
+With this patch, driver returns EBUSY when requested port has already
+been used. In this case, attach command retries from step-1: finding
+another unused port. If there's no unused port, the attach operation
+will fail in step-1. Otherwise it retries automatically using another
+unused port.
+
+vhci-hcd's interface (only errno) is changed as following.
+
+Current	errno	New errno	Condition
+EINVAL		same as left	specified port number is in invalid
+				range
+EAGAIN		same as left	platform_get_drvdata() failed
+EINVAL		same as left	specified socket fd is not valid
+EINVAL		EBUSY		specified port status is not free
+
+The errno EBUSY was not used in userspace
+src/usbip_attach.c:import_device(). It is needed to distinguish the
+condition to be able to retry from other unrecoverable errors.
+
+It is possible to avoid this failure by introducing userspace exclusive
+control. But it's exaggerated for this special condition. The locking
+itself has done in driver.
+As an alternate solution, userspace doesn't specify port number, driver
+searches unused port and it returns port number to the userspace. With
+this solution, the interface is much different than this patch.
+
+	Signed-off-by: Nobuo Iwata <nobuo.iwata@fujixerox.co.jp>
+	Acked-by: Shuah Khan <shuahkh@osg.samsung.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit a38711a88b7e3fd0c0d292a35693e0f608263759)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/usb/usbip/src/usbip_attach.c
+* Unmerged path tools/usb/usbip/src/usbip_attach.c
+diff --git a/drivers/usb/usbip/vhci_sysfs.c b/drivers/usb/usbip/vhci_sysfs.c
+index cdbfc7b9f0f7..66f5c34dc078 100644
+--- a/drivers/usb/usbip/vhci_sysfs.c
++++ b/drivers/usb/usbip/vhci_sysfs.c
+@@ -323,7 +323,11 @@ static ssize_t store_attach(struct device *dev, struct device_attribute *attr,
+ 		sockfd_put(socket);
+ 
+ 		dev_err(dev, "port %d already used\n", rhport);
+-		return -EINVAL;
++		/*
++		 * Will be retried from userspace
++		 * if there's another free port.
++		 */
++		return -EBUSY;
+ 	}
+ 
+ 	dev_info(dev, "pdev(%u) rhport(%u) sockfd(%d)\n",
+* Unmerged path tools/usb/usbip/src/usbip_attach.c
