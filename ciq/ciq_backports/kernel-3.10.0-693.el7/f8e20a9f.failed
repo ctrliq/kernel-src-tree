@@ -1,0 +1,462 @@
+switchdev: convert parent_id_get to switchdev attr get
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Scott Feldman <sfeldma@gmail.com>
+commit f8e20a9f87d33865cc1d67f13da0db8d457fc3c9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/f8e20a9f.failed
+
+Switch ID is just a gettable port attribute.  Convert switchdev op
+switchdev_parent_id_get to a switchdev attr.
+
+Note: for sysfs and netlink interfaces, SWITCHDEV_ATTR_PORT_PARENT_ID is
+called with SWITCHDEV_F_NO_RECUSE to limit switch ID user-visiblity to only
+port netdevs.  So when a port is stacked under bond/bridge, the user can
+only query switch id via the switch ports, but not via the upper devices
+
+	Signed-off-by: Scott Feldman <sfeldma@gmail.com>
+	Acked-by: Jiri Pirko <jiri@resnulli.us>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f8e20a9f87d33865cc1d67f13da0db8d457fc3c9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/rocker/rocker.c
+#	include/net/switchdev.h
+#	net/core/net-sysfs.c
+#	net/core/rtnetlink.c
+#	net/dsa/slave.c
+#	net/switchdev/switchdev.c
+diff --cc net/core/net-sysfs.c
+index c7c996a3d5f5,5a9ce96f6d27..000000000000
+--- a/net/core/net-sysfs.c
++++ b/net/core/net-sysfs.c
+@@@ -416,11 -458,15 +416,19 @@@ static ssize_t phys_switch_id_show(stru
+  		return restart_syscall();
+  
+  	if (dev_isalive(netdev)) {
+- 		struct netdev_phys_item_id ppid;
++ 		struct switchdev_attr attr = {
++ 			.id = SWITCHDEV_ATTR_PORT_PARENT_ID,
++ 			.flags = SWITCHDEV_F_NO_RECURSE,
++ 		};
+  
+++<<<<<<< HEAD
+ +		ret = netdev_switch_parent_id_get(netdev, &ppid);
+++=======
++ 		ret = switchdev_port_attr_get(netdev, &attr);
+++>>>>>>> f8e20a9f87d3 (switchdev: convert parent_id_get to switchdev attr get)
+  		if (!ret)
+- 			ret = sprintf(buf, "%*phN\n", ppid.id_len, ppid.id);
++ 			ret = sprintf(buf, "%*phN\n", attr.ppid.id_len,
++ 				      attr.ppid.id);
+  	}
+  	rtnl_unlock();
+  
+diff --cc net/core/rtnetlink.c
+index 590c29aca2b6,c6c6b2c34926..000000000000
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@@ -1022,6 -983,45 +1022,48 @@@ static int rtnl_phys_port_id_fill(struc
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int rtnl_phys_port_name_fill(struct sk_buff *skb, struct net_device *dev)
++ {
++ 	char name[IFNAMSIZ];
++ 	int err;
++ 
++ 	err = dev_get_phys_port_name(dev, name, sizeof(name));
++ 	if (err) {
++ 		if (err == -EOPNOTSUPP)
++ 			return 0;
++ 		return err;
++ 	}
++ 
++ 	if (nla_put(skb, IFLA_PHYS_PORT_NAME, strlen(name), name))
++ 		return -EMSGSIZE;
++ 
++ 	return 0;
++ }
++ 
++ static int rtnl_phys_switch_id_fill(struct sk_buff *skb, struct net_device *dev)
++ {
++ 	int err;
++ 	struct switchdev_attr attr = {
++ 		.id = SWITCHDEV_ATTR_PORT_PARENT_ID,
++ 		.flags = SWITCHDEV_F_NO_RECURSE,
++ 	};
++ 
++ 	err = switchdev_port_attr_get(dev, &attr);
++ 	if (err) {
++ 		if (err == -EOPNOTSUPP)
++ 			return 0;
++ 		return err;
++ 	}
++ 
++ 	if (nla_put(skb, IFLA_PHYS_SWITCH_ID, attr.ppid.id_len, attr.ppid.id))
++ 		return -EMSGSIZE;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> f8e20a9f87d3 (switchdev: convert parent_id_get to switchdev attr get)
+  static int rtnl_fill_ifinfo(struct sk_buff *skb, struct net_device *dev,
+  			    int type, u32 pid, u32 seq, u32 change,
+  			    unsigned int flags, u32 ext_filter_mask)
+diff --cc net/dsa/slave.c
+index 6ebd8fbd9285,de705b674ac9..000000000000
+--- a/net/dsa/slave.c
++++ b/net/dsa/slave.c
+@@@ -171,6 -308,116 +171,119 @@@ static int dsa_slave_ioctl(struct net_d
+  	return -EOPNOTSUPP;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Return a bitmask of all ports being currently bridged within a given bridge
++  * device. Note that on leave, the mask will still return the bitmask of ports
++  * currently bridged, prior to port removal, and this is exactly what we want.
++  */
++ static u32 dsa_slave_br_port_mask(struct dsa_switch *ds,
++ 				  struct net_device *bridge)
++ {
++ 	struct dsa_slave_priv *p;
++ 	unsigned int port;
++ 	u32 mask = 0;
++ 
++ 	for (port = 0; port < DSA_MAX_PORTS; port++) {
++ 		if (!dsa_is_port_initialized(ds, port))
++ 			continue;
++ 
++ 		p = netdev_priv(ds->ports[port]);
++ 
++ 		if (ds->ports[port]->priv_flags & IFF_BRIDGE_PORT &&
++ 		    p->bridge_dev == bridge)
++ 			mask |= 1 << port;
++ 	}
++ 
++ 	return mask;
++ }
++ 
++ static int dsa_slave_stp_update(struct net_device *dev, u8 state)
++ {
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct dsa_switch *ds = p->parent;
++ 	int ret = -EOPNOTSUPP;
++ 
++ 	if (ds->drv->port_stp_update)
++ 		ret = ds->drv->port_stp_update(ds, p->port, state);
++ 
++ 	return ret;
++ }
++ 
++ static int dsa_slave_bridge_port_join(struct net_device *dev,
++ 				      struct net_device *br)
++ {
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct dsa_switch *ds = p->parent;
++ 	int ret = -EOPNOTSUPP;
++ 
++ 	p->bridge_dev = br;
++ 
++ 	if (ds->drv->port_join_bridge)
++ 		ret = ds->drv->port_join_bridge(ds, p->port,
++ 						dsa_slave_br_port_mask(ds, br));
++ 
++ 	return ret;
++ }
++ 
++ static int dsa_slave_bridge_port_leave(struct net_device *dev)
++ {
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct dsa_switch *ds = p->parent;
++ 	int ret = -EOPNOTSUPP;
++ 
++ 
++ 	if (ds->drv->port_leave_bridge)
++ 		ret = ds->drv->port_leave_bridge(ds, p->port,
++ 						 dsa_slave_br_port_mask(ds, p->bridge_dev));
++ 
++ 	p->bridge_dev = NULL;
++ 
++ 	/* Port left the bridge, put in BR_STATE_DISABLED by the bridge layer,
++ 	 * so allow it to be in BR_STATE_FORWARDING to be kept functional
++ 	 */
++ 	dsa_slave_stp_update(dev, BR_STATE_FORWARDING);
++ 
++ 	return ret;
++ }
++ 
++ static int dsa_slave_port_attr_get(struct net_device *dev,
++ 				   struct switchdev_attr *attr)
++ {
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct dsa_switch *ds = p->parent;
++ 
++ 	switch (attr->id) {
++ 	case SWITCHDEV_ATTR_PORT_PARENT_ID:
++ 		attr->ppid.id_len = sizeof(ds->index);
++ 		memcpy(&attr->ppid.id, &ds->index, attr->ppid.id_len);
++ 		break;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static netdev_tx_t dsa_slave_xmit(struct sk_buff *skb, struct net_device *dev)
++ {
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 
++ 	return p->xmit(skb, dev);
++ }
++ 
++ static netdev_tx_t dsa_slave_notag_xmit(struct sk_buff *skb,
++ 					struct net_device *dev)
++ {
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 
++ 	skb->dev = p->parent->dst->master_netdev;
++ 	dev_queue_xmit(skb);
++ 
++ 	return NETDEV_TX_OK;
++ }
++ 
+++>>>>>>> f8e20a9f87d3 (switchdev: convert parent_id_get to switchdev attr get)
+  
+  /* ethtool operations *******************************************************/
+  static int
+@@@ -302,38 -674,188 +415,45 @@@ static const struct net_device_ops dsa_
+  	.ndo_change_rx_flags	= dsa_slave_change_rx_flags,
+  	.ndo_set_rx_mode	= dsa_slave_set_rx_mode,
+  	.ndo_set_mac_address	= dsa_slave_set_mac_address,
+ -	.ndo_fdb_add		= dsa_slave_fdb_add,
+ -	.ndo_fdb_del		= dsa_slave_fdb_del,
+ -	.ndo_fdb_dump		= dsa_slave_fdb_dump,
+  	.ndo_do_ioctl		= dsa_slave_ioctl,
+ -	.ndo_get_iflink		= dsa_slave_get_iflink,
+  };
+++<<<<<<< HEAD
+ +#endif
+ +#ifdef CONFIG_NET_DSA_TAG_EDSA
+ +static const struct net_device_ops edsa_netdev_ops = {
+ +	.ndo_init		= dsa_slave_init,
+ +	.ndo_open	 	= dsa_slave_open,
+ +	.ndo_stop		= dsa_slave_close,
+ +	.ndo_start_xmit		= edsa_xmit,
+ +	.ndo_change_rx_flags	= dsa_slave_change_rx_flags,
+ +	.ndo_set_rx_mode	= dsa_slave_set_rx_mode,
+ +	.ndo_set_mac_address	= dsa_slave_set_mac_address,
+ +	.ndo_do_ioctl		= dsa_slave_ioctl,
+++=======
++ 
++ static const struct switchdev_ops dsa_slave_switchdev_ops = {
++ 	.switchdev_port_attr_get	= dsa_slave_port_attr_get,
++ 	.switchdev_port_stp_update	= dsa_slave_stp_update,
+++>>>>>>> f8e20a9f87d3 (switchdev: convert parent_id_get to switchdev attr get)
+  };
+ -
+ -static void dsa_slave_adjust_link(struct net_device *dev)
+ -{
+ -	struct dsa_slave_priv *p = netdev_priv(dev);
+ -	struct dsa_switch *ds = p->parent;
+ -	unsigned int status_changed = 0;
+ -
+ -	if (p->old_link != p->phy->link) {
+ -		status_changed = 1;
+ -		p->old_link = p->phy->link;
+ -	}
+ -
+ -	if (p->old_duplex != p->phy->duplex) {
+ -		status_changed = 1;
+ -		p->old_duplex = p->phy->duplex;
+ -	}
+ -
+ -	if (p->old_pause != p->phy->pause) {
+ -		status_changed = 1;
+ -		p->old_pause = p->phy->pause;
+ -	}
+ -
+ -	if (ds->drv->adjust_link && status_changed)
+ -		ds->drv->adjust_link(ds, p->port, p->phy);
+ -
+ -	if (status_changed)
+ -		phy_print_status(p->phy);
+ -}
+ -
+ -static int dsa_slave_fixed_link_update(struct net_device *dev,
+ -				       struct fixed_phy_status *status)
+ -{
+ -	struct dsa_slave_priv *p = netdev_priv(dev);
+ -	struct dsa_switch *ds = p->parent;
+ -
+ -	if (ds->drv->fixed_link_update)
+ -		ds->drv->fixed_link_update(ds, p->port, status);
+ -
+ -	return 0;
+ -}
+ +#endif
+ +#ifdef CONFIG_NET_DSA_TAG_TRAILER
+ +static const struct net_device_ops trailer_netdev_ops = {
+ +	.ndo_init		= dsa_slave_init,
+ +	.ndo_open	 	= dsa_slave_open,
+ +	.ndo_stop		= dsa_slave_close,
+ +	.ndo_start_xmit		= trailer_xmit,
+ +	.ndo_change_rx_flags	= dsa_slave_change_rx_flags,
+ +	.ndo_set_rx_mode	= dsa_slave_set_rx_mode,
+ +	.ndo_set_mac_address	= dsa_slave_set_mac_address,
+ +	.ndo_do_ioctl		= dsa_slave_ioctl,
+ +};
+ +#endif
+  
+  /* slave device setup *******************************************************/
+ -static int dsa_slave_phy_connect(struct dsa_slave_priv *p,
+ -				 struct net_device *slave_dev,
+ -				 int addr)
+ -{
+ -	struct dsa_switch *ds = p->parent;
+ -
+ -	p->phy = ds->slave_mii_bus->phy_map[addr];
+ -	if (!p->phy)
+ -		return -ENODEV;
+ -
+ -	/* Use already configured phy mode */
+ -	p->phy_interface = p->phy->interface;
+ -	phy_connect_direct(slave_dev, p->phy, dsa_slave_adjust_link,
+ -			   p->phy_interface);
+ -
+ -	return 0;
+ -}
+ -
+ -static int dsa_slave_phy_setup(struct dsa_slave_priv *p,
+ -				struct net_device *slave_dev)
+ -{
+ -	struct dsa_switch *ds = p->parent;
+ -	struct dsa_chip_data *cd = ds->pd;
+ -	struct device_node *phy_dn, *port_dn;
+ -	bool phy_is_fixed = false;
+ -	u32 phy_flags = 0;
+ -	int mode, ret;
+ -
+ -	port_dn = cd->port_dn[p->port];
+ -	mode = of_get_phy_mode(port_dn);
+ -	if (mode < 0)
+ -		mode = PHY_INTERFACE_MODE_NA;
+ -	p->phy_interface = mode;
+ -
+ -	phy_dn = of_parse_phandle(port_dn, "phy-handle", 0);
+ -	if (of_phy_is_fixed_link(port_dn)) {
+ -		/* In the case of a fixed PHY, the DT node associated
+ -		 * to the fixed PHY is the Port DT node
+ -		 */
+ -		ret = of_phy_register_fixed_link(port_dn);
+ -		if (ret) {
+ -			netdev_err(slave_dev, "failed to register fixed PHY\n");
+ -			return ret;
+ -		}
+ -		phy_is_fixed = true;
+ -		phy_dn = port_dn;
+ -	}
+ -
+ -	if (ds->drv->get_phy_flags)
+ -		phy_flags = ds->drv->get_phy_flags(ds, p->port);
+ -
+ -	if (phy_dn) {
+ -		ret = of_mdio_parse_addr(&slave_dev->dev, phy_dn);
+ -		/* If this PHY address is part of phys_mii_mask, which means
+ -		 * that we need to divert reads and writes to/from it, then we
+ -		 * want to bind this device using the slave MII bus created by
+ -		 * DSA to make that happen.
+ -		 */
+ -		if (!phy_is_fixed && ret >= 0 &&
+ -		    (ds->phys_mii_mask & (1 << ret))) {
+ -			ret = dsa_slave_phy_connect(p, slave_dev, ret);
+ -			if (ret)
+ -				return ret;
+ -		} else {
+ -			p->phy = of_phy_connect(slave_dev, phy_dn,
+ -						dsa_slave_adjust_link,
+ -						phy_flags,
+ -						p->phy_interface);
+ -		}
+ -	}
+ -
+ -	if (p->phy && phy_is_fixed)
+ -		fixed_phy_set_link_update(p->phy, dsa_slave_fixed_link_update);
+ -
+ -	/* We could not connect to a designated PHY, so use the switch internal
+ -	 * MDIO bus instead
+ -	 */
+ -	if (!p->phy) {
+ -		ret = dsa_slave_phy_connect(p, slave_dev, p->port);
+ -		if (ret)
+ -			return ret;
+ -	} else {
+ -		netdev_info(slave_dev, "attached PHY at address %d [%s]\n",
+ -			    p->phy->addr, p->phy->drv->name);
+ -	}
+ -
+ -	return 0;
+ -}
+ -
+ -static struct lock_class_key dsa_slave_netdev_xmit_lock_key;
+ -static void dsa_slave_set_lockdep_class_one(struct net_device *dev,
+ -					    struct netdev_queue *txq,
+ -					    void *_unused)
+ -{
+ -	lockdep_set_class(&txq->_xmit_lock,
+ -			  &dsa_slave_netdev_xmit_lock_key);
+ -}
+ -
+ -int dsa_slave_suspend(struct net_device *slave_dev)
+ -{
+ -	struct dsa_slave_priv *p = netdev_priv(slave_dev);
+ -
+ -	if (p->phy) {
+ -		phy_stop(p->phy);
+ -		p->old_pause = -1;
+ -		p->old_link = -1;
+ -		p->old_duplex = -1;
+ -		phy_suspend(p->phy);
+ -	}
+ -
+ -	return 0;
+ -}
+ -
+ -int dsa_slave_resume(struct net_device *slave_dev)
+ -{
+ -	struct dsa_slave_priv *p = netdev_priv(slave_dev);
+ -
+ -	netif_device_attach(slave_dev);
+ -
+ -	if (p->phy) {
+ -		phy_resume(p->phy);
+ -		phy_start(p->phy);
+ -	}
+ -
+ -	return 0;
+ -}
+ -
+ -int dsa_slave_create(struct dsa_switch *ds, struct device *parent,
+ -		     int port, char *name)
+ +struct net_device *
+ +dsa_slave_create(struct dsa_switch *ds, struct device *parent,
+ +		 int port, char *name)
+  {
+  	struct net_device *master = ds->dst->master_netdev;
+  	struct net_device *slave_dev;
+* Unmerged path drivers/net/ethernet/rocker/rocker.c
+* Unmerged path include/net/switchdev.h
+* Unmerged path net/switchdev/switchdev.c
+* Unmerged path drivers/net/ethernet/rocker/rocker.c
+* Unmerged path include/net/switchdev.h
+* Unmerged path net/core/net-sysfs.c
+* Unmerged path net/core/rtnetlink.c
+* Unmerged path net/dsa/slave.c
+* Unmerged path net/switchdev/switchdev.c
