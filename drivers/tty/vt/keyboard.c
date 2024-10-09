@@ -2003,7 +2003,7 @@ out:
 /* FIXME: This one needs untangling */
 int vt_do_kdgkb_ioctl(int cmd, struct kbsentry __user *user_kdgkb, int perm)
 {
-	char *kbs;
+	char *kbs = NULL;
 	u_char *q;
 	int sz, fnw_sz;
 	int delta;
