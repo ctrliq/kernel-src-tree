@@ -1,0 +1,205 @@
+percpu: relegate chunks unusable when failing small allocations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Dennis Zhou <dennis@kernel.org>
+commit 8744d859427c6198dce490619809754336954297
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/8744d859.failed
+
+In certain cases, requestors of percpu memory may want specific
+alignments. However, it is possible to end up in situations where the
+contig_hint matches, but the alignment does not. This causes excess
+scanning of chunks that will fail. To prevent this, if a small
+allocation fails (< 32B), the chunk is moved to the empty list. Once an
+allocation is freed from that chunk, it is placed back into rotation.
+
+	Signed-off-by: Dennis Zhou <dennis@kernel.org>
+	Reviewed-by: Peng Fan <peng.fan@nxp.com>
+(cherry picked from commit 8744d859427c6198dce490619809754336954297)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/percpu.c
+diff --cc mm/percpu.c
+index 60a1f468f968,2c1a9a2ca13b..000000000000
+--- a/mm/percpu.c
++++ b/mm/percpu.c
+@@@ -75,10 -87,16 +75,23 @@@
+  #include <asm/tlbflush.h>
+  #include <asm/io.h>
+  
+++<<<<<<< HEAD
+ +#define PCPU_SLOT_BASE_SHIFT		5	/* 1-31 shares the same slot */
+ +#define PCPU_DFL_MAP_ALLOC		16	/* start a map with 16 ents */
+ +#define PCPU_ATOMIC_MAP_MARGIN_LOW	32
+ +#define PCPU_ATOMIC_MAP_MARGIN_HIGH	64
+++=======
++ #define CREATE_TRACE_POINTS
++ #include <trace/events/percpu.h>
++ 
++ #include "percpu-internal.h"
++ 
++ /* the slots are sorted by free bytes left, 1-31 bytes share the same slot */
++ #define PCPU_SLOT_BASE_SHIFT		5
++ /* chunks in slots below this are subject to being sidelined on failed alloc */
++ #define PCPU_SLOT_FAIL_THRESHOLD	3
++ 
+++>>>>>>> 8744d859427c (percpu: relegate chunks unusable when failing small allocations)
+  #define PCPU_EMPTY_POP_PAGES_LOW	2
+  #define PCPU_EMPTY_POP_PAGES_HIGH	4
+  
+@@@ -313,46 -485,27 +326,62 @@@ static void *pcpu_mem_zalloc(size_t siz
+   *
+   * Free @ptr.  @ptr should have been allocated using pcpu_mem_zalloc().
+   */
+ -static void pcpu_mem_free(void *ptr)
+ +static void pcpu_mem_free(void *ptr, size_t size)
+ +{
+ +	if (size <= PAGE_SIZE)
+ +		kfree(ptr);
+ +	else
+ +		vfree(ptr);
+ +}
+ +
+ +/**
+ + * pcpu_count_occupied_pages - count the number of pages an area occupies
+ + * @chunk: chunk of interest
+ + * @i: index of the area in question
+ + *
+ + * Count the number of pages chunk's @i'th area occupies.  When the area's
+ + * start and/or end address isn't aligned to page boundary, the straddled
+ + * page is included in the count iff the rest of the page is free.
+ + */
+ +static int pcpu_count_occupied_pages(struct pcpu_chunk *chunk, int i)
+  {
+ -	kvfree(ptr);
+ +	int off = chunk->map[i] & ~1;
+ +	int end = chunk->map[i + 1] & ~1;
+ +
+ +	if (!PAGE_ALIGNED(off) && i > 0) {
+ +		int prev = chunk->map[i - 1];
+ +
+ +		if (!(prev & 1) && prev <= round_down(off, PAGE_SIZE))
+ +			off = round_down(off, PAGE_SIZE);
+ +	}
+ +
+ +	if (!PAGE_ALIGNED(end) && i + 1 < chunk->map_used) {
+ +		int next = chunk->map[i + 1];
+ +		int nend = chunk->map[i + 2] & ~1;
+ +
+ +		if (!(next & 1) && nend >= round_up(end, PAGE_SIZE))
+ +			end = round_up(end, PAGE_SIZE);
+ +	}
+ +
+ +	return max_t(int, PFN_DOWN(end) - PFN_UP(off), 0);
+  }
+  
++ static void __pcpu_chunk_move(struct pcpu_chunk *chunk, int slot,
++ 			      bool move_front)
++ {
++ 	if (chunk != pcpu_reserved_chunk) {
++ 		if (move_front)
++ 			list_move(&chunk->list, &pcpu_slot[slot]);
++ 		else
++ 			list_move_tail(&chunk->list, &pcpu_slot[slot]);
++ 	}
++ }
++ 
++ static void pcpu_chunk_move(struct pcpu_chunk *chunk, int slot)
++ {
++ 	__pcpu_chunk_move(chunk, slot, true);
++ }
++ 
+  /**
+   * pcpu_chunk_relocate - put chunk in the appropriate chunk slot
+   * @chunk: chunk of interest
+@@@ -878,25 -1407,32 +903,25 @@@ static void __percpu *pcpu_alloc(size_
+  	bool is_atomic = (gfp & GFP_KERNEL) != GFP_KERNEL;
+  	bool do_warn = !(gfp & __GFP_NOWARN);
+  	static int warn_limit = 10;
+- 	struct pcpu_chunk *chunk;
++ 	struct pcpu_chunk *chunk, *next;
+  	const char *err;
+ -	int slot, off, cpu, ret;
+ +	int occ_pages = 0;
+ +	int slot, off, new_alloc, cpu, ret;
+  	unsigned long flags;
+  	void __percpu *ptr;
+ -	size_t bits, bit_align;
+  
+  	/*
+ -	 * There is now a minimum allocation size of PCPU_MIN_ALLOC_SIZE,
+ -	 * therefore alignment must be a minimum of that many bytes.
+ -	 * An allocation may have internal fragmentation from rounding up
+ -	 * of up to PCPU_MIN_ALLOC_SIZE - 1 bytes.
+ +	 * We want the lowest bit of offset available for in-use/free
+ +	 * indicator, so force >= 16bit alignment and make size even.
+  	 */
+ -	if (unlikely(align < PCPU_MIN_ALLOC_SIZE))
+ -		align = PCPU_MIN_ALLOC_SIZE;
+ +	if (unlikely(align < 2))
+ +		align = 2;
+  
+ -	size = ALIGN(size, PCPU_MIN_ALLOC_SIZE);
+ -	bits = size >> PCPU_MIN_ALLOC_SHIFT;
+ -	bit_align = align >> PCPU_MIN_ALLOC_SHIFT;
+ +	size = ALIGN(size, 2);
+  
+ -	if (unlikely(!size || size > PCPU_MIN_UNIT_SIZE || align > PAGE_SIZE ||
+ -		     !is_power_of_2(align))) {
+ -		WARN(do_warn, "illegal size (%zu) or align (%zu) for percpu allocation\n",
+ -		     size, align);
+ +	if (unlikely(!size || size > PCPU_MIN_UNIT_SIZE || align > PAGE_SIZE)) {
+ +		WARN(do_warn, "illegal size (%zu) or align (%zu) for "
+ +		     "percpu allocation\n", size, align);
+  		return NULL;
+  	}
+  
+@@@ -945,32 -1471,19 +970,42 @@@
+  restart:
+  	/* search through normal chunks */
+  	for (slot = pcpu_size_to_slot(size); slot < pcpu_nr_slots; slot++) {
+++<<<<<<< HEAD
+ +		list_for_each_entry(chunk, &pcpu_slot[slot], list) {
+ +			if (size > chunk->contig_hint)
+++=======
++ 		list_for_each_entry_safe(chunk, next, &pcpu_slot[slot], list) {
++ 			off = pcpu_find_block_fit(chunk, bits, bit_align,
++ 						  is_atomic);
++ 			if (off < 0) {
++ 				if (slot < PCPU_SLOT_FAIL_THRESHOLD)
++ 					pcpu_chunk_move(chunk, 0);
+++>>>>>>> 8744d859427c (percpu: relegate chunks unusable when failing small allocations)
+  				continue;
++ 			}
+  
+ -			off = pcpu_alloc_area(chunk, bits, bit_align, off);
+ +			new_alloc = pcpu_need_to_extend(chunk, is_atomic);
+ +			if (new_alloc) {
+ +				if (is_atomic)
+ +					continue;
+ +				spin_unlock_irqrestore(&pcpu_lock, flags);
+ +				if (pcpu_extend_area_map(chunk,
+ +							 new_alloc) < 0) {
+ +					err = "failed to extend area map";
+ +					goto fail;
+ +				}
+ +				spin_lock_irqsave(&pcpu_lock, flags);
+ +				/*
+ +				 * pcpu_lock has been dropped, need to
+ +				 * restart cpu_slot list walking.
+ +				 */
+ +				goto restart;
+ +			}
+ +
+ +			off = pcpu_alloc_area(chunk, size, align, is_atomic,
+ +					      &occ_pages);
+  			if (off >= 0)
+  				goto area_found;
+ -
+  		}
+  	}
+  
+* Unmerged path mm/percpu.c
