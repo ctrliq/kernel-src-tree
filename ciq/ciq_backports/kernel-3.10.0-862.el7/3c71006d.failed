@@ -1,0 +1,197 @@
+ipv4: fib_rules: Check if rule is a default rule
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Ido Schimmel <idosch@mellanox.com>
+commit 3c71006d15fd3a99071a2b20d01de3edabc85767
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/3c71006d.failed
+
+Currently, when non-default (custom) FIB rules are used, devices capable
+of layer 3 offloading flush their tables and let the kernel do the
+forwarding instead.
+
+When these devices' drivers are loaded they register to the FIB
+notification chain, which lets them know about the existence of any
+custom FIB rules. This is done by sending a RULE_ADD notification based
+on the value of 'net->ipv4.fib_has_custom_rules'.
+
+This approach is problematic when VRF offload is taken into account, as
+upon the creation of the first VRF netdev, a l3mdev rule is programmed
+to direct skbs to the VRF's table.
+
+Instead of merely reading the above value and sending a single RULE_ADD
+notification, we should iterate over all the FIB rules and send a
+detailed notification for each, thereby allowing offloading drivers to
+sanitize the rules they don't support and potentially flush their
+tables.
+
+While l3mdev rules are uniquely marked, the default rules are not.
+Therefore, when they are being notified they might invoke offloading
+drivers to unnecessarily flush their tables.
+
+Solve this by adding an helper to check if a FIB rule is a default rule.
+Namely, its selector should match all packets and its action should
+point to the local, main or default tables.
+
+As noted by David Ahern, uniquely marking the default rules is
+insufficient. When using VRFs, it's common to avoid false hits by moving
+the rule for the local table to just before the main table:
+
+Default configuration:
+$ ip rule show
+0:      from all lookup local
+32766:  from all lookup main
+32767:  from all lookup default
+
+Common configuration with VRFs:
+$ ip rule show
+1000:   from all lookup [l3mdev-table]
+32765:  from all lookup local
+32766:  from all lookup main
+32767:  from all lookup default
+
+	Signed-off-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Acked-by: David Ahern <dsa@cumulusnetworks.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3c71006d15fd3a99071a2b20d01de3edabc85767)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/fib_rules.h
+#	net/core/fib_rules.c
+#	net/ipv4/fib_rules.c
+diff --cc include/net/fib_rules.h
+index 951273722f8b,1243b9c7694e..000000000000
+--- a/include/net/fib_rules.h
++++ b/include/net/fib_rules.h
+@@@ -106,13 -133,16 +106,24 @@@ static inline u32 frh_get_table(struct 
+  	return frh->table;
+  }
+  
+ -struct fib_rules_ops *fib_rules_register(const struct fib_rules_ops *,
+ -					 struct net *);
+ -void fib_rules_unregister(struct fib_rules_ops *);
+ -
+ +extern struct fib_rules_ops *fib_rules_register(const struct fib_rules_ops *, struct net *);
+ +extern void fib_rules_unregister(struct fib_rules_ops *);
+ +
+++<<<<<<< HEAD
+ +extern int			fib_rules_lookup(struct fib_rules_ops *,
+ +						 struct flowi *, int flags,
+ +						 struct fib_lookup_arg *);
+ +extern int			fib_default_rule_add(struct fib_rules_ops *,
+ +						     u32 pref, u32 table,
+ +						     u32 flags);
+++=======
++ int fib_rules_lookup(struct fib_rules_ops *, struct flowi *, int flags,
++ 		     struct fib_lookup_arg *);
++ int fib_default_rule_add(struct fib_rules_ops *, u32 pref, u32 table,
++ 			 u32 flags);
++ bool fib_rule_matchall(const struct fib_rule *rule);
++ 
++ int fib_nl_newrule(struct sk_buff *skb, struct nlmsghdr *nlh);
++ int fib_nl_delrule(struct sk_buff *skb, struct nlmsghdr *nlh);
+++>>>>>>> 3c71006d15fd (ipv4: fib_rules: Check if rule is a default rule)
+  #endif
+diff --cc net/core/fib_rules.c
+index ce8f348377af,816e3ccb0ec9..000000000000
+--- a/net/core/fib_rules.c
++++ b/net/core/fib_rules.c
+@@@ -18,6 -18,25 +18,28 @@@
+  #include <net/fib_rules.h>
+  #include <net/ip_tunnels.h>
+  
+++<<<<<<< HEAD
+++=======
++ static const struct fib_kuid_range fib_kuid_range_unset = {
++ 	KUIDT_INIT(0),
++ 	KUIDT_INIT(~0),
++ };
++ 
++ bool fib_rule_matchall(const struct fib_rule *rule)
++ {
++ 	if (rule->iifindex || rule->oifindex || rule->mark || rule->tun_id ||
++ 	    rule->flags)
++ 		return false;
++ 	if (rule->suppress_ifgroup != -1 || rule->suppress_prefixlen != -1)
++ 		return false;
++ 	if (!uid_eq(rule->uid_range.start, fib_kuid_range_unset.start) ||
++ 	    !uid_eq(rule->uid_range.end, fib_kuid_range_unset.end))
++ 		return false;
++ 	return true;
++ }
++ EXPORT_SYMBOL_GPL(fib_rule_matchall);
++ 
+++>>>>>>> 3c71006d15fd (ipv4: fib_rules: Check if rule is a default rule)
+  int fib_default_rule_add(struct fib_rules_ops *ops,
+  			 u32 pref, u32 table, u32 flags)
+  {
+diff --cc net/ipv4/fib_rules.c
+index 329dfa168e33,d531bc94b15e..000000000000
+--- a/net/ipv4/fib_rules.c
++++ b/net/ipv4/fib_rules.c
+@@@ -47,7 -47,29 +47,33 @@@ struct fib4_rule 
+  #endif
+  };
+  
+++<<<<<<< HEAD
+ +int __fib_lookup(struct net *net, struct flowi4 *flp, struct fib_result *res)
+++=======
++ static bool fib4_rule_matchall(const struct fib_rule *rule)
++ {
++ 	struct fib4_rule *r = container_of(rule, struct fib4_rule, common);
++ 
++ 	if (r->dst_len || r->src_len || r->tos)
++ 		return false;
++ 	return fib_rule_matchall(rule);
++ }
++ 
++ bool fib4_rule_default(const struct fib_rule *rule)
++ {
++ 	if (!fib4_rule_matchall(rule) || rule->action != FR_ACT_TO_TBL ||
++ 	    rule->l3mdev)
++ 		return false;
++ 	if (rule->table != RT_TABLE_LOCAL && rule->table != RT_TABLE_MAIN &&
++ 	    rule->table != RT_TABLE_DEFAULT)
++ 		return false;
++ 	return true;
++ }
++ EXPORT_SYMBOL_GPL(fib4_rule_default);
++ 
++ int __fib_lookup(struct net *net, struct flowi4 *flp,
++ 		 struct fib_result *res, unsigned int flags)
+++>>>>>>> 3c71006d15fd (ipv4: fib_rules: Check if rule is a default rule)
+  {
+  	struct fib_lookup_arg arg = {
+  		.result = res,
+* Unmerged path include/net/fib_rules.h
+diff --git a/include/net/ip_fib.h b/include/net/ip_fib.h
+index c9e0e41061bc..b7d1c1a4034c 100644
+--- a/include/net/ip_fib.h
++++ b/include/net/ip_fib.h
+@@ -317,6 +317,11 @@ out:
+ 	return err;
+ }
+ 
++static inline bool fib4_rule_default(const struct fib_rule *rule)
++{
++	return true;
++}
++
+ #else /* CONFIG_IP_MULTIPLE_TABLES */
+ int __net_init fib4_rules_init(struct net *net);
+ void __net_exit fib4_rules_exit(struct net *net);
+@@ -366,6 +371,8 @@ out:
+ 	return err;
+ }
+ 
++bool fib4_rule_default(const struct fib_rule *rule);
++
+ #endif /* CONFIG_IP_MULTIPLE_TABLES */
+ 
+ /* Exported by fib_frontend.c */
+* Unmerged path net/core/fib_rules.c
+* Unmerged path net/ipv4/fib_rules.c
