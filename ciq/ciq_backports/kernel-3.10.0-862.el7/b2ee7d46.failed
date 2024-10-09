@@ -1,0 +1,92 @@
+loop: Add PF_LESS_THROTTLE to block/loop device thread.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [block] loop: Add PF_LESS_THROTTLE to block/loop device thread (Ming Lei) [1511107]
+Rebuild_FUZZ: 99.08%
+commit-author NeilBrown <neilb@suse.com>
+commit b2ee7d46befc43e355ffaf7bfabb00e7a901b3a0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/b2ee7d46.failed
+
+When a filesystem is mounted from a loop device, writes are
+throttled by balance_dirty_pages() twice: once when writing
+to the filesystem and once when the loop_handle_cmd() writes
+to the backing file.  This double-throttling can trigger
+positive feedback loops that create significant delays.  The
+throttling at the lower level is seen by the upper level as
+a slow device, so it throttles extra hard.
+
+The PF_LESS_THROTTLE flag was created to handle exactly this
+circumstance, though with an NFS filesystem mounted from a
+local NFS server.  It reduces the throttling on the lower
+layer so that it can proceed largely unthrottled.
+
+To demonstrate this, create a filesystem on a loop device
+and write (e.g. with dd) several large files which combine
+to consume significantly more than the limit set by
+/proc/sys/vm/dirty_ratio or dirty_bytes.  Measure the total
+time taken.
+
+When I do this directly on a device (no loop device) the
+total time for several runs (mkfs, mount, write 200 files,
+umount) is fairly stable: 28-35 seconds.
+When I do this over a loop device the times are much worse
+and less stable.  52-460 seconds.  Half below 100seconds,
+half above.
+When I apply this patch, the times become stable again,
+though not as fast as the no-loop-back case: 53-72 seconds.
+
+There may be room for further improvement as the total overhead still
+seems too high, but this is a big improvement.
+
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Ming Lei <tom.leiming@gmail.com>
+	Suggested-by: Michal Hocko <mhocko@suse.com>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Signed-off-by: NeilBrown <neilb@suse.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit b2ee7d46befc43e355ffaf7bfabb00e7a901b3a0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/loop.c
+diff --cc drivers/block/loop.c
+index d5de459aa504,0de11444e317..000000000000
+--- a/drivers/block/loop.c
++++ b/drivers/block/loop.c
+@@@ -841,6 -848,29 +841,32 @@@ static void loop_config_discard(struct 
+  	queue_flag_set_unlocked(QUEUE_FLAG_DISCARD, q);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void loop_unprepare_queue(struct loop_device *lo)
++ {
++ 	kthread_flush_worker(&lo->worker);
++ 	kthread_stop(lo->worker_task);
++ }
++ 
++ static int loop_kthread_worker_fn(void *worker_ptr)
++ {
++ 	current->flags |= PF_LESS_THROTTLE;
++ 	return kthread_worker_fn(worker_ptr);
++ }
++ 
++ static int loop_prepare_queue(struct loop_device *lo)
++ {
++ 	kthread_init_worker(&lo->worker);
++ 	lo->worker_task = kthread_run(loop_kthread_worker_fn,
++ 			&lo->worker, "loop%d", lo->lo_number);
++ 	if (IS_ERR(lo->worker_task))
++ 		return -ENOMEM;
++ 	set_user_nice(lo->worker_task, MIN_NICE);
++ 	return 0;
++ }
++ 
+++>>>>>>> b2ee7d46befc (loop: Add PF_LESS_THROTTLE to block/loop device thread.)
+  static int loop_set_fd(struct loop_device *lo, fmode_t mode,
+  		       struct block_device *bdev, unsigned int arg)
+  {
+* Unmerged path drivers/block/loop.c
