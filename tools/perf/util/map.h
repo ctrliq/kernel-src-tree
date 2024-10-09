@@ -56,9 +56,12 @@ struct map {
 	refcount_t		refcnt;
 };
 
+#define KMAP_NAME_LEN 256
+
 struct kmap {
 	struct ref_reloc_sym	*ref_reloc_sym;
 	struct map_groups	*kmaps;
+	char			name[KMAP_NAME_LEN];
 };
 
 struct maps {
@@ -85,6 +88,7 @@ static inline struct map_groups *map_groups__get(struct map_groups *mg)
 
 void map_groups__put(struct map_groups *mg);
 
+struct kmap *__map__kmap(struct map *map);
 struct kmap *map__kmap(struct map *map);
 struct map_groups *map__kmaps(struct map *map);
 
@@ -260,10 +264,11 @@ static inline struct map *map_groups__find_by_name(struct map_groups *mg, const 
 }
 
 bool __map__is_kernel(const struct map *map);
+bool __map__is_extra_kernel_map(const struct map *map);
 
 static inline bool __map__is_kmodule(const struct map *map)
 {
-	return !__map__is_kernel(map);
+	return !__map__is_kernel(map) && !__map__is_extra_kernel_map(map);
 }
 
 bool map__has_symbols(const struct map *map);
