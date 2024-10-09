@@ -1,0 +1,86 @@
+userns: Free user namespaces in process context
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Eric W. Biederman <ebiederm@xmission.com>
+commit b032132c3c218f4a09e9499b3674299a752581c6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/b032132c.failed
+
+Add the necessary boiler plate to move freeing of user namespaces into
+work queue and thus into process context where things can sleep.
+
+This is a necessary precursor to per user namespace sysctls.
+
+	Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+(cherry picked from commit b032132c3c218f4a09e9499b3674299a752581c6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/user_namespace.h
+diff --cc include/linux/user_namespace.h
+index 9b176275291d,4e79b3c64dee..000000000000
+--- a/include/linux/user_namespace.h
++++ b/include/linux/user_namespace.h
+@@@ -39,8 -39,7 +39,12 @@@ struct user_namespace 
+  	struct key		*persistent_keyring_register;
+  	struct rw_semaphore	persistent_keyring_register_sem;
+  #endif
+++<<<<<<< HEAD
+ +	RH_KABI_EXTEND(int level)
+ +	RH_KABI_EXTEND(unsigned long flags)
+++=======
++ 	struct work_struct	work;
+++>>>>>>> b032132c3c21 (userns: Free user namespaces in process context)
+  };
+  
+  extern struct user_namespace init_user_ns;
+* Unmerged path include/linux/user_namespace.h
+diff --git a/kernel/user_namespace.c b/kernel/user_namespace.c
+index 57f036cb8f03..126b0150c34d 100644
+--- a/kernel/user_namespace.c
++++ b/kernel/user_namespace.c
+@@ -30,6 +30,7 @@ static DEFINE_MUTEX(userns_state_mutex);
+ static bool new_idmap_permitted(const struct file *file,
+ 				struct user_namespace *ns, int cap_setid,
+ 				struct uid_gid_map *map);
++static void free_user_ns(struct work_struct *work);
+ 
+ static void set_cred_user_ns(struct cred *cred, struct user_namespace *user_ns)
+ {
+@@ -113,6 +114,7 @@ int create_user_ns(struct cred *new)
+ 	ns->level = parent_ns->level + 1;
+ 	ns->owner = owner;
+ 	ns->group = group;
++	INIT_WORK(&ns->work, free_user_ns);
+ 
+ 	/* Inherit USERNS_SETGROUPS_ALLOWED from our parent */
+ 	mutex_lock(&userns_state_mutex);
+@@ -149,9 +151,10 @@ int unshare_userns(unsigned long unshare_flags, struct cred **new_cred)
+ 	return err;
+ }
+ 
+-void free_user_ns(struct user_namespace *ns)
++static void free_user_ns(struct work_struct *work)
+ {
+-	struct user_namespace *parent;
++	struct user_namespace *parent, *ns =
++		container_of(work, struct user_namespace, work);
+ 
+ 	do {
+ 		parent = ns->parent;
+@@ -163,7 +166,12 @@ void free_user_ns(struct user_namespace *ns)
+ 		ns = parent;
+ 	} while (atomic_dec_and_test(&parent->count));
+ }
+-EXPORT_SYMBOL(free_user_ns);
++
++void __put_user_ns(struct user_namespace *ns)
++{
++	schedule_work(&ns->work);
++}
++EXPORT_SYMBOL(__put_user_ns);
+ 
+ static u32 map_id_range_down(struct uid_gid_map *map, u32 id, u32 count)
+ {
