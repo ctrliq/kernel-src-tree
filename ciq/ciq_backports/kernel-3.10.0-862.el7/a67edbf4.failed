@@ -1,0 +1,1047 @@
+bpf: add initial bpf tracepoints
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit a67edbf4fb6deadcfe57a04a134abed4a5ba3bb5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/a67edbf4.failed
+
+This work adds a number of tracepoints to paths that are either
+considered slow-path or exception-like states, where monitoring or
+inspecting them would be desirable.
+
+For bpf(2) syscall, tracepoints have been placed for main commands
+when they succeed. In XDP case, tracepoint is for exceptions, that
+is, f.e. on abnormal BPF program exit such as unknown or XDP_ABORTED
+return code, or when error occurs during XDP_TX action and the packet
+could not be forwarded.
+
+Both have been split into separate event headers, and can be further
+extended. Worst case, if they unexpectedly should get into our way in
+future, they can also removed [1]. Of course, these tracepoints (like
+any other) can be analyzed by eBPF itself, etc. Example output:
+
+  # ./perf record -a -e bpf:* sleep 10
+  # ./perf script
+  sock_example  6197 [005]   283.980322:      bpf:bpf_map_create: map type=ARRAY ufd=4 key=4 val=8 max=256 flags=0
+  sock_example  6197 [005]   283.980721:       bpf:bpf_prog_load: prog=a5ea8fa30ea6849c type=SOCKET_FILTER ufd=5
+  sock_example  6197 [005]   283.988423:   bpf:bpf_prog_get_type: prog=a5ea8fa30ea6849c type=SOCKET_FILTER
+  sock_example  6197 [005]   283.988443: bpf:bpf_map_lookup_elem: map type=ARRAY ufd=4 key=[06 00 00 00] val=[00 00 00 00 00 00 00 00]
+  [...]
+  sock_example  6197 [005]   288.990868: bpf:bpf_map_lookup_elem: map type=ARRAY ufd=4 key=[01 00 00 00] val=[14 00 00 00 00 00 00 00]
+       swapper     0 [005]   289.338243:    bpf:bpf_prog_put_rcu: prog=a5ea8fa30ea6849c type=SOCKET_FILTER
+
+  [1] https://lwn.net/Articles/705270/
+
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a67edbf4fb6deadcfe57a04a134abed4a5ba3bb5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx4/en_rx.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+#	drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+#	drivers/net/ethernet/qlogic/qede/qede_fp.c
+#	drivers/net/virtio_net.c
+#	kernel/bpf/core.c
+#	kernel/bpf/inode.c
+#	kernel/bpf/syscall.c
+diff --cc drivers/net/ethernet/mellanox/mlx4/en_rx.c
+index cacebaec3f9d,f15ddba3659a..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_rx.c
+@@@ -32,6 -32,8 +32,11 @@@
+   */
+  
+  #include <net/busy_poll.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/bpf.h>
++ #include <linux/bpf_trace.h>
+++>>>>>>> a67edbf4fb6d (bpf: add initial bpf tracepoints)
+  #include <linux/mlx4/cq.h>
+  #include <linux/slab.h>
+  #include <linux/mlx4/qp.h>
+@@@ -888,10 -889,61 +893,66 @@@ int mlx4_en_process_rx_cq(struct net_de
+  		 */
+  		length = be32_to_cpu(cqe->byte_cnt);
+  		length -= ring->fcs_del;
+++<<<<<<< HEAD
+++=======
++ 		l2_tunnel = (dev->hw_enc_features & NETIF_F_RXCSUM) &&
++ 			(cqe->vlan_my_qpn & cpu_to_be32(MLX4_CQE_L2_TUNNEL));
++ 
++ 		/* A bpf program gets first chance to drop the packet. It may
++ 		 * read bytes but not past the end of the frag.
++ 		 */
++ 		if (xdp_prog) {
++ 			struct xdp_buff xdp;
++ 			dma_addr_t dma;
++ 			void *orig_data;
++ 			u32 act;
++ 
++ 			dma = be64_to_cpu(rx_desc->data[0].addr);
++ 			dma_sync_single_for_cpu(priv->ddev, dma,
++ 						priv->frag_info[0].frag_size,
++ 						DMA_FROM_DEVICE);
++ 
++ 			xdp.data_hard_start = page_address(frags[0].page);
++ 			xdp.data = xdp.data_hard_start + frags[0].page_offset;
++ 			xdp.data_end = xdp.data + length;
++ 			orig_data = xdp.data;
++ 
++ 			act = bpf_prog_run_xdp(xdp_prog, &xdp);
++ 
++ 			if (xdp.data != orig_data) {
++ 				length = xdp.data_end - xdp.data;
++ 				frags[0].page_offset = xdp.data -
++ 					xdp.data_hard_start;
++ 			}
++ 
++ 			switch (act) {
++ 			case XDP_PASS:
++ 				break;
++ 			case XDP_TX:
++ 				if (likely(!mlx4_en_xmit_frame(ring, frags, dev,
++ 							length, cq->ring,
++ 							&doorbell_pending)))
++ 					goto consumed;
++ 				trace_xdp_exception(dev, xdp_prog, act);
++ 				goto xdp_drop_no_cnt; /* Drop on xmit failure */
++ 			default:
++ 				bpf_warn_invalid_xdp_action(act);
++ 			case XDP_ABORTED:
++ 				trace_xdp_exception(dev, xdp_prog, act);
++ 			case XDP_DROP:
++ 				ring->xdp_drop++;
++ xdp_drop_no_cnt:
++ 				if (likely(mlx4_en_rx_recycle(ring, frags)))
++ 					goto consumed;
++ 				goto next;
++ 			}
++ 		}
++ 
+++>>>>>>> a67edbf4fb6d (bpf: add initial bpf tracepoints)
+  		ring->bytes += length;
+  		ring->packets++;
+ +		l2_tunnel = (dev->hw_enc_features & NETIF_F_RXCSUM) &&
+ +			(cqe->vlan_my_qpn & cpu_to_be32(MLX4_CQE_L2_TUNNEL));
+  
+  		if (likely(dev->features & NETIF_F_RXCSUM)) {
+  			if (cqe->status & cpu_to_be16(MLX4_CQE_STATUS_TCP |
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index 8b4b5a3808c1,3d2e1a1886a5..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -637,6 -629,121 +638,124 @@@ static inline void mlx5e_complete_rx_cq
+  	mlx5e_build_rx_skb(cqe, cqe_bcnt, rq, skb);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline void mlx5e_xmit_xdp_doorbell(struct mlx5e_sq *sq)
++ {
++ 	struct mlx5_wq_cyc *wq = &sq->wq;
++ 	struct mlx5e_tx_wqe *wqe;
++ 	u16 pi = (sq->pc - MLX5E_XDP_TX_WQEBBS) & wq->sz_m1; /* last pi */
++ 
++ 	wqe  = mlx5_wq_cyc_get_wqe(wq, pi);
++ 
++ 	wqe->ctrl.fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE;
++ 	mlx5e_tx_notify_hw(sq, &wqe->ctrl, 0);
++ }
++ 
++ static inline bool mlx5e_xmit_xdp_frame(struct mlx5e_rq *rq,
++ 					struct mlx5e_dma_info *di,
++ 					const struct xdp_buff *xdp)
++ {
++ 	struct mlx5e_sq          *sq   = &rq->channel->xdp_sq;
++ 	struct mlx5_wq_cyc       *wq   = &sq->wq;
++ 	u16                      pi    = sq->pc & wq->sz_m1;
++ 	struct mlx5e_tx_wqe      *wqe  = mlx5_wq_cyc_get_wqe(wq, pi);
++ 	struct mlx5e_sq_wqe_info *wi   = &sq->db.xdp.wqe_info[pi];
++ 
++ 	struct mlx5_wqe_ctrl_seg *cseg = &wqe->ctrl;
++ 	struct mlx5_wqe_eth_seg  *eseg = &wqe->eth;
++ 	struct mlx5_wqe_data_seg *dseg;
++ 
++ 	ptrdiff_t data_offset = xdp->data - xdp->data_hard_start;
++ 	dma_addr_t dma_addr  = di->addr + data_offset + MLX5E_XDP_MIN_INLINE;
++ 	unsigned int dma_len = xdp->data_end - xdp->data;
++ 
++ 	if (unlikely(dma_len < MLX5E_XDP_MIN_INLINE ||
++ 		     MLX5E_SW2HW_MTU(rq->netdev->mtu) < dma_len)) {
++ 		rq->stats.xdp_drop++;
++ 		mlx5e_page_release(rq, di, true);
++ 		return false;
++ 	}
++ 
++ 	if (unlikely(!mlx5e_sq_has_room_for(sq, MLX5E_XDP_TX_WQEBBS))) {
++ 		if (sq->db.xdp.doorbell) {
++ 			/* SQ is full, ring doorbell */
++ 			mlx5e_xmit_xdp_doorbell(sq);
++ 			sq->db.xdp.doorbell = false;
++ 		}
++ 		rq->stats.xdp_tx_full++;
++ 		mlx5e_page_release(rq, di, true);
++ 		return false;
++ 	}
++ 
++ 	dma_len -= MLX5E_XDP_MIN_INLINE;
++ 	dma_sync_single_for_device(sq->pdev, dma_addr, dma_len,
++ 				   PCI_DMA_TODEVICE);
++ 
++ 	memset(wqe, 0, sizeof(*wqe));
++ 
++ 	/* copy the inline part */
++ 	memcpy(eseg->inline_hdr_start, xdp->data, MLX5E_XDP_MIN_INLINE);
++ 	eseg->inline_hdr_sz = cpu_to_be16(MLX5E_XDP_MIN_INLINE);
++ 
++ 	dseg = (struct mlx5_wqe_data_seg *)cseg + (MLX5E_XDP_TX_DS_COUNT - 1);
++ 
++ 	/* write the dma part */
++ 	dseg->addr       = cpu_to_be64(dma_addr);
++ 	dseg->byte_count = cpu_to_be32(dma_len);
++ 	dseg->lkey       = sq->mkey_be;
++ 
++ 	cseg->opmod_idx_opcode = cpu_to_be32((sq->pc << 8) | MLX5_OPCODE_SEND);
++ 	cseg->qpn_ds = cpu_to_be32((sq->sqn << 8) | MLX5E_XDP_TX_DS_COUNT);
++ 
++ 	sq->db.xdp.di[pi] = *di;
++ 	wi->opcode     = MLX5_OPCODE_SEND;
++ 	wi->num_wqebbs = MLX5E_XDP_TX_WQEBBS;
++ 	sq->pc += MLX5E_XDP_TX_WQEBBS;
++ 
++ 	sq->db.xdp.doorbell = true;
++ 	rq->stats.xdp_tx++;
++ 	return true;
++ }
++ 
++ /* returns true if packet was consumed by xdp */
++ static inline int mlx5e_xdp_handle(struct mlx5e_rq *rq,
++ 				   struct mlx5e_dma_info *di,
++ 				   void *va, u16 *rx_headroom, u32 *len)
++ {
++ 	const struct bpf_prog *prog = READ_ONCE(rq->xdp_prog);
++ 	struct xdp_buff xdp;
++ 	u32 act;
++ 
++ 	if (!prog)
++ 		return false;
++ 
++ 	xdp.data = va + *rx_headroom;
++ 	xdp.data_end = xdp.data + *len;
++ 	xdp.data_hard_start = va;
++ 
++ 	act = bpf_prog_run_xdp(prog, &xdp);
++ 	switch (act) {
++ 	case XDP_PASS:
++ 		*rx_headroom = xdp.data - xdp.data_hard_start;
++ 		*len = xdp.data_end - xdp.data;
++ 		return false;
++ 	case XDP_TX:
++ 		if (unlikely(!mlx5e_xmit_xdp_frame(rq, di, &xdp)))
++ 			trace_xdp_exception(rq->netdev, prog, act);
++ 		return true;
++ 	default:
++ 		bpf_warn_invalid_xdp_action(act);
++ 	case XDP_ABORTED:
++ 		trace_xdp_exception(rq->netdev, prog, act);
++ 	case XDP_DROP:
++ 		rq->stats.xdp_drop++;
++ 		mlx5e_page_release(rq, di, true);
++ 		return true;
++ 	}
++ }
++ 
+++>>>>>>> a67edbf4fb6d (bpf: add initial bpf tracepoints)
+  static inline
+  struct sk_buff *skb_from_cqe(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe,
+  			     u16 wqe_counter, u32 cqe_bcnt)
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index de17d3265a77,6ac43abf561b..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@@ -41,6 -41,8 +41,11 @@@
+   *          Chris Telfer <chris.telfer@netronome.com>
+   */
+  
+++<<<<<<< HEAD
+++=======
++ #include <linux/bpf.h>
++ #include <linux/bpf_trace.h>
+++>>>>>>> a67edbf4fb6d (bpf: add initial bpf tracepoints)
+  #include <linux/module.h>
+  #include <linux/kernel.h>
+  #include <linux/init.h>
+@@@ -1351,6 -1460,69 +1356,72 @@@ nfp_net_rx_drop(struct nfp_net_r_vecto
+  		dev_kfree_skb_any(skb);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool
++ nfp_net_tx_xdp_buf(struct nfp_net *nn, struct nfp_net_rx_ring *rx_ring,
++ 		   struct nfp_net_tx_ring *tx_ring,
++ 		   struct nfp_net_rx_buf *rxbuf, unsigned int pkt_off,
++ 		   unsigned int pkt_len)
++ {
++ 	struct nfp_net_tx_buf *txbuf;
++ 	struct nfp_net_tx_desc *txd;
++ 	dma_addr_t new_dma_addr;
++ 	void *new_frag;
++ 	int wr_idx;
++ 
++ 	if (unlikely(nfp_net_tx_full(tx_ring, 1))) {
++ 		nfp_net_rx_drop(rx_ring->r_vec, rx_ring, rxbuf, NULL);
++ 		return false;
++ 	}
++ 
++ 	new_frag = nfp_net_napi_alloc_one(nn, DMA_BIDIRECTIONAL, &new_dma_addr);
++ 	if (unlikely(!new_frag)) {
++ 		nfp_net_rx_drop(rx_ring->r_vec, rx_ring, rxbuf, NULL);
++ 		return false;
++ 	}
++ 	nfp_net_rx_give_one(rx_ring, new_frag, new_dma_addr);
++ 
++ 	wr_idx = tx_ring->wr_p & (tx_ring->cnt - 1);
++ 
++ 	/* Stash the soft descriptor of the head then initialize it */
++ 	txbuf = &tx_ring->txbufs[wr_idx];
++ 	txbuf->frag = rxbuf->frag;
++ 	txbuf->dma_addr = rxbuf->dma_addr;
++ 	txbuf->fidx = -1;
++ 	txbuf->pkt_cnt = 1;
++ 	txbuf->real_len = pkt_len;
++ 
++ 	dma_sync_single_for_device(&nn->pdev->dev, rxbuf->dma_addr + pkt_off,
++ 				   pkt_len, DMA_TO_DEVICE);
++ 
++ 	/* Build TX descriptor */
++ 	txd = &tx_ring->txds[wr_idx];
++ 	txd->offset_eop = PCIE_DESC_TX_EOP;
++ 	txd->dma_len = cpu_to_le16(pkt_len);
++ 	nfp_desc_set_dma_addr(txd, rxbuf->dma_addr + pkt_off);
++ 	txd->data_len = cpu_to_le16(pkt_len);
++ 
++ 	txd->flags = 0;
++ 	txd->mss = 0;
++ 	txd->l4_offset = 0;
++ 
++ 	tx_ring->wr_p++;
++ 	tx_ring->wr_ptr_add++;
++ 	return true;
++ }
++ 
++ static int nfp_net_run_xdp(struct bpf_prog *prog, void *data, unsigned int len)
++ {
++ 	struct xdp_buff xdp;
++ 
++ 	xdp.data = data;
++ 	xdp.data_end = data + len;
++ 
++ 	return bpf_prog_run_xdp(prog, &xdp);
++ }
++ 
+++>>>>>>> a67edbf4fb6d (bpf: add initial bpf tracepoints)
+  /**
+   * nfp_net_rx() - receive up to @budget packets on @rx_ring
+   * @rx_ring:   RX ring to receive from
+@@@ -1420,7 -1602,36 +1491,40 @@@ static int nfp_net_rx(struct nfp_net_rx
+  		r_vec->rx_bytes += pkt_len;
+  		u64_stats_update_end(&r_vec->rx_sync);
+  
+++<<<<<<< HEAD
+ +		skb = build_skb(rxbuf->frag, nn->fl_bufsz);
+++=======
++ 		if (xdp_prog && !(rxd->rxd.flags & PCIE_DESC_RX_BPF &&
++ 				  nn->bpf_offload_xdp)) {
++ 			int act;
++ 
++ 			dma_sync_single_for_cpu(&nn->pdev->dev,
++ 						rxbuf->dma_addr + pkt_off,
++ 						pkt_len, DMA_FROM_DEVICE);
++ 			act = nfp_net_run_xdp(xdp_prog, rxbuf->frag + data_off,
++ 					      pkt_len);
++ 			switch (act) {
++ 			case XDP_PASS:
++ 				break;
++ 			case XDP_TX:
++ 				if (unlikely(!nfp_net_tx_xdp_buf(nn, rx_ring,
++ 								 tx_ring, rxbuf,
++ 								 pkt_off, pkt_len)))
++ 					trace_xdp_exception(nn->netdev, xdp_prog, act);
++ 				continue;
++ 			default:
++ 				bpf_warn_invalid_xdp_action(act);
++ 			case XDP_ABORTED:
++ 				trace_xdp_exception(nn->netdev, xdp_prog, act);
++ 			case XDP_DROP:
++ 				nfp_net_rx_give_one(rx_ring, rxbuf->frag,
++ 						    rxbuf->dma_addr);
++ 				continue;
++ 			}
++ 		}
++ 
++ 		skb = build_skb(rxbuf->frag, true_bufsz);
+++>>>>>>> a67edbf4fb6d (bpf: add initial bpf tracepoints)
+  		if (unlikely(!skb)) {
+  			nfp_net_rx_drop(r_vec, rx_ring, rxbuf, NULL);
+  			continue;
+diff --cc drivers/net/ethernet/qlogic/qede/qede_fp.c
+index f9574e2b30d3,445d4d2492c3..000000000000
+--- a/drivers/net/ethernet/qlogic/qede/qede_fp.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_fp.c
+@@@ -921,6 -983,69 +922,72 @@@ static bool qede_pkt_is_ip_fragmented(s
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Return true iff packet is to be passed to stack */
++ static bool qede_rx_xdp(struct qede_dev *edev,
++ 			struct qede_fastpath *fp,
++ 			struct qede_rx_queue *rxq,
++ 			struct bpf_prog *prog,
++ 			struct sw_rx_data *bd,
++ 			struct eth_fast_path_rx_reg_cqe *cqe)
++ {
++ 	u16 len = le16_to_cpu(cqe->len_on_first_bd);
++ 	struct xdp_buff xdp;
++ 	enum xdp_action act;
++ 
++ 	xdp.data = page_address(bd->data) + cqe->placement_offset;
++ 	xdp.data_end = xdp.data + len;
++ 
++ 	/* Queues always have a full reset currently, so for the time
++ 	 * being until there's atomic program replace just mark read
++ 	 * side for map helpers.
++ 	 */
++ 	rcu_read_lock();
++ 	act = bpf_prog_run_xdp(prog, &xdp);
++ 	rcu_read_unlock();
++ 
++ 	if (act == XDP_PASS)
++ 		return true;
++ 
++ 	/* Count number of packets not to be passed to stack */
++ 	rxq->xdp_no_pass++;
++ 
++ 	switch (act) {
++ 	case XDP_TX:
++ 		/* We need the replacement buffer before transmit. */
++ 		if (qede_alloc_rx_buffer(rxq, true)) {
++ 			qede_recycle_rx_bd_ring(rxq, 1);
++ 			trace_xdp_exception(edev->ndev, prog, act);
++ 			return false;
++ 		}
++ 
++ 		/* Now if there's a transmission problem, we'd still have to
++ 		 * throw current buffer, as replacement was already allocated.
++ 		 */
++ 		if (qede_xdp_xmit(edev, fp, bd, cqe->placement_offset, len)) {
++ 			dma_unmap_page(rxq->dev, bd->mapping,
++ 				       PAGE_SIZE, DMA_BIDIRECTIONAL);
++ 			__free_page(bd->data);
++ 			trace_xdp_exception(edev->ndev, prog, act);
++ 		}
++ 
++ 		/* Regardless, we've consumed an Rx BD */
++ 		qede_rx_bd_ring_consume(rxq);
++ 		return false;
++ 
++ 	default:
++ 		bpf_warn_invalid_xdp_action(act);
++ 	case XDP_ABORTED:
++ 		trace_xdp_exception(edev->ndev, prog, act);
++ 	case XDP_DROP:
++ 		qede_recycle_rx_bd_ring(rxq, cqe->bd_num);
++ 	}
++ 
++ 	return false;
++ }
++ 
+++>>>>>>> a67edbf4fb6d (bpf: add initial bpf tracepoints)
+  static struct sk_buff *qede_rx_allocate_skb(struct qede_dev *edev,
+  					    struct qede_rx_queue *rxq,
+  					    struct sw_rx_data *bd, u16 len,
+diff --cc drivers/net/virtio_net.c
+index 27d840eb5123,f9bf94887ff1..000000000000
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@@ -23,6 -22,8 +23,11 @@@
+  #include <linux/module.h>
+  #include <linux/virtio.h>
+  #include <linux/virtio_net.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/bpf.h>
++ #include <linux/bpf_trace.h>
+++>>>>>>> a67edbf4fb6d (bpf: add initial bpf tracepoints)
+  #include <linux/scatterlist.h>
+  #include <linux/if_vlan.h>
+  #include <linux/slab.h>
+@@@ -288,9 -331,119 +293,122 @@@ static struct sk_buff *page_to_skb(stru
+  	return skb;
+  }
+  
+++<<<<<<< HEAD
+ +static struct sk_buff *receive_small(struct virtnet_info *vi, void *buf, unsigned int len)
+++=======
++ static bool virtnet_xdp_xmit(struct virtnet_info *vi,
++ 			     struct receive_queue *rq,
++ 			     struct send_queue *sq,
++ 			     struct xdp_buff *xdp,
++ 			     void *data)
++ {
++ 	struct virtio_net_hdr_mrg_rxbuf *hdr;
++ 	unsigned int num_sg, len;
++ 	void *xdp_sent;
++ 	int err;
++ 
++ 	/* Free up any pending old buffers before queueing new ones. */
++ 	while ((xdp_sent = virtqueue_get_buf(sq->vq, &len)) != NULL) {
++ 		if (vi->mergeable_rx_bufs) {
++ 			struct page *sent_page = virt_to_head_page(xdp_sent);
++ 
++ 			put_page(sent_page);
++ 		} else { /* small buffer */
++ 			struct sk_buff *skb = xdp_sent;
++ 
++ 			kfree_skb(skb);
++ 		}
++ 	}
++ 
++ 	if (vi->mergeable_rx_bufs) {
++ 		/* Zero header and leave csum up to XDP layers */
++ 		hdr = xdp->data;
++ 		memset(hdr, 0, vi->hdr_len);
++ 
++ 		num_sg = 1;
++ 		sg_init_one(sq->sg, xdp->data, xdp->data_end - xdp->data);
++ 	} else { /* small buffer */
++ 		struct sk_buff *skb = data;
++ 
++ 		/* Zero header and leave csum up to XDP layers */
++ 		hdr = skb_vnet_hdr(skb);
++ 		memset(hdr, 0, vi->hdr_len);
++ 
++ 		num_sg = 2;
++ 		sg_init_table(sq->sg, 2);
++ 		sg_set_buf(sq->sg, hdr, vi->hdr_len);
++ 		skb_to_sgvec(skb, sq->sg + 1, 0, skb->len);
++ 	}
++ 	err = virtqueue_add_outbuf(sq->vq, sq->sg, num_sg,
++ 				   data, GFP_ATOMIC);
++ 	if (unlikely(err)) {
++ 		if (vi->mergeable_rx_bufs) {
++ 			struct page *page = virt_to_head_page(xdp->data);
++ 
++ 			put_page(page);
++ 		} else /* small buffer */
++ 			kfree_skb(data);
++ 		/* On error abort to avoid unnecessary kick */
++ 		return false;
++ 	}
++ 
++ 	virtqueue_kick(sq->vq);
++ 	return true;
++ }
++ 
++ static u32 do_xdp_prog(struct virtnet_info *vi,
++ 		       struct receive_queue *rq,
++ 		       struct bpf_prog *xdp_prog,
++ 		       void *data, int len)
++ {
++ 	int hdr_padded_len;
++ 	struct xdp_buff xdp;
++ 	void *buf;
++ 	unsigned int qp;
++ 	u32 act;
++ 
++ 	if (vi->mergeable_rx_bufs) {
++ 		hdr_padded_len = sizeof(struct virtio_net_hdr_mrg_rxbuf);
++ 		xdp.data = data + hdr_padded_len;
++ 		xdp.data_end = xdp.data + (len - vi->hdr_len);
++ 		buf = data;
++ 	} else { /* small buffers */
++ 		struct sk_buff *skb = data;
++ 
++ 		xdp.data = skb->data;
++ 		xdp.data_end = xdp.data + len;
++ 		buf = skb->data;
++ 	}
++ 
++ 	act = bpf_prog_run_xdp(xdp_prog, &xdp);
++ 	switch (act) {
++ 	case XDP_PASS:
++ 		return XDP_PASS;
++ 	case XDP_TX:
++ 		qp = vi->curr_queue_pairs -
++ 			vi->xdp_queue_pairs +
++ 			smp_processor_id();
++ 		xdp.data = buf;
++ 		if (unlikely(!virtnet_xdp_xmit(vi, rq, &vi->sq[qp], &xdp,
++ 					       data)))
++ 			trace_xdp_exception(vi->dev, xdp_prog, act);
++ 		return XDP_TX;
++ 	default:
++ 		bpf_warn_invalid_xdp_action(act);
++ 	case XDP_ABORTED:
++ 		trace_xdp_exception(vi->dev, xdp_prog, act);
++ 	case XDP_DROP:
++ 		return XDP_DROP;
++ 	}
++ }
++ 
++ static struct sk_buff *receive_small(struct net_device *dev,
++ 				     struct virtnet_info *vi,
++ 				     struct receive_queue *rq,
++ 				     void *buf, unsigned int len)
+++>>>>>>> a67edbf4fb6d (bpf: add initial bpf tracepoints)
+  {
+  	struct sk_buff * skb = buf;
+ -	struct bpf_prog *xdp_prog;
+  
+  	len -= vi->hdr_len;
+  	skb_trim(skb, len);
+* Unmerged path kernel/bpf/core.c
+* Unmerged path kernel/bpf/inode.c
+* Unmerged path kernel/bpf/syscall.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/en_rx.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+* Unmerged path drivers/net/ethernet/qlogic/qede/qede_fp.c
+* Unmerged path drivers/net/virtio_net.c
+diff --git a/include/linux/bpf_trace.h b/include/linux/bpf_trace.h
+new file mode 100644
+index 000000000000..b22efbdd2eb4
+--- /dev/null
++++ b/include/linux/bpf_trace.h
+@@ -0,0 +1,7 @@
++#ifndef __LINUX_BPF_TRACE_H__
++#define __LINUX_BPF_TRACE_H__
++
++#include <trace/events/bpf.h>
++#include <trace/events/xdp.h>
++
++#endif /* __LINUX_BPF_TRACE_H__ */
+diff --git a/include/trace/events/bpf.h b/include/trace/events/bpf.h
+new file mode 100644
+index 000000000000..c3a53fd47ff1
+--- /dev/null
++++ b/include/trace/events/bpf.h
+@@ -0,0 +1,347 @@
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM bpf
++
++#if !defined(_TRACE_BPF_H) || defined(TRACE_HEADER_MULTI_READ)
++#define _TRACE_BPF_H
++
++#include <linux/filter.h>
++#include <linux/bpf.h>
++#include <linux/fs.h>
++#include <linux/tracepoint.h>
++
++#define __PROG_TYPE_MAP(FN)	\
++	FN(SOCKET_FILTER)	\
++	FN(KPROBE)		\
++	FN(SCHED_CLS)		\
++	FN(SCHED_ACT)		\
++	FN(TRACEPOINT)		\
++	FN(XDP)			\
++	FN(PERF_EVENT)		\
++	FN(CGROUP_SKB)		\
++	FN(CGROUP_SOCK)		\
++	FN(LWT_IN)		\
++	FN(LWT_OUT)		\
++	FN(LWT_XMIT)
++
++#define __MAP_TYPE_MAP(FN)	\
++	FN(HASH)		\
++	FN(ARRAY)		\
++	FN(PROG_ARRAY)		\
++	FN(PERF_EVENT_ARRAY)	\
++	FN(PERCPU_HASH)		\
++	FN(PERCPU_ARRAY)	\
++	FN(STACK_TRACE)		\
++	FN(CGROUP_ARRAY)	\
++	FN(LRU_HASH)		\
++	FN(LRU_PERCPU_HASH)	\
++	FN(LPM_TRIE)
++
++#define __PROG_TYPE_TP_FN(x)	\
++	TRACE_DEFINE_ENUM(BPF_PROG_TYPE_##x);
++#define __PROG_TYPE_SYM_FN(x)	\
++	{ BPF_PROG_TYPE_##x, #x },
++#define __PROG_TYPE_SYM_TAB	\
++	__PROG_TYPE_MAP(__PROG_TYPE_SYM_FN) { -1, 0 }
++__PROG_TYPE_MAP(__PROG_TYPE_TP_FN)
++
++#define __MAP_TYPE_TP_FN(x)	\
++	TRACE_DEFINE_ENUM(BPF_MAP_TYPE_##x);
++#define __MAP_TYPE_SYM_FN(x)	\
++	{ BPF_MAP_TYPE_##x, #x },
++#define __MAP_TYPE_SYM_TAB	\
++	__MAP_TYPE_MAP(__MAP_TYPE_SYM_FN) { -1, 0 }
++__MAP_TYPE_MAP(__MAP_TYPE_TP_FN)
++
++DECLARE_EVENT_CLASS(bpf_prog_event,
++
++	TP_PROTO(const struct bpf_prog *prg),
++
++	TP_ARGS(prg),
++
++	TP_STRUCT__entry(
++		__array(u8, prog_tag, 8)
++		__field(u32, type)
++	),
++
++	TP_fast_assign(
++		BUILD_BUG_ON(sizeof(__entry->prog_tag) != sizeof(prg->tag));
++		memcpy(__entry->prog_tag, prg->tag, sizeof(prg->tag));
++		__entry->type = prg->type;
++	),
++
++	TP_printk("prog=%s type=%s",
++		  __print_hex_str(__entry->prog_tag, 8),
++		  __print_symbolic(__entry->type, __PROG_TYPE_SYM_TAB))
++);
++
++DEFINE_EVENT(bpf_prog_event, bpf_prog_get_type,
++
++	TP_PROTO(const struct bpf_prog *prg),
++
++	TP_ARGS(prg)
++);
++
++DEFINE_EVENT(bpf_prog_event, bpf_prog_put_rcu,
++
++	TP_PROTO(const struct bpf_prog *prg),
++
++	TP_ARGS(prg)
++);
++
++TRACE_EVENT(bpf_prog_load,
++
++	TP_PROTO(const struct bpf_prog *prg, int ufd),
++
++	TP_ARGS(prg, ufd),
++
++	TP_STRUCT__entry(
++		__array(u8, prog_tag, 8)
++		__field(u32, type)
++		__field(int, ufd)
++	),
++
++	TP_fast_assign(
++		BUILD_BUG_ON(sizeof(__entry->prog_tag) != sizeof(prg->tag));
++		memcpy(__entry->prog_tag, prg->tag, sizeof(prg->tag));
++		__entry->type = prg->type;
++		__entry->ufd  = ufd;
++	),
++
++	TP_printk("prog=%s type=%s ufd=%d",
++		  __print_hex_str(__entry->prog_tag, 8),
++		  __print_symbolic(__entry->type, __PROG_TYPE_SYM_TAB),
++		  __entry->ufd)
++);
++
++TRACE_EVENT(bpf_map_create,
++
++	TP_PROTO(const struct bpf_map *map, int ufd),
++
++	TP_ARGS(map, ufd),
++
++	TP_STRUCT__entry(
++		__field(u32, type)
++		__field(u32, size_key)
++		__field(u32, size_value)
++		__field(u32, max_entries)
++		__field(u32, flags)
++		__field(int, ufd)
++	),
++
++	TP_fast_assign(
++		__entry->type        = map->map_type;
++		__entry->size_key    = map->key_size;
++		__entry->size_value  = map->value_size;
++		__entry->max_entries = map->max_entries;
++		__entry->flags       = map->map_flags;
++		__entry->ufd         = ufd;
++	),
++
++	TP_printk("map type=%s ufd=%d key=%u val=%u max=%u flags=%x",
++		  __print_symbolic(__entry->type, __MAP_TYPE_SYM_TAB),
++		  __entry->ufd, __entry->size_key, __entry->size_value,
++		  __entry->max_entries, __entry->flags)
++);
++
++DECLARE_EVENT_CLASS(bpf_obj_prog,
++
++	TP_PROTO(const struct bpf_prog *prg, int ufd,
++		 const struct filename *pname),
++
++	TP_ARGS(prg, ufd, pname),
++
++	TP_STRUCT__entry(
++		__array(u8, prog_tag, 8)
++		__field(int, ufd)
++		__string(path, pname->name)
++	),
++
++	TP_fast_assign(
++		BUILD_BUG_ON(sizeof(__entry->prog_tag) != sizeof(prg->tag));
++		memcpy(__entry->prog_tag, prg->tag, sizeof(prg->tag));
++		__assign_str(path, pname->name);
++		__entry->ufd = ufd;
++	),
++
++	TP_printk("prog=%s path=%s ufd=%d",
++		  __print_hex_str(__entry->prog_tag, 8),
++		  __get_str(path), __entry->ufd)
++);
++
++DEFINE_EVENT(bpf_obj_prog, bpf_obj_pin_prog,
++
++	TP_PROTO(const struct bpf_prog *prg, int ufd,
++		 const struct filename *pname),
++
++	TP_ARGS(prg, ufd, pname)
++);
++
++DEFINE_EVENT(bpf_obj_prog, bpf_obj_get_prog,
++
++	TP_PROTO(const struct bpf_prog *prg, int ufd,
++		 const struct filename *pname),
++
++	TP_ARGS(prg, ufd, pname)
++);
++
++DECLARE_EVENT_CLASS(bpf_obj_map,
++
++	TP_PROTO(const struct bpf_map *map, int ufd,
++		 const struct filename *pname),
++
++	TP_ARGS(map, ufd, pname),
++
++	TP_STRUCT__entry(
++		__field(u32, type)
++		__field(int, ufd)
++		__string(path, pname->name)
++	),
++
++	TP_fast_assign(
++		__assign_str(path, pname->name);
++		__entry->type = map->map_type;
++		__entry->ufd  = ufd;
++	),
++
++	TP_printk("map type=%s ufd=%d path=%s",
++		  __print_symbolic(__entry->type, __MAP_TYPE_SYM_TAB),
++		  __entry->ufd, __get_str(path))
++);
++
++DEFINE_EVENT(bpf_obj_map, bpf_obj_pin_map,
++
++	TP_PROTO(const struct bpf_map *map, int ufd,
++		 const struct filename *pname),
++
++	TP_ARGS(map, ufd, pname)
++);
++
++DEFINE_EVENT(bpf_obj_map, bpf_obj_get_map,
++
++	TP_PROTO(const struct bpf_map *map, int ufd,
++		 const struct filename *pname),
++
++	TP_ARGS(map, ufd, pname)
++);
++
++DECLARE_EVENT_CLASS(bpf_map_keyval,
++
++	TP_PROTO(const struct bpf_map *map, int ufd,
++		 const void *key, const void *val),
++
++	TP_ARGS(map, ufd, key, val),
++
++	TP_STRUCT__entry(
++		__field(u32, type)
++		__field(u32, key_len)
++		__dynamic_array(u8, key, map->key_size)
++		__field(bool, key_trunc)
++		__field(u32, val_len)
++		__dynamic_array(u8, val, map->value_size)
++		__field(bool, val_trunc)
++		__field(int, ufd)
++	),
++
++	TP_fast_assign(
++		memcpy(__get_dynamic_array(key), key, map->key_size);
++		memcpy(__get_dynamic_array(val), val, map->value_size);
++		__entry->type      = map->map_type;
++		__entry->key_len   = min(map->key_size, 16U);
++		__entry->key_trunc = map->key_size != __entry->key_len;
++		__entry->val_len   = min(map->value_size, 16U);
++		__entry->val_trunc = map->value_size != __entry->val_len;
++		__entry->ufd       = ufd;
++	),
++
++	TP_printk("map type=%s ufd=%d key=[%s%s] val=[%s%s]",
++		  __print_symbolic(__entry->type, __MAP_TYPE_SYM_TAB),
++		  __entry->ufd,
++		  __print_hex(__get_dynamic_array(key), __entry->key_len),
++		  __entry->key_trunc ? " ..." : "",
++		  __print_hex(__get_dynamic_array(val), __entry->val_len),
++		  __entry->val_trunc ? " ..." : "")
++);
++
++DEFINE_EVENT(bpf_map_keyval, bpf_map_lookup_elem,
++
++	TP_PROTO(const struct bpf_map *map, int ufd,
++		 const void *key, const void *val),
++
++	TP_ARGS(map, ufd, key, val)
++);
++
++DEFINE_EVENT(bpf_map_keyval, bpf_map_update_elem,
++
++	TP_PROTO(const struct bpf_map *map, int ufd,
++		 const void *key, const void *val),
++
++	TP_ARGS(map, ufd, key, val)
++);
++
++TRACE_EVENT(bpf_map_delete_elem,
++
++	TP_PROTO(const struct bpf_map *map, int ufd,
++		 const void *key),
++
++	TP_ARGS(map, ufd, key),
++
++	TP_STRUCT__entry(
++		__field(u32, type)
++		__field(u32, key_len)
++		__dynamic_array(u8, key, map->key_size)
++		__field(bool, key_trunc)
++		__field(int, ufd)
++	),
++
++	TP_fast_assign(
++		memcpy(__get_dynamic_array(key), key, map->key_size);
++		__entry->type      = map->map_type;
++		__entry->key_len   = min(map->key_size, 16U);
++		__entry->key_trunc = map->key_size != __entry->key_len;
++		__entry->ufd       = ufd;
++	),
++
++	TP_printk("map type=%s ufd=%d key=[%s%s]",
++		  __print_symbolic(__entry->type, __MAP_TYPE_SYM_TAB),
++		  __entry->ufd,
++		  __print_hex(__get_dynamic_array(key), __entry->key_len),
++		  __entry->key_trunc ? " ..." : "")
++);
++
++TRACE_EVENT(bpf_map_next_key,
++
++	TP_PROTO(const struct bpf_map *map, int ufd,
++		 const void *key, const void *key_next),
++
++	TP_ARGS(map, ufd, key, key_next),
++
++	TP_STRUCT__entry(
++		__field(u32, type)
++		__field(u32, key_len)
++		__dynamic_array(u8, key, map->key_size)
++		__dynamic_array(u8, nxt, map->key_size)
++		__field(bool, key_trunc)
++		__field(int, ufd)
++	),
++
++	TP_fast_assign(
++		memcpy(__get_dynamic_array(key), key, map->key_size);
++		memcpy(__get_dynamic_array(nxt), key_next, map->key_size);
++		__entry->type      = map->map_type;
++		__entry->key_len   = min(map->key_size, 16U);
++		__entry->key_trunc = map->key_size != __entry->key_len;
++		__entry->ufd       = ufd;
++	),
++
++	TP_printk("map type=%s ufd=%d key=[%s%s] next=[%s%s]",
++		  __print_symbolic(__entry->type, __MAP_TYPE_SYM_TAB),
++		  __entry->ufd,
++		  __print_hex(__get_dynamic_array(key), __entry->key_len),
++		  __entry->key_trunc ? " ..." : "",
++		  __print_hex(__get_dynamic_array(nxt), __entry->key_len),
++		  __entry->key_trunc ? " ..." : "")
++);
++
++#endif /* _TRACE_BPF_H */
++
++#include <trace/define_trace.h>
+diff --git a/include/trace/events/xdp.h b/include/trace/events/xdp.h
+new file mode 100644
+index 000000000000..1b61357d3f57
+--- /dev/null
++++ b/include/trace/events/xdp.h
+@@ -0,0 +1,53 @@
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM xdp
++
++#if !defined(_TRACE_XDP_H) || defined(TRACE_HEADER_MULTI_READ)
++#define _TRACE_XDP_H
++
++#include <linux/netdevice.h>
++#include <linux/filter.h>
++#include <linux/tracepoint.h>
++
++#define __XDP_ACT_MAP(FN)	\
++	FN(ABORTED)		\
++	FN(DROP)		\
++	FN(PASS)		\
++	FN(TX)
++
++#define __XDP_ACT_TP_FN(x)	\
++	TRACE_DEFINE_ENUM(XDP_##x);
++#define __XDP_ACT_SYM_FN(x)	\
++	{ XDP_##x, #x },
++#define __XDP_ACT_SYM_TAB	\
++	__XDP_ACT_MAP(__XDP_ACT_SYM_FN) { -1, 0 }
++__XDP_ACT_MAP(__XDP_ACT_TP_FN)
++
++TRACE_EVENT(xdp_exception,
++
++	TP_PROTO(const struct net_device *dev,
++		 const struct bpf_prog *xdp, u32 act),
++
++	TP_ARGS(dev, xdp, act),
++
++	TP_STRUCT__entry(
++		__string(name, dev->name)
++		__array(u8, prog_tag, 8)
++		__field(u32, act)
++	),
++
++	TP_fast_assign(
++		BUILD_BUG_ON(sizeof(__entry->prog_tag) != sizeof(xdp->tag));
++		memcpy(__entry->prog_tag, xdp->tag, sizeof(xdp->tag));
++		__assign_str(name, dev->name);
++		__entry->act = act;
++	),
++
++	TP_printk("prog=%s device=%s action=%s",
++		  __print_hex_str(__entry->prog_tag, 8),
++		  __get_str(name),
++		  __print_symbolic(__entry->act, __XDP_ACT_SYM_TAB))
++);
++
++#endif /* _TRACE_XDP_H */
++
++#include <trace/define_trace.h>
+* Unmerged path kernel/bpf/core.c
+* Unmerged path kernel/bpf/inode.c
+* Unmerged path kernel/bpf/syscall.c
