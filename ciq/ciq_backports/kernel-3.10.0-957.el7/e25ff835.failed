@@ -1,0 +1,154 @@
+xfs: Close race between direct IO and xfs_break_layouts()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Dave Jiang <dave.jiang@intel.com>
+commit e25ff835af89a80aa6a4de58f413e494b2b96bd1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/e25ff835.failed
+
+This patch is the duplicate of ross's fix for ext4 for xfs.
+
+If the refcount of a page is lowered between the time that it is returned
+by dax_busy_page() and when the refcount is again checked in
+xfs_break_layouts() => ___wait_var_event(), the waiting function
+xfs_wait_dax_page() will never be called.  This means that
+xfs_break_layouts() will still have 'retry' set to false, so we'll stop
+looping and never check the refcount of other pages in this inode.
+
+Instead, always continue looping as long as dax_layout_busy_page() gives us
+a page which it found with an elevated refcount.
+
+	Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit e25ff835af89a80aa6a4de58f413e494b2b96bd1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_file.c
+diff --cc fs/xfs/xfs_file.c
+index cea567087acc,181e9084519b..000000000000
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@@ -874,34 -698,93 +874,103 @@@ xfs_file_aio_write
+  	if (ocount == 0)
+  		return 0;
+  
+ -	if (XFS_FORCED_SHUTDOWN(ip->i_mount))
+ -		return -EIO;
+ +	if (XFS_FORCED_SHUTDOWN(ip->i_mount)) {
+ +		ret = -EIO;
+ +		goto out;
+ +	}
+  
+  	if (IS_DAX(inode))
+ -		return xfs_file_dax_write(iocb, from);
+ +		ret = xfs_file_dax_write(iocb, iovp, nr_segs, pos, ocount);
+ +	else if ((file->f_flags & O_DIRECT))
+ +		ret = xfs_file_dio_aio_write(iocb, iovp, nr_segs, pos, ocount);
+ +	else
+ +		ret = xfs_file_buffered_aio_write(iocb, iovp, nr_segs, pos,
+ +						  ocount);
+  
+ -	if (iocb->ki_flags & IOCB_DIRECT) {
+ -		/*
+ -		 * Allow a directio write to fall back to a buffered
+ -		 * write *only* in the case that we're doing a reflink
+ -		 * CoW.  In all other directio scenarios we do not
+ -		 * allow an operation to fall back to buffered mode.
+ -		 */
+ -		ret = xfs_file_dio_aio_write(iocb, from);
+ -		if (ret != -EREMCHG)
+ -			return ret;
+ +	if (ret > 0) {
+ +		ssize_t err;
+ +
+ +		XFS_STATS_ADD(ip->i_mount, xs_write_bytes, ret);
+ +
+ +		/* Handle various SYNC-type writes */
+ +		err = generic_write_sync(file, pos, ret);
+ +		if (err < 0)
+ +			ret = err;
+  	}
+  
+ -	return xfs_file_buffered_aio_write(iocb, from);
+ +out:
+ +	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void
++ xfs_wait_dax_page(
++ 	struct inode		*inode)
++ {
++ 	struct xfs_inode        *ip = XFS_I(inode);
++ 
++ 	xfs_iunlock(ip, XFS_MMAPLOCK_EXCL);
++ 	schedule();
++ 	xfs_ilock(ip, XFS_MMAPLOCK_EXCL);
++ }
++ 
++ static int
++ xfs_break_dax_layouts(
++ 	struct inode		*inode,
++ 	bool			*retry)
++ {
++ 	struct page		*page;
++ 
++ 	ASSERT(xfs_isilocked(XFS_I(inode), XFS_MMAPLOCK_EXCL));
++ 
++ 	page = dax_layout_busy_page(inode->i_mapping);
++ 	if (!page)
++ 		return 0;
++ 
++ 	*retry = true;
++ 	return ___wait_var_event(&page->_refcount,
++ 			atomic_read(&page->_refcount) == 1, TASK_INTERRUPTIBLE,
++ 			0, 0, xfs_wait_dax_page(inode));
++ }
++ 
++ int
++ xfs_break_layouts(
++ 	struct inode		*inode,
++ 	uint			*iolock,
++ 	enum layout_break_reason reason)
++ {
++ 	bool			retry;
++ 	int			error;
++ 
++ 	ASSERT(xfs_isilocked(XFS_I(inode), XFS_IOLOCK_SHARED|XFS_IOLOCK_EXCL));
++ 
++ 	do {
++ 		retry = false;
++ 		switch (reason) {
++ 		case BREAK_UNMAP:
++ 			error = xfs_break_dax_layouts(inode, &retry);
++ 			if (error || retry)
++ 				break;
++ 			/* fall through */
++ 		case BREAK_WRITE:
++ 			error = xfs_break_leased_layouts(inode, iolock, &retry);
++ 			break;
++ 		default:
++ 			WARN_ON_ONCE(1);
++ 			error = -EINVAL;
++ 		}
++ 	} while (error == 0 && retry);
++ 
++ 	return error;
++ }
++ 
++ #define	XFS_FALLOC_FL_SUPPORTED						\
++ 		(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE |		\
++ 		 FALLOC_FL_COLLAPSE_RANGE | FALLOC_FL_ZERO_RANGE |	\
++ 		 FALLOC_FL_INSERT_RANGE | FALLOC_FL_UNSHARE_RANGE)
++ 
+++>>>>>>> e25ff835af89 (xfs: Close race between direct IO and xfs_break_layouts())
+  STATIC long
+  xfs_file_fallocate(
+  	struct file		*file,
+* Unmerged path fs/xfs/xfs_file.c
