@@ -1,0 +1,232 @@
+md/raid10: add failfast handling for reads.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [md] raid10: add failfast handling for reads (Jes Sorensen) [1380016]
+Rebuild_FUZZ: 95.12%
+commit-author NeilBrown <neilb@suse.com>
+commit 8d3ca83dcf9ca3d58822eddd279918d46f41e9ff
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8d3ca83d.failed
+
+If a device is marked FailFast, and it is not the only
+device we can read from, we mark the bio as MD_FAILFAST.
+
+If this does fail-fast, we don't try read repair but just
+allow failure.
+
+If it was the last device, it doesn't get marked Faulty so
+the retry happens on the same device - this time without
+FAILFAST.  A subsequent failure will not retry but will just
+pass up the error.
+
+During resync we may use FAILFAST requests, and on a failure
+we will simply use the other device(s).
+
+During recovery we will only use FAILFAST in the unusual
+case were there are multiple places to read from - i.e. if
+there are > 2 devices.  If we get a failure we will fail the
+device and complete the resync/recovery with remaining
+devices.
+
+	Signed-off-by: NeilBrown <neilb@suse.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit 8d3ca83dcf9ca3d58822eddd279918d46f41e9ff)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid10.c
+diff --cc drivers/md/raid10.c
+index 9848c5d0edf0,7cdc9bcd21b0..000000000000
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@@ -1295,9 -1173,16 +1299,16 @@@ read_again
+  			choose_data_offset(r10_bio, rdev);
+  		read_bio->bi_bdev = rdev->bdev;
+  		read_bio->bi_end_io = raid10_end_read_request;
+++<<<<<<< HEAD
+ +		read_bio->bi_rw = READ | do_sync;
+++=======
++ 		bio_set_op_attrs(read_bio, op, do_sync);
++ 		if (test_bit(FailFast, &rdev->flags) &&
++ 		    test_bit(R10BIO_FailFast, &r10_bio->state))
++ 			read_bio->bi_opf |= MD_FAILFAST;
+++>>>>>>> 8d3ca83dcf9c (md/raid10: add failfast handling for reads.)
+  		read_bio->bi_private = r10_bio;
+  
+ -		if (mddev->gendisk)
+ -			trace_block_bio_remap(bdev_get_queue(read_bio->bi_bdev),
+ -					      read_bio, disk_devt(mddev->gendisk),
+ -					      r10_bio->sector);
+  		if (max_sectors < r10_bio->sectors) {
+  			/* Could not read all from this device, so we will
+  			 * need another r10_bio.
+@@@ -2083,7 -2003,9 +2095,13 @@@ static void sync_request_write(struct m
+  			continue;
+  		if (i == first)
+  			continue;
+++<<<<<<< HEAD
+ +		if (test_bit(BIO_UPTODATE, &r10_bio->devs[i].bio->bi_flags)) {
+++=======
++ 		d = r10_bio->devs[i].devnum;
++ 		rdev = conf->mirrors[d].rdev;
++ 		if (!r10_bio->devs[i].bio->bi_error) {
+++>>>>>>> 8d3ca83dcf9c (md/raid10: add failfast handling for reads.)
+  			/* We know that the bi_io_vec layout is the same for
+  			 * both 'first' and 'i', so we just compare them.
+  			 * All vec entries are PAGE_SIZE;
+@@@ -2114,22 -2040,14 +2136,21 @@@
+  		bio_reset(tbio);
+  
+  		tbio->bi_vcnt = vcnt;
+ -		tbio->bi_iter.bi_size = fbio->bi_iter.bi_size;
+ +		tbio->bi_size = fbio->bi_size;
+ +		tbio->bi_rw = WRITE;
+  		tbio->bi_private = r10_bio;
+ -		tbio->bi_iter.bi_sector = r10_bio->devs[i].addr;
+ -		tbio->bi_end_io = end_sync_write;
+ -		bio_set_op_attrs(tbio, REQ_OP_WRITE, 0);
+ +		tbio->bi_sector = r10_bio->devs[i].addr;
+  
+ -		bio_copy_data(tbio, fbio);
+ +		for (j=0; j < vcnt ; j++) {
+ +			tbio->bi_io_vec[j].bv_offset = 0;
+ +			tbio->bi_io_vec[j].bv_len = PAGE_SIZE;
+ +
+ +			memcpy(page_address(tbio->bi_io_vec[j].bv_page),
+ +			       page_address(fbio->bi_io_vec[j].bv_page),
+ +			       PAGE_SIZE);
+ +		}
+ +		tbio->bi_end_io = end_sync_write;
+  
+- 		d = r10_bio->devs[i].devnum;
+  		atomic_inc(&conf->mirrors[d].rdev->nr_pending);
+  		atomic_inc(&r10_bio->remaining);
+  		md_sync_acct(conf->mirrors[d].rdev->bdev, bio_sectors(tbio));
+@@@ -2658,15 -2583,22 +2681,22 @@@ read_more
+  			   (unsigned long long)r10_bio->sector);
+  	bio = bio_clone_mddev(r10_bio->master_bio,
+  			      GFP_NOIO, mddev);
+ -	bio_trim(bio, r10_bio->sector - bio->bi_iter.bi_sector, max_sectors);
+ +	bio_trim(bio, r10_bio->sector - bio->bi_sector, max_sectors);
+  	r10_bio->devs[slot].bio = bio;
+  	r10_bio->devs[slot].rdev = rdev;
+ -	bio->bi_iter.bi_sector = r10_bio->devs[slot].addr
+ +	bio->bi_sector = r10_bio->devs[slot].addr
+  		+ choose_data_offset(r10_bio, rdev);
+  	bio->bi_bdev = rdev->bdev;
+++<<<<<<< HEAD
+ +	bio->bi_rw = READ | do_sync;
+++=======
++ 	bio_set_op_attrs(bio, REQ_OP_READ, do_sync);
++ 	if (test_bit(FailFast, &rdev->flags) &&
++ 	    test_bit(R10BIO_FailFast, &r10_bio->state))
++ 		bio->bi_opf |= MD_FAILFAST;
+++>>>>>>> 8d3ca83dcf9c (md/raid10: add failfast handling for reads.)
+  	bio->bi_private = r10_bio;
+  	bio->bi_end_io = raid10_end_read_request;
+ -	trace_block_bio_remap(bdev_get_queue(bio->bi_bdev),
+ -			      bio, bio_dev,
+ -			      bio_last_sector - r10_bio->sectors);
+ -
+  	if (max_sectors < r10_bio->sectors) {
+  		/* Drat - have to split this up more */
+  		struct bio *mbio = r10_bio->master_bio;
+@@@ -3163,9 -3113,12 +3193,15 @@@ static sector_t raid10_sync_request(str
+  				biolist = bio;
+  				bio->bi_private = r10_bio;
+  				bio->bi_end_io = end_sync_read;
+++<<<<<<< HEAD
+ +				bio->bi_rw = READ;
+++=======
++ 				bio_set_op_attrs(bio, REQ_OP_READ, 0);
++ 				if (test_bit(FailFast, &rdev->flags))
++ 					bio->bi_opf |= MD_FAILFAST;
+++>>>>>>> 8d3ca83dcf9c (md/raid10: add failfast handling for reads.)
+  				from_addr = r10_bio->devs[j].addr;
+ -				bio->bi_iter.bi_sector = from_addr +
+ -					rdev->data_offset;
+ +				bio->bi_sector = from_addr + rdev->data_offset;
+  				bio->bi_bdev = rdev->bdev;
+  				atomic_inc(&rdev->nr_pending);
+  				/* and we write to 'i' (if not in_sync) */
+@@@ -3260,8 -3213,31 +3296,31 @@@
+  				if (rb2)
+  					atomic_dec(&rb2->remaining);
+  				r10_bio = rb2;
+ -				rdev_dec_pending(mrdev, mddev);
+ -				if (mreplace)
+ -					rdev_dec_pending(mreplace, mddev);
+  				break;
+  			}
+++<<<<<<< HEAD
+++=======
++ 			rdev_dec_pending(mrdev, mddev);
++ 			if (mreplace)
++ 				rdev_dec_pending(mreplace, mddev);
++ 			if (r10_bio->devs[0].bio->bi_opf & MD_FAILFAST) {
++ 				/* Only want this if there is elsewhere to
++ 				 * read from. 'j' is currently the first
++ 				 * readable copy.
++ 				 */
++ 				int targets = 1;
++ 				for (; j < conf->copies; j++) {
++ 					int d = r10_bio->devs[j].devnum;
++ 					if (conf->mirrors[d].rdev &&
++ 					    test_bit(In_sync,
++ 						      &conf->mirrors[d].rdev->flags))
++ 						targets++;
++ 				}
++ 				if (targets == 1)
++ 					r10_bio->devs[0].bio->bi_opf
++ 						&= ~MD_FAILFAST;
++ 			}
+++>>>>>>> 8d3ca83dcf9c (md/raid10: add failfast handling for reads.)
+  		}
+  		if (biolist == NULL) {
+  			while (r10_bio) {
+@@@ -3335,16 -3315,20 +3394,24 @@@
+  			biolist = bio;
+  			bio->bi_private = r10_bio;
+  			bio->bi_end_io = end_sync_read;
+++<<<<<<< HEAD
+ +			bio->bi_rw = READ;
+ +			bio->bi_sector = sector +
+ +				conf->mirrors[d].rdev->data_offset;
+ +			bio->bi_bdev = conf->mirrors[d].rdev->bdev;
+++=======
++ 			bio_set_op_attrs(bio, REQ_OP_READ, 0);
++ 			if (test_bit(FailFast, &conf->mirrors[d].rdev->flags))
++ 				bio->bi_opf |= MD_FAILFAST;
++ 			bio->bi_iter.bi_sector = sector + rdev->data_offset;
++ 			bio->bi_bdev = rdev->bdev;
+++>>>>>>> 8d3ca83dcf9c (md/raid10: add failfast handling for reads.)
+  			count++;
+  
+ -			rdev = rcu_dereference(conf->mirrors[d].replacement);
+ -			if (rdev == NULL || test_bit(Faulty, &rdev->flags)) {
+ -				rcu_read_unlock();
+ +			if (conf->mirrors[d].replacement == NULL ||
+ +			    test_bit(Faulty,
+ +				     &conf->mirrors[d].replacement->flags))
+  				continue;
+ -			}
+ -			atomic_inc(&rdev->nr_pending);
+ -			rcu_read_unlock();
+  
+  			/* Need to set up for writing to the replacement */
+  			bio = r10_bio->devs[i].repl_bio;
+* Unmerged path drivers/md/raid10.c
+diff --git a/drivers/md/raid10.h b/drivers/md/raid10.h
+index 18ec1f7a98bf..3162615e57bd 100644
+--- a/drivers/md/raid10.h
++++ b/drivers/md/raid10.h
+@@ -156,5 +156,7 @@ enum r10bio_state {
+  * flag is set
+  */
+ 	R10BIO_Previous,
++/* failfast devices did receive failfast requests. */
++	R10BIO_FailFast,
+ };
+ #endif
