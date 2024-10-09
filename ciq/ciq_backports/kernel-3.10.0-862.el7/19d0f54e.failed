@@ -1,0 +1,251 @@
+nfp: bpf: add packet marking support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 19d0f54edab6e77b6b73277ac33717be1f858fa8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/19d0f54e.failed
+
+Add missing ABI defines and eBPF instructions to allow
+mark to be passed on and extend prepend parsing on the
+RX path to pick it up from packet metadata.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 19d0f54edab6e77b6b73277ac33717be1f858fa8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_bpf.h
+#	drivers/net/ethernet/netronome/nfp/nfp_bpf_jit.c
+#	drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+#	drivers/net/ethernet/netronome/nfp/nfp_netvf_main.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index de17d3265a77,415691edcaa5..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@@ -1318,39 -1311,54 +1304,87 @@@ static void nfp_net_set_hash(struct net
+  	}
+  }
+  
++ static void
++ nfp_net_set_hash_desc(struct net_device *netdev, struct sk_buff *skb,
++ 		      struct nfp_net_rx_desc *rxd)
++ {
++ 	struct nfp_net_rx_hash *rx_hash;
++ 
++ 	if (!(rxd->rxd.flags & PCIE_DESC_RX_RSS))
++ 		return;
++ 
++ 	rx_hash = (struct nfp_net_rx_hash *)(skb->data - sizeof(*rx_hash));
++ 
++ 	nfp_net_set_hash(netdev, skb, get_unaligned_be32(&rx_hash->hash_type),
++ 			 &rx_hash->hash);
++ }
++ 
++ static void *
++ nfp_net_parse_meta(struct net_device *netdev, struct sk_buff *skb,
++ 		   int meta_len)
++ {
++ 	u8 *data = skb->data - meta_len;
++ 	u32 meta_info;
++ 
++ 	meta_info = get_unaligned_be32(data);
++ 	data += 4;
++ 
++ 	while (meta_info) {
++ 		switch (meta_info & NFP_NET_META_FIELD_MASK) {
++ 		case NFP_NET_META_HASH:
++ 			meta_info >>= NFP_NET_META_FIELD_SIZE;
++ 			nfp_net_set_hash(netdev, skb,
++ 					 meta_info & NFP_NET_META_FIELD_MASK,
++ 					 (__be32 *)data);
++ 			data += 4;
++ 			break;
++ 		case NFP_NET_META_MARK:
++ 			skb->mark = get_unaligned_be32(data);
++ 			data += 4;
++ 			break;
++ 		default:
++ 			return NULL;
++ 		}
++ 
++ 		meta_info >>= NFP_NET_META_FIELD_SIZE;
++ 	}
++ 
++ 	return data;
++ }
++ 
+ +static void
+ +nfp_net_set_hash_desc(struct net_device *netdev, struct sk_buff *skb,
+ +		      struct nfp_net_rx_desc *rxd)
+ +{
+ +	struct nfp_net_rx_hash *rx_hash;
+ +
+ +	if (!(rxd->rxd.flags & PCIE_DESC_RX_RSS))
+ +		return;
+ +
+ +	rx_hash = (struct nfp_net_rx_hash *)(skb->data - sizeof(*rx_hash));
+ +
+ +	nfp_net_set_hash(netdev, skb, rxd);
+ +}
+ +
+ +static void
+ +nfp_net_rx_drop(struct nfp_net_r_vector *r_vec, struct nfp_net_rx_ring *rx_ring,
+ +		struct nfp_net_rx_buf *rxbuf, struct sk_buff *skb)
+ +{
+ +	u64_stats_update_begin(&r_vec->rx_sync);
+ +	r_vec->rx_drops++;
+ +	u64_stats_update_end(&r_vec->rx_sync);
+ +
+ +	/* skb is build based on the frag, free_skb() would free the frag
+ +	 * so to be able to reuse it we need an extra ref.
+ +	 */
+ +	if (skb && rxbuf && skb->head == rxbuf->frag)
+ +		page_ref_inc(virt_to_head_page(rxbuf->frag));
+ +	if (rxbuf)
+ +		nfp_net_rx_give_one(rx_ring, rxbuf->frag, rxbuf->dma_addr);
+ +	if (skb)
+ +		dev_kfree_skb_any(skb);
+ +}
+ +
+  /**
+   * nfp_net_rx() - receive up to @budget packets on @rx_ring
+   * @rx_ring:   RX ring to receive from
+@@@ -1406,44 -1466,36 +1440,69 @@@ static int nfp_net_rx(struct nfp_net_rx
+  		 */
+  		meta_len = rxd->rxd.meta_len_dd & PCIE_DESC_RX_META_LEN_MASK;
+  		data_len = le16_to_cpu(rxd->rxd.data_len);
+ +		pkt_len = data_len - meta_len;
+  
+  		if (nn->rx_offset == NFP_NET_CFG_RX_OFFSET_DYNAMIC)
+ -			skb_reserve(skb, meta_len);
+ +			pkt_off = meta_len;
+  		else
+++<<<<<<< HEAD
+ +			pkt_off = nn->rx_offset;
+ +		data_off = NFP_NET_RX_BUF_HEADROOM + pkt_off;
+++=======
++ 			skb_reserve(skb, nn->rx_offset);
++ 		skb_put(skb, data_len - meta_len);
+++>>>>>>> 19d0f54edab6 (nfp: bpf: add packet marking support)
+  
+  		/* Stats update */
+  		u64_stats_update_begin(&r_vec->rx_sync);
+  		r_vec->rx_pkts++;
+ -		r_vec->rx_bytes += skb->len;
+ +		r_vec->rx_bytes += pkt_len;
+  		u64_stats_update_end(&r_vec->rx_sync);
+  
+++<<<<<<< HEAD
+ +		skb = build_skb(rxbuf->frag, nn->fl_bufsz);
+ +		if (unlikely(!skb)) {
+ +			nfp_net_rx_drop(r_vec, rx_ring, rxbuf, NULL);
+ +			continue;
+ +		}
+ +
+ +		nfp_net_set_hash(nn->netdev, skb, rxd);
+ +
+ +		new_frag = nfp_net_napi_alloc_one(nn, &new_dma_addr);
+ +		if (unlikely(!new_frag)) {
+ +			nfp_net_rx_drop(r_vec, rx_ring, rxbuf, skb);
+ +			continue;
+ +		}
+ +
+ +		nfp_net_dma_unmap_rx(nn, rx_ring->rxbufs[idx].dma_addr,
+ +				     nn->fl_bufsz, DMA_FROM_DEVICE);
+ +
+ +		nfp_net_rx_give_one(rx_ring, new_frag, new_dma_addr);
+ +
+ +		skb_reserve(skb, data_off);
+ +		skb_put(skb, pkt_len);
+ +
+ +		nfp_net_set_hash_desc(nn->netdev, skb, rxd);
+ +
+++=======
++ 		if (nn->fw_ver.major <= 3) {
++ 			nfp_net_set_hash_desc(nn->netdev, skb, rxd);
++ 		} else if (meta_len) {
++ 			void *end;
++ 
++ 			end = nfp_net_parse_meta(nn->netdev, skb, meta_len);
++ 			if (unlikely(end != skb->data)) {
++ 				u64_stats_update_begin(&r_vec->rx_sync);
++ 				r_vec->rx_drops++;
++ 				u64_stats_update_end(&r_vec->rx_sync);
++ 
++ 				dev_kfree_skb_any(skb);
++ 				nn_warn_ratelimit(nn, "invalid RX packet metadata\n");
++ 				continue;
++ 			}
++ 		}
++ 
+++>>>>>>> 19d0f54edab6 (nfp: bpf: add packet marking support)
+  		skb_record_rx_queue(skb, rx_ring->idx);
+  		skb->protocol = eth_type_trans(skb, nn->netdev);
+  
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_netvf_main.c
+index bd3cf87f2365,2800bbf65a89..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_netvf_main.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_netvf_main.c
+@@@ -161,9 -149,15 +161,21 @@@ static int nfp_netvf_pci_probe(struct p
+  	} else {
+  		switch (fw_ver.major) {
+  		case 1 ... 4:
+++<<<<<<< HEAD
+ +			stride = 4;
+ +			tx_bar_no = NFP_NET_Q0_BAR;
+ +			rx_bar_no = tx_bar_no;
+++=======
++ 			if (is_nfp3200) {
++ 				stride = 2;
++ 				tx_bar_no = NFP_NET_Q0_BAR;
++ 				rx_bar_no = NFP_NET_Q1_BAR;
++ 			} else {
++ 				stride = 4;
++ 				tx_bar_no = NFP_NET_Q0_BAR;
++ 				rx_bar_no = tx_bar_no;
++ 			}
+++>>>>>>> 19d0f54edab6 (nfp: bpf: add packet marking support)
+  			break;
+  		default:
+  			dev_err(&pdev->dev, "Unsupported Firmware ABI %d.%d.%d.%d\n",
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_bpf.h
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_bpf_jit.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_bpf.h
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_bpf_jit.c
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net.h b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+index 1826ee93d1da..4daec4d5995a 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+@@ -275,6 +275,8 @@ struct nfp_net_rx_desc {
+ 	};
+ };
+ 
++#define NFP_NET_META_FIELD_MASK GENMASK(NFP_NET_META_FIELD_SIZE - 1, 0)
++
+ struct nfp_net_rx_hash {
+ 	__be32 hash_type;
+ 	__be32 hash;
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net_ctrl.h b/drivers/net/ethernet/netronome/nfp/nfp_net_ctrl.h
+index 12afff29a681..35f28cf5610d 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_ctrl.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_ctrl.h
+@@ -65,6 +65,13 @@
+  */
+ #define NFP_NET_LSO_MAX_HDR_SZ		255
+ 
++/**
++ * Prepend field types
++ */
++#define NFP_NET_META_FIELD_SIZE		4
++#define NFP_NET_META_HASH		1 /* next field carries hash type */
++#define NFP_NET_META_MARK		2
++
+ /**
+  * Hash type pre-pended when a RSS hash was computed
+  */
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_netvf_main.c
