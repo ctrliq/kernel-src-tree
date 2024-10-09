@@ -307,8 +307,14 @@ extern int xfs_bwrite(struct xfs_buf *bp);
 extern void xfs_buf_ioend(struct xfs_buf *bp);
 extern void xfs_buf_ioerror(xfs_buf_t *, int);
 extern void xfs_buf_ioerror_alert(struct xfs_buf *, const char *func);
-extern void xfs_buf_submit(struct xfs_buf *bp);
-extern int xfs_buf_submit_wait(struct xfs_buf *bp);
+
+extern int __xfs_buf_submit(struct xfs_buf *bp, bool);
+static inline int xfs_buf_submit(struct xfs_buf *bp)
+{
+	bool wait = bp->b_flags & XBF_ASYNC ? false : true;
+	return __xfs_buf_submit(bp, wait);
+}
+
 extern void xfs_buf_iomove(xfs_buf_t *, size_t, size_t, void *,
 				xfs_buf_rw_t);
 #define xfs_buf_zero(bp, off, len) \
