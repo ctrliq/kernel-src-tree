@@ -1,0 +1,159 @@
+NFSv4.1/pNFS: Don't queue up a new commit if the layout segment is invalid
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Trond Myklebust <trond.myklebust@primarydata.com>
+commit b20135d0b2431900a3a5395970ffb7e4f3767c8b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/b20135d0.failed
+
+If the layout segment is invalid, then we should not be adding more
+write requests to the commit list. Instead, those writes should be
+replayed after requesting a new layout.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit b20135d0b2431900a3a5395970ffb7e4f3767c8b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/direct.c
+#	fs/nfs/write.c
+diff --cc fs/nfs/direct.c
+index 07e5f6823c61,a9a93927fe3e..000000000000
+--- a/fs/nfs/direct.c
++++ b/fs/nfs/direct.c
+@@@ -794,14 -721,20 +794,30 @@@ static void nfs_direct_commit_complete(
+  		nfs_direct_write_complete(dreq, data->inode);
+  }
+  
+++<<<<<<< HEAD
+ +static void nfs_direct_error_cleanup(struct nfs_inode *nfsi)
+ +{
+ +	/* There is no lock to clear */
+++=======
++ static void nfs_direct_resched_write(struct nfs_commit_info *cinfo,
++ 		struct nfs_page *req)
++ {
++ 	struct nfs_direct_req *dreq = cinfo->dreq;
++ 
++ 	spin_lock(&dreq->lock);
++ 	dreq->flags = NFS_ODIRECT_RESCHED_WRITES;
++ 	spin_unlock(&dreq->lock);
++ 	nfs_mark_request_commit(req, NULL, cinfo, 0);
+++>>>>>>> b20135d0b243 (NFSv4.1/pNFS: Don't queue up a new commit if the layout segment is invalid)
+  }
+  
+  static const struct nfs_commit_completion_ops nfs_direct_commit_completion_ops = {
+  	.completion = nfs_direct_commit_complete,
+++<<<<<<< HEAD
+ +	.error_cleanup = nfs_direct_error_cleanup,
+++=======
++ 	.resched_write = nfs_direct_resched_write,
+++>>>>>>> b20135d0b243 (NFSv4.1/pNFS: Don't queue up a new commit if the layout segment is invalid)
+  };
+  
+  static void nfs_direct_commit_schedule(struct nfs_direct_req *dreq)
+diff --cc fs/nfs/write.c
+index 1c0e89c593fe,0aa8d6f23b4c..000000000000
+--- a/fs/nfs/write.c
++++ b/fs/nfs/write.c
+@@@ -1773,7 -1784,7 +1780,11 @@@ static const struct rpc_call_ops nfs_co
+  
+  static const struct nfs_commit_completion_ops nfs_commit_completion_ops = {
+  	.completion = nfs_commit_release_pages,
+++<<<<<<< HEAD
+ +	.error_cleanup = nfs_commit_clear_lock,
+++=======
++ 	.resched_write = nfs_commit_resched_write,
+++>>>>>>> b20135d0b243 (NFSv4.1/pNFS: Don't queue up a new commit if the layout segment is invalid)
+  };
+  
+  int nfs_generic_commit_list(struct inode *inode, struct list_head *head,
+diff --git a/fs/nfs/callback_proc.c b/fs/nfs/callback_proc.c
+index e4dbab5dce6e..2be8b252e3b1 100644
+--- a/fs/nfs/callback_proc.c
++++ b/fs/nfs/callback_proc.c
+@@ -233,6 +233,8 @@ static u32 initiate_file_draining(struct nfs_client *clp,
+ unlock:
+ 	spin_unlock(&ino->i_lock);
+ 	pnfs_free_lseg_list(&free_me_list);
++	/* Free all lsegs that are attached to commit buckets */
++	nfs_commit_inode(ino, 0);
+ 	pnfs_put_layout_hdr(lo);
+ 	trace_nfs4_cb_layoutrecall_file(clp, &args->cbl_fh, ino,
+ 			&args->cbl_stateid, -rv);
+* Unmerged path fs/nfs/direct.c
+diff --git a/fs/nfs/pnfs.c b/fs/nfs/pnfs.c
+index e606ab7847f0..77df411a3072 100644
+--- a/fs/nfs/pnfs.c
++++ b/fs/nfs/pnfs.c
+@@ -702,6 +702,8 @@ pnfs_layout_free_bulk_destroy_list(struct list_head *layout_list,
+ 			ret = -EAGAIN;
+ 		spin_unlock(&inode->i_lock);
+ 		pnfs_free_lseg_list(&lseg_list);
++		/* Free all lsegs that are attached to commit buckets */
++		nfs_commit_inode(inode, 0);
+ 		pnfs_put_layout_hdr(lo);
+ 		iput(inode);
+ 	}
+@@ -1786,6 +1788,7 @@ void pnfs_error_mark_layout_for_return(struct inode *inode,
+ 	pnfs_mark_matching_lsegs_return(lo, &free_me, &range);
+ 	spin_unlock(&inode->i_lock);
+ 	pnfs_free_lseg_list(&free_me);
++	nfs_commit_inode(inode, 0);
+ }
+ EXPORT_SYMBOL_GPL(pnfs_error_mark_layout_for_return);
+ 
+diff --git a/fs/nfs/pnfs.h b/fs/nfs/pnfs.h
+index d4e2833ede5a..3d6687232864 100644
+--- a/fs/nfs/pnfs.h
++++ b/fs/nfs/pnfs.h
+@@ -391,6 +391,12 @@ pnfs_get_lseg(struct pnfs_layout_segment *lseg)
+ 	return lseg;
+ }
+ 
++static inline bool
++pnfs_is_valid_lseg(struct pnfs_layout_segment *lseg)
++{
++	return test_bit(NFS_LSEG_VALID, &lseg->pls_flags) != 0;
++}
++
+ /* Return true if a layout driver is being used for this mountpoint */
+ static inline int pnfs_enabled_sb(struct nfs_server *nfss)
+ {
+diff --git a/fs/nfs/pnfs_nfs.c b/fs/nfs/pnfs_nfs.c
+index 7bab8ecc2235..f73d42c4bdc6 100644
+--- a/fs/nfs/pnfs_nfs.c
++++ b/fs/nfs/pnfs_nfs.c
+@@ -911,6 +911,11 @@ pnfs_layout_mark_request_commit(struct nfs_page *req,
+ 	buckets = cinfo->ds->buckets;
+ 	list = &buckets[ds_commit_idx].written;
+ 	if (list_empty(list)) {
++		if (!pnfs_is_valid_lseg(lseg)) {
++			spin_unlock(cinfo->lock);
++			cinfo->completion_ops->resched_write(cinfo, req);
++			return;
++		}
+ 		/* Non-empty buckets hold a reference on the lseg.  That ref
+ 		 * is normally transferred to the COMMIT call and released
+ 		 * there.  It could also be released if the last req is pulled
+* Unmerged path fs/nfs/write.c
+diff --git a/include/linux/nfs_xdr.h b/include/linux/nfs_xdr.h
+index ec4603fd2a1c..13a09b3581da 100644
+--- a/include/linux/nfs_xdr.h
++++ b/include/linux/nfs_xdr.h
+@@ -1422,11 +1422,13 @@ struct nfs_mds_commit_info {
+ 	struct list_head	list;
+ };
+ 
++struct nfs_commit_info;
+ struct nfs_commit_data;
+ struct nfs_inode;
+ struct nfs_commit_completion_ops {
+ 	void (*error_cleanup) (struct nfs_inode *nfsi);
+ 	void (*completion) (struct nfs_commit_data *data);
++	void (*resched_write) (struct nfs_commit_info *, struct nfs_page *);
+ };
+ 
+ struct nfs_commit_info {
