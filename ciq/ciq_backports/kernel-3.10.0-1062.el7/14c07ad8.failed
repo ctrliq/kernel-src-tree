@@ -1,0 +1,315 @@
+x86/kvm/mmu: introduce guest_mmu
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [x86] kvm/mmu: introduce guest_mmu (Vitaly Kuznetsov) [1565739 1497611]
+Rebuild_FUZZ: 93.33%
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit 14c07ad89f4d728a468caaea6a769c018c2b8dd6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/14c07ad8.failed
+
+When EPT is used for nested guest we need to re-init MMU as shadow
+EPT MMU (nested_ept_init_mmu_context() does that). When we return back
+from L2 to L1 kvm_mmu_reset_context() in nested_vmx_load_cr3() resets
+MMU back to normal TDP mode. Add a special 'guest_mmu' so we can use
+separate root caches; the improved hit rate is not very important for
+single vCPU performance, but it avoids contention on the mmu_lock for
+many vCPUs.
+
+On the nested CPUID benchmark, with 16 vCPUs, an L2->L1->L2 vmexit
+goes from 42k to 26k cycles.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Reviewed-by: Sean Christopherson <sean.j.christopherson@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 14c07ad89f4d728a468caaea6a769c018c2b8dd6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu.c
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/mmu.c
+index e7052d2c946d,bf9e3145ff0b..000000000000
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@@ -4497,14 -4829,32 +4497,34 @@@ void kvm_init_shadow_mmu(struct kvm_vcp
+  }
+  EXPORT_SYMBOL_GPL(kvm_init_shadow_mmu);
+  
+++<<<<<<< HEAD
+++=======
++ static union kvm_mmu_page_role
++ kvm_calc_shadow_ept_root_page_role(struct kvm_vcpu *vcpu, bool accessed_dirty)
++ {
++ 	union kvm_mmu_page_role role;
++ 
++ 	/* Role is inherited from root_mmu */
++ 	role.word = vcpu->arch.root_mmu.base_role.word;
++ 
++ 	role.level = PT64_ROOT_4LEVEL;
++ 	role.direct = false;
++ 	role.ad_disabled = !accessed_dirty;
++ 	role.guest_mode = true;
++ 	role.access = ACC_ALL;
++ 
++ 	return role;
++ }
++ 
+++>>>>>>> 14c07ad89f4d (x86/kvm/mmu: introduce guest_mmu)
+  void kvm_init_shadow_ept_mmu(struct kvm_vcpu *vcpu, bool execonly,
+ -			     bool accessed_dirty, gpa_t new_eptp)
+ +			     bool accessed_dirty)
+  {
+ -	struct kvm_mmu *context = vcpu->arch.mmu;
+ -	union kvm_mmu_page_role root_page_role =
+ -		kvm_calc_shadow_ept_root_page_role(vcpu, accessed_dirty);
+ +	struct kvm_mmu *context = &vcpu->arch.mmu;
+ +
+ +	MMU_WARN_ON(VALID_PAGE(context->root_hpa));
+  
+ -	__kvm_mmu_new_cr3(vcpu, new_eptp, root_page_role, false);
+ -	context->shadow_root_level = PT64_ROOT_4LEVEL;
+ +	context->shadow_root_level = kvm_x86_ops->get_tdp_level();
+  
+  	context->nx = true;
+  	context->ept_ad = accessed_dirty;
+@@@ -4614,8 -4985,10 +4634,15 @@@ EXPORT_SYMBOL_GPL(kvm_mmu_load)
+  
+  void kvm_mmu_unload(struct kvm_vcpu *vcpu)
+  {
+++<<<<<<< HEAD
+ +	mmu_free_roots(vcpu);
+ +	WARN_ON(VALID_PAGE(vcpu->arch.mmu.root_hpa));
+++=======
++ 	kvm_mmu_free_roots(vcpu, &vcpu->arch.root_mmu, KVM_MMU_ROOTS_ALL);
++ 	WARN_ON(VALID_PAGE(vcpu->arch.root_mmu.root_hpa));
++ 	kvm_mmu_free_roots(vcpu, &vcpu->arch.guest_mmu, KVM_MMU_ROOTS_ALL);
++ 	WARN_ON(VALID_PAGE(vcpu->arch.guest_mmu.root_hpa));
+++>>>>>>> 14c07ad89f4d (x86/kvm/mmu: introduce guest_mmu)
+  }
+  EXPORT_SYMBOL_GPL(kvm_mmu_unload);
+  
+@@@ -4980,11 -5423,22 +5007,30 @@@ static int alloc_mmu_pages(struct kvm_v
+  
+  int kvm_mmu_create(struct kvm_vcpu *vcpu)
+  {
+++<<<<<<< HEAD
+ +	vcpu->arch.walk_mmu = &vcpu->arch.mmu;
+ +	vcpu->arch.mmu.root_hpa = INVALID_PAGE;
+ +	vcpu->arch.mmu.translate_gpa = translate_gpa;
+ +	vcpu->arch.nested_mmu.translate_gpa = translate_nested_gpa;
+ +
+++=======
++ 	uint i;
++ 
++ 	vcpu->arch.mmu = &vcpu->arch.root_mmu;
++ 	vcpu->arch.walk_mmu = &vcpu->arch.root_mmu;
++ 
++ 	vcpu->arch.root_mmu.root_hpa = INVALID_PAGE;
++ 	vcpu->arch.root_mmu.translate_gpa = translate_gpa;
++ 	for (i = 0; i < KVM_MMU_NUM_PREV_ROOTS; i++)
++ 		vcpu->arch.root_mmu.prev_roots[i] = KVM_MMU_ROOT_INFO_INVALID;
++ 
++ 	vcpu->arch.guest_mmu.root_hpa = INVALID_PAGE;
++ 	vcpu->arch.guest_mmu.translate_gpa = translate_gpa;
++ 	for (i = 0; i < KVM_MMU_NUM_PREV_ROOTS; i++)
++ 		vcpu->arch.guest_mmu.prev_roots[i] = KVM_MMU_ROOT_INFO_INVALID;
++ 
++ 	vcpu->arch.nested_mmu.translate_gpa = translate_nested_gpa;
+++>>>>>>> 14c07ad89f4d (x86/kvm/mmu: introduce guest_mmu)
+  	return alloc_mmu_pages(vcpu);
+  }
+  
+diff --cc arch/x86/kvm/vmx.c
+index 5501a1957de2,02888031d038..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -7345,10 -8499,8 +7353,15 @@@ static int handle_vmoff(struct kvm_vcp
+  {
+  	if (!nested_vmx_check_permission(vcpu))
+  		return 1;
+++<<<<<<< HEAD
+ +	free_nested(to_vmx(vcpu));
+ +	skip_emulated_instruction(vcpu);
+ +	nested_vmx_succeed(vcpu);
+ +	return 1;
+++=======
++ 	free_nested(vcpu);
++ 	return nested_vmx_succeed(vcpu);
+++>>>>>>> 14c07ad89f4d (x86/kvm/mmu: introduce guest_mmu)
+  }
+  
+  /* Emulate the VMCLEAR instruction */
+@@@ -7361,11 -8513,19 +7374,11 @@@ static int handle_vmclear(struct kvm_vc
+  	if (!nested_vmx_check_permission(vcpu))
+  		return 1;
+  
+ -	if (nested_vmx_get_vmptr(vcpu, &vmptr))
+ +	if (nested_vmx_check_vmptr(vcpu, EXIT_REASON_VMCLEAR, &vmptr))
+  		return 1;
+  
+ -	if (!PAGE_ALIGNED(vmptr) || (vmptr >> cpuid_maxphyaddr(vcpu)))
+ -		return nested_vmx_failValid(vcpu,
+ -			VMXERR_VMCLEAR_INVALID_ADDRESS);
+ -
+ -	if (vmptr == vmx->nested.vmxon_ptr)
+ -		return nested_vmx_failValid(vcpu,
+ -			VMXERR_VMCLEAR_VMXON_POINTER);
+ -
+  	if (vmptr == vmx->nested.current_vmptr)
+- 		nested_release_vmcs12(vmx);
++ 		nested_release_vmcs12(vcpu);
+  
+  	kvm_vcpu_write_guest(vcpu,
+  			vmptr + offsetof(struct vmcs12, launch_state),
+@@@ -7688,23 -8858,30 +7701,24 @@@ static int handle_vmptrld(struct kvm_vc
+  	if (vmx->nested.current_vmptr != vmptr) {
+  		struct vmcs12 *new_vmcs12;
+  		struct page *page;
+ -		page = kvm_vcpu_gpa_to_page(vcpu, vmptr);
+ -		if (is_error_page(page))
+ -			return nested_vmx_failInvalid(vcpu);
+ -
+ +		page = nested_get_page(vcpu, vmptr);
+ +		if (page == NULL) {
+ +			nested_vmx_failInvalid(vcpu);
+ +			skip_emulated_instruction(vcpu);
+ +			return 1;
+ +		}
+  		new_vmcs12 = kmap(page);
+ -		if (new_vmcs12->hdr.revision_id != VMCS12_REVISION ||
+ -		    (new_vmcs12->hdr.shadow_vmcs &&
+ -		     !nested_cpu_has_vmx_shadow_vmcs(vcpu))) {
+ +		if (new_vmcs12->revision_id != VMCS12_REVISION) {
+  			kunmap(page);
+ -			kvm_release_page_clean(page);
+ -			return nested_vmx_failValid(vcpu,
+ +			nested_release_page_clean(page);
+ +			nested_vmx_failValid(vcpu,
+  				VMXERR_VMPTRLD_INCORRECT_VMCS_REVISION_ID);
+ +			skip_emulated_instruction(vcpu);
+ +			return 1;
+  		}
+  
+- 		nested_release_vmcs12(vmx);
++ 		nested_release_vmcs12(vcpu);
++ 
+  		/*
+  		 * Load VMCS12 from guest memory since it is not already
+  		 * cached.
+@@@ -9390,14 -10937,10 +9404,21 @@@ static void vmx_switch_vmcs(struct kvm_
+   */
+  static void vmx_free_vcpu_nested(struct kvm_vcpu *vcpu)
+  {
+++<<<<<<< HEAD
+ +       struct vcpu_vmx *vmx = to_vmx(vcpu);
+ +       int r;
+ +
+ +       r = vcpu_load(vcpu);
+ +       BUG_ON(r);
+ +       vmx_switch_vmcs(vcpu, &vmx->vmcs01);
+ +       free_nested(vmx);
+ +       vcpu_put(vcpu);
+++=======
++ 	vcpu_load(vcpu);
++ 	vmx_switch_vmcs(vcpu, &to_vmx(vcpu)->vmcs01);
++ 	free_nested(vcpu);
++ 	vcpu_put(vcpu);
+++>>>>>>> 14c07ad89f4d (x86/kvm/mmu: introduce guest_mmu)
+  }
+  
+  static void vmx_free_vcpu(struct kvm_vcpu *vcpu)
+@@@ -9704,28 -11303,28 +9725,37 @@@ static unsigned long nested_ept_get_cr3
+  	return get_vmcs12(vcpu)->ept_pointer;
+  }
+  
+ -static void nested_ept_init_mmu_context(struct kvm_vcpu *vcpu)
+ +static int nested_ept_init_mmu_context(struct kvm_vcpu *vcpu)
+  {
+  	WARN_ON(mmu_is_nested(vcpu));
+ +	if (!valid_ept_address(vcpu, nested_ept_get_cr3(vcpu)))
+ +		return 1;
+  
+++<<<<<<< HEAD
+ +	kvm_mmu_unload(vcpu);
+++=======
++ 	vcpu->arch.mmu = &vcpu->arch.guest_mmu;
+++>>>>>>> 14c07ad89f4d (x86/kvm/mmu: introduce guest_mmu)
+  	kvm_init_shadow_ept_mmu(vcpu,
+ -			to_vmx(vcpu)->nested.msrs.ept_caps &
+ +			to_vmx(vcpu)->nested.nested_vmx_ept_caps &
+  			VMX_EPT_EXECUTE_ONLY_BIT,
+ -			nested_ept_ad_enabled(vcpu),
+ -			nested_ept_get_cr3(vcpu));
+ -	vcpu->arch.mmu->set_cr3           = vmx_set_cr3;
+ -	vcpu->arch.mmu->get_cr3           = nested_ept_get_cr3;
+ -	vcpu->arch.mmu->inject_page_fault = nested_ept_inject_page_fault;
+ -	vcpu->arch.mmu->get_pdptr         = kvm_pdptr_read;
+ +			nested_ept_ad_enabled(vcpu));
+ +	vcpu->arch.mmu.set_cr3           = vmx_set_cr3;
+ +	vcpu->arch.mmu.get_cr3           = nested_ept_get_cr3;
+ +	vcpu->arch.mmu.inject_page_fault = nested_ept_inject_page_fault;
+  
+  	vcpu->arch.walk_mmu              = &vcpu->arch.nested_mmu;
+ +	return 0;
+  }
+  
+  static void nested_ept_uninit_mmu_context(struct kvm_vcpu *vcpu)
+  {
+++<<<<<<< HEAD
+ +	vcpu->arch.walk_mmu = &vcpu->arch.mmu;
+++=======
++ 	vcpu->arch.mmu = &vcpu->arch.root_mmu;
++ 	vcpu->arch.walk_mmu = &vcpu->arch.root_mmu;
+++>>>>>>> 14c07ad89f4d (x86/kvm/mmu: introduce guest_mmu)
+  }
+  
+  static bool nested_vmx_is_page_fault_vmexit(struct vmcs12 *vmcs12,
+@@@ -11451,28 -13740,9 +11481,28 @@@ static void vmx_leave_nested(struct kvm
+  		to_vmx(vcpu)->nested.nested_run_pending = 0;
+  		nested_vmx_vmexit(vcpu, -1, 0, 0);
+  	}
+- 	free_nested(to_vmx(vcpu));
++ 	free_nested(vcpu);
+  }
+  
+ +/*
+ + * L1's failure to enter L2 is a subset of a normal exit, as explained in
+ + * 23.7 "VM-entry failures during or after loading guest state" (this also
+ + * lists the acceptable exit-reason and exit-qualification parameters).
+ + * It should only be called before L2 actually succeeded to run, and when
+ + * vmcs01 is current (it doesn't leave_guest_mode() or switch vmcss).
+ + */
+ +static void nested_vmx_entry_failure(struct kvm_vcpu *vcpu,
+ +			struct vmcs12 *vmcs12,
+ +			u32 reason, unsigned long qualification)
+ +{
+ +	load_vmcs12_host_state(vcpu, vmcs12);
+ +	vmcs12->vm_exit_reason = reason | VMX_EXIT_REASONS_FAILED_VMENTRY;
+ +	vmcs12->exit_qualification = qualification;
+ +	nested_vmx_succeed(vcpu);
+ +	if (enable_shadow_vmcs)
+ +		to_vmx(vcpu)->nested.sync_shadow_vmcs = true;
+ +}
+ +
+  static int vmx_check_intercept(struct kvm_vcpu *vcpu,
+  			       struct x86_instruction_info *info,
+  			       enum x86_intercept_stage stage)
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 86bec63d5f8a..62deaaa1f23a 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -461,6 +461,9 @@ struct kvm_vcpu_arch {
+ 	 */
+ 	struct kvm_mmu mmu;
+ 
++	/* L1 MMU when running nested */
++	struct kvm_mmu guest_mmu;
++
+ 	/*
+ 	 * Paging state of an L2 guest (used for nested npt)
+ 	 *
+* Unmerged path arch/x86/kvm/mmu.c
+* Unmerged path arch/x86/kvm/vmx.c
