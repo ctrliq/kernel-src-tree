@@ -1,0 +1,251 @@
+kvm: nVMX: support EPT accessed/dirty bits
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit ae1e2d1082ae6969ff8c626ef80804d950bf256b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/ae1e2d10.failed
+
+Now use bit 6 of EPTP to optionally enable A/D bits for EPTP.  Another
+thing to change is that, when EPT accessed and dirty bits are not in use,
+VMX treats accesses to guest paging structures as data reads.  When they
+are in use (bit 6 of EPTP is set), they are treated as writes and the
+corresponding EPT dirty bit is set.  The MMU didn't know this detail,
+so this patch adds it.
+
+We also have to fix up the exit qualification.  It may be wrong because
+KVM sets bit 6 but the guest might not.
+
+L1 emulates EPT A/D bits using write permissions, so in principle it may
+be possible for EPT A/D bits to be used by L1 even though not available
+in hardware.  The problem is that guest page-table walks will be treated
+as reads rather than writes, so they would not cause an EPT violation.
+
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+[Fixed typo in walk_addr_generic() comment and changed bit clear +
+ conditional-set pattern in handle_ept_violation() to conditional-clear]
+	Signed-off-by: Radim Krčmář <rkrcmar@redhat.com>
+(cherry picked from commit ae1e2d1082ae6969ff8c626ef80804d950bf256b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index 8426c9cb3bfe,5556cce99749..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -9892,35 -10209,19 +9914,45 @@@ static int prepare_vmcs02(struct kvm_vc
+  
+  	}
+  
+ +	if (enable_pml) {
+ +		/*
+ +		 * Conceptually we want to copy the PML address and index from
+ +		 * vmcs01 here, and then back to vmcs01 on nested vmexit. But,
+ +		 * since we always flush the log on each vmexit, this happens
+ +		 * to be equivalent to simply resetting the fields in vmcs02.
+ +		 */
+ +		ASSERT(vmx->pml_pg);
+ +		vmcs_write64(PML_ADDRESS, page_to_phys(vmx->pml_pg));
+ +		vmcs_write16(GUEST_PML_INDEX, PML_ENTITY_NUM - 1);
+ +	}
+ +
+  	if (nested_cpu_has_ept(vmcs12)) {
+++<<<<<<< HEAD
+ +		kvm_mmu_unload(vcpu);
+ +		nested_ept_init_mmu_context(vcpu);
+++=======
++ 		if (nested_ept_init_mmu_context(vcpu)) {
++ 			*entry_failure_code = ENTRY_FAIL_DEFAULT;
++ 			return 1;
++ 		}
++ 	} else if (nested_cpu_has2(vmcs12,
++ 				   SECONDARY_EXEC_VIRTUALIZE_APIC_ACCESSES)) {
++ 		vmx_flush_tlb_ept_only(vcpu);
+++>>>>>>> ae1e2d1082ae (kvm: nVMX: support EPT accessed/dirty bits)
+  	}
+  
+ +	if (vmcs12->vm_entry_controls & VM_ENTRY_LOAD_IA32_EFER)
+ +		vcpu->arch.efer = vmcs12->guest_ia32_efer;
+ +	else if (vmcs12->vm_entry_controls & VM_ENTRY_IA32E_MODE)
+ +		vcpu->arch.efer |= (EFER_LMA | EFER_LME);
+ +	else
+ +		vcpu->arch.efer &= ~(EFER_LMA | EFER_LME);
+ +	/* Note: modifies VM_ENTRY/EXIT_CONTROLS and GUEST/HOST_IA32_EFER */
+ +	vmx_set_efer(vcpu, vcpu->arch.efer);
+ +
+  	/*
+ -	 * This sets GUEST_CR0 to vmcs12->guest_cr0, possibly modifying those
+ -	 * bits which we consider mandatory enabled.
+ +	 * This sets GUEST_CR0 to vmcs12->guest_cr0, with possibly a modified
+ +	 * TS bit (for lazy fpu) and bits which we consider mandatory enabled.
+  	 * The CR0_READ_SHADOW is what L2 should have expected to read given
+  	 * the specifications by L1; It's not enough to take
+  	 * vmcs12->cr0_read_shadow because on our cr0_guest_host_mask we we
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 5c70a7e5331b..a229a4b3f4b9 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -309,9 +309,10 @@ struct kvm_mmu {
+ 	void (*update_pte)(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,
+ 			   u64 *spte, const void *pte);
+ 	hpa_t root_hpa;
+-	int root_level;
+-	int shadow_root_level;
+ 	union kvm_mmu_page_role base_role;
++	u8 root_level;
++	u8 shadow_root_level;
++	u8 ept_ad;
+ 	bool direct_map;
+ 
+ 	/*
+diff --git a/arch/x86/include/asm/vmx.h b/arch/x86/include/asm/vmx.h
+index b200bbe19637..66e8142a3f45 100644
+--- a/arch/x86/include/asm/vmx.h
++++ b/arch/x86/include/asm/vmx.h
+@@ -482,12 +482,14 @@ struct vmx_msr_entry {
+ #define EPT_VIOLATION_READABLE_BIT	3
+ #define EPT_VIOLATION_WRITABLE_BIT	4
+ #define EPT_VIOLATION_EXECUTABLE_BIT	5
++#define EPT_VIOLATION_GVA_TRANSLATED_BIT 8
+ #define EPT_VIOLATION_ACC_READ		(1 << EPT_VIOLATION_ACC_READ_BIT)
+ #define EPT_VIOLATION_ACC_WRITE		(1 << EPT_VIOLATION_ACC_WRITE_BIT)
+ #define EPT_VIOLATION_ACC_INSTR		(1 << EPT_VIOLATION_ACC_INSTR_BIT)
+ #define EPT_VIOLATION_READABLE		(1 << EPT_VIOLATION_READABLE_BIT)
+ #define EPT_VIOLATION_WRITABLE		(1 << EPT_VIOLATION_WRITABLE_BIT)
+ #define EPT_VIOLATION_EXECUTABLE	(1 << EPT_VIOLATION_EXECUTABLE_BIT)
++#define EPT_VIOLATION_GVA_TRANSLATED	(1 << EPT_VIOLATION_GVA_TRANSLATED_BIT)
+ 
+ /*
+  * VM-instruction error numbers
+diff --git a/arch/x86/kvm/mmu.c b/arch/x86/kvm/mmu.c
+index e71e54d84771..2ada6fd68db5 100644
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@ -4179,7 +4179,8 @@ void kvm_init_shadow_mmu(struct kvm_vcpu *vcpu)
+ }
+ EXPORT_SYMBOL_GPL(kvm_init_shadow_mmu);
+ 
+-void kvm_init_shadow_ept_mmu(struct kvm_vcpu *vcpu, bool execonly)
++void kvm_init_shadow_ept_mmu(struct kvm_vcpu *vcpu, bool execonly,
++			     bool accessed_dirty)
+ {
+ 	struct kvm_mmu *context = &vcpu->arch.mmu;
+ 
+@@ -4188,6 +4189,7 @@ void kvm_init_shadow_ept_mmu(struct kvm_vcpu *vcpu, bool execonly)
+ 	context->shadow_root_level = kvm_x86_ops->get_tdp_level();
+ 
+ 	context->nx = true;
++	context->ept_ad = accessed_dirty;
+ 	context->page_fault = ept_page_fault;
+ 	context->gva_to_gpa = ept_gva_to_gpa;
+ 	context->sync_page = ept_sync_page;
+diff --git a/arch/x86/kvm/mmu.h b/arch/x86/kvm/mmu.h
+index 34ee51669a88..89dc194f57fe 100644
+--- a/arch/x86/kvm/mmu.h
++++ b/arch/x86/kvm/mmu.h
+@@ -74,7 +74,8 @@ enum {
+ 
+ int handle_mmio_page_fault(struct kvm_vcpu *vcpu, u64 addr, bool direct);
+ void kvm_init_shadow_mmu(struct kvm_vcpu *vcpu);
+-void kvm_init_shadow_ept_mmu(struct kvm_vcpu *vcpu, bool execonly);
++void kvm_init_shadow_ept_mmu(struct kvm_vcpu *vcpu, bool execonly,
++			     bool accessed_dirty);
+ 
+ static inline unsigned int kvm_mmu_available_pages(struct kvm *kvm)
+ {
+diff --git a/arch/x86/kvm/paging_tmpl.h b/arch/x86/kvm/paging_tmpl.h
+index 637ea88b8386..aba6d29bb17b 100644
+--- a/arch/x86/kvm/paging_tmpl.h
++++ b/arch/x86/kvm/paging_tmpl.h
+@@ -23,13 +23,6 @@
+  * so the code in this file is compiled twice, once per pte size.
+  */
+ 
+-/*
+- * This is used to catch non optimized PT_GUEST_(DIRTY|ACCESS)_SHIFT macro
+- * uses for EPT without A/D paging type.
+- */
+-extern u64 __pure __using_nonexistent_pte_bit(void)
+-	       __compiletime_error("wrong use of PT_GUEST_(DIRTY|ACCESS)_SHIFT");
+-
+ #if PTTYPE == 64
+ 	#define pt_element_t u64
+ 	#define guest_walker guest_walker64
+@@ -39,8 +32,6 @@ extern u64 __pure __using_nonexistent_pte_bit(void)
+ 	#define PT_LVL_OFFSET_MASK(lvl) PT64_LVL_OFFSET_MASK(lvl)
+ 	#define PT_INDEX(addr, level) PT64_INDEX(addr, level)
+ 	#define PT_LEVEL_BITS PT64_LEVEL_BITS
+-	#define PT_GUEST_ACCESSED_MASK PT_ACCESSED_MASK
+-	#define PT_GUEST_DIRTY_MASK PT_DIRTY_MASK
+ 	#define PT_GUEST_DIRTY_SHIFT PT_DIRTY_SHIFT
+ 	#define PT_GUEST_ACCESSED_SHIFT PT_ACCESSED_SHIFT
+ 	#define PT_HAVE_ACCESSED_DIRTY(mmu) true
+@@ -61,8 +52,6 @@ extern u64 __pure __using_nonexistent_pte_bit(void)
+ 	#define PT_INDEX(addr, level) PT32_INDEX(addr, level)
+ 	#define PT_LEVEL_BITS PT32_LEVEL_BITS
+ 	#define PT_MAX_FULL_LEVELS 2
+-	#define PT_GUEST_ACCESSED_MASK PT_ACCESSED_MASK
+-	#define PT_GUEST_DIRTY_MASK PT_DIRTY_MASK
+ 	#define PT_GUEST_DIRTY_SHIFT PT_DIRTY_SHIFT
+ 	#define PT_GUEST_ACCESSED_SHIFT PT_ACCESSED_SHIFT
+ 	#define PT_HAVE_ACCESSED_DIRTY(mmu) true
+@@ -76,17 +65,18 @@ extern u64 __pure __using_nonexistent_pte_bit(void)
+ 	#define PT_LVL_OFFSET_MASK(lvl) PT64_LVL_OFFSET_MASK(lvl)
+ 	#define PT_INDEX(addr, level) PT64_INDEX(addr, level)
+ 	#define PT_LEVEL_BITS PT64_LEVEL_BITS
+-	#define PT_GUEST_ACCESSED_MASK 0
+-	#define PT_GUEST_DIRTY_MASK 0
+-	#define PT_GUEST_DIRTY_SHIFT __using_nonexistent_pte_bit()
+-	#define PT_GUEST_ACCESSED_SHIFT __using_nonexistent_pte_bit()
+-	#define PT_HAVE_ACCESSED_DIRTY(mmu) false
++	#define PT_GUEST_DIRTY_SHIFT 9
++	#define PT_GUEST_ACCESSED_SHIFT 8
++	#define PT_HAVE_ACCESSED_DIRTY(mmu) ((mmu)->ept_ad)
+ 	#define CMPXCHG cmpxchg64
+ 	#define PT_MAX_FULL_LEVELS 4
+ #else
+ 	#error Invalid PTTYPE value
+ #endif
+ 
++#define PT_GUEST_DIRTY_MASK    (1 << PT_GUEST_DIRTY_SHIFT)
++#define PT_GUEST_ACCESSED_MASK (1 << PT_GUEST_ACCESSED_SHIFT)
++
+ #define gpte_to_gfn_lvl FNAME(gpte_to_gfn_lvl)
+ #define gpte_to_gfn(pte) gpte_to_gfn_lvl((pte), PT_PAGE_TABLE_LEVEL)
+ 
+@@ -290,6 +280,7 @@ static int FNAME(walk_addr_generic)(struct guest_walker *walker,
+ 	pt_element_t __user *uninitialized_var(ptep_user);
+ 	gfn_t table_gfn;
+ 	unsigned index, pt_access, pte_access, accessed_dirty, pte_pkey;
++	unsigned nested_access;
+ 	gpa_t pte_gpa;
+ 	bool have_ad;
+ 	int offset;
+@@ -319,6 +310,14 @@ retry_walk:
+ 	ASSERT(!(is_long_mode(vcpu) && !is_pae(vcpu)));
+ 
+ 	accessed_dirty = have_ad ? PT_GUEST_ACCESSED_MASK : 0;
++
++	/*
++	 * FIXME: on Intel processors, loads of the PDPTE registers for PAE paging
++	 * by the MOV to CR instruction are treated as reads and do not cause the
++	 * processor to set the dirty flag in any EPT paging-structure entry.
++	 */
++	nested_access = (have_ad ? PFERR_WRITE_MASK : 0) | PFERR_USER_MASK;
++
+ 	pt_access = pte_access = ACC_ALL;
+ 	++walker->level;
+ 
+@@ -338,7 +337,7 @@ retry_walk:
+ 		walker->pte_gpa[walker->level - 1] = pte_gpa;
+ 
+ 		real_gfn = mmu->translate_gpa(vcpu, gfn_to_gpa(table_gfn),
+-					      PFERR_USER_MASK|PFERR_WRITE_MASK,
++					      nested_access,
+ 					      &walker->fault);
+ 
+ 		/*
+* Unmerged path arch/x86/kvm/vmx.c
