@@ -1,0 +1,185 @@
+nvme: centralize ctrl removal prints
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [nvme] centralize ctrl removal prints (David Milburn) [1515584]
+Rebuild_FUZZ: 90.91%
+commit-author Max Gurtovoy <maxg@mellanox.com>
+commit 77d0612da0e61cb2903ecd0be02444e4c958c672
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/77d0612d.failed
+
+nvme_delete_ctrl can be called from various contexts in parallel,
+and cause duplicated information prints, even though the specific
+context doesn't perform the actual removal. Instead, print the
+information when the actual removal occurs.
+
+	Signed-off-by: Max Gurtovoy <maxg@mellanox.com>
+	Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 77d0612da0e61cb2903ecd0be02444e4c958c672)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+#	drivers/nvme/host/fc.c
+#	drivers/nvme/host/rdma.c
+diff --cc drivers/nvme/host/core.c
+index d63d62bfc80f,f29a07ef122f..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -95,12 -115,65 +95,61 @@@ static int nvme_reset_ctrl_sync(struct 
+  	int ret;
+  
+  	ret = nvme_reset_ctrl(ctrl);
+++<<<<<<< HEAD
+++=======
++ 	if (!ret) {
++ 		flush_work(&ctrl->reset_work);
++ 		if (ctrl->state != NVME_CTRL_LIVE)
++ 			ret = -ENETRESET;
++ 	}
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(nvme_reset_ctrl_sync);
++ 
++ static void nvme_delete_ctrl_work(struct work_struct *work)
++ {
++ 	struct nvme_ctrl *ctrl =
++ 		container_of(work, struct nvme_ctrl, delete_work);
++ 
++ 	dev_info(ctrl->device,
++ 		 "Removing ctrl: NQN \"%s\"\n", ctrl->opts->subsysnqn);
++ 
++ 	flush_work(&ctrl->reset_work);
++ 	nvme_stop_ctrl(ctrl);
++ 	nvme_remove_namespaces(ctrl);
++ 	ctrl->ops->delete_ctrl(ctrl);
++ 	nvme_uninit_ctrl(ctrl);
++ 	nvme_put_ctrl(ctrl);
++ }
++ 
++ int nvme_delete_ctrl(struct nvme_ctrl *ctrl)
++ {
++ 	if (!nvme_change_ctrl_state(ctrl, NVME_CTRL_DELETING))
++ 		return -EBUSY;
++ 	if (!queue_work(nvme_delete_wq, &ctrl->delete_work))
++ 		return -EBUSY;
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(nvme_delete_ctrl);
++ 
++ int nvme_delete_ctrl_sync(struct nvme_ctrl *ctrl)
++ {
++ 	int ret = 0;
++ 
++ 	/*
++ 	 * Keep a reference until the work is flushed since ->delete_ctrl
++ 	 * can free the controller.
++ 	 */
++ 	nvme_get_ctrl(ctrl);
++ 	ret = nvme_delete_ctrl(ctrl);
+++>>>>>>> 77d0612da0e6 (nvme: centralize ctrl removal prints)
+  	if (!ret)
+ -		flush_work(&ctrl->delete_work);
+ -	nvme_put_ctrl(ctrl);
+ +		flush_work(&ctrl->reset_work);
+  	return ret;
+  }
+ -EXPORT_SYMBOL_GPL(nvme_delete_ctrl_sync);
+ -
+ -static inline bool nvme_ns_has_pi(struct nvme_ns *ns)
+ -{
+ -	return ns->pi_type && ns->ms == sizeof(struct t10_pi_tuple);
+ -}
+  
+ -static blk_status_t nvme_error_status(struct request *req)
+ +static int nvme_error_status(struct request *req)
+  {
+  	switch (nvme_req(req)->status & 0x7ff) {
+  	case NVME_SC_SUCCESS:
+diff --cc drivers/nvme/host/fc.c
+index 6e7bb75ba7ba,7edaa30cb61b..000000000000
+--- a/drivers/nvme/host/fc.c
++++ b/drivers/nvme/host/fc.c
+@@@ -783,10 -768,9 +783,9 @@@ nvme_fc_ctrl_connectivity_loss(struct n
+  		 */
+  		if (nvme_reset_ctrl(&ctrl->ctrl)) {
+  			dev_warn(ctrl->ctrl.device,
+- 				"NVME-FC{%d}: Couldn't schedule reset. "
+- 				"Deleting controller.\n",
++ 				"NVME-FC{%d}: Couldn't schedule reset.\n",
+  				ctrl->cnum);
+ -			nvme_delete_ctrl(&ctrl->ctrl);
+ +			__nvme_fc_del_ctrl(ctrl);
+  		}
+  		break;
+  
+@@@ -851,10 -835,9 +850,9 @@@ nvme_fc_unregister_remoteport(struct nv
+  		/* if dev_loss_tmo==0, dev loss is immediate */
+  		if (!portptr->dev_loss_tmo) {
+  			dev_warn(ctrl->ctrl.device,
+- 				"NVME-FC{%d}: controller connectivity lost. "
+- 				"Deleting controller.\n",
++ 				"NVME-FC{%d}: controller connectivity lost.\n",
+  				ctrl->cnum);
+ -			nvme_delete_ctrl(&ctrl->ctrl);
+ +			__nvme_fc_del_ctrl(ctrl);
+  		} else
+  			nvme_fc_ctrl_connectivity_loss(ctrl);
+  	}
+@@@ -3005,10 -2885,9 +3003,16 @@@ nvme_fc_reconnect_or_delete(struct nvme
+  		else
+  			dev_warn(ctrl->ctrl.device,
+  				"NVME-FC{%d}: dev_loss_tmo (%d) expired "
+++<<<<<<< HEAD
+ +				"while waiting for remoteport connectivity. "
+ +				"Removing controller\n", ctrl->cnum,
+ +				portptr->dev_loss_tmo);
+ +		WARN_ON(__nvme_fc_del_ctrl(ctrl));
+++=======
++ 				"while waiting for remoteport connectivity.\n",
++ 				ctrl->cnum, portptr->dev_loss_tmo);
++ 		WARN_ON(nvme_delete_ctrl(&ctrl->ctrl));
+++>>>>>>> 77d0612da0e6 (nvme: centralize ctrl removal prints)
+  	}
+  }
+  
+diff --cc drivers/nvme/host/rdma.c
+index 2e9ce2cbb1eb,f5f460b8045c..000000000000
+--- a/drivers/nvme/host/rdma.c
++++ b/drivers/nvme/host/rdma.c
+@@@ -715,8 -899,7 +715,12 @@@ static void nvme_rdma_reconnect_or_remo
+  		queue_delayed_work(nvme_wq, &ctrl->reconnect_work,
+  				ctrl->ctrl.opts->reconnect_delay * HZ);
+  	} else {
+++<<<<<<< HEAD
+ +		dev_info(ctrl->ctrl.device, "Removing controller...\n");
+ +		queue_work(nvme_wq, &ctrl->delete_work);
+++=======
++ 		nvme_delete_ctrl(&ctrl->ctrl);
+++>>>>>>> 77d0612da0e6 (nvme: centralize ctrl removal prints)
+  	}
+  }
+  
+@@@ -2118,10 -2030,7 +2122,14 @@@ static void nvme_rdma_remove_one(struc
+  	list_for_each_entry(ctrl, &nvme_rdma_ctrl_list, list) {
+  		if (ctrl->device->dev != ib_device)
+  			continue;
+++<<<<<<< HEAD
+ +		dev_info(ctrl->ctrl.device,
+ +			"Removing ctrl: NQN \"%s\", addr %pISp\n",
+ +			ctrl->ctrl.opts->subsysnqn, &ctrl->addr);
+ +		__nvme_rdma_del_ctrl(ctrl);
+++=======
++ 		nvme_delete_ctrl(&ctrl->ctrl);
+++>>>>>>> 77d0612da0e6 (nvme: centralize ctrl removal prints)
+  	}
+  	mutex_unlock(&nvme_rdma_ctrl_mutex);
+  
+* Unmerged path drivers/nvme/host/core.c
+* Unmerged path drivers/nvme/host/fc.c
+* Unmerged path drivers/nvme/host/rdma.c
