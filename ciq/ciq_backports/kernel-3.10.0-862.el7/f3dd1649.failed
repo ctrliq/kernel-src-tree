@@ -1,0 +1,204 @@
+gfs2: Remove gl_spin define
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit f3dd1649122b9e73f869e5304d5fa8554e128b7a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/f3dd1649.failed
+
+Commit e66cf161 replaced the gl_spin spinlock in struct gfs2_glock with a
+gl_lockref lockref and defined gl_spin as gl_lockref.lock (the spinlock in
+gl_lockref).  Remove that define to make the references to gl_lockref.lock more
+obvious.
+
+	Signed-off-by: Andreas Gruenbacher <andreas.gruenbacher@gmail.com>
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+(cherry picked from commit f3dd1649122b9e73f869e5304d5fa8554e128b7a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/glock.c
+diff --cc fs/gfs2/glock.c
+index edb49499a3c5,32e74710b1aa..000000000000
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@@ -407,10 -402,10 +407,10 @@@ retry
+  			do_xmote(gl, gh, LM_ST_UNLOCKED);
+  			break;
+  		default: /* Everything else */
+ -			pr_err("wanted %u got %u\n", gl->gl_target, state);
+ +			printk(KERN_ERR "GFS2: wanted %u got %u\n", gl->gl_target, state);
+  			GLOCK_BUG_ON(gl, 1);
+  		}
+- 		spin_unlock(&gl->gl_spin);
++ 		spin_unlock(&gl->gl_lockref.lock);
+  		return;
+  	}
+  
+@@@ -1365,10 -1341,9 +1365,10 @@@ add_back_to_lru
+  		if (demote_ok(gl))
+  			handle_callback(gl, LM_ST_UNLOCKED, 0, false);
+  		WARN_ON(!test_and_clear_bit(GLF_LOCK, &gl->gl_flags));
+ +		smp_mb__after_clear_bit();
+  		if (queue_delayed_work(glock_workqueue, &gl->gl_work, 0) == 0)
+  			gl->gl_lockref.count--;
+- 		spin_unlock(&gl->gl_spin);
++ 		spin_unlock(&gl->gl_lockref.lock);
+  		cond_resched_lock(&lru_lock);
+  	}
+  }
+@@@ -1499,13 -1480,11 +1499,19 @@@ void gfs2_glock_thaw(struct gfs2_sbd *s
+  	glock_hash_walk(thaw_glock, sdp);
+  }
+  
+ -static void dump_glock(struct seq_file *seq, struct gfs2_glock *gl)
+ +static int dump_glock(struct seq_file *seq, struct gfs2_glock *gl)
+  {
+++<<<<<<< HEAD
+ +	int ret;
+ +	spin_lock(&gl->gl_spin);
+ +	ret = gfs2_dump_glock(seq, gl);
+ +	spin_unlock(&gl->gl_spin);
+ +	return ret;
+++=======
++ 	spin_lock(&gl->gl_lockref.lock);
++ 	gfs2_dump_glock(seq, gl);
++ 	spin_unlock(&gl->gl_lockref.lock);
+++>>>>>>> f3dd1649122b (gfs2: Remove gl_spin define)
+  }
+  
+  static void dump_glock_func(struct gfs2_glock *gl)
+diff --git a/Documentation/filesystems/gfs2-glocks.txt b/Documentation/filesystems/gfs2-glocks.txt
+index fcc79957be63..1fb12f9dfe48 100644
+--- a/Documentation/filesystems/gfs2-glocks.txt
++++ b/Documentation/filesystems/gfs2-glocks.txt
+@@ -5,7 +5,7 @@ This documents the basic principles of the glock state machine
+ internals. Each glock (struct gfs2_glock in fs/gfs2/incore.h)
+ has two main (internal) locks:
+ 
+- 1. A spinlock (gl_spin) which protects the internal state such
++ 1. A spinlock (gl_lockref.lock) which protects the internal state such
+     as gl_state, gl_target and the list of holders (gl_holders)
+  2. A non-blocking bit lock, GLF_LOCK, which is used to prevent other
+     threads from making calls to the DLM, etc. at the same time. If a
+@@ -82,8 +82,8 @@ rather than via the glock.
+ 
+ Locking rules for glock operations:
+ 
+-Operation     |  GLF_LOCK bit lock held |  gl_spin spinlock held
+------------------------------------------------------------------
++Operation     |  GLF_LOCK bit lock held |  gl_lockref.lock spinlock held
++-------------------------------------------------------------------------
+ go_xmote_th   |       Yes               |       No
+ go_xmote_bh   |       Yes               |       No
+ go_inval      |       Yes               |       No
+* Unmerged path fs/gfs2/glock.c
+diff --git a/fs/gfs2/glock.h b/fs/gfs2/glock.h
+index 6cb4a44ce8c8..9176b2b435a5 100644
+--- a/fs/gfs2/glock.h
++++ b/fs/gfs2/glock.h
+@@ -141,7 +141,7 @@ static inline struct gfs2_holder *gfs2_glock_is_locked_by_me(struct gfs2_glock *
+ 	struct pid *pid;
+ 
+ 	/* Look in glock's list of holders for one with current task as owner */
+-	spin_lock(&gl->gl_spin);
++	spin_lock(&gl->gl_lockref.lock);
+ 	pid = task_pid(current);
+ 	list_for_each_entry(gh, &gl->gl_holders, gh_list) {
+ 		if (!test_bit(HIF_HOLDER, &gh->gh_iflags))
+@@ -151,7 +151,7 @@ static inline struct gfs2_holder *gfs2_glock_is_locked_by_me(struct gfs2_glock *
+ 	}
+ 	gh = NULL;
+ out:
+-	spin_unlock(&gl->gl_spin);
++	spin_unlock(&gl->gl_lockref.lock);
+ 
+ 	return gh;
+ }
+diff --git a/fs/gfs2/glops.c b/fs/gfs2/glops.c
+index d61cffef9466..851782d30589 100644
+--- a/fs/gfs2/glops.c
++++ b/fs/gfs2/glops.c
+@@ -148,11 +148,11 @@ static void rgrp_go_sync(struct gfs2_glock *gl)
+ 	struct gfs2_rgrpd *rgd;
+ 	int error;
+ 
+-	spin_lock(&gl->gl_spin);
++	spin_lock(&gl->gl_lockref.lock);
+ 	rgd = gl->gl_object;
+ 	if (rgd)
+ 		gfs2_rgrp_brelse(rgd);
+-	spin_unlock(&gl->gl_spin);
++	spin_unlock(&gl->gl_lockref.lock);
+ 
+ 	if (!test_and_clear_bit(GLF_DIRTY, &gl->gl_flags))
+ 		return;
+@@ -164,11 +164,11 @@ static void rgrp_go_sync(struct gfs2_glock *gl)
+         mapping_set_error(metamapping, error);
+ 	gfs2_ail_empty_gl(gl);
+ 
+-	spin_lock(&gl->gl_spin);
++	spin_lock(&gl->gl_lockref.lock);
+ 	rgd = gl->gl_object;
+ 	if (rgd)
+ 		gfs2_free_clones(rgd);
+-	spin_unlock(&gl->gl_spin);
++	spin_unlock(&gl->gl_lockref.lock);
+ }
+ 
+ /**
+@@ -539,7 +539,7 @@ static int trans_go_demote_ok(const struct gfs2_glock *gl)
+  * iopen_go_callback - schedule the dcache entry for the inode to be deleted
+  * @gl: the glock
+  *
+- * gl_spin lock is held while calling this
++ * gl_lockref.lock lock is held while calling this
+  */
+ static void iopen_go_callback(struct gfs2_glock *gl, bool remote)
+ {
+diff --git a/fs/gfs2/incore.h b/fs/gfs2/incore.h
+index fd519f9ec8bc..bd55e564f76d 100644
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@ -330,9 +330,8 @@ struct gfs2_glock {
+ 	struct lm_lockname gl_name;
+ 
+ 	struct lockref gl_lockref;
+-#define gl_spin gl_lockref.lock
+ 
+-	/* State fields protected by gl_spin */
++	/* State fields protected by gl_lockref.lock */
+ 	unsigned int gl_state:2,	/* Current state */
+ 		     gl_target:2,	/* Target state */
+ 		     gl_demote_state:2,	/* State requested by remote node */
+diff --git a/fs/gfs2/main.c b/fs/gfs2/main.c
+index 6c8f42d78f4e..c87ea2d1a6f0 100644
+--- a/fs/gfs2/main.c
++++ b/fs/gfs2/main.c
+@@ -50,7 +50,7 @@ static void gfs2_init_glock_once(void *foo)
+ 	struct gfs2_glock *gl = foo;
+ 
+ 	INIT_HLIST_BL_NODE(&gl->gl_list);
+-	spin_lock_init(&gl->gl_spin);
++	spin_lock_init(&gl->gl_lockref.lock);
+ 	INIT_LIST_HEAD(&gl->gl_holders);
+ 	INIT_LIST_HEAD(&gl->gl_lru);
+ 	INIT_LIST_HEAD(&gl->gl_ail_list);
+diff --git a/fs/gfs2/rgrp.c b/fs/gfs2/rgrp.c
+index 1e6a443a7c59..e73ea2ebb61e 100644
+--- a/fs/gfs2/rgrp.c
++++ b/fs/gfs2/rgrp.c
+@@ -685,9 +685,9 @@ void gfs2_clear_rgrpd(struct gfs2_sbd *sdp)
+ 		rb_erase(n, &sdp->sd_rindex_tree);
+ 
+ 		if (gl) {
+-			spin_lock(&gl->gl_spin);
++			spin_lock(&gl->gl_lockref.lock);
+ 			gl->gl_object = NULL;
+-			spin_unlock(&gl->gl_spin);
++			spin_unlock(&gl->gl_lockref.lock);
+ 			gfs2_glock_add_to_lru(gl);
+ 			gfs2_glock_put(gl);
+ 		}
