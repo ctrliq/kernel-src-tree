@@ -1,0 +1,103 @@
+genetlink: fix counting regression on ctrl_dumpfamily()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Stanislaw Gruszka <sgruszka@redhat.com>
+commit 1d2a6a5e4bf2921531071fcff8538623dce74efa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/1d2a6a5e.failed
+
+Commit 2ae0f17df1cd ("genetlink: use idr to track families") replaced
+
+	if (++n < fams_to_skip)
+		continue;
+into:
+
+	if (n++ < fams_to_skip)
+		continue;
+
+This subtle change cause that on retry ctrl_dumpfamily() call we omit
+one family that failed to do ctrl_fill_info() on previous call, because
+cb->args[0] = n number counts also family that failed to do
+ctrl_fill_info().
+
+Patch fixes the problem and avoid confusion in the future just decrease
+n counter when ctrl_fill_info() fail.
+
+User visible problem caused by this bug is failure to get access to
+some genetlink family i.e. nl80211. However problem is reproducible
+only if number of registered genetlink families is big enough to
+cause second call of ctrl_dumpfamily().
+
+	Cc: Xose Vazquez Perez <xose.vazquez@gmail.com>
+	Cc: Larry Finger <Larry.Finger@lwfinger.net>
+	Cc: Johannes Berg <johannes@sipsolutions.net>
+Fixes: 2ae0f17df1cd ("genetlink: use idr to track families")
+	Signed-off-by: Stanislaw Gruszka <sgruszka@redhat.com>
+	Acked-by: Johannes Berg <johannes@sipsolutions.net>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1d2a6a5e4bf2921531071fcff8538623dce74efa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netlink/genetlink.c
+diff --cc net/netlink/genetlink.c
+index a93aabe188f7,92e0981f7404..000000000000
+--- a/net/netlink/genetlink.c
++++ b/net/netlink/genetlink.c
+@@@ -811,33 -768,28 +811,45 @@@ nla_put_failure
+  
+  static int ctrl_dumpfamily(struct sk_buff *skb, struct netlink_callback *cb)
+  {
+ -	int n = 0;
+ +
+ +	int i, n = 0;
+  	struct genl_family *rt;
+  	struct net *net = sock_net(skb->sk);
+ -	int fams_to_skip = cb->args[0];
+ -	unsigned int id;
+ -
+ -	idr_for_each_entry(&genl_fam_idr, rt, id) {
+ -		if (!rt->netnsok && !net_eq(net, &init_net))
+ -			continue;
+ +	int chains_to_skip = cb->args[0];
+ +	int fams_to_skip = cb->args[1];
+ +
+ +	for (i = chains_to_skip; i < GENL_FAM_TAB_SIZE; i++) {
+ +		n = 0;
+ +		list_for_each_entry(rt, genl_family_chain(i), family_list) {
+ +			if (!rt->netnsok && !net_eq(net, &init_net))
+ +				continue;
+ +			if (++n < fams_to_skip)
+ +				continue;
+ +			if (ctrl_fill_info(rt, NETLINK_CB(cb->skb).portid,
+ +					   cb->nlh->nlmsg_seq, NLM_F_MULTI,
+ +					   skb, CTRL_CMD_NEWFAMILY) < 0)
+ +				goto errout;
+ +		}
+  
+++<<<<<<< HEAD
+ +		fams_to_skip = 0;
+++=======
++ 		if (n++ < fams_to_skip)
++ 			continue;
++ 
++ 		if (ctrl_fill_info(rt, NETLINK_CB(cb->skb).portid,
++ 				   cb->nlh->nlmsg_seq, NLM_F_MULTI,
++ 				   skb, CTRL_CMD_NEWFAMILY) < 0) {
++ 			n--;
++ 			break;
++ 		}
+++>>>>>>> 1d2a6a5e4bf2 (genetlink: fix counting regression on ctrl_dumpfamily())
+  	}
+  
+ -	cb->args[0] = n;
+ +errout:
+ +	cb->args[0] = i;
+ +	cb->args[1] = n;
+ +
+  	return skb->len;
+  }
+  
+* Unmerged path net/netlink/genetlink.c
