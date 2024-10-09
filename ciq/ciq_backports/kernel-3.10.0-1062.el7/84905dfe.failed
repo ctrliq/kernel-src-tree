@@ -1,0 +1,186 @@
+scsi: qla2xxx: Fix TMF and Multi-Queue config
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: Fix TMF and Multi-Queue config (Himanshu Madhani) [1628301]
+Rebuild_FUZZ: 92.86%
+commit-author Quinn Tran <quinn.tran@cavium.com>
+commit 84905dfe78d28b597a1c991bfc05722a8fba1184
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/84905dfe.failed
+
+For target mode, task management command is queued to specific cpu base
+on where the SCSI command is residing.  This prevent race condition of
+task management command getting ahead of regular scsi command.
+
+	Signed-off-by: Quinn Tran <quinn.tran@cavium.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 84905dfe78d28b597a1c991bfc05722a8fba1184)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_target.c
+diff --cc drivers/scsi/qla2xxx/qla_target.c
+index 2ec0b3b49350,b85c833099ff..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@@ -1921,39 -2000,13 +1992,43 @@@ static int __qlt_24xx_handle_abts(struc
+  	struct abts_recv_from_24xx *abts, struct fc_port *sess)
+  {
+  	struct qla_hw_data *ha = vha->hw;
+ +	struct se_session *se_sess = sess->se_sess;
+  	struct qla_tgt_mgmt_cmd *mcmd;
+++<<<<<<< HEAD
+ +	struct se_cmd *se_cmd;
+ +	u64 lun = 0;
+ +	int rc;
+ +	bool found_lun = false;
+ +	unsigned long flags;
+++=======
++ 	struct qla_qpair_hint *h = &vha->vha_tgt.qla_tgt->qphints[0];
+++>>>>>>> 84905dfe78d2 (scsi: qla2xxx: Fix TMF and Multi-Queue config)
+ +
+ +	spin_lock_irqsave(&se_sess->sess_cmd_lock, flags);
+ +	list_for_each_entry(se_cmd, &se_sess->sess_cmd_list, se_cmd_list) {
+ +		struct qla_tgt_cmd *cmd =
+ +			container_of(se_cmd, struct qla_tgt_cmd, se_cmd);
+ +		if (se_cmd->tag == abts->exchange_addr_to_abort) {
+ +			lun = cmd->unpacked_lun;
+ +			found_lun = true;
+ +			break;
+ +		}
+ +	}
+ +	spin_unlock_irqrestore(&se_sess->sess_cmd_lock, flags);
+  
+ -	if (abort_cmd_for_tag(vha, abts->exchange_addr_to_abort)) {
+ -		/* send TASK_ABORT response immediately */
+ -		qlt_24xx_send_abts_resp(ha->base_qpair, abts, FCP_TMF_CMPL, false);
+ -		return 0;
+ +	/* cmd not in LIO lists, look in qla list */
+ +	if (!found_lun) {
+ +		if (abort_cmd_for_tag(vha, abts->exchange_addr_to_abort)) {
+ +			/* send TASK_ABORT response immediately */
+ +			qlt_24xx_send_abts_resp(ha->base_qpair, abts,
+ +			    FCP_TMF_CMPL, false);
+ +			return 0;
+ +		} else {
+ +			ql_dbg(ql_dbg_tgt_mgt, vha, 0xf081,
+ +			    "unable to find cmd in driver or LIO for tag 0x%x\n",
+ +			    abts->exchange_addr_to_abort);
+ +			return -ENOENT;
+ +		}
+  	}
+  
+  	ql_dbg(ql_dbg_tgt_mgt, vha, 0xf00f,
+@@@ -1973,19 -2026,29 +2048,40 @@@
+  	memcpy(&mcmd->orig_iocb.abts, abts, sizeof(mcmd->orig_iocb.abts));
+  	mcmd->reset_count = ha->base_qpair->chip_reset;
+  	mcmd->tmr_func = QLA_TGT_ABTS;
+- 	mcmd->qpair = ha->base_qpair;
++ 	mcmd->qpair = h->qpair;
+  	mcmd->vha = vha;
+  
+++<<<<<<< HEAD
+ +	rc = ha->tgt.tgt_ops->handle_tmr(mcmd, lun, mcmd->tmr_func,
+ +	    abts->exchange_addr_to_abort);
+ +	if (rc != 0) {
+ +		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf052,
+ +		    "qla_target(%d):  tgt_ops->handle_tmr()"
+ +		    " failed: %d", vha->vp_idx, rc);
+ +		mempool_free(mcmd, qla_tgt_mgmt_cmd_mempool);
+ +		return -EFAULT;
+++=======
++ 	/*
++ 	 * LUN is looked up by target-core internally based on the passed
++ 	 * abts->exchange_addr_to_abort tag.
++ 	 */
++ 	mcmd->se_cmd.cpuid = h->cpuid;
++ 
++ 	if (ha->tgt.tgt_ops->find_cmd_by_tag) {
++ 		struct qla_tgt_cmd *abort_cmd;
++ 
++ 		abort_cmd = ha->tgt.tgt_ops->find_cmd_by_tag(sess,
++ 		    abts->exchange_addr_to_abort);
++ 		if (abort_cmd && abort_cmd->qpair) {
++ 			mcmd->qpair = abort_cmd->qpair;
++ 			mcmd->se_cmd.cpuid = abort_cmd->se_cmd.cpuid;
++ 		}
+++>>>>>>> 84905dfe78d2 (scsi: qla2xxx: Fix TMF and Multi-Queue config)
+  	}
+  
++ 	INIT_WORK(&mcmd->work, qlt_do_tmr_work);
++ 	queue_work_on(mcmd->se_cmd.cpuid, qla_tgt_wq, &mcmd->work);
++ 
+  	return 0;
+  }
+  
+* Unmerged path drivers/scsi/qla2xxx/qla_target.c
+diff --git a/drivers/scsi/qla2xxx/qla_target.h b/drivers/scsi/qla2xxx/qla_target.h
+index a4fa48467b9c..59800f93aa62 100644
+--- a/drivers/scsi/qla2xxx/qla_target.h
++++ b/drivers/scsi/qla2xxx/qla_target.h
+@@ -683,7 +683,7 @@ struct qla_tgt_cmd;
+  * target module (tcm_qla2xxx).
+  */
+ struct qla_tgt_func_tmpl {
+-
++	struct qla_tgt_cmd *(*find_cmd_by_tag)(struct fc_port *, uint64_t);
+ 	int (*handle_cmd)(struct scsi_qla_host *, struct qla_tgt_cmd *,
+ 			unsigned char *, uint32_t, int, int, int);
+ 	void (*handle_data)(struct qla_tgt_cmd *);
+@@ -967,6 +967,8 @@ struct qla_tgt_mgmt_cmd {
+ 	unsigned int flags;
+ 	uint32_t reset_count;
+ #define QLA24XX_MGMT_SEND_NACK	1
++	struct work_struct work;
++	uint64_t unpacked_lun;
+ 	union {
+ 		struct atio_from_isp atio;
+ 		struct imm_ntfy_from_isp imm_ntfy;
+diff --git a/drivers/scsi/qla2xxx/tcm_qla2xxx.c b/drivers/scsi/qla2xxx/tcm_qla2xxx.c
+index a92e580047a9..629716218075 100644
+--- a/drivers/scsi/qla2xxx/tcm_qla2xxx.c
++++ b/drivers/scsi/qla2xxx/tcm_qla2xxx.c
+@@ -643,6 +643,32 @@ static int tcm_qla2xxx_handle_tmr(struct qla_tgt_mgmt_cmd *mcmd, u64 lun,
+ 	    transl_tmr_func, GFP_ATOMIC, tag, TARGET_SCF_ACK_KREF);
+ }
+ 
++static struct qla_tgt_cmd *tcm_qla2xxx_find_cmd_by_tag(struct fc_port *sess,
++    uint64_t tag)
++{
++	struct qla_tgt_cmd *cmd = NULL;
++	struct se_cmd *secmd;
++	unsigned long flags;
++
++	if (!sess->se_sess)
++		return NULL;
++
++	spin_lock_irqsave(&sess->se_sess->sess_cmd_lock, flags);
++	list_for_each_entry(secmd, &sess->se_sess->sess_cmd_list, se_cmd_list) {
++		/* skip task management functions, including tmr->task_cmd */
++		if (secmd->se_cmd_flags & SCF_SCSI_TMR_CDB)
++			continue;
++
++		if (secmd->tag == tag) {
++			cmd = container_of(secmd, struct qla_tgt_cmd, se_cmd);
++			break;
++		}
++	}
++	spin_unlock_irqrestore(&sess->se_sess->sess_cmd_lock, flags);
++
++	return cmd;
++}
++
+ static int tcm_qla2xxx_queue_data_in(struct se_cmd *se_cmd)
+ {
+ 	struct qla_tgt_cmd *cmd = container_of(se_cmd,
+@@ -1594,6 +1620,7 @@ static void tcm_qla2xxx_update_sess(struct fc_port *sess, port_id_t s_id,
+  * Calls into tcm_qla2xxx used by qla2xxx LLD I/O path.
+  */
+ static struct qla_tgt_func_tmpl tcm_qla2xxx_template = {
++	.find_cmd_by_tag	= tcm_qla2xxx_find_cmd_by_tag,
+ 	.handle_cmd		= tcm_qla2xxx_handle_cmd,
+ 	.handle_data		= tcm_qla2xxx_handle_data,
+ 	.handle_tmr		= tcm_qla2xxx_handle_tmr,
