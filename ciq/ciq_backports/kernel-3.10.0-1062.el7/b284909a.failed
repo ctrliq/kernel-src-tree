@@ -1,0 +1,910 @@
+cpu/hotplug: Fix "SMT disabled by BIOS" detection for KVM
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Josh Poimboeuf <jpoimboe@redhat.com>
+commit b284909abad48b07d3071a9fc9b5692b3e64914b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/b284909a.failed
+
+With the following commit:
+
+  73d5e2b47264 ("cpu/hotplug: detect SMT disabled by BIOS")
+
+... the hotplug code attempted to detect when SMT was disabled by BIOS,
+in which case it reported SMT as permanently disabled.  However, that
+code broke a virt hotplug scenario, where the guest is booted with only
+primary CPU threads, and a sibling is brought online later.
+
+The problem is that there doesn't seem to be a way to reliably
+distinguish between the HW "SMT disabled by BIOS" case and the virt
+"sibling not yet brought online" case.  So the above-mentioned commit
+was a bit misguided, as it permanently disabled SMT for both cases,
+preventing future virt sibling hotplugs.
+
+Going back and reviewing the original problems which were attempted to
+be solved by that commit, when SMT was disabled in BIOS:
+
+  1) /sys/devices/system/cpu/smt/control showed "on" instead of
+     "notsupported"; and
+
+  2) vmx_vm_init() was incorrectly showing the L1TF_MSG_SMT warning.
+
+I'd propose that we instead consider #1 above to not actually be a
+problem.  Because, at least in the virt case, it's possible that SMT
+wasn't disabled by BIOS and a sibling thread could be brought online
+later.  So it makes sense to just always default the smt control to "on"
+to allow for that possibility (assuming cpuid indicates that the CPU
+supports SMT).
+
+The real problem is #2, which has a simple fix: change vmx_vm_init() to
+query the actual current SMT state -- i.e., whether any siblings are
+currently online -- instead of looking at the SMT "control" sysfs value.
+
+So fix it by:
+
+  a) reverting the original "fix" and its followup fix:
+
+     73d5e2b47264 ("cpu/hotplug: detect SMT disabled by BIOS")
+     bc2d8d262cba ("cpu/hotplug: Fix SMT supported evaluation")
+
+     and
+
+  b) changing vmx_vm_init() to query the actual current SMT state --
+     instead of the sysfs control value -- to determine whether the L1TF
+     warning is needed.  This also requires the 'sched_smt_present'
+     variable to exported, instead of 'cpu_smt_control'.
+
+Fixes: 73d5e2b47264 ("cpu/hotplug: detect SMT disabled by BIOS")
+	Reported-by: Igor Mammedov <imammedo@redhat.com>
+	Signed-off-by: Josh Poimboeuf <jpoimboe@redhat.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Joe Mario <jmario@redhat.com>
+	Cc: Jiri Kosina <jikos@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: kvm@vger.kernel.org
+	Cc: stable@vger.kernel.org
+Link: https://lkml.kernel.org/r/e3a85d585da28cc333ecbc1e78ee9216e6da9396.1548794349.git.jpoimboe@redhat.com
+
+(cherry picked from commit b284909abad48b07d3071a9fc9b5692b3e64914b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/vmx.c
+#	kernel/cpu.c
+#	kernel/sched/fair.c
+#	kernel/smp.c
+diff --cc kernel/cpu.c
+index 364a4aba2443,d1c6d152da89..000000000000
+--- a/kernel/cpu.c
++++ b/kernel/cpu.c
+@@@ -229,7 -376,6 +229,10 @@@ static void cpu_hotplug_done(void) {
+  
+  #ifdef CONFIG_HOTPLUG_SMT
+  enum cpuhp_smt_control cpu_smt_control __read_mostly = CPU_SMT_ENABLED;
+++<<<<<<< HEAD
+ +EXPORT_SYMBOL_GPL(cpu_smt_control);
+++=======
+++>>>>>>> b284909abad4 (cpu/hotplug: Fix "SMT disabled by BIOS" detection for KVM)
+  
+  void __init cpu_smt_disable(bool force)
+  {
+diff --cc kernel/sched/fair.c
+index 79c7b22bbc9b,310d0637fe4b..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -4472,145 -5922,646 +4472,737 @@@ find_idlest_cpu(struct sched_group *gro
+  		}
+  	}
+  
+ -	return shallowest_idle_cpu != -1 ? shallowest_idle_cpu : least_loaded_cpu;
+ +	return idlest;
+  }
+  
+ -static inline int find_idlest_cpu(struct sched_domain *sd, struct task_struct *p,
+ -				  int cpu, int prev_cpu, int sd_flag)
+ +/*
+ + * Try and locate an idle CPU in the sched_domain.
+ + */
+ +static int select_idle_sibling(struct task_struct *p, int target)
+  {
+ -	int new_cpu = cpu;
+ +	struct sched_domain *sd;
+ +	struct sched_group *sg;
+ +	int i = task_cpu(p);
+  
+ -	if (!cpumask_intersects(sched_domain_span(sd), &p->cpus_allowed))
+ -		return prev_cpu;
+ +	if (idle_cpu(target))
+ +		return target;
+  
+  	/*
+ -	 * We need task's util for capacity_spare_without, sync it up to
+ -	 * prev_cpu's last_update_time.
+ +	 * If the prevous cpu is cache affine and idle, don't be stupid.
+  	 */
+ -	if (!(sd_flag & SD_BALANCE_FORK))
+ -		sync_entity_load_avg(&p->se);
+ -
+ -	while (sd) {
+ -		struct sched_group *group;
+ -		struct sched_domain *tmp;
+ -		int weight;
+ -
+ -		if (!(sd->flags & sd_flag)) {
+ -			sd = sd->child;
+ -			continue;
+ -		}
+ +	if (i != target && cpus_share_cache(i, target) && idle_cpu(i))
+ +		return i;
+  
+ -		group = find_idlest_group(sd, p, cpu, sd_flag);
+ -		if (!group) {
+ -			sd = sd->child;
+ -			continue;
+ -		}
+ +	/*
+ +	 * Otherwise, iterate the domains and find an elegible idle cpu.
+ +	 */
+ +	sd = rcu_dereference(per_cpu(sd_llc, target));
+ +	for_each_lower_domain(sd) {
+ +		sg = sd->groups;
+ +		do {
+ +			if (!cpumask_intersects(sched_group_cpus(sg),
+ +						tsk_cpus_allowed(p)))
+ +				goto next;
+  
+ -		new_cpu = find_idlest_group_cpu(group, p, cpu);
+ -		if (new_cpu == cpu) {
+ -			/* Now try balancing at a lower domain level of 'cpu': */
+ -			sd = sd->child;
+ -			continue;
+ -		}
+ +			for_each_cpu(i, sched_group_cpus(sg)) {
+ +				if (i == target || !idle_cpu(i))
+ +					goto next;
+ +			}
+  
+ -		/* Now try balancing at a lower domain level of 'new_cpu': */
+ -		cpu = new_cpu;
+ -		weight = sd->span_weight;
+ -		sd = NULL;
+ -		for_each_domain(cpu, tmp) {
+ -			if (weight <= tmp->span_weight)
+ -				break;
+ -			if (tmp->flags & sd_flag)
+ -				sd = tmp;
+ -		}
+ +			target = cpumask_first_and(sched_group_cpus(sg),
+ +					tsk_cpus_allowed(p));
+ +			goto done;
+ +next:
+ +			sg = sg->next;
+ +		} while (sg != sd->groups);
+  	}
+ -
+ -	return new_cpu;
+ +done:
+ +	return target;
+  }
+  
+ -#ifdef CONFIG_SCHED_SMT
+ -DEFINE_STATIC_KEY_FALSE(sched_smt_present);
+ -EXPORT_SYMBOL_GPL(sched_smt_present);
+ -
+ -static inline void set_idle_cores(int cpu, int val)
+ -{
+ +/*
+ + * sched_balance_self: balance the current task (running on cpu) in domains
+ + * that have the 'flag' flag set. In practice, this is SD_BALANCE_FORK and
+ + * SD_BALANCE_EXEC.
+ + *
+ + * Balance, ie. select the least loaded group.
+ + *
+ + * Returns the target CPU number, or the same CPU if no balancing is needed.
+ + *
+ + * preempt must be disabled.
+ + */
+ +static int
+ +select_task_rq_fair(struct task_struct *p, int prev_cpu, int sd_flag, int wake_flags)
+ +{
+ +	struct sched_domain *tmp, *affine_sd = NULL, *sd = NULL;
+ +	int cpu = smp_processor_id();
+ +	int new_cpu = cpu;
+ +	int want_affine = 0;
+ +	int sync = wake_flags & WF_SYNC;
+ +
+ +	if (sd_flag & SD_BALANCE_WAKE) {
+ +		if (cpumask_test_cpu(cpu, tsk_cpus_allowed(p)))
+ +			want_affine = 1;
+ +		new_cpu = prev_cpu;
+ +		record_wakee(p);
+ +	}
+ +
+ +	rcu_read_lock();
+ +	for_each_domain(cpu, tmp) {
+ +		if (!(tmp->flags & SD_LOAD_BALANCE))
+ +			continue;
+ +
+ +		/*
+ +		 * If both cpu and prev_cpu are part of this domain,
+ +		 * cpu is a valid SD_WAKE_AFFINE target.
+ +		 */
+ +		if (want_affine && (tmp->flags & SD_WAKE_AFFINE) &&
+ +		    cpumask_test_cpu(prev_cpu, sched_domain_span(tmp))) {
+ +			affine_sd = tmp;
+ +			break;
+ +		}
+ +
+ +		if (tmp->flags & sd_flag)
+ +			sd = tmp;
+ +	}
+ +
+ +	if (affine_sd) {
+ +		if (cpu != prev_cpu && wake_affine(affine_sd, p, sync))
+ +			prev_cpu = cpu;
+ +
+ +		new_cpu = select_idle_sibling(p, prev_cpu);
+ +		goto unlock;
+ +	}
+ +
+ +	while (sd) {
+ +		int load_idx = sd->forkexec_idx;
+ +		struct sched_group *group;
+ +		int weight;
+ +
+ +		if (!(sd->flags & sd_flag)) {
+ +			sd = sd->child;
+ +			continue;
+ +		}
+ +
+ +		if (sd_flag & SD_BALANCE_WAKE)
+ +			load_idx = sd->wake_idx;
+ +
+ +		group = find_idlest_group(sd, p, cpu, load_idx);
+ +		if (!group) {
+ +			sd = sd->child;
+ +			continue;
+ +		}
+ +
+ +		new_cpu = find_idlest_cpu(group, p, cpu);
+ +		if (new_cpu == -1 || new_cpu == cpu) {
+ +			/* Now try balancing at a lower domain level of cpu */
+ +			sd = sd->child;
+ +			continue;
+ +		}
+ +
+ +		/* Now try balancing at a lower domain level of new_cpu */
+ +		cpu = new_cpu;
+ +		weight = sd->span_weight;
+ +		sd = NULL;
+ +		for_each_domain(cpu, tmp) {
+ +			if (weight <= tmp->span_weight)
+ +				break;
+ +			if (tmp->flags & sd_flag)
+ +				sd = tmp;
+ +		}
+++<<<<<<< HEAD
+ +		/* while loop will break here if sd == NULL */
+++=======
+++	}
+++
+++	return new_cpu;
+++}
+++
+++#ifdef CONFIG_SCHED_SMT
+++DEFINE_STATIC_KEY_FALSE(sched_smt_present);
+++EXPORT_SYMBOL_GPL(sched_smt_present);
+++
+++static inline void set_idle_cores(int cpu, int val)
+++{
++ 	struct sched_domain_shared *sds;
++ 
++ 	sds = rcu_dereference(per_cpu(sd_llc_shared, cpu));
++ 	if (sds)
++ 		WRITE_ONCE(sds->has_idle_cores, val);
++ }
++ 
++ static inline bool test_idle_cores(int cpu, bool def)
++ {
++ 	struct sched_domain_shared *sds;
++ 
++ 	sds = rcu_dereference(per_cpu(sd_llc_shared, cpu));
++ 	if (sds)
++ 		return READ_ONCE(sds->has_idle_cores);
++ 
++ 	return def;
++ }
++ 
++ /*
++  * Scans the local SMT mask to see if the entire core is idle, and records this
++  * information in sd_llc_shared->has_idle_cores.
++  *
++  * Since SMT siblings share all cache levels, inspecting this limited remote
++  * state should be fairly cheap.
++  */
++ void __update_idle_core(struct rq *rq)
++ {
++ 	int core = cpu_of(rq);
++ 	int cpu;
++ 
++ 	rcu_read_lock();
++ 	if (test_idle_cores(core, true))
++ 		goto unlock;
++ 
++ 	for_each_cpu(cpu, cpu_smt_mask(core)) {
++ 		if (cpu == core)
++ 			continue;
++ 
++ 		if (!available_idle_cpu(cpu))
++ 			goto unlock;
++ 	}
++ 
++ 	set_idle_cores(core, 1);
++ unlock:
++ 	rcu_read_unlock();
++ }
++ 
++ /*
++  * Scan the entire LLC domain for idle cores; this dynamically switches off if
++  * there are no idle cores left in the system; tracked through
++  * sd_llc->shared->has_idle_cores and enabled through update_idle_core() above.
++  */
++ static int select_idle_core(struct task_struct *p, struct sched_domain *sd, int target)
++ {
++ 	struct cpumask *cpus = this_cpu_cpumask_var_ptr(select_idle_mask);
++ 	int core, cpu;
++ 
++ 	if (!static_branch_likely(&sched_smt_present))
++ 		return -1;
++ 
++ 	if (!test_idle_cores(target, false))
++ 		return -1;
++ 
++ 	cpumask_and(cpus, sched_domain_span(sd), &p->cpus_allowed);
++ 
++ 	for_each_cpu_wrap(core, cpus, target) {
++ 		bool idle = true;
++ 
++ 		for_each_cpu(cpu, cpu_smt_mask(core)) {
++ 			cpumask_clear_cpu(cpu, cpus);
++ 			if (!available_idle_cpu(cpu))
++ 				idle = false;
++ 		}
++ 
++ 		if (idle)
++ 			return core;
++ 	}
++ 
++ 	/*
++ 	 * Failed to find an idle core; stop looking for one.
++ 	 */
++ 	set_idle_cores(target, 0);
++ 
++ 	return -1;
++ }
++ 
++ /*
++  * Scan the local SMT mask for idle CPUs.
++  */
++ static int select_idle_smt(struct task_struct *p, struct sched_domain *sd, int target)
++ {
++ 	int cpu;
++ 
++ 	if (!static_branch_likely(&sched_smt_present))
++ 		return -1;
++ 
++ 	for_each_cpu(cpu, cpu_smt_mask(target)) {
++ 		if (!cpumask_test_cpu(cpu, &p->cpus_allowed))
++ 			continue;
++ 		if (available_idle_cpu(cpu))
++ 			return cpu;
++ 	}
++ 
++ 	return -1;
++ }
++ 
++ #else /* CONFIG_SCHED_SMT */
++ 
++ static inline int select_idle_core(struct task_struct *p, struct sched_domain *sd, int target)
++ {
++ 	return -1;
++ }
++ 
++ static inline int select_idle_smt(struct task_struct *p, struct sched_domain *sd, int target)
++ {
++ 	return -1;
++ }
++ 
++ #endif /* CONFIG_SCHED_SMT */
++ 
++ /*
++  * Scan the LLC domain for idle CPUs; this is dynamically regulated by
++  * comparing the average scan cost (tracked in sd->avg_scan_cost) against the
++  * average idle time for this rq (as found in rq->avg_idle).
++  */
++ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, int target)
++ {
++ 	struct sched_domain *this_sd;
++ 	u64 avg_cost, avg_idle;
++ 	u64 time, cost;
++ 	s64 delta;
++ 	int cpu, nr = INT_MAX;
++ 
++ 	this_sd = rcu_dereference(*this_cpu_ptr(&sd_llc));
++ 	if (!this_sd)
++ 		return -1;
++ 
++ 	/*
++ 	 * Due to large variance we need a large fuzz factor; hackbench in
++ 	 * particularly is sensitive here.
++ 	 */
++ 	avg_idle = this_rq()->avg_idle / 512;
++ 	avg_cost = this_sd->avg_scan_cost + 1;
++ 
++ 	if (sched_feat(SIS_AVG_CPU) && avg_idle < avg_cost)
++ 		return -1;
++ 
++ 	if (sched_feat(SIS_PROP)) {
++ 		u64 span_avg = sd->span_weight * avg_idle;
++ 		if (span_avg > 4*avg_cost)
++ 			nr = div_u64(span_avg, avg_cost);
++ 		else
++ 			nr = 4;
++ 	}
++ 
++ 	time = local_clock();
++ 
++ 	for_each_cpu_wrap(cpu, sched_domain_span(sd), target) {
++ 		if (!--nr)
++ 			return -1;
++ 		if (!cpumask_test_cpu(cpu, &p->cpus_allowed))
++ 			continue;
++ 		if (available_idle_cpu(cpu))
++ 			break;
++ 	}
++ 
++ 	time = local_clock() - time;
++ 	cost = this_sd->avg_scan_cost;
++ 	delta = (s64)(time - cost) / 8;
++ 	this_sd->avg_scan_cost += delta;
++ 
++ 	return cpu;
++ }
++ 
++ /*
++  * Try and locate an idle core/thread in the LLC cache domain.
++  */
++ static int select_idle_sibling(struct task_struct *p, int prev, int target)
++ {
++ 	struct sched_domain *sd;
++ 	int i, recent_used_cpu;
++ 
++ 	if (available_idle_cpu(target))
++ 		return target;
++ 
++ 	/*
++ 	 * If the previous CPU is cache affine and idle, don't be stupid:
++ 	 */
++ 	if (prev != target && cpus_share_cache(prev, target) && available_idle_cpu(prev))
++ 		return prev;
++ 
++ 	/* Check a recently used CPU as a potential idle candidate: */
++ 	recent_used_cpu = p->recent_used_cpu;
++ 	if (recent_used_cpu != prev &&
++ 	    recent_used_cpu != target &&
++ 	    cpus_share_cache(recent_used_cpu, target) &&
++ 	    available_idle_cpu(recent_used_cpu) &&
++ 	    cpumask_test_cpu(p->recent_used_cpu, &p->cpus_allowed)) {
++ 		/*
++ 		 * Replace recent_used_cpu with prev as it is a potential
++ 		 * candidate for the next wake:
++ 		 */
++ 		p->recent_used_cpu = prev;
++ 		return recent_used_cpu;
++ 	}
++ 
++ 	sd = rcu_dereference(per_cpu(sd_llc, target));
++ 	if (!sd)
++ 		return target;
++ 
++ 	i = select_idle_core(p, sd, target);
++ 	if ((unsigned)i < nr_cpumask_bits)
++ 		return i;
++ 
++ 	i = select_idle_cpu(p, sd, target);
++ 	if ((unsigned)i < nr_cpumask_bits)
++ 		return i;
++ 
++ 	i = select_idle_smt(p, sd, target);
++ 	if ((unsigned)i < nr_cpumask_bits)
++ 		return i;
++ 
++ 	return target;
++ }
++ 
++ /**
++  * Amount of capacity of a CPU that is (estimated to be) used by CFS tasks
++  * @cpu: the CPU to get the utilization of
++  *
++  * The unit of the return value must be the one of capacity so we can compare
++  * the utilization with the capacity of the CPU that is available for CFS task
++  * (ie cpu_capacity).
++  *
++  * cfs_rq.avg.util_avg is the sum of running time of runnable tasks plus the
++  * recent utilization of currently non-runnable tasks on a CPU. It represents
++  * the amount of utilization of a CPU in the range [0..capacity_orig] where
++  * capacity_orig is the cpu_capacity available at the highest frequency
++  * (arch_scale_freq_capacity()).
++  * The utilization of a CPU converges towards a sum equal to or less than the
++  * current capacity (capacity_curr <= capacity_orig) of the CPU because it is
++  * the running time on this CPU scaled by capacity_curr.
++  *
++  * The estimated utilization of a CPU is defined to be the maximum between its
++  * cfs_rq.avg.util_avg and the sum of the estimated utilization of the tasks
++  * currently RUNNABLE on that CPU.
++  * This allows to properly represent the expected utilization of a CPU which
++  * has just got a big task running since a long sleep period. At the same time
++  * however it preserves the benefits of the "blocked utilization" in
++  * describing the potential for other tasks waking up on the same CPU.
++  *
++  * Nevertheless, cfs_rq.avg.util_avg can be higher than capacity_curr or even
++  * higher than capacity_orig because of unfortunate rounding in
++  * cfs.avg.util_avg or just after migrating tasks and new task wakeups until
++  * the average stabilizes with the new running time. We need to check that the
++  * utilization stays within the range of [0..capacity_orig] and cap it if
++  * necessary. Without utilization capping, a group could be seen as overloaded
++  * (CPU0 utilization at 121% + CPU1 utilization at 80%) whereas CPU1 has 20% of
++  * available capacity. We allow utilization to overshoot capacity_curr (but not
++  * capacity_orig) as it useful for predicting the capacity required after task
++  * migrations (scheduler-driven DVFS).
++  *
++  * Return: the (estimated) utilization for the specified CPU
++  */
++ static inline unsigned long cpu_util(int cpu)
++ {
++ 	struct cfs_rq *cfs_rq;
++ 	unsigned int util;
++ 
++ 	cfs_rq = &cpu_rq(cpu)->cfs;
++ 	util = READ_ONCE(cfs_rq->avg.util_avg);
++ 
++ 	if (sched_feat(UTIL_EST))
++ 		util = max(util, READ_ONCE(cfs_rq->avg.util_est.enqueued));
++ 
++ 	return min_t(unsigned long, util, capacity_orig_of(cpu));
++ }
++ 
++ /*
++  * cpu_util_without: compute cpu utilization without any contributions from *p
++  * @cpu: the CPU which utilization is requested
++  * @p: the task which utilization should be discounted
++  *
++  * The utilization of a CPU is defined by the utilization of tasks currently
++  * enqueued on that CPU as well as tasks which are currently sleeping after an
++  * execution on that CPU.
++  *
++  * This method returns the utilization of the specified CPU by discounting the
++  * utilization of the specified task, whenever the task is currently
++  * contributing to the CPU utilization.
++  */
++ static unsigned long cpu_util_without(int cpu, struct task_struct *p)
++ {
++ 	struct cfs_rq *cfs_rq;
++ 	unsigned int util;
++ 
++ 	/* Task has no contribution or is new */
++ 	if (cpu != task_cpu(p) || !READ_ONCE(p->se.avg.last_update_time))
++ 		return cpu_util(cpu);
++ 
++ 	cfs_rq = &cpu_rq(cpu)->cfs;
++ 	util = READ_ONCE(cfs_rq->avg.util_avg);
++ 
++ 	/* Discount task's util from CPU's util */
++ 	lsub_positive(&util, task_util(p));
++ 
++ 	/*
++ 	 * Covered cases:
++ 	 *
++ 	 * a) if *p is the only task sleeping on this CPU, then:
++ 	 *      cpu_util (== task_util) > util_est (== 0)
++ 	 *    and thus we return:
++ 	 *      cpu_util_without = (cpu_util - task_util) = 0
++ 	 *
++ 	 * b) if other tasks are SLEEPING on this CPU, which is now exiting
++ 	 *    IDLE, then:
++ 	 *      cpu_util >= task_util
++ 	 *      cpu_util > util_est (== 0)
++ 	 *    and thus we discount *p's blocked utilization to return:
++ 	 *      cpu_util_without = (cpu_util - task_util) >= 0
++ 	 *
++ 	 * c) if other tasks are RUNNABLE on that CPU and
++ 	 *      util_est > cpu_util
++ 	 *    then we use util_est since it returns a more restrictive
++ 	 *    estimation of the spare capacity on that CPU, by just
++ 	 *    considering the expected utilization of tasks already
++ 	 *    runnable on that CPU.
++ 	 *
++ 	 * Cases a) and b) are covered by the above code, while case c) is
++ 	 * covered by the following code when estimated utilization is
++ 	 * enabled.
++ 	 */
++ 	if (sched_feat(UTIL_EST)) {
++ 		unsigned int estimated =
++ 			READ_ONCE(cfs_rq->avg.util_est.enqueued);
++ 
++ 		/*
++ 		 * Despite the following checks we still have a small window
++ 		 * for a possible race, when an execl's select_task_rq_fair()
++ 		 * races with LB's detach_task():
++ 		 *
++ 		 *   detach_task()
++ 		 *     p->on_rq = TASK_ON_RQ_MIGRATING;
++ 		 *     ---------------------------------- A
++ 		 *     deactivate_task()                   \
++ 		 *       dequeue_task()                     + RaceTime
++ 		 *         util_est_dequeue()              /
++ 		 *     ---------------------------------- B
++ 		 *
++ 		 * The additional check on "current == p" it's required to
++ 		 * properly fix the execl regression and it helps in further
++ 		 * reducing the chances for the above race.
++ 		 */
++ 		if (unlikely(task_on_rq_queued(p) || current == p))
++ 			lsub_positive(&estimated, _task_util_est(p));
++ 
++ 		util = max(util, estimated);
++ 	}
++ 
++ 	/*
++ 	 * Utilization (estimated) can exceed the CPU capacity, thus let's
++ 	 * clamp to the maximum CPU capacity to ensure consistency with
++ 	 * the cpu_util call.
++ 	 */
++ 	return min_t(unsigned long, util, capacity_orig_of(cpu));
++ }
++ 
++ /*
++  * Disable WAKE_AFFINE in the case where task @p doesn't fit in the
++  * capacity of either the waking CPU @cpu or the previous CPU @prev_cpu.
++  *
++  * In that case WAKE_AFFINE doesn't make sense and we'll let
++  * BALANCE_WAKE sort things out.
++  */
++ static int wake_cap(struct task_struct *p, int cpu, int prev_cpu)
++ {
++ 	long min_cap, max_cap;
++ 
++ 	if (!static_branch_unlikely(&sched_asym_cpucapacity))
++ 		return 0;
++ 
++ 	min_cap = min(capacity_orig_of(prev_cpu), capacity_orig_of(cpu));
++ 	max_cap = cpu_rq(cpu)->rd->max_cpu_capacity;
++ 
++ 	/* Minimum capacity is close to max, no need to abort wake_affine */
++ 	if (max_cap - min_cap < max_cap >> 3)
++ 		return 0;
++ 
++ 	/* Bring task utilization in sync with prev_cpu */
++ 	sync_entity_load_avg(&p->se);
++ 
++ 	return !task_fits_capacity(p, min_cap);
++ }
++ 
++ /*
++  * Predicts what cpu_util(@cpu) would return if @p was migrated (and enqueued)
++  * to @dst_cpu.
++  */
++ static unsigned long cpu_util_next(int cpu, struct task_struct *p, int dst_cpu)
++ {
++ 	struct cfs_rq *cfs_rq = &cpu_rq(cpu)->cfs;
++ 	unsigned long util_est, util = READ_ONCE(cfs_rq->avg.util_avg);
++ 
++ 	/*
++ 	 * If @p migrates from @cpu to another, remove its contribution. Or,
++ 	 * if @p migrates from another CPU to @cpu, add its contribution. In
++ 	 * the other cases, @cpu is not impacted by the migration, so the
++ 	 * util_avg should already be correct.
++ 	 */
++ 	if (task_cpu(p) == cpu && dst_cpu != cpu)
++ 		sub_positive(&util, task_util(p));
++ 	else if (task_cpu(p) != cpu && dst_cpu == cpu)
++ 		util += task_util(p);
++ 
++ 	if (sched_feat(UTIL_EST)) {
++ 		util_est = READ_ONCE(cfs_rq->avg.util_est.enqueued);
++ 
++ 		/*
++ 		 * During wake-up, the task isn't enqueued yet and doesn't
++ 		 * appear in the cfs_rq->avg.util_est.enqueued of any rq,
++ 		 * so just add it (if needed) to "simulate" what will be
++ 		 * cpu_util() after the task has been enqueued.
++ 		 */
++ 		if (dst_cpu == cpu)
++ 			util_est += _task_util_est(p);
++ 
++ 		util = max(util, util_est);
++ 	}
++ 
++ 	return min(util, capacity_orig_of(cpu));
++ }
++ 
++ /*
++  * compute_energy(): Estimates the energy that would be consumed if @p was
++  * migrated to @dst_cpu. compute_energy() predicts what will be the utilization
++  * landscape of the * CPUs after the task migration, and uses the Energy Model
++  * to compute what would be the energy if we decided to actually migrate that
++  * task.
++  */
++ static long
++ compute_energy(struct task_struct *p, int dst_cpu, struct perf_domain *pd)
++ {
++ 	long util, max_util, sum_util, energy = 0;
++ 	int cpu;
++ 
++ 	for (; pd; pd = pd->next) {
++ 		max_util = sum_util = 0;
++ 		/*
++ 		 * The capacity state of CPUs of the current rd can be driven by
++ 		 * CPUs of another rd if they belong to the same performance
++ 		 * domain. So, account for the utilization of these CPUs too
++ 		 * by masking pd with cpu_online_mask instead of the rd span.
++ 		 *
++ 		 * If an entire performance domain is outside of the current rd,
++ 		 * it will not appear in its pd list and will not be accounted
++ 		 * by compute_energy().
++ 		 */
++ 		for_each_cpu_and(cpu, perf_domain_span(pd), cpu_online_mask) {
++ 			util = cpu_util_next(cpu, p, dst_cpu);
++ 			util = schedutil_energy_util(cpu, util);
++ 			max_util = max(util, max_util);
++ 			sum_util += util;
++ 		}
++ 
++ 		energy += em_pd_energy(pd->em_pd, max_util, sum_util);
++ 	}
++ 
++ 	return energy;
++ }
++ 
++ /*
++  * find_energy_efficient_cpu(): Find most energy-efficient target CPU for the
++  * waking task. find_energy_efficient_cpu() looks for the CPU with maximum
++  * spare capacity in each performance domain and uses it as a potential
++  * candidate to execute the task. Then, it uses the Energy Model to figure
++  * out which of the CPU candidates is the most energy-efficient.
++  *
++  * The rationale for this heuristic is as follows. In a performance domain,
++  * all the most energy efficient CPU candidates (according to the Energy
++  * Model) are those for which we'll request a low frequency. When there are
++  * several CPUs for which the frequency request will be the same, we don't
++  * have enough data to break the tie between them, because the Energy Model
++  * only includes active power costs. With this model, if we assume that
++  * frequency requests follow utilization (e.g. using schedutil), the CPU with
++  * the maximum spare capacity in a performance domain is guaranteed to be among
++  * the best candidates of the performance domain.
++  *
++  * In practice, it could be preferable from an energy standpoint to pack
++  * small tasks on a CPU in order to let other CPUs go in deeper idle states,
++  * but that could also hurt our chances to go cluster idle, and we have no
++  * ways to tell with the current Energy Model if this is actually a good
++  * idea or not. So, find_energy_efficient_cpu() basically favors
++  * cluster-packing, and spreading inside a cluster. That should at least be
++  * a good thing for latency, and this is consistent with the idea that most
++  * of the energy savings of EAS come from the asymmetry of the system, and
++  * not so much from breaking the tie between identical CPUs. That's also the
++  * reason why EAS is enabled in the topology code only for systems where
++  * SD_ASYM_CPUCAPACITY is set.
++  *
++  * NOTE: Forkees are not accepted in the energy-aware wake-up path because
++  * they don't have any useful utilization data yet and it's not possible to
++  * forecast their impact on energy consumption. Consequently, they will be
++  * placed by find_idlest_cpu() on the least loaded CPU, which might turn out
++  * to be energy-inefficient in some use-cases. The alternative would be to
++  * bias new tasks towards specific types of CPUs first, or to try to infer
++  * their util_avg from the parent task, but those heuristics could hurt
++  * other use-cases too. So, until someone finds a better way to solve this,
++  * let's keep things simple by re-using the existing slow path.
++  */
++ 
++ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
++ {
++ 	unsigned long prev_energy = ULONG_MAX, best_energy = ULONG_MAX;
++ 	struct root_domain *rd = cpu_rq(smp_processor_id())->rd;
++ 	int cpu, best_energy_cpu = prev_cpu;
++ 	struct perf_domain *head, *pd;
++ 	unsigned long cpu_cap, util;
++ 	struct sched_domain *sd;
++ 
++ 	rcu_read_lock();
++ 	pd = rcu_dereference(rd->pd);
++ 	if (!pd || READ_ONCE(rd->overutilized))
++ 		goto fail;
++ 	head = pd;
++ 
++ 	/*
++ 	 * Energy-aware wake-up happens on the lowest sched_domain starting
++ 	 * from sd_asym_cpucapacity spanning over this_cpu and prev_cpu.
++ 	 */
++ 	sd = rcu_dereference(*this_cpu_ptr(&sd_asym_cpucapacity));
++ 	while (sd && !cpumask_test_cpu(prev_cpu, sched_domain_span(sd)))
++ 		sd = sd->parent;
++ 	if (!sd)
++ 		goto fail;
++ 
++ 	sync_entity_load_avg(&p->se);
++ 	if (!task_util_est(p))
++ 		goto unlock;
++ 
++ 	for (; pd; pd = pd->next) {
++ 		unsigned long cur_energy, spare_cap, max_spare_cap = 0;
++ 		int max_spare_cap_cpu = -1;
++ 
++ 		for_each_cpu_and(cpu, perf_domain_span(pd), sched_domain_span(sd)) {
++ 			if (!cpumask_test_cpu(cpu, &p->cpus_allowed))
++ 				continue;
++ 
++ 			/* Skip CPUs that will be overutilized. */
++ 			util = cpu_util_next(cpu, p, cpu);
++ 			cpu_cap = capacity_of(cpu);
++ 			if (cpu_cap * 1024 < util * capacity_margin)
++ 				continue;
++ 
++ 			/* Always use prev_cpu as a candidate. */
++ 			if (cpu == prev_cpu) {
++ 				prev_energy = compute_energy(p, prev_cpu, head);
++ 				best_energy = min(best_energy, prev_energy);
++ 				continue;
++ 			}
++ 
++ 			/*
++ 			 * Find the CPU with the maximum spare capacity in
++ 			 * the performance domain
++ 			 */
++ 			spare_cap = cpu_cap - util;
++ 			if (spare_cap > max_spare_cap) {
++ 				max_spare_cap = spare_cap;
++ 				max_spare_cap_cpu = cpu;
++ 			}
++ 		}
++ 
++ 		/* Evaluate the energy impact of using this CPU. */
++ 		if (max_spare_cap_cpu >= 0) {
++ 			cur_energy = compute_energy(p, max_spare_cap_cpu, head);
++ 			if (cur_energy < best_energy) {
++ 				best_energy = cur_energy;
++ 				best_energy_cpu = max_spare_cap_cpu;
++ 			}
++ 		}
+++>>>>>>> b284909abad4 (cpu/hotplug: Fix "SMT disabled by BIOS" detection for KVM)
+  	}
+  unlock:
+  	rcu_read_unlock();
+diff --cc kernel/smp.c
+index 3150b5af3117,f4cf1b0bb3b8..000000000000
+--- a/kernel/smp.c
++++ b/kernel/smp.c
+@@@ -556,8 -578,13 +556,17 @@@ void __init smp_init(void
+  			cpu_up(cpu);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	num_nodes = num_online_nodes();
++ 	num_cpus  = num_online_cpus();
++ 	pr_info("Brought up %d node%s, %d CPU%s\n",
++ 		num_nodes, (num_nodes > 1 ? "s" : ""),
++ 		num_cpus,  (num_cpus  > 1 ? "s" : ""));
++ 
+++>>>>>>> b284909abad4 (cpu/hotplug: Fix "SMT disabled by BIOS" detection for KVM)
+  	/* Any cleanup work */
+ +	printk(KERN_INFO "Brought up %ld CPUs\n", (long)num_online_cpus());
+  	smp_cpus_done(setup_max_cpus);
+  }
+  
+* Unmerged path arch/x86/kvm/vmx/vmx.c
+* Unmerged path arch/x86/kvm/vmx/vmx.c
+* Unmerged path kernel/cpu.c
+* Unmerged path kernel/sched/fair.c
+* Unmerged path kernel/smp.c
