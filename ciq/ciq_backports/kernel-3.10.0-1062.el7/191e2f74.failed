@@ -1,0 +1,354 @@
+scsi: lpfc: Correct errors accessing fw log
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [scsi] lpfc: Correct errors accessing fw log (Dick Kennedy) [1642905]
+Rebuild_FUZZ: 92.50%
+commit-author James Smart <jsmart2021@gmail.com>
+commit 191e2f749370ea7f319c2b1d626e459f4ee37384
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/191e2f74.failed
+
+This patch corrects two issues:
+
+- An oops would occur if reading based on a non-zero offset.  Offset
+  calculation was incorrect.
+
+- Updates to ras config (logging level) were ignored if change was
+  made while fw logging was enabled. Revise to dynamically update.
+
+	Signed-off-by: Dick Kennedy <dick.kennedy@broadcom.com>
+	Signed-off-by: James Smart <jsmart2021@gmail.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 191e2f749370ea7f319c2b1d626e459f4ee37384)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/lpfc/lpfc_bsg.c
+diff --cc drivers/scsi/lpfc/lpfc_bsg.c
+index cd54eb39f32f,eb2e8c941b78..000000000000
+--- a/drivers/scsi/lpfc/lpfc_bsg.c
++++ b/drivers/scsi/lpfc/lpfc_bsg.c
+@@@ -5240,6 -5307,316 +5240,319 @@@ job_error
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * lpfc_check_fwlog_support: Check FW log support on the adapter
++  * @phba: Pointer to HBA context object.
++  *
++  * Check if FW Logging support by the adapter
++  **/
++ int
++ lpfc_check_fwlog_support(struct lpfc_hba *phba)
++ {
++ 	struct lpfc_ras_fwlog *ras_fwlog = NULL;
++ 
++ 	ras_fwlog = &phba->ras_fwlog;
++ 
++ 	if (ras_fwlog->ras_hwsupport == false)
++ 		return -EACCES;
++ 	else if (ras_fwlog->ras_enabled == false)
++ 		return -EPERM;
++ 	else
++ 		return 0;
++ }
++ 
++ /**
++  * lpfc_bsg_get_ras_config: Get RAS configuration settings
++  * @job: fc_bsg_job to handle
++  *
++  * Get RAS configuration values set.
++  **/
++ static int
++ lpfc_bsg_get_ras_config(struct bsg_job *job)
++ {
++ 	struct Scsi_Host *shost = fc_bsg_to_shost(job);
++ 	struct lpfc_vport *vport = shost_priv(shost);
++ 	struct fc_bsg_reply *bsg_reply = job->reply;
++ 	struct lpfc_hba *phba = vport->phba;
++ 	struct lpfc_bsg_get_ras_config_reply *ras_reply;
++ 	struct lpfc_ras_fwlog *ras_fwlog = &phba->ras_fwlog;
++ 	int rc = 0;
++ 
++ 	if (job->request_len <
++ 	    sizeof(struct fc_bsg_request) +
++ 	    sizeof(struct lpfc_bsg_ras_req)) {
++ 		lpfc_printf_log(phba, KERN_ERR, LOG_LIBDFC,
++ 				"6181 Received RAS_LOG request "
++ 				"below minimum size\n");
++ 		rc = -EINVAL;
++ 		goto ras_job_error;
++ 	}
++ 
++ 	/* Check FW log status */
++ 	rc = lpfc_check_fwlog_support(phba);
++ 	if (rc == -EACCES || rc == -EPERM)
++ 		goto ras_job_error;
++ 
++ 	ras_reply = (struct lpfc_bsg_get_ras_config_reply *)
++ 		bsg_reply->reply_data.vendor_reply.vendor_rsp;
++ 
++ 	/* Current logging state */
++ 	if (ras_fwlog->ras_active == true)
++ 		ras_reply->state = LPFC_RASLOG_STATE_RUNNING;
++ 	else
++ 		ras_reply->state = LPFC_RASLOG_STATE_STOPPED;
++ 
++ 	ras_reply->log_level = phba->ras_fwlog.fw_loglevel;
++ 	ras_reply->log_buff_sz = phba->cfg_ras_fwlog_buffsize;
++ 
++ ras_job_error:
++ 	/* make error code available to userspace */
++ 	bsg_reply->result = rc;
++ 
++ 	/* complete the job back to userspace */
++ 	bsg_job_done(job, bsg_reply->result, bsg_reply->reply_payload_rcv_len);
++ 	return rc;
++ }
++ 
++ /**
++  * lpfc_ras_stop_fwlog: Disable FW logging by the adapter
++  * @phba: Pointer to HBA context object.
++  *
++  * Disable FW logging into host memory on the adapter. To
++  * be done before reading logs from the host memory.
++  **/
++ static void
++ lpfc_ras_stop_fwlog(struct lpfc_hba *phba)
++ {
++ 	struct lpfc_ras_fwlog *ras_fwlog = &phba->ras_fwlog;
++ 
++ 	ras_fwlog->ras_active = false;
++ 
++ 	/* Disable FW logging to host memory */
++ 	writel(LPFC_CTL_PDEV_CTL_DDL_RAS,
++ 	       phba->sli4_hba.conf_regs_memmap_p + LPFC_CTL_PDEV_CTL_OFFSET);
++ }
++ 
++ /**
++  * lpfc_bsg_set_ras_config: Set FW logging parameters
++  * @job: fc_bsg_job to handle
++  *
++  * Set log-level parameters for FW-logging in host memory
++  **/
++ static int
++ lpfc_bsg_set_ras_config(struct bsg_job *job)
++ {
++ 	struct Scsi_Host *shost = fc_bsg_to_shost(job);
++ 	struct lpfc_vport *vport = shost_priv(shost);
++ 	struct lpfc_hba *phba = vport->phba;
++ 	struct lpfc_bsg_set_ras_config_req *ras_req;
++ 	struct fc_bsg_request *bsg_request = job->request;
++ 	struct lpfc_ras_fwlog *ras_fwlog = &phba->ras_fwlog;
++ 	struct fc_bsg_reply *bsg_reply = job->reply;
++ 	uint8_t action = 0, log_level = 0;
++ 	int rc = 0, action_status = 0;
++ 
++ 	if (job->request_len <
++ 	    sizeof(struct fc_bsg_request) +
++ 	    sizeof(struct lpfc_bsg_set_ras_config_req)) {
++ 		lpfc_printf_log(phba, KERN_ERR, LOG_LIBDFC,
++ 				"6182 Received RAS_LOG request "
++ 				"below minimum size\n");
++ 		rc = -EINVAL;
++ 		goto ras_job_error;
++ 	}
++ 
++ 	/* Check FW log status */
++ 	rc = lpfc_check_fwlog_support(phba);
++ 	if (rc == -EACCES || rc == -EPERM)
++ 		goto ras_job_error;
++ 
++ 	ras_req = (struct lpfc_bsg_set_ras_config_req *)
++ 		bsg_request->rqst_data.h_vendor.vendor_cmd;
++ 	action = ras_req->action;
++ 	log_level = ras_req->log_level;
++ 
++ 	if (action == LPFC_RASACTION_STOP_LOGGING) {
++ 		/* Check if already disabled */
++ 		if (ras_fwlog->ras_active == false) {
++ 			rc = -ESRCH;
++ 			goto ras_job_error;
++ 		}
++ 
++ 		/* Disable logging */
++ 		lpfc_ras_stop_fwlog(phba);
++ 	} else {
++ 		/*action = LPFC_RASACTION_START_LOGGING*/
++ 
++ 		/* Even though FW-logging is active re-initialize
++ 		 * FW-logging with new log-level. Return status
++ 		 * "Logging already Running" to caller.
++ 		 **/
++ 		if (ras_fwlog->ras_active)
++ 			action_status = -EINPROGRESS;
++ 
++ 		/* Enable logging */
++ 		rc = lpfc_sli4_ras_fwlog_init(phba, log_level,
++ 					      LPFC_RAS_ENABLE_LOGGING);
++ 		if (rc) {
++ 			rc = -EINVAL;
++ 			goto ras_job_error;
++ 		}
++ 
++ 		/* Check if FW-logging is re-initialized */
++ 		if (action_status == -EINPROGRESS)
++ 			rc = action_status;
++ 	}
++ ras_job_error:
++ 	/* make error code available to userspace */
++ 	bsg_reply->result = rc;
++ 
++ 	/* complete the job back to userspace */
++ 	bsg_job_done(job, bsg_reply->result,
++ 		       bsg_reply->reply_payload_rcv_len);
++ 
++ 	return rc;
++ }
++ 
++ /**
++  * lpfc_bsg_get_ras_lwpd: Get log write position data
++  * @job: fc_bsg_job to handle
++  *
++  * Get Offset/Wrap count of the log message written
++  * in host memory
++  **/
++ static int
++ lpfc_bsg_get_ras_lwpd(struct bsg_job *job)
++ {
++ 	struct Scsi_Host *shost = fc_bsg_to_shost(job);
++ 	struct lpfc_vport *vport = shost_priv(shost);
++ 	struct lpfc_bsg_get_ras_lwpd *ras_reply;
++ 	struct lpfc_hba *phba = vport->phba;
++ 	struct lpfc_ras_fwlog *ras_fwlog = &phba->ras_fwlog;
++ 	struct fc_bsg_reply *bsg_reply = job->reply;
++ 	u32 *lwpd_ptr = NULL;
++ 	int rc = 0;
++ 
++ 	rc = lpfc_check_fwlog_support(phba);
++ 	if (rc == -EACCES || rc == -EPERM)
++ 		goto ras_job_error;
++ 
++ 	if (job->request_len <
++ 	    sizeof(struct fc_bsg_request) +
++ 	    sizeof(struct lpfc_bsg_ras_req)) {
++ 		lpfc_printf_log(phba, KERN_ERR, LOG_LIBDFC,
++ 				"6183 Received RAS_LOG request "
++ 				"below minimum size\n");
++ 		rc = -EINVAL;
++ 		goto ras_job_error;
++ 	}
++ 
++ 	ras_reply = (struct lpfc_bsg_get_ras_lwpd *)
++ 		bsg_reply->reply_data.vendor_reply.vendor_rsp;
++ 
++ 	/* Get lwpd offset */
++ 	lwpd_ptr = (uint32_t *)(ras_fwlog->lwpd.virt);
++ 	ras_reply->offset = be32_to_cpu(*lwpd_ptr & 0xffffffff);
++ 
++ 	/* Get wrap count */
++ 	ras_reply->wrap_count = be32_to_cpu(*(++lwpd_ptr) & 0xffffffff);
++ 
++ ras_job_error:
++ 	/* make error code available to userspace */
++ 	bsg_reply->result = rc;
++ 
++ 	/* complete the job back to userspace */
++ 	bsg_job_done(job, bsg_reply->result, bsg_reply->reply_payload_rcv_len);
++ 
++ 	return rc;
++ }
++ 
++ /**
++  * lpfc_bsg_get_ras_fwlog: Read FW log
++  * @job: fc_bsg_job to handle
++  *
++  * Copy the FW log into the passed buffer.
++  **/
++ static int
++ lpfc_bsg_get_ras_fwlog(struct bsg_job *job)
++ {
++ 	struct Scsi_Host *shost = fc_bsg_to_shost(job);
++ 	struct lpfc_vport *vport = shost_priv(shost);
++ 	struct lpfc_hba *phba = vport->phba;
++ 	struct fc_bsg_request *bsg_request = job->request;
++ 	struct fc_bsg_reply *bsg_reply = job->reply;
++ 	struct lpfc_bsg_get_fwlog_req *ras_req;
++ 	u32 rd_offset, rd_index, offset;
++ 	void *src, *fwlog_buff;
++ 	struct lpfc_ras_fwlog *ras_fwlog = NULL;
++ 	struct lpfc_dmabuf *dmabuf, *next;
++ 	int rc = 0;
++ 
++ 	ras_fwlog = &phba->ras_fwlog;
++ 
++ 	rc = lpfc_check_fwlog_support(phba);
++ 	if (rc == -EACCES || rc == -EPERM)
++ 		goto ras_job_error;
++ 
++ 	/* Logging to be stopped before reading */
++ 	if (ras_fwlog->ras_active == true) {
++ 		rc = -EINPROGRESS;
++ 		goto ras_job_error;
++ 	}
++ 
++ 	if (job->request_len <
++ 	    sizeof(struct fc_bsg_request) +
++ 	    sizeof(struct lpfc_bsg_get_fwlog_req)) {
++ 		lpfc_printf_log(phba, KERN_ERR, LOG_LIBDFC,
++ 				"6184 Received RAS_LOG request "
++ 				"below minimum size\n");
++ 		rc = -EINVAL;
++ 		goto ras_job_error;
++ 	}
++ 
++ 	ras_req = (struct lpfc_bsg_get_fwlog_req *)
++ 		bsg_request->rqst_data.h_vendor.vendor_cmd;
++ 	rd_offset = ras_req->read_offset;
++ 
++ 	/* Allocate memory to read fw log*/
++ 	fwlog_buff = vmalloc(ras_req->read_size);
++ 	if (!fwlog_buff) {
++ 		rc = -ENOMEM;
++ 		goto ras_job_error;
++ 	}
++ 
++ 	rd_index = (rd_offset / LPFC_RAS_MAX_ENTRY_SIZE);
++ 	offset = (rd_offset % LPFC_RAS_MAX_ENTRY_SIZE);
++ 
++ 	list_for_each_entry_safe(dmabuf, next,
++ 			      &ras_fwlog->fwlog_buff_list, list) {
++ 
++ 		if (dmabuf->buffer_tag < rd_index)
++ 			continue;
++ 
++ 		src = dmabuf->virt + offset;
++ 		memcpy(fwlog_buff, src, ras_req->read_size);
++ 		break;
++ 	}
++ 
++ 	bsg_reply->reply_payload_rcv_len =
++ 		sg_copy_from_buffer(job->reply_payload.sg_list,
++ 				    job->reply_payload.sg_cnt,
++ 				    fwlog_buff, ras_req->read_size);
++ 
++ 	vfree(fwlog_buff);
++ 
++ ras_job_error:
++ 	bsg_reply->result = rc;
++ 	bsg_job_done(job, bsg_reply->result, bsg_reply->reply_payload_rcv_len);
++ 
++ 	return rc;
++ }
++ 
++ 
++ /**
+++>>>>>>> 191e2f749370 (scsi: lpfc: Correct errors accessing fw log)
+   * lpfc_bsg_hst_vendor - process a vendor-specific fc_bsg_job
+   * @job: fc_bsg_job to handle
+   **/
+* Unmerged path drivers/scsi/lpfc/lpfc_bsg.c
