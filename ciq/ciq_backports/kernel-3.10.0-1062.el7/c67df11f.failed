@@ -1,0 +1,168 @@
+vhost_net: try batch dequing from skb array
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jason Wang <jasowang@redhat.com>
+commit c67df11f6e48061e43e9bf9dade83fe268b47d27
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/c67df11f.failed
+
+We used to dequeue one skb during recvmsg() from skb_array, this could
+be inefficient because of the bad cache utilization and spinlock
+touching for each packet. This patch tries to batch them by calling
+batch dequeuing helpers explicitly on the exported skb array and pass
+the skb back through msg_control for underlayer socket to finish the
+userspace copying. Batch dequeuing is also the requirement for more
+batching improvement on receive path.
+
+Tests were done by pktgen on tap with XDP1 in guest. Host is Intel(R)
+Xeon(R) CPU E5-2650 0 @ 2.00GHz.
+
+rx batch | pps
+
+0   2.25Mpps
+1   2.33Mpps (+3.56%)
+4   2.33Mpps (+3.56%)
+16  2.35Mpps (+4.44%)
+64  2.42Mpps (+7.56%) <- Default rx batching
+128 2.40Mpps (+6.67%)
+256 2.38Mpps (+5.78%)
+
+	Signed-off-by: Jason Wang <jasowang@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c67df11f6e48061e43e9bf9dade83fe268b47d27)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/vhost/net.c
+diff --cc drivers/vhost/net.c
+index baf5b225a11a,e3d7ea1288c6..000000000000
+--- a/drivers/vhost/net.c
++++ b/drivers/vhost/net.c
+@@@ -24,7 -26,10 +24,9 @@@
+  #include <linux/if_arp.h>
+  #include <linux/if_tun.h>
+  #include <linux/if_macvlan.h>
+ -#include <linux/if_tap.h>
+  #include <linux/if_vlan.h>
++ #include <linux/skb_array.h>
++ #include <linux/skbuff.h>
+  
+  #include <net/sock.h>
+  
+@@@ -83,12 -87,15 +85,19 @@@ struct vhost_net_ubuf_ref 
+  	struct vhost_virtqueue *vq;
+  };
+  
++ #define VHOST_RX_BATCH 64
++ struct vhost_net_buf {
++ 	struct sk_buff **queue;
++ 	int tail;
++ 	int head;
++ };
++ 
+  struct vhost_net_virtqueue {
+  	struct vhost_virtqueue vq;
+ +	/* hdr is used to store the virtio header.
+ +	 * Since each iovec has >= 1 byte length, we never need more than
+ +	 * header length entries to store the header. */
+ +	struct iovec hdr[sizeof(struct virtio_net_hdr_mrg_rxbuf)];
+  	size_t vhost_hlen;
+  	size_t sock_hlen;
+  	/* vhost zerocopy support fields below: */
+@@@ -576,16 -634,11 +653,16 @@@ static int vhost_net_rx_peek_head_len(s
+  
+  		preempt_enable();
+  
+ -		if (vhost_enable_notify(&net->dev, vq))
+ +		if (!vhost_vq_avail_empty(&net->dev, vq))
+  			vhost_poll_queue(&vq->poll);
+ +		else if (unlikely(vhost_enable_notify(&net->dev, vq))) {
+ +			vhost_disable_notify(&net->dev, vq);
+ +			vhost_poll_queue(&vq->poll);
+ +		}
+ +
+  		mutex_unlock(&vq->mutex);
+  
+- 		len = peek_head_len(sk);
++ 		len = peek_head_len(rvq, sk);
+  	}
+  
+  	return len;
+@@@ -720,11 -775,13 +797,17 @@@ static void handle_rx(struct vhost_net 
+  					likely(mergeable) ? UIO_MAXIOV : 1);
+  		/* On error, stop handling until the next kick. */
+  		if (unlikely(headcount < 0))
+++<<<<<<< HEAD
+ +			break;
+++=======
++ 			goto out;
++ 		if (nvq->rx_array)
++ 			msg.msg_control = vhost_net_buf_consume(&nvq->rxq);
+++>>>>>>> c67df11f6e48 (vhost_net: try batch dequing from skb array)
+  		/* On overrun, truncate and discard */
+  		if (unlikely(headcount > UIO_MAXIOV)) {
+ -			iov_iter_init(&msg.msg_iter, READ, vq->iov, 1, 1);
+ -			err = sock->ops->recvmsg(sock, &msg,
+ +			msg.msg_iovlen = 1;
+ +			err = sock->ops->recvmsg(NULL, sock, &msg,
+  						 1, MSG_DONTWAIT | MSG_TRUNC);
+  			pr_debug("Discarded rx packet: len %zd\n", sock_len);
+  			continue;
+@@@ -838,7 -894,8 +921,12 @@@ static int vhost_net_open(struct inode 
+  	struct vhost_net *n;
+  	struct vhost_dev *dev;
+  	struct vhost_virtqueue **vqs;
+++<<<<<<< HEAD
+ +	int r, i;
+++=======
++ 	struct sk_buff **queue;
++ 	int i;
+++>>>>>>> c67df11f6e48 (vhost_net: try batch dequing from skb array)
+  
+  	n = kvmalloc(sizeof *n, GFP_KERNEL | __GFP_REPEAT);
+  	if (!n)
+@@@ -861,13 -927,9 +958,14 @@@
+  		n->vqs[i].done_idx = 0;
+  		n->vqs[i].vhost_hlen = 0;
+  		n->vqs[i].sock_hlen = 0;
++ 		vhost_net_buf_init(&n->vqs[i].rxq);
+  	}
+ -	vhost_dev_init(dev, vqs, VHOST_NET_VQ_MAX);
+ +	r = vhost_dev_init(dev, vqs, VHOST_NET_VQ_MAX);
+ +	if (r < 0) {
+ +		kfree(n);
+ +		kfree(vqs);
+ +		return r;
+ +	}
+  
+  	vhost_poll_init(n->poll + VHOST_NET_VQ_TX, handle_tx_net, POLLOUT, dev);
+  	vhost_poll_init(n->poll + VHOST_NET_VQ_RX, handle_rx_net, POLLIN, dev);
+@@@ -966,8 -1005,9 +1067,9 @@@ static int vhost_net_release(struct ino
+  	/* We do an extra flush before freeing memory,
+  	 * since jobs can re-queue themselves. */
+  	vhost_net_flush(n);
++ 	kfree(n->vqs[VHOST_NET_VQ_RX].rxq.queue);
+  	kfree(n->dev.vqs);
+ -	kvfree(n);
+ +	vhost_net_free(n);
+  	return 0;
+  }
+  
+@@@ -1080,7 -1139,10 +1201,14 @@@ static long vhost_net_set_backend(struc
+  
+  		vhost_net_disable_vq(n, vq);
+  		vq->private_data = sock;
+++<<<<<<< HEAD
+ +		r = vhost_init_used(vq);
+++=======
++ 		vhost_net_buf_unproduce(nvq);
++ 		if (index == VHOST_NET_VQ_RX)
++ 			nvq->rx_array = get_tap_skb_array(fd);
++ 		r = vhost_vq_init_access(vq);
+++>>>>>>> c67df11f6e48 (vhost_net: try batch dequing from skb array)
+  		if (r)
+  			goto err_used;
+  		r = vhost_net_enable_vq(n, vq);
+* Unmerged path drivers/vhost/net.c
