@@ -1,0 +1,505 @@
+net: sched: add percpu stats to actions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] sched: add percpu stats to actions (Ivan Vecera) [1428588]
+Rebuild_FUZZ: 93.15%
+commit-author Eric Dumazet <edumazet@google.com>
+commit 519c818e8fb646eef1e8bfedd18519bec47bc9a9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/519c818e.failed
+
+Reuse existing percpu infrastructure John Fastabend added for qdisc.
+
+This patch adds a new cpustats parameter to tcf_hash_create() and all
+actions pass false, meaning this patch should have no effect yet.
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Cc: Alexei Starovoitov <ast@plumgrid.com>
+	Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Acked-by: John Fastabend <john.fastabend@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 519c818e8fb646eef1e8bfedd18519bec47bc9a9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/act_api.h
+#	net/sched/act_api.c
+#	net/sched/act_bpf.c
+#	net/sched/act_connmark.c
+#	net/sched/act_csum.c
+#	net/sched/act_gact.c
+#	net/sched/act_ipt.c
+#	net/sched/act_mirred.c
+#	net/sched/act_nat.c
+#	net/sched/act_pedit.c
+#	net/sched/act_simple.c
+#	net/sched/act_skbedit.c
+diff --cc include/net/act_api.h
+index 11aac9abd0ca,db2063ffd181..000000000000
+--- a/include/net/act_api.h
++++ b/include/net/act_api.h
+@@@ -21,8 -21,10 +21,10 @@@ struct tcf_common 
+  	struct gnet_stats_rate_est64	tcfc_rate_est;
+  	spinlock_t			tcfc_lock;
+  	struct rcu_head			tcfc_rcu;
++ 	struct gnet_stats_basic_cpu __percpu *cpu_bstats;
++ 	struct gnet_stats_queue __percpu *cpu_qstats;
+  };
+ -#define tcf_head	common.tcfc_head
+ +#define tcf_next	common.tcfc_next
+  #define tcf_index	common.tcfc_index
+  #define tcf_refcnt	common.tcfc_refcnt
+  #define tcf_bindcnt	common.tcfc_bindcnt
+@@@ -77,22 -99,19 +79,34 @@@ struct tc_action_ops 
+  	int     (*walk)(struct sk_buff *, struct netlink_callback *, int, struct tc_action *);
+  };
+  
+++<<<<<<< HEAD
+ +struct tcf_common *tcf_hash_lookup(u32 index, struct tcf_hashinfo *hinfo);
+ +void tcf_hash_destroy(struct tcf_common *p, struct tcf_hashinfo *hinfo);
+ +int tcf_hash_release(struct tcf_common *p, int bind,
+ +		     struct tcf_hashinfo *hinfo);
+ +u32 tcf_hash_new_index(u32 *idx_gen, struct tcf_hashinfo *hinfo);
+ +struct tcf_common *tcf_hash_check(u32 index, struct tc_action *a,
+ +				  int bind, struct tcf_hashinfo *hinfo);
+ +struct tcf_common *tcf_hash_create(u32 index, struct nlattr *est,
+ +				   struct tc_action *a, int size,
+ +				   int bind, u32 *idx_gen,
+ +				   struct tcf_hashinfo *hinfo);
+ +void tcf_hash_insert(struct tcf_common *p, struct tcf_hashinfo *hinfo);
+++=======
++ int tcf_hash_search(struct tc_action *a, u32 index);
++ void tcf_hash_destroy(struct tc_action *a);
++ int tcf_hash_release(struct tc_action *a, int bind);
++ u32 tcf_hash_new_index(struct tcf_hashinfo *hinfo);
++ int tcf_hash_check(u32 index, struct tc_action *a, int bind);
++ int tcf_hash_create(u32 index, struct nlattr *est, struct tc_action *a,
++ 		    int size, int bind, bool cpustats);
++ void tcf_hash_cleanup(struct tc_action *a, struct nlattr *est);
++ void tcf_hash_insert(struct tc_action *a);
+++>>>>>>> 519c818e8fb6 (net: sched: add percpu stats to actions)
+  
+ -int tcf_register_action(struct tc_action_ops *a, unsigned int mask);
+ +int tcf_register_action(struct tc_action_ops *a);
+  int tcf_unregister_action(struct tc_action_ops *a);
+ -int tcf_action_destroy(struct list_head *actions, int bind);
+ +void tcf_action_destroy(struct list_head *actions, int bind);
+  int tcf_action_exec(struct sk_buff *skb, const struct list_head *actions,
+  		    struct tcf_result *res);
+  int tcf_action_init(struct net *net, struct nlattr *nla,
+diff --cc net/sched/act_api.c
+index 45d305cc522a,074a32f466f8..000000000000
+--- a/net/sched/act_api.c
++++ b/net/sched/act_api.c
+@@@ -27,27 -27,30 +27,53 @@@
+  #include <net/act_api.h>
+  #include <net/netlink.h>
+  
+++<<<<<<< HEAD
+ +void tcf_hash_destroy(struct tcf_common *p, struct tcf_hashinfo *hinfo)
+++=======
++ static void free_tcf(struct rcu_head *head)
++ {
++ 	struct tcf_common *p = container_of(head, struct tcf_common, tcfc_rcu);
++ 
++ 	free_percpu(p->cpu_bstats);
++ 	free_percpu(p->cpu_qstats);
++ 	kfree(p);
++ }
++ 
++ void tcf_hash_destroy(struct tc_action *a)
+++>>>>>>> 519c818e8fb6 (net: sched: add percpu stats to actions)
+  {
+ -	struct tcf_common *p = a->priv;
+ -	struct tcf_hashinfo *hinfo = a->ops->hinfo;
+ -
+ +	unsigned int h = tcf_hash(p->tcfc_index, hinfo->hmask);
+ +	struct tcf_common **p1p;
+ +
+++<<<<<<< HEAD
+ +	for (p1p = &hinfo->htab[h]; *p1p; p1p = &(*p1p)->tcfc_next) {
+ +		if (*p1p == p) {
+ +			write_lock_bh(hinfo->lock);
+ +			*p1p = p->tcfc_next;
+ +			write_unlock_bh(hinfo->lock);
+ +			gen_kill_estimator(&p->tcfc_bstats,
+ +					   &p->tcfc_rate_est);
+ +			/*
+ +			 * gen_estimator est_timer() might access p->tcfc_lock
+ +			 * or bstats, wait a RCU grace period before freeing p
+ +			 */
+ +			kfree_rcu(p, tcfc_rcu);
+ +			return;
+ +		}
+ +	}
+ +	WARN_ON(1);
+++=======
++ 	spin_lock_bh(&hinfo->lock);
++ 	hlist_del(&p->tcfc_head);
++ 	spin_unlock_bh(&hinfo->lock);
++ 	gen_kill_estimator(&p->tcfc_bstats,
++ 			   &p->tcfc_rate_est);
++ 	/*
++ 	 * gen_estimator est_timer() might access p->tcfc_lock
++ 	 * or bstats, wait a RCU grace period before freeing p
++ 	 */
++ 	call_rcu(&p->tcfc_rcu, free_tcf);
+++>>>>>>> 519c818e8fb6 (net: sched: add percpu stats to actions)
+  }
+  EXPORT_SYMBOL(tcf_hash_destroy);
+  
+@@@ -221,28 -233,55 +247,67 @@@ struct tcf_common *tcf_hash_check(u32 i
+  }
+  EXPORT_SYMBOL(tcf_hash_check);
+  
+ -void tcf_hash_cleanup(struct tc_action *a, struct nlattr *est)
+ +struct tcf_common *tcf_hash_create(u32 index, struct nlattr *est,
+ +				   struct tc_action *a, int size, int bind,
+ +				   u32 *idx_gen, struct tcf_hashinfo *hinfo)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct tcf_common *pc = a->priv;
++ 	if (est)
++ 		gen_kill_estimator(&pc->tcfc_bstats,
++ 				   &pc->tcfc_rate_est);
++ 	call_rcu(&pc->tcfc_rcu, free_tcf);
++ }
++ EXPORT_SYMBOL(tcf_hash_cleanup);
++ 
++ int tcf_hash_create(u32 index, struct nlattr *est, struct tc_action *a,
++ 		    int size, int bind, bool cpustats)
++ {
++ 	struct tcf_hashinfo *hinfo = a->ops->hinfo;
+++>>>>>>> 519c818e8fb6 (net: sched: add percpu stats to actions)
+  	struct tcf_common *p = kzalloc(size, GFP_KERNEL);
++ 	int err = -ENOMEM;
+  
+  	if (unlikely(!p))
+ -		return -ENOMEM;
+ +		return ERR_PTR(-ENOMEM);
+  	p->tcfc_refcnt = 1;
+  	if (bind)
+  		p->tcfc_bindcnt = 1;
+  
++ 	if (cpustats) {
++ 		p->cpu_bstats = netdev_alloc_pcpu_stats(struct gnet_stats_basic_cpu);
++ 		if (!p->cpu_bstats) {
++ err1:
++ 			kfree(p);
++ 			return err;
++ 		}
++ 		p->cpu_qstats = alloc_percpu(struct gnet_stats_queue);
++ 		if (!p->cpu_qstats) {
++ err2:
++ 			free_percpu(p->cpu_bstats);
++ 			goto err1;
++ 		}
++ 	}
+  	spin_lock_init(&p->tcfc_lock);
+ -	INIT_HLIST_NODE(&p->tcfc_head);
+ -	p->tcfc_index = index ? index : tcf_hash_new_index(hinfo);
+ +	p->tcfc_index = index ? index : tcf_hash_new_index(idx_gen, hinfo);
+  	p->tcfc_tm.install = jiffies;
+  	p->tcfc_tm.lastuse = jiffies;
+  	if (est) {
+++<<<<<<< HEAD
+ +		int err = gen_new_estimator(&p->tcfc_bstats, &p->tcfc_rate_est,
+ +					    &p->tcfc_lock, est);
+ +		if (err) {
+ +			kfree(p);
+ +			return ERR_PTR(err);
+++=======
++ 		err = gen_new_estimator(&p->tcfc_bstats, p->cpu_bstats,
++ 					&p->tcfc_rate_est,
++ 					&p->tcfc_lock, est);
++ 		if (err) {
++ 			free_percpu(p->cpu_qstats);
++ 			goto err2;
+++>>>>>>> 519c818e8fb6 (net: sched: add percpu stats to actions)
+  		}
+  	}
+  
+@@@ -580,10 -639,12 +645,19 @@@ int tcf_action_copy_stats(struct sk_buf
+  	if (err < 0)
+  		goto errout;
+  
+++<<<<<<< HEAD
+ +	if (gnet_stats_copy_basic(&d, &p->tcfc_bstats) < 0 ||
+ +	    gnet_stats_copy_rate_est(&d, &p->tcfc_bstats,
+ +				     &p->tcfc_rate_est) < 0 ||
+ +	    gnet_stats_copy_queue(&d, &p->tcfc_qstats) < 0)
+++=======
++ 	if (gnet_stats_copy_basic(&d, p->cpu_bstats, &p->tcfc_bstats) < 0 ||
++ 	    gnet_stats_copy_rate_est(&d, &p->tcfc_bstats,
++ 				     &p->tcfc_rate_est) < 0 ||
++ 	    gnet_stats_copy_queue(&d, p->cpu_qstats,
++ 				  &p->tcfc_qstats,
++ 				  p->tcfc_qstats.qlen) < 0)
+++>>>>>>> 519c818e8fb6 (net: sched: add percpu stats to actions)
+  		goto errout;
+  
+  	if (gnet_stats_finish_copy(&d) < 0)
+diff --cc net/sched/act_csum.c
+index 11fe1a416433,b07c535ba8e7..000000000000
+--- a/net/sched/act_csum.c
++++ b/net/sched/act_csum.c
+@@@ -71,12 -61,11 +71,20 @@@ static int tcf_csum_init(struct net *n
+  		return -EINVAL;
+  	parm = nla_data(tb[TCA_CSUM_PARMS]);
+  
+++<<<<<<< HEAD
+ +	pc = tcf_hash_check(parm->index, a, bind, &csum_hash_info);
+ +	if (!pc) {
+ +		pc = tcf_hash_create(parm->index, est, a, sizeof(*p), bind,
+ +				     &csum_idx_gen, &csum_hash_info);
+ +		if (IS_ERR(pc))
+ +			return PTR_ERR(pc);
+++=======
++ 	if (!tcf_hash_check(parm->index, a, bind)) {
++ 		ret = tcf_hash_create(parm->index, est, a, sizeof(*p),
++ 				      bind, false);
++ 		if (ret)
++ 			return ret;
+++>>>>>>> 519c818e8fb6 (net: sched: add percpu stats to actions)
+  		ret = ACT_P_CREATED;
+  	} else {
+  		if (bind)/* dont override defaults */
+diff --cc net/sched/act_gact.c
+index eb9ba60ebab4,a4f8af29ee30..000000000000
+--- a/net/sched/act_gact.c
++++ b/net/sched/act_gact.c
+@@@ -94,12 -84,11 +94,20 @@@ static int tcf_gact_init(struct net *ne
+  	}
+  #endif
+  
+++<<<<<<< HEAD
+ +	pc = tcf_hash_check(parm->index, a, bind, &gact_hash_info);
+ +	if (!pc) {
+ +		pc = tcf_hash_create(parm->index, est, a, sizeof(*gact),
+ +				     bind, &gact_idx_gen, &gact_hash_info);
+ +		if (IS_ERR(pc))
+ +			return PTR_ERR(pc);
+++=======
++ 	if (!tcf_hash_check(parm->index, a, bind)) {
++ 		ret = tcf_hash_create(parm->index, est, a, sizeof(*gact),
++ 				      bind, false);
++ 		if (ret)
++ 			return ret;
+++>>>>>>> 519c818e8fb6 (net: sched: add percpu stats to actions)
+  		ret = ACT_P_CREATED;
+  	} else {
+  		if (bind)/* dont override defaults */
+diff --cc net/sched/act_ipt.c
+index 90a973aacc76,99c9cc1c7af9..000000000000
+--- a/net/sched/act_ipt.c
++++ b/net/sched/act_ipt.c
+@@@ -134,12 -113,10 +134,19 @@@ static int tcf_ipt_init(struct net *net
+  	if (tb[TCA_IPT_INDEX] != NULL)
+  		index = nla_get_u32(tb[TCA_IPT_INDEX]);
+  
+++<<<<<<< HEAD
+ +	pc = tcf_hash_check(index, a, bind, &ipt_hash_info);
+ +	if (!pc) {
+ +		pc = tcf_hash_create(index, est, a, sizeof(*ipt), bind,
+ +				     &ipt_idx_gen, &ipt_hash_info);
+ +		if (IS_ERR(pc))
+ +			return PTR_ERR(pc);
+++=======
++ 	if (!tcf_hash_check(index, a, bind) ) {
++ 		ret = tcf_hash_create(index, est, a, sizeof(*ipt), bind, false);
++ 		if (ret)
++ 			return ret;
+++>>>>>>> 519c818e8fb6 (net: sched: add percpu stats to actions)
+  		ret = ACT_P_CREATED;
+  	} else {
+  		if (bind)/* dont override defaults */
+diff --cc net/sched/act_mirred.c
+index 4b6188539f6c,002cd6c83dc6..000000000000
+--- a/net/sched/act_mirred.c
++++ b/net/sched/act_mirred.c
+@@@ -109,14 -90,13 +109,21 @@@ static int tcf_mirred_init(struct net *
+  		dev = NULL;
+  	}
+  
+ -	if (!tcf_hash_check(parm->index, a, bind)) {
+ +	pc = tcf_hash_check(parm->index, a, bind, &mirred_hash_info);
+ +	if (!pc) {
+  		if (dev == NULL)
+  			return -EINVAL;
+++<<<<<<< HEAD
+ +		pc = tcf_hash_create(parm->index, est, a, sizeof(*m), bind,
+ +				     &mirred_idx_gen, &mirred_hash_info);
+ +		if (IS_ERR(pc))
+ +			return PTR_ERR(pc);
+++=======
++ 		ret = tcf_hash_create(parm->index, est, a, sizeof(*m),
++ 				      bind, false);
++ 		if (ret)
++ 			return ret;
+++>>>>>>> 519c818e8fb6 (net: sched: add percpu stats to actions)
+  		ret = ACT_P_CREATED;
+  	} else {
+  		if (!ovr) {
+diff --cc net/sched/act_nat.c
+index 76869538d028,5be0b3c1c5b0..000000000000
+--- a/net/sched/act_nat.c
++++ b/net/sched/act_nat.c
+@@@ -64,12 -54,11 +64,20 @@@ static int tcf_nat_init(struct net *net
+  		return -EINVAL;
+  	parm = nla_data(tb[TCA_NAT_PARMS]);
+  
+++<<<<<<< HEAD
+ +	pc = tcf_hash_check(parm->index, a, bind, &nat_hash_info);
+ +	if (!pc) {
+ +		pc = tcf_hash_create(parm->index, est, a, sizeof(*p), bind,
+ +				     &nat_idx_gen, &nat_hash_info);
+ +		if (IS_ERR(pc))
+ +			return PTR_ERR(pc);
+++=======
++ 	if (!tcf_hash_check(parm->index, a, bind)) {
++ 		ret = tcf_hash_create(parm->index, est, a, sizeof(*p),
++ 				      bind, false);
++ 		if (ret)
++ 			return ret;
+++>>>>>>> 519c818e8fb6 (net: sched: add percpu stats to actions)
+  		ret = ACT_P_CREATED;
+  	} else {
+  		if (bind)
+diff --cc net/sched/act_pedit.c
+index 0978c6d2f6cf,ce8676ad892f..000000000000
+--- a/net/sched/act_pedit.c
++++ b/net/sched/act_pedit.c
+@@@ -64,21 -54,17 +64,29 @@@ static int tcf_pedit_init(struct net *n
+  	if (nla_len(tb[TCA_PEDIT_PARMS]) < sizeof(*parm) + ksize)
+  		return -EINVAL;
+  
+ -	if (!tcf_hash_check(parm->index, a, bind)) {
+ +	pc = tcf_hash_check(parm->index, a, bind, &pedit_hash_info);
+ +	if (!pc) {
+  		if (!parm->nkeys)
+  			return -EINVAL;
+++<<<<<<< HEAD
+ +		pc = tcf_hash_create(parm->index, est, a, sizeof(*p), bind,
+ +				     &pedit_idx_gen, &pedit_hash_info);
+ +		if (IS_ERR(pc))
+ +			return PTR_ERR(pc);
+ +		p = to_pedit(pc);
+++=======
++ 		ret = tcf_hash_create(parm->index, est, a, sizeof(*p),
++ 				      bind, false);
++ 		if (ret)
++ 			return ret;
++ 		p = to_pedit(a);
+++>>>>>>> 519c818e8fb6 (net: sched: add percpu stats to actions)
+  		keys = kmalloc(ksize, GFP_KERNEL);
+  		if (keys == NULL) {
+ -			tcf_hash_cleanup(a, est);
+ +			if (est)
+ +				gen_kill_estimator(&pc->tcfc_bstats,
+ +						   &pc->tcfc_rate_est);
+ +			kfree_rcu(pc, tcfc_rcu);
+  			return -ENOMEM;
+  		}
+  		ret = ACT_P_CREATED;
+diff --cc net/sched/act_simple.c
+index f7b45ab85388,d6b708d6afdf..000000000000
+--- a/net/sched/act_simple.c
++++ b/net/sched/act_simple.c
+@@@ -122,20 -102,16 +122,28 @@@ static int tcf_simp_init(struct net *ne
+  	parm = nla_data(tb[TCA_DEF_PARMS]);
+  	defdata = nla_data(tb[TCA_DEF_DATA]);
+  
+++<<<<<<< HEAD
+ +	pc = tcf_hash_check(parm->index, a, bind, &simp_hash_info);
+ +	if (!pc) {
+ +		pc = tcf_hash_create(parm->index, est, a, sizeof(*d), bind,
+ +				     &simp_idx_gen, &simp_hash_info);
+ +		if (IS_ERR(pc))
+ +			return PTR_ERR(pc);
+++=======
++ 	if (!tcf_hash_check(parm->index, a, bind)) {
++ 		ret = tcf_hash_create(parm->index, est, a, sizeof(*d),
++ 				      bind, false);
++ 		if (ret)
++ 			return ret;
+++>>>>>>> 519c818e8fb6 (net: sched: add percpu stats to actions)
+  
+ -		d = to_defact(a);
+ +		d = to_defact(pc);
+  		ret = alloc_defdata(d, defdata);
+  		if (ret < 0) {
+ -			tcf_hash_cleanup(a, est);
+ +			if (est)
+ +				gen_kill_estimator(&pc->tcfc_bstats,
+ +						   &pc->tcfc_rate_est);
+ +			kfree_rcu(pc, tcfc_rcu);
+  			return ret;
+  		}
+  		d->tcf_action = parm->action;
+diff --cc net/sched/act_skbedit.c
+index 8fe9d25c3008,6751b5f8c046..000000000000
+--- a/net/sched/act_skbedit.c
++++ b/net/sched/act_skbedit.c
+@@@ -109,20 -98,19 +109,28 @@@ static int tcf_skbedit_init(struct net 
+  
+  	parm = nla_data(tb[TCA_SKBEDIT_PARMS]);
+  
+++<<<<<<< HEAD
+ +	pc = tcf_hash_check(parm->index, a, bind, &skbedit_hash_info);
+ +	if (!pc) {
+ +		pc = tcf_hash_create(parm->index, est, a, sizeof(*d), bind,
+ +				     &skbedit_idx_gen, &skbedit_hash_info);
+ +		if (IS_ERR(pc))
+ +			return PTR_ERR(pc);
+++=======
++ 	if (!tcf_hash_check(parm->index, a, bind)) {
++ 		ret = tcf_hash_create(parm->index, est, a, sizeof(*d),
++ 				      bind, false);
++ 		if (ret)
++ 			return ret;
+++>>>>>>> 519c818e8fb6 (net: sched: add percpu stats to actions)
+  
+ -		d = to_skbedit(a);
+ +		d = to_skbedit(pc);
+  		ret = ACT_P_CREATED;
+  	} else {
+ -		d = to_skbedit(a);
+ +		d = to_skbedit(pc);
+  		if (bind)
+  			return 0;
+ -		tcf_hash_release(a, bind);
+ +		tcf_hash_release(pc, bind, &skbedit_hash_info);
+  		if (!ovr)
+  			return -EEXIST;
+  	}
+* Unmerged path net/sched/act_bpf.c
+* Unmerged path net/sched/act_connmark.c
+* Unmerged path include/net/act_api.h
+* Unmerged path net/sched/act_api.c
+* Unmerged path net/sched/act_bpf.c
+* Unmerged path net/sched/act_connmark.c
+* Unmerged path net/sched/act_csum.c
+* Unmerged path net/sched/act_gact.c
+* Unmerged path net/sched/act_ipt.c
+* Unmerged path net/sched/act_mirred.c
+* Unmerged path net/sched/act_nat.c
+* Unmerged path net/sched/act_pedit.c
+* Unmerged path net/sched/act_simple.c
+* Unmerged path net/sched/act_skbedit.c
+diff --git a/net/sched/act_vlan.c b/net/sched/act_vlan.c
+index d735ecf0b1a7..796785e0bf96 100644
+--- a/net/sched/act_vlan.c
++++ b/net/sched/act_vlan.c
+@@ -116,7 +116,8 @@ static int tcf_vlan_init(struct net *net, struct nlattr *nla,
+ 	action = parm->v_action;
+ 
+ 	if (!tcf_hash_check(parm->index, a, bind)) {
+-		ret = tcf_hash_create(parm->index, est, a, sizeof(*v), bind);
++		ret = tcf_hash_create(parm->index, est, a, sizeof(*v),
++				      bind, false);
+ 		if (ret)
+ 			return ret;
+ 
