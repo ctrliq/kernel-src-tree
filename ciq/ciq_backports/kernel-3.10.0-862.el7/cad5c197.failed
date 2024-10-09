@@ -1,0 +1,469 @@
+netvsc: keep track of some non-fatal overload conditions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author stephen hemminger <stephen@networkplumber.org>
+commit cad5c197704d82faf33ffdbef414f15db08d9ef9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/cad5c197.failed
+
+Add ethtool statistics for case where send chimmeny buffer is
+exhausted and driver has to fall back to doing scatter/gather
+send. Also, add statistic for case where ring buffer is full and
+receive completions are delayed.
+
+	Signed-off-by: Stephen Hemminger <sthemmin@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit cad5c197704d82faf33ffdbef414f15db08d9ef9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/netvsc.c
+#	drivers/net/hyperv/netvsc_drv.c
+diff --cc drivers/net/hyperv/netvsc.c
+index 52667f48ba1c,0530e7d729e1..000000000000
+--- a/drivers/net/hyperv/netvsc.c
++++ b/drivers/net/hyperv/netvsc.c
+@@@ -981,129 -950,103 +983,164 @@@ send_now
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int netvsc_send_recv_completion(struct vmbus_channel *channel,
+ +				       u64 transaction_id, u32 status)
+ +{
+ +	struct nvsp_message recvcompMessage;
+++=======
++ /* Send pending recv completions */
++ static int send_recv_completions(struct net_device *ndev,
++ 				 struct netvsc_device *nvdev,
++ 				 struct netvsc_channel *nvchan)
++ {
++ 	struct multi_recv_comp *mrc = &nvchan->mrc;
++ 	struct recv_comp_msg {
++ 		struct nvsp_message_header hdr;
++ 		u32 status;
++ 	}  __packed;
++ 	struct recv_comp_msg msg = {
++ 		.hdr.msg_type = NVSP_MSG1_TYPE_SEND_RNDIS_PKT_COMPLETE,
++ 	};
+++>>>>>>> cad5c197704d (netvsc: keep track of some non-fatal overload conditions)
+  	int ret;
+  
+ -	while (mrc->first != mrc->next) {
+ -		const struct recv_comp_data *rcd
+ -			= mrc->slots + mrc->first;
+ +	recvcompMessage.hdr.msg_type =
+ +				NVSP_MSG1_TYPE_SEND_RNDIS_PKT_COMPLETE;
+  
+++<<<<<<< HEAD
+ +	recvcompMessage.msg.v1_msg.send_rndis_pkt_complete.status = status;
+++=======
++ 		msg.status = rcd->status;
++ 		ret = vmbus_sendpacket(nvchan->channel, &msg, sizeof(msg),
++ 				       rcd->tid, VM_PKT_COMP, 0);
++ 		if (unlikely(ret)) {
++ 			struct net_device_context *ndev_ctx = netdev_priv(ndev);
++ 
++ 			++ndev_ctx->eth_stats.rx_comp_busy;
++ 			return ret;
++ 		}
+++>>>>>>> cad5c197704d (netvsc: keep track of some non-fatal overload conditions)
+  
+ -		if (++mrc->first == nvdev->recv_completion_cnt)
+ -			mrc->first = 0;
+ -	}
+ -
+ -	/* receive completion ring has been emptied */
+ -	if (unlikely(nvdev->destroy))
+ -		wake_up(&nvdev->wait_drain);
+ +	/* Send the completion */
+ +	ret = vmbus_sendpacket(channel, &recvcompMessage,
+ +			       sizeof(struct nvsp_message_header) + sizeof(u32),
+ +			       transaction_id, VM_PKT_COMP, 0);
+  
+ -	return 0;
+ +	return ret;
+  }
+  
+ -/* Count how many receive completions are outstanding */
+ -static void recv_comp_slot_avail(const struct netvsc_device *nvdev,
+ -				 const struct multi_recv_comp *mrc,
+ -				 u32 *filled, u32 *avail)
+ +static inline void count_recv_comp_slot(struct netvsc_device *nvdev, u16 q_idx,
+ +					u32 *filled, u32 *avail)
+  {
+ -	u32 count = nvdev->recv_completion_cnt;
+ +	u32 first = nvdev->mrc[q_idx].first;
+ +	u32 next = nvdev->mrc[q_idx].next;
+  
+ -	if (mrc->next >= mrc->first)
+ -		*filled = mrc->next - mrc->first;
+ -	else
+ -		*filled = (count - mrc->first) + mrc->next;
+ +	*filled = (first > next) ? NETVSC_RECVSLOT_MAX - first + next :
+ +		  next - first;
+  
+ -	*avail = count - *filled - 1;
+ +	*avail = NETVSC_RECVSLOT_MAX - *filled - 1;
+  }
+  
+ -/* Add receive complete to ring to send to host. */
+ -static void enq_receive_complete(struct net_device *ndev,
+ -				 struct netvsc_device *nvdev, u16 q_idx,
+ -				 u64 tid, u32 status)
+ +/* Read the first filled slot, no change to index */
+ +static inline struct recv_comp_data *read_recv_comp_slot(struct netvsc_device
+ +							 *nvdev, u16 q_idx)
+  {
+ -	struct netvsc_channel *nvchan = &nvdev->chan_table[q_idx];
+ -	struct multi_recv_comp *mrc = &nvchan->mrc;
+ -	struct recv_comp_data *rcd;
+  	u32 filled, avail;
+  
+ -	recv_comp_slot_avail(nvdev, mrc, &filled, &avail);
+ +	if (!nvdev->mrc[q_idx].buf)
+ +		return NULL;
+  
+++<<<<<<< HEAD
+ +	count_recv_comp_slot(nvdev, q_idx, &filled, &avail);
+ +	if (!filled)
+ +		return NULL;
+++=======
++ 	if (unlikely(filled > NAPI_POLL_WEIGHT)) {
++ 		send_recv_completions(ndev, nvdev, nvchan);
++ 		recv_comp_slot_avail(nvdev, mrc, &filled, &avail);
++ 	}
+++>>>>>>> cad5c197704d (netvsc: keep track of some non-fatal overload conditions)
+  
+ -	if (unlikely(!avail)) {
+ -		netdev_err(ndev, "Recv_comp full buf q:%hd, tid:%llx\n",
+ -			   q_idx, tid);
+ -		return;
+ +	return nvdev->mrc[q_idx].buf + nvdev->mrc[q_idx].first *
+ +	       sizeof(struct recv_comp_data);
+ +}
+ +
+ +/* Put the first filled slot back to available pool */
+ +static inline void put_recv_comp_slot(struct netvsc_device *nvdev, u16 q_idx)
+ +{
+ +	int num_recv;
+ +
+ +	nvdev->mrc[q_idx].first = (nvdev->mrc[q_idx].first + 1) %
+ +				  NETVSC_RECVSLOT_MAX;
+ +
+ +	num_recv = atomic_dec_return(&nvdev->num_outstanding_recvs);
+ +
+ +	if (nvdev->destroy && num_recv == 0)
+ +		wake_up(&nvdev->wait_drain);
+ +}
+ +
+ +/* Check and send pending recv completions */
+ +static void netvsc_chk_recv_comp(struct netvsc_device *nvdev,
+ +				 struct vmbus_channel *channel, u16 q_idx)
+ +{
+ +	struct recv_comp_data *rcd;
+ +	int ret;
+ +
+ +	while (true) {
+ +		rcd = read_recv_comp_slot(nvdev, q_idx);
+ +		if (!rcd)
+ +			break;
+ +
+ +		ret = netvsc_send_recv_completion(channel, rcd->tid,
+ +						  rcd->status);
+ +		if (ret)
+ +			break;
+ +
+ +		put_recv_comp_slot(nvdev, q_idx);
+  	}
+ +}
+  
+ -	rcd = mrc->slots + mrc->next;
+ -	rcd->tid = tid;
+ -	rcd->status = status;
+ +#define NETVSC_RCD_WATERMARK 80
+ +
+ +/* Get next available slot */
+ +static inline struct recv_comp_data *get_recv_comp_slot(
+ +	struct netvsc_device *nvdev, struct vmbus_channel *channel, u16 q_idx)
+ +{
+ +	u32 filled, avail, next;
+ +	struct recv_comp_data *rcd;
+ +
+ +	if (!nvdev->recv_section)
+ +		return NULL;
+ +
+ +	if (!nvdev->mrc[q_idx].buf)
+ +		return NULL;
+ +
+ +	if (atomic_read(&nvdev->num_outstanding_recvs) >
+ +	    nvdev->recv_section->num_sub_allocs * NETVSC_RCD_WATERMARK / 100)
+ +		netvsc_chk_recv_comp(nvdev, channel, q_idx);
+  
+ -	if (++mrc->next == nvdev->recv_completion_cnt)
+ -		mrc->next = 0;
+ +	count_recv_comp_slot(nvdev, q_idx, &filled, &avail);
+ +	if (!avail)
+ +		return NULL;
+ +
+ +	next = nvdev->mrc[q_idx].next;
+ +	rcd = nvdev->mrc[q_idx].buf + next * sizeof(struct recv_comp_data);
+ +	nvdev->mrc[q_idx].next = (next + 1) % NETVSC_RECVSLOT_MAX;
+ +
+ +	atomic_inc(&nvdev->num_outstanding_recvs);
+ +
+ +	return rcd;
+  }
+  
+ -static int netvsc_receive(struct net_device *ndev,
+ -			  struct netvsc_device *net_device,
+ -			  struct net_device_context *net_device_ctx,
+ -			  struct hv_device *device,
+ -			  struct vmbus_channel *channel,
+ -			  const struct vmpacket_descriptor *desc,
+ -			  struct nvsp_message *nvsp)
+ +static void netvsc_receive(struct net_device *ndev,
+ +		   struct netvsc_device *net_device,
+ +		   struct net_device_context *net_device_ctx,
+ +		   struct hv_device *device,
+ +		   struct vmbus_channel *channel,
+ +		   struct vmtransfer_page_packet_header *vmxferpage_packet,
+ +		   struct nvsp_message *nvsp)
+  {
+ -	const struct vmtransfer_page_packet_header *vmxferpage_packet
+ -		= container_of(desc, const struct vmtransfer_page_packet_header, d);
+ -	u16 q_idx = channel->offermsg.offer.sub_channel_index;
+  	char *recv_buf = net_device->recv_buf;
+  	u32 status = NVSP_STAT_SUCCESS;
+  	int i;
+@@@ -1240,101 -1157,80 +1277,156 @@@ static void netvsc_process_raw_pkt(stru
+  
+  	default:
+  		netdev_err(ndev, "unhandled packet type %d, tid %llx\n",
+ -			   desc->type, desc->trans_id);
+ +			   desc->type, request_id);
+  		break;
+  	}
+ -
+ -	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct hv_device *netvsc_channel_to_device(struct vmbus_channel *channel)
++ {
++ 	struct vmbus_channel *primary = channel->primary_channel;
++ 
++ 	return primary ? primary->device_obj : channel->device_obj;
++ }
++ 
++ /* Network processing softirq
++  * Process data in incoming ring buffer from host
++  * Stops when ring is empty or budget is met or exceeded.
++  */
++ int netvsc_poll(struct napi_struct *napi, int budget)
++ {
++ 	struct netvsc_channel *nvchan
++ 		= container_of(napi, struct netvsc_channel, napi);
++ 	struct netvsc_device *net_device = nvchan->net_device;
++ 	struct vmbus_channel *channel = nvchan->channel;
++ 	struct hv_device *device = netvsc_channel_to_device(channel);
++ 	struct net_device *ndev = hv_get_drvdata(device);
++ 	int work_done = 0;
++ 
++ 	/* If starting a new interval */
++ 	if (!nvchan->desc)
++ 		nvchan->desc = hv_pkt_iter_first(channel);
++ 
++ 	while (nvchan->desc && work_done < budget) {
++ 		work_done += netvsc_process_raw_pkt(device, channel, net_device,
++ 						    ndev, nvchan->desc, budget);
++ 		nvchan->desc = hv_pkt_iter_next(channel, nvchan->desc);
++ 	}
++ 
++ 	/* If send of pending receive completions suceeded
++ 	 *   and did not exhaust NAPI budget this time
++ 	 *   and not doing busy poll
++ 	 * then re-enable host interrupts
++ 	 *     and reschedule if ring is not empty.
++ 	 */
++ 	if (send_recv_completions(ndev, net_device, nvchan) == 0 &&
++ 	    work_done < budget &&
++ 	    napi_complete_done(napi, work_done) &&
++ 	    hv_end_read(&channel->inbound)) {
++ 		hv_begin_read(&channel->inbound);
++ 		napi_reschedule(napi);
++ 	}
++ 
++ 	/* Driver may overshoot since multiple packets per descriptor */
++ 	return min(work_done, budget);
++ }
++ 
++ /* Call back when data is available in host ring buffer.
++  * Processing is deferred until network softirq (NAPI)
++  */
+++>>>>>>> cad5c197704d (netvsc: keep track of some non-fatal overload conditions)
+  void netvsc_channel_cb(void *context)
+  {
+ -	struct netvsc_channel *nvchan = context;
+ -	struct vmbus_channel *channel = nvchan->channel;
+ -	struct hv_ring_buffer_info *rbi = &channel->inbound;
+ +	int ret;
+ +	struct vmbus_channel *channel = (struct vmbus_channel *)context;
+ +	u16 q_idx = channel->offermsg.offer.sub_channel_index;
+ +	struct hv_device *device;
+ +	struct netvsc_device *net_device;
+ +	u32 bytes_recvd;
+ +	u64 request_id;
+ +	struct vmpacket_descriptor *desc;
+ +	unsigned char *buffer;
+ +	int bufferlen = NETVSC_PACKET_SIZE;
+ +	struct net_device *ndev;
+ +	bool need_to_commit = false;
+ +
+ +	if (channel->primary_channel != NULL)
+ +		device = channel->primary_channel->device_obj;
+ +	else
+ +		device = channel->device_obj;
+ +
+ +	net_device = get_inbound_net_device(device);
+ +	if (!net_device)
+ +		return;
+ +	ndev = hv_get_drvdata(device);
+ +	buffer = get_per_channel_state(channel);
+ +
+ +	/* commit_rd_index() -> hv_signal_on_read() needs this. */
+ +	init_cached_read_index(channel);
+ +
+ +	do {
+ +		desc = get_next_pkt_raw(channel);
+ +		if (desc != NULL) {
+ +			netvsc_process_raw_pkt(device,
+ +					       channel,
+ +					       net_device,
+ +					       ndev,
+ +					       desc->trans_id,
+ +					       desc);
+ +
+ +			put_pkt_raw(channel, desc);
+ +			need_to_commit = true;
+ +			continue;
+ +		}
+ +		if (need_to_commit) {
+ +			need_to_commit = false;
+ +			commit_rd_index(channel);
+ +		}
+ +
+ +		ret = vmbus_recvpacket_raw(channel, buffer, bufferlen,
+ +					   &bytes_recvd, &request_id);
+ +		if (ret == 0) {
+ +			if (bytes_recvd > 0) {
+ +				desc = (struct vmpacket_descriptor *)buffer;
+ +				netvsc_process_raw_pkt(device,
+ +						       channel,
+ +						       net_device,
+ +						       ndev,
+ +						       request_id,
+ +						       desc);
+ +			} else {
+ +				/*
+ +				 * We are done for this pass.
+ +				 */
+ +				break;
+ +			}
+ +
+ +		} else if (ret == -ENOBUFS) {
+ +			if (bufferlen > NETVSC_PACKET_SIZE)
+ +				kfree(buffer);
+ +			/* Handle large packet */
+ +			buffer = kmalloc(bytes_recvd, GFP_ATOMIC);
+ +			if (buffer == NULL) {
+ +				/* Try again next time around */
+ +				netdev_err(ndev,
+ +					   "unable to allocate buffer of size "
+ +					   "(%d)!!\n", bytes_recvd);
+ +				break;
+ +			}
+ +
+ +			bufferlen = bytes_recvd;
+ +		}
+  
+ -	/* preload first vmpacket descriptor */
+ -	prefetch(hv_get_ring_buffer(rbi) + rbi->priv_read_index);
+ +		init_cached_read_index(channel);
+  
+ -	if (napi_schedule_prep(&nvchan->napi)) {
+ -		/* disable interupts from host */
+ -		hv_begin_read(rbi);
+ +	} while (1);
+  
+ -		__napi_schedule(&nvchan->napi);
+ -	}
+ +	if (bufferlen > NETVSC_PACKET_SIZE)
+ +		kfree(buffer);
+ +
+ +	netvsc_chk_recv_comp(net_device, channel, q_idx);
+  }
+  
+  /*
+diff --cc drivers/net/hyperv/netvsc_drv.c
+index b16b610847ea,b33f0507c373..000000000000
+--- a/drivers/net/hyperv/netvsc_drv.c
++++ b/drivers/net/hyperv/netvsc_drv.c
+@@@ -1010,13 -1112,35 +1010,24 @@@ static const struct 
+  	{ "tx_no_space",  offsetof(struct netvsc_ethtool_stats, tx_no_space) },
+  	{ "tx_too_big",	  offsetof(struct netvsc_ethtool_stats, tx_too_big) },
+  	{ "tx_busy",	  offsetof(struct netvsc_ethtool_stats, tx_busy) },
+++<<<<<<< HEAD
+++=======
++ 	{ "tx_send_full", offsetof(struct netvsc_ethtool_stats, tx_send_full) },
++ 	{ "rx_comp_busy", offsetof(struct netvsc_ethtool_stats, rx_comp_busy) },
++ }, vf_stats[] = {
++ 	{ "vf_rx_packets", offsetof(struct netvsc_vf_pcpu_stats, rx_packets) },
++ 	{ "vf_rx_bytes",   offsetof(struct netvsc_vf_pcpu_stats, rx_bytes) },
++ 	{ "vf_tx_packets", offsetof(struct netvsc_vf_pcpu_stats, tx_packets) },
++ 	{ "vf_tx_bytes",   offsetof(struct netvsc_vf_pcpu_stats, tx_bytes) },
++ 	{ "vf_tx_dropped", offsetof(struct netvsc_vf_pcpu_stats, tx_dropped) },
+++>>>>>>> cad5c197704d (netvsc: keep track of some non-fatal overload conditions)
+  };
+  
+ -#define NETVSC_GLOBAL_STATS_LEN	ARRAY_SIZE(netvsc_stats)
+ -#define NETVSC_VF_STATS_LEN	ARRAY_SIZE(vf_stats)
+ -
+ -/* 4 statistics per queue (rx/tx packets/bytes) */
+ -#define NETVSC_QUEUE_STATS_LEN(dev) ((dev)->num_chn * 4)
+ -
+  static int netvsc_get_sset_count(struct net_device *dev, int string_set)
+  {
+ -	struct net_device_context *ndc = netdev_priv(dev);
+ -	struct netvsc_device *nvdev = rtnl_dereference(ndc->nvdev);
+ -
+ -	if (!nvdev)
+ -		return -ENODEV;
+ -
+  	switch (string_set) {
+  	case ETH_SS_STATS:
+ -		return NETVSC_GLOBAL_STATS_LEN
+ -			+ NETVSC_VF_STATS_LEN
+ -			+ NETVSC_QUEUE_STATS_LEN(nvdev);
+ +		return ARRAY_SIZE(netvsc_stats);
+  	default:
+  		return -EINVAL;
+  	}
+diff --git a/drivers/net/hyperv/hyperv_net.h b/drivers/net/hyperv/hyperv_net.h
+index a32d7f1b2505..d9116541b5bb 100644
+--- a/drivers/net/hyperv/hyperv_net.h
++++ b/drivers/net/hyperv/hyperv_net.h
+@@ -670,6 +670,8 @@ struct netvsc_ethtool_stats {
+ 	unsigned long tx_no_space;
+ 	unsigned long tx_too_big;
+ 	unsigned long tx_busy;
++	unsigned long tx_send_full;
++	unsigned long rx_comp_busy;
+ };
+ 
+ struct netvsc_reconfig {
+* Unmerged path drivers/net/hyperv/netvsc.c
+* Unmerged path drivers/net/hyperv/netvsc_drv.c
