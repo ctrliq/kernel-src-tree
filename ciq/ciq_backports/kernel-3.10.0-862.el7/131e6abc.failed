@@ -1,0 +1,674 @@
+target: Add TFO->abort_task for aborted task resources release
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [target] Add TFO->abort_task for aborted task resources release (Himanshu Madhani) [1327621]
+Rebuild_FUZZ: 93.10%
+commit-author Nicholas Bellinger <nab@linux-iscsi.org>
+commit 131e6abc674edb9f9a59090bb35bf6650569b7e7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/131e6abc.failed
+
+Now that TASK_ABORTED status is not generated for all cases by
+TMR ABORT_TASK + LUN_RESET, a new TFO->abort_task() caller is
+necessary in order to give fabric drivers a chance to unmap
+hardware / software resources before the se_cmd descriptor is
+released via the normal TFO->release_cmd() codepath.
+
+This patch adds TFO->aborted_task() in core_tmr_abort_task()
+in place of the original transport_send_task_abort(), and
+also updates all fabric drivers to implement this caller.
+
+The fabric drivers that include changes to perform cleanup
+via ->aborted_task() are:
+
+  - iscsi-target
+  - iser-target
+  - srpt
+  - tcm_qla2xxx
+
+The fabric drivers that currently set ->aborted_task() to
+NOPs are:
+
+  - loopback
+  - tcm_fc
+  - usb-gadget
+  - sbp-target
+  - vhost-scsi
+
+For the latter five, there appears to be no additional cleanup
+required before invoking TFO->release_cmd() to release the
+se_cmd descriptor.
+
+v2 changes:
+  - Move ->aborted_task() call into transport_cmd_finish_abort (Alex)
+
+	Cc: Alex Leung <amleung21@yahoo.com>
+	Cc: Mark Rustad <mark.d.rustad@intel.com>
+	Cc: Roland Dreier <roland@kernel.org>
+	Cc: Vu Pham <vu@mellanox.com>
+	Cc: Chris Boot <bootc@bootc.net>
+	Cc: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+	Cc: Michael S. Tsirkin <mst@redhat.com>
+	Cc: Giridhar Malavali <giridhar.malavali@qlogic.com>
+	Cc: Saurav Kashyap <saurav.kashyap@qlogic.com>
+	Cc: Quinn Tran <quinn.tran@qlogic.com>
+	Cc: Sagi Grimberg <sagig@mellanox.com>
+	Cc: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 131e6abc674edb9f9a59090bb35bf6650569b7e7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/isert/ib_isert.c
+#	drivers/infiniband/ulp/srpt/ib_srpt.c
+#	drivers/target/iscsi/iscsi_target.c
+#	include/target/iscsi/iscsi_transport.h
+diff --cc drivers/infiniband/ulp/isert/ib_isert.c
+index 98429c0702e6,18ada7fb0fc9..000000000000
+--- a/drivers/infiniband/ulp/isert/ib_isert.c
++++ b/drivers/infiniband/ulp/isert/ib_isert.c
+@@@ -1889,39 -1984,200 +1889,49 @@@ isert_put_response(struct iscsi_conn *c
+  }
+  
+  static void
+ -isert_cq_rx_comp_err(struct isert_conn *isert_conn)
+ +isert_aborted_task(struct iscsi_conn *conn, struct iscsi_cmd *cmd)
+  {
+ -	struct ib_device *ib_dev = isert_conn->conn_cm_id->device;
+ -	struct iscsi_conn *conn = isert_conn->conn;
+ -
+ -	if (isert_conn->post_recv_buf_count)
+ -		return;
+ +	struct isert_cmd *isert_cmd = iscsit_priv_cmd(cmd);
+++<<<<<<< HEAD
+ +	struct isert_conn *isert_conn = conn->context;
+++=======
+++	struct isert_conn *isert_conn = (struct isert_conn *)conn->context;
+++	struct isert_device *device = isert_conn->conn_device;
+++>>>>>>> 131e6abc674e (target: Add TFO->abort_task for aborted task resources release)
+  
+ -	isert_cq_drain_comp_llist(isert_conn, ib_dev);
+ -
+ -	if (conn->sess) {
+ -		target_sess_cmd_list_set_waiting(conn->sess->se_sess);
+ -		target_wait_for_sess_cmds(conn->sess->se_sess);
+ -	}
+ -
+ -	while (atomic_read(&isert_conn->post_send_buf_count))
+ -		msleep(3000);
+ -
+ -	mutex_lock(&isert_conn->conn_mutex);
+ -	isert_conn->state = ISER_CONN_DOWN;
+ -	mutex_unlock(&isert_conn->conn_mutex);
+ -
+ -	complete(&isert_conn->conn_wait_comp_err);
+ -}
+ -
+ -static void
+ -isert_cq_tx_work(struct work_struct *work)
+ -{
+ -	struct isert_cq_desc *cq_desc = container_of(work,
+ -				struct isert_cq_desc, cq_tx_work);
+ -	struct isert_device *device = cq_desc->device;
+ -	int cq_index = cq_desc->cq_index;
+ -	struct ib_cq *tx_cq = device->dev_tx_cq[cq_index];
+ -	struct isert_conn *isert_conn;
+ -	struct iser_tx_desc *tx_desc;
+ -	struct ib_wc wc;
+ -
+ -	while (ib_poll_cq(tx_cq, 1, &wc) == 1) {
+ -		tx_desc = (struct iser_tx_desc *)(unsigned long)wc.wr_id;
+ -		isert_conn = wc.qp->qp_context;
+ -
+ -		if (wc.status == IB_WC_SUCCESS) {
+ -			isert_send_completion(tx_desc, isert_conn);
+ -		} else {
+ -			pr_debug("TX wc.status != IB_WC_SUCCESS >>>>>>>>>>>>>>\n");
+ -			pr_debug("TX wc.status: 0x%08x\n", wc.status);
+ -			pr_debug("TX wc.vendor_err: 0x%08x\n", wc.vendor_err);
+ -
+ -			if (wc.wr_id != ISER_FASTREG_LI_WRID) {
+ -				if (tx_desc->llnode_active)
+ -					continue;
+ -
+ -				atomic_dec(&isert_conn->post_send_buf_count);
+ -				isert_cq_tx_comp_err(tx_desc, isert_conn);
+ -			}
+ -		}
+ -	}
+ +	spin_lock_bh(&conn->cmd_lock);
+ +	if (!list_empty(&cmd->i_conn_node))
+ +		list_del_init(&cmd->i_conn_node);
+ +	spin_unlock_bh(&conn->cmd_lock);
+  
+ -	ib_req_notify_cq(tx_cq, IB_CQ_NEXT_COMP);
+ +	if (cmd->data_direction == DMA_TO_DEVICE)
+ +		iscsit_stop_dataout_timer(cmd);
+++<<<<<<< HEAD
+ +	isert_rdma_rw_ctx_destroy(isert_cmd, isert_conn);
+  }
+  
+ -static void
+ -isert_cq_tx_callback(struct ib_cq *cq, void *context)
+ +static enum target_prot_op
+ +isert_get_sup_prot_ops(struct iscsi_conn *conn)
+  {
+ -	struct isert_cq_desc *cq_desc = (struct isert_cq_desc *)context;
+ -
+ -	queue_work(isert_comp_wq, &cq_desc->cq_tx_work);
+ -}
+ +	struct isert_conn *isert_conn = conn->context;
+ +	struct isert_device *device = isert_conn->device;
+  
+ -static void
+ -isert_cq_rx_work(struct work_struct *work)
+ -{
+ -	struct isert_cq_desc *cq_desc = container_of(work,
+ -			struct isert_cq_desc, cq_rx_work);
+ -	struct isert_device *device = cq_desc->device;
+ -	int cq_index = cq_desc->cq_index;
+ -	struct ib_cq *rx_cq = device->dev_rx_cq[cq_index];
+ -	struct isert_conn *isert_conn;
+ -	struct iser_rx_desc *rx_desc;
+ -	struct ib_wc wc;
+ -	unsigned long xfer_len;
+ -
+ -	while (ib_poll_cq(rx_cq, 1, &wc) == 1) {
+ -		rx_desc = (struct iser_rx_desc *)(unsigned long)wc.wr_id;
+ -		isert_conn = wc.qp->qp_context;
+ -
+ -		if (wc.status == IB_WC_SUCCESS) {
+ -			xfer_len = (unsigned long)wc.byte_len;
+ -			isert_rx_completion(rx_desc, isert_conn, xfer_len);
+ -		} else {
+ -			pr_debug("RX wc.status != IB_WC_SUCCESS >>>>>>>>>>>>>>\n");
+ -			if (wc.status != IB_WC_WR_FLUSH_ERR) {
+ -				pr_debug("RX wc.status: 0x%08x\n", wc.status);
+ -				pr_debug("RX wc.vendor_err: 0x%08x\n",
+ -					 wc.vendor_err);
+ -			}
+ -			isert_conn->post_recv_buf_count--;
+ -			isert_cq_rx_comp_err(isert_conn);
+ +	if (conn->tpg->tpg_attrib.t10_pi) {
+ +		if (device->pi_capable) {
+ +			isert_info("conn %p PI offload enabled\n", isert_conn);
+ +			isert_conn->pi_support = true;
+ +			return TARGET_PROT_ALL;
+  		}
+  	}
+  
+ -	ib_req_notify_cq(rx_cq, IB_CQ_NEXT_COMP);
+ -}
+ -
+ -static void
+ -isert_cq_rx_callback(struct ib_cq *cq, void *context)
+ -{
+ -	struct isert_cq_desc *cq_desc = (struct isert_cq_desc *)context;
+ -
+ -	queue_work(isert_rx_wq, &cq_desc->cq_rx_work);
+ -}
+ -
+ -static int
+ -isert_post_response(struct isert_conn *isert_conn, struct isert_cmd *isert_cmd)
+ -{
+ -	struct ib_send_wr *wr_failed;
+ -	int ret;
+ -
+ -	atomic_inc(&isert_conn->post_send_buf_count);
+ -
+ -	ret = ib_post_send(isert_conn->conn_qp, &isert_cmd->tx_desc.send_wr,
+ -			   &wr_failed);
+ -	if (ret) {
+ -		pr_err("ib_post_send failed with %d\n", ret);
+ -		atomic_dec(&isert_conn->post_send_buf_count);
+ -		return ret;
+ -	}
+ -	return ret;
+ -}
+ -
+ -static int
+ -isert_put_response(struct iscsi_conn *conn, struct iscsi_cmd *cmd)
+ -{
+ -	struct isert_cmd *isert_cmd = iscsit_priv_cmd(cmd);
+ -	struct isert_conn *isert_conn = (struct isert_conn *)conn->context;
+ -	struct ib_send_wr *send_wr = &isert_cmd->tx_desc.send_wr;
+ -	struct iscsi_scsi_rsp *hdr = (struct iscsi_scsi_rsp *)
+ -				&isert_cmd->tx_desc.iscsi_header;
+ -
+ -	isert_create_send_desc(isert_conn, isert_cmd, &isert_cmd->tx_desc);
+ -	iscsit_build_rsp_pdu(cmd, conn, true, hdr);
+ -	isert_init_tx_hdrs(isert_conn, &isert_cmd->tx_desc);
+ -	/*
+ -	 * Attach SENSE DATA payload to iSCSI Response PDU
+ -	 */
+ -	if (cmd->se_cmd.sense_buffer &&
+ -	    ((cmd->se_cmd.se_cmd_flags & SCF_TRANSPORT_TASK_SENSE) ||
+ -	    (cmd->se_cmd.se_cmd_flags & SCF_EMULATED_TASK_SENSE))) {
+ -		struct ib_device *ib_dev = isert_conn->conn_cm_id->device;
+ -		struct ib_sge *tx_dsg = &isert_cmd->tx_desc.tx_sg[1];
+ -		u32 padding, pdu_len;
+ -
+ -		put_unaligned_be16(cmd->se_cmd.scsi_sense_length,
+ -				   cmd->sense_buffer);
+ -		cmd->se_cmd.scsi_sense_length += sizeof(__be16);
+ -
+ -		padding = -(cmd->se_cmd.scsi_sense_length) & 3;
+ -		hton24(hdr->dlength, (u32)cmd->se_cmd.scsi_sense_length);
+ -		pdu_len = cmd->se_cmd.scsi_sense_length + padding;
+ -
+ -		isert_cmd->pdu_buf_dma = ib_dma_map_single(ib_dev,
+ -				(void *)cmd->sense_buffer, pdu_len,
+ -				DMA_TO_DEVICE);
+ -
+ -		isert_cmd->pdu_buf_len = pdu_len;
+ -		tx_dsg->addr	= isert_cmd->pdu_buf_dma;
+ -		tx_dsg->length	= pdu_len;
+ -		tx_dsg->lkey	= isert_conn->conn_mr->lkey;
+ -		isert_cmd->tx_desc.num_sge = 2;
+ -	}
+ -
+ -	isert_init_send_wr(isert_conn, isert_cmd, send_wr, true);
+ -
+ -	pr_debug("Posting SCSI Response IB_WR_SEND >>>>>>>>>>>>>>>>>>>>>>\n");
+ -
+ -	return isert_post_response(isert_conn, isert_cmd);
+ -}
+ -
+ -static void
+ -isert_aborted_task(struct iscsi_conn *conn, struct iscsi_cmd *cmd)
+ -{
+ -	struct isert_cmd *isert_cmd = iscsit_priv_cmd(cmd);
+ -	struct isert_conn *isert_conn = (struct isert_conn *)conn->context;
+ -	struct isert_device *device = isert_conn->conn_device;
+ -
+ -	spin_lock_bh(&conn->cmd_lock);
+ -	if (!list_empty(&cmd->i_conn_node))
+ -		list_del_init(&cmd->i_conn_node);
+ -	spin_unlock_bh(&conn->cmd_lock);
+ +	isert_info("conn %p PI offload disabled\n", isert_conn);
+ +	isert_conn->pi_support = false;
+  
+ -	if (cmd->data_direction == DMA_TO_DEVICE)
+ -		iscsit_stop_dataout_timer(cmd);
+ +	return TARGET_PROT_NORMAL;
+++=======
++ 
++ 	device->unreg_rdma_mem(isert_cmd, isert_conn);
+++>>>>>>> 131e6abc674e (target: Add TFO->abort_task for aborted task resources release)
+  }
+  
+  static int
+@@@ -2667,8 -3236,6 +2677,11 @@@ static struct iscsit_transport iser_tar
+  	.iscsit_queue_data_in	= isert_put_datain,
+  	.iscsit_queue_status	= isert_put_response,
+  	.iscsit_aborted_task	= isert_aborted_task,
+++<<<<<<< HEAD
+ +	.iscsit_get_rx_pdu	= isert_get_rx_pdu,
+ +	.iscsit_get_sup_prot_ops = isert_get_sup_prot_ops,
+++=======
+++>>>>>>> 131e6abc674e (target: Add TFO->abort_task for aborted task resources release)
+  };
+  
+  static int __init isert_init(void)
+diff --cc drivers/infiniband/ulp/srpt/ib_srpt.c
+index 72146d165e84,f03aafdc3572..000000000000
+--- a/drivers/infiniband/ulp/srpt/ib_srpt.c
++++ b/drivers/infiniband/ulp/srpt/ib_srpt.c
+@@@ -2412,6 -3083,10 +2412,13 @@@ static void srpt_queue_tm_rsp(struct se
+  
+  static void srpt_aborted_task(struct se_cmd *cmd)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct srpt_send_ioctx *ioctx = container_of(cmd,
++ 				struct srpt_send_ioctx, cmd);
++ 
++ 	srpt_unmap_sg_to_ib_sge(ioctx->ch, ioctx);
+++>>>>>>> 131e6abc674e (target: Add TFO->abort_task for aborted task resources release)
+  }
+  
+  static int srpt_queue_status(struct se_cmd *cmd)
+diff --cc drivers/target/iscsi/iscsi_target.c
+index 35209f0a469a,27f37c92dff3..000000000000
+--- a/drivers/target/iscsi/iscsi_target.c
++++ b/drivers/target/iscsi/iscsi_target.c
+@@@ -480,192 -490,25 +480,205 @@@ int iscsit_del_np(struct iscsi_np *np
+  	return 0;
+  }
+  
+ -static int iscsit_immediate_queue(struct iscsi_conn *, struct iscsi_cmd *, int);
+ -static int iscsit_response_queue(struct iscsi_conn *, struct iscsi_cmd *, int);
+ +static void iscsit_get_rx_pdu(struct iscsi_conn *);
+ +
+ +int iscsit_queue_rsp(struct iscsi_conn *conn, struct iscsi_cmd *cmd)
+ +{
+ +	return iscsit_add_cmd_to_response_queue(cmd, cmd->conn, cmd->i_state);
+ +}
+ +EXPORT_SYMBOL(iscsit_queue_rsp);
+ +
+ +void iscsit_aborted_task(struct iscsi_conn *conn, struct iscsi_cmd *cmd)
+ +{
+ +	bool scsi_cmd = (cmd->iscsi_opcode == ISCSI_OP_SCSI_CMD);
+ +
+ +	spin_lock_bh(&conn->cmd_lock);
+ +	if (!list_empty(&cmd->i_conn_node))
+ +		list_del_init(&cmd->i_conn_node);
+ +	spin_unlock_bh(&conn->cmd_lock);
+ +
+ +	__iscsit_free_cmd(cmd, scsi_cmd, true);
+ +}
+ +EXPORT_SYMBOL(iscsit_aborted_task);
+ +
+ +static void iscsit_do_crypto_hash_buf(struct ahash_request *, const void *,
+ +				      u32, u32, u8 *, u8 *);
+ +static void iscsit_tx_thread_wait_for_tcp(struct iscsi_conn *);
+ +
+ +static int
+ +iscsit_xmit_nondatain_pdu(struct iscsi_conn *conn, struct iscsi_cmd *cmd,
+ +			  const void *data_buf, u32 data_buf_len)
+ +{
+ +	struct iscsi_hdr *hdr = (struct iscsi_hdr *)cmd->pdu;
+ +	struct kvec *iov;
+ +	u32 niov = 0, tx_size = ISCSI_HDR_LEN;
+ +	int ret;
+ +
+ +	iov = &cmd->iov_misc[0];
+ +	iov[niov].iov_base	= cmd->pdu;
+ +	iov[niov++].iov_len	= ISCSI_HDR_LEN;
+ +
+ +	if (conn->conn_ops->HeaderDigest) {
+ +		u32 *header_digest = (u32 *)&cmd->pdu[ISCSI_HDR_LEN];
+ +
+ +		iscsit_do_crypto_hash_buf(conn->conn_tx_hash, hdr,
+ +					  ISCSI_HDR_LEN, 0, NULL,
+ +					  (u8 *)header_digest);
+ +
+ +		iov[0].iov_len += ISCSI_CRC_LEN;
+ +		tx_size += ISCSI_CRC_LEN;
+ +		pr_debug("Attaching CRC32C HeaderDigest"
+ +			 " to opcode 0x%x 0x%08x\n",
+ +			 hdr->opcode, *header_digest);
+ +	}
+ +
+ +	if (data_buf_len) {
+ +		u32 padding = ((-data_buf_len) & 3);
+ +
+ +		iov[niov].iov_base	= (void *)data_buf;
+ +		iov[niov++].iov_len	= data_buf_len;
+ +		tx_size += data_buf_len;
+ +
+ +		if (padding != 0) {
+ +			iov[niov].iov_base = &cmd->pad_bytes;
+ +			iov[niov++].iov_len = padding;
+ +			tx_size += padding;
+ +			pr_debug("Attaching %u additional"
+ +				 " padding bytes.\n", padding);
+ +		}
+ +
+ +		if (conn->conn_ops->DataDigest) {
+ +			iscsit_do_crypto_hash_buf(conn->conn_tx_hash,
+ +						  data_buf, data_buf_len,
+ +						  padding,
+ +						  (u8 *)&cmd->pad_bytes,
+ +						  (u8 *)&cmd->data_crc);
+ +
+ +			iov[niov].iov_base = &cmd->data_crc;
+ +			iov[niov++].iov_len = ISCSI_CRC_LEN;
+ +			tx_size += ISCSI_CRC_LEN;
+ +			pr_debug("Attached DataDigest for %u"
+ +				 " bytes opcode 0x%x, CRC 0x%08x\n",
+ +				 data_buf_len, hdr->opcode, cmd->data_crc);
+ +		}
+ +	}
+ +
+ +	cmd->iov_misc_count = niov;
+ +	cmd->tx_size = tx_size;
+ +
+ +	ret = iscsit_send_tx_data(cmd, conn, 1);
+ +	if (ret < 0) {
+ +		iscsit_tx_thread_wait_for_tcp(conn);
+ +		return ret;
+ +	}
+ +
+ +	return 0;
+ +}
+  
+ -static int iscsit_queue_rsp(struct iscsi_conn *conn, struct iscsi_cmd *cmd)
+++<<<<<<< HEAD
+ +static int iscsit_map_iovec(struct iscsi_cmd *, struct kvec *, u32, u32);
+ +static void iscsit_unmap_iovec(struct iscsi_cmd *);
+ +static u32 iscsit_do_crypto_hash_sg(struct ahash_request *, struct iscsi_cmd *,
+ +				    u32, u32, u32, u8 *);
+ +static int
+ +iscsit_xmit_datain_pdu(struct iscsi_conn *conn, struct iscsi_cmd *cmd,
+ +		       const struct iscsi_datain *datain)
+  {
+ -	iscsit_add_cmd_to_response_queue(cmd, cmd->conn, cmd->i_state);
+ +	struct kvec *iov;
+ +	u32 iov_count = 0, tx_size = 0;
+ +	int ret, iov_ret;
+ +
+ +	iov = &cmd->iov_data[0];
+ +	iov[iov_count].iov_base	= cmd->pdu;
+ +	iov[iov_count++].iov_len = ISCSI_HDR_LEN;
+ +	tx_size += ISCSI_HDR_LEN;
+ +
+ +	if (conn->conn_ops->HeaderDigest) {
+ +		u32 *header_digest = (u32 *)&cmd->pdu[ISCSI_HDR_LEN];
+ +
+ +		iscsit_do_crypto_hash_buf(conn->conn_tx_hash, cmd->pdu,
+ +					  ISCSI_HDR_LEN, 0, NULL,
+ +					  (u8 *)header_digest);
+ +
+ +		iov[0].iov_len += ISCSI_CRC_LEN;
+ +		tx_size += ISCSI_CRC_LEN;
+ +
+ +		pr_debug("Attaching CRC32 HeaderDigest for DataIN PDU 0x%08x\n",
+ +			 *header_digest);
+ +	}
+ +
+ +	iov_ret = iscsit_map_iovec(cmd, &cmd->iov_data[1],
+ +				   datain->offset, datain->length);
+ +	if (iov_ret < 0)
+ +		return -1;
+ +
+ +	iov_count += iov_ret;
+ +	tx_size += datain->length;
+ +
+ +	cmd->padding = ((-datain->length) & 3);
+ +	if (cmd->padding) {
+ +		iov[iov_count].iov_base		= cmd->pad_bytes;
+ +		iov[iov_count++].iov_len	= cmd->padding;
+ +		tx_size += cmd->padding;
+ +
+ +		pr_debug("Attaching %u padding bytes\n", cmd->padding);
+ +	}
+ +
+ +	if (conn->conn_ops->DataDigest) {
+ +		cmd->data_crc = iscsit_do_crypto_hash_sg(conn->conn_tx_hash,
+ +							 cmd, datain->offset,
+ +							 datain->length,
+ +							 cmd->padding,
+ +							 cmd->pad_bytes);
+ +
+ +		iov[iov_count].iov_base	= &cmd->data_crc;
+ +		iov[iov_count++].iov_len = ISCSI_CRC_LEN;
+ +		tx_size += ISCSI_CRC_LEN;
+ +
+ +		pr_debug("Attached CRC32C DataDigest %d bytes, crc 0x%08x\n",
+ +			 datain->length + cmd->padding, cmd->data_crc);
+ +	}
+ +
+ +	cmd->iov_data_count = iov_count;
+ +	cmd->tx_size = tx_size;
+ +
+ +	ret = iscsit_fe_sendpage_sg(cmd, conn);
+ +
+ +	iscsit_unmap_iovec(cmd);
+ +
+ +	if (ret < 0) {
+ +		iscsit_tx_thread_wait_for_tcp(conn);
+ +		return ret;
+ +	}
+ +
+  	return 0;
+  }
+  
+ +static int iscsit_xmit_pdu(struct iscsi_conn *conn, struct iscsi_cmd *cmd,
+ +			   struct iscsi_datain_req *dr, const void *buf,
+ +			   u32 buf_len)
+ +{
+ +	if (dr)
+ +		return iscsit_xmit_datain_pdu(conn, cmd, buf);
+ +	else
+ +		return iscsit_xmit_nondatain_pdu(conn, cmd, buf, buf_len);
+ +}
+ +
+ +static enum target_prot_op iscsit_get_sup_prot_ops(struct iscsi_conn *conn)
+ +{
+ +	return TARGET_PROT_NORMAL;
+++=======
++ static void iscsit_aborted_task(struct iscsi_conn *conn, struct iscsi_cmd *cmd)
++ {
++ 	bool scsi_cmd = (cmd->iscsi_opcode == ISCSI_OP_SCSI_CMD);
++ 
++ 	spin_lock_bh(&conn->cmd_lock);
++ 	if (!list_empty(&cmd->i_conn_node))
++ 		list_del_init(&cmd->i_conn_node);
++ 	spin_unlock_bh(&conn->cmd_lock);
++ 
++ 	__iscsit_free_cmd(cmd, scsi_cmd, true);
+++>>>>>>> 131e6abc674e (target: Add TFO->abort_task for aborted task resources release)
+  }
+  
+  static struct iscsit_transport iscsi_target_transport = {
+@@@ -684,9 -526,6 +697,12 @@@
+  	.iscsit_queue_data_in	= iscsit_queue_rsp,
+  	.iscsit_queue_status	= iscsit_queue_rsp,
+  	.iscsit_aborted_task	= iscsit_aborted_task,
+++<<<<<<< HEAD
+ +	.iscsit_xmit_pdu	= iscsit_xmit_pdu,
+ +	.iscsit_get_rx_pdu	= iscsit_get_rx_pdu,
+ +	.iscsit_get_sup_prot_ops = iscsit_get_sup_prot_ops,
+++=======
+++>>>>>>> 131e6abc674e (target: Add TFO->abort_task for aborted task resources release)
+  };
+  
+  static int __init iscsi_target_init_module(void)
+diff --cc include/target/iscsi/iscsi_transport.h
+index 4917a3ae9949,8d19339292b8..000000000000
+--- a/include/target/iscsi/iscsi_transport.h
++++ b/include/target/iscsi/iscsi_transport.h
+@@@ -23,14 -22,6 +23,17 @@@ struct iscsit_transport 
+  	int (*iscsit_queue_data_in)(struct iscsi_conn *, struct iscsi_cmd *);
+  	int (*iscsit_queue_status)(struct iscsi_conn *, struct iscsi_cmd *);
+  	void (*iscsit_aborted_task)(struct iscsi_conn *, struct iscsi_cmd *);
+++<<<<<<< HEAD
+ +	int (*iscsit_xmit_pdu)(struct iscsi_conn *, struct iscsi_cmd *,
+ +			       struct iscsi_datain_req *, const void *, u32);
+ +	void (*iscsit_release_cmd)(struct iscsi_conn *, struct iscsi_cmd *);
+ +	void (*iscsit_get_rx_pdu)(struct iscsi_conn *);
+ +	int (*iscsit_validate_params)(struct iscsi_conn *);
+ +	void (*iscsit_get_r2t_ttt)(struct iscsi_conn *, struct iscsi_cmd *,
+ +				   struct iscsi_r2t *);
+ +	enum target_prot_op (*iscsit_get_sup_prot_ops)(struct iscsi_conn *);
+++=======
+++>>>>>>> 131e6abc674e (target: Add TFO->abort_task for aborted task resources release)
+  };
+  
+  static inline void *iscsit_priv_cmd(struct iscsi_cmd *cmd)
+* Unmerged path drivers/infiniband/ulp/isert/ib_isert.c
+* Unmerged path drivers/infiniband/ulp/srpt/ib_srpt.c
+diff --git a/drivers/scsi/qla2xxx/tcm_qla2xxx.c b/drivers/scsi/qla2xxx/tcm_qla2xxx.c
+index e9c7bfd1510c..0d7f901eb139 100644
+--- a/drivers/scsi/qla2xxx/tcm_qla2xxx.c
++++ b/drivers/scsi/qla2xxx/tcm_qla2xxx.c
+@@ -753,6 +753,20 @@ static int tcm_qla2xxx_queue_tm_rsp(struct se_cmd *se_cmd)
+ 	return 0;
+ }
+ 
++static void tcm_qla2xxx_aborted_task(struct se_cmd *se_cmd)
++{
++	struct qla_tgt_cmd *cmd = container_of(se_cmd,
++				struct qla_tgt_cmd, se_cmd);
++	struct scsi_qla_host *vha = cmd->vha;
++	struct qla_hw_data *ha = vha->hw;
++
++	if (!cmd->sg_mapped)
++		return;
++
++	pci_unmap_sg(ha->pdev, cmd->sg, cmd->sg_cnt, cmd->dma_data_direction);
++	cmd->sg_mapped = 0;
++}
++
+ /* Local pointer to allocated TCM configfs fabric module */
+ struct target_fabric_configfs *tcm_qla2xxx_fabric_configfs;
+ struct target_fabric_configfs *tcm_qla2xxx_npiv_fabric_configfs;
+@@ -1778,6 +1792,7 @@ static struct target_core_fabric_ops tcm_qla2xxx_ops = {
+ 	.queue_data_in			= tcm_qla2xxx_queue_data_in,
+ 	.queue_status			= tcm_qla2xxx_queue_status,
+ 	.queue_tm_rsp			= tcm_qla2xxx_queue_tm_rsp,
++	.aborted_task			= tcm_qla2xxx_aborted_task,
+ 	/*
+ 	 * Setup function pointers for generic logic in
+ 	 * target_core_fabric_configfs.c
+@@ -1825,6 +1840,7 @@ static struct target_core_fabric_ops tcm_qla2xxx_npiv_ops = {
+ 	.queue_data_in			= tcm_qla2xxx_queue_data_in,
+ 	.queue_status			= tcm_qla2xxx_queue_status,
+ 	.queue_tm_rsp			= tcm_qla2xxx_queue_tm_rsp,
++	.aborted_task			= tcm_qla2xxx_aborted_task,
+ 	/*
+ 	 * Setup function pointers for generic logic in
+ 	 * target_core_fabric_configfs.c
+* Unmerged path drivers/target/iscsi/iscsi_target.c
+diff --git a/drivers/usb/gadget/tcm_usb_gadget.c b/drivers/usb/gadget/tcm_usb_gadget.c
+index 7cacd6ae818e..3556c236718b 100644
+--- a/drivers/usb/gadget/tcm_usb_gadget.c
++++ b/drivers/usb/gadget/tcm_usb_gadget.c
+@@ -1472,6 +1472,11 @@ static int usbg_queue_tm_rsp(struct se_cmd *se_cmd)
+ 	return 0;
+ }
+ 
++static void usbg_aborted_task(struct se_cmd *se_cmd)
++{
++	return;
++}
++
+ static const char *usbg_check_wwn(const char *name)
+ {
+ 	const char *n;
+@@ -1898,6 +1903,7 @@ static struct target_core_fabric_ops usbg_ops = {
+ 	.queue_data_in			= usbg_send_read_response,
+ 	.queue_status			= usbg_send_status_response,
+ 	.queue_tm_rsp			= usbg_queue_tm_rsp,
++	.aborted_task			= usbg_aborted_task,
+ 	.check_stop_free		= usbg_check_stop_free,
+ 
+ 	.fabric_make_wwn		= usbg_make_tport,
+diff --git a/drivers/vhost/scsi.c b/drivers/vhost/scsi.c
+index 65142d377371..3eff1cc8bdbe 100644
+--- a/drivers/vhost/scsi.c
++++ b/drivers/vhost/scsi.c
+@@ -520,6 +520,11 @@ static int tcm_vhost_queue_tm_rsp(struct se_cmd *se_cmd)
+ 	return 0;
+ }
+ 
++static void tcm_vhost_aborted_task(struct se_cmd *se_cmd)
++{
++	return;
++}
++
+ static void tcm_vhost_free_evt(struct vhost_scsi *vs, struct tcm_vhost_evt *evt)
+ {
+ 	vs->vs_events_nr--;
+@@ -2018,6 +2023,7 @@ static struct target_core_fabric_ops tcm_vhost_ops = {
+ 	.queue_data_in			= tcm_vhost_queue_data_in,
+ 	.queue_status			= tcm_vhost_queue_status,
+ 	.queue_tm_rsp			= tcm_vhost_queue_tm_rsp,
++	.aborted_task			= tcm_vhost_aborted_task,
+ 	/*
+ 	 * Setup callers for generic logic in target_core_fabric_configfs.c
+ 	 */
+* Unmerged path include/target/iscsi/iscsi_transport.h
