@@ -202,6 +202,8 @@ int		rpc_clnt_add_xprt(struct rpc_clnt *, struct xprt_create *,
 				struct rpc_xprt *,
 				void *),
 			void *data);
+void		rpc_cap_max_reconnect_timeout(struct rpc_clnt *clnt,
+			unsigned long timeo);
 
 int		rpc_clnt_setup_test_and_add_xprt(struct rpc_clnt *,
 			struct rpc_xprt_switch *,
