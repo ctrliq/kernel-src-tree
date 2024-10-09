@@ -1798,6 +1798,8 @@ static int mlxsw_sp_setup_tc(struct net_device *dev, enum tc_setup_type type,
 		return 0; /* will be removed after conversion from ndo */
 	case TC_SETUP_BLOCK:
 		return mlxsw_sp_setup_tc_block(mlxsw_sp_port, type_data);
+	case TC_SETUP_QDISC_RED:
+		return mlxsw_sp_setup_tc_red(mlxsw_sp_port, type_data);
 	default:
 		return -EOPNOTSUPP;
 	}
