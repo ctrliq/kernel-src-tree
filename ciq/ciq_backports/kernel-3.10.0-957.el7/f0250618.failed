@@ -1,0 +1,333 @@
+md: raid10: don't use bio's vec table to manage resync pages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [md] raid10: don't use bio's vec table to manage resync pages (Nigel Croxon) [1494474]
+Rebuild_FUZZ: 96.55%
+commit-author Ming Lei <tom.leiming@gmail.com>
+commit f0250618361db1447d66c494c6dd2df815f42c87
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/f0250618.failed
+
+Now we allocate one page array for managing resync pages, instead
+of using bio's vec table to do that, and the old way is very hacky
+and won't work any more if multipage bvec is enabled.
+
+The introduced cost is that we need to allocate (128 + 16) * copies
+bytes per r10_bio, and it is fine because the inflight r10_bio for
+resync shouldn't be much, as pointed by Shaohua.
+
+Also bio_reset() in raid10_sync_request() and reshape_request()
+are removed because all bios are freshly new now in these functions
+and not necessary to reset any more.
+
+This patch can be thought as cleanup too.
+
+	Suggested-by: Shaohua Li <shli@kernel.org>
+	Signed-off-by: Ming Lei <tom.leiming@gmail.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit f0250618361db1447d66c494c6dd2df815f42c87)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid10.c
+diff --cc drivers/md/raid10.c
+index e568b64df05f,629ae45bb18e..000000000000
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@@ -103,9 -104,30 +103,33 @@@ static int enough(struct r10conf *conf
+  static sector_t reshape_request(struct mddev *mddev, sector_t sector_nr,
+  				int *skipped);
+  static void reshape_request_write(struct mddev *mddev, struct r10bio *r10_bio);
+ -static void end_reshape_write(struct bio *bio);
+ +static void end_reshape_write(struct bio *bio, int error);
+  static void end_reshape(struct r10conf *conf);
+  
+++<<<<<<< HEAD
+++=======
++ #define raid10_log(md, fmt, args...)				\
++ 	do { if ((md)->queue) blk_add_trace_msg((md)->queue, "raid10 " fmt, ##args); } while (0)
++ 
++ /*
++  * 'strct resync_pages' stores actual pages used for doing the resync
++  *  IO, and it is per-bio, so make .bi_private points to it.
++  */
++ static inline struct resync_pages *get_resync_pages(struct bio *bio)
++ {
++ 	return bio->bi_private;
++ }
++ 
++ /*
++  * for resync bio, r10bio pointer can be retrieved from the per-bio
++  * 'struct resync_pages'.
++  */
++ static inline struct r10bio *get_resync_r10bio(struct bio *bio)
++ {
++ 	return get_resync_pages(bio)->raid_bio;
++ }
++ 
+++>>>>>>> f0250618361d (md: raid10: don't use bio's vec table to manage resync pages)
+  static void * r10bio_pool_alloc(gfp_t gfp_flags, void *data)
+  {
+  	struct r10conf *conf = data;
+@@@ -2014,6 -1950,23 +2055,26 @@@ static void end_sync_read(struct bio *b
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void end_sync_read(struct bio *bio)
++ {
++ 	struct r10bio *r10_bio = get_resync_r10bio(bio);
++ 	struct r10conf *conf = r10_bio->mddev->private;
++ 	int d = find_bio_disk(conf, r10_bio, bio, NULL, NULL);
++ 
++ 	__end_sync_read(r10_bio, bio, d);
++ }
++ 
++ static void end_reshape_read(struct bio *bio)
++ {
++ 	/* reshape read bio isn't allocated from r10buf_pool */
++ 	struct r10bio *r10_bio = bio->bi_private;
++ 
++ 	__end_sync_read(r10_bio, bio, r10_bio->read_slot);
++ }
++ 
+++>>>>>>> f0250618361d (md: raid10: don't use bio's vec table to manage resync pages)
+  static void end_sync_request(struct r10bio *r10_bio)
+  {
+  	struct mddev *mddev = r10_bio->mddev;
+@@@ -2041,10 -1994,9 +2102,14 @@@
+  	}
+  }
+  
+ -static void end_sync_write(struct bio *bio)
+ +static void end_sync_write(struct bio *bio, int error)
+  {
+++<<<<<<< HEAD
+ +	int uptodate = test_bit(BIO_UPTODATE, &bio->bi_flags);
+ +	struct r10bio *r10_bio = bio->bi_private;
+++=======
++ 	struct r10bio *r10_bio = get_resync_r10bio(bio);
+++>>>>>>> f0250618361d (md: raid10: don't use bio's vec table to manage resync pages)
+  	struct mddev *mddev = r10_bio->mddev;
+  	struct r10conf *conf = mddev->private;
+  	int d;
+@@@ -2168,20 -2122,14 +2235,29 @@@ static void sync_request_write(struct m
+  		bio_reset(tbio);
+  
+  		tbio->bi_vcnt = vcnt;
+++<<<<<<< HEAD
+ +		tbio->bi_size = fbio->bi_size;
+ +		tbio->bi_rw = WRITE;
+ +		tbio->bi_private = r10_bio;
+ +		tbio->bi_sector = r10_bio->devs[i].addr;
+++=======
++ 		tbio->bi_iter.bi_size = fbio->bi_iter.bi_size;
++ 		rp->raid_bio = r10_bio;
++ 		tbio->bi_private = rp;
++ 		tbio->bi_iter.bi_sector = r10_bio->devs[i].addr;
++ 		tbio->bi_end_io = end_sync_write;
++ 		bio_set_op_attrs(tbio, REQ_OP_WRITE, 0);
+++>>>>>>> f0250618361d (md: raid10: don't use bio's vec table to manage resync pages)
+ +
+ +		for (j=0; j < vcnt ; j++) {
+ +			tbio->bi_io_vec[j].bv_offset = 0;
+ +			tbio->bi_io_vec[j].bv_len = PAGE_SIZE;
+  
+ -		bio_copy_data(tbio, fbio);
+ +			memcpy(page_address(tbio->bi_io_vec[j].bv_page),
+ +			       page_address(fbio->bi_io_vec[j].bv_page),
+ +			       PAGE_SIZE);
+ +		}
+ +		tbio->bi_end_io = end_sync_write;
+  
+  		atomic_inc(&conf->mirrors[d].rdev->nr_pending);
+  		atomic_inc(&r10_bio->remaining);
+@@@ -3242,16 -3188,15 +3318,14 @@@ static sector_t raid10_sync_request(str
+  					}
+  				}
+  				bio = r10_bio->devs[0].bio;
+- 				bio_reset(bio);
+  				bio->bi_next = biolist;
+  				biolist = bio;
+- 				bio->bi_private = r10_bio;
+  				bio->bi_end_io = end_sync_read;
+ -				bio_set_op_attrs(bio, REQ_OP_READ, 0);
+ +				bio->bi_rw = READ;
+  				if (test_bit(FailFast, &rdev->flags))
+ -					bio->bi_opf |= MD_FAILFAST;
+ +					bio->bi_rw |= MD_FAILFAST;
+  				from_addr = r10_bio->devs[j].addr;
+ -				bio->bi_iter.bi_sector = from_addr +
+ -					rdev->data_offset;
+ +				bio->bi_sector = from_addr + rdev->data_offset;
+  				bio->bi_bdev = rdev->bdev;
+  				atomic_inc(&rdev->nr_pending);
+  				/* and we write to 'i' (if not in_sync) */
+@@@ -3268,13 -3213,11 +3342,11 @@@
+  
+  				if (!test_bit(In_sync, &mrdev->flags)) {
+  					bio = r10_bio->devs[1].bio;
+- 					bio_reset(bio);
+  					bio->bi_next = biolist;
+  					biolist = bio;
+- 					bio->bi_private = r10_bio;
+  					bio->bi_end_io = end_sync_write;
+ -					bio_set_op_attrs(bio, REQ_OP_WRITE, 0);
+ -					bio->bi_iter.bi_sector = to_addr
+ +					bio->bi_rw = WRITE;
+ +					bio->bi_sector = to_addr
+  						+ mrdev->data_offset;
+  					bio->bi_bdev = mrdev->bdev;
+  					atomic_inc(&r10_bio->remaining);
+@@@ -3296,13 -3239,11 +3368,11 @@@
+  				if (mreplace == NULL || bio == NULL ||
+  				    test_bit(Faulty, &mreplace->flags))
+  					break;
+- 				bio_reset(bio);
+  				bio->bi_next = biolist;
+  				biolist = bio;
+- 				bio->bi_private = r10_bio;
+  				bio->bi_end_io = end_sync_write;
+ -				bio_set_op_attrs(bio, REQ_OP_WRITE, 0);
+ -				bio->bi_iter.bi_sector = to_addr +
+ +				bio->bi_rw = WRITE;
+ +				bio->bi_sector = to_addr +
+  					mreplace->data_offset;
+  				bio->bi_bdev = mreplace->bdev;
+  				atomic_inc(&r10_bio->remaining);
+@@@ -3421,8 -3362,7 +3491,12 @@@
+  				r10_bio->devs[i].repl_bio->bi_end_io = NULL;
+  
+  			bio = r10_bio->devs[i].bio;
+++<<<<<<< HEAD
+ +			bio_reset(bio);
+ +			clear_bit(BIO_UPTODATE, &bio->bi_flags);
+++=======
++ 			bio->bi_error = -EIO;
+++>>>>>>> f0250618361d (md: raid10: don't use bio's vec table to manage resync pages)
+  			rcu_read_lock();
+  			rdev = rcu_dereference(conf->mirrors[d].rdev);
+  			if (rdev == NULL || test_bit(Faulty, &rdev->flags)) {
+@@@ -3446,12 -3386,11 +3520,11 @@@
+  			atomic_inc(&r10_bio->remaining);
+  			bio->bi_next = biolist;
+  			biolist = bio;
+- 			bio->bi_private = r10_bio;
+  			bio->bi_end_io = end_sync_read;
+ -			bio_set_op_attrs(bio, REQ_OP_READ, 0);
+ +			bio->bi_rw = READ;
+  			if (test_bit(FailFast, &conf->mirrors[d].rdev->flags))
+ -				bio->bi_opf |= MD_FAILFAST;
+ -			bio->bi_iter.bi_sector = sector + rdev->data_offset;
+ +				bio->bi_rw |= MD_FAILFAST;
+ +			bio->bi_sector = sector + rdev->data_offset;
+  			bio->bi_bdev = rdev->bdev;
+  			count++;
+  
+@@@ -3465,18 -3404,16 +3538,21 @@@
+  
+  			/* Need to set up for writing to the replacement */
+  			bio = r10_bio->devs[i].repl_bio;
+++<<<<<<< HEAD
+ +			bio_reset(bio);
+ +			clear_bit(BIO_UPTODATE, &bio->bi_flags);
+++=======
++ 			bio->bi_error = -EIO;
+++>>>>>>> f0250618361d (md: raid10: don't use bio's vec table to manage resync pages)
+  
+  			sector = r10_bio->devs[i].addr;
+  			bio->bi_next = biolist;
+  			biolist = bio;
+- 			bio->bi_private = r10_bio;
+  			bio->bi_end_io = end_sync_write;
+ -			bio_set_op_attrs(bio, REQ_OP_WRITE, 0);
+ +			bio->bi_rw = WRITE;
+  			if (test_bit(FailFast, &conf->mirrors[d].rdev->flags))
+ -				bio->bi_opf |= MD_FAILFAST;
+ -			bio->bi_iter.bi_sector = sector + rdev->data_offset;
+ +				bio->bi_rw |= MD_FAILFAST;
+ +			bio->bi_sector = sector + rdev->data_offset;
+  			bio->bi_bdev = rdev->bdev;
+  			count++;
+  		}
+@@@ -3510,27 -3447,17 +3586,41 @@@
+  		if (len == 0)
+  			break;
+  		for (bio= biolist ; bio ; bio=bio->bi_next) {
+++<<<<<<< HEAD
+ +			struct bio *bio2;
+ +			page = bio->bi_io_vec[bio->bi_vcnt].bv_page;
+ +			if (bio_add_page(bio, page, len, 0))
+ +				continue;
+ +
+ +			/* stop here */
+ +			bio->bi_io_vec[bio->bi_vcnt].bv_page = page;
+ +			for (bio2 = biolist;
+ +			     bio2 && bio2 != bio;
+ +			     bio2 = bio2->bi_next) {
+ +				/* remove last page from this bio */
+ +				bio2->bi_vcnt--;
+ +				bio2->bi_size -= len;
+ +				__clear_bit(BIO_SEG_VALID, &bio2->bi_flags);
+ +			}
+ +			goto bio_full;
+ +		}
+ +		nr_sectors += len>>9;
+ +		sector_nr += len>>9;
+ +	} while (biolist->bi_vcnt < RESYNC_PAGES);
+ + bio_full:
+++=======
++ 			struct resync_pages *rp = get_resync_pages(bio);
++ 			page = resync_fetch_page(rp, rp->idx++);
++ 			/*
++ 			 * won't fail because the vec table is big enough
++ 			 * to hold all these pages
++ 			 */
++ 			bio_add_page(bio, page, len, 0);
++ 		}
++ 		nr_sectors += len>>9;
++ 		sector_nr += len>>9;
++ 	} while (get_resync_pages(biolist)->idx < RESYNC_PAGES);
+++>>>>>>> f0250618361d (md: raid10: don't use bio's vec table to manage resync pages)
+  	r10_bio->sectors = nr_sectors;
+  
+  	while (biolist) {
+@@@ -4584,12 -4507,11 +4675,16 @@@ read_more
+  		if (!rdev2 || test_bit(Faulty, &rdev2->flags))
+  			continue;
+  
+- 		bio_reset(b);
+  		b->bi_bdev = rdev2->bdev;
+++<<<<<<< HEAD
+ +		b->bi_sector = r10_bio->devs[s/2].addr + rdev2->new_data_offset;
+ +		b->bi_private = r10_bio;
+++=======
++ 		b->bi_iter.bi_sector = r10_bio->devs[s/2].addr +
++ 			rdev2->new_data_offset;
+++>>>>>>> f0250618361d (md: raid10: don't use bio's vec table to manage resync pages)
+  		b->bi_end_io = end_reshape_write;
+ -		bio_set_op_attrs(b, REQ_OP_WRITE, 0);
+ +		b->bi_rw = WRITE;
+  		b->bi_next = blist;
+  		blist = b;
+  	}
+@@@ -4790,10 -4703,9 +4886,14 @@@ static int handle_reshape_read_error(st
+  	return 0;
+  }
+  
+ -static void end_reshape_write(struct bio *bio)
+ +static void end_reshape_write(struct bio *bio, int error)
+  {
+++<<<<<<< HEAD
+ +	int uptodate = test_bit(BIO_UPTODATE, &bio->bi_flags);
+ +	struct r10bio *r10_bio = bio->bi_private;
+++=======
++ 	struct r10bio *r10_bio = get_resync_r10bio(bio);
+++>>>>>>> f0250618361d (md: raid10: don't use bio's vec table to manage resync pages)
+  	struct mddev *mddev = r10_bio->mddev;
+  	struct r10conf *conf = mddev->private;
+  	int d;
+* Unmerged path drivers/md/raid10.c
