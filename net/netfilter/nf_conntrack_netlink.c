@@ -1809,7 +1809,7 @@ ctnetlink_create_conntrack(struct net *net,
 	}
 	tstamp = nf_conn_tstamp_find(ct);
 	if (tstamp)
-		tstamp->start = ktime_to_ns(ktime_get_real());
+		tstamp->start = ktime_get_real_ns();
 
 	err = nf_conntrack_hash_check_insert(ct);
 	if (err < 0)

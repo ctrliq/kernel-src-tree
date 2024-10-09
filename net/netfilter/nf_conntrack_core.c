@@ -435,7 +435,7 @@ bool nf_ct_delete(struct nf_conn *ct, u32 portid, int report)
 
 	tstamp = nf_conn_tstamp_find(ct);
 	if (tstamp && tstamp->stop == 0)
-		tstamp->stop = ktime_to_ns(ktime_get_real());
+		tstamp->stop = ktime_get_real_ns();
 
 	if (!nf_ct_is_dying(ct) &&
 	    unlikely(nf_conntrack_event_report(IPCT_DESTROY, ct,
