@@ -1,0 +1,147 @@
+btrfs: Introduce new mount option usebackuproot to replace recovery
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Qu Wenruo <quwenruo@cn.fujitsu.com>
+commit 8dcddfa048de637c8bbfa20ffd22757aeab7c604
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8dcddfa0.failed
+
+Current "recovery" mount option will only try to use backup root.
+However the word "recovery" is too generic and may be confusing for some
+users.
+
+Here introduce a new and more specific mount option, "usebackuproot" to
+replace "recovery" mount option.
+"Recovery" will be kept for compatibility reason, but will be
+deprecated.
+
+Also, since "usebackuproot" will only affect mount behavior and after
+open_ctree() it has nothing to do with the filesystem, so clear the flag
+after mount succeeded.
+
+This provides the basis for later unified "norecovery" mount option.
+
+	Signed-off-by: Qu Wenruo <quwenruo@cn.fujitsu.com>
+[ dropped usebackuproot from show_mount, added note about 'recovery' to
+  docs ]
+	Signed-off-by: David Sterba <dsterba@suse.com>
+(cherry picked from commit 8dcddfa048de637c8bbfa20ffd22757aeab7c604)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/filesystems/btrfs.txt
+diff --cc Documentation/filesystems/btrfs.txt
+index f97b4dc0578f,a2b1c508c32c..000000000000
+--- a/Documentation/filesystems/btrfs.txt
++++ b/Documentation/filesystems/btrfs.txt
+@@@ -168,10 -168,15 +168,21 @@@ Options with (*) are default options an
+    notreelog
+  	Enable/disable the tree logging used for fsync and O_SYNC writes.
+  
+++<<<<<<< HEAD
+ +  recovery
+ +	Enable autorecovery attempts if a bad tree root is found at mount time.
+ +	Currently this scans a list of several previous tree roots and tries to 
+++=======
++   usebackuproot
++ 	Enable attempts to use backup tree roots if a bad tree root is found at
++ 	mount time.
++ 	Currently this scans a list of 4 previous tree roots and tries to
+++>>>>>>> 8dcddfa048de (btrfs: Introduce new mount option usebackuproot to replace recovery)
+  	use the first readable.
++ 	And since the mount option doesn't affect any behavior after mount,
++ 	it won't be shown in mount info.
++ 	Prior to 4.6, this was done by 'recovery' option that has been
++ 	deprecated, but will work.
+  
+    rescan_uuid_tree
+  	Force check and rebuild procedure of the UUID tree. This should not
+* Unmerged path Documentation/filesystems/btrfs.txt
+diff --git a/fs/btrfs/ctree.h b/fs/btrfs/ctree.h
+index c4e61965ae55..24c369aebff6 100644
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -2263,7 +2263,7 @@ struct btrfs_ioctl_defrag_range_args {
+ #define BTRFS_MOUNT_ENOSPC_DEBUG	 (1 << 15)
+ #define BTRFS_MOUNT_AUTO_DEFRAG		(1 << 16)
+ #define BTRFS_MOUNT_INODE_MAP_CACHE	(1 << 17)
+-#define BTRFS_MOUNT_RECOVERY		(1 << 18)
++#define BTRFS_MOUNT_USEBACKUPROOT	(1 << 18)
+ #define BTRFS_MOUNT_SKIP_BALANCE	(1 << 19)
+ #define BTRFS_MOUNT_CHECK_INTEGRITY	(1 << 20)
+ #define BTRFS_MOUNT_CHECK_INTEGRITY_INCLUDING_EXTENT_DATA (1 << 21)
+diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+index f496335743a6..7d8b5c230cdf 100644
+--- a/fs/btrfs/disk-io.c
++++ b/fs/btrfs/disk-io.c
+@@ -3104,6 +3104,12 @@ retry_root_backup:
+ 
+ 	fs_info->open = 1;
+ 
++	/*
++	 * backuproot only affect mount behavior, and if open_ctree succeeded,
++	 * no need to keep the flag
++	 */
++	btrfs_clear_opt(fs_info->mount_opt, USEBACKUPROOT);
++
+ 	return 0;
+ 
+ fail_qgroup:
+@@ -3158,7 +3164,7 @@ fail:
+ 	return err;
+ 
+ recovery_tree_root:
+-	if (!btrfs_test_opt(tree_root, RECOVERY))
++	if (!btrfs_test_opt(tree_root, USEBACKUPROOT))
+ 		goto fail_tree_roots;
+ 
+ 	free_root_pointers(fs_info, 0);
+diff --git a/fs/btrfs/super.c b/fs/btrfs/super.c
+index a840b471f796..fcf161d8719c 100644
+--- a/fs/btrfs/super.c
++++ b/fs/btrfs/super.c
+@@ -302,7 +302,7 @@ enum {
+ 	Opt_check_integrity_print_mask, Opt_fatal_errors, Opt_rescan_uuid_tree,
+ 	Opt_commit_interval, Opt_barrier, Opt_nodefrag, Opt_nodiscard,
+ 	Opt_noenospc_debug, Opt_noflushoncommit, Opt_acl, Opt_datacow,
+-	Opt_datasum, Opt_treelog, Opt_noinode_cache,
++	Opt_datasum, Opt_treelog, Opt_noinode_cache, Opt_usebackuproot,
+ #ifdef CONFIG_BTRFS_DEBUG
+ 	Opt_fragment_data, Opt_fragment_metadata, Opt_fragment_all,
+ #endif
+@@ -350,7 +350,8 @@ static const match_table_t tokens = {
+ 	{Opt_inode_cache, "inode_cache"},
+ 	{Opt_noinode_cache, "noinode_cache"},
+ 	{Opt_no_space_cache, "nospace_cache"},
+-	{Opt_recovery, "recovery"},
++	{Opt_recovery, "recovery"}, /* deprecated */
++	{Opt_usebackuproot, "usebackuproot"},
+ 	{Opt_skip_balance, "skip_balance"},
+ 	{Opt_check_integrity, "check_int"},
+ 	{Opt_check_integrity_including_extent_data, "check_int_data"},
+@@ -672,8 +673,12 @@ int btrfs_parse_options(struct btrfs_root *root, char *options)
+ 					     "disabling auto defrag");
+ 			break;
+ 		case Opt_recovery:
+-			btrfs_info(root->fs_info, "enabling auto recovery");
+-			btrfs_set_opt(info->mount_opt, RECOVERY);
++			btrfs_warn(root->fs_info,
++				   "'recovery' is deprecated, use 'usebackuproot' instead");
++		case Opt_usebackuproot:
++			btrfs_info(root->fs_info,
++				   "trying to use backup root at mount time");
++			btrfs_set_opt(info->mount_opt, USEBACKUPROOT);
+ 			break;
+ 		case Opt_skip_balance:
+ 			btrfs_set_opt(info->mount_opt, SKIP_BALANCE);
+@@ -1192,8 +1197,6 @@ static int btrfs_show_options(struct seq_file *seq, struct dentry *dentry)
+ 		seq_puts(seq, ",inode_cache");
+ 	if (btrfs_test_opt(root, SKIP_BALANCE))
+ 		seq_puts(seq, ",skip_balance");
+-	if (btrfs_test_opt(root, RECOVERY))
+-		seq_puts(seq, ",recovery");
+ #ifdef CONFIG_BTRFS_FS_CHECK_INTEGRITY
+ 	if (btrfs_test_opt(root, CHECK_INTEGRITY_INCLUDING_EXTENT_DATA))
+ 		seq_puts(seq, ",check_int_data");
