@@ -1,0 +1,307 @@
+x86/smp: Provide topology_is_primary_thread()
+
+jira LE-1907
+cve CVE-2018-3620
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [x86] smp: provide topology_is_primary_thread(), part 2 (Christoph von Recklinghausen) [1593384] {CVE-2018-3620}
+Rebuild_FUZZ: 87.23%
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 6a4d2657e048f096c7ffcad254010bd94891c8c0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/6a4d2657.failed
+
+If the CPU is supporting SMT then the primary thread can be found by
+checking the lower APIC ID bits for zero. smp_num_siblings is used to build
+the mask for the APIC ID bits which need to be taken into account.
+
+This uses the MPTABLE or ACPI/MADT supplied APIC ID, which can be different
+than the initial APIC ID in CPUID. But according to AMD the lower bits have
+to be consistent. Intel gave a tentative confirmation as well.
+
+Preparatory patch to support disabling SMT at boot/runtime.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Acked-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 6a4d2657e048f096c7ffcad254010bd94891c8c0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/apic.h
+#	arch/x86/kernel/apic/apic.c
+diff --cc arch/x86/include/asm/apic.h
+index 83a199eb0bee,9362a3aae927..000000000000
+--- a/arch/x86/include/asm/apic.h
++++ b/arch/x86/include/asm/apic.h
+@@@ -561,137 -488,26 +561,147 @@@ static inline unsigned int read_apic_id
+  	return apic->get_apic_id(reg);
+  }
+  
+ -extern int default_apic_id_valid(u32 apicid);
+ +static inline int default_apic_id_valid(int apicid)
+ +{
+ +	return (apicid < 255);
+ +}
+ +
+  extern int default_acpi_madt_oem_check(char *, char *);
+ +
+  extern void default_setup_apic_routing(void);
+  
+ -extern u32 apic_default_calc_apicid(unsigned int cpu);
+ -extern u32 apic_flat_calc_apicid(unsigned int cpu);
+ +extern struct apic apic_noop;
+ +
+ +#ifdef CONFIG_X86_32
+ +
+ +static inline int noop_x86_32_early_logical_apicid(int cpu)
+ +{
+ +	return BAD_APICID;
+ +}
+ +
+ +/*
+ + * Set up the logical destination ID.
+ + *
+ + * Intel recommends to set DFR, LDR and TPR before enabling
+ + * an APIC.  See e.g. "AP-388 82489DX User's Manual" (Intel
+ + * document number 292116).  So here it goes...
+ + */
+ +extern void default_init_apic_ldr(void);
+ +
+ +static inline int default_apic_id_registered(void)
+ +{
+ +	return physid_isset(read_apic_id(), phys_cpu_present_map);
+ +}
+ +
+ +static inline int default_phys_pkg_id(int cpuid_apic, int index_msb)
+ +{
+ +	return cpuid_apic >> index_msb;
+ +}
+ +
+ +#endif
+ +
+ +static inline int
+ +flat_cpu_mask_to_apicid_and(const struct cpumask *cpumask,
+ +			    const struct cpumask *andmask,
+ +			    unsigned int *apicid)
+ +{
+ +	unsigned long cpu_mask = cpumask_bits(cpumask)[0] &
+ +				 cpumask_bits(andmask)[0] &
+ +				 cpumask_bits(cpu_online_mask)[0] &
+ +				 APIC_ALL_CPUS;
+ +
+ +	if (likely(cpu_mask)) {
+ +		*apicid = (unsigned int)cpu_mask;
+ +		return 0;
+ +	} else {
+ +		return -EINVAL;
+ +	}
+ +}
+ +
+ +extern int
+ +default_cpu_mask_to_apicid_and(const struct cpumask *cpumask,
+ +			       const struct cpumask *andmask,
+ +			       unsigned int *apicid);
+ +
+ +static inline void
+ +flat_vector_allocation_domain(int cpu, struct cpumask *retmask,
+ +			      const struct cpumask *mask)
+ +{
+ +	/* Careful. Some cpus do not strictly honor the set of cpus
+ +	 * specified in the interrupt destination when using lowest
+ +	 * priority interrupt delivery mode.
+ +	 *
+ +	 * In particular there was a hyperthreading cpu observed to
+ +	 * deliver interrupts to the wrong hyperthread when only one
+ +	 * hyperthread was specified in the interrupt desitination.
+ +	 */
+ +	cpumask_clear(retmask);
+ +	cpumask_bits(retmask)[0] = APIC_ALL_CPUS;
+ +}
+ +
+ +static inline void
+ +default_vector_allocation_domain(int cpu, struct cpumask *retmask,
+ +				 const struct cpumask *mask)
+ +{
+ +	cpumask_copy(retmask, cpumask_of(cpu));
+ +}
+ +
+ +static inline unsigned long default_check_apicid_used(physid_mask_t *map, int apicid)
+ +{
+ +	return physid_isset(apicid, *map);
+ +}
+ +
+ +static inline unsigned long default_check_apicid_present(int bit)
+ +{
+ +	return physid_isset(bit, phys_cpu_present_map);
+ +}
+ +
+ +static inline void default_ioapic_phys_id_map(physid_mask_t *phys_map, physid_mask_t *retmap)
+ +{
+ +	*retmap = *phys_map;
+ +}
+ +
+ +static inline int __default_cpu_present_to_apicid(int mps_cpu)
+ +{
+ +	if (mps_cpu < nr_cpu_ids && cpu_present(mps_cpu))
+ +		return (int)per_cpu(x86_bios_cpu_apicid, mps_cpu);
+ +	else
+ +		return BAD_APICID;
+ +}
+ +
+ +static inline int
+ +__default_check_phys_apicid_present(int phys_apicid)
+ +{
+ +	return physid_isset(phys_apicid, phys_cpu_present_map);
+ +}
+ +
+ +#ifdef CONFIG_X86_32
+ +static inline int default_cpu_present_to_apicid(int mps_cpu)
+ +{
+ +	return __default_cpu_present_to_apicid(mps_cpu);
+ +}
+  
+ -extern bool default_check_apicid_used(physid_mask_t *map, int apicid);
+ -extern void default_ioapic_phys_id_map(physid_mask_t *phys_map, physid_mask_t *retmap);
+ +static inline int
+ +default_check_phys_apicid_present(int phys_apicid)
+ +{
+ +	return __default_check_phys_apicid_present(phys_apicid);
+ +}
+ +#else
+  extern int default_cpu_present_to_apicid(int mps_cpu);
+  extern int default_check_phys_apicid_present(int phys_apicid);
+ +#endif
+  
+  #endif /* CONFIG_X86_LOCAL_APIC */
+++<<<<<<< HEAD
+++=======
++ 
++ #ifdef CONFIG_SMP
++ bool apic_id_is_primary_thread(unsigned int id);
++ #else
++ static inline bool apic_id_is_primary_thread(unsigned int id) { return false; }
++ #endif
++ 
+++>>>>>>> 6a4d2657e048 (x86/smp: Provide topology_is_primary_thread())
+  extern void irq_enter(void);
+  extern void irq_exit(void);
+  
+diff --cc arch/x86/kernel/apic/apic.c
+index 3cb4ee28fa8c,8703caa9d6db..000000000000
+--- a/arch/x86/kernel/apic/apic.c
++++ b/arch/x86/kernel/apic/apic.c
+@@@ -2230,6 -2172,67 +2230,70 @@@ void disconnect_bsp_APIC(int virt_wire_
+  	apic_write(APIC_LVT1, value);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * The number of allocated logical CPU IDs. Since logical CPU IDs are allocated
++  * contiguously, it equals to current allocated max logical CPU ID plus 1.
++  * All allocated CPU IDs should be in the [0, nr_logical_cpuids) range,
++  * so the maximum of nr_logical_cpuids is nr_cpu_ids.
++  *
++  * NOTE: Reserve 0 for BSP.
++  */
++ static int nr_logical_cpuids = 1;
++ 
++ /*
++  * Used to store mapping between logical CPU IDs and APIC IDs.
++  */
++ static int cpuid_to_apicid[] = {
++ 	[0 ... NR_CPUS - 1] = -1,
++ };
++ 
++ /**
++  * apic_id_is_primary_thread - Check whether APIC ID belongs to a primary thread
++  * @id:	APIC ID to check
++  */
++ bool apic_id_is_primary_thread(unsigned int apicid)
++ {
++ 	u32 mask;
++ 
++ 	if (smp_num_siblings == 1)
++ 		return true;
++ 	/* Isolate the SMT bit(s) in the APICID and check for 0 */
++ 	mask = (1U << (fls(smp_num_siblings) - 1)) - 1;
++ 	return !(apicid & mask);
++ }
++ 
++ /*
++  * Should use this API to allocate logical CPU IDs to keep nr_logical_cpuids
++  * and cpuid_to_apicid[] synchronized.
++  */
++ static int allocate_logical_cpuid(int apicid)
++ {
++ 	int i;
++ 
++ 	/*
++ 	 * cpuid <-> apicid mapping is persistent, so when a cpu is up,
++ 	 * check if the kernel has allocated a cpuid for it.
++ 	 */
++ 	for (i = 0; i < nr_logical_cpuids; i++) {
++ 		if (cpuid_to_apicid[i] == apicid)
++ 			return i;
++ 	}
++ 
++ 	/* Allocate a new cpuid. */
++ 	if (nr_logical_cpuids >= nr_cpu_ids) {
++ 		WARN_ONCE(1, "APIC: NR_CPUS/possible_cpus limit of %u reached. "
++ 			     "Processor %d/0x%x and the rest are ignored.\n",
++ 			     nr_cpu_ids, nr_logical_cpuids, apicid);
++ 		return -EINVAL;
++ 	}
++ 
++ 	cpuid_to_apicid[nr_logical_cpuids] = apicid;
++ 	return nr_logical_cpuids++;
++ }
++ 
+++>>>>>>> 6a4d2657e048 (x86/smp: Provide topology_is_primary_thread())
+  int generic_processor_info(int apicid, int version)
+  {
+  	int cpu, max = nr_cpu_ids;
+* Unmerged path arch/x86/include/asm/apic.h
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 3e8d0c74fce1..0ab266e7704a 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -140,13 +140,15 @@ static inline int topology_max_smt_threads(void)
+ }
+ 
+ int topology_update_package_map(unsigned int apicid, unsigned int cpu);
+-extern int topology_phys_to_logical_pkg(unsigned int pkg);
++int topology_phys_to_logical_pkg(unsigned int pkg);
++bool topology_is_primary_thread(unsigned int cpu);
+ #else
+ #define topology_max_packages()			(1)
+ static inline int
+ topology_update_package_map(unsigned int apicid, unsigned int cpu) { return 0; }
+ static inline int topology_phys_to_logical_pkg(unsigned int pkg) { return 0; }
+ static inline int topology_max_smt_threads(void) { return 1; }
++static inline bool topology_is_primary_thread(unsigned int cpu) { return true; }
+ #endif
+ 
+ static inline void arch_fix_phys_package_id(int num, u32 slot)
+* Unmerged path arch/x86/kernel/apic/apic.c
+diff --git a/arch/x86/kernel/smpboot.c b/arch/x86/kernel/smpboot.c
+index 331c8872578a..ca1c1695d324 100644
+--- a/arch/x86/kernel/smpboot.c
++++ b/arch/x86/kernel/smpboot.c
+@@ -258,6 +258,15 @@ static void notrace start_secondary(void *unused)
+ 	cpu_startup_entry(CPUHP_ONLINE);
+ }
+ 
++/**
++ * topology_is_primary_thread - Check whether CPU is the primary SMT thread
++ * @cpu:	CPU to check
++ */
++bool topology_is_primary_thread(unsigned int cpu)
++{
++	return apic_id_is_primary_thread(per_cpu(x86_cpu_to_apicid, cpu));
++}
++
+ /**
+  * topology_phys_to_logical_pkg - Map a physical package id to a logical
+  *
