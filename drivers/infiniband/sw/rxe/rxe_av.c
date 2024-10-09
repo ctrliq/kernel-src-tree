@@ -62,8 +62,7 @@ int rxe_av_from_attr(u8 port_num, struct rxe_av *av,
 	return 0;
 }
 
-int rxe_av_to_attr(struct rxe_dev *rxe, struct rxe_av *av,
-		   struct rdma_ah_attr *attr)
+int rxe_av_to_attr(struct rxe_av *av, struct rdma_ah_attr *attr)
 {
 	attr->type = RDMA_AH_ATTR_TYPE_ROCE;
 	memcpy(rdma_ah_retrieve_grh(attr), &av->grh, sizeof(av->grh));
