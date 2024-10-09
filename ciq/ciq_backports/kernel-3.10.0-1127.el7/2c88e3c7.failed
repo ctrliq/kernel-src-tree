@@ -1,0 +1,153 @@
+block: fix use-after-free on gendisk
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+Rebuild_CHGLOG: - [block] fix use-after-free on gendisk (Ming Lei) [1700091]
+Rebuild_FUZZ: 89.23%
+commit-author Yufen Yu <yuyufen@huawei.com>
+commit 2c88e3c7ec32d7a40cc7c9b4a487cf90e4671bdd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/2c88e3c7.failed
+
+commit 2da78092dda "block: Fix dev_t minor allocation lifetime"
+specifically moved blk_free_devt(dev->devt) call to part_release()
+to avoid reallocating device number before the device is fully
+shutdown.
+
+However, it can cause use-after-free on gendisk in get_gendisk().
+We use md device as example to show the race scenes:
+
+Process1		Worker			Process2
+md_free
+						blkdev_open
+del_gendisk
+  add delete_partition_work_fn() to wq
+  						__blkdev_get
+						get_gendisk
+put_disk
+  disk_release
+    kfree(disk)
+    						find part from ext_devt_idr
+						get_disk_and_module(disk)
+    					  	cause use after free
+
+    			delete_partition_work_fn
+			put_device(part)
+    		  	part_release
+		    	remove part from ext_devt_idr
+
+Before <devt, hd_struct pointer> is removed from ext_devt_idr by
+delete_partition_work_fn(), we can find the devt and then access
+gendisk by hd_struct pointer. But, if we access the gendisk after
+it have been freed, it can cause in use-after-freeon gendisk in
+get_gendisk().
+
+We fix this by adding a new helper blk_invalidate_devt() in
+delete_partition() and del_gendisk(). It replaces hd_struct
+pointer in idr with value 'NULL', and deletes the entry from
+idr in part_release() as we do now.
+
+Thanks to Jan Kara for providing the solution and more clear comments
+for the code.
+
+Fixes: 2da78092dda1 ("block: Fix dev_t minor allocation lifetime")
+	Cc: Al Viro <viro@zeniv.linux.org.uk>
+	Reviewed-by: Bart Van Assche <bvanassche@acm.org>
+	Reviewed-by: Keith Busch <keith.busch@intel.com>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Suggested-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Yufen Yu <yuyufen@huawei.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 2c88e3c7ec32d7a40cc7c9b4a487cf90e4671bdd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/genhd.c
+#	block/partition-generic.c
+diff --cc block/genhd.c
+index f3895ba5c0f8,83f5c33d1e80..000000000000
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@@ -729,13 -784,37 +741,42 @@@ void del_gendisk(struct gendisk *disk
+  	disk_part_iter_exit(&piter);
+  
+  	invalidate_partition(disk, 0);
+ -	bdev_unhash_inode(disk_devt(disk));
+  	set_capacity(disk, 0);
+  	disk->flags &= ~GENHD_FL_UP;
+ -	up_write(&disk->lookup_sem);
+  
+++<<<<<<< HEAD
+ +	sysfs_remove_link(&disk_to_dev(disk)->kobj, "bdi");
+ +	bdi_unregister(&disk->queue->backing_dev_info);
+ +	blk_unregister_queue(disk);
+ +	blk_unregister_region(disk_devt(disk), disk->minors);
+++=======
++ 	if (!(disk->flags & GENHD_FL_HIDDEN))
++ 		sysfs_remove_link(&disk_to_dev(disk)->kobj, "bdi");
++ 	if (disk->queue) {
++ 		/*
++ 		 * Unregister bdi before releasing device numbers (as they can
++ 		 * get reused and we'd get clashes in sysfs).
++ 		 */
++ 		if (!(disk->flags & GENHD_FL_HIDDEN))
++ 			bdi_unregister(disk->queue->backing_dev_info);
++ 		blk_unregister_queue(disk);
++ 	} else {
++ 		WARN_ON(1);
++ 	}
++ 
++ 	if (!(disk->flags & GENHD_FL_HIDDEN))
++ 		blk_unregister_region(disk_devt(disk), disk->minors);
++ 	/*
++ 	 * Remove gendisk pointer from idr so that it cannot be looked up
++ 	 * while RCU period before freeing gendisk is running to prevent
++ 	 * use-after-free issues. Note that the device number stays
++ 	 * "in-use" until we really free the gendisk.
++ 	 */
++ 	blk_invalidate_devt(disk_devt(disk));
++ 
++ 	kobject_put(disk->part0.holder_dir);
++ 	kobject_put(disk->slave_dir);
+++>>>>>>> 2c88e3c7ec32 (block: fix use-after-free on gendisk)
+  
+  	part_stat_set_all(&disk->part0, 0);
+  	disk->part0.stamp = 0;
+diff --cc block/partition-generic.c
+index f3d9b7526c2a,aee643ce13d1..000000000000
+--- a/block/partition-generic.c
++++ b/block/partition-generic.c
+@@@ -260,7 -285,14 +260,18 @@@ void delete_partition(struct gendisk *d
+  	kobject_put(part->holder_dir);
+  	device_del(part_to_dev(part));
+  
+++<<<<<<< HEAD
+ +	hd_struct_put(part);
+++=======
++ 	/*
++ 	 * Remove gendisk pointer from idr so that it cannot be looked up
++ 	 * while RCU period before freeing gendisk is running to prevent
++ 	 * use-after-free issues. Note that the device number stays
++ 	 * "in-use" until we really free the gendisk.
++ 	 */
++ 	blk_invalidate_devt(part_devt(part));
++ 	hd_struct_kill(part);
+++>>>>>>> 2c88e3c7ec32 (block: fix use-after-free on gendisk)
+  }
+  
+  static ssize_t whole_disk_show(struct device *dev,
+* Unmerged path block/genhd.c
+* Unmerged path block/partition-generic.c
+diff --git a/include/linux/genhd.h b/include/linux/genhd.h
+index 6e9f6033c809..8c45e6e1f01f 100644
+--- a/include/linux/genhd.h
++++ b/include/linux/genhd.h
+@@ -595,6 +595,7 @@ struct unixware_disklabel {
+ 
+ extern int blk_alloc_devt(struct hd_struct *part, dev_t *devt);
+ extern void blk_free_devt(dev_t devt);
++extern void blk_invalidate_devt(dev_t devt);
+ extern dev_t blk_lookup_devt(const char *name, int partno);
+ extern char *disk_name (struct gendisk *hd, int partno, char *buf);
+ 
