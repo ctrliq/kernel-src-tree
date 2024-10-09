@@ -1,0 +1,333 @@
+net/mlx5: Introduce general notification event
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] mlx5: Introduce general notification event (Don Dutile) [1499364 1456694]
+Rebuild_FUZZ: 95.45%
+commit-author Maor Gottlieb <maorg@mellanox.com>
+commit 246ac9814c5b2c0e9916dca5fbf8d6a40245fad1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/246ac981.failed
+
+When delay drop timeout is expired, the firmware raises
+general notification event of DELAY_DROP_TIMEOUT subtype.
+In addition the feature is disable so the driver have to
+reactivate the timeout.
+
+	Signed-off-by: Maor Gottlieb <maorg@mellanox.com>
+	Reviewed-by: Yishai Hadas <yishaih@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leon@kernel.org>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 246ac9814c5b2c0e9916dca5fbf8d6a40245fad1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/eq.c
+#	include/linux/mlx5/mlx5_ifc.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eq.c
+index 634e6e3dfa90,849417425811..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eq.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eq.c
+@@@ -155,6 -157,12 +155,15 @@@ static const char *eqe_type_str(u8 type
+  		return "MLX5_EVENT_TYPE_PAGE_FAULT";
+  	case MLX5_EVENT_TYPE_PPS_EVENT:
+  		return "MLX5_EVENT_TYPE_PPS_EVENT";
+++<<<<<<< HEAD
+++=======
++ 	case MLX5_EVENT_TYPE_NIC_VPORT_CHANGE:
++ 		return "MLX5_EVENT_TYPE_NIC_VPORT_CHANGE";
++ 	case MLX5_EVENT_TYPE_FPGA_ERROR:
++ 		return "MLX5_EVENT_TYPE_FPGA_ERROR";
++ 	case MLX5_EVENT_TYPE_GENERAL_EVENT:
++ 		return "MLX5_EVENT_TYPE_GENERAL_EVENT";
+++>>>>>>> 246ac9814c5b (net/mlx5: Introduce general notification event)
+  	default:
+  		return "Unrecognized event";
+  	}
+@@@ -190,10 -198,207 +199,210 @@@ static void eq_update_ci(struct mlx5_e
+  	mb();
+  }
+  
+ -#ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
+ -static void eqe_pf_action(struct work_struct *work)
+ +static int mlx5_eq_int(struct mlx5_core_dev *dev, struct mlx5_eq *eq)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct mlx5_pagefault *pfault = container_of(work,
++ 						     struct mlx5_pagefault,
++ 						     work);
++ 	struct mlx5_eq *eq = pfault->eq;
++ 
++ 	mlx5_core_page_fault(eq->dev, pfault);
++ 	mempool_free(pfault, eq->pf_ctx.pool);
++ }
++ 
++ static void eq_pf_process(struct mlx5_eq *eq)
++ {
++ 	struct mlx5_core_dev *dev = eq->dev;
++ 	struct mlx5_eqe_page_fault *pf_eqe;
++ 	struct mlx5_pagefault *pfault;
++ 	struct mlx5_eqe *eqe;
++ 	int set_ci = 0;
++ 
++ 	while ((eqe = next_eqe_sw(eq))) {
++ 		pfault = mempool_alloc(eq->pf_ctx.pool, GFP_ATOMIC);
++ 		if (!pfault) {
++ 			schedule_work(&eq->pf_ctx.work);
++ 			break;
++ 		}
++ 
++ 		dma_rmb();
++ 		pf_eqe = &eqe->data.page_fault;
++ 		pfault->event_subtype = eqe->sub_type;
++ 		pfault->bytes_committed = be32_to_cpu(pf_eqe->bytes_committed);
++ 
++ 		mlx5_core_dbg(dev,
++ 			      "PAGE_FAULT: subtype: 0x%02x, bytes_committed: 0x%06x\n",
++ 			      eqe->sub_type, pfault->bytes_committed);
++ 
++ 		switch (eqe->sub_type) {
++ 		case MLX5_PFAULT_SUBTYPE_RDMA:
++ 			/* RDMA based event */
++ 			pfault->type =
++ 				be32_to_cpu(pf_eqe->rdma.pftype_token) >> 24;
++ 			pfault->token =
++ 				be32_to_cpu(pf_eqe->rdma.pftype_token) &
++ 				MLX5_24BIT_MASK;
++ 			pfault->rdma.r_key =
++ 				be32_to_cpu(pf_eqe->rdma.r_key);
++ 			pfault->rdma.packet_size =
++ 				be16_to_cpu(pf_eqe->rdma.packet_length);
++ 			pfault->rdma.rdma_op_len =
++ 				be32_to_cpu(pf_eqe->rdma.rdma_op_len);
++ 			pfault->rdma.rdma_va =
++ 				be64_to_cpu(pf_eqe->rdma.rdma_va);
++ 			mlx5_core_dbg(dev,
++ 				      "PAGE_FAULT: type:0x%x, token: 0x%06x, r_key: 0x%08x\n",
++ 				      pfault->type, pfault->token,
++ 				      pfault->rdma.r_key);
++ 			mlx5_core_dbg(dev,
++ 				      "PAGE_FAULT: rdma_op_len: 0x%08x, rdma_va: 0x%016llx\n",
++ 				      pfault->rdma.rdma_op_len,
++ 				      pfault->rdma.rdma_va);
++ 			break;
++ 
++ 		case MLX5_PFAULT_SUBTYPE_WQE:
++ 			/* WQE based event */
++ 			pfault->type =
++ 				be32_to_cpu(pf_eqe->wqe.pftype_wq) >> 24;
++ 			pfault->token =
++ 				be32_to_cpu(pf_eqe->wqe.token);
++ 			pfault->wqe.wq_num =
++ 				be32_to_cpu(pf_eqe->wqe.pftype_wq) &
++ 				MLX5_24BIT_MASK;
++ 			pfault->wqe.wqe_index =
++ 				be16_to_cpu(pf_eqe->wqe.wqe_index);
++ 			pfault->wqe.packet_size =
++ 				be16_to_cpu(pf_eqe->wqe.packet_length);
++ 			mlx5_core_dbg(dev,
++ 				      "PAGE_FAULT: type:0x%x, token: 0x%06x, wq_num: 0x%06x, wqe_index: 0x%04x\n",
++ 				      pfault->type, pfault->token,
++ 				      pfault->wqe.wq_num,
++ 				      pfault->wqe.wqe_index);
++ 			break;
++ 
++ 		default:
++ 			mlx5_core_warn(dev,
++ 				       "Unsupported page fault event sub-type: 0x%02hhx\n",
++ 				       eqe->sub_type);
++ 			/* Unsupported page faults should still be
++ 			 * resolved by the page fault handler
++ 			 */
++ 		}
++ 
++ 		pfault->eq = eq;
++ 		INIT_WORK(&pfault->work, eqe_pf_action);
++ 		queue_work(eq->pf_ctx.wq, &pfault->work);
++ 
++ 		++eq->cons_index;
++ 		++set_ci;
++ 
++ 		if (unlikely(set_ci >= MLX5_NUM_SPARE_EQE)) {
++ 			eq_update_ci(eq, 0);
++ 			set_ci = 0;
++ 		}
++ 	}
++ 
++ 	eq_update_ci(eq, 1);
++ }
++ 
++ static irqreturn_t mlx5_eq_pf_int(int irq, void *eq_ptr)
++ {
++ 	struct mlx5_eq *eq = eq_ptr;
++ 	unsigned long flags;
++ 
++ 	if (spin_trylock_irqsave(&eq->pf_ctx.lock, flags)) {
++ 		eq_pf_process(eq);
++ 		spin_unlock_irqrestore(&eq->pf_ctx.lock, flags);
++ 	} else {
++ 		schedule_work(&eq->pf_ctx.work);
++ 	}
++ 
++ 	return IRQ_HANDLED;
++ }
++ 
++ /* mempool_refill() was proposed but unfortunately wasn't accepted
++  * http://lkml.iu.edu/hypermail/linux/kernel/1512.1/05073.html
++  * Chip workaround.
++  */
++ static void mempool_refill(mempool_t *pool)
++ {
++ 	while (pool->curr_nr < pool->min_nr)
++ 		mempool_free(mempool_alloc(pool, GFP_KERNEL), pool);
++ }
++ 
++ static void eq_pf_action(struct work_struct *work)
++ {
++ 	struct mlx5_eq *eq = container_of(work, struct mlx5_eq, pf_ctx.work);
++ 
++ 	mempool_refill(eq->pf_ctx.pool);
++ 
++ 	spin_lock_irq(&eq->pf_ctx.lock);
++ 	eq_pf_process(eq);
++ 	spin_unlock_irq(&eq->pf_ctx.lock);
++ }
++ 
++ static int init_pf_ctx(struct mlx5_eq_pagefault *pf_ctx, const char *name)
++ {
++ 	spin_lock_init(&pf_ctx->lock);
++ 	INIT_WORK(&pf_ctx->work, eq_pf_action);
++ 
++ 	pf_ctx->wq = alloc_ordered_workqueue(name,
++ 					     WQ_MEM_RECLAIM);
++ 	if (!pf_ctx->wq)
++ 		return -ENOMEM;
++ 
++ 	pf_ctx->pool = mempool_create_kmalloc_pool
++ 		(MLX5_NUM_PF_DRAIN, sizeof(struct mlx5_pagefault));
++ 	if (!pf_ctx->pool)
++ 		goto err_wq;
++ 
++ 	return 0;
++ err_wq:
++ 	destroy_workqueue(pf_ctx->wq);
++ 	return -ENOMEM;
++ }
++ 
++ int mlx5_core_page_fault_resume(struct mlx5_core_dev *dev, u32 token,
++ 				u32 wq_num, u8 type, int error)
++ {
++ 	u32 out[MLX5_ST_SZ_DW(page_fault_resume_out)] = {0};
++ 	u32 in[MLX5_ST_SZ_DW(page_fault_resume_in)]   = {0};
++ 
++ 	MLX5_SET(page_fault_resume_in, in, opcode,
++ 		 MLX5_CMD_OP_PAGE_FAULT_RESUME);
++ 	MLX5_SET(page_fault_resume_in, in, error, !!error);
++ 	MLX5_SET(page_fault_resume_in, in, page_fault_type, type);
++ 	MLX5_SET(page_fault_resume_in, in, wq_number, wq_num);
++ 	MLX5_SET(page_fault_resume_in, in, token, token);
++ 
++ 	return mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
++ }
++ EXPORT_SYMBOL_GPL(mlx5_core_page_fault_resume);
++ #endif
++ 
++ static void general_event_handler(struct mlx5_core_dev *dev,
++ 				  struct mlx5_eqe *eqe)
++ {
++ 	switch (eqe->sub_type) {
++ 	case MLX5_GENERAL_SUBTYPE_DELAY_DROP_TIMEOUT:
++ 		if (dev->event)
++ 			dev->event(dev, MLX5_DEV_EVENT_DELAY_DROP_TIMEOUT, 0);
++ 		break;
++ 	default:
++ 		mlx5_core_dbg(dev, "General event with unrecognized subtype: sub_type %d\n",
++ 			      eqe->sub_type);
++ 	}
++ }
++ 
++ static irqreturn_t mlx5_eq_int(int irq, void *eq_ptr)
++ {
++ 	struct mlx5_eq *eq = eq_ptr;
++ 	struct mlx5_core_dev *dev = eq->dev;
+++>>>>>>> 246ac9814c5b (net/mlx5: Introduce general notification event)
+  	struct mlx5_eqe *eqe;
+ +	int eqes_found = 0;
+  	int set_ci = 0;
+  	u32 cqn = -1;
+  	u32 rsn;
+@@@ -298,6 -497,14 +507,17 @@@
+  			if (dev->event)
+  				dev->event(dev, MLX5_DEV_EVENT_PPS, (unsigned long)eqe);
+  			break;
+++<<<<<<< HEAD
+++=======
++ 
++ 		case MLX5_EVENT_TYPE_FPGA_ERROR:
++ 			mlx5_fpga_event(dev, eqe->type, &eqe->data.raw);
++ 			break;
++ 
++ 		case MLX5_EVENT_TYPE_GENERAL_EVENT:
++ 			general_event_handler(dev, eqe);
++ 			break;
+++>>>>>>> 246ac9814c5b (net/mlx5: Introduce general notification event)
+  		default:
+  			mlx5_core_warn(dev, "Unhandled event 0x%x on EQ 0x%x\n",
+  				       eqe->type, eq->eqn);
+diff --cc include/linux/mlx5/mlx5_ifc.h
+index 7814f59a455b,4bc57647fad8..000000000000
+--- a/include/linux/mlx5/mlx5_ifc.h
++++ b/include/linux/mlx5/mlx5_ifc.h
+@@@ -860,7 -874,9 +860,13 @@@ struct mlx5_ifc_cmd_hca_cap_bits 
+  	u8         max_tc[0x4];
+  	u8         reserved_at_1d0[0x1];
+  	u8         dcbx[0x1];
+++<<<<<<< HEAD
+ +	u8         reserved_at_1d2[0x4];
+++=======
++ 	u8         general_notification_event[0x1];
++ 	u8         reserved_at_1d3[0x2];
++ 	u8         fpga[0x1];
+++>>>>>>> 246ac9814c5b (net/mlx5: Introduce general notification event)
+  	u8         rol_s[0x1];
+  	u8         rol_g[0x1];
+  	u8         reserved_at_1d8[0x1];
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eq.c
+diff --git a/include/linux/mlx5/device.h b/include/linux/mlx5/device.h
+index f1b071c6a867..ee178d7ba390 100644
+--- a/include/linux/mlx5/device.h
++++ b/include/linux/mlx5/device.h
+@@ -280,6 +280,7 @@ enum mlx5_event {
+ 	MLX5_EVENT_TYPE_GPIO_EVENT	   = 0x15,
+ 	MLX5_EVENT_TYPE_PORT_MODULE_EVENT  = 0x16,
+ 	MLX5_EVENT_TYPE_REMOTE_CONFIG	   = 0x19,
++	MLX5_EVENT_TYPE_GENERAL_EVENT	   = 0x22,
+ 	MLX5_EVENT_TYPE_PPS_EVENT          = 0x25,
+ 
+ 	MLX5_EVENT_TYPE_DB_BF_CONGESTION   = 0x1a,
+@@ -292,6 +293,10 @@ enum mlx5_event {
+ 	MLX5_EVENT_TYPE_NIC_VPORT_CHANGE   = 0xd,
+ };
+ 
++enum {
++	MLX5_GENERAL_SUBTYPE_DELAY_DROP_TIMEOUT = 0x1,
++};
++
+ enum {
+ 	MLX5_PORT_CHANGE_SUBTYPE_DOWN		= 1,
+ 	MLX5_PORT_CHANGE_SUBTYPE_ACTIVE		= 4,
+diff --git a/include/linux/mlx5/driver.h b/include/linux/mlx5/driver.h
+index 522c3e2f587a..cf95b0ea8de5 100644
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@ -183,6 +183,7 @@ enum mlx5_dev_event {
+ 	MLX5_DEV_EVENT_GUID_CHANGE,
+ 	MLX5_DEV_EVENT_CLIENT_REREG,
+ 	MLX5_DEV_EVENT_PPS,
++	MLX5_DEV_EVENT_DELAY_DROP_TIMEOUT,
+ };
+ 
+ enum mlx5_port_status {
+* Unmerged path include/linux/mlx5/mlx5_ifc.h
