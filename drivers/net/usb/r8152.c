@@ -2536,14 +2536,6 @@ static void rtl8152_disable(struct r8152 *tp)
 
 static void r8152b_hw_phy_cfg(struct r8152 *tp)
 {
-	u16 data;
-
-	data = r8152_mdio_read(tp, MII_BMCR);
-	if (data & BMCR_PDOWN) {
-		data &= ~BMCR_PDOWN;
-		r8152_mdio_write(tp, MII_BMCR, data);
-	}
-
 	set_bit(PHY_RESET, &tp->flags);
 }
 
@@ -2680,16 +2672,6 @@ static void r8153_hw_phy_cfg(struct r8152 *tp)
 {
 	u32 ocp_data;
 	u16 data;
-
-	if (tp->version == RTL_VER_03 || tp->version == RTL_VER_04 ||
-	    tp->version == RTL_VER_05)
-		ocp_reg_write(tp, OCP_ADC_CFG, CKADSEL_L | ADC_EN | EN_EMI_L);
-
-	data = r8152_mdio_read(tp, MII_BMCR);
-	if (data & BMCR_PDOWN) {
-		data &= ~BMCR_PDOWN;
-		r8152_mdio_write(tp, MII_BMCR, data);
-	}
 
 	if (tp->version == RTL_VER_03) {
 		data = ocp_reg_read(tp, OCP_EEE_CFG);
@@ -3327,9 +3309,16 @@ static void rtl_tally_reset(struct r8152 *tp)
 static void r8152b_init(struct r8152 *tp)
 {
 	u32 ocp_data;
+	u16 data;
 
 	if (test_bit(RTL8152_UNPLUG, &tp->flags))
 		return;
+
+	data = r8152_mdio_read(tp, MII_BMCR);
+	if (data & BMCR_PDOWN) {
+		data &= ~BMCR_PDOWN;
+		r8152_mdio_write(tp, MII_BMCR, data);
+	}
 
 	r8152_aldps_en(tp, false);
 
@@ -3366,6 +3355,7 @@ static void r8152b_init(struct r8152 *tp)
 static void r8153_init(struct r8152 *tp)
 {
 	u32 ocp_data;
+	u16 data;
 	int i;
 
 	if (test_bit(RTL8152_UNPLUG, &tp->flags))
@@ -3384,6 +3374,23 @@ static void r8153_init(struct r8152 *tp)
 	for (i = 0; i < 500; i++) {
 		ocp_data = ocp_reg_read(tp, OCP_PHY_STATUS) & PHY_STAT_MASK;
 		if (ocp_data == PHY_STAT_LAN_ON || ocp_data == PHY_STAT_PWRDN)
+			break;
+		msleep(20);
+	}
+
+	if (tp->version == RTL_VER_03 || tp->version == RTL_VER_04 ||
+	    tp->version == RTL_VER_05)
+		ocp_reg_write(tp, OCP_ADC_CFG, CKADSEL_L | ADC_EN | EN_EMI_L);
+
+	data = r8152_mdio_read(tp, MII_BMCR);
+	if (data & BMCR_PDOWN) {
+		data &= ~BMCR_PDOWN;
+		r8152_mdio_write(tp, MII_BMCR, data);
+	}
+
+	for (i = 0; i < 500; i++) {
+		ocp_data = ocp_reg_read(tp, OCP_PHY_STATUS) & PHY_STAT_MASK;
+		if (ocp_data == PHY_STAT_LAN_ON)
 			break;
 		msleep(20);
 	}
