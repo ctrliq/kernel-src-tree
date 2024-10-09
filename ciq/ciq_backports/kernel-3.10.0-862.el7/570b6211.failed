@@ -1,0 +1,227 @@
+xfs: use xfs_zero_range in xfs_zero_eof
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 570b6211b85692f408cbe47664ab2378eb9519ff
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/570b6211.failed
+
+We now skip holes in it, so no need to have the caller do it as well.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+
+(cherry picked from commit 570b6211b85692f408cbe47664ab2378eb9519ff)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_file.c
+diff --cc fs/xfs/xfs_file.c
+index 4da908a64865,713991c22781..000000000000
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@@ -502,112 -380,7 +502,115 @@@ out
+  	return ret;
+  }
+  
+ +static ssize_t
+ +xfs_file_splice_write_actor(
+ +	struct pipe_inode_info	*pipe,
+ +	struct splice_desc	*sd)
+ +{
+ +	struct file		*out = sd->u.file;
+ +	ssize_t ret;
+ +
+ +	ret = file_remove_privs(out);
+ +	if (!ret) {
+ +		file_update_time(out);
+ +		ret = splice_from_pipe_feed(pipe, sd, pipe_to_file);
+ +	}
+ +
+ +	return ret;
+ +}
+ +
+ +/*
+ + * xfs_file_splice_write() does not use the generic file splice write path
+ + * because that takes the i_mutex, causing lock inversions with the IOLOCK.
+ + * Instead, we call splice_write_to_file() directly with our own actor that does
+ + * not take the i_mutex. This allows us to use the xfs_rw_ilock() functions like
+ + * the rest of the code and hence avoid lock inversions and deadlocks.
+ + */
+ +STATIC ssize_t
+ +xfs_file_splice_write(
+ +	struct pipe_inode_info	*pipe,
+ +	struct file		*outfilp,
+ +	loff_t			*ppos,
+ +	size_t			count,
+ +	unsigned int		flags)
+ +{
+ +	struct inode		*inode = outfilp->f_mapping->host;
+ +	struct xfs_inode	*ip = XFS_I(inode);
+ +	ssize_t			ret;
+ +
+ +	/*
+ +	 * For dax, we need to avoid the page cache.  Locking and stats will
+ +	 * be handled in xfs_file_dio_aio_write().
+ +	 */
+ +	if (IS_DAX(inode))
+ +		return default_file_splice_write(pipe, outfilp, ppos, count,
+ +				flags);
+ +
+ +	XFS_STATS_INC(ip->i_mount, xs_write_calls);
+ +
+ +	if (XFS_FORCED_SHUTDOWN(ip->i_mount))
+ +		return -EIO;
+ +
+ +	xfs_rw_ilock(ip, XFS_IOLOCK_EXCL);
+ +
+ +	trace_xfs_file_splice_write(ip, count, *ppos);
+ +
+ +	ret = splice_write_to_file(pipe, outfilp, ppos, count, flags,
+ +					xfs_file_splice_write_actor);
+ +	if (ret > 0)
+ +		XFS_STATS_ADD(ip->i_mount, xs_write_bytes, ret);
+ +
+ +	xfs_rw_iunlock(ip, XFS_IOLOCK_EXCL);
+ +	return ret;
+ +}
+ +
+ +/*
+++<<<<<<< HEAD
+ + * This routine is called to handle zeroing any space in the last block of the
+ + * file that is beyond the EOF.  We do this since the size is being increased
+ + * without writing anything to that block and we don't want to read the
+ + * garbage on the disk.
+ + */
+ +STATIC int				/* error (positive) */
+ +xfs_zero_last_block(
+ +	struct xfs_inode	*ip,
+ +	xfs_fsize_t		offset,
+ +	xfs_fsize_t		isize,
+ +	bool			*did_zeroing)
+ +{
+ +	struct xfs_mount	*mp = ip->i_mount;
+ +	xfs_fileoff_t		last_fsb = XFS_B_TO_FSBT(mp, isize);
+ +	int			zero_offset = XFS_B_FSB_OFFSET(mp, isize);
+ +	int			zero_len;
+ +	int			nimaps = 1;
+ +	int			error = 0;
+ +	struct xfs_bmbt_irec	imap;
+ +
+ +	xfs_ilock(ip, XFS_ILOCK_EXCL);
+ +	error = xfs_bmapi_read(ip, last_fsb, 1, &imap, &nimaps, 0);
+ +	xfs_iunlock(ip, XFS_ILOCK_EXCL);
+ +	if (error)
+ +		return error;
+ +
+ +	ASSERT(nimaps > 0);
+ +
+ +	/*
+ +	 * If the block underlying isize is just a hole, then there
+ +	 * is nothing to zero.
+ +	 */
+ +	if (imap.br_startblock == HOLESTARTBLOCK)
+ +		return 0;
+ +
+ +	zero_len = mp->m_sb.sb_blocksize - zero_offset;
+ +	if (isize + zero_len > offset)
+ +		zero_len = offset - isize;
+ +	*did_zeroing = true;
+ +	return xfs_iozero(ip, isize, zero_len);
+ +}
+ +
+  /*
+++=======
+++>>>>>>> 570b6211b856 (xfs: use xfs_zero_range in xfs_zero_eof)
+   * Zero any on disk space between the current EOF and the new, larger EOF.
+   *
+   * This handles the normal case of zeroing the remainder of the last block in
+@@@ -640,79 -402,7 +632,83 @@@ xfs_zero_eof
+  	ASSERT(offset > isize);
+  
+  	trace_xfs_zero_eof(ip, isize, offset - isize);
+++<<<<<<< HEAD
+ +
+ +	/*
+ +	 * First handle zeroing the block on which isize resides.
+ +	 *
+ +	 * We only zero a part of that block so it is handled specially.
+ +	 */
+ +	if (XFS_B_FSB_OFFSET(mp, isize) != 0) {
+ +		error = xfs_zero_last_block(ip, offset, isize, did_zeroing);
+ +		if (error)
+ +			return error;
+ +	}
+ +
+ +	/*
+ +	 * Calculate the range between the new size and the old where blocks
+ +	 * needing to be zeroed may exist.
+ +	 *
+ +	 * To get the block where the last byte in the file currently resides,
+ +	 * we need to subtract one from the size and truncate back to a block
+ +	 * boundary.  We subtract 1 in case the size is exactly on a block
+ +	 * boundary.
+ +	 */
+ +	last_fsb = isize ? XFS_B_TO_FSBT(mp, isize - 1) : (xfs_fileoff_t)-1;
+ +	start_zero_fsb = XFS_B_TO_FSB(mp, (xfs_ufsize_t)isize);
+ +	end_zero_fsb = XFS_B_TO_FSBT(mp, offset - 1);
+ +	ASSERT((xfs_sfiloff_t)last_fsb < (xfs_sfiloff_t)start_zero_fsb);
+ +	if (last_fsb == end_zero_fsb) {
+ +		/*
+ +		 * The size was only incremented on its last block.
+ +		 * We took care of that above, so just return.
+ +		 */
+ +		return 0;
+ +	}
+ +
+ +	ASSERT(start_zero_fsb <= end_zero_fsb);
+ +	while (start_zero_fsb <= end_zero_fsb) {
+ +		nimaps = 1;
+ +		zero_count_fsb = end_zero_fsb - start_zero_fsb + 1;
+ +
+ +		xfs_ilock(ip, XFS_ILOCK_EXCL);
+ +		error = xfs_bmapi_read(ip, start_zero_fsb, zero_count_fsb,
+ +					  &imap, &nimaps, 0);
+ +		xfs_iunlock(ip, XFS_ILOCK_EXCL);
+ +		if (error)
+ +			return error;
+ +
+ +		ASSERT(nimaps > 0);
+ +
+ +		if (imap.br_state == XFS_EXT_UNWRITTEN ||
+ +		    imap.br_startblock == HOLESTARTBLOCK) {
+ +			start_zero_fsb = imap.br_startoff + imap.br_blockcount;
+ +			ASSERT(start_zero_fsb <= (end_zero_fsb + 1));
+ +			continue;
+ +		}
+ +
+ +		/*
+ +		 * There are blocks we need to zero.
+ +		 */
+ +		zero_off = XFS_FSB_TO_B(mp, start_zero_fsb);
+ +		zero_len = XFS_FSB_TO_B(mp, imap.br_blockcount);
+ +
+ +		if ((zero_off + zero_len) > offset)
+ +			zero_len = offset - zero_off;
+ +
+ +		error = xfs_iozero(ip, zero_off, zero_len);
+ +		if (error)
+ +			return error;
+ +
+ +		*did_zeroing = true;
+ +		start_zero_fsb = imap.br_startoff + imap.br_blockcount;
+ +		ASSERT(start_zero_fsb <= (end_zero_fsb + 1));
+ +	}
+ +
+ +	return 0;
+++=======
++ 	return xfs_zero_range(ip, isize, offset - isize, did_zeroing);
+++>>>>>>> 570b6211b856 (xfs: use xfs_zero_range in xfs_zero_eof)
+  }
+  
+  /*
+* Unmerged path fs/xfs/xfs_file.c
