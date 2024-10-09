@@ -1,0 +1,115 @@
+net/mlx5e: Adjust to max number of channles when re-attaching
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Adjust to max number of channles when re-attaching (Alaa Hleihel) [1642498]
+Rebuild_FUZZ: 96.61%
+commit-author Yuval Avnery <yuvalav@mellanox.com>
+commit a1f240f1801721f76bee734c50df2d9529da86e0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/a1f240f1.failed
+
+When core driver enters deattach/attach flow after pci reset,
+Number of logical CPUs may have changed.
+As a result we need to update the cpu affiliated resource tables.
+	1. indirect rqt list
+	2. eq table
+
+Reproduction (PowerPC):
+	echo 1000 > /sys/kernel/debug/powerpc/eeh_max_freezes
+	ppc64_cpu --smt=on
+	# Restart driver
+	modprobe -r ... ; modprobe ...
+	# Link up
+	ifconfig ...
+	# Only physical CPUs
+	ppc64_cpu --smt=off
+	# Inject PCI errors so PCI will reset - calling the pci error handler
+	echo 0x8000000000000000 > /sys/kernel/debug/powerpc/<PCI BUS>/err_injct_inboundA
+
+Call trace when trying to add non-existing rqs to an indirect rqt:
+	mlx5e_redirect_rqt+0x84/0x260 [mlx5_core] (unreliable)
+	mlx5e_redirect_rqts+0x188/0x190 [mlx5_core]
+	mlx5e_activate_priv_channels+0x488/0x570 [mlx5_core]
+	mlx5e_open_locked+0xbc/0x140 [mlx5_core]
+	mlx5e_open+0x50/0x130 [mlx5_core]
+	mlx5e_nic_enable+0x174/0x1b0 [mlx5_core]
+	mlx5e_attach_netdev+0x154/0x290 [mlx5_core]
+	mlx5e_attach+0x88/0xd0 [mlx5_core]
+	mlx5_attach_device+0x168/0x1e0 [mlx5_core]
+	mlx5_load_one+0x1140/0x1210 [mlx5_core]
+	mlx5_pci_resume+0x6c/0xf0 [mlx5_core]
+
+Create cq will fail when trying to use non-existing EQ.
+
+Fixes: 89d44f0a6c73 ("net/mlx5_core: Add pci error handlers to mlx5_core driver")
+	Signed-off-by: Yuval Avnery <yuvalav@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit a1f240f1801721f76bee734c50df2d9529da86e0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 489704305daa,25b09bb68e8b..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -1403,8 -1689,12 +1405,12 @@@ static int mlx5e_create_cq(struct mlx5e
+  	int eqn;
+  	int err;
+  
++ 	err = mlx5_vector2eqn(mdev, param->eq_ix, &eqn, &irqn_not_used);
++ 	if (err)
++ 		return err;
++ 
+  	inlen = MLX5_ST_SZ_BYTES(create_cq_in) +
+ -		sizeof(u64) * cq->wq_ctrl.buf.npages;
+ +		sizeof(u64) * cq->wq_ctrl.frag_buf.npages;
+  	in = kvzalloc(inlen, GFP_KERNEL);
+  	if (!in)
+  		return -ENOMEM;
+@@@ -1413,11 -1703,9 +1419,9 @@@
+  
+  	memcpy(cqc, param->cqc, sizeof(param->cqc));
+  
+ -	mlx5_fill_page_frag_array(&cq->wq_ctrl.buf,
+ +	mlx5_fill_page_frag_array(&cq->wq_ctrl.frag_buf,
+  				  (__be64 *)MLX5_ADDR_OF(create_cq_in, in, pas));
+  
+- 	mlx5_vector2eqn(mdev, param->eq_ix, &eqn, &irqn_not_used);
+- 
+  	MLX5_SET(cqc,   cqc, cq_period_mode, param->cq_period_mode);
+  	MLX5_SET(cqc,   cqc, c_eqn,         eqn);
+  	MLX5_SET(cqc,   cqc, uar_page,      mdev->priv.uar->index);
+@@@ -1637,7 -1925,11 +1641,15 @@@ static int mlx5e_open_channel(struct ml
+  	int err;
+  	int eqn;
+  
+++<<<<<<< HEAD
+ +	c = kzalloc_node(sizeof(*c), GFP_KERNEL, cpu_to_node(cpu));
+++=======
++ 	err = mlx5_vector2eqn(priv->mdev, ix, &eqn, &irq);
++ 	if (err)
++ 		return err;
++ 
++ 	c = kvzalloc_node(sizeof(*c), GFP_KERNEL, cpu_to_node(cpu));
+++>>>>>>> a1f240f18017 (net/mlx5e: Adjust to max number of channles when re-attaching)
+  	if (!c)
+  		return -ENOMEM;
+  
+@@@ -1653,10 -1945,7 +1665,13 @@@
+  	c->xdp      = !!params->xdp_prog;
+  	c->stats    = &priv->channel_stats[ix].ch;
+  
+++<<<<<<< HEAD
+ +	mlx5_vector2eqn(priv->mdev, ix, &eqn, &irq);
+ +#ifdef CONFIG_GENERIC_HARDIRQS
+++=======
+++>>>>>>> a1f240f18017 (net/mlx5e: Adjust to max number of channles when re-attaching)
+  	c->irq_desc = irq_to_desc(irq);
+ +#endif
+  
+  	netif_napi_add(netdev, &c->napi, mlx5e_napi_poll, 64);
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
