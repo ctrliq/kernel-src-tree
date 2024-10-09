@@ -1,0 +1,103 @@
+kvm: x86: mmu: Set SPTE_SPECIAL_MASK within mmu.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Junaid Shahid <junaids@google.com>
+commit 312b616b30d87581b88d3db54c14ed89610cc97b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/312b616b.failed
+
+Instead of the caller including the SPTE_SPECIAL_MASK in the masks being
+supplied to kvm_mmu_set_mmio_spte_mask() and kvm_mmu_set_mask_ptes(),
+those functions now themselves include the SPTE_SPECIAL_MASK.
+
+Note that bit 63 is now reset in the default MMIO mask.
+
+	Signed-off-by: Junaid Shahid <junaids@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 312b616b30d87581b88d3db54c14ed89610cc97b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index ff955649c150,d850d5d36182..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -4832,12 -5236,11 +4832,10 @@@ static void ept_set_mmio_spte_mask(void
+  	/*
+  	 * EPT Misconfigurations can be generated if the value of bits 2:0
+  	 * of an EPT paging-structure entry is 110b (write/execute).
+- 	 * Also, special bit (62) is set to quickly identify mmio spte.
+  	 */
+- 	kvm_mmu_set_mmio_spte_mask(SPTE_SPECIAL_MASK |
+- 				   VMX_EPT_MISCONFIG_WX_VALUE);
++ 	kvm_mmu_set_mmio_spte_mask(VMX_EPT_MISCONFIG_WX_VALUE);
+  }
+  
+ -#define VMX_XSS_EXIT_BITMAP 0
+  /*
+   * Sets up the vmcs for emulated real mode.
+   */
+@@@ -6173,6 -6576,19 +6171,22 @@@ static void wakeup_handler(void
+  	spin_unlock(&per_cpu(blocked_vcpu_on_cpu_lock, cpu));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void vmx_enable_tdp(void)
++ {
++ 	kvm_mmu_set_mask_ptes(VMX_EPT_READABLE_MASK,
++ 		enable_ept_ad_bits ? VMX_EPT_ACCESS_BIT : 0ull,
++ 		enable_ept_ad_bits ? VMX_EPT_DIRTY_BIT : 0ull,
++ 		0ull, VMX_EPT_EXECUTABLE_MASK,
++ 		cpu_has_vmx_ept_execute_only() ? 0ull : VMX_EPT_READABLE_MASK,
++ 		enable_ept_ad_bits ? 0ull : VMX_EPT_RWX_MASK);
++ 
++ 	ept_set_mmio_spte_mask();
++ 	kvm_enable_tdp();
++ }
++ 
+++>>>>>>> 312b616b30d8 (kvm: x86: mmu: Set SPTE_SPECIAL_MASK within mmu.c)
+  static __init int hardware_setup(void)
+  {
+  	int r = -ENOMEM, i, msr;
+diff --git a/arch/x86/kvm/mmu.c b/arch/x86/kvm/mmu.c
+index 7460413d4173..f48899102013 100644
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@ -182,7 +182,7 @@ static void mmu_free_roots(struct kvm_vcpu *vcpu);
+ 
+ void kvm_mmu_set_mmio_spte_mask(u64 mmio_mask)
+ {
+-	shadow_mmio_mask = mmio_mask;
++	shadow_mmio_mask = mmio_mask | SPTE_SPECIAL_MASK;
+ }
+ EXPORT_SYMBOL_GPL(kvm_mmu_set_mmio_spte_mask);
+ 
+@@ -285,6 +285,9 @@ static bool check_mmio_spte(struct kvm_vcpu *vcpu, u64 spte)
+ void kvm_mmu_set_mask_ptes(u64 user_mask, u64 accessed_mask,
+ 		u64 dirty_mask, u64 nx_mask, u64 x_mask, u64 p_mask)
+ {
++	if (acc_track_mask != 0)
++		acc_track_mask |= SPTE_SPECIAL_MASK;
++
+ 	shadow_user_mask = user_mask;
+ 	shadow_accessed_mask = accessed_mask;
+ 	shadow_dirty_mask = dirty_mask;
+* Unmerged path arch/x86/kvm/vmx.c
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 99e230533b87..da0daf9edb33 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -5813,9 +5813,6 @@ static void kvm_set_mmio_spte_mask(void)
+ 	 /* Mask the reserved physical address bits. */
+ 	mask = rsvd_bits(maxphyaddr, 51);
+ 
+-	/* Bit 62 is always reserved for 32bit host. */
+-	mask |= 0x3ull << 62;
+-
+ 	/* Set the present bit. */
+ 	mask |= 1ull;
+ 
