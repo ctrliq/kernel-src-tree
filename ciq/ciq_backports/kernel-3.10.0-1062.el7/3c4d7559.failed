@@ -1,0 +1,1726 @@
+tls: kernel TLS support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Dave Watson <davejwatson@fb.com>
+commit 3c4d7559159bfe1e3b94df3a657b2cda3a34e218
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/3c4d7559.failed
+
+Software implementation of transport layer security, implemented using ULP
+infrastructure.  tcp proto_ops are replaced with tls equivalents of sendmsg and
+sendpage.
+
+Only symmetric crypto is done in the kernel, keys are passed by setsockopt
+after the handshake is complete.  All control messages are supported via CMSG
+data - the actual symmetric encryption is the same, just the message type needs
+to be passed separately.
+
+For user API, please see Documentation patch.
+
+Pieces that can be shared between hw and sw implementation
+are in tls_main.c
+
+	Signed-off-by: Boris Pismenny <borisp@mellanox.com>
+	Signed-off-by: Ilya Lesokhin <ilyal@mellanox.com>
+	Signed-off-by: Aviad Yehezkel <aviadye@mellanox.com>
+	Signed-off-by: Dave Watson <davejwatson@fb.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3c4d7559159bfe1e3b94df3a657b2cda3a34e218)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/socket.h
+diff --cc include/linux/socket.h
+index 17a909a7432e,8b13db5163cc..000000000000
+--- a/include/linux/socket.h
++++ b/include/linux/socket.h
+@@@ -301,6 -333,8 +301,11 @@@ struct ucred 
+  #define SOL_CAIF	278
+  #define SOL_ALG		279
+  #define SOL_NFC		280
+++<<<<<<< HEAD
+++=======
++ #define SOL_KCM		281
++ #define SOL_TLS		282
+++>>>>>>> 3c4d7559159b (tls: kernel TLS support)
+  
+  /* IPX options */
+  #define IPX_TYPE	1
+diff --git a/MAINTAINERS b/MAINTAINERS
+index fe4f04bf548a..53d523ddda84 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -6061,6 +6061,16 @@ F:	net/ipv6/
+ F:	include/net/ip*
+ F:	arch/x86/net/*
+ 
++NETWORKING [TLS]
++M:	Ilya Lesokhin <ilyal@mellanox.com>
++M:	Aviad Yehezkel <aviadye@mellanox.com>
++M:	Dave Watson <davejwatson@fb.com>
++L:	netdev@vger.kernel.org
++S:	Maintained
++F:	net/tls/*
++F:	include/uapi/linux/tls.h
++F:	include/net/tls.h
++
+ NETWORKING [IPSEC]
+ M:	Steffen Klassert <steffen.klassert@secunet.com>
+ M:	Herbert Xu <herbert@gondor.apana.org.au>
+* Unmerged path include/linux/socket.h
+diff --git a/include/net/tls.h b/include/net/tls.h
+new file mode 100644
+index 000000000000..b89d397dd62f
+--- /dev/null
++++ b/include/net/tls.h
+@@ -0,0 +1,237 @@
++/*
++ * Copyright (c) 2016-2017, Mellanox Technologies. All rights reserved.
++ * Copyright (c) 2016-2017, Dave Watson <davejwatson@fb.com>. All rights reserved.
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the
++ * OpenIB.org BSD license below:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      - Redistributions of source code must retain the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer.
++ *
++ *      - Redistributions in binary form must reproduce the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer in the documentation and/or other materials
++ *        provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#ifndef _TLS_OFFLOAD_H
++#define _TLS_OFFLOAD_H
++
++#include <linux/types.h>
++
++#include <uapi/linux/tls.h>
++
++
++/* Maximum data size carried in a TLS record */
++#define TLS_MAX_PAYLOAD_SIZE		((size_t)1 << 14)
++
++#define TLS_HEADER_SIZE			5
++#define TLS_NONCE_OFFSET		TLS_HEADER_SIZE
++
++#define TLS_CRYPTO_INFO_READY(info)	((info)->cipher_type)
++
++#define TLS_RECORD_TYPE_DATA		0x17
++
++#define TLS_AAD_SPACE_SIZE		13
++
++struct tls_sw_context {
++	struct crypto_aead *aead_send;
++
++	/* Sending context */
++	char aad_space[TLS_AAD_SPACE_SIZE];
++
++	unsigned int sg_plaintext_size;
++	int sg_plaintext_num_elem;
++	struct scatterlist sg_plaintext_data[MAX_SKB_FRAGS];
++
++	unsigned int sg_encrypted_size;
++	int sg_encrypted_num_elem;
++	struct scatterlist sg_encrypted_data[MAX_SKB_FRAGS];
++
++	/* AAD | sg_plaintext_data | sg_tag */
++	struct scatterlist sg_aead_in[2];
++	/* AAD | sg_encrypted_data (data contain overhead for hdr&iv&tag) */
++	struct scatterlist sg_aead_out[2];
++};
++
++enum {
++	TLS_PENDING_CLOSED_RECORD
++};
++
++struct tls_context {
++	union {
++		struct tls_crypto_info crypto_send;
++		struct tls12_crypto_info_aes_gcm_128 crypto_send_aes_gcm_128;
++	};
++
++	void *priv_ctx;
++
++	u16 prepend_size;
++	u16 tag_size;
++	u16 overhead_size;
++	u16 iv_size;
++	char *iv;
++	u16 rec_seq_size;
++	char *rec_seq;
++
++	struct scatterlist *partially_sent_record;
++	u16 partially_sent_offset;
++	unsigned long flags;
++
++	u16 pending_open_record_frags;
++	int (*push_pending_record)(struct sock *sk, int flags);
++	void (*free_resources)(struct sock *sk);
++
++	void (*sk_write_space)(struct sock *sk);
++	void (*sk_proto_close)(struct sock *sk, long timeout);
++
++	int  (*setsockopt)(struct sock *sk, int level,
++			   int optname, char __user *optval,
++			   unsigned int optlen);
++	int  (*getsockopt)(struct sock *sk, int level,
++			   int optname, char __user *optval,
++			   int __user *optlen);
++};
++
++int wait_on_pending_writer(struct sock *sk, long *timeo);
++int tls_sk_query(struct sock *sk, int optname, char __user *optval,
++		int __user *optlen);
++int tls_sk_attach(struct sock *sk, int optname, char __user *optval,
++		  unsigned int optlen);
++
++
++int tls_set_sw_offload(struct sock *sk, struct tls_context *ctx);
++int tls_sw_sendmsg(struct sock *sk, struct msghdr *msg, size_t size);
++int tls_sw_sendpage(struct sock *sk, struct page *page,
++		    int offset, size_t size, int flags);
++void tls_sw_close(struct sock *sk, long timeout);
++
++void tls_sk_destruct(struct sock *sk, struct tls_context *ctx);
++void tls_icsk_clean_acked(struct sock *sk);
++
++int tls_push_sg(struct sock *sk, struct tls_context *ctx,
++		struct scatterlist *sg, u16 first_offset,
++		int flags);
++int tls_push_pending_closed_record(struct sock *sk, struct tls_context *ctx,
++				   int flags, long *timeo);
++
++static inline bool tls_is_pending_closed_record(struct tls_context *ctx)
++{
++	return test_bit(TLS_PENDING_CLOSED_RECORD, &ctx->flags);
++}
++
++static inline int tls_complete_pending_work(struct sock *sk,
++					    struct tls_context *ctx,
++					    int flags, long *timeo)
++{
++	int rc = 0;
++
++	if (unlikely(sk->sk_write_pending))
++		rc = wait_on_pending_writer(sk, timeo);
++
++	if (!rc && tls_is_pending_closed_record(ctx))
++		rc = tls_push_pending_closed_record(sk, ctx, flags, timeo);
++
++	return rc;
++}
++
++static inline bool tls_is_partially_sent_record(struct tls_context *ctx)
++{
++	return !!ctx->partially_sent_record;
++}
++
++static inline bool tls_is_pending_open_record(struct tls_context *tls_ctx)
++{
++	return tls_ctx->pending_open_record_frags;
++}
++
++static inline void tls_err_abort(struct sock *sk)
++{
++	sk->sk_err = -EBADMSG;
++	sk->sk_error_report(sk);
++}
++
++static inline bool tls_bigint_increment(unsigned char *seq, int len)
++{
++	int i;
++
++	for (i = len - 1; i >= 0; i--) {
++		++seq[i];
++		if (seq[i] != 0)
++			break;
++	}
++
++	return (i == -1);
++}
++
++static inline void tls_advance_record_sn(struct sock *sk,
++					 struct tls_context *ctx)
++{
++	if (tls_bigint_increment(ctx->rec_seq, ctx->rec_seq_size))
++		tls_err_abort(sk);
++	tls_bigint_increment(ctx->iv + TLS_CIPHER_AES_GCM_128_SALT_SIZE,
++			     ctx->iv_size);
++}
++
++static inline void tls_fill_prepend(struct tls_context *ctx,
++			     char *buf,
++			     size_t plaintext_len,
++			     unsigned char record_type)
++{
++	size_t pkt_len, iv_size = ctx->iv_size;
++
++	pkt_len = plaintext_len + iv_size + ctx->tag_size;
++
++	/* we cover nonce explicit here as well, so buf should be of
++	 * size KTLS_DTLS_HEADER_SIZE + KTLS_DTLS_NONCE_EXPLICIT_SIZE
++	 */
++	buf[0] = record_type;
++	buf[1] = TLS_VERSION_MINOR(ctx->crypto_send.version);
++	buf[2] = TLS_VERSION_MAJOR(ctx->crypto_send.version);
++	/* we can use IV for nonce explicit according to spec */
++	buf[3] = pkt_len >> 8;
++	buf[4] = pkt_len & 0xFF;
++	memcpy(buf + TLS_NONCE_OFFSET,
++	       ctx->iv + TLS_CIPHER_AES_GCM_128_SALT_SIZE, iv_size);
++}
++
++static inline struct tls_context *tls_get_ctx(const struct sock *sk)
++{
++	struct inet_connection_sock *icsk = inet_csk(sk);
++
++	return icsk->icsk_ulp_data;
++}
++
++static inline struct tls_sw_context *tls_sw_ctx(
++		const struct tls_context *tls_ctx)
++{
++	return (struct tls_sw_context *)tls_ctx->priv_ctx;
++}
++
++static inline struct tls_offload_context *tls_offload_ctx(
++		const struct tls_context *tls_ctx)
++{
++	return (struct tls_offload_context *)tls_ctx->priv_ctx;
++}
++
++int tls_proccess_cmsg(struct sock *sk, struct msghdr *msg,
++		      unsigned char *record_type);
++
++#endif /* _TLS_OFFLOAD_H */
+diff --git a/include/uapi/linux/tls.h b/include/uapi/linux/tls.h
+new file mode 100644
+index 000000000000..cc1d21db35d8
+--- /dev/null
++++ b/include/uapi/linux/tls.h
+@@ -0,0 +1,79 @@
++/*
++ * Copyright (c) 2016-2017, Mellanox Technologies. All rights reserved.
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the
++ * OpenIB.org BSD license below:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      - Redistributions of source code must retain the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer.
++ *
++ *      - Redistributions in binary form must reproduce the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer in the documentation and/or other materials
++ *        provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#ifndef _UAPI_LINUX_TLS_H
++#define _UAPI_LINUX_TLS_H
++
++#include <linux/types.h>
++#include <asm/byteorder.h>
++#include <linux/socket.h>
++#include <linux/tcp.h>
++#include <net/tcp.h>
++
++/* TLS socket options */
++#define TLS_TX			1	/* Set transmit parameters */
++
++/* Supported versions */
++#define TLS_VERSION_MINOR(ver)	((ver) & 0xFF)
++#define TLS_VERSION_MAJOR(ver)	(((ver) >> 8) & 0xFF)
++
++#define TLS_VERSION_NUMBER(id)	((((id##_VERSION_MAJOR) & 0xFF) << 8) |	\
++				 ((id##_VERSION_MINOR) & 0xFF))
++
++#define TLS_1_2_VERSION_MAJOR	0x3
++#define TLS_1_2_VERSION_MINOR	0x3
++#define TLS_1_2_VERSION		TLS_VERSION_NUMBER(TLS_1_2)
++
++/* Supported ciphers */
++#define TLS_CIPHER_AES_GCM_128				51
++#define TLS_CIPHER_AES_GCM_128_IV_SIZE			8
++#define TLS_CIPHER_AES_GCM_128_KEY_SIZE		16
++#define TLS_CIPHER_AES_GCM_128_SALT_SIZE		4
++#define TLS_CIPHER_AES_GCM_128_TAG_SIZE		16
++#define TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE		8
++
++#define TLS_SET_RECORD_TYPE	1
++
++struct tls_crypto_info {
++	__u16 version;
++	__u16 cipher_type;
++};
++
++struct tls12_crypto_info_aes_gcm_128 {
++	struct tls_crypto_info info;
++	unsigned char iv[TLS_CIPHER_AES_GCM_128_IV_SIZE];
++	unsigned char key[TLS_CIPHER_AES_GCM_128_KEY_SIZE];
++	unsigned char salt[TLS_CIPHER_AES_GCM_128_SALT_SIZE];
++	unsigned char rec_seq[TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE];
++};
++
++#endif /* _UAPI_LINUX_TLS_H */
+diff --git a/net/Kconfig b/net/Kconfig
+index f96c133747b9..c70cd171859e 100644
+--- a/net/Kconfig
++++ b/net/Kconfig
+@@ -54,6 +54,7 @@ menu "Networking options"
+ 
+ source "net/packet/Kconfig"
+ source "net/unix/Kconfig"
++source "net/tls/Kconfig"
+ source "net/xfrm/Kconfig"
+ source "net/iucv/Kconfig"
+ 
+diff --git a/net/Makefile b/net/Makefile
+index 07facc853fad..aeade0b352eb 100644
+--- a/net/Makefile
++++ b/net/Makefile
+@@ -18,6 +18,7 @@ obj-$(CONFIG_BPF_SYSCALL)	+= bpf/
+ endif
+ obj-$(CONFIG_NETFILTER)		+= netfilter/
+ obj-$(CONFIG_INET)		+= ipv4/
++obj-$(CONFIG_TLS)		+= tls/
+ obj-$(CONFIG_XFRM)		+= xfrm/
+ obj-$(CONFIG_UNIX)		+= unix/
+ obj-$(CONFIG_NET)		+= ipv6/
+diff --git a/net/tls/Kconfig b/net/tls/Kconfig
+new file mode 100644
+index 000000000000..61e532964c82
+--- /dev/null
++++ b/net/tls/Kconfig
+@@ -0,0 +1,12 @@
++#
++# TLS configuration
++#
++config TLS
++	tristate "Transport Layer Security support"
++	depends on NET
++	default m
++	---help---
++	Enable kernel support for TLS protocol. This allows symmetric
++	encryption handling of the TLS protocol to be done in-kernel.
++
++	If unsure, say M.
+diff --git a/net/tls/Makefile b/net/tls/Makefile
+new file mode 100644
+index 000000000000..a930fd1c4f7b
+--- /dev/null
++++ b/net/tls/Makefile
+@@ -0,0 +1,7 @@
++#
++# Makefile for the TLS subsystem.
++#
++
++obj-$(CONFIG_TLS) += tls.o
++
++tls-y := tls_main.o tls_sw.o
+diff --git a/net/tls/tls_main.c b/net/tls/tls_main.c
+new file mode 100644
+index 000000000000..2ebc328bda96
+--- /dev/null
++++ b/net/tls/tls_main.c
+@@ -0,0 +1,487 @@
++/*
++ * Copyright (c) 2016-2017, Mellanox Technologies. All rights reserved.
++ * Copyright (c) 2016-2017, Dave Watson <davejwatson@fb.com>. All rights reserved.
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the
++ * OpenIB.org BSD license below:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      - Redistributions of source code must retain the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer.
++ *
++ *      - Redistributions in binary form must reproduce the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer in the documentation and/or other materials
++ *        provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#include <linux/module.h>
++
++#include <net/tcp.h>
++#include <net/inet_common.h>
++#include <linux/highmem.h>
++#include <linux/netdevice.h>
++#include <linux/sched/signal.h>
++
++#include <net/tls.h>
++
++MODULE_AUTHOR("Mellanox Technologies");
++MODULE_DESCRIPTION("Transport Layer Security Support");
++MODULE_LICENSE("Dual BSD/GPL");
++
++static struct proto tls_base_prot;
++static struct proto tls_sw_prot;
++
++int wait_on_pending_writer(struct sock *sk, long *timeo)
++{
++	int rc = 0;
++	DEFINE_WAIT_FUNC(wait, woken_wake_function);
++
++	add_wait_queue(sk_sleep(sk), &wait);
++	while (1) {
++		if (!*timeo) {
++			rc = -EAGAIN;
++			break;
++		}
++
++		if (signal_pending(current)) {
++			rc = sock_intr_errno(*timeo);
++			break;
++		}
++
++		if (sk_wait_event(sk, timeo, !sk->sk_write_pending, &wait))
++			break;
++	}
++	remove_wait_queue(sk_sleep(sk), &wait);
++	return rc;
++}
++
++int tls_push_sg(struct sock *sk,
++		struct tls_context *ctx,
++		struct scatterlist *sg,
++		u16 first_offset,
++		int flags)
++{
++	int sendpage_flags = flags | MSG_SENDPAGE_NOTLAST;
++	int ret = 0;
++	struct page *p;
++	size_t size;
++	int offset = first_offset;
++
++	size = sg->length - offset;
++	offset += sg->offset;
++
++	while (1) {
++		if (sg_is_last(sg))
++			sendpage_flags = flags;
++
++		/* is sending application-limited? */
++		tcp_rate_check_app_limited(sk);
++		p = sg_page(sg);
++retry:
++		ret = do_tcp_sendpages(sk, p, offset, size, sendpage_flags);
++
++		if (ret != size) {
++			if (ret > 0) {
++				offset += ret;
++				size -= ret;
++				goto retry;
++			}
++
++			offset -= sg->offset;
++			ctx->partially_sent_offset = offset;
++			ctx->partially_sent_record = (void *)sg;
++			return ret;
++		}
++
++		put_page(p);
++		sk_mem_uncharge(sk, sg->length);
++		sg = sg_next(sg);
++		if (!sg)
++			break;
++
++		offset = sg->offset;
++		size = sg->length;
++	}
++
++	clear_bit(TLS_PENDING_CLOSED_RECORD, &ctx->flags);
++
++	return 0;
++}
++
++static int tls_handle_open_record(struct sock *sk, int flags)
++{
++	struct tls_context *ctx = tls_get_ctx(sk);
++
++	if (tls_is_pending_open_record(ctx))
++		return ctx->push_pending_record(sk, flags);
++
++	return 0;
++}
++
++int tls_proccess_cmsg(struct sock *sk, struct msghdr *msg,
++		      unsigned char *record_type)
++{
++	struct cmsghdr *cmsg;
++	int rc = -EINVAL;
++
++	for_each_cmsghdr(cmsg, msg) {
++		if (!CMSG_OK(msg, cmsg))
++			return -EINVAL;
++		if (cmsg->cmsg_level != SOL_TLS)
++			continue;
++
++		switch (cmsg->cmsg_type) {
++		case TLS_SET_RECORD_TYPE:
++			if (cmsg->cmsg_len < CMSG_LEN(sizeof(*record_type)))
++				return -EINVAL;
++
++			if (msg->msg_flags & MSG_MORE)
++				return -EINVAL;
++
++			rc = tls_handle_open_record(sk, msg->msg_flags);
++			if (rc)
++				return rc;
++
++			*record_type = *(unsigned char *)CMSG_DATA(cmsg);
++			rc = 0;
++			break;
++		default:
++			return -EINVAL;
++		}
++	}
++
++	return rc;
++}
++
++int tls_push_pending_closed_record(struct sock *sk, struct tls_context *ctx,
++				   int flags, long *timeo)
++{
++	struct scatterlist *sg;
++	u16 offset;
++
++	if (!tls_is_partially_sent_record(ctx))
++		return ctx->push_pending_record(sk, flags);
++
++	sg = ctx->partially_sent_record;
++	offset = ctx->partially_sent_offset;
++
++	ctx->partially_sent_record = NULL;
++	return tls_push_sg(sk, ctx, sg, offset, flags);
++}
++
++static void tls_write_space(struct sock *sk)
++{
++	struct tls_context *ctx = tls_get_ctx(sk);
++
++	if (!sk->sk_write_pending && tls_is_pending_closed_record(ctx)) {
++		gfp_t sk_allocation = sk->sk_allocation;
++		int rc;
++		long timeo = 0;
++
++		sk->sk_allocation = GFP_ATOMIC;
++		rc = tls_push_pending_closed_record(sk, ctx,
++						    MSG_DONTWAIT |
++						    MSG_NOSIGNAL,
++						    &timeo);
++		sk->sk_allocation = sk_allocation;
++
++		if (rc < 0)
++			return;
++	}
++
++	ctx->sk_write_space(sk);
++}
++
++static void tls_sk_proto_close(struct sock *sk, long timeout)
++{
++	struct tls_context *ctx = tls_get_ctx(sk);
++	long timeo = sock_sndtimeo(sk, 0);
++	void (*sk_proto_close)(struct sock *sk, long timeout);
++
++	lock_sock(sk);
++
++	if (!tls_complete_pending_work(sk, ctx, 0, &timeo))
++		tls_handle_open_record(sk, 0);
++
++	if (ctx->partially_sent_record) {
++		struct scatterlist *sg = ctx->partially_sent_record;
++
++		while (1) {
++			put_page(sg_page(sg));
++			sk_mem_uncharge(sk, sg->length);
++
++			if (sg_is_last(sg))
++				break;
++			sg++;
++		}
++	}
++	ctx->free_resources(sk);
++	kfree(ctx->rec_seq);
++	kfree(ctx->iv);
++
++	sk_proto_close = ctx->sk_proto_close;
++	kfree(ctx);
++
++	release_sock(sk);
++	sk_proto_close(sk, timeout);
++}
++
++static int do_tls_getsockopt_tx(struct sock *sk, char __user *optval,
++				int __user *optlen)
++{
++	int rc = 0;
++	struct tls_context *ctx = tls_get_ctx(sk);
++	struct tls_crypto_info *crypto_info;
++	int len;
++
++	if (get_user(len, optlen))
++		return -EFAULT;
++
++	if (!optval || (len < sizeof(*crypto_info))) {
++		rc = -EINVAL;
++		goto out;
++	}
++
++	if (!ctx) {
++		rc = -EBUSY;
++		goto out;
++	}
++
++	/* get user crypto info */
++	crypto_info = &ctx->crypto_send;
++
++	if (!TLS_CRYPTO_INFO_READY(crypto_info)) {
++		rc = -EBUSY;
++		goto out;
++	}
++
++	if (len == sizeof(crypto_info)) {
++		rc = copy_to_user(optval, crypto_info, sizeof(*crypto_info));
++		goto out;
++	}
++
++	switch (crypto_info->cipher_type) {
++	case TLS_CIPHER_AES_GCM_128: {
++		struct tls12_crypto_info_aes_gcm_128 *
++		  crypto_info_aes_gcm_128 =
++		  container_of(crypto_info,
++			       struct tls12_crypto_info_aes_gcm_128,
++			       info);
++
++		if (len != sizeof(*crypto_info_aes_gcm_128)) {
++			rc = -EINVAL;
++			goto out;
++		}
++		lock_sock(sk);
++		memcpy(crypto_info_aes_gcm_128->iv, ctx->iv,
++		       TLS_CIPHER_AES_GCM_128_IV_SIZE);
++		release_sock(sk);
++		rc = copy_to_user(optval,
++				  crypto_info_aes_gcm_128,
++				  sizeof(*crypto_info_aes_gcm_128));
++		break;
++	}
++	default:
++		rc = -EINVAL;
++	}
++
++out:
++	return rc;
++}
++
++static int do_tls_getsockopt(struct sock *sk, int optname,
++			     char __user *optval, int __user *optlen)
++{
++	int rc = 0;
++
++	switch (optname) {
++	case TLS_TX:
++		rc = do_tls_getsockopt_tx(sk, optval, optlen);
++		break;
++	default:
++		rc = -ENOPROTOOPT;
++		break;
++	}
++	return rc;
++}
++
++static int tls_getsockopt(struct sock *sk, int level, int optname,
++			  char __user *optval, int __user *optlen)
++{
++	struct tls_context *ctx = tls_get_ctx(sk);
++
++	if (level != SOL_TLS)
++		return ctx->getsockopt(sk, level, optname, optval, optlen);
++
++	return do_tls_getsockopt(sk, optname, optval, optlen);
++}
++
++static int do_tls_setsockopt_tx(struct sock *sk, char __user *optval,
++				unsigned int optlen)
++{
++	struct tls_crypto_info *crypto_info, tmp_crypto_info;
++	struct tls_context *ctx = tls_get_ctx(sk);
++	struct proto *prot = NULL;
++	int rc = 0;
++
++	if (!optval || (optlen < sizeof(*crypto_info))) {
++		rc = -EINVAL;
++		goto out;
++	}
++
++	rc = copy_from_user(&tmp_crypto_info, optval, sizeof(*crypto_info));
++	if (rc) {
++		rc = -EFAULT;
++		goto out;
++	}
++
++	/* check version */
++	if (tmp_crypto_info.version != TLS_1_2_VERSION) {
++		rc = -ENOTSUPP;
++		goto out;
++	}
++
++	/* get user crypto info */
++	crypto_info = &ctx->crypto_send;
++
++	/* Currently we don't support set crypto info more than one time */
++	if (TLS_CRYPTO_INFO_READY(crypto_info))
++		goto out;
++
++	switch (tmp_crypto_info.cipher_type) {
++	case TLS_CIPHER_AES_GCM_128: {
++		if (optlen != sizeof(struct tls12_crypto_info_aes_gcm_128)) {
++			rc = -EINVAL;
++			goto out;
++		}
++		rc = copy_from_user(
++		  crypto_info,
++		  optval,
++		  sizeof(struct tls12_crypto_info_aes_gcm_128));
++
++		if (rc) {
++			rc = -EFAULT;
++			goto err_crypto_info;
++		}
++		break;
++	}
++	default:
++		rc = -EINVAL;
++		goto out;
++	}
++
++	ctx->sk_write_space = sk->sk_write_space;
++	sk->sk_write_space = tls_write_space;
++
++	ctx->sk_proto_close = sk->sk_prot->close;
++
++	/* currently SW is default, we will have ethtool in future */
++	rc = tls_set_sw_offload(sk, ctx);
++	prot = &tls_sw_prot;
++	if (rc)
++		goto err_crypto_info;
++
++	sk->sk_prot = prot;
++	goto out;
++
++err_crypto_info:
++	memset(crypto_info, 0, sizeof(*crypto_info));
++out:
++	return rc;
++}
++
++static int do_tls_setsockopt(struct sock *sk, int optname,
++			     char __user *optval, unsigned int optlen)
++{
++	int rc = 0;
++
++	switch (optname) {
++	case TLS_TX:
++		lock_sock(sk);
++		rc = do_tls_setsockopt_tx(sk, optval, optlen);
++		release_sock(sk);
++		break;
++	default:
++		rc = -ENOPROTOOPT;
++		break;
++	}
++	return rc;
++}
++
++static int tls_setsockopt(struct sock *sk, int level, int optname,
++			  char __user *optval, unsigned int optlen)
++{
++	struct tls_context *ctx = tls_get_ctx(sk);
++
++	if (level != SOL_TLS)
++		return ctx->setsockopt(sk, level, optname, optval, optlen);
++
++	return do_tls_setsockopt(sk, optname, optval, optlen);
++}
++
++static int tls_init(struct sock *sk)
++{
++	struct inet_connection_sock *icsk = inet_csk(sk);
++	struct tls_context *ctx;
++	int rc = 0;
++
++	/* allocate tls context */
++	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
++	if (!ctx) {
++		rc = -ENOMEM;
++		goto out;
++	}
++	icsk->icsk_ulp_data = ctx;
++	ctx->setsockopt = sk->sk_prot->setsockopt;
++	ctx->getsockopt = sk->sk_prot->getsockopt;
++	sk->sk_prot = &tls_base_prot;
++out:
++	return rc;
++}
++
++static struct tcp_ulp_ops tcp_tls_ulp_ops __read_mostly = {
++	.name			= "tls",
++	.owner			= THIS_MODULE,
++	.init			= tls_init,
++};
++
++static int __init tls_register(void)
++{
++	tls_base_prot			= tcp_prot;
++	tls_base_prot.setsockopt	= tls_setsockopt;
++	tls_base_prot.getsockopt	= tls_getsockopt;
++
++	tls_sw_prot			= tls_base_prot;
++	tls_sw_prot.sendmsg		= tls_sw_sendmsg;
++	tls_sw_prot.sendpage            = tls_sw_sendpage;
++	tls_sw_prot.close               = tls_sk_proto_close;
++
++	tcp_register_ulp(&tcp_tls_ulp_ops);
++
++	return 0;
++}
++
++static void __exit tls_unregister(void)
++{
++	tcp_unregister_ulp(&tcp_tls_ulp_ops);
++}
++
++module_init(tls_register);
++module_exit(tls_unregister);
+diff --git a/net/tls/tls_sw.c b/net/tls/tls_sw.c
+new file mode 100644
+index 000000000000..fa596fa71ba7
+--- /dev/null
++++ b/net/tls/tls_sw.c
+@@ -0,0 +1,772 @@
++/*
++ * Copyright (c) 2016-2017, Mellanox Technologies. All rights reserved.
++ * Copyright (c) 2016-2017, Dave Watson <davejwatson@fb.com>. All rights reserved.
++ * Copyright (c) 2016-2017, Lance Chao <lancerchao@fb.com>. All rights reserved.
++ * Copyright (c) 2016, Fridolin Pokorny <fridolin.pokorny@gmail.com>. All rights reserved.
++ * Copyright (c) 2016, Nikos Mavrogiannopoulos <nmav@gnutls.org>. All rights reserved.
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the
++ * OpenIB.org BSD license below:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      - Redistributions of source code must retain the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer.
++ *
++ *      - Redistributions in binary form must reproduce the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer in the documentation and/or other materials
++ *        provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#include <linux/module.h>
++#include <crypto/aead.h>
++
++#include <net/tls.h>
++
++static inline void tls_make_aad(int recv,
++				char *buf,
++				size_t size,
++				char *record_sequence,
++				int record_sequence_size,
++				unsigned char record_type)
++{
++	memcpy(buf, record_sequence, record_sequence_size);
++
++	buf[8] = record_type;
++	buf[9] = TLS_1_2_VERSION_MAJOR;
++	buf[10] = TLS_1_2_VERSION_MINOR;
++	buf[11] = size >> 8;
++	buf[12] = size & 0xFF;
++}
++
++static void trim_sg(struct sock *sk, struct scatterlist *sg,
++		    int *sg_num_elem, unsigned int *sg_size, int target_size)
++{
++	int i = *sg_num_elem - 1;
++	int trim = *sg_size - target_size;
++
++	if (trim <= 0) {
++		WARN_ON(trim < 0);
++		return;
++	}
++
++	*sg_size = target_size;
++	while (trim >= sg[i].length) {
++		trim -= sg[i].length;
++		sk_mem_uncharge(sk, sg[i].length);
++		put_page(sg_page(&sg[i]));
++		i--;
++
++		if (i < 0)
++			goto out;
++	}
++
++	sg[i].length -= trim;
++	sk_mem_uncharge(sk, trim);
++
++out:
++	*sg_num_elem = i + 1;
++}
++
++static void trim_both_sgl(struct sock *sk, int target_size)
++{
++	struct tls_context *tls_ctx = tls_get_ctx(sk);
++	struct tls_sw_context *ctx = tls_sw_ctx(tls_ctx);
++
++	trim_sg(sk, ctx->sg_plaintext_data,
++		&ctx->sg_plaintext_num_elem,
++		&ctx->sg_plaintext_size,
++		target_size);
++
++	if (target_size > 0)
++		target_size += tls_ctx->overhead_size;
++
++	trim_sg(sk, ctx->sg_encrypted_data,
++		&ctx->sg_encrypted_num_elem,
++		&ctx->sg_encrypted_size,
++		target_size);
++}
++
++static int alloc_sg(struct sock *sk, int len, struct scatterlist *sg,
++		    int *sg_num_elem, unsigned int *sg_size,
++		    int first_coalesce)
++{
++	struct page_frag *pfrag;
++	unsigned int size = *sg_size;
++	int num_elem = *sg_num_elem, use = 0, rc = 0;
++	struct scatterlist *sge;
++	unsigned int orig_offset;
++
++	len -= size;
++	pfrag = sk_page_frag(sk);
++
++	while (len > 0) {
++		if (!sk_page_frag_refill(sk, pfrag)) {
++			rc = -ENOMEM;
++			goto out;
++		}
++
++		use = min_t(int, len, pfrag->size - pfrag->offset);
++
++		if (!sk_wmem_schedule(sk, use)) {
++			rc = -ENOMEM;
++			goto out;
++		}
++
++		sk_mem_charge(sk, use);
++		size += use;
++		orig_offset = pfrag->offset;
++		pfrag->offset += use;
++
++		sge = sg + num_elem - 1;
++		if (num_elem > first_coalesce && sg_page(sg) == pfrag->page &&
++		    sg->offset + sg->length == orig_offset) {
++			sg->length += use;
++		} else {
++			sge++;
++			sg_unmark_end(sge);
++			sg_set_page(sge, pfrag->page, use, orig_offset);
++			get_page(pfrag->page);
++			++num_elem;
++			if (num_elem == MAX_SKB_FRAGS) {
++				rc = -ENOSPC;
++				break;
++			}
++		}
++
++		len -= use;
++	}
++	goto out;
++
++out:
++	*sg_size = size;
++	*sg_num_elem = num_elem;
++	return rc;
++}
++
++static int alloc_encrypted_sg(struct sock *sk, int len)
++{
++	struct tls_context *tls_ctx = tls_get_ctx(sk);
++	struct tls_sw_context *ctx = tls_sw_ctx(tls_ctx);
++	int rc = 0;
++
++	rc = alloc_sg(sk, len, ctx->sg_encrypted_data,
++		      &ctx->sg_encrypted_num_elem, &ctx->sg_encrypted_size, 0);
++
++	return rc;
++}
++
++static int alloc_plaintext_sg(struct sock *sk, int len)
++{
++	struct tls_context *tls_ctx = tls_get_ctx(sk);
++	struct tls_sw_context *ctx = tls_sw_ctx(tls_ctx);
++	int rc = 0;
++
++	rc = alloc_sg(sk, len, ctx->sg_plaintext_data,
++		      &ctx->sg_plaintext_num_elem, &ctx->sg_plaintext_size,
++		      tls_ctx->pending_open_record_frags);
++
++	return rc;
++}
++
++static void free_sg(struct sock *sk, struct scatterlist *sg,
++		    int *sg_num_elem, unsigned int *sg_size)
++{
++	int i, n = *sg_num_elem;
++
++	for (i = 0; i < n; ++i) {
++		sk_mem_uncharge(sk, sg[i].length);
++		put_page(sg_page(&sg[i]));
++	}
++	*sg_num_elem = 0;
++	*sg_size = 0;
++}
++
++static void tls_free_both_sg(struct sock *sk)
++{
++	struct tls_context *tls_ctx = tls_get_ctx(sk);
++	struct tls_sw_context *ctx = tls_sw_ctx(tls_ctx);
++
++	free_sg(sk, ctx->sg_encrypted_data, &ctx->sg_encrypted_num_elem,
++		&ctx->sg_encrypted_size);
++
++	free_sg(sk, ctx->sg_plaintext_data, &ctx->sg_plaintext_num_elem,
++		&ctx->sg_plaintext_size);
++}
++
++static int tls_do_encryption(struct tls_context *tls_ctx,
++			     struct tls_sw_context *ctx, size_t data_len,
++			     gfp_t flags)
++{
++	unsigned int req_size = sizeof(struct aead_request) +
++		crypto_aead_reqsize(ctx->aead_send);
++	struct aead_request *aead_req;
++	int rc;
++
++	aead_req = kmalloc(req_size, flags);
++	if (!aead_req)
++		return -ENOMEM;
++
++	ctx->sg_encrypted_data[0].offset += tls_ctx->prepend_size;
++	ctx->sg_encrypted_data[0].length -= tls_ctx->prepend_size;
++
++	aead_request_set_tfm(aead_req, ctx->aead_send);
++	aead_request_set_ad(aead_req, TLS_AAD_SPACE_SIZE);
++	aead_request_set_crypt(aead_req, ctx->sg_aead_in, ctx->sg_aead_out,
++			       data_len, tls_ctx->iv);
++	rc = crypto_aead_encrypt(aead_req);
++
++	ctx->sg_encrypted_data[0].offset -= tls_ctx->prepend_size;
++	ctx->sg_encrypted_data[0].length += tls_ctx->prepend_size;
++
++	kfree(aead_req);
++	return rc;
++}
++
++static int tls_push_record(struct sock *sk, int flags,
++			   unsigned char record_type)
++{
++	struct tls_context *tls_ctx = tls_get_ctx(sk);
++	struct tls_sw_context *ctx = tls_sw_ctx(tls_ctx);
++	int rc;
++
++	sg_mark_end(ctx->sg_plaintext_data + ctx->sg_plaintext_num_elem - 1);
++	sg_mark_end(ctx->sg_encrypted_data + ctx->sg_encrypted_num_elem - 1);
++
++	tls_make_aad(0, ctx->aad_space, ctx->sg_plaintext_size,
++		     tls_ctx->rec_seq, tls_ctx->rec_seq_size,
++		     record_type);
++
++	tls_fill_prepend(tls_ctx,
++			 page_address(sg_page(&ctx->sg_encrypted_data[0])) +
++			 ctx->sg_encrypted_data[0].offset,
++			 ctx->sg_plaintext_size, record_type);
++
++	tls_ctx->pending_open_record_frags = 0;
++	set_bit(TLS_PENDING_CLOSED_RECORD, &tls_ctx->flags);
++
++	rc = tls_do_encryption(tls_ctx, ctx, ctx->sg_plaintext_size,
++			       sk->sk_allocation);
++	if (rc < 0) {
++		/* If we are called from write_space and
++		 * we fail, we need to set this SOCK_NOSPACE
++		 * to trigger another write_space in the future.
++		 */
++		set_bit(SOCK_NOSPACE, &sk->sk_socket->flags);
++		return rc;
++	}
++
++	free_sg(sk, ctx->sg_plaintext_data, &ctx->sg_plaintext_num_elem,
++		&ctx->sg_plaintext_size);
++
++	ctx->sg_encrypted_num_elem = 0;
++	ctx->sg_encrypted_size = 0;
++
++	/* Only pass through MSG_DONTWAIT and MSG_NOSIGNAL flags */
++	rc = tls_push_sg(sk, tls_ctx, ctx->sg_encrypted_data, 0, flags);
++	if (rc < 0 && rc != -EAGAIN)
++		tls_err_abort(sk);
++
++	tls_advance_record_sn(sk, tls_ctx);
++	return rc;
++}
++
++static int tls_sw_push_pending_record(struct sock *sk, int flags)
++{
++	return tls_push_record(sk, flags, TLS_RECORD_TYPE_DATA);
++}
++
++static int zerocopy_from_iter(struct sock *sk, struct iov_iter *from,
++			      int length)
++{
++	struct tls_context *tls_ctx = tls_get_ctx(sk);
++	struct tls_sw_context *ctx = tls_sw_ctx(tls_ctx);
++	struct page *pages[MAX_SKB_FRAGS];
++
++	size_t offset;
++	ssize_t copied, use;
++	int i = 0;
++	unsigned int size = ctx->sg_plaintext_size;
++	int num_elem = ctx->sg_plaintext_num_elem;
++	int rc = 0;
++	int maxpages;
++
++	while (length > 0) {
++		i = 0;
++		maxpages = ARRAY_SIZE(ctx->sg_plaintext_data) - num_elem;
++		if (maxpages == 0) {
++			rc = -EFAULT;
++			goto out;
++		}
++		copied = iov_iter_get_pages(from, pages,
++					    length,
++					    maxpages, &offset);
++		if (copied <= 0) {
++			rc = -EFAULT;
++			goto out;
++		}
++
++		iov_iter_advance(from, copied);
++
++		length -= copied;
++		size += copied;
++		while (copied) {
++			use = min_t(int, copied, PAGE_SIZE - offset);
++
++			sg_set_page(&ctx->sg_plaintext_data[num_elem],
++				    pages[i], use, offset);
++			sg_unmark_end(&ctx->sg_plaintext_data[num_elem]);
++			sk_mem_charge(sk, use);
++
++			offset = 0;
++			copied -= use;
++
++			++i;
++			++num_elem;
++		}
++	}
++
++out:
++	ctx->sg_plaintext_size = size;
++	ctx->sg_plaintext_num_elem = num_elem;
++	return rc;
++}
++
++static int memcopy_from_iter(struct sock *sk, struct iov_iter *from,
++			     int bytes)
++{
++	struct tls_context *tls_ctx = tls_get_ctx(sk);
++	struct tls_sw_context *ctx = tls_sw_ctx(tls_ctx);
++	struct scatterlist *sg = ctx->sg_plaintext_data;
++	int copy, i, rc = 0;
++
++	for (i = tls_ctx->pending_open_record_frags;
++	     i < ctx->sg_plaintext_num_elem; ++i) {
++		copy = sg[i].length;
++		if (copy_from_iter(
++				page_address(sg_page(&sg[i])) + sg[i].offset,
++				copy, from) != copy) {
++			rc = -EFAULT;
++			goto out;
++		}
++		bytes -= copy;
++
++		++tls_ctx->pending_open_record_frags;
++
++		if (!bytes)
++			break;
++	}
++
++out:
++	return rc;
++}
++
++int tls_sw_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
++{
++	struct tls_context *tls_ctx = tls_get_ctx(sk);
++	struct tls_sw_context *ctx = tls_sw_ctx(tls_ctx);
++	int ret = 0;
++	int required_size;
++	long timeo = sock_sndtimeo(sk, msg->msg_flags & MSG_DONTWAIT);
++	bool eor = !(msg->msg_flags & MSG_MORE);
++	size_t try_to_copy, copied = 0;
++	unsigned char record_type = TLS_RECORD_TYPE_DATA;
++	int record_room;
++	bool full_record;
++	int orig_size;
++
++	if (msg->msg_flags & ~(MSG_MORE | MSG_DONTWAIT | MSG_NOSIGNAL))
++		return -ENOTSUPP;
++
++	lock_sock(sk);
++
++	if (tls_complete_pending_work(sk, tls_ctx, msg->msg_flags, &timeo))
++		goto send_end;
++
++	if (unlikely(msg->msg_controllen)) {
++		ret = tls_proccess_cmsg(sk, msg, &record_type);
++		if (ret)
++			goto send_end;
++	}
++
++	while (msg_data_left(msg)) {
++		if (sk->sk_err) {
++			ret = sk->sk_err;
++			goto send_end;
++		}
++
++		orig_size = ctx->sg_plaintext_size;
++		full_record = false;
++		try_to_copy = msg_data_left(msg);
++		record_room = TLS_MAX_PAYLOAD_SIZE - ctx->sg_plaintext_size;
++		if (try_to_copy >= record_room) {
++			try_to_copy = record_room;
++			full_record = true;
++		}
++
++		required_size = ctx->sg_plaintext_size + try_to_copy +
++				tls_ctx->overhead_size;
++
++		if (!sk_stream_memory_free(sk))
++			goto wait_for_sndbuf;
++alloc_encrypted:
++		ret = alloc_encrypted_sg(sk, required_size);
++		if (ret) {
++			if (ret != -ENOSPC)
++				goto wait_for_memory;
++
++			/* Adjust try_to_copy according to the amount that was
++			 * actually allocated. The difference is due
++			 * to max sg elements limit
++			 */
++			try_to_copy -= required_size - ctx->sg_encrypted_size;
++			full_record = true;
++		}
++
++		if (full_record || eor) {
++			ret = zerocopy_from_iter(sk, &msg->msg_iter,
++						 try_to_copy);
++			if (ret)
++				goto fallback_to_reg_send;
++
++			copied += try_to_copy;
++			ret = tls_push_record(sk, msg->msg_flags, record_type);
++			if (!ret)
++				continue;
++			if (ret == -EAGAIN)
++				goto send_end;
++
++			copied -= try_to_copy;
++fallback_to_reg_send:
++			iov_iter_revert(&msg->msg_iter,
++					ctx->sg_plaintext_size - orig_size);
++			trim_sg(sk, ctx->sg_plaintext_data,
++				&ctx->sg_plaintext_num_elem,
++				&ctx->sg_plaintext_size,
++				orig_size);
++		}
++
++		required_size = ctx->sg_plaintext_size + try_to_copy;
++alloc_plaintext:
++		ret = alloc_plaintext_sg(sk, required_size);
++		if (ret) {
++			if (ret != -ENOSPC)
++				goto wait_for_memory;
++
++			/* Adjust try_to_copy according to the amount that was
++			 * actually allocated. The difference is due
++			 * to max sg elements limit
++			 */
++			try_to_copy -= required_size - ctx->sg_plaintext_size;
++			full_record = true;
++
++			trim_sg(sk, ctx->sg_encrypted_data,
++				&ctx->sg_encrypted_num_elem,
++				&ctx->sg_encrypted_size,
++				ctx->sg_plaintext_size +
++				tls_ctx->overhead_size);
++		}
++
++		ret = memcopy_from_iter(sk, &msg->msg_iter, try_to_copy);
++		if (ret)
++			goto trim_sgl;
++
++		copied += try_to_copy;
++		if (full_record || eor) {
++push_record:
++			ret = tls_push_record(sk, msg->msg_flags, record_type);
++			if (ret) {
++				if (ret == -ENOMEM)
++					goto wait_for_memory;
++
++				goto send_end;
++			}
++		}
++
++		continue;
++
++wait_for_sndbuf:
++		set_bit(SOCK_NOSPACE, &sk->sk_socket->flags);
++wait_for_memory:
++		ret = sk_stream_wait_memory(sk, &timeo);
++		if (ret) {
++trim_sgl:
++			trim_both_sgl(sk, orig_size);
++			goto send_end;
++		}
++
++		if (tls_is_pending_closed_record(tls_ctx))
++			goto push_record;
++
++		if (ctx->sg_encrypted_size < required_size)
++			goto alloc_encrypted;
++
++		goto alloc_plaintext;
++	}
++
++send_end:
++	ret = sk_stream_error(sk, msg->msg_flags, ret);
++
++	release_sock(sk);
++	return copied ? copied : ret;
++}
++
++int tls_sw_sendpage(struct sock *sk, struct page *page,
++		    int offset, size_t size, int flags)
++{
++	struct tls_context *tls_ctx = tls_get_ctx(sk);
++	struct tls_sw_context *ctx = tls_sw_ctx(tls_ctx);
++	int ret = 0;
++	long timeo = sock_sndtimeo(sk, flags & MSG_DONTWAIT);
++	bool eor;
++	size_t orig_size = size;
++	unsigned char record_type = TLS_RECORD_TYPE_DATA;
++	struct scatterlist *sg;
++	bool full_record;
++	int record_room;
++
++	if (flags & ~(MSG_MORE | MSG_DONTWAIT | MSG_NOSIGNAL |
++		      MSG_SENDPAGE_NOTLAST))
++		return -ENOTSUPP;
++
++	/* No MSG_EOR from splice, only look at MSG_MORE */
++	eor = !(flags & (MSG_MORE | MSG_SENDPAGE_NOTLAST));
++
++	lock_sock(sk);
++
++	sk_clear_bit(SOCKWQ_ASYNC_NOSPACE, sk);
++
++	if (tls_complete_pending_work(sk, tls_ctx, flags, &timeo))
++		goto sendpage_end;
++
++	/* Call the sk_stream functions to manage the sndbuf mem. */
++	while (size > 0) {
++		size_t copy, required_size;
++
++		if (sk->sk_err) {
++			ret = sk->sk_err;
++			goto sendpage_end;
++		}
++
++		full_record = false;
++		record_room = TLS_MAX_PAYLOAD_SIZE - ctx->sg_plaintext_size;
++		copy = size;
++		if (copy >= record_room) {
++			copy = record_room;
++			full_record = true;
++		}
++		required_size = ctx->sg_plaintext_size + copy +
++			      tls_ctx->overhead_size;
++
++		if (!sk_stream_memory_free(sk))
++			goto wait_for_sndbuf;
++alloc_payload:
++		ret = alloc_encrypted_sg(sk, required_size);
++		if (ret) {
++			if (ret != -ENOSPC)
++				goto wait_for_memory;
++
++			/* Adjust copy according to the amount that was
++			 * actually allocated. The difference is due
++			 * to max sg elements limit
++			 */
++			copy -= required_size - ctx->sg_plaintext_size;
++			full_record = true;
++		}
++
++		get_page(page);
++		sg = ctx->sg_plaintext_data + ctx->sg_plaintext_num_elem;
++		sg_set_page(sg, page, copy, offset);
++		ctx->sg_plaintext_num_elem++;
++
++		sk_mem_charge(sk, copy);
++		offset += copy;
++		size -= copy;
++		ctx->sg_plaintext_size += copy;
++		tls_ctx->pending_open_record_frags = ctx->sg_plaintext_num_elem;
++
++		if (full_record || eor ||
++		    ctx->sg_plaintext_num_elem ==
++		    ARRAY_SIZE(ctx->sg_plaintext_data)) {
++push_record:
++			ret = tls_push_record(sk, flags, record_type);
++			if (ret) {
++				if (ret == -ENOMEM)
++					goto wait_for_memory;
++
++				goto sendpage_end;
++			}
++		}
++		continue;
++wait_for_sndbuf:
++		set_bit(SOCK_NOSPACE, &sk->sk_socket->flags);
++wait_for_memory:
++		ret = sk_stream_wait_memory(sk, &timeo);
++		if (ret) {
++			trim_both_sgl(sk, ctx->sg_plaintext_size);
++			goto sendpage_end;
++		}
++
++		if (tls_is_pending_closed_record(tls_ctx))
++			goto push_record;
++
++		goto alloc_payload;
++	}
++
++sendpage_end:
++	if (orig_size > size)
++		ret = orig_size - size;
++	else
++		ret = sk_stream_error(sk, flags, ret);
++
++	release_sock(sk);
++	return ret;
++}
++
++void tls_sw_free_resources(struct sock *sk)
++{
++	struct tls_context *tls_ctx = tls_get_ctx(sk);
++	struct tls_sw_context *ctx = tls_sw_ctx(tls_ctx);
++
++	if (ctx->aead_send)
++		crypto_free_aead(ctx->aead_send);
++
++	tls_free_both_sg(sk);
++
++	kfree(ctx);
++}
++
++int tls_set_sw_offload(struct sock *sk, struct tls_context *ctx)
++{
++	char keyval[TLS_CIPHER_AES_GCM_128_KEY_SIZE];
++	struct tls_crypto_info *crypto_info;
++	struct tls12_crypto_info_aes_gcm_128 *gcm_128_info;
++	struct tls_sw_context *sw_ctx;
++	u16 nonce_size, tag_size, iv_size, rec_seq_size;
++	char *iv, *rec_seq;
++	int rc = 0;
++
++	if (!ctx) {
++		rc = -EINVAL;
++		goto out;
++	}
++
++	if (ctx->priv_ctx) {
++		rc = -EEXIST;
++		goto out;
++	}
++
++	sw_ctx = kzalloc(sizeof(*sw_ctx), GFP_KERNEL);
++	if (!sw_ctx) {
++		rc = -ENOMEM;
++		goto out;
++	}
++
++	ctx->priv_ctx = (struct tls_offload_context *)sw_ctx;
++	ctx->free_resources = tls_sw_free_resources;
++
++	crypto_info = &ctx->crypto_send;
++	switch (crypto_info->cipher_type) {
++	case TLS_CIPHER_AES_GCM_128: {
++		nonce_size = TLS_CIPHER_AES_GCM_128_IV_SIZE;
++		tag_size = TLS_CIPHER_AES_GCM_128_TAG_SIZE;
++		iv_size = TLS_CIPHER_AES_GCM_128_IV_SIZE;
++		iv = ((struct tls12_crypto_info_aes_gcm_128 *)crypto_info)->iv;
++		rec_seq_size = TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE;
++		rec_seq =
++		 ((struct tls12_crypto_info_aes_gcm_128 *)crypto_info)->rec_seq;
++		gcm_128_info =
++			(struct tls12_crypto_info_aes_gcm_128 *)crypto_info;
++		break;
++	}
++	default:
++		rc = -EINVAL;
++		goto out;
++	}
++
++	ctx->prepend_size = TLS_HEADER_SIZE + nonce_size;
++	ctx->tag_size = tag_size;
++	ctx->overhead_size = ctx->prepend_size + ctx->tag_size;
++	ctx->iv_size = iv_size;
++	ctx->iv = kmalloc(iv_size + TLS_CIPHER_AES_GCM_128_SALT_SIZE,
++			  GFP_KERNEL);
++	if (!ctx->iv) {
++		rc = -ENOMEM;
++		goto out;
++	}
++	memcpy(ctx->iv, gcm_128_info->salt, TLS_CIPHER_AES_GCM_128_SALT_SIZE);
++	memcpy(ctx->iv + TLS_CIPHER_AES_GCM_128_SALT_SIZE, iv, iv_size);
++	ctx->rec_seq_size = rec_seq_size;
++	ctx->rec_seq = kmalloc(rec_seq_size, GFP_KERNEL);
++	if (!ctx->rec_seq) {
++		rc = -ENOMEM;
++		goto free_iv;
++	}
++	memcpy(ctx->rec_seq, rec_seq, rec_seq_size);
++
++	sg_init_table(sw_ctx->sg_encrypted_data,
++		      ARRAY_SIZE(sw_ctx->sg_encrypted_data));
++	sg_init_table(sw_ctx->sg_plaintext_data,
++		      ARRAY_SIZE(sw_ctx->sg_plaintext_data));
++
++	sg_init_table(sw_ctx->sg_aead_in, 2);
++	sg_set_buf(&sw_ctx->sg_aead_in[0], sw_ctx->aad_space,
++		   sizeof(sw_ctx->aad_space));
++	sg_unmark_end(&sw_ctx->sg_aead_in[1]);
++	sg_chain(sw_ctx->sg_aead_in, 2, sw_ctx->sg_plaintext_data);
++	sg_init_table(sw_ctx->sg_aead_out, 2);
++	sg_set_buf(&sw_ctx->sg_aead_out[0], sw_ctx->aad_space,
++		   sizeof(sw_ctx->aad_space));
++	sg_unmark_end(&sw_ctx->sg_aead_out[1]);
++	sg_chain(sw_ctx->sg_aead_out, 2, sw_ctx->sg_encrypted_data);
++
++	if (!sw_ctx->aead_send) {
++		sw_ctx->aead_send = crypto_alloc_aead("gcm(aes)", 0, 0);
++		if (IS_ERR(sw_ctx->aead_send)) {
++			rc = PTR_ERR(sw_ctx->aead_send);
++			sw_ctx->aead_send = NULL;
++			goto free_rec_seq;
++		}
++	}
++
++	ctx->push_pending_record = tls_sw_push_pending_record;
++
++	memcpy(keyval, gcm_128_info->key, TLS_CIPHER_AES_GCM_128_KEY_SIZE);
++
++	rc = crypto_aead_setkey(sw_ctx->aead_send, keyval,
++				TLS_CIPHER_AES_GCM_128_KEY_SIZE);
++	if (rc)
++		goto free_aead;
++
++	rc = crypto_aead_setauthsize(sw_ctx->aead_send, ctx->tag_size);
++	if (!rc)
++		goto out;
++
++free_aead:
++	crypto_free_aead(sw_ctx->aead_send);
++	sw_ctx->aead_send = NULL;
++free_rec_seq:
++	kfree(ctx->rec_seq);
++	ctx->rec_seq = NULL;
++free_iv:
++	kfree(ctx->iv);
++	ctx->iv = NULL;
++out:
++	return rc;
++}
