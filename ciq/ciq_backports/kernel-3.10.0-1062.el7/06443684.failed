@@ -1,0 +1,168 @@
+net: ena: allow the driver to work with small number of msix vectors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Netanel Belgazal <netanel@amazon.com>
+commit 06443684daede6ded1fab8f8729249436fb0cd8e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/06443684.failed
+
+Current driver tries to allocate msix vectors as the number of the
+negotiated io queues. (with another msix vector for management).
+If pci_alloc_irq_vectors() fails, the driver aborts the probe
+and the ENA network device is never brought up.
+
+With this patch, the driver's logic will reduce the number of IO
+queues to the number of allocated msix vectors (minus one for management)
+instead of failing probe().
+
+	Signed-off-by: Netanel Belgazal <netanel@amazon.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 06443684daede6ded1fab8f8729249436fb0cd8e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/amazon/ena/ena_netdev.c
+#	drivers/net/ethernet/amazon/ena/ena_netdev.h
+diff --cc drivers/net/ethernet/amazon/ena/ena_netdev.c
+index c9fb38254854,04aade842097..000000000000
+--- a/drivers/net/ethernet/amazon/ena/ena_netdev.c
++++ b/drivers/net/ethernet/amazon/ena/ena_netdev.c
+@@@ -1283,9 -1269,14 +1283,18 @@@ static irqreturn_t ena_intr_msix_io(in
+  	return IRQ_HANDLED;
+  }
+  
++ /* Reserve a single MSI-X vector for management (admin + aenq).
++  * plus reserve one vector for each potential io queue.
++  * the number of potential io queues is the minimum of what the device
++  * supports and the number of vCPUs.
++  */
+  static int ena_enable_msix(struct ena_adapter *adapter, int num_queues)
+  {
+++<<<<<<< HEAD
+ +	int i, msix_vecs, rc;
+++=======
++ 	int msix_vecs, irq_cnt;
+++>>>>>>> 06443684daed (net: ena: allow the driver to work with small number of msix vectors)
+  
+  	if (test_bit(ENA_FLAG_MSIX_ENABLED, &adapter->flags)) {
+  		netif_err(adapter, probe, adapter->netdev,
+@@@ -1298,32 -1289,28 +1307,44 @@@
+  	netif_dbg(adapter, probe, adapter->netdev,
+  		  "trying to enable MSI-X, vectors %d\n", msix_vecs);
+  
+++<<<<<<< HEAD
+ +	adapter->msix_entries = vzalloc(msix_vecs * sizeof(struct msix_entry));
+ +
+ +	if (!adapter->msix_entries)
+ +		return -ENOMEM;
+ +
+ +	for (i = 0; i < msix_vecs; i++)
+ +		adapter->msix_entries[i].entry = i;
+ +
+ +	rc = pci_enable_msix(adapter->pdev, adapter->msix_entries, msix_vecs);
+ +	if (rc != 0) {
+++=======
++ 	irq_cnt = pci_alloc_irq_vectors(adapter->pdev, ENA_MIN_MSIX_VEC,
++ 					msix_vecs, PCI_IRQ_MSIX);
++ 
++ 	if (irq_cnt < 0) {
+++>>>>>>> 06443684daed (net: ena: allow the driver to work with small number of msix vectors)
+  		netif_err(adapter, probe, adapter->netdev,
+- 			  "Failed to enable MSI-X, vectors %d rc %d\n",
+- 			  msix_vecs, rc);
++ 			  "Failed to enable MSI-X. irq_cnt %d\n", irq_cnt);
+  		return -ENOSPC;
+  	}
+  
+- 	netif_dbg(adapter, probe, adapter->netdev, "enable MSI-X, vectors %d\n",
+- 		  msix_vecs);
+- 
+- 	if (msix_vecs >= 1) {
+- 		if (ena_init_rx_cpu_rmap(adapter))
+- 			netif_warn(adapter, probe, adapter->netdev,
+- 				   "Failed to map IRQs to CPUs\n");
++ 	if (irq_cnt != msix_vecs) {
++ 		netif_notice(adapter, probe, adapter->netdev,
++ 			     "enable only %d MSI-X (out of %d), reduce the number of queues\n",
++ 			     irq_cnt, msix_vecs);
++ 		adapter->num_queues = irq_cnt - ENA_ADMIN_MSIX_VEC;
+  	}
+  
+++<<<<<<< HEAD
+ +	adapter->msix_vecs = msix_vecs;
+++=======
++ 	if (ena_init_rx_cpu_rmap(adapter))
++ 		netif_warn(adapter, probe, adapter->netdev,
++ 			   "Failed to map IRQs to CPUs\n");
++ 
++ 	adapter->msix_vecs = irq_cnt;
+++>>>>>>> 06443684daed (net: ena: allow the driver to work with small number of msix vectors)
+  	set_bit(ENA_FLAG_MSIX_ENABLED, &adapter->flags);
+  
+  	return 0;
+@@@ -1468,11 -1455,7 +1489,15 @@@ static void ena_free_io_irq(struct ena_
+  static void ena_disable_msix(struct ena_adapter *adapter)
+  {
+  	if (test_and_clear_bit(ENA_FLAG_MSIX_ENABLED, &adapter->flags))
+++<<<<<<< HEAD
+ +		pci_disable_msix(adapter->pdev);
+ +
+ +	if (adapter->msix_entries)
+ +		vfree(adapter->msix_entries);
+ +	adapter->msix_entries = NULL;
+++=======
++ 		pci_free_irq_vectors(adapter->pdev);
+++>>>>>>> 06443684daed (net: ena: allow the driver to work with small number of msix vectors)
+  }
+  
+  static void ena_disable_io_intr_sync(struct ena_adapter *adapter)
+@@@ -3531,17 -3371,17 +3556,23 @@@ static void ena_remove(struct pci_dev *
+  
+  	cancel_work_sync(&adapter->reset_task);
+  
+ -	cancel_work_sync(&adapter->suspend_io_task);
+ -
+ -	cancel_work_sync(&adapter->resume_io_task);
+ +	unregister_netdev(netdev);
+  
+ -	/* Reset the device only if the device is running. */
+ +	/* If the device is running then we want to make sure the device will be
+ +	 * reset to make sure no more events will be issued by the device.
+ +	 */
+  	if (test_bit(ENA_FLAG_DEVICE_RUNNING, &adapter->flags))
+ -		ena_com_dev_reset(ena_dev, adapter->reset_reason);
+ +		set_bit(ENA_FLAG_TRIGGER_RESET, &adapter->flags);
+  
+++<<<<<<< HEAD
+ +	rtnl_lock();
+ +	ena_destroy_device(adapter, true);
+ +	rtnl_unlock();
+++=======
++ 	ena_free_mgmnt_irq(adapter);
++ 
++ 	ena_disable_msix(adapter);
+++>>>>>>> 06443684daed (net: ena: allow the driver to work with small number of msix vectors)
+  
+  	free_netdev(netdev);
+  
+diff --cc drivers/net/ethernet/amazon/ena/ena_netdev.h
+index 959ecca79e3c,86b0f0dbae65..000000000000
+--- a/drivers/net/ethernet/amazon/ena/ena_netdev.h
++++ b/drivers/net/ethernet/amazon/ena/ena_netdev.h
+@@@ -280,8 -271,7 +283,12 @@@ enum ena_flags_t 
+  	ENA_FLAG_DEV_UP,
+  	ENA_FLAG_LINK_UP,
+  	ENA_FLAG_MSIX_ENABLED,
+++<<<<<<< HEAD
+ +	ENA_FLAG_TRIGGER_RESET,
+ +	ENA_FLAG_ONGOING_RESET
+++=======
++ 	ENA_FLAG_TRIGGER_RESET
+++>>>>>>> 06443684daed (net: ena: allow the driver to work with small number of msix vectors)
+  };
+  
+  /* adapter specific private data structure */
+* Unmerged path drivers/net/ethernet/amazon/ena/ena_netdev.c
+* Unmerged path drivers/net/ethernet/amazon/ena/ena_netdev.h
