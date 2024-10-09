@@ -1,0 +1,151 @@
+nvme-pci: Remove watchdog timer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [nvme] pci: Remove watchdog timer (David Milburn) [1457880 1456486 1454365]
+Rebuild_FUZZ: 91.23%
+commit-author Keith Busch <keith.busch@intel.com>
+commit b2a0eb1a0ac72869c910a79d935a0b049ec78ad9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/b2a0eb1a.failed
+
+The controller status polling was added to preemptively reset a failed
+controller. This early detection would allow commands that would normally
+timeout a chance for a retry, or find broken links when the platform
+didn't support hotplug.
+
+This once-per-second MMIO read, however, created more problems than
+it solves. This often races with PCIe Hotplug events that required
+complicated syncing between work queues, frequently triggered PCIe
+Completion Timeout errors that also lead to fatal machine checks, and
+unnecessarily disrupts low power modes by running on idle controllers.
+
+This patch removes the watchdog timer, and instead checks controller
+health only on an IO timeout when we have a reason to believe something
+is wrong. If the controller is failed, the driver will disable immediately
+and request scheduling a reset.
+
+	Suggested-by: Andy Lutomirski <luto@amacapital.net>
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit b2a0eb1a0ac72869c910a79d935a0b049ec78ad9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/pci.c
+diff --cc drivers/nvme/host/pci.c
+index f136fc3284bb,ef2b1537afe2..000000000000
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@@ -89,9 -95,9 +89,8 @@@ struct nvme_dev 
+  	int q_depth;
+  	u32 db_stride;
+  	void __iomem *bar;
+ -	unsigned long bar_mapped_size;
+  	struct work_struct reset_work;
+  	struct work_struct remove_work;
+- 	struct timer_list watchdog_timer;
+  	struct mutex shutdown_lock;
+  	bool subsystem;
+  	void __iomem *cmb;
+@@@ -762,7 -1011,28 +806,18 @@@ static enum blk_eh_timer_return nvme_ti
+  	struct nvme_dev *dev = nvmeq->dev;
+  	struct request *abort_req;
+  	struct nvme_command cmd;
++ 	u32 csts = readl(dev->bar + NVME_REG_CSTS);
++ 
++ 	/*
++ 	 * Reset immediately if the controller is failed
++ 	 */
++ 	if (nvme_should_reset(dev, csts)) {
++ 		nvme_warn_reset(dev, csts);
++ 		nvme_dev_disable(dev, false);
++ 		nvme_reset(dev);
++ 		return BLK_EH_HANDLED;
++ 	}
+  
+ -	/*
+ -	 * Did we miss an interrupt?
+ -	 */
+ -	if (__nvme_poll(nvmeq, req->tag)) {
+ -		dev_warn(dev->ctrl.device,
+ -			 "I/O %d QID %d timeout, completion polled\n",
+ -			 req->tag, nvmeq->qid);
+ -		return BLK_EH_HANDLED;
+ -	}
+ -
+  	/*
+  	 * Shutdown immediately if controller times out while starting. The
+  	 * reset work will see the pci device disabled when it gets the forced
+@@@ -1150,66 -1453,6 +1205,69 @@@ static int nvme_configure_admin_queue(s
+  	return result;
+  }
+  
+++<<<<<<< HEAD
+ +static bool nvme_should_reset(struct nvme_dev *dev, u32 csts)
+ +{
+ +
+ +	/* If true, indicates loss of adapter communication, possibly by a
+ +	 * NVMe Subsystem reset.
+ +	 */
+ +	bool nssro = dev->subsystem && (csts & NVME_CSTS_NSSRO);
+ +
+ +	/* If there is a reset ongoing, we shouldn't reset again. */
+ +	if (dev->ctrl.state == NVME_CTRL_RESETTING)
+ +		return false;
+ +
+ +	/* We shouldn't reset unless the controller is on fatal error state
+ +	 * _or_ if we lost the communication with it.
+ +	 */
+ +	if (!(csts & NVME_CSTS_CFS) && !nssro)
+ +		return false;
+ +
+ +	/* If PCI error recovery process is happening, we cannot reset or
+ +	 * the recovery mechanism will surely fail.
+ +	 */
+ +	if (pci_channel_offline(to_pci_dev(dev->dev)))
+ +		return false;
+ +
+ +	return true;
+ +}
+ +
+ +static void nvme_warn_reset(struct nvme_dev *dev, u32 csts)
+ +{
+ +	/* Read a config register to help see what died. */
+ +	u16 pci_status;
+ +	int result;
+ +
+ +	result = pci_read_config_word(to_pci_dev(dev->dev), PCI_STATUS,
+ +				      &pci_status);
+ +	if (result == PCIBIOS_SUCCESSFUL)
+ +		dev_warn(dev->dev,
+ +			 "controller is down; will reset: CSTS=0x%x, PCI_STATUS=0x%hx\n",
+ +			 csts, pci_status);
+ +	else
+ +		dev_warn(dev->dev,
+ +			 "controller is down; will reset: CSTS=0x%x, PCI_STATUS read failed (%d)\n",
+ +			 csts, result);
+ +}
+ +
+ +static void nvme_watchdog_timer(unsigned long data)
+ +{
+ +	struct nvme_dev *dev = (struct nvme_dev *)data;
+ +	u32 csts = readl(dev->bar + NVME_REG_CSTS);
+ +
+ +	/* Skip controllers under certain specific conditions. */
+ +	if (nvme_should_reset(dev, csts)) {
+ +		if (!nvme_reset(dev))
+ +			nvme_warn_reset(dev, csts);
+ +		return;
+ +	}
+ +
+ +	mod_timer(&dev->watchdog_timer, round_jiffies(jiffies + HZ));
+ +}
+ +
+++=======
+++>>>>>>> b2a0eb1a0ac7 (nvme-pci: Remove watchdog timer)
+  static int nvme_create_io_queues(struct nvme_dev *dev)
+  {
+  	unsigned i, max;
+* Unmerged path drivers/nvme/host/pci.c
