@@ -1,0 +1,121 @@
+net/mlx5e: Add TXQ set max rate support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Add TXQ set max rate support (Don Dutile) [1383785 1417284]
+Rebuild_FUZZ: 94.59%
+commit-author Yevgeny Petrilin <yevgenyp@mellanox.com>
+commit 507f0c817f7a28bbf4facb3a8dca72a68bc25248
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/507f0c81.failed
+
+Implement set_maxrate ndo.
+Use the rate index from the hardware table to attach to channel SQ/TXQ.
+In case of failure to configure new rate, the queue remains with
+unlimited rate.
+
+We save the configuration on priv structure and apply it each time
+Send Queues are being reinitialized (after open/close) operations.
+
+	Signed-off-by: Yevgeny Petrilin <yevgenyp@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 507f0c817f7a28bbf4facb3a8dca72a68bc25248)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 3bc18a2b4cee,e5a2cefdc0a3..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -812,19 -801,12 +820,24 @@@ static void mlx5e_close_sq(struct mlx5e
+  		if (mlx5e_sq_has_room_for(sq, 1))
+  			mlx5e_send_nop(sq, true);
+  
+++<<<<<<< HEAD
+ +		err = mlx5e_modify_sq(sq, MLX5_SQC_STATE_RDY,
+ +				      MLX5_SQC_STATE_ERR);
+ +		if (err)
+ +			set_bit(MLX5E_SQ_STATE_TX_TIMEOUT, &sq->state);
+++=======
++ 		mlx5e_modify_sq(sq, MLX5_SQC_STATE_RDY, MLX5_SQC_STATE_ERR,
++ 				false, 0);
+++>>>>>>> 507f0c817f7a (net/mlx5e: Add TXQ set max rate support)
+  	}
+  
+ -	while (sq->cc != sq->pc) /* wait till sq is empty */
+ -		msleep(20);
+ +	/* wait till sq is empty, unless a TX timeout occurred on this SQ */
+ +	while (sq->cc != sq->pc &&
+ +	       !test_bit(MLX5E_SQ_STATE_TX_TIMEOUT, &sq->state)) {
+ +		msleep(MLX5_EN_QP_FLUSH_MSLEEP_QUANT);
+ +		if (tout++ > MLX5_EN_QP_FLUSH_MAX_ITER)
+ +			set_bit(MLX5E_SQ_STATE_TX_TIMEOUT, &sq->state);
+ +	}
+  
+  	/* avoid destroying sq before mlx5e_poll_tx_cq() is done with it */
+  	napi_synchronize(&sq->channel->napi);
+@@@ -2580,6 -2705,10 +2678,13 @@@ static const struct net_device_ops mlx5
+  	.ndo_set_features        = mlx5e_set_features,
+  	.ndo_change_mtu          = mlx5e_change_mtu,
+  	.ndo_do_ioctl            = mlx5e_ioctl,
+++<<<<<<< HEAD
+++=======
++ 	.ndo_set_tx_maxrate      = mlx5e_set_tx_maxrate,
++ #ifdef CONFIG_RFS_ACCEL
++ 	.ndo_rx_flow_steer	 = mlx5e_rx_flow_steer,
++ #endif
+++>>>>>>> 507f0c817f7a (net/mlx5e: Add TXQ set max rate support)
+  };
+  
+  static const struct net_device_ops mlx5e_netdev_ops_sriov = {
+@@@ -2596,10 -2725,12 +2701,16 @@@
+  	.ndo_set_features        = mlx5e_set_features,
+  	.ndo_change_mtu          = mlx5e_change_mtu,
+  	.ndo_do_ioctl            = mlx5e_ioctl,
+++<<<<<<< HEAD
+ +#ifdef CONFIG_MLX5_CORE_EN_VXLAN
+ +	.ndo_add_vxlan_port      = mlx5e_add_vxlan_port,
+ +	.ndo_del_vxlan_port      = mlx5e_del_vxlan_port,
+++=======
++ 	.ndo_udp_tunnel_add	 = mlx5e_add_vxlan_port,
++ 	.ndo_udp_tunnel_del	 = mlx5e_del_vxlan_port,
++ 	.ndo_set_tx_maxrate      = mlx5e_set_tx_maxrate,
+++>>>>>>> 507f0c817f7a (net/mlx5e: Add TXQ set max rate support)
+  	.ndo_features_check      = mlx5e_features_check,
+ -#ifdef CONFIG_RFS_ACCEL
+ -	.ndo_rx_flow_steer	 = mlx5e_rx_flow_steer,
+  #endif
+  	.ndo_set_vf_mac          = mlx5e_set_vf_mac,
+  	.ndo_set_vf_vlan         = mlx5e_set_vf_vlan,
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index f893d7b4c843..e035e4904607 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -85,6 +85,7 @@
+ #define MLX5E_LOG_INDIR_RQT_SIZE       0x7
+ #define MLX5E_INDIR_RQT_SIZE           BIT(MLX5E_LOG_INDIR_RQT_SIZE)
+ #define MLX5E_MAX_NUM_CHANNELS         (MLX5E_INDIR_RQT_SIZE >> 1)
++#define MLX5E_MAX_NUM_SQS              (MLX5E_MAX_NUM_CHANNELS * MLX5E_MAX_NUM_TC)
+ #define MLX5E_TX_CQ_POLL_BUDGET        128
+ #define MLX5E_UPDATE_STATS_INTERVAL    200 /* msecs */
+ #define MLX5E_SQ_BF_BUDGET             16
+@@ -355,6 +356,7 @@ struct mlx5e_sq {
+ 	struct mlx5e_channel      *channel;
+ 	int                        tc;
+ 	struct mlx5e_ico_wqe_info *ico_wqe_info;
++	u32                        rate_limit;
+ } ____cacheline_aligned_in_smp;
+ 
+ static inline bool mlx5e_sq_has_room_for(struct mlx5e_sq *sq, u16 n)
+@@ -476,6 +478,7 @@ struct mlx5e_priv {
+ 	u32                        indir_rqtn;
+ 	u32                        indir_tirn[MLX5E_NUM_INDIR_TIRS];
+ 	struct mlx5e_direct_tir    direct_tir[MLX5E_MAX_NUM_CHANNELS];
++	u32                        tx_rates[MLX5E_MAX_NUM_SQS];
+ 
+ 	struct mlx5e_flow_tables   fts;
+ 	struct mlx5e_eth_addr_db   eth_addr;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
