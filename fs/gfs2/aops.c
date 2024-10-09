@@ -526,8 +526,8 @@ static int stuffed_readpage(struct gfs2_inode *ip, struct page *page)
 		return error;
 
 	kaddr = kmap_atomic(page);
-	if (dsize > (dibh->b_size - sizeof(struct gfs2_dinode)))
-		dsize = (dibh->b_size - sizeof(struct gfs2_dinode));
+	if (dsize > gfs2_max_stuffed_size(ip))
+		dsize = gfs2_max_stuffed_size(ip);
 	memcpy(kaddr, dibh->b_data + sizeof(struct gfs2_dinode), dsize);
 	memset(kaddr + dsize, 0, PAGE_CACHE_SIZE - dsize);
 	kunmap_atomic(kaddr);
@@ -764,7 +764,7 @@ static int gfs2_write_begin(struct file *file, struct address_space *mapping,
 
 	if (gfs2_is_stuffed(ip)) {
 		error = 0;
-		if (pos + len > sdp->sd_sb.sb_bsize - sizeof(struct gfs2_dinode)) {
+		if (pos + len > gfs2_max_stuffed_size(ip)) {
 			error = gfs2_unstuff_dinode(ip, page);
 			if (error == 0)
 				goto prepare_write;
@@ -871,7 +871,8 @@ static int gfs2_stuffed_write_end(struct inode *inode, struct buffer_head *dibh,
 	void *kaddr;
 	unsigned char *buf = dibh->b_data + sizeof(struct gfs2_dinode);
 
-	BUG_ON((pos + len) > (dibh->b_size - sizeof(struct gfs2_dinode)));
+	BUG_ON(pos + len > gfs2_max_stuffed_size(ip));
+
 	kaddr = kmap_atomic(page);
 	memcpy(buf + pos, kaddr + pos, copied);
 	memset(kaddr + pos + copied, 0, len - copied);
