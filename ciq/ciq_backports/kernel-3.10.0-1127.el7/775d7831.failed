@@ -1,0 +1,361 @@
+md: improve handling of bio with REQ_PREFLUSH in md_flush_request()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author David Jeffery <djeffery@redhat.com>
+commit 775d78319f1ceb32be8eb3b1202ccdc60e9cb7f1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/775d7831.failed
+
+If pers->make_request fails in md_flush_request(), the bio is lost. To
+fix this, pass back a bool to indicate if the original make_request call
+should continue to handle the I/O and instead of assuming the flush logic
+will push it to completion.
+
+Convert md_flush_request to return a bool and no longer calls the raid
+driver's make_request function.  If the return is true, then the md flush
+logic has or will complete the bio and the md make_request call is done.
+If false, then the md make_request function needs to keep processing like
+it is a normal bio. Let the original call to md_handle_request handle any
+need to retry sending the bio to the raid driver's make_request function
+should it be needed.
+
+Also mark md_flush_request and the make_request function pointer as
+__must_check to issue warnings should these critical return values be
+ignored.
+
+Fixes: 2bc13b83e629 ("md: batch flush requests.")
+	Cc: stable@vger.kernel.org # # v4.19+
+	Cc: NeilBrown <neilb@suse.com>
+	Signed-off-by: David Jeffery <djeffery@redhat.com>
+	Reviewed-by: Xiao Ni <xni@redhat.com>
+	Signed-off-by: Song Liu <songliubraving@fb.com>
+(cherry picked from commit 775d78319f1ceb32be8eb3b1202ccdc60e9cb7f1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/md-linear.c
+#	drivers/md/md-multipath.c
+#	drivers/md/md.c
+#	drivers/md/raid0.c
+#	drivers/md/raid1.c
+#	drivers/md/raid10.c
+diff --cc drivers/md/md-linear.c
+index e15de8e23224,26c75c0199fa..000000000000
+--- a/drivers/md/md-linear.c
++++ b/drivers/md/md-linear.c
+@@@ -288,45 -239,25 +288,49 @@@ static void linear_free(struct mddev *m
+  
+  static bool linear_make_request(struct mddev *mddev, struct bio *bio)
+  {
+ -	char b[BDEVNAME_SIZE];
+  	struct dev_info *tmp_dev;
+ -	sector_t start_sector, end_sector, data_offset;
+ -	sector_t bio_sector = bio->bi_iter.bi_sector;
+ -
+ +	sector_t start_sector;
+ +	unsigned int max_sectors = blk_queue_get_max_sectors(mddev->queue,
+ +			bio->bi_rw);
+ +	const unsigned long do_discard = (bio->bi_rw
+ +					  & (REQ_DISCARD | REQ_SECURE));
+ +	const unsigned long do_same = (bio->bi_rw & REQ_WRITE_SAME);
+ +
+++<<<<<<< HEAD
+ +	if (unlikely(bio->bi_rw & REQ_FLUSH)) {
+ +		md_flush_request(mddev, bio);
+++=======
++ 	if (unlikely(bio->bi_opf & REQ_PREFLUSH)
++ 	    && md_flush_request(mddev, bio))
+++>>>>>>> 775d78319f1c (md: improve handling of bio with REQ_PREFLUSH in md_flush_request())
+ +		return true;
+- 	}
+ +
+ +	if (!do_discard && !do_same && bio_sectors(bio) > max_sectors) {
+ +		struct bio_pair2 *bp = bio_split2(bio, max_sectors);
+ +		if (!bp) {
+ +			bio_io_error(bio);
+ +			return true;
+ +		}
+ +
+ +		generic_make_request(bp->bio1);
+ +		generic_make_request(bp->bio2);
+ +		bio_pair2_release(bp);
+  		return true;
+ +	}
+  
+ -	tmp_dev = which_dev(mddev, bio_sector);
+ +	tmp_dev = which_dev(mddev, bio->bi_sector);
+  	start_sector = tmp_dev->end_sector - tmp_dev->rdev->sectors;
+ -	end_sector = tmp_dev->end_sector;
+ -	data_offset = tmp_dev->rdev->data_offset;
+  
+ -	if (unlikely(bio_sector >= end_sector ||
+ -		     bio_sector < start_sector))
+ -		goto out_of_bounds;
+ +	if (unlikely(bio->bi_sector >= (tmp_dev->end_sector)
+ +		     || (bio->bi_sector < start_sector))) {
+ +		char b[BDEVNAME_SIZE];
+  
+ -	if (unlikely(is_mddev_broken(tmp_dev->rdev, "linear"))) {
+ +		pr_err("md/linear:%s: make_request: Sector %llu out of bounds on dev %s: %llu sectors, offset %llu\n",
+ +		       mdname(mddev),
+ +		       (unsigned long long)bio->bi_sector,
+ +		       bdevname(tmp_dev->rdev->bdev, b),
+ +		       (unsigned long long)tmp_dev->rdev->sectors,
+ +		       (unsigned long long)start_sector);
+  		bio_io_error(bio);
+  		return true;
+  	}
+diff --cc drivers/md/md-multipath.c
+index c1e888deed4a,152f9e65a226..000000000000
+--- a/drivers/md/md-multipath.c
++++ b/drivers/md/md-multipath.c
+@@@ -111,31 -103,12 +111,35 @@@ static bool multipath_make_request(stru
+  	struct mpconf *conf = mddev->private;
+  	struct multipath_bh * mp_bh;
+  	struct multipath_info *multipath;
+ -
+ +	unsigned int max_sectors = blk_queue_get_max_sectors(mddev->queue,
+ +			bio->bi_rw);
+ +	const unsigned long do_discard = (bio->bi_rw
+ +					  & (REQ_DISCARD | REQ_SECURE));
+ +	const unsigned long do_same = (bio->bi_rw & REQ_WRITE_SAME);
+ +
+++<<<<<<< HEAD
+ +	if (unlikely(bio->bi_rw & REQ_FLUSH)) {
+ +		md_flush_request(mddev, bio);
+++=======
++ 	if (unlikely(bio->bi_opf & REQ_PREFLUSH)
++ 	    && md_flush_request(mddev, bio))
+++>>>>>>> 775d78319f1c (md: improve handling of bio with REQ_PREFLUSH in md_flush_request())
+ +		return true;
+- 	}
+ +
+ +	if (!do_discard && !do_same && bio_sectors(bio) > max_sectors) {
+ +		struct bio_pair2 *bp = bio_split2(bio, max_sectors);
+ +		if (!bp) {
+ +			bio_io_error(bio);
+ +			return true;
+ +		}
+ +
+ +		generic_make_request(bp->bio1);
+ +		generic_make_request(bp->bio2);
+ +		bio_pair2_release(bp);
+  		return true;
+ +	}
+  
+ -	mp_bh = mempool_alloc(&conf->pool, GFP_NOIO);
+ +	mp_bh = mempool_alloc(conf->pool, GFP_NOIO);
+  
+  	mp_bh->master_bio = bio;
+  	mp_bh->mddev = mddev;
+diff --cc drivers/md/md.c
+index 67f1c428a00f,b8dd56b746da..000000000000
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@@ -521,14 -576,15 +527,20 @@@ bool md_flush_request(struct mddev *mdd
+  		queue_work(md_wq, &mddev->flush_work);
+  	} else {
+  		/* flush was performed for some other bio while we waited. */
+ -		if (bio->bi_iter.bi_size == 0)
+ +		if (bio->bi_size == 0)
+  			/* an empty barrier - all done */
+ -			bio_endio(bio);
+ +			bio_endio(bio, 0);
+  		else {
+++<<<<<<< HEAD
+ +			bio->bi_rw &= ~REQ_FLUSH;
+ +			mddev->pers->make_request(mddev, bio);
+++=======
++ 			bio->bi_opf &= ~REQ_PREFLUSH;
++ 			return false;
+++>>>>>>> 775d78319f1c (md: improve handling of bio with REQ_PREFLUSH in md_flush_request())
+  		}
+  	}
++ 	return true;
+  }
+  EXPORT_SYMBOL(md_flush_request);
+  
+diff --cc drivers/md/raid0.c
+index 0bfe93a75836,f2b83bd2fee6..000000000000
+--- a/drivers/md/raid0.c
++++ b/drivers/md/raid0.c
+@@@ -679,23 -554,30 +679,27 @@@ static void raid0_handle_discard(struc
+  		    !discard_bio)
+  			continue;
+  		bio_chain(discard_bio, bio);
+ -		bio_clone_blkg_association(discard_bio, bio);
+ -		if (mddev->gendisk)
+ -			trace_block_bio_remap(bdev_get_queue(rdev->bdev),
+ -				discard_bio, disk_devt(mddev->gendisk),
+ -				bio->bi_iter.bi_sector);
+ -		generic_make_request(discard_bio);
+ +		submit_bio(REQ_WRITE | REQ_DISCARD, discard_bio);
+  	}
+ -	bio_endio(bio);
+ +	bio_endio(bio, 0);
+  }
+  
+ +
+  static bool raid0_make_request(struct mddev *mddev, struct bio *bio)
+  {
+ -	struct r0conf *conf = mddev->private;
+ +	unsigned int chunk_sects;
+ +	sector_t sector_offset;
+  	struct strip_zone *zone;
+  	struct md_rdev *tmp_dev;
+ -	sector_t bio_sector;
+ -	sector_t sector;
+ -	sector_t orig_sector;
+ -	unsigned chunk_sects;
+ -	unsigned sectors;
+  
+++<<<<<<< HEAD
+ +	if (unlikely(bio->bi_rw & REQ_FLUSH)) {
+ +		md_flush_request(mddev, bio);
+++=======
++ 	if (unlikely(bio->bi_opf & REQ_PREFLUSH)
++ 	    && md_flush_request(mddev, bio))
+++>>>>>>> 775d78319f1c (md: improve handling of bio with REQ_PREFLUSH in md_flush_request())
+  		return true;
+- 	}
+  
+  	if (unlikely((bio_op(bio) == REQ_OP_DISCARD))) {
+  		raid0_handle_discard(mddev, bio);
+diff --cc drivers/md/raid1.c
+index b69cd658dbb5,bb29aeefcbd0..000000000000
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@@ -1531,29 -1565,28 +1531,33 @@@ static bool raid1_write_request(struct 
+  
+  static bool raid1_make_request(struct mddev *mddev, struct bio *bio)
+  {
+ -	sector_t sectors;
+ +	struct r1bio *r1_bio;
+ +	bool ret;
+  
+++<<<<<<< HEAD
+ +	if (unlikely(bio->bi_rw & REQ_FLUSH)) {
+ +		md_flush_request(mddev, bio);
+++=======
++ 	if (unlikely(bio->bi_opf & REQ_PREFLUSH)
++ 	    && md_flush_request(mddev, bio))
+++>>>>>>> 775d78319f1c (md: improve handling of bio with REQ_PREFLUSH in md_flush_request())
+  		return true;
+- 	}
+  
+  	/*
+ -	 * There is a limit to the maximum size, but
+ -	 * the read/write handler might find a lower limit
+ -	 * due to bad blocks.  To avoid multiple splits,
+ -	 * we pass the maximum number of sectors down
+ -	 * and let the lower level perform the split.
+ +	 * make_request() can abort the operation when read-ahead is being
+ +	 * used and no empty request is available.
+ +	 *
+  	 */
+ -	sectors = align_to_barrier_unit_end(
+ -		bio->bi_iter.bi_sector, bio_sectors(bio));
+ +	r1_bio = alloc_r1bio(mddev, bio, 0);
+  
+  	if (bio_data_dir(bio) == READ)
+ -		raid1_read_request(mddev, bio, sectors, NULL);
+ +		raid1_read_request(mddev, bio, r1_bio);
+  	else {
+ -		if (!md_write_start(mddev,bio))
+ +		ret = raid1_write_request(mddev, bio, r1_bio);
+ +		if (ret == false) {
+ +			free_r1bio(r1_bio);
+  			return false;
+ -		raid1_write_request(mddev, bio, sectors);
+ +		}
+  	}
+  	return true;
+  }
+diff --cc drivers/md/raid10.c
+index ca76012444cf,2eca0a81a8c9..000000000000
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@@ -1689,6 -1516,35 +1689,38 @@@ static bool raid10_make_request(struct 
+  		raid10_read_request(mddev, bio, r10_bio);
+  	else
+  		raid10_write_request(mddev, bio, r10_bio);
+++<<<<<<< HEAD
+++=======
++ }
++ 
++ static bool raid10_make_request(struct mddev *mddev, struct bio *bio)
++ {
++ 	struct r10conf *conf = mddev->private;
++ 	sector_t chunk_mask = (conf->geo.chunk_mask & conf->prev.chunk_mask);
++ 	int chunk_sects = chunk_mask + 1;
++ 	int sectors = bio_sectors(bio);
++ 
++ 	if (unlikely(bio->bi_opf & REQ_PREFLUSH)
++ 	    && md_flush_request(mddev, bio))
++ 		return true;
++ 
++ 	if (!md_write_start(mddev, bio))
++ 		return false;
++ 
++ 	/*
++ 	 * If this request crosses a chunk boundary, we need to split
++ 	 * it.
++ 	 */
++ 	if (unlikely((bio->bi_iter.bi_sector & chunk_mask) +
++ 		     sectors > chunk_sects
++ 		     && (conf->geo.near_copies < conf->geo.raid_disks
++ 			 || conf->prev.near_copies <
++ 			 conf->prev.raid_disks)))
++ 		sectors = chunk_sects -
++ 			(bio->bi_iter.bi_sector &
++ 			 (chunk_sects - 1));
++ 	__make_request(mddev, bio, sectors);
+++>>>>>>> 775d78319f1c (md: improve handling of bio with REQ_PREFLUSH in md_flush_request())
+  
+  	/* In case raid10d snuck in to freeze_array */
+  	wake_up(&conf->wait_barrier);
+* Unmerged path drivers/md/md-linear.c
+* Unmerged path drivers/md/md-multipath.c
+* Unmerged path drivers/md/md.c
+diff --git a/drivers/md/md.h b/drivers/md/md.h
+index f08c16284cf7..73babb473f8d 100644
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@ -528,7 +528,7 @@ struct md_personality
+ 	int level;
+ 	struct list_head list;
+ 	struct module *owner;
+-	bool (*make_request)(struct mddev *mddev, struct bio *bio);
++	bool __must_check (*make_request)(struct mddev *mddev, struct bio *bio);
+ 	/*
+ 	 * start up works that do NOT require md_thread. tasks that
+ 	 * requires md_thread should go into start()
+@@ -679,7 +679,7 @@ extern void md_error(struct mddev *mddev, struct md_rdev *rdev);
+ extern void md_finish_reshape(struct mddev *mddev);
+ 
+ extern int mddev_congested(struct mddev *mddev, int bits);
+-extern void md_flush_request(struct mddev *mddev, struct bio *bio);
++extern bool __must_check md_flush_request(struct mddev *mddev, struct bio *bio);
+ extern void md_super_write(struct mddev *mddev, struct md_rdev *rdev,
+ 			   sector_t sector, int size, struct page *page);
+ extern int md_super_wait(struct mddev *mddev);
+* Unmerged path drivers/md/raid0.c
+* Unmerged path drivers/md/raid1.c
+* Unmerged path drivers/md/raid10.c
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index 97daecc57b8b..5600f44909d9 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -5623,8 +5623,8 @@ static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
+ 		if (ret == 0)
+ 			return true;
+ 		if (ret == -ENODEV) {
+-			md_flush_request(mddev, bi);
+-			return true;
++			if (md_flush_request(mddev, bi))
++				return true;
+ 		}
+ 		/* ret == -EAGAIN, fallback */
+ 		/*
