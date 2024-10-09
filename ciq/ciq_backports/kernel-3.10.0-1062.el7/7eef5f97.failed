@@ -1,0 +1,137 @@
+mm: thp: relocate flush_cache_range() in migrate_misplaced_transhuge_page()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [mm] thp: relocate flush_cache_range() in migrate_misplaced_transhuge_page() (Andrea Arcangeli) [1636066]
+Rebuild_FUZZ: 97.26%
+commit-author Andrea Arcangeli <aarcange@redhat.com>
+commit 7eef5f97c1f94c7b72520b42d372037e97a81b95
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/7eef5f97.failed
+
+There should be no cache left by the time we overwrite the old transhuge
+pmd with the new one.  It's already too late to flush through the virtual
+address because we already copied the page data to the new physical
+address.
+
+So flush the cache before the data copy.
+
+Also delete the "end" variable to shutoff a "unused variable" warning on
+x86 where flush_cache_range() is a noop.
+
+Link: http://lkml.kernel.org/r/20181015202311.7209-1-aarcange@redhat.com
+	Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
+	Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Aaron Tomlin <atomlin@redhat.com>
+	Cc: Jerome Glisse <jglisse@redhat.com>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 7eef5f97c1f94c7b72520b42d372037e97a81b95)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/migrate.c
+diff --cc mm/migrate.c
+index dc35415df847,b6700f2962f3..000000000000
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@@ -1787,22 -1974,11 +1787,26 @@@ int migrate_misplaced_transhuge_page(st
+  	pg_data_t *pgdat = NODE_DATA(node);
+  	int isolated = 0;
+  	struct page *new_page = NULL;
+ +	struct mem_cgroup *memcg = NULL;
+  	int page_lru = page_is_file_cache(page);
+++<<<<<<< HEAD
+ +	unsigned long mmun_start = address & HPAGE_PMD_MASK;
+ +	unsigned long mmun_end = mmun_start + HPAGE_PMD_SIZE;
+ +	pmd_t orig_entry;
+ +
+ +	/*
+ +	 * Rate-limit the amount of data that is being migrated to a node.
+ +	 * Optimal placement is no good if the memory bus is saturated and
+ +	 * all the time is being spent migrating!
+ +	 */
+ +	if (numamigrate_update_ratelimit(pgdat, HPAGE_PMD_NR))
+ +		goto out_dropref;
+++=======
++ 	unsigned long start = address & HPAGE_PMD_MASK;
+++>>>>>>> 7eef5f97c1f9 (mm: thp: relocate flush_cache_range() in migrate_misplaced_transhuge_page())
+  
+  	new_page = alloc_pages_node(node,
+ -		(GFP_TRANSHUGE_LIGHT | __GFP_THISNODE),
+ +		(GFP_TRANSHUGE | __GFP_THISNODE) & ~__GFP_WAIT,
+  		HPAGE_PMD_ORDER);
+  	if (!new_page)
+  		goto out_fail;
+@@@ -1869,39 -2030,38 +1875,55 @@@ fail_putback
+  	entry = maybe_pmd_mkwrite(pmd_mkdirty(entry), vma);
+  
+  	/*
+ -	 * Overwrite the old entry under pagetable lock and establish
+ -	 * the new PTE. Any parallel GUP will either observe the old
+ -	 * page blocking on the page lock, block on the page table
+ -	 * lock or observe the new page. The SetPageUptodate on the
+ -	 * new page and page_add_new_anon_rmap guarantee the copy is
+ -	 * visible before the pagetable update.
+ +	 * Clear the old entry under pagetable lock and establish the new PTE.
+ +	 * Any parallel GUP will either observe the old page blocking on the
+ +	 * page lock, block on the page table lock or observe the new page.
+ +	 * The SetPageUptodate on the new page and page_add_new_anon_rmap
+ +	 * guarantee the copy is visible before the pagetable update.
+  	 */
+++<<<<<<< HEAD
+ +	flush_cache_range(vma, mmun_start, mmun_end);
+ +	page_add_new_anon_rmap(new_page, vma, mmun_start);
+ +	pmdp_clear_flush_notify(vma, mmun_start, pmd);
+ +	set_pmd_at(mm, mmun_start, pmd, entry);
+ +	flush_tlb_range(vma, mmun_start, mmun_end);
+++=======
++ 	page_add_anon_rmap(new_page, vma, start, true);
++ 	/*
++ 	 * At this point the pmd is numa/protnone (i.e. non present) and the TLB
++ 	 * has already been flushed globally.  So no TLB can be currently
++ 	 * caching this non present pmd mapping.  There's no need to clear the
++ 	 * pmd before doing set_pmd_at(), nor to flush the TLB after
++ 	 * set_pmd_at().  Clearing the pmd here would introduce a race
++ 	 * condition against MADV_DONTNEED, because MADV_DONTNEED only holds the
++ 	 * mmap_sem for reading.  If the pmd is set to NULL at any given time,
++ 	 * MADV_DONTNEED won't wait on the pmd lock and it'll skip clearing this
++ 	 * pmd.
++ 	 */
++ 	set_pmd_at(mm, start, pmd, entry);
+++>>>>>>> 7eef5f97c1f9 (mm: thp: relocate flush_cache_range() in migrate_misplaced_transhuge_page())
+  	update_mmu_cache_pmd(vma, address, &entry);
+  
+ -	page_ref_unfreeze(page, 2);
+ +	if (page_count(page) != 2) {
+ +		set_pmd_at(mm, mmun_start, pmd, orig_entry);
+ +		flush_tlb_range(vma, mmun_start, mmun_end);
+ +		mmu_notifier_invalidate_range(mm, mmun_start, mmun_end);
+ +		update_mmu_cache_pmd(vma, address, &entry);
+ +		page_remove_rmap(new_page);
+ +		goto fail_putback;
+ +	}
+ +
+  	mlock_migrate_page(new_page, page);
+ -	page_remove_rmap(page, true);
+ -	set_page_owner_migrate_reason(new_page, MR_NUMA_MISPLACED);
+ +	page_remove_rmap(page);
+  
+ +	/*
+ +	 * Finish the charge transaction under the page table lock to
+ +	 * prevent split_huge_page() from dividing up the charge
+ +	 * before it's fully transferred to the new page.
+ +	 */
+ +	mem_cgroup_end_migration(memcg, page, new_page, true);
+  	spin_unlock(ptl);
+ -
+ -	/* Take an "isolate" reference and put new page on the LRU. */
+ -	get_page(new_page);
+ -	putback_lru_page(new_page);
+ +	mmu_notifier_invalidate_range_end(mm, mmun_start, mmun_end);
+  
+  	unlock_page(new_page);
+  	unlock_page(page);
+* Unmerged path mm/migrate.c
