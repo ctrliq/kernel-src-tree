@@ -1,0 +1,197 @@
+xfs: kill ioflags
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 3176c3e0ef32963aa5f6f9754142e420a4ba5d64
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/3176c3e0.failed
+
+Now that we have the direct I/O kiocb flag there is no real need to sample
+the value inside of XFS, and the invis flag was always just partially used
+and isn't worth keeping this infrastructure around for.   This also splits
+the read tracepoint into buffered vs direct as we've done for writes a long
+time ago.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+(cherry picked from commit 3176c3e0ef32963aa5f6f9754142e420a4ba5d64)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_file.c
+diff --cc fs/xfs/xfs_file.c
+index 815d8f3721f9,e51622c8e482..000000000000
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@@ -295,25 -290,14 +295,28 @@@ xfs_file_aio_read
+  	struct inode		*inode = file->f_mapping->host;
+  	struct xfs_inode	*ip = XFS_I(inode);
+  	struct xfs_mount	*mp = ip->i_mount;
+ -	size_t			size = iov_iter_count(to);
+ +	size_t			size = 0;
+  	ssize_t			ret = 0;
+- 	int			ioflags = 0;
+  	xfs_fsize_t		n;
+ -	loff_t			pos = iocb->ki_pos;
+  
+  	XFS_STATS_INC(mp, xs_read_calls);
+  
+++<<<<<<< HEAD
+ +	BUG_ON(iocb->ki_pos != pos);
+ +
+ +	if (unlikely(file->f_flags & O_DIRECT))
+ +		ioflags |= XFS_IO_ISDIRECT;
+ +	if (file->f_mode & FMODE_NOCMTIME)
+ +		ioflags |= XFS_IO_INVIS;
+ +
+ +	ret = generic_segment_checks(iovp, &nr_segs, &size, VERIFY_WRITE);
+ +	if (ret < 0)
+ +		return ret;
+ +
+ +	if ((ioflags & XFS_IO_ISDIRECT) && !IS_DAX(inode)) {
+++=======
++ 	if ((iocb->ki_flags & IOCB_DIRECT) && !IS_DAX(inode)) {
+++>>>>>>> 3176c3e0ef32 (xfs: kill ioflags)
+  		xfs_buftarg_t	*target =
+  			XFS_IS_REALTIME_INODE(ip) ?
+  				mp->m_rtdev_targp : mp->m_ddev_targp;
+@@@ -380,9 -364,12 +383,12 @@@
+  		xfs_rw_ilock_demote(ip, XFS_IOLOCK_EXCL);
+  	}
+  
+- 	trace_xfs_file_read(ip, size, pos, ioflags);
++ 	if (iocb->ki_flags & IOCB_DIRECT)
++ 		trace_xfs_file_direct_read(ip, size, pos);
++ 	else
++ 		trace_xfs_file_buffered_read(ip, size, pos);
+  
+ -	ret = generic_file_read_iter(iocb, to);
+ +	ret = generic_file_aio_read(iocb, iovp, nr_segs, pos);
+  	if (ret > 0)
+  		XFS_STATS_ADD(mp, xs_read_bytes, ret);
+  
+@@@ -861,10 -782,22 +863,14 @@@ xfs_file_dio_aio_write
+  		iolock = XFS_IOLOCK_SHARED;
+  	}
+  
+++<<<<<<< HEAD
+ +	trace_xfs_file_direct_write(ip, count, iocb->ki_pos, 0);
+ +	ret = generic_file_direct_write(iocb, iovp,
+ +			&nr_segs, pos, &iocb->ki_pos, count, ocount);
+++=======
++ 	trace_xfs_file_direct_write(ip, count, iocb->ki_pos);
+++>>>>>>> 3176c3e0ef32 (xfs: kill ioflags)
+  
+ -	data = *from;
+ -	ret = mapping->a_ops->direct_IO(iocb, &data);
+ -
+ -	/* see generic_file_direct_write() for why this is necessary */
+ -	if (mapping->nrpages) {
+ -		invalidate_inode_pages2_range(mapping,
+ -					      iocb->ki_pos >> PAGE_SHIFT,
+ -					      end >> PAGE_SHIFT);
+ -	}
+ -
+ -	if (ret > 0) {
+ -		iocb->ki_pos += ret;
+ -		iov_iter_advance(from, ret);
+ -	}
+  out:
+  	xfs_rw_iunlock(ip, iolock);
+  
+@@@ -900,12 -829,13 +906,19 @@@ xfs_file_buffered_aio_write
+  		goto out;
+  
+  	/* We can write back this queue in page reclaim */
+ -	current->backing_dev_info = inode_to_bdi(inode);
+ +	current->backing_dev_info = mapping->backing_dev_info;
+  
+  write_retry:
+++<<<<<<< HEAD
+ +	trace_xfs_file_buffered_write(ip, count, iocb->ki_pos, 0);
+ +	ret = generic_file_buffered_write(iocb, iovp, nr_segs,
+ +			pos, &iocb->ki_pos, count, 0);
+++=======
++ 	trace_xfs_file_buffered_write(ip, iov_iter_count(from), iocb->ki_pos);
++ 	ret = generic_perform_write(file, from, iocb->ki_pos);
++ 	if (likely(ret >= 0))
++ 		iocb->ki_pos += ret;
+++>>>>>>> 3176c3e0ef32 (xfs: kill ioflags)
+  
+  	/*
+  	 * If we hit a space limit, try to free up some lingering preallocated
+* Unmerged path fs/xfs/xfs_file.c
+diff --git a/fs/xfs/xfs_inode.h b/fs/xfs/xfs_inode.h
+index 4b3afab97ddb..43e409495082 100644
+--- a/fs/xfs/xfs_inode.h
++++ b/fs/xfs/xfs_inode.h
+@@ -476,14 +476,4 @@ do { \
+ 
+ extern struct kmem_zone	*xfs_inode_zone;
+ 
+-/*
+- * Flags for read/write calls
+- */
+-#define XFS_IO_ISDIRECT	0x00001		/* bypass page cache */
+-#define XFS_IO_INVIS	0x00002		/* don't update inode timestamps */
+-
+-#define XFS_IO_FLAGS \
+-	{ XFS_IO_ISDIRECT,	"DIRECT" }, \
+-	{ XFS_IO_INVIS,		"INVIS"}
+-
+ #endif	/* __XFS_INODE_H__ */
+diff --git a/fs/xfs/xfs_trace.h b/fs/xfs/xfs_trace.h
+index 96c4f1be0409..a1e87da0b08d 100644
+--- a/fs/xfs/xfs_trace.h
++++ b/fs/xfs/xfs_trace.h
+@@ -1136,15 +1136,14 @@ TRACE_EVENT(xfs_log_assign_tail_lsn,
+ )
+ 
+ DECLARE_EVENT_CLASS(xfs_file_class,
+-	TP_PROTO(struct xfs_inode *ip, size_t count, loff_t offset, int flags),
+-	TP_ARGS(ip, count, offset, flags),
++	TP_PROTO(struct xfs_inode *ip, size_t count, loff_t offset),
++	TP_ARGS(ip, count, offset),
+ 	TP_STRUCT__entry(
+ 		__field(dev_t, dev)
+ 		__field(xfs_ino_t, ino)
+ 		__field(xfs_fsize_t, size)
+ 		__field(loff_t, offset)
+ 		__field(size_t, count)
+-		__field(int, flags)
+ 	),
+ 	TP_fast_assign(
+ 		__entry->dev = VFS_I(ip)->i_sb->s_dev;
+@@ -1152,23 +1151,21 @@ DECLARE_EVENT_CLASS(xfs_file_class,
+ 		__entry->size = ip->i_d.di_size;
+ 		__entry->offset = offset;
+ 		__entry->count = count;
+-		__entry->flags = flags;
+ 	),
+-	TP_printk("dev %d:%d ino 0x%llx size 0x%llx "
+-		  "offset 0x%llx count 0x%zx ioflags %s",
++	TP_printk("dev %d:%d ino 0x%llx size 0x%llx offset 0x%llx count 0x%zx",
+ 		  MAJOR(__entry->dev), MINOR(__entry->dev),
+ 		  __entry->ino,
+ 		  __entry->size,
+ 		  __entry->offset,
+-		  __entry->count,
+-		  __print_flags(__entry->flags, "|", XFS_IO_FLAGS))
++		  __entry->count)
+ )
+ 
+ #define DEFINE_RW_EVENT(name)		\
+ DEFINE_EVENT(xfs_file_class, name,	\
+-	TP_PROTO(struct xfs_inode *ip, size_t count, loff_t offset, int flags),	\
+-	TP_ARGS(ip, count, offset, flags))
+-DEFINE_RW_EVENT(xfs_file_read);
++	TP_PROTO(struct xfs_inode *ip, size_t count, loff_t offset),	\
++	TP_ARGS(ip, count, offset))
++DEFINE_RW_EVENT(xfs_file_buffered_read);
++DEFINE_RW_EVENT(xfs_file_direct_read);
+ DEFINE_RW_EVENT(xfs_file_buffered_write);
+ DEFINE_RW_EVENT(xfs_file_direct_write);
+ DEFINE_RW_EVENT(xfs_file_splice_read);
