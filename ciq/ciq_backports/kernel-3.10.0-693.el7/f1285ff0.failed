@@ -1,0 +1,165 @@
+xfs: stop using generic_file_read_iter for direct I/O
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit f1285ff0acf9040a39921355d07bd83a3308c402
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/f1285ff0.failed
+
+XFS already implement it's own flushing of the pagecache because it
+implements proper synchronization for direct I/O reads.  This means
+calling generic_file_read_iter for direct I/O is rather useless,
+as it doesn't do much but updating the atime and iocb position for
+us.  This also gets rid of the buffered I/O fallback that isn't used
+for XFS.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+
+(cherry picked from commit f1285ff0acf9040a39921355d07bd83a3308c402)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_file.c
+diff --cc fs/xfs/xfs_file.c
+index 815d8f3721f9,440bb8b5c64d..000000000000
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@@ -285,41 -282,33 +285,63 @@@ xfs_file_fsync
+  }
+  
+  STATIC ssize_t
+ -xfs_file_dio_aio_read(
+ +xfs_file_aio_read(
+  	struct kiocb		*iocb,
+ -	struct iov_iter		*to)
+ +	const struct iovec	*iovp,
+ +	unsigned long		nr_segs,
+ +	loff_t			pos)
+  {
+ -	struct address_space	*mapping = iocb->ki_filp->f_mapping;
+ -	struct inode		*inode = mapping->host;
+ +	struct file		*file = iocb->ki_filp;
+ +	struct inode		*inode = file->f_mapping->host;
+  	struct xfs_inode	*ip = XFS_I(inode);
+++<<<<<<< HEAD
+ +	struct xfs_mount	*mp = ip->i_mount;
+ +	size_t			size = 0;
+++=======
++ 	loff_t			isize = i_size_read(inode);
++ 	size_t			count = iov_iter_count(to);
++ 	struct iov_iter		data;
++ 	struct xfs_buftarg	*target;
+++>>>>>>> f1285ff0acf9 (xfs: stop using generic_file_read_iter for direct I/O)
+  	ssize_t			ret = 0;
+ +	int			ioflags = 0;
+ +	xfs_fsize_t		n;
+  
+ -	trace_xfs_file_direct_read(ip, count, iocb->ki_pos);
+ +	XFS_STATS_INC(mp, xs_read_calls);
+  
+++<<<<<<< HEAD
+ +	BUG_ON(iocb->ki_pos != pos);
+++=======
++ 	if (!count)
++ 		return 0; /* skip atime */
++ 
++ 	if (XFS_IS_REALTIME_INODE(ip))
++ 		target = ip->i_mount->m_rtdev_targp;
++ 	else
++ 		target = ip->i_mount->m_ddev_targp;
+++>>>>>>> f1285ff0acf9 (xfs: stop using generic_file_read_iter for direct I/O)
+ +
+ +	if (unlikely(file->f_flags & O_DIRECT))
+ +		ioflags |= XFS_IO_ISDIRECT;
+ +	if (file->f_mode & FMODE_NOCMTIME)
+ +		ioflags |= XFS_IO_INVIS;
+ +
+ +	ret = generic_segment_checks(iovp, &nr_segs, &size, VERIFY_WRITE);
+ +	if (ret < 0)
+ +		return ret;
+  
+ -	if (!IS_DAX(inode)) {
+ +	if ((ioflags & XFS_IO_ISDIRECT) && !IS_DAX(inode)) {
+ +		xfs_buftarg_t	*target =
+ +			XFS_IS_REALTIME_INODE(ip) ?
+ +				mp->m_rtdev_targp : mp->m_ddev_targp;
+  		/* DIO must be aligned to device logical sector size */
+++<<<<<<< HEAD
+ +		if ((pos | size) & target->bt_logical_sectormask) {
+ +			if (pos == i_size_read(inode))
+++=======
++ 		if ((iocb->ki_pos | count) & target->bt_logical_sectormask) {
++ 			if (iocb->ki_pos == isize)
+++>>>>>>> f1285ff0acf9 (xfs: stop using generic_file_read_iter for direct I/O)
+  				return 0;
+  			return -EINVAL;
+  		}
+@@@ -380,13 -359,55 +402,62 @@@
+  		xfs_rw_ilock_demote(ip, XFS_IOLOCK_EXCL);
+  	}
+  
+++<<<<<<< HEAD
+ +	trace_xfs_file_read(ip, size, pos, ioflags);
+++=======
++ 	data = *to;
++ 	ret = mapping->a_ops->direct_IO(iocb, &data);
++ 	if (ret > 0) {
++ 		iocb->ki_pos += ret;
++ 		iov_iter_advance(to, ret);
++ 	}
++ 	xfs_rw_iunlock(ip, XFS_IOLOCK_SHARED);
++ 
++ 	file_accessed(iocb->ki_filp);
++ 	return ret;
++ }
++ 
++ STATIC ssize_t
++ xfs_file_buffered_aio_read(
++ 	struct kiocb		*iocb,
++ 	struct iov_iter		*to)
++ {
++ 	struct xfs_inode	*ip = XFS_I(file_inode(iocb->ki_filp));
++ 	ssize_t			ret;
++ 
++ 	trace_xfs_file_buffered_read(ip, iov_iter_count(to), iocb->ki_pos);
++ 
++ 	xfs_rw_ilock(ip, XFS_IOLOCK_SHARED);
++ 	ret = generic_file_read_iter(iocb, to);
++ 	xfs_rw_iunlock(ip, XFS_IOLOCK_SHARED);
++ 
++ 	return ret;
++ }
++ 
++ STATIC ssize_t
++ xfs_file_read_iter(
++ 	struct kiocb		*iocb,
++ 	struct iov_iter		*to)
++ {
++ 	struct xfs_mount	*mp = XFS_I(file_inode(iocb->ki_filp))->i_mount;
++ 	ssize_t			ret = 0;
++ 
++ 	XFS_STATS_INC(mp, xs_read_calls);
++ 
++ 	if (XFS_FORCED_SHUTDOWN(mp))
++ 		return -EIO;
++ 
++ 	if (iocb->ki_flags & IOCB_DIRECT)
++ 		ret = xfs_file_dio_aio_read(iocb, to);
++ 	else
++ 		ret = xfs_file_buffered_aio_read(iocb, to);
+++>>>>>>> f1285ff0acf9 (xfs: stop using generic_file_read_iter for direct I/O)
+  
+ +	ret = generic_file_aio_read(iocb, iovp, nr_segs, pos);
+  	if (ret > 0)
+  		XFS_STATS_ADD(mp, xs_read_bytes, ret);
+ +
+ +	xfs_rw_iunlock(ip, XFS_IOLOCK_SHARED);
+  	return ret;
+  }
+  
+* Unmerged path fs/xfs/xfs_file.c
