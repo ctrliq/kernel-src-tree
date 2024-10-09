@@ -133,8 +133,7 @@ static const struct snd_pcm_hardware snd_intel_hadstream = {
 		SNDRV_PCM_INFO_MMAP|
 		SNDRV_PCM_INFO_MMAP_VALID |
 		SNDRV_PCM_INFO_BATCH),
-	.formats = (SNDRV_PCM_FMTBIT_S24 |
-		SNDRV_PCM_FMTBIT_U24),
+	.formats = SNDRV_PCM_FMTBIT_S24,
 	.rates = SNDRV_PCM_RATE_32000 |
 		SNDRV_PCM_RATE_44100 |
 		SNDRV_PCM_RATE_48000 |
