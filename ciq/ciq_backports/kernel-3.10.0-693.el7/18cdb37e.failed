@@ -1,0 +1,402 @@
+net: sched: do not use tcf_proto 'tp' argument from call_rcu
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] sched: do not use tcf_proto 'tp' argument from call_rcu (Ivan Vecera) [1428588]
+Rebuild_FUZZ: 95.65%
+commit-author John Fastabend <john.fastabend@gmail.com>
+commit 18cdb37ebf4c986d9502405cbd16b0ac29770c25
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/18cdb37e.failed
+
+Using the tcf_proto pointer 'tp' from inside the classifiers callback
+is not valid because it may have been cleaned up by another call_rcu
+occuring on another CPU.
+
+'tp' is currently being used by tcf_unbind_filter() in this patch we
+move instances of tcf_unbind_filter outside of the call_rcu() context.
+This is safe to do because any running schedulers will either read the
+valid class field or it will be zeroed.
+
+And all schedulers today when the class is 0 do a lookup using the
+same call used by the tcf_exts_bind(). So even if we have a running
+classifier hit the null class pointer it will do a lookup and get
+to the same result. This is particularly fragile at the moment because
+the only way to verify this is to audit the schedulers call sites.
+
+	Reported-by: Cong Wang <xiyou.wangconf@gmail.com>
+	Signed-off-by: John Fastabend <john.r.fastabend@intel.com>
+	Acked-by: Cong Wang <cwang@twopensource.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 18cdb37ebf4c986d9502405cbd16b0ac29770c25)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/cls_bpf.c
+#	net/sched/cls_fw.c
+#	net/sched/cls_route.c
+diff --cc net/sched/cls_bpf.c
+index f9a9a429c8cb,eed49d1d0878..000000000000
+--- a/net/sched/cls_bpf.c
++++ b/net/sched/cls_bpf.c
+@@@ -89,10 -92,9 +89,9 @@@ static int cls_bpf_init(struct tcf_prot
+  
+  static void cls_bpf_delete_prog(struct tcf_proto *tp, struct cls_bpf_prog *prog)
+  {
+- 	tcf_unbind_filter(tp, &prog->res);
+  	tcf_exts_destroy(&prog->exts);
+  
+ -	bpf_prog_destroy(prog->filter);
+ +	sk_unattached_filter_destroy(prog->filter);
+  
+  	kfree(prog->bpf_ops);
+  	kfree(prog);
+@@@ -105,11 -114,9 +104,17 @@@ static int cls_bpf_delete(struct tcf_pr
+  
+  	list_for_each_entry(prog, &head->plist, link) {
+  		if (prog == todel) {
+++<<<<<<< HEAD
+ +			tcf_tree_lock(tp);
+ +			list_del(&prog->link);
+ +			tcf_tree_unlock(tp);
+ +
+ +			cls_bpf_delete_prog(tp, prog);
+++=======
++ 			list_del_rcu(&prog->link);
++ 			tcf_unbind_filter(tp, &prog->res);
++ 			call_rcu(&prog->rcu, __cls_bpf_delete_prog);
+++>>>>>>> 18cdb37ebf4c (net: sched: do not use tcf_proto 'tp' argument from call_rcu)
+  			return 0;
+  		}
+  	}
+@@@ -123,11 -130,13 +128,17 @@@ static void cls_bpf_destroy(struct tcf_
+  	struct cls_bpf_prog *prog, *tmp;
+  
+  	list_for_each_entry_safe(prog, tmp, &head->plist, link) {
+++<<<<<<< HEAD
+ +		list_del(&prog->link);
+ +		cls_bpf_delete_prog(tp, prog);
+++=======
++ 		list_del_rcu(&prog->link);
++ 		tcf_unbind_filter(tp, &prog->res);
++ 		call_rcu(&prog->rcu, __cls_bpf_delete_prog);
+++>>>>>>> 18cdb37ebf4c (net: sched: do not use tcf_proto 'tp' argument from call_rcu)
+  	}
+  
+ -	RCU_INIT_POINTER(tp->root, NULL);
+ -	kfree_rcu(head, rcu);
+ +	kfree(head);
+  }
+  
+  static unsigned long cls_bpf_get(struct tcf_proto *tp, u32 handle)
+@@@ -281,16 -281,18 +292,26 @@@ static int cls_bpf_change(struct net *n
+  	if (ret < 0)
+  		goto errout;
+  
+++<<<<<<< HEAD
+ +	tcf_tree_lock(tp);
+ +	list_add(&prog->link, &head->plist);
+ +	tcf_tree_unlock(tp);
+++=======
++ 	if (oldprog) {
++ 		list_replace_rcu(&prog->link, &oldprog->link);
++ 		tcf_unbind_filter(tp, &oldprog->res);
++ 		call_rcu(&oldprog->rcu, __cls_bpf_delete_prog);
++ 	} else {
++ 		list_add_rcu(&prog->link, &head->plist);
++ 	}
+++>>>>>>> 18cdb37ebf4c (net: sched: do not use tcf_proto 'tp' argument from call_rcu)
+  
+  	*arg = (unsigned long) prog;
+ +
+  	return 0;
+  errout:
+ -	kfree(prog);
+ +	if (*arg == 0UL && prog)
+ +		kfree(prog);
+  
+  	return ret;
+  }
+diff --cc net/sched/cls_fw.c
+index 767413b99c0e,dbfdfd1f1a9f..000000000000
+--- a/net/sched/cls_fw.c
++++ b/net/sched/cls_fw.c
+@@@ -114,9 -120,10 +114,14 @@@ static int fw_init(struct tcf_proto *tp
+  	return 0;
+  }
+  
+ -static void fw_delete_filter(struct rcu_head *head)
+ +static void fw_delete_filter(struct tcf_proto *tp, struct fw_filter *f)
+  {
+++<<<<<<< HEAD
+ +	tcf_unbind_filter(tp, &f->res);
+++=======
++ 	struct fw_filter *f = container_of(head, struct fw_filter, rcu);
++ 
+++>>>>>>> 18cdb37ebf4c (net: sched: do not use tcf_proto 'tp' argument from call_rcu)
+  	tcf_exts_destroy(&f->exts);
+  	kfree(f);
+  }
+@@@ -131,12 -138,15 +136,20 @@@ static void fw_destroy(struct tcf_prot
+  		return;
+  
+  	for (h = 0; h < HTSIZE; h++) {
+++<<<<<<< HEAD
+ +		while ((f = head->ht[h]) != NULL) {
+ +			head->ht[h] = f->next;
+ +			fw_delete_filter(tp, f);
+++=======
++ 		while ((f = rtnl_dereference(head->ht[h])) != NULL) {
++ 			RCU_INIT_POINTER(head->ht[h],
++ 					 rtnl_dereference(f->next));
++ 			tcf_unbind_filter(tp, &f->res);
++ 			call_rcu(&f->rcu, fw_delete_filter);
+++>>>>>>> 18cdb37ebf4c (net: sched: do not use tcf_proto 'tp' argument from call_rcu)
+  		}
+  	}
+ -	RCU_INIT_POINTER(tp->root, NULL);
+ -	kfree_rcu(head, rcu);
+ +	kfree(head);
+  }
+  
+  static int fw_delete(struct tcf_proto *tp, unsigned long arg)
+@@@ -148,12 -159,14 +161,23 @@@
+  	if (head == NULL || f == NULL)
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	for (fp = &head->ht[fw_hash(f->id)]; *fp; fp = &(*fp)->next) {
+ +		if (*fp == f) {
+ +			tcf_tree_lock(tp);
+ +			*fp = f->next;
+ +			tcf_tree_unlock(tp);
+ +			fw_delete_filter(tp, f);
+++=======
++ 	fp = &head->ht[fw_hash(f->id)];
++ 
++ 	for (pfp = rtnl_dereference(*fp); pfp;
++ 	     fp = &pfp->next, pfp = rtnl_dereference(*fp)) {
++ 		if (pfp == f) {
++ 			RCU_INIT_POINTER(*fp, rtnl_dereference(f->next));
++ 			tcf_unbind_filter(tp, &f->res);
++ 			call_rcu(&f->rcu, fw_delete_filter);
+++>>>>>>> 18cdb37ebf4c (net: sched: do not use tcf_proto 'tp' argument from call_rcu)
+  			return 0;
+  		}
+  	}
+@@@ -233,10 -246,45 +257,46 @@@ static int fw_change(struct net *net, s
+  	if (err < 0)
+  		return err;
+  
+ -	if (f) {
+ -		struct fw_filter *pfp, *fnew;
+ -		struct fw_filter __rcu **fp;
+ -
+ +	if (f != NULL) {
+  		if (f->id != handle && handle)
+  			return -EINVAL;
+++<<<<<<< HEAD
+ +		return fw_change_attrs(net, tp, f, tb, tca, base, ovr);
+++=======
++ 
++ 		fnew = kzalloc(sizeof(struct fw_filter), GFP_KERNEL);
++ 		if (!fnew)
++ 			return -ENOBUFS;
++ 
++ 		fnew->id = f->id;
++ 		fnew->res = f->res;
++ #ifdef CONFIG_NET_CLS_IND
++ 		fnew->ifindex = f->ifindex;
++ #endif /* CONFIG_NET_CLS_IND */
++ 		fnew->tp = f->tp;
++ 
++ 		tcf_exts_init(&fnew->exts, TCA_FW_ACT, TCA_FW_POLICE);
++ 
++ 		err = fw_change_attrs(net, tp, fnew, tb, tca, base, ovr);
++ 		if (err < 0) {
++ 			kfree(fnew);
++ 			return err;
++ 		}
++ 
++ 		fp = &head->ht[fw_hash(fnew->id)];
++ 		for (pfp = rtnl_dereference(*fp); pfp;
++ 		     fp = &pfp->next, pfp = rtnl_dereference(*fp))
++ 			if (pfp == f)
++ 				break;
++ 
++ 		RCU_INIT_POINTER(fnew->next, rtnl_dereference(pfp->next));
++ 		rcu_assign_pointer(*fp, fnew);
++ 		tcf_unbind_filter(tp, &f->res);
++ 		call_rcu(&f->rcu, fw_delete_filter);
++ 
++ 		*arg = (unsigned long)fnew;
++ 		return err;
+++>>>>>>> 18cdb37ebf4c (net: sched: do not use tcf_proto 'tp' argument from call_rcu)
+  	}
+  
+  	if (!handle)
+diff --cc net/sched/cls_route.c
+index 9b3f2b5a44be,6f22baae0afa..000000000000
+--- a/net/sched/cls_route.c
++++ b/net/sched/cls_route.c
+@@@ -248,9 -266,10 +248,14 @@@ static int route4_init(struct tcf_prot
+  }
+  
+  static void
+ -route4_delete_filter(struct rcu_head *head)
+ +route4_delete_filter(struct tcf_proto *tp, struct route4_filter *f)
+  {
+++<<<<<<< HEAD
+ +	tcf_unbind_filter(tp, &f->res);
+++=======
++ 	struct route4_filter *f = container_of(head, struct route4_filter, rcu);
++ 
+++>>>>>>> 18cdb37ebf4c (net: sched: do not use tcf_proto 'tp' argument from call_rcu)
+  	tcf_exts_destroy(&f->exts);
+  	kfree(f);
+  }
+@@@ -271,15 -290,21 +276,25 @@@ static void route4_destroy(struct tcf_p
+  			for (h2 = 0; h2 <= 32; h2++) {
+  				struct route4_filter *f;
+  
+++<<<<<<< HEAD
+ +				while ((f = b->ht[h2]) != NULL) {
+ +					b->ht[h2] = f->next;
+ +					route4_delete_filter(tp, f);
+++=======
++ 				while ((f = rtnl_dereference(b->ht[h2])) != NULL) {
++ 					struct route4_filter *next;
++ 
++ 					next = rtnl_dereference(f->next);
++ 					RCU_INIT_POINTER(b->ht[h2], next);
++ 					tcf_unbind_filter(tp, &f->res);
++ 					call_rcu(&f->rcu, route4_delete_filter);
+++>>>>>>> 18cdb37ebf4c (net: sched: do not use tcf_proto 'tp' argument from call_rcu)
+  				}
+  			}
+ -			RCU_INIT_POINTER(head->table[h1], NULL);
+ -			kfree_rcu(b, rcu);
+ +			kfree(b);
+  		}
+  	}
+ -	RCU_INIT_POINTER(tp->root, NULL);
+ -	kfree_rcu(head, rcu);
+ +	kfree(head);
+  }
+  
+  static int route4_delete(struct tcf_proto *tp, unsigned long arg)
+@@@ -296,27 -323,36 +311,33 @@@
+  	h = f->handle;
+  	b = f->bkt;
+  
+ -	fp = &b->ht[from_hash(h >> 16)];
+ -	for (nf = rtnl_dereference(*fp); nf;
+ -	     fp = &nf->next, nf = rtnl_dereference(*fp)) {
+ -		if (nf == f) {
+ -			/* unlink it */
+ -			RCU_INIT_POINTER(*fp, rtnl_dereference(f->next));
+ +	for (fp = &b->ht[from_hash(h >> 16)]; *fp; fp = &(*fp)->next) {
+ +		if (*fp == f) {
+ +			tcf_tree_lock(tp);
+ +			*fp = f->next;
+ +			tcf_tree_unlock(tp);
+  
+ -			/* Remove any fastmap lookups that might ref filter
+ -			 * notice we unlink'd the filter so we can't get it
+ -			 * back in the fastmap.
+ -			 */
+ -			route4_reset_fastmap(head);
+ +			route4_reset_fastmap(tp->q, head, f->id);
+ +			route4_delete_filter(tp, f);
+  
+++<<<<<<< HEAD
+ +			/* Strip tree */
+++=======
++ 			/* Delete it */
++ 			tcf_unbind_filter(tp, &f->res);
++ 			call_rcu(&f->rcu, route4_delete_filter);
+++>>>>>>> 18cdb37ebf4c (net: sched: do not use tcf_proto 'tp' argument from call_rcu)
+  
+ -			/* Strip RTNL protected tree */
+ -			for (i = 0; i <= 32; i++) {
+ -				struct route4_filter *rt;
+ -
+ -				rt = rtnl_dereference(b->ht[i]);
+ -				if (rt)
+ +			for (i = 0; i <= 32; i++)
+ +				if (b->ht[i])
+  					return 0;
+ -			}
+  
+  			/* OK, session has no flows */
+ -			RCU_INIT_POINTER(head->table[to_hash(h)], NULL);
+ -			kfree_rcu(b, rcu);
+ +			tcf_tree_lock(tp);
+ +			head->table[to_hash(h)] = NULL;
+ +			tcf_tree_unlock(tp);
+  
+ +			kfree(b);
+  			return 0;
+  		}
+  	}
+@@@ -508,10 -542,13 +529,17 @@@ reinsert
+  			}
+  		}
+  	}
+ +	tcf_tree_unlock(tp);
+  
+ -	route4_reset_fastmap(head);
+ +	route4_reset_fastmap(tp->q, head, f->id);
+  	*arg = (unsigned long)f;
+++<<<<<<< HEAD
+++=======
++ 	if (fold) {
++ 		tcf_unbind_filter(tp, &fold->res);
++ 		call_rcu(&fold->rcu, route4_delete_filter);
++ 	}
+++>>>>>>> 18cdb37ebf4c (net: sched: do not use tcf_proto 'tp' argument from call_rcu)
+  	return 0;
+  
+  errout:
+diff --git a/net/sched/cls_basic.c b/net/sched/cls_basic.c
+index a2883e2cb8ec..7d4084fa847b 100644
+--- a/net/sched/cls_basic.c
++++ b/net/sched/cls_basic.c
+@@ -91,9 +91,7 @@ static int basic_init(struct tcf_proto *tp)
+ static void basic_delete_filter(struct rcu_head *head)
+ {
+ 	struct basic_filter *f = container_of(head, struct basic_filter, rcu);
+-	struct tcf_proto *tp = f->tp;
+ 
+-	tcf_unbind_filter(tp, &f->res);
+ 	tcf_exts_destroy(&f->exts);
+ 	tcf_em_tree_destroy(tp, &f->ematches);
+ 	kfree(f);
+@@ -106,6 +104,7 @@ static void basic_destroy(struct tcf_proto *tp)
+ 
+ 	list_for_each_entry_safe(f, n, &head->flist, link) {
+ 		list_del_rcu(&f->link);
++		tcf_unbind_filter(tp, &f->res);
+ 		call_rcu(&f->rcu, basic_delete_filter);
+ 	}
+ 	RCU_INIT_POINTER(tp->root, NULL);
+@@ -120,6 +119,7 @@ static int basic_delete(struct tcf_proto *tp, unsigned long arg)
+ 	list_for_each_entry(t, &head->flist, link)
+ 		if (t == f) {
+ 			list_del_rcu(&t->link);
++			tcf_unbind_filter(tp, &t->res);
+ 			call_rcu(&t->rcu, basic_delete_filter);
+ 			return 0;
+ 		}
+@@ -222,6 +222,7 @@ static int basic_change(struct net *net, struct sk_buff *in_skb,
+ 
+ 	if (fold) {
+ 		list_replace_rcu(&fold->link, &fnew->link);
++		tcf_unbind_filter(tp, &fold->res);
+ 		call_rcu(&fold->rcu, basic_delete_filter);
+ 	} else {
+ 		list_add_rcu(&fnew->link, &head->flist);
+* Unmerged path net/sched/cls_bpf.c
+* Unmerged path net/sched/cls_fw.c
+* Unmerged path net/sched/cls_route.c
