@@ -1,0 +1,284 @@
+bpf: add helper inlining infra and optimize map_array lookup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Alexei Starovoitov <ast@fb.com>
+commit 81ed18ab3098b6519274545e80a29caacb77d160
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/81ed18ab.failed
+
+Optimize bpf_call -> bpf_map_lookup_elem() -> array_map_lookup_elem()
+into a sequence of bpf instructions.
+When JIT is on the sequence of bpf instructions is the sequence
+of native cpu instructions with significantly faster performance
+than indirect call and two function's prologue/epilogue.
+
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Daniel Borkmann <daniel@iogearbox.net>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 81ed18ab3098b6519274545e80a29caacb77d160)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+#	include/linux/bpf_verifier.h
+#	include/linux/filter.h
+#	kernel/bpf/arraymap.c
+#	kernel/bpf/verifier.c
+diff --cc include/linux/bpf.h
+index d4c1f9049ad3,da8c64ca8dc9..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -22,8 -28,14 +22,17 @@@ struct bpf_map_ops 
+  
+  	/* funcs callable from userspace and from eBPF programs */
+  	void *(*map_lookup_elem)(struct bpf_map *map, void *key);
+ -	int (*map_update_elem)(struct bpf_map *map, void *key, void *value, u64 flags);
+ +	int (*map_update_elem)(struct bpf_map *map, void *key, void *value);
+  	int (*map_delete_elem)(struct bpf_map *map, void *key);
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* funcs called by prog_array and perf_event_array map */
++ 	void *(*map_fd_get_ptr)(struct bpf_map *map, struct file *map_file,
++ 				int fd);
++ 	void (*map_fd_put_ptr)(void *ptr);
++ 	u32 (*map_gen_lookup)(struct bpf_map *map, struct bpf_insn *insn_buf);
+++>>>>>>> 81ed18ab3098 (bpf: add helper inlining infra and optimize map_array lookup)
+  };
+  
+  struct bpf_map {
+diff --cc include/linux/filter.h
+index d322ed880333,dffa072b7b79..000000000000
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@@ -98,22 -676,208 +98,146 @@@ extern void bpf_jit_free(struct sk_filt
+  static inline void bpf_jit_dump(unsigned int flen, unsigned int proglen,
+  				u32 pass, void *image)
+  {
+ -	pr_err("flen=%u proglen=%u pass=%u image=%pK from=%s pid=%d\n", flen,
+ -	       proglen, pass, image, current->comm, task_pid_nr(current));
+ -
+ +	pr_err("flen=%u proglen=%u pass=%u image=%p\n",
+ +	       flen, proglen, pass, image);
+  	if (image)
+ -		print_hex_dump(KERN_ERR, "JIT code: ", DUMP_PREFIX_OFFSET,
+ +		print_hex_dump(KERN_ERR, "JIT code: ", DUMP_PREFIX_ADDRESS,
+  			       16, 1, image, proglen, false);
+  }
+++<<<<<<< HEAD
+ +#define SK_RUN_FILTER(FILTER, SKB) (*FILTER->bpf_func)(SKB, FILTER->insns)
+ +#else
+ +static inline void bpf_jit_compile(struct sk_filter *fp)
+++=======
++ 
++ static inline bool bpf_jit_is_ebpf(void)
++ {
++ # ifdef CONFIG_HAVE_EBPF_JIT
++ 	return true;
++ # else
++ 	return false;
++ # endif
++ }
++ 
++ static inline bool ebpf_jit_enabled(void)
++ {
++ 	return bpf_jit_enable && bpf_jit_is_ebpf();
++ }
++ 
++ static inline bool bpf_prog_ebpf_jited(const struct bpf_prog *fp)
++ {
++ 	return fp->jited && bpf_jit_is_ebpf();
++ }
++ 
++ static inline bool bpf_jit_blinding_enabled(void)
++ {
++ 	/* These are the prerequisites, should someone ever have the
++ 	 * idea to call blinding outside of them, we make sure to
++ 	 * bail out.
++ 	 */
++ 	if (!bpf_jit_is_ebpf())
++ 		return false;
++ 	if (!bpf_jit_enable)
++ 		return false;
++ 	if (!bpf_jit_harden)
++ 		return false;
++ 	if (bpf_jit_harden == 1 && capable(CAP_SYS_ADMIN))
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ static inline bool bpf_jit_kallsyms_enabled(void)
++ {
++ 	/* There are a couple of corner cases where kallsyms should
++ 	 * not be enabled f.e. on hardening.
++ 	 */
++ 	if (bpf_jit_harden)
++ 		return false;
++ 	if (!bpf_jit_kallsyms)
++ 		return false;
++ 	if (bpf_jit_kallsyms == 1)
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ const char *__bpf_address_lookup(unsigned long addr, unsigned long *size,
++ 				 unsigned long *off, char *sym);
++ bool is_bpf_text_address(unsigned long addr);
++ int bpf_get_kallsym(unsigned int symnum, unsigned long *value, char *type,
++ 		    char *sym);
++ 
++ static inline const char *
++ bpf_address_lookup(unsigned long addr, unsigned long *size,
++ 		   unsigned long *off, char **modname, char *sym)
++ {
++ 	const char *ret = __bpf_address_lookup(addr, size, off, sym);
++ 
++ 	if (ret && modname)
++ 		*modname = NULL;
++ 	return ret;
++ }
++ 
++ void bpf_prog_kallsyms_add(struct bpf_prog *fp);
++ void bpf_prog_kallsyms_del(struct bpf_prog *fp);
++ 
++ #else /* CONFIG_BPF_JIT */
++ 
++ static inline bool ebpf_jit_enabled(void)
++ {
++ 	return false;
++ }
++ 
++ static inline bool bpf_prog_ebpf_jited(const struct bpf_prog *fp)
++ {
++ 	return false;
++ }
++ 
++ static inline void bpf_jit_free(struct bpf_prog *fp)
++ {
++ 	bpf_prog_unlock_free(fp);
++ }
++ 
++ static inline bool bpf_jit_kallsyms_enabled(void)
++ {
++ 	return false;
++ }
++ 
++ static inline const char *
++ __bpf_address_lookup(unsigned long addr, unsigned long *size,
++ 		     unsigned long *off, char *sym)
++ {
++ 	return NULL;
++ }
++ 
++ static inline bool is_bpf_text_address(unsigned long addr)
++ {
++ 	return false;
++ }
++ 
++ static inline int bpf_get_kallsym(unsigned int symnum, unsigned long *value,
++ 				  char *type, char *sym)
++ {
++ 	return -ERANGE;
++ }
++ 
++ static inline const char *
++ bpf_address_lookup(unsigned long addr, unsigned long *size,
++ 		   unsigned long *off, char **modname, char *sym)
++ {
++ 	return NULL;
++ }
++ 
++ static inline void bpf_prog_kallsyms_add(struct bpf_prog *fp)
+++>>>>>>> 81ed18ab3098 (bpf: add helper inlining infra and optimize map_array lookup)
+  {
+  }
+ -
+ -static inline void bpf_prog_kallsyms_del(struct bpf_prog *fp)
+ +static inline void bpf_jit_free(struct sk_filter *fp)
+  {
+  }
+ -#endif /* CONFIG_BPF_JIT */
+ -
+ -#define BPF_ANC		BIT(15)
+ -
+ -static inline bool bpf_needs_clear_a(const struct sock_filter *first)
+ -{
+ -	switch (first->code) {
+ -	case BPF_RET | BPF_K:
+ -	case BPF_LD | BPF_W | BPF_LEN:
+ -		return false;
+ -
+ -	case BPF_LD | BPF_W | BPF_ABS:
+ -	case BPF_LD | BPF_H | BPF_ABS:
+ -	case BPF_LD | BPF_B | BPF_ABS:
+ -		if (first->k == SKF_AD_OFF + SKF_AD_ALU_XOR_X)
+ -			return true;
+ -		return false;
+ -
+ -	default:
+ -		return true;
+ -	}
+ -}
+ -
+ -static inline u16 bpf_anc_helper(const struct sock_filter *ftest)
+ -{
+ -	BUG_ON(ftest->code & BPF_ANC);
+ -
+ -	switch (ftest->code) {
+ -	case BPF_LD | BPF_W | BPF_ABS:
+ -	case BPF_LD | BPF_H | BPF_ABS:
+ -	case BPF_LD | BPF_B | BPF_ABS:
+ -#define BPF_ANCILLARY(CODE)	case SKF_AD_OFF + SKF_AD_##CODE:	\
+ -				return BPF_ANC | SKF_AD_##CODE
+ -		switch (ftest->k) {
+ -		BPF_ANCILLARY(PROTOCOL);
+ -		BPF_ANCILLARY(PKTTYPE);
+ -		BPF_ANCILLARY(IFINDEX);
+ -		BPF_ANCILLARY(NLATTR);
+ -		BPF_ANCILLARY(NLATTR_NEST);
+ -		BPF_ANCILLARY(MARK);
+ -		BPF_ANCILLARY(QUEUE);
+ -		BPF_ANCILLARY(HATYPE);
+ -		BPF_ANCILLARY(RXHASH);
+ -		BPF_ANCILLARY(CPU);
+ -		BPF_ANCILLARY(ALU_XOR_X);
+ -		BPF_ANCILLARY(VLAN_TAG);
+ -		BPF_ANCILLARY(VLAN_TAG_PRESENT);
+ -		BPF_ANCILLARY(PAY_OFFSET);
+ -		BPF_ANCILLARY(RANDOM);
+ -		BPF_ANCILLARY(VLAN_TPID);
+ -		}
+ -		/* Fallthrough. */
+ -	default:
+ -		return ftest->code;
+ -	}
+ -}
+ -
+ -void *bpf_internal_load_pointer_neg_helper(const struct sk_buff *skb,
+ -					   int k, unsigned int size);
+ -
+ -static inline void *bpf_load_pointer(const struct sk_buff *skb, int k,
+ -				     unsigned int size, void *buffer)
+ -{
+ -	if (k >= 0)
+ -		return skb_header_pointer(skb, k, size, buffer);
+ -
+ -	return bpf_internal_load_pointer_neg_helper(skb, k, size);
+ -}
+ +#define SK_RUN_FILTER(FILTER, SKB) sk_run_filter(SKB, FILTER->insns)
+ +#endif
+  
+  static inline int bpf_tell_extensions(void)
+  {
+* Unmerged path include/linux/bpf_verifier.h
+* Unmerged path kernel/bpf/arraymap.c
+* Unmerged path kernel/bpf/verifier.c
+* Unmerged path include/linux/bpf.h
+* Unmerged path include/linux/bpf_verifier.h
+* Unmerged path include/linux/filter.h
+* Unmerged path kernel/bpf/arraymap.c
+* Unmerged path kernel/bpf/verifier.c
