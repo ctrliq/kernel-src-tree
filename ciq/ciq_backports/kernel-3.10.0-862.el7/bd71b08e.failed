@@ -1,0 +1,1024 @@
+net/mlx5: Support multiple updates of steering rules in parallel
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] mlx5: Support multiple updates of steering rules in parallel (Kamal Heib) [1456687 1456694]
+Rebuild_FUZZ: 96.77%
+commit-author Maor Gottlieb <maorg@mellanox.com>
+commit bd71b08ec2ee4504bcc3b37a9283ce15e93dfacd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/bd71b08e.failed
+
+Most of the time spent on adding new flow steering rule
+is executing the firmware command.
+The most common action is adding a new flow steering entry.
+In order to enhance the update rate we parallelize the
+commands by doing the following:
+
+1) Replace the mutex lock with readers-writers semaphore and take
+the write lock only when necessary (e.g. allocating a new flow
+table entry index or adding a node to the parent's children list).
+When we try to find a suitable child in the parent's children list
+(e.g. search for flow group with the same match_criteria of the rule)
+then we only take the read lock.
+
+2) Add versioning mechanism - each steering entity (FT, FG, FTE, DST)
+will have an incremental version. The version is increased when the
+entity is changed (e.g. when a new FTE was added to FG - the FG's
+version is increased).
+Versioning is used in order to determine if the last traverse of an
+entity's children is valid or a rescan under write lock is required.
+
+This support improves the insertion rate of steering rules
+from ~5k/sec to ~40k/sec.
+
+	Signed-off-by: Maor Gottlieb <maorg@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit bd71b08ec2ee4504bcc3b37a9283ce15e93dfacd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+#	drivers/net/ethernet/mellanox/mlx5/core/fs_core.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+index f60baa93f1dc,e7301cf747c5..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+@@@ -143,16 -145,39 +143,22 @@@ static struct init_tree_node 
+  	}
+  };
+  
+ -enum fs_i_lock_class {
+ -	FS_LOCK_GRANDPARENT,
+ -	FS_LOCK_PARENT,
+ -	FS_LOCK_CHILD
+ -};
+ -
+ -static const struct rhashtable_params rhash_fte = {
+ -	.key_len = FIELD_SIZEOF(struct fs_fte, val),
+ -	.key_offset = offsetof(struct fs_fte, val),
+ -	.head_offset = offsetof(struct fs_fte, hash),
+ -	.automatic_shrinking = true,
+ -	.min_size = 1,
+ -};
+ -
+ -static const struct rhashtable_params rhash_fg = {
+ -	.key_len = FIELD_SIZEOF(struct mlx5_flow_group, mask),
+ -	.key_offset = offsetof(struct mlx5_flow_group, mask),
+ -	.head_offset = offsetof(struct mlx5_flow_group, hash),
+ -	.automatic_shrinking = true,
+ -	.min_size = 1,
+ -
+ +enum fs_i_mutex_lock_class {
+ +	FS_MUTEX_GRANDPARENT,
+ +	FS_MUTEX_PARENT,
+ +	FS_MUTEX_CHILD
+  };
+  
+- static void del_rule(struct fs_node *node);
+- static void del_flow_table(struct fs_node *node);
+- static void del_flow_group(struct fs_node *node);
+- static void del_fte(struct fs_node *node);
++ static void del_hw_flow_table(struct fs_node *node);
++ static void del_hw_flow_group(struct fs_node *node);
++ static void del_hw_fte(struct fs_node *node);
++ static void del_sw_flow_table(struct fs_node *node);
++ static void del_sw_flow_group(struct fs_node *node);
++ static void del_sw_fte(struct fs_node *node);
++ /* Delete rule (destination) is special case that 
++  * requires to lock the FTE for all the deletion process.
++  */
++ static void del_sw_hw_rule(struct fs_node *node);
+  static bool mlx5_flow_dests_cmp(struct mlx5_flow_destination *d1,
+  				struct mlx5_flow_destination *d2);
+  static struct mlx5_flow_rule *
+@@@ -160,14 -185,16 +166,26 @@@ find_flow_rule(struct fs_fte *fte
+  	       struct mlx5_flow_destination *dest);
+  
+  static void tree_init_node(struct fs_node *node,
+++<<<<<<< HEAD
+ +			   unsigned int refcount,
+ +			   void (*remove_func)(struct fs_node *))
+++=======
++ 			   void (*del_hw_func)(struct fs_node *),
++ 			   void (*del_sw_func)(struct fs_node *))
+++>>>>>>> bd71b08ec2ee (net/mlx5: Support multiple updates of steering rules in parallel)
+  {
+ -	atomic_set(&node->refcount, 1);
+ +	atomic_set(&node->refcount, refcount);
+  	INIT_LIST_HEAD(&node->list);
+  	INIT_LIST_HEAD(&node->children);
+++<<<<<<< HEAD
+ +	mutex_init(&node->lock);
+ +	node->remove_func = remove_func;
+++=======
++ 	init_rwsem(&node->lock);
++ 	node->del_hw_func = del_hw_func;
++ 	node->del_sw_func = del_sw_func;
++ 	node->active = false;
+++>>>>>>> bd71b08ec2ee (net/mlx5: Support multiple updates of steering rules in parallel)
+  }
+  
+  static void tree_add_node(struct fs_node *node, struct fs_node *parent)
+@@@ -183,34 -210,47 +201,59 @@@
+  		node->root = parent->root;
+  }
+  
+- static void tree_get_node(struct fs_node *node)
++ static int tree_get_node(struct fs_node *node)
+  {
+- 	atomic_inc(&node->refcount);
++ 	return atomic_add_unless(&node->refcount, 1, 0);
+  }
+  
+++<<<<<<< HEAD
+ +static void nested_lock_ref_node(struct fs_node *node,
+ +				 enum fs_i_mutex_lock_class class)
+++=======
++ static void nested_down_read_ref_node(struct fs_node *node,
++ 				      enum fs_i_lock_class class)
++ {
++ 	if (node) {
++ 		down_read_nested(&node->lock, class);
++ 		atomic_inc(&node->refcount);
++ 	}
++ }
++ 
++ static void nested_down_write_ref_node(struct fs_node *node,
++ 				       enum fs_i_lock_class class)
+++>>>>>>> bd71b08ec2ee (net/mlx5: Support multiple updates of steering rules in parallel)
+  {
+  	if (node) {
+ -		down_write_nested(&node->lock, class);
+ +		mutex_lock_nested(&node->lock, class);
+  		atomic_inc(&node->refcount);
+  	}
+  }
+  
+- static void lock_ref_node(struct fs_node *node)
++ static void down_write_ref_node(struct fs_node *node)
+  {
+  	if (node) {
+ -		down_write(&node->lock);
+ +		mutex_lock(&node->lock);
+  		atomic_inc(&node->refcount);
+  	}
+  }
+  
+- static void unlock_ref_node(struct fs_node *node)
++ static void up_read_ref_node(struct fs_node *node)
+  {
+++<<<<<<< HEAD
+ +	if (node) {
+ +		atomic_dec(&node->refcount);
+ +		mutex_unlock(&node->lock);
+ +	}
+++=======
++ 	atomic_dec(&node->refcount);
++ 	up_read(&node->lock);
++ }
++ 
++ static void up_write_ref_node(struct fs_node *node)
++ {
++ 	atomic_dec(&node->refcount);
++ 	up_write(&node->lock);
+++>>>>>>> bd71b08ec2ee (net/mlx5: Support multiple updates of steering rules in parallel)
+  }
+  
+  static void tree_put_node(struct fs_node *node)
+@@@ -356,9 -407,21 +404,27 @@@ static void del_hw_flow_table(struct fs
+  	fs_get_obj(ft, node);
+  	dev = get_dev(&ft->node);
+  
+++<<<<<<< HEAD
+ +	err = mlx5_cmd_destroy_flow_table(dev, ft);
+ +	if (err)
+ +		mlx5_core_warn(dev, "flow steering can't destroy ft\n");
+++=======
++ 	if (node->active) {
++ 		err = mlx5_cmd_destroy_flow_table(dev, ft);
++ 		if (err)
++ 			mlx5_core_warn(dev, "flow steering can't destroy ft\n");
++ 	}
++ }
++ 
++ static void del_sw_flow_table(struct fs_node *node)
++ {
++ 	struct mlx5_flow_table *ft;
++ 	struct fs_prio *prio;
++ 
++ 	fs_get_obj(ft, node);
++ 
++ 	rhltable_destroy(&ft->fgs_hash);
+++>>>>>>> bd71b08ec2ee (net/mlx5: Support multiple updates of steering rules in parallel)
+  	fs_get_obj(prio, ft->node.parent);
+  	prio->num_ft--;
+  }
+@@@ -385,9 -440,8 +451,13 @@@ static void del_sw_hw_rule(struct fs_no
+  	fs_get_obj(rule, node);
+  	fs_get_obj(fte, rule->node.parent);
+  	fs_get_obj(fg, fte->node.parent);
+ +	memcpy(match_value, fte->val, sizeof(fte->val));
+  	fs_get_obj(ft, fg->node.parent);
+++<<<<<<< HEAD
+ +	list_del(&rule->node.list);
+++=======
++ 	trace_mlx5_fs_del_rule(rule);
+++>>>>>>> bd71b08ec2ee (net/mlx5: Support multiple updates of steering rules in parallel)
+  	if (rule->sw_action == MLX5_FLOW_CONTEXT_ACTION_FWD_NEXT_PRIO) {
+  		mutex_lock(&rule->dest_attr.ft->lock);
+  		list_del(&rule->next_ft);
+@@@ -415,10 -469,9 +485,10 @@@ out
+  				       "%s can't del rule fg id=%d fte_index=%d\n",
+  				       __func__, fg->id, fte->index);
+  	}
+ +	kvfree(match_value);
+  }
+  
+- static void del_fte(struct fs_node *node)
++ static void del_hw_fte(struct fs_node *node)
+  {
+  	struct mlx5_flow_table *ft;
+  	struct mlx5_flow_group *fg;
+@@@ -430,19 -483,35 +500,41 @@@
+  	fs_get_obj(fg, fte->node.parent);
+  	fs_get_obj(ft, fg->node.parent);
+  
++ 	trace_mlx5_fs_del_fte(fte);
+  	dev = get_dev(&ft->node);
+++<<<<<<< HEAD
+ +	err = mlx5_cmd_delete_fte(dev, ft,
+ +				  fte->index);
+ +	if (err)
+ +		mlx5_core_warn(dev,
+ +			       "flow steering can't delete fte in index %d of flow group id %d\n",
+ +			       fte->index, fg->id);
+++=======
++ 	if (node->active) {
++ 		err = mlx5_cmd_delete_fte(dev, ft,
++ 					  fte->index);
++ 		if (err)
++ 			mlx5_core_warn(dev,
++ 				       "flow steering can't delete fte in index %d of flow group id %d\n",
++ 				       fte->index, fg->id);
++ 	}
++ }
++ 
++ static void del_sw_fte(struct fs_node *node)
++ {
++ 	struct mlx5_flow_group *fg;
++ 	struct fs_fte *fte;
++ 	int err;
++ 
++ 	fs_get_obj(fte, node);
++ 	fs_get_obj(fg, fte->node.parent);
+++>>>>>>> bd71b08ec2ee (net/mlx5: Support multiple updates of steering rules in parallel)
+  
+ -	err = rhashtable_remove_fast(&fg->ftes_hash,
+ -				     &fte->hash,
+ -				     rhash_fte);
+ -	WARN_ON(err);
+ -	ida_simple_remove(&fg->fte_allocator, fte->index - fg->start_index);
+ +	fte->status = 0;
+ +	fg->num_ftes--;
+  }
+  
+- static void del_flow_group(struct fs_node *node)
++ static void del_hw_flow_group(struct fs_node *node)
+  {
+  	struct mlx5_flow_group *fg;
+  	struct mlx5_flow_table *ft;
+@@@ -451,13 -520,30 +543,35 @@@
+  	fs_get_obj(fg, node);
+  	fs_get_obj(ft, fg->node.parent);
+  	dev = get_dev(&ft->node);
+ -	trace_mlx5_fs_del_fg(fg);
+  
+- 	if (ft->autogroup.active)
+- 		ft->autogroup.num_groups--;
++ 	if (fg->node.active && mlx5_cmd_destroy_flow_group(dev, ft, fg->id))
++ 		mlx5_core_warn(dev, "flow steering can't destroy fg %d of ft %d\n",
++ 			       fg->id, ft->id);
++ }
+  
++ static void del_sw_flow_group(struct fs_node *node)
++ {
++ 	struct mlx5_flow_group *fg;
++ 	struct mlx5_flow_table *ft;
++ 	int err;
++ 
++ 	fs_get_obj(fg, node);
++ 	fs_get_obj(ft, fg->node.parent);
++ 
+++<<<<<<< HEAD
+ +	if (mlx5_cmd_destroy_flow_group(dev, ft, fg->id))
+ +		mlx5_core_warn(dev, "flow steering can't destroy fg %d of ft %d\n",
+ +			       fg->id, ft->id);
+++=======
++ 	rhashtable_destroy(&fg->ftes_hash);
++ 	ida_destroy(&fg->fte_allocator);
++ 	if (ft->autogroup.active)
++ 		ft->autogroup.num_groups--;
++ 	err = rhltable_remove(&ft->fgs_hash,
++ 			      &fg->hash,
++ 			      rhash_fg);
++ 	WARN_ON(err);
+++>>>>>>> bd71b08ec2ee (net/mlx5: Support multiple updates of steering rules in parallel)
+  }
+  
+  static struct fs_fte *alloc_fte(struct mlx5_flow_act *flow_act,
+@@@ -481,14 -567,59 +595,66 @@@
+  	return fte;
+  }
+  
+++<<<<<<< HEAD
+ +static struct mlx5_flow_group *alloc_flow_group(u32 *create_fg_in)
+++=======
++ static struct fs_fte *alloc_insert_fte(struct mlx5_flow_group *fg,
++ 				       u32 *match_value,
++ 				       struct mlx5_flow_act *flow_act)
++ {
++ 	struct fs_fte *fte;
++ 	int index;
++ 	int ret;
++ 
++ 	index = ida_simple_get(&fg->fte_allocator, 0,
++ 			       fg->max_ftes,
++ 			       GFP_KERNEL);
++ 	if (index < 0)
++ 		return ERR_PTR(index);
++ 
++ 	fte = alloc_fte(flow_act, match_value, index + fg->start_index);
++ 	if (IS_ERR(fte)) {
++ 		ret = PTR_ERR(fte);
++ 		goto err_ida_remove;
++ 	}
++ 
++ 	ret = rhashtable_insert_fast(&fg->ftes_hash,
++ 				     &fte->hash,
++ 				     rhash_fte);
++ 	if (ret)
++ 		goto err_free;
++ 
++ 	tree_init_node(&fte->node, del_hw_fte, del_sw_fte);
++ 	tree_add_node(&fte->node, &fg->node);
++ 	list_add_tail(&fte->node.list, &fg->node.children);
++ 
++ 	return fte;
++ 
++ err_free:
++ 	kfree(fte);
++ err_ida_remove:
++ 	ida_simple_remove(&fg->fte_allocator, index);
++ 	return ERR_PTR(ret);
++ }
++ 
++ static void dealloc_flow_group(struct mlx5_flow_group *fg)
++ {
++ 	rhashtable_destroy(&fg->ftes_hash);
++ 	kfree(fg);
++ }
++ 
++ static struct mlx5_flow_group *alloc_flow_group(u8 match_criteria_enable,
++ 						void *match_criteria,
++ 						int start_index,
++ 						int end_index)
+++>>>>>>> bd71b08ec2ee (net/mlx5: Support multiple updates of steering rules in parallel)
+  {
+  	struct mlx5_flow_group *fg;
+ -	int ret;
+ -
+ +	void *match_criteria = MLX5_ADDR_OF(create_flow_group_in,
+ +					    create_fg_in, match_criteria);
+ +	u8 match_criteria_enable = MLX5_GET(create_flow_group_in,
+ +					    create_fg_in,
+ +					    match_criteria_enable);
+  	fg = kzalloc(sizeof(*fg), GFP_KERNEL);
+  	if (!fg)
+  		return ERR_PTR(-ENOMEM);
+@@@ -497,10 -634,42 +663,49 @@@
+  	memcpy(&fg->mask.match_criteria, match_criteria,
+  	       sizeof(fg->mask.match_criteria));
+  	fg->node.type =  FS_TYPE_FLOW_GROUP;
+++<<<<<<< HEAD
+ +	fg->start_index = MLX5_GET(create_flow_group_in, create_fg_in,
+ +				   start_flow_index);
+ +	fg->max_ftes = MLX5_GET(create_flow_group_in, create_fg_in,
+ +				end_flow_index) - fg->start_index + 1;
+++=======
++ 	fg->start_index = start_index;
++ 	fg->max_ftes = end_index - start_index + 1;
++ 
++ 	return fg;
++ }
++ 
++ static struct mlx5_flow_group *alloc_insert_flow_group(struct mlx5_flow_table *ft,
++ 						       u8 match_criteria_enable,
++ 						       void *match_criteria,
++ 						       int start_index,
++ 						       int end_index,
++ 						       struct list_head *prev)
++ {
++ 	struct mlx5_flow_group *fg;
++ 	int ret;
++ 
++ 	fg = alloc_flow_group(match_criteria_enable, match_criteria,
++ 			      start_index, end_index);
++ 	if (IS_ERR(fg))
++ 		return fg;
++ 
++ 	/* initialize refcnt, add to parent list */
++ 	ret = rhltable_insert(&ft->fgs_hash,
++ 			      &fg->hash,
++ 			      rhash_fg);
++ 	if (ret) {
++ 		dealloc_flow_group(fg);
++ 		return ERR_PTR(ret);
++ 	}
++ 
++ 	tree_init_node(&fg->node, del_hw_flow_group, del_sw_flow_group);
++ 	tree_add_node(&fg->node, &ft->node);
++ 	/* Add node to group list */
++ 	list_add(&fg->node.list, prev);
++ 	atomic_inc(&ft->node.version);
++ 
+++>>>>>>> bd71b08ec2ee (net/mlx5: Support multiple updates of steering rules in parallel)
+  	return fg;
+  }
+  
+@@@ -818,9 -994,7 +1023,13 @@@ static struct mlx5_flow_table *__mlx5_c
+  		goto unlock_root;
+  	}
+  
+++<<<<<<< HEAD
+ +	ft->underlay_qpn = ft_attr->underlay_qpn;
+ +
+ +	tree_init_node(&ft->node, 1, del_flow_table);
+++=======
++ 	tree_init_node(&ft->node, del_hw_flow_table, del_sw_flow_table);
+++>>>>>>> bd71b08ec2ee (net/mlx5: Support multiple updates of steering rules in parallel)
+  	log_table_sz = ft->max_fte ? ilog2(ft->max_fte) : 0;
+  	next_ft = find_next_chained_ft(fs_prio);
+  	err = mlx5_cmd_create_flow_table(root->dev, ft->vport, ft->op_mod, ft->type,
+@@@ -832,7 -1006,8 +1041,12 @@@
+  	err = connect_flow_table(root->dev, ft, fs_prio);
+  	if (err)
+  		goto destroy_ft;
+++<<<<<<< HEAD
+ +	lock_ref_node(&fs_prio->node);
+++=======
++ 	ft->node.active = true;
++ 	down_write_ref_node(&fs_prio->node);
+++>>>>>>> bd71b08ec2ee (net/mlx5: Support multiple updates of steering rules in parallel)
+  	tree_add_node(&ft->node, &fs_prio->node);
+  	list_add_flow_table(ft, fs_prio);
+  	fs_prio->num_ft++;
+@@@ -909,21 -1084,33 +1123,32 @@@ mlx5_create_auto_grouped_flow_table(str
+  }
+  EXPORT_SYMBOL(mlx5_create_auto_grouped_flow_table);
+  
+ -struct mlx5_flow_group *mlx5_create_flow_group(struct mlx5_flow_table *ft,
+ -					       u32 *fg_in)
+ +/* Flow table should be locked */
+ +static struct mlx5_flow_group *create_flow_group_common(struct mlx5_flow_table *ft,
+ +							u32 *fg_in,
+ +							struct list_head
+ +							*prev_fg,
+ +							bool is_auto_fg)
+  {
+ -	void *match_criteria = MLX5_ADDR_OF(create_flow_group_in,
+ -					    fg_in, match_criteria);
+ -	u8 match_criteria_enable = MLX5_GET(create_flow_group_in,
+ -					    fg_in,
+ -					    match_criteria_enable);
+ -	int start_index = MLX5_GET(create_flow_group_in, fg_in,
+ -				   start_flow_index);
+ -	int end_index = MLX5_GET(create_flow_group_in, fg_in,
+ -				 end_flow_index);
+ -	struct mlx5_core_dev *dev = get_dev(&ft->node);
+  	struct mlx5_flow_group *fg;
+ +	struct mlx5_core_dev *dev = get_dev(&ft->node);
+  	int err;
+  
+ -	if (!check_valid_mask(match_criteria_enable, match_criteria))
+ -		return ERR_PTR(-EINVAL);
+ +	if (!dev)
+ +		return ERR_PTR(-ENODEV);
+  
+++<<<<<<< HEAD
+ +	fg = alloc_flow_group(fg_in);
+++=======
++ 	if (ft->autogroup.active)
++ 		return ERR_PTR(-EPERM);
++ 
++ 	down_write_ref_node(&ft->node);
++ 	fg = alloc_insert_flow_group(ft, match_criteria_enable, match_criteria,
++ 				     start_index, end_index,
++ 				     ft->node.children.prev);
++ 	up_write_ref_node(&ft->node);
+++>>>>>>> bd71b08ec2ee (net/mlx5: Support multiple updates of steering rules in parallel)
+  	if (IS_ERR(fg))
+  		return fg;
+  
+@@@ -1039,7 -1205,7 +1264,11 @@@ create_flow_handle(struct fs_fte *fte
+  		/* Add dest to dests list- we need flow tables to be in the
+  		 * end of the list for forward to next prio rules.
+  		 */
+++<<<<<<< HEAD
+ +		tree_init_node(&rule->node, 1, del_rule);
+++=======
++ 		tree_init_node(&rule->node, NULL, del_sw_hw_rule);
+++>>>>>>> bd71b08ec2ee (net/mlx5: Support multiple updates of steering rules in parallel)
+  		if (dest &&
+  		    dest[i].type != MLX5_FLOW_DESTINATION_TYPE_FLOW_TABLE)
+  			list_add(&rule->node.list, &fte->node.children);
+@@@ -1095,7 -1261,9 +1324,8 @@@ add_rule_fte(struct fs_fte *fte
+  	if (err)
+  		goto free_handle;
+  
+ -	fte->node.active = true;
+  	fte->status |= FS_FTE_STATUS_EXISTING;
++ 	atomic_inc(&fte->node.version);
+  
+  out:
+  	return handle;
+@@@ -1233,75 -1420,34 +1463,101 @@@ static struct mlx5_flow_handle *add_rul
+  					    u32 *match_value,
+  					    struct mlx5_flow_act *flow_act,
+  					    struct mlx5_flow_destination *dest,
+ -					    int dest_num,
+ -					    struct fs_fte *fte)
+ +					    int dest_num)
+  {
+  	struct mlx5_flow_handle *handle;
+++<<<<<<< HEAD
+ +	struct mlx5_flow_table *ft;
+ +	struct list_head *prev;
+ +	struct fs_fte *fte;
+++=======
++ 	int old_action;
+++>>>>>>> bd71b08ec2ee (net/mlx5: Support multiple updates of steering rules in parallel)
+  	int i;
++ 	int ret;
+  
+++<<<<<<< HEAD
+ +	nested_lock_ref_node(&fg->node, FS_MUTEX_PARENT);
+ +	fs_for_each_fte(fte, fg) {
+ +		nested_lock_ref_node(&fte->node, FS_MUTEX_CHILD);
+ +		if (compare_match_value(&fg->mask, match_value, &fte->val) &&
+ +		    (flow_act->action & fte->action)) {
+ +			int old_action = fte->action;
+ +
+ +			if (fte->flow_tag != flow_act->flow_tag) {
+ +				mlx5_core_warn(get_dev(&fte->node),
+ +					       "FTE flow tag %u already exists with different flow tag %u\n",
+ +					       fte->flow_tag,
+ +					       flow_act->flow_tag);
+ +				handle = ERR_PTR(-EEXIST);
+ +				goto unlock_fte;
+ +			}
+ +
+ +			fte->action |= flow_act->action;
+ +			handle = add_rule_fte(fte, fg, dest, dest_num,
+ +					      old_action != flow_act->action);
+ +			if (IS_ERR(handle)) {
+ +				fte->action = old_action;
+ +				goto unlock_fte;
+ +			} else {
+ +				goto add_rules;
+ +			}
+ +		}
+ +		unlock_ref_node(&fte->node);
+ +	}
+ +	fs_get_obj(ft, fg->node.parent);
+ +	if (fg->num_ftes >= fg->max_ftes) {
+ +		handle = ERR_PTR(-ENOSPC);
+ +		goto unlock_fg;
+ +	}
+ +
+ +	fte = create_fte(fg, match_value, flow_act, &prev);
+ +	if (IS_ERR(fte)) {
+ +		handle = (void *)fte;
+ +		goto unlock_fg;
+ +	}
+ +	tree_init_node(&fte->node, 0, del_fte);
+ +	nested_lock_ref_node(&fte->node, FS_MUTEX_CHILD);
+ +	handle = add_rule_fte(fte, fg, dest, dest_num, false);
+ +	if (IS_ERR(handle)) {
+ +		unlock_ref_node(&fte->node);
+ +		kfree(fte);
+ +		goto unlock_fg;
+++=======
++ 	ret = check_conflicting_ftes(fte, flow_act);
++ 	if (ret)
++ 		return ERR_PTR(ret);
++ 
++ 	old_action = fte->action;
++ 	fte->action |= flow_act->action;
++ 	handle = add_rule_fte(fte, fg, dest, dest_num,
++ 			      old_action != flow_act->action);
++ 	if (IS_ERR(handle)) {
++ 		fte->action = old_action;
++ 		return handle;
+++>>>>>>> bd71b08ec2ee (net/mlx5: Support multiple updates of steering rules in parallel)
+  	}
++ 	trace_mlx5_fs_set_fte(fte, false);
+  
+++<<<<<<< HEAD
+ +	fg->num_ftes++;
+ +
+ +	tree_add_node(&fte->node, &fg->node);
+ +	list_add(&fte->node.list, prev);
+ +add_rules:
+++=======
+++>>>>>>> bd71b08ec2ee (net/mlx5: Support multiple updates of steering rules in parallel)
+  	for (i = 0; i < handle->num_rules; i++) {
+ -		if (atomic_read(&handle->rule[i]->node.refcount) == 1) {
+ +		if (atomic_read(&handle->rule[i]->node.refcount) == 1)
+  			tree_add_node(&handle->rule[i]->node, &fte->node);
+ -			trace_mlx5_fs_add_rule(handle->rule[i]);
+ -		}
+  	}
+++<<<<<<< HEAD
+ +unlock_fte:
+ +	unlock_ref_node(&fte->node);
+ +unlock_fg:
+ +	unlock_ref_node(&fg->node);
+++=======
+++>>>>>>> bd71b08ec2ee (net/mlx5: Support multiple updates of steering rules in parallel)
+  	return handle;
+  }
+  
+@@@ -1349,6 -1495,191 +1605,194 @@@ static bool dest_is_valid(struct mlx5_f
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct match_list {
++ 	struct list_head	list;
++ 	struct mlx5_flow_group *g;
++ };
++ 
++ struct match_list_head {
++ 	struct list_head  list;
++ 	struct match_list first;
++ };
++ 
++ static void free_match_list(struct match_list_head *head)
++ {
++ 	if (!list_empty(&head->list)) {
++ 		struct match_list *iter, *match_tmp;
++ 
++ 		list_del(&head->first.list);
++ 		tree_put_node(&head->first.g->node);
++ 		list_for_each_entry_safe(iter, match_tmp, &head->list,
++ 					 list) {
++ 			tree_put_node(&iter->g->node);
++ 			list_del(&iter->list);
++ 			kfree(iter);
++ 		}
++ 	}
++ }
++ 
++ static int build_match_list(struct match_list_head *match_head,
++ 			    struct mlx5_flow_table *ft,
++ 			    struct mlx5_flow_spec *spec)
++ {
++ 	struct rhlist_head *tmp, *list;
++ 	struct mlx5_flow_group *g;
++ 	int err = 0;
++ 
++ 	rcu_read_lock();
++ 	INIT_LIST_HEAD(&match_head->list);
++ 	/* Collect all fgs which has a matching match_criteria */
++ 	list = rhltable_lookup(&ft->fgs_hash, spec, rhash_fg);
++ 	/* RCU is atomic, we can't execute FW commands here */
++ 	rhl_for_each_entry_rcu(g, tmp, list, hash) {
++ 		struct match_list *curr_match;
++ 
++ 		if (likely(list_empty(&match_head->list))) {
++ 			if (!tree_get_node(&g->node))
++ 				continue;
++ 			match_head->first.g = g;
++ 			list_add_tail(&match_head->first.list,
++ 				      &match_head->list);
++ 			continue;
++ 		}
++ 
++ 		curr_match = kmalloc(sizeof(*curr_match), GFP_ATOMIC);
++ 		if (!curr_match) {
++ 			free_match_list(match_head);
++ 			err = -ENOMEM;
++ 			goto out;
++ 		}
++ 		if (!tree_get_node(&g->node)) {
++ 			kfree(curr_match);
++ 			continue;
++ 		}
++ 		curr_match->g = g;
++ 		list_add_tail(&curr_match->list, &match_head->list);
++ 	}
++ out:
++ 	rcu_read_unlock();
++ 	return err;
++ }
++ 
++ static u64 matched_fgs_get_version(struct list_head *match_head)
++ {
++ 	struct match_list *iter;
++ 	u64 version = 0;
++ 
++ 	list_for_each_entry(iter, match_head, list)
++ 		version += (u64)atomic_read(&iter->g->node.version);
++ 	return version;
++ }
++ 
++ static struct mlx5_flow_handle *
++ try_add_to_existing_fg(struct mlx5_flow_table *ft,
++ 		       struct list_head *match_head,
++ 		       struct mlx5_flow_spec *spec,
++ 		       struct mlx5_flow_act *flow_act,
++ 		       struct mlx5_flow_destination *dest,
++ 		       int dest_num,
++ 		       int ft_version)
++ {
++ 	struct mlx5_flow_group *g;
++ 	struct mlx5_flow_handle *rule;
++ 	struct match_list *iter;
++ 	bool take_write = false;
++ 	struct fs_fte *fte;
++ 	u64  version;
++ 
++ 	list_for_each_entry(iter, match_head, list) {
++ 		nested_down_read_ref_node(&iter->g->node, FS_LOCK_PARENT);
++ 		ida_pre_get(&iter->g->fte_allocator, GFP_KERNEL);
++ 	}
++ 
++ search_again_locked:
++ 	version = matched_fgs_get_version(match_head);
++ 	/* Try to find a fg that already contains a matching fte */
++ 	list_for_each_entry(iter, match_head, list) {
++ 		struct fs_fte *fte_tmp;
++ 
++ 		g = iter->g;
++ 		fte_tmp = rhashtable_lookup_fast(&g->ftes_hash, spec->match_value,
++ 						 rhash_fte);
++ 		if (!fte_tmp || !tree_get_node(&fte_tmp->node))
++ 			continue;
++ 
++ 		nested_down_write_ref_node(&fte_tmp->node, FS_LOCK_CHILD);
++ 		if (!take_write) {
++ 			list_for_each_entry(iter, match_head, list)
++ 				up_read_ref_node(&iter->g->node);
++ 		} else {
++ 			list_for_each_entry(iter, match_head, list)
++ 				up_write_ref_node(&iter->g->node);
++ 		}
++ 
++ 		rule = add_rule_fg(g, spec->match_value,
++ 				   flow_act, dest, dest_num, fte_tmp);
++ 		up_write_ref_node(&fte_tmp->node);
++ 		tree_put_node(&fte_tmp->node);
++ 		return rule;
++ 	}
++ 
++ 	/* No group with matching fte found. Try to add a new fte to any
++ 	 * matching fg.
++ 	 */
++ 
++ 	if (!take_write) {
++ 		list_for_each_entry(iter, match_head, list)
++ 			up_read_ref_node(&iter->g->node);
++ 		list_for_each_entry(iter, match_head, list)
++ 			nested_down_write_ref_node(&iter->g->node,
++ 						   FS_LOCK_PARENT);
++ 		take_write = true;
++ 	}
++ 
++ 	/* Check the ft version, for case that new flow group
++ 	 * was added while the fgs weren't locked
++ 	 */
++ 	if (atomic_read(&ft->node.version) != ft_version) {
++ 		rule = ERR_PTR(-EAGAIN);
++ 		goto out;
++ 	}
++ 
++ 	/* Check the fgs version, for case the new FTE with the
++ 	 * same values was added while the fgs weren't locked
++ 	 */
++ 	if (version != matched_fgs_get_version(match_head))
++ 		goto search_again_locked;
++ 
++ 	list_for_each_entry(iter, match_head, list) {
++ 		g = iter->g;
++ 
++ 		if (!g->node.active)
++ 			continue;
++ 		fte = alloc_insert_fte(g, spec->match_value, flow_act);
++ 		if (IS_ERR(fte)) {
++ 			if (PTR_ERR(fte) == -ENOSPC)
++ 				continue;
++ 			list_for_each_entry(iter, match_head, list)
++ 				up_write_ref_node(&iter->g->node);
++ 			return (void *)fte;
++ 		}
++ 
++ 		nested_down_write_ref_node(&fte->node, FS_LOCK_CHILD);
++ 		list_for_each_entry(iter, match_head, list)
++ 			up_write_ref_node(&iter->g->node);
++ 		rule = add_rule_fg(g, spec->match_value,
++ 				   flow_act, dest, dest_num, fte);
++ 		up_write_ref_node(&fte->node);
++ 		tree_put_node(&fte->node);
++ 		return rule;
++ 	}
++ 	rule = ERR_PTR(-ENOENT);
++ out:
++ 	list_for_each_entry(iter, match_head, list)
++ 		up_write_ref_node(&iter->g->node);
++ 	return rule;
++ }
++ 
+++>>>>>>> bd71b08ec2ee (net/mlx5: Support multiple updates of steering rules in parallel)
+  static struct mlx5_flow_handle *
+  _mlx5_add_flow_rules(struct mlx5_flow_table *ft,
+  		     struct mlx5_flow_spec *spec,
+@@@ -1359,45 -1690,81 +1803,111 @@@
+  {
+  	struct mlx5_flow_group *g;
+  	struct mlx5_flow_handle *rule;
+++<<<<<<< HEAD
+++=======
++ 	struct match_list_head match_head;
++ 	bool take_write = false;
++ 	struct fs_fte *fte;
++ 	int version;
++ 	int err;
+++>>>>>>> bd71b08ec2ee (net/mlx5: Support multiple updates of steering rules in parallel)
+  	int i;
+  
+ -	if (!check_valid_spec(spec))
+ -		return ERR_PTR(-EINVAL);
+ -
+  	for (i = 0; i < dest_num; i++) {
+  		if (!dest_is_valid(&dest[i], flow_act->action, ft))
+  			return ERR_PTR(-EINVAL);
+  	}
++ 	nested_down_read_ref_node(&ft->node, FS_LOCK_GRANDPARENT);
++ search_again_locked:
++ 	version = atomic_read(&ft->node.version);
+  
+++<<<<<<< HEAD
+ +	nested_lock_ref_node(&ft->node, FS_MUTEX_GRANDPARENT);
+ +	fs_for_each_fg(g, ft)
+ +		if (compare_match_criteria(g->mask.match_criteria_enable,
+ +					   spec->match_criteria_enable,
+ +					   g->mask.match_criteria,
+ +					   spec->match_criteria)) {
+ +			rule = add_rule_fg(g, spec->match_value,
+ +					   flow_act, dest, dest_num);
+ +			if (!IS_ERR(rule) || PTR_ERR(rule) != -ENOSPC)
+ +				goto unlock;
+ +		}
+++=======
++ 	/* Collect all fgs which has a matching match_criteria */
++ 	err = build_match_list(&match_head, ft, spec);
++ 	if (err)
++ 		return ERR_PTR(err);
++ 
++ 	if (!take_write)
++ 		up_read_ref_node(&ft->node);
++ 
++ 	rule = try_add_to_existing_fg(ft, &match_head.list, spec, flow_act, dest,
++ 				      dest_num, version);
++ 	free_match_list(&match_head);
++ 	if (!IS_ERR(rule) ||
++ 	    (PTR_ERR(rule) != -ENOENT && PTR_ERR(rule) != -EAGAIN))
++ 		return rule;
++ 
++ 	if (!take_write) {
++ 		nested_down_write_ref_node(&ft->node, FS_LOCK_GRANDPARENT);
++ 		take_write = true;
++ 	}
++ 
++ 	if (PTR_ERR(rule) == -EAGAIN ||
++ 	    version != atomic_read(&ft->node.version))
++ 		goto search_again_locked;
+++>>>>>>> bd71b08ec2ee (net/mlx5: Support multiple updates of steering rules in parallel)
+  
+ -	g = alloc_auto_flow_group(ft, spec);
+ +	g = create_autogroup(ft, spec->match_criteria_enable,
+ +			     spec->match_criteria);
+  	if (IS_ERR(g)) {
+  		rule = (void *)g;
+- 		goto unlock;
++ 		up_write_ref_node(&ft->node);
++ 		return rule;
+  	}
+  
+++<<<<<<< HEAD
+ +	rule = add_rule_fg(g, spec->match_value, flow_act, dest, dest_num);
+ +	if (IS_ERR(rule)) {
+ +		/* Remove assumes refcount > 0 and autogroup creates a group
+ +		 * with a refcount = 0.
+ +		 */
+ +		unlock_ref_node(&ft->node);
+ +		tree_get_node(&g->node);
+ +		tree_remove_node(&g->node);
+ +		return rule;
+ +	}
+ +unlock:
+ +	unlock_ref_node(&ft->node);
+++=======
++ 	nested_down_write_ref_node(&g->node, FS_LOCK_PARENT);
++ 	up_write_ref_node(&ft->node);
++ 
++ 	err = create_auto_flow_group(ft, g);
++ 	if (err)
++ 		goto err_release_fg;
++ 
++ 	fte = alloc_insert_fte(g, spec->match_value, flow_act);
++ 	if (IS_ERR(fte)) {
++ 		err = PTR_ERR(fte);
++ 		goto err_release_fg;
++ 	}
++ 
++ 	nested_down_write_ref_node(&fte->node, FS_LOCK_CHILD);
++ 	up_write_ref_node(&g->node);
++ 	rule = add_rule_fg(g, spec->match_value, flow_act, dest,
++ 			   dest_num, fte);
++ 	up_write_ref_node(&fte->node);
++ 	tree_put_node(&fte->node);
++ 	tree_put_node(&g->node);
+++>>>>>>> bd71b08ec2ee (net/mlx5: Support multiple updates of steering rules in parallel)
+  	return rule;
++ 
++ err_release_fg:
++ 	up_write_ref_node(&g->node);
++ 	tree_put_node(&g->node);
++ 	return ERR_PTR(err);
+  }
+  
+  static bool fwd_next_prio_supported(struct mlx5_flow_table *ft)
+@@@ -1637,7 -2005,7 +2147,11 @@@ static struct fs_prio *fs_create_prio(s
+  		return ERR_PTR(-ENOMEM);
+  
+  	fs_prio->node.type = FS_TYPE_PRIO;
+++<<<<<<< HEAD
+ +	tree_init_node(&fs_prio->node, 1, NULL);
+++=======
++ 	tree_init_node(&fs_prio->node, NULL, NULL);
+++>>>>>>> bd71b08ec2ee (net/mlx5: Support multiple updates of steering rules in parallel)
+  	tree_add_node(&fs_prio->node, &ns->node);
+  	fs_prio->num_levels = num_levels;
+  	fs_prio->prio = prio;
+@@@ -1663,7 -2031,7 +2177,11 @@@ static struct mlx5_flow_namespace *fs_c
+  		return ERR_PTR(-ENOMEM);
+  
+  	fs_init_namespace(ns);
+++<<<<<<< HEAD
+ +	tree_init_node(&ns->node, 1, NULL);
+++=======
++ 	tree_init_node(&ns->node, NULL, NULL);
+++>>>>>>> bd71b08ec2ee (net/mlx5: Support multiple updates of steering rules in parallel)
+  	tree_add_node(&ns->node, &prio->node);
+  	list_add_tail(&ns->node.list, &prio->node.children);
+  
+@@@ -1788,7 -2156,7 +2306,11 @@@ static struct mlx5_flow_root_namespace 
+  	ns = &root_ns->ns;
+  	fs_init_namespace(ns);
+  	mutex_init(&root_ns->chain_lock);
+++<<<<<<< HEAD
+ +	tree_init_node(&ns->node, 1, NULL);
+++=======
++ 	tree_init_node(&ns->node, NULL, NULL);
+++>>>>>>> bd71b08ec2ee (net/mlx5: Support multiple updates of steering rules in parallel)
+  	tree_add_node(&ns->node, NULL);
+  
+  	return root_ns;
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/fs_core.h
+index c840ec9c1fc4,875b753862b0..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_core.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_core.h
+@@@ -80,9 -80,12 +80,16 @@@ struct fs_node 
+  	struct fs_node		*parent;
+  	struct fs_node		*root;
+  	/* lock the node for writing and traversing */
+ -	struct rw_semaphore	lock;
+ +	struct mutex		lock;
+  	atomic_t		refcount;
+++<<<<<<< HEAD
+ +	void			(*remove_func)(struct fs_node *);
+++=======
++ 	bool			active;
++ 	void			(*del_hw_func)(struct fs_node *);
++ 	void			(*del_sw_func)(struct fs_node *);
++ 	atomic_t		version;
+++>>>>>>> bd71b08ec2ee (net/mlx5: Support multiple updates of steering rules in parallel)
+  };
+  
+  struct mlx5_flow_rule {
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/fs_core.h
