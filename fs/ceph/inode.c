@@ -991,6 +991,7 @@ static void update_dentry_lease(struct dentry *dentry,
 	long unsigned ttl = from_time + (duration * HZ) / 1000;
 	long unsigned half_ttl = from_time + (duration * HZ / 2) / 1000;
 	struct inode *dir;
+	struct ceph_mds_session *old_lease_session = NULL;
 
 	/* only track leases on regular dentries */
 	if (dentry->d_op != &ceph_dentry_ops)
@@ -1011,8 +1012,10 @@ static void update_dentry_lease(struct dentry *dentry,
 	    time_before(ttl, dentry->d_time))
 		goto out_unlock;  /* we already have a newer lease. */
 
-	if (di->lease_session && di->lease_session != session)
-		goto out_unlock;
+	if (di->lease_session && di->lease_session != session) {
+		old_lease_session = di->lease_session;
+		di->lease_session = NULL;
+	}
 
 	ceph_dentry_lru_touch(dentry);
 
@@ -1025,6 +1028,8 @@ static void update_dentry_lease(struct dentry *dentry,
 	dentry->d_time = ttl;
 out_unlock:
 	spin_unlock(&dentry->d_lock);
+	if (old_lease_session)
+		ceph_put_mds_session(old_lease_session);
 	return;
 }
 
