@@ -1,0 +1,128 @@
+mm: munlock: fix potential race with THP page split
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mm] munlock: fix potential race with THP page split (Rafael Aquini) [1560030]
+Rebuild_FUZZ: 95.92%
+commit-author Vlastimil Babka <vbabka@suse.cz>
+commit 01cc2e58697e34c6ee9a40fb6cebc18bf5a1923f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/01cc2e58.failed
+
+Since commit ff6a6da60b89 ("mm: accelerate munlock() treatment of THP
+pages") munlock skips tail pages of a munlocked THP page.  There is some
+attempt to prevent bad consequences of racing with a THP page split, but
+code inspection indicates that there are two problems that may lead to a
+non-fatal, yet wrong outcome.
+
+First, __split_huge_page_refcount() copies flags including PageMlocked
+from the head page to the tail pages.  Clearing PageMlocked by
+munlock_vma_page() in the middle of this operation might result in part
+of tail pages left with PageMlocked flag.  As the head page still
+appears to be a THP page until all tail pages are processed,
+munlock_vma_page() might think it munlocked the whole THP page and skip
+all the former tail pages.  Before ff6a6da60, those pages would be
+cleared in further iterations of munlock_vma_pages_range(), but NR_MLOCK
+would still become undercounted (related the next point).
+
+Second, NR_MLOCK accounting is based on call to hpage_nr_pages() after
+the PageMlocked is cleared.  The accounting might also become
+inconsistent due to race with __split_huge_page_refcount()
+
+- undercount when HUGE_PMD_NR is subtracted, but some tail pages are
+  left with PageMlocked set and counted again (only possible before
+  ff6a6da60)
+
+- overcount when hpage_nr_pages() sees a normal page (split has already
+  finished), but the parallel split has meanwhile cleared PageMlocked from
+  additional tail pages
+
+This patch prevents both problems via extending the scope of lru_lock in
+munlock_vma_page().  This is convenient because:
+
+- __split_huge_page_refcount() takes lru_lock for its whole operation
+
+- munlock_vma_page() typically takes lru_lock anyway for page isolation
+
+As this becomes a second function where page isolation is done with
+lru_lock already held, factor this out to a new
+__munlock_isolate_lru_page() function and clean up the code around.
+
+[akpm@linux-foundation.org: avoid a coding-style ugly]
+	Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Sasha Levin <sasha.levin@oracle.com>
+	Cc: Michel Lespinasse <walken@google.com>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 01cc2e58697e34c6ee9a40fb6cebc18bf5a1923f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/mlock.c
+diff --cc mm/mlock.c
+index 4c60a27cb85c,b30adbe62034..000000000000
+--- a/mm/mlock.c
++++ b/mm/mlock.c
+@@@ -149,22 -171,36 +169,55 @@@ static void __munlock_isolation_failed(
+   */
+  unsigned int munlock_vma_page(struct page *page)
+  {
+++<<<<<<< HEAD
+ +	unsigned int page_mask = 0;
+++=======
++ 	unsigned int nr_pages;
++ 	struct zone *zone = page_zone(page);
+++>>>>>>> 01cc2e58697e (mm: munlock: fix potential race with THP page split)
+  
+ +	/* For try_to_munlock() and to serialize with page migration */
+  	BUG_ON(!PageLocked(page));
+  
+++<<<<<<< HEAD
+ +	if (TestClearPageMlocked(page)) {
+ +		int nr_pages = hpage_nr_pages(page);
+ +		mod_zone_page_state(page_zone(page), NR_MLOCK, -nr_pages);
+ +		page_mask = nr_pages - 1;
+ +		if (!isolate_lru_page(page))
+ +			__munlock_isolated_page(page);
+ +		else
+ +			__munlock_isolation_failed(page);
+ +	}
+ +
+ +	return page_mask;
+++=======
++ 	/*
++ 	 * Serialize with any parallel __split_huge_page_refcount() which
++ 	 * might otherwise copy PageMlocked to part of the tail pages before
++ 	 * we clear it in the head page. It also stabilizes hpage_nr_pages().
++ 	 */
++ 	spin_lock_irq(&zone->lru_lock);
++ 
++ 	nr_pages = hpage_nr_pages(page);
++ 	if (!TestClearPageMlocked(page))
++ 		goto unlock_out;
++ 
++ 	__mod_zone_page_state(zone, NR_MLOCK, -nr_pages);
++ 
++ 	if (__munlock_isolate_lru_page(page, true)) {
++ 		spin_unlock_irq(&zone->lru_lock);
++ 		__munlock_isolated_page(page);
++ 		goto out;
++ 	}
++ 	__munlock_isolation_failed(page);
++ 
++ unlock_out:
++ 	spin_unlock_irq(&zone->lru_lock);
++ 
++ out:
++ 	return nr_pages - 1;
+++>>>>>>> 01cc2e58697e (mm: munlock: fix potential race with THP page split)
+  }
+  
+  /**
+* Unmerged path mm/mlock.c
