@@ -1,0 +1,205 @@
+hugetlbfs: fix races and page leaks during migration
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Mike Kravetz <mike.kravetz@oracle.com>
+commit cb6acd01e2e43fd8bad11155752b7699c3d0fb76
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/cb6acd01.failed
+
+hugetlb pages should only be migrated if they are 'active'.  The
+routines set/clear_page_huge_active() modify the active state of hugetlb
+pages.
+
+When a new hugetlb page is allocated at fault time, set_page_huge_active
+is called before the page is locked.  Therefore, another thread could
+race and migrate the page while it is being added to page table by the
+fault code.  This race is somewhat hard to trigger, but can be seen by
+strategically adding udelay to simulate worst case scheduling behavior.
+Depending on 'how' the code races, various BUG()s could be triggered.
+
+To address this issue, simply delay the set_page_huge_active call until
+after the page is successfully added to the page table.
+
+Hugetlb pages can also be leaked at migration time if the pages are
+associated with a file in an explicitly mounted hugetlbfs filesystem.
+For example, consider a two node system with 4GB worth of huge pages
+available.  A program mmaps a 2G file in a hugetlbfs filesystem.  It
+then migrates the pages associated with the file from one node to
+another.  When the program exits, huge page counts are as follows:
+
+  node0
+  1024    free_hugepages
+  1024    nr_hugepages
+
+  node1
+  0       free_hugepages
+  1024    nr_hugepages
+
+  Filesystem                         Size  Used Avail Use% Mounted on
+  nodev                              4.0G  2.0G  2.0G  50% /var/opt/hugepool
+
+That is as expected.  2G of huge pages are taken from the free_hugepages
+counts, and 2G is the size of the file in the explicitly mounted
+filesystem.  If the file is then removed, the counts become:
+
+  node0
+  1024    free_hugepages
+  1024    nr_hugepages
+
+  node1
+  1024    free_hugepages
+  1024    nr_hugepages
+
+  Filesystem                         Size  Used Avail Use% Mounted on
+  nodev                              4.0G  2.0G  2.0G  50% /var/opt/hugepool
+
+Note that the filesystem still shows 2G of pages used, while there
+actually are no huge pages in use.  The only way to 'fix' the filesystem
+accounting is to unmount the filesystem
+
+If a hugetlb page is associated with an explicitly mounted filesystem,
+this information in contained in the page_private field.  At migration
+time, this information is not preserved.  To fix, simply transfer
+page_private from old to new page at migration time if necessary.
+
+There is a related race with removing a huge page from a file and
+migration.  When a huge page is removed from the pagecache, the
+page_mapping() field is cleared, yet page_private remains set until the
+page is actually freed by free_huge_page().  A page could be migrated
+while in this state.  However, since page_mapping() is not set the
+hugetlbfs specific routine to transfer page_private is not called and we
+leak the page count in the filesystem.
+
+To fix that, check for this condition before migrating a huge page.  If
+the condition is detected, return EBUSY for the page.
+
+Link: http://lkml.kernel.org/r/74510272-7319-7372-9ea6-ec914734c179@oracle.com
+Link: http://lkml.kernel.org/r/20190212221400.3512-1-mike.kravetz@oracle.com
+Fixes: bcc54222309c ("mm: hugetlb: introduce page_huge_active")
+	Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
+	Reviewed-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: "Kirill A . Shutemov" <kirill.shutemov@linux.intel.com>
+	Cc: Mel Gorman <mgorman@techsingularity.net>
+	Cc: Davidlohr Bueso <dave@stgolabs.net>
+	Cc: <stable@vger.kernel.org>
+[mike.kravetz@oracle.com: v2]
+  Link: http://lkml.kernel.org/r/7534d322-d782-8ac6-1c8d-a8dc380eb3ab@oracle.com
+[mike.kravetz@oracle.com: update comment and changelog]
+  Link: http://lkml.kernel.org/r/420bcfd6-158b-38e4-98da-26d0cd85bd01@oracle.com
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit cb6acd01e2e43fd8bad11155752b7699c3d0fb76)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hugetlb.c
+diff --cc mm/hugetlb.c
+index 57897a3833f6,8dfdffc34a99..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -3676,11 -3624,10 +3676,10 @@@ retry_avoidcopy
+  	copy_user_huge_page(new_page, old_page, address, vma,
+  			    pages_per_huge_page(h));
+  	__SetPageUptodate(new_page);
+- 	set_page_huge_active(new_page);
+  
+ -	mmu_notifier_range_init(&range, mm, haddr, haddr + huge_page_size(h));
+ -	mmu_notifier_invalidate_range_start(&range);
+ -
+ +	mmun_start = address & huge_page_mask(h);
+ +	mmun_end = mmun_start + huge_page_size(h);
+ +	mmu_notifier_invalidate_range_start(mm, mmun_start, mmun_end);
+  	/*
+  	 * Retake the page table lock to check for racing updates
+  	 * before the page tables are altered
+@@@ -3691,12 -3638,13 +3690,18 @@@
+  		ClearPagePrivate(new_page);
+  
+  		/* Break COW */
+ -		huge_ptep_clear_flush(vma, haddr, ptep);
+ -		mmu_notifier_invalidate_range(mm, range.start, range.end);
+ -		set_huge_pte_at(mm, haddr, ptep,
+ +		huge_ptep_clear_flush(vma, address, ptep);
+ +		mmu_notifier_invalidate_range(mm, mmun_start, mmun_end);
+ +		set_huge_pte_at(mm, address, ptep,
+  				make_huge_pte(vma, new_page, 1));
+++<<<<<<< HEAD
+ +		page_remove_rmap(old_page);
+ +		hugepage_add_new_anon_rmap(new_page, vma, address);
+++=======
++ 		page_remove_rmap(old_page, true);
++ 		hugepage_add_new_anon_rmap(new_page, vma, haddr);
++ 		set_page_huge_active(new_page);
+++>>>>>>> cb6acd01e2e4 (hugetlbfs: fix races and page leaks during migration)
+  		/* Make the old page be freed below */
+  		new_page = old_page;
+  	}
+@@@ -3778,6 -3728,8 +3783,11 @@@ static int hugetlb_no_page(struct mm_st
+  	struct page *page;
+  	pte_t new_pte;
+  	spinlock_t *ptl;
+++<<<<<<< HEAD
+++=======
++ 	unsigned long haddr = address & huge_page_mask(h);
++ 	bool new_page = false;
+++>>>>>>> cb6acd01e2e4 (hugetlbfs: fix races and page leaks during migration)
+  
+  	/*
+  	 * Currently, we are forced to kill the process in the event the
+diff --git a/fs/hugetlbfs/inode.c b/fs/hugetlbfs/inode.c
+index f281dd71f4ca..33c46b5282e6 100644
+--- a/fs/hugetlbfs/inode.c
++++ b/fs/hugetlbfs/inode.c
+@@ -888,6 +888,18 @@ static int hugetlbfs_migrate_page(struct address_space *mapping,
+ 	rc = migrate_huge_page_move_mapping(mapping, newpage, page);
+ 	if (rc != MIGRATEPAGE_SUCCESS)
+ 		return rc;
++
++	/*
++	 * page_private is subpool pointer in hugetlb pages.  Transfer to
++	 * new page.  PagePrivate is not associated with page_private for
++	 * hugetlb pages and can not be set here as only page_huge_active
++	 * pages can be migrated.
++	 */
++	if (page_private(page)) {
++		set_page_private(newpage, page_private(page));
++		set_page_private(page, 0);
++	}
++
+ 	if (mode != MIGRATE_SYNC_NO_COPY)
+ 		migrate_page_copy(newpage, page);
+ 	else
+* Unmerged path mm/hugetlb.c
+diff --git a/mm/migrate.c b/mm/migrate.c
+index 520f303d5422..345768880fe2 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -1096,6 +1096,16 @@ static int unmap_and_move_huge_page(new_page_t get_new_page,
+ 		lock_page(hpage);
+ 	}
+ 
++	/*
++	 * Check for pages which are in the process of being freed.  Without
++	 * page_mapping() set, hugetlbfs specific move page routine will not
++	 * be called and we could leak usage counts for subpools.
++	 */
++	if (page_private(hpage) && !page_mapping(hpage)) {
++		rc = -EBUSY;
++		goto out_unlock;
++	}
++
+ 	if (PageAnon(hpage))
+ 		anon_vma = page_get_anon_vma(hpage);
+ 
+@@ -1117,6 +1127,7 @@ static int unmap_and_move_huge_page(new_page_t get_new_page,
+ 	if (!rc)
+ 		hugetlb_cgroup_migrate(hpage, new_hpage);
+ 
++out_unlock:
+ 	unlock_page(hpage);
+ out:
+ 	if (rc != -EAGAIN)
