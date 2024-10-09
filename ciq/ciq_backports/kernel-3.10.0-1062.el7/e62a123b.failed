@@ -1,0 +1,101 @@
+tcp: fix NULL deref in tcp_v4_send_ack()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit e62a123b8ef7c5dc4db2c16383d506860ad21b47
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/e62a123b.failed
+
+Neal reported crashes with this stack trace :
+
+ RIP: 0010:[<ffffffff8c57231b>] tcp_v4_send_ack+0x41/0x20f
+...
+ CR2: 0000000000000018 CR3: 000000044005c000 CR4: 00000000001427e0
+...
+  [<ffffffff8c57258e>] tcp_v4_reqsk_send_ack+0xa5/0xb4
+  [<ffffffff8c1a7caa>] tcp_check_req+0x2ea/0x3e0
+  [<ffffffff8c19e420>] tcp_rcv_state_process+0x850/0x2500
+  [<ffffffff8c1a6d21>] tcp_v4_do_rcv+0x141/0x330
+  [<ffffffff8c56cdb2>] sk_backlog_rcv+0x21/0x30
+  [<ffffffff8c098bbd>] tcp_recvmsg+0x75d/0xf90
+  [<ffffffff8c0a8700>] inet_recvmsg+0x80/0xa0
+  [<ffffffff8c17623e>] sock_aio_read+0xee/0x110
+  [<ffffffff8c066fcf>] do_sync_read+0x6f/0xa0
+  [<ffffffff8c0673a1>] SyS_read+0x1e1/0x290
+  [<ffffffff8c5ca262>] system_call_fastpath+0x16/0x1b
+
+The problem here is the skb we provide to tcp_v4_send_ack() had to
+be parked in the backlog of a new TCP fastopen child because this child
+was owned by the user at the time an out of window packet arrived.
+
+Before queuing a packet, TCP has to set skb->dev to NULL as the device
+could disappear before packet is removed from the queue.
+
+Fix this issue by using the net pointer provided by the socket (being a
+timewait or a request socket).
+
+IPv6 is immune to the bug : tcp_v6_send_response() already gets the net
+pointer from the socket if provided.
+
+Fixes: 168a8f58059a ("tcp: TCP Fast Open Server - main code path")
+	Reported-by: Neal Cardwell <ncardwell@google.com>
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Cc: Jerry Chu <hkchu@google.com>
+	Cc: Yuchung Cheng <ycheng@google.com>
+	Acked-by: Neal Cardwell <ncardwell@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e62a123b8ef7c5dc4db2c16383d506860ad21b47)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp_ipv4.c
+diff --cc net/ipv4/tcp_ipv4.c
+index 2efc1b2188fd,2a67244f97ca..000000000000
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@@ -729,9 -724,6 +730,12 @@@ static void tcp_v4_send_ack(struct net 
+  			];
+  	} rep;
+  	struct ip_reply_arg arg;
+++<<<<<<< HEAD
+ +	struct net *net = dev_net(skb_dst(skb)->dev);
+ +	struct sock *sk = skb->sk;
+ +	struct sock *ctl_sk;
+++=======
+++>>>>>>> e62a123b8ef7 (tcp: fix NULL deref in tcp_v4_send_ack())
+  
+  	memset(&rep.th, 0, sizeof(struct tcphdr));
+  	memset(&arg, 0, sizeof(arg));
+@@@ -799,9 -784,9 +803,10 @@@ static void tcp_v4_timewait_ack(struct 
+  {
+  	struct inet_timewait_sock *tw = inet_twsk(sk);
+  	struct tcp_timewait_sock *tcptw = tcp_twsk(sk);
+ +	skb->sk = sk;
+  
+- 	tcp_v4_send_ack(skb, tcptw->tw_snd_nxt, tcptw->tw_rcv_nxt,
++ 	tcp_v4_send_ack(sock_net(sk), skb,
++ 			tcptw->tw_snd_nxt, tcptw->tw_rcv_nxt,
+  			tcptw->tw_rcv_wnd >> tw->tw_rcv_wscale,
+  			tcp_time_stamp + tcptw->tw_ts_offset,
+  			tcptw->tw_ts_recent,
+@@@ -820,9 -805,11 +825,17 @@@ static void tcp_v4_reqsk_send_ack(struc
+  	/* sk->sk_state == TCP_LISTEN -> for regular TCP_SYN_RECV
+  	 * sk->sk_state == TCP_SYN_RECV -> for Fast Open.
+  	 */
+++<<<<<<< HEAD
+ +	tcp_v4_send_ack(skb, (sk->sk_state == TCP_LISTEN) ?
+ +			tcp_rsk(req)->snt_isn + 1 : tcp_sk(sk)->snd_nxt,
+ +			tcp_rsk(req)->rcv_nxt, req->rcv_wnd,
+++=======
++ 	u32 seq = (sk->sk_state == TCP_LISTEN) ? tcp_rsk(req)->snt_isn + 1 :
++ 					     tcp_sk(sk)->snd_nxt;
++ 
++ 	tcp_v4_send_ack(sock_net(sk), skb, seq,
++ 			tcp_rsk(req)->rcv_nxt, req->rsk_rcv_wnd,
+++>>>>>>> e62a123b8ef7 (tcp: fix NULL deref in tcp_v4_send_ack())
+  			tcp_time_stamp,
+  			req->ts_recent,
+  			0,
+* Unmerged path net/ipv4/tcp_ipv4.c
