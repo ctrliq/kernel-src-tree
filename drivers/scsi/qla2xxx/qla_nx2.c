@@ -11,8 +11,6 @@
 #include "qla_def.h"
 #include "qla_gbl.h"
 
-#include <linux/delay.h>
-
 #define TIMEOUT_100_MS 100
 
 /* 8044 Flash Read/Write functions */
