@@ -1,0 +1,148 @@
+net_sched: add the ability to defer skb freeing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit 1b5c5493e3e68181be344cb51bf9df192d05ffc2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/1b5c5493.failed
+
+qdisc are changed under RTNL protection and often
+while blocking BH and root qdisc spinlock.
+
+When lots of skbs need to be dropped, we free
+them under these locks causing TX/RX freezes,
+and more generally latency spikes.
+
+This commit adds rtnl_kfree_skbs(), used to queue
+skbs for deferred freeing.
+
+Actual freeing happens right after RTNL is released,
+with appropriate scheduling points.
+
+rtnl_qdisc_drop() can also be used in place
+of disc_drop() when RTNL is held.
+
+qdisc_reset_queue() and __qdisc_reset_queue() get
+the new behavior, so standard qdiscs like pfifo, pfifo_fast...
+have their ->reset() method automatically handled.
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1b5c5493e3e68181be344cb51bf9df192d05ffc2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/rtnetlink.h
+#	include/net/sch_generic.h
+diff --cc include/linux/rtnetlink.h
+index e5e3fc72eb1c,2daece8979f7..000000000000
+--- a/include/linux/rtnetlink.h
++++ b/include/linux/rtnetlink.h
+@@@ -84,8 -84,14 +84,19 @@@ void net_inc_ingress_queue(void)
+  void net_dec_ingress_queue(void);
+  #endif
+  
+++<<<<<<< HEAD
+ +extern void rtnetlink_init(void);
+ +extern void __rtnl_unlock(void);
+++=======
++ #ifdef CONFIG_NET_EGRESS
++ void net_inc_egress_queue(void);
++ void net_dec_egress_queue(void);
++ #endif
++ 
++ void rtnetlink_init(void);
++ void __rtnl_unlock(void);
++ void rtnl_kfree_skbs(struct sk_buff *head, struct sk_buff *tail);
+++>>>>>>> 1b5c5493e3e6 (net_sched: add the ability to defer skb freeing)
+  
+  #define ASSERT_RTNL() do { \
+  	if (unlikely(!rtnl_is_locked())) { \
+diff --cc include/net/sch_generic.h
+index 71548842d47c,4f7cee8344c4..000000000000
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@@ -738,23 -718,10 +740,30 @@@ static inline struct Qdisc *qdisc_repla
+  	return old;
+  }
+  
+++<<<<<<< HEAD
+ +static inline unsigned int __qdisc_queue_drop(struct Qdisc *sch,
+ +					      struct sk_buff_head *list)
+ +{
+ +	struct sk_buff *skb = __qdisc_dequeue_tail(sch, list);
+ +
+ +	if (likely(skb != NULL)) {
+ +		unsigned int len = qdisc_pkt_len(skb);
+ +		kfree_skb(skb);
+ +		return len;
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+ +static inline unsigned int qdisc_queue_drop(struct Qdisc *sch)
+ +{
+ +	return __qdisc_queue_drop(sch, &sch->q);
+++=======
++ static inline void rtnl_qdisc_drop(struct sk_buff *skb, struct Qdisc *sch)
++ {
++ 	rtnl_kfree_skbs(skb, skb);
++ 	qdisc_qstats_drop(sch);
+++>>>>>>> 1b5c5493e3e6 (net_sched: add the ability to defer skb freeing)
+  }
+  
+  static inline int qdisc_drop(struct sk_buff *skb, struct Qdisc *sch)
+* Unmerged path include/linux/rtnetlink.h
+* Unmerged path include/net/sch_generic.h
+diff --git a/net/core/rtnetlink.c b/net/core/rtnetlink.c
+index ee0dec5a4ec6..c7181fa80b14 100644
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@ -75,9 +75,31 @@ void rtnl_lock(void)
+ }
+ EXPORT_SYMBOL(rtnl_lock);
+ 
++static struct sk_buff *defer_kfree_skb_list;
++void rtnl_kfree_skbs(struct sk_buff *head, struct sk_buff *tail)
++{
++	if (head && tail) {
++		tail->next = defer_kfree_skb_list;
++		defer_kfree_skb_list = head;
++	}
++}
++EXPORT_SYMBOL(rtnl_kfree_skbs);
++
+ void __rtnl_unlock(void)
+ {
++	struct sk_buff *head = defer_kfree_skb_list;
++
++	defer_kfree_skb_list = NULL;
++
+ 	mutex_unlock(&rtnl_mutex);
++
++	while (head) {
++		struct sk_buff *next = head->next;
++
++		kfree_skb(head);
++		cond_resched();
++		head = next;
++	}
+ }
+ 
+ void rtnl_unlock(void)
+diff --git a/net/sched/sch_generic.c b/net/sched/sch_generic.c
+index e276704c5e88..b31bb82af7c4 100644
+--- a/net/sched/sch_generic.c
++++ b/net/sched/sch_generic.c
+@@ -526,7 +526,7 @@ static void pfifo_fast_reset(struct Qdisc *qdisc)
+ 	struct pfifo_fast_priv *priv = qdisc_priv(qdisc);
+ 
+ 	for (prio = 0; prio < PFIFO_FAST_BANDS; prio++)
+-		__qdisc_reset_queue(qdisc, band2list(priv, prio));
++		__qdisc_reset_queue(band2list(priv, prio));
+ 
+ 	priv->bitmap = 0;
+ 	qdisc->qstats.backlog = 0;
