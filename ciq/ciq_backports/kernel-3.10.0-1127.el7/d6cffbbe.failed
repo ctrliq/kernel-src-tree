@@ -1,0 +1,145 @@
+proc/sysctl: prune stale dentries during unregistering
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+commit d6cffbbe9a7e51eb705182965a189457c17ba8a3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/d6cffbbe.failed
+
+Currently unregistering sysctl table does not prune its dentries.
+Stale dentries could slowdown sysctl operations significantly.
+
+For example, command:
+
+ # for i in {1..100000} ; do unshare -n -- sysctl -a &> /dev/null ; done
+ creates a millions of stale denties around sysctls of loopback interface:
+
+ # sysctl fs.dentry-state
+ fs.dentry-state = 25812579  24724135        45      0       0       0
+
+ All of them have matching names thus lookup have to scan though whole
+ hash chain and call d_compare (proc_sys_compare) which checks them
+ under system-wide spinlock (sysctl_lock).
+
+ # time sysctl -a > /dev/null
+ real    1m12.806s
+ user    0m0.016s
+ sys     1m12.400s
+
+Currently only memory reclaimer could remove this garbage.
+But without significant memory pressure this never happens.
+
+This patch collects sysctl inodes into list on sysctl table header and
+prunes all their dentries once that table unregisters.
+
+Konstantin Khlebnikov <khlebnikov@yandex-team.ru> writes:
+> On 10.02.2017 10:47, Al Viro wrote:
+>> how about >> the matching stats *after* that patch?
+>
+> dcache size doesn't grow endlessly, so stats are fine
+>
+> # sysctl fs.dentry-state
+> fs.dentry-state = 92712	58376	45	0	0	0
+>
+> # time sysctl -a &>/dev/null
+>
+> real	0m0.013s
+> user	0m0.004s
+> sys	0m0.008s
+
+	Signed-off-by: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+	Suggested-by: Al Viro <viro@zeniv.linux.org.uk>
+	Signed-off-by: Eric W. Biederman <ebiederm@xmission.com>
+(cherry picked from commit d6cffbbe9a7e51eb705182965a189457c17ba8a3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/proc/inode.c
+#	fs/proc/internal.h
+#	fs/proc/proc_sysctl.c
+diff --cc fs/proc/inode.c
+index c5ba439ec5ac,7ad9ed7958af..000000000000
+--- a/fs/proc/inode.c
++++ b/fs/proc/inode.c
+@@@ -42,19 -40,15 +42,25 @@@ static void proc_evict_inode(struct ino
+  	put_pid(PROC_I(inode)->pid);
+  
+  	/* Let go of any associated proc directory entry */
+ -	de = PDE(inode);
+ +	de = PROC_I(inode)->pde;
+  	if (de)
+  		pde_put(de);
++ 
+  	head = PROC_I(inode)->sysctl;
+  	if (head) {
+++<<<<<<< HEAD
+ +		rcu_assign_pointer(PROC_I(inode)->sysctl, NULL);
+ +		sysctl_head_put(head);
+++=======
++ 		RCU_INIT_POINTER(PROC_I(inode)->sysctl, NULL);
++ 		proc_sys_evict_inode(inode, head);
+++>>>>>>> d6cffbbe9a7e (proc/sysctl: prune stale dentries during unregistering)
+  	}
+ +	/* Release any associated namespace */
+ +	ns_ops = PROC_I(inode)->ns.ns_ops;
+ +	ns = PROC_I(inode)->ns.ns;
+ +	if (ns_ops && ns)
+ +		ns_ops->put(ns);
+  }
+  
+  static struct kmem_cache * proc_inode_cachep;
+diff --cc fs/proc/internal.h
+index 2e3c29a0f0b8,5d6960f5f1c0..000000000000
+--- a/fs/proc/internal.h
++++ b/fs/proc/internal.h
+@@@ -77,7 -65,8 +77,12 @@@ struct proc_inode 
+  	struct proc_dir_entry *pde;
+  	struct ctl_table_header *sysctl;
+  	struct ctl_table *sysctl_entry;
+++<<<<<<< HEAD
+ +	struct proc_ns ns;
+++=======
++ 	struct list_head sysctl_inodes;
++ 	const struct proc_ns_operations *ns_ops;
+++>>>>>>> d6cffbbe9a7e (proc/sysctl: prune stale dentries during unregistering)
+  	struct inode vfs_inode;
+  };
+  
+diff --cc fs/proc/proc_sysctl.c
+index df9e927d244d,8efb1e10b025..000000000000
+--- a/fs/proc/proc_sysctl.c
++++ b/fs/proc/proc_sysctl.c
+@@@ -444,7 -458,12 +457,16 @@@ static struct inode *proc_sys_make_inod
+  	ei->sysctl = head;
+  	ei->sysctl_entry = table;
+  
+++<<<<<<< HEAD
+ +	inode->i_mtime = inode->i_atime = inode->i_ctime = CURRENT_TIME;
+++=======
++ 	spin_lock(&sysctl_lock);
++ 	list_add(&ei->sysctl_inodes, &head->inodes);
++ 	head->count++;
++ 	spin_unlock(&sysctl_lock);
++ 
++ 	inode->i_mtime = inode->i_atime = inode->i_ctime = current_time(inode);
+++>>>>>>> d6cffbbe9a7e (proc/sysctl: prune stale dentries during unregistering)
+  	inode->i_mode = table->mode;
+  	if (!S_ISDIR(table->mode)) {
+  		inode->i_mode |= S_IFREG;
+* Unmerged path fs/proc/inode.c
+* Unmerged path fs/proc/internal.h
+* Unmerged path fs/proc/proc_sysctl.c
+diff --git a/include/linux/sysctl.h b/include/linux/sysctl.h
+index 5bc418a12633..62adce5f8225 100644
+--- a/include/linux/sysctl.h
++++ b/include/linux/sysctl.h
+@@ -149,6 +149,7 @@ struct ctl_table_header
+ 	struct ctl_table_set *set;
+ 	struct ctl_dir *parent;
+ 	struct ctl_node *node;
++	struct list_head inodes; /* head for proc_inode->sysctl_inodes */
+ };
+ 
+ struct ctl_dir {
