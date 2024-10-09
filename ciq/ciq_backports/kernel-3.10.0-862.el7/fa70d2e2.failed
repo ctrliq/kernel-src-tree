@@ -1,0 +1,245 @@
+block: allow gendisk's request_queue registration to be deferred
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [block] allow gendisk's request_queue registration to be deferred (Mike Snitzer) [1517771]
+Rebuild_FUZZ: 94.21%
+commit-author Mike Snitzer <snitzer@redhat.com>
+commit fa70d2e2c4a0a54ced98260c6a176cc94c876d27
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/fa70d2e2.failed
+
+Since I can remember DM has forced the block layer to allow the
+allocation and initialization of the request_queue to be distinct
+operations.  Reason for this is block/genhd.c:add_disk() has requires
+that the request_queue (and associated bdi) be tied to the gendisk
+before add_disk() is called -- because add_disk() also deals with
+exposing the request_queue via blk_register_queue().
+
+DM's dynamic creation of arbitrary device types (and associated
+request_queue types) requires the DM device's gendisk be available so
+that DM table loads can establish a master/slave relationship with
+subordinate devices that are referenced by loaded DM tables -- using
+bd_link_disk_holder().  But until these DM tables, and their associated
+subordinate devices, are known DM cannot know what type of request_queue
+it needs -- nor what its queue_limits should be.
+
+This chicken and egg scenario has created all manner of problems for DM
+and, at times, the block layer.
+
+Summary of changes:
+
+- Add device_add_disk_no_queue_reg() and add_disk_no_queue_reg() variant
+  that drivers may use to add a disk without also calling
+  blk_register_queue().  Driver must call blk_register_queue() once its
+  request_queue is fully initialized.
+
+- Return early from blk_unregister_queue() if QUEUE_FLAG_REGISTERED
+  is not set.  It won't be set if driver used add_disk_no_queue_reg()
+  but driver encounters an error and must del_gendisk() before calling
+  blk_register_queue().
+
+- Export blk_register_queue().
+
+These changes allow DM to use add_disk_no_queue_reg() to anchor its
+gendisk as the "master" for master/slave relationships DM must establish
+with subordinate devices referenced in DM tables that get loaded.  Once
+all "slave" devices for a DM device are known its request_queue can be
+properly initialized and then advertised via sysfs -- important
+improvement being that no request_queue resource initialization
+performed by blk_register_queue() is missed for DM devices anymore.
+
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+	Reviewed-by: Ming Lei <ming.lei@redhat.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit fa70d2e2c4a0a54ced98260c6a176cc94c876d27)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-sysfs.c
+#	block/genhd.c
+#	include/linux/genhd.h
+diff --cc block/blk-sysfs.c
+index 28651fcb101c,4a6a40ffd78e..000000000000
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@@ -628,12 -913,15 +628,13 @@@ int blk_register_queue(struct gendisk *
+  			kobject_del(&q->kobj);
+  			blk_trace_remove_sysfs(dev);
+  			kobject_put(&dev->kobj);
+ -			goto unlock;
+ +			return ret;
+  		}
+  	}
+ -	ret = 0;
+ -unlock:
+ -	mutex_unlock(&q->sysfs_lock);
+ -	return ret;
+ +
+ +	return 0;
+  }
++ EXPORT_SYMBOL_GPL(blk_register_queue);
+  
+  void blk_unregister_queue(struct gendisk *disk)
+  {
+@@@ -642,6 -930,22 +643,25 @@@
+  	if (WARN_ON(!q))
+  		return;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Return early if disk->queue was never registered. */
++ 	if (!test_bit(QUEUE_FLAG_REGISTERED, &q->queue_flags))
++ 		return;
++ 
++ 	/*
++ 	 * Protect against the 'queue' kobj being accessed
++ 	 * while/after it is removed.
++ 	 */
++ 	mutex_lock(&q->sysfs_lock);
++ 
++ 	spin_lock_irq(q->queue_lock);
++ 	queue_flag_clear(QUEUE_FLAG_REGISTERED, q);
++ 	spin_unlock_irq(q->queue_lock);
++ 
++ 	wbt_exit(q);
++ 
+++>>>>>>> fa70d2e2c4a0 (block: allow gendisk's request_queue registration to be deferred)
+  	if (q->mq_ops)
+  		blk_mq_unregister_dev(disk_to_dev(disk), q);
+  
+diff --cc block/genhd.c
+index 2716ae28a57d,88a53c188cb7..000000000000
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@@ -572,17 -624,24 +572,28 @@@ exit
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * add_disk - add partitioning information to kernel list
+++=======
++  * __device_add_disk - add disk information to kernel list
++  * @parent: parent device for the disk
+++>>>>>>> fa70d2e2c4a0 (block: allow gendisk's request_queue registration to be deferred)
+   * @disk: per-device partitioning information
++  * @register_queue: register the queue if set to true
+   *
+   * This function registers the partitioning information in @disk
+   * with the kernel.
+   *
+   * FIXME: error handling
+   */
+++<<<<<<< HEAD
+ +void add_disk(struct gendisk *disk)
+++=======
++ static void __device_add_disk(struct device *parent, struct gendisk *disk,
++ 			      bool register_queue)
+++>>>>>>> fa70d2e2c4a0 (block: allow gendisk's request_queue registration to be deferred)
+  {
+ +	struct backing_dev_info *bdi;
+  	dev_t devt;
+  	int retval;
+  
+@@@ -610,14 -665,27 +621,28 @@@
+  
+  	disk_alloc_events(disk);
+  
+ -	if (disk->flags & GENHD_FL_HIDDEN) {
+ -		/*
+ -		 * Don't let hidden disks show up in /proc/partitions,
+ -		 * and don't bother scanning for partitions either.
+ -		 */
+ -		disk->flags |= GENHD_FL_SUPPRESS_PARTITION_INFO;
+ -		disk->flags |= GENHD_FL_NO_PART_SCAN;
+ -	} else {
+ -		int ret;
+ +	/* Register BDI before referencing it from bdev */
+ +	bdi = &disk->queue->backing_dev_info;
+ +	bdi_register_dev(bdi, disk_devt(disk));
+  
+++<<<<<<< HEAD
+ +	blk_register_region(disk_devt(disk), disk->minors, NULL,
+ +			    exact_match, exact_lock, disk);
+ +	register_disk(disk);
+ +	blk_register_queue(disk);
+++=======
++ 		/* Register BDI before referencing it from bdev */
++ 		disk_to_dev(disk)->devt = devt;
++ 		ret = bdi_register_owner(disk->queue->backing_dev_info,
++ 						disk_to_dev(disk));
++ 		WARN_ON(ret);
++ 		blk_register_region(disk_devt(disk), disk->minors, NULL,
++ 				    exact_match, exact_lock, disk);
++ 	}
++ 	register_disk(parent, disk);
++ 	if (register_queue)
++ 		blk_register_queue(disk);
+++>>>>>>> fa70d2e2c4a0 (block: allow gendisk's request_queue registration to be deferred)
+  
+  	/*
+  	 * Take an extra ref on queue which will be put on disk_release()
+@@@ -625,13 -693,21 +650,28 @@@
+  	 */
+  	WARN_ON_ONCE(!blk_get_queue(disk->queue));
+  
+ +	retval = sysfs_create_link(&disk_to_dev(disk)->kobj, &bdi->dev->kobj,
+ +				   "bdi");
+ +	WARN_ON(retval);
+ +
+  	disk_add_events(disk);
+ -	blk_integrity_add(disk);
+  }
+++<<<<<<< HEAD
+ +EXPORT_SYMBOL(add_disk);
+++=======
++ 
++ void device_add_disk(struct device *parent, struct gendisk *disk)
++ {
++ 	__device_add_disk(parent, disk, true);
++ }
++ EXPORT_SYMBOL(device_add_disk);
+++>>>>>>> fa70d2e2c4a0 (block: allow gendisk's request_queue registration to be deferred)
++ 
++ void device_add_disk_no_queue_reg(struct device *parent, struct gendisk *disk)
++ {
++ 	__device_add_disk(parent, disk, false);
++ }
++ EXPORT_SYMBOL(device_add_disk_no_queue_reg);
+  
+  void del_gendisk(struct gendisk *disk)
+  {
+diff --cc include/linux/genhd.h
+index 23d6e1a903ab,5e3531027b51..000000000000
+--- a/include/linux/genhd.h
++++ b/include/linux/genhd.h
+@@@ -415,10 -387,20 +415,24 @@@ static inline void free_part_info(struc
+  }
+  
+  /* block/blk-core.c */
+ -extern void part_round_stats(struct request_queue *q, int cpu, struct hd_struct *part);
+ +extern void part_round_stats(int cpu, struct hd_struct *part);
+  
+  /* block/genhd.c */
+++<<<<<<< HEAD
+ +extern void add_disk(struct gendisk *disk);
+++=======
++ extern void device_add_disk(struct device *parent, struct gendisk *disk);
++ static inline void add_disk(struct gendisk *disk)
++ {
++ 	device_add_disk(NULL, disk);
++ }
++ extern void device_add_disk_no_queue_reg(struct device *parent, struct gendisk *disk);
++ static inline void add_disk_no_queue_reg(struct gendisk *disk)
++ {
++ 	device_add_disk_no_queue_reg(NULL, disk);
++ }
++ 
+++>>>>>>> fa70d2e2c4a0 (block: allow gendisk's request_queue registration to be deferred)
+  extern void del_gendisk(struct gendisk *gp);
+  extern struct gendisk *get_gendisk(dev_t dev, int *partno);
+  extern struct block_device *bdget_disk(struct gendisk *disk, int partno);
+* Unmerged path block/blk-sysfs.c
+* Unmerged path block/genhd.c
+* Unmerged path include/linux/genhd.h
