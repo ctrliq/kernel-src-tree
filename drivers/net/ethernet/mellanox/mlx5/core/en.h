@@ -250,6 +250,7 @@ struct mlx5e_dcbx {
 
 	/* The only setting that cannot be read from FW */
 	u8                         tc_tsa[IEEE_8021QAZ_MAX_TCS];
+	u8                         cap;
 };
 #endif
 
