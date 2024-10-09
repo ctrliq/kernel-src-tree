@@ -1,0 +1,430 @@
+perf stat: Support per-die aggregation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Kan Liang <kan.liang@linux.intel.com>
+commit db5742b6849ed7f01d764e6755b8ab2b422f29b2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/db5742b6.failed
+
+It is useful to aggregate counts per die. E.g. Uncore becomes die-scope
+on Xeon Cascade Lake-AP.
+
+Introduce a new option "--per-die" to support per-die aggregation.
+
+The global id for each core has been changed to socket + die id + core
+id. The global id for each die is socket + die id.
+
+Add die information for per-core aggregation. The output of per-core
+aggregation will be changed from "S0-C0" to "S0-D0-C0". Any scripts
+which rely on the output format of per-core aggregation probably be
+broken.
+
+For 'perf stat record/report', there is no die information when
+processing the old perf.data. The per-die result will be the same as
+per-socket.
+
+Committer notes:
+
+Renamed 'die' variable to 'die_id' to fix the build in some systems:
+
+    CC       /tmp/build/perf/builtin-script.o
+  cc1: warnings being treated as errors
+  builtin-stat.c: In function 'perf_env__get_die':
+  builtin-stat.c:963: error: declaration of 'die' shadows a global declaration
+  util/util.h:19: error: shadowed declaration is here
+  mv: cannot stat `/tmp/build/perf/.builtin-stat.o.tmp': No such file or directory
+
+	Signed-off-by: Kan Liang <kan.liang@linux.intel.com>
+	Reviewed-by: Jiri Olsa <jolsa@kernel.org>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+Link: https://lkml.kernel.org/n/tip-bsnhx7vgsuu6ei307mw60mbj@git.kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit db5742b6849ed7f01d764e6755b8ab2b422f29b2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/stat-display.c
+diff --cc tools/perf/util/stat-display.c
+index 665ee374fc01,a6b9de3e83fc..000000000000
+--- a/tools/perf/util/stat-display.c
++++ b/tools/perf/util/stat-display.c
+@@@ -92,9 -99,18 +103,24 @@@ static void aggr_printout(struct perf_s
+  			config->csv_sep);
+  			break;
+  	case AGGR_NONE:
+++<<<<<<< HEAD
+ +		fprintf(config->output, "CPU%*d%s",
+ +			config->csv_output ? 0 : -4,
+ +			perf_evsel__cpus(evsel)->map[id], config->csv_sep);
+++=======
++ 		if (evsel->percore) {
++ 			fprintf(config->output, "S%d-D%d-C%*d%s",
++ 				cpu_map__id_to_socket(id),
++ 				cpu_map__id_to_die(id),
++ 				config->csv_output ? 0 : -5,
++ 				cpu_map__id_to_cpu(id), config->csv_sep);
++ 		} else {
++ 			fprintf(config->output, "CPU%*d%s ",
++ 				config->csv_output ? 0 : -5,
++ 				perf_evsel__cpus(evsel)->map[id],
++ 				config->csv_sep);
++ 		}
+++>>>>>>> db5742b6849e (perf stat: Support per-die aggregation)
+  		break;
+  	case AGGR_THREAD:
+  		fprintf(config->output, "%*s-%*d%s",
+diff --git a/tools/perf/Documentation/perf-stat.txt b/tools/perf/Documentation/perf-stat.txt
+index b10a90b6a718..30ca7965407a 100644
+--- a/tools/perf/Documentation/perf-stat.txt
++++ b/tools/perf/Documentation/perf-stat.txt
+@@ -197,6 +197,13 @@ use --per-socket in addition to -a. (system-wide).  The output includes the
+ socket number and the number of online processors on that socket. This is
+ useful to gauge the amount of aggregation.
+ 
++--per-die::
++Aggregate counts per processor die for system-wide mode measurements.  This
++is a useful mode to detect imbalance between dies.  To enable this mode,
++use --per-die in addition to -a. (system-wide).  The output includes the
++die number and the number of online processors on that die. This is
++useful to gauge the amount of aggregation.
++
+ --per-core::
+ Aggregate counts per physical processor for system-wide mode measurements.  This
+ is a useful mode to detect imbalance between physical cores.  To enable this mode,
+@@ -236,6 +243,9 @@ Input file name.
+ --per-socket::
+ Aggregate counts per processor socket for system-wide mode measurements.
+ 
++--per-die::
++Aggregate counts per processor die for system-wide mode measurements.
++
+ --per-core::
+ Aggregate counts per physical processor for system-wide mode measurements.
+ 
+diff --git a/tools/perf/builtin-stat.c b/tools/perf/builtin-stat.c
+index a635abfa77b6..4f350e2ebdb4 100644
+--- a/tools/perf/builtin-stat.c
++++ b/tools/perf/builtin-stat.c
+@@ -771,6 +771,8 @@ static const struct option stat_options[] = {
+ 		    "stop workload and print counts after a timeout period in ms (>= 10ms)"),
+ 	OPT_SET_UINT(0, "per-socket", &stat_config.aggr_mode,
+ 		     "aggregate counts per processor socket", AGGR_SOCKET),
++	OPT_SET_UINT(0, "per-die", &stat_config.aggr_mode,
++		     "aggregate counts per processor die", AGGR_DIE),
+ 	OPT_SET_UINT(0, "per-core", &stat_config.aggr_mode,
+ 		     "aggregate counts per physical processor core", AGGR_CORE),
+ 	OPT_SET_UINT(0, "per-thread", &stat_config.aggr_mode,
+@@ -795,6 +797,12 @@ static int perf_stat__get_socket(struct perf_stat_config *config __maybe_unused,
+ 	return cpu_map__get_socket(map, cpu, NULL);
+ }
+ 
++static int perf_stat__get_die(struct perf_stat_config *config __maybe_unused,
++			      struct cpu_map *map, int cpu)
++{
++	return cpu_map__get_die(map, cpu, NULL);
++}
++
+ static int perf_stat__get_core(struct perf_stat_config *config __maybe_unused,
+ 			       struct cpu_map *map, int cpu)
+ {
+@@ -835,6 +843,12 @@ static int perf_stat__get_socket_cached(struct perf_stat_config *config,
+ 	return perf_stat__get_aggr(config, perf_stat__get_socket, map, idx);
+ }
+ 
++static int perf_stat__get_die_cached(struct perf_stat_config *config,
++					struct cpu_map *map, int idx)
++{
++	return perf_stat__get_aggr(config, perf_stat__get_die, map, idx);
++}
++
+ static int perf_stat__get_core_cached(struct perf_stat_config *config,
+ 				      struct cpu_map *map, int idx)
+ {
+@@ -853,6 +867,13 @@ static int perf_stat_init_aggr_mode(void)
+ 		}
+ 		stat_config.aggr_get_id = perf_stat__get_socket_cached;
+ 		break;
++	case AGGR_DIE:
++		if (cpu_map__build_die_map(evsel_list->cpus, &stat_config.aggr_map)) {
++			perror("cannot build die map");
++			return -1;
++		}
++		stat_config.aggr_get_id = perf_stat__get_die_cached;
++		break;
+ 	case AGGR_CORE:
+ 		if (cpu_map__build_core_map(evsel_list->cpus, &stat_config.aggr_map)) {
+ 			perror("cannot build core map");
+@@ -909,21 +930,55 @@ static int perf_env__get_socket(struct cpu_map *map, int idx, void *data)
+ 	return cpu == -1 ? -1 : env->cpu[cpu].socket_id;
+ }
+ 
++static int perf_env__get_die(struct cpu_map *map, int idx, void *data)
++{
++	struct perf_env *env = data;
++	int die_id = -1, cpu = perf_env__get_cpu(env, map, idx);
++
++	if (cpu != -1) {
++		/*
++		 * Encode socket in bit range 15:8
++		 * die_id is relative to socket,
++		 * we need a global id. So we combine
++		 * socket + die id
++		 */
++		if (WARN_ONCE(env->cpu[cpu].socket_id >> 8, "The socket id number is too big.\n"))
++			return -1;
++
++		if (WARN_ONCE(env->cpu[cpu].die_id >> 8, "The die id number is too big.\n"))
++			return -1;
++
++		die_id = (env->cpu[cpu].socket_id << 8) | (env->cpu[cpu].die_id & 0xff);
++	}
++
++	return die_id;
++}
++
+ static int perf_env__get_core(struct cpu_map *map, int idx, void *data)
+ {
+ 	struct perf_env *env = data;
+ 	int core = -1, cpu = perf_env__get_cpu(env, map, idx);
+ 
+ 	if (cpu != -1) {
+-		int socket_id = env->cpu[cpu].socket_id;
+-
+ 		/*
+-		 * Encode socket in upper 16 bits
+-		 * core_id is relative to socket, and
++		 * Encode socket in bit range 31:24
++		 * encode die id in bit range 23:16
++		 * core_id is relative to socket and die,
+ 		 * we need a global id. So we combine
+-		 * socket + core id.
++		 * socket + die id + core id
+ 		 */
+-		core = (socket_id << 16) | (env->cpu[cpu].core_id & 0xffff);
++		if (WARN_ONCE(env->cpu[cpu].socket_id >> 8, "The socket id number is too big.\n"))
++			return -1;
++
++		if (WARN_ONCE(env->cpu[cpu].die_id >> 8, "The die id number is too big.\n"))
++			return -1;
++
++		if (WARN_ONCE(env->cpu[cpu].core_id >> 16, "The core id number is too big.\n"))
++			return -1;
++
++		core = (env->cpu[cpu].socket_id << 24) |
++		       (env->cpu[cpu].die_id << 16) |
++		       (env->cpu[cpu].core_id & 0xffff);
+ 	}
+ 
+ 	return core;
+@@ -935,6 +990,12 @@ static int perf_env__build_socket_map(struct perf_env *env, struct cpu_map *cpus
+ 	return cpu_map__build_map(cpus, sockp, perf_env__get_socket, env);
+ }
+ 
++static int perf_env__build_die_map(struct perf_env *env, struct cpu_map *cpus,
++				   struct cpu_map **diep)
++{
++	return cpu_map__build_map(cpus, diep, perf_env__get_die, env);
++}
++
+ static int perf_env__build_core_map(struct perf_env *env, struct cpu_map *cpus,
+ 				    struct cpu_map **corep)
+ {
+@@ -946,6 +1007,11 @@ static int perf_stat__get_socket_file(struct perf_stat_config *config __maybe_un
+ {
+ 	return perf_env__get_socket(map, idx, &perf_stat.session->header.env);
+ }
++static int perf_stat__get_die_file(struct perf_stat_config *config __maybe_unused,
++				   struct cpu_map *map, int idx)
++{
++	return perf_env__get_die(map, idx, &perf_stat.session->header.env);
++}
+ 
+ static int perf_stat__get_core_file(struct perf_stat_config *config __maybe_unused,
+ 				    struct cpu_map *map, int idx)
+@@ -965,6 +1031,13 @@ static int perf_stat_init_aggr_mode_file(struct perf_stat *st)
+ 		}
+ 		stat_config.aggr_get_id = perf_stat__get_socket_file;
+ 		break;
++	case AGGR_DIE:
++		if (perf_env__build_die_map(env, evsel_list->cpus, &stat_config.aggr_map)) {
++			perror("cannot build die map");
++			return -1;
++		}
++		stat_config.aggr_get_id = perf_stat__get_die_file;
++		break;
+ 	case AGGR_CORE:
+ 		if (perf_env__build_core_map(env, evsel_list->cpus, &stat_config.aggr_map)) {
+ 			perror("cannot build core map");
+@@ -1514,6 +1587,8 @@ static int __cmd_report(int argc, const char **argv)
+ 	OPT_STRING('i', "input", &input_name, "file", "input file name"),
+ 	OPT_SET_UINT(0, "per-socket", &perf_stat.aggr_mode,
+ 		     "aggregate counts per processor socket", AGGR_SOCKET),
++	OPT_SET_UINT(0, "per-die", &perf_stat.aggr_mode,
++		     "aggregate counts per processor die", AGGR_DIE),
+ 	OPT_SET_UINT(0, "per-core", &perf_stat.aggr_mode,
+ 		     "aggregate counts per physical processor core", AGGR_CORE),
+ 	OPT_SET_UINT('A', "no-aggr", &perf_stat.aggr_mode,
+diff --git a/tools/perf/util/cpumap.c b/tools/perf/util/cpumap.c
+index 5089449101a5..db0471ae4b91 100644
+--- a/tools/perf/util/cpumap.c
++++ b/tools/perf/util/cpumap.c
+@@ -372,6 +372,39 @@ int cpu_map__get_die_id(int cpu)
+ 	return ret ?: value;
+ }
+ 
++int cpu_map__get_die(struct cpu_map *map, int idx, void *data)
++{
++	int cpu, die_id, s;
++
++	if (idx > map->nr)
++		return -1;
++
++	cpu = map->map[idx];
++
++	die_id = cpu_map__get_die_id(cpu);
++	/* There is no die_id on legacy system. */
++	if (die_id == -1)
++		die_id = 0;
++
++	s = cpu_map__get_socket(map, idx, data);
++	if (s == -1)
++		return -1;
++
++	/*
++	 * Encode socket in bit range 15:8
++	 * die_id is relative to socket, and
++	 * we need a global id. So we combine
++	 * socket + die id
++	 */
++	if (WARN_ONCE(die_id >> 8, "The die id number is too big.\n"))
++		return -1;
++
++	if (WARN_ONCE(s >> 8, "The socket id number is too big.\n"))
++		return -1;
++
++	return (s << 8) | (die_id & 0xff);
++}
++
+ int cpu_map__get_core_id(int cpu)
+ {
+ 	int value, ret = cpu__get_topology_int(cpu, "core_id", &value);
+@@ -380,7 +413,7 @@ int cpu_map__get_core_id(int cpu)
+ 
+ int cpu_map__get_core(struct cpu_map *map, int idx, void *data)
+ {
+-	int cpu, s;
++	int cpu, s_die;
+ 
+ 	if (idx > map->nr)
+ 		return -1;
+@@ -389,17 +422,22 @@ int cpu_map__get_core(struct cpu_map *map, int idx, void *data)
+ 
+ 	cpu = cpu_map__get_core_id(cpu);
+ 
+-	s = cpu_map__get_socket(map, idx, data);
+-	if (s == -1)
++	/* s_die is the combination of socket + die id */
++	s_die = cpu_map__get_die(map, idx, data);
++	if (s_die == -1)
+ 		return -1;
+ 
+ 	/*
+-	 * encode socket in upper 16 bits
+-	 * core_id is relative to socket, and
++	 * encode socket in bit range 31:24
++	 * encode die id in bit range 23:16
++	 * core_id is relative to socket and die,
+ 	 * we need a global id. So we combine
+-	 * socket+ core id
++	 * socket + die id + core id
+ 	 */
+-	return (s << 16) | (cpu & 0xffff);
++	if (WARN_ONCE(cpu >> 16, "The core id number is too big.\n"))
++		return -1;
++
++	return (s_die << 16) | (cpu & 0xffff);
+ }
+ 
+ int cpu_map__build_socket_map(struct cpu_map *cpus, struct cpu_map **sockp)
+@@ -407,6 +445,11 @@ int cpu_map__build_socket_map(struct cpu_map *cpus, struct cpu_map **sockp)
+ 	return cpu_map__build_map(cpus, sockp, cpu_map__get_socket, NULL);
+ }
+ 
++int cpu_map__build_die_map(struct cpu_map *cpus, struct cpu_map **diep)
++{
++	return cpu_map__build_map(cpus, diep, cpu_map__get_die, NULL);
++}
++
+ int cpu_map__build_core_map(struct cpu_map *cpus, struct cpu_map **corep)
+ {
+ 	return cpu_map__build_map(cpus, corep, cpu_map__get_core, NULL);
+diff --git a/tools/perf/util/cpumap.h b/tools/perf/util/cpumap.h
+index cc41c917ad7b..dc1cc064046d 100644
+--- a/tools/perf/util/cpumap.h
++++ b/tools/perf/util/cpumap.h
+@@ -25,9 +25,11 @@ size_t cpu_map__fprintf(struct cpu_map *map, FILE *fp);
+ int cpu_map__get_socket_id(int cpu);
+ int cpu_map__get_socket(struct cpu_map *map, int idx, void *data);
+ int cpu_map__get_die_id(int cpu);
++int cpu_map__get_die(struct cpu_map *map, int idx, void *data);
+ int cpu_map__get_core_id(int cpu);
+ int cpu_map__get_core(struct cpu_map *map, int idx, void *data);
+ int cpu_map__build_socket_map(struct cpu_map *cpus, struct cpu_map **sockp);
++int cpu_map__build_die_map(struct cpu_map *cpus, struct cpu_map **diep);
+ int cpu_map__build_core_map(struct cpu_map *cpus, struct cpu_map **corep);
+ 
+ struct cpu_map *cpu_map__get(struct cpu_map *map);
+@@ -42,7 +44,12 @@ static inline int cpu_map__socket(struct cpu_map *sock, int s)
+ 
+ static inline int cpu_map__id_to_socket(int id)
+ {
+-	return id >> 16;
++	return id >> 24;
++}
++
++static inline int cpu_map__id_to_die(int id)
++{
++	return (id >> 16) & 0xff;
+ }
+ 
+ static inline int cpu_map__id_to_cpu(int id)
+* Unmerged path tools/perf/util/stat-display.c
+diff --git a/tools/perf/util/stat-shadow.c b/tools/perf/util/stat-shadow.c
+index 9a486bcd9890..c2343ec4be87 100644
+--- a/tools/perf/util/stat-shadow.c
++++ b/tools/perf/util/stat-shadow.c
+@@ -11,6 +11,7 @@
+ /*
+  * AGGR_GLOBAL: Use CPU 0
+  * AGGR_SOCKET: Use first CPU of socket
++ * AGGR_DIE: Use first CPU of die
+  * AGGR_CORE: Use first CPU of core
+  * AGGR_NONE: Use matching CPU
+  * AGGR_THREAD: Not supported?
+diff --git a/tools/perf/util/stat.c b/tools/perf/util/stat.c
+index 7a3883fd901f..449e088e4418 100644
+--- a/tools/perf/util/stat.c
++++ b/tools/perf/util/stat.c
+@@ -271,6 +271,7 @@ process_counter_values(struct perf_stat_config *config, struct perf_evsel *evsel
+ 	switch (config->aggr_mode) {
+ 	case AGGR_THREAD:
+ 	case AGGR_CORE:
++	case AGGR_DIE:
+ 	case AGGR_SOCKET:
+ 	case AGGR_NONE:
+ 		if (!evsel->snapshot)
+diff --git a/tools/perf/util/stat.h b/tools/perf/util/stat.h
+index 573ff5e3e649..0ea0a868958d 100644
+--- a/tools/perf/util/stat.h
++++ b/tools/perf/util/stat.h
+@@ -43,6 +43,7 @@ enum aggr_mode {
+ 	AGGR_NONE,
+ 	AGGR_GLOBAL,
+ 	AGGR_SOCKET,
++	AGGR_DIE,
+ 	AGGR_CORE,
+ 	AGGR_THREAD,
+ 	AGGR_UNSET,
