@@ -107,6 +107,7 @@ obj-$(CONFIG_UPROBES)			+= uprobes.o
 obj-$(CONFIG_PERF_EVENTS)		+= perf_regs.o
 obj-$(CONFIG_TRACING)			+= tracepoint.o
 obj-$(CONFIG_SCHED_MC_PRIO)		+= itmt.o
+obj-$(CONFIG_X86_INTEL_UMIP)		+= umip.o
 
 ifdef CONFIG_FRAME_POINTER
 obj-y					+= unwind_frame.o
