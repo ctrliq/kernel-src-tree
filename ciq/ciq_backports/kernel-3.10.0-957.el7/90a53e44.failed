@@ -1,0 +1,210 @@
+cfg80211: implement regdb signature checking
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Johannes Berg <johannes.berg@intel.com>
+commit 90a53e4432b12288316efaa5f308adafb8d304b0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/90a53e44.failed
+
+Currently CRDA implements the signature checking, and the previous
+commits added the ability to load the whole regulatory database
+into the kernel.
+
+However, we really can't lose the signature checking, so implement
+it in the kernel by loading a detached signature (regulatory.db.p7s)
+and check it against built-in keys.
+
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit 90a53e4432b12288316efaa5f308adafb8d304b0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/wireless/.gitignore
+#	net/wireless/Makefile
+#	net/wireless/reg.c
+#	net/wireless/reg.h
+diff --cc net/wireless/.gitignore
+index c33451b896d9,61cbc304a3d3..000000000000
+--- a/net/wireless/.gitignore
++++ b/net/wireless/.gitignore
+@@@ -1,1 -1,2 +1,6 @@@
+++<<<<<<< HEAD
+ +regdb.c
+++=======
++ shipped-certs.c
++ extra-certs.c
+++>>>>>>> 90a53e4432b1 (cfg80211: implement regdb signature checking)
+diff --cc net/wireless/Makefile
+index d06e5015751a,219baea57e4e..000000000000
+--- a/net/wireless/Makefile
++++ b/net/wireless/Makefile
+@@@ -18,7 -17,24 +18,31 @@@ cfg80211-$(CONFIG_CFG80211_INTERNAL_REG
+  
+  CFLAGS_trace.o := -I$(src)
+  
+++<<<<<<< HEAD
+ +$(obj)/regdb.c: $(src)/db.txt $(src)/genregdb.awk
+ +	@$(AWK) -f $(srctree)/$(src)/genregdb.awk < $< > $@
+ +
+ +clean-files := regdb.c
+++=======
++ cfg80211-$(CONFIG_CFG80211_USE_KERNEL_REGDB_KEYS) += shipped-certs.o
++ ifneq ($(CONFIG_CFG80211_EXTRA_REGDB_KEYDIR),)
++ cfg80211-y += extra-certs.o
++ endif
++ 
++ $(obj)/shipped-certs.c: $(wildcard $(srctree)/$(src)/certs/*.x509)
++ 	@echo "  GEN     $@"
++ 	@echo '#include "reg.h"' > $@
++ 	@echo 'const u8 shipped_regdb_certs[] = {' >> $@
++ 	@for f in $^ ; do hexdump -v -e '1/1 "0x%.2x," "\n"' < $$f >> $@ ; done
++ 	@echo '};' >> $@
++ 	@echo 'unsigned int shipped_regdb_certs_len = sizeof(shipped_regdb_certs);' >> $@
++ 
++ $(obj)/extra-certs.c: $(CONFIG_CFG80211_EXTRA_REGDB_KEYDIR:"%"=%) \
++ 		      $(wildcard $(CONFIG_CFG80211_EXTRA_REGDB_KEYDIR:"%"=%)/*.x509)
++ 	@echo "  GEN     $@"
++ 	@echo '#include "reg.h"' > $@
++ 	@echo 'const u8 extra_regdb_certs[] = {' >> $@
++ 	@for f in $^ ; do test -f $$f && hexdump -v -e '1/1 "0x%.2x," "\n"' < $$f >> $@ || true ; done
++ 	@echo '};' >> $@
++ 	@echo 'unsigned int extra_regdb_certs_len = sizeof(extra_regdb_certs);' >> $@
+++>>>>>>> 90a53e4432b1 (cfg80211: implement regdb signature checking)
+diff --cc net/wireless/reg.c
+index e9aeb05aaf3e,58319c82ecb3..000000000000
+--- a/net/wireless/reg.c
++++ b/net/wireless/reg.c
+@@@ -800,33 -884,35 +913,40 @@@ static void regdb_fw_cb(const struct fi
+  
+  	if (!fw) {
+  		pr_info("failed to load regulatory.db\n");
+++<<<<<<< HEAD
+ +		regdb = ERR_PTR(-ENODATA);
+ +		goto restore;
+ +	}
+ +
+ +	if (!valid_regdb(fw->data, fw->size)) {
+ +		pr_info("loaded regulatory.db is malformed\n");
+ +		release_firmware(fw);
+ +		regdb = ERR_PTR(-EINVAL);
+ +		goto restore;
+++=======
++ 		set_error = -ENODATA;
++ 	} else if (!valid_regdb(fw->data, fw->size)) {
++ 		pr_info("loaded regulatory.db is malformed or signature is missing/invalid\n");
++ 		set_error = -EINVAL;
+++>>>>>>> 90a53e4432b1 (cfg80211: implement regdb signature checking)
+  	}
+  
+ -	rtnl_lock();
+ -	if (WARN_ON(regdb && !IS_ERR(regdb))) {
+ -		/* just restore and free new db */
+ -	} else if (set_error) {
+ -		regdb = ERR_PTR(set_error);
+ -	} else if (fw) {
+ -		db = kmemdup(fw->data, fw->size, GFP_KERNEL);
+ -		if (db) {
+ -			regdb = db;
+ -			restore = context && query_regdb(context);
+ -		} else {
+ -			restore = true;
+ -		}
+ -	}
+ +	db = kmemdup(fw->data, fw->size, GFP_KERNEL);
+ +	release_firmware(fw);
+  
+ -	if (restore)
+ -		restore_regulatory_settings(true);
+ +	if (!db)
+ +		goto restore;
+ +	regdb = db;
+  
+ +	if (query_regdb(context))
+ +		goto restore;
+ +	goto free;
+ + restore:
+ +	rtnl_lock();
+ +	restore_regulatory_settings(true);
+  	rtnl_unlock();
+ -
+ + free:
+  	kfree(context);
+ -
+ -	release_firmware(fw);
+  }
+  
+  static int query_regdb_file(const char *alpha2)
+diff --cc net/wireless/reg.h
+index ca7fedf2e7a1,9ceeb5f3a7cb..000000000000
+--- a/net/wireless/reg.h
++++ b/net/wireless/reg.h
+@@@ -179,4 -182,15 +182,18 @@@ void regulatory_propagate_dfs_state(str
+   * @wiphy2 - wiphy it's dfs_region to be checked against that of wiphy1
+   */
+  bool reg_dfs_domain_same(struct wiphy *wiphy1, struct wiphy *wiphy2);
+++<<<<<<< HEAD
+++=======
++ 
++ /**
++  * reg_reload_regdb - reload the regulatory.db firmware file
++  */
++ int reg_reload_regdb(void);
++ 
++ extern const u8 shipped_regdb_certs[];
++ extern unsigned int shipped_regdb_certs_len;
++ extern const u8 extra_regdb_certs[];
++ extern unsigned int extra_regdb_certs_len;
++ 
+++>>>>>>> 90a53e4432b1 (cfg80211: implement regdb signature checking)
+  #endif  /* __NET_WIRELESS_REG_H */
+* Unmerged path net/wireless/.gitignore
+diff --git a/net/wireless/Kconfig b/net/wireless/Kconfig
+index 24eec5516649..93c6272a2c2e 100644
+--- a/net/wireless/Kconfig
++++ b/net/wireless/Kconfig
+@@ -83,6 +83,36 @@ config CFG80211_CERTIFICATION_ONUS
+ 	  you are a wireless researcher and are working in a controlled
+ 	  and approved environment by your local regulatory agency.
+ 
++config CFG80211_REQUIRE_SIGNED_REGDB
++	bool "require regdb signature" if CFG80211_CERTIFICATION_ONUS
++	default y
++	select SYSTEM_DATA_VERIFICATION
++	help
++	  Require that in addition to the "regulatory.db" file a
++	  "regulatory.db.p7s" can be loaded with a valid PKCS#7
++	  signature for the regulatory.db file made by one of the
++	  keys in the certs/ directory.
++
++config CFG80211_USE_KERNEL_REGDB_KEYS
++	bool "allow regdb keys shipped with the kernel" if CFG80211_CERTIFICATION_ONUS
++	default y
++	depends on CFG80211_REQUIRE_SIGNED_REGDB
++	help
++	  Allow the regulatory database to be signed by one of the keys for
++	  which certificates are part of the kernel sources
++	  (in net/wireless/certs/).
++
++	  This is currently only Seth Forshee's key, who is the regulatory
++	  database maintainer.
++
++config CFG80211_EXTRA_REGDB_KEYDIR
++	string "additional regdb key directory" if CFG80211_CERTIFICATION_ONUS
++	depends on CFG80211_REQUIRE_SIGNED_REGDB
++	help
++	  If selected, point to a directory with DER-encoded X.509
++	  certificates like in the kernel sources (net/wireless/certs/)
++	  that shall be accepted for a signed regulatory database.
++
+ config CFG80211_REG_CELLULAR_HINTS
+ 	bool "cfg80211 regulatory support for cellular base station hints"
+ 	depends on CFG80211_CERTIFICATION_ONUS
+* Unmerged path net/wireless/Makefile
+diff --git a/net/wireless/certs/sforshee.x509 b/net/wireless/certs/sforshee.x509
+new file mode 100644
+index 000000000000..c6f8f9d6b988
+Binary files /dev/null and b/net/wireless/certs/sforshee.x509 differ
+* Unmerged path net/wireless/reg.c
+* Unmerged path net/wireless/reg.h
