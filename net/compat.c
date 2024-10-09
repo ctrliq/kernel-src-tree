@@ -22,6 +22,7 @@
 #include <linux/filter.h>
 #include <linux/compat.h>
 #include <linux/security.h>
+#include <linux/audit.h>
 #include <linux/export.h>
 
 #include <net/scm.h>
@@ -803,14 +804,24 @@ asmlinkage long compat_sys_recvmmsg(int fd, struct compat_mmsghdr __user *mmsg,
 
 asmlinkage long compat_sys_socketcall(int call, u32 __user *args)
 {
-	int ret;
-	u32 a[6];
+	u32 a[AUDITSC_ARGS];
+	unsigned int len;
 	u32 a0, a1;
+	int ret;
 
 	if (call < SYS_SOCKET || call > SYS_SENDMMSG)
 		return -EINVAL;
-	if (copy_from_user(a, args, nas[call]))
+	len = nas[call];
+	if (len > sizeof(a))
+		return -EINVAL;
+
+	if (copy_from_user(a, args, len))
 		return -EFAULT;
+
+	ret = audit_socketcall_compat(len / sizeof(a[0]), a);
+	if (ret)
+		return ret;
+
 	a0 = a[0];
 	a1 = a[1];
 
