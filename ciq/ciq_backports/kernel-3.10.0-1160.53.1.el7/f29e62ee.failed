@@ -1,0 +1,171 @@
+gfs2: replace more printk with calls to fs_info and friends
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.53.1.el7
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit f29e62eed261f01431d348d8b22a6f275d553a51
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.53.1.el7/f29e62ee.failed
+
+This patch replaces a few leftover printk errors with calls to
+fs_info and similar, so that the file system having the error is
+properly logged.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit f29e62eed261f01431d348d8b22a6f275d553a51)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/glops.c
+#	fs/gfs2/super.c
+diff --cc fs/gfs2/glops.c
+index 90b93ba7dd9f,ff213690e364..000000000000
+--- a/fs/gfs2/glops.c
++++ b/fs/gfs2/glops.c
+@@@ -485,14 -496,23 +485,27 @@@ static int inode_go_dump(struct seq_fil
+   *
+   */
+  
+ -static void freeze_go_sync(struct gfs2_glock *gl)
+ +static void trans_go_sync(struct gfs2_glock *gl)
+  {
+ -	int error = 0;
+  	struct gfs2_sbd *sdp = gl->gl_name.ln_sbd;
+  
+ -	if (gl->gl_state == LM_ST_SHARED &&
+ +	if (gl->gl_state != LM_ST_UNLOCKED &&
+  	    test_bit(SDF_JOURNAL_LIVE, &sdp->sd_flags)) {
+++<<<<<<< HEAD
+ +		gfs2_meta_syncfs(sdp);
+ +		gfs2_log_shutdown(sdp, 0);
+++=======
++ 		atomic_set(&sdp->sd_freeze_state, SFS_STARTING_FREEZE);
++ 		error = freeze_super(sdp->sd_vfs);
++ 		if (error) {
++ 			fs_info(sdp, "GFS2: couldn't freeze filesystem: %d\n",
++ 				error);
++ 			gfs2_assert_withdraw(sdp, 0);
++ 		}
++ 		queue_work(gfs2_freeze_wq, &sdp->sd_freeze_work);
++ 		gfs2_log_flush(sdp, NULL, GFS2_LOG_HEAD_FLUSH_FREEZE |
++ 			       GFS2_LFC_FREEZE_GO_SYNC);
+++>>>>>>> f29e62eed261 (gfs2: replace more printk with calls to fs_info and friends)
+  	}
+  }
+  
+diff --cc fs/gfs2/super.c
+index fac088989e79,0acc5834f653..000000000000
+--- a/fs/gfs2/super.c
++++ b/fs/gfs2/super.c
+@@@ -961,6 -967,37 +961,40 @@@ static int gfs2_sync_fs(struct super_bl
+  	return sdp->sd_log_error;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void gfs2_freeze_func(struct work_struct *work)
++ {
++ 	int error;
++ 	struct gfs2_holder freeze_gh;
++ 	struct gfs2_sbd *sdp = container_of(work, struct gfs2_sbd, sd_freeze_work);
++ 	struct super_block *sb = sdp->sd_vfs;
++ 
++ 	atomic_inc(&sb->s_active);
++ 	error = gfs2_glock_nq_init(sdp->sd_freeze_gl, LM_ST_SHARED, 0,
++ 				   &freeze_gh);
++ 	if (error) {
++ 		fs_info(sdp, "GFS2: couldn't get freeze lock : %d\n", error);
++ 		gfs2_assert_withdraw(sdp, 0);
++ 	} else {
++ 		atomic_set(&sdp->sd_freeze_state, SFS_UNFROZEN);
++ 		error = thaw_super(sb);
++ 		if (error) {
++ 			fs_info(sdp, "GFS2: couldn't thaw filesystem: %d\n",
++ 				error);
++ 			gfs2_assert_withdraw(sdp, 0);
++ 		}
++ 		if (!test_bit(SDF_JOURNAL_LIVE, &sdp->sd_flags))
++ 			freeze_gh.gh_flags |= GL_NOCACHE;
++ 		gfs2_glock_dq_uninit(&freeze_gh);
++ 	}
++ 	deactivate_super(sb);
++ 	clear_bit_unlock(SDF_FS_FROZEN, &sdp->sd_flags);
++ 	wake_up_bit(&sdp->sd_flags, SDF_FS_FROZEN);
++ 	return;
++ }
++ 
+++>>>>>>> f29e62eed261 (gfs2: replace more printk with calls to fs_info and friends)
+  /**
+   * gfs2_freeze - prevent further writes to the filesystem
+   * @sb: the VFS structure for the filesystem
+diff --git a/fs/gfs2/bmap.c b/fs/gfs2/bmap.c
+index 740c8652e771..572406620b95 100644
+--- a/fs/gfs2/bmap.c
++++ b/fs/gfs2/bmap.c
+@@ -1866,9 +1866,8 @@ static int punch_hole(struct gfs2_inode *ip, u64 offset, u64 length)
+ 			gfs2_assert_withdraw(sdp, bh);
+ 			if (gfs2_assert_withdraw(sdp,
+ 						 prev_bnr != bh->b_blocknr)) {
+-				printk(KERN_EMERG "GFS2: fsid=%s:inode %llu, "
+-				       "block:%llu, i_h:%u, s_h:%u, mp_h:%u\n",
+-				       sdp->sd_fsname,
++				fs_emerg(sdp, "inode %llu, block:%llu, i_h:%u,"
++					 "s_h:%u, mp_h:%u\n",
+ 				       (unsigned long long)ip->i_no_addr,
+ 				       prev_bnr, ip->i_height, strip_h, mp_h);
+ 			}
+* Unmerged path fs/gfs2/glops.c
+diff --git a/fs/gfs2/rgrp.c b/fs/gfs2/rgrp.c
+index eebb1e1cfe40..392a55e57a4d 100644
+--- a/fs/gfs2/rgrp.c
++++ b/fs/gfs2/rgrp.c
+@@ -1034,32 +1034,33 @@ static int gfs2_rgrp_lvb_valid(struct gfs2_rgrpd *rgd)
+ {
+ 	struct gfs2_rgrp_lvb *rgl = rgd->rd_rgl;
+ 	struct gfs2_rgrp *str = (struct gfs2_rgrp *)rgd->rd_bits[0].bi_bh->b_data;
++	struct gfs2_sbd *sdp = rgd->rd_sbd;
+ 	int valid = 1;
+ 
+ 	if (rgl->rl_flags != str->rg_flags) {
+-		printk(KERN_WARNING "GFS2: rgd: %llu lvb flag mismatch %u/%u",
+-		       (unsigned long long)rgd->rd_addr,
++		fs_warn(sdp, "GFS2: rgd: %llu lvb flag mismatch %u/%u",
++			(unsigned long long)rgd->rd_addr,
+ 		       be32_to_cpu(rgl->rl_flags), be32_to_cpu(str->rg_flags));
+ 		valid = 0;
+ 	}
+ 	if (rgl->rl_free != str->rg_free) {
+-		printk(KERN_WARNING "GFS2: rgd: %llu lvb free mismatch %u/%u",
+-		       (unsigned long long)rgd->rd_addr,
+-		       be32_to_cpu(rgl->rl_free), be32_to_cpu(str->rg_free));
++		fs_warn(sdp, "GFS2: rgd: %llu lvb free mismatch %u/%u",
++			(unsigned long long)rgd->rd_addr,
++			be32_to_cpu(rgl->rl_free), be32_to_cpu(str->rg_free));
+ 		valid = 0;
+ 	}
+ 	if (rgl->rl_dinodes != str->rg_dinodes) {
+-		printk(KERN_WARNING "GFS2: rgd: %llu lvb dinode mismatch %u/%u",
+-		       (unsigned long long)rgd->rd_addr,
+-		       be32_to_cpu(rgl->rl_dinodes),
+-		       be32_to_cpu(str->rg_dinodes));
++		fs_warn(sdp, "GFS2: rgd: %llu lvb dinode mismatch %u/%u",
++			(unsigned long long)rgd->rd_addr,
++			be32_to_cpu(rgl->rl_dinodes),
++			be32_to_cpu(str->rg_dinodes));
+ 		valid = 0;
+ 	}
+ 	if (rgl->rl_igeneration != str->rg_igeneration) {
+-		printk(KERN_WARNING "GFS2: rgd: %llu lvb igen mismatch "
+-		       "%llu/%llu", (unsigned long long)rgd->rd_addr,
+-		       (unsigned long long)be64_to_cpu(rgl->rl_igeneration),
+-		       (unsigned long long)be64_to_cpu(str->rg_igeneration));
++		fs_warn(sdp, "GFS2: rgd: %llu lvb igen mismatch %llu/%llu",
++			(unsigned long long)rgd->rd_addr,
++			(unsigned long long)be64_to_cpu(rgl->rl_igeneration),
++			(unsigned long long)be64_to_cpu(str->rg_igeneration));
+ 		valid = 0;
+ 	}
+ 	return valid;
+* Unmerged path fs/gfs2/super.c
