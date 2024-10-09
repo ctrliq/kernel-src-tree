@@ -747,6 +747,16 @@ static int nfit_test1_alloc(struct nfit_test *t)
 	return ars_state_init(&t->pdev.dev, &t->ars_state);
 }
 
+static void dcr_common_init(struct acpi_nfit_control_region *dcr)
+{
+	dcr->vendor_id = 0xabcd;
+	dcr->device_id = 0;
+	dcr->revision_id = 1;
+	dcr->valid_fields = 1;
+	dcr->manufacturing_location = 0xa;
+	dcr->manufacturing_date = cpu_to_be16(2016);
+}
+
 static void nfit_test0_setup(struct nfit_test *t)
 {
 	const int flush_hint_size = sizeof(struct acpi_nfit_flush_address)
@@ -1075,9 +1085,7 @@ static void nfit_test0_setup(struct nfit_test *t)
 	dcr->header.type = ACPI_NFIT_TYPE_CONTROL_REGION;
 	dcr->header.length = sizeof(struct acpi_nfit_control_region);
 	dcr->region_index = 0+1;
-	dcr->vendor_id = 0xabcd;
-	dcr->device_id = 0;
-	dcr->revision_id = 1;
+	dcr_common_init(dcr);
 	dcr->serial_number = ~handle[0];
 	dcr->code = NFIT_FIC_BLK;
 	dcr->windows = 1;
@@ -1092,9 +1100,7 @@ static void nfit_test0_setup(struct nfit_test *t)
 	dcr->header.type = ACPI_NFIT_TYPE_CONTROL_REGION;
 	dcr->header.length = sizeof(struct acpi_nfit_control_region);
 	dcr->region_index = 1+1;
-	dcr->vendor_id = 0xabcd;
-	dcr->device_id = 0;
-	dcr->revision_id = 1;
+	dcr_common_init(dcr);
 	dcr->serial_number = ~handle[1];
 	dcr->code = NFIT_FIC_BLK;
 	dcr->windows = 1;
@@ -1109,9 +1115,7 @@ static void nfit_test0_setup(struct nfit_test *t)
 	dcr->header.type = ACPI_NFIT_TYPE_CONTROL_REGION;
 	dcr->header.length = sizeof(struct acpi_nfit_control_region);
 	dcr->region_index = 2+1;
-	dcr->vendor_id = 0xabcd;
-	dcr->device_id = 0;
-	dcr->revision_id = 1;
+	dcr_common_init(dcr);
 	dcr->serial_number = ~handle[2];
 	dcr->code = NFIT_FIC_BLK;
 	dcr->windows = 1;
@@ -1126,9 +1130,7 @@ static void nfit_test0_setup(struct nfit_test *t)
 	dcr->header.type = ACPI_NFIT_TYPE_CONTROL_REGION;
 	dcr->header.length = sizeof(struct acpi_nfit_control_region);
 	dcr->region_index = 3+1;
-	dcr->vendor_id = 0xabcd;
-	dcr->device_id = 0;
-	dcr->revision_id = 1;
+	dcr_common_init(dcr);
 	dcr->serial_number = ~handle[3];
 	dcr->code = NFIT_FIC_BLK;
 	dcr->windows = 1;
@@ -1145,9 +1147,7 @@ static void nfit_test0_setup(struct nfit_test *t)
 	dcr->header.length = offsetof(struct acpi_nfit_control_region,
 			window_size);
 	dcr->region_index = 4+1;
-	dcr->vendor_id = 0xabcd;
-	dcr->device_id = 0;
-	dcr->revision_id = 1;
+	dcr_common_init(dcr);
 	dcr->serial_number = ~handle[0];
 	dcr->code = NFIT_FIC_BYTEN;
 	dcr->windows = 0;
@@ -1159,9 +1159,7 @@ static void nfit_test0_setup(struct nfit_test *t)
 	dcr->header.length = offsetof(struct acpi_nfit_control_region,
 			window_size);
 	dcr->region_index = 5+1;
-	dcr->vendor_id = 0xabcd;
-	dcr->device_id = 0;
-	dcr->revision_id = 1;
+	dcr_common_init(dcr);
 	dcr->serial_number = ~handle[1];
 	dcr->code = NFIT_FIC_BYTEN;
 	dcr->windows = 0;
@@ -1173,9 +1171,7 @@ static void nfit_test0_setup(struct nfit_test *t)
 	dcr->header.length = offsetof(struct acpi_nfit_control_region,
 			window_size);
 	dcr->region_index = 6+1;
-	dcr->vendor_id = 0xabcd;
-	dcr->device_id = 0;
-	dcr->revision_id = 1;
+	dcr_common_init(dcr);
 	dcr->serial_number = ~handle[2];
 	dcr->code = NFIT_FIC_BYTEN;
 	dcr->windows = 0;
@@ -1187,9 +1183,7 @@ static void nfit_test0_setup(struct nfit_test *t)
 	dcr->header.length = offsetof(struct acpi_nfit_control_region,
 			window_size);
 	dcr->region_index = 7+1;
-	dcr->vendor_id = 0xabcd;
-	dcr->device_id = 0;
-	dcr->revision_id = 1;
+	dcr_common_init(dcr);
 	dcr->serial_number = ~handle[3];
 	dcr->code = NFIT_FIC_BYTEN;
 	dcr->windows = 0;
@@ -1284,9 +1278,7 @@ static void nfit_test0_setup(struct nfit_test *t)
 		dcr->header.type = ACPI_NFIT_TYPE_CONTROL_REGION;
 		dcr->header.length = sizeof(struct acpi_nfit_control_region);
 		dcr->region_index = 8+1;
-		dcr->vendor_id = 0xabcd;
-		dcr->device_id = 0;
-		dcr->revision_id = 1;
+		dcr_common_init(dcr);
 		dcr->serial_number = ~handle[4];
 		dcr->code = NFIT_FIC_BLK;
 		dcr->windows = 1;
@@ -1303,9 +1295,7 @@ static void nfit_test0_setup(struct nfit_test *t)
 		dcr->header.length = offsetof(struct acpi_nfit_control_region,
 				window_size);
 		dcr->region_index = 9+1;
-		dcr->vendor_id = 0xabcd;
-		dcr->device_id = 0;
-		dcr->revision_id = 1;
+		dcr_common_init(dcr);
 		dcr->serial_number = ~handle[4];
 		dcr->code = NFIT_FIC_BYTEN;
 		dcr->windows = 0;
@@ -1483,9 +1473,7 @@ static void nfit_test1_setup(struct nfit_test *t)
 	dcr->header.length = offsetof(struct acpi_nfit_control_region,
 			window_size);
 	dcr->region_index = 0+1;
-	dcr->vendor_id = 0xabcd;
-	dcr->device_id = 0;
-	dcr->revision_id = 1;
+	dcr_common_init(dcr);
 	dcr->serial_number = ~0;
 	dcr->code = NFIT_FIC_BYTE;
 	dcr->windows = 0;
