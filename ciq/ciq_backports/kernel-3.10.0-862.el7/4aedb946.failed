@@ -1,0 +1,419 @@
+ALSA: x86: Create ELD control element
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Takashi Iwai <tiwai@suse.de>
+commit 4aedb9465f717a8393bb5f40581eb7942af12506
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/4aedb946.failed
+
+Like other drivers, expose the ELD bytes via a control element so that
+user-space can parse it.
+
+For the simplicity, the code to register the ctl elements is
+refactored using an array.  Also, since ELD ctl read copies the bytes
+also during disconnection, clear the ELD bytes at hot-unplug, in order
+to avoid the leak of the previous bogus ELD.
+
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit 4aedb9465f717a8393bb5f40581eb7942af12506)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/x86/intel_hdmi_audio.c
+diff --cc sound/x86/intel_hdmi_audio.c
+index 063e2be94d05,f49520117dd6..000000000000
+--- a/sound/x86/intel_hdmi_audio.c
++++ b/sound/x86/intel_hdmi_audio.c
+@@@ -1552,85 -1660,278 +1552,203 @@@ static int had_iec958_put(struct snd_kc
+  		(ucontrol->value.iec958.status[1] << 8) |
+  		(ucontrol->value.iec958.status[2] << 16) |
+  		(ucontrol->value.iec958.status[3] << 24);
+ -	mutex_lock(&intelhaddata->mutex);
+  	if (intelhaddata->aes_bits != val) {
+  		intelhaddata->aes_bits = val;
+ -		changed = 1;
+ +		return 1;
+  	}
+ -	mutex_unlock(&intelhaddata->mutex);
+ -	return changed;
+ +	return 1;
+  }
+  
+- static struct snd_kcontrol_new had_control_iec958_mask = {
+- 	.access =   SNDRV_CTL_ELEM_ACCESS_READ,
+- 	.iface =    SNDRV_CTL_ELEM_IFACE_PCM,
+- 	.name =     SNDRV_CTL_NAME_IEC958("", PLAYBACK, MASK),
+- 	.info =     had_iec958_info, /* shared */
+- 	.get =      had_iec958_mask_get,
+- };
++ static int had_ctl_eld_info(struct snd_kcontrol *kcontrol,
++ 			    struct snd_ctl_elem_info *uinfo)
++ {
++ 	uinfo->type = SNDRV_CTL_ELEM_TYPE_BYTES;
++ 	uinfo->count = HDMI_MAX_ELD_BYTES;
++ 	return 0;
++ }
+  
+- static struct snd_kcontrol_new had_control_iec958 = {
+- 	.iface =    SNDRV_CTL_ELEM_IFACE_PCM,
+- 	.name =         SNDRV_CTL_NAME_IEC958("", PLAYBACK, DEFAULT),
+- 	.info =         had_iec958_info,
+- 	.get =          had_iec958_get,
+- 	.put =          had_iec958_put
++ static int had_ctl_eld_get(struct snd_kcontrol *kcontrol,
++ 			   struct snd_ctl_elem_value *ucontrol)
++ {
++ 	struct snd_intelhad *intelhaddata = snd_kcontrol_chip(kcontrol);
++ 
++ 	mutex_lock(&intelhaddata->mutex);
++ 	memcpy(ucontrol->value.bytes.data, intelhaddata->eld,
++ 	       HDMI_MAX_ELD_BYTES);
++ 	mutex_unlock(&intelhaddata->mutex);
++ 	return 0;
++ }
++ 
++ static struct snd_kcontrol_new had_controls[] = {
++ 	{
++ 		.access = SNDRV_CTL_ELEM_ACCESS_READ,
++ 		.iface = SNDRV_CTL_ELEM_IFACE_PCM,
++ 		.name = SNDRV_CTL_NAME_IEC958("", PLAYBACK, MASK),
++ 		.info = had_iec958_info, /* shared */
++ 		.get = had_iec958_mask_get,
++ 	},
++ 	{
++ 		.iface = SNDRV_CTL_ELEM_IFACE_PCM,
++ 		.name = SNDRV_CTL_NAME_IEC958("", PLAYBACK, DEFAULT),
++ 		.info = had_iec958_info,
++ 		.get = had_iec958_get,
++ 		.put = had_iec958_put,
++ 	},
++ 	{
++ 		.access = (SNDRV_CTL_ELEM_ACCESS_READ |
++ 			   SNDRV_CTL_ELEM_ACCESS_VOLATILE),
++ 		.iface = SNDRV_CTL_ELEM_IFACE_PCM,
++ 		.name = "ELD",
++ 		.info = had_ctl_eld_info,
++ 		.get = had_ctl_eld_get,
++ 	},
+  };
+  
++ 
+++<<<<<<< HEAD
+++=======
++ static irqreturn_t display_pipe_interrupt_handler(int irq, void *dev_id)
++ {
++ 	struct snd_intelhad *ctx = dev_id;
++ 	u32 audio_stat, audio_reg;
++ 
++ 	audio_reg = AUD_HDMI_STATUS;
++ 	mid_hdmi_audio_read(ctx, audio_reg, &audio_stat);
++ 
++ 	if (audio_stat & HDMI_AUDIO_UNDERRUN) {
++ 		mid_hdmi_audio_write(ctx, audio_reg, HDMI_AUDIO_UNDERRUN);
++ 		had_process_buffer_underrun(ctx);
++ 	}
++ 
++ 	if (audio_stat & HDMI_AUDIO_BUFFER_DONE) {
++ 		mid_hdmi_audio_write(ctx, audio_reg, HDMI_AUDIO_BUFFER_DONE);
++ 		had_process_buffer_done(ctx);
++ 	}
++ 
++ 	return IRQ_HANDLED;
++ }
++ 
++ static void notify_audio_lpe(struct platform_device *pdev)
++ {
++ 	struct snd_intelhad *ctx = platform_get_drvdata(pdev);
++ 
++ 	schedule_work(&ctx->hdmi_audio_wq);
++ }
++ 
++ static void had_audio_wq(struct work_struct *work)
++ {
++ 	struct snd_intelhad *ctx =
++ 		container_of(work, struct snd_intelhad, hdmi_audio_wq);
++ 	struct intel_hdmi_lpe_audio_pdata *pdata = ctx->dev->platform_data;
++ 
++ 	pm_runtime_get_sync(ctx->dev);
++ 	mutex_lock(&ctx->mutex);
++ 	if (!pdata->hdmi_connected) {
++ 		dev_dbg(ctx->dev, "%s: Event: HAD_NOTIFY_HOT_UNPLUG\n",
++ 			__func__);
++ 		memset(ctx->eld, 0, sizeof(ctx->eld)); /* clear the old ELD */
++ 		had_process_hot_unplug(ctx);
++ 	} else {
++ 		struct intel_hdmi_lpe_audio_eld *eld = &pdata->eld;
++ 
++ 		dev_dbg(ctx->dev, "%s: HAD_NOTIFY_ELD : port = %d, tmds = %d\n",
++ 			__func__, eld->port_id,	pdata->tmds_clock_speed);
++ 
++ 		switch (eld->pipe_id) {
++ 		case 0:
++ 			ctx->had_config_offset = AUDIO_HDMI_CONFIG_A;
++ 			break;
++ 		case 1:
++ 			ctx->had_config_offset = AUDIO_HDMI_CONFIG_B;
++ 			break;
++ 		case 2:
++ 			ctx->had_config_offset = AUDIO_HDMI_CONFIG_C;
++ 			break;
++ 		default:
++ 			dev_dbg(ctx->dev, "Invalid pipe %d\n",
++ 				eld->pipe_id);
++ 			break;
++ 		}
++ 
++ 		memcpy(ctx->eld, eld->eld_data, sizeof(ctx->eld));
++ 
++ 		ctx->dp_output = pdata->dp_output;
++ 		ctx->tmds_clock_speed = pdata->tmds_clock_speed;
++ 		ctx->link_rate = pdata->link_rate;
++ 
++ 		had_process_hot_plug(ctx);
++ 
++ 		/* Process mode change if stream is active */
++ 		hdmi_audio_mode_change(ctx);
++ 	}
++ 	mutex_unlock(&ctx->mutex);
++ 	pm_runtime_put(ctx->dev);
++ }
++ 
+++>>>>>>> 4aedb9465f71 (ALSA: x86: Create ELD control element)
+  /*
+ - * PM callbacks
+ - */
+ -
+ -static int hdmi_lpe_audio_runtime_suspend(struct device *dev)
+ -{
+ -	struct snd_intelhad *ctx = dev_get_drvdata(dev);
+ -	struct snd_pcm_substream *substream;
+ -
+ -	substream = had_substream_get(ctx);
+ -	if (substream) {
+ -		snd_pcm_suspend(substream);
+ -		had_substream_put(ctx);
+ -	}
+ -
+ -	return 0;
+ -}
+ -
+ -static int hdmi_lpe_audio_suspend(struct device *dev)
+ -{
+ -	struct snd_intelhad *ctx = dev_get_drvdata(dev);
+ -	int err;
+ -
+ -	err = hdmi_lpe_audio_runtime_suspend(dev);
+ -	if (!err)
+ -		snd_power_change_state(ctx->card, SNDRV_CTL_POWER_D3hot);
+ -	return err;
+ -}
+ -
+ -static int hdmi_lpe_audio_resume(struct device *dev)
+ -{
+ -	struct snd_intelhad *ctx = dev_get_drvdata(dev);
+ -
+ -	snd_power_change_state(ctx->card, SNDRV_CTL_POWER_D0);
+ -	return 0;
+ -}
+ -
+ -/* release resources */
+ -static void hdmi_lpe_audio_free(struct snd_card *card)
+ -{
+ -	struct snd_intelhad *ctx = card->private_data;
+ -
+ -	cancel_work_sync(&ctx->hdmi_audio_wq);
+ -
+ -	if (ctx->mmio_start)
+ -		iounmap(ctx->mmio_start);
+ -	if (ctx->irq >= 0)
+ -		free_irq(ctx->irq, ctx);
+ -}
+ -
+ -/*
+ - * hdmi_lpe_audio_probe - start bridge with i915
+ + * hdmi_audio_probe - to create sound card instance for HDMI audio playabck
+ + *
+ + * @devptr: platform device
+ + * @had_ret: pointer to store the created snd_intelhad object
+   *
+ - * This function is called when the i915 driver creates the
+ - * hdmi-lpe-audio platform device.
+ + * This function is called when the platform device is probed. This function
+ + * creates and registers the sound card with ALSA
+   */
+ -static int hdmi_lpe_audio_probe(struct platform_device *pdev)
+ +int hdmi_audio_probe(struct platform_device *devptr,
+ +		     struct snd_intelhad **had_ret)
+  {
+ -	struct snd_card *card;
+ -	struct snd_intelhad *ctx;
+ +	int retval;
+  	struct snd_pcm *pcm;
+++<<<<<<< HEAD
+ +	struct snd_card *card;
+ +	struct snd_intelhad *intelhaddata;
+ +	struct had_pvt_data *had_stream;
+++=======
++ 	struct intel_hdmi_lpe_audio_pdata *pdata;
++ 	int irq;
++ 	struct resource *res_mmio;
++ 	int i, ret;
+++>>>>>>> 4aedb9465f71 (ALSA: x86: Create ELD control element)
+  
+ -	dev_dbg(&pdev->dev, "dma_mask: %p\n", pdev->dev.dma_mask);
+ +	pr_debug("Enter %s\n", __func__);
+  
+ -	pdata = pdev->dev.platform_data;
+ -	if (!pdata) {
+ -		dev_err(&pdev->dev, "%s: quit: pdata not allocated by i915!!\n", __func__);
+ -		return -EINVAL;
+ -	}
+ -
+ -	/* get resources */
+ -	irq = platform_get_irq(pdev, 0);
+ -	if (irq < 0) {
+ -		dev_err(&pdev->dev, "Could not get irq resource\n");
+ -		return -ENODEV;
+ -	}
+ -
+ -	res_mmio = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+ -	if (!res_mmio) {
+ -		dev_err(&pdev->dev, "Could not get IO_MEM resources\n");
+ -		return -ENXIO;
+ -	}
+ +	pr_debug("hdmi_audio_probe dma_mask: %p\n", devptr->dev.dma_mask);
+  
+ -	/* create a card instance with ALSA framework */
+ -	ret = snd_card_new(&pdev->dev, hdmi_card_index, hdmi_card_id,
+ -			   THIS_MODULE, sizeof(*ctx), &card);
+ -	if (ret)
+ -		return ret;
+ -
+ -	ctx = card->private_data;
+ -	spin_lock_init(&ctx->had_spinlock);
+ -	mutex_init(&ctx->mutex);
+ -	ctx->drv_status = HAD_DRV_DISCONNECTED;
+ -	ctx->dev = &pdev->dev;
+ -	ctx->card = card;
+ -	ctx->aes_bits = SNDRV_PCM_DEFAULT_CON_SPDIF;
+ -	strcpy(card->driver, INTEL_HAD);
+ -	strcpy(card->shortname, INTEL_HAD);
+ -
+ -	ctx->irq = -1;
+ -	ctx->tmds_clock_speed = DIS_SAMPLE_RATE_148_5;
+ -	INIT_WORK(&ctx->hdmi_audio_wq, had_audio_wq);
+ -
+ -	card->private_free = hdmi_lpe_audio_free;
+ -
+ -	/* assume pipe A as default */
+ -	ctx->had_config_offset = AUDIO_HDMI_CONFIG_A;
+ -
+ -	platform_set_drvdata(pdev, ctx);
+ -
+ -	dev_dbg(&pdev->dev, "%s: mmio_start = 0x%x, mmio_end = 0x%x\n",
+ -		__func__, (unsigned int)res_mmio->start,
+ -		(unsigned int)res_mmio->end);
+ -
+ -	ctx->mmio_start = ioremap_nocache(res_mmio->start,
+ -					  (size_t)(resource_size(res_mmio)));
+ -	if (!ctx->mmio_start) {
+ -		dev_err(&pdev->dev, "Could not get ioremap\n");
+ -		ret = -EACCES;
+ -		goto err;
+ -	}
+ +	/* allocate memory for saving internal context and working */
+ +	intelhaddata = kzalloc(sizeof(*intelhaddata), GFP_KERNEL);
+ +	if (!intelhaddata)
+ +		return -ENOMEM;
+  
+ -	/* setup interrupt handler */
+ -	ret = request_irq(irq, display_pipe_interrupt_handler, 0,
+ -			  pdev->name, ctx);
+ -	if (ret < 0) {
+ -		dev_err(&pdev->dev, "request_irq failed\n");
+ -		goto err;
+ +	had_stream = kzalloc(sizeof(*had_stream), GFP_KERNEL);
+ +	if (!had_stream) {
+ +		retval = -ENOMEM;
+ +		goto free_haddata;
+  	}
+  
+ -	ctx->irq = irq;
+ +	spin_lock_init(&intelhaddata->had_spinlock);
+ +	intelhaddata->drv_status = HAD_DRV_DISCONNECTED;
+ +	pr_debug("%s @ %d:DEBUG PLUG/UNPLUG : HAD_DRV_DISCONNECTED\n",
+ +			__func__, __LINE__);
+  
+ -	ret = snd_pcm_new(card, INTEL_HAD, PCM_INDEX, MAX_PB_STREAMS,
+ -			  MAX_CAP_STREAMS, &pcm);
+ -	if (ret)
+ +	/* create a card instance with ALSA framework */
+ +	retval = snd_card_new(&devptr->dev, hdmi_card_index, hdmi_card_id,
+ +				THIS_MODULE, 0, &card);
+ +
+ +	if (retval)
+ +		goto free_hadstream;
+ +	intelhaddata->card = card;
+ +	intelhaddata->card_id = hdmi_card_id;
+ +	intelhaddata->card_index = card->number;
+ +	intelhaddata->private_data = had_stream;
+ +	intelhaddata->flag_underrun = 0;
+ +	intelhaddata->aes_bits = SNDRV_PCM_DEFAULT_CON_SPDIF;
+ +	strncpy(card->driver, INTEL_HAD, strlen(INTEL_HAD));
+ +	strncpy(card->shortname, INTEL_HAD, strlen(INTEL_HAD));
+ +
+ +	retval = snd_pcm_new(card, INTEL_HAD, PCM_INDEX, MAX_PB_STREAMS,
+ +						MAX_CAP_STREAMS, &pcm);
+ +	if (retval)
+  		goto err;
+  
+  	/* setup private data which can be retrieved when required */
+@@@ -1649,36 -1949,12 +1767,45 @@@
+  			SNDRV_DMA_TYPE_DEV, NULL,
+  			HAD_MAX_BUFFER, HAD_MAX_BUFFER);
+  
+++<<<<<<< HEAD
+ +	if (card->dev == NULL)
+ +		pr_debug("card->dev is NULL!!!!! Should not be this case\n");
+ +	else if (card->dev->dma_mask == NULL)
+ +		pr_debug("hdmi_audio_probe dma_mask is NULL!!!!!\n");
+ +	else
+ +		pr_debug("hdmi_audio_probe dma_mask is : %p\n",
+ +				card->dev->dma_mask);
+ +
+ +	if (retval)
+ +		goto err;
+ +
+ +	/* internal function call to register device with ALSA */
+ +	retval = snd_intelhad_create(intelhaddata, card);
+ +	if (retval)
+ +		goto err;
+ +
+ +	card->private_data = &intelhaddata;
+ +	retval = snd_card_register(card);
+ +	if (retval)
+ +		goto err;
+ +
+ +	/* IEC958 controls */
+ +	retval = snd_ctl_add(card, snd_ctl_new1(&had_control_iec958_mask,
+ +						intelhaddata));
+ +	if (retval < 0)
+ +		goto err;
+ +	retval = snd_ctl_add(card, snd_ctl_new1(&had_control_iec958,
+ +						intelhaddata));
+ +	if (retval < 0)
+ +		goto err;
+++=======
++ 	/* create controls */
++ 	for (i = 0; i < ARRAY_SIZE(had_controls); i++) {
++ 		ret = snd_ctl_add(card, snd_ctl_new1(&had_controls[i], ctx));
++ 		if (ret < 0)
++ 			goto err;
++ 	}
+++>>>>>>> 4aedb9465f71 (ALSA: x86: Create ELD control element)
+  
+  	init_channel_allocations();
+  
+* Unmerged path sound/x86/intel_hdmi_audio.c
