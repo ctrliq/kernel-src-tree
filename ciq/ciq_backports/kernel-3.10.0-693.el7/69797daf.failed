@@ -1,0 +1,183 @@
+Revert "x86/mm/ASLR: Propagate base load address calculation"
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Borislav Petkov <bp@suse.de>
+commit 69797dafe35541bfff1989c0b37c66ed785faf0e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/69797daf.failed
+
+This reverts commit:
+
+  f47233c2d34f ("x86/mm/ASLR: Propagate base load address calculation")
+
+The main reason for the revert is that the new boot flag does not work
+at all currently, and in order to make this work, we need non-trivial
+changes to the x86 boot code which we didn't manage to get done in
+time for merging.
+
+And even if we did, they would've been too risky so instead of
+rushing things and break booting 4.1 on boxes left and right, we
+will be very strict and conservative and will take our time with
+this to fix and test it properly.
+
+	Reported-by: Yinghai Lu <yinghai@kernel.org>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Cc: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+	Cc: Baoquan He <bhe@redhat.com>
+	Cc: H. Peter Anvin <hpa@linux.intel.com
+	Cc: Jiri Kosina <jkosina@suse.cz>
+	Cc: Josh Triplett <josh@joshtriplett.org>
+	Cc: Junjie Mao <eternal.n08@gmail.com>
+	Cc: Kees Cook <keescook@chromium.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Matt Fleming <matt.fleming@intel.com>
+Link: http://lkml.kernel.org/r/20150316100628.GD22995@pd.tnic
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 69797dafe35541bfff1989c0b37c66ed785faf0e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/aslr.c
+#	arch/x86/boot/compressed/misc.c
+#	arch/x86/boot/compressed/misc.h
+#	arch/x86/kernel/module.c
+diff --cc arch/x86/boot/compressed/misc.c
+index 136cb407d4ef,a950864a64da..000000000000
+--- a/arch/x86/boot/compressed/misc.c
++++ b/arch/x86/boot/compressed/misc.c
+@@@ -397,6 -396,16 +397,19 @@@ asmlinkage void decompress_kernel(void 
+  	free_mem_ptr     = heap;	/* Heap */
+  	free_mem_end_ptr = heap + BOOT_HEAP_SIZE;
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * The memory hole needed for the kernel is the larger of either
++ 	 * the entire decompressed kernel plus relocation table, or the
++ 	 * entire decompressed kernel plus .bss and .brk sections.
++ 	 */
++ 	output = choose_kernel_location(input_data, input_len, output,
++ 					output_len > run_size ? output_len
++ 							      : run_size);
++ 
++ 	/* Validate memory location choices. */
+++>>>>>>> 69797dafe355 (Revert "x86/mm/ASLR: Propagate base load address calculation")
+  	if ((unsigned long)output & (MIN_KERNEL_ALIGN - 1))
+  		error("Destination address inappropriately aligned");
+  #ifdef CONFIG_X86_64
+diff --cc arch/x86/boot/compressed/misc.h
+index 674019d8e235,04477d68403f..000000000000
+--- a/arch/x86/boot/compressed/misc.h
++++ b/arch/x86/boot/compressed/misc.h
+@@@ -44,7 -52,29 +44,31 @@@ static inline void debug_putstr(const c
+  /* cmdline.c */
+  int cmdline_find_option(const char *option, char *buffer, int bufsize);
+  int cmdline_find_option_bool(const char *option);
+ -#endif
+  
+++<<<<<<< HEAD
+++=======
++ 
++ #if CONFIG_RANDOMIZE_BASE
++ /* aslr.c */
++ unsigned char *choose_kernel_location(unsigned char *input,
++ 				      unsigned long input_size,
++ 				      unsigned char *output,
++ 				      unsigned long output_size);
++ /* cpuflags.c */
++ bool has_cpuflag(int flag);
++ #else
++ static inline
++ unsigned char *choose_kernel_location(unsigned char *input,
++ 				      unsigned long input_size,
++ 				      unsigned char *output,
++ 				      unsigned long output_size)
++ {
++ 	return output;
++ }
++ #endif
++ 
++ #ifdef CONFIG_EARLY_PRINTK
+++>>>>>>> 69797dafe355 (Revert "x86/mm/ASLR: Propagate base load address calculation")
+  /* early_serial_console.c */
+  extern int early_serial_base;
+  void console_init(void);
+diff --cc arch/x86/kernel/module.c
+index 7c1efc437dc0,d1ac80b72c72..000000000000
+--- a/arch/x86/kernel/module.c
++++ b/arch/x86/kernel/module.c
+@@@ -43,13 -45,61 +43,53 @@@ do {							
+  } while (0)
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_RANDOMIZE_BASE
++ static unsigned long module_load_offset;
++ static int randomize_modules = 1;
++ 
++ /* Mutex protects the module_load_offset. */
++ static DEFINE_MUTEX(module_kaslr_mutex);
++ 
++ static int __init parse_nokaslr(char *p)
++ {
++ 	randomize_modules = 0;
++ 	return 0;
++ }
++ early_param("nokaslr", parse_nokaslr);
++ 
++ static unsigned long int get_module_load_offset(void)
++ {
++ 	if (randomize_modules) {
++ 		mutex_lock(&module_kaslr_mutex);
++ 		/*
++ 		 * Calculate the module_load_offset the first time this
++ 		 * code is called. Once calculated it stays the same until
++ 		 * reboot.
++ 		 */
++ 		if (module_load_offset == 0)
++ 			module_load_offset =
++ 				(get_random_int() % 1024 + 1) * PAGE_SIZE;
++ 		mutex_unlock(&module_kaslr_mutex);
++ 	}
++ 	return module_load_offset;
++ }
++ #else
++ static unsigned long int get_module_load_offset(void)
++ {
++ 	return 0;
++ }
++ #endif
++ 
+++>>>>>>> 69797dafe355 (Revert "x86/mm/ASLR: Propagate base load address calculation")
+  void *module_alloc(unsigned long size)
+  {
+ -	void *p;
+ -
+  	if (PAGE_ALIGN(size) > MODULES_LEN)
+  		return NULL;
+ -
+ -	p = __vmalloc_node_range(size, MODULE_ALIGN,
+ -				    MODULES_VADDR + get_module_load_offset(),
+ -				    MODULES_END, GFP_KERNEL | __GFP_HIGHMEM,
+ -				    PAGE_KERNEL_EXEC, 0, NUMA_NO_NODE,
+ -				    __builtin_return_address(0));
+ -	if (p && (kasan_module_alloc(p, size) < 0)) {
+ -		vfree(p);
+ -		return NULL;
+ -	}
+ -
+ -	return p;
+ +	return __vmalloc_node_range(size, 1, MODULES_VADDR, MODULES_END,
+ +				GFP_KERNEL | __GFP_HIGHMEM, PAGE_KERNEL_EXEC,
+ +				-1, __builtin_return_address(0));
+  }
+  
+  #ifdef CONFIG_X86_32
+* Unmerged path arch/x86/boot/compressed/aslr.c
+* Unmerged path arch/x86/boot/compressed/aslr.c
+* Unmerged path arch/x86/boot/compressed/misc.c
+* Unmerged path arch/x86/boot/compressed/misc.h
+* Unmerged path arch/x86/kernel/module.c
