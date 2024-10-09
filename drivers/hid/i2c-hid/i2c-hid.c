@@ -38,7 +38,7 @@
 #include <linux/mutex.h>
 #include <linux/acpi.h>
 
-#include <linux/i2c/i2c-hid.h>
+#include <linux/platform_data/i2c-hid.h>
 
 #include "../hid-ids.h"
 
