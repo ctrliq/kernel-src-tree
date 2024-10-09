@@ -1,0 +1,375 @@
+memcg, slab: do not destroy children caches if parent has aliases
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Vladimir Davydov <vdavydov@parallels.com>
+commit b8529907ba35d625fa4b85d3e4dc8021be97c1f3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/b8529907.failed
+
+Currently we destroy children caches at the very beginning of
+kmem_cache_destroy().  This is wrong, because the root cache will not
+necessarily be destroyed in the end - if it has aliases (refcount > 0),
+kmem_cache_destroy() will simply decrement its refcount and return.  In
+this case, at best we will get a bunch of warnings in dmesg, like this
+one:
+
+  kmem_cache_destroy kmalloc-32:0: Slab cache still has objects
+  CPU: 1 PID: 7139 Comm: modprobe Tainted: G    B   W    3.13.0+ #117
+  Call Trace:
+    dump_stack+0x49/0x5b
+    kmem_cache_destroy+0xdf/0xf0
+    kmem_cache_destroy_memcg_children+0x97/0xc0
+    kmem_cache_destroy+0xf/0xf0
+    xfs_mru_cache_uninit+0x21/0x30 [xfs]
+    exit_xfs_fs+0x2e/0xc44 [xfs]
+    SyS_delete_module+0x198/0x1f0
+    system_call_fastpath+0x16/0x1b
+
+At worst - if kmem_cache_destroy() will race with an allocation from a
+memcg cache - the kernel will panic.
+
+This patch fixes this by moving children caches destruction after the
+check if the cache has aliases.  Plus, it forbids destroying a root
+cache if it still has children caches, because each children cache keeps
+a reference to its parent.
+
+	Signed-off-by: Vladimir Davydov <vdavydov@parallels.com>
+	Cc: Michal Hocko <mhocko@suse.cz>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Pekka Enberg <penberg@kernel.org>
+	Cc: Glauber Costa <glommer@gmail.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit b8529907ba35d625fa4b85d3e4dc8021be97c1f3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memcontrol.c
+#	mm/slab_common.c
+diff --cc mm/memcontrol.c
+index 23e6528af2de,29501f040568..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -3354,99 -3321,10 +3354,98 @@@ void mem_cgroup_destroy_cache(struct km
+  	schedule_work(&cachep->memcg_params->destroy);
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * This lock protects updaters, not readers. We want readers to be as fast as
+ + * they can, and they will either see NULL or a valid cache value. Our model
+ + * allow them to see NULL, in which case the root memcg will be selected.
+ + *
+ + * We need this lock because multiple allocations to the same cache from a non
+ + * will span more than one worker. Only one of them can create the cache.
+ + */
+ +static DEFINE_MUTEX(memcg_cache_mutex);
+ +
+ +/*
+ + * Called with memcg_cache_mutex held
+ + */
+ +static struct kmem_cache *kmem_cache_dup(struct mem_cgroup *memcg,
+ +					 struct kmem_cache *s)
+ +{
+ +	struct kmem_cache *new;
+ +	static char *tmp_name = NULL;
+ +
+ +	lockdep_assert_held(&memcg_cache_mutex);
+ +
+ +	/*
+ +	 * kmem_cache_create_memcg duplicates the given name and
+ +	 * cgroup_name for this name requires RCU context.
+ +	 * This static temporary buffer is used to prevent from
+ +	 * pointless shortliving allocation.
+ +	 */
+ +	if (!tmp_name) {
+ +		tmp_name = kmalloc(PATH_MAX, GFP_KERNEL);
+ +		if (!tmp_name)
+ +			return NULL;
+ +	}
+ +
+ +	rcu_read_lock();
+ +	snprintf(tmp_name, PATH_MAX, "%s(%d:%s)", s->name,
+ +			 memcg_cache_id(memcg), cgroup_name(memcg->css.cgroup));
+ +	rcu_read_unlock();
+ +
+ +	new = kmem_cache_create_memcg(memcg, tmp_name, s->object_size, s->align,
+ +				      (s->flags & ~SLAB_PANIC), s->ctor, s);
+ +
+ +	if (new)
+ +		new->allocflags |= __GFP_KMEMCG;
+ +
+ +	return new;
+ +}
+ +
+ +static struct kmem_cache *memcg_create_kmem_cache(struct mem_cgroup *memcg,
+ +						  struct kmem_cache *cachep)
+ +{
+ +	struct kmem_cache *new_cachep;
+ +	int idx;
+ +
+ +	BUG_ON(!memcg_can_account_kmem(memcg));
+ +
+ +	idx = memcg_cache_id(memcg);
+ +
+ +	mutex_lock(&memcg_cache_mutex);
+ +	new_cachep = cachep->memcg_params->memcg_caches[idx];
+ +	if (new_cachep)
+ +		goto out;
+ +
+ +	new_cachep = kmem_cache_dup(memcg, cachep);
+ +	if (new_cachep == NULL) {
+ +		new_cachep = cachep;
+ +		goto out;
+ +	}
+ +
+ +	mem_cgroup_get(memcg);
+ +	atomic_set(&new_cachep->memcg_params->nr_pages , 0);
+ +
+ +	cachep->memcg_params->memcg_caches[idx] = new_cachep;
+ +	/*
+ +	 * the readers won't lock, make sure everybody sees the updated value,
+ +	 * so they won't put stuff in the queue again for no reason
+ +	 */
+ +	wmb();
+ +out:
+ +	mutex_unlock(&memcg_cache_mutex);
+ +	return new_cachep;
+ +}
+ +
+ +static DEFINE_MUTEX(memcg_limit_mutex);
+ +
+ +void kmem_cache_destroy_memcg_children(struct kmem_cache *s)
+++=======
++ int __kmem_cache_destroy_memcg_children(struct kmem_cache *s)
+++>>>>>>> b8529907ba35 (memcg, slab: do not destroy children caches if parent has aliases)
+  {
+  	struct kmem_cache *c;
+- 	int i;
+- 
+- 	if (!s->memcg_params)
+- 		return;
+- 	if (!s->memcg_params->is_root_cache)
+- 		return;
++ 	int i, failed = 0;
+  
+  	/*
+  	 * If the cache is being destroyed, we trust that there is no one else
+@@@ -3479,16 -3358,14 +3478,24 @@@
+  		c->memcg_params->dead = false;
+  		cancel_work_sync(&c->memcg_params->destroy);
+  		kmem_cache_destroy(c);
++ 
++ 		if (cache_from_memcg_idx(s, i))
++ 			failed++;
+  	}
+++<<<<<<< HEAD
+ +	mutex_unlock(&memcg_limit_mutex);
+++=======
++ 	mutex_unlock(&activate_kmem_mutex);
++ 	return failed;
+++>>>>>>> b8529907ba35 (memcg, slab: do not destroy children caches if parent has aliases)
+  }
+  
+ +struct create_work {
+ +	struct mem_cgroup *memcg;
+ +	struct kmem_cache *cachep;
+ +	struct work_struct work;
+ +};
+ +
+  static void mem_cgroup_destroy_all_caches(struct mem_cgroup *memcg)
+  {
+  	struct kmem_cache *cachep;
+diff --cc mm/slab_common.c
+index e13d227ed0ab,f3cfccf76dda..000000000000
+--- a/mm/slab_common.c
++++ b/mm/slab_common.c
+@@@ -256,53 -250,115 +256,155 @@@ out_locked
+  				name, err);
+  			dump_stack();
+  		}
+ +
+  		return NULL;
+  	}
+ +
+  	return s;
+  }
+ +
+ +struct kmem_cache *
+ +kmem_cache_create(const char *name, size_t size, size_t align,
+ +		  unsigned long flags, void (*ctor)(void *))
+ +{
+ +	return kmem_cache_create_memcg(NULL, name, size, align, flags, ctor, NULL);
+ +}
+  EXPORT_SYMBOL(kmem_cache_create);
+  
+++<<<<<<< HEAD
+ +void kmem_cache_destroy(struct kmem_cache *s)
+ +{
+ +	if (unlikely(!s))
+ +		return;
+ +
+ +	/* Destroy all the children caches if we aren't a memcg cache */
+ +	kmem_cache_destroy_memcg_children(s);
+ +
+++=======
++ #ifdef CONFIG_MEMCG_KMEM
++ /*
++  * kmem_cache_create_memcg - Create a cache for a memory cgroup.
++  * @memcg: The memory cgroup the new cache is for.
++  * @root_cache: The parent of the new cache.
++  *
++  * This function attempts to create a kmem cache that will serve allocation
++  * requests going from @memcg to @root_cache. The new cache inherits properties
++  * from its parent.
++  */
++ void kmem_cache_create_memcg(struct mem_cgroup *memcg, struct kmem_cache *root_cache)
++ {
++ 	struct kmem_cache *s;
++ 	char *cache_name;
++ 
++ 	get_online_cpus();
++ 	mutex_lock(&slab_mutex);
++ 
++ 	/*
++ 	 * Since per-memcg caches are created asynchronously on first
++ 	 * allocation (see memcg_kmem_get_cache()), several threads can try to
++ 	 * create the same cache, but only one of them may succeed.
++ 	 */
++ 	if (cache_from_memcg_idx(root_cache, memcg_cache_id(memcg)))
++ 		goto out_unlock;
++ 
++ 	cache_name = memcg_create_cache_name(memcg, root_cache);
++ 	if (!cache_name)
++ 		goto out_unlock;
++ 
++ 	s = do_kmem_cache_create(cache_name, root_cache->object_size,
++ 				 root_cache->size, root_cache->align,
++ 				 root_cache->flags, root_cache->ctor,
++ 				 memcg, root_cache);
++ 	if (IS_ERR(s)) {
++ 		kfree(cache_name);
++ 		goto out_unlock;
++ 	}
++ 
++ 	s->allocflags |= __GFP_KMEMCG;
++ 
++ out_unlock:
++ 	mutex_unlock(&slab_mutex);
++ 	put_online_cpus();
++ }
++ 
++ static int kmem_cache_destroy_memcg_children(struct kmem_cache *s)
++ {
++ 	int rc;
++ 
++ 	if (!s->memcg_params ||
++ 	    !s->memcg_params->is_root_cache)
++ 		return 0;
++ 
++ 	mutex_unlock(&slab_mutex);
++ 	rc = __kmem_cache_destroy_memcg_children(s);
++ 	mutex_lock(&slab_mutex);
++ 
++ 	return rc;
++ }
++ #else
++ static int kmem_cache_destroy_memcg_children(struct kmem_cache *s)
++ {
++ 	return 0;
++ }
++ #endif /* CONFIG_MEMCG_KMEM */
++ 
++ void kmem_cache_destroy(struct kmem_cache *s)
++ {
+++>>>>>>> b8529907ba35 (memcg, slab: do not destroy children caches if parent has aliases)
+  	get_online_cpus();
+  	mutex_lock(&slab_mutex);
++ 
+  	s->refcount--;
+++<<<<<<< HEAD
+ +	if (!s->refcount) {
+ +		list_del(&s->list);
+++=======
++ 	if (s->refcount)
++ 		goto out_unlock;
+++>>>>>>> b8529907ba35 (memcg, slab: do not destroy children caches if parent has aliases)
+  
+- 		if (!__kmem_cache_shutdown(s)) {
+- 			mutex_unlock(&slab_mutex);
+- 			if (s->flags & SLAB_DESTROY_BY_RCU)
+- 				rcu_barrier();
++ 	if (kmem_cache_destroy_memcg_children(s) != 0)
++ 		goto out_unlock;
+  
+++<<<<<<< HEAD
+ +			memcg_release_cache(s);
+ +			kfree(s->name);
+ +			kmem_cache_free(kmem_cache, s);
+ +		} else {
+ +			list_add(&s->list, &slab_caches);
+ +			mutex_unlock(&slab_mutex);
+ +			printk(KERN_ERR "kmem_cache_destroy %s: Slab cache still has objects\n",
+ +				s->name);
+ +			dump_stack();
+ +		}
+ +	} else {
+ +		mutex_unlock(&slab_mutex);
+++=======
++ 	list_del(&s->list);
++ 	memcg_unregister_cache(s);
++ 
++ 	if (__kmem_cache_shutdown(s) != 0) {
++ 		list_add(&s->list, &slab_caches);
++ 		memcg_register_cache(s);
++ 		printk(KERN_ERR "kmem_cache_destroy %s: "
++ 		       "Slab cache still has objects\n", s->name);
++ 		dump_stack();
++ 		goto out_unlock;
+++>>>>>>> b8529907ba35 (memcg, slab: do not destroy children caches if parent has aliases)
+  	}
++ 
++ 	mutex_unlock(&slab_mutex);
++ 	if (s->flags & SLAB_DESTROY_BY_RCU)
++ 		rcu_barrier();
++ 
++ 	memcg_free_cache_params(s);
++ 	kfree(s->name);
++ 	kmem_cache_free(kmem_cache, s);
++ 	goto out_put_cpus;
++ 
++ out_unlock:
++ 	mutex_unlock(&slab_mutex);
++ out_put_cpus:
+  	put_online_cpus();
+  }
+  EXPORT_SYMBOL(kmem_cache_destroy);
+diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
+index 584b3a91b9fd..f592235c32b3 100644
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -496,7 +496,7 @@ struct kmem_cache *
+ __memcg_kmem_get_cache(struct kmem_cache *cachep, gfp_t gfp);
+ 
+ void mem_cgroup_destroy_cache(struct kmem_cache *cachep);
+-void kmem_cache_destroy_memcg_children(struct kmem_cache *s);
++int __kmem_cache_destroy_memcg_children(struct kmem_cache *s);
+ 
+ /**
+  * memcg_kmem_newpage_charge: verify if a new kmem allocation is allowed.
+@@ -647,10 +647,6 @@ memcg_kmem_get_cache(struct kmem_cache *cachep, gfp_t gfp)
+ {
+ 	return cachep;
+ }
+-
+-static inline void kmem_cache_destroy_memcg_children(struct kmem_cache *s)
+-{
+-}
+ #endif /* CONFIG_MEMCG_KMEM */
+ #endif /* _LINUX_MEMCONTROL_H */
+ 
+* Unmerged path mm/memcontrol.c
+* Unmerged path mm/slab_common.c
