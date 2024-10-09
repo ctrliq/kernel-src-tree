@@ -1,0 +1,220 @@
+ovl: Pass argument to ovl_get_inode() in a structure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Vivek Goyal <vgoyal@redhat.com>
+commit ac6a52eb65b5327859135269c9374bf2ff731c9f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/ac6a52eb.failed
+
+ovl_get_inode() right now has 5 parameters. Soon this patch series will
+add 2 more and suddenly argument list starts looking too long.
+
+Hence pass arguments to ovl_get_inode() in a structure and it looks
+little cleaner.
+
+	Signed-off-by: Vivek Goyal <vgoyal@redhat.com>
+	Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit ac6a52eb65b5327859135269c9374bf2ff731c9f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/overlayfs/export.c
+#	fs/overlayfs/inode.c
+#	fs/overlayfs/namei.c
+#	fs/overlayfs/overlayfs.h
+diff --cc fs/overlayfs/inode.c
+index 24ce49ae057f,2b9e8370500c..000000000000
+--- a/fs/overlayfs/inode.c
++++ b/fs/overlayfs/inode.c
+@@@ -690,16 -698,68 +690,81 @@@ static bool ovl_verify_inode(struct ino
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+ +struct inode *ovl_get_inode(struct super_block *sb, struct dentry *upperdentry,
+ +			    struct dentry *lowerdentry, struct dentry *index,
+ +			    unsigned int numlower)
+ +{
+ +	struct ovl_fs *ofs = sb->s_fs_info;
+ +	struct inode *realinode = upperdentry ? d_inode(upperdentry) : NULL;
+ +	struct inode *inode;
+ +	/* Already indexed or could be indexed on copy up? */
+ +	bool indexed = (index || (ovl_indexdir(sb) && !upperdentry));
+ +	struct dentry *origin = indexed ? lowerdentry : NULL;
+++=======
++ struct inode *ovl_lookup_inode(struct super_block *sb, struct dentry *real,
++ 			       bool is_upper)
++ {
++ 	struct inode *inode, *key = d_inode(real);
++ 
++ 	inode = ilookup5(sb, (unsigned long) key, ovl_inode_test, key);
++ 	if (!inode)
++ 		return NULL;
++ 
++ 	if (!ovl_verify_inode(inode, is_upper ? NULL : real,
++ 			      is_upper ? real : NULL, false)) {
++ 		iput(inode);
++ 		return ERR_PTR(-ESTALE);
++ 	}
++ 
++ 	return inode;
++ }
++ 
++ /*
++  * Does overlay inode need to be hashed by lower inode?
++  */
++ static bool ovl_hash_bylower(struct super_block *sb, struct dentry *upper,
++ 			     struct dentry *lower, struct dentry *index)
++ {
++ 	struct ovl_fs *ofs = sb->s_fs_info;
++ 
++ 	/* No, if pure upper */
++ 	if (!lower)
++ 		return false;
++ 
++ 	/* Yes, if already indexed */
++ 	if (index)
++ 		return true;
++ 
++ 	/* Yes, if won't be copied up */
++ 	if (!ofs->upper_mnt)
++ 		return true;
++ 
++ 	/* No, if lower hardlink is or will be broken on copy up */
++ 	if ((upper || !ovl_indexdir(sb)) &&
++ 	    !d_is_dir(lower) && d_inode(lower)->i_nlink > 1)
++ 		return false;
++ 
++ 	/* No, if non-indexed upper with NFS export */
++ 	if (sb->s_export_op && upper)
++ 		return false;
++ 
++ 	/* Otherwise, hash by lower inode for fsnotify */
++ 	return true;
++ }
++ 
++ struct inode *ovl_get_inode(struct super_block *sb,
++ 			    struct ovl_inode_params *oip)
++ {
++ 	struct dentry *upperdentry = oip->upperdentry;
++ 	struct ovl_path *lowerpath = oip->lowerpath;
++ 	struct inode *realinode = upperdentry ? d_inode(upperdentry) : NULL;
++ 	struct inode *inode;
++ 	struct dentry *lowerdentry = lowerpath ? lowerpath->dentry : NULL;
++ 	bool bylower = ovl_hash_bylower(sb, upperdentry, lowerdentry,
++ 					oip->index);
++ 	int fsid = bylower ? oip->lowerpath->layer->fsid : 0;
+++>>>>>>> ac6a52eb65b5 (ovl: Pass argument to ovl_get_inode() in a structure)
+  	bool is_dir;
+  	unsigned long ino = 0;
+  
+@@@ -710,23 -767,17 +775,23 @@@
+  		realinode = d_inode(lowerdentry);
+  
+  	/*
+ -	 * Copy up origin (lower) may exist for non-indexed upper, but we must
+ -	 * not use lower as hash key if this is a broken hardlink.
+ +	 * Copy up origin (lower) may exist for non-indexed non-dir upper, but
+ +	 * we must not use lower as hash key in that case.
+ +	 * Hash non-dir that is or could be indexed by origin inode.
+ +	 * Hash dir that is or could be merged by origin inode.
+ +	 * Hash pure upper and non-indexed non-dir by upper inode.
+ +	 * Hash non-indexed dir by upper inode for NFS export.
+  	 */
+  	is_dir = S_ISDIR(realinode->i_mode);
+ -	if (upperdentry || bylower) {
+ -		struct inode *key = d_inode(bylower ? lowerdentry :
+ -						      upperdentry);
+ +	if (is_dir && (indexed || !sb->s_export_op || !ofs->upper_mnt))
+ +		origin = lowerdentry;
+ +
+ +	if (upperdentry || origin) {
+ +		struct inode *key = d_inode(origin ?: upperdentry);
+  		unsigned int nlink = is_dir ? 1 : realinode->i_nlink;
+  
+- 		inode = iget5_locked(sb, (unsigned long) key,
+- 				     ovl_inode_test, ovl_inode_set, key);
++ 		inode = iget5_locked(sb, (unsigned long) key, ovl_inode_test,
++ 				     ovl_inode_set, key);
+  		if (!inode)
+  			goto out_nomem;
+  		if (!(inode->i_state & I_NEW)) {
+@@@ -760,9 -813,12 +825,15 @@@
+  	if (upperdentry && ovl_is_impuredir(upperdentry))
+  		ovl_set_flag(OVL_IMPURE, inode);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (oip->index)
++ 		ovl_set_flag(OVL_INDEX, inode);
++ 
+++>>>>>>> ac6a52eb65b5 (ovl: Pass argument to ovl_get_inode() in a structure)
+  	/* Check for non-merge dir that may have whiteouts */
+  	if (is_dir) {
+- 		if (((upperdentry && lowerdentry) || numlower > 1) ||
++ 		if (((upperdentry && lowerdentry) || oip->numlower > 1) ||
+  		    ovl_check_origin_xattr(upperdentry ?: lowerdentry)) {
+  			ovl_set_flag(OVL_WHITEOUTS, inode);
+  		}
+diff --cc fs/overlayfs/namei.c
+index 42e824e6e6cb,08801b45df00..000000000000
+--- a/fs/overlayfs/namei.c
++++ b/fs/overlayfs/namei.c
+@@@ -747,10 -1004,14 +747,21 @@@ struct dentry *ovl_lookup(struct inode 
+  		upperdentry = dget(index);
+  
+  	if (upperdentry || ctr) {
+++<<<<<<< HEAD
+ +		if (ctr)
+ +			origin = stack[0].dentry;
+ +		inode = ovl_get_inode(dentry->d_sb, upperdentry, origin, index,
+ +				      ctr);
+++=======
++ 		struct ovl_inode_params oip = {
++ 			.upperdentry = upperdentry,
++ 			.lowerpath = stack,
++ 			.index = index,
++ 			.numlower = ctr,
++ 		};
++ 
++ 		inode = ovl_get_inode(dentry->d_sb, &oip);
+++>>>>>>> ac6a52eb65b5 (ovl: Pass argument to ovl_get_inode() in a structure)
+  		err = PTR_ERR(inode);
+  		if (IS_ERR(inode))
+  			goto out_free_oe;
+diff --cc fs/overlayfs/overlayfs.h
+index 403c48960f89,b8a0160742b2..000000000000
+--- a/fs/overlayfs/overlayfs.h
++++ b/fs/overlayfs/overlayfs.h
+@@@ -288,10 -328,17 +288,23 @@@ int ovl_open_maybe_copy_up(struct dentr
+  int ovl_update_time(struct inode *inode, struct timespec *ts, int flags);
+  bool ovl_is_private_xattr(const char *name);
+  
++ struct ovl_inode_params {
++ 	struct dentry *upperdentry;
++ 	struct ovl_path *lowerpath;
++ 	struct dentry *index;
++ 	unsigned int numlower;
++ };
+  struct inode *ovl_new_inode(struct super_block *sb, umode_t mode, dev_t rdev);
+++<<<<<<< HEAD
+ +struct inode *ovl_get_inode(struct super_block *sb, struct dentry *upperdentry,
+ +			    struct dentry *lowerdentry, struct dentry *index,
+ +			    unsigned int numlower);
+++=======
++ struct inode *ovl_lookup_inode(struct super_block *sb, struct dentry *real,
++ 			       bool is_upper);
++ struct inode *ovl_get_inode(struct super_block *sb,
++ 			    struct ovl_inode_params *oip);
+++>>>>>>> ac6a52eb65b5 (ovl: Pass argument to ovl_get_inode() in a structure)
+  static inline void ovl_copyattr(struct inode *from, struct inode *to)
+  {
+  	to->i_uid = from->i_uid;
+* Unmerged path fs/overlayfs/export.c
+* Unmerged path fs/overlayfs/export.c
+* Unmerged path fs/overlayfs/inode.c
+* Unmerged path fs/overlayfs/namei.c
+* Unmerged path fs/overlayfs/overlayfs.h
