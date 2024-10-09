@@ -1,0 +1,174 @@
+sock_diag: align nlattr properly when needed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Nicolas Dichtel <nicolas.dichtel@6wind.com>
+commit 6ed46d1247a595c58b6c04481fa77cf532f45de0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/6ed46d12.failed
+
+I also fix the value of INET_DIAG_MAX. It's wrong since commit 8f840e47f190
+which is only in net-next right now, thus I didn't make a separate patch.
+
+Fixes: 8f840e47f190 ("sctp: add the sctp_diag.c file")
+	Signed-off-by: Nicolas Dichtel <nicolas.dichtel@6wind.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6ed46d1247a595c58b6c04481fa77cf532f45de0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/sock_diag.c
+#	net/ipv4/inet_diag.c
+diff --cc net/core/sock_diag.c
+index 39b9bcdc1390,6b10573cc9fa..000000000000
+--- a/net/core/sock_diag.c
++++ b/net/core/sock_diag.c
+@@@ -88,6 -111,62 +88,65 @@@ out
+  }
+  EXPORT_SYMBOL(sock_diag_put_filterinfo);
+  
+++<<<<<<< HEAD
+++=======
++ struct broadcast_sk {
++ 	struct sock *sk;
++ 	struct work_struct work;
++ };
++ 
++ static size_t sock_diag_nlmsg_size(void)
++ {
++ 	return NLMSG_ALIGN(sizeof(struct inet_diag_msg)
++ 	       + nla_total_size(sizeof(u8)) /* INET_DIAG_PROTOCOL */
++ 	       + nla_total_size_64bit(sizeof(struct tcp_info))); /* INET_DIAG_INFO */
++ }
++ 
++ static void sock_diag_broadcast_destroy_work(struct work_struct *work)
++ {
++ 	struct broadcast_sk *bsk =
++ 		container_of(work, struct broadcast_sk, work);
++ 	struct sock *sk = bsk->sk;
++ 	const struct sock_diag_handler *hndl;
++ 	struct sk_buff *skb;
++ 	const enum sknetlink_groups group = sock_diag_destroy_group(sk);
++ 	int err = -1;
++ 
++ 	WARN_ON(group == SKNLGRP_NONE);
++ 
++ 	skb = nlmsg_new(sock_diag_nlmsg_size(), GFP_KERNEL);
++ 	if (!skb)
++ 		goto out;
++ 
++ 	mutex_lock(&sock_diag_table_mutex);
++ 	hndl = sock_diag_handlers[sk->sk_family];
++ 	if (hndl && hndl->get_info)
++ 		err = hndl->get_info(skb, sk);
++ 	mutex_unlock(&sock_diag_table_mutex);
++ 
++ 	if (!err)
++ 		nlmsg_multicast(sock_net(sk)->diag_nlsk, skb, 0, group,
++ 				GFP_KERNEL);
++ 	else
++ 		kfree_skb(skb);
++ out:
++ 	sk_destruct(sk);
++ 	kfree(bsk);
++ }
++ 
++ void sock_diag_broadcast_destroy(struct sock *sk)
++ {
++ 	/* Note, this function is often called from an interrupt context. */
++ 	struct broadcast_sk *bsk =
++ 		kmalloc(sizeof(struct broadcast_sk), GFP_ATOMIC);
++ 	if (!bsk)
++ 		return sk_destruct(sk);
++ 	bsk->sk = sk;
++ 	INIT_WORK(&bsk->work, sock_diag_broadcast_destroy_work);
++ 	queue_work(broadcast_wq, &bsk->work);
++ }
++ 
+++>>>>>>> 6ed46d1247a5 (sock_diag: align nlattr properly when needed)
+  void sock_diag_register_inet_compat(int (*fn)(struct sk_buff *skb, struct nlmsghdr *nlh))
+  {
+  	mutex_lock(&sock_diag_table_mutex);
+diff --cc net/ipv4/inet_diag.c
+index 5d3d6a64a700,25af1243649b..000000000000
+--- a/net/ipv4/inet_diag.c
++++ b/net/ipv4/inet_diag.c
+@@@ -1102,7 -1042,55 +1103,59 @@@ static int inet_diag_handler_dump(struc
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	return inet_diag_get_exact(skb, h, nlmsg_data(h));
+++=======
++ 	return inet_diag_cmd_exact(h->nlmsg_type, skb, h, nlmsg_data(h));
++ }
++ 
++ static
++ int inet_diag_handler_get_info(struct sk_buff *skb, struct sock *sk)
++ {
++ 	const struct inet_diag_handler *handler;
++ 	struct nlmsghdr *nlh;
++ 	struct nlattr *attr;
++ 	struct inet_diag_msg *r;
++ 	void *info = NULL;
++ 	int err = 0;
++ 
++ 	nlh = nlmsg_put(skb, 0, 0, SOCK_DIAG_BY_FAMILY, sizeof(*r), 0);
++ 	if (!nlh)
++ 		return -ENOMEM;
++ 
++ 	r = nlmsg_data(nlh);
++ 	memset(r, 0, sizeof(*r));
++ 	inet_diag_msg_common_fill(r, sk);
++ 	if (sk->sk_type == SOCK_DGRAM || sk->sk_type == SOCK_STREAM)
++ 		r->id.idiag_sport = inet_sk(sk)->inet_sport;
++ 	r->idiag_state = sk->sk_state;
++ 
++ 	if ((err = nla_put_u8(skb, INET_DIAG_PROTOCOL, sk->sk_protocol))) {
++ 		nlmsg_cancel(skb, nlh);
++ 		return err;
++ 	}
++ 
++ 	handler = inet_diag_lock_handler(sk->sk_protocol);
++ 	if (IS_ERR(handler)) {
++ 		inet_diag_unlock_handler(handler);
++ 		nlmsg_cancel(skb, nlh);
++ 		return PTR_ERR(handler);
++ 	}
++ 
++ 	attr = handler->idiag_info_size
++ 		? nla_reserve_64bit(skb, INET_DIAG_INFO,
++ 				    handler->idiag_info_size,
++ 				    INET_DIAG_PAD)
++ 		: NULL;
++ 	if (attr)
++ 		info = nla_data(attr);
++ 
++ 	handler->idiag_get_info(sk, r, info);
++ 	inet_diag_unlock_handler(handler);
++ 
++ 	nlmsg_end(skb, nlh);
++ 	return 0;
+++>>>>>>> 6ed46d1247a5 (sock_diag: align nlattr properly when needed)
+  }
+  
+  static const struct sock_diag_handler inet_diag_handler = {
+* Unmerged path net/core/sock_diag.c
+* Unmerged path net/ipv4/inet_diag.c
+diff --git a/net/sctp/sctp_diag.c b/net/sctp/sctp_diag.c
+index cc8ae8124b6e..12f00aae4236 100644
+--- a/net/sctp/sctp_diag.c
++++ b/net/sctp/sctp_diag.c
+@@ -171,8 +171,9 @@ static int inet_sctp_diag_fill(struct sock *sk, struct sctp_association *asoc,
+ 	if (ext & (1 << (INET_DIAG_INFO - 1))) {
+ 		struct nlattr *attr;
+ 
+-		attr = nla_reserve(skb, INET_DIAG_INFO,
+-				   sizeof(struct sctp_info));
++		attr = nla_reserve_64bit(skb, INET_DIAG_INFO,
++					 sizeof(struct sctp_info),
++					 INET_DIAG_PAD);
+ 		if (!attr)
+ 			goto errout;
+ 
