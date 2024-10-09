@@ -1,0 +1,168 @@
+platform/x86: wmi: Turn WMI into a bus driver
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [platform] x86: wmi: Turn WMI into a bus driver (Jarod Wilson) [1562200]
+Rebuild_FUZZ: 88.89%
+commit-author Andy Lutomirski <luto@kernel.org>
+commit 844af950da946cfab227a04b950614da04cb6275
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/844af950.failed
+
+WMI is logically a bus: the WMI driver binds to an ACPI node (or
+more than one), and each instance of the WMI driver enumerates its
+children and hopes that drivers will attach to the children that are
+useful.
+
+This patch gives WMI a driver model bus type and the ability to
+match to drivers. The bus itself is a device in the new "wmi_bus"
+class, and all of the individual WMI devices are slotted into the
+device hierarchy correctly.
+
+	Signed-off-by: Andy Lutomirski <luto@kernel.org>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Mario Limonciello <mario_limonciello@dell.com>
+	Cc: Pali Rohár <pali.rohar@gmail.com>
+	Cc: linux-kernel@vger.kernel.org
+	Cc: platform-driver-x86@vger.kernel.org
+	Cc: linux-acpi@vger.kernel.org
+	Acked-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Signed-off-by: Darren Hart (VMware) <dvhart@infradead.org>
+(cherry picked from commit 844af950da946cfab227a04b950614da04cb6275)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/platform/x86/wmi.c
+diff --cc drivers/platform/x86/wmi.c
+index 84dcc7a04b0a,f06b7c00339d..000000000000
+--- a/drivers/platform/x86/wmi.c
++++ b/drivers/platform/x86/wmi.c
+@@@ -37,8 -37,8 +37,13 @@@
+  #include <linux/acpi.h>
+  #include <linux/slab.h>
+  #include <linux/module.h>
+++<<<<<<< HEAD
+ +#include <acpi/acpi_bus.h>
+ +#include <acpi/acpi_drivers.h>
+++=======
++ #include <linux/wmi.h>
++ #include <linux/uuid.h>
+++>>>>>>> 844af950da94 (platform/x86: wmi: Turn WMI into a bus driver)
+  
+  ACPI_MODULE_NAME("wmi");
+  MODULE_AUTHOR("Carlos Corbacho");
+@@@ -901,17 -893,48 +977,58 @@@ static int acpi_wmi_add(struct acpi_dev
+  		return -ENODEV;
+  	}
+  
+- 	error = parse_wdg(device);
++ 	wmi_bus_dev = device_create(&wmi_bus_class, &device->dev, MKDEV(0, 0),
++ 				    NULL, "wmi_bus-%s", dev_name(&device->dev));
++ 	if (IS_ERR(wmi_bus_dev)) {
++ 		error = PTR_ERR(wmi_bus_dev);
++ 		goto err_remove_handler;
++ 	}
++ 	device->driver_data = wmi_bus_dev;
++ 
++ 	error = parse_wdg(wmi_bus_dev, device);
+  	if (error) {
+ +		acpi_remove_address_space_handler(device->handle,
+ +						  ACPI_ADR_SPACE_EC,
+ +						  &acpi_wmi_ec_space_handler);
+  		pr_err("Failed to parse WDG method\n");
+++<<<<<<< HEAD
+ +		return error;
+ +	}
+ +
+ +	return 0;
+++=======
++ 		goto err_remove_busdev;
++ 	}
++ 
++ 	return 0;
++ 
++ err_remove_busdev:
++ 	device_unregister(wmi_bus_dev);
++ 
++ err_remove_handler:
++ 	acpi_remove_address_space_handler(device->handle,
++ 					  ACPI_ADR_SPACE_EC,
++ 					  &acpi_wmi_ec_space_handler);
++ 
++ 	return error;
+++>>>>>>> 844af950da94 (platform/x86: wmi: Turn WMI into a bus driver)
++ }
++ 
++ int __must_check __wmi_driver_register(struct wmi_driver *driver,
++ 				       struct module *owner)
++ {
++ 	driver->driver.owner = owner;
++ 	driver->driver.bus = &wmi_bus_type;
++ 
++ 	return driver_register(&driver->driver);
+  }
++ EXPORT_SYMBOL(__wmi_driver_register);
++ 
++ void wmi_driver_unregister(struct wmi_driver *driver)
++ {
++ 	driver_unregister(&driver->driver);
++ }
++ EXPORT_SYMBOL(wmi_driver_unregister);
+  
+  static int __init acpi_wmi_init(void)
+  {
+* Unmerged path drivers/platform/x86/wmi.c
+diff --git a/include/linux/wmi.h b/include/linux/wmi.h
+new file mode 100644
+index 000000000000..29ed34b4dae1
+--- /dev/null
++++ b/include/linux/wmi.h
+@@ -0,0 +1,47 @@
++/*
++ * wmi.h - ACPI WMI interface
++ *
++ * Copyright (c) 2015 Andrew Lutomirski
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ */
++
++#ifndef _LINUX_WMI_H
++#define _LINUX_WMI_H
++
++#include <linux/device.h>
++#include <linux/acpi.h>
++
++struct wmi_device {
++	struct device dev;
++};
++
++struct wmi_device_id {
++	const char *guid_string;
++};
++
++struct wmi_driver {
++	struct device_driver driver;
++	const struct wmi_device_id *id_table;
++
++	int (*probe)(struct wmi_device *wdev);
++	int (*remove)(struct wmi_device *wdev);
++};
++
++extern int __must_check __wmi_driver_register(struct wmi_driver *driver,
++					      struct module *owner);
++extern void wmi_driver_unregister(struct wmi_driver *driver);
++#define wmi_driver_register(driver) __wmi_driver_register((driver), THIS_MODULE)
++
++#define module_wmi_driver(__wmi_driver) \
++	module_driver(__wmi_driver, wmi_driver_register, \
++		      wmi_driver_unregister)
++
++#endif
