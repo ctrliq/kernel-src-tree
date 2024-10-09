@@ -1,0 +1,677 @@
+net/mlx4_en: Refactor the XDP forwarding rings scheme
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [netdrv] mlx4_en: Refactor the XDP forwarding rings scheme (Don Dutile) [1385329 1417286]
+Rebuild_FUZZ: 96.08%
+commit-author Tariq Toukan <tariqt@mellanox.com>
+commit 67f8b1dcb9ee7f1e165da4eb2ec53483a6b141ea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/67f8b1dc.failed
+
+Separately manage the two types of TX rings: regular ones, and XDP.
+Upon an XDP set, do not borrow regular TX rings and convert them
+into XDP ones, but allocate new ones, unless we hit the max number
+of rings.
+Which means that in systems with smaller #cores we will not consume
+the current TX rings for XDP, while we are still in the num TX limit.
+
+XDP TX rings counters are not shown in ethtool statistics.
+Instead, XDP counters will be added to the respective RX rings
+in a downstream patch.
+
+This has no performance implications.
+
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 67f8b1dcb9ee7f1e165da4eb2ec53483a6b141ea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx4/en_ethtool.c
+#	drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+#	drivers/net/ethernet/mellanox/mlx4/en_rx.c
+#	drivers/net/ethernet/mellanox/mlx4/en_tx.c
+diff --cc drivers/net/ethernet/mellanox/mlx4/en_ethtool.c
+index 17c15ed3db70,e8ccb95680bc..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/en_ethtool.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_ethtool.c
+@@@ -1750,7 -1765,7 +1765,11 @@@ static int mlx4_en_set_channels(struct 
+  
+  	mlx4_en_safe_replace_resources(priv, tmp);
+  
+++<<<<<<< HEAD
+ +	netif_set_real_num_tx_queues(dev, priv->tx_ring_num);
+++=======
++ 	netif_set_real_num_tx_queues(dev, priv->tx_ring_num[TX]);
+++>>>>>>> 67f8b1dcb9ee (net/mlx4_en: Refactor the XDP forwarding rings scheme)
+  	netif_set_real_num_rx_queues(dev, priv->rx_ring_num);
+  
+  	if (dev->num_tc)
+diff --cc drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+index b5fcade5597f,edf0a99177e1..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+@@@ -1513,6 -1527,18 +1517,21 @@@ static void mlx4_en_free_affinity_hint(
+  	free_cpumask_var(priv->rx_ring[ring_idx]->affinity_mask);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void mlx4_en_init_recycle_ring(struct mlx4_en_priv *priv,
++ 				      int tx_ring_idx)
++ {
++ 	struct mlx4_en_tx_ring *tx_ring = priv->tx_ring[TX_XDP][tx_ring_idx];
++ 	int rr_index = tx_ring_idx;
++ 
++ 	tx_ring->free_tx_desc = mlx4_en_recycle_tx_desc;
++ 	tx_ring->recycle_ring = priv->rx_ring[rr_index];
++ 	en_dbg(DRV, priv, "Set tx_ring[%d][%d]->recycle_ring = rx_ring[%d]\n",
++ 	       TX_XDP, tx_ring_idx, rr_index);
++ }
++ 
+++>>>>>>> 67f8b1dcb9ee (net/mlx4_en: Refactor the XDP forwarding rings scheme)
+  int mlx4_en_start_port(struct net_device *dev)
+  {
+  	struct mlx4_en_priv *priv = netdev_priv(dev);
+@@@ -1607,41 -1632,51 +1625,81 @@@
+  		goto rss_err;
+  
+  	/* Configure tx cq's and rings */
+- 	for (i = 0; i < priv->tx_ring_num; i++) {
+- 		/* Configure cq */
+- 		cq = priv->tx_cq[i];
+- 		err = mlx4_en_activate_cq(priv, cq, i);
+- 		if (err) {
+- 			en_err(priv, "Failed allocating Tx CQ\n");
+- 			goto tx_err;
++ 	for (t = 0 ; t < MLX4_EN_NUM_TX_TYPES; t++) {
++ 		u8 num_tx_rings_p_up = t == TX ? priv->num_tx_rings_p_up : 1;
++ 
++ 		for (i = 0; i < priv->tx_ring_num[t]; i++) {
++ 			/* Configure cq */
++ 			cq = priv->tx_cq[t][i];
++ 			err = mlx4_en_activate_cq(priv, cq, i);
++ 			if (err) {
++ 				en_err(priv, "Failed allocating Tx CQ\n");
++ 				goto tx_err;
++ 			}
++ 			err = mlx4_en_set_cq_moder(priv, cq);
++ 			if (err) {
++ 				en_err(priv, "Failed setting cq moderation parameters\n");
++ 				mlx4_en_deactivate_cq(priv, cq);
++ 				goto tx_err;
++ 			}
++ 			en_dbg(DRV, priv,
++ 			       "Resetting index of collapsed CQ:%d to -1\n", i);
++ 			cq->buf->wqe_index = cpu_to_be16(0xffff);
++ 
++ 			/* Configure ring */
++ 			tx_ring = priv->tx_ring[t][i];
++ 			err = mlx4_en_activate_tx_ring(priv, tx_ring,
++ 						       cq->mcq.cqn,
++ 						       i / num_tx_rings_p_up);
++ 			if (err) {
++ 				en_err(priv, "Failed allocating Tx ring\n");
++ 				mlx4_en_deactivate_cq(priv, cq);
++ 				goto tx_err;
++ 			}
++ 			if (t != TX_XDP) {
++ 				tx_ring->tx_queue = netdev_get_tx_queue(dev, i);
++ 				tx_ring->recycle_ring = NULL;
++ 			} else {
++ 				mlx4_en_init_recycle_ring(priv, i);
++ 			}
++ 
++ 			/* Arm CQ for TX completions */
++ 			mlx4_en_arm_cq(priv, cq);
++ 
++ 			/* Set initial ownership of all Tx TXBBs to SW (1) */
++ 			for (j = 0; j < tx_ring->buf_size; j += STAMP_STRIDE)
++ 				*((u32 *)(tx_ring->buf + j)) = 0xffffffff;
+  		}
+++<<<<<<< HEAD
+ +		err = mlx4_en_set_cq_moder(priv, cq);
+ +		if (err) {
+ +			en_err(priv, "Failed setting cq moderation parameters\n");
+ +			mlx4_en_deactivate_cq(priv, cq);
+ +			goto tx_err;
+ +		}
+ +		en_dbg(DRV, priv, "Resetting index of collapsed CQ:%d to -1\n", i);
+ +		cq->buf->wqe_index = cpu_to_be16(0xffff);
+ +
+ +		/* Configure ring */
+ +		tx_ring = priv->tx_ring[i];
+ +		err = mlx4_en_activate_tx_ring(priv, tx_ring, cq->mcq.cqn,
+ +			i / priv->num_tx_rings_p_up);
+ +		if (err) {
+ +			en_err(priv, "Failed allocating Tx ring\n");
+ +			mlx4_en_deactivate_cq(priv, cq);
+ +			goto tx_err;
+ +		}
+ +		tx_ring->tx_queue = netdev_get_tx_queue(dev, i);
+ +
+ +		/* Arm CQ for TX completions */
+ +		mlx4_en_arm_cq(priv, cq);
+ +
+ +		/* Set initial ownership of all Tx TXBBs to SW (1) */
+ +		for (j = 0; j < tx_ring->buf_size; j += STAMP_STRIDE)
+ +			*((u32 *) (tx_ring->buf + j)) = 0xffffffff;
+ +		++tx_index;
+++=======
+++>>>>>>> 67f8b1dcb9ee (net/mlx4_en: Refactor the XDP forwarding rings scheme)
+  	}
+  
+  	/* Configure port */
+@@@ -2123,6 -2208,9 +2225,12 @@@ void mlx4_en_destroy_netdev(struct net_
+  {
+  	struct mlx4_en_priv *priv = netdev_priv(dev);
+  	struct mlx4_en_dev *mdev = priv->mdev;
+++<<<<<<< HEAD
+++=======
++ 	bool shutdown = mdev->dev->persist->interface_state &
++ 					    MLX4_INTERFACE_STATE_SHUTDOWN;
++ 	int t;
+++>>>>>>> 67f8b1dcb9ee (net/mlx4_en: Refactor the XDP forwarding rings scheme)
+  
+  	en_dbg(DRV, priv, "Destroying netdev on port:%d\n", priv->port);
+  
+@@@ -2154,12 -2246,15 +2262,14 @@@
+  #endif
+  
+  	mlx4_en_free_resources(priv);
+ +	mutex_unlock(&mdev->state_lock);
+  
+- 	kfree(priv->tx_ring);
+- 	kfree(priv->tx_cq);
++ 	for (t = 0; t < MLX4_EN_NUM_TX_TYPES; t++) {
++ 		kfree(priv->tx_ring[t]);
++ 		kfree(priv->tx_cq[t]);
++ 	}
+  
+ -	if (!shutdown)
+ -		free_netdev(dev);
+ -	dev->ethtool_ops = NULL;
+ +	free_netdev(dev);
+  }
+  
+  static int mlx4_en_change_mtu(struct net_device *dev, int new_mtu)
+@@@ -2171,9 -2266,10 +2281,16 @@@
+  	en_dbg(DRV, priv, "Change MTU called - current:%d new:%d\n",
+  		 dev->mtu, new_mtu);
+  
+++<<<<<<< HEAD
+ +	if ((new_mtu < MLX4_EN_MIN_MTU) || (new_mtu > priv->max_mtu)) {
+ +		en_err(priv, "Bad MTU size:%d.\n", new_mtu);
+ +		return -EPERM;
+++=======
++ 	if (priv->tx_ring_num[TX_XDP] && MLX4_EN_EFF_MTU(new_mtu) > FRAG_SZ0) {
++ 		en_err(priv, "MTU size:%d requires frags but XDP running\n",
++ 		       new_mtu);
++ 		return -EOPNOTSUPP;
+++>>>>>>> 67f8b1dcb9ee (net/mlx4_en: Refactor the XDP forwarding rings scheme)
+  	}
+  	dev->mtu = new_mtu;
+  
+@@@ -2573,8 -2681,130 +2690,134 @@@ static int mlx4_en_set_tx_maxrate(struc
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int mlx4_xdp_set(struct net_device *dev, struct bpf_prog *prog)
++ {
++ 	struct mlx4_en_priv *priv = netdev_priv(dev);
++ 	struct mlx4_en_dev *mdev = priv->mdev;
++ 	struct mlx4_en_port_profile new_prof;
++ 	struct bpf_prog *old_prog;
++ 	struct mlx4_en_priv *tmp;
++ 	int tx_changed = 0;
++ 	int xdp_ring_num;
++ 	int port_up = 0;
++ 	int err;
++ 	int i;
++ 
++ 	xdp_ring_num = prog ? priv->rx_ring_num : 0;
++ 
++ 	/* No need to reconfigure buffers when simply swapping the
++ 	 * program for a new one.
++ 	 */
++ 	if (priv->tx_ring_num[TX_XDP] == xdp_ring_num) {
++ 		if (prog) {
++ 			prog = bpf_prog_add(prog, priv->rx_ring_num - 1);
++ 			if (IS_ERR(prog))
++ 				return PTR_ERR(prog);
++ 		}
++ 		mutex_lock(&mdev->state_lock);
++ 		for (i = 0; i < priv->rx_ring_num; i++) {
++ 			old_prog = rcu_dereference_protected(
++ 					priv->rx_ring[i]->xdp_prog,
++ 					lockdep_is_held(&mdev->state_lock));
++ 			rcu_assign_pointer(priv->rx_ring[i]->xdp_prog, prog);
++ 			if (old_prog)
++ 				bpf_prog_put(old_prog);
++ 		}
++ 		mutex_unlock(&mdev->state_lock);
++ 		return 0;
++ 	}
++ 
++ 	if (priv->num_frags > 1) {
++ 		en_err(priv, "Cannot set XDP if MTU requires multiple frags\n");
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	tmp = kzalloc(sizeof(*tmp), GFP_KERNEL);
++ 	if (!tmp)
++ 		return -ENOMEM;
++ 
++ 	if (prog) {
++ 		prog = bpf_prog_add(prog, priv->rx_ring_num - 1);
++ 		if (IS_ERR(prog)) {
++ 			err = PTR_ERR(prog);
++ 			goto out;
++ 		}
++ 	}
++ 
++ 	mutex_lock(&mdev->state_lock);
++ 	memcpy(&new_prof, priv->prof, sizeof(struct mlx4_en_port_profile));
++ 	new_prof.tx_ring_num[TX_XDP] = xdp_ring_num;
++ 
++ 	if (priv->tx_ring_num[TX] + xdp_ring_num > MAX_TX_RINGS) {
++ 		tx_changed = 1;
++ 		new_prof.tx_ring_num[TX] =
++ 			MAX_TX_RINGS - ALIGN(xdp_ring_num, MLX4_EN_NUM_UP);
++ 		en_warn(priv, "Reducing the number of TX rings, to not exceed the max total rings number.\n");
++ 	}
++ 
++ 	err = mlx4_en_try_alloc_resources(priv, tmp, &new_prof);
++ 	if (err)
++ 		goto unlock_out;
++ 
++ 	if (priv->port_up) {
++ 		port_up = 1;
++ 		mlx4_en_stop_port(dev, 1);
++ 	}
++ 
++ 	mlx4_en_safe_replace_resources(priv, tmp);
++ 	if (tx_changed)
++ 		netif_set_real_num_tx_queues(dev, priv->tx_ring_num[TX]);
++ 
++ 	for (i = 0; i < priv->rx_ring_num; i++) {
++ 		old_prog = rcu_dereference_protected(
++ 					priv->rx_ring[i]->xdp_prog,
++ 					lockdep_is_held(&mdev->state_lock));
++ 		rcu_assign_pointer(priv->rx_ring[i]->xdp_prog, prog);
++ 		if (old_prog)
++ 			bpf_prog_put(old_prog);
++ 	}
++ 
++ 	if (port_up) {
++ 		err = mlx4_en_start_port(dev);
++ 		if (err) {
++ 			en_err(priv, "Failed starting port %d for XDP change\n",
++ 			       priv->port);
++ 			queue_work(mdev->workqueue, &priv->watchdog_task);
++ 		}
++ 	}
++ 
++ unlock_out:
++ 	mutex_unlock(&mdev->state_lock);
++ out:
++ 	kfree(tmp);
++ 	return err;
++ }
++ 
++ static bool mlx4_xdp_attached(struct net_device *dev)
++ {
++ 	struct mlx4_en_priv *priv = netdev_priv(dev);
++ 
++ 	return !!priv->tx_ring_num[TX_XDP];
++ }
++ 
++ static int mlx4_xdp(struct net_device *dev, struct netdev_xdp *xdp)
++ {
++ 	switch (xdp->command) {
++ 	case XDP_SETUP_PROG:
++ 		return mlx4_xdp_set(dev, xdp->prog);
++ 	case XDP_QUERY_PROG:
++ 		xdp->prog_attached = mlx4_xdp_attached(dev);
++ 		return 0;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
+++>>>>>>> 67f8b1dcb9ee (net/mlx4_en: Refactor the XDP forwarding rings scheme)
+  static const struct net_device_ops mlx4_netdev_ops = {
+ +	.ndo_size		= sizeof(struct net_device_ops),
+  	.ndo_open		= mlx4_en_open,
+  	.ndo_stop		= mlx4_en_close,
+  	.ndo_start_xmit		= mlx4_en_xmit,
+@@@ -3042,10 -3280,10 +3291,10 @@@ int mlx4_en_init_netdev(struct mlx4_en_
+  	else
+  		dev->netdev_ops = &mlx4_netdev_ops;
+  	dev->watchdog_timeo = MLX4_EN_WATCHDOG_TIMEOUT;
+- 	netif_set_real_num_tx_queues(dev, priv->tx_ring_num);
++ 	netif_set_real_num_tx_queues(dev, priv->tx_ring_num[TX]);
+  	netif_set_real_num_rx_queues(dev, priv->rx_ring_num);
+  
+ -	dev->ethtool_ops = &mlx4_en_ethtool_ops;
+ +	SET_ETHTOOL_OPS(dev, &mlx4_en_ethtool_ops);
+  
+  	/*
+  	 * Set driver features
+diff --cc drivers/net/ethernet/mellanox/mlx4/en_rx.c
+index 3629069532c8,71196f68b55d..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_rx.c
+@@@ -749,12 -797,17 +749,20 @@@ int mlx4_en_process_rx_cq(struct net_de
+  	u64 timestamp;
+  	bool l2_tunnel;
+  
+ -	if (unlikely(!priv->port_up))
+ +	if (!priv->port_up)
+  		return 0;
+  
+ -	if (unlikely(budget <= 0))
+ +	if (budget <= 0)
+  		return polled;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Protect accesses to: ring->xdp_prog, priv->mac_hash list */
++ 	rcu_read_lock();
++ 	xdp_prog = rcu_dereference(ring->xdp_prog);
++ 	doorbell_pending = 0;
++ 
+++>>>>>>> 67f8b1dcb9ee (net/mlx4_en: Refactor the XDP forwarding rings scheme)
+  	/* We assume a 1:1 mapping between CQEs and Rx descriptors, so Rx
+  	 * descriptor offset can be deduced from the CQE index instead of
+  	 * reading 'cqe->index' */
+@@@ -831,6 -880,44 +839,47 @@@
+  		l2_tunnel = (dev->hw_enc_features & NETIF_F_RXCSUM) &&
+  			(cqe->vlan_my_qpn & cpu_to_be32(MLX4_CQE_L2_TUNNEL));
+  
+++<<<<<<< HEAD
+++=======
++ 		/* A bpf program gets first chance to drop the packet. It may
++ 		 * read bytes but not past the end of the frag.
++ 		 */
++ 		if (xdp_prog) {
++ 			struct xdp_buff xdp;
++ 			dma_addr_t dma;
++ 			u32 act;
++ 
++ 			dma = be64_to_cpu(rx_desc->data[0].addr);
++ 			dma_sync_single_for_cpu(priv->ddev, dma,
++ 						priv->frag_info[0].frag_size,
++ 						DMA_FROM_DEVICE);
++ 
++ 			xdp.data = page_address(frags[0].page) +
++ 							frags[0].page_offset;
++ 			xdp.data_end = xdp.data + length;
++ 
++ 			act = bpf_prog_run_xdp(xdp_prog, &xdp);
++ 			switch (act) {
++ 			case XDP_PASS:
++ 				break;
++ 			case XDP_TX:
++ 				if (likely(!mlx4_en_xmit_frame(frags, dev,
++ 							length, cq->ring,
++ 							&doorbell_pending)))
++ 					goto consumed;
++ 				goto xdp_drop; /* Drop on xmit failure */
++ 			default:
++ 				bpf_warn_invalid_xdp_action(act);
++ 			case XDP_ABORTED:
++ 			case XDP_DROP:
++ xdp_drop:
++ 				if (likely(mlx4_en_rx_recycle(ring, frags)))
++ 					goto consumed;
++ 				goto next;
++ 			}
++ 		}
++ 
+++>>>>>>> 67f8b1dcb9ee (net/mlx4_en: Refactor the XDP forwarding rings scheme)
+  		if (likely(dev->features & NETIF_F_RXCSUM)) {
+  			if (cqe->status & cpu_to_be16(MLX4_CQE_STATUS_TCP |
+  						      MLX4_CQE_STATUS_UDP)) {
+@@@ -990,6 -1078,10 +1039,13 @@@ next
+  	}
+  
+  out:
+++<<<<<<< HEAD
+++=======
++ 	rcu_read_unlock();
++ 	if (doorbell_pending)
++ 		mlx4_en_xmit_doorbell(priv->tx_ring[TX_XDP][cq->ring]);
++ 
+++>>>>>>> 67f8b1dcb9ee (net/mlx4_en: Refactor the XDP forwarding rings scheme)
+  	AVG_PERF_COUNTER(priv->pstats.rx_coal_avg, polled);
+  	mlx4_cq_set_ci(&cq->mcq);
+  	wmb(); /* ensure HW sees CQ consumer before we post new buffers */
+@@@ -1079,7 -1157,20 +1135,22 @@@ void mlx4_en_calc_rx_buf(struct net_dev
+  	int buf_size = 0;
+  	int i = 0;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* bpf requires buffers to be set up as 1 packet per page.
++ 	 * This only works when num_frags == 1.
++ 	 */
++ 	if (priv->tx_ring_num[TX_XDP]) {
++ 		dma_dir = PCI_DMA_BIDIRECTIONAL;
++ 		/* This will gain efficient xdp frame recycling at the expense
++ 		 * of more costly truesize accounting
++ 		 */
++ 		align = PAGE_SIZE;
++ 		order = 0;
++ 	}
++ 
+++>>>>>>> 67f8b1dcb9ee (net/mlx4_en: Refactor the XDP forwarding rings scheme)
+  	while (buf_size < eff_mtu) {
+ -		priv->frag_info[i].order = order;
+  		priv->frag_info[i].frag_size =
+  			(eff_mtu > buf_size + frag_sizes[i]) ?
+  				frag_sizes[i] : eff_mtu - buf_size;
+diff --cc drivers/net/ethernet/mellanox/mlx4/en_tx.c
+index b3a7a69913f7,95dc864bb2f7..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_tx.c
+@@@ -1046,9 -1072,114 +1047,115 @@@ tx_drop_unmap
+  			       PCI_DMA_TODEVICE);
+  	}
+  
+ -tx_drop_count:
+ -	ring->tx_dropped++;
+  tx_drop:
+  	dev_kfree_skb_any(skb);
+++<<<<<<< HEAD
+++=======
++ 	return NETDEV_TX_OK;
++ }
++ 
++ netdev_tx_t mlx4_en_xmit_frame(struct mlx4_en_rx_alloc *frame,
++ 			       struct net_device *dev, unsigned int length,
++ 			       int tx_ind, int *doorbell_pending)
++ {
++ 	struct mlx4_en_priv *priv = netdev_priv(dev);
++ 	union mlx4_wqe_qpn_vlan	qpn_vlan = {};
++ 	struct mlx4_en_tx_ring *ring;
++ 	struct mlx4_en_tx_desc *tx_desc;
++ 	struct mlx4_wqe_data_seg *data;
++ 	struct mlx4_en_tx_info *tx_info;
++ 	int index, bf_index;
++ 	bool send_doorbell;
++ 	int nr_txbb = 1;
++ 	bool stop_queue;
++ 	dma_addr_t dma;
++ 	int real_size;
++ 	__be32 op_own;
++ 	u32 ring_cons;
++ 	bool bf_ok;
++ 
++ 	BUILD_BUG_ON_MSG(ALIGN(CTRL_SIZE + DS_SIZE, TXBB_SIZE) != TXBB_SIZE,
++ 			 "mlx4_en_xmit_frame requires minimum size tx desc");
++ 
++ 	ring = priv->tx_ring[TX_XDP][tx_ind];
++ 
++ 	if (!priv->port_up)
++ 		goto tx_drop;
++ 
++ 	if (mlx4_en_is_tx_ring_full(ring))
++ 		goto tx_drop_count;
++ 
++ 	/* fetch ring->cons far ahead before needing it to avoid stall */
++ 	ring_cons = READ_ONCE(ring->cons);
++ 
++ 	index = ring->prod & ring->size_mask;
++ 	tx_info = &ring->tx_info[index];
++ 
++ 	bf_ok = ring->bf_enabled;
++ 
++ 	/* Track current inflight packets for performance analysis */
++ 	AVG_PERF_COUNTER(priv->pstats.inflight_avg,
++ 			 (u32)(ring->prod - ring_cons - 1));
++ 
++ 	bf_index = ring->prod;
++ 	tx_desc = ring->buf + index * TXBB_SIZE;
++ 	data = &tx_desc->data;
++ 
++ 	dma = frame->dma;
++ 
++ 	tx_info->page = frame->page;
++ 	frame->page = NULL;
++ 	tx_info->map0_dma = dma;
++ 	tx_info->map0_byte_count = length;
++ 	tx_info->nr_txbb = nr_txbb;
++ 	tx_info->nr_bytes = max_t(unsigned int, length, ETH_ZLEN);
++ 	tx_info->data_offset = (void *)data - (void *)tx_desc;
++ 	tx_info->ts_requested = 0;
++ 	tx_info->nr_maps = 1;
++ 	tx_info->linear = 1;
++ 	tx_info->inl = 0;
++ 
++ 	dma_sync_single_for_device(priv->ddev, dma, length, PCI_DMA_TODEVICE);
++ 
++ 	data->addr = cpu_to_be64(dma);
++ 	data->lkey = ring->mr_key;
++ 	dma_wmb();
++ 	data->byte_count = cpu_to_be32(length);
++ 
++ 	/* tx completion can avoid cache line miss for common cases */
++ 	tx_desc->ctrl.srcrb_flags = priv->ctrl_flags;
++ 
++ 	op_own = cpu_to_be32(MLX4_OPCODE_SEND) |
++ 		((ring->prod & ring->size) ?
++ 		 cpu_to_be32(MLX4_EN_BIT_DESC_OWN) : 0);
++ 
++ 	ring->packets++;
++ 	ring->bytes += tx_info->nr_bytes;
++ 	AVG_PERF_COUNTER(priv->pstats.tx_pktsz_avg, length);
++ 
++ 	ring->prod += nr_txbb;
++ 
++ 	stop_queue = mlx4_en_is_tx_ring_full(ring);
++ 	send_doorbell = stop_queue ||
++ 				*doorbell_pending > MLX4_EN_DOORBELL_BUDGET;
++ 	bf_ok &= send_doorbell;
++ 
++ 	real_size = ((CTRL_SIZE + nr_txbb * DS_SIZE) / 16) & 0x3f;
++ 
++ 	if (bf_ok)
++ 		qpn_vlan.bf_qpn = ring->doorbell_qpn | cpu_to_be32(real_size);
++ 	else
++ 		qpn_vlan.fence_size = real_size;
++ 
++ 	mlx4_en_tx_write_desc(ring, tx_desc, qpn_vlan, TXBB_SIZE, bf_index,
++ 			      op_own, bf_ok, send_doorbell);
++ 	*doorbell_pending = send_doorbell ? 0 : *doorbell_pending + 1;
++ 
++ 	return NETDEV_TX_OK;
++ 
++ tx_drop_count:
+++>>>>>>> 67f8b1dcb9ee (net/mlx4_en: Refactor the XDP forwarding rings scheme)
+  	ring->tx_dropped++;
+ -tx_drop:
+ -	return NETDEV_TX_BUSY;
+ +	return NETDEV_TX_OK;
+  }
+ +
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/en_ethtool.c
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_main.c b/drivers/net/ethernet/mellanox/mlx4/en_main.c
+index 13dff912c9e7..af606c13aed7 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_main.c
+@@ -169,7 +169,7 @@ static int mlx4_en_get_profile(struct mlx4_en_dev *mdev)
+ 		params->prof[i].tx_ppp = pfctx;
+ 		params->prof[i].tx_ring_size = MLX4_EN_DEF_TX_RING_SIZE;
+ 		params->prof[i].rx_ring_size = MLX4_EN_DEF_RX_RING_SIZE;
+-		params->prof[i].tx_ring_num = params->num_tx_rings_p_up *
++		params->prof[i].tx_ring_num[TX] = params->num_tx_rings_p_up *
+ 			MLX4_EN_NUM_UP;
+ 		params->prof[i].rss_rings = 0;
+ 		params->prof[i].inline_thold = inline_thold;
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_port.c b/drivers/net/ethernet/mellanox/mlx4/en_port.c
+index 59473a0ebcdf..2e1ab4642569 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_port.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_port.c
+@@ -196,8 +196,8 @@ int mlx4_en_DUMP_ETH_STATS(struct mlx4_en_dev *mdev, u8 port, u8 reset)
+ 	priv->port_stats.tso_packets = 0;
+ 	priv->port_stats.xmit_more = 0;
+ 
+-	for (i = 0; i < priv->tx_ring_num; i++) {
+-		const struct mlx4_en_tx_ring *ring = priv->tx_ring[i];
++	for (i = 0; i < priv->tx_ring_num[TX]; i++) {
++		const struct mlx4_en_tx_ring *ring = priv->tx_ring[TX][i];
+ 
+ 		stats->tx_packets += ring->packets;
+ 		stats->tx_bytes += ring->bytes;
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/en_rx.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/en_tx.c
+diff --git a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+index ee5e9137296c..a5d2f7377faf 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
++++ b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+@@ -207,8 +207,10 @@ enum {
+  */
+ 
+ enum cq_type {
++	/* keep tx types first */
+ 	TX,
+ 	TX_XDP,
++#define MLX4_EN_NUM_TX_TYPES (TX_XDP + 1)
+ 	RX,
+ };
+ 
+@@ -358,7 +360,7 @@ struct mlx4_en_cq {
+ 
+ struct mlx4_en_port_profile {
+ 	u32 flags;
+-	u32 tx_ring_num;
++	u32 tx_ring_num[MLX4_EN_NUM_TX_TYPES];
+ 	u32 rx_ring_num;
+ 	u32 tx_ring_size;
+ 	u32 rx_ring_size;
+@@ -539,16 +541,16 @@ struct mlx4_en_priv {
+ 	u32 flags;
+ 	u8 num_tx_rings_p_up;
+ 	u32 tx_work_limit;
+-	u32 tx_ring_num;
++	u32 tx_ring_num[MLX4_EN_NUM_TX_TYPES];
+ 	u32 rx_ring_num;
+ 	u32 rx_skb_size;
+ 	struct mlx4_en_frag_info frag_info[MLX4_EN_MAX_RX_FRAGS];
+ 	u16 num_frags;
+ 	u16 log_rx_info;
+ 
+-	struct mlx4_en_tx_ring **tx_ring;
++	struct mlx4_en_tx_ring **tx_ring[MLX4_EN_NUM_TX_TYPES];
+ 	struct mlx4_en_rx_ring *rx_ring[MAX_RX_RINGS];
+-	struct mlx4_en_cq **tx_cq;
++	struct mlx4_en_cq **tx_cq[MLX4_EN_NUM_TX_TYPES];
+ 	struct mlx4_en_cq *rx_cq[MAX_RX_RINGS];
+ 	struct mlx4_qp drop_qp;
+ 	struct work_struct rx_mode_task;
