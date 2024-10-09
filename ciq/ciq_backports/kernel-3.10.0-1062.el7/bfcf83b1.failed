@@ -1,0 +1,133 @@
+KVM: nVMX: Fix trying to cancel vmlauch/vmresume
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Wanpeng Li <wanpeng.li@hotmail.com>
+commit bfcf83b1444d90f6e680a0dde0916f3b289b5066
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/bfcf83b1.failed
+
+------------[ cut here ]------------
+WARNING: CPU: 7 PID: 3861 at /home/kernel/ssd/kvm/arch/x86/kvm//vmx.c:11299 nested_vmx_vmexit+0x176e/0x1980 [kvm_intel]
+CPU: 7 PID: 3861 Comm: qemu-system-x86 Tainted: G        W  OE   4.13.0-rc4+ #11
+RIP: 0010:nested_vmx_vmexit+0x176e/0x1980 [kvm_intel]
+Call Trace:
+ ? kvm_multiple_exception+0x149/0x170 [kvm]
+ ? handle_emulation_failure+0x79/0x230 [kvm]
+ ? load_vmcs12_host_state+0xa80/0xa80 [kvm_intel]
+ ? check_chain_key+0x137/0x1e0
+ ? reexecute_instruction.part.168+0x130/0x130 [kvm]
+ nested_vmx_inject_exception_vmexit+0xb7/0x100 [kvm_intel]
+ ? nested_vmx_inject_exception_vmexit+0xb7/0x100 [kvm_intel]
+ vmx_queue_exception+0x197/0x300 [kvm_intel]
+ kvm_arch_vcpu_ioctl_run+0x1b0c/0x2c90 [kvm]
+ ? kvm_arch_vcpu_runnable+0x220/0x220 [kvm]
+ ? preempt_count_sub+0x18/0xc0
+ ? restart_apic_timer+0x17d/0x300 [kvm]
+ ? kvm_lapic_restart_hv_timer+0x37/0x50 [kvm]
+ ? kvm_arch_vcpu_load+0x1d8/0x350 [kvm]
+ kvm_vcpu_ioctl+0x4e4/0x910 [kvm]
+ ? kvm_vcpu_ioctl+0x4e4/0x910 [kvm]
+ ? kvm_dev_ioctl+0xbe0/0xbe0 [kvm]
+
+The flag "nested_run_pending", which can override the decision of which should run
+next, L1 or L2. nested_run_pending=1 means that we *must* run L2 next, not L1. This
+is necessary in particular when L1 did a VMLAUNCH of L2 and therefore expects L2 to
+be run (and perhaps be injected with an event it specified, etc.). Nested_run_pending
+is especially intended to avoid switching  to L1 in the injection decision-point.
+
+This can be handled just like the other cases in vmx_check_nested_events, instead of
+having a special case in vmx_queue_exception.
+
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: Radim Krčmář <rkrcmar@redhat.com>
+	Signed-off-by: Wanpeng Li <wanpeng.li@hotmail.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit bfcf83b1444d90f6e680a0dde0916f3b289b5066)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index 6a91db0f62b1,e0d2ca092788..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -2640,17 -2472,41 +2640,54 @@@ static void skip_emulated_instruction(s
+   * KVM wants to inject page-faults which it got to the guest. This function
+   * checks whether in a nested guest, we need to inject them to L1 or L2.
+   */
+++<<<<<<< HEAD
+ +static int nested_vmx_check_exception(struct kvm_vcpu *vcpu, unsigned nr)
+++=======
++ static int nested_vmx_check_exception(struct kvm_vcpu *vcpu, unsigned long *exit_qual)
+++>>>>>>> bfcf83b1444d (KVM: nVMX: Fix trying to cancel vmlauch/vmresume)
+  {
+  	struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
+ -	unsigned int nr = vcpu->arch.exception.nr;
+  
+++<<<<<<< HEAD
+ +	if (!(vmcs12->exception_bitmap & (1u << nr)))
+ +		return 0;
+ +
+ +	nested_vmx_vmexit(vcpu, EXIT_REASON_EXCEPTION_NMI,
+ +			  vmcs_read32(VM_EXIT_INTR_INFO),
+ +			  vmcs_readl(EXIT_QUALIFICATION));
+ +	return 1;
+++=======
++ 	if (nr == PF_VECTOR) {
++ 		if (vcpu->arch.exception.nested_apf) {
++ 			*exit_qual = vcpu->arch.apf.nested_apf_token;
++ 			return 1;
++ 		}
++ 		/*
++ 		 * FIXME: we must not write CR2 when L1 intercepts an L2 #PF exception.
++ 		 * The fix is to add the ancillary datum (CR2 or DR6) to structs
++ 		 * kvm_queued_exception and kvm_vcpu_events, so that CR2 and DR6
++ 		 * can be written only when inject_pending_event runs.  This should be
++ 		 * conditional on a new capability---if the capability is disabled,
++ 		 * kvm_multiple_exception would write the ancillary information to
++ 		 * CR2 or DR6, for backwards ABI-compatibility.
++ 		 */
++ 		if (nested_vmx_is_page_fault_vmexit(vmcs12,
++ 						    vcpu->arch.exception.error_code)) {
++ 			*exit_qual = vcpu->arch.cr2;
++ 			return 1;
++ 		}
++ 	} else {
++ 		if (vmcs12->exception_bitmap & (1u << nr)) {
++ 			if (nr == DB_VECTOR)
++ 				*exit_qual = vcpu->arch.dr6;
++ 			else
++ 				*exit_qual = 0;
++ 			return 1;
++ 		}
++ 	}
++ 
++ 	return 0;
+++>>>>>>> bfcf83b1444d (KVM: nVMX: Fix trying to cancel vmlauch/vmresume)
+  }
+  
+  static void vmx_queue_exception(struct kvm_vcpu *vcpu)
+@@@ -2658,14 -2514,9 +2695,20 @@@
+  	struct vcpu_vmx *vmx = to_vmx(vcpu);
+  	unsigned nr = vcpu->arch.exception.nr;
+  	bool has_error_code = vcpu->arch.exception.has_error_code;
+++<<<<<<< HEAD
+ +	bool reinject = vcpu->arch.exception.reinject;
+  	u32 error_code = vcpu->arch.exception.error_code;
+  	u32 intr_info = nr | INTR_INFO_VALID_MASK;
+  
+ +	if (!reinject && is_guest_mode(vcpu) &&
+ +	    nested_vmx_check_exception(vcpu, nr))
+ +		return;
+ +
+++=======
+++	u32 error_code = vcpu->arch.exception.error_code;
+++	u32 intr_info = nr | INTR_INFO_VALID_MASK;
+++
+++>>>>>>> bfcf83b1444d (KVM: nVMX: Fix trying to cancel vmlauch/vmresume)
+  	if (has_error_code) {
+  		vmcs_write32(VM_ENTRY_EXCEPTION_ERROR_CODE, error_code);
+  		intr_info |= INTR_INFO_DELIVER_CODE_MASK;
+* Unmerged path arch/x86/kvm/vmx.c
