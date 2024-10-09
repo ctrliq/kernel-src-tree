@@ -1,0 +1,141 @@
+bridge: mdb: add support for more attributes and export timer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+commit 2125715635053d4207a756a35aa718f548824e58
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/21257156.failed
+
+Currently mdb entries are exported directly as a structure inside
+MDBA_MDB_ENTRY_INFO attribute, we can't really extend it without
+breaking user-space. In order to export new mdb fields, I've converted
+the MDBA_MDB_ENTRY_INFO into a nested attribute which starts like before
+with struct br_mdb_entry (without header, as it's casted directly in
+iproute2) and continues with MDBA_MDB_EATTR_ attributes. This way we
+keep compatibility with older users and can export new data.
+I've tested this with iproute2, both with and without support for the
+added attribute and it works fine.
+So basically we again have MDBA_MDB_ENTRY_INFO with struct br_mdb_entry
+inside but it may contain also some additional MDBA_MDB_EATTR_ attributes
+such as MDBA_MDB_EATTR_TIMER which can be parsed by user-space.
+
+So the new structure is:
+[MDBA_MDB] = {
+     [MDBA_MDB_ENTRY] = {
+         [MDBA_MDB_ENTRY_INFO]
+         [MDBA_MDB_ENTRY_INFO] { <- Nested attribute
+             struct br_mdb_entry <- nla_put_nohdr()
+             [MDBA_MDB_ENTRY attributes] <- normal netlink attributes
+         }
+     }
+}
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2125715635053d4207a756a35aa718f548824e58)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_mdb.c
+diff --cc net/bridge/br_mdb.c
+index 51431890398f,cf51b7bcb5d5..000000000000
+--- a/net/bridge/br_mdb.c
++++ b/net/bridge/br_mdb.c
+@@@ -79,25 -88,41 +79,61 @@@ static int br_mdb_fill_info(struct sk_b
+  			for (pp = &mp->ports;
+  			     (p = rcu_dereference(*pp)) != NULL;
+  			      pp = &p->next) {
+++<<<<<<< HEAD
+ +				port = p->port;
+ +				if (port) {
+ +					struct br_mdb_entry e;
+ +					memset(&e, 0, sizeof(e));
+ +					e.ifindex = port->dev->ifindex;
+ +					e.state = p->state;
+ +					if (p->addr.proto == htons(ETH_P_IP))
+ +						e.addr.u.ip4 = p->addr.u.ip4;
+++=======
++ 				struct nlattr *nest_ent;
++ 				struct br_mdb_entry e;
++ 
++ 				port = p->port;
++ 				if (!port)
++ 					continue;
++ 
++ 				memset(&e, 0, sizeof(e));
++ 				e.ifindex = port->dev->ifindex;
++ 				e.vid = p->addr.vid;
++ 				__mdb_entry_fill_flags(&e, p->flags);
++ 				if (p->addr.proto == htons(ETH_P_IP))
++ 					e.addr.u.ip4 = p->addr.u.ip4;
+++>>>>>>> 212571563505 (bridge: mdb: add support for more attributes and export timer)
+  #if IS_ENABLED(CONFIG_IPV6)
+ -				if (p->addr.proto == htons(ETH_P_IPV6))
+ -					e.addr.u.ip6 = p->addr.u.ip6;
+ +					if (p->addr.proto == htons(ETH_P_IPV6))
+ +						e.addr.u.ip6 = p->addr.u.ip6;
+  #endif
+++<<<<<<< HEAD
+ +					e.addr.proto = p->addr.proto;
+ +					if (nla_put(skb, MDBA_MDB_ENTRY_INFO, sizeof(e), &e)) {
+ +						nla_nest_cancel(skb, nest2);
+ +						err = -EMSGSIZE;
+ +						goto out;
+ +					}
+++=======
++ 				e.addr.proto = p->addr.proto;
++ 				nest_ent = nla_nest_start(skb,
++ 							  MDBA_MDB_ENTRY_INFO);
++ 				if (!nest_ent) {
++ 					nla_nest_cancel(skb, nest2);
++ 					err = -EMSGSIZE;
++ 					goto out;
+++>>>>>>> 212571563505 (bridge: mdb: add support for more attributes and export timer)
++ 				}
++ 				if (nla_put_nohdr(skb, sizeof(e), &e) ||
++ 				    nla_put_u32(skb,
++ 						MDBA_MDB_EATTR_TIMER,
++ 						br_timer_value(&p->timer))) {
++ 					nla_nest_cancel(skb, nest_ent);
++ 					nla_nest_cancel(skb, nest2);
++ 					err = -EMSGSIZE;
++ 					goto out;
+  				}
++ 				nla_nest_end(skb, nest_ent);
+  			}
+  			nla_nest_end(skb, nest2);
+  		skip:
+diff --git a/include/uapi/linux/if_bridge.h b/include/uapi/linux/if_bridge.h
+index 8218dc361221..27b25610a5f9 100644
+--- a/include/uapi/linux/if_bridge.h
++++ b/include/uapi/linux/if_bridge.h
+@@ -135,7 +135,10 @@ struct bridge_vlan_info {
+ /* Bridge multicast database attributes
+  * [MDBA_MDB] = {
+  *     [MDBA_MDB_ENTRY] = {
+- *         [MDBA_MDB_ENTRY_INFO]
++ *         [MDBA_MDB_ENTRY_INFO] {
++ *		struct br_mdb_entry
++ *		[MDBA_MDB_EATTR attributes]
++ *         }
+  *     }
+  * }
+  * [MDBA_ROUTER] = {
+@@ -164,6 +167,14 @@ enum {
+ };
+ #define MDBA_MDB_ENTRY_MAX (__MDBA_MDB_ENTRY_MAX - 1)
+ 
++/* per mdb entry additional attributes */
++enum {
++	MDBA_MDB_EATTR_UNSPEC,
++	MDBA_MDB_EATTR_TIMER,
++	__MDBA_MDB_EATTR_MAX
++};
++#define MDBA_MDB_EATTR_MAX (__MDBA_MDB_EATTR_MAX - 1)
++
+ enum {
+ 	MDBA_ROUTER_UNSPEC,
+ 	MDBA_ROUTER_PORT,
+* Unmerged path net/bridge/br_mdb.c
