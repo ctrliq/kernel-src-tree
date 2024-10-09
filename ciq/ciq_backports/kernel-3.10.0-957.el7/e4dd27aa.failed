@@ -1,0 +1,417 @@
+drm/i915: Allow DBLSCAN user modes with eDP/LVDS/DSI
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Ville Syrjälä <ville.syrjala@linux.intel.com>
+commit e4dd27aadd205417a2e9ea9902b698a0252ec3a0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/e4dd27aa.failed
+
+When encountering a connector with the scaling mode property both
+intel and modesetting ddxs sometimes add tons of DBLSCAN modes
+to the output's mode list. The idea presumably being that since the
+output will be going through the panel fitter anyway we can pretend
+to use any kind of mode.
+
+Sadly that means we can't reject user modes with the DBLSCAN flag
+until we know whether we're going to be using the panel's native
+mode or the user mode directly. Doing otherwise means X clients using
+xf86vidmode/xrandr will get a protocol error (and often self
+terminate as a result) when the kernel refuses to use the requested
+mode with the DBLSCAN flag.
+
+To undo the regression we'll move the DBLSCAN checks into the
+connector->mode_valid() and encoder->compute_config() hooks.
+
+	Cc: stable@vger.kernel.org
+	Cc: Vito Caputo <vcaputo@pengaru.com>
+	Reported-by: Vito Caputo <vcaputo@pengaru.com>
+Fixes: e995ca0b8139 ("drm/i915: Provide a device level .mode_valid() hook")
+References: https://lkml.org/lkml/2018/5/21/715
+	Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180524125403.23445-1-ville.syrjala@linux.intel.com
+	Reviewed-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=106804
+	Tested-by: Arkadiusz Miskiewicz <arekm@maven.pl>
+(cherry picked from commit e4dd27aadd205417a2e9ea9902b698a0252ec3a0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_crt.c
+#	drivers/gpu/drm/i915/intel_display.c
+#	drivers/gpu/drm/i915/intel_dp.c
+#	drivers/gpu/drm/i915/intel_dsi.c
+#	drivers/gpu/drm/i915/intel_sdvo.c
+diff --cc drivers/gpu/drm/i915/intel_crt.c
+index 70e0ff41070c,95aa29cf2d9c..000000000000
+--- a/drivers/gpu/drm/i915/intel_crt.c
++++ b/drivers/gpu/drm/i915/intel_crt.c
+@@@ -279,10 -340,42 +279,46 @@@ static bool intel_crt_compute_config(st
+  				     struct intel_crtc_state *pipe_config,
+  				     struct drm_connector_state *conn_state)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct drm_display_mode *adjusted_mode =
++ 		&pipe_config->base.adjusted_mode;
++ 
++ 	if (adjusted_mode->flags & DRM_MODE_FLAG_DBLSCAN)
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ static bool pch_crt_compute_config(struct intel_encoder *encoder,
++ 				   struct intel_crtc_state *pipe_config,
++ 				   struct drm_connector_state *conn_state)
++ {
++ 	struct drm_display_mode *adjusted_mode =
++ 		&pipe_config->base.adjusted_mode;
++ 
++ 	if (adjusted_mode->flags & DRM_MODE_FLAG_DBLSCAN)
++ 		return false;
++ 
++ 	pipe_config->has_pch_encoder = true;
++ 
++ 	return true;
++ }
++ 
++ static bool hsw_crt_compute_config(struct intel_encoder *encoder,
++ 				   struct intel_crtc_state *pipe_config,
++ 				   struct drm_connector_state *conn_state)
++ {
+++>>>>>>> e4dd27aadd20 (drm/i915: Allow DBLSCAN user modes with eDP/LVDS/DSI)
+  	struct drm_i915_private *dev_priv = to_i915(encoder->base.dev);
++ 	struct drm_display_mode *adjusted_mode =
++ 		&pipe_config->base.adjusted_mode;
++ 
++ 	if (adjusted_mode->flags & DRM_MODE_FLAG_DBLSCAN)
++ 		return false;
+  
+ -	pipe_config->has_pch_encoder = true;
+ +	if (HAS_PCH_SPLIT(dev_priv))
+ +		pipe_config->has_pch_encoder = true;
+  
+  	/* LPT FDI RX only supports 8bpc. */
+  	if (HAS_PCH_LPT(dev_priv)) {
+diff --cc drivers/gpu/drm/i915/intel_display.c
+index 074a5a77f88d,3323470596ca..000000000000
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@@ -14154,6 -14525,42 +14154,45 @@@ static void intel_atomic_state_free(str
+  	kfree(state);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static enum drm_mode_status
++ intel_mode_valid(struct drm_device *dev,
++ 		 const struct drm_display_mode *mode)
++ {
++ 	/*
++ 	 * Can't reject DBLSCAN here because Xorg ddxen can add piles
++ 	 * of DBLSCAN modes to the output's mode list when they detect
++ 	 * the scaling mode property on the connector. And they don't
++ 	 * ask the kernel to validate those modes in any way until
++ 	 * modeset time at which point the client gets a protocol error.
++ 	 * So in order to not upset those clients we silently ignore the
++ 	 * DBLSCAN flag on such connectors. For other connectors we will
++ 	 * reject modes with the DBLSCAN flag in encoder->compute_config().
++ 	 * And we always reject DBLSCAN modes in connector->mode_valid()
++ 	 * as we never want such modes on the connector's mode list.
++ 	 */
++ 
++ 	if (mode->vscan > 1)
++ 		return MODE_NO_VSCAN;
++ 
++ 	if (mode->flags & DRM_MODE_FLAG_HSKEW)
++ 		return MODE_H_ILLEGAL;
++ 
++ 	if (mode->flags & (DRM_MODE_FLAG_CSYNC |
++ 			   DRM_MODE_FLAG_NCSYNC |
++ 			   DRM_MODE_FLAG_PCSYNC))
++ 		return MODE_HSYNC;
++ 
++ 	if (mode->flags & (DRM_MODE_FLAG_BCAST |
++ 			   DRM_MODE_FLAG_PIXMUX |
++ 			   DRM_MODE_FLAG_CLKDIV2))
++ 		return MODE_BAD;
++ 
++ 	return MODE_OK;
++ }
++ 
+++>>>>>>> e4dd27aadd20 (drm/i915: Allow DBLSCAN user modes with eDP/LVDS/DSI)
+  static const struct drm_mode_config_funcs intel_mode_funcs = {
+  	.fb_create = intel_user_framebuffer_create,
+  	.get_format_info = intel_get_format_info,
+diff --cc drivers/gpu/drm/i915/intel_dp.c
+index 533c6778522a,a58bac01aeea..000000000000
+--- a/drivers/gpu/drm/i915/intel_dp.c
++++ b/drivers/gpu/drm/i915/intel_dp.c
+@@@ -386,9 -420,12 +386,12 @@@ intel_dp_mode_valid(struct drm_connecto
+  	int max_rate, mode_rate, max_lanes, max_link_clock;
+  	int max_dotclk;
+  
++ 	if (mode->flags & DRM_MODE_FLAG_DBLSCAN)
++ 		return MODE_NO_DBLESCAN;
++ 
+  	max_dotclk = intel_dp_downstream_max_dotclock(intel_dp);
+  
+ -	if (intel_dp_is_edp(intel_dp) && fixed_mode) {
+ +	if (is_edp(intel_dp) && fixed_mode) {
+  		if (mode->hdisplay > fixed_mode->hdisplay)
+  			return MODE_PANEL;
+  
+@@@ -1708,78 -1872,19 +1711,93 @@@ intel_dp_compute_config(struct intel_en
+  						conn_state->scaling_mode);
+  	}
+  
+ +	if (adjusted_mode->flags & DRM_MODE_FLAG_DBLCLK)
+ +		return false;
+ +
+ +	/* Use values requested by Compliance Test Request */
+ +	if (intel_dp->compliance.test_type == DP_TEST_LINK_TRAINING) {
+ +		int index;
+ +
+ +		/* Validate the compliance test data since max values
+ +		 * might have changed due to link train fallback.
+ +		 */
+ +		if (intel_dp_link_params_valid(intel_dp, intel_dp->compliance.test_link_rate,
+ +					       intel_dp->compliance.test_lane_count)) {
+ +			index = intel_dp_rate_index(intel_dp->common_rates,
+ +						    intel_dp->num_common_rates,
+ +						    intel_dp->compliance.test_link_rate);
+ +			if (index >= 0)
+ +				min_clock = max_clock = index;
+ +			min_lane_count = max_lane_count = intel_dp->compliance.test_lane_count;
+ +		}
+ +	}
+ +	DRM_DEBUG_KMS("DP link computation with max lane count %i "
+ +		      "max bw %d pixel clock %iKHz\n",
+ +		      max_lane_count, intel_dp->common_rates[max_clock],
+ +		      adjusted_mode->crtc_clock);
+ +
+ +	/* Walk through all bpp values. Luckily they're all nicely spaced with 2
+ +	 * bpc in between. */
+ +	bpp = intel_dp_compute_bpp(intel_dp, pipe_config);
+ +	if (is_edp(intel_dp)) {
+ +
+ +		/* Get bpp from vbt only for panels that dont have bpp in edid */
+ +		if (intel_connector->base.display_info.bpc == 0 &&
+ +			(dev_priv->vbt.edp.bpp && dev_priv->vbt.edp.bpp < bpp)) {
+ +			DRM_DEBUG_KMS("clamping bpp for eDP panel to BIOS-provided %i\n",
+ +				      dev_priv->vbt.edp.bpp);
+ +			bpp = dev_priv->vbt.edp.bpp;
+ +		}
+ +
+ +		/*
+ +		 * Use the maximum clock and number of lanes the eDP panel
+ +		 * advertizes being capable of. The panels are generally
+ +		 * designed to support only a single clock and lane
+ +		 * configuration, and typically these values correspond to the
+ +		 * native resolution of the panel.
+ +		 */
+ +		min_lane_count = max_lane_count;
+ +		min_clock = max_clock;
+ +	}
+ +
+ +	for (; bpp >= 6*3; bpp -= 2*3) {
+ +		mode_rate = intel_dp_link_required(adjusted_mode->crtc_clock,
+ +						   bpp);
+ +
+ +		for (clock = min_clock; clock <= max_clock; clock++) {
+ +			for (lane_count = min_lane_count;
+ +				lane_count <= max_lane_count;
+ +				lane_count <<= 1) {
+ +
+ +				link_clock = intel_dp->common_rates[clock];
+ +				link_avail = intel_dp_max_data_rate(link_clock,
+ +								    lane_count);
+ +
+ +				if (mode_rate <= link_avail) {
+ +					goto found;
+ +				}
+ +			}
+ +		}
+ +	}
+ +
+++<<<<<<< HEAD
+ +	return false;
+++=======
++ 	if (adjusted_mode->flags & DRM_MODE_FLAG_DBLSCAN)
++ 		return false;
++ 
++ 	if ((IS_VALLEYVIEW(dev_priv) || IS_CHERRYVIEW(dev_priv)) &&
++ 	    adjusted_mode->flags & DRM_MODE_FLAG_INTERLACE)
++ 		return false;
++ 
++ 	if (adjusted_mode->flags & DRM_MODE_FLAG_DBLCLK)
++ 		return false;
++ 
++ 	if (!intel_dp_compute_link_config(encoder, pipe_config))
++ 		return false;
+++>>>>>>> e4dd27aadd20 (drm/i915: Allow DBLSCAN user modes with eDP/LVDS/DSI)
+  
+ +found:
+  	if (intel_conn_state->broadcast_rgb == INTEL_BROADCAST_RGB_AUTO) {
+  		/*
+  		 * See:
+diff --cc drivers/gpu/drm/i915/intel_dsi.c
+index 7442891762be,3b7acb5a70b3..000000000000
+--- a/drivers/gpu/drm/i915/intel_dsi.c
++++ b/drivers/gpu/drm/i915/intel_dsi.c
+@@@ -1252,10 -1269,8 +1255,15 @@@ intel_dsi_mode_valid(struct drm_connect
+  
+  	DRM_DEBUG_KMS("\n");
+  
+++<<<<<<< HEAD
+ +	if (mode->flags & DRM_MODE_FLAG_DBLSCAN) {
+ +		DRM_DEBUG_KMS("MODE_NO_DBLESCAN\n");
+ +		return MODE_NO_DBLESCAN;
+ +	}
+++=======
++ 	if (mode->flags & DRM_MODE_FLAG_DBLSCAN)
++ 		return MODE_NO_DBLESCAN;
+++>>>>>>> e4dd27aadd20 (drm/i915: Allow DBLSCAN user modes with eDP/LVDS/DSI)
+  
+  	if (fixed_mode) {
+  		if (mode->hdisplay > fixed_mode->hdisplay)
+diff --cc drivers/gpu/drm/i915/intel_sdvo.c
+index f1ed5f3ef427,9d9229a1f36c..000000000000
+--- a/drivers/gpu/drm/i915/intel_sdvo.c
++++ b/drivers/gpu/drm/i915/intel_sdvo.c
+@@@ -1148,7 -1160,11 +1148,15 @@@ static bool intel_sdvo_compute_config(s
+  							   adjusted_mode);
+  	}
+  
+++<<<<<<< HEAD
+ +	/* Make the CRTC code factor in the SDVO pixel multiplier.  The
+++=======
++ 	if (adjusted_mode->flags & DRM_MODE_FLAG_DBLSCAN)
++ 		return false;
++ 
++ 	/*
++ 	 * Make the CRTC code factor in the SDVO pixel multiplier.  The
+++>>>>>>> e4dd27aadd20 (drm/i915: Allow DBLSCAN user modes with eDP/LVDS/DSI)
+  	 * SDVO device will factor out the multiplier during mode_set.
+  	 */
+  	pipe_config->pixel_multiplier =
+* Unmerged path drivers/gpu/drm/i915/intel_crt.c
+* Unmerged path drivers/gpu/drm/i915/intel_display.c
+* Unmerged path drivers/gpu/drm/i915/intel_dp.c
+diff --git a/drivers/gpu/drm/i915/intel_dp_mst.c b/drivers/gpu/drm/i915/intel_dp_mst.c
+index 93fc8ab9bb31..9924041cc13f 100644
+--- a/drivers/gpu/drm/i915/intel_dp_mst.c
++++ b/drivers/gpu/drm/i915/intel_dp_mst.c
+@@ -47,6 +47,9 @@ static bool intel_dp_mst_compute_config(struct intel_encoder *encoder,
+ 	bool reduce_m_n = drm_dp_has_quirk(&intel_dp->desc,
+ 					   DP_DPCD_QUIRK_LIMITED_M_N);
+ 
++	if (adjusted_mode->flags & DRM_MODE_FLAG_DBLSCAN)
++		return false;
++
+ 	pipe_config->has_pch_encoder = false;
+ 	bpp = 24;
+ 	if (intel_dp->compliance.test_data.bpc) {
+@@ -373,6 +376,9 @@ intel_dp_mst_mode_valid(struct drm_connector *connector,
+ 	if (!intel_dp)
+ 		return MODE_ERROR;
+ 
++	if (mode->flags & DRM_MODE_FLAG_DBLSCAN)
++		return MODE_NO_DBLESCAN;
++
+ 	max_link_clock = intel_dp_max_link_rate(intel_dp);
+ 	max_lanes = intel_dp_max_lane_count(intel_dp);
+ 
+* Unmerged path drivers/gpu/drm/i915/intel_dsi.c
+diff --git a/drivers/gpu/drm/i915/intel_dvo.c b/drivers/gpu/drm/i915/intel_dvo.c
+index c0a027274c06..8e9713c02150 100644
+--- a/drivers/gpu/drm/i915/intel_dvo.c
++++ b/drivers/gpu/drm/i915/intel_dvo.c
+@@ -254,6 +254,9 @@ static bool intel_dvo_compute_config(struct intel_encoder *encoder,
+ 	if (fixed_mode)
+ 		intel_fixed_panel_mode(fixed_mode, adjusted_mode);
+ 
++	if (adjusted_mode->flags & DRM_MODE_FLAG_DBLSCAN)
++		return false;
++
+ 	return true;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/intel_hdmi.c b/drivers/gpu/drm/i915/intel_hdmi.c
+index 3fed1d3ecded..424027717a3b 100644
+--- a/drivers/gpu/drm/i915/intel_hdmi.c
++++ b/drivers/gpu/drm/i915/intel_hdmi.c
+@@ -1405,6 +1405,9 @@ bool intel_hdmi_compute_config(struct intel_encoder *encoder,
+ 	int desired_bpp;
+ 	bool force_dvi = intel_conn_state->force_audio == HDMI_AUDIO_OFF_DVI;
+ 
++	if (adjusted_mode->flags & DRM_MODE_FLAG_DBLSCAN)
++		return false;
++
+ 	pipe_config->has_hdmi_sink = !force_dvi && intel_hdmi->has_hdmi_sink;
+ 
+ 	if (pipe_config->has_hdmi_sink)
+diff --git a/drivers/gpu/drm/i915/intel_lvds.c b/drivers/gpu/drm/i915/intel_lvds.c
+index 0f587a9fbb93..b8a17145b637 100644
+--- a/drivers/gpu/drm/i915/intel_lvds.c
++++ b/drivers/gpu/drm/i915/intel_lvds.c
+@@ -370,6 +370,8 @@ intel_lvds_mode_valid(struct drm_connector *connector,
+ 	struct drm_display_mode *fixed_mode = intel_connector->panel.fixed_mode;
+ 	int max_pixclk = to_i915(connector->dev)->max_dotclk_freq;
+ 
++	if (mode->flags & DRM_MODE_FLAG_DBLSCAN)
++		return MODE_NO_DBLESCAN;
+ 	if (mode->hdisplay > fixed_mode->hdisplay)
+ 		return MODE_PANEL;
+ 	if (mode->vdisplay > fixed_mode->vdisplay)
+@@ -419,6 +421,9 @@ static bool intel_lvds_compute_config(struct intel_encoder *intel_encoder,
+ 	intel_fixed_panel_mode(intel_connector->panel.fixed_mode,
+ 			       adjusted_mode);
+ 
++	if (adjusted_mode->flags & DRM_MODE_FLAG_DBLSCAN)
++		return false;
++
+ 	if (HAS_PCH_SPLIT(dev_priv)) {
+ 		pipe_config->has_pch_encoder = true;
+ 
+* Unmerged path drivers/gpu/drm/i915/intel_sdvo.c
+diff --git a/drivers/gpu/drm/i915/intel_tv.c b/drivers/gpu/drm/i915/intel_tv.c
+index 906893c006d8..e9d92968a4ef 100644
+--- a/drivers/gpu/drm/i915/intel_tv.c
++++ b/drivers/gpu/drm/i915/intel_tv.c
+@@ -852,6 +852,9 @@ intel_tv_mode_valid(struct drm_connector *connector,
+ 	const struct tv_mode *tv_mode = intel_tv_mode_find(connector->state);
+ 	int max_dotclk = to_i915(connector->dev)->max_dotclk_freq;
+ 
++	if (mode->flags & DRM_MODE_FLAG_DBLSCAN)
++		return MODE_NO_DBLESCAN;
++
+ 	if (mode->clock > max_dotclk)
+ 		return MODE_CLOCK_HIGH;
+ 
+@@ -877,16 +880,21 @@ intel_tv_compute_config(struct intel_encoder *encoder,
+ 			struct drm_connector_state *conn_state)
+ {
+ 	const struct tv_mode *tv_mode = intel_tv_mode_find(conn_state);
++	struct drm_display_mode *adjusted_mode =
++		&pipe_config->base.adjusted_mode;
+ 
+ 	if (!tv_mode)
+ 		return false;
+ 
+-	pipe_config->base.adjusted_mode.crtc_clock = tv_mode->clock;
++	if (adjusted_mode->flags & DRM_MODE_FLAG_DBLSCAN)
++		return false;
++
++	adjusted_mode->crtc_clock = tv_mode->clock;
+ 	DRM_DEBUG_KMS("forcing bpc to 8 for TV\n");
+ 	pipe_config->pipe_bpp = 8*3;
+ 
+ 	/* TV has it's own notion of sync and other mode flags, so clear them. */
+-	pipe_config->base.adjusted_mode.flags = 0;
++	adjusted_mode->flags = 0;
+ 
+ 	/*
+ 	 * FIXME: We don't check whether the input mode is actually what we want
