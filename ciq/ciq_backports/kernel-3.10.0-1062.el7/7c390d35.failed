@@ -1,0 +1,280 @@
+kvm: x86: Add fast CR3 switch code path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Junaid Shahid <junaids@google.com>
+commit 7c390d350f8b677df3236afef4ced80dba6c3201
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/7c390d35.failed
+
+When using shadow paging, a CR3 switch in the guest results in a VM Exit.
+In the common case, that VM exit doesn't require much processing by KVM.
+However, it does acquire the MMU lock, which can start showing signs of
+contention under some workloads even on a 2 VCPU VM when the guest is
+using KPTI. Therefore, we add a fast path that avoids acquiring the MMU
+lock in the most common cases e.g. when switching back and forth between
+the kernel and user mode CR3s used by KPTI with no guest page table
+changes in between.
+
+For now, this fast path is implemented only for 64-bit guests and hosts
+to avoid the handling of PDPTEs, but it can be extended later to 32-bit
+guests and/or hosts as well.
+
+	Signed-off-by: Junaid Shahid <junaids@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 7c390d350f8b677df3236afef4ced80dba6c3201)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+#	arch/x86/kvm/mmu.c
+diff --cc arch/x86/include/asm/kvm_host.h
+index 86bec63d5f8a,290b7d05790a..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -298,10 -326,18 +298,18 @@@ struct rsvd_bits_validate 
+  	u64 bad_mt_xwr;
+  };
+  
++ struct kvm_mmu_root_info {
++ 	gpa_t cr3;
++ 	hpa_t hpa;
++ };
++ 
++ #define KVM_MMU_ROOT_INFO_INVALID \
++ 	((struct kvm_mmu_root_info) { .cr3 = INVALID_PAGE, .hpa = INVALID_PAGE })
++ 
+  /*
+ - * x86 supports 4 paging modes (5-level 64-bit, 4-level 64-bit, 3-level 32-bit,
+ - * and 2-level 32-bit).  The kvm_mmu structure abstracts the details of the
+ - * current mmu mode.
+ + * x86 supports 3 paging modes (4-level 64-bit, 3-level 64-bit, and 2-level
+ + * 32-bit).  The kvm_mmu structure abstracts the details of the current mmu
+ + * mode.
+   */
+  struct kvm_mmu {
+  	void (*set_cr3)(struct kvm_vcpu *vcpu, unsigned long root);
+@@@ -1168,6 -1297,7 +1177,10 @@@ void __kvm_mmu_free_some_pages(struct k
+  int kvm_mmu_load(struct kvm_vcpu *vcpu);
+  void kvm_mmu_unload(struct kvm_vcpu *vcpu);
+  void kvm_mmu_sync_roots(struct kvm_vcpu *vcpu);
+++<<<<<<< HEAD
+++=======
++ void kvm_mmu_free_roots(struct kvm_vcpu *vcpu, bool free_prev_root);
+++>>>>>>> 7c390d350f8b (kvm: x86: Add fast CR3 switch code path)
+  gpa_t translate_nested_gpa(struct kvm_vcpu *vcpu, gpa_t gpa, u32 access,
+  			   struct x86_exception *exception);
+  gpa_t kvm_mmu_gva_to_gpa_read(struct kvm_vcpu *vcpu, gva_t gva,
+diff --cc arch/x86/kvm/mmu.c
+index db86a346eaea,7f490298c635..000000000000
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@@ -3319,54 -3386,56 +3319,90 @@@ static int nonpaging_map(struct kvm_vcp
+  out_unlock:
+  	spin_unlock(&vcpu->kvm->mmu_lock);
+  	kvm_release_pfn_clean(pfn);
+ -	return RET_PF_RETRY;
+ +	return 0;
+  }
+  
+ -static void mmu_free_root_page(struct kvm *kvm, hpa_t *root_hpa,
+ -			       struct list_head *invalid_list)
+ -{
+ -	struct kvm_mmu_page *sp;
+  
+++<<<<<<< HEAD
+ +static void mmu_free_roots(struct kvm_vcpu *vcpu)
+++=======
++ 	if (!VALID_PAGE(*root_hpa))
++ 		return;
++ 
++ 	sp = page_header(*root_hpa & PT64_BASE_ADDR_MASK);
++ 	--sp->root_count;
++ 	if (!sp->root_count && sp->role.invalid)
++ 		kvm_mmu_prepare_zap_page(kvm, sp, invalid_list);
++ 
++ 	*root_hpa = INVALID_PAGE;
++ }
++ 
++ void kvm_mmu_free_roots(struct kvm_vcpu *vcpu, bool free_prev_root)
+++>>>>>>> 7c390d350f8b (kvm: x86: Add fast CR3 switch code path)
+  {
+  	int i;
+ +	struct kvm_mmu_page *sp;
+  	LIST_HEAD(invalid_list);
+ -	struct kvm_mmu *mmu = &vcpu->arch.mmu;
+  
+++<<<<<<< HEAD
+ +	if (!VALID_PAGE(vcpu->arch.mmu.root_hpa))
+++=======
++ 	if (!VALID_PAGE(mmu->root_hpa) &&
++ 	    (!VALID_PAGE(mmu->prev_root.hpa) || !free_prev_root))
+++>>>>>>> 7c390d350f8b (kvm: x86: Add fast CR3 switch code path)
+  		return;
+  
+ -	spin_lock(&vcpu->kvm->mmu_lock);
+ +	if (vcpu->arch.mmu.shadow_root_level == PT64_ROOT_LEVEL &&
+ +	    (vcpu->arch.mmu.root_level == PT64_ROOT_LEVEL ||
+ +	     vcpu->arch.mmu.direct_map)) {
+ +		hpa_t root = vcpu->arch.mmu.root_hpa;
+  
+++<<<<<<< HEAD
+ +		spin_lock(&vcpu->kvm->mmu_lock);
+ +		sp = page_header(root);
+ +		--sp->root_count;
+ +		if (!sp->root_count && sp->role.invalid) {
+ +			kvm_mmu_prepare_zap_page(vcpu->kvm, sp, &invalid_list);
+ +			kvm_mmu_commit_zap_page(vcpu->kvm, &invalid_list);
+ +		}
+ +		spin_unlock(&vcpu->kvm->mmu_lock);
+ +		vcpu->arch.mmu.root_hpa = INVALID_PAGE;
+ +		return;
+++=======
++ 	if (free_prev_root)
++ 		mmu_free_root_page(vcpu->kvm, &mmu->prev_root.hpa,
++ 				   &invalid_list);
++ 
++ 	if (mmu->shadow_root_level >= PT64_ROOT_4LEVEL &&
++ 	    (mmu->root_level >= PT64_ROOT_4LEVEL || mmu->direct_map)) {
++ 		mmu_free_root_page(vcpu->kvm, &mmu->root_hpa, &invalid_list);
++ 	} else {
++ 		for (i = 0; i < 4; ++i)
++ 			if (mmu->pae_root[i] != 0)
++ 				mmu_free_root_page(vcpu->kvm, &mmu->pae_root[i],
++ 						   &invalid_list);
++ 		mmu->root_hpa = INVALID_PAGE;
+++>>>>>>> 7c390d350f8b (kvm: x86: Add fast CR3 switch code path)
+  	}
+  
+ +	spin_lock(&vcpu->kvm->mmu_lock);
+ +	for (i = 0; i < 4; ++i) {
+ +		hpa_t root = vcpu->arch.mmu.pae_root[i];
+ +
+ +		if (root) {
+ +			root &= PT64_BASE_ADDR_MASK;
+ +			sp = page_header(root);
+ +			--sp->root_count;
+ +			if (!sp->root_count && sp->role.invalid)
+ +				kvm_mmu_prepare_zap_page(vcpu->kvm, sp,
+ +							 &invalid_list);
+ +		}
+ +		vcpu->arch.mmu.pae_root[i] = INVALID_PAGE;
+ +	}
+  	kvm_mmu_commit_zap_page(vcpu->kvm, &invalid_list);
+  	spin_unlock(&vcpu->kvm->mmu_lock);
+ +	vcpu->arch.mmu.root_hpa = INVALID_PAGE;
+  }
+ -EXPORT_SYMBOL_GPL(kvm_mmu_free_roots);
+  
+  static int mmu_check_root(struct kvm_vcpu *vcpu, gfn_t root_gfn)
+  {
+@@@ -3914,9 -4025,51 +3951,55 @@@ static void nonpaging_init_context(stru
+  	context->nx = false;
+  }
+  
+- void kvm_mmu_new_cr3(struct kvm_vcpu *vcpu)
++ static bool fast_cr3_switch(struct kvm_vcpu *vcpu, gpa_t new_cr3)
+  {
+++<<<<<<< HEAD
+ +	mmu_free_roots(vcpu);
+++=======
++ 	struct kvm_mmu *mmu = &vcpu->arch.mmu;
++ 
++ 	/*
++ 	 * For now, limit the fast switch to 64-bit hosts+VMs in order to avoid
++ 	 * having to deal with PDPTEs. We may add support for 32-bit hosts/VMs
++ 	 * later if necessary.
++ 	 */
++ 	if (mmu->shadow_root_level >= PT64_ROOT_4LEVEL &&
++ 	    mmu->root_level >= PT64_ROOT_4LEVEL) {
++ 		gpa_t prev_cr3 = mmu->prev_root.cr3;
++ 
++ 		if (mmu_check_root(vcpu, new_cr3 >> PAGE_SHIFT))
++ 			return false;
++ 
++ 		swap(mmu->root_hpa, mmu->prev_root.hpa);
++ 		mmu->prev_root.cr3 = kvm_read_cr3(vcpu);
++ 
++ 		if (new_cr3 == prev_cr3 && VALID_PAGE(mmu->root_hpa)) {
++ 			/*
++ 			 * It is possible that the cached previous root page is
++ 			 * obsolete because of a change in the MMU
++ 			 * generation number. However, that is accompanied by
++ 			 * KVM_REQ_MMU_RELOAD, which will free the root that we
++ 			 * have set here and allocate a new one.
++ 			 */
++ 
++ 			kvm_make_request(KVM_REQ_MMU_SYNC, vcpu);
++ 			__clear_sp_write_flooding_count(
++ 				page_header(mmu->root_hpa));
++ 
++ 			mmu->set_cr3(vcpu, mmu->root_hpa);
++ 
++ 			return true;
++ 		}
++ 	}
++ 
++ 	return false;
++ }
++ 
++ void kvm_mmu_new_cr3(struct kvm_vcpu *vcpu, gpa_t new_cr3)
++ {
++ 	if (!fast_cr3_switch(vcpu, new_cr3))
++ 		kvm_mmu_free_roots(vcpu, false);
+++>>>>>>> 7c390d350f8b (kvm: x86: Add fast CR3 switch code path)
+  }
+  
+  static unsigned long get_cr3(struct kvm_vcpu *vcpu)
+@@@ -4432,8 -4600,9 +4517,9 @@@ static void init_kvm_tdp_mmu(struct kvm
+  	context->sync_page = nonpaging_sync_page;
+  	context->invlpg = nonpaging_invlpg;
+  	context->update_pte = nonpaging_update_pte;
+ -	context->shadow_root_level = kvm_x86_ops->get_tdp_level(vcpu);
+ +	context->shadow_root_level = kvm_x86_ops->get_tdp_level();
+  	context->root_hpa = INVALID_PAGE;
++ 	context->prev_root = KVM_MMU_ROOT_INFO_INVALID;
+  	context->direct_map = true;
+  	context->set_cr3 = kvm_x86_ops->set_tdp_cr3;
+  	context->get_cr3 = get_cr3;
+@@@ -4513,8 -4683,9 +4599,9 @@@ void kvm_init_shadow_ept_mmu(struct kvm
+  	context->sync_page = ept_sync_page;
+  	context->invlpg = ept_invlpg;
+  	context->update_pte = ept_update_pte;
+ -	context->root_level = PT64_ROOT_4LEVEL;
+ +	context->root_level = context->shadow_root_level;
+  	context->root_hpa = INVALID_PAGE;
++ 	context->prev_root = KVM_MMU_ROOT_INFO_INVALID;
+  	context->direct_map = false;
+  	context->base_role.ad_disabled = !accessed_dirty;
+  	context->base_role.guest_mode = 1;
+@@@ -4614,7 -4788,7 +4701,11 @@@ EXPORT_SYMBOL_GPL(kvm_mmu_load)
+  
+  void kvm_mmu_unload(struct kvm_vcpu *vcpu)
+  {
+++<<<<<<< HEAD
+ +	mmu_free_roots(vcpu);
+++=======
++ 	kvm_mmu_free_roots(vcpu, true);
+++>>>>>>> 7c390d350f8b (kvm: x86: Add fast CR3 switch code path)
+  	WARN_ON(VALID_PAGE(vcpu->arch.mmu.root_hpa));
+  }
+  EXPORT_SYMBOL_GPL(kvm_mmu_unload);
+* Unmerged path arch/x86/include/asm/kvm_host.h
+* Unmerged path arch/x86/kvm/mmu.c
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index bc19a3517278..139a09d3a2b1 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -818,9 +818,10 @@ int kvm_set_cr3(struct kvm_vcpu *vcpu, unsigned long cr3)
+ 		   !load_pdptrs(vcpu, vcpu->arch.walk_mmu, cr3))
+ 		return 1;
+ 
++	kvm_mmu_new_cr3(vcpu, cr3);
+ 	vcpu->arch.cr3 = cr3;
+ 	__set_bit(VCPU_EXREG_CR3, (ulong *)&vcpu->arch.regs_avail);
+-	kvm_mmu_new_cr3(vcpu);
++
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(kvm_set_cr3);
