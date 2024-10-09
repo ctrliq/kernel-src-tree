@@ -1,0 +1,221 @@
+EDAC, sb_edac: Carve out dimm-populating loop
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [edac] sb_edac: Carve out dimm-populating loop (Aristeu Rozanski) [1483004 1483026]
+Rebuild_FUZZ: 92.86%
+commit-author Borislav Petkov <bp@suse.de>
+commit 6696522957a192130dc42d80ea34796ec7ba0c2b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/66965229.failed
+
+... to slim down get_dimm_config().
+
+No functionality change.
+
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+(cherry picked from commit 6696522957a192130dc42d80ea34796ec7ba0c2b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/edac/sb_edac.c
+diff --cc drivers/edac/sb_edac.c
+index f1a8f77d6ee8,fad5c79741d2..000000000000
+--- a/drivers/edac/sb_edac.c
++++ b/drivers/edac/sb_edac.c
+@@@ -1608,21 -1620,101 +1608,101 @@@ static void get_source_id(struct mem_ct
+  		pvt->sbridge_dev->source_id = SOURCE_ID(reg);
+  }
+  
+- static int get_dimm_config(struct mem_ctl_info *mci)
++ static void __populate_dimms(struct mem_ctl_info *mci,
++ 			     u64 knl_mc_sizes[KNL_MAX_CHANNELS],
++ 			     enum edac_type mode)
+  {
+  	struct sbridge_pvt *pvt = mci->pvt_info;
++ 	int channels = pvt->info.type == KNIGHTS_LANDING ? KNL_MAX_CHANNELS
++ 							 : NUM_CHANNELS;
++ 	unsigned int i, j, banks, ranks, rows, cols, npages;
+  	struct dimm_info *dimm;
+- 	unsigned i, j, banks, ranks, rows, cols, npages;
+- 	u64 size;
+- 	u32 reg;
+- 	enum edac_type mode;
+  	enum mem_type mtype;
+- 	int channels = pvt->info.type == KNIGHTS_LANDING ?
+- 		KNL_MAX_CHANNELS : NUM_CHANNELS;
++ 	u64 size;
++ 
++ 	mtype = pvt->info.get_memory_type(pvt);
++ 	if (mtype == MEM_RDDR3 || mtype == MEM_RDDR4)
++ 		edac_dbg(0, "Memory is registered\n");
++ 	else if (mtype == MEM_UNKNOWN)
++ 		edac_dbg(0, "Cannot determine memory type\n");
++ 	else
++ 		edac_dbg(0, "Memory is unregistered\n");
++ 
++ 	if (mtype == MEM_DDR4 || mtype == MEM_RDDR4)
++ 		banks = 16;
++ 	else
++ 		banks = 8;
++ 
++ 	for (i = 0; i < channels; i++) {
++ 		u32 mtr;
++ 
++ 		int max_dimms_per_channel;
++ 
++ 		if (pvt->info.type == KNIGHTS_LANDING) {
++ 			max_dimms_per_channel = 1;
++ 			if (!pvt->knl.pci_channel[i])
++ 				continue;
++ 		} else {
++ 			max_dimms_per_channel = ARRAY_SIZE(mtr_regs);
++ 			if (!pvt->pci_tad[i])
++ 				continue;
++ 		}
++ 
++ 		for (j = 0; j < max_dimms_per_channel; j++) {
++ 			dimm = EDAC_DIMM_PTR(mci->layers, mci->dimms, mci->n_layers, i, j, 0);
++ 			if (pvt->info.type == KNIGHTS_LANDING) {
++ 				pci_read_config_dword(pvt->knl.pci_channel[i],
++ 					knl_mtr_reg, &mtr);
++ 			} else {
++ 				pci_read_config_dword(pvt->pci_tad[i],
++ 					mtr_regs[j], &mtr);
++ 			}
++ 			edac_dbg(4, "Channel #%d  MTR%d = %x\n", i, j, mtr);
++ 			if (IS_DIMM_PRESENT(mtr)) {
++ 				pvt->channel[i].dimms++;
++ 
++ 				ranks = numrank(pvt->info.type, mtr);
++ 
++ 				if (pvt->info.type == KNIGHTS_LANDING) {
++ 					/* For DDR4, this is fixed. */
++ 					cols = 1 << 10;
++ 					rows = knl_mc_sizes[i] /
++ 						((u64) cols * ranks * banks * 8);
++ 				} else {
++ 					rows = numrow(mtr);
++ 					cols = numcol(mtr);
++ 				}
++ 
++ 				size = ((u64)rows * cols * banks * ranks) >> (20 - 3);
++ 				npages = MiB_TO_PAGES(size);
++ 
++ 				edac_dbg(0, "mc#%d: ha %d channel %d, dimm %d, %lld Mb (%d pages) bank: %d, rank: %d, row: %#x, col: %#x\n",
++ 					 pvt->sbridge_dev->mc, pvt->sbridge_dev->dom, i, j,
++ 					 size, npages,
++ 					 banks, ranks, rows, cols);
++ 
++ 				dimm->nr_pages = npages;
++ 				dimm->grain = 32;
++ 				dimm->dtype = pvt->info.get_width(pvt, mtr);
++ 				dimm->mtype = mtype;
++ 				dimm->edac_mode = mode;
++ 				snprintf(dimm->label, sizeof(dimm->label),
++ 						 "CPU_SrcID#%u_Ha#%u_Chan#%u_DIMM#%u",
++ 						 pvt->sbridge_dev->source_id, pvt->sbridge_dev->dom, i, j);
++ 			}
++ 		}
++ 	}
++ }
++ 
++ static int get_dimm_config(struct mem_ctl_info *mci)
++ {
++ 	struct sbridge_pvt *pvt = mci->pvt_info;
+  	u64 knl_mc_sizes[KNL_MAX_CHANNELS];
++ 	enum edac_type mode;
++ 	u32 reg;
+  
+  	if (pvt->info.type == HASWELL || pvt->info.type == BROADWELL) {
+ -		pci_read_config_dword(pvt->pci_ha, HASWELL_HASYSDEFEATURE2, &reg);
+ +		pci_read_config_dword(pvt->pci_ha0, HASWELL_HASYSDEFEATURE2, &reg);
+  		pvt->is_chan_hash = GET_BITFIELD(reg, 21, 21);
+  	}
+  	pvt->sbridge_dev->node_id = pvt->info.get_node_id(pvt);
+@@@ -1669,79 -1761,7 +1749,83 @@@
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	mtype = pvt->info.get_memory_type(pvt);
+ +	if (mtype == MEM_RDDR3 || mtype == MEM_RDDR4)
+ +		edac_dbg(0, "Memory is registered\n");
+ +	else if (mtype == MEM_UNKNOWN)
+ +		edac_dbg(0, "Cannot determine memory type\n");
+ +	else
+ +		edac_dbg(0, "Memory is unregistered\n");
+ +
+ +	if (mtype == MEM_DDR4 || mtype == MEM_RDDR4)
+ +		banks = 16;
+ +	else
+ +		banks = 8;
+ +
+ +	for (i = 0; i < channels; i++) {
+ +		u32 mtr;
+ +
+ +		int max_dimms_per_channel;
+ +
+ +		if (pvt->info.type == KNIGHTS_LANDING) {
+ +			max_dimms_per_channel = 1;
+ +			if (!pvt->knl.pci_channel[i])
+ +				continue;
+ +		} else {
+ +			max_dimms_per_channel = ARRAY_SIZE(mtr_regs);
+ +			if (!pvt->pci_tad[i])
+ +				continue;
+ +		}
+ +
+ +		for (j = 0; j < max_dimms_per_channel; j++) {
+ +			dimm = EDAC_DIMM_PTR(mci->layers, mci->dimms, mci->n_layers,
+ +				       i, j, 0);
+ +			if (pvt->info.type == KNIGHTS_LANDING) {
+ +				pci_read_config_dword(pvt->knl.pci_channel[i],
+ +					knl_mtr_reg, &mtr);
+ +			} else {
+ +				pci_read_config_dword(pvt->pci_tad[i],
+ +					mtr_regs[j], &mtr);
+ +			}
+ +			edac_dbg(4, "Channel #%d  MTR%d = %x\n", i, j, mtr);
+ +			if (IS_DIMM_PRESENT(mtr)) {
+ +				pvt->channel[i].dimms++;
+ +
+ +				ranks = numrank(pvt->info.type, mtr);
+ +
+ +				if (pvt->info.type == KNIGHTS_LANDING) {
+ +					/* For DDR4, this is fixed. */
+ +					cols = 1 << 10;
+ +					rows = knl_mc_sizes[i] /
+ +						((u64) cols * ranks * banks * 8);
+ +				} else {
+ +					rows = numrow(mtr);
+ +					cols = numcol(mtr);
+ +				}
+ +
+ +				size = ((u64)rows * cols * banks * ranks) >> (20 - 3);
+ +				npages = MiB_TO_PAGES(size);
+ +
+ +				edac_dbg(0, "mc#%d: ha %d channel %d, dimm %d, %lld Mb (%d pages) bank: %d, rank: %d, row: %#x, col: %#x\n",
+ +					 pvt->sbridge_dev->mc, i/4, i%4, j,
+ +					 size, npages,
+ +					 banks, ranks, rows, cols);
+ +
+ +				dimm->nr_pages = npages;
+ +				dimm->grain = 32;
+ +				dimm->dtype = pvt->info.get_width(pvt, mtr);
+ +				dimm->mtype = mtype;
+ +				dimm->edac_mode = mode;
+ +				snprintf(dimm->label, sizeof(dimm->label),
+ +					 "CPU_SrcID#%u_Ha#%u_Chan#%u_DIMM#%u",
+ +					 pvt->sbridge_dev->source_id, i/4, i%4, j);
+ +			}
+ +		}
+ +	}
+++=======
++ 	__populate_dimms(mci, knl_mc_sizes, mode);
+++>>>>>>> 6696522957a1 (EDAC, sb_edac: Carve out dimm-populating loop)
+  
+  	return 0;
+  }
+* Unmerged path drivers/edac/sb_edac.c
