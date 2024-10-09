@@ -160,6 +160,20 @@ static int tcf_gact(struct sk_buff *skb, const struct tc_action *a,
 	return action;
 }
 
+static void tcf_gact_stats_update(struct tc_action *a, u64 bytes, u32 packets,
+				  u64 lastuse)
+{
+	struct tcf_gact *gact = a->priv;
+	int action = READ_ONCE(gact->tcf_action);
+	struct tcf_t *tm = &gact->tcf_tm;
+
+	_bstats_cpu_update(this_cpu_ptr(gact->common.cpu_bstats), bytes, packets);
+	if (action == TC_ACT_SHOT)
+		this_cpu_ptr(gact->common.cpu_qstats)->drops += packets;
+
+	tm->lastuse = lastuse;
+}
+
 static int tcf_gact_dump(struct sk_buff *skb, struct tc_action *a, int bind, int ref)
 {
 	unsigned char *b = skb_tail_pointer(skb);
@@ -205,6 +219,7 @@ static struct tc_action_ops act_gact_ops = {
 	.capab		=	TCA_CAP_NONE,
 	.owner		=	THIS_MODULE,
 	.act		=	tcf_gact,
+	.stats_update	=	tcf_gact_stats_update,
 	.dump		=	tcf_gact_dump,
 	.cleanup	=	tcf_gact_cleanup,
 	.init		=	tcf_gact_init,
