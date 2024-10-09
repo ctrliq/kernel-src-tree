@@ -1169,9 +1169,6 @@ int qla24xx_fcport_handle_login(struct scsi_qla_host *vha, fc_port_t *fcport)
 	    fcport->login_gen, fcport->login_retry,
 	    fcport->loop_id, fcport->scan_state);
 
-	if (fcport->login_retry == 0)
-		return 0;
-
 	if (fcport->scan_state != QLA_FCPORT_FOUND)
 		return 0;
 
@@ -1196,7 +1193,8 @@ int qla24xx_fcport_handle_login(struct scsi_qla_host *vha, fc_port_t *fcport)
 		return 0;
 	}
 
-	fcport->login_retry--;
+	if (fcport->login_retry > 0)
+		fcport->login_retry--;
 
 	switch (fcport->disc_state) {
 	case DSC_DELETED:
