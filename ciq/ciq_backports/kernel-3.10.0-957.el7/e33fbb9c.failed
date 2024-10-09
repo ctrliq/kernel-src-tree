@@ -1,0 +1,109 @@
+md/raid5-cache: exclude reclaiming stripes in reclaim check
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [md] raid5-cache: exclude reclaiming stripes in reclaim check (Nigel Croxon) [1494474]
+Rebuild_FUZZ: 97.39%
+commit-author Shaohua Li <shli@fb.com>
+commit e33fbb9cc73d6502e69eaf1c178e0c39059763ea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/e33fbb9c.failed
+
+stripes which are being reclaimed are still accounted into cached
+stripes. The reclaim takes time. r5c_do_reclaim isn't aware of the
+stripes and does unnecessary stripe reclaim. In practice, I saw one
+stripe is reclaimed one time. This will cause bad IO pattern. Fixing
+this by excluding the reclaing stripes in the check.
+
+	Cc: Song Liu <songliubraving@fb.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit e33fbb9cc73d6502e69eaf1c178e0c39059763ea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid5-cache.c
+diff --cc drivers/md/raid5-cache.c
+index 45f5446ca2a5,3f307be01b10..000000000000
+--- a/drivers/md/raid5-cache.c
++++ b/drivers/md/raid5-cache.c
+@@@ -2387,12 -2579,45 +2395,50 @@@ void r5c_finish_stripe_write_out(struc
+  	if (do_wakeup)
+  		wake_up(&conf->wait_for_overlap);
+  
+ -	spin_lock_irq(&log->stripe_in_journal_lock);
+ +	spin_lock_irq(&conf->log->stripe_in_journal_lock);
+  	list_del_init(&sh->r5c);
+ -	spin_unlock_irq(&log->stripe_in_journal_lock);
+ +	spin_unlock_irq(&conf->log->stripe_in_journal_lock);
+  	sh->log_start = MaxSector;
+++<<<<<<< HEAD
+ +	atomic_dec(&conf->log->stripe_in_journal_count);
+ +	r5c_update_log_state(conf->log);
+++=======
++ 
++ 	atomic_dec(&log->stripe_in_journal_count);
++ 	r5c_update_log_state(log);
++ 
++ 	/* stop counting this stripe in big_stripe_tree */
++ 	if (test_bit(STRIPE_R5C_PARTIAL_STRIPE, &sh->state) ||
++ 	    test_bit(STRIPE_R5C_FULL_STRIPE, &sh->state)) {
++ 		tree_index = r5c_tree_index(conf, sh->sector);
++ 		spin_lock(&log->tree_lock);
++ 		pslot = radix_tree_lookup_slot(&log->big_stripe_tree,
++ 					       tree_index);
++ 		BUG_ON(pslot == NULL);
++ 		refcount = (uintptr_t)radix_tree_deref_slot_protected(
++ 			pslot, &log->tree_lock) >>
++ 			R5C_RADIX_COUNT_SHIFT;
++ 		if (refcount == 1)
++ 			radix_tree_delete(&log->big_stripe_tree, tree_index);
++ 		else
++ 			radix_tree_replace_slot(
++ 				&log->big_stripe_tree, pslot,
++ 				(void *)((refcount - 1) << R5C_RADIX_COUNT_SHIFT));
++ 		spin_unlock(&log->tree_lock);
++ 	}
++ 
++ 	if (test_and_clear_bit(STRIPE_R5C_PARTIAL_STRIPE, &sh->state)) {
++ 		BUG_ON(atomic_read(&conf->r5c_cached_partial_stripes) == 0);
++ 		atomic_dec(&conf->r5c_flushing_partial_stripes);
++ 		atomic_dec(&conf->r5c_cached_partial_stripes);
++ 	}
++ 
++ 	if (test_and_clear_bit(STRIPE_R5C_FULL_STRIPE, &sh->state)) {
++ 		BUG_ON(atomic_read(&conf->r5c_cached_full_stripes) == 0);
++ 		atomic_dec(&conf->r5c_flushing_full_stripes);
++ 		atomic_dec(&conf->r5c_cached_full_stripes);
++ 	}
+++>>>>>>> e33fbb9cc73d (md/raid5-cache: exclude reclaiming stripes in reclaim check)
+  }
+  
+  int
+* Unmerged path drivers/md/raid5-cache.c
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index c1b941d8a9f4..4d6dcb81f5bb 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -6875,6 +6875,8 @@ static struct r5conf *setup_conf(struct mddev *mddev)
+ 	INIT_LIST_HEAD(&conf->r5c_full_stripe_list);
+ 	atomic_set(&conf->r5c_cached_partial_stripes, 0);
+ 	INIT_LIST_HEAD(&conf->r5c_partial_stripe_list);
++	atomic_set(&conf->r5c_flushing_full_stripes, 0);
++	atomic_set(&conf->r5c_flushing_partial_stripes, 0);
+ 
+ 	conf->level = mddev->new_level;
+ 	conf->chunk_sectors = mddev->new_chunk_sectors;
+diff --git a/drivers/md/raid5.h b/drivers/md/raid5.h
+index 3a5c11387bbd..9298a31a3ff5 100644
+--- a/drivers/md/raid5.h
++++ b/drivers/md/raid5.h
+@@ -680,6 +680,8 @@ struct r5conf {
+ 	struct list_head	r5c_full_stripe_list;
+ 	atomic_t		r5c_cached_partial_stripes;
+ 	struct list_head	r5c_partial_stripe_list;
++	atomic_t		r5c_flushing_full_stripes;
++	atomic_t		r5c_flushing_partial_stripes;
+ 
+ 	atomic_t		empty_inactive_list_nr;
+ 	struct llist_head	released_stripes;
