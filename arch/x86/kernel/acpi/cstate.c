@@ -106,7 +106,7 @@ static long acpi_processor_ffh_cstate_probe_cpu(void *_cx)
 			"state\n", cx->type);
 	}
 	snprintf(cx->desc,
-			ACPI_CX_DESC_LEN, "ACPI FFH INTEL MWAIT 0x%x",
+			ACPI_CX_DESC_LEN, "ACPI FFH MWAIT 0x%x",
 			cx->address);
 out:
 	return retval;
