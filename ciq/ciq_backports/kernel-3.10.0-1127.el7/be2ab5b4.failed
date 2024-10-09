@@ -1,0 +1,168 @@
+netfilter: nf_tables: take module reference when starting a batch
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Florian Westphal <fw@strlen.de>
+commit be2ab5b4d5c0bf041a34ec2e1397d50afbfb095e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/be2ab5b4.failed
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit be2ab5b4d5c0bf041a34ec2e1397d50afbfb095e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netfilter/nfnetlink.h
+#	net/netfilter/nf_tables_api.c
+#	net/netfilter/nfnetlink.c
+diff --cc include/linux/netfilter/nfnetlink.h
+index 7192383ab277,4a520d3304a2..000000000000
+--- a/include/linux/netfilter/nfnetlink.h
++++ b/include/linux/netfilter/nfnetlink.h
+@@@ -26,8 -29,11 +26,16 @@@ struct nfnetlink_subsystem 
+  	__u8 subsys_id;			/* nfnetlink subsystem ID */
+  	__u8 cb_count;			/* number of callbacks */
+  	const struct nfnl_callback *cb;	/* callback for individual types */
+++<<<<<<< HEAD
+ +	int (*commit)(struct sk_buff *skb);
+ +	int (*abort)(struct sk_buff *skb);
+++=======
++ 	struct module *owner;
++ 	int (*commit)(struct net *net, struct sk_buff *skb);
++ 	int (*abort)(struct net *net, struct sk_buff *skb);
++ 	void (*cleanup)(struct net *net);
++ 	bool (*valid_genid)(struct net *net, u32 genid);
+++>>>>>>> be2ab5b4d5c0 (netfilter: nf_tables: take module reference when starting a batch)
+  };
+  
+  int nfnetlink_subsys_register(const struct nfnetlink_subsystem *n);
+diff --cc net/netfilter/nf_tables_api.c
+index 0cf39357e9a5,c16c481fc52a..000000000000
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@@ -4197,6 -6601,9 +4197,12 @@@ static const struct nfnetlink_subsyste
+  	.cb		= nf_tables_cb,
+  	.commit		= nf_tables_commit,
+  	.abort		= nf_tables_abort,
+++<<<<<<< HEAD
+++=======
++ 	.cleanup	= nf_tables_cleanup,
++ 	.valid_genid	= nf_tables_valid_genid,
++ 	.owner		= THIS_MODULE,
+++>>>>>>> be2ab5b4d5c0 (netfilter: nf_tables: take module reference when starting a batch)
+  };
+  
+  int nft_chain_validate_dependency(const struct nft_chain *chain,
+diff --cc net/netfilter/nfnetlink.c
+index d1e972913291,dd1d7bc23b03..000000000000
+--- a/net/netfilter/nfnetlink.c
++++ b/net/netfilter/nfnetlink.c
+@@@ -310,9 -331,22 +310,26 @@@ replay
+  		}
+  	}
+  
+ -	if (!ss->valid_genid || !ss->commit || !ss->abort) {
+ +	if (!ss->commit || !ss->abort) {
+  		nfnl_unlock(subsys_id);
+++<<<<<<< HEAD
+ +		netlink_ack(oskb, nlh, -EOPNOTSUPP);
+++=======
++ 		netlink_ack(oskb, nlh, -EOPNOTSUPP, NULL);
++ 		return kfree_skb(skb);
++ 	}
++ 
++ 	if (!try_module_get(ss->owner)) {
++ 		nfnl_unlock(subsys_id);
++ 		netlink_ack(oskb, nlh, -EOPNOTSUPP, NULL);
++ 		return kfree_skb(skb);
++ 	}
++ 
++ 	if (!ss->valid_genid(net, genid)) {
++ 		module_put(ss->owner);
++ 		nfnl_unlock(subsys_id);
++ 		netlink_ack(oskb, nlh, -ERESTART, NULL);
+++>>>>>>> be2ab5b4d5c0 (netfilter: nf_tables: take module reference when starting a batch)
+  		return kfree_skb(skb);
+  	}
+  
+@@@ -422,16 -479,69 +439,64 @@@ done
+  		nfnl_err_reset(&err_list);
+  		nfnl_unlock(subsys_id);
+  		kfree_skb(skb);
++ 		module_put(ss->owner);
+  		goto replay;
+  	} else if (status == NFNL_BATCH_DONE) {
+ -		err = ss->commit(net, oskb);
+ -		if (err == -EAGAIN) {
+ -			status |= NFNL_BATCH_REPLAY;
+ -			goto done;
+ -		} else if (err) {
+ -			ss->abort(net, oskb);
+ -			netlink_ack(oskb, nlmsg_hdr(oskb), err, NULL);
+ -		}
+ +		ss->commit(oskb);
+  	} else {
+ -		ss->abort(net, oskb);
+ +		ss->abort(oskb);
+  	}
+ -	if (ss->cleanup)
+ -		ss->cleanup(net);
+  
+  	nfnl_err_deliver(&err_list, oskb);
+  	nfnl_unlock(subsys_id);
+++<<<<<<< HEAD
+ +	kfree_skb(nskb);
+++=======
++ 	kfree_skb(skb);
++ 	module_put(ss->owner);
++ }
++ 
++ static const struct nla_policy nfnl_batch_policy[NFNL_BATCH_MAX + 1] = {
++ 	[NFNL_BATCH_GENID]	= { .type = NLA_U32 },
++ };
++ 
++ static void nfnetlink_rcv_skb_batch(struct sk_buff *skb, struct nlmsghdr *nlh)
++ {
++ 	int min_len = nlmsg_total_size(sizeof(struct nfgenmsg));
++ 	struct nlattr *attr = (void *)nlh + min_len;
++ 	struct nlattr *cda[NFNL_BATCH_MAX + 1];
++ 	int attrlen = nlh->nlmsg_len - min_len;
++ 	struct nfgenmsg *nfgenmsg;
++ 	int msglen, err;
++ 	u32 gen_id = 0;
++ 	u16 res_id;
++ 
++ 	msglen = NLMSG_ALIGN(nlh->nlmsg_len);
++ 	if (msglen > skb->len)
++ 		msglen = skb->len;
++ 
++ 	if (skb->len < NLMSG_HDRLEN + sizeof(struct nfgenmsg))
++ 		return;
++ 
++ 	err = nla_parse(cda, NFNL_BATCH_MAX, attr, attrlen, nfnl_batch_policy,
++ 			NULL);
++ 	if (err < 0) {
++ 		netlink_ack(skb, nlh, err, NULL);
++ 		return;
++ 	}
++ 	if (cda[NFNL_BATCH_GENID])
++ 		gen_id = ntohl(nla_get_be32(cda[NFNL_BATCH_GENID]));
++ 
++ 	nfgenmsg = nlmsg_data(nlh);
++ 	skb_pull(skb, msglen);
++ 	/* Work around old nft using host byte order */
++ 	if (nfgenmsg->res_id == NFNL_SUBSYS_NFTABLES)
++ 		res_id = NFNL_SUBSYS_NFTABLES;
++ 	else
++ 		res_id = ntohs(nfgenmsg->res_id);
++ 
++ 	nfnetlink_rcv_batch(skb, nlh, res_id, gen_id);
+++>>>>>>> be2ab5b4d5c0 (netfilter: nf_tables: take module reference when starting a batch)
+  }
+  
+  static void nfnetlink_rcv(struct sk_buff *skb)
+* Unmerged path include/linux/netfilter/nfnetlink.h
+* Unmerged path net/netfilter/nf_tables_api.c
+* Unmerged path net/netfilter/nfnetlink.c
