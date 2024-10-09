@@ -1,0 +1,241 @@
+scsi: cxlflash: Add scsi command abort handler
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] cxlflash: Add scsi command abort handler (Gustavo Duarte) [1456494]
+Rebuild_FUZZ: 93.02%
+commit-author Uma Krishnan <ukrishn@linux.vnet.ibm.com>
+commit 7c4c41f172b6d5dda1119ce5f59151bef732a058
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/7c4c41f1.failed
+
+To date, CXL flash devices do not support a single command abort operation.
+Instead, the SISLite specification provides a context reset operation to
+cleanup all pending commands for a given context.
+
+When a context reset is successful, it is guaranteed that the AFU has
+aborted all currently pending I/O. This sequence is less invasive than a
+device or host reset and can be executed to support scsi command abort
+requests. Add eh_abort_handler callback support to process command timeouts
+and abort requests.
+
+	Signed-off-by: Uma Krishnan <ukrishn@linux.vnet.ibm.com>
+	Acked-by: Matthew R. Ochs <mrochs@linux.vnet.ibm.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 7c4c41f172b6d5dda1119ce5f59151bef732a058)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/cxlflash/main.c
+diff --cc drivers/scsi/cxlflash/main.c
+index c68badcfa77f,ceb247b5d1f2..000000000000
+--- a/drivers/scsi/cxlflash/main.c
++++ b/drivers/scsi/cxlflash/main.c
+@@@ -253,44 -194,79 +253,103 @@@ static void cmd_complete(struct afu_cm
+  }
+  
+  /**
+ - * flush_pending_cmds() - flush all pending commands on this hardware queue
+ - * @hwq:	Hardware queue to flush.
+ + * context_reset() - timeout handler for AFU commands
+ + * @cmd:	AFU command that timed out.
+   *
+ - * The hardware send queue lock associated with this hardware queue must be
+ - * held when calling this routine.
+ + * Sends a reset to the AFU.
+   */
+ -static void flush_pending_cmds(struct hwq *hwq)
+ +static void context_reset(struct afu_cmd *cmd)
+  {
+++<<<<<<< HEAD
+ +	int nretry = 0;
+ +	u64 rrin = 0x1;
+ +	struct afu *afu = cmd->parent;
+ +	struct cxlflash_cfg *cfg = afu->parent;
+ +	struct device *dev = &cfg->dev->dev;
+++=======
++ 	struct afu_cmd *cmd, *tmp;
++ 	struct scsi_cmnd *scp;
++ 
++ 	list_for_each_entry_safe(cmd, tmp, &hwq->pending_cmds, list) {
++ 		/* Bypass command when on a doneq, cmd_complete() will handle */
++ 		if (!list_empty(&cmd->queue))
++ 			continue;
++ 
++ 		list_del(&cmd->list);
++ 
++ 		if (cmd->scp) {
++ 			scp = cmd->scp;
++ 			scp->result = (DID_IMM_RETRY << 16);
++ 			scp->scsi_done(scp);
++ 		} else {
++ 			cmd->cmd_aborted = true;
++ 			complete(&cmd->cevent);
++ 		}
++ 	}
++ }
++ 
++ /**
++  * context_reset() - reset context via specified register
++  * @hwq:	Hardware queue owning the context to be reset.
++  * @reset_reg:	MMIO register to perform reset.
++  *
++  * When the reset is successful, the SISLite specification guarantees that
++  * the AFU has aborted all currently pending I/O. Accordingly, these commands
++  * must be flushed.
++  *
++  * Return: 0 on success, -errno on failure
++  */
++ static int context_reset(struct hwq *hwq, __be64 __iomem *reset_reg)
++ {
++ 	struct cxlflash_cfg *cfg = hwq->afu->parent;
++ 	struct device *dev = &cfg->dev->dev;
++ 	int rc = -ETIMEDOUT;
++ 	int nretry = 0;
++ 	u64 val = 0x1;
+++>>>>>>> 7c4c41f172b6 (scsi: cxlflash: Add scsi command abort handler)
+  	ulong lock_flags;
+  
+ -	dev_dbg(dev, "%s: hwq=%p\n", __func__, hwq);
+ +	pr_debug("%s: cmd=%p\n", __func__, cmd);
+ +
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&cmd->slock, lock_flags);
+ +
+ +	/* Already completed? */
+ +	if (cmd->sa.host_use_b[0] & B_DONE) {
+ +		spin_unlock_irqrestore(&cmd->slock, lock_flags);
+ +		return;
+ +	}
+ +
+ +	cmd->sa.host_use_b[0] |= (B_DONE | B_ERROR | B_TIMEOUT);
+ +	spin_unlock_irqrestore(&cmd->slock, lock_flags);
+  
+ +	writeq_be(rrin, &afu->host_map->ioarrin);
+++=======
++ 	spin_lock_irqsave(&hwq->hsq_slock, lock_flags);
++ 
++ 	writeq_be(val, reset_reg);
+++>>>>>>> 7c4c41f172b6 (scsi: cxlflash: Add scsi command abort handler)
+  	do {
+ -		val = readq_be(reset_reg);
+ -		if ((val & 0x1) == 0x0) {
+ -			rc = 0;
+ +		rrin = readq_be(&afu->host_map->ioarrin);
+ +		if (rrin != 0x1)
+  			break;
+ -		}
+ -
+  		/* Double delay each time */
+  		udelay(1 << nretry);
+  	} while (nretry++ < MC_ROOM_RETRY_CNT);
+  
+++<<<<<<< HEAD
+ +	dev_dbg(dev, "%s: returning rrin=0x%016llX nretry=%d\n",
+ +		__func__, rrin, nretry);
+++=======
++ 	if (!rc)
++ 		flush_pending_cmds(hwq);
++ 
++ 	spin_unlock_irqrestore(&hwq->hsq_slock, lock_flags);
++ 
++ 	dev_dbg(dev, "%s: returning rc=%d, val=%016llx nretry=%d\n",
++ 		__func__, rc, val, nretry);
++ 	return rc;
+++>>>>>>> 7c4c41f172b6 (scsi: cxlflash: Add scsi command abort handler)
+  }
+  
+  /**
+@@@ -1861,40 -2268,54 +1920,90 @@@ out
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * afu_reset() - resets the AFU
+ + * @cfg:	Internal structure associated with the host.
+ + *
+ + * Return: 0 on success, -errno on failure
+ + */
+ +static int afu_reset(struct cxlflash_cfg *cfg)
+ +{
+ +	int rc = 0;
+ +	/* Stop the context before the reset. Since the context is
+ +	 * no longer available restart it after the reset is complete
+ +	 */
+ +
+ +	term_afu(cfg);
+ +
+ +	rc = init_afu(cfg);
+ +
+ +	pr_debug("%s: returning rc=%d\n", __func__, rc);
+++=======
++  * cxlflash_eh_abort_handler() - abort a SCSI command
++  * @scp:	SCSI command to abort.
++  *
++  * CXL Flash devices do not support a single command abort. Reset the context
++  * as per SISLite specification. Flush any pending commands in the hardware
++  * queue before the reset.
++  *
++  * Return: SUCCESS/FAILED as defined in scsi/scsi.h
++  */
++ static int cxlflash_eh_abort_handler(struct scsi_cmnd *scp)
++ {
++ 	int rc = FAILED;
++ 	struct Scsi_Host *host = scp->device->host;
++ 	struct cxlflash_cfg *cfg = shost_priv(host);
++ 	struct afu_cmd *cmd = sc_to_afuc(scp);
++ 	struct device *dev = &cfg->dev->dev;
++ 	struct afu *afu = cfg->afu;
++ 	struct hwq *hwq = get_hwq(afu, cmd->hwq_index);
++ 
++ 	dev_dbg(dev, "%s: (scp=%p) %d/%d/%d/%llu "
++ 		"cdb=(%08x-%08x-%08x-%08x)\n", __func__, scp, host->host_no,
++ 		scp->device->channel, scp->device->id, scp->device->lun,
++ 		get_unaligned_be32(&((u32 *)scp->cmnd)[0]),
++ 		get_unaligned_be32(&((u32 *)scp->cmnd)[1]),
++ 		get_unaligned_be32(&((u32 *)scp->cmnd)[2]),
++ 		get_unaligned_be32(&((u32 *)scp->cmnd)[3]));
++ 
++ 	/* When the state is not normal, another reset/reload is in progress.
++ 	 * Return failed and the mid-layer will invoke host reset handler.
++ 	 */
++ 	if (cfg->state != STATE_NORMAL) {
++ 		dev_dbg(dev, "%s: Invalid state for abort, state=%d\n",
++ 			__func__, cfg->state);
++ 		goto out;
++ 	}
++ 
++ 	rc = afu->context_reset(hwq);
++ 	if (unlikely(rc))
++ 		goto out;
++ 
++ 	rc = SUCCESS;
++ 
++ out:
++ 	dev_dbg(dev, "%s: returning rc=%d\n", __func__, rc);
+++>>>>>>> 7c4c41f172b6 (scsi: cxlflash: Add scsi command abort handler)
+  	return rc;
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * drain_ioctls() - wait until all currently executing ioctls have completed
+ + * @cfg:	Internal structure associated with the host.
+ + *
+ + * Obtain write access to read/write semaphore that wraps ioctl
+ + * handling to 'drain' ioctls currently executing.
+ + */
+ +static void drain_ioctls(struct cxlflash_cfg *cfg)
+ +{
+ +	down_write(&cfg->ioctl_rwsem);
+ +	up_write(&cfg->ioctl_rwsem);
+ +}
+ +
+ +/**
+++=======
+++>>>>>>> 7c4c41f172b6 (scsi: cxlflash: Add scsi command abort handler)
+   * cxlflash_eh_device_reset_handler() - reset a single LUN
+   * @scp:	SCSI command to send.
+   *
+* Unmerged path drivers/scsi/cxlflash/main.c
