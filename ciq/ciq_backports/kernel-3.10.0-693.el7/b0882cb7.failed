@@ -1,0 +1,257 @@
+HID: wacom: Status packet provides 'charging', not 'powered' bit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [hid] wacom: Status packet provides charging, not powered bit (Aristeu Rozanski) [1346348 1388646 1385026]
+Rebuild_FUZZ: 92.44%
+commit-author Jason Gerecke <killertofu@gmail.com>
+commit b0882cb79dbd2bbdfac1416f8474aa6b0adb9334
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/b0882cb7.failed
+
+The status packet for tablets which can use a wireless module contains a
+bit that is set if the battery is charging. This bit will be 0 if either
+a battery is not present or if the battery has reached full charge. Note
+that the charging circuit may continue to charge the battery for a short
+time after reaching "100%".
+
+	Signed-off-by: Jason Gerecke <killertofu@gmail.com>
+	Acked-by: Ping Cheng <pingc@wacom.com>
+	Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+(cherry picked from commit b0882cb79dbd2bbdfac1416f8474aa6b0adb9334)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hid/wacom_sys.c
+#	drivers/hid/wacom_wac.c
+diff --cc drivers/hid/wacom_sys.c
+index 527bf559d1db,955ce7ceda89..000000000000
+--- a/drivers/hid/wacom_sys.c
++++ b/drivers/hid/wacom_sys.c
+@@@ -1083,9 -964,23 +1083,24 @@@ static int wacom_battery_get_property(s
+  	int ret = 0;
+  
+  	switch (psp) {
+ -		case POWER_SUPPLY_PROP_SCOPE:
+ -			val->intval = POWER_SUPPLY_SCOPE_DEVICE;
+ -			break;
+  		case POWER_SUPPLY_PROP_CAPACITY:
+  			val->intval =
+++<<<<<<< HEAD
+ +				wacom->wacom_wac.battery_capacity * 100 / 31;
+++=======
++ 				wacom->wacom_wac.battery_capacity;
++ 			break;
++ 		case POWER_SUPPLY_PROP_STATUS:
++ 			if (wacom->wacom_wac.bat_charging)
++ 				val->intval = POWER_SUPPLY_STATUS_CHARGING;
++ 			else if (wacom->wacom_wac.battery_capacity == 100 &&
++ 				    wacom->wacom_wac.ps_connected)
++ 				val->intval = POWER_SUPPLY_STATUS_FULL;
++ 			else if (wacom->wacom_wac.ps_connected)
++ 				val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
++ 			else
++ 				val->intval = POWER_SUPPLY_STATUS_DISCHARGING;
+++>>>>>>> b0882cb79dbd (HID: wacom: Status packet provides 'charging', not 'powered' bit)
+  			break;
+  		default:
+  			ret = -EINVAL;
+diff --cc drivers/hid/wacom_wac.c
+index 27dda3639500,57faf5b68b3d..000000000000
+--- a/drivers/hid/wacom_wac.c
++++ b/drivers/hid/wacom_wac.c
+@@@ -1314,25 -1822,122 +1314,48 @@@ static int wacom_bpt_irq(struct wacom_w
+  	return 0;
+  }
+  
+ -static void wacom_bamboo_pad_pen_event(struct wacom_wac *wacom,
+ -		unsigned char *data)
+ +static int wacom_wireless_irq(struct wacom_wac *wacom, size_t len)
+  {
+ -	unsigned char prefix;
+ +	unsigned char *data = wacom->data;
+ +	int connected;
+  
+ -	/*
+ -	 * We need to reroute the event from the debug interface to the
+ -	 * pen interface.
+ -	 * We need to add the report ID to the actual pen report, so we
+ -	 * temporary overwrite the first byte to prevent having to kzalloc/kfree
+ -	 * and memcpy the report.
+ -	 */
+ -	prefix = data[0];
+ -	data[0] = WACOM_REPORT_BPAD_PEN;
+ +	if (len != WACOM_PKGLEN_WIRELESS || data[0] != 0x80)
+ +		return 0;
+  
+ -	/*
+ -	 * actually reroute the event.
+ -	 * No need to check if wacom->shared->pen is valid, hid_input_report()
+ -	 * will check for us.
+ -	 */
+ -	hid_input_report(wacom->shared->pen, HID_INPUT_REPORT, data,
+ -			 WACOM_PKGLEN_PENABLED, 1);
+ +	connected = data[1] & 0x01;
+ +	if (connected) {
+++<<<<<<< HEAD
+ +		int pid, battery;
+  
+ -	data[0] = prefix;
+ -}
+ -
+ -static int wacom_bamboo_pad_touch_event(struct wacom_wac *wacom,
+ -		unsigned char *data)
+ -{
+ -	struct input_dev *input = wacom->input;
+ -	unsigned char *finger_data, prefix;
+ -	unsigned id;
+ -	int x, y;
+ -	bool valid;
+ -
+ -	prefix = data[0];
+ -
+ -	for (id = 0; id < wacom->features.touch_max; id++) {
+ -		valid = !!(prefix & BIT(id)) &&
+ -			!wacom->shared->stylus_in_proximity;
+ -
+ -		input_mt_slot(input, id);
+ -		input_mt_report_slot_state(input, MT_TOOL_FINGER, valid);
+ -
+ -		if (!valid)
+ -			continue;
+ -
+ -		finger_data = data + 1 + id * 3;
+ -		x = finger_data[0] | ((finger_data[1] & 0x0f) << 8);
+ -		y = (finger_data[2] << 4) | (finger_data[1] >> 4);
+ -
+ -		input_report_abs(input, ABS_MT_POSITION_X, x);
+ -		input_report_abs(input, ABS_MT_POSITION_Y, y);
+ -	}
+ -
+ -	input_mt_sync_frame(input);
+ -
+ -	input_report_key(input, BTN_LEFT, prefix & 0x40);
+ -	input_report_key(input, BTN_RIGHT, prefix & 0x80);
+ -
+ -	/* keep touch state for pen event */
+ -	wacom->shared->touch_down = !!prefix &&
+ -				    !wacom->shared->stylus_in_proximity;
+ -
+ -	return 1;
+ -}
+ -
+ -static int wacom_bamboo_pad_irq(struct wacom_wac *wacom, size_t len)
+ -{
+ -	unsigned char *data = wacom->data;
+ -
+ -	if (!((len == WACOM_PKGLEN_BPAD_TOUCH) ||
+ -	      (len == WACOM_PKGLEN_BPAD_TOUCH_USB)) ||
+ -	    (data[0] != WACOM_REPORT_BPAD_TOUCH))
+ -		return 0;
+ -
+ -	if (data[1] & 0x01)
+ -		wacom_bamboo_pad_pen_event(wacom, &data[1]);
+ -
+ -	if (data[1] & 0x02)
+ -		return wacom_bamboo_pad_touch_event(wacom, &data[9]);
+ -
+ -	return 0;
+ -}
+ -
+ -static int wacom_wireless_irq(struct wacom_wac *wacom, size_t len)
+ -{
+ -	unsigned char *data = wacom->data;
+ -	int connected;
+ -
+ -	if (len != WACOM_PKGLEN_WIRELESS || data[0] != WACOM_REPORT_WL)
+ -		return 0;
+ -
+ -	connected = data[1] & 0x01;
+ -	if (connected) {
+ -		int pid, battery, charging;
+ +		pid = get_unaligned_be16(&data[6]);
+ +		battery = data[5] & 0x3f;
+++=======
+++		int pid, battery, charging;
++ 
++ 		if ((wacom->shared->type == INTUOSHT) &&
++ 		    wacom->shared->touch_input &&
++ 		    wacom->shared->touch_max) {
++ 			input_report_switch(wacom->shared->touch_input,
++ 					SW_MUTE_DEVICE, data[5] & 0x40);
++ 			input_sync(wacom->shared->touch_input);
++ 		}
++ 
++ 		pid = get_unaligned_be16(&data[6]);
++ 		battery = (data[5] & 0x3f) * 100 / 31;
++ 		charging = !!(data[5] & 0x80);
+++>>>>>>> b0882cb79dbd (HID: wacom: Status packet provides 'charging', not 'powered' bit)
+  		if (wacom->pid != pid) {
+  			wacom->pid = pid;
+  			wacom_schedule_work(wacom);
+  		}
+++<<<<<<< HEAD
+ +		wacom->battery_capacity = battery;
+++=======
++ 
++ 		if (wacom->shared->type)
++ 			wacom_notify_battery(wacom, battery, charging, 0);
++ 
+++>>>>>>> b0882cb79dbd (HID: wacom: Status packet provides 'charging', not 'powered' bit)
+  	} else if (wacom->pid != 0) {
+  		/* disconnected while previously connected */
+  		wacom->pid = 0;
+@@@ -1343,6 -1948,47 +1366,50 @@@
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int wacom_status_irq(struct wacom_wac *wacom_wac, size_t len)
++ {
++ 	struct wacom *wacom = container_of(wacom_wac, struct wacom, wacom_wac);
++ 	struct wacom_features *features = &wacom_wac->features;
++ 	unsigned char *data = wacom_wac->data;
++ 
++ 	if (data[0] != WACOM_REPORT_USB)
++ 		return 0;
++ 
++ 	if (features->type == INTUOSHT &&
++ 	    wacom_wac->shared->touch_input &&
++ 	    features->touch_max) {
++ 		input_report_switch(wacom_wac->shared->touch_input,
++ 				    SW_MUTE_DEVICE, data[8] & 0x40);
++ 		input_sync(wacom_wac->shared->touch_input);
++ 	}
++ 
++ 	if (data[9] & 0x02) { /* wireless module is attached */
++ 		int battery = (data[8] & 0x3f) * 100 / 31;
++ 		bool charging = !!(data[8] & 0x80);
++ 
++ 		wacom_notify_battery(wacom_wac, battery, charging,
++ 				     1);
++ 
++ 		if (!wacom->battery.dev &&
++ 		    !(features->quirks & WACOM_QUIRK_BATTERY)) {
++ 			features->quirks |= WACOM_QUIRK_BATTERY;
++ 			INIT_WORK(&wacom->work, wacom_battery_work);
++ 			wacom_schedule_work(wacom_wac);
++ 		}
++ 	}
++ 	else if ((features->quirks & WACOM_QUIRK_BATTERY) &&
++ 		 wacom->battery.dev) {
++ 		features->quirks &= ~WACOM_QUIRK_BATTERY;
++ 		INIT_WORK(&wacom->work, wacom_battery_work);
++ 		wacom_schedule_work(wacom_wac);
++ 		wacom_notify_battery(wacom_wac, 0, 0, 0);
++ 	}
++ 	return 0;
++ }
++ 
+++>>>>>>> b0882cb79dbd (HID: wacom: Status packet provides 'charging', not 'powered' bit)
+  void wacom_wac_irq(struct wacom_wac *wacom_wac, size_t len)
+  {
+  	bool sync;
+* Unmerged path drivers/hid/wacom_sys.c
+* Unmerged path drivers/hid/wacom_wac.c
