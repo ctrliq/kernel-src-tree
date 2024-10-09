@@ -1,0 +1,488 @@
+ipc/msg: introduce msgctl(MSG_STAT_ANY)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [ipc] msg: introduce msgctl(MSG_STAT_ANY) (Joe Lawrence) [1579402]
+Rebuild_FUZZ: 94.59%
+commit-author Davidlohr Bueso <dave@stgolabs.net>
+commit 23c8cec8cf679b10997a512abb1e86f0cedc42ba
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/23c8cec8.failed
+
+There is a permission discrepancy when consulting msq ipc object
+metadata between /proc/sysvipc/msg (0444) and the MSG_STAT shmctl
+command.  The later does permission checks for the object vs S_IRUGO.
+As such there can be cases where EACCESS is returned via syscall but the
+info is displayed anyways in the procfs files.
+
+While this might have security implications via info leaking (albeit no
+writing to the msq metadata), this behavior goes way back and showing
+all the objects regardless of the permissions was most likely an
+overlook - so we are stuck with it.  Furthermore, modifying either the
+syscall or the procfs file can cause userspace programs to break (ie
+ipcs).  Some applications require getting the procfs info (without root
+privileges) and can be rather slow in comparison with a syscall -- up to
+500x in some reported cases for shm.
+
+This patch introduces a new MSG_STAT_ANY command such that the msq ipc
+object permissions are ignored, and only audited instead.  In addition,
+I've left the lsm security hook checks in place, as if some policy can
+block the call, then the user has no other choice than just parsing the
+procfs file.
+
+Link: http://lkml.kernel.org/r/20180215162458.10059-4-dave@stgolabs.net
+	Signed-off-by: Davidlohr Bueso <dbueso@suse.de>
+	Reported-by: Robert Kettler <robert.kettler@outlook.com>
+	Cc: Eric W. Biederman <ebiederm@xmission.com>
+	Cc: Kees Cook <keescook@chromium.org>
+	Cc: Manfred Spraul <manfred@colorfullife.com>
+	Cc: Michael Kerrisk <mtk.manpages@gmail.com>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 23c8cec8cf679b10997a512abb1e86f0cedc42ba)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	ipc/msg.c
+diff --cc ipc/msg.c
+index 73593879d59e,56fd1c73eedc..000000000000
+--- a/ipc/msg.c
++++ b/ipc/msg.c
+@@@ -469,111 -451,102 +469,138 @@@ out_up
+  	return err;
+  }
+  
+ -static int msgctl_info(struct ipc_namespace *ns, int msqid,
+ -			 int cmd, struct msginfo *msginfo)
+ +static int msgctl_nolock(struct ipc_namespace *ns, int msqid,
+ +			 int cmd, int version, void __user *buf)
+  {
+  	int err;
+ -	int max_id;
+ -
+ -	/*
+ -	 * We must not return kernel stack data.
+ -	 * due to padding, it's not enough
+ -	 * to set all member fields.
+ -	 */
+ -	err = security_msg_queue_msgctl(NULL, cmd);
+ -	if (err)
+ -		return err;
+ +	struct msg_queue *msq;
+  
+ -	memset(msginfo, 0, sizeof(*msginfo));
+ -	msginfo->msgmni = ns->msg_ctlmni;
+ -	msginfo->msgmax = ns->msg_ctlmax;
+ -	msginfo->msgmnb = ns->msg_ctlmnb;
+ -	msginfo->msgssz = MSGSSZ;
+ -	msginfo->msgseg = MSGSEG;
+ -	down_read(&msg_ids(ns).rwsem);
+ -	if (cmd == MSG_INFO) {
+ -		msginfo->msgpool = msg_ids(ns).in_use;
+ -		msginfo->msgmap = atomic_read(&ns->msg_hdrs);
+ -		msginfo->msgtql = atomic_read(&ns->msg_bytes);
+ -	} else {
+ -		msginfo->msgmap = MSGMAP;
+ -		msginfo->msgpool = MSGPOOL;
+ -		msginfo->msgtql = MSGTQL;
+ -	}
+ -	max_id = ipc_get_maxid(&msg_ids(ns));
+ -	up_read(&msg_ids(ns).rwsem);
+ -	return (max_id < 0) ? 0 : max_id;
+ -}
+ +	switch (cmd) {
+ +	case IPC_INFO:
+ +	case MSG_INFO:
+ +	{
+ +		struct msginfo msginfo;
+ +		int max_id;
+  
+ -static int msgctl_stat(struct ipc_namespace *ns, int msqid,
+ -			 int cmd, struct msqid64_ds *p)
+ -{
+ -	struct msg_queue *msq;
+ -	int id = 0;
+ -	int err;
+++<<<<<<< HEAD
+ +		if (!buf)
+ +			return -EFAULT;
+  
+ -	memset(p, 0, sizeof(*p));
+ +		/*
+ +		 * We must not return kernel stack data.
+ +		 * due to padding, it's not enough
+ +		 * to set all member fields.
+ +		 */
+ +		err = security_msg_queue_msgctl(NULL, cmd);
+ +		if (err)
+ +			return err;
+  
+ +		memset(&msginfo, 0, sizeof(msginfo));
+ +		msginfo.msgmni = ns->msg_ctlmni;
+ +		msginfo.msgmax = ns->msg_ctlmax;
+ +		msginfo.msgmnb = ns->msg_ctlmnb;
+ +		msginfo.msgssz = MSGSSZ;
+ +		msginfo.msgseg = MSGSEG;
+ +		down_read(&msg_ids(ns).rwsem);
+ +		if (cmd == MSG_INFO) {
+ +			msginfo.msgpool = msg_ids(ns).in_use;
+ +			msginfo.msgmap = atomic_read(&ns->msg_hdrs);
+ +			msginfo.msgtql = atomic_read(&ns->msg_bytes);
+ +		} else {
+ +			msginfo.msgmap = MSGMAP;
+ +			msginfo.msgpool = MSGPOOL;
+ +			msginfo.msgtql = MSGTQL;
+++=======
++ 	rcu_read_lock();
++ 	if (cmd == MSG_STAT || cmd == MSG_STAT_ANY) {
++ 		msq = msq_obtain_object(ns, msqid);
++ 		if (IS_ERR(msq)) {
++ 			err = PTR_ERR(msq);
++ 			goto out_unlock;
++ 		}
++ 		id = msq->q_perm.id;
++ 	} else { /* IPC_STAT */
++ 		msq = msq_obtain_object_check(ns, msqid);
++ 		if (IS_ERR(msq)) {
++ 			err = PTR_ERR(msq);
++ 			goto out_unlock;
+++>>>>>>> 23c8cec8cf67 (ipc/msg: introduce msgctl(MSG_STAT_ANY))
+  		}
+ +		max_id = ipc_get_maxid(&msg_ids(ns));
+ +		up_read(&msg_ids(ns).rwsem);
+ +		if (copy_to_user(buf, &msginfo, sizeof(struct msginfo)))
+ +			return -EFAULT;
+ +		return (max_id < 0) ? 0 : max_id;
+  	}
+  
+++<<<<<<< HEAD
+ +	case MSG_STAT:
+ +	case IPC_STAT:
+ +	{
+ +		struct msqid64_ds tbuf;
+ +		int success_return;
+++=======
++ 	/* see comment for SHM_STAT_ANY */
++ 	if (cmd == MSG_STAT_ANY)
++ 		audit_ipc_obj(&msq->q_perm);
++ 	else {
++ 		err = -EACCES;
++ 		if (ipcperms(ns, &msq->q_perm, S_IRUGO))
++ 			goto out_unlock;
++ 	}
+++>>>>>>> 23c8cec8cf67 (ipc/msg: introduce msgctl(MSG_STAT_ANY))
+  
+ -	err = security_msg_queue_msgctl(&msq->q_perm, cmd);
+ -	if (err)
+ -		goto out_unlock;
+ +		if (!buf)
+ +			return -EFAULT;
+  
+ -	ipc_lock_object(&msq->q_perm);
+ +		memset(&tbuf, 0, sizeof(tbuf));
+  
+ -	if (!ipc_valid_object(&msq->q_perm)) {
+ -		ipc_unlock_object(&msq->q_perm);
+ -		err = -EIDRM;
+ -		goto out_unlock;
+ -	}
+ +		rcu_read_lock();
+ +		if (cmd == MSG_STAT) {
+ +			msq = msq_obtain_object(ns, msqid);
+ +			if (IS_ERR(msq)) {
+ +				err = PTR_ERR(msq);
+ +				goto out_unlock;
+ +			}
+ +			success_return = msq->q_perm.id;
+ +		} else {
+ +			msq = msq_obtain_object_check(ns, msqid);
+ +			if (IS_ERR(msq)) {
+ +				err = PTR_ERR(msq);
+ +				goto out_unlock;
+ +			}
+ +			success_return = 0;
+ +		}
+  
+ -	kernel_to_ipc64_perm(&msq->q_perm, &p->msg_perm);
+ -	p->msg_stime  = msq->q_stime;
+ -	p->msg_rtime  = msq->q_rtime;
+ -	p->msg_ctime  = msq->q_ctime;
+ -	p->msg_cbytes = msq->q_cbytes;
+ -	p->msg_qnum   = msq->q_qnum;
+ -	p->msg_qbytes = msq->q_qbytes;
+ -	p->msg_lspid  = pid_vnr(msq->q_lspid);
+ -	p->msg_lrpid  = pid_vnr(msq->q_lrpid);
+ +		err = -EACCES;
+ +		if (ipcperms(ns, &msq->q_perm, S_IRUGO))
+ +			goto out_unlock;
+  
+ -	ipc_unlock_object(&msq->q_perm);
+ -	rcu_read_unlock();
+ -	return id;
+ +		err = security_msg_queue_msgctl(msq, cmd);
+ +		if (err)
+ +			goto out_unlock;
+ +
+ +		kernel_to_ipc64_perm(&msq->q_perm, &tbuf.msg_perm);
+ +		tbuf.msg_stime  = msq->q_stime;
+ +		tbuf.msg_rtime  = msq->q_rtime;
+ +		tbuf.msg_ctime  = msq->q_ctime;
+ +		tbuf.msg_cbytes = msq->q_cbytes;
+ +		tbuf.msg_qnum   = msq->q_qnum;
+ +		tbuf.msg_qbytes = msq->q_qbytes;
+ +		tbuf.msg_lspid  = msq->q_lspid;
+ +		tbuf.msg_lrpid  = msq->q_lrpid;
+ +		rcu_read_unlock();
+ +
+ +		if (copy_msqid_to_user(buf, &tbuf, version))
+ +			return -EFAULT;
+ +		return success_return;
+ +	}
+ +
+ +	default:
+ +		return -EINVAL;
+ +	}
+  
+ +	return err;
+  out_unlock:
+  	rcu_read_unlock();
+  	return err;
+@@@ -592,37 -567,177 +619,165 @@@ SYSCALL_DEFINE3(msgctl, int, msqid, int
+  
+  	switch (cmd) {
+  	case IPC_INFO:
+ -	case MSG_INFO: {
+ -		struct msginfo msginfo;
+ -		err = msgctl_info(ns, msqid, cmd, &msginfo);
+ -		if (err < 0)
+ -			return err;
+ -		if (copy_to_user(buf, &msginfo, sizeof(struct msginfo)))
+ -			err = -EFAULT;
+ -		return err;
+ -	}
+ +	case MSG_INFO:
+  	case MSG_STAT:	/* msqid is an index rather than a msg queue id */
++ 	case MSG_STAT_ANY:
+  	case IPC_STAT:
+ -		err = msgctl_stat(ns, msqid, cmd, &msqid64);
+ -		if (err < 0)
+ -			return err;
+ -		if (copy_msqid_to_user(buf, &msqid64, version))
+ -			err = -EFAULT;
+ -		return err;
+ +		return msgctl_nolock(ns, msqid, cmd, version, buf);
+  	case IPC_SET:
+ -		if (copy_msqid_from_user(&msqid64, buf, version))
+ -			return -EFAULT;
+ -		/* fallthru */
+  	case IPC_RMID:
+ -		return msgctl_down(ns, msqid, cmd, &msqid64);
+ +		return msgctl_down(ns, msqid, cmd, buf, version);
+  	default:
+  		return  -EINVAL;
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ SYSCALL_DEFINE3(msgctl, int, msqid, int, cmd, struct msqid_ds __user *, buf)
++ {
++ 	return ksys_msgctl(msqid, cmd, buf);
++ }
++ 
++ #ifdef CONFIG_COMPAT
++ 
++ struct compat_msqid_ds {
++ 	struct compat_ipc_perm msg_perm;
++ 	compat_uptr_t msg_first;
++ 	compat_uptr_t msg_last;
++ 	compat_time_t msg_stime;
++ 	compat_time_t msg_rtime;
++ 	compat_time_t msg_ctime;
++ 	compat_ulong_t msg_lcbytes;
++ 	compat_ulong_t msg_lqbytes;
++ 	unsigned short msg_cbytes;
++ 	unsigned short msg_qnum;
++ 	unsigned short msg_qbytes;
++ 	compat_ipc_pid_t msg_lspid;
++ 	compat_ipc_pid_t msg_lrpid;
++ };
++ 
++ static int copy_compat_msqid_from_user(struct msqid64_ds *out, void __user *buf,
++ 					int version)
++ {
++ 	memset(out, 0, sizeof(*out));
++ 	if (version == IPC_64) {
++ 		struct compat_msqid64_ds __user *p = buf;
++ 		if (get_compat_ipc64_perm(&out->msg_perm, &p->msg_perm))
++ 			return -EFAULT;
++ 		if (get_user(out->msg_qbytes, &p->msg_qbytes))
++ 			return -EFAULT;
++ 	} else {
++ 		struct compat_msqid_ds __user *p = buf;
++ 		if (get_compat_ipc_perm(&out->msg_perm, &p->msg_perm))
++ 			return -EFAULT;
++ 		if (get_user(out->msg_qbytes, &p->msg_qbytes))
++ 			return -EFAULT;
++ 	}
++ 	return 0;
++ }
++ 
++ static int copy_compat_msqid_to_user(void __user *buf, struct msqid64_ds *in,
++ 					int version)
++ {
++ 	if (version == IPC_64) {
++ 		struct compat_msqid64_ds v;
++ 		memset(&v, 0, sizeof(v));
++ 		to_compat_ipc64_perm(&v.msg_perm, &in->msg_perm);
++ 		v.msg_stime = in->msg_stime;
++ 		v.msg_rtime = in->msg_rtime;
++ 		v.msg_ctime = in->msg_ctime;
++ 		v.msg_cbytes = in->msg_cbytes;
++ 		v.msg_qnum = in->msg_qnum;
++ 		v.msg_qbytes = in->msg_qbytes;
++ 		v.msg_lspid = in->msg_lspid;
++ 		v.msg_lrpid = in->msg_lrpid;
++ 		return copy_to_user(buf, &v, sizeof(v));
++ 	} else {
++ 		struct compat_msqid_ds v;
++ 		memset(&v, 0, sizeof(v));
++ 		to_compat_ipc_perm(&v.msg_perm, &in->msg_perm);
++ 		v.msg_stime = in->msg_stime;
++ 		v.msg_rtime = in->msg_rtime;
++ 		v.msg_ctime = in->msg_ctime;
++ 		v.msg_cbytes = in->msg_cbytes;
++ 		v.msg_qnum = in->msg_qnum;
++ 		v.msg_qbytes = in->msg_qbytes;
++ 		v.msg_lspid = in->msg_lspid;
++ 		v.msg_lrpid = in->msg_lrpid;
++ 		return copy_to_user(buf, &v, sizeof(v));
++ 	}
++ }
++ 
++ long compat_ksys_msgctl(int msqid, int cmd, void __user *uptr)
++ {
++ 	struct ipc_namespace *ns;
++ 	int err;
++ 	struct msqid64_ds msqid64;
++ 	int version = compat_ipc_parse_version(&cmd);
++ 
++ 	ns = current->nsproxy->ipc_ns;
++ 
++ 	if (msqid < 0 || cmd < 0)
++ 		return -EINVAL;
++ 
++ 	switch (cmd & (~IPC_64)) {
++ 	case IPC_INFO:
++ 	case MSG_INFO: {
++ 		struct msginfo msginfo;
++ 		err = msgctl_info(ns, msqid, cmd, &msginfo);
++ 		if (err < 0)
++ 			return err;
++ 		if (copy_to_user(uptr, &msginfo, sizeof(struct msginfo)))
++ 			err = -EFAULT;
++ 		return err;
++ 	}
++ 	case IPC_STAT:
++ 	case MSG_STAT:
++ 	case MSG_STAT_ANY:
++ 		err = msgctl_stat(ns, msqid, cmd, &msqid64);
++ 		if (err < 0)
++ 			return err;
++ 		if (copy_compat_msqid_to_user(uptr, &msqid64, version))
++ 			err = -EFAULT;
++ 		return err;
++ 	case IPC_SET:
++ 		if (copy_compat_msqid_from_user(&msqid64, uptr, version))
++ 			return -EFAULT;
++ 		/* fallthru */
++ 	case IPC_RMID:
++ 		return msgctl_down(ns, msqid, cmd, &msqid64);
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
++ COMPAT_SYSCALL_DEFINE3(msgctl, int, msqid, int, cmd, void __user *, uptr)
++ {
++ 	return compat_ksys_msgctl(msqid, cmd, uptr);
++ }
++ #endif
++ 
+++>>>>>>> 23c8cec8cf67 (ipc/msg: introduce msgctl(MSG_STAT_ANY))
+  static int testmsg(struct msg_msg *msg, long type, int mode)
+  {
+ -	switch (mode) {
+ -	case SEARCH_ANY:
+ -	case SEARCH_NUMBER:
+ -		return 1;
+ -	case SEARCH_LESSEQUAL:
+ -		if (msg->m_type <= type)
+ -			return 1;
+ -		break;
+ -	case SEARCH_EQUAL:
+ -		if (msg->m_type == type)
+ -			return 1;
+ -		break;
+ -	case SEARCH_NOTEQUAL:
+ -		if (msg->m_type != type)
+ +	switch(mode)
+ +	{
+ +		case SEARCH_ANY:
+ +		case SEARCH_NUMBER:
+  			return 1;
+ -		break;
+ +		case SEARCH_LESSEQUAL:
+ +			if (msg->m_type <=type)
+ +				return 1;
+ +			break;
+ +		case SEARCH_EQUAL:
+ +			if (msg->m_type == type)
+ +				return 1;
+ +			break;
+ +		case SEARCH_NOTEQUAL:
+ +			if (msg->m_type != type)
+ +				return 1;
+ +			break;
+  	}
+  	return 0;
+  }
+diff --git a/include/uapi/linux/msg.h b/include/uapi/linux/msg.h
+index 22d95c6854e0..8e5f4d4f55f2 100644
+--- a/include/uapi/linux/msg.h
++++ b/include/uapi/linux/msg.h
+@@ -6,6 +6,7 @@
+ /* ipcs ctl commands */
+ #define MSG_STAT 11
+ #define MSG_INFO 12
++#define MSG_STAT_ANY 13
+ 
+ /* msgrcv options */
+ #define MSG_NOERROR     010000  /* no error if message is too big */
+* Unmerged path ipc/msg.c
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index fe0d2b1b58b3..0c405d947fff 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -5395,6 +5395,7 @@ static int selinux_msg_queue_msgctl(struct msg_queue *msq, int cmd)
+ 		return task_has_system(current, SYSTEM__IPC_INFO);
+ 	case IPC_STAT:
+ 	case MSG_STAT:
++	case MSG_STAT_ANY:
+ 		perms = MSGQ__GETATTR | MSGQ__ASSOCIATE;
+ 		break;
+ 	case IPC_SET:
+diff --git a/security/smack/smack_lsm.c b/security/smack/smack_lsm.c
+index 42fad0f7949a..0820fbc94a29 100644
+--- a/security/smack/smack_lsm.c
++++ b/security/smack/smack_lsm.c
+@@ -2368,6 +2368,7 @@ static int smack_msg_queue_msgctl(struct msg_queue *msq, int cmd)
+ 	switch (cmd) {
+ 	case IPC_STAT:
+ 	case MSG_STAT:
++	case MSG_STAT_ANY:
+ 		may = MAY_READ;
+ 		break;
+ 	case IPC_SET:
