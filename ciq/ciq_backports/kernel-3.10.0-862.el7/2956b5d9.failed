@@ -1,0 +1,1566 @@
+pinctrl / gpio: Introduce .set_config() callback for GPIO chips
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Mika Westerberg <mika.westerberg@linux.intel.com>
+commit 2956b5d94a76b596fa5057c2b3ca915cb27d7652
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/2956b5d9.failed
+
+Currently we already have two pin configuration related callbacks
+available for GPIO chips .set_single_ended() and .set_debounce(). In
+future we expect to have even more, which does not scale well if we need
+to add yet another callback to the GPIO chip structure for each possible
+configuration parameter.
+
+Better solution is to reuse what we already have available in the
+generic pinconf.
+
+To support this, we introduce a new .set_config() callback for GPIO
+chips. The callback takes a single packed pin configuration value as
+parameter. This can then be extended easily beyond what is currently
+supported by just adding new types to the generic pinconf enum.
+
+If the GPIO driver is backed up by a pinctrl driver the GPIO driver can
+just assign gpiochip_generic_config() (introduced in this patch) to
+.set_config and that will take care configuration requests are directed
+to the pinctrl driver.
+
+We then convert the existing drivers over .set_config() and finally
+remove the .set_single_ended() and .set_debounce() callbacks.
+
+	Suggested-by: Linus Walleij <linus.walleij@linaro.org>
+	Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+	Reviewed-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+	Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
+(cherry picked from commit 2956b5d94a76b596fa5057c2b3ca915cb27d7652)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/gpio/driver.txt
+#	drivers/gpio/gpio-bcm-kona.c
+#	drivers/gpio/gpio-dln2.c
+#	drivers/gpio/gpio-dwapb.c
+#	drivers/gpio/gpio-ep93xx.c
+#	drivers/gpio/gpio-f7188x.c
+#	drivers/gpio/gpio-lp873x.c
+#	drivers/gpio/gpio-max77620.c
+#	drivers/gpio/gpio-menz127.c
+#	drivers/gpio/gpio-merrifield.c
+#	drivers/gpio/gpio-omap.c
+#	drivers/gpio/gpio-tc3589x.c
+#	drivers/gpio/gpio-tegra.c
+#	drivers/gpio/gpio-tps65218.c
+#	drivers/gpio/gpio-vx855.c
+#	drivers/gpio/gpio-wcove.c
+#	drivers/gpio/gpio-wm831x.c
+#	drivers/gpio/gpio-wm8994.c
+#	drivers/gpio/gpiolib.c
+#	drivers/pinctrl/mediatek/pinctrl-mtk-common.c
+#	drivers/pinctrl/pinctrl-sx150x.c
+#	drivers/staging/greybus/gpio.c
+#	drivers/usb/serial/cp210x.c
+#	include/linux/gpio/driver.h
+#	include/linux/pinctrl/pinconf-generic.h
+diff --cc Documentation/gpio/driver.txt
+index 9da0bfa74781,ad8f0c0cd13f..000000000000
+--- a/Documentation/gpio/driver.txt
++++ b/Documentation/gpio/driver.txt
+@@@ -62,6 -62,259 +62,262 @@@ Any debugfs dump method should normall
+  requested as GPIOs. They can use gpiochip_is_requested(), which returns either
+  NULL or the label associated with that GPIO when it was requested.
+  
+++<<<<<<< HEAD
+++=======
++ RT_FULL: GPIO driver should not use spinlock_t or any sleepable APIs
++ (like PM runtime) in its gpio_chip implementation (.get/.set and direction
++ control callbacks) if it is expected to call GPIO APIs from atomic context
++ on -RT (inside hard IRQ handlers and similar contexts). Normally this should
++ not be required.
++ 
++ 
++ GPIOs with open drain/source support
++ ------------------------------------
++ 
++ Open drain (CMOS) or open collector (TTL) means the line is not actively driven
++ high: instead you provide the drain/collector as output, so when the transistor
++ is not open, it will present a high-impedance (tristate) to the external rail.
++ 
++ 
++    CMOS CONFIGURATION      TTL CONFIGURATION
++ 
++             ||--- out              +--- out
++      in ----||                   |/
++             ||--+         in ----|
++                 |                |\
++                GND	           GND
++ 
++ This configuration is normally used as a way to achieve one of two things:
++ 
++ - Level-shifting: to reach a logical level higher than that of the silicon
++   where the output resides.
++ 
++ - inverse wire-OR on an I/O line, for example a GPIO line, making it possible
++   for any driving stage on the line to drive it low even if any other output
++   to the same line is simultaneously driving it high. A special case of this
++   is driving the SCL and SCA lines of an I2C bus, which is by definition a
++   wire-OR bus.
++ 
++ Both usecases require that the line be equipped with a pull-up resistor. This
++ resistor will make the line tend to high level unless one of the transistors on
++ the rail actively pulls it down.
++ 
++ The level on the line will go as high as the VDD on the pull-up resistor, which
++ may be higher than the level supported by the transistor, achieveing a
++ level-shift to the higher VDD.
++ 
++ Integrated electronics often have an output driver stage in the form of a CMOS
++ "totem-pole" with one N-MOS and one P-MOS transistor where one of them drives
++ the line high and one of them drives the line low. This is called a push-pull
++ output. The "totem-pole" looks like so:
++ 
++                  VDD
++                   |
++         OD    ||--+
++      +--/ ---o||     P-MOS-FET
++      |        ||--+
++ IN --+            +----- out
++      |        ||--+
++      +--/ ----||     N-MOS-FET
++         OS    ||--+
++                   |
++                  GND
++ 
++ The desired output signal (e.g. coming directly from some GPIO output register)
++ arrives at IN. The switches named "OD" and "OS" are normally closed, creating
++ a push-pull circuit.
++ 
++ Consider the little "switches" named "OD" and "OS" that enable/disable the
++ P-MOS or N-MOS transistor right after the split of the input. As you can see,
++ either transistor will go totally numb if this switch is open. The totem-pole
++ is then halved and give high impedance instead of actively driving the line
++ high or low respectively. That is usually how software-controlled open
++ drain/source works.
++ 
++ Some GPIO hardware come in open drain / open source configuration. Some are
++ hard-wired lines that will only support open drain or open source no matter
++ what: there is only one transistor there. Some are software-configurable:
++ by flipping a bit in a register the output can be configured as open drain
++ or open source, in practice by flicking open the switches labeled "OD" and "OS"
++ in the drawing above.
++ 
++ By disabling the P-MOS transistor, the output can be driven between GND and
++ high impedance (open drain), and by disabling the N-MOS transistor, the output
++ can be driven between VDD and high impedance (open source). In the first case,
++ a pull-up resistor is needed on the outgoing rail to complete the circuit, and
++ in the second case, a pull-down resistor is needed on the rail.
++ 
++ Hardware that supports open drain or open source or both, can implement a
++ special callback in the gpio_chip: .set_config() that takes a generic
++ pinconf packed value telling whether to configure the line as open drain,
++ open source or push-pull. This will happen in response to the
++ GPIO_OPEN_DRAIN or GPIO_OPEN_SOURCE flag set in the machine file, or coming
++ from other hardware descriptions.
++ 
++ If this state can not be configured in hardware, i.e. if the GPIO hardware does
++ not support open drain/open source in hardware, the GPIO library will instead
++ use a trick: when a line is set as output, if the line is flagged as open
++ drain, and the IN output value is low, it will be driven low as usual. But
++ if the IN output value is set to high, it will instead *NOT* be driven high,
++ instead it will be switched to input, as input mode is high impedance, thus
++ achieveing an "open drain emulation" of sorts: electrically the behaviour will
++ be identical, with the exception of possible hardware glitches when switching
++ the mode of the line.
++ 
++ For open source configuration the same principle is used, just that instead
++ of actively driving the line low, it is set to input.
++ 
++ 
++ GPIO drivers providing IRQs
++ ---------------------------
++ It is custom that GPIO drivers (GPIO chips) are also providing interrupts,
++ most often cascaded off a parent interrupt controller, and in some special
++ cases the GPIO logic is melded with a SoC's primary interrupt controller.
++ 
++ The IRQ portions of the GPIO block are implemented using an irqchip, using
++ the header <linux/irq.h>. So basically such a driver is utilizing two sub-
++ systems simultaneously: gpio and irq.
++ 
++ RT_FULL: a realtime compliant GPIO driver should not use spinlock_t or any
++ sleepable APIs (like PM runtime) as part of its irq_chip implementation.
++ - spinlock_t should be replaced with raw_spinlock_t [1].
++ - If sleepable APIs have to be used, these can be done from the .irq_bus_lock()
++   and .irq_bus_unlock() callbacks, as these are the only slowpath callbacks
++   on an irqchip. Create the callbacks if needed [2].
++ 
++ GPIO irqchips usually fall in one of two categories:
++ 
++ * CHAINED GPIO irqchips: these are usually the type that is embedded on
++   an SoC. This means that there is a fast IRQ flow handler for the GPIOs that
++   gets called in a chain from the parent IRQ handler, most typically the
++   system interrupt controller. This means that the GPIO irqchip handler will
++   be called immediately from the parent irqchip, while holding the IRQs
++   disabled. The GPIO irqchip will then end up calling something like this
++   sequence in its interrupt handler:
++ 
++   static irqreturn_t foo_gpio_irq(int irq, void *data)
++       chained_irq_enter(...);
++       generic_handle_irq(...);
++       chained_irq_exit(...);
++ 
++   Chained GPIO irqchips typically can NOT set the .can_sleep flag on
++   struct gpio_chip, as everything happens directly in the callbacks: no
++   slow bus traffic like I2C can be used.
++ 
++   RT_FULL: Note, chained IRQ handlers will not be forced threaded on -RT.
++   As result, spinlock_t or any sleepable APIs (like PM runtime) can't be used
++   in chained IRQ handler.
++   If required (and if it can't be converted to the nested threaded GPIO irqchip)
++   a chained IRQ handler can be converted to generic irq handler and this way
++   it will be a threaded IRQ handler on -RT and a hard IRQ handler on non-RT
++   (for example, see [3]).
++   Know W/A: The generic_handle_irq() is expected to be called with IRQ disabled,
++   so the IRQ core will complain if it is called from an IRQ handler which is
++   forced to a thread. The "fake?" raw lock can be used to W/A this problem:
++ 
++ 	raw_spinlock_t wa_lock;
++ 	static irqreturn_t omap_gpio_irq_handler(int irq, void *gpiobank)
++ 		unsigned long wa_lock_flags;
++ 		raw_spin_lock_irqsave(&bank->wa_lock, wa_lock_flags);
++ 		generic_handle_irq(irq_find_mapping(bank->chip.irqdomain, bit));
++ 		raw_spin_unlock_irqrestore(&bank->wa_lock, wa_lock_flags);
++ 
++ * GENERIC CHAINED GPIO irqchips: these are the same as "CHAINED GPIO irqchips",
++   but chained IRQ handlers are not used. Instead GPIO IRQs dispatching is
++   performed by generic IRQ handler which is configured using request_irq().
++   The GPIO irqchip will then end up calling something like this sequence in
++   its interrupt handler:
++ 
++   static irqreturn_t gpio_rcar_irq_handler(int irq, void *dev_id)
++ 	for each detected GPIO IRQ
++ 		generic_handle_irq(...);
++ 
++   RT_FULL: Such kind of handlers will be forced threaded on -RT, as result IRQ
++   core will complain that generic_handle_irq() is called with IRQ enabled and
++   the same W/A as for "CHAINED GPIO irqchips" can be applied.
++ 
++ * NESTED THREADED GPIO irqchips: these are off-chip GPIO expanders and any
++   other GPIO irqchip residing on the other side of a sleeping bus. Of course
++   such drivers that need slow bus traffic to read out IRQ status and similar,
++   traffic which may in turn incur other IRQs to happen, cannot be handled
++   in a quick IRQ handler with IRQs disabled. Instead they need to spawn a
++   thread and then mask the parent IRQ line until the interrupt is handled
++   by the driver. The hallmark of this driver is to call something like
++   this in its interrupt handler:
++ 
++   static irqreturn_t foo_gpio_irq(int irq, void *data)
++       ...
++       handle_nested_irq(irq);
++ 
++   The hallmark of threaded GPIO irqchips is that they set the .can_sleep
++   flag on struct gpio_chip to true, indicating that this chip may sleep
++   when accessing the GPIOs.
++ 
++ To help out in handling the set-up and management of GPIO irqchips and the
++ associated irqdomain and resource allocation callbacks, the gpiolib has
++ some helpers that can be enabled by selecting the GPIOLIB_IRQCHIP Kconfig
++ symbol:
++ 
++ * gpiochip_irqchip_add(): adds a chained irqchip to a gpiochip. It will pass
++   the struct gpio_chip* for the chip to all IRQ callbacks, so the callbacks
++   need to embed the gpio_chip in its state container and obtain a pointer
++   to the container using container_of().
++   (See Documentation/driver-model/design-patterns.txt)
++ 
++ * gpiochip_irqchip_add_nested(): adds a nested irqchip to a gpiochip.
++   Apart from that it works exactly like the chained irqchip.
++ 
++ * gpiochip_set_chained_irqchip(): sets up a chained irq handler for a
++   gpio_chip from a parent IRQ and passes the struct gpio_chip* as handler
++   data. (Notice handler data, since the irqchip data is likely used by the
++   parent irqchip!).
++ 
++ * gpiochip_set_nested_irqchip(): sets up a nested irq handler for a
++   gpio_chip from a parent IRQ. As the parent IRQ has usually been
++   explicitly requested by the driver, this does very little more than
++   mark all the child IRQs as having the other IRQ as parent.
++ 
++ If there is a need to exclude certain GPIOs from the IRQ domain, you can
++ set .irq_need_valid_mask of the gpiochip before gpiochip_add_data() is
++ called. This allocates an .irq_valid_mask with as many bits set as there
++ are GPIOs in the chip. Drivers can exclude GPIOs by clearing bits from this
++ mask. The mask must be filled in before gpiochip_irqchip_add() or
++ gpiochip_irqchip_add_nested() is called.
++ 
++ To use the helpers please keep the following in mind:
++ 
++ - Make sure to assign all relevant members of the struct gpio_chip so that
++   the irqchip can initialize. E.g. .dev and .can_sleep shall be set up
++   properly.
++ 
++ - Nominally set all handlers to handle_bad_irq() in the setup call and pass
++   handle_bad_irq() as flow handler parameter in gpiochip_irqchip_add() if it is
++   expected for GPIO driver that irqchip .set_type() callback have to be called
++   before using/enabling GPIO IRQ. Then set the handler to handle_level_irq()
++   and/or handle_edge_irq() in the irqchip .set_type() callback depending on
++   what your controller supports.
++ 
++ It is legal for any IRQ consumer to request an IRQ from any irqchip no matter
++ if that is a combined GPIO+IRQ driver. The basic premise is that gpio_chip and
++ irq_chip are orthogonal, and offering their services independent of each
++ other.
++ 
++ gpiod_to_irq() is just a convenience function to figure out the IRQ for a
++ certain GPIO line and should not be relied upon to have been called before
++ the IRQ is used.
++ 
++ So always prepare the hardware and make it ready for action in respective
++ callbacks from the GPIO and irqchip APIs. Do not rely on gpiod_to_irq() having
++ been called first.
++ 
++ This orthogonality leads to ambiguities that we need to solve: if there is
++ competition inside the subsystem which side is using the resource (a certain
++ GPIO line and register for example) it needs to deny certain operations and
++ keep track of usage inside of the gpiolib subsystem. This is why the API
++ below exists.
++ 
++ 
+++>>>>>>> 2956b5d94a76 (pinctrl / gpio: Introduce .set_config() callback for GPIO chips)
+  Locking IRQ usage
+  -----------------
+  Input GPIOs can be used as IRQ signals. When this happens, a driver is requested
+diff --cc drivers/gpio/gpio-ep93xx.c
+index 56b98eebe1fc,45d384039e9b..000000000000
+--- a/drivers/gpio/gpio-ep93xx.c
++++ b/drivers/gpio/gpio-ep93xx.c
+@@@ -329,15 -336,15 +334,20 @@@ static int ep93xx_gpio_add_bank(struct 
+  	if (err)
+  		return err;
+  
+ -	gc->label = bank->label;
+ -	gc->base = bank->base;
+ +	bgc->gc.label = bank->label;
+ +	bgc->gc.base = bank->base;
+  
+  	if (bank->has_debounce) {
+++<<<<<<< HEAD
+ +		bgc->gc.set_debounce = ep93xx_gpio_set_debounce;
+ +		bgc->gc.to_irq = ep93xx_gpio_to_irq;
+++=======
++ 		gc->set_config = ep93xx_gpio_set_config;
++ 		gc->to_irq = ep93xx_gpio_to_irq;
+++>>>>>>> 2956b5d94a76 (pinctrl / gpio: Introduce .set_config() callback for GPIO chips)
+  	}
+  
+ -	return devm_gpiochip_add_data(dev, gc, NULL);
+ +	return gpiochip_add(&bgc->gc);
+  }
+  
+  static int ep93xx_gpio_probe(struct platform_device *pdev)
+diff --cc drivers/gpio/gpio-omap.c
+index 54052125859a,efc85a279d54..000000000000
+--- a/drivers/gpio/gpio-omap.c
++++ b/drivers/gpio/gpio-omap.c
+@@@ -990,7 -974,19 +990,23 @@@ static int gpio_debounce(struct gpio_ch
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static void gpio_set(struct gpio_chip *chip, unsigned offset, int value)
+++=======
++ static int omap_gpio_set_config(struct gpio_chip *chip, unsigned offset,
++ 				unsigned long config)
++ {
++ 	u32 debounce;
++ 
++ 	if (pinconf_to_config_param(config) != PIN_CONFIG_INPUT_DEBOUNCE)
++ 		return -ENOTSUPP;
++ 
++ 	debounce = pinconf_to_config_argument(config);
++ 	return omap_gpio_debounce(chip, offset, debounce);
++ }
++ 
++ static void omap_gpio_set(struct gpio_chip *chip, unsigned offset, int value)
+++>>>>>>> 2956b5d94a76 (pinctrl / gpio: Introduce .set_config() callback for GPIO chips)
+  {
+  	struct gpio_bank *bank;
+  	unsigned long flags;
+@@@ -1092,12 -1053,12 +1108,21 @@@ static void omap_gpio_chip_init(struct 
+  	 */
+  	bank->chip.request = omap_gpio_request;
+  	bank->chip.free = omap_gpio_free;
+++<<<<<<< HEAD
+ +	bank->chip.direction_input = gpio_input;
+ +	bank->chip.get = gpio_get;
+ +	bank->chip.direction_output = gpio_output;
+ +	bank->chip.set_debounce = gpio_debounce;
+ +	bank->chip.set = gpio_set;
+ +	bank->chip.to_irq = omap_gpio_to_irq;
+++=======
++ 	bank->chip.get_direction = omap_gpio_get_direction;
++ 	bank->chip.direction_input = omap_gpio_input;
++ 	bank->chip.get = omap_gpio_get;
++ 	bank->chip.direction_output = omap_gpio_output;
++ 	bank->chip.set_config = omap_gpio_set_config;
++ 	bank->chip.set = omap_gpio_set;
+++>>>>>>> 2956b5d94a76 (pinctrl / gpio: Introduce .set_config() callback for GPIO chips)
+  	if (bank->is_mpuio) {
+  		bank->chip.label = "mpuio";
+  		if (bank->regs->wkup_en)
+diff --cc drivers/gpio/gpio-tc3589x.c
+index d34d80dfb083,433b45ef332e..000000000000
+--- a/drivers/gpio/gpio-tc3589x.c
++++ b/drivers/gpio/gpio-tc3589x.c
+@@@ -85,49 -74,81 +85,85 @@@ static int tc3589x_gpio_direction_outpu
+  }
+  
+  static int tc3589x_gpio_direction_input(struct gpio_chip *chip,
+ -					unsigned int offset)
+ +					unsigned offset)
+  {
+ -	struct tc3589x_gpio *tc3589x_gpio = gpiochip_get_data(chip);
+ +	struct tc3589x_gpio *tc3589x_gpio = to_tc3589x_gpio(chip);
+  	struct tc3589x *tc3589x = tc3589x_gpio->tc3589x;
+  	u8 reg = TC3589x_GPIODIR0 + offset / 8;
+ -	unsigned int pos = offset % 8;
+ +	unsigned pos = offset % 8;
+  
+ -	return tc3589x_set_bits(tc3589x, reg, BIT(pos), 0);
+ +	return tc3589x_set_bits(tc3589x, reg, 1 << pos, 0);
+  }
+  
+ -static int tc3589x_gpio_get_direction(struct gpio_chip *chip,
+ -				      unsigned int offset)
+ +/**
+ + * tc3589x_gpio_irq_get_virq(): Map an interrupt on a chip to a virtual IRQ
+ + *
+ + * @tc3589x_gpio: tc3589x_gpio_irq controller to operate on.
+ + * @irq: index of the interrupt requested in the chip IRQs
+ + *
+ + * Useful for drivers to request their own IRQs.
+ + */
+ +static int tc3589x_gpio_irq_get_virq(struct tc3589x_gpio *tc3589x_gpio,
+ +				     int irq)
+  {
+ -	struct tc3589x_gpio *tc3589x_gpio = gpiochip_get_data(chip);
+ -	struct tc3589x *tc3589x = tc3589x_gpio->tc3589x;
+ -	u8 reg = TC3589x_GPIODIR0 + offset / 8;
+ -	unsigned int pos = offset % 8;
+ -	int ret;
+ -
+ -	ret = tc3589x_reg_read(tc3589x, reg);
+ -	if (ret < 0)
+ -		return ret;
+ +	if (!tc3589x_gpio)
+ +		return -EINVAL;
+  
+ -	return !(ret & BIT(pos));
+ +	return irq_create_mapping(tc3589x_gpio->domain, irq);
+  }
+  
+++<<<<<<< HEAD
+ +static int tc3589x_gpio_to_irq(struct gpio_chip *chip, unsigned offset)
+++=======
++ static int tc3589x_gpio_set_config(struct gpio_chip *chip, unsigned int offset,
++ 				   unsigned long config)
+++>>>>>>> 2956b5d94a76 (pinctrl / gpio: Introduce .set_config() callback for GPIO chips)
+  {
+ -	struct tc3589x_gpio *tc3589x_gpio = gpiochip_get_data(chip);
+ -	struct tc3589x *tc3589x = tc3589x_gpio->tc3589x;
+ -	/*
+ -	 * These registers are alterated at each second address
+ -	 * ODM bit 0 = drive to GND or Hi-Z (open drain)
+ -	 * ODM bit 1 = drive to VDD or Hi-Z (open source)
+ -	 */
+ -	u8 odmreg = TC3589x_GPIOODM0 + (offset / 8) * 2;
+ -	u8 odereg = TC3589x_GPIOODE0 + (offset / 8) * 2;
+ -	unsigned int pos = offset % 8;
+ -	int ret;
+ +	struct tc3589x_gpio *tc3589x_gpio = to_tc3589x_gpio(chip);
+  
+++<<<<<<< HEAD
+ +	return tc3589x_gpio_irq_get_virq(tc3589x_gpio, offset);
+++=======
++ 	switch (pinconf_to_config_param(config)) {
++ 	case PIN_CONFIG_DRIVE_OPEN_DRAIN:
++ 		/* Set open drain mode */
++ 		ret = tc3589x_set_bits(tc3589x, odmreg, BIT(pos), 0);
++ 		if (ret)
++ 			return ret;
++ 		/* Enable open drain/source mode */
++ 		return tc3589x_set_bits(tc3589x, odereg, BIT(pos), BIT(pos));
++ 	case PIN_CONFIG_DRIVE_OPEN_SOURCE:
++ 		/* Set open source mode */
++ 		ret = tc3589x_set_bits(tc3589x, odmreg, BIT(pos), BIT(pos));
++ 		if (ret)
++ 			return ret;
++ 		/* Enable open drain/source mode */
++ 		return tc3589x_set_bits(tc3589x, odereg, BIT(pos), BIT(pos));
++ 	case PIN_CONFIG_DRIVE_PUSH_PULL:
++ 		/* Disable open drain/source mode */
++ 		return tc3589x_set_bits(tc3589x, odereg, BIT(pos), 0);
++ 	default:
++ 		break;
++ 	}
++ 	return -ENOTSUPP;
+++>>>>>>> 2956b5d94a76 (pinctrl / gpio: Introduce .set_config() callback for GPIO chips)
+  }
+  
+ -static const struct gpio_chip template_chip = {
+ +static struct gpio_chip template_chip = {
+  	.label			= "tc3589x",
+  	.owner			= THIS_MODULE,
+ +	.direction_input	= tc3589x_gpio_direction_input,
+++<<<<<<< HEAD
+  	.get			= tc3589x_gpio_get,
+ -	.set			= tc3589x_gpio_set,
+  	.direction_output	= tc3589x_gpio_direction_output,
+ -	.direction_input	= tc3589x_gpio_direction_input,
+ +	.set			= tc3589x_gpio_set,
+ +	.to_irq			= tc3589x_gpio_to_irq,
+ +	.can_sleep		= 1,
+++=======
++ 	.get_direction		= tc3589x_gpio_get_direction,
++ 	.set_config		= tc3589x_gpio_set_config,
++ 	.can_sleep		= true,
+++>>>>>>> 2956b5d94a76 (pinctrl / gpio: Introduce .set_config() callback for GPIO chips)
+  };
+  
+  static int tc3589x_gpio_irq_set_type(struct irq_data *d, unsigned int type)
+diff --cc drivers/gpio/gpio-tegra.c
+index 9a62672f1bed,88529d3c06c9..000000000000
+--- a/drivers/gpio/gpio-tegra.c
++++ b/drivers/gpio/gpio-tegra.c
+@@@ -159,28 -238,32 +159,40 @@@ static int tegra_gpio_direction_output(
+  	return 0;
+  }
+  
++ static int tegra_gpio_set_config(struct gpio_chip *chip, unsigned int offset,
++ 				 unsigned long config)
++ {
++ 	u32 debounce;
++ 
++ 	if (pinconf_to_config_param(config) != PIN_CONFIG_INPUT_DEBOUNCE)
++ 		return -ENOTSUPP;
++ 
++ 	debounce = pinconf_to_config_argument(config);
++ 	return tegra_gpio_set_debounce(chip, offset, debounce);
++ }
++ 
+  static int tegra_gpio_to_irq(struct gpio_chip *chip, unsigned offset)
+  {
+ -	struct tegra_gpio_info *tgi = gpiochip_get_data(chip);
+ -
+ -	return irq_find_mapping(tgi->irq_domain, offset);
+ +	return irq_find_mapping(irq_domain, offset);
+  }
+  
+ +static struct gpio_chip tegra_gpio_chip = {
+ +	.label			= "tegra-gpio",
+ +	.request		= tegra_gpio_request,
+ +	.free			= tegra_gpio_free,
+ +	.direction_input	= tegra_gpio_direction_input,
+ +	.get			= tegra_gpio_get,
+ +	.direction_output	= tegra_gpio_direction_output,
+ +	.set			= tegra_gpio_set,
+ +	.to_irq			= tegra_gpio_to_irq,
+ +	.base			= 0,
+ +};
+ +
+  static void tegra_gpio_irq_ack(struct irq_data *d)
+  {
+ -	struct tegra_gpio_bank *bank = irq_data_get_irq_chip_data(d);
+ -	struct tegra_gpio_info *tgi = bank->tgi;
+  	int gpio = d->hwirq;
+  
+ -	tegra_gpio_writel(tgi, 1 << GPIO_BIT(gpio), GPIO_INT_CLR(tgi, gpio));
+ +	tegra_gpio_writel(1 << GPIO_BIT(gpio), GPIO_INT_CLR(gpio));
+  }
+  
+  static void tegra_gpio_irq_mask(struct irq_data *d)
+@@@ -434,23 -600,47 +446,34 @@@ static int tegra_gpio_probe(struct plat
+  		return -ENODEV;
+  	}
+  
+ -	tgi->gc.label			= "tegra-gpio";
+ -	tgi->gc.request			= tegra_gpio_request;
+ -	tgi->gc.free			= tegra_gpio_free;
+ -	tgi->gc.direction_input		= tegra_gpio_direction_input;
+ -	tgi->gc.get			= tegra_gpio_get;
+ -	tgi->gc.direction_output	= tegra_gpio_direction_output;
+ -	tgi->gc.set			= tegra_gpio_set;
+ -	tgi->gc.get_direction		= tegra_gpio_get_direction;
+ -	tgi->gc.to_irq			= tegra_gpio_to_irq;
+ -	tgi->gc.base			= 0;
+ -	tgi->gc.ngpio			= tgi->bank_count * 32;
+ -	tgi->gc.parent			= &pdev->dev;
+ -	tgi->gc.of_node			= pdev->dev.of_node;
+ -
+ -	tgi->ic.name			= "GPIO";
+ -	tgi->ic.irq_ack			= tegra_gpio_irq_ack;
+ -	tgi->ic.irq_mask		= tegra_gpio_irq_mask;
+ -	tgi->ic.irq_unmask		= tegra_gpio_irq_unmask;
+ -	tgi->ic.irq_set_type		= tegra_gpio_irq_set_type;
+ -	tgi->ic.irq_shutdown		= tegra_gpio_irq_shutdown;
+ -#ifdef CONFIG_PM_SLEEP
+ -	tgi->ic.irq_set_wake		= tegra_gpio_irq_set_wake;
+ -#endif
+ +	tegra_gpio_chip.ngpio = tegra_gpio_bank_count * 32;
+ +
+ +	tegra_gpio_banks = devm_kzalloc(&pdev->dev,
+ +			tegra_gpio_bank_count * sizeof(*tegra_gpio_banks),
+ +			GFP_KERNEL);
+ +	if (!tegra_gpio_banks) {
+ +		dev_err(&pdev->dev, "Couldn't allocate bank structure\n");
+ +		return -ENODEV;
+ +	}
+  
+++<<<<<<< HEAD
+ +	irq_domain = irq_domain_add_linear(pdev->dev.of_node,
+ +					   tegra_gpio_chip.ngpio,
+ +					   &irq_domain_simple_ops, NULL);
+ +	if (!irq_domain)
+++=======
++ 	platform_set_drvdata(pdev, tgi);
++ 
++ 	if (config->debounce_supported)
++ 		tgi->gc.set_config = tegra_gpio_set_config;
++ 
++ 	tgi->bank_info = devm_kzalloc(&pdev->dev, tgi->bank_count *
++ 				      sizeof(*tgi->bank_info), GFP_KERNEL);
++ 	if (!tgi->bank_info)
+++>>>>>>> 2956b5d94a76 (pinctrl / gpio: Introduce .set_config() callback for GPIO chips)
+  		return -ENODEV;
+  
+ -	tgi->irq_domain = irq_domain_add_linear(pdev->dev.of_node,
+ -						tgi->gc.ngpio,
+ -						&irq_domain_simple_ops, NULL);
+ -	if (!tgi->irq_domain)
+ -		return -ENODEV;
+ -
+ -	for (i = 0; i < tgi->bank_count; i++) {
+ +	for (i = 0; i < tegra_gpio_bank_count; i++) {
+  		res = platform_get_resource(pdev, IORESOURCE_IRQ, i);
+  		if (!res) {
+  			dev_err(&pdev->dev, "Missing IRQ resource\n");
+diff --cc drivers/gpio/gpio-vx855.c
+index 2b7252cb2427,98a6f1fcc561..000000000000
+--- a/drivers/gpio/gpio-vx855.c
++++ b/drivers/gpio/gpio-vx855.c
+@@@ -188,6 -186,29 +188,32 @@@ static int vx855gpio_direction_output(s
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int vx855gpio_set_config(struct gpio_chip *gpio, unsigned int nr,
++ 				unsigned long config)
++ {
++ 	enum pin_config_param param = pinconf_to_config_param(config);
++ 
++ 	/* The GPI cannot be single-ended */
++ 	if (nr < NR_VX855_GPI)
++ 		return -EINVAL;
++ 
++ 	/* The GPO's are push-pull */
++ 	if (nr < NR_VX855_GPInO) {
++ 		if (param != PIN_CONFIG_DRIVE_PUSH_PULL)
++ 			return -ENOTSUPP;
++ 		return 0;
++ 	}
++ 
++ 	/* The GPIO's are open drain */
++ 	if (param != PIN_CONFIG_DRIVE_OPEN_DRAIN)
++ 		return -ENOTSUPP;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 2956b5d94a76 (pinctrl / gpio: Introduce .set_config() callback for GPIO chips)
+  static const char *vx855gpio_names[NR_VX855_GP] = {
+  	"VX855_GPI0", "VX855_GPI1", "VX855_GPI2", "VX855_GPI3", "VX855_GPI4",
+  	"VX855_GPI5", "VX855_GPI6", "VX855_GPI7", "VX855_GPI8", "VX855_GPI9",
+@@@ -211,6 -232,7 +237,10 @@@ static void vx855gpio_gpio_setup(struc
+  	c->direction_output = vx855gpio_direction_output;
+  	c->get = vx855gpio_get;
+  	c->set = vx855gpio_set;
+++<<<<<<< HEAD
+++=======
++ 	c->set_config = vx855gpio_set_config,
+++>>>>>>> 2956b5d94a76 (pinctrl / gpio: Introduce .set_config() callback for GPIO chips)
+  	c->dbg_show = NULL;
+  	c->base = 0;
+  	c->ngpio = NR_VX855_GP;
+diff --cc drivers/gpio/gpio-wm831x.c
+index 2a743e10ecb6,00e3839b3f96..000000000000
+--- a/drivers/gpio/gpio-wm831x.c
++++ b/drivers/gpio/gpio-wm831x.c
+@@@ -106,11 -101,9 +106,14 @@@ static int wm831x_gpio_to_irq(struct gp
+  				  WM831X_IRQ_GPIO_1 + offset);
+  }
+  
+- static int wm831x_gpio_set_debounce(struct gpio_chip *chip, unsigned offset,
++ static int wm831x_gpio_set_debounce(struct wm831x *wm831x, unsigned offset,
+  				    unsigned debounce)
+  {
+++<<<<<<< HEAD
+ +	struct wm831x_gpio *wm831x_gpio = to_wm831x_gpio(chip);
+ +	struct wm831x *wm831x = wm831x_gpio->wm831x;
+++=======
+++>>>>>>> 2956b5d94a76 (pinctrl / gpio: Introduce .set_config() callback for GPIO chips)
+  	int reg = WM831X_GPIO1_CONTROL + offset;
+  	int ret, fn;
+  
+@@@ -137,6 -130,30 +140,33 @@@
+  	return wm831x_set_bits(wm831x, reg, WM831X_GPN_FN_MASK, fn);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int wm831x_set_config(struct gpio_chip *chip, unsigned int offset,
++ 			     unsigned long config)
++ {
++ 	struct wm831x_gpio *wm831x_gpio = gpiochip_get_data(chip);
++ 	struct wm831x *wm831x = wm831x_gpio->wm831x;
++ 	int reg = WM831X_GPIO1_CONTROL + offset;
++ 
++ 	switch (pinconf_to_config_param(config)) {
++ 	case PIN_CONFIG_DRIVE_OPEN_DRAIN:
++ 		return wm831x_set_bits(wm831x, reg,
++ 				       WM831X_GPN_OD_MASK, WM831X_GPN_OD);
++ 	case PIN_CONFIG_DRIVE_PUSH_PULL:
++ 		return wm831x_set_bits(wm831x, reg,
++ 				       WM831X_GPN_OD_MASK, 0);
++ 	case PIN_CONFIG_INPUT_DEBOUNCE:
++ 		return wm831x_gpio_set_debounce(wm831x, offset,
++ 			pinconf_to_config_argument(config));
++ 	default:
++ 		break;
++ 	}
++ 
++ 	return -ENOTSUPP;
++ }
++ 
+++>>>>>>> 2956b5d94a76 (pinctrl / gpio: Introduce .set_config() callback for GPIO chips)
+  #ifdef CONFIG_DEBUG_FS
+  static void wm831x_gpio_dbg_show(struct seq_file *s, struct gpio_chip *chip)
+  {
+@@@ -238,9 -255,9 +268,13 @@@ static struct gpio_chip template_chip 
+  	.direction_output	= wm831x_gpio_direction_out,
+  	.set			= wm831x_gpio_set,
+  	.to_irq			= wm831x_gpio_to_irq,
+++<<<<<<< HEAD
+ +	.set_debounce		= wm831x_gpio_set_debounce,
+++=======
++ 	.set_config		= wm831x_set_config,
+++>>>>>>> 2956b5d94a76 (pinctrl / gpio: Introduce .set_config() callback for GPIO chips)
+  	.dbg_show		= wm831x_gpio_dbg_show,
+ -	.can_sleep		= true,
+ +	.can_sleep		= 1,
+  };
+  
+  static int wm831x_gpio_probe(struct platform_device *pdev)
+diff --cc drivers/gpio/gpio-wm8994.c
+index ae409fd94af7,1e35756ac55b..000000000000
+--- a/drivers/gpio/gpio-wm8994.c
++++ b/drivers/gpio/gpio-wm8994.c
+@@@ -108,9 -103,30 +108,33 @@@ static void wm8994_gpio_set(struct gpio
+  	wm8994_set_bits(wm8994, WM8994_GPIO_1 + offset, WM8994_GPN_LVL, value);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int wm8994_gpio_set_config(struct gpio_chip *chip, unsigned int offset,
++ 				  unsigned long config)
++ {
++ 	struct wm8994_gpio *wm8994_gpio = gpiochip_get_data(chip);
++ 	struct wm8994 *wm8994 = wm8994_gpio->wm8994;
++ 
++ 	switch (pinconf_to_config_param(config)) {
++ 	case PIN_CONFIG_DRIVE_OPEN_DRAIN:
++ 		return wm8994_set_bits(wm8994, WM8994_GPIO_1 + offset,
++ 				       WM8994_GPN_OP_CFG_MASK,
++ 				       WM8994_GPN_OP_CFG);
++ 	case PIN_CONFIG_DRIVE_PUSH_PULL:
++ 		return wm8994_set_bits(wm8994, WM8994_GPIO_1 + offset,
++ 				       WM8994_GPN_OP_CFG_MASK, 0);
++ 	default:
++ 		break;
++ 	}
++ 
++ 	return -ENOTSUPP;
++ }
++ 
+++>>>>>>> 2956b5d94a76 (pinctrl / gpio: Introduce .set_config() callback for GPIO chips)
+  static int wm8994_gpio_to_irq(struct gpio_chip *chip, unsigned offset)
+  {
+ -	struct wm8994_gpio *wm8994_gpio = gpiochip_get_data(chip);
+ +	struct wm8994_gpio *wm8994_gpio = to_wm8994_gpio(chip);
+  	struct wm8994 *wm8994 = wm8994_gpio->wm8994;
+  
+  	return regmap_irq_get_virq(wm8994->irq_data, offset);
+@@@ -240,9 -256,10 +264,13 @@@ static struct gpio_chip template_chip 
+  	.get			= wm8994_gpio_get,
+  	.direction_output	= wm8994_gpio_direction_out,
+  	.set			= wm8994_gpio_set,
+++<<<<<<< HEAD
+++=======
++ 	.set_config		= wm8994_gpio_set_config,
+++>>>>>>> 2956b5d94a76 (pinctrl / gpio: Introduce .set_config() callback for GPIO chips)
+  	.to_irq			= wm8994_gpio_to_irq,
+  	.dbg_show		= wm8994_gpio_dbg_show,
+ -	.can_sleep		= true,
+ +	.can_sleep		= 1,
+  };
+  
+  static int wm8994_gpio_probe(struct platform_device *pdev)
+diff --cc drivers/gpio/gpiolib.c
+index 927a1d077837,b1659860be1a..000000000000
+--- a/drivers/gpio/gpiolib.c
++++ b/drivers/gpio/gpiolib.c
+@@@ -1704,6 -1848,47 +1704,44 @@@ static void gpiochip_irqchip_remove(str
+  
+  #endif /* CONFIG_GPIOLIB_IRQCHIP */
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * gpiochip_generic_request() - request the gpio function for a pin
++  * @chip: the gpiochip owning the GPIO
++  * @offset: the offset of the GPIO to request for GPIO function
++  */
++ int gpiochip_generic_request(struct gpio_chip *chip, unsigned offset)
++ {
++ 	return pinctrl_request_gpio(chip->gpiodev->base + offset);
++ }
++ EXPORT_SYMBOL_GPL(gpiochip_generic_request);
++ 
++ /**
++  * gpiochip_generic_free() - free the gpio function from a pin
++  * @chip: the gpiochip to request the gpio function for
++  * @offset: the offset of the GPIO to free from GPIO function
++  */
++ void gpiochip_generic_free(struct gpio_chip *chip, unsigned offset)
++ {
++ 	pinctrl_free_gpio(chip->gpiodev->base + offset);
++ }
++ EXPORT_SYMBOL_GPL(gpiochip_generic_free);
++ 
++ /**
++  * gpiochip_generic_config() - apply configuration for a pin
++  * @chip: the gpiochip owning the GPIO
++  * @offset: the offset of the GPIO to apply the configuration
++  * @config: the configuration to be applied
++  */
++ int gpiochip_generic_config(struct gpio_chip *chip, unsigned offset,
++ 			    unsigned long config)
++ {
++ 	return pinctrl_gpio_set_config(chip->gpiodev->base + offset, config);
++ }
++ EXPORT_SYMBOL_GPL(gpiochip_generic_config);
++ 
+++>>>>>>> 2956b5d94a76 (pinctrl / gpio: Introduce .set_config() callback for GPIO chips)
+  #ifdef CONFIG_PINCTRL
+  
+  /**
+@@@ -2125,27 -2277,19 +2163,39 @@@ fail
+  }
+  EXPORT_SYMBOL_GPL(gpiod_direction_input);
+  
+++<<<<<<< HEAD
+ +/**
+ + * gpiod_direction_output - set the GPIO direction to input
+ + * @desc:	GPIO to set to output
+ + * @value:	initial output value of the GPIO
+ + *
+ + * Set the direction of the passed GPIO to output, such as gpiod_set_value() can
+ + * be called safely on it. The initial value of the output must be specified.
+ + *
+ + * Return 0 in case of success, else an error code.
+ + */
+ +int gpiod_direction_output(struct gpio_desc *desc, int value)
+++=======
++ static int gpio_set_drive_single_ended(struct gpio_chip *gc, unsigned offset,
++ 				       enum pin_config_param mode)
++ {
++ 	unsigned long config = { PIN_CONF_PACKED(mode, 0) };
++ 
++ 	return gc->set_config ? gc->set_config(gc, offset, config) : -ENOTSUPP;
++ }
++ 
++ static int _gpiod_direction_output_raw(struct gpio_desc *desc, int value)
+++>>>>>>> 2956b5d94a76 (pinctrl / gpio: Introduce .set_config() callback for GPIO chips)
+  {
+ -	struct gpio_chip *gc = desc->gdev->chip;
+ -	int val = !!value;
+ -	int ret;
+ +	unsigned long		flags;
+ +	struct gpio_chip	*chip;
+ +	int			status = -EINVAL;
+ +	int offset;
+ +
+ +	if (!desc || !desc->chip) {
+ +		pr_warn("%s: invalid GPIO\n", __func__);
+ +		return -EINVAL;
+ +	}
+  
+  	/* GPIOs used for IRQs shall not be set as output */
+  	if (test_bit(FLAG_USED_AS_IRQ, &desc->flags)) {
+@@@ -2155,16 -2299,31 +2205,41 @@@
+  		return -EIO;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* Open drain pin should not be driven to 1 */
+ +	if (value && test_bit(FLAG_OPEN_DRAIN,  &desc->flags))
+ +		return gpiod_direction_input(desc);
+++=======
++ 	if (test_bit(FLAG_OPEN_DRAIN, &desc->flags)) {
++ 		/* First see if we can enable open drain in hardware */
++ 		ret = gpio_set_drive_single_ended(gc, gpio_chip_hwgpio(desc),
++ 						  PIN_CONFIG_DRIVE_OPEN_DRAIN);
++ 		if (!ret)
++ 			goto set_output_value;
++ 		/* Emulate open drain by not actively driving the line high */
++ 		if (val)
++ 			return gpiod_direction_input(desc);
++ 	}
++ 	else if (test_bit(FLAG_OPEN_SOURCE, &desc->flags)) {
++ 		ret = gpio_set_drive_single_ended(gc, gpio_chip_hwgpio(desc),
++ 						  PIN_CONFIG_DRIVE_OPEN_SOURCE);
++ 		if (!ret)
++ 			goto set_output_value;
++ 		/* Emulate open source by not actively driving the line low */
++ 		if (!val)
++ 			return gpiod_direction_input(desc);
++ 	} else {
++ 		gpio_set_drive_single_ended(gc, gpio_chip_hwgpio(desc),
++ 					    PIN_CONFIG_DRIVE_PUSH_PULL);
++ 	}
+++>>>>>>> 2956b5d94a76 (pinctrl / gpio: Introduce .set_config() callback for GPIO chips)
+  
+ -set_output_value:
+ -	if (!gc->set || !gc->direction_output) {
+ +	/* Open source pin should not be driven to 0 */
+ +	if (!value && test_bit(FLAG_OPEN_SOURCE,  &desc->flags))
+ +		return gpiod_direction_input(desc);
+ +
+ +	chip = desc->chip;
+ +	if (!chip->set || !chip->direction_output) {
+  		gpiod_warn(desc,
+  		       "%s: missing set() or direction_output() operations\n",
+  		       __func__);
+@@@ -2221,45 -2389,20 +2296,58 @@@ EXPORT_SYMBOL_GPL(gpiod_direction_outpu
+   */
+  int gpiod_set_debounce(struct gpio_desc *desc, unsigned debounce)
+  {
+ +	unsigned long		flags;
+  	struct gpio_chip	*chip;
+++<<<<<<< HEAD
+ +	int			status = -EINVAL;
+ +	int			offset;
+ +
+ +	if (!desc || !desc->chip) {
+ +		pr_warn("%s: invalid GPIO\n", __func__);
+ +		return -EINVAL;
+ +	}
+ +
+ +	chip = desc->chip;
+ +	if (!chip->set || !chip->set_debounce) {
+++=======
++ 	unsigned long		config;
++ 
++ 	VALIDATE_DESC(desc);
++ 	chip = desc->gdev->chip;
++ 	if (!chip->set || !chip->set_config) {
+++>>>>>>> 2956b5d94a76 (pinctrl / gpio: Introduce .set_config() callback for GPIO chips)
+  		gpiod_dbg(desc,
+- 			  "%s: missing set() or set_debounce() operations\n",
++ 			  "%s: missing set() or set_config() operations\n",
+  			  __func__);
+  		return -ENOTSUPP;
+  	}
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&gpio_lock, flags);
+ +
+ +	status = gpio_ensure_requested(desc);
+ +	if (status < 0)
+ +		goto fail;
+ +
+ +	/* now we know the gpio is valid and chip won't vanish */
+ +
+ +	spin_unlock_irqrestore(&gpio_lock, flags);
+ +
+ +	might_sleep_if(chip->can_sleep);
+ +
+ +	offset = gpio_chip_hwgpio(desc);
+ +	return chip->set_debounce(chip, offset, debounce);
+ +
+ +fail:
+ +	spin_unlock_irqrestore(&gpio_lock, flags);
+ +	if (status)
+ +		gpiod_dbg(desc, "%s: status %d\n", __func__, status);
+ +
+ +	return status;
+++=======
++ 	config = pinconf_to_config_packed(PIN_CONFIG_INPUT_DEBOUNCE, debounce);
++ 	return chip->set_config(chip, gpio_chip_hwgpio(desc), config);
+++>>>>>>> 2956b5d94a76 (pinctrl / gpio: Introduce .set_config() callback for GPIO chips)
+  }
+  EXPORT_SYMBOL_GPL(gpiod_set_debounce);
+  
+diff --cc drivers/usb/serial/cp210x.c
+index 1661a127f1a5,5d61d0871f2e..000000000000
+--- a/drivers/usb/serial/cp210x.c
++++ b/drivers/usb/serial/cp210x.c
+@@@ -1101,6 -1260,188 +1101,191 @@@ static void cp210x_break_ctl(struct tty
+  	cp210x_write_u16_reg(port, CP210X_SET_BREAK, state);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_GPIOLIB
++ static int cp210x_gpio_request(struct gpio_chip *gc, unsigned int offset)
++ {
++ 	struct usb_serial *serial = gpiochip_get_data(gc);
++ 	struct cp210x_serial_private *priv = usb_get_serial_data(serial);
++ 
++ 	switch (offset) {
++ 	case 0:
++ 		if (priv->config & CP2105_GPIO0_TXLED_MODE)
++ 			return -ENODEV;
++ 		break;
++ 	case 1:
++ 		if (priv->config & (CP2105_GPIO1_RXLED_MODE |
++ 				    CP2105_GPIO1_RS485_MODE))
++ 			return -ENODEV;
++ 		break;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int cp210x_gpio_get(struct gpio_chip *gc, unsigned int gpio)
++ {
++ 	struct usb_serial *serial = gpiochip_get_data(gc);
++ 	int result;
++ 	u8 buf;
++ 
++ 	result = cp210x_read_vendor_block(serial, REQTYPE_INTERFACE_TO_HOST,
++ 					  CP210X_READ_LATCH, &buf, sizeof(buf));
++ 	if (result < 0)
++ 		return result;
++ 
++ 	return !!(buf & BIT(gpio));
++ }
++ 
++ static void cp210x_gpio_set(struct gpio_chip *gc, unsigned int gpio, int value)
++ {
++ 	struct usb_serial *serial = gpiochip_get_data(gc);
++ 	struct cp210x_gpio_write buf;
++ 
++ 	if (value == 1)
++ 		buf.state = BIT(gpio);
++ 	else
++ 		buf.state = 0;
++ 
++ 	buf.mask = BIT(gpio);
++ 
++ 	cp210x_write_vendor_block(serial, REQTYPE_HOST_TO_INTERFACE,
++ 				  CP210X_WRITE_LATCH, &buf, sizeof(buf));
++ }
++ 
++ static int cp210x_gpio_direction_get(struct gpio_chip *gc, unsigned int gpio)
++ {
++ 	/* Hardware does not support an input mode */
++ 	return 0;
++ }
++ 
++ static int cp210x_gpio_direction_input(struct gpio_chip *gc, unsigned int gpio)
++ {
++ 	/* Hardware does not support an input mode */
++ 	return -ENOTSUPP;
++ }
++ 
++ static int cp210x_gpio_direction_output(struct gpio_chip *gc, unsigned int gpio,
++ 					int value)
++ {
++ 	return 0;
++ }
++ 
++ static int cp210x_gpio_set_config(struct gpio_chip *gc, unsigned int gpio,
++ 				  unsigned long config)
++ {
++ 	struct usb_serial *serial = gpiochip_get_data(gc);
++ 	struct cp210x_serial_private *priv = usb_get_serial_data(serial);
++ 	enum pin_config_param param = pinconf_to_config_param(config);
++ 
++ 	/* Succeed only if in correct mode (this can't be set at runtime) */
++ 	if ((param == PIN_CONFIG_DRIVE_PUSH_PULL) &&
++ 	    (priv->gpio_mode & BIT(gpio)))
++ 		return 0;
++ 
++ 	if ((param == PIN_CONFIG_DRIVE_OPEN_DRAIN) &&
++ 	    !(priv->gpio_mode & BIT(gpio)))
++ 		return 0;
++ 
++ 	return -ENOTSUPP;
++ }
++ 
++ /*
++  * This function is for configuring GPIO using shared pins, where other signals
++  * are made unavailable by configuring the use of GPIO. This is believed to be
++  * only applicable to the cp2105 at this point, the other devices supported by
++  * this driver that provide GPIO do so in a way that does not impact other
++  * signals and are thus expected to have very different initialisation.
++  */
++ static int cp2105_shared_gpio_init(struct usb_serial *serial)
++ {
++ 	struct cp210x_serial_private *priv = usb_get_serial_data(serial);
++ 	struct cp210x_pin_mode mode;
++ 	struct cp210x_config config;
++ 	u8 intf_num = cp210x_interface_num(serial);
++ 	int result;
++ 
++ 	result = cp210x_read_vendor_block(serial, REQTYPE_DEVICE_TO_HOST,
++ 					  CP210X_GET_DEVICEMODE, &mode,
++ 					  sizeof(mode));
++ 	if (result < 0)
++ 		return result;
++ 
++ 	result = cp210x_read_vendor_block(serial, REQTYPE_DEVICE_TO_HOST,
++ 					  CP210X_GET_PORTCONFIG, &config,
++ 					  sizeof(config));
++ 	if (result < 0)
++ 		return result;
++ 
++ 	/*  2 banks of GPIO - One for the pins taken from each serial port */
++ 	if (intf_num == 0) {
++ 		if (mode.eci == CP210X_PIN_MODE_MODEM)
++ 			return 0;
++ 
++ 		priv->config = config.eci_cfg;
++ 		priv->gpio_mode = (u8)((le16_to_cpu(config.gpio_mode) &
++ 						CP210X_ECI_GPIO_MODE_MASK) >>
++ 						CP210X_ECI_GPIO_MODE_OFFSET);
++ 		priv->gc.ngpio = 2;
++ 	} else if (intf_num == 1) {
++ 		if (mode.sci == CP210X_PIN_MODE_MODEM)
++ 			return 0;
++ 
++ 		priv->config = config.sci_cfg;
++ 		priv->gpio_mode = (u8)((le16_to_cpu(config.gpio_mode) &
++ 						CP210X_SCI_GPIO_MODE_MASK) >>
++ 						CP210X_SCI_GPIO_MODE_OFFSET);
++ 		priv->gc.ngpio = 3;
++ 	} else {
++ 		return -ENODEV;
++ 	}
++ 
++ 	priv->gc.label = "cp210x";
++ 	priv->gc.request = cp210x_gpio_request;
++ 	priv->gc.get_direction = cp210x_gpio_direction_get;
++ 	priv->gc.direction_input = cp210x_gpio_direction_input;
++ 	priv->gc.direction_output = cp210x_gpio_direction_output;
++ 	priv->gc.get = cp210x_gpio_get;
++ 	priv->gc.set = cp210x_gpio_set;
++ 	priv->gc.set_config = cp210x_gpio_set_config;
++ 	priv->gc.owner = THIS_MODULE;
++ 	priv->gc.parent = &serial->interface->dev;
++ 	priv->gc.base = -1;
++ 	priv->gc.can_sleep = true;
++ 
++ 	result = gpiochip_add_data(&priv->gc, serial);
++ 	if (!result)
++ 		priv->gpio_registered = true;
++ 
++ 	return result;
++ }
++ 
++ static void cp210x_gpio_remove(struct usb_serial *serial)
++ {
++ 	struct cp210x_serial_private *priv = usb_get_serial_data(serial);
++ 
++ 	if (priv->gpio_registered) {
++ 		gpiochip_remove(&priv->gc);
++ 		priv->gpio_registered = false;
++ 	}
++ }
++ 
++ #else
++ 
++ static int cp2105_shared_gpio_init(struct usb_serial *serial)
++ {
++ 	return 0;
++ }
++ 
++ static void cp210x_gpio_remove(struct usb_serial *serial)
++ {
++ 	/* Nothing to do */
++ }
++ 
++ #endif
++ 
+++>>>>>>> 2956b5d94a76 (pinctrl / gpio: Introduce .set_config() callback for GPIO chips)
+  static int cp210x_port_probe(struct usb_serial_port *port)
+  {
+  	struct usb_serial *serial = port->serial;
+diff --cc include/linux/gpio/driver.h
+index e61dc96b3e98,db2022910caf..000000000000
+--- a/include/linux/gpio/driver.h
++++ b/include/linux/gpio/driver.h
+@@@ -7,12 -6,18 +7,24 @@@
+  #include <linux/irq.h>
+  #include <linux/irqchip/chained_irq.h>
+  #include <linux/irqdomain.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/lockdep.h>
++ #include <linux/pinctrl/pinctrl.h>
++ #include <linux/pinctrl/pinconf-generic.h>
+++>>>>>>> 2956b5d94a76 (pinctrl / gpio: Introduce .set_config() callback for GPIO chips)
+  
+  struct gpio_desc;
+  struct of_phandle_args;
+  struct device_node;
+  struct seq_file;
+  struct gpio_device;
+++<<<<<<< HEAD
+++=======
++ struct module;
++ 
++ #ifdef CONFIG_GPIOLIB
+++>>>>>>> 2956b5d94a76 (pinctrl / gpio: Introduce .set_config() callback for GPIO chips)
+  
+  /**
+   * struct gpio_chip - abstract a GPIO controller
+@@@ -28,11 -34,11 +40,17 @@@
+   *	(same as GPIOF_DIR_XXX), or negative error
+   * @direction_input: configures signal "offset" as input, or returns error
+   * @direction_output: configures signal "offset" as output, or returns error
+ - * @get: returns value for signal "offset", 0=low, 1=high, or negative error
+ + * @get: returns value for signal "offset"; for output signals this
+ + *	returns either the value actually sensed, or zero
+   * @set: assigns output value for signal "offset"
+++<<<<<<< HEAD
+ + * @set_debounce: optional hook for setting debounce time for specified gpio in
+ + *      interrupt triggered gpio chips
+++=======
++  * @set_multiple: assigns output values for multiple signals defined by "mask"
++  * @set_config: optional hook for all kinds of settings. Uses the same
++  *	packed config format as generic pinconf.
+++>>>>>>> 2956b5d94a76 (pinctrl / gpio: Introduce .set_config() callback for GPIO chips)
+   * @to_irq: optional hook supporting non-static gpio_to_irq() mappings;
+   *	implementation may not sleep
+   * @dbg_show: optional routine to show contents in debugfs; default code
+@@@ -86,10 -128,12 +104,19 @@@ struct gpio_chip 
+  						unsigned offset);
+  	void			(*set)(struct gpio_chip *chip,
+  						unsigned offset, int value);
+++<<<<<<< HEAD
+ +	int			(*set_debounce)(struct gpio_chip *chip,
+ +						unsigned offset,
+ +						unsigned debounce);
+ +
+++=======
++ 	void			(*set_multiple)(struct gpio_chip *chip,
++ 						unsigned long *mask,
++ 						unsigned long *bits);
++ 	int			(*set_config)(struct gpio_chip *chip,
++ 					      unsigned offset,
++ 					      unsigned long config);
+++>>>>>>> 2956b5d94a76 (pinctrl / gpio: Introduce .set_config() callback for GPIO chips)
+  	int			(*to_irq)(struct gpio_chip *chip,
+  						unsigned offset);
+  
+@@@ -209,12 -247,109 +236,115 @@@ void gpiochip_set_chained_irqchip(struc
+  		int parent_irq,
+  		irq_flow_handler_t parent_handler);
+  
+ -void gpiochip_set_nested_irqchip(struct gpio_chip *gpiochip,
+ +int gpiochip_irqchip_add(struct gpio_chip *gpiochip,
+  		struct irq_chip *irqchip,
+ -		int parent_irq);
+ +		unsigned int first_irq,
+ +		irq_flow_handler_t handler,
+ +		unsigned int type);
+  
+++<<<<<<< HEAD
+ +#endif /* CONFIG_GPIO_IRQCHIP */
+++=======
++ int _gpiochip_irqchip_add(struct gpio_chip *gpiochip,
++ 			  struct irq_chip *irqchip,
++ 			  unsigned int first_irq,
++ 			  irq_flow_handler_t handler,
++ 			  unsigned int type,
++ 			  bool nested,
++ 			  struct lock_class_key *lock_key);
++ 
++ /* FIXME: I assume threaded IRQchips do not have the lockdep problem */
++ static inline int gpiochip_irqchip_add_nested(struct gpio_chip *gpiochip,
++ 			  struct irq_chip *irqchip,
++ 			  unsigned int first_irq,
++ 			  irq_flow_handler_t handler,
++ 			  unsigned int type)
++ {
++ 	return _gpiochip_irqchip_add(gpiochip, irqchip, first_irq,
++ 				     handler, type, true, NULL);
++ }
++ 
++ #ifdef CONFIG_LOCKDEP
++ #define gpiochip_irqchip_add(...)				\
++ (								\
++ 	({							\
++ 		static struct lock_class_key _key;		\
++ 		_gpiochip_irqchip_add(__VA_ARGS__, false, &_key); \
++ 	})							\
++ )
++ #else
++ #define gpiochip_irqchip_add(...)				\
++ 	_gpiochip_irqchip_add(__VA_ARGS__, false, NULL)
++ #endif
++ 
++ #endif /* CONFIG_GPIOLIB_IRQCHIP */
++ 
++ int gpiochip_generic_request(struct gpio_chip *chip, unsigned offset);
++ void gpiochip_generic_free(struct gpio_chip *chip, unsigned offset);
++ int gpiochip_generic_config(struct gpio_chip *chip, unsigned offset,
++ 			    unsigned long config);
++ 
++ #ifdef CONFIG_PINCTRL
++ 
++ /**
++  * struct gpio_pin_range - pin range controlled by a gpio chip
++  * @head: list for maintaining set of pin ranges, used internally
++  * @pctldev: pinctrl device which handles corresponding pins
++  * @range: actual range of pins controlled by a gpio controller
++  */
++ 
++ struct gpio_pin_range {
++ 	struct list_head node;
++ 	struct pinctrl_dev *pctldev;
++ 	struct pinctrl_gpio_range range;
++ };
++ 
++ int gpiochip_add_pin_range(struct gpio_chip *chip, const char *pinctl_name,
++ 			   unsigned int gpio_offset, unsigned int pin_offset,
++ 			   unsigned int npins);
++ int gpiochip_add_pingroup_range(struct gpio_chip *chip,
++ 			struct pinctrl_dev *pctldev,
++ 			unsigned int gpio_offset, const char *pin_group);
++ void gpiochip_remove_pin_ranges(struct gpio_chip *chip);
++ 
++ #else
++ 
++ static inline int
++ gpiochip_add_pin_range(struct gpio_chip *chip, const char *pinctl_name,
++ 		       unsigned int gpio_offset, unsigned int pin_offset,
++ 		       unsigned int npins)
++ {
++ 	return 0;
++ }
++ static inline int
++ gpiochip_add_pingroup_range(struct gpio_chip *chip,
++ 			struct pinctrl_dev *pctldev,
++ 			unsigned int gpio_offset, const char *pin_group)
++ {
++ 	return 0;
++ }
++ 
++ static inline void
++ gpiochip_remove_pin_ranges(struct gpio_chip *chip)
++ {
++ }
++ 
++ #endif /* CONFIG_PINCTRL */
++ 
++ struct gpio_desc *gpiochip_request_own_desc(struct gpio_chip *chip, u16 hwnum,
++ 					    const char *label);
++ void gpiochip_free_own_desc(struct gpio_desc *desc);
++ 
++ #else /* CONFIG_GPIOLIB */
++ 
++ static inline struct gpio_chip *gpiod_to_chip(const struct gpio_desc *desc)
++ {
++ 	/* GPIO can never have been requested */
++ 	WARN_ON(1);
++ 	return ERR_PTR(-ENODEV);
++ }
++ 
++ #endif /* CONFIG_GPIOLIB */
+++>>>>>>> 2956b5d94a76 (pinctrl / gpio: Introduce .set_config() callback for GPIO chips)
+  
+  #endif
+diff --cc include/linux/pinctrl/pinconf-generic.h
+index 6aa238096622,7620eb127cff..000000000000
+--- a/include/linux/pinctrl/pinconf-generic.h
++++ b/include/linux/pinctrl/pinconf-generic.h
+@@@ -12,14 -12,13 +12,8 @@@
+  #ifndef __LINUX_PINCTRL_PINCONF_GENERIC_H
+  #define __LINUX_PINCTRL_PINCONF_GENERIC_H
+  
+- /*
+-  * You shouldn't even be able to compile with these enums etc unless you're
+-  * using generic pin config. That is why this is defined out.
+-  */
+- #ifdef CONFIG_GENERIC_PINCONF
+- 
+  /**
+   * enum pin_config_param - possible pin configuration parameters
+ - * @PIN_CONFIG_BIAS_BUS_HOLD: the pin will be set to weakly latch so that it
+ - *	weakly drives the last value on a tristate bus, also known as a "bus
+ - *	holder", "bus keeper" or "repeater". This allows another device on the
+ - *	bus to change the value by driving the bus high or low and switching to
+ - *	tristate. The argument is ignored.
+   * @PIN_CONFIG_BIAS_DISABLE: disable any pin bias on the pin, a
+   *	transition from say pull-up to pull-down implies that you disable
+   *	pull-up in the process, this setting disables all biasing.
+@@@ -122,6 -140,73 +116,76 @@@ static inline unsigned long pinconf_to_
+  	return PIN_CONF_PACKED(param, argument);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_GENERIC_PINCONF
++ 
++ #ifdef CONFIG_DEBUG_FS
++ #define PCONFDUMP(a, b, c, d) {					\
++ 	.param = a, .display = b, .format = c, .has_arg = d	\
++ 	}
++ 
++ struct pin_config_item {
++ 	const enum pin_config_param param;
++ 	const char * const display;
++ 	const char * const format;
++ 	bool has_arg;
++ };
++ #endif /* CONFIG_DEBUG_FS */
++ 
++ #ifdef CONFIG_OF
++ 
++ #include <linux/device.h>
++ #include <linux/pinctrl/machine.h>
++ struct pinctrl_dev;
++ struct pinctrl_map;
++ 
++ struct pinconf_generic_params {
++ 	const char * const property;
++ 	enum pin_config_param param;
++ 	u32 default_value;
++ };
++ 
++ int pinconf_generic_dt_subnode_to_map(struct pinctrl_dev *pctldev,
++ 		struct device_node *np, struct pinctrl_map **map,
++ 		unsigned *reserved_maps, unsigned *num_maps,
++ 		enum pinctrl_map_type type);
++ int pinconf_generic_dt_node_to_map(struct pinctrl_dev *pctldev,
++ 		struct device_node *np_config, struct pinctrl_map **map,
++ 		unsigned *num_maps, enum pinctrl_map_type type);
++ void pinconf_generic_dt_free_map(struct pinctrl_dev *pctldev,
++ 		struct pinctrl_map *map, unsigned num_maps);
++ 
++ static inline int pinconf_generic_dt_node_to_map_group(
++ 		struct pinctrl_dev *pctldev, struct device_node *np_config,
++ 		struct pinctrl_map **map, unsigned *num_maps)
++ {
++ 	return pinconf_generic_dt_node_to_map(pctldev, np_config, map, num_maps,
++ 			PIN_MAP_TYPE_CONFIGS_GROUP);
++ }
++ 
++ static inline int pinconf_generic_dt_node_to_map_pin(
++ 		struct pinctrl_dev *pctldev, struct device_node *np_config,
++ 		struct pinctrl_map **map, unsigned *num_maps)
++ {
++ 	return pinconf_generic_dt_node_to_map(pctldev, np_config, map, num_maps,
++ 			PIN_MAP_TYPE_CONFIGS_PIN);
++ }
++ 
++ static inline int pinconf_generic_dt_node_to_map_all(
++ 		struct pinctrl_dev *pctldev, struct device_node *np_config,
++ 		struct pinctrl_map **map, unsigned *num_maps)
++ {
++ 	/*
++ 	 * passing the type as PIN_MAP_TYPE_INVALID causes the underlying parser
++ 	 * to infer the map type from the DT properties used.
++ 	 */
++ 	return pinconf_generic_dt_node_to_map(pctldev, np_config, map, num_maps,
++ 			PIN_MAP_TYPE_INVALID);
++ }
++ #endif
++ 
+++>>>>>>> 2956b5d94a76 (pinctrl / gpio: Introduce .set_config() callback for GPIO chips)
+  #endif /* CONFIG_GENERIC_PINCONF */
+  
+  #endif /* __LINUX_PINCTRL_PINCONF_GENERIC_H */
+* Unmerged path drivers/gpio/gpio-bcm-kona.c
+* Unmerged path drivers/gpio/gpio-dln2.c
+* Unmerged path drivers/gpio/gpio-dwapb.c
+* Unmerged path drivers/gpio/gpio-f7188x.c
+* Unmerged path drivers/gpio/gpio-lp873x.c
+* Unmerged path drivers/gpio/gpio-max77620.c
+* Unmerged path drivers/gpio/gpio-menz127.c
+* Unmerged path drivers/gpio/gpio-merrifield.c
+* Unmerged path drivers/gpio/gpio-tps65218.c
+* Unmerged path drivers/gpio/gpio-wcove.c
+* Unmerged path drivers/pinctrl/mediatek/pinctrl-mtk-common.c
+* Unmerged path drivers/pinctrl/pinctrl-sx150x.c
+* Unmerged path drivers/staging/greybus/gpio.c
+* Unmerged path Documentation/gpio/driver.txt
+* Unmerged path drivers/gpio/gpio-bcm-kona.c
+* Unmerged path drivers/gpio/gpio-dln2.c
+* Unmerged path drivers/gpio/gpio-dwapb.c
+* Unmerged path drivers/gpio/gpio-ep93xx.c
+* Unmerged path drivers/gpio/gpio-f7188x.c
+* Unmerged path drivers/gpio/gpio-lp873x.c
+* Unmerged path drivers/gpio/gpio-max77620.c
+* Unmerged path drivers/gpio/gpio-menz127.c
+* Unmerged path drivers/gpio/gpio-merrifield.c
+* Unmerged path drivers/gpio/gpio-omap.c
+* Unmerged path drivers/gpio/gpio-tc3589x.c
+* Unmerged path drivers/gpio/gpio-tegra.c
+* Unmerged path drivers/gpio/gpio-tps65218.c
+* Unmerged path drivers/gpio/gpio-vx855.c
+* Unmerged path drivers/gpio/gpio-wcove.c
+* Unmerged path drivers/gpio/gpio-wm831x.c
+* Unmerged path drivers/gpio/gpio-wm8994.c
+* Unmerged path drivers/gpio/gpiolib.c
+* Unmerged path drivers/pinctrl/mediatek/pinctrl-mtk-common.c
+diff --git a/drivers/pinctrl/pinctrl-amd.c b/drivers/pinctrl/pinctrl-amd.c
+index 1c5ae8a3336b..b80c3d39f9fc 100644
+--- a/drivers/pinctrl/pinctrl-amd.c
++++ b/drivers/pinctrl/pinctrl-amd.c
+@@ -168,6 +168,18 @@ static int amd_gpio_set_debounce(struct gpio_chip *gc, unsigned offset,
+ 	return ret;
+ }
+ 
++static int amd_gpio_set_config(struct gpio_chip *gc, unsigned offset,
++			       unsigned long config)
++{
++	u32 debounce;
++
++	if (pinconf_to_config_param(config) != PIN_CONFIG_INPUT_DEBOUNCE)
++		return -ENOTSUPP;
++
++	debounce = pinconf_to_config_argument(config);
++	return amd_gpio_set_debounce(gc, offset, debounce);
++}
++
+ #ifdef CONFIG_DEBUG_FS
+ static void amd_gpio_dbg_show(struct seq_file *s, struct gpio_chip *gc)
+ {
+@@ -765,7 +777,7 @@ static int amd_gpio_probe(struct platform_device *pdev)
+ 	gpio_dev->gc.direction_output	= amd_gpio_direction_output;
+ 	gpio_dev->gc.get			= amd_gpio_get_value;
+ 	gpio_dev->gc.set			= amd_gpio_set_value;
+-	gpio_dev->gc.set_debounce	= amd_gpio_set_debounce;
++	gpio_dev->gc.set_config		= amd_gpio_set_config;
+ 	gpio_dev->gc.dbg_show		= amd_gpio_dbg_show;
+ 
+ 	gpio_dev->gc.base		= -1;
+* Unmerged path drivers/pinctrl/pinctrl-sx150x.c
+* Unmerged path drivers/staging/greybus/gpio.c
+* Unmerged path drivers/usb/serial/cp210x.c
+* Unmerged path include/linux/gpio/driver.h
+* Unmerged path include/linux/pinctrl/pinconf-generic.h
