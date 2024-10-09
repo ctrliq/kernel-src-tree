@@ -79,7 +79,7 @@ static void __init early_code_mapping_set_exec(int executable)
 	}
 }
 
-void __init efi_call_phys_prelog(void)
+void __init efi_call_phys_prolog(void)
 {
 	unsigned long vaddr, addr_pgd, addr_pud;
 	pgd_t *pgd_k, *pgd_efi;
@@ -176,7 +176,7 @@ void efi_sync_low_kernel_mappings(void)
 		sizeof(pgd_t) * num_pgds);
 }
 
-int efi_setup_page_tables(unsigned long pa_memmap, unsigned num_pages)
+int __init efi_setup_page_tables(unsigned long pa_memmap, unsigned num_pages)
 {
 	unsigned long text;
 	unsigned npages;
@@ -229,7 +229,7 @@ int efi_setup_page_tables(unsigned long pa_memmap, unsigned num_pages)
 	return 0;
 }
 
-void efi_cleanup_page_tables(unsigned long pa_memmap, unsigned num_pages)
+void __init efi_cleanup_page_tables(unsigned long pa_memmap, unsigned num_pages)
 {
 	pgd_t *pgd = (pgd_t *)__va(real_mode_header->trampoline_pgd);
 
