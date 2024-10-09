@@ -18,6 +18,7 @@
 #include <linux/dmi.h>
 #include <linux/pci-aspm.h>
 
+#include "../pci.h"
 #include "portdrv.h"
 #include "aer/aerdrv.h"
 
@@ -166,7 +167,7 @@ static int pcie_portdrv_probe(struct pci_dev *dev,
 	 * subordinate devices).  We can't be sure for native PCIe hotplug
 	 * either so prevent that as well.
 	 */
-	if (!dev->is_hotplug_bridge) {
+	if (pci_bridge_d3_possible(dev) && !dev->is_hotplug_bridge) {
 		/*
 		 * Keep the port resumed 100ms to make sure things like
 		 * config space accesses from userspace (lspci) will not
@@ -184,7 +185,7 @@ static int pcie_portdrv_probe(struct pci_dev *dev,
 
 static void pcie_portdrv_remove(struct pci_dev *dev)
 {
-	if (!dev->is_hotplug_bridge) {
+	if (pci_bridge_d3_possible(dev) && !dev->is_hotplug_bridge) {
 		pm_runtime_forbid(&dev->dev);
 		pm_runtime_get_noresume(&dev->dev);
 		pm_runtime_dont_use_autosuspend(&dev->dev);
