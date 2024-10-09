@@ -168,6 +168,7 @@ struct qed_rdma_qp {
 
 #if IS_ENABLED(CONFIG_QED_RDMA)
 void qed_rdma_dpm_bar(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt);
+void qed_roce_dpm_dcbx(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt);
 void qed_roce_async_event(struct qed_hwfn *p_hwfn,
 			  u8 fw_event_code, union rdma_eqe_data *rdma_data);
 void qed_ll2b_complete_tx_gsi_packet(struct qed_hwfn *p_hwfn,
@@ -192,6 +193,10 @@ void qed_ll2b_complete_rx_gsi_packet(struct qed_hwfn *p_hwfn,
 				     u16 src_mac_addr_lo, bool b_last_packet);
 #else
 static inline void qed_rdma_dpm_bar(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt) {}
+
+static inline void qed_roce_dpm_dcbx(struct qed_hwfn *p_hwfn,
+				     struct qed_ptt *p_ptt) {}
+
 static inline void qed_roce_async_event(struct qed_hwfn *p_hwfn,
 					u8 fw_event_code,
 					union rdma_eqe_data *rdma_data) {}
