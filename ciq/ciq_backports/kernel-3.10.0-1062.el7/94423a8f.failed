@@ -1,0 +1,85 @@
+nvme-rdma: fix error flow during mapping request data
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Max Gurtovoy <maxg@mellanox.com>
+commit 94423a8f89ed7b66746cade3351a185fb6a1f38d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/94423a8f.failed
+
+After dma mapping the sgl, we map the sgl to nvme sgl descriptor. In case
+of failure during the last mapping we never dma unmap the sgl.
+
+	Signed-off-by: Max Gurtovoy <maxg@mellanox.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 94423a8f89ed7b66746cade3351a185fb6a1f38d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/rdma.c
+diff --cc drivers/nvme/host/rdma.c
+index 6f8551fff943,7cd4199db225..000000000000
+--- a/drivers/nvme/host/rdma.c
++++ b/drivers/nvme/host/rdma.c
+@@@ -1211,28 -1184,43 +1211,52 @@@ static int nvme_rdma_map_data(struct nv
+  	if (ret)
+  		return -ENOMEM;
+  
+ -	req->nents = blk_rq_map_sg(rq->q, rq, req->sg_table.sgl);
+ +	nents = blk_rq_map_sg(rq->q, rq, req->sg_table.sgl);
+ +	BUG_ON(nents > rq->nr_phys_segments);
+ +	req->nents = nents;
+  
+ -	count = ib_dma_map_sg(ibdev, req->sg_table.sgl, req->nents,
+ +	count = ib_dma_map_sg(ibdev, req->sg_table.sgl, nents,
+  		    rq_data_dir(rq) == WRITE ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
+  	if (unlikely(count <= 0)) {
+- 		sg_free_table_chained(&req->sg_table, true);
+- 		return -EIO;
++ 		ret = -EIO;
++ 		goto out_free_table;
+  	}
+  
+  	if (count == 1) {
+++<<<<<<< HEAD
+ +		if (rq_data_dir(rq) == WRITE &&
+ +		    map_len <= nvme_rdma_inline_data_size(queue) &&
+ +		    nvme_rdma_queue_idx(queue))
+ +			return nvme_rdma_map_sg_inline(queue, req, c);
+++=======
++ 		if (rq_data_dir(rq) == WRITE && nvme_rdma_queue_idx(queue) &&
++ 		    blk_rq_payload_bytes(rq) <=
++ 				nvme_rdma_inline_data_size(queue)) {
++ 			ret = nvme_rdma_map_sg_inline(queue, req, c);
++ 			goto out;
++ 		}
+++>>>>>>> 94423a8f89ed (nvme-rdma: fix error flow during mapping request data)
+  
+- 		if (dev->pd->flags & IB_PD_UNSAFE_GLOBAL_RKEY)
+- 			return nvme_rdma_map_sg_single(queue, req, c);
++ 		if (dev->pd->flags & IB_PD_UNSAFE_GLOBAL_RKEY) {
++ 			ret = nvme_rdma_map_sg_single(queue, req, c);
++ 			goto out;
++ 		}
+  	}
+  
+- 	return nvme_rdma_map_sg_fr(queue, req, c, count);
++ 	ret = nvme_rdma_map_sg_fr(queue, req, c, count);
++ out:
++ 	if (unlikely(ret))
++ 		goto out_unmap_sg;
++ 
++ 	return 0;
++ 
++ out_unmap_sg:
++ 	ib_dma_unmap_sg(ibdev, req->sg_table.sgl,
++ 			req->nents, rq_data_dir(rq) ==
++ 			WRITE ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
++ out_free_table:
++ 	sg_free_table_chained(&req->sg_table, true);
++ 	return ret;
+  }
+  
+  static void nvme_rdma_send_done(struct ib_cq *cq, struct ib_wc *wc)
+* Unmerged path drivers/nvme/host/rdma.c
