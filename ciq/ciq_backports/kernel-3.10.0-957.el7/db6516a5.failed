@@ -1,0 +1,157 @@
+ext4: do not update s_last_mounted of a frozen fs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Amir Goldstein <amir73il@gmail.com>
+commit db6516a5e7ddb6dc72d167b920f2f272596ea22d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/db6516a5.failed
+
+If fs is frozen after mount and before the first file open, the
+update of s_last_mounted bypasses freeze protection and prints out
+a WARNING splat:
+
+$ mount /vdf
+$ fsfreeze -f /vdf
+$ cat /vdf/foo
+
+[   31.578555] WARNING: CPU: 1 PID: 1415 at
+fs/ext4/ext4_jbd2.c:53 ext4_journal_check_start+0x48/0x82
+
+[   31.614016] Call Trace:
+[   31.614997]  __ext4_journal_start_sb+0xe4/0x1a4
+[   31.616771]  ? ext4_file_open+0xb6/0x189
+[   31.618094]  ext4_file_open+0xb6/0x189
+
+If fs is frozen, skip s_last_mounted update.
+
+[backport hint: to apply to stable tree, need to apply also patches
+ vfs: add the sb_start_intwrite_trylock() helper
+ ext4: factor out helper ext4_sample_last_mounted()]
+
+	Cc: stable@vger.kernel.org
+Fixes: bc0b0d6d69ee ("ext4: update the s_last_mounted field in the superblock")
+	Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+(cherry picked from commit db6516a5e7ddb6dc72d167b920f2f272596ea22d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/file.c
+diff --cc fs/ext4/file.c
+index feb7f54458b2,7f8023340eb8..000000000000
+--- a/fs/ext4/file.c
++++ b/fs/ext4/file.c
+@@@ -383,46 -381,69 +383,97 @@@ static int ext4_file_mmap(struct file *
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int ext4_sample_last_mounted(struct super_block *sb,
++ 				    struct vfsmount *mnt)
++ {
++ 	struct ext4_sb_info *sbi = EXT4_SB(sb);
++ 	struct path path;
++ 	char buf[64], *cp;
++ 	handle_t *handle;
++ 	int err;
++ 
++ 	if (likely(sbi->s_mount_flags & EXT4_MF_MNTDIR_SAMPLED))
++ 		return 0;
++ 
++ 	if (sb_rdonly(sb) || !sb_start_intwrite_trylock(sb))
++ 		return 0;
++ 
++ 	sbi->s_mount_flags |= EXT4_MF_MNTDIR_SAMPLED;
++ 	/*
++ 	 * Sample where the filesystem has been mounted and
++ 	 * store it in the superblock for sysadmin convenience
++ 	 * when trying to sort through large numbers of block
++ 	 * devices or filesystem images.
++ 	 */
++ 	memset(buf, 0, sizeof(buf));
++ 	path.mnt = mnt;
++ 	path.dentry = mnt->mnt_root;
++ 	cp = d_path(&path, buf, sizeof(buf));
++ 	err = 0;
++ 	if (IS_ERR(cp))
++ 		goto out;
++ 
++ 	handle = ext4_journal_start_sb(sb, EXT4_HT_MISC, 1);
++ 	err = PTR_ERR(handle);
++ 	if (IS_ERR(handle))
++ 		goto out;
++ 	BUFFER_TRACE(sbi->s_sbh, "get_write_access");
++ 	err = ext4_journal_get_write_access(handle, sbi->s_sbh);
++ 	if (err)
++ 		goto out_journal;
++ 	strlcpy(sbi->s_es->s_last_mounted, cp,
++ 		sizeof(sbi->s_es->s_last_mounted));
++ 	ext4_handle_dirty_super(handle, sb);
++ out_journal:
++ 	ext4_journal_stop(handle);
++ out:
++ 	sb_end_intwrite(sb);
++ 	return err;
++ }
++ 
+++>>>>>>> db6516a5e7dd (ext4: do not update s_last_mounted of a frozen fs)
+  static int ext4_file_open(struct inode * inode, struct file * filp)
+  {
+ -	int ret;
+ -
+ -	if (unlikely(ext4_forced_shutdown(EXT4_SB(inode->i_sb))))
+ -		return -EIO;
+ -
+ -	ret = ext4_sample_last_mounted(inode->i_sb, filp->f_path.mnt);
+ -	if (ret)
+ -		return ret;
+ -
+ -	ret = fscrypt_file_open(inode, filp);
+ -	if (ret)
+ -		return ret;
+ +	struct super_block *sb = inode->i_sb;
+ +	struct ext4_sb_info *sbi = EXT4_SB(inode->i_sb);
+ +	struct vfsmount *mnt = filp->f_path.mnt;
+ +	struct path path;
+ +	char buf[64], *cp;
+  
+ +	if (unlikely(!(sbi->s_mount_flags & EXT4_MF_MNTDIR_SAMPLED) &&
+ +		     !(sb->s_flags & MS_RDONLY))) {
+ +		sbi->s_mount_flags |= EXT4_MF_MNTDIR_SAMPLED;
+ +		/*
+ +		 * Sample where the filesystem has been mounted and
+ +		 * store it in the superblock for sysadmin convenience
+ +		 * when trying to sort through large numbers of block
+ +		 * devices or filesystem images.
+ +		 */
+ +		memset(buf, 0, sizeof(buf));
+ +		path.mnt = mnt;
+ +		path.dentry = mnt->mnt_root;
+ +		cp = d_path(&path, buf, sizeof(buf));
+ +		if (!IS_ERR(cp)) {
+ +			handle_t *handle;
+ +			int err;
+ +
+ +			handle = ext4_journal_start_sb(sb, EXT4_HT_MISC, 1);
+ +			if (IS_ERR(handle))
+ +				return PTR_ERR(handle);
+ +			BUFFER_TRACE(sbi->s_sbh, "get_write_access");
+ +			err = ext4_journal_get_write_access(handle, sbi->s_sbh);
+ +			if (err) {
+ +				ext4_journal_stop(handle);
+ +				return err;
+ +			}
+ +			strlcpy(sbi->s_es->s_last_mounted, cp,
+ +				sizeof(sbi->s_es->s_last_mounted));
+ +			ext4_handle_dirty_super(handle, sb);
+ +			ext4_journal_stop(handle);
+ +		}
+ +	}
+  	/*
+  	 * Set up the jbd2_inode if we are opening the inode for
+  	 * writing and the journal is present
+* Unmerged path fs/ext4/file.c
