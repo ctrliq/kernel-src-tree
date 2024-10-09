@@ -1,0 +1,152 @@
+net: sched: push tp down to action init
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [net] sched: push tp down to action init (Ivan Vecera) [1445420]
+Rebuild_FUZZ: 93.15%
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit 9fb9f251d229f6cabd9dbe4214eb7f1e6a4e8a9d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/9fb9f251.failed
+
+Tp pointer will be needed by the next patch in order to get the chain.
+
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9fb9f251d229f6cabd9dbe4214eb7f1e6a4e8a9d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/act_api.h
+#	net/sched/cls_api.c
+diff --cc include/net/act_api.h
+index 7eba1aba336b,b22c6f3d6710..000000000000
+--- a/include/net/act_api.h
++++ b/include/net/act_api.h
+@@@ -135,17 -174,18 +135,28 @@@ static inline int tcf_hash_release(stru
+  	return __tcf_hash_release(a, bind, false);
+  }
+  
+ -int tcf_register_action(struct tc_action_ops *a, struct pernet_operations *ops);
+ -int tcf_unregister_action(struct tc_action_ops *a,
+ -			  struct pernet_operations *ops);
+ +int tcf_register_action(struct tc_action_ops *a, unsigned int mask);
+ +int tcf_unregister_action(struct tc_action_ops *a);
+  int tcf_action_destroy(struct list_head *actions, int bind);
+++<<<<<<< HEAD
+ +int tcf_action_exec(struct sk_buff *skb, const struct list_head *actions,
+ +		    struct tcf_result *res);
+ +int tcf_action_init(struct net *net, struct nlattr *nla,
+ +				  struct nlattr *est, char *n, int ovr,
+ +				  int bind, struct list_head *);
+ +struct tc_action *tcf_action_init_1(struct net *net, struct nlattr *nla,
+ +				    struct nlattr *est, char *n, int ovr,
+ +				    int bind);
+++=======
++ int tcf_action_exec(struct sk_buff *skb, struct tc_action **actions,
++ 		    int nr_actions, struct tcf_result *res);
++ int tcf_action_init(struct net *net, struct tcf_proto *tp, struct nlattr *nla,
++ 		    struct nlattr *est, char *name, int ovr, int bind,
++ 		    struct list_head *actions);
++ struct tc_action *tcf_action_init_1(struct net *net, struct tcf_proto *tp,
++ 				    struct nlattr *nla, struct nlattr *est,
++ 				    char *name, int ovr, int bind);
+++>>>>>>> 9fb9f251d229 (net: sched: push tp down to action init)
+  int tcf_action_dump(struct sk_buff *skb, struct list_head *, int, int);
+  int tcf_action_dump_old(struct sk_buff *skb, struct tc_action *a, int, int);
+  int tcf_action_dump_1(struct sk_buff *skb, struct tc_action *a, int, int);
+diff --cc net/sched/cls_api.c
+index 1dc6d123ed94,9e0c4bb82528..000000000000
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@@ -561,22 -831,28 +561,32 @@@ int tcf_exts_validate(struct net *net, 
+  	{
+  		struct tc_action *act;
+  
+ +		INIT_LIST_HEAD(&exts->actions);
+  		if (exts->police && tb[exts->police]) {
+- 			act = tcf_action_init_1(net, tb[exts->police], rate_tlv,
+- 						"police", ovr, TCA_ACT_BIND);
++ 			act = tcf_action_init_1(net, tp, tb[exts->police],
++ 						rate_tlv, "police", ovr,
++ 						TCA_ACT_BIND);
+  			if (IS_ERR(act))
+  				return PTR_ERR(act);
+  
+  			act->type = exts->type = TCA_OLD_COMPAT;
+ -			exts->actions[0] = act;
+ -			exts->nr_actions = 1;
+ +			list_add(&act->list, &exts->actions);
+  		} else if (exts->action && tb[exts->action]) {
+++<<<<<<< HEAD
+ +			int err;
+ +			err = tcf_action_init(net, tb[exts->action], rate_tlv,
+ +					      NULL, ovr, TCA_ACT_BIND,
+ +					      &exts->actions);
+++=======
++ 			LIST_HEAD(actions);
++ 			int err, i = 0;
++ 
++ 			err = tcf_action_init(net, tp, tb[exts->action],
++ 					      rate_tlv, NULL, ovr, TCA_ACT_BIND,
++ 					      &actions);
+++>>>>>>> 9fb9f251d229 (net: sched: push tp down to action init)
+  			if (err)
+  				return err;
+ -			list_for_each_entry(act, &actions, list)
+ -				exts->actions[i++] = act;
+ -			exts->nr_actions = i;
+  		}
+  	}
+  #else
+* Unmerged path include/net/act_api.h
+diff --git a/net/sched/act_api.c b/net/sched/act_api.c
+index 19022d7219af..4a2e544c53dc 100644
+--- a/net/sched/act_api.c
++++ b/net/sched/act_api.c
+@@ -561,9 +561,9 @@ static struct tc_cookie *nla_memdup_cookie(struct nlattr **tb)
+ 	return c;
+ }
+ 
+-struct tc_action *tcf_action_init_1(struct net *net, struct nlattr *nla,
+-				    struct nlattr *est, char *name, int ovr,
+-				    int bind)
++struct tc_action *tcf_action_init_1(struct net *net, struct tcf_proto *tp,
++				    struct nlattr *nla, struct nlattr *est,
++				    char *name, int ovr, int bind)
+ {
+ 	struct tc_action *a;
+ 	struct tc_action_ops *a_o;
+@@ -682,8 +682,9 @@ static void cleanup_a(struct list_head *actions, int ovr)
+ 		a->tcfa_refcnt--;
+ }
+ 
+-int tcf_action_init(struct net *net, struct nlattr *nla, struct nlattr *est,
+-		    char *name, int ovr, int bind, struct list_head *actions)
++int tcf_action_init(struct net *net, struct tcf_proto *tp, struct nlattr *nla,
++		    struct nlattr *est, char *name, int ovr, int bind,
++		    struct list_head *actions)
+ {
+ 	struct nlattr *tb[TCA_ACT_MAX_PRIO + 1];
+ 	struct tc_action *act;
+@@ -695,7 +696,7 @@ int tcf_action_init(struct net *net, struct nlattr *nla, struct nlattr *est,
+ 		return err;
+ 
+ 	for (i = 1; i <= TCA_ACT_MAX_PRIO && tb[i]; i++) {
+-		act = tcf_action_init_1(net, tb[i], est, name, ovr, bind);
++		act = tcf_action_init_1(net, tp, tb[i], est, name, ovr, bind);
+ 		if (IS_ERR(act)) {
+ 			err = PTR_ERR(act);
+ 			goto err;
+@@ -1049,7 +1050,7 @@ static int tcf_action_add(struct net *net, struct nlattr *nla,
+ 	int ret = 0;
+ 	LIST_HEAD(actions);
+ 
+-	ret = tcf_action_init(net, nla, NULL, NULL, ovr, 0, &actions);
++	ret = tcf_action_init(net, NULL, nla, NULL, NULL, ovr, 0, &actions);
+ 	if (ret)
+ 		return ret;
+ 
+* Unmerged path net/sched/cls_api.c
