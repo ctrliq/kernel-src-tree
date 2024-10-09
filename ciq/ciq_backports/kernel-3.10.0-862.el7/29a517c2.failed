@@ -1,0 +1,197 @@
+kernfs: The cgroup filesystem also benefits from SB_I_NOEXEC
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Eric W. Biederman <ebiederm@xmission.com>
+commit 29a517c232d21a717aecea29838aeb07131f6196
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/29a517c2.failed
+
+The cgroup filesystem is in the same boat as sysfs.  No one ever
+permits executables of any kind on the cgroup filesystem, and there is
+no reasonable future case to support executables in the future.
+
+Therefore move the setting of SB_I_NOEXEC which makes the code proof
+against future mistakes of accidentally creating executables from
+sysfs to kernfs itself.  Making the code simpler and covering the
+sysfs, cgroup, and cgroup2 filesystems.
+
+	Acked-by: Seth Forshee <seth.forshee@canonical.com>
+	Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+(cherry picked from commit 29a517c232d21a717aecea29838aeb07131f6196)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/kernfs/mount.c
+#	fs/sysfs/mount.c
+diff --cc fs/kernfs/mount.c
+index 642fe1db4ffa,1443df670260..000000000000
+--- a/fs/kernfs/mount.c
++++ b/fs/kernfs/mount.c
+@@@ -68,8 -151,11 +68,16 @@@ static int kernfs_fill_super(struct sup
+  	struct inode *inode;
+  	struct dentry *root;
+  
+++<<<<<<< HEAD
+ +	sb->s_blocksize = PAGE_CACHE_SIZE;
+ +	sb->s_blocksize_bits = PAGE_CACHE_SHIFT;
+++=======
++ 	info->sb = sb;
++ 	/* Userspace would break if executables appear on sysfs */
++ 	sb->s_iflags |= SB_I_NOEXEC;
++ 	sb->s_blocksize = PAGE_SIZE;
++ 	sb->s_blocksize_bits = PAGE_SHIFT;
+++>>>>>>> 29a517c232d2 (kernfs: The cgroup filesystem also benefits from SB_I_NOEXEC)
+  	sb->s_magic = magic;
+  	sb->s_op = &kernfs_sops;
+  	sb->s_time_gran = 1;
+diff --cc fs/sysfs/mount.c
+index 59ee03fe48e1,20b8f82e115b..000000000000
+--- a/fs/sysfs/mount.c
++++ b/fs/sysfs/mount.c
+@@@ -23,121 -20,30 +23,133 @@@
+  
+  #include "sysfs.h"
+  
+ -static struct kernfs_root *sysfs_root;
+ -struct kernfs_node *sysfs_root_kn;
+  
+ -static struct dentry *sysfs_mount(struct file_system_type *fs_type,
+ -	int flags, const char *dev_name, void *data)
+ +struct kmem_cache *sysfs_dir_cachep;
+ +
+ +static const struct super_operations sysfs_ops = {
+ +	.statfs		= simple_statfs,
+ +	.drop_inode	= generic_delete_inode,
+ +	.evict_inode	= sysfs_evict_inode,
+ +};
+ +
+ +static struct sysfs_dirent sysfs_root = {
+ +	.s_name		= "",
+ +	.s_count	= ATOMIC_INIT(1),
+ +	.s_flags	= SYSFS_DIR | (KOBJ_NS_TYPE_NONE << SYSFS_NS_TYPE_SHIFT),
+ +	.s_mode		= S_IFDIR | S_IRUGO | S_IXUGO,
+ +	.s_ino		= 1,
+ +};
+ +
+ +struct sysfs_dirent *sysfs_root_sd = &sysfs_root;
+ +
+ +static int sysfs_fill_super(struct super_block *sb)
+  {
+ +	struct inode *inode;
+  	struct dentry *root;
+ -	void *ns;
+ -	bool new_sb;
+  
+ -	if (!(flags & MS_KERNMOUNT)) {
+ -		if (!kobj_ns_current_may_mount(KOBJ_NS_TYPE_NET))
+ -			return ERR_PTR(-EPERM);
+ +	sb->s_blocksize = PAGE_CACHE_SIZE;
+ +	sb->s_blocksize_bits = PAGE_CACHE_SHIFT;
+ +	sb->s_magic = SYSFS_MAGIC;
+ +	sb->s_op = &sysfs_ops;
+ +	sb->s_time_gran = 1;
+ +
+ +	/* get root inode, initialize and unlock it */
+ +	mutex_lock(&sysfs_mutex);
+ +	inode = sysfs_get_inode(sb, sysfs_root_sd);
+ +	mutex_unlock(&sysfs_mutex);
+ +	if (!inode) {
+ +		pr_debug("sysfs: could not get root inode\n");
+ +		return -ENOMEM;
+ +	}
+ +
+ +	/* instantiate and link root dentry */
+ +	root = d_make_root(inode);
+ +	if (!root) {
+ +		pr_debug("%s: could not get root dentry!\n",__func__);
+ +		return -ENOMEM;
+ +	}
+ +	root->d_fsdata = sysfs_root_sd;
+ +	sb->s_root = root;
+ +	sb->s_d_op = &sysfs_dentry_ops;
+ +	return 0;
+ +}
+ +
+ +static int sysfs_test_super(struct super_block *sb, void *data)
+ +{
+ +	struct sysfs_super_info *sb_info = sysfs_info(sb);
+ +	struct sysfs_super_info *info = data;
+ +	enum kobj_ns_type type;
+ +	int found = 1;
+ +
+ +	for (type = KOBJ_NS_TYPE_NONE; type < KOBJ_NS_TYPES; type++) {
+ +		if (sb_info->ns[type] != info->ns[type])
+ +			found = 0;
+ +	}
+ +	return found;
+ +}
+ +
+ +static int sysfs_set_super(struct super_block *sb, void *data)
+ +{
+ +	int error;
+ +	error = set_anon_super(sb, data);
+ +	if (!error)
+ +		sb->s_fs_info = data;
+ +	return error;
+ +}
+ +
+ +static void free_sysfs_super_info(struct sysfs_super_info *info)
+ +{
+ +	int type;
+ +	for (type = KOBJ_NS_TYPE_NONE; type < KOBJ_NS_TYPES; type++)
+ +		kobj_ns_drop(type, info->ns[type]);
+ +	kfree(info);
+ +}
+ +
+ +static struct dentry *sysfs_mount(struct file_system_type *fs_type,
+ +	int flags, const char *dev_name, void *data)
+ +{
+ +	struct sysfs_super_info *info;
+ +	enum kobj_ns_type type;
+ +	struct super_block *sb;
+ +	int error;
+ +
+ +	if (!(flags & MS_KERNMOUNT) && !current_user_ns()->may_mount_sysfs)
+ +		return ERR_PTR(-EPERM);
+ +
+ +	info = kzalloc(sizeof(*info), GFP_KERNEL);
+ +	if (!info)
+ +		return ERR_PTR(-ENOMEM);
+ +
+ +	for (type = KOBJ_NS_TYPE_NONE; type < KOBJ_NS_TYPES; type++)
+ +		info->ns[type] = kobj_ns_grab_current(type);
+ +
+ +	sb = sget(fs_type, sysfs_test_super, sysfs_set_super, flags, info);
+ +	if (IS_ERR(sb) || sb->s_fs_info != info)
+ +		free_sysfs_super_info(info);
+ +	if (IS_ERR(sb))
+ +		return ERR_CAST(sb);
+ +	if (!sb->s_root) {
+ +		error = sysfs_fill_super(sb);
+ +		if (error) {
+ +			deactivate_locked_super(sb);
+ +			return ERR_PTR(error);
+ +		}
+ +		sb->s_flags |= MS_ACTIVE;
+  	}
+  
+++<<<<<<< HEAD
+ +	return dget(sb->s_root);
+++=======
++ 	ns = kobj_ns_grab_current(KOBJ_NS_TYPE_NET);
++ 	root = kernfs_mount_ns(fs_type, flags, sysfs_root,
++ 				SYSFS_MAGIC, &new_sb, ns);
++ 	if (IS_ERR(root) || !new_sb)
++ 		kobj_ns_drop(KOBJ_NS_TYPE_NET, ns);
++ 	else if (new_sb)
++ 		root->d_sb->s_iflags |= SB_I_USERNS_VISIBLE;
++ 
++ 	return root;
+++>>>>>>> 29a517c232d2 (kernfs: The cgroup filesystem also benefits from SB_I_NOEXEC)
+  }
+  
+  static void sysfs_kill_sb(struct super_block *sb)
+* Unmerged path fs/kernfs/mount.c
+* Unmerged path fs/sysfs/mount.c
