@@ -1,0 +1,189 @@
+scsi: tcmu: check if dev is configured before block/reset
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Mike Christie <mchristi@redhat.com>
+commit a30b0473b62652f9b8ccb1e4f4a3a3c31d2b72b3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/a30b0473.failed
+
+Do not allow userspace to block or reset the ring until the device has been
+configured. This will prevent the bug where userspace can write to those
+files and access mb_addr before it has been setup.
+
+	Signed-off-by: Mike Christie <mchristi@redhat.com>
+	Reviewed-by: Xiubo Li <xiubli@redhat.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit a30b0473b62652f9b8ccb1e4f4a3a3c31d2b72b3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_user.c
+diff --cc drivers/target/target_core_user.c
+index 5534ef1b341c,d6b402203b20..000000000000
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@@ -1623,10 -2381,155 +1623,160 @@@ static ssize_t tcmu_max_data_area_mb_sh
+  						struct se_dev_attrib, da_group);
+  	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
+  
+ -	return snprintf(page, PAGE_SIZE, "%d\n", udev->nl_reply_supported);
+ +	return snprintf(page, PAGE_SIZE, "%u\n",
+ +			TCMU_BLOCKS_TO_MBS(udev->max_blocks));
+  }
+++<<<<<<< HEAD
+ +CONFIGFS_ATTR_RO(tcmu_, max_data_area_mb);
+++=======
++ 
++ static ssize_t tcmu_nl_reply_supported_store(struct config_item *item,
++ 		const char *page, size_t count)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 						struct se_dev_attrib, da_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
++ 	s8 val;
++ 	int ret;
++ 
++ 	ret = kstrtos8(page, 0, &val);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	udev->nl_reply_supported = val;
++ 	return count;
++ }
++ CONFIGFS_ATTR(tcmu_, nl_reply_supported);
++ 
++ static ssize_t tcmu_emulate_write_cache_show(struct config_item *item,
++ 					     char *page)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 					struct se_dev_attrib, da_group);
++ 
++ 	return snprintf(page, PAGE_SIZE, "%i\n", da->emulate_write_cache);
++ }
++ 
++ static int tcmu_send_emulate_write_cache(struct tcmu_dev *udev, u8 val)
++ {
++ 	struct sk_buff *skb = NULL;
++ 	void *msg_header = NULL;
++ 	int ret = 0;
++ 
++ 	ret = tcmu_netlink_event_init(udev, TCMU_CMD_RECONFIG_DEVICE,
++ 				      &skb, &msg_header);
++ 	if (ret < 0)
++ 		return ret;
++ 	ret = nla_put_u8(skb, TCMU_ATTR_WRITECACHE, val);
++ 	if (ret < 0) {
++ 		nlmsg_free(skb);
++ 		return ret;
++ 	}
++ 	return tcmu_netlink_event_send(udev, TCMU_CMD_RECONFIG_DEVICE,
++ 				       skb, msg_header);
++ }
++ 
++ static ssize_t tcmu_emulate_write_cache_store(struct config_item *item,
++ 					      const char *page, size_t count)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 					struct se_dev_attrib, da_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
++ 	u8 val;
++ 	int ret;
++ 
++ 	ret = kstrtou8(page, 0, &val);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	/* Check if device has been configured before */
++ 	if (target_dev_configured(&udev->se_dev)) {
++ 		ret = tcmu_send_emulate_write_cache(udev, val);
++ 		if (ret) {
++ 			pr_err("Unable to reconfigure device\n");
++ 			return ret;
++ 		}
++ 	}
++ 
++ 	da->emulate_write_cache = val;
++ 	return count;
++ }
++ CONFIGFS_ATTR(tcmu_, emulate_write_cache);
++ 
++ static ssize_t tcmu_block_dev_show(struct config_item *item, char *page)
++ {
++ 	struct se_device *se_dev = container_of(to_config_group(item),
++ 						struct se_device,
++ 						dev_action_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(se_dev);
++ 
++ 	if (test_bit(TCMU_DEV_BIT_BLOCKED, &udev->flags))
++ 		return snprintf(page, PAGE_SIZE, "%s\n", "blocked");
++ 	else
++ 		return snprintf(page, PAGE_SIZE, "%s\n", "unblocked");
++ }
++ 
++ static ssize_t tcmu_block_dev_store(struct config_item *item, const char *page,
++ 				    size_t count)
++ {
++ 	struct se_device *se_dev = container_of(to_config_group(item),
++ 						struct se_device,
++ 						dev_action_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(se_dev);
++ 	u8 val;
++ 	int ret;
++ 
++ 	if (!target_dev_configured(&udev->se_dev)) {
++ 		pr_err("Device is not configured.\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	ret = kstrtou8(page, 0, &val);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	if (val > 1) {
++ 		pr_err("Invalid block value %d\n", val);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (!val)
++ 		tcmu_unblock_dev(udev);
++ 	else
++ 		tcmu_block_dev(udev);
++ 	return count;
++ }
++ CONFIGFS_ATTR(tcmu_, block_dev);
++ 
++ static ssize_t tcmu_reset_ring_store(struct config_item *item, const char *page,
++ 				     size_t count)
++ {
++ 	struct se_device *se_dev = container_of(to_config_group(item),
++ 						struct se_device,
++ 						dev_action_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(se_dev);
++ 	u8 val;
++ 	int ret;
++ 
++ 	if (!target_dev_configured(&udev->se_dev)) {
++ 		pr_err("Device is not configured.\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	ret = kstrtou8(page, 0, &val);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	if (val != 1 && val != 2) {
++ 		pr_err("Invalid reset ring value %d\n", val);
++ 		return -EINVAL;
++ 	}
++ 
++ 	tcmu_reset_ring(udev, val);
++ 	return count;
++ }
++ CONFIGFS_ATTR_WO(tcmu_, reset_ring);
+++>>>>>>> a30b0473b626 (scsi: tcmu: check if dev is configured before block/reset)
+  
+  static struct configfs_attribute *tcmu_attrib_attrs[] = {
+  	&tcmu_attr_cmd_time_out,
+* Unmerged path drivers/target/target_core_user.c
