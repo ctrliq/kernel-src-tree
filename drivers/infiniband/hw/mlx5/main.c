@@ -1600,6 +1600,9 @@ static int mlx5_ib_alloc_transport_domain(struct mlx5_ib_dev *dev, u32 *tdn)
 {
 	int err;
 
+	if (!MLX5_CAP_GEN(dev->mdev, log_max_transport_domain))
+		return 0;
+
 	err = mlx5_core_alloc_transport_domain(dev->mdev, tdn);
 	if (err)
 		return err;
@@ -1621,6 +1624,9 @@ static int mlx5_ib_alloc_transport_domain(struct mlx5_ib_dev *dev, u32 *tdn)
 
 static void mlx5_ib_dealloc_transport_domain(struct mlx5_ib_dev *dev, u32 tdn)
 {
+	if (!MLX5_CAP_GEN(dev->mdev, log_max_transport_domain))
+		return;
+
 	mlx5_core_dealloc_transport_domain(dev->mdev, tdn);
 
 	if ((MLX5_CAP_GEN(dev->mdev, port_type) != MLX5_CAP_PORT_TYPE_ETH) ||
@@ -1745,11 +1751,9 @@ static struct ib_ucontext *mlx5_ib_alloc_ucontext(struct ib_device *ibdev,
 	context->ibucontext.invalidate_range = &mlx5_ib_invalidate_range;
 #endif
 
-	if (MLX5_CAP_GEN(dev->mdev, log_max_transport_domain)) {
-		err = mlx5_ib_alloc_transport_domain(dev, &context->tdn);
-		if (err)
-			goto out_uars;
-	}
+	err = mlx5_ib_alloc_transport_domain(dev, &context->tdn);
+	if (err)
+		goto out_uars;
 
 	INIT_LIST_HEAD(&context->vma_private_list);
 	mutex_init(&context->vma_private_list_mutex);
@@ -1822,8 +1826,7 @@ static struct ib_ucontext *mlx5_ib_alloc_ucontext(struct ib_device *ibdev,
 	return &context->ibucontext;
 
 out_td:
-	if (MLX5_CAP_GEN(dev->mdev, log_max_transport_domain))
-		mlx5_ib_dealloc_transport_domain(dev, context->tdn);
+	mlx5_ib_dealloc_transport_domain(dev, context->tdn);
 
 out_uars:
 	deallocate_uars(dev, context);
@@ -1847,8 +1850,7 @@ static int mlx5_ib_dealloc_ucontext(struct ib_ucontext *ibcontext)
 	struct mlx5_bfreg_info *bfregi;
 
 	bfregi = &context->bfregi;
-	if (MLX5_CAP_GEN(dev->mdev, log_max_transport_domain))
-		mlx5_ib_dealloc_transport_domain(dev, context->tdn);
+	mlx5_ib_dealloc_transport_domain(dev, context->tdn);
 
 	deallocate_uars(dev, context);
 	kfree(bfregi->sys_pages);
