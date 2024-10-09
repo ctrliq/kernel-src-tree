@@ -1,0 +1,1264 @@
+mlxsw: spectrum_dpipe: Add support for controlling nexthop counters
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Arkadi Sharshevsky <arkadis@mellanox.com>
+commit 427e652aa34d90960f729c0b902c3c4a8a821b2e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/427e652a.failed
+
+Add support for controlling nexthop counters via dpipe.
+
+	Signed-off-by: Arkadi Sharshevsky <arkadis@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 427e652aa34d90960f729c0b902c3c4a8a821b2e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_router.h
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+index 6908726c154c,321f7356073c..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+@@@ -978,366 -1425,735 +978,614 @@@ mlxsw_sp_router_neigh_entry_op4(struct 
+  }
+  
+  static void
+ -mlxsw_sp_neigh_counter_alloc(struct mlxsw_sp *mlxsw_sp,
+ -			     struct mlxsw_sp_neigh_entry *neigh_entry)
+ +mlxsw_sp_neigh_entry_update(struct mlxsw_sp *mlxsw_sp,
+ +			    struct mlxsw_sp_neigh_entry *neigh_entry,
+ +			    bool adding)
+  {
+ -	if (!mlxsw_sp_neigh_counter_should_alloc(mlxsw_sp, neigh_entry))
+ -		return;
+ -
+ -	if (mlxsw_sp_flow_counter_alloc(mlxsw_sp, &neigh_entry->counter_index))
+ +	if (!adding && !neigh_entry->connected)
+  		return;
+ -
+ -	neigh_entry->counter_valid = true;
+ +	neigh_entry->connected = adding;
+ +	if (neigh_entry->key.n->tbl == &arp_tbl)
+ +		mlxsw_sp_router_neigh_entry_op4(mlxsw_sp, neigh_entry,
+ +						mlxsw_sp_rauht_op(adding));
+ +	else
+ +		WARN_ON_ONCE(1);
+  }
+  
+ -static void
+ -mlxsw_sp_neigh_counter_free(struct mlxsw_sp *mlxsw_sp,
+ -			    struct mlxsw_sp_neigh_entry *neigh_entry)
+ -{
+ -	if (!neigh_entry->counter_valid)
+ -		return;
+ -	mlxsw_sp_flow_counter_free(mlxsw_sp,
+ -				   neigh_entry->counter_index);
+ -	neigh_entry->counter_valid = false;
+ -}
+ +struct mlxsw_sp_neigh_event_work {
+ +	struct work_struct work;
+ +	struct mlxsw_sp *mlxsw_sp;
+ +	struct neighbour *n;
+ +};
+  
+ -static struct mlxsw_sp_neigh_entry *
+ -mlxsw_sp_neigh_entry_create(struct mlxsw_sp *mlxsw_sp, struct neighbour *n)
+ +static void mlxsw_sp_router_neigh_event_work(struct work_struct *work)
+  {
+ +	struct mlxsw_sp_neigh_event_work *neigh_work =
+ +		container_of(work, struct mlxsw_sp_neigh_event_work, work);
+ +	struct mlxsw_sp *mlxsw_sp = neigh_work->mlxsw_sp;
+  	struct mlxsw_sp_neigh_entry *neigh_entry;
+ -	struct mlxsw_sp_rif *rif;
+ -	int err;
+ -
+ -	rif = mlxsw_sp_rif_find_by_dev(mlxsw_sp, n->dev);
+ -	if (!rif)
+ -		return ERR_PTR(-EINVAL);
+ +	struct neighbour *n = neigh_work->n;
+ +	unsigned char ha[ETH_ALEN];
+ +	bool entry_connected;
+ +	u8 nud_state, dead;
+  
+ -	neigh_entry = mlxsw_sp_neigh_entry_alloc(mlxsw_sp, n, rif->rif_index);
+ -	if (!neigh_entry)
+ -		return ERR_PTR(-ENOMEM);
+ +	/* If these parameters are changed after we release the lock,
+ +	 * then we are guaranteed to receive another event letting us
+ +	 * know about it.
+ +	 */
+ +	read_lock_bh(&n->lock);
+ +	memcpy(ha, n->ha, ETH_ALEN);
+ +	nud_state = n->nud_state;
+ +	dead = n->dead;
+ +	read_unlock_bh(&n->lock);
+  
+ -	err = mlxsw_sp_neigh_entry_insert(mlxsw_sp, neigh_entry);
+ -	if (err)
+ -		goto err_neigh_entry_insert;
+ +	rtnl_lock();
+ +	entry_connected = nud_state & NUD_VALID && !dead;
+ +	neigh_entry = mlxsw_sp_neigh_entry_lookup(mlxsw_sp, n);
+ +	if (!entry_connected && !neigh_entry)
+ +		goto out;
+ +	if (!neigh_entry) {
+ +		neigh_entry = mlxsw_sp_neigh_entry_create(mlxsw_sp, n);
+ +		if (IS_ERR(neigh_entry))
+ +			goto out;
+ +	}
+  
+ -	mlxsw_sp_neigh_counter_alloc(mlxsw_sp, neigh_entry);
+ -	list_add(&neigh_entry->rif_list_node, &rif->neigh_list);
+ +	memcpy(neigh_entry->ha, ha, ETH_ALEN);
+ +	mlxsw_sp_neigh_entry_update(mlxsw_sp, neigh_entry, entry_connected);
+ +	mlxsw_sp_nexthop_neigh_update(mlxsw_sp, neigh_entry, !entry_connected);
+  
+ -	return neigh_entry;
+ +	if (!neigh_entry->connected && list_empty(&neigh_entry->nexthop_list))
+ +		mlxsw_sp_neigh_entry_destroy(mlxsw_sp, neigh_entry);
+  
+ -err_neigh_entry_insert:
+ -	mlxsw_sp_neigh_entry_free(neigh_entry);
+ -	return ERR_PTR(err);
+ +out:
+ +	rtnl_unlock();
+ +	neigh_release(n);
+ +	kfree(neigh_work);
+  }
+  
+ -static void
+ -mlxsw_sp_neigh_entry_destroy(struct mlxsw_sp *mlxsw_sp,
+ -			     struct mlxsw_sp_neigh_entry *neigh_entry)
+ +int mlxsw_sp_router_netevent_event(struct notifier_block *unused,
+ +				   unsigned long event, void *ptr)
+  {
+ -	list_del(&neigh_entry->rif_list_node);
+ -	mlxsw_sp_neigh_counter_free(mlxsw_sp, neigh_entry);
+ -	mlxsw_sp_neigh_entry_remove(mlxsw_sp, neigh_entry);
+ -	mlxsw_sp_neigh_entry_free(neigh_entry);
+ -}
+ +	struct mlxsw_sp_neigh_event_work *neigh_work;
+ +	struct mlxsw_sp_port *mlxsw_sp_port;
+ +	struct mlxsw_sp *mlxsw_sp;
+ +	unsigned long interval;
+ +	struct neigh_parms *p;
+ +	struct neighbour *n;
+  
+ -static struct mlxsw_sp_neigh_entry *
+ -mlxsw_sp_neigh_entry_lookup(struct mlxsw_sp *mlxsw_sp, struct neighbour *n)
+ -{
+ -	struct mlxsw_sp_neigh_key key;
+ +	switch (event) {
+ +	case NETEVENT_DELAY_PROBE_TIME_UPDATE:
+ +		p = ptr;
+  
+ -	key.n = n;
+ -	return rhashtable_lookup_fast(&mlxsw_sp->router->neigh_ht,
+ -				      &key, mlxsw_sp_neigh_ht_params);
+ -}
+ +		/* We don't care about changes in the default table. */
+ +		if (!p->dev || p->tbl != &arp_tbl)
+ +			return NOTIFY_DONE;
+  
+ -static void
+ -mlxsw_sp_router_neighs_update_interval_init(struct mlxsw_sp *mlxsw_sp)
+ -{
+ -	unsigned long interval;
+ +		/* We are in atomic context and can't take RTNL mutex,
+ +		 * so use RCU variant to walk the device chain.
+ +		 */
+ +		mlxsw_sp_port = mlxsw_sp_port_lower_dev_hold(p->dev);
+ +		if (!mlxsw_sp_port)
+ +			return NOTIFY_DONE;
+  
+ -#if IS_ENABLED(CONFIG_IPV6)
+ -	interval = min_t(unsigned long,
+ -			 NEIGH_VAR(&arp_tbl.parms, DELAY_PROBE_TIME),
+ -			 NEIGH_VAR(&nd_tbl.parms, DELAY_PROBE_TIME));
+ -#else
+ -	interval = NEIGH_VAR(&arp_tbl.parms, DELAY_PROBE_TIME);
+ -#endif
+ -	mlxsw_sp->router->neighs_update.interval = jiffies_to_msecs(interval);
+ -}
+ +		mlxsw_sp = mlxsw_sp_port->mlxsw_sp;
+ +		interval = jiffies_to_msecs(NEIGH_VAR(p, DELAY_PROBE_TIME));
+ +		mlxsw_sp->router.neighs_update.interval = interval;
+  
+ -static void mlxsw_sp_router_neigh_ent_ipv4_process(struct mlxsw_sp *mlxsw_sp,
+ -						   char *rauhtd_pl,
+ -						   int ent_index)
+ -{
+ -	struct net_device *dev;
+ -	struct neighbour *n;
+ -	__be32 dipn;
+ -	u32 dip;
+ -	u16 rif;
+ +		mlxsw_sp_port_dev_put(mlxsw_sp_port);
+ +		break;
+ +	case NETEVENT_NEIGH_UPDATE:
+ +		n = ptr;
+  
+ -	mlxsw_reg_rauhtd_ent_ipv4_unpack(rauhtd_pl, ent_index, &rif, &dip);
+ +		if (n->tbl != &arp_tbl)
+ +			return NOTIFY_DONE;
+  
+ -	if (!mlxsw_sp->router->rifs[rif]) {
+ -		dev_err_ratelimited(mlxsw_sp->bus_info->dev, "Incorrect RIF in neighbour entry\n");
+ -		return;
+ -	}
+ +		mlxsw_sp_port = mlxsw_sp_port_lower_dev_hold(n->dev);
+ +		if (!mlxsw_sp_port)
+ +			return NOTIFY_DONE;
+  
+ -	dipn = htonl(dip);
+ -	dev = mlxsw_sp->router->rifs[rif]->dev;
+ -	n = neigh_lookup(&arp_tbl, &dipn, dev);
+ -	if (!n) {
+ -		netdev_err(dev, "Failed to find matching neighbour for IP=%pI4h\n",
+ -			   &dip);
+ -		return;
+ +		neigh_work = kzalloc(sizeof(*neigh_work), GFP_ATOMIC);
+ +		if (!neigh_work) {
+ +			mlxsw_sp_port_dev_put(mlxsw_sp_port);
+ +			return NOTIFY_BAD;
+ +		}
+ +
+ +		INIT_WORK(&neigh_work->work, mlxsw_sp_router_neigh_event_work);
+ +		neigh_work->mlxsw_sp = mlxsw_sp_port->mlxsw_sp;
+ +		neigh_work->n = n;
+ +
+ +		/* Take a reference to ensure the neighbour won't be
+ +		 * destructed until we drop the reference in delayed
+ +		 * work.
+ +		 */
+ +		neigh_clone(n);
+ +		mlxsw_core_schedule_work(&neigh_work->work);
+ +		mlxsw_sp_port_dev_put(mlxsw_sp_port);
+ +		break;
+  	}
+  
+ -	netdev_dbg(dev, "Updating neighbour with IP=%pI4h\n", &dip);
+ -	neigh_event_send(n, NULL);
+ -	neigh_release(n);
+ +	return NOTIFY_DONE;
+  }
+  
+ -#if IS_ENABLED(CONFIG_IPV6)
+ -static void mlxsw_sp_router_neigh_ent_ipv6_process(struct mlxsw_sp *mlxsw_sp,
+ -						   char *rauhtd_pl,
+ -						   int rec_index)
+ +static int mlxsw_sp_neigh_init(struct mlxsw_sp *mlxsw_sp)
+  {
+ -	struct net_device *dev;
+ -	struct neighbour *n;
+ -	struct in6_addr dip;
+ -	u16 rif;
+ -
+ -	mlxsw_reg_rauhtd_ent_ipv6_unpack(rauhtd_pl, rec_index, &rif,
+ -					 (char *) &dip);
+ +	int err;
+  
+ -	if (!mlxsw_sp->router->rifs[rif]) {
+ -		dev_err_ratelimited(mlxsw_sp->bus_info->dev, "Incorrect RIF in neighbour entry\n");
+ -		return;
+ -	}
+ +	err = rhashtable_init(&mlxsw_sp->router.neigh_ht,
+ +			      &mlxsw_sp_neigh_ht_params);
+ +	if (err)
+ +		return err;
+  
+ -	dev = mlxsw_sp->router->rifs[rif]->dev;
+ -	n = neigh_lookup(&nd_tbl, &dip, dev);
+ -	if (!n) {
+ -		netdev_err(dev, "Failed to find matching neighbour for IP=%pI6c\n",
+ -			   &dip);
+ -		return;
+ -	}
+ +	/* Initialize the polling interval according to the default
+ +	 * table.
+ +	 */
+ +	mlxsw_sp_router_neighs_update_interval_init(mlxsw_sp);
+  
+ -	netdev_dbg(dev, "Updating neighbour with IP=%pI6c\n", &dip);
+ -	neigh_event_send(n, NULL);
+ -	neigh_release(n);
+ +	/* Create the delayed works for the activity_update */
+ +	INIT_DELAYED_WORK(&mlxsw_sp->router.neighs_update.dw,
+ +			  mlxsw_sp_router_neighs_update_work);
+ +	INIT_DELAYED_WORK(&mlxsw_sp->router.nexthop_probe_dw,
+ +			  mlxsw_sp_router_probe_unresolved_nexthops);
+ +	mlxsw_core_schedule_dw(&mlxsw_sp->router.neighs_update.dw, 0);
+ +	mlxsw_core_schedule_dw(&mlxsw_sp->router.nexthop_probe_dw, 0);
+ +	return 0;
+  }
+ -#else
+ -static void mlxsw_sp_router_neigh_ent_ipv6_process(struct mlxsw_sp *mlxsw_sp,
+ -						   char *rauhtd_pl,
+ -						   int rec_index)
+ +
+ +static void mlxsw_sp_neigh_fini(struct mlxsw_sp *mlxsw_sp)
+  {
+ +	cancel_delayed_work_sync(&mlxsw_sp->router.neighs_update.dw);
+ +	cancel_delayed_work_sync(&mlxsw_sp->router.nexthop_probe_dw);
+ +	rhashtable_destroy(&mlxsw_sp->router.neigh_ht);
+  }
+ -#endif
+  
+ -static void mlxsw_sp_router_neigh_rec_ipv4_process(struct mlxsw_sp *mlxsw_sp,
+ -						   char *rauhtd_pl,
+ -						   int rec_index)
+ +static int mlxsw_sp_neigh_rif_flush(struct mlxsw_sp *mlxsw_sp,
+ +				    const struct mlxsw_sp_rif *r)
+  {
+ -	u8 num_entries;
+ -	int i;
+ -
+ -	num_entries = mlxsw_reg_rauhtd_ipv4_rec_num_entries_get(rauhtd_pl,
+ -								rec_index);
+ -	/* Hardware starts counting at 0, so add 1. */
+ -	num_entries++;
+ -
+ -	/* Each record consists of several neighbour entries. */
+ -	for (i = 0; i < num_entries; i++) {
+ -		int ent_index;
+ -
+ -		ent_index = rec_index * MLXSW_REG_RAUHTD_IPV4_ENT_PER_REC + i;
+ -		mlxsw_sp_router_neigh_ent_ipv4_process(mlxsw_sp, rauhtd_pl,
+ -						       ent_index);
+ -	}
+ +	char rauht_pl[MLXSW_REG_RAUHT_LEN];
+  
+ +	mlxsw_reg_rauht_pack(rauht_pl, MLXSW_REG_RAUHT_OP_WRITE_DELETE_ALL,
+ +			     r->rif, r->addr);
+ +	return mlxsw_reg_write(mlxsw_sp->core, MLXSW_REG(rauht), rauht_pl);
+  }
+  
+ -static void mlxsw_sp_router_neigh_rec_ipv6_process(struct mlxsw_sp *mlxsw_sp,
+ -						   char *rauhtd_pl,
+ -						   int rec_index)
+ +static void mlxsw_sp_neigh_rif_gone_sync(struct mlxsw_sp *mlxsw_sp,
+ +					 struct mlxsw_sp_rif *r)
+  {
+ -	/* One record contains one entry. */
+ -	mlxsw_sp_router_neigh_ent_ipv6_process(mlxsw_sp, rauhtd_pl,
+ -					       rec_index);
+ -}
+ +	struct mlxsw_sp_neigh_entry *neigh_entry, *tmp;
+  
+ -static void mlxsw_sp_router_neigh_rec_process(struct mlxsw_sp *mlxsw_sp,
+ -					      char *rauhtd_pl, int rec_index)
+ -{
+ -	switch (mlxsw_reg_rauhtd_rec_type_get(rauhtd_pl, rec_index)) {
+ -	case MLXSW_REG_RAUHTD_TYPE_IPV4:
+ -		mlxsw_sp_router_neigh_rec_ipv4_process(mlxsw_sp, rauhtd_pl,
+ -						       rec_index);
+ -		break;
+ -	case MLXSW_REG_RAUHTD_TYPE_IPV6:
+ -		mlxsw_sp_router_neigh_rec_ipv6_process(mlxsw_sp, rauhtd_pl,
+ -						       rec_index);
+ -		break;
+ -	}
+ +	mlxsw_sp_neigh_rif_flush(mlxsw_sp, r);
+ +	list_for_each_entry_safe(neigh_entry, tmp, &r->neigh_list,
+ +				 rif_list_node)
+ +		mlxsw_sp_neigh_entry_destroy(mlxsw_sp, neigh_entry);
+  }
+  
+ -static bool mlxsw_sp_router_rauhtd_is_full(char *rauhtd_pl)
+ -{
+ -	u8 num_rec, last_rec_index, num_entries;
+ +struct mlxsw_sp_nexthop_key {
+ +	struct fib_nh *fib_nh;
+ +};
+  
+ -	num_rec = mlxsw_reg_rauhtd_num_rec_get(rauhtd_pl);
+ -	last_rec_index = num_rec - 1;
+ +struct mlxsw_sp_nexthop {
+ +	struct list_head neigh_list_node; /* member of neigh entry list */
+ +	struct list_head rif_list_node;
+ +	struct mlxsw_sp_nexthop_group *nh_grp; /* pointer back to the group
+ +						* this belongs to
+ +						*/
+ +	struct rhash_head ht_node;
+ +	struct mlxsw_sp_nexthop_key key;
+ +	struct mlxsw_sp_rif *r;
+ +	u8 should_offload:1, /* set indicates this neigh is connected and
+ +			      * should be put to KVD linear area of this group.
+ +			      */
+ +	   offloaded:1, /* set in case the neigh is actually put into
+ +			 * KVD linear area of this group.
+ +			 */
+ +	   update:1; /* set indicates that MAC of this neigh should be
+ +		      * updated in HW
+ +		      */
+ +	struct mlxsw_sp_neigh_entry *neigh_entry;
+ +};
+  
+ -	if (num_rec < MLXSW_REG_RAUHTD_REC_MAX_NUM)
+ -		return false;
+ -	if (mlxsw_reg_rauhtd_rec_type_get(rauhtd_pl, last_rec_index) ==
+ -	    MLXSW_REG_RAUHTD_TYPE_IPV6)
+ -		return true;
+ +struct mlxsw_sp_nexthop_group_key {
+ +	struct fib_info *fi;
+ +};
+  
+ -	num_entries = mlxsw_reg_rauhtd_ipv4_rec_num_entries_get(rauhtd_pl,
+ -								last_rec_index);
+ -	if (++num_entries == MLXSW_REG_RAUHTD_IPV4_ENT_PER_REC)
+ -		return true;
+ -	return false;
+ -}
+ +struct mlxsw_sp_nexthop_group {
+ +	struct rhash_head ht_node;
+ +	struct list_head fib_list; /* list of fib entries that use this group */
+ +	struct mlxsw_sp_nexthop_group_key key;
+ +	u8 adj_index_valid:1,
+ +	   gateway:1; /* routes using the group use a gateway */
+ +	u32 adj_index;
+ +	u16 ecmp_size;
+ +	u16 count;
+ +	struct mlxsw_sp_nexthop nexthops[0];
+ +#define nh_rif	nexthops[0].r
+ +};
+  
+ -static int
+ -__mlxsw_sp_router_neighs_update_rauhtd(struct mlxsw_sp *mlxsw_sp,
+ -				       char *rauhtd_pl,
+ -				       enum mlxsw_reg_rauhtd_type type)
+++<<<<<<< HEAD
+++=======
+++void mlxsw_sp_nexthop_counter_alloc(struct mlxsw_sp *mlxsw_sp,
+++				    struct mlxsw_sp_nexthop *nh)
++ {
+ -	int i, num_rec;
+ -	int err;
+++	struct devlink *devlink;
++ 
+ -	/* Make sure the neighbour's netdev isn't removed in the
+ -	 * process.
+ -	 */
+ -	rtnl_lock();
+ -	do {
+ -		mlxsw_reg_rauhtd_pack(rauhtd_pl, type);
+ -		err = mlxsw_reg_query(mlxsw_sp->core, MLXSW_REG(rauhtd),
+ -				      rauhtd_pl);
+ -		if (err) {
+ -			dev_err_ratelimited(mlxsw_sp->bus_info->dev, "Failed to dump neighbour talbe\n");
+ -			break;
+ -		}
+ -		num_rec = mlxsw_reg_rauhtd_num_rec_get(rauhtd_pl);
+ -		for (i = 0; i < num_rec; i++)
+ -			mlxsw_sp_router_neigh_rec_process(mlxsw_sp, rauhtd_pl,
+ -							  i);
+ -	} while (mlxsw_sp_router_rauhtd_is_full(rauhtd_pl));
+ -	rtnl_unlock();
+++	devlink = priv_to_devlink(mlxsw_sp->core);
+++	if (!devlink_dpipe_table_counter_enabled(devlink,
+++						 MLXSW_SP_DPIPE_TABLE_NAME_ADJ))
+++		return;
++ 
+ -	return err;
+++	if (mlxsw_sp_flow_counter_alloc(mlxsw_sp, &nh->counter_index))
+++		return;
+++
+++	nh->counter_valid = true;
++ }
++ 
+ -static int mlxsw_sp_router_neighs_update_rauhtd(struct mlxsw_sp *mlxsw_sp)
+++void mlxsw_sp_nexthop_counter_free(struct mlxsw_sp *mlxsw_sp,
+++				   struct mlxsw_sp_nexthop *nh)
++ {
+ -	enum mlxsw_reg_rauhtd_type type;
+ -	char *rauhtd_pl;
+ -	int err;
+ -
+ -	rauhtd_pl = kmalloc(MLXSW_REG_RAUHTD_LEN, GFP_KERNEL);
+ -	if (!rauhtd_pl)
+ -		return -ENOMEM;
+ -
+ -	type = MLXSW_REG_RAUHTD_TYPE_IPV4;
+ -	err = __mlxsw_sp_router_neighs_update_rauhtd(mlxsw_sp, rauhtd_pl, type);
+ -	if (err)
+ -		goto out;
+ -
+ -	type = MLXSW_REG_RAUHTD_TYPE_IPV6;
+ -	err = __mlxsw_sp_router_neighs_update_rauhtd(mlxsw_sp, rauhtd_pl, type);
+ -out:
+ -	kfree(rauhtd_pl);
+ -	return err;
+++	if (!nh->counter_valid)
+++		return;
+++	mlxsw_sp_flow_counter_free(mlxsw_sp, nh->counter_index);
+++	nh->counter_valid = false;
++ }
++ 
+ -static void mlxsw_sp_router_neighs_update_nh(struct mlxsw_sp *mlxsw_sp)
+++int mlxsw_sp_nexthop_counter_get(struct mlxsw_sp *mlxsw_sp,
+++				 struct mlxsw_sp_nexthop *nh, u64 *p_counter)
++ {
+ -	struct mlxsw_sp_neigh_entry *neigh_entry;
+++	if (!nh->counter_valid)
+++		return -EINVAL;
++ 
+ -	/* Take RTNL mutex here to prevent lists from changes */
+ -	rtnl_lock();
+ -	list_for_each_entry(neigh_entry, &mlxsw_sp->router->nexthop_neighs_list,
+ -			    nexthop_neighs_list_node)
+ -		/* If this neigh have nexthops, make the kernel think this neigh
+ -		 * is active regardless of the traffic.
+ -		 */
+ -		neigh_event_send(neigh_entry->key.n, NULL);
+ -	rtnl_unlock();
+++	return mlxsw_sp_flow_counter_get(mlxsw_sp, nh->counter_index,
+++					 p_counter, NULL);
++ }
++ 
+ -static void
+ -mlxsw_sp_router_neighs_update_work_schedule(struct mlxsw_sp *mlxsw_sp)
+++struct mlxsw_sp_nexthop *mlxsw_sp_nexthop_next(struct mlxsw_sp_router *router,
+++					       struct mlxsw_sp_nexthop *nh)
++ {
+ -	unsigned long interval = mlxsw_sp->router->neighs_update.interval;
+ -
+ -	mlxsw_core_schedule_dw(&mlxsw_sp->router->neighs_update.dw,
+ -			       msecs_to_jiffies(interval));
+++	if (!nh) {
+++		if (list_empty(&router->nexthop_list))
+++			return NULL;
+++		else
+++			return list_first_entry(&router->nexthop_list,
+++						typeof(*nh), router_list_node);
+++	}
+++	if (list_is_last(&nh->router_list_node, &router->nexthop_list))
+++		return NULL;
+++	return list_next_entry(nh, router_list_node);
++ }
++ 
+ -static void mlxsw_sp_router_neighs_update_work(struct work_struct *work)
+++bool mlxsw_sp_nexthop_offload(struct mlxsw_sp_nexthop *nh)
++ {
+ -	struct mlxsw_sp_router *router;
+ -	int err;
+ -
+ -	router = container_of(work, struct mlxsw_sp_router,
+ -			      neighs_update.dw.work);
+ -	err = mlxsw_sp_router_neighs_update_rauhtd(router->mlxsw_sp);
+ -	if (err)
+ -		dev_err(router->mlxsw_sp->bus_info->dev, "Could not update kernel for neigh activity");
+ -
+ -	mlxsw_sp_router_neighs_update_nh(router->mlxsw_sp);
+ -
+ -	mlxsw_sp_router_neighs_update_work_schedule(router->mlxsw_sp);
+++	return nh->offloaded;
++ }
++ 
+ -static void mlxsw_sp_router_probe_unresolved_nexthops(struct work_struct *work)
+++unsigned char *mlxsw_sp_nexthop_ha(struct mlxsw_sp_nexthop *nh)
++ {
+ -	struct mlxsw_sp_neigh_entry *neigh_entry;
+ -	struct mlxsw_sp_router *router;
+++	if (!nh->offloaded)
+++		return NULL;
+++	return nh->neigh_entry->ha;
+++}
++ 
+ -	router = container_of(work, struct mlxsw_sp_router,
+ -			      nexthop_probe_dw.work);
+ -	/* Iterate over nexthop neighbours, find those who are unresolved and
+ -	 * send arp on them. This solves the chicken-egg problem when
+ -	 * the nexthop wouldn't get offloaded until the neighbor is resolved
+ -	 * but it wouldn't get resolved ever in case traffic is flowing in HW
+ -	 * using different nexthop.
+ -	 *
+ -	 * Take RTNL mutex here to prevent lists from changes.
+ -	 */
+ -	rtnl_lock();
+ -	list_for_each_entry(neigh_entry, &router->nexthop_neighs_list,
+ -			    nexthop_neighs_list_node)
+ -		if (!neigh_entry->connected)
+ -			neigh_event_send(neigh_entry->key.n, NULL);
+ -	rtnl_unlock();
+++int mlxsw_sp_nexthop_indexes(struct mlxsw_sp_nexthop *nh, u32 *p_adj_index,
+++			     u32 *p_adj_hash_index)
+++{
+++	struct mlxsw_sp_nexthop_group *nh_grp = nh->nh_grp;
+++	u32 adj_hash_index = 0;
+++	int i;
++ 
+ -	mlxsw_core_schedule_dw(&router->nexthop_probe_dw,
+ -			       MLXSW_SP_UNRESOLVED_NH_PROBE_INTERVAL);
+ -}
+++	if (!nh->offloaded || !nh_grp->adj_index_valid)
+++		return -EINVAL;
++ 
+ -static void
+ -mlxsw_sp_nexthop_neigh_update(struct mlxsw_sp *mlxsw_sp,
+ -			      struct mlxsw_sp_neigh_entry *neigh_entry,
+ -			      bool removing);
+++	*p_adj_index = nh_grp->adj_index;
++ 
+ -static enum mlxsw_reg_rauht_op mlxsw_sp_rauht_op(bool adding)
+ -{
+ -	return adding ? MLXSW_REG_RAUHT_OP_WRITE_ADD :
+ -			MLXSW_REG_RAUHT_OP_WRITE_DELETE;
+ -}
+++	for (i = 0; i < nh_grp->count; i++) {
+++		struct mlxsw_sp_nexthop *nh_iter = &nh_grp->nexthops[i];
++ 
+ -static void
+ -mlxsw_sp_router_neigh_entry_op4(struct mlxsw_sp *mlxsw_sp,
+ -				struct mlxsw_sp_neigh_entry *neigh_entry,
+ -				enum mlxsw_reg_rauht_op op)
+ -{
+ -	struct neighbour *n = neigh_entry->key.n;
+ -	u32 dip = ntohl(*((__be32 *) n->primary_key));
+ -	char rauht_pl[MLXSW_REG_RAUHT_LEN];
+++		if (nh_iter == nh)
+++			break;
+++		if (nh_iter->offloaded)
+++			adj_hash_index++;
+++	}
++ 
+ -	mlxsw_reg_rauht_pack4(rauht_pl, op, neigh_entry->rif, neigh_entry->ha,
+ -			      dip);
+ -	if (neigh_entry->counter_valid)
+ -		mlxsw_reg_rauht_pack_counter(rauht_pl,
+ -					     neigh_entry->counter_index);
+ -	mlxsw_reg_write(mlxsw_sp->core, MLXSW_REG(rauht), rauht_pl);
+++	*p_adj_hash_index = adj_hash_index;
+++	return 0;
++ }
++ 
+ -static void
+ -mlxsw_sp_router_neigh_entry_op6(struct mlxsw_sp *mlxsw_sp,
+ -				struct mlxsw_sp_neigh_entry *neigh_entry,
+ -				enum mlxsw_reg_rauht_op op)
+++struct mlxsw_sp_rif *mlxsw_sp_nexthop_rif(struct mlxsw_sp_nexthop *nh)
++ {
+ -	struct neighbour *n = neigh_entry->key.n;
+ -	char rauht_pl[MLXSW_REG_RAUHT_LEN];
+ -	const char *dip = n->primary_key;
+ -
+ -	mlxsw_reg_rauht_pack6(rauht_pl, op, neigh_entry->rif, neigh_entry->ha,
+ -			      dip);
+ -	if (neigh_entry->counter_valid)
+ -		mlxsw_reg_rauht_pack_counter(rauht_pl,
+ -					     neigh_entry->counter_index);
+ -	mlxsw_reg_write(mlxsw_sp->core, MLXSW_REG(rauht), rauht_pl);
+++	return nh->rif;
++ }
++ 
+ -bool mlxsw_sp_neigh_ipv6_ignore(struct mlxsw_sp_neigh_entry *neigh_entry)
+++bool mlxsw_sp_nexthop_group_has_ipip(struct mlxsw_sp_nexthop *nh)
++ {
+ -	struct neighbour *n = neigh_entry->key.n;
+++	struct mlxsw_sp_nexthop_group *nh_grp = nh->nh_grp;
+++	int i;
++ 
+ -	/* Packets with a link-local destination address are trapped
+ -	 * after LPM lookup and never reach the neighbour table, so
+ -	 * there is no need to program such neighbours to the device.
+ -	 */
+ -	if (ipv6_addr_type((struct in6_addr *) &n->primary_key) &
+ -	    IPV6_ADDR_LINKLOCAL)
+ -		return true;
+++	for (i = 0; i < nh_grp->count; i++) {
+++		struct mlxsw_sp_nexthop *nh_iter = &nh_grp->nexthops[i];
+++
+++		if (nh_iter->type == MLXSW_SP_NEXTHOP_TYPE_IPIP)
+++			return true;
+++	}
++ 	return false;
++ }
++ 
+ -static void
+ -mlxsw_sp_neigh_entry_update(struct mlxsw_sp *mlxsw_sp,
+ -			    struct mlxsw_sp_neigh_entry *neigh_entry,
+ -			    bool adding)
+ -{
+ -	if (!adding && !neigh_entry->connected)
+ -		return;
+ -	neigh_entry->connected = adding;
+ -	if (neigh_entry->key.n->tbl->family == AF_INET) {
+ -		mlxsw_sp_router_neigh_entry_op4(mlxsw_sp, neigh_entry,
+ -						mlxsw_sp_rauht_op(adding));
+ -	} else if (neigh_entry->key.n->tbl->family == AF_INET6) {
+ -		if (mlxsw_sp_neigh_ipv6_ignore(neigh_entry))
+ -			return;
+ -		mlxsw_sp_router_neigh_entry_op6(mlxsw_sp, neigh_entry,
+ -						mlxsw_sp_rauht_op(adding));
+ -	} else {
+ -		WARN_ON_ONCE(1);
+ -	}
+ -}
+ -
+ -void
+ -mlxsw_sp_neigh_entry_counter_update(struct mlxsw_sp *mlxsw_sp,
+ -				    struct mlxsw_sp_neigh_entry *neigh_entry,
+ -				    bool adding)
+++static struct fib_info *
+++mlxsw_sp_nexthop4_group_fi(const struct mlxsw_sp_nexthop_group *nh_grp)
++ {
+ -	if (adding)
+ -		mlxsw_sp_neigh_counter_alloc(mlxsw_sp, neigh_entry);
+ -	else
+ -		mlxsw_sp_neigh_counter_free(mlxsw_sp, neigh_entry);
+ -	mlxsw_sp_neigh_entry_update(mlxsw_sp, neigh_entry, true);
+++	return nh_grp->priv;
++ }
++ 
+ -struct mlxsw_sp_neigh_event_work {
+ -	struct work_struct work;
+ -	struct mlxsw_sp *mlxsw_sp;
+ -	struct neighbour *n;
+++struct mlxsw_sp_nexthop_group_cmp_arg {
+++	enum mlxsw_sp_l3proto proto;
+++	union {
+++		struct fib_info *fi;
+++		struct mlxsw_sp_fib6_entry *fib6_entry;
+++	};
++ };
++ 
+ -static void mlxsw_sp_router_neigh_event_work(struct work_struct *work)
+++static bool
+++mlxsw_sp_nexthop6_group_has_nexthop(const struct mlxsw_sp_nexthop_group *nh_grp,
+++				    const struct in6_addr *gw, int ifindex)
++ {
+ -	struct mlxsw_sp_neigh_event_work *neigh_work =
+ -		container_of(work, struct mlxsw_sp_neigh_event_work, work);
+ -	struct mlxsw_sp *mlxsw_sp = neigh_work->mlxsw_sp;
+ -	struct mlxsw_sp_neigh_entry *neigh_entry;
+ -	struct neighbour *n = neigh_work->n;
+ -	unsigned char ha[ETH_ALEN];
+ -	bool entry_connected;
+ -	u8 nud_state, dead;
+++	int i;
++ 
+ -	/* If these parameters are changed after we release the lock,
+ -	 * then we are guaranteed to receive another event letting us
+ -	 * know about it.
+ -	 */
+ -	read_lock_bh(&n->lock);
+ -	memcpy(ha, n->ha, ETH_ALEN);
+ -	nud_state = n->nud_state;
+ -	dead = n->dead;
+ -	read_unlock_bh(&n->lock);
+++	for (i = 0; i < nh_grp->count; i++) {
+++		const struct mlxsw_sp_nexthop *nh;
++ 
+ -	rtnl_lock();
+ -	entry_connected = nud_state & NUD_VALID && !dead;
+ -	neigh_entry = mlxsw_sp_neigh_entry_lookup(mlxsw_sp, n);
+ -	if (!entry_connected && !neigh_entry)
+ -		goto out;
+ -	if (!neigh_entry) {
+ -		neigh_entry = mlxsw_sp_neigh_entry_create(mlxsw_sp, n);
+ -		if (IS_ERR(neigh_entry))
+ -			goto out;
+++		nh = &nh_grp->nexthops[i];
+++		if (nh->ifindex == ifindex &&
+++		    ipv6_addr_equal(gw, (struct in6_addr *) nh->gw_addr))
+++			return true;
++ 	}
++ 
+ -	memcpy(neigh_entry->ha, ha, ETH_ALEN);
+ -	mlxsw_sp_neigh_entry_update(mlxsw_sp, neigh_entry, entry_connected);
+ -	mlxsw_sp_nexthop_neigh_update(mlxsw_sp, neigh_entry, !entry_connected);
+ -
+ -	if (!neigh_entry->connected && list_empty(&neigh_entry->nexthop_list))
+ -		mlxsw_sp_neigh_entry_destroy(mlxsw_sp, neigh_entry);
+ -
+ -out:
+ -	rtnl_unlock();
+ -	neigh_release(n);
+ -	kfree(neigh_work);
+++	return false;
++ }
++ 
+ -int mlxsw_sp_router_netevent_event(struct notifier_block *unused,
+ -				   unsigned long event, void *ptr)
+++static bool
+++mlxsw_sp_nexthop6_group_cmp(const struct mlxsw_sp_nexthop_group *nh_grp,
+++			    const struct mlxsw_sp_fib6_entry *fib6_entry)
++ {
+ -	struct mlxsw_sp_neigh_event_work *neigh_work;
+ -	struct mlxsw_sp_port *mlxsw_sp_port;
+ -	struct mlxsw_sp *mlxsw_sp;
+ -	unsigned long interval;
+ -	struct neigh_parms *p;
+ -	struct neighbour *n;
+++	struct mlxsw_sp_rt6 *mlxsw_sp_rt6;
++ 
+ -	switch (event) {
+ -	case NETEVENT_DELAY_PROBE_TIME_UPDATE:
+ -		p = ptr;
+++	if (nh_grp->count != fib6_entry->nrt6)
+++		return false;
++ 
+ -		/* We don't care about changes in the default table. */
+ -		if (!p->dev || (p->tbl->family != AF_INET &&
+ -				p->tbl->family != AF_INET6))
+ -			return NOTIFY_DONE;
+++	list_for_each_entry(mlxsw_sp_rt6, &fib6_entry->rt6_list, list) {
+++		struct in6_addr *gw;
+++		int ifindex;
++ 
+ -		/* We are in atomic context and can't take RTNL mutex,
+ -		 * so use RCU variant to walk the device chain.
+ -		 */
+ -		mlxsw_sp_port = mlxsw_sp_port_lower_dev_hold(p->dev);
+ -		if (!mlxsw_sp_port)
+ -			return NOTIFY_DONE;
+++		ifindex = mlxsw_sp_rt6->rt->dst.dev->ifindex;
+++		gw = &mlxsw_sp_rt6->rt->rt6i_gateway;
+++		if (!mlxsw_sp_nexthop6_group_has_nexthop(nh_grp, gw, ifindex))
+++			return false;
+++	}
++ 
+ -		mlxsw_sp = mlxsw_sp_port->mlxsw_sp;
+ -		interval = jiffies_to_msecs(NEIGH_VAR(p, DELAY_PROBE_TIME));
+ -		mlxsw_sp->router->neighs_update.interval = interval;
+++	return true;
+++}
++ 
+ -		mlxsw_sp_port_dev_put(mlxsw_sp_port);
+ -		break;
+ -	case NETEVENT_NEIGH_UPDATE:
+ -		n = ptr;
+++static int
+++mlxsw_sp_nexthop_group_cmp(struct rhashtable_compare_arg *arg, const void *ptr)
+++{
+++	const struct mlxsw_sp_nexthop_group_cmp_arg *cmp_arg = arg->key;
+++	const struct mlxsw_sp_nexthop_group *nh_grp = ptr;
++ 
+ -		if (n->tbl->family != AF_INET && n->tbl->family != AF_INET6)
+ -			return NOTIFY_DONE;
+++	switch (cmp_arg->proto) {
+++	case MLXSW_SP_L3_PROTO_IPV4:
+++		return cmp_arg->fi != mlxsw_sp_nexthop4_group_fi(nh_grp);
+++	case MLXSW_SP_L3_PROTO_IPV6:
+++		return !mlxsw_sp_nexthop6_group_cmp(nh_grp,
+++						    cmp_arg->fib6_entry);
+++	default:
+++		WARN_ON(1);
+++		return 1;
+++	}
+++}
++ 
+ -		mlxsw_sp_port = mlxsw_sp_port_lower_dev_hold(n->dev);
+ -		if (!mlxsw_sp_port)
+ -			return NOTIFY_DONE;
+++static int
+++mlxsw_sp_nexthop_group_type(const struct mlxsw_sp_nexthop_group *nh_grp)
+++{
+++	return nh_grp->neigh_tbl->family;
+++}
++ 
+ -		neigh_work = kzalloc(sizeof(*neigh_work), GFP_ATOMIC);
+ -		if (!neigh_work) {
+ -			mlxsw_sp_port_dev_put(mlxsw_sp_port);
+ -			return NOTIFY_BAD;
+++static u32 mlxsw_sp_nexthop_group_hash_obj(const void *data, u32 len, u32 seed)
+++{
+++	const struct mlxsw_sp_nexthop_group *nh_grp = data;
+++	const struct mlxsw_sp_nexthop *nh;
+++	struct fib_info *fi;
+++	unsigned int val;
+++	int i;
+++
+++	switch (mlxsw_sp_nexthop_group_type(nh_grp)) {
+++	case AF_INET:
+++		fi = mlxsw_sp_nexthop4_group_fi(nh_grp);
+++		return jhash(&fi, sizeof(fi), seed);
+++	case AF_INET6:
+++		val = nh_grp->count;
+++		for (i = 0; i < nh_grp->count; i++) {
+++			nh = &nh_grp->nexthops[i];
+++			val ^= nh->ifindex;
++ 		}
+++		return jhash(&val, sizeof(val), seed);
+++	default:
+++		WARN_ON(1);
+++		return 0;
+++	}
+++}
++ 
+ -		INIT_WORK(&neigh_work->work, mlxsw_sp_router_neigh_event_work);
+ -		neigh_work->mlxsw_sp = mlxsw_sp_port->mlxsw_sp;
+ -		neigh_work->n = n;
+++static u32
+++mlxsw_sp_nexthop6_group_hash(struct mlxsw_sp_fib6_entry *fib6_entry, u32 seed)
+++{
+++	unsigned int val = fib6_entry->nrt6;
+++	struct mlxsw_sp_rt6 *mlxsw_sp_rt6;
+++	struct net_device *dev;
++ 
+ -		/* Take a reference to ensure the neighbour won't be
+ -		 * destructed until we drop the reference in delayed
+ -		 * work.
+ -		 */
+ -		neigh_clone(n);
+ -		mlxsw_core_schedule_work(&neigh_work->work);
+ -		mlxsw_sp_port_dev_put(mlxsw_sp_port);
+ -		break;
+++	list_for_each_entry(mlxsw_sp_rt6, &fib6_entry->rt6_list, list) {
+++		dev = mlxsw_sp_rt6->rt->dst.dev;
+++		val ^= dev->ifindex;
++ 	}
++ 
+ -	return NOTIFY_DONE;
+++	return jhash(&val, sizeof(val), seed);
++ }
++ 
+ -static int mlxsw_sp_neigh_init(struct mlxsw_sp *mlxsw_sp)
+++static u32
+++mlxsw_sp_nexthop_group_hash(const void *data, u32 len, u32 seed)
++ {
+ -	int err;
+++	const struct mlxsw_sp_nexthop_group_cmp_arg *cmp_arg = data;
++ 
+ -	err = rhashtable_init(&mlxsw_sp->router->neigh_ht,
+ -			      &mlxsw_sp_neigh_ht_params);
+ -	if (err)
+ -		return err;
+++	switch (cmp_arg->proto) {
+++	case MLXSW_SP_L3_PROTO_IPV4:
+++		return jhash(&cmp_arg->fi, sizeof(cmp_arg->fi), seed);
+++	case MLXSW_SP_L3_PROTO_IPV6:
+++		return mlxsw_sp_nexthop6_group_hash(cmp_arg->fib6_entry, seed);
+++	default:
+++		WARN_ON(1);
+++		return 0;
+++	}
+++}
++ 
+ -	/* Initialize the polling interval according to the default
+ -	 * table.
+ -	 */
+ -	mlxsw_sp_router_neighs_update_interval_init(mlxsw_sp);
+++>>>>>>> 427e652aa34d (mlxsw: spectrum_dpipe: Add support for controlling nexthop counters)
+ +static const struct rhashtable_params mlxsw_sp_nexthop_group_ht_params = {
+ +	.key_offset = offsetof(struct mlxsw_sp_nexthop_group, key),
+ +	.head_offset = offsetof(struct mlxsw_sp_nexthop_group, ht_node),
+ +	.key_len = sizeof(struct mlxsw_sp_nexthop_group_key),
+ +};
+  
+ -	/* Create the delayed works for the activity_update */
+ -	INIT_DELAYED_WORK(&mlxsw_sp->router->neighs_update.dw,
+ -			  mlxsw_sp_router_neighs_update_work);
+ -	INIT_DELAYED_WORK(&mlxsw_sp->router->nexthop_probe_dw,
+ -			  mlxsw_sp_router_probe_unresolved_nexthops);
+ -	mlxsw_core_schedule_dw(&mlxsw_sp->router->neighs_update.dw, 0);
+ -	mlxsw_core_schedule_dw(&mlxsw_sp->router->nexthop_probe_dw, 0);
+ -	return 0;
+ +static int mlxsw_sp_nexthop_group_insert(struct mlxsw_sp *mlxsw_sp,
+ +					 struct mlxsw_sp_nexthop_group *nh_grp)
+ +{
+ +	return rhashtable_insert_fast(&mlxsw_sp->router.nexthop_group_ht,
+ +				      &nh_grp->ht_node,
+ +				      mlxsw_sp_nexthop_group_ht_params);
+  }
+  
+ -static void mlxsw_sp_neigh_fini(struct mlxsw_sp *mlxsw_sp)
+ +static void mlxsw_sp_nexthop_group_remove(struct mlxsw_sp *mlxsw_sp,
+ +					  struct mlxsw_sp_nexthop_group *nh_grp)
+  {
+ -	cancel_delayed_work_sync(&mlxsw_sp->router->neighs_update.dw);
+ -	cancel_delayed_work_sync(&mlxsw_sp->router->nexthop_probe_dw);
+ -	rhashtable_destroy(&mlxsw_sp->router->neigh_ht);
+ +	rhashtable_remove_fast(&mlxsw_sp->router.nexthop_group_ht,
+ +			       &nh_grp->ht_node,
+ +			       mlxsw_sp_nexthop_group_ht_params);
+  }
+  
+ -static void mlxsw_sp_neigh_rif_gone_sync(struct mlxsw_sp *mlxsw_sp,
+ -					 struct mlxsw_sp_rif *rif)
+ +static struct mlxsw_sp_nexthop_group *
+ +mlxsw_sp_nexthop_group_lookup(struct mlxsw_sp *mlxsw_sp,
+ +			      struct mlxsw_sp_nexthop_group_key key)
+  {
+ -	struct mlxsw_sp_neigh_entry *neigh_entry, *tmp;
+ -
+ -	list_for_each_entry_safe(neigh_entry, tmp, &rif->neigh_list,
+ -				 rif_list_node) {
+ -		mlxsw_sp_neigh_entry_update(mlxsw_sp, neigh_entry, false);
+ -		mlxsw_sp_neigh_entry_destroy(mlxsw_sp, neigh_entry);
+ -	}
+ +	return rhashtable_lookup_fast(&mlxsw_sp->router.nexthop_group_ht, &key,
+ +				      mlxsw_sp_nexthop_group_ht_params);
+  }
+  
+ -enum mlxsw_sp_nexthop_type {
+ -	MLXSW_SP_NEXTHOP_TYPE_ETH,
+ -	MLXSW_SP_NEXTHOP_TYPE_IPIP,
+ +static const struct rhashtable_params mlxsw_sp_nexthop_ht_params = {
+ +	.key_offset = offsetof(struct mlxsw_sp_nexthop, key),
+ +	.head_offset = offsetof(struct mlxsw_sp_nexthop, ht_node),
+ +	.key_len = sizeof(struct mlxsw_sp_nexthop_key),
+  };
+  
+ -struct mlxsw_sp_nexthop_key {
+ -	struct fib_nh *fib_nh;
+ -};
+ +static int mlxsw_sp_nexthop_insert(struct mlxsw_sp *mlxsw_sp,
+ +				   struct mlxsw_sp_nexthop *nh)
+ +{
+ +	return rhashtable_insert_fast(&mlxsw_sp->router.nexthop_ht,
+ +				      &nh->ht_node, mlxsw_sp_nexthop_ht_params);
+ +}
+  
+ -struct mlxsw_sp_nexthop {
+ -	struct list_head neigh_list_node; /* member of neigh entry list */
+ -	struct list_head rif_list_node;
+ -	struct list_head router_list_node;
+ -	struct mlxsw_sp_nexthop_group *nh_grp; /* pointer back to the group
+ -						* this belongs to
+ -						*/
+ -	struct rhash_head ht_node;
+ -	struct mlxsw_sp_nexthop_key key;
+ -	unsigned char gw_addr[sizeof(struct in6_addr)];
+ -	int ifindex;
+ -	struct mlxsw_sp_rif *rif;
+ -	u8 should_offload:1, /* set indicates this neigh is connected and
+ -			      * should be put to KVD linear area of this group.
+ -			      */
+ -	   offloaded:1, /* set in case the neigh is actually put into
+ -			 * KVD linear area of this group.
+ -			 */
+ -	   update:1; /* set indicates that MAC of this neigh should be
+ -		      * updated in HW
+ -		      */
+ -	enum mlxsw_sp_nexthop_type type;
+ -	union {
+ -		struct mlxsw_sp_neigh_entry *neigh_entry;
+ -		struct mlxsw_sp_ipip_entry *ipip_entry;
+ -	};
+ -	unsigned int counter_index;
+ -	bool counter_valid;
+ -};
+ -
+ -struct mlxsw_sp_nexthop_group {
+ -	void *priv;
+ -	struct rhash_head ht_node;
+ -	struct list_head fib_list; /* list of fib entries that use this group */
+ -	struct neigh_table *neigh_tbl;
+ -	u8 adj_index_valid:1,
+ -	   gateway:1; /* routes using the group use a gateway */
+ -	u32 adj_index;
+ -	u16 ecmp_size;
+ -	u16 count;
+ -	struct mlxsw_sp_nexthop nexthops[0];
+ -#define nh_rif	nexthops[0].rif
+ -};
+ -
+ -void mlxsw_sp_nexthop_counter_alloc(struct mlxsw_sp *mlxsw_sp,
+ +static void mlxsw_sp_nexthop_remove(struct mlxsw_sp *mlxsw_sp,
+  				    struct mlxsw_sp_nexthop *nh)
+  {
+ -	struct devlink *devlink;
+ -
+ -	devlink = priv_to_devlink(mlxsw_sp->core);
+ -	if (!devlink_dpipe_table_counter_enabled(devlink,
+ -						 MLXSW_SP_DPIPE_TABLE_NAME_ADJ))
+ -		return;
+ -
+ -	if (mlxsw_sp_flow_counter_alloc(mlxsw_sp, &nh->counter_index))
+ -		return;
+ -
+ -	nh->counter_valid = true;
+ +	rhashtable_remove_fast(&mlxsw_sp->router.nexthop_ht, &nh->ht_node,
+ +			       mlxsw_sp_nexthop_ht_params);
+  }
+  
+ -void mlxsw_sp_nexthop_counter_free(struct mlxsw_sp *mlxsw_sp,
+ -				   struct mlxsw_sp_nexthop *nh)
+ +static struct mlxsw_sp_nexthop *
+ +mlxsw_sp_nexthop_lookup(struct mlxsw_sp *mlxsw_sp,
+ +			struct mlxsw_sp_nexthop_key key)
+  {
+ -	if (!nh->counter_valid)
+ -		return;
+ -	mlxsw_sp_flow_counter_free(mlxsw_sp, nh->counter_index);
+ -	nh->counter_valid = false;
+ +	return rhashtable_lookup_fast(&mlxsw_sp->router.nexthop_ht, &key,
+ +				      mlxsw_sp_nexthop_ht_params);
+  }
+  
+ -int mlxsw_sp_nexthop_counter_get(struct mlxsw_sp *mlxsw_sp,
+ -				 struct mlxsw_sp_nexthop *nh, u64 *p_counter)
+ +static int mlxsw_sp_adj_index_mass_update_vr(struct mlxsw_sp *mlxsw_sp,
+ +					     const struct mlxsw_sp_fib *fib,
+ +					     u32 adj_index, u16 ecmp_size,
+ +					     u32 new_adj_index,
+ +					     u16 new_ecmp_size)
+  {
+ -	if (!nh->counter_valid)
+ -		return -EINVAL;
+ +	char raleu_pl[MLXSW_REG_RALEU_LEN];
+  
+ -	return mlxsw_sp_flow_counter_get(mlxsw_sp, nh->counter_index,
+ -					 p_counter, NULL);
+ +	mlxsw_reg_raleu_pack(raleu_pl,
+ +			     (enum mlxsw_reg_ralxx_protocol) fib->proto,
+ +			     fib->vr->id, adj_index, ecmp_size, new_adj_index,
+ +			     new_ecmp_size);
+ +	return mlxsw_reg_write(mlxsw_sp->core, MLXSW_REG(raleu), raleu_pl);
+  }
+  
+ -struct mlxsw_sp_nexthop *mlxsw_sp_nexthop_next(struct mlxsw_sp_router *router,
+ -					       struct mlxsw_sp_nexthop *nh)
+ +static int mlxsw_sp_adj_index_mass_update(struct mlxsw_sp *mlxsw_sp,
+ +					  struct mlxsw_sp_nexthop_group *nh_grp,
+ +					  u32 old_adj_index, u16 old_ecmp_size)
+  {
+ -	if (!nh) {
+ -		if (list_empty(&router->nexthop_list))
+ -			return NULL;
+ -		else
+ -			return list_first_entry(&router->nexthop_list,
+ -						typeof(*nh), router_list_node);
+ +	struct mlxsw_sp_fib_entry *fib_entry;
+ +	struct mlxsw_sp_fib *fib = NULL;
+ +	int err;
+ +
+ +	list_for_each_entry(fib_entry, &nh_grp->fib_list, nexthop_group_node) {
+ +		if (fib == fib_entry->fib_node->fib)
+ +			continue;
+ +		fib = fib_entry->fib_node->fib;
+ +		err = mlxsw_sp_adj_index_mass_update_vr(mlxsw_sp, fib,
+ +							old_adj_index,
+ +							old_ecmp_size,
+ +							nh_grp->adj_index,
+ +							nh_grp->ecmp_size);
+ +		if (err)
+ +			return err;
+  	}
+ -	if (list_is_last(&nh->router_list_node, &router->nexthop_list))
+ -		return NULL;
+ -	return list_next_entry(nh, router_list_node);
+ +	return 0;
+  }
+  
+ -bool mlxsw_sp_nexthop_offload(struct mlxsw_sp_nexthop *nh)
+++<<<<<<< HEAD
+ +static int mlxsw_sp_nexthop_mac_update(struct mlxsw_sp *mlxsw_sp, u32 adj_index,
+ +				       struct mlxsw_sp_nexthop *nh)
+++=======
+++int mlxsw_sp_nexthop_update(struct mlxsw_sp *mlxsw_sp, u32 adj_index,
+++			    struct mlxsw_sp_nexthop *nh)
+++>>>>>>> 427e652aa34d (mlxsw: spectrum_dpipe: Add support for controlling nexthop counters)
+  {
+ -	return nh->offloaded;
+ -}
+ +	struct mlxsw_sp_neigh_entry *neigh_entry = nh->neigh_entry;
+ +	char ratr_pl[MLXSW_REG_RATR_LEN];
+  
+ -unsigned char *mlxsw_sp_nexthop_ha(struct mlxsw_sp_nexthop *nh)
+ -{
+ -	if (!nh->offloaded)
+ -		return NULL;
+ -	return nh->neigh_entry->ha;
+ +	mlxsw_reg_ratr_pack(ratr_pl, MLXSW_REG_RATR_OP_WRITE_WRITE_ENTRY,
+ +			    true, MLXSW_REG_RATR_TYPE_ETHERNET,
+ +			    adj_index, neigh_entry->rif);
+ +	mlxsw_reg_ratr_eth_entry_pack(ratr_pl, neigh_entry->ha);
+ +	return mlxsw_reg_write(mlxsw_sp->core, MLXSW_REG(ratr), ratr_pl);
+  }
+  
+ -int mlxsw_sp_nexthop_indexes(struct mlxsw_sp_nexthop *nh, u32 *p_adj_index,
+ -			     u32 *p_adj_hash_index)
+ +static int
+ +mlxsw_sp_nexthop_group_mac_update(struct mlxsw_sp *mlxsw_sp,
+ +				  struct mlxsw_sp_nexthop_group *nh_grp,
+ +				  bool reallocate)
+  {
+ -	struct mlxsw_sp_nexthop_group *nh_grp = nh->nh_grp;
+ -	u32 adj_hash_index = 0;
+ +	u32 adj_index = nh_grp->adj_index; /* base */
+ +	struct mlxsw_sp_nexthop *nh;
+  	int i;
+ -
+ -	if (!nh->offloaded || !nh_grp->adj_index_valid)
+ -		return -EINVAL;
+ -
+ -	*p_adj_index = nh_grp->adj_index;
+ +	int err;
+  
+  	for (i = 0; i < nh_grp->count; i++) {
+ -		struct mlxsw_sp_nexthop *nh_iter = &nh_grp->nexthops[i];
+ +		nh = &nh_grp->nexthops[i];
+  
+ -		if (nh_iter == nh)
+ -			break;
+ -		if (nh_iter->offloaded)
+ -			adj_hash_index++;
+ -	}
+ +		if (!nh->should_offload) {
+ +			nh->offloaded = 0;
+ +			continue;
+ +		}
+  
+ -	*p_adj_hash_index = adj_hash_index;
+ +		if (nh->update || reallocate) {
+ +			err = mlxsw_sp_nexthop_mac_update(mlxsw_sp,
+ +							  adj_index, nh);
+ +			if (err)
+ +				return err;
+ +			nh->update = 0;
+ +			nh->offloaded = 1;
+ +		}
+ +		adj_index++;
+ +	}
+  	return 0;
+  }
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_router.h
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum_dpipe.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum_dpipe.c
+index 90f2e20cd58b..8243f96aa8c9 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_dpipe.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_dpipe.c
+@@ -1097,6 +1097,29 @@ out:
+ 	return err;
+ }
+ 
++static int mlxsw_sp_dpipe_table_adj_counters_update(void *priv, bool enable)
++{
++	struct mlxsw_sp *mlxsw_sp = priv;
++	struct mlxsw_sp_nexthop *nh;
++	u32 adj_hash_index = 0;
++	u32 adj_index = 0;
++
++	mlxsw_sp_nexthop_for_each(nh, mlxsw_sp->router) {
++		if (!mlxsw_sp_nexthop_offload(nh) ||
++		    mlxsw_sp_nexthop_group_has_ipip(nh))
++			continue;
++
++		mlxsw_sp_nexthop_indexes(nh, &adj_index, &adj_hash_index);
++		if (enable)
++			mlxsw_sp_nexthop_counter_alloc(mlxsw_sp, nh);
++		else
++			mlxsw_sp_nexthop_counter_free(mlxsw_sp, nh);
++		mlxsw_sp_nexthop_update(mlxsw_sp,
++					adj_index + adj_hash_index, nh);
++	}
++	return 0;
++}
++
+ static u64
+ mlxsw_sp_dpipe_table_adj_size_get(void *priv)
+ {
+@@ -1114,6 +1137,7 @@ static struct devlink_dpipe_table_ops mlxsw_sp_dpipe_table_adj_ops = {
+ 	.matches_dump = mlxsw_sp_dpipe_table_adj_matches_dump,
+ 	.actions_dump = mlxsw_sp_dpipe_table_adj_actions_dump,
+ 	.entries_dump = mlxsw_sp_dpipe_table_adj_entries_dump,
++	.counters_set_update = mlxsw_sp_dpipe_table_adj_counters_update,
+ 	.size_get = mlxsw_sp_dpipe_table_adj_size_get,
+ };
+ 
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_router.h
