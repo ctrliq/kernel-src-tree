@@ -1,0 +1,154 @@
+perf/ring_buffer: Introduce new ioctl options to pause and resume the ring-buffer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Wang Nan <wangnan0@huawei.com>
+commit 86e7972f690c1017fd086cdfe53d8524e68c661c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/86e7972f.failed
+
+Add new ioctl() to pause/resume ring-buffer output.
+
+In some situations we want to read from the ring-buffer only when we
+ensure nothing can write to the ring-buffer during reading. Without
+this patch we have to turn off all events attached to this ring-buffer
+to achieve this.
+
+This patch is a prerequisite to enable overwrite support for the
+perf ring-buffer support. Following commits will introduce new methods
+support reading from overwrite ring buffer. Before reading, caller
+must ensure the ring buffer is frozen, or the reading is unreliable.
+
+	Signed-off-by: Wang Nan <wangnan0@huawei.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: <pi3orama@163.com>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Alexei Starovoitov <ast@kernel.org>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Brendan Gregg <brendan.d.gregg@gmail.com>
+	Cc: He Kuang <hekuang@huawei.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Vince Weaver <vincent.weaver@maine.edu>
+	Cc: Zefan Li <lizefan@huawei.com>
+Link: http://lkml.kernel.org/r/1459147292-239310-2-git-send-email-wangnan0@huawei.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 86e7972f690c1017fd086cdfe53d8524e68c661c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/perf_event.h
+#	kernel/events/core.c
+diff --cc include/uapi/linux/perf_event.h
+index f2a1c58ccd91,a3c19034d5f8..000000000000
+--- a/include/uapi/linux/perf_event.h
++++ b/include/uapi/linux/perf_event.h
+@@@ -406,6 -400,8 +406,11 @@@ struct perf_event_attr 
+  #define PERF_EVENT_IOC_SET_OUTPUT	_IO ('$', 5)
+  #define PERF_EVENT_IOC_SET_FILTER	_IOW('$', 6, char *)
+  #define PERF_EVENT_IOC_ID		_IOR('$', 7, __u64 *)
+++<<<<<<< HEAD
+++=======
++ #define PERF_EVENT_IOC_SET_BPF		_IOW('$', 8, __u32)
++ #define PERF_EVENT_IOC_PAUSE_OUTPUT	_IOW('$', 9, __u32)
+++>>>>>>> 86e7972f690c (perf/ring_buffer: Introduce new ioctl options to pause and resume the ring-buffer)
+  
+  enum perf_event_ioc_flags {
+  	PERF_IOC_FLAG_GROUP		= 1U << 0,
+diff --cc kernel/events/core.c
+index 58edc3adc815,51386e84293e..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -4343,6 -4376,22 +4343,25 @@@ static long _perf_ioctl(struct perf_eve
+  	case PERF_EVENT_IOC_SET_FILTER:
+  		return perf_event_set_filter(event, (void __user *)arg);
+  
+++<<<<<<< HEAD
+++=======
++ 	case PERF_EVENT_IOC_SET_BPF:
++ 		return perf_event_set_bpf_prog(event, arg);
++ 
++ 	case PERF_EVENT_IOC_PAUSE_OUTPUT: {
++ 		struct ring_buffer *rb;
++ 
++ 		rcu_read_lock();
++ 		rb = rcu_dereference(event->rb);
++ 		if (!rb || !rb->nr_pages) {
++ 			rcu_read_unlock();
++ 			return -EINVAL;
++ 		}
++ 		rb_toggle_paused(rb, !!arg);
++ 		rcu_read_unlock();
++ 		return 0;
++ 	}
+++>>>>>>> 86e7972f690c (perf/ring_buffer: Introduce new ioctl options to pause and resume the ring-buffer)
+  	default:
+  		return -ENOTTY;
+  	}
+* Unmerged path include/uapi/linux/perf_event.h
+* Unmerged path kernel/events/core.c
+diff --git a/kernel/events/internal.h b/kernel/events/internal.h
+index 2b229fdcfc09..2d67327d9ad9 100644
+--- a/kernel/events/internal.h
++++ b/kernel/events/internal.h
+@@ -17,6 +17,7 @@ struct ring_buffer {
+ #endif
+ 	int				nr_pages;	/* nr of data pages  */
+ 	int				overwrite;	/* can overwrite itself */
++	int				paused;		/* can write into ring buffer */
+ 
+ 	atomic_t			poll;		/* POLL_ for wakeups */
+ 
+@@ -64,6 +65,14 @@ static inline void rb_free_rcu(struct rcu_head *rcu_head)
+ 	rb_free(rb);
+ }
+ 
++static inline void rb_toggle_paused(struct ring_buffer *rb, bool pause)
++{
++	if (!pause && rb->nr_pages)
++		rb->paused = 0;
++	else
++		rb->paused = 1;
++}
++
+ extern struct ring_buffer *
+ rb_alloc(int nr_pages, long watermark, int cpu, int flags);
+ extern void perf_event_wakeup(struct perf_event *event);
+diff --git a/kernel/events/ring_buffer.c b/kernel/events/ring_buffer.c
+index 743412449a18..d7975254c122 100644
+--- a/kernel/events/ring_buffer.c
++++ b/kernel/events/ring_buffer.c
+@@ -125,8 +125,11 @@ int perf_output_begin(struct perf_output_handle *handle,
+ 	if (unlikely(!rb))
+ 		goto out;
+ 
+-	if (unlikely(!rb->nr_pages))
++	if (unlikely(rb->paused)) {
++		if (rb->nr_pages)
++			local_inc(&rb->lost);
+ 		goto out;
++	}
+ 
+ 	handle->rb    = rb;
+ 	handle->event = event;
+@@ -241,6 +244,13 @@ ring_buffer_init(struct ring_buffer *rb, long watermark, int flags)
+ 
+ 	INIT_LIST_HEAD(&rb->event_list);
+ 	spin_lock_init(&rb->event_lock);
++
++	/*
++	 * perf_output_begin() only checks rb->paused, therefore
++	 * rb->paused must be true if we have no pages for output.
++	 */
++	if (!rb->nr_pages)
++		rb->paused = 1;
+ }
+ 
+ /*
