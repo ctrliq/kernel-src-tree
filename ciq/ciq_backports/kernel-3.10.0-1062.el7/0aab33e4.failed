@@ -1,0 +1,97 @@
+kvm: x86: Add support for fast CR3 switch across different MMU modes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Junaid Shahid <junaids@google.com>
+commit 0aab33e4f9459fc80378bc2a089d5784fe8ccd3b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/0aab33e4.failed
+
+This generalizes the lockless CR3 switch path to be able to work
+across different MMU modes (e.g. nested vs non-nested) by checking
+that the expected page role of the new root page matches the page role
+of the previously stored root page in addition to checking that the new
+CR3 matches the previous CR3. Furthermore, instead of loading the
+hardware CR3 in fast_cr3_switch(), it is now done in vcpu_enter_guest(),
+as by that time the MMU context would be up-to-date with the VCPU mode.
+
+	Signed-off-by: Junaid Shahid <junaids@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 0aab33e4f9459fc80378bc2a089d5784fe8ccd3b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu.c
+diff --cc arch/x86/kvm/mmu.c
+index db86a346eaea,536473411930..000000000000
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@@ -3914,9 -4038,60 +3914,66 @@@ static void nonpaging_init_context(stru
+  	context->nx = false;
+  }
+  
+++<<<<<<< HEAD
+ +void kvm_mmu_new_cr3(struct kvm_vcpu *vcpu)
+ +{
+ +	mmu_free_roots(vcpu);
+++=======
++ static bool fast_cr3_switch(struct kvm_vcpu *vcpu, gpa_t new_cr3,
++ 			    union kvm_mmu_page_role new_role)
++ {
++ 	struct kvm_mmu *mmu = &vcpu->arch.mmu;
++ 
++ 	/*
++ 	 * For now, limit the fast switch to 64-bit hosts+VMs in order to avoid
++ 	 * having to deal with PDPTEs. We may add support for 32-bit hosts/VMs
++ 	 * later if necessary.
++ 	 */
++ 	if (mmu->shadow_root_level >= PT64_ROOT_4LEVEL &&
++ 	    mmu->root_level >= PT64_ROOT_4LEVEL) {
++ 		gpa_t prev_cr3 = mmu->prev_root.cr3;
++ 
++ 		if (mmu_check_root(vcpu, new_cr3 >> PAGE_SHIFT))
++ 			return false;
++ 
++ 		swap(mmu->root_hpa, mmu->prev_root.hpa);
++ 		mmu->prev_root.cr3 = kvm_read_cr3(vcpu);
++ 
++ 		if (new_cr3 == prev_cr3 &&
++ 		    VALID_PAGE(mmu->root_hpa) &&
++ 		    page_header(mmu->root_hpa) != NULL &&
++ 		    new_role.word == page_header(mmu->root_hpa)->role.word) {
++ 			/*
++ 			 * It is possible that the cached previous root page is
++ 			 * obsolete because of a change in the MMU
++ 			 * generation number. However, that is accompanied by
++ 			 * KVM_REQ_MMU_RELOAD, which will free the root that we
++ 			 * have set here and allocate a new one.
++ 			 */
++ 
++ 			kvm_make_request(KVM_REQ_LOAD_CR3, vcpu);
++ 			kvm_make_request(KVM_REQ_MMU_SYNC, vcpu);
++ 			__clear_sp_write_flooding_count(
++ 				page_header(mmu->root_hpa));
++ 
++ 			return true;
++ 		}
++ 	}
++ 
++ 	return false;
++ }
++ 
++ static void __kvm_mmu_new_cr3(struct kvm_vcpu *vcpu, gpa_t new_cr3,
++ 			      union kvm_mmu_page_role new_role)
++ {
++ 	if (!fast_cr3_switch(vcpu, new_cr3, new_role))
++ 		kvm_mmu_free_roots(vcpu, false);
++ }
++ 
++ void kvm_mmu_new_cr3(struct kvm_vcpu *vcpu, gpa_t new_cr3)
++ {
++ 	__kvm_mmu_new_cr3(vcpu, new_cr3, kvm_mmu_calc_root_page_role(vcpu));
+++>>>>>>> 0aab33e4f945 (kvm: x86: Add support for fast CR3 switch across different MMU modes)
+  }
+  
+  static unsigned long get_cr3(struct kvm_vcpu *vcpu)
+* Unmerged path arch/x86/kvm/mmu.c
