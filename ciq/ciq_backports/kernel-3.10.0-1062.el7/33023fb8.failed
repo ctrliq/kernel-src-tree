@@ -1,0 +1,449 @@
+IB/core: add max_send_sge and max_recv_sge attributes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Steve Wise <swise@opengridcomputing.com>
+commit 33023fb85a42b53bf778bc025f9667b582282be4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/33023fb8.failed
+
+This patch replaces the ib_device_attr.max_sge with max_send_sge and
+max_recv_sge. It allows ulps to take advantage of devices that have very
+different send and recv sge depths.  For example cxgb4 has a max_recv_sge
+of 4, yet a max_send_sge of 16.  Splitting out these attributes allows
+much more efficient use of the SQ for cxgb4 with ulps that use the RDMA_RW
+API. Consider a large RDMA WRITE that has 16 scattergather entries.
+With max_sge of 4, the ulp would send 4 WRITE WRs, but with max_sge of
+16, it can be done with 1 WRITE WR.
+
+	Acked-by: Sagi Grimberg <sagi@grimberg.me>
+	Acked-by: Christoph Hellwig <hch@lst.de>
+	Acked-by: Selvin Xavier <selvin.xavier@broadcom.com>
+	Acked-by: Shiraz Saleem <shiraz.saleem@intel.com>
+	Acked-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Steve Wise <swise@opengridcomputing.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 33023fb85a42b53bf778bc025f9667b582282be4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hns/hns_roce_main.c
+#	fs/cifs/smbdirect.c
+#	net/sunrpc/xprtrdma/svc_rdma_transport.c
+diff --cc net/sunrpc/xprtrdma/svc_rdma_transport.c
+index c28ee7409658,547b2cdf1427..000000000000
+--- a/net/sunrpc/xprtrdma/svc_rdma_transport.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_transport.c
+@@@ -723,8 -476,13 +723,18 @@@ static struct svc_xprt *svc_rdma_accept
+  
+  	/* Qualify the transport resource defaults with the
+  	 * capabilities of this particular device */
+++<<<<<<< HEAD
+ +	newxprt->sc_max_sge = min((size_t)dev->attrs.max_sge,
+ +				  (size_t)RPCSVC_MAXPAGES);
+++=======
++ 	newxprt->sc_max_send_sges = dev->attrs.max_send_sge;
++ 	/* transport hdr, head iovec, one page list entry, tail iovec */
++ 	if (newxprt->sc_max_send_sges < 4) {
++ 		pr_err("svcrdma: too few Send SGEs available (%d)\n",
++ 		       newxprt->sc_max_send_sges);
++ 		goto errout;
++ 	}
+++>>>>>>> 33023fb85a42 (IB/core: add max_send_sge and max_recv_sge attributes)
+  	newxprt->sc_max_req_size = svcrdma_max_req_size;
+  	newxprt->sc_max_requests = svcrdma_max_requests;
+  	newxprt->sc_max_bc_requests = svcrdma_max_bc_requests;
+* Unmerged path drivers/infiniband/hw/hns/hns_roce_main.c
+* Unmerged path fs/cifs/smbdirect.c
+diff --git a/drivers/infiniband/core/uverbs_cmd.c b/drivers/infiniband/core/uverbs_cmd.c
+index 19c46a7a01e2..423aaee5298a 100644
+--- a/drivers/infiniband/core/uverbs_cmd.c
++++ b/drivers/infiniband/core/uverbs_cmd.c
+@@ -180,7 +180,7 @@ static void copy_query_dev_fields(struct ib_uverbs_file *file,
+ 	resp->max_qp		= attr->max_qp;
+ 	resp->max_qp_wr		= attr->max_qp_wr;
+ 	resp->device_cap_flags	= lower_32_bits(attr->device_cap_flags);
+-	resp->max_sge		= attr->max_sge;
++	resp->max_sge		= min(attr->max_send_sge, attr->max_recv_sge);
+ 	resp->max_sge_rd	= attr->max_sge_rd;
+ 	resp->max_cq		= attr->max_cq;
+ 	resp->max_cqe		= attr->max_cqe;
+diff --git a/drivers/infiniband/hw/bnxt_re/ib_verbs.c b/drivers/infiniband/hw/bnxt_re/ib_verbs.c
+index 8301d7e5fa8c..86bd4c500390 100644
+--- a/drivers/infiniband/hw/bnxt_re/ib_verbs.c
++++ b/drivers/infiniband/hw/bnxt_re/ib_verbs.c
+@@ -166,7 +166,8 @@ int bnxt_re_query_device(struct ib_device *ibdev,
+ 				    | IB_DEVICE_MEM_WINDOW
+ 				    | IB_DEVICE_MEM_WINDOW_TYPE_2B
+ 				    | IB_DEVICE_MEM_MGT_EXTENSIONS;
+-	ib_attr->max_sge = dev_attr->max_qp_sges;
++	ib_attr->max_send_sge = dev_attr->max_qp_sges;
++	ib_attr->max_recv_sge = dev_attr->max_qp_sges;
+ 	ib_attr->max_sge_rd = dev_attr->max_qp_sges;
+ 	ib_attr->max_cq = dev_attr->max_cq;
+ 	ib_attr->max_cqe = dev_attr->max_cq_wqes;
+diff --git a/drivers/infiniband/hw/cxgb3/iwch_provider.c b/drivers/infiniband/hw/cxgb3/iwch_provider.c
+index a723ed67a705..e097f391baaa 100644
+--- a/drivers/infiniband/hw/cxgb3/iwch_provider.c
++++ b/drivers/infiniband/hw/cxgb3/iwch_provider.c
+@@ -1105,7 +1105,8 @@ static int iwch_query_device(struct ib_device *ibdev, struct ib_device_attr *pro
+ 	props->max_mr_size = dev->attr.max_mr_size;
+ 	props->max_qp = dev->attr.max_qps;
+ 	props->max_qp_wr = dev->attr.max_wrs;
+-	props->max_sge = dev->attr.max_sge_per_wr;
++	props->max_send_sge = dev->attr.max_sge_per_wr;
++	props->max_recv_sge = dev->attr.max_sge_per_wr;
+ 	props->max_sge_rd = 1;
+ 	props->max_qp_rd_atom = dev->attr.max_rdma_reads_per_qp;
+ 	props->max_qp_init_rd_atom = dev->attr.max_rdma_reads_per_qp;
+diff --git a/drivers/infiniband/hw/cxgb4/provider.c b/drivers/infiniband/hw/cxgb4/provider.c
+index 596ceaefacf4..ab61b65de374 100644
+--- a/drivers/infiniband/hw/cxgb4/provider.c
++++ b/drivers/infiniband/hw/cxgb4/provider.c
+@@ -343,7 +343,8 @@ static int c4iw_query_device(struct ib_device *ibdev, struct ib_device_attr *pro
+ 	props->max_mr_size = T4_MAX_MR_SIZE;
+ 	props->max_qp = dev->rdev.lldi.vr->qp.size / 2;
+ 	props->max_qp_wr = dev->rdev.hw_queue.t4_max_qp_depth;
+-	props->max_sge = T4_MAX_RECV_SGE;
++	props->max_send_sge = min(T4_MAX_SEND_SGE, T4_MAX_WRITE_SGE);
++	props->max_recv_sge = T4_MAX_RECV_SGE;
+ 	props->max_sge_rd = 1;
+ 	props->max_res_rd_atom = dev->rdev.lldi.max_ird_adapter;
+ 	props->max_qp_rd_atom = min(dev->rdev.lldi.max_ordird_qp,
+diff --git a/drivers/infiniband/hw/hfi1/verbs.c b/drivers/infiniband/hw/hfi1/verbs.c
+index 550d7fc6d187..14c0dfc1ecbb 100644
+--- a/drivers/infiniband/hw/hfi1/verbs.c
++++ b/drivers/infiniband/hw/hfi1/verbs.c
+@@ -1401,7 +1401,8 @@ static void hfi1_fill_device_attr(struct hfi1_devdata *dd)
+ 	rdi->dparms.props.max_fast_reg_page_list_len = UINT_MAX;
+ 	rdi->dparms.props.max_qp = hfi1_max_qps;
+ 	rdi->dparms.props.max_qp_wr = hfi1_max_qp_wrs;
+-	rdi->dparms.props.max_sge = hfi1_max_sges;
++	rdi->dparms.props.max_send_sge = hfi1_max_sges;
++	rdi->dparms.props.max_recv_sge = hfi1_max_sges;
+ 	rdi->dparms.props.max_sge_rd = hfi1_max_sges;
+ 	rdi->dparms.props.max_cq = hfi1_max_cqs;
+ 	rdi->dparms.props.max_ah = hfi1_max_ahs;
+* Unmerged path drivers/infiniband/hw/hns/hns_roce_main.c
+diff --git a/drivers/infiniband/hw/i40iw/i40iw_verbs.c b/drivers/infiniband/hw/i40iw/i40iw_verbs.c
+index 744f55eeb57b..c3851c8eb046 100644
+--- a/drivers/infiniband/hw/i40iw/i40iw_verbs.c
++++ b/drivers/infiniband/hw/i40iw/i40iw_verbs.c
+@@ -71,7 +71,8 @@ static int i40iw_query_device(struct ib_device *ibdev,
+ 	props->max_mr_size = I40IW_MAX_OUTBOUND_MESSAGE_SIZE;
+ 	props->max_qp = iwdev->max_qp - iwdev->used_qps;
+ 	props->max_qp_wr = I40IW_MAX_QP_WRS;
+-	props->max_sge = I40IW_MAX_WQ_FRAGMENT_COUNT;
++	props->max_send_sge = I40IW_MAX_WQ_FRAGMENT_COUNT;
++	props->max_recv_sge = I40IW_MAX_WQ_FRAGMENT_COUNT;
+ 	props->max_cq = iwdev->max_cq - iwdev->used_cqs;
+ 	props->max_cqe = iwdev->max_cqe;
+ 	props->max_mr = iwdev->max_mr - iwdev->used_mrs;
+diff --git a/drivers/infiniband/hw/mlx4/main.c b/drivers/infiniband/hw/mlx4/main.c
+index dfb86d79ccd8..4f716470cd60 100644
+--- a/drivers/infiniband/hw/mlx4/main.c
++++ b/drivers/infiniband/hw/mlx4/main.c
+@@ -522,8 +522,8 @@ static int mlx4_ib_query_device(struct ib_device *ibdev,
+ 	props->page_size_cap	   = dev->dev->caps.page_size_cap;
+ 	props->max_qp		   = dev->dev->quotas.qp;
+ 	props->max_qp_wr	   = dev->dev->caps.max_wqes - MLX4_IB_SQ_MAX_SPARE;
+-	props->max_sge		   = min(dev->dev->caps.max_sq_sg,
+-					 dev->dev->caps.max_rq_sg);
++	props->max_send_sge	   = dev->dev->caps.max_sq_sg;
++	props->max_recv_sge	   = dev->dev->caps.max_rq_sg;
+ 	props->max_sge_rd	   = MLX4_MAX_SGE_RD;
+ 	props->max_cq		   = dev->dev->quotas.cq;
+ 	props->max_cqe		   = dev->dev->caps.max_cqes;
+diff --git a/drivers/infiniband/hw/mlx5/main.c b/drivers/infiniband/hw/mlx5/main.c
+index caab7cc36fbe..0dba8d0c8b0a 100644
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@ -884,7 +884,8 @@ static int mlx5_ib_query_device(struct ib_device *ibdev,
+ 	max_sq_sg = (max_sq_desc - sizeof(struct mlx5_wqe_ctrl_seg) -
+ 		     sizeof(struct mlx5_wqe_raddr_seg)) /
+ 		sizeof(struct mlx5_wqe_data_seg);
+-	props->max_sge = min(max_rq_sg, max_sq_sg);
++	props->max_send_sge = max_sq_sg;
++	props->max_recv_sge = max_rq_sg;
+ 	props->max_sge_rd	   = MLX5_MAX_SGE_RD;
+ 	props->max_cq		   = 1 << MLX5_CAP_GEN(mdev, log_max_cq);
+ 	props->max_cqe = (1 << MLX5_CAP_GEN(mdev, log_max_cq_sz)) - 1;
+diff --git a/drivers/infiniband/hw/mthca/mthca_provider.c b/drivers/infiniband/hw/mthca/mthca_provider.c
+index 6fee7795d1c8..d89519144625 100644
+--- a/drivers/infiniband/hw/mthca/mthca_provider.c
++++ b/drivers/infiniband/hw/mthca/mthca_provider.c
+@@ -96,8 +96,9 @@ static int mthca_query_device(struct ib_device *ibdev, struct ib_device_attr *pr
+ 	props->page_size_cap       = mdev->limits.page_size_cap;
+ 	props->max_qp              = mdev->limits.num_qps - mdev->limits.reserved_qps;
+ 	props->max_qp_wr           = mdev->limits.max_wqes;
+-	props->max_sge             = mdev->limits.max_sg;
+-	props->max_sge_rd          = props->max_sge;
++	props->max_send_sge        = mdev->limits.max_sg;
++	props->max_recv_sge        = mdev->limits.max_sg;
++	props->max_sge_rd          = mdev->limits.max_sg;
+ 	props->max_cq              = mdev->limits.num_cqs - mdev->limits.reserved_cqs;
+ 	props->max_cqe             = mdev->limits.max_cqes;
+ 	props->max_mr              = mdev->limits.num_mpts - mdev->limits.reserved_mrws;
+diff --git a/drivers/infiniband/hw/nes/nes_verbs.c b/drivers/infiniband/hw/nes/nes_verbs.c
+index 989ad9f44435..30816faf3098 100644
+--- a/drivers/infiniband/hw/nes/nes_verbs.c
++++ b/drivers/infiniband/hw/nes/nes_verbs.c
+@@ -436,7 +436,8 @@ static int nes_query_device(struct ib_device *ibdev, struct ib_device_attr *prop
+ 	props->max_mr_size = 0x80000000;
+ 	props->max_qp = nesibdev->max_qp;
+ 	props->max_qp_wr = nesdev->nesadapter->max_qp_wr - 2;
+-	props->max_sge = nesdev->nesadapter->max_sge;
++	props->max_send_sge = nesdev->nesadapter->max_sge;
++	props->max_recv_sge = nesdev->nesadapter->max_sge;
+ 	props->max_cq = nesibdev->max_cq;
+ 	props->max_cqe = nesdev->nesadapter->max_cqe;
+ 	props->max_mr = nesibdev->max_mr;
+diff --git a/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c b/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
+index d5dfaa0a3ffe..22f37a9ffd7d 100644
+--- a/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
++++ b/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
+@@ -107,7 +107,8 @@ int ocrdma_query_device(struct ib_device *ibdev, struct ib_device_attr *attr,
+ 					IB_DEVICE_SYS_IMAGE_GUID |
+ 					IB_DEVICE_LOCAL_DMA_LKEY |
+ 					IB_DEVICE_MEM_MGT_EXTENSIONS;
+-	attr->max_sge = min(dev->attr.max_send_sge, dev->attr.max_recv_sge);
++	attr->max_send_sge = dev->attr.max_send_sge;
++	attr->max_recv_sge = dev->attr.max_recv_sge;
+ 	attr->max_sge_rd = dev->attr.max_rdma_sge;
+ 	attr->max_cq = dev->attr.max_cq;
+ 	attr->max_cqe = dev->attr.max_cqe;
+diff --git a/drivers/infiniband/hw/qedr/verbs.c b/drivers/infiniband/hw/qedr/verbs.c
+index 7a90bdd4b979..e249ebdf3685 100644
+--- a/drivers/infiniband/hw/qedr/verbs.c
++++ b/drivers/infiniband/hw/qedr/verbs.c
+@@ -133,7 +133,8 @@ int qedr_query_device(struct ib_device *ibdev,
+ 	    IB_DEVICE_RC_RNR_NAK_GEN |
+ 	    IB_DEVICE_LOCAL_DMA_LKEY | IB_DEVICE_MEM_MGT_EXTENSIONS;
+ 
+-	attr->max_sge = qattr->max_sge;
++	attr->max_send_sge = qattr->max_sge;
++	attr->max_recv_sge = qattr->max_sge;
+ 	attr->max_sge_rd = qattr->max_sge;
+ 	attr->max_cq = qattr->max_cq;
+ 	attr->max_cqe = qattr->max_cqe;
+diff --git a/drivers/infiniband/hw/qib/qib_verbs.c b/drivers/infiniband/hw/qib/qib_verbs.c
+index 021a776bffe6..56441a095e34 100644
+--- a/drivers/infiniband/hw/qib/qib_verbs.c
++++ b/drivers/infiniband/hw/qib/qib_verbs.c
+@@ -1490,7 +1490,8 @@ static void qib_fill_device_attr(struct qib_devdata *dd)
+ 	rdi->dparms.props.max_mr_size = ~0ULL;
+ 	rdi->dparms.props.max_qp = ib_qib_max_qps;
+ 	rdi->dparms.props.max_qp_wr = ib_qib_max_qp_wrs;
+-	rdi->dparms.props.max_sge = ib_qib_max_sges;
++	rdi->dparms.props.max_send_sge = ib_qib_max_sges;
++	rdi->dparms.props.max_recv_sge = ib_qib_max_sges;
+ 	rdi->dparms.props.max_sge_rd = ib_qib_max_sges;
+ 	rdi->dparms.props.max_cq = ib_qib_max_cqs;
+ 	rdi->dparms.props.max_cqe = ib_qib_max_cqes;
+diff --git a/drivers/infiniband/hw/vmw_pvrdma/pvrdma_verbs.c b/drivers/infiniband/hw/vmw_pvrdma/pvrdma_verbs.c
+index a51463cd2f37..816cc285daf6 100644
+--- a/drivers/infiniband/hw/vmw_pvrdma/pvrdma_verbs.c
++++ b/drivers/infiniband/hw/vmw_pvrdma/pvrdma_verbs.c
+@@ -82,7 +82,8 @@ int pvrdma_query_device(struct ib_device *ibdev,
+ 	props->max_qp = dev->dsr->caps.max_qp;
+ 	props->max_qp_wr = dev->dsr->caps.max_qp_wr;
+ 	props->device_cap_flags = dev->dsr->caps.device_cap_flags;
+-	props->max_sge = dev->dsr->caps.max_sge;
++	props->max_send_sge = dev->dsr->caps.max_sge;
++	props->max_recv_sge = dev->dsr->caps.max_sge;
+ 	props->max_sge_rd = PVRDMA_GET_CAP(dev, dev->dsr->caps.max_sge,
+ 					   dev->dsr->caps.max_sge_rd);
+ 	props->max_srq = dev->dsr->caps.max_srq;
+diff --git a/drivers/infiniband/sw/rdmavt/qp.c b/drivers/infiniband/sw/rdmavt/qp.c
+index f91606eb43cc..49b8f1813cc1 100644
+--- a/drivers/infiniband/sw/rdmavt/qp.c
++++ b/drivers/infiniband/sw/rdmavt/qp.c
+@@ -780,14 +780,15 @@ struct ib_qp *rvt_create_qp(struct ib_pd *ibpd,
+ 	if (!rdi)
+ 		return ERR_PTR(-EINVAL);
+ 
+-	if (init_attr->cap.max_send_sge > rdi->dparms.props.max_sge ||
++	if (init_attr->cap.max_send_sge > rdi->dparms.props.max_send_sge ||
+ 	    init_attr->cap.max_send_wr > rdi->dparms.props.max_qp_wr ||
+ 	    init_attr->create_flags)
+ 		return ERR_PTR(-EINVAL);
+ 
+ 	/* Check receive queue parameters if no SRQ is specified. */
+ 	if (!init_attr->srq) {
+-		if (init_attr->cap.max_recv_sge > rdi->dparms.props.max_sge ||
++		if (init_attr->cap.max_recv_sge >
++		    rdi->dparms.props.max_recv_sge ||
+ 		    init_attr->cap.max_recv_wr > rdi->dparms.props.max_qp_wr)
+ 			return ERR_PTR(-EINVAL);
+ 
+diff --git a/drivers/infiniband/sw/rxe/rxe.c b/drivers/infiniband/sw/rxe/rxe.c
+index 7121e1b1eb89..10999fa69281 100644
+--- a/drivers/infiniband/sw/rxe/rxe.c
++++ b/drivers/infiniband/sw/rxe/rxe.c
+@@ -91,7 +91,8 @@ static void rxe_init_device_param(struct rxe_dev *rxe)
+ 	rxe->attr.max_qp			= RXE_MAX_QP;
+ 	rxe->attr.max_qp_wr			= RXE_MAX_QP_WR;
+ 	rxe->attr.device_cap_flags		= RXE_DEVICE_CAP_FLAGS;
+-	rxe->attr.max_sge			= RXE_MAX_SGE;
++	rxe->attr.max_send_sge			= RXE_MAX_SGE;
++	rxe->attr.max_recv_sge			= RXE_MAX_SGE;
+ 	rxe->attr.max_sge_rd			= RXE_MAX_SGE_RD;
+ 	rxe->attr.max_cq			= RXE_MAX_CQ;
+ 	rxe->attr.max_cqe			= (1 << RXE_MAX_LOG_CQE) - 1;
+diff --git a/drivers/infiniband/sw/rxe/rxe_qp.c b/drivers/infiniband/sw/rxe/rxe_qp.c
+index 0175864ade6f..7a7a7db1575f 100644
+--- a/drivers/infiniband/sw/rxe/rxe_qp.c
++++ b/drivers/infiniband/sw/rxe/rxe_qp.c
+@@ -49,9 +49,9 @@ static int rxe_qp_chk_cap(struct rxe_dev *rxe, struct ib_qp_cap *cap,
+ 		goto err1;
+ 	}
+ 
+-	if (cap->max_send_sge > rxe->attr.max_sge) {
++	if (cap->max_send_sge > rxe->attr.max_send_sge) {
+ 		pr_warn("invalid send sge = %d > %d\n",
+-			cap->max_send_sge, rxe->attr.max_sge);
++			cap->max_send_sge, rxe->attr.max_send_sge);
+ 		goto err1;
+ 	}
+ 
+@@ -62,9 +62,9 @@ static int rxe_qp_chk_cap(struct rxe_dev *rxe, struct ib_qp_cap *cap,
+ 			goto err1;
+ 		}
+ 
+-		if (cap->max_recv_sge > rxe->attr.max_sge) {
++		if (cap->max_recv_sge > rxe->attr.max_recv_sge) {
+ 			pr_warn("invalid recv sge = %d > %d\n",
+-				cap->max_recv_sge, rxe->attr.max_sge);
++				cap->max_recv_sge, rxe->attr.max_recv_sge);
+ 			goto err1;
+ 		}
+ 	}
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_cm.c b/drivers/infiniband/ulp/ipoib/ipoib_cm.c
+index ea3f3a5baf7e..8e318b1d15a6 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_cm.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_cm.c
+@@ -1066,8 +1066,8 @@ static struct ib_qp *ipoib_cm_create_tx_qp(struct net_device *dev, struct ipoib_
+ 	struct ib_qp *tx_qp;
+ 
+ 	if (dev->features & NETIF_F_SG)
+-		attr.cap.max_send_sge =
+-			min_t(u32, priv->ca->attrs.max_sge, MAX_SKB_FRAGS + 1);
++		attr.cap.max_send_sge = min_t(u32, priv->ca->attrs.max_send_sge,
++					      MAX_SKB_FRAGS + 1);
+ 
+ 	tx_qp = ib_create_qp(priv->pd, &attr);
+ 	tx->max_send_sge = attr.cap.max_send_sge;
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_verbs.c b/drivers/infiniband/ulp/ipoib/ipoib_verbs.c
+index 984a88096f39..ba4669f24014 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_verbs.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_verbs.c
+@@ -147,7 +147,7 @@ int ipoib_transport_dev_init(struct net_device *dev, struct ib_device *ca)
+ 		.cap = {
+ 			.max_send_wr  = ipoib_sendq_size,
+ 			.max_recv_wr  = ipoib_recvq_size,
+-			.max_send_sge = min_t(u32, priv->ca->attrs.max_sge,
++			.max_send_sge = min_t(u32, priv->ca->attrs.max_send_sge,
+ 					      MAX_SKB_FRAGS + 1),
+ 			.max_recv_sge = IPOIB_UD_RX_SG
+ 		},
+diff --git a/drivers/infiniband/ulp/isert/ib_isert.c b/drivers/infiniband/ulp/isert/ib_isert.c
+index b56c9154309f..14f44238ba24 100644
+--- a/drivers/infiniband/ulp/isert/ib_isert.c
++++ b/drivers/infiniband/ulp/isert/ib_isert.c
+@@ -136,7 +136,7 @@ isert_create_qp(struct isert_conn *isert_conn,
+ 	attr.cap.max_send_wr = ISERT_QP_MAX_REQ_DTOS + 1;
+ 	attr.cap.max_recv_wr = ISERT_QP_MAX_RECV_DTOS + 1;
+ 	attr.cap.max_rdma_ctxs = ISCSI_DEF_XMIT_CMDS_MAX;
+-	attr.cap.max_send_sge = device->ib_device->attrs.max_sge;
++	attr.cap.max_send_sge = device->ib_device->attrs.max_send_sge;
+ 	attr.cap.max_recv_sge = 1;
+ 	attr.sq_sig_type = IB_SIGNAL_REQ_WR;
+ 	attr.qp_type = IB_QPT_RC;
+@@ -298,7 +298,8 @@ isert_create_device_ib_res(struct isert_device *device)
+ 	struct ib_device *ib_dev = device->ib_device;
+ 	int ret;
+ 
+-	isert_dbg("devattr->max_sge: %d\n", ib_dev->attrs.max_sge);
++	isert_dbg("devattr->max_send_sge: %d devattr->max_recv_sge %d\n",
++		  ib_dev->attrs.max_send_sge, ib_dev->attrs.max_recv_sge);
+ 	isert_dbg("devattr->max_sge_rd: %d\n", ib_dev->attrs.max_sge_rd);
+ 
+ 	ret = isert_alloc_comps(device);
+diff --git a/drivers/infiniband/ulp/srpt/ib_srpt.c b/drivers/infiniband/ulp/srpt/ib_srpt.c
+index dacc0c56f621..633e0d6eedab 100644
+--- a/drivers/infiniband/ulp/srpt/ib_srpt.c
++++ b/drivers/infiniband/ulp/srpt/ib_srpt.c
+@@ -1754,13 +1754,15 @@ retry:
+ 	 */
+ 	qp_init->cap.max_send_wr = min(sq_size / 2, attrs->max_qp_wr);
+ 	qp_init->cap.max_rdma_ctxs = sq_size / 2;
+-	qp_init->cap.max_send_sge = min(attrs->max_sge, SRPT_MAX_SG_PER_WQE);
++	qp_init->cap.max_send_sge = min(attrs->max_send_sge,
++					SRPT_MAX_SG_PER_WQE);
+ 	qp_init->port_num = ch->sport->port;
+ 	if (sdev->use_srq) {
+ 		qp_init->srq = sdev->srq;
+ 	} else {
+ 		qp_init->cap.max_recv_wr = ch->rq_size;
+-		qp_init->cap.max_recv_sge = qp_init->cap.max_send_sge;
++		qp_init->cap.max_recv_sge = min(attrs->max_recv_sge,
++						SRPT_MAX_SG_PER_WQE);
+ 	}
+ 
+ 	if (ch->using_rdma_cm) {
+diff --git a/drivers/nvme/target/rdma.c b/drivers/nvme/target/rdma.c
+index 1284bf718f6b..05e8455acd9f 100644
+--- a/drivers/nvme/target/rdma.c
++++ b/drivers/nvme/target/rdma.c
+@@ -929,7 +929,7 @@ static int nvmet_rdma_create_queue_ib(struct nvmet_rdma_queue *queue)
+ 	qp_attr.cap.max_send_wr = queue->send_queue_size + 1;
+ 	qp_attr.cap.max_rdma_ctxs = queue->send_queue_size;
+ 	qp_attr.cap.max_send_sge = max(ndev->device->attrs.max_sge_rd,
+-					ndev->device->attrs.max_sge);
++					ndev->device->attrs.max_send_sge);
+ 
+ 	if (ndev->srq) {
+ 		qp_attr.srq = ndev->srq;
+* Unmerged path fs/cifs/smbdirect.c
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index 7ee6ef75f948..7df0f5db74ef 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -326,7 +326,8 @@ struct ib_device_attr {
+ 	int			max_qp;
+ 	int			max_qp_wr;
+ 	u64			device_cap_flags;
+-	int			max_sge;
++	int			max_send_sge;
++	int			max_recv_sge;
+ 	int			max_sge_rd;
+ 	int			max_cq;
+ 	int			max_cqe;
+diff --git a/net/rds/ib.c b/net/rds/ib.c
+index 57189fefc1c3..7031f75466a2 100644
+--- a/net/rds/ib.c
++++ b/net/rds/ib.c
+@@ -139,7 +139,7 @@ static void rds_ib_add_one(struct ib_device *device)
+ 	INIT_WORK(&rds_ibdev->free_work, rds_ib_dev_free);
+ 
+ 	rds_ibdev->max_wrs = device->attrs.max_qp_wr;
+-	rds_ibdev->max_sge = min(device->attrs.max_sge, RDS_IB_MAX_SGE);
++	rds_ibdev->max_sge = min(device->attrs.max_send_sge, RDS_IB_MAX_SGE);
+ 
+ 	rds_ibdev->has_fr = (device->attrs.device_cap_flags &
+ 				  IB_DEVICE_MEM_MGT_EXTENSIONS);
+* Unmerged path net/sunrpc/xprtrdma/svc_rdma_transport.c
+diff --git a/net/sunrpc/xprtrdma/verbs.c b/net/sunrpc/xprtrdma/verbs.c
+index 16161a36dc73..112a15abc4a4 100644
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@ -508,7 +508,7 @@ rpcrdma_ep_create(struct rpcrdma_ep *ep, struct rpcrdma_ia *ia,
+ 	unsigned int max_sge;
+ 	int rc;
+ 
+-	max_sge = min_t(unsigned int, ia->ri_device->attrs.max_sge,
++	max_sge = min_t(unsigned int, ia->ri_device->attrs.max_send_sge,
+ 			RPCRDMA_MAX_SEND_SGES);
+ 	if (max_sge < RPCRDMA_MIN_SEND_SGES) {
+ 		pr_warn("rpcrdma: HCA provides only %d send SGEs\n", max_sge);
