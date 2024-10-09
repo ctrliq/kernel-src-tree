@@ -1,0 +1,131 @@
+locking/rwsem: Set lock ownership ASAP
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Davidlohr Bueso <dave@stgolabs.net>
+commit 7a215f89a0335582292ec6f3edaa3abd570da75a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/7a215f89.failed
+
+In order to optimize the spinning step, we need to set the lock
+owner as soon as the lock is acquired; after a successful counter
+cmpxchg operation, that is. This is particularly useful as rwsems
+need to set the owner to nil for readers, so there is a greater
+chance of falling out of the spinning. Currently we only set the
+owner much later in the game, in the more generic level -- latency
+can be specially bad when waiting for a node->next pointer when
+releasing the osq in up_write calls.
+
+As such, update the owner inside rwsem_try_write_lock (when the
+lock is obtained after blocking) and rwsem_try_write_lock_unqueued
+(when the lock is obtained while spinning). This requires creating
+a new internal rwsem.h header to share the owner related calls.
+
+Also cleanup some headers for mutex and rwsem.
+
+	Suggested-by: Peter Zijlstra <peterz@infradead.org>
+	Signed-off-by: Davidlohr Bueso <dbueso@suse.de>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Jason Low <jason.low2@hp.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Michel Lespinasse <walken@google.com>
+	Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: Tim Chen <tim.c.chen@linux.intel.com>
+Link: http://lkml.kernel.org/r/1422609267-15102-4-git-send-email-dave@stgolabs.net
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 7a215f89a0335582292ec6f3edaa3abd570da75a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/rwsem.c
+#	kernel/rwsem.h
+diff --cc kernel/rwsem.c
+index 42f806de49d4,205be0ce34de..000000000000
+--- a/kernel/rwsem.c
++++ b/kernel/rwsem.c
+@@@ -9,29 -9,9 +9,32 @@@
+  #include <linux/sched.h>
+  #include <linux/export.h>
+  #include <linux/rwsem.h>
+- 
+  #include <linux/atomic.h>
+  
+++<<<<<<< HEAD:kernel/rwsem.c
+ +#if defined(CONFIG_SMP) && defined(CONFIG_RWSEM_XCHGADD_ALGORITHM)
+ +static inline void rwsem_set_owner(struct rw_semaphore *sem)
+ +{
+ +	sem->owner = current;
+ +}
+ +
+ +static inline void rwsem_clear_owner(struct rw_semaphore *sem)
+ +{
+ +	sem->owner = NULL;
+ +}
+ +
+ +#else
+ +static inline void rwsem_set_owner(struct rw_semaphore *sem)
+ +{
+ +}
+ +
+ +static inline void rwsem_clear_owner(struct rw_semaphore *sem)
+ +{
+ +}
+ +#endif
+++=======
++ #include "rwsem.h"
+++>>>>>>> 7a215f89a033 (locking/rwsem: Set lock ownership ASAP):kernel/locking/rwsem.c
+  
+  /*
+   * lock for reading
+* Unmerged path kernel/rwsem.h
+diff --git a/kernel/mutex.c b/kernel/mutex.c
+index d8af8cf9c6e9..249949b09c36 100644
+--- a/kernel/mutex.c
++++ b/kernel/mutex.c
+@@ -25,7 +25,7 @@
+ #include <linux/spinlock.h>
+ #include <linux/interrupt.h>
+ #include <linux/debug_locks.h>
+-#include "mcs_spinlock.h"
++#include <linux/osq_lock.h>
+ 
+ /*
+  * In the DEBUG case we are using the "NULL fastpath" for mutexes,
+* Unmerged path kernel/rwsem.c
+* Unmerged path kernel/rwsem.h
+diff --git a/lib/rwsem.c b/lib/rwsem.c
+index 306e609cda46..2f9d9aabc591 100644
+--- a/lib/rwsem.c
++++ b/lib/rwsem.c
+@@ -14,8 +14,9 @@
+ #include <linux/init.h>
+ #include <linux/export.h>
+ #include <linux/sched/rt.h>
++#include <linux/osq_lock.h>
+ 
+-#include "mcs_spinlock.h"
++#include "rwsem.h"
+ 
+ /*
+  * Guide to the rw_semaphore's count field for common values.
+@@ -265,6 +266,7 @@ static inline bool rwsem_try_write_lock(long count, struct rw_semaphore *sem)
+ 		    RWSEM_ACTIVE_WRITE_BIAS) == RWSEM_WAITING_BIAS) {
+ 		if (!list_is_singular(&sem->wait_list))
+ 			rwsem_atomic_update(RWSEM_WAITING_BIAS, sem);
++		rwsem_set_owner(sem);
+ 		return true;
+ 	}
+ 
+@@ -284,8 +286,10 @@ static inline bool rwsem_try_write_lock_unqueued(struct rw_semaphore *sem)
+ 			return false;
+ 
+ 		old = cmpxchg(&sem->count, count, count + RWSEM_ACTIVE_WRITE_BIAS);
+-		if (old == count)
++		if (old == count) {
++			rwsem_set_owner(sem);
+ 			return true;
++		}
+ 
+ 		count = old;
+ 	}
