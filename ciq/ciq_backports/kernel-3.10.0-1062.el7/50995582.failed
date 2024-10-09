@@ -1,0 +1,250 @@
+xfs: log recovery should replay deferred ops in order
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Darrick J. Wong <darrick.wong@oracle.com>
+commit 509955823cc9cc225c05673b1b83d70ca70c5c60
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/50995582.failed
+
+As part of testing log recovery with dm_log_writes, Amir Goldstein
+discovered an error in the deferred ops recovery that lead to corruption
+of the filesystem metadata if a reflink+rmap filesystem happened to shut
+down midway through a CoW remap:
+
+"This is what happens [after failed log recovery]:
+
+"Phase 1 - find and verify superblock...
+"Phase 2 - using internal log
+"        - zero log...
+"        - scan filesystem freespace and inode maps...
+"        - found root inode chunk
+"Phase 3 - for each AG...
+"        - scan (but don't clear) agi unlinked lists...
+"        - process known inodes and perform inode discovery...
+"        - agno = 0
+"data fork in regular inode 134 claims CoW block 376
+"correcting nextents for inode 134
+"bad data fork in inode 134
+"would have cleared inode 134"
+
+Hou Tao dissected the log contents of exactly such a crash:
+
+"According to the implementation of xfs_defer_finish(), these ops should
+be completed in the following sequence:
+
+"Have been done:
+"(1) CUI: Oper (160)
+"(2) BUI: Oper (161)
+"(3) CUD: Oper (194), for CUI Oper (160)
+"(4) RUI A: Oper (197), free rmap [0x155, 2, -9]
+
+"Should be done:
+"(5) BUD: for BUI Oper (161)
+"(6) RUI B: add rmap [0x155, 2, 137]
+"(7) RUD: for RUI A
+"(8) RUD: for RUI B
+
+"Actually be done by xlog_recover_process_intents()
+"(5) BUD: for BUI Oper (161)
+"(6) RUI B: add rmap [0x155, 2, 137]
+"(7) RUD: for RUI B
+"(8) RUD: for RUI A
+
+"So the rmap entry [0x155, 2, -9] for COW should be freed firstly,
+then a new rmap entry [0x155, 2, 137] will be added. However, as we can see
+from the log record in post_mount.log (generated after umount) and the trace
+print, the new rmap entry [0x155, 2, 137] are added firstly, then the rmap
+entry [0x155, 2, -9] are freed."
+
+When reconstructing the internal log state from the log items found on
+disk, it's required that deferred ops replay in exactly the same order
+that they would have had the filesystem not gone down.  However,
+replaying unfinished deferred ops can create /more/ deferred ops.  These
+new deferred ops are finished in the wrong order.  This causes fs
+corruption and replay crashes, so let's create a single defer_ops to
+handle the subsequent ops created during replay, then use one single
+transaction at the end of log recovery to ensure that everything is
+replayed in the same order as they're supposed to be.
+
+	Reported-by: Amir Goldstein <amir73il@gmail.com>
+Analyzed-by: Hou Tao <houtao1@huawei.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Tested-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit 509955823cc9cc225c05673b1b83d70ca70c5c60)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_bmap_item.c
+#	fs/xfs/xfs_bmap_item.h
+#	fs/xfs/xfs_log_recover.c
+#	fs/xfs/xfs_refcount_item.c
+#	fs/xfs/xfs_refcount_item.h
+diff --cc fs/xfs/xfs_log_recover.c
+index cc011c722ed6,28d1abfe835e..000000000000
+--- a/fs/xfs/xfs_log_recover.c
++++ b/fs/xfs/xfs_log_recover.c
+@@@ -4301,6 -4672,128 +4302,131 @@@ xlog_recover_cancel_efi
+  	spin_lock(&ailp->xa_lock);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Recover the RUI if necessary. */
++ STATIC int
++ xlog_recover_process_rui(
++ 	struct xfs_mount		*mp,
++ 	struct xfs_ail			*ailp,
++ 	struct xfs_log_item		*lip)
++ {
++ 	struct xfs_rui_log_item		*ruip;
++ 	int				error;
++ 
++ 	/*
++ 	 * Skip RUIs that we've already processed.
++ 	 */
++ 	ruip = container_of(lip, struct xfs_rui_log_item, rui_item);
++ 	if (test_bit(XFS_RUI_RECOVERED, &ruip->rui_flags))
++ 		return 0;
++ 
++ 	spin_unlock(&ailp->xa_lock);
++ 	error = xfs_rui_recover(mp, ruip);
++ 	spin_lock(&ailp->xa_lock);
++ 
++ 	return error;
++ }
++ 
++ /* Release the RUI since we're cancelling everything. */
++ STATIC void
++ xlog_recover_cancel_rui(
++ 	struct xfs_mount		*mp,
++ 	struct xfs_ail			*ailp,
++ 	struct xfs_log_item		*lip)
++ {
++ 	struct xfs_rui_log_item		*ruip;
++ 
++ 	ruip = container_of(lip, struct xfs_rui_log_item, rui_item);
++ 
++ 	spin_unlock(&ailp->xa_lock);
++ 	xfs_rui_release(ruip);
++ 	spin_lock(&ailp->xa_lock);
++ }
++ 
++ /* Recover the CUI if necessary. */
++ STATIC int
++ xlog_recover_process_cui(
++ 	struct xfs_mount		*mp,
++ 	struct xfs_ail			*ailp,
++ 	struct xfs_log_item		*lip,
++ 	struct xfs_defer_ops		*dfops)
++ {
++ 	struct xfs_cui_log_item		*cuip;
++ 	int				error;
++ 
++ 	/*
++ 	 * Skip CUIs that we've already processed.
++ 	 */
++ 	cuip = container_of(lip, struct xfs_cui_log_item, cui_item);
++ 	if (test_bit(XFS_CUI_RECOVERED, &cuip->cui_flags))
++ 		return 0;
++ 
++ 	spin_unlock(&ailp->xa_lock);
++ 	error = xfs_cui_recover(mp, cuip, dfops);
++ 	spin_lock(&ailp->xa_lock);
++ 
++ 	return error;
++ }
++ 
++ /* Release the CUI since we're cancelling everything. */
++ STATIC void
++ xlog_recover_cancel_cui(
++ 	struct xfs_mount		*mp,
++ 	struct xfs_ail			*ailp,
++ 	struct xfs_log_item		*lip)
++ {
++ 	struct xfs_cui_log_item		*cuip;
++ 
++ 	cuip = container_of(lip, struct xfs_cui_log_item, cui_item);
++ 
++ 	spin_unlock(&ailp->xa_lock);
++ 	xfs_cui_release(cuip);
++ 	spin_lock(&ailp->xa_lock);
++ }
++ 
++ /* Recover the BUI if necessary. */
++ STATIC int
++ xlog_recover_process_bui(
++ 	struct xfs_mount		*mp,
++ 	struct xfs_ail			*ailp,
++ 	struct xfs_log_item		*lip,
++ 	struct xfs_defer_ops		*dfops)
++ {
++ 	struct xfs_bui_log_item		*buip;
++ 	int				error;
++ 
++ 	/*
++ 	 * Skip BUIs that we've already processed.
++ 	 */
++ 	buip = container_of(lip, struct xfs_bui_log_item, bui_item);
++ 	if (test_bit(XFS_BUI_RECOVERED, &buip->bui_flags))
++ 		return 0;
++ 
++ 	spin_unlock(&ailp->xa_lock);
++ 	error = xfs_bui_recover(mp, buip, dfops);
++ 	spin_lock(&ailp->xa_lock);
++ 
++ 	return error;
++ }
++ 
++ /* Release the BUI since we're cancelling everything. */
++ STATIC void
++ xlog_recover_cancel_bui(
++ 	struct xfs_mount		*mp,
++ 	struct xfs_ail			*ailp,
++ 	struct xfs_log_item		*lip)
++ {
++ 	struct xfs_bui_log_item		*buip;
++ 
++ 	buip = container_of(lip, struct xfs_bui_log_item, bui_item);
++ 
++ 	spin_unlock(&ailp->xa_lock);
++ 	xfs_bui_release(buip);
++ 	spin_lock(&ailp->xa_lock);
++ }
++ 
+++>>>>>>> 509955823cc9 (xfs: log recovery should replay deferred ops in order)
+  /* Is this log item a deferred action intent? */
+  static inline bool xlog_item_is_intent(struct xfs_log_item *lip)
+  {
+@@@ -4370,6 -4915,17 +4545,20 @@@ xlog_recover_process_intents
+  		case XFS_LI_EFI:
+  			error = xlog_recover_process_efi(log->l_mp, ailp, lip);
+  			break;
+++<<<<<<< HEAD
+++=======
++ 		case XFS_LI_RUI:
++ 			error = xlog_recover_process_rui(log->l_mp, ailp, lip);
++ 			break;
++ 		case XFS_LI_CUI:
++ 			error = xlog_recover_process_cui(log->l_mp, ailp, lip,
++ 					&dfops);
++ 			break;
++ 		case XFS_LI_BUI:
++ 			error = xlog_recover_process_bui(log->l_mp, ailp, lip,
++ 					&dfops);
++ 			break;
+++>>>>>>> 509955823cc9 (xfs: log recovery should replay deferred ops in order)
+  		}
+  		if (error)
+  			goto out;
+* Unmerged path fs/xfs/xfs_bmap_item.c
+* Unmerged path fs/xfs/xfs_bmap_item.h
+* Unmerged path fs/xfs/xfs_refcount_item.c
+* Unmerged path fs/xfs/xfs_refcount_item.h
+* Unmerged path fs/xfs/xfs_bmap_item.c
+* Unmerged path fs/xfs/xfs_bmap_item.h
+* Unmerged path fs/xfs/xfs_log_recover.c
+* Unmerged path fs/xfs/xfs_refcount_item.c
+* Unmerged path fs/xfs/xfs_refcount_item.h
