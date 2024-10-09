@@ -1,0 +1,1797 @@
+net: bpf: rename ndo_xdp to ndo_bpf
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [net] bpf: rename ndo_xdp to ndo_bpf (Neil Horman) [1553106]
+Rebuild_FUZZ: 92.31%
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit f4e63525ee35f9c02e9f51f90571718363e9a9a9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/f4e63525.failed
+
+ndo_xdp is a control path callback for setting up XDP in the
+driver.  We can reuse it for other forms of communication
+between the eBPF stack and the drivers.  Rename the callback
+and associated structures and definitions.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Simon Horman <simon.horman@netronome.com>
+	Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f4e63525ee35f9c02e9f51f90571718363e9a9a9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.c
+#	drivers/net/ethernet/cavium/thunder/nicvf_main.c
+#	drivers/net/ethernet/intel/i40e/i40e_main.c
+#	drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+#	drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+#	drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+#	drivers/net/ethernet/qlogic/qede/qede.h
+#	drivers/net/ethernet/qlogic/qede/qede_filter.c
+#	drivers/net/ethernet/qlogic/qede/qede_main.c
+#	drivers/net/tun.c
+#	drivers/net/virtio_net.c
+#	include/linux/netdevice.h
+#	net/core/dev.c
+#	net/core/rtnetlink.c
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index 44d1856b10e5,96416f5d97f3..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@@ -8201,12 -7773,12 +8201,18 @@@ static const struct net_device_ops bnxt
+  #ifdef CONFIG_RFS_ACCEL
+  	.ndo_rx_flow_steer	= bnxt_rx_flow_steer,
+  #endif
+++<<<<<<< HEAD
+ +	.extended.ndo_udp_tunnel_add	= bnxt_udp_tunnel_add,
+ +	.extended.ndo_udp_tunnel_del	= bnxt_udp_tunnel_del,
+ +	.extended.ndo_xdp		= bnxt_xdp,
+++=======
++ 	.ndo_udp_tunnel_add	= bnxt_udp_tunnel_add,
++ 	.ndo_udp_tunnel_del	= bnxt_udp_tunnel_del,
++ 	.ndo_bpf		= bnxt_xdp,
+++>>>>>>> f4e63525ee35 (net: bpf: rename ndo_xdp to ndo_bpf)
+  	.ndo_bridge_getlink	= bnxt_bridge_getlink,
+  	.ndo_bridge_setlink	= bnxt_bridge_setlink,
+ -	.ndo_get_phys_port_name = bnxt_get_phys_port_name
+ +	.extended.ndo_get_phys_port_name = bnxt_get_phys_port_name
+  };
+  
+  static void bnxt_remove_one(struct pci_dev *pdev)
+diff --cc drivers/net/ethernet/intel/i40e/i40e_main.c
+index 3bb13ceeda72,05b94d87a6c3..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_main.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_main.c
+@@@ -9445,8 -11606,74 +9445,78 @@@ out_err
+  	return features & ~(NETIF_F_CSUM_MASK | NETIF_F_GSO_MASK);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * i40e_xdp_setup - add/remove an XDP program
++  * @vsi: VSI to changed
++  * @prog: XDP program
++  **/
++ static int i40e_xdp_setup(struct i40e_vsi *vsi,
++ 			  struct bpf_prog *prog)
++ {
++ 	int frame_size = vsi->netdev->mtu + ETH_HLEN + ETH_FCS_LEN + VLAN_HLEN;
++ 	struct i40e_pf *pf = vsi->back;
++ 	struct bpf_prog *old_prog;
++ 	bool need_reset;
++ 	int i;
++ 
++ 	/* Don't allow frames that span over multiple buffers */
++ 	if (frame_size > vsi->rx_buf_len)
++ 		return -EINVAL;
++ 
++ 	if (!i40e_enabled_xdp_vsi(vsi) && !prog)
++ 		return 0;
++ 
++ 	/* When turning XDP on->off/off->on we reset and rebuild the rings. */
++ 	need_reset = (i40e_enabled_xdp_vsi(vsi) != !!prog);
++ 
++ 	if (need_reset)
++ 		i40e_prep_for_reset(pf, true);
++ 
++ 	old_prog = xchg(&vsi->xdp_prog, prog);
++ 
++ 	if (need_reset)
++ 		i40e_reset_and_rebuild(pf, true, true);
++ 
++ 	for (i = 0; i < vsi->num_queue_pairs; i++)
++ 		WRITE_ONCE(vsi->rx_rings[i]->xdp_prog, vsi->xdp_prog);
++ 
++ 	if (old_prog)
++ 		bpf_prog_put(old_prog);
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * i40e_xdp - implements ndo_bpf for i40e
++  * @dev: netdevice
++  * @xdp: XDP command
++  **/
++ static int i40e_xdp(struct net_device *dev,
++ 		    struct netdev_bpf *xdp)
++ {
++ 	struct i40e_netdev_priv *np = netdev_priv(dev);
++ 	struct i40e_vsi *vsi = np->vsi;
++ 
++ 	if (vsi->type != I40E_VSI_MAIN)
++ 		return -EINVAL;
++ 
++ 	switch (xdp->command) {
++ 	case XDP_SETUP_PROG:
++ 		return i40e_xdp_setup(vsi, xdp->prog);
++ 	case XDP_QUERY_PROG:
++ 		xdp->prog_attached = i40e_enabled_xdp_vsi(vsi);
++ 		xdp->prog_id = vsi->xdp_prog ? vsi->xdp_prog->aux->id : 0;
++ 		return 0;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
+++>>>>>>> f4e63525ee35 (net: bpf: rename ndo_xdp to ndo_bpf)
+  static const struct net_device_ops i40e_netdev_ops = {
+ +	.ndo_size		= sizeof(struct net_device_ops),
+  	.ndo_open		= i40e_open,
+  	.ndo_stop		= i40e_close,
+  	.ndo_start_xmit		= i40e_lan_xmit_frame,
+@@@ -9478,6 -11705,7 +9548,10 @@@
+  	.ndo_features_check	= i40e_features_check,
+  	.ndo_bridge_getlink	= i40e_ndo_bridge_getlink,
+  	.ndo_bridge_setlink	= i40e_ndo_bridge_setlink,
+++<<<<<<< HEAD
+++=======
++ 	.ndo_bpf		= i40e_xdp,
+++>>>>>>> f4e63525ee35 (net: bpf: rename ndo_xdp to ndo_bpf)
+  };
+  
+  /**
+diff --cc drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+index 1516b79c78d8,e5dcb25be398..000000000000
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@@ -9692,8 -9957,118 +9692,122 @@@ ixgbe_features_check(struct sk_buff *sk
+  	return features;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int ixgbe_xdp_setup(struct net_device *dev, struct bpf_prog *prog)
++ {
++ 	int i, frame_size = dev->mtu + ETH_HLEN + ETH_FCS_LEN + VLAN_HLEN;
++ 	struct ixgbe_adapter *adapter = netdev_priv(dev);
++ 	struct bpf_prog *old_prog;
++ 
++ 	if (adapter->flags & IXGBE_FLAG_SRIOV_ENABLED)
++ 		return -EINVAL;
++ 
++ 	if (adapter->flags & IXGBE_FLAG_DCB_ENABLED)
++ 		return -EINVAL;
++ 
++ 	/* verify ixgbe ring attributes are sufficient for XDP */
++ 	for (i = 0; i < adapter->num_rx_queues; i++) {
++ 		struct ixgbe_ring *ring = adapter->rx_ring[i];
++ 
++ 		if (ring_is_rsc_enabled(ring))
++ 			return -EINVAL;
++ 
++ 		if (frame_size > ixgbe_rx_bufsz(ring))
++ 			return -EINVAL;
++ 	}
++ 
++ 	if (nr_cpu_ids > MAX_XDP_QUEUES)
++ 		return -ENOMEM;
++ 
++ 	old_prog = xchg(&adapter->xdp_prog, prog);
++ 
++ 	/* If transitioning XDP modes reconfigure rings */
++ 	if (!!prog != !!old_prog) {
++ 		int err = ixgbe_setup_tc(dev, netdev_get_num_tc(dev));
++ 
++ 		if (err) {
++ 			rcu_assign_pointer(adapter->xdp_prog, old_prog);
++ 			return -EINVAL;
++ 		}
++ 	} else {
++ 		for (i = 0; i < adapter->num_rx_queues; i++)
++ 			xchg(&adapter->rx_ring[i]->xdp_prog, adapter->xdp_prog);
++ 	}
++ 
++ 	if (old_prog)
++ 		bpf_prog_put(old_prog);
++ 
++ 	return 0;
++ }
++ 
++ static int ixgbe_xdp(struct net_device *dev, struct netdev_bpf *xdp)
++ {
++ 	struct ixgbe_adapter *adapter = netdev_priv(dev);
++ 
++ 	switch (xdp->command) {
++ 	case XDP_SETUP_PROG:
++ 		return ixgbe_xdp_setup(dev, xdp->prog);
++ 	case XDP_QUERY_PROG:
++ 		xdp->prog_attached = !!(adapter->xdp_prog);
++ 		xdp->prog_id = adapter->xdp_prog ?
++ 			adapter->xdp_prog->aux->id : 0;
++ 		return 0;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
++ static int ixgbe_xdp_xmit(struct net_device *dev, struct xdp_buff *xdp)
++ {
++ 	struct ixgbe_adapter *adapter = netdev_priv(dev);
++ 	struct ixgbe_ring *ring;
++ 	int err;
++ 
++ 	if (unlikely(test_bit(__IXGBE_DOWN, &adapter->state)))
++ 		return -ENETDOWN;
++ 
++ 	/* During program transitions its possible adapter->xdp_prog is assigned
++ 	 * but ring has not been configured yet. In this case simply abort xmit.
++ 	 */
++ 	ring = adapter->xdp_prog ? adapter->xdp_ring[smp_processor_id()] : NULL;
++ 	if (unlikely(!ring))
++ 		return -ENXIO;
++ 
++ 	err = ixgbe_xmit_xdp_ring(adapter, xdp);
++ 	if (err != IXGBE_XDP_TX)
++ 		return -ENOSPC;
++ 
++ 	return 0;
++ }
++ 
++ static void ixgbe_xdp_flush(struct net_device *dev)
++ {
++ 	struct ixgbe_adapter *adapter = netdev_priv(dev);
++ 	struct ixgbe_ring *ring;
++ 
++ 	/* Its possible the device went down between xdp xmit and flush so
++ 	 * we need to ensure device is still up.
++ 	 */
++ 	if (unlikely(test_bit(__IXGBE_DOWN, &adapter->state)))
++ 		return;
++ 
++ 	ring = adapter->xdp_prog ? adapter->xdp_ring[smp_processor_id()] : NULL;
++ 	if (unlikely(!ring))
++ 		return;
++ 
++ 	/* Force memory writes to complete before letting h/w know there
++ 	 * are new descriptors to fetch.
++ 	 */
++ 	wmb();
++ 	writel(ring->next_to_use, ring->tail);
++ 
++ 	return;
++ }
++ 
+++>>>>>>> f4e63525ee35 (net: bpf: rename ndo_xdp to ndo_bpf)
+  static const struct net_device_ops ixgbe_netdev_ops = {
+ +	.ndo_size		= sizeof(struct net_device_ops),
+  	.ndo_open		= ixgbe_open,
+  	.ndo_stop		= ixgbe_close,
+  	.ndo_start_xmit		= ixgbe_xmit_frame,
+@@@ -9733,11 -10108,14 +9847,17 @@@
+  	.ndo_fdb_add		= ixgbe_ndo_fdb_add,
+  	.ndo_bridge_setlink	= ixgbe_ndo_bridge_setlink,
+  	.ndo_bridge_getlink	= ixgbe_ndo_bridge_getlink,
+ -	.ndo_dfwd_add_station	= ixgbe_fwd_add,
+ -	.ndo_dfwd_del_station	= ixgbe_fwd_del,
+ -	.ndo_udp_tunnel_add	= ixgbe_add_udp_tunnel_port,
+ -	.ndo_udp_tunnel_del	= ixgbe_del_udp_tunnel_port,
+ +	.extended.ndo_udp_tunnel_add	= ixgbe_add_udp_tunnel_port,
+ +	.extended.ndo_udp_tunnel_del	= ixgbe_del_udp_tunnel_port,
+  	.ndo_features_check	= ixgbe_features_check,
+++<<<<<<< HEAD
+ +	.extended.ndo_dfwd_add_station	= ixgbe_fwd_add,
+ +	.extended.ndo_dfwd_del_station	= ixgbe_fwd_del,
+++=======
++ 	.ndo_bpf		= ixgbe_xdp,
++ 	.ndo_xdp_xmit		= ixgbe_xdp_xmit,
++ 	.ndo_xdp_flush		= ixgbe_xdp_flush,
+++>>>>>>> f4e63525ee35 (net: bpf: rename ndo_xdp to ndo_bpf)
+  };
+  
+  /**
+diff --cc drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+index f6188ebef405,736a6ccaf05e..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+@@@ -2735,8 -2791,146 +2735,150 @@@ static int mlx4_en_set_tx_maxrate(struc
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int mlx4_xdp_set(struct net_device *dev, struct bpf_prog *prog)
++ {
++ 	struct mlx4_en_priv *priv = netdev_priv(dev);
++ 	struct mlx4_en_dev *mdev = priv->mdev;
++ 	struct mlx4_en_port_profile new_prof;
++ 	struct bpf_prog *old_prog;
++ 	struct mlx4_en_priv *tmp;
++ 	int tx_changed = 0;
++ 	int xdp_ring_num;
++ 	int port_up = 0;
++ 	int err;
++ 	int i;
++ 
++ 	xdp_ring_num = prog ? priv->rx_ring_num : 0;
++ 
++ 	/* No need to reconfigure buffers when simply swapping the
++ 	 * program for a new one.
++ 	 */
++ 	if (priv->tx_ring_num[TX_XDP] == xdp_ring_num) {
++ 		if (prog) {
++ 			prog = bpf_prog_add(prog, priv->rx_ring_num - 1);
++ 			if (IS_ERR(prog))
++ 				return PTR_ERR(prog);
++ 		}
++ 		mutex_lock(&mdev->state_lock);
++ 		for (i = 0; i < priv->rx_ring_num; i++) {
++ 			old_prog = rcu_dereference_protected(
++ 					priv->rx_ring[i]->xdp_prog,
++ 					lockdep_is_held(&mdev->state_lock));
++ 			rcu_assign_pointer(priv->rx_ring[i]->xdp_prog, prog);
++ 			if (old_prog)
++ 				bpf_prog_put(old_prog);
++ 		}
++ 		mutex_unlock(&mdev->state_lock);
++ 		return 0;
++ 	}
++ 
++ 	if (!mlx4_en_check_xdp_mtu(dev, dev->mtu))
++ 		return -EOPNOTSUPP;
++ 
++ 	tmp = kzalloc(sizeof(*tmp), GFP_KERNEL);
++ 	if (!tmp)
++ 		return -ENOMEM;
++ 
++ 	if (prog) {
++ 		prog = bpf_prog_add(prog, priv->rx_ring_num - 1);
++ 		if (IS_ERR(prog)) {
++ 			err = PTR_ERR(prog);
++ 			goto out;
++ 		}
++ 	}
++ 
++ 	mutex_lock(&mdev->state_lock);
++ 	memcpy(&new_prof, priv->prof, sizeof(struct mlx4_en_port_profile));
++ 	new_prof.tx_ring_num[TX_XDP] = xdp_ring_num;
++ 
++ 	if (priv->tx_ring_num[TX] + xdp_ring_num > MAX_TX_RINGS) {
++ 		tx_changed = 1;
++ 		new_prof.tx_ring_num[TX] =
++ 			MAX_TX_RINGS - ALIGN(xdp_ring_num, priv->prof->num_up);
++ 		en_warn(priv, "Reducing the number of TX rings, to not exceed the max total rings number.\n");
++ 	}
++ 
++ 	err = mlx4_en_try_alloc_resources(priv, tmp, &new_prof, false);
++ 	if (err) {
++ 		if (prog)
++ 			bpf_prog_sub(prog, priv->rx_ring_num - 1);
++ 		goto unlock_out;
++ 	}
++ 
++ 	if (priv->port_up) {
++ 		port_up = 1;
++ 		mlx4_en_stop_port(dev, 1);
++ 	}
++ 
++ 	mlx4_en_safe_replace_resources(priv, tmp);
++ 	if (tx_changed)
++ 		netif_set_real_num_tx_queues(dev, priv->tx_ring_num[TX]);
++ 
++ 	for (i = 0; i < priv->rx_ring_num; i++) {
++ 		old_prog = rcu_dereference_protected(
++ 					priv->rx_ring[i]->xdp_prog,
++ 					lockdep_is_held(&mdev->state_lock));
++ 		rcu_assign_pointer(priv->rx_ring[i]->xdp_prog, prog);
++ 		if (old_prog)
++ 			bpf_prog_put(old_prog);
++ 	}
++ 
++ 	if (port_up) {
++ 		err = mlx4_en_start_port(dev);
++ 		if (err) {
++ 			en_err(priv, "Failed starting port %d for XDP change\n",
++ 			       priv->port);
++ 			queue_work(mdev->workqueue, &priv->watchdog_task);
++ 		}
++ 	}
++ 
++ unlock_out:
++ 	mutex_unlock(&mdev->state_lock);
++ out:
++ 	kfree(tmp);
++ 	return err;
++ }
++ 
++ static u32 mlx4_xdp_query(struct net_device *dev)
++ {
++ 	struct mlx4_en_priv *priv = netdev_priv(dev);
++ 	struct mlx4_en_dev *mdev = priv->mdev;
++ 	const struct bpf_prog *xdp_prog;
++ 	u32 prog_id = 0;
++ 
++ 	if (!priv->tx_ring_num[TX_XDP])
++ 		return prog_id;
++ 
++ 	mutex_lock(&mdev->state_lock);
++ 	xdp_prog = rcu_dereference_protected(
++ 		priv->rx_ring[0]->xdp_prog,
++ 		lockdep_is_held(&mdev->state_lock));
++ 	if (xdp_prog)
++ 		prog_id = xdp_prog->aux->id;
++ 	mutex_unlock(&mdev->state_lock);
++ 
++ 	return prog_id;
++ }
++ 
++ static int mlx4_xdp(struct net_device *dev, struct netdev_bpf *xdp)
++ {
++ 	switch (xdp->command) {
++ 	case XDP_SETUP_PROG:
++ 		return mlx4_xdp_set(dev, xdp->prog);
++ 	case XDP_QUERY_PROG:
++ 		xdp->prog_id = mlx4_xdp_query(dev);
++ 		xdp->prog_attached = !!xdp->prog_id;
++ 		return 0;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
+++>>>>>>> f4e63525ee35 (net: bpf: rename ndo_xdp to ndo_bpf)
+  static const struct net_device_ops mlx4_netdev_ops = {
+ +	.ndo_size		= sizeof(struct net_device_ops),
+  	.ndo_open		= mlx4_en_open,
+  	.ndo_stop		= mlx4_en_close,
+  	.ndo_start_xmit		= mlx4_en_xmit,
+@@@ -2760,10 -2954,11 +2902,15 @@@
+  	.ndo_rx_flow_steer	= mlx4_en_filter_rfs,
+  #endif
+  	.ndo_get_phys_port_id	= mlx4_en_get_phys_port_id,
+ -	.ndo_udp_tunnel_add	= mlx4_en_add_vxlan_port,
+ -	.ndo_udp_tunnel_del	= mlx4_en_del_vxlan_port,
+ +	.extended.ndo_udp_tunnel_add	= mlx4_en_add_vxlan_port,
+ +	.extended.ndo_udp_tunnel_del	= mlx4_en_del_vxlan_port,
+  	.ndo_features_check	= mlx4_en_features_check,
+++<<<<<<< HEAD
+ +	.extended.ndo_set_tx_maxrate	= mlx4_en_set_tx_maxrate,
+++=======
++ 	.ndo_set_tx_maxrate	= mlx4_en_set_tx_maxrate,
++ 	.ndo_bpf		= mlx4_xdp,
+++>>>>>>> f4e63525ee35 (net: bpf: rename ndo_xdp to ndo_bpf)
+  };
+  
+  static const struct net_device_ops mlx4_netdev_ops_master = {
+@@@ -2797,93 -2991,13 +2944,98 @@@
+  	.ndo_rx_flow_steer	= mlx4_en_filter_rfs,
+  #endif
+  	.ndo_get_phys_port_id	= mlx4_en_get_phys_port_id,
+ -	.ndo_udp_tunnel_add	= mlx4_en_add_vxlan_port,
+ -	.ndo_udp_tunnel_del	= mlx4_en_del_vxlan_port,
+ +	.extended.ndo_udp_tunnel_add	= mlx4_en_add_vxlan_port,
+ +	.extended.ndo_udp_tunnel_del	= mlx4_en_del_vxlan_port,
+  	.ndo_features_check	= mlx4_en_features_check,
+++<<<<<<< HEAD
+ +	.extended.ndo_set_tx_maxrate	= mlx4_en_set_tx_maxrate,
+++=======
++ 	.ndo_set_tx_maxrate	= mlx4_en_set_tx_maxrate,
++ 	.ndo_bpf		= mlx4_xdp,
+++>>>>>>> f4e63525ee35 (net: bpf: rename ndo_xdp to ndo_bpf)
+  };
+  
+ +void mlx4_en_update_pfc_stats_bitmap(struct mlx4_dev *dev,
+ +				     struct mlx4_en_stats_bitmap *stats_bitmap,
+ +				     u8 rx_ppp, u8 rx_pause,
+ +				     u8 tx_ppp, u8 tx_pause)
+ +{
+ +	int last_i = NUM_MAIN_STATS + NUM_PORT_STATS + NUM_PF_STATS;
+ +
+ +	if (!mlx4_is_slave(dev) &&
+ +	    (dev->caps.flags2 & MLX4_DEV_CAP_FLAG2_FLOWSTATS_EN)) {
+ +		mutex_lock(&stats_bitmap->mutex);
+ +		bitmap_clear(stats_bitmap->bitmap, last_i, NUM_FLOW_STATS);
+ +
+ +		if (rx_ppp)
+ +			bitmap_set(stats_bitmap->bitmap, last_i,
+ +				   NUM_FLOW_PRIORITY_STATS_RX);
+ +		last_i += NUM_FLOW_PRIORITY_STATS_RX;
+ +
+ +		if (rx_pause && !(rx_ppp))
+ +			bitmap_set(stats_bitmap->bitmap, last_i,
+ +				   NUM_FLOW_STATS_RX);
+ +		last_i += NUM_FLOW_STATS_RX;
+ +
+ +		if (tx_ppp)
+ +			bitmap_set(stats_bitmap->bitmap, last_i,
+ +				   NUM_FLOW_PRIORITY_STATS_TX);
+ +		last_i += NUM_FLOW_PRIORITY_STATS_TX;
+ +
+ +		if (tx_pause && !(tx_ppp))
+ +			bitmap_set(stats_bitmap->bitmap, last_i,
+ +				   NUM_FLOW_STATS_TX);
+ +		last_i += NUM_FLOW_STATS_TX;
+ +
+ +		mutex_unlock(&stats_bitmap->mutex);
+ +	}
+ +}
+ +
+ +void mlx4_en_set_stats_bitmap(struct mlx4_dev *dev,
+ +			      struct mlx4_en_stats_bitmap *stats_bitmap,
+ +			      u8 rx_ppp, u8 rx_pause,
+ +			      u8 tx_ppp, u8 tx_pause)
+ +{
+ +	int last_i = 0;
+ +
+ +	mutex_init(&stats_bitmap->mutex);
+ +	bitmap_zero(stats_bitmap->bitmap, NUM_ALL_STATS);
+ +
+ +	if (mlx4_is_slave(dev)) {
+ +		bitmap_set(stats_bitmap->bitmap, last_i +
+ +					 MLX4_FIND_NETDEV_STAT(rx_packets), 1);
+ +		bitmap_set(stats_bitmap->bitmap, last_i +
+ +					 MLX4_FIND_NETDEV_STAT(tx_packets), 1);
+ +		bitmap_set(stats_bitmap->bitmap, last_i +
+ +					 MLX4_FIND_NETDEV_STAT(rx_bytes), 1);
+ +		bitmap_set(stats_bitmap->bitmap, last_i +
+ +					 MLX4_FIND_NETDEV_STAT(tx_bytes), 1);
+ +		bitmap_set(stats_bitmap->bitmap, last_i +
+ +					 MLX4_FIND_NETDEV_STAT(rx_dropped), 1);
+ +		bitmap_set(stats_bitmap->bitmap, last_i +
+ +					 MLX4_FIND_NETDEV_STAT(tx_dropped), 1);
+ +	} else {
+ +		bitmap_set(stats_bitmap->bitmap, last_i, NUM_MAIN_STATS);
+ +	}
+ +	last_i += NUM_MAIN_STATS;
+ +
+ +	bitmap_set(stats_bitmap->bitmap, last_i, NUM_PORT_STATS);
+ +	last_i += NUM_PORT_STATS;
+ +
+ +	if (mlx4_is_master(dev))
+ +		bitmap_set(stats_bitmap->bitmap, last_i,
+ +			   NUM_PF_STATS);
+ +	last_i += NUM_PF_STATS;
+ +
+ +	mlx4_en_update_pfc_stats_bitmap(dev, stats_bitmap,
+ +					rx_ppp, rx_pause,
+ +					tx_ppp, tx_pause);
+ +	last_i += NUM_FLOW_STATS;
+ +
+ +	if (!mlx4_is_slave(dev))
+ +		bitmap_set(stats_bitmap->bitmap, last_i, NUM_PKT_STATS);
+ +}
+ +
+  struct mlx4_en_bond {
+  	struct work_struct work;
+  	struct mlx4_en_priv *priv;
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index f9f9996c2b9e,3b7b7bb84eb0..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -3571,8 -3775,74 +3571,79 @@@ static void mlx5e_tx_timeout(struct net
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	if (reopen_channels && test_bit(MLX5E_STATE_OPENED, &priv->state))
+ +		schedule_work(&priv->tx_timeout_work);
+++=======
++ 	/* exchange programs, extra prog reference we got from caller
++ 	 * as long as we don't fail from this point onwards.
++ 	 */
++ 	old_prog = xchg(&priv->channels.params.xdp_prog, prog);
++ 	if (old_prog)
++ 		bpf_prog_put(old_prog);
++ 
++ 	if (reset) /* change RQ type according to priv->xdp_prog */
++ 		mlx5e_set_rq_params(priv->mdev, &priv->channels.params);
++ 
++ 	if (was_opened && reset)
++ 		mlx5e_open_locked(netdev);
++ 
++ 	if (!test_bit(MLX5E_STATE_OPENED, &priv->state) || reset)
++ 		goto unlock;
++ 
++ 	/* exchanging programs w/o reset, we update ref counts on behalf
++ 	 * of the channels RQs here.
++ 	 */
++ 	for (i = 0; i < priv->channels.num; i++) {
++ 		struct mlx5e_channel *c = priv->channels.c[i];
++ 
++ 		clear_bit(MLX5E_RQ_STATE_ENABLED, &c->rq.state);
++ 		napi_synchronize(&c->napi);
++ 		/* prevent mlx5e_poll_rx_cq from accessing rq->xdp_prog */
++ 
++ 		old_prog = xchg(&c->rq.xdp_prog, prog);
++ 
++ 		set_bit(MLX5E_RQ_STATE_ENABLED, &c->rq.state);
++ 		/* napi_schedule in case we have missed anything */
++ 		napi_schedule(&c->napi);
++ 
++ 		if (old_prog)
++ 			bpf_prog_put(old_prog);
++ 	}
++ 
++ unlock:
++ 	mutex_unlock(&priv->state_lock);
++ 	return err;
++ }
++ 
++ static u32 mlx5e_xdp_query(struct net_device *dev)
++ {
++ 	struct mlx5e_priv *priv = netdev_priv(dev);
++ 	const struct bpf_prog *xdp_prog;
++ 	u32 prog_id = 0;
++ 
++ 	mutex_lock(&priv->state_lock);
++ 	xdp_prog = priv->channels.params.xdp_prog;
++ 	if (xdp_prog)
++ 		prog_id = xdp_prog->aux->id;
++ 	mutex_unlock(&priv->state_lock);
++ 
++ 	return prog_id;
++ }
++ 
++ static int mlx5e_xdp(struct net_device *dev, struct netdev_bpf *xdp)
++ {
++ 	switch (xdp->command) {
++ 	case XDP_SETUP_PROG:
++ 		return mlx5e_xdp_set(dev, xdp->prog);
++ 	case XDP_QUERY_PROG:
++ 		xdp->prog_id = mlx5e_xdp_query(dev);
++ 		xdp->prog_attached = !!xdp->prog_id;
++ 		return 0;
++ 	default:
++ 		return -EINVAL;
++ 	}
+++>>>>>>> f4e63525ee35 (net: bpf: rename ndo_xdp to ndo_bpf)
+  }
+  
+  #ifdef CONFIG_NET_POLL_CONTROLLER
+@@@ -3614,6 -3883,7 +3685,10 @@@ static const struct net_device_ops mlx5
+  	.ndo_rx_flow_steer	 = mlx5e_rx_flow_steer,
+  #endif
+  	.ndo_tx_timeout          = mlx5e_tx_timeout,
+++<<<<<<< HEAD
+++=======
++ 	.ndo_bpf		 = mlx5e_xdp,
+++>>>>>>> f4e63525ee35 (net: bpf: rename ndo_xdp to ndo_bpf)
+  #ifdef CONFIG_NET_POLL_CONTROLLER
+  	.ndo_poll_controller     = mlx5e_netpoll,
+  #endif
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index 85c724545e26,f6c6ad4e8a59..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@@ -3412,11 -3377,9 +3412,11 @@@ nfp_net_xdp_setup(struct nfp_net *nn, s
+  
+  	return 0;
+  }
+ +#endif
+  
+- static int nfp_net_xdp(struct net_device *netdev, struct netdev_xdp *xdp)
++ static int nfp_net_xdp(struct net_device *netdev, struct netdev_bpf *xdp)
+  {
+ +#if 0 /* Not in RHEL7 */
+  	struct nfp_net *nn = netdev_priv(netdev);
+  
+  	switch (xdp->command) {
+@@@ -3480,10 -3438,10 +3480,17 @@@ const struct net_device_ops nfp_net_net
+  	.ndo_set_mac_address	= nfp_net_set_mac_address,
+  	.ndo_set_features	= nfp_net_set_features,
+  	.ndo_features_check	= nfp_net_features_check,
+++<<<<<<< HEAD
+ +	.extended.ndo_get_phys_port_name	= nfp_port_get_phys_port_name,
+ +	.extended.ndo_udp_tunnel_add	= nfp_net_add_vxlan_port,
+ +	.extended.ndo_udp_tunnel_del	= nfp_net_del_vxlan_port,
+ +	.extended.ndo_xdp		= nfp_net_xdp,
+++=======
++ 	.ndo_get_phys_port_name	= nfp_port_get_phys_port_name,
++ 	.ndo_udp_tunnel_add	= nfp_net_add_vxlan_port,
++ 	.ndo_udp_tunnel_del	= nfp_net_del_vxlan_port,
++ 	.ndo_bpf		= nfp_net_xdp,
+++>>>>>>> f4e63525ee35 (net: bpf: rename ndo_xdp to ndo_bpf)
+  };
+  
+  /**
+diff --cc drivers/net/ethernet/qlogic/qede/qede.h
+index 9b239e0413d6,a3a70ade411f..000000000000
+--- a/drivers/net/ethernet/qlogic/qede/qede.h
++++ b/drivers/net/ethernet/qlogic/qede/qede.h
+@@@ -475,6 -503,8 +475,11 @@@ void qede_fill_rss_params(struct qede_d
+  void qede_udp_tunnel_add(struct net_device *dev, struct udp_tunnel_info *ti);
+  void qede_udp_tunnel_del(struct net_device *dev, struct udp_tunnel_info *ti);
+  
+++<<<<<<< HEAD
+++=======
++ int qede_xdp(struct net_device *dev, struct netdev_bpf *xdp);
++ 
+++>>>>>>> f4e63525ee35 (net: bpf: rename ndo_xdp to ndo_bpf)
+  #ifdef CONFIG_DCB
+  void qede_set_dcbnl_ops(struct net_device *ndev);
+  #endif
+diff --cc drivers/net/ethernet/qlogic/qede/qede_filter.c
+index b0a5725cf1fe,c1a0708a7d7c..000000000000
+--- a/drivers/net/ethernet/qlogic/qede/qede_filter.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_filter.c
+@@@ -1043,6 -1043,44 +1043,47 @@@ void qede_udp_tunnel_del(struct net_dev
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void qede_xdp_reload_func(struct qede_dev *edev,
++ 				 struct qede_reload_args *args)
++ {
++ 	struct bpf_prog *old;
++ 
++ 	old = xchg(&edev->xdp_prog, args->u.new_prog);
++ 	if (old)
++ 		bpf_prog_put(old);
++ }
++ 
++ static int qede_xdp_set(struct qede_dev *edev, struct bpf_prog *prog)
++ {
++ 	struct qede_reload_args args;
++ 
++ 	/* If we're called, there was already a bpf reference increment */
++ 	args.func = &qede_xdp_reload_func;
++ 	args.u.new_prog = prog;
++ 	qede_reload(edev, &args, false);
++ 
++ 	return 0;
++ }
++ 
++ int qede_xdp(struct net_device *dev, struct netdev_bpf *xdp)
++ {
++ 	struct qede_dev *edev = netdev_priv(dev);
++ 
++ 	switch (xdp->command) {
++ 	case XDP_SETUP_PROG:
++ 		return qede_xdp_set(edev, xdp->prog);
++ 	case XDP_QUERY_PROG:
++ 		xdp->prog_attached = !!edev->xdp_prog;
++ 		xdp->prog_id = edev->xdp_prog ? edev->xdp_prog->aux->id : 0;
++ 		return 0;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
+++>>>>>>> f4e63525ee35 (net: bpf: rename ndo_xdp to ndo_bpf)
+  static int qede_set_mcast_rx_mac(struct qede_dev *edev,
+  				 enum qed_filter_xcast_params_type opcode,
+  				 unsigned char *mac, int num_macs)
+diff --cc drivers/net/ethernet/qlogic/qede/qede_main.c
+index b6f3dbb9e63d,8f9b3eb82137..000000000000
+--- a/drivers/net/ethernet/qlogic/qede/qede_main.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_main.c
+@@@ -551,9 -553,10 +551,13 @@@ static const struct net_device_ops qede
+  	.ndo_get_vf_config = qede_get_vf_config,
+  	.ndo_set_vf_rate = qede_set_vf_rate,
+  #endif
+ -	.ndo_udp_tunnel_add = qede_udp_tunnel_add,
+ -	.ndo_udp_tunnel_del = qede_udp_tunnel_del,
+ +	.extended.ndo_udp_tunnel_add = qede_udp_tunnel_add,
+ +	.extended.ndo_udp_tunnel_del = qede_udp_tunnel_del,
+  	.ndo_features_check = qede_features_check,
+++<<<<<<< HEAD
+++=======
++ 	.ndo_bpf = qede_xdp,
+++>>>>>>> f4e63525ee35 (net: bpf: rename ndo_xdp to ndo_bpf)
+  #ifdef CONFIG_RFS_ACCEL
+  	.ndo_rx_flow_steer = qede_rx_flow_steer,
+  #endif
+@@@ -574,6 -577,26 +578,27 @@@ static const struct net_device_ops qede
+  	.ndo_features_check = qede_features_check,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static const struct net_device_ops qede_netdev_vf_xdp_ops = {
++ 	.ndo_open = qede_open,
++ 	.ndo_stop = qede_close,
++ 	.ndo_start_xmit = qede_start_xmit,
++ 	.ndo_set_rx_mode = qede_set_rx_mode,
++ 	.ndo_set_mac_address = qede_set_mac_addr,
++ 	.ndo_validate_addr = eth_validate_addr,
++ 	.ndo_change_mtu = qede_change_mtu,
++ 	.ndo_vlan_rx_add_vid = qede_vlan_rx_add_vid,
++ 	.ndo_vlan_rx_kill_vid = qede_vlan_rx_kill_vid,
++ 	.ndo_set_features = qede_set_features,
++ 	.ndo_get_stats64 = qede_get_stats64,
++ 	.ndo_udp_tunnel_add = qede_udp_tunnel_add,
++ 	.ndo_udp_tunnel_del = qede_udp_tunnel_del,
++ 	.ndo_features_check = qede_features_check,
++ 	.ndo_bpf = qede_xdp,
++ };
++ 
+++>>>>>>> f4e63525ee35 (net: bpf: rename ndo_xdp to ndo_bpf)
+  /* -------------------------------------------------------------------------
+   * START OF PROBE / REMOVE
+   * -------------------------------------------------------------------------
+diff --cc drivers/net/tun.c
+index 3c46a6b55234,1a326b697221..000000000000
+--- a/drivers/net/tun.c
++++ b/drivers/net/tun.c
+@@@ -948,32 -1115,44 +948,62 @@@ tun_net_get_stats64(struct net_device *
+  	stats->tx_dropped = tx_dropped;
+  }
+  
+ -static int tun_xdp_set(struct net_device *dev, struct bpf_prog *prog,
+ -		       struct netlink_ext_ack *extack)
+ +#ifdef CONFIG_NET_POLL_CONTROLLER
+ +static void tun_poll_controller(struct net_device *dev)
+ +{
+ +	/*
+ +	 * Tun only receives frames when:
+ +	 * 1) the char device endpoint gets data from user space
+ +	 * 2) the tun socket gets a sendmsg call from user space
+ +	 * Since both of those are syncronous operations, we are guaranteed
+ +	 * never to have pending data when we poll for it
+ +	 * so theres nothing to do here but return.
+ +	 * We need this though so netpoll recognizes us as an interface that
+ +	 * supports polling, which enables bridge devices in virt setups to
+ +	 * still use netconsole
+ +	 */
+ +	return;
+ +}
+ +#endif
+ +
+ +static void tun_set_headroom(struct net_device *dev, int new_hr)
+  {
+  	struct tun_struct *tun = netdev_priv(dev);
+ -	struct bpf_prog *old_prog;
+  
+ -	old_prog = rtnl_dereference(tun->xdp_prog);
+ -	rcu_assign_pointer(tun->xdp_prog, prog);
+ -	if (old_prog)
+ -		bpf_prog_put(old_prog);
+ +	if (new_hr < NET_SKB_PAD)
+ +		new_hr = NET_SKB_PAD;
+  
+++<<<<<<< HEAD
+ +	tun->align = new_hr;
+++=======
++ 	return 0;
++ }
++ 
++ static u32 tun_xdp_query(struct net_device *dev)
++ {
++ 	struct tun_struct *tun = netdev_priv(dev);
++ 	const struct bpf_prog *xdp_prog;
++ 
++ 	xdp_prog = rtnl_dereference(tun->xdp_prog);
++ 	if (xdp_prog)
++ 		return xdp_prog->aux->id;
++ 
++ 	return 0;
++ }
++ 
++ static int tun_xdp(struct net_device *dev, struct netdev_bpf *xdp)
++ {
++ 	switch (xdp->command) {
++ 	case XDP_SETUP_PROG:
++ 		return tun_xdp_set(dev, xdp->prog, xdp->extack);
++ 	case XDP_QUERY_PROG:
++ 		xdp->prog_id = tun_xdp_query(dev);
++ 		xdp->prog_attached = !!xdp->prog_id;
++ 		return 0;
++ 	default:
++ 		return -EINVAL;
++ 	}
+++>>>>>>> f4e63525ee35 (net: bpf: rename ndo_xdp to ndo_bpf)
+  }
+  
+  static const struct net_device_ops tun_netdev_ops = {
+@@@ -1006,9 -1182,10 +1036,13 @@@ static const struct net_device_ops tap_
+  #ifdef CONFIG_NET_POLL_CONTROLLER
+  	.ndo_poll_controller	= tun_poll_controller,
+  #endif
+ -	.ndo_features_check	= passthru_features_check,
+ -	.ndo_set_rx_headroom	= tun_set_headroom,
+ +	.ndo_size		= sizeof(struct net_device_ops),
+ +	.extended.ndo_set_rx_headroom	= tun_set_headroom,
+  	.ndo_get_stats64	= tun_net_get_stats64,
+++<<<<<<< HEAD
+++=======
++ 	.ndo_bpf		= tun_xdp,
+++>>>>>>> f4e63525ee35 (net: bpf: rename ndo_xdp to ndo_bpf)
+  };
+  
+  static void tun_flow_init(struct tun_struct *tun)
+diff --cc drivers/net/virtio_net.c
+index 7b0841ddd139,edf984406ba0..000000000000
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@@ -1255,29 -1898,208 +1255,116 @@@ static const struct ethtool_ops virtnet
+  	.get_ringparam = virtnet_get_ringparam,
+  	.set_channels = virtnet_set_channels,
+  	.get_channels = virtnet_get_channels,
+ -	.get_ts_info = ethtool_op_get_ts_info,
+ -	.get_link_ksettings = virtnet_get_link_ksettings,
+ -	.set_link_ksettings = virtnet_set_link_ksettings,
+  };
+  
+ -static void virtnet_freeze_down(struct virtio_device *vdev)
+ -{
+ -	struct virtnet_info *vi = vdev->priv;
+ -	int i;
+ -
+ -	/* Make sure no work handler is accessing the device */
+ -	flush_work(&vi->config_work);
+ -
+ -	netif_device_detach(vi->dev);
+ -	netif_tx_disable(vi->dev);
+ -	cancel_delayed_work_sync(&vi->refill);
+ -
+ -	if (netif_running(vi->dev)) {
+ -		for (i = 0; i < vi->max_queue_pairs; i++) {
+ -			napi_disable(&vi->rq[i].napi);
+ -			virtnet_napi_tx_disable(&vi->sq[i].napi);
+ -		}
+ -	}
+ -}
+ -
+ -static int init_vqs(struct virtnet_info *vi);
+ -
+ -static int virtnet_restore_up(struct virtio_device *vdev)
+ -{
+ -	struct virtnet_info *vi = vdev->priv;
+ -	int err, i;
+ -
+ -	err = init_vqs(vi);
+ -	if (err)
+ -		return err;
+ -
+ -	virtio_device_ready(vdev);
+ -
+ -	if (netif_running(vi->dev)) {
+ -		for (i = 0; i < vi->curr_queue_pairs; i++)
+ -			if (!try_fill_recv(vi, &vi->rq[i], GFP_KERNEL))
+ -				schedule_delayed_work(&vi->refill, 0);
+ -
+ -		for (i = 0; i < vi->max_queue_pairs; i++) {
+ -			virtnet_napi_enable(vi->rq[i].vq, &vi->rq[i].napi);
+ -			virtnet_napi_tx_enable(vi, vi->sq[i].vq,
+ -					       &vi->sq[i].napi);
+ -		}
+ -	}
+ -
+ -	netif_device_attach(vi->dev);
+ -	return err;
+ -}
+ -
+ -static int virtnet_set_guest_offloads(struct virtnet_info *vi, u64 offloads)
+ -{
+ -	struct scatterlist sg;
+ -	vi->ctrl_offloads = cpu_to_virtio64(vi->vdev, offloads);
+ -
+ -	sg_init_one(&sg, &vi->ctrl_offloads, sizeof(vi->ctrl_offloads));
+ -
+ -	if (!virtnet_send_command(vi, VIRTIO_NET_CTRL_GUEST_OFFLOADS,
+ -				  VIRTIO_NET_CTRL_GUEST_OFFLOADS_SET, &sg)) {
+ -		dev_warn(&vi->dev->dev, "Fail to set guest offload. \n");
+ -		return -EINVAL;
+ -	}
+ -
+ -	return 0;
+ -}
+ -
+ -static int virtnet_clear_guest_offloads(struct virtnet_info *vi)
+ -{
+ -	u64 offloads = 0;
+ -
+ -	if (!vi->guest_offloads)
+ -		return 0;
+ -
+ -	if (virtio_has_feature(vi->vdev, VIRTIO_NET_F_GUEST_CSUM))
+ -		offloads = 1ULL << VIRTIO_NET_F_GUEST_CSUM;
+ -
+ -	return virtnet_set_guest_offloads(vi, offloads);
+ -}
+ -
+ -static int virtnet_restore_guest_offloads(struct virtnet_info *vi)
+ -{
+ -	u64 offloads = vi->guest_offloads;
+ -
+ -	if (!vi->guest_offloads)
+ -		return 0;
+ -	if (virtio_has_feature(vi->vdev, VIRTIO_NET_F_GUEST_CSUM))
+ -		offloads |= 1ULL << VIRTIO_NET_F_GUEST_CSUM;
+ -
+ -	return virtnet_set_guest_offloads(vi, offloads);
+ -}
+ -
+ -static int virtnet_xdp_set(struct net_device *dev, struct bpf_prog *prog,
+ -			   struct netlink_ext_ack *extack)
+ +/* To avoid contending a lock hold by a vcpu who would exit to host, select the
+ + * txq based on the processor id.
+ + */
+ +static u16 virtnet_select_queue(struct net_device *dev, struct sk_buff *skb,
+ +			void *accel_priv, select_queue_fallback_t fallback)
+  {
+ -	unsigned long int max_sz = PAGE_SIZE - sizeof(struct padded_vnet_hdr);
+ +	int txq;
+  	struct virtnet_info *vi = netdev_priv(dev);
+ -	struct bpf_prog *old_prog;
+ -	u16 xdp_qp = 0, curr_qp;
+ -	int i, err;
+  
+ -	if (!virtio_has_feature(vi->vdev, VIRTIO_NET_F_CTRL_GUEST_OFFLOADS)
+ -	    && (virtio_has_feature(vi->vdev, VIRTIO_NET_F_GUEST_TSO4) ||
+ -	        virtio_has_feature(vi->vdev, VIRTIO_NET_F_GUEST_TSO6) ||
+ -	        virtio_has_feature(vi->vdev, VIRTIO_NET_F_GUEST_ECN) ||
+ -		virtio_has_feature(vi->vdev, VIRTIO_NET_F_GUEST_UFO))) {
+ -		NL_SET_ERR_MSG_MOD(extack, "Can't set XDP while host is implementing LRO, disable LRO first");
+ -		return -EOPNOTSUPP;
+ +	if (skb_rx_queue_recorded(skb)) {
+ +		txq = skb_get_rx_queue(skb);
+ +	} else {
+ +		txq = *__this_cpu_ptr(vi->vq_index);
+ +		if (txq == -1)
+ +			txq = 0;
+  	}
+  
+ -	if (vi->mergeable_rx_bufs && !vi->any_header_sg) {
+ -		NL_SET_ERR_MSG_MOD(extack, "XDP expects header/data in single page, any_header_sg required");
+ -		return -EINVAL;
+ -	}
+ +	while (unlikely(txq >= dev->real_num_tx_queues))
+ +		txq -= dev->real_num_tx_queues;
+  
+++<<<<<<< HEAD
+ +	return txq;
+++=======
++ 	if (dev->mtu > max_sz) {
++ 		NL_SET_ERR_MSG_MOD(extack, "MTU too large to enable XDP");
++ 		netdev_warn(dev, "XDP requires MTU less than %lu\n", max_sz);
++ 		return -EINVAL;
++ 	}
++ 
++ 	curr_qp = vi->curr_queue_pairs - vi->xdp_queue_pairs;
++ 	if (prog)
++ 		xdp_qp = nr_cpu_ids;
++ 
++ 	/* XDP requires extra queues for XDP_TX */
++ 	if (curr_qp + xdp_qp > vi->max_queue_pairs) {
++ 		NL_SET_ERR_MSG_MOD(extack, "Too few free TX rings available");
++ 		netdev_warn(dev, "request %i queues but max is %i\n",
++ 			    curr_qp + xdp_qp, vi->max_queue_pairs);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	if (prog) {
++ 		prog = bpf_prog_add(prog, vi->max_queue_pairs - 1);
++ 		if (IS_ERR(prog))
++ 			return PTR_ERR(prog);
++ 	}
++ 
++ 	/* Make sure NAPI is not using any XDP TX queues for RX. */
++ 	for (i = 0; i < vi->max_queue_pairs; i++)
++ 		napi_disable(&vi->rq[i].napi);
++ 
++ 	netif_set_real_num_rx_queues(dev, curr_qp + xdp_qp);
++ 	err = _virtnet_set_queues(vi, curr_qp + xdp_qp);
++ 	if (err)
++ 		goto err;
++ 	vi->xdp_queue_pairs = xdp_qp;
++ 
++ 	for (i = 0; i < vi->max_queue_pairs; i++) {
++ 		old_prog = rtnl_dereference(vi->rq[i].xdp_prog);
++ 		rcu_assign_pointer(vi->rq[i].xdp_prog, prog);
++ 		if (i == 0) {
++ 			if (!old_prog)
++ 				virtnet_clear_guest_offloads(vi);
++ 			if (!prog)
++ 				virtnet_restore_guest_offloads(vi);
++ 		}
++ 		if (old_prog)
++ 			bpf_prog_put(old_prog);
++ 		virtnet_napi_enable(vi->rq[i].vq, &vi->rq[i].napi);
++ 	}
++ 
++ 	return 0;
++ 
++ err:
++ 	for (i = 0; i < vi->max_queue_pairs; i++)
++ 		virtnet_napi_enable(vi->rq[i].vq, &vi->rq[i].napi);
++ 	if (prog)
++ 		bpf_prog_sub(prog, vi->max_queue_pairs - 1);
++ 	return err;
++ }
++ 
++ static u32 virtnet_xdp_query(struct net_device *dev)
++ {
++ 	struct virtnet_info *vi = netdev_priv(dev);
++ 	const struct bpf_prog *xdp_prog;
++ 	int i;
++ 
++ 	for (i = 0; i < vi->max_queue_pairs; i++) {
++ 		xdp_prog = rtnl_dereference(vi->rq[i].xdp_prog);
++ 		if (xdp_prog)
++ 			return xdp_prog->aux->id;
++ 	}
++ 	return 0;
++ }
++ 
++ static int virtnet_xdp(struct net_device *dev, struct netdev_bpf *xdp)
++ {
++ 	switch (xdp->command) {
++ 	case XDP_SETUP_PROG:
++ 		return virtnet_xdp_set(dev, xdp->prog, xdp->extack);
++ 	case XDP_QUERY_PROG:
++ 		xdp->prog_id = virtnet_xdp_query(dev);
++ 		xdp->prog_attached = !!xdp->prog_id;
++ 		return 0;
++ 	default:
++ 		return -EINVAL;
++ 	}
+++>>>>>>> f4e63525ee35 (net: bpf: rename ndo_xdp to ndo_bpf)
+  }
+  
+  static const struct net_device_ops virtnet_netdev = {
+@@@ -1294,6 -2115,9 +1381,12 @@@
+  #ifdef CONFIG_NET_POLL_CONTROLLER
+  	.ndo_poll_controller = virtnet_netpoll,
+  #endif
+++<<<<<<< HEAD
+++=======
++ 	.ndo_bpf		= virtnet_xdp,
++ 	.ndo_xdp_xmit		= virtnet_xdp_xmit,
++ 	.ndo_xdp_flush		= virtnet_xdp_flush,
+++>>>>>>> f4e63525ee35 (net: bpf: rename ndo_xdp to ndo_bpf)
+  	.ndo_features_check	= passthru_features_check,
+  };
+  
+diff --cc include/linux/netdevice.h
+index dbc794e21d64,9af9feaaeb64..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -814,176 -775,14 +814,176 @@@ enum tc_setup_type 
+  	TC_SETUP_CLSFLOWER,
+  	TC_SETUP_CLSMATCHALL,
+  	TC_SETUP_CLSBPF,
+ -	TC_SETUP_BLOCK,
+ -	TC_SETUP_CBS,
+ +};
+ +
+ +/* Forward declaration of tc_to_netdev structure used by __rh_call_ndo_setup_tc
+ + * wrapper for out-of-tree drivers compiled against RHEL7.4.
+ + */
+ +struct tc_to_netdev_rh74;
+ +
+ +struct tc_cls_u32_offload;
+ +
+ +struct tc_to_netdev {
+ +	unsigned int type;
+ +	union {
+ +		u8 tc;
+ +		struct tc_cls_u32_offload *cls_u32;
+ +		struct tc_cls_flower_offload *cls_flower;
+ +		struct tc_cls_matchall_offload *cls_mall;
+ +		struct tc_cls_bpf_offload *cls_bpf;
+ +	};
+ +	bool egress_dev;
+ +};
+ +
+ +/* This structure defines the management hooks for network devices.
+ + * It is an extension of net_device_ops. Drivers that want to use any of the
+ + * fields defined here must initialize net_device_ops->ndo_size to
+ + * sizeof(struct net_device_ops).
+ + *
+ + * void* (*ndo_dfwd_add_station)(struct net_device *pdev,
+ + *				 struct net_device *dev)
+ + *	Called by upper layer devices to accelerate switching or other
+ + *	station functionality into hardware. 'pdev is the lowerdev
+ + *	to use for the offload and 'dev' is the net device that will
+ + *	back the offload. Returns a pointer to the private structure
+ + *	the upper layer will maintain.
+ + * void (*ndo_dfwd_del_station)(struct net_device *pdev, void *priv)
+ + *	Called by upper layer device to delete the station created
+ + *	by 'ndo_dfwd_add_station'. 'pdev' is the net device backing
+ + *	the station and priv is the structure returned by the add
+ + *	operation.
+ + * int (*ndo_set_tx_maxrate)(struct net_device *dev,
+ + *			     int queue_index, u32 maxrate);
+ + *	Called when a user wants to set a max-rate limitation of specific
+ + *	TX queue.
+ + * void (*ndo_set_rx_headroom)(struct net_device *dev, int needed_headroom);
+ + *	This function is used to specify the headroom that the skb must
+ + *	consider when allocation skb during packet reception. Setting
+ + *	appropriate rx headroom value allows avoiding skb head copy on
+ + *	forward. Setting a negative value reset the rx headroom to the
+ + *	default value.
+ + * int (*ndo_fdb_dump)(struct sk_buff *skb, struct netlink_callback *cb,
+ + *		       struct net_device *dev, struct net_device *filter_dev,
+ + *		       int *idx)
+ + *	Used to add FDB entries to dump requests. Implementers should add
+ + *	entries to skb and update idx with the number of entries.
+ + * void (*ndo_change_proto_down)(struct net_device *dev,
+ + *				 bool proto_down);
+ + *	This function is used to pass protocol port error state information
+ + *	to the switch driver. The switch driver can react to the proto_down
+ + *      by doing a phys down on the associated switch port.
+ + * void (*ndo_udp_tunnel_add)(struct net_device *dev,
+ + *			      struct udp_tunnel_info *ti);
+ + *	Called by UDP tunnel to notify a driver about the UDP port and socket
+ + *	address family that a UDP tunnel is listnening to. It is called only
+ + *	when a new port starts listening. The operation is protected by the
+ + *	RTNL.
+ + *
+ + * void (*ndo_udp_tunnel_del)(struct net_device *dev,
+ + *			      struct udp_tunnel_info *ti);
+ + *	Called by UDP tunnel to notify the driver about a UDP port and socket
+ + *	address family that the UDP tunnel is not listening to anymore. The
+ + *	operation is protected by the RTNL.
+ + *
+ + * int (*ndo_set_vf_vlan)(struct net_device *dev, int vf, u16 vlan,
+ + *			  u8 qos, __be16 proto);
+ + *
+ + * bool (*ndo_has_offload_stats)(const struct net_device *dev, int attr_id)
+ + *	Return true if this device supports offload stats of this attr_id.
+ + *
+ + * int (*ndo_get_offload_stats)(int attr_id, const struct net_device *dev,
+ + *	void *attr_data)
+ + *	Get statistics for offload operations by attr_id. Write it into the
+ + *	attr_data pointer.
+ + *
+ + * int (*ndo_change_mtu)(struct net_device *dev, int new_mtu);
+ + *	Called when a user wants to change the Maximum Transfer Unit
+ + *	of a device.
+ + *	RHEL: This is an entry point for network device drivers that
+ + *	      use central MTU range checking provided by network core.
+ + *
+ + * int (*ndo_setup_tc)(struct net_device *dev, enum tc_setup_type type,
+ + *		       void *type_data);
+ + *	Called to setup any 'tc' scheduler, classifier or action on @dev.
+ + *	This is always called from the stack with the rtnl lock held and netif
+ + *	tx queues stopped. This allows the netdevice to perform queue
+ + *	management safely.
+ + *	RHEL: Note that this callback is not part of kABI and its prototype
+ + *	and semantic can be changed across releases.
+ + * int (*ndo_xdp)(struct net_device *dev, struct netdev_xdp *xdp);
+ + *	This function is used to set or query state related to XDP on the
+ + *	netdevice. See definition of enum xdp_netdev_command for details.
+ + * int (*ndo_xdp_xmit)(struct net_device *dev, struct xdp_buff *xdp);
+ + *	This function is used to submit a XDP packet for transmit on a
+ + *	netdevice.
+ + * void (*ndo_xdp_flush)(struct net_device *dev);
+ + *	This function is used to inform the driver to flush a paticular
+ + *	xpd tx queue. Must be called on same CPU as xdp_xmit.
+ + */
+ +struct net_device_ops_extended {
+ +	int			(*ndo_set_vf_trust)(struct net_device *dev,
+ +						    int vf, bool setting);
+ +	void*			(*ndo_dfwd_add_station)(struct net_device *pdev,
+ +							struct net_device *dev);
+ +	void			(*ndo_dfwd_del_station)(struct net_device *pdev,
+ +							void *priv);
+ +	int			(*ndo_set_tx_maxrate)(struct net_device *dev,
+ +						      int queue_index,
+ +						      u32 maxrate);
+ +	void			(*ndo_set_rx_headroom)(struct net_device *dev,
+ +						       int needed_headroom);
+ +	int			(*ndo_set_vf_guid)(struct net_device *dev,
+ +						   int vf, u64 guid,
+ +						   int guid_type);
+ +	int			(*ndo_fdb_dump_rh73)(struct sk_buff *skb,
+ +						struct netlink_callback *cb,
+ +						struct net_device *dev,
+ +						struct net_device *filter_dev,
+ +						int idx);
+ +	int			(*ndo_get_phys_port_name)(struct net_device *dev,
+ +							  char *name, size_t len);
+ +	int			(*ndo_change_proto_down)(struct net_device *dev,
+ +							 bool proto_down);
+ +	void			(*ndo_udp_tunnel_add)(struct net_device *dev,
+ +						      struct udp_tunnel_info *ti);
+ +	void			(*ndo_udp_tunnel_del)(struct net_device *dev,
+ +						      struct udp_tunnel_info *ti);
+ +	int			(*ndo_neigh_construct)(struct net_device *dev,
+ +						       struct neighbour *n);
+ +	void			(*ndo_neigh_destroy)(struct net_device *dev,
+ +						     struct neighbour *n);
+ +	int			(*ndo_set_vf_vlan)(struct net_device *dev,
+ +						   int vf, u16 vlan, u8 qos,
+ +						   __be16 proto);
+ +	int			(*ndo_fdb_dump)(struct sk_buff *skb,
+ +						struct netlink_callback *cb,
+ +						struct net_device *dev,
+ +						struct net_device *filter_dev,
+ +						int *idx);
+ +	bool			(*ndo_has_offload_stats)(const struct net_device *dev, int attr_id);
+ +	int			(*ndo_get_offload_stats)(int attr_id,
+ +							 const struct net_device *dev,
+ +							 void *attr_data);
+ +	int			(*ndo_change_mtu)(struct net_device *dev,
+ +						  int new_mtu);
+ +	/*
+ +	 * RHEL: Note that this callback is not part of kABI and its prototype
+ +	 * and semantic can be changed across releases.
+ +	 */
+ +	int			(*ndo_setup_tc_rh)(struct net_device *dev,
+ +						   enum tc_setup_type type,
+ +						   void *type_data);
+ +	int			(*ndo_xdp)(struct net_device *dev,
+ +						  struct netdev_xdp *xdp);
+ +	int                     (*ndo_xdp_xmit)(struct net_device *dev,
+ +						struct xdp_buff *xdp);
+ +	void                    (*ndo_xdp_flush)(struct net_device *dev);
+  };
+  
+- /* These structures hold the attributes of xdp state that are being passed
+-  * to the netdevice through the xdp op.
++ /* These structures hold the attributes of bpf state that are being passed
++  * to the netdevice through the bpf op.
+   */
+- enum xdp_netdev_command {
++ enum bpf_netdev_command {
+  	/* Set or clear a bpf program used in the earliest stages of packet
+  	 * rx. The prog will have been loaded as BPF_PROG_TYPE_XDP. The callee
+  	 * is responsible for calling bpf_prog_put on any old progs that are
+@@@ -998,17 -799,21 +998,24 @@@
+  	XDP_QUERY_PROG,
+  };
+  
+++<<<<<<< HEAD
+ +struct netdev_xdp {
+ +	enum xdp_netdev_command command;
+++=======
++ struct netlink_ext_ack;
++ 
++ struct netdev_bpf {
++ 	enum bpf_netdev_command command;
+++>>>>>>> f4e63525ee35 (net: bpf: rename ndo_xdp to ndo_bpf)
+  	union {
+  		/* XDP_SETUP_PROG */
+ -		struct {
+ -			u32 flags;
+ -			struct bpf_prog *prog;
+ -			struct netlink_ext_ack *extack;
+ -		};
+ +		struct bpf_prog *prog;
+  		/* XDP_QUERY_PROG */
+  		struct {
+ -			u8 prog_attached;
+ +			bool prog_attached;
+  			u32 prog_id;
+ +			/* flags with which program was installed */
+ +			u32 prog_flags;
+  		};
+  	};
+  };
+@@@ -1272,6 -1118,22 +1279,25 @@@
+   *	This function is used to get egress tunnel information for given skb.
+   *	This is useful for retrieving outer tunnel header parameters while
+   *	sampling packet.
+++<<<<<<< HEAD
+++=======
++  * void (*ndo_set_rx_headroom)(struct net_device *dev, int needed_headroom);
++  *	This function is used to specify the headroom that the skb must
++  *	consider when allocation skb during packet reception. Setting
++  *	appropriate rx headroom value allows avoiding skb head copy on
++  *	forward. Setting a negative value resets the rx headroom to the
++  *	default value.
++  * int (*ndo_bpf)(struct net_device *dev, struct netdev_bpf *bpf);
++  *	This function is used to set or query state related to XDP on the
++  *	netdevice and manage BPF offload. See definition of
++  *	enum bpf_netdev_command for details.
++  * int (*ndo_xdp_xmit)(struct net_device *dev, struct xdp_buff *xdp);
++  *	This function is used to submit a XDP packet for transmit on a
++  *	netdevice.
++  * void (*ndo_xdp_flush)(struct net_device *dev);
++  *	This function is used to inform the driver to flush a particular
++  *	xdp tx queue. Must be called on same CPU as xdp_xmit.
+++>>>>>>> f4e63525ee35 (net: bpf: rename ndo_xdp to ndo_bpf)
+   */
+  struct net_device_ops {
+  	int			(*ndo_init)(struct net_device *dev);
+@@@ -1433,77 -1294,35 +1459,96 @@@
+  						      bool new_carrier);
+  	int			(*ndo_get_phys_port_id)(struct net_device *dev,
+  							struct netdev_phys_item_id *ppid);
+ -	int			(*ndo_get_phys_port_name)(struct net_device *dev,
+ -							  char *name, size_t len);
+ -	void			(*ndo_udp_tunnel_add)(struct net_device *dev,
+ -						      struct udp_tunnel_info *ti);
+ -	void			(*ndo_udp_tunnel_del)(struct net_device *dev,
+ -						      struct udp_tunnel_info *ti);
+ -	void*			(*ndo_dfwd_add_station)(struct net_device *pdev,
+ -							struct net_device *dev);
+ -	void			(*ndo_dfwd_del_station)(struct net_device *pdev,
+ -							void *priv);
+ +	void			(*ndo_add_vxlan_port)(struct  net_device *dev,
+ +						      sa_family_t sa_family,
+ +						      __be16 port);
+ +	void			(*ndo_del_vxlan_port)(struct  net_device *dev,
+ +						      sa_family_t sa_family,
+ +						      __be16 port);
+ +
+++<<<<<<< HEAD
+ +	/* RHEL SPECIFIC
+ +	 *
+ +	 * The following padding has been inserted before ABI freeze to
+ +	 * allow extending the structure while preserve ABI. Feel free
+ +	 * to replace reserved slots with required structure field
+ +	 * additions of your backport.
+ +	 */
+ +	RH_KABI_USE_P(1, int	(*ndo_get_iflink)(const struct net_device *dev))
+ +	RH_KABI_USE_P(2, netdev_features_t
+ +				(*ndo_features_check)(struct sk_buff *skb,
+ +						      struct net_device *dev,
+ +						      netdev_features_t features))
+ +	RH_KABI_USE_P(3, int	(*ndo_set_vf_rate)(struct net_device *dev,
+ +						   int vf, int min_tx_rate,
+ +						   int max_tx_rate))
+ +	RH_KABI_USE_P(4, int	(*ndo_get_vf_stats)(struct net_device *dev,
+ +						    int vf,
+ +						    struct ifla_vf_stats
+ +						    *vf_stats))
+ +	RH_KABI_USE_P(5, int    (*ndo_set_vf_rss_query_en)(struct net_device *dev,
+ +							   int vf, bool setting))
+  
+ +	RH_KABI_USE_P(6, int	(*ndo_fdb_add)(struct ndmsg *ndm,
+ +					       struct nlattr *tb[],
+ +					       struct net_device *dev,
+ +					       const unsigned char *addr,
+ +					       u16 vid,
+ +					       u16 flags))
+ +	RH_KABI_USE_P(7,int	(*ndo_setup_tc_rh74)(struct net_device *dev,
+ +						     u32 handle,
+ +						     __be16 protocol,
+ +						     struct tc_to_netdev_rh74 *tc))
+ +	RH_KABI_USE_P(8, int	(*ndo_fill_metadata_dst)(struct net_device *dev,
+ +						       struct sk_buff *skb))
+ +	RH_KABI_USE_P(9, void	(*ndo_add_geneve_port)(struct  net_device *dev,
+ +						       sa_family_t sa_family,
+ +						       __be16 port))
+ +	RH_KABI_USE_P(10, void	(*ndo_del_geneve_port)(struct  net_device *dev,
+ +						       sa_family_t sa_family,
+ +						       __be16 port))
+ +	RH_KABI_RESERVE_P(11)
+ +	RH_KABI_RESERVE_P(12)
+ +	RH_KABI_RESERVE_P(13)
+ +	RH_KABI_RESERVE_P(14)
+ +	RH_KABI_RESERVE_P(15)
+ +	RH_KABI_USE_P(16, size_t ndo_size)
+ +	/* RHEL: put all new non-performance critical ndo's into
+ +	 * net_device_ops_extended. The reserved slots above can be used
+ +	 * only for performance critical operations.
+ +	 * Drivers may access the extended fields directly from
+ +	 * net_device_ops, if they allocated the net_device_ops structure
+ +	 * themselves (usually statically). The kernel core and drivers
+ +	 * using others' net_device_ops must access the extended fields
+ +	 * using the get_ndo_ext macro.
+ +	 */
+ +	RH_KABI_EXTEND(struct net_device_ops_extended extended)
+++=======
++ 	int			(*ndo_get_lock_subclass)(struct net_device *dev);
++ 	int			(*ndo_set_tx_maxrate)(struct net_device *dev,
++ 						      int queue_index,
++ 						      u32 maxrate);
++ 	int			(*ndo_get_iflink)(const struct net_device *dev);
++ 	int			(*ndo_change_proto_down)(struct net_device *dev,
++ 							 bool proto_down);
++ 	int			(*ndo_fill_metadata_dst)(struct net_device *dev,
++ 						       struct sk_buff *skb);
++ 	void			(*ndo_set_rx_headroom)(struct net_device *dev,
++ 						       int needed_headroom);
++ 	int			(*ndo_bpf)(struct net_device *dev,
++ 					   struct netdev_bpf *bpf);
++ 	int			(*ndo_xdp_xmit)(struct net_device *dev,
++ 						struct xdp_buff *xdp);
++ 	void			(*ndo_xdp_flush)(struct net_device *dev);
+++>>>>>>> f4e63525ee35 (net: bpf: rename ndo_xdp to ndo_bpf)
+  };
+  
+ +#define get_ndo_ext(ops, field)		({				\
+ +	const struct net_device_ops *__ops = (ops);			\
+ +	size_t __off = offsetof(struct net_device_ops, extended.field);	\
+ +	__ops->ndo_size > __off ? __ops->extended.field : NULL;		\
+ +	})
+ +
+  /**
+   * enum net_device_priv_flags - &struct net_device priv_flags
+   *
+@@@ -3396,11 -3311,36 +3441,20 @@@ int dev_change_xdp_fd(struct net_devic
+  struct sk_buff *validate_xmit_skb_list(struct sk_buff *skb, struct net_device *dev);
+  struct sk_buff *dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev,
+  				    struct netdev_queue *txq, int *ret);
+++<<<<<<< HEAD
+++=======
++ 
++ typedef int (*bpf_op_t)(struct net_device *dev, struct netdev_bpf *bpf);
++ int dev_change_xdp_fd(struct net_device *dev, struct netlink_ext_ack *extack,
++ 		      int fd, u32 flags);
++ u8 __dev_xdp_attached(struct net_device *dev, bpf_op_t xdp_op, u32 *prog_id);
++ 
+++>>>>>>> f4e63525ee35 (net: bpf: rename ndo_xdp to ndo_bpf)
+  int __dev_forward_skb(struct net_device *dev, struct sk_buff *skb);
+  int dev_forward_skb(struct net_device *dev, struct sk_buff *skb);
+ -bool is_skb_forwardable(const struct net_device *dev,
+ -			const struct sk_buff *skb);
+ -
+ -static __always_inline int ____dev_forward_skb(struct net_device *dev,
+ -					       struct sk_buff *skb)
+ -{
+ -	if (skb_orphan_frags(skb, GFP_ATOMIC) ||
+ -	    unlikely(!is_skb_forwardable(dev, skb))) {
+ -		atomic_long_inc(&dev->rx_dropped);
+ -		kfree_skb(skb);
+ -		return NET_RX_DROP;
+ -	}
+ -
+ -	skb_scrub_packet(skb, true);
+ -	skb->priority = 0;
+ -	return 0;
+ -}
+ -
+ -void dev_queue_xmit_nit(struct sk_buff *skb, struct net_device *dev);
+ +bool is_skb_forwardable(struct net_device *dev, struct sk_buff *skb);
+  
+  extern int		netdev_budget;
+ -extern unsigned int	netdev_budget_usecs;
+  
+  /* Called by rtnetlink.c:rtnl_unlock() */
+  void netdev_run_todo(void);
+diff --cc net/core/dev.c
+index 057b965c99c7,10cde58d3275..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -4266,6 -4545,39 +4266,42 @@@ static int __netif_receive_skb(struct s
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int generic_xdp_install(struct net_device *dev, struct netdev_bpf *xdp)
++ {
++ 	struct bpf_prog *old = rtnl_dereference(dev->xdp_prog);
++ 	struct bpf_prog *new = xdp->prog;
++ 	int ret = 0;
++ 
++ 	switch (xdp->command) {
++ 	case XDP_SETUP_PROG:
++ 		rcu_assign_pointer(dev->xdp_prog, new);
++ 		if (old)
++ 			bpf_prog_put(old);
++ 
++ 		if (old && !new) {
++ 			static_key_slow_dec(&generic_xdp_needed);
++ 		} else if (new && !old) {
++ 			static_key_slow_inc(&generic_xdp_needed);
++ 			dev_disable_lro(dev);
++ 		}
++ 		break;
++ 
++ 	case XDP_QUERY_PROG:
++ 		xdp->prog_attached = !!old;
++ 		xdp->prog_id = old ? old->aux->id : 0;
++ 		break;
++ 
++ 	default:
++ 		ret = -EINVAL;
++ 		break;
++ 	}
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> f4e63525ee35 (net: bpf: rename ndo_xdp to ndo_bpf)
+  static int netif_receive_skb_internal(struct sk_buff *skb)
+  {
+  	int ret;
+@@@ -7054,6 -7090,39 +7090,42 @@@ int dev_change_proto_down(struct net_de
+  }
+  EXPORT_SYMBOL(dev_change_proto_down);
+  
+++<<<<<<< HEAD
+++=======
++ u8 __dev_xdp_attached(struct net_device *dev, bpf_op_t bpf_op, u32 *prog_id)
++ {
++ 	struct netdev_bpf xdp;
++ 
++ 	memset(&xdp, 0, sizeof(xdp));
++ 	xdp.command = XDP_QUERY_PROG;
++ 
++ 	/* Query must always succeed. */
++ 	WARN_ON(bpf_op(dev, &xdp) < 0);
++ 	if (prog_id)
++ 		*prog_id = xdp.prog_id;
++ 
++ 	return xdp.prog_attached;
++ }
++ 
++ static int dev_xdp_install(struct net_device *dev, bpf_op_t bpf_op,
++ 			   struct netlink_ext_ack *extack, u32 flags,
++ 			   struct bpf_prog *prog)
++ {
++ 	struct netdev_bpf xdp;
++ 
++ 	memset(&xdp, 0, sizeof(xdp));
++ 	if (flags & XDP_FLAGS_HW_MODE)
++ 		xdp.command = XDP_SETUP_PROG_HW;
++ 	else
++ 		xdp.command = XDP_SETUP_PROG;
++ 	xdp.extack = extack;
++ 	xdp.flags = flags;
++ 	xdp.prog = prog;
++ 
++ 	return bpf_op(dev, &xdp);
++ }
++ 
+++>>>>>>> f4e63525ee35 (net: bpf: rename ndo_xdp to ndo_bpf)
+  /**
+   *	dev_change_xdp_fd - set or clear a bpf program for a device rx path
+   *	@dev: device
+@@@ -7061,14 -7131,43 +7133,49 @@@
+   *
+   *	Set or clear a bpf program for a device
+   */
+ -int dev_change_xdp_fd(struct net_device *dev, struct netlink_ext_ack *extack,
+ -		      int fd, u32 flags)
+ +int dev_change_xdp_fd(struct net_device *dev, int fd)
+  {
+++<<<<<<< HEAD
+ +	/* NOTE: RHEL7 does not support XDP.  These symbols are just
+ +	 * here to allow the backporting of drivers easier
+ +	 */
+ +	return -EOPNOTSUPP;
+++=======
++ 	const struct net_device_ops *ops = dev->netdev_ops;
++ 	struct bpf_prog *prog = NULL;
++ 	bpf_op_t bpf_op, bpf_chk;
++ 	int err;
++ 
++ 	ASSERT_RTNL();
++ 
++ 	bpf_op = bpf_chk = ops->ndo_bpf;
++ 	if (!bpf_op && (flags & (XDP_FLAGS_DRV_MODE | XDP_FLAGS_HW_MODE)))
++ 		return -EOPNOTSUPP;
++ 	if (!bpf_op || (flags & XDP_FLAGS_SKB_MODE))
++ 		bpf_op = generic_xdp_install;
++ 	if (bpf_op == bpf_chk)
++ 		bpf_chk = generic_xdp_install;
++ 
++ 	if (fd >= 0) {
++ 		if (bpf_chk && __dev_xdp_attached(dev, bpf_chk, NULL))
++ 			return -EEXIST;
++ 		if ((flags & XDP_FLAGS_UPDATE_IF_NOEXIST) &&
++ 		    __dev_xdp_attached(dev, bpf_op, NULL))
++ 			return -EBUSY;
++ 
++ 		prog = bpf_prog_get_type(fd, BPF_PROG_TYPE_XDP);
++ 		if (IS_ERR(prog))
++ 			return PTR_ERR(prog);
++ 	}
++ 
++ 	err = dev_xdp_install(dev, bpf_op, extack, flags, prog);
++ 	if (err < 0 && prog)
++ 		bpf_prog_put(prog);
++ 
++ 	return err;
+++>>>>>>> f4e63525ee35 (net: bpf: rename ndo_xdp to ndo_bpf)
+  }
+ +EXPORT_SYMBOL(dev_change_xdp_fd);
+  
+  /**
+   *	dev_new_index	-	allocate an ifindex
+diff --cc net/core/rtnetlink.c
+index 33c38a0673ce,dc5ad84ac096..000000000000
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@@ -1333,6 -1257,54 +1333,57 @@@ static int rtnl_fill_link_ifmap(struct 
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static u8 rtnl_xdp_attached_mode(struct net_device *dev, u32 *prog_id)
++ {
++ 	const struct net_device_ops *ops = dev->netdev_ops;
++ 	const struct bpf_prog *generic_xdp_prog;
++ 
++ 	ASSERT_RTNL();
++ 
++ 	*prog_id = 0;
++ 	generic_xdp_prog = rtnl_dereference(dev->xdp_prog);
++ 	if (generic_xdp_prog) {
++ 		*prog_id = generic_xdp_prog->aux->id;
++ 		return XDP_ATTACHED_SKB;
++ 	}
++ 	if (!ops->ndo_bpf)
++ 		return XDP_ATTACHED_NONE;
++ 
++ 	return __dev_xdp_attached(dev, ops->ndo_bpf, prog_id);
++ }
++ 
++ static int rtnl_xdp_fill(struct sk_buff *skb, struct net_device *dev)
++ {
++ 	struct nlattr *xdp;
++ 	u32 prog_id;
++ 	int err;
++ 
++ 	xdp = nla_nest_start(skb, IFLA_XDP);
++ 	if (!xdp)
++ 		return -EMSGSIZE;
++ 
++ 	err = nla_put_u8(skb, IFLA_XDP_ATTACHED,
++ 			 rtnl_xdp_attached_mode(dev, &prog_id));
++ 	if (err)
++ 		goto err_cancel;
++ 
++ 	if (prog_id) {
++ 		err = nla_put_u32(skb, IFLA_XDP_PROG_ID, prog_id);
++ 		if (err)
++ 			goto err_cancel;
++ 	}
++ 
++ 	nla_nest_end(skb, xdp);
++ 	return 0;
++ 
++ err_cancel:
++ 	nla_nest_cancel(skb, xdp);
++ 	return err;
++ }
++ 
+++>>>>>>> f4e63525ee35 (net: bpf: rename ndo_xdp to ndo_bpf)
+  static u32 rtnl_get_event(unsigned long event)
+  {
+  	u32 rtnl_event_type = IFLA_EVENT_NONE;
+* Unmerged path drivers/net/ethernet/cavium/thunder/nicvf_main.c
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.c
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
+index 7dcf0666233f..1b02e41b6682 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
+@@ -208,7 +208,7 @@ static int bnxt_xdp_set(struct bnxt *bp, struct bpf_prog *prog)
+ 	return 0;
+ }
+ 
+-int bnxt_xdp(struct net_device *dev, struct netdev_xdp *xdp)
++int bnxt_xdp(struct net_device *dev, struct netdev_bpf *xdp)
+ {
+ 	struct bnxt *bp = netdev_priv(dev);
+ 	int rc;
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.h b/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.h
+index 12a5ad66b564..414b748038ca 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.h
+@@ -16,6 +16,6 @@ void bnxt_tx_int_xdp(struct bnxt *bp, struct bnxt_napi *bnapi, int nr_pkts);
+ bool bnxt_rx_xdp(struct bnxt *bp, struct bnxt_rx_ring_info *rxr, u16 cons,
+ 		 struct page *page, u8 **data_ptr, unsigned int *len,
+ 		 u8 *event);
+-int bnxt_xdp(struct net_device *dev, struct netdev_xdp *xdp);
++int bnxt_xdp(struct net_device *dev, struct netdev_bpf *xdp);
+ 
+ #endif
+* Unmerged path drivers/net/ethernet/cavium/thunder/nicvf_main.c
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_main.c
+* Unmerged path drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+* Unmerged path drivers/net/ethernet/qlogic/qede/qede.h
+* Unmerged path drivers/net/ethernet/qlogic/qede/qede_filter.c
+* Unmerged path drivers/net/ethernet/qlogic/qede/qede_main.c
+* Unmerged path drivers/net/tun.c
+* Unmerged path drivers/net/virtio_net.c
+* Unmerged path include/linux/netdevice.h
+* Unmerged path net/core/dev.c
+* Unmerged path net/core/rtnetlink.c
