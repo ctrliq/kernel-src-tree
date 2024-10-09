@@ -155,7 +155,7 @@ int ovl_create_real(struct inode *dir, struct dentry *newdentry,
 		 * Not quite sure if non-instantiated dentry is legal or not.
 		 * VFS doesn't seem to care so check and warn here.
 		 */
-		err = -ENOENT;
+		err = -EIO;
 	}
 	return err;
 }
