@@ -1,0 +1,124 @@
+net/mlx5e: RX, Remove HW LRO support in legacy RQ
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: RX, Remove HW LRO support in legacy RQ (Alaa Hleihel) [1642498]
+Rebuild_FUZZ: 95.74%
+commit-author Tariq Toukan <tariqt@mellanox.com>
+commit 6c3a823e1e9c645f30c5b03fefe87fea8881060b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/6c3a823e.failed
+
+Current LRO implementation in Legacy RQ uses high-order pages.
+In downstream patches of this series we complete the transition
+to using only order-0 pages in RX datapath (which was already done
+in Striding RQ).
+
+Unlike the more advanced Striding RQ, Legacy RQ does not make reuse
+of any non-consumed buffers of non-full LRO sessions, and combining
+it with order-0 pages has many performance drawbacks.
+
+Hence, here we totally remove LRO support in Legacy RQ.
+This guarantees having no out-of-order completions, which allows using
+a cyclic work queue (instead of a linked-list) in a downstream patch.
+
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 6c3a823e1e9c645f30c5b03fefe87fea8881060b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index a11f70af9727,3f1f0552843c..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -118,21 -179,9 +118,27 @@@ void mlx5e_init_rq_type_params(struct m
+  			       struct mlx5e_params *params)
+  {
+  	params->lro_wqe_sz = MLX5E_PARAMS_DEFAULT_LRO_WQE_SZ;
+++<<<<<<< HEAD
+ +	switch (params->rq_wq_type) {
+ +	case MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ:
+ +		params->log_rq_size = is_kdump_kernel() ?
+ +			MLX5E_PARAMS_MINIMUM_LOG_RQ_SIZE_MPW :
+ +			MLX5E_PARAMS_DEFAULT_LOG_RQ_SIZE_MPW;
+ +		break;
+ +	default: /* MLX5_WQ_TYPE_LINKED_LIST */
+ +		params->log_rq_size = is_kdump_kernel() ?
+ +			MLX5E_PARAMS_MINIMUM_LOG_RQ_SIZE :
+ +			MLX5E_PARAMS_DEFAULT_LOG_RQ_SIZE;
+ +
+ +		/* Extra room needed for build_skb */
+ +		params->lro_wqe_sz -= mlx5e_get_rq_headroom(params) +
+ +			SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+ +	}
+++=======
++ 	params->log_rq_mtu_frames = is_kdump_kernel() ?
++ 		MLX5E_PARAMS_MINIMUM_LOG_RQ_SIZE :
++ 		MLX5E_PARAMS_DEFAULT_LOG_RQ_SIZE;
+++>>>>>>> 6c3a823e1e9c (net/mlx5e: RX, Remove HW LRO support in legacy RQ)
+  
+  	mlx5_core_info(mdev, "MLX5E: StrdRq(%d) RqSz(%ld) StrdSz(%ld) RxCqeCmprss(%d)\n",
+  		       params->rq_wq_type == MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ,
+@@@ -3148,14 -3300,26 +3152,25 @@@ static int set_feature_lro(struct net_d
+  
+  	mutex_lock(&priv->state_lock);
+  
+++<<<<<<< HEAD
+ +	reset = (priv->channels.params.rq_wq_type == MLX5_WQ_TYPE_LINKED_LIST);
+ +	reset = reset && test_bit(MLX5E_STATE_OPENED, &priv->state);
+++=======
++ 	old_params = &priv->channels.params;
++ 	if (enable && !MLX5E_GET_PFLAG(old_params, MLX5E_PFLAG_RX_STRIDING_RQ)) {
++ 		netdev_warn(netdev, "can't set LRO with legacy RQ\n");
++ 		err = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	reset = test_bit(MLX5E_STATE_OPENED, &priv->state);
+++>>>>>>> 6c3a823e1e9c (net/mlx5e: RX, Remove HW LRO support in legacy RQ)
+  
+ -	new_channels.params = *old_params;
+ +	new_channels.params = priv->channels.params;
+  	new_channels.params.lro_en = enable;
+  
+ -	if (old_params->rq_wq_type != MLX5_WQ_TYPE_LINKED_LIST) {
+ -		if (mlx5e_rx_mpwqe_is_linear_skb(mdev, old_params) ==
+ -		    mlx5e_rx_mpwqe_is_linear_skb(mdev, &new_channels.params))
+ -			reset = false;
+ -	}
+ -
+  	if (!reset) {
+ -		*old_params = new_channels.params;
+ +		priv->channels.params = new_channels.params;
+  		err = mlx5e_modify_tirs_lro(priv);
+  		goto out;
+  	}
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c b/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+index 79aa7ade1ade..8e07248c3c11 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+@@ -1599,6 +1599,9 @@ static int set_pflag_rx_striding_rq(struct net_device *netdev, bool enable)
+ 			return -EOPNOTSUPP;
+ 		if (!mlx5e_striding_rq_possible(mdev, &priv->channels.params))
+ 			return -EINVAL;
++	} else if (priv->channels.params.lro_en) {
++		netdev_warn(netdev, "Can't set legacy RQ with LRO, disable LRO first\n");
++		return -EINVAL;
+ 	}
+ 
+ 	new_channels.params = priv->channels.params;
+@@ -1673,6 +1676,10 @@ static int mlx5e_set_priv_flags(struct net_device *netdev, u32 pflags)
+ 
+ out:
+ 	mutex_unlock(&priv->state_lock);
++
++	/* Need to fix some features.. */
++	netdev_update_features(netdev);
++
+ 	return err;
+ }
+ 
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
