@@ -1,0 +1,142 @@
+mlxsw: spectrum_switchdev: Check status of memory allocation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Ido Schimmel <idosch@mellanox.com>
+commit 6f497930af73863b32e8c73947a52d1003af31e2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/6f497930.failed
+
+We can't rely on kzalloc() always succeeding, so check its return value.
+
+Suppresses the following smatch error:
+
+mlxsw_sp_switchdev_event() error: potential null dereference
+'switchdev_work->fdb_info.addr'.  (kzalloc returns
+ null)
+
+Fixes: af061378924f ("mlxsw: spectrum_switchdev: Add support for learning FDB through notification")
+	Signed-off-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6f497930af73863b32e8c73947a52d1003af31e2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
+index a7736231096b,656b2d3f1bee..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
+@@@ -1486,8 -1847,106 +1486,108 @@@ out
+  	mlxsw_sp_fdb_notify_work_schedule(mlxsw_sp);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct mlxsw_sp_switchdev_event_work {
++ 	struct work_struct work;
++ 	struct switchdev_notifier_fdb_info fdb_info;
++ 	struct net_device *dev;
++ 	unsigned long event;
++ };
++ 
++ static void mlxsw_sp_switchdev_event_work(struct work_struct *work)
++ {
++ 	struct mlxsw_sp_switchdev_event_work *switchdev_work =
++ 		container_of(work, struct mlxsw_sp_switchdev_event_work, work);
++ 	struct net_device *dev = switchdev_work->dev;
++ 	struct switchdev_notifier_fdb_info *fdb_info;
++ 	struct mlxsw_sp_port *mlxsw_sp_port;
++ 	int err;
++ 
++ 	rtnl_lock();
++ 	mlxsw_sp_port = mlxsw_sp_port_dev_lower_find(dev);
++ 	if (!mlxsw_sp_port)
++ 		goto out;
++ 
++ 	switch (switchdev_work->event) {
++ 	case SWITCHDEV_FDB_ADD_TO_DEVICE:
++ 		fdb_info = &switchdev_work->fdb_info;
++ 		err = mlxsw_sp_port_fdb_set(mlxsw_sp_port, fdb_info, true);
++ 		if (err)
++ 			break;
++ 		mlxsw_sp_fdb_call_notifiers(SWITCHDEV_FDB_OFFLOADED,
++ 					    fdb_info->addr,
++ 					    fdb_info->vid, dev);
++ 		break;
++ 	case SWITCHDEV_FDB_DEL_TO_DEVICE:
++ 		fdb_info = &switchdev_work->fdb_info;
++ 		mlxsw_sp_port_fdb_set(mlxsw_sp_port, fdb_info, false);
++ 		break;
++ 	}
++ 
++ out:
++ 	rtnl_unlock();
++ 	kfree(switchdev_work->fdb_info.addr);
++ 	kfree(switchdev_work);
++ 	dev_put(dev);
++ }
++ 
++ /* Called under rcu_read_lock() */
++ static int mlxsw_sp_switchdev_event(struct notifier_block *unused,
++ 				    unsigned long event, void *ptr)
++ {
++ 	struct net_device *dev = switchdev_notifier_info_to_dev(ptr);
++ 	struct mlxsw_sp_switchdev_event_work *switchdev_work;
++ 	struct switchdev_notifier_fdb_info *fdb_info = ptr;
++ 
++ 	if (!mlxsw_sp_port_dev_lower_find_rcu(dev))
++ 		return NOTIFY_DONE;
++ 
++ 	switchdev_work = kzalloc(sizeof(*switchdev_work), GFP_ATOMIC);
++ 	if (!switchdev_work)
++ 		return NOTIFY_BAD;
++ 
++ 	INIT_WORK(&switchdev_work->work, mlxsw_sp_switchdev_event_work);
++ 	switchdev_work->dev = dev;
++ 	switchdev_work->event = event;
++ 
++ 	switch (event) {
++ 	case SWITCHDEV_FDB_ADD_TO_DEVICE: /* fall through */
++ 	case SWITCHDEV_FDB_DEL_TO_DEVICE:
++ 		memcpy(&switchdev_work->fdb_info, ptr,
++ 		       sizeof(switchdev_work->fdb_info));
++ 		switchdev_work->fdb_info.addr = kzalloc(ETH_ALEN, GFP_ATOMIC);
++ 		if (!switchdev_work->fdb_info.addr)
++ 			goto err_addr_alloc;
++ 		ether_addr_copy((u8 *)switchdev_work->fdb_info.addr,
++ 				fdb_info->addr);
++ 		/* Take a reference on the device. This can be either
++ 		 * upper device containig mlxsw_sp_port or just a
++ 		 * mlxsw_sp_port
++ 		 */
++ 		dev_hold(dev);
++ 		break;
++ 	default:
++ 		kfree(switchdev_work);
++ 		return NOTIFY_DONE;
++ 	}
++ 
++ 	mlxsw_core_schedule_work(&switchdev_work->work);
++ 
++ 	return NOTIFY_DONE;
++ 
++ err_addr_alloc:
++ 	kfree(switchdev_work);
++ 	return NOTIFY_BAD;
++ }
++ 
++ static struct notifier_block mlxsw_sp_switchdev_notifier = {
++ 	.notifier_call = mlxsw_sp_switchdev_event,
++ };
++ 
+++>>>>>>> 6f497930af73 (mlxsw: spectrum_switchdev: Check status of memory allocation)
+  static int mlxsw_sp_fdb_init(struct mlxsw_sp *mlxsw_sp)
+  {
+ -	struct mlxsw_sp_bridge *bridge = mlxsw_sp->bridge;
+  	int err;
+  
+  	err = mlxsw_sp_ageing_set(mlxsw_sp, MLXSW_SP_DEFAULT_AGEING_TIME);
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
