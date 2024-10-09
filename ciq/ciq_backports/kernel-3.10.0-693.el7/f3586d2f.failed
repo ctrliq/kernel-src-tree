@@ -1,0 +1,218 @@
+HID: wacom: remove hardcoded WACOM_QUIRK_MULTI_INPUT
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [hid] wacom: remove hardcoded WACOM_QUIRK_MULTI_INPUT (Aristeu Rozanski) [1346348 1388646 1385026]
+Rebuild_FUZZ: 94.95%
+commit-author Ping Cheng <pinglinux@gmail.com>
+commit f3586d2f819af6dbe5b08d2a6f1d22b1a97e2b64
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/f3586d2f.failed
+
+The quirk was added for devices that support both pen and touch.  It decides if
+a device supports multiple inputs by hardcoded feature type. However, for some
+devices, we do not know if they support both before accessing their HID
+descriptors.
+
+This patch relies on dynamically assigned device_type to make the decision.
+Also, we make it certain that wacom_wac->shared is always created. That is, the
+driver will not be loaded if it fails to create wacom_wac->shared.
+
+	Signed-off-by: Ping Cheng <pingc@wacom.com>
+	Reviewed-by: Jason Gerecke <jason.gerecke@wacom.com>
+	Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+(cherry picked from commit f3586d2f819af6dbe5b08d2a6f1d22b1a97e2b64)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hid/wacom_sys.c
+#	drivers/hid/wacom_wac.c
+#	drivers/hid/wacom_wac.h
+diff --cc drivers/hid/wacom_sys.c
+index 527bf559d1db,1b00d8d4466c..000000000000
+--- a/drivers/hid/wacom_sys.c
++++ b/drivers/hid/wacom_sys.c
+@@@ -1374,41 -1518,50 +1374,55 @@@ static int wacom_probe(struct usb_inter
+  	wacom_calculate_res(features);
+  
+  	strlcpy(wacom_wac->name, features->name, sizeof(wacom_wac->name));
+ -	snprintf(wacom_wac->pad_name, sizeof(wacom_wac->pad_name),
+ -		"%s Pad", features->name);
+  
+++<<<<<<< HEAD
+ +	if (features->quirks & WACOM_QUIRK_MULTI_INPUT) {
+ +		struct usb_device *other_dev;
+ +
+ +		/* Append the device type to the name */
+ +		if (features->device_type != BTN_TOOL_FINGER)
+ +			strlcat(wacom_wac->name, " Pen", WACOM_NAME_MAX);
+ +		else if (features->touch_max)
+ +			strlcat(wacom_wac->name, " Finger", WACOM_NAME_MAX);
+ +		else
+ +			strlcat(wacom_wac->name, " Pad", WACOM_NAME_MAX);
+ +
+ +		other_dev = wacom_get_sibling(dev, features->oVid, features->oPid);
+ +		if (other_dev == NULL || wacom_get_usbdev_data(other_dev) == NULL)
+ +			other_dev = dev;
+ +		error = wacom_add_shared_data(wacom_wac, other_dev);
+ +		if (error)
+ +			goto fail3;
+ +	}
+++=======
++ 	/* Append the device type to the name */
++ 	if (features->device_type != BTN_TOOL_FINGER)
++ 		strlcat(wacom_wac->name, " Pen", WACOM_NAME_MAX);
++ 	else if (features->touch_max)
++ 		strlcat(wacom_wac->name, " Finger", WACOM_NAME_MAX);
++ 	else
++ 		strlcat(wacom_wac->name, " Pad", WACOM_NAME_MAX);
++ 
++ 	error = wacom_add_shared_data(hdev);
++ 	if (error)
++ 		goto fail_shared_data;
+++>>>>>>> f3586d2f819a (HID: wacom: remove hardcoded WACOM_QUIRK_MULTI_INPUT)
+  
+ -	if (!(features->quirks & WACOM_QUIRK_MONITOR) &&
+ -	     (features->quirks & WACOM_QUIRK_BATTERY)) {
+ -		error = wacom_initialize_battery(wacom);
+ -		if (error)
+ -			goto fail_battery;
+ -	}
+ +	usb_fill_int_urb(wacom->irq, dev,
+ +			 usb_rcvintpipe(dev, endpoint->bEndpointAddress),
+ +			 wacom_wac->data, features->pktlen,
+ +			 wacom_sys_irq, wacom, endpoint->bInterval);
+ +	wacom->irq->transfer_dma = wacom->data_dma;
+ +	wacom->irq->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+  
+ -	if (!(features->quirks & WACOM_QUIRK_NO_INPUT)) {
+ -		error = wacom_register_inputs(wacom);
+ -		if (error)
+ -			goto fail_register_inputs;
+ -	}
+ +	error = wacom_initialize_leds(wacom);
+ +	if (error)
+ +		goto fail4;
+  
+ -	if (hdev->bus == BUS_BLUETOOTH) {
+ -		error = device_create_file(&hdev->dev, &dev_attr_speed);
+ +	if (!(features->quirks & WACOM_QUIRK_NO_INPUT)) {
+ +		error = wacom_register_input(wacom);
+  		if (error)
+ -			hid_warn(hdev,
+ -				 "can't create sysfs speed attribute err: %d\n",
+ -				 error);
+ -	}
+ -
+ -	if (features->type == HID_GENERIC)
+ -		connect_mask |= HID_CONNECT_DRIVER;
+ -
+ -	/* Regular HID work starts now */
+ -	error = hid_hw_start(hdev, connect_mask);
+ -	if (error) {
+ -		hid_err(hdev, "hw start failed\n");
+ -		goto fail_hw_start;
+ +			goto fail5;
+  	}
+  
+  	/* Note that if query fails it is not a hard failure */
+diff --cc drivers/hid/wacom_wac.c
+index 27dda3639500,221443710aed..000000000000
+--- a/drivers/hid/wacom_wac.c
++++ b/drivers/hid/wacom_wac.c
+@@@ -446,8 -581,12 +446,17 @@@ static int wacom_intuos_inout(struct wa
+  	   (features->type == CINTIQ && !(data[1] & 0x40)))
+  		return 1;
+  
+++<<<<<<< HEAD
+ +	/* Range Report */
+ +	if ((data[1] & 0xfe) == 0x20) {
+++=======
++ 	wacom->shared->stylus_in_proximity = true;
++ 	if (wacom->shared->touch_down)
++ 		return 1;
++ 
++ 	/* in Range while exiting */
++ 	if (((data[1] & 0xfe) == 0x20) && wacom->reporting_data) {
+++>>>>>>> f3586d2f819a (HID: wacom: remove hardcoded WACOM_QUIRK_MULTI_INPUT)
+  		input_report_key(input, BTN_TOUCH, 0);
+  		input_report_abs(input, ABS_PRESSURE, 0);
+  		input_report_abs(input, ABS_DISTANCE, wacom->features.distance_max);
+@@@ -455,8 -595,8 +464,13 @@@
+  
+  	/* Exit report */
+  	if ((data[1] & 0xfe) == 0x80) {
+++<<<<<<< HEAD
+ +		if (features->quirks == WACOM_QUIRK_MULTI_INPUT)
+ +			wacom->shared->stylus_in_proximity = false;
+++=======
++ 		wacom->shared->stylus_in_proximity = false;
++ 		wacom->reporting_data = false;
+++>>>>>>> f3586d2f819a (HID: wacom: remove hardcoded WACOM_QUIRK_MULTI_INPUT)
+  
+  		/* don't report exit if we don't know the ID */
+  		if (!wacom->id[idx])
+@@@ -1482,12 -2193,6 +1496,15 @@@ void wacom_setup_device_quirks(struct w
+  		features->y_max = 1023;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* these device have multiple inputs */
+ +	if (features->type >= WIRELESS ||
+ +	    (features->type >= INTUOS5S && features->type <= INTUOSPL) ||
+ +	    (features->oVid && features->oPid))
+ +		features->quirks |= WACOM_QUIRK_MULTI_INPUT;
+ +
+++=======
+++>>>>>>> f3586d2f819a (HID: wacom: remove hardcoded WACOM_QUIRK_MULTI_INPUT)
+  	/* quirk for bamboo touch with 2 low res touches */
+  	if (features->type == BAMBOO_PT &&
+  	    features->pktlen == WACOM_PKGLEN_BBTOUCH) {
+diff --cc drivers/hid/wacom_wac.h
+index d220d069f329,4700ac994a3b..000000000000
+--- a/drivers/hid/wacom_wac.h
++++ b/drivers/hid/wacom_wac.h
+@@@ -53,16 -58,33 +53,31 @@@
+  #define WACOM_REPORT_TPC1FG		6
+  #define WACOM_REPORT_TPC2FG		13
+  #define WACOM_REPORT_TPCMT		13
+ -#define WACOM_REPORT_TPCMT2		3
+  #define WACOM_REPORT_TPCHID		15
+ -#define WACOM_REPORT_CINTIQ		16
+ -#define WACOM_REPORT_CINTIQPAD		17
+  #define WACOM_REPORT_TPCST		16
+ -#define WACOM_REPORT_DTUS		17
+  #define WACOM_REPORT_TPC1FGE		18
+  #define WACOM_REPORT_24HDT		1
+ -#define WACOM_REPORT_WL			128
+ -#define WACOM_REPORT_USB		192
+ -#define WACOM_REPORT_BPAD_PEN		3
+ -#define WACOM_REPORT_BPAD_TOUCH		16
+  
+  /* device quirks */
+++<<<<<<< HEAD
+ +#define WACOM_QUIRK_MULTI_INPUT		0x0001
+ +#define WACOM_QUIRK_BBTOUCH_LOWRES	0x0002
+ +#define WACOM_QUIRK_NO_INPUT		0x0004
+ +#define WACOM_QUIRK_MONITOR		0x0008
+++=======
++ #define WACOM_QUIRK_BBTOUCH_LOWRES	0x0001
++ #define WACOM_QUIRK_NO_INPUT		0x0002
++ #define WACOM_QUIRK_MONITOR		0x0004
++ #define WACOM_QUIRK_BATTERY		0x0008
++ 
++ #define WACOM_PEN_FIELD(f)	(((f)->logical == HID_DG_STYLUS) || \
++ 				 ((f)->physical == HID_DG_STYLUS) || \
++ 				 ((f)->physical == HID_DG_PEN) || \
++ 				 ((f)->application == HID_DG_PEN))
++ #define WACOM_FINGER_FIELD(f)	(((f)->logical == HID_DG_FINGER) || \
++ 				 ((f)->physical == HID_DG_FINGER) || \
++ 				 ((f)->application == HID_DG_TOUCHSCREEN))
+++>>>>>>> f3586d2f819a (HID: wacom: remove hardcoded WACOM_QUIRK_MULTI_INPUT)
+  
+  enum {
+  	PENPARTNER = 0,
+* Unmerged path drivers/hid/wacom_sys.c
+* Unmerged path drivers/hid/wacom_wac.c
+* Unmerged path drivers/hid/wacom_wac.h
