@@ -1,0 +1,146 @@
+RDMA/core: Properly return the error code of rdma_set_src_addr_rcu
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author YueHaibing <yuehaibing@huawei.com>
+commit 0965cc953a235196b8d6ef0cba45ecb5c355194f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/0965cc95.failed
+
+rdma_set_src_addr_rcu should check copy_src_l2_addr fails, rather than
+always return 0. Also copy_src_l2_addr should return 'ret' as its return
+value when rdma_translate_ip fails.
+
+Fixes: c31d4b2ddf07 ("RDMA/core: Protect against changing dst->dev during destination resolve")
+	Signed-off-by: YueHaibing <yuehaibing@huawei.com>
+	Reviewed-by: Parav Pandit <parav@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 0965cc953a235196b8d6ef0cba45ecb5c355194f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/addr.c
+diff --cc drivers/infiniband/core/addr.c
+index c2c2ceb1cadb,c2ca9e4b5160..000000000000
+--- a/drivers/infiniband/core/addr.c
++++ b/drivers/infiniband/core/addr.c
+@@@ -485,31 -452,98 +485,107 @@@ static int addr6_resolve(struct sockadd
+  static int addr_resolve_neigh(const struct dst_entry *dst,
+  			      const struct sockaddr *dst_in,
+  			      struct rdma_dev_addr *addr,
+ -			      unsigned int ndev_flags,
+  			      u32 seq)
+  {
+ -	int ret = 0;
+ -
+ -	if (ndev_flags & IFF_LOOPBACK) {
+ +	if (dst->dev->flags & IFF_LOOPBACK) {
+  		memcpy(addr->dst_dev_addr, addr->src_dev_addr, MAX_ADDR_LEN);
+ -	} else {
+ -		if (!(ndev_flags & IFF_NOARP)) {
+ -			/* If the device doesn't do ARP internally */
+ -			ret = fetch_ha(dst, addr, dst_in, seq);
+ -		}
+ +		return 0;
+  	}
+ -	return ret;
+ +
+ +	/* If the device doesn't do ARP internally */
+ +	if (!(dst->dev->flags & IFF_NOARP))
+ +		return fetch_ha(dst, addr, dst_in, seq);
+ +
+ +	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int rdma_set_src_addr(const struct dst_entry *dst,
+ +			     const struct sockaddr *dst_in,
+ +			     struct rdma_dev_addr *dev_addr)
+++=======
++ static int copy_src_l2_addr(struct rdma_dev_addr *dev_addr,
++ 			    const struct sockaddr *dst_in,
++ 			    const struct dst_entry *dst,
++ 			    const struct net_device *ndev)
+++>>>>>>> 0965cc953a23 (RDMA/core: Properly return the error code of rdma_set_src_addr_rcu)
+  {
+  	int ret = 0;
+  
+  	if (dst->dev->flags & IFF_LOOPBACK)
+  		ret = rdma_translate_ip(dst_in, dev_addr);
+  	else
+++<<<<<<< HEAD
+ +		rdma_copy_addr(dev_addr, dst->dev, NULL);
+ +	return ret;
+++=======
++ 		rdma_copy_src_l2_addr(dev_addr, dst->dev);
++ 
++ 	/*
++ 	 * If there's a gateway and type of device not ARPHRD_INFINIBAND,
++ 	 * we're definitely in RoCE v2 (as RoCE v1 isn't routable) set the
++ 	 * network type accordingly.
++ 	 */
++ 	if (has_gateway(dst, dst_in->sa_family) &&
++ 	    ndev->type != ARPHRD_INFINIBAND)
++ 		dev_addr->network = dst_in->sa_family == AF_INET ?
++ 						RDMA_NETWORK_IPV4 :
++ 						RDMA_NETWORK_IPV6;
++ 	else
++ 		dev_addr->network = RDMA_NETWORK_IB;
++ 
++ 	return ret;
++ }
++ 
++ static int rdma_set_src_addr_rcu(struct rdma_dev_addr *dev_addr,
++ 				 unsigned int *ndev_flags,
++ 				 const struct sockaddr *dst_in,
++ 				 const struct dst_entry *dst)
++ {
++ 	struct net_device *ndev = READ_ONCE(dst->dev);
++ 
++ 	*ndev_flags = ndev->flags;
++ 	/* A physical device must be the RDMA device to use */
++ 	if (ndev->flags & IFF_LOOPBACK) {
++ 		/*
++ 		 * RDMA (IB/RoCE, iWarp) doesn't run on lo interface or
++ 		 * loopback IP address. So if route is resolved to loopback
++ 		 * interface, translate that to a real ndev based on non
++ 		 * loopback IP address.
++ 		 */
++ 		ndev = rdma_find_ndev_for_src_ip_rcu(dev_net(ndev), dst_in);
++ 		if (!ndev)
++ 			return -ENODEV;
++ 	}
++ 
++ 	return copy_src_l2_addr(dev_addr, dst_in, dst, ndev);
++ }
++ 
++ static int set_addr_netns_by_gid_rcu(struct rdma_dev_addr *addr)
++ {
++ 	struct net_device *ndev;
++ 
++ 	ndev = rdma_read_gid_attr_ndev_rcu(addr->sgid_attr);
++ 	if (IS_ERR(ndev))
++ 		return PTR_ERR(ndev);
++ 
++ 	/*
++ 	 * Since we are holding the rcu, reading net and ifindex
++ 	 * are safe without any additional reference; because
++ 	 * change_net_namespace() in net/core/dev.c does rcu sync
++ 	 * after it changes the state to IFF_DOWN and before
++ 	 * updating netdev fields {net, ifindex}.
++ 	 */
++ 	addr->net = dev_net(ndev);
++ 	addr->bound_dev_if = ndev->ifindex;
++ 	return 0;
++ }
++ 
++ static void rdma_addr_set_net_defaults(struct rdma_dev_addr *addr)
++ {
++ 	addr->net = &init_net;
++ 	addr->bound_dev_if = 0;
+++>>>>>>> 0965cc953a23 (RDMA/core: Properly return the error code of rdma_set_src_addr_rcu)
+  }
+  
+  static int addr_resolve(struct sockaddr *src_in,
+* Unmerged path drivers/infiniband/core/addr.c
