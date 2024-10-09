@@ -1137,6 +1137,8 @@ static int replace_user_tlv(struct snd_kcontrol *kctl, unsigned int __user *buf,
 	ue->tlv_data = container;
 	ue->tlv_data_size = size;
 
+	snd_ctl_notify(ue->card, SNDRV_CTL_EVENT_MASK_TLV, &kctl->id);
+
 	return change;
 }
 
@@ -1422,7 +1424,6 @@ static int call_tlv_handler(struct snd_ctl_file *file, int op_flag,
 	};
 	struct snd_kcontrol_volatile *vd = &kctl->vd[snd_ctl_get_ioff(kctl, id)];
 	int i;
-	int err;
 
 	/* Check support of the request for this element. */
 	for (i = 0; i < ARRAY_SIZE(pairs); ++i) {
@@ -1439,14 +1440,7 @@ static int call_tlv_handler(struct snd_ctl_file *file, int op_flag,
 	if (vd->owner != NULL && vd->owner != file)
 		return -EPERM;
 
-	err = kctl->tlv.c(kctl, op_flag, size, buf);
-	if (err < 0)
-		return err;
-
-	if (err > 0)
-		snd_ctl_notify(file->card, SNDRV_CTL_EVENT_MASK_TLV, id);
-
-	return 0;
+	return kctl->tlv.c(kctl, op_flag, size, buf);
 }
 
 static int read_tlv_buf(struct snd_kcontrol *kctl, struct snd_ctl_elem_id *id,
