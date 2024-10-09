@@ -1966,8 +1966,7 @@ static int trace__pgfault(struct trace *trace,
 	if (trace->summary_only)
 		goto out;
 
-	thread__find_addr_location(thread, sample->cpumode, MAP__FUNCTION,
-			      sample->ip, &al);
+	thread__find_symbol(thread, sample->cpumode, sample->ip, &al);
 
 	trace__fprintf_entry_head(trace, thread, 0, true, sample->time, trace->output);
 
@@ -1979,12 +1978,10 @@ static int trace__pgfault(struct trace *trace,
 
 	fprintf(trace->output, "] => ");
 
-	thread__find_addr_location(thread, sample->cpumode, MAP__VARIABLE,
-				   sample->addr, &al);
+	__thread__find_symbol(thread, sample->cpumode, MAP__VARIABLE, sample->addr, &al);
 
 	if (!al.map) {
-		thread__find_addr_location(thread, sample->cpumode,
-					   MAP__FUNCTION, sample->addr, &al);
+		thread__find_symbol(thread, sample->cpumode, sample->addr, &al);
 
 		if (al.map)
 			map_type = 'x';
