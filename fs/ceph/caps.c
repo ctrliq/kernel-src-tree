@@ -339,6 +339,8 @@ void ceph_reservation_status(struct ceph_fs_client *fsc,
 {
 	struct ceph_mds_client *mdsc = fsc->mdsc;
 
+	spin_lock(&mdsc->caps_list_lock);
+
 	if (total)
 		*total = mdsc->caps_total_count;
 	if (avail)
@@ -349,6 +351,8 @@ void ceph_reservation_status(struct ceph_fs_client *fsc,
 		*reserved = mdsc->caps_reserve_count;
 	if (min)
 		*min = mdsc->caps_min_count;
+
+	spin_unlock(&mdsc->caps_list_lock);
 }
 
 /*
