@@ -1,0 +1,146 @@
+s390/perf: add perf_regs support and user stack dump
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.95.1.el7
+commit-author Heiko Carstens <heiko.carstens@de.ibm.com>
+commit c33eff600584ed493adfb42e3f130a6335f97750
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.95.1.el7/c33eff60.failed
+
+Add s390 support to dump user stack to user space for DWARF
+stack unwinding.
+
+	Signed-off-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+	Reviewed-by: Hendrik Brueckner <brueckner@linux.vnet.ibm.com>
+Reviewed-and-tested-by: Thomas Richter <tmricht@linux.vnet.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit c33eff600584ed493adfb42e3f130a6335f97750)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kernel/Makefile
+diff --cc arch/s390/kernel/Makefile
+index 25efd9148cd1,909bce65cb2b..000000000000
+--- a/arch/s390/kernel/Makefile
++++ b/arch/s390/kernel/Makefile
+@@@ -62,12 -78,8 +62,17 @@@ obj-$(CONFIG_FUNCTION_TRACER)	+= ftrace
+  obj-$(CONFIG_CRASH_DUMP)	+= crash_dump.o
+  obj-$(CONFIG_UPROBES)		+= uprobes.o
+  
+++<<<<<<< HEAD
+ +ifdef CONFIG_64BIT
+ +obj-$(CONFIG_PERF_EVENTS)	+= perf_event.o perf_cpum_cf.o perf_cpum_sf.o \
+ +						perf_cpum_cf_events.o
+ +obj-y				+= runtime_instr.o cache.o
+ +endif
+ +obj-$(CONFIG_PROTECTED_VIRTUALIZATION_GUEST)	+= uv.o
+++=======
++ obj-$(CONFIG_PERF_EVENTS)	+= perf_event.o perf_cpum_cf.o perf_cpum_sf.o
++ obj-$(CONFIG_PERF_EVENTS)	+= perf_cpum_cf_events.o perf_regs.o
+++>>>>>>> c33eff600584 (s390/perf: add perf_regs support and user stack dump)
+  
+  obj-$(CONFIG_TRACEPOINTS)	+= trace.o
+  
+diff --git a/arch/s390/Kconfig b/arch/s390/Kconfig
+index 62a8c033bd55..3c8ba36fc7cd 100644
+--- a/arch/s390/Kconfig
++++ b/arch/s390/Kconfig
+@@ -142,6 +142,8 @@ config S390
+ 	select HAVE_KRETPROBES
+ 	select HAVE_KVM if 64BIT
+ 	select HAVE_LIVEPATCH
++	select HAVE_PERF_REGS
++	select HAVE_PERF_USER_STACK_DUMP
+ 	select HAVE_MEMBLOCK
+ 	select HAVE_MEMBLOCK_NODE_MAP
+ 	select HAVE_MOD_ARCH_SPECIFIC
+diff --git a/arch/s390/include/uapi/asm/perf_regs.h b/arch/s390/include/uapi/asm/perf_regs.h
+new file mode 100644
+index 000000000000..f84ea6a181d3
+--- /dev/null
++++ b/arch/s390/include/uapi/asm/perf_regs.h
+@@ -0,0 +1,27 @@
++#ifndef _ASM_S390_PERF_REGS_H
++#define _ASM_S390_PERF_REGS_H
++
++enum perf_event_s390_regs {
++	PERF_REG_S390_R0,
++	PERF_REG_S390_R1,
++	PERF_REG_S390_R2,
++	PERF_REG_S390_R3,
++	PERF_REG_S390_R4,
++	PERF_REG_S390_R5,
++	PERF_REG_S390_R6,
++	PERF_REG_S390_R7,
++	PERF_REG_S390_R8,
++	PERF_REG_S390_R9,
++	PERF_REG_S390_R10,
++	PERF_REG_S390_R11,
++	PERF_REG_S390_R12,
++	PERF_REG_S390_R13,
++	PERF_REG_S390_R14,
++	PERF_REG_S390_R15,
++	PERF_REG_S390_MASK,
++	PERF_REG_S390_PC,
++
++	PERF_REG_S390_MAX
++};
++
++#endif /* _ASM_S390_PERF_REGS_H */
+* Unmerged path arch/s390/kernel/Makefile
+diff --git a/arch/s390/kernel/perf_regs.c b/arch/s390/kernel/perf_regs.c
+new file mode 100644
+index 000000000000..e883e6a2146a
+--- /dev/null
++++ b/arch/s390/kernel/perf_regs.c
+@@ -0,0 +1,49 @@
++#include <linux/perf_event.h>
++#include <linux/perf_regs.h>
++#include <linux/kernel.h>
++#include <linux/errno.h>
++#include <linux/bug.h>
++#include <asm/ptrace.h>
++
++u64 perf_reg_value(struct pt_regs *regs, int idx)
++{
++	if (WARN_ON_ONCE((u32)idx >= PERF_REG_S390_MAX))
++		return 0;
++
++	if (idx == PERF_REG_S390_MASK)
++		return regs->psw.mask;
++	if (idx == PERF_REG_S390_PC)
++		return regs->psw.addr;
++
++	return regs->gprs[idx];
++}
++
++#define REG_RESERVED (~((1UL << PERF_REG_S390_MAX) - 1))
++
++int perf_reg_validate(u64 mask)
++{
++	if (!mask || mask & REG_RESERVED)
++		return -EINVAL;
++
++	return 0;
++}
++
++u64 perf_reg_abi(struct task_struct *task)
++{
++	if (test_tsk_thread_flag(task, TIF_31BIT))
++		return PERF_SAMPLE_REGS_ABI_32;
++
++	return PERF_SAMPLE_REGS_ABI_64;
++}
++
++void perf_get_regs_user(struct perf_regs *regs_user,
++			struct pt_regs *regs,
++			struct pt_regs *regs_user_copy)
++{
++	/*
++	 * Use the regs from the first interruption and let
++	 * perf_sample_regs_intr() handle interrupts (regs == get_irq_regs()).
++	 */
++	regs_user->regs = task_pt_regs(current);
++	regs_user->abi = perf_reg_abi(current);
++}
