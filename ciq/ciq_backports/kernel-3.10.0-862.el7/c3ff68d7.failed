@@ -1,0 +1,207 @@
+dax: add tracepoints to dax_pfn_mkwrite()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Ross Zwisler <ross.zwisler@linux.intel.com>
+commit c3ff68d7d1e6a24b7ad76d00ee583929858d4001
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c3ff68d7.failed
+
+Add tracepoints to dax_pfn_mkwrite(), following the same logging
+conventions as the rest of DAX.
+
+Here is an example PTE fault followed by a pfn_mkwrite:
+
+  small_aligned-1094  [002] ....
+   374.084998: dax_pte_fault: dev 259:0 ino 0x1003 shared WRITE|ALLOW_RETRY|KILLABLE|USER address 0x10400000 pgoff 0x200
+
+  small_aligned-1094  [002] ....
+   374.085145: dax_pte_fault_done: dev 259:0 ino 0x1003 shared WRITE|ALLOW_RETRY|KILLABLE|USER address 0x10400000 pgoff 0x200 MAJOR|NOPAGE
+
+  small_aligned-1094  [002] ....
+   374.085165: dax_pfn_mkwrite: dev 259:0 ino 0x1003 shared WRITE|MKWRITE|ALLOW_RETRY|KILLABLE|USER address 0x10400000 pgoff 0x200 NOPAGE
+
+Link: http://lkml.kernel.org/r/20170221195116.13278-3-ross.zwisler@linux.intel.com
+	Signed-off-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Matthew Wilcox <mawilcox@microsoft.com>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit c3ff68d7d1e6a24b7ad76d00ee583929858d4001)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+#	include/trace/events/fs_dax.h
+diff --cc fs/dax.c
+index 1dfecdfb6245,d10524ab7e55..000000000000
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@@ -822,128 -916,41 +822,155 @@@ static int dax_insert_mapping(struct ad
+  		return PTR_ERR(ret);
+  	*entryp = ret;
+  
+ -	return vm_insert_mixed(vma, vaddr, pfn);
+ +	return vm_insert_mixed(vma, vaddr, dax.pfn);
+  }
+  
+ +/**
+ + * dax_fault - handle a page fault on a DAX file
+ + * @vma: The virtual memory area where the fault occurred
+ + * @vmf: The description of the fault
+ + * @get_block: The filesystem method used to translate file offsets to blocks
+ + *
+ + * When a page fault occurs, filesystems may call this helper in their
+ + * fault handler for DAX files. dax_fault() assumes the caller has done all
+ + * the necessary locking for the page fault to proceed successfully.
+ + */
+ +int dax_fault(struct vm_area_struct *vma, struct vm_fault *vmf,
+ +			get_block_t get_block)
+ +{
+ +	struct file *file = vma->vm_file;
+ +	struct address_space *mapping = file->f_mapping;
+ +	struct inode *inode = mapping->host;
+ +	void *entry;
+ +	struct buffer_head bh;
+ +	unsigned long vaddr = (unsigned long)vmf->virtual_address;
+ +	unsigned blkbits = inode->i_blkbits;
+ +	sector_t block;
+ +	pgoff_t size;
+ +	int error;
+ +	int major = 0;
+ +
+ +	/*
+ +	 * Check whether offset isn't beyond end of file now. Caller is supposed
+ +	 * to hold locks serializing us with truncate / punch hole so this is
+ +	 * a reliable test.
+ +	 */
+ +	size = (i_size_read(inode) + PAGE_SIZE - 1) >> PAGE_SHIFT;
+ +	if (vmf->pgoff >= size)
+ +		return VM_FAULT_SIGBUS;
+ +
+ +	memset(&bh, 0, sizeof(bh));
+ +	block = (sector_t)vmf->pgoff << (PAGE_SHIFT - blkbits);
+ +	bh.b_bdev = inode->i_sb->s_bdev;
+ +	bh.b_size = PAGE_SIZE;
+ +
+ +	entry = grab_mapping_entry(mapping, vmf->pgoff);
+ +	if (IS_ERR(entry)) {
+ +		error = PTR_ERR(entry);
+ +		goto out;
+ +	}
+ +
+ +	error = get_block(inode, block, &bh, 0);
+ +	if (!error && (bh.b_size < PAGE_SIZE))
+ +		error = -EIO;		/* fs corruption? */
+ +	if (error)
+ +		goto unlock_entry;
+ +
+ +	if (vmf->cow_page) {
+ +		struct page *new_page = vmf->cow_page;
+ +		if (buffer_written(&bh))
+ +			error = copy_user_dax(bh.b_bdev, to_sector(&bh, inode),
+ +					bh.b_size, new_page, vaddr);
+ +		else
+ +			clear_user_highpage(new_page, vaddr);
+ +		if (error)
+ +			goto unlock_entry;
+ +		if (!radix_tree_exceptional_entry(entry)) {
+ +			vmf->page = entry;
+ +			return VM_FAULT_LOCKED;
+ +		}
+ +		vmf->entry = entry;
+ +		return VM_FAULT_DAX_LOCKED;
+ +	}
+ +
+ +	if (!buffer_mapped(&bh)) {
+ +		if (vmf->flags & FAULT_FLAG_WRITE) {
+ +			error = get_block(inode, block, &bh, 1);
+ +			count_vm_event(PGMAJFAULT);
+ +			mem_cgroup_count_vm_event(vma->vm_mm, PGMAJFAULT);
+ +			major = VM_FAULT_MAJOR;
+ +			if (!error && (bh.b_size < PAGE_SIZE))
+ +				error = -EIO;
+ +			if (error)
+ +				goto unlock_entry;
+ +		} else {
+ +			return dax_load_hole(mapping, entry, vmf);
+ +		}
+ +	}
+ +
+ +	/* Filesystem should not return unwritten buffers to us! */
+ +	WARN_ON_ONCE(buffer_unwritten(&bh) || buffer_new(&bh));
+ +	error = dax_insert_mapping(mapping, bh.b_bdev, to_sector(&bh, inode),
+ +			bh.b_size, &entry, vma, vmf);
+ + unlock_entry:
+ +	put_locked_mapping_entry(mapping, vmf->pgoff, entry);
+ + out:
+ +	if (error == -ENOMEM)
+ +		return VM_FAULT_OOM | major;
+ +	/* -EBUSY is fine, somebody else faulted on the same PTE */
+ +	if ((error < 0) && (error != -EBUSY))
+ +		return VM_FAULT_SIGBUS | major;
+ +	return VM_FAULT_NOPAGE | major;
+ +}
+ +EXPORT_SYMBOL_GPL(dax_fault);
+ +
+  /**
+   * dax_pfn_mkwrite - handle first write to DAX page
+ + * @vma: The virtual memory area where the fault occurred
+   * @vmf: The description of the fault
+   */
+ -int dax_pfn_mkwrite(struct vm_fault *vmf)
+ +int dax_pfn_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf)
+  {
+ -	struct file *file = vmf->vma->vm_file;
+ +	struct file *file = vma->vm_file;
+  	struct address_space *mapping = file->f_mapping;
+++<<<<<<< HEAD
+ +	void *entry;
+ +	pgoff_t index = vmf->pgoff;
+ +
+ +	spin_lock_irq(&mapping->tree_lock);
+ +	entry = get_unlocked_mapping_entry(mapping, index, NULL);
+ +	if (!entry || !radix_tree_exceptional_entry(entry))
+ +		goto out;
+++=======
++ 	struct inode *inode = mapping->host;
++ 	void *entry, **slot;
++ 	pgoff_t index = vmf->pgoff;
++ 
++ 	spin_lock_irq(&mapping->tree_lock);
++ 	entry = get_unlocked_mapping_entry(mapping, index, &slot);
++ 	if (!entry || !radix_tree_exceptional_entry(entry)) {
++ 		if (entry)
++ 			put_unlocked_mapping_entry(mapping, index, entry);
++ 		spin_unlock_irq(&mapping->tree_lock);
++ 		trace_dax_pfn_mkwrite_no_entry(inode, vmf, VM_FAULT_NOPAGE);
++ 		return VM_FAULT_NOPAGE;
++ 	}
+++>>>>>>> c3ff68d7d1e6 (dax: add tracepoints to dax_pfn_mkwrite())
+  	radix_tree_tag_set(&mapping->page_tree, index, PAGECACHE_TAG_DIRTY);
+ -	entry = lock_slot(mapping, slot);
+ +	put_unlocked_mapping_entry(mapping, index, entry);
+ +out:
+  	spin_unlock_irq(&mapping->tree_lock);
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * If we race with somebody updating the PTE and finish_mkwrite_fault()
++ 	 * fails, we don't care. We need to return VM_FAULT_NOPAGE and retry
++ 	 * the fault in either case.
++ 	 */
++ 	finish_mkwrite_fault(vmf);
++ 	put_locked_mapping_entry(mapping, index, entry);
++ 	trace_dax_pfn_mkwrite(inode, vmf, VM_FAULT_NOPAGE);
+++>>>>>>> c3ff68d7d1e6 (dax: add tracepoints to dax_pfn_mkwrite())
+  	return VM_FAULT_NOPAGE;
+  }
+  EXPORT_SYMBOL_GPL(dax_pfn_mkwrite);
+* Unmerged path include/trace/events/fs_dax.h
+* Unmerged path fs/dax.c
+* Unmerged path include/trace/events/fs_dax.h
