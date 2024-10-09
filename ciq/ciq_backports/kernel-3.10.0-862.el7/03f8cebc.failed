@@ -1,0 +1,168 @@
+nvme: remove unused parameter
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [qla_target] remove unused parameter (Himanshu Madhani) [1327621]
+Rebuild_FUZZ: 88.46%
+commit-author Keith Busch <kbusch@kernel.org>
+commit 03f8cebc127fa285874074ec314b76b1333f6c43
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/03f8cebc.failed
+
+nvme_alloc_ns_head() doesn't use the 'struct nvme_id_ns' parameter.
+Remove it, and update caller accordingly.
+
+	Signed-off-by: Keith Busch <kbusch@kernel.org>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 03f8cebc127fa285874074ec314b76b1333f6c43)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+diff --cc drivers/nvme/host/core.c
+index 309d1bf67eb4,3d0c7d90ad25..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -1567,6 -3377,136 +1567,139 @@@ static const struct attribute_group *nv
+  	NULL,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static struct nvme_ns_head *nvme_find_ns_head(struct nvme_subsystem *subsys,
++ 		unsigned nsid)
++ {
++ 	struct nvme_ns_head *h;
++ 
++ 	lockdep_assert_held(&subsys->lock);
++ 
++ 	list_for_each_entry(h, &subsys->nsheads, entry) {
++ 		if (h->ns_id == nsid && kref_get_unless_zero(&h->ref))
++ 			return h;
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ static int __nvme_check_ids(struct nvme_subsystem *subsys,
++ 		struct nvme_ns_head *new)
++ {
++ 	struct nvme_ns_head *h;
++ 
++ 	lockdep_assert_held(&subsys->lock);
++ 
++ 	list_for_each_entry(h, &subsys->nsheads, entry) {
++ 		if (nvme_ns_ids_valid(&new->ids) &&
++ 		    !list_empty(&h->list) &&
++ 		    nvme_ns_ids_equal(&new->ids, &h->ids))
++ 			return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static struct nvme_ns_head *nvme_alloc_ns_head(struct nvme_ctrl *ctrl,
++ 		unsigned nsid, struct nvme_ns_ids *ids)
++ {
++ 	struct nvme_ns_head *head;
++ 	size_t size = sizeof(*head);
++ 	int ret = -ENOMEM;
++ 
++ #ifdef CONFIG_NVME_MULTIPATH
++ 	size += num_possible_nodes() * sizeof(struct nvme_ns *);
++ #endif
++ 
++ 	head = kzalloc(size, GFP_KERNEL);
++ 	if (!head)
++ 		goto out;
++ 	ret = ida_simple_get(&ctrl->subsys->ns_ida, 1, 0, GFP_KERNEL);
++ 	if (ret < 0)
++ 		goto out_free_head;
++ 	head->instance = ret;
++ 	INIT_LIST_HEAD(&head->list);
++ 	ret = init_srcu_struct(&head->srcu);
++ 	if (ret)
++ 		goto out_ida_remove;
++ 	head->subsys = ctrl->subsys;
++ 	head->ns_id = nsid;
++ 	head->ids = *ids;
++ 	kref_init(&head->ref);
++ 
++ 	ret = __nvme_check_ids(ctrl->subsys, head);
++ 	if (ret) {
++ 		dev_err(ctrl->device,
++ 			"duplicate IDs for nsid %d\n", nsid);
++ 		goto out_cleanup_srcu;
++ 	}
++ 
++ 	ret = nvme_mpath_alloc_disk(ctrl, head);
++ 	if (ret)
++ 		goto out_cleanup_srcu;
++ 
++ 	list_add_tail(&head->entry, &ctrl->subsys->nsheads);
++ 
++ 	kref_get(&ctrl->subsys->ref);
++ 
++ 	return head;
++ out_cleanup_srcu:
++ 	cleanup_srcu_struct(&head->srcu);
++ out_ida_remove:
++ 	ida_simple_remove(&ctrl->subsys->ns_ida, head->instance);
++ out_free_head:
++ 	kfree(head);
++ out:
++ 	if (ret > 0)
++ 		ret = blk_status_to_errno(nvme_error_status(ret));
++ 	return ERR_PTR(ret);
++ }
++ 
++ static int nvme_init_ns_head(struct nvme_ns *ns, unsigned nsid,
++ 		struct nvme_id_ns *id)
++ {
++ 	struct nvme_ctrl *ctrl = ns->ctrl;
++ 	bool is_shared = id->nmic & (1 << 0);
++ 	struct nvme_ns_head *head = NULL;
++ 	struct nvme_ns_ids ids;
++ 	int ret = 0;
++ 
++ 	ret = nvme_report_ns_ids(ctrl, nsid, id, &ids);
++ 	if (ret)
++ 		goto out;
++ 
++ 	mutex_lock(&ctrl->subsys->lock);
++ 	if (is_shared)
++ 		head = nvme_find_ns_head(ctrl->subsys, nsid);
++ 	if (!head) {
++ 		head = nvme_alloc_ns_head(ctrl, nsid, &ids);
++ 		if (IS_ERR(head)) {
++ 			ret = PTR_ERR(head);
++ 			goto out_unlock;
++ 		}
++ 	} else {
++ 		if (!nvme_ns_ids_equal(&head->ids, &ids)) {
++ 			dev_err(ctrl->device,
++ 				"IDs don't match for shared namespace %d\n",
++ 					nsid);
++ 			ret = -EINVAL;
++ 			goto out_unlock;
++ 		}
++ 	}
++ 
++ 	list_add_tail(&ns->siblings, &head->list);
++ 	ns->head = head;
++ 
++ out_unlock:
++ 	mutex_unlock(&ctrl->subsys->lock);
++ out:
++ 	if (ret > 0)
++ 		ret = blk_status_to_errno(nvme_error_status(ret));
++ 	return ret;
++ }
++ 
+++>>>>>>> 03f8cebc127f (nvme: remove unused parameter)
+  static int ns_cmp(void *priv, struct list_head *a, struct list_head *b)
+  {
+  	struct nvme_ns *nsa = container_of(a, struct nvme_ns, list);
+* Unmerged path drivers/nvme/host/core.c
