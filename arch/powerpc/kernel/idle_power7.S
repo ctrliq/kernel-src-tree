@@ -56,6 +56,7 @@
  * Threads will spin in HMT_LOW until the lock bit is cleared.
  * r14 - pointer to core_idle_state
  * r15 - used to load contents of core_idle_state
+ * r9  - used as a temporary variable
  */
 
 core_idle_lock_held:
@@ -65,6 +66,8 @@ core_idle_lock_held:
 	bne	3b
 	HMT_MEDIUM
 	lwarx	r15,0,r14
+	andi.	r9,r15,PNV_CORE_IDLE_LOCK_BIT
+	bne	core_idle_lock_held
 	blr
 
 /*
