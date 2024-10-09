@@ -1,0 +1,213 @@
+PCI: Distribute available buses to hotplug-capable bridges
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [pci] Distribute available buses to hotplug-capable bridges (Myron Stowe) [1517629]
+Rebuild_FUZZ: 95.50%
+commit-author Mika Westerberg <mika.westerberg@linux.intel.com>
+commit 1c02ea81006548a5cd55f7ac6df77cf8d7b08e00
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/1c02ea81.failed
+
+System BIOS sometimes allocates extra bus space for hotplug-capable PCIe
+root/downstream ports. This space is needed if the device plugged to the
+port will have more hotplug-capable downstream ports. A good example of
+this is Thunderbolt. Each Thunderbolt device contains a PCIe switch and
+one or more hotplug-capable PCIe downstream ports where the daisy chain
+can be extended.
+
+Currently Linux only allocates minimal bus space to make sure all the
+enumerated devices barely fit there. The BIOS reserved extra space is
+not taken into consideration at all. Because of this we run out of bus
+space pretty quickly when more PCIe devices are attached to hotplug
+downstream ports in order to extend the chain.
+
+Modify the PCI core so we distribute the available BIOS allocated bus space
+equally between hotplug-capable bridges to make sure there is enough bus
+space for extending the hierarchy later on.
+
+Update kernel docs of the affected functions.
+
+	Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+(cherry picked from commit 1c02ea81006548a5cd55f7ac6df77cf8d7b08e00)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/probe.c
+diff --cc drivers/pci/probe.c
+index 61ca9d4104ec,14e0ea1ff38b..000000000000
+--- a/drivers/pci/probe.c
++++ b/drivers/pci/probe.c
+@@@ -2069,9 -2429,33 +2110,39 @@@ void pcie_bus_configure_settings(struc
+  }
+  EXPORT_SYMBOL_GPL(pcie_bus_configure_settings);
+  
+++<<<<<<< HEAD
+ +unsigned int pci_scan_child_bus(struct pci_bus *bus)
+ +{
+ +	unsigned int devfn, pass, max = bus->busn_res.start;
+++=======
++ /*
++  * Called after each bus is probed, but before its children are examined.  This
++  * is marked as __weak because multiple architectures define it.
++  */
++ void __weak pcibios_fixup_bus(struct pci_bus *bus)
++ {
++        /* nothing to do, expected to be removed in the future */
++ }
++ 
++ /**
++  * pci_scan_child_bus_extend() - Scan devices below a bus
++  * @bus: Bus to scan for devices
++  * @available_buses: Total number of buses available (%0 does not try to
++  *		     extend beyond the minimal)
++  *
++  * Scans devices below @bus including subordinate buses. Returns new
++  * subordinate number including all the found devices. Passing
++  * @available_buses causes the remaining bus space to be distributed
++  * equally between hotplug-capable bridges to allow future extension of the
++  * hierarchy.
++  */
++ static unsigned int pci_scan_child_bus_extend(struct pci_bus *bus,
++ 					      unsigned int available_buses)
++ {
++ 	unsigned int used_buses, normal_bridges = 0, hotplug_bridges = 0;
++ 	unsigned int start = bus->busn_res.start;
++ 	unsigned int devfn, cmax, max = start;
+++>>>>>>> 1c02ea810065 (PCI: Distribute available buses to hotplug-capable bridges)
+  	struct pci_dev *dev;
+  
+  	dev_dbg(&bus->dev, "scanning bus\n");
+@@@ -2093,21 -2478,73 +2165,79 @@@
+  		bus->is_added = 1;
+  	}
+  
+++<<<<<<< HEAD
+ +	for (pass = 0; pass < 2; pass++)
+ +		for_each_pci_bridge(dev, bus)
+ +			max = pci_scan_bridge(bus, dev, max, pass);
+++=======
++ 	/*
++ 	 * Calculate how many hotplug bridges and normal bridges there
++ 	 * are on this bus. We will distribute the additional available
++ 	 * buses between hotplug bridges.
++ 	 */
++ 	for_each_pci_bridge(dev, bus) {
++ 		if (dev->is_hotplug_bridge)
++ 			hotplug_bridges++;
++ 		else
++ 			normal_bridges++;
++ 	}
+  
+  	/*
+- 	 * Make sure a hotplug bridge has at least the minimum requested
+- 	 * number of buses.
++ 	 * Scan bridges that are already configured. We don't touch them
++ 	 * unless they are misconfigured (which will be done in the second
++ 	 * scan below).
+  	 */
+- 	if (bus->self && bus->self->is_hotplug_bridge && pci_hotplug_bus_size) {
+- 		if (max - bus->busn_res.start < pci_hotplug_bus_size - 1)
+- 			max = bus->busn_res.start + pci_hotplug_bus_size - 1;
++ 	for_each_pci_bridge(dev, bus) {
++ 		cmax = max;
++ 		max = pci_scan_bridge_extend(bus, dev, max, 0, 0);
++ 		used_buses += cmax - max;
++ 	}
++ 
++ 	/* Scan bridges that need to be reconfigured */
++ 	for_each_pci_bridge(dev, bus) {
++ 		unsigned int buses = 0;
+  
+- 		/* Do not allocate more buses than we have room left */
+- 		if (max > bus->busn_res.end)
+- 			max = bus->busn_res.end;
++ 		if (!hotplug_bridges && normal_bridges == 1) {
++ 			/*
++ 			 * There is only one bridge on the bus (upstream
++ 			 * port) so it gets all available buses which it
++ 			 * can then distribute to the possible hotplug
++ 			 * bridges below.
++ 			 */
++ 			buses = available_buses;
++ 		} else if (dev->is_hotplug_bridge) {
++ 			/*
++ 			 * Distribute the extra buses between hotplug
++ 			 * bridges if any.
++ 			 */
++ 			buses = available_buses / hotplug_bridges;
++ 			buses = min(buses, available_buses - used_buses);
++ 		}
++ 
++ 		cmax = max;
++ 		max = pci_scan_bridge_extend(bus, dev, cmax, buses, 1);
++ 		used_buses += max - cmax;
++ 	}
+++>>>>>>> 1c02ea810065 (PCI: Distribute available buses to hotplug-capable bridges)
++ 
++ 	/*
++ 	 * Make sure a hotplug bridge has at least the minimum requested
++ 	 * number of buses but allow it to grow up to the maximum available
++ 	 * bus number of there is room.
++ 	 */
++ 	if (bus->self && bus->self->is_hotplug_bridge) {
++ 		used_buses = max_t(unsigned int, available_buses,
++ 				   pci_hotplug_bus_size - 1);
++ 		if (max - start < used_buses) {
++ 			max = start + used_buses;
++ 
++ 			/* Do not allocate more buses than we have room left */
++ 			if (max > bus->busn_res.end)
++ 				max = bus->busn_res.end;
++ 
++ 			dev_dbg(&bus->dev, "%pR extended by %#02x\n",
++ 				&bus->busn_res, max - start);
++ 		}
+  	}
+  
+  	/*
+@@@ -2460,3 -2861,38 +2602,41 @@@ void __init pci_sort_breadthfirst(void
+  {
+  	bus_sort_breadthfirst(&pci_bus_type, &pci_sort_bf_cmp);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ int pci_hp_add_bridge(struct pci_dev *dev)
++ {
++ 	struct pci_bus *parent = dev->bus;
++ 	int busnr, start = parent->busn_res.start;
++ 	unsigned int available_buses = 0;
++ 	int end = parent->busn_res.end;
++ 
++ 	for (busnr = start; busnr <= end; busnr++) {
++ 		if (!pci_find_bus(pci_domain_nr(parent), busnr))
++ 			break;
++ 	}
++ 	if (busnr-- > end) {
++ 		dev_err(&dev->dev, "No bus number available for hot-added bridge\n");
++ 		return -1;
++ 	}
++ 
++ 	/* Scan bridges that are already configured */
++ 	busnr = pci_scan_bridge(parent, dev, busnr, 0);
++ 
++ 	/*
++ 	 * Distribute the available bus numbers between hotplug-capable
++ 	 * bridges to make extending the chain later possible.
++ 	 */
++ 	available_buses = end - busnr;
++ 
++ 	/* Scan bridges that need to be reconfigured */
++ 	pci_scan_bridge_extend(parent, dev, busnr, available_buses, 1);
++ 
++ 	if (!dev->subordinate)
++ 		return -1;
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(pci_hp_add_bridge);
+++>>>>>>> 1c02ea810065 (PCI: Distribute available buses to hotplug-capable bridges)
+* Unmerged path drivers/pci/probe.c
