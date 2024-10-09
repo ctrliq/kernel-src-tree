@@ -1349,6 +1349,9 @@ sbc_dif_verify_write(struct se_cmd *cmd, sector_t start, unsigned int sectors,
 		kunmap_atomic(paddr);
 		kunmap_atomic(daddr);
 	}
+	if (!sg)
+		return 0;
+
 	sbc_dif_copy_prot(cmd, sectors, false, sg, sg_off);
 
 	return 0;
