@@ -2418,16 +2418,11 @@ static struct iommu_group *amd_iommu_device_group(struct device *dev)
 static struct protection_domain *get_domain(struct device *dev)
 {
 	struct protection_domain *domain;
-	struct iommu_domain *io_domain;
 
 	if (!check_device(dev))
 		return ERR_PTR(-EINVAL);
 
-	io_domain = iommu_get_domain_for_dev(dev);
-	if (!io_domain)
-		return NULL;
-
-	domain = to_pdomain(io_domain);
+	domain = get_dev_data(dev)->domain;
 	if (!dma_ops_domain(domain))
 		return ERR_PTR(-EBUSY);
 
