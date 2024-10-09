@@ -416,6 +416,7 @@ static int spi_gpio_probe(struct platform_device *pdev)
 	struct spi_gpio_platform_data	*pdata;
 	u16 master_flags = 0;
 	bool use_of = 0;
+	int num_devices;
 
 	status = spi_gpio_probe_dt(pdev);
 	if (status < 0)
@@ -425,16 +426,21 @@ static int spi_gpio_probe(struct platform_device *pdev)
 
 	pdata = pdev->dev.platform_data;
 #ifdef GENERIC_BITBANG
-	if (!pdata || !pdata->num_chipselect)
+	if (!pdata || (!use_of && !pdata->num_chipselect))
 		return -ENODEV;
 #endif
+
+	if (use_of && !SPI_N_CHIPSEL)
+		num_devices = 1;
+	else
+		num_devices = SPI_N_CHIPSEL;
 
 	status = spi_gpio_request(pdata, dev_name(&pdev->dev), &master_flags);
 	if (status < 0)
 		return status;
 
 	master = spi_alloc_master(&pdev->dev, sizeof(*spi_gpio) +
-					(sizeof(int) * SPI_N_CHIPSEL));
+					(sizeof(int) * num_devices));
 	if (!master) {
 		status = -ENOMEM;
 		goto gpio_free;
@@ -448,7 +454,7 @@ static int spi_gpio_probe(struct platform_device *pdev)
 
 	master->flags = master_flags;
 	master->bus_num = pdev->id;
-	master->num_chipselect = SPI_N_CHIPSEL;
+	master->num_chipselect = num_devices;
 	master->setup = spi_gpio_setup;
 	master->cleanup = spi_gpio_cleanup;
 #ifdef CONFIG_OF
@@ -463,9 +469,12 @@ static int spi_gpio_probe(struct platform_device *pdev)
 		 * property of the node.
 		 */
 
-		for (i = 0; i < SPI_N_CHIPSEL; i++)
-			spi_gpio->cs_gpios[i] =
-				of_get_named_gpio(np, "cs-gpios", i);
+		if (!SPI_N_CHIPSEL)
+			spi_gpio->cs_gpios[0] = SPI_GPIO_NO_CHIPSELECT;
+		else
+			for (i = 0; i < SPI_N_CHIPSEL; i++)
+				spi_gpio->cs_gpios[i] =
+					of_get_named_gpio(np, "cs-gpios", i);
 	}
 #endif
 
