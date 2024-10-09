@@ -1,0 +1,216 @@
+x86/intel_rdt: Organize code properly
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] intel_rdt: Organize code properly (Jiri Olsa) [1379551]
+Rebuild_FUZZ: 94.29%
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 70a1ee92564d079b4c7a375b244a6c849b81f12f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/70a1ee92.failed
+
+Having init functions at random places in the middle of the code is
+unintuitive.
+
+Move them close to the init routine and mark them __init.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: ravi.v.shankar@intel.com
+	Cc: tony.luck@intel.com
+	Cc: fenghua.yu@intel.com
+	Cc: vikas.shivappa@intel.com
+(cherry picked from commit 70a1ee92564d079b4c7a375b244a6c849b81f12f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/intel_rdt.c
+diff --cc arch/x86/kernel/cpu/intel_rdt.c
+index ad087dd4421e,d2e5f92b5428..000000000000
+--- a/arch/x86/kernel/cpu/intel_rdt.c
++++ b/arch/x86/kernel/cpu/intel_rdt.c
+@@@ -168,58 -168,17 +168,61 @@@ static void rdt_get_cdp_l3_config(int t
+  	r->enabled = false;
+  }
+  
+ -static int get_cache_id(int cpu, int level)
+++<<<<<<< HEAD
+ +/**
+ + * Choose a width for the resource name
+ + * and resource data based on the resource that has
+ + * widest name and cbm.
+ + */
+ +static void rdt_init_padding(void)
+  {
+ -	struct cpu_cacheinfo *ci = get_cpu_cacheinfo(cpu);
+ -	int i;
+ +	struct rdt_resource *r;
+ +	int cl;
+ +
+ +	for_each_enabled_rdt_resource(r) {
+ +		cl = strlen(r->name);
+ +		if (cl > max_name_width)
+ +			max_name_width = cl;
+ +
+ +		if (r->data_width > max_data_width)
+ +			max_data_width = r->data_width;
+ +	}
+ +}
+ +
+ +static inline bool get_rdt_resources(void)
+ +{
+ +	bool ret = false;
+  
+ -	for (i = 0; i < ci->num_leaves; i++) {
+ -		if (ci->info_list[i].level == level)
+ -			return ci->info_list[i].id;
+ +	if (cache_alloc_hsw_probe())
+ +		return true;
+ +
+ +	if (!boot_cpu_has(X86_FEATURE_RDT_A))
+ +		return false;
+ +
+ +	if (boot_cpu_has(X86_FEATURE_CAT_L3)) {
+ +		rdt_get_config(1, &rdt_resources_all[RDT_RESOURCE_L3]);
+ +		if (boot_cpu_has(X86_FEATURE_CDP_L3)) {
+ +			rdt_get_cdp_l3_config(RDT_RESOURCE_L3DATA);
+ +			rdt_get_cdp_l3_config(RDT_RESOURCE_L3CODE);
+ +		}
+ +		ret = true;
+ +	}
+ +	if (boot_cpu_has(X86_FEATURE_CAT_L2)) {
+ +		/* CPUID 0x10.2 fields are same format at 0x10.1 */
+ +		rdt_get_config(2, &rdt_resources_all[RDT_RESOURCE_L2]);
+ +		ret = true;
+  	}
+  
+ -	return -1;
+ +	rdt_init_padding();
+ +
+ +	return ret;
+ +}
+ +
+++=======
+++>>>>>>> 70a1ee92564d (x86/intel_rdt: Organize code properly)
+ +static int get_cache_id(int cpu, int level)
+ +{
+ +	return get_cpu_cache_id(cpu, level);
+  }
+  
+  void rdt_cbm_update(void *arg)
+@@@ -398,68 -353,49 +401,114 @@@ static int intel_rdt_offline_cpu(unsign
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int
+ +rdt_cpu_notify(struct notifier_block *self, unsigned long action, void *hcpu)
+ +{
+ +       unsigned int cpu = (long)hcpu;
+ +
+ +       switch (action & ~CPU_TASKS_FROZEN) {
+ +
+ +       case CPU_ONLINE:
+ +       case CPU_DOWN_FAILED:
+ +               intel_rdt_online_cpu(cpu, true);
+ +               break;
+ +
+ +       case CPU_UP_CANCELED:
+ +       case CPU_DOWN_PREPARE:
+ +               intel_rdt_offline_cpu(cpu);
+ +               break;
+ +       default:
+ +               break;
+ +       }
+ +
+ +       return NOTIFY_OK;
+ +}
+ +
+ +static void __init rdt_cpu_setup(void *dummy)
+ +{
+ +	struct rdt_resource *r;
+ +	int i;
+ +
+ +	clear_closid(smp_processor_id());
+ +
+ +	for_each_capable_rdt_resource(r) {
+ +		for (i = 0; i < r->num_closid; i++) {
+ +			int idx = cbm_idx(r, i);
+ +
+ +			wrmsrl(r->msr_base + idx, r->max_cbm);
+ +		}
+ +	}
+ +}
+ +
+ +static struct notifier_block rdt_cpu_nb = {
+ +	.notifier_call  = rdt_cpu_notify,
+ +	.priority	= -INT_MAX,
+ +};
+ +
+ +static int __init rdt_notifier_init(void)
+ +{
+ +	unsigned int cpu;
+ +
+ +	for_each_online_cpu(cpu) {
+ +		intel_rdt_online_cpu(cpu, false);
+ +		/*
+ +		 * RHEL7 - The upstream hotplug notification invokes the
+ +		 *         callbacks on related cpus, but that's not the
+ +		 *         case of the RHEL7 notification support.
+ +		 *         Following call ensures we run all the msr
+ +		 *         initialization setup on related cpus.
+ +		 */
+ +		smp_call_function_single(cpu, rdt_cpu_setup, NULL, 1);
+ +	}
+ +
+ +	__register_cpu_notifier(&rdt_cpu_nb);
+ +	return 0;
+++=======
++ /*
++  * Choose a width for the resource name and resource data based on the
++  * resource that has widest name and cbm.
++  */
++ static __init void rdt_init_padding(void)
++ {
++ 	struct rdt_resource *r;
++ 	int cl;
++ 
++ 	for_each_enabled_rdt_resource(r) {
++ 		cl = strlen(r->name);
++ 		if (cl > max_name_width)
++ 			max_name_width = cl;
++ 
++ 		if (r->data_width > max_data_width)
++ 			max_data_width = r->data_width;
++ 	}
++ }
++ 
++ static __init bool get_rdt_resources(void)
++ {
++ 	bool ret = false;
++ 
++ 	if (cache_alloc_hsw_probe())
++ 		return true;
++ 
++ 	if (!boot_cpu_has(X86_FEATURE_RDT_A))
++ 		return false;
++ 
++ 	if (boot_cpu_has(X86_FEATURE_CAT_L3)) {
++ 		rdt_get_config(1, &rdt_resources_all[RDT_RESOURCE_L3]);
++ 		if (boot_cpu_has(X86_FEATURE_CDP_L3)) {
++ 			rdt_get_cdp_l3_config(RDT_RESOURCE_L3DATA);
++ 			rdt_get_cdp_l3_config(RDT_RESOURCE_L3CODE);
++ 		}
++ 		ret = true;
++ 	}
++ 	if (boot_cpu_has(X86_FEATURE_CAT_L2)) {
++ 		/* CPUID 0x10.2 fields are same format at 0x10.1 */
++ 		rdt_get_config(2, &rdt_resources_all[RDT_RESOURCE_L2]);
++ 		ret = true;
++ 	}
++ 	return ret;
+++>>>>>>> 70a1ee92564d (x86/intel_rdt: Organize code properly)
+  }
+  
+  static int __init intel_rdt_late_init(void)
+* Unmerged path arch/x86/kernel/cpu/intel_rdt.c
