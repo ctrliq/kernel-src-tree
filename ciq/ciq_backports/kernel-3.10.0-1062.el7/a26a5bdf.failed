@@ -1,0 +1,179 @@
+net/mlx5e: Restrict the combination of large MTU and XDP
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Restrict the combination of large MTU and XDP (Alaa Hleihel) [1642498]
+Rebuild_FUZZ: 96.30%
+commit-author Tariq Toukan <tariqt@mellanox.com>
+commit a26a5bdf3ee2da419ba2c2baa54f467103dc8cc5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/a26a5bdf.failed
+
+Add checks in control path upon an MTU change or an XDP program set,
+to prevent reaching cases where large MTU and XDP are set simultaneously.
+
+This is to make sure we allow XDP only with the linear RX memory scheme,
+i.e. a received packet is not scattered to different pages.
+Change mlx5e_rx_get_linear_frag_sz() accordingly, so that we make sure
+the XDP configuration can really be set, instead of assuming that it is.
+
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit a26a5bdf3ee2da419ba2c2baa54f467103dc8cc5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 6cb0654a5d0a,56ae6e428fdf..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -82,14 -78,89 +82,42 @@@ struct mlx5e_channel_param 
+  
+  bool mlx5e_check_fragmented_striding_rq_cap(struct mlx5_core_dev *mdev)
+  {
+ -	bool striding_rq_umr = MLX5_CAP_GEN(mdev, striding_rq) &&
+ +	return MLX5_CAP_GEN(mdev, striding_rq) &&
+  		MLX5_CAP_GEN(mdev, umr_ptr_rlky) &&
+  		MLX5_CAP_ETH(mdev, reg_umr_sq);
+ -	u16 max_wqe_sz_cap = MLX5_CAP_GEN(mdev, max_wqe_sz_sq);
+ -	bool inline_umr = MLX5E_UMR_WQE_INLINE_SZ <= max_wqe_sz_cap;
+ -
+ -	if (!striding_rq_umr)
+ -		return false;
+ -	if (!inline_umr) {
+ -		mlx5_core_warn(mdev, "Cannot support Striding RQ: UMR WQE size (%d) exceeds maximum supported (%d).\n",
+ -			       (int)MLX5E_UMR_WQE_INLINE_SZ, max_wqe_sz_cap);
+ -		return false;
+ -	}
+ -	return true;
+  }
+  
+++<<<<<<< HEAD
+ +u8 mlx5e_mpwqe_get_log_stride_size(struct mlx5_core_dev *mdev,
+++=======
++ static u32 mlx5e_rx_get_linear_frag_sz(struct mlx5e_params *params)
++ {
++ 	u16 hw_mtu = MLX5E_SW2HW_MTU(params, params->sw_mtu);
++ 	u16 linear_rq_headroom = params->xdp_prog ?
++ 		XDP_PACKET_HEADROOM : MLX5_RX_HEADROOM;
++ 	u32 frag_sz;
++ 
++ 	linear_rq_headroom += NET_IP_ALIGN;
++ 
++ 	frag_sz = MLX5_SKB_FRAG_SZ(linear_rq_headroom + hw_mtu);
++ 
++ 	if (params->xdp_prog && frag_sz < PAGE_SIZE)
++ 		frag_sz = PAGE_SIZE;
++ 
++ 	return frag_sz;
++ }
++ 
++ static u8 mlx5e_mpwqe_log_pkts_per_wqe(struct mlx5e_params *params)
++ {
++ 	u32 linear_frag_sz = mlx5e_rx_get_linear_frag_sz(params);
++ 
++ 	return MLX5_MPWRQ_LOG_WQE_SZ - order_base_2(linear_frag_sz);
++ }
++ 
++ static bool mlx5e_rx_is_linear_skb(struct mlx5_core_dev *mdev,
+++>>>>>>> a26a5bdf3ee2 (net/mlx5e: Restrict the combination of large MTU and XDP)
+  				   struct mlx5e_params *params)
+  {
+ -	u32 frag_sz = mlx5e_rx_get_linear_frag_sz(params);
+ -
+ -	return !params->lro_en && frag_sz <= PAGE_SIZE;
+ -}
+ -
+ -static bool mlx5e_rx_mpwqe_is_linear_skb(struct mlx5_core_dev *mdev,
+ -					 struct mlx5e_params *params)
+ -{
+ -	u32 frag_sz = mlx5e_rx_get_linear_frag_sz(params);
+ -	s8 signed_log_num_strides_param;
+ -	u8 log_num_strides;
+ -
+ -	if (!mlx5e_rx_is_linear_skb(mdev, params))
+ -		return false;
+ -
+ -	if (MLX5_CAP_GEN(mdev, ext_stride_num_range))
+ -		return true;
+ -
+ -	log_num_strides = MLX5_MPWRQ_LOG_WQE_SZ - order_base_2(frag_sz);
+ -	signed_log_num_strides_param =
+ -		(s8)log_num_strides - MLX5_MPWQE_LOG_NUM_STRIDES_BASE;
+ -
+ -	return signed_log_num_strides_param >= 0;
+ -}
+ -
+ -static u8 mlx5e_mpwqe_get_log_rq_size(struct mlx5e_params *params)
+ -{
+ -	if (params->log_rq_mtu_frames <
+ -	    mlx5e_mpwqe_log_pkts_per_wqe(params) + MLX5E_PARAMS_MINIMUM_LOG_RQ_SIZE_MPW)
+ -		return MLX5E_PARAMS_MINIMUM_LOG_RQ_SIZE_MPW;
+ -
+ -	return params->log_rq_mtu_frames - mlx5e_mpwqe_log_pkts_per_wqe(params);
+ -}
+ -
+ -static u8 mlx5e_mpwqe_get_log_stride_size(struct mlx5_core_dev *mdev,
+ -					  struct mlx5e_params *params)
+ -{
+ -	if (mlx5e_rx_mpwqe_is_linear_skb(mdev, params))
+ -		return order_base_2(mlx5e_rx_get_linear_frag_sz(params));
+ -
+  	return MLX5E_MPWQE_STRIDE_SZ(mdev,
+  		MLX5E_GET_PFLAG(params, MLX5E_PFLAG_RX_CQE_COMPRESS));
+  }
+@@@ -3339,15 -3705,31 +3367,36 @@@ int mlx5e_change_mtu(struct net_device 
+  	mutex_lock(&priv->state_lock);
+  
+  	params = &priv->channels.params;
+ +	reset = !params->lro_en &&
+ +		(params->rq_wq_type != MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ);
+  
+ -	reset = !params->lro_en;
+  	reset = reset && test_bit(MLX5E_STATE_OPENED, &priv->state);
+  
+++<<<<<<< HEAD
+++=======
++ 	new_channels.params = *params;
++ 	new_channels.params.sw_mtu = new_mtu;
++ 
++ 	if (params->xdp_prog &&
++ 	    !mlx5e_rx_is_linear_skb(priv->mdev, &new_channels.params)) {
++ 		netdev_err(netdev, "MTU(%d) > %d is not allowed while XDP enabled\n",
++ 			   new_mtu, MLX5E_XDP_MAX_MTU);
++ 		err = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	if (params->rq_wq_type == MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ) {
++ 		u8 ppw_old = mlx5e_mpwqe_log_pkts_per_wqe(params);
++ 		u8 ppw_new = mlx5e_mpwqe_log_pkts_per_wqe(&new_channels.params);
++ 
++ 		reset = reset && (ppw_old != ppw_new);
++ 	}
++ 
+++>>>>>>> a26a5bdf3ee2 (net/mlx5e: Restrict the combination of large MTU and XDP)
+  	if (!reset) {
+  		params->sw_mtu = new_mtu;
+ -		set_mtu_cb(priv);
+ +		if (set_mtu_cb)
+ +			set_mtu_cb(priv);
+  		netdev->mtu = params->sw_mtu;
+  		goto out;
+  	}
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index d500f9aa1bd7..23ceb65e304c 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -78,6 +78,8 @@
+ #define MLX5_RX_HEADROOM NET_SKB_PAD
+ #define MLX5_SKB_FRAG_SZ(len)	(SKB_DATA_ALIGN(len) +	\
+ 				 SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))
++#define MLX5E_XDP_MAX_MTU ((int)(PAGE_SIZE - \
++				 MLX5_SKB_FRAG_SZ(XDP_PACKET_HEADROOM)))
+ 
+ #define MLX5_MPWRQ_MIN_LOG_STRIDE_SZ(mdev) \
+ 	(6 + MLX5_CAP_GEN(mdev, cache_line_128byte)) /* HW restriction */
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
