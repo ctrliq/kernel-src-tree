@@ -1,0 +1,282 @@
+fs/dcache.c: avoid soft-lockup in dput()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [fs] dcache.c: avoid soft-lockup in dput() (Miklos Szeredi) [1431297]
+Rebuild_FUZZ: 96.10%
+commit-author Wei Fang <fangwei1@huawei.com>
+commit 47be61845c775643f1aa4d2a54343549f943c94c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/47be6184.failed
+
+We triggered soft-lockup under stress test which
+open/access/write/close one file concurrently on more than
+five different CPUs:
+
+WARN: soft lockup - CPU#0 stuck for 11s! [who:30631]
+...
+[<ffffffc0003986f8>] dput+0x100/0x298
+[<ffffffc00038c2dc>] terminate_walk+0x4c/0x60
+[<ffffffc00038f56c>] path_lookupat+0x5cc/0x7a8
+[<ffffffc00038f780>] filename_lookup+0x38/0xf0
+[<ffffffc000391180>] user_path_at_empty+0x78/0xd0
+[<ffffffc0003911f4>] user_path_at+0x1c/0x28
+[<ffffffc00037d4fc>] SyS_faccessat+0xb4/0x230
+
+->d_lock trylock may failed many times because of concurrently
+operations, and dput() may execute a long time.
+
+Fix this by replacing cpu_relax() with cond_resched().
+dput() used to be sleepable, so make it sleepable again
+should be safe.
+
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Wei Fang <fangwei1@huawei.com>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 47be61845c775643f1aa4d2a54343549f943c94c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dcache.c
+diff --cc fs/dcache.c
+index e518a196fb4f,f650a4fc5b7c..000000000000
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@@ -479,15 -537,206 +479,188 @@@ relock
+  	 * inform the fs via d_prune that this dentry is about to be
+  	 * unhashed and destroyed.
+  	 */
+ -	if (dentry->d_flags & DCACHE_OP_PRUNE)
+ +	if ((dentry->d_flags & DCACHE_OP_PRUNE) && !d_unhashed(dentry))
+  		dentry->d_op->d_prune(dentry);
+  
+ -	if (dentry->d_flags & DCACHE_LRU_LIST) {
+ -		if (!(dentry->d_flags & DCACHE_SHRINK_LIST))
+ -			d_lru_del(dentry);
+ -	}
+ +	dentry_lru_del(dentry);
+  	/* if it was on the hash then remove it */
+  	__d_drop(dentry);
+ -	dentry_unlist(dentry, parent);
+ -	if (parent)
+ -		spin_unlock(&parent->d_lock);
+ -	if (dentry->d_inode)
+ -		dentry_unlink_inode(dentry);
+ -	else
+ -		spin_unlock(&dentry->d_lock);
+ -	this_cpu_dec(nr_dentry);
+ -	if (dentry->d_op && dentry->d_op->d_release)
+ -		dentry->d_op->d_release(dentry);
+ -
+ -	spin_lock(&dentry->d_lock);
+ -	if (dentry->d_flags & DCACHE_SHRINK_LIST) {
+ -		dentry->d_flags |= DCACHE_MAY_FREE;
+ -		can_free = false;
+ -	}
+ -	spin_unlock(&dentry->d_lock);
+ -	if (likely(can_free))
+ -		dentry_free(dentry);
+ +	return d_kill(dentry, parent);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Finish off a dentry we've decided to kill.
++  * dentry->d_lock must be held, returns with it unlocked.
++  * If ref is non-zero, then decrement the refcount too.
++  * Returns dentry requiring refcount drop, or NULL if we're done.
++  */
++ static struct dentry *dentry_kill(struct dentry *dentry)
++ 	__releases(dentry->d_lock)
++ {
++ 	struct inode *inode = dentry->d_inode;
++ 	struct dentry *parent = NULL;
++ 
++ 	if (inode && unlikely(!spin_trylock(&inode->i_lock)))
++ 		goto failed;
++ 
++ 	if (!IS_ROOT(dentry)) {
++ 		parent = dentry->d_parent;
++ 		if (unlikely(!spin_trylock(&parent->d_lock))) {
++ 			if (inode)
++ 				spin_unlock(&inode->i_lock);
++ 			goto failed;
++ 		}
++ 	}
++ 
++ 	__dentry_kill(dentry);
++ 	return parent;
++ 
++ failed:
++ 	spin_unlock(&dentry->d_lock);
++ 	return dentry; /* try again with same dentry */
++ }
++ 
++ static inline struct dentry *lock_parent(struct dentry *dentry)
++ {
++ 	struct dentry *parent = dentry->d_parent;
++ 	if (IS_ROOT(dentry))
++ 		return NULL;
++ 	if (unlikely(dentry->d_lockref.count < 0))
++ 		return NULL;
++ 	if (likely(spin_trylock(&parent->d_lock)))
++ 		return parent;
++ 	rcu_read_lock();
++ 	spin_unlock(&dentry->d_lock);
++ again:
++ 	parent = ACCESS_ONCE(dentry->d_parent);
++ 	spin_lock(&parent->d_lock);
++ 	/*
++ 	 * We can't blindly lock dentry until we are sure
++ 	 * that we won't violate the locking order.
++ 	 * Any changes of dentry->d_parent must have
++ 	 * been done with parent->d_lock held, so
++ 	 * spin_lock() above is enough of a barrier
++ 	 * for checking if it's still our child.
++ 	 */
++ 	if (unlikely(parent != dentry->d_parent)) {
++ 		spin_unlock(&parent->d_lock);
++ 		goto again;
++ 	}
++ 	rcu_read_unlock();
++ 	if (parent != dentry)
++ 		spin_lock_nested(&dentry->d_lock, DENTRY_D_LOCK_NESTED);
++ 	else
++ 		parent = NULL;
++ 	return parent;
++ }
++ 
++ /*
++  * Try to do a lockless dput(), and return whether that was successful.
++  *
++  * If unsuccessful, we return false, having already taken the dentry lock.
++  *
++  * The caller needs to hold the RCU read lock, so that the dentry is
++  * guaranteed to stay around even if the refcount goes down to zero!
++  */
++ static inline bool fast_dput(struct dentry *dentry)
++ {
++ 	int ret;
++ 	unsigned int d_flags;
++ 
++ 	/*
++ 	 * If we have a d_op->d_delete() operation, we sould not
++ 	 * let the dentry count go to zero, so use "put_or_lock".
++ 	 */
++ 	if (unlikely(dentry->d_flags & DCACHE_OP_DELETE))
++ 		return lockref_put_or_lock(&dentry->d_lockref);
++ 
++ 	/*
++ 	 * .. otherwise, we can try to just decrement the
++ 	 * lockref optimistically.
++ 	 */
++ 	ret = lockref_put_return(&dentry->d_lockref);
++ 
++ 	/*
++ 	 * If the lockref_put_return() failed due to the lock being held
++ 	 * by somebody else, the fast path has failed. We will need to
++ 	 * get the lock, and then check the count again.
++ 	 */
++ 	if (unlikely(ret < 0)) {
++ 		spin_lock(&dentry->d_lock);
++ 		if (dentry->d_lockref.count > 1) {
++ 			dentry->d_lockref.count--;
++ 			spin_unlock(&dentry->d_lock);
++ 			return 1;
++ 		}
++ 		return 0;
++ 	}
++ 
++ 	/*
++ 	 * If we weren't the last ref, we're done.
++ 	 */
++ 	if (ret)
++ 		return 1;
++ 
++ 	/*
++ 	 * Careful, careful. The reference count went down
++ 	 * to zero, but we don't hold the dentry lock, so
++ 	 * somebody else could get it again, and do another
++ 	 * dput(), and we need to not race with that.
++ 	 *
++ 	 * However, there is a very special and common case
++ 	 * where we don't care, because there is nothing to
++ 	 * do: the dentry is still hashed, it does not have
++ 	 * a 'delete' op, and it's referenced and already on
++ 	 * the LRU list.
++ 	 *
++ 	 * NOTE! Since we aren't locked, these values are
++ 	 * not "stable". However, it is sufficient that at
++ 	 * some point after we dropped the reference the
++ 	 * dentry was hashed and the flags had the proper
++ 	 * value. Other dentry users may have re-gotten
++ 	 * a reference to the dentry and change that, but
++ 	 * our work is done - we can leave the dentry
++ 	 * around with a zero refcount.
++ 	 */
++ 	smp_rmb();
++ 	d_flags = ACCESS_ONCE(dentry->d_flags);
++ 	d_flags &= DCACHE_REFERENCED | DCACHE_LRU_LIST | DCACHE_DISCONNECTED;
++ 
++ 	/* Nothing to do? Dropping the reference was all we needed? */
++ 	if (d_flags == (DCACHE_REFERENCED | DCACHE_LRU_LIST) && !d_unhashed(dentry))
++ 		return 1;
++ 
++ 	/*
++ 	 * Not the fast normal case? Get the lock. We've already decremented
++ 	 * the refcount, but we'll need to re-check the situation after
++ 	 * getting the lock.
++ 	 */
++ 	spin_lock(&dentry->d_lock);
++ 
++ 	/*
++ 	 * Did somebody else grab a reference to it in the meantime, and
++ 	 * we're no longer the last user after all? Alternatively, somebody
++ 	 * else could have killed it and marked it dead. Either way, we
++ 	 * don't need to do anything else.
++ 	 */
++ 	if (dentry->d_lockref.count) {
++ 		spin_unlock(&dentry->d_lock);
++ 		return 1;
++ 	}
++ 
++ 	/*
++ 	 * Re-get the reference we optimistically dropped. We hold the
++ 	 * lock, and we just tested that it was zero, so we can just
++ 	 * set it to 1.
++ 	 */
++ 	dentry->d_lockref.count = 1;
++ 	return 0;
++ }
++ 
++ 
+++>>>>>>> 47be61845c77 (fs/dcache.c: avoid soft-lockup in dput())
+  /* 
+   * This is dput
+   *
+@@@ -520,8 -769,18 +693,16 @@@ void dput(struct dentry *dentry
+  		return;
+  
+  repeat:
+++<<<<<<< HEAD
+ +	if (lockref_put_or_lock(&dentry->d_lockref))
+++=======
++ 	might_sleep();
++ 
++ 	rcu_read_lock();
++ 	if (likely(fast_dput(dentry))) {
++ 		rcu_read_unlock();
+++>>>>>>> 47be61845c77 (fs/dcache.c: avoid soft-lockup in dput())
+  		return;
+ -	}
+ -
+ -	/* Slow case: now with the dentry lock held */
+ -	rcu_read_unlock();
+ -
+ -	WARN_ON(d_in_lookup(dentry));
+  
+  	/* Unreachable? Get rid of it */
+  	if (unlikely(d_unhashed(dentry)))
+* Unmerged path fs/dcache.c
