@@ -59,7 +59,7 @@ struct set_adt_elem {
 /* Type structure */
 struct list_set {
 	size_t dsize;		/* element size */
-	size_t offset[IPSET_OFFSET_MAX]; /* Offsets to extensions */
+	size_t offset[IPSET_EXT_ID_MAX]; /* Offsets to extensions */
 	u32 size;		/* size of set list array */
 	u32 timeout;		/* timeout value */
 	struct timer_list gc;	/* garbage collection */
@@ -74,9 +74,9 @@ list_set_elem(const struct list_set *map, u32 id)
 }
 
 #define ext_timeout(e, m)	\
-(unsigned long *)((void *)(e) + (m)->offset[IPSET_OFFSET_TIMEOUT])
+(unsigned long *)((void *)(e) + (m)->offset[IPSET_EXT_ID_TIMEOUT])
 #define ext_counter(e, m)	\
-(struct ip_set_counter *)((void *)(e) + (m)->offset[IPSET_OFFSET_COUNTER])
+(struct ip_set_counter *)((void *)(e) + (m)->offset[IPSET_EXT_ID_COUNTER])
 
 static int
 list_set_ktest(struct ip_set *set, const struct sk_buff *skb,
@@ -671,9 +671,9 @@ list_set_create(struct net *net, struct ip_set *set, struct nlattr *tb[],
 			if (!map)
 				return -ENOMEM;
 			set->extensions |= IPSET_EXT_TIMEOUT;
-			map->offset[IPSET_OFFSET_TIMEOUT] =
+			map->offset[IPSET_EXT_ID_TIMEOUT] =
 				offsetof(struct setct_elem, timeout);
-			map->offset[IPSET_OFFSET_COUNTER] =
+			map->offset[IPSET_EXT_ID_COUNTER] =
 				offsetof(struct setct_elem, counter);
 			list_set_gc_init(set, list_set_gc);
 		} else {
@@ -681,7 +681,7 @@ list_set_create(struct net *net, struct ip_set *set, struct nlattr *tb[],
 					    sizeof(struct setc_elem), 0);
 			if (!map)
 				return -ENOMEM;
-			map->offset[IPSET_OFFSET_COUNTER] =
+			map->offset[IPSET_EXT_ID_COUNTER] =
 				offsetof(struct setc_elem, counter);
 		}
 	} else if (tb[IPSET_ATTR_TIMEOUT]) {
@@ -690,7 +690,7 @@ list_set_create(struct net *net, struct ip_set *set, struct nlattr *tb[],
 		if (!map)
 			return -ENOMEM;
 		set->extensions |= IPSET_EXT_TIMEOUT;
-		map->offset[IPSET_OFFSET_TIMEOUT] =
+		map->offset[IPSET_EXT_ID_TIMEOUT] =
 			offsetof(struct sett_elem, timeout);
 		list_set_gc_init(set, list_set_gc);
 	} else {
