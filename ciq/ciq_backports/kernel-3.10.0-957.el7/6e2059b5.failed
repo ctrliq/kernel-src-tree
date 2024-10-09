@@ -1,0 +1,186 @@
+ipv4/igmp: init group mode as INCLUDE when join source group
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Hangbin Liu <liuhangbin@gmail.com>
+commit 6e2059b53f9885f202b086d7b4ca10a98926e974
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/6e2059b5.failed
+
+Based on RFC3376 5.1
+   If no interface
+   state existed for that multicast address before the change (i.e., the
+   change consisted of creating a new per-interface record), or if no
+   state exists after the change (i.e., the change consisted of deleting
+   a per-interface record), then the "non-existent" state is considered
+   to have a filter mode of INCLUDE and an empty source list.
+
+Which means a new multicast group should start with state IN().
+
+Function ip_mc_join_group() works correctly for IGMP ASM(Any-Source Multicast)
+mode. It adds a group with state EX() and inits crcount to mc_qrv,
+so the kernel will send a TO_EX() report message after adding group.
+
+But for IGMPv3 SSM(Source-specific multicast) JOIN_SOURCE_GROUP mode, we
+split the group joining into two steps. First we join the group like ASM,
+i.e. via ip_mc_join_group(). So the state changes from IN() to EX().
+
+Then we add the source-specific address with INCLUDE mode. So the state
+changes from EX() to IN(A).
+
+Before the first step sends a group change record, we finished the second
+step. So we will only send the second change record. i.e. TO_IN(A).
+
+Regarding the RFC stands, we should actually send an ALLOW(A) message for
+SSM JOIN_SOURCE_GROUP as the state should mimic the 'IN() to IN(A)'
+transition.
+
+The issue was exposed by commit a052517a8ff65 ("net/multicast: should not
+send source list records when have filter mode change"). Before this change,
+we used to send both ALLOW(A) and TO_IN(A). After this change we only send
+TO_IN(A).
+
+Fix it by adding a new parameter to init group mode. Also add new wrapper
+functions so we don't need to change too much code.
+
+v1 -> v2:
+In my first version I only cleared the group change record. But this is not
+enough. Because when a new group join, it will init as EXCLUDE and trigger
+an filter mode change in ip/ip6_mc_add_src(), which will clear all source
+addresses' sf_crcount. This will prevent early joined address sending state
+change records if multi source addressed joined at the same time.
+
+In v2 patch, I fixed it by directly initializing the mode to INCLUDE for SSM
+JOIN_SOURCE_GROUP. I also split the original patch into two separated patches
+for IPv4 and IPv6.
+
+Fixes: a052517a8ff65 ("net/multicast: should not send source list records when have filter mode change")
+	Reviewed-by: Stefano Brivio <sbrivio@redhat.com>
+	Signed-off-by: Hangbin Liu <liuhangbin@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6e2059b53f9885f202b086d7b4ca10a98926e974)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/igmp.c
+diff --cc net/ipv4/igmp.c
+index e1c8403127c2,b3c899a630a0..000000000000
+--- a/net/ipv4/igmp.c
++++ b/net/ipv4/igmp.c
+@@@ -1121,7 -1200,6 +1121,10 @@@ static void igmpv3_del_delrec(struct in
+  	spin_lock_bh(&im->lock);
+  	if (pmc) {
+  		im->interface = pmc->interface;
+++<<<<<<< HEAD
+ +		im->crcount = in_dev->mr_qrv ?: sysctl_igmp_qrv;
+++=======
+++>>>>>>> 6e2059b53f98 (ipv4/igmp: init group mode as INCLUDE when join source group)
+  		im->sfmode = pmc->sfmode;
+  		if (pmc->sfmode == MCAST_INCLUDE) {
+  			im->tomb = pmc->tomb;
+@@@ -1206,9 -1289,12 +1211,9 @@@ static void igmp_group_dropped(struct i
+  #endif
+  }
+  
+- static void igmp_group_added(struct ip_mc_list *im)
++ static void igmp_group_added(struct ip_mc_list *im, unsigned int mode)
+  {
+  	struct in_device *in_dev = im->interface;
+ -#ifdef CONFIG_IP_MULTICAST
+ -	struct net *net = dev_net(in_dev->dev);
+ -#endif
+  
+  	if (im->loaded == 0) {
+  		im->loaded = 1;
+@@@ -1229,7 -1317,13 +1234,17 @@@
+  	}
+  	/* else, v3 */
+  
+++<<<<<<< HEAD
+ +	im->crcount = in_dev->mr_qrv ?: sysctl_igmp_qrv;
+++=======
++ 	/* Based on RFC3376 5.1, for newly added INCLUDE SSM, we should
++ 	 * not send filter-mode change record as the mode should be from
++ 	 * IN() to IN(A).
++ 	 */
++ 	if (mode == MCAST_EXCLUDE)
++ 		im->crcount = in_dev->mr_qrv ?: net->ipv4.sysctl_igmp_qrv;
++ 
+++>>>>>>> 6e2059b53f98 (ipv4/igmp: init group mode as INCLUDE when join source group)
+  	igmp_ifc_event(in_dev);
+  #endif
+  }
+@@@ -1243,10 -1388,12 +1258,9 @@@
+  /*
+   *	A socket has joined a multicast group on device dev.
+   */
+- 
+- void ip_mc_inc_group(struct in_device *in_dev, __be32 addr)
++ void __ip_mc_inc_group(struct in_device *in_dev, __be32 addr, unsigned int mode)
+  {
+  	struct ip_mc_list *im;
+ -#ifdef CONFIG_IP_MULTICAST
+ -	struct net *net = dev_net(in_dev->dev);
+ -#endif
+  
+  	ASSERT_RTNL();
+  
+@@@ -1267,13 -1414,13 +1281,19 @@@
+  	in_dev_hold(in_dev);
+  	im->multiaddr = addr;
+  	/* initial mode is (EX, empty) */
+++<<<<<<< HEAD
+ +	im->sfmode = MCAST_EXCLUDE;
+ +	im->sfcount[MCAST_EXCLUDE] = 1;
+ +	atomic_set(&im->refcnt, 1);
+++=======
++ 	im->sfmode = mode;
++ 	im->sfcount[mode] = 1;
++ 	refcount_set(&im->refcnt, 1);
+++>>>>>>> 6e2059b53f98 (ipv4/igmp: init group mode as INCLUDE when join source group)
+  	spin_lock_init(&im->lock);
+  #ifdef CONFIG_IP_MULTICAST
+ -	timer_setup(&im->timer, igmp_timer_expire, 0);
+ -	im->unsolicit_count = net->ipv4.sysctl_igmp_qrv;
+ +	setup_timer(&im->timer, &igmp_timer_expire, (unsigned long)im);
+ +	im->unsolicit_count = sysctl_igmp_qrv;
+  #endif
+  
+  	im->next_rcu = in_dev->mc_list;
+diff --git a/include/linux/igmp.h b/include/linux/igmp.h
+index 67f1579fbbb6..a7f09e2e1a12 100644
+--- a/include/linux/igmp.h
++++ b/include/linux/igmp.h
+@@ -111,6 +111,8 @@ struct ip_mc_list {
+ extern int ip_check_mc_rcu(struct in_device *dev, __be32 mc_addr, __be32 src_addr, u16 proto);
+ extern int igmp_rcv(struct sk_buff *);
+ extern int ip_mc_join_group(struct sock *sk, struct ip_mreqn *imr);
++extern int ip_mc_join_group_ssm(struct sock *sk, struct ip_mreqn *imr,
++				unsigned int mode);
+ extern int ip_mc_leave_group(struct sock *sk, struct ip_mreqn *imr);
+ extern void ip_mc_drop_socket(struct sock *sk);
+ extern int ip_mc_source(int add, int omode, struct sock *sk,
+* Unmerged path net/ipv4/igmp.c
+diff --git a/net/ipv4/ip_sockglue.c b/net/ipv4/ip_sockglue.c
+index ac07084c45ef..c2c4645d2f6d 100644
+--- a/net/ipv4/ip_sockglue.c
++++ b/net/ipv4/ip_sockglue.c
+@@ -877,7 +877,7 @@ static int do_ip_setsockopt(struct sock *sk, int level,
+ 			mreq.imr_multiaddr.s_addr = mreqs.imr_multiaddr;
+ 			mreq.imr_address.s_addr = mreqs.imr_interface;
+ 			mreq.imr_ifindex = 0;
+-			err = ip_mc_join_group(sk, &mreq);
++			err = ip_mc_join_group_ssm(sk, &mreq, MCAST_INCLUDE);
+ 			if (err && err != -EADDRINUSE)
+ 				break;
+ 			omode = MCAST_INCLUDE;
+@@ -954,7 +954,7 @@ static int do_ip_setsockopt(struct sock *sk, int level,
+ 			mreq.imr_multiaddr = psin->sin_addr;
+ 			mreq.imr_address.s_addr = 0;
+ 			mreq.imr_ifindex = greqs.gsr_interface;
+-			err = ip_mc_join_group(sk, &mreq);
++			err = ip_mc_join_group_ssm(sk, &mreq, MCAST_INCLUDE);
+ 			if (err && err != -EADDRINUSE)
+ 				break;
+ 			greqs.gsr_interface = mreq.imr_ifindex;
