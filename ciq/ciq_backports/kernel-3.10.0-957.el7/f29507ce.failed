@@ -1,0 +1,169 @@
+fscache: Fix reference overput in fscache_attach_object() error handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Kiran Kumar Modukuri <kiran.modukuri@gmail.com>
+commit f29507ce66701084c39aeb1b0ae71690cbff3554
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/f29507ce.failed
+
+When a cookie is allocated that causes fscache_object structs to be
+allocated, those objects are initialised with the cookie pointer, but
+aren't blessed with a ref on that cookie unless the attachment is
+successfully completed in fscache_attach_object().
+
+If attachment fails because the parent object was dying or there was a
+collision, fscache_attach_object() returns without incrementing the cookie
+counter - but upon failure of this function, the object is released which
+then puts the cookie, whether or not a ref was taken on the cookie.
+
+Fix this by taking a ref on the cookie when it is assigned in
+fscache_object_init(), even when we're creating a root object.
+
+
+Analysis from Kiran Kumar:
+
+This bug has been seen in 4.4.0-124-generic #148-Ubuntu kernel
+
+BugLink: https://bugs.launchpad.net/ubuntu/+source/linux/+bug/1776277
+
+fscache cookie ref count updated incorrectly during fscache object
+allocation resulting in following Oops.
+
+kernel BUG at /build/linux-Y09MKI/linux-4.4.0/fs/fscache/internal.h:321!
+kernel BUG at /build/linux-Y09MKI/linux-4.4.0/fs/fscache/cookie.c:639!
+
+[Cause]
+Two threads are trying to do operate on a cookie and two objects.
+
+(1) One thread tries to unmount the filesystem and in process goes over a
+    huge list of objects marking them dead and deleting the objects.
+    cookie->usage is also decremented in following path:
+
+      nfs_fscache_release_super_cookie
+       -> __fscache_relinquish_cookie
+        ->__fscache_cookie_put
+        ->BUG_ON(atomic_read(&cookie->usage) <= 0);
+
+(2) A second thread tries to lookup an object for reading data in following
+    path:
+
+    fscache_alloc_object
+    1) cachefiles_alloc_object
+        -> fscache_object_init
+           -> assign cookie, but usage not bumped.
+    2) fscache_attach_object -> fails in cant_attach_object because the
+         cookie's backing object or cookie's->parent object are going away
+    3) fscache_put_object
+        -> cachefiles_put_object
+          ->fscache_object_destroy
+            ->fscache_cookie_put
+               ->BUG_ON(atomic_read(&cookie->usage) <= 0);
+
+[NOTE from dhowells] It's unclear as to the circumstances in which (2) can
+take place, given that thread (1) is in nfs_kill_super(), however a
+conflicting NFS mount with slightly different parameters that creates a
+different superblock would do it.  A backtrace from Kiran seems to show
+that this is a possibility:
+
+    kernel BUG at/build/linux-Y09MKI/linux-4.4.0/fs/fscache/cookie.c:639!
+    ...
+    RIP: __fscache_cookie_put+0x3a/0x40 [fscache]
+    Call Trace:
+     __fscache_relinquish_cookie+0x87/0x120 [fscache]
+     nfs_fscache_release_super_cookie+0x2d/0xb0 [nfs]
+     nfs_kill_super+0x29/0x40 [nfs]
+     deactivate_locked_super+0x48/0x80
+     deactivate_super+0x5c/0x60
+     cleanup_mnt+0x3f/0x90
+     __cleanup_mnt+0x12/0x20
+     task_work_run+0x86/0xb0
+     exit_to_usermode_loop+0xc2/0xd0
+     syscall_return_slowpath+0x4e/0x60
+     int_ret_from_sys_call+0x25/0x9f
+
+[Fix] Bump up the cookie usage in fscache_object_init, when it is first
+being assigned a cookie atomically such that the cookie is added and bumped
+up if its refcount is not zero.  Remove the assignment in
+fscache_attach_object().
+
+[Testcase]
+I have run ~100 hours of NFS stress tests and not seen this bug recur.
+
+[Regression Potential]
+ - Limited to fscache/cachefiles.
+
+Fixes: ccc4fc3d11e9 ("FS-Cache: Implement the cookie management part of the netfs API")
+	Signed-off-by: Kiran Kumar Modukuri <kiran.modukuri@gmail.com>
+	Signed-off-by: David Howells <dhowells@redhat.com>
+(cherry picked from commit f29507ce66701084c39aeb1b0ae71690cbff3554)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/fscache/cookie.c
+diff --cc fs/fscache/cookie.c
+index aca5dfd4e343,83bfe04456b6..000000000000
+--- a/fs/fscache/cookie.c
++++ b/fs/fscache/cookie.c
+@@@ -396,9 -613,7 +399,13 @@@ static int fscache_attach_object(struc
+  		spin_unlock(&cache->object_list_lock);
+  	}
+  
+++<<<<<<< HEAD
+ +	/* attach to the cookie */
+ +	object->cookie = cookie;
+ +	atomic_inc(&cookie->usage);
+++=======
++ 	/* Attach to the cookie.  The object already has a ref on it. */
+++>>>>>>> f29507ce6670 (fscache: Fix reference overput in fscache_attach_object() error handling)
+  	hlist_add_head(&object->cookie_link, &cookie->backing_objects);
+  
+  	fscache_objlist_add(object);
+diff --git a/fs/cachefiles/bind.c b/fs/cachefiles/bind.c
+index fbb08e97438d..66e563174e4c 100644
+--- a/fs/cachefiles/bind.c
++++ b/fs/cachefiles/bind.c
+@@ -218,7 +218,8 @@ static int cachefiles_daemon_add_cache(struct cachefiles_cache *cache)
+ 			   "%s",
+ 			   fsdef->dentry->d_sb->s_id);
+ 
+-	fscache_object_init(&fsdef->fscache, NULL, &cache->cache);
++	fscache_object_init(&fsdef->fscache, &fscache_fsdef_index,
++			    &cache->cache);
+ 
+ 	ret = fscache_add_cache(&cache->cache, &fsdef->fscache, cache->tag);
+ 	if (ret < 0)
+diff --git a/fs/fscache/cache.c b/fs/fscache/cache.c
+index 56cce7fdd39e..a8fe6e63ca23 100644
+--- a/fs/fscache/cache.c
++++ b/fs/fscache/cache.c
+@@ -220,6 +220,7 @@ int fscache_add_cache(struct fscache_cache *cache,
+ {
+ 	struct fscache_cache_tag *tag;
+ 
++	ASSERTCMP(ifsdef->cookie, ==, &fscache_fsdef_index);
+ 	BUG_ON(!cache->ops);
+ 	BUG_ON(!ifsdef);
+ 
+@@ -248,7 +249,6 @@ int fscache_add_cache(struct fscache_cache *cache,
+ 	if (!cache->kobj)
+ 		goto error;
+ 
+-	ifsdef->cookie = &fscache_fsdef_index;
+ 	ifsdef->cache = cache;
+ 	cache->fsdef = ifsdef;
+ 
+* Unmerged path fs/fscache/cookie.c
+diff --git a/fs/fscache/object.c b/fs/fscache/object.c
+index 7a182c87f378..3e6bfdf3fe3f 100644
+--- a/fs/fscache/object.c
++++ b/fs/fscache/object.c
+@@ -318,6 +318,7 @@ void fscache_object_init(struct fscache_object *object,
+ 	object->store_limit_l = 0;
+ 	object->cache = cache;
+ 	object->cookie = cookie;
++	fscache_cookie_get(cookie, fscache_cookie_get_attach_object);
+ 	object->parent = NULL;
+ #ifdef CONFIG_FSCACHE_OBJECT_LIST
+ 	RB_CLEAR_NODE(&object->objlist_link);
