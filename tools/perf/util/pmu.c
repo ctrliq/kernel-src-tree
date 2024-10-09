@@ -1130,8 +1130,7 @@ static void wordwrap(char *s, int start, int max, int corr)
 			break;
 		s += wlen;
 		column += n;
-		while (isspace(*s))
-			s++;
+		s = ltrim(s);
 	}
 }
 
