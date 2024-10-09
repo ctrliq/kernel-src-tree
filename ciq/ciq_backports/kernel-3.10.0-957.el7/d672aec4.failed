@@ -1,0 +1,207 @@
+mlxsw: spectrum: Add ability to query KVDL allocation size
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Ido Schimmel <idosch@mellanox.com>
+commit d672aec45fd4a1e060109fbce6739ef91c3bd135
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/d672aec4.failed
+
+The current KVDL allocation API allows the user to specify the requested
+number of entries, but the user has no way of knowing how many entries
+were actually allocated.
+
+This works because existing users (e.g., router) request the exact
+number they end up using. With the introduction of large adjacency
+groups, this will change, as the router will have the ability to choose
+from several allocation sizes, where larger allocations provide higher
+accuracy with respect to requested weights and better resilience against
+nexthop failures.
+
+One option is to have the router try several allocations of descending
+size until one succeeds, but a better way is to simply allow it to query
+the actual allocation size and then size its request accordingly.
+
+	Signed-off-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d672aec45fd4a1e060109fbce6739ef91c3bd135)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_kvdl.c
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum_kvdl.c
+index 26c26cd30c3d,266b3af6513c..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_kvdl.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_kvdl.c
+@@@ -81,13 -156,144 +81,125 @@@ int mlxsw_sp_kvdl_alloc(struct mlxsw_s
+  
+  void mlxsw_sp_kvdl_free(struct mlxsw_sp *mlxsw_sp, int entry_index)
+  {
+++<<<<<<< HEAD
+ +	int type_entries;
+++=======
++ 	struct mlxsw_sp_kvdl_part *part;
++ 
++ 	part = mlxsw_sp_kvdl_index_part(mlxsw_sp->kvdl, entry_index);
++ 	if (IS_ERR(part))
++ 		return;
++ 	mlxsw_sp_kvdl_part_free(part, entry_index);
++ }
++ 
++ int mlxsw_sp_kvdl_alloc_size_query(struct mlxsw_sp *mlxsw_sp,
++ 				   unsigned int entry_count,
++ 				   unsigned int *p_alloc_size)
++ {
++ 	struct mlxsw_sp_kvdl_part *part;
++ 
++ 	part = mlxsw_sp_kvdl_alloc_size_part(mlxsw_sp->kvdl, entry_count);
++ 	if (IS_ERR(part))
++ 		return PTR_ERR(part);
++ 
++ 	*p_alloc_size = part->info->alloc_size;
++ 
++ 	return 0;
++ }
++ 
++ static const struct mlxsw_sp_kvdl_part_info kvdl_parts_info[] = {
++ 	{
++ 		.part_index	= 0,
++ 		.start_index	= MLXSW_SP_KVDL_SINGLE_BASE,
++ 		.end_index	= MLXSW_SP_KVDL_SINGLE_END,
++ 		.alloc_size	= 1,
++ 	},
++ 	{
++ 		.part_index	= 1,
++ 		.start_index	= MLXSW_SP_KVDL_CHUNKS_BASE,
++ 		.end_index	= MLXSW_SP_KVDL_CHUNKS_END,
++ 		.alloc_size	= MLXSW_SP_CHUNK_MAX,
++ 	},
++ };
++ 
++ static struct mlxsw_sp_kvdl_part *
++ mlxsw_sp_kvdl_part_find(struct mlxsw_sp *mlxsw_sp, unsigned int part_index)
++ {
++ 	struct mlxsw_sp_kvdl_part *part;
++ 
++ 	list_for_each_entry(part, &mlxsw_sp->kvdl->parts_list, list) {
++ 		if (part->info->part_index == part_index)
++ 			return part;
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ static int mlxsw_sp_kvdl_part_init(struct mlxsw_sp *mlxsw_sp,
++ 				   unsigned int part_index)
++ {
++ 	const struct mlxsw_sp_kvdl_part_info *info;
++ 	struct mlxsw_sp_kvdl_part *part;
++ 	unsigned int nr_entries;
++ 	size_t usage_size;
++ 
++ 	info = &kvdl_parts_info[part_index];
++ 
++ 	nr_entries = (info->end_index - info->start_index + 1) /
++ 		     info->alloc_size;
++ 	usage_size = BITS_TO_LONGS(nr_entries) * sizeof(unsigned long);
++ 	part = kzalloc(sizeof(*part) + usage_size, GFP_KERNEL);
++ 	if (!part)
++ 		return -ENOMEM;
++ 
++ 	part->info = info;
++ 	list_add(&part->list, &mlxsw_sp->kvdl->parts_list);
++ 
++ 	return 0;
++ }
++ 
++ static void mlxsw_sp_kvdl_part_fini(struct mlxsw_sp *mlxsw_sp,
++ 				    unsigned int part_index)
++ {
++ 	struct mlxsw_sp_kvdl_part *part;
++ 
++ 	part = mlxsw_sp_kvdl_part_find(mlxsw_sp, part_index);
++ 	if (!part)
++ 		return;
++ 
++ 	list_del(&part->list);
++ 	kfree(part);
++ }
++ 
++ static int mlxsw_sp_kvdl_parts_init(struct mlxsw_sp *mlxsw_sp)
++ {
++ 	int err, i;
++ 
++ 	INIT_LIST_HEAD(&mlxsw_sp->kvdl->parts_list);
++ 
++ 	for (i = 0; i < ARRAY_SIZE(kvdl_parts_info); i++) {
++ 		err = mlxsw_sp_kvdl_part_init(mlxsw_sp, i);
++ 		if (err)
++ 			goto err_kvdl_part_init;
++ 	}
++ 
++ 	return 0;
++ 
++ err_kvdl_part_init:
++ 	for (i--; i >= 0; i--)
++ 		mlxsw_sp_kvdl_part_fini(mlxsw_sp, i);
++ 	return err;
++ }
++ 
++ static void mlxsw_sp_kvdl_parts_fini(struct mlxsw_sp *mlxsw_sp)
++ {
+++>>>>>>> d672aec45fd4 (mlxsw: spectrum: Add ability to query KVDL allocation size)
+  	int i;
+  
+ -	for (i = ARRAY_SIZE(kvdl_parts_info) - 1; i >= 0; i--)
+ -		mlxsw_sp_kvdl_part_fini(mlxsw_sp, i);
+ -}
+ -
+ -int mlxsw_sp_kvdl_init(struct mlxsw_sp *mlxsw_sp)
+ -{
+ -	struct mlxsw_sp_kvdl *kvdl;
+ -	int err;
+ -
+ -	kvdl = kzalloc(sizeof(*mlxsw_sp->kvdl), GFP_KERNEL);
+ -	if (!kvdl)
+ -		return -ENOMEM;
+ -	mlxsw_sp->kvdl = kvdl;
+ -
+ -	err = mlxsw_sp_kvdl_parts_init(mlxsw_sp);
+ -	if (err)
+ -		goto err_kvdl_parts_init;
+ -
+ -	return 0;
+ -
+ -err_kvdl_parts_init:
+ -	kfree(mlxsw_sp->kvdl);
+ -	return err;
+ -}
+ -
+ -void mlxsw_sp_kvdl_fini(struct mlxsw_sp *mlxsw_sp)
+ -{
+ -	mlxsw_sp_kvdl_parts_fini(mlxsw_sp);
+ -	kfree(mlxsw_sp->kvdl);
+ +	if (entry_index < MLXSW_SP_KVDL_CHUNKS_BASE)
+ +		type_entries = 1;
+ +	else
+ +		type_entries = MLXSW_SP_CHUNK_MAX;
+ +	for (i = 0; i < type_entries; i++)
+ +		clear_bit(entry_index + i, mlxsw_sp->kvdl.usage);
+  }
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum.h b/drivers/net/ethernet/mellanox/mlxsw/spectrum.h
+index 000f84519b1c..ebddefb36900 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum.h
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum.h
+@@ -409,6 +409,9 @@ void mlxsw_sp_rif_destroy(struct mlxsw_sp_rif *rif);
+ int mlxsw_sp_kvdl_alloc(struct mlxsw_sp *mlxsw_sp, unsigned int entry_count,
+ 			u32 *p_entry_index);
+ void mlxsw_sp_kvdl_free(struct mlxsw_sp *mlxsw_sp, int entry_index);
++int mlxsw_sp_kvdl_alloc_size_query(struct mlxsw_sp *mlxsw_sp,
++				   unsigned int entry_count,
++				   unsigned int *p_alloc_size);
+ 
+ struct mlxsw_sp_acl_rule_info {
+ 	unsigned int priority;
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_kvdl.c
