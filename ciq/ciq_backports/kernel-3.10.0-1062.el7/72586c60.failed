@@ -1,0 +1,143 @@
+n_tty: Fix auditing support for cannonical mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Laura Abbott <labbott@fedoraproject.org>
+commit 72586c6061ab8c23ffd9f301ed19782a44ff5f04
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/72586c60.failed
+
+Commit 32f13521ca68bc624ff6effc77f308a52b038bf0
+("n_tty: Line copy to user buffer in canonical mode")
+changed cannonical mode copying to use copy_to_user
+but missed adding the call to the audit framework.
+Add in the appropriate functions to get audit support.
+
+Fixes: 32f13521ca68 ("n_tty: Line copy to user buffer in canonical mode")
+	Reported-by: Miloslav Trmač <mitr@redhat.com>
+	Signed-off-by: Laura Abbott <labbott@fedoraproject.org>
+	Reviewed-by: Peter Hurley <peter@hurleysoftware.com>
+	Cc: stable <stable@vger.kernel.org>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 72586c6061ab8c23ffd9f301ed19782a44ff5f04)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/tty/n_tty.c
+diff --cc drivers/tty/n_tty.c
+index 4181bb27f72e,396344cb011f..000000000000
+--- a/drivers/tty/n_tty.c
++++ b/drivers/tty/n_tty.c
+@@@ -121,54 -162,37 +121,65 @@@ static inline int tty_put_user(struct t
+  	return put_user(x, ptr);
+  }
+  
++ static inline int tty_copy_to_user(struct tty_struct *tty,
++ 					void __user *to,
++ 					const void *from,
++ 					unsigned long n)
++ {
++ 	struct n_tty_data *ldata = tty->disc_data;
++ 
++ 	tty_audit_add_data(tty, to, n, ldata->icanon);
++ 	return copy_to_user(to, from, n);
++ }
++ 
+  /**
+ - *	n_tty_kick_worker - start input worker (if required)
+ + *	n_tty_set_room	-	receive space
+   *	@tty: terminal
+   *
+ - *	Re-schedules the flip buffer work if it may have stopped
+ + *	Updates tty->receive_room to reflect the currently available space
+ + *	in the input buffer, and re-schedules the flip buffer work if space
+ + *	just became available.
+   *
+ - *	Caller holds exclusive termios_rwsem
+ - *	   or
+ - *	n_tty_read()/consumer path:
+ - *		holds non-exclusive termios_rwsem
+ + *	Locks: Concurrent update is protected with read_lock
+   */
+  
+ -static void n_tty_kick_worker(struct tty_struct *tty)
+ +static int set_room(struct tty_struct *tty)
+  {
+  	struct n_tty_data *ldata = tty->disc_data;
+ +	int left;
+ +	int old_left;
+ +	unsigned long flags;
+ +
+ +	raw_spin_lock_irqsave(&ldata->read_lock, flags);
+ +
+ +	if (I_PARMRK(tty)) {
+ +		/* Multiply read_cnt by 3, since each byte might take up to
+ +		 * three times as many spaces when PARMRK is set (depending on
+ +		 * its flags, e.g. parity error). */
+ +		left = N_TTY_BUF_SIZE - ldata->read_cnt * 3 - 1;
+ +	} else
+ +		left = N_TTY_BUF_SIZE - ldata->read_cnt - 1;
+ +
+ +	/*
+ +	 * If we are doing input canonicalization, and there are no
+ +	 * pending newlines, let characters through without limit, so
+ +	 * that erase characters will be handled.  Other excess
+ +	 * characters will be beeped.
+ +	 */
+ +	if (left <= 0)
+ +		left = ldata->icanon && !ldata->canon_data;
+ +	old_left = tty->receive_room;
+ +	tty->receive_room = left;
+  
+ -	/* Did the input worker stop? Restart it */
+ -	if (unlikely(ldata->no_room)) {
+ -		ldata->no_room = 0;
+ +	raw_spin_unlock_irqrestore(&ldata->read_lock, flags);
+  
+ +	return left && !old_left;
+ +}
+ +
+ +static void n_tty_set_room(struct tty_struct *tty)
+ +{
+ +	/* Did this open up the receive buffer? We may need to flip */
+ +	if (set_room(tty)) {
+  		WARN_RATELIMIT(tty->port->itty == NULL,
+  				"scheduling with invalid itty\n");
+  		/* see if ldisc has been killed - if so, this means that
+@@@ -1799,21 -2086,21 +1810,29 @@@ static int canon_copy_from_read_buf(str
+  	n += found;
+  	c = n;
+  
+ -	if (found && !ldata->push && read_buf(ldata, eol) == __DISABLED_CHAR) {
+ +	if (found && ldata->read_buf[eol] == __DISABLED_CHAR)
+  		n--;
+ -		eof_push = !n && ldata->read_tail != ldata->line_start;
+ -	}
+  
+ -	n_tty_trace("%s: eol:%zu found:%d n:%zu c:%zu size:%zu more:%zu\n",
+ +	n_tty_trace("%s: eol:%lu found:%d n:%zu c:%zu size:%zu more:%zu\n",
+  		    __func__, eol, found, n, c, size, more);
+  
+ +	raw_spin_unlock_irqrestore(&ldata->read_lock, flags);
+ +
+  	if (n > size) {
+++<<<<<<< HEAD
+ +		ret = copy_to_user(*b, &ldata->read_buf[tail], size);
+++=======
++ 		ret = tty_copy_to_user(tty, *b, read_buf_addr(ldata, tail), size);
+++>>>>>>> 72586c6061ab (n_tty: Fix auditing support for cannonical mode)
+  		if (ret)
+  			return -EFAULT;
+- 		ret = copy_to_user(*b + size, ldata->read_buf, n - size);
++ 		ret = tty_copy_to_user(tty, *b + size, ldata->read_buf, n - size);
+  	} else
+++<<<<<<< HEAD
+ +		ret = copy_to_user(*b, &ldata->read_buf[tail], n);
+++=======
++ 		ret = tty_copy_to_user(tty, *b, read_buf_addr(ldata, tail), n);
+++>>>>>>> 72586c6061ab (n_tty: Fix auditing support for cannonical mode)
+  
+  	if (ret)
+  		return -EFAULT;
+* Unmerged path drivers/tty/n_tty.c
