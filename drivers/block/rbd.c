@@ -6081,8 +6081,6 @@ static void rbd_dev_image_release(struct rbd_device *rbd_dev)
 	rbd_dev->image_format = 0;
 	kfree(rbd_dev->spec->image_id);
 	rbd_dev->spec->image_id = NULL;
-
-	rbd_dev_destroy(rbd_dev);
 }
 
 /*
@@ -6249,8 +6247,7 @@ static ssize_t do_rbd_add(struct bus_type *bus,
 		 * commit 1f3ef78861ac.
 		 */
 		rbd_unregister_watch(rbd_dev);
-		rbd_dev_image_release(rbd_dev);
-		goto out;
+		goto err_out_image_probe;
 	}
 
 	rc = count;
@@ -6258,6 +6255,8 @@ out:
 	module_put(THIS_MODULE);
 	return rc;
 
+err_out_image_probe:
+	rbd_dev_image_release(rbd_dev);
 err_out_rbd_dev:
 	rbd_dev_destroy(rbd_dev);
 err_out_client:
@@ -6317,6 +6316,7 @@ static void rbd_dev_remove_parent(struct rbd_device *rbd_dev)
 		}
 		rbd_assert(second);
 		rbd_dev_image_release(second);
+		rbd_dev_destroy(second);
 		first->parent = NULL;
 		first->parent_overlap = 0;
 
@@ -6399,7 +6399,7 @@ static ssize_t do_rbd_remove(struct bus_type *bus,
 	 */
 	rbd_dev_device_release(rbd_dev);
 	rbd_dev_image_release(rbd_dev);
-
+	rbd_dev_destroy(rbd_dev);
 	return count;
 }
 
