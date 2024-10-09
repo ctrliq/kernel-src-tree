@@ -1,0 +1,286 @@
+amd-xgbe: Add ethtool support to retrieve SFP module info
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Tom Lendacky <thomas.lendacky@amd.com>
+commit 53a1024abf3e4cb3310a54b08c48323649158c13
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/53a1024a.failed
+
+Add support to get SFP module information using ethtool.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 53a1024abf3e4cb3310a54b08c48323649158c13)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/amd/xgbe/xgbe-phy-v2.c
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-phy-v2.c
+index 230ec43c1d0e,141bb13dda26..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-phy-v2.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-phy-v2.c
+@@@ -1287,8 -1311,133 +1297,132 @@@ put
+  	xgbe_phy_put_comm_ownership(pdata);
+  }
+  
++ static int xgbe_phy_module_eeprom(struct xgbe_prv_data *pdata,
++ 				  struct ethtool_eeprom *eeprom, u8 *data)
++ {
++ 	struct xgbe_phy_data *phy_data = pdata->phy_data;
++ 	u8 eeprom_addr, eeprom_data[XGBE_SFP_EEPROM_MAX];
++ 	struct xgbe_sfp_eeprom *sfp_eeprom;
++ 	unsigned int i, j, rem;
++ 	int ret;
++ 
++ 	rem = eeprom->len;
++ 
++ 	if (!eeprom->len) {
++ 		ret = -EINVAL;
++ 		goto done;
++ 	}
++ 
++ 	if ((eeprom->offset + eeprom->len) > XGBE_SFP_EEPROM_MAX) {
++ 		ret = -EINVAL;
++ 		goto done;
++ 	}
++ 
++ 	if (phy_data->port_mode != XGBE_PORT_MODE_SFP) {
++ 		ret = -ENXIO;
++ 		goto done;
++ 	}
++ 
++ 	if (!netif_running(pdata->netdev)) {
++ 		ret = -EIO;
++ 		goto done;
++ 	}
++ 
++ 	if (phy_data->sfp_mod_absent) {
++ 		ret = -EIO;
++ 		goto done;
++ 	}
++ 
++ 	ret = xgbe_phy_get_comm_ownership(pdata);
++ 	if (ret) {
++ 		ret = -EIO;
++ 		goto done;
++ 	}
++ 
++ 	ret = xgbe_phy_sfp_get_mux(pdata);
++ 	if (ret) {
++ 		netdev_err(pdata->netdev, "I2C error setting SFP MUX\n");
++ 		ret = -EIO;
++ 		goto put_own;
++ 	}
++ 
++ 	/* Read the SFP serial ID eeprom */
++ 	eeprom_addr = 0;
++ 	ret = xgbe_phy_i2c_read(pdata, XGBE_SFP_SERIAL_ID_ADDRESS,
++ 				&eeprom_addr, sizeof(eeprom_addr),
++ 				eeprom_data, XGBE_SFP_EEPROM_BASE_LEN);
++ 	if (ret) {
++ 		netdev_err(pdata->netdev,
++ 			   "I2C error reading SFP EEPROM\n");
++ 		ret = -EIO;
++ 		goto put_mux;
++ 	}
++ 
++ 	sfp_eeprom = (struct xgbe_sfp_eeprom *)eeprom_data;
++ 
++ 	if (XGBE_SFP_DIAGS_SUPPORTED(sfp_eeprom)) {
++ 		/* Read the SFP diagnostic eeprom */
++ 		eeprom_addr = 0;
++ 		ret = xgbe_phy_i2c_read(pdata, XGBE_SFP_DIAG_INFO_ADDRESS,
++ 					&eeprom_addr, sizeof(eeprom_addr),
++ 					eeprom_data + XGBE_SFP_EEPROM_BASE_LEN,
++ 					XGBE_SFP_EEPROM_DIAG_LEN);
++ 		if (ret) {
++ 			netdev_err(pdata->netdev,
++ 				   "I2C error reading SFP DIAGS\n");
++ 			ret = -EIO;
++ 			goto put_mux;
++ 		}
++ 	}
++ 
++ 	for (i = 0, j = eeprom->offset; i < eeprom->len; i++, j++) {
++ 		if ((j >= XGBE_SFP_EEPROM_BASE_LEN) &&
++ 		    !XGBE_SFP_DIAGS_SUPPORTED(sfp_eeprom))
++ 			break;
++ 
++ 		data[i] = eeprom_data[j];
++ 		rem--;
++ 	}
++ 
++ put_mux:
++ 	xgbe_phy_sfp_put_mux(pdata);
++ 
++ put_own:
++ 	xgbe_phy_put_comm_ownership(pdata);
++ 
++ done:
++ 	eeprom->len -= rem;
++ 
++ 	return ret;
++ }
++ 
++ static int xgbe_phy_module_info(struct xgbe_prv_data *pdata,
++ 				struct ethtool_modinfo *modinfo)
++ {
++ 	struct xgbe_phy_data *phy_data = pdata->phy_data;
++ 
++ 	if (phy_data->port_mode != XGBE_PORT_MODE_SFP)
++ 		return -ENXIO;
++ 
++ 	if (!netif_running(pdata->netdev))
++ 		return -EIO;
++ 
++ 	if (phy_data->sfp_mod_absent)
++ 		return -EIO;
++ 
++ 	if (XGBE_SFP_DIAGS_SUPPORTED(&phy_data->sfp_eeprom)) {
++ 		modinfo->type = ETH_MODULE_SFF_8472;
++ 		modinfo->eeprom_len = ETH_MODULE_SFF_8472_LEN;
++ 	} else {
++ 		modinfo->type = ETH_MODULE_SFF_8079;
++ 		modinfo->eeprom_len = ETH_MODULE_SFF_8079_LEN;
++ 	}
++ 
++ 	return 0;
++ }
++ 
+  static void xgbe_phy_phydev_flowctrl(struct xgbe_prv_data *pdata)
+  {
+ -	struct ethtool_link_ksettings *lks = &pdata->phy.lks;
+  	struct xgbe_phy_data *phy_data = pdata->phy_data;
+  	u16 lcl_adv = 0, rmt_adv = 0;
+  	u8 fc;
+@@@ -3045,4 -3324,13 +3179,16 @@@ void xgbe_init_function_ptrs_phy_v2(str
+  	phy_impl->an_advertising	= xgbe_phy_an_advertising;
+  
+  	phy_impl->an_outcome		= xgbe_phy_an_outcome;
+++<<<<<<< HEAD
+++=======
++ 
++ 	phy_impl->an_pre		= xgbe_phy_an_pre;
++ 	phy_impl->an_post		= xgbe_phy_an_post;
++ 
++ 	phy_impl->kr_training_pre	= xgbe_phy_kr_training_pre;
++ 	phy_impl->kr_training_post	= xgbe_phy_kr_training_post;
++ 
++ 	phy_impl->module_info		= xgbe_phy_module_info;
++ 	phy_impl->module_eeprom		= xgbe_phy_module_eeprom;
+++>>>>>>> 53a1024abf3e (amd-xgbe: Add ethtool support to retrieve SFP module info)
+  }
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-ethtool.c b/drivers/net/ethernet/amd/xgbe/xgbe-ethtool.c
+index f80b186779b7..0ae3561bea9f 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-ethtool.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-ethtool.c
+@@ -614,6 +614,22 @@ static int xgbe_get_ts_info(struct net_device *netdev,
+ 	return 0;
+ }
+ 
++static int xgbe_get_module_info(struct net_device *netdev,
++				struct ethtool_modinfo *modinfo)
++{
++	struct xgbe_prv_data *pdata = netdev_priv(netdev);
++
++	return pdata->phy_if.module_info(pdata, modinfo);
++}
++
++static int xgbe_get_module_eeprom(struct net_device *netdev,
++				  struct ethtool_eeprom *eeprom, u8 *data)
++{
++	struct xgbe_prv_data *pdata = netdev_priv(netdev);
++
++	return pdata->phy_if.module_eeprom(pdata, eeprom, data);
++}
++
+ static const struct ethtool_ops xgbe_ethtool_ops = {
+ 	.get_drvinfo = xgbe_get_drvinfo,
+ 	.get_msglevel = xgbe_get_msglevel,
+@@ -634,6 +650,8 @@ static const struct ethtool_ops xgbe_ethtool_ops = {
+ 	.get_ts_info = xgbe_get_ts_info,
+ 	.get_link_ksettings = xgbe_get_link_ksettings,
+ 	.set_link_ksettings = xgbe_set_link_ksettings,
++	.get_module_info = xgbe_get_module_info,
++	.get_module_eeprom = xgbe_get_module_eeprom,
+ };
+ 
+ const struct ethtool_ops *xgbe_get_ethtool_ops(void)
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-mdio.c b/drivers/net/ethernet/amd/xgbe/xgbe-mdio.c
+index cdb2d52ec227..d640943b8f89 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-mdio.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-mdio.c
+@@ -126,6 +126,24 @@
+ #include "xgbe.h"
+ #include "xgbe-common.h"
+ 
++static int xgbe_phy_module_eeprom(struct xgbe_prv_data *pdata,
++				  struct ethtool_eeprom *eeprom, u8 *data)
++{
++	if (!pdata->phy_if.phy_impl.module_eeprom)
++		return -ENXIO;
++
++	return pdata->phy_if.phy_impl.module_eeprom(pdata, eeprom, data);
++}
++
++static int xgbe_phy_module_info(struct xgbe_prv_data *pdata,
++				struct ethtool_modinfo *modinfo)
++{
++	if (!pdata->phy_if.phy_impl.module_info)
++		return -ENXIO;
++
++	return pdata->phy_if.phy_impl.module_info(pdata, modinfo);
++}
++
+ static void xgbe_an37_clear_interrupts(struct xgbe_prv_data *pdata)
+ {
+ 	int reg;
+@@ -1620,4 +1638,7 @@ void xgbe_init_function_ptrs_phy(struct xgbe_phy_if *phy_if)
+ 	phy_if->phy_valid_speed = xgbe_phy_valid_speed;
+ 
+ 	phy_if->an_isr          = xgbe_an_combined_isr;
++
++	phy_if->module_info     = xgbe_phy_module_info;
++	phy_if->module_eeprom   = xgbe_phy_module_eeprom;
+ }
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-phy-v2.c
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe.h b/drivers/net/ethernet/amd/xgbe/xgbe.h
+index 8ee4166e96ad..845ce98951bd 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe.h
++++ b/drivers/net/ethernet/amd/xgbe/xgbe.h
+@@ -781,6 +781,7 @@ struct xgbe_hw_if {
+  *   Optional routines:
+  *     an_pre, an_post
+  *     kr_training_pre, kr_training_post
++ *     module_info, module_eeprom
+  */
+ struct xgbe_phy_impl_if {
+ 	/* Perform Setup/teardown actions */
+@@ -828,6 +829,12 @@ struct xgbe_phy_impl_if {
+ 	/* Pre/Post KR training enablement support */
+ 	void (*kr_training_pre)(struct xgbe_prv_data *);
+ 	void (*kr_training_post)(struct xgbe_prv_data *);
++
++	/* SFP module related info */
++	int (*module_info)(struct xgbe_prv_data *pdata,
++			   struct ethtool_modinfo *modinfo);
++	int (*module_eeprom)(struct xgbe_prv_data *pdata,
++			     struct ethtool_eeprom *eeprom, u8 *data);
+ };
+ 
+ struct xgbe_phy_if {
+@@ -850,6 +857,12 @@ struct xgbe_phy_if {
+ 	/* For single interrupt support */
+ 	irqreturn_t (*an_isr)(struct xgbe_prv_data *);
+ 
++	/* For ethtool PHY support */
++	int (*module_info)(struct xgbe_prv_data *pdata,
++			   struct ethtool_modinfo *modinfo);
++	int (*module_eeprom)(struct xgbe_prv_data *pdata,
++			     struct ethtool_eeprom *eeprom, u8 *data);
++
+ 	/* PHY implementation specific services */
+ 	struct xgbe_phy_impl_if phy_impl;
+ };
