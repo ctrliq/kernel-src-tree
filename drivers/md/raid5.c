@@ -4002,10 +4002,15 @@ static void handle_parity_checks5(struct r5conf *conf, struct stripe_head *sh,
 			set_bit(STRIPE_INSYNC, &sh->state);
 		else {
 			atomic64_add(STRIPE_SECTORS, &conf->mddev->resync_mismatches);
-			if (test_bit(MD_RECOVERY_CHECK, &conf->mddev->recovery))
+			if (test_bit(MD_RECOVERY_CHECK, &conf->mddev->recovery)) {
 				/* don't try to repair!! */
 				set_bit(STRIPE_INSYNC, &sh->state);
-			else {
+				pr_warn_ratelimited("%s: mismatch sector in range "
+						    "%llu-%llu\n", mdname(conf->mddev),
+						    (unsigned long long) sh->sector,
+						    (unsigned long long) sh->sector +
+						    STRIPE_SECTORS);
+			} else {
 				sh->check_state = check_state_compute_run;
 				set_bit(STRIPE_COMPUTE_RUN, &sh->state);
 				set_bit(STRIPE_OP_COMPUTE_BLK, &s->ops_request);
@@ -4154,10 +4159,15 @@ static void handle_parity_checks6(struct r5conf *conf, struct stripe_head *sh,
 			}
 		} else {
 			atomic64_add(STRIPE_SECTORS, &conf->mddev->resync_mismatches);
-			if (test_bit(MD_RECOVERY_CHECK, &conf->mddev->recovery))
+			if (test_bit(MD_RECOVERY_CHECK, &conf->mddev->recovery)) {
 				/* don't try to repair!! */
 				set_bit(STRIPE_INSYNC, &sh->state);
-			else {
+				pr_warn_ratelimited("%s: mismatch sector in range "
+						    "%llu-%llu\n", mdname(conf->mddev),
+						    (unsigned long long) sh->sector,
+						    (unsigned long long) sh->sector +
+						    STRIPE_SECTORS);
+			} else {
 				int *target = &sh->ops.target;
 
 				sh->ops.target = -1;
