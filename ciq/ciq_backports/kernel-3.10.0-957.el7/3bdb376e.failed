@@ -1,0 +1,600 @@
+cxgb4: introduce SMT ops to prepare for SMAC rewrite support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Kumar Sanghvi <kumaras@chelsio.com>
+commit 3bdb376e6944134d0f4d6d65497054a54ef273c9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/3bdb376e.failed
+
+Introduce SMT operations for allocating/removing entries from
+SMAC table. Make TCAM filters use the SMT ops whenever SMAC rewrite
+is required.
+
+	Signed-off-by: Kumar Sanghvi <kumaras@chelsio.com>
+	Signed-off-by: Rahul Lakkireddy <rahul.lakkireddy@chelsio.com>
+	Signed-off-by: Ganesh Goudar <ganeshgr@chelsio.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3bdb376e6944134d0f4d6d65497054a54ef273c9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4_filter.c
+diff --cc drivers/net/ethernet/chelsio/cxgb4/cxgb4_filter.c
+index b23367ec5c36,a8084be5e13b..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_filter.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_filter.c
+@@@ -332,8 -334,22 +334,27 @@@ int set_filter_wr(struct adapter *adapt
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	fwr = (struct fw_filter_wr *)__skb_put(skb, sizeof(*fwr));
+ +	memset(fwr, 0, sizeof(*fwr));
+++=======
++ 	/* If the new filter requires loopback Source MAC rewriting then
++ 	 * we need to allocate a SMT entry for the filter.
++ 	 */
++ 	if (f->fs.newsmac) {
++ 		f->smt = cxgb4_smt_alloc_switching(f->dev, f->fs.smac);
++ 		if (!f->smt) {
++ 			if (f->l2t) {
++ 				cxgb4_l2t_release(f->l2t);
++ 				f->l2t = NULL;
++ 			}
++ 			kfree_skb(skb);
++ 			return -ENOMEM;
++ 		}
++ 	}
++ 
++ 	fwr = __skb_put_zero(skb, sizeof(*fwr));
+++>>>>>>> 3bdb376e6944 (cxgb4: introduce SMT ops to prepare for SMAC rewrite support)
+  
+  	/* It would be nice to put most of the following in t4_hw.c but most
+  	 * of the work is translating the cxgbtool ch_filter_specification
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/Makefile b/drivers/net/ethernet/chelsio/cxgb4/Makefile
+index 24aa850be3d0..9da4b7ceaac1 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/Makefile
++++ b/drivers/net/ethernet/chelsio/cxgb4/Makefile
+@@ -4,7 +4,7 @@
+ 
+ obj-$(CONFIG_CHELSIO_T4) += cxgb4.o
+ 
+-cxgb4-objs := cxgb4_main.o l2t.o t4_hw.o sge.o clip_tbl.o cxgb4_ethtool.o \
++cxgb4-objs := cxgb4_main.o l2t.o smt.o t4_hw.o sge.o clip_tbl.o cxgb4_ethtool.o \
+ 	      cxgb4_uld.o sched.o cxgb4_filter.o cxgb4_tc_u32.o \
+ 	      cxgb4_ptp.o cxgb4_tc_flower.o
+ cxgb4-$(CONFIG_CHELSIO_T4_DCB) +=  cxgb4_dcb.o
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+index 03fd7bd4f4f0..11cb03a4a1a1 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+@@ -851,6 +851,7 @@ struct adapter {
+ 	unsigned int clipt_start;
+ 	unsigned int clipt_end;
+ 	struct clip_tbl *clipt;
++	struct smt_data *smt;
+ 	struct cxgb4_uld_info *uld;
+ 	void *uld_handle[CXGB4_ULD_MAX];
+ 	unsigned int num_uld;
+@@ -1088,9 +1089,9 @@ struct filter_entry {
+ 	u32 locked:1;           /* filter is administratively locked */
+ 
+ 	u32 pending:1;          /* filter action is pending firmware reply */
+-	u32 smtidx:8;           /* Source MAC Table index for smac */
+ 	struct filter_ctx *ctx; /* Caller's completion hook */
+ 	struct l2t_entry *l2t;  /* Layer Two Table entry for dmac */
++	struct smt_entry *smt;  /* Source Mac Table entry for smac */
+ 	struct net_device *dev; /* Associated net device */
+ 	u32 tid;                /* This will store the actual tid */
+ 
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4_filter.c
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+index 3ad5c4c50f29..700deeb9c4a8 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+@@ -78,6 +78,7 @@
+ #include "cxgb4_debugfs.h"
+ #include "clip_tbl.h"
+ #include "l2t.h"
++#include "smt.h"
+ #include "sched.h"
+ #include "cxgb4_tc_u32.h"
+ #include "cxgb4_tc_flower.h"
+@@ -563,6 +564,10 @@ static int fwevtq_handler(struct sge_rspq *q, const __be64 *rsp,
+ 		const struct cpl_l2t_write_rpl *p = (void *)rsp;
+ 
+ 		do_l2t_write_rpl(q->adap, p);
++	} else if (opcode == CPL_SMT_WRITE_RPL) {
++		const struct cpl_smt_write_rpl *p = (void *)rsp;
++
++		do_smt_write_rpl(q->adap, p);
+ 	} else if (opcode == CPL_SET_TCB_RPL) {
+ 		const struct cpl_set_tcb_rpl *p = (void *)rsp;
+ 
+@@ -4636,6 +4641,7 @@ static void free_some_resources(struct adapter *adapter)
+ {
+ 	unsigned int i;
+ 
++	kvfree(adapter->smt);
+ 	kvfree(adapter->l2t);
+ 	t4_cleanup_sched(adapter);
+ 	kvfree(adapter->tids.tid_tab);
+@@ -5056,6 +5062,12 @@ static int init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 	 */
+ 	cfg_queues(adapter);
+ 
++	adapter->smt = t4_init_smt();
++	if (!adapter->smt) {
++		/* We tolerate a lack of SMT, giving up some functionality */
++		dev_warn(&pdev->dev, "could not allocate SMT, continuing\n");
++	}
++
+ 	adapter->l2t = t4_init_l2t(adapter->l2t_start, adapter->l2t_end);
+ 	if (!adapter->l2t) {
+ 		/* We tolerate a lack of L2T, giving up some functionality */
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/smt.c b/drivers/net/ethernet/chelsio/cxgb4/smt.c
+new file mode 100644
+index 000000000000..7b2207a2a130
+--- /dev/null
++++ b/drivers/net/ethernet/chelsio/cxgb4/smt.c
+@@ -0,0 +1,247 @@
++/*
++ * This file is part of the Chelsio T4/T5/T6 Ethernet driver for Linux.
++ *
++ * Copyright (c) 2017 Chelsio Communications, Inc. All rights reserved.
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the
++ * OpenIB.org BSD license below:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      - Redistributions of source code must retain the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer.
++ *
++ *      - Redistributions in binary form must reproduce the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer in the documentation and/or other materials
++ *        provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#include "cxgb4.h"
++#include "smt.h"
++#include "t4_msg.h"
++#include "t4fw_api.h"
++#include "t4_regs.h"
++#include "t4_values.h"
++
++struct smt_data *t4_init_smt(void)
++{
++	unsigned int smt_size;
++	struct smt_data *s;
++	int i;
++
++	smt_size = SMT_SIZE;
++
++	s = kvzalloc(sizeof(*s) + smt_size * sizeof(struct smt_entry),
++		     GFP_KERNEL);
++	if (!s)
++		return NULL;
++	s->smt_size = smt_size;
++	rwlock_init(&s->lock);
++	for (i = 0; i < s->smt_size; ++i) {
++		s->smtab[i].idx = i;
++		s->smtab[i].state = SMT_STATE_UNUSED;
++		memset(&s->smtab[i].src_mac, 0, ETH_ALEN);
++		spin_lock_init(&s->smtab[i].lock);
++		atomic_set(&s->smtab[i].refcnt, 0);
++	}
++	return s;
++}
++
++static struct smt_entry *find_or_alloc_smte(struct smt_data *s, u8 *smac)
++{
++	struct smt_entry *first_free = NULL;
++	struct smt_entry *e, *end;
++
++	for (e = &s->smtab[0], end = &s->smtab[s->smt_size]; e != end; ++e) {
++		if (atomic_read(&e->refcnt) == 0) {
++			if (!first_free)
++				first_free = e;
++		} else {
++			if (e->state == SMT_STATE_SWITCHING) {
++				/* This entry is actually in use. See if we can
++				 * re-use it ?
++				 */
++				if (memcmp(e->src_mac, smac, ETH_ALEN) == 0)
++					goto found_reuse;
++			}
++		}
++	}
++
++	if (first_free) {
++		e = first_free;
++		goto found;
++	}
++	return NULL;
++
++found:
++	e->state = SMT_STATE_UNUSED;
++
++found_reuse:
++	return e;
++}
++
++static void t4_smte_free(struct smt_entry *e)
++{
++	spin_lock_bh(&e->lock);
++	if (atomic_read(&e->refcnt) == 0) {  /* hasn't been recycled */
++		e->state = SMT_STATE_UNUSED;
++	}
++	spin_unlock_bh(&e->lock);
++}
++
++/**
++ * @e: smt entry to release
++ *
++ * Releases ref count and frees up an smt entry from SMT table
++ */
++void cxgb4_smt_release(struct smt_entry *e)
++{
++	if (atomic_dec_and_test(&e->refcnt))
++		t4_smte_free(e);
++}
++EXPORT_SYMBOL(cxgb4_smt_release);
++
++void do_smt_write_rpl(struct adapter *adap, const struct cpl_smt_write_rpl *rpl)
++{
++	unsigned int smtidx = TID_TID_G(GET_TID(rpl));
++	struct smt_data *s = adap->smt;
++
++	if (unlikely(rpl->status != CPL_ERR_NONE)) {
++		struct smt_entry *e = &s->smtab[smtidx];
++
++		dev_err(adap->pdev_dev,
++			"Unexpected SMT_WRITE_RPL status %u for entry %u\n",
++			rpl->status, smtidx);
++		spin_lock(&e->lock);
++		e->state = SMT_STATE_ERROR;
++		spin_unlock(&e->lock);
++		return;
++	}
++}
++
++static int write_smt_entry(struct adapter *adapter, struct smt_entry *e)
++{
++	struct cpl_t6_smt_write_req *t6req;
++	struct smt_data *s = adapter->smt;
++	struct cpl_smt_write_req *req;
++	struct sk_buff *skb;
++	int size;
++	u8 row;
++
++	if (CHELSIO_CHIP_VERSION(adapter->params.chip) <= CHELSIO_T5) {
++		size = sizeof(*req);
++		skb = alloc_skb(size, GFP_ATOMIC);
++		if (!skb)
++			return -ENOMEM;
++		/* Source MAC Table (SMT) contains 256 SMAC entries
++		 * organized in 128 rows of 2 entries each.
++		 */
++		req = (struct cpl_smt_write_req *)__skb_put(skb, size);
++		INIT_TP_WR(req, 0);
++
++		/* Each row contains an SMAC pair.
++		 * LSB selects the SMAC entry within a row
++		 */
++		row = (e->idx >> 1);
++		if (e->idx & 1) {
++			req->pfvf1 = 0x0;
++			memcpy(req->src_mac1, e->src_mac, ETH_ALEN);
++
++			/* fill pfvf0/src_mac0 with entry
++			 * at prev index from smt-tab.
++			 */
++			req->pfvf0 = 0x0;
++			memcpy(req->src_mac0, s->smtab[e->idx - 1].src_mac,
++			       ETH_ALEN);
++		} else {
++			req->pfvf0 = 0x0;
++			memcpy(req->src_mac0, e->src_mac, ETH_ALEN);
++
++			/* fill pfvf1/src_mac1 with entry
++			 * at next index from smt-tab
++			 */
++			req->pfvf1 = 0x0;
++			memcpy(req->src_mac1, s->smtab[e->idx + 1].src_mac,
++			       ETH_ALEN);
++		}
++	} else {
++		size = sizeof(*t6req);
++		skb = alloc_skb(size, GFP_ATOMIC);
++		if (!skb)
++			return -ENOMEM;
++		/* Source MAC Table (SMT) contains 256 SMAC entries */
++		t6req = (struct cpl_t6_smt_write_req *)__skb_put(skb, size);
++		INIT_TP_WR(t6req, 0);
++		req = (struct cpl_smt_write_req *)t6req;
++
++		/* fill pfvf0/src_mac0 from smt-tab */
++		req->pfvf0 = 0x0;
++		memcpy(req->src_mac0, s->smtab[e->idx].src_mac, ETH_ALEN);
++		row = e->idx;
++	}
++
++	OPCODE_TID(req) =
++		htonl(MK_OPCODE_TID(CPL_SMT_WRITE_REQ, e->idx |
++				    TID_QID_V(adapter->sge.fw_evtq.abs_id)));
++	req->params = htonl(SMTW_NORPL_V(0) |
++			    SMTW_IDX_V(row) |
++			    SMTW_OVLAN_IDX_V(0));
++	t4_mgmt_tx(adapter, skb);
++	return 0;
++}
++
++static struct smt_entry *t4_smt_alloc_switching(struct adapter *adap, u16 pfvf,
++						u8 *smac)
++{
++	struct smt_data *s = adap->smt;
++	struct smt_entry *e;
++
++	write_lock_bh(&s->lock);
++	e = find_or_alloc_smte(s, smac);
++	if (e) {
++		spin_lock(&e->lock);
++		if (!atomic_read(&e->refcnt)) {
++			atomic_set(&e->refcnt, 1);
++			e->state = SMT_STATE_SWITCHING;
++			e->pfvf = pfvf;
++			memcpy(e->src_mac, smac, ETH_ALEN);
++			write_smt_entry(adap, e);
++		} else {
++			atomic_inc(&e->refcnt);
++		}
++		spin_unlock(&e->lock);
++	}
++	write_unlock_bh(&s->lock);
++	return e;
++}
++
++/**
++ * @dev: net_device pointer
++ * @smac: MAC address to add to SMT
++ * Returns pointer to the SMT entry created
++ *
++ * Allocates an SMT entry to be used by switching rule of a filter.
++ */
++struct smt_entry *cxgb4_smt_alloc_switching(struct net_device *dev, u8 *smac)
++{
++	struct adapter *adap = netdev2adap(dev);
++
++	return t4_smt_alloc_switching(adap, 0x0, smac);
++}
++EXPORT_SYMBOL(cxgb4_smt_alloc_switching);
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/smt.h b/drivers/net/ethernet/chelsio/cxgb4/smt.h
+new file mode 100644
+index 000000000000..d6c2cc271398
+--- /dev/null
++++ b/drivers/net/ethernet/chelsio/cxgb4/smt.h
+@@ -0,0 +1,76 @@
++/*
++ * This file is part of the Chelsio T4/T5/T6 Ethernet driver for Linux.
++ *
++ * Copyright (c) 2017 Chelsio Communications, Inc. All rights reserved.
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the
++ * OpenIB.org BSD license below:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      - Redistributions of source code must retain the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer.
++ *
++ *      - Redistributions in binary form must reproduce the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer in the documentation and/or other materials
++ *        provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#ifndef __CXGB4_SMT_H
++#define __CXGB4_SMT_H
++
++#include <linux/spinlock.h>
++#include <linux/if_ether.h>
++#include <linux/atomic.h>
++
++struct adapter;
++struct cpl_smt_write_rpl;
++
++/* SMT related handling. Heavily adapted based on l2t ops in l2t.h/l2t.c
++ */
++enum {
++	SMT_STATE_SWITCHING,
++	SMT_STATE_UNUSED,
++	SMT_STATE_ERROR
++};
++
++enum {
++	SMT_SIZE = 256
++};
++
++struct smt_entry {
++	u16 state;
++	u16 idx;
++	u16 pfvf;
++	u8 src_mac[ETH_ALEN];
++	atomic_t refcnt;
++	spinlock_t lock;	/* protect smt entry add,removal */
++};
++
++struct smt_data {
++	unsigned int smt_size;
++	rwlock_t lock;
++	struct smt_entry smtab[0];
++};
++
++struct smt_data *t4_init_smt(void);
++struct smt_entry *cxgb4_smt_alloc_switching(struct net_device *dev, u8 *smac);
++void cxgb4_smt_release(struct smt_entry *e);
++void do_smt_write_rpl(struct adapter *p, const struct cpl_smt_write_rpl *rpl);
++#endif /* __CXGB4_SMT_H */
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/t4_msg.h b/drivers/net/ethernet/chelsio/cxgb4/t4_msg.h
+index 88a8d242cb4a..e461008bb04d 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/t4_msg.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/t4_msg.h
+@@ -50,6 +50,7 @@ enum {
+ 	CPL_RX_DATA_ACK       = 0xD,
+ 	CPL_TX_PKT            = 0xE,
+ 	CPL_L2T_WRITE_REQ     = 0x12,
++	CPL_SMT_WRITE_REQ     = 0x14,
+ 	CPL_TID_RELEASE       = 0x1A,
+ 	CPL_TX_DATA_ISO	      = 0x1F,
+ 
+@@ -60,6 +61,7 @@ enum {
+ 	CPL_PEER_CLOSE        = 0x26,
+ 	CPL_ABORT_REQ_RSS     = 0x2B,
+ 	CPL_ABORT_RPL_RSS     = 0x2D,
++	CPL_SMT_WRITE_RPL     = 0x2E,
+ 
+ 	CPL_RX_PHYS_ADDR      = 0x30,
+ 	CPL_CLOSE_CON_RPL     = 0x32,
+@@ -681,8 +683,8 @@ struct cpl_set_tcb_field {
+ };
+ 
+ /* cpl_set_tcb_field.word_cookie fields */
+-#define TCB_WORD_S    0
+-#define TCB_WORD(x)   ((x) << TCB_WORD_S)
++#define TCB_WORD_S	0
++#define TCB_WORD_V(x)	((x) << TCB_WORD_S)
+ 
+ #define TCB_COOKIE_S    5
+ #define TCB_COOKIE_M    0x7
+@@ -1249,6 +1251,44 @@ struct cpl_l2t_write_rpl {
+ 	u8 rsvd[3];
+ };
+ 
++struct cpl_smt_write_req {
++	WR_HDR;
++	union opcode_tid ot;
++	__be32 params;
++	__be16 pfvf1;
++	u8 src_mac1[6];
++	__be16 pfvf0;
++	u8 src_mac0[6];
++};
++
++struct cpl_t6_smt_write_req {
++	WR_HDR;
++	union opcode_tid ot;
++	__be32 params;
++	__be64 tag;
++	__be16 pfvf0;
++	u8 src_mac0[6];
++	__be32 local_ip;
++	__be32 rsvd;
++};
++
++struct cpl_smt_write_rpl {
++	union opcode_tid ot;
++	u8 status;
++	u8 rsvd[3];
++};
++
++/* cpl_smt_{read,write}_req.params fields */
++#define SMTW_OVLAN_IDX_S	16
++#define SMTW_OVLAN_IDX_V(x)	((x) << SMTW_OVLAN_IDX_S)
++
++#define SMTW_IDX_S	20
++#define SMTW_IDX_V(x)	((x) << SMTW_IDX_S)
++
++#define SMTW_NORPL_S	31
++#define SMTW_NORPL_V(x)	((x) << SMTW_NORPL_S)
++#define SMTW_NORPL_F	SMTW_NORPL_V(1U)
++
+ struct cpl_rdma_terminate {
+ 	union opcode_tid ot;
+ 	__be16 rsvd;
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/t4_tcb.h b/drivers/net/ethernet/chelsio/cxgb4/t4_tcb.h
+new file mode 100644
+index 000000000000..c1c76663034d
+--- /dev/null
++++ b/drivers/net/ethernet/chelsio/cxgb4/t4_tcb.h
+@@ -0,0 +1,47 @@
++/*
++ * This file is part of the Chelsio T4/T5/T6 Ethernet driver for Linux.
++ *
++ * Copyright (c) 2017 Chelsio Communications, Inc. All rights reserved.
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the
++ * OpenIB.org BSD license below:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      - Redistributions of source code must retain the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer.
++ *
++ *      - Redistributions in binary form must reproduce the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer in the documentation and/or other materials
++ *        provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#ifndef __T4_TCB_H
++#define __T4_TCB_H
++
++#define TCB_SMAC_SEL_W		0
++#define TCB_SMAC_SEL_S		24
++#define TCB_SMAC_SEL_M		0xffULL
++#define TCB_SMAC_SEL_V(x)	((x) << TCB_SMAC_SEL_S)
++
++#define TCB_T_FLAGS_W		1
++
++#define TF_CCTRL_CWR_S		61
++
++#endif /* __T4_TCB_H */
