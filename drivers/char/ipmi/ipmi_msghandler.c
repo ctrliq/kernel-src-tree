@@ -2856,7 +2856,7 @@ static void ipmi_bmc_unregister(ipmi_smi_t intf)
 static int ipmi_bmc_register(ipmi_smi_t intf, int ifnum)
 {
 	int               rv;
-	struct bmc_device *bmc = intf->bmc;
+	struct bmc_device *bmc;
 	struct bmc_device *old_bmc;
 
 	/*
