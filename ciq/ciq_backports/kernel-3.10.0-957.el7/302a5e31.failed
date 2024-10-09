@@ -1,0 +1,133 @@
+dax: Inline dax_pmd_insert_mapping() into the callsite
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jan Kara <jack@suse.cz>
+commit 302a5e312b3a106fec49ba08da3f6545c9b7ee18
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/302a5e31.failed
+
+dax_pmd_insert_mapping() has only one callsite and we will need to
+further fine tune what it does for synchronous faults. Just inline it
+into the callsite so that we don't have to pass awkward bools around.
+
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 302a5e312b3a106fec49ba08da3f6545c9b7ee18)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+diff --cc fs/dax.c
+index 1e11e516c09f,675fab8ec41f..000000000000
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@@ -1322,63 -1240,12 +1322,66 @@@ static int dax_iomap_pte_fault(struct v
+   * more often than one might expect in the below functions.
+   */
+  #define PG_PMD_COLOUR	((PMD_SIZE >> PAGE_SHIFT) - 1)
+++<<<<<<< HEAD
+ +
+ +static int dax_pmd_insert_mapping(struct vm_fault *vmf, struct iomap *iomap,
+ +		loff_t pos, void **entryp)
+ +{
+ +	unsigned long address = (unsigned long)vmf->virtual_address;
+ +	struct address_space *mapping = vmf->vma->vm_file->f_mapping;
+ +	const sector_t sector = dax_iomap_sector(iomap, pos);
+ +	struct dax_device *dax_dev = iomap->dax_dev;
+ +	struct block_device *bdev = iomap->bdev;
+ +	struct inode *inode = mapping->host;
+ +	const size_t size = PMD_SIZE;
+ +	void *ret = NULL, *kaddr;
+ +	long length = 0;
+ +	pgoff_t pgoff;
+ +	pfn_t pfn = {};
+ +	int id;
+ +
+ +	if (bdev_dax_pgoff(bdev, sector, size, &pgoff) != 0)
+ +		goto fallback;
+ +
+ +	id = dax_read_lock();
+ +	length = dax_direct_access(dax_dev, pgoff, PHYS_PFN(size), &kaddr, &pfn);
+ +	if (length < 0)
+ +		goto unlock_fallback;
+ +	length = PFN_PHYS(length);
+ +
+ +	if (length < size)
+ +		goto unlock_fallback;
+ +	if (pfn_t_to_pfn(pfn) & PG_PMD_COLOUR)
+ +		goto unlock_fallback;
+ +	if (!pfn_t_devmap(pfn))
+ +		goto unlock_fallback;
+ +	dax_read_unlock(id);
+ +
+ +	ret = dax_insert_mapping_entry(mapping, vmf, *entryp, sector,
+ +			RADIX_DAX_PMD);
+ +	if (IS_ERR(ret))
+ +		goto fallback;
+ +	*entryp = ret;
+ +
+ +	trace_dax_pmd_insert_mapping(inode, vmf, length, pfn, ret);
+ +	return vmf_insert_pfn_pmd(vmf->vma, address, vmf->pmd,
+ +			pfn, vmf->flags & FAULT_FLAG_WRITE);
+ +
+ +unlock_fallback:
+ +	dax_read_unlock(id);
+ +fallback:
+ +	trace_dax_pmd_insert_mapping_fallback(inode, vmf, length, pfn, ret);
+ +	return VM_FAULT_FALLBACK;
+ +}
+++=======
+++>>>>>>> 302a5e312b3a (dax: Inline dax_pmd_insert_mapping() into the callsite)
+  
+  static int dax_pmd_load_hole(struct vm_fault *vmf, struct iomap *iomap,
+ -		void *entry)
+ +		void **entryp)
+  {
+ +	unsigned long address = (unsigned long)vmf->virtual_address;
+  	struct address_space *mapping = vmf->vma->vm_file->f_mapping;
+ -	unsigned long pmd_addr = vmf->address & PMD_MASK;
+ +	unsigned long pmd_addr = address & PMD_MASK;
+  	struct inode *inode = mapping->host;
+  	struct page *zero_page;
+  	void *ret = NULL;
+@@@ -1507,7 -1373,19 +1511,23 @@@ static int dax_iomap_pmd_fault(struct v
+  
+  	switch (iomap.type) {
+  	case IOMAP_MAPPED:
+++<<<<<<< HEAD
+ +		result = dax_pmd_insert_mapping(vmf, &iomap, pos, &entry);
+++=======
++ 		error = dax_iomap_pfn(&iomap, pos, PMD_SIZE, &pfn);
++ 		if (error < 0)
++ 			goto finish_iomap;
++ 
++ 		entry = dax_insert_mapping_entry(mapping, vmf, entry,
++ 						dax_iomap_sector(&iomap, pos),
++ 						RADIX_DAX_PMD);
++ 		if (IS_ERR(entry))
++ 			goto finish_iomap;
++ 
++ 		trace_dax_pmd_insert_mapping(inode, vmf, PMD_SIZE, pfn, entry);
++ 		result = vmf_insert_pfn_pmd(vma, vmf->address, vmf->pmd, pfn,
++ 					    write);
+++>>>>>>> 302a5e312b3a (dax: Inline dax_pmd_insert_mapping() into the callsite)
+  		break;
+  	case IOMAP_UNWRITTEN:
+  	case IOMAP_HOLE:
+* Unmerged path fs/dax.c
+diff --git a/include/trace/events/fs_dax.h b/include/trace/events/fs_dax.h
+index bb37a1fc4e75..20bff5dae022 100644
+--- a/include/trace/events/fs_dax.h
++++ b/include/trace/events/fs_dax.h
+@@ -147,7 +147,6 @@ DEFINE_EVENT(dax_pmd_insert_mapping_class, name, \
+ 	TP_ARGS(inode, vmf, length, pfn, radix_entry))
+ 
+ DEFINE_PMD_INSERT_MAPPING_EVENT(dax_pmd_insert_mapping);
+-DEFINE_PMD_INSERT_MAPPING_EVENT(dax_pmd_insert_mapping_fallback);
+ 
+ DECLARE_EVENT_CLASS(dax_pte_fault_class,
+ 	TP_PROTO(struct inode *inode, struct vm_fault *vmf, int result),
