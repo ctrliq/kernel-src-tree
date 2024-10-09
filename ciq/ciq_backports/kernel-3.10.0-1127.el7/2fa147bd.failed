@@ -1,0 +1,103 @@
+mm, dev_pagemap: Do not clear ->mapping on final put
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 2fa147bdbf672c53386a8f5f2c7fe358004c3ef8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/2fa147bd.failed
+
+MEMORY_DEVICE_FS_DAX relies on typical page semantics whereby ->mapping
+is only ever cleared by truncation, not final put.
+
+Without this fix dax pages may forget their mapping association at the
+end of every page pin event.
+
+Move this atypical behavior that HMM wants into the HMM ->page_free()
+callback.
+
+	Cc: <stable@vger.kernel.org>
+	Cc: Jan Kara <jack@suse.cz>
+	Cc: Jérôme Glisse <jglisse@redhat.com>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Ross Zwisler <ross.zwisler@linux.intel.com>
+Fixes: d2c997c0f145 ("fs, dax: use page->mapping...")
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+	Acked-by: Jérôme Glisse <jglisse@redhat.com>
+	Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+(cherry picked from commit 2fa147bdbf672c53386a8f5f2c7fe358004c3ef8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/memremap.c
+diff --cc kernel/memremap.c
+index 36651e4d6537,62603634a1d2..000000000000
+--- a/kernel/memremap.c
++++ b/kernel/memremap.c
+@@@ -334,3 -302,48 +334,51 @@@ struct dev_pagemap *get_dev_pagemap(uns
+  	return pgmap;
+  }
+  EXPORT_SYMBOL_GPL(get_dev_pagemap);
+++<<<<<<< HEAD
+++=======
++ 
++ #ifdef CONFIG_DEV_PAGEMAP_OPS
++ DEFINE_STATIC_KEY_FALSE(devmap_managed_key);
++ EXPORT_SYMBOL_GPL(devmap_managed_key);
++ static atomic_t devmap_enable;
++ 
++ /*
++  * Toggle the static key for ->page_free() callbacks when dev_pagemap
++  * pages go idle.
++  */
++ void dev_pagemap_get_ops(void)
++ {
++ 	if (atomic_inc_return(&devmap_enable) == 1)
++ 		static_branch_enable(&devmap_managed_key);
++ }
++ EXPORT_SYMBOL_GPL(dev_pagemap_get_ops);
++ 
++ void dev_pagemap_put_ops(void)
++ {
++ 	if (atomic_dec_and_test(&devmap_enable))
++ 		static_branch_disable(&devmap_managed_key);
++ }
++ EXPORT_SYMBOL_GPL(dev_pagemap_put_ops);
++ 
++ void __put_devmap_managed_page(struct page *page)
++ {
++ 	int count = page_ref_dec_return(page);
++ 
++ 	/*
++ 	 * If refcount is 1 then page is freed and refcount is stable as nobody
++ 	 * holds a reference on the page.
++ 	 */
++ 	if (count == 1) {
++ 		/* Clear Active bit in case of parallel mark_page_accessed */
++ 		__ClearPageActive(page);
++ 		__ClearPageWaiters(page);
++ 
++ 		mem_cgroup_uncharge(page);
++ 
++ 		page->pgmap->page_free(page, page->pgmap->data);
++ 	} else if (!count)
++ 		__put_page(page);
++ }
++ EXPORT_SYMBOL_GPL(__put_devmap_managed_page);
++ #endif /* CONFIG_DEV_PAGEMAP_OPS */
+++>>>>>>> 2fa147bdbf67 (mm, dev_pagemap: Do not clear ->mapping on final put)
+* Unmerged path kernel/memremap.c
+diff --git a/mm/hmm.c b/mm/hmm.c
+index 7cf199384fe9..56726a29115b 100644
+--- a/mm/hmm.c
++++ b/mm/hmm.c
+@@ -787,6 +787,8 @@ static void hmm_devmem_free(struct page *page, void *data)
+ {
+ 	struct hmm_devmem *devmem = data;
+ 
++	page->mapping = NULL;
++
+ 	devmem->ops->free(devmem, page);
+ }
+ 
