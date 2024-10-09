@@ -1,0 +1,265 @@
+nfp: add CHECKSUM_COMPLETE support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit ddb98d94e8e7dd9cc1c9dc76d36b5b60c54504c8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/ddb98d94.failed
+
+Introduce NFP_NET_CFG_CTRL_CSUM_COMPLETE capability and implement parsing
+of CHECKSUM_COMPLETE metadata.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: Edwin Peer <edwin.peer@netronome.com>
+	Reviewed-by: Simon Horman <simon.horman@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ddb98d94e8e7dd9cc1c9dc76d36b5b60c54504c8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net.h
+#	drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+#	drivers/net/ethernet/netronome/nfp/nfp_net_ctrl.h
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net.h
+index 600c79f39fe0,acd9811d08d1..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+@@@ -275,6 -289,16 +275,19 @@@ struct nfp_net_rx_desc 
+  	};
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #define NFP_NET_META_FIELD_MASK GENMASK(NFP_NET_META_FIELD_SIZE - 1, 0)
++ 
++ struct nfp_meta_parsed {
++ 	u8 hash_type;
++ 	u8 csum_type;
++ 	u32 hash;
++ 	u32 mark;
++ 	__wsum csum;
++ };
++ 
+++>>>>>>> ddb98d94e8e7 (nfp: add CHECKSUM_COMPLETE support)
+  struct nfp_net_rx_hash {
+  	__be32 hash_type;
+  	__be32 hash;
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index 5094c56dbda7,d640b3331741..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@@ -1259,19 -1351,31 +1259,36 @@@ static int nfp_net_rx_csum_has_errors(u
+  
+  /**
+   * nfp_net_rx_csum() - set SKB checksum field based on RX descriptor flags
+ - * @dp:  NFP Net data path struct
+ + * @nn:  NFP Net device
+   * @r_vec: per-ring structure
+   * @rxd: Pointer to RX descriptor
++  * @meta: Parsed metadata prepend
+   * @skb: Pointer to SKB
+   */
+++<<<<<<< HEAD
+ +static void nfp_net_rx_csum(struct nfp_net *nn, struct nfp_net_r_vector *r_vec,
+ +			    struct nfp_net_rx_desc *rxd, struct sk_buff *skb)
+++=======
++ static void nfp_net_rx_csum(struct nfp_net_dp *dp,
++ 			    struct nfp_net_r_vector *r_vec,
++ 			    struct nfp_net_rx_desc *rxd,
++ 			    struct nfp_meta_parsed *meta, struct sk_buff *skb)
+++>>>>>>> ddb98d94e8e7 (nfp: add CHECKSUM_COMPLETE support)
+  {
+  	skb_checksum_none_assert(skb);
+  
+ -	if (!(dp->netdev->features & NETIF_F_RXCSUM))
+ +	if (!(nn->netdev->features & NETIF_F_RXCSUM))
+  		return;
+  
++ 	if (meta->csum_type) {
++ 		skb->ip_summed = meta->csum_type;
++ 		skb->csum = meta->csum;
++ 		u64_stats_update_begin(&r_vec->rx_sync);
++ 		r_vec->hw_csum_rx_ok++;
++ 		u64_stats_update_end(&r_vec->rx_sync);
++ 		return;
++ 	}
++ 
+  	if (nfp_net_rx_csum_has_errors(le16_to_cpu(rxd->rxd.flags))) {
+  		u64_stats_update_begin(&r_vec->rx_sync);
+  		r_vec->hw_csum_rx_error++;
+@@@ -1341,9 -1434,46 +1358,48 @@@ nfp_net_set_hash_desc(struct net_devic
+  	if (!(rxd->rxd.flags & PCIE_DESC_RX_RSS))
+  		return;
+  
+ -	nfp_net_set_hash(netdev, meta, get_unaligned_be32(&rx_hash->hash_type),
+ -			 &rx_hash->hash);
+ -}
+ +	rx_hash = (struct nfp_net_rx_hash *)(skb->data - sizeof(*rx_hash));
+  
+++<<<<<<< HEAD
+ +	nfp_net_set_hash(netdev, skb, rxd);
+++=======
++ static void *
++ nfp_net_parse_meta(struct net_device *netdev, struct nfp_meta_parsed *meta,
++ 		   void *data, int meta_len)
++ {
++ 	u32 meta_info;
++ 
++ 	meta_info = get_unaligned_be32(data);
++ 	data += 4;
++ 
++ 	while (meta_info) {
++ 		switch (meta_info & NFP_NET_META_FIELD_MASK) {
++ 		case NFP_NET_META_HASH:
++ 			meta_info >>= NFP_NET_META_FIELD_SIZE;
++ 			nfp_net_set_hash(netdev, meta,
++ 					 meta_info & NFP_NET_META_FIELD_MASK,
++ 					 (__be32 *)data);
++ 			data += 4;
++ 			break;
++ 		case NFP_NET_META_MARK:
++ 			meta->mark = get_unaligned_be32(data);
++ 			data += 4;
++ 			break;
++ 		case NFP_NET_META_CSUM:
++ 			meta->csum_type = CHECKSUM_COMPLETE;
++ 			meta->csum =
++ 				(__force __wsum)__get_unaligned_cpu32(data);
++ 			data += 4;
++ 			break;
++ 		default:
++ 			return NULL;
++ 		}
++ 
++ 		meta_info >>= NFP_NET_META_FIELD_SIZE;
++ 	}
++ 
++ 	return data;
+++>>>>>>> ddb98d94e8e7 (nfp: add CHECKSUM_COMPLETE support)
+  }
+  
+  static void
+@@@ -1448,20 -1716,20 +1504,24 @@@ static int nfp_net_rx(struct nfp_net_rx
+  			continue;
+  		}
+  
+ -		nfp_net_dma_unmap_rx(dp, rxbuf->dma_addr);
+ +		nfp_net_dma_unmap_rx(nn, rx_ring->rxbufs[idx].dma_addr,
+ +				     nn->fl_bufsz, DMA_FROM_DEVICE);
+  
+ -		nfp_net_rx_give_one(dp, rx_ring, new_frag, new_dma_addr);
+ +		nfp_net_rx_give_one(rx_ring, new_frag, new_dma_addr);
+  
+ -		skb_reserve(skb, pkt_off);
+ +		skb_reserve(skb, data_off);
+  		skb_put(skb, pkt_len);
+  
+ -		skb->mark = meta.mark;
+ -		skb_set_hash(skb, meta.hash, meta.hash_type);
+ +		nfp_net_set_hash_desc(nn->netdev, skb, rxd);
+  
+  		skb_record_rx_queue(skb, rx_ring->idx);
+ -		skb->protocol = eth_type_trans(skb, dp->netdev);
+ +		skb->protocol = eth_type_trans(skb, nn->netdev);
+  
+++<<<<<<< HEAD
+ +		nfp_net_rx_csum(nn, r_vec, rxd, skb);
+++=======
++ 		nfp_net_rx_csum(dp, r_vec, rxd, &meta, skb);
+++>>>>>>> ddb98d94e8e7 (nfp: add CHECKSUM_COMPLETE support)
+  
+  		if (rxd->rxd.flags & PCIE_DESC_RX_VLAN)
+  			__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q),
+@@@ -2630,7 -3052,7 +2690,11 @@@ void nfp_net_info(struct nfp_net *nn
+  		nn->fw_ver.resv, nn->fw_ver.class,
+  		nn->fw_ver.major, nn->fw_ver.minor,
+  		nn->max_mtu);
+++<<<<<<< HEAD
+ +	nn_info(nn, "CAP: %#x %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n",
+++=======
++ 	nn_info(nn, "CAP: %#x %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n",
+++>>>>>>> ddb98d94e8e7 (nfp: add CHECKSUM_COMPLETE support)
+  		nn->cap,
+  		nn->cap & NFP_NET_CFG_CTRL_PROMISC  ? "PROMISC "  : "",
+  		nn->cap & NFP_NET_CFG_CTRL_L2BC     ? "L2BCFILT " : "",
+@@@ -2647,7 -3071,10 +2711,14 @@@
+  		nn->cap & NFP_NET_CFG_CTRL_MSIXAUTO ? "AUTOMASK " : "",
+  		nn->cap & NFP_NET_CFG_CTRL_IRQMOD   ? "IRQMOD "   : "",
+  		nn->cap & NFP_NET_CFG_CTRL_VXLAN    ? "VXLAN "    : "",
+++<<<<<<< HEAD
+ +		nn->cap & NFP_NET_CFG_CTRL_NVGRE    ? "NVGRE "	  : "");
+++=======
++ 		nn->cap & NFP_NET_CFG_CTRL_NVGRE    ? "NVGRE "	  : "",
++ 		nfp_net_ebpf_capable(nn)            ? "BPF "	  : "",
++ 		nn->cap & NFP_NET_CFG_CTRL_CSUM_COMPLETE ?
++ 						      "RXCSUM_COMPLETE " : "");
+++>>>>>>> ddb98d94e8e7 (nfp: add CHECKSUM_COMPLETE support)
+  }
+  
+  /**
+@@@ -2776,9 -3265,9 +2847,13 @@@ int nfp_net_netdev_init(struct net_devi
+  	 * supported.  By default we enable most features.
+  	 */
+  	netdev->hw_features = NETIF_F_HIGHDMA;
+- 	if (nn->cap & NFP_NET_CFG_CTRL_RXCSUM) {
++ 	if (nn->cap & NFP_NET_CFG_CTRL_RXCSUM_ANY) {
+  		netdev->hw_features |= NETIF_F_RXCSUM;
+++<<<<<<< HEAD
+ +		nn->ctrl |= NFP_NET_CFG_CTRL_RXCSUM;
+++=======
++ 		nn->dp.ctrl |= nn->cap & NFP_NET_CFG_CTRL_RXCSUM_ANY;
+++>>>>>>> ddb98d94e8e7 (nfp: add CHECKSUM_COMPLETE support)
+  	}
+  	if (nn->cap & NFP_NET_CFG_CTRL_TXCSUM) {
+  		netdev->hw_features |= NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM;
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_ctrl.h
+index 92d76a860c19,df75b8dc3617..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_ctrl.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_ctrl.h
+@@@ -66,6 -66,14 +66,17 @@@
+  #define NFP_NET_LSO_MAX_HDR_SZ		255
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * Prepend field types
++  */
++ #define NFP_NET_META_FIELD_SIZE		4
++ #define NFP_NET_META_HASH		1 /* next field carries hash type */
++ #define NFP_NET_META_MARK		2
++ #define NFP_NET_META_CSUM		6 /* checksum complete type */
++ 
++ /**
+++>>>>>>> ddb98d94e8e7 (nfp: add CHECKSUM_COMPLETE support)
+   * Hash type pre-pended when a RSS hash was computed
+   */
+  #define NFP_NET_RSS_NONE                0
+@@@ -123,6 -131,20 +134,23 @@@
+  #define   NFP_NET_CFG_CTRL_L2SWITCH_LOCAL (0x1 << 23) /* Switch to local */
+  #define   NFP_NET_CFG_CTRL_VXLAN	  (0x1 << 24) /* VXLAN tunnel support */
+  #define   NFP_NET_CFG_CTRL_NVGRE	  (0x1 << 25) /* NVGRE tunnel support */
+++<<<<<<< HEAD
+++=======
++ #define   NFP_NET_CFG_CTRL_BPF		  (0x1 << 27) /* BPF offload capable */
++ #define   NFP_NET_CFG_CTRL_LSO2		  (0x1 << 28) /* LSO/TSO (version 2) */
++ #define   NFP_NET_CFG_CTRL_RSS2		  (0x1 << 29) /* RSS (version 2) */
++ #define   NFP_NET_CFG_CTRL_CSUM_COMPLETE  (0x1 << 30) /* Checksum complete */
++ 
++ #define NFP_NET_CFG_CTRL_LSO_ANY	(NFP_NET_CFG_CTRL_LSO | \
++ 					 NFP_NET_CFG_CTRL_LSO2)
++ #define NFP_NET_CFG_CTRL_RSS_ANY	(NFP_NET_CFG_CTRL_RSS | \
++ 					 NFP_NET_CFG_CTRL_RSS2)
++ #define NFP_NET_CFG_CTRL_RXCSUM_ANY	(NFP_NET_CFG_CTRL_RXCSUM | \
++ 					 NFP_NET_CFG_CTRL_CSUM_COMPLETE)
++ #define NFP_NET_CFG_CTRL_CHAIN_META	(NFP_NET_CFG_CTRL_RSS2 | \
++ 					 NFP_NET_CFG_CTRL_CSUM_COMPLETE)
++ 
+++>>>>>>> ddb98d94e8e7 (nfp: add CHECKSUM_COMPLETE support)
+  #define NFP_NET_CFG_UPDATE              0x0004
+  #define   NFP_NET_CFG_UPDATE_GEN          (0x1 <<  0) /* General update */
+  #define   NFP_NET_CFG_UPDATE_RING         (0x1 <<  1) /* Ring config change */
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net.h
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_ctrl.h
