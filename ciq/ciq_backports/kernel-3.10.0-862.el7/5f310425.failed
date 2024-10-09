@@ -1,0 +1,470 @@
+scsi: smartpqi: update rescan worker
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] smartpqi: update rescan worker (Don Brace) [1457414]
+Rebuild_FUZZ: 90.91%
+commit-author Kevin Barnett <kevin.barnett@microsemi.com>
+commit 5f310425c8eabeeb303809898682e5b79c8a9c7e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/5f310425.failed
+
+improve support for taking controller offline.
+
+	Reviewed-by: Scott Benesh <scott.benesh@microsemi.com>
+	Signed-off-by: Kevin Barnett <kevin.barnett@microsemi.com>
+	Signed-off-by: Don Brace <don.brace@microsemi.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 5f310425c8eabeeb303809898682e5b79c8a9c7e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/smartpqi/smartpqi.h
+#	drivers/scsi/smartpqi/smartpqi_init.c
+diff --cc drivers/scsi/smartpqi/smartpqi.h
+index 5acdb3969532,2ed15cfd01d9..000000000000
+--- a/drivers/scsi/smartpqi/smartpqi.h
++++ b/drivers/scsi/smartpqi/smartpqi.h
+@@@ -942,7 -994,6 +942,10 @@@ struct pqi_ctrl_info 
+  	u8		inbound_spanning_supported : 1;
+  	u8		outbound_spanning_supported : 1;
+  	u8		pqi_mode_enabled : 1;
+++<<<<<<< HEAD
+ +	u8		heartbeat_timer_started : 1;
+++=======
+++>>>>>>> 5f310425c8ea (scsi: smartpqi: update rescan worker)
+  
+  	struct list_head scsi_device_list;
+  	spinlock_t	scsi_device_list_lock;
+@@@ -961,8 -1012,10 +964,9 @@@
+  
+  	atomic_t	num_interrupts;
+  	int		previous_num_interrupts;
+ -	u32		previous_heartbeat_count;
+ -	__le32 __iomem	*heartbeat_counter;
+ +	unsigned int	num_heartbeats_requested;
+  	struct timer_list heartbeat_timer;
++ 	struct work_struct ctrl_offline_work;
+  
+  	struct semaphore sync_request_sem;
+  	atomic_t	num_busy_threads;
+diff --cc drivers/scsi/smartpqi/smartpqi_init.c
+index a3837a6f86ae,338ba03762b1..000000000000
+--- a/drivers/scsi/smartpqi/smartpqi_init.c
++++ b/drivers/scsi/smartpqi/smartpqi_init.c
+@@@ -61,6 -62,8 +61,11 @@@ static char *hpe_branded_controller = "
+  static char *microsemi_branded_controller = "Microsemi Smart Family Controller";
+  
+  static void pqi_take_ctrl_offline(struct pqi_ctrl_info *ctrl_info);
+++<<<<<<< HEAD
+++=======
++ static void pqi_ctrl_offline_worker(struct work_struct *work);
++ static void pqi_retry_raid_bypass_requests(struct pqi_ctrl_info *ctrl_info);
+++>>>>>>> 5f310425c8ea (scsi: smartpqi: update rescan worker)
+  static int pqi_scan_scsi_devices(struct pqi_ctrl_info *ctrl_info);
+  static void pqi_scan_start(struct Scsi_Host *shost);
+  static void pqi_start_io(struct pqi_ctrl_info *ctrl_info,
+@@@ -261,12 -302,41 +265,28 @@@ static inline bool pqi_device_in_reset(
+  	return device->in_reset;
+  }
+  
++ static inline void pqi_schedule_rescan_worker_with_delay(
++ 	struct pqi_ctrl_info *ctrl_info, unsigned long delay)
++ {
++ 	if (pqi_ctrl_offline(ctrl_info))
++ 		return;
++ 
++ 	schedule_delayed_work(&ctrl_info->rescan_work, delay);
++ }
++ 
+  static inline void pqi_schedule_rescan_worker(struct pqi_ctrl_info *ctrl_info)
+  {
+- 	schedule_delayed_work(&ctrl_info->rescan_work,
+- 		PQI_RESCAN_WORK_INTERVAL);
++ 	pqi_schedule_rescan_worker_with_delay(ctrl_info, 0);
++ }
++ 
++ #define PQI_RESCAN_WORK_DELAY  (10 * HZ)
++ 
++ static inline void pqi_schedule_rescan_worker_delayed(
++ 	struct pqi_ctrl_info *ctrl_info)
++ {
++ 	pqi_schedule_rescan_worker_with_delay(ctrl_info, PQI_RESCAN_WORK_DELAY);
+  }
+  
+ -static inline void pqi_cancel_rescan_worker(struct pqi_ctrl_info *ctrl_info)
+ -{
+ -	cancel_delayed_work_sync(&ctrl_info->rescan_work);
+ -}
+ -
+ -static inline u32 pqi_read_heartbeat_counter(struct pqi_ctrl_info *ctrl_info)
+ -{
+ -	if (!ctrl_info->heartbeat_counter)
+ -		return 0;
+ -
+ -	return readl(ctrl_info->heartbeat_counter);
+ -}
+ -
+  static int pqi_map_single(struct pci_dev *pci_dev,
+  	struct pqi_sg_descriptor *sg_descriptor, void *buffer,
+  	size_t buffer_length, int data_direction)
+@@@ -693,6 -770,12 +716,15 @@@ static inline void pqi_schedule_update_
+  	struct pqi_ctrl_info *ctrl_info)
+  {
+  	schedule_delayed_work(&ctrl_info->update_time_work, 0);
+++<<<<<<< HEAD
+++=======
++ }
++ 
++ static inline void pqi_cancel_update_time_worker(
++ 	struct pqi_ctrl_info *ctrl_info)
++ {
++ 	cancel_delayed_work_sync(&ctrl_info->update_time_work);
+++>>>>>>> 5f310425c8ea (scsi: smartpqi: update rescan worker)
+  }
+  
+  static int pqi_report_luns(struct pqi_ctrl_info *ctrl_info, u8 cmd,
+@@@ -2809,53 -2778,11 +2845,52 @@@ static void pqi_event_worker(struct wor
+  		event++;
+  	}
+  
++ out:
+  	pqi_ctrl_unbusy(ctrl_info);
+- 
+- 	pqi_schedule_rescan_worker(ctrl_info);
+  }
+  
+ -#define PQI_HEARTBEAT_TIMER_INTERVAL	(10 * HZ)
+ +static void pqi_take_ctrl_offline(struct pqi_ctrl_info *ctrl_info)
+ +{
+ +	unsigned int i;
+ +	unsigned int path;
+ +	struct pqi_queue_group *queue_group;
+ +	unsigned long flags;
+ +	struct pqi_io_request *io_request;
+ +	struct pqi_io_request *next;
+ +	struct scsi_cmnd *scmd;
+ +
+ +	ctrl_info->controller_online = false;
+ +	dev_err(&ctrl_info->pci_dev->dev, "controller offline\n");
+ +	sis_shutdown_ctrl(ctrl_info);
+ +
+ +	for (i = 0; i < ctrl_info->num_queue_groups; i++) {
+ +		queue_group = &ctrl_info->queue_groups[i];
+ +
+ +		for (path = 0; path < 2; path++) {
+ +			spin_lock_irqsave(
+ +				&queue_group->submit_lock[path], flags);
+ +
+ +			list_for_each_entry_safe(io_request, next,
+ +				&queue_group->request_list[path],
+ +				request_list_entry) {
+ +
+ +				scmd = io_request->scmd;
+ +				if (scmd) {
+ +					set_host_byte(scmd, DID_NO_CONNECT);
+ +					pqi_scsi_done(scmd);
+ +				}
+ +
+ +				list_del(&io_request->request_list_entry);
+ +			}
+ +
+ +			spin_unlock_irqrestore(
+ +				&queue_group->submit_lock[path], flags);
+ +		}
+ +	}
+ +}
+ +
+ +#define PQI_HEARTBEAT_TIMER_INTERVAL	(5 * HZ)
+ +#define PQI_MAX_HEARTBEAT_REQUESTS	5
+  
+  static void pqi_heartbeat_timer_handler(unsigned long data)
+  {
+@@@ -4605,6 -4595,176 +4640,179 @@@ static int pqi_raid_submit_scsi_cmd(str
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline int pqi_raid_submit_scsi_cmd(struct pqi_ctrl_info *ctrl_info,
++ 	struct pqi_scsi_dev *device, struct scsi_cmnd *scmd,
++ 	struct pqi_queue_group *queue_group)
++ {
++ 	struct pqi_io_request *io_request;
++ 
++ 	io_request = pqi_alloc_io_request(ctrl_info);
++ 
++ 	return pqi_raid_submit_scsi_cmd_with_io_request(ctrl_info, io_request,
++ 		device, scmd, queue_group);
++ }
++ 
++ static inline void pqi_schedule_bypass_retry(struct pqi_ctrl_info *ctrl_info)
++ {
++ 	if (!pqi_ctrl_blocked(ctrl_info))
++ 		schedule_work(&ctrl_info->raid_bypass_retry_work);
++ }
++ 
++ static bool pqi_raid_bypass_retry_needed(struct pqi_io_request *io_request)
++ {
++ 	struct scsi_cmnd *scmd;
++ 	struct pqi_scsi_dev *device;
++ 	struct pqi_ctrl_info *ctrl_info;
++ 
++ 	if (!io_request->raid_bypass)
++ 		return false;
++ 
++ 	scmd = io_request->scmd;
++ 	if ((scmd->result & 0xff) == SAM_STAT_GOOD)
++ 		return false;
++ 	if (host_byte(scmd->result) == DID_NO_CONNECT)
++ 		return false;
++ 
++ 	device = scmd->device->hostdata;
++ 	if (pqi_device_offline(device))
++ 		return false;
++ 
++ 	ctrl_info = shost_to_hba(scmd->device->host);
++ 	if (pqi_ctrl_offline(ctrl_info))
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ static inline void pqi_add_to_raid_bypass_retry_list(
++ 	struct pqi_ctrl_info *ctrl_info,
++ 	struct pqi_io_request *io_request, bool at_head)
++ {
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&ctrl_info->raid_bypass_retry_list_lock, flags);
++ 	if (at_head)
++ 		list_add(&io_request->request_list_entry,
++ 			&ctrl_info->raid_bypass_retry_list);
++ 	else
++ 		list_add_tail(&io_request->request_list_entry,
++ 			&ctrl_info->raid_bypass_retry_list);
++ 	spin_unlock_irqrestore(&ctrl_info->raid_bypass_retry_list_lock, flags);
++ }
++ 
++ static void pqi_queued_raid_bypass_complete(struct pqi_io_request *io_request,
++ 	void *context)
++ {
++ 	struct scsi_cmnd *scmd;
++ 
++ 	scmd = io_request->scmd;
++ 	pqi_free_io_request(io_request);
++ 	pqi_scsi_done(scmd);
++ }
++ 
++ static void pqi_queue_raid_bypass_retry(struct pqi_io_request *io_request)
++ {
++ 	struct scsi_cmnd *scmd;
++ 	struct pqi_ctrl_info *ctrl_info;
++ 
++ 	io_request->io_complete_callback = pqi_queued_raid_bypass_complete;
++ 	scmd = io_request->scmd;
++ 	scmd->result = 0;
++ 	ctrl_info = shost_to_hba(scmd->device->host);
++ 
++ 	pqi_add_to_raid_bypass_retry_list(ctrl_info, io_request, false);
++ 	pqi_schedule_bypass_retry(ctrl_info);
++ }
++ 
++ static int pqi_retry_raid_bypass(struct pqi_io_request *io_request)
++ {
++ 	struct scsi_cmnd *scmd;
++ 	struct pqi_scsi_dev *device;
++ 	struct pqi_ctrl_info *ctrl_info;
++ 	struct pqi_queue_group *queue_group;
++ 
++ 	scmd = io_request->scmd;
++ 	device = scmd->device->hostdata;
++ 	if (pqi_device_in_reset(device)) {
++ 		pqi_free_io_request(io_request);
++ 		set_host_byte(scmd, DID_RESET);
++ 		pqi_scsi_done(scmd);
++ 		return 0;
++ 	}
++ 
++ 	ctrl_info = shost_to_hba(scmd->device->host);
++ 	queue_group = io_request->queue_group;
++ 
++ 	pqi_reinit_io_request(io_request);
++ 
++ 	return pqi_raid_submit_scsi_cmd_with_io_request(ctrl_info, io_request,
++ 		device, scmd, queue_group);
++ }
++ 
++ static inline struct pqi_io_request *pqi_next_queued_raid_bypass_request(
++ 	struct pqi_ctrl_info *ctrl_info)
++ {
++ 	unsigned long flags;
++ 	struct pqi_io_request *io_request;
++ 
++ 	spin_lock_irqsave(&ctrl_info->raid_bypass_retry_list_lock, flags);
++ 	io_request = list_first_entry_or_null(
++ 		&ctrl_info->raid_bypass_retry_list,
++ 		struct pqi_io_request, request_list_entry);
++ 	if (io_request)
++ 		list_del(&io_request->request_list_entry);
++ 	spin_unlock_irqrestore(&ctrl_info->raid_bypass_retry_list_lock, flags);
++ 
++ 	return io_request;
++ }
++ 
++ static void pqi_retry_raid_bypass_requests(struct pqi_ctrl_info *ctrl_info)
++ {
++ 	int rc;
++ 	struct pqi_io_request *io_request;
++ 
++ 	pqi_ctrl_busy(ctrl_info);
++ 
++ 	while (1) {
++ 		if (pqi_ctrl_blocked(ctrl_info))
++ 			break;
++ 		io_request = pqi_next_queued_raid_bypass_request(ctrl_info);
++ 		if (!io_request)
++ 			break;
++ 		rc = pqi_retry_raid_bypass(io_request);
++ 		if (rc) {
++ 			pqi_add_to_raid_bypass_retry_list(ctrl_info, io_request,
++ 				true);
++ 			pqi_schedule_bypass_retry(ctrl_info);
++ 			break;
++ 		}
++ 	}
++ 
++ 	pqi_ctrl_unbusy(ctrl_info);
++ }
++ 
++ static void pqi_raid_bypass_retry_worker(struct work_struct *work)
++ {
++ 	struct pqi_ctrl_info *ctrl_info;
++ 
++ 	ctrl_info = container_of(work, struct pqi_ctrl_info,
++ 		raid_bypass_retry_work);
++ 	pqi_retry_raid_bypass_requests(ctrl_info);
++ }
++ 
++ static void pqi_clear_all_queued_raid_bypass_retries(
++ 	struct pqi_ctrl_info *ctrl_info)
++ {
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&ctrl_info->raid_bypass_retry_list_lock, flags);
++ 	INIT_LIST_HEAD(&ctrl_info->raid_bypass_retry_list);
++ 	spin_unlock_irqrestore(&ctrl_info->raid_bypass_retry_list_lock, flags);
++ }
++ 
+++>>>>>>> 5f310425c8ea (scsi: smartpqi: update rescan worker)
+  static void pqi_aio_io_complete(struct pqi_io_request *io_request,
+  	void *context)
+  {
+@@@ -5897,6 -6316,9 +6105,12 @@@ static struct pqi_ctrl_info *pqi_alloc_
+  	INIT_DELAYED_WORK(&ctrl_info->rescan_work, pqi_rescan_worker);
+  	INIT_DELAYED_WORK(&ctrl_info->update_time_work, pqi_update_time_worker);
+  
+++<<<<<<< HEAD
+++=======
++ 	init_timer(&ctrl_info->heartbeat_timer);
++ 	INIT_WORK(&ctrl_info->ctrl_offline_work, pqi_ctrl_offline_worker);
++ 
+++>>>>>>> 5f310425c8ea (scsi: smartpqi: update rescan worker)
+  	sema_init(&ctrl_info->sync_request_sem,
+  		PQI_RESERVED_IO_SLOTS_SYNCHRONOUS_REQUESTS);
+  	init_waitqueue_head(&ctrl_info->block_requests_wait);
+@@@ -5956,7 -6382,87 +6170,91 @@@ static void pqi_remove_ctrl(struct pqi_
+  	pqi_free_ctrl_resources(ctrl_info);
+  }
+  
+++<<<<<<< HEAD
+ +static void pqi_print_ctrl_info(struct pci_dev *pdev,
+++=======
++ static void pqi_perform_lockup_action(void)
++ {
++ 	switch (pqi_lockup_action) {
++ 	case PANIC:
++ 		panic("FATAL: Smart Family Controller lockup detected");
++ 		break;
++ 	case REBOOT:
++ 		emergency_restart();
++ 		break;
++ 	case NONE:
++ 	default:
++ 		break;
++ 	}
++ }
++ 
++ static struct pqi_raid_error_info pqi_ctrl_offline_raid_error_info = {
++ 	.data_out_result = PQI_DATA_IN_OUT_HARDWARE_ERROR,
++ 	.status = SAM_STAT_CHECK_CONDITION,
++ };
++ 
++ static void pqi_fail_all_outstanding_requests(struct pqi_ctrl_info *ctrl_info)
++ {
++ 	unsigned int i;
++ 	struct pqi_io_request *io_request;
++ 	struct scsi_cmnd *scmd;
++ 
++ 	for (i = 0; i < ctrl_info->max_io_slots; i++) {
++ 		io_request = &ctrl_info->io_request_pool[i];
++ 		if (atomic_read(&io_request->refcount) == 0)
++ 			continue;
++ 
++ 		scmd = io_request->scmd;
++ 		if (scmd) {
++ 			set_host_byte(scmd, DID_NO_CONNECT);
++ 		} else {
++ 			io_request->status = -ENXIO;
++ 			io_request->error_info =
++ 				&pqi_ctrl_offline_raid_error_info;
++ 		}
++ 
++ 		io_request->io_complete_callback(io_request,
++ 			io_request->context);
++ 	}
++ }
++ 
++ static void pqi_take_ctrl_offline_deferred(struct pqi_ctrl_info *ctrl_info)
++ {
++ 	pqi_perform_lockup_action();
++ 	pqi_stop_heartbeat_timer(ctrl_info);
++ 	pqi_free_interrupts(ctrl_info);
++ 	pqi_cancel_rescan_worker(ctrl_info);
++ 	pqi_cancel_update_time_worker(ctrl_info);
++ 	pqi_ctrl_wait_until_quiesced(ctrl_info);
++ 	pqi_fail_all_outstanding_requests(ctrl_info);
++ 	pqi_clear_all_queued_raid_bypass_retries(ctrl_info);
++ 	pqi_ctrl_unblock_requests(ctrl_info);
++ }
++ 
++ static void pqi_ctrl_offline_worker(struct work_struct *work)
++ {
++ 	struct pqi_ctrl_info *ctrl_info;
++ 
++ 	ctrl_info = container_of(work, struct pqi_ctrl_info, ctrl_offline_work);
++ 	pqi_take_ctrl_offline_deferred(ctrl_info);
++ }
++ 
++ static void pqi_take_ctrl_offline(struct pqi_ctrl_info *ctrl_info)
++ {
++ 	if (!ctrl_info->controller_online)
++ 		return;
++ 
++ 	ctrl_info->controller_online = false;
++ 	ctrl_info->pqi_mode_enabled = false;
++ 	pqi_ctrl_block_requests(ctrl_info);
++ 	sis_shutdown_ctrl(ctrl_info);
++ 	pci_disable_device(ctrl_info->pci_dev);
++ 	dev_err(&ctrl_info->pci_dev->dev, "controller offline\n");
++ 	schedule_work(&ctrl_info->ctrl_offline_work);
++ }
++ 
++ static void pqi_print_ctrl_info(struct pci_dev *pci_dev,
+++>>>>>>> 5f310425c8ea (scsi: smartpqi: update rescan worker)
+  	const struct pci_device_id *id)
+  {
+  	char *ctrl_description;
+* Unmerged path drivers/scsi/smartpqi/smartpqi.h
+* Unmerged path drivers/scsi/smartpqi/smartpqi_init.c
