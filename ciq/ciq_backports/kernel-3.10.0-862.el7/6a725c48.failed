@@ -1,0 +1,206 @@
+net: sched: cls_bpf: rename cls_bpf_modify_existing function
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [net] sched: cls_bpf: rename cls_bpf_modify_existing function (Ivan Vecera) [1445420]
+Rebuild_FUZZ: 95.65%
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit 6a725c481df36b1ad471ea788a5bc64c25bf7af8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/6a725c48.failed
+
+The name cls_bpf_modify_existing is highly misleading, as it indeed does
+not modify anything existing. It does not modify at all.
+
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Acked-by: Daniel Borkmann <daniel@iogearbox.net>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6a725c481df36b1ad471ea788a5bc64c25bf7af8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/cls_bpf.c
+diff --cc net/sched/cls_bpf.c
+index c13fb5505297,e9ab8374a877..000000000000
+--- a/net/sched/cls_bpf.c
++++ b/net/sched/cls_bpf.c
+@@@ -151,66 -312,132 +151,142 @@@ static unsigned long cls_bpf_get(struc
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int cls_bpf_modify_existing(struct net *net, struct tcf_proto *tp,
+ +				   struct cls_bpf_prog *prog,
+ +				   unsigned long base, struct nlattr **tb,
+ +				   struct nlattr *est, bool ovr)
+++=======
++ static int cls_bpf_prog_from_ops(struct nlattr **tb, struct cls_bpf_prog *prog)
++ {
++ 	struct sock_filter *bpf_ops;
++ 	struct sock_fprog_kern fprog_tmp;
++ 	struct bpf_prog *fp;
++ 	u16 bpf_size, bpf_num_ops;
++ 	int ret;
++ 
++ 	bpf_num_ops = nla_get_u16(tb[TCA_BPF_OPS_LEN]);
++ 	if (bpf_num_ops > BPF_MAXINSNS || bpf_num_ops == 0)
++ 		return -EINVAL;
++ 
++ 	bpf_size = bpf_num_ops * sizeof(*bpf_ops);
++ 	if (bpf_size != nla_len(tb[TCA_BPF_OPS]))
++ 		return -EINVAL;
++ 
++ 	bpf_ops = kzalloc(bpf_size, GFP_KERNEL);
++ 	if (bpf_ops == NULL)
++ 		return -ENOMEM;
++ 
++ 	memcpy(bpf_ops, nla_data(tb[TCA_BPF_OPS]), bpf_size);
++ 
++ 	fprog_tmp.len = bpf_num_ops;
++ 	fprog_tmp.filter = bpf_ops;
++ 
++ 	ret = bpf_prog_create(&fp, &fprog_tmp);
++ 	if (ret < 0) {
++ 		kfree(bpf_ops);
++ 		return ret;
++ 	}
++ 
++ 	prog->bpf_ops = bpf_ops;
++ 	prog->bpf_num_ops = bpf_num_ops;
++ 	prog->bpf_name = NULL;
++ 	prog->filter = fp;
++ 
++ 	return 0;
++ }
++ 
++ static int cls_bpf_prog_from_efd(struct nlattr **tb, struct cls_bpf_prog *prog,
++ 				 const struct tcf_proto *tp)
++ {
++ 	struct bpf_prog *fp;
++ 	char *name = NULL;
++ 	u32 bpf_fd;
++ 
++ 	bpf_fd = nla_get_u32(tb[TCA_BPF_FD]);
++ 
++ 	fp = bpf_prog_get_type(bpf_fd, BPF_PROG_TYPE_SCHED_CLS);
++ 	if (IS_ERR(fp))
++ 		return PTR_ERR(fp);
++ 
++ 	if (tb[TCA_BPF_NAME]) {
++ 		name = nla_memdup(tb[TCA_BPF_NAME], GFP_KERNEL);
++ 		if (!name) {
++ 			bpf_prog_put(fp);
++ 			return -ENOMEM;
++ 		}
++ 	}
++ 
++ 	prog->bpf_ops = NULL;
++ 	prog->bpf_name = name;
++ 	prog->filter = fp;
++ 
++ 	if (fp->dst_needed && !(tp->q->flags & TCQ_F_INGRESS))
++ 		netif_keep_dst(qdisc_dev(tp->q));
++ 
++ 	return 0;
++ }
++ 
++ static int cls_bpf_set_parms(struct net *net, struct tcf_proto *tp,
++ 			     struct cls_bpf_prog *prog, unsigned long base,
++ 			     struct nlattr **tb, struct nlattr *est, bool ovr)
+++>>>>>>> 6a725c481df3 (net: sched: cls_bpf: rename cls_bpf_modify_existing function)
+  {
+ -	bool is_bpf, is_ebpf, have_exts = false;
+ +	struct sock_filter *bpf_ops;
+  	struct tcf_exts exts;
+ -	u32 gen_flags = 0;
+ +	struct sock_fprog tmp;
+ +	struct sk_filter *fp;
+ +	u16 bpf_size, bpf_len;
+ +	u32 classid;
+  	int ret;
+  
+ -	is_bpf = tb[TCA_BPF_OPS_LEN] && tb[TCA_BPF_OPS];
+ -	is_ebpf = tb[TCA_BPF_FD];
+ -	if ((!is_bpf && !is_ebpf) || (is_bpf && is_ebpf))
+ +	if (!tb[TCA_BPF_OPS_LEN] || !tb[TCA_BPF_OPS] || !tb[TCA_BPF_CLASSID])
+  		return -EINVAL;
+  
+ -	ret = tcf_exts_init(&exts, TCA_BPF_ACT, TCA_BPF_POLICE);
+ -	if (ret < 0)
+ -		return ret;
+ +	tcf_exts_init(&exts, TCA_BPF_ACT, TCA_BPF_POLICE);
+  	ret = tcf_exts_validate(net, tp, tb, est, &exts, ovr);
+  	if (ret < 0)
+ -		goto errout;
+ -
+ -	if (tb[TCA_BPF_FLAGS]) {
+ -		u32 bpf_flags = nla_get_u32(tb[TCA_BPF_FLAGS]);
+ +		return ret;
+  
+ -		if (bpf_flags & ~TCA_BPF_FLAG_ACT_DIRECT) {
+ -			ret = -EINVAL;
+ -			goto errout;
+ -		}
+ +	classid = nla_get_u32(tb[TCA_BPF_CLASSID]);
+ +	bpf_len = nla_get_u16(tb[TCA_BPF_OPS_LEN]);
+ +	if (bpf_len > BPF_MAXINSNS || bpf_len == 0) {
+ +		ret = -EINVAL;
+ +		goto errout;
+ +	}
+  
+ -		have_exts = bpf_flags & TCA_BPF_FLAG_ACT_DIRECT;
+ +	bpf_size = bpf_len * sizeof(*bpf_ops);
+ +	if (bpf_size != nla_len(tb[TCA_BPF_OPS])) {
+ +		ret = -EINVAL;
+ +		goto errout;
+  	}
+ -	if (tb[TCA_BPF_FLAGS_GEN]) {
+ -		gen_flags = nla_get_u32(tb[TCA_BPF_FLAGS_GEN]);
+ -		if (gen_flags & ~CLS_BPF_SUPPORTED_GEN_FLAGS ||
+ -		    !tc_flags_valid(gen_flags)) {
+ -			ret = -EINVAL;
+ -			goto errout;
+ -		}
+ +
+ +	bpf_ops = kzalloc(bpf_size, GFP_KERNEL);
+ +	if (bpf_ops == NULL) {
+ +		ret = -ENOMEM;
+ +		goto errout;
+  	}
+  
+ -	prog->exts_integrated = have_exts;
+ -	prog->gen_flags = gen_flags;
+ +	memcpy(bpf_ops, nla_data(tb[TCA_BPF_OPS]), bpf_size);
+  
+ -	ret = is_bpf ? cls_bpf_prog_from_ops(tb, prog) :
+ -		       cls_bpf_prog_from_efd(tb, prog, tp);
+ -	if (ret < 0)
+ -		goto errout;
+ +	tmp.len = bpf_len;
+ +	tmp.filter = (struct sock_filter __user *) bpf_ops;
+  
+ -	if (tb[TCA_BPF_CLASSID]) {
+ -		prog->res.classid = nla_get_u32(tb[TCA_BPF_CLASSID]);
+ -		tcf_bind_filter(tp, &prog->res, base);
+ -	}
+ +	ret = sk_unattached_filter_create(&fp, &tmp);
+ +	if (ret)
+ +		goto errout_free;
+  
+ +	prog->bpf_len = bpf_len;
+ +	prog->bpf_ops = bpf_ops;
+ +	prog->filter = fp;
+ +	prog->res.classid = classid;
+ +
+ +	tcf_bind_filter(tp, &prog->res, base);
+  	tcf_exts_change(tp, &prog->exts, &exts);
+ -	return 0;
+  
+ +	return 0;
+ +errout_free:
+ +	kfree(bpf_ops);
+  errout:
+  	tcf_exts_destroy(&exts);
+  	return ret;
+* Unmerged path net/sched/cls_bpf.c
