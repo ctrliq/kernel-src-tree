@@ -274,6 +274,7 @@ int fixed_phy_register(unsigned int irq,
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(fixed_phy_register);
 
 static int __init fixed_mdio_bus_init(void)
 {
