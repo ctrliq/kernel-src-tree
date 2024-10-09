@@ -1,0 +1,179 @@
+net: ipv6_gre: Fix GRO to work on IPv6 over GRE tap
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+Rebuild_CHGLOG: - [net] ipv6_gre: Fix GRO to work on IPv6 over GRE tap (Hangbin Liu) [1725596]
+Rebuild_FUZZ: 94.85%
+commit-author Maria Pasechnik <mariap@mellanox.com>
+commit eb95f52fc72d15566fe06807c9e0cabbcd3480f1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/eb95f52f.failed
+
+IPv6 GRO over GRE tap is not working while GRO is not set
+over the native interface.
+
+gro_list_prepare function updates the same_flow variable
+of existing sessions to 1 if their mac headers match the one
+of the incoming packet.
+same_flow is used to filter out non-matching sessions and keep
+potential ones for aggregation.
+
+The number of bytes to compare should be the number of bytes
+in the mac headers. In gro_list_prepare this number is set to
+be skb->dev->hard_header_len. For GRE interfaces this hard_header_len
+should be as it is set in the initialization process (when GRE is
+created), it should not be overridden. But currently it is being overridden
+by the value that is actually supposed to represent the needed_headroom.
+Therefore, the number of bytes compared in order to decide whether the
+the mac headers are the same is greater than the length of the headers.
+
+As it's documented in netdevice.h, hard_header_len is the maximum
+hardware header length, and needed_headroom is the extra headroom
+the hardware may need.
+hard_header_len is basically all the bytes received by the physical
+till layer 3 header of the packet received by the interface.
+For example, if the interface is a GRE tap then the needed_headroom
+should be the total length of the following headers:
+IP header of the physical, GRE header, mac header of GRE.
+It is often used to calculate the MTU of the created interface.
+
+This patch removes the override of the hard_header_len, and
+assigns the calculated value to needed_headroom.
+This way, the comparison in gro_list_prepare is really of
+the mac headers, and if the packets have the same mac headers
+the same_flow will be set to 1.
+
+Performance testing: 45% higher bandwidth.
+Measuring bandwidth of single-stream IPv4 TCP traffic over IPv6
+GRE tap while GRO is not set on the native.
+NIC: ConnectX-4LX
+Before (GRO not working) : 7.2 Gbits/sec
+After (GRO working): 10.5 Gbits/sec
+
+	Signed-off-by: Maria Pasechnik <mariap@mellanox.com>
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit eb95f52fc72d15566fe06807c9e0cabbcd3480f1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/ip6_gre.c
+diff --cc net/ipv6/ip6_gre.c
+index d333143106be,18a3794b0f52..000000000000
+--- a/net/ipv6/ip6_gre.c
++++ b/net/ipv6/ip6_gre.c
+@@@ -774,8 -1147,26 +774,31 @@@ static void ip6gre_tnl_link_config(stru
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static int ip6gre_tnl_change(struct ip6_tnl *t,
+ +	const struct __ip6_tnl_parm *p, int set_mtu)
+++=======
++ static int ip6gre_calc_hlen(struct ip6_tnl *tunnel)
++ {
++ 	int t_hlen;
++ 
++ 	tunnel->tun_hlen = gre_calc_hlen(tunnel->parms.o_flags);
++ 	tunnel->hlen = tunnel->tun_hlen + tunnel->encap_hlen;
++ 
++ 	t_hlen = tunnel->hlen + sizeof(struct ipv6hdr);
++ 	tunnel->dev->needed_headroom = LL_MAX_HEADER + t_hlen;
++ 	return t_hlen;
++ }
++ 
++ static void ip6gre_tnl_link_config(struct ip6_tnl *t, int set_mtu)
++ {
++ 	ip6gre_tnl_link_config_common(t);
++ 	ip6gre_tnl_link_config_route(t, set_mtu, ip6gre_calc_hlen(t));
++ }
++ 
++ static void ip6gre_tnl_copy_tnl_parm(struct ip6_tnl *t,
++ 				     const struct __ip6_tnl_parm *p)
+++>>>>>>> eb95f52fc72d (net: ipv6_gre: Fix GRO to work on IPv6 over GRE tap)
+  {
+  	t->parms.laddr = p->laddr;
+  	t->parms.raddr = p->raddr;
+@@@ -1281,10 -1816,73 +1304,80 @@@ static const struct net_device_ops ip6g
+  	.ndo_get_iflink = ip6_tnl_get_iflink,
+  };
+  
+++<<<<<<< HEAD
+ +#define GRE6_FEATURES (NETIF_F_SG |		\
+ +		       NETIF_F_FRAGLIST |	\
+ +		       NETIF_F_HIGHDMA |		\
+ +		       NETIF_F_HW_CSUM)
+++=======
++ static int ip6erspan_calc_hlen(struct ip6_tnl *tunnel)
++ {
++ 	int t_hlen;
++ 
++ 	tunnel->tun_hlen = 8;
++ 	tunnel->hlen = tunnel->tun_hlen + tunnel->encap_hlen +
++ 		       erspan_hdr_len(tunnel->parms.erspan_ver);
++ 
++ 	t_hlen = tunnel->hlen + sizeof(struct ipv6hdr);
++ 	tunnel->dev->needed_headroom = LL_MAX_HEADER + t_hlen;
++ 	return t_hlen;
++ }
++ 
++ static int ip6erspan_tap_init(struct net_device *dev)
++ {
++ 	struct ip6_tnl *tunnel;
++ 	int t_hlen;
++ 	int ret;
++ 
++ 	tunnel = netdev_priv(dev);
++ 
++ 	tunnel->dev = dev;
++ 	tunnel->net = dev_net(dev);
++ 	strcpy(tunnel->parms.name, dev->name);
++ 
++ 	dev->tstats = netdev_alloc_pcpu_stats(struct pcpu_sw_netstats);
++ 	if (!dev->tstats)
++ 		return -ENOMEM;
++ 
++ 	ret = dst_cache_init(&tunnel->dst_cache, GFP_KERNEL);
++ 	if (ret)
++ 		goto cleanup_alloc_pcpu_stats;
++ 
++ 	ret = gro_cells_init(&tunnel->gro_cells, dev);
++ 	if (ret)
++ 		goto cleanup_dst_cache_init;
++ 
++ 	t_hlen = ip6erspan_calc_hlen(tunnel);
++ 	dev->mtu = ETH_DATA_LEN - t_hlen;
++ 	if (dev->type == ARPHRD_ETHER)
++ 		dev->mtu -= ETH_HLEN;
++ 	if (!(tunnel->parms.flags & IP6_TNL_F_IGN_ENCAP_LIMIT))
++ 		dev->mtu -= 8;
++ 
++ 	dev->priv_flags |= IFF_LIVE_ADDR_CHANGE;
++ 	ip6erspan_tnl_link_config(tunnel, 1);
++ 
++ 	return 0;
++ 
++ cleanup_dst_cache_init:
++ 	dst_cache_destroy(&tunnel->dst_cache);
++ cleanup_alloc_pcpu_stats:
++ 	free_percpu(dev->tstats);
++ 	dev->tstats = NULL;
++ 	return ret;
++ }
++ 
++ static const struct net_device_ops ip6erspan_netdev_ops = {
++ 	.ndo_init =		ip6erspan_tap_init,
++ 	.ndo_uninit =		ip6erspan_tunnel_uninit,
++ 	.ndo_start_xmit =	ip6erspan_tunnel_xmit,
++ 	.ndo_set_mac_address =	eth_mac_addr,
++ 	.ndo_validate_addr =	eth_validate_addr,
++ 	.ndo_change_mtu =	ip6_tnl_change_mtu,
++ 	.ndo_get_stats64 =	ip_tunnel_get_stats64,
++ 	.ndo_get_iflink =	ip6_tnl_get_iflink,
++ };
+++>>>>>>> eb95f52fc72d (net: ipv6_gre: Fix GRO to work on IPv6 over GRE tap)
+  
+  static void ip6gre_tap_setup(struct net_device *dev)
+  {
+* Unmerged path net/ipv6/ip6_gre.c
