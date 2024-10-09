@@ -1,0 +1,275 @@
+GFS2: Switch tr_touched to flag in transaction
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit 9862ca056e654633e521b303f74fb123f7f17e98
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/9862ca05.failed
+
+This patch eliminates the int variable tr_touched in favor of a
+new flag in the transaction. This is a step toward reducing contention
+on the gfs2_log_lock spin_lock.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+(cherry picked from commit 9862ca056e654633e521b303f74fb123f7f17e98)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/incore.h
+#	fs/gfs2/log.c
+#	fs/gfs2/meta_io.c
+#	fs/gfs2/trans.c
+diff --cc fs/gfs2/incore.h
+index 435f6cce6f7a,c45084ac642d..000000000000
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@@ -463,11 -482,7 +469,15 @@@ struct gfs2_trans 
+  	unsigned int tr_blocks;
+  	unsigned int tr_revokes;
+  	unsigned int tr_reserved;
+++<<<<<<< HEAD
+ +
+ +	struct gfs2_holder tr_t_gh;
+ +
+ +	int tr_touched;
+ +	int tr_attached;
+++=======
++ 	unsigned long tr_flags;
+++>>>>>>> 9862ca056e65 (GFS2: Switch tr_touched to flag in transaction)
+  
+  	unsigned int tr_num_buf_new;
+  	unsigned int tr_num_databuf_new;
+diff --cc fs/gfs2/log.c
+index 67ed790519f8,4fb76c04e65b..000000000000
+--- a/fs/gfs2/log.c
++++ b/fs/gfs2/log.c
+@@@ -671,6 -791,27 +671,30 @@@ void gfs2_log_flush(struct gfs2_sbd *sd
+  	kfree(tr);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * gfs2_merge_trans - Merge a new transaction into a cached transaction
++  * @old: Original transaction to be expanded
++  * @new: New transaction to be merged
++  */
++ 
++ static void gfs2_merge_trans(struct gfs2_trans *old, struct gfs2_trans *new)
++ {
++ 	WARN_ON_ONCE(!test_bit(TR_ATTACHED, &old->tr_flags));
++ 
++ 	old->tr_num_buf_new	+= new->tr_num_buf_new;
++ 	old->tr_num_databuf_new	+= new->tr_num_databuf_new;
++ 	old->tr_num_buf_rm	+= new->tr_num_buf_rm;
++ 	old->tr_num_databuf_rm	+= new->tr_num_databuf_rm;
++ 	old->tr_num_revoke	+= new->tr_num_revoke;
++ 	old->tr_num_revoke_rm	+= new->tr_num_revoke_rm;
++ 
++ 	list_splice_tail_init(&new->tr_databuf, &old->tr_databuf);
++ 	list_splice_tail_init(&new->tr_buf, &old->tr_buf);
++ }
++ 
+++>>>>>>> 9862ca056e65 (GFS2: Switch tr_touched to flag in transaction)
+  static void log_refund(struct gfs2_sbd *sdp, struct gfs2_trans *tr)
+  {
+  	unsigned int reserved;
+@@@ -678,15 -819,20 +702,26 @@@
+  
+  	gfs2_log_lock(sdp);
+  
+++<<<<<<< HEAD
+ +	sdp->sd_log_commited_buf += tr->tr_num_buf_new - tr->tr_num_buf_rm;
+ +	sdp->sd_log_commited_databuf += tr->tr_num_databuf_new -
+ +		tr->tr_num_databuf_rm;
+ +	gfs2_assert_withdraw(sdp, (((int)sdp->sd_log_commited_buf) >= 0) ||
+ +			     (((int)sdp->sd_log_commited_databuf) >= 0));
+++=======
++ 	if (sdp->sd_log_tr) {
++ 		gfs2_merge_trans(sdp->sd_log_tr, tr);
++ 	} else if (tr->tr_num_buf_new || tr->tr_num_databuf_new) {
++ 		gfs2_assert_withdraw(sdp, test_bit(TR_ALLOCED, &tr->tr_flags));
++ 		sdp->sd_log_tr = tr;
++ 		set_bit(TR_ATTACHED, &tr->tr_flags);
++ 	}
++ 
+++>>>>>>> 9862ca056e65 (GFS2: Switch tr_touched to flag in transaction)
+  	sdp->sd_log_commited_revoke += tr->tr_num_revoke - tr->tr_num_revoke_rm;
+  	reserved = calc_reserved(sdp);
+ -	maxres = sdp->sd_log_blks_reserved + tr->tr_reserved;
+ -	gfs2_assert_withdraw(sdp, maxres >= reserved);
+ -	unused = maxres - reserved;
+ +	gfs2_assert_withdraw(sdp, sdp->sd_log_blks_reserved + tr->tr_reserved >= reserved);
+ +	unused = sdp->sd_log_blks_reserved - reserved + tr->tr_reserved;
+  	atomic_add(unused, &sdp->sd_log_blks_free);
+  	trace_gfs2_log_blocks(sdp, unused);
+  	gfs2_assert_withdraw(sdp, atomic_read(&sdp->sd_log_blks_free) <=
+diff --cc fs/gfs2/meta_io.c
+index fbbe1b648fd3,a88a347cffe3..000000000000
+--- a/fs/gfs2/meta_io.c
++++ b/fs/gfs2/meta_io.c
+@@@ -350,16 -342,11 +350,20 @@@ void gfs2_remove_from_journal(struct bu
+  		trace_gfs2_pin(bd, 0);
+  		atomic_dec(&sdp->sd_log_pinned);
+  		list_del_init(&bd->bd_list);
+ -		if (meta == REMOVE_META)
+ +		if (meta) {
+ +			gfs2_assert_warn(sdp, sdp->sd_log_num_buf);
+ +			sdp->sd_log_num_buf--;
+  			tr->tr_num_buf_rm++;
+ -		else
+ +		} else {
+ +			gfs2_assert_warn(sdp, sdp->sd_log_num_databuf);
+ +			sdp->sd_log_num_databuf--;
+  			tr->tr_num_databuf_rm++;
+++<<<<<<< HEAD
+ +		}
+ +		tr->tr_touched = 1;
+++=======
++ 		set_bit(TR_TOUCHED, &tr->tr_flags);
+++>>>>>>> 9862ca056e65 (GFS2: Switch tr_touched to flag in transaction)
+  		was_pinned = 1;
+  		brelse(bh);
+  	}
+diff --cc fs/gfs2/trans.c
+index d7f68983ce8e,5d7f5b08d600..000000000000
+--- a/fs/gfs2/trans.c
++++ b/fs/gfs2/trans.c
+@@@ -46,6 -48,7 +46,10 @@@ int gfs2_trans_begin(struct gfs2_sbd *s
+  	tr->tr_blocks = blocks;
+  	tr->tr_revokes = revokes;
+  	tr->tr_reserved = 1;
+++<<<<<<< HEAD
+++=======
++ 	set_bit(TR_ALLOCED, &tr->tr_flags);
+++>>>>>>> 9862ca056e65 (GFS2: Switch tr_touched to flag in transaction)
+  	if (blocks)
+  		tr->tr_reserved += 6 + blocks;
+  	if (revokes)
+@@@ -77,50 -74,33 +81,66 @@@ fail_holder_uninit
+  	return error;
+  }
+  
+ +/**
+ + * gfs2_log_release - Release a given number of log blocks
+ + * @sdp: The GFS2 superblock
+ + * @blks: The number of blocks
+ + *
+ + */
+ +
+ +static void gfs2_log_release(struct gfs2_sbd *sdp, unsigned int blks)
+ +{
+ +
+ +	atomic_add(blks, &sdp->sd_log_blks_free);
+ +	trace_gfs2_log_blocks(sdp, blks);
+ +	gfs2_assert_withdraw(sdp, atomic_read(&sdp->sd_log_blks_free) <=
+ +				  sdp->sd_jdesc->jd_blocks);
+ +	up_read(&sdp->sd_log_flush_lock);
+ +}
+ +
+  static void gfs2_print_trans(const struct gfs2_trans *tr)
+  {
+++<<<<<<< HEAD
+ +	printk(KERN_WARNING "GFS2: Transaction created at: %pSR\n",
+ +	       (void *)tr->tr_ip);
+ +	printk(KERN_WARNING "GFS2: blocks=%u revokes=%u reserved=%u touched=%d\n",
+ +	       tr->tr_blocks, tr->tr_revokes, tr->tr_reserved, tr->tr_touched);
+ +	printk(KERN_WARNING "GFS2: Buf %u/%u Databuf %u/%u Revoke %u/%u\n",
+ +	       tr->tr_num_buf_new, tr->tr_num_buf_rm,
+ +	       tr->tr_num_databuf_new, tr->tr_num_databuf_rm,
+ +	       tr->tr_num_revoke, tr->tr_num_revoke_rm);
+++=======
++ 	pr_warn("Transaction created at: %pSR\n", (void *)tr->tr_ip);
++ 	pr_warn("blocks=%u revokes=%u reserved=%u touched=%u\n",
++ 		tr->tr_blocks, tr->tr_revokes, tr->tr_reserved,
++ 		test_bit(TR_TOUCHED, &tr->tr_flags));
++ 	pr_warn("Buf %u/%u Databuf %u/%u Revoke %u/%u\n",
++ 		tr->tr_num_buf_new, tr->tr_num_buf_rm,
++ 		tr->tr_num_databuf_new, tr->tr_num_databuf_rm,
++ 		tr->tr_num_revoke, tr->tr_num_revoke_rm);
+++>>>>>>> 9862ca056e65 (GFS2: Switch tr_touched to flag in transaction)
+  }
+  
+  void gfs2_trans_end(struct gfs2_sbd *sdp)
+  {
+  	struct gfs2_trans *tr = current->journal_info;
+  	s64 nbuf;
+++<<<<<<< HEAD
+++=======
++ 	int alloced = test_bit(TR_ALLOCED, &tr->tr_flags);
++ 
+++>>>>>>> 9862ca056e65 (GFS2: Switch tr_touched to flag in transaction)
+  	BUG_ON(!tr);
+  	current->journal_info = NULL;
+  
+- 	if (!tr->tr_touched) {
++ 	if (!test_bit(TR_TOUCHED, &tr->tr_flags)) {
+  		gfs2_log_release(sdp, tr->tr_reserved);
+ -		if (alloced) {
+ +		if (tr->tr_t_gh.gh_gl) {
+ +			gfs2_glock_dq(&tr->tr_t_gh);
+ +			gfs2_holder_uninit(&tr->tr_t_gh);
+  			kfree(tr);
+ -			sb_end_intwrite(sdp->sd_vfs);
+  		}
+ +		sb_end_intwrite(sdp->sd_vfs);
+  		return;
+  	}
+  
+@@@ -133,12 -113,8 +153,17 @@@
+  		gfs2_print_trans(tr);
+  
+  	gfs2_log_commit(sdp, tr);
+++<<<<<<< HEAD
+ +	if (tr->tr_t_gh.gh_gl) {
+ +		gfs2_glock_dq(&tr->tr_t_gh);
+ +		gfs2_holder_uninit(&tr->tr_t_gh);
+ +		if (!tr->tr_attached)
+ +			kfree(tr);
+ +	}
+++=======
++ 	if (alloced && !test_bit(TR_ATTACHED, &tr->tr_flags))
++ 		kfree(tr);
+++>>>>>>> 9862ca056e65 (GFS2: Switch tr_touched to flag in transaction)
+  	up_read(&sdp->sd_log_flush_lock);
+  
+  	if (sdp->sd_vfs->s_flags & MS_SYNCHRONOUS)
+@@@ -223,9 -199,10 +248,9 @@@ static void meta_lo_add(struct gfs2_sb
+  {
+  	struct gfs2_meta_header *mh;
+  	struct gfs2_trans *tr;
+ -	enum gfs2_freeze_state state = atomic_read(&sdp->sd_freeze_state);
+  
+  	tr = current->journal_info;
+- 	tr->tr_touched = 1;
++ 	set_bit(TR_TOUCHED, &tr->tr_flags);
+  	if (!list_empty(&bd->bd_list))
+  		return;
+  	set_bit(GLF_LFLUSH, &bd->bd_gl->gl_flags);
+@@@ -278,15 -256,9 +303,20 @@@ void gfs2_trans_add_revoke(struct gfs2_
+  	struct gfs2_trans *tr = current->journal_info;
+  
+  	BUG_ON(!list_empty(&bd->bd_list));
+++<<<<<<< HEAD
+ +	BUG_ON(!list_empty(&bd->bd_ail_st_list));
+ +	BUG_ON(!list_empty(&bd->bd_ail_gl_list));
+ +	bd->bd_ops = &gfs2_revoke_lops;
+ +	tr->tr_touched = 1;
+++=======
++ 	gfs2_add_revoke(sdp, bd);
++ 	set_bit(TR_TOUCHED, &tr->tr_flags);
+++>>>>>>> 9862ca056e65 (GFS2: Switch tr_touched to flag in transaction)
+  	tr->tr_num_revoke++;
+ +	sdp->sd_log_num_revoke++;
+ +	atomic_inc(&gl->gl_revokes);
+ +	set_bit(GLF_LFLUSH, &gl->gl_flags);
+ +	list_add(&bd->bd_list, &sdp->sd_log_le_revoke);
+  }
+  
+  void gfs2_trans_add_unrevoke(struct gfs2_sbd *sdp, u64 blkno, unsigned int len)
+* Unmerged path fs/gfs2/incore.h
+* Unmerged path fs/gfs2/log.c
+* Unmerged path fs/gfs2/meta_io.c
+* Unmerged path fs/gfs2/trans.c
