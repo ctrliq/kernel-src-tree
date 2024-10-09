@@ -1,0 +1,194 @@
+ipv4: fix fnhe usage by non-cached routes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.el7
+commit-author Julian Anastasov <ja@ssi.bg>
+commit 94720e3aee6884d8c8beb678001629da60ec6366
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.el7/94720e3a.failed
+
+Allow some non-cached routes to use non-expired fnhe:
+
+1. ip_del_fnhe: moved above and now called by find_exception.
+The 4.5+ commit deed49df7390 expires fnhe only when caching
+routes. Change that to:
+
+1.1. use fnhe for non-cached local output routes, with the help
+from (2)
+
+1.2. allow __mkroute_input to detect expired fnhe (outdated
+fnhe_gw, for example) when do_cache is false, eg. when itag!=0
+for unicast destinations.
+
+2. __mkroute_output: keep fi to allow local routes with orig_oif != 0
+to use fnhe info even when the new route will not be cached into fnhe.
+After commit 839da4d98960 ("net: ipv4: set orig_oif based on fib
+result for local traffic") it means all local routes will be affected
+because they are not cached. This change is used to solve a PMTU
+problem with IPVS (and probably Netfilter DNAT) setups that redirect
+local clients from target local IP (local route to Virtual IP)
+to new remote IP target, eg. IPVS TUN real server. Loopback has
+64K MTU and we need to create fnhe on the local route that will
+keep the reduced PMTU for the Virtual IP. Without this change
+fnhe_pmtu is updated from ICMP but never exposed to non-cached
+local routes. This includes routes with flowi4_oif!=0 for 4.6+ and
+with flowi4_oif=any for 4.14+).
+
+3. update_or_create_fnhe: make sure fnhe_expires is not 0 for
+new entries
+
+Fixes: 839da4d98960 ("net: ipv4: set orig_oif based on fib result for local traffic")
+Fixes: d6d5e999e5df ("route: do not cache fib route info on local routes with oif")
+Fixes: deed49df7390 ("route: check and remove route cache when we get route")
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Xin Long <lucien.xin@gmail.com>
+	Signed-off-by: Julian Anastasov <ja@ssi.bg>
+	Acked-by: David Ahern <dsahern@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 94720e3aee6884d8c8beb678001629da60ec6366)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/route.c
+diff --cc net/ipv4/route.c
+index 9cf3c3fd762f,1412a7baf0b9..000000000000
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@@ -1286,9 -1292,41 +1286,39 @@@ static unsigned int ipv4_mtu(const stru
+  			mtu = 576;
+  	}
+  
+ -	mtu = min_t(unsigned int, mtu, IP_MAX_MTU);
+ -
+ -	return mtu - lwtunnel_headroom(dst->lwtstate, mtu);
+ +	return min_t(unsigned int, mtu, IP_MAX_MTU);
+  }
+  
++ static void ip_del_fnhe(struct fib_nh *nh, __be32 daddr)
++ {
++ 	struct fnhe_hash_bucket *hash;
++ 	struct fib_nh_exception *fnhe, __rcu **fnhe_p;
++ 	u32 hval = fnhe_hashfun(daddr);
++ 
++ 	spin_lock_bh(&fnhe_lock);
++ 
++ 	hash = rcu_dereference_protected(nh->nh_exceptions,
++ 					 lockdep_is_held(&fnhe_lock));
++ 	hash += hval;
++ 
++ 	fnhe_p = &hash->chain;
++ 	fnhe = rcu_dereference_protected(*fnhe_p, lockdep_is_held(&fnhe_lock));
++ 	while (fnhe) {
++ 		if (fnhe->fnhe_daddr == daddr) {
++ 			rcu_assign_pointer(*fnhe_p, rcu_dereference_protected(
++ 				fnhe->fnhe_next, lockdep_is_held(&fnhe_lock)));
++ 			fnhe_flush_routes(fnhe);
++ 			kfree_rcu(fnhe, rcu);
++ 			break;
++ 		}
++ 		fnhe_p = &fnhe->fnhe_next;
++ 		fnhe = rcu_dereference_protected(fnhe->fnhe_next,
++ 						 lockdep_is_held(&fnhe_lock));
++ 	}
++ 
++ 	spin_unlock_bh(&fnhe_lock);
++ }
++ 
+  static struct fib_nh_exception *find_exception(struct fib_nh *nh, __be32 daddr)
+  {
+  	struct fnhe_hash_bucket *hash = rcu_dereference(nh->nh_exceptions);
+@@@ -1600,40 -1672,6 +1636,43 @@@ static void ip_handle_martian_source(st
+  #endif
+  }
+  
+++<<<<<<< HEAD
+ +static void ip_del_fnhe(struct fib_nh *nh, __be32 daddr)
+ +{
+ +	struct fnhe_hash_bucket *hash;
+ +	struct fib_nh_exception *fnhe, __rcu **fnhe_p;
+ +	u32 hval = fnhe_hashfun(daddr);
+ +
+ +	spin_lock_bh(&fnhe_lock);
+ +
+ +	hash = rcu_dereference_protected(nh->nh_exceptions,
+ +					 lockdep_is_held(&fnhe_lock));
+ +	hash += hval;
+ +
+ +	fnhe_p = &hash->chain;
+ +	fnhe = rcu_dereference_protected(*fnhe_p, lockdep_is_held(&fnhe_lock));
+ +	while (fnhe) {
+ +		if (fnhe->fnhe_daddr == daddr) {
+ +			rcu_assign_pointer(*fnhe_p, rcu_dereference_protected(
+ +				fnhe->fnhe_next, lockdep_is_held(&fnhe_lock)));
+ +			/* set fnhe_daddr to 0 to ensure it won't bind with
+ +			 * new dsts in rt_bind_exception().
+ +			 */
+ +			fnhe->fnhe_daddr = 0;
+ +			fnhe_flush_routes(fnhe);
+ +			kfree_rcu(fnhe, rcu);
+ +			break;
+ +		}
+ +		fnhe_p = &fnhe->fnhe_next;
+ +		fnhe = rcu_dereference_protected(fnhe->fnhe_next,
+ +						 lockdep_is_held(&fnhe_lock));
+ +	}
+ +
+ +	spin_unlock_bh(&fnhe_lock);
+ +}
+ +
+++=======
+++>>>>>>> 94720e3aee68 (ipv4: fix fnhe usage by non-cached routes)
+  /* called in rcu_read_lock() section */
+  static int __mkroute_input(struct sk_buff *skb,
+  			   const struct fib_result *res,
+@@@ -2153,33 -2222,23 +2182,41 @@@ static struct rtable *__mkroute_output(
+  		struct fib_nh *nh = &FIB_RES_NH(*res);
+  
+  		fnhe = find_exception(nh, fl4->daddr);
++ 		if (!do_cache)
++ 			goto add;
+  		if (fnhe) {
+  			prth = &fnhe->fnhe_rth_output;
+- 			rth = rcu_dereference(*prth);
+- 			if (rth && rth->dst.expires &&
+- 			    time_after(jiffies, rth->dst.expires)) {
+- 				ip_del_fnhe(nh, fl4->daddr);
+- 				fnhe = NULL;
+- 			} else {
+- 				goto rt_cache;
++ 		} else {
++ 			if (unlikely(fl4->flowi4_flags &
++ 				     FLOWI_FLAG_KNOWN_NH &&
++ 				     !(nh->nh_gw &&
++ 				       nh->nh_scope == RT_SCOPE_LINK))) {
++ 				do_cache = false;
++ 				goto add;
+  			}
++ 			prth = raw_cpu_ptr(nh->nh_pcpu_rth_output);
+  		}
+++<<<<<<< HEAD
+ +
+ +		if (unlikely(fl4->flowi4_flags &
+ +			     FLOWI_FLAG_KNOWN_NH &&
+ +			     !(nh->nh_gw &&
+ +			       nh->nh_scope == RT_SCOPE_LINK))) {
+ +			do_cache = false;
+ +			goto add;
+ +		}
+ +		prth = __this_cpu_ptr(nh->nh_pcpu_rth_output);
+ +		rth = rcu_dereference(*prth);
+ +
+ +rt_cache:
+ +		if (rt_cache_valid(rth)) {
+ +			dst_hold(&rth->dst);
+++=======
++ 		rth = rcu_dereference(*prth);
++ 		if (rt_cache_valid(rth) && dst_hold_safe(&rth->dst))
+++>>>>>>> 94720e3aee68 (ipv4: fix fnhe usage by non-cached routes)
+  			return rth;
+ +		}
+  	}
+  
+  add:
+* Unmerged path net/ipv4/route.c
