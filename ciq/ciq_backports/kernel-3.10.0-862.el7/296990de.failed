@@ -1,0 +1,218 @@
+mnt: Make propagate_umount less slow for overlapping mount propagation trees
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Eric W. Biederman <ebiederm@xmission.com>
+commit 296990deb389c7da21c78030376ba244dc1badf5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/296990de.failed
+
+Andrei Vagin pointed out that time to executue propagate_umount can go
+non-linear (and take a ludicrious amount of time) when the mount
+propogation trees of the mounts to be unmunted by a lazy unmount
+overlap.
+
+Make the walk of the mount propagation trees nearly linear by
+remembering which mounts have already been visited, allowing
+subsequent walks to detect when walking a mount propgation tree or a
+subtree of a mount propgation tree would be duplicate work and to skip
+them entirely.
+
+Walk the list of mounts whose propgatation trees need to be traversed
+from the mount highest in the mount tree to mounts lower in the mount
+tree so that odds are higher that the code will walk the largest trees
+first, allowing later tree walks to be skipped entirely.
+
+Add cleanup_umount_visitation to remover the code's memory of which
+mounts have been visited.
+
+Add the functions last_slave and skip_propagation_subtree to allow
+skipping appropriate parts of the mount propagation tree without
+needing to change the logic of the rest of the code.
+
+A script to generate overlapping mount propagation trees:
+
+$ cat runs.h
+set -e
+mount -t tmpfs zdtm /mnt
+mkdir -p /mnt/1 /mnt/2
+mount -t tmpfs zdtm /mnt/1
+mount --make-shared /mnt/1
+mkdir /mnt/1/1
+
+iteration=10
+if [ -n "$1" ] ; then
+	iteration=$1
+fi
+
+for i in $(seq $iteration); do
+	mount --bind /mnt/1/1 /mnt/1/1
+done
+
+mount --rbind /mnt/1 /mnt/2
+
+TIMEFORMAT='%Rs'
+nr=$(( ( 2 ** ( $iteration + 1 ) ) + 1 ))
+echo -n "umount -l /mnt/1 -> $nr        "
+time umount -l /mnt/1
+
+nr=$(cat /proc/self/mountinfo | grep zdtm | wc -l )
+time umount -l /mnt/2
+
+$ for i in $(seq 9 19); do echo $i; unshare -Urm bash ./run.sh $i; done
+
+Here are the performance numbers with and without the patch:
+
+     mhash |  8192   |  8192  | 1048576 | 1048576
+    mounts | before  | after  |  before | after
+    ------------------------------------------------
+      1025 |  0.040s | 0.016s |  0.038s | 0.019s
+      2049 |  0.094s | 0.017s |  0.080s | 0.018s
+      4097 |  0.243s | 0.019s |  0.206s | 0.023s
+      8193 |  1.202s | 0.028s |  1.562s | 0.032s
+     16385 |  9.635s | 0.036s |  9.952s | 0.041s
+     32769 | 60.928s | 0.063s | 44.321s | 0.064s
+     65537 |         | 0.097s |         | 0.097s
+    131073 |         | 0.233s |         | 0.176s
+    262145 |         | 0.653s |         | 0.344s
+    524289 |         | 2.305s |         | 0.735s
+   1048577 |         | 7.107s |         | 2.603s
+
+Andrei Vagin reports fixing the performance problem is part of the
+work to fix CVE-2016-6213.
+
+	Cc: stable@vger.kernel.org
+Fixes: a05964f3917c ("[PATCH] shared mounts handling: umount")
+	Reported-by: Andrei Vagin <avagin@openvz.org>
+	Reviewed-by: Andrei Vagin <avagin@virtuozzo.com>
+	Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+(cherry picked from commit 296990deb389c7da21c78030376ba244dc1badf5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/pnode.c
+diff --cc fs/pnode.c
+index 5922b82d049b,53d411a371ce..000000000000
+--- a/fs/pnode.c
++++ b/fs/pnode.c
+@@@ -438,6 -500,38 +456,41 @@@ static void __propagate_umount(struct m
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void restore_mounts(struct list_head *to_restore)
++ {
++ 	/* Restore mounts to a clean working state */
++ 	while (!list_empty(to_restore)) {
++ 		struct mount *mnt, *parent;
++ 		struct mountpoint *mp;
++ 
++ 		mnt = list_first_entry(to_restore, struct mount, mnt_umounting);
++ 		CLEAR_MNT_MARK(mnt);
++ 		list_del_init(&mnt->mnt_umounting);
++ 
++ 		/* Should this mount be reparented? */
++ 		mp = mnt->mnt_mp;
++ 		parent = mnt->mnt_parent;
++ 		while (parent->mnt.mnt_flags & MNT_UMOUNT) {
++ 			mp = parent->mnt_mp;
++ 			parent = parent->mnt_parent;
++ 		}
++ 		if (parent != mnt->mnt_parent)
++ 			mnt_change_mountpoint(parent, mp, mnt);
++ 	}
++ }
++ 
++ static void cleanup_umount_visitations(struct list_head *visited)
++ {
++ 	while (!list_empty(visited)) {
++ 		struct mount *mnt =
++ 			list_first_entry(visited, struct mount, mnt_umounting);
++ 		list_del_init(&mnt->mnt_umounting);
++ 	}
++ }
++ 
+++>>>>>>> 296990deb389 (mnt: Make propagate_umount less slow for overlapping mount propagation trees)
+  /*
+   * collect all mounts that receive propagation from the mount in @list,
+   * and return these additional mounts in the same list.
+@@@ -448,11 -542,68 +501,76 @@@
+  int propagate_umount(struct list_head *list)
+  {
+  	struct mount *mnt;
+++<<<<<<< HEAD
+ +
+ +	list_for_each_entry_reverse(mnt, list, mnt_list)
+ +		mark_umount_candidates(mnt);
+++=======
++ 	LIST_HEAD(to_restore);
++ 	LIST_HEAD(to_umount);
++ 	LIST_HEAD(visited);
++ 
++ 	/* Find candidates for unmounting */
++ 	list_for_each_entry_reverse(mnt, list, mnt_list) {
++ 		struct mount *parent = mnt->mnt_parent;
++ 		struct mount *m;
++ 
++ 		/*
++ 		 * If this mount has already been visited it is known that it's
++ 		 * entire peer group and all of their slaves in the propagation
++ 		 * tree for the mountpoint has already been visited and there is
++ 		 * no need to visit them again.
++ 		 */
++ 		if (!list_empty(&mnt->mnt_umounting))
++ 			continue;
++ 
++ 		list_add_tail(&mnt->mnt_umounting, &visited);
++ 		for (m = propagation_next(parent, parent); m;
++ 		     m = propagation_next(m, parent)) {
++ 			struct mount *child = __lookup_mnt(&m->mnt,
++ 							   mnt->mnt_mountpoint);
++ 			if (!child)
++ 				continue;
++ 
++ 			if (!list_empty(&child->mnt_umounting)) {
++ 				/*
++ 				 * If the child has already been visited it is
++ 				 * know that it's entire peer group and all of
++ 				 * their slaves in the propgation tree for the
++ 				 * mountpoint has already been visited and there
++ 				 * is no need to visit this subtree again.
++ 				 */
++ 				m = skip_propagation_subtree(m, parent);
++ 				continue;
++ 			} else if (child->mnt.mnt_flags & MNT_UMOUNT) {
++ 				/*
++ 				 * We have come accross an partially unmounted
++ 				 * mount in list that has not been visited yet.
++ 				 * Remember it has been visited and continue
++ 				 * about our merry way.
++ 				 */
++ 				list_add_tail(&child->mnt_umounting, &visited);
++ 				continue;
++ 			}
++ 
++ 			/* Check the child and parents while progress is made */
++ 			while (__propagate_umount(child,
++ 						  &to_umount, &to_restore)) {
++ 				/* Is the parent a umount candidate? */
++ 				child = child->mnt_parent;
++ 				if (list_empty(&child->mnt_umounting))
++ 					break;
++ 			}
++ 		}
++ 	}
++ 
++ 	umount_list(&to_umount, &to_restore);
++ 	restore_mounts(&to_restore);
++ 	cleanup_umount_visitations(&visited);
++ 	list_splice_tail(&to_umount, list);
+++>>>>>>> 296990deb389 (mnt: Make propagate_umount less slow for overlapping mount propagation trees)
+  
+ +	list_for_each_entry(mnt, list, mnt_list)
+ +		__propagate_umount(mnt);
+  	return 0;
+  }
+* Unmerged path fs/pnode.c
