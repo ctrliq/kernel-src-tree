@@ -1,0 +1,153 @@
+qed: Learn of RDMA capabilities per-device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Mintz, Yuval <Yuval.Mintz@cavium.com>
+commit 6927e82680699f7999d68c648d50574a5e4a8f37
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/6927e826.failed
+
+Today, RDMA capabilities are learned from management firmware
+which provides a per-device indication for all interfaces.
+Newer management firmware is capable of providing a per-device
+indication [would later be extended to either RoCE/iWARP].
+
+Try using this newer learning mechanism, but fallback in case
+management firmware is too old to retain current functionality.
+
+	Signed-off-by: Yuval Mintz <Yuval.Mintz@cavium.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6927e82680699f7999d68c648d50574a5e4a8f37)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qed/qed_hsi.h
+diff --cc drivers/net/ethernet/qlogic/qed/qed_hsi.h
+index 3601aad5e229,1d113ce814e1..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_hsi.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_hsi.h
+@@@ -8585,6 -8601,8 +8585,11 @@@ struct public_drv_mb 
+  
+  #define DRV_MSG_CODE_BIST_TEST			0x001e0000
+  #define DRV_MSG_CODE_SET_LED_MODE		0x00200000
+++<<<<<<< HEAD
+++=======
++ #define DRV_MSG_CODE_GET_PF_RDMA_PROTOCOL	0x002b0000
++ #define DRV_MSG_CODE_OS_WOL			0x002e0000
+++>>>>>>> 6927e8268069 (qed: Learn of RDMA capabilities per-device)
+  
+  #define DRV_MSG_SEQ_NUMBER_MASK			0x0000ffff
+  
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_hsi.h
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_mcp.c b/drivers/net/ethernet/qlogic/qed/qed_mcp.c
+index dae4c0af6504..120f859a3fc9 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_mcp.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_mcp.c
+@@ -1001,28 +1001,89 @@ int qed_mcp_get_media_type(struct qed_dev *cdev, u32 *p_media_type)
+ 	return 0;
+ }
+ 
++/* Old MFW has a global configuration for all PFs regarding RDMA support */
++static void
++qed_mcp_get_shmem_proto_legacy(struct qed_hwfn *p_hwfn,
++			       enum qed_pci_personality *p_proto)
++{
++	/* There wasn't ever a legacy MFW that published iwarp.
++	 * So at this point, this is either plain l2 or RoCE.
++	 */
++	if (test_bit(QED_DEV_CAP_ROCE, &p_hwfn->hw_info.device_capabilities))
++		*p_proto = QED_PCI_ETH_ROCE;
++	else
++		*p_proto = QED_PCI_ETH;
++
++	DP_VERBOSE(p_hwfn, NETIF_MSG_IFUP,
++		   "According to Legacy capabilities, L2 personality is %08x\n",
++		   (u32) *p_proto);
++}
++
++static int
++qed_mcp_get_shmem_proto_mfw(struct qed_hwfn *p_hwfn,
++			    struct qed_ptt *p_ptt,
++			    enum qed_pci_personality *p_proto)
++{
++	u32 resp = 0, param = 0;
++	int rc;
++
++	rc = qed_mcp_cmd(p_hwfn, p_ptt,
++			 DRV_MSG_CODE_GET_PF_RDMA_PROTOCOL, 0, &resp, &param);
++	if (rc)
++		return rc;
++	if (resp != FW_MSG_CODE_OK) {
++		DP_VERBOSE(p_hwfn, NETIF_MSG_IFUP,
++			   "MFW lacks support for command; Returns %08x\n",
++			   resp);
++		return -EINVAL;
++	}
++
++	switch (param) {
++	case FW_MB_PARAM_GET_PF_RDMA_NONE:
++		*p_proto = QED_PCI_ETH;
++		break;
++	case FW_MB_PARAM_GET_PF_RDMA_ROCE:
++		*p_proto = QED_PCI_ETH_ROCE;
++		break;
++	case FW_MB_PARAM_GET_PF_RDMA_BOTH:
++		DP_NOTICE(p_hwfn,
++			  "Current day drivers don't support RoCE & iWARP. Default to RoCE-only\n");
++		*p_proto = QED_PCI_ETH_ROCE;
++		break;
++	case FW_MB_PARAM_GET_PF_RDMA_IWARP:
++	default:
++		DP_NOTICE(p_hwfn,
++			  "MFW answers GET_PF_RDMA_PROTOCOL but param is %08x\n",
++			  param);
++		return -EINVAL;
++	}
++
++	DP_VERBOSE(p_hwfn,
++		   NETIF_MSG_IFUP,
++		   "According to capabilities, L2 personality is %08x [resp %08x param %08x]\n",
++		   (u32) *p_proto, resp, param);
++	return 0;
++}
++
+ static int
+ qed_mcp_get_shmem_proto(struct qed_hwfn *p_hwfn,
+ 			struct public_func *p_info,
++			struct qed_ptt *p_ptt,
+ 			enum qed_pci_personality *p_proto)
+ {
+ 	int rc = 0;
+ 
+ 	switch (p_info->config & FUNC_MF_CFG_PROTOCOL_MASK) {
+ 	case FUNC_MF_CFG_PROTOCOL_ETHERNET:
+-		if (test_bit(QED_DEV_CAP_ROCE,
+-			     &p_hwfn->hw_info.device_capabilities))
+-			*p_proto = QED_PCI_ETH_ROCE;
+-		else
+-			*p_proto = QED_PCI_ETH;
++		if (qed_mcp_get_shmem_proto_mfw(p_hwfn, p_ptt, p_proto))
++			qed_mcp_get_shmem_proto_legacy(p_hwfn, p_proto);
+ 		break;
+ 	case FUNC_MF_CFG_PROTOCOL_ISCSI:
+ 		*p_proto = QED_PCI_ISCSI;
+ 		break;
+ 	case FUNC_MF_CFG_PROTOCOL_ROCE:
+ 		DP_NOTICE(p_hwfn, "RoCE personality is not a valid value!\n");
+-		rc = -EINVAL;
+-		break;
++	/* Fallthrough */
+ 	default:
+ 		rc = -EINVAL;
+ 	}
+@@ -1042,7 +1103,8 @@ int qed_mcp_fill_shmem_func_info(struct qed_hwfn *p_hwfn,
+ 	info->pause_on_host = (shmem_info.config &
+ 			       FUNC_MF_CFG_PAUSE_ON_HOST_RING) ? 1 : 0;
+ 
+-	if (qed_mcp_get_shmem_proto(p_hwfn, &shmem_info, &info->protocol)) {
++	if (qed_mcp_get_shmem_proto(p_hwfn, &shmem_info, p_ptt,
++				    &info->protocol)) {
+ 		DP_ERR(p_hwfn, "Unknown personality %08x\n",
+ 		       (u32)(shmem_info.config & FUNC_MF_CFG_PROTOCOL_MASK));
+ 		return -EINVAL;
