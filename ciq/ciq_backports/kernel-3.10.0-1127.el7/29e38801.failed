@@ -1,0 +1,118 @@
+netfilter: nf_tables: fix use-after-free when deleting compat expressions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Florian Westphal <fw@strlen.de>
+commit 29e3880109e357fdc607b4393f8308cef6af9413
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/29e38801.failed
+
+nft_compat ops do not have static storage duration, unlike all other
+expressions.
+
+When nf_tables_expr_destroy() returns, expr->ops might have been
+free'd already, so we need to store next address before calling
+expression destructor.
+
+For same reason, we can't deref match pointer after nft_xt_put().
+
+This can be easily reproduced by adding msleep() before
+nft_match_destroy() returns.
+
+Fixes: 0ca743a55991 ("netfilter: nf_tables: add compatibility layer for x_tables")
+	Reported-by: Pablo Neira Ayuso <pablo@netfilter.org>
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 29e3880109e357fdc607b4393f8308cef6af9413)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nft_compat.c
+diff --cc net/netfilter/nft_compat.c
+index 424d1b9a8293,7334e0b80a5e..000000000000
+--- a/net/netfilter/nft_compat.c
++++ b/net/netfilter/nft_compat.c
+@@@ -429,25 -516,42 +429,47 @@@ err
+  }
+  
+  static void
+++<<<<<<< HEAD
+++=======
++ __nft_match_destroy(const struct nft_ctx *ctx, const struct nft_expr *expr,
++ 		    void *info)
++ {
++ 	struct xt_match *match = expr->ops->data;
++ 	struct module *me = match->me;
++ 	struct xt_mtdtor_param par;
++ 
++ 	par.net = ctx->net;
++ 	par.match = match;
++ 	par.matchinfo = info;
++ 	par.family = ctx->family;
++ 	if (par.match->destroy != NULL)
++ 		par.match->destroy(&par);
++ 
++ 	if (nft_xt_put(container_of(expr->ops, struct nft_xt, ops)))
++ 		module_put(me);
++ }
++ 
++ static void
+++>>>>>>> 29e3880109e3 (netfilter: nf_tables: fix use-after-free when deleting compat expressions)
+  nft_match_destroy(const struct nft_ctx *ctx, const struct nft_expr *expr)
+  {
+ -	__nft_match_destroy(ctx, expr, nft_expr_priv(expr));
+ -}
+ +	struct xt_match *match = expr->ops->data;
+ +	void *info = nft_expr_priv(expr);
+ +	struct xt_mtdtor_param par;
+  
+ -static void
+ -nft_match_large_destroy(const struct nft_ctx *ctx, const struct nft_expr *expr)
+ -{
+ -	struct nft_xt_match_priv *priv = nft_expr_priv(expr);
+ +	par.net = ctx->net;
+ +	par.match = match;
+ +	par.matchinfo = info;
+ +	par.family = ctx->afi->family;
+ +	if (par.match->destroy != NULL)
+ +		par.match->destroy(&par);
+  
+ -	__nft_match_destroy(ctx, expr, priv->info);
+ -	kfree(priv->info);
+ +	module_put(match->me);
+  }
+  
+ -static int __nft_match_dump(struct sk_buff *skb, const struct nft_expr *expr,
+ -			    void *info)
+ +static int nft_match_dump(struct sk_buff *skb, const struct nft_expr *expr)
+  {
+ +	void *info = nft_expr_priv(expr);
+  	struct xt_match *match = expr->ops->data;
+  
+  	if (nla_put_string(skb, NFTA_MATCH_NAME, match->name) ||
+diff --git a/net/netfilter/nf_tables_api.c b/net/netfilter/nf_tables_api.c
+index fac54e2397f0..06edd5eeb013 100644
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@ -2006,7 +2006,7 @@ err:
+ static void nf_tables_rule_destroy(const struct nft_ctx *ctx,
+ 				   struct nft_rule *rule)
+ {
+-	struct nft_expr *expr;
++	struct nft_expr *expr, *next;
+ 
+ 	/*
+ 	 * Careful: some expressions might not be initialized in case this
+@@ -2014,8 +2014,9 @@ static void nf_tables_rule_destroy(const struct nft_ctx *ctx,
+ 	 */
+ 	expr = nft_expr_first(rule);
+ 	while (expr != nft_expr_last(rule) && expr->ops) {
++		next = nft_expr_next(expr);
+ 		nf_tables_expr_destroy(ctx, expr);
+-		expr = nft_expr_next(expr);
++		expr = next;
+ 	}
+ 	kfree(rule);
+ }
+* Unmerged path net/netfilter/nft_compat.c
