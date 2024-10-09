@@ -1,0 +1,303 @@
+perf/core: Rewrite event timekeeping
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 0d3d73aac2ff05c78387aa9dcc2c8aa3804405e7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/0d3d73aa.failed
+
+The current even timekeeping, which computes enabled and running
+times, uses 3 distinct timestamps to reflect the various event states:
+OFF (stopped), INACTIVE (enabled) and ACTIVE (running).
+
+Furthermore, the update rules are such that even INACTIVE events need
+their timestamps updated. This is undesirable because we'd like to not
+touch INACTIVE events if at all possible, this makes event scheduling
+(much) more expensive than needed.
+
+Rewrite the timekeeping to directly use event->state, this greatly
+simplifies the code and results in only having to update things when
+we change state, or an up-to-date value is requested (read).
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 0d3d73aac2ff05c78387aa9dcc2c8aa3804405e7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/events/core.c
+diff --cc kernel/events/core.c
+index e490cd411934,2551e8ce7224..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -845,39 -923,41 +927,77 @@@ perf_cgroup_set_shadow_time(struct perf
+  	event->shadow_ctx_time = now - t->timestamp;
+  }
+  
+++<<<<<<< HEAD
+ +static inline void
+ +perf_cgroup_defer_enabled(struct perf_event *event)
+ +{
+ +	/*
+ +	 * when the current task's perf cgroup does not match
+ +	 * the event's, we need to remember to call the
+ +	 * perf_mark_enable() function the first time a task with
+ +	 * a matching perf cgroup is scheduled in.
+ +	 */
+ +	if (is_cgroup_event(event) && !perf_cgroup_match(event))
+ +		event->cgrp_defer_enabled = 1;
+ +}
+ +
+ +static inline void
+ +perf_cgroup_mark_enabled(struct perf_event *event,
+ +			 struct perf_event_context *ctx)
+ +{
+ +	struct perf_event *sub;
+ +	u64 tstamp = perf_event_time(event);
+ +
+ +	if (!event->cgrp_defer_enabled)
+ +		return;
+ +
+ +	event->cgrp_defer_enabled = 0;
+ +
+ +	event->tstamp_enabled = tstamp - event->total_time_enabled;
+ +	list_for_each_entry(sub, &event->sibling_list, group_entry) {
+ +		if (sub->state >= PERF_EVENT_STATE_INACTIVE) {
+ +			sub->tstamp_enabled = tstamp - sub->total_time_enabled;
+ +			sub->cgrp_defer_enabled = 0;
+ +		}
+ +	}
+ +}
+++=======
++ /*
++  * Update cpuctx->cgrp so that it is set when first cgroup event is added and
++  * cleared when last cgroup event is removed.
++  */
++ static inline void
++ list_update_cgroup_event(struct perf_event *event,
++ 			 struct perf_event_context *ctx, bool add)
++ {
++ 	struct perf_cpu_context *cpuctx;
++ 	struct list_head *cpuctx_entry;
++ 
++ 	if (!is_cgroup_event(event))
++ 		return;
++ 
++ 	if (add && ctx->nr_cgroups++)
++ 		return;
++ 	else if (!add && --ctx->nr_cgroups)
++ 		return;
++ 	/*
++ 	 * Because cgroup events are always per-cpu events,
++ 	 * this will always be called from the right CPU.
++ 	 */
++ 	cpuctx = __get_cpu_context(ctx);
++ 	cpuctx_entry = &cpuctx->cgrp_cpuctx_entry;
++ 	/* cpuctx->cgrp is NULL unless a cgroup event is active in this CPU .*/
++ 	if (add) {
++ 		list_add(cpuctx_entry, this_cpu_ptr(&cgrp_cpuctx_list));
++ 		if (perf_cgroup_from_task(current, ctx) == event->cgrp)
++ 			cpuctx->cgrp = event->cgrp;
++ 	} else {
++ 		list_del(cpuctx_entry);
++ 		cpuctx->cgrp = NULL;
++ 	}
++ }
++ 
+++>>>>>>> 0d3d73aac2ff (perf/core: Rewrite event timekeeping)
+  #else /* !CONFIG_CGROUP_PERF */
+  
+  static inline bool
+@@@ -941,15 -1021,11 +1061,23 @@@ static inline u64 perf_cgroup_event_tim
+  }
+  
+  static inline void
+++<<<<<<< HEAD
+ +perf_cgroup_defer_enabled(struct perf_event *event)
+ +{
+ +}
+ +
+ +static inline void
+ +perf_cgroup_mark_enabled(struct perf_event *event,
+ +			 struct perf_event_context *ctx)
+ +{
+ +}
+++=======
++ list_update_cgroup_event(struct perf_event *event,
++ 			 struct perf_event_context *ctx, bool add)
++ {
++ }
++ 
+++>>>>>>> 0d3d73aac2ff (perf/core: Rewrite event timekeeping)
+  #endif
+  
+  /*
+@@@ -2026,11 -2050,12 +2086,11 @@@ event_sched_in(struct perf_event *event
+  
+  	WRITE_ONCE(event->oncpu, smp_processor_id());
+  	/*
+ -	 * Order event::oncpu write to happen before the ACTIVE state is
+ -	 * visible. This allows perf_event_{stop,read}() to observe the correct
+ -	 * ->oncpu if it sees ACTIVE.
+ +	 * Order event::oncpu write to happen before the ACTIVE state
+ +	 * is visible.
+  	 */
+  	smp_wmb();
+- 	WRITE_ONCE(event->state, PERF_EVENT_STATE_ACTIVE);
++ 	perf_event_set_state(event, PERF_EVENT_STATE_ACTIVE);
+  
+  	/*
+  	 * Unthrottle events, since we scheduled we might have missed several
+@@@ -3594,7 -3518,10 +3559,14 @@@ static void __perf_event_read(void *inf
+  		update_cgrp_time_from_event(event);
+  	}
+  
+++<<<<<<< HEAD
+ +	update_event_times(event);
+++=======
++ 	perf_event_update_time(event);
++ 	if (data->group)
++ 		perf_event_update_sibling_time(event);
++ 
+++>>>>>>> 0d3d73aac2ff (perf/core: Rewrite event timekeeping)
+  	if (event->state != PERF_EVENT_STATE_ACTIVE)
+  		goto unlock;
+  
+@@@ -3638,10 -3564,11 +3610,14 @@@ static inline u64 perf_event_count(stru
+   *     will not be local and we cannot read them atomically
+   *   - must not have a pmu::count method
+   */
+ -int perf_event_read_local(struct perf_event *event, u64 *value,
+ -			  u64 *enabled, u64 *running)
+ +u64 perf_event_read_local(struct perf_event *event)
+  {
+  	unsigned long flags;
+++<<<<<<< HEAD
+ +	u64 val;
+++=======
++ 	int ret = 0;
+++>>>>>>> 0d3d73aac2ff (perf/core: Rewrite event timekeeping)
+  
+  	/*
+  	 * Disabling interrupts avoids all counter scheduling (context
+@@@ -3661,8 -3580,26 +3637,26 @@@
+  	 * It must not be an event with inherit set, we cannot read
+  	 * all child counters from atomic context.
+  	 */
+ -	if (event->attr.inherit) {
+ -		ret = -EOPNOTSUPP;
+ -		goto out;
+ -	}
+ +	WARN_ON_ONCE(event->attr.inherit);
+  
+++<<<<<<< HEAD
+++=======
++ 	/* If this is a per-task event, it must be for current */
++ 	if ((event->attach_state & PERF_ATTACH_TASK) &&
++ 	    event->hw.target != current) {
++ 		ret = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	/* If this is a per-CPU event, it must be for this CPU */
++ 	if (!(event->attach_state & PERF_ATTACH_TASK) &&
++ 	    event->cpu != smp_processor_id()) {
++ 		ret = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 
+++>>>>>>> 0d3d73aac2ff (perf/core: Rewrite event timekeeping)
+  	/*
+  	 * If the event is currently on this CPU, its either a per-task event,
+  	 * or local to this CPU. Furthermore it means its ACTIVE (otherwise
+@@@ -3671,10 -3608,21 +3665,25 @@@
+  	if (event->oncpu == smp_processor_id())
+  		event->pmu->read(event);
+  
+++<<<<<<< HEAD
+ +	val = local64_read(&event->count);
+++=======
++ 	*value = local64_read(&event->count);
++ 	if (enabled || running) {
++ 		u64 now = event->shadow_ctx_time + perf_clock();
++ 		u64 __enabled, __running;
++ 
++ 		__perf_update_times(event, now, &__enabled, &__running);
++ 		if (enabled)
++ 			*enabled = __enabled;
++ 		if (running)
++ 			*running = __running;
++ 	}
++ out:
+++>>>>>>> 0d3d73aac2ff (perf/core: Rewrite event timekeeping)
+  	local_irq_restore(flags);
+  
+ -	return ret;
+ +	return val;
+  }
+  
+  static int perf_event_read(struct perf_event *event, bool group)
+@@@ -3722,10 -3692,10 +3731,13 @@@
+  			update_context_time(ctx);
+  			update_cgrp_time_from_event(event);
+  		}
+++<<<<<<< HEAD
+++=======
++ 
++ 		perf_event_update_time(event);
+++>>>>>>> 0d3d73aac2ff (perf/core: Rewrite event timekeeping)
+  		if (group)
+- 			update_group_times(event);
+- 		else
+- 			update_event_times(event);
++ 			perf_event_update_sibling_time(event);
+  		raw_spin_unlock_irqrestore(&ctx->lock, flags);
+  	}
+  
+diff --git a/include/linux/perf_event.h b/include/linux/perf_event.h
+index c93e5f6b30d7..3e3814b9e610 100644
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -479,26 +479,10 @@ struct perf_event {
+ 	 * has been enabled (i.e. eligible to run, and the task has
+ 	 * been scheduled in, if this is a per-task event)
+ 	 * and running (scheduled onto the CPU), respectively.
+-	 *
+-	 * They are computed from tstamp_enabled, tstamp_running and
+-	 * tstamp_stopped when the event is in INACTIVE or ACTIVE state.
+ 	 */
+ 	u64				total_time_enabled;
+ 	u64				total_time_running;
+-
+-	/*
+-	 * These are timestamps used for computing total_time_enabled
+-	 * and total_time_running when the event is in INACTIVE or
+-	 * ACTIVE state, measured in nanoseconds from an arbitrary point
+-	 * in time.
+-	 * tstamp_enabled: the notional time when the event was enabled
+-	 * tstamp_running: the notional time when the event was scheduled on
+-	 * tstamp_stopped: in INACTIVE state, the notional time when the
+-	 *	event was scheduled off.
+-	 */
+-	u64				tstamp_enabled;
+-	u64				tstamp_running;
+-	u64				tstamp_stopped;
++	u64				tstamp;
+ 
+ 	/*
+ 	 * timestamp shadows the actual context timing but it can
+@@ -577,7 +561,6 @@ struct perf_event {
+ 
+ #ifdef CONFIG_CGROUP_PERF
+ 	struct perf_cgroup		*cgrp; /* cgroup event is attach to */
+-	int				cgrp_defer_enabled;
+ #endif
+ 
+ 	/*
+* Unmerged path kernel/events/core.c
