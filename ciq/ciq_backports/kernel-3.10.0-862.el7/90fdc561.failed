@@ -1,0 +1,153 @@
+nfp: remove the refresh of all ports optimization
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 90fdc561b08ce292f1d39a62f70012f150583b98
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/90fdc561.failed
+
+The code refreshing the eth port state was trying to update state
+of all ports of the card.  Unfortunately to safely walk the port
+list we would have to hold the port lock, which we can't due to
+lock ordering constraints against rtnl.
+
+Make the per-port sync refresh and async refresh of all ports
+completely separate routines.
+
+Fixes: 172f638c93dd ("nfp: add port state refresh")
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 90fdc561b08ce292f1d39a62f70012f150583b98)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
+#	drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
+index 69f458e0de89,6e27d1281425..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
+@@@ -194,10 -211,16 +194,19 @@@ nfp_net_get_link_ksettings(struct net_d
+  		return 0;
+  
+  	/* Use link speed from ETH table if available, otherwise try the BAR */
+- 	if (nn->eth_port && nfp_net_link_changed_read_clear(nn))
+- 		nfp_net_refresh_port_config(nn);
+- 	/* Separate if - on FW error the port could've disappeared from table */
+  	if (nn->eth_port) {
+++<<<<<<< HEAD
+++=======
++ 		int err;
++ 
++ 		if (nfp_net_link_changed_read_clear(nn)) {
++ 			err = nfp_net_refresh_eth_port(nn);
++ 			if (err)
++ 				return err;
++ 		}
++ 
++ 		cmd->base.port = nn->eth_port->port_type;
+++>>>>>>> 90fdc561b08c (nfp: remove the refresh of all ports optimization)
+  		cmd->base.speed = nn->eth_port->speed;
+  		cmd->base.duplex = DUPLEX_FULL;
+  		return 0;
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+index b753f555c725,8cb87cbe1120..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+@@@ -157,34 -171,20 +157,45 @@@ nfp_net_get_mac_addr_hwinfo(struct nfp_
+  		return;
+  	}
+  
+ -	ether_addr_copy(dp->netdev->dev_addr, mac_addr);
+ -	ether_addr_copy(dp->netdev->perm_addr, mac_addr);
+ +	ether_addr_copy(nn->netdev->dev_addr, mac_addr);
+ +	ether_addr_copy(nn->netdev->perm_addr, mac_addr);
+  }
+  
+++<<<<<<< HEAD
+ +/**
+ + * nfp_net_get_mac_addr() - Get the MAC address.
+ + * @nn:       NFP Network structure
+ + * @pf:	      NFP PF device structure
+ + * @id:	      NFP port id
+ + *
+ + * First try to get the MAC address from NSP ETH table. If that
+ + * fails try HWInfo.  As a last resort generate a random address.
+ + */
+ +static void
+ +nfp_net_get_mac_addr(struct nfp_net *nn, struct nfp_pf *pf, unsigned int id)
+ +{
+ +	int i;
+ +
+ +	for (i = 0; pf->eth_tbl && i < pf->eth_tbl->count; i++)
+ +		if (pf->eth_tbl->ports[i].eth_index == id) {
+ +			const u8 *mac_addr = pf->eth_tbl->ports[i].mac_addr;
+++=======
++ static struct nfp_eth_table_port *
++ nfp_net_find_port(struct nfp_eth_table *eth_tbl, unsigned int id)
++ {
++ 	int i;
++ 
++ 	for (i = 0; eth_tbl && i < eth_tbl->count; i++)
++ 		if (eth_tbl->ports[i].eth_index == id)
++ 			return &eth_tbl->ports[i];
+++>>>>>>> 90fdc561b08c (nfp: remove the refresh of all ports optimization)
+  
+ -	return NULL;
+ +			ether_addr_copy(nn->netdev->dev_addr, mac_addr);
+ +			ether_addr_copy(nn->netdev->perm_addr, mac_addr);
+ +			return;
+ +		}
+ +
+ +	nfp_net_get_mac_addr_hwinfo(nn, pf->cpp, id);
+  }
+  
+  static unsigned int nfp_net_pf_get_num_ports(struct nfp_pf *pf)
+@@@ -363,13 -367,20 +374,29 @@@ nfp_net_pf_alloc_netdevs(struct nfp_pf 
+  		prev_tx_base = tgt_tx_base;
+  		prev_rx_base = tgt_rx_base;
+  
+++<<<<<<< HEAD
+ +		nn = nfp_net_pf_alloc_port_netdev(pf, ctrl_bar, tx_bar, rx_bar,
+ +						  stride, fw_ver);
+ +		if (IS_ERR(nn)) {
+ +			err = PTR_ERR(nn);
+ +			goto err_free_prev;
+++=======
++ 		eth_port = nfp_net_find_port(pf->eth_tbl, i);
++ 		if (eth_port && eth_port->override_changed) {
++ 			nfp_warn(pf->cpp, "Config changed for port #%d, reboot required before port will be operational\n", i);
++ 		} else {
++ 			nn = nfp_net_pf_alloc_port_netdev(pf, ctrl_bar, tx_bar,
++ 							  rx_bar, stride,
++ 							  fw_ver, eth_port);
++ 			if (IS_ERR(nn)) {
++ 				err = PTR_ERR(nn);
++ 				goto err_free_prev;
++ 			}
++ 			list_add_tail(&nn->port_list, &pf->ports);
++ 			pf->num_netdevs++;
+++>>>>>>> 90fdc561b08c (nfp: remove the refresh of all ports optimization)
+  		}
+ +		list_add_tail(&nn->port_list, &pf->ports);
+  
+  		ctrl_bar += NFP_PF_CSR_SLICE_SIZE;
+  	}
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net.h b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+index 600c79f39fe0..5b2b353f49a0 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+@@ -762,7 +762,8 @@ nfp_net_ring_reconfig(struct nfp_net *nn, struct nfp_net_ring_set *rx,
+ 		      struct nfp_net_ring_set *tx);
+ 
+ bool nfp_net_link_changed_read_clear(struct nfp_net *nn);
+-void nfp_net_refresh_port_config(struct nfp_net *nn);
++int nfp_net_refresh_eth_port(struct nfp_net *nn);
++void nfp_net_refresh_port_table(struct nfp_net *nn);
+ 
+ #ifdef CONFIG_NFP_DEBUG
+ void nfp_net_debugfs_create(void);
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_main.c
