@@ -1,0 +1,512 @@
+netvsc: use ERR_PTR to avoid dereference issues
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author stephen hemminger <stephen@networkplumber.org>
+commit 9749fed5d43d84b86f1c98b70167c31c296bb6a6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/9749fed5.failed
+
+The rndis_filter_device_add function is called both in
+probe context and RTNL context,and creates the netvsc_device
+inner structure. It is easier to get the RTNL lock annotation
+correct if it returns the object directly, rather than implicitly
+by updating network device private data.
+
+	Signed-off-by: Stephen Hemminger <sthemmin@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9749fed5d43d84b86f1c98b70167c31c296bb6a6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/hyperv_net.h
+#	drivers/net/hyperv/netvsc.c
+#	drivers/net/hyperv/netvsc_drv.c
+#	drivers/net/hyperv/rndis_filter.c
+diff --cc drivers/net/hyperv/hyperv_net.h
+index a32d7f1b2505,e620374727c8..000000000000
+--- a/drivers/net/hyperv/hyperv_net.h
++++ b/drivers/net/hyperv/hyperv_net.h
+@@@ -180,7 -183,8 +180,12 @@@ struct rndis_device 
+  /* Interface */
+  struct rndis_message;
+  struct netvsc_device;
+++<<<<<<< HEAD
+ +int netvsc_device_add(struct hv_device *device, void *additional_info);
+++=======
++ struct netvsc_device *netvsc_device_add(struct hv_device *device,
++ 					const struct netvsc_device_info *info);
+++>>>>>>> 9749fed5d43d (netvsc: use ERR_PTR to avoid dereference issues)
+  void netvsc_device_remove(struct hv_device *device);
+  int netvsc_send(struct hv_device *device,
+  		struct hv_netvsc_packet *packet,
+@@@ -195,11 -199,15 +200,19 @@@ int netvsc_recv_callback(struct net_dev
+  			 const struct ndis_tcp_ip_checksum_info *csum_info,
+  			 const struct ndis_pkt_8021q_info *vlan);
+  void netvsc_channel_cb(void *context);
+ -int netvsc_poll(struct napi_struct *napi, int budget);
+ -bool rndis_filter_opened(const struct netvsc_device *nvdev);
+  int rndis_filter_open(struct netvsc_device *nvdev);
+  int rndis_filter_close(struct netvsc_device *nvdev);
+++<<<<<<< HEAD
+ +int rndis_filter_device_add(struct hv_device *dev,
+ +			void *additional_info);
+ +void rndis_filter_device_remove(struct hv_device *dev);
+++=======
++ struct netvsc_device *rndis_filter_device_add(struct hv_device *dev,
++ 					      struct netvsc_device_info *info);
++ void rndis_filter_update(struct netvsc_device *nvdev);
++ void rndis_filter_device_remove(struct hv_device *dev,
++ 				struct netvsc_device *nvdev);
+++>>>>>>> 9749fed5d43d (netvsc: use ERR_PTR to avoid dereference issues)
+  int rndis_filter_set_rss_param(struct rndis_device *rdev,
+  			       const u8 *key, int num_queue);
+  int rndis_filter_receive(struct net_device *ndev,
+diff --cc drivers/net/hyperv/netvsc.c
+index 3170ba757106,4a2550559442..000000000000
+--- a/drivers/net/hyperv/netvsc.c
++++ b/drivers/net/hyperv/netvsc.c
+@@@ -29,6 -28,9 +29,12 @@@
+  #include <linux/slab.h>
+  #include <linux/netdevice.h>
+  #include <linux/if_ether.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/vmalloc.h>
++ #include <linux/rtnetlink.h>
++ 
+++>>>>>>> 9749fed5d43d (netvsc: use ERR_PTR to avoid dereference issues)
+  #include <asm/sync_bitops.h>
+  
+  #include "hyperv_net.h"
+@@@ -1339,11 -1274,11 +1345,16 @@@ void netvsc_channel_cb(void *context
+   * netvsc_device_add - Callback when the device belonging to this
+   * driver is added
+   */
+++<<<<<<< HEAD
+ +int netvsc_device_add(struct hv_device *device, void *additional_info)
+++=======
++ struct netvsc_device *netvsc_device_add(struct hv_device *device,
++ 				const struct netvsc_device_info *device_info)
+++>>>>>>> 9749fed5d43d (netvsc: use ERR_PTR to avoid dereference issues)
+  {
+  	int i, ret = 0;
+ -	int ring_size = device_info->ring_size;
+ +	int ring_size =
+ +	((struct netvsc_device_info *)additional_info)->ring_size;
+  	struct netvsc_device *net_device;
+  	struct net_device *ndev = hv_get_drvdata(device);
+  	struct net_device_context *net_device_ctx = netdev_priv(ndev);
+@@@ -1391,15 -1341,16 +1402,14 @@@
+  		goto close;
+  	}
+  
+- 	return ret;
++ 	return net_device;
+  
+  close:
+ -	netif_napi_del(&net_device->chan_table[0].napi);
+ -
+  	/* Now, we can close the channel safely */
+  	vmbus_close(device->channel);
+  
+  cleanup:
+ -	free_netvsc_device(&net_device->rcu);
+ +	free_netvsc_device(net_device);
+  
+- 	return ret;
+- 
++ 	return ERR_PTR(ret);
+  }
+diff --cc drivers/net/hyperv/netvsc_drv.c
+index d4dc9c189b85,0ca8c74143b4..000000000000
+--- a/drivers/net/hyperv/netvsc_drv.c
++++ b/drivers/net/hyperv/netvsc_drv.c
+@@@ -736,6 -713,30 +736,33 @@@ static void netvsc_get_channels(struct 
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int netvsc_set_queues(struct net_device *net, struct hv_device *dev,
++ 			     u32 num_chn)
++ {
++ 	struct netvsc_device_info device_info;
++ 	struct netvsc_device *net_device;
++ 	int ret;
++ 
++ 	memset(&device_info, 0, sizeof(device_info));
++ 	device_info.num_chn = num_chn;
++ 	device_info.ring_size = ring_size;
++ 	device_info.max_num_vrss_chns = num_chn;
++ 
++ 	ret = netif_set_real_num_tx_queues(net, num_chn);
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = netif_set_real_num_rx_queues(net, num_chn);
++ 	if (ret)
++ 		return ret;
++ 
++ 	net_device = rndis_filter_device_add(dev, &device_info);
++ 	return IS_ERR(net_device) ? PTR_ERR(net_device) : 0;
++ }
++ 
+++>>>>>>> 9749fed5d43d (netvsc: use ERR_PTR to avoid dereference issues)
+  static int netvsc_set_channels(struct net_device *net,
+  			       struct ethtool_channels *channels)
+  {
+@@@ -893,42 -845,43 +920,60 @@@ static int netvsc_set_link_ksettings(st
+  static int netvsc_change_mtu(struct net_device *ndev, int mtu)
+  {
+  	struct net_device_context *ndevctx = netdev_priv(ndev);
+ -	struct netvsc_device *nvdev = rtnl_dereference(ndevctx->nvdev);
+ +	struct netvsc_device *nvdev = ndevctx->nvdev;
+  	struct hv_device *hdev = ndevctx->device_ctx;
++ 	int orig_mtu = ndev->mtu;
+  	struct netvsc_device_info device_info;
+++<<<<<<< HEAD
+ +	int limit = ETH_DATA_LEN;
+ +	u32 num_chn;
+++=======
++ 	bool was_opened;
+++>>>>>>> 9749fed5d43d (netvsc: use ERR_PTR to avoid dereference issues)
+  	int ret = 0;
+  
+ -	if (!nvdev || nvdev->destroy)
+ +	if (ndevctx->start_remove || !nvdev || nvdev->destroy)
+  		return -ENODEV;
+  
+ -	netif_device_detach(ndev);
+ -	was_opened = rndis_filter_opened(nvdev);
+ -	if (was_opened)
+ -		rndis_filter_close(nvdev);
+ +	if (nvdev->nvsp_version >= NVSP_PROTOCOL_VERSION_2)
+ +		limit = NETVSC_MTU - ETH_HLEN;
+  
+ -	memset(&device_info, 0, sizeof(device_info));
+ -	device_info.ring_size = ring_size;
+ -	device_info.num_chn = nvdev->num_chn;
+ -	device_info.max_num_vrss_chns = nvdev->num_chn;
+ +	if (mtu < NETVSC_MTU_MIN || mtu > limit)
+ +		return -EINVAL;
+ +
+ +	ret = netvsc_close(ndev);
+ +	if (ret)
+ +		goto out;
+  
+ -	rndis_filter_device_remove(hdev, nvdev);
+++<<<<<<< HEAD
+ +	num_chn = nvdev->num_chn;
+  
+ +	ndevctx->start_remove = true;
+ +	rndis_filter_device_remove(hdev);
+ +
+ +	ndev->mtu = mtu;
+ +
+ +	memset(&device_info, 0, sizeof(device_info));
+ +	device_info.ring_size = ring_size;
+ +	device_info.num_chn = num_chn;
+ +	device_info.max_num_vrss_chns = max_num_vrss_chns;
+ +	rndis_filter_device_add(hdev, &device_info);
+++=======
++ 	ndev->mtu = mtu;
++ 
++ 	nvdev = rndis_filter_device_add(hdev, &device_info);
++ 	if (IS_ERR(nvdev)) {
++ 		ret = PTR_ERR(nvdev);
++ 
++ 		/* Attempt rollback to original MTU */
++ 		ndev->mtu = orig_mtu;
++ 		rndis_filter_device_add(hdev, &device_info);
++ 	}
+++>>>>>>> 9749fed5d43d (netvsc: use ERR_PTR to avoid dereference issues)
+  
+ -	if (was_opened)
+ -		rndis_filter_open(nvdev);
+ -
+ -	netif_device_attach(ndev);
+ +out:
+ +	netvsc_open(ndev);
+ +	ndevctx->start_remove = false;
+  
+  	/* We may have missed link change notifications */
+  	schedule_delayed_work(&ndevctx->dwork, 0);
+@@@ -1531,20 -1528,35 +1576,48 @@@ static int netvsc_probe(struct hv_devic
+  	/* Notify the netvsc driver of the new device */
+  	memset(&device_info, 0, sizeof(device_info));
+  	device_info.ring_size = ring_size;
+++<<<<<<< HEAD
+ +	device_info.max_num_vrss_chns = max_num_vrss_chns;
+ +	ret = rndis_filter_device_add(dev, &device_info);
+ +	if (ret != 0) {
+++=======
++ 	device_info.num_chn = VRSS_CHANNEL_DEFAULT;
++ 
++ 	nvdev = rndis_filter_device_add(dev, &device_info);
++ 	if (IS_ERR(nvdev)) {
++ 		ret = PTR_ERR(nvdev);
+++>>>>>>> 9749fed5d43d (netvsc: use ERR_PTR to avoid dereference issues)
+  		netdev_err(net, "unable to add netvsc device (ret %d)\n", ret);
+ -		free_netdev(net);
+ +		netvsc_free_netdev(net);
+  		hv_set_drvdata(dev, NULL);
+  		return ret;
+  	}
+  	memcpy(net->dev_addr, device_info.mac_adr, ETH_ALEN);
+  
+++<<<<<<< HEAD
+ +	nvdev = net_device_ctx->nvdev;
+ +	netif_set_real_num_tx_queues(net, nvdev->num_chn);
+ +	netif_set_real_num_rx_queues(net, nvdev->num_chn);
+ +	netif_set_gso_max_size(net, NETVSC_GSO_MAX_SIZE);
+++=======
++ 	/* hw_features computed in rndis_filter_device_add */
++ 	net->features = net->hw_features |
++ 		NETIF_F_HIGHDMA | NETIF_F_SG |
++ 		NETIF_F_HW_VLAN_CTAG_TX | NETIF_F_HW_VLAN_CTAG_RX;
++ 	net->vlan_features = net->features;
++ 
++ 	netif_set_real_num_tx_queues(net, nvdev->num_chn);
++ 	netif_set_real_num_rx_queues(net, nvdev->num_chn);
++ 
++ 	netdev_lockdep_set_classes(net);
++ 
++ 	/* MTU range: 68 - 1500 or 65521 */
++ 	net->min_mtu = NETVSC_MTU_MIN;
++ 	if (nvdev->nvsp_version >= NVSP_PROTOCOL_VERSION_2)
++ 		net->max_mtu = NETVSC_MTU - ETH_HLEN;
++ 	else
++ 		net->max_mtu = ETH_DATA_LEN;
+++>>>>>>> 9749fed5d43d (netvsc: use ERR_PTR to avoid dereference issues)
+  
+  	ret = register_netdev(net);
+  	if (ret != 0) {
+diff --cc drivers/net/hyperv/rndis_filter.c
+index b6bc44dd1f92,cacf1e5536f7..000000000000
+--- a/drivers/net/hyperv/rndis_filter.c
++++ b/drivers/net/hyperv/rndis_filter.c
+@@@ -939,8 -1052,8 +939,13 @@@ static void netvsc_sc_open(struct vmbus
+  		complete(&nvscdev->channel_init_wait);
+  }
+  
+++<<<<<<< HEAD
+ +int rndis_filter_device_add(struct hv_device *dev,
+ +			    void *additional_info)
+++=======
++ struct netvsc_device *rndis_filter_device_add(struct hv_device *dev,
++ 				      struct netvsc_device_info *device_info)
+++>>>>>>> 9749fed5d43d (netvsc: use ERR_PTR to avoid dereference issues)
+  {
+  	struct net_device *net = hv_get_drvdata(dev);
+  	struct net_device_context *net_device_ctx = netdev_priv(net);
+@@@ -968,10 -1079,10 +973,15 @@@
+  	 * NOTE! Once the channel is created, we may get a receive callback
+  	 * (RndisFilterOnReceive()) before this call is completed
+  	 */
+++<<<<<<< HEAD
+ +	ret = netvsc_device_add(dev, additional_info);
+ +	if (ret != 0) {
+++=======
++ 	net_device = netvsc_device_add(dev, device_info);
++ 	if (IS_ERR(net_device)) {
+++>>>>>>> 9749fed5d43d (netvsc: use ERR_PTR to avoid dereference issues)
+  		kfree(rndis_device);
+- 		return ret;
++ 		return net_device;
+  	}
+  
+  	/* Initialize the rndis device */
+@@@ -986,10 -1096,8 +995,15 @@@
+  
+  	/* Send the rndis initialization message */
+  	ret = rndis_filter_init_device(rndis_device);
+++<<<<<<< HEAD
+ +	if (ret != 0) {
+ +		rndis_filter_device_remove(dev);
+ +		return ret;
+ +	}
+++=======
++ 	if (ret != 0)
++ 		goto err_dev_remv;
+++>>>>>>> 9749fed5d43d (netvsc: use ERR_PTR to avoid dereference issues)
+  
+  	/* Get the MTU from the host */
+  	size = sizeof(u32);
+@@@ -1001,41 -1109,81 +1015,55 @@@
+  
+  	/* Get the mac address */
+  	ret = rndis_filter_query_device_mac(rndis_device);
+++<<<<<<< HEAD
+ +	if (ret != 0) {
+ +		rndis_filter_device_remove(dev);
+ +		return ret;
+ +	}
+ +
+ +	memcpy(device_info->mac_adr, rndis_device->hw_mac_adr, ETH_ALEN);
+ +
+ +	/* Turn on the offloads; the host supports all of the relevant
+ +	 * offloads.
+ +	 */
+++=======
++ 	if (ret != 0)
++ 		goto err_dev_remv;
++ 
++ 	memcpy(device_info->mac_adr, rndis_device->hw_mac_adr, ETH_ALEN);
++ 
++ 	/* Find HW offload capabilities */
++ 	ret = rndis_query_hwcaps(rndis_device, &hwcaps);
++ 	if (ret != 0)
++ 		goto err_dev_remv;
++ 
++ 	/* A value of zero means "no change"; now turn on what we want. */
+++>>>>>>> 9749fed5d43d (netvsc: use ERR_PTR to avoid dereference issues)
+  	memset(&offloads, 0, sizeof(struct ndis_offload_params));
+ -
+ -	/* Linux does not care about IP checksum, always does in kernel */
+ -	offloads.ip_v4_csum = NDIS_OFFLOAD_PARAMETERS_TX_RX_DISABLED;
+ -
+ -	/* Compute tx offload settings based on hw capabilities */
+ -	net->hw_features = NETIF_F_RXCSUM;
+ -
+ -	if ((hwcaps.csum.ip4_txcsum & NDIS_TXCSUM_ALL_TCP4) == NDIS_TXCSUM_ALL_TCP4) {
+ -		/* Can checksum TCP */
+ -		net->hw_features |= NETIF_F_IP_CSUM;
+ -		net_device_ctx->tx_checksum_mask |= TRANSPORT_INFO_IPV4_TCP;
+ -
+ -		offloads.tcp_ip_v4_csum = NDIS_OFFLOAD_PARAMETERS_TX_RX_ENABLED;
+ -
+ -		if (hwcaps.lsov2.ip4_encap & NDIS_OFFLOAD_ENCAP_8023) {
+ -			offloads.lso_v2_ipv4 = NDIS_OFFLOAD_PARAMETERS_LSOV2_ENABLED;
+ -			net->hw_features |= NETIF_F_TSO;
+ -
+ -			if (hwcaps.lsov2.ip4_maxsz < gso_max_size)
+ -				gso_max_size = hwcaps.lsov2.ip4_maxsz;
+ -		}
+ -
+ -		if (hwcaps.csum.ip4_txcsum & NDIS_TXCSUM_CAP_UDP4) {
+ -			offloads.udp_ip_v4_csum = NDIS_OFFLOAD_PARAMETERS_TX_RX_ENABLED;
+ -			net_device_ctx->tx_checksum_mask |= TRANSPORT_INFO_IPV4_UDP;
+ -		}
+ -	}
+ -
+ -	if ((hwcaps.csum.ip6_txcsum & NDIS_TXCSUM_ALL_TCP6) == NDIS_TXCSUM_ALL_TCP6) {
+ -		net->hw_features |= NETIF_F_IPV6_CSUM;
+ -
+ -		offloads.tcp_ip_v6_csum = NDIS_OFFLOAD_PARAMETERS_TX_RX_ENABLED;
+ -		net_device_ctx->tx_checksum_mask |= TRANSPORT_INFO_IPV6_TCP;
+ -
+ -		if ((hwcaps.lsov2.ip6_encap & NDIS_OFFLOAD_ENCAP_8023) &&
+ -		    (hwcaps.lsov2.ip6_opts & NDIS_LSOV2_CAP_IP6) == NDIS_LSOV2_CAP_IP6) {
+ -			offloads.lso_v2_ipv6 = NDIS_OFFLOAD_PARAMETERS_LSOV2_ENABLED;
+ -			net->hw_features |= NETIF_F_TSO6;
+ -
+ -			if (hwcaps.lsov2.ip6_maxsz < gso_max_size)
+ -				gso_max_size = hwcaps.lsov2.ip6_maxsz;
+ -		}
+ -
+ -		if (hwcaps.csum.ip6_txcsum & NDIS_TXCSUM_CAP_UDP6) {
+ -			offloads.udp_ip_v6_csum = NDIS_OFFLOAD_PARAMETERS_TX_RX_ENABLED;
+ -			net_device_ctx->tx_checksum_mask |= TRANSPORT_INFO_IPV6_UDP;
+ -		}
+ -	}
+ -
+ -	netif_set_gso_max_size(net, gso_max_size);
+ +	/* A value of zero means "no change"; now turn on what we
+ +	 * want.
+ +	 */
+ +	offloads.ip_v4_csum = NDIS_OFFLOAD_PARAMETERS_TX_RX_ENABLED;
+ +	offloads.tcp_ip_v4_csum = NDIS_OFFLOAD_PARAMETERS_TX_RX_ENABLED;
+ +	offloads.udp_ip_v4_csum = NDIS_OFFLOAD_PARAMETERS_TX_RX_ENABLED;
+ +	offloads.tcp_ip_v6_csum = NDIS_OFFLOAD_PARAMETERS_TX_RX_ENABLED;
+ +	offloads.udp_ip_v6_csum = NDIS_OFFLOAD_PARAMETERS_TX_RX_ENABLED;
+ +	offloads.lso_v2_ipv4 = NDIS_OFFLOAD_PARAMETERS_LSOV2_ENABLED;
+  
+- 	ret = rndis_filter_set_offload_params(net, &offloads);
++ 	ret = rndis_filter_set_offload_params(net, net_device, &offloads);
+  	if (ret)
+  		goto err_dev_remv;
+  
+  	rndis_filter_query_device_link_status(rndis_device);
+  
+ +	device_info->link_state = rndis_device->link_state;
+ +
+  	netdev_dbg(net, "Device MAC %pM link state %s\n",
+  		   rndis_device->hw_mac_adr,
+ -		   rndis_device->link_state ? "down" : "up");
+ +		   device_info->link_state ? "down" : "up");
+  
+  	if (net_device->nvsp_version < NVSP_PROTOCOL_VERSION_5)
+- 		return 0;
++ 		return net_device;
+  
+  	rndis_filter_query_link_speed(rndis_device);
+  
+@@@ -1070,19 -1214,11 +1098,25 @@@
+  		rndis_device->ind_table[i] = ethtool_rxfh_indir_default(i,
+  							net_device->num_chn);
+  
+++<<<<<<< HEAD
+ +	net_device->num_sc_offered = num_rss_qs;
+ +
+ +	if (net_device->num_chn == 1)
+ +		goto out;
+ +
+ +	net_device->sub_cb_buf = vzalloc((net_device->num_chn - 1) *
+ +					 NETVSC_PACKET_SIZE);
+ +	if (!net_device->sub_cb_buf) {
+ +		net_device->num_chn = 1;
+ +		dev_info(&dev->device, "No memory for subchannels.\n");
+ +		goto out;
+ +	}
+++=======
++ 	num_rss_qs = net_device->num_chn - 1;
++ 	if (num_rss_qs == 0)
++ 		return net_device;
+++>>>>>>> 9749fed5d43d (netvsc: use ERR_PTR to avoid dereference issues)
+  
+ -	refcount_set(&net_device->sc_offered, num_rss_qs);
+  	vmbus_set_sc_create_callback(dev->channel, netvsc_sc_open);
+  
+  	init_packet = &net_device->channel_init_pkt;
+@@@ -1123,27 -1251,20 +1157,32 @@@ out
+  	if (ret) {
+  		net_device->max_chn = 1;
+  		net_device->num_chn = 1;
+ +		net_device->num_sc_offered = 0;
+  	}
+  
+- 	return 0; /* return 0 because primary channel can be used alone */
++ 	return net_device;
+  
+  err_dev_remv:
+++<<<<<<< HEAD
+ +	rndis_filter_device_remove(dev);
+ +	return ret;
+++=======
++ 	rndis_filter_device_remove(dev, net_device);
++ 	return ERR_PTR(ret);
+++>>>>>>> 9749fed5d43d (netvsc: use ERR_PTR to avoid dereference issues)
+  }
+  
+ -void rndis_filter_device_remove(struct hv_device *dev,
+ -				struct netvsc_device *net_dev)
+ +void rndis_filter_device_remove(struct hv_device *dev)
+  {
+ +	struct netvsc_device *net_dev = hv_device_to_netvsc_device(dev);
+  	struct rndis_device *rndis_dev = net_dev->extension;
+  
+ +	/* If not all subchannel offers are complete, wait for them until
+ +	 * completion to avoid race.
+ +	 */
+ +	if (net_dev->num_sc_offered > 0)
+ +		wait_for_completion(&net_dev->channel_init_wait);
+ +
+  	/* Halt and release the rndis device */
+  	rndis_filter_halt_device(rndis_dev);
+  
+* Unmerged path drivers/net/hyperv/hyperv_net.h
+* Unmerged path drivers/net/hyperv/netvsc.c
+* Unmerged path drivers/net/hyperv/netvsc_drv.c
+* Unmerged path drivers/net/hyperv/rndis_filter.c
