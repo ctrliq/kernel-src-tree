@@ -1,0 +1,117 @@
+nvme: send uevent for some asynchronous events
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [nvme] send uevent for some asynchronous events (David Milburn) [1519689]
+Rebuild_FUZZ: 93.02%
+commit-author Keith Busch <keith.busch@intel.com>
+commit e3d7874dcf175cca2dca7795d6453f637ad8ba9b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/e3d7874d.failed
+
+This will give udev a chance to observe and handle asynchronous event
+notifications and clear the log to unmask future events of the same type.
+The driver will create a change uevent of the asyncronuos event result
+before submitting the next AEN request to the device if a completed AEN
+event is of type error, smart, command set or vendor specific,
+
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Reviewed-by: Guan Junxiong <guanjunxiong@huawei.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit e3d7874dcf175cca2dca7795d6453f637ad8ba9b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+diff --cc drivers/nvme/host/core.c
+index 9225e17bc34a,683d890d73fa..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -2370,15 -2686,8 +2386,20 @@@ static void nvme_async_event_work(struc
+  	struct nvme_ctrl *ctrl =
+  		container_of(work, struct nvme_ctrl, async_event_work);
+  
+++<<<<<<< HEAD
+ +	spin_lock_irq(&ctrl->lock);
+ +	while (ctrl->state == NVME_CTRL_LIVE && ctrl->event_limit > 0) {
+ +		int aer_idx = --ctrl->event_limit;
+ +
+ +		spin_unlock_irq(&ctrl->lock);
+ +		ctrl->ops->submit_async_event(ctrl, aer_idx);
+ +		spin_lock_irq(&ctrl->lock);
+ +	}
+ +	spin_unlock_irq(&ctrl->lock);
+++=======
++ 	nvme_aen_uevent(ctrl);
++ 	ctrl->ops->submit_async_event(ctrl);
+++>>>>>>> e3d7874dcf17 (nvme: send uevent for some asynchronous events)
+  }
+  
+  static bool nvme_ctrl_pp_status(struct nvme_ctrl *ctrl)
+@@@ -2450,24 -2754,21 +2471,35 @@@ void nvme_complete_async_event(struct n
+  		union nvme_result *res)
+  {
+  	u32 result = le32_to_cpu(res->u32);
+ +	bool done = true;
+ +
+ +	switch (le16_to_cpu(status) >> 1) {
+ +	case NVME_SC_SUCCESS:
+ +		done = false;
+ +		/*FALLTHRU*/
+ +	case NVME_SC_ABORT_REQ:
+ +		++ctrl->event_limit;
+ +		if (ctrl->state == NVME_CTRL_LIVE)
+ +			queue_work(nvme_wq, &ctrl->async_event_work);
+ +		break;
+ +	default:
+ +		break;
+ +	}
+  
+ -	if (le16_to_cpu(status) >> 1 != NVME_SC_SUCCESS)
+ +	if (done)
+  		return;
+  
++ 	switch (result & 0x7) {
++ 	case NVME_AER_ERROR:
++ 	case NVME_AER_SMART:
++ 	case NVME_AER_CSS:
++ 	case NVME_AER_VS:
++ 		ctrl->aen_result = result;
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ 
+  	switch (result & 0xff07) {
+  	case NVME_AER_NOTICE_NS_CHANGED:
+  		dev_info(ctrl->device, "rescanning\n");
+* Unmerged path drivers/nvme/host/core.c
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index df4c3bd4f65c..7f4b24fe6b70 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -151,6 +151,7 @@ struct nvme_ctrl {
+ 	u16 kas;
+ 	u8 npss;
+ 	u8 apsta;
++	u32 aen_result;
+ 	unsigned int shutdown_timeout;
+ 	unsigned int kato;
+ 	bool subsystem;
+diff --git a/include/linux/nvme.h b/include/linux/nvme.h
+index f45d62f2ecf8..15f1bae33d30 100644
+--- a/include/linux/nvme.h
++++ b/include/linux/nvme.h
+@@ -385,6 +385,10 @@ enum {
+ };
+ 
+ enum {
++	NVME_AER_ERROR			= 0,
++	NVME_AER_SMART			= 1,
++	NVME_AER_CSS			= 6,
++	NVME_AER_VS			= 7,
+ 	NVME_AER_NOTICE_NS_CHANGED	= 0x0002,
+ 	NVME_AER_NOTICE_FW_ACT_STARTING = 0x0102,
+ };
