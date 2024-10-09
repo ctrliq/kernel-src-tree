@@ -1,0 +1,225 @@
+perf/x86/intel: Fix regression by default disabling perfmon v4 interrupt handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 2a5bf23d5b795d5df33dc284e8f5cf8b6a5b4042
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/2a5bf23d.failed
+
+Kyle Huey reported that 'rr', a replay debugger, broke due to the following commit:
+
+  af3bdb991a5c ("perf/x86/intel: Add a separate Arch Perfmon v4 PMI handler")
+
+Rework the 'disable_counter_freezing' __setup() parameter such that we
+can explicitly enable/disable it and switch to default disabled.
+
+To this purpose, rename the parameter to "perf_v4_pmi=" which is a much
+better description and allows requiring a bool argument.
+
+[ mingo: Improved the changelog some more. ]
+
+	Reported-by: Kyle Huey <me@kylehuey.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Kan Liang <kan.liang@linux.intel.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Robert O'Callahan <robert@ocallahan.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Vince Weaver <vincent.weaver@maine.edu>
+	Cc: acme@kernel.org
+Link: http://lkml.kernel.org/r/20181120170842.GZ2131@hirez.programming.kicks-ass.net
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 2a5bf23d5b795d5df33dc284e8f5cf8b6a5b4042)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/kernel-parameters.txt
+#	arch/x86/events/intel/core.c
+diff --cc Documentation/kernel-parameters.txt
+index f6852ae416ce,5463d5a4d85c..000000000000
+--- a/Documentation/kernel-parameters.txt
++++ b/Documentation/kernel-parameters.txt
+@@@ -812,7 -856,13 +812,17 @@@ bytes respectively. Such letter suffixe
+  			causing system reset or hang due to sending
+  			INIT from AP to BSP.
+  
+++<<<<<<< HEAD:Documentation/kernel-parameters.txt
+ +	disable_ddw     [PPC/PSERIES]
+++=======
++ 	perf_v4_pmi=	[X86,INTEL]
++ 			Format: <bool>
++ 			Disable Intel PMU counter freezing feature.
++ 			The feature only exists starting from
++ 			Arch Perfmon v4 (Skylake and newer).
++ 
++ 	disable_ddw	[PPC/PSERIES]
+++>>>>>>> 2a5bf23d5b79 (perf/x86/intel: Fix regression by default disabling perfmon v4 interrupt handling):Documentation/admin-guide/kernel-parameters.txt
+  			Disable Dynamic DMA Window support. Use this if
+  			to workaround buggy firmware.
+  
+diff --cc arch/x86/events/intel/core.c
+index 65e18eccc087,af8bea9d4006..000000000000
+--- a/arch/x86/events/intel/core.c
++++ b/arch/x86/events/intel/core.c
+@@@ -2265,6 -2303,150 +2265,153 @@@ again
+  			x86_pmu_stop(event, 0);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	return handled;
++ }
++ 
++ static bool disable_counter_freezing = true;
++ static int __init intel_perf_counter_freezing_setup(char *s)
++ {
++ 	bool res;
++ 
++ 	if (kstrtobool(s, &res))
++ 		return -EINVAL;
++ 
++ 	disable_counter_freezing = !res;
++ 	return 1;
++ }
++ __setup("perf_v4_pmi=", intel_perf_counter_freezing_setup);
++ 
++ /*
++  * Simplified handler for Arch Perfmon v4:
++  * - We rely on counter freezing/unfreezing to enable/disable the PMU.
++  * This is done automatically on PMU ack.
++  * - Ack the PMU only after the APIC.
++  */
++ 
++ static int intel_pmu_handle_irq_v4(struct pt_regs *regs)
++ {
++ 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
++ 	int handled = 0;
++ 	bool bts = false;
++ 	u64 status;
++ 	int pmu_enabled = cpuc->enabled;
++ 	int loops = 0;
++ 
++ 	/* PMU has been disabled because of counter freezing */
++ 	cpuc->enabled = 0;
++ 	if (test_bit(INTEL_PMC_IDX_FIXED_BTS, cpuc->active_mask)) {
++ 		bts = true;
++ 		intel_bts_disable_local();
++ 		handled = intel_pmu_drain_bts_buffer();
++ 		handled += intel_bts_interrupt();
++ 	}
++ 	status = intel_pmu_get_status();
++ 	if (!status)
++ 		goto done;
++ again:
++ 	intel_pmu_lbr_read();
++ 	if (++loops > 100) {
++ 		static bool warned;
++ 
++ 		if (!warned) {
++ 			WARN(1, "perfevents: irq loop stuck!\n");
++ 			perf_event_print_debug();
++ 			warned = true;
++ 		}
++ 		intel_pmu_reset();
++ 		goto done;
++ 	}
++ 
++ 
++ 	handled += handle_pmi_common(regs, status);
++ done:
++ 	/* Ack the PMI in the APIC */
++ 	apic_write(APIC_LVTPC, APIC_DM_NMI);
++ 
++ 	/*
++ 	 * The counters start counting immediately while ack the status.
++ 	 * Make it as close as possible to IRET. This avoids bogus
++ 	 * freezing on Skylake CPUs.
++ 	 */
++ 	if (status) {
++ 		intel_pmu_ack_status(status);
++ 	} else {
++ 		/*
++ 		 * CPU may issues two PMIs very close to each other.
++ 		 * When the PMI handler services the first one, the
++ 		 * GLOBAL_STATUS is already updated to reflect both.
++ 		 * When it IRETs, the second PMI is immediately
++ 		 * handled and it sees clear status. At the meantime,
++ 		 * there may be a third PMI, because the freezing bit
++ 		 * isn't set since the ack in first PMI handlers.
++ 		 * Double check if there is more work to be done.
++ 		 */
++ 		status = intel_pmu_get_status();
++ 		if (status)
++ 			goto again;
++ 	}
++ 
++ 	if (bts)
++ 		intel_bts_enable_local();
++ 	cpuc->enabled = pmu_enabled;
++ 	return handled;
++ }
++ 
++ /*
++  * This handler is triggered by the local APIC, so the APIC IRQ handling
++  * rules apply:
++  */
++ static int intel_pmu_handle_irq(struct pt_regs *regs)
++ {
++ 	struct cpu_hw_events *cpuc;
++ 	int loops;
++ 	u64 status;
++ 	int handled;
++ 	int pmu_enabled;
++ 
++ 	cpuc = this_cpu_ptr(&cpu_hw_events);
++ 
++ 	/*
++ 	 * Save the PMU state.
++ 	 * It needs to be restored when leaving the handler.
++ 	 */
++ 	pmu_enabled = cpuc->enabled;
++ 	/*
++ 	 * No known reason to not always do late ACK,
++ 	 * but just in case do it opt-in.
++ 	 */
++ 	if (!x86_pmu.late_ack)
++ 		apic_write(APIC_LVTPC, APIC_DM_NMI);
++ 	intel_bts_disable_local();
++ 	cpuc->enabled = 0;
++ 	__intel_pmu_disable_all();
++ 	handled = intel_pmu_drain_bts_buffer();
++ 	handled += intel_bts_interrupt();
++ 	status = intel_pmu_get_status();
++ 	if (!status)
++ 		goto done;
++ 
++ 	loops = 0;
++ again:
++ 	intel_pmu_lbr_read();
++ 	intel_pmu_ack_status(status);
++ 	if (++loops > 100) {
++ 		static bool warned;
++ 
++ 		if (!warned) {
++ 			WARN(1, "perfevents: irq loop stuck!\n");
++ 			perf_event_print_debug();
++ 			warned = true;
++ 		}
++ 		intel_pmu_reset();
++ 		goto done;
++ 	}
++ 
++ 	handled += handle_pmi_common(regs, status);
++ 
+++>>>>>>> 2a5bf23d5b79 (perf/x86/intel: Fix regression by default disabling perfmon v4 interrupt handling)
+  	/*
+  	 * Repeat if there is more work to be done:
+  	 */
+* Unmerged path Documentation/kernel-parameters.txt
+* Unmerged path arch/x86/events/intel/core.c
