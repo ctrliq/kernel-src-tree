@@ -1,0 +1,320 @@
+gfs2: Rename SDF_SHUTDOWN to SDF_WITHDRAWN
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.53.1.el7
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit 04aea0ca14f025828c22d8ef586ff59d0be2f98b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.53.1.el7/04aea0ca.failed
+
+Before this patch, the superblock flag indicating when a file system
+is withdrawn was called SDF_SHUTDOWN. This patch simply renames it to
+the more obvious SDF_WITHDRAWN.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 04aea0ca14f025828c22d8ef586ff59d0be2f98b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/glock.c
+#	fs/gfs2/super.c
+#	fs/gfs2/util.c
+diff --cc fs/gfs2/glock.c
+index d5f0bcb8970e,f114a4045fcc..000000000000
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@@ -587,8 -580,8 +587,13 @@@ __acquires(&gl->gl_lockref.lock
+  			gfs2_glock_queue_work(gl, 0);
+  		}
+  		else if (ret) {
+++<<<<<<< HEAD
+ +			printk(KERN_ERR "GFS2: lm_lock ret %d\n", ret);
+ +			GLOCK_BUG_ON(gl, !test_bit(SDF_SHUTDOWN,
+++=======
++ 			fs_err(sdp, "lm_lock ret %d\n", ret);
++ 			GLOCK_BUG_ON(gl, !test_bit(SDF_WITHDRAWN,
+++>>>>>>> 04aea0ca14f0 (gfs2: Rename SDF_SHUTDOWN to SDF_WITHDRAWN)
+  						   &sdp->sd_flags));
+  		}
+  	} else { /* lock_nolock */
+diff --cc fs/gfs2/super.c
+index fac088989e79,129ae4376af4..000000000000
+--- a/fs/gfs2/super.c
++++ b/fs/gfs2/super.c
+@@@ -797,9 -803,9 +797,9 @@@ static void gfs2_dirty_inode(struct ino
+  	int need_endtrans = 0;
+  	int ret;
+  
+ -	if (!(flags & I_DIRTY_INODE))
+ +	if (!(flags & (I_DIRTY_DATASYNC|I_DIRTY_SYNC)))
+  		return;
+- 	if (unlikely(test_bit(SDF_SHUTDOWN, &sdp->sd_flags)))
++ 	if (unlikely(test_bit(SDF_WITHDRAWN, &sdp->sd_flags)))
+  		return;
+  	if (!gfs2_glock_is_locked_by_me(ip->i_gl)) {
+  		ret = gfs2_glock_nq_init(ip->i_gl, LM_ST_EXCLUSIVE, 0, &gh);
+@@@ -843,19 -849,22 +843,26 @@@ out
+  
+  static int gfs2_make_fs_ro(struct gfs2_sbd *sdp)
+  {
+ -	struct gfs2_holder freeze_gh;
+ +	struct gfs2_holder t_gh;
+  	int error;
+  
+++<<<<<<< HEAD
+ +	if (sdp->sd_quotad_process) {
+ +		kthread_stop(sdp->sd_quotad_process);
+ +		sdp->sd_quotad_process = NULL;
+ +	}
+ +	if (sdp->sd_logd_process) {
+ +		kthread_stop(sdp->sd_logd_process);
+ +		sdp->sd_logd_process = NULL;
+ +	}
+++=======
++ 	error = gfs2_glock_nq_init(sdp->sd_freeze_gl, LM_ST_SHARED, GL_NOCACHE,
++ 				   &freeze_gh);
++ 	if (error && !test_bit(SDF_WITHDRAWN, &sdp->sd_flags))
++ 		return error;
+++>>>>>>> 04aea0ca14f0 (gfs2: Rename SDF_SHUTDOWN to SDF_WITHDRAWN)
+  
+  	flush_workqueue(gfs2_delete_workqueue);
+ -	if (sdp->sd_quotad_process)
+ -		kthread_stop(sdp->sd_quotad_process);
+ -	sdp->sd_quotad_process = NULL;
+ -	if (sdp->sd_logd_process)
+ -		kthread_stop(sdp->sd_logd_process);
+ -	sdp->sd_logd_process = NULL;
+ -
+  	gfs2_quota_sync(sdp->sd_vfs, 0);
+  	gfs2_statfs_sync(sdp->sd_vfs, 0);
+  
+@@@ -970,10 -1007,16 +977,21 @@@ static int gfs2_sync_fs(struct super_bl
+  static int gfs2_freeze(struct super_block *sb)
+  {
+  	struct gfs2_sbd *sdp = sb->s_fs_info;
+ -	int error = 0;
+ +	int error;
+  
+++<<<<<<< HEAD
+ +	if (test_bit(SDF_SHUTDOWN, &sdp->sd_flags))
+ +		return -EINVAL;
+++=======
++ 	mutex_lock(&sdp->sd_freeze_mutex);
++ 	if (atomic_read(&sdp->sd_freeze_state) != SFS_UNFROZEN)
++ 		goto out;
++ 
++ 	if (test_bit(SDF_WITHDRAWN, &sdp->sd_flags)) {
++ 		error = -EINVAL;
++ 		goto out;
++ 	}
+++>>>>>>> 04aea0ca14f0 (gfs2: Rename SDF_SHUTDOWN to SDF_WITHDRAWN)
+  
+  	for (;;) {
+  		error = gfs2_lock_fs_check_clean(sdp, &sdp->sd_freeze_gh);
+diff --cc fs/gfs2/util.c
+index d62797b79ef2,6aea0146e0c8..000000000000
+--- a/fs/gfs2/util.c
++++ b/fs/gfs2/util.c
+@@@ -40,14 -38,22 +40,14 @@@ int gfs2_lm_withdraw(struct gfs2_sbd *s
+  	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
+  	const struct lm_lockops *lm = ls->ls_ops;
+  	va_list args;
+ -	struct va_format vaf;
+  
+  	if (sdp->sd_args.ar_errors == GFS2_ERRORS_WITHDRAW &&
+- 	    test_and_set_bit(SDF_SHUTDOWN, &sdp->sd_flags))
++ 	    test_and_set_bit(SDF_WITHDRAWN, &sdp->sd_flags))
+  		return 0;
+  
+ -	if (fmt) {
+ -		va_start(args, fmt);
+ -
+ -		vaf.fmt = fmt;
+ -		vaf.va = &args;
+ -
+ -		fs_err(sdp, "%pV", &vaf);
+ -
+ -		va_end(args);
+ -	}
+ +	va_start(args, fmt);
+ +	vprintk(fmt, args);
+ +	va_end(args);
+  
+  	if (sdp->sd_args.ar_errors == GFS2_ERRORS_WITHDRAW) {
+  		fs_err(sdp, "about to withdraw this file system\n");
+@@@ -253,21 -248,22 +253,33 @@@ int gfs2_io_error_i(struct gfs2_sbd *sd
+  }
+  
+  /**
+ - * gfs2_io_error_bh_i - Flag a buffer I/O error
+ - * @withdraw: withdraw the filesystem
+ + * gfs2_io_error_bh_i - Flag a buffer I/O error and withdraw
+ + * Returns: -1 if this call withdrew the machine,
+ + *          0 if it was already withdrawn
+   */
+  
+ -void gfs2_io_error_bh_i(struct gfs2_sbd *sdp, struct buffer_head *bh,
+ -			const char *function, char *file, unsigned int line,
+ -			bool withdraw)
+ +int gfs2_io_error_bh_i(struct gfs2_sbd *sdp, struct buffer_head *bh,
+ +		       const char *function, char *file, unsigned int line)
+  {
+++<<<<<<< HEAD
+ +	int rv;
+ +	rv = gfs2_lm_withdraw(sdp,
+ +		"GFS2: fsid=%s: fatal: I/O error\n"
+ +		"GFS2: fsid=%s:   block = %llu\n"
+ +		"GFS2: fsid=%s:   function = %s, file = %s, line = %u\n",
+ +		sdp->sd_fsname,
+ +		sdp->sd_fsname, (unsigned long long)bh->b_blocknr,
+ +		sdp->sd_fsname, function, file, line);
+ +	return rv;
+++=======
++ 	if (!test_bit(SDF_WITHDRAWN, &sdp->sd_flags))
++ 		fs_err(sdp,
++ 		       "fatal: I/O error\n"
++ 		       "  block = %llu\n"
++ 		       "  function = %s, file = %s, line = %u\n",
++ 		       (unsigned long long)bh->b_blocknr,
++ 		       function, file, line);
++ 	if (withdraw)
++ 		gfs2_lm_withdraw(sdp, NULL);
+++>>>>>>> 04aea0ca14f0 (gfs2: Rename SDF_SHUTDOWN to SDF_WITHDRAWN)
+  }
+ -
+diff --git a/fs/gfs2/aops.c b/fs/gfs2/aops.c
+index 0b7cbf658c05..ad6379ea6ddc 100644
+--- a/fs/gfs2/aops.c
++++ b/fs/gfs2/aops.c
+@@ -539,7 +539,7 @@ static int __gfs2_readpage(void *file, struct page *page)
+ 		error = mpage_readpage(page, gfs2_block_map);
+ 	}
+ 
+-	if (unlikely(test_bit(SDF_SHUTDOWN, &sdp->sd_flags)))
++	if (unlikely(test_bit(SDF_WITHDRAWN, &sdp->sd_flags)))
+ 		return -EIO;
+ 
+ 	return error;
+@@ -653,7 +653,7 @@ static int gfs2_readpages(struct file *file, struct address_space *mapping,
+ 	gfs2_glock_dq(&gh);
+ out_uninit:
+ 	gfs2_holder_uninit(&gh);
+-	if (unlikely(test_bit(SDF_SHUTDOWN, &sdp->sd_flags)))
++	if (unlikely(test_bit(SDF_WITHDRAWN, &sdp->sd_flags)))
+ 		ret = -EIO;
+ 	return ret;
+ }
+diff --git a/fs/gfs2/file.c b/fs/gfs2/file.c
+index 90830069086c..73ac7c5d408c 100644
+--- a/fs/gfs2/file.c
++++ b/fs/gfs2/file.c
+@@ -1116,7 +1116,7 @@ static int gfs2_lock(struct file *file, int cmd, struct file_lock *fl)
+ 		cmd = F_SETLK;
+ 		fl->fl_type = F_UNLCK;
+ 	}
+-	if (unlikely(test_bit(SDF_SHUTDOWN, &sdp->sd_flags))) {
++	if (unlikely(test_bit(SDF_WITHDRAWN, &sdp->sd_flags))) {
+ 		if (fl->fl_type == F_UNLCK)
+ 			locks_lock_file_wait(file, fl);
+ 		return -EIO;
+* Unmerged path fs/gfs2/glock.c
+diff --git a/fs/gfs2/glops.c b/fs/gfs2/glops.c
+index 90b93ba7dd9f..1e22a2bf4d01 100644
+--- a/fs/gfs2/glops.c
++++ b/fs/gfs2/glops.c
+@@ -520,7 +520,7 @@ static int trans_go_xmote_bh(struct gfs2_glock *gl, struct gfs2_holder *gh)
+ 			gfs2_consist(sdp);
+ 
+ 		/*  Initialize some head of the log stuff  */
+-		if (!test_bit(SDF_SHUTDOWN, &sdp->sd_flags)) {
++		if (!test_bit(SDF_WITHDRAWN, &sdp->sd_flags)) {
+ 			sdp->sd_log_sequence = head.lh_sequence + 1;
+ 			gfs2_log_pointers_init(sdp, head.lh_blkno);
+ 		}
+diff --git a/fs/gfs2/incore.h b/fs/gfs2/incore.h
+index 1f6f222b6802..360b5bfa3bae 100644
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@ -580,7 +580,7 @@ struct gfs2_tune {
+ enum {
+ 	SDF_JOURNAL_CHECKED	= 0,
+ 	SDF_JOURNAL_LIVE	= 1,
+-	SDF_SHUTDOWN		= 2,
++	SDF_WITHDRAWN		= 2,
+ 	SDF_NOBARRIERS		= 3,
+ 	SDF_NORECOVERY		= 4,
+ 	SDF_DEMOTE		= 5,
+diff --git a/fs/gfs2/meta_io.c b/fs/gfs2/meta_io.c
+index 8efc17222f4f..daa5ff249d1a 100644
+--- a/fs/gfs2/meta_io.c
++++ b/fs/gfs2/meta_io.c
+@@ -264,7 +264,7 @@ int gfs2_meta_read(struct gfs2_glock *gl, u64 blkno, int flags,
+ 	struct buffer_head *bh, *bhs[2];
+ 	int num = 0;
+ 
+-	if (unlikely(test_bit(SDF_SHUTDOWN, &sdp->sd_flags))) {
++	if (unlikely(test_bit(SDF_WITHDRAWN, &sdp->sd_flags))) {
+ 		*bhp = NULL;
+ 		return -EIO;
+ 	}
+@@ -322,7 +322,7 @@ int gfs2_meta_read(struct gfs2_glock *gl, u64 blkno, int flags,
+ 
+ int gfs2_meta_wait(struct gfs2_sbd *sdp, struct buffer_head *bh)
+ {
+-	if (unlikely(test_bit(SDF_SHUTDOWN, &sdp->sd_flags)))
++	if (unlikely(test_bit(SDF_WITHDRAWN, &sdp->sd_flags)))
+ 		return -EIO;
+ 
+ 	wait_on_buffer(bh);
+@@ -333,7 +333,7 @@ int gfs2_meta_wait(struct gfs2_sbd *sdp, struct buffer_head *bh)
+ 			gfs2_io_error_bh(sdp, bh);
+ 		return -EIO;
+ 	}
+-	if (unlikely(test_bit(SDF_SHUTDOWN, &sdp->sd_flags)))
++	if (unlikely(test_bit(SDF_WITHDRAWN, &sdp->sd_flags)))
+ 		return -EIO;
+ 
+ 	return 0;
+diff --git a/fs/gfs2/ops_fstype.c b/fs/gfs2/ops_fstype.c
+index cc0fc48b4376..8cb73009fc82 100644
+--- a/fs/gfs2/ops_fstype.c
++++ b/fs/gfs2/ops_fstype.c
+@@ -989,7 +989,7 @@ hostdata_error:
+ void gfs2_lm_unmount(struct gfs2_sbd *sdp)
+ {
+ 	const struct lm_lockops *lm = sdp->sd_lockstruct.ls_ops;
+-	if (likely(!test_bit(SDF_SHUTDOWN, &sdp->sd_flags)) &&
++	if (likely(!test_bit(SDF_WITHDRAWN, &sdp->sd_flags)) &&
+ 	    lm->lm_unmount)
+ 		lm->lm_unmount(sdp);
+ }
+diff --git a/fs/gfs2/quota.c b/fs/gfs2/quota.c
+index e2f42a2af815..737f7fa2d6d6 100644
+--- a/fs/gfs2/quota.c
++++ b/fs/gfs2/quota.c
+@@ -1488,7 +1488,7 @@ static void quotad_error(struct gfs2_sbd *sdp, const char *msg, int error)
+ {
+ 	if (error == 0 || error == -EROFS)
+ 		return;
+-	if (!test_bit(SDF_SHUTDOWN, &sdp->sd_flags)) {
++	if (!test_bit(SDF_WITHDRAWN, &sdp->sd_flags)) {
+ 		fs_err(sdp, "gfs2_quotad: %s error %d\n", msg, error);
+ 		sdp->sd_log_error = error;
+ 		wake_up(&sdp->sd_logd_waitq);
+* Unmerged path fs/gfs2/super.c
+diff --git a/fs/gfs2/sys.c b/fs/gfs2/sys.c
+index 66e85f87e8c9..fa29d75bf08f 100644
+--- a/fs/gfs2/sys.c
++++ b/fs/gfs2/sys.c
+@@ -126,7 +126,7 @@ static ssize_t freeze_store(struct gfs2_sbd *sdp, const char *buf, size_t len)
+ 
+ static ssize_t withdraw_show(struct gfs2_sbd *sdp, char *buf)
+ {
+-	unsigned int b = test_bit(SDF_SHUTDOWN, &sdp->sd_flags);
++	unsigned int b = test_bit(SDF_WITHDRAWN, &sdp->sd_flags);
+ 	return snprintf(buf, PAGE_SIZE, "%u\n", b);
+ }
+ 
+* Unmerged path fs/gfs2/util.c
