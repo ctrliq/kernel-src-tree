@@ -1,0 +1,420 @@
+ibmvnic: driver initialization for kdump/kexec
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Nathan Fontenot <nfont@linux.vnet.ibm.com>
+commit 6a2fb0e99f9cab349dce0a36862b0cd370036452
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/6a2fb0e9.failed
+
+When booting into the kdump/kexec kernel, pHyp and vios
+are not prepared for the initialization crq request and
+a failover transport event is generated. This is not
+handled correctly.
+
+At this point in initialization the driver is still in
+the 'probing' state and cannot handle a full reset of the
+driver as is normally done for a failover transport event.
+
+To correct this we catch driver resets while still in the
+'probing' state and return EAGAIN. This results in the
+driver tearing down the main crq and calling ibmvnic_init()
+again.
+
+	Signed-off-by: Nathan Fontenot <nfont@linux.vnet.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6a2fb0e99f9cab349dce0a36862b0cd370036452)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/ibm/ibmvnic.c
+diff --cc drivers/net/ethernet/ibm/ibmvnic.c
+index 6bfad3f7c17a,722daf55d757..000000000000
+--- a/drivers/net/ethernet/ibm/ibmvnic.c
++++ b/drivers/net/ethernet/ibm/ibmvnic.c
+@@@ -982,6 -1377,113 +982,116 @@@ static int ibmvnic_change_mtu(struct ne
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct ibmvnic_rwi *get_next_rwi(struct ibmvnic_adapter *adapter)
++ {
++ 	struct ibmvnic_rwi *rwi;
++ 
++ 	mutex_lock(&adapter->rwi_lock);
++ 
++ 	if (!list_empty(&adapter->rwi_list)) {
++ 		rwi = list_first_entry(&adapter->rwi_list, struct ibmvnic_rwi,
++ 				       list);
++ 		list_del(&rwi->list);
++ 	} else {
++ 		rwi = NULL;
++ 	}
++ 
++ 	mutex_unlock(&adapter->rwi_lock);
++ 	return rwi;
++ }
++ 
++ static void free_all_rwi(struct ibmvnic_adapter *adapter)
++ {
++ 	struct ibmvnic_rwi *rwi;
++ 
++ 	rwi = get_next_rwi(adapter);
++ 	while (rwi) {
++ 		kfree(rwi);
++ 		rwi = get_next_rwi(adapter);
++ 	}
++ }
++ 
++ static void __ibmvnic_reset(struct work_struct *work)
++ {
++ 	struct ibmvnic_rwi *rwi;
++ 	struct ibmvnic_adapter *adapter;
++ 	struct net_device *netdev;
++ 	u32 reset_state;
++ 	int rc;
++ 
++ 	adapter = container_of(work, struct ibmvnic_adapter, ibmvnic_reset);
++ 	netdev = adapter->netdev;
++ 
++ 	mutex_lock(&adapter->reset_lock);
++ 	adapter->resetting = true;
++ 	reset_state = adapter->state;
++ 
++ 	rwi = get_next_rwi(adapter);
++ 	while (rwi) {
++ 		rc = do_reset(adapter, rwi, reset_state);
++ 		kfree(rwi);
++ 		if (rc)
++ 			break;
++ 
++ 		rwi = get_next_rwi(adapter);
++ 	}
++ 
++ 	if (rc) {
++ 		free_all_rwi(adapter);
++ 		mutex_unlock(&adapter->reset_lock);
++ 		return;
++ 	}
++ 
++ 	adapter->resetting = false;
++ 	mutex_unlock(&adapter->reset_lock);
++ }
++ 
++ static void ibmvnic_reset(struct ibmvnic_adapter *adapter,
++ 			  enum ibmvnic_reset_reason reason)
++ {
++ 	struct ibmvnic_rwi *rwi, *tmp;
++ 	struct net_device *netdev = adapter->netdev;
++ 	struct list_head *entry;
++ 
++ 	if (adapter->state == VNIC_REMOVING ||
++ 	    adapter->state == VNIC_REMOVED) {
++ 		netdev_dbg(netdev, "Adapter removing, skipping reset\n");
++ 		return;
++ 	}
++ 
++ 	if (adapter->state == VNIC_PROBING) {
++ 		netdev_warn(netdev, "Adapter reset during probe\n");
++ 		adapter->init_done_rc = EAGAIN;
++ 		return;
++ 	}
++ 
++ 	mutex_lock(&adapter->rwi_lock);
++ 
++ 	list_for_each(entry, &adapter->rwi_list) {
++ 		tmp = list_entry(entry, struct ibmvnic_rwi, list);
++ 		if (tmp->reset_reason == reason) {
++ 			netdev_err(netdev, "Matching reset found, skipping\n");
++ 			mutex_unlock(&adapter->rwi_lock);
++ 			return;
++ 		}
++ 	}
++ 
++ 	rwi = kzalloc(sizeof(*rwi), GFP_KERNEL);
++ 	if (!rwi) {
++ 		mutex_unlock(&adapter->rwi_lock);
++ 		ibmvnic_close(netdev);
++ 		return;
++ 	}
++ 
++ 	rwi->reset_reason = reason;
++ 	list_add_tail(&rwi->list, &adapter->rwi_list);
++ 	mutex_unlock(&adapter->rwi_lock);
++ 	schedule_work(&adapter->ibmvnic_reset);
++ }
++ 
+++>>>>>>> 6a2fb0e99f9c (ibmvnic: driver initialization for kdump/kexec)
+  static void ibmvnic_tx_timeout(struct net_device *dev)
+  {
+  	struct ibmvnic_adapter *adapter = netdev_priv(dev);
+@@@ -3722,122 -3632,60 +3832,143 @@@ map_failed
+  	return retrc;
+  }
+  
+ -static int ibmvnic_init(struct ibmvnic_adapter *adapter)
+ +/* debugfs for dump */
+ +static int ibmvnic_dump_show(struct seq_file *seq, void *v)
+  {
+ +	struct net_device *netdev = seq->private;
+ +	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
+  	struct device *dev = &adapter->vdev->dev;
+ -	unsigned long timeout = msecs_to_jiffies(30000);
+ -	int rc;
+ +	union ibmvnic_crq crq;
+  
+ -	if (adapter->resetting) {
+ -		rc = ibmvnic_reset_crq(adapter);
+ -		if (!rc)
+ -			rc = vio_enable_interrupts(adapter->vdev);
+ -	} else {
+ -		rc = init_crq_queue(adapter);
+ -	}
+ +	memset(&crq, 0, sizeof(crq));
+ +	crq.request_dump_size.first = IBMVNIC_CRQ_CMD;
+ +	crq.request_dump_size.cmd = REQUEST_DUMP_SIZE;
+  
+ -	if (rc) {
+ -		dev_err(dev, "Couldn't initialize crq. rc=%d\n", rc);
+ -		return rc;
+ -	}
+ +	init_completion(&adapter->fw_done);
+ +	ibmvnic_send_crq(adapter, &crq);
+ +	wait_for_completion(&adapter->fw_done);
+  
+ -	adapter->from_passive_init = false;
+ +	seq_write(seq, adapter->dump_data, adapter->dump_data_size);
+ +
+++<<<<<<< HEAD
+ +	dma_unmap_single(dev, adapter->dump_data_token, adapter->dump_data_size,
+ +			 DMA_BIDIRECTIONAL);
+  
+ +	kfree(adapter->dump_data);
+++=======
++ 	init_completion(&adapter->init_done);
++ 	adapter->init_done_rc = 0;
++ 	ibmvnic_send_crq_init(adapter);
++ 	if (!wait_for_completion_timeout(&adapter->init_done, timeout)) {
++ 		dev_err(dev, "Initialization sequence timed out\n");
++ 		return -1;
++ 	}
++ 
++ 	if (adapter->init_done_rc) {
++ 		release_crq_queue(adapter);
++ 		return adapter->init_done_rc;
++ 	}
++ 
++ 	if (adapter->from_passive_init) {
++ 		adapter->state = VNIC_OPEN;
++ 		adapter->from_passive_init = false;
++ 		return -1;
++ 	}
+++>>>>>>> 6a2fb0e99f9c (ibmvnic: driver initialization for kdump/kexec)
+  
+ -	if (adapter->resetting)
+ -		rc = reset_sub_crq_queues(adapter);
+ -	else
+ -		rc = init_sub_crqs(adapter);
+ +	return 0;
+ +}
+ +
+ +static int ibmvnic_dump_open(struct inode *inode, struct file *file)
+ +{
+ +	return single_open(file, ibmvnic_dump_show, inode->i_private);
+ +}
+ +
+ +static const struct file_operations ibmvnic_dump_ops = {
+ +	.owner          = THIS_MODULE,
+ +	.open           = ibmvnic_dump_open,
+ +	.read           = seq_read,
+ +	.llseek         = seq_lseek,
+ +	.release        = single_release,
+ +};
+ +
+ +static void handle_crq_init_rsp(struct work_struct *work)
+ +{
+ +	struct ibmvnic_adapter *adapter = container_of(work,
+ +						       struct ibmvnic_adapter,
+ +						       vnic_crq_init);
+ +	struct device *dev = &adapter->vdev->dev;
+ +	struct net_device *netdev = adapter->netdev;
+ +	unsigned long timeout = msecs_to_jiffies(30000);
+ +	bool restart = false;
+ +	int rc;
+ +
+ +	if (adapter->failover) {
+ +		release_sub_crqs(adapter);
+ +		if (netif_running(netdev)) {
+ +			netif_tx_disable(netdev);
+ +			ibmvnic_close(netdev);
+ +			restart = true;
+ +		}
+ +	}
+ +
+ +	reinit_completion(&adapter->init_done);
+ +	send_version_xchg(adapter);
+ +	if (!wait_for_completion_timeout(&adapter->init_done, timeout)) {
+ +		dev_err(dev, "Passive init timeout\n");
+ +		goto task_failed;
+ +	}
+ +
+ +	do {
+ +		if (adapter->renegotiate) {
+ +			adapter->renegotiate = false;
+ +			release_sub_crqs_no_irqs(adapter);
+ +
+ +			reinit_completion(&adapter->init_done);
+ +			send_cap_queries(adapter);
+ +			if (!wait_for_completion_timeout(&adapter->init_done,
+ +							 timeout)) {
+ +				dev_err(dev, "Passive init timeout\n");
+ +				goto task_failed;
+ +			}
+ +		}
+ +	} while (adapter->renegotiate);
+ +	rc = init_sub_crq_irqs(adapter);
+ +
+ +	if (rc)
+ +		goto task_failed;
+ +
+ +	netdev->real_num_tx_queues = adapter->req_tx_queues;
+ +	netdev->mtu = adapter->req_mtu;
+ +
+ +	if (adapter->failover) {
+ +		adapter->failover = false;
+ +		if (restart) {
+ +			rc = ibmvnic_open(netdev);
+ +			if (rc)
+ +				goto restart_failed;
+ +		}
+ +		netif_carrier_on(netdev);
+ +		return;
+ +	}
+ +
+ +	rc = register_netdev(netdev);
+  	if (rc) {
+ -		dev_err(dev, "Initialization of sub crqs failed\n");
+ -		release_crq_queue(adapter);
+ +		dev_err(dev,
+ +			"failed to register netdev rc=%d\n", rc);
+ +		goto register_failed;
+  	}
+ +	dev_info(dev, "ibmvnic registered\n");
+  
+ -	return rc;
+ -}
+ +	return;
+  
+ -static struct device_attribute dev_attr_failover;
+ +restart_failed:
+ +	dev_err(dev, "Failed to restart ibmvnic, rc=%d\n", rc);
+ +register_failed:
+ +	release_sub_crqs(adapter);
+ +task_failed:
+ +	dev_err(dev, "Passive initialization was not successful\n");
+ +}
+  
+  static int ibmvnic_probe(struct vio_dev *dev, const struct vio_device_id *id)
+  {
+@@@ -3879,77 -3724,33 +4010,93 @@@
+  	netdev->ethtool_ops = &ibmvnic_ethtool_ops;
+  	SET_NETDEV_DEV(netdev, &dev->dev);
+  
+ +	INIT_WORK(&adapter->vnic_crq_init, handle_crq_init_rsp);
+ +	INIT_WORK(&adapter->ibmvnic_xport, ibmvnic_xport_event);
+ +
+  	spin_lock_init(&adapter->stats_lock);
+  
+ +	rc = ibmvnic_init_crq_queue(adapter);
+ +	if (rc) {
+ +		dev_err(&dev->dev, "Couldn't initialize crq. rc=%d\n", rc);
+ +		goto free_netdev;
+ +	}
+ +
+  	INIT_LIST_HEAD(&adapter->errors);
+ +	INIT_LIST_HEAD(&adapter->inflight);
+  	spin_lock_init(&adapter->error_list_lock);
+ -
+ +	spin_lock_init(&adapter->inflight_lock);
+ +
+++<<<<<<< HEAD
+ +	adapter->stats_token = dma_map_single(&dev->dev, &adapter->stats,
+ +					      sizeof(struct ibmvnic_statistics),
+ +					      DMA_FROM_DEVICE);
+ +	if (dma_mapping_error(&dev->dev, adapter->stats_token)) {
+ +		if (!firmware_has_feature(FW_FEATURE_CMO))
+ +			dev_err(&dev->dev, "Couldn't map stats buffer\n");
+ +		rc = -ENOMEM;
+ +		goto free_crq;
+ +	}
+++=======
++ 	INIT_WORK(&adapter->ibmvnic_reset, __ibmvnic_reset);
++ 	INIT_LIST_HEAD(&adapter->rwi_list);
++ 	mutex_init(&adapter->reset_lock);
++ 	mutex_init(&adapter->rwi_lock);
++ 	adapter->resetting = false;
++ 
++ 	do {
++ 		rc = ibmvnic_init(adapter);
++ 		if (rc != EAGAIN) {
++ 			free_netdev(netdev);
++ 			return rc;
++ 		}
++ 	} while (rc == EAGAIN);
+++>>>>>>> 6a2fb0e99f9c (ibmvnic: driver initialization for kdump/kexec)
+  
+ -	netdev->mtu = adapter->req_mtu - ETH_HLEN;
+ +	snprintf(buf, sizeof(buf), "ibmvnic_%x", dev->unit_address);
+ +	ent = debugfs_create_dir(buf, NULL);
+ +	if (!ent || IS_ERR(ent)) {
+ +		dev_info(&dev->dev, "debugfs create directory failed\n");
+ +		adapter->debugfs_dir = NULL;
+ +	} else {
+ +		adapter->debugfs_dir = ent;
+ +		ent = debugfs_create_file("dump", S_IRUGO, adapter->debugfs_dir,
+ +					  netdev, &ibmvnic_dump_ops);
+ +		if (!ent || IS_ERR(ent)) {
+ +			dev_info(&dev->dev,
+ +				 "debugfs create dump file failed\n");
+ +			adapter->debugfs_dump = NULL;
+ +		} else {
+ +			adapter->debugfs_dump = ent;
+ +		}
+ +	}
+ +
+ +	init_completion(&adapter->init_done);
+ +	ibmvnic_send_crq_init(adapter);
+ +	if (!wait_for_completion_timeout(&adapter->init_done, timeout))
+ +		return 0;
+ +
+ +	do {
+ +		if (adapter->renegotiate) {
+ +			adapter->renegotiate = false;
+ +			release_sub_crqs_no_irqs(adapter);
+ +
+ +			reinit_completion(&adapter->init_done);
+ +			send_cap_queries(adapter);
+ +			if (!wait_for_completion_timeout(&adapter->init_done,
+ +							 timeout))
+ +				return 0;
+ +		}
+ +	} while (adapter->renegotiate);
+  
+ -	rc = device_create_file(&dev->dev, &dev_attr_failover);
+ +	rc = init_sub_crq_irqs(adapter);
+  	if (rc) {
+ -		free_netdev(netdev);
+ -		return rc;
+ +		dev_err(&dev->dev, "failed to initialize sub crq irqs\n");
+ +		goto free_debugfs;
+  	}
+  
+ +	netdev->real_num_tx_queues = adapter->req_tx_queues;
+ +	netdev->mtu = adapter->req_mtu;
+ +
+  	rc = register_netdev(netdev);
+  	if (rc) {
+  		dev_err(&dev->dev, "failed to register netdev rc=%d\n", rc);
+* Unmerged path drivers/net/ethernet/ibm/ibmvnic.c
