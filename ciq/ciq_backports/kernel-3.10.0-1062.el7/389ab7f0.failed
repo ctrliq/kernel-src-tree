@@ -1,0 +1,332 @@
+xdp: introduce xdp_return_frame_rx_napi
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jesper Dangaard Brouer <brouer@redhat.com>
+commit 389ab7f01af988c2a1ec5617eb0c7e220df1ef1c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/389ab7f0.failed
+
+When sending an xdp_frame through xdp_do_redirect call, then error
+cases can happen where the xdp_frame needs to be dropped, and
+returning an -errno code isn't sufficient/possible any-longer
+(e.g. for cpumap case). This is already fully supported, by simply
+calling xdp_return_frame.
+
+This patch is an optimization, which provides xdp_return_frame_rx_napi,
+which is a faster variant for these error cases.  It take advantage of
+the protection provided by XDP RX running under NAPI protection.
+
+This change is mostly relevant for drivers using the page_pool
+allocator as it can take advantage of this. (Tested with mlx5).
+
+	Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit 389ab7f01af988c2a1ec5617eb0c7e220df1ef1c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/page_pool.h
+#	include/net/xdp.h
+#	kernel/bpf/cpumap.c
+#	kernel/bpf/devmap.c
+#	net/core/xdp.c
+diff --cc include/net/page_pool.h
+index 1fe77db59518,694d055e01ef..000000000000
+--- a/include/net/page_pool.h
++++ b/include/net/page_pool.h
+@@@ -115,9 -115,15 +115,19 @@@ void page_pool_destroy(struct page_poo
+  void __page_pool_put_page(struct page_pool *pool,
+  			  struct page *page, bool allow_direct);
+  
+- static inline void page_pool_put_page(struct page_pool *pool, struct page *page)
++ static inline void page_pool_put_page(struct page_pool *pool,
++ 				      struct page *page, bool allow_direct)
+  {
+++<<<<<<< HEAD
+ +	__page_pool_put_page(pool, page, false);
+++=======
++ 	/* When page_pool isn't compiled-in, net/core/xdp.c doesn't
++ 	 * allow registering MEM_TYPE_PAGE_POOL, but shield linker.
++ 	 */
++ #ifdef CONFIG_PAGE_POOL
++ 	__page_pool_put_page(pool, page, allow_direct);
++ #endif
+++>>>>>>> 389ab7f01af9 (xdp: introduce xdp_return_frame_rx_napi)
+  }
+  /* Very limited use-cases allow recycle direct */
+  static inline void page_pool_recycle_direct(struct page_pool *pool,
+diff --cc include/net/xdp.h
+index 6ac69520ed7c,7ad779237ae8..000000000000
+--- a/include/net/xdp.h
++++ b/include/net/xdp.h
+@@@ -73,14 -78,34 +73,20 @@@ struct xdp_frame 
+  static inline
+  struct xdp_frame *convert_to_xdp_frame(struct xdp_buff *xdp)
+  {
+ -	struct xdp_frame *xdp_frame;
+ -	int metasize;
+ -	int headroom;
+ -
+ -	/* Assure headroom is available for storing info */
+ -	headroom = xdp->data - xdp->data_hard_start;
+ -	metasize = xdp->data - xdp->data_meta;
+ -	metasize = metasize > 0 ? metasize : 0;
+ -	if (unlikely((headroom - metasize) < sizeof(*xdp_frame)))
+ -		return NULL;
+ -
+ -	/* Store info in top of packet */
+ -	xdp_frame = xdp->data_hard_start;
+ -
+ -	xdp_frame->data = xdp->data;
+ -	xdp_frame->len  = xdp->data_end - xdp->data;
+ -	xdp_frame->headroom = headroom - sizeof(*xdp_frame);
+ -	xdp_frame->metasize = metasize;
+ -
+ -	/* rxq only valid until napi_schedule ends, convert to xdp_mem_info */
+ -	xdp_frame->mem = xdp->rxq->mem;
+ -
+ -	return xdp_frame;
+ +	return NULL;
+  }
+  
+++<<<<<<< HEAD
+ +static inline
+ +void xdp_return_frame(struct xdp_frame *xdpf)
+ +{
+ +	return;
+ +}
+++=======
++ void xdp_return_frame(struct xdp_frame *xdpf);
++ void xdp_return_frame_rx_napi(struct xdp_frame *xdpf);
++ void xdp_return_buff(struct xdp_buff *xdp);
+++>>>>>>> 389ab7f01af9 (xdp: introduce xdp_return_frame_rx_napi)
+  
+  int xdp_rxq_info_reg(struct xdp_rxq_info *xdp_rxq,
+  		     struct net_device *dev, u32 queue_index);
+diff --cc kernel/bpf/devmap.c
+index 644098c7566a,a9cd5c93dd2b..000000000000
+--- a/kernel/bpf/devmap.c
++++ b/kernel/bpf/devmap.c
+@@@ -156,6 -208,84 +156,87 @@@ static int dev_map_get_next_key(struct 
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void __dev_map_insert_ctx(struct bpf_map *map, u32 bit)
++ {
++ 	struct bpf_dtab *dtab = container_of(map, struct bpf_dtab, map);
++ 	unsigned long *bitmap = this_cpu_ptr(dtab->flush_needed);
++ 
++ 	__set_bit(bit, bitmap);
++ }
++ 
++ static int bq_xmit_all(struct bpf_dtab_netdev *obj,
++ 			 struct xdp_bulk_queue *bq)
++ {
++ 	struct net_device *dev = obj->dev;
++ 	int sent = 0, drops = 0;
++ 	int i;
++ 
++ 	if (unlikely(!bq->count))
++ 		return 0;
++ 
++ 	for (i = 0; i < bq->count; i++) {
++ 		struct xdp_frame *xdpf = bq->q[i];
++ 
++ 		prefetch(xdpf);
++ 	}
++ 
++ 	for (i = 0; i < bq->count; i++) {
++ 		struct xdp_frame *xdpf = bq->q[i];
++ 		int err;
++ 
++ 		err = dev->netdev_ops->ndo_xdp_xmit(dev, xdpf);
++ 		if (err) {
++ 			drops++;
++ 			xdp_return_frame_rx_napi(xdpf);
++ 		} else {
++ 			sent++;
++ 		}
++ 	}
++ 	bq->count = 0;
++ 
++ 	trace_xdp_devmap_xmit(&obj->dtab->map, obj->bit,
++ 			      sent, drops, bq->dev_rx, dev);
++ 	bq->dev_rx = NULL;
++ 	return 0;
++ }
++ 
++ /* __dev_map_flush is called from xdp_do_flush_map() which _must_ be signaled
++  * from the driver before returning from its napi->poll() routine. The poll()
++  * routine is called either from busy_poll context or net_rx_action signaled
++  * from NET_RX_SOFTIRQ. Either way the poll routine must complete before the
++  * net device can be torn down. On devmap tear down we ensure the ctx bitmap
++  * is zeroed before completing to ensure all flush operations have completed.
++  */
++ void __dev_map_flush(struct bpf_map *map)
++ {
++ 	struct bpf_dtab *dtab = container_of(map, struct bpf_dtab, map);
++ 	unsigned long *bitmap = this_cpu_ptr(dtab->flush_needed);
++ 	u32 bit;
++ 
++ 	for_each_set_bit(bit, bitmap, map->max_entries) {
++ 		struct bpf_dtab_netdev *dev = READ_ONCE(dtab->netdev_map[bit]);
++ 		struct xdp_bulk_queue *bq;
++ 		struct net_device *netdev;
++ 
++ 		/* This is possible if the dev entry is removed by user space
++ 		 * between xdp redirect and flush op.
++ 		 */
++ 		if (unlikely(!dev))
++ 			continue;
++ 
++ 		__clear_bit(bit, bitmap);
++ 
++ 		bq = this_cpu_ptr(dev->bulkq);
++ 		bq_xmit_all(dev, bq);
++ 		netdev = dev->dev;
++ 		if (likely(netdev->netdev_ops->ndo_xdp_flush))
++ 			netdev->netdev_ops->ndo_xdp_flush(netdev);
++ 	}
++ }
++ 
+++>>>>>>> 389ab7f01af9 (xdp: introduce xdp_return_frame_rx_napi)
+  /* rcu_read_lock (from syscall and BPF contexts) ensures that if a delete and/or
+   * update happens in parallel here a dev_put wont happen until after reading the
+   * ifindex.
+diff --cc net/core/xdp.c
+index e553510efc2e,cb8c4e061a5a..000000000000
+--- a/net/core/xdp.c
++++ b/net/core/xdp.c
+@@@ -42,6 -245,119 +42,63 @@@ EXPORT_SYMBOL_GPL(xdp_rxq_info_is_reg)
+  int xdp_rxq_info_reg_mem_model(struct xdp_rxq_info *xdp_rxq,
+  			       enum xdp_mem_type type, void *allocator)
+  {
+ -	struct xdp_mem_allocator *xdp_alloc;
+ -	gfp_t gfp = GFP_KERNEL;
+ -	int id, errno, ret;
+ -	void *ptr;
+ -
+ -	if (xdp_rxq->reg_state != REG_STATE_REGISTERED) {
+ -		WARN(1, "Missing register, driver bug");
+ -		return -EFAULT;
+ -	}
+ -
+ -	if (!__is_supported_mem_type(type))
+ -		return -EOPNOTSUPP;
+ -
+ -	xdp_rxq->mem.type = type;
+ -
+ -	if (!allocator) {
+ -		if (type == MEM_TYPE_PAGE_POOL)
+ -			return -EINVAL; /* Setup time check page_pool req */
+ -		return 0;
+ -	}
+ -
+ -	/* Delay init of rhashtable to save memory if feature isn't used */
+ -	if (!mem_id_init) {
+ -		mutex_lock(&mem_id_lock);
+ -		ret = __mem_id_init_hash_table();
+ -		mutex_unlock(&mem_id_lock);
+ -		if (ret < 0) {
+ -			WARN_ON(1);
+ -			return ret;
+ -		}
+ -	}
+ -
+ -	xdp_alloc = kzalloc(sizeof(*xdp_alloc), gfp);
+ -	if (!xdp_alloc)
+ -		return -ENOMEM;
+ -
+ -	mutex_lock(&mem_id_lock);
+ -	id = __mem_id_cyclic_get(gfp);
+ -	if (id < 0) {
+ -		errno = id;
+ -		goto err;
+ -	}
+ -	xdp_rxq->mem.id = id;
+ -	xdp_alloc->mem  = xdp_rxq->mem;
+ -	xdp_alloc->allocator = allocator;
+ -
+ -	/* Insert allocator into ID lookup table */
+ -	ptr = rhashtable_insert_slow(mem_id_ht, &id, &xdp_alloc->node);
+ -	if (IS_ERR(ptr)) {
+ -		errno = PTR_ERR(ptr);
+ -		goto err;
+ -	}
+ -
+ -	mutex_unlock(&mem_id_lock);
+ -
+  	return 0;
+ -err:
+ -	mutex_unlock(&mem_id_lock);
+ -	kfree(xdp_alloc);
+ -	return errno;
+  }
+  EXPORT_SYMBOL_GPL(xdp_rxq_info_reg_mem_model);
+++<<<<<<< HEAD
+++=======
++ 
++ /* XDP RX runs under NAPI protection, and in different delivery error
++  * scenarios (e.g. queue full), it is possible to return the xdp_frame
++  * while still leveraging this protection.  The @napi_direct boolian
++  * is used for those calls sites.  Thus, allowing for faster recycling
++  * of xdp_frames/pages in those cases.
++  */
++ static void __xdp_return(void *data, struct xdp_mem_info *mem, bool napi_direct)
++ {
++ 	struct xdp_mem_allocator *xa;
++ 	struct page *page;
++ 
++ 	switch (mem->type) {
++ 	case MEM_TYPE_PAGE_POOL:
++ 		rcu_read_lock();
++ 		/* mem->id is valid, checked in xdp_rxq_info_reg_mem_model() */
++ 		xa = rhashtable_lookup(mem_id_ht, &mem->id, mem_id_rht_params);
++ 		page = virt_to_head_page(data);
++ 		if (xa)
++ 			page_pool_put_page(xa->page_pool, page, napi_direct);
++ 		else
++ 			put_page(page);
++ 		rcu_read_unlock();
++ 		break;
++ 	case MEM_TYPE_PAGE_SHARED:
++ 		page_frag_free(data);
++ 		break;
++ 	case MEM_TYPE_PAGE_ORDER0:
++ 		page = virt_to_page(data); /* Assumes order0 page*/
++ 		put_page(page);
++ 		break;
++ 	default:
++ 		/* Not possible, checked in xdp_rxq_info_reg_mem_model() */
++ 		break;
++ 	}
++ }
++ 
++ void xdp_return_frame(struct xdp_frame *xdpf)
++ {
++ 	__xdp_return(xdpf->data, &xdpf->mem, false);
++ }
++ EXPORT_SYMBOL_GPL(xdp_return_frame);
++ 
++ void xdp_return_frame_rx_napi(struct xdp_frame *xdpf)
++ {
++ 	__xdp_return(xdpf->data, &xdpf->mem, true);
++ }
++ EXPORT_SYMBOL_GPL(xdp_return_frame_rx_napi);
++ 
++ void xdp_return_buff(struct xdp_buff *xdp)
++ {
++ 	__xdp_return(xdp->data, &xdp->rxq->mem, true);
++ }
++ EXPORT_SYMBOL_GPL(xdp_return_buff);
+++>>>>>>> 389ab7f01af9 (xdp: introduce xdp_return_frame_rx_napi)
+* Unmerged path kernel/bpf/cpumap.c
+* Unmerged path include/net/page_pool.h
+* Unmerged path include/net/xdp.h
+* Unmerged path kernel/bpf/cpumap.c
+* Unmerged path kernel/bpf/devmap.c
+* Unmerged path net/core/xdp.c
