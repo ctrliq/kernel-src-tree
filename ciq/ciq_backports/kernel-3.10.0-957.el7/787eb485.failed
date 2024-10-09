@@ -1,0 +1,104 @@
+xfs: fix and streamline error handling in xfs_end_io
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 787eb485509f9d58962bd8b4dbc6a5ac6e2034fe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/787eb485.failed
+
+There are two different cases of buffered I/O errors:
+
+ - first we can have an already shutdown fs.  In that case we should skip
+   any on-disk operations and just clean up the appen transaction if
+   present and destroy the ioend
+ - a real I/O error.  In that case we should cleanup any lingering COW
+   blocks.  This gets skipped in the current code and is fixed by this
+   patch.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit 787eb485509f9d58962bd8b4dbc6a5ac6e2034fe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_aops.c
+diff --cc fs/xfs/xfs_aops.c
+index 767102523abf,61494295d92f..000000000000
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@@ -276,31 -274,44 +276,68 @@@ xfs_end_io
+  	struct xfs_ioend	*ioend =
+  		container_of(work, struct xfs_ioend, io_work);
+  	struct xfs_inode	*ip = XFS_I(ioend->io_inode);
+++<<<<<<< HEAD
+ +	int			error = ioend->io_error;
+++=======
++ 	xfs_off_t		offset = ioend->io_offset;
++ 	size_t			size = ioend->io_size;
++ 	int			error = ioend->io_bio->bi_error;
+++>>>>>>> 787eb485509f (xfs: fix and streamline error handling in xfs_end_io)
+  
+  	/*
+- 	 * Set an error if the mount has shut down and proceed with end I/O
+- 	 * processing so it can perform whatever cleanups are necessary.
++ 	 * Just clean up the in-memory strutures if the fs has been shut down.
+  	 */
+- 	if (XFS_FORCED_SHUTDOWN(ip->i_mount))
++ 	if (XFS_FORCED_SHUTDOWN(ip->i_mount)) {
+  		error = -EIO;
+++<<<<<<< HEAD
+ +
+ +	/*
+ +	 * For unwritten extents we need to issue transactions to convert a
+ +	 * range to normal written extens after the data I/O has finished.
+ +	 * Detecting and handling completion IO errors is done individually
+ +	 * for each case as different cleanup operations need to be performed
+ +	 * on error.
+ +	 */
+ +	if (ioend->io_type == XFS_IO_UNWRITTEN) {
+ +		if (error)
+ +			goto done;
+ +		error = xfs_iomap_write_unwritten(ip, ioend->io_offset,
+ +						  ioend->io_size);
+ +	} else if (ioend->io_append_trans) {
+ +		error = xfs_setfilesize_ioend(ioend, error);
+ +	} else {
+ +		ASSERT(!xfs_ioend_is_append(ioend));
+++=======
++ 		goto done;
++ 	}
++ 
++ 	/*
++ 	 * Clean up any COW blocks on an I/O error.
++ 	 */
++ 	if (unlikely(error)) {
++ 		switch (ioend->io_type) {
++ 		case XFS_IO_COW:
++ 			xfs_reflink_cancel_cow_range(ip, offset, size, true);
++ 			break;
++ 		}
++ 
++ 		goto done;
++ 	}
++ 
++ 	/*
++ 	 * Success:  commit the COW or unwritten blocks if needed.
++ 	 */
++ 	switch (ioend->io_type) {
++ 	case XFS_IO_COW:
++ 		error = xfs_reflink_end_cow(ip, offset, size);
++ 		break;
++ 	case XFS_IO_UNWRITTEN:
++ 		error = xfs_iomap_write_unwritten(ip, offset, size);
++ 		break;
++ 	default:
++ 		ASSERT(!xfs_ioend_is_append(ioend) || ioend->io_append_trans);
++ 		break;
+++>>>>>>> 787eb485509f (xfs: fix and streamline error handling in xfs_end_io)
+  	}
+  
+  done:
+* Unmerged path fs/xfs/xfs_aops.c
