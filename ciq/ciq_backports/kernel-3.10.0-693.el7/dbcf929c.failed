@@ -1,0 +1,267 @@
+powerpc/pseries: Add support for hash table resizing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [powerpc] pseries: Add support for hash table resizing (David Gibson) [1305399]
+Rebuild_FUZZ: 91.67%
+commit-author David Gibson <david@gibson.dropbear.id.au>
+commit dbcf929c0062b758fbb6312ccaf30716c0c0a608
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/dbcf929c.failed
+
+This adds support for using two hypercalls to change the size of the
+main hash page table while running as a PAPR guest. For now these
+hypercalls are only in experimental qemu versions.
+
+The interface is two part: first H_RESIZE_HPT_PREPARE is used to
+allocate and prepare the new hash table. This may be slow, but can be
+done asynchronously. Then, H_RESIZE_HPT_COMMIT is used to switch to the
+new hash table. This requires that no CPUs be concurrently updating the
+HPT, and so must be run under stop_machine().
+
+This also adds a debugfs file which can be used to manually control
+HPT resizing or testing purposes.
+
+	Signed-off-by: David Gibson <david@gibson.dropbear.id.au>
+	Reviewed-by: Paul Mackerras <paulus@samba.org>
+[mpe: Rename the debugfs file to "hpt_order"]
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit dbcf929c0062b758fbb6312ccaf30716c0c0a608)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/mmu-hash64.h
+#	arch/powerpc/mm/hash_utils_64.c
+#	arch/powerpc/platforms/pseries/lpar.c
+diff --cc arch/powerpc/include/asm/mmu-hash64.h
+index e49744c8a58d,52d8d1e4b772..000000000000
+--- a/arch/powerpc/include/asm/mmu-hash64.h
++++ b/arch/powerpc/include/asm/mmu-hash64.h
+@@@ -138,6 -126,49 +138,49 @@@ extern char initial_stab[]
+  
+  #ifndef __ASSEMBLY__
+  
+++<<<<<<< HEAD:arch/powerpc/include/asm/mmu-hash64.h
+++=======
++ struct mmu_hash_ops {
++ 	void            (*hpte_invalidate)(unsigned long slot,
++ 					   unsigned long vpn,
++ 					   int bpsize, int apsize,
++ 					   int ssize, int local);
++ 	long		(*hpte_updatepp)(unsigned long slot,
++ 					 unsigned long newpp,
++ 					 unsigned long vpn,
++ 					 int bpsize, int apsize,
++ 					 int ssize, unsigned long flags);
++ 	void            (*hpte_updateboltedpp)(unsigned long newpp,
++ 					       unsigned long ea,
++ 					       int psize, int ssize);
++ 	long		(*hpte_insert)(unsigned long hpte_group,
++ 				       unsigned long vpn,
++ 				       unsigned long prpn,
++ 				       unsigned long rflags,
++ 				       unsigned long vflags,
++ 				       int psize, int apsize,
++ 				       int ssize);
++ 	long		(*hpte_remove)(unsigned long hpte_group);
++ 	int             (*hpte_removebolted)(unsigned long ea,
++ 					     int psize, int ssize);
++ 	void		(*flush_hash_range)(unsigned long number, int local);
++ 	void		(*hugepage_invalidate)(unsigned long vsid,
++ 					       unsigned long addr,
++ 					       unsigned char *hpte_slot_array,
++ 					       int psize, int ssize, int local);
++ 	int		(*resize_hpt)(unsigned long shift);
++ 	/*
++ 	 * Special for kexec.
++ 	 * To be called in real mode with interrupts disabled. No locks are
++ 	 * taken as such, concurrent access on pre POWER5 hardware could result
++ 	 * in a deadlock.
++ 	 * The linear mapping is destroyed as well.
++ 	 */
++ 	void		(*hpte_clear_all)(void);
++ };
++ extern struct mmu_hash_ops mmu_hash_ops;
++ 
+++>>>>>>> dbcf929c0062 (powerpc/pseries: Add support for hash table resizing):arch/powerpc/include/asm/book3s/64/mmu-hash.h
+  struct hash_pte {
+  	__be64 v;
+  	__be64 r;
+diff --cc arch/powerpc/mm/hash_utils_64.c
+index e471be023510,a3371d4e35b6..000000000000
+--- a/arch/powerpc/mm/hash_utils_64.c
++++ b/arch/powerpc/mm/hash_utils_64.c
+@@@ -34,7 -34,10 +34,13 @@@
+  #include <linux/signal.h>
+  #include <linux/memblock.h>
+  #include <linux/context_tracking.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/libfdt.h>
++ #include <linux/debugfs.h>
+++>>>>>>> dbcf929c0062 (powerpc/pseries: Add support for hash table resizing)
+  
++ #include <asm/debug.h>
+  #include <asm/processor.h>
+  #include <asm/pgtable.h>
+  #include <asm/mmu.h>
+diff --cc arch/powerpc/platforms/pseries/lpar.c
+index e53d396f4601,c2e13a51f369..000000000000
+--- a/arch/powerpc/platforms/pseries/lpar.c
++++ b/arch/powerpc/platforms/pseries/lpar.c
+@@@ -26,6 -26,9 +26,12 @@@
+  #include <linux/dma-mapping.h>
+  #include <linux/console.h>
+  #include <linux/export.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/jump_label.h>
++ #include <linux/delay.h>
++ #include <linux/stop_machine.h>
+++>>>>>>> dbcf929c0062 (powerpc/pseries: Add support for hash table resizing)
+  #include <asm/processor.h>
+  #include <asm/mmu.h>
+  #include <asm/page.h>
+@@@ -591,17 -611,124 +597,138 @@@ static int __init disable_bulk_remove(c
+  
+  __setup("bulk_remove=", disable_bulk_remove);
+  
+++<<<<<<< HEAD
+ +void __init hpte_init_lpar(void)
+ +{
+ +	ppc_md.hpte_invalidate	= pSeries_lpar_hpte_invalidate;
+ +	ppc_md.hpte_updatepp	= pSeries_lpar_hpte_updatepp;
+ +	ppc_md.hpte_updateboltedpp = pSeries_lpar_hpte_updateboltedpp;
+ +	ppc_md.hpte_insert	= pSeries_lpar_hpte_insert;
+ +	ppc_md.hpte_remove	= pSeries_lpar_hpte_remove;
+ +	ppc_md.hpte_removebolted = pSeries_lpar_hpte_removebolted;
+ +	ppc_md.flush_hash_range	= pSeries_lpar_flush_hash_range;
+ +	ppc_md.hpte_clear_all   = pSeries_lpar_hptab_clear;
+ +	ppc_md.hugepage_invalidate = pSeries_lpar_hugepage_invalidate;
+++=======
++ #define HPT_RESIZE_TIMEOUT	10000 /* ms */
++ 
++ struct hpt_resize_state {
++ 	unsigned long shift;
++ 	int commit_rc;
++ };
++ 
++ static int pseries_lpar_resize_hpt_commit(void *data)
++ {
++ 	struct hpt_resize_state *state = data;
++ 
++ 	state->commit_rc = plpar_resize_hpt_commit(0, state->shift);
++ 	if (state->commit_rc != H_SUCCESS)
++ 		return -EIO;
++ 
++ 	/* Hypervisor has transitioned the HTAB, update our globals */
++ 	ppc64_pft_size = state->shift;
++ 	htab_size_bytes = 1UL << ppc64_pft_size;
++ 	htab_hash_mask = (htab_size_bytes >> 7) - 1;
++ 
++ 	return 0;
++ }
++ 
++ /* Must be called in user context */
++ static int pseries_lpar_resize_hpt(unsigned long shift)
++ {
++ 	struct hpt_resize_state state = {
++ 		.shift = shift,
++ 		.commit_rc = H_FUNCTION,
++ 	};
++ 	unsigned int delay, total_delay = 0;
++ 	int rc;
++ 	ktime_t t0, t1, t2;
++ 
++ 	might_sleep();
++ 
++ 	if (!firmware_has_feature(FW_FEATURE_HPT_RESIZE))
++ 		return -ENODEV;
++ 
++ 	printk(KERN_INFO "lpar: Attempting to resize HPT to shift %lu\n",
++ 	       shift);
++ 
++ 	t0 = ktime_get();
++ 
++ 	rc = plpar_resize_hpt_prepare(0, shift);
++ 	while (H_IS_LONG_BUSY(rc)) {
++ 		delay = get_longbusy_msecs(rc);
++ 		total_delay += delay;
++ 		if (total_delay > HPT_RESIZE_TIMEOUT) {
++ 			/* prepare with shift==0 cancels an in-progress resize */
++ 			rc = plpar_resize_hpt_prepare(0, 0);
++ 			if (rc != H_SUCCESS)
++ 				printk(KERN_WARNING
++ 				       "lpar: Unexpected error %d cancelling timed out HPT resize\n",
++ 				       rc);
++ 			return -ETIMEDOUT;
++ 		}
++ 		msleep(delay);
++ 		rc = plpar_resize_hpt_prepare(0, shift);
++ 	};
++ 
++ 	switch (rc) {
++ 	case H_SUCCESS:
++ 		/* Continue on */
++ 		break;
++ 
++ 	case H_PARAMETER:
++ 		return -EINVAL;
++ 	case H_RESOURCE:
++ 		return -EPERM;
++ 	default:
++ 		printk(KERN_WARNING
++ 		       "lpar: Unexpected error %d from H_RESIZE_HPT_PREPARE\n",
++ 		       rc);
++ 		return -EIO;
++ 	}
++ 
++ 	t1 = ktime_get();
++ 
++ 	rc = stop_machine(pseries_lpar_resize_hpt_commit, &state, NULL);
++ 
++ 	t2 = ktime_get();
++ 
++ 	if (rc != 0) {
++ 		switch (state.commit_rc) {
++ 		case H_PTEG_FULL:
++ 			printk(KERN_WARNING
++ 			       "lpar: Hash collision while resizing HPT\n");
++ 			return -ENOSPC;
++ 
++ 		default:
++ 			printk(KERN_WARNING
++ 			       "lpar: Unexpected error %d from H_RESIZE_HPT_COMMIT\n",
++ 			       state.commit_rc);
++ 			return -EIO;
++ 		};
++ 	}
++ 
++ 	printk(KERN_INFO
++ 	       "lpar: HPT resize to shift %lu complete (%lld ms / %lld ms)\n",
++ 	       shift, (long long) ktime_ms_delta(t1, t0),
++ 	       (long long) ktime_ms_delta(t2, t1));
++ 
++ 	return 0;
++ }
++ 
++ void __init hpte_init_pseries(void)
++ {
++ 	mmu_hash_ops.hpte_invalidate	 = pSeries_lpar_hpte_invalidate;
++ 	mmu_hash_ops.hpte_updatepp	 = pSeries_lpar_hpte_updatepp;
++ 	mmu_hash_ops.hpte_updateboltedpp = pSeries_lpar_hpte_updateboltedpp;
++ 	mmu_hash_ops.hpte_insert	 = pSeries_lpar_hpte_insert;
++ 	mmu_hash_ops.hpte_remove	 = pSeries_lpar_hpte_remove;
++ 	mmu_hash_ops.hpte_removebolted   = pSeries_lpar_hpte_removebolted;
++ 	mmu_hash_ops.flush_hash_range	 = pSeries_lpar_flush_hash_range;
++ 	mmu_hash_ops.hpte_clear_all      = pseries_hpte_clear_all;
++ 	mmu_hash_ops.hugepage_invalidate = pSeries_lpar_hugepage_invalidate;
++ 	mmu_hash_ops.resize_hpt		 = pseries_lpar_resize_hpt;
+++>>>>>>> dbcf929c0062 (powerpc/pseries: Add support for hash table resizing)
+  }
+  
+  #ifdef CONFIG_PPC_SMLPAR
+* Unmerged path arch/powerpc/include/asm/mmu-hash64.h
+* Unmerged path arch/powerpc/mm/hash_utils_64.c
+* Unmerged path arch/powerpc/platforms/pseries/lpar.c
