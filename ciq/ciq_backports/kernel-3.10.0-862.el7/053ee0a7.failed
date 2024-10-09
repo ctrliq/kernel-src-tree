@@ -1,0 +1,133 @@
+net/mlx5e: fix build error without CONFIG_SYSFS
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: fix build error without CONFIG_SYSFS (Don Dutile) [1456694 1499362]
+Rebuild_FUZZ: 95.56%
+commit-author Tobias Regnery <tobias.regnery@gmail.com>
+commit 053ee0a7035781a27eedb2b06cac638c8c65ce83
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/053ee0a7.failed
+
+Commit 9008ae074885 ("net/mlx5e: Minimize mlx5e_{open/close}_locked")
+copied the calls to netif_set_real_num_{tx,rx}_queues from
+mlx5e_open_locked to mlx5e_activate_priv_channels and wraps them in an
+if condition to test for netdev->real_num_{tx,rx}_queues.
+
+But netdev->real_num_rx_queues is conditionally compiled in if CONFIG_SYSFS
+is set. Without CONFIG_SYSFS the build fails:
+
+drivers/net/ethernet/mellanox/mlx5/core/en_main.c: In function 'mlx5e_activate_priv_channels':
+drivers/net/ethernet/mellanox/mlx5/core/en_main.c:2515:12: error: 'struct net_device' has no member named 'real_num_rx_queues'; did you mean 'real_num_tx_queues'?
+
+Fix this by unconditionally call netif_set_real_num{tx,rx}_queues like before
+commit 9008ae074885.
+
+Fixes: 9008ae074885 ("net/mlx5e: Minimize mlx5e_{open/close}_locked")
+	Signed-off-by: Tobias Regnery <tobias.regnery@gmail.com>
+	Acked-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 053ee0a7035781a27eedb2b06cac638c8c65ce83)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index fc92406a15c4,d5248637d44f..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -2195,6 -2485,89 +2195,92 @@@ static void mlx5e_netdev_set_tcs(struc
+  		netdev_set_tc_queue(netdev, tc, nch, 0);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void mlx5e_build_channels_tx_maps(struct mlx5e_priv *priv)
++ {
++ 	struct mlx5e_channel *c;
++ 	struct mlx5e_txqsq *sq;
++ 	int i, tc;
++ 
++ 	for (i = 0; i < priv->channels.num; i++)
++ 		for (tc = 0; tc < priv->profile->max_tc; tc++)
++ 			priv->channel_tc2txq[i][tc] = i + tc * priv->channels.num;
++ 
++ 	for (i = 0; i < priv->channels.num; i++) {
++ 		c = priv->channels.c[i];
++ 		for (tc = 0; tc < c->num_tc; tc++) {
++ 			sq = &c->sq[tc];
++ 			priv->txq2sq[sq->txq_ix] = sq;
++ 		}
++ 	}
++ }
++ 
++ static void mlx5e_activate_priv_channels(struct mlx5e_priv *priv)
++ {
++ 	int num_txqs = priv->channels.num * priv->channels.params.num_tc;
++ 	struct net_device *netdev = priv->netdev;
++ 
++ 	mlx5e_netdev_set_tcs(netdev);
++ 	netif_set_real_num_tx_queues(netdev, num_txqs);
++ 	netif_set_real_num_rx_queues(netdev, priv->channels.num);
++ 
++ 	mlx5e_build_channels_tx_maps(priv);
++ 	mlx5e_activate_channels(&priv->channels);
++ 	netif_tx_start_all_queues(priv->netdev);
++ 
++ 	if (MLX5_CAP_GEN(priv->mdev, vport_group_manager))
++ 		mlx5e_add_sqs_fwd_rules(priv);
++ 
++ 	mlx5e_wait_channels_min_rx_wqes(&priv->channels);
++ 	mlx5e_redirect_rqts_to_channels(priv, &priv->channels);
++ }
++ 
++ static void mlx5e_deactivate_priv_channels(struct mlx5e_priv *priv)
++ {
++ 	mlx5e_redirect_rqts_to_drop(priv);
++ 
++ 	if (MLX5_CAP_GEN(priv->mdev, vport_group_manager))
++ 		mlx5e_remove_sqs_fwd_rules(priv);
++ 
++ 	/* FIXME: This is a W/A only for tx timeout watch dog false alarm when
++ 	 * polling for inactive tx queues.
++ 	 */
++ 	netif_tx_stop_all_queues(priv->netdev);
++ 	netif_tx_disable(priv->netdev);
++ 	mlx5e_deactivate_channels(&priv->channels);
++ }
++ 
++ void mlx5e_switch_priv_channels(struct mlx5e_priv *priv,
++ 				struct mlx5e_channels *new_chs,
++ 				mlx5e_fp_hw_modify hw_modify)
++ {
++ 	struct net_device *netdev = priv->netdev;
++ 	int new_num_txqs;
++ 
++ 	new_num_txqs = new_chs->num * new_chs->params.num_tc;
++ 
++ 	netif_carrier_off(netdev);
++ 
++ 	if (new_num_txqs < netdev->real_num_tx_queues)
++ 		netif_set_real_num_tx_queues(netdev, new_num_txqs);
++ 
++ 	mlx5e_deactivate_priv_channels(priv);
++ 	mlx5e_close_channels(&priv->channels);
++ 
++ 	priv->channels = *new_chs;
++ 
++ 	/* New channels are ready to roll, modify HW settings if needed */
++ 	if (hw_modify)
++ 		hw_modify(priv);
++ 
++ 	mlx5e_refresh_tirs(priv, false);
++ 	mlx5e_activate_priv_channels(priv);
++ 
++ 	mlx5e_update_carrier(priv);
++ }
++ 
+++>>>>>>> 053ee0a70357 (net/mlx5e: fix build error without CONFIG_SYSFS)
+  int mlx5e_open_locked(struct net_device *netdev)
+  {
+  	struct mlx5e_priv *priv = netdev_priv(netdev);
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
