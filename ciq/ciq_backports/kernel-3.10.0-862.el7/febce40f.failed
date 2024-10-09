@@ -1,0 +1,170 @@
+intel_pstate: Avoid extra invocation of intel_pstate_sample()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit febce40febcff3ccdb33f63456ffc4cfc61640c8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/febce40f.failed
+
+The initialization of intel_pstate for a given CPU involves populating
+the fields of its struct cpudata that represent the previous sample,
+but currently that is done in a problematic way.
+
+Namely, intel_pstate_init_cpu() makes an extra call to
+intel_pstate_sample() so it reads the current register values that
+will be used to populate the "previous sample" record during the
+next invocation of intel_pstate_sample().  However, after commit
+a4675fbc4a7a (cpufreq: intel_pstate: Replace timers with utilization
+update callbacks) that doesn't work for last_sample_time, because
+the time value is passed to intel_pstate_sample() as an argument now.
+Passing 0 to it from intel_pstate_init_cpu() is problematic, because
+that causes cpu->last_sample_time == 0 to be visible in
+get_target_pstate_use_performance() (and hence the extra
+cpu->last_sample_time > 0 check in there) and effectively allows
+the first invocation of intel_pstate_sample() from
+intel_pstate_update_util() to happen immediately after the
+initialization which may lead to a significant "turn on"
+effect in the governor algorithm.
+
+To mitigate that issue, rework the initialization to avoid the
+extra intel_pstate_sample() call from intel_pstate_init_cpu().
+Instead, make intel_pstate_sample() return false if it has been
+called with cpu->sample.time equal to zero, which will make
+intel_pstate_update_util() skip the sample in that case, and
+reset cpu->sample.time from intel_pstate_set_update_util_hook()
+to make the algorithm start properly every time the hook is set.
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit febce40febcff3ccdb33f63456ffc4cfc61640c8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/intel_pstate.c
+diff --cc drivers/cpufreq/intel_pstate.c
+index 5e3c944b968b,9ae159631f52..000000000000
+--- a/drivers/cpufreq/intel_pstate.c
++++ b/drivers/cpufreq/intel_pstate.c
+@@@ -899,22 -910,20 +899,33 @@@ static inline void intel_pstate_sample(
+  	cpu->prev_aperf = aperf;
+  	cpu->prev_mperf = mperf;
+  	cpu->prev_tsc = tsc;
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * First time this function is invoked in a given cycle, all of the
++ 	 * previous sample data fields are equal to zero or stale and they must
++ 	 * be populated with meaningful numbers for things to work, so assume
++ 	 * that sample.time will always be reset before setting the utilization
++ 	 * update hook and make the caller skip the sample then.
++ 	 */
++ 	return !!cpu->last_sample_time;
+++>>>>>>> febce40febcf (intel_pstate: Avoid extra invocation of intel_pstate_sample())
+ +}
+ +
+ +static inline void intel_hwp_set_sample_time(struct cpudata *cpu)
+ +{
+ +	int delay;
+ +
+ +	delay = msecs_to_jiffies(50);
+ +	mod_timer_pinned(&cpu->timer, jiffies + delay);
+  }
+  
+ -static inline int32_t get_avg_frequency(struct cpudata *cpu)
+ +static inline void intel_pstate_set_sample_time(struct cpudata *cpu)
+  {
+ -	return div64_u64(cpu->pstate.max_pstate_physical * cpu->sample.aperf *
+ -		cpu->pstate.scaling, cpu->sample.mperf);
+ +	int delay;
+ +
+ +	delay = msecs_to_jiffies(pid_params.sample_rate_ms);
+ +	mod_timer_pinned(&cpu->timer, jiffies + delay);
+  }
+  
+  static inline int32_t get_target_pstate_use_cpu_load(struct cpudata *cpu)
+@@@ -977,18 -985,15 +988,25 @@@ static inline int32_t get_target_pstate
+  	core_busy = mul_fp(core_busy, div_fp(max_pstate, current_pstate));
+  
+  	/*
+ -	 * Since our utilization update callback will not run unless we are
+ -	 * in C0, check if the actual elapsed time is significantly greater (3x)
+ -	 * than our sample interval.  If it is, then we were idle for a long
+ -	 * enough period of time to adjust our busyness.
+ +	 * Since we have a deferred timer, it will not fire unless
+ +	 * we are in C0.  So, determine if the actual elapsed time
+ +	 * is significantly greater (3x) than our sample interval.  If it
+ +	 * is, then we were idle for a long enough period of time
+ +	 * to adjust our busyness.
+  	 */
+++<<<<<<< HEAD
+ +	sample_time = pid_params.sample_rate_ms  * USEC_PER_MSEC;
+ +	duration_us = ktime_us_delta(cpu->sample.time,
+ +				     cpu->last_sample_time);
+ +	if (duration_us > sample_time * 3) {
+ +		sample_ratio = div_fp(int_tofp(sample_time),
+ +				      int_tofp(duration_us));
+++=======
++ 	duration_ns = cpu->sample.time - cpu->last_sample_time;
++ 	if ((s64)duration_ns > pid_params.sample_rate_ns * 3) {
++ 		sample_ratio = div_fp(int_tofp(pid_params.sample_rate_ns),
++ 				      int_tofp(duration_ns));
+++>>>>>>> febce40febcf (intel_pstate: Avoid extra invocation of intel_pstate_sample())
+  		core_busy = mul_fp(core_busy, sample_ratio);
+  	}
+  
+@@@ -1099,21 -1105,11 +1117,24 @@@ static int intel_pstate_init_cpu(unsign
+  
+  	intel_pstate_get_cpu_pstates(cpu);
+  
+ +	init_timer_deferrable(&cpu->timer);
+ +	cpu->timer.data = (unsigned long)cpu;
+ +	cpu->timer.expires = jiffies + HZ/100;
+ +
+ +	if (!hwp_active)
+ +		cpu->timer.function = intel_pstate_timer_func;
+ +	else
+ +		cpu->timer.function = intel_hwp_timer_func;
+ +
+  	intel_pstate_busy_pid_reset(cpu);
+++<<<<<<< HEAD
+ +	intel_pstate_sample(cpu);
+++=======
+++>>>>>>> febce40febcf (intel_pstate: Avoid extra invocation of intel_pstate_sample())
+  
+ -	cpu->update_util.func = intel_pstate_update_util;
+ +	add_timer_on(&cpu->timer, cpunum);
+  
+ -	pr_debug("intel_pstate: controlling: cpu %d\n", cpunum);
+ +	pr_debug("Intel pstate controlling: cpu %d\n", cpunum);
+  
+  	return 0;
+  }
+@@@ -1127,7 -1123,22 +1148,26 @@@ static unsigned int intel_pstate_get(un
+  	if (!cpu)
+  		return 0;
+  	sample = &cpu->sample;
+++<<<<<<< HEAD
+ +	return sample->freq;
+++=======
++ 	return get_avg_frequency(cpu);
++ }
++ 
++ static void intel_pstate_set_update_util_hook(unsigned int cpu_num)
++ {
++ 	struct cpudata *cpu = all_cpu_data[cpu_num];
++ 
++ 	/* Prevent intel_pstate_update_util() from using stale data. */
++ 	cpu->sample.time = 0;
++ 	cpufreq_set_update_util_data(cpu_num, &cpu->update_util);
++ }
++ 
++ static void intel_pstate_clear_update_util_hook(unsigned int cpu)
++ {
++ 	cpufreq_set_update_util_data(cpu, NULL);
++ 	synchronize_sched();
+++>>>>>>> febce40febcf (intel_pstate: Avoid extra invocation of intel_pstate_sample())
+  }
+  
+  static int intel_pstate_set_policy(struct cpufreq_policy *policy)
+* Unmerged path drivers/cpufreq/intel_pstate.c
