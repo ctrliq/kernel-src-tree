@@ -1,0 +1,223 @@
+taint/module: Clean up global and module taint flags handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Petr Mladek <pmladek@suse.com>
+commit 7fd8329ba502ef76dd91db561c7aed696b2c7720
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/7fd8329b.failed
+
+The commit 66cc69e34e86a231 ("Fix: module signature vs tracepoints:
+add new TAINT_UNSIGNED_MODULE") updated module_taint_flags() to
+potentially print one more character. But it did not increase the
+size of the corresponding buffers in m_show() and print_modules().
+
+We have recently done the same mistake when adding a taint flag
+for livepatching, see
+https://lkml.kernel.org/r/cfba2c823bb984690b73572aaae1db596b54a082.1472137475.git.jpoimboe@redhat.com
+
+Also struct module uses an incompatible type for mod-taints flags.
+It survived from the commit 2bc2d61a9638dab670d ("[PATCH] list module
+taint flags in Oops/panic"). There was used "int" for the global taint
+flags at these times. But only the global tain flags was later changed
+to "unsigned long" by the commit 25ddbb18aae33ad2 ("Make the taint
+flags reliable").
+
+This patch defines TAINT_FLAGS_COUNT that can be used to create
+arrays and buffers of the right size. Note that we could not use
+enum because the taint flag indexes are used also in assembly code.
+
+Then it reworks the table that describes the taint flags. The TAINT_*
+numbers can be used as the index. Instead, we add information
+if the taint flag is also shown per-module.
+
+Finally, it uses "unsigned long", bit operations, and the updated
+taint_flags table also for mod->taints.
+
+It is not optimal because only few taint flags can be printed by
+module_taint_flags(). But better be on the safe side. IMHO, it is
+not worth the optimization and this is a good compromise.
+
+	Signed-off-by: Petr Mladek <pmladek@suse.com>
+Link: http://lkml.kernel.org/r/1474458442-21581-1-git-send-email-pmladek@suse.com
+[jeyu@redhat.com: fix broken lkml link in changelog]
+	Signed-off-by: Jessica Yu <jeyu@redhat.com>
+(cherry picked from commit 7fd8329ba502ef76dd91db561c7aed696b2c7720)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/kernel.h
+#	kernel/module.c
+#	kernel/panic.c
+diff --cc include/linux/kernel.h
+index 4ee809347a72,441def77246d..000000000000
+--- a/include/linux/kernel.h
++++ b/include/linux/kernel.h
+@@@ -498,26 -506,15 +498,38 @@@ extern enum system_states 
+  #define TAINT_UNSIGNED_MODULE		13
+  #define TAINT_SOFTLOCKUP		14
+  #define TAINT_LIVEPATCH			15
+++<<<<<<< HEAD
+ +#define TAINT_16			16
+ +#define TAINT_17			17
+ +#define TAINT_18			18
+ +#define TAINT_19			19
+ +#define TAINT_20			20
+ +#define TAINT_21			21
+ +#define TAINT_22			22
+ +#define TAINT_23			23
+ +#define TAINT_24			24
+ +#define TAINT_25			25
+ +#define TAINT_26			26
+ +#define TAINT_27			27
+ +/* Reserving bits for vendor specific uses */
+ +#define TAINT_HARDWARE_UNSUPPORTED	28
+ +#define TAINT_TECH_PREVIEW		29
+ +/* Bits 30 - 31 are reserved for Red Hat use only */
+ +#define TAINT_RESERVED30		30
+ +#define TAINT_RESERVED31		31
+ +
+ +
+++=======
++ #define TAINT_FLAGS_COUNT		16
++ 
++ struct taint_flag {
++ 	char true;	/* character printed when tainted */
++ 	char false;	/* character printed when not tainted */
++ 	bool module;	/* also show as a per-module taint flag */
++ };
++ 
++ extern const struct taint_flag taint_flags[TAINT_FLAGS_COUNT];
+++>>>>>>> 7fd8329ba502 (taint/module: Clean up global and module taint flags handling)
+  
+  extern const char hex_asc[];
+  #define hex_asc_lo(x)	hex_asc[((x) & 0x0f)]
+diff --cc kernel/module.c
+index 82f01d69a669,a4acd8f403ae..000000000000
+--- a/kernel/module.c
++++ b/kernel/module.c
+@@@ -1107,24 -1138,13 +1107,33 @@@ static inline int module_unload_init(st
+  static size_t module_flags_taint(struct module *mod, char *buf)
+  {
+  	size_t l = 0;
++ 	int i;
++ 
++ 	for (i = 0; i < TAINT_FLAGS_COUNT; i++) {
++ 		if (taint_flags[i].module && test_bit(i, &mod->taints))
++ 			buf[l++] = taint_flags[i].true;
++ 	}
+  
+++<<<<<<< HEAD
+ +	if (mod->taints & (1 << TAINT_PROPRIETARY_MODULE))
+ +		buf[l++] = 'P';
+ +	if (mod->taints & (1 << TAINT_OOT_MODULE))
+ +		buf[l++] = 'O';
+ +	if (mod->taints & (1 << TAINT_FORCED_MODULE))
+ +		buf[l++] = 'F';
+ +	if (mod->taints & (1 << TAINT_CRAP))
+ +		buf[l++] = 'C';
+ +	if (mod->taints & (1 << TAINT_UNSIGNED_MODULE))
+ +		buf[l++] = 'E';
+ +	if (mod->taints & (1 << TAINT_TECH_PREVIEW))
+ +		buf[l++] = 'T';
+ +	/*
+ +	 * TAINT_FORCED_RMMOD: could be added.
+ +	 * TAINT_UNSAFE_SMP, TAINT_MACHINE_CHECK, TAINT_BAD_PAGE don't
+ +	 * apply to modules.
+ +	 */
+++=======
+++>>>>>>> 7fd8329ba502 (taint/module: Clean up global and module taint flags handling)
+  	return l;
+  }
+  
+diff --cc kernel/panic.c
+index 3011cd3cc5e3,c51edaa04fce..000000000000
+--- a/kernel/panic.c
++++ b/kernel/panic.c
+@@@ -231,45 -298,27 +231,69 @@@ void panic(const char *fmt, ...
+  
+  EXPORT_SYMBOL(panic);
+  
+++<<<<<<< HEAD
+ +
+ +struct tnt {
+ +	u8	bit;
+ +	char	true;
+ +	char	false;
+ +};
+ +
+ +static const struct tnt tnts[] = {
+ +	{ TAINT_PROPRIETARY_MODULE,	'P', 'G' },
+ +	{ TAINT_FORCED_MODULE,		'F', ' ' },
+ +	{ TAINT_UNSAFE_SMP,		'S', ' ' },
+ +	{ TAINT_FORCED_RMMOD,		'R', ' ' },
+ +	{ TAINT_MACHINE_CHECK,		'M', ' ' },
+ +	{ TAINT_BAD_PAGE,		'B', ' ' },
+ +	{ TAINT_USER,			'U', ' ' },
+ +	{ TAINT_DIE,			'D', ' ' },
+ +	{ TAINT_OVERRIDDEN_ACPI_TABLE,	'A', ' ' },
+ +	{ TAINT_WARN,			'W', ' ' },
+ +	{ TAINT_CRAP,			'C', ' ' },
+ +	{ TAINT_FIRMWARE_WORKAROUND,	'I', ' ' },
+ +	{ TAINT_OOT_MODULE,		'O', ' ' },
+ +	{ TAINT_UNSIGNED_MODULE,	'E', ' ' },
+ +	{ TAINT_SOFTLOCKUP,		'L', ' ' },
+ +	{ TAINT_LIVEPATCH,		'K', ' ' },
+ +	{ TAINT_16,			'?', '-' },
+ +	{ TAINT_17,			'?', '-' },
+ +	{ TAINT_18,			'?', '-' },
+ +	{ TAINT_19,			'?', '-' },
+ +	{ TAINT_20,			'?', '-' },
+ +	{ TAINT_21,			'?', '-' },
+ +	{ TAINT_22,			'?', '-' },
+ +	{ TAINT_23,			'?', '-' },
+ +	{ TAINT_24,			'?', '-' },
+ +	{ TAINT_25,			'?', '-' },
+ +	{ TAINT_26,			'?', '-' },
+ +	{ TAINT_27,			'?', '-' },
+ +	{ TAINT_HARDWARE_UNSUPPORTED,	'H', ' ' },
+ +	{ TAINT_TECH_PREVIEW,		'T', ' ' },
+ +
+++=======
++ /*
++  * TAINT_FORCED_RMMOD could be a per-module flag but the module
++  * is being removed anyway.
++  */
++ const struct taint_flag taint_flags[TAINT_FLAGS_COUNT] = {
++ 	{ 'P', 'G', true },	/* TAINT_PROPRIETARY_MODULE */
++ 	{ 'F', ' ', true },	/* TAINT_FORCED_MODULE */
++ 	{ 'S', ' ', false },	/* TAINT_CPU_OUT_OF_SPEC */
++ 	{ 'R', ' ', false },	/* TAINT_FORCED_RMMOD */
++ 	{ 'M', ' ', false },	/* TAINT_MACHINE_CHECK */
++ 	{ 'B', ' ', false },	/* TAINT_BAD_PAGE */
++ 	{ 'U', ' ', false },	/* TAINT_USER */
++ 	{ 'D', ' ', false },	/* TAINT_DIE */
++ 	{ 'A', ' ', false },	/* TAINT_OVERRIDDEN_ACPI_TABLE */
++ 	{ 'W', ' ', false },	/* TAINT_WARN */
++ 	{ 'C', ' ', true },	/* TAINT_CRAP */
++ 	{ 'I', ' ', false },	/* TAINT_FIRMWARE_WORKAROUND */
++ 	{ 'O', ' ', true },	/* TAINT_OOT_MODULE */
++ 	{ 'E', ' ', true },	/* TAINT_UNSIGNED_MODULE */
++ 	{ 'L', ' ', false },	/* TAINT_SOFTLOCKUP */
++ 	{ 'K', ' ', true },	/* TAINT_LIVEPATCH */
+++>>>>>>> 7fd8329ba502 (taint/module: Clean up global and module taint flags handling)
+  };
+  
+  /**
+* Unmerged path include/linux/kernel.h
+diff --git a/include/linux/module.h b/include/linux/module.h
+index 6df0f35492d1..8196b2f1b4c3 100644
+--- a/include/linux/module.h
++++ b/include/linux/module.h
+@@ -314,7 +314,7 @@ struct module
+ 	/* Arch-specific module values */
+ 	struct mod_arch_specific arch;
+ 
+-	unsigned int taints;	/* same bits as kernel:tainted */
++	unsigned long taints;	/* same bits as kernel:taint_flags */
+ 
+ #ifdef CONFIG_GENERIC_BUG
+ 	/* Support for BUG */
+* Unmerged path kernel/module.c
+* Unmerged path kernel/panic.c
