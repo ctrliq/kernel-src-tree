@@ -1,0 +1,137 @@
+sctp: use new rhlist interface on sctp transport rhashtable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Xin Long <lucien.xin@gmail.com>
+commit 7fda702f9315e6f4a74fee155c540750788a2d66
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/7fda702f.failed
+
+Now sctp transport rhashtable uses hash(lport, dport, daddr) as the key
+to hash a node to one chain. If in one host thousands of assocs connect
+to one server with the same lport and different laddrs (although it's
+not a normal case), all the transports would be hashed into the same
+chain.
+
+It may cause to keep returning -EBUSY when inserting a new node, as the
+chain is too long and sctp inserts a transport node in a loop, which
+could even lead to system hangs there.
+
+The new rhlist interface works for this case that there are many nodes
+with the same key in one chain. It puts them into a list then makes this
+list be as a node of the chain.
+
+This patch is to replace rhashtable_ interface with rhltable_ interface.
+Since a chain would not be too long and it would not return -EBUSY with
+this fix when inserting a node, the reinsert loop is also removed here.
+
+	Signed-off-by: Xin Long <lucien.xin@gmail.com>
+	Acked-by: Neil Horman <nhorman@tuxdriver.com>
+	Acked-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7fda702f9315e6f4a74fee155c540750788a2d66)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sctp/input.c
+#	net/sctp/socket.c
+diff --cc net/sctp/input.c
+index 9cdbec2d525c,458e506ef84b..000000000000
+--- a/net/sctp/input.c
++++ b/net/sctp/input.c
+@@@ -854,12 -839,10 +843,15 @@@ static inline u32 sctp_hash_key(const v
+  {
+  	const struct sctp_hash_cmp_arg *x = data;
+  	const union sctp_addr *paddr = x->paddr;
+++<<<<<<< HEAD
+ +	struct net *net = (struct net *)x->net;
+ +	u16 lport;
+++=======
++ 	const struct net *net = x->net;
++ 	u16 lport = x->lport;
+++>>>>>>> 7fda702f9315 (sctp: use new rhlist interface on sctp transport rhashtable)
+  	u32 addr;
+  
+- 	lport = x->ep ? htons(x->ep->base.bind_addr.port) :
+- 			x->laddr->v4.sin_port;
+  	if (paddr->sa.sa_family == AF_INET6)
+  		addr = jhash(&paddr->v6.sin6_addr, 16, seed);
+  	else
+diff --cc net/sctp/socket.c
+index cc2832024ec4,d5f4b4a8369b..000000000000
+--- a/net/sctp/socket.c
++++ b/net/sctp/socket.c
+@@@ -4295,9 -4392,7 +4295,13 @@@ int sctp_transport_walk_start(struct rh
+  {
+  	int err;
+  
+++<<<<<<< HEAD
+ +	err = rhashtable_walk_init(&sctp_transport_hashtable, iter);
+ +	if (err)
+ +		return err;
+++=======
++ 	rhltable_walk_enter(&sctp_transport_hashtable, iter);
+++>>>>>>> 7fda702f9315 (sctp: use new rhlist interface on sctp transport rhashtable)
+  
+  	err = rhashtable_walk_start(iter);
+  	if (err && err != -EAGAIN) {
+diff --git a/include/net/sctp/sctp.h b/include/net/sctp/sctp.h
+index 5e1b0dc26470..df401a1d18d9 100644
+--- a/include/net/sctp/sctp.h
++++ b/include/net/sctp/sctp.h
+@@ -170,7 +170,7 @@ void sctp_backlog_migrate(struct sctp_association *assoc,
+ 			  struct sock *oldsk, struct sock *newsk);
+ int sctp_transport_hashtable_init(void);
+ void sctp_transport_hashtable_destroy(void);
+-void sctp_hash_transport(struct sctp_transport *t);
++int sctp_hash_transport(struct sctp_transport *t);
+ void sctp_unhash_transport(struct sctp_transport *t);
+ struct sctp_transport *sctp_addrs_lookup_transport(
+ 				struct net *net,
+diff --git a/include/net/sctp/structs.h b/include/net/sctp/structs.h
+index 4f9d7015fcef..016832a8237a 100644
+--- a/include/net/sctp/structs.h
++++ b/include/net/sctp/structs.h
+@@ -131,7 +131,7 @@ extern struct sctp_globals {
+ 	/* This is the sctp port control hash.	*/
+ 	struct sctp_bind_hashbucket *port_hashtable;
+ 	/* This is the hash of all transports. */
+-	struct rhashtable transport_hashtable;
++	struct rhltable transport_hashtable;
+ 
+ 	/* Sizes of above hashtables. */
+ 	int ep_hashsize;
+@@ -774,7 +774,7 @@ static inline int sctp_packet_empty(struct sctp_packet *packet)
+ struct sctp_transport {
+ 	/* A list of transports. */
+ 	struct list_head transports;
+-	struct rhash_head node;
++	struct rhlist_head node;
+ 
+ 	/* Reference counting. */
+ 	atomic_t refcnt;
+diff --git a/net/sctp/associola.c b/net/sctp/associola.c
+index 593b869fa747..7d12b1ab735d 100644
+--- a/net/sctp/associola.c
++++ b/net/sctp/associola.c
+@@ -709,11 +709,15 @@ struct sctp_transport *sctp_assoc_add_peer(struct sctp_association *asoc,
+ 	/* Set the peer's active state. */
+ 	peer->state = peer_state;
+ 
++	/* Add this peer into the transport hashtable */
++	if (sctp_hash_transport(peer)) {
++		sctp_transport_free(peer);
++		return NULL;
++	}
++
+ 	/* Attach the remote transport to our asoc.  */
+ 	list_add_tail_rcu(&peer->transports, &asoc->peer.transport_addr_list);
+ 	asoc->peer.transport_count++;
+-	/* Add this peer into the transport hashtable */
+-	sctp_hash_transport(peer);
+ 
+ 	/* If we do not yet have a primary path, set one.  */
+ 	if (!asoc->peer.primary_path) {
+* Unmerged path net/sctp/input.c
+* Unmerged path net/sctp/socket.c
