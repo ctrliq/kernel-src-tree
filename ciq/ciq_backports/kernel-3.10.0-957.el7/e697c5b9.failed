@@ -1,0 +1,142 @@
+memremap: merge find_dev_pagemap into get_dev_pagemap
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit e697c5b90e97792187e45f8d78fb2bfa62eb0496
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/e697c5b9.failed
+
+There is only one caller of the trivial function find_dev_pagemap left,
+so just merge it into the caller.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit e697c5b90e97792187e45f8d78fb2bfa62eb0496)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/memremap.c
+diff --cc kernel/memremap.c
+index eca98ec515d8,ada31b0d76d4..000000000000
+--- a/kernel/memremap.c
++++ b/kernel/memremap.c
+@@@ -325,25 -296,16 +325,28 @@@ static void devm_memremap_pages_release
+  	align_size = ALIGN(resource_size(res), SECTION_SIZE);
+  
+  	mem_hotplug_begin();
+ -	arch_remove_memory(align_start, align_size, pgmap->altmap_valid ?
+ -			&pgmap->altmap : NULL);
+ -	mem_hotplug_done();
+ -
+ +	arch_remove_memory(align_start, align_size);
+  	untrack_pfn(NULL, PHYS_PFN(align_start), align_size);
+ +	mem_hotplug_done();
+  	pgmap_radix_release(res);
+ -	dev_WARN_ONCE(dev, pgmap->altmap.alloc,
+ -		      "%s: failed to free all reserved pages\n", __func__);
+ +	dev_WARN_ONCE(dev, pgmap->altmap && pgmap->altmap->alloc,
+ +			"%s: failed to free all reserved pages\n", __func__);
+  }
+  
+++<<<<<<< HEAD
+ +/* assumes rcu_read_lock() held at entry */
+ +struct dev_pagemap *find_dev_pagemap(resource_size_t phys)
+ +{
+ +	struct page_map *page_map;
+ +
+ +	WARN_ON_ONCE(!rcu_read_lock_held());
+ +
+ +	page_map = radix_tree_lookup(&pgmap_radix, PHYS_PFN(phys));
+ +	return page_map ? &page_map->pgmap : NULL;
+ +}
+ +
+++=======
+++>>>>>>> e697c5b90e97 (memremap: merge find_dev_pagemap into get_dev_pagemap)
+  /**
+   * devm_memremap_pages - remap and provide memmap backing for the given resource
+   * @dev: hosting device for @res
+@@@ -479,31 -434,59 +482,37 @@@ void vmem_altmap_free(struct vmem_altma
+  	altmap->alloc -= nr_pfns;
+  }
+  
+ -/**
+ - * get_dev_pagemap() - take a new live reference on the dev_pagemap for @pfn
+ - * @pfn: page frame number to lookup page_map
+ - * @pgmap: optional known pgmap that already has a reference
+ - *
+ - * If @pgmap is non-NULL and covers @pfn it will be returned as-is.  If @pgmap
+ - * is non-NULL but does not cover @pfn the reference to it will be released.
+ - */
+ -struct dev_pagemap *get_dev_pagemap(unsigned long pfn,
+ -		struct dev_pagemap *pgmap)
+ +#ifdef CONFIG_SPARSEMEM_VMEMMAP
+ +struct vmem_altmap *to_vmem_altmap(unsigned long memmap_start)
+  {
+ -	resource_size_t phys = PFN_PHYS(pfn);
+ -
+  	/*
+ -	 * In the cached case we're already holding a live reference.
+ +	 * 'memmap_start' is the virtual address for the first "struct
+ +	 * page" in this range of the vmemmap array.  In the case of
+ +	 * CONFIG_SPARSE_VMEMMAP a page_to_pfn conversion is simple
+ +	 * pointer arithmetic, so we can perform this to_vmem_altmap()
+ +	 * conversion without concern for the initialization state of
+ +	 * the struct page fields.
+  	 */
+ -	if (pgmap) {
+ -		if (phys >= pgmap->res.start && phys <= pgmap->res.end)
+ -			return pgmap;
+ -		put_dev_pagemap(pgmap);
+ -	}
+ +	struct page *page = (struct page *) memmap_start;
+ +	struct dev_pagemap *pgmap;
+  
+ -	/* fall back to slow path lookup */
+ +	/*
+ +	 * Uncoditionally retrieve a dev_pagemap associated with the
+ +	 * given physical address, this is only for use in the
+ +	 * arch_{add|remove}_memory() for setting up and tearing down
+ +	 * the memmap.
+ +	 */
+  	rcu_read_lock();
+++<<<<<<< HEAD
+ +	pgmap = find_dev_pagemap(__pfn_to_phys(page_to_pfn(page)));
+++=======
++ 	pgmap = radix_tree_lookup(&pgmap_radix, PHYS_PFN(phys));
++ 	if (pgmap && !percpu_ref_tryget_live(pgmap->ref))
++ 		pgmap = NULL;
+++>>>>>>> e697c5b90e97 (memremap: merge find_dev_pagemap into get_dev_pagemap)
+  	rcu_read_unlock();
+  
+ -	return pgmap;
+ +	return pgmap ? pgmap->altmap : NULL;
+  }
+ +#endif /* CONFIG_SPARSEMEM_VMEMMAP */
+  #endif /* CONFIG_ZONE_DEVICE */
+ -
+ -#if IS_ENABLED(CONFIG_DEVICE_PRIVATE) ||  IS_ENABLED(CONFIG_DEVICE_PUBLIC)
+ -void put_zone_device_private_or_public_page(struct page *page)
+ -{
+ -	int count = page_ref_dec_return(page);
+ -
+ -	/*
+ -	 * If refcount is 1 then page is freed and refcount is stable as nobody
+ -	 * holds a reference on the page.
+ -	 */
+ -	if (count == 1) {
+ -		/* Clear Active bit in case of parallel mark_page_accessed */
+ -		__ClearPageActive(page);
+ -		__ClearPageWaiters(page);
+ -
+ -		page->mapping = NULL;
+ -		mem_cgroup_uncharge(page);
+ -
+ -		page->pgmap->page_free(page, page->pgmap->data);
+ -	} else if (!count)
+ -		__put_page(page);
+ -}
+ -EXPORT_SYMBOL(put_zone_device_private_or_public_page);
+ -#endif /* CONFIG_DEVICE_PRIVATE || CONFIG_DEVICE_PUBLIC */
+* Unmerged path kernel/memremap.c
