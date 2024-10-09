@@ -456,6 +456,7 @@ static void sctp_diag_dump(struct sk_buff *skb, struct netlink_callback *cb,
 		.cb = cb,
 		.r = r,
 	};
+	int pos = cb->args[2];
 
 	/* eps hashtable dumps
 	 * args:
@@ -486,7 +487,8 @@ skip:
 		goto done;
 
 	sctp_for_each_transport(sctp_sock_filter, sctp_sock_dump,
-				net, (int *)&cb->args[2], &commp);
+				net, &pos, &commp);
+	cb->args[2] = pos;
 
 done:
 	cb->args[1] = cb->args[4];
