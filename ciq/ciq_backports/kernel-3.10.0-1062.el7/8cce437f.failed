@@ -1,0 +1,294 @@
+s390/kdump: Fix elfcorehdr size calculation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [s390] kdump: Fix elfcorehdr size calculation (Hendrik Brueckner) [1656017]
+Rebuild_FUZZ: 93.83%
+commit-author Philipp Rudo <prudo@linux.ibm.com>
+commit 8cce437fbb5c1f2af2f63834fa05082596beca5d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/8cce437f.failed
+
+Before the memory for the elfcorehdr is allocated the required size is
+estimated with
+
+       alloc_size = 0x1000 + get_cpu_cnt() * 0x4a0 +
+               mem_chunk_cnt * sizeof(Elf64_Phdr);
+
+Where 0x4a0 is used as size for the ELF notes to store the register
+contend. This size is 8 bytes too small. Usually this does not immediately
+cause a problem because the page reserved for overhead (Elf_Ehdr,
+vmcoreinfo, etc.) is pretty generous. So usually there is enough spare
+memory to counter the mis-calculated per cpu size. However, with growing
+overhead and/or a huge cpu count the allocated size gets too small for the
+elfcorehdr. Ultimately a BUG_ON is triggered causing the crash kernel to
+panic.
+
+Fix this by properly calculating the required size instead of relying on
+magic numbers.
+
+Fixes: a62bc07392539 ("s390/kdump: add support for vector extension")
+	Signed-off-by: Philipp Rudo <prudo@linux.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 8cce437fbb5c1f2af2f63834fa05082596beca5d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kernel/crash_dump.c
+diff --cc arch/s390/kernel/crash_dump.c
+index 04e93148c09a,c3620bafc374..000000000000
+--- a/arch/s390/kernel/crash_dump.c
++++ b/arch/s390/kernel/crash_dump.c
+@@@ -266,19 -306,15 +266,28 @@@ static void *kzalloc_panic(int len
+  	return rc;
+  }
+  
++ static const char *nt_name(Elf64_Word type)
++ {
++ 	const char *name = "LINUX";
++ 
++ 	if (type == NT_PRPSINFO || type == NT_PRSTATUS || type == NT_PRFPREG)
++ 		name = KEXEC_CORE_NOTE_NAME;
++ 	return name;
++ }
++ 
+ +/*
+ + * Get memory layout and create hole for oldmem
+ + */
+ +static struct mem_chunk *get_memory_layout(void)
+ +{
+ +	struct mem_chunk *chunk_array;
+ +
+ +	chunk_array = kzalloc_panic(MEMORY_CHUNKS * sizeof(struct mem_chunk));
+ +	detect_memory_layout(chunk_array, 0);
+ +	create_mem_hole(chunk_array, OLDMEM_BASE, OLDMEM_SIZE);
+ +	return chunk_array;
+ +}
+ +
+  /*
+   * Initialize ELF note
+   */
+@@@ -303,119 -339,28 +312,142 @@@ static void *nt_init(void *buf, Elf64_W
+  	return PTR_ADD(buf, len);
+  }
+  
+ -static inline void *nt_init(void *buf, Elf64_Word type, void *desc, int d_len)
+ +/*
+ + * Initialize prstatus note
+ + */
+ +static void *nt_prstatus(void *ptr, struct save_area *sa)
+  {
+++<<<<<<< HEAD
+ +	struct elf_prstatus nt_prstatus;
+ +	static int cpu_nr = 1;
+ +
+ +	memset(&nt_prstatus, 0, sizeof(nt_prstatus));
+ +	memcpy(&nt_prstatus.pr_reg.gprs, sa->gp_regs, sizeof(sa->gp_regs));
+ +	memcpy(&nt_prstatus.pr_reg.psw, sa->psw, sizeof(sa->psw));
+ +	memcpy(&nt_prstatus.pr_reg.acrs, sa->acc_regs, sizeof(sa->acc_regs));
+ +	nt_prstatus.pr_pid = cpu_nr;
+ +	cpu_nr++;
+ +
+ +	return nt_init(ptr, NT_PRSTATUS, &nt_prstatus, sizeof(nt_prstatus),
+ +			 "CORE");
+ +}
+ +
+ +/*
+ + * Initialize fpregset (floating point) note
+ + */
+ +static void *nt_fpregset(void *ptr, struct save_area *sa)
+ +{
+ +	elf_fpregset_t nt_fpregset;
+ +
+ +	memset(&nt_fpregset, 0, sizeof(nt_fpregset));
+ +	memcpy(&nt_fpregset.fpc, &sa->fp_ctrl_reg, sizeof(sa->fp_ctrl_reg));
+ +	memcpy(&nt_fpregset.fprs, &sa->fp_regs, sizeof(sa->fp_regs));
+ +
+ +	return nt_init(ptr, NT_PRFPREG, &nt_fpregset, sizeof(nt_fpregset),
+ +		       "CORE");
+ +}
+ +
+ +/*
+ + * Initialize timer note
+ + */
+ +static void *nt_s390_timer(void *ptr, struct save_area *sa)
+ +{
+ +	return nt_init(ptr, NT_S390_TIMER, &sa->timer, sizeof(sa->timer),
+ +			 KEXEC_CORE_NOTE_NAME);
+ +}
+ +
+ +/*
+ + * Initialize TOD clock comparator note
+ + */
+ +static void *nt_s390_tod_cmp(void *ptr, struct save_area *sa)
+ +{
+ +	return nt_init(ptr, NT_S390_TODCMP, &sa->clk_cmp,
+ +		       sizeof(sa->clk_cmp), KEXEC_CORE_NOTE_NAME);
+ +}
+ +
+ +/*
+ + * Initialize TOD programmable register note
+ + */
+ +static void *nt_s390_tod_preg(void *ptr, struct save_area *sa)
+ +{
+ +	return nt_init(ptr, NT_S390_TODPREG, &sa->tod_reg,
+ +		       sizeof(sa->tod_reg), KEXEC_CORE_NOTE_NAME);
+ +}
+ +
+ +/*
+ + * Initialize control register note
+ + */
+ +static void *nt_s390_ctrs(void *ptr, struct save_area *sa)
+ +{
+ +	return nt_init(ptr, NT_S390_CTRS, &sa->ctrl_regs,
+ +		       sizeof(sa->ctrl_regs), KEXEC_CORE_NOTE_NAME);
+ +}
+ +
+ +/*
+ + * Initialize prefix register note
+ + */
+ +static void *nt_s390_prefix(void *ptr, struct save_area *sa)
+ +{
+ +	return nt_init(ptr, NT_S390_PREFIX, &sa->pref_reg,
+ +			 sizeof(sa->pref_reg), KEXEC_CORE_NOTE_NAME);
+ +}
+ +
+ +/*
+ + * Initialize vxrs high note (full 128 bit VX registers 16-31)
+ + */
+ +static void *nt_s390_vx_high(void *ptr, __vector128 *vx_regs)
+ +{
+ +	return nt_init(ptr, NT_S390_VXRS_HIGH, &vx_regs[16],
+ +		       16 * sizeof(__vector128), KEXEC_CORE_NOTE_NAME);
+ +}
+ +
+ +/*
+ + * Initialize vxrs low note (lower halves of VX registers 0-15)
+ + */
+ +static void *nt_s390_vx_low(void *ptr, __vector128 *vx_regs)
+ +{
+ +	Elf64_Nhdr *note;
+ +	u64 len;
+ +	int i;
+ +
+ +	note = (Elf64_Nhdr *)ptr;
+ +	note->n_namesz = strlen(KEXEC_CORE_NOTE_NAME) + 1;
+ +	note->n_descsz = 16 * 8;
+ +	note->n_type = NT_S390_VXRS_LOW;
+ +	len = sizeof(Elf64_Nhdr);
+ +
+ +	memcpy(ptr + len, KEXEC_CORE_NOTE_NAME, note->n_namesz);
+ +	len = roundup(len + note->n_namesz, 4);
+ +
+ +	ptr += len;
+ +	/* Copy lower halves of SIMD registers 0-15 */
+ +	for (i = 0; i < 16; i++) {
+ +		memcpy(ptr, &vx_regs[i].u[2], 8);
+ +		ptr += 8;
+ +	}
+ +	return ptr;
+++=======
++ 	return nt_init_name(buf, type, desc, d_len, nt_name(type));
++ }
++ 
++ /*
++  * Calculate the size of ELF note
++  */
++ static size_t nt_size_name(int d_len, const char *name)
++ {
++ 	size_t size;
++ 
++ 	size = sizeof(Elf64_Nhdr);
++ 	size += roundup(strlen(name) + 1, 4);
++ 	size += roundup(d_len, 4);
++ 
++ 	return size;
++ }
++ 
++ static inline size_t nt_size(Elf64_Word type, int d_len)
++ {
++ 	return nt_size_name(d_len, nt_name(type));
+++>>>>>>> 8cce437fbb5c (s390/kdump: Fix elfcorehdr size calculation)
+  }
+  
+  /*
+@@@ -489,7 -473,45 +544,49 @@@ static void *nt_vmcoreinfo(void *ptr
+  		vmcoreinfo = get_vmcoreinfo_old(&size);
+  	if (!vmcoreinfo)
+  		return ptr;
+++<<<<<<< HEAD
+ +	return nt_init(ptr, 0, vmcoreinfo, size, "VMCOREINFO");
+++=======
++ 	return nt_init_name(ptr, 0, vmcoreinfo, size, "VMCOREINFO");
++ }
++ 
++ static size_t nt_vmcoreinfo_size(void)
++ {
++ 	const char *name = "VMCOREINFO";
++ 	char nt_name[11];
++ 	Elf64_Nhdr note;
++ 	void *addr;
++ 
++ 	if (copy_oldmem_kernel(&addr, &S390_lowcore.vmcore_info, sizeof(addr)))
++ 		return 0;
++ 
++ 	if (copy_oldmem_kernel(&note, addr, sizeof(note)))
++ 		return 0;
++ 
++ 	memset(nt_name, 0, sizeof(nt_name));
++ 	if (copy_oldmem_kernel(nt_name, addr + sizeof(note),
++ 			       sizeof(nt_name) - 1))
++ 		return 0;
++ 
++ 	if (strcmp(nt_name, name) != 0)
++ 		return 0;
++ 
++ 	return nt_size_name(note.n_descsz, name);
++ }
++ 
++ /*
++  * Initialize final note (needed for /proc/vmcore code)
++  */
++ static void *nt_final(void *ptr)
++ {
++ 	Elf64_Nhdr *note;
++ 
++ 	note = (Elf64_Nhdr *) ptr;
++ 	note->n_namesz = 0;
++ 	note->n_descsz = 0;
++ 	note->n_type = 0;
++ 	return PTR_ADD(ptr, sizeof(Elf64_Nhdr));
+++>>>>>>> 8cce437fbb5c (s390/kdump: Fix elfcorehdr size calculation)
+  }
+  
+  /*
+@@@ -621,16 -645,21 +739,16 @@@ int elfcorehdr_alloc(unsigned long lon
+  	/* If we are not in kdump or zfcpdump mode return */
+  	if (!OLDMEM_BASE && ipl_info.type != IPL_TYPE_FCP_DUMP)
+  		return 0;
+ +	/* If elfcorehdr= has been passed via cmdline, we use that one */
+ +	if (elfcorehdr_addr != ELFCORE_ADDR_MAX)
+ +		return 0;
+  	/* If we cannot get HSA size for zfcpdump return error */
+ -	if (ipl_info.type == IPL_TYPE_FCP_DUMP && !sclp.hsa_size)
+ +	if (ipl_info.type == IPL_TYPE_FCP_DUMP && !sclp_get_hsa_size())
+  		return -ENODEV;
+ -
+ -	/* For kdump, exclude previous crashkernel memory */
+ -	if (OLDMEM_BASE) {
+ -		oldmem_region.base = OLDMEM_BASE;
+ -		oldmem_region.size = OLDMEM_SIZE;
+ -		oldmem_type.total_size = OLDMEM_SIZE;
+ -	}
+ -
+  	mem_chunk_cnt = get_mem_chunk_cnt();
+  
+- 	alloc_size = 0x1000 + get_cpu_cnt() * 0x4a0 +
+- 		mem_chunk_cnt * sizeof(Elf64_Phdr);
++ 	alloc_size = get_elfcorehdr_size(mem_chunk_cnt);
++ 
+  	hdr = kzalloc_panic(alloc_size);
+  	/* Init elf header */
+  	ptr = ehdr_init(hdr, mem_chunk_cnt);
+* Unmerged path arch/s390/kernel/crash_dump.c
