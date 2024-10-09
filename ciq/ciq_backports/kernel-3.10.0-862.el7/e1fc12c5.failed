@@ -1,0 +1,135 @@
+drm/ttm: Always and only destroy bo->ttm_resv in ttm_bo_release_list
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Michel Dänzer <michel.daenzer@amd.com>
+commit e1fc12c5d9ad06a2a74e97a91f1b0c5f4c723b50
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/e1fc12c5.failed
+
+Fixes a use-after-free due to a race condition in
+ttm_bo_cleanup_refs_and_unlock, which allows one task to reserve a BO
+and destroy its ttm_resv while another task is waiting for it to signal
+in reservation_object_wait_timeout_rcu.
+
+v2:
+* Always initialize bo->ttm_resv in ttm_bo_init_reserved
+ (Christian König)
+
+Fixes: 0d2bd2ae045d "drm/ttm: fix memory leak while individualizing BOs"
+	Reviewed-by: Chunming Zhou <david1.zhou@amd.com> # v1
+	Reviewed-by: Christian König <christian.koenig@amd.com>
+	Signed-off-by: Michel Dänzer <michel.daenzer@amd.com>
+	Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+(cherry picked from commit e1fc12c5d9ad06a2a74e97a91f1b0c5f4c723b50)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/ttm/ttm_bo.c
+diff --cc drivers/gpu/drm/ttm/ttm_bo.c
+index 86e3b233b722,c088703777e2..000000000000
+--- a/drivers/gpu/drm/ttm/ttm_bo.c
++++ b/drivers/gpu/drm/ttm/ttm_bo.c
+@@@ -423,6 -394,22 +422,25 @@@ static void ttm_bo_cleanup_memtype_use(
+  	ww_mutex_unlock (&bo->resv->lock);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int ttm_bo_individualize_resv(struct ttm_buffer_object *bo)
++ {
++ 	int r;
++ 
++ 	if (bo->resv == &bo->ttm_resv)
++ 		return 0;
++ 
++ 	BUG_ON(!reservation_object_trylock(&bo->ttm_resv));
++ 
++ 	r = reservation_object_copy_fences(&bo->ttm_resv, bo->resv);
++ 	if (r)
++ 		reservation_object_unlock(&bo->ttm_resv);
++ 
++ 	return r;
++ }
++ 
+++>>>>>>> e1fc12c5d9ad (drm/ttm: Always and only destroy bo->ttm_resv in ttm_bo_release_list)
+  static void ttm_bo_flush_all_fences(struct ttm_buffer_object *bo)
+  {
+  	struct reservation_object_list *fobj;
+@@@ -447,24 -434,33 +465,30 @@@ static void ttm_bo_cleanup_refs_or_queu
+  {
+  	struct ttm_bo_device *bdev = bo->bdev;
+  	struct ttm_bo_global *glob = bo->glob;
+ +	int put_count;
+  	int ret;
+  
+ -	ret = ttm_bo_individualize_resv(bo);
+ -	if (ret) {
+ -		/* Last resort, if we fail to allocate memory for the
+ -		 * fences block for the BO to become idle
+ -		 */
+ -		reservation_object_wait_timeout_rcu(bo->resv, true, false,
+ -						    30 * HZ);
+ -		spin_lock(&glob->lru_lock);
+ -		goto error;
+ -	}
+ -
+  	spin_lock(&glob->lru_lock);
+  	ret = __ttm_bo_reserve(bo, false, true, NULL);
+ +
+  	if (!ret) {
+ -		if (reservation_object_test_signaled_rcu(&bo->ttm_resv, true)) {
+ -			ttm_bo_del_from_lru(bo);
+ +		if (!ttm_bo_wait(bo, false, true)) {
+ +			put_count = ttm_bo_del_from_lru(bo);
+ +
+  			spin_unlock(&glob->lru_lock);
+++<<<<<<< HEAD
+++=======
++ 			if (bo->resv != &bo->ttm_resv)
++ 				reservation_object_unlock(&bo->ttm_resv);
++ 
+++>>>>>>> e1fc12c5d9ad (drm/ttm: Always and only destroy bo->ttm_resv in ttm_bo_release_list)
+  			ttm_bo_cleanup_memtype_use(bo);
+ -			return;
+ -		}
+  
+ -		ttm_bo_flush_all_fences(bo);
+ +			ttm_bo_list_ref_sub(bo, put_count, true);
+ +
+ +			return;
+ +		} else
+ +			ttm_bo_flush_all_fences(bo);
+  
+  		/*
+  		 * Make NO_EVICT bos immediately available to
+@@@ -554,9 -553,9 +578,13 @@@ static int ttm_bo_cleanup_refs_and_unlo
+  		return ret;
+  	}
+  
+++<<<<<<< HEAD
+ +	put_count = ttm_bo_del_from_lru(bo);
+++=======
++ 	ttm_bo_del_from_lru(bo);
+++>>>>>>> e1fc12c5d9ad (drm/ttm: Always and only destroy bo->ttm_resv in ttm_bo_release_list)
+  	list_del_init(&bo->ddestroy);
+ -	kref_put(&bo->list_kref, ttm_bo_ref_bug);
+ +	++put_count;
+  
+  	spin_unlock(&glob->lru_lock);
+  	ttm_bo_cleanup_memtype_use(bo);
+@@@ -1193,10 -1202,11 +1221,10 @@@ int ttm_bo_init(struct ttm_bo_device *b
+  		lockdep_assert_held(&bo->resv->lock.base);
+  	} else {
+  		bo->resv = &bo->ttm_resv;
+- 		reservation_object_init(&bo->ttm_resv);
+  	}
++ 	reservation_object_init(&bo->ttm_resv);
+  	atomic_inc(&bo->glob->bo_count);
+  	drm_vma_node_reset(&bo->vma_node);
+ -	bo->priority = 0;
+  
+  	/*
+  	 * For ttm_bo_type_device buffers, allocate
+* Unmerged path drivers/gpu/drm/ttm/ttm_bo.c
