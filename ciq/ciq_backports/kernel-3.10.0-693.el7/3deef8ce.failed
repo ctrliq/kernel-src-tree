@@ -1,0 +1,247 @@
+net/mlx5e: Un-register uplink representor on nic_disable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Un-register uplink representor on nic_disable (Don Dutile) [1385330 1417286]
+Rebuild_FUZZ: 96.30%
+commit-author Saeed Mahameed <saeedm@mellanox.com>
+commit 3deef8cea3efcaeeae240bb00541de66abb9bfa0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/3deef8ce.failed
+
+The code before this patch registered uplink e-Switch representor
+on nic_enable and unregistered on nic_cleanup, the right place
+for this unregister is in nic_disable.
+
+Fixes: 127ea380acc9 ("net/mlx5: Add Representors registration API")
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Reviewed-by: Mohamad Haj Yahia <mohamad@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3deef8cea3efcaeeae240bb00541de66abb9bfa0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 2aca61ab5499,2b7dd315020c..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -2968,53 -3661,180 +2968,171 @@@ static void mlx5e_destroy_q_counter(str
+  	mlx5_core_dealloc_q_counter(priv->mdev, priv->q_counter);
+  }
+  
+++<<<<<<< HEAD
+ +static int mlx5e_create_umr_mkey(struct mlx5e_priv *priv)
+++=======
++ static void mlx5e_nic_init(struct mlx5_core_dev *mdev,
++ 			   struct net_device *netdev,
++ 			   const struct mlx5e_profile *profile,
++ 			   void *ppriv)
++ {
++ 	struct mlx5e_priv *priv = netdev_priv(netdev);
++ 
++ 	mlx5e_build_nic_netdev_priv(mdev, netdev, profile, ppriv);
++ 	mlx5e_build_nic_netdev(netdev);
++ 	mlx5e_vxlan_init(priv);
++ }
++ 
++ static void mlx5e_nic_cleanup(struct mlx5e_priv *priv)
++ {
++ 	mlx5e_vxlan_cleanup(priv);
++ 
++ 	if (priv->xdp_prog)
++ 		bpf_prog_put(priv->xdp_prog);
++ }
++ 
++ static int mlx5e_init_nic_rx(struct mlx5e_priv *priv)
+++>>>>>>> 3deef8cea3ef (net/mlx5e: Un-register uplink representor on nic_disable)
+  {
+  	struct mlx5_core_dev *mdev = priv->mdev;
+ +	struct mlx5_create_mkey_mbox_in *in;
+ +	struct mlx5_mkey_seg *mkc;
+ +	int inlen = sizeof(*in);
+ +	u64 npages =
+ +		mlx5e_get_max_num_channels(mdev) * MLX5_CHANNEL_MAX_NUM_MTTS;
+  	int err;
+ -	int i;
+  
+ -	err = mlx5e_create_indirect_rqts(priv);
+ -	if (err) {
+ -		mlx5_core_warn(mdev, "create indirect rqts failed, %d\n", err);
+ -		return err;
+ -	}
+ +	in = mlx5_vzalloc(inlen);
+ +	if (!in)
+ +		return -ENOMEM;
+  
+ -	err = mlx5e_create_direct_rqts(priv);
+ -	if (err) {
+ -		mlx5_core_warn(mdev, "create direct rqts failed, %d\n", err);
+ -		goto err_destroy_indirect_rqts;
+ -	}
+ +	mkc = &in->seg;
+ +	mkc->status = MLX5_MKEY_STATUS_FREE;
+ +	mkc->flags = MLX5_PERM_UMR_EN |
+ +		     MLX5_PERM_LOCAL_READ |
+ +		     MLX5_PERM_LOCAL_WRITE |
+ +		     MLX5_ACCESS_MODE_MTT;
+  
+ -	err = mlx5e_create_indirect_tirs(priv);
+ -	if (err) {
+ -		mlx5_core_warn(mdev, "create indirect tirs failed, %d\n", err);
+ -		goto err_destroy_direct_rqts;
+ -	}
+ +	mkc->qpn_mkey7_0 = cpu_to_be32(0xffffff << 8);
+ +	mkc->flags_pd = cpu_to_be32(priv->pdn);
+ +	mkc->len = cpu_to_be64(npages << PAGE_SHIFT);
+ +	mkc->xlt_oct_size = cpu_to_be32(mlx5e_get_mtt_octw(npages));
+ +	mkc->log2_page_size = PAGE_SHIFT;
+  
+ -	err = mlx5e_create_direct_tirs(priv);
+ -	if (err) {
+ -		mlx5_core_warn(mdev, "create direct tirs failed, %d\n", err);
+ -		goto err_destroy_indirect_tirs;
+ -	}
+ +	err = mlx5_core_create_mkey(mdev, &priv->umr_mkey, in, inlen, NULL,
+ +				    NULL, NULL);
+  
+ -	err = mlx5e_create_flow_steering(priv);
+ -	if (err) {
+ -		mlx5_core_warn(mdev, "create flow steering failed, %d\n", err);
+ -		goto err_destroy_direct_tirs;
+ -	}
+ -
+ -	err = mlx5e_tc_init(priv);
+ -	if (err)
+ -		goto err_destroy_flow_steering;
+ -
+ -	return 0;
+ +	kvfree(in);
+  
+ -err_destroy_flow_steering:
+ -	mlx5e_destroy_flow_steering(priv);
+ -err_destroy_direct_tirs:
+ -	mlx5e_destroy_direct_tirs(priv);
+ -err_destroy_indirect_tirs:
+ -	mlx5e_destroy_indirect_tirs(priv);
+ -err_destroy_direct_rqts:
+ -	for (i = 0; i < priv->profile->max_nch(mdev); i++)
+ -		mlx5e_destroy_rqt(priv, &priv->direct_tir[i].rqt);
+ -err_destroy_indirect_rqts:
+ -	mlx5e_destroy_rqt(priv, &priv->indir_rqt);
+  	return err;
+  }
+  
+ -static void mlx5e_cleanup_nic_rx(struct mlx5e_priv *priv)
+ +static void *mlx5e_create_netdev(struct mlx5_core_dev *mdev)
+  {
+++<<<<<<< HEAD
+++=======
++ 	int i;
++ 
++ 	mlx5e_tc_cleanup(priv);
++ 	mlx5e_destroy_flow_steering(priv);
++ 	mlx5e_destroy_direct_tirs(priv);
++ 	mlx5e_destroy_indirect_tirs(priv);
++ 	for (i = 0; i < priv->profile->max_nch(priv->mdev); i++)
++ 		mlx5e_destroy_rqt(priv, &priv->direct_tir[i].rqt);
++ 	mlx5e_destroy_rqt(priv, &priv->indir_rqt);
++ }
++ 
++ static int mlx5e_init_nic_tx(struct mlx5e_priv *priv)
++ {
++ 	int err;
++ 
++ 	err = mlx5e_create_tises(priv);
++ 	if (err) {
++ 		mlx5_core_warn(priv->mdev, "create tises failed, %d\n", err);
++ 		return err;
++ 	}
++ 
++ #ifdef CONFIG_MLX5_CORE_EN_DCB
++ 	mlx5e_dcbnl_initialize(priv);
++ #endif
++ 	return 0;
++ }
++ 
++ static void mlx5e_nic_enable(struct mlx5e_priv *priv)
++ {
++ 	struct net_device *netdev = priv->netdev;
++ 	struct mlx5_core_dev *mdev = priv->mdev;
++ 	struct mlx5_eswitch *esw = mdev->priv.eswitch;
++ 	struct mlx5_eswitch_rep rep;
++ 
++ 	mlx5_lag_add(mdev, netdev);
++ 
++ 	mlx5e_enable_async_events(priv);
++ 
++ 	if (MLX5_CAP_GEN(mdev, vport_group_manager)) {
++ 		mlx5_query_nic_vport_mac_address(mdev, 0, rep.hw_id);
++ 		rep.load = mlx5e_nic_rep_load;
++ 		rep.unload = mlx5e_nic_rep_unload;
++ 		rep.vport = FDB_UPLINK_VPORT;
++ 		rep.netdev = netdev;
++ 		mlx5_eswitch_register_vport_rep(esw, 0, &rep);
++ 	}
++ 
++ 	if (netdev->reg_state != NETREG_REGISTERED)
++ 		return;
++ 
++ 	/* Device already registered: sync netdev system state */
++ 	if (mlx5e_vxlan_allowed(mdev)) {
++ 		rtnl_lock();
++ 		udp_tunnel_get_rx_info(netdev);
++ 		rtnl_unlock();
++ 	}
++ 
++ 	queue_work(priv->wq, &priv->set_rx_mode_work);
++ }
++ 
++ static void mlx5e_nic_disable(struct mlx5e_priv *priv)
++ {
++ 	struct mlx5_core_dev *mdev = priv->mdev;
++ 	struct mlx5_eswitch *esw = mdev->priv.eswitch;
++ 
++ 	queue_work(priv->wq, &priv->set_rx_mode_work);
++ 	if (MLX5_CAP_GEN(mdev, vport_group_manager))
++ 		mlx5_eswitch_unregister_vport_rep(esw, 0);
++ 	mlx5e_disable_async_events(priv);
++ 	mlx5_lag_remove(mdev);
++ }
++ 
++ static const struct mlx5e_profile mlx5e_nic_profile = {
++ 	.init		   = mlx5e_nic_init,
++ 	.cleanup	   = mlx5e_nic_cleanup,
++ 	.init_rx	   = mlx5e_init_nic_rx,
++ 	.cleanup_rx	   = mlx5e_cleanup_nic_rx,
++ 	.init_tx	   = mlx5e_init_nic_tx,
++ 	.cleanup_tx	   = mlx5e_cleanup_nic_tx,
++ 	.enable		   = mlx5e_nic_enable,
++ 	.disable	   = mlx5e_nic_disable,
++ 	.update_stats	   = mlx5e_update_stats,
++ 	.max_nch	   = mlx5e_get_max_num_channels,
++ 	.max_tc		   = MLX5E_MAX_NUM_TC,
++ };
++ 
++ struct net_device *mlx5e_create_netdev(struct mlx5_core_dev *mdev,
++ 				       const struct mlx5e_profile *profile,
++ 				       void *ppriv)
++ {
++ 	int nch = profile->max_nch(mdev);
+++>>>>>>> 3deef8cea3ef (net/mlx5e: Un-register uplink representor on nic_disable)
+  	struct net_device *netdev;
+  	struct mlx5e_priv *priv;
+ +	int nch = mlx5e_get_max_num_channels(mdev);
+ +	int err;
+ +
+ +	if (mlx5e_check_required_hca_cap(mdev))
+ +		return NULL;
+  
+  	netdev = alloc_etherdev_mqs(sizeof(struct mlx5e_priv),
+ -				    nch * profile->max_tc,
+ +				    nch * MLX5E_MAX_NUM_TC,
+  				    nch);
+  	if (!netdev) {
+  		mlx5_core_err(mdev, "alloc_etherdev_mqs() failed\n");
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
