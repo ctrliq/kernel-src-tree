@@ -1,0 +1,321 @@
+RDS: Rework path specific indirections
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Sowmini Varadhan <sowmini.varadhan@oracle.com>
+commit 226f7a7d97e37220a442f52eb85ebff2cd6fc0d2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/226f7a7d.failed
+
+Refactor code to avoid separate indirections for single-path
+and multipath transports. All transports (both single and mp-capable)
+will get a pointer to the rds_conn_path, and can trivially derive
+the rds_connection from the ->cp_conn.
+
+	Acked-by: Santosh Shilimkar <santosh.shilimkar@oracle.com>
+	Signed-off-by: Sowmini Varadhan <sowmini.varadhan@oracle.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 226f7a7d97e37220a442f52eb85ebff2cd6fc0d2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/rds/connection.c
+#	net/rds/rds.h
+#	net/rds/send.c
+diff --cc net/rds/connection.c
+index 92b812312d9d,17c2f2591ac4..000000000000
+--- a/net/rds/connection.c
++++ b/net/rds/connection.c
+@@@ -282,25 -308,29 +282,30 @@@ void rds_conn_shutdown(struct rds_conne
+  		 * deadlocking with the CM handler. Instead, the CM event
+  		 * handler is supposed to check for state DISCONNECTING
+  		 */
+ -		mutex_lock(&cp->cp_cm_lock);
+ -		if (!rds_conn_path_transition(cp, RDS_CONN_UP,
+ -					      RDS_CONN_DISCONNECTING) &&
+ -		    !rds_conn_path_transition(cp, RDS_CONN_ERROR,
+ -					      RDS_CONN_DISCONNECTING)) {
+ -			rds_conn_path_error(cp,
+ -					    "shutdown called in state %d\n",
+ -					    atomic_read(&cp->cp_state));
+ -			mutex_unlock(&cp->cp_cm_lock);
+ +		mutex_lock(&conn->c_cm_lock);
+ +		if (!rds_conn_transition(conn, RDS_CONN_UP, RDS_CONN_DISCONNECTING)
+ +		 && !rds_conn_transition(conn, RDS_CONN_ERROR, RDS_CONN_DISCONNECTING)) {
+ +			rds_conn_error(conn, "shutdown called in state %d\n",
+ +					atomic_read(&conn->c_state));
+ +			mutex_unlock(&conn->c_cm_lock);
+  			return;
+  		}
+ -		mutex_unlock(&cp->cp_cm_lock);
+ +		mutex_unlock(&conn->c_cm_lock);
+  
+ -		wait_event(cp->cp_waitq,
+ -			   !test_bit(RDS_IN_XMIT, &cp->cp_flags));
+ -		wait_event(cp->cp_waitq,
+ -			   !test_bit(RDS_RECV_REFILL, &cp->cp_flags));
+ +		wait_event(conn->c_waitq,
+ +			   !test_bit(RDS_IN_XMIT, &conn->c_flags));
+ +		wait_event(conn->c_waitq,
+ +			   !test_bit(RDS_RECV_REFILL, &conn->c_flags));
+  
+++<<<<<<< HEAD
+ +		conn->c_trans->conn_shutdown(conn);
+ +		rds_conn_reset(conn);
+++=======
++ 		conn->c_trans->conn_path_shutdown(cp);
++ 		rds_conn_path_reset(cp);
+++>>>>>>> 226f7a7d97e3 (RDS: Rework path specific indirections)
+  
+ -		if (!rds_conn_path_transition(cp, RDS_CONN_DISCONNECTING,
+ -					      RDS_CONN_DOWN)) {
+ +		if (!rds_conn_transition(conn, RDS_CONN_DISCONNECTING, RDS_CONN_DOWN)) {
+  			/* This can happen - eg when we're in the middle of tearing
+  			 * down the connection, and someone unloads the rds module.
+  			 * Quite reproduceable with loopback connections.
+diff --cc net/rds/rds.h
+index 8889455d9d7c,5bbad08262f5..000000000000
+--- a/net/rds/rds.h
++++ b/net/rds/rds.h
+@@@ -441,9 -455,9 +441,15 @@@ struct rds_transport 
+  	int (*conn_alloc)(struct rds_connection *conn, gfp_t gfp);
+  	void (*conn_free)(void *data);
+  	int (*conn_connect)(struct rds_connection *conn);
+++<<<<<<< HEAD
+ +	void (*conn_shutdown)(struct rds_connection *conn);
+ +	void (*xmit_prepare)(struct rds_connection *conn);
+ +	void (*xmit_complete)(struct rds_connection *conn);
+++=======
++ 	void (*conn_path_shutdown)(struct rds_conn_path *conn);
++ 	void (*xmit_path_prepare)(struct rds_conn_path *cp);
++ 	void (*xmit_path_complete)(struct rds_conn_path *cp);
+++>>>>>>> 226f7a7d97e3 (RDS: Rework path specific indirections)
+  	int (*xmit)(struct rds_connection *conn, struct rds_message *rm,
+  		    unsigned int hdr_off, unsigned int sg, unsigned int off);
+  	int (*xmit_rdma)(struct rds_connection *conn, struct rm_rdma_op *op);
+diff --cc net/rds/send.c
+index 283757171fc5,5a9caf1da896..000000000000
+--- a/net/rds/send.c
++++ b/net/rds/send.c
+@@@ -187,8 -183,8 +187,13 @@@ restart
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (conn->c_trans->xmit_prepare)
+ +		conn->c_trans->xmit_prepare(conn);
+++=======
++ 	if (conn->c_trans->xmit_path_prepare)
++ 		conn->c_trans->xmit_path_prepare(cp);
+++>>>>>>> 226f7a7d97e3 (RDS: Rework path specific indirections)
+  
+  	/*
+  	 * spin trying to push headers and data down the connection until
+@@@ -397,9 -399,9 +402,15 @@@
+  	}
+  
+  over_batch:
+++<<<<<<< HEAD
+ +	if (conn->c_trans->xmit_complete)
+ +		conn->c_trans->xmit_complete(conn);
+ +	release_in_xmit(conn);
+++=======
++ 	if (conn->c_trans->xmit_path_complete)
++ 		conn->c_trans->xmit_path_complete(cp);
++ 	release_in_xmit(cp);
+++>>>>>>> 226f7a7d97e3 (RDS: Rework path specific indirections)
+  
+  	/* Nuke any messages we decided not to retransmit. */
+  	if (!list_empty(&to_be_dropped)) {
+* Unmerged path net/rds/connection.c
+diff --git a/net/rds/ib.c b/net/rds/ib.c
+index 6c6dd30d927b..270ab6486759 100644
+--- a/net/rds/ib.c
++++ b/net/rds/ib.c
+@@ -379,7 +379,7 @@ void rds_ib_exit(void)
+ 
+ struct rds_transport rds_ib_transport = {
+ 	.laddr_check		= rds_ib_laddr_check,
+-	.xmit_complete		= rds_ib_xmit_complete,
++	.xmit_path_complete	= rds_ib_xmit_path_complete,
+ 	.xmit			= rds_ib_xmit,
+ 	.xmit_rdma		= rds_ib_xmit_rdma,
+ 	.xmit_atomic		= rds_ib_xmit_atomic,
+@@ -387,7 +387,7 @@ struct rds_transport rds_ib_transport = {
+ 	.conn_alloc		= rds_ib_conn_alloc,
+ 	.conn_free		= rds_ib_conn_free,
+ 	.conn_connect		= rds_ib_conn_connect,
+-	.conn_shutdown		= rds_ib_conn_shutdown,
++	.conn_path_shutdown	= rds_ib_conn_path_shutdown,
+ 	.inc_copy_to_user	= rds_ib_inc_copy_to_user,
+ 	.inc_free		= rds_ib_inc_free,
+ 	.cm_initiate_connect	= rds_ib_cm_initiate_connect,
+diff --git a/net/rds/ib.h b/net/rds/ib.h
+index 33ec6a6553e1..f177206646d2 100644
+--- a/net/rds/ib.h
++++ b/net/rds/ib.h
+@@ -329,7 +329,7 @@ extern struct list_head ib_nodev_conns;
+ int rds_ib_conn_alloc(struct rds_connection *conn, gfp_t gfp);
+ void rds_ib_conn_free(void *arg);
+ int rds_ib_conn_connect(struct rds_connection *conn);
+-void rds_ib_conn_shutdown(struct rds_connection *conn);
++void rds_ib_conn_path_shutdown(struct rds_conn_path *cp);
+ void rds_ib_state_change(struct sock *sk);
+ int rds_ib_listen_init(void);
+ void rds_ib_listen_stop(void);
+@@ -385,7 +385,7 @@ u32 rds_ib_ring_completed(struct rds_ib_work_ring *ring, u32 wr_id, u32 oldest);
+ extern wait_queue_head_t rds_ib_ring_empty_wait;
+ 
+ /* ib_send.c */
+-void rds_ib_xmit_complete(struct rds_connection *conn);
++void rds_ib_xmit_path_complete(struct rds_conn_path *cp);
+ int rds_ib_xmit(struct rds_connection *conn, struct rds_message *rm,
+ 		unsigned int hdr_off, unsigned int sg, unsigned int off);
+ void rds_ib_send_cqe_handler(struct rds_ib_connection *ic, struct ib_wc *wc);
+diff --git a/net/rds/ib_cm.c b/net/rds/ib_cm.c
+index 121ebb33e60b..ed039d485874 100644
+--- a/net/rds/ib_cm.c
++++ b/net/rds/ib_cm.c
+@@ -721,8 +721,9 @@ out:
+  * so that it can be called at any point during startup.  In fact it
+  * can be called multiple times for a given connection.
+  */
+-void rds_ib_conn_shutdown(struct rds_connection *conn)
++void rds_ib_conn_path_shutdown(struct rds_conn_path *cp)
+ {
++	struct rds_connection *conn = cp->cp_conn;
+ 	struct rds_ib_connection *ic = conn->c_transport_data;
+ 	int err = 0;
+ 
+diff --git a/net/rds/ib_send.c b/net/rds/ib_send.c
+index 116c1e8740f1..a58ce3963cdf 100644
+--- a/net/rds/ib_send.c
++++ b/net/rds/ib_send.c
+@@ -979,8 +979,9 @@ out:
+ 	return ret;
+ }
+ 
+-void rds_ib_xmit_complete(struct rds_connection *conn)
++void rds_ib_xmit_path_complete(struct rds_conn_path *cp)
+ {
++	struct rds_connection *conn = cp->cp_conn;
+ 	struct rds_ib_connection *ic = conn->c_transport_data;
+ 
+ 	/* We may have a pending ACK or window update we were unable
+diff --git a/net/rds/loop.c b/net/rds/loop.c
+index 6b12b68541ae..3621d2bb3a64 100644
+--- a/net/rds/loop.c
++++ b/net/rds/loop.c
+@@ -154,7 +154,7 @@ static int rds_loop_conn_connect(struct rds_connection *conn)
+ 	return 0;
+ }
+ 
+-static void rds_loop_conn_shutdown(struct rds_connection *conn)
++static void rds_loop_conn_path_shutdown(struct rds_conn_path *cp)
+ {
+ }
+ 
+@@ -187,7 +187,7 @@ struct rds_transport rds_loop_transport = {
+ 	.conn_alloc		= rds_loop_conn_alloc,
+ 	.conn_free		= rds_loop_conn_free,
+ 	.conn_connect		= rds_loop_conn_connect,
+-	.conn_shutdown		= rds_loop_conn_shutdown,
++	.conn_path_shutdown	= rds_loop_conn_path_shutdown,
+ 	.inc_copy_to_user	= rds_message_inc_copy_to_user,
+ 	.inc_free		= rds_loop_inc_free,
+ 	.t_name			= "loopback",
+* Unmerged path net/rds/rds.h
+* Unmerged path net/rds/send.c
+diff --git a/net/rds/tcp.c b/net/rds/tcp.c
+index b76a0b9ccbfb..7c6f6d0da08a 100644
+--- a/net/rds/tcp.c
++++ b/net/rds/tcp.c
+@@ -339,14 +339,14 @@ static void rds_tcp_exit(void);
+ 
+ struct rds_transport rds_tcp_transport = {
+ 	.laddr_check		= rds_tcp_laddr_check,
+-	.xmit_prepare		= rds_tcp_xmit_prepare,
+-	.xmit_complete		= rds_tcp_xmit_complete,
++	.xmit_path_prepare	= rds_tcp_xmit_path_prepare,
++	.xmit_path_complete	= rds_tcp_xmit_path_complete,
+ 	.xmit			= rds_tcp_xmit,
+ 	.recv			= rds_tcp_recv,
+ 	.conn_alloc		= rds_tcp_conn_alloc,
+ 	.conn_free		= rds_tcp_conn_free,
+ 	.conn_connect		= rds_tcp_conn_connect,
+-	.conn_shutdown		= rds_tcp_conn_shutdown,
++	.conn_path_shutdown	= rds_tcp_conn_path_shutdown,
+ 	.inc_copy_to_user	= rds_tcp_inc_copy_to_user,
+ 	.inc_free		= rds_tcp_inc_free,
+ 	.stats_info_copy	= rds_tcp_stats_info_copy,
+diff --git a/net/rds/tcp.h b/net/rds/tcp.h
+index 3949f2d1c41c..d1791a05da5c 100644
+--- a/net/rds/tcp.h
++++ b/net/rds/tcp.h
+@@ -61,7 +61,7 @@ void rds_tcp_accept_work(struct sock *sk);
+ 
+ /* tcp_connect.c */
+ int rds_tcp_conn_connect(struct rds_connection *conn);
+-void rds_tcp_conn_shutdown(struct rds_connection *conn);
++void rds_tcp_conn_path_shutdown(struct rds_conn_path *conn);
+ void rds_tcp_state_change(struct sock *sk);
+ 
+ /* tcp_listen.c */
+@@ -81,8 +81,8 @@ int rds_tcp_inc_copy_to_user(struct rds_incoming *inc, struct iovec *iov,
+ 			     size_t size);
+ 
+ /* tcp_send.c */
+-void rds_tcp_xmit_prepare(struct rds_connection *conn);
+-void rds_tcp_xmit_complete(struct rds_connection *conn);
++void rds_tcp_xmit_path_prepare(struct rds_conn_path *cp);
++void rds_tcp_xmit_path_complete(struct rds_conn_path *cp);
+ int rds_tcp_xmit(struct rds_connection *conn, struct rds_message *rm,
+ 	         unsigned int hdr_off, unsigned int sg, unsigned int off);
+ void rds_tcp_write_space(struct sock *sk);
+diff --git a/net/rds/tcp_connect.c b/net/rds/tcp_connect.c
+index a86fb96b1ae0..b0551cf71426 100644
+--- a/net/rds/tcp_connect.c
++++ b/net/rds/tcp_connect.c
+@@ -142,12 +142,13 @@ out:
+  * callbacks to those set by TCP.  Our callbacks won't execute again once we
+  * hold the sock lock.
+  */
+-void rds_tcp_conn_shutdown(struct rds_connection *conn)
++void rds_tcp_conn_path_shutdown(struct rds_conn_path *cp)
+ {
+-	struct rds_tcp_connection *tc = conn->c_transport_data;
++	struct rds_tcp_connection *tc = cp->cp_transport_data;
+ 	struct socket *sock = tc->t_sock;
+ 
+-	rdsdebug("shutting down conn %p tc %p sock %p\n", conn, tc, sock);
++	rdsdebug("shutting down conn %p tc %p sock %p\n",
++		 cp->cp_conn, tc, sock);
+ 
+ 	if (sock) {
+ 		sock->ops->shutdown(sock, RCV_SHUTDOWN | SEND_SHUTDOWN);
+diff --git a/net/rds/tcp_send.c b/net/rds/tcp_send.c
+index 4be8e6261b9f..2f4354b13150 100644
+--- a/net/rds/tcp_send.c
++++ b/net/rds/tcp_send.c
+@@ -48,16 +48,16 @@ static void rds_tcp_cork(struct socket *sock, int val)
+ 	set_fs(oldfs);
+ }
+ 
+-void rds_tcp_xmit_prepare(struct rds_connection *conn)
++void rds_tcp_xmit_path_prepare(struct rds_conn_path *cp)
+ {
+-	struct rds_tcp_connection *tc = conn->c_transport_data;
++	struct rds_tcp_connection *tc = cp->cp_transport_data;
+ 
+ 	rds_tcp_cork(tc->t_sock, 1);
+ }
+ 
+-void rds_tcp_xmit_complete(struct rds_connection *conn)
++void rds_tcp_xmit_path_complete(struct rds_conn_path *cp)
+ {
+-	struct rds_tcp_connection *tc = conn->c_transport_data;
++	struct rds_tcp_connection *tc = cp->cp_transport_data;
+ 
+ 	rds_tcp_cork(tc->t_sock, 0);
+ }
