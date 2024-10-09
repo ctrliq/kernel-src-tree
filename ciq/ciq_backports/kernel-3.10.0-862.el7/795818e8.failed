@@ -1,0 +1,233 @@
+s390/pci: don't cleanup in arch_setup_msi_irqs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [s390] pci: don't cleanup in arch_setup_msi_irqs (Hendrik Brueckner) [1486403]
+Rebuild_FUZZ: 94.25%
+commit-author Sebastian Ott <sebott@linux.vnet.ibm.com>
+commit 795818e8bf17dbc791764ba9fb723278ee934676
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/795818e8.failed
+
+After failures in arch_setup_msi_irqs common code calls
+arch_teardown_msi_irqs. Thus, remove cleanup code from
+arch_setup_msi_irqs.
+
+	Signed-off-by: Sebastian Ott <sebott@linux.vnet.ibm.com>
+	Reviewed-by: Gerald Schaefer <gerald.schaefer@de.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 795818e8bf17dbc791764ba9fb723278ee934676)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/pci/pci.c
+diff --cc arch/s390/pci/pci.c
+index 833b01424c9d,3dd9686c576a..000000000000
+--- a/arch/s390/pci/pci.c
++++ b/arch/s390/pci/pci.c
+@@@ -411,111 -363,60 +411,139 @@@ static void zpci_irq_handler(struct air
+  	}
+  }
+  
+ +static int zpci_alloc_msi(struct zpci_dev *zdev, int msi_vecs)
+ +{
+ +	unsigned long size;
+ +
+ +	/* Alloc aibv & callback space */
+ +	zdev->irq_map = kmem_cache_zalloc(zdev_irq_cache, GFP_KERNEL);
+ +	if (!zdev->irq_map)
+ +		goto out;
+ +	/* Store the number of used MSI vectors */
+ +	zdev->irq_map->msi_vecs = msi_vecs;
+ +	/* Allocate callback array */
+ +	size = sizeof(struct callback) * msi_vecs;
+ +	zdev->irq_map->cb = kzalloc(size, GFP_KERNEL);
+ +	if (!zdev->irq_map->cb)
+ +		goto out_map;
+ +	/* Allocate msi_map array */
+ +	size = sizeof(struct msi_map) * msi_vecs;
+ +	zdev->msi_map = kzalloc(size, GFP_KERNEL);
+ +	if (!zdev->msi_map)
+ +		goto out_cb;
+ +	return 0;
+ +
+ +out_cb:
+ +	kfree(zdev->irq_map->cb);
+ +out_map:
+ +	kmem_cache_free(zdev_irq_cache, zdev->irq_map);
+ +out:
+ +	return -ENOMEM;
+ +}
+ +
+ +static void zpci_free_msi(struct zpci_dev *zdev)
+ +{
+ +	kfree(zdev->msi_map);
+ +	kfree(zdev->irq_map->cb);
+ +	kmem_cache_free(zdev_irq_cache, zdev->irq_map);
+ +}
+ +
+  int arch_setup_msi_irqs(struct pci_dev *pdev, int nvec, int type)
+  {
+ -	struct zpci_dev *zdev = to_zpci(pdev);
+ -	unsigned int hwirq, msi_vecs;
+ +	struct zpci_dev *zdev = get_zdev(pdev);
+ +	unsigned int msi_nr, msi_vecs;
+  	unsigned long aisb;
+  	struct msi_desc *msi;
+ -	struct msi_msg msg;
+ -	int rc, irq;
+ +	int rc;
+  
++ 	zdev->aisb = -1UL;
+  	if (type == PCI_CAP_ID_MSI && nvec > 1)
+  		return 1;
+ -	msi_vecs = min_t(unsigned int, nvec, zdev->max_msi);
+ +	msi_vecs = min(nvec, ZPCI_MSI_VEC_MAX);
+  
+  	/* Allocate adapter summary indicator bit */
+- 	rc = -EIO;
+  	aisb = airq_iv_alloc_bit(zpci_aisb_iv);
+  	if (aisb == -1UL)
+- 		goto out;
++ 		return -EIO;
+  	zdev->aisb = aisb;
+  
+  	/* Create adapter interrupt vector */
+++<<<<<<< HEAD
+ +	rc = -ENOMEM;
+ +	zdev->aibv = airq_iv_create(msi_vecs, AIRQ_IV_BITLOCK);
+++=======
++ 	zdev->aibv = airq_iv_create(msi_vecs, AIRQ_IV_DATA | AIRQ_IV_BITLOCK);
+++>>>>>>> 795818e8bf17 (s390/pci: don't cleanup in arch_setup_msi_irqs)
+  	if (!zdev->aibv)
+- 		goto out_si;
++ 		return -ENOMEM;
+  
+ +	/* Allocate data structures for msi interrupts */
+ +	rc = zpci_alloc_msi(zdev, msi_vecs);
+ +	if (rc)
+ +		goto out_iv;
+ +
+++<<<<<<< HEAD
+  	/* Wire up shortcut pointer */
+ -	zpci_aibv[aisb] = zdev->aibv;
+ +	zpci_imap[aisb] = zdev->irq_map;
+ +	zdev->irq_map->aibv = zdev->aibv;
+  
+ +	/*
+ +	 * TODO: irq number 0 wont be found if we return less than the
+ +	 * requested MSIs. Ignore it for now and fix in common code.
+ +	 */
+ +	msi_nr = aisb << ZPCI_MSI_VEC_BITS;
+ +	list_for_each_entry(msi, &pdev->msi_list, list) {
+ +		rc = zpci_setup_msi_irq(zdev, msi, msi_nr,
+ +					  aisb << ZPCI_MSI_VEC_BITS);
+ +		if (rc)
+ +			goto out_msi;
+ +		msi_nr++;
+++=======
++ 	/* Request MSI interrupts */
++ 	hwirq = 0;
++ 	for_each_pci_msi_entry(msi, pdev) {
++ 		rc = -EIO;
++ 		irq = irq_alloc_desc(0);	/* Alloc irq on node 0 */
++ 		if (irq < 0)
++ 			return -ENOMEM;
++ 		rc = irq_set_msi_desc(irq, msi);
++ 		if (rc)
++ 			return rc;
++ 		irq_set_chip_and_handler(irq, &zpci_irq_chip,
++ 					 handle_simple_irq);
++ 		msg.data = hwirq;
++ 		msg.address_lo = zdev->msi_addr & 0xffffffff;
++ 		msg.address_hi = zdev->msi_addr >> 32;
++ 		pci_write_msi_msg(irq, &msg);
++ 		airq_iv_set_data(zdev->aibv, hwirq, irq);
++ 		hwirq++;
+++>>>>>>> 795818e8bf17 (s390/pci: don't cleanup in arch_setup_msi_irqs)
+  	}
+  
+  	/* Enable adapter interrupts */
+  	rc = zpci_set_airq(zdev);
+  	if (rc)
+- 		goto out_msi;
++ 		return rc;
+  
+  	return (msi_vecs == nvec) ? 0 : msi_vecs;
+++<<<<<<< HEAD
+ +
+ +out_msi:
+ +	msi_nr -= aisb << ZPCI_MSI_VEC_BITS;
+ +	list_for_each_entry(msi, &pdev->msi_list, list) {
+ +		if (msi_nr-- == 0)
+ +			break;
+ +		zpci_teardown_msi_irq(zdev, msi);
+ +	}
+ +	zpci_free_msi(zdev);
+ +out_iv:
+ +	airq_iv_release(zdev->aibv);
+ +out_si:
+ +	airq_iv_free_bit(zpci_aisb_iv, aisb);
+ +out:
+ +	return rc;
+++=======
+++>>>>>>> 795818e8bf17 (s390/pci: don't cleanup in arch_setup_msi_irqs)
+  }
+  
+  void arch_teardown_msi_irqs(struct pci_dev *pdev)
+@@@ -529,12 -430,31 +557,40 @@@
+  	if (rc)
+  		return;
+  
+++<<<<<<< HEAD
+ +	list_for_each_entry(msi, &pdev->msi_list, list)
+ +		zpci_teardown_msi_irq(zdev, msi);
+ +
+ +	zpci_free_msi(zdev);
+ +	airq_iv_release(zdev->aibv);
+ +	airq_iv_free_bit(zpci_aisb_iv, zdev->aisb);
+++=======
++ 	/* Release MSI interrupts */
++ 	for_each_pci_msi_entry(msi, pdev) {
++ 		if (!msi->irq)
++ 			continue;
++ 		if (msi->msi_attrib.is_msix)
++ 			__pci_msix_desc_mask_irq(msi, 1);
++ 		else
++ 			__pci_msi_desc_mask_irq(msi, 1, 1);
++ 		irq_set_msi_desc(msi->irq, NULL);
++ 		irq_free_desc(msi->irq);
++ 		msi->msg.address_lo = 0;
++ 		msi->msg.address_hi = 0;
++ 		msi->msg.data = 0;
++ 		msi->irq = 0;
++ 	}
++ 
++ 	if (zdev->aisb != -1UL) {
++ 		zpci_aibv[zdev->aisb] = NULL;
++ 		airq_iv_free_bit(zpci_aisb_iv, zdev->aisb);
++ 		zdev->aisb = -1UL;
++ 	}
++ 	if (zdev->aibv) {
++ 		airq_iv_release(zdev->aibv);
++ 		zdev->aibv = NULL;
++ 	}
+++>>>>>>> 795818e8bf17 (s390/pci: don't cleanup in arch_setup_msi_irqs)
+  }
+  
+  static void zpci_map_resources(struct pci_dev *pdev)
+diff --git a/arch/s390/include/asm/pci.h b/arch/s390/include/asm/pci.h
+index 1c270f366fe8..d78c6e33a19e 100644
+--- a/arch/s390/include/asm/pci.h
++++ b/arch/s390/include/asm/pci.h
+@@ -116,7 +116,7 @@ struct zpci_dev {
+ 	struct zdev_irq_map *irq_map;
+ 	struct msi_map *msi_map;
+ 	struct airq_iv *aibv;		/* adapter interrupt bit vector */
+-	unsigned int	aisb;		/* number of the summary bit */
++	unsigned long	aisb;		/* number of the summary bit */
+ 
+ 	/* DMA stuff */
+ 	unsigned long	*dma_table;
+* Unmerged path arch/s390/pci/pci.c
