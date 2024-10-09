@@ -1,0 +1,367 @@
+dax, dm: allow device-mapper to operate without dax support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 976431b02c2ef92ae3f8b6a7d699fc554025e118
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/976431b0.failed
+
+Change device-mapper's DAX dependency to require the presence of at
+least one DAX_DRIVER. This allows device-mapper to be built without
+bringing the DAX core along which is especially wasteful when there are
+no DAX drivers, like BLK_DEV_PMEM, configured.
+
+	Cc: Alasdair Kergon <agk@redhat.com>
+	Reported-by: Bart Van Assche <Bart.VanAssche@wdc.com>
+	Reported-by: kbuild test robot <lkp@intel.com>
+	Reported-by: Arnd Bergmann <arnd@arndb.de>
+	Reviewed-by: Mike Snitzer <snitzer@redhat.com>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 976431b02c2ef92ae3f8b6a7d699fc554025e118)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-linear.c
+#	drivers/md/dm-stripe.c
+#	include/linux/dax.h
+diff --cc drivers/md/dm-linear.c
+index d40e867fe4c7,89443e0ededa..000000000000
+--- a/drivers/md/dm-linear.c
++++ b/drivers/md/dm-linear.c
+@@@ -172,9 -171,29 +173,31 @@@ static long linear_dax_direct_access(st
+  	return dax_direct_access(dax_dev, pgoff, nr_pages, kaddr, pfn);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static size_t linear_dax_copy_from_iter(struct dm_target *ti, pgoff_t pgoff,
++ 		void *addr, size_t bytes, struct iov_iter *i)
++ {
++ 	struct linear_c *lc = ti->private;
++ 	struct block_device *bdev = lc->dev->bdev;
++ 	struct dax_device *dax_dev = lc->dev->dax_dev;
++ 	sector_t dev_sector, sector = pgoff * PAGE_SECTORS;
++ 
++ 	dev_sector = linear_map_sector(ti, sector);
++ 	if (bdev_dax_pgoff(bdev, dev_sector, ALIGN(bytes, PAGE_SIZE), &pgoff))
++ 		return 0;
++ 	return dax_copy_from_iter(dax_dev, pgoff, addr, bytes, i);
++ }
++ 
++ #else
++ #define linear_dax_direct_access NULL
++ #define linear_dax_copy_from_iter NULL
++ #endif
++ 
+++>>>>>>> 976431b02c2e (dax, dm: allow device-mapper to operate without dax support)
+  static struct target_type linear_target = {
+  	.name   = "linear",
+ -	.version = {1, 4, 0},
+ -	.features = DM_TARGET_PASSES_INTEGRITY | DM_TARGET_ZONED_HM,
+ +	.version = {1, 3, 0},
+  	.module = THIS_MODULE,
+  	.ctr    = linear_ctr,
+  	.dtr    = linear_dtr,
+diff --cc drivers/md/dm-stripe.c
+index db56c81ef539,ac2e8ee9d586..000000000000
+--- a/drivers/md/dm-stripe.c
++++ b/drivers/md/dm-stripe.c
+@@@ -327,6 -333,30 +328,33 @@@ static long stripe_dax_direct_access(st
+  	return dax_direct_access(dax_dev, pgoff, nr_pages, kaddr, pfn);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static size_t stripe_dax_copy_from_iter(struct dm_target *ti, pgoff_t pgoff,
++ 		void *addr, size_t bytes, struct iov_iter *i)
++ {
++ 	sector_t dev_sector, sector = pgoff * PAGE_SECTORS;
++ 	struct stripe_c *sc = ti->private;
++ 	struct dax_device *dax_dev;
++ 	struct block_device *bdev;
++ 	uint32_t stripe;
++ 
++ 	stripe_map_sector(sc, sector, &stripe, &dev_sector);
++ 	dev_sector += sc->stripe[stripe].physical_start;
++ 	dax_dev = sc->stripe[stripe].dev->dax_dev;
++ 	bdev = sc->stripe[stripe].dev->bdev;
++ 
++ 	if (bdev_dax_pgoff(bdev, dev_sector, ALIGN(bytes, PAGE_SIZE), &pgoff))
++ 		return 0;
++ 	return dax_copy_from_iter(dax_dev, pgoff, addr, bytes, i);
++ }
++ 
++ #else
++ #define stripe_dax_direct_access NULL
++ #define stripe_dax_copy_from_iter NULL
++ #endif
++ 
+++>>>>>>> 976431b02c2e (dax, dm: allow device-mapper to operate without dax support)
+  /*
+   * Stripe status:
+   *
+diff --cc include/linux/dax.h
+index b7b81d6cc271,f9eb22ad341e..000000000000
+--- a/include/linux/dax.h
++++ b/include/linux/dax.h
+@@@ -74,24 -49,83 +87,37 @@@ static inline struct dax_device *alloc_
+  static inline void put_dax(struct dax_device *dax_dev)
+  {
+  }
++ static inline void kill_dax(struct dax_device *dax_dev)
++ {
++ }
++ static inline void dax_write_cache(struct dax_device *dax_dev, bool wc)
++ {
++ }
++ static inline bool dax_write_cache_enabled(struct dax_device *dax_dev)
++ {
++ 	return false;
++ }
+  #endif
+  
+ -struct writeback_control;
+ -int bdev_dax_pgoff(struct block_device *, sector_t, size_t, pgoff_t *pgoff);
+ -#if IS_ENABLED(CONFIG_FS_DAX)
+ -int __bdev_dax_supported(struct super_block *sb, int blocksize);
+ -static inline int bdev_dax_supported(struct super_block *sb, int blocksize)
+ -{
+ -	return __bdev_dax_supported(sb, blocksize);
+ -}
+ -
+ -static inline struct dax_device *fs_dax_get_by_host(const char *host)
+ -{
+ -	return dax_get_by_host(host);
+ -}
+ -
+ -static inline void fs_put_dax(struct dax_device *dax_dev)
+ -{
+ -	put_dax(dax_dev);
+ -}
+ -
+ -struct dax_device *fs_dax_get_by_bdev(struct block_device *bdev);
+ -int dax_writeback_mapping_range(struct address_space *mapping,
+ -		struct block_device *bdev, struct writeback_control *wbc);
+ -#else
+ -static inline int bdev_dax_supported(struct super_block *sb, int blocksize)
+ -{
+ -	return -EOPNOTSUPP;
+ -}
+ -
+ -static inline struct dax_device *fs_dax_get_by_host(const char *host)
+ -{
+ -	return NULL;
+ -}
+ -
+ -static inline void fs_put_dax(struct dax_device *dax_dev)
+ -{
+ -}
+ -
+ -static inline struct dax_device *fs_dax_get_by_bdev(struct block_device *bdev)
+ -{
+ -	return NULL;
+ -}
+ -
+ -static inline int dax_writeback_mapping_range(struct address_space *mapping,
+ -		struct block_device *bdev, struct writeback_control *wbc)
+ -{
+ -	return -EOPNOTSUPP;
+ -}
+ -#endif
+ -
+  int dax_read_lock(void);
+  void dax_read_unlock(int id);
+- struct dax_device *alloc_dax(void *private, const char *host,
+- 		const struct dax_operations *ops);
+  bool dax_alive(struct dax_device *dax_dev);
+- void kill_dax(struct dax_device *dax_dev);
+  void *dax_get_private(struct dax_device *dax_dev);
+  long dax_direct_access(struct dax_device *dax_dev, pgoff_t pgoff, long nr_pages,
+  		void **kaddr, pfn_t *pfn);
+++<<<<<<< HEAD
+++=======
++ size_t dax_copy_from_iter(struct dax_device *dax_dev, pgoff_t pgoff, void *addr,
++ 		size_t bytes, struct iov_iter *i);
++ void dax_flush(struct dax_device *dax_dev, void *addr, size_t size);
+++>>>>>>> 976431b02c2e (dax, dm: allow device-mapper to operate without dax support)
+  
+ -ssize_t dax_iomap_rw(struct kiocb *iocb, struct iov_iter *iter,
+ -		const struct iomap_ops *ops);
+ +ssize_t dax_iomap_rw(int rw, struct kiocb *iocb, const struct iovec *iov,
+ +		unsigned long nr_segs, loff_t pos,
+ +		size_t count, const struct iomap_ops *ops);
+  int dax_iomap_fault(struct vm_fault *vmf, enum page_entry_size pe_size,
+ -		    pfn_t *pfnp, int *errp, const struct iomap_ops *ops);
+ -int dax_finish_sync_fault(struct vm_fault *vmf, enum page_entry_size pe_size,
+ -			  pfn_t pfn);
+ +		const struct iomap_ops *ops);
+ +int dax_fault(struct vm_area_struct *, struct vm_fault *, get_block_t);
+  int dax_delete_mapping_entry(struct address_space *mapping, pgoff_t index);
+  int dax_invalidate_mapping_entry_sync(struct address_space *mapping,
+  				      pgoff_t index);
+diff --git a/drivers/md/Kconfig b/drivers/md/Kconfig
+index 56f9d6702739..01d8467f7f50 100644
+--- a/drivers/md/Kconfig
++++ b/drivers/md/Kconfig
+@@ -182,7 +182,7 @@ config BLK_DEV_DM_BUILTIN
+ config BLK_DEV_DM
+ 	tristate "Device mapper support"
+ 	select BLK_DEV_DM_BUILTIN
+-	select DAX
++	depends on DAX || DAX=n
+ 	---help---
+ 	  Device-mapper is a low level volume manager.  It works by allowing
+ 	  people to specify mappings for ranges of logical sectors.  Various
+* Unmerged path drivers/md/dm-linear.c
+diff --git a/drivers/md/dm-log-writes.c b/drivers/md/dm-log-writes.c
+index 080dee545525..767a10559342 100644
+--- a/drivers/md/dm-log-writes.c
++++ b/drivers/md/dm-log-writes.c
+@@ -610,51 +610,6 @@ static int log_mark(struct log_writes_c *lc, char *data)
+ 	return 0;
+ }
+ 
+-static int log_dax(struct log_writes_c *lc, sector_t sector, size_t bytes,
+-		   struct iov_iter *i)
+-{
+-	struct pending_block *block;
+-
+-	if (!bytes)
+-		return 0;
+-
+-	block = kzalloc(sizeof(struct pending_block), GFP_KERNEL);
+-	if (!block) {
+-		DMERR("Error allocating dax pending block");
+-		return -ENOMEM;
+-	}
+-
+-	block->data = kzalloc(bytes, GFP_KERNEL);
+-	if (!block->data) {
+-		DMERR("Error allocating dax data space");
+-		kfree(block);
+-		return -ENOMEM;
+-	}
+-
+-	/* write data provided via the iterator */
+-	if (!copy_from_iter(block->data, bytes, i)) {
+-		DMERR("Error copying dax data");
+-		kfree(block->data);
+-		kfree(block);
+-		return -EIO;
+-	}
+-
+-	/* rewind the iterator so that the block driver can use it */
+-	iov_iter_revert(i, bytes);
+-
+-	block->datalen = bytes;
+-	block->sector = bio_to_dev_sectors(lc, sector);
+-	block->nr_sectors = ALIGN(bytes, lc->sectorsize) >> lc->sectorshift;
+-
+-	atomic_inc(&lc->pending_blocks);
+-	spin_lock_irq(&lc->blocks_lock);
+-	list_add_tail(&block->list, &lc->unflushed_blocks);
+-	spin_unlock_irq(&lc->blocks_lock);
+-	wake_up_process(lc->log_kthread);
+-
+-	return 0;
+-}
+-
+ static void log_writes_dtr(struct dm_target *ti)
+ {
+ 	struct log_writes_c *lc = ti->private;
+@@ -935,6 +890,52 @@ static void log_writes_io_hints(struct dm_target *ti, struct queue_limits *limit
+ 	limits->io_min = limits->physical_block_size;
+ }
+ 
++#if IS_ENABLED(CONFIG_DAX_DRIVER)
++static int log_dax(struct log_writes_c *lc, sector_t sector, size_t bytes,
++		   struct iov_iter *i)
++{
++	struct pending_block *block;
++
++	if (!bytes)
++		return 0;
++
++	block = kzalloc(sizeof(struct pending_block), GFP_KERNEL);
++	if (!block) {
++		DMERR("Error allocating dax pending block");
++		return -ENOMEM;
++	}
++
++	block->data = kzalloc(bytes, GFP_KERNEL);
++	if (!block->data) {
++		DMERR("Error allocating dax data space");
++		kfree(block);
++		return -ENOMEM;
++	}
++
++	/* write data provided via the iterator */
++	if (!copy_from_iter(block->data, bytes, i)) {
++		DMERR("Error copying dax data");
++		kfree(block->data);
++		kfree(block);
++		return -EIO;
++	}
++
++	/* rewind the iterator so that the block driver can use it */
++	iov_iter_revert(i, bytes);
++
++	block->datalen = bytes;
++	block->sector = bio_to_dev_sectors(lc, sector);
++	block->nr_sectors = ALIGN(bytes, lc->sectorsize) >> lc->sectorshift;
++
++	atomic_inc(&lc->pending_blocks);
++	spin_lock_irq(&lc->blocks_lock);
++	list_add_tail(&block->list, &lc->unflushed_blocks);
++	spin_unlock_irq(&lc->blocks_lock);
++	wake_up_process(lc->log_kthread);
++
++	return 0;
++}
++
+ static long log_writes_dax_direct_access(struct dm_target *ti, pgoff_t pgoff,
+ 					 long nr_pages, void **kaddr, pfn_t *pfn)
+ {
+@@ -971,6 +972,10 @@ static size_t log_writes_dax_copy_from_iter(struct dm_target *ti,
+ dax_copy:
+ 	return dax_copy_from_iter(lc->dev->dax_dev, pgoff, addr, bytes, i);
+ }
++#else
++#define log_writes_dax_direct_access NULL
++#define log_writes_dax_copy_from_iter NULL
++#endif
+ 
+ static struct target_type log_writes_target = {
+ 	.name   = "log-writes",
+* Unmerged path drivers/md/dm-stripe.c
+diff --git a/drivers/md/dm.c b/drivers/md/dm.c
+index 14d7215727e9..d9a572692362 100644
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@ -1719,7 +1719,7 @@ static void cleanup_mapped_device(struct mapped_device *md)
+ static struct mapped_device *alloc_dev(int minor)
+ {
+ 	int r, numa_node_id = dm_get_numa_node();
+-	struct dax_device *dax_dev;
++	struct dax_device *dax_dev = NULL;
+ 	struct mapped_device *md;
+ 	void *old_md;
+ 
+@@ -1785,9 +1785,11 @@ static struct mapped_device *alloc_dev(int minor)
+ 	md->disk->private_data = md;
+ 	sprintf(md->disk->disk_name, "dm-%d", minor);
+ 
+-	dax_dev = alloc_dax(md, md->disk->disk_name, &dm_dax_ops);
+-	if (!dax_dev)
+-		goto bad;
++	if (IS_ENABLED(CONFIG_DAX_DRIVER)) {
++		dax_dev = alloc_dax(md, md->disk->disk_name, &dm_dax_ops);
++		if (!dax_dev)
++			goto bad;
++	}
+ 	md->dax_dev = dax_dev;
+ 
+ 	add_disk_no_queue_reg(md->disk);
+* Unmerged path include/linux/dax.h
