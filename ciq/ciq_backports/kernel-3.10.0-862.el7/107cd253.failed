@@ -1,0 +1,200 @@
+x86/mm: Encrypt the initrd earlier for BSP microcode update
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] mm: Encrypt the initrd earlier for BSP microcode update (Suravee Suthikulpanit) [1540104]
+Rebuild_FUZZ: 96.49%
+commit-author Tom Lendacky <thomas.lendacky@amd.com>
+commit 107cd2532181b96c549e8f224cdcca8631c3076b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/107cd253.failed
+
+Currently the BSP microcode update code examines the initrd very early
+in the boot process.  If SME is active, the initrd is treated as being
+encrypted but it has not been encrypted (in place) yet.  Update the
+early boot code that encrypts the kernel to also encrypt the initrd so
+that early BSP microcode updates work.
+
+	Tested-by: Gabriel Craciunescu <nix.or.die@gmail.com>
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Reviewed-by: Borislav Petkov <bp@suse.de>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brijesh Singh <brijesh.singh@amd.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/20180110192634.6026.10452.stgit@tlendack-t1.amdoffice.net
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 107cd2532181b96c549e8f224cdcca8631c3076b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/mem_encrypt.h
+#	arch/x86/kernel/head64.c
+#	arch/x86/mm/mem_encrypt.c
+#	arch/x86/mm/mem_encrypt_boot.S
+diff --cc arch/x86/kernel/head64.c
+index 39ad3cdc4c78,7ba5d819ebe3..000000000000
+--- a/arch/x86/kernel/head64.c
++++ b/arch/x86/kernel/head64.c
+@@@ -31,11 -35,147 +31,151 @@@
+  /*
+   * Manage page tables very early on.
+   */
+ +extern pgd_t early_level4_pgt[PTRS_PER_PGD];
+  extern pmd_t early_dynamic_pgts[EARLY_DYNAMIC_PAGE_TABLES][PTRS_PER_PMD];
+ -static unsigned int __initdata next_early_pgt;
+ +static unsigned int __initdata next_early_pgt = 2;
+  pmdval_t early_pmd_flags = __PAGE_KERNEL_LARGE & ~(_PAGE_GLOBAL | _PAGE_NX);
+  
+++<<<<<<< HEAD
+++=======
++ #define __head	__section(.head.text)
++ 
++ static void __head *fixup_pointer(void *ptr, unsigned long physaddr)
++ {
++ 	return ptr - (void *)_text + (void *)physaddr;
++ }
++ 
++ unsigned long __head __startup_64(unsigned long physaddr,
++ 				  struct boot_params *bp)
++ {
++ 	unsigned long load_delta, *p;
++ 	unsigned long pgtable_flags;
++ 	pgdval_t *pgd;
++ 	p4dval_t *p4d;
++ 	pudval_t *pud;
++ 	pmdval_t *pmd, pmd_entry;
++ 	int i;
++ 	unsigned int *next_pgt_ptr;
++ 
++ 	/* Is the address too large? */
++ 	if (physaddr >> MAX_PHYSMEM_BITS)
++ 		for (;;);
++ 
++ 	/*
++ 	 * Compute the delta between the address I am compiled to run at
++ 	 * and the address I am actually running at.
++ 	 */
++ 	load_delta = physaddr - (unsigned long)(_text - __START_KERNEL_map);
++ 
++ 	/* Is the address not 2M aligned? */
++ 	if (load_delta & ~PMD_PAGE_MASK)
++ 		for (;;);
++ 
++ 	/* Activate Secure Memory Encryption (SME) if supported and enabled */
++ 	sme_enable(bp);
++ 
++ 	/* Include the SME encryption mask in the fixup value */
++ 	load_delta += sme_get_me_mask();
++ 
++ 	/* Fixup the physical addresses in the page table */
++ 
++ 	pgd = fixup_pointer(&early_top_pgt, physaddr);
++ 	pgd[pgd_index(__START_KERNEL_map)] += load_delta;
++ 
++ 	if (IS_ENABLED(CONFIG_X86_5LEVEL)) {
++ 		p4d = fixup_pointer(&level4_kernel_pgt, physaddr);
++ 		p4d[511] += load_delta;
++ 	}
++ 
++ 	pud = fixup_pointer(&level3_kernel_pgt, physaddr);
++ 	pud[510] += load_delta;
++ 	pud[511] += load_delta;
++ 
++ 	pmd = fixup_pointer(level2_fixmap_pgt, physaddr);
++ 	pmd[506] += load_delta;
++ 
++ 	/*
++ 	 * Set up the identity mapping for the switchover.  These
++ 	 * entries should *NOT* have the global bit set!  This also
++ 	 * creates a bunch of nonsense entries but that is fine --
++ 	 * it avoids problems around wraparound.
++ 	 */
++ 
++ 	next_pgt_ptr = fixup_pointer(&next_early_pgt, physaddr);
++ 	pud = fixup_pointer(early_dynamic_pgts[(*next_pgt_ptr)++], physaddr);
++ 	pmd = fixup_pointer(early_dynamic_pgts[(*next_pgt_ptr)++], physaddr);
++ 
++ 	pgtable_flags = _KERNPG_TABLE_NOENC + sme_get_me_mask();
++ 
++ 	if (IS_ENABLED(CONFIG_X86_5LEVEL)) {
++ 		p4d = fixup_pointer(early_dynamic_pgts[next_early_pgt++], physaddr);
++ 
++ 		i = (physaddr >> PGDIR_SHIFT) % PTRS_PER_PGD;
++ 		pgd[i + 0] = (pgdval_t)p4d + pgtable_flags;
++ 		pgd[i + 1] = (pgdval_t)p4d + pgtable_flags;
++ 
++ 		i = (physaddr >> P4D_SHIFT) % PTRS_PER_P4D;
++ 		p4d[i + 0] = (pgdval_t)pud + pgtable_flags;
++ 		p4d[i + 1] = (pgdval_t)pud + pgtable_flags;
++ 	} else {
++ 		i = (physaddr >> PGDIR_SHIFT) % PTRS_PER_PGD;
++ 		pgd[i + 0] = (pgdval_t)pud + pgtable_flags;
++ 		pgd[i + 1] = (pgdval_t)pud + pgtable_flags;
++ 	}
++ 
++ 	i = (physaddr >> PUD_SHIFT) % PTRS_PER_PUD;
++ 	pud[i + 0] = (pudval_t)pmd + pgtable_flags;
++ 	pud[i + 1] = (pudval_t)pmd + pgtable_flags;
++ 
++ 	pmd_entry = __PAGE_KERNEL_LARGE_EXEC & ~_PAGE_GLOBAL;
++ 	pmd_entry += sme_get_me_mask();
++ 	pmd_entry +=  physaddr;
++ 
++ 	for (i = 0; i < DIV_ROUND_UP(_end - _text, PMD_SIZE); i++) {
++ 		int idx = i + (physaddr >> PMD_SHIFT) % PTRS_PER_PMD;
++ 		pmd[idx] = pmd_entry + i * PMD_SIZE;
++ 	}
++ 
++ 	/*
++ 	 * Fixup the kernel text+data virtual addresses. Note that
++ 	 * we might write invalid pmds, when the kernel is relocated
++ 	 * cleanup_highmap() fixes this up along with the mappings
++ 	 * beyond _end.
++ 	 */
++ 
++ 	pmd = fixup_pointer(level2_kernel_pgt, physaddr);
++ 	for (i = 0; i < PTRS_PER_PMD; i++) {
++ 		if (pmd[i] & _PAGE_PRESENT)
++ 			pmd[i] += load_delta;
++ 	}
++ 
++ 	/*
++ 	 * Fixup phys_base - remove the memory encryption mask to obtain
++ 	 * the true physical address.
++ 	 */
++ 	p = fixup_pointer(&phys_base, physaddr);
++ 	*p += load_delta - sme_get_me_mask();
++ 
++ 	/* Encrypt the kernel and related (if SME is active) */
++ 	sme_encrypt_kernel(bp);
++ 
++ 	/*
++ 	 * Return the SME encryption mask (if SME is active) to be used as a
++ 	 * modifier for the initial pgdir entry programmed into CR3.
++ 	 */
++ 	return sme_get_me_mask();
++ }
++ 
++ unsigned long __startup_secondary_64(void)
++ {
++ 	/*
++ 	 * Return the SME encryption mask (if SME is active) to be used as a
++ 	 * modifier for the initial pgdir entry programmed into CR3.
++ 	 */
++ 	return sme_get_me_mask();
++ }
++ 
+++>>>>>>> 107cd2532181 (x86/mm: Encrypt the initrd earlier for BSP microcode update)
+  /* Wipe all early page tables except for the kernel symbol map */
+  static void __init reset_early_page_tables(void)
+  {
+* Unmerged path arch/x86/include/asm/mem_encrypt.h
+* Unmerged path arch/x86/mm/mem_encrypt.c
+* Unmerged path arch/x86/mm/mem_encrypt_boot.S
+* Unmerged path arch/x86/include/asm/mem_encrypt.h
+* Unmerged path arch/x86/kernel/head64.c
+* Unmerged path arch/x86/mm/mem_encrypt.c
+* Unmerged path arch/x86/mm/mem_encrypt_boot.S
