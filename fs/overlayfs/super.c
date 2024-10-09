@@ -624,7 +624,7 @@ static int ovl_mount_dir_noesc(const char *name, struct path *path)
 	return 0;
 
 out_put:
-	path_put(path);
+	path_put_init(path);
 out:
 	return err;
 }
@@ -642,7 +642,7 @@ static int ovl_mount_dir(const char *name, struct path *path)
 			if (ovl_dentry_remote(path->dentry)) {
 				pr_err("overlayfs: filesystem on '%s' not supported as upperdir\n",
 				       tmp);
-				path_put(path);
+				path_put_init(path);
 				err = -EINVAL;
 			}
 		kfree(tmp);
@@ -702,7 +702,7 @@ static int ovl_lower_dir(const char *name, struct path *path,
 	return 0;
 
 out_put:
-	path_put(path);
+	path_put_init(path);
 out:
 	return err;
 }
