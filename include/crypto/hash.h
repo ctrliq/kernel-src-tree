@@ -14,6 +14,7 @@
 #define _CRYPTO_HASH_H
 
 #include <linux/crypto.h>
+#include <linux/string.h>
 
 struct crypto_ahash;
 
@@ -242,6 +243,12 @@ static inline void ahash_request_free(struct ahash_request *req)
 	kzfree(req);
 }
 
+static inline void ahash_request_zero(struct ahash_request *req)
+{
+	memzero_explicit(req, sizeof(*req) +
+			      crypto_ahash_reqsize(crypto_ahash_reqtfm(req)));
+}
+
 static inline struct ahash_request *ahash_request_cast(
 	struct crypto_async_request *req)
 {
@@ -361,5 +368,11 @@ int crypto_shash_update(struct shash_desc *desc, const u8 *data,
 int crypto_shash_final(struct shash_desc *desc, u8 *out);
 int crypto_shash_finup(struct shash_desc *desc, const u8 *data,
 		       unsigned int len, u8 *out);
+
+static inline void shash_desc_zero(struct shash_desc *desc)
+{
+	memzero_explicit(desc,
+			 sizeof(*desc) + crypto_shash_descsize(desc->tfm));
+}
 
 #endif	/* _CRYPTO_HASH_H */
