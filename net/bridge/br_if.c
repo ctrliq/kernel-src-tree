@@ -434,6 +434,20 @@ int br_min_mtu(const struct net_bridge *br)
 	return mtu;
 }
 
+static void br_set_gso_limits(struct net_bridge *br)
+{
+	unsigned int gso_max_size = GSO_MAX_SIZE;
+	u16 gso_max_segs = GSO_MAX_SEGS;
+	const struct net_bridge_port *p;
+
+	list_for_each_entry(p, &br->port_list, list) {
+		gso_max_size = min(gso_max_size, p->dev->gso_max_size);
+		gso_max_segs = min(gso_max_segs, p->dev->gso_max_segs);
+	}
+	br->dev->gso_max_size = gso_max_size;
+	br->dev->gso_max_segs = gso_max_segs;
+}
+
 /*
  * Recomputes features using slave's features
  */
@@ -547,6 +561,7 @@ int br_add_if(struct net_bridge *br, struct net_device *dev)
 		call_netdevice_notifiers(NETDEV_CHANGEADDR, br->dev);
 
 	dev_set_mtu(br->dev, br_min_mtu(br));
+	br_set_gso_limits(br);
 
 	if (nbp_vlan_init(p))
 		netdev_err(dev, "failed to initialize vlan filtering on this port\n");
@@ -590,6 +605,7 @@ int br_del_if(struct net_bridge *br, struct net_device *dev)
 	del_nbp(p);
 
 	dev_set_mtu(br->dev, br_min_mtu(br));
+	br_set_gso_limits(br);
 
 	spin_lock_bh(&br->lock);
 	changed_addr = br_stp_recalculate_bridge_id(br);
