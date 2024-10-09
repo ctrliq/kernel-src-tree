@@ -1,0 +1,190 @@
+crypto: ccp - Move HMAC calculation down to ccp ops file
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [crypto] ccp - Move HMAC calculation down to ccp ops file (Suravee Suthikulpanit) [1390820]
+Rebuild_FUZZ: 92.31%
+commit-author Tom Lendacky <thomas.lendacky@amd.com>
+commit c11baa02c5d6ea06362fa61da070af34b7706c83
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/c11baa02.failed
+
+Move the support to perform an HMAC calculation into
+the CCP operations file.  This eliminates the need to
+perform a synchronous SHA operation used to calculate
+the HMAC.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit c11baa02c5d6ea06362fa61da070af34b7706c83)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/crypto/ccp/ccp-crypto-sha.c
+#	drivers/crypto/ccp/ccp-crypto.h
+* Unmerged path drivers/crypto/ccp/ccp-crypto-sha.c
+* Unmerged path drivers/crypto/ccp/ccp-crypto.h
+* Unmerged path drivers/crypto/ccp/ccp-crypto-sha.c
+* Unmerged path drivers/crypto/ccp/ccp-crypto.h
+diff --git a/drivers/crypto/ccp/ccp-ops.c b/drivers/crypto/ccp/ccp-ops.c
+index 26a77f79dd00..5d1496af1509 100644
+--- a/drivers/crypto/ccp/ccp-ops.c
++++ b/drivers/crypto/ccp/ccp-ops.c
+@@ -23,6 +23,7 @@
+ #include <linux/ccp.h>
+ #include <linux/scatterlist.h>
+ #include <crypto/scatterwalk.h>
++#include <crypto/sha.h>
+ 
+ #include "ccp-dev.h"
+ 
+@@ -132,6 +133,27 @@ struct ccp_op {
+ 	} u;
+ };
+ 
++/* SHA initial context values */
++static const __be32 ccp_sha1_init[CCP_SHA_CTXSIZE / sizeof(__be32)] = {
++	cpu_to_be32(SHA1_H0), cpu_to_be32(SHA1_H1),
++	cpu_to_be32(SHA1_H2), cpu_to_be32(SHA1_H3),
++	cpu_to_be32(SHA1_H4), 0, 0, 0,
++};
++
++static const __be32 ccp_sha224_init[CCP_SHA_CTXSIZE / sizeof(__be32)] = {
++	cpu_to_be32(SHA224_H0), cpu_to_be32(SHA224_H1),
++	cpu_to_be32(SHA224_H2), cpu_to_be32(SHA224_H3),
++	cpu_to_be32(SHA224_H4), cpu_to_be32(SHA224_H5),
++	cpu_to_be32(SHA224_H6), cpu_to_be32(SHA224_H7),
++};
++
++static const __be32 ccp_sha256_init[CCP_SHA_CTXSIZE / sizeof(__be32)] = {
++	cpu_to_be32(SHA256_H0), cpu_to_be32(SHA256_H1),
++	cpu_to_be32(SHA256_H2), cpu_to_be32(SHA256_H3),
++	cpu_to_be32(SHA256_H4), cpu_to_be32(SHA256_H5),
++	cpu_to_be32(SHA256_H6), cpu_to_be32(SHA256_H7),
++};
++
+ /* The CCP cannot perform zero-length sha operations so the caller
+  * is required to buffer data for the final operation.  However, a
+  * sha operation for a message with a total length of zero is valid
+@@ -1407,7 +1429,27 @@ static int ccp_run_sha_cmd(struct ccp_cmd_queue *cmd_q, struct ccp_cmd *cmd)
+ 	if (ret)
+ 		return ret;
+ 
+-	ccp_set_dm_area(&ctx, 0, sha->ctx, 0, sha->ctx_len);
++	if (sha->first) {
++		const __be32 *init;
++
++		switch (sha->type) {
++		case CCP_SHA_TYPE_1:
++			init = ccp_sha1_init;
++			break;
++		case CCP_SHA_TYPE_224:
++			init = ccp_sha224_init;
++			break;
++		case CCP_SHA_TYPE_256:
++			init = ccp_sha256_init;
++			break;
++		default:
++			ret = -EINVAL;
++			goto e_ctx;
++		}
++		memcpy(ctx.address, init, CCP_SHA_CTXSIZE);
++	} else
++		ccp_set_dm_area(&ctx, 0, sha->ctx, 0, sha->ctx_len);
++
+ 	ret = ccp_copy_to_ksb(cmd_q, &ctx, op.jobid, op.ksb_ctx,
+ 			      CCP_PASSTHRU_BYTESWAP_256BIT);
+ 	if (ret) {
+@@ -1447,6 +1489,66 @@ static int ccp_run_sha_cmd(struct ccp_cmd_queue *cmd_q, struct ccp_cmd *cmd)
+ 
+ 	ccp_get_dm_area(&ctx, 0, sha->ctx, 0, sha->ctx_len);
+ 
++	if (sha->final && sha->opad) {
++		/* HMAC operation, recursively perform final SHA */
++		struct ccp_cmd hmac_cmd;
++		struct scatterlist sg;
++		u64 block_size, digest_size;
++		u8 *hmac_buf;
++
++		switch (sha->type) {
++		case CCP_SHA_TYPE_1:
++			block_size = SHA1_BLOCK_SIZE;
++			digest_size = SHA1_DIGEST_SIZE;
++			break;
++		case CCP_SHA_TYPE_224:
++			block_size = SHA224_BLOCK_SIZE;
++			digest_size = SHA224_DIGEST_SIZE;
++			break;
++		case CCP_SHA_TYPE_256:
++			block_size = SHA256_BLOCK_SIZE;
++			digest_size = SHA256_DIGEST_SIZE;
++			break;
++		default:
++			ret = -EINVAL;
++			goto e_data;
++		}
++
++		if (sha->opad_len != block_size) {
++			ret = -EINVAL;
++			goto e_data;
++		}
++
++		hmac_buf = kmalloc(block_size + digest_size, GFP_KERNEL);
++		if (!hmac_buf) {
++			ret = -ENOMEM;
++			goto e_data;
++		}
++		sg_init_one(&sg, hmac_buf, block_size + digest_size);
++
++		scatterwalk_map_and_copy(hmac_buf, sha->opad, 0, block_size, 0);
++		memcpy(hmac_buf + block_size, ctx.address, digest_size);
++
++		memset(&hmac_cmd, 0, sizeof(hmac_cmd));
++		hmac_cmd.engine = CCP_ENGINE_SHA;
++		hmac_cmd.u.sha.type = sha->type;
++		hmac_cmd.u.sha.ctx = sha->ctx;
++		hmac_cmd.u.sha.ctx_len = sha->ctx_len;
++		hmac_cmd.u.sha.src = &sg;
++		hmac_cmd.u.sha.src_len = block_size + digest_size;
++		hmac_cmd.u.sha.opad = NULL;
++		hmac_cmd.u.sha.opad_len = 0;
++		hmac_cmd.u.sha.first = 1;
++		hmac_cmd.u.sha.final = 1;
++		hmac_cmd.u.sha.msg_bits = (block_size + digest_size) << 3;
++
++		ret = ccp_run_sha_cmd(cmd_q, &hmac_cmd);
++		if (ret)
++			cmd->engine_error = hmac_cmd.engine_error;
++
++		kfree(hmac_buf);
++	}
++
+ e_data:
+ 	ccp_free_data(&src, cmd_q);
+ 
+diff --git a/include/linux/ccp.h b/include/linux/ccp.h
+index e643e293eaee..0e768254e21b 100644
+--- a/include/linux/ccp.h
++++ b/include/linux/ccp.h
+@@ -232,6 +232,9 @@ enum ccp_sha_type {
+  * @ctx_len: length in bytes of hash value
+  * @src: data to be used for this operation
+  * @src_len: length in bytes of data used for this operation
++ * @opad: data to be used for final HMAC operation
++ * @opad_len: length in bytes of data used for final HMAC operation
++ * @first: indicates first SHA operation
+  * @final: indicates final SHA operation
+  * @msg_bits: total length of the message in bits used in final SHA operation
+  *
+@@ -251,6 +254,10 @@ struct ccp_sha_engine {
+ 	struct scatterlist *src;
+ 	u32 src_len;		/* In bytes */
+ 
++	struct scatterlist *opad;
++	u32 opad_len;		/* In bytes */
++
++	u32 first;		/* Indicates first sha cmd */
+ 	u32 final;		/* Indicates final sha cmd */
+ 	u64 msg_bits;		/* Message length in bits required for
+ 				 * final sha cmd */
