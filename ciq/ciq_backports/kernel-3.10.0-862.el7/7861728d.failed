@@ -1,0 +1,147 @@
+target: Add target_alloc_session() helper function
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [target] Add target_alloc_session() helper function (Maurizio Lombardi) [1366062]
+Rebuild_FUZZ: 91.30%
+commit-author Nicholas Bellinger <nab@linux-iscsi.org>
+commit 7861728d42338e1efac9d400c39319c1b5efd05c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/7861728d.failed
+
+Based on HCH's original patch, this adds a full version to
+support percpu-ida tag pre-allocation and callback function
+pointer into fabric driver code to complete session setup.
+
+	Reported-by: Christoph Hellwig <hch@lst.de>
+	Cc: Sagi Grimberg <sagig@mellanox.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Hannes Reinecke <hare@suse.de>
+	Cc: Andy Grover <agrover@redhat.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 7861728d42338e1efac9d400c39319c1b5efd05c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/target/target_core_fabric.h
+diff --cc include/target/target_core_fabric.h
+index 990942f22016,685a51aa98cc..000000000000
+--- a/include/target/target_core_fabric.h
++++ b/include/target/target_core_fabric.h
+@@@ -87,11 -86,34 +87,26 @@@ struct target_core_fabric_ops 
+  	struct se_tpg_np *(*fabric_make_np)(struct se_portal_group *,
+  				struct config_group *, const char *);
+  	void (*fabric_drop_np)(struct se_tpg_np *);
+ -	int (*fabric_init_nodeacl)(struct se_node_acl *, const char *);
+ -	void (*fabric_cleanup_nodeacl)(struct se_node_acl *);
+ -
+ -	struct configfs_attribute **tfc_discovery_attrs;
+ -	struct configfs_attribute **tfc_wwn_attrs;
+ -	struct configfs_attribute **tfc_tpg_base_attrs;
+ -	struct configfs_attribute **tfc_tpg_np_base_attrs;
+ -	struct configfs_attribute **tfc_tpg_attrib_attrs;
+ -	struct configfs_attribute **tfc_tpg_auth_attrs;
+ -	struct configfs_attribute **tfc_tpg_param_attrs;
+ -	struct configfs_attribute **tfc_tpg_nacl_base_attrs;
+ -	struct configfs_attribute **tfc_tpg_nacl_attrib_attrs;
+ -	struct configfs_attribute **tfc_tpg_nacl_auth_attrs;
+ -	struct configfs_attribute **tfc_tpg_nacl_param_attrs;
+ +	struct se_node_acl *(*fabric_make_nodeacl)(struct se_portal_group *,
+ +				struct config_group *, const char *);
+ +	void (*fabric_drop_nodeacl)(struct se_node_acl *);
+  };
+  
+++<<<<<<< HEAD
+++=======
++ int target_register_template(const struct target_core_fabric_ops *fo);
++ void target_unregister_template(const struct target_core_fabric_ops *fo);
++ 
++ int target_depend_item(struct config_item *item);
++ void target_undepend_item(struct config_item *item);
++ 
++ struct se_session *target_alloc_session(struct se_portal_group *,
++ 		unsigned int, unsigned int, enum target_prot_op prot_op,
++ 		const char *, void *,
++ 		int (*callback)(struct se_portal_group *,
++ 				struct se_session *, void *));
++ 
+++>>>>>>> 7861728d4233 (target: Add target_alloc_session() helper function)
+  struct se_session *transport_init_session(enum target_prot_op);
+  int transport_alloc_session_tags(struct se_session *, unsigned int,
+  		unsigned int);
+diff --git a/drivers/target/target_core_transport.c b/drivers/target/target_core_transport.c
+index 68bc47c2e404..b10e4d2370d1 100644
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@ -296,6 +296,17 @@ struct se_session *transport_init_session_tags(unsigned int tag_num,
+ 	struct se_session *se_sess;
+ 	int rc;
+ 
++	if (tag_num != 0 && !tag_size) {
++		pr_err("init_session_tags called with percpu-ida tag_num:"
++		       " %u, but zero tag_size\n", tag_num);
++		return ERR_PTR(-EINVAL);
++	}
++	if (!tag_num && tag_size) {
++		pr_err("init_session_tags called with percpu-ida tag_size:"
++		       " %u, but zero tag_num\n", tag_size);
++		return ERR_PTR(-EINVAL);
++	}
++
+ 	se_sess = transport_init_session(sup_prot_ops);
+ 	if (IS_ERR(se_sess))
+ 		return se_sess;
+@@ -390,6 +401,51 @@ void transport_register_session(
+ }
+ EXPORT_SYMBOL(transport_register_session);
+ 
++struct se_session *
++target_alloc_session(struct se_portal_group *tpg,
++		     unsigned int tag_num, unsigned int tag_size,
++		     enum target_prot_op prot_op,
++		     const char *initiatorname, void *private,
++		     int (*callback)(struct se_portal_group *,
++				     struct se_session *, void *))
++{
++	struct se_session *sess;
++
++	/*
++	 * If the fabric driver is using percpu-ida based pre allocation
++	 * of I/O descriptor tags, go ahead and perform that setup now..
++	 */
++	if (tag_num != 0)
++		sess = transport_init_session_tags(tag_num, tag_size, prot_op);
++	else
++		sess = transport_init_session(prot_op);
++
++	if (IS_ERR(sess))
++		return sess;
++
++	sess->se_node_acl = core_tpg_check_initiator_node_acl(tpg,
++					(unsigned char *)initiatorname);
++	if (!sess->se_node_acl) {
++		transport_free_session(sess);
++		return ERR_PTR(-EACCES);
++	}
++	/*
++	 * Go ahead and perform any remaining fabric setup that is
++	 * required before transport_register_session().
++	 */
++	if (callback != NULL) {
++		int rc = callback(tpg, sess, private);
++		if (rc) {
++			transport_free_session(sess);
++			return ERR_PTR(rc);
++		}
++	}
++
++	transport_register_session(tpg, sess->se_node_acl, sess, private);
++	return sess;
++}
++EXPORT_SYMBOL(target_alloc_session);
++
+ static void target_release_session(struct kref *kref)
+ {
+ 	struct se_session *se_sess = container_of(kref,
+* Unmerged path include/target/target_core_fabric.h
