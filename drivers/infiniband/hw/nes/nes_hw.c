@@ -1857,8 +1857,9 @@ int nes_init_nic_qp(struct nes_device *nesdev, struct net_device *netdev)
 	}
 	if ((nesdev->nesadapter->allow_unaligned_fpdus) &&
 		(nes_init_mgt_qp(nesdev, netdev, nesvnic))) {
-			nes_debug(NES_DBG_INIT, "%s: Out of memory for pau nic\n", netdev->name);
-			nes_destroy_nic_qp(nesvnic);
+		nes_debug(NES_DBG_INIT, "%s: Out of memory for pau nic\n",
+			  netdev->name);
+		nes_destroy_nic_qp(nesvnic);
 		return -ENOMEM;
 	}
 

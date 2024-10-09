@@ -887,10 +887,10 @@ void nes_clc(struct timer_list *t)
 	unsigned long flags;
 
 	spin_lock_irqsave(&nesadapter->phy_lock, flags);
-    nesadapter->link_interrupt_count[0] = 0;
-    nesadapter->link_interrupt_count[1] = 0;
-    nesadapter->link_interrupt_count[2] = 0;
-    nesadapter->link_interrupt_count[3] = 0;
+	nesadapter->link_interrupt_count[0] = 0;
+	nesadapter->link_interrupt_count[1] = 0;
+	nesadapter->link_interrupt_count[2] = 0;
+	nesadapter->link_interrupt_count[3] = 0;
 	spin_unlock_irqrestore(&nesadapter->phy_lock, flags);
 
 	nesadapter->lc_timer.expires = jiffies + 3600 * HZ;  /* 1 hour */
