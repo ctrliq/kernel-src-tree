@@ -291,7 +291,7 @@ static int _ctx_stats_seq_show(struct seq_file *s, void *v)
 	spos = v;
 	i = *spos;
 
-	rcd = hfi1_rcd_get_by_index(dd, i);
+	rcd = hfi1_rcd_get_by_index_safe(dd, i);
 	if (!rcd)
 		return SEQ_SKIP;
 
@@ -450,7 +450,7 @@ static int _rcds_seq_show(struct seq_file *s, void *v)
 	loff_t *spos = v;
 	loff_t i = *spos;
 
-	rcd = hfi1_rcd_get_by_index(dd, i);
+	rcd = hfi1_rcd_get_by_index_safe(dd, i);
 	if (rcd)
 		seqfile_dump_rcd(s, rcd);
 	hfi1_rcd_put(rcd);
