@@ -1,0 +1,123 @@
+nfp: flower: add ipv4 set ttl and tos offload
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Pieter Jansen van Vuuren <pieter.jansenvanvuuren@netronome.com>
+commit a3c6b063fee70a7ceae385741210f39b1ec2ab94
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/a3c6b063.failed
+
+Add ipv4 set ttl and tos action offload. Since pedit sets headers per 4
+byte word, we need to ensure that setting either version, ihl, protocol,
+total length or checksum does not get offloaded.
+
+	Signed-off-by: Pieter Jansen van Vuuren <pieter.jansenvanvuuren@netronome.com>
+	Reviewed-by: John Hurley <john.hurley@netronome.com>
+	Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a3c6b063fee70a7ceae385741210f39b1ec2ab94)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/flower/action.c
+diff --cc drivers/net/ethernet/netronome/nfp/flower/action.c
+index 7e0903bc6007,b79b924ef56d..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/action.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/action.c
+@@@ -453,18 -534,40 +497,20 @@@ nfp_fl_set_tport(const struct tc_actio
+  	return 0;
+  }
+  
+ -static u32 nfp_fl_csum_l4_to_flag(u8 ip_proto)
+ -{
+ -	switch (ip_proto) {
+ -	case 0:
+ -		/* Filter doesn't force proto match,
+ -		 * both TCP and UDP will be updated if encountered
+ -		 */
+ -		return TCA_CSUM_UPDATE_FLAG_TCP | TCA_CSUM_UPDATE_FLAG_UDP;
+ -	case IPPROTO_TCP:
+ -		return TCA_CSUM_UPDATE_FLAG_TCP;
+ -	case IPPROTO_UDP:
+ -		return TCA_CSUM_UPDATE_FLAG_UDP;
+ -	default:
+ -		/* All other protocols will be ignored by FW */
+ -		return 0;
+ -	}
+ -}
+ -
+  static int
+ -nfp_fl_pedit(const struct tc_action *action, struct tc_cls_flower_offload *flow,
+ -	     char *nfp_action, int *a_len, u32 *csum_updated)
+ +nfp_fl_pedit(const struct tc_action *action, char *nfp_action, int *a_len)
+  {
+  	struct nfp_fl_set_ipv6_addr set_ip6_dst, set_ip6_src;
++ 	struct nfp_fl_set_ip4_ttl_tos set_ip_ttl_tos;
+  	struct nfp_fl_set_ip4_addrs set_ip_addr;
+  	struct nfp_fl_set_tport set_tport;
+  	struct nfp_fl_set_eth set_eth;
+  	enum pedit_header_type htype;
+  	int idx, nkeys, err;
+ -	size_t act_size = 0;
+ +	size_t act_size;
+  	u32 offset, cmd;
+ -	u8 ip_proto = 0;
+  
++ 	memset(&set_ip_ttl_tos, 0, sizeof(set_ip_ttl_tos));
+  	memset(&set_ip6_dst, 0, sizeof(set_ip6_dst));
+  	memset(&set_ip6_src, 0, sizeof(set_ip6_src));
+  	memset(&set_ip_addr, 0, sizeof(set_ip_addr));
+@@@ -510,7 -623,19 +557,23 @@@
+  		act_size = sizeof(set_eth);
+  		memcpy(nfp_action, &set_eth, act_size);
+  		*a_len += act_size;
+++<<<<<<< HEAD
+ +	} else if (set_ip_addr.head.len_lw) {
+++=======
++ 	}
++ 	if (set_ip_ttl_tos.head.len_lw) {
++ 		nfp_action += act_size;
++ 		act_size = sizeof(set_ip_ttl_tos);
++ 		memcpy(nfp_action, &set_ip_ttl_tos, act_size);
++ 		*a_len += act_size;
++ 
++ 		/* Hardware will automatically fix IPv4 and TCP/UDP checksum. */
++ 		*csum_updated |= TCA_CSUM_UPDATE_FLAG_IPV4HDR |
++ 				nfp_fl_csum_l4_to_flag(ip_proto);
++ 	}
++ 	if (set_ip_addr.head.len_lw) {
++ 		nfp_action += act_size;
+++>>>>>>> a3c6b063fee7 (nfp: flower: add ipv4 set ttl and tos offload)
+  		act_size = sizeof(set_ip_addr);
+  		memcpy(nfp_action, &set_ip_addr, act_size);
+  		*a_len += act_size;
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/action.c
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/cmsg.h b/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
+index 062d7040a0dc..3a835744d0ad 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
++++ b/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
+@@ -95,6 +95,7 @@
+ #define NFP_FL_ACTION_OPCODE_SET_IPV4_TUNNEL	6
+ #define NFP_FL_ACTION_OPCODE_SET_ETHERNET	7
+ #define NFP_FL_ACTION_OPCODE_SET_IPV4_ADDRS	9
++#define NFP_FL_ACTION_OPCODE_SET_IPV4_TTL_TOS	10
+ #define NFP_FL_ACTION_OPCODE_SET_IPV6_SRC	11
+ #define NFP_FL_ACTION_OPCODE_SET_IPV6_DST	12
+ #define NFP_FL_ACTION_OPCODE_SET_UDP		14
+@@ -151,6 +152,15 @@ struct nfp_fl_set_ip4_addrs {
+ 	__be32 ipv4_dst;
+ };
+ 
++struct nfp_fl_set_ip4_ttl_tos {
++	struct nfp_fl_act_head head;
++	u8 ipv4_ttl_mask;
++	u8 ipv4_tos_mask;
++	u8 ipv4_ttl;
++	u8 ipv4_tos;
++	__be16 reserved;
++};
++
+ struct nfp_fl_set_ipv6_addr {
+ 	struct nfp_fl_act_head head;
+ 	__be16 reserved;
