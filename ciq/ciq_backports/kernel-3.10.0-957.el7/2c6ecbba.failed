@@ -1,0 +1,371 @@
+Input: synaptics - add synaptics_query_int()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [input] synaptics - add synaptics_query_int() (Benjamin Tissoires) [1554926]
+Rebuild_FUZZ: 91.36%
+commit-author Dmitry Torokhov <dmitry.torokhov@gmail.com>
+commit 2c6ecbba90d4e909bdc8982b4a2318e99d7fc4f2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/2c6ecbba.failed
+
+Factor out querying and parsing 3-byte response into an integer value.
+
+	Reviewed-by: Benjamin Tissoires <benjamin.tissoires@redhat.com>
+	Signed-off-by: Dmitry Torokhov <dmitry.torokhov@gmail.com>
+(cherry picked from commit 2c6ecbba90d4e909bdc8982b4a2318e99d7fc4f2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/input/mouse/synaptics.c
+diff --cc drivers/input/mouse/synaptics.c
+index 5f5887ef5b0a,da9ca356a7e3..000000000000
+--- a/drivers/input/mouse/synaptics.c
++++ b/drivers/input/mouse/synaptics.c
+@@@ -196,6 -162,327 +196,330 @@@ static const char * const topbuttonpad_
+  	NULL
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static const char * const smbus_pnp_ids[] = {
++ 	/* all of the topbuttonpad_pnp_ids are valid, we just add some extras */
++ 	"LEN0048", /* X1 Carbon 3 */
++ 	"LEN0046", /* X250 */
++ 	"LEN004a", /* W541 */
++ 	"LEN200f", /* T450s */
++ 	NULL
++ };
++ 
++ /*
++  * Send a command to the synpatics touchpad by special commands
++  */
++ static int synaptics_send_cmd(struct psmouse *psmouse,
++ 			      unsigned char c, unsigned char *param)
++ {
++ 	int error;
++ 
++ 	error = psmouse_sliced_command(psmouse, c);
++ 	if (error)
++ 		return error;
++ 
++ 	error = ps2_command(&psmouse->ps2dev, param, PSMOUSE_CMD_GETINFO);
++ 	if (error)
++ 		return error;
++ 
++ 	return 0;
++ }
++ 
++ static int synaptics_query_int(struct psmouse *psmouse, u8 query_cmd, u32 *val)
++ {
++ 	int error;
++ 	union {
++ 		__be32 be_val;
++ 		char buf[4];
++ 	} resp = { 0 };
++ 
++ 	error = synaptics_send_cmd(psmouse, query_cmd, resp.buf + 1);
++ 	if (error)
++ 		return error;
++ 
++ 	*val = be32_to_cpu(resp.be_val);
++ 	return 0;
++ }
++ 
++ /*
++  * Identify Touchpad
++  * See also the SYN_ID_* macros
++  */
++ static int synaptics_identify(struct psmouse *psmouse,
++ 			      struct synaptics_device_info *info)
++ {
++ 	int error;
++ 
++ 	error = synaptics_query_int(psmouse, SYN_QUE_IDENTIFY, &info->identity);
++ 	if (error)
++ 		return error;
++ 
++ 	return SYN_ID_IS_SYNAPTICS(info->identity) ? 0 : -ENXIO;
++ }
++ 
++ /*
++  * Read the model-id bytes from the touchpad
++  * see also SYN_MODEL_* macros
++  */
++ static int synaptics_model_id(struct psmouse *psmouse,
++ 			      struct synaptics_device_info *info)
++ {
++ 	return synaptics_query_int(psmouse, SYN_QUE_MODEL, &info->model_id);
++ }
++ 
++ /*
++  * Read the firmware id from the touchpad
++  */
++ static int synaptics_firmware_id(struct psmouse *psmouse,
++ 				 struct synaptics_device_info *info)
++ {
++ 	return synaptics_query_int(psmouse, SYN_QUE_FIRMWARE_ID,
++ 				   &info->firmware_id);
++ }
++ 
++ /*
++  * Read the board id and the "More Extended Queries" from the touchpad
++  * The board id is encoded in the "QUERY MODES" response
++  */
++ static int synaptics_query_modes(struct psmouse *psmouse,
++ 				 struct synaptics_device_info *info)
++ {
++ 	unsigned char bid[3];
++ 	int error;
++ 
++ 	/* firmwares prior 7.5 have no board_id encoded */
++ 	if (SYN_ID_FULL(info->identity) < 0x705)
++ 		return 0;
++ 
++ 	error = synaptics_send_cmd(psmouse, SYN_QUE_MODES, bid);
++ 	if (error)
++ 		return error;
++ 
++ 	info->board_id = ((bid[0] & 0xfc) << 6) | bid[1];
++ 
++ 	if (SYN_MEXT_CAP_BIT(bid[0]))
++ 		return synaptics_query_int(psmouse, SYN_QUE_MEXT_CAPAB_10,
++ 					   &info->ext_cap_10);
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * Read the capability-bits from the touchpad
++  * see also the SYN_CAP_* macros
++  */
++ static int synaptics_capability(struct psmouse *psmouse,
++ 				struct synaptics_device_info *info)
++ {
++ 	int error;
++ 
++ 	error = synaptics_query_int(psmouse, SYN_QUE_CAPABILITIES,
++ 				    &info->capabilities);
++ 	if (error)
++ 		return error;
++ 
++ 	info->ext_cap = info->ext_cap_0c = 0;
++ 
++ 	/*
++ 	 * Older firmwares had submodel ID fixed to 0x47
++ 	 */
++ 	if (SYN_ID_FULL(info->identity) < 0x705 &&
++ 	    SYN_CAP_SUBMODEL_ID(info->capabilities) != 0x47) {
++ 		return -ENXIO;
++ 	}
++ 
++ 	/*
++ 	 * Unless capExtended is set the rest of the flags should be ignored
++ 	 */
++ 	if (!SYN_CAP_EXTENDED(info->capabilities))
++ 		info->capabilities = 0;
++ 
++ 	if (SYN_EXT_CAP_REQUESTS(info->capabilities) >= 1) {
++ 		error = synaptics_query_int(psmouse, SYN_QUE_EXT_CAPAB,
++ 					    &info->ext_cap);
++ 		if (error) {
++ 			psmouse_warn(psmouse,
++ 				     "device claims to have extended capabilities, but I'm not able to read them.\n");
++ 		} else {
++ 			/*
++ 			 * if nExtBtn is greater than 8 it should be considered
++ 			 * invalid and treated as 0
++ 			 */
++ 			if (SYN_CAP_MULTI_BUTTON_NO(info->ext_cap) > 8)
++ 				info->ext_cap &= ~SYN_CAP_MB_MASK;
++ 		}
++ 	}
++ 
++ 	if (SYN_EXT_CAP_REQUESTS(info->capabilities) >= 4) {
++ 		error = synaptics_query_int(psmouse, SYN_QUE_EXT_CAPAB_0C,
++ 					    &info->ext_cap_0c);
++ 		if (error)
++ 			psmouse_warn(psmouse,
++ 				     "device claims to have extended capability 0x0c, but I'm not able to read it.\n");
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * Read touchpad resolution and maximum reported coordinates
++  * Resolution is left zero if touchpad does not support the query
++  */
++ static int synaptics_resolution(struct psmouse *psmouse,
++ 				struct synaptics_device_info *info)
++ {
++ 	unsigned char resp[3];
++ 	int error;
++ 
++ 	if (SYN_ID_MAJOR(info->identity) < 4)
++ 		return 0;
++ 
++ 	error = synaptics_send_cmd(psmouse, SYN_QUE_RESOLUTION, resp);
++ 	if (!error) {
++ 		if (resp[0] != 0 && (resp[1] & 0x80) && resp[2] != 0) {
++ 			info->x_res = resp[0]; /* x resolution in units/mm */
++ 			info->y_res = resp[2]; /* y resolution in units/mm */
++ 		}
++ 	}
++ 
++ 	if (SYN_EXT_CAP_REQUESTS(info->capabilities) >= 5 &&
++ 	    SYN_CAP_MAX_DIMENSIONS(info->ext_cap_0c)) {
++ 		error = synaptics_send_cmd(psmouse,
++ 					   SYN_QUE_EXT_MAX_COORDS, resp);
++ 		if (error) {
++ 			psmouse_warn(psmouse,
++ 				     "device claims to have max coordinates query, but I'm not able to read it.\n");
++ 		} else {
++ 			info->x_max = (resp[0] << 5) | ((resp[1] & 0x0f) << 1);
++ 			info->y_max = (resp[2] << 5) | ((resp[1] & 0xf0) >> 3);
++ 			psmouse_info(psmouse,
++ 				     "queried max coordinates: x [..%d], y [..%d]\n",
++ 				     info->x_max, info->y_max);
++ 		}
++ 	}
++ 
++ 	if (SYN_CAP_MIN_DIMENSIONS(info->ext_cap_0c) &&
++ 	    (SYN_EXT_CAP_REQUESTS(info->capabilities) >= 7 ||
++ 	     /*
++ 	      * Firmware v8.1 does not report proper number of extended
++ 	      * capabilities, but has been proven to report correct min
++ 	      * coordinates.
++ 	      */
++ 	     SYN_ID_FULL(info->identity) == 0x801)) {
++ 		error = synaptics_send_cmd(psmouse,
++ 					   SYN_QUE_EXT_MIN_COORDS, resp);
++ 		if (error) {
++ 			psmouse_warn(psmouse,
++ 				     "device claims to have min coordinates query, but I'm not able to read it.\n");
++ 		} else {
++ 			info->x_min = (resp[0] << 5) | ((resp[1] & 0x0f) << 1);
++ 			info->y_min = (resp[2] << 5) | ((resp[1] & 0xf0) >> 3);
++ 			psmouse_info(psmouse,
++ 				     "queried min coordinates: x [%d..], y [%d..]\n",
++ 				     info->x_min, info->y_min);
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int synaptics_query_hardware(struct psmouse *psmouse,
++ 				    struct synaptics_device_info *info)
++ {
++ 	int error;
++ 
++ 	error = synaptics_identify(psmouse, info);
++ 	if (error)
++ 		return error;
++ 
++ 	error = synaptics_model_id(psmouse, info);
++ 	if (error)
++ 		return error;
++ 
++ 	error = synaptics_firmware_id(psmouse, info);
++ 	if (error)
++ 		return error;
++ 
++ 	error = synaptics_query_modes(psmouse, info);
++ 	if (error)
++ 		return error;
++ 
++ 	error = synaptics_capability(psmouse, info);
++ 	if (error)
++ 		return error;
++ 
++ 	error = synaptics_resolution(psmouse, info);
++ 	if (error)
++ 		return error;
++ 
++ 	return 0;
++ }
++ 
++ #endif /* CONFIG_MOUSE_PS2_SYNAPTICS || CONFIG_MOUSE_PS2_SYNAPTICS_SMBUS */
++ 
++ #ifdef CONFIG_MOUSE_PS2_SYNAPTICS
++ 
++ static bool cr48_profile_sensor;
++ 
++ #define ANY_BOARD_ID 0
++ struct min_max_quirk {
++ 	const char * const *pnp_ids;
++ 	struct {
++ 		u32 min, max;
++ 	} board_id;
++ 	u32 x_min, x_max, y_min, y_max;
++ };
++ 
++ static const struct min_max_quirk min_max_pnpid_table[] = {
++ 	{
++ 		(const char * const []){"LEN0033", NULL},
++ 		{ANY_BOARD_ID, ANY_BOARD_ID},
++ 		1024, 5052, 2258, 4832
++ 	},
++ 	{
++ 		(const char * const []){"LEN0042", NULL},
++ 		{ANY_BOARD_ID, ANY_BOARD_ID},
++ 		1232, 5710, 1156, 4696
++ 	},
++ 	{
++ 		(const char * const []){"LEN0034", "LEN0036", "LEN0037",
++ 					"LEN0039", "LEN2002", "LEN2004",
++ 					NULL},
++ 		{ANY_BOARD_ID, 2961},
++ 		1024, 5112, 2024, 4832
++ 	},
++ 	{
++ 		(const char * const []){"LEN2000", NULL},
++ 		{ANY_BOARD_ID, ANY_BOARD_ID},
++ 		1024, 5113, 2021, 4832
++ 	},
++ 	{
++ 		(const char * const []){"LEN2001", NULL},
++ 		{ANY_BOARD_ID, ANY_BOARD_ID},
++ 		1024, 5022, 2508, 4832
++ 	},
++ 	{
++ 		(const char * const []){"LEN2006", NULL},
++ 		{2691, 2691},
++ 		1024, 5045, 2457, 4832
++ 	},
++ 	{
++ 		(const char * const []){"LEN2006", NULL},
++ 		{ANY_BOARD_ID, ANY_BOARD_ID},
++ 		1264, 5675, 1171, 4688
++ 	},
++ 	{ }
++ };
++ 
++ /* This list has been kindly provided by Synaptics. */
++ static const char * const forcepad_pnp_ids[] = {
++ 	"SYN300D",
++ 	"SYN3014",
++ 	NULL
++ };
++ 
+++>>>>>>> 2c6ecbba90d4 (Input: synaptics - add synaptics_query_int())
+  /*****************************************************************************
+   *	Synaptics communications functions
+   ****************************************************************************/
+* Unmerged path drivers/input/mouse/synaptics.c
+diff --git a/drivers/input/mouse/synaptics.h b/drivers/input/mouse/synaptics.h
+index 1b0e490b1040..2491754bc2e5 100644
+--- a/drivers/input/mouse/synaptics.h
++++ b/drivers/input/mouse/synaptics.h
+@@ -52,7 +52,8 @@
+ #define SYN_CAP_PALMDETECT(c)		((c) & (1 << 0))
+ #define SYN_CAP_SUBMODEL_ID(c)		(((c) & 0x00ff00) >> 8)
+ #define SYN_EXT_CAP_REQUESTS(c)		(((c) & 0x700000) >> 20)
+-#define SYN_CAP_MULTI_BUTTON_NO(ec)	(((ec) & 0x00f000) >> 12)
++#define SYN_CAP_MB_MASK			GENMASK(15, 12)
++#define SYN_CAP_MULTI_BUTTON_NO(ec)	(((ec) & SYN_CAP_MB_MASK) >> 12)
+ #define SYN_CAP_PRODUCT_ID(ec)		(((ec) & 0xff0000) >> 16)
+ #define SYN_MEXT_CAP_BIT(m)		((m) & (1 << 1))
+ 
