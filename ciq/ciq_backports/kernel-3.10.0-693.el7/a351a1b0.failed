@@ -1,0 +1,156 @@
+net/mlx5: Introduce bulk reading of flow counters
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [netdrv] mlx5: Introduce bulk reading of flow counters (Don Dutile) [1385330 1417284]
+Rebuild_FUZZ: 95.74%
+commit-author Amir Vadai <amir@vadai.me>
+commit a351a1b03bf169f77891060be30036ef71cbe618
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/a351a1b0.failed
+
+This commit utilize the ability of ConnectX-4 to bulk read flow counters.
+Few bulk counter queries could be done instead of issuing thousands of
+firmware commands per second to get statistics of all flows set to HW,
+such as those programmed when we offload tc filters.
+
+Counters are stored sorted by hardware id, and queried in blocks (id +
+number of counters).
+
+Due to hardware requirement, start of block and number of counters in a
+block must be four aligned.
+
+	Reviewed-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: Amir Vadai <amir@vadai.me>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a351a1b03bf169f77891060be30036ef71cbe618)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/fs_counters.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/fs_counters.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.c b/drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.c
+index 9255fb6f5d9d..25d33ee9a8fb 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.c
+@@ -356,3 +356,70 @@ int mlx5_cmd_fc_query(struct mlx5_core_dev *dev, u16 id,
+ 
+ 	return 0;
+ }
++
++struct mlx5_cmd_fc_bulk {
++	u16 id;
++	int num;
++	int outlen;
++	u32 out[0];
++};
++
++struct mlx5_cmd_fc_bulk *
++mlx5_cmd_fc_bulk_alloc(struct mlx5_core_dev *dev, u16 id, int num)
++{
++	struct mlx5_cmd_fc_bulk *b;
++	int outlen = sizeof(*b) +
++		MLX5_ST_SZ_BYTES(query_flow_counter_out) +
++		MLX5_ST_SZ_BYTES(traffic_counter) * num;
++
++	b = kzalloc(outlen, GFP_KERNEL);
++	if (!b)
++		return NULL;
++
++	b->id = id;
++	b->num = num;
++	b->outlen = outlen;
++
++	return b;
++}
++
++void mlx5_cmd_fc_bulk_free(struct mlx5_cmd_fc_bulk *b)
++{
++	kfree(b);
++}
++
++int
++mlx5_cmd_fc_bulk_query(struct mlx5_core_dev *dev, struct mlx5_cmd_fc_bulk *b)
++{
++	u32 in[MLX5_ST_SZ_DW(query_flow_counter_in)];
++
++	memset(in, 0, sizeof(in));
++
++	MLX5_SET(query_flow_counter_in, in, opcode,
++		 MLX5_CMD_OP_QUERY_FLOW_COUNTER);
++	MLX5_SET(query_flow_counter_in, in, op_mod, 0);
++	MLX5_SET(query_flow_counter_in, in, flow_counter_id, b->id);
++	MLX5_SET(query_flow_counter_in, in, num_of_counters, b->num);
++
++	return mlx5_cmd_exec_check_status(dev, in, sizeof(in),
++					  b->out, b->outlen);
++}
++
++void mlx5_cmd_fc_bulk_get(struct mlx5_core_dev *dev,
++			  struct mlx5_cmd_fc_bulk *b, u16 id,
++			  u64 *packets, u64 *bytes)
++{
++	int index = id - b->id;
++	void *stats;
++
++	if (index < 0 || index >= b->num) {
++		mlx5_core_warn(dev, "Flow counter id (0x%x) out of range (0x%x..0x%x). Counter ignored.\n",
++			       id, b->id, b->id + b->num - 1);
++		return;
++	}
++
++	stats = MLX5_ADDR_OF(query_flow_counter_out, b->out,
++			     flow_statistics[index]);
++	*packets = MLX5_GET64(traffic_counter, stats, packets);
++	*bytes = MLX5_GET64(traffic_counter, stats, octets);
++}
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.h b/drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.h
+index ef9e0168938b..8aacf761815e 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.h
+@@ -74,4 +74,16 @@ int mlx5_cmd_fc_alloc(struct mlx5_core_dev *dev, u16 *id);
+ int mlx5_cmd_fc_free(struct mlx5_core_dev *dev, u16 id);
+ int mlx5_cmd_fc_query(struct mlx5_core_dev *dev, u16 id,
+ 		      u64 *packets, u64 *bytes);
++
++struct mlx5_cmd_fc_bulk;
++
++struct mlx5_cmd_fc_bulk *
++mlx5_cmd_fc_bulk_alloc(struct mlx5_core_dev *dev, u16 id, int num);
++void mlx5_cmd_fc_bulk_free(struct mlx5_cmd_fc_bulk *b);
++int
++mlx5_cmd_fc_bulk_query(struct mlx5_core_dev *dev, struct mlx5_cmd_fc_bulk *b);
++void mlx5_cmd_fc_bulk_get(struct mlx5_core_dev *dev,
++			  struct mlx5_cmd_fc_bulk *b, u16 id,
++			  u64 *packets, u64 *bytes);
++
+ #endif
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/fs_counters.c
+diff --git a/include/linux/mlx5/mlx5_ifc.h b/include/linux/mlx5/mlx5_ifc.h
+index 0bcf75be23ff..291219cde88c 100644
+--- a/include/linux/mlx5/mlx5_ifc.h
++++ b/include/linux/mlx5/mlx5_ifc.h
+@@ -893,7 +893,10 @@ struct mlx5_ifc_cmd_hca_cap_bits {
+ 	u8         reserved_at_330[0xb];
+ 	u8         log_max_xrcd[0x5];
+ 
+-	u8         reserved_at_340[0x20];
++	u8         reserved_at_340[0x8];
++	u8         log_max_flow_counter_bulk[0x8];
++	u8         max_flow_counter[0x10];
++
+ 
+ 	u8         reserved_at_360[0x3];
+ 	u8         log_max_rq[0x5];
+@@ -978,7 +981,8 @@ struct mlx5_ifc_dest_format_struct_bits {
+ };
+ 
+ struct mlx5_ifc_flow_counter_list_bits {
+-	u8         reserved_at_0[0x10];
++	u8         clear[0x1];
++	u8         num_of_counters[0xf];
+ 	u8         flow_counter_id[0x10];
+ 
+ 	u8         reserved_at_20[0x20];
