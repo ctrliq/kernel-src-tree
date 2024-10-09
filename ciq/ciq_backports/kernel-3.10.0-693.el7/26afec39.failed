@@ -1,0 +1,125 @@
+r8152: avoid start_xmit to call napi_schedule during autosuspend
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author hayeswang <hayeswang@realtek.com>
+commit 26afec39306926654e9cd320f19bbf3685bb0997
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/26afec39.failed
+
+Adjust the setting of the flag of SELECTIVE_SUSPEND to prevent start_xmit()
+from calling napi_schedule() directly during runtime suspend.
+
+After calling napi_disable() or clearing the flag of WORK_ENABLE,
+scheduling the napi is useless.
+
+	Signed-off-by: Hayes Wang <hayeswang@realtek.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 26afec39306926654e9cd320f19bbf3685bb0997)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/usb/r8152.c
+diff --cc drivers/net/usb/r8152.c
+index 75c63121e793,23bef8e6e0bd..000000000000
+--- a/drivers/net/usb/r8152.c
++++ b/drivers/net/usb/r8152.c
+@@@ -3549,6 -3580,80 +3549,83 @@@ static bool delay_autosuspend(struct r8
+  		return false;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int rtl8152_rumtime_suspend(struct r8152 *tp)
++ {
++ 	struct net_device *netdev = tp->netdev;
++ 	int ret = 0;
++ 
++ 	set_bit(SELECTIVE_SUSPEND, &tp->flags);
++ 	smp_mb__after_atomic();
++ 
++ 	if (netif_running(netdev) && test_bit(WORK_ENABLE, &tp->flags)) {
++ 		u32 rcr = 0;
++ 
++ 		if (delay_autosuspend(tp)) {
++ 			clear_bit(SELECTIVE_SUSPEND, &tp->flags);
++ 			smp_mb__after_atomic();
++ 			ret = -EBUSY;
++ 			goto out1;
++ 		}
++ 
++ 		if (netif_carrier_ok(netdev)) {
++ 			u32 ocp_data;
++ 
++ 			rcr = ocp_read_dword(tp, MCU_TYPE_PLA, PLA_RCR);
++ 			ocp_data = rcr & ~RCR_ACPT_ALL;
++ 			ocp_write_dword(tp, MCU_TYPE_PLA, PLA_RCR, ocp_data);
++ 			rxdy_gated_en(tp, true);
++ 			ocp_data = ocp_read_byte(tp, MCU_TYPE_PLA,
++ 						 PLA_OOB_CTRL);
++ 			if (!(ocp_data & RXFIFO_EMPTY)) {
++ 				rxdy_gated_en(tp, false);
++ 				ocp_write_dword(tp, MCU_TYPE_PLA, PLA_RCR, rcr);
++ 				clear_bit(SELECTIVE_SUSPEND, &tp->flags);
++ 				smp_mb__after_atomic();
++ 				ret = -EBUSY;
++ 				goto out1;
++ 			}
++ 		}
++ 
++ 		clear_bit(WORK_ENABLE, &tp->flags);
++ 		usb_kill_urb(tp->intr_urb);
++ 
++ 		tp->rtl_ops.autosuspend_en(tp, true);
++ 
++ 		if (netif_carrier_ok(netdev)) {
++ 			napi_disable(&tp->napi);
++ 			rtl_stop_rx(tp);
++ 			rxdy_gated_en(tp, false);
++ 			ocp_write_dword(tp, MCU_TYPE_PLA, PLA_RCR, rcr);
++ 			napi_enable(&tp->napi);
++ 		}
++ 	}
++ 
++ out1:
++ 	return ret;
++ }
++ 
++ static int rtl8152_system_suspend(struct r8152 *tp)
++ {
++ 	struct net_device *netdev = tp->netdev;
++ 	int ret = 0;
++ 
++ 	netif_device_detach(netdev);
++ 
++ 	if (netif_running(netdev) && test_bit(WORK_ENABLE, &tp->flags)) {
++ 		clear_bit(WORK_ENABLE, &tp->flags);
++ 		usb_kill_urb(tp->intr_urb);
++ 		napi_disable(&tp->napi);
++ 		cancel_delayed_work_sync(&tp->schedule);
++ 		tp->rtl_ops.down(tp);
++ 		napi_enable(&tp->napi);
++ 	}
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> 26afec393069 (r8152: avoid start_xmit to call napi_schedule during autosuspend)
+  static int rtl8152_suspend(struct usb_interface *intf, pm_message_t message)
+  {
+  	struct r8152 *tp = usb_get_intfdata(intf);
+@@@ -3601,8 -3685,7 +3678,12 @@@ static int rtl8152_resume(struct usb_in
+  
+  	if (netif_running(tp->netdev) && tp->netdev->flags & IFF_UP) {
+  		if (test_bit(SELECTIVE_SUSPEND, &tp->flags)) {
+++<<<<<<< HEAD
+ +			rtl_runtime_suspend_enable(tp, false);
+ +			clear_bit(SELECTIVE_SUSPEND, &tp->flags);
+++=======
++ 			tp->rtl_ops.autosuspend_en(tp, false);
+++>>>>>>> 26afec393069 (r8152: avoid start_xmit to call napi_schedule during autosuspend)
+  			napi_disable(&tp->napi);
+  			set_bit(WORK_ENABLE, &tp->flags);
+  			if (netif_carrier_ok(tp->netdev))
+* Unmerged path drivers/net/usb/r8152.c
