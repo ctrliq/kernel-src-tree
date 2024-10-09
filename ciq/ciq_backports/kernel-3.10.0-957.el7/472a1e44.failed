@@ -1,0 +1,362 @@
+net/mlx5e: Save MTU in channels params
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Save MTU in channels params (Erez Alfasi) [1625195]
+Rebuild_FUZZ: 94.44%
+commit-author Tariq Toukan <tariqt@mellanox.com>
+commit 472a1e44b3495df01c83e048667ef93dd2ea1ca0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/472a1e44.failed
+
+Knowing the MTU is required for RQ creation flow.
+By our design, channels creation flow is totally isolated
+from priv/netdev, and can be completed with access to
+channels params and mdev.
+Adding the MTU to the channels params helps preserving that.
+In addition, we save it in RQ to make its access faster in
+datapath checks.
+
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 472a1e44b3495df01c83e048667ef93dd2ea1ca0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 9dc25f7ba1d2,823876bfd6ab..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@@ -57,9 -57,10 +57,16 @@@
+  
+  #define MLX5E_ETH_HARD_MTU (ETH_HLEN + VLAN_HLEN + ETH_FCS_LEN)
+  
+++<<<<<<< HEAD
+ +#define MLX5E_HW2SW_MTU(priv, hwmtu) ((hwmtu) - ((priv)->hard_mtu))
+ +#define MLX5E_SW2HW_MTU(priv, swmtu) ((swmtu) + ((priv)->hard_mtu))
+ + 
+++=======
++ #define MLX5E_HW2SW_MTU(params, hwmtu) ((hwmtu) - ((params)->hard_mtu))
++ #define MLX5E_SW2HW_MTU(params, swmtu) ((swmtu) + ((params)->hard_mtu))
++ 
++ #define MLX5E_MAX_DSCP          64
+++>>>>>>> 472a1e44b349 (net/mlx5e: Save MTU in channels params)
+  #define MLX5E_MAX_NUM_TC	8
+  
+  #define MLX5E_PARAMS_MINIMUM_LOG_SQ_SIZE                0x6
+@@@ -489,7 -532,12 +498,16 @@@ struct mlx5e_rq 
+  	unsigned long          state;
+  	int                    ix;
+  
+++<<<<<<< HEAD
+ +	struct mlx5e_rx_am     am; /* Adaptive Moderation */
+++=======
++ 	struct net_dim         dim; /* Dynamic Interrupt Moderation */
++ 
++ 	/* XDP */
++ 	struct bpf_prog       *xdp_prog;
++ 	unsigned int           hw_mtu;
++ 	struct mlx5e_xdpsq     xdpsq;
+++>>>>>>> 472a1e44b349 (net/mlx5e: Save MTU in channels params)
+  
+  	/* control */
+  	struct mlx5_wq_ctrl    wq_ctrl;
+@@@ -1038,6 -1113,7 +1055,12 @@@ void mlx5e_detach_netdev(struct mlx5e_p
+  void mlx5e_destroy_netdev(struct mlx5e_priv *priv);
+  void mlx5e_build_nic_params(struct mlx5_core_dev *mdev,
+  			    struct mlx5e_params *params,
+++<<<<<<< HEAD
+ +			    u16 max_channels);
+ +
+++=======
++ 			    u16 max_channels, u16 mtu);
++ u8 mlx5e_params_calculate_tx_min_inline(struct mlx5_core_dev *mdev);
++ void mlx5e_rx_dim_work(struct work_struct *work);
+++>>>>>>> 472a1e44b349 (net/mlx5e: Save MTU in channels params)
+  #endif /* __MLX5_EN_H__ */
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index a42a2f9547cb,af345323b2ce..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -566,9 -419,21 +566,10 @@@ static int mlx5e_alloc_rq(struct mlx5e_
+  	rq->channel = c;
+  	rq->ix      = c->ix;
+  	rq->mdev    = mdev;
++ 	rq->hw_mtu  = MLX5E_SW2HW_MTU(params, params->sw_mtu);
+  
+ -	rq->xdp_prog = params->xdp_prog ? bpf_prog_inc(params->xdp_prog) : NULL;
+ -	if (IS_ERR(rq->xdp_prog)) {
+ -		err = PTR_ERR(rq->xdp_prog);
+ -		rq->xdp_prog = NULL;
+ -		goto err_rq_wq_destroy;
+ -	}
+ -
+ -	err = xdp_rxq_info_reg(&rq->xdp_rxq, rq->netdev, rq->ix);
+ -	if (err < 0)
+ -		goto err_rq_wq_destroy;
+ -
+ -	rq->buff.map_dir = rq->xdp_prog ? DMA_BIDIRECTIONAL : DMA_FROM_DEVICE;
+ -	rq->buff.headroom = mlx5e_get_rq_headroom(params);
+ +	rq->buff.map_dir = DMA_FROM_DEVICE;
+ +	rq->buff.headroom = params->rq_headroom;
+  
+  	switch (rq->wq_type) {
+  	case MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ:
+@@@ -3771,12 -4113,12 +3773,14 @@@ u32 mlx5e_choose_lro_timeout(struct mlx
+  
+  void mlx5e_build_nic_params(struct mlx5_core_dev *mdev,
+  			    struct mlx5e_params *params,
+- 			    u16 max_channels)
++ 			    u16 max_channels, u16 mtu)
+  {
+  	u8 cq_period_mode = 0;
+ +	u32 link_speed = 0;
+ +	u32 pci_bw = 0;
+  
++ 	params->sw_mtu = mtu;
++ 	params->hard_mtu = MLX5E_ETH_HARD_MTU;
+  	params->num_channels = max_channels;
+  	params->num_tc       = 1;
+  
+@@@ -4109,9 -4456,9 +4113,13 @@@ static void mlx5e_nic_enable(struct mlx
+  		mlx5_set_port_admin_status(mdev, MLX5_PORT_DOWN);
+  
+  	/* MTU range: 68 - hw-specific max */
+ -	netdev->min_mtu = ETH_MIN_MTU;
+ +	netdev->extended->min_mtu = ETH_MIN_MTU;
+  	mlx5_query_port_max_mtu(priv->mdev, &max_mtu, 1);
+++<<<<<<< HEAD
+ +	netdev->extended->max_mtu = MLX5E_HW2SW_MTU(priv, max_mtu);
+++=======
++ 	netdev->max_mtu = MLX5E_HW2SW_MTU(&priv->channels.params, max_mtu);
+++>>>>>>> 472a1e44b349 (net/mlx5e: Save MTU in channels params)
+  	mlx5e_set_dev_port_mtu(priv);
+  
+  	mlx5_lag_add(mdev, netdev);
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+index 21475fbee7ea,cd884829cb30..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+@@@ -893,14 -877,14 +893,19 @@@ static void mlx5e_build_rep_params(stru
+  					 MLX5_CQ_PERIOD_MODE_START_FROM_CQE :
+  					 MLX5_CQ_PERIOD_MODE_START_FROM_EQE;
+  
+++<<<<<<< HEAD
+ +	params->log_sq_size = MLX5E_REP_PARAMS_LOG_SQ_SIZE;
+++=======
++ 	params->hard_mtu    = MLX5E_ETH_HARD_MTU;
++ 	params->log_sq_size = MLX5E_PARAMS_MINIMUM_LOG_SQ_SIZE;
+++>>>>>>> 472a1e44b349 (net/mlx5e: Save MTU in channels params)
+  	params->rq_wq_type  = MLX5_WQ_TYPE_LINKED_LIST;
+ -	params->log_rq_size = MLX5E_PARAMS_MINIMUM_LOG_RQ_SIZE;
+ +	params->log_rq_size = MLX5E_REP_PARAMS_LOG_RQ_SIZE;
+  
+ -	params->rx_dim_enabled = MLX5_CAP_GEN(mdev, cq_moderation);
+ +	params->rx_am_enabled = MLX5_CAP_GEN(mdev, cq_moderation);
+  	mlx5e_set_rx_cq_mode_params(params, cq_period_mode);
+  
+ +	params->tx_max_inline         = mlx5e_get_max_inline_cap(mdev);
+  	params->num_tc                = 1;
+  	params->lro_wqe_sz            = MLX5E_PARAMS_DEFAULT_LRO_WQE_SZ;
+  
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index f75f2c655534,c0d528f2131b..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -733,6 -736,123 +733,126 @@@ static inline void mlx5e_complete_rx_cq
+  	mlx5e_build_rx_skb(cqe, cqe_bcnt, rq, skb);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline void mlx5e_xmit_xdp_doorbell(struct mlx5e_xdpsq *sq)
++ {
++ 	struct mlx5_wq_cyc *wq = &sq->wq;
++ 	struct mlx5e_tx_wqe *wqe;
++ 	u16 pi = (sq->pc - 1) & wq->sz_m1; /* last pi */
++ 
++ 	wqe  = mlx5_wq_cyc_get_wqe(wq, pi);
++ 
++ 	mlx5e_notify_hw(wq, sq->pc, sq->uar_map, &wqe->ctrl);
++ }
++ 
++ static inline bool mlx5e_xmit_xdp_frame(struct mlx5e_rq *rq,
++ 					struct mlx5e_dma_info *di,
++ 					const struct xdp_buff *xdp)
++ {
++ 	struct mlx5e_xdpsq       *sq   = &rq->xdpsq;
++ 	struct mlx5_wq_cyc       *wq   = &sq->wq;
++ 	u16                       pi   = sq->pc & wq->sz_m1;
++ 	struct mlx5e_tx_wqe      *wqe  = mlx5_wq_cyc_get_wqe(wq, pi);
++ 
++ 	struct mlx5_wqe_ctrl_seg *cseg = &wqe->ctrl;
++ 	struct mlx5_wqe_eth_seg  *eseg = &wqe->eth;
++ 	struct mlx5_wqe_data_seg *dseg;
++ 
++ 	ptrdiff_t data_offset = xdp->data - xdp->data_hard_start;
++ 	dma_addr_t dma_addr  = di->addr + data_offset;
++ 	unsigned int dma_len = xdp->data_end - xdp->data;
++ 
++ 	prefetchw(wqe);
++ 
++ 	if (unlikely(dma_len < MLX5E_XDP_MIN_INLINE || rq->hw_mtu < dma_len)) {
++ 		rq->stats.xdp_drop++;
++ 		return false;
++ 	}
++ 
++ 	if (unlikely(!mlx5e_wqc_has_room_for(wq, sq->cc, sq->pc, 1))) {
++ 		if (sq->db.doorbell) {
++ 			/* SQ is full, ring doorbell */
++ 			mlx5e_xmit_xdp_doorbell(sq);
++ 			sq->db.doorbell = false;
++ 		}
++ 		rq->stats.xdp_tx_full++;
++ 		return false;
++ 	}
++ 
++ 	dma_sync_single_for_device(sq->pdev, dma_addr, dma_len, PCI_DMA_TODEVICE);
++ 
++ 	cseg->fm_ce_se = 0;
++ 
++ 	dseg = (struct mlx5_wqe_data_seg *)eseg + 1;
++ 
++ 	/* copy the inline part if required */
++ 	if (sq->min_inline_mode != MLX5_INLINE_MODE_NONE) {
++ 		memcpy(eseg->inline_hdr.start, xdp->data, MLX5E_XDP_MIN_INLINE);
++ 		eseg->inline_hdr.sz = cpu_to_be16(MLX5E_XDP_MIN_INLINE);
++ 		dma_len  -= MLX5E_XDP_MIN_INLINE;
++ 		dma_addr += MLX5E_XDP_MIN_INLINE;
++ 		dseg++;
++ 	}
++ 
++ 	/* write the dma part */
++ 	dseg->addr       = cpu_to_be64(dma_addr);
++ 	dseg->byte_count = cpu_to_be32(dma_len);
++ 
++ 	cseg->opmod_idx_opcode = cpu_to_be32((sq->pc << 8) | MLX5_OPCODE_SEND);
++ 
++ 	/* move page to reference to sq responsibility,
++ 	 * and mark so it's not put back in page-cache.
++ 	 */
++ 	rq->wqe.xdp_xmit = true;
++ 	sq->db.di[pi] = *di;
++ 	sq->pc++;
++ 
++ 	sq->db.doorbell = true;
++ 
++ 	rq->stats.xdp_tx++;
++ 	return true;
++ }
++ 
++ /* returns true if packet was consumed by xdp */
++ static inline int mlx5e_xdp_handle(struct mlx5e_rq *rq,
++ 				   struct mlx5e_dma_info *di,
++ 				   void *va, u16 *rx_headroom, u32 *len)
++ {
++ 	const struct bpf_prog *prog = READ_ONCE(rq->xdp_prog);
++ 	struct xdp_buff xdp;
++ 	u32 act;
++ 
++ 	if (!prog)
++ 		return false;
++ 
++ 	xdp.data = va + *rx_headroom;
++ 	xdp_set_data_meta_invalid(&xdp);
++ 	xdp.data_end = xdp.data + *len;
++ 	xdp.data_hard_start = va;
++ 	xdp.rxq = &rq->xdp_rxq;
++ 
++ 	act = bpf_prog_run_xdp(prog, &xdp);
++ 	switch (act) {
++ 	case XDP_PASS:
++ 		*rx_headroom = xdp.data - xdp.data_hard_start;
++ 		*len = xdp.data_end - xdp.data;
++ 		return false;
++ 	case XDP_TX:
++ 		if (unlikely(!mlx5e_xmit_xdp_frame(rq, di, &xdp)))
++ 			trace_xdp_exception(rq->netdev, prog, act);
++ 		return true;
++ 	default:
++ 		bpf_warn_invalid_xdp_action(act);
++ 	case XDP_ABORTED:
++ 		trace_xdp_exception(rq->netdev, prog, act);
++ 	case XDP_DROP:
++ 		rq->stats.xdp_drop++;
++ 		return true;
++ 	}
++ }
++ 
+++>>>>>>> 472a1e44b349 (net/mlx5e: Save MTU in channels params)
+  static inline
+  struct sk_buff *skb_from_cqe(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe,
+  			     struct mlx5e_wqe_frag_info *wi, u32 cqe_bcnt)
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+index 2331dd9ef4d0..8ab2419d2cd8 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+@@ -66,6 +66,7 @@ static void mlx5i_build_nic_params(struct mlx5_core_dev *mdev,
+ 		MLX5I_PARAMS_DEFAULT_LOG_RQ_SIZE;
+ 
+ 	params->lro_en = false;
++	params->hard_mtu = MLX5_IB_GRH_BYTES + MLX5_IPOIB_HARD_LEN;
+ }
+ 
+ /* Called directly after IPoIB netdevice was created to initialize SW structs */
+@@ -81,10 +82,10 @@ void mlx5i_init(struct mlx5_core_dev *mdev,
+ 	priv->netdev      = netdev;
+ 	priv->profile     = profile;
+ 	priv->ppriv       = ppriv;
+-	priv->hard_mtu = MLX5_IB_GRH_BYTES + MLX5_IPOIB_HARD_LEN;
+ 	mutex_init(&priv->state_lock);
+ 
+-	mlx5e_build_nic_params(mdev, &priv->channels.params, profile->max_nch(mdev));
++	mlx5e_build_nic_params(mdev, &priv->channels.params,
++			       profile->max_nch(mdev), netdev->mtu);
+ 	mlx5i_build_nic_params(mdev, &priv->channels.params);
+ 
+ 	mlx5e_timestamp_init(priv);
+@@ -368,25 +369,27 @@ static int mlx5i_change_mtu(struct net_device *netdev, int new_mtu)
+ {
+ 	struct mlx5e_priv *priv = mlx5i_epriv(netdev);
+ 	struct mlx5e_channels new_channels = {};
+-	int curr_mtu;
++	struct mlx5e_params *params;
+ 	int err = 0;
+ 
+ 	mutex_lock(&priv->state_lock);
+ 
+-	curr_mtu    = netdev->mtu;
+-	netdev->mtu = new_mtu;
++	params = &priv->channels.params;
+ 
+-	if (!test_bit(MLX5E_STATE_OPENED, &priv->state))
++	if (!test_bit(MLX5E_STATE_OPENED, &priv->state)) {
++		params->sw_mtu = new_mtu;
++		netdev->mtu = params->sw_mtu;
+ 		goto out;
++	}
+ 
+-	new_channels.params = priv->channels.params;
++	new_channels.params = *params;
++	new_channels.params.sw_mtu = new_mtu;
+ 	err = mlx5e_open_channels(priv, &new_channels);
+-	if (err) {
+-		netdev->mtu = curr_mtu;
++	if (err)
+ 		goto out;
+-	}
+ 
+ 	mlx5e_switch_priv_channels(priv, &new_channels, NULL);
++	netdev->mtu = new_channels.params.sw_mtu;
+ 
+ out:
+ 	mutex_unlock(&priv->state_lock);
