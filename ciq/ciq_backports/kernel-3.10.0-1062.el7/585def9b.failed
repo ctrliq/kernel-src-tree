@@ -1,0 +1,249 @@
+scsi: qla2xxx: Move ABTS code behind qpair
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: Move ABTS code behind qpair (Himanshu Madhani) [1628301]
+Rebuild_FUZZ: 92.31%
+commit-author Quinn Tran <quinn.tran@cavium.com>
+commit 585def9b2f47d35aab6cf116d63ec6c70e929e51
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/585def9b.failed
+
+Current abort code defaults to legacy single queue where hardware_lock is used
+to protect command search.  This patch moves this code behind the QPair where
+the qp_lock_ptr will reference the appropriate lock for either legacy/single
+queue or MQ.
+
+	Signed-off-by: Quinn Tran <quinn.tran@cavium.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 585def9b2f47d35aab6cf116d63ec6c70e929e51)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_os.c
+diff --cc drivers/scsi/qla2xxx/qla_os.c
+index 52038b7f917b,8a2ba6bb5d1b..000000000000
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@@ -13,6 -13,9 +13,12 @@@
+  #include <linux/mutex.h>
+  #include <linux/kobject.h>
+  #include <linux/slab.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/blk-mq-pci.h>
++ #include <linux/refcount.h>
++ 
+++>>>>>>> 585def9b2f47 (scsi: qla2xxx: Move ABTS code behind qpair)
+  #include <scsi/scsi_tcq.h>
+  #include <scsi/scsicam.h>
+  #include <scsi/scsi_transport.h>
+@@@ -1297,8 -1310,18 +1312,18 @@@ qla2xxx_eh_abort(struct scsi_cmnd *cmd
+  		return SUCCESS;
+  	}
+  
++ 	if (sp_get(sp)){
++ 		/* ref_count is already 0 */
++ 		spin_unlock_irqrestore(qpair->qp_lock_ptr, flags);
++ 		return SUCCESS;
++ 	}
++ 	spin_unlock_irqrestore(qpair->qp_lock_ptr, flags);
++ 
++ 	id = cmd->device->id;
++ 	lun = cmd->device->lun;
++ 
+  	ql_dbg(ql_dbg_taskm, vha, 0x8002,
+ -	    "Aborting from RISC nexus=%ld:%d:%llu sp=%p cmd=%p handle=%x\n",
+ +	    "Aborting from RISC nexus=%ld:%d:%u sp=%p cmd=%p handle=%x\n",
+  	    vha->host_no, id, lun, sp, cmd, sp->handle);
+  
+  	/* Get a reference to the sp and drop the lock.*/
+@@@ -1729,64 -1766,67 +1766,124 @@@ __qla2x00_abort_all_cmds(struct qla_qpa
+  		sp = req->outstanding_cmds[cnt];
+  		if (sp) {
+  			req->outstanding_cmds[cnt] = NULL;
+++<<<<<<< HEAD
+ +			if (sp->cmd_type == TYPE_SRB) {
+ +				if (sp->type == SRB_NVME_CMD ||
+ +				    sp->type == SRB_NVME_LS) {
+ +					sp_get(sp);
+ +					spin_unlock_irqrestore(qp->qp_lock_ptr,
+ +					    flags);
+ +					qla_nvme_abort(ha, sp, res);
+ +					spin_lock_irqsave(qp->qp_lock_ptr,
+ +					    flags);
+++=======
++ 			switch (sp->cmd_type) {
++ 			case TYPE_SRB:
++ 				if (sp->type == SRB_NVME_CMD ||
++ 				    sp->type == SRB_NVME_LS) {
++ 					if (!sp_get(sp)) {
++ 						/* got sp */
++ 						spin_unlock_irqrestore
++ 							(qp->qp_lock_ptr,
++ 							 flags);
++ 						qla_nvme_abort(ha, sp, res);
++ 						spin_lock_irqsave
++ 							(qp->qp_lock_ptr, flags);
++ 					}
+++>>>>>>> 585def9b2f47 (scsi: qla2xxx: Move ABTS code behind qpair)
+  				} else if (GET_CMD_SP(sp) &&
+  				    !ha->flags.eeh_busy &&
+  				    (!test_bit(ABORT_ISP_ACTIVE,
+  					&vha->dpc_flags)) &&
+  				    (sp->type == SRB_SCSI_CMD)) {
+  					/*
+++<<<<<<< HEAD
+ +					 * Don't abort commands in
+ +					 * adapter during EEH
+ +					 * recovery as it's not
+ +					 * accessible/responding.
+ +					 *
+ +					 * Get a reference to the sp
+ +					 * and drop the lock. The
+ +					 * reference ensures this
+ +					 * sp->done() call and not the
+ +					 * call in qla2xxx_eh_abort()
+ +					 * ends the SCSI command (with
+ +					 * result 'res').
+ +					 */
+ +					sp_get(sp);
+ +					spin_unlock_irqrestore(qp->qp_lock_ptr,
+ +					    flags);
+ +					status = qla2xxx_eh_abort(
+ +					    GET_CMD_SP(sp));
+ +					spin_lock_irqsave(qp->qp_lock_ptr,
+ +					    flags);
+ +					/*
+ +					 * Get rid of extra reference
+ +					 * if immediate exit from
+ +					 * ql2xxx_eh_abort
+ +					 */
+ +					if (status == FAILED &&
+ +					    (qla2x00_isp_reg_stat(ha)))
+ +						atomic_dec(
+ +						    &sp->ref_count);
+ +				}
+ +				sp->done(sp, res);
+ +			} else {
+ +				if (!vha->hw->tgt.tgt_ops || !tgt ||
+ +				    qla_ini_mode_enabled(vha)) {
+ +					if (!trace)
+ +						ql_dbg(ql_dbg_tgt_mgt,
+ +						    vha, 0xf003,
+ +						    "HOST-ABORT-HNDLR: dpc_flags=%lx. Target mode disabled\n",
+ +						    vha->dpc_flags);
+++=======
++ 					 * Don't abort commands in adapter
++ 					 * during EEH recovery as it's not
++ 					 * accessible/responding.
++ 					 *
++ 					 * Get a reference to the sp and drop
++ 					 * the lock. The reference ensures this
++ 					 * sp->done() call and not the call in
++ 					 * qla2xxx_eh_abort() ends the SCSI cmd
++ 					 * (with result 'res').
++ 					 */
++ 					if (!sp_get(sp)) {
++ 						spin_unlock_irqrestore
++ 							(qp->qp_lock_ptr, flags);
++ 						status = qla2xxx_eh_abort(
++ 						    GET_CMD_SP(sp));
++ 						spin_lock_irqsave
++ 							(qp->qp_lock_ptr, flags);
++ 					}
++ 				}
++ 				sp->done(sp, res);
++ 				break;
++ 			case TYPE_TGT_CMD:
++ 				if (!vha->hw->tgt.tgt_ops || !tgt ||
++ 				    qla_ini_mode_enabled(vha)) {
++ 					ql_dbg(ql_dbg_tgt_mgt, vha, 0xf003,
++ 					    "HOST-ABORT-HNDLR: dpc_flags=%lx. Target mode disabled\n",
++ 					    vha->dpc_flags);
+++>>>>>>> 585def9b2f47 (scsi: qla2xxx: Move ABTS code behind qpair)
+  					continue;
+  				}
+  				cmd = (struct qla_tgt_cmd *)sp;
+  				qlt_abort_cmd_on_host_reset(cmd->vha, cmd);
+++<<<<<<< HEAD
+++=======
++ 				break;
++ 			case TYPE_TGT_TMCMD:
++ 				/*
++ 				 * Currently, only ABTS response gets on the
++ 				 * outstanding_cmds[]
++ 				 */
++ 				ha->tgt.tgt_ops->free_mcmd(
++ 				   (struct qla_tgt_mgmt_cmd *)sp);
++ 				break;
++ 			default:
++ 				break;
+++>>>>>>> 585def9b2f47 (scsi: qla2xxx: Move ABTS code behind qpair)
+  			}
+  		}
+  	}
+diff --git a/drivers/scsi/qla2xxx/qla_init.c b/drivers/scsi/qla2xxx/qla_init.c
+index 28e7d0272d09..026a09adcc37 100644
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@ -1629,19 +1629,17 @@ qla24xx_async_abort_command(srb_t *sp)
+ 
+ 	uint32_t	handle;
+ 	fc_port_t	*fcport = sp->fcport;
++	struct qla_qpair *qpair = sp->qpair;
+ 	struct scsi_qla_host *vha = fcport->vha;
+-	struct qla_hw_data *ha = vha->hw;
+-	struct req_que *req = vha->req;
+-
+-	if (vha->flags.qpairs_available && sp->qpair)
+-		req = sp->qpair->req;
++	struct req_que *req = qpair->req;
+ 
+-	spin_lock_irqsave(&ha->hardware_lock, flags);
++	spin_lock_irqsave(qpair->qp_lock_ptr, flags);
+ 	for (handle = 1; handle < req->num_outstanding_cmds; handle++) {
+ 		if (req->outstanding_cmds[handle] == sp)
+ 			break;
+ 	}
+-	spin_unlock_irqrestore(&ha->hardware_lock, flags);
++	spin_unlock_irqrestore(qpair->qp_lock_ptr, flags);
++
+ 	if (handle == req->num_outstanding_cmds) {
+ 		/* Command not found. */
+ 		return QLA_FUNCTION_FAILED;
+diff --git a/drivers/scsi/qla2xxx/qla_mbx.c b/drivers/scsi/qla2xxx/qla_mbx.c
+index 68c3b8af334a..840445374c04 100644
+--- a/drivers/scsi/qla2xxx/qla_mbx.c
++++ b/drivers/scsi/qla2xxx/qla_mbx.c
+@@ -3070,22 +3070,25 @@ qla24xx_abort_command(srb_t *sp)
+ 	struct scsi_qla_host *vha = fcport->vha;
+ 	struct qla_hw_data *ha = vha->hw;
+ 	struct req_que *req = vha->req;
++	struct qla_qpair *qpair = sp->qpair;
+ 
+ 	ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x108c,
+ 	    "Entered %s.\n", __func__);
+ 
+ 	if (vha->flags.qpairs_available && sp->qpair)
+ 		req = sp->qpair->req;
++	else
++		return QLA_FUNCTION_FAILED;
+ 
+ 	if (ql2xasynctmfenable)
+ 		return qla24xx_async_abort_command(sp);
+ 
+-	spin_lock_irqsave(&ha->hardware_lock, flags);
++	spin_lock_irqsave(qpair->qp_lock_ptr, flags);
+ 	for (handle = 1; handle < req->num_outstanding_cmds; handle++) {
+ 		if (req->outstanding_cmds[handle] == sp)
+ 			break;
+ 	}
+-	spin_unlock_irqrestore(&ha->hardware_lock, flags);
++	spin_unlock_irqrestore(qpair->qp_lock_ptr, flags);
+ 	if (handle == req->num_outstanding_cmds) {
+ 		/* Command not found. */
+ 		return QLA_FUNCTION_FAILED;
+* Unmerged path drivers/scsi/qla2xxx/qla_os.c
