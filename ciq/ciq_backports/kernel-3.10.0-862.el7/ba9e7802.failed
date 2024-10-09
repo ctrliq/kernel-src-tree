@@ -1,0 +1,339 @@
+xfs: add tracepoints and error injection for deferred extent freeing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Darrick J. Wong <darrick.wong@oracle.com>
+commit ba9e780246a15a35f8ebe5b60f4a11bb58e85bda
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/ba9e7802.failed
+
+Add a couple of tracepoints for the deferred extent free operation and
+a site for injecting errors while finishing the operation.  This makes
+it easier to debug deferred ops and test log redo.
+
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit ba9e780246a15a35f8ebe5b60f4a11bb58e85bda)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_bmap.c
+#	fs/xfs/xfs_trace.h
+diff --cc fs/xfs/libxfs/xfs_bmap.c
+index e335b368ac04,8e14ff45c73a..000000000000
+--- a/fs/xfs/libxfs/xfs_bmap.c
++++ b/fs/xfs/libxfs/xfs_bmap.c
+@@@ -594,9 -594,11 +594,17 @@@ xfs_bmap_add_free
+  #endif
+  	ASSERT(xfs_bmap_free_item_zone != NULL);
+  	new = kmem_zone_alloc(xfs_bmap_free_item_zone, KM_SLEEP);
+++<<<<<<< HEAD
+ +	new->xbfi_startblock = bno;
+ +	new->xbfi_blockcount = (xfs_extlen_t)len;
+ +	xfs_defer_add(flist, XFS_DEFER_OPS_TYPE_FREE, &new->xbfi_list);
+++=======
++ 	new->xefi_startblock = bno;
++ 	new->xefi_blockcount = (xfs_extlen_t)len;
++ 	trace_xfs_bmap_free_defer(mp, XFS_FSB_TO_AGNO(mp, bno), 0,
++ 			XFS_FSB_TO_AGBNO(mp, bno), len);
++ 	xfs_defer_add(dfops, XFS_DEFER_OPS_TYPE_FREE, &new->xefi_list);
+++>>>>>>> ba9e780246a1 (xfs: add tracepoints and error injection for deferred extent freeing)
+  }
+  
+  /*
+diff --cc fs/xfs/xfs_trace.h
+index e83c100d88de,939caf5f5a45..000000000000
+--- a/fs/xfs/xfs_trace.h
++++ b/fs/xfs/xfs_trace.h
+@@@ -2210,6 -2186,243 +2210,246 @@@ DEFINE_DISCARD_EVENT(xfs_discard_toosma
+  DEFINE_DISCARD_EVENT(xfs_discard_exclude);
+  DEFINE_DISCARD_EVENT(xfs_discard_busy);
+  
+++<<<<<<< HEAD
+++=======
++ /* btree cursor events */
++ DECLARE_EVENT_CLASS(xfs_btree_cur_class,
++ 	TP_PROTO(struct xfs_btree_cur *cur, int level, struct xfs_buf *bp),
++ 	TP_ARGS(cur, level, bp),
++ 	TP_STRUCT__entry(
++ 		__field(dev_t, dev)
++ 		__field(xfs_btnum_t, btnum)
++ 		__field(int, level)
++ 		__field(int, nlevels)
++ 		__field(int, ptr)
++ 		__field(xfs_daddr_t, daddr)
++ 	),
++ 	TP_fast_assign(
++ 		__entry->dev = cur->bc_mp->m_super->s_dev;
++ 		__entry->btnum = cur->bc_btnum;
++ 		__entry->level = level;
++ 		__entry->nlevels = cur->bc_nlevels;
++ 		__entry->ptr = cur->bc_ptrs[level];
++ 		__entry->daddr = bp ? bp->b_bn : -1;
++ 	),
++ 	TP_printk("dev %d:%d btnum %d level %d/%d ptr %d daddr 0x%llx",
++ 		  MAJOR(__entry->dev), MINOR(__entry->dev),
++ 		  __entry->btnum,
++ 		  __entry->level,
++ 		  __entry->nlevels,
++ 		  __entry->ptr,
++ 		  (unsigned long long)__entry->daddr)
++ )
++ 
++ #define DEFINE_BTREE_CUR_EVENT(name) \
++ DEFINE_EVENT(xfs_btree_cur_class, name, \
++ 	TP_PROTO(struct xfs_btree_cur *cur, int level, struct xfs_buf *bp), \
++ 	TP_ARGS(cur, level, bp))
++ DEFINE_BTREE_CUR_EVENT(xfs_btree_updkeys);
++ DEFINE_BTREE_CUR_EVENT(xfs_btree_overlapped_query_range);
++ 
++ /* deferred ops */
++ struct xfs_defer_pending;
++ struct xfs_defer_intake;
++ struct xfs_defer_ops;
++ 
++ DECLARE_EVENT_CLASS(xfs_defer_class,
++ 	TP_PROTO(struct xfs_mount *mp, struct xfs_defer_ops *dop),
++ 	TP_ARGS(mp, dop),
++ 	TP_STRUCT__entry(
++ 		__field(dev_t, dev)
++ 		__field(void *, dop)
++ 		__field(bool, committed)
++ 		__field(bool, low)
++ 	),
++ 	TP_fast_assign(
++ 		__entry->dev = mp ? mp->m_super->s_dev : 0;
++ 		__entry->dop = dop;
++ 		__entry->committed = dop->dop_committed;
++ 		__entry->low = dop->dop_low;
++ 	),
++ 	TP_printk("dev %d:%d ops %p committed %d low %d\n",
++ 		  MAJOR(__entry->dev), MINOR(__entry->dev),
++ 		  __entry->dop,
++ 		  __entry->committed,
++ 		  __entry->low)
++ )
++ #define DEFINE_DEFER_EVENT(name) \
++ DEFINE_EVENT(xfs_defer_class, name, \
++ 	TP_PROTO(struct xfs_mount *mp, struct xfs_defer_ops *dop), \
++ 	TP_ARGS(mp, dop))
++ 
++ DECLARE_EVENT_CLASS(xfs_defer_error_class,
++ 	TP_PROTO(struct xfs_mount *mp, struct xfs_defer_ops *dop, int error),
++ 	TP_ARGS(mp, dop, error),
++ 	TP_STRUCT__entry(
++ 		__field(dev_t, dev)
++ 		__field(void *, dop)
++ 		__field(bool, committed)
++ 		__field(bool, low)
++ 		__field(int, error)
++ 	),
++ 	TP_fast_assign(
++ 		__entry->dev = mp ? mp->m_super->s_dev : 0;
++ 		__entry->dop = dop;
++ 		__entry->committed = dop->dop_committed;
++ 		__entry->low = dop->dop_low;
++ 		__entry->error = error;
++ 	),
++ 	TP_printk("dev %d:%d ops %p committed %d low %d err %d\n",
++ 		  MAJOR(__entry->dev), MINOR(__entry->dev),
++ 		  __entry->dop,
++ 		  __entry->committed,
++ 		  __entry->low,
++ 		  __entry->error)
++ )
++ #define DEFINE_DEFER_ERROR_EVENT(name) \
++ DEFINE_EVENT(xfs_defer_error_class, name, \
++ 	TP_PROTO(struct xfs_mount *mp, struct xfs_defer_ops *dop, int error), \
++ 	TP_ARGS(mp, dop, error))
++ 
++ DECLARE_EVENT_CLASS(xfs_defer_pending_class,
++ 	TP_PROTO(struct xfs_mount *mp, struct xfs_defer_pending *dfp),
++ 	TP_ARGS(mp, dfp),
++ 	TP_STRUCT__entry(
++ 		__field(dev_t, dev)
++ 		__field(int, type)
++ 		__field(void *, intent)
++ 		__field(bool, committed)
++ 		__field(int, nr)
++ 	),
++ 	TP_fast_assign(
++ 		__entry->dev = mp ? mp->m_super->s_dev : 0;
++ 		__entry->type = dfp->dfp_type->type;
++ 		__entry->intent = dfp->dfp_intent;
++ 		__entry->committed = dfp->dfp_committed;
++ 		__entry->nr = dfp->dfp_count;
++ 	),
++ 	TP_printk("dev %d:%d optype %d intent %p committed %d nr %d\n",
++ 		  MAJOR(__entry->dev), MINOR(__entry->dev),
++ 		  __entry->type,
++ 		  __entry->intent,
++ 		  __entry->committed,
++ 		  __entry->nr)
++ )
++ #define DEFINE_DEFER_PENDING_EVENT(name) \
++ DEFINE_EVENT(xfs_defer_pending_class, name, \
++ 	TP_PROTO(struct xfs_mount *mp, struct xfs_defer_pending *dfp), \
++ 	TP_ARGS(mp, dfp))
++ 
++ DECLARE_EVENT_CLASS(xfs_phys_extent_deferred_class,
++ 	TP_PROTO(struct xfs_mount *mp, xfs_agnumber_t agno,
++ 		 int type, xfs_agblock_t agbno, xfs_extlen_t len),
++ 	TP_ARGS(mp, agno, type, agbno, len),
++ 	TP_STRUCT__entry(
++ 		__field(dev_t, dev)
++ 		__field(xfs_agnumber_t, agno)
++ 		__field(int, type)
++ 		__field(xfs_agblock_t, agbno)
++ 		__field(xfs_extlen_t, len)
++ 	),
++ 	TP_fast_assign(
++ 		__entry->dev = mp->m_super->s_dev;
++ 		__entry->agno = agno;
++ 		__entry->type = type;
++ 		__entry->agbno = agbno;
++ 		__entry->len = len;
++ 	),
++ 	TP_printk("dev %d:%d op %d agno %u agbno %u len %u",
++ 		  MAJOR(__entry->dev), MINOR(__entry->dev),
++ 		  __entry->type,
++ 		  __entry->agno,
++ 		  __entry->agbno,
++ 		  __entry->len)
++ );
++ #define DEFINE_PHYS_EXTENT_DEFERRED_EVENT(name) \
++ DEFINE_EVENT(xfs_phys_extent_deferred_class, name, \
++ 	TP_PROTO(struct xfs_mount *mp, xfs_agnumber_t agno, \
++ 		 int type, \
++ 		 xfs_agblock_t bno, \
++ 		 xfs_extlen_t len), \
++ 	TP_ARGS(mp, agno, type, bno, len))
++ 
++ DECLARE_EVENT_CLASS(xfs_map_extent_deferred_class,
++ 	TP_PROTO(struct xfs_mount *mp, xfs_agnumber_t agno,
++ 		 int op,
++ 		 xfs_agblock_t agbno,
++ 		 xfs_ino_t ino,
++ 		 int whichfork,
++ 		 xfs_fileoff_t offset,
++ 		 xfs_filblks_t len,
++ 		 xfs_exntst_t state),
++ 	TP_ARGS(mp, agno, op, agbno, ino, whichfork, offset, len, state),
++ 	TP_STRUCT__entry(
++ 		__field(dev_t, dev)
++ 		__field(xfs_agnumber_t, agno)
++ 		__field(xfs_ino_t, ino)
++ 		__field(xfs_agblock_t, agbno)
++ 		__field(int, whichfork)
++ 		__field(xfs_fileoff_t, l_loff)
++ 		__field(xfs_filblks_t, l_len)
++ 		__field(xfs_exntst_t, l_state)
++ 		__field(int, op)
++ 	),
++ 	TP_fast_assign(
++ 		__entry->dev = mp->m_super->s_dev;
++ 		__entry->agno = agno;
++ 		__entry->ino = ino;
++ 		__entry->agbno = agbno;
++ 		__entry->whichfork = whichfork;
++ 		__entry->l_loff = offset;
++ 		__entry->l_len = len;
++ 		__entry->l_state = state;
++ 		__entry->op = op;
++ 	),
++ 	TP_printk("dev %d:%d op %d agno %u agbno %u owner %lld %s offset %llu len %llu state %d",
++ 		  MAJOR(__entry->dev), MINOR(__entry->dev),
++ 		  __entry->op,
++ 		  __entry->agno,
++ 		  __entry->agbno,
++ 		  __entry->ino,
++ 		  __entry->whichfork == XFS_ATTR_FORK ? "attr" : "data",
++ 		  __entry->l_loff,
++ 		  __entry->l_len,
++ 		  __entry->l_state)
++ );
++ #define DEFINE_MAP_EXTENT_DEFERRED_EVENT(name) \
++ DEFINE_EVENT(xfs_map_extent_deferred_class, name, \
++ 	TP_PROTO(struct xfs_mount *mp, xfs_agnumber_t agno, \
++ 		 int op, \
++ 		 xfs_agblock_t agbno, \
++ 		 xfs_ino_t ino, \
++ 		 int whichfork, \
++ 		 xfs_fileoff_t offset, \
++ 		 xfs_filblks_t len, \
++ 		 xfs_exntst_t state), \
++ 	TP_ARGS(mp, agno, op, agbno, ino, whichfork, offset, len, state))
++ 
++ DEFINE_DEFER_EVENT(xfs_defer_init);
++ DEFINE_DEFER_EVENT(xfs_defer_cancel);
++ DEFINE_DEFER_EVENT(xfs_defer_trans_roll);
++ DEFINE_DEFER_EVENT(xfs_defer_trans_abort);
++ DEFINE_DEFER_EVENT(xfs_defer_finish);
++ DEFINE_DEFER_EVENT(xfs_defer_finish_done);
++ 
++ DEFINE_DEFER_ERROR_EVENT(xfs_defer_trans_roll_error);
++ DEFINE_DEFER_ERROR_EVENT(xfs_defer_finish_error);
++ DEFINE_DEFER_ERROR_EVENT(xfs_defer_op_finish_error);
++ 
++ DEFINE_DEFER_PENDING_EVENT(xfs_defer_intake_work);
++ DEFINE_DEFER_PENDING_EVENT(xfs_defer_intake_cancel);
++ DEFINE_DEFER_PENDING_EVENT(xfs_defer_pending_commit);
++ DEFINE_DEFER_PENDING_EVENT(xfs_defer_pending_cancel);
++ DEFINE_DEFER_PENDING_EVENT(xfs_defer_pending_finish);
++ DEFINE_DEFER_PENDING_EVENT(xfs_defer_pending_abort);
++ 
++ DEFINE_MAP_EXTENT_DEFERRED_EVENT(xfs_defer_map_extent);
++ 
++ #define DEFINE_BMAP_FREE_DEFERRED_EVENT DEFINE_PHYS_EXTENT_DEFERRED_EVENT
++ DEFINE_BMAP_FREE_DEFERRED_EVENT(xfs_bmap_free_defer);
++ DEFINE_BMAP_FREE_DEFERRED_EVENT(xfs_bmap_free_deferred);
++ 
+++>>>>>>> ba9e780246a1 (xfs: add tracepoints and error injection for deferred extent freeing)
+  #endif /* _TRACE_XFS_H */
+  
+  #undef TRACE_INCLUDE_PATH
+diff --git a/fs/xfs/libxfs/xfs_alloc.c b/fs/xfs/libxfs/xfs_alloc.c
+index 38fe0753ea05..b89bdbbab26a 100644
+--- a/fs/xfs/libxfs/xfs_alloc.c
++++ b/fs/xfs/libxfs/xfs_alloc.c
+@@ -2702,6 +2702,13 @@ xfs_free_extent(
+ 
+ 	ASSERT(len != 0);
+ 
++	trace_xfs_bmap_free_deferred(mp, agno, 0, agbno, len);
++
++	if (XFS_TEST_ERROR(false, mp,
++			XFS_ERRTAG_FREE_EXTENT,
++			XFS_RANDOM_FREE_EXTENT))
++		return -EIO;
++
+ 	error = xfs_free_extent_fix_freelist(tp, agno, &agbp);
+ 	if (error)
+ 		return error;
+* Unmerged path fs/xfs/libxfs/xfs_bmap.c
+diff --git a/fs/xfs/xfs_error.h b/fs/xfs/xfs_error.h
+index 2e4f67f68856..da6f951435c9 100644
+--- a/fs/xfs/xfs_error.h
++++ b/fs/xfs/xfs_error.h
+@@ -90,7 +90,8 @@ extern void xfs_verifier_error(struct xfs_buf *bp);
+ #define XFS_ERRTAG_STRATCMPL_IOERR			19
+ #define XFS_ERRTAG_DIOWRITE_IOERR			20
+ #define XFS_ERRTAG_BMAPIFORMAT				21
+-#define XFS_ERRTAG_MAX					22
++#define XFS_ERRTAG_FREE_EXTENT				22
++#define XFS_ERRTAG_MAX					23
+ 
+ /*
+  * Random factors for above tags, 1 means always, 2 means 1/2 time, etc.
+@@ -117,6 +118,7 @@ extern void xfs_verifier_error(struct xfs_buf *bp);
+ #define XFS_RANDOM_STRATCMPL_IOERR			(XFS_RANDOM_DEFAULT/10)
+ #define XFS_RANDOM_DIOWRITE_IOERR			(XFS_RANDOM_DEFAULT/10)
+ #define	XFS_RANDOM_BMAPIFORMAT				XFS_RANDOM_DEFAULT
++#define XFS_RANDOM_FREE_EXTENT				1
+ 
+ #ifdef DEBUG
+ extern int xfs_error_test_active;
+* Unmerged path fs/xfs/xfs_trace.h
