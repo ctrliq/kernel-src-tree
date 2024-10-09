@@ -1,0 +1,147 @@
+Btrfs: catch invalid free space trees
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Omar Sandoval <osandov@fb.com>
+commit 6675df311db87aa2107a04ef97e19420953cbace
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/6675df31.failed
+
+There are two separate issues that can lead to corrupted free space
+trees.
+
+1. The free space tree bitmaps had an endianness issue on big-endian
+   systems which is fixed by an earlier patch in this series.
+2. btrfs-progs before v4.7.3 modified filesystems without updating the
+   free space tree.
+
+To catch both of these issues at once, we need to force the free space
+tree to be rebuilt. To do so, add a FREE_SPACE_TREE_VALID compat_ro bit.
+If the bit isn't set, we know that it was either produced by a broken
+big-endian kernel or may have been corrupted by btrfs-progs.
+
+This also provides us with a way to add rudimentary read-write support
+for the free space tree to btrfs-progs: it can just clear this bit and
+have the kernel rebuild the free space tree.
+
+	Cc: stable@vger.kernel.org # 4.5+
+	Tested-by: Holger Hoffstätte <holger@applied-asynchrony.com>
+	Tested-by: Chandan Rajendra <chandan@linux.vnet.ibm.com>
+	Signed-off-by: Omar Sandoval <osandov@fb.com>
+	Signed-off-by: David Sterba <dsterba@suse.com>
+(cherry picked from commit 6675df311db87aa2107a04ef97e19420953cbace)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/ctree.h
+#	fs/btrfs/disk-io.c
+#	fs/btrfs/free-space-tree.c
+diff --cc fs/btrfs/ctree.h
+index 697e1ee4061a,791e47ce9d27..000000000000
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@@ -247,7 -249,11 +247,15 @@@ struct btrfs_super_block 
+  #define BTRFS_FEATURE_COMPAT_SUPP		0ULL
+  #define BTRFS_FEATURE_COMPAT_SAFE_SET		0ULL
+  #define BTRFS_FEATURE_COMPAT_SAFE_CLEAR		0ULL
+++<<<<<<< HEAD
+ +#define BTRFS_FEATURE_COMPAT_RO_SUPP		0ULL
+++=======
++ 
++ #define BTRFS_FEATURE_COMPAT_RO_SUPP			\
++ 	(BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE |	\
++ 	 BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE_VALID)
++ 
+++>>>>>>> 6675df311db8 (Btrfs: catch invalid free space trees)
+  #define BTRFS_FEATURE_COMPAT_RO_SAFE_SET	0ULL
+  #define BTRFS_FEATURE_COMPAT_RO_SAFE_CLEAR	0ULL
+  
+diff --cc fs/btrfs/disk-io.c
+index e91f5fae0f68,3dede6d53bad..000000000000
+--- a/fs/btrfs/disk-io.c
++++ b/fs/btrfs/disk-io.c
+@@@ -3124,6 -3130,38 +3125,41 @@@ retry_root_backup
+  	if (sb->s_flags & MS_RDONLY)
+  		return 0;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (btrfs_test_opt(fs_info, CLEAR_CACHE) &&
++ 	    btrfs_fs_compat_ro(fs_info, FREE_SPACE_TREE)) {
++ 		clear_free_space_tree = 1;
++ 	} else if (btrfs_fs_compat_ro(fs_info, FREE_SPACE_TREE) &&
++ 		   !btrfs_fs_compat_ro(fs_info, FREE_SPACE_TREE_VALID)) {
++ 		btrfs_warn(fs_info, "free space tree is invalid");
++ 		clear_free_space_tree = 1;
++ 	}
++ 
++ 	if (clear_free_space_tree) {
++ 		btrfs_info(fs_info, "clearing free space tree");
++ 		ret = btrfs_clear_free_space_tree(fs_info);
++ 		if (ret) {
++ 			btrfs_warn(fs_info,
++ 				   "failed to clear free space tree: %d", ret);
++ 			close_ctree(tree_root);
++ 			return ret;
++ 		}
++ 	}
++ 
++ 	if (btrfs_test_opt(tree_root->fs_info, FREE_SPACE_TREE) &&
++ 	    !btrfs_fs_compat_ro(fs_info, FREE_SPACE_TREE)) {
++ 		btrfs_info(fs_info, "creating free space tree");
++ 		ret = btrfs_create_free_space_tree(fs_info);
++ 		if (ret) {
++ 			btrfs_warn(fs_info,
++ 				"failed to create free space tree: %d", ret);
++ 			close_ctree(tree_root);
++ 			return ret;
++ 		}
++ 	}
++ 
+++>>>>>>> 6675df311db8 (Btrfs: catch invalid free space trees)
+  	down_read(&fs_info->cleanup_work_sem);
+  	if ((ret = btrfs_orphan_cleanup(fs_info->fs_root)) ||
+  	    (ret = btrfs_orphan_cleanup(fs_info->tree_root))) {
+diff --cc fs/btrfs/free-space-tree.c
+index 6da7e246ea6b,ea605ffd0e03..000000000000
+--- a/fs/btrfs/free-space-tree.c
++++ b/fs/btrfs/free-space-tree.c
+@@@ -1178,6 -1182,8 +1178,11 @@@ int btrfs_create_free_space_tree(struc
+  	}
+  
+  	btrfs_set_fs_compat_ro(fs_info, FREE_SPACE_TREE);
+++<<<<<<< HEAD
+++=======
++ 	btrfs_set_fs_compat_ro(fs_info, FREE_SPACE_TREE_VALID);
++ 	fs_info->creating_free_space_tree = 0;
+++>>>>>>> 6675df311db8 (Btrfs: catch invalid free space trees)
+  
+  	ret = btrfs_commit_transaction(trans, tree_root);
+  	if (ret)
+* Unmerged path fs/btrfs/ctree.h
+* Unmerged path fs/btrfs/disk-io.c
+* Unmerged path fs/btrfs/free-space-tree.c
+diff --git a/include/uapi/linux/btrfs.h b/include/uapi/linux/btrfs.h
+index 764fd4b11701..60ce431a45c0 100644
+--- a/include/uapi/linux/btrfs.h
++++ b/include/uapi/linux/btrfs.h
+@@ -228,7 +228,17 @@ struct btrfs_ioctl_fs_info_args {
+  * Used by:
+  * struct btrfs_ioctl_feature_flags
+  */
+-#define BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE	(1ULL << 0)
++#define BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE		(1ULL << 0)
++/*
++ * Older kernels (< 4.9) on big-endian systems produced broken free space tree
++ * bitmaps, and btrfs-progs also used to corrupt the free space tree (versions
++ * < 4.7.3).  If this bit is clear, then the free space tree cannot be trusted.
++ * btrfs-progs can also intentionally clear this bit to ask the kernel to
++ * rebuild the free space tree, however this might not work on older kernels
++ * that do not know about this bit. If not sure, clear the cache manually on
++ * first mount when booting older kernel versions.
++ */
++#define BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE_VALID	(1ULL << 1)
+ 
+ #define BTRFS_FEATURE_INCOMPAT_MIXED_BACKREF	(1ULL << 0)
+ #define BTRFS_FEATURE_INCOMPAT_DEFAULT_SUBVOL	(1ULL << 1)
