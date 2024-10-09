@@ -1,0 +1,90 @@
+dm thin: fix a memory leak when passing discard bio down
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Dennis Yang <dennisyang@qnap.com>
+commit 948f581a53b704b984aa20df009f0a2b4cf7f907
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/948f581a.failed
+
+dm-thin does not free the discard_parent bio after all chained sub
+bios finished. The following kmemleak report could be observed after
+pool with discard_passdown option processes discard bios in
+linux v4.11-rc7. To fix this, we drop the discard_parent bio reference
+when its endio (passdown_endio) called.
+
+unreferenced object 0xffff8803d6b29700 (size 256):
+  comm "kworker/u8:0", pid 30349, jiffies 4379504020 (age 143002.776s)
+  hex dump (first 32 bytes):
+    00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+    01 00 00 00 00 00 00 f0 00 00 00 00 00 00 00 00  ................
+  backtrace:
+    [<ffffffff81a5efd9>] kmemleak_alloc+0x49/0xa0
+    [<ffffffff8114ec34>] kmem_cache_alloc+0xb4/0x100
+    [<ffffffff8110eec0>] mempool_alloc_slab+0x10/0x20
+    [<ffffffff8110efa5>] mempool_alloc+0x55/0x150
+    [<ffffffff81374939>] bio_alloc_bioset+0xb9/0x260
+    [<ffffffffa018fd20>] process_prepared_discard_passdown_pt1+0x40/0x1c0 [dm_thin_pool]
+    [<ffffffffa018b409>] break_up_discard_bio+0x1a9/0x200 [dm_thin_pool]
+    [<ffffffffa018b484>] process_discard_cell_passdown+0x24/0x40 [dm_thin_pool]
+    [<ffffffffa018b24d>] process_discard_bio+0xdd/0xf0 [dm_thin_pool]
+    [<ffffffffa018ecf6>] do_worker+0xa76/0xd50 [dm_thin_pool]
+    [<ffffffff81086239>] process_one_work+0x139/0x370
+    [<ffffffff810867b1>] worker_thread+0x61/0x450
+    [<ffffffff8108b316>] kthread+0xd6/0xf0
+    [<ffffffff81a6cd1f>] ret_from_fork+0x3f/0x70
+    [<ffffffffffffffff>] 0xffffffffffffffff
+
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Dennis Yang <dennisyang@qnap.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 948f581a53b704b984aa20df009f0a2b4cf7f907)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-thin.c
+diff --cc drivers/md/dm-thin.c
+index b773c1fd5e36,f90bcbf24ebc..000000000000
+--- a/drivers/md/dm-thin.c
++++ b/drivers/md/dm-thin.c
+@@@ -1103,11 -1047,32 +1103,36 @@@ static int passdown_double_checking_sha
+  
+  		b = e;
+  	}
+ -out:
+ -	end_discard(&op, r);
+ +
+ +	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static void process_prepared_discard_passdown(struct dm_thin_new_mapping *m)
+++=======
++ static void queue_passdown_pt2(struct dm_thin_new_mapping *m)
++ {
++ 	unsigned long flags;
++ 	struct pool *pool = m->tc->pool;
++ 
++ 	spin_lock_irqsave(&pool->lock, flags);
++ 	list_add_tail(&m->list, &pool->prepared_discards_pt2);
++ 	spin_unlock_irqrestore(&pool->lock, flags);
++ 	wake_worker(pool);
++ }
++ 
++ static void passdown_endio(struct bio *bio)
++ {
++ 	/*
++ 	 * It doesn't matter if the passdown discard failed, we still want
++ 	 * to unmap (we ignore err).
++ 	 */
++ 	queue_passdown_pt2(bio->bi_private);
++ 	bio_put(bio);
++ }
++ 
++ static void process_prepared_discard_passdown_pt1(struct dm_thin_new_mapping *m)
+++>>>>>>> 948f581a53b7 (dm thin: fix a memory leak when passing discard bio down)
+  {
+  	int r;
+  	struct thin_c *tc = m->tc;
+* Unmerged path drivers/md/dm-thin.c
