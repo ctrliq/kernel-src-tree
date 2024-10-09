@@ -1,0 +1,125 @@
+pidns: Add a limit on the number of pid namespaces
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Eric W. Biederman <ebiederm@xmission.com>
+commit f333c700c6100b53050980986be922bb21466e29
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/f333c700.failed
+
+	Acked-by: Kees Cook <keescook@chromium.org>
+	Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+(cherry picked from commit f333c700c6100b53050980986be922bb21466e29)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/user_namespace.h
+#	kernel/ucount.c
+diff --cc include/linux/user_namespace.h
+index 9b176275291d,9ee94827728d..000000000000
+--- a/include/linux/user_namespace.h
++++ b/include/linux/user_namespace.h
+@@@ -22,6 -22,14 +22,17 @@@ struct uid_gid_map {	/* 64 bytes -- 1 c
+  
+  #define USERNS_INIT_FLAGS USERNS_SETGROUPS_ALLOWED
+  
+++<<<<<<< HEAD
+++=======
++ struct ucounts;
++ 
++ enum ucount_type {
++ 	UCOUNT_USER_NAMESPACES,
++ 	UCOUNT_PID_NAMESPACES,
++ 	UCOUNT_COUNTS,
++ };
++ 
+++>>>>>>> f333c700c610 (pidns: Add a limit on the number of pid namespaces)
+  struct user_namespace {
+  	struct uid_gid_map	uid_map;
+  	struct uid_gid_map	gid_map;
+* Unmerged path kernel/ucount.c
+diff --git a/include/linux/pid_namespace.h b/include/linux/pid_namespace.h
+index 7246ef3d4455..772fc3e06a09 100644
+--- a/include/linux/pid_namespace.h
++++ b/include/linux/pid_namespace.h
+@@ -38,6 +38,7 @@ struct pid_namespace {
+ 	struct bsd_acct_struct *bacct;
+ #endif
+ 	struct user_namespace *user_ns;
++	struct ucounts *ucounts;
+ 	struct work_struct proc_work;
+ 	kgid_t pid_gid;
+ 	int hide_pid;
+* Unmerged path include/linux/user_namespace.h
+diff --git a/kernel/pid_namespace.c b/kernel/pid_namespace.c
+index 710b724f760b..0b1bece05a5f 100644
+--- a/kernel/pid_namespace.c
++++ b/kernel/pid_namespace.c
+@@ -79,23 +79,36 @@ static void proc_cleanup_work(struct work_struct *work)
+ /* MAX_PID_NS_LEVEL is needed for limiting size of 'struct pid' */
+ #define MAX_PID_NS_LEVEL 32
+ 
++static struct ucounts *inc_pid_namespaces(struct user_namespace *ns)
++{
++	return inc_ucount(ns, current_euid(), UCOUNT_PID_NAMESPACES);
++}
++
++static void dec_pid_namespaces(struct ucounts *ucounts)
++{
++	dec_ucount(ucounts, UCOUNT_PID_NAMESPACES);
++}
++
+ static struct pid_namespace *create_pid_namespace(struct user_namespace *user_ns,
+ 	struct pid_namespace *parent_pid_ns)
+ {
+ 	struct pid_namespace *ns;
+ 	unsigned int level = parent_pid_ns->level + 1;
++	struct ucounts *ucounts;
+ 	int i;
+ 	int err;
+ 
+-	if (level > MAX_PID_NS_LEVEL) {
+-		err = -EINVAL;
++	err = -EINVAL;
++	if (level > MAX_PID_NS_LEVEL)
++		goto out;
++	ucounts = inc_pid_namespaces(user_ns);
++	if (!ucounts)
+ 		goto out;
+-	}
+ 
+ 	err = -ENOMEM;
+ 	ns = kmem_cache_zalloc(pid_ns_cachep, GFP_KERNEL);
+ 	if (ns == NULL)
+-		goto out;
++		goto out_dec;
+ 
+ 	ns->pidmap[0].page = kzalloc(PAGE_SIZE, GFP_KERNEL);
+ 	if (!ns->pidmap[0].page)
+@@ -113,6 +126,7 @@ static struct pid_namespace *create_pid_namespace(struct user_namespace *user_ns
+ 	ns->level = level;
+ 	ns->parent = get_pid_ns(parent_pid_ns);
+ 	ns->user_ns = get_user_ns(user_ns);
++	ns->ucounts = ucounts;
+ 	ns->nr_hashed = PIDNS_HASH_ADDING;
+ 	INIT_WORK(&ns->proc_work, proc_cleanup_work);
+ 
+@@ -128,6 +142,8 @@ out_free_map:
+ 	kfree(ns->pidmap[0].page);
+ out_free:
+ 	kmem_cache_free(pid_ns_cachep, ns);
++out_dec:
++	dec_pid_namespaces(ucounts);
+ out:
+ 	return ERR_PTR(err);
+ }
+@@ -145,6 +161,7 @@ static void destroy_pid_namespace(struct pid_namespace *ns)
+ 	proc_free_inum(ns->proc_inum);
+ 	for (i = 0; i < PIDMAP_ENTRIES; i++)
+ 		kfree(ns->pidmap[i].page);
++	dec_pid_namespaces(ns->ucounts);
+ 	put_user_ns(ns->user_ns);
+ 	call_rcu(&ns->rcu, delayed_free_pidns);
+ }
+* Unmerged path kernel/ucount.c
