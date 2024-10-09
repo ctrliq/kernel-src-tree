@@ -1,0 +1,195 @@
+sched: Allow hotplug notifiers to be setup early
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit e26fbffd32c28107d9d268b432706ccf84fb6411
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/e26fbffd.failed
+
+Prevent the SMP scheduler related notifiers to be executed before the smp
+scheduler is initialized and install them early.
+
+This is a preparatory change for further consolidation of the hotplug notifier
+maze.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Acked-by: Peter Zijlstra <peterz@infradead.org>
+	Cc: rt@linutronix.de
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit e26fbffd32c28107d9d268b432706ccf84fb6411)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/core.c
+diff --cc kernel/sched/core.c
+index a2be1733b651,328502c9af00..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -5770,126 -5194,9 +5770,128 @@@ out
+  }
+  
+  #ifdef CONFIG_SMP
+ +void do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask)
+ +{
+ +	if (p->sched_class && p->sched_class->set_cpus_allowed)
+ +		p->sched_class->set_cpus_allowed(p, new_mask);
+ +
+ +	cpumask_copy(&p->cpus_allowed, new_mask);
+ +	p->nr_cpus_allowed = cpumask_weight(new_mask);
+ +}
+ +
+ +/*
+ + * This is how migration works:
+ + *
+ + * 1) we invoke migration_cpu_stop() on the target CPU using
+ + *    stop_one_cpu().
+ + * 2) stopper starts to run (implicitly forcing the migrated thread
+ + *    off the CPU)
+ + * 3) it checks whether the migrated task is still in the wrong runqueue.
+ + * 4) if it's in the wrong runqueue then the migration thread removes
+ + *    it and puts it into the right queue.
+ + * 5) stopper completes and stop_one_cpu() returns and the migration
+ + *    is done.
+ + */
+ +
+ +/*
+ + * Change a given task's CPU affinity. Migrate the thread to a
+ + * proper CPU and schedule it away if the CPU it's executing on
+ + * is removed from the allowed bitmask.
+ + *
+ + * NOTE: the caller must have a valid reference to the task, the
+ + * task must not exit() & deallocate itself prematurely. The
+ + * call is not atomic; no spinlocks may be held.
+ + */
+ +int set_cpus_allowed_ptr(struct task_struct *p, const struct cpumask *new_mask)
+ +{
+ +	unsigned long flags;
+ +	struct rq *rq;
+ +	unsigned int dest_cpu;
+ +	int ret = 0;
+ +
+ +	rq = task_rq_lock(p, &flags);
+ +
+ +	if (cpumask_equal(&p->cpus_allowed, new_mask))
+ +		goto out;
+ +
+ +	if (!cpumask_intersects(new_mask, cpu_active_mask)) {
+ +		ret = -EINVAL;
+ +		goto out;
+ +	}
+ +
+ +	do_set_cpus_allowed(p, new_mask);
+ +
+ +	/* Can the task run on the task's current CPU? If so, we're done */
+ +	if (cpumask_test_cpu(task_cpu(p), new_mask))
+ +		goto out;
+ +
+ +	dest_cpu = cpumask_any_and(cpu_active_mask, new_mask);
+ +	if (p->on_rq) {
+ +		struct migration_arg arg = { p, dest_cpu };
+ +		/* Need help from migration thread: drop lock and wait. */
+ +		task_rq_unlock(rq, p, &flags);
+ +		stop_one_cpu(cpu_of(rq), migration_cpu_stop, &arg);
+ +		tlb_migrate_finish(p->mm);
+ +		return 0;
+ +	}
+ +out:
+ +	task_rq_unlock(rq, p, &flags);
+ +
+ +	return ret;
+ +}
+ +EXPORT_SYMBOL_GPL(set_cpus_allowed_ptr);
+ +
+ +/*
+ + * Move (not current) task off this cpu, onto dest cpu. We're doing
+ + * this because either it can't run here any more (set_cpus_allowed()
+ + * away from this CPU, or CPU going down), or because we're
+ + * attempting to rebalance this task on exec (sched_exec).
+ + *
+ + * So we race with normal scheduler movements, but that's OK, as long
+ + * as the task is no longer on this CPU.
+ + *
+ + * Returns non-zero if task was successfully migrated.
+ + */
+ +static int __migrate_task(struct task_struct *p, int src_cpu, int dest_cpu)
+ +{
+ +	struct rq *rq_dest, *rq_src;
+ +	int ret = 0;
+ +
+ +	if (unlikely(!cpu_active(dest_cpu)))
+ +		return ret;
+ +
+ +	rq_src = cpu_rq(src_cpu);
+ +	rq_dest = cpu_rq(dest_cpu);
+ +
+ +	raw_spin_lock(&p->pi_lock);
+ +	double_rq_lock(rq_src, rq_dest);
+ +	/* Already moved. */
+ +	if (task_cpu(p) != src_cpu)
+ +		goto done;
+ +	/* Affinity changed (again). */
+ +	if (!cpumask_test_cpu(dest_cpu, tsk_cpus_allowed(p)))
+ +		goto fail;
+ +
+ +	/*
+ +	 * If we're not on a rq, the next wake-up will ensure we're
+ +	 * placed properly.
+ +	 */
+ +	if (p->on_rq) {
+ +		dequeue_task(rq_src, p, 0);
+ +		set_task_cpu(p, dest_cpu);
+ +		enqueue_task(rq_dest, p, 0);
+ +		check_preempt_curr(rq_dest, p, 0);
+ +	}
+ +done:
+ +	ret = 1;
+ +fail:
+ +	double_rq_unlock(rq_src, rq_dest);
+ +	raw_spin_unlock(&p->pi_lock);
+ +	return ret;
+ +}
+  
++ static bool sched_smp_initialized __read_mostly;
++ 
+  #ifdef CONFIG_NUMA_BALANCING
+  /* Migrate current task p to target_cpu */
+  int migrate_task_to(struct task_struct *p, int target_cpu)
+@@@ -6335,27 -5509,11 +6337,35 @@@ static int sched_cpu_inactive(struct no
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static int __init migration_init(void)
+ +{
+ +	void *cpu = (void *)(long)smp_processor_id();
+ +	int err;
+ +
+ +	/* Initialize migration for the boot CPU */
+ +	err = migration_call(&migration_notifier, CPU_UP_PREPARE, cpu);
+ +	BUG_ON(err == NOTIFY_BAD);
+ +	migration_call(&migration_notifier, CPU_ONLINE, cpu);
+ +	register_cpu_notifier(&migration_notifier);
+ +
+ +	/* Register cpu active notifiers */
+ +	cpu_notifier(sched_cpu_active, CPU_PRI_SCHED_ACTIVE);
+ +	cpu_notifier(sched_cpu_inactive, CPU_PRI_SCHED_INACTIVE);
+ +
+ +	return 0;
+ +}
+ +early_initcall(migration_init);
+ +#endif
+ +
+ +#ifdef CONFIG_SMP
+++=======
++ int sched_cpu_starting(unsigned int cpu)
++ {
++ 	set_cpu_rq_start_time(cpu);
++ 	return 0;
++ }
+++>>>>>>> e26fbffd32c2 (sched: Allow hotplug notifiers to be setup early)
+  
+  static cpumask_var_t sched_domains_tmpmask; /* sched_domains_mutex */
+  
+* Unmerged path kernel/sched/core.c
