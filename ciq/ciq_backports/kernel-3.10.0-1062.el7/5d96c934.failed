@@ -1,0 +1,184 @@
+acpi/nfit, x86/mce: Handle only uncorrectable machine checks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [acpi] nfit, x86/mce: Handle only uncorrectable machine checks (Jeff Moyer) [1662229]
+Rebuild_FUZZ: 95.65%
+commit-author Vishal Verma <vishal.l.verma@intel.com>
+commit 5d96c9342c23ee1d084802dcf064caa67ecaa45b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/5d96c934.failed
+
+The MCE handler for nfit devices is called for memory errors on a
+Non-Volatile DIMM and adds the error location to a 'badblocks' list.
+This list is used by the various NVDIMM drivers to avoid consuming known
+poison locations during IO.
+
+The MCE handler gets called for both corrected and uncorrectable errors.
+Until now, both kinds of errors have been added to the badblocks list.
+However, corrected memory errors indicate that the problem has already
+been fixed by hardware, and the resulting interrupt is merely a
+notification to Linux.
+
+As far as future accesses to that location are concerned, it is
+perfectly fine to use, and thus doesn't need to be included in the above
+badblocks list.
+
+Add a check in the nfit MCE handler to filter out corrected mce events,
+and only process uncorrectable errors.
+
+Fixes: 6839a6d96f4e ("nfit: do an ARS scrub on hitting a latent media error")
+	Reported-by: Omar Avelar <omar.avelar@intel.com>
+	Signed-off-by: Vishal Verma <vishal.l.verma@intel.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+CC: Arnd Bergmann <arnd@arndb.de>
+CC: Dan Williams <dan.j.williams@intel.com>
+CC: Dave Jiang <dave.jiang@intel.com>
+CC: elliott@hpe.com
+CC: "H. Peter Anvin" <hpa@zytor.com>
+CC: Ingo Molnar <mingo@redhat.com>
+CC: Len Brown <lenb@kernel.org>
+CC: linux-acpi@vger.kernel.org
+CC: linux-edac <linux-edac@vger.kernel.org>
+CC: linux-nvdimm@lists.01.org
+CC: Qiuxu Zhuo <qiuxu.zhuo@intel.com>
+CC: "Rafael J. Wysocki" <rjw@rjwysocki.net>
+CC: Ross Zwisler <zwisler@kernel.org>
+CC: stable <stable@vger.kernel.org>
+CC: Thomas Gleixner <tglx@linutronix.de>
+CC: Tony Luck <tony.luck@intel.com>
+CC: x86-ml <x86@kernel.org>
+CC: Yazen Ghannam <yazen.ghannam@amd.com>
+Link: http://lkml.kernel.org/r/20181026003729.8420-1-vishal.l.verma@intel.com
+(cherry picked from commit 5d96c9342c23ee1d084802dcf064caa67ecaa45b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/mcheck/mce.c
+diff --cc arch/x86/kernel/cpu/mcheck/mce.c
+index f4e26139f488,77527b8ea982..000000000000
+--- a/arch/x86/kernel/cpu/mcheck/mce.c
++++ b/arch/x86/kernel/cpu/mcheck/mce.c
+@@@ -553,6 -505,91 +553,93 @@@ static int mce_usable_address(struct mc
+  	return 1;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ bool mce_is_memory_error(struct mce *m)
++ {
++ 	if (m->cpuvendor == X86_VENDOR_AMD ||
++ 	    m->cpuvendor == X86_VENDOR_HYGON) {
++ 		return amd_mce_is_memory_error(m);
++ 	} else if (m->cpuvendor == X86_VENDOR_INTEL) {
++ 		/*
++ 		 * Intel SDM Volume 3B - 15.9.2 Compound Error Codes
++ 		 *
++ 		 * Bit 7 of the MCACOD field of IA32_MCi_STATUS is used for
++ 		 * indicating a memory error. Bit 8 is used for indicating a
++ 		 * cache hierarchy error. The combination of bit 2 and bit 3
++ 		 * is used for indicating a `generic' cache hierarchy error
++ 		 * But we can't just blindly check the above bits, because if
++ 		 * bit 11 is set, then it is a bus/interconnect error - and
++ 		 * either way the above bits just gives more detail on what
++ 		 * bus/interconnect error happened. Note that bit 12 can be
++ 		 * ignored, as it's the "filter" bit.
++ 		 */
++ 		return (m->status & 0xef80) == BIT(7) ||
++ 		       (m->status & 0xef00) == BIT(8) ||
++ 		       (m->status & 0xeffc) == 0xc;
++ 	}
++ 
++ 	return false;
++ }
++ EXPORT_SYMBOL_GPL(mce_is_memory_error);
++ 
++ bool mce_is_correctable(struct mce *m)
++ {
++ 	if (m->cpuvendor == X86_VENDOR_AMD && m->status & MCI_STATUS_DEFERRED)
++ 		return false;
++ 
++ 	if (m->cpuvendor == X86_VENDOR_HYGON && m->status & MCI_STATUS_DEFERRED)
++ 		return false;
++ 
++ 	if (m->status & MCI_STATUS_UC)
++ 		return false;
++ 
++ 	return true;
++ }
++ EXPORT_SYMBOL_GPL(mce_is_correctable);
++ 
++ static bool cec_add_mce(struct mce *m)
++ {
++ 	if (!m)
++ 		return false;
++ 
++ 	/* We eat only correctable DRAM errors with usable addresses. */
++ 	if (mce_is_memory_error(m) &&
++ 	    mce_is_correctable(m)  &&
++ 	    mce_usable_address(m))
++ 		if (!cec_add_elem(m->addr >> PAGE_SHIFT))
++ 			return true;
++ 
++ 	return false;
++ }
++ 
++ static int mce_first_notifier(struct notifier_block *nb, unsigned long val,
++ 			      void *data)
++ {
++ 	struct mce *m = (struct mce *)data;
++ 
++ 	if (!m)
++ 		return NOTIFY_DONE;
++ 
++ 	if (cec_add_mce(m))
++ 		return NOTIFY_STOP;
++ 
++ 	/* Emit the trace record: */
++ 	trace_mce_record(m);
++ 
++ 	set_bit(0, &mce_need_notify);
++ 
++ 	mce_notify_irq();
++ 
++ 	return NOTIFY_DONE;
++ }
++ 
++ static struct notifier_block first_nb = {
++ 	.notifier_call	= mce_first_notifier,
++ 	.priority	= MCE_PRIO_FIRST,
++ };
++ 
+++>>>>>>> 5d96c9342c23 (acpi/nfit, x86/mce: Handle only uncorrectable machine checks)
+  static int srao_decode_notifier(struct notifier_block *nb, unsigned long val,
+  				void *data)
+  {
+diff --git a/arch/x86/include/asm/mce.h b/arch/x86/include/asm/mce.h
+index 24cc5fd74543..ed30a6859226 100644
+--- a/arch/x86/include/asm/mce.h
++++ b/arch/x86/include/asm/mce.h
+@@ -269,6 +269,7 @@ static inline int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *s
+ 
+ int mce_available(struct cpuinfo_x86 *c);
+ bool mce_is_memory_error(struct mce *m);
++bool mce_is_correctable(struct mce *m);
+ 
+ DECLARE_PER_CPU(unsigned, mce_exception_count);
+ DECLARE_PER_CPU(unsigned, mce_poll_count);
+* Unmerged path arch/x86/kernel/cpu/mcheck/mce.c
+diff --git a/drivers/acpi/nfit/mce.c b/drivers/acpi/nfit/mce.c
+index e9626bf6ca29..7a51707f87e9 100644
+--- a/drivers/acpi/nfit/mce.c
++++ b/drivers/acpi/nfit/mce.c
+@@ -25,8 +25,8 @@ static int nfit_handle_mce(struct notifier_block *nb, unsigned long val,
+ 	struct acpi_nfit_desc *acpi_desc;
+ 	struct nfit_spa *nfit_spa;
+ 
+-	/* We only care about memory errors */
+-	if (!mce_is_memory_error(mce))
++	/* We only care about uncorrectable memory errors */
++	if (!mce_is_memory_error(mce) || mce_is_correctable(mce))
+ 		return NOTIFY_DONE;
+ 
+ 	/*
