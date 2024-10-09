@@ -1,0 +1,110 @@
+iwlwifi: mvm: change state when queueing agg start work
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Naftali Goldstein <naftali.goldstein@intel.com>
+commit bd800e41a3de5c7e56b2fd27088bdaf5e228d227
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/bd800e41.failed
+
+Add a new state to enum iwl_mvm_agg_state, which is used between
+queueing the work that starts tx aggregations and actually starting that
+work (changing to state IWL_AGG_STARTING).
+This solves a race where ieee80211_start_tx_ba_session is called a
+second time, before the work queued by the first run has a chance to
+change the agg_state. In this case the second call to
+ieee80211_start_tx_ba_session returns an error, and the fallback is to
+abort the ba session start.
+
+Fixes: 482e48440a0e ("iwlwifi: mvm: change open and close criteria of a BA session")
+	Signed-off-by: Naftali Goldstein <naftali.goldstein@intel.com>
+	Signed-off-by: Luca Coelho <luciano.coelho@intel.com>
+(cherry picked from commit bd800e41a3de5c7e56b2fd27088bdaf5e228d227)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/intel/iwlwifi/mvm/rs.c
+diff --cc drivers/net/wireless/intel/iwlwifi/mvm/rs.c
+index ce907c58ebf6,0fe723ca844e..000000000000
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/rs.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/rs.c
+@@@ -636,15 -638,32 +636,31 @@@ static int rs_tl_turn_on_agg_for_tid(st
+  	return ret;
+  }
+  
+ -static void rs_tl_turn_on_agg(struct iwl_mvm *mvm, struct iwl_mvm_sta *mvmsta,
+ -			      u8 tid, struct iwl_lq_sta *lq_sta,
+ +static void rs_tl_turn_on_agg(struct iwl_mvm *mvm, u8 tid,
+ +			      struct iwl_lq_sta *lq_data,
+  			      struct ieee80211_sta *sta)
+  {
+ -	struct iwl_mvm_tid_data *tid_data;
+ -
+ -	/*
+ -	 * In AP mode, tid can be equal to IWL_MAX_TID_COUNT
+ -	 * when the frame is not QoS
+ -	 */
+ -	if (WARN_ON_ONCE(tid > IWL_MAX_TID_COUNT)) {
+ +	if (tid < IWL_MAX_TID_COUNT)
+ +		rs_tl_turn_on_agg_for_tid(mvm, lq_data, tid, sta);
+ +	else
+  		IWL_ERR(mvm, "tid exceeds max TID count: %d/%d\n",
+  			tid, IWL_MAX_TID_COUNT);
+++<<<<<<< HEAD
+++=======
++ 		return;
++ 	} else if (tid == IWL_MAX_TID_COUNT) {
++ 		return;
++ 	}
++ 
++ 	tid_data = &mvmsta->tid_data[tid];
++ 	if ((tid_data->state == IWL_AGG_OFF) &&
++ 	    (lq_sta->tx_agg_tid_en & BIT(tid)) &&
++ 	    (tid_data->tx_count_last >= IWL_MVM_RS_AGG_START_THRESHOLD)) {
++ 		IWL_DEBUG_RATE(mvm, "try to aggregate tid %d\n", tid);
++ 		if (rs_tl_turn_on_agg_for_tid(mvm, lq_sta, tid, sta) == 0)
++ 			tid_data->state = IWL_AGG_QUEUED;
++ 	}
+++>>>>>>> bd800e41a3de (iwlwifi: mvm: change state when queueing agg start work)
+  }
+  
+  static inline int get_num_of_ant_from_rate(u32 rate_n_flags)
+* Unmerged path drivers/net/wireless/intel/iwlwifi/mvm/rs.c
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/sta.c b/drivers/net/wireless/intel/iwlwifi/mvm/sta.c
+index 9d28db7f56aa..d53b45d892f4 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/sta.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/sta.c
+@@ -2284,8 +2284,10 @@ int iwl_mvm_sta_tx_agg_start(struct iwl_mvm *mvm, struct ieee80211_vif *vif,
+ 	if (WARN_ON_ONCE(tid >= IWL_MAX_TID_COUNT))
+ 		return -EINVAL;
+ 
+-	if (mvmsta->tid_data[tid].state != IWL_AGG_OFF) {
+-		IWL_ERR(mvm, "Start AGG when state is not IWL_AGG_OFF %d!\n",
++	if (mvmsta->tid_data[tid].state != IWL_AGG_QUEUED &&
++	    mvmsta->tid_data[tid].state != IWL_AGG_OFF) {
++		IWL_ERR(mvm,
++			"Start AGG when state is not IWL_AGG_QUEUED or IWL_AGG_OFF %d!\n",
+ 			mvmsta->tid_data[tid].state);
+ 		return -ENXIO;
+ 	}
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/sta.h b/drivers/net/wireless/intel/iwlwifi/mvm/sta.h
+index 1927ce607798..b6fa508ca317 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/sta.h
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/sta.h
+@@ -290,6 +290,7 @@ struct iwl_mvm_vif;
+  * These states relate to a specific RA / TID.
+  *
+  * @IWL_AGG_OFF: aggregation is not used
++ * @IWL_AGG_QUEUED: aggregation start work has been queued
+  * @IWL_AGG_STARTING: aggregation are starting (between start and oper)
+  * @IWL_AGG_ON: aggregation session is up
+  * @IWL_EMPTYING_HW_QUEUE_ADDBA: establishing a BA session - waiting for the
+@@ -299,6 +300,7 @@ struct iwl_mvm_vif;
+  */
+ enum iwl_mvm_agg_state {
+ 	IWL_AGG_OFF = 0,
++	IWL_AGG_QUEUED,
+ 	IWL_AGG_STARTING,
+ 	IWL_AGG_ON,
+ 	IWL_EMPTYING_HW_QUEUE_ADDBA,
