@@ -1,0 +1,118 @@
+filesystem-dax: Introduce dax_lock_mapping_entry()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit c2a7d2a115525d3501d38e23d24875a79a07e15e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/c2a7d2a1.failed
+
+In preparation for implementing support for memory poison (media error)
+handling via dax mappings, implement a lock_page() equivalent. Poison
+error handling requires rmap and needs guarantees that the page->mapping
+association is maintained / valid (inode not freed) for the duration of
+the lookup.
+
+In the device-dax case it is sufficient to simply hold a dev_pagemap
+reference. In the filesystem-dax case we need to use the entry lock.
+
+Export the entry lock via dax_lock_mapping_entry() that uses
+rcu_read_lock() to protect against the inode being freed, and
+revalidates the page->mapping association under xa_lock().
+
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Cc: Jan Kara <jack@suse.cz>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+	Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+(cherry picked from commit c2a7d2a115525d3501d38e23d24875a79a07e15e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+diff --cc fs/dax.c
+index 97c3ab5e2b69,57ec272038da..000000000000
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@@ -246,10 -224,10 +246,10 @@@ static inline void *unlock_slot(struct 
+   * put_locked_mapping_entry() when he locked the entry and now wants to
+   * unlock it.
+   *
+ - * Must be called with the i_pages lock held.
+ + * The function must be called with mapping->tree_lock held.
+   */
+- static void *get_unlocked_mapping_entry(struct address_space *mapping,
+- 					pgoff_t index, void ***slotp)
++ static void *__get_unlocked_mapping_entry(struct address_space *mapping,
++ 		pgoff_t index, void ***slotp, bool (*wait_fn)(void))
+  {
+  	void *entry, **slot;
+  	struct wait_exceptional_entry_queue ewait;
+@@@ -259,7 -237,9 +259,13 @@@
+  	ewait.wait.func = wake_exceptional_entry_func;
+  
+  	for (;;) {
+++<<<<<<< HEAD
+ +		entry = __radix_tree_lookup(&mapping->page_tree, index, NULL,
+++=======
++ 		bool revalidate;
++ 
++ 		entry = __radix_tree_lookup(&mapping->i_pages, index, NULL,
+++>>>>>>> c2a7d2a11552 (filesystem-dax: Introduce dax_lock_mapping_entry())
+  					  &slot);
+  		if (!entry ||
+  		    WARN_ON_ONCE(!radix_tree_exceptional_entry(entry)) ||
+@@@ -272,10 -252,12 +278,19 @@@
+  		wq = dax_entry_waitqueue(mapping, index, entry, &ewait.key);
+  		prepare_to_wait_exclusive(wq, &ewait.wait,
+  					  TASK_UNINTERRUPTIBLE);
+++<<<<<<< HEAD
+ +		spin_unlock_irq(&mapping->tree_lock);
+ +		schedule();
+ +		finish_wait(wq, &ewait.wait);
+ +		spin_lock_irq(&mapping->tree_lock);
+++=======
++ 		xa_unlock_irq(&mapping->i_pages);
++ 		revalidate = wait_fn();
++ 		finish_wait(wq, &ewait.wait);
++ 		xa_lock_irq(&mapping->i_pages);
++ 		if (revalidate)
++ 			return ERR_PTR(-EAGAIN);
+++>>>>>>> c2a7d2a11552 (filesystem-dax: Introduce dax_lock_mapping_entry())
+  	}
+  }
+  
+* Unmerged path fs/dax.c
+diff --git a/include/linux/dax.h b/include/linux/dax.h
+index 8bc6b57259e5..0195fd3db7c9 100644
+--- a/include/linux/dax.h
++++ b/include/linux/dax.h
+@@ -86,6 +86,8 @@ int dax_writeback_mapping_range(struct address_space *mapping,
+ 		struct block_device *bdev, struct writeback_control *wbc);
+ 
+ struct page *dax_layout_busy_page(struct address_space *mapping);
++bool dax_lock_mapping_entry(struct page *page);
++void dax_unlock_mapping_entry(struct page *page);
+ #else
+ static inline bool bdev_dax_supported(struct block_device *bdev,
+ 		int blocksize)
+@@ -117,6 +119,17 @@ static inline int dax_writeback_mapping_range(struct address_space *mapping,
+ {
+ 	return -EOPNOTSUPP;
+ }
++
++static inline bool dax_lock_mapping_entry(struct page *page)
++{
++	if (IS_DAX(page->mapping->host))
++		return true;
++	return false;
++}
++
++static inline void dax_unlock_mapping_entry(struct page *page)
++{
++}
+ #endif
+ 
+ int dax_read_lock(void);
