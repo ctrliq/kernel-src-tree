@@ -1,0 +1,115 @@
+ip_tunnel: restore binding to ifaces with a large mtu
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Nicolas Dichtel <nicolas.dichtel@6wind.com>
+commit 82612de1c98e610d194e34178bde3cca7dedce41
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/82612de1.failed
+
+After commit f6cc9c054e77, the following conf is broken (note that the
+default loopback mtu is 65536, ie IP_MAX_MTU + 1):
+
+$ ip tunnel add gre1 mode gre local 10.125.0.1 remote 10.125.0.2 dev lo
+add tunnel "gre0" failed: Invalid argument
+$ ip l a type dummy
+$ ip l s dummy1 up
+$ ip l s dummy1 mtu 65535
+$ ip tunnel add gre1 mode gre local 10.125.0.1 remote 10.125.0.2 dev dummy1
+add tunnel "gre0" failed: Invalid argument
+
+dev_set_mtu() doesn't allow to set a mtu which is too large.
+First, let's cap the mtu returned by ip_tunnel_bind_dev(). Second, remove
+the magic value 0xFFF8 and use IP_MAX_MTU instead.
+0xFFF8 seems to be there for ages, I don't know why this value was used.
+
+With a recent kernel, it's also possible to set a mtu > IP_MAX_MTU:
+$ ip l s dummy1 mtu 66000
+After that patch, it's also possible to bind an ip tunnel on that kind of
+interface.
+
+CC: Petr Machata <petrm@mellanox.com>
+CC: Ido Schimmel <idosch@mellanox.com>
+Link: https://git.kernel.org/pub/scm/linux/kernel/git/davem/netdev-vger-cvs.git/commit/?id=e5afd356a411a
+Fixes: f6cc9c054e77 ("ip_tunnel: Emit events for post-register MTU changes")
+	Signed-off-by: Nicolas Dichtel <nicolas.dichtel@6wind.com>
+	Reviewed-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 82612de1c98e610d194e34178bde3cca7dedce41)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/ip_tunnel.c
+diff --cc net/ipv4/ip_tunnel.c
+index 3a8988c09fa8,38d906baf1df..000000000000
+--- a/net/ipv4/ip_tunnel.c
++++ b/net/ipv4/ip_tunnel.c
+@@@ -362,11 -354,21 +362,17 @@@ static struct ip_tunnel *ip_tunnel_crea
+  	if (IS_ERR(dev))
+  		return ERR_CAST(dev);
+  
+ -	mtu = ip_tunnel_bind_dev(dev);
+ -	err = dev_set_mtu(dev, mtu);
+ -	if (err)
+ -		goto err_dev_set_mtu;
+ +	dev->mtu = ip_tunnel_bind_dev(dev);
+  
+  	nt = netdev_priv(dev);
+++<<<<<<< HEAD
+++=======
++ 	t_hlen = nt->hlen + sizeof(struct iphdr);
++ 	dev->min_mtu = ETH_MIN_MTU;
++ 	dev->max_mtu = IP_MAX_MTU - dev->hard_header_len - t_hlen;
+++>>>>>>> 82612de1c98e (ip_tunnel: restore binding to ifaces with a large mtu)
+  	ip_tunnel_add(itn, nt);
+  	return nt;
+ -
+ -err_dev_set_mtu:
+ -	unregister_netdevice(dev);
+ -	return ERR_PTR(err);
+  }
+  
+  int ip_tunnel_rcv(struct ip_tunnel *tunnel, struct sk_buff *skb,
+@@@ -895,9 -930,9 +901,9 @@@ int __ip_tunnel_change_mtu(struct net_d
+  {
+  	struct ip_tunnel *tunnel = netdev_priv(dev);
+  	int t_hlen = tunnel->hlen + sizeof(struct iphdr);
+- 	int max_mtu = 0xFFF8 - dev->hard_header_len - t_hlen;
++ 	int max_mtu = IP_MAX_MTU - dev->hard_header_len - t_hlen;
+  
+ -	if (new_mtu < ETH_MIN_MTU)
+ +	if (new_mtu < 68)
+  		return -EINVAL;
+  
+  	if (new_mtu > max_mtu) {
+@@@ -1062,16 -1107,22 +1068,16 @@@ int ip_tunnel_newlink(struct net_devic
+  
+  	mtu = ip_tunnel_bind_dev(dev);
+  	if (tb[IFLA_MTU]) {
+- 		unsigned int max = 0xfff8 - dev->hard_header_len - nt->hlen;
++ 		unsigned int max = IP_MAX_MTU - dev->hard_header_len - nt->hlen;
+  
+ -		mtu = clamp(dev->mtu, (unsigned int)ETH_MIN_MTU,
+ -			    (unsigned int)(max - sizeof(struct iphdr)));
+ +		dev->mtu = clamp(dev->mtu, (unsigned int)ETH_MIN_MTU,
+ +				 (unsigned int)(max - sizeof(struct iphdr)));
+ +	} else {
+ +		dev->mtu = mtu;
+  	}
+  
+ -	err = dev_set_mtu(dev, mtu);
+ -	if (err)
+ -		goto err_dev_set_mtu;
+ -
+  	ip_tunnel_add(itn, nt);
+ -	return 0;
+ -
+ -err_dev_set_mtu:
+ -	unregister_netdevice(dev);
+ -err_register_netdevice:
+ +out:
+  	return err;
+  }
+  EXPORT_SYMBOL_GPL(ip_tunnel_newlink);
+* Unmerged path net/ipv4/ip_tunnel.c
