@@ -1,0 +1,390 @@
+cifs: fix a buffer leak in smb2_query_symlink
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.102.1.el7
+commit-author Ronnie Sahlberg <lsahlber@redhat.com>
+commit 9d874c36552afbd08778687aeaff24a8a7260f20
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.102.1.el7/9d874c36.failed
+
+This leak was introduced in 91cb74f5142c14dd921ab2d064b7b128054f9fae and caused us
+to leak one small buffer for every symlink query.
+
+	Signed-off-by: Ronnie Sahlberg <lsahlber@redhat.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 9d874c36552afbd08778687aeaff24a8a7260f20)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/smb2file.c
+#	fs/cifs/smb2inode.c
+#	fs/cifs/smb2ops.c
+#	fs/cifs/smb2pdu.c
+#	fs/cifs/smb2proto.h
+diff --cc fs/cifs/smb2file.c
+index 885d7c31d76c,788412675723..000000000000
+--- a/fs/cifs/smb2file.c
++++ b/fs/cifs/smb2file.c
+@@@ -59,9 -59,13 +59,17 @@@ smb2_open_file(const unsigned int xid, 
+  	}
+  
+  	oparms->desired_access |= FILE_READ_ATTRIBUTES;
+ -	*smb2_oplock = SMB2_OPLOCK_LEVEL_BATCH;
+ +	smb2_oplock = SMB2_OPLOCK_LEVEL_BATCH;
+  
+++<<<<<<< HEAD
+ +	rc = SMB2_open(xid, oparms, smb2_path, &smb2_oplock, smb2_data, NULL);
+++=======
++ 	if (oparms->tcon->ses->server->capabilities & SMB2_GLOBAL_CAP_LEASING)
++ 		memcpy(smb2_oplock + 1, fid->lease_key, SMB2_LEASE_KEY_SIZE);
++ 
++ 	rc = SMB2_open(xid, oparms, smb2_path, smb2_oplock, smb2_data, NULL,
++ 		       NULL);
+++>>>>>>> 9d874c36552a (cifs: fix a buffer leak in smb2_query_symlink)
+  	if (rc)
+  		goto out;
+  
+diff --cc fs/cifs/smb2inode.c
+index 1238cd3552f9,d01ad706d7fc..000000000000
+--- a/fs/cifs/smb2inode.c
++++ b/fs/cifs/smb2inode.c
+@@@ -48,22 -48,35 +48,38 @@@ smb2_open_op_close(const unsigned int x
+  	__u8 oplock = SMB2_OPLOCK_LEVEL_NONE;
+  	struct cifs_open_parms oparms;
+  	struct cifs_fid fid;
+ -	bool use_cached_root_handle = false;
+  
+ -	if ((strcmp(full_path, "") == 0) && (create_options == 0) &&
+ -	    (desired_access == FILE_READ_ATTRIBUTES) &&
+ -	    (create_disposition == FILE_OPEN) &&
+ -	    (tcon->nohandlecache == false)) {
+ -		rc = open_shroot(xid, tcon, &fid);
+ -		if (rc == 0)
+ -			use_cached_root_handle = true;
+ -	}
+ +	utf16_path = cifs_convert_path_to_utf16(full_path, cifs_sb);
+ +	if (!utf16_path)
+ +		return -ENOMEM;
+  
+ -	if (use_cached_root_handle == false) {
+ -		utf16_path = cifs_convert_path_to_utf16(full_path, cifs_sb);
+ -		if (!utf16_path)
+ -			return -ENOMEM;
+ +	oparms.tcon = tcon;
+ +	oparms.desired_access = desired_access;
+ +	oparms.disposition = create_disposition;
+ +	oparms.create_options = create_options;
+ +	oparms.fid = &fid;
+ +	oparms.reconnect = false;
+  
+++<<<<<<< HEAD
+ +	rc = SMB2_open(xid, &oparms, utf16_path, &oplock, NULL, NULL);
+ +	if (rc) {
+ +		kfree(utf16_path);
+ +		return rc;
+++=======
++ 		oparms.tcon = tcon;
++ 		oparms.desired_access = desired_access;
++ 		oparms.disposition = create_disposition;
++ 		oparms.create_options = create_options;
++ 		oparms.fid = &fid;
++ 		oparms.reconnect = false;
++ 
++ 		rc = SMB2_open(xid, &oparms, utf16_path, &oplock, NULL, NULL,
++ 			       NULL);
++ 		if (rc) {
++ 			kfree(utf16_path);
++ 			return rc;
++ 		}
+++>>>>>>> 9d874c36552a (cifs: fix a buffer leak in smb2_query_symlink)
+  	}
+  
+  	switch (command) {
+diff --cc fs/cifs/smb2ops.c
+index a79543553d0e,b15f5957d645..000000000000
+--- a/fs/cifs/smb2ops.c
++++ b/fs/cifs/smb2ops.c
+@@@ -321,8 -323,42 +321,45 @@@ SMB3_request_interfaces(const unsigned 
+  }
+  #endif /* STATS2 */
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Open the directory at the root of a share
++  */
++ int open_shroot(unsigned int xid, struct cifs_tcon *tcon, struct cifs_fid *pfid)
++ {
++ 	struct cifs_open_parms oparams;
++ 	int rc;
++ 	__le16 srch_path = 0; /* Null - since an open of top of share */
++ 	u8 oplock = SMB2_OPLOCK_LEVEL_NONE;
++ 
++ 	mutex_lock(&tcon->prfid_mutex);
++ 	if (tcon->valid_root_fid) {
++ 		cifs_dbg(FYI, "found a cached root file handle\n");
++ 		memcpy(pfid, tcon->prfid, sizeof(struct cifs_fid));
++ 		mutex_unlock(&tcon->prfid_mutex);
++ 		return 0;
++ 	}
++ 
++ 	oparams.tcon = tcon;
++ 	oparams.create_options = 0;
++ 	oparams.desired_access = FILE_READ_ATTRIBUTES;
++ 	oparams.disposition = FILE_OPEN;
++ 	oparams.fid = pfid;
++ 	oparams.reconnect = false;
++ 
++ 	rc = SMB2_open(xid, &oparams, &srch_path, &oplock, NULL, NULL, NULL);
++ 	if (rc == 0) {
++ 		memcpy(tcon->prfid, pfid, sizeof(struct cifs_fid));
++ 		tcon->valid_root_fid = true;
++ 	}
++ 	mutex_unlock(&tcon->prfid_mutex);
++ 	return rc;
++ }
++ 
+++>>>>>>> 9d874c36552a (cifs: fix a buffer leak in smb2_query_symlink)
+  static void
+ -smb3_qfs_tcon(const unsigned int xid, struct cifs_tcon *tcon)
+ +smb3_qfs_tcon(const unsigned int xid, struct cifs_tcon *tcon, struct cifs_sb_info *cifs_sb)
+  {
+  	int rc;
+  	__le16 srch_path = 0; /* Null - open root of share */
+@@@ -339,15 -374,12 +376,24 @@@
+  	oparms.fid = &fid;
+  	oparms.reconnect = false;
+  
+++<<<<<<< HEAD
+ +	if (cifs_sb && (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_USE_PREFIX_PATH)
+ +	    && cifs_sb->prepath) {
+ +		utf16_path = cifs_convert_path_to_utf16(cifs_sb->prepath, cifs_sb);
+ +		if (!utf16_path)
+ +			return;
+ +		path = utf16_path;
+ +	}
+ +	rc = SMB2_open(xid, &oparms, path, &oplock, NULL, NULL);
+ +	kfree(utf16_path);
+++=======
++ 	if (no_cached_open)
++ 		rc = SMB2_open(xid, &oparms, &srch_path, &oplock, NULL, NULL,
++ 			       NULL);
++ 	else
++ 		rc = open_shroot(xid, tcon, &fid);
++ 
+++>>>>>>> 9d874c36552a (cifs: fix a buffer leak in smb2_query_symlink)
+  	if (rc)
+  		return;
+  
+@@@ -383,15 -414,7 +429,19 @@@ smb2_qfs_tcon(const unsigned int xid, s
+  	oparms.fid = &fid;
+  	oparms.reconnect = false;
+  
+++<<<<<<< HEAD
+ +	if (cifs_sb && (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_USE_PREFIX_PATH)
+ +	    && cifs_sb->prepath) {
+ +		utf16_path = cifs_convert_path_to_utf16(cifs_sb->prepath, cifs_sb);
+ +		if (!utf16_path)
+ +			return;
+ +		path = utf16_path;
+ +	}
+ +	rc = SMB2_open(xid, &oparms, path, &oplock, NULL, NULL);
+ +	kfree(utf16_path);
+++=======
++ 	rc = SMB2_open(xid, &oparms, &srch_path, &oplock, NULL, NULL, NULL);
+++>>>>>>> 9d874c36552a (cifs: fix a buffer leak in smb2_query_symlink)
+  	if (rc)
+  		return;
+  
+@@@ -1333,15 -1362,7 +1383,19 @@@ smb2_queryfs(const unsigned int xid, st
+  	oparms.fid = &fid;
+  	oparms.reconnect = false;
+  
+++<<<<<<< HEAD
+ +	if (cifs_sb && (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_USE_PREFIX_PATH)
+ +	    && cifs_sb->prepath) {
+ +		utf16_path = cifs_convert_path_to_utf16(cifs_sb->prepath, cifs_sb);
+ +		if (!utf16_path)
+ +			return -ENOMEM;
+ +		path = utf16_path;
+ +	}
+ +	rc = SMB2_open(xid, &oparms, path, &oplock, NULL, NULL);
+ +	kfree(utf16_path);
+++=======
++ 	rc = SMB2_open(xid, &oparms, &srch_path, &oplock, NULL, NULL, NULL);
+++>>>>>>> 9d874c36552a (cifs: fix a buffer leak in smb2_query_symlink)
+  	if (rc)
+  		return rc;
+  	buf->f_type = SMB2_MAGIC_NUMBER;
+@@@ -1494,7 -1515,9 +1548,13 @@@ smb2_query_symlink(const unsigned int x
+  	__u8 oplock = SMB2_OPLOCK_LEVEL_NONE;
+  	struct cifs_open_parms oparms;
+  	struct cifs_fid fid;
+++<<<<<<< HEAD
+++	struct smb2_err_rsp *err_buf = NULL;
+++=======
++ 	struct kvec err_iov = {NULL, 0};
+  	struct smb2_err_rsp *err_buf = NULL;
++ 	int resp_buftype;
+++>>>>>>> 9d874c36552a (cifs: fix a buffer leak in smb2_query_symlink)
+  	struct smb2_symlink_err_rsp *symlink;
+  	unsigned int sub_len;
+  	unsigned int sub_offset;
+@@@ -1514,24 -1537,18 +1574,38 @@@
+  	oparms.fid = &fid;
+  	oparms.reconnect = false;
+  
+++<<<<<<< HEAD
+ +	rc = SMB2_open(xid, &oparms, utf16_path, &oplock, NULL, &err_buf);
+ +
+ +	if (!rc || !err_buf) {
+ +		kfree(utf16_path);
+ +		return -ENOENT;
+++=======
++ 	rc = SMB2_open(xid, &oparms, utf16_path, &oplock, NULL, &err_iov,
++ 		       &resp_buftype);
++ 	if (!rc || !err_iov.iov_base) {
++ 		rc = -ENOENT;
++ 		goto querty_exit;
+++>>>>>>> 9d874c36552a (cifs: fix a buffer leak in smb2_query_symlink)
+  	}
+  
+ -	err_buf = err_iov.iov_base;
+  	if (le32_to_cpu(err_buf->ByteCount) < sizeof(struct smb2_symlink_err_rsp) ||
+++<<<<<<< HEAD
+ +	    get_rfc1002_length(err_buf) + 4 < SMB2_SYMLINK_STRUCT_SIZE) {
+ +		kfree(utf16_path);
+ +		return -EINVAL;
+ +	}
+ +
+ +	symlink = (struct smb2_symlink_err_rsp *)err_buf->ErrorData;
+ +	if (le32_to_cpu(symlink->SymLinkErrorTag) != SYMLINK_ERROR_TAG ||
+ +	    le32_to_cpu(symlink->ReparseTag) != IO_REPARSE_TAG_SYMLINK) {
+ +		kfree(utf16_path);
+ +		return -EINVAL;
+++=======
++ 	    err_iov.iov_len < SMB2_SYMLINK_STRUCT_SIZE) {
++ 		rc = -ENOENT;
++ 		goto querty_exit;
+++>>>>>>> 9d874c36552a (cifs: fix a buffer leak in smb2_query_symlink)
+  	}
+  
+  	/* open must fail on symlink - reset rc */
+@@@ -1541,16 -1559,15 +1615,28 @@@
+  	print_len = le16_to_cpu(symlink->PrintNameLength);
+  	print_offset = le16_to_cpu(symlink->PrintNameOffset);
+  
+++<<<<<<< HEAD
+ +	if (get_rfc1002_length(err_buf) + 4 <
+ +			SMB2_SYMLINK_STRUCT_SIZE + sub_offset + sub_len) {
+ +		kfree(utf16_path);
+ +		return -EINVAL;
+ +	}
+ +
+ +	if (get_rfc1002_length(err_buf) + 4 <
+ +			SMB2_SYMLINK_STRUCT_SIZE + print_offset + print_len) {
+ +		kfree(utf16_path);
+ +		return -EINVAL;
+++=======
++ 	if (err_iov.iov_len < SMB2_SYMLINK_STRUCT_SIZE + sub_offset + sub_len) {
++ 		rc = -ENOENT;
++ 		goto querty_exit;
++ 	}
++ 
++ 	if (err_iov.iov_len <
++ 	    SMB2_SYMLINK_STRUCT_SIZE + print_offset + print_len) {
++ 		rc = -ENOENT;
++ 		goto querty_exit;
+++>>>>>>> 9d874c36552a (cifs: fix a buffer leak in smb2_query_symlink)
+  	}
+  
+  	*target_path = cifs_strndup_from_utf16(
+diff --cc fs/cifs/smb2pdu.c
+index bd43d928dfcf,48e2004c75fb..000000000000
+--- a/fs/cifs/smb2pdu.c
++++ b/fs/cifs/smb2pdu.c
+@@@ -1679,7 -1889,7 +1679,11 @@@ alloc_path_with_tree_prefix(__le16 **ou
+  int
+  SMB2_open(const unsigned int xid, struct cifs_open_parms *oparms, __le16 *path,
+  	  __u8 *oplock, struct smb2_file_all_info *buf,
+++<<<<<<< HEAD
+ +	  struct smb2_err_rsp **err_buf)
+++=======
++ 	  struct kvec *err_iov, int *buftype)
+++>>>>>>> 9d874c36552a (cifs: fix a buffer leak in smb2_query_symlink)
+  {
+  	struct smb2_create_req *req;
+  	struct smb2_create_rsp *rsp;
+@@@ -1816,11 -2050,19 +1820,22 @@@
+  
+  	if (rc != 0) {
+  		cifs_stats_fail_inc(tcon, SMB2_CREATE_HE);
+++<<<<<<< HEAD
+ +		if (err_buf && rsp)
+ +			*err_buf = kmemdup(rsp, get_rfc1002_length(rsp) + 4,
+ +					   GFP_KERNEL);
+++=======
++ 		if (err_iov && rsp) {
++ 			*err_iov = rsp_iov;
++ 			*buftype = resp_buftype;
++ 			resp_buftype = CIFS_NO_BUFFER;
++ 			rsp = NULL;
++ 		}
++ 		trace_smb3_open_err(xid, tcon->tid, ses->Suid,
++ 				    oparms->create_options, oparms->desired_access, rc);
+++>>>>>>> 9d874c36552a (cifs: fix a buffer leak in smb2_query_symlink)
+  		goto creat_exit;
+ -	} else
+ -		trace_smb3_open_done(xid, rsp->PersistentFileId, tcon->tid,
+ -				     ses->Suid, oparms->create_options,
+ -				     oparms->desired_access);
+ +	}
+  
+  	oparms->fid->persistent_fid = rsp->PersistentFileId;
+  	oparms->fid->volatile_fid = rsp->VolatileFileId;
+diff --cc fs/cifs/smb2proto.h
+index 05287b01f596,c84020057bd8..000000000000
+--- a/fs/cifs/smb2proto.h
++++ b/fs/cifs/smb2proto.h
+@@@ -122,7 -125,7 +122,11 @@@ extern int SMB2_tdis(const unsigned in
+  extern int SMB2_open(const unsigned int xid, struct cifs_open_parms *oparms,
+  		     __le16 *path, __u8 *oplock,
+  		     struct smb2_file_all_info *buf,
+++<<<<<<< HEAD
+ +		     struct smb2_err_rsp **err_buf);
+++=======
++ 		     struct kvec *err_iov, int *resp_buftype);
+++>>>>>>> 9d874c36552a (cifs: fix a buffer leak in smb2_query_symlink)
+  extern int SMB2_ioctl(const unsigned int xid, struct cifs_tcon *tcon,
+  		     u64 persistent_fid, u64 volatile_fid, u32 opcode,
+  		     bool is_fsctl, char *in_data, u32 indatalen,
+diff --git a/fs/cifs/link.c b/fs/cifs/link.c
+index d8526779c909..2c6cf2574ecf 100644
+--- a/fs/cifs/link.c
++++ b/fs/cifs/link.c
+@@ -436,7 +436,8 @@ smb3_query_mf_symlink(unsigned int xid, struct cifs_tcon *tcon,
+ 		return  -ENOMEM;
+ 	}
+ 
+-	rc = SMB2_open(xid, &oparms, utf16_path, &oplock, pfile_info, NULL);
++	rc = SMB2_open(xid, &oparms, utf16_path, &oplock, pfile_info, NULL,
++		       NULL);
+ 	if (rc)
+ 		goto qmf_out_open_fail;
+ 
+@@ -493,7 +494,8 @@ smb3_create_mf_symlink(unsigned int xid, struct cifs_tcon *tcon,
+ 	oparms.fid = &fid;
+ 	oparms.reconnect = false;
+ 
+-	rc = SMB2_open(xid, &oparms, utf16_path, &oplock, NULL, NULL);
++	rc = SMB2_open(xid, &oparms, utf16_path, &oplock, NULL, NULL,
++		       NULL);
+ 	if (rc) {
+ 		kfree(utf16_path);
+ 		return rc;
+* Unmerged path fs/cifs/smb2file.c
+* Unmerged path fs/cifs/smb2inode.c
+* Unmerged path fs/cifs/smb2ops.c
+* Unmerged path fs/cifs/smb2pdu.c
+* Unmerged path fs/cifs/smb2proto.h
