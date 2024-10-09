@@ -1,0 +1,323 @@
+iio: hid-sensor: Store restore poll and hysteresis on S3
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+commit 5d9854eaea776441b38a9a45b4e6879524c4f48c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/5d9854ea.failed
+
+This change undo the change done by 'commit 3bec24747446
+("iio: hid-sensor-trigger: Change get poll value function order to avoid
+sensor properties losing after resume from S3")' as this breaks some
+USB/i2c sensor hubs.
+
+Instead of relying on HW for restoring poll and hysteresis, driver stores
+and restores on resume (S3). In this way user space modified settings are
+not lost for any kind of sensor hub behavior.
+
+In this change, whenever user space modifies sampling frequency or
+hysteresis driver will get the feature value from the hub and store in the
+per device hid_sensor_common data structure. On resume callback from S3,
+system will set the feature to sensor hub, if user space ever modified the
+feature value.
+
+Fixes: 3bec24747446 ("iio: hid-sensor-trigger: Change get poll value function order to avoid sensor properties losing after resume from S3")
+	Reported-by: Ritesh Raj Sarraf <rrs@researchut.com>
+	Tested-by: Ritesh Raj Sarraf <rrs@researchut.com>
+	Tested-by: Song, Hongyan <hongyan.song@intel.com>
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+	Signed-off-by: Jonathan Cameron <jic23@kernel.org>
+(cherry picked from commit 5d9854eaea776441b38a9a45b4e6879524c4f48c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iio/common/hid-sensors/hid-sensor-attributes.c
+#	drivers/iio/common/hid-sensors/hid-sensor-trigger.c
+#	include/linux/hid-sensor-hub.h
+diff --cc drivers/iio/common/hid-sensors/hid-sensor-attributes.c
+index 75b54730a963,ca742ac8f128..000000000000
+--- a/drivers/iio/common/hid-sensors/hid-sensor-attributes.c
++++ b/drivers/iio/common/hid-sensors/hid-sensor-attributes.c
+@@@ -209,6 -287,112 +226,115 @@@ int hid_sensor_write_raw_hyst_value(str
+  }
+  EXPORT_SYMBOL(hid_sensor_write_raw_hyst_value);
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * This fuction applies the unit exponent to the scale.
++  * For example:
++  * 9.806650000 ->exp:2-> val0[980]val1[665000000]
++  * 9.000806000 ->exp:2-> val0[900]val1[80600000]
++  * 0.174535293 ->exp:2-> val0[17]val1[453529300]
++  * 1.001745329 ->exp:0-> val0[1]val1[1745329]
++  * 1.001745329 ->exp:2-> val0[100]val1[174532900]
++  * 1.001745329 ->exp:4-> val0[10017]val1[453290000]
++  * 9.806650000 ->exp:-2-> val0[0]val1[98066500]
++  */
++ static void adjust_exponent_nano(int *val0, int *val1, int scale0,
++ 				  int scale1, int exp)
++ {
++ 	int i;
++ 	int x;
++ 	int res;
++ 	int rem;
++ 
++ 	if (exp > 0) {
++ 		*val0 = scale0 * pow_10(exp);
++ 		res = 0;
++ 		if (exp > 9) {
++ 			*val1 = 0;
++ 			return;
++ 		}
++ 		for (i = 0; i < exp; ++i) {
++ 			x = scale1 / pow_10(8 - i);
++ 			res += (pow_10(exp - 1 - i) * x);
++ 			scale1 = scale1 % pow_10(8 - i);
++ 		}
++ 		*val0 += res;
++ 			*val1 = scale1 * pow_10(exp);
++ 	} else if (exp < 0) {
++ 		exp = abs(exp);
++ 		if (exp > 9) {
++ 			*val0 = *val1 = 0;
++ 			return;
++ 		}
++ 		*val0 = scale0 / pow_10(exp);
++ 		rem = scale0 % pow_10(exp);
++ 		res = 0;
++ 		for (i = 0; i < (9 - exp); ++i) {
++ 			x = scale1 / pow_10(8 - i);
++ 			res += (pow_10(8 - exp - i) * x);
++ 			scale1 = scale1 % pow_10(8 - i);
++ 		}
++ 		*val1 = rem * pow_10(9 - exp) + res;
++ 	} else {
++ 		*val0 = scale0;
++ 		*val1 = scale1;
++ 	}
++ }
++ 
++ int hid_sensor_format_scale(u32 usage_id,
++ 			struct hid_sensor_hub_attribute_info *attr_info,
++ 			int *val0, int *val1)
++ {
++ 	int i;
++ 	int exp;
++ 
++ 	*val0 = 1;
++ 	*val1 = 0;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(unit_conversion); ++i) {
++ 		if (unit_conversion[i].usage_id == usage_id &&
++ 			unit_conversion[i].unit == attr_info->units) {
++ 			exp  = hid_sensor_convert_exponent(
++ 						attr_info->unit_expo);
++ 			adjust_exponent_nano(val0, val1,
++ 					unit_conversion[i].scale_val0,
++ 					unit_conversion[i].scale_val1, exp);
++ 			break;
++ 		}
++ 	}
++ 
++ 	return IIO_VAL_INT_PLUS_NANO;
++ }
++ EXPORT_SYMBOL(hid_sensor_format_scale);
++ 
++ int64_t hid_sensor_convert_timestamp(struct hid_sensor_common *st,
++ 				     int64_t raw_value)
++ {
++ 	return st->timestamp_ns_scale * raw_value;
++ }
++ EXPORT_SYMBOL(hid_sensor_convert_timestamp);
++ 
++ static
++ int hid_sensor_get_reporting_interval(struct hid_sensor_hub_device *hsdev,
++ 					u32 usage_id,
++ 					struct hid_sensor_common *st)
++ {
++ 	sensor_hub_input_get_attribute_info(hsdev,
++ 					HID_FEATURE_REPORT, usage_id,
++ 					HID_USAGE_SENSOR_PROP_REPORT_INTERVAL,
++ 					&st->poll);
++ 	/* Default unit of measure is milliseconds */
++ 	if (st->poll.units == 0)
++ 		st->poll.units = HID_USAGE_SENSOR_UNITS_MILLISECOND;
++ 
++ 	st->poll_interval = -1;
++ 
++ 	return 0;
++ 
++ }
++ 
+++>>>>>>> 5d9854eaea77 (iio: hid-sensor: Store restore poll and hysteresis on S3)
+  int hid_sensor_parse_common_attributes(struct hid_sensor_hub_device *hsdev,
+  					u32 usage_id,
+  					struct hid_sensor_common *st)
+@@@ -234,11 -419,35 +360,43 @@@
+  			HID_USAGE_SENSOR_PROP_SENSITIVITY_ABS,
+  			 &st->sensitivity);
+  
+++<<<<<<< HEAD
+ +	hid_dbg(hsdev->hdev, "common attributes: %x:%x, %x:%x, %x:%x %x:%x\n",
+ +			st->poll.index, st->poll.report_id,
+ +			st->report_state.index, st->report_state.report_id,
+ +			st->power_state.index, st->power_state.report_id,
+ +			st->sensitivity.index, st->sensitivity.report_id);
+++=======
++ 	st->raw_hystersis = -1;
++ 
++ 	sensor_hub_input_get_attribute_info(hsdev,
++ 					    HID_INPUT_REPORT, usage_id,
++ 					    HID_USAGE_SENSOR_TIME_TIMESTAMP,
++ 					    &timestamp);
++ 	if (timestamp.index >= 0 && timestamp.report_id) {
++ 		int val0, val1;
++ 
++ 		hid_sensor_format_scale(HID_USAGE_SENSOR_TIME_TIMESTAMP,
++ 					&timestamp, &val0, &val1);
++ 		st->timestamp_ns_scale = val0;
++ 	} else
++ 		st->timestamp_ns_scale = 1000000000;
++ 
++ 	hid_dbg(hsdev->hdev, "common attributes: %x:%x, %x:%x, %x:%x %x:%x %x:%x\n",
++ 		st->poll.index, st->poll.report_id,
++ 		st->report_state.index, st->report_state.report_id,
++ 		st->power_state.index, st->power_state.report_id,
++ 		st->sensitivity.index, st->sensitivity.report_id,
++ 		timestamp.index, timestamp.report_id);
++ 
++ 	ret = sensor_hub_get_feature(hsdev,
++ 				st->power_state.report_id,
++ 				st->power_state.index, sizeof(value), &value);
++ 	if (ret < 0)
++ 		return ret;
++ 	if (value < 0)
++ 		return -EINVAL;
+++>>>>>>> 5d9854eaea77 (iio: hid-sensor: Store restore poll and hysteresis on S3)
+  
+  	return 0;
+  }
+diff --cc drivers/iio/common/hid-sensors/hid-sensor-trigger.c
+index 5cc9e5190684,60829340a82e..000000000000
+--- a/drivers/iio/common/hid-sensors/hid-sensor-trigger.c
++++ b/drivers/iio/common/hid-sensors/hid-sensor-trigger.c
+@@@ -46,7 -51,15 +46,9 @@@ static int hid_sensor_data_rdy_trigger_
+  			st->report_state.report_id,
+  			st->report_state.index,
+  			HID_USAGE_SENSOR_PROP_REPORTING_STATE_ALL_EVENTS_ENUM);
++ 
++ 		poll_value = hid_sensor_read_poll_value(st);
+  	} else {
+ -		int val;
+ -
+ -		val = atomic_dec_if_positive(&st->data_ready);
+ -		if (val < 0)
+ -			return 0;
+ -
+  		sensor_hub_device_close(st->hsdev);
+  		state_val = hid_sensor_get_usage_index(st->hsdev,
+  			st->power_state.report_id,
+@@@ -74,10 -87,68 +76,75 @@@
+  	}
+  
+  	sensor_hub_get_feature(st->hsdev, st->power_state.report_id,
+++<<<<<<< HEAD
+ +					st->power_state.index,
+ +					&state_val);
+ +	return 0;
+ +}
+++=======
++ 			       st->power_state.index,
++ 			       sizeof(state_val), &state_val);
++ 	if (state && poll_value)
++ 		msleep_interruptible(poll_value * 2);
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(hid_sensor_power_state);
++ 
++ int hid_sensor_power_state(struct hid_sensor_common *st, bool state)
++ {
++ 
++ #ifdef CONFIG_PM
++ 	int ret;
++ 
++ 	atomic_set(&st->user_requested_state, state);
++ 	if (state)
++ 		ret = pm_runtime_get_sync(&st->pdev->dev);
++ 	else {
++ 		pm_runtime_mark_last_busy(&st->pdev->dev);
++ 		ret = pm_runtime_put_autosuspend(&st->pdev->dev);
++ 	}
++ 	if (ret < 0) {
++ 		if (state)
++ 			pm_runtime_put_noidle(&st->pdev->dev);
++ 		return ret;
++ 	}
++ 
++ 	return 0;
++ #else
++ 	atomic_set(&st->user_requested_state, state);
++ 	return _hid_sensor_power_state(st, state);
++ #endif
++ }
++ 
++ static void hid_sensor_set_power_work(struct work_struct *work)
++ {
++ 	struct hid_sensor_common *attrb = container_of(work,
++ 						       struct hid_sensor_common,
++ 						       work);
++ 
++ 	if (attrb->poll_interval >= 0)
++ 		sensor_hub_set_feature(attrb->hsdev, attrb->poll.report_id,
++ 				       attrb->poll.index,
++ 				       sizeof(attrb->poll_interval),
++ 				       &attrb->poll_interval);
++ 
++ 	if (attrb->raw_hystersis >= 0)
++ 		sensor_hub_set_feature(attrb->hsdev,
++ 				       attrb->sensitivity.report_id,
++ 				       attrb->sensitivity.index,
++ 				       sizeof(attrb->raw_hystersis),
++ 				       &attrb->raw_hystersis);
++ 
++ 	_hid_sensor_power_state(attrb, true);
++ }
++ 
++ static int hid_sensor_data_rdy_trigger_set_state(struct iio_trigger *trig,
++ 						bool state)
++ {
++ 	return hid_sensor_power_state(iio_trigger_get_drvdata(trig), state);
++ }
+++>>>>>>> 5d9854eaea77 (iio: hid-sensor: Store restore poll and hysteresis on S3)
+  
+  void hid_sensor_remove_trigger(struct hid_sensor_common *attrb)
+  {
+diff --cc include/linux/hid-sensor-hub.h
+index 05fe6c21f3e2,f32d7c392c1e..000000000000
+--- a/include/linux/hid-sensor-hub.h
++++ b/include/linux/hid-sensor-hub.h
+@@@ -167,8 -229,12 +167,15 @@@ struct hid_sensor_common 
+  	struct hid_sensor_hub_device *hsdev;
+  	struct platform_device *pdev;
+  	unsigned usage_id;
+++<<<<<<< HEAD
+ +	bool data_ready;
+++=======
++ 	atomic_t data_ready;
++ 	atomic_t user_requested_state;
++ 	int poll_interval;
++ 	int raw_hystersis;
+++>>>>>>> 5d9854eaea77 (iio: hid-sensor: Store restore poll and hysteresis on S3)
+  	struct iio_trigger *trigger;
+ -	int timestamp_ns_scale;
+  	struct hid_sensor_hub_attribute_info poll;
+  	struct hid_sensor_hub_attribute_info report_state;
+  	struct hid_sensor_hub_attribute_info power_state;
+* Unmerged path drivers/iio/common/hid-sensors/hid-sensor-attributes.c
+* Unmerged path drivers/iio/common/hid-sensors/hid-sensor-trigger.c
+* Unmerged path include/linux/hid-sensor-hub.h
