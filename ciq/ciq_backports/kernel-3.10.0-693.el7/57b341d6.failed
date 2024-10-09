@@ -1,0 +1,200 @@
+i40e: When searching all MAC/VLAN filters, ignore removed filters
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit 57b341d66684e380cae332eadcc210e177a9f289
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/57b341d6.failed
+
+When adding new MAC address filters, the driver determines if it should
+behave in VLAN mode (where all MAC addresses get assigned to every
+existing VLAN) or in non-VLAN mode where MAC addresses get assigned the
+VLAN_ANY identifier. Under some circumstances it is possible that a VLAN
+has been marked for removal (such that all filters of that VLAN are set
+to I40E_FILTER_REMOVE), and a subsequent call to i40e_put_mac_in_vlan
+may occur prior to the driver subtask that syncs filters to the
+hardware.
+
+In this case, we may add filters to the new removed VLAN, even though it
+should have been removed. This is most obvious when first adding a new
+VLAN. We will delete all filters which are in I40E_VLAN_ANY (-1) and
+then re-add them as in VLAN 0 (untagged). Then before we sync filters,
+we will add new MAC address filter, which will be added to every VLAN
+that exists. Unfortunately, this will include I40E_VLAN_ANY, so we will
+end up incorrectly adding filters to the -1 VLAN. This can be fixed by
+simply skipping all filters which are marked for removal.
+
+A similar check is not necessary in i40e_del_mac_all_vlan, since we are
+deleting, and any filter which we find already marked for removal would
+simply be deleted again, which doesn't cause any issues.
+
+Change-Id: I7962154013ce02fe950584690aeeb3ed853d0086
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 57b341d66684e380cae332eadcc210e177a9f289)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/i40e/i40e_main.c
+diff --cc drivers/net/ethernet/intel/i40e/i40e_main.c
+index 6f5b9c2cdeec,86ad9537d44f..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_main.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_main.c
+@@@ -1383,48 -1289,81 +1383,61 @@@ void i40e_del_filter(struct i40e_vsi *v
+  	if (!vsi || !macaddr)
+  		return;
+  
+ -	f = i40e_find_filter(vsi, macaddr, vlan);
+ -	if (!f)
+ +	f = i40e_find_filter(vsi, macaddr, vlan, is_vf, is_netdev);
+ +	if (!f || f->counter == 0)
+  		return;
+  
+ -	if ((f->state == I40E_FILTER_FAILED) ||
+ -	    (f->state == I40E_FILTER_NEW)) {
+ -		/* this one never got added by the FW. Just remove it,
+ -		 * no need to sync anything.
+ -		 */
+ -		list_del(&f->list);
+ -		kfree(f);
+ +	if (is_vf) {
+ +		if (f->is_vf) {
+ +			f->is_vf = false;
+ +			f->counter--;
+ +		}
+ +	} else if (is_netdev) {
+ +		if (f->is_netdev) {
+ +			f->is_netdev = false;
+ +			f->counter--;
+ +		}
+  	} else {
+ -		f->state = I40E_FILTER_REMOVE;
+ -		vsi->flags |= I40E_VSI_FLAG_FILTER_CHANGED;
+ -		vsi->back->flags |= I40E_FLAG_FILTER_SYNC;
+ -	}
+ -}
+ +		/* make sure we don't remove a filter in use by VF or netdev */
+ +		int min_f = 0;
+  
+ -/**
+ - * i40e_put_mac_in_vlan - Make macvlan filters from macaddrs and vlans
+ - * @vsi: the VSI to be searched
+ - * @macaddr: the mac address to be filtered
+ - *
+ - * Goes through all the macvlan filters and adds a macvlan filter for each
+ - * unique vlan that already exists. If a PVID has been assigned, instead only
+ - * add the macaddr to that VLAN.
+ - *
+ - * Returns last filter added on success, else NULL
+ - **/
+ -struct i40e_mac_filter *i40e_put_mac_in_vlan(struct i40e_vsi *vsi,
+ -					     const u8 *macaddr)
+ -{
+ -	struct i40e_mac_filter *f, *add = NULL;
+ +		min_f += (f->is_vf ? 1 : 0);
+ +		min_f += (f->is_netdev ? 1 : 0);
+  
+++<<<<<<< HEAD
+ +		if (f->counter > min_f)
+ +			f->counter--;
+++=======
++ 	if (vsi->info.pvid)
++ 		return i40e_add_filter(vsi, macaddr,
++ 				       le16_to_cpu(vsi->info.pvid));
++ 
++ 	list_for_each_entry(f, &vsi->mac_filter_list, list) {
++ 		if (f->state == I40E_FILTER_REMOVE)
++ 			continue;
++ 		add = i40e_add_filter(vsi, macaddr, f->vlan);
++ 		if (!add)
++ 			return NULL;
+++>>>>>>> 57b341d66684 (i40e: When searching all MAC/VLAN filters, ignore removed filters)
+  	}
+  
+ -	return add;
+ -}
+ -
+ -/**
+ - * i40e_del_mac_all_vlan - Remove a MAC filter from all VLANS
+ - * @vsi: the VSI to be searched
+ - * @macaddr: the mac address to be removed
+ - *
+ - * Removes a given MAC address from a VSI, regardless of VLAN
+ - *
+ - * Returns 0 for success, or error
+ - **/
+ -int i40e_del_mac_all_vlan(struct i40e_vsi *vsi, const u8 *macaddr)
+ -{
+ -	struct i40e_mac_filter *f = NULL;
+ -	int changed = 0;
+ -
+ -	WARN(!spin_is_locked(&vsi->mac_filter_list_lock),
+ -	     "Missing mac_filter_list_lock\n");
+ -	list_for_each_entry(f, &vsi->mac_filter_list, list) {
+ -		if (ether_addr_equal(macaddr, f->macaddr))
+ +	/* counter == 0 tells sync_filters_subtask to
+ +	 * remove the filter from the firmware's list
+ +	 */
+ +	if (f->counter == 0) {
+ +		if ((f->state == I40E_FILTER_FAILED) ||
+ +		    (f->state == I40E_FILTER_NEW)) {
+ +			/* this one never got added by the FW. Just remove it,
+ +			 * no need to sync anything.
+ +			 */
+ +			list_del(&f->list);
+ +			kfree(f);
+ +		} else {
+  			f->state = I40E_FILTER_REMOVE;
+ +			vsi->flags |= I40E_VSI_FLAG_FILTER_CHANGED;
+ +			vsi->back->flags |= I40E_FLAG_FILTER_SYNC;
+ +		}
+  	}
+ -	if (changed) {
+ -		vsi->flags |= I40E_VSI_FLAG_FILTER_CHANGED;
+ -		vsi->back->flags |= I40E_FLAG_FILTER_SYNC;
+ -		return 0;
+ -	}
+ -	return -ENOENT;
+  }
+  
+  /**
+@@@ -2348,7 -2273,9 +2361,13 @@@ int i40e_vsi_add_vlan(struct i40e_vsi *
+  	}
+  
+  	list_for_each_entry_safe(f, ftmp, &vsi->mac_filter_list, list) {
+++<<<<<<< HEAD
+ +		add_f = i40e_add_filter(vsi, f->macaddr, vid, is_vf, is_netdev);
+++=======
++ 		if (f->state == I40E_FILTER_REMOVE)
++ 			continue;
++ 		add_f = i40e_add_filter(vsi, f->macaddr, vid);
+++>>>>>>> 57b341d66684 (i40e: When searching all MAC/VLAN filters, ignore removed filters)
+  		if (!add_f) {
+  			dev_info(&vsi->back->pdev->dev,
+  				 "Could not add vlan filter %d for %pM\n",
+@@@ -2384,13 -2309,12 +2403,19 @@@
+  	/* Do not assume that I40E_VLAN_ANY should be reset to VLAN 0 */
+  	if (vid > 0 && !vsi->info.pvid) {
+  		list_for_each_entry_safe(f, ftmp, &vsi->mac_filter_list, list) {
+++<<<<<<< HEAD
+ +			if (!i40e_find_filter(vsi, f->macaddr, I40E_VLAN_ANY,
+ +					      is_vf, is_netdev))
+++=======
++ 			if (f->state == I40E_FILTER_REMOVE)
++ 				continue;
++ 			if (!i40e_find_filter(vsi, f->macaddr, I40E_VLAN_ANY))
+++>>>>>>> 57b341d66684 (i40e: When searching all MAC/VLAN filters, ignore removed filters)
+  				continue;
+ -			i40e_del_filter(vsi, f->macaddr, I40E_VLAN_ANY);
+ -			add_f = i40e_add_filter(vsi, f->macaddr, 0);
+ +			i40e_del_filter(vsi, f->macaddr, I40E_VLAN_ANY,
+ +					is_vf, is_netdev);
+ +			add_f = i40e_add_filter(vsi, f->macaddr,
+ +						0, is_vf, is_netdev);
+  			if (!add_f) {
+  				dev_info(&vsi->back->pdev->dev,
+  					 "Could not add filter 0 for %pM\n",
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_main.c
