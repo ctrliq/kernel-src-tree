@@ -1,0 +1,176 @@
+net/mlx5: Add hash table to search FTEs in a flow-group
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] mlx5: Add hash table to search FTEs in a flow-group (Kamal Heib) [1456694]
+Rebuild_FUZZ: 96.23%
+commit-author Matan Barak <matanb@mellanox.com>
+commit 0d235c3fabb79bddc46527885985f0ae281a89f9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/0d235c3f.failed
+
+When adding a flow table entry (fte) to a flow group (fg), we first
+need to check whether this fte exist. In such a case we just merge
+the destinations (if possible). Currently, this is done by traversing
+the fte list available in a fg. This could take a lot of time when
+using large flow groups. Speeding this up by using rhashtable, which
+is much faster.
+
+	Signed-off-by: Matan Barak <matanb@mellanox.com>
+	Reviewed-by: Maor Gottlieb <maorg@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 0d235c3fabb79bddc46527885985f0ae281a89f9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+index bdd564dcef53,d8d45b006996..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+@@@ -415,9 -412,20 +419,21 @@@ out
+  				       "%s can't del rule fg id=%d fte_index=%d\n",
+  				       __func__, fg->id, fte->index);
+  	}
+ +	kvfree(match_value);
+  }
+  
++ static void destroy_fte(struct fs_fte *fte, struct mlx5_flow_group *fg)
++ {
++ 	struct mlx5_flow_table *ft;
++ 	int ret;
++ 
++ 	ret = rhashtable_remove_fast(&fg->ftes_hash, &fte->hash, rhash_fte);
++ 	WARN_ON(ret);
++ 	fte->status = 0;
++ 	fs_get_obj(ft, fg->node.parent);
++ 	ida_simple_remove(&ft->fte_allocator, fte->index);
++ }
++ 
+  static void del_fte(struct fs_node *node)
+  {
+  	struct mlx5_flow_table *ft;
+@@@ -438,8 -446,7 +454,12 @@@
+  			       "flow steering can't delete fte in index %d of flow group id %d\n",
+  			       fte->index, fg->id);
+  
+++<<<<<<< HEAD
+ +	fte->status = 0;
+ +	fg->num_ftes--;
+++=======
++ 	destroy_fte(fte, fg);
+++>>>>>>> 0d235c3fabb7 (net/mlx5: Add hash table to search FTEs in a flow-group)
+  }
+  
+  static void del_flow_group(struct fs_node *node)
+@@@ -1105,43 -1132,38 +1145,60 @@@ free_handle
+  	return ERR_PTR(err);
+  }
+  
+ +/* Assumed fg is locked */
+ +static unsigned int get_free_fte_index(struct mlx5_flow_group *fg,
+ +				       struct list_head **prev)
+ +{
+ +	struct fs_fte *fte;
+ +	unsigned int start = fg->start_index;
+ +
+ +	if (prev)
+ +		*prev = &fg->node.children;
+ +
+ +	/* assumed list is sorted by index */
+ +	fs_for_each_fte(fte, fg) {
+ +		if (fte->index != start)
+ +			return start;
+ +		start++;
+ +		if (prev)
+ +			*prev = &fte->node.list;
+ +	}
+ +
+ +	return start;
+ +}
+ +
+ +/* prev is output, prev->next = new_fte */
+  static struct fs_fte *create_fte(struct mlx5_flow_group *fg,
+  				 u32 *match_value,
+ -				 struct mlx5_flow_act *flow_act)
+ +				 struct mlx5_flow_act *flow_act,
+ +				 struct list_head **prev)
+  {
+ -	struct mlx5_flow_table *ft;
+  	struct fs_fte *fte;
+  	int index;
++ 	int ret;
+  
+ -	fs_get_obj(ft, fg->node.parent);
+ -	index = ida_simple_get(&ft->fte_allocator, fg->start_index,
+ -			       fg->start_index + fg->max_ftes,
+ -			       GFP_KERNEL);
+ -	if (index < 0)
+ -		return ERR_PTR(index);
+ -
+ +	index = get_free_fte_index(fg, prev);
+  	fte = alloc_fte(flow_act, match_value, index);
+++<<<<<<< HEAD
+ +	if (IS_ERR(fte))
+ +		return fte;
+++=======
++ 	if (IS_ERR(fte)) {
++ 		ret = PTR_ERR(fte);
++ 		goto err_alloc;
++ 	}
++ 	ret = rhashtable_insert_fast(&fg->ftes_hash, &fte->hash, rhash_fte);
++ 	if (ret)
++ 		goto err_hash;
+++>>>>>>> 0d235c3fabb7 (net/mlx5: Add hash table to search FTEs in a flow-group)
+  
+  	return fte;
++ 
++ err_hash:
++ 	kfree(fte);
++ err_alloc:
++ 	ida_simple_remove(&ft->fte_allocator, index);
++ 	return ERR_PTR(ret);
+  }
+  
+  static struct mlx5_flow_group *create_autogroup(struct mlx5_flow_table *ft,
+@@@ -1235,9 -1293,9 +1328,10 @@@ static struct mlx5_flow_handle *add_rul
+  					    struct mlx5_flow_destination *dest,
+  					    int dest_num)
+  {
++ 	u32 masked_val[sizeof(fg->mask.match_criteria)];
+  	struct mlx5_flow_handle *handle;
+  	struct mlx5_flow_table *ft;
+ +	struct list_head *prev;
+  	struct fs_fte *fte;
+  	int i;
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/fs_core.h b/drivers/net/ethernet/mellanox/mlx5/core/fs_core.h
+index 9ce3f6c35408..6d02221515dc 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_core.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_core.h
+@@ -34,6 +34,7 @@
+ #define _MLX5_FS_CORE_
+ 
+ #include <linux/mlx5/fs.h>
++#include <linux/rhashtable.h>
+ 
+ enum fs_node_type {
+ 	FS_TYPE_NAMESPACE,
+@@ -156,6 +157,7 @@ struct fs_fte {
+ 	u32				modify_id;
+ 	enum fs_fte_status		status;
+ 	struct mlx5_fc			*counter;
++	struct rhash_head		hash;
+ };
+ 
+ /* Type of children is mlx5_flow_table/namespace */
+@@ -186,6 +188,7 @@ struct mlx5_flow_group {
+ 	u32				max_ftes;
+ 	u32				num_ftes;
+ 	u32				id;
++	struct rhashtable		ftes_hash;
+ };
+ 
+ struct mlx5_flow_root_namespace {
