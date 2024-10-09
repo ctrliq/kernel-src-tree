@@ -1,0 +1,182 @@
+KVM: PPC: Book3S HV: Update irq stats for IRQs handled in real mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Suresh Warrier <warrier@linux.vnet.ibm.com>
+commit 366274f59c4de018f72ab44bb41ccaf3d657eb52
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/366274f5.failed
+
+When a passthrough IRQ is handled completely within KVM real
+mode code, it has to also update the IRQ stats since this
+does not go through the generic IRQ handling code.
+
+However, the per CPU kstat_irqs field is an allocated (not static)
+field and so cannot be directly accessed in real mode safely.
+
+The function this_cpu_inc_rm() is introduced to safely increment
+per CPU fields (currently coded for unsigned integers only) that
+are allocated and could thus be vmalloced also.
+
+	Signed-off-by: Suresh Warrier <warrier@linux.vnet.ibm.com>
+	Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+(cherry picked from commit 366274f59c4de018f72ab44bb41ccaf3d657eb52)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_hv_rm_xics.c
+diff --cc arch/powerpc/kvm/book3s_hv_rm_xics.c
+index 37eb41dc50c9,554cdfa9aeb3..000000000000
+--- a/arch/powerpc/kvm/book3s_hv_rm_xics.c
++++ b/arch/powerpc/kvm/book3s_hv_rm_xics.c
+@@@ -17,7 -18,10 +18,12 @@@
+  #include <asm/xics.h>
+  #include <asm/debug.h>
+  #include <asm/synch.h>
+++<<<<<<< HEAD
+++=======
++ #include <asm/cputhreads.h>
++ #include <asm/pgtable.h>
+++>>>>>>> 366274f59c4d (KVM: PPC: Book3S HV: Update irq stats for IRQs handled in real mode)
+  #include <asm/ppc-opcode.h>
+ -#include <asm/pnv-pci.h>
+  
+  #include "book3s_xics.h"
+  
+@@@ -625,3 -716,131 +631,134 @@@ int kvmppc_rm_h_eoi(struct kvm_vcpu *vc
+   bail:
+  	return check_too_hard(xics, icp);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ unsigned long eoi_rc;
++ 
++ static void icp_eoi(struct irq_chip *c, u32 hwirq, u32 xirr)
++ {
++ 	unsigned long xics_phys;
++ 	int64_t rc;
++ 
++ 	rc = pnv_opal_pci_msi_eoi(c, hwirq);
++ 
++ 	if (rc)
++ 		eoi_rc = rc;
++ 
++ 	iosync();
++ 
++ 	/* EOI it */
++ 	xics_phys = local_paca->kvm_hstate.xics_phys;
++ 	_stwcix(xics_phys + XICS_XIRR, xirr);
++ }
++ 
++ /*
++  * Increment a per-CPU 32-bit unsigned integer variable.
++  * Safe to call in real-mode. Handles vmalloc'ed addresses
++  *
++  * ToDo: Make this work for any integral type
++  */
++ 
++ static inline void this_cpu_inc_rm(unsigned int __percpu *addr)
++ {
++ 	unsigned long l;
++ 	unsigned int *raddr;
++ 	int cpu = smp_processor_id();
++ 
++ 	raddr = per_cpu_ptr(addr, cpu);
++ 	l = (unsigned long)raddr;
++ 
++ 	if (REGION_ID(l) == VMALLOC_REGION_ID) {
++ 		l = vmalloc_to_phys(raddr);
++ 		raddr = (unsigned int *)l;
++ 	}
++ 	++*raddr;
++ }
++ 
++ /*
++  * We don't try to update the flags in the irq_desc 'istate' field in
++  * here as would happen in the normal IRQ handling path for several reasons:
++  *  - state flags represent internal IRQ state and are not expected to be
++  *    updated outside the IRQ subsystem
++  *  - more importantly, these are useful for edge triggered interrupts,
++  *    IRQ probing, etc., but we are only handling MSI/MSIx interrupts here
++  *    and these states shouldn't apply to us.
++  *
++  * However, we do update irq_stats - we somewhat duplicate the code in
++  * kstat_incr_irqs_this_cpu() for this since this function is defined
++  * in irq/internal.h which we don't want to include here.
++  * The only difference is that desc->kstat_irqs is an allocated per CPU
++  * variable and could have been vmalloc'ed, so we can't directly
++  * call __this_cpu_inc() on it. The kstat structure is a static
++  * per CPU variable and it should be accessible by real-mode KVM.
++  *
++  */
++ static void kvmppc_rm_handle_irq_desc(struct irq_desc *desc)
++ {
++ 	this_cpu_inc_rm(desc->kstat_irqs);
++ 	__this_cpu_inc(kstat.irqs_sum);
++ }
++ 
++ long kvmppc_deliver_irq_passthru(struct kvm_vcpu *vcpu,
++ 				 u32 xirr,
++ 				 struct kvmppc_irq_map *irq_map,
++ 				 struct kvmppc_passthru_irqmap *pimap)
++ {
++ 	struct kvmppc_xics *xics;
++ 	struct kvmppc_icp *icp;
++ 	u32 irq;
++ 
++ 	irq = irq_map->v_hwirq;
++ 	xics = vcpu->kvm->arch.xics;
++ 	icp = vcpu->arch.icp;
++ 
++ 	kvmppc_rm_handle_irq_desc(irq_map->desc);
++ 	icp_rm_deliver_irq(xics, icp, irq);
++ 
++ 	/* EOI the interrupt */
++ 	icp_eoi(irq_desc_get_chip(irq_map->desc), irq_map->r_hwirq, xirr);
++ 
++ 	if (check_too_hard(xics, icp) == H_TOO_HARD)
++ 		return 2;
++ 	else
++ 		return -2;
++ }
++ 
++ /*  --- Non-real mode XICS-related built-in routines ---  */
++ 
++ /**
++  * Host Operations poked by RM KVM
++  */
++ static void rm_host_ipi_action(int action, void *data)
++ {
++ 	switch (action) {
++ 	case XICS_RM_KICK_VCPU:
++ 		kvmppc_host_rm_ops_hv->vcpu_kick(data);
++ 		break;
++ 	default:
++ 		WARN(1, "Unexpected rm_action=%d data=%p\n", action, data);
++ 		break;
++ 	}
++ 
++ }
++ 
++ void kvmppc_xics_ipi_action(void)
++ {
++ 	int core;
++ 	unsigned int cpu = smp_processor_id();
++ 	struct kvmppc_host_rm_core *rm_corep;
++ 
++ 	core = cpu >> threads_shift;
++ 	rm_corep = &kvmppc_host_rm_ops_hv->rm_core[core];
++ 
++ 	if (rm_corep->rm_data) {
++ 		rm_host_ipi_action(rm_corep->rm_state.rm_action,
++ 							rm_corep->rm_data);
++ 		/* Order these stores against the real mode KVM */
++ 		rm_corep->rm_data = NULL;
++ 		smp_wmb();
++ 		rm_corep->rm_state.rm_action = 0;
++ 	}
++ }
+++>>>>>>> 366274f59c4d (KVM: PPC: Book3S HV: Update irq stats for IRQs handled in real mode)
+* Unmerged path arch/powerpc/kvm/book3s_hv_rm_xics.c
