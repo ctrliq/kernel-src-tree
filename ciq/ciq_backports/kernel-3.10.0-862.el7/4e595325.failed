@@ -1,0 +1,312 @@
+nfp: don't depend on compiler constant propagation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 4e59532541c865c85c92d42be4edf2ba6aa4af64
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/4e595325.failed
+
+Matthias reports:
+
+  nfp_eth_set_bit_config() is marked as __always_inline to allow gcc to
+  identify the 'mask' parameter as known to be constant at compile time,
+  which is required to use the FIELD_GET() macro.
+
+  The forced inlining does the trick for gcc, but for kernel builds with
+  clang it results in undefined symbols:
+
+  drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.o: In function
+    `__nfp_eth_set_aneg':
+
+drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c:(.text+0x787):
+    undefined reference to `__compiletime_assert_492'
+
+drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c:(.text+0x7b1):
+    undefined reference to `__compiletime_assert_496'
+
+  These __compiletime_assert_xyx() calls would have been optimized away
+if
+  the compiler had seen 'mask' as a constant.
+
+Add a macro to extract the mask and shift and pass those to
+nfp_eth_set_bit_config() separately.
+
+	Reported-by: Matthias Kaehlcke <mka@chromium.org>
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Tested-by: Dirk van der Merwe <dirk.vandermerwe@netronome.com>
+	Signed-off-by: Simon Horman <simon.horman@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4e59532541c865c85c92d42be4edf2ba6aa4af64)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c
+index f94361014b87,47251396fcae..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c
++++ b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c
+@@@ -251,26 -331,243 +251,180 @@@ int nfp_eth_set_mod_enable(struct nfp_c
+  	if (!(entries[idx].port & NSP_ETH_PORT_LANES_MASK)) {
+  		nfp_warn(cpp, "trying to set port state on disabled port %d\n",
+  			 idx);
+ -		goto err;
+ +		ret = -EINVAL;
+ +		goto exit_close_nsp;
+  	}
+  
+ -	nfp_nsp_config_set_state(nsp, entries, idx);
+ -	return nsp;
+ -
+ -err:
+ -	nfp_nsp_close(nsp);
+ -	kfree(entries);
+ -	return ERR_PTR(-EIO);
+ -}
+ +	/* Check if we are already in requested state */
+ +	reg = le64_to_cpu(entries[idx].state);
+ +	if (enable == FIELD_GET(NSP_ETH_CTRL_ENABLED, reg)) {
+ +		ret = 0;
+ +		goto exit_close_nsp;
+ +	}
+  
+ -void nfp_eth_config_cleanup_end(struct nfp_nsp *nsp)
+ -{
+ -	union eth_table_entry *entries = nfp_nsp_config_entries(nsp);
+++<<<<<<< HEAD
+ +	reg = le64_to_cpu(entries[idx].control);
+ +	reg &= ~NSP_ETH_CTRL_ENABLED;
+ +	reg |= FIELD_PREP(NSP_ETH_CTRL_ENABLED, enable);
+ +	entries[idx].control = cpu_to_le64(reg);
+  
+ -	nfp_nsp_config_set_modified(nsp, false);
+ -	nfp_nsp_config_clear_state(nsp);
+ +	ret = nfp_nsp_write_eth_table(nsp, entries, NSP_ETH_TABLE_SIZE);
+ +exit_close_nsp:
+  	nfp_nsp_close(nsp);
+  	kfree(entries);
+ -}
+ -
+ -/**
+ - * nfp_eth_config_commit_end() - perform recorded configuration changes
+ - * @nsp:	NFP NSP handle returned from nfp_eth_config_start()
+ - *
+ - * Perform the configuration which was requested with __nfp_eth_set_*()
+ - * helpers and recorded in @nsp state.  If device was already configured
+ - * as requested or no __nfp_eth_set_*() operations were made no NSP command
+ - * will be performed.
+ - *
+ - * Return:
+ - * 0 - configuration successful;
+ - * 1 - no changes were needed;
+ - * -ERRNO - configuration failed.
+ - */
+ -int nfp_eth_config_commit_end(struct nfp_nsp *nsp)
+ -{
+ -	union eth_table_entry *entries = nfp_nsp_config_entries(nsp);
+ -	int ret = 1;
+ -
+ -	if (nfp_nsp_config_modified(nsp)) {
+ -		ret = nfp_nsp_write_eth_table(nsp, entries, NSP_ETH_TABLE_SIZE);
+ -		ret = ret < 0 ? ret : 0;
+ -	}
+ -
+ -	nfp_eth_config_cleanup_end(nsp);
+ -
+ -	return ret;
+ -}
+ -
+ -/**
+ - * nfp_eth_set_mod_enable() - set PHY module enable control bit
+ - * @cpp:	NFP CPP handle
+ - * @idx:	NFP chip-wide port index
+ - * @enable:	Desired state
+ - *
+ - * Enable or disable PHY module (this usually means setting the TX lanes
+ - * disable bits).
+ - *
+ - * Return:
+ - * 0 - configuration successful;
+ - * 1 - no changes were needed;
+ - * -ERRNO - configuration failed.
+ - */
+ -int nfp_eth_set_mod_enable(struct nfp_cpp *cpp, unsigned int idx, bool enable)
+ -{
+ -	union eth_table_entry *entries;
+ -	struct nfp_nsp *nsp;
+ -	u64 reg;
+ -
+ -	nsp = nfp_eth_config_start(cpp, idx);
+ -	if (IS_ERR(nsp))
+ -		return PTR_ERR(nsp);
+ -
+ -	entries = nfp_nsp_config_entries(nsp);
+ -
+ -	/* Check if we are already in requested state */
+ -	reg = le64_to_cpu(entries[idx].state);
+ -	if (enable != FIELD_GET(NSP_ETH_CTRL_ENABLED, reg)) {
+ -		reg = le64_to_cpu(entries[idx].control);
+ -		reg &= ~NSP_ETH_CTRL_ENABLED;
+ -		reg |= FIELD_PREP(NSP_ETH_CTRL_ENABLED, enable);
+ -		entries[idx].control = cpu_to_le64(reg);
+ -
+ -		nfp_nsp_config_set_modified(nsp, true);
+ -	}
+  
+ +	return ret < 0 ? ret : 0;
+++=======
++ 	return nfp_eth_config_commit_end(nsp);
++ }
++ 
++ /**
++  * nfp_eth_set_configured() - set PHY module configured control bit
++  * @cpp:	NFP CPP handle
++  * @idx:	NFP chip-wide port index
++  * @configed:	Desired state
++  *
++  * Set the ifup/ifdown state on the PHY.
++  *
++  * Return:
++  * 0 - configuration successful;
++  * 1 - no changes were needed;
++  * -ERRNO - configuration failed.
++  */
++ int nfp_eth_set_configured(struct nfp_cpp *cpp, unsigned int idx, bool configed)
++ {
++ 	union eth_table_entry *entries;
++ 	struct nfp_nsp *nsp;
++ 	u64 reg;
++ 
++ 	nsp = nfp_eth_config_start(cpp, idx);
++ 	if (IS_ERR(nsp))
++ 		return PTR_ERR(nsp);
++ 
++ 	/* Older ABI versions did support this feature, however this has only
++ 	 * been reliable since ABI 20.
++ 	 */
++ 	if (nfp_nsp_get_abi_ver_minor(nsp) < 20) {
++ 		nfp_eth_config_cleanup_end(nsp);
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	entries = nfp_nsp_config_entries(nsp);
++ 
++ 	/* Check if we are already in requested state */
++ 	reg = le64_to_cpu(entries[idx].state);
++ 	if (configed != FIELD_GET(NSP_ETH_STATE_CONFIGURED, reg)) {
++ 		reg = le64_to_cpu(entries[idx].control);
++ 		reg &= ~NSP_ETH_CTRL_CONFIGURED;
++ 		reg |= FIELD_PREP(NSP_ETH_CTRL_CONFIGURED, configed);
++ 		entries[idx].control = cpu_to_le64(reg);
++ 
++ 		nfp_nsp_config_set_modified(nsp, true);
++ 	}
++ 
++ 	return nfp_eth_config_commit_end(nsp);
++ }
++ 
++ static int
++ nfp_eth_set_bit_config(struct nfp_nsp *nsp, unsigned int raw_idx,
++ 		       const u64 mask, const unsigned int shift,
++ 		       unsigned int val, const u64 ctrl_bit)
++ {
++ 	union eth_table_entry *entries = nfp_nsp_config_entries(nsp);
++ 	unsigned int idx = nfp_nsp_config_idx(nsp);
++ 	u64 reg;
++ 
++ 	/* Note: set features were added in ABI 0.14 but the error
++ 	 *	 codes were initially not populated correctly.
++ 	 */
++ 	if (nfp_nsp_get_abi_ver_minor(nsp) < 17) {
++ 		nfp_err(nfp_nsp_cpp(nsp),
++ 			"set operations not supported, please update flash\n");
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	/* Check if we are already in requested state */
++ 	reg = le64_to_cpu(entries[idx].raw[raw_idx]);
++ 	if (val == (reg & mask) >> shift)
++ 		return 0;
++ 
++ 	reg &= ~mask;
++ 	reg |= (val << shift) & mask;
++ 	entries[idx].raw[raw_idx] = cpu_to_le64(reg);
++ 
++ 	entries[idx].control |= cpu_to_le64(ctrl_bit);
++ 
++ 	nfp_nsp_config_set_modified(nsp, true);
++ 
++ 	return 0;
++ }
++ 
++ #define NFP_ETH_SET_BIT_CONFIG(nsp, raw_idx, mask, val, ctrl_bit)	\
++ 	({								\
++ 		__BF_FIELD_CHECK(mask, 0ULL, val, "NFP_ETH_SET_BIT_CONFIG: "); \
++ 		nfp_eth_set_bit_config(nsp, raw_idx, mask, __bf_shf(mask), \
++ 				       val, ctrl_bit);			\
++ 	})
++ 
++ /**
++  * __nfp_eth_set_aneg() - set PHY autonegotiation control bit
++  * @nsp:	NFP NSP handle returned from nfp_eth_config_start()
++  * @mode:	Desired autonegotiation mode
++  *
++  * Allow/disallow PHY module to advertise/perform autonegotiation.
++  * Will write to hwinfo overrides in the flash (persistent config).
++  *
++  * Return: 0 or -ERRNO.
++  */
++ int __nfp_eth_set_aneg(struct nfp_nsp *nsp, enum nfp_eth_aneg mode)
++ {
++ 	return NFP_ETH_SET_BIT_CONFIG(nsp, NSP_ETH_RAW_STATE,
++ 				      NSP_ETH_STATE_ANEG, mode,
++ 				      NSP_ETH_CTRL_SET_ANEG);
++ }
++ 
++ /**
++  * __nfp_eth_set_speed() - set interface speed/rate
++  * @nsp:	NFP NSP handle returned from nfp_eth_config_start()
++  * @speed:	Desired speed (per lane)
++  *
++  * Set lane speed.  Provided @speed value should be subport speed divided
++  * by number of lanes this subport is spanning (i.e. 10000 for 40G, 25000 for
++  * 50G, etc.)
++  * Will write to hwinfo overrides in the flash (persistent config).
++  *
++  * Return: 0 or -ERRNO.
++  */
++ int __nfp_eth_set_speed(struct nfp_nsp *nsp, unsigned int speed)
++ {
++ 	enum nfp_eth_rate rate;
++ 
++ 	rate = nfp_eth_speed2rate(speed);
++ 	if (rate == RATE_INVALID) {
++ 		nfp_warn(nfp_nsp_cpp(nsp),
++ 			 "could not find matching lane rate for speed %u\n",
++ 			 speed);
++ 		return -EINVAL;
++ 	}
++ 
++ 	return NFP_ETH_SET_BIT_CONFIG(nsp, NSP_ETH_RAW_STATE,
++ 				      NSP_ETH_STATE_RATE, rate,
++ 				      NSP_ETH_CTRL_SET_RATE);
++ }
++ 
++ /**
++  * __nfp_eth_set_split() - set interface lane split
++  * @nsp:	NFP NSP handle returned from nfp_eth_config_start()
++  * @lanes:	Desired lanes per port
++  *
++  * Set number of lanes in the port.
++  * Will write to hwinfo overrides in the flash (persistent config).
++  *
++  * Return: 0 or -ERRNO.
++  */
++ int __nfp_eth_set_split(struct nfp_nsp *nsp, unsigned int lanes)
++ {
++ 	return NFP_ETH_SET_BIT_CONFIG(nsp, NSP_ETH_RAW_PORT, NSP_ETH_PORT_LANES,
++ 				      lanes, NSP_ETH_CTRL_SET_LANES);
+++>>>>>>> 4e59532541c8 (nfp: don't depend on compiler constant propagation)
+  }
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c
