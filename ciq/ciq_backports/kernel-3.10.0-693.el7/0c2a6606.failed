@@ -1,0 +1,215 @@
+KVM: PPC: Book3S HV: Host side kick VCPU when poked by real-mode KVM
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Suresh Warrier <warrier@linux.vnet.ibm.com>
+commit 0c2a66062470cd1f6d11ae6db31059f59d3f725f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/0c2a6606.failed
+
+This patch adds the support for the kick VCPU operation for
+kvmppc_host_rm_ops. The kvmppc_xics_ipi_action() function
+provides the function to be invoked for a host side operation
+when poked by the real mode KVM. This is initiated by KVM by
+sending an IPI to any free host core.
+
+KVM real mode must set the rm_action to XICS_RM_KICK_VCPU and
+rm_data to point to the VCPU to be woken up before sending the IPI.
+Note that we have allocated one kvmppc_host_rm_core structure
+per core. The above values need to be set in the structure
+corresponding to the core to which the IPI will be sent.
+
+	Signed-off-by: Suresh Warrier <warrier@linux.vnet.ibm.com>
+	Signed-off-by: Paul Mackerras <paulus@samba.org>
+(cherry picked from commit 0c2a66062470cd1f6d11ae6db31059f59d3f725f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_hv.c
+diff --cc arch/powerpc/kvm/book3s_hv.c
+index 32dd0caea96b,c3c731085c1f..000000000000
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@@ -3041,6 -3052,114 +3041,117 @@@ static int kvmppc_hv_setup_htab_rma(str
+  	goto out_srcu;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_KVM_XICS
++ static int kvmppc_cpu_notify(struct notifier_block *self, unsigned long action,
++ 			void *hcpu)
++ {
++ 	unsigned long cpu = (long)hcpu;
++ 
++ 	switch (action) {
++ 	case CPU_UP_PREPARE:
++ 	case CPU_UP_PREPARE_FROZEN:
++ 		kvmppc_set_host_core(cpu);
++ 		break;
++ 
++ #ifdef CONFIG_HOTPLUG_CPU
++ 	case CPU_DEAD:
++ 	case CPU_DEAD_FROZEN:
++ 	case CPU_UP_CANCELED:
++ 	case CPU_UP_CANCELED_FROZEN:
++ 		kvmppc_clear_host_core(cpu);
++ 		break;
++ #endif
++ 	default:
++ 		break;
++ 	}
++ 
++ 	return NOTIFY_OK;
++ }
++ 
++ static struct notifier_block kvmppc_cpu_notifier = {
++ 	    .notifier_call = kvmppc_cpu_notify,
++ };
++ 
++ /*
++  * Allocate a per-core structure for managing state about which cores are
++  * running in the host versus the guest and for exchanging data between
++  * real mode KVM and CPU running in the host.
++  * This is only done for the first VM.
++  * The allocated structure stays even if all VMs have stopped.
++  * It is only freed when the kvm-hv module is unloaded.
++  * It's OK for this routine to fail, we just don't support host
++  * core operations like redirecting H_IPI wakeups.
++  */
++ void kvmppc_alloc_host_rm_ops(void)
++ {
++ 	struct kvmppc_host_rm_ops *ops;
++ 	unsigned long l_ops;
++ 	int cpu, core;
++ 	int size;
++ 
++ 	/* Not the first time here ? */
++ 	if (kvmppc_host_rm_ops_hv != NULL)
++ 		return;
++ 
++ 	ops = kzalloc(sizeof(struct kvmppc_host_rm_ops), GFP_KERNEL);
++ 	if (!ops)
++ 		return;
++ 
++ 	size = cpu_nr_cores() * sizeof(struct kvmppc_host_rm_core);
++ 	ops->rm_core = kzalloc(size, GFP_KERNEL);
++ 
++ 	if (!ops->rm_core) {
++ 		kfree(ops);
++ 		return;
++ 	}
++ 
++ 	get_online_cpus();
++ 
++ 	for (cpu = 0; cpu < nr_cpu_ids; cpu += threads_per_core) {
++ 		if (!cpu_online(cpu))
++ 			continue;
++ 
++ 		core = cpu >> threads_shift;
++ 		ops->rm_core[core].rm_state.in_host = 1;
++ 	}
++ 
++ 	ops->vcpu_kick = kvmppc_fast_vcpu_kick_hv;
++ 
++ 	/*
++ 	 * Make the contents of the kvmppc_host_rm_ops structure visible
++ 	 * to other CPUs before we assign it to the global variable.
++ 	 * Do an atomic assignment (no locks used here), but if someone
++ 	 * beats us to it, just free our copy and return.
++ 	 */
++ 	smp_wmb();
++ 	l_ops = (unsigned long) ops;
++ 
++ 	if (cmpxchg64((unsigned long *)&kvmppc_host_rm_ops_hv, 0, l_ops)) {
++ 		put_online_cpus();
++ 		kfree(ops->rm_core);
++ 		kfree(ops);
++ 		return;
++ 	}
++ 
++ 	register_cpu_notifier(&kvmppc_cpu_notifier);
++ 
++ 	put_online_cpus();
++ }
++ 
++ void kvmppc_free_host_rm_ops(void)
++ {
++ 	if (kvmppc_host_rm_ops_hv) {
++ 		unregister_cpu_notifier(&kvmppc_cpu_notifier);
++ 		kfree(kvmppc_host_rm_ops_hv->rm_core);
++ 		kfree(kvmppc_host_rm_ops_hv);
++ 		kvmppc_host_rm_ops_hv = NULL;
++ 	}
++ }
++ #endif
++ 
+++>>>>>>> 0c2a66062470 (KVM: PPC: Book3S HV: Host side kick VCPU when poked by real-mode KVM)
+  static int kvmppc_core_init_vm_hv(struct kvm *kvm)
+  {
+  	unsigned long lpcr, lpid;
+diff --git a/arch/powerpc/include/asm/kvm_ppc.h b/arch/powerpc/include/asm/kvm_ppc.h
+index 19c0b19b88fc..074b816c9289 100644
+--- a/arch/powerpc/include/asm/kvm_ppc.h
++++ b/arch/powerpc/include/asm/kvm_ppc.h
+@@ -441,6 +441,7 @@ extern u64 kvmppc_xics_get_icp(struct kvm_vcpu *vcpu);
+ extern int kvmppc_xics_set_icp(struct kvm_vcpu *vcpu, u64 icpval);
+ extern int kvmppc_xics_connect_vcpu(struct kvm_device *dev,
+ 			struct kvm_vcpu *vcpu, u32 cpu);
++extern void kvmppc_xics_ipi_action(void);
+ #else
+ static inline int kvmppc_xics_enabled(struct kvm_vcpu *vcpu)
+ 	{ return 0; }
+* Unmerged path arch/powerpc/kvm/book3s_hv.c
+diff --git a/arch/powerpc/kvm/book3s_hv_rm_xics.c b/arch/powerpc/kvm/book3s_hv_rm_xics.c
+index 1ec9b5d6ad10..d5c1dcf9ac32 100644
+--- a/arch/powerpc/kvm/book3s_hv_rm_xics.c
++++ b/arch/powerpc/kvm/book3s_hv_rm_xics.c
+@@ -17,6 +17,7 @@
+ #include <asm/xics.h>
+ #include <asm/debug.h>
+ #include <asm/synch.h>
++#include <asm/cputhreads.h>
+ #include <asm/ppc-opcode.h>
+ 
+ #include "book3s_xics.h"
+@@ -623,3 +624,38 @@ int kvmppc_rm_h_eoi(struct kvm_vcpu *vcpu, unsigned long xirr)
+  bail:
+ 	return check_too_hard(xics, icp);
+ }
++
++/*  --- Non-real mode XICS-related built-in routines ---  */
++
++/**
++ * Host Operations poked by RM KVM
++ */
++static void rm_host_ipi_action(int action, void *data)
++{
++	switch (action) {
++	case XICS_RM_KICK_VCPU:
++		kvmppc_host_rm_ops_hv->vcpu_kick(data);
++		break;
++	default:
++		WARN(1, "Unexpected rm_action=%d data=%p\n", action, data);
++		break;
++	}
++
++}
++
++void kvmppc_xics_ipi_action(void)
++{
++	int core;
++	unsigned int cpu = smp_processor_id();
++	struct kvmppc_host_rm_core *rm_corep;
++
++	core = cpu >> threads_shift;
++	rm_corep = &kvmppc_host_rm_ops_hv->rm_core[core];
++
++	if (rm_corep->rm_data) {
++		rm_host_ipi_action(rm_corep->rm_state.rm_action,
++							rm_corep->rm_data);
++		rm_corep->rm_data = NULL;
++		rm_corep->rm_state.rm_action = 0;
++	}
++}
