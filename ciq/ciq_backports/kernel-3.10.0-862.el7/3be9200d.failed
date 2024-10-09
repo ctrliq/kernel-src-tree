@@ -1,0 +1,138 @@
+cpufreq: intel_pstate: Adjust policy->max
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [cpufreq] intel_pstate: Adjust policy->max (Prarit Bhargava) [1465349]
+Rebuild_FUZZ: 87.67%
+commit-author Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+commit 3be9200d512bfa8d6292f5dce6c02aa151821e09
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/3be9200d.failed
+
+When policy->max is changed via _PPC or sysfs and is more than the max non
+turbo frequency, it does not really change resulting performance in some
+processors. When policy->max results in a P-State ratio more than the
+turbo activation ratio, then processor can choose any P-State up to max
+turbo. So the user or _PPC setting has no value, but this can cause
+undesirable side effects like:
+- Showing reduced max percentage in Intel P-State sysfs
+- It can cause reduced max performance under certain boundary conditions:
+The requested max scaling frequency either via _PPC or via cpufreq-sysfs,
+will be converted into a fixed floating point max percent scale. In
+majority of the cases this will result in correct max. But not 100% of the
+time. If the _PPC is requested at a point where the calculation lead to a
+lower max, this can result in a lower P-State then expected and it will
+impact performance.
+Example of this condition using a Broadwell laptop with config TDP.
+
+ACPI _PSS table from a Broadwell laptop
+2301000 2300000 2200000 2000000 1900000 1800000 1700000 1500000 1400000
+1300000 1100000 1000000 900000 800000 600000 500000
+
+The actual results by disabling config TDP so that we can get what is
+requested on or below 2300000Khz.
+
+scaling_max_freq        Max Requested P-State   Resultant scaling
+max
+---------------------------------------- ----------------------
+2400000                 18                      2900000 (max
+turbo)
+2300000                 17                      2300000 (max
+physical non turbo)
+2200000                 15                      2100000
+2100000                 15                      2100000
+2000000                 13                      1900000
+1900000                 13                      1900000
+1800000                 12                      1800000
+1700000                 11                      1700000
+1600000                 10                      1600000
+1500000                 f                       1500000
+1400000                 e                       1400000
+1300000                 d                       1300000
+1200000                 c                       1200000
+1100000                 a                       1000000
+1000000                 a                       1000000
+900000                  9                        900000
+800000                  8                        800000
+700000                  7                        700000
+600000                  6                        600000
+500000                  5                        500000
+------------------------------------------------------------------
+
+Now set the config TDP level 1 ratio as 0x0b (equivalent to 1100000KHz)
+in BIOS (not every system will let you adjust this).
+The turbo activation ratio will be set to one less than that, which will
+be 0x0a (So any request above 1000000KHz should result in turbo region
+assuming no thermal limits).
+Here _PPC will request max to 1100000KHz (which basically should still
+result in turbo as this is more than the turbo activation ratio up to
+max allowable turbo frequency), but actual calculation resulted in a max
+ceiling P-State which is 0x0a. So under any load condition, this driver
+will not request turbo P-States. This will be a huge performance hit.
+
+When config TDP feature is ON, if the _PPC points to a frequency above
+turbo activation ratio, the performance can still reach max turbo. In this
+case we don't need to treat this as the reduced frequency in set_policy
+callback.
+
+In this change when config TDP is active (by checking if the physical max
+non turbo ratio is more than the current max non turbo ratio), any request
+above current max non turbo is treated as full performance.
+
+	Signed-off-by: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+[ rjw : Minor cleanups ]
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 3be9200d512bfa8d6292f5dce6c02aa151821e09)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/intel_pstate.c
+diff --cc drivers/cpufreq/intel_pstate.c
+index 302e769ea631,31f6ffe0cf10..000000000000
+--- a/drivers/cpufreq/intel_pstate.c
++++ b/drivers/cpufreq/intel_pstate.c
+@@@ -1403,20 -1423,29 +1405,33 @@@ static int intel_pstate_set_policy(stru
+  	if (!policy->cpuinfo.max_freq)
+  		return -ENODEV;
+  
+ -	intel_pstate_clear_update_util_hook(policy->cpu);
+ +	pr_debug("set_policy cpuinfo.max %u policy->max %u\n",
+ +		 policy->cpuinfo.max_freq, policy->max);
+  
+++<<<<<<< HEAD
+ +	if (policy->policy == CPUFREQ_POLICY_PERFORMANCE &&
+ +	    policy->max >= policy->cpuinfo.max_freq) {
+ +		pr_debug("intel_pstate: set performance\n");
+++=======
++ 	cpu = all_cpu_data[0];
++ 	if (cpu->pstate.max_pstate_physical > cpu->pstate.max_pstate) {
++ 		if (policy->max < policy->cpuinfo.max_freq &&
++ 		    policy->max > cpu->pstate.max_pstate * cpu->pstate.scaling) {
++ 			pr_debug("policy->max > max non turbo frequency\n");
++ 			policy->max = policy->cpuinfo.max_freq;
++ 		}
++ 	}
++ 
++ 	if (policy->policy == CPUFREQ_POLICY_PERFORMANCE) {
+++>>>>>>> 3be9200d512b (cpufreq: intel_pstate: Adjust policy->max)
+  		limits = &performance_limits;
+ -		if (policy->max >= policy->cpuinfo.max_freq) {
+ -			pr_debug("set performance\n");
+ -			intel_pstate_set_performance_limits(limits);
+ -			goto out;
+ -		}
+ -	} else {
+ -		pr_debug("set powersave\n");
+ -		limits = &powersave_limits;
+ +		if (hwp_active)
+ +			intel_pstate_hwp_set(policy->cpus);
+ +		return 0;
+  	}
+  
+ +	pr_debug("intel_pstate: set powersave\n");
+ +	limits = &powersave_limits;
+  	limits->min_policy_pct = (policy->min * 100) / policy->cpuinfo.max_freq;
+  	limits->min_policy_pct = clamp_t(int, limits->min_policy_pct, 0 , 100);
+  	limits->max_policy_pct = DIV_ROUND_UP(policy->max * 100,
+* Unmerged path drivers/cpufreq/intel_pstate.c
