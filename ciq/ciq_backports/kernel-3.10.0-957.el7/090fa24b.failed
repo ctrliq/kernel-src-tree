@@ -1,0 +1,162 @@
+IB/srpt: Preparations for adding RDMA/CM support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Bart Van Assche <bart.vanassche@wdc.com>
+commit 090fa24bf239ce1ec58f2b90c5ba54feca456cb0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/090fa24b.failed
+
+Introduce a union in struct srpt_rdma_ch for member variables that
+depend on the type of connection manager. Avoid that error messages
+report the IB/CM ID.
+
+	Signed-off-by: Bart Van Assche <bart.vanassche@wdc.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 090fa24bf239ce1ec58f2b90c5ba54feca456cb0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/srpt/ib_srpt.h
+diff --cc drivers/infiniband/ulp/srpt/ib_srpt.h
+index 26dbb4ea600d,4d9199fd00dc..000000000000
+--- a/drivers/infiniband/ulp/srpt/ib_srpt.h
++++ b/drivers/infiniband/ulp/srpt/ib_srpt.h
+@@@ -240,8 -242,9 +240,13 @@@ enum rdma_ch_state 
+  
+  /**
+   * struct srpt_rdma_ch - RDMA channel
+++<<<<<<< HEAD
+ + * @cm_id:         IB CM ID associated with the channel.
+++=======
++  * @nexus:         I_T nexus this channel is associated with.
+++>>>>>>> 090fa24bf239 (IB/srpt: Preparations for adding RDMA/CM support)
+   * @qp:            IB queue pair used for communicating over this channel.
++  * @cm_id:         IB CM ID associated with the channel.
+   * @cq:            IB completion queue for this channel.
+   * @zw_cqe:	   Zero-length write CQE.
+   * @rcu:           RCU head.
+@@@ -271,8 -274,13 +276,17 @@@
+   * @release_work:  Allows scheduling of srpt_release_channel().
+   */
+  struct srpt_rdma_ch {
+++<<<<<<< HEAD
+ +	struct ib_cm_id		*cm_id;
+++=======
++ 	struct srpt_nexus	*nexus;
+++>>>>>>> 090fa24bf239 (IB/srpt: Preparations for adding RDMA/CM support)
+  	struct ib_qp		*qp;
++ 	union {
++ 		struct {
++ 			struct ib_cm_id		*cm_id;
++ 		} ib_cm;
++ 	};
+  	struct ib_cq		*cq;
+  	struct ib_cqe		zw_cqe;
+  	struct rcu_head		rcu;
+diff --git a/drivers/infiniband/ulp/srpt/ib_srpt.c b/drivers/infiniband/ulp/srpt/ib_srpt.c
+index 22badbe26bbc..bd0578d364e7 100644
+--- a/drivers/infiniband/ulp/srpt/ib_srpt.c
++++ b/drivers/infiniband/ulp/srpt/ib_srpt.c
+@@ -213,12 +213,12 @@ static const char *get_ch_state_name(enum rdma_ch_state s)
+  */
+ static void srpt_qp_event(struct ib_event *event, struct srpt_rdma_ch *ch)
+ {
+-	pr_debug("QP event %d on cm_id=%p sess_name=%s state=%d\n",
+-		 event->event, ch->cm_id, ch->sess_name, ch->state);
++	pr_debug("QP event %d on ch=%p sess_name=%s state=%d\n",
++		 event->event, ch, ch->sess_name, ch->state);
+ 
+ 	switch (event->event) {
+ 	case IB_EVENT_COMM_EST:
+-		ib_cm_notify(ch->cm_id, event->event);
++		ib_cm_notify(ch->ib_cm.cm_id, event->event);
+ 		break;
+ 	case IB_EVENT_QP_LAST_WQE_REACHED:
+ 		pr_debug("%s-%d, state %s: received Last WQE event.\n",
+@@ -1090,7 +1090,7 @@ static int srpt_ch_qp_rtr(struct srpt_rdma_ch *ch, struct ib_qp *qp)
+ 	int ret;
+ 
+ 	qp_attr.qp_state = IB_QPS_RTR;
+-	ret = ib_cm_init_qp_attr(ch->cm_id, &qp_attr, &attr_mask);
++	ret = ib_cm_init_qp_attr(ch->ib_cm.cm_id, &qp_attr, &attr_mask);
+ 	if (ret)
+ 		goto out;
+ 
+@@ -1120,7 +1120,7 @@ static int srpt_ch_qp_rts(struct srpt_rdma_ch *ch, struct ib_qp *qp)
+ 	int ret;
+ 
+ 	qp_attr.qp_state = IB_QPS_RTS;
+-	ret = ib_cm_init_qp_attr(ch->cm_id, &qp_attr, &attr_mask);
++	ret = ib_cm_init_qp_attr(ch->ib_cm.cm_id, &qp_attr, &attr_mask);
+ 	if (ret)
+ 		goto out;
+ 
+@@ -1502,9 +1502,9 @@ static void srpt_handle_tsk_mgmt(struct srpt_rdma_ch *ch,
+ 	srp_tsk = recv_ioctx->ioctx.buf;
+ 	cmd = &send_ioctx->cmd;
+ 
+-	pr_debug("recv tsk_mgmt fn %d for task_tag %lld and cmd tag %lld"
+-		 " cm_id %p sess %p\n", srp_tsk->tsk_mgmt_func,
+-		 srp_tsk->task_tag, srp_tsk->tag, ch->cm_id, ch->sess);
++	pr_debug("recv tsk_mgmt fn %d for task_tag %lld and cmd tag %lld ch %p sess %p\n",
++		 srp_tsk->tsk_mgmt_func, srp_tsk->task_tag, srp_tsk->tag, ch,
++		 ch->sess);
+ 
+ 	srpt_set_cmd_state(send_ioctx, SRPT_STATE_MGMT);
+ 	send_ioctx->cmd.tag = srp_tsk->tag;
+@@ -1747,9 +1747,9 @@ retry:
+ 
+ 	atomic_set(&ch->sq_wr_avail, qp_init->cap.max_send_wr);
+ 
+-	pr_debug("%s: max_cqe= %d max_sge= %d sq_size = %d cm_id= %p\n",
++	pr_debug("%s: max_cqe= %d max_sge= %d sq_size = %d ch= %p\n",
+ 		 __func__, ch->cq->cqe, qp_init->cap.max_send_sge,
+-		 qp_init->cap.max_send_wr, ch->cm_id);
++		 qp_init->cap.max_send_wr, ch);
+ 
+ 	ret = srpt_init_ch_qp(ch, ch->qp);
+ 	if (ret)
+@@ -1834,9 +1834,9 @@ static int srpt_disconnect_ch(struct srpt_rdma_ch *ch)
+ 	if (!srpt_set_ch_state(ch, CH_DISCONNECTING))
+ 		return -ENOTCONN;
+ 
+-	ret = ib_send_cm_dreq(ch->cm_id, NULL, 0);
++	ret = ib_send_cm_dreq(ch->ib_cm.cm_id, NULL, 0);
+ 	if (ret < 0)
+-		ret = ib_send_cm_drep(ch->cm_id, NULL, 0);
++		ret = ib_send_cm_drep(ch->ib_cm.cm_id, NULL, 0);
+ 
+ 	if (ret < 0 && srpt_close_ch(ch))
+ 		ret = 0;
+@@ -1944,7 +1944,7 @@ static void srpt_release_channel_work(struct work_struct *w)
+ 	transport_deregister_session(se_sess);
+ 	ch->sess = NULL;
+ 
+-	ib_destroy_cm_id(ch->cm_id);
++	ib_destroy_cm_id(ch->ib_cm.cm_id);
+ 
+ 	srpt_destroy_ch_ib(ch);
+ 
+@@ -2083,7 +2083,7 @@ static int srpt_cm_req_recv(struct ib_cm_id *cm_id,
+ 	memcpy(ch->i_port_id, req->initiator_port_id, 16);
+ 	memcpy(ch->t_port_id, req->target_port_id, 16);
+ 	ch->sport = &sdev->port[param->port - 1];
+-	ch->cm_id = cm_id;
++	ch->ib_cm.cm_id = cm_id;
+ 	cm_id->context = ch;
+ 	/*
+ 	 * ch->rq_size should be at least as large as the initiator queue
+@@ -2169,8 +2169,8 @@ static int srpt_cm_req_recv(struct ib_cm_id *cm_id,
+ 		goto destroy_ib;
+ 	}
+ 
+-	pr_debug("Establish connection sess=%p name=%s cm_id=%p\n", ch->sess,
+-		 ch->sess_name, ch->cm_id);
++	pr_debug("Establish connection sess=%p name=%s ch=%p\n", ch->sess,
++		 ch->sess_name, ch);
+ 
+ 	/* create srp_login_response */
+ 	rsp->opcode = SRP_LOGIN_RSP;
+* Unmerged path drivers/infiniband/ulp/srpt/ib_srpt.h
