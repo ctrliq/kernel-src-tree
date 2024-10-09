@@ -1,0 +1,452 @@
+IB/hfi1: Fix bar0 mapping to use write combining
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Mike Marciniszyn <mike.marciniszyn@intel.com>
+commit cb51c5d2cda855302910ab352f3d391c1a00aba0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/cb51c5d2.failed
+
+When the debugpat kernel boot flag is turned on the following
+traces are printed:
+
+[ 1884.793168] x86/PAT: Overlap at 0x90000000-0x92000000
+[ 1884.803510] x86/PAT: reserve_memtype added [mem 0x91200000-0x9127ffff],
+track uncached-minus, req write-combining, ret uncached-minus
+[ 1884.818167] hfi1 0000:05:00.0: hfi1_0: WC Remapped RcvArray:
+ffffc9000a980000
+
+The ioremap_wc() clearly is not returning a write combining mapping due
+to an overlap where the RcvArray is mapped in a uncached mapping prior
+to creating the proposed write combining mapping.
+
+The patch replaces the single base register for uncached CSRs that
+used to overlap the RcvArray with two mappings.   One, kregbase1, from the
+bar0 up to the RcvArray and another, kregbase2, from the end of the
+RcvArray to the pio send buffer space.  A new dd field, base2_start,
+is used to convert the zero-based offset in the CSR routines to the
+correct kregbase1/kregbase2 mapping.  A single direct write of the
+RcvArray CSRs is replaced with hfi1_put_tid() to insure correct access
+using the new disjoint mapping.
+
+Additionally, the kregend field is deleted since it is only ever written.
+
+patdebug now shows the RcvArray as write combining:
+[   35.688990] x86/PAT: reserve_memtype added [mem 0x91200000-0x9127ffff],
+track write-combining, req write-combining, ret write-combining
+
+To insulate from any potential issues with write combining, all
+writeq are now flushed in hfi1_put_tid() and rcv_array_wc_fill().
+
+	Reviewed-by: Mitko Haralanov <mitko.haralanov@intel.com>
+	Reviewed-by: Ashutosh Dixit <ashutosh.dixit@intel.com>
+	Signed-off-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit cb51c5d2cda855302910ab352f3d391c1a00aba0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hfi1/exp_rcv.h
+#	drivers/infiniband/hw/hfi1/file_ops.c
+#	drivers/infiniband/hw/hfi1/pcie.c
+diff --cc drivers/infiniband/hw/hfi1/file_ops.c
+index 32dd4a920494,fbf52841aea4..000000000000
+--- a/drivers/infiniband/hw/hfi1/file_ops.c
++++ b/drivers/infiniband/hw/hfi1/file_ops.c
+@@@ -174,6 -181,9 +174,12 @@@ static int hfi1_file_open(struct inode 
+  					       struct hfi1_devdata,
+  					       user_cdev);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!((dd->flags & HFI1_PRESENT) && dd->kregbase1))
++ 		return -EINVAL;
++ 
+++>>>>>>> cb51c5d2cda8 (IB/hfi1: Fix bar0 mapping to use write combining)
+  	if (!atomic_inc_not_zero(&dd->user_refcount))
+  		return -ENXIO;
+  
+diff --cc drivers/infiniband/hw/hfi1/pcie.c
+index 6a9f6f9819e1,cc7be224095d..000000000000
+--- a/drivers/infiniband/hw/hfi1/pcie.c
++++ b/drivers/infiniband/hw/hfi1/pcie.c
+@@@ -207,19 -224,62 +223,32 @@@ int hfi1_pcie_ddinit(struct hfi1_devdat
+  	/*
+  	 * Save BARs and command to rewrite after device reset.
+  	 */
+ -
+ -	ret = pci_read_config_dword(dd->pcidev, PCI_BASE_ADDRESS_0, &dd->pcibar0);
+ -	if (ret)
+ -		goto read_error;
+ -
+ -	ret = pci_read_config_dword(dd->pcidev, PCI_BASE_ADDRESS_1, &dd->pcibar1);
+ -	if (ret)
+ -		goto read_error;
+ -
+ -	ret = pci_read_config_dword(dd->pcidev, PCI_ROM_ADDRESS, &dd->pci_rom);
+ -	if (ret)
+ -		goto read_error;
+ -
+ -	ret = pci_read_config_word(dd->pcidev, PCI_COMMAND, &dd->pci_command);
+ -	if (ret)
+ -		goto read_error;
+ -
+ -	ret = pcie_capability_read_word(dd->pcidev, PCI_EXP_DEVCTL,
+ -					&dd->pcie_devctl);
+ -	if (ret)
+ -		goto read_error;
+ -
+ -	ret = pcie_capability_read_word(dd->pcidev, PCI_EXP_LNKCTL,
+ -					&dd->pcie_lnkctl);
+ -	if (ret)
+ -		goto read_error;
+ -
+ -	ret = pcie_capability_read_word(dd->pcidev, PCI_EXP_DEVCTL2,
+ -					&dd->pcie_devctl2);
+ -	if (ret)
+ -		goto read_error;
+ -
+ -	ret = pci_read_config_dword(dd->pcidev, PCI_CFG_MSIX0, &dd->pci_msix0);
+ -	if (ret)
+ -		goto read_error;
+ -
+ -	ret = pci_read_config_dword(dd->pcidev, PCIE_CFG_SPCIE1,
+ -				    &dd->pci_lnkctl3);
+ -	if (ret)
+ -		goto read_error;
+ -
+ -	ret = pci_read_config_dword(dd->pcidev, PCIE_CFG_TPH2, &dd->pci_tph2);
+ -	if (ret)
+ -		goto read_error;
+ +	pci_read_config_dword(dd->pcidev, PCI_BASE_ADDRESS_0, &dd->pcibar0);
+ +	pci_read_config_dword(dd->pcidev, PCI_BASE_ADDRESS_1, &dd->pcibar1);
+ +	pci_read_config_dword(dd->pcidev, PCI_ROM_ADDRESS, &dd->pci_rom);
+ +	pci_read_config_word(dd->pcidev, PCI_COMMAND, &dd->pci_command);
+ +	pcie_capability_read_word(dd->pcidev, PCI_EXP_DEVCTL, &dd->pcie_devctl);
+ +	pcie_capability_read_word(dd->pcidev, PCI_EXP_LNKCTL, &dd->pcie_lnkctl);
+ +	pcie_capability_read_word(dd->pcidev, PCI_EXP_DEVCTL2,
+ +				  &dd->pcie_devctl2);
+ +	pci_read_config_dword(dd->pcidev, PCI_CFG_MSIX0, &dd->pci_msix0);
+ +	pci_read_config_dword(dd->pcidev, PCIE_CFG_SPCIE1, &dd->pci_lnkctl3);
+ +	pci_read_config_dword(dd->pcidev, PCIE_CFG_TPH2, &dd->pci_tph2);
+  
++ 	dd->flags |= HFI1_PRESENT;	/* chip.c CSR routines now work */
+  	return 0;
+++<<<<<<< HEAD
+++=======
++ 
++ read_error:
++ 	dd_dev_err(dd, "Unable to read from PCI config\n");
++ 	goto bail_error;
++ nomem:
++ 	ret = -ENOMEM;
++ bail_error:
++ 	hfi1_pcie_ddcleanup(dd);
++ 	return ret;
+++>>>>>>> cb51c5d2cda8 (IB/hfi1: Fix bar0 mapping to use write combining)
+  }
+  
+  /*
+@@@ -229,61 -289,21 +258,65 @@@
+   */
+  void hfi1_pcie_ddcleanup(struct hfi1_devdata *dd)
+  {
+- 	u64 __iomem *base = (void __iomem *)dd->kregbase;
+- 
+  	dd->flags &= ~HFI1_PRESENT;
+- 	dd->kregbase = NULL;
+- 	iounmap(base);
++ 	if (dd->kregbase1)
++ 		iounmap(dd->kregbase1);
++ 	dd->kregbase1 = NULL;
++ 	if (dd->kregbase2)
++ 		iounmap(dd->kregbase2);
++ 	dd->kregbase2 = NULL;
+  	if (dd->rcvarray_wc)
+  		iounmap(dd->rcvarray_wc);
++ 	dd->rcvarray_wc = NULL;
+  	if (dd->piobase)
+  		iounmap(dd->piobase);
++ 	dd->piobase = NULL;
+  }
+  
+ +static void msix_setup(struct hfi1_devdata *dd, int pos, u32 *msixcnt,
+ +		       struct hfi1_msix_entry *hfi1_msix_entry)
+ +{
+ +	int ret;
+ +	int nvec = *msixcnt;
+ +	struct msix_entry *msix_entry;
+ +	int i;
+ +
+ +	/*
+ +	 * We can't pass hfi1_msix_entry array to msix_setup
+ +	 * so use a dummy msix_entry array and copy the allocated
+ +	 * irq back to the hfi1_msix_entry array.
+ +	 */
+ +	msix_entry = kmalloc_array(nvec, sizeof(*msix_entry), GFP_KERNEL);
+ +	if (!msix_entry) {
+ +		ret = -ENOMEM;
+ +		goto do_intx;
+ +	}
+ +
+ +	for (i = 0; i < nvec; i++)
+ +		msix_entry[i] = hfi1_msix_entry[i].msix;
+ +
+ +	ret = pci_enable_msix_range(dd->pcidev, msix_entry, 1, nvec);
+ +	if (ret < 0)
+ +		goto free_msix_entry;
+ +	nvec = ret;
+ +
+ +	for (i = 0; i < nvec; i++)
+ +		hfi1_msix_entry[i].msix = msix_entry[i];
+ +
+ +	kfree(msix_entry);
+ +	*msixcnt = nvec;
+ +	return;
+ +
+ +free_msix_entry:
+ +	kfree(msix_entry);
+ +
+ +do_intx:
+ +	dd_dev_err(dd, "pci_enable_msix_range %d vectors failed: %d, falling back to INTx\n",
+ +		   nvec, ret);
+ +	*msixcnt = 0;
+ +	hfi1_enable_intx(dd->pcidev);
+ +}
+ +
+  /* return the PCIe link speed from the given link status */
+  static u32 extract_speed(u16 linkstat)
+  {
+* Unmerged path drivers/infiniband/hw/hfi1/exp_rcv.h
+diff --git a/drivers/infiniband/hw/hfi1/chip.c b/drivers/infiniband/hw/hfi1/chip.c
+index f57caa8b4d09..cb2ba0332c2a 100644
+--- a/drivers/infiniband/hw/hfi1/chip.c
++++ b/drivers/infiniband/hw/hfi1/chip.c
+@@ -1295,25 +1295,71 @@ CNTR_ELEM(#name, \
+ 	  CNTR_SYNTH, \
+ 	  access_ibp_##cntr)
+ 
++/**
++ * hfi_addr_from_offset - return addr for readq/writeq
++ * @dd - the dd device
++ * @offset - the offset of the CSR within bar0
++ *
++ * This routine selects the appropriate base address
++ * based on the indicated offset.
++ */
++static inline void __iomem *hfi1_addr_from_offset(
++	const struct hfi1_devdata *dd,
++	u32 offset)
++{
++	if (offset >= dd->base2_start)
++		return dd->kregbase2 + (offset - dd->base2_start);
++	return dd->kregbase1 + offset;
++}
++
++/**
++ * read_csr - read CSR at the indicated offset
++ * @dd - the dd device
++ * @offset - the offset of the CSR within bar0
++ *
++ * Return: the value read or all FF's if there
++ * is no mapping
++ */
+ u64 read_csr(const struct hfi1_devdata *dd, u32 offset)
+ {
+-	if (dd->flags & HFI1_PRESENT) {
+-		return readq((void __iomem *)dd->kregbase + offset);
+-	}
++	if (dd->flags & HFI1_PRESENT)
++		return readq(hfi1_addr_from_offset(dd, offset));
+ 	return -1;
+ }
+ 
++/**
++ * write_csr - write CSR at the indicated offset
++ * @dd - the dd device
++ * @offset - the offset of the CSR within bar0
++ * @value - value to write
++ */
+ void write_csr(const struct hfi1_devdata *dd, u32 offset, u64 value)
+ {
+-	if (dd->flags & HFI1_PRESENT)
+-		writeq(value, (void __iomem *)dd->kregbase + offset);
++	if (dd->flags & HFI1_PRESENT) {
++		void __iomem *base = hfi1_addr_from_offset(dd, offset);
++
++		/* avoid write to RcvArray */
++		if (WARN_ON(offset >= RCV_ARRAY && offset < dd->base2_start))
++			return;
++		writeq(value, base);
++	}
+ }
+ 
++/**
++ * get_csr_addr - return te iomem address for offset
++ * @dd - the dd device
++ * @offset - the offset of the CSR within bar0
++ *
++ * Return: The iomem address to use in subsequent
++ * writeq/readq operations.
++ */
+ void __iomem *get_csr_addr(
+-	struct hfi1_devdata *dd,
++	const struct hfi1_devdata *dd,
+ 	u32 offset)
+ {
+-	return (void __iomem *)dd->kregbase + offset;
++	if (dd->flags & HFI1_PRESENT)
++		return hfi1_addr_from_offset(dd, offset);
++	return NULL;
+ }
+ 
+ static inline u64 read_write_csr(const struct hfi1_devdata *dd, u32 csr,
+@@ -9750,14 +9796,13 @@ void hfi1_put_tid(struct hfi1_devdata *dd, u32 index,
+ 		  u32 type, unsigned long pa, u16 order)
+ {
+ 	u64 reg;
+-	void __iomem *base = (dd->rcvarray_wc ? dd->rcvarray_wc :
+-			      (dd->kregbase + RCV_ARRAY));
+ 
+ 	if (!(dd->flags & HFI1_PRESENT))
+ 		goto done;
+ 
+-	if (type == PT_INVALID) {
++	if (type == PT_INVALID || type == PT_INVALID_FLUSH) {
+ 		pa = 0;
++		order = 0;
+ 	} else if (type > PT_INVALID) {
+ 		dd_dev_err(dd,
+ 			   "unexpected receive array type %u for index %u, not handled\n",
+@@ -9771,13 +9816,14 @@ void hfi1_put_tid(struct hfi1_devdata *dd, u32 index,
+ 		| (u64)order << RCV_ARRAY_RT_BUF_SIZE_SHIFT
+ 		| ((pa >> RT_ADDR_SHIFT) & RCV_ARRAY_RT_ADDR_MASK)
+ 					<< RCV_ARRAY_RT_ADDR_SHIFT;
+-	trace_hfi1_write_rcvarray(base + (index * 8), reg);
+-	writeq(reg, base + (index * 8));
++	trace_hfi1_write_rcvarray(dd->rcvarray_wc + (index * 8), reg);
++	writeq(reg, dd->rcvarray_wc + (index * 8));
+ 
+-	if (type == PT_EAGER)
++	if (type == PT_EAGER || type == PT_INVALID_FLUSH || (index & 3) == 3)
+ 		/*
+-		 * Eager entries are written one-by-one so we have to push them
+-		 * after we write the entry.
++		 * Eager entries are written and flushed
++		 *
++		 * Expected entries are flushed every 4 writes
+ 		 */
+ 		flush_wc();
+ done:
+@@ -13386,8 +13432,7 @@ static void write_uninitialized_csrs_and_memories(struct hfi1_devdata *dd)
+ 
+ 	/* RcvArray */
+ 	for (i = 0; i < dd->chip_rcv_array_count; i++)
+-		write_csr(dd, RCV_ARRAY + (8 * i),
+-			  RCV_ARRAY_RT_WRITE_ENABLE_SMASK);
++		hfi1_put_tid(dd, i, PT_INVALID_FLUSH, 0, 0);
+ 
+ 	/* RcvQPMapTable */
+ 	for (i = 0; i < 32; i++)
+diff --git a/drivers/infiniband/hw/hfi1/chip.h b/drivers/infiniband/hw/hfi1/chip.h
+index 8a7b218d745f..c82774537bfe 100644
+--- a/drivers/infiniband/hw/hfi1/chip.h
++++ b/drivers/infiniband/hw/hfi1/chip.h
+@@ -605,11 +605,11 @@ int read_lcb_csr(struct hfi1_devdata *dd, u32 offset, u64 *data);
+ int write_lcb_csr(struct hfi1_devdata *dd, u32 offset, u64 data);
+ 
+ void __iomem *get_csr_addr(
+-	struct hfi1_devdata *dd,
++	const struct hfi1_devdata *dd,
+ 	u32 offset);
+ 
+ static inline void __iomem *get_kctxt_csr_addr(
+-	struct hfi1_devdata *dd,
++	const struct hfi1_devdata *dd,
+ 	int ctxt,
+ 	u32 offset0)
+ {
+diff --git a/drivers/infiniband/hw/hfi1/driver.c b/drivers/infiniband/hw/hfi1/driver.c
+index 500b129ed565..601d202a5e56 100644
+--- a/drivers/infiniband/hw/hfi1/driver.c
++++ b/drivers/infiniband/hw/hfi1/driver.c
+@@ -196,7 +196,7 @@ int hfi1_count_active_units(void)
+ 
+ 	spin_lock_irqsave(&hfi1_devs_lock, flags);
+ 	list_for_each_entry(dd, &hfi1_dev_list, list) {
+-		if (!(dd->flags & HFI1_PRESENT) || !dd->kregbase)
++		if (!(dd->flags & HFI1_PRESENT) || !dd->kregbase1)
+ 			continue;
+ 		for (pidx = 0; pidx < dd->num_pports; ++pidx) {
+ 			ppd = dd->pport + pidx;
+@@ -1313,7 +1313,7 @@ int hfi1_reset_device(int unit)
+ 
+ 	dd_dev_info(dd, "Reset on unit %u requested\n", unit);
+ 
+-	if (!dd->kregbase || !(dd->flags & HFI1_PRESENT)) {
++	if (!dd->kregbase1 || !(dd->flags & HFI1_PRESENT)) {
+ 		dd_dev_info(dd,
+ 			    "Invalid unit number %u or not initialized or not present\n",
+ 			    unit);
+* Unmerged path drivers/infiniband/hw/hfi1/exp_rcv.h
+* Unmerged path drivers/infiniband/hw/hfi1/file_ops.c
+diff --git a/drivers/infiniband/hw/hfi1/hfi.h b/drivers/infiniband/hw/hfi1/hfi.h
+index 9e4a63b05006..13ec531b3320 100644
+--- a/drivers/infiniband/hw/hfi1/hfi.h
++++ b/drivers/infiniband/hw/hfi1/hfi.h
+@@ -867,12 +867,15 @@ struct hfi1_devdata {
+ 	struct device *diag_device;
+ 	struct device *ui_device;
+ 
+-	/* mem-mapped pointer to base of chip regs */
+-	u8 __iomem *kregbase;
+-	/* end of mem-mapped chip space excluding sendbuf and user regs */
+-	u8 __iomem *kregend;
+-	/* physical address of chip for io_remap, etc. */
++	/* first mapping up to RcvArray */
++	u8 __iomem *kregbase1;
+ 	resource_size_t physaddr;
++
++	/* second uncached mapping from RcvArray to pio send buffers */
++	u8 __iomem *kregbase2;
++	/* for detecting offset above kregbase2 address */
++	u32 base2_start;
++
+ 	/* Per VL data. Enough for all VLs but not all elements are set/used. */
+ 	struct per_vl_data vld[PER_VL_SEND_CONTEXTS];
+ 	/* send context data */
+@@ -1236,9 +1239,10 @@ static inline bool hfi1_vnic_is_rsm_full(struct hfi1_devdata *dd, int spare)
+ #define dc8051_ver_patch(a) ((a) & 0x0000ff)
+ 
+ /* f_put_tid types */
+-#define PT_EXPECTED 0
+-#define PT_EAGER    1
+-#define PT_INVALID  2
++#define PT_EXPECTED       0
++#define PT_EAGER          1
++#define PT_INVALID_FLUSH  2
++#define PT_INVALID        3
+ 
+ struct tid_rb_node;
+ struct mmu_rb_node;
+* Unmerged path drivers/infiniband/hw/hfi1/pcie.c
+diff --git a/drivers/infiniband/hw/hfi1/user_exp_rcv.c b/drivers/infiniband/hw/hfi1/user_exp_rcv.c
+index c7f13df471c4..28bad3712052 100644
+--- a/drivers/infiniband/hw/hfi1/user_exp_rcv.c
++++ b/drivers/infiniband/hw/hfi1/user_exp_rcv.c
+@@ -925,12 +925,11 @@ static void clear_tid_node(struct hfi1_filedata *fd, struct tid_rb_node *node)
+ 				 node->npages, node->mmu.addr, node->phys,
+ 				 node->dma_addr);
+ 
+-	hfi1_put_tid(dd, node->rcventry, PT_INVALID, 0, 0);
+ 	/*
+ 	 * Make sure device has seen the write before we unpin the
+ 	 * pages.
+ 	 */
+-	flush_wc();
++	hfi1_put_tid(dd, node->rcventry, PT_INVALID_FLUSH, 0, 0);
+ 
+ 	pci_unmap_single(dd->pcidev, node->dma_addr, node->mmu.len,
+ 			 PCI_DMA_FROMDEVICE);
