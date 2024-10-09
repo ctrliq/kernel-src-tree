@@ -49,7 +49,6 @@ const uuid_le mei_amthif_guid  = UUID_LE(0x12f80028, 0xb4b7, 0x4b2d,
 void mei_amthif_reset_params(struct mei_device *dev)
 {
 	/* reset iamthif parameters. */
-	dev->iamthif_current_cb = NULL;
 	dev->iamthif_canceled = false;
 	dev->iamthif_state = MEI_IAMTHIF_IDLE;
 	dev->iamthif_stall_timer = 0;
@@ -214,7 +213,6 @@ static int mei_amthif_read_start(struct mei_cl *cl, const struct file *file)
 
 	dev->iamthif_state = MEI_IAMTHIF_READING;
 	dev->iamthif_fp = cb->fp;
-	dev->iamthif_current_cb = cb;
 
 	return 0;
 err:
@@ -241,7 +239,6 @@ static int mei_amthif_send_cmd(struct mei_cl *cl, struct mei_cl_cb *cb)
 	dev = cl->dev;
 
 	dev->iamthif_state = MEI_IAMTHIF_WRITING;
-	dev->iamthif_current_cb = cb;
 	dev->iamthif_fp = cb->fp;
 	dev->iamthif_canceled = false;
 
@@ -408,7 +405,6 @@ void mei_amthif_complete(struct mei_cl *cl, struct mei_cl_cb *cb)
 			mei_io_cb_free(cb);
 			return;
 		}
-		dev->iamthif_current_cb = NULL;
 		dev->iamthif_state = MEI_IAMTHIF_IDLE;
 		dev->iamthif_fp = NULL;
 		if (!dev->iamthif_canceled) {
@@ -431,7 +427,6 @@ void mei_amthif_complete(struct mei_cl *cl, struct mei_cl_cb *cb)
 			mei_io_cb_free(cb);
 		}
 
-		dev->iamthif_current_cb = NULL;
 		dev->iamthif_stall_timer = 0;
 		mei_amthif_run_next_cmd(dev);
 		break;
