@@ -1,0 +1,720 @@
+net: Add and use skb_copy_datagram_msg() helper.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] Add and use skb_copy_datagram_msg() helper (Ivan Vecera) [1382040]
+Rebuild_FUZZ: 93.33%
+commit-author David S. Miller <davem@davemloft.net>
+commit 51f3d02b980a338cd291d2bc7629cdfb2568424b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/51f3d02b.failed
+
+This encapsulates all of the skb_copy_datagram_iovec() callers
+with call argument signature "skb, offset, msghdr->msg_iov, length".
+
+When we move to iov_iters in the networking, the iov_iter object will
+sit in the msghdr.
+
+Having a helper like this means there will be less places to touch
+during that transformation.
+
+Based upon descriptions and patch from Al Viro.
+
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 51f3d02b980a338cd291d2bc7629cdfb2568424b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/skbuff.h
+#	net/core/sock.c
+#	net/ieee802154/dgram.c
+#	net/ieee802154/raw.c
+#	net/ipv4/udp.c
+#	net/ipv6/udp.c
+#	net/rxrpc/ar-recvmsg.c
+#	net/unix/af_unix.c
+diff --cc include/linux/skbuff.h
+index 449d0a455cd2,39ec7530ae27..000000000000
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@@ -20,6 -20,8 +20,11 @@@
+  #include <linux/time.h>
+  #include <linux/bug.h>
+  #include <linux/cache.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/rbtree.h>
++ #include <linux/socket.h>
+++>>>>>>> 51f3d02b980a (net: Add and use skb_copy_datagram_msg() helper.)
+  
+  #include <linux/atomic.h>
+  #include <asm/types.h>
+@@@ -2812,8 -2640,13 +2817,13 @@@ unsigned int datagram_poll(struct file 
+  			   struct poll_table_struct *wait);
+  int skb_copy_datagram_iovec(const struct sk_buff *from, int offset,
+  			    struct iovec *to, int size);
++ static inline int skb_copy_datagram_msg(const struct sk_buff *from, int offset,
++ 					struct msghdr *msg, int size)
++ {
++ 	return skb_copy_datagram_iovec(from, offset, msg->msg_iov, size);
++ }
+  int skb_copy_and_csum_datagram_iovec(struct sk_buff *skb, int hlen,
+ -				     struct iovec *iov);
+ +				     struct iovec *iov, int len);
+  int skb_copy_datagram_from_iovec(struct sk_buff *skb, int offset,
+  				 const struct iovec *from, int from_offset,
+  				 int len);
+diff --cc net/core/sock.c
+index 960b698f3aa7,ac56dd06c306..000000000000
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@@ -2498,6 -2440,42 +2498,45 @@@ void sock_enable_timestamp(struct sock 
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int sock_recv_errqueue(struct sock *sk, struct msghdr *msg, int len,
++ 		       int level, int type)
++ {
++ 	struct sock_exterr_skb *serr;
++ 	struct sk_buff *skb;
++ 	int copied, err;
++ 
++ 	err = -EAGAIN;
++ 	skb = sock_dequeue_err_skb(sk);
++ 	if (skb == NULL)
++ 		goto out;
++ 
++ 	copied = skb->len;
++ 	if (copied > len) {
++ 		msg->msg_flags |= MSG_TRUNC;
++ 		copied = len;
++ 	}
++ 	err = skb_copy_datagram_msg(skb, 0, msg, copied);
++ 	if (err)
++ 		goto out_free_skb;
++ 
++ 	sock_recv_timestamp(msg, sk, skb);
++ 
++ 	serr = SKB_EXT_ERR(skb);
++ 	put_cmsg(msg, level, type, sizeof(serr->ee), &serr->ee);
++ 
++ 	msg->msg_flags |= MSG_ERRQUEUE;
++ 	err = copied;
++ 
++ out_free_skb:
++ 	kfree_skb(skb);
++ out:
++ 	return err;
++ }
++ EXPORT_SYMBOL(sock_recv_errqueue);
++ 
+++>>>>>>> 51f3d02b980a (net: Add and use skb_copy_datagram_msg() helper.)
+  /*
+   *	Get a socket option on an socket.
+   *
+diff --cc net/ipv4/udp.c
+index a02b20ab0f64,df19027f44f3..000000000000
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@@ -1276,9 -1280,9 +1276,15 @@@ try_again
+  			goto csum_copy_err;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (checksum_valid || skb_csum_unnecessary(skb))
+ +		err = skb_copy_datagram_iovec(skb, sizeof(struct udphdr),
+ +					      msg->msg_iov, copied);
+++=======
++ 	if (skb_csum_unnecessary(skb))
++ 		err = skb_copy_datagram_msg(skb, sizeof(struct udphdr),
++ 					    msg, copied);
+++>>>>>>> 51f3d02b980a (net: Add and use skb_copy_datagram_msg() helper.)
+  	else {
+  		err = skb_copy_and_csum_datagram_iovec(skb,
+  						       sizeof(struct udphdr),
+diff --cc net/ipv6/udp.c
+index addc33af6bd2,9b6809232b17..000000000000
+--- a/net/ipv6/udp.c
++++ b/net/ipv6/udp.c
+@@@ -438,12 -423,11 +438,18 @@@ try_again
+  			goto csum_copy_err;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (checksum_valid || skb_csum_unnecessary(skb))
+ +		err = skb_copy_datagram_iovec(skb, sizeof(struct udphdr),
+ +					      msg->msg_iov, copied);
+++=======
++ 	if (skb_csum_unnecessary(skb))
++ 		err = skb_copy_datagram_msg(skb, sizeof(struct udphdr),
++ 					    msg, copied);
+++>>>>>>> 51f3d02b980a (net: Add and use skb_copy_datagram_msg() helper.)
+  	else {
+ -		err = skb_copy_and_csum_datagram_iovec(skb, sizeof(struct udphdr), msg->msg_iov);
+ +		err = skb_copy_and_csum_datagram_iovec(skb, sizeof(struct udphdr),
+ +						       msg->msg_iov, copied);
+  		if (err == -EINVAL)
+  			goto csum_copy_err;
+  	}
+diff --cc net/rxrpc/ar-recvmsg.c
+index 3bf088ebc650,4575485ad1b4..000000000000
+--- a/net/rxrpc/ar-recvmsg.c
++++ b/net/rxrpc/ar-recvmsg.c
+@@@ -180,15 -180,7 +180,19 @@@ int rxrpc_recvmsg(struct kiocb *iocb, s
+  		if (copy > len - copied)
+  			copy = len - copied;
+  
+++<<<<<<< HEAD
+ +		if (skb->ip_summed == CHECKSUM_UNNECESSARY) {
+ +			ret = skb_copy_datagram_iovec(skb, offset,
+ +						      msg->msg_iov, copy);
+ +		} else {
+ +			ret = skb_copy_and_csum_datagram_iovec(skb, offset,
+ +							       msg->msg_iov, copy);
+ +			if (ret == -EINVAL)
+ +				goto csum_copy_error;
+ +		}
+++=======
++ 		ret = skb_copy_datagram_msg(skb, offset, msg, copy);
+++>>>>>>> 51f3d02b980a (net: Add and use skb_copy_datagram_msg() helper.)
+  
+  		if (ret < 0)
+  			goto copy_error;
+diff --cc net/unix/af_unix.c
+index 4b15ed85564a,5eee625d113f..000000000000
+--- a/net/unix/af_unix.c
++++ b/net/unix/af_unix.c
+@@@ -2385,12 -2030,8 +2385,17 @@@ unlock
+  		}
+  
+  		chunk = min_t(unsigned int, unix_skb_len(skb) - skip, size);
+++<<<<<<< HEAD
+ +		skb_get(skb);
+ +		chunk = state->recv_actor(skb, skip, chunk, state);
+ +		drop_skb = !unix_skb_len(skb);
+ +		/* skb is only safe to use if !drop_skb */
+ +		consume_skb(skb);
+ +		if (chunk < 0) {
+++=======
++ 		if (skb_copy_datagram_msg(skb, UNIXCB(skb).consumed + skip,
++ 					  msg, chunk)) {
+++>>>>>>> 51f3d02b980a (net: Add and use skb_copy_datagram_msg() helper.)
+  			if (copied == 0)
+  				copied = -EFAULT;
+  			break;
+* Unmerged path net/ieee802154/dgram.c
+* Unmerged path net/ieee802154/raw.c
+diff --git a/drivers/isdn/mISDN/socket.c b/drivers/isdn/mISDN/socket.c
+index 5cefb479c707..2954aa825a3d 100644
+--- a/drivers/isdn/mISDN/socket.c
++++ b/drivers/isdn/mISDN/socket.c
+@@ -163,7 +163,7 @@ mISDN_sock_recvmsg(struct kiocb *iocb, struct socket *sock,
+ 	memcpy(skb_push(skb, MISDN_HEADER_LEN), mISDN_HEAD_P(skb),
+ 	       MISDN_HEADER_LEN);
+ 
+-	err = skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copied);
++	err = skb_copy_datagram_msg(skb, 0, msg, copied);
+ 
+ 	mISDN_sock_cmsg(sk, msg, skb);
+ 
+diff --git a/drivers/net/ppp/pppoe.c b/drivers/net/ppp/pppoe.c
+index ad6fbcd7be5d..2c1226e68222 100644
+--- a/drivers/net/ppp/pppoe.c
++++ b/drivers/net/ppp/pppoe.c
+@@ -1000,7 +1000,7 @@ static int pppoe_recvmsg(struct kiocb *iocb, struct socket *sock,
+ 
+ 	if (skb) {
+ 		total_len = min_t(size_t, total_len, skb->len);
+-		error = skb_copy_datagram_iovec(skb, 0, m->msg_iov, total_len);
++		error = skb_copy_datagram_msg(skb, 0, m, total_len);
+ 		if (error == 0) {
+ 			consume_skb(skb);
+ 			return total_len;
+* Unmerged path include/linux/skbuff.h
+diff --git a/net/appletalk/ddp.c b/net/appletalk/ddp.c
+index 3e362d7127b4..fc4e8702edf9 100644
+--- a/net/appletalk/ddp.c
++++ b/net/appletalk/ddp.c
+@@ -1761,7 +1761,7 @@ static int atalk_recvmsg(struct kiocb *iocb, struct socket *sock, struct msghdr
+ 		copied = size;
+ 		msg->msg_flags |= MSG_TRUNC;
+ 	}
+-	err = skb_copy_datagram_iovec(skb, offset, msg->msg_iov, copied);
++	err = skb_copy_datagram_msg(skb, offset, msg, copied);
+ 
+ 	if (!err && msg->msg_name) {
+ 		struct sockaddr_at *sat = msg->msg_name;
+diff --git a/net/atm/common.c b/net/atm/common.c
+index 7b491006eaf4..ecaface2878d 100644
+--- a/net/atm/common.c
++++ b/net/atm/common.c
+@@ -554,7 +554,7 @@ int vcc_recvmsg(struct kiocb *iocb, struct socket *sock, struct msghdr *msg,
+ 		msg->msg_flags |= MSG_TRUNC;
+ 	}
+ 
+-	error = skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copied);
++	error = skb_copy_datagram_msg(skb, 0, msg, copied);
+ 	if (error)
+ 		return error;
+ 	sock_recv_ts_and_drops(msg, sk, skb);
+diff --git a/net/ax25/af_ax25.c b/net/ax25/af_ax25.c
+index ade1cd58c484..992a0beb1d72 100644
+--- a/net/ax25/af_ax25.c
++++ b/net/ax25/af_ax25.c
+@@ -1637,7 +1637,7 @@ static int ax25_recvmsg(struct kiocb *iocb, struct socket *sock,
+ 		msg->msg_flags |= MSG_TRUNC;
+ 	}
+ 
+-	skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copied);
++	skb_copy_datagram_msg(skb, 0, msg, copied);
+ 
+ 	if (msg->msg_name) {
+ 		ax25_digi digi;
+diff --git a/net/bluetooth/af_bluetooth.c b/net/bluetooth/af_bluetooth.c
+index d5d94227090f..c931a7b6c181 100644
+--- a/net/bluetooth/af_bluetooth.c
++++ b/net/bluetooth/af_bluetooth.c
+@@ -237,7 +237,7 @@ int bt_sock_recvmsg(struct kiocb *iocb, struct socket *sock,
+ 	}
+ 
+ 	skb_reset_transport_header(skb);
+-	err = skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copied);
++	err = skb_copy_datagram_msg(skb, 0, msg, copied);
+ 	if (err == 0) {
+ 		sock_recv_ts_and_drops(msg, sk, skb);
+ 
+@@ -328,7 +328,7 @@ int bt_sock_stream_recvmsg(struct kiocb *iocb, struct socket *sock,
+ 		}
+ 
+ 		chunk = min_t(unsigned int, skb->len, size);
+-		if (skb_copy_datagram_iovec(skb, 0, msg->msg_iov, chunk)) {
++		if (skb_copy_datagram_msg(skb, 0, msg, chunk)) {
+ 			skb_queue_head(&sk->sk_receive_queue, skb);
+ 			if (!copied)
+ 				copied = -EFAULT;
+diff --git a/net/bluetooth/hci_sock.c b/net/bluetooth/hci_sock.c
+index 6d1d0e526ce6..c188b6b878e5 100644
+--- a/net/bluetooth/hci_sock.c
++++ b/net/bluetooth/hci_sock.c
+@@ -1071,7 +1071,7 @@ static int hci_sock_recvmsg(struct kiocb *iocb, struct socket *sock,
+ 	}
+ 
+ 	skb_reset_transport_header(skb);
+-	err = skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copied);
++	err = skb_copy_datagram_msg(skb, 0, msg, copied);
+ 
+ 	switch (hci_pi(sk)->channel) {
+ 	case HCI_CHANNEL_RAW:
+diff --git a/net/caif/caif_socket.c b/net/caif/caif_socket.c
+index 0b614acbf1de..cc5398aadf92 100644
+--- a/net/caif/caif_socket.c
++++ b/net/caif/caif_socket.c
+@@ -295,7 +295,7 @@ static int caif_seqpkt_recvmsg(struct kiocb *iocb, struct socket *sock,
+ 		copylen = len;
+ 	}
+ 
+-	ret = skb_copy_datagram_iovec(skb, 0, m->msg_iov, copylen);
++	ret = skb_copy_datagram_msg(skb, 0, m, copylen);
+ 	if (ret)
+ 		goto out_free;
+ 
+* Unmerged path net/core/sock.c
+diff --git a/net/dccp/proto.c b/net/dccp/proto.c
+index 63649bc44f22..6ee01290912d 100644
+--- a/net/dccp/proto.c
++++ b/net/dccp/proto.c
+@@ -896,7 +896,7 @@ verify_sock_status:
+ 		else if (len < skb->len)
+ 			msg->msg_flags |= MSG_TRUNC;
+ 
+-		if (skb_copy_datagram_iovec(skb, 0, msg->msg_iov, len)) {
++		if (skb_copy_datagram_msg(skb, 0, msg, len)) {
+ 			/* Exception. Bailout! */
+ 			len = -EFAULT;
+ 			break;
+* Unmerged path net/ieee802154/dgram.c
+* Unmerged path net/ieee802154/raw.c
+diff --git a/net/ipv4/ip_sockglue.c b/net/ipv4/ip_sockglue.c
+index 29d411fe019d..1ab757874bb8 100644
+--- a/net/ipv4/ip_sockglue.c
++++ b/net/ipv4/ip_sockglue.c
+@@ -408,7 +408,7 @@ int ip_recv_error(struct sock *sk, struct msghdr *msg, int len, int *addr_len)
+ 		msg->msg_flags |= MSG_TRUNC;
+ 		copied = len;
+ 	}
+-	err = skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copied);
++	err = skb_copy_datagram_msg(skb, 0, msg, copied);
+ 	if (err)
+ 		goto out_free_skb;
+ 
+diff --git a/net/ipv4/ping.c b/net/ipv4/ping.c
+index 291ac786a807..281415fb6536 100644
+--- a/net/ipv4/ping.c
++++ b/net/ipv4/ping.c
+@@ -660,7 +660,7 @@ static int ping_recvmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
+ 	}
+ 
+ 	/* Don't bother checking the checksum */
+-	err = skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copied);
++	err = skb_copy_datagram_msg(skb, 0, msg, copied);
+ 	if (err)
+ 		goto done;
+ 
+diff --git a/net/ipv4/raw.c b/net/ipv4/raw.c
+index ae470b0da4ce..42fb8cb2351e 100644
+--- a/net/ipv4/raw.c
++++ b/net/ipv4/raw.c
+@@ -709,7 +709,7 @@ static int raw_recvmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
+ 		copied = len;
+ 	}
+ 
+-	err = skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copied);
++	err = skb_copy_datagram_msg(skb, 0, msg, copied);
+ 	if (err)
+ 		goto done;
+ 
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index d5591c5dc0aa..bd44f3aa63fc 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -1355,7 +1355,7 @@ static int tcp_peek_sndq(struct sock *sk, struct msghdr *msg, int len)
+ 	/* XXX -- need to support SO_PEEK_OFF */
+ 
+ 	skb_queue_walk(&sk->sk_write_queue, skb) {
+-		err = skb_copy_datagram_iovec(skb, 0, msg->msg_iov, skb->len);
++		err = skb_copy_datagram_msg(skb, 0, msg, skb->len);
+ 		if (err)
+ 			break;
+ 
+@@ -1811,8 +1811,7 @@ do_prequeue:
+ 		}
+ 
+ 		if (!(flags & MSG_TRUNC)) {
+-			err = skb_copy_datagram_iovec(skb, offset,
+-						      msg->msg_iov, used);
++			err = skb_copy_datagram_msg(skb, offset, msg, used);
+ 			if (err) {
+ 				/* Exception. Bailout! */
+ 				if (!copied)
+* Unmerged path net/ipv4/udp.c
+diff --git a/net/ipv6/datagram.c b/net/ipv6/datagram.c
+index 053beb286c7e..e2dcfe3ab7eb 100644
+--- a/net/ipv6/datagram.c
++++ b/net/ipv6/datagram.c
+@@ -389,7 +389,7 @@ int ipv6_recv_error(struct sock *sk, struct msghdr *msg, int len, int *addr_len)
+ 		msg->msg_flags |= MSG_TRUNC;
+ 		copied = len;
+ 	}
+-	err = skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copied);
++	err = skb_copy_datagram_msg(skb, 0, msg, copied);
+ 	if (err)
+ 		goto out_free_skb;
+ 
+@@ -493,7 +493,7 @@ int ipv6_recv_rxpmtu(struct sock *sk, struct msghdr *msg, int len,
+ 		msg->msg_flags |= MSG_TRUNC;
+ 		copied = len;
+ 	}
+-	err = skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copied);
++	err = skb_copy_datagram_msg(skb, 0, msg, copied);
+ 	if (err)
+ 		goto out_free_skb;
+ 
+diff --git a/net/ipv6/raw.c b/net/ipv6/raw.c
+index 9b59b22b15c3..e0ff284ea297 100644
+--- a/net/ipv6/raw.c
++++ b/net/ipv6/raw.c
+@@ -476,11 +476,11 @@ static int rawv6_recvmsg(struct kiocb *iocb, struct sock *sk,
+ 	}
+ 
+ 	if (skb_csum_unnecessary(skb)) {
+-		err = skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copied);
++		err = skb_copy_datagram_msg(skb, 0, msg, copied);
+ 	} else if (msg->msg_flags&MSG_TRUNC) {
+ 		if (__skb_checksum_complete(skb))
+ 			goto csum_copy_err;
+-		err = skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copied);
++		err = skb_copy_datagram_msg(skb, 0, msg, copied);
+ 	} else {
+ 		err = skb_copy_and_csum_datagram_iovec(skb, 0, msg->msg_iov, copied);
+ 		if (err == -EINVAL)
+* Unmerged path net/ipv6/udp.c
+diff --git a/net/ipx/af_ipx.c b/net/ipx/af_ipx.c
+index 7d6d51073cf8..ba74bc798c8b 100644
+--- a/net/ipx/af_ipx.c
++++ b/net/ipx/af_ipx.c
+@@ -1816,8 +1816,7 @@ static int ipx_recvmsg(struct kiocb *iocb, struct socket *sock,
+ 		msg->msg_flags |= MSG_TRUNC;
+ 	}
+ 
+-	rc = skb_copy_datagram_iovec(skb, sizeof(struct ipxhdr), msg->msg_iov,
+-				     copied);
++	rc = skb_copy_datagram_msg(skb, sizeof(struct ipxhdr), msg, copied);
+ 	if (rc)
+ 		goto out_free;
+ 	if (skb->tstamp.tv64)
+diff --git a/net/irda/af_irda.c b/net/irda/af_irda.c
+index f8133ff5b081..a85c5cf846b1 100644
+--- a/net/irda/af_irda.c
++++ b/net/irda/af_irda.c
+@@ -1402,7 +1402,7 @@ static int irda_recvmsg_dgram(struct kiocb *iocb, struct socket *sock,
+ 		copied = size;
+ 		msg->msg_flags |= MSG_TRUNC;
+ 	}
+-	skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copied);
++	skb_copy_datagram_msg(skb, 0, msg, copied);
+ 
+ 	skb_free_datagram(sk, skb);
+ 
+diff --git a/net/iucv/af_iucv.c b/net/iucv/af_iucv.c
+index f1a141a2db54..2830ba343225 100644
+--- a/net/iucv/af_iucv.c
++++ b/net/iucv/af_iucv.c
+@@ -1344,7 +1344,7 @@ static int iucv_sock_recvmsg(struct kiocb *iocb, struct socket *sock,
+ 		sk->sk_shutdown = sk->sk_shutdown | RCV_SHUTDOWN;
+ 
+ 	cskb = skb;
+-	if (skb_copy_datagram_iovec(cskb, offset, msg->msg_iov, copied)) {
++	if (skb_copy_datagram_msg(cskb, offset, msg, copied)) {
+ 		if (!(flags & MSG_PEEK))
+ 			skb_queue_head(&sk->sk_receive_queue, skb);
+ 		return -EFAULT;
+diff --git a/net/key/af_key.c b/net/key/af_key.c
+index 00bca8409825..26a45febbb2a 100644
+--- a/net/key/af_key.c
++++ b/net/key/af_key.c
+@@ -3664,7 +3664,7 @@ static int pfkey_recvmsg(struct kiocb *kiocb,
+ 	}
+ 
+ 	skb_reset_transport_header(skb);
+-	err = skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copied);
++	err = skb_copy_datagram_msg(skb, 0, msg, copied);
+ 	if (err)
+ 		goto out_free;
+ 
+diff --git a/net/l2tp/l2tp_ip.c b/net/l2tp/l2tp_ip.c
+index 0fc8e647a166..e0d91d9887ca 100644
+--- a/net/l2tp/l2tp_ip.c
++++ b/net/l2tp/l2tp_ip.c
+@@ -528,7 +528,7 @@ static int l2tp_ip_recvmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *m
+ 		copied = len;
+ 	}
+ 
+-	err = skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copied);
++	err = skb_copy_datagram_msg(skb, 0, msg, copied);
+ 	if (err)
+ 		goto done;
+ 
+diff --git a/net/l2tp/l2tp_ip6.c b/net/l2tp/l2tp_ip6.c
+index aae2af6e81df..af2e407bd849 100644
+--- a/net/l2tp/l2tp_ip6.c
++++ b/net/l2tp/l2tp_ip6.c
+@@ -680,7 +680,7 @@ static int l2tp_ip6_recvmsg(struct kiocb *iocb, struct sock *sk,
+ 		copied = len;
+ 	}
+ 
+-	err = skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copied);
++	err = skb_copy_datagram_msg(skb, 0, msg, copied);
+ 	if (err)
+ 		goto done;
+ 
+diff --git a/net/l2tp/l2tp_ppp.c b/net/l2tp/l2tp_ppp.c
+index ce63092ef909..f7982bf5af3e 100644
+--- a/net/l2tp/l2tp_ppp.c
++++ b/net/l2tp/l2tp_ppp.c
+@@ -208,7 +208,7 @@ static int pppol2tp_recvmsg(struct kiocb *iocb, struct socket *sock,
+ 	else if (len < skb->len)
+ 		msg->msg_flags |= MSG_TRUNC;
+ 
+-	err = skb_copy_datagram_iovec(skb, 0, msg->msg_iov, len);
++	err = skb_copy_datagram_msg(skb, 0, msg, len);
+ 	if (likely(err == 0))
+ 		err = len;
+ 
+diff --git a/net/llc/af_llc.c b/net/llc/af_llc.c
+index f883bc51dd62..087b8b6719c3 100644
+--- a/net/llc/af_llc.c
++++ b/net/llc/af_llc.c
+@@ -818,8 +818,7 @@ static int llc_ui_recvmsg(struct kiocb *iocb, struct socket *sock,
+ 			used = len;
+ 
+ 		if (!(flags & MSG_TRUNC)) {
+-			int rc = skb_copy_datagram_iovec(skb, offset,
+-							 msg->msg_iov, used);
++			int rc = skb_copy_datagram_msg(skb, offset, msg, used);
+ 			if (rc) {
+ 				/* Exception. Bailout! */
+ 				if (!copied)
+diff --git a/net/netlink/af_netlink.c b/net/netlink/af_netlink.c
+index 0fd422065eb1..2e8db3d1d72f 100644
+--- a/net/netlink/af_netlink.c
++++ b/net/netlink/af_netlink.c
+@@ -2462,7 +2462,7 @@ static int netlink_recvmsg(struct kiocb *kiocb, struct socket *sock,
+ 	}
+ 
+ 	skb_reset_transport_header(data_skb);
+-	err = skb_copy_datagram_iovec(data_skb, 0, msg->msg_iov, copied);
++	err = skb_copy_datagram_msg(data_skb, 0, msg, copied);
+ 
+ 	if (msg->msg_name) {
+ 		struct sockaddr_nl *addr = (struct sockaddr_nl *)msg->msg_name;
+diff --git a/net/netrom/af_netrom.c b/net/netrom/af_netrom.c
+index 44abd5094f38..6f7b52b06261 100644
+--- a/net/netrom/af_netrom.c
++++ b/net/netrom/af_netrom.c
+@@ -1167,7 +1167,7 @@ static int nr_recvmsg(struct kiocb *iocb, struct socket *sock,
+ 		msg->msg_flags |= MSG_TRUNC;
+ 	}
+ 
+-	er = skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copied);
++	er = skb_copy_datagram_msg(skb, 0, msg, copied);
+ 	if (er < 0) {
+ 		skb_free_datagram(sk, skb);
+ 		release_sock(sk);
+diff --git a/net/nfc/llcp_sock.c b/net/nfc/llcp_sock.c
+index 86470cf54cee..8909421f389a 100644
+--- a/net/nfc/llcp_sock.c
++++ b/net/nfc/llcp_sock.c
+@@ -828,7 +828,7 @@ static int llcp_sock_recvmsg(struct kiocb *iocb, struct socket *sock,
+ 	copied = min_t(unsigned int, rlen, len);
+ 
+ 	cskb = skb;
+-	if (skb_copy_datagram_iovec(cskb, 0, msg->msg_iov, copied)) {
++	if (skb_copy_datagram_msg(cskb, 0, msg, copied)) {
+ 		if (!(flags & MSG_PEEK))
+ 			skb_queue_head(&sk->sk_receive_queue, skb);
+ 		return -EFAULT;
+diff --git a/net/nfc/rawsock.c b/net/nfc/rawsock.c
+index 5d11f4ac3ecb..4207ec98002c 100644
+--- a/net/nfc/rawsock.c
++++ b/net/nfc/rawsock.c
+@@ -247,7 +247,7 @@ static int rawsock_recvmsg(struct kiocb *iocb, struct socket *sock,
+ 		copied = len;
+ 	}
+ 
+-	rc = skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copied);
++	rc = skb_copy_datagram_msg(skb, 0, msg, copied);
+ 
+ 	skb_free_datagram(sk, skb);
+ 
+diff --git a/net/packet/af_packet.c b/net/packet/af_packet.c
+index 4839c0b7b9bc..22b88ca01080 100644
+--- a/net/packet/af_packet.c
++++ b/net/packet/af_packet.c
+@@ -2935,7 +2935,7 @@ static int packet_recvmsg(struct kiocb *iocb, struct socket *sock,
+ 		msg->msg_flags |= MSG_TRUNC;
+ 	}
+ 
+-	err = skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copied);
++	err = skb_copy_datagram_msg(skb, 0, msg, copied);
+ 	if (err)
+ 		goto out_free;
+ 
+diff --git a/net/phonet/datagram.c b/net/phonet/datagram.c
+index 38946b26e471..86144be296e3 100644
+--- a/net/phonet/datagram.c
++++ b/net/phonet/datagram.c
+@@ -151,7 +151,7 @@ static int pn_recvmsg(struct kiocb *iocb, struct sock *sk,
+ 		copylen = len;
+ 	}
+ 
+-	rval = skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copylen);
++	rval = skb_copy_datagram_msg(skb, 0, msg, copylen);
+ 	if (rval) {
+ 		rval = -EFAULT;
+ 		goto out;
+diff --git a/net/phonet/pep.c b/net/phonet/pep.c
+index e77411735de8..98a585f1e867 100644
+--- a/net/phonet/pep.c
++++ b/net/phonet/pep.c
+@@ -1298,7 +1298,7 @@ copy:
+ 	else
+ 		len = skb->len;
+ 
+-	err = skb_copy_datagram_iovec(skb, 0, msg->msg_iov, len);
++	err = skb_copy_datagram_msg(skb, 0, msg, len);
+ 	if (!err)
+ 		err = (flags & MSG_TRUNC) ? skb->len : len;
+ 
+diff --git a/net/rose/af_rose.c b/net/rose/af_rose.c
+index 1ea4320ffc6b..1bcb7b6d0be2 100644
+--- a/net/rose/af_rose.c
++++ b/net/rose/af_rose.c
+@@ -1249,7 +1249,7 @@ static int rose_recvmsg(struct kiocb *iocb, struct socket *sock,
+ 		msg->msg_flags |= MSG_TRUNC;
+ 	}
+ 
+-	skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copied);
++	skb_copy_datagram_msg(skb, 0, msg, copied);
+ 
+ 	if (msg->msg_name) {
+ 		struct sockaddr_rose *srose;
+* Unmerged path net/rxrpc/ar-recvmsg.c
+diff --git a/net/sctp/socket.c b/net/sctp/socket.c
+index cc2832024ec4..8138b07cf48c 100644
+--- a/net/sctp/socket.c
++++ b/net/sctp/socket.c
+@@ -2098,7 +2098,7 @@ static int sctp_recvmsg(struct kiocb *iocb, struct sock *sk,
+ 	if (copied > len)
+ 		copied = len;
+ 
+-	err = skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copied);
++	err = skb_copy_datagram_msg(skb, 0, msg, copied);
+ 
+ 	event = sctp_skb2event(skb);
+ 
+diff --git a/net/tipc/socket.c b/net/tipc/socket.c
+index 2b1d7c2d677d..33f16611b539 100644
+--- a/net/tipc/socket.c
++++ b/net/tipc/socket.c
+@@ -951,8 +951,7 @@ restart:
+ 			sz = buf_len;
+ 			m->msg_flags |= MSG_TRUNC;
+ 		}
+-		res = skb_copy_datagram_iovec(buf, msg_hdr_sz(msg),
+-					      m->msg_iov, sz);
++		res = skb_copy_datagram_msg(buf, msg_hdr_sz(msg), m, sz);
+ 		if (res)
+ 			goto exit;
+ 		res = sz;
+@@ -1063,8 +1062,8 @@ restart:
+ 		needed = (buf_len - sz_copied);
+ 		sz_to_copy = (sz <= needed) ? sz : needed;
+ 
+-		res = skb_copy_datagram_iovec(buf, msg_hdr_sz(msg) + offset,
+-					      m->msg_iov, sz_to_copy);
++		res = skb_copy_datagram_msg(buf, msg_hdr_sz(msg) + offset,
++					    m, sz_to_copy);
+ 		if (res)
+ 			goto exit;
+ 
+* Unmerged path net/unix/af_unix.c
+diff --git a/net/vmw_vsock/vmci_transport.c b/net/vmw_vsock/vmci_transport.c
+index d043fa147c83..61c9d7dc2cf8 100644
+--- a/net/vmw_vsock/vmci_transport.c
++++ b/net/vmw_vsock/vmci_transport.c
+@@ -1762,8 +1762,7 @@ static int vmci_transport_dgram_dequeue(struct kiocb *kiocb,
+ 	}
+ 
+ 	/* Place the datagram payload in the user's iovec. */
+-	err = skb_copy_datagram_iovec(skb, sizeof(*dg), msg->msg_iov,
+-		payload_len);
++	err = skb_copy_datagram_msg(skb, sizeof(*dg), msg, payload_len);
+ 	if (err)
+ 		goto out;
+ 
+diff --git a/net/x25/af_x25.c b/net/x25/af_x25.c
+index 01b99ffc4da1..957445ccc9c8 100644
+--- a/net/x25/af_x25.c
++++ b/net/x25/af_x25.c
+@@ -1333,7 +1333,7 @@ static int x25_recvmsg(struct kiocb *iocb, struct socket *sock,
+ 	/* Currently, each datagram always contains a complete record */
+ 	msg->msg_flags |= MSG_EOR;
+ 
+-	rc = skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copied);
++	rc = skb_copy_datagram_msg(skb, 0, msg, copied);
+ 	if (rc)
+ 		goto out_free_dgram;
+ 
