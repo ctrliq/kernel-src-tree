@@ -1,0 +1,394 @@
+nfp: convert all RTsym users to use new read/write helpers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 1240989ccca95863ceebfbdff0f84993d84458f9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/1240989c.failed
+
+Convert all users of RTsym to the new set of helpers which
+handle all targets correctly.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Francois H. Theron <francois.theron@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1240989ccca95863ceebfbdff0f84993d84458f9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/abm/ctrl.c
+diff --cc drivers/net/ethernet/netronome/nfp/abm/ctrl.c
+index e40f6f06417b,53fb40aa83db..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/abm/ctrl.c
++++ b/drivers/net/ethernet/netronome/nfp/abm/ctrl.c
+@@@ -40,6 -42,228 +40,231 @@@
+  #include "../nfp_net.h"
+  #include "main.h"
+  
+++<<<<<<< HEAD
+++=======
++ #define NFP_QLVL_SYM_NAME	"_abi_nfd_out_q_lvls_%u"
++ #define NFP_QLVL_STRIDE		16
++ #define NFP_QLVL_BLOG_BYTES	0
++ #define NFP_QLVL_BLOG_PKTS	4
++ #define NFP_QLVL_THRS		8
++ 
++ #define NFP_QMSTAT_SYM_NAME	"_abi_nfdqm%u_stats"
++ #define NFP_QMSTAT_STRIDE	32
++ #define NFP_QMSTAT_NON_STO	0
++ #define NFP_QMSTAT_STO		8
++ #define NFP_QMSTAT_DROP		16
++ #define NFP_QMSTAT_ECN		24
++ 
++ static int
++ nfp_abm_ctrl_stat(struct nfp_abm_link *alink, const struct nfp_rtsym *sym,
++ 		  unsigned int stride, unsigned int offset, unsigned int i,
++ 		  bool is_u64, u64 *res)
++ {
++ 	struct nfp_cpp *cpp = alink->abm->app->cpp;
++ 	u64 val, sym_offset;
++ 	u32 val32;
++ 	int err;
++ 
++ 	sym_offset = (alink->queue_base + i) * stride + offset;
++ 	if (is_u64)
++ 		err = __nfp_rtsym_readq(cpp, sym, 3, 0, sym_offset, &val);
++ 	else
++ 		err = __nfp_rtsym_readl(cpp, sym, 3, 0, sym_offset, &val32);
++ 	if (err) {
++ 		nfp_err(cpp,
++ 			"RED offload reading stat failed on vNIC %d queue %d\n",
++ 			alink->id, i);
++ 		return err;
++ 	}
++ 
++ 	*res = is_u64 ? val : val32;
++ 	return 0;
++ }
++ 
++ static int
++ nfp_abm_ctrl_stat_all(struct nfp_abm_link *alink, const struct nfp_rtsym *sym,
++ 		      unsigned int stride, unsigned int offset, bool is_u64,
++ 		      u64 *res)
++ {
++ 	u64 val, sum = 0;
++ 	unsigned int i;
++ 	int err;
++ 
++ 	for (i = 0; i < alink->vnic->max_rx_rings; i++) {
++ 		err = nfp_abm_ctrl_stat(alink, sym, stride, offset, i,
++ 					is_u64, &val);
++ 		if (err)
++ 			return err;
++ 		sum += val;
++ 	}
++ 
++ 	*res = sum;
++ 	return 0;
++ }
++ 
++ int nfp_abm_ctrl_set_q_lvl(struct nfp_abm_link *alink, unsigned int i, u32 val)
++ {
++ 	struct nfp_cpp *cpp = alink->abm->app->cpp;
++ 	u64 sym_offset;
++ 	int err;
++ 
++ 	sym_offset = (alink->queue_base + i) * NFP_QLVL_STRIDE + NFP_QLVL_THRS;
++ 	err = __nfp_rtsym_writel(cpp, alink->abm->q_lvls, 4, 0,
++ 				 sym_offset, val);
++ 	if (err) {
++ 		nfp_err(cpp, "RED offload setting level failed on vNIC %d queue %d\n",
++ 			alink->id, i);
++ 		return err;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ int nfp_abm_ctrl_set_all_q_lvls(struct nfp_abm_link *alink, u32 val)
++ {
++ 	int i, err;
++ 
++ 	for (i = 0; i < alink->vnic->max_rx_rings; i++) {
++ 		err = nfp_abm_ctrl_set_q_lvl(alink, i, val);
++ 		if (err)
++ 			return err;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ u64 nfp_abm_ctrl_stat_non_sto(struct nfp_abm_link *alink, unsigned int i)
++ {
++ 	u64 val;
++ 
++ 	if (nfp_abm_ctrl_stat(alink, alink->abm->qm_stats, NFP_QMSTAT_STRIDE,
++ 			      NFP_QMSTAT_NON_STO, i, true, &val))
++ 		return 0;
++ 	return val;
++ }
++ 
++ u64 nfp_abm_ctrl_stat_sto(struct nfp_abm_link *alink, unsigned int i)
++ {
++ 	u64 val;
++ 
++ 	if (nfp_abm_ctrl_stat(alink, alink->abm->qm_stats, NFP_QMSTAT_STRIDE,
++ 			      NFP_QMSTAT_STO, i, true, &val))
++ 		return 0;
++ 	return val;
++ }
++ 
++ int nfp_abm_ctrl_read_q_stats(struct nfp_abm_link *alink, unsigned int i,
++ 			      struct nfp_alink_stats *stats)
++ {
++ 	int err;
++ 
++ 	stats->tx_pkts = nn_readq(alink->vnic, NFP_NET_CFG_RXR_STATS(i));
++ 	stats->tx_bytes = nn_readq(alink->vnic, NFP_NET_CFG_RXR_STATS(i) + 8);
++ 
++ 	err = nfp_abm_ctrl_stat(alink, alink->abm->q_lvls,
++ 				NFP_QLVL_STRIDE, NFP_QLVL_BLOG_BYTES,
++ 				i, false, &stats->backlog_bytes);
++ 	if (err)
++ 		return err;
++ 
++ 	err = nfp_abm_ctrl_stat(alink, alink->abm->q_lvls,
++ 				NFP_QLVL_STRIDE, NFP_QLVL_BLOG_PKTS,
++ 				i, false, &stats->backlog_pkts);
++ 	if (err)
++ 		return err;
++ 
++ 	err = nfp_abm_ctrl_stat(alink, alink->abm->qm_stats,
++ 				NFP_QMSTAT_STRIDE, NFP_QMSTAT_DROP,
++ 				i, true, &stats->drops);
++ 	if (err)
++ 		return err;
++ 
++ 	return nfp_abm_ctrl_stat(alink, alink->abm->qm_stats,
++ 				 NFP_QMSTAT_STRIDE, NFP_QMSTAT_ECN,
++ 				 i, true, &stats->overlimits);
++ }
++ 
++ int nfp_abm_ctrl_read_stats(struct nfp_abm_link *alink,
++ 			    struct nfp_alink_stats *stats)
++ {
++ 	u64 pkts = 0, bytes = 0;
++ 	int i, err;
++ 
++ 	for (i = 0; i < alink->vnic->max_rx_rings; i++) {
++ 		pkts += nn_readq(alink->vnic, NFP_NET_CFG_RXR_STATS(i));
++ 		bytes += nn_readq(alink->vnic, NFP_NET_CFG_RXR_STATS(i) + 8);
++ 	}
++ 	stats->tx_pkts = pkts;
++ 	stats->tx_bytes = bytes;
++ 
++ 	err = nfp_abm_ctrl_stat_all(alink, alink->abm->q_lvls,
++ 				    NFP_QLVL_STRIDE, NFP_QLVL_BLOG_BYTES,
++ 				    false, &stats->backlog_bytes);
++ 	if (err)
++ 		return err;
++ 
++ 	err = nfp_abm_ctrl_stat_all(alink, alink->abm->q_lvls,
++ 				    NFP_QLVL_STRIDE, NFP_QLVL_BLOG_PKTS,
++ 				    false, &stats->backlog_pkts);
++ 	if (err)
++ 		return err;
++ 
++ 	err = nfp_abm_ctrl_stat_all(alink, alink->abm->qm_stats,
++ 				    NFP_QMSTAT_STRIDE, NFP_QMSTAT_DROP,
++ 				    true, &stats->drops);
++ 	if (err)
++ 		return err;
++ 
++ 	return nfp_abm_ctrl_stat_all(alink, alink->abm->qm_stats,
++ 				     NFP_QMSTAT_STRIDE, NFP_QMSTAT_ECN,
++ 				     true, &stats->overlimits);
++ }
++ 
++ int nfp_abm_ctrl_read_q_xstats(struct nfp_abm_link *alink, unsigned int i,
++ 			       struct nfp_alink_xstats *xstats)
++ {
++ 	int err;
++ 
++ 	err = nfp_abm_ctrl_stat(alink, alink->abm->qm_stats,
++ 				NFP_QMSTAT_STRIDE, NFP_QMSTAT_DROP,
++ 				i, true, &xstats->pdrop);
++ 	if (err)
++ 		return err;
++ 
++ 	return nfp_abm_ctrl_stat(alink, alink->abm->qm_stats,
++ 				 NFP_QMSTAT_STRIDE, NFP_QMSTAT_ECN,
++ 				 i, true, &xstats->ecn_marked);
++ }
++ 
++ int nfp_abm_ctrl_read_xstats(struct nfp_abm_link *alink,
++ 			     struct nfp_alink_xstats *xstats)
++ {
++ 	int err;
++ 
++ 	err = nfp_abm_ctrl_stat_all(alink, alink->abm->qm_stats,
++ 				    NFP_QMSTAT_STRIDE, NFP_QMSTAT_DROP,
++ 				    true, &xstats->pdrop);
++ 	if (err)
++ 		return err;
++ 
++ 	return nfp_abm_ctrl_stat_all(alink, alink->abm->qm_stats,
++ 				     NFP_QMSTAT_STRIDE, NFP_QMSTAT_ECN,
++ 				     true, &xstats->ecn_marked);
++ }
++ 
++ int nfp_abm_ctrl_qm_enable(struct nfp_abm *abm)
++ {
++ 	return nfp_mbox_cmd(abm->app->pf, NFP_MBOX_PCIE_ABM_ENABLE,
++ 			    NULL, 0, NULL, 0);
++ }
++ 
++ int nfp_abm_ctrl_qm_disable(struct nfp_abm *abm)
++ {
++ 	return nfp_mbox_cmd(abm->app->pf, NFP_MBOX_PCIE_ABM_DISABLE,
++ 			    NULL, 0, NULL, 0);
++ }
++ 
+++>>>>>>> 1240989ccca9 (nfp: convert all RTsym users to use new read/write helpers)
+  void nfp_abm_ctrl_read_params(struct nfp_abm_link *alink)
+  {
+  	alink->queue_base = nn_readl(alink->vnic, NFP_NET_CFG_START_RXQ);
+* Unmerged path drivers/net/ethernet/netronome/nfp/abm/ctrl.c
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_main.c b/drivers/net/ethernet/netronome/nfp/nfp_main.c
+index cbb34f018556..ed695160065a 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_main.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_main.c
+@@ -111,23 +111,18 @@ nfp_pf_map_rtsym(struct nfp_pf *pf, const char *name, const char *sym_fmt,
+ int nfp_mbox_cmd(struct nfp_pf *pf, u32 cmd, void *in_data, u64 in_length,
+ 		 void *out_data, u64 out_length)
+ {
+-	unsigned long long addr;
+ 	unsigned long err_at;
+ 	u64 max_data_sz;
+ 	u32 val = 0;
+-	u32 cpp_id;
+ 	int n, err;
+ 
+ 	if (!pf->mbox)
+ 		return -EOPNOTSUPP;
+ 
+-	cpp_id = NFP_CPP_ISLAND_ID(pf->mbox->target, NFP_CPP_ACTION_RW, 0,
+-				   pf->mbox->domain);
+-	addr = pf->mbox->addr;
+ 	max_data_sz = pf->mbox->size - NFP_MBOX_SYM_MIN_SIZE;
+ 
+ 	/* Check if cmd field is clear */
+-	err = nfp_cpp_readl(pf->cpp, cpp_id, addr + NFP_MBOX_CMD, &val);
++	err = nfp_rtsym_readl(pf->cpp, pf->mbox, NFP_MBOX_CMD, &val);
+ 	if (err || val) {
+ 		nfp_warn(pf->cpp, "failed to issue command (%u): %u, err: %d\n",
+ 			 cmd, val, err);
+@@ -135,30 +130,29 @@ int nfp_mbox_cmd(struct nfp_pf *pf, u32 cmd, void *in_data, u64 in_length,
+ 	}
+ 
+ 	in_length = min(in_length, max_data_sz);
+-	n = nfp_cpp_write(pf->cpp, cpp_id, addr + NFP_MBOX_DATA,
+-			  in_data, in_length);
++	n = nfp_rtsym_write(pf->cpp, pf->mbox, NFP_MBOX_DATA, in_data,
++			    in_length);
+ 	if (n != in_length)
+ 		return -EIO;
+ 	/* Write data_len and wipe reserved */
+-	err = nfp_cpp_writeq(pf->cpp, cpp_id, addr + NFP_MBOX_DATA_LEN,
+-			     in_length);
++	err = nfp_rtsym_writeq(pf->cpp, pf->mbox, NFP_MBOX_DATA_LEN, in_length);
+ 	if (err)
+ 		return err;
+ 
+ 	/* Read back for ordering */
+-	err = nfp_cpp_readl(pf->cpp, cpp_id, addr + NFP_MBOX_DATA_LEN, &val);
++	err = nfp_rtsym_readl(pf->cpp, pf->mbox, NFP_MBOX_DATA_LEN, &val);
+ 	if (err)
+ 		return err;
+ 
+ 	/* Write cmd and wipe return value */
+-	err = nfp_cpp_writeq(pf->cpp, cpp_id, addr + NFP_MBOX_CMD, cmd);
++	err = nfp_rtsym_writeq(pf->cpp, pf->mbox, NFP_MBOX_CMD, cmd);
+ 	if (err)
+ 		return err;
+ 
+ 	err_at = jiffies + 5 * HZ;
+ 	while (true) {
+ 		/* Wait for command to go to 0 (NFP_MBOX_NO_CMD) */
+-		err = nfp_cpp_readl(pf->cpp, cpp_id, addr + NFP_MBOX_CMD, &val);
++		err = nfp_rtsym_readl(pf->cpp, pf->mbox, NFP_MBOX_CMD, &val);
+ 		if (err)
+ 			return err;
+ 		if (!val)
+@@ -171,18 +165,18 @@ int nfp_mbox_cmd(struct nfp_pf *pf, u32 cmd, void *in_data, u64 in_length,
+ 	}
+ 
+ 	/* Copy output if any (could be error info, do it before reading ret) */
+-	err = nfp_cpp_readl(pf->cpp, cpp_id, addr + NFP_MBOX_DATA_LEN, &val);
++	err = nfp_rtsym_readl(pf->cpp, pf->mbox, NFP_MBOX_DATA_LEN, &val);
+ 	if (err)
+ 		return err;
+ 
+ 	out_length = min_t(u32, val, min(out_length, max_data_sz));
+-	n = nfp_cpp_read(pf->cpp, cpp_id, addr + NFP_MBOX_DATA,
+-			 out_data, out_length);
++	n = nfp_rtsym_read(pf->cpp, pf->mbox, NFP_MBOX_DATA,
++			   out_data, out_length);
+ 	if (n != out_length)
+ 		return -EIO;
+ 
+ 	/* Check if there is an error */
+-	err = nfp_cpp_readl(pf->cpp, cpp_id, addr + NFP_MBOX_RET, &val);
++	err = nfp_rtsym_readl(pf->cpp, pf->mbox, NFP_MBOX_RET, &val);
+ 	if (err)
+ 		return err;
+ 	if (val)
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net_debugdump.c b/drivers/net/ethernet/netronome/nfp/nfp_net_debugdump.c
+index bb8ed460086e..242c9363e9e8 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_debugdump.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_debugdump.c
+@@ -188,7 +188,6 @@ nfp_net_dump_load_dumpspec(struct nfp_cpp *cpp, struct nfp_rtsym_table *rtbl)
+ 	const struct nfp_rtsym *specsym;
+ 	struct nfp_dumpspec *dumpspec;
+ 	int bytes_read;
+-	u32 cpp_id;
+ 
+ 	specsym = nfp_rtsym_lookup(rtbl, NFP_DUMP_SPEC_RTSYM);
+ 	if (!specsym)
+@@ -201,11 +200,8 @@ nfp_net_dump_load_dumpspec(struct nfp_cpp *cpp, struct nfp_rtsym_table *rtbl)
+ 
+ 	dumpspec->size = specsym->size;
+ 
+-	cpp_id = NFP_CPP_ISLAND_ID(specsym->target, NFP_CPP_ACTION_RW, 0,
+-				   specsym->domain);
+-
+-	bytes_read = nfp_cpp_read(cpp, cpp_id, specsym->addr, dumpspec->data,
+-				  specsym->size);
++	bytes_read = nfp_rtsym_read(cpp, specsym, 0, dumpspec->data,
++				    specsym->size);
+ 	if (bytes_read != specsym->size) {
+ 		vfree(dumpspec);
+ 		nfp_warn(cpp, "Debug dump specification read failed.\n");
+@@ -644,7 +640,6 @@ nfp_dump_single_rtsym(struct nfp_pf *pf, struct nfp_dumpspec_rtsym *spec,
+ 	const struct nfp_rtsym *sym;
+ 	u32 tl_len, key_len;
+ 	int bytes_read;
+-	u32 cpp_id;
+ 	void *dest;
+ 	int err;
+ 
+@@ -683,11 +678,9 @@ nfp_dump_single_rtsym(struct nfp_pf *pf, struct nfp_dumpspec_rtsym *spec,
+ 		cpp_params.action = NFP_CPP_ACTION_RW;
+ 		cpp_params.token  = 0;
+ 		cpp_params.island = sym->domain;
+-		cpp_id = nfp_get_numeric_cpp_id(&cpp_params);
+ 		dump_header->cpp.cpp_id = cpp_params;
+ 		dump_header->cpp.offset = cpu_to_be32(sym->addr);
+-		bytes_read = nfp_cpp_read(pf->cpp, cpp_id, sym->addr, dest,
+-					  sym_size);
++		bytes_read = nfp_rtsym_read(pf->cpp, sym, 0, dest, sym_size);
+ 		if (bytes_read != sym_size) {
+ 			if (bytes_read >= 0)
+ 				bytes_read = -EIO;
