@@ -1,0 +1,180 @@
+blk-mq: move hctx lock/unlock into a helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 04ced159cec863f9bc27015d6b970bb13cfa6176
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/04ced159.failed
+
+Move the RCU vs SRCU logic into lock/unlock helpers, which makes
+the actual functional bits within the locked region much easier
+to read.
+
+tj: Reordered in front of timeout revamp patches and added the missing
+    blk_mq_run_hw_queue() conversion.
+
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 04ced159cec863f9bc27015d6b970bb13cfa6176)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index 1eaa154c3ecb,bd7c47eb2923..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -449,27 -557,20 +449,44 @@@ static void blk_mq_ipi_complete_request
+  	put_cpu();
+  }
+  
+++<<<<<<< HEAD
+ +static void blk_mq_stat_add(struct request *rq)
+ +{
+ +	if (rq->cmd_flags & REQ_STATS) {
+ +		blk_mq_poll_stats_start(rq->q);
+ +		blk_stat_add(rq);
+ +	}
+ +}
+ +
+ +static void __blk_mq_complete_request(struct request *rq)
+ +{
+ +	struct request_queue *q = rq->q;
+ +
+ +	if (rq_aux(rq)->internal_tag != -1)
+ +		blk_mq_sched_completed_request(rq);
+ +
+ +	blk_mq_stat_add(rq);
+ +
+ +	if (!q->softirq_done_fn)
+ +		blk_mq_end_request(rq, rq->errors);
+ +	else
+ +		blk_mq_ipi_complete_request(rq);
+++=======
++ static void hctx_unlock(struct blk_mq_hw_ctx *hctx, int srcu_idx)
++ {
++ 	if (!(hctx->flags & BLK_MQ_F_BLOCKING))
++ 		rcu_read_unlock();
++ 	else
++ 		srcu_read_unlock(hctx->queue_rq_srcu, srcu_idx);
++ }
++ 
++ static void hctx_lock(struct blk_mq_hw_ctx *hctx, int *srcu_idx)
++ {
++ 	if (!(hctx->flags & BLK_MQ_F_BLOCKING))
++ 		rcu_read_lock();
++ 	else
++ 		*srcu_idx = srcu_read_lock(hctx->queue_rq_srcu);
+++>>>>>>> 04ced159cec8 (blk-mq: move hctx lock/unlock into a helper)
+  }
+  
+  /**
+@@@ -1154,17 -1220,21 +1171,31 @@@ static void __blk_mq_run_hw_queue(struc
+  	WARN_ON(!cpumask_test_cpu(raw_smp_processor_id(), hctx->cpumask) &&
+  		cpu_online(hctx->next_cpu));
+  
+++<<<<<<< HEAD
+ +	if (!(hctx->flags & BLK_MQ_F_BLOCKING)) {
+ +		rcu_read_lock();
+ +		blk_mq_sched_dispatch_requests(hctx);
+ +		rcu_read_unlock();
+ +	} else {
+ +		might_sleep();
+ +
+ +		srcu_idx = srcu_read_lock(&hctx->queue_rq_srcu);
+ +		blk_mq_sched_dispatch_requests(hctx);
+ +		srcu_read_unlock(&hctx->queue_rq_srcu, srcu_idx);
+ +	}
+++=======
++ 	/*
++ 	 * We can't run the queue inline with ints disabled. Ensure that
++ 	 * we catch bad users of this early.
++ 	 */
++ 	WARN_ON_ONCE(in_interrupt());
++ 
++ 	might_sleep_if(hctx->flags & BLK_MQ_F_BLOCKING);
++ 
++ 	hctx_lock(hctx, &srcu_idx);
++ 	blk_mq_sched_dispatch_requests(hctx);
++ 	hctx_unlock(hctx, srcu_idx);
+++>>>>>>> 04ced159cec8 (blk-mq: move hctx lock/unlock into a helper)
+  }
+  
+  /*
+@@@ -1529,8 -1611,17 +1553,13 @@@ static inline void blk_mq_queue_io(stru
+  	spin_unlock(&ctx->lock);
+  }
+  
+ -static blk_qc_t request_to_qc_t(struct blk_mq_hw_ctx *hctx, struct request *rq)
+ -{
+ -	if (rq->tag != -1)
+ -		return blk_tag_to_qc_t(rq->tag, hctx->queue_num, false);
+ -
+ -	return blk_tag_to_qc_t(rq->internal_tag, hctx->queue_num, true);
+ -}
+ -
+  static void __blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
+++<<<<<<< HEAD
+ +					struct request *rq, bool may_sleep)
+++=======
++ 					struct request *rq,
++ 					blk_qc_t *cookie)
+++>>>>>>> 04ced159cec8 (blk-mq: move hctx lock/unlock into a helper)
+  {
+  	struct request_queue *q = rq->q;
+  	struct blk_mq_queue_data bd = {
+@@@ -1572,33 -1670,27 +1601,44 @@@
+  		return;
+  	}
+  
+ +	__blk_mq_requeue_request(rq);
+  insert:
+- 	blk_mq_sched_insert_request(rq, false, run_queue, false, may_sleep);
++ 	blk_mq_sched_insert_request(rq, false, run_queue, false,
++ 					hctx->flags & BLK_MQ_F_BLOCKING);
+  }
+  
+  static void blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
+ -		struct request *rq, blk_qc_t *cookie)
+ +				      struct request *rq)
+  {
+++<<<<<<< HEAD
+ +	if (!(hctx->flags & BLK_MQ_F_BLOCKING)) {
+ +		rcu_read_lock();
+ +		__blk_mq_try_issue_directly(hctx, rq, false);
+ +		rcu_read_unlock();
+ +	} else {
+ +		unsigned int srcu_idx;
+++=======
++ 	int srcu_idx;
+++>>>>>>> 04ced159cec8 (blk-mq: move hctx lock/unlock into a helper)
+  
+- 		might_sleep();
++ 	might_sleep_if(hctx->flags & BLK_MQ_F_BLOCKING);
+  
+++<<<<<<< HEAD
+ +		srcu_idx = srcu_read_lock(&hctx->queue_rq_srcu);
+ +		__blk_mq_try_issue_directly(hctx, rq, true);
+ +		srcu_read_unlock(&hctx->queue_rq_srcu, srcu_idx);
+ +	}
+++=======
++ 	hctx_lock(hctx, &srcu_idx);
++ 	__blk_mq_try_issue_directly(hctx, rq, cookie);
++ 	hctx_unlock(hctx, srcu_idx);
+++>>>>>>> 04ced159cec8 (blk-mq: move hctx lock/unlock into a helper)
+  }
+  
+ -static blk_qc_t blk_mq_make_request(struct request_queue *q, struct bio *bio)
+ +static void blk_mq_make_request(struct request_queue *q, struct bio *bio)
+  {
+ -	const int is_sync = op_is_sync(bio->bi_opf);
+ -	const int is_flush_fua = op_is_flush(bio->bi_opf);
+ +	const int is_sync = rw_is_sync(bio->bi_rw);
+ +	const int is_flush_fua = bio->bi_rw & (REQ_FLUSH | REQ_FUA);
+  	struct blk_mq_alloc_data data = { .flags = 0 };
+  	struct request *rq;
+  	unsigned int request_count = 0;
+* Unmerged path block/blk-mq.c
