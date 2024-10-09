@@ -1,0 +1,202 @@
+udp: properly cope with csum errors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit 69629464e0b587f3711739b3aa2bcdaf2e075276
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/69629464.failed
+
+Dmitry reported that UDP sockets being destroyed would trigger the
+WARN_ON(atomic_read(&sk->sk_rmem_alloc)); in inet_sock_destruct()
+
+It turns out we do not properly destroy skb(s) that have wrong UDP
+checksum.
+
+Thanks again to syzkaller team.
+
+Fixes : 7c13f97ffde6 ("udp: do fwd memory scheduling on dequeue")
+	Reported-by: Dmitry Vyukov <dvyukov@google.com>
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Cc: Paolo Abeni <pabeni@redhat.com>
+	Cc: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Acked-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 69629464e0b587f3711739b3aa2bcdaf2e075276)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sock.h
+#	net/core/datagram.c
+#	net/ipv4/udp.c
+#	net/ipv6/udp.c
+diff --cc include/net/sock.h
+index 58c7b9c999a7,c4f5e6fca17c..000000000000
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@@ -2114,14 -2000,20 +2114,23 @@@ static inline void skb_set_owner_r(stru
+  	sk_mem_charge(sk, skb->truesize);
+  }
+  
+ -void sk_reset_timer(struct sock *sk, struct timer_list *timer,
+ -		    unsigned long expires);
+ +extern void sk_reset_timer(struct sock *sk, struct timer_list *timer,
+ +			   unsigned long expires);
+  
+ -void sk_stop_timer(struct sock *sk, struct timer_list *timer);
+ +extern void sk_stop_timer(struct sock *sk, struct timer_list *timer);
+  
+++<<<<<<< HEAD
+ +extern int sock_queue_rcv_skb(struct sock *sk, struct sk_buff *skb);
+++=======
++ int __sk_queue_drop_skb(struct sock *sk, struct sk_buff *skb,
++ 			unsigned int flags,
++ 			void (*destructor)(struct sock *sk,
++ 					   struct sk_buff *skb));
++ int __sock_queue_rcv_skb(struct sock *sk, struct sk_buff *skb);
++ int sock_queue_rcv_skb(struct sock *sk, struct sk_buff *skb);
+++>>>>>>> 69629464e0b5 (udp: properly cope with csum errors)
+  
+ -int sock_queue_err_skb(struct sock *sk, struct sk_buff *skb);
+ -struct sk_buff *sock_dequeue_err_skb(struct sock *sk);
+ +extern int sock_queue_err_skb(struct sock *sk, struct sk_buff *skb);
+  
+  /*
+   *	Recover an error report and clear atomically
+diff --cc net/core/datagram.c
+index 4f0a43b26c79,ea633342ab0d..000000000000
+--- a/net/core/datagram.c
++++ b/net/core/datagram.c
+@@@ -316,7 -329,32 +316,36 @@@ void skb_free_datagram_locked(struct so
+  	/* skb is now orphaned, can be freed outside of locked section */
+  	__kfree_skb(skb);
+  }
+++<<<<<<< HEAD
+ +EXPORT_SYMBOL(skb_free_datagram_locked);
+++=======
++ EXPORT_SYMBOL(__skb_free_datagram_locked);
++ 
++ int __sk_queue_drop_skb(struct sock *sk, struct sk_buff *skb,
++ 			unsigned int flags,
++ 			void (*destructor)(struct sock *sk,
++ 					   struct sk_buff *skb))
++ {
++ 	int err = 0;
++ 
++ 	if (flags & MSG_PEEK) {
++ 		err = -ENOENT;
++ 		spin_lock_bh(&sk->sk_receive_queue.lock);
++ 		if (skb == skb_peek(&sk->sk_receive_queue)) {
++ 			__skb_unlink(skb, &sk->sk_receive_queue);
++ 			atomic_dec(&skb->users);
++ 			if (destructor)
++ 				destructor(sk, skb);
++ 			err = 0;
++ 		}
++ 		spin_unlock_bh(&sk->sk_receive_queue.lock);
++ 	}
++ 
++ 	atomic_inc(&sk->sk_drops);
++ 	return err;
++ }
++ EXPORT_SYMBOL(__sk_queue_drop_skb);
+++>>>>>>> 69629464e0b5 (udp: properly cope with csum errors)
+  
+  /**
+   *	skb_kill_datagram - Free a datagram skbuff forcibly
+@@@ -341,23 -379,10 +370,27 @@@
+  
+  int skb_kill_datagram(struct sock *sk, struct sk_buff *skb, unsigned int flags)
+  {
+++<<<<<<< HEAD
+ +	int err = 0;
+ +
+ +	if (flags & MSG_PEEK) {
+ +		err = -ENOENT;
+ +		spin_lock_bh(&sk->sk_receive_queue.lock);
+ +		if (skb == skb_peek(&sk->sk_receive_queue)) {
+ +			__skb_unlink(skb, &sk->sk_receive_queue);
+ +			atomic_dec(&skb->users);
+ +			err = 0;
+ +		}
+ +		spin_unlock_bh(&sk->sk_receive_queue.lock);
+ +	}
+++=======
++ 	int err = __sk_queue_drop_skb(sk, skb, flags, NULL);
+++>>>>>>> 69629464e0b5 (udp: properly cope with csum errors)
+  
+  	kfree_skb(skb);
+ +	atomic_inc(&sk->sk_drops);
+  	sk_mem_reclaim_partial(sk);
+ +
+  	return err;
+  }
+  EXPORT_SYMBOL(skb_kill_datagram);
+diff --cc net/ipv4/udp.c
+index a02b20ab0f64,8aab7d78d25b..000000000000
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@@ -1325,12 -1501,11 +1325,18 @@@ out
+  	return err;
+  
+  csum_copy_err:
+++<<<<<<< HEAD
+ +	slow = lock_sock_fast(sk);
+ +	if (!skb_kill_datagram(sk, skb, flags)) {
+ +		UDP_INC_STATS_USER(sock_net(sk), UDP_MIB_CSUMERRORS, is_udplite);
+ +		UDP_INC_STATS_USER(sock_net(sk), UDP_MIB_INERRORS, is_udplite);
+++=======
++ 	if (!__sk_queue_drop_skb(sk, skb, flags, udp_skb_destructor)) {
++ 		UDP_INC_STATS(sock_net(sk), UDP_MIB_CSUMERRORS, is_udplite);
++ 		UDP_INC_STATS(sock_net(sk), UDP_MIB_INERRORS, is_udplite);
+++>>>>>>> 69629464e0b5 (udp: properly cope with csum errors)
+  	}
+ -	kfree_skb(skb);
+ +	unlock_sock_fast(sk, slow);
+  
+  	/* starting over for a new packet, but check if we need to yield */
+  	cond_resched();
+diff --cc net/ipv6/udp.c
+index addc33af6bd2,8990856f5101..000000000000
+--- a/net/ipv6/udp.c
++++ b/net/ipv6/udp.c
+@@@ -512,21 -441,20 +512,25 @@@ out
+  	return err;
+  
+  csum_copy_err:
+++<<<<<<< HEAD
+ +	slow = lock_sock_fast(sk);
+ +	if (!skb_kill_datagram(sk, skb, flags)) {
+++=======
++ 	if (!__sk_queue_drop_skb(sk, skb, flags, udp_skb_destructor)) {
+++>>>>>>> 69629464e0b5 (udp: properly cope with csum errors)
+  		if (is_udp4) {
+ -			UDP_INC_STATS(sock_net(sk),
+ -				      UDP_MIB_CSUMERRORS, is_udplite);
+ -			UDP_INC_STATS(sock_net(sk),
+ -				      UDP_MIB_INERRORS, is_udplite);
+ +			UDP_INC_STATS_USER(sock_net(sk),
+ +					UDP_MIB_CSUMERRORS, is_udplite);
+ +			UDP_INC_STATS_USER(sock_net(sk),
+ +					UDP_MIB_INERRORS, is_udplite);
+  		} else {
+ -			UDP6_INC_STATS(sock_net(sk),
+ -				       UDP_MIB_CSUMERRORS, is_udplite);
+ -			UDP6_INC_STATS(sock_net(sk),
+ -				       UDP_MIB_INERRORS, is_udplite);
+ +			UDP6_INC_STATS_USER(sock_net(sk),
+ +					UDP_MIB_CSUMERRORS, is_udplite);
+ +			UDP6_INC_STATS_USER(sock_net(sk),
+ +					UDP_MIB_INERRORS, is_udplite);
+  		}
+  	}
+ -	kfree_skb(skb);
+ +	unlock_sock_fast(sk, slow);
+  
+  	/* starting over for a new packet, but check if we need to yield */
+  	cond_resched();
+* Unmerged path include/net/sock.h
+* Unmerged path net/core/datagram.c
+* Unmerged path net/ipv4/udp.c
+* Unmerged path net/ipv6/udp.c
