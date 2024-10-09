@@ -229,8 +229,12 @@ void locks_release_private(struct file_lock *fl)
 			fl->fl_ops->fl_release_private(fl);
 		fl->fl_ops = NULL;
 	}
-	fl->fl_lmops = NULL;
 
+	if (fl->fl_lmops) {
+		if (fl->fl_lmops->lm_put_owner)
+			fl->fl_lmops->lm_put_owner(fl);
+		fl->fl_lmops = NULL;
+	}
 }
 EXPORT_SYMBOL_GPL(locks_release_private);
 
@@ -261,8 +265,12 @@ static void locks_copy_private(struct file_lock *new, struct file_lock *fl)
 			fl->fl_ops->fl_copy_lock(new, fl);
 		new->fl_ops = fl->fl_ops;
 	}
-	if (fl->fl_lmops)
+
+	if (fl->fl_lmops) {
+		if (fl->fl_lmops->lm_get_owner)
+			fl->fl_lmops->lm_get_owner(new, fl);
 		new->fl_lmops = fl->fl_lmops;
+	}
 }
 
 /*
