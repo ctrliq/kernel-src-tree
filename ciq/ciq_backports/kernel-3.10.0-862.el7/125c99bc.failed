@@ -1,0 +1,238 @@
+scsi: add new scsi-command flag for tagged commands
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 125c99bc8b6b108d251169a86324a7ed3c6f3cce
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/125c99bc.failed
+
+Currently scsi piggy backs on the block layer to define the concept
+of a tagged command.  But we want to be able to have block-level host-wide
+tags assigned even for untagged commands like the initial INQUIRY, so add
+a new SCSI-level flag for commands that are tagged at the scsi level, so
+that even commands without that set can have tags assigned to them.  Note
+that this alredy is the case for the blk-mq code path, and this just lets
+the old path catch up with it.
+
+We also set this flag based upon sdev->simple_tags instead of the block
+queue flag, so that it is entirely independent of the block layer tagging,
+and thus always correct even if a driver doesn't use block level tagging
+yet.
+
+Also remove the old blk_rq_tagged; it was only used by SCSI drivers, and
+removing it forces them to look for the proper replacement.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Mike Christie <michaelc@cs.wisc.edu>
+	Reviewed-by: Martin K. Petersen <martin.petersen@oracle.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+(cherry picked from commit 125c99bc8b6b108d251169a86324a7ed3c6f3cce)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/storage/uas.c
+diff --cc drivers/usb/storage/uas.c
+index d371b91ecf04,b38bc1318a60..000000000000
+--- a/drivers/usb/storage/uas.c
++++ b/drivers/usb/storage/uas.c
+@@@ -173,6 -173,22 +173,25 @@@ static void uas_sense(struct urb *urb, 
+  	cmnd->result = sense_iu->status;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * scsi-tags go from 0 - (nr_tags - 1), uas tags need to match stream-ids,
++  * which go from 1 - nr_streams. And we use 1 for untagged commands.
++  */
++ static int uas_get_tag(struct scsi_cmnd *cmnd)
++ {
++ 	int tag;
++ 
++ 	if (cmnd->flags & SCMD_TAGGED)
++ 		tag = cmnd->request->tag + 2;
++ 	else
++ 		tag = 1;
++ 
++ 	return tag;
++ }
++ 
+++>>>>>>> 125c99bc8b6b (scsi: add new scsi-command flag for tagged commands)
+  static void uas_log_cmd_state(struct scsi_cmnd *cmnd, const char *prefix,
+  			      int status)
+  {
+diff --git a/Documentation/block/biodoc.txt b/Documentation/block/biodoc.txt
+index 8df5e8e6dceb..2e8616142936 100644
+--- a/Documentation/block/biodoc.txt
++++ b/Documentation/block/biodoc.txt
+@@ -828,10 +828,6 @@ but in the event of any barrier requests in the tag queue we need to ensure
+ that requests are restarted in the order they were queue. This may happen
+ if the driver needs to use blk_queue_invalidate_tags().
+ 
+-Tagging also defines a new request flag, REQ_QUEUED. This is set whenever
+-a request is currently tagged. You should not use this flag directly,
+-blk_rq_tagged(rq) is the portable way to do so.
+-
+ 3.3 I/O Submission
+ 
+ The routine submit_bio() is used to submit a single io. Higher level i/o
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 844f81639307..cfc40fbd205b 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -1376,7 +1376,7 @@ void blk_requeue_request(struct request_queue *q, struct request *rq)
+ 	blk_clear_rq_complete(rq);
+ 	trace_block_rq_requeue(q, rq);
+ 
+-	if (blk_rq_tagged(rq))
++	if (rq->cmd_flags & REQ_QUEUED)
+ 		blk_queue_end_tag(q, rq);
+ 
+ 	BUG_ON(blk_queued_rq(rq));
+@@ -2714,7 +2714,7 @@ EXPORT_SYMBOL_GPL(blk_unprep_request);
+  */
+ void blk_finish_request(struct request *req, int error)
+ {
+-	if (blk_rq_tagged(req))
++	if (req->cmd_flags & REQ_QUEUED)
+ 		blk_queue_end_tag(req->q, req);
+ 
+ 	BUG_ON(blk_queued_rq(req));
+diff --git a/drivers/scsi/53c700.c b/drivers/scsi/53c700.c
+index 2d268d79765a..44d0830229af 100644
+--- a/drivers/scsi/53c700.c
++++ b/drivers/scsi/53c700.c
+@@ -1766,7 +1766,7 @@ NCR_700_queuecommand_lck(struct scsi_cmnd *SCp, void (*done)(struct scsi_cmnd *)
+ 	 */
+ 	if(NCR_700_get_depth(SCp->device) != 0
+ 	   && (!(hostdata->tag_negotiated & (1<<scmd_id(SCp)))
+-	       || !blk_rq_tagged(SCp->request))) {
++	       || !(SCp->flags & SCMD_TAGGED))) {
+ 		CDEBUG(KERN_ERR, SCp, "has non zero depth %d\n",
+ 		       NCR_700_get_depth(SCp->device));
+ 		return SCSI_MLQUEUE_DEVICE_BUSY;
+@@ -1794,7 +1794,7 @@ NCR_700_queuecommand_lck(struct scsi_cmnd *SCp, void (*done)(struct scsi_cmnd *)
+ 	printk("53c700: scsi%d, command ", SCp->device->host->host_no);
+ 	scsi_print_command(SCp);
+ #endif
+-	if(blk_rq_tagged(SCp->request)
++	if ((SCp->flags & SCMD_TAGGED)
+ 	   && (hostdata->tag_negotiated &(1<<scmd_id(SCp))) == 0
+ 	   && NCR_700_get_tag_neg_state(SCp->device) == NCR_700_START_TAG_NEGOTIATION) {
+ 		scmd_printk(KERN_ERR, SCp, "Enabling Tag Command Queuing\n");
+@@ -1808,7 +1808,7 @@ NCR_700_queuecommand_lck(struct scsi_cmnd *SCp, void (*done)(struct scsi_cmnd *)
+ 	 *
+ 	 * FIXME: This will royally screw up on multiple LUN devices
+ 	 * */
+-	if(!blk_rq_tagged(SCp->request)
++	if (!(SCp->flags & SCMD_TAGGED)
+ 	   && (hostdata->tag_negotiated &(1<<scmd_id(SCp)))) {
+ 		scmd_printk(KERN_INFO, SCp, "Disabling Tag Command Queuing\n");
+ 		hostdata->tag_negotiated &= ~(1<<scmd_id(SCp));
+diff --git a/drivers/scsi/aic7xxx/aic7xxx_osm.c b/drivers/scsi/aic7xxx/aic7xxx_osm.c
+index c0c62583b542..430c9ac130b6 100644
+--- a/drivers/scsi/aic7xxx/aic7xxx_osm.c
++++ b/drivers/scsi/aic7xxx/aic7xxx_osm.c
+@@ -1457,7 +1457,7 @@ ahc_linux_run_command(struct ahc_softc *ahc, struct ahc_linux_device *dev,
+ 	 * we are storing a full busy target *lun*
+ 	 * table in SCB space.
+ 	 */
+-	if (!blk_rq_tagged(cmd->request)
++	if (!(cmd->flags & SCMD_TAGGED)
+ 	    && (ahc->features & AHC_SCB_BTT) == 0) {
+ 		int target_offset;
+ 
+diff --git a/drivers/scsi/scsi_lib.c b/drivers/scsi/scsi_lib.c
+index 09ae8ec23494..dc6f6360481b 100644
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@ -1667,7 +1667,7 @@ static void scsi_request_fn(struct request_queue *q)
+ 		 * we add the dev to the starved list so it eventually gets
+ 		 * a run when a tag is freed.
+ 		 */
+-		if (blk_queue_tagged(q) && !blk_rq_tagged(req)) {
++		if (blk_queue_tagged(q) && !(req->cmd_flags & REQ_QUEUED)) {
+ 			spin_lock_irq(shost->host_lock);
+ 			if (list_empty(&sdev->starved_entry))
+ 				list_add_tail(&sdev->starved_entry,
+@@ -1681,6 +1681,11 @@ static void scsi_request_fn(struct request_queue *q)
+ 
+ 		if (!scsi_host_queue_ready(q, shost, sdev))
+ 			goto host_not_ready;
++	
++		if (sdev->simple_tags)
++			cmd->flags |= SCMD_TAGGED;
++		else
++			cmd->flags &= ~SCMD_TAGGED;
+ 
+ 		/*
+ 		 * Finally, initialize any error handling parameters, and set up
+@@ -1838,10 +1843,10 @@ static int scsi_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 		blk_mq_start_request(req);
+ 	}
+ 
+-	if (blk_queue_tagged(q))
+-		req->cmd_flags |= REQ_QUEUED;
++	if (sdev->simple_tags)
++		cmd->flags |= SCMD_TAGGED;
+ 	else
+-		req->cmd_flags &= ~REQ_QUEUED;
++		cmd->flags &= ~SCMD_TAGGED;
+ 
+ 	scsi_init_cmd_errh(cmd);
+ 	cmd->scsi_done = scsi_mq_done;
+* Unmerged path drivers/usb/storage/uas.c
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index ba3405333171..5ad03a8c252b 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -1219,7 +1219,6 @@ static inline bool blk_needs_flush_plug(struct task_struct *tsk)
+ /*
+  * tag stuff
+  */
+-#define blk_rq_tagged(rq)		((rq)->cmd_flags & REQ_QUEUED)
+ extern int blk_queue_start_tag(struct request_queue *, struct request *);
+ extern struct request *blk_queue_find_tag(struct request_queue *, int);
+ extern void blk_queue_end_tag(struct request_queue *, struct request *);
+diff --git a/include/scsi/scsi_cmnd.h b/include/scsi/scsi_cmnd.h
+index 9b1ebe610b5d..efdf40f88a4b 100644
+--- a/include/scsi/scsi_cmnd.h
++++ b/include/scsi/scsi_cmnd.h
+@@ -54,6 +54,9 @@ struct scsi_pointer {
+ 	volatile int phase;
+ };
+ 
++/* for scmd->flags */
++#define SCMD_TAGGED		(1 << 0)
++
+ struct scsi_cmnd {
+ 	struct scsi_device *device;
+ 	struct list_head list;  /* scsi_cmnd participates in queue lists */
+@@ -132,6 +135,7 @@ struct scsi_cmnd {
+ 					 * to be at an address < 16Mb). */
+ 
+ 	int result;		/* Status code from lower level driver */
++	int flags;		/* Command flags */
+ 
+ 	unsigned char tag;	/* SCSI-II queued command tag */
+ 
+diff --git a/include/scsi/scsi_tcq.h b/include/scsi/scsi_tcq.h
+index b0bed5aec6c0..7492f0f88a05 100644
+--- a/include/scsi/scsi_tcq.h
++++ b/include/scsi/scsi_tcq.h
+@@ -99,11 +99,9 @@ static inline void scsi_deactivate_tcq(struct scsi_device *sdev, int depth)
+  **/
+ static inline int scsi_populate_tag_msg(struct scsi_cmnd *cmd, char *msg)
+ {
+-        struct request *req = cmd->request;
+-
+-        if (blk_rq_tagged(req)) {
++        if (cmd->flags & SCMD_TAGGED) {
+ 		*msg++ = MSG_SIMPLE_TAG;
+-        	*msg++ = req->tag;
++        	*msg++ = cmd->request->tag;
+         	return 2;
+ 	}
+ 
