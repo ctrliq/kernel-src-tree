@@ -1,0 +1,253 @@
+drm/i915: Move the release of PT page to the upper caller
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [drm] i915: Move the release of PT page to the upper caller (Rob Clark) [1380115 1422186]
+Rebuild_FUZZ: 96.36%
+commit-author Zhi Wang <zhi.a.wang@intel.com>
+commit a18dbba8f01ffae229d00517994f84e7bfad4c49
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/a18dbba8.failed
+
+a PT page will be released if it doesn't contain any meaningful mappings
+during PPGTT page table shrinking. The PT entry in the upper level will
+be set to a scratch entry.
+
+Normally this works nicely, but in virtualization world, the PPGTT page
+table is tracked by hypervisor. Releasing the PT page before modifying
+the upper level PT entry would cause extra efforts.
+
+As the tracked page has been returned to OS before losing track from
+hypervisor, it could be written in any pattern. Hypervisor has to recognize
+if a page is still being used as a PT page by validating these writing
+patterns. It's complicated. Better let the guest modify the PT entry in
+upper level PT first, then release the PT page.
+
+	Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+	Reviewed-by: Michał Winiarski <michal.winiarski@intel.com>
+	Cc: Michał Winiarski <michal.winiarski@intel.com>
+	Cc: Michel Thierry <michel.thierry@intel.com>
+	Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+	Cc: Chris Wilson <chris@chris-wilson.co.uk>
+	Cc: Zhenyu Wang <zhenyuw@linux.intel.com>
+	Cc: Zhiyuan Lv <zhiyuan.lv@intel.com>
+	Signed-off-by: Zhi Wang <zhi.a.wang@intel.com>
+Link: https://patchwork.freedesktop.org/patch/122697/msgid/1479728666-25333-1-git-send-email-zhi.a.wang@intel.com
+	Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: http://patchwork.freedesktop.org/patch/msgid/1480402516-22275-1-git-send-email-zhi.a.wang@intel.com
+(cherry picked from commit a18dbba8f01ffae229d00517994f84e7bfad4c49)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/i915_gem_gtt.c
+diff --cc drivers/gpu/drm/i915/i915_gem_gtt.c
+index 49e4f26b79d8,6cee70745fea..000000000000
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.c
+@@@ -700,59 -703,153 +700,178 @@@ static int gen8_48b_mm_switch(struct i9
+  	return gen8_write_pdp(req, 0, px_dma(&ppgtt->pml4));
+  }
+  
+ -/* PDE TLBs are a pain to invalidate on GEN8+. When we modify
+ - * the page table structures, we mark them dirty so that
+ - * context switching/execlist queuing code takes extra steps
+ - * to ensure that tlbs are flushed.
+ - */
+ -static void mark_tlbs_dirty(struct i915_hw_ppgtt *ppgtt)
+ +static void gen8_ppgtt_clear_pte_range(struct i915_address_space *vm,
+ +				       struct i915_page_directory_pointer *pdp,
+ +				       uint64_t start,
+ +				       uint64_t length,
+ +				       gen8_pte_t scratch_pte)
+  {
+ -	ppgtt->pd_dirty_rings = INTEL_INFO(to_i915(ppgtt->base.dev))->ring_mask;
+ -}
+ -
+ -/* Removes entries from a single page table, releasing it if it's empty.
+ - * Caller can use the return value to update higher-level entries.
+ - */
+ -static bool gen8_ppgtt_clear_pt(struct i915_address_space *vm,
+ -				struct i915_page_table *pt,
+ -				uint64_t start,
+ -				uint64_t length)
+ -{
+ -	struct i915_hw_ppgtt *ppgtt = i915_vm_to_ppgtt(vm);
+ -	unsigned int num_entries = gen8_pte_count(start, length);
+ -	unsigned int pte = gen8_pte_index(start);
+ -	unsigned int pte_end = pte + num_entries;
+ +	struct i915_hw_ppgtt *ppgtt =
+ +		container_of(vm, struct i915_hw_ppgtt, base);
+  	gen8_pte_t *pt_vaddr;
+ -	gen8_pte_t scratch_pte = gen8_pte_encode(vm->scratch_page.daddr,
+ -						 I915_CACHE_LLC);
+ +	unsigned pdpe = gen8_pdpe_index(start);
+ +	unsigned pde = gen8_pde_index(start);
+ +	unsigned pte = gen8_pte_index(start);
+ +	unsigned num_entries = length >> PAGE_SHIFT;
+ +	unsigned last_pte, i;
+  
+ -	if (WARN_ON(!px_page(pt)))
+ -		return false;
+ +	if (WARN_ON(!pdp))
+ +		return;
+  
+ -	GEM_BUG_ON(pte_end > GEN8_PTES);
+ +	while (num_entries) {
+ +		struct i915_page_directory *pd;
+ +		struct i915_page_table *pt;
+  
+++<<<<<<< HEAD
+ +		if (WARN_ON(!pdp->page_directory[pdpe]))
+ +			break;
+ +
+ +		pd = pdp->page_directory[pdpe];
+ +
+ +		if (WARN_ON(!pd->page_table[pde]))
+ +			break;
+ +
+ +		pt = pd->page_table[pde];
+ +
+ +		if (WARN_ON(!px_page(pt)))
+ +			break;
+ +
+ +		last_pte = pte + num_entries;
+ +		if (last_pte > GEN8_PTES)
+ +			last_pte = GEN8_PTES;
+ +
+ +		pt_vaddr = kmap_px(pt);
+ +
+ +		for (i = pte; i < last_pte; i++) {
+ +			pt_vaddr[i] = scratch_pte;
+ +			num_entries--;
+ +		}
+ +
+ +		kunmap_px(ppgtt, pt);
+ +
+ +		pte = 0;
+ +		if (++pde == I915_PDES) {
+ +			if (++pdpe == I915_PDPES_PER_PDP(vm->dev))
+ +				break;
+ +			pde = 0;
+++=======
++ 	bitmap_clear(pt->used_ptes, pte, num_entries);
++ 
++ 	if (bitmap_empty(pt->used_ptes, GEN8_PTES))
++ 		return true;
++ 
++ 	pt_vaddr = kmap_px(pt);
++ 
++ 	while (pte < pte_end)
++ 		pt_vaddr[pte++] = scratch_pte;
++ 
++ 	kunmap_px(ppgtt, pt_vaddr);
++ 
++ 	return false;
++ }
++ 
++ /* Removes entries from a single page dir, releasing it if it's empty.
++  * Caller can use the return value to update higher-level entries
++  */
++ static bool gen8_ppgtt_clear_pd(struct i915_address_space *vm,
++ 				struct i915_page_directory *pd,
++ 				uint64_t start,
++ 				uint64_t length)
++ {
++ 	struct i915_hw_ppgtt *ppgtt = i915_vm_to_ppgtt(vm);
++ 	struct i915_page_table *pt;
++ 	uint64_t pde;
++ 	gen8_pde_t *pde_vaddr;
++ 	gen8_pde_t scratch_pde = gen8_pde_encode(px_dma(vm->scratch_pt),
++ 						 I915_CACHE_LLC);
++ 
++ 	gen8_for_each_pde(pt, pd, start, length, pde) {
++ 		if (WARN_ON(!pd->page_table[pde]))
++ 			break;
++ 
++ 		if (gen8_ppgtt_clear_pt(vm, pt, start, length)) {
++ 			__clear_bit(pde, pd->used_pdes);
++ 			pde_vaddr = kmap_px(pd);
++ 			pde_vaddr[pde] = scratch_pde;
++ 			kunmap_px(ppgtt, pde_vaddr);
++ 			free_pt(to_i915(vm->dev), pt);
++ 		}
++ 	}
++ 
++ 	if (bitmap_empty(pd->used_pdes, I915_PDES))
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ /* Removes entries from a single page dir pointer, releasing it if it's empty.
++  * Caller can use the return value to update higher-level entries
++  */
++ static bool gen8_ppgtt_clear_pdp(struct i915_address_space *vm,
++ 				 struct i915_page_directory_pointer *pdp,
++ 				 uint64_t start,
++ 				 uint64_t length)
++ {
++ 	struct i915_hw_ppgtt *ppgtt = i915_vm_to_ppgtt(vm);
++ 	struct i915_page_directory *pd;
++ 	uint64_t pdpe;
++ 	gen8_ppgtt_pdpe_t *pdpe_vaddr;
++ 	gen8_ppgtt_pdpe_t scratch_pdpe =
++ 		gen8_pdpe_encode(px_dma(vm->scratch_pd), I915_CACHE_LLC);
++ 
++ 	gen8_for_each_pdpe(pd, pdp, start, length, pdpe) {
++ 		if (WARN_ON(!pdp->page_directory[pdpe]))
++ 			break;
++ 
++ 		if (gen8_ppgtt_clear_pd(vm, pd, start, length)) {
++ 			__clear_bit(pdpe, pdp->used_pdpes);
++ 			if (USES_FULL_48BIT_PPGTT(dev_priv)) {
++ 				pdpe_vaddr = kmap_px(pdp);
++ 				pdpe_vaddr[pdpe] = scratch_pdpe;
++ 				kunmap_px(ppgtt, pdpe_vaddr);
++ 			}
++ 			free_pd(to_i915(vm->dev), pd);
++ 		}
++ 	}
++ 
++ 	mark_tlbs_dirty(ppgtt);
++ 
++ 	if (bitmap_empty(pdp->used_pdpes, I915_PDPES_PER_PDP(dev_priv)))
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ /* Removes entries from a single pml4.
++  * This is the top-level structure in 4-level page tables used on gen8+.
++  * Empty entries are always scratch pml4e.
++  */
++ static void gen8_ppgtt_clear_pml4(struct i915_address_space *vm,
++ 				  struct i915_pml4 *pml4,
++ 				  uint64_t start,
++ 				  uint64_t length)
++ {
++ 	struct drm_i915_private *dev_priv = to_i915(vm->dev);
++ 	struct i915_hw_ppgtt *ppgtt = i915_vm_to_ppgtt(vm);
++ 	struct i915_page_directory_pointer *pdp;
++ 	uint64_t pml4e;
++ 	gen8_ppgtt_pml4e_t *pml4e_vaddr;
++ 	gen8_ppgtt_pml4e_t scratch_pml4e =
++ 		gen8_pml4e_encode(px_dma(vm->scratch_pdp), I915_CACHE_LLC);
++ 
++ 	GEM_BUG_ON(!USES_FULL_48BIT_PPGTT(to_i915(vm->dev)));
++ 
++ 	gen8_for_each_pml4e(pdp, pml4, start, length, pml4e) {
++ 		if (WARN_ON(!pml4->pdps[pml4e]))
++ 			break;
++ 
++ 		if (gen8_ppgtt_clear_pdp(vm, pdp, start, length)) {
++ 			__clear_bit(pml4e, pml4->used_pml4es);
++ 			pml4e_vaddr = kmap_px(pml4);
++ 			pml4e_vaddr[pml4e] = scratch_pml4e;
++ 			kunmap_px(ppgtt, pml4e_vaddr);
++ 			free_pdp(dev_priv, pdp);
+++>>>>>>> a18dbba8f01f (drm/i915: Move the release of PT page to the upper caller)
+  		}
+  	}
+  }
+* Unmerged path drivers/gpu/drm/i915/i915_gem_gtt.c
