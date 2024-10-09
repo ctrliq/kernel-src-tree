@@ -1748,13 +1748,14 @@ nvme_fc_timeout(struct request *rq, bool reserved)
 	struct nvme_fc_ctrl *ctrl = op->ctrl;
 	int ret;
 
-	if (reserved)
+	if (ctrl->rport->remoteport.port_state != FC_OBJSTATE_ONLINE ||
+			atomic_read(&op->state) == FCPOP_STATE_ABORTED)
 		return BLK_EH_RESET_TIMER;
 
 	ret = __nvme_fc_abort_op(ctrl, op);
 	if (ret)
-		/* io wasn't active to abort consider it done */
-		return BLK_EH_HANDLED;
+		/* io wasn't active to abort */
+		return BLK_EH_NOT_HANDLED;
 
 	/*
 	 * TODO: force a controller reset
@@ -1763,7 +1764,12 @@ nvme_fc_timeout(struct request *rq, bool reserved)
 	 *   will no longer be needed.
 	 */
 
-	return BLK_EH_HANDLED;
+	/*
+	 * the io abort has been initiated. Have the reset timer
+	 * restarted and the abort completion will complete the io
+	 * shortly. Avoids a synchronous wait while the abort finishes.
+	 */
+	return BLK_EH_RESET_TIMER;
 }
 
 static int
