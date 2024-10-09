@@ -78,6 +78,8 @@ int ipmi_si_hardcode_find_bmc(void)
 	struct si_sm_io io;
 	char *str;
 
+	memset(si_type, 0, sizeof(si_type));
+
 	/* Parse out the si_type string into its components. */
 	str = si_type_str;
 	if (*str != '\0') {
