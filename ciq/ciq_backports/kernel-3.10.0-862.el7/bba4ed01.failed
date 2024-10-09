@@ -1,0 +1,430 @@
+x86/mm, kexec: Allow kexec to be used with SME
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] mm, kexec: Allow kexec to be used with SME (Suravee Suthikulpanit) [1361287]
+Rebuild_FUZZ: 95.45%
+commit-author Tom Lendacky <thomas.lendacky@amd.com>
+commit bba4ed011a52d494aa7ef5e08cf226709bbf3f60
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/bba4ed01.failed
+
+Provide support so that kexec can be used to boot a kernel when SME is
+enabled.
+
+Support is needed to allocate pages for kexec without encryption.  This
+is needed in order to be able to reboot in the kernel in the same manner
+as originally booted.
+
+Additionally, when shutting down all of the CPUs we need to be sure to
+flush the caches and then halt. This is needed when booting from a state
+where SME was not active into a state where SME is active (or vice-versa).
+Without these steps, it is possible for cache lines to exist for the same
+physical location but tagged both with and without the encryption bit. This
+can cause random memory corruption when caches are flushed depending on
+which cacheline is written last.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Borislav Petkov <bp@suse.de>
+	Cc: <kexec@lists.infradead.org>
+	Cc: Alexander Potapenko <glider@google.com>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Arnd Bergmann <arnd@arndb.de>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brijesh Singh <brijesh.singh@amd.com>
+	Cc: Dave Young <dyoung@redhat.com>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Cc: Larry Woodman <lwoodman@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Matt Fleming <matt@codeblueprint.co.uk>
+	Cc: Michael S. Tsirkin <mst@redhat.com>
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Radim Krčmář <rkrcmar@redhat.com>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Toshimitsu Kani <toshi.kani@hpe.com>
+	Cc: kasan-dev@googlegroups.com
+	Cc: kvm@vger.kernel.org
+	Cc: linux-arch@vger.kernel.org
+	Cc: linux-doc@vger.kernel.org
+	Cc: linux-efi@vger.kernel.org
+	Cc: linux-mm@kvack.org
+Link: http://lkml.kernel.org/r/b95ff075db3e7cd545313f2fb609a49619a09625.1500319216.git.thomas.lendacky@amd.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit bba4ed011a52d494aa7ef5e08cf226709bbf3f60)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/init.h
+#	arch/x86/include/asm/pgtable_types.h
+#	arch/x86/kernel/machine_kexec_64.c
+#	arch/x86/mm/ident_map.c
+#	include/linux/kexec.h
+diff --cc arch/x86/include/asm/init.h
+index 737da62bfeb0,05c4aa00cc86..000000000000
+--- a/arch/x86/include/asm/init.h
++++ b/arch/x86/include/asm/init.h
+@@@ -4,8 -4,10 +4,13 @@@
+  struct x86_mapping_info {
+  	void *(*alloc_pgt_page)(void *); /* allocate buf for page table */
+  	void *context;			 /* context for alloc_pgt_page */
+ -	unsigned long page_flag;	 /* page flag for PMD or PUD entry */
+ +	unsigned long pmd_flag;		 /* page flag for PMD entry */
+  	unsigned long offset;		 /* ident mapping offset */
+++<<<<<<< HEAD
+++=======
++ 	bool direct_gbpages;		 /* PUD level 1GB page support */
++ 	unsigned long kernpg_flag;	 /* kernel pagetable flag override */
+++>>>>>>> bba4ed011a52 (x86/mm, kexec: Allow kexec to be used with SME)
+  };
+  
+  int kernel_ident_mapping_init(struct x86_mapping_info *info, pgd_t *pgd_page,
+diff --cc arch/x86/include/asm/pgtable_types.h
+index 5e5b6dc9e568,830992fc5a06..000000000000
+--- a/arch/x86/include/asm/pgtable_types.h
++++ b/arch/x86/include/asm/pgtable_types.h
+@@@ -220,41 -185,46 +220,72 @@@ enum page_cache_mode 
+  
+  #define __PAGE_KERNEL_RO		(__PAGE_KERNEL & ~_PAGE_RW)
+  #define __PAGE_KERNEL_RX		(__PAGE_KERNEL_EXEC & ~_PAGE_RW)
+ -#define __PAGE_KERNEL_NOCACHE		(__PAGE_KERNEL | _PAGE_NOCACHE)
+ +#define __PAGE_KERNEL_EXEC_NOCACHE	(__PAGE_KERNEL_EXEC | _PAGE_PCD | _PAGE_PWT)
+ +#define __PAGE_KERNEL_WC		(__PAGE_KERNEL | _PAGE_CACHE_WC)
+ +#define __PAGE_KERNEL_NOCACHE		(__PAGE_KERNEL | _PAGE_PCD | _PAGE_PWT)
+ +#define __PAGE_KERNEL_UC_MINUS		(__PAGE_KERNEL | _PAGE_PCD)
+  #define __PAGE_KERNEL_VSYSCALL		(__PAGE_KERNEL_RX | _PAGE_USER)
+  #define __PAGE_KERNEL_VVAR		(__PAGE_KERNEL_RO | _PAGE_USER)
+ +#define __PAGE_KERNEL_VVAR_NOCACHE	(__PAGE_KERNEL_VVAR | _PAGE_PCD | _PAGE_PWT)
+  #define __PAGE_KERNEL_LARGE		(__PAGE_KERNEL | _PAGE_PSE)
+ +#define __PAGE_KERNEL_LARGE_NOCACHE	(__PAGE_KERNEL | _PAGE_CACHE_UC | _PAGE_PSE)
+  #define __PAGE_KERNEL_LARGE_EXEC	(__PAGE_KERNEL_EXEC | _PAGE_PSE)
+ -#define __PAGE_KERNEL_WP		(__PAGE_KERNEL | _PAGE_CACHE_WP)
+ -
+ -#define __PAGE_KERNEL_IO		(__PAGE_KERNEL)
+ -#define __PAGE_KERNEL_IO_NOCACHE	(__PAGE_KERNEL_NOCACHE)
+ -
+ -#ifndef __ASSEMBLY__
+  
+ +#define __PAGE_KERNEL_IO		(__PAGE_KERNEL | _PAGE_IOMAP)
+ +#define __PAGE_KERNEL_IO_NOCACHE	(__PAGE_KERNEL_NOCACHE | _PAGE_IOMAP)
+ +#define __PAGE_KERNEL_IO_UC_MINUS	(__PAGE_KERNEL_UC_MINUS | _PAGE_IOMAP)
+ +#define __PAGE_KERNEL_IO_WC		(__PAGE_KERNEL_WC | _PAGE_IOMAP)
+ +
+ +#define PAGE_KERNEL			__pgprot(__PAGE_KERNEL)
+ +#define PAGE_KERNEL_RO			__pgprot(__PAGE_KERNEL_RO)
+ +#define PAGE_KERNEL_EXEC		__pgprot(__PAGE_KERNEL_EXEC)
+ +#define PAGE_KERNEL_RX			__pgprot(__PAGE_KERNEL_RX)
+ +#define PAGE_KERNEL_WC			__pgprot(__PAGE_KERNEL_WC)
+ +#define PAGE_KERNEL_NOCACHE		__pgprot(__PAGE_KERNEL_NOCACHE)
+ +#define PAGE_KERNEL_UC_MINUS		__pgprot(__PAGE_KERNEL_UC_MINUS)
+ +#define PAGE_KERNEL_EXEC_NOCACHE	__pgprot(__PAGE_KERNEL_EXEC_NOCACHE)
+ +#define PAGE_KERNEL_LARGE		__pgprot(__PAGE_KERNEL_LARGE)
+ +#define PAGE_KERNEL_LARGE_NOCACHE	__pgprot(__PAGE_KERNEL_LARGE_NOCACHE)
+ +#define PAGE_KERNEL_LARGE_EXEC		__pgprot(__PAGE_KERNEL_LARGE_EXEC)
+ +#define PAGE_KERNEL_VSYSCALL		__pgprot(__PAGE_KERNEL_VSYSCALL)
+ +#define PAGE_KERNEL_VVAR		__pgprot(__PAGE_KERNEL_VVAR)
+ +#define PAGE_KERNEL_VVAR_NOCACHE	__pgprot(__PAGE_KERNEL_VVAR_NOCACHE)
+ +
+++<<<<<<< HEAD
+ +#define PAGE_KERNEL_IO			__pgprot(__PAGE_KERNEL_IO)
+ +#define PAGE_KERNEL_IO_NOCACHE		__pgprot(__PAGE_KERNEL_IO_NOCACHE)
+ +#define PAGE_KERNEL_IO_UC_MINUS		__pgprot(__PAGE_KERNEL_IO_UC_MINUS)
+ +#define PAGE_KERNEL_IO_WC		__pgprot(__PAGE_KERNEL_IO_WC)
+++=======
++ #define _PAGE_ENC	(_AT(pteval_t, sme_me_mask))
++ 
++ #define _PAGE_TABLE	(_PAGE_PRESENT | _PAGE_RW | _PAGE_USER |	\
++ 			 _PAGE_ACCESSED | _PAGE_DIRTY | _PAGE_ENC)
++ #define _KERNPG_TABLE	(_PAGE_PRESENT | _PAGE_RW | _PAGE_ACCESSED |	\
++ 			 _PAGE_DIRTY | _PAGE_ENC)
++ 
++ #define __PAGE_KERNEL_ENC	(__PAGE_KERNEL | _PAGE_ENC)
++ #define __PAGE_KERNEL_ENC_WP	(__PAGE_KERNEL_WP | _PAGE_ENC)
++ 
++ #define __PAGE_KERNEL_NOENC	(__PAGE_KERNEL)
++ #define __PAGE_KERNEL_NOENC_WP	(__PAGE_KERNEL_WP)
++ 
++ #define PAGE_KERNEL		__pgprot(__PAGE_KERNEL | _PAGE_ENC)
++ #define PAGE_KERNEL_RO		__pgprot(__PAGE_KERNEL_RO | _PAGE_ENC)
++ #define PAGE_KERNEL_EXEC	__pgprot(__PAGE_KERNEL_EXEC | _PAGE_ENC)
++ #define PAGE_KERNEL_EXEC_NOENC	__pgprot(__PAGE_KERNEL_EXEC)
++ #define PAGE_KERNEL_RX		__pgprot(__PAGE_KERNEL_RX | _PAGE_ENC)
++ #define PAGE_KERNEL_NOCACHE	__pgprot(__PAGE_KERNEL_NOCACHE | _PAGE_ENC)
++ #define PAGE_KERNEL_LARGE	__pgprot(__PAGE_KERNEL_LARGE | _PAGE_ENC)
++ #define PAGE_KERNEL_LARGE_EXEC	__pgprot(__PAGE_KERNEL_LARGE_EXEC | _PAGE_ENC)
++ #define PAGE_KERNEL_VSYSCALL	__pgprot(__PAGE_KERNEL_VSYSCALL | _PAGE_ENC)
++ #define PAGE_KERNEL_VVAR	__pgprot(__PAGE_KERNEL_VVAR | _PAGE_ENC)
++ 
++ #define PAGE_KERNEL_IO		__pgprot(__PAGE_KERNEL_IO)
++ #define PAGE_KERNEL_IO_NOCACHE	__pgprot(__PAGE_KERNEL_IO_NOCACHE)
++ 
++ #endif	/* __ASSEMBLY__ */
+++>>>>>>> bba4ed011a52 (x86/mm, kexec: Allow kexec to be used with SME)
+  
+  /*         xwr */
+  #define __P000	PAGE_NONE
+diff --cc arch/x86/kernel/machine_kexec_64.c
+index cd16f3b0d19a,9cf8daacc046..000000000000
+--- a/arch/x86/kernel/machine_kexec_64.c
++++ b/arch/x86/kernel/machine_kexec_64.c
+@@@ -101,7 -114,8 +101,12 @@@ static int init_pgtable(struct kimage *
+  	struct x86_mapping_info info = {
+  		.alloc_pgt_page	= alloc_pgt_page,
+  		.context	= image,
+++<<<<<<< HEAD
+ +		.pmd_flag	= __PAGE_KERNEL_LARGE_EXEC,
+++=======
++ 		.page_flag	= __PAGE_KERNEL_LARGE_EXEC,
++ 		.kernpg_flag	= _KERNPG_TABLE_NOENC,
+++>>>>>>> bba4ed011a52 (x86/mm, kexec: Allow kexec to be used with SME)
+  	};
+  	unsigned long mstart, mend;
+  	pgd_t *level4p;
+diff --cc arch/x86/mm/ident_map.c
+index 4473cb4f8b90,31cea988fa36..000000000000
+--- a/arch/x86/mm/ident_map.c
++++ b/arch/x86/mm/ident_map.c
+@@@ -45,6 -57,34 +45,37 @@@ static int ident_pud_init(struct x86_ma
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int ident_p4d_init(struct x86_mapping_info *info, p4d_t *p4d_page,
++ 			  unsigned long addr, unsigned long end)
++ {
++ 	unsigned long next;
++ 
++ 	for (; addr < end; addr = next) {
++ 		p4d_t *p4d = p4d_page + p4d_index(addr);
++ 		pud_t *pud;
++ 
++ 		next = (addr & P4D_MASK) + P4D_SIZE;
++ 		if (next > end)
++ 			next = end;
++ 
++ 		if (p4d_present(*p4d)) {
++ 			pud = pud_offset(p4d, 0);
++ 			ident_pud_init(info, pud, addr, next);
++ 			continue;
++ 		}
++ 		pud = (pud_t *)info->alloc_pgt_page(info->context);
++ 		if (!pud)
++ 			return -ENOMEM;
++ 		ident_pud_init(info, pud, addr, next);
++ 		set_p4d(p4d, __p4d(__pa(pud) | info->kernpg_flag));
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> bba4ed011a52 (x86/mm, kexec: Allow kexec to be used with SME)
+  int kernel_ident_mapping_init(struct x86_mapping_info *info, pgd_t *pgd_page,
+  			      unsigned long pstart, unsigned long pend)
+  {
+@@@ -53,9 -93,13 +84,13 @@@
+  	unsigned long next;
+  	int result;
+  
++ 	/* Set the default pagetable flags if not supplied */
++ 	if (!info->kernpg_flag)
++ 		info->kernpg_flag = _KERNPG_TABLE;
++ 
+  	for (; addr < end; addr = next) {
+  		pgd_t *pgd = pgd_page + pgd_index(addr);
+ -		p4d_t *p4d;
+ +		pud_t *pud;
+  
+  		next = (addr & PGDIR_MASK) + PGDIR_SIZE;
+  		if (next > end)
+@@@ -69,13 -113,22 +104,26 @@@
+  			continue;
+  		}
+  
+ -		p4d = (p4d_t *)info->alloc_pgt_page(info->context);
+ -		if (!p4d)
+ +		pud = (pud_t *)info->alloc_pgt_page(info->context);
+ +		if (!pud)
+  			return -ENOMEM;
+ -		result = ident_p4d_init(info, p4d, addr, next);
+ +		result = ident_pud_init(info, pud, addr, next);
+  		if (result)
+  			return result;
+++<<<<<<< HEAD
+ +		set_pgd(pgd, __pgd(__pa(pud) | _KERNPG_TABLE));
+++=======
++ 		if (IS_ENABLED(CONFIG_X86_5LEVEL)) {
++ 			set_pgd(pgd, __pgd(__pa(p4d) | info->kernpg_flag));
++ 		} else {
++ 			/*
++ 			 * With p4d folded, pgd is equal to p4d.
++ 			 * The pgd entry has to point to the pud page table in this case.
++ 			 */
++ 			pud_t *pud = pud_offset(p4d, 0);
++ 			set_pgd(pgd, __pgd(__pa(pud) | info->kernpg_flag));
++ 		}
+++>>>>>>> bba4ed011a52 (x86/mm, kexec: Allow kexec to be used with SME)
+  	}
+  
+  	return 0;
+diff --cc include/linux/kexec.h
+index 49113b30f883,2b7590f5483a..000000000000
+--- a/include/linux/kexec.h
++++ b/include/linux/kexec.h
+@@@ -253,6 -289,52 +253,55 @@@ int __weak arch_kexec_apply_relocations
+  void arch_kexec_protect_crashkres(void);
+  void arch_kexec_unprotect_crashkres(void);
+  
+++<<<<<<< HEAD
+++=======
++ #ifndef page_to_boot_pfn
++ static inline unsigned long page_to_boot_pfn(struct page *page)
++ {
++ 	return page_to_pfn(page);
++ }
++ #endif
++ 
++ #ifndef boot_pfn_to_page
++ static inline struct page *boot_pfn_to_page(unsigned long boot_pfn)
++ {
++ 	return pfn_to_page(boot_pfn);
++ }
++ #endif
++ 
++ #ifndef phys_to_boot_phys
++ static inline unsigned long phys_to_boot_phys(phys_addr_t phys)
++ {
++ 	return phys;
++ }
++ #endif
++ 
++ #ifndef boot_phys_to_phys
++ static inline phys_addr_t boot_phys_to_phys(unsigned long boot_phys)
++ {
++ 	return boot_phys;
++ }
++ #endif
++ 
++ static inline unsigned long virt_to_boot_phys(void *addr)
++ {
++ 	return phys_to_boot_phys(__pa((unsigned long)addr));
++ }
++ 
++ static inline void *boot_phys_to_virt(unsigned long entry)
++ {
++ 	return phys_to_virt(boot_phys_to_phys(entry));
++ }
++ 
++ #ifndef arch_kexec_post_alloc_pages
++ static inline int arch_kexec_post_alloc_pages(void *vaddr, unsigned int pages, gfp_t gfp) { return 0; }
++ #endif
++ 
++ #ifndef arch_kexec_pre_free_pages
++ static inline void arch_kexec_pre_free_pages(void *vaddr, unsigned int pages) { }
++ #endif
++ 
+++>>>>>>> bba4ed011a52 (x86/mm, kexec: Allow kexec to be used with SME)
+  #else /* !CONFIG_KEXEC_CORE */
+  struct pt_regs;
+  struct task_struct;
+* Unmerged path arch/x86/include/asm/init.h
+diff --git a/arch/x86/include/asm/kexec.h b/arch/x86/include/asm/kexec.h
+index f9f9dec3eb22..aca763e5e7b0 100644
+--- a/arch/x86/include/asm/kexec.h
++++ b/arch/x86/include/asm/kexec.h
+@@ -207,6 +207,14 @@ struct kexec_entry64_regs {
+ 	uint64_t r15;
+ 	uint64_t rip;
+ };
++
++extern int arch_kexec_post_alloc_pages(void *vaddr, unsigned int pages,
++				       gfp_t gfp);
++#define arch_kexec_post_alloc_pages arch_kexec_post_alloc_pages
++
++extern void arch_kexec_pre_free_pages(void *vaddr, unsigned int pages);
++#define arch_kexec_pre_free_pages arch_kexec_pre_free_pages
++
+ #endif
+ 
+ typedef void crash_vmclear_fn(void);
+* Unmerged path arch/x86/include/asm/pgtable_types.h
+* Unmerged path arch/x86/kernel/machine_kexec_64.c
+diff --git a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
+index 1e5497794b6a..83cee9207169 100644
+--- a/arch/x86/kernel/process.c
++++ b/arch/x86/kernel/process.c
+@@ -330,6 +330,7 @@ bool xen_set_default_idle(void)
+ 	return ret;
+ }
+ #endif
++
+ void stop_this_cpu(void *dummy)
+ {
+ 	local_irq_disable();
+@@ -340,8 +341,20 @@ void stop_this_cpu(void *dummy)
+ 	disable_local_APIC();
+ 	mcheck_cpu_clear(this_cpu_ptr(&cpu_info));
+ 
+-	for (;;)
+-		halt();
++	for (;;) {
++		/*
++		 * Use wbinvd followed by hlt to stop the processor. This
++		 * provides support for kexec on a processor that supports
++		 * SME. With kexec, going from SME inactive to SME active
++		 * requires clearing cache entries so that addresses without
++		 * the encryption bit set don't corrupt the same physical
++		 * address that has the encryption bit set when caches are
++		 * flushed. To achieve this a wbinvd is performed followed by
++		 * a hlt. Even if the processor is not in the kexec/SME
++		 * scenario this only adds a wbinvd to a halting processor.
++		 */
++		asm volatile("wbinvd; hlt" : : : "memory");
++	}
+ }
+ 
+ bool amd_e400_c1e_detected;
+* Unmerged path arch/x86/mm/ident_map.c
+* Unmerged path include/linux/kexec.h
+diff --git a/kernel/kexec_core.c b/kernel/kexec_core.c
+index 14172d54abad..fbcfdb3e9561 100644
+--- a/kernel/kexec_core.c
++++ b/kernel/kexec_core.c
+@@ -277,7 +277,7 @@ static struct page *kimage_alloc_pages(gfp_t gfp_mask, unsigned int order)
+ {
+ 	struct page *pages;
+ 
+-	pages = alloc_pages(gfp_mask, order);
++	pages = alloc_pages(gfp_mask & ~__GFP_ZERO, order);
+ 	if (pages) {
+ 		unsigned int count, i;
+ 
+@@ -286,6 +286,13 @@ static struct page *kimage_alloc_pages(gfp_t gfp_mask, unsigned int order)
+ 		count = 1 << order;
+ 		for (i = 0; i < count; i++)
+ 			SetPageReserved(pages + i);
++
++		arch_kexec_post_alloc_pages(page_address(pages), count,
++					    gfp_mask);
++
++		if (gfp_mask & __GFP_ZERO)
++			for (i = 0; i < count; i++)
++				clear_highpage(pages + i);
+ 	}
+ 
+ 	return pages;
+@@ -297,6 +304,9 @@ static void kimage_free_pages(struct page *page)
+ 
+ 	order = page_private(page);
+ 	count = 1 << order;
++
++	arch_kexec_pre_free_pages(page_address(page), count);
++
+ 	for (i = 0; i < count; i++)
+ 		ClearPageReserved(page + i);
+ 	__free_pages(page, order);
