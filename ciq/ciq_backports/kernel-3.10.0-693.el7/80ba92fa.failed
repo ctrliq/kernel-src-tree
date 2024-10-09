@@ -1,0 +1,262 @@
+codel: add ce_threshold attribute
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit 80ba92fa1a92dea128283f69f55b02242e213650
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/80ba92fa.failed
+
+For DCTCP or similar ECN based deployments on fabrics with shallow
+buffers, hosts are responsible for a good part of the buffering.
+
+This patch adds an optional ce_threshold to codel & fq_codel qdiscs,
+so that DCTCP can have feedback from queuing in the host.
+
+A DCTCP enabled egress port simply have a queue occupancy threshold
+above which ECT packets get CE mark.
+
+In codel language this translates to a sojourn time, so that one doesn't
+have to worry about bytes or bandwidth but delays.
+
+This makes the host an active participant in the health of the whole
+network.
+
+This also helps experimenting DCTCP in a setup without DCTCP compliant
+fabric.
+
+On following example, ce_threshold is set to 1ms, and we can see from
+'ldelay xxx us' that TCP is not trying to go around the 5ms codel
+target.
+
+Queue has more capacity to absorb inelastic bursts (say from UDP
+traffic), as queues are maintained to an optimal level.
+
+lpaa23:~# ./tc -s -d qd sh dev eth1
+qdisc mq 1: dev eth1 root
+ Sent 87910654696 bytes 58065331 pkt (dropped 0, overlimits 0 requeues 42961)
+ backlog 3108242b 364p requeues 42961
+qdisc codel 8063: dev eth1 parent 1:1 limit 1000p target 5.0ms ce_threshold 1.0ms interval 100.0ms
+ Sent 7363778701 bytes 4863809 pkt (dropped 0, overlimits 0 requeues 5503)
+ rate 2348Mbit 193919pps backlog 255866b 46p requeues 5503
+  count 0 lastcount 0 ldelay 1.0ms drop_next 0us
+  maxpacket 68130 ecn_mark 0 drop_overlimit 0 ce_mark 72384
+qdisc codel 8064: dev eth1 parent 1:2 limit 1000p target 5.0ms ce_threshold 1.0ms interval 100.0ms
+ Sent 7636486190 bytes 5043942 pkt (dropped 0, overlimits 0 requeues 5186)
+ rate 2319Mbit 191538pps backlog 207418b 64p requeues 5186
+  count 0 lastcount 0 ldelay 694us drop_next 0us
+  maxpacket 68130 ecn_mark 0 drop_overlimit 0 ce_mark 69873
+qdisc codel 8065: dev eth1 parent 1:3 limit 1000p target 5.0ms ce_threshold 1.0ms interval 100.0ms
+ Sent 11569360142 bytes 7641602 pkt (dropped 0, overlimits 0 requeues 5554)
+ rate 3041Mbit 251096pps backlog 210446b 59p requeues 5554
+  count 0 lastcount 0 ldelay 889us drop_next 0us
+  maxpacket 68130 ecn_mark 0 drop_overlimit 0 ce_mark 37780
+...
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Cc: Florian Westphal <fw@strlen.de>
+	Cc: Daniel Borkmann <daniel@iogearbox.net>
+	Cc: Glenn Judd <glenn.judd@morganstanley.com>
+	Cc: Nandita Dukkipati <nanditad@google.com>
+	Cc: Neal Cardwell <ncardwell@google.com>
+	Cc: Yuchung Cheng <ycheng@google.com>
+	Acked-by: Neal Cardwell <ncardwell@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 80ba92fa1a92dea128283f69f55b02242e213650)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/codel.h
+diff --cc include/net/codel.h
+index 1e18005f7f65,8c0f78f209e8..000000000000
+--- a/include/net/codel.h
++++ b/include/net/codel.h
+@@@ -119,14 -119,14 +119,16 @@@ static inline u32 codel_time_to_us(code
+  /**
+   * struct codel_params - contains codel parameters
+   * @target:	target queue size (in time units)
++  * @ce_threshold:  threshold for marking packets with ECN CE
+   * @interval:	width of moving time window
+ + * @mtu:	device mtu, or minimal queue backlog in bytes.
+   * @ecn:	is Explicit Congestion Notification enabled
+   */
+  struct codel_params {
+  	codel_time_t	target;
++ 	codel_time_t	ce_threshold;
+  	codel_time_t	interval;
+ +	u32		mtu;
+  	bool		ecn;
+  };
+  
+@@@ -166,14 -167,16 +169,25 @@@ struct codel_stats 
+  	u32		maxpacket;
+  	u32		drop_count;
+  	u32		ecn_mark;
++ 	u32		ce_mark;
+  };
+  
+++<<<<<<< HEAD
+ +static void codel_params_init(struct codel_params *params,
+ +			      const struct Qdisc *sch)
+ +{
+ +	params->interval = MS2TIME(100);
+ +	params->target = MS2TIME(5);
+ +	params->mtu = psched_mtu(qdisc_dev(sch));
+++=======
++ #define CODEL_DISABLED_THRESHOLD INT_MAX
++ 
++ static void codel_params_init(struct codel_params *params)
++ {
++ 	params->interval = MS2TIME(100);
++ 	params->target = MS2TIME(5);
++ 	params->ce_threshold = CODEL_DISABLED_THRESHOLD;
+++>>>>>>> 80ba92fa1a92 (codel: add ce_threshold attribute)
+  	params->ecn = false;
+  }
+  
+* Unmerged path include/net/codel.h
+diff --git a/include/uapi/linux/pkt_sched.h b/include/uapi/linux/pkt_sched.h
+index 918b7796073f..b53d2653c60d 100644
+--- a/include/uapi/linux/pkt_sched.h
++++ b/include/uapi/linux/pkt_sched.h
+@@ -683,6 +683,7 @@ enum {
+ 	TCA_CODEL_LIMIT,
+ 	TCA_CODEL_INTERVAL,
+ 	TCA_CODEL_ECN,
++	TCA_CODEL_CE_THRESHOLD,
+ 	__TCA_CODEL_MAX
+ };
+ 
+@@ -699,6 +700,7 @@ struct tc_codel_xstats {
+ 	__u32	drop_overlimit; /* number of time max qdisc packet limit was hit */
+ 	__u32	ecn_mark;  /* number of packets we ECN marked instead of dropped */
+ 	__u32	dropping;  /* are we in dropping state ? */
++	__u32	ce_mark;   /* number of CE marked packets because of ce_threshold */
+ };
+ 
+ /* FQ_CODEL */
+@@ -711,6 +713,7 @@ enum {
+ 	TCA_FQ_CODEL_ECN,
+ 	TCA_FQ_CODEL_FLOWS,
+ 	TCA_FQ_CODEL_QUANTUM,
++	TCA_FQ_CODEL_CE_THRESHOLD,
+ 	__TCA_FQ_CODEL_MAX
+ };
+ 
+@@ -734,6 +737,7 @@ struct tc_fq_codel_qd_stats {
+ 				 */
+ 	__u32	new_flows_len;	/* count of flows in new list */
+ 	__u32	old_flows_len;	/* count of flows in old list */
++	__u32	ce_mark;	/* packets above ce_threshold */
+ };
+ 
+ struct tc_fq_codel_cl_stats {
+diff --git a/net/sched/sch_codel.c b/net/sched/sch_codel.c
+index 7a0bdb16ac92..535007d5f0b5 100644
+--- a/net/sched/sch_codel.c
++++ b/net/sched/sch_codel.c
+@@ -6,7 +6,7 @@
+  *
+  *  Implemented on linux by :
+  *  Copyright (C) 2012 Michael D. Taht <dave.taht@bufferbloat.net>
+- *  Copyright (C) 2012 Eric Dumazet <edumazet@google.com>
++ *  Copyright (C) 2012,2015 Eric Dumazet <edumazet@google.com>
+  *
+  * Redistribution and use in source and binary forms, with or without
+  * modification, are permitted provided that the following conditions
+@@ -109,6 +109,7 @@ static const struct nla_policy codel_policy[TCA_CODEL_MAX + 1] = {
+ 	[TCA_CODEL_LIMIT]	= { .type = NLA_U32 },
+ 	[TCA_CODEL_INTERVAL]	= { .type = NLA_U32 },
+ 	[TCA_CODEL_ECN]		= { .type = NLA_U32 },
++	[TCA_CODEL_CE_THRESHOLD]= { .type = NLA_U32 },
+ };
+ 
+ static int codel_change(struct Qdisc *sch, struct nlattr *opt)
+@@ -133,6 +134,12 @@ static int codel_change(struct Qdisc *sch, struct nlattr *opt)
+ 		q->params.target = ((u64)target * NSEC_PER_USEC) >> CODEL_SHIFT;
+ 	}
+ 
++	if (tb[TCA_CODEL_CE_THRESHOLD]) {
++		u64 val = nla_get_u32(tb[TCA_CODEL_CE_THRESHOLD]);
++
++		q->params.ce_threshold = (val * NSEC_PER_USEC) >> CODEL_SHIFT;
++	}
++
+ 	if (tb[TCA_CODEL_INTERVAL]) {
+ 		u32 interval = nla_get_u32(tb[TCA_CODEL_INTERVAL]);
+ 
+@@ -201,7 +208,10 @@ static int codel_dump(struct Qdisc *sch, struct sk_buff *skb)
+ 	    nla_put_u32(skb, TCA_CODEL_ECN,
+ 			q->params.ecn))
+ 		goto nla_put_failure;
+-
++	if (q->params.ce_threshold != CODEL_DISABLED_THRESHOLD &&
++	    nla_put_u32(skb, TCA_CODEL_CE_THRESHOLD,
++			codel_time_to_us(q->params.ce_threshold)))
++		goto nla_put_failure;
+ 	return nla_nest_end(skb, opts);
+ 
+ nla_put_failure:
+@@ -220,6 +230,7 @@ static int codel_dump_stats(struct Qdisc *sch, struct gnet_dump *d)
+ 		.ldelay		= codel_time_to_us(q->vars.ldelay),
+ 		.dropping	= q->vars.dropping,
+ 		.ecn_mark	= q->stats.ecn_mark,
++		.ce_mark	= q->stats.ce_mark,
+ 	};
+ 
+ 	if (q->vars.dropping) {
+diff --git a/net/sched/sch_fq_codel.c b/net/sched/sch_fq_codel.c
+index 03125323e5e3..41878391c9ea 100644
+--- a/net/sched/sch_fq_codel.c
++++ b/net/sched/sch_fq_codel.c
+@@ -6,7 +6,7 @@
+  *	as published by the Free Software Foundation; either version
+  *	2 of the License, or (at your option) any later version.
+  *
+- *  Copyright (C) 2012 Eric Dumazet <edumazet@google.com>
++ *  Copyright (C) 2012,2015 Eric Dumazet <edumazet@google.com>
+  */
+ 
+ #include <linux/module.h>
+@@ -297,6 +297,7 @@ static const struct nla_policy fq_codel_policy[TCA_FQ_CODEL_MAX + 1] = {
+ 	[TCA_FQ_CODEL_ECN]	= { .type = NLA_U32 },
+ 	[TCA_FQ_CODEL_FLOWS]	= { .type = NLA_U32 },
+ 	[TCA_FQ_CODEL_QUANTUM]	= { .type = NLA_U32 },
++	[TCA_FQ_CODEL_CE_THRESHOLD] = { .type = NLA_U32 },
+ };
+ 
+ static int fq_codel_change(struct Qdisc *sch, struct nlattr *opt)
+@@ -327,6 +328,12 @@ static int fq_codel_change(struct Qdisc *sch, struct nlattr *opt)
+ 		q->cparams.target = (target * NSEC_PER_USEC) >> CODEL_SHIFT;
+ 	}
+ 
++	if (tb[TCA_FQ_CODEL_CE_THRESHOLD]) {
++		u64 val = nla_get_u32(tb[TCA_FQ_CODEL_CE_THRESHOLD]);
++
++		q->cparams.ce_threshold = (val * NSEC_PER_USEC) >> CODEL_SHIFT;
++	}
++
+ 	if (tb[TCA_FQ_CODEL_INTERVAL]) {
+ 		u64 interval = nla_get_u32(tb[TCA_FQ_CODEL_INTERVAL]);
+ 
+@@ -451,6 +458,11 @@ static int fq_codel_dump(struct Qdisc *sch, struct sk_buff *skb)
+ 			q->flows_cnt))
+ 		goto nla_put_failure;
+ 
++	if (q->cparams.ce_threshold != CODEL_DISABLED_THRESHOLD &&
++	    nla_put_u32(skb, TCA_FQ_CODEL_CE_THRESHOLD,
++			codel_time_to_us(q->cparams.ce_threshold)))
++		goto nla_put_failure;
++
+ 	return nla_nest_end(skb, opts);
+ 
+ nla_put_failure:
+@@ -469,6 +481,7 @@ static int fq_codel_dump_stats(struct Qdisc *sch, struct gnet_dump *d)
+ 	st.qdisc_stats.drop_overlimit = q->drop_overlimit;
+ 	st.qdisc_stats.ecn_mark = q->cstats.ecn_mark;
+ 	st.qdisc_stats.new_flow_count = q->new_flow_count;
++	st.qdisc_stats.ce_mark = q->cstats.ce_mark;
+ 
+ 	list_for_each(pos, &q->new_flows)
+ 		st.qdisc_stats.new_flows_len++;
