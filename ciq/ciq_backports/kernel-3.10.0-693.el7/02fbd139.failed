@@ -1,0 +1,370 @@
+dax: Remove complete_unwritten argument
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jan Kara <jack@suse.cz>
+commit 02fbd139759feb1f331cebd858523b5d774082e6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/02fbd139.failed
+
+Fault handlers currently take complete_unwritten argument to convert
+unwritten extents after PTEs are updated. However no filesystem uses
+this anymore as the code is racy. Remove the unused argument.
+
+	Reviewed-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Vishal Verma <vishal.l.verma@intel.com>
+(cherry picked from commit 02fbd139759feb1f331cebd858523b5d774082e6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/block_dev.c
+#	fs/ext4/file.c
+#	include/linux/fs.h
+diff --cc fs/block_dev.c
+index 7d6ea6f10f58,b25bb230b28a..000000000000
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@@ -1808,6 -1724,72 +1808,75 @@@ static const struct address_space_opera
+  	.is_dirty_writeback = buffer_check_dirty_writeback,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_FS_DAX
++ /*
++  * In the raw block case we do not need to contend with truncation nor
++  * unwritten file extents.  Without those concerns there is no need for
++  * additional locking beyond the mmap_sem context that these routines
++  * are already executing under.
++  *
++  * Note, there is no protection if the block device is dynamically
++  * resized (partition grow/shrink) during a fault. A stable block device
++  * size is already not enforced in the blkdev_direct_IO path.
++  *
++  * For DAX, it is the responsibility of the block device driver to
++  * ensure the whole-disk device size is stable while requests are in
++  * flight.
++  *
++  * Finally, unlike the filemap_page_mkwrite() case there is no
++  * filesystem superblock to sync against freezing.  We still include a
++  * pfn_mkwrite callback for dax drivers to receive write fault
++  * notifications.
++  */
++ static int blkdev_dax_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
++ {
++ 	return __dax_fault(vma, vmf, blkdev_get_block);
++ }
++ 
++ static int blkdev_dax_pfn_mkwrite(struct vm_area_struct *vma,
++ 		struct vm_fault *vmf)
++ {
++ 	return dax_pfn_mkwrite(vma, vmf);
++ }
++ 
++ static int blkdev_dax_pmd_fault(struct vm_area_struct *vma, unsigned long addr,
++ 		pmd_t *pmd, unsigned int flags)
++ {
++ 	return __dax_pmd_fault(vma, addr, pmd, flags, blkdev_get_block);
++ }
++ 
++ static const struct vm_operations_struct blkdev_dax_vm_ops = {
++ 	.fault		= blkdev_dax_fault,
++ 	.pmd_fault	= blkdev_dax_pmd_fault,
++ 	.pfn_mkwrite	= blkdev_dax_pfn_mkwrite,
++ };
++ 
++ static const struct vm_operations_struct blkdev_default_vm_ops = {
++ 	.fault		= filemap_fault,
++ 	.map_pages	= filemap_map_pages,
++ };
++ 
++ static int blkdev_mmap(struct file *file, struct vm_area_struct *vma)
++ {
++ 	struct inode *bd_inode = bdev_file_inode(file);
++ 
++ 	file_accessed(file);
++ 	if (IS_DAX(bd_inode)) {
++ 		vma->vm_ops = &blkdev_dax_vm_ops;
++ 		vma->vm_flags |= VM_MIXEDMAP | VM_HUGEPAGE;
++ 	} else {
++ 		vma->vm_ops = &blkdev_default_vm_ops;
++ 	}
++ 
++ 	return 0;
++ }
++ #else
++ #define blkdev_mmap generic_file_mmap
++ #endif
++ 
+++>>>>>>> 02fbd139759f (dax: Remove complete_unwritten argument)
+  const struct file_operations def_blk_fops = {
+  	.open		= blkdev_open,
+  	.release	= blkdev_close,
+diff --cc fs/ext4/file.c
+index de8914c0fbc1,7a6398867ff2..000000000000
+--- a/fs/ext4/file.c
++++ b/fs/ext4/file.c
+@@@ -222,7 -207,7 +222,11 @@@ static int ext4_dax_fault(struct vm_are
+  	if (IS_ERR(handle))
+  		result = VM_FAULT_SIGBUS;
+  	else
+++<<<<<<< HEAD
+ +		result = __dax_fault(vma, vmf, ext4_dax_mmap_get_block, NULL);
+++=======
++ 		result = __dax_fault(vma, vmf, ext4_dax_get_block);
+++>>>>>>> 02fbd139759f (dax: Remove complete_unwritten argument)
+  
+  	if (write) {
+  		if (!IS_ERR(handle))
+@@@ -258,7 -243,7 +262,11 @@@ static int ext4_dax_pmd_fault(struct vm
+  		result = VM_FAULT_SIGBUS;
+  	else
+  		result = __dax_pmd_fault(vma, addr, pmd, flags,
+++<<<<<<< HEAD
+ +				ext4_dax_mmap_get_block, NULL);
+++=======
++ 					 ext4_dax_get_block);
+++>>>>>>> 02fbd139759f (dax: Remove complete_unwritten argument)
+  
+  	if (write) {
+  		if (!IS_ERR(handle))
+diff --cc include/linux/fs.h
+index 8dc175024e03,9f2813090d1b..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -64,10 -72,8 +64,15 @@@ extern int sysctl_protected_hardlinks
+  struct buffer_head;
+  typedef int (get_block_t)(struct inode *inode, sector_t iblock,
+  			struct buffer_head *bh_result, int create);
+++<<<<<<< HEAD
+ +typedef void (dio_iodone_t)(struct kiocb *iocb, loff_t offset,
+ +			ssize_t bytes, void *private, int ret,
+ +			bool is_async);
+ +typedef void (dax_iodone_t)(struct buffer_head *bh_map, int uptodate);
+++=======
++ typedef int (dio_iodone_t)(struct kiocb *iocb, loff_t offset,
++ 			ssize_t bytes, void *private);
+++>>>>>>> 02fbd139759f (dax: Remove complete_unwritten argument)
+  
+  #define MAY_EXEC		0x00000001
+  #define MAY_WRITE		0x00000002
+* Unmerged path fs/block_dev.c
+diff --git a/fs/dax.c b/fs/dax.c
+index ac0232cd059c..0f9f6992ef53 100644
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@ -622,19 +622,13 @@ static int dax_insert_mapping(struct inode *inode, struct buffer_head *bh,
+  * @vma: The virtual memory area where the fault occurred
+  * @vmf: The description of the fault
+  * @get_block: The filesystem method used to translate file offsets to blocks
+- * @complete_unwritten: The filesystem method used to convert unwritten blocks
+- *	to written so the data written to them is exposed. This is required for
+- *	required by write faults for filesystems that will return unwritten
+- *	extent mappings from @get_block, but it is optional for reads as
+- *	dax_insert_mapping() will always zero unwritten blocks. If the fs does
+- *	not support unwritten extents, the it should pass NULL.
+  *
+  * When a page fault occurs, filesystems may call this helper in their
+  * fault handler for DAX files. __dax_fault() assumes the caller has done all
+  * the necessary locking for the page fault to proceed successfully.
+  */
+ int __dax_fault(struct vm_area_struct *vma, struct vm_fault *vmf,
+-			get_block_t get_block, dax_iodone_t complete_unwritten)
++			get_block_t get_block)
+ {
+ 	struct file *file = vma->vm_file;
+ 	struct address_space *mapping = file->f_mapping;
+@@ -737,23 +731,9 @@ int __dax_fault(struct vm_area_struct *vma, struct vm_fault *vmf,
+ 		page = NULL;
+ 	}
+ 
+-	/*
+-	 * If we successfully insert the new mapping over an unwritten extent,
+-	 * we need to ensure we convert the unwritten extent. If there is an
+-	 * error inserting the mapping, the filesystem needs to leave it as
+-	 * unwritten to prevent exposure of the stale underlying data to
+-	 * userspace, but we still need to call the completion function so
+-	 * the private resources on the mapping buffer can be released. We
+-	 * indicate what the callback should do via the uptodate variable, same
+-	 * as for normal BH based IO completions.
+-	 */
++	/* Filesystem should not return unwritten buffers to us! */
++	WARN_ON_ONCE(buffer_unwritten(&bh));
+ 	error = dax_insert_mapping(inode, &bh, vma, vmf);
+-	if (buffer_unwritten(&bh)) {
+-		if (complete_unwritten)
+-			complete_unwritten(&bh, !error);
+-		else
+-			WARN_ON_ONCE(!(vmf->flags & FAULT_FLAG_WRITE));
+-	}
+ 
+  out:
+ 	if (error == -ENOMEM)
+@@ -782,7 +762,7 @@ EXPORT_SYMBOL(__dax_fault);
+  * fault handler for DAX files.
+  */
+ int dax_fault(struct vm_area_struct *vma, struct vm_fault *vmf,
+-	      get_block_t get_block, dax_iodone_t complete_unwritten)
++	      get_block_t get_block)
+ {
+ 	int result;
+ 	struct super_block *sb = file_inode(vma->vm_file)->i_sb;
+@@ -791,7 +771,7 @@ int dax_fault(struct vm_area_struct *vma, struct vm_fault *vmf,
+ 		sb_start_pagefault(sb);
+ 		file_update_time(vma->vm_file);
+ 	}
+-	result = __dax_fault(vma, vmf, get_block, complete_unwritten);
++	result = __dax_fault(vma, vmf, get_block);
+ 	if (vmf->flags & FAULT_FLAG_WRITE)
+ 		sb_end_pagefault(sb);
+ 
+@@ -807,8 +787,7 @@ EXPORT_SYMBOL_GPL(dax_fault);
+ #define PG_PMD_COLOUR	((PMD_SIZE >> PAGE_SHIFT) - 1)
+ 
+ int __dax_pmd_fault(struct vm_area_struct *vma, unsigned long address,
+-		pmd_t *pmd, unsigned int flags, get_block_t get_block,
+-		dax_iodone_t complete_unwritten)
++		pmd_t *pmd, unsigned int flags, get_block_t get_block)
+ {
+ 	struct file *file = vma->vm_file;
+ 	struct address_space *mapping = file->f_mapping;
+@@ -856,6 +835,7 @@ int __dax_pmd_fault(struct vm_area_struct *vma, unsigned long address,
+ 		if (get_block(inode, block, &bh, 1) != 0)
+ 			return VM_FAULT_SIGBUS;
+ 		alloc = true;
++		WARN_ON_ONCE(buffer_unwritten(&bh));
+ 	}
+ 
+ 	bdev = bh.b_bdev;
+@@ -987,9 +967,6 @@ int __dax_pmd_fault(struct vm_area_struct *vma, unsigned long address,
+  out:
+ 	mutex_unlock(&mapping->i_mmap_mutex);
+ 
+-	if (buffer_unwritten(&bh))
+-		complete_unwritten(&bh, !(result & VM_FAULT_ERROR));
+-
+ 	return result;
+ 
+  fallback:
+@@ -1009,8 +986,7 @@ EXPORT_SYMBOL_GPL(__dax_pmd_fault);
+  * pmd_fault handler for DAX files.
+  */
+ int dax_pmd_fault(struct vm_area_struct *vma, unsigned long address,
+-			pmd_t *pmd, unsigned int flags, get_block_t get_block,
+-			dax_iodone_t complete_unwritten)
++			pmd_t *pmd, unsigned int flags, get_block_t get_block)
+ {
+ 	int result;
+ 	struct super_block *sb = file_inode(vma->vm_file)->i_sb;
+@@ -1019,8 +995,7 @@ int dax_pmd_fault(struct vm_area_struct *vma, unsigned long address,
+ 		sb_start_pagefault(sb);
+ 		file_update_time(vma->vm_file);
+ 	}
+-	result = __dax_pmd_fault(vma, address, pmd, flags, get_block,
+-				complete_unwritten);
++	result = __dax_pmd_fault(vma, address, pmd, flags, get_block);
+ 	if (flags & FAULT_FLAG_WRITE)
+ 		sb_end_pagefault(sb);
+ 
+diff --git a/fs/ext2/file.c b/fs/ext2/file.c
+index 97f094d5601e..597f23f77b5d 100644
+--- a/fs/ext2/file.c
++++ b/fs/ext2/file.c
+@@ -51,7 +51,7 @@ static int ext2_dax_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
+ 	}
+ 	down_read(&ei->dax_sem);
+ 
+-	ret = __dax_fault(vma, vmf, ext2_get_block, NULL);
++	ret = __dax_fault(vma, vmf, ext2_get_block);
+ 
+ 	up_read(&ei->dax_sem);
+ 	if (vmf->flags & FAULT_FLAG_WRITE)
+@@ -72,7 +72,7 @@ static int ext2_dax_pmd_fault(struct vm_area_struct *vma, unsigned long addr,
+ 	}
+ 	down_read(&ei->dax_sem);
+ 
+-	ret = __dax_pmd_fault(vma, addr, pmd, flags, ext2_get_block, NULL);
++	ret = __dax_pmd_fault(vma, addr, pmd, flags, ext2_get_block);
+ 
+ 	up_read(&ei->dax_sem);
+ 	if (flags & FAULT_FLAG_WRITE)
+* Unmerged path fs/ext4/file.c
+diff --git a/fs/xfs/xfs_file.c b/fs/xfs/xfs_file.c
+index 815d8f3721f9..6aa7ce7b8106 100644
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@ -1595,7 +1595,7 @@ xfs_filemap_page_mkwrite(
+ 	xfs_ilock(XFS_I(inode), XFS_MMAPLOCK_SHARED);
+ 
+ 	if (IS_DAX(inode)) {
+-		ret = __dax_mkwrite(vma, vmf, xfs_get_blocks_dax_fault, NULL);
++		ret = __dax_mkwrite(vma, vmf, xfs_get_blocks_dax_fault);
+ 	} else {
+ 		ret = __block_page_mkwrite(vma, vmf, xfs_get_blocks);
+ 		ret = block_page_mkwrite_return(ret);
+@@ -1629,7 +1629,7 @@ xfs_filemap_fault(
+ 		 * changes to xfs_get_blocks_direct() to map unwritten extent
+ 		 * ioend for conversion on read-only mappings.
+ 		 */
+-		ret = __dax_fault(vma, vmf, xfs_get_blocks_dax_fault, NULL);
++		ret = __dax_fault(vma, vmf, xfs_get_blocks_dax_fault);
+ 	} else
+ 		ret = filemap_fault(vma, vmf);
+ 	xfs_iunlock(XFS_I(inode), XFS_MMAPLOCK_SHARED);
+@@ -1666,8 +1666,7 @@ xfs_filemap_pmd_fault(
+ 	}
+ 
+ 	xfs_ilock(XFS_I(inode), XFS_MMAPLOCK_SHARED);
+-	ret = __dax_pmd_fault(vma, addr, pmd, flags, xfs_get_blocks_dax_fault,
+-			      NULL);
++	ret = __dax_pmd_fault(vma, addr, pmd, flags, xfs_get_blocks_dax_fault);
+ 	xfs_iunlock(XFS_I(inode), XFS_MMAPLOCK_SHARED);
+ 
+ 	if (flags & FAULT_FLAG_WRITE)
+diff --git a/include/linux/dax.h b/include/linux/dax.h
+index bbe07d8b9dee..a82e64325001 100644
+--- a/include/linux/dax.h
++++ b/include/linux/dax.h
+@@ -11,10 +11,8 @@ ssize_t dax_do_io(int rw, struct kiocb *iocb, struct inode *inode,
+ int dax_clear_sectors(struct block_device *bdev, sector_t _sector, long _size);
+ int dax_zero_page_range(struct inode *, loff_t from, unsigned len, get_block_t);
+ int dax_truncate_page(struct inode *, loff_t from, get_block_t);
+-int dax_fault(struct vm_area_struct *, struct vm_fault *, get_block_t,
+-		dax_iodone_t);
+-int __dax_fault(struct vm_area_struct *, struct vm_fault *, get_block_t,
+-		dax_iodone_t);
++int dax_fault(struct vm_area_struct *, struct vm_fault *, get_block_t);
++int __dax_fault(struct vm_area_struct *, struct vm_fault *, get_block_t);
+ 
+ #ifdef CONFIG_FS_DAX
+ struct page *read_dax_sector(struct block_device *bdev, sector_t n);
+@@ -28,21 +26,20 @@ static inline struct page *read_dax_sector(struct block_device *bdev,
+ 
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ int dax_pmd_fault(struct vm_area_struct *, unsigned long addr, pmd_t *,
+-				unsigned int flags, get_block_t, dax_iodone_t);
++				unsigned int flags, get_block_t);
+ int __dax_pmd_fault(struct vm_area_struct *, unsigned long addr, pmd_t *,
+-				unsigned int flags, get_block_t, dax_iodone_t);
++				unsigned int flags, get_block_t);
+ #else
+ static inline int dax_pmd_fault(struct vm_area_struct *vma, unsigned long addr,
+-				pmd_t *pmd, unsigned int flags, get_block_t gb,
+-				dax_iodone_t di)
++				pmd_t *pmd, unsigned int flags, get_block_t gb)
+ {
+ 	return VM_FAULT_FALLBACK;
+ }
+ #define __dax_pmd_fault dax_pmd_fault
+ #endif
+ int dax_pfn_mkwrite(struct vm_area_struct *, struct vm_fault *);
+-#define dax_mkwrite(vma, vmf, gb, iod)		dax_fault(vma, vmf, gb, iod)
+-#define __dax_mkwrite(vma, vmf, gb, iod)	__dax_fault(vma, vmf, gb, iod)
++#define dax_mkwrite(vma, vmf, gb)	dax_fault(vma, vmf, gb)
++#define __dax_mkwrite(vma, vmf, gb)	__dax_fault(vma, vmf, gb)
+ 
+ static inline bool vma_is_dax(struct vm_area_struct *vma)
+ {
+* Unmerged path include/linux/fs.h
