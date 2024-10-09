@@ -1,0 +1,159 @@
+dax: introduce a fs_dax_get_by_bdev() helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 78f35473508118df5ea04b9515ac3f1aaec0a980
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/78f35473.failed
+
+Add a helper that can replace the following common pattern:
+
+	if (blk_queue_dax(bdev->bd_queue))
+		fs_dax_get_by_host(bdev->bd_disk->disk_name);
+
+This will be used to move dax_device lookup from iomap-operation time to
+fs-mount time.
+
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 78f35473508118df5ea04b9515ac3f1aaec0a980)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/dax.h
+diff --cc include/linux/dax.h
+index b7b81d6cc271,ac8afa18f707..000000000000
+--- a/include/linux/dax.h
++++ b/include/linux/dax.h
+@@@ -6,6 -6,95 +6,98 @@@
+  #include <linux/radix-tree.h>
+  #include <asm/pgtable.h>
+  
+++<<<<<<< HEAD
+++=======
++ struct iomap_ops;
++ struct dax_device;
++ struct dax_operations {
++ 	/*
++ 	 * direct_access: translate a device-relative
++ 	 * logical-page-offset into an absolute physical pfn. Return the
++ 	 * number of pages available for DAX at that pfn.
++ 	 */
++ 	long (*direct_access)(struct dax_device *, pgoff_t, long,
++ 			void **, pfn_t *);
++ 	/* copy_from_iter: required operation for fs-dax direct-i/o */
++ 	size_t (*copy_from_iter)(struct dax_device *, pgoff_t, void *, size_t,
++ 			struct iov_iter *);
++ 	/* flush: optional driver-specific cache management after writes */
++ 	void (*flush)(struct dax_device *, pgoff_t, void *, size_t);
++ };
++ 
++ extern struct attribute_group dax_attribute_group;
++ 
++ #if IS_ENABLED(CONFIG_DAX)
++ struct dax_device *dax_get_by_host(const char *host);
++ void put_dax(struct dax_device *dax_dev);
++ #else
++ static inline struct dax_device *dax_get_by_host(const char *host)
++ {
++ 	return NULL;
++ }
++ 
++ static inline void put_dax(struct dax_device *dax_dev)
++ {
++ }
++ #endif
++ 
++ int bdev_dax_pgoff(struct block_device *, sector_t, size_t, pgoff_t *pgoff);
++ #if IS_ENABLED(CONFIG_FS_DAX)
++ int __bdev_dax_supported(struct super_block *sb, int blocksize);
++ static inline int bdev_dax_supported(struct super_block *sb, int blocksize)
++ {
++ 	return __bdev_dax_supported(sb, blocksize);
++ }
++ 
++ static inline struct dax_device *fs_dax_get_by_host(const char *host)
++ {
++ 	return dax_get_by_host(host);
++ }
++ 
++ static inline void fs_put_dax(struct dax_device *dax_dev)
++ {
++ 	put_dax(dax_dev);
++ }
++ 
++ struct dax_device *fs_dax_get_by_bdev(struct block_device *bdev);
++ #else
++ static inline int bdev_dax_supported(struct super_block *sb, int blocksize)
++ {
++ 	return -EOPNOTSUPP;
++ }
++ 
++ static inline struct dax_device *fs_dax_get_by_host(const char *host)
++ {
++ 	return NULL;
++ }
++ 
++ static inline void fs_put_dax(struct dax_device *dax_dev)
++ {
++ }
++ 
++ static inline struct dax_device *fs_dax_get_by_bdev(struct block_device *bdev)
++ {
++ 	return NULL;
++ }
++ #endif
++ 
++ int dax_read_lock(void);
++ void dax_read_unlock(int id);
++ struct dax_device *alloc_dax(void *private, const char *host,
++ 		const struct dax_operations *ops);
++ bool dax_alive(struct dax_device *dax_dev);
++ void kill_dax(struct dax_device *dax_dev);
++ void *dax_get_private(struct dax_device *dax_dev);
++ long dax_direct_access(struct dax_device *dax_dev, pgoff_t pgoff, long nr_pages,
++ 		void **kaddr, pfn_t *pfn);
++ size_t dax_copy_from_iter(struct dax_device *dax_dev, pgoff_t pgoff, void *addr,
++ 		size_t bytes, struct iov_iter *i);
++ void dax_flush(struct dax_device *dax_dev, pgoff_t pgoff, void *addr,
++ 		size_t size);
++ void dax_write_cache(struct dax_device *dax_dev, bool wc);
++ bool dax_write_cache_enabled(struct dax_device *dax_dev);
++ 
+++>>>>>>> 78f354735081 (dax: introduce a fs_dax_get_by_bdev() helper)
+  /*
+   * We use lowest available bit in exceptional entry for locking, one bit for
+   * the entry size (PMD) and two more to tell us if the entry is a huge zero
+diff --git a/drivers/dax/super.c b/drivers/dax/super.c
+index bc81d3253618..57042831c424 100644
+--- a/drivers/dax/super.c
++++ b/drivers/dax/super.c
+@@ -48,6 +48,8 @@ void dax_read_unlock(int id)
+ EXPORT_SYMBOL_GPL(dax_read_unlock);
+ 
+ #ifdef CONFIG_BLOCK
++#include <linux/blkdev.h>
++
+ int bdev_dax_pgoff(struct block_device *bdev, sector_t sector, size_t size,
+ 		pgoff_t *pgoff)
+ {
+@@ -61,6 +63,14 @@ int bdev_dax_pgoff(struct block_device *bdev, sector_t sector, size_t size,
+ }
+ EXPORT_SYMBOL(bdev_dax_pgoff);
+ 
++struct dax_device *fs_dax_get_by_bdev(struct block_device *bdev)
++{
++	if (!blk_queue_dax(bdev->bd_queue))
++		return NULL;
++	return fs_dax_get_by_host(bdev->bd_disk->disk_name);
++}
++EXPORT_SYMBOL_GPL(fs_dax_get_by_bdev);
++
+ /**
+  * __bdev_dax_supported() - Check if the device supports dax for filesystem
+  * @sb: The superblock of the device
+* Unmerged path include/linux/dax.h
