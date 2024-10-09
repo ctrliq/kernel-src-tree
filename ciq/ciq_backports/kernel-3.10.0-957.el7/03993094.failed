@@ -1,0 +1,657 @@
+xdp: transition into using xdp_frame for return API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jesper Dangaard Brouer <brouer@redhat.com>
+commit 039930945a72d9af5ff04ae9b9e60658a52e0770
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/03993094.failed
+
+Changing API xdp_return_frame() to take struct xdp_frame as argument,
+seems like a natural choice. But there are some subtle performance
+details here that needs extra care, which is a deliberate choice.
+
+When de-referencing xdp_frame on a remote CPU during DMA-TX
+completion, result in the cache-line is change to "Shared"
+state. Later when the page is reused for RX, then this xdp_frame
+cache-line is written, which change the state to "Modified".
+
+This situation already happens (naturally) for, virtio_net, tun and
+cpumap as the xdp_frame pointer is the queued object.  In tun and
+cpumap, the ptr_ring is used for efficiently transferring cache-lines
+(with pointers) between CPUs. Thus, the only option is to
+de-referencing xdp_frame.
+
+It is only the ixgbe driver that had an optimization, in which it can
+avoid doing the de-reference of xdp_frame.  The driver already have
+TX-ring queue, which (in case of remote DMA-TX completion) have to be
+transferred between CPUs anyhow.  In this data area, we stored a
+struct xdp_mem_info and a data pointer, which allowed us to avoid
+de-referencing xdp_frame.
+
+To compensate for this, a prefetchw is used for telling the cache
+coherency protocol about our access pattern.  My benchmarks show that
+this prefetchw is enough to compensate the ixgbe driver.
+
+V7: Adjust for commit d9314c474d4f ("i40e: add support for XDP_REDIRECT")
+V8: Adjust for commit bd658dda4237 ("net/mlx5e: Separate dma base address
+and offset in dma_sync call")
+
+	Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 039930945a72d9af5ff04ae9b9e60658a52e0770)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/i40e/i40e_txrx.c
+#	drivers/net/ethernet/intel/ixgbe/ixgbe.h
+#	drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+#	drivers/net/tun.c
+#	drivers/net/virtio_net.c
+#	include/net/xdp.h
+#	kernel/bpf/cpumap.c
+#	net/core/xdp.c
+diff --cc drivers/net/ethernet/intel/i40e/i40e_txrx.c
+index 3b4ef0138639,c8bf4d35fdea..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_txrx.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_txrx.c
+@@@ -630,6 -637,8 +630,11 @@@ static void i40e_unmap_and_free_tx_reso
+  	if (tx_buffer->skb) {
+  		if (tx_buffer->tx_flags & I40E_TX_FLAGS_FD_SB)
+  			kfree(tx_buffer->raw_buf);
+++<<<<<<< HEAD
+++=======
++ 		else if (ring_is_xdp(ring))
++ 			xdp_return_frame(tx_buffer->xdpf);
+++>>>>>>> 039930945a72 (xdp: transition into using xdp_frame for return API)
+  		else
+  			dev_kfree_skb_any(tx_buffer->skb);
+  		if (dma_unmap_len(tx_buffer, len))
+@@@ -771,8 -839,11 +776,16 @@@ static bool i40e_clean_tx_irq(struct i4
+  		total_bytes += tx_buf->bytecount;
+  		total_packets += tx_buf->gso_segs;
+  
+++<<<<<<< HEAD
+ +		/* free the skb */
+ +		napi_consume_skb(tx_buf->skb, napi_budget);
+++=======
++ 		/* free the skb/XDP data */
++ 		if (ring_is_xdp(tx_ring))
++ 			xdp_return_frame(tx_buf->xdpf);
++ 		else
++ 			napi_consume_skb(tx_buf->skb, napi_budget);
+++>>>>>>> 039930945a72 (xdp: transition into using xdp_frame for return API)
+  
+  		/* unmap skb header data */
+  		dma_unmap_single(tx_ring->dev,
+diff --cc drivers/net/ethernet/intel/ixgbe/ixgbe.h
+index 3a841dcc90f6,7dd5038cfcc4..000000000000
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe.h
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe.h
+@@@ -237,7 -239,10 +237,14 @@@ struct vf_macvlans 
+  struct ixgbe_tx_buffer {
+  	union ixgbe_adv_tx_desc *next_to_watch;
+  	unsigned long time_stamp;
+++<<<<<<< HEAD
+ +	struct sk_buff *skb;
+++=======
++ 	union {
++ 		struct sk_buff *skb;
++ 		struct xdp_frame *xdpf;
++ 	};
+++>>>>>>> 039930945a72 (xdp: transition into using xdp_frame for return API)
+  	unsigned int bytecount;
+  	unsigned short gso_segs;
+  	__be16 protocol;
+diff --cc drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+index bc2d9678add4,4f2864165723..000000000000
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@@ -1190,7 -1215,10 +1190,14 @@@ static bool ixgbe_clean_tx_irq(struct i
+  			total_ipsec++;
+  
+  		/* free the skb */
+++<<<<<<< HEAD
+ +		napi_consume_skb(tx_buffer->skb, napi_budget);
+++=======
++ 		if (ring_is_xdp(tx_ring))
++ 			xdp_return_frame(tx_buffer->xdpf);
++ 		else
++ 			napi_consume_skb(tx_buffer->skb, napi_budget);
+++>>>>>>> 039930945a72 (xdp: transition into using xdp_frame for return API)
+  
+  		/* unmap skb header data */
+  		dma_unmap_single(tx_ring->dev,
+@@@ -2249,14 -2379,36 +2256,39 @@@ static int ixgbe_clean_rx_irq(struct ix
+  		rx_buffer = ixgbe_get_rx_buffer(rx_ring, rx_desc, &skb, size);
+  
+  		/* retrieve a buffer from the ring */
+++<<<<<<< HEAD
+ +		if (skb)
+++=======
++ 		if (!skb) {
++ 			xdp.data = page_address(rx_buffer->page) +
++ 				   rx_buffer->page_offset;
++ 			xdp.data_meta = xdp.data;
++ 			xdp.data_hard_start = xdp.data -
++ 					      ixgbe_rx_offset(rx_ring);
++ 			xdp.data_end = xdp.data + size;
++ 			prefetchw(xdp.data_hard_start); /* xdp_frame write */
++ 
++ 			skb = ixgbe_run_xdp(adapter, rx_ring, &xdp);
++ 		}
++ 
++ 		if (IS_ERR(skb)) {
++ 			if (PTR_ERR(skb) == -IXGBE_XDP_TX) {
++ 				xdp_xmit = true;
++ 				ixgbe_rx_buffer_flip(rx_ring, rx_buffer, size);
++ 			} else {
++ 				rx_buffer->pagecnt_bias++;
++ 			}
++ 			total_rx_packets++;
++ 			total_rx_bytes += size;
++ 		} else if (skb) {
+++>>>>>>> 039930945a72 (xdp: transition into using xdp_frame for return API)
+  			ixgbe_add_rx_frag(rx_ring, rx_buffer, skb, size);
+ -		} else if (ring_uses_build_skb(rx_ring)) {
+ +		else if (ring_uses_build_skb(rx_ring))
+  			skb = ixgbe_build_skb(rx_ring, rx_buffer,
+ -					      &xdp, rx_desc);
+ -		} else {
+ +					      rx_desc, size);
+ +		else
+  			skb = ixgbe_construct_skb(rx_ring, rx_buffer,
+ -						  &xdp, rx_desc);
+ -		}
+ +						  rx_desc, size);
+  
+  		/* exit if we failed to retrieve a buffer */
+  		if (!skb) {
+@@@ -5667,7 -5797,10 +5699,14 @@@ static void ixgbe_clean_tx_ring(struct 
+  		union ixgbe_adv_tx_desc *eop_desc, *tx_desc;
+  
+  		/* Free all the Tx ring sk_buffs */
+++<<<<<<< HEAD
+ +		dev_kfree_skb_any(tx_buffer->skb);
+++=======
++ 		if (ring_is_xdp(tx_ring))
++ 			xdp_return_frame(tx_buffer->xdpf);
++ 		else
++ 			dev_kfree_skb_any(tx_buffer->skb);
+++>>>>>>> 039930945a72 (xdp: transition into using xdp_frame for return API)
+  
+  		/* unmap skb header data */
+  		dma_unmap_single(tx_ring->dev,
+@@@ -8191,6 -8343,68 +8230,71 @@@ static u16 ixgbe_select_queue(struct ne
+  #endif
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int ixgbe_xmit_xdp_ring(struct ixgbe_adapter *adapter,
++ 			       struct xdp_buff *xdp)
++ {
++ 	struct ixgbe_ring *ring = adapter->xdp_ring[smp_processor_id()];
++ 	struct ixgbe_tx_buffer *tx_buffer;
++ 	union ixgbe_adv_tx_desc *tx_desc;
++ 	struct xdp_frame *xdpf;
++ 	u32 len, cmd_type;
++ 	dma_addr_t dma;
++ 	u16 i;
++ 
++ 	xdpf = convert_to_xdp_frame(xdp);
++ 	if (unlikely(!xdpf))
++ 		return -EOVERFLOW;
++ 
++ 	len = xdpf->len;
++ 
++ 	if (unlikely(!ixgbe_desc_unused(ring)))
++ 		return IXGBE_XDP_CONSUMED;
++ 
++ 	dma = dma_map_single(ring->dev, xdpf->data, len, DMA_TO_DEVICE);
++ 	if (dma_mapping_error(ring->dev, dma))
++ 		return IXGBE_XDP_CONSUMED;
++ 
++ 	/* record the location of the first descriptor for this packet */
++ 	tx_buffer = &ring->tx_buffer_info[ring->next_to_use];
++ 	tx_buffer->bytecount = len;
++ 	tx_buffer->gso_segs = 1;
++ 	tx_buffer->protocol = 0;
++ 
++ 	i = ring->next_to_use;
++ 	tx_desc = IXGBE_TX_DESC(ring, i);
++ 
++ 	dma_unmap_len_set(tx_buffer, len, len);
++ 	dma_unmap_addr_set(tx_buffer, dma, dma);
++ 	tx_buffer->xdpf = xdpf;
++ 
++ 	tx_desc->read.buffer_addr = cpu_to_le64(dma);
++ 
++ 	/* put descriptor type bits */
++ 	cmd_type = IXGBE_ADVTXD_DTYP_DATA |
++ 		   IXGBE_ADVTXD_DCMD_DEXT |
++ 		   IXGBE_ADVTXD_DCMD_IFCS;
++ 	cmd_type |= len | IXGBE_TXD_CMD;
++ 	tx_desc->read.cmd_type_len = cpu_to_le32(cmd_type);
++ 	tx_desc->read.olinfo_status =
++ 		cpu_to_le32(len << IXGBE_ADVTXD_PAYLEN_SHIFT);
++ 
++ 	/* Avoid any potential race with xdp_xmit and cleanup */
++ 	smp_wmb();
++ 
++ 	/* set next_to_watch value indicating a packet is present */
++ 	i++;
++ 	if (i == ring->count)
++ 		i = 0;
++ 
++ 	tx_buffer->next_to_watch = tx_desc;
++ 	ring->next_to_use = i;
++ 
++ 	return IXGBE_XDP_TX;
++ }
++ 
+++>>>>>>> 039930945a72 (xdp: transition into using xdp_frame for return API)
+  netdev_tx_t ixgbe_xmit_frame_ring(struct sk_buff *skb,
+  			  struct ixgbe_adapter *adapter,
+  			  struct ixgbe_ring *tx_ring)
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index f75f2c655534,7bbf0db27a01..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -747,10 -888,9 +747,16 @@@ struct sk_buff *skb_from_cqe(struct mlx
+  	data           = va + rx_headroom;
+  	frag_size      = MLX5_SKB_FRAG_SZ(rx_headroom + cqe_bcnt);
+  
+++<<<<<<< HEAD
+ +	dma_sync_single_range_for_cpu(rq->pdev,
+ +				      di->addr + wi->offset,
+ +				      0, frag_size,
+ +				      DMA_FROM_DEVICE);
+++=======
++ 	dma_sync_single_range_for_cpu(rq->pdev, di->addr, wi->offset,
++ 				      frag_size, DMA_FROM_DEVICE);
++ 	prefetchw(va); /* xdp_frame data area */
+++>>>>>>> 039930945a72 (xdp: transition into using xdp_frame for return API)
+  	prefetch(data);
+  	wi->offset += frag_size;
+  
+diff --cc drivers/net/tun.c
+index 3c46a6b55234,bec130cdbd9d..000000000000
+--- a/drivers/net/tun.c
++++ b/drivers/net/tun.c
+@@@ -505,14 -656,38 +505,31 @@@ static struct tun_struct *tun_enable_qu
+  	return tun;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void tun_ptr_free(void *ptr)
++ {
++ 	if (!ptr)
++ 		return;
++ 	if (tun_is_xdp_frame(ptr)) {
++ 		struct xdp_frame *xdpf = tun_ptr_to_xdp(ptr);
++ 
++ 		xdp_return_frame(xdpf);
++ 	} else {
++ 		__skb_array_destroy_skb(ptr);
++ 	}
++ }
++ EXPORT_SYMBOL_GPL(tun_ptr_free);
++ 
+++>>>>>>> 039930945a72 (xdp: transition into using xdp_frame for return API)
+  static void tun_queue_purge(struct tun_file *tfile)
+  {
+ -	void *ptr;
+ +	struct sk_buff *skb;
+  
+ -	while ((ptr = ptr_ring_consume(&tfile->tx_ring)) != NULL)
+ -		tun_ptr_free(ptr);
+ +	while ((skb = skb_array_consume(&tfile->tx_array)) != NULL)
+ +		kfree_skb(skb);
+  
+  	skb_queue_purge(&tfile->sk.sk_write_queue);
+ -	skb_queue_purge(&tfile->sk.sk_error_queue);
+ -}
+ -
+ -static void tun_cleanup_tx_ring(struct tun_file *tfile)
+ -{
+ -	if (tfile->tx_ring.queue) {
+ -		ptr_ring_cleanup(&tfile->tx_ring, tun_ptr_free);
+ -		xdp_rxq_info_unreg(&tfile->xdp_rxq);
+ -		memset(&tfile->tx_ring, 0, sizeof(tfile->tx_ring));
+ -	}
+  }
+  
+  static void __tun_detach(struct tun_file *tfile, bool clean)
+@@@ -1652,19 -2180,32 +1669,36 @@@ static ssize_t tun_do_read(struct tun_s
+  
+  	tun_debug(KERN_INFO, tun, "tun_do_read\n");
+  
+ -	if (!iov_iter_count(to)) {
+ -		tun_ptr_free(ptr);
+ +	if (!len)
+  		return 0;
+ -	}
+  
+ -	if (!ptr) {
+ -		/* Read frames from ring */
+ -		ptr = tun_ring_recv(tfile, noblock, &err);
+ -		if (!ptr)
+ -			return err;
+ -	}
+ +	/* Read frames from ring */
+ +	skb = tun_ring_recv(tun, tfile, noblock, &err);
+ +	if (!skb)
+ +		return err;
+  
+++<<<<<<< HEAD
+ +	ret = tun_put_user(tun, tfile, skb, iv, len);
+ +	if (unlikely(ret < 0))
+ +		kfree_skb(skb);
+ +	else
+ +		consume_skb(skb);
+++=======
++ 	if (tun_is_xdp_frame(ptr)) {
++ 		struct xdp_frame *xdpf = tun_ptr_to_xdp(ptr);
++ 
++ 		ret = tun_put_user_xdp(tun, tfile, xdpf, to);
++ 		xdp_return_frame(xdpf);
++ 	} else {
++ 		struct sk_buff *skb = ptr;
++ 
++ 		ret = tun_put_user(tun, tfile, skb, to);
++ 		if (unlikely(ret < 0))
++ 			kfree_skb(skb);
++ 		else
++ 			consume_skb(skb);
++ 	}
+++>>>>>>> 039930945a72 (xdp: transition into using xdp_frame for return API)
+  
+  	return ret;
+  }
+diff --cc drivers/net/virtio_net.c
+index 7b0841ddd139,ab3d7cbc4c49..000000000000
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@@ -288,14 -403,260 +288,174 @@@ static struct sk_buff *page_to_skb(stru
+  	return skb;
+  }
+  
+ -static void virtnet_xdp_flush(struct net_device *dev)
+ +static struct sk_buff *receive_small(struct virtnet_info *vi, void *buf, unsigned int len)
+  {
+++<<<<<<< HEAD
+ +	struct sk_buff * skb = buf;
+++=======
++ 	struct virtnet_info *vi = netdev_priv(dev);
++ 	struct send_queue *sq;
++ 	unsigned int qp;
++ 
++ 	qp = vi->curr_queue_pairs - vi->xdp_queue_pairs + smp_processor_id();
++ 	sq = &vi->sq[qp];
++ 
++ 	virtqueue_kick(sq->vq);
++ }
++ 
++ static int __virtnet_xdp_xmit(struct virtnet_info *vi,
++ 			      struct xdp_buff *xdp)
++ {
++ 	struct virtio_net_hdr_mrg_rxbuf *hdr;
++ 	struct xdp_frame *xdpf, *xdpf_sent;
++ 	struct send_queue *sq;
++ 	unsigned int len;
++ 	unsigned int qp;
++ 	int err;
++ 
++ 	qp = vi->curr_queue_pairs - vi->xdp_queue_pairs + smp_processor_id();
++ 	sq = &vi->sq[qp];
++ 
++ 	/* Free up any pending old buffers before queueing new ones. */
++ 	while ((xdpf_sent = virtqueue_get_buf(sq->vq, &len)) != NULL)
++ 		xdp_return_frame(xdpf_sent);
++ 
++ 	xdpf = convert_to_xdp_frame(xdp);
++ 	if (unlikely(!xdpf))
++ 		return -EOVERFLOW;
++ 
++ 	/* virtqueue want to use data area in-front of packet */
++ 	if (unlikely(xdpf->metasize > 0))
++ 		return -EOPNOTSUPP;
++ 
++ 	if (unlikely(xdpf->headroom < vi->hdr_len))
++ 		return -EOVERFLOW;
++ 
++ 	/* Make room for virtqueue hdr (also change xdpf->headroom?) */
++ 	xdpf->data -= vi->hdr_len;
++ 	/* Zero header and leave csum up to XDP layers */
++ 	hdr = xdpf->data;
++ 	memset(hdr, 0, vi->hdr_len);
++ 	xdpf->len   += vi->hdr_len;
++ 
++ 	sg_init_one(sq->sg, xdpf->data, xdpf->len);
++ 
++ 	err = virtqueue_add_outbuf(sq->vq, sq->sg, 1, xdpf, GFP_ATOMIC);
++ 	if (unlikely(err))
++ 		return -ENOSPC; /* Caller handle free/refcnt */
++ 
++ 	return 0;
++ }
++ 
++ static int virtnet_xdp_xmit(struct net_device *dev, struct xdp_buff *xdp)
++ {
++ 	struct virtnet_info *vi = netdev_priv(dev);
++ 	struct receive_queue *rq = vi->rq;
++ 	struct bpf_prog *xdp_prog;
++ 
++ 	/* Only allow ndo_xdp_xmit if XDP is loaded on dev, as this
++ 	 * indicate XDP resources have been successfully allocated.
++ 	 */
++ 	xdp_prog = rcu_dereference(rq->xdp_prog);
++ 	if (!xdp_prog)
++ 		return -ENXIO;
++ 
++ 	return __virtnet_xdp_xmit(vi, xdp);
++ }
++ 
++ static unsigned int virtnet_get_headroom(struct virtnet_info *vi)
++ {
++ 	return vi->xdp_queue_pairs ? VIRTIO_XDP_HEADROOM : 0;
++ }
++ 
++ /* We copy the packet for XDP in the following cases:
++  *
++  * 1) Packet is scattered across multiple rx buffers.
++  * 2) Headroom space is insufficient.
++  *
++  * This is inefficient but it's a temporary condition that
++  * we hit right after XDP is enabled and until queue is refilled
++  * with large buffers with sufficient headroom - so it should affect
++  * at most queue size packets.
++  * Afterwards, the conditions to enable
++  * XDP should preclude the underlying device from sending packets
++  * across multiple buffers (num_buf > 1), and we make sure buffers
++  * have enough headroom.
++  */
++ static struct page *xdp_linearize_page(struct receive_queue *rq,
++ 				       u16 *num_buf,
++ 				       struct page *p,
++ 				       int offset,
++ 				       int page_off,
++ 				       unsigned int *len)
++ {
++ 	struct page *page = alloc_page(GFP_ATOMIC);
++ 
++ 	if (!page)
++ 		return NULL;
++ 
++ 	memcpy(page_address(page) + page_off, page_address(p) + offset, *len);
++ 	page_off += *len;
++ 
++ 	while (--*num_buf) {
++ 		int tailroom = SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
++ 		unsigned int buflen;
++ 		void *buf;
++ 		int off;
++ 
++ 		buf = virtqueue_get_buf(rq->vq, &buflen);
++ 		if (unlikely(!buf))
++ 			goto err_buf;
++ 
++ 		p = virt_to_head_page(buf);
++ 		off = buf - page_address(p);
++ 
++ 		/* guard against a misconfigured or uncooperative backend that
++ 		 * is sending packet larger than the MTU.
++ 		 */
++ 		if ((page_off + buflen + tailroom) > PAGE_SIZE) {
++ 			put_page(p);
++ 			goto err_buf;
++ 		}
++ 
++ 		memcpy(page_address(page) + page_off,
++ 		       page_address(p) + off, buflen);
++ 		page_off += buflen;
++ 		put_page(p);
++ 	}
++ 
++ 	/* Headroom does not contribute to packet length */
++ 	*len = page_off - VIRTIO_XDP_HEADROOM;
++ 	return page;
++ err_buf:
++ 	__free_pages(page, 0);
++ 	return NULL;
++ }
++ 
++ static struct sk_buff *receive_small(struct net_device *dev,
++ 				     struct virtnet_info *vi,
++ 				     struct receive_queue *rq,
++ 				     void *buf, void *ctx,
++ 				     unsigned int len,
++ 				     bool *xdp_xmit)
++ {
++ 	struct sk_buff *skb;
++ 	struct bpf_prog *xdp_prog;
++ 	unsigned int xdp_headroom = (unsigned long)ctx;
++ 	unsigned int header_offset = VIRTNET_RX_PAD + xdp_headroom;
++ 	unsigned int headroom = vi->hdr_len + header_offset;
++ 	unsigned int buflen = SKB_DATA_ALIGN(GOOD_PACKET_LEN + headroom) +
++ 			      SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
++ 	struct page *page = virt_to_head_page(buf);
++ 	unsigned int delta = 0;
++ 	struct page *xdp_page;
++ 	int err;
+++>>>>>>> 039930945a72 (xdp: transition into using xdp_frame for return API)
+  
+  	len -= vi->hdr_len;
+ +	skb_trim(skb, len);
+  
+ -	rcu_read_lock();
+ -	xdp_prog = rcu_dereference(rq->xdp_prog);
+ -	if (xdp_prog) {
+ -		struct virtio_net_hdr_mrg_rxbuf *hdr = buf + header_offset;
+ -		struct xdp_buff xdp;
+ -		void *orig_data;
+ -		u32 act;
+ -
+ -		if (unlikely(hdr->hdr.gso_type))
+ -			goto err_xdp;
+ -
+ -		if (unlikely(xdp_headroom < virtnet_get_headroom(vi))) {
+ -			int offset = buf - page_address(page) + header_offset;
+ -			unsigned int tlen = len + vi->hdr_len;
+ -			u16 num_buf = 1;
+ -
+ -			xdp_headroom = virtnet_get_headroom(vi);
+ -			header_offset = VIRTNET_RX_PAD + xdp_headroom;
+ -			headroom = vi->hdr_len + header_offset;
+ -			buflen = SKB_DATA_ALIGN(GOOD_PACKET_LEN + headroom) +
+ -				 SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+ -			xdp_page = xdp_linearize_page(rq, &num_buf, page,
+ -						      offset, header_offset,
+ -						      &tlen);
+ -			if (!xdp_page)
+ -				goto err_xdp;
+ -
+ -			buf = page_address(xdp_page);
+ -			put_page(page);
+ -			page = xdp_page;
+ -		}
+ -
+ -		xdp.data_hard_start = buf + VIRTNET_RX_PAD + vi->hdr_len;
+ -		xdp.data = xdp.data_hard_start + xdp_headroom;
+ -		xdp_set_data_meta_invalid(&xdp);
+ -		xdp.data_end = xdp.data + len;
+ -		xdp.rxq = &rq->xdp_rxq;
+ -		orig_data = xdp.data;
+ -		act = bpf_prog_run_xdp(xdp_prog, &xdp);
+ -
+ -		switch (act) {
+ -		case XDP_PASS:
+ -			/* Recalculate length in case bpf program changed it */
+ -			delta = orig_data - xdp.data;
+ -			break;
+ -		case XDP_TX:
+ -			err = __virtnet_xdp_xmit(vi, &xdp);
+ -			if (unlikely(err)) {
+ -				trace_xdp_exception(vi->dev, xdp_prog, act);
+ -				goto err_xdp;
+ -			}
+ -			*xdp_xmit = true;
+ -			rcu_read_unlock();
+ -			goto xdp_xmit;
+ -		case XDP_REDIRECT:
+ -			err = xdp_do_redirect(dev, &xdp, xdp_prog);
+ -			if (err)
+ -				goto err_xdp;
+ -			*xdp_xmit = true;
+ -			rcu_read_unlock();
+ -			goto xdp_xmit;
+ -		default:
+ -			bpf_warn_invalid_xdp_action(act);
+ -		case XDP_ABORTED:
+ -			trace_xdp_exception(vi->dev, xdp_prog, act);
+ -		case XDP_DROP:
+ -			goto err_xdp;
+ -		}
+ -	}
+ -	rcu_read_unlock();
+ -
+ -	skb = build_skb(buf, buflen);
+ -	if (!skb) {
+ -		put_page(page);
+ -		goto err;
+ -	}
+ -	skb_reserve(skb, headroom - delta);
+ -	skb_put(skb, len + delta);
+ -	if (!delta) {
+ -		buf += header_offset;
+ -		memcpy(skb_vnet_hdr(skb), buf, vi->hdr_len);
+ -	} /* keep zeroed vnet hdr since packet was changed by bpf */
+ -
+ -err:
+  	return skb;
+ -
+ -err_xdp:
+ -	rcu_read_unlock();
+ -	dev->stats.rx_dropped++;
+ -	put_page(page);
+ -xdp_xmit:
+ -	return NULL;
+  }
+  
+  static struct sk_buff *receive_big(struct net_device *dev,
+* Unmerged path include/net/xdp.h
+* Unmerged path kernel/bpf/cpumap.c
+* Unmerged path net/core/xdp.c
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_txrx.c
+* Unmerged path drivers/net/ethernet/intel/ixgbe/ixgbe.h
+* Unmerged path drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+* Unmerged path drivers/net/tun.c
+* Unmerged path drivers/net/virtio_net.c
+* Unmerged path include/net/xdp.h
+* Unmerged path kernel/bpf/cpumap.c
+* Unmerged path net/core/xdp.c
