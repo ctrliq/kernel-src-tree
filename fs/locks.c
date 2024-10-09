@@ -270,21 +270,6 @@ void locks_init_lock(struct file_lock *fl)
 
 EXPORT_SYMBOL(locks_init_lock);
 
-static void locks_copy_private(struct file_lock *new, struct file_lock *fl)
-{
-	if (fl->fl_ops) {
-		if (fl->fl_ops->fl_copy_lock)
-			fl->fl_ops->fl_copy_lock(new, fl);
-		new->fl_ops = fl->fl_ops;
-	}
-
-	if (fl->fl_lmops) {
-		if (fl->fl_lmops->lm_get_owner)
-			fl->fl_lmops->lm_get_owner(new, fl);
-		new->fl_lmops = fl->fl_lmops;
-	}
-}
-
 /*
  * Initialize a new lock from an existing file_lock structure.
  */
@@ -297,8 +282,13 @@ void locks_copy_conflock(struct file_lock *new, struct file_lock *fl)
 	new->fl_type = fl->fl_type;
 	new->fl_start = fl->fl_start;
 	new->fl_end = fl->fl_end;
+	new->fl_lmops = fl->fl_lmops;
 	new->fl_ops = NULL;
-	new->fl_lmops = NULL;
+
+	if (fl->fl_lmops) {
+		if (fl->fl_lmops->lm_get_owner)
+			fl->fl_lmops->lm_get_owner(new, fl);
+	}
 }
 EXPORT_SYMBOL(locks_copy_conflock);
 
@@ -307,11 +297,14 @@ void locks_copy_lock(struct file_lock *new, struct file_lock *fl)
 	locks_release_private(new);
 
 	locks_copy_conflock(new, fl);
+
 	new->fl_file = fl->fl_file;
 	new->fl_ops = fl->fl_ops;
-	new->fl_lmops = fl->fl_lmops;
 
-	locks_copy_private(new, fl);
+	if (fl->fl_ops) {
+		if (fl->fl_ops->fl_copy_lock)
+			fl->fl_ops->fl_copy_lock(new, fl);
+	}
 }
 
 EXPORT_SYMBOL(locks_copy_lock);
@@ -2015,11 +2008,13 @@ int fcntl_getlk(struct file *filp, struct flock __user *l)
 	if (file_lock.fl_type != F_UNLCK) {
 		error = posix_lock_to_flock(&flock, &file_lock);
 		if (error)
-			goto out;
+			goto rel_priv;
 	}
 	error = -EFAULT;
 	if (!copy_to_user(l, &flock, sizeof(flock)))
 		error = 0;
+rel_priv:
+	locks_release_private(&file_lock);
 out:
 	return error;
 }
@@ -2203,7 +2198,8 @@ int fcntl_getlk64(struct file *filp, struct flock64 __user *l)
 	error = -EFAULT;
 	if (!copy_to_user(l, &flock, sizeof(flock)))
 		error = 0;
-  
+
+	locks_release_private(&file_lock);
 out:
 	return error;
 }
