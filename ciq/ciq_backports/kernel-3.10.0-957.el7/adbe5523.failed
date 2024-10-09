@@ -1,0 +1,157 @@
+scsi: megaraid_sas: fix selection of reply queue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [scsi] megaraid_sas: fix selection of reply queue (Tomas Henzl) [1513838]
+Rebuild_FUZZ: 93.33%
+commit-author Ming Lei <ming.lei@redhat.com>
+commit adbe552349f2d1e48357a00e564d26135e586634
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/adbe5523.failed
+
+Since commit 84676c1f21e8 ("genirq/affinity: assign vectors to all
+possible CPUs") we could end up with an MSI-X vector that did not have
+any online CPUs mapped. This would lead to I/O hangs since there was no
+CPU to receive the completion.
+
+Retrieve IRQ affinity information using pci_irq_get_affinity() and use
+this mapping to choose a reply queue.
+
+[mkp: tweaked commit desc]
+
+	Cc: Hannes Reinecke <hare@suse.de>
+	Cc: "Martin K. Petersen" <martin.petersen@oracle.com>,
+	Cc: James Bottomley <james.bottomley@hansenpartnership.com>,
+	Cc: Christoph Hellwig <hch@lst.de>,
+	Cc: Don Brace <don.brace@microsemi.com>
+	Cc: Kashyap Desai <kashyap.desai@broadcom.com>
+	Cc: Laurence Oberman <loberman@redhat.com>
+	Cc: Mike Snitzer <snitzer@redhat.com>
+	Cc: Meelis Roos <mroos@linux.ee>
+	Cc: Artem Bityutskiy <artem.bityutskiy@intel.com>
+Fixes: 84676c1f21e8 ("genirq/affinity: assign vectors to all possible CPUs")
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Acked-by: Kashyap Desai <kashyap.desai@broadcom.com>
+	Tested-by: Kashyap Desai <kashyap.desai@broadcom.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Tested-by: Artem Bityutskiy <artem.bityutskiy@intel.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit adbe552349f2d1e48357a00e564d26135e586634)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/megaraid/megaraid_sas_base.c
+diff --cc drivers/scsi/megaraid/megaraid_sas_base.c
+index c999b3ce3835,7b2bed5ab04c..000000000000
+--- a/drivers/scsi/megaraid/megaraid_sas_base.c
++++ b/drivers/scsi/megaraid/megaraid_sas_base.c
+@@@ -5345,6 -5357,14 +5365,17 @@@ static int megasas_init_fw(struct megas
+  			MPI2_REPLY_POST_HOST_INDEX_OFFSET);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!instance->msix_vectors) {
++ 		i = pci_alloc_irq_vectors(instance->pdev, 1, 1, PCI_IRQ_LEGACY);
++ 		if (i < 0)
++ 			goto fail_setup_irqs;
++ 	}
++ 
++ 	megasas_setup_reply_map(instance);
++ 
+++>>>>>>> adbe552349f2 (scsi: megaraid_sas: fix selection of reply queue)
+  	dev_info(&instance->pdev->dev,
+  		"firmware supports msix\t: (%d)", fw_msix_count);
+  	dev_info(&instance->pdev->dev,
+@@@ -6447,15 -6569,10 +6488,14 @@@ fail_io_attach
+  	else
+  		megasas_release_mfi(instance);
+  	if (instance->msix_vectors)
+ -		pci_free_irq_vectors(instance->pdev);
+ +		pci_disable_msix(instance->pdev);
+  fail_init_mfi:
+ +fail_alloc_dma_buf:
+ +	megasas_free_ctrl_dma_buffers(instance);
+ +	megasas_free_ctrl_mem(instance);
+  	scsi_host_put(host);
+- 
+  fail_alloc_instance:
+ +fail_set_dma_mask:
+  	pci_disable_device(pdev);
+  
+  	return -ENODEV;
+@@@ -6641,18 -6765,20 +6681,20 @@@ megasas_resume(struct pci_dev *pdev
+  	atomic_set(&instance->fw_outstanding, 0);
+  	atomic_set(&instance->ldio_outstanding, 0);
+  
+ +	/*
+ +	 * We expect the FW state to be READY
+ +	 */
+ +	if (megasas_transition_to_ready(instance, 0))
+ +		goto fail_ready_state;
+ +
+  	/* Now re-enable MSI-X */
+ -	if (instance->msix_vectors) {
+ -		irq_flags = PCI_IRQ_MSIX;
+ -		if (smp_affinity_enable)
+ -			irq_flags |= PCI_IRQ_AFFINITY;
+ -	}
+ -	rval = pci_alloc_irq_vectors(instance->pdev, 1,
+ -				     instance->msix_vectors ?
+ -				     instance->msix_vectors : 1, irq_flags);
+ -	if (rval < 0)
+ +	if (instance->msix_vectors &&
+ +	    pci_enable_msix_exact(instance->pdev, instance->msixentry,
+ +				  instance->msix_vectors))
+  		goto fail_reenable_msix;
+  
++ 	megasas_setup_reply_map(instance);
++ 
+  	if (instance->adapter_type != MFI_SERIES) {
+  		megasas_reset_reply_desc(instance);
+  		if (megasas_ioc_init_fusion(instance)) {
+diff --git a/drivers/scsi/megaraid/megaraid_sas.h b/drivers/scsi/megaraid/megaraid_sas.h
+index 4851bc47e3cd..c6da948d2f37 100644
+--- a/drivers/scsi/megaraid/megaraid_sas.h
++++ b/drivers/scsi/megaraid/megaraid_sas.h
+@@ -2103,6 +2103,7 @@ enum MR_PD_TYPE {
+ 
+ struct megasas_instance {
+ 
++	unsigned int *reply_map;
+ 	__le32 *producer;
+ 	dma_addr_t producer_h;
+ 	__le32 *consumer;
+* Unmerged path drivers/scsi/megaraid/megaraid_sas_base.c
+diff --git a/drivers/scsi/megaraid/megaraid_sas_fusion.c b/drivers/scsi/megaraid/megaraid_sas_fusion.c
+index e7751d9bff05..fa26ec59472f 100644
+--- a/drivers/scsi/megaraid/megaraid_sas_fusion.c
++++ b/drivers/scsi/megaraid/megaraid_sas_fusion.c
+@@ -2432,11 +2432,8 @@ megasas_build_ldio_fusion(struct megasas_instance *instance,
+ 			fp_possible = (io_info.fpOkForIo > 0) ? true : false;
+ 	}
+ 
+-	/* Use raw_smp_processor_id() for now until cmd->request->cpu is CPU
+-	   id by default, not CPU group id, otherwise all MSI-X queues won't
+-	   be utilized */
+-	cmd->request_desc->SCSIIO.MSIxIndex = instance->msix_vectors ?
+-		raw_smp_processor_id() % instance->msix_vectors : 0;
++	cmd->request_desc->SCSIIO.MSIxIndex =
++		instance->reply_map[raw_smp_processor_id()];
+ 
+ 	praid_context = &io_request->RaidContext;
+ 
+@@ -2762,10 +2759,9 @@ megasas_build_syspd_fusion(struct megasas_instance *instance,
+ 	}
+ 
+ 	cmd->request_desc->SCSIIO.DevHandle = io_request->DevHandle;
+-	cmd->request_desc->SCSIIO.MSIxIndex =
+-		instance->msix_vectors ?
+-		(raw_smp_processor_id() % instance->msix_vectors) : 0;
+ 
++	cmd->request_desc->SCSIIO.MSIxIndex =
++		instance->reply_map[raw_smp_processor_id()];
+ 
+ 	if (!fp_possible) {
+ 		/* system pd firmware path */
