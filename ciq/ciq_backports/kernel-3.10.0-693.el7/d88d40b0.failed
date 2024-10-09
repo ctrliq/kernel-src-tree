@@ -1,0 +1,264 @@
+i40e: allow i40e_update_filter_state to skip broadcast filters
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit d88d40b01c5c0dad6a1dca3b18267849eef4a2a9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/d88d40b0.failed
+
+Fix a bug where we modified the mac_filter_hash while outside a lock,
+when handling addition of broadcast filters.
+
+Normally, we add filters to firmware by batching the additions into
+lists and issuing 1 update for every few filters. Broadcast filters are
+handled differently, by instead setting the broadcast promiscuous mode
+flags. In order to make sure the 1<->1 mapping of filters in our
+addition array lined up with filters in the hlist tmp_add_list, we had
+to remove the filter and move it back to the main hash. However, we
+didn't do this under lock, which could cause consistency problems for
+the list.
+
+Fix this by updating i40e_update_filter_state logic so that it knows to
+avoid broadcast filters. This ensures that we don't have to remove the
+filter separately, and can put it back using the normal flow.
+
+Change-ID: Id288fade80b3e3a9a54b68cc249188cb95147518
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit d88d40b01c5c0dad6a1dca3b18267849eef4a2a9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/i40e/i40e_main.c
+diff --cc drivers/net/ethernet/intel/i40e/i40e_main.c
+index e910f71bdc92,06c80d4162af..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_main.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_main.c
+@@@ -1748,37 -1885,138 +1773,142 @@@ i40e_update_filter_state(int count
+  	int retval = 0;
+  	int i;
+  
+ -	for (i = 0; i < count; i++) {
+ -		/* Always check status of each filter. We don't need to check
+ -		 * the firmware return status because we pre-set the filter
+ -		 * status to I40E_AQC_MM_ERR_NO_RES when sending the filter
+ -		 * request to the adminq. Thus, if it no longer matches then
+ -		 * we know the filter is active.
+ -		 */
+ -		if (add_list[i].match_method == I40E_AQC_MM_ERR_NO_RES) {
+ -			add_head->state = I40E_FILTER_FAILED;
+ -		} else {
+ +
+ +	if (!aq_err) {
+ +		retval = count;
+ +		/* Everything's good, mark all filters active. */
+ +		for (i = 0; i < count ; i++) {
+  			add_head->state = I40E_FILTER_ACTIVE;
+ -			retval++;
+ +			add_head = list_next_entry(add_head, list);
+  		}
+ +	} else if (aq_err == I40E_AQ_RC_ENOSPC) {
+ +		/* Device ran out of filter space. Check the return value
+ +		 * for each filter to see which ones are active.
+ +		 */
+ +		for (i = 0; i < count ; i++) {
+ +			if (add_list[i].match_method ==
+ +			    I40E_AQC_MM_ERR_NO_RES) {
+ +				add_head->state = I40E_FILTER_FAILED;
+ +			} else {
+ +				add_head->state = I40E_FILTER_ACTIVE;
+ +				retval++;
+ +			}
+ +			add_head = list_next_entry(add_head, list);
+ +		}
+++<<<<<<< HEAD
+++=======
++ 
++ 		add_head = i40e_next_filter(add_head);
++ 		if (!add_head)
++ 			break;
++ 	}
++ 
++ 	return retval;
++ }
++ 
++ /**
++  * i40e_aqc_del_filters - Request firmware to delete a set of filters
++  * @vsi: ptr to the VSI
++  * @vsi_name: name to display in messages
++  * @list: the list of filters to send to firmware
++  * @num_del: the number of filters to delete
++  * @retval: Set to -EIO on failure to delete
++  *
++  * Send a request to firmware via AdminQ to delete a set of filters. Uses
++  * *retval instead of a return value so that success does not force ret_val to
++  * be set to 0. This ensures that a sequence of calls to this function
++  * preserve the previous value of *retval on successful delete.
++  */
++ static
++ void i40e_aqc_del_filters(struct i40e_vsi *vsi, const char *vsi_name,
++ 			  struct i40e_aqc_remove_macvlan_element_data *list,
++ 			  int num_del, int *retval)
++ {
++ 	struct i40e_hw *hw = &vsi->back->hw;
++ 	i40e_status aq_ret;
++ 	int aq_err;
++ 
++ 	aq_ret = i40e_aq_remove_macvlan(hw, vsi->seid, list, num_del, NULL);
++ 	aq_err = hw->aq.asq_last_status;
++ 
++ 	/* Explicitly ignore and do not report when firmware returns ENOENT */
++ 	if (aq_ret && !(aq_err == I40E_AQ_RC_ENOENT)) {
++ 		*retval = -EIO;
++ 		dev_info(&vsi->back->pdev->dev,
++ 			 "ignoring delete macvlan error on %s, err %s, aq_err %s\n",
++ 			 vsi_name, i40e_stat_str(hw, aq_ret),
++ 			 i40e_aq_str(hw, aq_err));
++ 	}
++ }
++ 
++ /**
++  * i40e_aqc_add_filters - Request firmware to add a set of filters
++  * @vsi: ptr to the VSI
++  * @vsi_name: name to display in messages
++  * @list: the list of filters to send to firmware
++  * @add_head: Position in the add hlist
++  * @num_add: the number of filters to add
++  * @promisc_change: set to true on exit if promiscuous mode was forced on
++  *
++  * Send a request to firmware via AdminQ to add a chunk of filters. Will set
++  * promisc_changed to true if the firmware has run out of space for more
++  * filters.
++  */
++ static
++ void i40e_aqc_add_filters(struct i40e_vsi *vsi, const char *vsi_name,
++ 			  struct i40e_aqc_add_macvlan_element_data *list,
++ 			  struct i40e_mac_filter *add_head,
++ 			  int num_add, bool *promisc_changed)
++ {
++ 	struct i40e_hw *hw = &vsi->back->hw;
++ 	int aq_err, fcnt;
++ 
++ 	i40e_aq_add_macvlan(hw, vsi->seid, list, num_add, NULL);
++ 	aq_err = hw->aq.asq_last_status;
++ 	fcnt = i40e_update_filter_state(num_add, list, add_head);
++ 
++ 	if (fcnt != num_add) {
++ 		*promisc_changed = true;
++ 		set_bit(__I40E_FILTER_OVERFLOW_PROMISC, &vsi->state);
++ 		dev_warn(&vsi->back->pdev->dev,
++ 			 "Error %s adding RX filters on %s, promiscuous mode forced on\n",
++ 			 i40e_aq_str(hw, aq_err),
++ 			 vsi_name);
++ 	}
++ }
++ 
++ /**
++  * i40e_aqc_broadcast_filter - Set promiscuous broadcast flags
++  * @vsi: pointer to the VSI
++  * @f: filter data
++  *
++  * This function sets or clears the promiscuous broadcast flags for VLAN
++  * filters in order to properly receive broadcast frames. Assumes that only
++  * broadcast filters are passed.
++  **/
++ static
++ void i40e_aqc_broadcast_filter(struct i40e_vsi *vsi, const char *vsi_name,
++ 			       struct i40e_mac_filter *f)
++ {
++ 	bool enable = f->state == I40E_FILTER_NEW;
++ 	struct i40e_hw *hw = &vsi->back->hw;
++ 	i40e_status aq_ret;
++ 
++ 	if (f->vlan == I40E_VLAN_ANY) {
++ 		aq_ret = i40e_aq_set_vsi_broadcast(hw,
++ 						   vsi->seid,
++ 						   enable,
++ 						   NULL);
+++>>>>>>> d88d40b01c5c (i40e: allow i40e_update_filter_state to skip broadcast filters)
+  	} else {
+ -		aq_ret = i40e_aq_set_vsi_bc_promisc_on_vlan(hw,
+ -							    vsi->seid,
+ -							    enable,
+ -							    f->vlan,
+ -							    NULL);
+ -	}
+ -
+ -	if (aq_ret) {
+ -		dev_warn(&vsi->back->pdev->dev,
+ -			 "Error %s setting broadcast promiscuous mode on %s\n",
+ -			 i40e_aq_str(hw, hw->aq.asq_last_status),
+ -			 vsi_name);
+ -		f->state = I40E_FILTER_FAILED;
+ -	} else if (enable) {
+ -		f->state = I40E_FILTER_ACTIVE;
+ +		/* Some other horrible thing happened, fail all filters */
+ +		retval = 0;
+ +		for (i = 0; i < count ; i++) {
+ +			add_head->state = I40E_FILTER_FAILED;
+ +			add_head = list_next_entry(add_head, list);
+ +		}
+  	}
+ +	return retval;
+  }
+  
+  /**
+@@@ -1857,18 -2113,23 +1987,32 @@@ int i40e_sync_vsi_filters(struct i40e_v
+  		list_size = filter_list_len *
+  			    sizeof(struct i40e_aqc_remove_macvlan_element_data);
+  		del_list = kzalloc(list_size, GFP_ATOMIC);
+ -		if (!del_list)
+ -			goto err_no_memory;
+ +		if (!del_list) {
+ +			/* Undo VSI's MAC filter entry element updates */
+ +			spin_lock_bh(&vsi->mac_filter_list_lock);
+ +			i40e_undo_del_filter_entries(vsi, &tmp_del_list);
+ +			spin_unlock_bh(&vsi->mac_filter_list_lock);
+ +			retval = -ENOMEM;
+ +			goto out;
+ +		}
+  
+ -		hlist_for_each_entry_safe(f, h, &tmp_del_list, hlist) {
+ +		list_for_each_entry_safe(f, ftmp, &tmp_del_list, list) {
+  			cmd_flags = 0;
+  
+++<<<<<<< HEAD
+++=======
++ 			/* handle broadcast filters by updating the broadcast
++ 			 * promiscuous flag and release filter list.
++ 			 */
++ 			if (is_broadcast_ether_addr(f->macaddr)) {
++ 				i40e_aqc_broadcast_filter(vsi, vsi_name, f);
++ 
++ 				hlist_del(&f->hlist);
++ 				kfree(f);
++ 				continue;
++ 			}
++ 
+++>>>>>>> d88d40b01c5c (i40e: allow i40e_update_filter_state to skip broadcast filters)
+  			/* add to delete list */
+  			ether_addr_copy(del_list[num_del].mac_addr, f->macaddr);
+  			if (f->vlan == I40E_VLAN_ANY) {
+@@@ -1952,6 -2184,15 +2096,18 @@@
+  				f->state = I40E_FILTER_FAILED;
+  				continue;
+  			}
+++<<<<<<< HEAD
+++=======
++ 
++ 			/* handle broadcast filters by updating the broadcast
++ 			 * promiscuous flag instead of adding a MAC filter.
++ 			 */
++ 			if (is_broadcast_ether_addr(f->macaddr)) {
++ 				i40e_aqc_broadcast_filter(vsi, vsi_name, f);
++ 				continue;
++ 			}
++ 
+++>>>>>>> d88d40b01c5c (i40e: allow i40e_update_filter_state to skip broadcast filters)
+  			/* add to add array */
+  			if (num_add == 0)
+  				add_head = f;
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_main.c
