@@ -1,0 +1,144 @@
+x86/mm: Fix boot crash caused by incorrect loop count calculation in sync_global_pgds()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [x86] mm: Fix boot crash caused by incorrect loop count calculation in sync_global_pgds() (Baoquan He) [1440196]
+Rebuild_FUZZ: 97.65%
+commit-author Baoquan He <bhe@redhat.com>
+commit fc5f9d5f151c9fff21d3d1d2907b888a5aec3ff7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/fc5f9d5f.failed
+
+Jeff Moyer reported that on his system with two memory regions 0~64G and
+1T~1T+192G, and kernel option "memmap=192G!1024G" added, enabling KASLR
+will make the system hang intermittently during boot. While adding 'nokaslr'
+won't.
+
+The back trace is:
+
+ Oops: 0000 [#1] SMP
+
+ RIP: memcpy_erms()
+ [ .... ]
+ Call Trace:
+  pmem_rw_page()
+  bdev_read_page()
+  do_mpage_readpage()
+  mpage_readpages()
+  blkdev_readpages()
+  __do_page_cache_readahead()
+  force_page_cache_readahead()
+  page_cache_sync_readahead()
+  generic_file_read_iter()
+  blkdev_read_iter()
+  __vfs_read()
+  vfs_read()
+  SyS_read()
+  entry_SYSCALL_64_fastpath()
+
+This crash happens because the for loop count calculation in sync_global_pgds()
+is not correct. When a mapping area crosses PGD entries, we should
+calculate the starting address of region which next PGD covers and assign
+it to next for loop count, but not add PGDIR_SIZE directly. The old
+code works right only if the mapping area is an exact multiple of PGDIR_SIZE,
+otherwize the end region could be skipped so that it can't be synchronized
+to all other processes from kernel PGD init_mm.pgd.
+
+In Jeff's system, emulated pmem area [1024G, 1216G) is smaller than
+PGDIR_SIZE. While 'nokaslr' works because PAGE_OFFSET is 1T aligned, it
+makes this area be mapped inside one PGD entry. With KASLR enabled,
+this area could cross two PGD entries, then the next PGD entry won't
+be synced to all other processes. That is why we saw empty PGD.
+
+Fix it.
+
+	Reported-by: Jeff Moyer <jmoyer@redhat.com>
+	Signed-off-by: Baoquan He <bhe@redhat.com>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brian Gerst <brgerst@gmail.com>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Dave Hansen <dave.hansen@linux.intel.com>
+	Cc: Dave Young <dyoung@redhat.com>
+	Cc: Denys Vlasenko <dvlasenk@redhat.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Jinbum Park <jinb.park7@gmail.com>
+	Cc: Josh Poimboeuf <jpoimboe@redhat.com>
+	Cc: Kees Cook <keescook@chromium.org>
+	Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Garnier <thgarnie@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Yasuaki Ishimatsu <yasu.isimatu@gmail.com>
+	Cc: Yinghai Lu <yinghai@kernel.org>
+Link: http://lkml.kernel.org/r/1493864747-8506-1-git-send-email-bhe@redhat.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit fc5f9d5f151c9fff21d3d1d2907b888a5aec3ff7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/mm/init_64.c
+diff --cc arch/x86/mm/init_64.c
+index e793e0f54c7a,97fe88749e18..000000000000
+--- a/arch/x86/mm/init_64.c
++++ b/arch/x86/mm/init_64.c
+@@@ -104,31 -89,36 +104,49 @@@ static int __init nonx32_setup(char *st
+  __setup("noexec32=", nonx32_setup);
+  
+  /*
+ - * When memory was added make sure all the processes MM have
+ + * When memory was added/removed make sure all the processes MM have
+   * suitable PGD entries in the local PGD level page.
+   */
+ -void sync_global_pgds(unsigned long start, unsigned long end)
+ +void sync_global_pgds(unsigned long start, unsigned long end, int removed)
+  {
+- 	unsigned long address;
++ 	unsigned long addr;
+  
+++<<<<<<< HEAD
+ +	for (address = start; address <= end; address += PGDIR_SIZE) {
+ +		const pgd_t *pgd_ref = pgd_offset_k(address);
+++=======
++ 	for (addr = start; addr <= end; addr = ALIGN(addr + 1, PGDIR_SIZE)) {
++ 		pgd_t *pgd_ref = pgd_offset_k(addr);
++ 		const p4d_t *p4d_ref;
+++>>>>>>> fc5f9d5f151c (x86/mm: Fix boot crash caused by incorrect loop count calculation in sync_global_pgds())
+  		struct page *page;
+  
+  		/*
+ -		 * With folded p4d, pgd_none() is always false, we need to
+ -		 * handle synchonization on p4d level.
+ +		 * When it is called after memory hot remove, pgd_none()
+ +		 * returns true. In this case (removed == 1), we must clear
+ +		 * the PGD entries in the local PGD level page.
+  		 */
+++<<<<<<< HEAD
+ +		if (pgd_none(*pgd_ref) && !removed)
+++=======
++ 		BUILD_BUG_ON(pgd_none(*pgd_ref));
++ 		p4d_ref = p4d_offset(pgd_ref, addr);
++ 
++ 		if (p4d_none(*p4d_ref))
+++>>>>>>> fc5f9d5f151c (x86/mm: Fix boot crash caused by incorrect loop count calculation in sync_global_pgds())
+  			continue;
+  
+  		spin_lock(&pgd_lock);
+  		list_for_each_entry(page, &pgd_list, lru) {
+  			pgd_t *pgd;
+ -			p4d_t *p4d;
+  			spinlock_t *pgt_lock;
+  
+++<<<<<<< HEAD
+ +			pgd = (pgd_t *)page_address(page) + pgd_index(address);
+++=======
++ 			pgd = (pgd_t *)page_address(page) + pgd_index(addr);
++ 			p4d = p4d_offset(pgd, addr);
+++>>>>>>> fc5f9d5f151c (x86/mm: Fix boot crash caused by incorrect loop count calculation in sync_global_pgds())
+  			/* the pgt_lock only for Xen */
+  			pgt_lock = &pgd_page_get_mm(page)->page_table_lock;
+  			spin_lock(pgt_lock);
+* Unmerged path arch/x86/mm/init_64.c
