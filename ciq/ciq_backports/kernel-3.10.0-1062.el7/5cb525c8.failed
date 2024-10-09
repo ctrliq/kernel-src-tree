@@ -1,0 +1,155 @@
+nvme-pci: handle completions outside of the queue lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 5cb525c8315f1dd9232b59cd1cf1e0f19ff1a5df
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/5cb525c8.failed
+
+Split the completion of events into a two part process:
+
+1) Reap the events inside the queue lock
+2) Complete the events outside the queue lock
+
+Since we never wrap the queue, we can access it locklessly after we've
+updated the completion queue head. This patch started off with batching
+events on the stack, but with this trick we don't have to. Keith Busch
+<keith.busch@intel.com> came up with that idea.
+
+Note that this kills the ->cqe_seen as well. I haven't been able to
+trigger any ill effects of this. If we do race with polling every so
+often, it should be rare enough NOT to trigger any issues.
+
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+[hch: refactored, restored poll early exit optimization]
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 5cb525c8315f1dd9232b59cd1cf1e0f19ff1a5df)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/pci.c
+diff --cc drivers/nvme/host/pci.c
+index 555634b3136a,7fbb6f94b561..000000000000
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@@ -756,36 -960,39 +754,63 @@@ static inline void nvme_handle_cqe(stru
+  	nvme_end_request(req, cqe->status, cqe->result);
+  }
+  
+- static inline bool nvme_read_cqe(struct nvme_queue *nvmeq,
+- 		struct nvme_completion *cqe)
++ static void nvme_complete_cqes(struct nvme_queue *nvmeq, u16 start, u16 end)
+  {
+++<<<<<<< HEAD
+ +	if (nvme_cqe_valid(nvmeq, nvmeq->cq_head, nvmeq->cq_phase)) {
+ +		*cqe = nvmeq->cqes[nvmeq->cq_head];
+ +
+ +		if (++nvmeq->cq_head == nvmeq->q_depth) {
+ +			nvmeq->cq_head = 0;
+ +			nvmeq->cq_phase = !nvmeq->cq_phase;
+ +		}
+ +		return true;
+ +	}
+ +
+ +	return false;
+ +}
+ +
+ +static int nvme_process_cq(struct nvme_queue *nvmeq)
+- {
+- 	struct nvme_completion cqe;
+- 	int consumed = 0;
+++=======
++ 	while (start != end) {
++ 		nvme_handle_cqe(nvmeq, start);
++ 		if (++start == nvmeq->q_depth)
++ 			start = 0;
++ 	}
++ }
+  
+- 	while (nvme_read_cqe(nvmeq, &cqe)) {
+- 		nvme_handle_cqe(nvmeq, &cqe);
+- 		consumed++;
++ static inline void nvme_update_cq_head(struct nvme_queue *nvmeq)
+++>>>>>>> 5cb525c8315f (nvme-pci: handle completions outside of the queue lock)
++ {
++ 	if (++nvmeq->cq_head == nvmeq->q_depth) {
++ 		nvmeq->cq_head = 0;
++ 		nvmeq->cq_phase = !nvmeq->cq_phase;
+  	}
++ }
+  
+++<<<<<<< HEAD
+ +	if (consumed) 
+ +		nvme_ring_cq_doorbell(nvmeq);
+ +
+ +	return 1;
+++=======
++ static inline bool nvme_process_cq(struct nvme_queue *nvmeq, u16 *start,
++ 		u16 *end, int tag)
++ {
++ 	bool found = false;
++ 
++ 	*start = nvmeq->cq_head;
++ 	while (!found && nvme_cqe_pending(nvmeq)) {
++ 		if (nvmeq->cqes[nvmeq->cq_head].command_id == tag)
++ 			found = true;
++ 		nvme_update_cq_head(nvmeq);
++ 	}
++ 	*end = nvmeq->cq_head;
++ 
++ 	if (*start != *end)
++ 		nvme_ring_cq_doorbell(nvmeq);
++ 	return found;
+++>>>>>>> 5cb525c8315f (nvme-pci: handle completions outside of the queue lock)
+  }
+  
+  static irqreturn_t nvme_irq(int irq, void *data)
+@@@ -808,6 -1018,29 +836,32 @@@ static irqreturn_t nvme_irq_check(int i
+  	return IRQ_NONE;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int __nvme_poll(struct nvme_queue *nvmeq, unsigned int tag)
++ {
++ 	u16 start, end;
++ 	bool found;
++ 
++ 	if (!nvme_cqe_pending(nvmeq))
++ 		return 0;
++ 
++ 	spin_lock_irq(&nvmeq->q_lock);
++ 	found = nvme_process_cq(nvmeq, &start, &end, tag);
++ 	spin_unlock_irq(&nvmeq->q_lock);
++ 
++ 	nvme_complete_cqes(nvmeq, start, end);
++ 	return found;
++ }
++ 
++ static int nvme_poll(struct blk_mq_hw_ctx *hctx, unsigned int tag)
++ {
++ 	struct nvme_queue *nvmeq = hctx->driver_data;
++ 
++ 	return __nvme_poll(nvmeq, tag);
++ }
++ 
+++>>>>>>> 5cb525c8315f (nvme-pci: handle completions outside of the queue lock)
+  static void nvme_pci_submit_async_event(struct nvme_ctrl *ctrl)
+  {
+  	struct nvme_dev *dev = to_nvme_dev(ctrl);
+@@@ -1747,9 -1992,10 +1804,10 @@@ static void nvme_del_queue_end(struct r
+  	complete(&nvmeq->dev->ioq_wait);
+  }
+  
+ -static void nvme_del_cq_end(struct request *req, blk_status_t error)
+ +static void nvme_del_cq_end(struct request *req, int error)
+  {
+  	struct nvme_queue *nvmeq = req->end_io_data;
++ 	u16 start, end;
+  
+  	if (!error) {
+  		unsigned long flags;
+* Unmerged path drivers/nvme/host/pci.c
