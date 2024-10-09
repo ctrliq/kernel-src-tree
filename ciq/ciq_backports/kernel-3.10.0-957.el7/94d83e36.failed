@@ -1,0 +1,132 @@
+scsi: qla2xxx: Tweak resource count dump
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: Tweak resource count dump (Himanshu Madhani) [1547714]
+Rebuild_FUZZ: 91.89%
+commit-author Quinn Tran <quinn.tran@qlogic.com>
+commit 94d83e3641765e08076efc93632eab579c0397e2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/94d83e36.failed
+
+Fetch actual data from firmware instead of static data
+at chip reset time.
+
+	Signed-off-by: Quinn Tran <quinn.tran@qlogic.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 94d83e3641765e08076efc93632eab579c0397e2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_gbl.h
+diff --cc drivers/scsi/qla2xxx/qla_gbl.h
+index 547baeb17bb1,9d7b66abfc10..000000000000
+--- a/drivers/scsi/qla2xxx/qla_gbl.h
++++ b/drivers/scsi/qla2xxx/qla_gbl.h
+@@@ -484,6 -499,12 +484,15 @@@ int qla24xx_gidlist_wait(struct scsi_ql
+      uint16_t *);
+  int __qla24xx_parse_gpdb(struct scsi_qla_host *, fc_port_t *,
+  	struct port_database_24xx *);
+++<<<<<<< HEAD
+++=======
++ int qla24xx_get_port_login_templ(scsi_qla_host_t *, dma_addr_t,
++ 				 void *, uint16_t);
++ 
++ extern int qla27xx_get_zio_threshold(scsi_qla_host_t *, uint16_t *);
++ extern int qla27xx_set_zio_threshold(scsi_qla_host_t *, uint16_t);
++ int qla24xx_res_count_wait(struct scsi_qla_host *, uint16_t *, int);
+++>>>>>>> 94d83e364176 (scsi: qla2xxx: Tweak resource count dump)
+  
+  /*
+   * Global Function Prototypes in qla_isr.c source file.
+diff --git a/drivers/scsi/qla2xxx/qla_dfs.c b/drivers/scsi/qla2xxx/qla_dfs.c
+index 6d5a5cabfbe3..a95fe4f96588 100644
+--- a/drivers/scsi/qla2xxx/qla_dfs.c
++++ b/drivers/scsi/qla2xxx/qla_dfs.c
+@@ -127,21 +127,23 @@ static int
+ qla_dfs_fw_resource_cnt_show(struct seq_file *s, void *unused)
+ {
+ 	struct scsi_qla_host *vha = s->private;
+-	struct qla_hw_data *ha = vha->hw;
+-
+-	seq_puts(s, "FW Resource count\n\n");
+-	seq_printf(s, "Original TGT exchg count[%d]\n",
+-	    ha->orig_fw_tgt_xcb_count);
+-	seq_printf(s, "current TGT exchg count[%d]\n",
+-	    ha->cur_fw_tgt_xcb_count);
+-	seq_printf(s, "original Initiator Exchange count[%d]\n",
+-	    ha->orig_fw_xcb_count);
+-	seq_printf(s, "Current Initiator Exchange count[%d]\n",
+-	    ha->cur_fw_xcb_count);
+-	seq_printf(s, "Original IOCB count[%d]\n", ha->orig_fw_iocb_count);
+-	seq_printf(s, "Current IOCB count[%d]\n", ha->cur_fw_iocb_count);
+-	seq_printf(s, "MAX VP count[%d]\n", ha->max_npiv_vports);
+-	seq_printf(s, "MAX FCF count[%d]\n", ha->fw_max_fcf_count);
++	uint16_t mb[MAX_IOCB_MB_REG];
++	int rc;
++
++	rc = qla24xx_res_count_wait(vha, mb, SIZEOF_IOCB_MB_REG);
++	if (rc != QLA_SUCCESS) {
++		seq_printf(s, "Mailbox Command failed %d, mb %#x", rc, mb[0]);
++	} else {
++		seq_puts(s, "FW Resource count\n\n");
++		seq_printf(s, "Original TGT exchg count[%d]\n", mb[1]);
++		seq_printf(s, "current TGT exchg count[%d]\n", mb[2]);
++		seq_printf(s, "original Initiator Exchange count[%d]\n", mb[3]);
++		seq_printf(s, "Current Initiator Exchange count[%d]\n", mb[6]);
++		seq_printf(s, "Original IOCB count[%d]\n", mb[7]);
++		seq_printf(s, "Current IOCB count[%d]\n", mb[10]);
++		seq_printf(s, "MAX VP count[%d]\n", mb[11]);
++		seq_printf(s, "MAX FCF count[%d]\n", mb[12]);
++	}
+ 
+ 	return 0;
+ }
+* Unmerged path drivers/scsi/qla2xxx/qla_gbl.h
+diff --git a/drivers/scsi/qla2xxx/qla_mbx.c b/drivers/scsi/qla2xxx/qla_mbx.c
+index 4649e83dd88d..cdfc58a0531b 100644
+--- a/drivers/scsi/qla2xxx/qla_mbx.c
++++ b/drivers/scsi/qla2xxx/qla_mbx.c
+@@ -17,6 +17,7 @@ static struct mb_cmd_name {
+ 	{MBC_GET_PORT_DATABASE,		"GPDB"},
+ 	{MBC_GET_ID_LIST,		"GIDList"},
+ 	{MBC_GET_LINK_PRIV_STATS,	"Stats"},
++	{MBC_GET_RESOURCE_COUNTS,	"ResCnt"},
+ };
+ 
+ static const char *mb_to_str(uint16_t cmd)
+@@ -6122,3 +6123,32 @@ qla2x00_read_sfp_dev(struct scsi_qla_host *vha, char *buf, int count)
+ 
+ 	return rval;
+ }
++
++int qla24xx_res_count_wait(struct scsi_qla_host *vha,
++    uint16_t *out_mb, int out_mb_sz)
++{
++	int rval = QLA_FUNCTION_FAILED;
++	mbx_cmd_t mc;
++
++	if (!vha->hw->flags.fw_started)
++		goto done;
++
++	memset(&mc, 0, sizeof(mc));
++	mc.mb[0] = MBC_GET_RESOURCE_COUNTS;
++
++	rval = qla24xx_send_mb_cmd(vha, &mc);
++	if (rval != QLA_SUCCESS) {
++		ql_dbg(ql_dbg_mbx, vha, 0xffff,
++			"%s:  fail\n", __func__);
++	} else {
++		if (out_mb_sz <= SIZEOF_IOCB_MB_REG)
++			memcpy(out_mb, mc.mb, out_mb_sz);
++		else
++			memcpy(out_mb, mc.mb, SIZEOF_IOCB_MB_REG);
++
++		ql_dbg(ql_dbg_mbx, vha, 0xffff,
++			"%s:  done\n", __func__);
++	}
++done:
++	return rval;
++}
