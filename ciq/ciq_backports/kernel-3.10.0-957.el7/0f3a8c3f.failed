@@ -1,0 +1,351 @@
+iio: Add support for creating IIO devices via configfs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [iio] Add support for creating IIO devices via configfs (Tony Camuso) [1559170]
+Rebuild_FUZZ: 95.15%
+commit-author Daniel Baluta <daniel.baluta@intel.com>
+commit 0f3a8c3f34f728e7c96651bb7271e1c388c9aac2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/0f3a8c3f.failed
+
+This is similar with support for creating triggers via configfs.
+Devices will be hosted under:
+	* /config/iio/devices
+
+We allow users to register "device types" under:
+	* /config/iio/devices/<device_types>/
+
+	Signed-off-by: Daniel Baluta <daniel.baluta@intel.com>
+	Signed-off-by: Jonathan Cameron <jic23@kernel.org>
+(cherry picked from commit 0f3a8c3f34f728e7c96651bb7271e1c388c9aac2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iio/Kconfig
+#	drivers/iio/Makefile
+diff --cc drivers/iio/Kconfig
+index 4445a10262c8,6743b18194fb..000000000000
+--- a/drivers/iio/Kconfig
++++ b/drivers/iio/Kconfig
+@@@ -59,6 -46,28 +59,31 @@@ config IIO_CONSUMERS_PER_TRIGGE
+  	This value controls the maximum number of consumers that a
+  	given trigger may handle. Default is 2.
+  
+++<<<<<<< HEAD
+++=======
++ config IIO_SW_DEVICE
++ 	tristate "Enable software IIO device support"
++ 	select IIO_CONFIGFS
++ 	help
++ 	 Provides IIO core support for software devices. A software
++ 	 device can be created via configfs or directly by a driver
++ 	 using the API provided.
++ 
++ config IIO_SW_TRIGGER
++ 	tristate "Enable software triggers support"
++ 	select IIO_CONFIGFS
++ 	help
++ 	 Provides IIO core support for software triggers. A software
++ 	 trigger can be created via configfs or directly by a driver
++ 	 using the API provided.
++ 
++ config IIO_TRIGGERED_EVENT
++ 	tristate
++ 	select IIO_TRIGGER
++ 	help
++ 	  Provides helper functions for setting up triggered events.
++ 
+++>>>>>>> 0f3a8c3f34f7 (iio: Add support for creating IIO devices via configfs)
+  source "drivers/iio/accel/Kconfig"
+  source "drivers/iio/adc/Kconfig"
+  source "drivers/iio/amplifiers/Kconfig"
+diff --cc drivers/iio/Makefile
+index 7a3866c2d2a1,87e4c4369e2f..000000000000
+--- a/drivers/iio/Makefile
++++ b/drivers/iio/Makefile
+@@@ -6,10 -6,11 +6,17 @@@ obj-$(CONFIG_IIO) += industrialio.
+  industrialio-y := industrialio-core.o industrialio-event.o inkern.o
+  industrialio-$(CONFIG_IIO_BUFFER) += industrialio-buffer.o
+  industrialio-$(CONFIG_IIO_TRIGGER) += industrialio-trigger.o
+ +industrialio-$(CONFIG_IIO_BUFFER_CB) += buffer_cb.o
+  
+++<<<<<<< HEAD
+ +obj-$(CONFIG_IIO_TRIGGERED_BUFFER) += industrialio-triggered-buffer.o
+ +obj-$(CONFIG_IIO_KFIFO_BUF) += kfifo_buf.o
+++=======
++ obj-$(CONFIG_IIO_CONFIGFS) += industrialio-configfs.o
++ obj-$(CONFIG_IIO_SW_DEVICE) += industrialio-sw-device.o
++ obj-$(CONFIG_IIO_SW_TRIGGER) += industrialio-sw-trigger.o
++ obj-$(CONFIG_IIO_TRIGGERED_EVENT) += industrialio-triggered-event.o
+++>>>>>>> 0f3a8c3f34f7 (iio: Add support for creating IIO devices via configfs)
+  
+  obj-y += accel/
+  obj-y += adc/
+* Unmerged path drivers/iio/Kconfig
+* Unmerged path drivers/iio/Makefile
+diff --git a/drivers/iio/industrialio-sw-device.c b/drivers/iio/industrialio-sw-device.c
+new file mode 100644
+index 000000000000..81b49cfca452
+--- /dev/null
++++ b/drivers/iio/industrialio-sw-device.c
+@@ -0,0 +1,182 @@
++/*
++ * The Industrial I/O core, software IIO devices functions
++ *
++ * Copyright (c) 2016 Intel Corporation
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 as published by
++ * the Free Software Foundation.
++ */
++
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/kmod.h>
++#include <linux/list.h>
++#include <linux/slab.h>
++
++#include <linux/iio/sw_device.h>
++#include <linux/iio/configfs.h>
++#include <linux/configfs.h>
++
++static struct config_group *iio_devices_group;
++static struct config_item_type iio_device_type_group_type;
++
++static struct config_item_type iio_devices_group_type = {
++	.ct_owner = THIS_MODULE,
++};
++
++static LIST_HEAD(iio_device_types_list);
++static DEFINE_MUTEX(iio_device_types_lock);
++
++static
++struct iio_sw_device_type *__iio_find_sw_device_type(const char *name,
++						     unsigned len)
++{
++	struct iio_sw_device_type *d = NULL, *iter;
++
++	list_for_each_entry(iter, &iio_device_types_list, list)
++		if (!strcmp(iter->name, name)) {
++			d = iter;
++			break;
++		}
++
++	return d;
++}
++
++int iio_register_sw_device_type(struct iio_sw_device_type *d)
++{
++	struct iio_sw_device_type *iter;
++	int ret = 0;
++
++	mutex_lock(&iio_device_types_lock);
++	iter = __iio_find_sw_device_type(d->name, strlen(d->name));
++	if (iter)
++		ret = -EBUSY;
++	else
++		list_add_tail(&d->list, &iio_device_types_list);
++	mutex_unlock(&iio_device_types_lock);
++
++	if (ret)
++		return ret;
++
++	d->group = configfs_register_default_group(iio_devices_group, d->name,
++						&iio_device_type_group_type);
++	if (IS_ERR(d->group))
++		ret = PTR_ERR(d->group);
++
++	return ret;
++}
++EXPORT_SYMBOL(iio_register_sw_device_type);
++
++void iio_unregister_sw_device_type(struct iio_sw_device_type *dt)
++{
++	struct iio_sw_device_type *iter;
++
++	mutex_lock(&iio_device_types_lock);
++	iter = __iio_find_sw_device_type(dt->name, strlen(dt->name));
++	if (iter)
++		list_del(&dt->list);
++	mutex_unlock(&iio_device_types_lock);
++
++	configfs_unregister_default_group(dt->group);
++}
++EXPORT_SYMBOL(iio_unregister_sw_device_type);
++
++static
++struct iio_sw_device_type *iio_get_sw_device_type(const char *name)
++{
++	struct iio_sw_device_type *dt;
++
++	mutex_lock(&iio_device_types_lock);
++	dt = __iio_find_sw_device_type(name, strlen(name));
++	if (dt && !try_module_get(dt->owner))
++		dt = NULL;
++	mutex_unlock(&iio_device_types_lock);
++
++	return dt;
++}
++
++struct iio_sw_device *iio_sw_device_create(const char *type, const char *name)
++{
++	struct iio_sw_device *d;
++	struct iio_sw_device_type *dt;
++
++	dt = iio_get_sw_device_type(type);
++	if (!dt) {
++		pr_err("Invalid device type: %s\n", type);
++		return ERR_PTR(-EINVAL);
++	}
++	d = dt->ops->probe(name);
++	if (IS_ERR(d))
++		goto out_module_put;
++
++	d->device_type = dt;
++
++	return d;
++out_module_put:
++	module_put(dt->owner);
++	return d;
++}
++EXPORT_SYMBOL(iio_sw_device_create);
++
++void iio_sw_device_destroy(struct iio_sw_device *d)
++{
++	struct iio_sw_device_type *dt = d->device_type;
++
++	dt->ops->remove(d);
++	module_put(dt->owner);
++}
++EXPORT_SYMBOL(iio_sw_device_destroy);
++
++static struct config_group *device_make_group(struct config_group *group,
++					      const char *name)
++{
++	struct iio_sw_device *d;
++
++	d = iio_sw_device_create(group->cg_item.ci_name, name);
++	if (IS_ERR(d))
++		return ERR_CAST(d);
++
++	config_item_set_name(&d->group.cg_item, "%s", name);
++
++	return &d->group;
++}
++
++static void device_drop_group(struct config_group *group,
++			      struct config_item *item)
++{
++	struct iio_sw_device *d = to_iio_sw_device(item);
++
++	iio_sw_device_destroy(d);
++	config_item_put(item);
++}
++
++static struct configfs_group_operations device_ops = {
++	.make_group	= &device_make_group,
++	.drop_item	= &device_drop_group,
++};
++
++static struct config_item_type iio_device_type_group_type = {
++	.ct_group_ops = &device_ops,
++	.ct_owner       = THIS_MODULE,
++};
++
++static int __init iio_sw_device_init(void)
++{
++	iio_devices_group =
++		configfs_register_default_group(&iio_configfs_subsys.su_group,
++						"devices",
++						&iio_devices_group_type);
++	return PTR_ERR_OR_ZERO(iio_devices_group);
++}
++module_init(iio_sw_device_init);
++
++static void __exit iio_sw_device_exit(void)
++{
++	configfs_unregister_default_group(iio_devices_group);
++}
++module_exit(iio_sw_device_exit);
++
++MODULE_AUTHOR("Daniel Baluta <daniel.baluta@intel.com>");
++MODULE_DESCRIPTION("Industrial I/O software devices support");
++MODULE_LICENSE("GPL v2");
+diff --git a/include/linux/iio/sw_device.h b/include/linux/iio/sw_device.h
+new file mode 100644
+index 000000000000..23ca41515527
+--- /dev/null
++++ b/include/linux/iio/sw_device.h
+@@ -0,0 +1,70 @@
++/*
++ * Industrial I/O software device interface
++ *
++ * Copyright (c) 2016 Intel Corporation
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 as published by
++ * the Free Software Foundation.
++ */
++
++#ifndef __IIO_SW_DEVICE
++#define __IIO_SW_DEVICE
++
++#include <linux/module.h>
++#include <linux/device.h>
++#include <linux/iio/iio.h>
++#include <linux/configfs.h>
++
++#define module_iio_sw_device_driver(__iio_sw_device_type) \
++	module_driver(__iio_sw_device_type, iio_register_sw_device_type, \
++		      iio_unregister_sw_device_type)
++
++struct iio_sw_device_ops;
++
++struct iio_sw_device_type {
++	const char *name;
++	struct module *owner;
++	const struct iio_sw_device_ops *ops;
++	struct list_head list;
++	struct config_group *group;
++};
++
++struct iio_sw_device {
++	struct iio_dev *device;
++	struct iio_sw_device_type *device_type;
++	struct config_group group;
++};
++
++struct iio_sw_device_ops {
++	struct iio_sw_device* (*probe)(const char *);
++	int (*remove)(struct iio_sw_device *);
++};
++
++static inline
++struct iio_sw_device *to_iio_sw_device(struct config_item *item)
++{
++	return container_of(to_config_group(item), struct iio_sw_device,
++			    group);
++}
++
++int iio_register_sw_device_type(struct iio_sw_device_type *dt);
++void iio_unregister_sw_device_type(struct iio_sw_device_type *dt);
++
++struct iio_sw_device *iio_sw_device_create(const char *, const char *);
++void iio_sw_device_destroy(struct iio_sw_device *);
++
++int iio_sw_device_type_configfs_register(struct iio_sw_device_type *dt);
++void iio_sw_device_type_configfs_unregister(struct iio_sw_device_type *dt);
++
++static inline
++void iio_swd_group_init_type_name(struct iio_sw_device *d,
++				  const char *name,
++				  struct config_item_type *type)
++{
++#ifdef CONFIG_CONFIGFS_FS
++	config_group_init_type_name(&d->group, name, type);
++#endif
++}
++
++#endif /* __IIO_SW_DEVICE */
