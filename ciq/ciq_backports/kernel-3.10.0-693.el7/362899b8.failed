@@ -1,0 +1,110 @@
+macvtap: switch to use skb array
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jason Wang <jasowang@redhat.com>
+commit 362899b8725b35e32802882c67f99cbf42bce2af
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/362899b8.failed
+
+This patch switch to use skb array instead of sk_receive_queue to
+avoid spinlock contentions. Tests shows about 21% improvements for
+guest rx pps:
+
+Before: 1472731 pkts/s
+After:  1786289 pkts/s
+
+	Signed-off-by: Jason Wang <jasowang@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 362899b8725b35e32802882c67f99cbf42bce2af)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/macvtap.c
+diff --cc drivers/net/macvtap.c
+index 5f51ecdb243d,9204d19fb30c..000000000000
+--- a/drivers/net/macvtap.c
++++ b/drivers/net/macvtap.c
+@@@ -531,9 -553,9 +544,9 @@@ static int macvtap_open(struct inode *i
+  
+  	err = -ENOMEM;
+  	q = (struct macvtap_queue *)sk_alloc(net, AF_UNSPEC, GFP_KERNEL,
+ -					     &macvtap_proto, 0);
+ +					     &macvtap_proto);
+  	if (!q)
+- 		goto out;
++ 		goto err;
+  
+  	RCU_INIT_POINTER(q->sock.wq, &q->wq);
+  	init_waitqueue_head(&q->wq.wait);
+@@@ -1033,21 -882,25 +1059,30 @@@ static ssize_t macvtap_do_read(struct m
+  					TASK_INTERRUPTIBLE);
+  
+  		/* Read frames from the queue */
+++<<<<<<< HEAD
+ +		skb = skb_dequeue(&q->sk.sk_receive_queue);
+ +		if (!skb) {
+ +			if (noblock) {
+ +				ret = -EAGAIN;
+ +				break;
+ +			}
+ +			if (signal_pending(current)) {
+ +				ret = -ERESTARTSYS;
+ +				break;
+ +			}
+ +			/* Nothing to read, let's sleep */
+ +			schedule();
+ +			continue;
+++=======
++ 		skb = skb_array_consume(&q->skb_array);
++ 		if (skb)
++ 			break;
++ 		if (noblock) {
++ 			ret = -EAGAIN;
++ 			break;
+++>>>>>>> 362899b8725b (macvtap: switch to use skb array)
+  		}
+ -		if (signal_pending(current)) {
+ -			ret = -ERESTARTSYS;
+ -			break;
+ -		}
+ -		/* Nothing to read, let's sleep */
+ -		schedule();
+ -	}
+ -	if (!noblock)
+ -		finish_wait(sk_sleep(&q->sk), &wait);
+ -
+ -	if (skb) {
+ -		ret = macvtap_put_user(q, skb, to);
+ +		ret = macvtap_put_user(q, skb, iv, len);
+  		if (unlikely(ret < 0))
+  			kfree_skb(skb);
+  		else
+@@@ -1386,12 -1291,24 +1451,16 @@@ static int macvtap_device_event(struct 
+  			macvtap_free_minor(vlan);
+  			return notifier_from_errno(PTR_ERR(classdev));
+  		}
+ -		err = sysfs_create_link(&dev->dev.kobj, &classdev->kobj,
+ -					tap_name);
+ -		if (err)
+ -			return notifier_from_errno(err);
+  		break;
+  	case NETDEV_UNREGISTER:
+ -		/* vlan->minor == 0 if NETDEV_REGISTER above failed */
+ -		if (vlan->minor == 0)
+ -			break;
+ -		sysfs_remove_link(&dev->dev.kobj, tap_name);
+  		devt = MKDEV(MAJOR(macvtap_major), vlan->minor);
+ -		device_destroy(&macvtap_class, devt);
+ +		device_destroy(macvtap_class, devt);
+  		macvtap_free_minor(vlan);
+  		break;
++ 	case NETDEV_CHANGE_TX_QUEUE_LEN:
++ 		if (macvtap_queue_resize(vlan))
++ 			return NOTIFY_BAD;
++ 		break;
+  	}
+  
+  	return NOTIFY_DONE;
+* Unmerged path drivers/net/macvtap.c
