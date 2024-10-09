@@ -1,0 +1,208 @@
+nfp: register flower reprs for egress dev offload
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author John Hurley <john.hurley@netronome.com>
+commit 1a24d4f9c07cc5b9d2207cd84236dff3048438e5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/1a24d4f9.failed
+
+Register a callback for offloading flows that have a repr as their egress
+device. The new egdev_register function is added to net-next for the 4.15
+release.
+
+	Signed-off-by: John Hurley <john.hurley@netronome.com>
+	Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1a24d4f9c07cc5b9d2207cd84236dff3048438e5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/flower/offload.c
+diff --cc drivers/net/ethernet/netronome/nfp/flower/offload.c
+index 0e039508dc42,a0193e0c24a0..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/offload.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/offload.c
+@@@ -463,6 -465,52 +463,55 @@@ nfp_flower_repr_offload(struct nfp_app 
+  	return -EOPNOTSUPP;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int nfp_flower_setup_tc_egress_cb(enum tc_setup_type type, void *type_data,
++ 				  void *cb_priv)
++ {
++ 	return -EINVAL;
++ }
++ 
++ static int nfp_flower_setup_tc_block_cb(enum tc_setup_type type,
++ 					void *type_data, void *cb_priv)
++ {
++ 	struct nfp_repr *repr = cb_priv;
++ 
++ 	if (!tc_can_offload(repr->netdev))
++ 		return -EOPNOTSUPP;
++ 
++ 	switch (type) {
++ 	case TC_SETUP_CLSFLOWER:
++ 		return nfp_flower_repr_offload(repr->app, repr->netdev,
++ 					       type_data);
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
++ static int nfp_flower_setup_tc_block(struct net_device *netdev,
++ 				     struct tc_block_offload *f)
++ {
++ 	struct nfp_repr *repr = netdev_priv(netdev);
++ 
++ 	if (f->binder_type != TCF_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
++ 		return -EOPNOTSUPP;
++ 
++ 	switch (f->command) {
++ 	case TC_BLOCK_BIND:
++ 		return tcf_block_cb_register(f->block,
++ 					     nfp_flower_setup_tc_block_cb,
++ 					     repr, repr);
++ 	case TC_BLOCK_UNBIND:
++ 		tcf_block_cb_unregister(f->block,
++ 					nfp_flower_setup_tc_block_cb,
++ 					repr);
++ 		return 0;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
+++>>>>>>> 1a24d4f9c07c (nfp: register flower reprs for egress dev offload)
+  int nfp_flower_setup_tc(struct nfp_app *app, struct net_device *netdev,
+  			enum tc_setup_type type, void *type_data)
+  {
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/main.c b/drivers/net/ethernet/netronome/nfp/flower/main.c
+index e0283bb24f06..8fcc90c0d2d3 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/main.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/main.c
+@@ -125,6 +125,21 @@ nfp_flower_repr_netdev_stop(struct nfp_app *app, struct nfp_repr *repr)
+ 	return nfp_flower_cmsg_portmod(repr, false);
+ }
+ 
++static int
++nfp_flower_repr_netdev_init(struct nfp_app *app, struct net_device *netdev)
++{
++	return tc_setup_cb_egdev_register(netdev,
++					  nfp_flower_setup_tc_egress_cb,
++					  netdev_priv(netdev));
++}
++
++static void
++nfp_flower_repr_netdev_clean(struct nfp_app *app, struct net_device *netdev)
++{
++	tc_setup_cb_egdev_unregister(netdev, nfp_flower_setup_tc_egress_cb,
++				     netdev_priv(netdev));
++}
++
+ static void nfp_flower_sriov_disable(struct nfp_app *app)
+ {
+ 	struct nfp_flower_priv *priv = app->priv;
+@@ -452,6 +467,9 @@ const struct nfp_app_type app_flower = {
+ 	.vnic_init	= nfp_flower_vnic_init,
+ 	.vnic_clean	= nfp_flower_vnic_clean,
+ 
++	.repr_init	= nfp_flower_repr_netdev_init,
++	.repr_clean	= nfp_flower_repr_netdev_clean,
++
+ 	.repr_open	= nfp_flower_repr_netdev_open,
+ 	.repr_stop	= nfp_flower_repr_netdev_stop,
+ 
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/main.h b/drivers/net/ethernet/netronome/nfp/flower/main.h
+index ef57da28fedd..82b32832b519 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/main.h
++++ b/drivers/net/ethernet/netronome/nfp/flower/main.h
+@@ -209,5 +209,7 @@ void nfp_tunnel_del_ipv4_off(struct nfp_app *app, __be32 ipv4);
+ void nfp_tunnel_add_ipv4_off(struct nfp_app *app, __be32 ipv4);
+ void nfp_tunnel_request_route(struct nfp_app *app, struct sk_buff *skb);
+ void nfp_tunnel_keep_alive(struct nfp_app *app, struct sk_buff *skb);
++int nfp_flower_setup_tc_egress_cb(enum tc_setup_type type, void *type_data,
++				  void *cb_priv);
+ 
+ #endif
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/offload.c
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_app.h b/drivers/net/ethernet/netronome/nfp/nfp_app.h
+index b6035aad75b0..062b4c060c4b 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_app.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_app.h
+@@ -76,6 +76,8 @@ extern const struct nfp_app_type app_flower;
+  * @vnic_free:	free up app's vNIC state
+  * @vnic_init:	vNIC netdev was registered
+  * @vnic_clean:	vNIC netdev about to be unregistered
++ * @repr_init:	representor about to be registered
++ * @repr_clean:	representor about to be unregistered
+  * @repr_open:	representor netdev open callback
+  * @repr_stop:	representor netdev stop callback
+  * @start:	start application logic
+@@ -106,6 +108,9 @@ struct nfp_app_type {
+ 	int (*vnic_init)(struct nfp_app *app, struct nfp_net *nn);
+ 	void (*vnic_clean)(struct nfp_app *app, struct nfp_net *nn);
+ 
++	int (*repr_init)(struct nfp_app *app, struct net_device *netdev);
++	void (*repr_clean)(struct nfp_app *app, struct net_device *netdev);
++
+ 	int (*repr_open)(struct nfp_app *app, struct nfp_repr *repr);
+ 	int (*repr_stop)(struct nfp_app *app, struct nfp_repr *repr);
+ 
+@@ -203,6 +208,21 @@ static inline int nfp_app_repr_stop(struct nfp_app *app, struct nfp_repr *repr)
+ 	return app->type->repr_stop(app, repr);
+ }
+ 
++static inline int
++nfp_app_repr_init(struct nfp_app *app, struct net_device *netdev)
++{
++	if (!app->type->repr_init)
++		return 0;
++	return app->type->repr_init(app, netdev);
++}
++
++static inline void
++nfp_app_repr_clean(struct nfp_app *app, struct net_device *netdev)
++{
++	if (app->type->repr_clean)
++		app->type->repr_clean(app, netdev);
++}
++
+ static inline int nfp_app_start(struct nfp_app *app, struct nfp_net *ctrl)
+ {
+ 	app->ctrl = ctrl;
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net_repr.c b/drivers/net/ethernet/netronome/nfp/nfp_net_repr.c
+index d5a948fafb7e..d7f0c383bbfa 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_repr.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_repr.c
+@@ -255,6 +255,7 @@ const struct net_device_ops nfp_repr_netdev_ops = {
+ static void nfp_repr_clean(struct nfp_repr *repr)
+ {
+ 	unregister_netdev(repr->netdev);
++	nfp_app_repr_clean(repr->app, repr->netdev);
+ 	dst_release((struct dst_entry *)repr->dst);
+ 	nfp_port_free(repr->port);
+ }
+@@ -303,12 +304,18 @@ int nfp_repr_init(struct nfp_app *app, struct net_device *netdev,
+ 		netdev->hw_features |= NETIF_F_HW_TC;
+ 	}
+ 
+-	err = register_netdev(netdev);
++	err = nfp_app_repr_init(app, netdev);
+ 	if (err)
+ 		goto err_clean;
+ 
++	err = register_netdev(netdev);
++	if (err)
++		goto err_repr_clean;
++
+ 	return 0;
+ 
++err_repr_clean:
++	nfp_app_repr_clean(app, netdev);
+ err_clean:
+ 	dst_release((struct dst_entry *)repr->dst);
+ 	return err;
