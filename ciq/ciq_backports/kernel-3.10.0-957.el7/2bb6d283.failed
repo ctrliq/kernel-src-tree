@@ -1,0 +1,335 @@
+mm: introduce get_user_pages_longterm
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mm] introduce get_user_pages_longterm (Jeff Moyer) [1505291]
+Rebuild_FUZZ: 94.29%
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 2bb6d2837083de722bfdc369cb0d76ce188dd9b4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/2bb6d283.failed
+
+Patch series "introduce get_user_pages_longterm()", v2.
+
+Here is a new get_user_pages api for cases where a driver intends to
+keep an elevated page count indefinitely.  This is distinct from usages
+like iov_iter_get_pages where the elevated page counts are transient.
+The iov_iter_get_pages cases immediately turn around and submit the
+pages to a device driver which will put_page when the i/o operation
+completes (under kernel control).
+
+In the longterm case userspace is responsible for dropping the page
+reference at some undefined point in the future.  This is untenable for
+filesystem-dax case where the filesystem is in control of the lifetime
+of the block / page and needs reasonable limits on how long it can wait
+for pages in a mapping to become idle.
+
+Fixing filesystems to actually wait for dax pages to be idle before
+blocks from a truncate/hole-punch operation are repurposed is saved for
+a later patch series.
+
+Also, allowing longterm registration of dax mappings is a future patch
+series that introduces a "map with lease" semantic where the kernel can
+revoke a lease and force userspace to drop its page references.
+
+I have also tagged these for -stable to purposely break cases that might
+assume that longterm memory registrations for filesystem-dax mappings
+were supported by the kernel.  The behavior regression this policy
+change implies is one of the reasons we maintain the "dax enabled.
+Warning: EXPERIMENTAL, use at your own risk" notification when mounting
+a filesystem in dax mode.
+
+It is worth noting the device-dax interface does not suffer the same
+constraints since it does not support file space management operations
+like hole-punch.
+
+This patch (of 4):
+
+Until there is a solution to the dma-to-dax vs truncate problem it is
+not safe to allow long standing memory registrations against
+filesytem-dax vmas.  Device-dax vmas do not have this problem and are
+explicitly allowed.
+
+This is temporary until a "memory registration with layout-lease"
+mechanism can be implemented for the affected sub-systems (RDMA and
+V4L2).
+
+[akpm@linux-foundation.org: use kcalloc()]
+Link: http://lkml.kernel.org/r/151068939435.7446.13560129395419350737.stgit@dwillia2-desk3.amr.corp.intel.com
+Fixes: 3565fce3a659 ("mm, x86: get_user_pages() for dax mappings")
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+	Suggested-by: Christoph Hellwig <hch@lst.de>
+	Cc: Doug Ledford <dledford@redhat.com>
+	Cc: Hal Rosenstock <hal.rosenstock@gmail.com>
+	Cc: Inki Dae <inki.dae@samsung.com>
+	Cc: Jan Kara <jack@suse.cz>
+	Cc: Jason Gunthorpe <jgg@mellanox.com>
+	Cc: Jeff Moyer <jmoyer@redhat.com>
+	Cc: Joonyoung Shim <jy0922.shim@samsung.com>
+	Cc: Kyungmin Park <kyungmin.park@samsung.com>
+	Cc: Mauro Carvalho Chehab <mchehab@kernel.org>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Cc: Sean Hefty <sean.hefty@intel.com>
+	Cc: Seung-Woo Kim <sw0312.kim@samsung.com>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 2bb6d2837083de722bfdc369cb0d76ce188dd9b4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/fs.h
+#	include/linux/mm.h
+diff --cc include/linux/fs.h
+index e3bcdb55c057,9dc498d16cc1..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -3192,6 -3194,53 +3192,56 @@@ static inline bool vma_is_dax(struct vm
+  	return vma->vm_file && IS_DAX(vma->vm_file->f_mapping->host);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool vma_is_fsdax(struct vm_area_struct *vma)
++ {
++ 	struct inode *inode;
++ 
++ 	if (!vma->vm_file)
++ 		return false;
++ 	if (!vma_is_dax(vma))
++ 		return false;
++ 	inode = file_inode(vma->vm_file);
++ 	if (inode->i_mode == S_IFCHR)
++ 		return false; /* device-dax */
++ 	return true;
++ }
++ 
++ static inline int iocb_flags(struct file *file)
++ {
++ 	int res = 0;
++ 	if (file->f_flags & O_APPEND)
++ 		res |= IOCB_APPEND;
++ 	if (io_is_direct(file))
++ 		res |= IOCB_DIRECT;
++ 	if ((file->f_flags & O_DSYNC) || IS_SYNC(file->f_mapping->host))
++ 		res |= IOCB_DSYNC;
++ 	if (file->f_flags & __O_SYNC)
++ 		res |= IOCB_SYNC;
++ 	return res;
++ }
++ 
++ static inline int kiocb_set_rw_flags(struct kiocb *ki, rwf_t flags)
++ {
++ 	if (unlikely(flags & ~RWF_SUPPORTED))
++ 		return -EOPNOTSUPP;
++ 
++ 	if (flags & RWF_NOWAIT) {
++ 		if (!(ki->ki_filp->f_mode & FMODE_NOWAIT))
++ 			return -EOPNOTSUPP;
++ 		ki->ki_flags |= IOCB_NOWAIT;
++ 	}
++ 	if (flags & RWF_HIPRI)
++ 		ki->ki_flags |= IOCB_HIPRI;
++ 	if (flags & RWF_DSYNC)
++ 		ki->ki_flags |= IOCB_DSYNC;
++ 	if (flags & RWF_SYNC)
++ 		ki->ki_flags |= (IOCB_DSYNC | IOCB_SYNC);
++ 	return 0;
++ }
++ 
+++>>>>>>> 2bb6d2837083 (mm: introduce get_user_pages_longterm)
+  static inline ino_t parent_ino(struct dentry *dentry)
+  {
+  	ino_t res;
+diff --cc include/linux/mm.h
+index a228f1a787bf,ea818ff739cd..000000000000
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@@ -1365,35 -1362,82 +1365,55 @@@ static inline int fixup_user_fault(stru
+  }
+  #endif
+  
+ -extern int access_process_vm(struct task_struct *tsk, unsigned long addr, void *buf, int len,
+ -		unsigned int gup_flags);
+ +extern int access_process_vm(struct task_struct *tsk, unsigned long addr, void *buf, int len, int write);
+  extern int access_remote_vm(struct mm_struct *mm, unsigned long addr,
+ -		void *buf, int len, unsigned int gup_flags);
+ -extern int __access_remote_vm(struct task_struct *tsk, struct mm_struct *mm,
+ -		unsigned long addr, void *buf, int len, unsigned int gup_flags);
+ +		void *buf, int len, int write);
+  
+ +long __get_user_pages(struct task_struct *tsk, struct mm_struct *mm,
+ +		      unsigned long start, unsigned long nr_pages,
+ +		      unsigned int foll_flags, struct page **pages,
+ +		      struct vm_area_struct **vmas, int *nonblocking);
+  long get_user_pages_remote(struct task_struct *tsk, struct mm_struct *mm,
+  			    unsigned long start, unsigned long nr_pages,
+ -			    unsigned int gup_flags, struct page **pages,
+ -			    struct vm_area_struct **vmas, int *locked);
+ -long get_user_pages(unsigned long start, unsigned long nr_pages,
+ -			    unsigned int gup_flags, struct page **pages,
+ +			    int write, int force, struct page **pages,
+  			    struct vm_area_struct **vmas);
+++<<<<<<< HEAD
+ +long get_user_pages(struct task_struct *tsk, struct mm_struct *mm,
+ +		    unsigned long start, unsigned long nr_pages,
+ +		    int write, int force, struct page **pages,
+ +		    struct vm_area_struct **vmas);
+ +long get_user_pages_locked(struct task_struct *tsk, struct mm_struct *mm,
+ +		    unsigned long start, unsigned long nr_pages,
+ +		    int write, int force, struct page **pages,
+ +		    int *locked);
+ +long __get_user_pages_unlocked(struct task_struct *tsk, struct mm_struct *mm,
+ +			       unsigned long start, unsigned long nr_pages,
+ +			       int write, int force, struct page **pages,
+ +			       unsigned int gup_flags);
+ +long get_user_pages_unlocked(struct task_struct *tsk, struct mm_struct *mm,
+ +		    unsigned long start, unsigned long nr_pages,
+ +		    int write, int force, struct page **pages);
+++=======
++ long get_user_pages_locked(unsigned long start, unsigned long nr_pages,
++ 		    unsigned int gup_flags, struct page **pages, int *locked);
++ long get_user_pages_unlocked(unsigned long start, unsigned long nr_pages,
++ 		    struct page **pages, unsigned int gup_flags);
++ #ifdef CONFIG_FS_DAX
++ long get_user_pages_longterm(unsigned long start, unsigned long nr_pages,
++ 			    unsigned int gup_flags, struct page **pages,
++ 			    struct vm_area_struct **vmas);
++ #else
++ static inline long get_user_pages_longterm(unsigned long start,
++ 		unsigned long nr_pages, unsigned int gup_flags,
++ 		struct page **pages, struct vm_area_struct **vmas)
++ {
++ 	return get_user_pages(start, nr_pages, gup_flags, pages, vmas);
++ }
++ #endif /* CONFIG_FS_DAX */
++ 
+++>>>>>>> 2bb6d2837083 (mm: introduce get_user_pages_longterm)
+  int get_user_pages_fast(unsigned long start, int nr_pages, int write,
+  			struct page **pages);
+ -
+ -/* Container for pinned pfns / pages */
+ -struct frame_vector {
+ -	unsigned int nr_allocated;	/* Number of frames we have space for */
+ -	unsigned int nr_frames;	/* Number of frames stored in ptrs array */
+ -	bool got_ref;		/* Did we pin pages by getting page ref? */
+ -	bool is_pfns;		/* Does array contain pages or pfns? */
+ -	void *ptrs[0];		/* Array of pinned pfns / pages. Use
+ -				 * pfns_vector_pages() or pfns_vector_pfns()
+ -				 * for access */
+ -};
+ -
+ -struct frame_vector *frame_vector_create(unsigned int nr_frames);
+ -void frame_vector_destroy(struct frame_vector *vec);
+ -int get_vaddr_frames(unsigned long start, unsigned int nr_pfns,
+ -		     unsigned int gup_flags, struct frame_vector *vec);
+ -void put_vaddr_frames(struct frame_vector *vec);
+ -int frame_vector_to_pages(struct frame_vector *vec);
+ -void frame_vector_to_pfns(struct frame_vector *vec);
+ -
+ -static inline unsigned int frame_vector_count(struct frame_vector *vec)
+ -{
+ -	return vec->nr_frames;
+ -}
+ -
+ -static inline struct page **frame_vector_pages(struct frame_vector *vec)
+ -{
+ -	if (vec->is_pfns) {
+ -		int err = frame_vector_to_pages(vec);
+ -
+ -		if (err)
+ -			return ERR_PTR(err);
+ -	}
+ -	return (struct page **)(vec->ptrs);
+ -}
+ -
+ -static inline unsigned long *frame_vector_pfns(struct frame_vector *vec)
+ -{
+ -	if (!vec->is_pfns)
+ -		frame_vector_to_pfns(vec);
+ -	return (unsigned long *)(vec->ptrs);
+ -}
+ -
+  struct kvec;
+  int get_kernel_pages(const struct kvec *iov, int nr_pages, int write,
+  			struct page **pages);
+* Unmerged path include/linux/fs.h
+* Unmerged path include/linux/mm.h
+diff --git a/mm/gup.c b/mm/gup.c
+index 20b926f646c5..0f82892a9f3e 100644
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@ -904,6 +904,70 @@ long get_user_pages(struct task_struct *tsk, struct mm_struct *mm,
+ }
+ EXPORT_SYMBOL(get_user_pages);
+ 
++#ifdef CONFIG_FS_DAX
++/*
++ * This is the same as get_user_pages() in that it assumes we are
++ * operating on the current task's mm, but it goes further to validate
++ * that the vmas associated with the address range are suitable for
++ * longterm elevated page reference counts. For example, filesystem-dax
++ * mappings are subject to the lifetime enforced by the filesystem and
++ * we need guarantees that longterm users like RDMA and V4L2 only
++ * establish mappings that have a kernel enforced revocation mechanism.
++ *
++ * "longterm" == userspace controlled elevated page count lifetime.
++ * Contrast this to iov_iter_get_pages() usages which are transient.
++ */
++long get_user_pages_longterm(unsigned long start, unsigned long nr_pages,
++		unsigned int gup_flags, struct page **pages,
++		struct vm_area_struct **vmas_arg)
++{
++	struct vm_area_struct **vmas = vmas_arg;
++	struct vm_area_struct *vma_prev = NULL;
++	long rc, i;
++
++	if (!pages)
++		return -EINVAL;
++
++	if (!vmas) {
++		vmas = kcalloc(nr_pages, sizeof(struct vm_area_struct *),
++			       GFP_KERNEL);
++		if (!vmas)
++			return -ENOMEM;
++	}
++
++	rc = get_user_pages(start, nr_pages, gup_flags, pages, vmas);
++
++	for (i = 0; i < rc; i++) {
++		struct vm_area_struct *vma = vmas[i];
++
++		if (vma == vma_prev)
++			continue;
++
++		vma_prev = vma;
++
++		if (vma_is_fsdax(vma))
++			break;
++	}
++
++	/*
++	 * Either get_user_pages() failed, or the vma validation
++	 * succeeded, in either case we don't need to put_page() before
++	 * returning.
++	 */
++	if (i >= rc)
++		goto out;
++
++	for (i = 0; i < rc; i++)
++		put_page(pages[i]);
++	rc = -EOPNOTSUPP;
++out:
++	if (vmas != vmas_arg)
++		kfree(vmas);
++	return rc;
++}
++EXPORT_SYMBOL(get_user_pages_longterm);
++#endif /* CONFIG_FS_DAX */
++
+ /**
+  * get_dump_page() - pin user page in memory while writing it to core dump
+  * @addr: user address
