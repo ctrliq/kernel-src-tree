@@ -1865,12 +1865,11 @@ static void __srpt_close_ch(struct srpt_rdma_ch *ch)
  */
 static void srpt_close_ch(struct srpt_rdma_ch *ch)
 {
-	struct srpt_device *sdev;
+	struct srpt_device *sdev = ch->sport->sdev;
 
-	sdev = ch->sport->sdev;
-	spin_lock_irq(&sdev->spinlock);
+	mutex_lock(&sdev->mutex);
 	__srpt_close_ch(ch);
-	spin_unlock_irq(&sdev->spinlock);
+	mutex_unlock(&sdev->mutex);
 }
 
 /**
@@ -1957,11 +1956,11 @@ static void srpt_release_channel_work(struct work_struct *w)
 			     ch->sport->sdev, ch->rq_size,
 			     ch->rsp_size, DMA_TO_DEVICE);
 
-	spin_lock_irq(&sdev->spinlock);
+	mutex_lock(&sdev->mutex);
 	list_del_init(&ch->list);
 	if (ch->release_done)
 		complete(ch->release_done);
-	spin_unlock_irq(&sdev->spinlock);
+	mutex_unlock(&sdev->mutex);
 
 	wake_up(&sdev->ch_releaseQ);
 
@@ -2067,7 +2066,7 @@ static int srpt_cm_req_recv(struct ib_cm_id *cm_id,
 	if ((req->req_flags & SRP_MTCH_ACTION) == SRP_MULTICHAN_SINGLE) {
 		rsp->rsp_flags = SRP_LOGIN_RSP_MULTICHAN_NO_CHAN;
 
-		spin_lock_irq(&sdev->spinlock);
+		mutex_lock(&sdev->mutex);
 
 		list_for_each_entry_safe(ch, tmp_ch, &sdev->rch_list, list) {
 			if (!memcmp(ch->i_port_id, req->initiator_port_id, 16)
@@ -2091,7 +2090,7 @@ static int srpt_cm_req_recv(struct ib_cm_id *cm_id,
 			}
 		}
 
-		spin_unlock_irq(&sdev->spinlock);
+		mutex_unlock(&sdev->mutex);
 
 	} else
 		rsp->rsp_flags = SRP_LOGIN_RSP_MULTICHAN_MAINTAINED;
@@ -2222,9 +2221,9 @@ static int srpt_cm_req_recv(struct ib_cm_id *cm_id,
 		goto release_channel;
 	}
 
-	spin_lock_irq(&sdev->spinlock);
+	mutex_lock(&sdev->mutex);
 	list_add_tail(&ch->list, &sdev->rch_list);
-	spin_unlock_irq(&sdev->spinlock);
+	mutex_unlock(&sdev->mutex);
 
 	goto out;
 
@@ -2669,17 +2668,6 @@ static void srpt_refresh_port_work(struct work_struct *work)
 	srpt_refresh_port(sport);
 }
 
-static int srpt_ch_list_empty(struct srpt_device *sdev)
-{
-	int res;
-
-	spin_lock_irq(&sdev->spinlock);
-	res = list_empty(&sdev->rch_list);
-	spin_unlock_irq(&sdev->spinlock);
-
-	return res;
-}
-
 /**
  * srpt_release_sdev() - Free the channel resources associated with a target.
  */
@@ -2692,13 +2680,13 @@ static int srpt_release_sdev(struct srpt_device *sdev)
 
 	BUG_ON(!sdev);
 
-	spin_lock_irq(&sdev->spinlock);
+	mutex_lock(&sdev->mutex);
 	list_for_each_entry_safe(ch, tmp_ch, &sdev->rch_list, list)
 		__srpt_close_ch(ch);
-	spin_unlock_irq(&sdev->spinlock);
+	mutex_unlock(&sdev->mutex);
 
 	res = wait_event_interruptible(sdev->ch_releaseQ,
-				       srpt_ch_list_empty(sdev));
+				       list_empty_careful(&sdev->rch_list));
 	if (res)
 		pr_err("%s: interrupted.\n", __func__);
 
@@ -2759,7 +2747,7 @@ static void srpt_add_one(struct ib_device *device)
 	sdev->device = device;
 	INIT_LIST_HEAD(&sdev->rch_list);
 	init_waitqueue_head(&sdev->ch_releaseQ);
-	spin_lock_init(&sdev->spinlock);
+	mutex_init(&sdev->mutex);
 
 	sdev->pd = ib_alloc_pd(device);
 	if (IS_ERR(sdev->pd))
@@ -3057,12 +3045,12 @@ static void srpt_close_session(struct se_session *se_sess)
 	pr_debug("ch %s-%d state %d\n", ch->sess_name, ch->qp->qp_num,
 		 ch->state);
 
-	spin_lock_irq(&sdev->spinlock);
+	mutex_lock(&sdev->mutex);
 	BUG_ON(ch->release_done);
 	ch->release_done = &release_done;
 	wait = !list_empty(&ch->list);
 	__srpt_close_ch(ch);
-	spin_unlock_irq(&sdev->spinlock);
+	mutex_unlock(&sdev->mutex);
 
 	if (!wait)
 		return;
