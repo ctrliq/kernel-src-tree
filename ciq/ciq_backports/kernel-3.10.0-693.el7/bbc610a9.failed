@@ -1,0 +1,281 @@
+s390/scm_block: handle multiple requests in one HW request
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [s390] scm_block: handle multiple requests in one HW request (Hendrik Brueckner) [1274409]
+Rebuild_FUZZ: 95.50%
+commit-author Sebastian Ott <sebott@linux.vnet.ibm.com>
+commit bbc610a96524fbfa4ed38c4b1fc6348a1169f358
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/bbc610a9.failed
+
+Handle up to 8 block layer requests per HW request. These requests
+can be processed in parallel on the device leading to better
+throughput (and less interrupts). The overhead for additional
+requests is small since we don't blindly allocate new aidaws but
+try to use what's left of the previous one.
+
+	Signed-off-by: Sebastian Ott <sebott@linux.vnet.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit bbc610a96524fbfa4ed38c4b1fc6348a1169f358)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/block/scm_blk.c
+#	drivers/s390/block/scm_blk.h
+#	drivers/s390/block/scm_blk_cluster.c
+diff --cc drivers/s390/block/scm_blk.c
+index b2ecdc8a0df9,cd27cb92ac6d..000000000000
+--- a/drivers/s390/block/scm_blk.c
++++ b/drivers/s390/block/scm_blk.c
+@@@ -112,7 -118,19 +112,22 @@@ out
+  static void scm_request_done(struct scm_request *scmrq)
+  {
+  	unsigned long flags;
++ 	struct msb *msb;
++ 	u64 aidaw;
++ 	int i;
++ 
+++<<<<<<< HEAD
+++=======
++ 	for (i = 0; i < SCM_RQ_PER_IO && scmrq->request[i]; i++) {
++ 		msb = &scmrq->aob->msb[i];
++ 		aidaw = msb->data_addr;
++ 
++ 		if ((msb->flags & MSB_FLAG_IDA) && aidaw &&
++ 		    IS_ALIGNED(aidaw, PAGE_SIZE))
++ 			mempool_free(virt_to_page(aidaw), aidaw_pool);
++ 	}
+  
+++>>>>>>> bbc610a96524 (s390/scm_block: handle multiple requests in one HW request)
+  	spin_lock_irqsave(&list_lock, flags);
+  	list_add(&scmrq->list, &inactive_requests);
+  	spin_unlock_irqrestore(&list_lock, flags);
+@@@ -127,26 -173,39 +142,55 @@@ static void scm_request_prepare(struct 
+  {
+  	struct scm_blk_dev *bdev = scmrq->bdev;
+  	struct scm_device *scmdev = bdev->gendisk->private_data;
+++<<<<<<< HEAD
+ +	struct aidaw *aidaw = scmrq->aidaw;
+ +	struct msb *msb = &scmrq->aob->msb[0];
+ +	struct req_iterator iter;
+ +	struct bio_vec *bv;
+++=======
++ 	int pos = scmrq->aob->request.msb_count;
++ 	struct msb *msb = &scmrq->aob->msb[pos];
++ 	struct request *req = scmrq->request[pos];
++ 	struct req_iterator iter;
++ 	struct aidaw *aidaw;
++ 	struct bio_vec bv;
++ 
++ 	aidaw = scm_aidaw_fetch(scmrq, blk_rq_bytes(req));
++ 	if (!aidaw)
++ 		return -ENOMEM;
+++>>>>>>> bbc610a96524 (s390/scm_block: handle multiple requests in one HW request)
+  
+  	msb->bs = MSB_BS_4K;
+- 	scmrq->aob->request.msb_count = 1;
+- 	msb->scm_addr = scmdev->address +
+- 		((u64) blk_rq_pos(scmrq->request) << 9);
+- 	msb->oc = (rq_data_dir(scmrq->request) == READ) ?
+- 		MSB_OC_READ : MSB_OC_WRITE;
++ 	scmrq->aob->request.msb_count++;
++ 	msb->scm_addr = scmdev->address + ((u64) blk_rq_pos(req) << 9);
++ 	msb->oc = (rq_data_dir(req) == READ) ? MSB_OC_READ : MSB_OC_WRITE;
+  	msb->flags |= MSB_FLAG_IDA;
+  	msb->data_addr = (u64) aidaw;
+  
+++<<<<<<< HEAD
+ +	rq_for_each_segment(bv, scmrq->request, iter) {
+ +		WARN_ON(bv->bv_offset);
+ +		msb->blk_count += bv->bv_len >> 12;
+ +		aidaw->data_addr = (u64) page_address(bv->bv_page);
+ +		aidaw++;
+ +	}
+++=======
++ 	rq_for_each_segment(bv, req, iter) {
++ 		WARN_ON(bv.bv_offset);
++ 		msb->blk_count += bv.bv_len >> 12;
++ 		aidaw->data_addr = (u64) page_address(bv.bv_page);
++ 		aidaw++;
++ 	}
++ 
++ 	scmrq->next_aidaw = aidaw;
++ 	return 0;
+++>>>>>>> bbc610a96524 (s390/scm_block: handle multiple requests in one HW request)
++ }
++ 
++ static inline void scm_request_set(struct scm_request *scmrq,
++ 				   struct request *req)
++ {
++ 	scmrq->request[scmrq->aob->request.msb_count] = req;
+  }
+  
+  static inline void scm_request_init(struct scm_blk_dev *bdev,
+@@@ -156,15 -214,16 +199,20 @@@
+  	struct aob_rq_header *aobrq = to_aobrq(scmrq);
+  	struct aob *aob = scmrq->aob;
+  
++ 	memset(scmrq->request, 0, sizeof(scmrq->request));
+  	memset(aob, 0, sizeof(*aob));
+ +	memset(scmrq->aidaw, 0, PAGE_SIZE);
+  	aobrq->scmdev = bdev->scmdev;
+  	aob->request.cmd_code = ARQB_CMD_MOVE;
+  	aob->request.data = (u64) aobrq;
+  	scmrq->bdev = bdev;
+  	scmrq->retries = 4;
+  	scmrq->error = 0;
+++<<<<<<< HEAD
+++=======
++ 	/* We don't use all msbs - place aidaws at the end of the aob page. */
++ 	scmrq->next_aidaw = (void *) &aob->msb[SCM_RQ_PER_IO];
+++>>>>>>> bbc610a96524 (s390/scm_block: handle multiple requests in one HW request)
+  	scm_request_cluster_init(scmrq);
+  }
+  
+@@@ -202,47 -286,75 +275,76 @@@ static void scm_blk_request(struct requ
+  {
+  	struct scm_device *scmdev = rq->queuedata;
+  	struct scm_blk_dev *bdev = dev_get_drvdata(&scmdev->dev);
+- 	struct scm_request *scmrq;
++ 	struct scm_request *scmrq = NULL;
+  	struct request *req;
+- 	int ret;
+  
+  	while ((req = blk_peek_request(rq))) {
+ -		if (req->cmd_type != REQ_TYPE_FS) {
+ -			blk_start_request(req);
+ -			blk_dump_rq_flags(req, KMSG_COMPONENT " bad request");
+ -			blk_end_request_all(req, -EIO);
+ +		if (req->cmd_type != REQ_TYPE_FS)
+  			continue;
+ -		}
+  
+- 		if (!scm_permit_request(bdev, req)) {
+- 			scm_ensure_queue_restart(bdev);
+- 			return;
+- 		}
+- 		scmrq = scm_request_fetch();
++ 		if (!scm_permit_request(bdev, req))
++ 			goto out;
++ 
+  		if (!scmrq) {
+- 			SCM_LOG(5, "no request");
+- 			scm_ensure_queue_restart(bdev);
+- 			return;
++ 			scmrq = scm_request_fetch();
++ 			if (!scmrq) {
++ 				SCM_LOG(5, "no request");
++ 				goto out;
++ 			}
++ 			scm_request_init(bdev, scmrq);
+  		}
+- 		scm_request_init(bdev, scmrq, req);
++ 		scm_request_set(scmrq, req);
++ 
+  		if (!scm_reserve_cluster(scmrq)) {
+  			SCM_LOG(5, "cluster busy");
++ 			scm_request_set(scmrq, NULL);
++ 			if (scmrq->aob->request.msb_count)
++ 				goto out;
++ 
+  			scm_request_done(scmrq);
+  			return;
+  		}
++ 
+  		if (scm_need_cluster_request(scmrq)) {
+- 			atomic_inc(&bdev->queued_reqs);
+- 			blk_start_request(req);
+- 			scm_initiate_cluster_request(scmrq);
+- 			return;
++ 			if (scmrq->aob->request.msb_count) {
++ 				/* Start cluster requests separately. */
++ 				scm_request_set(scmrq, NULL);
++ 				if (scm_request_start(scmrq))
++ 					return;
++ 			} else {
++ 				atomic_inc(&bdev->queued_reqs);
++ 				blk_start_request(req);
++ 				scm_initiate_cluster_request(scmrq);
++ 			}
++ 			scmrq = NULL;
++ 			continue;
+  		}
+++<<<<<<< HEAD
+ +		scm_request_prepare(scmrq);
+ +		atomic_inc(&bdev->queued_reqs);
+++=======
++ 
++ 		if (scm_request_prepare(scmrq)) {
++ 			SCM_LOG(5, "aidaw alloc failed");
++ 			scm_request_set(scmrq, NULL);
++ 			goto out;
++ 		}
+++>>>>>>> bbc610a96524 (s390/scm_block: handle multiple requests in one HW request)
+  		blk_start_request(req);
+  
+- 		ret = eadm_start_aob(scmrq->aob);
+- 		if (ret) {
+- 			SCM_LOG(5, "no subchannel");
+- 			scm_request_requeue(scmrq);
++ 		if (scmrq->aob->request.msb_count < SCM_RQ_PER_IO)
++ 			continue;
++ 
++ 		if (scm_request_start(scmrq))
+  			return;
+- 		}
++ 
++ 		scmrq = NULL;
+  	}
++ out:
++ 	if (scmrq)
++ 		scm_request_start(scmrq);
++ 	else
++ 		scm_ensure_queue_restart(bdev);
+  }
+  
+  static void __scmrq_log_error(struct scm_request *scmrq)
+diff --cc drivers/s390/block/scm_blk.h
+index 8b387b32fd62,3dae0a3570ce..000000000000
+--- a/drivers/s390/block/scm_blk.h
++++ b/drivers/s390/block/scm_blk.h
+@@@ -30,8 -31,8 +31,13 @@@ struct scm_blk_dev 
+  
+  struct scm_request {
+  	struct scm_blk_dev *bdev;
+++<<<<<<< HEAD
+ +	struct request *request;
+ +	struct aidaw *aidaw;
+++=======
++ 	struct aidaw *next_aidaw;
++ 	struct request *request[SCM_RQ_PER_IO];
+++>>>>>>> bbc610a96524 (s390/scm_block: handle multiple requests in one HW request)
+  	struct aob *aob;
+  	struct list_head list;
+  	u8 retries;
+diff --cc drivers/s390/block/scm_blk_cluster.c
+index 27f930cd657f,09db45296eed..000000000000
+--- a/drivers/s390/block/scm_blk_cluster.c
++++ b/drivers/s390/block/scm_blk_cluster.c
+@@@ -118,11 -131,11 +131,15 @@@ static void scm_prepare_cluster_request
+  {
+  	struct scm_blk_dev *bdev = scmrq->bdev;
+  	struct scm_device *scmdev = bdev->gendisk->private_data;
+++<<<<<<< HEAD
+ +	struct request *req = scmrq->request;
+ +	struct aidaw *aidaw = scmrq->aidaw;
+++=======
++ 	struct request *req = scmrq->request[0];
+++>>>>>>> bbc610a96524 (s390/scm_block: handle multiple requests in one HW request)
+  	struct msb *msb = &scmrq->aob->msb[0];
+  	struct req_iterator iter;
+ -	struct aidaw *aidaw;
+ -	struct bio_vec bv;
+ +	struct bio_vec *bv;
+  	int i = 0;
+  	u64 addr;
+  
+* Unmerged path drivers/s390/block/scm_blk.c
+* Unmerged path drivers/s390/block/scm_blk.h
+* Unmerged path drivers/s390/block/scm_blk_cluster.c
