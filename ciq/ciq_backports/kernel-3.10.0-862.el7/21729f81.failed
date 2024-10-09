@@ -1,0 +1,1093 @@
+x86/mm: Provide general kernel support for memory encryption
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] mm: Provide general kernel support for memory encryption (Suravee Suthikulpanit) [1361287]
+Rebuild_FUZZ: 96.55%
+commit-author Tom Lendacky <thomas.lendacky@amd.com>
+commit 21729f81ce8ae76a6995681d40e16f7ce8075db4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/21729f81.failed
+
+Changes to the existing page table macros will allow the SME support to
+be enabled in a simple fashion with minimal changes to files that use these
+macros.  Since the memory encryption mask will now be part of the regular
+pagetable macros, we introduce two new macros (_PAGE_TABLE_NOENC and
+_KERNPG_TABLE_NOENC) to allow for early pagetable creation/initialization
+without the encryption mask before SME becomes active.  Two new pgprot()
+macros are defined to allow setting or clearing the page encryption mask.
+
+The FIXMAP_PAGE_NOCACHE define is introduced for use with MMIO.  SME does
+not support encryption for MMIO areas so this define removes the encryption
+mask from the page attribute.
+
+Two new macros are introduced (__sme_pa() / __sme_pa_nodebug()) to allow
+creating a physical address with the encryption mask.  These are used when
+working with the cr3 register so that the PGD can be encrypted. The current
+__va() macro is updated so that the virtual address is generated based off
+of the physical address without the encryption mask thus allowing the same
+virtual address to be generated regardless of whether encryption is enabled
+for that physical location or not.
+
+Also, an early initialization function is added for SME.  If SME is active,
+this function:
+
+ - Updates the early_pmd_flags so that early page faults create mappings
+   with the encryption mask.
+
+ - Updates the __supported_pte_mask to include the encryption mask.
+
+ - Updates the protection_map entries to include the encryption mask so
+   that user-space allocations will automatically have the encryption mask
+   applied.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Borislav Petkov <bp@suse.de>
+	Cc: Alexander Potapenko <glider@google.com>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Arnd Bergmann <arnd@arndb.de>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brijesh Singh <brijesh.singh@amd.com>
+	Cc: Dave Young <dyoung@redhat.com>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Cc: Larry Woodman <lwoodman@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Matt Fleming <matt@codeblueprint.co.uk>
+	Cc: Michael S. Tsirkin <mst@redhat.com>
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Radim Krčmář <rkrcmar@redhat.com>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Toshimitsu Kani <toshi.kani@hpe.com>
+	Cc: kasan-dev@googlegroups.com
+	Cc: kvm@vger.kernel.org
+	Cc: linux-arch@vger.kernel.org
+	Cc: linux-doc@vger.kernel.org
+	Cc: linux-efi@vger.kernel.org
+	Cc: linux-mm@kvack.org
+Link: http://lkml.kernel.org/r/b36e952c4c39767ae7f0a41cf5345adf27438480.1500319216.git.thomas.lendacky@amd.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 21729f81ce8ae76a6995681d40e16f7ce8075db4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/fixmap.h
+#	arch/x86/include/asm/mem_encrypt.h
+#	arch/x86/include/asm/page_types.h
+#	arch/x86/include/asm/pgtable_types.h
+#	arch/x86/kernel/espfix_64.c
+#	arch/x86/kernel/head64.c
+#	arch/x86/kernel/head_64.S
+#	arch/x86/mm/kasan_init_64.c
+#	arch/x86/mm/mem_encrypt.c
+#	arch/x86/mm/pageattr.c
+#	arch/x86/mm/tlb.c
+#	include/linux/mem_encrypt.h
+diff --cc arch/x86/include/asm/fixmap.h
+index 9d7d36c82fc2,d9ff226cb489..000000000000
+--- a/arch/x86/include/asm/fixmap.h
++++ b/arch/x86/include/asm/fixmap.h
+@@@ -175,64 -157,20 +175,75 @@@ static inline void __set_fixmap(enum fi
+  }
+  #endif
+  
+++<<<<<<< HEAD
+ +#define set_fixmap(idx, phys)				\
+ +	__set_fixmap(idx, phys, PAGE_KERNEL)
+++=======
++ /*
++  * FIXMAP_PAGE_NOCACHE is used for MMIO. Memory encryption is not
++  * supported for MMIO addresses, so make sure that the memory encryption
++  * mask is not part of the page attributes.
++  */
++ #define FIXMAP_PAGE_NOCACHE PAGE_KERNEL_IO_NOCACHE
++ 
++ #include <asm-generic/fixmap.h>
+++>>>>>>> 21729f81ce8a (x86/mm: Provide general kernel support for memory encryption)
+ +
+ +/*
+ + * Some hardware wants to get fixmapped without caching.
+ + */
+ +#define set_fixmap_nocache(idx, phys)			\
+ +	__set_fixmap(idx, phys, PAGE_KERNEL_NOCACHE)
+ +
+ +#define clear_fixmap(idx)			\
+ +	__set_fixmap(idx, 0, __pgprot(0))
+ +
+ +#define __fix_to_virt(x)	(FIXADDR_TOP - ((x) << PAGE_SHIFT))
+ +#define __virt_to_fix(x)	((FIXADDR_TOP - ((x)&PAGE_MASK)) >> PAGE_SHIFT)
+ +
+ +extern void __this_fixmap_does_not_exist(void);
+ +
+ +/*
+ + * 'index to address' translation. If anyone tries to use the idx
+ + * directly without translation, we catch the bug with a NULL-deference
+ + * kernel oops. Illegal ranges of incoming indices are caught too.
+ + */
+ +static __always_inline unsigned long fix_to_virt(const unsigned int idx)
+ +{
+ +	/*
+ +	 * this branch gets completely eliminated after inlining,
+ +	 * except when someone tries to use fixaddr indices in an
+ +	 * illegal way. (such as mixing up address types or using
+ +	 * out-of-range indices).
+ +	 *
+ +	 * If it doesn't get removed, the linker will complain
+ +	 * loudly with a reasonably clear error message..
+ +	 */
+ +	if (idx >= __end_of_fixed_addresses)
+ +		__this_fixmap_does_not_exist();
+ +
+ +	return __fix_to_virt(idx);
+ +}
+ +
+ +static inline unsigned long virt_to_fix(const unsigned long vaddr)
+ +{
+ +	BUG_ON(vaddr >= FIXADDR_TOP || vaddr < FIXADDR_START);
+ +	return __virt_to_fix(vaddr);
+ +}
+ +
+ +/* Return an pointer with offset calculated */
+ +static __always_inline unsigned long
+ +__set_fixmap_offset(enum fixed_addresses idx, phys_addr_t phys, pgprot_t flags)
+ +{
+ +	__set_fixmap(idx, phys, flags);
+ +	return fix_to_virt(idx) + (phys & (PAGE_SIZE - 1));
+ +}
+  
+ -#define __late_set_fixmap(idx, phys, flags) __set_fixmap(idx, phys, flags)
+ -#define __late_clear_fixmap(idx) __set_fixmap(idx, 0, __pgprot(0))
+ +#define set_fixmap_offset(idx, phys)			\
+ +	__set_fixmap_offset(idx, phys, PAGE_KERNEL)
+  
+ -void __early_set_fixmap(enum fixed_addresses idx,
+ -			phys_addr_t phys, pgprot_t flags);
+ +#define set_fixmap_offset_nocache(idx, phys)			\
+ +	__set_fixmap_offset(idx, phys, PAGE_KERNEL_NOCACHE)
+  
+  #endif /* !__ASSEMBLY__ */
+  #endif /* _ASM_X86_FIXMAP_H */
+diff --cc arch/x86/include/asm/page_types.h
+index c5b7fb2774d0,b98ed9d14630..000000000000
+--- a/arch/x86/include/asm/page_types.h
++++ b/arch/x86/include/asm/page_types.h
+@@@ -3,19 -3,12 +3,20 @@@
+  
+  #include <linux/const.h>
+  #include <linux/types.h>
++ #include <linux/mem_encrypt.h>
+  
+  /* PAGE_SHIFT determines the page size */
+ -#define PAGE_SHIFT		12
+ -#define PAGE_SIZE		(_AC(1,UL) << PAGE_SHIFT)
+ -#define PAGE_MASK		(~(PAGE_SIZE-1))
+ +#define PAGE_SHIFT	12
+ +#define PAGE_SIZE	(_AC(1,UL) << PAGE_SHIFT)
+ +#define PAGE_MASK	(~(PAGE_SIZE-1))
+ +
+ +#define __PHYSICAL_MASK		((phys_addr_t)((1ULL << __PHYSICAL_MASK_SHIFT) - 1))
+ +#define __VIRTUAL_MASK		((1UL << __VIRTUAL_MASK_SHIFT) - 1)
+ +
+ +/* Cast PAGE_MASK to a signed type so that it is sign-extended if
+ +   virtual addresses are 32-bits but physical addresses are larger
+ +   (ie, 32-bit PAE). */
+ +#define PHYSICAL_PAGE_MASK	(((signed long)PAGE_MASK) & __PHYSICAL_MASK)
+  
+  #define PMD_PAGE_SIZE		(_AC(1, UL) << PMD_SHIFT)
+  #define PMD_PAGE_MASK		(~(PMD_PAGE_SIZE-1))
+@@@ -23,6 -16,16 +24,19 @@@
+  #define PUD_PAGE_SIZE		(_AC(1, UL) << PUD_SHIFT)
+  #define PUD_PAGE_MASK		(~(PUD_PAGE_SIZE-1))
+  
+++<<<<<<< HEAD
+++=======
++ #define __PHYSICAL_MASK		((phys_addr_t)(__sme_clr((1ULL << __PHYSICAL_MASK_SHIFT) - 1)))
++ #define __VIRTUAL_MASK		((1UL << __VIRTUAL_MASK_SHIFT) - 1)
++ 
++ /* Cast *PAGE_MASK to a signed type so that it is sign-extended if
++    virtual addresses are 32-bits but physical addresses are larger
++    (ie, 32-bit PAE). */
++ #define PHYSICAL_PAGE_MASK	(((signed long)PAGE_MASK) & __PHYSICAL_MASK)
++ #define PHYSICAL_PMD_PAGE_MASK	(((signed long)PMD_PAGE_MASK) & __PHYSICAL_MASK)
++ #define PHYSICAL_PUD_PAGE_MASK	(((signed long)PUD_PAGE_MASK) & __PHYSICAL_MASK)
++ 
+++>>>>>>> 21729f81ce8a (x86/mm: Provide general kernel support for memory encryption)
+  #define HPAGE_SHIFT		PMD_SHIFT
+  #define HPAGE_SIZE		(_AC(1,UL) << HPAGE_SHIFT)
+  #define HPAGE_MASK		(~(HPAGE_SIZE - 1))
+diff --cc arch/x86/include/asm/pgtable_types.h
+index 5e5b6dc9e568,de32ca32928a..000000000000
+--- a/arch/x86/include/asm/pgtable_types.h
++++ b/arch/x86/include/asm/pgtable_types.h
+@@@ -2,9 -2,11 +2,11 @@@
+  #define _ASM_X86_PGTABLE_DEFS_H
+  
+  #include <linux/const.h>
++ #include <linux/mem_encrypt.h>
++ 
+  #include <asm/page_types.h>
+  
+ -#define FIRST_USER_ADDRESS	0UL
+ +#define FIRST_USER_ADDRESS	0
+  
+  #define _PAGE_BIT_PRESENT	0	/* is present */
+  #define _PAGE_BIT_RW		1	/* writeable */
+@@@ -136,35 -121,19 +138,42 @@@
+  #define _PAGE_DEVMAP	(_AT(pteval_t, 0))
+  #endif
+  
+ +#define _PAGE_FILE	(_AT(pteval_t, 1) << _PAGE_BIT_FILE)
+  #define _PAGE_PROTNONE	(_AT(pteval_t, 1) << _PAGE_BIT_PROTNONE)
+  
+++<<<<<<< HEAD
+ +/*
+ + * _PAGE_NUMA indicates that this page will trigger a numa hinting
+ + * minor page fault to gather numa placement statistics (see
+ + * pte_numa()). The bit picked (8) is within the range between
+ + * _PAGE_FILE (6) and _PAGE_PROTNONE (8) bits. Therefore, it doesn't
+ + * require changes to the swp entry format because that bit is always
+ + * zero when the pte is not present.
+ + *
+ + * The bit picked must be always zero when the pmd is present and not
+ + * present, so that we don't lose information when we set it while
+ + * atomically clearing the present bit.
+ + *
+ + * Because we shared the same bit (8) with _PAGE_PROTNONE this can be
+ + * interpreted as _PAGE_NUMA only in places that _PAGE_PROTNONE
+ + * couldn't reach, like handle_mm_fault() (see access_error in
+ + * arch/x86/mm/fault.c, the vma protection must not be PROT_NONE for
+ + * handle_mm_fault() to be invoked).
+ + */
+ +#define _PAGE_NUMA	_PAGE_PROTNONE
+ +
+ +#define _PAGE_TABLE	(_PAGE_PRESENT | _PAGE_RW | _PAGE_USER |	\
+ +			 _PAGE_ACCESSED | _PAGE_DIRTY)
+ +#define _KERNPG_TABLE	(_PAGE_PRESENT | _PAGE_RW | _PAGE_ACCESSED |	\
+ +			 _PAGE_DIRTY)
+++=======
++ #define _PAGE_TABLE_NOENC	(_PAGE_PRESENT | _PAGE_RW | _PAGE_USER |\
++ 				 _PAGE_ACCESSED | _PAGE_DIRTY)
++ #define _KERNPG_TABLE_NOENC	(_PAGE_PRESENT | _PAGE_RW |		\
++ 				 _PAGE_ACCESSED | _PAGE_DIRTY)
+++>>>>>>> 21729f81ce8a (x86/mm: Provide general kernel support for memory encryption)
+  
+ -/*
+ - * Set of bits not changed in pte_modify.  The pte's
+ - * protection key is treated like _PAGE_RW, for
+ - * instance, and is *not* included in this mask since
+ - * pte_modify() does modify it.
+ - */
+ +/* Set of bits not changed in pte_modify */
+  #define _PAGE_CHG_MASK	(PTE_PFN_MASK | _PAGE_PCD | _PAGE_PWT |		\
+  			 _PAGE_SPECIAL | _PAGE_ACCESSED | _PAGE_DIRTY |	\
+  			 _PAGE_SOFT_DIRTY)
+@@@ -220,41 -184,38 +229,67 @@@ enum page_cache_mode 
+  
+  #define __PAGE_KERNEL_RO		(__PAGE_KERNEL & ~_PAGE_RW)
+  #define __PAGE_KERNEL_RX		(__PAGE_KERNEL_EXEC & ~_PAGE_RW)
+ -#define __PAGE_KERNEL_NOCACHE		(__PAGE_KERNEL | _PAGE_NOCACHE)
+ +#define __PAGE_KERNEL_EXEC_NOCACHE	(__PAGE_KERNEL_EXEC | _PAGE_PCD | _PAGE_PWT)
+ +#define __PAGE_KERNEL_WC		(__PAGE_KERNEL | _PAGE_CACHE_WC)
+ +#define __PAGE_KERNEL_NOCACHE		(__PAGE_KERNEL | _PAGE_PCD | _PAGE_PWT)
+ +#define __PAGE_KERNEL_UC_MINUS		(__PAGE_KERNEL | _PAGE_PCD)
+  #define __PAGE_KERNEL_VSYSCALL		(__PAGE_KERNEL_RX | _PAGE_USER)
+  #define __PAGE_KERNEL_VVAR		(__PAGE_KERNEL_RO | _PAGE_USER)
+ +#define __PAGE_KERNEL_VVAR_NOCACHE	(__PAGE_KERNEL_VVAR | _PAGE_PCD | _PAGE_PWT)
+  #define __PAGE_KERNEL_LARGE		(__PAGE_KERNEL | _PAGE_PSE)
+ +#define __PAGE_KERNEL_LARGE_NOCACHE	(__PAGE_KERNEL | _PAGE_CACHE_UC | _PAGE_PSE)
+  #define __PAGE_KERNEL_LARGE_EXEC	(__PAGE_KERNEL_EXEC | _PAGE_PSE)
+  
+ -#define __PAGE_KERNEL_IO		(__PAGE_KERNEL)
+ -#define __PAGE_KERNEL_IO_NOCACHE	(__PAGE_KERNEL_NOCACHE)
+ -
+ +#define __PAGE_KERNEL_IO		(__PAGE_KERNEL | _PAGE_IOMAP)
+ +#define __PAGE_KERNEL_IO_NOCACHE	(__PAGE_KERNEL_NOCACHE | _PAGE_IOMAP)
+ +#define __PAGE_KERNEL_IO_UC_MINUS	(__PAGE_KERNEL_UC_MINUS | _PAGE_IOMAP)
+ +#define __PAGE_KERNEL_IO_WC		(__PAGE_KERNEL_WC | _PAGE_IOMAP)
+ +
+++<<<<<<< HEAD
+ +#define PAGE_KERNEL			__pgprot(__PAGE_KERNEL)
+ +#define PAGE_KERNEL_RO			__pgprot(__PAGE_KERNEL_RO)
+ +#define PAGE_KERNEL_EXEC		__pgprot(__PAGE_KERNEL_EXEC)
+ +#define PAGE_KERNEL_RX			__pgprot(__PAGE_KERNEL_RX)
+ +#define PAGE_KERNEL_WC			__pgprot(__PAGE_KERNEL_WC)
+ +#define PAGE_KERNEL_NOCACHE		__pgprot(__PAGE_KERNEL_NOCACHE)
+ +#define PAGE_KERNEL_UC_MINUS		__pgprot(__PAGE_KERNEL_UC_MINUS)
+ +#define PAGE_KERNEL_EXEC_NOCACHE	__pgprot(__PAGE_KERNEL_EXEC_NOCACHE)
+ +#define PAGE_KERNEL_LARGE		__pgprot(__PAGE_KERNEL_LARGE)
+ +#define PAGE_KERNEL_LARGE_NOCACHE	__pgprot(__PAGE_KERNEL_LARGE_NOCACHE)
+ +#define PAGE_KERNEL_LARGE_EXEC		__pgprot(__PAGE_KERNEL_LARGE_EXEC)
+ +#define PAGE_KERNEL_VSYSCALL		__pgprot(__PAGE_KERNEL_VSYSCALL)
+ +#define PAGE_KERNEL_VVAR		__pgprot(__PAGE_KERNEL_VVAR)
+ +#define PAGE_KERNEL_VVAR_NOCACHE	__pgprot(__PAGE_KERNEL_VVAR_NOCACHE)
+ +
+ +#define PAGE_KERNEL_IO			__pgprot(__PAGE_KERNEL_IO)
+ +#define PAGE_KERNEL_IO_NOCACHE		__pgprot(__PAGE_KERNEL_IO_NOCACHE)
+ +#define PAGE_KERNEL_IO_UC_MINUS		__pgprot(__PAGE_KERNEL_IO_UC_MINUS)
+ +#define PAGE_KERNEL_IO_WC		__pgprot(__PAGE_KERNEL_IO_WC)
+++=======
++ #ifndef __ASSEMBLY__
++ 
++ #define _PAGE_ENC	(_AT(pteval_t, sme_me_mask))
++ 
++ #define _PAGE_TABLE	(_PAGE_PRESENT | _PAGE_RW | _PAGE_USER |	\
++ 			 _PAGE_ACCESSED | _PAGE_DIRTY | _PAGE_ENC)
++ #define _KERNPG_TABLE	(_PAGE_PRESENT | _PAGE_RW | _PAGE_ACCESSED |	\
++ 			 _PAGE_DIRTY | _PAGE_ENC)
++ 
++ #define PAGE_KERNEL		__pgprot(__PAGE_KERNEL | _PAGE_ENC)
++ #define PAGE_KERNEL_RO		__pgprot(__PAGE_KERNEL_RO | _PAGE_ENC)
++ #define PAGE_KERNEL_EXEC	__pgprot(__PAGE_KERNEL_EXEC | _PAGE_ENC)
++ #define PAGE_KERNEL_RX		__pgprot(__PAGE_KERNEL_RX | _PAGE_ENC)
++ #define PAGE_KERNEL_NOCACHE	__pgprot(__PAGE_KERNEL_NOCACHE | _PAGE_ENC)
++ #define PAGE_KERNEL_LARGE	__pgprot(__PAGE_KERNEL_LARGE | _PAGE_ENC)
++ #define PAGE_KERNEL_LARGE_EXEC	__pgprot(__PAGE_KERNEL_LARGE_EXEC | _PAGE_ENC)
++ #define PAGE_KERNEL_VSYSCALL	__pgprot(__PAGE_KERNEL_VSYSCALL | _PAGE_ENC)
++ #define PAGE_KERNEL_VVAR	__pgprot(__PAGE_KERNEL_VVAR | _PAGE_ENC)
++ 
++ #define PAGE_KERNEL_IO		__pgprot(__PAGE_KERNEL_IO)
++ #define PAGE_KERNEL_IO_NOCACHE	__pgprot(__PAGE_KERNEL_IO_NOCACHE)
++ 
++ #endif	/* __ASSEMBLY__ */
+++>>>>>>> 21729f81ce8a (x86/mm: Provide general kernel support for memory encryption)
+  
+  /*         xwr */
+  #define __P000	PAGE_NONE
+diff --cc arch/x86/kernel/head64.c
+index 39ad3cdc4c78,5cd0b72a0283..000000000000
+--- a/arch/x86/kernel/head64.c
++++ b/arch/x86/kernel/head64.c
+@@@ -31,22 -34,150 +31,162 @@@
+  /*
+   * Manage page tables very early on.
+   */
+ -extern pgd_t early_top_pgt[PTRS_PER_PGD];
+ +extern pgd_t early_level4_pgt[PTRS_PER_PGD];
+  extern pmd_t early_dynamic_pgts[EARLY_DYNAMIC_PAGE_TABLES][PTRS_PER_PMD];
+ -static unsigned int __initdata next_early_pgt;
+ +static unsigned int __initdata next_early_pgt = 2;
+  pmdval_t early_pmd_flags = __PAGE_KERNEL_LARGE & ~(_PAGE_GLOBAL | _PAGE_NX);
+  
+++<<<<<<< HEAD
+++=======
++ #define __head	__section(.head.text)
++ 
++ static void __head *fixup_pointer(void *ptr, unsigned long physaddr)
++ {
++ 	return ptr - (void *)_text + (void *)physaddr;
++ }
++ 
++ unsigned long __head __startup_64(unsigned long physaddr)
++ {
++ 	unsigned long load_delta, *p;
++ 	unsigned long pgtable_flags;
++ 	pgdval_t *pgd;
++ 	p4dval_t *p4d;
++ 	pudval_t *pud;
++ 	pmdval_t *pmd, pmd_entry;
++ 	int i;
++ 
++ 	/* Is the address too large? */
++ 	if (physaddr >> MAX_PHYSMEM_BITS)
++ 		for (;;);
++ 
++ 	/*
++ 	 * Compute the delta between the address I am compiled to run at
++ 	 * and the address I am actually running at.
++ 	 */
++ 	load_delta = physaddr - (unsigned long)(_text - __START_KERNEL_map);
++ 
++ 	/* Is the address not 2M aligned? */
++ 	if (load_delta & ~PMD_PAGE_MASK)
++ 		for (;;);
++ 
++ 	/* Activate Secure Memory Encryption (SME) if supported and enabled */
++ 	sme_enable();
++ 
++ 	/* Include the SME encryption mask in the fixup value */
++ 	load_delta += sme_get_me_mask();
++ 
++ 	/* Fixup the physical addresses in the page table */
++ 
++ 	pgd = fixup_pointer(&early_top_pgt, physaddr);
++ 	pgd[pgd_index(__START_KERNEL_map)] += load_delta;
++ 
++ 	if (IS_ENABLED(CONFIG_X86_5LEVEL)) {
++ 		p4d = fixup_pointer(&level4_kernel_pgt, physaddr);
++ 		p4d[511] += load_delta;
++ 	}
++ 
++ 	pud = fixup_pointer(&level3_kernel_pgt, physaddr);
++ 	pud[510] += load_delta;
++ 	pud[511] += load_delta;
++ 
++ 	pmd = fixup_pointer(level2_fixmap_pgt, physaddr);
++ 	pmd[506] += load_delta;
++ 
++ 	/*
++ 	 * Set up the identity mapping for the switchover.  These
++ 	 * entries should *NOT* have the global bit set!  This also
++ 	 * creates a bunch of nonsense entries but that is fine --
++ 	 * it avoids problems around wraparound.
++ 	 */
++ 
++ 	pud = fixup_pointer(early_dynamic_pgts[next_early_pgt++], physaddr);
++ 	pmd = fixup_pointer(early_dynamic_pgts[next_early_pgt++], physaddr);
++ 	pgtable_flags = _KERNPG_TABLE_NOENC + sme_get_me_mask();
++ 
++ 	if (IS_ENABLED(CONFIG_X86_5LEVEL)) {
++ 		p4d = fixup_pointer(early_dynamic_pgts[next_early_pgt++], physaddr);
++ 
++ 		i = (physaddr >> PGDIR_SHIFT) % PTRS_PER_PGD;
++ 		pgd[i + 0] = (pgdval_t)p4d + pgtable_flags;
++ 		pgd[i + 1] = (pgdval_t)p4d + pgtable_flags;
++ 
++ 		i = (physaddr >> P4D_SHIFT) % PTRS_PER_P4D;
++ 		p4d[i + 0] = (pgdval_t)pud + pgtable_flags;
++ 		p4d[i + 1] = (pgdval_t)pud + pgtable_flags;
++ 	} else {
++ 		i = (physaddr >> PGDIR_SHIFT) % PTRS_PER_PGD;
++ 		pgd[i + 0] = (pgdval_t)pud + pgtable_flags;
++ 		pgd[i + 1] = (pgdval_t)pud + pgtable_flags;
++ 	}
++ 
++ 	i = (physaddr >> PUD_SHIFT) % PTRS_PER_PUD;
++ 	pud[i + 0] = (pudval_t)pmd + pgtable_flags;
++ 	pud[i + 1] = (pudval_t)pmd + pgtable_flags;
++ 
++ 	pmd_entry = __PAGE_KERNEL_LARGE_EXEC & ~_PAGE_GLOBAL;
++ 	pmd_entry += sme_get_me_mask();
++ 	pmd_entry +=  physaddr;
++ 
++ 	for (i = 0; i < DIV_ROUND_UP(_end - _text, PMD_SIZE); i++) {
++ 		int idx = i + (physaddr >> PMD_SHIFT) % PTRS_PER_PMD;
++ 		pmd[idx] = pmd_entry + i * PMD_SIZE;
++ 	}
++ 
++ 	/*
++ 	 * Fixup the kernel text+data virtual addresses. Note that
++ 	 * we might write invalid pmds, when the kernel is relocated
++ 	 * cleanup_highmap() fixes this up along with the mappings
++ 	 * beyond _end.
++ 	 */
++ 
++ 	pmd = fixup_pointer(level2_kernel_pgt, physaddr);
++ 	for (i = 0; i < PTRS_PER_PMD; i++) {
++ 		if (pmd[i] & _PAGE_PRESENT)
++ 			pmd[i] += load_delta;
++ 	}
++ 
++ 	/*
++ 	 * Fixup phys_base - remove the memory encryption mask to obtain
++ 	 * the true physical address.
++ 	 */
++ 	p = fixup_pointer(&phys_base, physaddr);
++ 	*p += load_delta - sme_get_me_mask();
++ 
++ 	/* Encrypt the kernel (if SME is active) */
++ 	sme_encrypt_kernel();
++ 
++ 	/*
++ 	 * Return the SME encryption mask (if SME is active) to be used as a
++ 	 * modifier for the initial pgdir entry programmed into CR3.
++ 	 */
++ 	return sme_get_me_mask();
++ }
++ 
++ unsigned long __startup_secondary_64(void)
++ {
++ 	/*
++ 	 * Return the SME encryption mask (if SME is active) to be used as a
++ 	 * modifier for the initial pgdir entry programmed into CR3.
++ 	 */
++ 	return sme_get_me_mask();
++ }
++ 
+++>>>>>>> 21729f81ce8a (x86/mm: Provide general kernel support for memory encryption)
+  /* Wipe all early page tables except for the kernel symbol map */
+  static void __init reset_early_page_tables(void)
+  {
+ -	memset(early_top_pgt, 0, sizeof(pgd_t)*(PTRS_PER_PGD-1));
+ +	unsigned long i;
+ +
+ +	for (i = 0; i < PTRS_PER_PGD-1; i++)
+ +		early_level4_pgt[i].pgd = 0;
+ +
+  	next_early_pgt = 0;
+++<<<<<<< HEAD
+ +
+ +	write_cr3(__pa(early_level4_pgt));
+++=======
++ 	write_cr3(__sme_pa_nodebug(early_top_pgt));
+++>>>>>>> 21729f81ce8a (x86/mm: Provide general kernel support for memory encryption)
+  }
+  
+  /* Create a new PMD entry */
+@@@ -158,9 -304,21 +298,23 @@@ void __init x86_64_start_kernel(char * 
+  	/* Kill off the identity-map trampoline */
+  	reset_early_page_tables();
+  
+ +	/* clear bss before set_intr_gate with early_idt_handler */
+  	clear_bss();
+  
+++<<<<<<< HEAD
+++=======
++ 	clear_page(init_top_pgt);
++ 
++ 	/*
++ 	 * SME support may update early_pmd_flags to include the memory
++ 	 * encryption mask, so it needs to be called before anything
++ 	 * that may generate a page fault.
++ 	 */
++ 	sme_early_init();
++ 
++ 	kasan_early_init();
++ 
+++>>>>>>> 21729f81ce8a (x86/mm: Provide general kernel support for memory encryption)
+  	for (i = 0; i < NUM_EXCEPTION_VECTORS; i++)
+  		set_intr_gate(i, early_idt_handler_array[i]);
+  	load_idt((const struct desc_ptr *)&idt_descr);
+diff --cc arch/x86/kernel/head_64.S
+index d567183c0ffb,513cbb012ecc..000000000000
+--- a/arch/x86/kernel/head_64.S
++++ b/arch/x86/kernel/head_64.S
+@@@ -455,9 -348,13 +455,17 @@@ GLOBAL(name
+  	.endr
+  
+  	__INITDATA
+ -NEXT_PAGE(early_top_pgt)
+ +NEXT_PAGE(early_level4_pgt)
+  	.fill	511,8,0
+++<<<<<<< HEAD
+ +	.quad	level3_kernel_pgt - __START_KERNEL_map + _PAGE_TABLE
+++=======
++ #ifdef CONFIG_X86_5LEVEL
++ 	.quad	level4_kernel_pgt - __START_KERNEL_map + _PAGE_TABLE_NOENC
++ #else
++ 	.quad	level3_kernel_pgt - __START_KERNEL_map + _PAGE_TABLE_NOENC
++ #endif
+++>>>>>>> 21729f81ce8a (x86/mm: Provide general kernel support for memory encryption)
+  
+  NEXT_PAGE(early_dynamic_pgts)
+  	.fill	512*EARLY_DYNAMIC_PAGE_TABLES,8,0
+@@@ -465,19 -362,19 +473,27 @@@
+  	.data
+  
+  #ifndef CONFIG_XEN
+ -NEXT_PAGE(init_top_pgt)
+ +NEXT_PAGE(init_level4_pgt)
+  	.fill	512,8,0
+  #else
+++<<<<<<< HEAD
+ +NEXT_PAGE(init_level4_pgt)
+ +	.quad   level3_ident_pgt - __START_KERNEL_map + _KERNPG_TABLE
+ +	.org    init_level4_pgt + L4_PAGE_OFFSET*8, 0
+ +	.quad   level3_ident_pgt - __START_KERNEL_map + _KERNPG_TABLE
+ +	.org    init_level4_pgt + L4_START_KERNEL*8, 0
+++=======
++ NEXT_PAGE(init_top_pgt)
++ 	.quad   level3_ident_pgt - __START_KERNEL_map + _KERNPG_TABLE_NOENC
++ 	.org    init_top_pgt + PGD_PAGE_OFFSET*8, 0
++ 	.quad   level3_ident_pgt - __START_KERNEL_map + _KERNPG_TABLE_NOENC
++ 	.org    init_top_pgt + PGD_START_KERNEL*8, 0
+++>>>>>>> 21729f81ce8a (x86/mm: Provide general kernel support for memory encryption)
+  	/* (2^48-(2*1024*1024*1024))/(2^39) = 511 */
+- 	.quad   level3_kernel_pgt - __START_KERNEL_map + _PAGE_TABLE
++ 	.quad   level3_kernel_pgt - __START_KERNEL_map + _PAGE_TABLE_NOENC
+  
+  NEXT_PAGE(level3_ident_pgt)
+- 	.quad	level2_ident_pgt - __START_KERNEL_map + _KERNPG_TABLE
++ 	.quad	level2_ident_pgt - __START_KERNEL_map + _KERNPG_TABLE_NOENC
+  	.fill	511, 8, 0
+  NEXT_PAGE(level2_ident_pgt)
+  	/* Since I easily can, map the first 1G.
+@@@ -486,6 -383,12 +502,15 @@@
+  	PMDS(0, __PAGE_KERNEL_IDENT_LARGE_EXEC, PTRS_PER_PMD)
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_X86_5LEVEL
++ NEXT_PAGE(level4_kernel_pgt)
++ 	.fill	511,8,0
++ 	.quad	level3_kernel_pgt - __START_KERNEL_map + _PAGE_TABLE_NOENC
++ #endif
++ 
+++>>>>>>> 21729f81ce8a (x86/mm: Provide general kernel support for memory encryption)
+  NEXT_PAGE(level3_kernel_pgt)
+  	.fill	L3_START_KERNEL,8,0
+  	/* (2^48-(2*1024*1024*1024)-((2^39)*511))/(2^30) = 510 */
+diff --cc arch/x86/mm/pageattr.c
+index 3fe832369c84,7e2d6c0a64c4..000000000000
+--- a/arch/x86/mm/pageattr.c
++++ b/arch/x86/mm/pageattr.c
+@@@ -1874,6 -2017,12 +1874,15 @@@ int kernel_map_pages_in_pgd(pgd_t *pgd
+  	if (!(page_flags & _PAGE_NX))
+  		cpa.mask_clr = __pgprot(_PAGE_NX);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!(page_flags & _PAGE_RW))
++ 		cpa.mask_clr = __pgprot(_PAGE_RW);
++ 
++ 	if (!(page_flags & _PAGE_ENC))
++ 		cpa.mask_clr = pgprot_encrypted(cpa.mask_clr);
++ 
+++>>>>>>> 21729f81ce8a (x86/mm: Provide general kernel support for memory encryption)
+  	cpa.mask_set = __pgprot(_PAGE_PRESENT | page_flags);
+  
+  	retval = __change_page_attr_set_clr(&cpa, 0);
+diff --cc arch/x86/mm/tlb.c
+index 3dc284b799aa,593d2f76a54c..000000000000
+--- a/arch/x86/mm/tlb.c
++++ b/arch/x86/mm/tlb.c
+@@@ -31,72 -28,271 +31,212 @@@ DEFINE_PER_CPU_SHARED_ALIGNED(struct tl
+   *	Implement flush IPI by CALL_FUNCTION_VECTOR, Alex Shi
+   */
+  
+++<<<<<<< HEAD
+ +struct flush_tlb_info {
+ +	struct mm_struct *flush_mm;
+ +	unsigned long flush_start;
+ +	unsigned long flush_end;
+ +};
+++=======
++ atomic64_t last_mm_ctx_id = ATOMIC64_INIT(1);
++ 
++ void leave_mm(int cpu)
++ {
++ 	struct mm_struct *loaded_mm = this_cpu_read(cpu_tlbstate.loaded_mm);
++ 
++ 	/*
++ 	 * It's plausible that we're in lazy TLB mode while our mm is init_mm.
++ 	 * If so, our callers still expect us to flush the TLB, but there
++ 	 * aren't any user TLB entries in init_mm to worry about.
++ 	 *
++ 	 * This needs to happen before any other sanity checks due to
++ 	 * intel_idle's shenanigans.
++ 	 */
++ 	if (loaded_mm == &init_mm)
++ 		return;
++ 
++ 	/* Warn if we're not lazy. */
++ 	WARN_ON(cpumask_test_cpu(smp_processor_id(), mm_cpumask(loaded_mm)));
++ 
++ 	switch_mm(NULL, &init_mm, NULL);
++ }
++ 
++ void switch_mm(struct mm_struct *prev, struct mm_struct *next,
++ 	       struct task_struct *tsk)
++ {
++ 	unsigned long flags;
++ 
++ 	local_irq_save(flags);
++ 	switch_mm_irqs_off(prev, next, tsk);
++ 	local_irq_restore(flags);
++ }
++ 
++ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
++ 			struct task_struct *tsk)
++ {
++ 	struct mm_struct *real_prev = this_cpu_read(cpu_tlbstate.loaded_mm);
++ 	unsigned cpu = smp_processor_id();
++ 	u64 next_tlb_gen;
++ 
++ 	/*
++ 	 * NB: The scheduler will call us with prev == next when switching
++ 	 * from lazy TLB mode to normal mode if active_mm isn't changing.
++ 	 * When this happens, we don't assume that CR3 (and hence
++ 	 * cpu_tlbstate.loaded_mm) matches next.
++ 	 *
++ 	 * NB: leave_mm() calls us with prev == NULL and tsk == NULL.
++ 	 */
++ 
++ 	/* We don't want flush_tlb_func_* to run concurrently with us. */
++ 	if (IS_ENABLED(CONFIG_PROVE_LOCKING))
++ 		WARN_ON_ONCE(!irqs_disabled());
++ 
++ 	/*
++ 	 * Verify that CR3 is what we think it is.  This will catch
++ 	 * hypothetical buggy code that directly switches to swapper_pg_dir
++ 	 * without going through leave_mm() / switch_mm_irqs_off().
++ 	 */
++ 	VM_BUG_ON(read_cr3_pa() != __pa(real_prev->pgd));
++ 
++ 	if (real_prev == next) {
++ 		VM_BUG_ON(this_cpu_read(cpu_tlbstate.ctxs[0].ctx_id) !=
++ 			  next->context.ctx_id);
++ 
++ 		if (cpumask_test_cpu(cpu, mm_cpumask(next))) {
++ 			/*
++ 			 * There's nothing to do: we weren't lazy, and we
++ 			 * aren't changing our mm.  We don't need to flush
++ 			 * anything, nor do we need to update CR3, CR4, or
++ 			 * LDTR.
++ 			 */
++ 			return;
++ 		}
++ 
++ 		/* Resume remote flushes and then read tlb_gen. */
++ 		cpumask_set_cpu(cpu, mm_cpumask(next));
++ 		next_tlb_gen = atomic64_read(&next->context.tlb_gen);
++ 
++ 		if (this_cpu_read(cpu_tlbstate.ctxs[0].tlb_gen) < next_tlb_gen) {
++ 			/*
++ 			 * Ideally, we'd have a flush_tlb() variant that
++ 			 * takes the known CR3 value as input.  This would
++ 			 * be faster on Xen PV and on hypothetical CPUs
++ 			 * on which INVPCID is fast.
++ 			 */
++ 			this_cpu_write(cpu_tlbstate.ctxs[0].tlb_gen,
++ 				       next_tlb_gen);
++ 			write_cr3(__sme_pa(next->pgd));
++ 			trace_tlb_flush(TLB_FLUSH_ON_TASK_SWITCH,
++ 					TLB_FLUSH_ALL);
++ 		}
++ 
++ 		/*
++ 		 * We just exited lazy mode, which means that CR4 and/or LDTR
++ 		 * may be stale.  (Changes to the required CR4 and LDTR states
++ 		 * are not reflected in tlb_gen.)
++ 		 */
++ 	} else {
++ 		VM_BUG_ON(this_cpu_read(cpu_tlbstate.ctxs[0].ctx_id) ==
++ 			  next->context.ctx_id);
++ 
++ 		if (IS_ENABLED(CONFIG_VMAP_STACK)) {
++ 			/*
++ 			 * If our current stack is in vmalloc space and isn't
++ 			 * mapped in the new pgd, we'll double-fault.  Forcibly
++ 			 * map it.
++ 			 */
++ 			unsigned int index = pgd_index(current_stack_pointer());
++ 			pgd_t *pgd = next->pgd + index;
++ 
++ 			if (unlikely(pgd_none(*pgd)))
++ 				set_pgd(pgd, init_mm.pgd[index]);
++ 		}
++ 
++ 		/* Stop remote flushes for the previous mm */
++ 		if (cpumask_test_cpu(cpu, mm_cpumask(real_prev)))
++ 			cpumask_clear_cpu(cpu, mm_cpumask(real_prev));
++ 
++ 		VM_WARN_ON_ONCE(cpumask_test_cpu(cpu, mm_cpumask(next)));
++ 
++ 		/*
++ 		 * Start remote flushes and then read tlb_gen.
++ 		 */
++ 		cpumask_set_cpu(cpu, mm_cpumask(next));
++ 		next_tlb_gen = atomic64_read(&next->context.tlb_gen);
++ 
++ 		this_cpu_write(cpu_tlbstate.ctxs[0].ctx_id, next->context.ctx_id);
++ 		this_cpu_write(cpu_tlbstate.ctxs[0].tlb_gen, next_tlb_gen);
++ 		this_cpu_write(cpu_tlbstate.loaded_mm, next);
++ 		write_cr3(__sme_pa(next->pgd));
++ 
++ 		trace_tlb_flush(TLB_FLUSH_ON_TASK_SWITCH, TLB_FLUSH_ALL);
++ 	}
++ 
++ 	load_mm_cr4(next);
++ 	switch_ldt(real_prev, next);
++ }
+++>>>>>>> 21729f81ce8a (x86/mm: Provide general kernel support for memory encryption)
+  
+  /*
+ - * flush_tlb_func_common()'s memory ordering requirement is that any
+ - * TLB fills that happen after we flush the TLB are ordered after we
+ - * read active_mm's tlb_gen.  We don't need any explicit barriers
+ - * because all x86 flush operations are serializing and the
+ - * atomic64_read operation won't be reordered by the compiler.
+ + * We cannot call mmdrop() because we are in interrupt context,
+ + * instead update mm->cpu_vm_mask.
+   */
+ -static void flush_tlb_func_common(const struct flush_tlb_info *f,
+ -				  bool local, enum tlb_flush_reason reason)
+ +void leave_mm(int cpu)
+  {
+ -	/*
+ -	 * We have three different tlb_gen values in here.  They are:
+ -	 *
+ -	 * - mm_tlb_gen:     the latest generation.
+ -	 * - local_tlb_gen:  the generation that this CPU has already caught
+ -	 *                   up to.
+ -	 * - f->new_tlb_gen: the generation that the requester of the flush
+ -	 *                   wants us to catch up to.
+ -	 */
+ -	struct mm_struct *loaded_mm = this_cpu_read(cpu_tlbstate.loaded_mm);
+ -	u64 mm_tlb_gen = atomic64_read(&loaded_mm->context.tlb_gen);
+ -	u64 local_tlb_gen = this_cpu_read(cpu_tlbstate.ctxs[0].tlb_gen);
+ -
+ -	/* This code cannot presently handle being reentered. */
+ -	VM_WARN_ON(!irqs_disabled());
+ -
+ -	VM_WARN_ON(this_cpu_read(cpu_tlbstate.ctxs[0].ctx_id) !=
+ -		   loaded_mm->context.ctx_id);
+ -
+ -	if (!cpumask_test_cpu(smp_processor_id(), mm_cpumask(loaded_mm))) {
+ -		/*
+ -		 * We're in lazy mode -- don't flush.  We can get here on
+ -		 * remote flushes due to races and on local flushes if a
+ -		 * kernel thread coincidentally flushes the mm it's lazily
+ -		 * still using.
+ -		 */
+ -		return;
+ -	}
+ -
+ -	if (unlikely(local_tlb_gen == mm_tlb_gen)) {
+ -		/*
+ -		 * There's nothing to do: we're already up to date.  This can
+ -		 * happen if two concurrent flushes happen -- the first flush to
+ -		 * be handled can catch us all the way up, leaving no work for
+ -		 * the second flush.
+ -		 */
+ -		trace_tlb_flush(reason, 0);
+ -		return;
+ +	struct mm_struct *active_mm = this_cpu_read(cpu_tlbstate.active_mm);
+ +	if (this_cpu_read(cpu_tlbstate.state) == TLBSTATE_OK)
+ +		BUG();
+ +	if (cpumask_test_cpu(cpu, mm_cpumask(active_mm))) {
+ +		cpumask_clear_cpu(cpu, mm_cpumask(active_mm));
+ +		load_cr3(swapper_pg_dir);
+  	}
+ -
+ -	WARN_ON_ONCE(local_tlb_gen > mm_tlb_gen);
+ -	WARN_ON_ONCE(f->new_tlb_gen > mm_tlb_gen);
+ -
+ -	/*
+ -	 * If we get to this point, we know that our TLB is out of date.
+ -	 * This does not strictly imply that we need to flush (it's
+ -	 * possible that f->new_tlb_gen <= local_tlb_gen), but we're
+ -	 * going to need to flush in the very near future, so we might
+ -	 * as well get it over with.
+ -	 *
+ -	 * The only question is whether to do a full or partial flush.
+ -	 *
+ -	 * We do a partial flush if requested and two extra conditions
+ -	 * are met:
+ -	 *
+ -	 * 1. f->new_tlb_gen == local_tlb_gen + 1.  We have an invariant that
+ -	 *    we've always done all needed flushes to catch up to
+ -	 *    local_tlb_gen.  If, for example, local_tlb_gen == 2 and
+ -	 *    f->new_tlb_gen == 3, then we know that the flush needed to bring
+ -	 *    us up to date for tlb_gen 3 is the partial flush we're
+ -	 *    processing.
+ -	 *
+ -	 *    As an example of why this check is needed, suppose that there
+ -	 *    are two concurrent flushes.  The first is a full flush that
+ -	 *    changes context.tlb_gen from 1 to 2.  The second is a partial
+ -	 *    flush that changes context.tlb_gen from 2 to 3.  If they get
+ -	 *    processed on this CPU in reverse order, we'll see
+ -	 *     local_tlb_gen == 1, mm_tlb_gen == 3, and end != TLB_FLUSH_ALL.
+ -	 *    If we were to use __flush_tlb_single() and set local_tlb_gen to
+ -	 *    3, we'd be break the invariant: we'd update local_tlb_gen above
+ -	 *    1 without the full flush that's needed for tlb_gen 2.
+ -	 *
+ -	 * 2. f->new_tlb_gen == mm_tlb_gen.  This is purely an optimiation.
+ -	 *    Partial TLB flushes are not all that much cheaper than full TLB
+ -	 *    flushes, so it seems unlikely that it would be a performance win
+ -	 *    to do a partial flush if that won't bring our TLB fully up to
+ -	 *    date.  By doing a full flush instead, we can increase
+ -	 *    local_tlb_gen all the way to mm_tlb_gen and we can probably
+ -	 *    avoid another flush in the very near future.
+ -	 */
+ -	if (f->end != TLB_FLUSH_ALL &&
+ -	    f->new_tlb_gen == local_tlb_gen + 1 &&
+ -	    f->new_tlb_gen == mm_tlb_gen) {
+ -		/* Partial flush */
+ -		unsigned long addr;
+ -		unsigned long nr_pages = (f->end - f->start) >> PAGE_SHIFT;
+ -
+ -		addr = f->start;
+ -		while (addr < f->end) {
+ -			__flush_tlb_single(addr);
+ -			addr += PAGE_SIZE;
+ -		}
+ -		if (local)
+ -			count_vm_tlb_events(NR_TLB_LOCAL_FLUSH_ONE, nr_pages);
+ -		trace_tlb_flush(reason, nr_pages);
+ -	} else {
+ -		/* Full flush. */
+ -		local_flush_tlb();
+ -		if (local)
+ -			count_vm_tlb_event(NR_TLB_LOCAL_FLUSH_ALL);
+ -		trace_tlb_flush(reason, TLB_FLUSH_ALL);
+ -	}
+ -
+ -	/* Both paths above update our state to mm_tlb_gen. */
+ -	this_cpu_write(cpu_tlbstate.ctxs[0].tlb_gen, mm_tlb_gen);
+  }
+ +EXPORT_SYMBOL_GPL(leave_mm);
+  
+ -static void flush_tlb_func_local(void *info, enum tlb_flush_reason reason)
+ -{
+ -	const struct flush_tlb_info *f = info;
+ -
+ -	flush_tlb_func_common(f, true, reason);
+ -}
+ +/*
+ + * The flush IPI assumes that a thread switch happens in this order:
+ + * [cpu0: the cpu that switches]
+ + * 1) switch_mm() either 1a) or 1b)
+ + * 1a) thread switch to a different mm
+ + * 1a1) set cpu_tlbstate to TLBSTATE_OK
+ + *	Now the tlb flush NMI handler flush_tlb_func won't call leave_mm
+ + *	if cpu0 was in lazy tlb mode.
+ + * 1a2) update cpu active_mm
+ + *	Now cpu0 accepts tlb flushes for the new mm.
+ + * 1a3) cpu_set(cpu, new_mm->cpu_vm_mask);
+ + *	Now the other cpus will send tlb flush ipis.
+ + * 1a4) change cr3.
+ + * 1a5) cpu_clear(cpu, old_mm->cpu_vm_mask);
+ + *	Stop ipi delivery for the old mm. This is not synchronized with
+ + *	the other cpus, but flush_tlb_func ignore flush ipis for the wrong
+ + *	mm, and in the worst case we perform a superfluous tlb flush.
+ + * 1b) thread switch without mm change
+ + *	cpu active_mm is correct, cpu0 already handles flush ipis.
+ + * 1b1) set cpu_tlbstate to TLBSTATE_OK
+ + * 1b2) test_and_set the cpu bit in cpu_vm_mask.
+ + *	Atomically set the bit [other cpus will start sending flush ipis],
+ + *	and test the bit.
+ + * 1b3) if the bit was 0: leave_mm was called, flush the tlb.
+ + * 2) switch %%esp, ie current
+ + *
+ + * The interrupt must handle 2 special cases:
+ + * - cr3 is changed before %%esp, ie. it cannot use current->{active_,}mm.
+ + * - the cpu performs speculative tlb reads, i.e. even if the cpu only
+ + *   runs in kernel space, the cpu could load tlb entries for user space
+ + *   pages.
+ + *
+ + * The good news is that cpu_tlbstate is local to each cpu, no
+ + * write/read ordering problems.
+ + */
+  
+ -static void flush_tlb_func_remote(void *info)
+ +/*
+ + * TLB flush funcation:
+ + * 1) Flush the tlb entries if the cpu uses the mm that's being flushed.
+ + * 2) Leave the mm if we are in the lazy tlb mode.
+ + */
+ +static void flush_tlb_func(void *info)
+  {
+ -	const struct flush_tlb_info *f = info;
+ +	struct flush_tlb_info *f = info;
+  
+  	inc_irq_stat(irq_tlb_count);
+  
+* Unmerged path arch/x86/include/asm/mem_encrypt.h
+* Unmerged path arch/x86/kernel/espfix_64.c
+* Unmerged path arch/x86/mm/kasan_init_64.c
+* Unmerged path arch/x86/mm/mem_encrypt.c
+* Unmerged path include/linux/mem_encrypt.h
+diff --git a/arch/x86/boot/compressed/pagetable.c b/arch/x86/boot/compressed/pagetable.c
+index 7a916659f660..b22d3a478861 100644
+--- a/arch/x86/boot/compressed/pagetable.c
++++ b/arch/x86/boot/compressed/pagetable.c
+@@ -15,6 +15,13 @@
+ #define __pa(x)  ((unsigned long)(x))
+ #define __va(x)  ((void *)((unsigned long)(x)))
+ 
++/*
++ * The pgtable.h and mm/ident_map.c includes make use of the SME related
++ * information which is not used in the compressed image support. Un-define
++ * the SME support to avoid any compile and link errors.
++ */
++#undef CONFIG_AMD_MEM_ENCRYPT
++
+ #include "misc.h"
+ 
+ /* These actually do the work of building the kernel identity maps. */
+* Unmerged path arch/x86/include/asm/fixmap.h
+* Unmerged path arch/x86/include/asm/mem_encrypt.h
+* Unmerged path arch/x86/include/asm/page_types.h
+diff --git a/arch/x86/include/asm/pgtable.h b/arch/x86/include/asm/pgtable.h
+index ec9e20b59d06..441cf031af0c 100644
+--- a/arch/x86/include/asm/pgtable.h
++++ b/arch/x86/include/asm/pgtable.h
+@@ -1,6 +1,7 @@
+ #ifndef _ASM_X86_PGTABLE_H
+ #define _ASM_X86_PGTABLE_H
+ 
++#include <linux/mem_encrypt.h>
+ #include <asm/page.h>
+ #include <asm/e820.h>
+ 
+@@ -15,6 +16,12 @@
+ 		     cachemode2protval(_PAGE_CACHE_MODE_UC_MINUS)))	\
+ 	 : (prot))
+ 
++/*
++ * Macros to add or remove encryption attribute
++ */
++#define pgprot_encrypted(prot)	__pgprot(__sme_set(pgprot_val(prot)))
++#define pgprot_decrypted(prot)	__pgprot(__sme_clr(pgprot_val(prot)))
++
+ #ifndef __ASSEMBLY__
+ #include <asm/x86_init.h>
+ 
+@@ -32,6 +39,8 @@ extern struct list_head pgd_list;
+ 
+ extern struct mm_struct *pgd_page_get_mm(struct page *page);
+ 
++extern pmdval_t early_pmd_flags;
++
+ #ifdef CONFIG_PARAVIRT
+ #include <asm/paravirt.h>
+ #else  /* !CONFIG_PARAVIRT */
+* Unmerged path arch/x86/include/asm/pgtable_types.h
+diff --git a/arch/x86/include/asm/processor.h b/arch/x86/include/asm/processor.h
+index 5023ca6231a6..f9e094ba7819 100644
+--- a/arch/x86/include/asm/processor.h
++++ b/arch/x86/include/asm/processor.h
+@@ -29,6 +29,7 @@ struct mm_struct;
+ #include <linux/math64.h>
+ #include <linux/err.h>
+ #include <linux/irqflags.h>
++#include <linux/mem_encrypt.h>
+ 
+ #include <linux/rh_kabi.h>
+ 
+@@ -226,7 +227,7 @@ static inline void native_cpuid(unsigned int *eax, unsigned int *ebx,
+ 
+ static inline void load_cr3(pgd_t *pgdir)
+ {
+-	write_cr3(__pa(pgdir));
++	write_cr3(__sme_pa(pgdir));
+ }
+ 
+ #ifdef CONFIG_X86_32
+* Unmerged path arch/x86/kernel/espfix_64.c
+* Unmerged path arch/x86/kernel/head64.c
+* Unmerged path arch/x86/kernel/head_64.S
+* Unmerged path arch/x86/mm/kasan_init_64.c
+* Unmerged path arch/x86/mm/mem_encrypt.c
+* Unmerged path arch/x86/mm/pageattr.c
+* Unmerged path arch/x86/mm/tlb.c
+diff --git a/include/asm-generic/pgtable.h b/include/asm-generic/pgtable.h
+index 987c42c28cfd..c4924ccd399c 100644
+--- a/include/asm-generic/pgtable.h
++++ b/include/asm-generic/pgtable.h
+@@ -378,6 +378,18 @@ static inline void ptep_modify_prot_commit(struct mm_struct *mm,
+ #endif /* __HAVE_ARCH_PTEP_MODIFY_PROT_TRANSACTION */
+ #endif /* CONFIG_MMU */
+ 
++/*
++ * No-op macros that just return the current protection value. Defined here
++ * because these macros can be used used even if CONFIG_MMU is not defined.
++ */
++#ifndef pgprot_encrypted
++#define pgprot_encrypted(prot)	(prot)
++#endif
++
++#ifndef pgprot_decrypted
++#define pgprot_decrypted(prot)	(prot)
++#endif
++
+ /*
+  * A facility to provide lazy MMU batching.  This allows PTE updates and
+  * page invalidations to be delayed until a call to leave lazy MMU mode
+* Unmerged path include/linux/mem_encrypt.h
