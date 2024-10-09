@@ -1,0 +1,159 @@
+x86/speculation: Fix redundant MDS mitigation message
+
+jira LE-1907
+cve CVE-2019-11135
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Waiman Long <longman@redhat.com>
+commit cd5a2aa89e847bdda7b62029d94e95488d73f6b2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/cd5a2aa8.failed
+
+Since MDS and TAA mitigations are inter-related for processors that are
+affected by both vulnerabilities, the followiing confusing messages can
+be printed in the kernel log:
+
+  MDS: Vulnerable
+  MDS: Mitigation: Clear CPU buffers
+
+To avoid the first incorrect message, defer the printing of MDS
+mitigation after the TAA mitigation selection has been done. However,
+that has the side effect of printing TAA mitigation first before MDS
+mitigation.
+
+ [ bp: Check box is affected/mitigations are disabled first before
+   printing and massage. ]
+
+	Suggested-by: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+	Signed-off-by: Waiman Long <longman@redhat.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Josh Poimboeuf <jpoimboe@redhat.com>
+	Cc: Mark Gross <mgross@linux.intel.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Tim Chen <tim.c.chen@linux.intel.com>
+	Cc: Tony Luck <tony.luck@intel.com>
+	Cc: Tyler Hicks <tyhicks@canonical.com>
+	Cc: x86-ml <x86@kernel.org>
+Link: https://lkml.kernel.org/r/20191115161445.30809-3-longman@redhat.com
+(cherry picked from commit cd5a2aa89e847bdda7b62029d94e95488d73f6b2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/bugs.c
+diff --cc arch/x86/kernel/cpu/bugs.c
+index 9ec6cfa4f503,8bf64899f56a..000000000000
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@@ -22,28 -27,51 +22,33 @@@
+  #include <asm/paravirt.h>
+  #include <asm/alternative.h>
+  #include <asm/pgtable.h>
+ -#include <asm/set_memory.h>
+ -#include <asm/intel-family.h>
+ -#include <asm/e820/api.h>
+ +#include <asm/cacheflush.h>
+ +#include <asm/spec_ctrl.h>
+  #include <asm/hypervisor.h>
+ +#include <asm/intel-family.h>
+ +#include <linux/prctl.h>
+ +#include <linux/sched/smt.h>
+  
+ -#include "cpu.h"
+  
+ -static void __init spectre_v1_select_mitigation(void);
+  static void __init spectre_v2_select_mitigation(void);
+ -static void __init ssb_select_mitigation(void);
+ +static void __init ssb_parse_cmdline(void);
+ +void ssb_select_mitigation(void);
+  static void __init l1tf_select_mitigation(void);
+  static void __init mds_select_mitigation(void);
+++<<<<<<< HEAD
+ +extern void spec_ctrl_save_msr(void);
+++=======
++ static void __init mds_print_mitigation(void);
++ static void __init taa_select_mitigation(void);
+++>>>>>>> cd5a2aa89e84 (x86/speculation: Fix redundant MDS mitigation message)
+  
+ -/* The base value of the SPEC_CTRL MSR that always has to be preserved. */
+ -u64 x86_spec_ctrl_base;
+ -EXPORT_SYMBOL_GPL(x86_spec_ctrl_base);
+  static DEFINE_MUTEX(spec_ctrl_mutex);
+  
+ -/*
+ - * The vendor and possibly platform specific bits which can be modified in
+ - * x86_spec_ctrl_base.
+ - */
+ -static u64 __ro_after_init x86_spec_ctrl_mask = SPEC_CTRL_IBRS;
+ -
+ -/*
+ - * AMD specific MSR info for Speculative Store Bypass control.
+ - * x86_amd_ls_cfg_ssbd_mask is initialized in identify_boot_cpu().
+ - */
+ -u64 __ro_after_init x86_amd_ls_cfg_base;
+ -u64 __ro_after_init x86_amd_ls_cfg_ssbd_mask;
+ -
+ -/* Control conditional STIBP in switch_to() */
+ -DEFINE_STATIC_KEY_FALSE(switch_to_cond_stibp);
+ -/* Control conditional IBPB in switch_mm() */
+ -DEFINE_STATIC_KEY_FALSE(switch_mm_cond_ibpb);
+ -/* Control unconditional IBPB in switch_mm() */
+ -DEFINE_STATIC_KEY_FALSE(switch_mm_always_ibpb);
+ -
+  /* Control MDS CPU buffer clear before returning to user space */
+ -DEFINE_STATIC_KEY_FALSE(mds_user_clear);
+ +struct static_key mds_user_clear = STATIC_KEY_INIT_FALSE;
+  EXPORT_SYMBOL_GPL(mds_user_clear);
+  /* Control MDS CPU buffer clear before idling (halt, mwait) */
+ -DEFINE_STATIC_KEY_FALSE(mds_idle_clear);
+ +struct static_key mds_idle_clear = STATIC_KEY_INIT_FALSE;
+  EXPORT_SYMBOL_GPL(mds_idle_clear);
+  
+  void __init check_bugs(void)
+@@@ -64,23 -90,31 +69,29 @@@
+  	}
+  
+  	/*
+ -	 * Read the SPEC_CTRL MSR to account for reserved bits which may
+ -	 * have unknown values. AMD64_LS_CFG MSR is cached in the early AMD
+ -	 * init code as it is not enumerated and depends on the family.
+ +	 * Select proper mitigation for any exposure to the Speculative Store
+ +	 * Bypass vulnerability (exposed as a bug in "Memory Disambiguation")
+ +	 * This has to be done before spec_ctrl_init() to make sure that its
+ +	 * SPEC_CTRL MSR value is properly set up.
+  	 */
+ -	if (boot_cpu_has(X86_FEATURE_MSR_SPEC_CTRL))
+ -		rdmsrl(MSR_IA32_SPEC_CTRL, x86_spec_ctrl_base);
+ -
+ -	/* Allow STIBP in MSR_SPEC_CTRL if supported */
+ -	if (boot_cpu_has(X86_FEATURE_STIBP))
+ -		x86_spec_ctrl_mask |= SPEC_CTRL_STIBP;
+ +	ssb_parse_cmdline();
+ +	ssb_select_mitigation();
+  
+ -	/* Select the proper CPU mitigations before patching alternatives: */
+ -	spectre_v1_select_mitigation();
+ +	spec_ctrl_init();
+  	spectre_v2_select_mitigation();
+ -	ssb_select_mitigation();
+ +
+ +	spec_ctrl_cpu_init();
+ +
+  	l1tf_select_mitigation();
+ +
+  	mds_select_mitigation();
+ -	taa_select_mitigation();
+  
++ 	/*
++ 	 * As MDS and TAA mitigations are inter-related, print MDS
++ 	 * mitigation until after TAA mitigation selection is done.
++ 	 */
++ 	mds_print_mitigation();
++ 
+  	arch_smt_update();
+  
+  #ifdef CONFIG_X86_32
+* Unmerged path arch/x86/kernel/cpu/bugs.c
