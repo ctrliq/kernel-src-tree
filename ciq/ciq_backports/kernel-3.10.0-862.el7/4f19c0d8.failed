@@ -1,0 +1,227 @@
+netvsc: move filter setting to rndis_device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author stephen hemminger <stephen@networkplumber.org>
+commit 4f19c0d8070cd4aa8e85bbf8a19d9ef5bef77c90
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/4f19c0d8.failed
+
+The work queue and handling of network filter parameters should
+be in rndis_device. This gets rid of warning from RCU checks,
+eliminates a race and cleans up code.
+
+	Signed-off-by: Stephen Hemminger <sthemmin@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4f19c0d8070cd4aa8e85bbf8a19d9ef5bef77c90)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/hyperv_net.h
+#	drivers/net/hyperv/netvsc_drv.c
+diff --cc drivers/net/hyperv/hyperv_net.h
+index 487cb1bbd0e5,6066f1bcaf2d..000000000000
+--- a/drivers/net/hyperv/hyperv_net.h
++++ b/drivers/net/hyperv/hyperv_net.h
+@@@ -198,8 -201,11 +200,15 @@@ void netvsc_channel_cb(void *context)
+  int rndis_filter_open(struct netvsc_device *nvdev);
+  int rndis_filter_close(struct netvsc_device *nvdev);
+  int rndis_filter_device_add(struct hv_device *dev,
+++<<<<<<< HEAD
+ +			void *additional_info);
+ +void rndis_filter_device_remove(struct hv_device *dev);
+++=======
++ 			    struct netvsc_device_info *info);
++ void rndis_filter_update(struct netvsc_device *nvdev);
++ void rndis_filter_device_remove(struct hv_device *dev,
++ 				struct netvsc_device *nvdev);
+++>>>>>>> 4f19c0d8070c (netvsc: move filter setting to rndis_device)
+  int rndis_filter_set_rss_param(struct rndis_device *rdev,
+  			       const u8 *key, int num_queue);
+  int rndis_filter_receive(struct net_device *ndev,
+@@@ -692,11 -698,11 +700,10 @@@ struct net_device_context 
+  	/* list protection */
+  	spinlock_t lock;
+  
+- 	struct work_struct work;
+  	u32 msg_enable; /* debug level */
+  
+ -	u32 tx_checksum_mask;
+ -
+ -	u32 tx_send_table[VRSS_SEND_TAB_SIZE];
+ +	struct netvsc_stats __percpu *tx_stats;
+ +	struct netvsc_stats __percpu *rx_stats;
+  
+  	/* Ethtool settings */
+  	u8 duplex;
+diff --cc drivers/net/hyperv/netvsc_drv.c
+index 5b73a7dfd4fd,82d6c022ca85..000000000000
+--- a/drivers/net/hyperv/netvsc_drv.c
++++ b/drivers/net/hyperv/netvsc_drv.c
+@@@ -69,32 -56,6 +69,35 @@@ static int debug = -1
+  module_param(debug, int, S_IRUGO);
+  MODULE_PARM_DESC(debug, "Debug level (0=none,...,16=all)");
+  
+++<<<<<<< HEAD
+ +static void do_set_multicast(struct work_struct *w)
+ +{
+ +	struct net_device_context *ndevctx =
+ +		container_of(w, struct net_device_context, work);
+ +	struct hv_device *device_obj = ndevctx->device_ctx;
+ +	struct net_device *ndev = hv_get_drvdata(device_obj);
+ +	struct netvsc_device *nvdev = ndevctx->nvdev;
+ +	struct rndis_device *rdev;
+ +
+ +	if (!nvdev)
+ +		return;
+ +
+ +	rdev = nvdev->extension;
+ +	if (rdev == NULL)
+ +		return;
+ +
+ +	if (ndev->flags & IFF_PROMISC)
+ +		rndis_filter_set_packet_filter(rdev,
+ +			NDIS_PACKET_TYPE_PROMISCUOUS);
+ +	else
+ +		rndis_filter_set_packet_filter(rdev,
+ +			NDIS_PACKET_TYPE_BROADCAST |
+ +			NDIS_PACKET_TYPE_ALL_MULTICAST |
+ +			NDIS_PACKET_TYPE_DIRECTED);
+ +}
+ +
+++=======
+++>>>>>>> 4f19c0d8070c (netvsc: move filter setting to rndis_device)
+  static void netvsc_set_multicast_list(struct net_device *net)
+  {
+  	struct net_device_context *net_device_ctx = netdev_priv(net);
+@@@ -1496,24 -1533,9 +1498,23 @@@ static int netvsc_probe(struct hv_devic
+  		netdev_dbg(net, "netvsc msg_enable: %d\n",
+  			   net_device_ctx->msg_enable);
+  
+ +	net_device_ctx->tx_stats = netdev_alloc_pcpu_stats(struct netvsc_stats);
+ +	if (!net_device_ctx->tx_stats) {
+ +		free_netdev(net);
+ +		return -ENOMEM;
+ +	}
+ +	net_device_ctx->rx_stats = netdev_alloc_pcpu_stats(struct netvsc_stats);
+ +	if (!net_device_ctx->rx_stats) {
+ +		free_percpu(net_device_ctx->tx_stats);
+ +		free_netdev(net);
+ +		return -ENOMEM;
+ +	}
+ +
+  	hv_set_drvdata(dev, net);
+  
+ +	net_device_ctx->start_remove = false;
+ +
+  	INIT_DELAYED_WORK(&net_device_ctx->dwork, netvsc_link_change);
+- 	INIT_WORK(&net_device_ctx->work, do_set_multicast);
+  
+  	spin_lock_init(&net_device_ctx->lock);
+  	INIT_LIST_HEAD(&net_device_ctx->reconfig_events);
+@@@ -1571,26 -1602,19 +1572,25 @@@ static int netvsc_remove(struct hv_devi
+  
+  	ndev_ctx = netdev_priv(net);
+  
+ -	netif_device_detach(net);
+ +	/* Avoid racing with netvsc_change_mtu()/netvsc_set_channels()
+ +	 * removing the device.
+ +	 */
+ +	rtnl_lock();
+ +	ndev_ctx->start_remove = true;
+ +	rtnl_unlock();
+  
+  	cancel_delayed_work_sync(&ndev_ctx->dwork);
+- 	cancel_work_sync(&ndev_ctx->work);
+  
+ +	/* Stop outbound asap */
+ +	netif_tx_disable(net);
+ +
+ +	unregister_netdev(net);
+ +
+  	/*
+  	 * Call to the vsc driver to let it know that the device is being
+ -	 * removed. Also blocks mtu and channel changes.
+ +	 * removed
+  	 */
+ -	rtnl_lock();
+ -	rndis_filter_device_remove(dev, ndev_ctx->nvdev);
+ -	rtnl_unlock();
+ -
+ -	unregister_netdev(net);
+ +	rndis_filter_device_remove(dev);
+  
+  	hv_set_drvdata(dev, NULL);
+  
+* Unmerged path drivers/net/hyperv/hyperv_net.h
+* Unmerged path drivers/net/hyperv/netvsc_drv.c
+diff --git a/drivers/net/hyperv/rndis_filter.c b/drivers/net/hyperv/rndis_filter.c
+index b6bc44dd1f92..a14094df82c0 100644
+--- a/drivers/net/hyperv/rndis_filter.c
++++ b/drivers/net/hyperv/rndis_filter.c
+@@ -31,6 +31,7 @@
+ 
+ #include "hyperv_net.h"
+ 
++static void rndis_set_multicast(struct work_struct *w);
+ 
+ #define RNDIS_EXT_LEN PAGE_SIZE
+ struct rndis_request {
+@@ -76,6 +77,7 @@ static struct rndis_device *get_rndis_device(void)
+ 	spin_lock_init(&device->request_lock);
+ 
+ 	INIT_LIST_HEAD(&device->req_list);
++	INIT_WORK(&device->mcast_work, rndis_set_multicast);
+ 
+ 	device->state = RNDIS_DEV_UNINITIALIZED;
+ 
+@@ -749,7 +751,8 @@ static int rndis_filter_query_link_speed(struct rndis_device *dev)
+ 	return ret;
+ }
+ 
+-int rndis_filter_set_packet_filter(struct rndis_device *dev, u32 new_filter)
++static int rndis_filter_set_packet_filter(struct rndis_device *dev,
++					  u32 new_filter)
+ {
+ 	struct rndis_request *request;
+ 	struct rndis_set_request *set;
+@@ -780,6 +783,28 @@ int rndis_filter_set_packet_filter(struct rndis_device *dev, u32 new_filter)
+ 	return ret;
+ }
+ 
++static void rndis_set_multicast(struct work_struct *w)
++{
++	struct rndis_device *rdev
++		= container_of(w, struct rndis_device, mcast_work);
++
++	if (rdev->ndev->flags & IFF_PROMISC)
++		rndis_filter_set_packet_filter(rdev,
++					       NDIS_PACKET_TYPE_PROMISCUOUS);
++	else
++		rndis_filter_set_packet_filter(rdev,
++					       NDIS_PACKET_TYPE_BROADCAST |
++					       NDIS_PACKET_TYPE_ALL_MULTICAST |
++					       NDIS_PACKET_TYPE_DIRECTED);
++}
++
++void rndis_filter_update(struct netvsc_device *nvdev)
++{
++	struct rndis_device *rdev = nvdev->extension;
++
++	schedule_work(&rdev->mcast_work);
++}
++
+ static int rndis_filter_init_device(struct rndis_device *dev)
+ {
+ 	struct rndis_request *request;
+@@ -892,6 +917,9 @@ static int rndis_filter_close_device(struct rndis_device *dev)
+ 	if (dev->state != RNDIS_DEV_DATAINITIALIZED)
+ 		return 0;
+ 
++	/* Make sure rndis_set_multicast doesn't re-enable filter! */
++	cancel_work_sync(&dev->mcast_work);
++
+ 	ret = rndis_filter_set_packet_filter(dev, 0);
+ 	if (ret == -ENODEV)
+ 		ret = 0;
