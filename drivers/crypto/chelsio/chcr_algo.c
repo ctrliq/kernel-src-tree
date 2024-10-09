@@ -1339,8 +1339,7 @@ static int chcr_device_init(struct chcr_context *ctx)
 		}
 		ctx->dev = u_ctx->dev;
 		adap = padap(ctx->dev);
-		ntxq = min_not_zero((unsigned int)u_ctx->lldi.nrxq,
-				    adap->vres.ncrypto_fc);
+		ntxq = u_ctx->lldi.ntxq;
 		rxq_perchan = u_ctx->lldi.nrxq / u_ctx->lldi.nchan;
 		txq_perchan = ntxq / u_ctx->lldi.nchan;
 		rxq_idx = ctx->dev->tx_channel_id * rxq_perchan;
