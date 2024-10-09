@@ -1,0 +1,170 @@
+qede: Add support for ingress headroom
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Mintz, Yuval <Yuval.Mintz@cavium.com>
+commit 15ed8a47ff0571dd268e37002511993b47e996bd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/15ed8a47.failed
+
+Driver currently doesn't support any headroom; The only 'available'
+space it has in the head of the buffer is due to the placement
+offset.
+In order to allow [later] support of XDP adjustment of headroom,
+modify the the ingress flow to properly handle a scenario where
+the packets would have such.
+
+	Signed-off-by: Yuval Mintz <Yuval.Mintz@cavium.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 15ed8a47ff0571dd268e37002511993b47e996bd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qede/qede_fp.c
+diff --cc drivers/net/ethernet/qlogic/qede/qede_fp.c
+index 798f7f869b6b,e382d4bdf430..000000000000
+--- a/drivers/net/ethernet/qlogic/qede/qede_fp.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_fp.c
+@@@ -921,6 -987,70 +923,73 @@@ static bool qede_pkt_is_ip_fragmented(s
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Return true iff packet is to be passed to stack */
++ static bool qede_rx_xdp(struct qede_dev *edev,
++ 			struct qede_fastpath *fp,
++ 			struct qede_rx_queue *rxq,
++ 			struct bpf_prog *prog,
++ 			struct sw_rx_data *bd,
++ 			struct eth_fast_path_rx_reg_cqe *cqe,
++ 			u16 data_offset)
++ {
++ 	u16 len = le16_to_cpu(cqe->len_on_first_bd);
++ 	struct xdp_buff xdp;
++ 	enum xdp_action act;
++ 
++ 	xdp.data = page_address(bd->data) + data_offset;
++ 	xdp.data_end = xdp.data + len;
++ 
++ 	/* Queues always have a full reset currently, so for the time
++ 	 * being until there's atomic program replace just mark read
++ 	 * side for map helpers.
++ 	 */
++ 	rcu_read_lock();
++ 	act = bpf_prog_run_xdp(prog, &xdp);
++ 	rcu_read_unlock();
++ 
++ 	if (act == XDP_PASS)
++ 		return true;
++ 
++ 	/* Count number of packets not to be passed to stack */
++ 	rxq->xdp_no_pass++;
++ 
++ 	switch (act) {
++ 	case XDP_TX:
++ 		/* We need the replacement buffer before transmit. */
++ 		if (qede_alloc_rx_buffer(rxq, true)) {
++ 			qede_recycle_rx_bd_ring(rxq, 1);
++ 			trace_xdp_exception(edev->ndev, prog, act);
++ 			return false;
++ 		}
++ 
++ 		/* Now if there's a transmission problem, we'd still have to
++ 		 * throw current buffer, as replacement was already allocated.
++ 		 */
++ 		if (qede_xdp_xmit(edev, fp, bd, data_offset, len)) {
++ 			dma_unmap_page(rxq->dev, bd->mapping,
++ 				       PAGE_SIZE, DMA_BIDIRECTIONAL);
++ 			__free_page(bd->data);
++ 			trace_xdp_exception(edev->ndev, prog, act);
++ 		}
++ 
++ 		/* Regardless, we've consumed an Rx BD */
++ 		qede_rx_bd_ring_consume(rxq);
++ 		return false;
++ 
++ 	default:
++ 		bpf_warn_invalid_xdp_action(act);
++ 	case XDP_ABORTED:
++ 		trace_xdp_exception(edev->ndev, prog, act);
++ 	case XDP_DROP:
++ 		qede_recycle_rx_bd_ring(rxq, cqe->bd_num);
++ 	}
++ 
++ 	return false;
++ }
++ 
+++>>>>>>> 15ed8a47ff05 (qede: Add support for ingress headroom)
+  static struct sk_buff *qede_rx_allocate_skb(struct qede_dev *edev,
+  					    struct qede_rx_queue *rxq,
+  					    struct sw_rx_data *bd, u16 len,
+@@@ -1097,8 -1227,12 +1166,15 @@@ static int qede_rx_process_cqe(struct q
+  
+  	fp_cqe = &cqe->fast_path_regular;
+  	len = le16_to_cpu(fp_cqe->len_on_first_bd);
+- 	pad = fp_cqe->placement_offset;
++ 	pad = fp_cqe->placement_offset + rxq->rx_headroom;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Run eBPF program if one is attached */
++ 	if (xdp_prog)
++ 		if (!qede_rx_xdp(edev, fp, rxq, xdp_prog, bd, fp_cqe, pad))
++ 			return 0;
+++>>>>>>> 15ed8a47ff05 (qede: Add support for ingress headroom)
+  
+  	/* If this is an error packet then drop it */
+  	flags = cqe->fast_path_regular.pars_flags.flags;
+diff --git a/drivers/net/ethernet/qlogic/qede/qede.h b/drivers/net/ethernet/qlogic/qede/qede.h
+index 610917dc8503..82bea98224cc 100644
+--- a/drivers/net/ethernet/qlogic/qede/qede.h
++++ b/drivers/net/ethernet/qlogic/qede/qede.h
+@@ -307,21 +307,24 @@ struct qede_rx_queue {
+ 	u16 filled_buffers;
+ 	u8 rxq_id;
+ 
++	/* Used once per each NAPI run */
++	u16 num_rx_buffers;
++
++	u16 rx_headroom;
++
+ 	u32 rx_buf_size;
+ 	u32 rx_buf_seg_size;
+ 
+-	u64 rcv_pkts;
+-
+ 	struct sw_rx_data *sw_rx_ring;
+ 	struct qed_chain rx_bd_ring;
+ 	struct qed_chain rx_comp_ring ____cacheline_aligned;
+ 
+-	/* Used once per each NAPI run */
+-	u16 num_rx_buffers;
+-
+ 	/* GRO */
+ 	struct qede_agg_info tpa_info[ETH_TPA_MAX_AGGS_NUM];
+ 
++	/* Used once per each NAPI run */
++	u64 rcv_pkts;
++
+ 	u64 rx_hw_errors;
+ 	u64 rx_alloc_errors;
+ 	u64 rx_ip_frags;
+* Unmerged path drivers/net/ethernet/qlogic/qede/qede_fp.c
+diff --git a/drivers/net/ethernet/qlogic/qede/qede_main.c b/drivers/net/ethernet/qlogic/qede/qede_main.c
+index ca645148d03f..ecb8e0a68dd0 100644
+--- a/drivers/net/ethernet/qlogic/qede/qede_main.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_main.c
+@@ -1161,8 +1161,9 @@ static int qede_alloc_mem_rxq(struct qede_dev *edev, struct qede_rx_queue *rxq)
+ 
+ 	rxq->rx_buf_size = NET_IP_ALIGN + ETH_OVERHEAD + edev->ndev->mtu;
+ 
+-	if (rxq->rx_buf_size > PAGE_SIZE)
+-		rxq->rx_buf_size = PAGE_SIZE;
++	/* Make sure that the headroom and  payload fit in a single page */
++	if (rxq->rx_buf_size + rxq->rx_headroom > PAGE_SIZE)
++		rxq->rx_buf_size = PAGE_SIZE - rxq->rx_headroom;
+ 
+ 	/* Segment size to spilt a page in multiple equal parts */
+ 	rxq->rx_buf_seg_size = roundup_pow_of_two(rxq->rx_buf_size);
