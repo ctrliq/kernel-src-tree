@@ -1,0 +1,491 @@
+perf tools: Load eBPF object into kernel
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Wang Nan <wangnan0@huawei.com>
+commit 1e5e3ee8ff3877db6943032b54a6ac21c095affd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/1e5e3ee8.failed
+
+This patch utilizes bpf_object__load() provided by libbpf to load all
+objects into kernel.
+
+Committer notes:
+
+Testing it:
+
+When using an incorrect kernel version number, i.e., having this in your
+eBPF proggie:
+
+  int _version __attribute__((section("version"), used)) = 0x40100;
+
+For a 4.3.0-rc6+ kernel, say, this happens and needs checking at event
+parsing time, to provide a better error report to the user:
+
+  # perf record --event /tmp/foo.o sleep 1
+  libbpf: load bpf program failed: Invalid argument
+  libbpf: -- BEGIN DUMP LOG ---
+  libbpf:
+
+  libbpf: -- END LOG --
+  libbpf: failed to load program 'fork=_do_fork'
+  libbpf: failed to load object '/tmp/foo.o'
+  event syntax error: '/tmp/foo.o'
+                       \___ Invalid argument: Are you root and runing a CONFIG_BPF_SYSCALL kernel?
+
+  (add -v to see detail)
+  Run 'perf list' for a list of valid events
+
+   Usage: perf record [<options>] [<command>]
+      or: perf record [<options>] -- <command> [<options>]
+
+      -e, --event <event>   event selector. use 'perf list' to list available events
+
+If we instead make it match, i.e. use 0x40300 on this v4.3.0-rc6+
+kernel, the whole process goes thru:
+
+  # perf record --event /tmp/foo.o -a usleep 1
+  [ perf record: Woken up 1 times to write data ]
+  [ perf record: Captured and wrote 0.202 MB perf.data ]
+  # perf evlist -v
+  /tmp/foo.o: type: 1, size: 112, config: 0x9, { sample_period,
+  sample_freq }: 4000, sample_type: IP|TID|TIME|CPU|PERIOD, disabled: 1,
+  inherit: 1, mmap: 1, comm: 1, freq: 1, task: 1, sample_id_all: 1,
+  exclude_guest: 1, mmap2: 1, comm_exec: 1
+  #
+
+	Signed-off-by: Wang Nan <wangnan0@huawei.com>
+	Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Alexei Starovoitov <ast@plumgrid.com>
+	Cc: Brendan Gregg <brendan.d.gregg@gmail.com>
+	Cc: Daniel Borkmann <daniel@iogearbox.net>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: He Kuang <hekuang@huawei.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Kaixu Xia <xiakaixu@huawei.com>
+	Cc: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Paul Mackerras <paulus@samba.org>
+	Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+	Cc: Zefan Li <lizefan@huawei.com>
+	Cc: pi3orama@163.com
+Link: http://lkml.kernel.org/r/1444826502-49291-6-git-send-email-wangnan0@huawei.com
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 1e5e3ee8ff3877db6943032b54a6ac21c095affd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/bpf-loader.c
+#	tools/perf/util/bpf-loader.h
+#	tools/perf/util/parse-events.c
+diff --cc tools/perf/util/bpf-loader.c
+index ab56073c5d6e,727955858d00..000000000000
+--- a/tools/perf/util/bpf-loader.c
++++ b/tools/perf/util/bpf-loader.c
+@@@ -52,6 -58,242 +52,244 @@@ void bpf__clear(void
+  {
+  	struct bpf_object *obj, *tmp;
+  
+ -	bpf_object__for_each_safe(obj, tmp) {
+ -		bpf__unprobe(obj);
+ +	bpf_object__for_each_safe(obj, tmp)
+  		bpf_object__close(obj);
+++<<<<<<< HEAD
+++=======
++ 	}
++ }
++ 
++ static void
++ bpf_prog_priv__clear(struct bpf_program *prog __maybe_unused,
++ 		     void *_priv)
++ {
++ 	struct bpf_prog_priv *priv = _priv;
++ 
++ 	cleanup_perf_probe_events(&priv->pev, 1);
++ 	free(priv);
++ }
++ 
++ static int
++ config_bpf_program(struct bpf_program *prog)
++ {
++ 	struct perf_probe_event *pev = NULL;
++ 	struct bpf_prog_priv *priv = NULL;
++ 	const char *config_str;
++ 	int err;
++ 
++ 	config_str = bpf_program__title(prog, false);
++ 	if (!config_str) {
++ 		pr_debug("bpf: unable to get title for program\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	priv = calloc(sizeof(*priv), 1);
++ 	if (!priv) {
++ 		pr_debug("bpf: failed to alloc priv\n");
++ 		return -ENOMEM;
++ 	}
++ 	pev = &priv->pev;
++ 
++ 	pr_debug("bpf: config program '%s'\n", config_str);
++ 	err = parse_perf_probe_command(config_str, pev);
++ 	if (err < 0) {
++ 		pr_debug("bpf: '%s' is not a valid config string\n",
++ 			 config_str);
++ 		err = -EINVAL;
++ 		goto errout;
++ 	}
++ 
++ 	if (pev->group && strcmp(pev->group, PERF_BPF_PROBE_GROUP)) {
++ 		pr_debug("bpf: '%s': group for event is set and not '%s'.\n",
++ 			 config_str, PERF_BPF_PROBE_GROUP);
++ 		err = -EINVAL;
++ 		goto errout;
++ 	} else if (!pev->group)
++ 		pev->group = strdup(PERF_BPF_PROBE_GROUP);
++ 
++ 	if (!pev->group) {
++ 		pr_debug("bpf: strdup failed\n");
++ 		err = -ENOMEM;
++ 		goto errout;
++ 	}
++ 
++ 	if (!pev->event) {
++ 		pr_debug("bpf: '%s': event name is missing\n",
++ 			 config_str);
++ 		err = -EINVAL;
++ 		goto errout;
++ 	}
++ 	pr_debug("bpf: config '%s' is ok\n", config_str);
++ 
++ 	err = bpf_program__set_private(prog, priv, bpf_prog_priv__clear);
++ 	if (err) {
++ 		pr_debug("Failed to set priv for program '%s'\n", config_str);
++ 		goto errout;
++ 	}
++ 
++ 	return 0;
++ 
++ errout:
++ 	if (pev)
++ 		clear_perf_probe_event(pev);
++ 	free(priv);
++ 	return err;
++ }
++ 
++ static int bpf__prepare_probe(void)
++ {
++ 	static int err = 0;
++ 	static bool initialized = false;
++ 
++ 	/*
++ 	 * Make err static, so if init failed the first, bpf__prepare_probe()
++ 	 * fails each time without calling init_probe_symbol_maps multiple
++ 	 * times.
++ 	 */
++ 	if (initialized)
++ 		return err;
++ 
++ 	initialized = true;
++ 	err = init_probe_symbol_maps(false);
++ 	if (err < 0)
++ 		pr_debug("Failed to init_probe_symbol_maps\n");
++ 	probe_conf.max_probes = MAX_PROBES;
++ 	return err;
++ }
++ 
++ int bpf__probe(struct bpf_object *obj)
++ {
++ 	int err = 0;
++ 	struct bpf_program *prog;
++ 	struct bpf_prog_priv *priv;
++ 	struct perf_probe_event *pev;
++ 
++ 	err = bpf__prepare_probe();
++ 	if (err) {
++ 		pr_debug("bpf__prepare_probe failed\n");
++ 		return err;
++ 	}
++ 
++ 	bpf_object__for_each_program(prog, obj) {
++ 		err = config_bpf_program(prog);
++ 		if (err)
++ 			goto out;
++ 
++ 		err = bpf_program__get_private(prog, (void **)&priv);
++ 		if (err || !priv)
++ 			goto out;
++ 		pev = &priv->pev;
++ 
++ 		err = convert_perf_probe_events(pev, 1);
++ 		if (err < 0) {
++ 			pr_debug("bpf_probe: failed to convert perf probe events");
++ 			goto out;
++ 		}
++ 
++ 		err = apply_perf_probe_events(pev, 1);
++ 		if (err < 0) {
++ 			pr_debug("bpf_probe: failed to apply perf probe events");
++ 			goto out;
++ 		}
++ 	}
++ out:
++ 	return err < 0 ? err : 0;
++ }
++ 
++ #define EVENTS_WRITE_BUFSIZE  4096
++ int bpf__unprobe(struct bpf_object *obj)
++ {
++ 	int err, ret = 0;
++ 	struct bpf_program *prog;
++ 	struct bpf_prog_priv *priv;
++ 
++ 	bpf_object__for_each_program(prog, obj) {
++ 		int i;
++ 
++ 		err = bpf_program__get_private(prog, (void **)&priv);
++ 		if (err || !priv)
++ 			continue;
++ 
++ 		for (i = 0; i < priv->pev.ntevs; i++) {
++ 			struct probe_trace_event *tev = &priv->pev.tevs[i];
++ 			char name_buf[EVENTS_WRITE_BUFSIZE];
++ 			struct strfilter *delfilter;
++ 
++ 			snprintf(name_buf, EVENTS_WRITE_BUFSIZE,
++ 				 "%s:%s", tev->group, tev->event);
++ 			name_buf[EVENTS_WRITE_BUFSIZE - 1] = '\0';
++ 
++ 			delfilter = strfilter__new(name_buf, NULL);
++ 			if (!delfilter) {
++ 				pr_debug("Failed to create filter for unprobing\n");
++ 				ret = -ENOMEM;
++ 				continue;
++ 			}
++ 
++ 			err = del_perf_probe_events(delfilter);
++ 			strfilter__delete(delfilter);
++ 			if (err) {
++ 				pr_debug("Failed to delete %s\n", name_buf);
++ 				ret = err;
++ 				continue;
++ 			}
++ 		}
++ 	}
++ 	return ret;
++ }
++ 
++ int bpf__load(struct bpf_object *obj)
++ {
++ 	int err;
++ 
++ 	err = bpf_object__load(obj);
++ 	if (err) {
++ 		pr_debug("bpf: load objects failed\n");
++ 		return err;
++ 	}
++ 	return 0;
++ }
++ 
++ #define bpf__strerror_head(err, buf, size) \
++ 	char sbuf[STRERR_BUFSIZE], *emsg;\
++ 	if (!size)\
++ 		return 0;\
++ 	if (err < 0)\
++ 		err = -err;\
++ 	emsg = strerror_r(err, sbuf, sizeof(sbuf));\
++ 	switch (err) {\
++ 	default:\
++ 		scnprintf(buf, size, "%s", emsg);\
++ 		break;
++ 
++ #define bpf__strerror_entry(val, fmt...)\
++ 	case val: {\
++ 		scnprintf(buf, size, fmt);\
++ 		break;\
++ 	}
++ 
++ #define bpf__strerror_end(buf, size)\
++ 	}\
++ 	buf[size - 1] = '\0';
++ 
++ int bpf__strerror_probe(struct bpf_object *obj __maybe_unused,
++ 			int err, char *buf, size_t size)
++ {
++ 	bpf__strerror_head(err, buf, size);
++ 	bpf__strerror_entry(EEXIST, "Probe point exist. Try use 'perf probe -d \"*\"'");
++ 	bpf__strerror_entry(EPERM, "You need to be root, and /proc/sys/kernel/kptr_restrict should be 0\n");
++ 	bpf__strerror_entry(ENOENT, "You need to check probing points in BPF file\n");
++ 	bpf__strerror_end(buf, size);
++ 	return 0;
+++>>>>>>> 1e5e3ee8ff38 (perf tools: Load eBPF object into kernel)
++ }
++ 
++ int bpf__strerror_load(struct bpf_object *obj __maybe_unused,
++ 		       int err, char *buf, size_t size)
++ {
++ 	bpf__strerror_head(err, buf, size);
++ 	bpf__strerror_entry(EINVAL, "%s: Are you root and runing a CONFIG_BPF_SYSCALL kernel?",
++ 			    emsg)
++ 	bpf__strerror_end(buf, size);
++ 	return 0;
+  }
+diff --cc tools/perf/util/bpf-loader.h
+index f402d7c8c288,b091ceb19c48..000000000000
+--- a/tools/perf/util/bpf-loader.h
++++ b/tools/perf/util/bpf-loader.h
+@@@ -16,6 -17,15 +16,18 @@@ struct bpf_object
+  struct bpf_object *bpf__prepare_load(const char *filename);
+  
+  void bpf__clear(void);
+++<<<<<<< HEAD
+++=======
++ 
++ int bpf__probe(struct bpf_object *obj);
++ int bpf__unprobe(struct bpf_object *obj);
++ int bpf__strerror_probe(struct bpf_object *obj, int err,
++ 			char *buf, size_t size);
++ 
++ int bpf__load(struct bpf_object *obj);
++ int bpf__strerror_load(struct bpf_object *obj, int err,
++ 		       char *buf, size_t size);
+++>>>>>>> 1e5e3ee8ff38 (perf tools: Load eBPF object into kernel)
+  #else
+  static inline struct bpf_object *
+  bpf__prepare_load(const char *filename __maybe_unused)
+@@@ -25,5 -35,36 +37,39 @@@
+  }
+  
+  static inline void bpf__clear(void) { }
+++<<<<<<< HEAD
+++=======
++ 
++ static inline int bpf__probe(struct bpf_object *obj __maybe_unused) { return 0;}
++ static inline int bpf__unprobe(struct bpf_object *obj __maybe_unused) { return 0;}
++ static inline int bpf__load(struct bpf_object *obj __maybe_unused) { return 0; }
++ 
++ static inline int
++ __bpf_strerror(char *buf, size_t size)
++ {
++ 	if (!size)
++ 		return 0;
++ 	strncpy(buf,
++ 		"ERROR: eBPF object loading is disabled during compiling.\n",
++ 		size);
++ 	buf[size - 1] = '\0';
++ 	return 0;
++ }
++ 
++ static inline int
++ bpf__strerror_probe(struct bpf_object *obj __maybe_unused,
++ 		    int err __maybe_unused,
++ 		    char *buf, size_t size)
++ {
++ 	return __bpf_strerror(buf, size);
++ }
++ 
++ static inline int bpf__strerror_load(struct bpf_object *obj __maybe_unused,
++ 				     int err __maybe_unused,
++ 				     char *buf, size_t size)
++ {
++ 	return __bpf_strerror(buf, size);
++ }
+++>>>>>>> 1e5e3ee8ff38 (perf tools: Load eBPF object into kernel)
+  #endif
+  #endif
+diff --cc tools/perf/util/parse-events.c
+index 3a234b74d6ff,c3aabeb63e88..000000000000
+--- a/tools/perf/util/parse-events.c
++++ b/tools/perf/util/parse-events.c
+@@@ -590,6 -530,85 +590,88 @@@ static int add_tracepoint_multi_sys(str
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int parse_events_load_bpf_obj(struct parse_events_evlist *data,
++ 			      struct list_head *list,
++ 			      struct bpf_object *obj)
++ {
++ 	int err;
++ 	char errbuf[BUFSIZ];
++ 	static bool registered_unprobe_atexit = false;
++ 
++ 	if (IS_ERR(obj) || !obj) {
++ 		snprintf(errbuf, sizeof(errbuf),
++ 			 "Internal error: load bpf obj with NULL");
++ 		err = -EINVAL;
++ 		goto errout;
++ 	}
++ 
++ 	/*
++ 	 * Register atexit handler before calling bpf__probe() so
++ 	 * bpf__probe() don't need to unprobe probe points its already
++ 	 * created when failure.
++ 	 */
++ 	if (!registered_unprobe_atexit) {
++ 		atexit(bpf__clear);
++ 		registered_unprobe_atexit = true;
++ 	}
++ 
++ 	err = bpf__probe(obj);
++ 	if (err) {
++ 		bpf__strerror_probe(obj, err, errbuf, sizeof(errbuf));
++ 		goto errout;
++ 	}
++ 
++ 	err = bpf__load(obj);
++ 	if (err) {
++ 		bpf__strerror_load(obj, err, errbuf, sizeof(errbuf));
++ 		goto errout;
++ 	}
++ 
++ 	/*
++ 	 * Temporary add a dummy event here so we can check whether
++ 	 * basic bpf loader works. Following patches will replace
++ 	 * dummy event by useful evsels.
++ 	 */
++ 	return parse_events_add_numeric(data, list, PERF_TYPE_SOFTWARE,
++ 					PERF_COUNT_SW_DUMMY, NULL);
++ errout:
++ 	data->error->help = strdup("(add -v to see detail)");
++ 	data->error->str = strdup(errbuf);
++ 	return err;
++ }
++ 
++ int parse_events_load_bpf(struct parse_events_evlist *data,
++ 			  struct list_head *list,
++ 			  char *bpf_file_name)
++ {
++ 	struct bpf_object *obj;
++ 
++ 	obj = bpf__prepare_load(bpf_file_name);
++ 	if (IS_ERR(obj) || !obj) {
++ 		char errbuf[BUFSIZ];
++ 		int err;
++ 
++ 		err = obj ? PTR_ERR(obj) : -EINVAL;
++ 
++ 		if (err == -ENOTSUP)
++ 			snprintf(errbuf, sizeof(errbuf),
++ 				 "BPF support is not compiled");
++ 		else
++ 			snprintf(errbuf, sizeof(errbuf),
++ 				 "BPF object file '%s' is invalid",
++ 				 bpf_file_name);
++ 
++ 		data->error->help = strdup("(add -v to see detail)");
++ 		data->error->str = strdup(errbuf);
++ 		return err;
++ 	}
++ 
++ 	return parse_events_load_bpf_obj(data, list, obj);
++ }
++ 
+++>>>>>>> 1e5e3ee8ff38 (perf tools: Load eBPF object into kernel)
+  static int
+  parse_breakpoint_type(const char *type, struct perf_event_attr *attr)
+  {
+* Unmerged path tools/perf/util/bpf-loader.c
+* Unmerged path tools/perf/util/bpf-loader.h
+* Unmerged path tools/perf/util/parse-events.c
