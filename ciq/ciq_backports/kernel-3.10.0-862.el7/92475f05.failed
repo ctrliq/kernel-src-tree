@@ -1,0 +1,126 @@
+ceph: handle epoch barriers in cap messages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jeff Layton <jlayton@redhat.com>
+commit 92475f05bdb6daefce3f55f46551153e7ed05f45
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/92475f05.failed
+
+Have the client store and update the osdc epoch_barrier when a cap
+message comes in with one.
+
+When sending cap messages, send the epoch barrier as well. This allows
+clients to inform servers that their released caps may not be used until
+a particular OSD map epoch.
+
+	Signed-off-by: Jeff Layton <jlayton@redhat.com>
+	Reviewed-by: "Yan, Zheng” <zyan@redhat.com>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit 92475f05bdb6daefce3f55f46551153e7ed05f45)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/caps.c
+#	fs/ceph/mds_client.h
+diff --cc fs/ceph/caps.c
+index 7f9ecb1da577,a3ebb632294e..000000000000
+--- a/fs/ceph/caps.c
++++ b/fs/ceph/caps.c
+@@@ -3601,9 -3649,8 +3614,14 @@@ void ceph_handle_caps(struct ceph_mds_s
+  	if (le16_to_cpu(msg->hdr.version) >= 8) {
+  		u64 flush_tid;
+  		u32 caller_uid, caller_gid;
+++<<<<<<< HEAD
+ +		u32 osd_epoch_barrier;
+ +		/* version >= 5 */
+ +		ceph_decode_32_safe(&p, end, osd_epoch_barrier, bad);
+++=======
++ 		u32 pool_ns_len;
++ 
+++>>>>>>> 92475f05bdb6 (ceph: handle epoch barriers in cap messages)
+  		/* version >= 6 */
+  		ceph_decode_64_safe(&p, end, flush_tid, bad);
+  		/* version >= 7 */
+diff --cc fs/ceph/mds_client.h
+index de2a0169112c,db57ae98ed34..000000000000
+--- a/fs/ceph/mds_client.h
++++ b/fs/ceph/mds_client.h
+@@@ -96,10 -106,13 +96,17 @@@ struct ceph_mds_reply_info_parsed 
+  
+  /*
+   * cap releases are batched and sent to the MDS en masse.
++  *
++  * Account for per-message overhead of mds_cap_release header
++  * and __le32 for osd epoch barrier trailing field.
+   */
+++<<<<<<< HEAD
+ +#define CEPH_CAPS_PER_RELEASE ((PAGE_CACHE_SIZE -			\
+++=======
++ #define CEPH_CAPS_PER_RELEASE ((PAGE_SIZE - sizeof(u32) -		\
+++>>>>>>> 92475f05bdb6 (ceph: handle epoch barriers in cap messages)
+  				sizeof(struct ceph_mds_cap_release)) /	\
+- 			       sizeof(struct ceph_mds_cap_item))
++ 			        sizeof(struct ceph_mds_cap_item))
+  
+  
+  /*
+* Unmerged path fs/ceph/caps.c
+diff --git a/fs/ceph/mds_client.c b/fs/ceph/mds_client.c
+index 06ecdebe64d7..e13d6c919190 100644
+--- a/fs/ceph/mds_client.c
++++ b/fs/ceph/mds_client.c
+@@ -1524,9 +1524,15 @@ void ceph_send_cap_releases(struct ceph_mds_client *mdsc,
+ 	struct ceph_msg *msg = NULL;
+ 	struct ceph_mds_cap_release *head;
+ 	struct ceph_mds_cap_item *item;
++	struct ceph_osd_client *osdc = &mdsc->fsc->client->osdc;
+ 	struct ceph_cap *cap;
+ 	LIST_HEAD(tmp_list);
+ 	int num_cap_releases;
++	__le32	barrier, *cap_barrier;
++
++	down_read(&osdc->lock);
++	barrier = cpu_to_le32(osdc->epoch_barrier);
++	up_read(&osdc->lock);
+ 
+ 	spin_lock(&session->s_cap_lock);
+ again:
+@@ -1544,7 +1550,11 @@ again:
+ 			head = msg->front.iov_base;
+ 			head->num = cpu_to_le32(0);
+ 			msg->front.iov_len = sizeof(*head);
++
++			msg->hdr.version = cpu_to_le16(2);
++			msg->hdr.compat_version = cpu_to_le16(1);
+ 		}
++
+ 		cap = list_first_entry(&tmp_list, struct ceph_cap,
+ 					session_caps);
+ 		list_del(&cap->session_caps);
+@@ -1562,6 +1572,11 @@ again:
+ 		ceph_put_cap(mdsc, cap);
+ 
+ 		if (le32_to_cpu(head->num) == CEPH_CAPS_PER_RELEASE) {
++			// Append cap_barrier field
++			cap_barrier = msg->front.iov_base + msg->front.iov_len;
++			*cap_barrier = barrier;
++			msg->front.iov_len += sizeof(*cap_barrier);
++
+ 			msg->hdr.front_len = cpu_to_le32(msg->front.iov_len);
+ 			dout("send_cap_releases mds%d %p\n", session->s_mds, msg);
+ 			ceph_con_send(&session->s_con, msg);
+@@ -1577,6 +1592,11 @@ again:
+ 	spin_unlock(&session->s_cap_lock);
+ 
+ 	if (msg) {
++		// Append cap_barrier field
++		cap_barrier = msg->front.iov_base + msg->front.iov_len;
++		*cap_barrier = barrier;
++		msg->front.iov_len += sizeof(*cap_barrier);
++
+ 		msg->hdr.front_len = cpu_to_le32(msg->front.iov_len);
+ 		dout("send_cap_releases mds%d %p\n", session->s_mds, msg);
+ 		ceph_con_send(&session->s_con, msg);
+* Unmerged path fs/ceph/mds_client.h
