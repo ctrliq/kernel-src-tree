@@ -1,0 +1,181 @@
+make sure that mntns_install() doesn't end up with referral for root
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [fs] make sure that mntns_install() doesn't end up with referral for root ("Eric W. Biederman") [1487751]
+Rebuild_FUZZ: 99.27%
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit 4f757f3cbf54edef7b75c68d6d6d2f1a0ca08d2e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/4f757f3c.failed
+
+new flag: LOOKUP_DOWN.  If the starting point is overmounted, cross
+into whatever's mounted on top, triggering referrals et.al.
+
+Use that instead of follow_down_one() loop in mntns_install(), handle
+errors properly.
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 4f757f3cbf54edef7b75c68d6d6d2f1a0ca08d2e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/namei.c
+#	fs/namespace.c
+diff --cc fs/namei.c
+index 999526d427c6,646db9cf2579..000000000000
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@@ -1954,56 -2249,63 +1954,105 @@@ static inline int lookup_last(struct na
+  		nd->flags |= LOOKUP_FOLLOW | LOOKUP_DIRECTORY;
+  
+  	nd->flags &= ~LOOKUP_PARENT;
+ -	return walk_component(nd, 0);
+ +	return walk_component(nd, path, nd->flags & LOOKUP_FOLLOW);
+  }
+  
++ static int handle_lookup_down(struct nameidata *nd)
++ {
++ 	struct path path = nd->path;
++ 	struct inode *inode = nd->inode;
++ 	unsigned seq = nd->seq;
++ 	int err;
++ 
++ 	if (nd->flags & LOOKUP_RCU) {
++ 		/*
++ 		 * don't bother with unlazy_walk on failure - we are
++ 		 * at the very beginning of walk, so we lose nothing
++ 		 * if we simply redo everything in non-RCU mode
++ 		 */
++ 		if (unlikely(!__follow_mount_rcu(nd, &path, &inode, &seq)))
++ 			return -ECHILD;
++ 	} else {
++ 		dget(path.dentry);
++ 		err = follow_managed(&path, nd);
++ 		if (unlikely(err < 0))
++ 			return err;
++ 		inode = d_backing_inode(path.dentry);
++ 		seq = 0;
++ 	}
++ 	path_to_nameidata(&path, nd);
++ 	nd->inode = inode;
++ 	nd->seq = seq;
++ 	return 0;
++ }
++ 
+  /* Returns 0 and nd will be valid on success; Retuns error, otherwise. */
+ -static int path_lookupat(struct nameidata *nd, unsigned flags, struct path *path)
+ +static int path_lookupat(int dfd, const char *name,
+ +				unsigned int flags, struct nameidata *nd)
+  {
+ -	const char *s = path_init(nd, flags);
+ +	struct file *base = NULL;
+ +	struct path path;
+  	int err;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Path walking is largely split up into 2 different synchronisation
+ +	 * schemes, rcu-walk and ref-walk (explained in
+ +	 * Documentation/filesystems/path-lookup.txt). These share much of the
+ +	 * path walk code, but some things particularly setup, cleanup, and
+ +	 * following mounts are sufficiently divergent that functions are
+ +	 * duplicated. Typically there is a function foo(), and its RCU
+ +	 * analogue, foo_rcu().
+ +	 *
+ +	 * -ECHILD is the error number of choice (just to avoid clashes) that
+ +	 * is returned if some aspect of an rcu-walk fails. Such an error must
+ +	 * be handled by restarting a traditional ref-walk (which will always
+ +	 * be able to complete).
+ +	 */
+ +	err = path_init(dfd, name, flags | LOOKUP_PARENT, nd, &base);
+ +
+ +	if (unlikely(err))
+ +		return err;
+ +
+ +	current->total_link_count = 0;
+ +	err = link_path_walk(name, nd);
+ +
+ +	if (!err && !(flags & LOOKUP_PARENT)) {
+ +		err = lookup_last(nd, &path);
+ +		while (err > 0) {
+ +			void *cookie;
+ +			struct path link = path;
+ +			err = may_follow_link(&link, nd);
+ +			if (unlikely(err))
+ +				break;
+ +			nd->flags |= LOOKUP_PARENT;
+ +			err = follow_link(&link, nd, &cookie);
+ +			if (err)
+ +				break;
+ +			err = lookup_last(nd, &path);
+ +			put_link(nd, &link, cookie);
+++=======
++ 	if (IS_ERR(s))
++ 		return PTR_ERR(s);
++ 
++ 	if (unlikely(flags & LOOKUP_DOWN)) {
++ 		err = handle_lookup_down(nd);
++ 		if (unlikely(err < 0)) {
++ 			terminate_walk(nd);
++ 			return err;
++ 		}
++ 	}
++ 
++ 	while (!(err = link_path_walk(s, nd))
++ 		&& ((err = lookup_last(nd)) > 0)) {
++ 		s = trailing_symlink(nd);
++ 		if (IS_ERR(s)) {
++ 			err = PTR_ERR(s);
++ 			break;
+++>>>>>>> 4f757f3cbf54 (make sure that mntns_install() doesn't end up with referral for root)
+  		}
+  	}
+ +
+  	if (!err)
+  		err = complete_walk(nd);
+  
+diff --cc fs/namespace.c
+index 58001128375d,0886ef28bff6..000000000000
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@@ -3328,16 -3457,17 +3328,21 @@@ static void *mntns_get(struct task_stru
+  	return ns;
+  }
+  
+ -static void mntns_put(struct ns_common *ns)
+ +static void mntns_put(void *ns)
+  {
+ -	put_mnt_ns(to_mnt_ns(ns));
+ +	put_mnt_ns(ns);
+  }
+  
+ -static int mntns_install(struct nsproxy *nsproxy, struct ns_common *ns)
+ +static int mntns_install(struct nsproxy *nsproxy, void *ns)
+  {
+  	struct fs_struct *fs = current->fs;
+++<<<<<<< HEAD
+ +	struct mnt_namespace *mnt_ns = ns;
+++=======
++ 	struct mnt_namespace *mnt_ns = to_mnt_ns(ns), *old_mnt_ns;
+++>>>>>>> 4f757f3cbf54 (make sure that mntns_install() doesn't end up with referral for root)
+  	struct path root;
++ 	int err;
+  
+  	if (!ns_capable(mnt_ns->user_ns, CAP_SYS_ADMIN) ||
+  	    !ns_capable(current_user_ns(), CAP_SYS_CHROOT) ||
+* Unmerged path fs/namei.c
+* Unmerged path fs/namespace.c
+diff --git a/include/linux/namei.h b/include/linux/namei.h
+index e6772d9fbe73..20da4337c38e 100644
+--- a/include/linux/namei.h
++++ b/include/linux/namei.h
+@@ -56,6 +56,7 @@ enum {LAST_NORM, LAST_ROOT, LAST_DOT, LAST_DOTDOT, LAST_BIND};
+ #define LOOKUP_JUMPED		0x1000
+ #define LOOKUP_ROOT		0x2000
+ #define LOOKUP_EMPTY		0x4000
++#define LOOKUP_DOWN		0x8000
+ 
+ extern int user_path_at(int, const char __user *, unsigned, struct path *);
+ extern int user_path_at_empty(int, const char __user *, unsigned, struct path *, int *empty);
