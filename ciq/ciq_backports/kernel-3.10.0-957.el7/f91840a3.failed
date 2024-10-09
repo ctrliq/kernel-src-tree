@@ -1,0 +1,236 @@
+perf, bpf: Add BPF support to all perf_event types
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Alexei Starovoitov <ast@fb.com>
+commit f91840a32deef5cb1bf73338bc5010f843b01426
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/f91840a3.failed
+
+Allow BPF_PROG_TYPE_PERF_EVENT program types to attach to all
+perf_event types, including HW_CACHE, RAW, and dynamic pmu events.
+Only tracepoint/kprobe events are treated differently which require
+BPF_PROG_TYPE_TRACEPOINT/BPF_PROG_TYPE_KPROBE program types accordingly.
+
+Also add support for reading all event counters using
+bpf_perf_event_read() helper.
+
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f91840a32deef5cb1bf73338bc5010f843b01426)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/arraymap.c
+#	kernel/events/core.c
+#	kernel/trace/bpf_trace.c
+diff --cc kernel/events/core.c
+index 3da42ad5a6b0,51e40e4876c0..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -3661,9 -3651,35 +3653,38 @@@ int perf_event_read_local(struct perf_e
+  	 * It must not be an event with inherit set, we cannot read
+  	 * all child counters from atomic context.
+  	 */
+- 	WARN_ON_ONCE(event->attr.inherit);
++ 	if (event->attr.inherit) {
++ 		ret = -EOPNOTSUPP;
++ 		goto out;
++ 	}
++ 
++ 	/*
+++<<<<<<< HEAD
+++=======
++ 	 * It must not have a pmu::count method, those are not
++ 	 * NMI safe.
++ 	 */
++ 	if (event->pmu->count) {
++ 		ret = -EOPNOTSUPP;
++ 		goto out;
++ 	}
++ 
++ 	/* If this is a per-task event, it must be for current */
++ 	if ((event->attach_state & PERF_ATTACH_TASK) &&
++ 	    event->hw.target != current) {
++ 		ret = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	/* If this is a per-CPU event, it must be for this CPU */
++ 	if (!(event->attach_state & PERF_ATTACH_TASK) &&
++ 	    event->cpu != smp_processor_id()) {
++ 		ret = -EINVAL;
++ 		goto out;
++ 	}
+  
+  	/*
+++>>>>>>> f91840a32dee (perf, bpf: Add BPF support to all perf_event types)
+  	 * If the event is currently on this CPU, its either a per-task event,
+  	 * or local to this CPU. Furthermore it means its ACTIVE (otherwise
+  	 * oncpu == -1).
+@@@ -7742,6 -7977,131 +7764,134 @@@ static void perf_event_free_filter(stru
+  	ftrace_profile_free_filter(event);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_BPF_SYSCALL
++ static void bpf_overflow_handler(struct perf_event *event,
++ 				 struct perf_sample_data *data,
++ 				 struct pt_regs *regs)
++ {
++ 	struct bpf_perf_event_data_kern ctx = {
++ 		.data = data,
++ 		.regs = regs,
++ 	};
++ 	int ret = 0;
++ 
++ 	preempt_disable();
++ 	if (unlikely(__this_cpu_inc_return(bpf_prog_active) != 1))
++ 		goto out;
++ 	rcu_read_lock();
++ 	ret = BPF_PROG_RUN(event->prog, &ctx);
++ 	rcu_read_unlock();
++ out:
++ 	__this_cpu_dec(bpf_prog_active);
++ 	preempt_enable();
++ 	if (!ret)
++ 		return;
++ 
++ 	event->orig_overflow_handler(event, data, regs);
++ }
++ 
++ static int perf_event_set_bpf_handler(struct perf_event *event, u32 prog_fd)
++ {
++ 	struct bpf_prog *prog;
++ 
++ 	if (event->overflow_handler_context)
++ 		/* hw breakpoint or kernel counter */
++ 		return -EINVAL;
++ 
++ 	if (event->prog)
++ 		return -EEXIST;
++ 
++ 	prog = bpf_prog_get_type(prog_fd, BPF_PROG_TYPE_PERF_EVENT);
++ 	if (IS_ERR(prog))
++ 		return PTR_ERR(prog);
++ 
++ 	event->prog = prog;
++ 	event->orig_overflow_handler = READ_ONCE(event->overflow_handler);
++ 	WRITE_ONCE(event->overflow_handler, bpf_overflow_handler);
++ 	return 0;
++ }
++ 
++ static void perf_event_free_bpf_handler(struct perf_event *event)
++ {
++ 	struct bpf_prog *prog = event->prog;
++ 
++ 	if (!prog)
++ 		return;
++ 
++ 	WRITE_ONCE(event->overflow_handler, event->orig_overflow_handler);
++ 	event->prog = NULL;
++ 	bpf_prog_put(prog);
++ }
++ #else
++ static int perf_event_set_bpf_handler(struct perf_event *event, u32 prog_fd)
++ {
++ 	return -EOPNOTSUPP;
++ }
++ static void perf_event_free_bpf_handler(struct perf_event *event)
++ {
++ }
++ #endif
++ 
++ static int perf_event_set_bpf_prog(struct perf_event *event, u32 prog_fd)
++ {
++ 	bool is_kprobe, is_tracepoint;
++ 	struct bpf_prog *prog;
++ 
++ 	if (event->attr.type != PERF_TYPE_TRACEPOINT)
++ 		return perf_event_set_bpf_handler(event, prog_fd);
++ 
++ 	if (event->tp_event->prog)
++ 		return -EEXIST;
++ 
++ 	is_kprobe = event->tp_event->flags & TRACE_EVENT_FL_UKPROBE;
++ 	is_tracepoint = event->tp_event->flags & TRACE_EVENT_FL_TRACEPOINT;
++ 	if (!is_kprobe && !is_tracepoint)
++ 		/* bpf programs can only be attached to u/kprobe or tracepoint */
++ 		return -EINVAL;
++ 
++ 	prog = bpf_prog_get(prog_fd);
++ 	if (IS_ERR(prog))
++ 		return PTR_ERR(prog);
++ 
++ 	if ((is_kprobe && prog->type != BPF_PROG_TYPE_KPROBE) ||
++ 	    (is_tracepoint && prog->type != BPF_PROG_TYPE_TRACEPOINT)) {
++ 		/* valid fd, but invalid bpf program type */
++ 		bpf_prog_put(prog);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (is_tracepoint) {
++ 		int off = trace_event_get_offsets(event->tp_event);
++ 
++ 		if (prog->aux->max_ctx_offset > off) {
++ 			bpf_prog_put(prog);
++ 			return -EACCES;
++ 		}
++ 	}
++ 	event->tp_event->prog = prog;
++ 
++ 	return 0;
++ }
++ 
++ static void perf_event_free_bpf_prog(struct perf_event *event)
++ {
++ 	struct bpf_prog *prog;
++ 
++ 	perf_event_free_bpf_handler(event);
++ 
++ 	if (!event->tp_event)
++ 		return;
++ 
++ 	prog = event->tp_event->prog;
++ 	if (prog) {
++ 		event->tp_event->prog = NULL;
++ 		bpf_prog_put(prog);
++ 	}
++ }
++ 
+++>>>>>>> f91840a32dee (perf, bpf: Add BPF support to all perf_event types)
+  #else
+  
+  static inline void perf_tp_register(void)
+* Unmerged path kernel/bpf/arraymap.c
+* Unmerged path kernel/trace/bpf_trace.c
+diff --git a/include/linux/perf_event.h b/include/linux/perf_event.h
+index c93e5f6b30d7..719351c2d5cd 100644
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -775,7 +775,7 @@ perf_event_create_kernel_counter(struct perf_event_attr *attr,
+ 				void *context);
+ extern void perf_pmu_migrate_context(struct pmu *pmu,
+ 				int src_cpu, int dst_cpu);
+-extern u64 perf_event_read_local(struct perf_event *event);
++int perf_event_read_local(struct perf_event *event, u64 *value);
+ extern u64 perf_event_read_value(struct perf_event *event,
+ 				 u64 *enabled, u64 *running);
+ 
+@@ -1132,7 +1132,10 @@ static inline const struct perf_event_attr *perf_event_attrs(struct perf_event *
+ {
+ 	return ERR_PTR(-EINVAL);
+ }
+-static inline u64 perf_event_read_local(struct perf_event *event)	{ return -EINVAL; }
++static inline int perf_event_read_local(struct perf_event *event, u64 *value)
++{
++	return -EINVAL;
++}
+ static inline void perf_event_print_debug(void)				{ }
+ static inline int perf_event_task_disable(void)				{ return -EINVAL; }
+ static inline int perf_event_task_enable(void)				{ return -EINVAL; }
+* Unmerged path kernel/bpf/arraymap.c
+* Unmerged path kernel/events/core.c
+* Unmerged path kernel/trace/bpf_trace.c
