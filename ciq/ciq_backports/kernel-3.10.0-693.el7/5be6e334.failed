@@ -1,0 +1,168 @@
+drm/i915: Do .init_clock_gating() earlier to avoid it clobbering watermarks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [drm] i915: Do .init_clock_gating() earlier to avoid it clobbering watermarks (Rob Clark) [1422186]
+Rebuild_FUZZ: 97.26%
+commit-author Ville Syrjälä <ville.syrjala@linux.intel.com>
+commit 5be6e33400992d3450e1c8234a5af353e1560580
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/5be6e334.failed
+
+Currently ILK-BDW explicitly disable LP1+ watermarks from their
+.init_clock_gating() hooks. Unfortunately that hook gets called way too
+late since by that time we've already initialized all the watermark
+state tracking which then gets out of sync with the hardware state.
+
+We may eventually want to consider killing off the explicit LP1+
+disable from .init_clock_gating(). In the meantime however, we can
+avoid the problem by reordering the init sequence such that
+intel_modeset_init_hw()->intel_init_clock_gating() gets called
+prior to the hardware state takeover.
+
+I suppose prior to the two stage watermark programming we were
+magically saved by something that forced the watermarks to be
+reprogrammed fully after .init_clock_gating() got called. But
+now that no longer happens.
+
+Note that the diff might look a bit odd as it kills off one
+call of intel_update_cdclk(), but that's fine because
+intel_modeset_init_hw() does the exact same thing. Previously
+we just did it twice.
+
+Actually even this new init sequence is pretty bogus as
+.init_clock_gating() really should be called before any gem
+hardware init since it can  configure various clock gating
+workarounds and whatnot that affect the GT side as well. Also
+intel_modeset_init() really should get split up into better
+defined init stages. Another "fun" detail is that
+intel_modeset_gem_init() is where RPS/RC6 gets configured.
+Why that is done from the display code is beyond me. I've
+decided to leave all this be for now, and just try to fix
+the init sequence enough for watermarks to work.
+
+	Cc: stable@vger.kernel.org
+	Cc: Gabriele Mazzotta <gabriele.mzt@gmail.com>
+	Cc: David Purton <dcpurton@marshwiggle.net>
+	Cc: Matt Roper <matthew.d.roper@intel.com>
+	Cc: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+	Reported-by: Gabriele Mazzotta <gabriele.mzt@gmail.com>
+	Reported-by: David Purton <dcpurton@marshwiggle.net>
+	Tested-by: Gabriele Mazzotta <gabriele.mzt@gmail.com>
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=96645
+Fixes: ed4a6a7ca853 ("drm/i915: Add two-stage ILK-style watermark programming (v11)")
+	Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20170220140443.30891-1-ville.syrjala@linux.intel.com
+	Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit 5be6e33400992d3450e1c8234a5af353e1560580)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_display.c
+diff --cc drivers/gpu/drm/i915/intel_display.c
+index 460d1c5248a2,5edf1ff8b688..000000000000
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@@ -15549,14 -14970,17 +15549,25 @@@ void intel_modeset_init(struct drm_devi
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	intel_update_czclk(dev_priv);
+ +	intel_update_cdclk(dev);
+ +
+ +	intel_shared_dpll_init(dev);
+ +
+++=======
++ 	intel_shared_dpll_init(dev);
++ 
++ 	intel_update_czclk(dev_priv);
++ 	intel_modeset_init_hw(dev);
++ 
++ 	if (dev_priv->max_cdclk_freq == 0)
++ 		intel_update_max_cdclk(dev_priv);
++ 
+++>>>>>>> 5be6e3340099 (drm/i915: Do .init_clock_gating() earlier to avoid it clobbering watermarks)
+  	/* Just disable it once at startup */
+ -	i915_disable_vga(dev_priv);
+ -	intel_setup_outputs(dev_priv);
+ +	i915_disable_vga(dev);
+ +	intel_setup_outputs(dev);
+  
+  	drm_modeset_lock_all(dev);
+  	intel_modeset_setup_hw_state(dev);
+@@@ -16149,51 -15550,34 +16160,55 @@@ retry
+  
+  void intel_modeset_gem_init(struct drm_device *dev)
+  {
+ -	struct drm_i915_private *dev_priv = to_i915(dev);
+ +	struct drm_crtc *c;
+ +	struct drm_i915_gem_object *obj;
+ +	int ret;
+  
+ -	intel_init_gt_powersave(dev_priv);
+ +	intel_init_gt_powersave(dev);
+  
+ -	intel_setup_overlay(dev_priv);
+ -}
+++<<<<<<< HEAD
+ +	intel_modeset_init_hw(dev);
+  
+ -int intel_connector_register(struct drm_connector *connector)
+ -{
+ -	struct intel_connector *intel_connector = to_intel_connector(connector);
+ -	int ret;
+ +	intel_setup_overlay(dev);
+  
+ -	ret = intel_backlight_device_register(intel_connector);
+ -	if (ret)
+ -		goto err;
+ +	/*
+ +	 * Make sure any fbs we allocated at startup are properly
+ +	 * pinned & fenced.  When we do the allocation it's too early
+ +	 * for this.
+ +	 */
+ +	for_each_crtc(dev, c) {
+ +		obj = intel_fb_obj(c->primary->fb);
+ +		if (obj == NULL)
+ +			continue;
+  
+ -	return 0;
+ +		mutex_lock(&dev->struct_mutex);
+ +		ret = intel_pin_and_fence_fb_obj(c->primary,
+ +						 c->primary->fb,
+ +						 c->primary->state);
+ +		mutex_unlock(&dev->struct_mutex);
+ +		if (ret) {
+ +			DRM_ERROR("failed to pin boot fb on pipe %d\n",
+ +				  to_intel_crtc(c)->pipe);
+ +			drm_framebuffer_unreference(c->primary->fb);
+ +			c->primary->fb = NULL;
+ +			c->primary->crtc = c->primary->state->crtc = NULL;
+ +			update_state_fb(c->primary);
+ +			c->state->plane_mask &= ~(1 << drm_plane_index(c->primary));
+ +		}
+ +	}
+  
+ -err:
+ -	return ret;
+ +	intel_backlight_register(dev);
+++=======
+++	intel_setup_overlay(dev_priv);
+++>>>>>>> 5be6e3340099 (drm/i915: Do .init_clock_gating() earlier to avoid it clobbering watermarks)
+  }
+  
+ -void intel_connector_unregister(struct drm_connector *connector)
+ +void intel_connector_unregister(struct intel_connector *intel_connector)
+  {
+ -	struct intel_connector *intel_connector = to_intel_connector(connector);
+ +	struct drm_connector *connector = &intel_connector->base;
+  
+ -	intel_backlight_device_unregister(intel_connector);
+  	intel_panel_destroy_backlight(connector);
+ +	drm_connector_unregister(connector);
+  }
+  
+  void intel_modeset_cleanup(struct drm_device *dev)
+* Unmerged path drivers/gpu/drm/i915/intel_display.c
