@@ -1,0 +1,252 @@
+x86: reorganize SMAP handling in user space accesses
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [x86] reorganize SMAP handling in user space accesses (Josh Poimboeuf) [1572653]
+Rebuild_FUZZ: 94.95%
+commit-author Linus Torvalds <torvalds@linux-foundation.org>
+commit 11f1a4b9755f5dbc3e822a96502ebe9b044b14d8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/11f1a4b9.failed
+
+This reorganizes how we do the stac/clac instructions in the user access
+code.  Instead of adding the instructions directly to the same inline
+asm that does the actual user level access and exception handling, add
+them at a higher level.
+
+This is mainly preparation for the next step, where we will expose an
+interface to allow users to mark several accesses together as being user
+space accesses, but it does already clean up some code:
+
+ - the inlined trivial cases of copy_in_user() now do stac/clac just
+   once over the accesses: they used to do one pair around the user
+   space read, and another pair around the write-back.
+
+ - the {get,put}_user_ex() macros that are used with the catch/try
+   handling don't do any stac/clac at all, because that happens in the
+   try/catch surrounding them.
+
+Other than those two cleanups that happened naturally from the
+re-organization, this should not make any difference. Yet.
+
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 11f1a4b9755f5dbc3e822a96502ebe9b044b14d8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/uaccess.h
+diff --cc arch/x86/include/asm/uaccess.h
+index 46d1d9482490,cc228f4713da..000000000000
+--- a/arch/x86/include/asm/uaccess.h
++++ b/arch/x86/include/asm/uaccess.h
+@@@ -397,17 -411,21 +408,25 @@@ do {									
+  #define __put_user_nocheck(x, ptr, size)			\
+  ({								\
+  	int __pu_err;						\
++ 	__uaccess_begin();					\
+  	__put_user_size((x), (ptr), (size), __pu_err, -EFAULT);	\
+++<<<<<<< HEAD
+ +	__pu_err;						\
+++=======
++ 	__uaccess_end();					\
++ 	__builtin_expect(__pu_err, 0);				\
+++>>>>>>> 11f1a4b9755f (x86: reorganize SMAP handling in user space accesses)
+  })
+  
+  #define __get_user_nocheck(x, ptr, size)				\
+  ({									\
+  	int __gu_err;							\
+  	unsigned long __gu_val;						\
++ 	__uaccess_begin();						\
+  	__get_user_size(__gu_val, (ptr), (size), __gu_err, -EFAULT);	\
++ 	__uaccess_end();						\
+  	(x) = (__force __typeof__(*(ptr)))__gu_val;			\
+ -	__builtin_expect(__gu_err, 0);					\
+ +	__gu_err;							\
+  })
+  
+  /* FIXME: this hack is definitely wrong -AK */
+* Unmerged path arch/x86/include/asm/uaccess.h
+diff --git a/arch/x86/include/asm/uaccess_64.h b/arch/x86/include/asm/uaccess_64.h
+index 109207779f98..c5611b215ae7 100644
+--- a/arch/x86/include/asm/uaccess_64.h
++++ b/arch/x86/include/asm/uaccess_64.h
+@@ -85,35 +85,49 @@ int __copy_from_user(void *dst, const void __user *src, unsigned size)
+ 	if (!__builtin_constant_p(size))
+ 		return copy_user_generic(dst, (__force void *)src, size);
+ 	switch (size) {
+-	case 1:__get_user_asm(*(u8 *)dst, (u8 __user *)src,
++	case 1:
++		__uaccess_begin();
++		__get_user_asm(*(u8 *)dst, (u8 __user *)src,
+ 			      ret, "b", "b", "=q", 1);
++		__uaccess_end();
+ 		return ret;
+-	case 2:__get_user_asm(*(u16 *)dst, (u16 __user *)src,
++	case 2:
++		__uaccess_begin();
++		__get_user_asm(*(u16 *)dst, (u16 __user *)src,
+ 			      ret, "w", "w", "=r", 2);
++		__uaccess_end();
+ 		return ret;
+-	case 4:__get_user_asm(*(u32 *)dst, (u32 __user *)src,
++	case 4:
++		__uaccess_begin();
++		__get_user_asm(*(u32 *)dst, (u32 __user *)src,
+ 			      ret, "l", "k", "=r", 4);
++		__uaccess_end();
+ 		return ret;
+-	case 8:__get_user_asm(*(u64 *)dst, (u64 __user *)src,
++	case 8:
++		__uaccess_begin();
++		__get_user_asm(*(u64 *)dst, (u64 __user *)src,
+ 			      ret, "q", "", "=r", 8);
++		__uaccess_end();
+ 		return ret;
+ 	case 10:
++		__uaccess_begin();
+ 		__get_user_asm(*(u64 *)dst, (u64 __user *)src,
+ 			       ret, "q", "", "=r", 10);
+-		if (unlikely(ret))
+-			return ret;
+-		__get_user_asm(*(u16 *)(8 + (char *)dst),
+-			       (u16 __user *)(8 + (char __user *)src),
+-			       ret, "w", "w", "=r", 2);
++		if (likely(!ret))
++			__get_user_asm(*(u16 *)(8 + (char *)dst),
++				       (u16 __user *)(8 + (char __user *)src),
++				       ret, "w", "w", "=r", 2);
++		__uaccess_end();
+ 		return ret;
+ 	case 16:
++		__uaccess_begin();
+ 		__get_user_asm(*(u64 *)dst, (u64 __user *)src,
+ 			       ret, "q", "", "=r", 16);
+-		if (unlikely(ret))
+-			return ret;
+-		__get_user_asm(*(u64 *)(8 + (char *)dst),
+-			       (u64 __user *)(8 + (char __user *)src),
+-			       ret, "q", "", "=r", 8);
++		if (likely(!ret))
++			__get_user_asm(*(u64 *)(8 + (char *)dst),
++				       (u64 __user *)(8 + (char __user *)src),
++				       ret, "q", "", "=r", 8);
++		__uaccess_end();
+ 		return ret;
+ 	default:
+ 		return copy_user_generic(dst, (__force void *)src, size);
+@@ -129,35 +143,51 @@ int __copy_to_user(void __user *dst, const void *src, unsigned size)
+ 	if (!__builtin_constant_p(size))
+ 		return copy_user_generic((__force void *)dst, src, size);
+ 	switch (size) {
+-	case 1:__put_user_asm(*(u8 *)src, (u8 __user *)dst,
++	case 1:
++		__uaccess_begin();
++		__put_user_asm(*(u8 *)src, (u8 __user *)dst,
+ 			      ret, "b", "b", "iq", 1);
++		__uaccess_end();
+ 		return ret;
+-	case 2:__put_user_asm(*(u16 *)src, (u16 __user *)dst,
++	case 2:
++		__uaccess_begin();
++		__put_user_asm(*(u16 *)src, (u16 __user *)dst,
+ 			      ret, "w", "w", "ir", 2);
++		__uaccess_end();
+ 		return ret;
+-	case 4:__put_user_asm(*(u32 *)src, (u32 __user *)dst,
++	case 4:
++		__uaccess_begin();
++		__put_user_asm(*(u32 *)src, (u32 __user *)dst,
+ 			      ret, "l", "k", "ir", 4);
++		__uaccess_end();
+ 		return ret;
+-	case 8:__put_user_asm(*(u64 *)src, (u64 __user *)dst,
++	case 8:
++		__uaccess_begin();
++		__put_user_asm(*(u64 *)src, (u64 __user *)dst,
+ 			      ret, "q", "", "er", 8);
++		__uaccess_end();
+ 		return ret;
+ 	case 10:
++		__uaccess_begin();
+ 		__put_user_asm(*(u64 *)src, (u64 __user *)dst,
+ 			       ret, "q", "", "er", 10);
+-		if (unlikely(ret))
+-			return ret;
+-		asm("":::"memory");
+-		__put_user_asm(4[(u16 *)src], 4 + (u16 __user *)dst,
+-			       ret, "w", "w", "ir", 2);
++		if (likely(!ret)) {
++			asm("":::"memory");
++			__put_user_asm(4[(u16 *)src], 4 + (u16 __user *)dst,
++				       ret, "w", "w", "ir", 2);
++		}
++		__uaccess_end();
+ 		return ret;
+ 	case 16:
++		__uaccess_begin();
+ 		__put_user_asm(*(u64 *)src, (u64 __user *)dst,
+ 			       ret, "q", "", "er", 16);
+-		if (unlikely(ret))
+-			return ret;
+-		asm("":::"memory");
+-		__put_user_asm(1[(u64 *)src], 1 + (u64 __user *)dst,
+-			       ret, "q", "", "er", 8);
++		if (likely(!ret)) {
++			asm("":::"memory");
++			__put_user_asm(1[(u64 *)src], 1 + (u64 __user *)dst,
++				       ret, "q", "", "er", 8);
++		}
++		__uaccess_end();
+ 		return ret;
+ 	default:
+ 		return copy_user_generic((__force void *)dst, src, size);
+@@ -176,39 +206,47 @@ int __copy_in_user(void __user *dst, const void __user *src, unsigned size)
+ 	switch (size) {
+ 	case 1: {
+ 		u8 tmp;
++		__uaccess_begin();
+ 		__get_user_asm(tmp, (u8 __user *)src,
+ 			       ret, "b", "b", "=q", 1);
+ 		if (likely(!ret))
+ 			__put_user_asm(tmp, (u8 __user *)dst,
+ 				       ret, "b", "b", "iq", 1);
++		__uaccess_end();
+ 		return ret;
+ 	}
+ 	case 2: {
+ 		u16 tmp;
++		__uaccess_begin();
+ 		__get_user_asm(tmp, (u16 __user *)src,
+ 			       ret, "w", "w", "=r", 2);
+ 		if (likely(!ret))
+ 			__put_user_asm(tmp, (u16 __user *)dst,
+ 				       ret, "w", "w", "ir", 2);
++		__uaccess_end();
+ 		return ret;
+ 	}
+ 
+ 	case 4: {
+ 		u32 tmp;
++		__uaccess_begin();
+ 		__get_user_asm(tmp, (u32 __user *)src,
+ 			       ret, "l", "k", "=r", 4);
+ 		if (likely(!ret))
+ 			__put_user_asm(tmp, (u32 __user *)dst,
+ 				       ret, "l", "k", "ir", 4);
++		__uaccess_end();
+ 		return ret;
+ 	}
+ 	case 8: {
+ 		u64 tmp;
++		__uaccess_begin();
+ 		__get_user_asm(tmp, (u64 __user *)src,
+ 			       ret, "q", "", "=r", 8);
+ 		if (likely(!ret))
+ 			__put_user_asm(tmp, (u64 __user *)dst,
+ 				       ret, "q", "", "er", 8);
++		__uaccess_end();
+ 		return ret;
+ 	}
+ 	default:
