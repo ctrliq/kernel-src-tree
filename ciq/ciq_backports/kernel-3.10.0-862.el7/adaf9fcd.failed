@@ -1,0 +1,283 @@
+cpufreq: Move scheduler-related code to the sched directory
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit adaf9fcd136970e480d7ca834c0cf25ce922ea74
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/adaf9fcd.failed
+
+Create cpufreq.c under kernel/sched/ and move the cpufreq code
+related to the scheduler to that file and to sched.h.
+
+Redefine cpufreq_update_util() as a static inline function to avoid
+function calls at its call sites in the scheduler code (as suggested
+by Peter Zijlstra).
+
+Also move the definition of struct update_util_data and declaration
+of cpufreq_set_update_util_data() from include/linux/cpufreq.h to
+include/linux/sched.h.
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+(cherry picked from commit adaf9fcd136970e480d7ca834c0cf25ce922ea74)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/cpufreq.c
+#	include/linux/cpufreq.h
+#	kernel/sched/sched.h
+diff --cc drivers/cpufreq/cpufreq.c
+index 6ce63ca52d98,58e1a39b4d22..000000000000
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@@ -37,14 -101,8 +37,17 @@@
+   */
+  static struct cpufreq_driver *cpufreq_driver;
+  static DEFINE_PER_CPU(struct cpufreq_policy *, cpufreq_cpu_data);
+ +static DEFINE_PER_CPU(struct cpufreq_policy *, cpufreq_cpu_data_fallback);
+  static DEFINE_RWLOCK(cpufreq_driver_lock);
+ +DEFINE_MUTEX(cpufreq_governor_lock);
+ +static LIST_HEAD(cpufreq_policy_list);
+ +
+++<<<<<<< HEAD
+ +/* This one keeps track of the previously set governor of a removed CPU */
+ +static DEFINE_PER_CPU(char[CPUFREQ_NAME_LEN], cpufreq_cpu_governor);
+  
+++=======
+++>>>>>>> adaf9fcd1369 (cpufreq: Move scheduler-related code to the sched directory)
+  /* Flag to suspend/resume CPUFreq governors */
+  static bool cpufreq_suspended;
+  
+diff --cc include/linux/cpufreq.h
+index 6c9a308dec37,a5ea52f793f3..000000000000
+--- a/include/linux/cpufreq.h
++++ b/include/linux/cpufreq.h
+@@@ -167,91 -142,34 +167,115 @@@ static inline bool policy_is_shared(str
+  	return cpumask_weight(policy->cpus) > 1;
+  }
+  
+ -/* /sys/devices/system/cpu/cpufreq: entry point for global variables */
+ -extern struct kobject *cpufreq_global_kobject;
+ +/******************** cpufreq transition notifiers *******************/
+ +
+++<<<<<<< HEAD
+ +#define CPUFREQ_PRECHANGE	(0)
+ +#define CPUFREQ_POSTCHANGE	(1)
+ +
+ +struct cpufreq_freqs {
+ +	unsigned int cpu;	/* cpu nr */
+ +	unsigned int old;
+ +	unsigned int new;
+ +	u8 flags;		/* flags of cpufreq_driver, see below. */
+ +};
+  
+ +/**
+ + * cpufreq_scale - "old * mult / div" calculation for large values (32-bit-arch
+ + * safe)
+ + * @old:   old value
+ + * @div:   divisor
+ + * @mult:  multiplier
+ + *
+ + *
+ + * new = old * mult / div
+ + */
+ +static inline unsigned long cpufreq_scale(unsigned long old, u_int div,
+ +		u_int mult)
+ +{
+ +#if BITS_PER_LONG == 32
+ +
+ +	u64 result = ((u64) old) * ((u64) mult);
+ +	do_div(result, div);
+ +	return (unsigned long) result;
+++=======
++ #ifdef CONFIG_CPU_FREQ
++ unsigned int cpufreq_get(unsigned int cpu);
++ unsigned int cpufreq_quick_get(unsigned int cpu);
++ unsigned int cpufreq_quick_get_max(unsigned int cpu);
++ void disable_cpufreq(void);
+++>>>>>>> adaf9fcd1369 (cpufreq: Move scheduler-related code to the sched directory)
+  
+ -u64 get_cpu_idle_time(unsigned int cpu, u64 *wall, int io_busy);
+ -int cpufreq_get_policy(struct cpufreq_policy *policy, unsigned int cpu);
+ -int cpufreq_update_policy(unsigned int cpu);
+ -bool have_governor_per_policy(void);
+ -struct kobject *get_governor_parent_kobj(struct cpufreq_policy *policy);
+ +#elif BITS_PER_LONG == 64
+ +
+ +	unsigned long result = old * ((u64) mult);
+ +	result /= div;
+ +	return result;
+ +
+ +#endif
+ +};
+ +
+ +/*********************************************************************
+ + *                          CPUFREQ GOVERNORS                        *
+ + *********************************************************************/
+ +
+ +#define CPUFREQ_GOV_START	1
+ +#define CPUFREQ_GOV_STOP	2
+ +#define CPUFREQ_GOV_LIMITS	3
+ +#define CPUFREQ_GOV_POLICY_INIT	4
+ +#define CPUFREQ_GOV_POLICY_EXIT	5
+ +
+ +struct cpufreq_governor {
+ +	char	name[CPUFREQ_NAME_LEN];
+ +	int	initialized;
+ +	int	(*governor)	(struct cpufreq_policy *policy,
+ +				 unsigned int event);
+ +	ssize_t	(*show_setspeed)	(struct cpufreq_policy *policy,
+ +					 char *buf);
+ +	int	(*store_setspeed)	(struct cpufreq_policy *policy,
+ +					 unsigned int freq);
+ +	unsigned int max_transition_latency; /* HW must be able to switch to
+ +			next freq faster than this value in nano secs or we
+ +			will fallback to performance governor */
+ +	struct list_head	governor_list;
+ +	struct module		*owner;
+ +};
+ +
+ +/*
+ + * Pass a target to the cpufreq driver.
+ + */
+ +extern int cpufreq_driver_target(struct cpufreq_policy *policy,
+ +				 unsigned int target_freq,
+ +				 unsigned int relation);
+ +extern int __cpufreq_driver_target(struct cpufreq_policy *policy,
+ +				   unsigned int target_freq,
+ +				   unsigned int relation);
+ +int cpufreq_register_governor(struct cpufreq_governor *governor);
+ +void cpufreq_unregister_governor(struct cpufreq_governor *governor);
+ +
+ +#ifdef CONFIG_CPU_FREQ
+ +void cpufreq_suspend(void);
+ +void cpufreq_resume(void);
+ +int cpufreq_generic_suspend(struct cpufreq_policy *policy);
+  #else
+++<<<<<<< HEAD
+ +static inline void cpufreq_suspend(void) {}
+ +static inline void cpufreq_resume(void) {}
+++=======
++ static inline unsigned int cpufreq_get(unsigned int cpu)
++ {
++ 	return 0;
++ }
++ static inline unsigned int cpufreq_quick_get(unsigned int cpu)
++ {
++ 	return 0;
++ }
++ static inline unsigned int cpufreq_quick_get_max(unsigned int cpu)
++ {
++ 	return 0;
++ }
++ static inline void disable_cpufreq(void) { }
+++>>>>>>> adaf9fcd1369 (cpufreq: Move scheduler-related code to the sched directory)
+  #endif
+  
+  /*********************************************************************
+diff --cc kernel/sched/sched.h
+index 3e0ea93b25ef,faf7e2758dd0..000000000000
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@@ -6,10 -6,9 +6,13 @@@
+  #include <linux/mutex.h>
+  #include <linux/spinlock.h>
+  #include <linux/stop_machine.h>
+ -#include <linux/irq_work.h>
+  #include <linux/tick.h>
+  #include <linux/slab.h>
+++<<<<<<< HEAD
+ +
+ +#include <linux/rh_kabi.h>
+++=======
+++>>>>>>> adaf9fcd1369 (cpufreq: Move scheduler-related code to the sched directory)
+  
+  #include "cpupri.h"
+  #include "cpudeadline.h"
+* Unmerged path drivers/cpufreq/cpufreq.c
+diff --git a/drivers/cpufreq/cpufreq_governor.c b/drivers/cpufreq/cpufreq_governor.c
+index 1b44496b2d2b..3b9cb26749ec 100644
+--- a/drivers/cpufreq/cpufreq_governor.c
++++ b/drivers/cpufreq/cpufreq_governor.c
+@@ -18,6 +18,7 @@
+ 
+ #include <linux/export.h>
+ #include <linux/kernel_stat.h>
++#include <linux/sched.h>
+ #include <linux/slab.h>
+ 
+ #include "cpufreq_governor.h"
+* Unmerged path include/linux/cpufreq.h
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 17d2f0bc1bf5..e24c5e535b86 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -3207,4 +3207,13 @@ static inline unsigned long rlimit_max(unsigned int limit)
+ 	return task_rlimit_max(current, limit);
+ }
+ 
++#ifdef CONFIG_CPU_FREQ
++struct update_util_data {
++	void (*func)(struct update_util_data *data,
++		     u64 time, unsigned long util, unsigned long max);
++};
++
++void cpufreq_set_update_util_data(int cpu, struct update_util_data *data);
++#endif /* CONFIG_CPU_FREQ */
++
+ #endif
+diff --git a/kernel/sched/Makefile b/kernel/sched/Makefile
+index ac6cf1655dde..66a99759d2ed 100644
+--- a/kernel/sched/Makefile
++++ b/kernel/sched/Makefile
+@@ -18,3 +18,4 @@ obj-$(CONFIG_SCHED_AUTOGROUP) += auto_group.o
+ obj-$(CONFIG_SCHEDSTATS) += stats.o
+ obj-$(CONFIG_SCHED_DEBUG) += debug.o
+ obj-$(CONFIG_CGROUP_CPUACCT) += cpuacct.o
++obj-$(CONFIG_CPU_FREQ) += cpufreq.o
+diff --git a/kernel/sched/cpufreq.c b/kernel/sched/cpufreq.c
+new file mode 100644
+index 000000000000..928c4ba32f68
+--- /dev/null
++++ b/kernel/sched/cpufreq.c
+@@ -0,0 +1,37 @@
++/*
++ * Scheduler code and data structures related to cpufreq.
++ *
++ * Copyright (C) 2016, Intel Corporation
++ * Author: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include "sched.h"
++
++DEFINE_PER_CPU(struct update_util_data *, cpufreq_update_util_data);
++
++/**
++ * cpufreq_set_update_util_data - Populate the CPU's update_util_data pointer.
++ * @cpu: The CPU to set the pointer for.
++ * @data: New pointer value.
++ *
++ * Set and publish the update_util_data pointer for the given CPU.  That pointer
++ * points to a struct update_util_data object containing a callback function
++ * to call from cpufreq_update_util().  That function will be called from an RCU
++ * read-side critical section, so it must not sleep.
++ *
++ * Callers must use RCU-sched callbacks to free any memory that might be
++ * accessed via the old update_util_data pointer or invoke synchronize_sched()
++ * right after this function to avoid use-after-free.
++ */
++void cpufreq_set_update_util_data(int cpu, struct update_util_data *data)
++{
++	if (WARN_ON(data && !data->func))
++		return;
++
++	rcu_assign_pointer(per_cpu(cpufreq_update_util_data, cpu), data);
++}
++EXPORT_SYMBOL_GPL(cpufreq_set_update_util_data);
+* Unmerged path kernel/sched/sched.h
