@@ -1,0 +1,161 @@
+gfs2: Allow some glocks to be used during withdraw
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.53.1.el7
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit a72d2401f54b7db41c77ab971238a06eafe929fb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.53.1.el7/a72d2401.failed
+
+We need to allow some glocks to be enqueued, dequeued, promoted, and demoted
+when we're withdrawn. For example, to maintain metadata integrity, we should
+disallow the use of inode and rgrp glocks when withdrawn. Other glocks, like
+iopen or the transaction glocks may be safely used because none of their
+metadata goes through the journal. So in general, we should disallow all
+glocks with an address space, and allow all the others. One exception is:
+we need to allow our active journal to be demoted so others may recover it.
+
+Allowing glocks after withdraw gives us the ability to take appropriate
+action (in a following patch) to have our journal properly replayed by
+another node rather than just abandoning the current transactions and
+pretending nothing bad happened, leaving the other nodes free to modify
+the blocks we had in our journal, which may result in file system
+corruption.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+(cherry picked from commit a72d2401f54b7db41c77ab971238a06eafe929fb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/glock.c
+diff --cc fs/gfs2/glock.c
+index 2fe855e86afc,454d94dd8933..000000000000
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@@ -551,8 -576,7 +578,12 @@@ __acquires(&gl->gl_lockref.lock
+  	unsigned int lck_flags = (unsigned int)(gh ? gh->gh_flags : 0);
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	if (unlikely(test_bit(SDF_SHUTDOWN, &sdp->sd_flags)) &&
+ +	    target != LM_ST_UNLOCKED)
+++=======
++ 	if (target != LM_ST_UNLOCKED && glock_blocked_by_withdraw(gl))
+++>>>>>>> a72d2401f54b (gfs2: Allow some glocks to be used during withdraw)
+  		return;
+  	lck_flags &= (LM_FLAG_TRY | LM_FLAG_TRY_1CB | LM_FLAG_NOEXP |
+  		      LM_FLAG_PRIORITY);
+@@@ -1208,10 -1220,9 +1239,13 @@@ trap_recursive
+  int gfs2_glock_nq(struct gfs2_holder *gh)
+  {
+  	struct gfs2_glock *gl = gh->gh_gl;
+- 	struct gfs2_sbd *sdp = gl->gl_name.ln_sbd;
+  	int error = 0;
+  
+++<<<<<<< HEAD
+ +	if (unlikely(test_bit(SDF_SHUTDOWN, &sdp->sd_flags)))
+++=======
++ 	if (glock_blocked_by_withdraw(gl))
+++>>>>>>> a72d2401f54b (gfs2: Allow some glocks to be used during withdraw)
+  		return -EIO;
+  
+  	if (test_bit(GLF_LRU, &gl->gl_flags))
+* Unmerged path fs/gfs2/glock.c
+diff --git a/fs/gfs2/glops.c b/fs/gfs2/glops.c
+index 90b93ba7dd9f..b7078c123a5e 100644
+--- a/fs/gfs2/glops.c
++++ b/fs/gfs2/glops.c
+@@ -564,6 +564,7 @@ static void iopen_go_callback(struct gfs2_glock *gl, bool remote)
+ 
+ const struct gfs2_glock_operations gfs2_meta_glops = {
+ 	.go_type = LM_TYPE_META,
++	.go_flags = GLOF_NONDISK,
+ };
+ 
+ const struct gfs2_glock_operations gfs2_inode_glops = {
+@@ -591,30 +592,33 @@ const struct gfs2_glock_operations gfs2_trans_glops = {
+ 	.go_xmote_bh = trans_go_xmote_bh,
+ 	.go_demote_ok = trans_go_demote_ok,
+ 	.go_type = LM_TYPE_NONDISK,
++	.go_flags = GLOF_NONDISK,
+ };
+ 
+ const struct gfs2_glock_operations gfs2_iopen_glops = {
+ 	.go_type = LM_TYPE_IOPEN,
+ 	.go_callback = iopen_go_callback,
+-	.go_flags = GLOF_LRU,
++	.go_flags = GLOF_LRU | GLOF_NONDISK,
+ };
+ 
+ const struct gfs2_glock_operations gfs2_flock_glops = {
+ 	.go_type = LM_TYPE_FLOCK,
+-	.go_flags = GLOF_LRU,
++	.go_flags = GLOF_LRU | GLOF_NONDISK,
+ };
+ 
+ const struct gfs2_glock_operations gfs2_nondisk_glops = {
+ 	.go_type = LM_TYPE_NONDISK,
++	.go_flags = GLOF_NONDISK,
+ };
+ 
+ const struct gfs2_glock_operations gfs2_quota_glops = {
+ 	.go_type = LM_TYPE_QUOTA,
+-	.go_flags = GLOF_LVB | GLOF_LRU,
++	.go_flags = GLOF_LVB | GLOF_LRU | GLOF_NONDISK,
+ };
+ 
+ const struct gfs2_glock_operations gfs2_journal_glops = {
+ 	.go_type = LM_TYPE_JOURNAL,
++	.go_flags = GLOF_NONDISK,
+ };
+ 
+ const struct gfs2_glock_operations *gfs2_glops_list[] = {
+diff --git a/fs/gfs2/incore.h b/fs/gfs2/incore.h
+index 1f6f222b6802..6c3e52be7bbe 100644
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@ -215,9 +215,10 @@ struct gfs2_glock_operations {
+ 	void (*go_callback)(struct gfs2_glock *gl, bool remote);
+ 	const int go_type;
+ 	const unsigned long go_flags;
+-#define GLOF_ASPACE 1
+-#define GLOF_LVB    2
+-#define GLOF_LRU    4
++#define GLOF_ASPACE 1 /* address space attached */
++#define GLOF_LVB    2 /* Lock Value Block attached */
++#define GLOF_LRU    4 /* LRU managed */
++#define GLOF_NONDISK   8 /* not I/O related */
+ };
+ 
+ enum {
+@@ -514,6 +515,7 @@ struct gfs2_jdesc {
+ 	struct list_head jd_revoke_list;
+ 	unsigned int jd_replay_tail;
+ 
++	u64 jd_no_addr;
+ };
+ 
+ struct gfs2_statfs_change_host {
+diff --git a/fs/gfs2/ops_fstype.c b/fs/gfs2/ops_fstype.c
+index cc0fc48b4376..35d0a8810318 100644
+--- a/fs/gfs2/ops_fstype.c
++++ b/fs/gfs2/ops_fstype.c
+@@ -532,6 +532,8 @@ static int gfs2_jindex_hold(struct gfs2_sbd *sdp, struct gfs2_holder *ji_gh)
+ 	mutex_lock(&sdp->sd_jindex_mutex);
+ 
+ 	for (;;) {
++		struct gfs2_inode *jip;
++
+ 		error = gfs2_glock_nq_init(dip->i_gl, LM_ST_SHARED, 0, ji_gh);
+ 		if (error)
+ 			break;
+@@ -571,6 +573,8 @@ static int gfs2_jindex_hold(struct gfs2_sbd *sdp, struct gfs2_holder *ji_gh)
+ 
+ 		spin_lock(&sdp->sd_jindex_spin);
+ 		jd->jd_jid = sdp->sd_journals++;
++		jip = GFS2_I(jd->jd_inode);
++		jd->jd_no_addr = jip->i_no_addr;
+ 		list_add_tail(&jd->jd_list, &sdp->sd_jindex_list);
+ 		spin_unlock(&sdp->sd_jindex_spin);
+ 	}
