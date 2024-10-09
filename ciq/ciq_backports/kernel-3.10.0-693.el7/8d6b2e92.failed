@@ -1,0 +1,141 @@
+amd-xgbe: Allow for a greater number of Rx queues
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Lendacky, Thomas <Thomas.Lendacky@amd.com>
+commit 8d6b2e92bdadc925c9ea4d8d0c4554918357ee35
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8d6b2e92.failed
+
+Remove the call to netif_get_num_default_rss_queues() and replace it
+with num_online_cpus() to allow for the possibility of using all of
+the hardware DMA channels available.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8d6b2e92bdadc925c9ea4d8d0c4554918357ee35)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/amd/xgbe/xgbe-main.c
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-main.c
+index e79ba9088346,7655753e1825..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-main.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-main.c
+@@@ -240,12 -180,108 +240,114 @@@ static int xgbe_probe(struct platform_d
+  	SET_NETDEV_DEV(netdev, dev);
+  	pdata = netdev_priv(netdev);
+  	pdata->netdev = netdev;
+ +	pdata->pdev = pdev;
+  	pdata->dev = dev;
+ +	platform_set_drvdata(pdev, netdev);
+  
+  	spin_lock_init(&pdata->lock);
+++<<<<<<< HEAD
+ +	mutex_init(&pdata->xpcs_mutex);
+++=======
++ 	spin_lock_init(&pdata->xpcs_lock);
++ 	mutex_init(&pdata->rss_mutex);
++ 	spin_lock_init(&pdata->tstamp_lock);
++ 
++ 	pdata->msg_enable = netif_msg_init(debug, default_msg_level);
++ 
++ 	set_bit(XGBE_DOWN, &pdata->dev_state);
++ 
++ 	return pdata;
++ }
++ 
++ void xgbe_free_pdata(struct xgbe_prv_data *pdata)
++ {
++ 	struct net_device *netdev = pdata->netdev;
++ 
++ 	free_netdev(netdev);
++ }
++ 
++ void xgbe_set_counts(struct xgbe_prv_data *pdata)
++ {
++ 	/* Set all the function pointers */
++ 	xgbe_init_all_fptrs(pdata);
++ 
++ 	/* Populate the hardware features */
++ 	xgbe_get_all_hw_features(pdata);
++ 
++ 	/* Set default max values if not provided */
++ 	if (!pdata->tx_max_channel_count)
++ 		pdata->tx_max_channel_count = pdata->hw_feat.tx_ch_cnt;
++ 	if (!pdata->rx_max_channel_count)
++ 		pdata->rx_max_channel_count = pdata->hw_feat.rx_ch_cnt;
++ 
++ 	if (!pdata->tx_max_q_count)
++ 		pdata->tx_max_q_count = pdata->hw_feat.tx_q_cnt;
++ 	if (!pdata->rx_max_q_count)
++ 		pdata->rx_max_q_count = pdata->hw_feat.rx_q_cnt;
++ 
++ 	/* Calculate the number of Tx and Rx rings to be created
++ 	 *  -Tx (DMA) Channels map 1-to-1 to Tx Queues so set
++ 	 *   the number of Tx queues to the number of Tx channels
++ 	 *   enabled
++ 	 *  -Rx (DMA) Channels do not map 1-to-1 so use the actual
++ 	 *   number of Rx queues or maximum allowed
++ 	 */
++ 	pdata->tx_ring_count = min_t(unsigned int, num_online_cpus(),
++ 				     pdata->hw_feat.tx_ch_cnt);
++ 	pdata->tx_ring_count = min_t(unsigned int, pdata->tx_ring_count,
++ 				     pdata->tx_max_channel_count);
++ 	pdata->tx_ring_count = min_t(unsigned int, pdata->tx_ring_count,
++ 				     pdata->tx_max_q_count);
++ 
++ 	pdata->tx_q_count = pdata->tx_ring_count;
++ 
++ 	pdata->rx_ring_count = min_t(unsigned int, num_online_cpus(),
++ 				     pdata->hw_feat.rx_ch_cnt);
++ 	pdata->rx_ring_count = min_t(unsigned int, pdata->rx_ring_count,
++ 				     pdata->rx_max_channel_count);
++ 
++ 	pdata->rx_q_count = min_t(unsigned int, pdata->hw_feat.rx_q_cnt,
++ 				  pdata->rx_max_q_count);
++ 
++ 	if (netif_msg_probe(pdata)) {
++ 		dev_dbg(pdata->dev, "TX/RX DMA channel count = %u/%u\n",
++ 			pdata->tx_ring_count, pdata->rx_ring_count);
++ 		dev_dbg(pdata->dev, "TX/RX hardware queue count = %u/%u\n",
++ 			pdata->tx_q_count, pdata->rx_q_count);
++ 	}
++ }
++ 
++ int xgbe_config_netdev(struct xgbe_prv_data *pdata)
++ {
++ 	struct net_device *netdev = pdata->netdev;
++ 	struct device *dev = pdata->dev;
++ 	unsigned int i;
++ 	int ret;
++ 
++ 	netdev->irq = pdata->dev_irq;
++ 	netdev->base_addr = (unsigned long)pdata->xgmac_regs;
++ 	memcpy(netdev->dev_addr, pdata->mac_addr, netdev->addr_len);
++ 
++ 	/* Issue software reset to device */
++ 	pdata->hw_if.exit(pdata);
++ 
++ 	/* Set default configuration data */
++ 	xgbe_default_config(pdata);
++ 
++ 	/* Set the DMA mask */
++ 	ret = dma_set_mask_and_coherent(dev,
++ 					DMA_BIT_MASK(pdata->hw_feat.dma_width));
++ 	if (ret) {
++ 		dev_err(dev, "dma_set_mask_and_coherent failed\n");
++ 		return ret;
++ 	}
++ 
++ 	/* Set default max values if not provided */
++ 	if (!pdata->tx_max_fifo_size)
++ 		pdata->tx_max_fifo_size = pdata->hw_feat.tx_fifo_size;
++ 	if (!pdata->rx_max_fifo_size)
++ 		pdata->rx_max_fifo_size = pdata->hw_feat.rx_fifo_size;
+++>>>>>>> 8d6b2e92bdad (amd-xgbe: Allow for a greater number of Rx queues)
+  
+  	/* Set and validate the number of descriptors for a ring */
+  	BUILD_BUG_ON_NOT_POWER_OF_2(XGBE_TX_DESC_CNT);
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-main.c
