@@ -448,7 +448,7 @@ struct ib_uverbs_wc {
 	__u32 vendor_err;
 	__u32 byte_len;
 	union {
-		__u32 imm_data;
+		__be32 imm_data;
 		__u32 invalidate_rkey;
 	} ex;
 	__u32 qp_num;
@@ -764,7 +764,7 @@ struct ib_uverbs_send_wr {
 	__u32 opcode;
 	__u32 send_flags;
 	union {
-		__u32 imm_data;
+		__be32 imm_data;
 		__u32 invalidate_rkey;
 	} ex;
 	union {
