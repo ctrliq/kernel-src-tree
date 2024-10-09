@@ -1,0 +1,250 @@
+mm: split deferred_init_range into initializing and freeing parts
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mm] split deferred_init_range into initializing and freeing parts (Masayoshi Mizuma) [1496330]
+Rebuild_FUZZ: 96.83%
+commit-author Pavel Tatashin <pasha.tatashin@oracle.com>
+commit 80b1f41c0957a9da3bab4fb9ae76dc886753a59b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/80b1f41c.failed
+
+In deferred_init_range() we initialize struct pages, and also free them
+to buddy allocator.  We do it in separate loops, because buddy page is
+computed ahead, so we do not want to access a struct page that has not
+been initialized yet.
+
+There is still, however, a corner case where it is potentially possible
+to access uninitialized struct page: this is when buddy page is from the
+next memblock range.
+
+This patch fixes this problem by splitting deferred_init_range() into
+two functions: one to initialize struct pages, and another to free them.
+
+In addition, this patch brings the following improvements:
+ - Get rid of __def_free() helper function. And simplifies loop logic by
+   adding a new pfn validity check function: deferred_pfn_valid().
+ - Reduces number of variables that we track. So, there is a higher
+   chance that we will avoid using stack to store/load variables inside
+   hot loops.
+ - Enables future multi-threading of these functions: do initialization
+   in multiple threads, wait for all threads to finish, do freeing part
+   in multithreading.
+
+Tested on x86 with 1T of memory to make sure no regressions are
+introduced.
+
+[akpm@linux-foundation.org: fix spello in comment]
+Link: http://lkml.kernel.org/r/20171107150446.32055-2-pasha.tatashin@oracle.com
+	Signed-off-by: Pavel Tatashin <pasha.tatashin@oracle.com>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Cc: Steven Sistare <steven.sistare@oracle.com>
+	Cc: Daniel Jordan <daniel.m.jordan@oracle.com>
+	Cc: Mel Gorman <mgorman@techsingularity.net>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 80b1f41c0957a9da3bab4fb9ae76dc886753a59b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/page_alloc.c
+diff --cc mm/page_alloc.c
+index 0f8b31880f9c,a73cffe287a5..000000000000
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@@ -1117,6 -1456,90 +1117,93 @@@ static inline void __init pgdat_init_re
+  		complete(&pgdat_init_all_done_comp);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Returns true if page needs to be initialized or freed to buddy allocator.
++  *
++  * First we check if pfn is valid on architectures where it is possible to have
++  * holes within pageblock_nr_pages. On systems where it is not possible, this
++  * function is optimized out.
++  *
++  * Then, we check if a current large page is valid by only checking the validity
++  * of the head pfn.
++  *
++  * Finally, meminit_pfn_in_nid is checked on systems where pfns can interleave
++  * within a node: a pfn is between start and end of a node, but does not belong
++  * to this memory node.
++  */
++ static inline bool __init
++ deferred_pfn_valid(int nid, unsigned long pfn,
++ 		   struct mminit_pfnnid_cache *nid_init_state)
++ {
++ 	if (!pfn_valid_within(pfn))
++ 		return false;
++ 	if (!(pfn & (pageblock_nr_pages - 1)) && !pfn_valid(pfn))
++ 		return false;
++ 	if (!meminit_pfn_in_nid(pfn, nid, nid_init_state))
++ 		return false;
++ 	return true;
++ }
++ 
++ /*
++  * Free pages to buddy allocator. Try to free aligned pages in
++  * pageblock_nr_pages sizes.
++  */
++ static void __init deferred_free_pages(int nid, int zid, unsigned long pfn,
++ 				       unsigned long end_pfn)
++ {
++ 	struct mminit_pfnnid_cache nid_init_state = { };
++ 	unsigned long nr_pgmask = pageblock_nr_pages - 1;
++ 	unsigned long nr_free = 0;
++ 
++ 	for (; pfn < end_pfn; pfn++) {
++ 		if (!deferred_pfn_valid(nid, pfn, &nid_init_state)) {
++ 			deferred_free_range(pfn - nr_free, nr_free);
++ 			nr_free = 0;
++ 		} else if (!(pfn & nr_pgmask)) {
++ 			deferred_free_range(pfn - nr_free, nr_free);
++ 			nr_free = 1;
++ 			cond_resched();
++ 		} else {
++ 			nr_free++;
++ 		}
++ 	}
++ 	/* Free the last block of pages to allocator */
++ 	deferred_free_range(pfn - nr_free, nr_free);
++ }
++ 
++ /*
++  * Initialize struct pages.  We minimize pfn page lookups and scheduler checks
++  * by performing it only once every pageblock_nr_pages.
++  * Return number of pages initialized.
++  */
++ static unsigned long  __init deferred_init_pages(int nid, int zid,
++ 						 unsigned long pfn,
++ 						 unsigned long end_pfn)
++ {
++ 	struct mminit_pfnnid_cache nid_init_state = { };
++ 	unsigned long nr_pgmask = pageblock_nr_pages - 1;
++ 	unsigned long nr_pages = 0;
++ 	struct page *page = NULL;
++ 
++ 	for (; pfn < end_pfn; pfn++) {
++ 		if (!deferred_pfn_valid(nid, pfn, &nid_init_state)) {
++ 			page = NULL;
++ 			continue;
++ 		} else if (!page || !(pfn & nr_pgmask)) {
++ 			page = pfn_to_page(pfn);
++ 			cond_resched();
++ 		} else {
++ 			page++;
++ 		}
++ 		__init_single_page(page, pfn, zid, nid);
++ 		nr_pages++;
++ 	}
++ 	return (nr_pages);
++ }
++ 
+++>>>>>>> 80b1f41c0957 (mm: split deferred_init_range into initializing and freeing parts)
+  /* Initialise remaining memory on a node */
+  static int __init deferred_init_memmap(void *data)
+  {
+@@@ -1151,80 -1575,23 +1238,98 @@@
+  		if (first_init_pfn < zone_end_pfn(zone))
+  			break;
+  	}
+ -	first_init_pfn = max(zone->zone_start_pfn, first_init_pfn);
+  
+++<<<<<<< HEAD
+ +	for_each_mem_pfn_range(i, nid, &walk_start, &walk_end, NULL) {
+ +		unsigned long pfn, end_pfn;
+ +		struct page *page = NULL;
+ +		struct page *free_base_page = NULL;
+ +		unsigned long free_base_pfn = 0;
+ +		int nr_to_free = 0;
+ +
+ +		end_pfn = min(walk_end, zone_end_pfn(zone));
+ +		pfn = first_init_pfn;
+ +		if (pfn < walk_start)
+ +			pfn = walk_start;
+ +		if (pfn < zone->zone_start_pfn)
+ +			pfn = zone->zone_start_pfn;
+ +
+ +		for (; pfn < end_pfn; pfn++) {
+ +			if (!pfn_valid_within(pfn))
+ +				goto free_range;
+ +
+ +			/*
+ +			 * Ensure pfn_valid is checked every
+ +			 * MAX_ORDER_NR_PAGES for memory holes
+ +			 */
+ +			if ((pfn & (MAX_ORDER_NR_PAGES - 1)) == 0) {
+ +				if (!pfn_valid(pfn)) {
+ +					page = NULL;
+ +					goto free_range;
+ +				}
+ +			}
+ +
+ +			if (!meminit_pfn_in_nid(pfn, nid, &nid_init_state)) {
+ +				page = NULL;
+ +				goto free_range;
+ +			}
+ +
+ +			/* Minimise pfn page lookups and scheduler checks */
+ +			if (page && (pfn & (MAX_ORDER_NR_PAGES - 1)) != 0) {
+ +				page++;
+ +			} else {
+ +				nr_pages += nr_to_free;
+ +				deferred_free_range(free_base_page,
+ +						free_base_pfn, nr_to_free);
+ +				free_base_page = NULL;
+ +				free_base_pfn = nr_to_free = 0;
+ +
+ +				page = pfn_to_page(pfn);
+ +				cond_resched();
+ +			}
+ +
+ +			if (page->flags) {
+ +				VM_BUG_ON(page_zone(page) != zone);
+ +				goto free_range;
+ +			}
+ +
+ +			__init_single_page(page, pfn, zid, nid);
+ +			if (!free_base_page) {
+ +				free_base_page = page;
+ +				free_base_pfn = pfn;
+ +				nr_to_free = 0;
+ +			}
+ +			nr_to_free++;
+ +
+ +			/* Where possible, batch up pages for a single free */
+ +			continue;
+ +free_range:
+ +			/* Free the current block of pages to allocator */
+ +			nr_pages += nr_to_free;
+ +			deferred_free_range(free_base_page, free_base_pfn,
+ +								nr_to_free);
+ +			free_base_page = NULL;
+ +			free_base_pfn = nr_to_free = 0;
+ +		}
+ +
+ +		first_init_pfn = max(end_pfn, first_init_pfn);
+++=======
++ 	/*
++ 	 * Initialize and free pages. We do it in two loops: first we initialize
++ 	 * struct page, than free to buddy allocator, because while we are
++ 	 * freeing pages we can access pages that are ahead (computing buddy
++ 	 * page in __free_one_page()).
++ 	 */
++ 	for_each_free_mem_range(i, nid, MEMBLOCK_NONE, &spa, &epa, NULL) {
++ 		spfn = max_t(unsigned long, first_init_pfn, PFN_UP(spa));
++ 		epfn = min_t(unsigned long, zone_end_pfn(zone), PFN_DOWN(epa));
++ 		nr_pages += deferred_init_pages(nid, zid, spfn, epfn);
++ 	}
++ 	for_each_free_mem_range(i, nid, MEMBLOCK_NONE, &spa, &epa, NULL) {
++ 		spfn = max_t(unsigned long, first_init_pfn, PFN_UP(spa));
++ 		epfn = min_t(unsigned long, zone_end_pfn(zone), PFN_DOWN(epa));
++ 		deferred_free_pages(nid, zid, spfn, epfn);
+++>>>>>>> 80b1f41c0957 (mm: split deferred_init_range into initializing and freeing parts)
+  	}
+  
+  	/* Sanity check that the next zone really is unpopulated */
+* Unmerged path mm/page_alloc.c
