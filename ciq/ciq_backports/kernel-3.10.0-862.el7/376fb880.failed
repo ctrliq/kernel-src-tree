@@ -1,0 +1,257 @@
+scsi: smartpqi: correct aio error path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] smartpqi: correct aio error path (Don Brace) [1457414]
+Rebuild_FUZZ: 91.43%
+commit-author Kevin Barnett <kevin.barnett@hpe.com>
+commit 376fb880a4fbf6903918a88081b16c167819af3f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/376fb880.failed
+
+set the internal flag that causes I/O to be sent down the
+RAID path when the AIO path is disabled
+
+	Reviewed-by: Scott Benesh <scott.benesh@microsemi.com>
+	Signed-off-by: Kevin Barnett <kevin.barnett@microsemi.com>
+	Signed-off-by: Don Brace <don.brace@microsemi.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 376fb880a4fbf6903918a88081b16c167819af3f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/smartpqi/smartpqi.h
+#	drivers/scsi/smartpqi/smartpqi_init.c
+diff --cc drivers/scsi/smartpqi/smartpqi.h
+index 5acdb3969532,94b92ae63f23..000000000000
+--- a/drivers/scsi/smartpqi/smartpqi.h
++++ b/drivers/scsi/smartpqi/smartpqi.h
+@@@ -731,9 -785,6 +731,12 @@@ struct pqi_scsi_dev 
+  	u8	is_physical_device : 1;
+  	u8	is_external_raid_device : 1;
+  	u8	target_lun_valid : 1;
+++<<<<<<< HEAD
+ +	u8	expose_device : 1;
+ +	u8	no_uld_attach : 1;
+ +	u8	aio_enabled : 1;	/* only valid for physical disks */
+++=======
+++>>>>>>> 376fb880a4fb (scsi: smartpqi: correct aio error path)
+  	u8	device_gone : 1;
+  	u8	new_device : 1;
+  	u8	keep_device : 1;
+diff --cc drivers/scsi/smartpqi/smartpqi_init.c
+index a3837a6f86ae,57ff80fba3f5..000000000000
+--- a/drivers/scsi/smartpqi/smartpqi_init.c
++++ b/drivers/scsi/smartpqi/smartpqi_init.c
+@@@ -60,7 -61,11 +60,10 @@@ MODULE_LICENSE("GPL")
+  static char *hpe_branded_controller = "HPE Smart Array Controller";
+  static char *microsemi_branded_controller = "Microsemi Smart Family Controller";
+  
+ -static void pqi_perform_lockup_action(void);
+  static void pqi_take_ctrl_offline(struct pqi_ctrl_info *ctrl_info);
++ static void pqi_complete_all_queued_raid_bypass_retries(
++ 	struct pqi_ctrl_info *ctrl_info, int result);
++ static void pqi_retry_raid_bypass_requests(struct pqi_ctrl_info *ctrl_info);
+  static int pqi_scan_scsi_devices(struct pqi_ctrl_info *ctrl_info);
+  static void pqi_scan_start(struct Scsi_Host *shost);
+  static void pqi_start_io(struct pqi_ctrl_info *ctrl_info,
+@@@ -2432,9 -2391,10 +2442,10 @@@ static inline void pqi_aio_path_disable
+  
+  	device = io_request->scmd->device->hostdata;
+  	device->offload_enabled = false;
++ 	device->aio_enabled = false;
+  }
+  
+ -static inline void pqi_take_device_offline(struct scsi_device *sdev, char *path)
+ +static inline void pqi_take_device_offline(struct scsi_device *sdev)
+  {
+  	struct pqi_ctrl_info *ctrl_info;
+  	struct pqi_scsi_dev *device;
+@@@ -2551,9 -2511,11 +2562,17 @@@ static void pqi_process_aio_io_error(st
+  			break;
+  		case PQI_AIO_STATUS_NO_PATH_TO_DEVICE:
+  		case PQI_AIO_STATUS_INVALID_DEVICE:
+++<<<<<<< HEAD
+ +			device_offline = true;
+ +			pqi_take_device_offline(scmd->device);
+ +			host_byte = DID_NO_CONNECT;
+++=======
++ 			if (!io_request->raid_bypass) {
++ 				device_offline = true;
++ 				pqi_take_device_offline(scmd->device, "AIO");
++ 				host_byte = DID_NO_CONNECT;
++ 			}
+++>>>>>>> 376fb880a4fb (scsi: smartpqi: correct aio error path)
+  			scsi_status = SAM_STAT_CHECK_CONDITION;
+  			break;
+  		case PQI_AIO_STATUS_IO_ERROR:
+@@@ -2814,48 -2764,7 +2833,52 @@@ static void pqi_event_worker(struct wor
+  	pqi_schedule_rescan_worker(ctrl_info);
+  }
+  
+++<<<<<<< HEAD
+ +static void pqi_take_ctrl_offline(struct pqi_ctrl_info *ctrl_info)
+ +{
+ +	unsigned int i;
+ +	unsigned int path;
+ +	struct pqi_queue_group *queue_group;
+ +	unsigned long flags;
+ +	struct pqi_io_request *io_request;
+ +	struct pqi_io_request *next;
+ +	struct scsi_cmnd *scmd;
+ +
+ +	ctrl_info->controller_online = false;
+ +	dev_err(&ctrl_info->pci_dev->dev, "controller offline\n");
+ +	sis_shutdown_ctrl(ctrl_info);
+ +
+ +	for (i = 0; i < ctrl_info->num_queue_groups; i++) {
+ +		queue_group = &ctrl_info->queue_groups[i];
+ +
+ +		for (path = 0; path < 2; path++) {
+ +			spin_lock_irqsave(
+ +				&queue_group->submit_lock[path], flags);
+ +
+ +			list_for_each_entry_safe(io_request, next,
+ +				&queue_group->request_list[path],
+ +				request_list_entry) {
+ +
+ +				scmd = io_request->scmd;
+ +				if (scmd) {
+ +					set_host_byte(scmd, DID_NO_CONNECT);
+ +					pqi_scsi_done(scmd);
+ +				}
+ +
+ +				list_del(&io_request->request_list_entry);
+ +			}
+ +
+ +			spin_unlock_irqrestore(
+ +				&queue_group->submit_lock[path], flags);
+ +		}
+ +	}
+ +}
+ +
+ +#define PQI_HEARTBEAT_TIMER_INTERVAL	(5 * HZ)
+ +#define PQI_MAX_HEARTBEAT_REQUESTS	5
+++=======
++ #define PQI_HEARTBEAT_TIMER_INTERVAL	(10 * HZ)
+++>>>>>>> 376fb880a4fb (scsi: smartpqi: correct aio error path)
+  
+  static void pqi_heartbeat_timer_handler(unsigned long data)
+  {
+@@@ -4752,13 -4913,10 +4959,17 @@@ static int pqi_scsi_queue_command(struc
+  	if (pqi_is_logical_device(device)) {
+  		raid_bypassed = false;
+  		if (device->offload_enabled &&
+ -				!blk_rq_is_passthrough(scmd->request)) {
+ +			scmd->request->cmd_type == REQ_TYPE_FS) {
+  			rc = pqi_raid_bypass_submit_scsi_cmd(ctrl_info, device,
+  				scmd, queue_group);
+++<<<<<<< HEAD
+ +			if (rc == 0 ||
+ +				rc == SCSI_MLQUEUE_HOST_BUSY ||
+ +				rc == SAM_STAT_CHECK_CONDITION ||
+ +				rc == SAM_STAT_RESERVATION_CONFLICT)
+++=======
++ 			if (rc == 0 || rc == SCSI_MLQUEUE_HOST_BUSY)
+++>>>>>>> 376fb880a4fb (scsi: smartpqi: correct aio error path)
+  				raid_bypassed = true;
+  		}
+  		if (!raid_bypassed)
+@@@ -5901,7 -6311,13 +6112,12 @@@ static struct pqi_ctrl_info *pqi_alloc_
+  		PQI_RESERVED_IO_SLOTS_SYNCHRONOUS_REQUESTS);
+  	init_waitqueue_head(&ctrl_info->block_requests_wait);
+  
++ 	INIT_LIST_HEAD(&ctrl_info->raid_bypass_retry_list);
++ 	spin_lock_init(&ctrl_info->raid_bypass_retry_list_lock);
++ 	INIT_WORK(&ctrl_info->raid_bypass_retry_work,
++ 		pqi_raid_bypass_retry_worker);
++ 
+  	ctrl_info->ctrl_id = atomic_inc_return(&pqi_controller_count) - 1;
+ -	ctrl_info->irq_mode = IRQ_MODE_NONE;
+  	ctrl_info->max_msix_vectors = PQI_MAX_MSIX_VECTORS;
+  
+  	return ctrl_info;
+@@@ -5956,7 -6370,76 +6172,80 @@@ static void pqi_remove_ctrl(struct pqi_
+  	pqi_free_ctrl_resources(ctrl_info);
+  }
+  
+++<<<<<<< HEAD
+ +static void pqi_print_ctrl_info(struct pci_dev *pdev,
+++=======
++ static void pqi_perform_lockup_action(void)
++ {
++ 	switch (pqi_lockup_action) {
++ 	case PANIC:
++ 		panic("FATAL: Smart Family Controller lockup detected");
++ 		break;
++ 	case REBOOT:
++ 		emergency_restart();
++ 		break;
++ 	case NONE:
++ 	default:
++ 		break;
++ 	}
++ }
++ 
++ static void pqi_complete_all_queued_requests(struct pqi_ctrl_info *ctrl_info,
++ 	int result)
++ {
++ 	unsigned int i;
++ 	unsigned int path;
++ 	struct pqi_queue_group *queue_group;
++ 	unsigned long flags;
++ 	struct pqi_io_request *io_request;
++ 	struct pqi_io_request *next;
++ 	struct scsi_cmnd *scmd;
++ 
++ 	for (i = 0; i < ctrl_info->num_queue_groups; i++) {
++ 		queue_group = &ctrl_info->queue_groups[i];
++ 
++ 		for (path = 0; path < 2; path++) {
++ 			spin_lock_irqsave(
++ 				&queue_group->submit_lock[path], flags);
++ 
++ 			list_for_each_entry_safe(io_request, next,
++ 				&queue_group->request_list[path],
++ 				request_list_entry) {
++ 
++ 				scmd = io_request->scmd;
++ 				if (scmd) {
++ 					scmd->result = result;
++ 					pqi_scsi_done(scmd);
++ 				}
++ 
++ 				list_del(&io_request->request_list_entry);
++ 			}
++ 
++ 			spin_unlock_irqrestore(
++ 				&queue_group->submit_lock[path], flags);
++ 		}
++ 	}
++ }
++ 
++ static void pqi_fail_all_queued_requests(struct pqi_ctrl_info *ctrl_info)
++ {
++ 	pqi_complete_all_queued_requests(ctrl_info, DID_NO_CONNECT << 16);
++ 	pqi_complete_all_queued_raid_bypass_retries(ctrl_info,
++ 		DID_NO_CONNECT << 16);
++ }
++ 
++ static void pqi_take_ctrl_offline(struct pqi_ctrl_info *ctrl_info)
++ {
++ 	ctrl_info->controller_online = false;
++ 	sis_shutdown_ctrl(ctrl_info);
++ 	pci_disable_device(ctrl_info->pci_dev);
++ 	dev_err(&ctrl_info->pci_dev->dev, "controller offline\n");
++ 	pqi_perform_lockup_action();
++ 	pqi_fail_all_queued_requests(ctrl_info);
++ }
++ 
++ static void pqi_print_ctrl_info(struct pci_dev *pci_dev,
+++>>>>>>> 376fb880a4fb (scsi: smartpqi: correct aio error path)
+  	const struct pci_device_id *id)
+  {
+  	char *ctrl_description;
+* Unmerged path drivers/scsi/smartpqi/smartpqi.h
+* Unmerged path drivers/scsi/smartpqi/smartpqi_init.c
