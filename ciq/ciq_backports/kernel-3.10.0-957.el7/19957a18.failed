@@ -1,0 +1,137 @@
+xfs: Correctly invert xfs_buftarg LRU isolation logic
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Vratislav Bendel <vbendel@redhat.com>
+commit 19957a181608d25c8f4136652d0ea00b3738972d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/19957a18.failed
+
+Due to an inverted logic mistake in xfs_buftarg_isolate()
+the xfs_buffers with zero b_lru_ref will take another trip
+around LRU, while isolating buffers with non-zero b_lru_ref.
+
+Additionally those isolated buffers end up right back on the LRU
+once they are released, because b_lru_ref remains elevated.
+
+Fix that circuitous route by leaving them on the LRU
+as originally intended.
+
+	Signed-off-by: Vratislav Bendel <vbendel@redhat.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit 19957a181608d25c8f4136652d0ea00b3738972d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_buf.c
+diff --cc fs/xfs/xfs_buf.c
+index 83f56c93d562,ac669a10c62f..000000000000
+--- a/fs/xfs/xfs_buf.c
++++ b/fs/xfs/xfs_buf.c
+@@@ -1653,49 -1664,63 +1653,74 @@@ xfs_wait_buftarg
+  		delay(100);
+  	flush_workqueue(btp->bt_mount->m_buf_workqueue);
+  
+ -	/* loop until there is nothing left on the lru list. */
+ -	while (list_lru_count(&btp->bt_lru)) {
+ -		list_lru_walk(&btp->bt_lru, xfs_buftarg_wait_rele,
+ -			      &dispose, LONG_MAX);
+ +restart:
+ +	spin_lock(&btp->bt_lru_lock);
+ +	while (!list_empty(&btp->bt_lru)) {
+ +		bp = list_first_entry(&btp->bt_lru, struct xfs_buf, b_lru);
+ +		if (atomic_read(&bp->b_hold) > 1) {
+ +			/* need to wait, so skip it this pass */
+ +			trace_xfs_buf_wait_buftarg(bp, _RET_IP_);
+ +skip:
+ +			list_move_tail(&bp->b_lru, &btp->bt_lru);
+ +			spin_unlock(&btp->bt_lru_lock);
+ +			delay(100);
+ +			goto restart;
+ +		}
+ +		if (!spin_trylock(&bp->b_lock))
+ +			goto skip;
+  
+ -		while (!list_empty(&dispose)) {
+ -			struct xfs_buf *bp;
+ -			bp = list_first_entry(&dispose, struct xfs_buf, b_lru);
+ -			list_del_init(&bp->b_lru);
+ -			if (bp->b_flags & XBF_WRITE_FAIL) {
+ -				xfs_alert(btp->bt_mount,
+ -"Corruption Alert: Buffer at daddr 0x%llx had permanent write failures!",
+ -					(long long)bp->b_bn);
+ -				xfs_alert(btp->bt_mount,
+++<<<<<<< HEAD
+ +		/*
+ +		 * clear the LRU reference count so the buffer doesn't get
+ +		 * ignored in xfs_buf_rele().
+ +		 */
+ +		atomic_set(&bp->b_lru_ref, 0);
+ +		if (bp->b_flags & XBF_WRITE_FAIL) {
+ +			xfs_alert(btp->bt_mount,
+ +"Corruption Alert: Buffer at block 0x%llx had permanent write failures!",
+ +				(long long)bp->b_bn);
+ +			xfs_alert(btp->bt_mount,
+  "Please run xfs_repair to determine the extent of the problem.");
+ -			}
+ -			xfs_buf_rele(bp);
+  		}
+ -		if (loop++ != 0)
+ -			delay(100);
+ -	}
+ -}
+ -
+ +		bp->b_state |= XFS_BSTATE_DISPOSE;
+ +		list_move_tail(&bp->b_lru, &dispose);
+++=======
++ static enum lru_status
++ xfs_buftarg_isolate(
++ 	struct list_head	*item,
++ 	struct list_lru_one	*lru,
++ 	spinlock_t		*lru_lock,
++ 	void			*arg)
++ {
++ 	struct xfs_buf		*bp = container_of(item, struct xfs_buf, b_lru);
++ 	struct list_head	*dispose = arg;
++ 
++ 	/*
++ 	 * we are inverting the lru lock/bp->b_lock here, so use a trylock.
++ 	 * If we fail to get the lock, just skip it.
++ 	 */
++ 	if (!spin_trylock(&bp->b_lock))
++ 		return LRU_SKIP;
++ 	/*
++ 	 * Decrement the b_lru_ref count unless the value is already
++ 	 * zero. If the value is already zero, we need to reclaim the
++ 	 * buffer, otherwise it gets another trip through the LRU.
++ 	 */
++ 	if (atomic_add_unless(&bp->b_lru_ref, -1, 0)) {
+++>>>>>>> 19957a181608 (xfs: Correctly invert xfs_buftarg LRU isolation logic)
+  		spin_unlock(&bp->b_lock);
+ -		return LRU_ROTATE;
+  	}
+ +	spin_unlock(&btp->bt_lru_lock);
+  
+ -	bp->b_state |= XFS_BSTATE_DISPOSE;
+ -	list_lru_isolate_move(lru, item, dispose);
+ -	spin_unlock(&bp->b_lock);
+ -	return LRU_REMOVED;
+ +	while (!list_empty(&dispose)) {
+ +		bp = list_first_entry(&dispose, struct xfs_buf, b_lru);
+ +		list_del_init(&bp->b_lru);
+ +		xfs_buf_rele(bp);
+ +	}
+  }
+  
+ -static unsigned long
+ -xfs_buftarg_shrink_scan(
+ +int
+ +xfs_buftarg_shrink(
+  	struct shrinker		*shrink,
+  	struct shrink_control	*sc)
+  {
+* Unmerged path fs/xfs/xfs_buf.c
