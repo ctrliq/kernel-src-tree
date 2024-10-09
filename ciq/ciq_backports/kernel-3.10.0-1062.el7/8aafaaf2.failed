@@ -1,0 +1,142 @@
+iommu/amd: Reserve exclusion range in iova-domain
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [iommu] amd: Reserve exclusion range in iova-domain (Jerry Snitselaar) [1691196]
+Rebuild_FUZZ: 93.48%
+commit-author Joerg Roedel <jroedel@suse.de>
+commit 8aafaaf2212192012f5bae305bb31cdf7681d777
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/8aafaaf2.failed
+
+If a device has an exclusion range specified in the IVRS
+table, this region needs to be reserved in the iova-domain
+of that device. This hasn't happened until now and can cause
+data corruption on data transfered with these devices.
+
+Treat exclusion ranges as reserved regions in the iommu-core
+to fix the problem.
+
+Fixes: be2a022c0dd0 ('x86, AMD IOMMU: add functions to parse IOMMU memory mapping requirements for devices')
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+	Reviewed-by: Gary R Hook <gary.hook@amd.com>
+(cherry picked from commit 8aafaaf2212192012f5bae305bb31cdf7681d777)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/amd_iommu.c
+diff --cc drivers/iommu/amd_iommu.c
+index 5fe6748c16ef,f7cdd2ab7f11..000000000000
+--- a/drivers/iommu/amd_iommu.c
++++ b/drivers/iommu/amd_iommu.c
+@@@ -3350,33 -3169,50 +3350,53 @@@ static void amd_iommu_get_dm_regions(st
+  		return;
+  
+  	list_for_each_entry(entry, &amd_iommu_unity_map, list) {
+++<<<<<<< HEAD
+ +		struct iommu_dm_region *region;
+++=======
++ 		int type, prot = 0;
++ 		size_t length;
+++>>>>>>> 8aafaaf22121 (iommu/amd: Reserve exclusion range in iova-domain)
+  
+  		if (devid < entry->devid_start || devid > entry->devid_end)
+  			continue;
+  
+++<<<<<<< HEAD
+ +		region = kzalloc(sizeof(*region), GFP_KERNEL);
+++=======
++ 		type   = IOMMU_RESV_DIRECT;
++ 		length = entry->address_end - entry->address_start;
++ 		if (entry->prot & IOMMU_PROT_IR)
++ 			prot |= IOMMU_READ;
++ 		if (entry->prot & IOMMU_PROT_IW)
++ 			prot |= IOMMU_WRITE;
++ 		if (entry->prot & IOMMU_UNITY_MAP_FLAG_EXCL_RANGE)
++ 			/* Exclusion range */
++ 			type = IOMMU_RESV_RESERVED;
++ 
++ 		region = iommu_alloc_resv_region(entry->address_start,
++ 						 length, prot, type);
+++>>>>>>> 8aafaaf22121 (iommu/amd: Reserve exclusion range in iova-domain)
+  		if (!region) {
+ -			dev_err(dev, "Out of memory allocating dm-regions\n");
+ +			pr_err("Out of memory allocating dm-regions for %s\n",
+ +				dev_name(dev));
+  			return;
+  		}
+ -		list_add_tail(&region->list, head);
+ -	}
+  
+ -	region = iommu_alloc_resv_region(MSI_RANGE_START,
+ -					 MSI_RANGE_END - MSI_RANGE_START + 1,
+ -					 0, IOMMU_RESV_MSI);
+ -	if (!region)
+ -		return;
+ -	list_add_tail(&region->list, head);
+ +		region->start = entry->address_start;
+ +		region->length = entry->address_end - entry->address_start;
+ +		if (entry->prot & IOMMU_PROT_IR)
+ +			region->prot |= IOMMU_READ;
+ +		if (entry->prot & IOMMU_PROT_IW)
+ +			region->prot |= IOMMU_WRITE;
+  
+ -	region = iommu_alloc_resv_region(HT_RANGE_START,
+ -					 HT_RANGE_END - HT_RANGE_START + 1,
+ -					 0, IOMMU_RESV_RESERVED);
+ -	if (!region)
+ -		return;
+ -	list_add_tail(&region->list, head);
+ +		list_add_tail(&region->list, head);
+ +	}
+  }
+  
+ -static void amd_iommu_put_resv_regions(struct device *dev,
+ +static void amd_iommu_put_dm_regions(struct device *dev,
+  				     struct list_head *head)
+  {
+ -	struct iommu_resv_region *entry, *next;
+ +	struct iommu_dm_region *entry, *next;
+  
+  	list_for_each_entry_safe(entry, next, head, list)
+  		kfree(entry);
+* Unmerged path drivers/iommu/amd_iommu.c
+diff --git a/drivers/iommu/amd_iommu_init.c b/drivers/iommu/amd_iommu_init.c
+index e7a603c0bff6..db281180ffb3 100644
+--- a/drivers/iommu/amd_iommu_init.c
++++ b/drivers/iommu/amd_iommu_init.c
+@@ -1990,6 +1990,9 @@ static int __init init_unity_map_range(struct ivmd_header *m)
+ 	if (e == NULL)
+ 		return -ENOMEM;
+ 
++	if (m->flags & IVMD_FLAG_EXCL_RANGE)
++		init_exclusion_range(m);
++
+ 	switch (m->type) {
+ 	default:
+ 		kfree(e);
+@@ -2036,9 +2039,7 @@ static int __init init_memory_definitions(struct acpi_table_header *table)
+ 
+ 	while (p < end) {
+ 		m = (struct ivmd_header *)p;
+-		if (m->flags & IVMD_FLAG_EXCL_RANGE)
+-			init_exclusion_range(m);
+-		else if (m->flags & IVMD_FLAG_UNITY_MAP)
++		if (m->flags & (IVMD_FLAG_UNITY_MAP | IVMD_FLAG_EXCL_RANGE))
+ 			init_unity_map_range(m);
+ 
+ 		p += m->length;
+diff --git a/drivers/iommu/amd_iommu_types.h b/drivers/iommu/amd_iommu_types.h
+index 3dbdd8893f57..69edc0edfa5e 100644
+--- a/drivers/iommu/amd_iommu_types.h
++++ b/drivers/iommu/amd_iommu_types.h
+@@ -372,6 +372,8 @@
+ #define IOMMU_PROT_IR 0x01
+ #define IOMMU_PROT_IW 0x02
+ 
++#define IOMMU_UNITY_MAP_FLAG_EXCL_RANGE	(1 << 2)
++
+ /* IOMMU capabilities */
+ #define IOMMU_CAP_IOTLB   24
+ #define IOMMU_CAP_NPCACHE 26
