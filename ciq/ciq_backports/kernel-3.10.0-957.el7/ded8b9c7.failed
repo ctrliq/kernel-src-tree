@@ -1,0 +1,102 @@
+sfc: Use filter index rather than ID for rps_flow_id table
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Edward Cree <ecree@solarflare.com>
+commit ded8b9c761c50d147b20d7de18766fcdb8f5b621
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/ded8b9c7.failed
+
+efx->type->filter_insert() returns an ID rather than the index that
+ efx->type->filter_async_insert() used to, which causes it to exceed
+ efx->type->max_rx_ip_filters on some EF10 configurations, leading to out-
+ of-bounds array writes.
+So, in efx_filter_rfs_work(), convert this back into an index (which is
+ what the remove call in the expiry path expects, anyway).
+
+Fixes: 3af0f34290f6 ("sfc: replace asynchronous filter operations")
+	Signed-off-by: Edward Cree <ecree@solarflare.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ded8b9c761c50d147b20d7de18766fcdb8f5b621)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/sfc/rx.c
+diff --cc drivers/net/ethernet/sfc/rx.c
+index 90c85f16047f,d2e254f2f72b..000000000000
+--- a/drivers/net/ethernet/sfc/rx.c
++++ b/drivers/net/ethernet/sfc/rx.c
+@@@ -827,6 -827,68 +827,71 @@@ MODULE_PARM_DESC(rx_refill_threshold
+  
+  #ifdef CONFIG_RFS_ACCEL
+  
+++<<<<<<< HEAD
+++=======
++ static void efx_filter_rfs_work(struct work_struct *data)
++ {
++ 	struct efx_async_filter_insertion *req = container_of(data, struct efx_async_filter_insertion,
++ 							      work);
++ 	struct efx_nic *efx = netdev_priv(req->net_dev);
++ 	struct efx_channel *channel = efx_get_channel(efx, req->rxq_index);
++ 	int slot_idx = req - efx->rps_slot;
++ 	struct efx_arfs_rule *rule;
++ 	u16 arfs_id = 0;
++ 	int rc;
++ 
++ 	rc = efx->type->filter_insert(efx, &req->spec, true);
++ 	if (rc >= 0)
++ 		rc %= efx->type->max_rx_ip_filters;
++ 	if (efx->rps_hash_table) {
++ 		spin_lock_bh(&efx->rps_hash_lock);
++ 		rule = efx_rps_hash_find(efx, &req->spec);
++ 		/* The rule might have already gone, if someone else's request
++ 		 * for the same spec was already worked and then expired before
++ 		 * we got around to our work.  In that case we have nothing
++ 		 * tying us to an arfs_id, meaning that as soon as the filter
++ 		 * is considered for expiry it will be removed.
++ 		 */
++ 		if (rule) {
++ 			if (rc < 0)
++ 				rule->filter_id = EFX_ARFS_FILTER_ID_ERROR;
++ 			else
++ 				rule->filter_id = rc;
++ 			arfs_id = rule->arfs_id;
++ 		}
++ 		spin_unlock_bh(&efx->rps_hash_lock);
++ 	}
++ 	if (rc >= 0) {
++ 		/* Remember this so we can check whether to expire the filter
++ 		 * later.
++ 		 */
++ 		mutex_lock(&efx->rps_mutex);
++ 		channel->rps_flow_id[rc] = req->flow_id;
++ 		++channel->rfs_filters_added;
++ 		mutex_unlock(&efx->rps_mutex);
++ 
++ 		if (req->spec.ether_type == htons(ETH_P_IP))
++ 			netif_info(efx, rx_status, efx->net_dev,
++ 				   "steering %s %pI4:%u:%pI4:%u to queue %u [flow %u filter %d id %u]\n",
++ 				   (req->spec.ip_proto == IPPROTO_TCP) ? "TCP" : "UDP",
++ 				   req->spec.rem_host, ntohs(req->spec.rem_port),
++ 				   req->spec.loc_host, ntohs(req->spec.loc_port),
++ 				   req->rxq_index, req->flow_id, rc, arfs_id);
++ 		else
++ 			netif_info(efx, rx_status, efx->net_dev,
++ 				   "steering %s [%pI6]:%u:[%pI6]:%u to queue %u [flow %u filter %d id %u]\n",
++ 				   (req->spec.ip_proto == IPPROTO_TCP) ? "TCP" : "UDP",
++ 				   req->spec.rem_host, ntohs(req->spec.rem_port),
++ 				   req->spec.loc_host, ntohs(req->spec.loc_port),
++ 				   req->rxq_index, req->flow_id, rc, arfs_id);
++ 	}
++ 
++ 	/* Release references */
++ 	clear_bit(slot_idx, &efx->rps_slot_map);
++ 	dev_put(req->net_dev);
++ }
++ 
+++>>>>>>> ded8b9c761c5 (sfc: Use filter index rather than ID for rps_flow_id table)
+  int efx_filter_rfs(struct net_device *net_dev, const struct sk_buff *skb,
+  		   u16 rxq_index, u32 flow_id)
+  {
+* Unmerged path drivers/net/ethernet/sfc/rx.c
