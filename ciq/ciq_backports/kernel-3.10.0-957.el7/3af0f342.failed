@@ -1,0 +1,618 @@
+sfc: replace asynchronous filter operations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Edward Cree <ecree@solarflare.com>
+commit 3af0f34290f6192756ee1d9c2d5fe27222267035
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/3af0f342.failed
+
+Instead of having an efx->type->filter_rfs_insert() method, just use
+ workitems with a worker function that calls efx->type->filter_insert().
+The only user of this is efx_filter_rfs(), which now queues a call to
+ efx_filter_rfs_work().
+Similarly, efx_filter_rfs_expire() is now a worker function called on a
+ new channel->filter_work work_struct, so the method
+ efx->type->filter_rfs_expire_one() is no longer called in atomic context.
+ We also add a new mutex efx->rps_mutex to protect the RPS state (efx->
+ rps_expire_channel, efx->rps_expire_index, and channel->rps_flow_id) so
+ that the taking of efx->filter_lock can be moved to
+ efx->type->filter_rfs_expire_one().
+Thus, all filter table functions are now called in a sleepable context,
+ allowing them to use sleeping locks in a future patch.
+
+	Signed-off-by: Edward Cree <ecree@solarflare.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3af0f34290f6192756ee1d9c2d5fe27222267035)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/sfc/efx.c
+#	drivers/net/ethernet/sfc/net_driver.h
+#	drivers/net/ethernet/sfc/rx.c
+diff --cc drivers/net/ethernet/sfc/efx.c
+index 546cc9e439a8,0be93abdb2ad..000000000000
+--- a/drivers/net/ethernet/sfc/efx.c
++++ b/drivers/net/ethernet/sfc/efx.c
+@@@ -470,10 -473,13 +473,14 @@@ efx_alloc_channel(struct efx_nic *efx, 
+  		tx_queue->channel = channel;
+  	}
+  
++ #ifdef CONFIG_RFS_ACCEL
++ 	INIT_WORK(&channel->filter_work, efx_filter_rfs_expire);
++ #endif
++ 
+  	rx_queue = &channel->rx_queue;
+  	rx_queue->efx = efx;
+ -	timer_setup(&rx_queue->slow_fill, efx_rx_slow_fill, 0);
+ +	setup_timer(&rx_queue->slow_fill, efx_rx_slow_fill,
+ +		    (unsigned long)rx_queue);
+  
+  	return channel;
+  }
+@@@ -512,8 -518,10 +519,15 @@@ efx_copy_channel(const struct efx_chann
+  	rx_queue = &channel->rx_queue;
+  	rx_queue->buffer = NULL;
+  	memset(&rx_queue->rxd, 0, sizeof(rx_queue->rxd));
+++<<<<<<< HEAD
+ +	setup_timer(&rx_queue->slow_fill, efx_rx_slow_fill,
+ +		    (unsigned long)rx_queue);
+++=======
++ 	timer_setup(&rx_queue->slow_fill, efx_rx_slow_fill, 0);
++ #ifdef CONFIG_RFS_ACCEL
++ 	INIT_WORK(&channel->filter_work, efx_filter_rfs_expire);
++ #endif
+++>>>>>>> 3af0f34290f6 (sfc: replace asynchronous filter operations)
+  
+  	return channel;
+  }
+diff --cc drivers/net/ethernet/sfc/net_driver.h
+index d3b503c79fbe,dad78e3dde70..000000000000
+--- a/drivers/net/ethernet/sfc/net_driver.h
++++ b/drivers/net/ethernet/sfc/net_driver.h
+@@@ -421,6 -430,9 +421,12 @@@ enum efx_sync_events_state 
+   * @event_test_cpu: Last CPU to handle interrupt or test event for this channel
+   * @irq_count: Number of IRQs since last adaptive moderation decision
+   * @irq_mod_score: IRQ moderation score
+++<<<<<<< HEAD
+++=======
++  * @filter_work: Work item for efx_filter_rfs_expire()
++  * @rps_flow_id: Flow IDs of filters allocated for accelerated RFS,
++  *      indexed by filter ID
+++>>>>>>> 3af0f34290f6 (sfc: replace asynchronous filter operations)
+   * @n_rx_tobe_disc: Count of RX_TOBE_DISC errors
+   * @n_rx_ip_hdr_chksum_err: Count of RX IP header checksum errors
+   * @n_rx_tcp_udp_chksum_err: Count of RX TCP and UDP checksum errors
+@@@ -464,6 -476,9 +470,12 @@@ struct efx_channel 
+  	unsigned int irq_mod_score;
+  #ifdef CONFIG_RFS_ACCEL
+  	unsigned int rfs_filters_added;
+++<<<<<<< HEAD
+++=======
++ 	struct work_struct filter_work;
++ #define RPS_FLOW_ID_INVALID 0xFFFFFFFF
++ 	u32 *rps_flow_id;
+++>>>>>>> 3af0f34290f6 (sfc: replace asynchronous filter operations)
+  #endif
+  
+  	unsigned int n_rx_tobe_disc;
+@@@ -824,9 -846,10 +836,16 @@@ struct efx_rss_context 
+   * @filter_sem: Filter table rw_semaphore, for freeing the table
+   * @filter_lock: Filter table lock, for mere content changes
+   * @filter_state: Architecture-dependent filter table state
+++<<<<<<< HEAD
+ + * @rps_flow_id: Flow IDs of filters allocated for accelerated RFS,
+ + *	indexed by filter ID
+ + * @rps_expire_index: Next index to check for expiry in @rps_flow_id
+++=======
++  * @rps_mutex: Protects RPS state of all channels
++  * @rps_expire_channel: Next channel to check for expiry
++  * @rps_expire_index: Next index to check for expiry in
++  *	@rps_expire_channel's @rps_flow_id
+++>>>>>>> 3af0f34290f6 (sfc: replace asynchronous filter operations)
+   * @active_queues: Count of RX and TX queues that haven't been flushed and drained.
+   * @rxq_flush_pending: Count of number of receive queues that need to be flushed.
+   *	Decremented when the efx_flush_rx_queue() is called.
+@@@ -977,7 -1001,8 +996,12 @@@ struct efx_nic 
+  	spinlock_t filter_lock;
+  	void *filter_state;
+  #ifdef CONFIG_RFS_ACCEL
+++<<<<<<< HEAD
+ +	u32 *rps_flow_id;
+++=======
++ 	struct mutex rps_mutex;
++ 	unsigned int rps_expire_channel;
+++>>>>>>> 3af0f34290f6 (sfc: replace asynchronous filter operations)
+  	unsigned int rps_expire_index;
+  #endif
+  
+diff --cc drivers/net/ethernet/sfc/rx.c
+index 90c85f16047f,95682831484e..000000000000
+--- a/drivers/net/ethernet/sfc/rx.c
++++ b/drivers/net/ethernet/sfc/rx.c
+@@@ -831,122 -886,88 +886,155 @@@ int efx_filter_rfs(struct net_device *n
+  		   u16 rxq_index, u32 flow_id)
+  {
+  	struct efx_nic *efx = netdev_priv(net_dev);
+++<<<<<<< HEAD
+ +	struct efx_channel *channel;
+ +	struct efx_filter_spec spec;
+ +	const __be16 *ports;
+ +	__be16 ether_type;
+ +	int nhoff;
+ +	int rc;
+++=======
++ 	struct efx_async_filter_insertion *req;
++ 	struct flow_keys fk;
+++>>>>>>> 3af0f34290f6 (sfc: replace asynchronous filter operations)
+  
+ -	if (flow_id == RPS_FLOW_ID_INVALID)
+ -		return -EINVAL;
+ +	/* The core RPS/RFS code has already parsed and validated
+ +	 * VLAN, IP and transport headers.  We assume they are in the
+ +	 * header area.
+ +	 */
+  
+ -	if (!skb_flow_dissect_flow_keys(skb, &fk, 0))
+ -		return -EPROTONOSUPPORT;
+ +	if (skb->protocol == htons(ETH_P_8021Q)) {
+ +		const struct vlan_hdr *vh =
+ +			(const struct vlan_hdr *)skb->data;
+  
+ -	if (fk.basic.n_proto != htons(ETH_P_IP) && fk.basic.n_proto != htons(ETH_P_IPV6))
+ -		return -EPROTONOSUPPORT;
+ -	if (fk.control.flags & FLOW_DIS_IS_FRAGMENT)
+ +		/* We can't filter on the IP 5-tuple and the vlan
+ +		 * together, so just strip the vlan header and filter
+ +		 * on the IP part.
+ +		 */
+ +		EFX_WARN_ON_ONCE_PARANOID(skb_headlen(skb) < sizeof(*vh));
+ +		ether_type = vh->h_vlan_encapsulated_proto;
+ +		nhoff = sizeof(struct vlan_hdr);
+ +	} else {
+ +		ether_type = skb->protocol;
+ +		nhoff = 0;
+ +	}
+ +
+ +	if (ether_type != htons(ETH_P_IP) && ether_type != htons(ETH_P_IPV6))
+  		return -EPROTONOSUPPORT;
+  
+- 	efx_filter_init_rx(&spec, EFX_FILTER_PRI_HINT,
++ 	req = kmalloc(sizeof(*req), GFP_ATOMIC);
++ 	if (!req)
++ 		return -ENOMEM;
++ 
++ 	efx_filter_init_rx(&req->spec, EFX_FILTER_PRI_HINT,
+  			   efx->rx_scatter ? EFX_FILTER_FLAG_RX_SCATTER : 0,
+  			   rxq_index);
+- 	spec.match_flags =
++ 	req->spec.match_flags =
+  		EFX_FILTER_MATCH_ETHER_TYPE | EFX_FILTER_MATCH_IP_PROTO |
+  		EFX_FILTER_MATCH_LOC_HOST | EFX_FILTER_MATCH_LOC_PORT |
+  		EFX_FILTER_MATCH_REM_HOST | EFX_FILTER_MATCH_REM_PORT;
+++<<<<<<< HEAD
+ +	spec.ether_type = ether_type;
+ +
+ +	if (ether_type == htons(ETH_P_IP)) {
+ +		const struct iphdr *ip =
+ +			(const struct iphdr *)(skb->data + nhoff);
+ +
+ +		EFX_WARN_ON_ONCE_PARANOID(skb_headlen(skb) < nhoff + sizeof(*ip));
+ +		if (ip_is_fragment(ip))
+ +			return -EPROTONOSUPPORT;
+ +		spec.ip_proto = ip->protocol;
+ +		spec.rem_host[0] = ip->saddr;
+ +		spec.loc_host[0] = ip->daddr;
+ +		EFX_WARN_ON_ONCE_PARANOID(skb_headlen(skb) < nhoff + 4 * ip->ihl + 4);
+ +		ports = (const __be16 *)(skb->data + nhoff + 4 * ip->ihl);
+ +	} else {
+ +		const struct ipv6hdr *ip6 =
+ +			(const struct ipv6hdr *)(skb->data + nhoff);
+ +
+ +		EFX_WARN_ON_ONCE_PARANOID(skb_headlen(skb) <
+ +					  nhoff + sizeof(*ip6) + 4);
+ +		spec.ip_proto = ip6->nexthdr;
+ +		memcpy(spec.rem_host, &ip6->saddr, sizeof(ip6->saddr));
+ +		memcpy(spec.loc_host, &ip6->daddr, sizeof(ip6->daddr));
+ +		ports = (const __be16 *)(ip6 + 1);
+ +	}
+ +
+ +	spec.rem_port = ports[0];
+ +	spec.loc_port = ports[1];
+ +
+ +	rc = efx->type->filter_rfs_insert(efx, &spec);
+ +	if (rc < 0)
+ +		return rc;
+ +
+ +	/* Remember this so we can check whether to expire the filter later */
+ +	efx->rps_flow_id[rc] = flow_id;
+ +	channel = efx_get_channel(efx, skb_get_rx_queue(skb));
+ +	++channel->rfs_filters_added;
+ +
+ +	if (ether_type == htons(ETH_P_IP))
+ +		netif_info(efx, rx_status, efx->net_dev,
+ +			   "steering %s %pI4:%u:%pI4:%u to queue %u [flow %u filter %d]\n",
+ +			   (spec.ip_proto == IPPROTO_TCP) ? "TCP" : "UDP",
+ +			   spec.rem_host, ntohs(ports[0]), spec.loc_host,
+ +			   ntohs(ports[1]), rxq_index, flow_id, rc);
+ +	else
+ +		netif_info(efx, rx_status, efx->net_dev,
+ +			   "steering %s [%pI6]:%u:[%pI6]:%u to queue %u [flow %u filter %d]\n",
+ +			   (spec.ip_proto == IPPROTO_TCP) ? "TCP" : "UDP",
+ +			   spec.rem_host, ntohs(ports[0]), spec.loc_host,
+ +			   ntohs(ports[1]), rxq_index, flow_id, rc);
+ +
+ +	return rc;
+++=======
++ 	req->spec.ether_type = fk.basic.n_proto;
++ 	req->spec.ip_proto = fk.basic.ip_proto;
++ 
++ 	if (fk.basic.n_proto == htons(ETH_P_IP)) {
++ 		req->spec.rem_host[0] = fk.addrs.v4addrs.src;
++ 		req->spec.loc_host[0] = fk.addrs.v4addrs.dst;
++ 	} else {
++ 		memcpy(req->spec.rem_host, &fk.addrs.v6addrs.src,
++ 		       sizeof(struct in6_addr));
++ 		memcpy(req->spec.loc_host, &fk.addrs.v6addrs.dst,
++ 		       sizeof(struct in6_addr));
++ 	}
++ 
++ 	req->spec.rem_port = fk.ports.src;
++ 	req->spec.loc_port = fk.ports.dst;
++ 
++ 	dev_hold(req->net_dev = net_dev);
++ 	INIT_WORK(&req->work, efx_filter_rfs_work);
++ 	req->rxq_index = rxq_index;
++ 	req->flow_id = flow_id;
++ 	schedule_work(&req->work);
++ 	return 0;
+++>>>>>>> 3af0f34290f6 (sfc: replace asynchronous filter operations)
+  }
+  
+  bool __efx_filter_rfs_expire(struct efx_nic *efx, unsigned int quota)
+  {
+  	bool (*expire_one)(struct efx_nic *efx, u32 flow_id, unsigned int index);
+ -	unsigned int channel_idx, index, size;
+ +	unsigned int index, size;
+  	u32 flow_id;
+  
+- 	if (!spin_trylock_bh(&efx->filter_lock))
++ 	if (!mutex_trylock(&efx->rps_mutex))
+  		return false;
+- 
+  	expire_one = efx->type->filter_rfs_expire_one;
+ -	channel_idx = efx->rps_expire_channel;
+  	index = efx->rps_expire_index;
+  	size = efx->type->max_rx_ip_filters;
+  	while (quota--) {
+ -		struct efx_channel *channel = efx_get_channel(efx, channel_idx);
+ -		flow_id = channel->rps_flow_id[index];
+ -
+ -		if (flow_id != RPS_FLOW_ID_INVALID &&
+ -		    expire_one(efx, flow_id, index)) {
+ +		flow_id = efx->rps_flow_id[index];
+ +		if (expire_one(efx, flow_id, index))
+  			netif_info(efx, rx_status, efx->net_dev,
+ -				   "expired filter %d [queue %u flow %u]\n",
+ -				   index, channel_idx, flow_id);
+ -			channel->rps_flow_id[index] = RPS_FLOW_ID_INVALID;
+ -		}
+ -		if (++index == size) {
+ -			if (++channel_idx == efx->n_channels)
+ -				channel_idx = 0;
+ +				   "expired filter %d [flow %u]\n",
+ +				   index, flow_id);
+ +		if (++index == size)
+  			index = 0;
+ -		}
+  	}
+ -	efx->rps_expire_channel = channel_idx;
+  	efx->rps_expire_index = index;
+  
+- 	spin_unlock_bh(&efx->filter_lock);
++ 	mutex_unlock(&efx->rps_mutex);
+  	return true;
+  }
+  
+diff --git a/drivers/net/ethernet/sfc/ef10.c b/drivers/net/ethernet/sfc/ef10.c
+index 85c02e9c3fe4..5db970f15b0a 100644
+--- a/drivers/net/ethernet/sfc/ef10.c
++++ b/drivers/net/ethernet/sfc/ef10.c
+@@ -4692,143 +4692,6 @@ static s32 efx_ef10_filter_get_rx_ids(struct efx_nic *efx,
+ 
+ #ifdef CONFIG_RFS_ACCEL
+ 
+-static efx_mcdi_async_completer efx_ef10_filter_rfs_insert_complete;
+-
+-static s32 efx_ef10_filter_rfs_insert(struct efx_nic *efx,
+-				      struct efx_filter_spec *spec)
+-{
+-	struct efx_ef10_filter_table *table = efx->filter_state;
+-	MCDI_DECLARE_BUF(inbuf, MC_CMD_FILTER_OP_EXT_IN_LEN);
+-	struct efx_filter_spec *saved_spec;
+-	unsigned int hash, i, depth = 1;
+-	bool replacing = false;
+-	int ins_index = -1;
+-	u64 cookie;
+-	s32 rc;
+-
+-	/* Must be an RX filter without RSS and not for a multicast
+-	 * destination address (RFS only works for connected sockets).
+-	 * These restrictions allow us to pass only a tiny amount of
+-	 * data through to the completion function.
+-	 */
+-	EFX_WARN_ON_PARANOID(spec->flags !=
+-			     (EFX_FILTER_FLAG_RX | EFX_FILTER_FLAG_RX_SCATTER));
+-	EFX_WARN_ON_PARANOID(spec->priority != EFX_FILTER_PRI_HINT);
+-	EFX_WARN_ON_PARANOID(efx_filter_is_mc_recipient(spec));
+-
+-	hash = efx_ef10_filter_hash(spec);
+-
+-	spin_lock_bh(&efx->filter_lock);
+-
+-	/* Find any existing filter with the same match tuple or else
+-	 * a free slot to insert at.  If an existing filter is busy,
+-	 * we have to give up.
+-	 */
+-	for (;;) {
+-		i = (hash + depth) & (HUNT_FILTER_TBL_ROWS - 1);
+-		saved_spec = efx_ef10_filter_entry_spec(table, i);
+-
+-		if (!saved_spec) {
+-			if (ins_index < 0)
+-				ins_index = i;
+-		} else if (efx_ef10_filter_equal(spec, saved_spec)) {
+-			if (table->entry[i].spec & EFX_EF10_FILTER_FLAG_BUSY) {
+-				rc = -EBUSY;
+-				goto fail_unlock;
+-			}
+-			if (spec->priority < saved_spec->priority) {
+-				rc = -EPERM;
+-				goto fail_unlock;
+-			}
+-			ins_index = i;
+-			break;
+-		}
+-
+-		/* Once we reach the maximum search depth, use the
+-		 * first suitable slot or return -EBUSY if there was
+-		 * none
+-		 */
+-		if (depth == EFX_EF10_FILTER_SEARCH_LIMIT) {
+-			if (ins_index < 0) {
+-				rc = -EBUSY;
+-				goto fail_unlock;
+-			}
+-			break;
+-		}
+-
+-		++depth;
+-	}
+-
+-	/* Create a software table entry if necessary, and mark it
+-	 * busy.  We might yet fail to insert, but any attempt to
+-	 * insert a conflicting filter while we're waiting for the
+-	 * firmware must find the busy entry.
+-	 */
+-	saved_spec = efx_ef10_filter_entry_spec(table, ins_index);
+-	if (saved_spec) {
+-		replacing = true;
+-	} else {
+-		saved_spec = kmalloc(sizeof(*spec), GFP_ATOMIC);
+-		if (!saved_spec) {
+-			rc = -ENOMEM;
+-			goto fail_unlock;
+-		}
+-		*saved_spec = *spec;
+-	}
+-	efx_ef10_filter_set_entry(table, ins_index, saved_spec,
+-				  EFX_EF10_FILTER_FLAG_BUSY);
+-
+-	spin_unlock_bh(&efx->filter_lock);
+-
+-	/* Pack up the variables needed on completion */
+-	cookie = replacing << 31 | ins_index << 16 | spec->dmaq_id;
+-
+-	efx_ef10_filter_push_prep(efx, spec, inbuf,
+-				  table->entry[ins_index].handle, NULL,
+-				  replacing);
+-	efx_mcdi_rpc_async(efx, MC_CMD_FILTER_OP, inbuf, sizeof(inbuf),
+-			   MC_CMD_FILTER_OP_OUT_LEN,
+-			   efx_ef10_filter_rfs_insert_complete, cookie);
+-
+-	return ins_index;
+-
+-fail_unlock:
+-	spin_unlock_bh(&efx->filter_lock);
+-	return rc;
+-}
+-
+-static void
+-efx_ef10_filter_rfs_insert_complete(struct efx_nic *efx, unsigned long cookie,
+-				    int rc, efx_dword_t *outbuf,
+-				    size_t outlen_actual)
+-{
+-	struct efx_ef10_filter_table *table = efx->filter_state;
+-	unsigned int ins_index, dmaq_id;
+-	struct efx_filter_spec *spec;
+-	bool replacing;
+-
+-	/* Unpack the cookie */
+-	replacing = cookie >> 31;
+-	ins_index = (cookie >> 16) & (HUNT_FILTER_TBL_ROWS - 1);
+-	dmaq_id = cookie & 0xffff;
+-
+-	spin_lock_bh(&efx->filter_lock);
+-	spec = efx_ef10_filter_entry_spec(table, ins_index);
+-	if (rc == 0) {
+-		table->entry[ins_index].handle =
+-			MCDI_QWORD(outbuf, FILTER_OP_OUT_HANDLE);
+-		if (replacing)
+-			spec->dmaq_id = dmaq_id;
+-	} else if (!replacing) {
+-		kfree(spec);
+-		spec = NULL;
+-	}
+-	efx_ef10_filter_set_entry(table, ins_index, spec, 0);
+-	spin_unlock_bh(&efx->filter_lock);
+-
+-	wake_up_all(&table->waitq);
+-}
+-
+ static void
+ efx_ef10_filter_rfs_expire_complete(struct efx_nic *efx,
+ 				    unsigned long filter_idx,
+@@ -4839,18 +4702,22 @@ static bool efx_ef10_filter_rfs_expire_one(struct efx_nic *efx, u32 flow_id,
+ 					   unsigned int filter_idx)
+ {
+ 	struct efx_ef10_filter_table *table = efx->filter_state;
+-	struct efx_filter_spec *spec =
+-		efx_ef10_filter_entry_spec(table, filter_idx);
++	struct efx_filter_spec *spec;
+ 	MCDI_DECLARE_BUF(inbuf,
+ 			 MC_CMD_FILTER_OP_IN_HANDLE_OFST +
+ 			 MC_CMD_FILTER_OP_IN_HANDLE_LEN);
++	bool ret = true;
+ 
++	spin_lock_bh(&efx->filter_lock);
++	spec = efx_ef10_filter_entry_spec(table, filter_idx);
+ 	if (!spec ||
+ 	    (table->entry[filter_idx].spec & EFX_EF10_FILTER_FLAG_BUSY) ||
+ 	    spec->priority != EFX_FILTER_PRI_HINT ||
+ 	    !rps_may_expire_flow(efx->net_dev, spec->dmaq_id,
+-				 flow_id, filter_idx))
+-		return false;
++				 flow_id, filter_idx)) {
++		ret = false;
++		goto out_unlock;
++	}
+ 
+ 	MCDI_SET_DWORD(inbuf, FILTER_OP_IN_OP,
+ 		       MC_CMD_FILTER_OP_IN_OP_REMOVE);
+@@ -4858,10 +4725,12 @@ static bool efx_ef10_filter_rfs_expire_one(struct efx_nic *efx, u32 flow_id,
+ 		       table->entry[filter_idx].handle);
+ 	if (efx_mcdi_rpc_async(efx, MC_CMD_FILTER_OP, inbuf, sizeof(inbuf), 0,
+ 			       efx_ef10_filter_rfs_expire_complete, filter_idx))
+-		return false;
+-
+-	table->entry[filter_idx].spec |= EFX_EF10_FILTER_FLAG_BUSY;
+-	return true;
++		ret = false;
++	else
++		table->entry[filter_idx].spec |= EFX_EF10_FILTER_FLAG_BUSY;
++out_unlock:
++	spin_unlock_bh(&efx->filter_lock);
++	return ret;
+ }
+ 
+ static void
+@@ -6717,7 +6586,6 @@ const struct efx_nic_type efx_hunt_a0_vf_nic_type = {
+ 	.filter_get_rx_id_limit = efx_ef10_filter_get_rx_id_limit,
+ 	.filter_get_rx_ids = efx_ef10_filter_get_rx_ids,
+ #ifdef CONFIG_RFS_ACCEL
+-	.filter_rfs_insert = efx_ef10_filter_rfs_insert,
+ 	.filter_rfs_expire_one = efx_ef10_filter_rfs_expire_one,
+ #endif
+ #ifdef CONFIG_SFC_MTD
+@@ -6830,7 +6698,6 @@ const struct efx_nic_type efx_hunt_a0_nic_type = {
+ 	.filter_get_rx_id_limit = efx_ef10_filter_get_rx_id_limit,
+ 	.filter_get_rx_ids = efx_ef10_filter_get_rx_ids,
+ #ifdef CONFIG_RFS_ACCEL
+-	.filter_rfs_insert = efx_ef10_filter_rfs_insert,
+ 	.filter_rfs_expire_one = efx_ef10_filter_rfs_expire_one,
+ #endif
+ #ifdef CONFIG_SFC_MTD
+* Unmerged path drivers/net/ethernet/sfc/efx.c
+diff --git a/drivers/net/ethernet/sfc/efx.h b/drivers/net/ethernet/sfc/efx.h
+index 871340e4cd7e..dcd9ec56e0e7 100644
+--- a/drivers/net/ethernet/sfc/efx.h
++++ b/drivers/net/ethernet/sfc/efx.h
+@@ -170,15 +170,18 @@ static inline s32 efx_filter_get_rx_ids(struct efx_nic *efx,
+ int efx_filter_rfs(struct net_device *net_dev, const struct sk_buff *skb,
+ 		   u16 rxq_index, u32 flow_id);
+ bool __efx_filter_rfs_expire(struct efx_nic *efx, unsigned quota);
+-static inline void efx_filter_rfs_expire(struct efx_channel *channel)
++static inline void efx_filter_rfs_expire(struct work_struct *data)
+ {
++	struct efx_channel *channel = container_of(data, struct efx_channel,
++						   filter_work);
++
+ 	if (channel->rfs_filters_added >= 60 &&
+ 	    __efx_filter_rfs_expire(channel->efx, 100))
+ 		channel->rfs_filters_added -= 60;
+ }
+ #define efx_filter_rfs_enabled() 1
+ #else
+-static inline void efx_filter_rfs_expire(struct efx_channel *channel) {}
++static inline void efx_filter_rfs_expire(struct work_struct *data) {}
+ #define efx_filter_rfs_enabled() 0
+ #endif
+ bool efx_filter_is_mc_recipient(const struct efx_filter_spec *spec);
+diff --git a/drivers/net/ethernet/sfc/farch.c b/drivers/net/ethernet/sfc/farch.c
+index 1f1b062a8d89..c555550ae543 100644
+--- a/drivers/net/ethernet/sfc/farch.c
++++ b/drivers/net/ethernet/sfc/farch.c
+@@ -2911,28 +2911,25 @@ void efx_farch_filter_update_rx_scatter(struct efx_nic *efx)
+ 
+ #ifdef CONFIG_RFS_ACCEL
+ 
+-s32 efx_farch_filter_rfs_insert(struct efx_nic *efx,
+-				struct efx_filter_spec *gen_spec)
+-{
+-	return efx_farch_filter_insert(efx, gen_spec, true);
+-}
+-
+ bool efx_farch_filter_rfs_expire_one(struct efx_nic *efx, u32 flow_id,
+ 				     unsigned int index)
+ {
+ 	struct efx_farch_filter_state *state = efx->filter_state;
+-	struct efx_farch_filter_table *table =
+-		&state->table[EFX_FARCH_FILTER_TABLE_RX_IP];
++	struct efx_farch_filter_table *table;
++	bool ret = false;
+ 
++	spin_lock_bh(&efx->filter_lock);
++	table = &state->table[EFX_FARCH_FILTER_TABLE_RX_IP];
+ 	if (test_bit(index, table->used_bitmap) &&
+ 	    table->spec[index].priority == EFX_FILTER_PRI_HINT &&
+ 	    rps_may_expire_flow(efx->net_dev, table->spec[index].dmaq_id,
+ 				flow_id, index)) {
+ 		efx_farch_filter_table_clear_entry(efx, table, index);
+-		return true;
++		ret = true;
+ 	}
+ 
+-	return false;
++	spin_unlock_bh(&efx->filter_lock);
++	return ret;
+ }
+ 
+ #endif /* CONFIG_RFS_ACCEL */
+* Unmerged path drivers/net/ethernet/sfc/net_driver.h
+diff --git a/drivers/net/ethernet/sfc/nic.h b/drivers/net/ethernet/sfc/nic.h
+index c176081112f9..e5807d042209 100644
+--- a/drivers/net/ethernet/sfc/nic.h
++++ b/drivers/net/ethernet/sfc/nic.h
+@@ -598,8 +598,6 @@ s32 efx_farch_filter_get_rx_ids(struct efx_nic *efx,
+ 				enum efx_filter_priority priority, u32 *buf,
+ 				u32 size);
+ #ifdef CONFIG_RFS_ACCEL
+-s32 efx_farch_filter_rfs_insert(struct efx_nic *efx,
+-				struct efx_filter_spec *spec);
+ bool efx_farch_filter_rfs_expire_one(struct efx_nic *efx, u32 flow_id,
+ 				     unsigned int index);
+ #endif
+* Unmerged path drivers/net/ethernet/sfc/rx.c
+diff --git a/drivers/net/ethernet/sfc/siena.c b/drivers/net/ethernet/sfc/siena.c
+index 18aab25234ba..65161f68265a 100644
+--- a/drivers/net/ethernet/sfc/siena.c
++++ b/drivers/net/ethernet/sfc/siena.c
+@@ -1035,7 +1035,6 @@ const struct efx_nic_type siena_a0_nic_type = {
+ 	.filter_get_rx_id_limit = efx_farch_filter_get_rx_id_limit,
+ 	.filter_get_rx_ids = efx_farch_filter_get_rx_ids,
+ #ifdef CONFIG_RFS_ACCEL
+-	.filter_rfs_insert = efx_farch_filter_rfs_insert,
+ 	.filter_rfs_expire_one = efx_farch_filter_rfs_expire_one,
+ #endif
+ #ifdef CONFIG_SFC_MTD
