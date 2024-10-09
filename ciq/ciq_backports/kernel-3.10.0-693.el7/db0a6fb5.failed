@@ -1,0 +1,160 @@
+audit: add tty field to LOGIN event
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Richard Guy Briggs <rgb@redhat.com>
+commit db0a6fb5d97afe01fd9c47d37c6daa82d4d4001d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/db0a6fb5.failed
+
+The tty field was missing from AUDIT_LOGIN events.
+
+Refactor code to create a new function audit_get_tty(), using it to
+replace the call in audit_log_task_info() and to add it to
+audit_log_set_loginuid().  Lock and bump the kref to protect it, adding
+audit_put_tty() alias to decrement it.
+
+	Signed-off-by: Richard Guy Briggs <rgb@redhat.com>
+	Signed-off-by: Paul Moore <paul@paul-moore.com>
+(cherry picked from commit db0a6fb5d97afe01fd9c47d37c6daa82d4d4001d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/audit.c
+diff --cc kernel/audit.c
+index d5475ca24dcc,384374a1d232..000000000000
+--- a/kernel/audit.c
++++ b/kernel/audit.c
+@@@ -60,10 -63,9 +60,9 @@@
+  #ifdef CONFIG_SECURITY
+  #include <linux/security.h>
+  #endif
+ +#include <net/netlink.h>
+  #include <linux/freezer.h>
+- #include <linux/tty.h>
+  #include <linux/pid_namespace.h>
+ -#include <net/netns/generic.h>
+  
+  #include "audit.h"
+  
+@@@ -1767,8 -1870,7 +1766,12 @@@ void audit_log_task_info(struct audit_b
+  {
+  	const struct cred *cred;
+  	char comm[sizeof(tsk->comm)];
+++<<<<<<< HEAD
+ +	struct mm_struct *mm = tsk->mm;
+ +	char *tty;
+++=======
++ 	struct tty_struct *tty;
+++>>>>>>> db0a6fb5d97a (audit: add tty field to LOGIN event)
+  
+  	if (!ab)
+  		return;
+@@@ -1798,17 -1893,12 +1794,22 @@@
+  			 from_kgid(&init_user_ns, cred->egid),
+  			 from_kgid(&init_user_ns, cred->sgid),
+  			 from_kgid(&init_user_ns, cred->fsgid),
+- 			 tty, audit_get_sessionid(tsk));
+- 
++ 			 tty ? tty_name(tty) : "(none)",
++ 			 audit_get_sessionid(tsk));
++ 	audit_put_tty(tty);
+  	audit_log_format(ab, " comm=");
+  	audit_log_untrustedstring(ab, get_task_comm(comm, tsk));
+++<<<<<<< HEAD
+ +
+ +	if (mm) {
+ +		down_read(&mm->mmap_sem);
+ +		if (mm->exe_file)
+ +			audit_log_d_path(ab, " exe=", &mm->exe_file->f_path);
+ +		up_read(&mm->mmap_sem);
+ +	}
+++=======
++ 	audit_log_d_path_exe(ab, tsk->mm);
+++>>>>>>> db0a6fb5d97a (audit: add tty field to LOGIN event)
+  	audit_log_task_context(ab);
+  }
+  EXPORT_SYMBOL(audit_log_task_info);
+diff --git a/include/linux/audit.h b/include/linux/audit.h
+index 7547fbd8104a..8ae1fb5f27a9 100644
+--- a/include/linux/audit.h
++++ b/include/linux/audit.h
+@@ -26,6 +26,7 @@
+ #include <linux/sched.h>
+ #include <linux/ptrace.h>
+ #include <uapi/linux/audit.h>
++#include <linux/tty.h>
+ 
+ #define AUDIT_INO_UNSET ((unsigned long)-1)
+ #define AUDIT_DEV_UNSET ((dev_t)-1)
+@@ -215,6 +216,23 @@ static inline int audit_get_sessionid(struct task_struct *tsk)
+ 	return tsk->sessionid;
+ }
+ 
++static inline struct tty_struct *audit_get_tty(struct task_struct *tsk)
++{
++	struct tty_struct *tty = NULL;
++	unsigned long flags;
++
++	spin_lock_irqsave(&tsk->sighand->siglock, flags);
++	if (tsk->signal)
++		tty = tty_kref_get(tsk->signal->tty);
++	spin_unlock_irqrestore(&tsk->sighand->siglock, flags);
++	return tty;
++}
++
++static inline void audit_put_tty(struct tty_struct *tty)
++{
++	tty_kref_put(tty);
++}
++
+ extern void __audit_ipc_obj(struct kern_ipc_perm *ipcp);
+ extern void __audit_ipc_set_perm(unsigned long qbytes, uid_t uid, gid_t gid, umode_t mode);
+ extern void __audit_bprm(struct linux_binprm *bprm);
+@@ -369,6 +387,12 @@ static inline int audit_get_sessionid(struct task_struct *tsk)
+ {
+ 	return -1;
+ }
++static inline struct tty_struct *audit_get_tty(struct task_struct *tsk)
++{
++	return NULL;
++}
++static inline void audit_put_tty(struct tty_struct *tty)
++{ }
+ static inline void audit_ipc_obj(struct kern_ipc_perm *ipcp)
+ { }
+ static inline void audit_ipc_set_perm(unsigned long qbytes, uid_t uid,
+* Unmerged path kernel/audit.c
+diff --git a/kernel/auditsc.c b/kernel/auditsc.c
+index fcd6a5cc6eaf..b5a3104ce369 100644
+--- a/kernel/auditsc.c
++++ b/kernel/auditsc.c
+@@ -1911,6 +1911,7 @@ static void audit_log_set_loginuid(kuid_t koldloginuid, kuid_t kloginuid,
+ {
+ 	struct audit_buffer *ab;
+ 	uid_t uid, oldloginuid, loginuid;
++	struct tty_struct *tty;
+ 
+ 	if (!audit_enabled)
+ 		return;
+@@ -1918,14 +1919,17 @@ static void audit_log_set_loginuid(kuid_t koldloginuid, kuid_t kloginuid,
+ 	uid = from_kuid(&init_user_ns, task_uid(current));
+ 	oldloginuid = from_kuid(&init_user_ns, koldloginuid);
+ 	loginuid = from_kuid(&init_user_ns, kloginuid),
++	tty = audit_get_tty(current);
+ 
+ 	ab = audit_log_start(NULL, GFP_KERNEL, AUDIT_LOGIN);
+ 	if (!ab)
+ 		return;
+ 	audit_log_format(ab, "pid=%d uid=%u", task_pid_nr(current), uid);
+ 	audit_log_task_context(ab);
+-	audit_log_format(ab, " old-auid=%u auid=%u old-ses=%u ses=%u res=%d",
+-			 oldloginuid, loginuid, oldsessionid, sessionid, !rc);
++	audit_log_format(ab, " old-auid=%u auid=%u tty=%s old-ses=%u ses=%u res=%d",
++			 oldloginuid, loginuid, tty ? tty_name(tty) : "(none)",
++			 oldsessionid, sessionid, !rc);
++	audit_put_tty(tty);
+ 	audit_log_end(ab);
+ }
+ 
