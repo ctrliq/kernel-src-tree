@@ -1,0 +1,111 @@
+nfp: flower: turn on recirc and merge hint support in firmware
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author John Hurley <john.hurley@netronome.com>
+commit 2f2622f59c70de16277ed85db620fed884f75e6a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/2f2622f5.failed
+
+Write to a FW symbol to indicate that the driver supports flow merging. If
+this symbol does not exist then flow merging and recirculation is not
+supported on the FW. If support is available, add a stub to deal with FW
+to kernel merge hint messages.
+
+Full flow merging requires the firmware to support of flow mods. If it
+does not, then do not attempt to 'turn on' flow merging.
+
+	Signed-off-by: John Hurley <john.hurley@netronome.com>
+	Signed-off-by: Simon Horman <simon.horman@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2f2622f59c70de16277ed85db620fed884f75e6a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/flower/main.c
+diff --cc drivers/net/ethernet/netronome/nfp/flower/main.c
+index 171014032993,1569fb6c2c36..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/main.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/main.c
+@@@ -586,8 -641,28 +586,31 @@@ static int nfp_flower_init(struct nfp_a
+  		goto err_cleanup_metadata;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (app_priv->flower_ext_feats & NFP_FL_FEATS_FLOW_MOD) {
++ 		/* Tell the firmware that the driver supports flow merging. */
++ 		err = nfp_rtsym_write_le(app->pf->rtbl,
++ 					 "_abi_flower_merge_hint_enable", 1);
++ 		if (!err)
++ 			app_priv->flower_ext_feats |= NFP_FL_FEATS_FLOW_MERGE;
++ 		else if (err == -ENOENT)
++ 			nfp_warn(app->cpp, "Flow merge not supported by FW.\n");
++ 		else
++ 			goto err_lag_clean;
++ 	} else {
++ 		nfp_warn(app->cpp, "Flow mod/merge not supported by FW.\n");
++ 	}
++ 
++ 	INIT_LIST_HEAD(&app_priv->indr_block_cb_priv);
++ 	INIT_LIST_HEAD(&app_priv->non_repr_priv);
++ 
+++>>>>>>> 2f2622f59c70 (nfp: flower: turn on recirc and merge hint support in firmware)
+  	return 0;
+  
++ err_lag_clean:
++ 	if (app_priv->flower_ext_feats & NFP_FL_FEATS_LAG)
++ 		nfp_flower_lag_cleanup(&app_priv->nfp_lag);
+  err_cleanup_metadata:
+  	nfp_flower_metadata_cleanup(app);
+  err_free_app_priv:
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/cmsg.c b/drivers/net/ethernet/netronome/nfp/flower/cmsg.c
+index cb8565222621..ebd21d28dc0d 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/cmsg.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/cmsg.c
+@@ -254,6 +254,10 @@ nfp_flower_cmsg_process_one_rx(struct nfp_app *app, struct sk_buff *skb)
+ 	case NFP_FLOWER_CMSG_TYPE_PORT_MOD:
+ 		nfp_flower_cmsg_portmod_rx(app, skb);
+ 		break;
++	case NFP_FLOWER_CMSG_TYPE_MERGE_HINT:
++		if (app_priv->flower_ext_feats & NFP_FL_FEATS_FLOW_MERGE)
++			break;
++		goto err_default;
+ 	case NFP_FLOWER_CMSG_TYPE_NO_NEIGH:
+ 		nfp_tunnel_request_route(app, skb);
+ 		break;
+@@ -267,6 +271,7 @@ nfp_flower_cmsg_process_one_rx(struct nfp_app *app, struct sk_buff *skb)
+ 		}
+ 		/* fall through */
+ 	default:
++err_default:
+ 		nfp_flower_cmsg_warn(app, "Cannot handle invalid repr control type %u\n",
+ 				     type);
+ 		goto out;
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/cmsg.h b/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
+index 062d7040a0dc..948319217430 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
++++ b/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
+@@ -397,6 +397,7 @@ enum nfp_flower_cmsg_type_port {
+ 	NFP_FLOWER_CMSG_TYPE_PORT_REIFY =	6,
+ 	NFP_FLOWER_CMSG_TYPE_MAC_REPR =		7,
+ 	NFP_FLOWER_CMSG_TYPE_PORT_MOD =		8,
++	NFP_FLOWER_CMSG_TYPE_MERGE_HINT =	9,
+ 	NFP_FLOWER_CMSG_TYPE_NO_NEIGH =		10,
+ 	NFP_FLOWER_CMSG_TYPE_TUN_MAC =		11,
+ 	NFP_FLOWER_CMSG_TYPE_ACTIVE_TUNS =	12,
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/main.c
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/main.h b/drivers/net/ethernet/netronome/nfp/flower/main.h
+index 90cc96d4eae4..84c4d994fe24 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/main.h
++++ b/drivers/net/ethernet/netronome/nfp/flower/main.h
+@@ -70,6 +70,8 @@ struct nfp_app;
+ #define NFP_FL_NBI_MTU_SETTING		BIT(1)
+ #define NFP_FL_FEATS_GENEVE_OPT		BIT(2)
+ #define NFP_FL_FEATS_VLAN_PCP		BIT(3)
++#define NFP_FL_FEATS_FLOW_MOD		BIT(5)
++#define NFP_FL_FEATS_FLOW_MERGE		BIT(30)
+ #define NFP_FL_FEATS_LAG		BIT(31)
+ 
+ #define NFP_FLOWER_GOLDEN_RATIO_64	0x61C8864680B583EBull
