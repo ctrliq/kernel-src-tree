@@ -1,0 +1,113 @@
+net: ethtool: convert large order kmalloc allocations to vzalloc
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.el7
+Rebuild_CHGLOG: - [net] ethtool: convert large order kmalloc allocations to vzalloc (Davide Caratti) [1786448]
+Rebuild_FUZZ: 95.93%
+commit-author Alexei Starovoitov <ast@fb.com>
+commit 4d1ceea8516cd6adf21f6b75995e2a7d4f376f9b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.el7/4d1ceea8.failed
+
+under memory pressure 'ethtool -S' command may warn:
+[ 2374.385195] ethtool: page allocation failure: order:4, mode:0x242c0c0
+[ 2374.405573] CPU: 12 PID: 40211 Comm: ethtool Not tainted
+[ 2374.423071] Call Trace:
+[ 2374.423076]  [<ffffffff8148cb29>] dump_stack+0x4d/0x64
+[ 2374.423080]  [<ffffffff811667cb>] warn_alloc_failed+0xeb/0x150
+[ 2374.423082]  [<ffffffff81169cd3>] ? __alloc_pages_direct_compact+0x43/0xf0
+[ 2374.423084]  [<ffffffff8116a25c>] __alloc_pages_nodemask+0x4dc/0xbf0
+[ 2374.423091]  [<ffffffffa0023dc2>] ? cmd_exec+0x722/0xcd0 [mlx5_core]
+[ 2374.423095]  [<ffffffff811b3dcc>] alloc_pages_current+0x8c/0x110
+[ 2374.423097]  [<ffffffff81168859>] alloc_kmem_pages+0x19/0x90
+[ 2374.423099]  [<ffffffff81186e5e>] kmalloc_order_trace+0x2e/0xe0
+[ 2374.423101]  [<ffffffff811c0084>] __kmalloc+0x204/0x220
+[ 2374.423105]  [<ffffffff816c269e>] dev_ethtool+0xe4e/0x1f80
+[ 2374.423106]  [<ffffffff816b967e>] ? dev_get_by_name_rcu+0x5e/0x80
+[ 2374.423108]  [<ffffffff816d6926>] dev_ioctl+0x156/0x560
+[ 2374.423111]  [<ffffffff811d4c68>] ? mem_cgroup_commit_charge+0x78/0x3c0
+[ 2374.423117]  [<ffffffff8169d542>] sock_do_ioctl+0x42/0x50
+[ 2374.423119]  [<ffffffff8169d9c3>] sock_ioctl+0x1b3/0x250
+[ 2374.423121]  [<ffffffff811f0f42>] do_vfs_ioctl+0x92/0x580
+[ 2374.423123]  [<ffffffff8100222b>] ? do_audit_syscall_entry+0x4b/0x70
+[ 2374.423124]  [<ffffffff8100287c>] ? syscall_trace_enter_phase1+0xfc/0x120
+[ 2374.423126]  [<ffffffff811f14a9>] SyS_ioctl+0x79/0x90
+[ 2374.423127]  [<ffffffff81002bb0>] do_syscall_64+0x50/0xa0
+[ 2374.423129]  [<ffffffff817e19bc>] entry_SYSCALL64_slow_path+0x25/0x25
+
+~1160 mlx5 counters ~= order 4 allocation which is unlikely to succeed
+under memory pressure. Convert them to vzalloc() as ethtool_get_regs() does.
+Also take care of drivers without counters similar to
+commit 67ae7cf1eeda ("ethtool: Allow zero-length register dumps again")
+and reduce warn_on to warn_on_once.
+
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4d1ceea8516cd6adf21f6b75995e2a7d4f376f9b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/ethtool.c
+diff --cc net/core/ethtool.c
+index 9a6f348360f2,6b3eee0834a0..000000000000
+--- a/net/core/ethtool.c
++++ b/net/core/ethtool.c
+@@@ -1991,10 -1937,52 +1995,55 @@@ static int ethtool_get_stats(struct net
+  	ret = 0;
+  
+   out:
+- 	kfree(data);
++ 	vfree(data);
++ 	return ret;
++ }
++ 
+++<<<<<<< HEAD
+++=======
++ static int ethtool_get_phy_stats(struct net_device *dev, void __user *useraddr)
++ {
++ 	struct ethtool_stats stats;
++ 	struct phy_device *phydev = dev->phydev;
++ 	u64 *data;
++ 	int ret, n_stats;
++ 
++ 	if (!phydev)
++ 		return -EOPNOTSUPP;
++ 
++ 	n_stats = phy_get_sset_count(phydev);
++ 	if (n_stats < 0)
++ 		return n_stats;
++ 	if (n_stats > S32_MAX / sizeof(u64))
++ 		return -ENOMEM;
++ 	WARN_ON_ONCE(!n_stats);
++ 
++ 	if (copy_from_user(&stats, useraddr, sizeof(stats)))
++ 		return -EFAULT;
++ 
++ 	stats.n_stats = n_stats;
++ 	data = vzalloc(n_stats * sizeof(u64));
++ 	if (n_stats && !data)
++ 		return -ENOMEM;
++ 
++ 	mutex_lock(&phydev->lock);
++ 	phydev->drv->get_stats(phydev, &stats, data);
++ 	mutex_unlock(&phydev->lock);
++ 
++ 	ret = -EFAULT;
++ 	if (copy_to_user(useraddr, &stats, sizeof(stats)))
++ 		goto out;
++ 	useraddr += sizeof(stats);
++ 	if (n_stats && copy_to_user(useraddr, data, n_stats * sizeof(u64)))
++ 		goto out;
++ 	ret = 0;
++ 
++  out:
++ 	vfree(data);
+  	return ret;
+  }
+  
+++>>>>>>> 4d1ceea8516c (net: ethtool: convert large order kmalloc allocations to vzalloc)
+  static int ethtool_get_perm_addr(struct net_device *dev, void __user *useraddr)
+  {
+  	struct ethtool_perm_addr epaddr;
+* Unmerged path net/core/ethtool.c
