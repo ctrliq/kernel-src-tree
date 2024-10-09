@@ -5653,6 +5653,7 @@ remove_symlinks:
 		netdev_adjacent_sysfs_del(dev, adj_dev->name, dev_list);
 free_adj:
 	kfree(adj);
+	dev_put(adj_dev);
 
 	return ret;
 }
