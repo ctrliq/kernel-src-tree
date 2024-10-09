@@ -1,0 +1,112 @@
+sched: move err set right before goto errout in tc_ctl_tfilter
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit 6bb16e7ae26095892e8c51de4142d8f344793340
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/6bb16e7a.failed
+
+This makes the reader to know right away what is the error value.
+
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6bb16e7ae26095892e8c51de4142d8f344793340)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/cls_api.c
+diff --cc net/sched/cls_api.c
+index 610890f8531c,f44378c4859f..000000000000
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@@ -249,68 -324,31 +252,77 @@@ replay
+  	if (tp == NULL) {
+  		/* Proto-tcf does not exist, create new one */
+  
+- 		if (tca[TCA_KIND] == NULL || !protocol)
++ 		if (tca[TCA_KIND] == NULL || !protocol) {
++ 			err = -EINVAL;
+  			goto errout;
++ 		}
+  
+- 		err = -ENOENT;
+  		if (n->nlmsg_type != RTM_NEWTFILTER ||
+- 		    !(n->nlmsg_flags & NLM_F_CREATE))
++ 		    !(n->nlmsg_flags & NLM_F_CREATE)) {
++ 			err = -ENOENT;
+  			goto errout;
++ 		}
+  
+ -		if (!nprio)
+ -			nprio = TC_H_MAJ(tcf_auto_prio(rtnl_dereference(*back)));
+  
+ -		tp = tcf_proto_create(nla_data(tca[TCA_KIND]),
+ -				      protocol, nprio, parent, q);
+ -		if (IS_ERR(tp)) {
+ -			err = PTR_ERR(tp);
+ +		/* Create new proto tcf */
+ +
+ +		err = -ENOBUFS;
+ +		tp = kzalloc(sizeof(*tp), GFP_KERNEL);
+ +		if (tp == NULL)
+ +			goto errout;
+ +		err = -ENOENT;
+ +		tp_ops = tcf_proto_lookup_ops(tca[TCA_KIND]);
+ +		if (tp_ops == NULL) {
+ +#ifdef CONFIG_MODULES
+ +			struct nlattr *kind = tca[TCA_KIND];
+ +			char name[IFNAMSIZ];
+ +
+ +			if (kind != NULL &&
+ +			    nla_strlcpy(name, kind, IFNAMSIZ) < IFNAMSIZ) {
+ +				rtnl_unlock();
+ +				request_module("cls_%s", name);
+ +				rtnl_lock();
+ +				tp_ops = tcf_proto_lookup_ops(kind);
+ +				/* We dropped the RTNL semaphore in order to
+ +				 * perform the module load.  So, even if we
+ +				 * succeeded in loading the module we have to
+ +				 * replay the request.  We indicate this using
+ +				 * -EAGAIN.
+ +				 */
+ +				if (tp_ops != NULL) {
+ +					module_put(tp_ops->owner);
+ +					err = -EAGAIN;
+ +				}
+ +			}
+ +#endif
+ +			kfree(tp);
+  			goto errout;
+  		}
+ +		tp->ops = tp_ops;
+ +		tp->protocol = protocol;
+ +		tp->prio = nprio ? :
+ +			       TC_H_MAJ(tcf_auto_prio(rtnl_dereference(*back)));
+ +		tp->q = q;
+ +		tp->classify = tp_ops->classify;
+ +		tp->classid = parent;
+ +
+ +		err = tp_ops->init(tp);
+ +		if (err != 0) {
+ +			module_put(tp_ops->owner);
+ +			kfree(tp);
+ +			goto errout;
+ +		}
+ +
+  		tp_created = 1;
+++<<<<<<< HEAD
+ +
+ +	} else if (tca[TCA_KIND] && nla_strcmp(tca[TCA_KIND], tp->ops->kind))
+++=======
++ 	} else if (tca[TCA_KIND] && nla_strcmp(tca[TCA_KIND], tp->ops->kind)) {
++ 		err = -EINVAL;
+++>>>>>>> 6bb16e7ae260 (sched: move err set right before goto errout in tc_ctl_tfilter)
+  		goto errout;
++ 	}
+  
+  	fh = tp->ops->get(tp, t->tcm_handle);
+  
+* Unmerged path net/sched/cls_api.c
