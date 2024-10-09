@@ -1,0 +1,82 @@
+ipvs: call rtnl_lock early
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Julian Anastasov <ja@ssi.bg>
+commit e0b26cc997d57305b4097711e12e13992580ae34
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/e0b26cc9.failed
+
+When the sync damon is started we need to hold rtnl
+lock while calling ip_mc_join_group. Currently, we have
+a wrong locking order because the correct one is
+rtnl_lock->__ip_vs_mutex. It is implied from the usage
+of __ip_vs_mutex in ip_vs_dst_event() which is called
+under rtnl lock during NETDEV_* notifications.
+
+Fix the problem by calling rtnl_lock early only for the
+start_sync_thread call. As a bonus this fixes the usage
+__dev_get_by_name which was not called under rtnl lock.
+
+This patch actually extends and depends on commit 54ff9ef36bdf
+("ipv4, ipv6: kill ip_mc_{join, leave}_group and
+ipv6_sock_mc_{join, drop}").
+
+	Signed-off-by: Julian Anastasov <ja@ssi.bg>
+	Signed-off-by: Simon Horman <horms@verge.net.au>
+(cherry picked from commit e0b26cc997d57305b4097711e12e13992580ae34)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/ipvs/ip_vs_ctl.c
+diff --cc net/netfilter/ipvs/ip_vs_ctl.c
+index 4aed1d77d557,af0b69e411b7..000000000000
+--- a/net/netfilter/ipvs/ip_vs_ctl.c
++++ b/net/netfilter/ipvs/ip_vs_ctl.c
+@@@ -3365,10 -3355,21 +3373,28 @@@ static int ip_vs_genl_new_daemon(struc
+  	      attrs[IPVS_DAEMON_ATTR_SYNC_ID]))
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	return start_sync_thread(net,
+ +				 nla_get_u32(attrs[IPVS_DAEMON_ATTR_STATE]),
+ +				 nla_data(attrs[IPVS_DAEMON_ATTR_MCAST_IFN]),
+ +				 nla_get_u32(attrs[IPVS_DAEMON_ATTR_SYNC_ID]));
+++=======
++ 	/* The synchronization protocol is incompatible with mixed family
++ 	 * services
++ 	 */
++ 	if (net_ipvs(net)->mixed_address_family_dests > 0)
++ 		return -EINVAL;
++ 
++ 	rtnl_lock();
++ 	mutex_lock(&ipvs->sync_mutex);
++ 	ret = start_sync_thread(net,
++ 				nla_get_u32(attrs[IPVS_DAEMON_ATTR_STATE]),
++ 				nla_data(attrs[IPVS_DAEMON_ATTR_MCAST_IFN]),
++ 				nla_get_u32(attrs[IPVS_DAEMON_ATTR_SYNC_ID]));
++ 	mutex_unlock(&ipvs->sync_mutex);
++ 	rtnl_unlock();
++ 	return ret;
+++>>>>>>> e0b26cc997d5 (ipvs: call rtnl_lock early)
+  }
+  
+  static int ip_vs_genl_del_daemon(struct net *net, struct nlattr **attrs)
+* Unmerged path net/netfilter/ipvs/ip_vs_ctl.c
+diff --git a/net/netfilter/ipvs/ip_vs_sync.c b/net/netfilter/ipvs/ip_vs_sync.c
+index ab0e9562476c..7016baabbde2 100644
+--- a/net/netfilter/ipvs/ip_vs_sync.c
++++ b/net/netfilter/ipvs/ip_vs_sync.c
+@@ -1383,11 +1383,9 @@ join_mcast_group(struct sock *sk, struct in_addr *addr, char *ifname)
+ 
+ 	mreq.imr_ifindex = dev->ifindex;
+ 
+-	rtnl_lock();
+ 	lock_sock(sk);
+ 	ret = ip_mc_join_group(sk, &mreq);
+ 	release_sock(sk);
+-	rtnl_unlock();
+ 
+ 	return ret;
+ }
