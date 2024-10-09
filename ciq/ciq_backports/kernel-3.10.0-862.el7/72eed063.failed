@@ -1,0 +1,179 @@
+crypto: qat - avoid an uninitialized variable warning
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [crypto] qat - avoid an uninitialized variable warning (Neil Horman) [1475478]
+Rebuild_FUZZ: 91.84%
+commit-author Arnd Bergmann <arnd@arndb.de>
+commit 72eed063767e131831fa10a0909c39a0254836ec
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/72eed063.failed
+
+After commit 9e442aa6a753 ("x86: remove DMA_ERROR_CODE"), the inlining
+decisions in the qat driver changed slightly, introducing a new false-positive
+warning:
+
+drivers/crypto/qat/qat_common/qat_algs.c: In function 'qat_alg_sgl_to_bufl.isra.6':
+include/linux/dma-mapping.h:228:2: error: 'sz_out' may be used uninitialized in this function [-Werror=maybe-uninitialized]
+drivers/crypto/qat/qat_common/qat_algs.c:676:9: note: 'sz_out' was declared here
+
+The patch that introduced this is correct, so let's just avoid the
+warning in this driver by rearranging the unwinding after an error
+to make it more obvious to the compiler what is going on.
+
+The problem here is the 'if (unlikely(dma_mapping_error(dev, blp)))'
+check, in which the 'unlikely' causes gcc to forget what it knew about
+the state of the variables. Cleaning up the dma state in the reverse
+order it was created means we can simplify the logic so it doesn't have
+to know about that state, and also makes it easier to understand.
+
+	Cc: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 72eed063767e131831fa10a0909c39a0254836ec)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/crypto/qat/qat_common/qat_algs.c
+diff --cc drivers/crypto/qat/qat_common/qat_algs.c
+index 2cc1c329225b,1a1d75fb189f..000000000000
+--- a/drivers/crypto/qat/qat_common/qat_algs.c
++++ b/drivers/crypto/qat/qat_common/qat_algs.c
+@@@ -704,44 -685,10 +704,44 @@@ static int qat_alg_sgl_to_bufl(struct q
+  
+  	blp = dma_map_single(dev, bufl, sz, DMA_TO_DEVICE);
+  	if (unlikely(dma_mapping_error(dev, blp)))
+- 		goto err;
++ 		goto err_in;
+  
+ +	for_each_sg(assoc, sg, assoc_n, i) {
+ +		if (!sg->length)
+ +			continue;
+ +
+ +		if (!(assoclen > 0))
+ +			break;
+ +
+ +		bufl->bufers[bufs].addr =
+ +			dma_map_single(dev, sg_virt(sg),
+ +				       min_t(int, assoclen, sg->length),
+ +				       DMA_BIDIRECTIONAL);
+ +		bufl->bufers[bufs].len = min_t(int, assoclen, sg->length);
+ +		if (unlikely(dma_mapping_error(dev, bufl->bufers[bufs].addr)))
+ +			goto err;
+ +		bufs++;
+ +		assoclen -= sg->length;
+ +	}
+ +
+ +	if (ivlen) {
+ +		civ = kmalloc_node(ivlen, GFP_ATOMIC,
+ +				  dev_to_node(&GET_DEV(inst->accel_dev)));
+ +		if (!civ)
+ +			goto err;
+ +		memcpy(civ, iv, ivlen);
+ +
+ +		bufl->bufers[bufs].addr = dma_map_single(dev, civ, ivlen,
+ +							 DMA_BIDIRECTIONAL);
+ +		bufl->bufers[bufs].len = ivlen;
+ +		if (unlikely(dma_mapping_error(dev, bufl->bufers[bufs].addr)))
+ +			goto err;
+ +		bufs++;
+ +		qat_req->buf.copyback = 1;
+ +	}
+ +
+  	for_each_sg(sgl, sg, n, i) {
+ -		int y = sg_nctr;
+ +		int y = sg_nctr + bufs;
+  
+  		if (!sg->length)
+  			continue;
+@@@ -751,10 -698,10 +751,10 @@@
+  						      DMA_BIDIRECTIONAL);
+  		bufl->bufers[y].len = sg->length;
+  		if (unlikely(dma_mapping_error(dev, bufl->bufers[y].addr)))
+- 			goto err;
++ 			goto err_in;
+  		sg_nctr++;
+  	}
+ -	bufl->num_bufs = sg_nctr;
+ +	bufl->num_bufs = sg_nctr + bufs;
+  	qat_req->buf.bl = bufl;
+  	qat_req->buf.blp = blp;
+  	qat_req->buf.sz = sz;
+@@@ -772,19 -716,13 +772,19 @@@
+  		buflout = kzalloc_node(sz_out, GFP_ATOMIC,
+  				       dev_to_node(&GET_DEV(inst->accel_dev)));
+  		if (unlikely(!buflout))
+- 			goto err;
++ 			goto err_in;
+  		bloutp = dma_map_single(dev, buflout, sz_out, DMA_TO_DEVICE);
+  		if (unlikely(dma_mapping_error(dev, bloutp)))
+- 			goto err;
++ 			goto err_out;
+  		bufers = buflout->bufers;
+ +		/* For out of place operation dma map only data and
+ +		 * reuse assoc mapping and iv */
+ +		for (i = 0; i < bufs; i++) {
+ +			bufers[i].len = bufl->bufers[i].len;
+ +			bufers[i].addr = bufl->bufers[i].addr;
+ +		}
+  		for_each_sg(sglout, sg, n, i) {
+ -			int y = sg_nctr;
+ +			int y = sg_nctr + bufs;
+  
+  			if (!sg->length)
+  				continue;
+@@@ -808,11 -746,21 +808,29 @@@
+  		qat_req->buf.sz_out = 0;
+  	}
+  	return 0;
+++<<<<<<< HEAD
+ +err:
+ +	dev_err(dev, "Failed to map buf for dma\n");
+ +	kfree(civ);
+ +	sg_nctr = 0;
+ +	for (i = 0; i < n + bufs; i++)
+++=======
++ 
++ err_out:
++ 	n = sg_nents(sglout);
++ 	for (i = 0; i < n; i++)
++ 		if (!dma_mapping_error(dev, buflout->bufers[i].addr))
++ 			dma_unmap_single(dev, buflout->bufers[i].addr,
++ 					 buflout->bufers[i].len,
++ 					 DMA_BIDIRECTIONAL);
++ 	if (!dma_mapping_error(dev, bloutp))
++ 		dma_unmap_single(dev, bloutp, sz_out, DMA_TO_DEVICE);
++ 	kfree(buflout);
++ 
++ err_in:
++ 	n = sg_nents(sgl);
++ 	for (i = 0; i < n; i++)
+++>>>>>>> 72eed063767e (crypto: qat - avoid an uninitialized variable warning)
+  		if (!dma_mapping_error(dev, bufl->bufers[i].addr))
+  			dma_unmap_single(dev, bufl->bufers[i].addr,
+  					 bufl->bufers[i].len,
+@@@ -821,17 -769,8 +839,22 @@@
+  	if (!dma_mapping_error(dev, blp))
+  		dma_unmap_single(dev, blp, sz, DMA_TO_DEVICE);
+  	kfree(bufl);
+++<<<<<<< HEAD
+ +	if (sgl != sglout && buflout) {
+ +		n = sg_nents(sglout);
+ +		for (i = bufs; i < n + bufs; i++)
+ +			if (!dma_mapping_error(dev, buflout->bufers[i].addr))
+ +				dma_unmap_single(dev, buflout->bufers[i].addr,
+ +						 buflout->bufers[i].len,
+ +						 DMA_BIDIRECTIONAL);
+ +		if (!dma_mapping_error(dev, bloutp))
+ +			dma_unmap_single(dev, bloutp, sz_out, DMA_TO_DEVICE);
+ +		kfree(buflout);
+ +	}
+++=======
++ 
++ 	dev_err(dev, "Failed to map buf for dma\n");
+++>>>>>>> 72eed063767e (crypto: qat - avoid an uninitialized variable warning)
+  	return -ENOMEM;
+  }
+  
+* Unmerged path drivers/crypto/qat/qat_common/qat_algs.c
