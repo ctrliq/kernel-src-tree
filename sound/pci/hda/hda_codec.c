@@ -2158,6 +2158,8 @@ static int snd_hda_spdif_default_get(struct snd_kcontrol *kcontrol,
 	int idx = kcontrol->private_value;
 	struct hda_spdif_out *spdif;
 
+	if (WARN_ON(codec->spdif_out.used <= idx))
+		return -EINVAL;
 	mutex_lock(&codec->spdif_mutex);
 	spdif = snd_array_elem(&codec->spdif_out, idx);
 	ucontrol->value.iec958.status[0] = spdif->status & 0xff;
@@ -2265,6 +2267,8 @@ static int snd_hda_spdif_default_put(struct snd_kcontrol *kcontrol,
 	unsigned short val;
 	int change;
 
+	if (WARN_ON(codec->spdif_out.used <= idx))
+		return -EINVAL;
 	mutex_lock(&codec->spdif_mutex);
 	spdif = snd_array_elem(&codec->spdif_out, idx);
 	nid = spdif->nid;
@@ -2291,6 +2295,8 @@ static int snd_hda_spdif_out_switch_get(struct snd_kcontrol *kcontrol,
 	int idx = kcontrol->private_value;
 	struct hda_spdif_out *spdif;
 
+	if (WARN_ON(codec->spdif_out.used <= idx))
+		return -EINVAL;
 	mutex_lock(&codec->spdif_mutex);
 	spdif = snd_array_elem(&codec->spdif_out, idx);
 	ucontrol->value.integer.value[0] = spdif->ctls & AC_DIG1_ENABLE;
@@ -2319,6 +2325,8 @@ static int snd_hda_spdif_out_switch_put(struct snd_kcontrol *kcontrol,
 	unsigned short val;
 	int change;
 
+	if (WARN_ON(codec->spdif_out.used <= idx))
+		return -EINVAL;
 	mutex_lock(&codec->spdif_mutex);
 	spdif = snd_array_elem(&codec->spdif_out, idx);
 	nid = spdif->nid;
@@ -2466,6 +2474,8 @@ void snd_hda_spdif_ctls_unassign(struct hda_codec *codec, int idx)
 {
 	struct hda_spdif_out *spdif;
 
+	if (WARN_ON(codec->spdif_out.used <= idx))
+		return;
 	mutex_lock(&codec->spdif_mutex);
 	spdif = snd_array_elem(&codec->spdif_out, idx);
 	spdif->nid = (u16)-1;
@@ -2486,6 +2496,8 @@ void snd_hda_spdif_ctls_assign(struct hda_codec *codec, int idx, hda_nid_t nid)
 	struct hda_spdif_out *spdif;
 	unsigned short val;
 
+	if (WARN_ON(codec->spdif_out.used <= idx))
+		return;
 	mutex_lock(&codec->spdif_mutex);
 	spdif = snd_array_elem(&codec->spdif_out, idx);
 	if (spdif->nid != nid) {
