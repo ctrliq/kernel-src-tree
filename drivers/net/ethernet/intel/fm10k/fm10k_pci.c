@@ -164,9 +164,17 @@ static void fm10k_reinit(struct fm10k_intfc *interface)
 	interface->last_reset = jiffies + (10 * HZ);
 
 	/* reset and initialize the hardware so it is in a known state */
-	err = hw->mac.ops.reset_hw(hw) ? : hw->mac.ops.init_hw(hw);
-	if (err)
+	err = hw->mac.ops.reset_hw(hw);
+	if (err) {
+		dev_err(&interface->pdev->dev, "reset_hw failed: %d\n", err);
+		goto reinit_err;
+	}
+
+	err = hw->mac.ops.init_hw(hw);
+	if (err) {
 		dev_err(&interface->pdev->dev, "init_hw failed: %d\n", err);
+		goto reinit_err;
+	}
 
 	/* reassociate interrupts */
 	fm10k_mbx_request_irq(interface);
@@ -193,6 +201,10 @@ static void fm10k_reinit(struct fm10k_intfc *interface)
 		fm10k_open(netdev);
 
 	fm10k_iov_resume(interface->pdev);
+
+reinit_err:
+	if (err)
+		netif_device_detach(netdev);
 
 	rtnl_unlock();
 
@@ -1689,7 +1701,13 @@ static int fm10k_sw_init(struct fm10k_intfc *interface,
 	interface->last_reset = jiffies + (10 * HZ);
 
 	/* reset and initialize the hardware so it is in a known state */
-	err = hw->mac.ops.reset_hw(hw) ? : hw->mac.ops.init_hw(hw);
+	err = hw->mac.ops.reset_hw(hw);
+	if (err) {
+		dev_err(&pdev->dev, "reset_hw failed: %d\n", err);
+		return err;
+	}
+
+	err = hw->mac.ops.init_hw(hw);
 	if (err) {
 		dev_err(&pdev->dev, "init_hw failed: %d\n", err);
 		return err;
@@ -2076,8 +2094,10 @@ static int fm10k_resume(struct pci_dev *pdev)
 
 	/* reset hardware to known state */
 	err = hw->mac.ops.init_hw(&interface->hw);
-	if (err)
+	if (err) {
+		dev_err(&pdev->dev, "init_hw failed: %d\n", err);
 		return err;
+	}
 
 	/* reset statistics starting values */
 	hw->mac.ops.rebind_hw_stats(hw, &interface->stats);
@@ -2253,7 +2273,11 @@ static void fm10k_io_resume(struct pci_dev *pdev)
 	int err = 0;
 
 	/* reset hardware to known state */
-	hw->mac.ops.init_hw(&interface->hw);
+	err = hw->mac.ops.init_hw(&interface->hw);
+	if (err) {
+		dev_err(&pdev->dev, "init_hw failed: %d\n", err);
+		return;
+	}
 
 	/* reset statistics starting values */
 	hw->mac.ops.rebind_hw_stats(hw, &interface->stats);
