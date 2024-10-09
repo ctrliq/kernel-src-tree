@@ -1,0 +1,96 @@
+KVM: vmx: fix underflow in TSC deadline calculation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 9175d2e97b08e86293e68246020a5c29f88aa674
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/9175d2e9.failed
+
+If the TSC deadline timer is programmed really close to the deadline or
+even in the past, the computation in vmx_set_hv_timer can underflow and
+cause delta_tsc to be set to a huge value.  This generally results
+in vmx_set_hv_timer returning -ERANGE, but we can fix it by limiting
+delta_tsc to be positive or zero.
+
+	Reported-by: Wanpeng Li <wanpeng.li@hotmail.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 9175d2e97b08e86293e68246020a5c29f88aa674)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index 04ec8bdd2903,85e2f0a882ca..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -10617,6 -10807,64 +10617,67 @@@ static int vmx_check_intercept(struct k
+  	return X86EMUL_CONTINUE;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_X86_64
++ /* (a << shift) / divisor, return 1 if overflow otherwise 0 */
++ static inline int u64_shl_div_u64(u64 a, unsigned int shift,
++ 				  u64 divisor, u64 *result)
++ {
++ 	u64 low = a << shift, high = a >> (64 - shift);
++ 
++ 	/* To avoid the overflow on divq */
++ 	if (high >= divisor)
++ 		return 1;
++ 
++ 	/* Low hold the result, high hold rem which is discarded */
++ 	asm("divq %2\n\t" : "=a" (low), "=d" (high) :
++ 	    "rm" (divisor), "0" (low), "1" (high));
++ 	*result = low;
++ 
++ 	return 0;
++ }
++ 
++ static int vmx_set_hv_timer(struct kvm_vcpu *vcpu, u64 guest_deadline_tsc)
++ {
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 	u64 tscl = rdtsc();
++ 	u64 guest_tscl = kvm_read_l1_tsc(vcpu, tscl);
++ 	u64 delta_tsc = max(guest_deadline_tsc, guest_tscl) - guest_tscl;
++ 
++ 	/* Convert to host delta tsc if tsc scaling is enabled */
++ 	if (vcpu->arch.tsc_scaling_ratio != kvm_default_tsc_scaling_ratio &&
++ 			u64_shl_div_u64(delta_tsc,
++ 				kvm_tsc_scaling_ratio_frac_bits,
++ 				vcpu->arch.tsc_scaling_ratio,
++ 				&delta_tsc))
++ 		return -ERANGE;
++ 
++ 	/*
++ 	 * If the delta tsc can't fit in the 32 bit after the multi shift,
++ 	 * we can't use the preemption timer.
++ 	 * It's possible that it fits on later vmentries, but checking
++ 	 * on every vmentry is costly so we just use an hrtimer.
++ 	 */
++ 	if (delta_tsc >> (cpu_preemption_timer_multi + 32))
++ 		return -ERANGE;
++ 
++ 	vmx->hv_deadline_tsc = tscl + delta_tsc;
++ 	vmcs_set_bits(PIN_BASED_VM_EXEC_CONTROL,
++ 			PIN_BASED_VMX_PREEMPTION_TIMER);
++ 	return 0;
++ }
++ 
++ static void vmx_cancel_hv_timer(struct kvm_vcpu *vcpu)
++ {
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 	vmx->hv_deadline_tsc = -1;
++ 	vmcs_clear_bits(PIN_BASED_VM_EXEC_CONTROL,
++ 			PIN_BASED_VMX_PREEMPTION_TIMER);
++ }
++ #endif
++ 
+++>>>>>>> 9175d2e97b08 (KVM: vmx: fix underflow in TSC deadline calculation)
+  static void vmx_sched_in(struct kvm_vcpu *vcpu, int cpu)
+  {
+  	if (ple_gap)
+* Unmerged path arch/x86/kvm/vmx.c
