@@ -1,0 +1,367 @@
+mm: replace __get_cpu_var uses with this_cpu_ptr
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Christoph Lameter <cl@linux.com>
+commit 7c8e0181e6e0b8079c4c2ce902bf52d7a2c6fa5d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/7c8e0181.failed
+
+Replace places where __get_cpu_var() is used for an address calculation
+with this_cpu_ptr().
+
+	Signed-off-by: Christoph Lameter <cl@linux.com>
+	Cc: Tejun Heo <tj@kernel.org>
+	Cc: Hugh Dickins <hughd@google.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 7c8e0181e6e0b8079c4c2ce902bf52d7a2c6fa5d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/swap.c
+#	mm/vmalloc.c
+#	mm/vmstat.c
+diff --cc mm/swap.c
+index 499f47fcf68a,913b99dfbea5..000000000000
+--- a/mm/swap.c
++++ b/mm/swap.c
+@@@ -485,8 -441,8 +485,13 @@@ void rotate_reclaimable_page(struct pag
+  
+  		page_cache_get(page);
+  		local_irq_save(flags);
+++<<<<<<< HEAD
+ +		pvec = &__get_cpu_var(lru_rotate_pvecs);
+ +		if (!pagevec_add(pvec, page) || PageCompound(page))
+++=======
++ 		pvec = this_cpu_ptr(&lru_rotate_pvecs);
++ 		if (!pagevec_add(pvec, page))
+++>>>>>>> 7c8e0181e6e0 (mm: replace __get_cpu_var uses with this_cpu_ptr)
+  			pagevec_move_tail(pvec);
+  		local_irq_restore(flags);
+  	}
+diff --cc mm/vmalloc.c
+index 7451febbaf6d,ddaf70b21b59..000000000000
+--- a/mm/vmalloc.c
++++ b/mm/vmalloc.c
+@@@ -1539,9 -1496,9 +1539,15 @@@ void vfree(const void *addr
+  	if (!addr)
+  		return;
+  	if (unlikely(in_interrupt())) {
+++<<<<<<< HEAD
+ +		struct vfree_deferred *p = &__get_cpu_var(vfree_deferred);
+ +		llist_add((struct llist_node *)addr, &p->list);
+ +		schedule_work(&p->wq);
+++=======
++ 		struct vfree_deferred *p = this_cpu_ptr(&vfree_deferred);
++ 		if (llist_add((struct llist_node *)addr, &p->list))
++ 			schedule_work(&p->wq);
+++>>>>>>> 7c8e0181e6e0 (mm: replace __get_cpu_var uses with this_cpu_ptr)
+  	} else
+  		__vunmap(addr, 1);
+  }
+diff --cc mm/vmstat.c
+index 808f2a0f79d5,376bd2d21482..000000000000
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@@ -474,40 -463,36 +474,50 @@@ static int refresh_cpu_vm_stats(bool do
+  #endif
+  			}
+  		}
+ -		cond_resched();
+  #ifdef CONFIG_NUMA
+ -		/*
+ -		 * Deal with draining the remote pageset of this
+ -		 * processor
+ -		 *
+ -		 * Check if there are pages remaining in this pageset
+ -		 * if not then there is nothing to expire.
+ -		 */
+ -		if (!__this_cpu_read(p->expire) ||
+ +		if (do_pagesets) {
+ +			cond_resched();
+ +			/*
+ +			 * Deal with draining the remote pageset of this
+ +			 * processor
+ +			 *
+ +			 * Check if there are pages remaining in this pageset
+ +			 * if not then there is nothing to expire.
+ +			 */
+ +			if (!__this_cpu_read(p->expire) ||
+  			       !__this_cpu_read(p->pcp.count))
+ -			continue;
+ +				continue;
+ +
+ +			/*
+ +			 * We never drain zones local to this processor.
+ +			 */
+ +			if (zone_to_nid(zone) == numa_node_id()) {
+ +				__this_cpu_write(p->expire, 0);
+ +				continue;
+ +			}
+  
+ -		/*
+ -		 * We never drain zones local to this processor.
+ -		 */
+ -		if (zone_to_nid(zone) == numa_node_id()) {
+ -			__this_cpu_write(p->expire, 0);
+ -			continue;
+ +			if (__this_cpu_dec_return(p->expire))
+ +				continue;
+ +
+ +			if (__this_cpu_read(p->pcp.count)) {
+ +				drain_zone_pages(zone, __this_cpu_ptr(&p->pcp));
+ +				changes++;
+ +			}
+  		}
+++<<<<<<< HEAD
+++=======
++ 
++ 
++ 		if (__this_cpu_dec_return(p->expire))
++ 			continue;
++ 
++ 		if (__this_cpu_read(p->pcp.count))
++ 			drain_zone_pages(zone, this_cpu_ptr(&p->pcp));
+++>>>>>>> 7c8e0181e6e0 (mm: replace __get_cpu_var uses with this_cpu_ptr)
+  #endif
+  	}
+ -	fold_diff(global_diff);
+ +	changes += fold_diff(global_diff);
+ +	return changes;
+  }
+  
+  /*
+@@@ -1242,95 -1229,20 +1252,101 @@@ static cpumask_var_t cpu_stat_off
+  
+  static void vmstat_update(struct work_struct *w)
+  {
+++<<<<<<< HEAD
+ +	if (refresh_cpu_vm_stats(true)) {
+ +		/*
+ +		 * Counters were updated so we expect more updates
+ +		 * to occur in the future. Keep on running the
+ +		 * update worker thread.
+ +		 * If we were marked on cpu_stat_off clear the flag
+ +		 * so that vmstat_shepherd doesn't schedule us again.
+ +		 */
+ +		if (!cpumask_test_and_clear_cpu(smp_processor_id(),
+ +						cpu_stat_off)) {
+ +			schedule_delayed_work(&__get_cpu_var(vmstat_work),
+ +				round_jiffies_relative(sysctl_stat_interval));
+ +		}
+ +	} else {
+ +		/*
+ +		 * We did not update any counters so the app may be in
+ +		 * a mode where it does not cause counter updates.
+ +		 * We may be uselessly running vmstat_update.
+ +		 * Defer the checking for differentials to the
+ +		 * shepherd thread on a different processor.
+ +		 */
+ +		cpumask_set_cpu(smp_processor_id(), cpu_stat_off);
+ +	}
+++=======
++ 	refresh_cpu_vm_stats();
++ 	schedule_delayed_work(this_cpu_ptr(&vmstat_work),
++ 		round_jiffies_relative(sysctl_stat_interval));
+++>>>>>>> 7c8e0181e6e0 (mm: replace __get_cpu_var uses with this_cpu_ptr)
+ +}
+ +
+ +/*
+ + * Switch off vmstat processing and then fold all the remaining differentials
+ + * until the diffs stay at zero. The function is used by NOHZ and can only be
+ + * invoked when tick processing is not active.
+ + */
+ +/*
+ + * Check if the diffs for a certain cpu indicate that
+ + * an update is needed.
+ + */
+ +static bool need_update(int cpu)
+ +{
+ +	struct zone *zone;
+ +
+ +	for_each_populated_zone(zone) {
+ +		struct per_cpu_pageset *p = per_cpu_ptr(zone->pageset, cpu);
+ +
+ +		BUILD_BUG_ON(sizeof(p->vm_stat_diff[0]) != 1);
+ +		/*
+ +		 * The fast way of checking if there are any vmstat diffs.
+ +		 * This works because the diffs are byte sized items.
+ +		 */
+ +		if (memchr_inv(p->vm_stat_diff, 0, NR_VM_ZONE_STAT_ITEMS))
+ +			return true;
+ +
+ +	}
+ +	return false;
+  }
+  
+ -static void start_cpu_timer(int cpu)
+ +void quiet_vmstat(void)
+  {
+ -	struct delayed_work *work = &per_cpu(vmstat_work, cpu);
+ +	if (system_state != SYSTEM_RUNNING)
+ +		return;
+ +
+ +	/*
+ +	 * If we are already in hands of the shepherd then there
+ +	 * is nothing for us to do here.
+ +	 */
+ +	if (cpumask_test_and_set_cpu(smp_processor_id(), cpu_stat_off))
+ +		return;
+  
+ -	INIT_DEFERRABLE_WORK(work, vmstat_update);
+ -	schedule_delayed_work_on(cpu, work, __round_jiffies_relative(HZ, cpu));
+ +	if (!need_update(smp_processor_id()))
+ +		return;
+ +
+ +	/*
+ +	 * Just refresh counters and do not care about the pending delayed
+ +	 * vmstat_update. It doesn't fire that often to matter and canceling
+ +	 * it would be too expensive from this path.
+ +	 * vmstat_shepherd will take care about that for us.
+ +	 */
+ +	refresh_cpu_vm_stats(false);
+  }
+  
+ -static void vmstat_cpu_dead(int node)
+ +
+ +/*
+ + * Shepherd worker thread that checks the
+ + * differentials of processors that have their worker
+ + * threads for vm statistics updates disabled because of
+ + * inactivity.
+ + */
+ +static void vmstat_shepherd(struct work_struct *w);
+ +
+ +static DECLARE_DEFERRABLE_WORK(shepherd, vmstat_shepherd);
+ +
+ +static void vmstat_shepherd(struct work_struct *w)
+  {
+  	int cpu;
+  
+diff --git a/lib/radix-tree.c b/lib/radix-tree.c
+index c70755d6a346..a2642fe0cf3f 100644
+--- a/lib/radix-tree.c
++++ b/lib/radix-tree.c
+@@ -194,7 +194,7 @@ radix_tree_node_alloc(struct radix_tree_root *root)
+ 		 * succeed in getting a node here (and never reach
+ 		 * kmem_cache_alloc)
+ 		 */
+-		rtp = &__get_cpu_var(radix_tree_preloads);
++		rtp = this_cpu_ptr(&radix_tree_preloads);
+ 		if (rtp->nr) {
+ 			ret = rtp->nodes[rtp->nr - 1];
+ 			rtp->nodes[rtp->nr - 1] = NULL;
+@@ -250,14 +250,14 @@ static int __radix_tree_preload(gfp_t gfp_mask)
+ 	int ret = -ENOMEM;
+ 
+ 	preempt_disable();
+-	rtp = &__get_cpu_var(radix_tree_preloads);
++	rtp = this_cpu_ptr(&radix_tree_preloads);
+ 	while (rtp->nr < ARRAY_SIZE(rtp->nodes)) {
+ 		preempt_enable();
+ 		node = kmem_cache_alloc(radix_tree_node_cachep, gfp_mask);
+ 		if (node == NULL)
+ 			goto out;
+ 		preempt_disable();
+-		rtp = &__get_cpu_var(radix_tree_preloads);
++		rtp = this_cpu_ptr(&radix_tree_preloads);
+ 		if (rtp->nr < ARRAY_SIZE(rtp->nodes))
+ 			rtp->nodes[rtp->nr++] = node;
+ 		else
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 23e6528af2de..de14d13db8b7 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -2448,7 +2448,7 @@ static void drain_stock(struct memcg_stock_pcp *stock)
+  */
+ static void drain_local_stock(struct work_struct *dummy)
+ {
+-	struct memcg_stock_pcp *stock = &__get_cpu_var(memcg_stock);
++	struct memcg_stock_pcp *stock = this_cpu_ptr(&memcg_stock);
+ 	drain_stock(stock);
+ 	clear_bit(FLUSHING_CACHED_CHARGE, &stock->flags);
+ }
+diff --git a/mm/memory-failure.c b/mm/memory-failure.c
+index 531b5124a40d..fe407640a275 100644
+--- a/mm/memory-failure.c
++++ b/mm/memory-failure.c
+@@ -1356,7 +1356,7 @@ static void memory_failure_work_func(struct work_struct *work)
+ 	unsigned long proc_flags;
+ 	int gotten;
+ 
+-	mf_cpu = &__get_cpu_var(memory_failure_cpu);
++	mf_cpu = this_cpu_ptr(&memory_failure_cpu);
+ 	for (;;) {
+ 		spin_lock_irqsave(&mf_cpu->lock, proc_flags);
+ 		gotten = kfifo_get(&mf_cpu->fifo, &entry);
+diff --git a/mm/page-writeback.c b/mm/page-writeback.c
+index e90d9c5e28b9..279bcd068757 100644
+--- a/mm/page-writeback.c
++++ b/mm/page-writeback.c
+@@ -1623,7 +1623,7 @@ void balance_dirty_pages_ratelimited(struct address_space *mapping)
+ 	 * 1000+ tasks, all of them start dirtying pages at exactly the same
+ 	 * time, hence all honoured too large initial task->nr_dirtied_pause.
+ 	 */
+-	p =  &__get_cpu_var(bdp_ratelimits);
++	p =  this_cpu_ptr(&bdp_ratelimits);
+ 	if (unlikely(current->nr_dirtied >= ratelimit))
+ 		*p = 0;
+ 	else if (unlikely(*p >= ratelimit_pages)) {
+@@ -1635,7 +1635,7 @@ void balance_dirty_pages_ratelimited(struct address_space *mapping)
+ 	 * short-lived tasks (eg. gcc invocations in a kernel build) escaping
+ 	 * the dirty throttling and livelock other long-run dirtiers.
+ 	 */
+-	p = &__get_cpu_var(dirty_throttle_leaks);
++	p = this_cpu_ptr(&dirty_throttle_leaks);
+ 	if (*p > 0 && current->nr_dirtied < ratelimit) {
+ 		unsigned long nr_pages_dirtied;
+ 		nr_pages_dirtied = min(*p, ratelimit - current->nr_dirtied);
+diff --git a/mm/slub.c b/mm/slub.c
+index 4e83c8337168..6b571843c62b 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -2194,7 +2194,7 @@ static inline void *new_slab_objects(struct kmem_cache *s, gfp_t flags,
+ 
+ 	page = new_slab(s, flags, node);
+ 	if (page) {
+-		c = __this_cpu_ptr(s->cpu_slab);
++		c = raw_cpu_ptr(s->cpu_slab);
+ 		if (c->page)
+ 			flush_slab(s, c);
+ 
+@@ -2433,7 +2433,7 @@ redo:
+ 	 * and the retrieval of the tid.
+ 	 */
+ 	preempt_disable();
+-	c = __this_cpu_ptr(s->cpu_slab);
++	c = this_cpu_ptr(s->cpu_slab);
+ 
+ 	/*
+ 	 * The transaction ids are globally unique per cpu and per operation on
+@@ -2697,7 +2697,7 @@ redo:
+ 	 * during the cmpxchg then the free will succedd.
+ 	 */
+ 	preempt_disable();
+-	c = __this_cpu_ptr(s->cpu_slab);
++	c = this_cpu_ptr(s->cpu_slab);
+ 
+ 	tid = c->tid;
+ 	preempt_enable();
+* Unmerged path mm/swap.c
+* Unmerged path mm/vmalloc.c
+* Unmerged path mm/vmstat.c
+diff --git a/mm/zsmalloc.c b/mm/zsmalloc.c
+index b919973220e7..c5e3887583cc 100644
+--- a/mm/zsmalloc.c
++++ b/mm/zsmalloc.c
+@@ -1162,7 +1162,7 @@ void zs_unmap_object(struct zs_pool *pool, unsigned long handle)
+ 	class = &pool->size_class[class_idx];
+ 	off = obj_idx_to_offset(page, obj_idx, class->size);
+ 
+-	area = &__get_cpu_var(zs_map_area);
++	area = this_cpu_ptr(&zs_map_area);
+ 	if (off + class->size <= PAGE_SIZE)
+ 		kunmap_atomic(area->vm_addr);
+ 	else {
