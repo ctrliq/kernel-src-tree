@@ -1,0 +1,170 @@
+mm: do not stall register_shrinker()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.24.1.el7
+commit-author Minchan Kim <minchan@kernel.org>
+commit e496612c5130567fc9d5f1969ca4b86665aa3cbb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.24.1.el7/e496612c.failed
+
+Shakeel Butt reported he has observed in production systems that the job
+loader gets stuck for 10s of seconds while doing a mount operation.  It
+turns out that it was stuck in register_shrinker() because some
+unrelated job was under memory pressure and was spending time in
+shrink_slab().  Machines have a lot of shrinkers registered and jobs
+under memory pressure have to traverse all of those memcg-aware
+shrinkers and affect unrelated jobs which want to register their own
+shrinkers.
+
+To solve the issue, this patch simply bails out slab shrinking if it is
+found that someone wants to register a shrinker in parallel.  A downside
+is it could cause unfair shrinking between shrinkers.  However, it
+should be rare and we can add compilcated logic if we find it's not
+enough.
+
+[akpm@linux-foundation.org: tweak code comment]
+Link: http://lkml.kernel.org/r/20171115005602.GB23810@bbox
+Link: http://lkml.kernel.org/r/1511481899-20335-1-git-send-email-minchan@kernel.org
+	Signed-off-by: Minchan Kim <minchan@kernel.org>
+	Signed-off-by: Shakeel Butt <shakeelb@google.com>
+	Reported-by: Shakeel Butt <shakeelb@google.com>
+	Tested-by: Shakeel Butt <shakeelb@google.com>
+	Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Cc: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+	Cc: Anshuman Khandual <khandual@linux.vnet.ibm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit e496612c5130567fc9d5f1969ca4b86665aa3cbb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/vmscan.c
+diff --cc mm/vmscan.c
+index 5f0cc975404e,153e0795f4f0..000000000000
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@@ -289,94 -470,36 +289,107 @@@ unsigned long shrink_slab(struct shrink
+  	}
+  
+  	list_for_each_entry(shrinker, &shrinker_list, list) {
+ -		struct shrink_control sc = {
+ -			.gfp_mask = gfp_mask,
+ -			.nid = nid,
+ -			.memcg = memcg,
+ -		};
+ +		unsigned long long delta;
+ +		long total_scan;
+ +		long max_pass;
+ +		int shrink_ret = 0;
+ +		long nr;
+ +		long new_nr;
+ +		long batch_size = shrinker->batch ? shrinker->batch
+ +						  : SHRINK_BATCH;
+ +
+ +		max_pass = do_shrinker_shrink(shrinker, shrink, 0);
+ +		if (max_pass <= 0)
+ +			continue;
+  
+  		/*
+ -		 * If kernel memory accounting is disabled, we ignore
+ -		 * SHRINKER_MEMCG_AWARE flag and call all shrinkers
+ -		 * passing NULL for memcg.
+ +		 * copy the current shrinker scan count into a local variable
+ +		 * and zero it so that other concurrent shrinker invocations
+ +		 * don't also do this scanning work.
+  		 */
+ -		if (memcg_kmem_enabled() &&
+ -		    !!memcg != !!(shrinker->flags & SHRINKER_MEMCG_AWARE))
+ -			continue;
+ +		nr = atomic_long_xchg(&shrinker->nr_in_batch, 0);
+ +
+++<<<<<<< HEAD
+ +		total_scan = nr;
+ +		delta = (4 * nr_pages_scanned) / shrinker->seeks;
+ +		delta *= max_pass;
+ +		do_div(delta, lru_pages + 1);
+ +		total_scan += delta;
+ +		if (total_scan < 0) {
+ +			printk(KERN_ERR "shrink_slab: %pF negative objects to "
+ +			       "delete nr=%ld\n",
+ +			       shrinker->shrink, total_scan);
+ +			total_scan = max_pass;
+ +		}
+ +
+ +		/*
+ +		 * We need to avoid excessive windup on filesystem shrinkers
+ +		 * due to large numbers of GFP_NOFS allocations causing the
+ +		 * shrinkers to return -1 all the time. This results in a large
+ +		 * nr being built up so when a shrink that can do some work
+ +		 * comes along it empties the entire cache due to nr >>>
+ +		 * max_pass.  This is bad for sustaining a working set in
+ +		 * memory.
+ +		 *
+ +		 * Hence only allow the shrinker to scan the entire cache when
+ +		 * a large delta change is calculated directly.
+ +		 */
+ +		if (delta < max_pass / 4)
+ +			total_scan = min(total_scan, max_pass / 2);
+ +
+ +		/*
+ +		 * Avoid risking looping forever due to too large nr value:
+ +		 * never try to free more than twice the estimate number of
+ +		 * freeable entries.
+ +		 */
+ +		if (total_scan > max_pass * 2)
+ +			total_scan = max_pass * 2;
+ +
+ +		trace_mm_shrink_slab_start(shrinker, shrink, nr,
+ +					nr_pages_scanned, lru_pages,
+ +					max_pass, delta, total_scan);
+ +
+ +		while (total_scan >= batch_size) {
+ +			int nr_before;
+ +
+ +			nr_before = do_shrinker_shrink(shrinker, shrink, 0);
+ +			shrink_ret = do_shrinker_shrink(shrinker, shrink,
+ +							batch_size);
+ +			if (shrink_ret == -1)
+ +				break;
+ +			if (shrink_ret < nr_before)
+ +				ret += nr_before - shrink_ret;
+ +			count_vm_events(SLABS_SCANNED, batch_size);
+ +			total_scan -= batch_size;
+ +
+ +			cond_resched();
+ +		}
+  
+ -		if (!(shrinker->flags & SHRINKER_NUMA_AWARE))
+ -			sc.nid = 0;
+ +		/*
+ +		 * move the unused scan count back into the shrinker in a
+ +		 * manner that handles concurrent updates. If we exhausted the
+ +		 * scan, there is no need to do an update.
+ +		 */
+ +		if (total_scan > 0)
+ +			new_nr = atomic_long_add_return(total_scan,
+ +					&shrinker->nr_in_batch);
+ +		else
+ +			new_nr = atomic_long_read(&shrinker->nr_in_batch);
+  
+ +		trace_mm_shrink_slab_end(shrinker, shrink_ret, nr, new_nr);
+++=======
++ 		freed += do_shrink_slab(&sc, shrinker, priority);
++ 		/*
++ 		 * Bail out if someone want to register a new shrinker to
++ 		 * prevent the regsitration from being stalled for long periods
++ 		 * by parallel ongoing shrinking.
++ 		 */
++ 		if (rwsem_is_contended(&shrinker_rwsem)) {
++ 			freed = freed ? : 1;
++ 			break;
++ 		}
+++>>>>>>> e496612c5130 (mm: do not stall register_shrinker())
+  	}
+ -
+  	up_read(&shrinker_rwsem);
+  out:
+  	cond_resched();
+* Unmerged path mm/vmscan.c
