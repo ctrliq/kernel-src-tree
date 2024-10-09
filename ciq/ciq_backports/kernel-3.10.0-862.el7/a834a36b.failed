@@ -1,0 +1,204 @@
+scsi: cxlflash: Create character device to provide host management interface
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] cxlflash: Create character device to provide host management interface (Gustavo Duarte) [1456494]
+Rebuild_FUZZ: 95.89%
+commit-author Uma Krishnan <ukrishn@linux.vnet.ibm.com>
+commit a834a36b57d93b31f683a5d2cf7d87e3e617cb70
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/a834a36b.failed
+
+The cxlflash driver currently lacks host management interface. Future
+devices supported by cxlflash will provide a variety of host-wide
+management functions. Examples include LUN provisioning, hardware debug
+support, and firmware download.
+
+In order to provide a way to manage the device, a character device will
+be created during probe of each adapter. This device will support a set of
+ioctls defined in the SISLite specification from which administrators can
+manage the adapter.
+
+	Signed-off-by: Uma Krishnan <ukrishn@linux.vnet.ibm.com>
+	Acked-by: Matthew R. Ochs <mrochs@linux.vnet.ibm.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit a834a36b57d93b31f683a5d2cf7d87e3e617cb70)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/cxlflash/common.h
+#	drivers/scsi/cxlflash/main.c
+diff --cc drivers/scsi/cxlflash/common.h
+index 811927d91c5c,cbc0eb70ab47..000000000000
+--- a/drivers/scsi/cxlflash/common.h
++++ b/drivers/scsi/cxlflash/common.h
+@@@ -15,6 -15,9 +15,12 @@@
+  #ifndef _CXLFLASH_COMMON_H
+  #define _CXLFLASH_COMMON_H
+  
+++<<<<<<< HEAD
+++=======
++ #include <linux/async.h>
++ #include <linux/cdev.h>
++ #include <linux/irq_poll.h>
+++>>>>>>> a834a36b57d9 (scsi: cxlflash: Create character device to provide host management interface)
+  #include <linux/list.h>
+  #include <linux/rwsem.h>
+  #include <linux/types.h>
+@@@ -98,6 -117,9 +105,12 @@@ struct cxlflash_cfg 
+  	struct pci_dev *dev;
+  	struct pci_device_id *dev_id;
+  	struct Scsi_Host *host;
+++<<<<<<< HEAD
+++=======
++ 	int num_fc_ports;
++ 	struct cdev cdev;
++ 	struct device *chardev;
+++>>>>>>> a834a36b57d9 (scsi: cxlflash: Create character device to provide host management interface)
+  
+  	ulong cxlflash_regs_pci;
+  
+diff --cc drivers/scsi/cxlflash/main.c
+index c68badcfa77f,0656dd2d3547..000000000000
+--- a/drivers/scsi/cxlflash/main.c
++++ b/drivers/scsi/cxlflash/main.c
+@@@ -35,65 -34,10 +35,69 @@@ MODULE_AUTHOR("Manoj N. Kumar <manoj@li
+  MODULE_AUTHOR("Matthew R. Ochs <mrochs@linux.vnet.ibm.com>");
+  MODULE_LICENSE("GPL");
+  
++ static struct class *cxlflash_class;
++ static u32 cxlflash_major;
++ static DECLARE_BITMAP(cxlflash_minor, CXLFLASH_MAX_ADAPTERS);
++ 
+ +/**
+ + * cmd_checkout() - checks out an AFU command
+ + * @afu:	AFU to checkout from.
+ + *
+ + * Commands are checked out in a round-robin fashion. Note that since
+ + * the command pool is larger than the hardware queue, the majority of
+ + * times we will only loop once or twice before getting a command. The
+ + * CDB within the command is initialized (zeroed) prior to returning.
+ + *
+ + * Return: The checked out command or NULL when command pool is empty.
+ + */
+ +static struct afu_cmd *cmd_checkout(struct afu *afu)
+ +{
+ +	int k, dec = CXLFLASH_NUM_CMDS;
+ +	struct afu_cmd *cmd;
+ +
+ +	while (dec--) {
+ +		k = (afu->cmd_couts++ & (CXLFLASH_NUM_CMDS - 1));
+ +
+ +		cmd = &afu->cmd[k];
+ +
+ +		if (!atomic_dec_if_positive(&cmd->free)) {
+ +			pr_devel("%s: returning found index=%d cmd=%p\n",
+ +				 __func__, cmd->slot, cmd);
+ +			memset(cmd->rcb.cdb, 0, sizeof(cmd->rcb.cdb));
+ +			return cmd;
+ +		}
+ +	}
+ +
+ +	return NULL;
+ +}
+ +
+ +/**
+ + * cmd_checkin() - checks in an AFU command
+ + * @cmd:	AFU command to checkin.
+ + *
+ + * Safe to pass commands that have already been checked in. Several
+ + * internal tracking fields are reset as part of the checkin. Note
+ + * that these are intentionally reset prior to toggling the free bit
+ + * to avoid clobbering values in the event that the command is checked
+ + * out right away.
+ + */
+ +static void cmd_checkin(struct afu_cmd *cmd)
+ +{
+ +	cmd->rcb.scp = NULL;
+ +	cmd->rcb.timeout = 0;
+ +	cmd->sa.ioasc = 0;
+ +	cmd->cmd_tmf = false;
+ +	cmd->sa.host_use[0] = 0; /* clears both completion and retry bytes */
+ +
+ +	if (unlikely(atomic_inc_return(&cmd->free) != 1)) {
+ +		pr_err("%s: Freeing cmd (%d) that is not in use!\n",
+ +		       __func__, cmd->slot);
+ +		return;
+ +	}
+ +
+ +	pr_devel("%s: released cmd %p index=%d\n", __func__, cmd, cmd->slot);
+ +}
+ +
+  /**
+   * process_cmd_err() - command error handler
+   * @cmd:	AFU command that experienced the error.
+@@@ -2484,8 -3356,20 +2611,23 @@@ static int cxlflash_probe(struct pci_de
+  	}
+  	cfg->init_state = INIT_STATE_SCSI;
+  
+++<<<<<<< HEAD
+++=======
++ 	rc = init_chrdev(cfg);
++ 	if (rc) {
++ 		dev_err(dev, "%s: init_chrdev failed rc=%d\n", __func__, rc);
++ 		goto out_remove;
++ 	}
++ 	cfg->init_state = INIT_STATE_CDEV;
++ 
++ 	if (wq_has_sleeper(&cfg->reset_waitq)) {
++ 		cfg->state = STATE_PROBED;
++ 		wake_up_all(&cfg->reset_waitq);
++ 	} else
++ 		cfg->state = STATE_NORMAL;
+++>>>>>>> a834a36b57d9 (scsi: cxlflash: Create character device to provide host management interface)
+  out:
+ -	dev_dbg(dev, "%s: returning rc=%d\n", __func__, rc);
+ +	pr_debug("%s: returning rc=%d\n", __func__, rc);
+  	return rc;
+  
+  out_remove:
+@@@ -2605,11 -3547,23 +2804,28 @@@ static struct pci_driver cxlflash_drive
+   */
+  static int __init init_cxlflash(void)
+  {
+++<<<<<<< HEAD
+ +	pr_info("%s: %s\n", __func__, CXLFLASH_ADAPTER_NAME);
+ +
+++=======
++ 	int rc;
++ 
++ 	check_sizes();
+++>>>>>>> a834a36b57d9 (scsi: cxlflash: Create character device to provide host management interface)
+  	cxlflash_list_init();
++ 	rc = cxlflash_class_init();
++ 	if (unlikely(rc))
++ 		goto out;
+  
+- 	return pci_register_driver(&cxlflash_driver);
++ 	rc = pci_register_driver(&cxlflash_driver);
++ 	if (unlikely(rc))
++ 		goto err;
++ out:
++ 	pr_debug("%s: returning rc=%d\n", __func__, rc);
++ 	return rc;
++ err:
++ 	cxlflash_class_exit();
++ 	goto out;
+  }
+  
+  /**
+* Unmerged path drivers/scsi/cxlflash/common.h
+* Unmerged path drivers/scsi/cxlflash/main.c
+diff --git a/drivers/scsi/cxlflash/main.h b/drivers/scsi/cxlflash/main.h
+index 055ea95141f2..5ab0472bf98f 100644
+--- a/drivers/scsi/cxlflash/main.h
++++ b/drivers/scsi/cxlflash/main.h
+@@ -22,6 +22,7 @@
+ 
+ #define CXLFLASH_NAME		"cxlflash"
+ #define CXLFLASH_ADAPTER_NAME	"IBM POWER CXL Flash Adapter"
++#define CXLFLASH_MAX_ADAPTERS	32
+ 
+ #define PCI_DEVICE_ID_IBM_CORSA		0x04F0
+ #define PCI_DEVICE_ID_IBM_FLASH_GT	0x0600
