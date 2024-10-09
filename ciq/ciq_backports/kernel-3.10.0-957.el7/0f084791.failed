@@ -1,0 +1,135 @@
+nfp: add repr_preclean callback
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Dirk van der Merwe <dirk.vandermerwe@netronome.com>
+commit 0f08479143854257a8e7b38f296b1fd17bc91091
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/0f084791.failed
+
+Just before a repr is cleaned up, we give the app a chance to perform
+some preclean configuration while the reprs pointer is still configured
+for the app.
+
+	Signed-off-by: Dirk van der Merwe <dirk.vandermerwe@netronome.com>
+	Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0f08479143854257a8e7b38f296b1fd17bc91091)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_app.h
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_app.h
+index b6035aad75b0,3af1943a8521..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_app.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_app.h
+@@@ -76,6 -76,10 +76,13 @@@ extern const struct nfp_app_type app_fl
+   * @vnic_free:	free up app's vNIC state
+   * @vnic_init:	vNIC netdev was registered
+   * @vnic_clean:	vNIC netdev about to be unregistered
+++<<<<<<< HEAD
+++=======
++  * @repr_init:	representor about to be registered
++  * @repr_preclean:	representor about to unregistered, executed before app
++  *			reference to the it is removed
++  * @repr_clean:	representor about to be unregistered
+++>>>>>>> 0f0847914385 (nfp: add repr_preclean callback)
+   * @repr_open:	representor netdev open callback
+   * @repr_stop:	representor netdev stop callback
+   * @start:	start application logic
+@@@ -106,6 -113,10 +113,13 @@@ struct nfp_app_type 
+  	int (*vnic_init)(struct nfp_app *app, struct nfp_net *nn);
+  	void (*vnic_clean)(struct nfp_app *app, struct nfp_net *nn);
+  
+++<<<<<<< HEAD
+++=======
++ 	int (*repr_init)(struct nfp_app *app, struct net_device *netdev);
++ 	void (*repr_preclean)(struct nfp_app *app, struct net_device *netdev);
++ 	void (*repr_clean)(struct nfp_app *app, struct net_device *netdev);
++ 
+++>>>>>>> 0f0847914385 (nfp: add repr_preclean callback)
+  	int (*repr_open)(struct nfp_app *app, struct nfp_repr *repr);
+  	int (*repr_stop)(struct nfp_app *app, struct nfp_repr *repr);
+  
+@@@ -203,6 -220,28 +217,31 @@@ static inline int nfp_app_repr_stop(str
+  	return app->type->repr_stop(app, repr);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline int
++ nfp_app_repr_init(struct nfp_app *app, struct net_device *netdev)
++ {
++ 	if (!app->type->repr_init)
++ 		return 0;
++ 	return app->type->repr_init(app, netdev);
++ }
++ 
++ static inline void
++ nfp_app_repr_preclean(struct nfp_app *app, struct net_device *netdev)
++ {
++ 	if (app->type->repr_preclean)
++ 		app->type->repr_preclean(app, netdev);
++ }
++ 
++ static inline void
++ nfp_app_repr_clean(struct nfp_app *app, struct net_device *netdev)
++ {
++ 	if (app->type->repr_clean)
++ 		app->type->repr_clean(app, netdev);
++ }
++ 
+++>>>>>>> 0f0847914385 (nfp: add repr_preclean callback)
+  static inline int nfp_app_start(struct nfp_app *app, struct nfp_net *ctrl)
+  {
+  	app->ctrl = ctrl;
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_app.h
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net_repr.c b/drivers/net/ethernet/netronome/nfp/nfp_net_repr.c
+index 90bc09b8021b..bf1da4b47fce 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_repr.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_repr.c
+@@ -370,11 +370,22 @@ nfp_reprs_clean_and_free_by_type(struct nfp_app *app,
+ 				 enum nfp_repr_type type)
+ {
+ 	struct nfp_reprs *reprs;
++	int i;
+ 
+-	reprs = nfp_app_reprs_set(app, type, NULL);
++	reprs = rcu_dereference_protected(app->reprs[type],
++					  lockdep_is_held(&app->pf->lock));
+ 	if (!reprs)
+ 		return;
+ 
++	/* Preclean must happen before we remove the reprs reference from the
++	 * app below.
++	 */
++	for (i = 0; i < reprs->num_reprs; i++)
++		if (reprs->reprs[i])
++			nfp_app_repr_preclean(app, reprs->reprs[i]);
++
++	reprs = nfp_app_reprs_set(app, type, NULL);
++
+ 	synchronize_rcu();
+ 	nfp_reprs_clean_and_free(reprs);
+ }
+@@ -413,8 +424,10 @@ int nfp_reprs_resync_phys_ports(struct nfp_app *app)
+ 			continue;
+ 
+ 		repr = netdev_priv(old_reprs->reprs[i]);
+-		if (repr->port->type == NFP_PORT_INVALID)
++		if (repr->port->type == NFP_PORT_INVALID) {
++			nfp_app_repr_preclean(app, old_reprs->reprs[i]);
+ 			continue;
++		}
+ 
+ 		reprs->reprs[i] = old_reprs->reprs[i];
+ 	}
+@@ -431,7 +444,6 @@ int nfp_reprs_resync_phys_ports(struct nfp_app *app)
+ 		if (repr->port->type != NFP_PORT_INVALID)
+ 			continue;
+ 
+-		nfp_app_repr_stop(app, repr);
+ 		nfp_repr_clean(repr);
+ 	}
+ 
