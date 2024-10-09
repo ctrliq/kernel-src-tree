@@ -1,0 +1,197 @@
+net/mlx5e: IPoIB, handle RX packet correctly
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: IPoIB, handle RX packet correctly (Don Dutile) [1385325 1499362]
+Rebuild_FUZZ: 95.24%
+commit-author Erez Shitrit <erezsh@mellanox.com>
+commit b57fe691961cc8f00541f9a435c70df45d41e514
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/b57fe691.failed
+
+IPoIB packet contains the pseudo header area, we need to pull it prior
+to reset_mac_header in order to let the GRO work well.
+
+In more details:
+GRO checks the mac address of the new coming packet, it does that by
+comparing the hard_header_len size of the current packet to the previous
+one in that session, the comparison is over hard_header_len size.
+Now, the driver prepares that area in the skb by allocating area from the
+reserved part and resetting the correct mac header to it.
+
+Fixes: 9d6bd752c63c ("net/mlx5e: IPoIB, RX handler")
+	Signed-off-by: Erez Shitrit <erezsh@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit b57fe691961cc8f00541f9a435c70df45d41e514)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index 8b4b5a3808c1,66b5fec15313..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -853,3 -963,158 +853,161 @@@ int mlx5e_poll_rx_cq(struct mlx5e_cq *c
+  
+  	return work_done;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ bool mlx5e_poll_xdpsq_cq(struct mlx5e_cq *cq)
++ {
++ 	struct mlx5e_xdpsq *sq;
++ 	struct mlx5e_rq *rq;
++ 	u16 sqcc;
++ 	int i;
++ 
++ 	sq = container_of(cq, struct mlx5e_xdpsq, cq);
++ 
++ 	if (unlikely(!test_bit(MLX5E_SQ_STATE_ENABLED, &sq->state)))
++ 		return false;
++ 
++ 	rq = container_of(sq, struct mlx5e_rq, xdpsq);
++ 
++ 	/* sq->cc must be updated only after mlx5_cqwq_update_db_record(),
++ 	 * otherwise a cq overrun may occur
++ 	 */
++ 	sqcc = sq->cc;
++ 
++ 	for (i = 0; i < MLX5E_TX_CQ_POLL_BUDGET; i++) {
++ 		struct mlx5_cqe64 *cqe;
++ 		u16 wqe_counter;
++ 		bool last_wqe;
++ 
++ 		cqe = mlx5e_get_cqe(cq);
++ 		if (!cqe)
++ 			break;
++ 
++ 		mlx5_cqwq_pop(&cq->wq);
++ 
++ 		wqe_counter = be16_to_cpu(cqe->wqe_counter);
++ 
++ 		do {
++ 			struct mlx5e_dma_info *di;
++ 			u16 ci;
++ 
++ 			last_wqe = (sqcc == wqe_counter);
++ 
++ 			ci = sqcc & sq->wq.sz_m1;
++ 			di = &sq->db.di[ci];
++ 
++ 			sqcc++;
++ 			/* Recycle RX page */
++ 			mlx5e_page_release(rq, di, true);
++ 		} while (!last_wqe);
++ 	}
++ 
++ 	mlx5_cqwq_update_db_record(&cq->wq);
++ 
++ 	/* ensure cq space is freed before enabling more cqes */
++ 	wmb();
++ 
++ 	sq->cc = sqcc;
++ 	return (i == MLX5E_TX_CQ_POLL_BUDGET);
++ }
++ 
++ void mlx5e_free_xdpsq_descs(struct mlx5e_xdpsq *sq)
++ {
++ 	struct mlx5e_rq *rq = container_of(sq, struct mlx5e_rq, xdpsq);
++ 	struct mlx5e_dma_info *di;
++ 	u16 ci;
++ 
++ 	while (sq->cc != sq->pc) {
++ 		ci = sq->cc & sq->wq.sz_m1;
++ 		di = &sq->db.di[ci];
++ 		sq->cc++;
++ 
++ 		mlx5e_page_release(rq, di, false);
++ 	}
++ }
++ 
++ #ifdef CONFIG_MLX5_CORE_IPOIB
++ 
++ #define MLX5_IB_GRH_DGID_OFFSET 24
++ #define MLX5_IB_GRH_BYTES       40
++ #define MLX5_IPOIB_ENCAP_LEN    4
++ #define MLX5_GID_SIZE           16
++ #define MLX5_IPOIB_PSEUDO_LEN   20
++ #define MLX5_IPOIB_HARD_LEN     (MLX5_IPOIB_PSEUDO_LEN + MLX5_IPOIB_ENCAP_LEN)
++ 
++ static inline void mlx5i_complete_rx_cqe(struct mlx5e_rq *rq,
++ 					 struct mlx5_cqe64 *cqe,
++ 					 u32 cqe_bcnt,
++ 					 struct sk_buff *skb)
++ {
++ 	struct net_device *netdev = rq->netdev;
++ 	char *pseudo_header;
++ 	u8 *dgid;
++ 	u8 g;
++ 
++ 	g = (be32_to_cpu(cqe->flags_rqpn) >> 28) & 3;
++ 	dgid = skb->data + MLX5_IB_GRH_DGID_OFFSET;
++ 	if ((!g) || dgid[0] != 0xff)
++ 		skb->pkt_type = PACKET_HOST;
++ 	else if (memcmp(dgid, netdev->broadcast + 4, MLX5_GID_SIZE) == 0)
++ 		skb->pkt_type = PACKET_BROADCAST;
++ 	else
++ 		skb->pkt_type = PACKET_MULTICAST;
++ 
++ 	/* TODO: IB/ipoib: Allow mcast packets from other VFs
++ 	 * 68996a6e760e5c74654723eeb57bf65628ae87f4
++ 	 */
++ 
++ 	skb_pull(skb, MLX5_IB_GRH_BYTES);
++ 
++ 	skb->protocol = *((__be16 *)(skb->data));
++ 
++ 	skb->ip_summed = CHECKSUM_COMPLETE;
++ 	skb->csum = csum_unfold((__force __sum16)cqe->check_sum);
++ 
++ 	skb_record_rx_queue(skb, rq->ix);
++ 
++ 	if (likely(netdev->features & NETIF_F_RXHASH))
++ 		mlx5e_skb_set_hash(cqe, skb);
++ 
++ 	/* 20 bytes of ipoib header and 4 for encap existing */
++ 	pseudo_header = skb_push(skb, MLX5_IPOIB_PSEUDO_LEN);
++ 	memset(pseudo_header, 0, MLX5_IPOIB_PSEUDO_LEN);
++ 	skb_reset_mac_header(skb);
++ 	skb_pull(skb, MLX5_IPOIB_HARD_LEN);
++ 
++ 	skb->dev = netdev;
++ 
++ 	rq->stats.csum_complete++;
++ 	rq->stats.packets++;
++ 	rq->stats.bytes += cqe_bcnt;
++ }
++ 
++ void mlx5i_handle_rx_cqe(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe)
++ {
++ 	struct mlx5e_rx_wqe *wqe;
++ 	__be16 wqe_counter_be;
++ 	struct sk_buff *skb;
++ 	u16 wqe_counter;
++ 	u32 cqe_bcnt;
++ 
++ 	wqe_counter_be = cqe->wqe_counter;
++ 	wqe_counter    = be16_to_cpu(wqe_counter_be);
++ 	wqe            = mlx5_wq_ll_get_wqe(&rq->wq, wqe_counter);
++ 	cqe_bcnt       = be32_to_cpu(cqe->byte_cnt);
++ 
++ 	skb = skb_from_cqe(rq, cqe, wqe_counter, cqe_bcnt);
++ 	if (!skb)
++ 		goto wq_ll_pop;
++ 
++ 	mlx5i_complete_rx_cqe(rq, cqe, cqe_bcnt, skb);
++ 	napi_gro_receive(rq->cq.napi, skb);
++ 
++ wq_ll_pop:
++ 	mlx5_wq_ll_pop(&rq->wq, wqe_counter_be,
++ 		       &wqe->next.next_wqe_index);
++ }
++ 
++ #endif /* CONFIG_MLX5_CORE_IPOIB */
+++>>>>>>> b57fe691961c (net/mlx5e: IPoIB, handle RX packet correctly)
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
