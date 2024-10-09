@@ -1,0 +1,379 @@
+ixgbe: Don't assume dev->num_tc is equal to hardware TC config
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Alexander Duyck <alexander.h.duyck@intel.com>
+commit 0efbf12b954b75ba4e5fa2926b2185a6e077ba52
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/0efbf12b.failed
+
+The code throughout ixgbe was assuming that dev->num_tc was populated and
+configured with the driver, when in fact this can be configured via mqprio
+without any hardware coordination other than restricting us to the real
+number of Tx queues we advertise.
+
+Instead of handling things this way we need to keep a local copy of the
+number of TCs in use so that we don't accidentally pull in the TC
+configuration from mqprio when it is configured in software mode.
+
+	Signed-off-by: Alexander Duyck <alexander.h.duyck@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 0efbf12b954b75ba4e5fa2926b2185a6e077ba52)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+#	drivers/net/ethernet/intel/ixgbe/ixgbe_sriov.c
+diff --cc drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+index 75e161ff1fee,42b4f4cee3d6..000000000000
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@@ -9550,6 -9799,8 +9552,11 @@@ static void *ixgbe_fwd_add(struct net_d
+  	struct ixgbe_fwd_adapter *fwd_adapter = NULL;
+  	struct ixgbe_adapter *adapter = netdev_priv(pdev);
+  	int used_pools = adapter->num_vfs + adapter->num_rx_pools;
+++<<<<<<< HEAD
+++=======
++ 	int tcs = adapter->hw_tcs ? : 1;
++ 	unsigned int limit;
+++>>>>>>> 0efbf12b954b (ixgbe: Don't assume dev->num_tc is equal to hardware TC config)
+  	int pool, err;
+  
+  	/* Hardware has a limited number of available pools. Each VF, and the
+@@@ -9584,11 -9841,11 +9591,11 @@@
+  
+  	/* Enable VMDq flag so device will be set in VM mode */
+  	adapter->flags |= IXGBE_FLAG_VMDQ_ENABLED | IXGBE_FLAG_SRIOV_ENABLED;
+ -	adapter->ring_feature[RING_F_VMDQ].limit = limit + 1;
+ -	adapter->ring_feature[RING_F_RSS].limit = vdev->num_tx_queues;
+ +	adapter->ring_feature[RING_F_VMDQ].limit = adapter->num_rx_pools;
+ +	adapter->ring_feature[RING_F_RSS].limit = vdev->num_rx_queues;
+  
+  	/* Force reinit of ring allocation with VMDQ enabled */
+- 	err = ixgbe_setup_tc(pdev, netdev_get_num_tc(pdev));
++ 	err = ixgbe_setup_tc(pdev, adapter->hw_tcs);
+  	if (err)
+  		goto fwd_add_err;
+  	fwd_adapter->pool = pool;
+@@@ -9633,12 -9890,12 +9640,17 @@@ static void ixgbe_fwd_del(struct net_de
+  		adapter->ring_feature[RING_F_RSS].limit = rss;
+  	}
+  
+++<<<<<<< HEAD
+ +	ixgbe_setup_tc(pdev, netdev_get_num_tc(pdev));
+ +	netdev_dbg(pdev, "pool %i:%i queues %i:%i VSI bitmask %lx\n",
+++=======
++ 	ixgbe_setup_tc(pdev, adapter->hw_tcs);
++ 	netdev_dbg(pdev, "pool %i:%i queues %i:%i\n",
+++>>>>>>> 0efbf12b954b (ixgbe: Don't assume dev->num_tc is equal to hardware TC config)
+  		   fwd_adapter->pool, adapter->num_rx_pools,
+  		   fwd_adapter->rx_base_queue,
+ -		   fwd_adapter->rx_base_queue +
+ -		   adapter->num_rx_queues_per_pool);
+ +		   fwd_adapter->rx_base_queue + adapter->num_rx_queues_per_pool,
+ +		   adapter->fwd_bitmask);
+  	kfree(fwd_adapter);
+  }
+  
+@@@ -9676,8 -9933,118 +9688,122 @@@ ixgbe_features_check(struct sk_buff *sk
+  	return features;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int ixgbe_xdp_setup(struct net_device *dev, struct bpf_prog *prog)
++ {
++ 	int i, frame_size = dev->mtu + ETH_HLEN + ETH_FCS_LEN + VLAN_HLEN;
++ 	struct ixgbe_adapter *adapter = netdev_priv(dev);
++ 	struct bpf_prog *old_prog;
++ 
++ 	if (adapter->flags & IXGBE_FLAG_SRIOV_ENABLED)
++ 		return -EINVAL;
++ 
++ 	if (adapter->flags & IXGBE_FLAG_DCB_ENABLED)
++ 		return -EINVAL;
++ 
++ 	/* verify ixgbe ring attributes are sufficient for XDP */
++ 	for (i = 0; i < adapter->num_rx_queues; i++) {
++ 		struct ixgbe_ring *ring = adapter->rx_ring[i];
++ 
++ 		if (ring_is_rsc_enabled(ring))
++ 			return -EINVAL;
++ 
++ 		if (frame_size > ixgbe_rx_bufsz(ring))
++ 			return -EINVAL;
++ 	}
++ 
++ 	if (nr_cpu_ids > MAX_XDP_QUEUES)
++ 		return -ENOMEM;
++ 
++ 	old_prog = xchg(&adapter->xdp_prog, prog);
++ 
++ 	/* If transitioning XDP modes reconfigure rings */
++ 	if (!!prog != !!old_prog) {
++ 		int err = ixgbe_setup_tc(dev, adapter->hw_tcs);
++ 
++ 		if (err) {
++ 			rcu_assign_pointer(adapter->xdp_prog, old_prog);
++ 			return -EINVAL;
++ 		}
++ 	} else {
++ 		for (i = 0; i < adapter->num_rx_queues; i++)
++ 			xchg(&adapter->rx_ring[i]->xdp_prog, adapter->xdp_prog);
++ 	}
++ 
++ 	if (old_prog)
++ 		bpf_prog_put(old_prog);
++ 
++ 	return 0;
++ }
++ 
++ static int ixgbe_xdp(struct net_device *dev, struct netdev_bpf *xdp)
++ {
++ 	struct ixgbe_adapter *adapter = netdev_priv(dev);
++ 
++ 	switch (xdp->command) {
++ 	case XDP_SETUP_PROG:
++ 		return ixgbe_xdp_setup(dev, xdp->prog);
++ 	case XDP_QUERY_PROG:
++ 		xdp->prog_attached = !!(adapter->xdp_prog);
++ 		xdp->prog_id = adapter->xdp_prog ?
++ 			adapter->xdp_prog->aux->id : 0;
++ 		return 0;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
++ static int ixgbe_xdp_xmit(struct net_device *dev, struct xdp_buff *xdp)
++ {
++ 	struct ixgbe_adapter *adapter = netdev_priv(dev);
++ 	struct ixgbe_ring *ring;
++ 	int err;
++ 
++ 	if (unlikely(test_bit(__IXGBE_DOWN, &adapter->state)))
++ 		return -ENETDOWN;
++ 
++ 	/* During program transitions its possible adapter->xdp_prog is assigned
++ 	 * but ring has not been configured yet. In this case simply abort xmit.
++ 	 */
++ 	ring = adapter->xdp_prog ? adapter->xdp_ring[smp_processor_id()] : NULL;
++ 	if (unlikely(!ring))
++ 		return -ENXIO;
++ 
++ 	err = ixgbe_xmit_xdp_ring(adapter, xdp);
++ 	if (err != IXGBE_XDP_TX)
++ 		return -ENOSPC;
++ 
++ 	return 0;
++ }
++ 
++ static void ixgbe_xdp_flush(struct net_device *dev)
++ {
++ 	struct ixgbe_adapter *adapter = netdev_priv(dev);
++ 	struct ixgbe_ring *ring;
++ 
++ 	/* Its possible the device went down between xdp xmit and flush so
++ 	 * we need to ensure device is still up.
++ 	 */
++ 	if (unlikely(test_bit(__IXGBE_DOWN, &adapter->state)))
++ 		return;
++ 
++ 	ring = adapter->xdp_prog ? adapter->xdp_ring[smp_processor_id()] : NULL;
++ 	if (unlikely(!ring))
++ 		return;
++ 
++ 	/* Force memory writes to complete before letting h/w know there
++ 	 * are new descriptors to fetch.
++ 	 */
++ 	wmb();
++ 	writel(ring->next_to_use, ring->tail);
++ 
++ 	return;
++ }
++ 
+++>>>>>>> 0efbf12b954b (ixgbe: Don't assume dev->num_tc is equal to hardware TC config)
+  static const struct net_device_ops ixgbe_netdev_ops = {
+ +	.ndo_size		= sizeof(struct net_device_ops),
+  	.ndo_open		= ixgbe_open,
+  	.ndo_stop		= ixgbe_close,
+  	.ndo_start_xmit		= ixgbe_xmit_frame,
+diff --cc drivers/net/ethernet/intel/ixgbe/ixgbe_sriov.c
+index abf1b1a3caa1,27a70a52f3c9..000000000000
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_sriov.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_sriov.c
+@@@ -315,23 -311,15 +315,30 @@@ static int ixgbe_pci_sriov_enable(struc
+  	 * than we have available pools. The PCI bus driver already checks for
+  	 * other values out of range.
+  	 */
+++<<<<<<< HEAD
+ +	num_tc = netdev_get_num_tc(adapter->netdev);
+++=======
++ 	num_tc = adapter->hw_tcs;
++ 	num_rx_pools = adapter->num_rx_pools;
++ 	limit = (num_tc > 4) ? IXGBE_MAX_VFS_8TC :
++ 		(num_tc > 1) ? IXGBE_MAX_VFS_4TC : IXGBE_MAX_VFS_1TC;
+++>>>>>>> 0efbf12b954b (ixgbe: Don't assume dev->num_tc is equal to hardware TC config)
+  
+ -	if (num_vfs > (limit - num_rx_pools)) {
+ -		e_dev_err("Currently configured with %d TCs, and %d offloaded macvlans. Creating more than %d VFs is not allowed\n",
+ -			  num_tc, num_rx_pools - 1, limit - num_rx_pools);
+ -		return -EPERM;
+ +	if (num_tc > 4) {
+ +		if ((num_vfs + adapter->num_rx_pools) > IXGBE_MAX_VFS_8TC) {
+ +			e_dev_err("Currently the device is configured with %d TCs, Creating more than %d VFs is not allowed\n", num_tc, IXGBE_MAX_VFS_8TC);
+ +			return -EPERM;
+ +		}
+ +	} else if ((num_tc > 1) && (num_tc <= 4)) {
+ +		if ((num_vfs + adapter->num_rx_pools) > IXGBE_MAX_VFS_4TC) {
+ +			e_dev_err("Currently the device is configured with %d TCs, Creating more than %d VFs is not allowed\n", num_tc, IXGBE_MAX_VFS_4TC);
+ +			return -EPERM;
+ +		}
+ +	} else {
+ +		if ((num_vfs + adapter->num_rx_pools) > IXGBE_MAX_VFS_1TC) {
+ +			e_dev_err("Currently the device is configured with %d TCs, Creating more than %d VFs is not allowed\n", num_tc, IXGBE_MAX_VFS_1TC);
+ +			return -EPERM;
+ +		}
+  	}
+  
+  	err = __ixgbe_enable_sriov(adapter, num_vfs);
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe.h b/drivers/net/ethernet/intel/ixgbe/ixgbe.h
+index 1a3ee618869e..449a3cbcc32c 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe.h
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe.h
+@@ -656,6 +656,7 @@ struct ixgbe_adapter {
+ 	struct ieee_ets *ixgbe_ieee_ets;
+ 	struct ixgbe_dcb_config dcb_cfg;
+ 	struct ixgbe_dcb_config temp_dcb_cfg;
++	u8 hw_tcs;
+ 	u8 dcb_set_bitmap;
+ 	u8 dcbx_cap;
+ 	enum ixgbe_fc_mode last_lfc_mode;
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_dcb_nl.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_dcb_nl.c
+index b786c89ed5a0..a4e3a3e815d2 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_dcb_nl.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_dcb_nl.c
+@@ -571,7 +571,7 @@ static int ixgbe_dcbnl_ieee_setets(struct net_device *dev,
+ 	if (max_tc > adapter->dcb_cfg.num_tcs.pg_tcs)
+ 		return -EINVAL;
+ 
+-	if (max_tc != netdev_get_num_tc(dev)) {
++	if (max_tc != adapter->hw_tcs) {
+ 		err = ixgbe_setup_tc(dev, max_tc);
+ 		if (err)
+ 			return err;
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_ethtool.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_ethtool.c
+index 92499b960651..73395675a963 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_ethtool.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_ethtool.c
+@@ -3088,7 +3088,7 @@ static int ixgbe_get_ts_info(struct net_device *dev,
+ static unsigned int ixgbe_max_channels(struct ixgbe_adapter *adapter)
+ {
+ 	unsigned int max_combined;
+-	u8 tcs = netdev_get_num_tc(adapter->netdev);
++	u8 tcs = adapter->hw_tcs;
+ 
+ 	if (!(adapter->flags & IXGBE_FLAG_MSIX_ENABLED)) {
+ 		/* We only support one q_vector without MSI-X */
+@@ -3145,7 +3145,7 @@ static void ixgbe_get_channels(struct net_device *dev,
+ 		return;
+ 
+ 	/* same thing goes for being DCB enabled */
+-	if (netdev_get_num_tc(dev) > 1)
++	if (adapter->hw_tcs > 1)
+ 		return;
+ 
+ 	/* if ATR is disabled we can exit */
+@@ -3191,7 +3191,7 @@ static int ixgbe_set_channels(struct net_device *dev,
+ 
+ #endif
+ 	/* use setup TC to update any traffic class queue mapping */
+-	return ixgbe_setup_tc(dev, netdev_get_num_tc(dev));
++	return ixgbe_setup_tc(dev, adapter->hw_tcs);
+ }
+ 
+ static int ixgbe_get_module_info(struct net_device *dev,
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_lib.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_lib.c
+index 35c1fe8a4430..b288475638d8 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_lib.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_lib.c
+@@ -47,7 +47,7 @@ static bool ixgbe_cache_ring_dcb_sriov(struct ixgbe_adapter *adapter)
+ 	struct ixgbe_ring_feature *vmdq = &adapter->ring_feature[RING_F_VMDQ];
+ 	int i;
+ 	u16 reg_idx;
+-	u8 tcs = netdev_get_num_tc(adapter->netdev);
++	u8 tcs = adapter->hw_tcs;
+ 
+ 	/* verify we have DCB queueing enabled before proceeding */
+ 	if (tcs <= 1)
+@@ -111,9 +111,8 @@ static bool ixgbe_cache_ring_dcb_sriov(struct ixgbe_adapter *adapter)
+ static void ixgbe_get_first_reg_idx(struct ixgbe_adapter *adapter, u8 tc,
+ 				    unsigned int *tx, unsigned int *rx)
+ {
+-	struct net_device *dev = adapter->netdev;
+ 	struct ixgbe_hw *hw = &adapter->hw;
+-	u8 num_tcs = netdev_get_num_tc(dev);
++	u8 num_tcs = adapter->hw_tcs;
+ 
+ 	*tx = 0;
+ 	*rx = 0;
+@@ -168,10 +167,9 @@ static void ixgbe_get_first_reg_idx(struct ixgbe_adapter *adapter, u8 tc,
+  **/
+ static bool ixgbe_cache_ring_dcb(struct ixgbe_adapter *adapter)
+ {
+-	struct net_device *dev = adapter->netdev;
++	u8 num_tcs = adapter->hw_tcs;
+ 	unsigned int tx_idx, rx_idx;
+ 	int tc, offset, rss_i, i;
+-	u8 num_tcs = netdev_get_num_tc(dev);
+ 
+ 	/* verify we have DCB queueing enabled before proceeding */
+ 	if (num_tcs <= 1)
+@@ -333,7 +331,7 @@ static bool ixgbe_set_dcb_sriov_queues(struct ixgbe_adapter *adapter)
+ #ifdef IXGBE_FCOE
+ 	u16 fcoe_i = 0;
+ #endif
+-	u8 tcs = netdev_get_num_tc(adapter->netdev);
++	u8 tcs = adapter->hw_tcs;
+ 
+ 	/* verify we have DCB queueing enabled before proceeding */
+ 	if (tcs <= 1)
+@@ -429,7 +427,7 @@ static bool ixgbe_set_dcb_queues(struct ixgbe_adapter *adapter)
+ 	int tcs;
+ 
+ 	/* Map queue offset and counts onto allocated tx queues */
+-	tcs = netdev_get_num_tc(dev);
++	tcs = adapter->hw_tcs;
+ 
+ 	/* verify we have DCB queueing enabled before proceeding */
+ 	if (tcs <= 1)
+@@ -816,7 +814,7 @@ static int ixgbe_alloc_q_vector(struct ixgbe_adapter *adapter,
+ 	int node = NUMA_NO_NODE;
+ 	int cpu = -1;
+ 	int ring_count, size;
+-	u8 tcs = netdev_get_num_tc(adapter->netdev);
++	u8 tcs = adapter->hw_tcs;
+ 
+ 	ring_count = txr_count + rxr_count;
+ 	size = sizeof(struct ixgbe_q_vector) +
+@@ -1118,7 +1116,7 @@ static void ixgbe_set_interrupt_capability(struct ixgbe_adapter *adapter)
+ 	 */
+ 
+ 	/* Disable DCB unless we only have a single traffic class */
+-	if (netdev_get_num_tc(adapter->netdev) > 1) {
++	if (adapter->hw_tcs > 1) {
+ 		e_dev_warn("Number of DCB TCs exceeds number of available queues. Disabling DCB support.\n");
+ 		netdev_reset_tc(adapter->netdev);
+ 
+@@ -1130,6 +1128,7 @@ static void ixgbe_set_interrupt_capability(struct ixgbe_adapter *adapter)
+ 		adapter->dcb_cfg.pfc_mode_enable = false;
+ 	}
+ 
++	adapter->hw_tcs = 0;
+ 	adapter->dcb_cfg.num_tcs.pg_tcs = 1;
+ 	adapter->dcb_cfg.num_tcs.pfc_tcs = 1;
+ 
+* Unmerged path drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+* Unmerged path drivers/net/ethernet/intel/ixgbe/ixgbe_sriov.c
