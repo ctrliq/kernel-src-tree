@@ -1,0 +1,152 @@
+perf/core: Optimize perf_rotate_context() event scheduling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 8d5bce0c37fa10f21dbdd6a6d8fcba85202fe24e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/8d5bce0c.failed
+
+The event schedule order (as per perf_event_sched_in()) is:
+
+ - cpu  pinned
+ - task pinned
+ - cpu  flexible
+ - task flexible
+
+But perf_rotate_context() will unschedule cpu-flexible even if it
+doesn't need a rotation.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Vince Weaver <vincent.weaver@maine.edu>
+	Cc: linux-kernel@vger.kernel.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 8d5bce0c37fa10f21dbdd6a6d8fcba85202fe24e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/events/core.c
+diff --cc kernel/events/core.c
+index e490cd411934,f98c0f88cc94..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -963,9 -1041,9 +963,9 @@@ perf_cgroup_mark_enabled(struct perf_ev
+  static enum hrtimer_restart perf_mux_hrtimer_handler(struct hrtimer *hr)
+  {
+  	struct perf_cpu_context *cpuctx;
+- 	int rotations = 0;
++ 	bool rotations;
+  
+ -	lockdep_assert_irqs_disabled();
+ +	WARN_ON(!irqs_disabled());
+  
+  	cpuctx = container_of(hr, struct perf_cpu_context, hrtimer);
+  	rotations = perf_rotate_context(cpuctx);
+@@@ -3417,14 -3593,30 +3417,30 @@@ static void rotate_ctx(struct perf_even
+  	 * Rotate the first entry last of non-pinned groups. Rotation might be
+  	 * disabled by the inheritance code.
+  	 */
+ -	if (ctx->rotate_disable)
+ -		return;
+ -
+ -	perf_event_groups_delete(&ctx->flexible_groups, event);
+ -	perf_event_groups_insert(&ctx->flexible_groups, event);
+ +	if (!ctx->rotate_disable)
+ +		list_rotate_left(&ctx->flexible_groups);
+  }
+  
+- static int perf_rotate_context(struct perf_cpu_context *cpuctx)
++ static inline struct perf_event *
++ ctx_first_active(struct perf_event_context *ctx)
+  {
+++<<<<<<< HEAD
+++=======
++ 	return list_first_entry_or_null(&ctx->flexible_active,
++ 					struct perf_event, active_list);
++ }
++ 
++ static bool perf_rotate_context(struct perf_cpu_context *cpuctx)
++ {
++ 	struct perf_event *cpu_event = NULL, *task_event = NULL;
++ 	bool cpu_rotate = false, task_rotate = false;
+++>>>>>>> 8d5bce0c37fa (perf/core: Optimize perf_rotate_context() event scheduling)
+  	struct perf_event_context *ctx = NULL;
+- 	int rotate = 0;
++ 
++ 	/*
++ 	 * Since we run this from IRQ context, nobody can install new
++ 	 * events, thus the event count values are stable.
++ 	 */
+  
+  	if (cpuctx->ctx.nr_events) {
+  		if (cpuctx->ctx.nr_events != cpuctx->ctx.nr_active)
+@@@ -3443,37 -3635,36 +3459,58 @@@
+  	perf_ctx_lock(cpuctx, cpuctx->task_ctx);
+  	perf_pmu_disable(cpuctx->ctx.pmu);
+  
+++<<<<<<< HEAD
+ +	cpu_ctx_sched_out(cpuctx, EVENT_FLEXIBLE);
+ +	if (ctx)
+++=======
++ 	if (task_rotate)
++ 		task_event = ctx_first_active(ctx);
++ 	if (cpu_rotate)
++ 		cpu_event = ctx_first_active(&cpuctx->ctx);
++ 
++ 	/*
++ 	 * As per the order given at ctx_resched() first 'pop' task flexible
++ 	 * and then, if needed CPU flexible.
++ 	 */
++ 	if (task_event || (ctx && cpu_event))
+++>>>>>>> 8d5bce0c37fa (perf/core: Optimize perf_rotate_context() event scheduling)
+  		ctx_sched_out(ctx, cpuctx, EVENT_FLEXIBLE);
++ 	if (cpu_event)
++ 		cpu_ctx_sched_out(cpuctx, EVENT_FLEXIBLE);
+  
+++<<<<<<< HEAD
+ +	rotate_ctx(&cpuctx->ctx);
+ +	if (ctx)
+ +		rotate_ctx(ctx);
+++=======
++ 	if (task_event)
++ 		rotate_ctx(ctx, task_event);
++ 	if (cpu_event)
++ 		rotate_ctx(&cpuctx->ctx, cpu_event);
+++>>>>>>> 8d5bce0c37fa (perf/core: Optimize perf_rotate_context() event scheduling)
+  
+  	perf_event_sched_in(cpuctx, ctx, current);
+  
+  	perf_pmu_enable(cpuctx->ctx.pmu);
+  	perf_ctx_unlock(cpuctx, cpuctx->task_ctx);
+- done:
+  
+- 	return rotate;
++ 	return true;
+  }
+  
+ +#ifdef CONFIG_NO_HZ_FULL
+ +bool perf_event_can_stop_tick(void)
+ +{
+ +	if (atomic_read(&nr_freq_events) ||
+ +	    __this_cpu_read(perf_throttled_count))
+ +		return false;
+ +	else
+ +		return true;
+ +}
+ +#endif
+ +
+  void perf_event_task_tick(void)
+  {
+ -	struct list_head *head = this_cpu_ptr(&active_ctx_list);
+ +	struct list_head *head = &__get_cpu_var(active_ctx_list);
+  	struct perf_event_context *ctx, *tmp;
+  	int throttled;
+  
+* Unmerged path kernel/events/core.c
