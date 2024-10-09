@@ -40,7 +40,6 @@
 #include <linux/err.h>
 #include <linux/filter.h>
 #include <linux/audit.h>
-#include <sys/ptrace.h>
 #include <linux/random.h>
 
 #ifndef O_CLOEXEC
