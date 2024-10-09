@@ -1,0 +1,161 @@
+net/mlx5e: Fix calculated checksum offloads counters
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Fix calculated checksum offloads counters (Kamal Heib) [1456694]
+Rebuild_FUZZ: 96.00%
+commit-author Gal Pressman <galp@mellanox.com>
+commit 603e1f5bd3ca76f16688e10040545594d2e91ba4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/603e1f5b.failed
+
+Instead of calculating the offloads counters, count them explicitly.
+The calculations done for these counters would result in bugs in some
+cases, for example:
+When running TCP traffic over a VXLAN tunnel with TSO enabled the following
+counters would increase:
+       tx_csum_partial: 1,333,284
+       tx_csum_partial_inner: 29,286
+       tx4_csum_partial_inner: 384
+       tx7_csum_partial_inner: 8
+       tx9_csum_partial_inner: 34
+       tx10_csum_partial_inner: 26,807
+       tx11_csum_partial_inner: 287
+       tx12_csum_partial_inner: 27
+       tx16_csum_partial_inner: 6
+       tx25_csum_partial_inner: 1,733
+
+Seems like tx_csum_partial increased out of nowhere.
+The issue is in the following calculation in mlx5e_update_sw_counters:
+s->tx_csum_partial = s->tx_packets - tx_offload_none - s->tx_csum_partial_inner;
+
+While tx_packets increases by the number of GSO segments for each SKB,
+tx_csum_partial_inner will only increase by one, resulting in wrong
+tx_csum_partial counter.
+
+Fixes: bfe6d8d1d433 ("net/mlx5e: Reorganize ethtool statistics")
+	Signed-off-by: Gal Pressman <galp@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 603e1f5bd3ca76f16688e10040545594d2e91ba4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+index eae13944f7a7,f8637213afc0..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+@@@ -65,6 -65,10 +65,13 @@@ struct mlx5e_sw_stats 
+  	u64 rx_csum_none;
+  	u64 rx_csum_complete;
+  	u64 rx_csum_unnecessary_inner;
+++<<<<<<< HEAD
+++=======
++ 	u64 rx_xdp_drop;
++ 	u64 rx_xdp_tx;
++ 	u64 rx_xdp_tx_full;
++ 	u64 tx_csum_none;
+++>>>>>>> 603e1f5bd3ca (net/mlx5e: Fix calculated checksum offloads counters)
+  	u64 tx_csum_partial;
+  	u64 tx_csum_partial_inner;
+  	u64 tx_queue_stopped;
+@@@ -100,6 -106,10 +107,13 @@@ static const struct counter_desc sw_sta
+  	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_csum_none) },
+  	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_csum_complete) },
+  	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_csum_unnecessary_inner) },
+++<<<<<<< HEAD
+++=======
++ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_xdp_drop) },
++ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_xdp_tx) },
++ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_xdp_tx_full) },
++ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, tx_csum_none) },
+++>>>>>>> 603e1f5bd3ca (net/mlx5e: Fix calculated checksum offloads counters)
+  	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, tx_csum_partial) },
+  	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, tx_csum_partial_inner) },
+  	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, tx_queue_stopped) },
+@@@ -338,8 -366,12 +353,9 @@@ static const struct counter_desc rq_sta
+  	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, packets) },
+  	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, bytes) },
+  	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, csum_complete) },
++ 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, csum_unnecessary) },
+  	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, csum_unnecessary_inner) },
+  	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, csum_none) },
+ -	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, xdp_drop) },
+ -	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, xdp_tx) },
+ -	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, xdp_tx_full) },
+  	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, lro_packets) },
+  	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, lro_bytes) },
+  	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, wqe_err) },
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 9035c90d5238..db1deb7e9b0a 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -169,7 +169,6 @@ static void mlx5e_update_sw_counters(struct mlx5e_priv *priv)
+ 	struct mlx5e_sw_stats temp, *s = &temp;
+ 	struct mlx5e_rq_stats *rq_stats;
+ 	struct mlx5e_sq_stats *sq_stats;
+-	u64 tx_offload_none = 0;
+ 	int i, j;
+ 
+ 	memset(s, 0, sizeof(*s));
+@@ -182,6 +181,7 @@ static void mlx5e_update_sw_counters(struct mlx5e_priv *priv)
+ 		s->rx_lro_bytes	+= rq_stats->lro_bytes;
+ 		s->rx_csum_none	+= rq_stats->csum_none;
+ 		s->rx_csum_complete += rq_stats->csum_complete;
++		s->rx_csum_unnecessary += rq_stats->csum_unnecessary;
+ 		s->rx_csum_unnecessary_inner += rq_stats->csum_unnecessary_inner;
+ 		s->rx_wqe_err   += rq_stats->wqe_err;
+ 		s->rx_mpwqe_filler += rq_stats->mpwqe_filler;
+@@ -207,14 +207,11 @@ static void mlx5e_update_sw_counters(struct mlx5e_priv *priv)
+ 			s->tx_queue_dropped	+= sq_stats->dropped;
+ 			s->tx_xmit_more		+= sq_stats->xmit_more;
+ 			s->tx_csum_partial_inner += sq_stats->csum_partial_inner;
+-			tx_offload_none		+= sq_stats->csum_none;
++			s->tx_csum_none		+= sq_stats->csum_none;
++			s->tx_csum_partial	+= sq_stats->csum_partial;
+ 		}
+ 	}
+ 
+-	/* Update calculated offload counters */
+-	s->tx_csum_partial = s->tx_packets - tx_offload_none - s->tx_csum_partial_inner;
+-	s->rx_csum_unnecessary = s->rx_packets - s->rx_csum_none - s->rx_csum_complete;
+-
+ 	s->link_down_events_phy = MLX5_GET(ppcnt_reg,
+ 				priv->stats.pport.phy_counters,
+ 				counter_set.phys_layer_cntrs.link_down_events);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index d6a4d3219a46..276229ae8d96 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@ -551,6 +551,7 @@ static inline void mlx5e_handle_csum(struct net_device *netdev,
+ 
+ 	if (lro) {
+ 		skb->ip_summed = CHECKSUM_UNNECESSARY;
++		rq->stats.csum_unnecessary++;
+ 		return;
+ 	}
+ 
+@@ -568,7 +569,9 @@ static inline void mlx5e_handle_csum(struct net_device *netdev,
+ 			skb->csum_level = 1;
+ 			skb->encapsulation = 1;
+ 			rq->stats.csum_unnecessary_inner++;
++			return;
+ 		}
++		rq->stats.csum_unnecessary++;
+ 		return;
+ 	}
+ csum_none:
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c b/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+index 46d0d61188dc..b3b2ad04584c 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+@@ -253,6 +253,7 @@ static netdev_tx_t mlx5e_sq_xmit(struct mlx5e_sq *sq, struct sk_buff *skb)
+ 			sq->stats.csum_partial_inner++;
+ 		} else {
+ 			eseg->cs_flags |= MLX5_ETH_WQE_L4_CSUM;
++			sq->stats.csum_partial++;
+ 		}
+ 	} else
+ 		sq->stats.csum_none++;
