@@ -1,0 +1,546 @@
+KEYS: Differentiate uses of rcu_dereference_key() and user_key_payload()
+
+jira LE-1907
+cve CVE-2017-7472
+cve CVE-2015-8539
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author David Howells <dhowells@redhat.com>
+commit 0837e49ab3fa8d903a499984575d71efee8097ce
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/0837e49a.failed
+
+rcu_dereference_key() and user_key_payload() are currently being used in
+two different, incompatible ways:
+
+ (1) As a wrapper to rcu_dereference() - when only the RCU read lock used
+     to protect the key.
+
+ (2) As a wrapper to rcu_dereference_protected() - when the key semaphor is
+     used to protect the key and the may be being modified.
+
+Fix this by splitting both of the key wrappers to produce:
+
+ (1) RCU accessors for keys when caller has the key semaphore locked:
+
+	dereference_key_locked()
+	user_key_payload_locked()
+
+ (2) RCU accessors for keys when caller holds the RCU read lock:
+
+	dereference_key_rcu()
+	user_key_payload_rcu()
+
+This should fix following warning in the NFS idmapper
+
+  ===============================
+  [ INFO: suspicious RCU usage. ]
+  4.10.0 #1 Tainted: G        W
+  -------------------------------
+  ./include/keys/user-type.h:53 suspicious rcu_dereference_protected() usage!
+  other info that might help us debug this:
+  rcu_scheduler_active = 2, debug_locks = 0
+  1 lock held by mount.nfs/5987:
+    #0:  (rcu_read_lock){......}, at: [<d000000002527abc>] nfs_idmap_get_key+0x15c/0x420 [nfsv4]
+  stack backtrace:
+  CPU: 1 PID: 5987 Comm: mount.nfs Tainted: G        W       4.10.0 #1
+  Call Trace:
+    dump_stack+0xe8/0x154 (unreliable)
+    lockdep_rcu_suspicious+0x140/0x190
+    nfs_idmap_get_key+0x380/0x420 [nfsv4]
+    nfs_map_name_to_uid+0x2a0/0x3b0 [nfsv4]
+    decode_getfattr_attrs+0xfac/0x16b0 [nfsv4]
+    decode_getfattr_generic.constprop.106+0xbc/0x150 [nfsv4]
+    nfs4_xdr_dec_lookup_root+0xac/0xb0 [nfsv4]
+    rpcauth_unwrap_resp+0xe8/0x140 [sunrpc]
+    call_decode+0x29c/0x910 [sunrpc]
+    __rpc_execute+0x140/0x8f0 [sunrpc]
+    rpc_run_task+0x170/0x200 [sunrpc]
+    nfs4_call_sync_sequence+0x68/0xa0 [nfsv4]
+    _nfs4_lookup_root.isra.44+0xd0/0xf0 [nfsv4]
+    nfs4_lookup_root+0xe0/0x350 [nfsv4]
+    nfs4_lookup_root_sec+0x70/0xa0 [nfsv4]
+    nfs4_find_root_sec+0xc4/0x100 [nfsv4]
+    nfs4_proc_get_rootfh+0x5c/0xf0 [nfsv4]
+    nfs4_get_rootfh+0x6c/0x190 [nfsv4]
+    nfs4_server_common_setup+0xc4/0x260 [nfsv4]
+    nfs4_create_server+0x278/0x3c0 [nfsv4]
+    nfs4_remote_mount+0x50/0xb0 [nfsv4]
+    mount_fs+0x74/0x210
+    vfs_kern_mount+0x78/0x220
+    nfs_do_root_mount+0xb0/0x140 [nfsv4]
+    nfs4_try_mount+0x60/0x100 [nfsv4]
+    nfs_fs_mount+0x5ec/0xda0 [nfs]
+    mount_fs+0x74/0x210
+    vfs_kern_mount+0x78/0x220
+    do_mount+0x254/0xf70
+    SyS_mount+0x94/0x100
+    system_call+0x38/0xe0
+
+	Reported-by: Jan Stancek <jstancek@redhat.com>
+	Signed-off-by: David Howells <dhowells@redhat.com>
+	Tested-by: Jan Stancek <jstancek@redhat.com>
+	Signed-off-by: James Morris <james.l.morris@oracle.com>
+(cherry picked from commit 0837e49ab3fa8d903a499984575d71efee8097ce)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/security/keys.txt
+#	drivers/md/dm-crypt.c
+#	fs/cifs/connect.c
+#	fs/crypto/keyinfo.c
+#	fs/ecryptfs/ecryptfs_kernel.h
+#	fs/fscache/object-list.c
+#	fs/nfs/nfs4idmap.c
+#	include/keys/user-type.h
+#	include/linux/key.h
+#	lib/digsig.c
+#	net/dns_resolver/dns_query.c
+#	security/keys/dh.c
+#	security/keys/encrypted-keys/encrypted.c
+#	security/keys/user_defined.c
+diff --cc Documentation/security/keys.txt
+index a4c33f1a7c6d,0e03baf271bd..000000000000
+--- a/Documentation/security/keys.txt
++++ b/Documentation/security/keys.txt
+@@@ -1094,6 -1147,26 +1094,29 @@@ data
+       the payload. key->datalen cannot be relied upon to be consistent with the
+       payload just dereferenced if the key's semaphore is not held.
+  
+++<<<<<<< HEAD
+++=======
++      Note that key->payload.data[0] has a shadow that is marked for __rcu
++      usage.  This is called key->payload.rcu_data0.  The following accessors
++      wrap the RCU calls to this element:
++ 
++      (a) Set or change the first payload pointer:
++ 
++ 		rcu_assign_keypointer(struct key *key, void *data);
++ 
++      (b) Read the first payload pointer with the key semaphore held:
++ 
++ 		[const] void *dereference_key_locked([const] struct key *key);
++ 
++ 	 Note that the return value will inherit its constness from the key
++ 	 parameter.  Static analysis will give an error if it things the lock
++ 	 isn't held.
++ 
++      (c) Read the first payload pointer with the RCU read lock held:
++ 
++ 		const void *dereference_key_rcu(const struct key *key);
++ 
+++>>>>>>> 0837e49ab3fa (KEYS: Differentiate uses of rcu_dereference_key() and user_key_payload())
+  
+  ===================
+  DEFINING A KEY TYPE
+diff --cc drivers/md/dm-crypt.c
+index 42505e46c965,389a3637ffcc..000000000000
+--- a/drivers/md/dm-crypt.c
++++ b/drivers/md/dm-crypt.c
+@@@ -1487,6 -1488,129 +1487,132 @@@ static int crypt_setkey(struct crypt_co
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_KEYS
++ 
++ static bool contains_whitespace(const char *str)
++ {
++ 	while (*str)
++ 		if (isspace(*str++))
++ 			return true;
++ 	return false;
++ }
++ 
++ static int crypt_set_keyring_key(struct crypt_config *cc, const char *key_string)
++ {
++ 	char *new_key_string, *key_desc;
++ 	int ret;
++ 	struct key *key;
++ 	const struct user_key_payload *ukp;
++ 
++ 	/*
++ 	 * Reject key_string with whitespace. dm core currently lacks code for
++ 	 * proper whitespace escaping in arguments on DM_TABLE_STATUS path.
++ 	 */
++ 	if (contains_whitespace(key_string)) {
++ 		DMERR("whitespace chars not allowed in key string");
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* look for next ':' separating key_type from key_description */
++ 	key_desc = strpbrk(key_string, ":");
++ 	if (!key_desc || key_desc == key_string || !strlen(key_desc + 1))
++ 		return -EINVAL;
++ 
++ 	if (strncmp(key_string, "logon:", key_desc - key_string + 1) &&
++ 	    strncmp(key_string, "user:", key_desc - key_string + 1))
++ 		return -EINVAL;
++ 
++ 	new_key_string = kstrdup(key_string, GFP_KERNEL);
++ 	if (!new_key_string)
++ 		return -ENOMEM;
++ 
++ 	key = request_key(key_string[0] == 'l' ? &key_type_logon : &key_type_user,
++ 			  key_desc + 1, NULL);
++ 	if (IS_ERR(key)) {
++ 		kzfree(new_key_string);
++ 		return PTR_ERR(key);
++ 	}
++ 
++ 	down_read(&key->sem);
++ 
++ 	ukp = user_key_payload_locked(key);
++ 	if (!ukp) {
++ 		up_read(&key->sem);
++ 		key_put(key);
++ 		kzfree(new_key_string);
++ 		return -EKEYREVOKED;
++ 	}
++ 
++ 	if (cc->key_size != ukp->datalen) {
++ 		up_read(&key->sem);
++ 		key_put(key);
++ 		kzfree(new_key_string);
++ 		return -EINVAL;
++ 	}
++ 
++ 	memcpy(cc->key, ukp->data, cc->key_size);
++ 
++ 	up_read(&key->sem);
++ 	key_put(key);
++ 
++ 	/* clear the flag since following operations may invalidate previously valid key */
++ 	clear_bit(DM_CRYPT_KEY_VALID, &cc->flags);
++ 
++ 	ret = crypt_setkey(cc);
++ 
++ 	/* wipe the kernel key payload copy in each case */
++ 	memset(cc->key, 0, cc->key_size * sizeof(u8));
++ 
++ 	if (!ret) {
++ 		set_bit(DM_CRYPT_KEY_VALID, &cc->flags);
++ 		kzfree(cc->key_string);
++ 		cc->key_string = new_key_string;
++ 	} else
++ 		kzfree(new_key_string);
++ 
++ 	return ret;
++ }
++ 
++ static int get_key_size(char **key_string)
++ {
++ 	char *colon, dummy;
++ 	int ret;
++ 
++ 	if (*key_string[0] != ':')
++ 		return strlen(*key_string) >> 1;
++ 
++ 	/* look for next ':' in key string */
++ 	colon = strpbrk(*key_string + 1, ":");
++ 	if (!colon)
++ 		return -EINVAL;
++ 
++ 	if (sscanf(*key_string + 1, "%u%c", &ret, &dummy) != 2 || dummy != ':')
++ 		return -EINVAL;
++ 
++ 	*key_string = colon;
++ 
++ 	/* remaining key string should be :<logon|user>:<key_desc> */
++ 
++ 	return ret;
++ }
++ 
++ #else
++ 
++ static int crypt_set_keyring_key(struct crypt_config *cc, const char *key_string)
++ {
++ 	return -EINVAL;
++ }
++ 
++ static int get_key_size(char **key_string)
++ {
++ 	return (*key_string[0] == ':') ? -EINVAL : strlen(*key_string) >> 1;
++ }
++ 
++ #endif
++ 
+++>>>>>>> 0837e49ab3fa (KEYS: Differentiate uses of rcu_dereference_key() and user_key_payload())
+  static int crypt_set_key(struct crypt_config *cc, char *key)
+  {
+  	int r = -EINVAL;
+diff --cc fs/cifs/connect.c
+index 4768def9363a,8a3ecef30d3c..000000000000
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@@ -2504,7 -2455,7 +2504,11 @@@ cifs_set_cifscreds(struct smb_vol *vol
+  	}
+  
+  	down_read(&key->sem);
+++<<<<<<< HEAD
+ +	upayload = key->payload.data;
+++=======
++ 	upayload = user_key_payload_locked(key);
+++>>>>>>> 0837e49ab3fa (KEYS: Differentiate uses of rcu_dereference_key() and user_key_payload())
+  	if (IS_ERR_OR_NULL(upayload)) {
+  		rc = upayload ? PTR_ERR(upayload) : -EINVAL;
+  		goto out_key_put;
+diff --cc fs/ecryptfs/ecryptfs_kernel.h
+index f622a733f7ad,95c1c8d34539..000000000000
+--- a/fs/ecryptfs/ecryptfs_kernel.h
++++ b/fs/ecryptfs/ecryptfs_kernel.h
+@@@ -117,8 -117,7 +117,12 @@@ ecryptfs_get_key_payload_data(struct ke
+  
+  	auth_tok = ecryptfs_get_encrypted_key_payload_data(key);
+  	if (!auth_tok)
+++<<<<<<< HEAD
+ +		return (struct ecryptfs_auth_tok *)
+ +			(((struct user_key_payload *)key->payload.data)->data);
+++=======
++ 		return (struct ecryptfs_auth_tok *)user_key_payload_locked(key)->data;
+++>>>>>>> 0837e49ab3fa (KEYS: Differentiate uses of rcu_dereference_key() and user_key_payload())
+  	else
+  		return auth_tok;
+  }
+diff --cc fs/fscache/object-list.c
+index 51dde817e1f2,67f940892ef8..000000000000
+--- a/fs/fscache/object-list.c
++++ b/fs/fscache/object-list.c
+@@@ -329,7 -329,7 +329,11 @@@ static void fscache_objlist_config(stru
+  	config = 0;
+  	rcu_read_lock();
+  
+++<<<<<<< HEAD
+ +	confkey = key->payload.data;
+++=======
++ 	confkey = user_key_payload_rcu(key);
+++>>>>>>> 0837e49ab3fa (KEYS: Differentiate uses of rcu_dereference_key() and user_key_payload())
+  	buf = confkey->data;
+  
+  	for (len = confkey->datalen - 1; len >= 0; len--) {
+diff --cc fs/nfs/nfs4idmap.c
+index fc1f0c846e95,835c163f61af..000000000000
+--- a/fs/nfs/nfs4idmap.c
++++ b/fs/nfs/nfs4idmap.c
+@@@ -315,7 -316,7 +315,11 @@@ static ssize_t nfs_idmap_get_key(const 
+  	if (ret < 0)
+  		goto out_up;
+  
+++<<<<<<< HEAD
+ +	payload = rcu_dereference(rkey->payload.rcudata);
+++=======
++ 	payload = user_key_payload_rcu(rkey);
+++>>>>>>> 0837e49ab3fa (KEYS: Differentiate uses of rcu_dereference_key() and user_key_payload())
+  	if (IS_ERR_OR_NULL(payload)) {
+  		ret = PTR_ERR(payload);
+  		goto out_up;
+diff --cc include/keys/user-type.h
+index 5e452c84f1e6,e098cbe27db5..000000000000
+--- a/include/keys/user-type.h
++++ b/include/keys/user-type.h
+@@@ -46,5 -48,16 +46,19 @@@ extern void user_describe(const struct 
+  extern long user_read(const struct key *key,
+  		      char __user *buffer, size_t buflen);
+  
+++<<<<<<< HEAD
+++=======
++ static inline const struct user_key_payload *user_key_payload_rcu(const struct key *key)
++ {
++ 	return (struct user_key_payload *)dereference_key_rcu(key);
++ }
++ 
++ static inline struct user_key_payload *user_key_payload_locked(const struct key *key)
++ {
++ 	return (struct user_key_payload *)dereference_key_locked((struct key *)key);
++ }
++ 
++ #endif /* CONFIG_KEYS */
+++>>>>>>> 0837e49ab3fa (KEYS: Differentiate uses of rcu_dereference_key() and user_key_payload())
+  
+  #endif /* _KEYS_USER_TYPE_H */
+diff --cc include/linux/key.h
+index e5afa2185527,e45212f2777e..000000000000
+--- a/include/linux/key.h
++++ b/include/linux/key.h
+@@@ -324,8 -354,11 +324,16 @@@ static inline bool key_is_instantiated(
+  		!test_bit(KEY_FLAG_NEGATIVE, &key->flags);
+  }
+  
+++<<<<<<< HEAD
+ +#define rcu_dereference_key(KEY)					\
+ +	(rcu_dereference_protected((KEY)->payload.rcudata,		\
+++=======
++ #define dereference_key_rcu(KEY)					\
++ 	(rcu_dereference((KEY)->payload.rcu_data0))
++ 
++ #define dereference_key_locked(KEY)					\
++ 	(rcu_dereference_protected((KEY)->payload.rcu_data0,		\
+++>>>>>>> 0837e49ab3fa (KEYS: Differentiate uses of rcu_dereference_key() and user_key_payload())
+  				   rwsem_is_locked(&((struct key *)(KEY))->sem)))
+  
+  #define rcu_assign_keypointer(KEY, PAYLOAD)				\
+diff --cc lib/digsig.c
+index 2f31e6a45f0a,03d7c63837ae..000000000000
+--- a/lib/digsig.c
++++ b/lib/digsig.c
+@@@ -84,7 -85,7 +84,11 @@@ static int digsig_verify_rsa(struct ke
+  	struct pubkey_hdr *pkh;
+  
+  	down_read(&key->sem);
+++<<<<<<< HEAD
+ +	ukp = key->payload.data;
+++=======
++ 	ukp = user_key_payload_locked(key);
+++>>>>>>> 0837e49ab3fa (KEYS: Differentiate uses of rcu_dereference_key() and user_key_payload())
+  
+  	if (ukp->datalen < sizeof(*pkh))
+  		goto err1;
+diff --cc net/dns_resolver/dns_query.c
+index 90967b2836c6,d502c94b1a82..000000000000
+--- a/net/dns_resolver/dns_query.c
++++ b/net/dns_resolver/dns_query.c
+@@@ -142,8 -141,7 +142,12 @@@ int dns_query(const char *type, const c
+  	if (ret)
+  		goto put;
+  
+++<<<<<<< HEAD
+ +	upayload = rcu_dereference_protected(rkey->payload.data,
+ +					     lockdep_is_held(&rkey->sem));
+++=======
++ 	upayload = user_key_payload_locked(rkey);
+++>>>>>>> 0837e49ab3fa (KEYS: Differentiate uses of rcu_dereference_key() and user_key_payload())
+  	len = upayload->datalen;
+  
+  	ret = -ENOMEM;
+diff --cc security/keys/encrypted-keys/encrypted.c
+index e203ed4069fb,0010955d7876..000000000000
+--- a/security/keys/encrypted-keys/encrypted.c
++++ b/security/keys/encrypted-keys/encrypted.c
+@@@ -314,7 -314,7 +314,11 @@@ static struct key *request_user_key(con
+  		goto error;
+  
+  	down_read(&ukey->sem);
+++<<<<<<< HEAD
+ +	upayload = ukey->payload.data;
+++=======
++ 	upayload = user_key_payload_locked(ukey);
+++>>>>>>> 0837e49ab3fa (KEYS: Differentiate uses of rcu_dereference_key() and user_key_payload())
+  	*master_key = upayload->data;
+  	*master_keylen = upayload->datalen;
+  error:
+diff --cc security/keys/user_defined.c
+index faa2caeb593f,26605134f17a..000000000000
+--- a/security/keys/user_defined.c
++++ b/security/keys/user_defined.c
+@@@ -97,34 -96,20 +97,43 @@@ EXPORT_SYMBOL_GPL(user_instantiate)
+   */
+  int user_update(struct key *key, struct key_preparsed_payload *prep)
+  {
+ -	struct user_key_payload *zap = NULL;
+ +	struct user_key_payload *upayload, *zap;
+ +	size_t datalen = prep->datalen;
+  	int ret;
+  
+ +	ret = -EINVAL;
+ +	if (datalen <= 0 || datalen > 32767 || !prep->data)
+ +		goto error;
+ +
+++<<<<<<< HEAD
+ +	/* construct a replacement payload */
+ +	ret = -ENOMEM;
+ +	upayload = kmalloc(sizeof(*upayload) + datalen, GFP_KERNEL);
+ +	if (!upayload)
+ +		goto error;
+ +
+ +	upayload->datalen = datalen;
+ +	memcpy(upayload->data, prep->data, datalen);
+ +
+  	/* check the quota and attach the new data */
+ -	ret = key_payload_reserve(key, prep->datalen);
+ -	if (ret < 0)
+ -		return ret;
+ +	zap = upayload;
+ +
+ +	ret = key_payload_reserve(key, datalen);
+  
+ +	if (ret == 0) {
+ +		/* attach the new data, displacing the old */
+ +		zap = key->payload.data;
+ +		rcu_assign_keypointer(key, upayload);
+ +		key->expiry = 0;
+ +	}
+++=======
++ 	/* attach the new data, displacing the old */
++ 	key->expiry = prep->expiry;
++ 	if (!test_bit(KEY_FLAG_NEGATIVE, &key->flags))
++ 		zap = dereference_key_locked(key);
++ 	rcu_assign_keypointer(key, prep->payload.data[0]);
++ 	prep->payload.data[0] = NULL;
+++>>>>>>> 0837e49ab3fa (KEYS: Differentiate uses of rcu_dereference_key() and user_key_payload())
+  
+  	if (zap)
+  		kfree_rcu(zap, rcu);
+@@@ -151,7 -123,7 +160,11 @@@ EXPORT_SYMBOL_GPL(user_match)
+   */
+  void user_revoke(struct key *key)
+  {
+++<<<<<<< HEAD
+ +	struct user_key_payload *upayload = key->payload.data;
+++=======
++ 	struct user_key_payload *upayload = user_key_payload_locked(key);
+++>>>>>>> 0837e49ab3fa (KEYS: Differentiate uses of rcu_dereference_key() and user_key_payload())
+  
+  	/* clear the quota */
+  	key_payload_reserve(key, 0);
+@@@ -194,10 -166,10 +207,14 @@@ EXPORT_SYMBOL_GPL(user_describe)
+   */
+  long user_read(const struct key *key, char __user *buffer, size_t buflen)
+  {
+ -	const struct user_key_payload *upayload;
+ +	struct user_key_payload *upayload;
+  	long ret;
+  
+++<<<<<<< HEAD
+ +	upayload = rcu_dereference_key(key);
+++=======
++ 	upayload = user_key_payload_locked(key);
+++>>>>>>> 0837e49ab3fa (KEYS: Differentiate uses of rcu_dereference_key() and user_key_payload())
+  	ret = upayload->datalen;
+  
+  	/* we can return the data as is */
+* Unmerged path fs/crypto/keyinfo.c
+* Unmerged path security/keys/dh.c
+* Unmerged path Documentation/security/keys.txt
+* Unmerged path drivers/md/dm-crypt.c
+* Unmerged path fs/cifs/connect.c
+* Unmerged path fs/crypto/keyinfo.c
+* Unmerged path fs/ecryptfs/ecryptfs_kernel.h
+* Unmerged path fs/fscache/object-list.c
+* Unmerged path fs/nfs/nfs4idmap.c
+* Unmerged path include/keys/user-type.h
+* Unmerged path include/linux/key.h
+* Unmerged path lib/digsig.c
+* Unmerged path net/dns_resolver/dns_query.c
+* Unmerged path security/keys/dh.c
+* Unmerged path security/keys/encrypted-keys/encrypted.c
+diff --git a/security/keys/trusted.c b/security/keys/trusted.c
+index 85c9acff3892..2659d28c316d 100644
+--- a/security/keys/trusted.c
++++ b/security/keys/trusted.c
+@@ -1137,12 +1137,12 @@ out:
+ static long trusted_read(const struct key *key, char __user *buffer,
+ 			 size_t buflen)
+ {
+-	struct trusted_key_payload *p;
++	const struct trusted_key_payload *p;
+ 	char *ascii_buf;
+ 	char *bufp;
+ 	int i;
+ 
+-	p = rcu_dereference_key(key);
++	p = dereference_key_locked(key);
+ 	if (!p)
+ 		return -EINVAL;
+ 	if (!buffer || buflen <= 0)
+* Unmerged path security/keys/user_defined.c
