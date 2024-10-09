@@ -1,0 +1,162 @@
+drm/i915: A hotfix for making aliasing PPGTT work for GVT-g
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [drm] i915: A hotfix for making aliasing PPGTT work for GVT-g (Rob Clark) [1380115 1422186]
+Rebuild_FUZZ: 96.49%
+commit-author Zhi Wang <zhi.a.wang@intel.com>
+commit e81ecb5e31db6c2a259d694738cf620d9fa70861
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/e81ecb5e.failed
+
+This patch makes PPGTT page table non-shrinkable when using aliasing PPGTT
+mode. It's just a temporary solution for making GVT-g work.
+
+Fixes: 2ce5179fe826 ("drm/i915/gtt: Free unused lower-level page tables")
+	Cc: Tvrtko Ursulin <tvrtko.ursulin@linux.intel.com>
+	Cc: Michal Winiarski <michal.winiarski@intel.com>
+	Cc: Michel Thierry <michel.thierry@intel.com>
+	Cc: Mika Kuoppala <mika.kuoppala@intel.com>
+	Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+	Cc: Chris Wilson <chris@chris-wilson.co.uk>
+	Cc: Daniel Vetter <daniel.vetter@intel.com>
+	Cc: Zhenyu Wang <zhenyuw@linux.intel.com>
+	Cc: Zhiyuan Lv <zhiyuan.lv@intel.com>
+	Signed-off-by: Zhi Wang <zhi.a.wang@intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/1486559013-25251-2-git-send-email-zhi.a.wang@intel.com
+	Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+	Cc: <drm-intel-fixes@lists.freedesktop.org> # v4.10-rc1+
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+(cherry picked from commit e81ecb5e31db6c2a259d694738cf620d9fa70861)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/i915_gem_gtt.c
+diff --cc drivers/gpu/drm/i915/i915_gem_gtt.c
+index 49e4f26b79d8,90acddbaaa5e..000000000000
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.c
+@@@ -700,28 -723,100 +700,94 @@@ static int gen8_48b_mm_switch(struct i9
+  	return gen8_write_pdp(req, 0, px_dma(&ppgtt->pml4));
+  }
+  
+ -/* PDE TLBs are a pain to invalidate on GEN8+. When we modify
+ - * the page table structures, we mark them dirty so that
+ - * context switching/execlist queuing code takes extra steps
+ - * to ensure that tlbs are flushed.
+ - */
+ -static void mark_tlbs_dirty(struct i915_hw_ppgtt *ppgtt)
+ +static void gen8_ppgtt_clear_pte_range(struct i915_address_space *vm,
+ +				       struct i915_page_directory_pointer *pdp,
+ +				       uint64_t start,
+ +				       uint64_t length,
+ +				       gen8_pte_t scratch_pte)
+  {
+ -	ppgtt->pd_dirty_rings = INTEL_INFO(ppgtt->base.i915)->ring_mask;
+ -}
+ -
+ -/* Removes entries from a single page table, releasing it if it's empty.
+ - * Caller can use the return value to update higher-level entries.
+ - */
+ -static bool gen8_ppgtt_clear_pt(struct i915_address_space *vm,
+ -				struct i915_page_table *pt,
+ -				uint64_t start,
+ -				uint64_t length)
+ -{
+ -	struct i915_hw_ppgtt *ppgtt = i915_vm_to_ppgtt(vm);
+ -	unsigned int num_entries = gen8_pte_count(start, length);
+ -	unsigned int pte = gen8_pte_index(start);
+ -	unsigned int pte_end = pte + num_entries;
+ +	struct i915_hw_ppgtt *ppgtt =
+ +		container_of(vm, struct i915_hw_ppgtt, base);
+  	gen8_pte_t *pt_vaddr;
+ -	gen8_pte_t scratch_pte = gen8_pte_encode(vm->scratch_page.daddr,
+ -						 I915_CACHE_LLC);
+ +	unsigned pdpe = gen8_pdpe_index(start);
+ +	unsigned pde = gen8_pde_index(start);
+ +	unsigned pte = gen8_pte_index(start);
+ +	unsigned num_entries = length >> PAGE_SHIFT;
+ +	unsigned last_pte, i;
+  
+ -	if (WARN_ON(!px_page(pt)))
+ -		return false;
+ +	if (WARN_ON(!pdp))
+ +		return;
+  
+ -	GEM_BUG_ON(pte_end > GEN8_PTES);
+ +	while (num_entries) {
+ +		struct i915_page_directory *pd;
+ +		struct i915_page_table *pt;
+  
+++<<<<<<< HEAD
+++=======
++ 	bitmap_clear(pt->used_ptes, pte, num_entries);
++ 	if (USES_FULL_PPGTT(vm->i915)) {
++ 		if (bitmap_empty(pt->used_ptes, GEN8_PTES))
++ 			return true;
++ 	}
++ 
++ 	pt_vaddr = kmap_px(pt);
++ 
++ 	while (pte < pte_end)
++ 		pt_vaddr[pte++] = scratch_pte;
++ 
++ 	kunmap_px(ppgtt, pt_vaddr);
++ 
++ 	return false;
++ }
++ 
++ /* Removes entries from a single page dir, releasing it if it's empty.
++  * Caller can use the return value to update higher-level entries
++  */
++ static bool gen8_ppgtt_clear_pd(struct i915_address_space *vm,
++ 				struct i915_page_directory *pd,
++ 				uint64_t start,
++ 				uint64_t length)
++ {
++ 	struct i915_hw_ppgtt *ppgtt = i915_vm_to_ppgtt(vm);
++ 	struct i915_page_table *pt;
++ 	uint64_t pde;
++ 	gen8_pde_t *pde_vaddr;
++ 	gen8_pde_t scratch_pde = gen8_pde_encode(px_dma(vm->scratch_pt),
++ 						 I915_CACHE_LLC);
++ 
++ 	gen8_for_each_pde(pt, pd, start, length, pde) {
++ 		if (WARN_ON(!pd->page_table[pde]))
++ 			break;
++ 
++ 		if (gen8_ppgtt_clear_pt(vm, pt, start, length)) {
++ 			__clear_bit(pde, pd->used_pdes);
++ 			pde_vaddr = kmap_px(pd);
++ 			pde_vaddr[pde] = scratch_pde;
++ 			kunmap_px(ppgtt, pde_vaddr);
++ 			free_pt(vm->i915, pt);
++ 		}
++ 	}
++ 
++ 	if (bitmap_empty(pd->used_pdes, I915_PDES))
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ /* Removes entries from a single page dir pointer, releasing it if it's empty.
++  * Caller can use the return value to update higher-level entries
++  */
++ static bool gen8_ppgtt_clear_pdp(struct i915_address_space *vm,
++ 				 struct i915_page_directory_pointer *pdp,
++ 				 uint64_t start,
++ 				 uint64_t length)
++ {
++ 	struct i915_hw_ppgtt *ppgtt = i915_vm_to_ppgtt(vm);
++ 	struct i915_page_directory *pd;
++ 	uint64_t pdpe;
++ 
++ 	gen8_for_each_pdpe(pd, pdp, start, length, pdpe) {
+++>>>>>>> e81ecb5e31db (drm/i915: A hotfix for making aliasing PPGTT work for GVT-g)
+  		if (WARN_ON(!pdp->page_directory[pdpe]))
+  			break;
+  
+* Unmerged path drivers/gpu/drm/i915/i915_gem_gtt.c
