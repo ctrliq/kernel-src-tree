@@ -1,0 +1,270 @@
+xfs: Change how listxattr generates synthetic attributes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 5d92b75c753ae27578ee764df3be650c67fa5877
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/5d92b75c.failed
+
+Instead of adding the synthesized POSIX ACL attribute names after listing all
+non-synthesized attributes, generate them immediately when listing the
+non-synthesized attributes.
+
+In addition, merge xfs_xattr_put_listent and xfs_xattr_put_listent_sizes to
+ensure that the list size is computed correctly; the split version was
+overestimating the list size for non-root users.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+	Cc: Dave Chinner <david@fromorbit.com>
+	Cc: xfs@oss.sgi.com
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 5d92b75c753ae27578ee764df3be650c67fa5877)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_acl.c
+#	fs/xfs/xfs_acl.h
+#	fs/xfs/xfs_xattr.c
+diff --cc fs/xfs/xfs_acl.c
+index 20123ec5aa96,2d5df1f23bbc..000000000000
+--- a/fs/xfs/xfs_acl.c
++++ b/fs/xfs/xfs_acl.c
+@@@ -261,147 -252,17 +261,150 @@@ xfs_set_mode(struct inode *inode, umode
+  	return error;
+  }
+  
+++<<<<<<< HEAD
+ +static int
+ +xfs_acl_exists(struct inode *inode, unsigned char *name)
+ +{
+ +	int len = XFS_ACL_MAX_SIZE(XFS_M(inode->i_sb));
+ +
+ +	return (xfs_attr_get(XFS_I(inode), name, NULL, &len,
+ +			    ATTR_ROOT|ATTR_KERNOVAL) == 0);
+ +}
+ +
+ +int
+ +posix_acl_access_exists(struct inode *inode)
+ +{
+ +	return xfs_acl_exists(inode, SGI_ACL_FILE);
+ +}
+ +
+ +int
+ +posix_acl_default_exists(struct inode *inode)
+ +{
+ +	if (!S_ISDIR(inode->i_mode))
+ +		return 0;
+ +	return xfs_acl_exists(inode, SGI_ACL_DEFAULT);
+ +}
+ +
+ +/*
+ + * No need for i_mutex because the inode is not yet exposed to the VFS.
+ + */
+++=======
+++>>>>>>> 5d92b75c753a (xfs: Change how listxattr generates synthetic attributes)
+ +int
+ +xfs_inherit_acl(struct inode *inode, struct posix_acl *acl)
+ +{
+ +	umode_t mode = inode->i_mode;
+ +	int error = 0, inherit = 0;
+ +
+ +	if (S_ISDIR(inode->i_mode)) {
+ +		error = xfs_set_acl(inode, ACL_TYPE_DEFAULT, acl);
+ +		if (error)
+ +			goto out;
+ +	}
+ +
+ +	error = posix_acl_create(&acl, GFP_KERNEL, &mode);
+ +	if (error < 0)
+ +		return error;
+ +
+ +	/*
+ +	 * If posix_acl_create returns a positive value we need to
+ +	 * inherit a permission that can't be represented using the Unix
+ +	 * mode bits and we actually need to set an ACL.
+ +	 */
+ +	if (error > 0)
+ +		inherit = 1;
+ +
+ +	error = xfs_set_mode(inode, mode);
+ +	if (error)
+ +		goto out;
+ +
+ +	if (inherit)
+ +		error = xfs_set_acl(inode, ACL_TYPE_ACCESS, acl);
+ +
+ +out:
+ +	posix_acl_release(acl);
+ +	return error;
+ +}
+ +
+  int
+ -xfs_set_acl(struct inode *inode, struct posix_acl *acl, int type)
+ +xfs_acl_chmod(struct inode *inode)
+  {
+ +	struct posix_acl *acl;
+ +	int error;
+ +
+ +	if (S_ISLNK(inode->i_mode))
+ +		return -EOPNOTSUPP;
+ +
+ +	acl = xfs_get_acl(inode, ACL_TYPE_ACCESS);
+ +	if (IS_ERR(acl) || !acl)
+ +		return PTR_ERR(acl);
+ +
+ +	error = posix_acl_chmod(&acl, GFP_KERNEL, inode->i_mode);
+ +	if (error)
+ +		return error;
+ +
+ +	error = xfs_set_acl(inode, ACL_TYPE_ACCESS, acl);
+ +	posix_acl_release(acl);
+ +	return error;
+ +}
+ +
+ +static int
+ +xfs_xattr_acl_get(struct dentry *dentry, const char *name,
+ +		void *value, size_t size, int type)
+ +{
+ +	struct posix_acl *acl;
+ +	int error;
+ +
+ +	acl = xfs_get_acl(dentry->d_inode, type);
+ +	if (IS_ERR(acl))
+ +		return PTR_ERR(acl);
+ +	if (acl == NULL)
+ +		return -ENODATA;
+ +
+ +	error = posix_acl_to_xattr(&init_user_ns, acl, value, size);
+ +	posix_acl_release(acl);
+ +
+ +	return error;
+ +}
+ +
+ +static int
+ +xfs_xattr_acl_set(struct dentry *dentry, const char *name,
+ +		const void *value, size_t size, int flags, int type)
+ +{
+ +	struct inode *inode = dentry->d_inode;
+ +	struct posix_acl *acl = NULL;
+  	int error = 0;
+  
+ -	if (!acl)
+ +	if (flags & XATTR_CREATE)
+ +		return -EINVAL;
+ +	if (type == ACL_TYPE_DEFAULT && !S_ISDIR(inode->i_mode))
+ +		return value ? -EACCES : 0;
+ +	if (!inode_owner_or_capable(inode))
+ +		return -EPERM;
+ +
+ +	if (!value)
+  		goto set_acl;
+  
+ +	acl = posix_acl_from_xattr(&init_user_ns, value, size);
+ +	if (!acl) {
+ +		/*
+ +		 * acl_set_file(3) may request that we set default ACLs with
+ +		 * zero length -- defend (gracefully) against that here.
+ +		 */
+ +		goto out;
+ +	}
+ +	if (IS_ERR(acl)) {
+ +		error = PTR_ERR(acl);
+ +		goto out;
+ +	}
+ +
+ +	error = posix_acl_valid(acl);
+ +	if (error)
+ +		goto out_release;
+ +
+  	error = -E2BIG;
+  	if (acl->a_count > XFS_ACL_MAX_ENTRIES(XFS_M(inode->i_sb)))
+ -		return error;
+ +		goto out_release;
+  
+  	if (type == ACL_TYPE_ACCESS) {
+  		umode_t mode = inode->i_mode;
+diff --cc fs/xfs/xfs_acl.h
+index b37c11a229e9,286fa89217f5..000000000000
+--- a/fs/xfs/xfs_acl.h
++++ b/fs/xfs/xfs_acl.h
+@@@ -23,22 -23,13 +23,30 @@@ struct posix_acl
+  
+  #ifdef CONFIG_XFS_POSIX_ACL
+  extern struct posix_acl *xfs_get_acl(struct inode *inode, int type);
+++<<<<<<< HEAD
+ +extern int xfs_inherit_acl(struct inode *inode, struct posix_acl *default_acl);
+ +extern int xfs_acl_chmod(struct inode *inode);
+ +extern int posix_acl_access_exists(struct inode *inode);
+ +extern int posix_acl_default_exists(struct inode *inode);
+ +
+ +extern const struct xattr_handler xfs_xattr_acl_access_handler;
+ +extern const struct xattr_handler xfs_xattr_acl_default_handler;
+++=======
++ extern int xfs_set_acl(struct inode *inode, struct posix_acl *acl, int type);
+++>>>>>>> 5d92b75c753a (xfs: Change how listxattr generates synthetic attributes)
+  #else
+  static inline struct posix_acl *xfs_get_acl(struct inode *inode, int type)
+  {
+  	return NULL;
+  }
+++<<<<<<< HEAD
+ +# define xfs_inherit_acl(inode, default_acl)		0
+ +# define xfs_acl_chmod(inode)				0
+ +# define posix_acl_access_exists(inode)			0
+ +# define posix_acl_default_exists(inode)		0
+++=======
++ # define xfs_set_acl					NULL
+++>>>>>>> 5d92b75c753a (xfs: Change how listxattr generates synthetic attributes)
+  #endif /* CONFIG_XFS_POSIX_ACL */
+  
+  extern void xfs_forget_acl(struct inode *inode, const char *name, int xflags);
+diff --cc fs/xfs/xfs_xattr.c
+index 2a753b46d3d8,110f1d7d86b0..000000000000
+--- a/fs/xfs/xfs_xattr.c
++++ b/fs/xfs/xfs_xattr.c
+@@@ -224,8 -225,7 +229,12 @@@ xfs_vn_listxattr(struct dentry *dentry
+  {
+  	struct xfs_attr_list_context context;
+  	struct attrlist_cursor_kern cursor = { 0 };
+++<<<<<<< HEAD
+ +	struct inode		*inode = dentry->d_inode;
+ +	int			error;
+++=======
++ 	struct inode		*inode = d_inode(dentry);
+++>>>>>>> 5d92b75c753a (xfs: Change how listxattr generates synthetic attributes)
+  
+  	/*
+  	 * First read the regular on-disk attributes.
+@@@ -247,24 -243,5 +252,27 @@@
+  	if (context.count < 0)
+  		return -ERANGE;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Then add the two synthetic ACL attributes.
+ +	 */
+ +	if (posix_acl_access_exists(inode)) {
+ +		error = list_one_attr(POSIX_ACL_XATTR_ACCESS,
+ +				strlen(POSIX_ACL_XATTR_ACCESS) + 1,
+ +				data, size, &context.count);
+ +		if (error)
+ +			return error;
+ +	}
+ +
+ +	if (posix_acl_default_exists(inode)) {
+ +		error = list_one_attr(POSIX_ACL_XATTR_DEFAULT,
+ +				strlen(POSIX_ACL_XATTR_DEFAULT) + 1,
+ +				data, size, &context.count);
+ +		if (error)
+ +			return error;
+ +	}
+ +
+++=======
+++>>>>>>> 5d92b75c753a (xfs: Change how listxattr generates synthetic attributes)
+  	return context.count;
+  }
+* Unmerged path fs/xfs/xfs_acl.c
+* Unmerged path fs/xfs/xfs_acl.h
+* Unmerged path fs/xfs/xfs_xattr.c
