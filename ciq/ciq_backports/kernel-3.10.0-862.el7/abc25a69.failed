@@ -1,0 +1,128 @@
+blk-mq: Fix preempt count imbalance
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Bart Van Assche <bart.vanassche@sandisk.com>
+commit abc25a693091e61537e40dfe24e8ee5deaf08208
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/abc25a69.failed
+
+Avoid that the following kernel bug gets triggered:
+
+BUG: sleeping function called from invalid context at ./include/linux/buffer_head.h:349
+in_atomic(): 1, irqs_disabled(): 0, pid: 8019, name: find
+CPU: 10 PID: 8019 Comm: find Tainted: G        W I     4.11.0-rc4-dbg+ #2
+Call Trace:
+ dump_stack+0x68/0x93
+ ___might_sleep+0x16e/0x230
+ __might_sleep+0x4a/0x80
+ __ext4_get_inode_loc+0x1e0/0x4e0
+ ext4_iget+0x70/0xbc0
+ ext4_iget_normal+0x2f/0x40
+ ext4_lookup+0xb6/0x1f0
+ lookup_slow+0x104/0x1e0
+ walk_component+0x19a/0x330
+ path_lookupat+0x4b/0x100
+ filename_lookup+0x9a/0x110
+ user_path_at_empty+0x36/0x40
+ vfs_statx+0x67/0xc0
+ SYSC_newfstatat+0x20/0x40
+ SyS_newfstatat+0xe/0x10
+ entry_SYSCALL_64_fastpath+0x18/0xad
+
+This happens since the big if/else in blk_mq_make_request() doesn't
+have final else section that also drops the ctx. Add that.
+
+Fixes: b00c53e8f411 ("blk-mq: fix schedule-while-atomic with scheduler attached")
+	Signed-off-by: Bart Van Assche <bart.vanassche@sandisk.com>
+	Cc: Omar Sandoval <osandov@fb.com>
+
+Added a bit more to the commit log.
+
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit abc25a693091e61537e40dfe24e8ee5deaf08208)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index 1b06c94aa73d,e6aad49c1686..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -1543,34 -1607,46 +1543,71 @@@ static void blk_sq_make_request(struct 
+  		}
+  
+  		list_add_tail(&rq->queuelist, &plug->mq_list);
+++<<<<<<< HEAD
+ +		return;
+ +	}
+++=======
++ 	} else if (plug && !blk_queue_nomerges(q)) {
++ 		blk_mq_bio_to_request(rq, bio);
++ 
++ 		/*
++ 		 * We do limited plugging. If the bio can be merged, do that.
++ 		 * Otherwise the existing request in the plug list will be
++ 		 * issued. So the plug list will have one request at most
++ 		 * The plug list might get flushed before this. If that happens,
++ 		 * the plug list is empty, and same_queue_rq is invalid.
++ 		 */
++ 		if (list_empty(&plug->mq_list))
++ 			same_queue_rq = NULL;
++ 		if (same_queue_rq)
++ 			list_del_init(&same_queue_rq->queuelist);
++ 		list_add_tail(&rq->queuelist, &plug->mq_list);
++ 
++ 		blk_mq_put_ctx(data.ctx);
++ 
++ 		if (same_queue_rq)
++ 			blk_mq_try_issue_directly(data.hctx, same_queue_rq,
++ 					&cookie);
++ 	} else if (q->nr_hw_queues > 1 && is_sync) {
++ 		blk_mq_put_ctx(data.ctx);
++ 		blk_mq_bio_to_request(rq, bio);
++ 		blk_mq_try_issue_directly(data.hctx, rq, &cookie);
++ 	} else if (q->elevator) {
++ 		blk_mq_put_ctx(data.ctx);
++ 		blk_mq_bio_to_request(rq, bio);
++ 		blk_mq_sched_insert_request(rq, false, true, true, true);
++ 	} else if (!blk_mq_merge_queue_io(data.hctx, data.ctx, rq, bio)) {
++ 		blk_mq_put_ctx(data.ctx);
++ 		blk_mq_run_hw_queue(data.hctx, true);
++ 	} else
++ 		blk_mq_put_ctx(data.ctx);
+++>>>>>>> abc25a693091 (blk-mq: Fix preempt count imbalance)
+  
+ -	return cookie;
+ +	if (!blk_mq_merge_queue_io(data.hctx, data.ctx, rq, bio)) {
+ +		/*
+ +		 * For a SYNC request, send it to the hardware immediately. For
+ +		 * an ASYNC request, just ensure that we run it later on. The
+ +		 * latter allows for merging opportunities and more efficient
+ +		 * dispatching.
+ +		 */
+ +run_queue:
+ +		blk_mq_run_hw_queue(data.hctx, !is_sync || is_flush_fua);
+ +	}
+ +
+ +	blk_mq_put_ctx(data.ctx);
+  }
+  
+ -void blk_mq_free_rqs(struct blk_mq_tag_set *set, struct blk_mq_tags *tags,
+ -		     unsigned int hctx_idx)
+ +/*
+ + * Default mapping to a software queue, since we use one per CPU.
+ + */
+ +struct blk_mq_hw_ctx *blk_mq_map_queue(struct request_queue *q, const int cpu)
+ +{
+ +	return q->queue_hw_ctx[q->mq_map[cpu]];
+ +}
+ +EXPORT_SYMBOL(blk_mq_map_queue);
+ +
+ +static void blk_mq_free_rq_map(struct blk_mq_tag_set *set,
+ +		struct blk_mq_tags *tags, unsigned int hctx_idx)
+  {
+  	struct page *page;
+  
+* Unmerged path block/blk-mq.c
