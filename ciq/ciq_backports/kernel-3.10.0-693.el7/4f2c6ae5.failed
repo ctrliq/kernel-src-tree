@@ -1,0 +1,241 @@
+switchdev: Require RTNL mutex to be held when sending FDB notifications
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Ido Schimmel <idosch@mellanox.com>
+commit 4f2c6ae5c64c353fb1b0425e4747e5603feadba1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/4f2c6ae5.failed
+
+When switchdev drivers process FDB notifications from the underlying
+device they resolve the netdev to which the entry points to and notify
+the bridge using the switchdev notifier.
+
+However, since the RTNL mutex is not held there is nothing preventing
+the netdev from disappearing in the middle, which will cause
+br_switchdev_event() to dereference a non-existing netdev.
+
+Make switchdev drivers hold the lock at the beginning of the
+notification processing session and release it once it ends, after
+notifying the bridge.
+
+Also, remove switchdev_mutex and fdb_lock, as they are no longer needed
+when RTNL mutex is held.
+
+Fixes: 03bf0c281234 ("switchdev: introduce switchdev notifier")
+	Signed-off-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4f2c6ae5c64c353fb1b0425e4747e5603feadba1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
+#	drivers/net/ethernet/rocker/rocker.c
+#	net/bridge/br.c
+#	net/switchdev/switchdev.c
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
+index 2e545c3ba767,e492ca2cdecd..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
+@@@ -1391,6 -1392,7 +1392,10 @@@ static void mlxsw_sp_fdb_notify_work(st
+  
+  	mlxsw_sp = container_of(work, struct mlxsw_sp, fdb_notify.dw.work);
+  
+++<<<<<<< HEAD
+++=======
++ 	rtnl_lock();
+++>>>>>>> 4f2c6ae5c64c (switchdev: Require RTNL mutex to be held when sending FDB notifications)
+  	do {
+  		mlxsw_reg_sfn_pack(sfn_pl);
+  		err = mlxsw_reg_query(mlxsw_sp->core, MLXSW_REG(sfn), sfn_pl);
+@@@ -1403,6 -1405,7 +1408,10 @@@
+  			mlxsw_sp_fdb_notify_rec_process(mlxsw_sp, sfn_pl, i);
+  
+  	} while (num_rec);
+++<<<<<<< HEAD
+++=======
++ 	rtnl_unlock();
+++>>>>>>> 4f2c6ae5c64c (switchdev: Require RTNL mutex to be held when sending FDB notifications)
+  
+  	kfree(sfn_pl);
+  	mlxsw_sp_fdb_notify_work_schedule(mlxsw_sp);
+diff --cc net/bridge/br.c
+index 8a1ecd1e7f96,3addc05b9a16..000000000000
+--- a/net/bridge/br.c
++++ b/net/bridge/br.c
+@@@ -22,6 -22,165 +22,167 @@@
+  
+  #include "br_private.h"
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Handle changes in state of network devices enslaved to a bridge.
++  *
++  * Note: don't care about up/down if bridge itself is down, because
++  *     port state is checked when bridge is brought up.
++  */
++ static int br_device_event(struct notifier_block *unused, unsigned long event, void *ptr)
++ {
++ 	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
++ 	struct net_bridge_port *p;
++ 	struct net_bridge *br;
++ 	bool changed_addr;
++ 	int err;
++ 
++ 	/* register of bridge completed, add sysfs entries */
++ 	if ((dev->priv_flags & IFF_EBRIDGE) && event == NETDEV_REGISTER) {
++ 		br_sysfs_addbr(dev);
++ 		return NOTIFY_DONE;
++ 	}
++ 
++ 	/* not a port of a bridge */
++ 	p = br_port_get_rtnl(dev);
++ 	if (!p)
++ 		return NOTIFY_DONE;
++ 
++ 	br = p->br;
++ 
++ 	switch (event) {
++ 	case NETDEV_CHANGEMTU:
++ 		dev_set_mtu(br->dev, br_min_mtu(br));
++ 		break;
++ 
++ 	case NETDEV_CHANGEADDR:
++ 		spin_lock_bh(&br->lock);
++ 		br_fdb_changeaddr(p, dev->dev_addr);
++ 		changed_addr = br_stp_recalculate_bridge_id(br);
++ 		spin_unlock_bh(&br->lock);
++ 
++ 		if (changed_addr)
++ 			call_netdevice_notifiers(NETDEV_CHANGEADDR, br->dev);
++ 
++ 		break;
++ 
++ 	case NETDEV_CHANGE:
++ 		br_port_carrier_check(p);
++ 		break;
++ 
++ 	case NETDEV_FEAT_CHANGE:
++ 		netdev_update_features(br->dev);
++ 		break;
++ 
++ 	case NETDEV_DOWN:
++ 		spin_lock_bh(&br->lock);
++ 		if (br->dev->flags & IFF_UP)
++ 			br_stp_disable_port(p);
++ 		spin_unlock_bh(&br->lock);
++ 		break;
++ 
++ 	case NETDEV_UP:
++ 		if (netif_running(br->dev) && netif_oper_up(dev)) {
++ 			spin_lock_bh(&br->lock);
++ 			br_stp_enable_port(p);
++ 			spin_unlock_bh(&br->lock);
++ 		}
++ 		break;
++ 
++ 	case NETDEV_UNREGISTER:
++ 		br_del_if(br, dev);
++ 		break;
++ 
++ 	case NETDEV_CHANGENAME:
++ 		err = br_sysfs_renameif(p);
++ 		if (err)
++ 			return notifier_from_errno(err);
++ 		break;
++ 
++ 	case NETDEV_PRE_TYPE_CHANGE:
++ 		/* Forbid underlaying device to change its type. */
++ 		return NOTIFY_BAD;
++ 
++ 	case NETDEV_RESEND_IGMP:
++ 		/* Propagate to master device */
++ 		call_netdevice_notifiers(event, br->dev);
++ 		break;
++ 	}
++ 
++ 	/* Events that may cause spanning tree to refresh */
++ 	if (event == NETDEV_CHANGEADDR || event == NETDEV_UP ||
++ 	    event == NETDEV_CHANGE || event == NETDEV_DOWN)
++ 		br_ifinfo_notify(RTM_NEWLINK, p);
++ 
++ 	return NOTIFY_DONE;
++ }
++ 
++ static struct notifier_block br_device_notifier = {
++ 	.notifier_call = br_device_event
++ };
++ 
++ /* called with RTNL */
++ static int br_switchdev_event(struct notifier_block *unused,
++ 			      unsigned long event, void *ptr)
++ {
++ 	struct net_device *dev = switchdev_notifier_info_to_dev(ptr);
++ 	struct net_bridge_port *p;
++ 	struct net_bridge *br;
++ 	struct switchdev_notifier_fdb_info *fdb_info;
++ 	int err = NOTIFY_DONE;
++ 
++ 	p = br_port_get_rtnl(dev);
++ 	if (!p)
++ 		goto out;
++ 
++ 	br = p->br;
++ 
++ 	switch (event) {
++ 	case SWITCHDEV_FDB_ADD:
++ 		fdb_info = ptr;
++ 		err = br_fdb_external_learn_add(br, p, fdb_info->addr,
++ 						fdb_info->vid);
++ 		if (err)
++ 			err = notifier_from_errno(err);
++ 		break;
++ 	case SWITCHDEV_FDB_DEL:
++ 		fdb_info = ptr;
++ 		err = br_fdb_external_learn_del(br, p, fdb_info->addr,
++ 						fdb_info->vid);
++ 		if (err)
++ 			err = notifier_from_errno(err);
++ 		break;
++ 	}
++ 
++ out:
++ 	return err;
++ }
++ 
++ static struct notifier_block br_switchdev_notifier = {
++ 	.notifier_call = br_switchdev_event,
++ };
++ 
++ static void __net_exit br_net_exit(struct net *net)
++ {
++ 	struct net_device *dev;
++ 	LIST_HEAD(list);
++ 
++ 	rtnl_lock();
++ 	for_each_netdev(net, dev)
++ 		if (dev->priv_flags & IFF_EBRIDGE)
++ 			br_dev_delete(dev, &list);
++ 
++ 	unregister_netdevice_many(&list);
++ 	rtnl_unlock();
++ 
++ }
++ 
++ static struct pernet_operations br_net_ops = {
++ 	.exit	= br_net_exit,
++ };
++ 
+++>>>>>>> 4f2c6ae5c64c (switchdev: Require RTNL mutex to be held when sending FDB notifications)
+  static const struct stp_proto br_stp_proto = {
+  	.rcv	= br_stp_rcv,
+  };
+* Unmerged path drivers/net/ethernet/rocker/rocker.c
+* Unmerged path net/switchdev/switchdev.c
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
+* Unmerged path drivers/net/ethernet/rocker/rocker.c
+* Unmerged path net/bridge/br.c
+* Unmerged path net/switchdev/switchdev.c
