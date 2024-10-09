@@ -1,0 +1,140 @@
+qed*: Change maximal number of queues
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Mintz, Yuval <Yuval.Mintz@cavium.com>
+commit e1d32acbcbd35af5264acc70ff03bf8da9e447a8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/e1d32acb.failed
+
+Today qede requests contexts that would suffice for 64 'whole'
+combined queues [192 meant for 64 rx, tx and xdp tx queues],
+but registers netdev and limits the number of queues based on
+information received by qed. In turn, qed doesn't take context
+into account when informing qede how many queues it can support.
+
+This would lead to a configuration problem in case user tries
+configuring >64 combined queues to interface [or >96 in case
+xdp isn't enabled]. Since we don't have a mangement firware
+that actually provides so many interrupt lines to a single
+device we're currently safe but that's about to change soon.
+
+The new maximum is hence changed:
+  - For RoCE devices, the limit would remain 64.
+  - For non-RoCE devices, the limit might be higher [depending
+    on the actual configuration of the device].
+qed would start enforcing that limit in both scenarios.
+
+	Signed-off-by: Yuval Mintz <Yuval.Mintz@cavium.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e1d32acbcbd35af5264acc70ff03bf8da9e447a8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qed/qed_main.c
+#	drivers/net/ethernet/qlogic/qede/qede_main.c
+diff --cc drivers/net/ethernet/qlogic/qed/qed_main.c
+index 82cda70ecd7a,93eee83ccdc3..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_main.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_main.c
+@@@ -834,13 -869,25 +834,35 @@@ static void qed_update_pf_params(struc
+  {
+  	int i;
+  
+++<<<<<<< HEAD
+ +#if IS_ENABLED(CONFIG_INFINIBAND_QEDR)
+ +	params->rdma_pf_params.num_qps = QED_ROCE_QPS;
+ +	params->rdma_pf_params.min_dpis = QED_ROCE_DPIS;
+ +	/* divide by 3 the MRs to avoid MF ILT overflow */
+ +	params->rdma_pf_params.num_mrs = RDMA_MAX_TIDS;
+ +	params->rdma_pf_params.gl_pi = QED_ROCE_PROTOCOL_INDEX;
+ +#endif
+++=======
++ 	if (IS_ENABLED(CONFIG_QED_RDMA)) {
++ 		params->rdma_pf_params.num_qps = QED_ROCE_QPS;
++ 		params->rdma_pf_params.min_dpis = QED_ROCE_DPIS;
++ 		/* divide by 3 the MRs to avoid MF ILT overflow */
++ 		params->rdma_pf_params.num_mrs = RDMA_MAX_TIDS;
++ 		params->rdma_pf_params.gl_pi = QED_ROCE_PROTOCOL_INDEX;
++ 	}
++ 
++ 	/* In case we might support RDMA, don't allow qede to be greedy
++ 	 * with the L2 contexts. Allow for 64 queues [rx, tx, xdp] per hwfn.
++ 	 */
++ 	if (QED_LEADING_HWFN(cdev)->hw_info.personality ==
++ 	    QED_PCI_ETH_ROCE) {
++ 		u16 *num_cons;
++ 
++ 		num_cons = &params->eth_pf_params.num_cons;
++ 		*num_cons = min_t(u16, *num_cons, 192);
++ 	}
++ 
+++>>>>>>> e1d32acbcbd3 (qed*: Change maximal number of queues)
+  	for (i = 0; i < cdev->num_hwfns; i++) {
+  		struct qed_hwfn *p_hwfn = &cdev->hwfns[i];
+  
+diff --cc drivers/net/ethernet/qlogic/qede/qede_main.c
+index 356ca114d243,a679d4296cd8..000000000000
+--- a/drivers/net/ethernet/qlogic/qede/qede_main.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_main.c
+@@@ -2474,9 -751,9 +2474,13 @@@ static void qede_update_pf_params(struc
+  {
+  	struct qed_pf_params pf_params;
+  
+ -	/* 64 rx + 64 tx + 64 XDP */
+ +	/* 64 rx + 64 tx */
+  	memset(&pf_params, 0, sizeof(struct qed_pf_params));
+++<<<<<<< HEAD
+ +	pf_params.eth_pf_params.num_cons = 128;
+++=======
++ 	pf_params.eth_pf_params.num_cons = (MAX_SB_PER_PF_MIMD - 1) * 3;
+++>>>>>>> e1d32acbcbd3 (qed*: Change maximal number of queues)
+  	qed_ops->common->update_pf_params(cdev, &pf_params);
+  }
+  
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_l2.c b/drivers/net/ethernet/qlogic/qed/qed_l2.c
+index 6b0e22d9fe4c..021801c4c067 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_l2.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_l2.c
+@@ -1655,13 +1655,31 @@ static int qed_fill_eth_dev_info(struct qed_dev *cdev,
+ 		int max_vf_mac_filters = 0;
+ 
+ 		if (cdev->int_params.out.int_mode == QED_INT_MODE_MSIX) {
+-			for_each_hwfn(cdev, i)
+-			    info->num_queues +=
+-			    FEAT_NUM(&cdev->hwfns[i], QED_PF_L2_QUE);
+-			if (cdev->int_params.fp_msix_cnt)
+-				info->num_queues =
+-				    min_t(u8, info->num_queues,
+-					  cdev->int_params.fp_msix_cnt);
++			u16 num_queues = 0;
++
++			/* Since the feature controls only queue-zones,
++			 * make sure we have the contexts [rx, tx, xdp] to
++			 * match.
++			 */
++			for_each_hwfn(cdev, i) {
++				struct qed_hwfn *hwfn = &cdev->hwfns[i];
++				u16 l2_queues = (u16)FEAT_NUM(hwfn,
++							      QED_PF_L2_QUE);
++				u16 cids;
++
++				cids = hwfn->pf_params.eth_pf_params.num_cons;
++				num_queues += min_t(u16, l2_queues, cids / 3);
++			}
++
++			/* queues might theoretically be >256, but interrupts'
++			 * upper-limit guarantes that it would fit in a u8.
++			 */
++			if (cdev->int_params.fp_msix_cnt) {
++				u8 irqs = cdev->int_params.fp_msix_cnt;
++
++				info->num_queues = (u8)min_t(u16,
++							     num_queues, irqs);
++			}
+ 		} else {
+ 			info->num_queues = cdev->num_hwfns;
+ 		}
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_main.c
+* Unmerged path drivers/net/ethernet/qlogic/qede/qede_main.c
