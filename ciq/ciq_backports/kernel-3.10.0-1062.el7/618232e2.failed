@@ -1,0 +1,156 @@
+KVM: x86: Avoid guest page table walk when gpa_available is set
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Brijesh Singh <brijesh.singh@amd.com>
+commit 618232e2196a6db1ed66b5e1ec049e5c46480f49
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/618232e2.failed
+
+When a guest causes a page fault which requires emulation, the
+vcpu->arch.gpa_available flag is set to indicate that cr2 contains a
+valid GPA.
+
+Currently, emulator_read_write_onepage() makes use of gpa_available flag
+to avoid a guest page walk for a known MMIO regions. Lets not limit
+the gpa_available optimization to just MMIO region. The patch extends
+the check to avoid page walk whenever gpa_available flag is set.
+
+	Signed-off-by: Brijesh Singh <brijesh.singh@amd.com>
+[Fix EPT=0 according to Wanpeng Li's fix, plus ensure VMX also uses the
+ new code. - Paolo]
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+	Reviewed-by: David Hildenbrand <david@redhat.com>
+[Moved "ret < 0" to the else brach, as per David's review. - Radim]
+	Signed-off-by: Radim Krčmář <rkrcmar@redhat.com>
+(cherry picked from commit 618232e2196a6db1ed66b5e1ec049e5c46480f49)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+#	arch/x86/kvm/mmu.c
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/include/asm/kvm_host.h
+index 4091026435c1,6db0ed9cf59e..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -625,8 -685,12 +625,17 @@@ struct kvm_vcpu_arch 
+  	int pending_ioapic_eoi;
+  	int pending_external_vector;
+  
+++<<<<<<< HEAD
+ +	/* Flush the L1 Data cache for L1TF mitigation on VMENTER */
+ +	bool l1tf_flush_l1d;
+++=======
++ 	/* GPA available */
++ 	bool gpa_available;
++ 	gpa_t gpa_val;
++ 
++ 	/* be preempted when it's in kernel-mode(cpl=0) */
++ 	bool preempted_in_kernel;
+++>>>>>>> 618232e2196a (KVM: x86: Avoid guest page table walk when gpa_available is set)
+  };
+  
+  struct kvm_lpage_info {
+diff --cc arch/x86/kvm/mmu.c
+index 6f8ae4f3d53a,a2c592b14617..000000000000
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@@ -4863,7 -4843,12 +4863,16 @@@ int kvm_mmu_page_fault(struct kvm_vcpu 
+  	enum emulation_result er;
+  	bool direct = vcpu->arch.mmu.direct_map || mmu_is_nested(vcpu);
+  
+++<<<<<<< HEAD
+ +	vcpu->arch.l1tf_flush_l1d = true;
+++=======
++ 	/* With shadow page tables, fault_address contains a GVA or nGPA.  */
++ 	if (vcpu->arch.mmu.direct_map) {
++ 		vcpu->arch.gpa_available = true;
++ 		vcpu->arch.gpa_val = cr2;
++ 	}
++ 
+++>>>>>>> 618232e2196a (KVM: x86: Avoid guest page table walk when gpa_available is set)
+  	if (unlikely(error_code & PFERR_RSVD_MASK)) {
+  		r = handle_mmio_page_fault(vcpu, cr2, direct);
+  		if (r == RET_MMIO_PF_EMULATE) {
+diff --cc arch/x86/kvm/x86.c
+index f751a44d4548,4e699238a113..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -4532,20 -4646,29 +4532,32 @@@ static int emulator_read_write_onepage(
+  	int handled, ret;
+  	bool write = ops->write;
+  	struct kvm_mmio_fragment *frag;
+++<<<<<<< HEAD
+++=======
++ 	struct x86_emulate_ctxt *ctxt = &vcpu->arch.emulate_ctxt;
+  
+- 	ret = vcpu_mmio_gva_to_gpa(vcpu, addr, &gpa, exception, write);
+- 
+- 	if (ret < 0)
+- 		return X86EMUL_PROPAGATE_FAULT;
+- 
+- 	/* For APIC access vmexit */
+- 	if (ret)
+- 		goto mmio;
++ 	/*
++ 	 * If the exit was due to a NPF we may already have a GPA.
++ 	 * If the GPA is present, use it to avoid the GVA to GPA table walk.
++ 	 * Note, this cannot be used on string operations since string
++ 	 * operation using rep will only have the initial GPA from the NPF
++ 	 * occurred.
++ 	 */
++ 	if (vcpu->arch.gpa_available &&
++ 	    emulator_can_use_gpa(ctxt) &&
++ 	    (addr & ~PAGE_MASK) == (vcpu->arch.gpa_val & ~PAGE_MASK)) {
++ 		gpa = vcpu->arch.gpa_val;
++ 		ret = vcpu_is_mmio_gpa(vcpu, addr, gpa, write);
++ 	} else {
++ 		ret = vcpu_mmio_gva_to_gpa(vcpu, addr, &gpa, exception, write);
++ 		if (ret < 0)
++ 			return X86EMUL_PROPAGATE_FAULT;
++ 	}
+++>>>>>>> 618232e2196a (KVM: x86: Avoid guest page table walk when gpa_available is set)
+  
+- 	if (ops->read_write_emulate(vcpu, gpa, val, bytes))
++ 	if (!ret && ops->read_write_emulate(vcpu, gpa, val, bytes))
+  		return X86EMUL_CONTINUE;
+  
+- mmio:
+  	/*
+  	 * Is this MMIO handled locally?
+  	 */
+* Unmerged path arch/x86/include/asm/kvm_host.h
+* Unmerged path arch/x86/kvm/mmu.c
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index 9c3cd8d4ac90..dbb2e6dd72d5 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -6520,9 +6520,7 @@ static int handle_ept_violation(struct kvm_vcpu *vcpu)
+ 	error_code |= (exit_qualification & 0x100) != 0 ?
+ 	       PFERR_GUEST_FINAL_MASK : PFERR_GUEST_PAGE_MASK;
+ 
+-	vcpu->arch.gpa_available = true;
+ 	vcpu->arch.exit_qualification = exit_qualification;
+-
+ 	return kvm_mmu_page_fault(vcpu, gpa, error_code, NULL, 0);
+ }
+ 
+@@ -6538,7 +6536,6 @@ static int handle_ept_misconfig(struct kvm_vcpu *vcpu)
+ 		return 1;
+ 	}
+ 
+-	vcpu->arch.gpa_available = true;
+ 	ret = kvm_mmu_page_fault(vcpu, gpa, PFERR_RSVD_MASK, NULL, 0);
+ 	if (ret >= 0)
+ 		return ret;
+@@ -8532,7 +8529,6 @@ static int vmx_handle_exit(struct kvm_vcpu *vcpu)
+ 	u32 vectoring_info = vmx->idt_vectoring_info;
+ 
+ 	trace_kvm_exit(exit_reason, vcpu, KVM_ISA_VMX);
+-	vcpu->arch.gpa_available = false;
+ 
+ 	/*
+ 	 * Flush logged GPAs PML buffer, this will make dirty_bitmap more
+* Unmerged path arch/x86/kvm/x86.c
