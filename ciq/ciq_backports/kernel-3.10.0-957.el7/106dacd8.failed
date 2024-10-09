@@ -1,0 +1,138 @@
+perf script: Support -F brstackoff,dso
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [tools] perf script: Support -F brstackoff, dso (Jiri Olsa) [1532861]
+Rebuild_FUZZ: 98.70%
+commit-author Mark Santaniello <marksan@fb.com>
+commit 106dacd86f042968e0bb974490fcb9cd017cd03a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/106dacd8.failed
+
+The idea here is to make AutoFDO easier in cloud environment with ASLR.
+It's easiest to show how this is useful by example. I built a small test
+akin to "while(1) { do_nothing(); }" where the do_nothing function is
+loaded from a dso:
+
+  $ cat burncpu.cpp
+  #include <dlfcn.h>
+
+  int main() {
+    void* handle = dlopen("./dso.so", RTLD_LAZY);
+    if (!handle) return -1;
+
+    typedef void (*fp)();
+    fp do_nothing = (fp) dlsym(handle, "do_nothing");
+
+    while(1) {
+      do_nothing();
+    }
+  }
+
+  $ cat dso.cpp
+  extern "C" void do_nothing() {}
+
+  $ cat build.sh
+  #!/bin/bash
+  g++ -shared dso.cpp -o dso.so
+  g++ burncpu.cpp -o burncpu -ldl
+
+I sampled the execution of this program with perf record -b.
+
+Using the existing "brstack,dso", we get absolute addresses that are
+affected by ASLR, and could be different on different hosts. The address
+does not uniquely identify a branch/target in the binary:
+
+  $ perf script -F brstack,dso | sed 's/\/0 /\/0\n/g' | grep burncpu | grep dso.so | head -n 1
+  0x7f967139b6aa(/tmp/burncpu/dso.so)/0x4006b1(/tmp/burncpu/exe)/P/-/-/0
+
+Using the existing "brstacksym,dso" is a little better, because the
+symbol plus offset and dso name *does* uniquely identify a branch/target
+in the binary.  Ultimately, however, AutoFDO wants a simple offset into
+the binary, so we'd have to undo all the work perf did to symbolize in
+the first place:
+
+  $ perf script -F brstacksym,dso | sed 's/\/0 /\/0\n/g' | grep burncpu | grep dso.so | head -n 1
+  do_nothing+0x5(/tmp/burncpu/dso.so)/main+0x44(/tmp/burncpu/exe)/P/-/-/0
+
+With the new "brstackoff,dso" we get what we need: a simple offset into a
+specific dso/binary that uniquely identifies a branch/target:
+  $ perf script -F brstackoff,dso | sed 's/\/0 /\/0\n/g' | grep burncpu | grep dso.so | head -n 1
+  0x6aa(/tmp/burncpu/dso.so)/0x4006b1(/tmp/burncpu/exe)/P/-/-/0
+
+	Signed-off-by: Mark Santaniello <marksan@fb.com>
+	Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/20170619163825.2012979-2-marksan@fb.com
+[ Updated documentation about 'brstackoff' using text from above ]
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 106dacd86f042968e0bb974490fcb9cd017cd03a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/Documentation/perf-script.txt
+#	tools/perf/builtin-script.c
+diff --cc tools/perf/Documentation/perf-script.txt
+index 66be2e69d03b,e2468ed6a307..000000000000
+--- a/tools/perf/Documentation/perf-script.txt
++++ b/tools/perf/Documentation/perf-script.txt
+@@@ -116,8 -116,8 +116,13 @@@ OPTION
+  --fields::
+          Comma separated list of fields to print. Options are:
+          comm, tid, pid, time, cpu, event, trace, ip, sym, dso, addr, symoff,
+++<<<<<<< HEAD
+ +	srcline, period, iregs, brstack, brstacksym, flags, brstackinsn, insn, insnlen.
+ +        Field list can be prepended with the type, trace, sw or hw,
+++=======
++         srcline, period, iregs, brstack, brstacksym, flags, bpf-output, brstackinsn, brstackoff,
++         callindent, insn, insnlen. Field list can be prepended with the type, trace, sw or hw,
+++>>>>>>> 106dacd86f04 (perf script: Support -F brstackoff,dso)
+          to indicate to which event type the field list applies.
+          e.g., -F sw:comm,tid,time,ip,sym  and -F trace:time,cpu,trace
+  
+diff --cc tools/perf/builtin-script.c
+index 8057cd439393,db5261c3f719..000000000000
+--- a/tools/perf/builtin-script.c
++++ b/tools/perf/builtin-script.c
+@@@ -296,10 -300,10 +298,17 @@@ static int perf_evsel__check_attr(struc
+  		       "selected.\n");
+  		return -EINVAL;
+  	}
+++<<<<<<< HEAD
+ +	if (PRINT_FIELD(DSO) && !PRINT_FIELD(IP) && !PRINT_FIELD(ADDR)) {
+ +		pr_err("Display of DSO requested but neither sample IP nor "
+ +			   "sample address\nis selected. Hence, no addresses to convert "
+ +		       "to DSO.\n");
+++=======
++ 	if (PRINT_FIELD(DSO) && !PRINT_FIELD(IP) && !PRINT_FIELD(ADDR) &&
++ 	    !PRINT_FIELD(BRSTACK) && !PRINT_FIELD(BRSTACKSYM) && !PRINT_FIELD(BRSTACKOFF)) {
++ 		pr_err("Display of DSO requested but no address to convert.  Select\n"
++ 		       "sample IP, sample address, brstack, brstacksym, or brstackoff.\n");
+++>>>>>>> 106dacd86f04 (perf script: Support -F brstackoff,dso)
+  		return -EINVAL;
+  	}
+  	if (PRINT_FIELD(SRCLINE) && !PRINT_FIELD(IP)) {
+@@@ -1106,9 -1270,14 +1160,18 @@@ static void process_event(struct perf_s
+  		print_sample_iregs(sample, attr);
+  
+  	if (PRINT_FIELD(BRSTACK))
+ -		print_sample_brstack(sample, thread, attr);
+ +		print_sample_brstack(sample);
+  	else if (PRINT_FIELD(BRSTACKSYM))
+++<<<<<<< HEAD
+ +		print_sample_brstacksym(sample, thread);
+++=======
++ 		print_sample_brstacksym(sample, thread, attr);
++ 	else if (PRINT_FIELD(BRSTACKOFF))
++ 		print_sample_brstackoff(sample, thread, attr);
++ 
++ 	if (perf_evsel__is_bpf_output(evsel) && PRINT_FIELD(BPF_OUTPUT))
++ 		print_sample_bpf_output(sample);
+++>>>>>>> 106dacd86f04 (perf script: Support -F brstackoff,dso)
+  	print_insn(sample, attr, thread, machine);
+  	printf("\n");
+  }
+* Unmerged path tools/perf/Documentation/perf-script.txt
+* Unmerged path tools/perf/builtin-script.c
