@@ -1,0 +1,145 @@
+nfp: bpf: correct printk formats for size_t
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 0bce7c9a607f1dbf8d83dd2865e1657096dbce59
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/0bce7c9a.failed
+
+Build bot reported warning about invalid printk formats on 32bit
+architectures.  Use %zu for size_t and %zd ptr diff.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit 0bce7c9a607f1dbf8d83dd2865e1657096dbce59)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/bpf/main.c
+diff --cc drivers/net/ethernet/netronome/nfp/bpf/main.c
+index 4ca14182b178,4f6553f01178..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.c
+@@@ -141,6 -157,116 +141,119 @@@ static bool nfp_bpf_tc_busy(struct nfp_
+  	return nn->dp.ctrl & NFP_NET_CFG_CTRL_BPF;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int
++ nfp_bpf_parse_cap_adjust_head(struct nfp_app_bpf *bpf, void __iomem *value,
++ 			      u32 length)
++ {
++ 	struct nfp_bpf_cap_tlv_adjust_head __iomem *cap = value;
++ 	struct nfp_cpp *cpp = bpf->app->pf->cpp;
++ 
++ 	if (length < sizeof(*cap)) {
++ 		nfp_err(cpp, "truncated adjust_head TLV: %d\n", length);
++ 		return -EINVAL;
++ 	}
++ 
++ 	bpf->adjust_head.flags = readl(&cap->flags);
++ 	bpf->adjust_head.off_min = readl(&cap->off_min);
++ 	bpf->adjust_head.off_max = readl(&cap->off_max);
++ 	bpf->adjust_head.guaranteed_sub = readl(&cap->guaranteed_sub);
++ 	bpf->adjust_head.guaranteed_add = readl(&cap->guaranteed_add);
++ 
++ 	if (bpf->adjust_head.off_min > bpf->adjust_head.off_max) {
++ 		nfp_err(cpp, "invalid adjust_head TLV: min > max\n");
++ 		return -EINVAL;
++ 	}
++ 	if (!FIELD_FIT(UR_REG_IMM_MAX, bpf->adjust_head.off_min) ||
++ 	    !FIELD_FIT(UR_REG_IMM_MAX, bpf->adjust_head.off_max)) {
++ 		nfp_warn(cpp, "disabling adjust_head - driver expects min/max to fit in as immediates\n");
++ 		memset(&bpf->adjust_head, 0, sizeof(bpf->adjust_head));
++ 		return 0;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int nfp_bpf_parse_capabilities(struct nfp_app *app)
++ {
++ 	struct nfp_cpp *cpp = app->pf->cpp;
++ 	struct nfp_cpp_area *area;
++ 	u8 __iomem *mem, *start;
++ 
++ 	mem = nfp_rtsym_map(app->pf->rtbl, "_abi_bpf_capabilities", "bpf.cap",
++ 			    8, &area);
++ 	if (IS_ERR(mem))
++ 		return PTR_ERR(mem) == -ENOENT ? 0 : PTR_ERR(mem);
++ 
++ 	start = mem;
++ 	while (mem - start + 8 < nfp_cpp_area_size(area)) {
++ 		u8 __iomem *value;
++ 		u32 type, length;
++ 
++ 		type = readl(mem);
++ 		length = readl(mem + 4);
++ 		value = mem + 8;
++ 
++ 		mem += 8 + length;
++ 		if (mem - start > nfp_cpp_area_size(area))
++ 			goto err_release_free;
++ 
++ 		switch (type) {
++ 		case NFP_BPF_CAP_TYPE_ADJUST_HEAD:
++ 			if (nfp_bpf_parse_cap_adjust_head(app->priv, value,
++ 							  length))
++ 				goto err_release_free;
++ 			break;
++ 		default:
++ 			nfp_dbg(cpp, "unknown BPF capability: %d\n", type);
++ 			break;
++ 		}
++ 	}
++ 	if (mem - start != nfp_cpp_area_size(area)) {
++ 		nfp_err(cpp, "BPF capabilities left after parsing, parsed:%zd total length:%zu\n",
++ 			mem - start, nfp_cpp_area_size(area));
++ 		goto err_release_free;
++ 	}
++ 
++ 	nfp_cpp_area_release_free(area);
++ 
++ 	return 0;
++ 
++ err_release_free:
++ 	nfp_err(cpp, "invalid BPF capabilities at offset:%zd\n", mem - start);
++ 	nfp_cpp_area_release_free(area);
++ 	return -EINVAL;
++ }
++ 
++ static int nfp_bpf_init(struct nfp_app *app)
++ {
++ 	struct nfp_app_bpf *bpf;
++ 	int err;
++ 
++ 	bpf = kzalloc(sizeof(*bpf), GFP_KERNEL);
++ 	if (!bpf)
++ 		return -ENOMEM;
++ 	bpf->app = app;
++ 	app->priv = bpf;
++ 
++ 	err = nfp_bpf_parse_capabilities(app);
++ 	if (err)
++ 		goto err_free_bpf;
++ 
++ 	return 0;
++ 
++ err_free_bpf:
++ 	kfree(bpf);
++ 	return err;
++ }
++ 
++ static void nfp_bpf_clean(struct nfp_app *app)
++ {
++ 	kfree(app->priv);
++ }
++ 
+++>>>>>>> 0bce7c9a607f (nfp: bpf: correct printk formats for size_t)
+  const struct nfp_app_type app_bpf = {
+  	.id		= NFP_APP_BPF_NIC,
+  	.name		= "ebpf",
+* Unmerged path drivers/net/ethernet/netronome/nfp/bpf/main.c
