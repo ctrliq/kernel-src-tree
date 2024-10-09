@@ -1,0 +1,136 @@
+mnt: Update detach_mounts to leave mounts connected
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Eric W. Biederman <ebiederm@xmission.com>
+commit e0c9c0afd2fc958ffa34b697972721d81df8a56f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/e0c9c0af.failed
+
+Now that it is possible to lazily unmount an entire mount tree and
+leave the individual mounts connected to each other add a new flag
+UMOUNT_CONNECTED to umount_tree to force this behavior and use
+this flag in detach_mounts.
+
+This closes a bug where the deletion of a file or directory could
+trigger an unmount and reveal data under a mount point.
+
+	Cc: stable@vger.kernel.org
+	Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+(cherry picked from commit e0c9c0afd2fc958ffa34b697972721d81df8a56f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/namespace.c
+diff --cc fs/namespace.c
+index 91fbddebae10,1f4f9dac6e5a..000000000000
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@@ -1208,11 -1345,16 +1208,19 @@@ static inline void namespace_lock(void
+  	down_write(&namespace_sem);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ enum umount_tree_flags {
++ 	UMOUNT_SYNC = 1,
++ 	UMOUNT_PROPAGATE = 2,
++ 	UMOUNT_CONNECTED = 4,
++ };
+++>>>>>>> e0c9c0afd2fc (mnt: Update detach_mounts to leave mounts connected)
+  /*
+ - * mount_lock must be held
+ + * vfsmount lock must be held for write
+   * namespace_sem must be held for write
+   */
+ -static void umount_tree(struct mount *mnt, enum umount_tree_flags how)
+ +void umount_tree(struct mount *mnt, int propagate)
+  {
+  	LIST_HEAD(tmp_list);
+  	struct mount *p;
+@@@ -1228,15 -1384,24 +1236,28 @@@
+  		list_del_init(&p->mnt_list);
+  		__touch_mnt_namespace(p->mnt_ns);
+  		p->mnt_ns = NULL;
+++<<<<<<< HEAD
+ +		list_del_init(&p->mnt_child);
+++=======
++ 		if (how & UMOUNT_SYNC)
++ 			p->mnt.mnt_flags |= MNT_SYNC_UMOUNT;
++ 
++ 		disconnect = !(((how & UMOUNT_CONNECTED) &&
++ 				mnt_has_parent(p) &&
++ 				(p->mnt_parent->mnt.mnt_flags & MNT_UMOUNT)) ||
++ 			       IS_MNT_LOCKED_AND_LAZY(p));
++ 
++ 		pin_insert_group(&p->mnt_umount, &p->mnt_parent->mnt,
++ 				 disconnect ? &unmounted : NULL);
+++>>>>>>> e0c9c0afd2fc (mnt: Update detach_mounts to leave mounts connected)
+  		if (mnt_has_parent(p)) {
+ -			mnt_add_count(p->mnt_parent, -1);
+ -			if (!disconnect) {
+ -				/* Don't forget about p */
+ -				list_add_tail(&p->mnt_child, &p->mnt_parent->mnt_mounts);
+ -			} else {
+ -				umount_mnt(p);
+ -			}
+ +			put_mountpoint(p->mnt_mp);
+ +			/* move the reference to mountpoint into ->mnt_ex_mountpoint */
+ +			p->mnt_ex_mountpoint.dentry = p->mnt_mountpoint;
+ +			p->mnt_ex_mountpoint.mnt = &p->mnt_parent->mnt;
+ +			p->mnt_mountpoint = p->mnt.mnt_root;
+ +			p->mnt_parent = p;
+ +			p->mnt_mp = NULL;
+  		}
+  		change_mnt_propagation(p, MS_PRIVATE);
+  	}
+@@@ -1335,6 -1503,44 +1356,47 @@@ static int do_umount(struct mount *mnt
+  	return retval;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * __detach_mounts - lazily unmount all mounts on the specified dentry
++  *
++  * During unlink, rmdir, and d_drop it is possible to loose the path
++  * to an existing mountpoint, and wind up leaking the mount.
++  * detach_mounts allows lazily unmounting those mounts instead of
++  * leaking them.
++  *
++  * The caller may hold dentry->d_inode->i_mutex.
++  */
++ void __detach_mounts(struct dentry *dentry)
++ {
++ 	struct mountpoint *mp;
++ 	struct mount *mnt;
++ 
++ 	namespace_lock();
++ 	mp = lookup_mountpoint(dentry);
++ 	if (IS_ERR_OR_NULL(mp))
++ 		goto out_unlock;
++ 
++ 	lock_mount_hash();
++ 	while (!hlist_empty(&mp->m_list)) {
++ 		mnt = hlist_entry(mp->m_list.first, struct mount, mnt_mp_list);
++ 		if (mnt->mnt.mnt_flags & MNT_UMOUNT) {
++ 			struct mount *p, *tmp;
++ 			list_for_each_entry_safe(p, tmp, &mnt->mnt_mounts,  mnt_child) {
++ 				hlist_add_head(&p->mnt_umount.s_list, &unmounted);
++ 				umount_mnt(p);
++ 			}
++ 		}
++ 		else umount_tree(mnt, UMOUNT_CONNECTED);
++ 	}
++ 	unlock_mount_hash();
++ 	put_mountpoint(mp);
++ out_unlock:
++ 	namespace_unlock();
++ }
++ 
+++>>>>>>> e0c9c0afd2fc (mnt: Update detach_mounts to leave mounts connected)
+  /* 
+   * Is the caller allowed to modify his namespace?
+   */
+* Unmerged path fs/namespace.c
