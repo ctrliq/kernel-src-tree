@@ -1,0 +1,176 @@
+cpufreq: intel_pstate: Drop redundant wrapper function
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [cpufreq] intel_pstate: Drop redundant wrapper function (Prarit Bhargava) [1465349]
+Rebuild_FUZZ: 90.91%
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit 5f98ced1c95e7706af6895f7b7b0d2216f075d59
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/5f98ced1.failed
+
+intel_pstate_hwp_set_policy() is a wrapper around
+intel_pstate_hwp_set(), but the only value it adds is to check
+hwp_active before calling the latter and one of its two callers
+has already checked hwp_active before that happens, so in that
+code path the additional check is redundant and using the wrapper
+is rather pointless.
+
+For this reason, drop intel_pstate_hwp_set_policy() and make its
+callers invoke intel_pstate_hwp_set() directly (after checking
+hwp_active).
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Acked-by: Viresh Kumar <viresh.kumar@linaro.org>
+(cherry picked from commit 5f98ced1c95e7706af6895f7b7b0d2216f075d59)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/intel_pstate.c
+diff --cc drivers/cpufreq/intel_pstate.c
+index b681c02dda0f,162657228c15..000000000000
+--- a/drivers/cpufreq/intel_pstate.c
++++ b/drivers/cpufreq/intel_pstate.c
+@@@ -580,11 -930,48 +580,56 @@@ static void intel_pstate_hwp_set(const 
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static void intel_pstate_hwp_set_online_cpus(void)
+ +{
+ +	get_online_cpus();
+ +	intel_pstate_hwp_set(cpu_online_mask);
+ +	put_online_cpus();
+++=======
++ static int intel_pstate_hwp_save_state(struct cpufreq_policy *policy)
++ {
++ 	struct cpudata *cpu_data = all_cpu_data[policy->cpu];
++ 
++ 	if (!hwp_active)
++ 		return 0;
++ 
++ 	cpu_data->epp_saved = intel_pstate_get_epp(cpu_data, 0);
++ 
++ 	return 0;
++ }
++ 
++ static int intel_pstate_resume(struct cpufreq_policy *policy)
++ {
++ 	if (!hwp_active)
++ 		return 0;
++ 
++ 	mutex_lock(&intel_pstate_limits_lock);
++ 
++ 	all_cpu_data[policy->cpu]->epp_policy = 0;
++ 	intel_pstate_hwp_set(policy);
++ 
++ 	mutex_unlock(&intel_pstate_limits_lock);
++ 
++ 	return 0;
++ }
++ 
++ static void intel_pstate_update_policies(void)
++ 	__releases(&intel_pstate_limits_lock)
++ 	__acquires(&intel_pstate_limits_lock)
++ {
++ 	struct perf_limits *saved_limits = limits;
++ 	int cpu;
++ 
++ 	mutex_unlock(&intel_pstate_limits_lock);
++ 
++ 	for_each_possible_cpu(cpu)
++ 		cpufreq_update_policy(cpu);
++ 
++ 	mutex_lock(&intel_pstate_limits_lock);
++ 
++ 	limits = saved_limits;
+++>>>>>>> 5f98ced1c95e (cpufreq: intel_pstate: Drop redundant wrapper function)
+  }
+  
+  /************************** debugfs begin ************************/
+@@@ -1471,14 -2095,73 +1516,79 @@@ static int intel_pstate_set_policy(stru
+  	/* Make sure min_perf_pct <= max_perf_pct */
+  	limits->min_perf_pct = min(limits->max_perf_pct, limits->min_perf_pct);
+  
+ -	limits->min_perf = div_ext_fp(limits->min_perf_pct, 100);
+ -	limits->max_perf = div_ext_fp(limits->max_perf_pct, 100);
+ -	limits->max_perf = round_up(limits->max_perf, EXT_FRAC_BITS);
+ -	limits->min_perf = round_up(limits->min_perf, EXT_FRAC_BITS);
+ +	limits->min_perf = div_fp(int_tofp(limits->min_perf_pct),
+ +				  int_tofp(100));
+ +	limits->max_perf = div_fp(int_tofp(limits->max_perf_pct),
+ +				  int_tofp(100));
+ +	limits->max_perf = round_up(limits->max_perf, FRAC_BITS);
+  
+++<<<<<<< HEAD
+ +	if (hwp_active)
+ +		intel_pstate_hwp_set(policy->cpus);
+++=======
++ 	pr_debug("cpu:%d max_perf_pct:%d min_perf_pct:%d\n", policy->cpu,
++ 		 limits->max_perf_pct, limits->min_perf_pct);
++ }
++ 
++ static int intel_pstate_set_policy(struct cpufreq_policy *policy)
++ {
++ 	struct cpudata *cpu;
++ 	struct perf_limits *perf_limits = NULL;
++ 
++ 	if (!policy->cpuinfo.max_freq)
++ 		return -ENODEV;
++ 
++ 	pr_debug("set_policy cpuinfo.max %u policy->max %u\n",
++ 		 policy->cpuinfo.max_freq, policy->max);
++ 
++ 	cpu = all_cpu_data[policy->cpu];
++ 	cpu->policy = policy->policy;
++ 
++ 	if (cpu->pstate.max_pstate_physical > cpu->pstate.max_pstate &&
++ 	    policy->max < policy->cpuinfo.max_freq &&
++ 	    policy->max > cpu->pstate.max_pstate * cpu->pstate.scaling) {
++ 		pr_debug("policy->max > max non turbo frequency\n");
++ 		policy->max = policy->cpuinfo.max_freq;
++ 	}
++ 
++ 	if (per_cpu_limits)
++ 		perf_limits = cpu->perf_limits;
++ 
++ 	mutex_lock(&intel_pstate_limits_lock);
++ 
++ 	if (policy->policy == CPUFREQ_POLICY_PERFORMANCE) {
++ 		pr_debug("set performance\n");
++ 		if (!perf_limits) {
++ 			limits = &performance_limits;
++ 			perf_limits = limits;
++ 		}
++ 	} else {
++ 		pr_debug("set powersave\n");
++ 		if (!perf_limits) {
++ 			limits = &powersave_limits;
++ 			perf_limits = limits;
++ 		}
++ 
++ 	}
++ 
++ 	intel_pstate_update_perf_limits(policy, perf_limits);
++ 
++ 	if (cpu->policy == CPUFREQ_POLICY_PERFORMANCE) {
++ 		/*
++ 		 * NOHZ_FULL CPUs need this as the governor callback may not
++ 		 * be invoked on them.
++ 		 */
++ 		intel_pstate_clear_update_util_hook(policy->cpu);
++ 		intel_pstate_max_within_limits(cpu);
++ 	}
++ 
++ 	intel_pstate_set_update_util_hook(policy->cpu);
++ 
++ 	if (hwp_active)
++ 		intel_pstate_hwp_set(policy);
++ 
++ 	mutex_unlock(&intel_pstate_limits_lock);
+++>>>>>>> 5f98ced1c95e (cpufreq: intel_pstate: Drop redundant wrapper function)
+  
+  	return 0;
+  }
+* Unmerged path drivers/cpufreq/intel_pstate.c
