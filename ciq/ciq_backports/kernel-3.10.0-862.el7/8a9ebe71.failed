@@ -1,0 +1,280 @@
+target: Fix WRITE_SAME/DISCARD conversion to linux 512b sectors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [target] Fix WRITE_SAME/DISCARD conversion to linux 512b sectors (Maurizio Lombardi) [1366062]
+Rebuild_FUZZ: 93.22%
+commit-author Mike Christie <mchristi@redhat.com>
+commit 8a9ebe717a133ba7bc90b06047f43cc6b8bcb8b3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/8a9ebe71.failed
+
+In a couple places we are not converting to/from the Linux
+block layer 512 bytes sectors.
+
+1.
+
+The request queue values and what we do are a mismatch of
+things:
+
+max_discard_sectors - This is in linux block layer 512 byte
+sectors. We are just copying this to max_unmap_lba_count.
+
+discard_granularity - This is in bytes. We are converting it
+to Linux block layer 512 byte sectors.
+
+discard_alignment - This is in bytes. We are just copying
+this over.
+
+The problem is that the core LIO code exports these values in
+spc_emulate_evpd_b0 and we use them to test request arguments
+in sbc_execute_unmap, but we never convert to the block size
+we export to the initiator. If we are not using 512 byte sectors
+then we are exporting the wrong values or are checks are off.
+And, for the discard_alignment/bytes case we are just plain messed
+up.
+
+2.
+
+blkdev_issue_discard's start and number of sector arguments
+are supposed to be in linux block layer 512 byte sectors. We are
+currently passing in the values we get from the initiator which
+might be based on some other sector size.
+
+There is a similar problem in iblock_execute_write_same where
+the bio functions want values in 512 byte sectors but we are
+passing in what we got from the initiator.
+
+	Signed-off-by: Mike Christie <mchristi@redhat.com>
+	Cc: stable@vger.kernel.org # 3.10+
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 8a9ebe717a133ba7bc90b06047f43cc6b8bcb8b3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_iblock.c
+#	include/target/target_core_backend.h
+diff --cc drivers/target/target_core_iblock.c
+index 4ff1c8404aab,abe4eb997a84..000000000000
+--- a/drivers/target/target_core_iblock.c
++++ b/drivers/target/target_core_iblock.c
+@@@ -127,27 -121,11 +127,32 @@@ static int iblock_configure_device(stru
+  	dev->dev_attrib.hw_max_sectors = queue_max_hw_sectors(q);
+  	dev->dev_attrib.hw_queue_depth = q->nr_requests;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Check if the underlying struct block_device request_queue supports
+ +	 * the QUEUE_FLAG_DISCARD bit for UNMAP/WRITE_SAME in SCSI + TRIM
+ +	 * in ATA and we need to set TPE=1
+ +	 */
+ +	if (blk_queue_discard(q)) {
+ +		dev->dev_attrib.max_unmap_lba_count =
+ +				q->limits.max_discard_sectors;
+ +
+ +		/*
+ +		 * Currently hardcoded to 1 in Linux/SCSI code..
+ +		 */
+ +		dev->dev_attrib.max_unmap_block_desc_count = 1;
+ +		dev->dev_attrib.unmap_granularity =
+ +				q->limits.discard_granularity >> 9;
+ +		dev->dev_attrib.unmap_granularity_alignment =
+ +				q->limits.discard_alignment;
+ +
+++=======
++ 	if (target_configure_unmap_from_queue(&dev->dev_attrib, q,
++ 					      dev->dev_attrib.hw_block_size))
+++>>>>>>> 8a9ebe717a13 (target: Fix WRITE_SAME/DISCARD conversion to linux 512b sectors)
+  		pr_debug("IBLOCK: BLOCK Discard support available,"
+- 				" disabled by default\n");
+- 	}
++ 			 " disabled by default\n");
++ 
+  	/*
+  	 * Enable write same emulation for IBLOCK and use 0xFFFF as
+  	 * the smaller WRITE_SAME(10) only has a two-byte block count.
+@@@ -415,13 -394,16 +420,21 @@@ iblock_execute_sync_cache(struct se_cm
+  }
+  
+  static sense_reason_t
+ -iblock_execute_unmap(struct se_cmd *cmd, sector_t lba, sector_t nolb)
+ +iblock_do_unmap(struct se_cmd *cmd, void *priv,
+ +		sector_t lba, sector_t nolb)
+  {
+++<<<<<<< HEAD
+ +	struct block_device *bdev = priv;
+++=======
++ 	struct block_device *bdev = IBLOCK_DEV(cmd->se_dev)->ibd_bd;
++ 	struct se_device *dev = cmd->se_dev;
+++>>>>>>> 8a9ebe717a13 (target: Fix WRITE_SAME/DISCARD conversion to linux 512b sectors)
+  	int ret;
+  
+- 	ret = blkdev_issue_discard(bdev, lba, nolb, GFP_KERNEL, 0);
++ 	ret = blkdev_issue_discard(bdev,
++ 				   target_to_linux_sector(dev, lba),
++ 				   target_to_linux_sector(dev,  nolb),
++ 				   GFP_KERNEL, 0);
+  	if (ret < 0) {
+  		pr_err("blkdev_issue_discard() failed: %d\n", ret);
+  		return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+diff --cc include/target/target_core_backend.h
+index b898a92cae3d,28ee5c2e6bcd..000000000000
+--- a/include/target/target_core_backend.h
++++ b/include/target/target_core_backend.h
+@@@ -108,38 -88,14 +108,45 @@@ void	transport_kunmap_data_sg(struct se
+  sense_reason_t	transport_generic_map_mem_to_cmd(struct se_cmd *,
+  		struct scatterlist *, u32, struct scatterlist *, u32);
+  
+ -bool	target_lun_is_rdonly(struct se_cmd *);
+ -sense_reason_t passthrough_parse_cdb(struct se_cmd *cmd,
+ -	sense_reason_t (*exec_cmd)(struct se_cmd *cmd));
+ -
+ +void	array_free(void *array, int n);
+ +
+++<<<<<<< HEAD
+ +/* From target_core_configfs.c to setup default backend config_item_types */
+ +void	target_core_setup_sub_cits(struct se_subsystem_api *);
+ +
+ +/* attribute helpers from target_core_device.c for backend drivers */
+ +bool	se_dev_check_wce(struct se_device *);
+ +int	se_dev_set_max_unmap_lba_count(struct se_device *, u32);
+ +int	se_dev_set_max_unmap_block_desc_count(struct se_device *, u32);
+ +int	se_dev_set_unmap_granularity(struct se_device *, u32);
+ +int	se_dev_set_unmap_granularity_alignment(struct se_device *, u32);
+ +int	se_dev_set_max_write_same_len(struct se_device *, u32);
+ +int	se_dev_set_emulate_model_alias(struct se_device *, int);
+ +int	se_dev_set_emulate_dpo(struct se_device *, int);
+ +int	se_dev_set_emulate_fua_write(struct se_device *, int);
+ +int	se_dev_set_emulate_fua_read(struct se_device *, int);
+ +int	se_dev_set_emulate_write_cache(struct se_device *, int);
+ +int	se_dev_set_emulate_ua_intlck_ctrl(struct se_device *, int);
+ +int	se_dev_set_emulate_tas(struct se_device *, int);
+ +int	se_dev_set_emulate_tpu(struct se_device *, int);
+ +int	se_dev_set_emulate_tpws(struct se_device *, int);
+ +int	se_dev_set_emulate_caw(struct se_device *, int);
+ +int	se_dev_set_emulate_3pc(struct se_device *, int);
+ +int	se_dev_set_pi_prot_type(struct se_device *, int);
+ +int	se_dev_set_pi_prot_format(struct se_device *, int);
+ +int	se_dev_set_enforce_pr_isids(struct se_device *, int);
+ +int	se_dev_set_force_pr_aptpl(struct se_device *, int);
+ +int	se_dev_set_is_nonrot(struct se_device *, int);
+ +int	se_dev_set_emulate_rest_reord(struct se_device *dev, int);
+ +int	se_dev_set_queue_depth(struct se_device *, u32);
+ +int	se_dev_set_max_sectors(struct se_device *, u32);
+ +int	se_dev_set_optimal_sectors(struct se_device *, u32);
+ +int	se_dev_set_block_size(struct se_device *, u32);
+++=======
++ bool target_sense_desc_format(struct se_device *dev);
++ sector_t target_to_linux_sector(struct se_device *dev, sector_t lb);
++ bool target_configure_unmap_from_queue(struct se_dev_attrib *attrib,
++ 				       struct request_queue *q, int block_size);
+++>>>>>>> 8a9ebe717a13 (target: Fix WRITE_SAME/DISCARD conversion to linux 512b sectors)
+  
+  #endif /* TARGET_CORE_BACKEND_H */
+diff --git a/drivers/target/target_core_device.c b/drivers/target/target_core_device.c
+index 1e65ea95d7f2..3d5b6ec594df 100644
+--- a/drivers/target/target_core_device.c
++++ b/drivers/target/target_core_device.c
+@@ -1546,6 +1546,50 @@ struct se_device *target_alloc_device(struct se_hba *hba, const char *name)
+ 	return dev;
+ }
+ 
++/*
++ * Check if the underlying struct block_device request_queue supports
++ * the QUEUE_FLAG_DISCARD bit for UNMAP/WRITE_SAME in SCSI + TRIM
++ * in ATA and we need to set TPE=1
++ */
++bool target_configure_unmap_from_queue(struct se_dev_attrib *attrib,
++				       struct request_queue *q, int block_size)
++{
++	if (!blk_queue_discard(q))
++		return false;
++
++	attrib->max_unmap_lba_count = (q->limits.max_discard_sectors << 9) /
++								block_size;
++	/*
++	 * Currently hardcoded to 1 in Linux/SCSI code..
++	 */
++	attrib->max_unmap_block_desc_count = 1;
++	attrib->unmap_granularity = q->limits.discard_granularity / block_size;
++	attrib->unmap_granularity_alignment = q->limits.discard_alignment /
++								block_size;
++	attrib->unmap_zeroes_data = q->limits.discard_zeroes_data;
++	return true;
++}
++EXPORT_SYMBOL(target_configure_unmap_from_queue);
++
++/*
++ * Convert from blocksize advertised to the initiator to the 512 byte
++ * units unconditionally used by the Linux block layer.
++ */
++sector_t target_to_linux_sector(struct se_device *dev, sector_t lb)
++{
++	switch (dev->dev_attrib.block_size) {
++	case 4096:
++		return lb << 3;
++	case 2048:
++		return lb << 2;
++	case 1024:
++		return lb << 1;
++	default:
++		return lb;
++	}
++}
++EXPORT_SYMBOL(target_to_linux_sector);
++
+ int target_configure_device(struct se_device *dev)
+ {
+ 	struct se_hba *hba = dev->se_hba;
+diff --git a/drivers/target/target_core_file.c b/drivers/target/target_core_file.c
+index 909f66aed985..4f168da004a0 100644
+--- a/drivers/target/target_core_file.c
++++ b/drivers/target/target_core_file.c
+@@ -165,25 +165,11 @@ static int fd_configure_device(struct se_device *dev)
+ 			" block_device blocks: %llu logical_block_size: %d\n",
+ 			dev_size, div_u64(dev_size, fd_dev->fd_block_size),
+ 			fd_dev->fd_block_size);
+-		/*
+-		 * Check if the underlying struct block_device request_queue supports
+-		 * the QUEUE_FLAG_DISCARD bit for UNMAP/WRITE_SAME in SCSI + TRIM
+-		 * in ATA and we need to set TPE=1
+-		 */
+-		if (blk_queue_discard(q)) {
+-			dev->dev_attrib.max_unmap_lba_count =
+-				q->limits.max_discard_sectors;
+-			/*
+-			 * Currently hardcoded to 1 in Linux/SCSI code..
+-			 */
+-			dev->dev_attrib.max_unmap_block_desc_count = 1;
+-			dev->dev_attrib.unmap_granularity =
+-				q->limits.discard_granularity >> 9;
+-			dev->dev_attrib.unmap_granularity_alignment =
+-				q->limits.discard_alignment;
++
++		if (target_configure_unmap_from_queue(&dev->dev_attrib, q,
++						      fd_dev->fd_block_size))
+ 			pr_debug("IFILE: BLOCK Discard support available,"
+-					" disabled by default\n");
+-		}
++				 " disabled by default\n");
+ 		/*
+ 		 * Enable write same emulation for IBLOCK and use 0xFFFF as
+ 		 * the smaller WRITE_SAME(10) only has a two-byte block count.
+@@ -607,9 +593,12 @@ fd_do_unmap(struct se_cmd *cmd, void *priv, sector_t lba, sector_t nolb)
+ 	if (S_ISBLK(inode->i_mode)) {
+ 		/* The backend is block device, use discard */
+ 		struct block_device *bdev = inode->i_bdev;
++		struct se_device *dev = cmd->se_dev;
+ 
+-		ret = blkdev_issue_discard(bdev, lba,
+-				nolb, GFP_KERNEL, 0);
++		ret = blkdev_issue_discard(bdev,
++					   target_to_linux_sector(dev, lba),
++					   target_to_linux_sector(dev,  nolb),
++					   GFP_KERNEL, 0);
+ 		if (ret < 0) {
+ 			pr_warn("FILEIO: blkdev_issue_discard() failed: %d\n",
+ 				ret);
+* Unmerged path drivers/target/target_core_iblock.c
+* Unmerged path include/target/target_core_backend.h
