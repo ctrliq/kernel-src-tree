@@ -1,0 +1,320 @@
+thunderbolt: Factor common ICM add and update operations out
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [thunderbolt] Factor common ICM add and update operations out (Jarod Wilson) [1495229]
+Rebuild_FUZZ: 87.85%
+commit-author Mika Westerberg <mika.westerberg@linux.intel.com>
+commit ee487dd2447a43dd318bd7ba2c54e59e707ad851
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/ee487dd2.failed
+
+The newer ICM will not use link and depth to address devices. Instead it
+uses route strings. In order to take advantage of the existing code
+factor out common operations so that we can use the same functions with
+the new ICM as well.
+
+No functional changes intended.
+
+	Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+	Reviewed-by: Andy Shevchenko <andy.shevchenko@gmail.com>
+(cherry picked from commit ee487dd2447a43dd318bd7ba2c54e59e707ad851)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/thunderbolt/icm.c
+diff --cc drivers/thunderbolt/icm.c
+index 675365e444f0,6798516d6474..000000000000
+--- a/drivers/thunderbolt/icm.c
++++ b/drivers/thunderbolt/icm.c
+@@@ -325,6 -329,102 +325,105 @@@ static int icm_fr_challenge_switch_key(
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int icm_fr_approve_xdomain_paths(struct tb *tb, struct tb_xdomain *xd)
++ {
++ 	struct icm_fr_pkg_approve_xdomain_response reply;
++ 	struct icm_fr_pkg_approve_xdomain request;
++ 	int ret;
++ 
++ 	memset(&request, 0, sizeof(request));
++ 	request.hdr.code = ICM_APPROVE_XDOMAIN;
++ 	request.link_info = xd->depth << ICM_LINK_INFO_DEPTH_SHIFT | xd->link;
++ 	memcpy(&request.remote_uuid, xd->remote_uuid, sizeof(*xd->remote_uuid));
++ 
++ 	request.transmit_path = xd->transmit_path;
++ 	request.transmit_ring = xd->transmit_ring;
++ 	request.receive_path = xd->receive_path;
++ 	request.receive_ring = xd->receive_ring;
++ 
++ 	memset(&reply, 0, sizeof(reply));
++ 	ret = icm_request(tb, &request, sizeof(request), &reply, sizeof(reply),
++ 			  1, ICM_TIMEOUT);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (reply.hdr.flags & ICM_FLAGS_ERROR)
++ 		return -EIO;
++ 
++ 	return 0;
++ }
++ 
++ static int icm_fr_disconnect_xdomain_paths(struct tb *tb, struct tb_xdomain *xd)
++ {
++ 	u8 phy_port;
++ 	u8 cmd;
++ 
++ 	phy_port = tb_phy_port_from_link(xd->link);
++ 	if (phy_port == 0)
++ 		cmd = NHI_MAILBOX_DISCONNECT_PA;
++ 	else
++ 		cmd = NHI_MAILBOX_DISCONNECT_PB;
++ 
++ 	nhi_mailbox_cmd(tb->nhi, cmd, 1);
++ 	usleep_range(10, 50);
++ 	nhi_mailbox_cmd(tb->nhi, cmd, 2);
++ 	return 0;
++ }
++ 
++ static void add_switch(struct tb_switch *parent_sw, u64 route,
++ 		       const uuid_t *uuid, u8 connection_id, u8 connection_key,
++ 		       u8 link, u8 depth, enum tb_security_level security_level,
++ 		       bool authorized)
++ {
++ 	struct tb_switch *sw;
++ 
++ 	sw = tb_switch_alloc(parent_sw->tb, &parent_sw->dev, route);
++ 	if (!sw)
++ 		return;
++ 
++ 	sw->uuid = kmemdup(uuid, sizeof(*uuid), GFP_KERNEL);
++ 	sw->connection_id = connection_id;
++ 	sw->connection_key = connection_key;
++ 	sw->link = link;
++ 	sw->depth = depth;
++ 	sw->authorized = authorized;
++ 	sw->security_level = security_level;
++ 
++ 	/* Link the two switches now */
++ 	tb_port_at(route, parent_sw)->remote = tb_upstream_port(sw);
++ 	tb_upstream_port(sw)->remote = tb_port_at(route, parent_sw);
++ 
++ 	if (tb_switch_add(sw)) {
++ 		tb_port_at(tb_route(sw), parent_sw)->remote = NULL;
++ 		tb_switch_put(sw);
++ 		return;
++ 	}
++ }
++ 
++ static void update_switch(struct tb_switch *parent_sw, struct tb_switch *sw,
++ 			  u64 route, u8 connection_id, u8 connection_key,
++ 			  u8 link, u8 depth)
++ {
++ 	/* Disconnect from parent */
++ 	tb_port_at(tb_route(sw), parent_sw)->remote = NULL;
++ 	/* Re-connect via updated port*/
++ 	tb_port_at(route, parent_sw)->remote = tb_upstream_port(sw);
++ 
++ 	/* Update with the new addressing information */
++ 	sw->config.route_hi = upper_32_bits(route);
++ 	sw->config.route_lo = lower_32_bits(route);
++ 	sw->connection_id = connection_id;
++ 	sw->connection_key = connection_key;
++ 	sw->link = link;
++ 	sw->depth = depth;
++ 
++ 	/* This switch still exists */
++ 	sw->is_unplugged = false;
++ }
++ 
+++>>>>>>> ee487dd2447a (thunderbolt: Factor common ICM add and update operations out)
+  static void remove_switch(struct tb_switch *sw)
+  {
+  	struct tb_switch *parent_sw;
+@@@ -334,6 -434,40 +433,43 @@@
+  	tb_switch_remove(sw);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void add_xdomain(struct tb_switch *sw, u64 route,
++ 			const uuid_t *local_uuid, const uuid_t *remote_uuid,
++ 			u8 link, u8 depth)
++ {
++ 	struct tb_xdomain *xd;
++ 
++ 	xd = tb_xdomain_alloc(sw->tb, &sw->dev, route, local_uuid, remote_uuid);
++ 	if (!xd)
++ 		return;
++ 
++ 	xd->link = link;
++ 	xd->depth = depth;
++ 
++ 	tb_port_at(route, sw)->xdomain = xd;
++ 
++ 	tb_xdomain_add(xd);
++ }
++ 
++ static void update_xdomain(struct tb_xdomain *xd, u64 route, u8 link)
++ {
++ 	xd->link = link;
++ 	xd->route = route;
++ 	xd->is_unplugged = false;
++ }
++ 
++ static void remove_xdomain(struct tb_xdomain *xd)
++ {
++ 	struct tb_switch *sw;
++ 
++ 	sw = tb_to_switch(xd->dev.parent);
++ 	tb_port_at(xd->route, sw)->xdomain = NULL;
++ 	tb_xdomain_remove(xd);
++ }
++ 
+++>>>>>>> ee487dd2447a (thunderbolt: Factor common ICM add and update operations out)
+  static void
+  icm_fr_device_connected(struct tb *tb, const struct icm_pkg_header *hdr)
+  {
+@@@ -350,7 -486,15 +487,9 @@@
+  	depth = (pkg->link_info & ICM_LINK_INFO_DEPTH_MASK) >>
+  		ICM_LINK_INFO_DEPTH_SHIFT;
+  	authorized = pkg->link_info & ICM_LINK_INFO_APPROVED;
++ 	security_level = (pkg->hdr.flags & ICM_FLAGS_SLEVEL_MASK) >>
++ 			 ICM_FLAGS_SLEVEL_SHIFT;
+  
+ -	if (pkg->link_info & ICM_LINK_INFO_REJECTED) {
+ -		tb_info(tb, "switch at %u.%u was rejected by ICM firmware because topology limit exceeded\n",
+ -			link, depth);
+ -		return;
+ -	}
+ -
+  	ret = icm->get_route(tb, link, depth, &route);
+  	if (ret) {
+  		tb_err(tb, "failed to find route string for switch at %u.%u\n",
+@@@ -480,6 -603,119 +591,122 @@@ icm_fr_device_disconnected(struct tb *t
+  	tb_switch_put(sw);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void
++ icm_fr_xdomain_connected(struct tb *tb, const struct icm_pkg_header *hdr)
++ {
++ 	const struct icm_fr_event_xdomain_connected *pkg =
++ 		(const struct icm_fr_event_xdomain_connected *)hdr;
++ 	struct tb_xdomain *xd;
++ 	struct tb_switch *sw;
++ 	u8 link, depth;
++ 	bool approved;
++ 	u64 route;
++ 
++ 	/*
++ 	 * After NVM upgrade adding root switch device fails because we
++ 	 * initiated reset. During that time ICM might still send
++ 	 * XDomain connected message which we ignore here.
++ 	 */
++ 	if (!tb->root_switch)
++ 		return;
++ 
++ 	link = pkg->link_info & ICM_LINK_INFO_LINK_MASK;
++ 	depth = (pkg->link_info & ICM_LINK_INFO_DEPTH_MASK) >>
++ 		ICM_LINK_INFO_DEPTH_SHIFT;
++ 	approved = pkg->link_info & ICM_LINK_INFO_APPROVED;
++ 
++ 	if (link > ICM_MAX_LINK || depth > ICM_MAX_DEPTH) {
++ 		tb_warn(tb, "invalid topology %u.%u, ignoring\n", link, depth);
++ 		return;
++ 	}
++ 
++ 	route = get_route(pkg->local_route_hi, pkg->local_route_lo);
++ 
++ 	xd = tb_xdomain_find_by_uuid(tb, &pkg->remote_uuid);
++ 	if (xd) {
++ 		u8 xd_phy_port, phy_port;
++ 
++ 		xd_phy_port = phy_port_from_route(xd->route, xd->depth);
++ 		phy_port = phy_port_from_route(route, depth);
++ 
++ 		if (xd->depth == depth && xd_phy_port == phy_port) {
++ 			update_xdomain(xd, route, link);
++ 			tb_xdomain_put(xd);
++ 			return;
++ 		}
++ 
++ 		/*
++ 		 * If we find an existing XDomain connection remove it
++ 		 * now. We need to go through login handshake and
++ 		 * everything anyway to be able to re-establish the
++ 		 * connection.
++ 		 */
++ 		remove_xdomain(xd);
++ 		tb_xdomain_put(xd);
++ 	}
++ 
++ 	/*
++ 	 * Look if there already exists an XDomain in the same place
++ 	 * than the new one and in that case remove it because it is
++ 	 * most likely another host that got disconnected.
++ 	 */
++ 	xd = tb_xdomain_find_by_link_depth(tb, link, depth);
++ 	if (!xd) {
++ 		u8 dual_link;
++ 
++ 		dual_link = dual_link_from_link(link);
++ 		if (dual_link)
++ 			xd = tb_xdomain_find_by_link_depth(tb, dual_link,
++ 							   depth);
++ 	}
++ 	if (xd) {
++ 		remove_xdomain(xd);
++ 		tb_xdomain_put(xd);
++ 	}
++ 
++ 	/*
++ 	 * If the user disconnected a switch during suspend and
++ 	 * connected another host to the same port, remove the switch
++ 	 * first.
++ 	 */
++ 	sw = get_switch_at_route(tb->root_switch, route);
++ 	if (sw)
++ 		remove_switch(sw);
++ 
++ 	sw = tb_switch_find_by_link_depth(tb, link, depth);
++ 	if (!sw) {
++ 		tb_warn(tb, "no switch exists at %u.%u, ignoring\n", link,
++ 			depth);
++ 		return;
++ 	}
++ 
++ 	add_xdomain(sw, route, &pkg->local_uuid, &pkg->remote_uuid, link,
++ 		    depth);
++ 	tb_switch_put(sw);
++ }
++ 
++ static void
++ icm_fr_xdomain_disconnected(struct tb *tb, const struct icm_pkg_header *hdr)
++ {
++ 	const struct icm_fr_event_xdomain_disconnected *pkg =
++ 		(const struct icm_fr_event_xdomain_disconnected *)hdr;
++ 	struct tb_xdomain *xd;
++ 
++ 	/*
++ 	 * If the connection is through one or multiple devices, the
++ 	 * XDomain device is removed along with them so it is fine if we
++ 	 * cannot find it here.
++ 	 */
++ 	xd = tb_xdomain_find_by_uuid(tb, &pkg->remote_uuid);
++ 	if (xd) {
++ 		remove_xdomain(xd);
++ 		tb_xdomain_put(xd);
++ 	}
++ }
++ 
+++>>>>>>> ee487dd2447a (thunderbolt: Factor common ICM add and update operations out)
+  static struct pci_dev *get_upstream_port(struct pci_dev *pdev)
+  {
+  	struct pci_dev *parent;
+* Unmerged path drivers/thunderbolt/icm.c
