@@ -1,0 +1,154 @@
+IB/srpt: Fix login-related race conditions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Bart Van Assche <bart.vanassche@wdc.com>
+commit db7683d7deb25d6edc9c59ac45c56c6a48a45514
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/db7683d7.failed
+
+Make sure that sport->mutex is not released between the duplicate
+channel check, adding a channel to the channel list and performing
+the sport enabled check. Avoid that srpt_disconnect_ch() can be
+invoked concurrently with the ib_send_cm_rep() call by
+srpt_cm_req_recv().
+
+	Signed-off-by: Bart Van Assche <bart.vanassche@wdc.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit db7683d7deb25d6edc9c59ac45c56c6a48a45514)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/srpt/ib_srpt.c
+diff --cc drivers/infiniband/ulp/srpt/ib_srpt.c
+index 22badbe26bbc,6278c4448061..000000000000
+--- a/drivers/infiniband/ulp/srpt/ib_srpt.c
++++ b/drivers/infiniband/ulp/srpt/ib_srpt.c
+@@@ -1981,14 -2032,15 +1981,14 @@@ static int srpt_cm_req_recv(struct ib_c
+  {
+  	struct srpt_device *sdev = cm_id->context;
+  	struct srpt_port *sport = &sdev->port[param->port - 1];
+ -	struct srpt_nexus *nexus;
+  	struct srp_login_req *req;
+ -	struct srp_login_rsp *rsp = NULL;
+ -	struct srp_login_rej *rej = NULL;
+ -	struct ib_cm_rep_param *rep_param = NULL;
+ -	struct srpt_rdma_ch *ch;
+ +	struct srp_login_rsp *rsp;
+ +	struct srp_login_rej *rej;
+ +	struct ib_cm_rep_param *rep_param;
+ +	struct srpt_rdma_ch *ch, *tmp_ch;
+  	char i_port_id[36];
+  	u32 it_iu_len;
+- 	int i, ret = 0;
++ 	int i, ret;
+  
+  	WARN_ON_ONCE(irqs_disabled());
+  
+@@@ -1999,10 -2051,19 +1999,11 @@@
+  
+  	it_iu_len = be32_to_cpu(req->req_it_iu_len);
+  
+ -	pr_info("Received SRP_LOGIN_REQ with i_port_id %pI6, t_port_id %pI6 and it_iu_len %d on port %d (guid=%pI6); pkey %#04x\n",
+ +	pr_info("Received SRP_LOGIN_REQ with i_port_id %pI6, t_port_id %pI6 and it_iu_len %d on port %d (guid=%pI6)\n",
+  		req->initiator_port_id, req->target_port_id, it_iu_len,
+ -		param->port, &sport->gid,
+ -		be16_to_cpu(param->primary_path->pkey));
+ -
+ -	nexus = srpt_get_nexus(sport, req->initiator_port_id,
+ -			       req->target_port_id);
+ -	if (IS_ERR(nexus)) {
+ -		ret = PTR_ERR(nexus);
+ -		goto out;
+ -	}
+ +		param->port, &sport->gid);
+  
++ 	ret = -ENOMEM;
+  	rsp = kzalloc(sizeof(*rsp), GFP_KERNEL);
+  	rej = kzalloc(sizeof(*rej), GFP_KERNEL);
+  	rep_param = kzalloc(sizeof(*rep_param), GFP_KERNEL);
+@@@ -2031,31 -2086,6 +2026,34 @@@
+  		goto reject;
+  	}
+  
+++<<<<<<< HEAD
+ +	if ((req->req_flags & SRP_MTCH_ACTION) == SRP_MULTICHAN_SINGLE) {
+ +		rsp->rsp_flags = SRP_LOGIN_RSP_MULTICHAN_NO_CHAN;
+ +
+ +		mutex_lock(&sport->mutex);
+ +
+ +		list_for_each_entry_safe(ch, tmp_ch, &sport->rch_list, list) {
+ +			if (!memcmp(ch->i_port_id, req->initiator_port_id, 16)
+ +			    && !memcmp(ch->t_port_id, req->target_port_id, 16)
+ +			    && param->port == ch->sport->port
+ +			    && param->listen_id == ch->sport->sdev->cm_id
+ +			    && ch->cm_id) {
+ +				if (srpt_disconnect_ch(ch) < 0)
+ +					continue;
+ +				pr_info("Relogin - closed existing channel %s\n",
+ +					ch->sess_name);
+ +				rsp->rsp_flags =
+ +					SRP_LOGIN_RSP_MULTICHAN_TERMINATED;
+ +			}
+ +		}
+ +
+ +		mutex_unlock(&sport->mutex);
+ +
+ +	} else
+ +		rsp->rsp_flags = SRP_LOGIN_RSP_MULTICHAN_MAINTAINED;
+ +
+++=======
+++>>>>>>> db7683d7deb2 (IB/srpt: Fix login-related race conditions)
+  	if (*(__be64 *)req->target_port_id != cpu_to_be64(srpt_service_guid)
+  	    || *(__be64 *)(req->target_port_id + 8) !=
+  	       cpu_to_be64(srpt_service_guid)) {
+@@@ -2195,24 -2255,30 +2223,34 @@@
+  	rep_param->responder_resources = 4;
+  	rep_param->initiator_depth = 4;
+  
+- 	ret = ib_send_cm_rep(cm_id, rep_param);
+- 	if (ret) {
+- 		pr_err("sending SRP_LOGIN_REQ response failed"
+- 		       " (error code = %d)\n", ret);
+- 		goto release_channel;
+- 	}
+- 
++ 	/*
++ 	 * Hold the sport mutex while accepting a connection to avoid that
++ 	 * srpt_disconnect_ch() is invoked concurrently with this code.
++ 	 */
+  	mutex_lock(&sport->mutex);
+++<<<<<<< HEAD
+ +	list_add_tail_rcu(&ch->list, &sport->rch_list);
+++=======
++ 	if (sport->enabled && ch->state == CH_CONNECTING)
++ 		ret = ib_send_cm_rep(cm_id, rep_param);
++ 	else
++ 		ret = -EINVAL;
+++>>>>>>> db7683d7deb2 (IB/srpt: Fix login-related race conditions)
+  	mutex_unlock(&sport->mutex);
+  
+- 	goto out;
++ 	switch (ret) {
++ 	case 0:
++ 		break;
++ 	case -EINVAL:
++ 		goto reject;
++ 	default:
++ 		rej->reason = cpu_to_be32(SRP_LOGIN_REJ_INSUFFICIENT_RESOURCES);
++ 		pr_err("sending SRP_LOGIN_REQ response failed (error code = %d)\n",
++ 		       ret);
++ 		goto reject;
++ 	}
+  
+- release_channel:
+- 	srpt_disconnect_ch(ch);
+- 	transport_deregister_session_configfs(ch->sess);
+- 	transport_deregister_session(ch->sess);
+- 	ch->sess = NULL;
++ 	goto out;
+  
+  destroy_ib:
+  	srpt_destroy_ch_ib(ch);
+* Unmerged path drivers/infiniband/ulp/srpt/ib_srpt.c
