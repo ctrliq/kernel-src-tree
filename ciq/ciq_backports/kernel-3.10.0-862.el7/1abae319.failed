@@ -1,0 +1,178 @@
+nfp: reorganize pkt_off variable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 1abae31953996283e1956af0b8ffa72c2b682e77
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/1abae319.failed
+
+Rename pkt_off variable to dma_off, it should hold data offset
+counting from beginning of DMA mapping.  Compute the value only
+in XDP context.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1abae31953996283e1956af0b8ffa72c2b682e77)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index e0a7eb1db7a9,0e4fa6802733..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@@ -1351,6 -1450,69 +1351,72 @@@ nfp_net_rx_drop(struct nfp_net_r_vecto
+  		dev_kfree_skb_any(skb);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool
++ nfp_net_tx_xdp_buf(struct nfp_net_dp *dp, struct nfp_net_rx_ring *rx_ring,
++ 		   struct nfp_net_tx_ring *tx_ring,
++ 		   struct nfp_net_rx_buf *rxbuf, unsigned int dma_off,
++ 		   unsigned int pkt_len)
++ {
++ 	struct nfp_net_tx_buf *txbuf;
++ 	struct nfp_net_tx_desc *txd;
++ 	dma_addr_t new_dma_addr;
++ 	void *new_frag;
++ 	int wr_idx;
++ 
++ 	if (unlikely(nfp_net_tx_full(tx_ring, 1))) {
++ 		nfp_net_rx_drop(rx_ring->r_vec, rx_ring, rxbuf, NULL);
++ 		return false;
++ 	}
++ 
++ 	new_frag = nfp_net_napi_alloc_one(dp, &new_dma_addr);
++ 	if (unlikely(!new_frag)) {
++ 		nfp_net_rx_drop(rx_ring->r_vec, rx_ring, rxbuf, NULL);
++ 		return false;
++ 	}
++ 	nfp_net_rx_give_one(rx_ring, new_frag, new_dma_addr);
++ 
++ 	wr_idx = tx_ring->wr_p & (tx_ring->cnt - 1);
++ 
++ 	/* Stash the soft descriptor of the head then initialize it */
++ 	txbuf = &tx_ring->txbufs[wr_idx];
++ 	txbuf->frag = rxbuf->frag;
++ 	txbuf->dma_addr = rxbuf->dma_addr;
++ 	txbuf->fidx = -1;
++ 	txbuf->pkt_cnt = 1;
++ 	txbuf->real_len = pkt_len;
++ 
++ 	dma_sync_single_for_device(dp->dev, rxbuf->dma_addr + dma_off,
++ 				   pkt_len, DMA_BIDIRECTIONAL);
++ 
++ 	/* Build TX descriptor */
++ 	txd = &tx_ring->txds[wr_idx];
++ 	txd->offset_eop = PCIE_DESC_TX_EOP;
++ 	txd->dma_len = cpu_to_le16(pkt_len);
++ 	nfp_desc_set_dma_addr(txd, rxbuf->dma_addr + dma_off);
++ 	txd->data_len = cpu_to_le16(pkt_len);
++ 
++ 	txd->flags = 0;
++ 	txd->mss = 0;
++ 	txd->l4_offset = 0;
++ 
++ 	tx_ring->wr_p++;
++ 	tx_ring->wr_ptr_add++;
++ 	return true;
++ }
++ 
++ static int nfp_net_run_xdp(struct bpf_prog *prog, void *data, unsigned int len)
++ {
++ 	struct xdp_buff xdp;
++ 
++ 	xdp.data = data;
++ 	xdp.data_end = data + len;
++ 
++ 	return bpf_prog_run_xdp(prog, &xdp);
++ }
++ 
+++>>>>>>> 1abae3195399 (nfp: reorganize pkt_off variable)
+  /**
+   * nfp_net_rx() - receive up to @budget packets on @rx_ring
+   * @rx_ring:   RX ring to receive from
+@@@ -1370,8 -1535,13 +1436,8 @@@ static int nfp_net_rx(struct nfp_net_rx
+  	int pkts_polled = 0;
+  	int idx;
+  
+ -	rcu_read_lock();
+ -	xdp_prog = READ_ONCE(dp->xdp_prog);
+ -	true_bufsz = xdp_prog ? PAGE_SIZE : dp->fl_bufsz;
+ -	tx_ring = r_vec->xdp_ring;
+ -
+  	while (pkts_polled < budget) {
+- 		unsigned int meta_len, data_len, data_off, pkt_len, pkt_off;
++ 		unsigned int meta_len, data_len, data_off, pkt_len;
+  		struct nfp_net_rx_buf *rxbuf;
+  		struct nfp_net_rx_desc *rxd;
+  		dma_addr_t new_dma_addr;
+@@@ -1408,11 -1578,10 +1474,18 @@@
+  		data_len = le16_to_cpu(rxd->rxd.data_len);
+  		pkt_len = data_len - meta_len;
+  
+++<<<<<<< HEAD
+ +		if (nn->rx_offset == NFP_NET_CFG_RX_OFFSET_DYNAMIC)
+ +			pkt_off = meta_len;
+ +		else
+ +			pkt_off = nn->rx_offset;
+ +		data_off = NFP_NET_RX_BUF_HEADROOM + pkt_off;
+++=======
++ 		if (dp->rx_offset == NFP_NET_CFG_RX_OFFSET_DYNAMIC)
++ 			data_off = NFP_NET_RX_BUF_HEADROOM + meta_len;
++ 		else
++ 			data_off = NFP_NET_RX_BUF_HEADROOM + dp->rx_offset;
+++>>>>>>> 1abae3195399 (nfp: reorganize pkt_off variable)
+  
+  		/* Stats update */
+  		u64_stats_update_begin(&r_vec->rx_sync);
+@@@ -1420,7 -1589,40 +1493,44 @@@
+  		r_vec->rx_bytes += pkt_len;
+  		u64_stats_update_end(&r_vec->rx_sync);
+  
+++<<<<<<< HEAD
+ +		skb = build_skb(rxbuf->frag, nn->fl_bufsz);
+++=======
++ 		if (xdp_prog && !(rxd->rxd.flags & PCIE_DESC_RX_BPF &&
++ 				  dp->bpf_offload_xdp)) {
++ 			unsigned int dma_off;
++ 			int act;
++ 
++ 			dma_off = data_off - NFP_NET_RX_BUF_HEADROOM;
++ 			dma_sync_single_for_cpu(dp->dev,
++ 						rxbuf->dma_addr + dma_off,
++ 						pkt_len, DMA_BIDIRECTIONAL);
++ 			act = nfp_net_run_xdp(xdp_prog, rxbuf->frag + data_off,
++ 					      pkt_len);
++ 			switch (act) {
++ 			case XDP_PASS:
++ 				break;
++ 			case XDP_TX:
++ 				if (unlikely(!nfp_net_tx_xdp_buf(dp, rx_ring,
++ 								 tx_ring, rxbuf,
++ 								 dma_off,
++ 								 pkt_len)))
++ 					trace_xdp_exception(dp->netdev,
++ 							    xdp_prog, act);
++ 				continue;
++ 			default:
++ 				bpf_warn_invalid_xdp_action(act);
++ 			case XDP_ABORTED:
++ 				trace_xdp_exception(dp->netdev, xdp_prog, act);
++ 			case XDP_DROP:
++ 				nfp_net_rx_give_one(rx_ring, rxbuf->frag,
++ 						    rxbuf->dma_addr);
++ 				continue;
++ 			}
++ 		}
++ 
++ 		skb = build_skb(rxbuf->frag, true_bufsz);
+++>>>>>>> 1abae3195399 (nfp: reorganize pkt_off variable)
+  		if (unlikely(!skb)) {
+  			nfp_net_rx_drop(r_vec, rx_ring, rxbuf, NULL);
+  			continue;
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_common.c
