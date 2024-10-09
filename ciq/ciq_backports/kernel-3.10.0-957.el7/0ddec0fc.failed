@@ -1,0 +1,620 @@
+seccomp: Sysctl to configure actions that are allowed to be logged
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Tyler Hicks <tyhicks@canonical.com>
+commit 0ddec0fc8900201c0897b87b762b7c420436662f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/0ddec0fc.failed
+
+Adminstrators can write to this sysctl to set the seccomp actions that
+are allowed to be logged. Any actions not found in this sysctl will not
+be logged.
+
+For example, all SECCOMP_RET_KILL, SECCOMP_RET_TRAP, and
+SECCOMP_RET_ERRNO actions would be loggable if "kill trap errno" were
+written to the sysctl. SECCOMP_RET_TRACE actions would not be logged
+since its string representation ("trace") wasn't present in the sysctl
+value.
+
+The path to the sysctl is:
+
+ /proc/sys/kernel/seccomp/actions_logged
+
+The actions_avail sysctl can be read to discover the valid action names
+that can be written to the actions_logged sysctl with the exception of
+"allow". SECCOMP_RET_ALLOW actions cannot be configured for logging.
+
+The default setting for the sysctl is to allow all actions to be logged
+except SECCOMP_RET_ALLOW. While only SECCOMP_RET_KILL actions are
+currently logged, an upcoming patch will allow applications to request
+additional actions to be logged.
+
+There's one important exception to this sysctl. If a task is
+specifically being audited, meaning that an audit context has been
+allocated for the task, seccomp will log all actions other than
+SECCOMP_RET_ALLOW despite the value of actions_logged. This exception
+preserves the existing auditing behavior of tasks with an allocated
+audit context.
+
+With this patch, the logic for deciding if an action will be logged is:
+
+if action == RET_ALLOW:
+  do not log
+else if action == RET_KILL && RET_KILL in actions_logged:
+  log
+else if audit_enabled && task-is-being-audited:
+  log
+else:
+  do not log
+
+	Signed-off-by: Tyler Hicks <tyhicks@canonical.com>
+	Signed-off-by: Kees Cook <keescook@chromium.org>
+(cherry picked from commit 0ddec0fc8900201c0897b87b762b7c420436662f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/audit.h
+#	kernel/seccomp.c
+diff --cc include/linux/audit.h
+index 3ffb60b9590a,8c30f06d639d..000000000000
+--- a/include/linux/audit.h
++++ b/include/linux/audit.h
+@@@ -188,8 -314,7 +188,12 @@@ void audit_core_dumps(long signr)
+  
+  static inline void audit_seccomp(unsigned long syscall, long signr, int code)
+  {
+++<<<<<<< HEAD
+ +	/* Force a record to be reported if a signal was delivered. */
+ +	if (signr || unlikely(!audit_dummy_context()))
+++=======
++ 	if (audit_enabled && unlikely(!audit_dummy_context()))
+++>>>>>>> 0ddec0fc8900 (seccomp: Sysctl to configure actions that are allowed to be logged)
+  		__audit_seccomp(syscall, signr, code);
+  }
+  
+diff --cc kernel/seccomp.c
+index 42e55449c1a5,54357e361aea..000000000000
+--- a/kernel/seccomp.c
++++ b/kernel/seccomp.c
+@@@ -551,18 -571,50 +590,30 @@@ static int mode1_syscalls[] = 
+  	0, /* null terminated */
+  };
+  
+ -static void __secure_computing_strict(int this_syscall)
+ -{
+ -	const int *syscall_whitelist = mode1_syscalls;
+  #ifdef CONFIG_COMPAT
+ -	if (in_compat_syscall())
+ -		syscall_whitelist = get_compat_mode1_syscalls();
+ +static int mode1_syscalls_32[] = {
+ +	__NR_seccomp_read_32, __NR_seccomp_write_32, __NR_seccomp_exit_32, __NR_seccomp_sigreturn_32,
+ +	0, /* null terminated */
+ +};
+  #endif
+ -	do {
+ -		if (*syscall_whitelist == this_syscall)
+ -			return;
+ -	} while (*++syscall_whitelist);
+  
+++<<<<<<< HEAD
+ +int __secure_computing(int this_syscall)
+++=======
++ #ifdef SECCOMP_DEBUG
++ 	dump_stack();
++ #endif
++ 	seccomp_log(this_syscall, SIGKILL, SECCOMP_RET_KILL);
++ 	do_exit(SIGKILL);
++ }
++ 
++ #ifndef CONFIG_HAVE_ARCH_SECCOMP_FILTER
++ void secure_computing_strict(int this_syscall)
+++>>>>>>> 0ddec0fc8900 (seccomp: Sysctl to configure actions that are allowed to be logged)
+  {
+ -	int mode = current->seccomp.mode;
+ -
+ -	if (IS_ENABLED(CONFIG_CHECKPOINT_RESTORE) &&
+ -	    unlikely(current->ptrace & PT_SUSPEND_SECCOMP))
+ -		return;
+ -
+ -	if (mode == SECCOMP_MODE_DISABLED)
+ -		return;
+ -	else if (mode == SECCOMP_MODE_STRICT)
+ -		__secure_computing_strict(this_syscall);
+ -	else
+ -		BUG();
+ -}
+ -#else
+ -
+ -#ifdef CONFIG_SECCOMP_FILTER
+ -static int __seccomp_filter(int this_syscall, const struct seccomp_data *sd,
+ -			    const bool recheck_after_trace)
+ -{
+ -	u32 filter_ret, action;
+ -	struct seccomp_filter *match = NULL;
+ -	int data;
+ +	int exit_sig = 0;
+ +	int *syscall;
+ +	u32 ret;
+  
+  	/*
+  	 * Make sure that any changes to mode from another thread have
+@@@ -570,70 -622,125 +621,187 @@@
+  	 */
+  	rmb();
+  
+++<<<<<<< HEAD
+ +	switch (current->seccomp.mode) {
+++=======
++ 	filter_ret = seccomp_run_filters(sd, &match);
++ 	data = filter_ret & SECCOMP_RET_DATA;
++ 	action = filter_ret & SECCOMP_RET_ACTION;
++ 
++ 	switch (action) {
++ 	case SECCOMP_RET_ERRNO:
++ 		/* Set low-order bits as an errno, capped at MAX_ERRNO. */
++ 		if (data > MAX_ERRNO)
++ 			data = MAX_ERRNO;
++ 		syscall_set_return_value(current, task_pt_regs(current),
++ 					 -data, 0);
++ 		goto skip;
++ 
++ 	case SECCOMP_RET_TRAP:
++ 		/* Show the handler the original registers. */
++ 		syscall_rollback(current, task_pt_regs(current));
++ 		/* Let the filter pass back 16 bits of data. */
++ 		seccomp_send_sigsys(this_syscall, data);
++ 		goto skip;
++ 
++ 	case SECCOMP_RET_TRACE:
++ 		/* We've been put in this state by the ptracer already. */
++ 		if (recheck_after_trace)
++ 			return 0;
++ 
++ 		/* ENOSYS these calls if there is no tracer attached. */
++ 		if (!ptrace_event_enabled(current, PTRACE_EVENT_SECCOMP)) {
++ 			syscall_set_return_value(current,
++ 						 task_pt_regs(current),
++ 						 -ENOSYS, 0);
++ 			goto skip;
++ 		}
++ 
++ 		/* Allow the BPF to provide the event message */
++ 		ptrace_event(PTRACE_EVENT_SECCOMP, data);
++ 		/*
++ 		 * The delivery of a fatal signal during event
++ 		 * notification may silently skip tracer notification,
++ 		 * which could leave us with a potentially unmodified
++ 		 * syscall that the tracer would have liked to have
++ 		 * changed. Since the process is about to die, we just
++ 		 * force the syscall to be skipped and let the signal
++ 		 * kill the process and correctly handle any tracer exit
++ 		 * notifications.
++ 		 */
++ 		if (fatal_signal_pending(current))
++ 			goto skip;
++ 		/* Check if the tracer forced the syscall to be skipped. */
++ 		this_syscall = syscall_get_nr(current, task_pt_regs(current));
++ 		if (this_syscall < 0)
++ 			goto skip;
++ 
++ 		/*
++ 		 * Recheck the syscall, since it may have changed. This
++ 		 * intentionally uses a NULL struct seccomp_data to force
++ 		 * a reload of all registers. This does not goto skip since
++ 		 * a skip would have already been reported.
++ 		 */
++ 		if (__seccomp_filter(this_syscall, NULL, true))
++ 			return -1;
++ 
++ 		return 0;
++ 
++ 	case SECCOMP_RET_ALLOW:
++ 		/*
++ 		 * Note that the "match" filter will always be NULL for
++ 		 * this action since SECCOMP_RET_ALLOW is the starting
++ 		 * state in seccomp_run_filters().
++ 		 */
++ 		return 0;
++ 
++ 	case SECCOMP_RET_KILL:
++ 	default:
++ 		seccomp_log(this_syscall, SIGSYS, action);
++ 		/* Dump core only if this is the last remaining thread. */
++ 		if (get_nr_threads(current) == 1) {
++ 			siginfo_t info;
++ 
++ 			/* Show the original registers in the dump. */
++ 			syscall_rollback(current, task_pt_regs(current));
++ 			/* Trigger a manual coredump since do_exit skips it. */
++ 			seccomp_init_siginfo(&info, this_syscall, data);
++ 			do_coredump(&info);
++ 		}
++ 		do_exit(SIGSYS);
++ 	}
++ 
++ 	unreachable();
++ 
++ skip:
++ 	seccomp_log(this_syscall, 0, action);
++ 	return -1;
++ }
++ #else
++ static int __seccomp_filter(int this_syscall, const struct seccomp_data *sd,
++ 			    const bool recheck_after_trace)
++ {
++ 	BUG();
++ }
++ #endif
++ 
++ int __secure_computing(const struct seccomp_data *sd)
++ {
++ 	int mode = current->seccomp.mode;
++ 	int this_syscall;
++ 
++ 	if (IS_ENABLED(CONFIG_CHECKPOINT_RESTORE) &&
++ 	    unlikely(current->ptrace & PT_SUSPEND_SECCOMP))
++ 		return 0;
++ 
++ 	this_syscall = sd ? sd->nr :
++ 		syscall_get_nr(current, task_pt_regs(current));
++ 
++ 	switch (mode) {
+++>>>>>>> 0ddec0fc8900 (seccomp: Sysctl to configure actions that are allowed to be logged)
+  	case SECCOMP_MODE_STRICT:
+ -		__secure_computing_strict(this_syscall);  /* may call do_exit */
+ -		return 0;
+ -	case SECCOMP_MODE_FILTER:
+ -		return __seccomp_filter(this_syscall, sd, false);
+ +		syscall = mode1_syscalls;
+ +#ifdef CONFIG_COMPAT
+ +		if (is_compat_task())
+ +			syscall = mode1_syscalls_32;
+ +#endif
+ +		do {
+ +			if (*syscall == this_syscall)
+ +				return 0;
+ +		} while (*++syscall);
+ +		exit_sig = SIGKILL;
+ +		ret = SECCOMP_RET_KILL;
+ +		break;
+ +#ifdef CONFIG_SECCOMP_FILTER
+ +	case SECCOMP_MODE_FILTER: {
+ +		int data;
+ +		struct pt_regs *regs = task_pt_regs(current);
+ +		ret = seccomp_run_filters(this_syscall);
+ +		data = ret & SECCOMP_RET_DATA;
+ +		ret &= SECCOMP_RET_ACTION;
+ +		switch (ret) {
+ +		case SECCOMP_RET_ERRNO:
+ +			/* Set the low-order 16-bits as a errno. */
+ +			syscall_set_return_value(current, regs,
+ +						 -data, 0);
+ +			goto skip;
+ +		case SECCOMP_RET_TRAP:
+ +			/* Show the handler the original registers. */
+ +			syscall_rollback(current, regs);
+ +			/* Let the filter pass back 16 bits of data. */
+ +			seccomp_send_sigsys(this_syscall, data);
+ +			goto skip;
+ +		case SECCOMP_RET_TRACE:
+ +			/* Skip these calls if there is no tracer. */
+ +			if (!ptrace_event_enabled(current, PTRACE_EVENT_SECCOMP)) {
+ +				syscall_set_return_value(current, regs,
+ +							 -ENOSYS, 0);
+ +				goto skip;
+ +			}
+ +			/* Allow the BPF to provide the event message */
+ +			ptrace_event(PTRACE_EVENT_SECCOMP, data);
+ +			/*
+ +			 * The delivery of a fatal signal during event
+ +			 * notification may silently skip tracer notification.
+ +			 * Terminating the task now avoids executing a system
+ +			 * call that may not be intended.
+ +			 */
+ +			if (fatal_signal_pending(current))
+ +				break;
+ +			if (syscall_get_nr(current, regs) < 0)
+ +				goto skip;  /* Explicit request to skip. */
+ +
+ +			return 0;
+ +		case SECCOMP_RET_ALLOW:
+ +			return 0;
+ +		case SECCOMP_RET_KILL:
+ +		default:
+ +			break;
+ +		}
+ +		exit_sig = SIGSYS;
+ +		break;
+ +	}
+ +#endif
+  	default:
+  		BUG();
+  	}
+@@@ -805,3 -928,251 +973,254 @@@ long prctl_set_seccomp(unsigned long se
+  	/* prctl interface doesn't have flags, so they are always zero. */
+  	return do_seccomp(op, 0, uargs);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ #if defined(CONFIG_SECCOMP_FILTER) && defined(CONFIG_CHECKPOINT_RESTORE)
++ long seccomp_get_filter(struct task_struct *task, unsigned long filter_off,
++ 			void __user *data)
++ {
++ 	struct seccomp_filter *filter;
++ 	struct sock_fprog_kern *fprog;
++ 	long ret;
++ 	unsigned long count = 0;
++ 
++ 	if (!capable(CAP_SYS_ADMIN) ||
++ 	    current->seccomp.mode != SECCOMP_MODE_DISABLED) {
++ 		return -EACCES;
++ 	}
++ 
++ 	spin_lock_irq(&task->sighand->siglock);
++ 	if (task->seccomp.mode != SECCOMP_MODE_FILTER) {
++ 		ret = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	filter = task->seccomp.filter;
++ 	while (filter) {
++ 		filter = filter->prev;
++ 		count++;
++ 	}
++ 
++ 	if (filter_off >= count) {
++ 		ret = -ENOENT;
++ 		goto out;
++ 	}
++ 	count -= filter_off;
++ 
++ 	filter = task->seccomp.filter;
++ 	while (filter && count > 1) {
++ 		filter = filter->prev;
++ 		count--;
++ 	}
++ 
++ 	if (WARN_ON(count != 1 || !filter)) {
++ 		/* The filter tree shouldn't shrink while we're using it. */
++ 		ret = -ENOENT;
++ 		goto out;
++ 	}
++ 
++ 	fprog = filter->prog->orig_prog;
++ 	if (!fprog) {
++ 		/* This must be a new non-cBPF filter, since we save
++ 		 * every cBPF filter's orig_prog above when
++ 		 * CONFIG_CHECKPOINT_RESTORE is enabled.
++ 		 */
++ 		ret = -EMEDIUMTYPE;
++ 		goto out;
++ 	}
++ 
++ 	ret = fprog->len;
++ 	if (!data)
++ 		goto out;
++ 
++ 	get_seccomp_filter(task);
++ 	spin_unlock_irq(&task->sighand->siglock);
++ 
++ 	if (copy_to_user(data, fprog->filter, bpf_classic_proglen(fprog)))
++ 		ret = -EFAULT;
++ 
++ 	put_seccomp_filter(task);
++ 	return ret;
++ 
++ out:
++ 	spin_unlock_irq(&task->sighand->siglock);
++ 	return ret;
++ }
++ #endif
++ 
++ #ifdef CONFIG_SYSCTL
++ 
++ /* Human readable action names for friendly sysctl interaction */
++ #define SECCOMP_RET_KILL_NAME		"kill"
++ #define SECCOMP_RET_TRAP_NAME		"trap"
++ #define SECCOMP_RET_ERRNO_NAME		"errno"
++ #define SECCOMP_RET_TRACE_NAME		"trace"
++ #define SECCOMP_RET_ALLOW_NAME		"allow"
++ 
++ static const char seccomp_actions_avail[] = SECCOMP_RET_KILL_NAME	" "
++ 					    SECCOMP_RET_TRAP_NAME	" "
++ 					    SECCOMP_RET_ERRNO_NAME	" "
++ 					    SECCOMP_RET_TRACE_NAME	" "
++ 					    SECCOMP_RET_ALLOW_NAME;
++ 
++ struct seccomp_log_name {
++ 	u32		log;
++ 	const char	*name;
++ };
++ 
++ static const struct seccomp_log_name seccomp_log_names[] = {
++ 	{ SECCOMP_LOG_KILL, SECCOMP_RET_KILL_NAME },
++ 	{ SECCOMP_LOG_TRAP, SECCOMP_RET_TRAP_NAME },
++ 	{ SECCOMP_LOG_ERRNO, SECCOMP_RET_ERRNO_NAME },
++ 	{ SECCOMP_LOG_TRACE, SECCOMP_RET_TRACE_NAME },
++ 	{ SECCOMP_LOG_ALLOW, SECCOMP_RET_ALLOW_NAME },
++ 	{ }
++ };
++ 
++ static bool seccomp_names_from_actions_logged(char *names, size_t size,
++ 					      u32 actions_logged)
++ {
++ 	const struct seccomp_log_name *cur;
++ 	bool append_space = false;
++ 
++ 	for (cur = seccomp_log_names; cur->name && size; cur++) {
++ 		ssize_t ret;
++ 
++ 		if (!(actions_logged & cur->log))
++ 			continue;
++ 
++ 		if (append_space) {
++ 			ret = strscpy(names, " ", size);
++ 			if (ret < 0)
++ 				return false;
++ 
++ 			names += ret;
++ 			size -= ret;
++ 		} else
++ 			append_space = true;
++ 
++ 		ret = strscpy(names, cur->name, size);
++ 		if (ret < 0)
++ 			return false;
++ 
++ 		names += ret;
++ 		size -= ret;
++ 	}
++ 
++ 	return true;
++ }
++ 
++ static bool seccomp_action_logged_from_name(u32 *action_logged,
++ 					    const char *name)
++ {
++ 	const struct seccomp_log_name *cur;
++ 
++ 	for (cur = seccomp_log_names; cur->name; cur++) {
++ 		if (!strcmp(cur->name, name)) {
++ 			*action_logged = cur->log;
++ 			return true;
++ 		}
++ 	}
++ 
++ 	return false;
++ }
++ 
++ static bool seccomp_actions_logged_from_names(u32 *actions_logged, char *names)
++ {
++ 	char *name;
++ 
++ 	*actions_logged = 0;
++ 	while ((name = strsep(&names, " ")) && *name) {
++ 		u32 action_logged = 0;
++ 
++ 		if (!seccomp_action_logged_from_name(&action_logged, name))
++ 			return false;
++ 
++ 		*actions_logged |= action_logged;
++ 	}
++ 
++ 	return true;
++ }
++ 
++ static int seccomp_actions_logged_handler(struct ctl_table *ro_table, int write,
++ 					  void __user *buffer, size_t *lenp,
++ 					  loff_t *ppos)
++ {
++ 	char names[sizeof(seccomp_actions_avail)];
++ 	struct ctl_table table;
++ 	int ret;
++ 
++ 	if (write && !capable(CAP_SYS_ADMIN))
++ 		return -EPERM;
++ 
++ 	memset(names, 0, sizeof(names));
++ 
++ 	if (!write) {
++ 		if (!seccomp_names_from_actions_logged(names, sizeof(names),
++ 						       seccomp_actions_logged))
++ 			return -EINVAL;
++ 	}
++ 
++ 	table = *ro_table;
++ 	table.data = names;
++ 	table.maxlen = sizeof(names);
++ 	ret = proc_dostring(&table, write, buffer, lenp, ppos);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (write) {
++ 		u32 actions_logged;
++ 
++ 		if (!seccomp_actions_logged_from_names(&actions_logged,
++ 						       table.data))
++ 			return -EINVAL;
++ 
++ 		if (actions_logged & SECCOMP_LOG_ALLOW)
++ 			return -EINVAL;
++ 
++ 		seccomp_actions_logged = actions_logged;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static struct ctl_path seccomp_sysctl_path[] = {
++ 	{ .procname = "kernel", },
++ 	{ .procname = "seccomp", },
++ 	{ }
++ };
++ 
++ static struct ctl_table seccomp_sysctl_table[] = {
++ 	{
++ 		.procname	= "actions_avail",
++ 		.data		= (void *) &seccomp_actions_avail,
++ 		.maxlen		= sizeof(seccomp_actions_avail),
++ 		.mode		= 0444,
++ 		.proc_handler	= proc_dostring,
++ 	},
++ 	{
++ 		.procname	= "actions_logged",
++ 		.mode		= 0644,
++ 		.proc_handler	= seccomp_actions_logged_handler,
++ 	},
++ 	{ }
++ };
++ 
++ static int __init seccomp_sysctl_init(void)
++ {
++ 	struct ctl_table_header *hdr;
++ 
++ 	hdr = register_sysctl_paths(seccomp_sysctl_path, seccomp_sysctl_table);
++ 	if (!hdr)
++ 		pr_warn("seccomp: sysctl registration failed\n");
++ 	else
++ 		kmemleak_not_leak(hdr);
++ 
++ 	return 0;
++ }
++ 
++ device_initcall(seccomp_sysctl_init)
++ 
++ #endif /* CONFIG_SYSCTL */
+++>>>>>>> 0ddec0fc8900 (seccomp: Sysctl to configure actions that are allowed to be logged)
+diff --git a/Documentation/prctl/seccomp_filter.txt b/Documentation/prctl/seccomp_filter.txt
+index 1e469ef75778..e7fb09a0cc7b 100644
+--- a/Documentation/prctl/seccomp_filter.txt
++++ b/Documentation/prctl/seccomp_filter.txt
+@@ -168,6 +168,24 @@ program generation.
+ 
+ 
+ 
++``actions_logged``:
++	A read-write ordered list of seccomp return values (refer to the
++	``SECCOMP_RET_*`` macros above) that are allowed to be logged. Writes
++	to the file do not need to be in ordered form but reads from the file
++	will be ordered in the same way as the actions_avail sysctl.
++
++	It is important to note that the value of ``actions_logged`` does not
++	prevent certain actions from being logged when the audit subsystem is
++	configured to audit a task. If the action is not found in
++	``actions_logged`` list, the final decision on whether to audit the
++	action for that task is ultimately left up to the audit subsystem to
++	decide for all seccomp return values other than ``SECCOMP_RET_ALLOW``.
++
++	The ``allow`` string is not accepted in the ``actions_logged`` sysctl
++	as it is not possible to log ``SECCOMP_RET_ALLOW`` actions. Attempting
++	to write ``allow`` to the sysctl will result in an EINVAL being
++	returned.
++
+ Adding architecture support
+ -----------------------
+ 
+* Unmerged path include/linux/audit.h
+* Unmerged path kernel/seccomp.c
