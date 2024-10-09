@@ -1,0 +1,193 @@
+mlx5: use page_pool for xdp_return_frame call
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jesper Dangaard Brouer <brouer@redhat.com>
+commit 60bbf7eeef10dc647430646d7fe5e3d8d132dbec
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/60bbf7ee.failed
+
+This patch shows how it is possible to have both the driver local page
+cache, which uses elevated refcnt for "catching"/avoiding SKB
+put_page returns the page through the page allocator.  And at the
+same time, have pages getting returned to the page_pool from
+ndp_xdp_xmit DMA completion.
+
+The performance improvement for XDP_REDIRECT in this patch is really
+good.  Especially considering that (currently) the xdp_return_frame
+API and page_pool_put_page() does per frame operations of both
+rhashtable ID-lookup and locked return into (page_pool) ptr_ring.
+(It is the plan to remove these per frame operation in a followup
+patchset).
+
+The benchmark performed was RX on mlx5 and XDP_REDIRECT out ixgbe,
+with xdp_redirect_map (using devmap) . And the target/maximum
+capability of ixgbe is 13Mpps (on this HW setup).
+
+Before this patch for mlx5, XDP redirected frames were returned via
+the page allocator.  The single flow performance was 6Mpps, and if I
+started two flows the collective performance drop to 4Mpps, because we
+hit the page allocator lock (further negative scaling occurs).
+
+Two test scenarios need to be covered, for xdp_return_frame API, which
+is DMA-TX completion running on same-CPU or cross-CPU free/return.
+Results were same-CPU=10Mpps, and cross-CPU=12Mpps.  This is very
+close to our 13Mpps max target.
+
+The reason max target isn't reached in cross-CPU test, is likely due
+to RX-ring DMA unmap/map overhead (which doesn't occur in ixgbe to
+ixgbe testing).  It is also planned to remove this unnecessary DMA
+unmap in a later patchset
+
+V2: Adjustments requested by Tariq
+ - Changed page_pool_create return codes not return NULL, only
+   ERR_PTR, as this simplifies err handling in drivers.
+ - Save a branch in mlx5e_page_release
+ - Correct page_pool size calc for MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ
+
+V5: Updated patch desc
+
+V8: Adjust for b0cedc844c00 ("net/mlx5e: Remove rq_headroom field from params")
+V9:
+ - Adjust for 121e89275471 ("net/mlx5e: Refactor RQ XDP_TX indication")
+ - Adjust for 73281b78a37a ("net/mlx5e: Derive Striding RQ size from MTU")
+ - Correct handling if page_pool_create fail for MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ
+
+V10: Req from Tariq
+ - Change pool_size calc for MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ
+
+	Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Reviewed-by: Tariq Toukan <tariqt@mellanox.com>
+	Acked-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 60bbf7eeef10dc647430646d7fe5e3d8d132dbec)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index a685c1b39acc,f10037419978..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -436,12 -428,18 +438,21 @@@ static int mlx5e_alloc_rq(struct mlx5e_
+  		goto err_rq_wq_destroy;
+  	}
+  
+ -	err = xdp_rxq_info_reg(&rq->xdp_rxq, rq->netdev, rq->ix);
+ -	if (err < 0)
+ -		goto err_rq_wq_destroy;
+ -
+  	rq->buff.map_dir = rq->xdp_prog ? DMA_BIDIRECTIONAL : DMA_FROM_DEVICE;
+++<<<<<<< HEAD
+ +	rq->buff.headroom = mlx5e_get_rq_headroom(params);
+++=======
++ 	rq->buff.headroom = mlx5e_get_rq_headroom(mdev, params);
++ 	pool_size = 1 << params->log_rq_mtu_frames;
+++>>>>>>> 60bbf7eeef10 (mlx5: use page_pool for xdp_return_frame call)
+  
+  	switch (rq->wq_type) {
+  	case MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ:
+  
+++<<<<<<< HEAD
+++=======
++ 		pool_size = MLX5_MPWRQ_PAGES_PER_WQE << mlx5e_mpwqe_get_log_rq_size(params);
+++>>>>>>> 60bbf7eeef10 (mlx5: use page_pool for xdp_return_frame call)
+  		rq->post_wqes = mlx5e_post_rx_mpwqes;
+  		rq->dealloc_wqe = mlx5e_dealloc_rx_mpwqe;
+  
+@@@ -558,6 -578,9 +587,12 @@@ err_destroy_umr_mkey
+  err_rq_wq_destroy:
+  	if (rq->xdp_prog)
+  		bpf_prog_put(rq->xdp_prog);
+++<<<<<<< HEAD
+++=======
++ 	xdp_rxq_info_unreg(&rq->xdp_rxq);
++ 	if (rq->page_pool)
++ 		page_pool_destroy(rq->page_pool);
+++>>>>>>> 60bbf7eeef10 (mlx5: use page_pool for xdp_return_frame call)
+  	mlx5_wq_destroy(&rq->wq_ctrl);
+  
+  	return err;
+@@@ -570,9 -593,13 +605,16 @@@ static void mlx5e_free_rq(struct mlx5e_
+  	if (rq->xdp_prog)
+  		bpf_prog_put(rq->xdp_prog);
+  
+++<<<<<<< HEAD
+++=======
++ 	xdp_rxq_info_unreg(&rq->xdp_rxq);
++ 	if (rq->page_pool)
++ 		page_pool_destroy(rq->page_pool);
++ 
+++>>>>>>> 60bbf7eeef10 (mlx5: use page_pool for xdp_return_frame call)
+  	switch (rq->wq_type) {
+  	case MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ:
+ -		kfree(rq->mpwqe.info);
+ +		mlx5e_rq_free_mpwqe_info(rq);
+  		mlx5_core_destroy_mkey(rq->mdev, &rq->umr_mkey);
+  		break;
+  	default: /* MLX5_WQ_TYPE_LINKED_LIST */
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 13394c230883..bb4bbd11374a 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -53,6 +53,8 @@
+ #include "mlx5_core.h"
+ #include "en_stats.h"
+ 
++struct page_pool;
++
+ #define MLX5_SET_CFG(p, f, v) MLX5_SET(create_flow_group_in, p, f, v)
+ 
+ #define MLX5E_ETH_HARD_MTU (ETH_HLEN + VLAN_HLEN + ETH_FCS_LEN)
+@@ -537,6 +539,7 @@ struct mlx5e_rq {
+ 	unsigned int           hw_mtu;
+ 	struct mlx5e_xdpsq     xdpsq;
+ 	DECLARE_BITMAP(flags, 8);
++	struct page_pool      *page_pool;
+ 
+ 	/* control */
+ 	struct mlx5_wq_ctrl    wq_ctrl;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index 29331bf7aa1d..7e7d5f1c7fef 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@ -37,6 +37,7 @@
+ #include <linux/bpf_trace.h>
+ #include <net/busy_poll.h>
+ #include <net/ip6_checksum.h>
++#include <net/page_pool.h>
+ #include "en.h"
+ #include "en_tc.h"
+ #include "eswitch.h"
+@@ -223,7 +224,7 @@ static inline int mlx5e_page_alloc_mapped(struct mlx5e_rq *rq,
+ 	if (mlx5e_rx_cache_get(rq, dma_info))
+ 		return 0;
+ 
+-	dma_info->page = dev_alloc_pages(rq->buff.page_order);
++	dma_info->page = page_pool_dev_alloc_pages(rq->page_pool);
+ 	if (unlikely(!dma_info->page))
+ 		return -ENOMEM;
+ 
+@@ -248,11 +249,16 @@ static void mlx5e_page_dma_unmap(struct mlx5e_rq *rq,
+ void mlx5e_page_release(struct mlx5e_rq *rq, struct mlx5e_dma_info *dma_info,
+ 			bool recycle)
+ {
+-	if (likely(recycle) && mlx5e_rx_cache_put(rq, dma_info))
+-		return;
++	if (likely(recycle)) {
++		if (mlx5e_rx_cache_put(rq, dma_info))
++			return;
+ 
+-	mlx5e_page_dma_unmap(rq, dma_info);
+-	put_page(dma_info->page);
++		mlx5e_page_dma_unmap(rq, dma_info);
++		page_pool_recycle_direct(rq->page_pool, dma_info->page);
++	} else {
++		mlx5e_page_dma_unmap(rq, dma_info);
++		put_page(dma_info->page);
++	}
+ }
+ 
+ static inline bool mlx5e_page_reuse(struct mlx5e_rq *rq,
