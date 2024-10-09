@@ -1,0 +1,481 @@
+dm mpath: add optional "queue_mode" feature
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Mike Snitzer <snitzer@redhat.com>
+commit e83068a5faafb8ca65d3b58bd1e1e3959ce1ddce
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/e83068a5.failed
+
+Allow a user to specify an optional feature 'queue_mode <mode>' where
+<mode> may be "bio", "rq" or "mq" -- which corresponds to bio-based,
+request_fn rq-based, and blk-mq rq-based respectively.
+
+If the queue_mode feature isn't specified the default for the
+"multipath" target is still "rq" but if dm_mod.use_blk_mq is set to Y
+it'll default to mode "mq".
+
+This new queue_mode feature introduces the ability for each multipath
+device to have its own queue_mode (whereas before this feature all
+multipath devices effectively had to have the same queue_mode).
+
+This commit also goes a long way to eliminate the awkward (ab)use of
+DM_TYPE_*, the associated filter_md_type() and other relatively fragile
+and difficult to maintain code.
+
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit e83068a5faafb8ca65d3b58bd1e1e3959ce1ddce)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-mpath.c
+#	drivers/md/dm-table.c
+diff --cc drivers/md/dm-mpath.c
+index d712f8cf8006,7eac080fcb18..000000000000
+--- a/drivers/md/dm-mpath.c
++++ b/drivers/md/dm-mpath.c
+@@@ -188,7 -192,7 +190,11 @@@ static void free_priority_group(struct 
+  	kfree(pg);
+  }
+  
+++<<<<<<< HEAD
+ +static struct multipath *alloc_multipath(struct dm_target *ti, bool use_blk_mq)
+++=======
++ static struct multipath *alloc_multipath(struct dm_target *ti)
+++>>>>>>> e83068a5faaf (dm mpath: add optional "queue_mode" feature)
+  {
+  	struct multipath *m;
+  
+@@@ -206,15 -210,7 +212,19 @@@
+  		mutex_init(&m->work_mutex);
+  
+  		m->mpio_pool = NULL;
+++<<<<<<< HEAD
+ +		if (!use_blk_mq) {
+ +			unsigned min_ios = dm_get_reserved_rq_based_ios();
+ +
+ +			m->mpio_pool = mempool_create_slab_pool(min_ios, _mpio_cache);
+ +			if (!m->mpio_pool) {
+ +				kfree(m);
+ +				return NULL;
+ +			}
+ +		}
+++=======
++ 		m->queue_mode = DM_TYPE_NONE;
+++>>>>>>> e83068a5faaf (dm mpath: add optional "queue_mode" feature)
+  
+  		m->ti = ti;
+  		ti->private = m;
+@@@ -540,6 -607,108 +583,111 @@@ static void multipath_release_clone(str
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Map cloned bios (bio-based multipath)
++  */
++ static int __multipath_map_bio(struct multipath *m, struct bio *bio, struct dm_mpath_io *mpio)
++ {
++ 	size_t nr_bytes = bio->bi_iter.bi_size;
++ 	struct pgpath *pgpath;
++ 	unsigned long flags;
++ 	bool queue_io;
++ 
++ 	/* Do we need to select a new pgpath? */
++ 	pgpath = lockless_dereference(m->current_pgpath);
++ 	queue_io = test_bit(MPATHF_QUEUE_IO, &m->flags);
++ 	if (!pgpath || !queue_io)
++ 		pgpath = choose_pgpath(m, nr_bytes);
++ 
++ 	if ((pgpath && queue_io) ||
++ 	    (!pgpath && test_bit(MPATHF_QUEUE_IF_NO_PATH, &m->flags))) {
++ 		/* Queue for the daemon to resubmit */
++ 		spin_lock_irqsave(&m->lock, flags);
++ 		bio_list_add(&m->queued_bios, bio);
++ 		spin_unlock_irqrestore(&m->lock, flags);
++ 		/* PG_INIT_REQUIRED cannot be set without QUEUE_IO */
++ 		if (queue_io || test_bit(MPATHF_PG_INIT_REQUIRED, &m->flags))
++ 			pg_init_all_paths(m);
++ 		else if (!queue_io)
++ 			queue_work(kmultipathd, &m->process_queued_bios);
++ 		return DM_MAPIO_SUBMITTED;
++ 	}
++ 
++ 	if (!pgpath) {
++ 		if (!must_push_back_bio(m))
++ 			return -EIO;
++ 		return DM_MAPIO_REQUEUE;
++ 	}
++ 
++ 	mpio->pgpath = pgpath;
++ 	mpio->nr_bytes = nr_bytes;
++ 
++ 	bio->bi_error = 0;
++ 	bio->bi_bdev = pgpath->path.dev->bdev;
++ 	bio->bi_rw |= REQ_FAILFAST_TRANSPORT;
++ 
++ 	if (pgpath->pg->ps.type->start_io)
++ 		pgpath->pg->ps.type->start_io(&pgpath->pg->ps,
++ 					      &pgpath->path,
++ 					      nr_bytes);
++ 	return DM_MAPIO_REMAPPED;
++ }
++ 
++ static int multipath_map_bio(struct dm_target *ti, struct bio *bio)
++ {
++ 	struct multipath *m = ti->private;
++ 	struct dm_mpath_io *mpio = NULL;
++ 
++ 	multipath_init_per_bio_data(bio, &mpio, NULL);
++ 
++ 	return __multipath_map_bio(m, bio, mpio);
++ }
++ 
++ static void process_queued_bios_list(struct multipath *m)
++ {
++ 	if (m->queue_mode == DM_TYPE_BIO_BASED)
++ 		queue_work(kmultipathd, &m->process_queued_bios);
++ }
++ 
++ static void process_queued_bios(struct work_struct *work)
++ {
++ 	int r;
++ 	unsigned long flags;
++ 	struct bio *bio;
++ 	struct bio_list bios;
++ 	struct blk_plug plug;
++ 	struct multipath *m =
++ 		container_of(work, struct multipath, process_queued_bios);
++ 
++ 	bio_list_init(&bios);
++ 
++ 	spin_lock_irqsave(&m->lock, flags);
++ 
++ 	if (bio_list_empty(&m->queued_bios)) {
++ 		spin_unlock_irqrestore(&m->lock, flags);
++ 		return;
++ 	}
++ 
++ 	bio_list_merge(&bios, &m->queued_bios);
++ 	bio_list_init(&m->queued_bios);
++ 
++ 	spin_unlock_irqrestore(&m->lock, flags);
++ 
++ 	blk_start_plug(&plug);
++ 	while ((bio = bio_list_pop(&bios))) {
++ 		r = __multipath_map_bio(m, bio, get_mpio_from_bio(bio));
++ 		if (r < 0 || r == DM_MAPIO_REQUEUE) {
++ 			bio->bi_error = r;
++ 			bio_endio(bio);
++ 		} else if (r == DM_MAPIO_REMAPPED)
++ 			generic_make_request(bio);
++ 	}
++ 	blk_finish_plug(&plug);
++ }
++ 
++ /*
+++>>>>>>> e83068a5faaf (dm mpath: add optional "queue_mode" feature)
+   * If we run out of usable paths, should we queue I/O or error it?
+   */
+  static int queue_if_no_path(struct multipath *m, bool queue_if_no_path,
+@@@ -814,13 -979,13 +962,22 @@@ static int parse_hw_handler(struct dm_a
+  	if (!hw_argc)
+  		return 0;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (m->queue_mode == DM_TYPE_BIO_BASED) {
++ 		dm_consume_args(as, hw_argc);
++ 		DMERR("bio-based multipath doesn't allow hardware handler args");
++ 		return 0;
++ 	}
++ 
+++>>>>>>> e83068a5faaf (dm mpath: add optional "queue_mode" feature)
+  	m->hw_handler_name = kstrdup(dm_shift_arg(as), GFP_KERNEL);
+ +	if (!try_then_request_module(scsi_dh_handler_exist(m->hw_handler_name),
+ +				     "scsi_dh_%s", m->hw_handler_name)) {
+ +		ti->error = "unknown hardware handler type";
+ +		ret = -EINVAL;
+ +		goto fail;
+ +	}
+  
+  	if (hw_argc > 1) {
+  		char *p;
+@@@ -902,8 -1085,7 +1077,12 @@@ static int parse_features(struct dm_arg
+  	return r;
+  }
+  
+++<<<<<<< HEAD
+ +static int multipath_ctr(struct dm_target *ti, unsigned int argc,
+ +			 char **argv)
+++=======
++ static int multipath_ctr(struct dm_target *ti, unsigned argc, char **argv)
+++>>>>>>> e83068a5faaf (dm mpath: add optional "queue_mode" feature)
+  {
+  	/* target arguments */
+  	static struct dm_arg _args[] = {
+@@@ -921,7 -1102,7 +1099,11 @@@
+  	as.argc = argc;
+  	as.argv = argv;
+  
+++<<<<<<< HEAD
+ +	m = alloc_multipath(ti, use_blk_mq);
+++=======
++ 	m = alloc_multipath(ti);
+++>>>>>>> e83068a5faaf (dm mpath: add optional "queue_mode" feature)
+  	if (!m) {
+  		ti->error = "can't allocate multipath";
+  		return -EINVAL;
+@@@ -980,7 -1165,9 +1166,13 @@@
+  	ti->num_flush_bios = 1;
+  	ti->num_discard_bios = 1;
+  	ti->num_write_same_bios = 1;
+++<<<<<<< HEAD
+ +	if (use_blk_mq)
+++=======
++ 	if (m->queue_mode == DM_TYPE_BIO_BASED)
++ 		ti->per_io_data_size = multipath_per_bio_data_size();
++ 	else if (m->queue_mode == DM_TYPE_MQ_REQUEST_BASED)
+++>>>>>>> e83068a5faaf (dm mpath: add optional "queue_mode" feature)
+  		ti->per_io_data_size = sizeof(struct dm_mpath_io);
+  
+  	return 0;
+@@@ -1781,6 -2041,8 +1985,11 @@@ static struct target_type multipath_tar
+  	.clone_and_map_rq = multipath_clone_and_map,
+  	.release_clone_rq = multipath_release_clone,
+  	.rq_end_io = multipath_end_io,
+++<<<<<<< HEAD
+++=======
++ 	.map = multipath_map_bio,
++ 	.end_io = multipath_end_io_bio,
+++>>>>>>> e83068a5faaf (dm mpath: add optional "queue_mode" feature)
+  	.presuspend = multipath_presuspend,
+  	.postsuspend = multipath_postsuspend,
+  	.resume = multipath_resume,
+diff --cc drivers/md/dm-table.c
+index fe39babf4ced,88f01744ac16..000000000000
+--- a/drivers/md/dm-table.c
++++ b/drivers/md/dm-table.c
+@@@ -1120,9 -1128,15 +1143,21 @@@ static int dm_table_prealloc_integrity(
+  	if (!template_disk)
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	if (!blk_integrity_is_initialized(dm_disk(md))) {
+ +		t->integrity_supported = 1;
+ +		return blk_integrity_register(dm_disk(md), NULL);
+++=======
++ 	if (!integrity_profile_exists(dm_disk(md))) {
++ 		t->integrity_supported = true;
++ 		/*
++ 		 * Register integrity profile during table load; we can do
++ 		 * this because the final profile must match during resume.
++ 		 */
++ 		blk_integrity_register(dm_disk(md),
++ 				       blk_get_integrity(template_disk));
++ 		return 0;
+++>>>>>>> e83068a5faaf (dm mpath: add optional "queue_mode" feature)
+  	}
+  
+  	/*
+@@@ -1138,8 -1151,8 +1173,13 @@@
+  		return 1;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* Preserve existing initialized integrity profile */
+ +	t->integrity_supported = 1;
+++=======
++ 	/* Preserve existing integrity profile */
++ 	t->integrity_supported = true;
+++>>>>>>> e83068a5faaf (dm mpath: add optional "queue_mode" feature)
+  	return 0;
+  }
+  
+* Unmerged path drivers/md/dm-mpath.c
+diff --git a/drivers/md/dm-rq.c b/drivers/md/dm-rq.c
+index 2d7c754aad6d..e7b68c48baed 100644
+--- a/drivers/md/dm-rq.c
++++ b/drivers/md/dm-rq.c
+@@ -236,7 +236,14 @@ static void free_rq_clone(struct request *clone)
+ 
+ 	blk_rq_unprep_clone(clone);
+ 
+-	if (md->type == DM_TYPE_MQ_REQUEST_BASED)
++	/*
++	 * It is possible for a clone_old_rq() allocated clone to
++	 * get passed in -- it may not yet have a request_queue.
++	 * This is known to occur if the error target replaces
++	 * a multipath target that has a request_fn queue stacked
++	 * on blk-mq queue(s).
++	 */
++	if (clone->q && clone->q->mq_ops)
+ 		/* stacked on blk-mq queue(s) */
+ 		tio->ti->type->release_clone_rq(clone);
+ 	else if (!md->queue->mq_ops)
+@@ -568,7 +575,7 @@ static struct dm_rq_target_io *dm_old_prep_tio(struct request *rq,
+ 	 * Must clone a request if this .request_fn DM device
+ 	 * is stacked on .request_fn device(s).
+ 	 */
+-	if (!dm_table_mq_request_based(table)) {
++	if (!dm_table_all_blk_mq_devices(table)) {
+ 		if (!clone_old_rq(rq, md, tio, gfp_mask)) {
+ 			dm_put_live_table(md, srcu_idx);
+ 			free_old_rq_tio(tio);
+@@ -717,7 +724,7 @@ ssize_t dm_attr_rq_based_seq_io_merge_deadline_store(struct mapped_device *md,
+ {
+ 	unsigned deadline;
+ 
+-	if (!dm_request_based(md) || md->use_blk_mq)
++	if (dm_get_md_type(md) != DM_TYPE_REQUEST_BASED)
+ 		return count;
+ 
+ 	if (kstrtouint(buf, 10, &deadline))
+@@ -903,12 +910,13 @@ static struct blk_mq_ops dm_mq_ops = {
+ 	.init_request = dm_mq_init_request,
+ };
+ 
+-int dm_mq_init_request_queue(struct mapped_device *md, struct dm_target *immutable_tgt)
++int dm_mq_init_request_queue(struct mapped_device *md, struct dm_table *t)
+ {
+ 	struct request_queue *q;
++	struct dm_target *immutable_tgt;
+ 	int err;
+ 
+-	if (dm_get_md_type(md) == DM_TYPE_REQUEST_BASED) {
++	if (!dm_table_all_blk_mq_devices(t)) {
+ 		DMERR("request-based dm-mq may only be stacked on blk-mq device(s)");
+ 		return -EINVAL;
+ 	}
+@@ -925,6 +933,7 @@ int dm_mq_init_request_queue(struct mapped_device *md, struct dm_target *immutab
+ 	md->tag_set->driver_data = md;
+ 
+ 	md->tag_set->cmd_size = sizeof(struct dm_rq_target_io);
++	immutable_tgt = dm_table_get_immutable_target(t);
+ 	if (immutable_tgt && immutable_tgt->per_io_data_size) {
+ 		/* any target-specific per-io data is immediately after the tio */
+ 		md->tag_set->cmd_size += immutable_tgt->per_io_data_size;
+diff --git a/drivers/md/dm-rq.h b/drivers/md/dm-rq.h
+index 1559f6486024..9e6f0a3773d4 100644
+--- a/drivers/md/dm-rq.h
++++ b/drivers/md/dm-rq.h
+@@ -49,7 +49,7 @@ bool dm_use_blk_mq_default(void);
+ bool dm_use_blk_mq(struct mapped_device *md);
+ 
+ int dm_old_init_request_queue(struct mapped_device *md);
+-int dm_mq_init_request_queue(struct mapped_device *md, struct dm_target *immutable_tgt);
++int dm_mq_init_request_queue(struct mapped_device *md, struct dm_table *t);
+ void dm_mq_cleanup_mapped_device(struct mapped_device *md);
+ 
+ void dm_start_queue(struct request_queue *q);
+* Unmerged path drivers/md/dm-table.c
+diff --git a/drivers/md/dm.c b/drivers/md/dm.c
+index a500e5a5f71c..c2ffa8d92201 100644
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@ -1965,23 +1965,14 @@ struct queue_limits *dm_get_queue_limits(struct mapped_device *md)
+ }
+ EXPORT_SYMBOL_GPL(dm_get_queue_limits);
+ 
+-static unsigned filter_md_type(unsigned type, struct mapped_device *md)
+-{
+-	if (type == DM_TYPE_BIO_BASED)
+-		return type;
+-
+-	return !md->use_blk_mq ? DM_TYPE_REQUEST_BASED : DM_TYPE_MQ_REQUEST_BASED;
+-}
+-
+ /*
+  * Setup the DM device's queue based on md's type
+  */
+ int dm_setup_md_queue(struct mapped_device *md, struct dm_table *t)
+ {
+ 	int r;
+-	unsigned md_type = filter_md_type(dm_get_md_type(md), md);
+ 
+-	switch (md_type) {
++	switch (dm_get_md_type(md)) {
+ 	case DM_TYPE_REQUEST_BASED:
+ 		r = dm_old_init_request_queue(md);
+ 		if (r) {
+@@ -1990,7 +1981,7 @@ int dm_setup_md_queue(struct mapped_device *md, struct dm_table *t)
+ 		}
+ 		break;
+ 	case DM_TYPE_MQ_REQUEST_BASED:
+-		r = dm_mq_init_request_queue(md, dm_table_get_immutable_target(t));
++		r = dm_mq_init_request_queue(md, t);
+ 		if (r) {
+ 			DMERR("Cannot initialize queue for request-based dm-mq mapped device");
+ 			return r;
+@@ -2703,8 +2694,6 @@ struct dm_md_mempools *dm_alloc_md_mempools(struct mapped_device *md, unsigned t
+ 	if (!pools)
+ 		return NULL;
+ 
+-	type = filter_md_type(type, md);
+-
+ 	switch (type) {
+ 	case DM_TYPE_BIO_BASED:
+ 		cachep = _io_cache;
+diff --git a/drivers/md/dm.h b/drivers/md/dm.h
+index 4c193bce7da9..f773834bebb0 100644
+--- a/drivers/md/dm.h
++++ b/drivers/md/dm.h
+@@ -32,14 +32,6 @@
+  */
+ #define DM_STATUS_NOFLUSH_FLAG		(1 << 0)
+ 
+-/*
+- * Type of table and mapped_device's mempool
+- */
+-#define DM_TYPE_NONE			0
+-#define DM_TYPE_BIO_BASED		1
+-#define DM_TYPE_REQUEST_BASED		2
+-#define DM_TYPE_MQ_REQUEST_BASED	3
+-
+ /*
+  * List of devices that a metadevice uses and should open/close.
+  */
+@@ -76,7 +68,7 @@ struct target_type *dm_table_get_immutable_target_type(struct dm_table *t);
+ struct dm_target *dm_table_get_immutable_target(struct dm_table *t);
+ struct dm_target *dm_table_get_wildcard_target(struct dm_table *t);
+ bool dm_table_request_based(struct dm_table *t);
+-bool dm_table_mq_request_based(struct dm_table *t);
++bool dm_table_all_blk_mq_devices(struct dm_table *t);
+ void dm_table_free_md_mempools(struct dm_table *t);
+ struct dm_md_mempools *dm_table_get_md_mempools(struct dm_table *t);
+ 
+diff --git a/include/linux/device-mapper.h b/include/linux/device-mapper.h
+index c35238f22905..e40ebe45c224 100644
+--- a/include/linux/device-mapper.h
++++ b/include/linux/device-mapper.h
+@@ -19,6 +19,14 @@ struct dm_table;
+ struct mapped_device;
+ struct bio_vec;
+ 
++/*
++ * Type of table, mapped_device's mempool and request_queue
++ */
++#define DM_TYPE_NONE			0
++#define DM_TYPE_BIO_BASED		1
++#define DM_TYPE_REQUEST_BASED		2
++#define DM_TYPE_MQ_REQUEST_BASED	3
++
+ typedef enum { STATUSTYPE_INFO, STATUSTYPE_TABLE } status_type_t;
+ 
+ union map_info {
+@@ -445,6 +453,14 @@ int dm_table_add_target(struct dm_table *t, const char *type,
+  */
+ void dm_table_add_target_callbacks(struct dm_table *t, struct dm_target_callbacks *cb);
+ 
++/*
++ * Target can use this to set the table's type.
++ * Can only ever be called from a target's ctr.
++ * Useful for "hybrid" target (supports both bio-based
++ * and request-based).
++ */
++void dm_table_set_type(struct dm_table *t, unsigned type);
++
+ /*
+  * Finally call this to make the table ready for use.
+  */
