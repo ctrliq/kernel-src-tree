@@ -1,0 +1,262 @@
+sfc: handle TX timestamps in the normal data path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Martin Habets <mhabets@solarflare.com>
+commit b9b603d46d5aad1fb66fa007759193e82a50c680
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/b9b603d4.failed
+
+Before this work, TX timestamping is done by sending each SKB to the MC.
+On the 8000 series (Medford1) we have high speed timestamping via the
+ MAC, which means we can use normal TX queues for this without a
+ significant drop in bandwidth.  On the X2000 series (Medford2) support
+ for transmitting via the MC is removed, so the new way must be used.
+
+This patch enables timestamping on a TX queue, if requested.
+It also enhances TX event handling to process the extra completion events,
+ and puts the time in the SKB.
+
+	Signed-off-by: Martin Habets <mhabets@solarflare.com>
+	Signed-off-by: Edward Cree <ecree@solarflare.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b9b603d46d5aad1fb66fa007759193e82a50c680)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/sfc/ef10.c
+diff --cc drivers/net/ethernet/sfc/ef10.c
+index a5be2b57d8ac,774e9cd14302..000000000000
+--- a/drivers/net/ethernet/sfc/ef10.c
++++ b/drivers/net/ethernet/sfc/ef10.c
+@@@ -3572,31 -3577,92 +3577,108 @@@ static int efx_ef10_handle_rx_event(str
+  	return n_packets;
+  }
+  
+++<<<<<<< HEAD
+ +static int
+++=======
++ static u32 efx_ef10_extract_event_ts(efx_qword_t *event)
++ {
++ 	u32 tstamp;
++ 
++ 	tstamp = EFX_QWORD_FIELD(*event, TX_TIMESTAMP_EVENT_TSTAMP_DATA_HI);
++ 	tstamp <<= 16;
++ 	tstamp |= EFX_QWORD_FIELD(*event, TX_TIMESTAMP_EVENT_TSTAMP_DATA_LO);
++ 
++ 	return tstamp;
++ }
++ 
++ static void
+++>>>>>>> b9b603d46d5a (sfc: handle TX timestamps in the normal data path)
+  efx_ef10_handle_tx_event(struct efx_channel *channel, efx_qword_t *event)
+  {
+  	struct efx_nic *efx = channel->efx;
+  	struct efx_tx_queue *tx_queue;
+  	unsigned int tx_ev_desc_ptr;
+  	unsigned int tx_ev_q_label;
+++<<<<<<< HEAD
+ +	int tx_descs = 0;
+++=======
++ 	unsigned int tx_ev_type;
++ 	u64 ts_part;
+++>>>>>>> b9b603d46d5a (sfc: handle TX timestamps in the normal data path)
+  
+ -	if (unlikely(READ_ONCE(efx->reset_pending)))
+ -		return;
+ +	if (unlikely(ACCESS_ONCE(efx->reset_pending)))
+ +		return 0;
+  
+  	if (unlikely(EFX_QWORD_FIELD(*event, ESF_DZ_TX_DROP_EVENT)))
+ -		return;
+ +		return 0;
+  
+- 	/* Transmit completion */
+- 	tx_ev_desc_ptr = EFX_QWORD_FIELD(*event, ESF_DZ_TX_DESCR_INDX);
++ 	/* Get the transmit queue */
+  	tx_ev_q_label = EFX_QWORD_FIELD(*event, ESF_DZ_TX_QLABEL);
+  	tx_queue = efx_channel_get_tx_queue(channel,
+  					    tx_ev_q_label % EFX_TXQ_TYPES);
+++<<<<<<< HEAD
+ +	tx_descs = ((tx_ev_desc_ptr + 1 - tx_queue->read_count) &
+ +		    tx_queue->ptr_mask);
+ +	efx_xmit_done(tx_queue, tx_ev_desc_ptr & tx_queue->ptr_mask);
+ +
+ +	return tx_descs;
+++=======
++ 
++ 	if (!tx_queue->timestamping) {
++ 		/* Transmit completion */
++ 		tx_ev_desc_ptr = EFX_QWORD_FIELD(*event, ESF_DZ_TX_DESCR_INDX);
++ 		efx_xmit_done(tx_queue, tx_ev_desc_ptr & tx_queue->ptr_mask);
++ 		return;
++ 	}
++ 
++ 	/* Transmit timestamps are only available for 8XXX series. They result
++ 	 * in three events per packet. These occur in order, and are:
++ 	 *  - the normal completion event
++ 	 *  - the low part of the timestamp
++ 	 *  - the high part of the timestamp
++ 	 *
++ 	 * Each part of the timestamp is itself split across two 16 bit
++ 	 * fields in the event.
++ 	 */
++ 	tx_ev_type = EFX_QWORD_FIELD(*event, ESF_EZ_TX_SOFT1);
++ 
++ 	switch (tx_ev_type) {
++ 	case TX_TIMESTAMP_EVENT_TX_EV_COMPLETION:
++ 		/* In case of Queue flush or FLR, we might have received
++ 		 * the previous TX completion event but not the Timestamp
++ 		 * events.
++ 		 */
++ 		if (tx_queue->completed_desc_ptr != tx_queue->ptr_mask)
++ 			efx_xmit_done(tx_queue, tx_queue->completed_desc_ptr);
++ 
++ 		tx_ev_desc_ptr = EFX_QWORD_FIELD(*event,
++ 						 ESF_DZ_TX_DESCR_INDX);
++ 		tx_queue->completed_desc_ptr =
++ 					tx_ev_desc_ptr & tx_queue->ptr_mask;
++ 		break;
++ 
++ 	case TX_TIMESTAMP_EVENT_TX_EV_TSTAMP_LO:
++ 		ts_part = efx_ef10_extract_event_ts(event);
++ 		tx_queue->completed_timestamp_minor = ts_part;
++ 		break;
++ 
++ 	case TX_TIMESTAMP_EVENT_TX_EV_TSTAMP_HI:
++ 		ts_part = efx_ef10_extract_event_ts(event);
++ 		tx_queue->completed_timestamp_major = ts_part;
++ 
++ 		efx_xmit_done(tx_queue, tx_queue->completed_desc_ptr);
++ 		tx_queue->completed_desc_ptr = tx_queue->ptr_mask;
++ 		break;
++ 
++ 	default:
++ 		netif_err(efx, hw, efx->net_dev,
++ 			  "channel %d unknown tx event type %d (data "
++ 			  EFX_QWORD_FMT ")\n",
++ 			  channel->channel, tx_ev_type,
++ 			  EFX_QWORD_VAL(*event));
++ 		break;
++ 	}
+++>>>>>>> b9b603d46d5a (sfc: handle TX timestamps in the normal data path)
+  }
+  
+  static void
+* Unmerged path drivers/net/ethernet/sfc/ef10.c
+diff --git a/drivers/net/ethernet/sfc/net_driver.h b/drivers/net/ethernet/sfc/net_driver.h
+index 44753b252b1b..13fd790bc600 100644
+--- a/drivers/net/ethernet/sfc/net_driver.h
++++ b/drivers/net/ethernet/sfc/net_driver.h
+@@ -191,6 +191,7 @@ struct efx_tx_buffer {
+  *	Size of the region is efx_piobuf_size.
+  * @piobuf_offset: Buffer offset to be specified in PIO descriptors
+  * @initialised: Has hardware queue been initialised?
++ * @timestamping: Is timestamping enabled for this channel?
+  * @handle_tso: TSO xmit preparation handler.  Sets up the TSO metadata and
+  *	may also map tx data, depending on the nature of the TSO implementation.
+  * @read_count: Current read pointer.
+@@ -202,6 +203,10 @@ struct efx_tx_buffer {
+  *	avoid cache-line ping-pong between the xmit path and the
+  *	completion path.
+  * @merge_events: Number of TX merged completion events
++ * @completed_desc_ptr: Most recent completed pointer - only used with
++ *      timestamping.
++ * @completed_timestamp_major: Top part of the most recent tx timestamp.
++ * @completed_timestamp_minor: Low part of the most recent tx timestamp.
+  * @insert_count: Current insert pointer
+  *	This is the number of buffers that have been added to the
+  *	software ring.
+@@ -247,6 +252,7 @@ struct efx_tx_queue {
+ 	void __iomem *piobuf;
+ 	unsigned int piobuf_offset;
+ 	bool initialised;
++	bool timestamping;
+ 
+ 	/* Function pointers used in the fast path. */
+ 	int (*handle_tso)(struct efx_tx_queue*, struct sk_buff*, bool *);
+@@ -257,6 +263,9 @@ struct efx_tx_queue {
+ 	unsigned int merge_events;
+ 	unsigned int bytes_compl;
+ 	unsigned int pkts_compl;
++	unsigned int completed_desc_ptr;
++	u32 completed_timestamp_major;
++	u32 completed_timestamp_minor;
+ 
+ 	/* Members used only on the xmit path */
+ 	unsigned int insert_count ____cacheline_aligned_in_smp;
+diff --git a/drivers/net/ethernet/sfc/nic.h b/drivers/net/ethernet/sfc/nic.h
+index a08560c494a6..19a1464fe740 100644
+--- a/drivers/net/ethernet/sfc/nic.h
++++ b/drivers/net/ethernet/sfc/nic.h
+@@ -471,6 +471,7 @@ static inline void efx_rx_skb_attach_timestamp(struct efx_channel *channel,
+ }
+ void efx_ptp_start_datapath(struct efx_nic *efx);
+ void efx_ptp_stop_datapath(struct efx_nic *efx);
++ktime_t efx_ptp_nic_to_kernel_time(struct efx_tx_queue *tx_queue);
+ 
+ extern const struct efx_nic_type falcon_a1_nic_type;
+ extern const struct efx_nic_type falcon_b0_nic_type;
+diff --git a/drivers/net/ethernet/sfc/ptp.c b/drivers/net/ethernet/sfc/ptp.c
+index 717bc8570a8d..bc6c6c3ff0d9 100644
+--- a/drivers/net/ethernet/sfc/ptp.c
++++ b/drivers/net/ethernet/sfc/ptp.c
+@@ -471,6 +471,17 @@ static ktime_t efx_ptp_s27_to_ktime_correction(u32 nic_major, u32 nic_minor,
+ 	return efx_ptp_s27_to_ktime(nic_major, nic_minor);
+ }
+ 
++ktime_t efx_ptp_nic_to_kernel_time(struct efx_tx_queue *tx_queue)
++{
++	struct efx_nic *efx = tx_queue->efx;
++	struct efx_ptp_data *ptp = efx->ptp_data;
++	ktime_t kt;
++
++	kt = ptp->nic_to_kernel_time(tx_queue->completed_timestamp_major,
++				     tx_queue->completed_timestamp_minor, 0);
++	return kt;
++}
++
+ /* Get PTP attributes and set up time conversions */
+ static int efx_ptp_get_attributes(struct efx_nic *efx)
+ {
+diff --git a/drivers/net/ethernet/sfc/tx.c b/drivers/net/ethernet/sfc/tx.c
+index 62b99b03d4e2..df98106154bb 100644
+--- a/drivers/net/ethernet/sfc/tx.c
++++ b/drivers/net/ethernet/sfc/tx.c
+@@ -77,9 +77,23 @@ static void efx_dequeue_buffer(struct efx_tx_queue *tx_queue,
+ 	}
+ 
+ 	if (buffer->flags & EFX_TX_BUF_SKB) {
++		struct sk_buff *skb = (struct sk_buff *)buffer->skb;
++
+ 		EFX_WARN_ON_PARANOID(!pkts_compl || !bytes_compl);
+ 		(*pkts_compl)++;
+-		(*bytes_compl) += buffer->skb->len;
++		(*bytes_compl) += skb->len;
++		if (tx_queue->timestamping &&
++		    (tx_queue->completed_timestamp_major ||
++		     tx_queue->completed_timestamp_minor)) {
++			struct skb_shared_hwtstamps hwtstamp;
++
++			hwtstamp.hwtstamp =
++				efx_ptp_nic_to_kernel_time(tx_queue);
++			skb_tstamp_tx(skb, &hwtstamp);
++
++			tx_queue->completed_timestamp_major = 0;
++			tx_queue->completed_timestamp_minor = 0;
++		}
+ 		dev_consume_skb_any((struct sk_buff *)buffer->skb);
+ 		netif_vdbg(tx_queue->efx, tx_done, tx_queue->efx->net_dev,
+ 			   "TX queue %d transmission id %x complete\n",
+@@ -830,6 +844,10 @@ void efx_init_tx_queue(struct efx_tx_queue *tx_queue)
+ 	tx_queue->old_read_count = 0;
+ 	tx_queue->empty_read_count = 0 | EFX_EMPTY_COUNT_VALID;
+ 	tx_queue->xmit_more_available = false;
++	tx_queue->timestamping = false;
++	tx_queue->completed_desc_ptr = tx_queue->ptr_mask;
++	tx_queue->completed_timestamp_major = 0;
++	tx_queue->completed_timestamp_minor = 0;
+ 
+ 	/* Set up default function pointers. These may get replaced by
+ 	 * efx_nic_init_tx() based off NIC/queue capabilities.
