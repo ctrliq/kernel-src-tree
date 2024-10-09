@@ -3615,12 +3615,8 @@ static int begin_wqe(struct mlx5_ib_qp *qp, void **seg,
 		     struct ib_send_wr *wr, unsigned *idx,
 		     int *size, int nreq)
 {
-	int err = 0;
-
-	if (unlikely(mlx5_wq_overflow(&qp->sq, nreq, qp->ibqp.send_cq))) {
-		err = -ENOMEM;
-		return err;
-	}
+	if (unlikely(mlx5_wq_overflow(&qp->sq, nreq, qp->ibqp.send_cq)))
+		return -ENOMEM;
 
 	*idx = qp->sq.cur_post & (qp->sq.wqe_cnt - 1);
 	*seg = mlx5_get_send_wqe(qp, *idx);
@@ -3636,7 +3632,7 @@ static int begin_wqe(struct mlx5_ib_qp *qp, void **seg,
 	*seg += sizeof(**ctrl);
 	*size = sizeof(**ctrl) / 16;
 
-	return err;
+	return 0;
 }
 
 static void finish_wqe(struct mlx5_ib_qp *qp,
