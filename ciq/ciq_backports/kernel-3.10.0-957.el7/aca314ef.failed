@@ -1,0 +1,408 @@
+mailbox: pcc: Support HW-Reduced Communication Subspace type 2
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mailbox] pcc: Support HW-Reduced Communication Subspace type 2 (Al Stone) [1568211]
+Rebuild_FUZZ: 92.17%
+commit-author hotran <hotran@apm.com>
+commit aca314efb177274b458f7e72c5ff375c80a5c2d0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/aca314ef.failed
+
+ACPI 6.1 has a PCC HW-Reduced Communication Subspace type 2 intended for
+use on HW-Reduce ACPI Platform, which requires read-modify-write sequence
+to acknowledge doorbell interrupt. This patch provides the implementation
+for the Communication Subspace Type 2.
+
+	Signed-off-by: Hoan Tran <hotran@apm.com>
+	Reviewed-by: Prashanth Prakash <pprakash@codeaurora.org>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit aca314efb177274b458f7e72c5ff375c80a5c2d0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mailbox/pcc.c
+diff --cc drivers/mailbox/pcc.c
+index f04f0a14eb47,08c87fadca8c..000000000000
+--- a/drivers/mailbox/pcc.c
++++ b/drivers/mailbox/pcc.c
+@@@ -70,6 -73,13 +72,16 @@@
+  
+  static struct mbox_chan *pcc_mbox_channels;
+  
+++<<<<<<< HEAD
+++=======
++ /* Array of cached virtual address for doorbell registers */
++ static void __iomem **pcc_doorbell_vaddr;
++ /* Array of cached virtual address for doorbell ack registers */
++ static void __iomem **pcc_doorbell_ack_vaddr;
++ /* Array of doorbell interrupts */
++ static int *pcc_doorbell_irq;
++ 
+++>>>>>>> aca314efb177 (mailbox: pcc: Support HW-Reduced Communication Subspace type 2)
+  static struct mbox_controller pcc_mbox_ctrl = {};
+  /**
+   * get_pcc_channel - Given a PCC subspace idx, get
+@@@ -87,78 -97,226 +99,301 @@@ static struct mbox_chan *get_pcc_channe
+  	return &pcc_mbox_channels[id];
+  }
+  
+++<<<<<<< HEAD
+ +/**
+ + * pcc_mbox_request_channel - PCC clients call this function to
+ + *		request a pointer to their PCC subspace, from which they
+ + *		can get the details of communicating with the remote.
+ + * @cl: Pointer to Mailbox client, so we know where to bind the
+ + *		Channel.
+ + * @subspace_id: The PCC Subspace index as parsed in the PCC client
+ + *		ACPI package. This is used to lookup the array of PCC
+ + *		subspaces as parsed by the PCC Mailbox controller.
+ + *
+ + * Return: Pointer to the Mailbox Channel if successful or
+ + *		ERR_PTR.
+ + */
+ +struct mbox_chan *pcc_mbox_request_channel(struct mbox_client *cl,
+ +		int subspace_id)
+ +{
+ +	struct device *dev = pcc_mbox_ctrl.dev;
+ +	struct mbox_chan *chan;
+ +	unsigned long flags;
+ +
+ +	/*
+ +	 * Each PCC Subspace is a Mailbox Channel.
+ +	 * The PCC Clients get their PCC Subspace ID
+ +	 * from their own tables and pass it here.
+ +	 * This returns a pointer to the PCC subspace
+ +	 * for the Client to operate on.
+ +	 */
+ +	chan = get_pcc_channel(subspace_id);
+ +
+ +	if (!chan || chan->cl) {
+ +		dev_err(dev, "Channel not found for idx: %d\n", subspace_id);
+ +		return ERR_PTR(-EBUSY);
+ +	}
+ +
+ +	spin_lock_irqsave(&chan->lock, flags);
+ +	chan->msg_free = 0;
+ +	chan->msg_count = 0;
+ +	chan->active_req = NULL;
+ +	chan->cl = cl;
+ +	init_completion(&chan->tx_complete);
+ +
+ +	if (chan->txdone_method == TXDONE_BY_POLL && cl->knows_txdone)
+ +		chan->txdone_method |= TXDONE_BY_ACK;
+ +
+ +	spin_unlock_irqrestore(&chan->lock, flags);
+ +
+ +	return chan;
+ +}
+ +EXPORT_SYMBOL_GPL(pcc_mbox_request_channel);
+ +
+ +/**
+ + * pcc_mbox_free_channel - Clients call this to free their Channel.
+ + *
+ + * @chan: Pointer to the mailbox channel as returned by
+ + *		pcc_mbox_request_channel()
+ + */
+ +void pcc_mbox_free_channel(struct mbox_chan *chan)
+ +{
+ +	unsigned long flags;
+ +
+ +	if (!chan || !chan->cl)
+ +		return;
+ +
+ +	spin_lock_irqsave(&chan->lock, flags);
+ +	chan->cl = NULL;
+ +	chan->active_req = NULL;
+ +	if (chan->txdone_method == (TXDONE_BY_POLL | TXDONE_BY_ACK))
+ +		chan->txdone_method = TXDONE_BY_POLL;
+ +
+ +	spin_unlock_irqrestore(&chan->lock, flags);
+ +}
+ +EXPORT_SYMBOL_GPL(pcc_mbox_free_channel);
+++=======
++ /*
++  * PCC can be used with perf critical drivers such as CPPC
++  * So it makes sense to locally cache the virtual address and
++  * use it to read/write to PCC registers such as doorbell register
++  *
++  * The below read_register and write_registers are used to read and
++  * write from perf critical registers such as PCC doorbell register
++  */
++ static int read_register(void __iomem *vaddr, u64 *val, unsigned int bit_width)
++ {
++ 	int ret_val = 0;
++ 
++ 	switch (bit_width) {
++ 	case 8:
++ 		*val = readb(vaddr);
++ 		break;
++ 	case 16:
++ 		*val = readw(vaddr);
++ 		break;
++ 	case 32:
++ 		*val = readl(vaddr);
++ 		break;
++ 	case 64:
++ 		*val = readq(vaddr);
++ 		break;
++ 	default:
++ 		pr_debug("Error: Cannot read register of %u bit width",
++ 			bit_width);
++ 		ret_val = -EFAULT;
++ 		break;
++ 	}
++ 	return ret_val;
++ }
++ 
++ static int write_register(void __iomem *vaddr, u64 val, unsigned int bit_width)
++ {
++ 	int ret_val = 0;
++ 
++ 	switch (bit_width) {
++ 	case 8:
++ 		writeb(val, vaddr);
++ 		break;
++ 	case 16:
++ 		writew(val, vaddr);
++ 		break;
++ 	case 32:
++ 		writel(val, vaddr);
++ 		break;
++ 	case 64:
++ 		writeq(val, vaddr);
++ 		break;
++ 	default:
++ 		pr_debug("Error: Cannot write register of %u bit width",
++ 			bit_width);
++ 		ret_val = -EFAULT;
++ 		break;
++ 	}
++ 	return ret_val;
++ }
+++>>>>>>> aca314efb177 (mailbox: pcc: Support HW-Reduced Communication Subspace type 2)
++ 
++ /**
++  * pcc_map_interrupt - Map a PCC subspace GSI to a linux IRQ number
++  * @interrupt: GSI number.
++  * @flags: interrupt flags
++  *
++  * Returns: a valid linux IRQ number on success
++  *		0 or -EINVAL on failure
++  */
++ static int pcc_map_interrupt(u32 interrupt, u32 flags)
++ {
++ 	int trigger, polarity;
++ 
++ 	if (!interrupt)
++ 		return 0;
++ 
++ 	trigger = (flags & ACPI_PCCT_INTERRUPT_MODE) ? ACPI_EDGE_SENSITIVE
++ 			: ACPI_LEVEL_SENSITIVE;
++ 
++ 	polarity = (flags & ACPI_PCCT_INTERRUPT_POLARITY) ? ACPI_ACTIVE_LOW
++ 			: ACPI_ACTIVE_HIGH;
++ 
++ 	return acpi_register_gsi(NULL, interrupt, trigger, polarity);
++ }
++ 
++ /**
++  * pcc_mbox_irq - PCC mailbox interrupt handler
++  */
++ static irqreturn_t pcc_mbox_irq(int irq, void *p)
++ {
++ 	struct acpi_generic_address *doorbell_ack;
++ 	struct acpi_pcct_hw_reduced *pcct_ss;
++ 	struct mbox_chan *chan = p;
++ 	u64 doorbell_ack_preserve;
++ 	u64 doorbell_ack_write;
++ 	u64 doorbell_ack_val;
++ 	int ret;
++ 
++ 	pcct_ss = chan->con_priv;
++ 
++ 	mbox_chan_received_data(chan, NULL);
++ 
++ 	if (pcct_ss->header.type == ACPI_PCCT_TYPE_HW_REDUCED_SUBSPACE_TYPE2) {
++ 		struct acpi_pcct_hw_reduced_type2 *pcct2_ss = chan->con_priv;
++ 		u32 id = chan - pcc_mbox_channels;
++ 
++ 		doorbell_ack = &pcct2_ss->doorbell_ack_register;
++ 		doorbell_ack_preserve = pcct2_ss->ack_preserve_mask;
++ 		doorbell_ack_write = pcct2_ss->ack_write_mask;
++ 
++ 		ret = read_register(pcc_doorbell_ack_vaddr[id],
++ 				    &doorbell_ack_val,
++ 				    doorbell_ack->bit_width);
++ 		if (ret)
++ 			return IRQ_NONE;
++ 
++ 		ret = write_register(pcc_doorbell_ack_vaddr[id],
++ 				     (doorbell_ack_val & doorbell_ack_preserve)
++ 					| doorbell_ack_write,
++ 				     doorbell_ack->bit_width);
++ 		if (ret)
++ 			return IRQ_NONE;
++ 	}
++ 
++ 	return IRQ_HANDLED;
++ }
++ 
++ /**
++  * pcc_mbox_request_channel - PCC clients call this function to
++  *		request a pointer to their PCC subspace, from which they
++  *		can get the details of communicating with the remote.
++  * @cl: Pointer to Mailbox client, so we know where to bind the
++  *		Channel.
++  * @subspace_id: The PCC Subspace index as parsed in the PCC client
++  *		ACPI package. This is used to lookup the array of PCC
++  *		subspaces as parsed by the PCC Mailbox controller.
++  *
++  * Return: Pointer to the Mailbox Channel if successful or
++  *		ERR_PTR.
++  */
++ struct mbox_chan *pcc_mbox_request_channel(struct mbox_client *cl,
++ 		int subspace_id)
++ {
++ 	struct device *dev = pcc_mbox_ctrl.dev;
++ 	struct mbox_chan *chan;
++ 	unsigned long flags;
++ 
++ 	/*
++ 	 * Each PCC Subspace is a Mailbox Channel.
++ 	 * The PCC Clients get their PCC Subspace ID
++ 	 * from their own tables and pass it here.
++ 	 * This returns a pointer to the PCC subspace
++ 	 * for the Client to operate on.
++ 	 */
++ 	chan = get_pcc_channel(subspace_id);
++ 
++ 	if (IS_ERR(chan) || chan->cl) {
++ 		dev_err(dev, "Channel not found for idx: %d\n", subspace_id);
++ 		return ERR_PTR(-EBUSY);
++ 	}
++ 
++ 	spin_lock_irqsave(&chan->lock, flags);
++ 	chan->msg_free = 0;
++ 	chan->msg_count = 0;
++ 	chan->active_req = NULL;
++ 	chan->cl = cl;
++ 	init_completion(&chan->tx_complete);
++ 
++ 	if (chan->txdone_method == TXDONE_BY_POLL && cl->knows_txdone)
++ 		chan->txdone_method |= TXDONE_BY_ACK;
++ 
++ 	if (pcc_doorbell_irq[subspace_id] > 0) {
++ 		int rc;
++ 
++ 		rc = devm_request_irq(dev, pcc_doorbell_irq[subspace_id],
++ 				      pcc_mbox_irq, 0, MBOX_IRQ_NAME, chan);
++ 		if (unlikely(rc)) {
++ 			dev_err(dev, "failed to register PCC interrupt %d\n",
++ 				pcc_doorbell_irq[subspace_id]);
++ 			chan = ERR_PTR(rc);
++ 		}
++ 	}
++ 
++ 	spin_unlock_irqrestore(&chan->lock, flags);
++ 
++ 	return chan;
++ }
++ EXPORT_SYMBOL_GPL(pcc_mbox_request_channel);
++ 
++ /**
++  * pcc_mbox_free_channel - Clients call this to free their Channel.
++  *
++  * @chan: Pointer to the mailbox channel as returned by
++  *		pcc_mbox_request_channel()
++  */
++ void pcc_mbox_free_channel(struct mbox_chan *chan)
++ {
++ 	u32 id = chan - pcc_mbox_channels;
++ 	unsigned long flags;
++ 
++ 	if (!chan || !chan->cl)
++ 		return;
++ 
++ 	if (id >= pcc_mbox_ctrl.num_chans) {
++ 		pr_debug("pcc_mbox_free_channel: Invalid mbox_chan passed\n");
++ 		return;
++ 	}
++ 
++ 	spin_lock_irqsave(&chan->lock, flags);
++ 	chan->cl = NULL;
++ 	chan->active_req = NULL;
++ 	if (chan->txdone_method == (TXDONE_BY_POLL | TXDONE_BY_ACK))
++ 		chan->txdone_method = TXDONE_BY_POLL;
++ 
++ 	if (pcc_doorbell_irq[id] > 0)
++ 		devm_free_irq(chan->mbox->dev, pcc_doorbell_irq[id], chan);
++ 
++ 	spin_unlock_irqrestore(&chan->lock, flags);
++ }
++ EXPORT_SYMBOL_GPL(pcc_mbox_free_channel);
++ 
+  
+  /**
+   * pcc_send_data - Called from Mailbox Controller code. Used
+@@@ -263,12 -488,50 +545,58 @@@ static int __init acpi_pcc_probe(void
+  		return -ENOMEM;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	pcc_doorbell_vaddr = kcalloc(sum, sizeof(void *), GFP_KERNEL);
++ 	if (!pcc_doorbell_vaddr) {
++ 		rc = -ENOMEM;
++ 		goto err_free_mbox;
++ 	}
++ 
++ 	pcc_doorbell_ack_vaddr = kcalloc(sum, sizeof(void *), GFP_KERNEL);
++ 	if (!pcc_doorbell_ack_vaddr) {
++ 		rc = -ENOMEM;
++ 		goto err_free_db_vaddr;
++ 	}
++ 
++ 	pcc_doorbell_irq = kcalloc(sum, sizeof(int), GFP_KERNEL);
++ 	if (!pcc_doorbell_irq) {
++ 		rc = -ENOMEM;
++ 		goto err_free_db_ack_vaddr;
++ 	}
++ 
+++>>>>>>> aca314efb177 (mailbox: pcc: Support HW-Reduced Communication Subspace type 2)
+  	/* Point to the first PCC subspace entry */
+  	pcct_entry = (struct acpi_subtable_header *) (
+  		(unsigned long) pcct_tbl + sizeof(struct acpi_table_pcct));
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < count; i++) {
+ +		pcc_mbox_channels[i].con_priv = pcct_entry;
+++=======
++ 	acpi_pcct_tbl = (struct acpi_table_pcct *) pcct_tbl;
++ 	if (acpi_pcct_tbl->flags & ACPI_PCCT_DOORBELL)
++ 		pcc_mbox_ctrl.txdone_irq = true;
++ 
++ 	for (i = 0; i < sum; i++) {
++ 		struct acpi_generic_address *db_reg;
++ 		struct acpi_pcct_hw_reduced *pcct_ss;
++ 		pcc_mbox_channels[i].con_priv = pcct_entry;
++ 
++ 		pcct_ss = (struct acpi_pcct_hw_reduced *) pcct_entry;
++ 
++ 		if (pcc_mbox_ctrl.txdone_irq) {
++ 			rc = pcc_parse_subspace_irq(i, pcct_ss);
++ 			if (rc < 0)
++ 				goto err;
++ 		}
++ 
++ 		/* If doorbell is in system memory cache the virt address */
++ 		db_reg = &pcct_ss->doorbell_register;
++ 		if (db_reg->space_id == ACPI_ADR_SPACE_SYSTEM_MEMORY)
++ 			pcc_doorbell_vaddr[i] = acpi_os_ioremap(db_reg->address,
++ 							db_reg->bit_width/8);
+++>>>>>>> aca314efb177 (mailbox: pcc: Support HW-Reduced Communication Subspace type 2)
+  		pcct_entry = (struct acpi_subtable_header *)
+  			((unsigned long) pcct_entry + pcct_entry->length);
+  	}
+* Unmerged path drivers/mailbox/pcc.c
