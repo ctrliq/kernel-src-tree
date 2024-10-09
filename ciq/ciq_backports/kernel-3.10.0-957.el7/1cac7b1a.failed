@@ -1,0 +1,350 @@
+perf/core: Fix event schedule order
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 1cac7b1ae3579457200213303fc28ca13b75592f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/1cac7b1a.failed
+
+Scheduling in events with cpu=-1 before events with cpu=# changes
+semantics and is undesirable in that it would priorize these events.
+
+Given that groups->index is across all groups we actually have an
+inter-group ordering, meaning we can merge-sort two groups, which is
+just what we need to preserve semantics.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Acked-by: Mark Rutland <mark.rutland@arm.com>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Alexey Budankov <alexey.budankov@linux.intel.com>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: David Carrillo-Cisneros <davidcc@google.com>
+	Cc: Dmitri Prokhorov <Dmitry.Prohorov@intel.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Kan Liang <kan.liang@intel.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Valery Cherepennikov <valery.cherepennikov@intel.com>
+	Cc: Vince Weaver <vincent.weaver@maine.edu>
+	Cc: linux-kernel@vger.kernel.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 1cac7b1ae3579457200213303fc28ca13b75592f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/events/core.c
+diff --cc kernel/events/core.c
+index e490cd411934,2d8c0208ca4a..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -1440,6 -1483,180 +1440,183 @@@ ctx_group_list(struct perf_event *event
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Helper function to initializes perf_event_group trees.
++  */
++ static void perf_event_groups_init(struct perf_event_groups *groups)
++ {
++ 	groups->tree = RB_ROOT;
++ 	groups->index = 0;
++ }
++ 
++ /*
++  * Compare function for event groups;
++  *
++  * Implements complex key that first sorts by CPU and then by virtual index
++  * which provides ordering when rotating groups for the same CPU.
++  */
++ static bool
++ perf_event_groups_less(struct perf_event *left, struct perf_event *right)
++ {
++ 	if (left->cpu < right->cpu)
++ 		return true;
++ 	if (left->cpu > right->cpu)
++ 		return false;
++ 
++ 	if (left->group_index < right->group_index)
++ 		return true;
++ 	if (left->group_index > right->group_index)
++ 		return false;
++ 
++ 	return false;
++ }
++ 
++ /*
++  * Insert @event into @groups' tree; using {@event->cpu, ++@groups->index} for
++  * key (see perf_event_groups_less). This places it last inside the CPU
++  * subtree.
++  */
++ static void
++ perf_event_groups_insert(struct perf_event_groups *groups,
++ 			 struct perf_event *event)
++ {
++ 	struct perf_event *node_event;
++ 	struct rb_node *parent;
++ 	struct rb_node **node;
++ 
++ 	event->group_index = ++groups->index;
++ 
++ 	node = &groups->tree.rb_node;
++ 	parent = *node;
++ 
++ 	while (*node) {
++ 		parent = *node;
++ 		node_event = container_of(*node, struct perf_event, group_node);
++ 
++ 		if (perf_event_groups_less(event, node_event))
++ 			node = &parent->rb_left;
++ 		else
++ 			node = &parent->rb_right;
++ 	}
++ 
++ 	rb_link_node(&event->group_node, parent, node);
++ 	rb_insert_color(&event->group_node, &groups->tree);
++ }
++ 
++ /*
++  * Helper function to insert event into the pinned or flexible groups.
++  */
++ static void
++ add_event_to_groups(struct perf_event *event, struct perf_event_context *ctx)
++ {
++ 	struct perf_event_groups *groups;
++ 
++ 	groups = get_event_groups(event, ctx);
++ 	perf_event_groups_insert(groups, event);
++ }
++ 
++ /*
++  * Delete a group from a tree.
++  */
++ static void
++ perf_event_groups_delete(struct perf_event_groups *groups,
++ 			 struct perf_event *event)
++ {
++ 	WARN_ON_ONCE(RB_EMPTY_NODE(&event->group_node) ||
++ 		     RB_EMPTY_ROOT(&groups->tree));
++ 
++ 	rb_erase(&event->group_node, &groups->tree);
++ 	init_event_group(event);
++ }
++ 
++ /*
++  * Helper function to delete event from its groups.
++  */
++ static void
++ del_event_from_groups(struct perf_event *event, struct perf_event_context *ctx)
++ {
++ 	struct perf_event_groups *groups;
++ 
++ 	groups = get_event_groups(event, ctx);
++ 	perf_event_groups_delete(groups, event);
++ }
++ 
++ /*
++  * Get the leftmost event in the @cpu subtree.
++  */
++ static struct perf_event *
++ perf_event_groups_first(struct perf_event_groups *groups, int cpu)
++ {
++ 	struct perf_event *node_event = NULL, *match = NULL;
++ 	struct rb_node *node = groups->tree.rb_node;
++ 
++ 	while (node) {
++ 		node_event = container_of(node, struct perf_event, group_node);
++ 
++ 		if (cpu < node_event->cpu) {
++ 			node = node->rb_left;
++ 		} else if (cpu > node_event->cpu) {
++ 			node = node->rb_right;
++ 		} else {
++ 			match = node_event;
++ 			node = node->rb_left;
++ 		}
++ 	}
++ 
++ 	return match;
++ }
++ 
++ /*
++  * Like rb_entry_next_safe() for the @cpu subtree.
++  */
++ static struct perf_event *
++ perf_event_groups_next(struct perf_event *event)
++ {
++ 	struct perf_event *next;
++ 
++ 	next = rb_entry_safe(rb_next(&event->group_node), typeof(*event), group_node);
++ 	if (next && next->cpu == event->cpu)
++ 		return next;
++ 
++ 	return NULL;
++ }
++ 
++ /*
++  * Rotate the @cpu subtree.
++  *
++  * Re-insert the leftmost event at the tail of the subtree.
++  */
++ static void
++ perf_event_groups_rotate(struct perf_event_groups *groups, int cpu)
++ {
++ 	struct perf_event *event = perf_event_groups_first(groups, cpu);
++ 
++ 	if (event) {
++ 		perf_event_groups_delete(groups, event);
++ 		perf_event_groups_insert(groups, event);
++ 	}
++ }
++ 
++ /*
++  * Iterate through the whole groups tree.
++  */
++ #define perf_event_groups_for_each(event, groups, node)		\
++ 	for (event = rb_entry_safe(rb_first(&((groups)->tree)),	\
++ 				typeof(*event), node); event;	\
++ 		event = rb_entry_safe(rb_next(&event->node),	\
++ 				typeof(*event), node))
++ /*
++  * Iterate event groups with cpu == key.
++  */
++ #define perf_event_groups_for_each_cpu(event, key, groups, node) \
++ 	for (event = perf_event_groups_first(groups, key);	 \
++ 		event && event->cpu == key;			 \
++ 		event = rb_entry_safe(rb_next(&event->node),	 \
++ 				typeof(*event), node))
++ 
++ /*
+++>>>>>>> 1cac7b1ae357 (perf/core: Fix event schedule order)
+   * Add a event from the lists for its context.
+   * Must be called with ctx->mutex and ctx->lock held.
+   */
+@@@ -2173,33 -2369,6 +2350,36 @@@ static int group_can_go_on(struct perf_
+  	return can_add_hw;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Complement to update_event_times(). This computes the tstamp_* values to
+ + * continue 'enabled' state from @now, and effectively discards the time
+ + * between the prior tstamp_stopped and now (as we were in the OFF state, or
+ + * just switched (context) time base).
+ + *
+ + * This further assumes '@event->state == INACTIVE' (we just came from OFF) and
+ + * cannot have been scheduled in yet. And going into INACTIVE state means
+ + * '@event->tstamp_stopped = @now'.
+ + *
+ + * Thus given the rules of update_event_times():
+ + *
+ + *   total_time_enabled = tstamp_stopped - tstamp_enabled
+ + *   total_time_running = tstamp_stopped - tstamp_running
+ + *
+ + * We can insert 'tstamp_stopped == now' and reverse them to compute new
+ + * tstamp_* values.
+ + */
+ +static void __perf_event_enable_time(struct perf_event *event, u64 now)
+ +{
+ +	WARN_ON_ONCE(event->state != PERF_EVENT_STATE_INACTIVE);
+ +
+ +	event->tstamp_stopped = now;
+ +	event->tstamp_enabled = now - event->total_time_enabled;
+ +	event->tstamp_running = now - event->total_time_running;
+ +}
+ +
+++=======
+++>>>>>>> 1cac7b1ae357 (perf/core: Fix event schedule order)
+  static void add_event_to_ctx(struct perf_event *event,
+  			       struct perf_event_context *ctx)
+  {
+@@@ -3047,59 -3266,30 +3305,83 @@@ static voi
+  ctx_pinned_sched_in(struct perf_event_context *ctx,
+  		    struct perf_cpu_context *cpuctx)
+  {
+++<<<<<<< HEAD
+ +	struct perf_event *event;
+ +
+ +	list_for_each_entry(event, &ctx->pinned_groups, group_entry) {
+ +		if (event->state <= PERF_EVENT_STATE_OFF)
+ +			continue;
+ +		if (!event_filter_match(event))
+ +			continue;
+ +
+ +		/* may need to reset tstamp_enabled */
+ +		if (is_cgroup_event(event))
+ +			perf_cgroup_mark_enabled(event, ctx);
+ +
+ +		if (group_can_go_on(event, cpuctx, 1))
+ +			group_sched_in(event, cpuctx, ctx);
+ +
+ +		/*
+ +		 * If this pinned group hasn't been scheduled,
+ +		 * put it in error state.
+ +		 */
+ +		if (event->state == PERF_EVENT_STATE_INACTIVE) {
+ +			update_group_times(event);
+ +			event->state = PERF_EVENT_STATE_ERROR;
+ +		}
+ +	}
+++=======
++ 	struct sched_in_data sid = {
++ 		.ctx = ctx,
++ 		.cpuctx = cpuctx,
++ 		.can_add_hw = 1,
++ 	};
++ 
++ 	visit_groups_merge(&ctx->pinned_groups,
++ 			   smp_processor_id(),
++ 			   pinned_sched_in, &sid);
+++>>>>>>> 1cac7b1ae357 (perf/core: Fix event schedule order)
+  }
+  
+  static void
+  ctx_flexible_sched_in(struct perf_event_context *ctx,
+  		      struct perf_cpu_context *cpuctx)
+  {
+ -	struct sched_in_data sid = {
+ -		.ctx = ctx,
+++<<<<<<< HEAD
+ +	struct perf_event *event;
+ +	int can_add_hw = 1;
+ +
+ +	list_for_each_entry(event, &ctx->flexible_groups, group_entry) {
+ +		/* Ignore events in OFF or ERROR state */
+ +		if (event->state <= PERF_EVENT_STATE_OFF)
+ +			continue;
+ +		/*
+ +		 * Listen to the 'cpu' scheduling filter constraint
+ +		 * of events:
+ +		 */
+ +		if (!event_filter_match(event))
+ +			continue;
+ +
+ +		/* may need to reset tstamp_enabled */
+ +		if (is_cgroup_event(event))
+ +			perf_cgroup_mark_enabled(event, ctx);
+ +
+ +		if (group_can_go_on(event, cpuctx, can_add_hw)) {
+ +			if (group_sched_in(event, cpuctx, ctx))
+ +				can_add_hw = 0;
+ +		}
+ +	}
+++=======
+++	struct sched_in_data sid = {
+++		.ctx = ctx,
++ 		.cpuctx = cpuctx,
++ 		.can_add_hw = 1,
++ 	};
++ 
++ 	visit_groups_merge(&ctx->flexible_groups,
++ 			   smp_processor_id(),
++ 			   flexible_sched_in, &sid);
+++>>>>>>> 1cac7b1ae357 (perf/core: Fix event schedule order)
+  }
+  
+  static void
+* Unmerged path kernel/events/core.c
