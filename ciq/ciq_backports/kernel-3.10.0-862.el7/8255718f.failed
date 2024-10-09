@@ -1,0 +1,141 @@
+perf pmu: Expand PMU events by prefix match
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Andi Kleen <ak@linux.intel.com>
+commit 8255718f4bedbfb3558fba10ff40a70934f2117d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/8255718f.failed
+
+When the user specifies a pmu directly, expand it automatically with a
+prefix match for all available PMUs, similar as we do for the normal
+aliases now.
+
+This allows to specify attributes for duplicated boxes quickly.  For
+example uncore_cbox_{0,6}/.../ can be now specified as uncore_cbox/.../
+and it gets automatically expanded for all boxes.
+
+This generally makes it more concise to write uncore specifications, and
+also avoids the need to know the exact topology of the system.
+
+Before:
+
+  % perf stat -a -e uncore_cbox_0/event=0x35,umask=0x1,filter_opc=0x19C/,\
+  uncore_cbox_1/event=0x35,umask=0x1,filter_opc=0x19C/,\
+  uncore_cbox_2/event=0x35,umask=0x1,filter_opc=0x19C/,\
+  uncore_cbox_3/event=0x35,umask=0x1,filter_opc=0x19C/,\
+  uncore_cbox_4/event=0x35,umask=0x1,filter_opc=0x19C/,\
+  uncore_cbox_5/event=0x35,umask=0x1,filter_opc=0x19C/ sleep 1
+
+After:
+
+  % perf stat -a -e uncore_cbox/event=0x35,umask=0x1,filter_opc=0x19C/ sleep 1
+
+v2: Handle all bison rules. Move multi add code to separate function.
+    Handle uncore_ prefix correctly.
+v3: Move parse_events_multi_pmu_add to separate patch. Move uncore
+    prefix check to separate patch.
+
+	Signed-off-by: Andi Kleen <ak@linux.intel.com>
+	Acked-by: Jiri Olsa <jolsa@kernel.org>
+Link: http://lkml.kernel.org/r/20170320201711.14142-6-andi@firstfloor.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 8255718f4bedbfb3558fba10ff40a70934f2117d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/parse-events.h
+#	tools/perf/util/parse-events.y
+diff --cc tools/perf/util/parse-events.h
+index ec78024114e4,f38086b8dbea..000000000000
+--- a/tools/perf/util/parse-events.h
++++ b/tools/perf/util/parse-events.h
+@@@ -142,6 -167,14 +142,17 @@@ int parse_events_add_breakpoint(struct 
+  int parse_events_add_pmu(struct parse_events_evlist *data,
+  			 struct list_head *list, char *name,
+  			 struct list_head *head_config);
+++<<<<<<< HEAD
+++=======
++ 
++ int parse_events_multi_pmu_add(struct parse_events_evlist *data,
++ 			       char *str,
++ 			       struct list_head **listp);
++ 
++ int parse_events_copy_term_list(struct list_head *old,
++ 				 struct list_head **new);
++ 
+++>>>>>>> 8255718f4bed (perf pmu: Expand PMU events by prefix match)
+  enum perf_pmu_event_symbol_type
+  perf_pmu__parse_check(const char *name);
+  void parse_events__set_leader(char *name, struct list_head *list);
+diff --cc tools/perf/util/parse-events.y
+index 3bcbf7cd7a4a,20935b17753d..000000000000
+--- a/tools/perf/util/parse-events.y
++++ b/tools/perf/util/parse-events.y
+@@@ -263,21 -266,12 +284,24 @@@ PE_KERNEL_PMU_EVENT sep_d
+  |
+  PE_PMU_EVENT_PRE '-' PE_PMU_EVENT_SUF sep_dc
+  {
+- 	struct parse_events_evlist *data = _data;
+- 	struct list_head *head;
+- 	struct parse_events_term *term;
+  	struct list_head *list;
+  	char pmu_name[128];
++ 
+  	snprintf(&pmu_name, 128, "%s-%s", $1, $3);
+++<<<<<<< HEAD
+ +
+ +	ALLOC_LIST(head);
+ +	ABORT_ON(parse_events_term__num(&term, PARSE_EVENTS__TERM_TYPE_USER,
+ +					&pmu_name, 1, &@1, NULL));
+ +	list_add_tail(&term->list, head);
+ +
+ +	ALLOC_LIST(list);
+ +	ABORT_ON(parse_events_add_pmu(data, list, "cpu", head));
+ +	parse_events_terms__delete(head);
+++=======
++ 	if (parse_events_multi_pmu_add(_data, pmu_name, &list) < 0)
++ 		YYABORT;
+++>>>>>>> 8255718f4bed (perf pmu: Expand PMU events by prefix match)
+  	$$ = list;
+  }
+  
+diff --git a/tools/perf/util/parse-events.c b/tools/perf/util/parse-events.c
+index 3c6f7bbf0303..93946a56ebfb 100644
+--- a/tools/perf/util/parse-events.c
++++ b/tools/perf/util/parse-events.c
+@@ -2179,6 +2179,31 @@ int parse_events_term__clone(struct parse_events_term **new,
+ 	return new_term(new, &temp, term->val.str, term->val.num);
+ }
+ 
++int parse_events_copy_term_list(struct list_head *old,
++				 struct list_head **new)
++{
++	struct parse_events_term *term, *n;
++	int ret;
++
++	if (!old) {
++		*new = NULL;
++		return 0;
++	}
++
++	*new = malloc(sizeof(struct list_head));
++	if (!*new)
++		return -ENOMEM;
++	INIT_LIST_HEAD(*new);
++
++	list_for_each_entry (term, old, list) {
++		ret = parse_events_term__clone(&n, term);
++		if (ret)
++			return ret;
++		list_add_tail(&n->list, *new);
++	}
++	return 0;
++}
++
+ void parse_events_terms__purge(struct list_head *terms)
+ {
+ 	struct parse_events_term *term, *h;
+* Unmerged path tools/perf/util/parse-events.h
+* Unmerged path tools/perf/util/parse-events.y
