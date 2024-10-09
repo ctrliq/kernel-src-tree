@@ -1,0 +1,355 @@
+net: sched: introduce support for multiple filter chain pointers registration
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [net] sched: introduce support for multiple filter chain pointers registration (Ivan Vecera) [1584592]
+Rebuild_FUZZ: 96.64%
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit a9b19443edbaac97c5c094f3cc903c1f1548b3f5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/a9b19443.failed
+
+So far, there was possible only to register a single filter chain
+pointer to block->chain[0]. However, when the blocks will get shareable,
+we need to allow multiple filter chain pointers registration.
+
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Acked-by: David Ahern <dsahern@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a9b19443edbaac97c5c094f3cc903c1f1548b3f5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sch_generic.h
+#	net/sched/cls_api.c
+diff --cc include/net/sch_generic.h
+index 7a74a222e0f8,17d8cfd0efda..000000000000
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@@ -275,9 -271,11 +275,13 @@@ struct qdisc_skb_cb 
+  	unsigned char		data[QDISC_CB_PRIV_LEN];
+  };
+  
+ -typedef void tcf_chain_head_change_t(struct tcf_proto *tp_head, void *priv);
+ -
+  struct tcf_chain {
+  	struct tcf_proto __rcu *filter_chain;
+++<<<<<<< HEAD
+ +	struct tcf_proto __rcu **p_filter_chain;
+++=======
++ 	struct list_head filter_chain_list;
+++>>>>>>> a9b19443edba (net: sched: introduce support for multiple filter chain pointers registration)
+  	struct list_head list;
+  	struct tcf_block *block;
+  	u32 index; /* chain index */
+diff --cc net/sched/cls_api.c
+index 0e9c21220742,e6b16b300844..000000000000
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@@ -195,6 -201,21 +202,24 @@@ static struct tcf_chain *tcf_chain_crea
+  	return chain;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void tcf_chain_head_change_item(struct tcf_filter_chain_list_item *item,
++ 				       struct tcf_proto *tp_head)
++ {
++ 	if (item->chain_head_change)
++ 		item->chain_head_change(tp_head, item->chain_head_change_priv);
++ }
++ static void tcf_chain_head_change(struct tcf_chain *chain,
++ 				  struct tcf_proto *tp_head)
++ {
++ 	struct tcf_filter_chain_list_item *item;
++ 
++ 	list_for_each_entry(item, &chain->filter_chain_list, list)
++ 		tcf_chain_head_change_item(item, tp_head);
++ }
++ 
+++>>>>>>> a9b19443edba (net: sched: introduce support for multiple filter chain pointers registration)
+  static void tcf_chain_flush(struct tcf_chain *chain)
+  {
+  	struct tcf_proto *tp = rtnl_dereference(chain->filter_chain);
+@@@ -247,15 -267,80 +272,77 @@@ void tcf_chain_put(struct tcf_chain *ch
+  }
+  EXPORT_SYMBOL(tcf_chain_put);
+  
+ -static void tcf_block_offload_cmd(struct tcf_block *block, struct Qdisc *q,
+ -				  struct tcf_block_ext_info *ei,
+ -				  enum tc_block_command command)
+ +static void
+ +tcf_chain_filter_chain_ptr_set(struct tcf_chain *chain,
+ +			       struct tcf_proto __rcu **p_filter_chain)
+  {
+ -	struct net_device *dev = q->dev_queue->dev;
+ -	struct tc_block_offload bo = {};
+ -
+ -	if (!dev->netdev_ops->ndo_setup_tc)
+ -		return;
+ -	bo.command = command;
+ -	bo.binder_type = ei->binder_type;
+ -	bo.block = block;
+ -	dev->netdev_ops->ndo_setup_tc(dev, TC_SETUP_BLOCK, &bo);
+ +	chain->p_filter_chain = p_filter_chain;
+  }
+  
+++<<<<<<< HEAD
+ +int tcf_block_get(struct tcf_block **p_block,
+ +		  struct tcf_proto __rcu **p_filter_chain)
+++=======
++ static void tcf_block_offload_bind(struct tcf_block *block, struct Qdisc *q,
++ 				   struct tcf_block_ext_info *ei)
++ {
++ 	tcf_block_offload_cmd(block, q, ei, TC_BLOCK_BIND);
++ }
++ 
++ static void tcf_block_offload_unbind(struct tcf_block *block, struct Qdisc *q,
++ 				     struct tcf_block_ext_info *ei)
++ {
++ 	tcf_block_offload_cmd(block, q, ei, TC_BLOCK_UNBIND);
++ }
++ 
++ static int
++ tcf_chain_head_change_cb_add(struct tcf_chain *chain,
++ 			     struct tcf_block_ext_info *ei,
++ 			     struct netlink_ext_ack *extack)
++ {
++ 	struct tcf_filter_chain_list_item *item;
++ 
++ 	item = kmalloc(sizeof(*item), GFP_KERNEL);
++ 	if (!item) {
++ 		NL_SET_ERR_MSG(extack, "Memory allocation for head change callback item failed");
++ 		return -ENOMEM;
++ 	}
++ 	item->chain_head_change = ei->chain_head_change;
++ 	item->chain_head_change_priv = ei->chain_head_change_priv;
++ 	if (chain->filter_chain)
++ 		tcf_chain_head_change_item(item, chain->filter_chain);
++ 	list_add(&item->list, &chain->filter_chain_list);
++ 	return 0;
++ }
++ 
++ static void
++ tcf_chain_head_change_cb_del(struct tcf_chain *chain,
++ 			     struct tcf_block_ext_info *ei)
++ {
++ 	struct tcf_filter_chain_list_item *item;
++ 
++ 	list_for_each_entry(item, &chain->filter_chain_list, list) {
++ 		if ((!ei->chain_head_change && !ei->chain_head_change_priv) ||
++ 		    (item->chain_head_change == ei->chain_head_change &&
++ 		     item->chain_head_change_priv == ei->chain_head_change_priv)) {
++ 			tcf_chain_head_change_item(item, NULL);
++ 			list_del(&item->list);
++ 			kfree(item);
++ 			return;
++ 		}
++ 	}
++ 	WARN_ON(1);
++ }
++ 
++ static struct tcf_chain *tcf_block_chain_zero(struct tcf_block *block)
++ {
++ 	return list_first_entry(&block->chain_list, struct tcf_chain, list);
++ }
++ 
++ int tcf_block_get_ext(struct tcf_block **p_block, struct Qdisc *q,
++ 		      struct tcf_block_ext_info *ei,
++ 		      struct netlink_ext_ack *extack)
+++>>>>>>> a9b19443edba (net: sched: introduce support for multiple filter chain pointers registration)
+  {
+  	struct tcf_block *block = kzalloc(sizeof(*block), GFP_KERNEL);
+  	struct tcf_chain *chain;
+@@@ -270,14 -359,44 +357,26 @@@
+  		err = -ENOMEM;
+  		goto err_chain_create;
+  	}
+++<<<<<<< HEAD
+ +	tcf_chain_filter_chain_ptr_set(chain, p_filter_chain);
+++=======
++ 	err = tcf_chain_head_change_cb_add(tcf_block_chain_zero(block),
++ 					   ei, extack);
++ 	if (err)
++ 		goto err_chain_head_change_cb_add;
++ 	block->net = qdisc_net(q);
++ 	block->q = q;
++ 	tcf_block_offload_bind(block, q, ei);
+++>>>>>>> a9b19443edba (net: sched: introduce support for multiple filter chain pointers registration)
+  	*p_block = block;
+  	return 0;
+  
+  err_chain_create:
+  	kfree(block);
++ err_chain_head_change_cb_add:
++ 	kfree(chain);
+  	return err;
+  }
+ -EXPORT_SYMBOL(tcf_block_get_ext);
+ -
+ -static void tcf_chain_head_change_dflt(struct tcf_proto *tp_head, void *priv)
+ -{
+ -	struct tcf_proto __rcu **p_filter_chain = priv;
+ -
+ -	rcu_assign_pointer(*p_filter_chain, tp_head);
+ -}
+ -
+ -int tcf_block_get(struct tcf_block **p_block,
+ -		  struct tcf_proto __rcu **p_filter_chain, struct Qdisc *q,
+ -		  struct netlink_ext_ack *extack)
+ -{
+ -	struct tcf_block_ext_info ei = {
+ -		.chain_head_change = tcf_chain_head_change_dflt,
+ -		.chain_head_change_priv = p_filter_chain,
+ -	};
+ -
+ -	WARN_ON(!p_filter_chain);
+ -	return tcf_block_get_ext(p_block, q, &ei, extack);
+ -}
+  EXPORT_SYMBOL(tcf_block_get);
+  
+  /* XXX: Standalone actions are not allowed to jump to any chain, and bound
+@@@ -293,6 -410,9 +392,12 @@@ void tcf_block_put(struct tcf_block *bl
+  	/* Hold a refcnt for all chains, so that they don't disappear
+  	 * while we are iterating.
+  	 */
+++<<<<<<< HEAD
+++=======
++ 	if (!block)
++ 		return;
++ 	tcf_chain_head_change_cb_del(tcf_block_chain_zero(block), ei);
+++>>>>>>> a9b19443edba (net: sched: introduce support for multiple filter chain pointers registration)
+  	list_for_each_entry(chain, &block->chain_list, list)
+  		tcf_chain_hold(chain);
+  
+@@@ -304,11 -426,124 +409,10 @@@
+  		tcf_chain_put(chain);
+  
+  	/* Finally, put chain 0 and allow block to be freed. */
+- 	chain = list_first_entry(&block->chain_list, struct tcf_chain, list);
+- 	tcf_chain_put(chain);
++ 	tcf_chain_put(tcf_block_chain_zero(block));
+  }
+ -EXPORT_SYMBOL(tcf_block_put_ext);
+ -
+ -void tcf_block_put(struct tcf_block *block)
+ -{
+ -	struct tcf_block_ext_info ei = {0, };
+ -
+ -	if (!block)
+ -		return;
+ -	tcf_block_put_ext(block, block->q, &ei);
+ -}
+ -
+  EXPORT_SYMBOL(tcf_block_put);
+  
+ -struct tcf_block_cb {
+ -	struct list_head list;
+ -	tc_setup_cb_t *cb;
+ -	void *cb_ident;
+ -	void *cb_priv;
+ -	unsigned int refcnt;
+ -};
+ -
+ -void *tcf_block_cb_priv(struct tcf_block_cb *block_cb)
+ -{
+ -	return block_cb->cb_priv;
+ -}
+ -EXPORT_SYMBOL(tcf_block_cb_priv);
+ -
+ -struct tcf_block_cb *tcf_block_cb_lookup(struct tcf_block *block,
+ -					 tc_setup_cb_t *cb, void *cb_ident)
+ -{	struct tcf_block_cb *block_cb;
+ -
+ -	list_for_each_entry(block_cb, &block->cb_list, list)
+ -		if (block_cb->cb == cb && block_cb->cb_ident == cb_ident)
+ -			return block_cb;
+ -	return NULL;
+ -}
+ -EXPORT_SYMBOL(tcf_block_cb_lookup);
+ -
+ -void tcf_block_cb_incref(struct tcf_block_cb *block_cb)
+ -{
+ -	block_cb->refcnt++;
+ -}
+ -EXPORT_SYMBOL(tcf_block_cb_incref);
+ -
+ -unsigned int tcf_block_cb_decref(struct tcf_block_cb *block_cb)
+ -{
+ -	return --block_cb->refcnt;
+ -}
+ -EXPORT_SYMBOL(tcf_block_cb_decref);
+ -
+ -struct tcf_block_cb *__tcf_block_cb_register(struct tcf_block *block,
+ -					     tc_setup_cb_t *cb, void *cb_ident,
+ -					     void *cb_priv)
+ -{
+ -	struct tcf_block_cb *block_cb;
+ -
+ -	block_cb = kzalloc(sizeof(*block_cb), GFP_KERNEL);
+ -	if (!block_cb)
+ -		return NULL;
+ -	block_cb->cb = cb;
+ -	block_cb->cb_ident = cb_ident;
+ -	block_cb->cb_priv = cb_priv;
+ -	list_add(&block_cb->list, &block->cb_list);
+ -	return block_cb;
+ -}
+ -EXPORT_SYMBOL(__tcf_block_cb_register);
+ -
+ -int tcf_block_cb_register(struct tcf_block *block,
+ -			  tc_setup_cb_t *cb, void *cb_ident,
+ -			  void *cb_priv)
+ -{
+ -	struct tcf_block_cb *block_cb;
+ -
+ -	block_cb = __tcf_block_cb_register(block, cb, cb_ident, cb_priv);
+ -	return block_cb ? 0 : -ENOMEM;
+ -}
+ -EXPORT_SYMBOL(tcf_block_cb_register);
+ -
+ -void __tcf_block_cb_unregister(struct tcf_block_cb *block_cb)
+ -{
+ -	list_del(&block_cb->list);
+ -	kfree(block_cb);
+ -}
+ -EXPORT_SYMBOL(__tcf_block_cb_unregister);
+ -
+ -void tcf_block_cb_unregister(struct tcf_block *block,
+ -			     tc_setup_cb_t *cb, void *cb_ident)
+ -{
+ -	struct tcf_block_cb *block_cb;
+ -
+ -	block_cb = tcf_block_cb_lookup(block, cb, cb_ident);
+ -	if (!block_cb)
+ -		return;
+ -	__tcf_block_cb_unregister(block_cb);
+ -}
+ -EXPORT_SYMBOL(tcf_block_cb_unregister);
+ -
+ -static int tcf_block_cb_call(struct tcf_block *block, enum tc_setup_type type,
+ -			     void *type_data, bool err_stop)
+ -{
+ -	struct tcf_block_cb *block_cb;
+ -	int ok_count = 0;
+ -	int err;
+ -
+ -	list_for_each_entry(block_cb, &block->cb_list, list) {
+ -		err = block_cb->cb(type, type_data, block_cb->cb_priv);
+ -		if (err) {
+ -			if (err_stop)
+ -				return err;
+ -		} else {
+ -			ok_count++;
+ -		}
+ -	}
+ -	return ok_count;
+ -}
+ -
+  /* Main classifier routine: scans classifier chain attached
+   * to this qdisc, (optionally) tests for protocol and asks
+   * specific classifiers.
+* Unmerged path include/net/sch_generic.h
+* Unmerged path net/sched/cls_api.c
