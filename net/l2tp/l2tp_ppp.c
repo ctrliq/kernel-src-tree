@@ -1291,7 +1291,7 @@ static int pppol2tp_session_setsockopt(struct sock *sk,
 			err = -EINVAL;
 			break;
 		}
-		session->recv_seq = val ? -1 : 0;
+		session->recv_seq = !!val;
 		l2tp_info(session, PPPOL2TP_MSG_CONTROL,
 			  "%s: set recv_seq=%d\n",
 			  session->name, session->recv_seq);
@@ -1302,7 +1302,7 @@ static int pppol2tp_session_setsockopt(struct sock *sk,
 			err = -EINVAL;
 			break;
 		}
-		session->send_seq = val ? -1 : 0;
+		session->send_seq = !!val;
 		{
 			struct sock *ssk      = ps->sock;
 			struct pppox_sock *po = pppox_sk(ssk);
@@ -1319,7 +1319,7 @@ static int pppol2tp_session_setsockopt(struct sock *sk,
 			err = -EINVAL;
 			break;
 		}
-		session->lns_mode = val ? -1 : 0;
+		session->lns_mode = !!val;
 		l2tp_info(session, PPPOL2TP_MSG_CONTROL,
 			  "%s: set lns_mode=%d\n",
 			  session->name, session->lns_mode);
