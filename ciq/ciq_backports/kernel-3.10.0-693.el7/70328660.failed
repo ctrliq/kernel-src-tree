@@ -1,0 +1,135 @@
+netns: Add a limit on the number of net namespaces
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Eric W. Biederman <ebiederm@xmission.com>
+commit 703286608a220d53584cca5986aad5305eec75ed
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/70328660.failed
+
+	Acked-by: Kees Cook <keescook@chromium.org>
+	Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+(cherry picked from commit 703286608a220d53584cca5986aad5305eec75ed)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/user_namespace.h
+#	include/net/net_namespace.h
+#	kernel/ucount.c
+diff --cc include/linux/user_namespace.h
+index 9b176275291d,c6bc980b06a9..000000000000
+--- a/include/linux/user_namespace.h
++++ b/include/linux/user_namespace.h
+@@@ -22,6 -22,18 +22,21 @@@ struct uid_gid_map {	/* 64 bytes -- 1 c
+  
+  #define USERNS_INIT_FLAGS USERNS_SETGROUPS_ALLOWED
+  
+++<<<<<<< HEAD
+++=======
++ struct ucounts;
++ 
++ enum ucount_type {
++ 	UCOUNT_USER_NAMESPACES,
++ 	UCOUNT_PID_NAMESPACES,
++ 	UCOUNT_UTS_NAMESPACES,
++ 	UCOUNT_IPC_NAMESPACES,
++ 	UCOUNT_NET_NAMESPACES,
++ 	UCOUNT_CGROUP_NAMESPACES,
++ 	UCOUNT_COUNTS,
++ };
++ 
+++>>>>>>> 703286608a22 (netns: Add a limit on the number of net namespaces)
+  struct user_namespace {
+  	struct uid_gid_map	uid_map;
+  	struct uid_gid_map	gid_map;
+diff --cc include/net/net_namespace.h
+index 6fdb0a45dbc0,fc4f757107df..000000000000
+--- a/include/net/net_namespace.h
++++ b/include/net/net_namespace.h
+@@@ -56,8 -60,11 +56,14 @@@ struct net 
+  	struct list_head	exit_list;	/* Use only net_mutex */
+  
+  	struct user_namespace   *user_ns;	/* Owning user namespace */
+++<<<<<<< HEAD
+++=======
++ 	struct ucounts		*ucounts;
++ 	spinlock_t		nsid_lock;
++ 	struct idr		netns_ids;
+++>>>>>>> 703286608a22 (netns: Add a limit on the number of net namespaces)
+  
+ -	struct ns_common	ns;
+ +	unsigned int		proc_inum;
+  
+  	struct proc_dir_entry 	*proc_net;
+  	struct proc_dir_entry 	*proc_net_stat;
+* Unmerged path kernel/ucount.c
+* Unmerged path include/linux/user_namespace.h
+* Unmerged path include/net/net_namespace.h
+* Unmerged path kernel/ucount.c
+diff --git a/net/core/net_namespace.c b/net/core/net_namespace.c
+index cdb169b3f290..7f2eb40e2a3f 100644
+--- a/net/core/net_namespace.c
++++ b/net/core/net_namespace.c
+@@ -268,6 +268,16 @@ struct net *get_net_ns_by_id(struct net *net, int id)
+ 	return peer;
+ }
+ 
++static struct ucounts *inc_net_namespaces(struct user_namespace *ns)
++{
++	return inc_ucount(ns, current_euid(), UCOUNT_NET_NAMESPACES);
++}
++
++static void dec_net_namespaces(struct ucounts *ucounts)
++{
++	dec_ucount(ucounts, UCOUNT_NET_NAMESPACES);
++}
++
+ /*
+  * setup_net runs the initializers for the network namespace object.
+  */
+@@ -353,19 +363,27 @@ void net_drop_ns(void *p)
+ struct net *copy_net_ns(unsigned long flags,
+ 			struct user_namespace *user_ns, struct net *old_net)
+ {
++	struct ucounts *ucounts;
+ 	struct net *net;
+ 	int rv;
+ 
+ 	if (!(flags & CLONE_NEWNET))
+ 		return get_net(old_net);
+ 
++	ucounts = inc_net_namespaces(user_ns);
++	if (!ucounts)
++		return ERR_PTR(-ENFILE);
++
+ 	net = net_alloc();
+-	if (!net)
++	if (!net) {
++		dec_net_namespaces(ucounts);
+ 		return ERR_PTR(-ENOMEM);
++	}
+ 
+ 	get_user_ns(user_ns);
+ 
+ 	mutex_lock(&net_mutex);
++	net->ucounts = ucounts;
+ 	rv = setup_net(net, user_ns);
+ 	if (rv == 0) {
+ 		rtnl_lock();
+@@ -374,6 +392,7 @@ struct net *copy_net_ns(unsigned long flags,
+ 	}
+ 	mutex_unlock(&net_mutex);
+ 	if (rv < 0) {
++		dec_net_namespaces(ucounts);
+ 		put_user_ns(user_ns);
+ 		net_drop_ns(net);
+ 		return ERR_PTR(rv);
+@@ -446,6 +465,7 @@ static void cleanup_net(struct work_struct *work)
+ 	/* Finally it is safe to free my network namespace structure */
+ 	list_for_each_entry_safe(net, tmp, &net_exit_list, exit_list) {
+ 		list_del_init(&net->exit_list);
++		dec_net_namespaces(net->ucounts);
+ 		put_user_ns(net->user_ns);
+ 		net_drop_ns(net);
+ 	}
