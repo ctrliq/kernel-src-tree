@@ -1,0 +1,268 @@
+udp: implement memory accounting helpers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit f970bd9e3a06f06df8d8ecf1f8ad2c8615cc17eb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/f970bd9e.failed
+
+Avoid using the generic helpers.
+Use the receive queue spin lock to protect the memory
+accounting operation, both on enqueue and on dequeue.
+
+On dequeue perform partial memory reclaiming, trying to
+leave a quantum of forward allocated memory.
+
+On enqueue use a custom helper, to allow some optimizations:
+- use a plain spin_lock() variant instead of the slightly
+  costly spin_lock_irqsave(),
+- avoid dst_force check, since the calling code has already
+  dropped the skb dst
+- avoid orphaning the skb, since skb_steal_sock() already did
+  the work for us
+
+The above needs custom memory reclaiming on shutdown, provided
+by the udp_destruct_sock().
+
+v5 -> v6:
+  - don't orphan the skb on enqueue
+
+v4 -> v5:
+  - replace the mem_lock with the receive queue spin lock
+  - ensure that the bh is always allowed to enqueue at least
+    a skb, even if sk_rcvbuf is exceeded
+
+v3 -> v4:
+  - reworked memory accunting, simplifying the schema
+  - provide an helper for both memory scheduling and enqueuing
+
+v1 -> v2:
+  - use a udp specific destrctor to perform memory reclaiming
+  - remove a couple of helpers, unneeded after the above cleanup
+  - do not reclaim memory on dequeue if not under memory
+    pressure
+  - reworked the fwd accounting schema to avoid potential
+    integer overflow
+
+	Acked-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Acked-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f970bd9e3a06f06df8d8ecf1f8ad2c8615cc17eb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/udp.h
+#	net/ipv4/udp.c
+diff --cc include/net/udp.h
+index 2c87c23321fa,18f1e6b91927..000000000000
+--- a/include/net/udp.h
++++ b/include/net/udp.h
+@@@ -227,42 -246,48 +227,75 @@@ static inline __be16 udp_flow_src_port(
+  }
+  
+  /* net/ipv4/udp.c */
++ void skb_consume_udp(struct sock *sk, struct sk_buff *skb, int len);
++ int __udp_enqueue_schedule_skb(struct sock *sk, struct sk_buff *skb);
++ 
+  void udp_v4_early_demux(struct sk_buff *skb);
+++<<<<<<< HEAD
+ +extern int udp_get_port(struct sock *sk, unsigned short snum,
+ +			int (*saddr_cmp)(const struct sock *,
+ +					 const struct sock *));
+ +extern void udp_err(struct sk_buff *, u32);
+ +extern int udp_sendmsg(struct kiocb *iocb, struct sock *sk,
+ +			    struct msghdr *msg, size_t len);
+ +extern int udp_push_pending_frames(struct sock *sk);
+ +extern void udp_flush_pending_frames(struct sock *sk);
+ +extern int udp_rcv(struct sk_buff *skb);
+ +extern int udp_ioctl(struct sock *sk, int cmd, unsigned long arg);
+ +extern int udp_disconnect(struct sock *sk, int flags);
+ +extern unsigned int udp_poll(struct file *file, struct socket *sock,
+ +			     poll_table *wait);
+ +extern struct sk_buff *skb_udp_tunnel_segment(struct sk_buff *skb,
+ +					      netdev_features_t features,
+ +					      bool is_ipv6);
+ +extern int udp_lib_getsockopt(struct sock *sk, int level, int optname,
+ +			      char __user *optval, int __user *optlen);
+ +extern int udp_lib_setsockopt(struct sock *sk, int level, int optname,
+ +			      char __user *optval, unsigned int optlen,
+ +			      int (*push_pending_frames)(struct sock *));
+ +extern struct sock *udp4_lib_lookup(struct net *net, __be32 saddr, __be16 sport,
+ +				    __be32 daddr, __be16 dport,
+ +				    int dif);
+ +extern struct sock *__udp4_lib_lookup(struct net *net, __be32 saddr, __be16 sport,
+ +				    __be32 daddr, __be16 dport,
+ +				    int dif, struct udp_table *tbl);
+++=======
++ int udp_get_port(struct sock *sk, unsigned short snum,
++ 		 int (*saddr_cmp)(const struct sock *,
++ 				  const struct sock *));
++ void udp_err(struct sk_buff *, u32);
++ int udp_abort(struct sock *sk, int err);
++ int udp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len);
++ int udp_push_pending_frames(struct sock *sk);
++ void udp_flush_pending_frames(struct sock *sk);
++ void udp4_hwcsum(struct sk_buff *skb, __be32 src, __be32 dst);
++ int udp_rcv(struct sk_buff *skb);
++ int udp_ioctl(struct sock *sk, int cmd, unsigned long arg);
++ int udp_init_sock(struct sock *sk);
++ int udp_disconnect(struct sock *sk, int flags);
++ unsigned int udp_poll(struct file *file, struct socket *sock, poll_table *wait);
++ struct sk_buff *skb_udp_tunnel_segment(struct sk_buff *skb,
++ 				       netdev_features_t features,
++ 				       bool is_ipv6);
++ int udp_lib_getsockopt(struct sock *sk, int level, int optname,
++ 		       char __user *optval, int __user *optlen);
++ int udp_lib_setsockopt(struct sock *sk, int level, int optname,
++ 		       char __user *optval, unsigned int optlen,
++ 		       int (*push_pending_frames)(struct sock *));
++ struct sock *udp4_lib_lookup(struct net *net, __be32 saddr, __be16 sport,
++ 			     __be32 daddr, __be16 dport, int dif);
++ struct sock *__udp4_lib_lookup(struct net *net, __be32 saddr, __be16 sport,
++ 			       __be32 daddr, __be16 dport, int dif,
++ 			       struct udp_table *tbl, struct sk_buff *skb);
+++>>>>>>> f970bd9e3a06 (udp: implement memory accounting helpers)
+  struct sock *udp4_lib_lookup_skb(struct sk_buff *skb,
+  				 __be16 sport, __be16 dport);
+ -struct sock *udp6_lib_lookup(struct net *net,
+ -			     const struct in6_addr *saddr, __be16 sport,
+ -			     const struct in6_addr *daddr, __be16 dport,
+ -			     int dif);
+ -struct sock *__udp6_lib_lookup(struct net *net,
+ -			       const struct in6_addr *saddr, __be16 sport,
+ -			       const struct in6_addr *daddr, __be16 dport,
+ -			       int dif, struct udp_table *tbl,
+ -			       struct sk_buff *skb);
+ +extern struct sock *udp6_lib_lookup(struct net *net, const struct in6_addr *saddr, __be16 sport,
+ +				    const struct in6_addr *daddr, __be16 dport,
+ +				    int dif);
+ +extern struct sock *__udp6_lib_lookup(struct net *net, const struct in6_addr *saddr, __be16 sport,
+ +				    const struct in6_addr *daddr, __be16 dport,
+ +				    int dif, struct udp_table *tbl);
+  struct sock *udp6_lib_lookup_skb(struct sk_buff *skb,
+  				 __be16 sport, __be16 dport);
+  
+diff --cc net/ipv4/udp.c
+index a02b20ab0f64,be3c3312df8d..000000000000
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@@ -1153,6 -1172,111 +1153,114 @@@ out
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void udp_rmem_release(struct sock *sk, int size, int partial)
++ {
++ 	int amt;
++ 
++ 	atomic_sub(size, &sk->sk_rmem_alloc);
++ 
++ 	spin_lock_bh(&sk->sk_receive_queue.lock);
++ 	sk->sk_forward_alloc += size;
++ 	amt = (sk->sk_forward_alloc - partial) & ~(SK_MEM_QUANTUM - 1);
++ 	sk->sk_forward_alloc -= amt;
++ 	spin_unlock_bh(&sk->sk_receive_queue.lock);
++ 
++ 	if (amt)
++ 		__sk_mem_reduce_allocated(sk, amt >> SK_MEM_QUANTUM_SHIFT);
++ }
++ 
++ static void udp_rmem_free(struct sk_buff *skb)
++ {
++ 	udp_rmem_release(skb->sk, skb->truesize, 1);
++ }
++ 
++ int __udp_enqueue_schedule_skb(struct sock *sk, struct sk_buff *skb)
++ {
++ 	struct sk_buff_head *list = &sk->sk_receive_queue;
++ 	int rmem, delta, amt, err = -ENOMEM;
++ 	int size = skb->truesize;
++ 
++ 	/* try to avoid the costly atomic add/sub pair when the receive
++ 	 * queue is full; always allow at least a packet
++ 	 */
++ 	rmem = atomic_read(&sk->sk_rmem_alloc);
++ 	if (rmem && (rmem + size > sk->sk_rcvbuf))
++ 		goto drop;
++ 
++ 	/* we drop only if the receive buf is full and the receive
++ 	 * queue contains some other skb
++ 	 */
++ 	rmem = atomic_add_return(size, &sk->sk_rmem_alloc);
++ 	if ((rmem > sk->sk_rcvbuf) && (rmem > size))
++ 		goto uncharge_drop;
++ 
++ 	spin_lock(&list->lock);
++ 	if (size >= sk->sk_forward_alloc) {
++ 		amt = sk_mem_pages(size);
++ 		delta = amt << SK_MEM_QUANTUM_SHIFT;
++ 		if (!__sk_mem_raise_allocated(sk, delta, amt, SK_MEM_RECV)) {
++ 			err = -ENOBUFS;
++ 			spin_unlock(&list->lock);
++ 			goto uncharge_drop;
++ 		}
++ 
++ 		sk->sk_forward_alloc += delta;
++ 	}
++ 
++ 	sk->sk_forward_alloc -= size;
++ 
++ 	/* the skb owner in now the udp socket */
++ 	skb->sk = sk;
++ 	skb->destructor = udp_rmem_free;
++ 	skb->dev = NULL;
++ 	sock_skb_set_dropcount(sk, skb);
++ 
++ 	__skb_queue_tail(list, skb);
++ 	spin_unlock(&list->lock);
++ 
++ 	if (!sock_flag(sk, SOCK_DEAD))
++ 		sk->sk_data_ready(sk);
++ 
++ 	return 0;
++ 
++ uncharge_drop:
++ 	atomic_sub(skb->truesize, &sk->sk_rmem_alloc);
++ 
++ drop:
++ 	atomic_inc(&sk->sk_drops);
++ 	return err;
++ }
++ EXPORT_SYMBOL_GPL(__udp_enqueue_schedule_skb);
++ 
++ static void udp_destruct_sock(struct sock *sk)
++ {
++ 	/* reclaim completely the forward allocated memory */
++ 	__skb_queue_purge(&sk->sk_receive_queue);
++ 	udp_rmem_release(sk, 0, 0);
++ 	inet_sock_destruct(sk);
++ }
++ 
++ int udp_init_sock(struct sock *sk)
++ {
++ 	sk->sk_destruct = udp_destruct_sock;
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(udp_init_sock);
++ 
++ void skb_consume_udp(struct sock *sk, struct sk_buff *skb, int len)
++ {
++ 	if (unlikely(READ_ONCE(sk->sk_peek_off) >= 0)) {
++ 		bool slow = lock_sock_fast(sk);
++ 
++ 		sk_peek_offset_bwd(sk, len);
++ 		unlock_sock_fast(sk, slow);
++ 	}
++ 	consume_skb(skb);
++ }
++ EXPORT_SYMBOL_GPL(skb_consume_udp);
+++>>>>>>> f970bd9e3a06 (udp: implement memory accounting helpers)
+  
+  /**
+   *	first_packet_length	- return length of first packet in receive queue
+* Unmerged path include/net/udp.h
+* Unmerged path net/ipv4/udp.c
