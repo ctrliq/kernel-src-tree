@@ -1,0 +1,138 @@
+cxgb4: copy the length of cpl_tx_pkt_core to fw_wr
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Ganesh Goudar <ganeshgr@chelsio.com>
+commit a6076fcd187a1cb4900cf970a04401957b4b4ab8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/a6076fcd.failed
+
+immdlen field of FW_ETH_TX_PKT_WR is filled in a wrong way,
+we must copy the length of all the cpls encapsulated in fw
+work request. In the xmit path we missed adding the length
+of CPL_TX_PKT_CORE but we added the length of WR_HDR and it
+worked because WR_HDR and CPL_TX_PKT_CORE are of same length.
+Add the length of cpl_tx_pkt_core not WR_HDR's. This also
+fixes the lso cpl errors for udp tunnels
+
+Fixes: d0a1299c6bf7 ("cxgb4: add support for vxlan segmentation offload")
+	Signed-off-by: Ganesh Goudar <ganeshgr@chelsio.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a6076fcd187a1cb4900cf970a04401957b4b4ab8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/chelsio/cxgb4/sge.c
+diff --cc drivers/net/ethernet/chelsio/cxgb4/sge.c
+index a64f3863f5c9,276f22357f81..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/sge.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/sge.c
+@@@ -1216,39 -1411,76 +1216,74 @@@ out_free:	dev_kfree_skb_any(skb)
+  	end = (u64 *)wr + flits;
+  
+  	len = immediate ? skb->len : 0;
+++<<<<<<< HEAD
+ +	ssi = skb_shinfo(skb);
+++=======
++ 	len += sizeof(*cpl);
+++>>>>>>> a6076fcd187a (cxgb4: copy the length of cpl_tx_pkt_core to fw_wr)
+  	if (ssi->gso_size) {
+- 		struct cpl_tx_pkt_lso *lso = (void *)wr;
++ 		struct cpl_tx_pkt_lso_core *lso = (void *)(wr + 1);
+  		bool v6 = (ssi->gso_type & SKB_GSO_TCPV6) != 0;
+  		int l3hdr_len = skb_network_header_len(skb);
+  		int eth_xtra_len = skb_network_offset(skb) - ETH_HLEN;
+ -		struct cpl_tx_tnl_lso *tnl_lso = (void *)(wr + 1);
+ -
+ -		if (tnl_type)
+ -			len += sizeof(*tnl_lso);
+ -		else
+ -			len += sizeof(*lso);
+  
+ +		len += sizeof(*lso);
+  		wr->op_immdlen = htonl(FW_WR_OP_V(FW_ETH_TX_PKT_WR) |
+  				       FW_WR_IMMDLEN_V(len));
+ -		if (tnl_type) {
+ -			struct iphdr *iph = ip_hdr(skb);
+ +		lso->c.lso_ctrl = htonl(LSO_OPCODE_V(CPL_TX_PKT_LSO) |
+ +					LSO_FIRST_SLICE_F | LSO_LAST_SLICE_F |
+ +					LSO_IPV6_V(v6) |
+ +					LSO_ETHHDR_LEN_V(eth_xtra_len / 4) |
+ +					LSO_IPHDR_LEN_V(l3hdr_len / 4) |
+ +					LSO_TCPHDR_LEN_V(tcp_hdr(skb)->doff));
+ +		lso->c.ipid_ofst = htons(0);
+ +		lso->c.mss = htons(ssi->gso_size);
+ +		lso->c.seqno_offset = htonl(0);
+ +		if (is_t4(adap->params.chip))
+ +			lso->c.len = htonl(skb->len);
+ +		else
+ +			lso->c.len = htonl(LSO_T5_XFER_SIZE_V(skb->len));
+ +		cpl = (void *)(lso + 1);
+  
+++<<<<<<< HEAD
+ +		if (CHELSIO_CHIP_VERSION(adap->params.chip) <= CHELSIO_T5)
+ +			cntrl =	TXPKT_ETHHDR_LEN_V(eth_xtra_len);
+ +		else
+ +			cntrl = T6_TXPKT_ETHHDR_LEN_V(eth_xtra_len);
+++=======
++ 			t6_fill_tnl_lso(skb, tnl_lso, tnl_type);
++ 			cpl = (void *)(tnl_lso + 1);
++ 			/* Driver is expected to compute partial checksum that
++ 			 * does not include the IP Total Length.
++ 			 */
++ 			if (iph->version == 4) {
++ 				iph->check = 0;
++ 				iph->tot_len = 0;
++ 				iph->check = (u16)(~ip_fast_csum((u8 *)iph,
++ 								 iph->ihl));
++ 			}
++ 			if (skb->ip_summed == CHECKSUM_PARTIAL)
++ 				cntrl = hwcsum(adap->params.chip, skb);
++ 		} else {
++ 			lso->lso_ctrl = htonl(LSO_OPCODE_V(CPL_TX_PKT_LSO) |
++ 					LSO_FIRST_SLICE_F | LSO_LAST_SLICE_F |
++ 					LSO_IPV6_V(v6) |
++ 					LSO_ETHHDR_LEN_V(eth_xtra_len / 4) |
++ 					LSO_IPHDR_LEN_V(l3hdr_len / 4) |
++ 					LSO_TCPHDR_LEN_V(tcp_hdr(skb)->doff));
++ 			lso->ipid_ofst = htons(0);
++ 			lso->mss = htons(ssi->gso_size);
++ 			lso->seqno_offset = htonl(0);
++ 			if (is_t4(adap->params.chip))
++ 				lso->len = htonl(skb->len);
++ 			else
++ 				lso->len = htonl(LSO_T5_XFER_SIZE_V(skb->len));
++ 			cpl = (void *)(lso + 1);
+++>>>>>>> a6076fcd187a (cxgb4: copy the length of cpl_tx_pkt_core to fw_wr)
+  
+ -			if (CHELSIO_CHIP_VERSION(adap->params.chip)
+ -			    <= CHELSIO_T5)
+ -				cntrl =	TXPKT_ETHHDR_LEN_V(eth_xtra_len);
+ -			else
+ -				cntrl = T6_TXPKT_ETHHDR_LEN_V(eth_xtra_len);
+ -
+ -			cntrl |= TXPKT_CSUM_TYPE_V(v6 ?
+ -				 TX_CSUM_TCPIP6 : TX_CSUM_TCPIP) |
+ -				 TXPKT_IPHDR_LEN_V(l3hdr_len);
+ -		}
+ -		sgl = (u64 *)(cpl + 1); /* sgl start here */
+ -		if (unlikely((u8 *)sgl >= (u8 *)q->q.stat)) {
+ -			/* If current position is already at the end of the
+ -			 * txq, reset the current to point to start of the queue
+ -			 * and update the end ptr as well.
+ -			 */
+ -			if (sgl == (u64 *)q->q.stat) {
+ -				int left = (u8 *)end - (u8 *)q->q.stat;
+ -
+ -				end = (void *)q->q.desc + left;
+ -				sgl = (void *)q->q.desc;
+ -			}
+ -		}
+ +		cntrl |= TXPKT_CSUM_TYPE_V(v6 ?
+ +					   TX_CSUM_TCPIP6 : TX_CSUM_TCPIP) |
+ +			 TXPKT_IPHDR_LEN_V(l3hdr_len);
+  		q->tso++;
+  		q->tx_cso += ssi->gso_segs;
+  	} else {
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/sge.c
