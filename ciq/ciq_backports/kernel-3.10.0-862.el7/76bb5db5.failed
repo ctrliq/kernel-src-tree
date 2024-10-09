@@ -1,0 +1,146 @@
+netvsc: fix use after free on module removal
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author stephen hemminger <stephen@networkplumber.org>
+commit 76bb5db5c749dfe19d779aac076133e821b859dd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/76bb5db5.failed
+
+The NAPI data structure is embedded in the netvsc_device structure
+and is freed when device is closed. There is still a reference
+(in NAPI list) to this which causes a crash in netif_napi_del
+when device is removed. Fix by managing NAPI instances correctly.
+
+	Signed-off-by: Stephen Hemminger <sthemmin@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 76bb5db5c749dfe19d779aac076133e821b859dd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/netvsc.c
+#	drivers/net/hyperv/rndis_filter.c
+diff --cc drivers/net/hyperv/netvsc.c
+index 531530628143,f99651c03e0a..000000000000
+--- a/drivers/net/hyperv/netvsc.c
++++ b/drivers/net/hyperv/netvsc.c
+@@@ -599,9 -584,12 +599,16 @@@ void netvsc_device_remove(struct hv_dev
+  	/* Now, we can close the channel safely */
+  	vmbus_close(device->channel);
+  
+++<<<<<<< HEAD
+++=======
++ 	/* And dissassociate NAPI context from device */
++ 	for (i = 0; i < net_device->num_chn; i++)
++ 		netif_napi_del(&net_device->chan_table[i].napi);
++ 
+++>>>>>>> 76bb5db5c749 (netvsc: fix use after free on module removal)
+  	/* Release all resources */
+ -	free_netvsc_device_rcu(net_device);
+ +	vfree(net_device->sub_cb_buf);
+ +	free_netvsc_device(net_device);
+  }
+  
+  #define RING_AVAIL_PERCENT_HIWATER 20
+@@@ -1363,7 -1305,23 +1370,27 @@@ int netvsc_device_add(struct hv_device 
+  
+  	net_device->ring_size = ring_size;
+  
+++<<<<<<< HEAD
+ +	set_per_channel_state(device->channel, net_device->cb_buffer);
+++=======
++ 	/* Because the device uses NAPI, all the interrupt batching and
++ 	 * control is done via Net softirq, not the channel handling
++ 	 */
++ 	set_channel_read_mode(device->channel, HV_CALL_ISR);
++ 
++ 	/* If we're reopening the device we may have multiple queues, fill the
++ 	 * chn_table with the default channel to use it before subchannels are
++ 	 * opened.
++ 	 * Initialize the channel state before we open;
++ 	 * we can be interrupted as soon as we open the channel.
++ 	 */
++ 
++ 	for (i = 0; i < VRSS_CHANNEL_MAX; i++) {
++ 		struct netvsc_channel *nvchan = &net_device->chan_table[i];
++ 
++ 		nvchan->channel = device->channel;
++ 	}
+++>>>>>>> 76bb5db5c749 (netvsc: fix use after free on module removal)
+  
+  	/* Open the channel */
+  	ret = vmbus_open(device->channel, ring_size * PAGE_SIZE,
+@@@ -1378,12 -1337,10 +1405,19 @@@
+  	/* Channel is opened */
+  	netdev_dbg(ndev, "hv_netvsc channel opened successfully\n");
+  
+++<<<<<<< HEAD
+ +	/* If we're reopening the device we may have multiple queues, fill the
+ +	 * chn_table with the default channel to use it before subchannels are
+ +	 * opened.
+ +	 */
+ +	for (i = 0; i < VRSS_CHANNEL_MAX; i++)
+ +		net_device->chn_table[i] = device->channel;
+++=======
++ 	/* Enable NAPI handler for init callbacks */
++ 	netif_napi_add(ndev, &net_device->chan_table[0].napi,
++ 		       netvsc_poll, NAPI_POLL_WEIGHT);
++ 	napi_enable(&net_device->chan_table[0].napi);
+++>>>>>>> 76bb5db5c749 (netvsc: fix use after free on module removal)
+  
+  	/* Writing nvdev pointer unlocks netvsc_send(), make sure chn_table is
+  	 * populated.
+@@@ -1403,6 -1358,8 +1437,11 @@@
+  	return ret;
+  
+  close:
+++<<<<<<< HEAD
+++=======
++ 	netif_napi_del(&net_device->chan_table[0].napi);
++ 
+++>>>>>>> 76bb5db5c749 (netvsc: fix use after free on module removal)
+  	/* Now, we can close the channel safely */
+  	vmbus_close(device->channel);
+  
+diff --cc drivers/net/hyperv/rndis_filter.c
+index b6bc44dd1f92,ab92c3c95951..000000000000
+--- a/drivers/net/hyperv/rndis_filter.c
++++ b/drivers/net/hyperv/rndis_filter.c
+@@@ -925,17 -1007,20 +925,34 @@@ static void netvsc_sc_open(struct vmbus
+  	 */
+  	set_channel_read_mode(new_sc, HV_CALL_ISR);
+  
+++<<<<<<< HEAD
+ +	ret = vmbus_open(new_sc, nvscdev->ring_size * PAGE_SIZE,
+ +			 nvscdev->ring_size * PAGE_SIZE, NULL, 0,
+ +			 netvsc_channel_cb, new_sc);
+ +
+ +	if (ret == 0)
+ +		nvscdev->chn_table[chn_index] = new_sc;
+ +
+ +	spin_lock_irqsave(&nvscdev->sc_lock, flags);
+ +	nvscdev->num_sc_offered--;
+ +	spin_unlock_irqrestore(&nvscdev->sc_lock, flags);
+ +	if (nvscdev->num_sc_offered == 0)
+++=======
++ 	/* Set the channel before opening.*/
++ 	nvchan->channel = new_sc;
++ 	netif_napi_add(ndev, &nvchan->napi,
++ 		       netvsc_poll, NAPI_POLL_WEIGHT);
++ 
++ 	ret = vmbus_open(new_sc, nvscdev->ring_size * PAGE_SIZE,
++ 			 nvscdev->ring_size * PAGE_SIZE, NULL, 0,
++ 			 netvsc_channel_cb, nvchan);
++ 	if (ret == 0)
++ 		napi_enable(&nvchan->napi);
++ 	else
++ 		netdev_err(ndev, "sub channel open failed (%d)\n", ret);
++ 
++ 	if (refcount_dec_and_test(&nvscdev->sc_offered))
+++>>>>>>> 76bb5db5c749 (netvsc: fix use after free on module removal)
+  		complete(&nvscdev->channel_init_wait);
+  }
+  
+* Unmerged path drivers/net/hyperv/netvsc.c
+* Unmerged path drivers/net/hyperv/rndis_filter.c
