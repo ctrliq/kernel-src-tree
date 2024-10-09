@@ -124,10 +124,8 @@ static int mqprio_init(struct Qdisc *sch, struct nlattr *opt)
 	/* pre-allocate qdisc, attachment can't fail */
 	priv->qdiscs = kcalloc(dev->num_tx_queues, sizeof(priv->qdiscs[0]),
 			       GFP_KERNEL);
-	if (priv->qdiscs == NULL) {
-		err = -ENOMEM;
-		goto err;
-	}
+	if (!priv->qdiscs)
+		return -ENOMEM;
 
 	for (i = 0; i < dev->num_tx_queues; i++) {
 		dev_queue = netdev_get_tx_queue(dev, i);
@@ -135,10 +133,9 @@ static int mqprio_init(struct Qdisc *sch, struct nlattr *opt)
 					  get_default_qdisc_ops(dev, i),
 					  TC_H_MAKE(TC_H_MAJ(sch->handle),
 						    TC_H_MIN(i + 1)));
-		if (qdisc == NULL) {
-			err = -ENOMEM;
-			goto err;
-		}
+		if (!qdisc)
+			return -ENOMEM;
+
 		priv->qdiscs[i] = qdisc;
 		qdisc->flags |= TCQ_F_ONETXQUEUE | TCQ_F_NOPARENT;
 	}
@@ -157,7 +154,7 @@ static int mqprio_init(struct Qdisc *sch, struct nlattr *opt)
 						      &tc) :
 			dev->netdev_ops->ndo_setup_tc_rh72(dev, qopt->num_tc);
 		if (err)
-			goto err;
+			return err;
 	} else {
 		netdev_set_num_tc(dev, qopt->num_tc);
 		for (i = 0; i < qopt->num_tc; i++)
@@ -171,10 +168,6 @@ static int mqprio_init(struct Qdisc *sch, struct nlattr *opt)
 
 	sch->flags |= TCQ_F_MQROOT;
 	return 0;
-
-err:
-	mqprio_destroy(sch);
-	return err;
 }
 
 static void mqprio_attach(struct Qdisc *sch)
