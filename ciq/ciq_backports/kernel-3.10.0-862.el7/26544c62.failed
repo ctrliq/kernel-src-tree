@@ -1,0 +1,110 @@
+ceph: when seeing write errors on an inode, switch to sync writes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jeff Layton <jlayton@redhat.com>
+commit 26544c623e741ac6445f8b1ae369ee32ae1794ad
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/26544c62.failed
+
+Currently, we don't have a real feedback mechanism in place for when we
+start seeing buffered writeback errors. If writeback is failing, there
+is nothing that prevents an application from continuing to dirty pages
+that aren't being cleaned.
+
+In the event that we're seeing write errors of any sort occur on an
+inode, have the callback set a flag to force further writes to be
+synchronous. When the next write succeeds, clear the flag to allow
+buffered writeback to continue.
+
+Since this is just a hint to the write submission mechanism, we only
+take the i_ceph_lock when a lockless check shows that the flag needs to
+be changed.
+
+	Signed-off-by: Jeff Layton <jlayton@redhat.com>
+	Reviewed-by: "Yan, Zheng” <zyan@redhat.com>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit 26544c623e741ac6445f8b1ae369ee32ae1794ad)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/file.c
+diff --cc fs/ceph/file.c
+index 520a65273c1e,39866d6a34b6..000000000000
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@@ -1399,10 -1332,11 +1403,15 @@@ retry_snap
+  	     inode, ceph_vinop(inode), pos, count, ceph_cap_string(got));
+  
+  	if ((got & (CEPH_CAP_FILE_BUFFER|CEPH_CAP_FILE_LAZYIO)) == 0 ||
+++<<<<<<< HEAD
+ +	    (file->f_flags & O_DIRECT) || (fi->flags & CEPH_F_SYNC)) {
+++=======
++ 	    (iocb->ki_flags & IOCB_DIRECT) || (fi->flags & CEPH_F_SYNC) ||
++ 	    (ci->i_ceph_flags & CEPH_I_ERROR_WRITE)) {
+++>>>>>>> 26544c623e74 (ceph: when seeing write errors on an inode, switch to sync writes)
+  		struct ceph_snap_context *snapc;
+ -		struct iov_iter data;
+ -		inode_unlock(inode);
+ +		struct iov_iter i;
+ +		mutex_unlock(&inode->i_mutex);
+  
+  		spin_lock(&ci->i_ceph_lock);
+  		if (__ceph_have_pending_cap_snap(ci)) {
+diff --git a/fs/ceph/addr.c b/fs/ceph/addr.c
+index f26258b3562b..d398bd2e9129 100644
+--- a/fs/ceph/addr.c
++++ b/fs/ceph/addr.c
+@@ -607,8 +607,12 @@ static void writepages_finish(struct ceph_osd_request *req)
+ 
+ 
+ 	dout("writepages_finish %p rc %d\n", inode, rc);
+-	if (rc < 0)
++	if (rc < 0) {
+ 		mapping_set_error(mapping, rc);
++		ceph_set_error_write(ci);
++	} else {
++		ceph_clear_error_write(ci);
++	}
+ 
+ 	/*
+ 	 * We lost the cache cap, need to truncate the page before
+* Unmerged path fs/ceph/file.c
+diff --git a/fs/ceph/super.h b/fs/ceph/super.h
+index a69e922ad375..4896692840bf 100644
+--- a/fs/ceph/super.h
++++ b/fs/ceph/super.h
+@@ -461,6 +461,32 @@ static inline struct inode *ceph_find_inode(struct super_block *sb,
+ #define CEPH_I_CAP_DROPPED	(1 << 8)  /* caps were forcibly dropped */
+ #define CEPH_I_KICK_FLUSH	(1 << 9)  /* kick flushing caps */
+ #define CEPH_I_FLUSH_SNAPS	(1 << 10) /* need flush snapss */
++#define CEPH_I_ERROR_WRITE	(1 << 11) /* have seen write errors */
++
++/*
++ * We set the ERROR_WRITE bit when we start seeing write errors on an inode
++ * and then clear it when they start succeeding. Note that we do a lockless
++ * check first, and only take the lock if it looks like it needs to be changed.
++ * The write submission code just takes this as a hint, so we're not too
++ * worried if a few slip through in either direction.
++ */
++static inline void ceph_set_error_write(struct ceph_inode_info *ci)
++{
++	if (!(READ_ONCE(ci->i_ceph_flags) & CEPH_I_ERROR_WRITE)) {
++		spin_lock(&ci->i_ceph_lock);
++		ci->i_ceph_flags |= CEPH_I_ERROR_WRITE;
++		spin_unlock(&ci->i_ceph_lock);
++	}
++}
++
++static inline void ceph_clear_error_write(struct ceph_inode_info *ci)
++{
++	if (READ_ONCE(ci->i_ceph_flags) & CEPH_I_ERROR_WRITE) {
++		spin_lock(&ci->i_ceph_lock);
++		ci->i_ceph_flags &= ~CEPH_I_ERROR_WRITE;
++		spin_unlock(&ci->i_ceph_lock);
++	}
++}
+ 
+ static inline void __ceph_dir_set_complete(struct ceph_inode_info *ci,
+ 					   long long release_count,
