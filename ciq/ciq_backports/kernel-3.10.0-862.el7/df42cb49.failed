@@ -1,0 +1,243 @@
+ALSA: x86: Drop unused stream.running field
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Takashi Iwai <tiwai@suse.de>
+commit df42cb499eb1869bfb535f6c6b5ea1406496baf4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/df42cb49.failed
+
+The pcm_stream_info.running field is only set in the PCM trigger
+callback but never referred, thus it can be safely removed.
+
+Also, properly cover the spinlock in both the trigger START and STOP
+to protect had_enable_audio() calls.
+
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit df42cb499eb1869bfb535f6c6b5ea1406496baf4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/x86/intel_hdmi_audio.c
+#	sound/x86/intel_hdmi_audio.h
+diff --cc sound/x86/intel_hdmi_audio.c
+index 3dd33e089501,9889cdf3ccf4..000000000000
+--- a/sound/x86/intel_hdmi_audio.c
++++ b/sound/x86/intel_hdmi_audio.c
+@@@ -1159,79 -1158,39 +1159,87 @@@ static int snd_intelhad_hw_free(struct 
+  	return 0;
+  }
+  
+ -/*
+ - * ALSA PCM trigger callback
+ +/**
+ + * snd_intelhad_pcm_trigger - stream activities are handled here
+ + * @substream:substream for which the stream function is called
+ + * @cmd:the stream commamd thats requested from upper layer
+ + * This function is called whenever an a stream activity is invoked
+   */
+ -static int had_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
+ +static int snd_intelhad_pcm_trigger(struct snd_pcm_substream *substream,
+ +					int cmd)
+  {
+ -	int retval = 0;
+ +	int caps, retval = 0;
+ +	unsigned long flag_irq;
+  	struct snd_intelhad *intelhaddata;
+ +	struct had_stream_pvt *stream;
+ +	struct had_pvt_data *had_stream;
+ +
+ +	pr_debug("snd_intelhad_pcm_trigger called\n");
+  
+  	intelhaddata = snd_pcm_substream_chip(substream);
+ +	stream = substream->runtime->private_data;
+ +	had_stream = intelhaddata->private_data;
+  
++ 	spin_lock(&intelhaddata->had_spinlock);
+  	switch (cmd) {
+  	case SNDRV_PCM_TRIGGER_START:
+ -	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+ -	case SNDRV_PCM_TRIGGER_RESUME:
+ +		pr_debug("Trigger Start\n");
+ +
+  		/* Disable local INTRs till register prgmng is done */
+ -		if (!intelhaddata->connected) {
+ -			dev_dbg(intelhaddata->dev,
+ -				"_START: HDMI cable plugged-out\n");
+ +		if (had_get_hwstate(intelhaddata)) {
+ +			pr_err("_START: HDMI cable plugged-out\n");
+  			retval = -ENODEV;
+  			break;
+  		}
+ +		stream->stream_status = STREAM_RUNNING;
+ +
+++<<<<<<< HEAD
+ +		had_stream->stream_type = HAD_RUNNING_STREAM;
+  
+++=======
+++>>>>>>> df42cb499eb1 (ALSA: x86: Drop unused stream.running field)
+  		/* Enable Audio */
+ -		had_ack_irqs(intelhaddata); /* FIXME: do we need this? */
+ -		had_enable_audio(intelhaddata, true);
+ +		/*
+ +		 * ToDo: Need to enable UNDERRUN interrupts as well
+ +		 *   caps = HDMI_AUDIO_UNDERRUN | HDMI_AUDIO_BUFFER_DONE;
+ +		 */
+ +		caps = HDMI_AUDIO_BUFFER_DONE;
+ +		retval = had_set_caps(intelhaddata, HAD_SET_ENABLE_AUDIO_INT,
+ +				      &caps);
+ +		retval = had_set_caps(intelhaddata, HAD_SET_ENABLE_AUDIO, NULL);
+ +		snd_intelhad_enable_audio(substream, 1);
+ +
+ +		pr_debug("Processed _Start\n");
+ +
+  		break;
+  
+  	case SNDRV_PCM_TRIGGER_STOP:
+++<<<<<<< HEAD
+ +		pr_debug("Trigger Stop\n");
+ +		spin_lock_irqsave(&intelhaddata->had_spinlock, flag_irq);
+ +		intelhaddata->stream_info.str_id = 0;
+ +		intelhaddata->curr_buf = 0;
+ +
+ +		/* Stop reporting BUFFER_DONE/UNDERRUN to above layers*/
+ +
+ +		had_stream->stream_type = HAD_INIT;
+ +		spin_unlock_irqrestore(&intelhaddata->had_spinlock, flag_irq);
+++=======
++ 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+++>>>>>>> df42cb499eb1 (ALSA: x86: Drop unused stream.running field)
+  		/* Disable Audio */
+ -		had_enable_audio(intelhaddata, false);
+ -		intelhaddata->need_reset = true;
+ +		/*
+ +		 * ToDo: Need to disable UNDERRUN interrupts as well
+ +		 *   caps = HDMI_AUDIO_UNDERRUN | HDMI_AUDIO_BUFFER_DONE;
+ +		 */
+ +		caps = HDMI_AUDIO_BUFFER_DONE;
+ +		had_set_caps(intelhaddata, HAD_SET_DISABLE_AUDIO_INT, &caps);
+ +		snd_intelhad_enable_audio(substream, 0);
+ +		/* Reset buffer pointers */
+ +		snd_intelhad_reset_audio(intelhaddata, 1);
+ +		snd_intelhad_reset_audio(intelhaddata, 0);
+ +		stream->stream_status = STREAM_DROPPED;
+ +		had_set_caps(intelhaddata, HAD_SET_DISABLE_AUDIO, NULL);
+  		break;
+  
+  	default:
+diff --cc sound/x86/intel_hdmi_audio.h
+index 32a2fb766e47,d6ba90fd011d..000000000000
+--- a/sound/x86/intel_hdmi_audio.h
++++ b/sound/x86/intel_hdmi_audio.h
+@@@ -44,62 -35,57 +44,67 @@@ struct platform_device
+  #define PCM_INDEX		0
+  #define MAX_PB_STREAMS		1
+  #define MAX_CAP_STREAMS		0
+ +#define HDMI_AUDIO_DRIVER	"hdmi-audio"
+ +
+ +#define HDMI_INFO_FRAME_WORD1	0x000a0184
+ +#define DP_INFO_FRAME_WORD1	0x00441b84
+ +#define FIFO_THRESHOLD		0xFE
+ +#define DMA_FIFO_THRESHOLD	0x7
+  #define BYTES_PER_WORD		0x4
+ -#define INTEL_HAD		"HdmiLpeAudio"
+  
+ -/*
+ - *	CEA speaker placement:
+ - *
+ - *	FL  FLC   FC   FRC   FR
+ - *
+ - *						LFE
+ - *
+ - *	RL  RLC   RC   RRC   RR
+ - *
+ - *	The Left/Right Surround channel _notions_ LS/RS in SMPTE 320M
+ - *	corresponds to CEA RL/RR; The SMPTE channel _assignment_ C/LFE is
+ - *	swapped to CEA LFE/FC.
+ - */
+ -enum cea_speaker_placement {
+ -	FL  = (1 <<  0),        /* Front Left           */
+ -	FC  = (1 <<  1),        /* Front Center         */
+ -	FR  = (1 <<  2),        /* Front Right          */
+ -	FLC = (1 <<  3),        /* Front Left Center    */
+ -	FRC = (1 <<  4),        /* Front Right Center   */
+ -	RL  = (1 <<  5),        /* Rear Left            */
+ -	RC  = (1 <<  6),        /* Rear Center          */
+ -	RR  = (1 <<  7),        /* Rear Right           */
+ -	RLC = (1 <<  8),        /* Rear Left Center     */
+ -	RRC = (1 <<  9),        /* Rear Right Center    */
+ -	LFE = (1 << 10),        /* Low Frequency Effect */
+ -};
+ +/* Sampling rate as per IEC60958 Ver 3 */
+ +#define CH_STATUS_MAP_32KHZ	0x3
+ +#define CH_STATUS_MAP_44KHZ	0x0
+ +#define CH_STATUS_MAP_48KHZ	0x2
+ +#define CH_STATUS_MAP_88KHZ	0x8
+ +#define CH_STATUS_MAP_96KHZ	0xA
+ +#define CH_STATUS_MAP_176KHZ	0xC
+ +#define CH_STATUS_MAP_192KHZ	0xE
+  
+ -struct cea_channel_speaker_allocation {
+ -	int ca_index;
+ -	int speakers[8];
+ +#define MAX_SMPL_WIDTH_20	0x0
+ +#define MAX_SMPL_WIDTH_24	0x1
+ +#define SMPL_WIDTH_16BITS	0x1
+ +#define SMPL_WIDTH_24BITS	0x5
+ +#define CHANNEL_ALLOCATION	0x1F
+ +#define MASK_BYTE0		0x000000FF
+ +#define VALID_DIP_WORDS		3
+ +#define LAYOUT0			0
+ +#define LAYOUT1			1
+ +#define SWAP_LFE_CENTER		0x00fac4c8
+ +#define AUD_CONFIG_CH_MASK_V2	0x70
+ +
+ +struct pcm_stream_info {
+++<<<<<<< HEAD
+ +	int		str_id;
+ +	void	*had_substream;
+ +	void	(*period_elapsed)(void *had_substream);
+ +	u32		buffer_ptr;
+ +	u64		buffer_rendered;
+ +	u32		ring_buf_size;
+ +	int		sfreq;
+++=======
+++	struct snd_pcm_substream *substream;
+++	int substream_refcount;
+++>>>>>>> df42cb499eb1 (ALSA: x86: Drop unused stream.running field)
+ +};
+  
+ -	/* derived values, just for convenience */
+ -	int channels;
+ -	int spk_mask;
+ +struct ring_buf_info {
+ +	u32	buf_addr;
+ +	u32	buf_size;
+ +	u8	is_valid;
+  };
+  
+ -struct channel_map_table {
+ -	unsigned char map;              /* ALSA API channel map position */
+ -	unsigned char cea_slot;         /* CEA slot value */
+ -	int spk_mask;                   /* speaker position bit mask */
+ +struct had_stream_pvt {
+ +	enum had_stream_status		stream_status;
+ +	int				stream_ops;
+ +	ssize_t				dbg_cum_bytes;
+  };
+  
+ -struct pcm_stream_info {
+ -	struct snd_pcm_substream *substream;
+ -	int substream_refcount;
+ +struct had_pvt_data {
+ +	enum had_status_stream		stream_type;
+  };
+  
+ -/*
+ +/**
+   * struct snd_intelhad - intelhad driver structure
+   *
+   * @card: ptr to hold card details
+* Unmerged path sound/x86/intel_hdmi_audio.c
+* Unmerged path sound/x86/intel_hdmi_audio.h
