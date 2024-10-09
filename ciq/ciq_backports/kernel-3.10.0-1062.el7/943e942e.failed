@@ -1,0 +1,278 @@
+nvme-pci: limit max IO size and segments to avoid high order allocations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 943e942e6266f22babee5efeb00f8f672fbff5bd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/943e942e.failed
+
+nvme requires an sg table allocation for each request. If the request
+is large, then the allocation can become quite large. For instance,
+with our default software settings of 1280KB IO size, we'll need
+10248 bytes of sg table. That turns into a 2nd order allocation,
+which we can't always guarantee. If we fail the allocation, blk-mq
+will retry it later. But there's no guarantee that we'll EVER be
+able to allocate that much contigious memory.
+
+Limit the IO size such that we never need more than a single page
+of memory. That's a lot faster and more reliable. Then back that
+allocation with a mempool, so that we know we'll always be able
+to succeed the allocation at some point.
+
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+	Acked-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 943e942e6266f22babee5efeb00f8f672fbff5bd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/pci.c
+diff --cc drivers/nvme/host/pci.c
+index 35f7a153bd5e,ba943f211687..000000000000
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@@ -34,6 -36,15 +34,18 @@@
+  #define SQ_SIZE(depth)		(depth * sizeof(struct nvme_command))
+  #define CQ_SIZE(depth)		(depth * sizeof(struct nvme_completion))
+  
+++<<<<<<< HEAD
+++=======
++ #define SGES_PER_PAGE	(PAGE_SIZE / sizeof(struct nvme_sgl_desc))
++ 
++ /*
++  * These can be higher, but we need to ensure that any command doesn't
++  * require an sg allocation that needs more than a page of data.
++  */
++ #define NVME_MAX_KB_SZ	4096
++ #define NVME_MAX_SEGS	127
++ 
+++>>>>>>> 943e942e6266 (nvme-pci: limit max IO size and segments to avoid high order allocations)
+  static int use_threaded_interrupts;
+  module_param(use_threaded_interrupts, int, 0);
+  
+@@@ -420,46 -430,65 +434,50 @@@ static int nvme_pci_map_queues(struct b
+  }
+  
+  /**
+ - * nvme_submit_cmd() - Copy a command into a queue and ring the doorbell
+ + * __nvme_submit_cmd() - Copy a command into a queue and ring the doorbell
+   * @nvmeq: The queue to use
+   * @cmd: The command to send
+ + *
+ + * Safe to use from interrupt context
+   */
+ -static void nvme_submit_cmd(struct nvme_queue *nvmeq, struct nvme_command *cmd)
+ +static void __nvme_submit_cmd(struct nvme_queue *nvmeq,
+ +						struct nvme_command *cmd)
+  {
+ -	spin_lock(&nvmeq->sq_lock);
+ +	u16 tail = nvmeq->sq_tail;
+ +
+  	if (nvmeq->sq_cmds_io)
+ -		memcpy_toio(&nvmeq->sq_cmds_io[nvmeq->sq_tail], cmd,
+ -				sizeof(*cmd));
+ +		memcpy_toio(&nvmeq->sq_cmds_io[tail], cmd, sizeof(*cmd));
+  	else
+ -		memcpy(&nvmeq->sq_cmds[nvmeq->sq_tail], cmd, sizeof(*cmd));
+ +		memcpy(&nvmeq->sq_cmds[tail], cmd, sizeof(*cmd));
+  
+ -	if (++nvmeq->sq_tail == nvmeq->q_depth)
+ -		nvmeq->sq_tail = 0;
+ -	if (nvme_dbbuf_update_and_check_event(nvmeq->sq_tail,
+ -			nvmeq->dbbuf_sq_db, nvmeq->dbbuf_sq_ei))
+ -		writel(nvmeq->sq_tail, nvmeq->q_db);
+ -	spin_unlock(&nvmeq->sq_lock);
+ -}
+ -
+ -static void **nvme_pci_iod_list(struct request *req)
+ -{
+ -	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+ -	return (void **)(iod->sg + blk_rq_nr_phys_segments(req));
+ +	if (++tail == nvmeq->q_depth)
+ +		tail = 0;
+ +	if (nvme_dbbuf_update_and_check_event(tail, nvmeq->dbbuf_sq_db,
+ +					      nvmeq->dbbuf_sq_ei))
+ +		writel(tail, nvmeq->q_db);
+ +	nvmeq->sq_tail = tail;
+  }
+  
+ -static inline bool nvme_pci_use_sgls(struct nvme_dev *dev, struct request *req)
+ +static __le64 **iod_list(struct request *req)
+  {
+  	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+ -	int nseg = blk_rq_nr_phys_segments(req);
+ -	unsigned int avg_seg_size;
+ -
+ -	if (nseg == 0)
+ -		return false;
+ -
+ -	avg_seg_size = DIV_ROUND_UP(blk_rq_payload_bytes(req), nseg);
+ -
+ -	if (!(dev->ctrl.sgls & ((1 << 0) | (1 << 1))))
+ -		return false;
+ -	if (!iod->nvmeq->qid)
+ -		return false;
+ -	if (!sgl_threshold || avg_seg_size < sgl_threshold)
+ -		return false;
+ -	return true;
+ +	return (__le64 **)(iod->sg + req->nr_phys_segments);
+  }
+  
+ -static blk_status_t nvme_init_iod(struct request *rq, struct nvme_dev *dev)
+ +static int nvme_init_iod(struct request *rq, unsigned size,
+ +		struct nvme_dev *dev)
+  {
+  	struct nvme_iod *iod = blk_mq_rq_to_pdu(rq);
+ -	int nseg = blk_rq_nr_phys_segments(rq);
+ -	unsigned int size = blk_rq_payload_bytes(rq);
+ -
+ -	iod->use_sgl = nvme_pci_use_sgls(dev, rq);
+ +	int nseg = rq->nr_phys_segments;
+  
+  	if (nseg > NVME_INT_PAGES || size > NVME_INT_BYTES(dev)) {
+++<<<<<<< HEAD
+ +		iod->sg = kmalloc(nvme_iod_alloc_size(dev, size, nseg), GFP_ATOMIC);
+++=======
++ 		iod->sg = mempool_alloc(dev->iod_mempool, GFP_ATOMIC);
+++>>>>>>> 943e942e6266 (nvme-pci: limit max IO size and segments to avoid high order allocations)
+  		if (!iod->sg)
+ -			return BLK_STS_RESOURCE;
+ +			return BLK_MQ_RQ_QUEUE_BUSY;
+  	} else {
+  		iod->sg = iod->inline_sg;
+  	}
+@@@ -492,11 -532,92 +510,11 @@@ static void nvme_free_iod(struct nvme_d
+  	}
+  
+  	if (iod->sg != iod->inline_sg)
+- 		kfree(iod->sg);
++ 		mempool_free(iod->sg, dev->iod_mempool);
+  }
+  
+ -#ifdef CONFIG_BLK_DEV_INTEGRITY
+ -static void nvme_dif_prep(u32 p, u32 v, struct t10_pi_tuple *pi)
+ -{
+ -	if (be32_to_cpu(pi->ref_tag) == v)
+ -		pi->ref_tag = cpu_to_be32(p);
+ -}
+ -
+ -static void nvme_dif_complete(u32 p, u32 v, struct t10_pi_tuple *pi)
+ -{
+ -	if (be32_to_cpu(pi->ref_tag) == p)
+ -		pi->ref_tag = cpu_to_be32(v);
+ -}
+ -
+ -/**
+ - * nvme_dif_remap - remaps ref tags to bip seed and physical lba
+ - *
+ - * The virtual start sector is the one that was originally submitted by the
+ - * block layer.	Due to partitioning, MD/DM cloning, etc. the actual physical
+ - * start sector may be different. Remap protection information to match the
+ - * physical LBA on writes, and back to the original seed on reads.
+ - *
+ - * Type 0 and 3 do not have a ref tag, so no remapping required.
+ - */
+ -static void nvme_dif_remap(struct request *req,
+ -			void (*dif_swap)(u32 p, u32 v, struct t10_pi_tuple *pi))
+ -{
+ -	struct nvme_ns *ns = req->rq_disk->private_data;
+ -	struct bio_integrity_payload *bip;
+ -	struct t10_pi_tuple *pi;
+ -	void *p, *pmap;
+ -	u32 i, nlb, ts, phys, virt;
+ -
+ -	if (!ns->pi_type || ns->pi_type == NVME_NS_DPS_PI_TYPE3)
+ -		return;
+ -
+ -	bip = bio_integrity(req->bio);
+ -	if (!bip)
+ -		return;
+ -
+ -	pmap = kmap_atomic(bip->bip_vec->bv_page) + bip->bip_vec->bv_offset;
+ -
+ -	p = pmap;
+ -	virt = bip_get_seed(bip);
+ -	phys = nvme_block_nr(ns, blk_rq_pos(req));
+ -	nlb = (blk_rq_bytes(req) >> ns->lba_shift);
+ -	ts = ns->disk->queue->integrity.tuple_size;
+ -
+ -	for (i = 0; i < nlb; i++, virt++, phys++) {
+ -		pi = (struct t10_pi_tuple *)p;
+ -		dif_swap(phys, virt, pi);
+ -		p += ts;
+ -	}
+ -	kunmap_atomic(pmap);
+ -}
+ -#else /* CONFIG_BLK_DEV_INTEGRITY */
+ -static void nvme_dif_remap(struct request *req,
+ -			void (*dif_swap)(u32 p, u32 v, struct t10_pi_tuple *pi))
+ -{
+ -}
+ -static void nvme_dif_prep(u32 p, u32 v, struct t10_pi_tuple *pi)
+ -{
+ -}
+ -static void nvme_dif_complete(u32 p, u32 v, struct t10_pi_tuple *pi)
+ -{
+ -}
+ -#endif
+ -
+ -static void nvme_print_sgl(struct scatterlist *sgl, int nents)
+ -{
+ -	int i;
+ -	struct scatterlist *sg;
+ -
+ -	for_each_sg(sgl, sg, nents, i) {
+ -		dma_addr_t phys = sg_phys(sg);
+ -		pr_warn("sg[%d] phys_addr:%pad offset:%d length:%d "
+ -			"dma_address:%pad dma_length:%d\n",
+ -			i, &phys, sg->offset, sg->length, &sg_dma_address(sg),
+ -			sg_dma_len(sg));
+ -	}
+ -}
+ -
+ -static blk_status_t nvme_pci_setup_prps(struct nvme_dev *dev,
+ -		struct request *req, struct nvme_rw_command *cmnd)
+ +static bool nvme_setup_prps(struct nvme_dev *dev, struct request *req,
+ +		int total_len)
+  {
+  	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+  	struct dma_pool *pool;
+@@@ -2026,6 -2285,8 +2044,11 @@@ static void nvme_pci_free_ctrl(struct n
+  	if (dev->ctrl.admin_q)
+  		blk_put_queue(dev->ctrl.admin_q);
+  	kfree(dev->queues);
+++<<<<<<< HEAD
+++=======
++ 	free_opal_dev(dev->ctrl.opal_dev);
++ 	mempool_destroy(dev->iod_mempool);
+++>>>>>>> 943e942e6266 (nvme-pci: limit max IO size and segments to avoid high order allocations)
+  	kfree(dev);
+  }
+  
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index cb5cd8fffb1e..a7cb8c15c1e0 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -1540,6 +1540,7 @@ static void nvme_set_queue_limits(struct nvme_ctrl *ctrl,
+ 		u32 max_segments =
+ 			(ctrl->max_hw_sectors / (ctrl->page_size >> 9)) + 1;
+ 
++		max_segments = min_not_zero(max_segments, ctrl->max_segments);
+ 		blk_queue_max_hw_sectors(q, ctrl->max_hw_sectors);
+ 		blk_queue_max_segments(q, min_t(u32, max_segments, USHRT_MAX));
+ 	}
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index 1df52e285852..37d7b2827d9f 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -148,6 +148,7 @@ struct nvme_ctrl {
+ 	u64 cap;
+ 	u32 page_size;
+ 	u32 max_hw_sectors;
++	u32 max_segments;
+ 	u16 oncs;
+ 	u16 vid;
+ 	u16 oacs;
+* Unmerged path drivers/nvme/host/pci.c
