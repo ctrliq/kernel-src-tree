@@ -1,0 +1,243 @@
+fs: Treat foreign mounts as nosuid
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [fs] Treat foreign mounts as nosuid ("Eric W. Biederman") [1487751]
+Rebuild_FUZZ: 93.75%
+commit-author Andy Lutomirski <luto@amacapital.net>
+commit 380cf5ba6b0a0b307f4afb62b186ca801defb203
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/380cf5ba.failed
+
+If a process gets access to a mount from a different user
+namespace, that process should not be able to take advantage of
+setuid files or selinux entrypoints from that filesystem.  Prevent
+this by treating mounts from other mount namespaces and those not
+owned by current_user_ns() or an ancestor as nosuid.
+
+This will make it safer to allow more complex filesystems to be
+mounted in non-root user namespaces.
+
+This does not remove the need for MNT_LOCK_NOSUID.  The setuid,
+setgid, and file capability bits can no longer be abused if code in
+a user namespace were to clear nosuid on an untrusted filesystem,
+but this patch, by itself, is insufficient to protect the system
+from abuse of files that, when execed, would increase MAC privilege.
+
+As a more concrete explanation, any task that can manipulate a
+vfsmount associated with a given user namespace already has
+capabilities in that namespace and all of its descendents.  If they
+can cause a malicious setuid, setgid, or file-caps executable to
+appear in that mount, then that executable will only allow them to
+elevate privileges in exactly the set of namespaces in which they
+are already privileges.
+
+On the other hand, if they can cause a malicious executable to
+appear with a dangerous MAC label, running it could change the
+caller's security context in a way that should not have been
+possible, even inside the namespace in which the task is confined.
+
+As a hardening measure, this would have made CVE-2014-5207 much
+more difficult to exploit.
+
+	Signed-off-by: Andy Lutomirski <luto@amacapital.net>
+	Signed-off-by: Seth Forshee <seth.forshee@canonical.com>
+	Acked-by: James Morris <james.l.morris@oracle.com>
+	Acked-by: Serge Hallyn <serge.hallyn@canonical.com>
+	Signed-off-by: Eric W. Biederman <ebiederm@xmission.com>
+(cherry picked from commit 380cf5ba6b0a0b307f4afb62b186ca801defb203)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/namespace.c
+#	security/commoncap.c
+diff --cc fs/namespace.c
+index 84149742b9d6,aabe8e397fc3..000000000000
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@@ -3296,23 -3202,100 +3296,63 @@@ void update_mnt_policy(struct user_name
+  
+  	down_read(&namespace_sem);
+  	list_for_each_entry(mnt, &ns->list, mnt_list) {
+ -		struct mount *child;
+ -		int mnt_flags;
+ -
+ -		if (mnt->mnt.mnt_sb->s_type != new->mnt_sb->s_type)
+ -			continue;
+ -
+ -		/* This mount is not fully visible if it's root directory
+ -		 * is not the root directory of the filesystem.
+ -		 */
+ -		if (mnt->mnt.mnt_root != mnt->mnt.mnt_sb->s_root)
+ -			continue;
+ -
+ -		/* A local view of the mount flags */
+ -		mnt_flags = mnt->mnt.mnt_flags;
+ -
+ -		/* Don't miss readonly hidden in the superblock flags */
+ -		if (mnt->mnt.mnt_sb->s_flags & MS_RDONLY)
+ -			mnt_flags |= MNT_LOCK_READONLY;
+ -
+ -		/* Verify the mount flags are equal to or more permissive
+ -		 * than the proposed new mount.
+ -		 */
+ -		if ((mnt_flags & MNT_LOCK_READONLY) &&
+ -		    !(new_flags & MNT_READONLY))
+ -			continue;
+ -		if ((mnt_flags & MNT_LOCK_ATIME) &&
+ -		    ((mnt_flags & MNT_ATIME_MASK) != (new_flags & MNT_ATIME_MASK)))
+ -			continue;
+ -
+ -		/* This mount is not fully visible if there are any
+ -		 * locked child mounts that cover anything except for
+ -		 * empty directories.
+ -		 */
+ -		list_for_each_entry(child, &mnt->mnt_mounts, mnt_child) {
+ -			struct inode *inode = child->mnt_mountpoint->d_inode;
+ -			/* Only worry about locked mounts */
+ -			if (!(child->mnt.mnt_flags & MNT_LOCKED))
+ -				continue;
+ -			/* Is the directory permanetly empty? */
+ -			if (!is_empty_dir_inode(inode))
+ -				goto next;
+ +		switch (mnt->mnt.mnt_sb->s_magic) {
+ +		case SYSFS_MAGIC:
+ +			userns->may_mount_sysfs = true;
+ +			break;
+ +		case PROC_SUPER_MAGIC:
+ +			userns->may_mount_proc = true;
+ +			break;
+  		}
+ -		/* Preserve the locked attributes */
+ -		*new_mnt_flags |= mnt_flags & (MNT_LOCK_READONLY | \
+ -					       MNT_LOCK_ATIME);
+ -		visible = true;
+ -		goto found;
+ -	next:	;
+ -	}
+ -found:
+ +		if (userns->may_mount_sysfs && userns->may_mount_proc)
+ +			break;
+ +	}
+  	up_read(&namespace_sem);
+ -	return visible;
+  }
+  
+ -static bool mount_too_revealing(struct vfsmount *mnt, int *new_mnt_flags)
+ +static void *mntns_get(struct task_struct *task)
+  {
+++<<<<<<< HEAD
+ +	struct mnt_namespace *ns = NULL;
+++=======
++ 	const unsigned long required_iflags = SB_I_NOEXEC | SB_I_NODEV;
++ 	struct mnt_namespace *ns = current->nsproxy->mnt_ns;
++ 	unsigned long s_iflags;
++ 
++ 	if (ns->user_ns == &init_user_ns)
++ 		return false;
++ 
++ 	/* Can this filesystem be too revealing? */
++ 	s_iflags = mnt->mnt_sb->s_iflags;
++ 	if (!(s_iflags & SB_I_USERNS_VISIBLE))
++ 		return false;
++ 
++ 	if ((s_iflags & required_iflags) != required_iflags) {
++ 		WARN_ONCE(1, "Expected s_iflags to contain 0x%lx\n",
++ 			  required_iflags);
++ 		return true;
++ 	}
++ 
++ 	return !mnt_already_visible(ns, mnt, new_mnt_flags);
++ }
++ 
++ bool mnt_may_suid(struct vfsmount *mnt)
++ {
++ 	/*
++ 	 * Foreign mounts (accessed via fchdir or through /proc
++ 	 * symlinks) are always treated as if they are nosuid.  This
++ 	 * prevents namespaces from trusting potentially unsafe
++ 	 * suid/sgid bits, file caps, or security labels that originate
++ 	 * in other namespaces.
++ 	 */
++ 	return !(mnt->mnt_flags & MNT_NOSUID) && check_mnt(real_mount(mnt)) &&
++ 	       current_in_userns(mnt->mnt_sb->s_user_ns);
++ }
++ 
++ static struct ns_common *mntns_get(struct task_struct *task)
++ {
++ 	struct ns_common *ns = NULL;
+++>>>>>>> 380cf5ba6b0a (fs: Treat foreign mounts as nosuid)
+  	struct nsproxy *nsproxy;
+  
+  	task_lock(task);
+diff --cc security/commoncap.c
+index 9fb6de81bb8f,14540bd78561..000000000000
+--- a/security/commoncap.c
++++ b/security/commoncap.c
+@@@ -454,12 -453,18 +454,23 @@@ static int get_file_caps(struct linux_b
+  	if (!file_caps_enabled)
+  		return 0;
+  
+- 	if (bprm->file->f_path.mnt->mnt_flags & MNT_NOSUID)
++ 	if (!mnt_may_suid(bprm->file->f_path.mnt))
+  		return 0;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/*
++ 	 * This check is redundant with mnt_may_suid() but is kept to make
++ 	 * explicit that capability bits are limited to s_user_ns and its
++ 	 * descendants.
++ 	 */
++ 	if (!current_in_userns(bprm->file->f_path.mnt->mnt_sb->s_user_ns))
++ 		return 0;
+++>>>>>>> 380cf5ba6b0a (fs: Treat foreign mounts as nosuid)
+ +
+ +	dentry = dget(bprm->file->f_dentry);
+  
+ -	rc = get_vfs_caps_from_disk(bprm->file->f_path.dentry, &vcaps);
+ +	rc = get_vfs_caps_from_disk(dentry, &vcaps);
+  	if (rc < 0) {
+  		if (rc == -EINVAL)
+  			printk(KERN_NOTICE "%s: get_vfs_caps_from_disk returned %d for %s\n",
+diff --git a/fs/exec.c b/fs/exec.c
+index 9ca6d51722de..bf84283b2f7b 100644
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@ -1246,7 +1246,7 @@ static void bprm_fill_uid(struct linux_binprm *bprm)
+ 	bprm->cred->euid = current_euid();
+ 	bprm->cred->egid = current_egid();
+ 
+-	if (bprm->file->f_path.mnt->mnt_flags & MNT_NOSUID)
++	if (!mnt_may_suid(bprm->file->f_path.mnt))
+ 		return;
+ 
+ 	if (current->no_new_privs)
+* Unmerged path fs/namespace.c
+diff --git a/include/linux/mount.h b/include/linux/mount.h
+index 952d044c1eba..11ee64bddc7a 100644
+--- a/include/linux/mount.h
++++ b/include/linux/mount.h
+@@ -81,6 +81,7 @@ extern void mntput(struct vfsmount *mnt);
+ extern struct vfsmount *mntget(struct vfsmount *mnt);
+ extern struct vfsmount *mnt_clone_internal(struct path *path);
+ extern int __mnt_is_readonly(struct vfsmount *mnt);
++extern bool mnt_may_suid(struct vfsmount *mnt);
+ 
+ struct path;
+ extern struct vfsmount *clone_private_mount(struct path *path);
+* Unmerged path security/commoncap.c
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index 7c150cbbfbc6..958689a4a087 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -2199,7 +2199,7 @@ static int check_nnp_nosuid(const struct linux_binprm *bprm,
+ 			    const struct task_security_struct *new_tsec)
+ {
+ 	int nnp = (bprm->unsafe & LSM_UNSAFE_NO_NEW_PRIVS);
+-	int nosuid = (bprm->file->f_path.mnt->mnt_flags & MNT_NOSUID);
++	int nosuid = !mnt_may_suid(bprm->file->f_path.mnt);
+ 	int rc;
+ 
+ 	if (!nnp && !nosuid)
