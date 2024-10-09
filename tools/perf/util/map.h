@@ -259,4 +259,6 @@ static inline bool __map__is_kmodule(const struct map *map)
 	return !__map__is_kernel(map);
 }
 
+bool map__has_symbols(const struct map *map);
+
 #endif /* __PERF_MAP_H */
