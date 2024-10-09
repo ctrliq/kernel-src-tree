@@ -1,0 +1,416 @@
+IB/hfi1,qib: Do not send QKey trap for UD qps
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [infiniband] ib/hfi1, qib: Do not send QKey trap for UD qps (Don Dutile) [1499364 1451799 1452789]
+Rebuild_FUZZ: 98.90%
+commit-author Dennis Dalessandro <dennis.dalessandro@intel.com>
+commit 13d84914db56c1afd1c9bf4f41e9bf91f061a7dd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/13d84914.failed
+
+According to IBTA spec a QKey violation should not result in a bad qkey
+trap being triggered for UD queue pairs. Also since it is a silent error
+we do not increment the q_key violation or the dropped packet counters.
+
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 13d84914db56c1afd1c9bf4f41e9bf91f061a7dd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hfi1/ruc.c
+#	drivers/infiniband/hw/hfi1/ud.c
+#	drivers/infiniband/hw/qib/qib_ud.c
+diff --cc drivers/infiniband/hw/hfi1/ruc.c
+index 35ef30189ff5,9cf506a9a796..000000000000
+--- a/drivers/infiniband/hw/hfi1/ruc.c
++++ b/drivers/infiniband/hw/hfi1/ruc.c
+@@@ -219,76 -218,87 +219,92 @@@ int hfi1_ruc_check_hdr(struct hfi1_ibpo
+  {
+  	__be64 guid;
+  	unsigned long flags;
+ -	struct rvt_qp *qp = packet->qp;
+ -	u8 sc5 = ibp->sl_to_sc[rdma_ah_get_sl(&qp->remote_ah_attr)];
+ -	u32 dlid = packet->dlid;
+ -	u32 slid = packet->slid;
+ -	u32 sl = packet->sl;
+ -	int migrated;
+ -	u32 bth0, bth1;
+ -
+ -	bth0 = be32_to_cpu(packet->ohdr->bth[0]);
+ -	bth1 = be32_to_cpu(packet->ohdr->bth[1]);
+ -	migrated = bth0 & IB_BTH_MIG_REQ;
+ -
+ -	if (qp->s_mig_state == IB_MIG_ARMED && migrated) {
+ -		if (!packet->grh) {
+ -			if (rdma_ah_get_ah_flags(&qp->alt_ah_attr) &
+ -			    IB_AH_GRH)
+ -				return 1;
+ +	u8 sc5 = ibp->sl_to_sc[qp->remote_ah_attr.sl];
+ +
+ +	if (qp->s_mig_state == IB_MIG_ARMED && (bth0 & IB_BTH_MIG_REQ)) {
+ +		if (!has_grh) {
+ +			if (qp->alt_ah_attr.ah_flags & IB_AH_GRH)
+ +				goto err;
+  		} else {
+ -			const struct ib_global_route *grh;
+ -
+ -			if (!(rdma_ah_get_ah_flags(&qp->alt_ah_attr) &
+ -			      IB_AH_GRH))
+ -				return 1;
+ -			grh = rdma_ah_read_grh(&qp->alt_ah_attr);
+ -			guid = get_sguid(ibp, grh->sgid_index);
+ -			if (!gid_ok(&packet->grh->dgid, ibp->rvp.gid_prefix,
+ +			if (!(qp->alt_ah_attr.ah_flags & IB_AH_GRH))
+ +				goto err;
+ +			guid = get_sguid(ibp, qp->alt_ah_attr.grh.sgid_index);
+ +			if (!gid_ok(&hdr->u.l.grh.dgid, ibp->rvp.gid_prefix,
+  				    guid))
+ -				return 1;
+ +				goto err;
+  			if (!gid_ok(
+ -				&packet->grh->sgid,
+ -				grh->dgid.global.subnet_prefix,
+ -				grh->dgid.global.interface_id))
+ -				return 1;
+ +				&hdr->u.l.grh.sgid,
+ +				qp->alt_ah_attr.grh.dgid.global.subnet_prefix,
+ +				qp->alt_ah_attr.grh.dgid.global.interface_id))
+ +				goto err;
+  		}
+++<<<<<<< HEAD
+ +		if (unlikely(rcv_pkey_check(ppd_from_ibp(ibp), (u16)bth0, sc5,
+ +					    ib_get_slid(hdr)))) {
+ +			hfi1_bad_pqkey(ibp, OPA_TRAP_BAD_P_KEY,
+ +				       (u16)bth0,
+ +				       ib_get_sl(hdr),
+ +				       0, qp->ibqp.qp_num,
+ +				       ib_get_slid(hdr),
+ +				       ib_get_dlid(hdr));
+ +			goto err;
+++=======
++ 		if (unlikely(rcv_pkey_check(ppd_from_ibp(ibp), (u16)bth0,
++ 					    sc5, slid))) {
++ 			hfi1_bad_pkey(ibp, (u16)bth0, sl,
++ 				      0, qp->ibqp.qp_num, slid, dlid);
++ 			return 1;
+++>>>>>>> 13d84914db56 (IB/hfi1,qib: Do not send QKey trap for UD qps)
+  		}
+  		/* Validate the SLID. See Ch. 9.6.1.5 and 17.2.8 */
+ -		if (slid != rdma_ah_get_dlid(&qp->alt_ah_attr) ||
+ -		    ppd_from_ibp(ibp)->port !=
+ -			rdma_ah_get_port_num(&qp->alt_ah_attr))
+ -			return 1;
+ +		if (ib_get_slid(hdr) != qp->alt_ah_attr.dlid ||
+ +		    ppd_from_ibp(ibp)->port != qp->alt_ah_attr.port_num)
+ +			goto err;
+  		spin_lock_irqsave(&qp->s_lock, flags);
+  		hfi1_migrate_qp(qp);
+  		spin_unlock_irqrestore(&qp->s_lock, flags);
+  	} else {
+ -		if (!packet->grh) {
+ -			if (rdma_ah_get_ah_flags(&qp->remote_ah_attr) &
+ -						 IB_AH_GRH)
+ -				return 1;
+ +		if (!has_grh) {
+ +			if (qp->remote_ah_attr.ah_flags & IB_AH_GRH)
+ +				goto err;
+  		} else {
+ -			const struct ib_global_route *grh;
+ -
+ -			if (!(rdma_ah_get_ah_flags(&qp->remote_ah_attr) &
+ -						   IB_AH_GRH))
+ -				return 1;
+ -			grh = rdma_ah_read_grh(&qp->remote_ah_attr);
+ -			guid = get_sguid(ibp, grh->sgid_index);
+ -			if (!gid_ok(&packet->grh->dgid, ibp->rvp.gid_prefix,
+ +			if (!(qp->remote_ah_attr.ah_flags & IB_AH_GRH))
+ +				goto err;
+ +			guid = get_sguid(ibp,
+ +					 qp->remote_ah_attr.grh.sgid_index);
+ +			if (!gid_ok(&hdr->u.l.grh.dgid, ibp->rvp.gid_prefix,
+  				    guid))
+ -				return 1;
+ +				goto err;
+  			if (!gid_ok(
+ -			     &packet->grh->sgid,
+ -			     grh->dgid.global.subnet_prefix,
+ -			     grh->dgid.global.interface_id))
+ -				return 1;
+ +			     &hdr->u.l.grh.sgid,
+ +			     qp->remote_ah_attr.grh.dgid.global.subnet_prefix,
+ +			     qp->remote_ah_attr.grh.dgid.global.interface_id))
+ +				goto err;
+  		}
+++<<<<<<< HEAD
+ +		if (unlikely(rcv_pkey_check(ppd_from_ibp(ibp), (u16)bth0, sc5,
+ +					    ib_get_slid(hdr)))) {
+ +			hfi1_bad_pqkey(ibp, OPA_TRAP_BAD_P_KEY,
+ +				       (u16)bth0,
+ +				       ib_get_sl(hdr),
+ +				       0, qp->ibqp.qp_num,
+ +				       ib_get_slid(hdr),
+ +				       ib_get_dlid(hdr));
+ +			goto err;
+++=======
++ 		if (unlikely(rcv_pkey_check(ppd_from_ibp(ibp), (u16)bth0,
++ 					    sc5, slid))) {
++ 			hfi1_bad_pkey(ibp, (u16)bth0, sl,
++ 				      0, qp->ibqp.qp_num, slid, dlid);
++ 			return 1;
+++>>>>>>> 13d84914db56 (IB/hfi1,qib: Do not send QKey trap for UD qps)
+  		}
+  		/* Validate the SLID. See Ch. 9.6.1.5 */
+ -		if ((slid != rdma_ah_get_dlid(&qp->remote_ah_attr)) ||
+ +		if (ib_get_slid(hdr) != qp->remote_ah_attr.dlid ||
+  		    ppd_from_ibp(ibp)->port != qp->port_num)
+ -			return 1;
+ -		if (qp->s_mig_state == IB_MIG_REARM && !migrated)
+ +			goto err;
+ +		if (qp->s_mig_state == IB_MIG_REARM &&
+ +		    !(bth0 & IB_BTH_MIG_REQ))
+  			qp->s_mig_state = IB_MIG_ARMED;
+  	}
+  
+diff --cc drivers/infiniband/hw/hfi1/ud.c
+index 45bc3f04793e,6bf7a1b08491..000000000000
+--- a/drivers/infiniband/hw/hfi1/ud.c
++++ b/drivers/infiniband/hw/hfi1/ud.c
+@@@ -110,10 -110,10 +110,17 @@@ static void ud_loopback(struct rvt_qp *
+  				   ((1 << ppd->lmc) - 1));
+  		if (unlikely(ingress_pkey_check(ppd, pkey, sc5,
+  						qp->s_pkey_index, slid))) {
+++<<<<<<< HEAD
+ +			hfi1_bad_pqkey(ibp, OPA_TRAP_BAD_P_KEY, pkey,
+ +				       ah_attr->sl,
+ +				       sqp->ibqp.qp_num, qp->ibqp.qp_num,
+ +				       slid, ah_attr->dlid);
+++=======
++ 			hfi1_bad_pkey(ibp, pkey,
++ 				      rdma_ah_get_sl(ah_attr),
++ 				      sqp->ibqp.qp_num, qp->ibqp.qp_num,
++ 				      slid, rdma_ah_get_dlid(ah_attr));
+++>>>>>>> 13d84914db56 (IB/hfi1,qib: Do not send QKey trap for UD qps)
+  			goto drop;
+  		}
+  	}
+@@@ -128,18 -128,8 +135,23 @@@
+  
+  		qkey = (int)swqe->ud_wr.remote_qkey < 0 ?
+  			sqp->qkey : swqe->ud_wr.remote_qkey;
+++<<<<<<< HEAD
+ +		if (unlikely(qkey != qp->qkey)) {
+ +			u16 lid;
+ +
+ +			lid = ppd->lid | (ah_attr->src_path_bits &
+ +					  ((1 << ppd->lmc) - 1));
+ +			hfi1_bad_pqkey(ibp, OPA_TRAP_BAD_Q_KEY, qkey,
+ +				       ah_attr->sl,
+ +				       sqp->ibqp.qp_num, qp->ibqp.qp_num,
+ +				       lid,
+ +				       ah_attr->dlid);
+ +			goto drop;
+ +		}
+++=======
++ 		if (unlikely(qkey != qp->qkey))
++ 			goto drop; /* silently drop per IBTA spec */
+++>>>>>>> 13d84914db56 (IB/hfi1,qib: Do not send QKey trap for UD qps)
+  	}
+  
+  	/*
+diff --cc drivers/infiniband/hw/qib/qib_ud.c
+index ddd4e7458750,be4907453ac4..000000000000
+--- a/drivers/infiniband/hw/qib/qib_ud.c
++++ b/drivers/infiniband/hw/qib/qib_ud.c
+@@@ -92,13 -91,13 +91,21 @@@ static void qib_ud_loopback(struct rvt_
+  		pkey1 = qib_get_pkey(ibp, sqp->s_pkey_index);
+  		pkey2 = qib_get_pkey(ibp, qp->s_pkey_index);
+  		if (unlikely(!qib_pkey_ok(pkey1, pkey2))) {
+ -			lid = ppd->lid | (rdma_ah_get_path_bits(ah_attr) &
+ +			lid = ppd->lid | (ah_attr->src_path_bits &
+  					  ((1 << ppd->lmc) - 1));
+++<<<<<<< HEAD
+ +			qib_bad_pqkey(ibp, IB_NOTICE_TRAP_BAD_PKEY, pkey1,
+ +				      ah_attr->sl,
+ +				      sqp->ibqp.qp_num, qp->ibqp.qp_num,
+ +				      cpu_to_be16(lid),
+ +				      cpu_to_be16(ah_attr->dlid));
+++=======
++ 			qib_bad_pkey(ibp, pkey1,
++ 				     rdma_ah_get_sl(ah_attr),
++ 				     sqp->ibqp.qp_num, qp->ibqp.qp_num,
++ 				     cpu_to_be16(lid),
++ 				     cpu_to_be16(rdma_ah_get_dlid(ah_attr)));
+++>>>>>>> 13d84914db56 (IB/hfi1,qib: Do not send QKey trap for UD qps)
+  			goto drop;
+  		}
+  	}
+@@@ -113,18 -112,8 +120,21 @@@
+  
+  		qkey = (int)swqe->ud_wr.remote_qkey < 0 ?
+  			sqp->qkey : swqe->ud_wr.remote_qkey;
+++<<<<<<< HEAD
+ +		if (unlikely(qkey != qp->qkey)) {
+ +			u16 lid;
+ +
+ +			lid = ppd->lid | (ah_attr->src_path_bits &
+ +					  ((1 << ppd->lmc) - 1));
+ +			qib_bad_pqkey(ibp, IB_NOTICE_TRAP_BAD_QKEY, qkey,
+ +				      ah_attr->sl,
+ +				      sqp->ibqp.qp_num, qp->ibqp.qp_num,
+ +				      cpu_to_be16(lid),
+ +				      cpu_to_be16(ah_attr->dlid));
+++=======
++ 		if (unlikely(qkey != qp->qkey))
+++>>>>>>> 13d84914db56 (IB/hfi1,qib: Do not send QKey trap for UD qps)
+  			goto drop;
+- 		}
+  	}
+  
+  	/*
+diff --git a/drivers/infiniband/hw/hfi1/mad.c b/drivers/infiniband/hw/hfi1/mad.c
+index d59426fb9866..fd1f06edf180 100644
+--- a/drivers/infiniband/hw/hfi1/mad.c
++++ b/drivers/infiniband/hw/hfi1/mad.c
+@@ -180,10 +180,10 @@ static void send_trap(struct hfi1_ibport *ibp, void *data, unsigned len)
+ }
+ 
+ /*
+- * Send a bad [PQ]_Key trap (ch. 14.3.8).
++ * Send a bad P_Key trap (ch. 14.3.8).
+  */
+-void hfi1_bad_pqkey(struct hfi1_ibport *ibp, __be16 trap_num, u32 key, u32 sl,
+-		    u32 qp1, u32 qp2, u16 lid1, u16 lid2)
++void hfi1_bad_pkey(struct hfi1_ibport *ibp, u32 key, u32 sl,
++		   u32 qp1, u32 qp2, u16 lid1, u16 lid2)
+ {
+ 	struct opa_mad_notice_attr data;
+ 	u32 lid = ppd_from_ibp(ibp)->lid;
+@@ -191,17 +191,13 @@ void hfi1_bad_pqkey(struct hfi1_ibport *ibp, __be16 trap_num, u32 key, u32 sl,
+ 	u32 _lid2 = lid2;
+ 
+ 	memset(&data, 0, sizeof(data));
+-
+-	if (trap_num == OPA_TRAP_BAD_P_KEY)
+-		ibp->rvp.pkey_violations++;
+-	else
+-		ibp->rvp.qkey_violations++;
+ 	ibp->rvp.n_pkt_drops++;
++	ibp->rvp.pkey_violations++;
+ 
+ 	/* Send violation trap */
+ 	data.generic_type = IB_NOTICE_TYPE_SECURITY;
+ 	data.prod_type_lsb = IB_NOTICE_PROD_CA;
+-	data.trap_num = trap_num;
++	data.trap_num = OPA_TRAP_BAD_P_KEY;
+ 	data.issuer_lid = cpu_to_be32(lid);
+ 	data.ntc_257_258.lid1 = cpu_to_be32(_lid1);
+ 	data.ntc_257_258.lid2 = cpu_to_be32(_lid2);
+* Unmerged path drivers/infiniband/hw/hfi1/ruc.c
+* Unmerged path drivers/infiniband/hw/hfi1/ud.c
+diff --git a/drivers/infiniband/hw/hfi1/verbs.h b/drivers/infiniband/hw/hfi1/verbs.h
+index 76081f770f70..56bd1054eb48 100644
+--- a/drivers/infiniband/hw/hfi1/verbs.h
++++ b/drivers/infiniband/hw/hfi1/verbs.h
+@@ -236,8 +236,8 @@ static inline int hfi1_send_ok(struct rvt_qp *qp)
+ /*
+  * This must be called with s_lock held.
+  */
+-void hfi1_bad_pqkey(struct hfi1_ibport *ibp, __be16 trap_num, u32 key, u32 sl,
+-		    u32 qp1, u32 qp2, u16 lid1, u16 lid2);
++void hfi1_bad_pkey(struct hfi1_ibport *ibp, u32 key, u32 sl,
++		   u32 qp1, u32 qp2, u16 lid1, u16 lid2);
+ void hfi1_cap_mask_chg(struct rvt_dev_info *rdi, u8 port_num);
+ void hfi1_sys_guid_chg(struct hfi1_ibport *ibp);
+ void hfi1_node_desc_chg(struct hfi1_ibport *ibp);
+diff --git a/drivers/infiniband/hw/qib/qib_mad.c b/drivers/infiniband/hw/qib/qib_mad.c
+index d2ac29861af5..249f386f27d6 100644
+--- a/drivers/infiniband/hw/qib/qib_mad.c
++++ b/drivers/infiniband/hw/qib/qib_mad.c
+@@ -134,24 +134,21 @@ static void qib_send_trap(struct qib_ibport *ibp, void *data, unsigned len)
+ }
+ 
+ /*
+- * Send a bad [PQ]_Key trap (ch. 14.3.8).
++ * Send a bad P_Key trap (ch. 14.3.8).
+  */
+-void qib_bad_pqkey(struct qib_ibport *ibp, __be16 trap_num, u32 key, u32 sl,
+-		   u32 qp1, u32 qp2, __be16 lid1, __be16 lid2)
++void qib_bad_pkey(struct qib_ibport *ibp, u32 key, u32 sl,
++		  u32 qp1, u32 qp2, __be16 lid1, __be16 lid2)
+ {
+ 	struct ib_mad_notice_attr data;
+ 
+-	if (trap_num == IB_NOTICE_TRAP_BAD_PKEY)
+-		ibp->rvp.pkey_violations++;
+-	else
+-		ibp->rvp.qkey_violations++;
+ 	ibp->rvp.n_pkt_drops++;
++	ibp->rvp.pkey_violations++;
+ 
+ 	/* Send violation trap */
+ 	data.generic_type = IB_NOTICE_TYPE_SECURITY;
+ 	data.prod_type_msb = 0;
+ 	data.prod_type_lsb = IB_NOTICE_PROD_CA;
+-	data.trap_num = trap_num;
++	data.trap_num = IB_NOTICE_TRAP_BAD_PKEY;
+ 	data.issuer_lid = cpu_to_be16(ppd_from_ibp(ibp)->lid);
+ 	data.toggle_count = 0;
+ 	memset(&data.details, 0, sizeof(data.details));
+diff --git a/drivers/infiniband/hw/qib/qib_ruc.c b/drivers/infiniband/hw/qib/qib_ruc.c
+index 2c0fa28ecea5..f4d5abcb6f68 100644
+--- a/drivers/infiniband/hw/qib/qib_ruc.c
++++ b/drivers/infiniband/hw/qib/qib_ruc.c
+@@ -251,11 +251,11 @@ int qib_ruc_check_hdr(struct qib_ibport *ibp, struct ib_header *hdr,
+ 		}
+ 		if (!qib_pkey_ok((u16)bth0,
+ 				 qib_get_pkey(ibp, qp->s_alt_pkey_index))) {
+-			qib_bad_pqkey(ibp, IB_NOTICE_TRAP_BAD_PKEY,
+-				      (u16)bth0,
+-				      (be16_to_cpu(hdr->lrh[0]) >> 4) & 0xF,
+-				      0, qp->ibqp.qp_num,
+-				      hdr->lrh[3], hdr->lrh[1]);
++			qib_bad_pkey(ibp,
++				     (u16)bth0,
++				     (be16_to_cpu(hdr->lrh[0]) >> 4) & 0xF,
++				     0, qp->ibqp.qp_num,
++				     hdr->lrh[3], hdr->lrh[1]);
+ 			goto err;
+ 		}
+ 		/* Validate the SLID. See Ch. 9.6.1.5 and 17.2.8 */
+@@ -284,11 +284,11 @@ int qib_ruc_check_hdr(struct qib_ibport *ibp, struct ib_header *hdr,
+ 		}
+ 		if (!qib_pkey_ok((u16)bth0,
+ 				 qib_get_pkey(ibp, qp->s_pkey_index))) {
+-			qib_bad_pqkey(ibp, IB_NOTICE_TRAP_BAD_PKEY,
+-				      (u16)bth0,
+-				      (be16_to_cpu(hdr->lrh[0]) >> 4) & 0xF,
+-				      0, qp->ibqp.qp_num,
+-				      hdr->lrh[3], hdr->lrh[1]);
++			qib_bad_pkey(ibp,
++				     (u16)bth0,
++				     (be16_to_cpu(hdr->lrh[0]) >> 4) & 0xF,
++				     0, qp->ibqp.qp_num,
++				     hdr->lrh[3], hdr->lrh[1]);
+ 			goto err;
+ 		}
+ 		/* Validate the SLID. See Ch. 9.6.1.5 */
+* Unmerged path drivers/infiniband/hw/qib/qib_ud.c
+diff --git a/drivers/infiniband/hw/qib/qib_verbs.h b/drivers/infiniband/hw/qib/qib_verbs.h
+index ce53145c2631..902a68962253 100644
+--- a/drivers/infiniband/hw/qib/qib_verbs.h
++++ b/drivers/infiniband/hw/qib/qib_verbs.h
+@@ -241,8 +241,8 @@ static inline int qib_pkey_ok(u16 pkey1, u16 pkey2)
+ 	return p1 && p1 == p2 && ((__s16)pkey1 < 0 || (__s16)pkey2 < 0);
+ }
+ 
+-void qib_bad_pqkey(struct qib_ibport *ibp, __be16 trap_num, u32 key, u32 sl,
+-		   u32 qp1, u32 qp2, __be16 lid1, __be16 lid2);
++void qib_bad_pkey(struct qib_ibport *ibp, u32 key, u32 sl,
++		  u32 qp1, u32 qp2, __be16 lid1, __be16 lid2);
+ void qib_cap_mask_chg(struct rvt_dev_info *rdi, u8 port_num);
+ void qib_sys_guid_chg(struct qib_ibport *ibp);
+ void qib_node_desc_chg(struct qib_ibport *ibp);
