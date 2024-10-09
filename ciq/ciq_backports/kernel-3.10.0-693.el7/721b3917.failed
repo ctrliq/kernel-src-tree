@@ -1,0 +1,181 @@
+nvme-fabrics: set sqe.command_id in core not transports
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author James Smart <james.smart@broadcom.com>
+commit 721b3917c4ae222085c6de70c24b73b0e7950b35
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/721b3917.failed
+
+Currently, core.c sets command_id only on rd/wr commands, leaving it to
+the transport to set it again to ensure the request had a command id.
+
+Move location of set in core so applies to all commands.
+Remove transport sets.
+
+	Signed-off-by: James Smart <james.smart@broadcom.com>
+	Reviewed-by: Jay Freyensee <james_p_freyensee@linux.intel.com>
+	Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+(cherry picked from commit 721b3917c4ae222085c6de70c24b73b0e7950b35)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+#	drivers/nvme/host/rdma.c
+#	drivers/nvme/target/loop.c
+diff --cc drivers/nvme/host/core.c
+index 0588703d149f,1b48514fbe99..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -131,6 -225,130 +131,133 @@@ struct request *nvme_alloc_request(stru
+  
+  	return req;
+  }
+++<<<<<<< HEAD
+++=======
++ EXPORT_SYMBOL_GPL(nvme_alloc_request);
++ 
++ static inline void nvme_setup_flush(struct nvme_ns *ns,
++ 		struct nvme_command *cmnd)
++ {
++ 	memset(cmnd, 0, sizeof(*cmnd));
++ 	cmnd->common.opcode = nvme_cmd_flush;
++ 	cmnd->common.nsid = cpu_to_le32(ns->ns_id);
++ }
++ 
++ static inline int nvme_setup_discard(struct nvme_ns *ns, struct request *req,
++ 		struct nvme_command *cmnd)
++ {
++ 	struct nvme_dsm_range *range;
++ 	struct page *page;
++ 	int offset;
++ 	unsigned int nr_bytes = blk_rq_bytes(req);
++ 
++ 	range = kmalloc(sizeof(*range), GFP_ATOMIC);
++ 	if (!range)
++ 		return BLK_MQ_RQ_QUEUE_BUSY;
++ 
++ 	range->cattr = cpu_to_le32(0);
++ 	range->nlb = cpu_to_le32(nr_bytes >> ns->lba_shift);
++ 	range->slba = cpu_to_le64(nvme_block_nr(ns, blk_rq_pos(req)));
++ 
++ 	memset(cmnd, 0, sizeof(*cmnd));
++ 	cmnd->dsm.opcode = nvme_cmd_dsm;
++ 	cmnd->dsm.nsid = cpu_to_le32(ns->ns_id);
++ 	cmnd->dsm.nr = 0;
++ 	cmnd->dsm.attributes = cpu_to_le32(NVME_DSMGMT_AD);
++ 
++ 	req->completion_data = range;
++ 	page = virt_to_page(range);
++ 	offset = offset_in_page(range);
++ 	blk_add_request_payload(req, page, offset, sizeof(*range));
++ 
++ 	/*
++ 	 * we set __data_len back to the size of the area to be discarded
++ 	 * on disk. This allows us to report completion on the full amount
++ 	 * of blocks described by the request.
++ 	 */
++ 	req->__data_len = nr_bytes;
++ 
++ 	return BLK_MQ_RQ_QUEUE_OK;
++ }
++ 
++ static inline void nvme_setup_write_zeroes(struct nvme_ns *ns,
++ 		struct request *req, struct nvme_command *cmnd)
++ {
++ 	struct nvme_write_zeroes_cmd *write_zeroes = &cmnd->write_zeroes;
++ 
++ 	memset(cmnd, 0, sizeof(*cmnd));
++ 	write_zeroes->opcode = nvme_cmd_write_zeroes;
++ 	write_zeroes->nsid = cpu_to_le32(ns->ns_id);
++ 	write_zeroes->slba =
++ 		cpu_to_le64(nvme_block_nr(ns, blk_rq_pos(req)));
++ 	write_zeroes->length =
++ 		cpu_to_le16((blk_rq_bytes(req) >> ns->lba_shift) - 1);
++ 	write_zeroes->control = 0;
++ }
++ 
++ static inline void nvme_setup_rw(struct nvme_ns *ns, struct request *req,
++ 		struct nvme_command *cmnd)
++ {
++ 	u16 control = 0;
++ 	u32 dsmgmt = 0;
++ 
++ 	if (req->cmd_flags & REQ_FUA)
++ 		control |= NVME_RW_FUA;
++ 	if (req->cmd_flags & (REQ_FAILFAST_DEV | REQ_RAHEAD))
++ 		control |= NVME_RW_LR;
++ 
++ 	if (req->cmd_flags & REQ_RAHEAD)
++ 		dsmgmt |= NVME_RW_DSM_FREQ_PREFETCH;
++ 
++ 	memset(cmnd, 0, sizeof(*cmnd));
++ 	cmnd->rw.opcode = (rq_data_dir(req) ? nvme_cmd_write : nvme_cmd_read);
++ 	cmnd->rw.nsid = cpu_to_le32(ns->ns_id);
++ 	cmnd->rw.slba = cpu_to_le64(nvme_block_nr(ns, blk_rq_pos(req)));
++ 	cmnd->rw.length = cpu_to_le16((blk_rq_bytes(req) >> ns->lba_shift) - 1);
++ 
++ 	if (ns->ms) {
++ 		switch (ns->pi_type) {
++ 		case NVME_NS_DPS_PI_TYPE3:
++ 			control |= NVME_RW_PRINFO_PRCHK_GUARD;
++ 			break;
++ 		case NVME_NS_DPS_PI_TYPE1:
++ 		case NVME_NS_DPS_PI_TYPE2:
++ 			control |= NVME_RW_PRINFO_PRCHK_GUARD |
++ 					NVME_RW_PRINFO_PRCHK_REF;
++ 			cmnd->rw.reftag = cpu_to_le32(
++ 					nvme_block_nr(ns, blk_rq_pos(req)));
++ 			break;
++ 		}
++ 		if (!blk_integrity_rq(req))
++ 			control |= NVME_RW_PRINFO_PRACT;
++ 	}
++ 
++ 	cmnd->rw.control = cpu_to_le16(control);
++ 	cmnd->rw.dsmgmt = cpu_to_le32(dsmgmt);
++ }
++ 
++ int nvme_setup_cmd(struct nvme_ns *ns, struct request *req,
++ 		struct nvme_command *cmd)
++ {
++ 	int ret = BLK_MQ_RQ_QUEUE_OK;
++ 
++ 	if (req->cmd_type == REQ_TYPE_DRV_PRIV)
++ 		memcpy(cmd, nvme_req(req)->cmd, sizeof(*cmd));
++ 	else if (req_op(req) == REQ_OP_FLUSH)
++ 		nvme_setup_flush(ns, cmd);
++ 	else if (req_op(req) == REQ_OP_DISCARD)
++ 		ret = nvme_setup_discard(ns, req, cmd);
++ 	else if (req_op(req) == REQ_OP_WRITE_ZEROES)
++ 		nvme_setup_write_zeroes(ns, req, cmd);
++ 	else
++ 		nvme_setup_rw(ns, req, cmd);
++ 
++ 	cmd->common.command_id = req->tag;
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(nvme_setup_cmd);
+++>>>>>>> 721b3917c4ae (nvme-fabrics: set sqe.command_id in core not transports)
+  
+  /*
+   * Returns 0 on success.  If the result is negative, it's a Linux error code;
+* Unmerged path drivers/nvme/host/rdma.c
+* Unmerged path drivers/nvme/target/loop.c
+* Unmerged path drivers/nvme/host/core.c
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 82e66e32363e..e91094a76c08 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -609,7 +609,6 @@ static int nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 	if (ret)
+ 		goto out;
+ 
+-	cmnd.common.command_id = req->tag;
+ 	blk_mq_start_request(req);
+ 
+ 	spin_lock_irq(&nvmeq->q_lock);
+* Unmerged path drivers/nvme/host/rdma.c
+* Unmerged path drivers/nvme/target/loop.c
