@@ -1,0 +1,122 @@
+IB/uverbs: Clarify the kref'ing ordering for alloc_commit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jason Gunthorpe <jgg@mellanox.com>
+commit c561c288463102b12c9089a42c6c2a9f55c4fb53
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/c561c288.failed
+
+The alloc_commit callback makes the uobj visible to other threads,
+and it does so using a 'move' semantic of the uobj kref on the stack
+into the public storage (eg the IDR, uobject list and file_private_data)
+
+Once this is done another thread could start up and trigger deletion
+of the kref. Fortunately cleanup_rwsem happens to prevent this from
+being a bug, but that is a fantastically unclear side effect.
+
+Re-organize things so that alloc_commit is that last thing to touch
+the uobj, get rid of the sneaky implicit dependency on cleanup_rwsem,
+and add a comment reminding that uobj is no longer kref'd after
+alloc_commit.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit c561c288463102b12c9089a42c6c2a9f55c4fb53)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/rdma_core.c
+diff --cc drivers/infiniband/core/rdma_core.c
+index 586f179a9de6,afa03d2f6826..000000000000
+--- a/drivers/infiniband/core/rdma_core.c
++++ b/drivers/infiniband/core/rdma_core.c
+@@@ -509,32 -498,47 +509,66 @@@ out
+  
+  static void alloc_commit_idr_uobject(struct ib_uobject *uobj)
+  {
+++<<<<<<< HEAD
+ +	spin_lock(&uobj->context->ufile->idr_lock);
+++=======
++ 	struct ib_uverbs_file *ufile = uobj->ufile;
++ 
++ 	spin_lock(&ufile->idr_lock);
+++>>>>>>> c561c2884631 (IB/uverbs: Clarify the kref'ing ordering for alloc_commit)
+  	/*
+  	 * We already allocated this IDR with a NULL object, so
+  	 * this shouldn't fail.
++ 	 *
++ 	 * NOTE: Once we set the IDR we loose ownership of our kref on uobj.
++ 	 * It will be put by remove_commit_idr_uobject()
+  	 */
+++<<<<<<< HEAD
+ +	WARN_ON(idr_replace(&uobj->context->ufile->idr,
+ +			    uobj, uobj->id));
+ +	spin_unlock(&uobj->context->ufile->idr_lock);
+++=======
++ 	WARN_ON(idr_replace(&ufile->idr, uobj, uobj->id));
++ 	spin_unlock(&ufile->idr_lock);
+++>>>>>>> c561c2884631 (IB/uverbs: Clarify the kref'ing ordering for alloc_commit)
+  }
+  
+  static void alloc_commit_fd_uobject(struct ib_uobject *uobj)
+  {
+++<<<<<<< HEAD
+ +	struct ib_uobject_file *uobj_file =
+ +		container_of(uobj, struct ib_uobject_file, uobj);
+ +
+ +	fd_install(uobj_file->uobj.id, uobj->object);
+ +	/* This shouldn't be used anymore. Use the file object instead */
+ +	uobj_file->uobj.id = 0;
+ +	/* Get another reference as we export this to the fops */
+ +	uverbs_uobject_get(&uobj_file->uobj);
+++=======
++ 	int fd = uobj->id;
++ 
++ 	/* This shouldn't be used anymore. Use the file object instead */
++ 	uobj->id = 0;
++ 
++ 	/* Get another reference as we export this to the fops */
++ 	uverbs_uobject_get(uobj);
++ 
++ 	/*
++ 	 * NOTE: Once we install the file we loose ownership of our kref on
++ 	 * uobj. It will be put by uverbs_close_fd()
++ 	 */
++ 	fd_install(fd, uobj->object);
+++>>>>>>> c561c2884631 (IB/uverbs: Clarify the kref'ing ordering for alloc_commit)
+  }
+  
++ /*
++  * In all cases rdma_alloc_commit_uobject() consumes the kref to uobj and the
++  * caller can no longer assume uobj is valid.
++  */
+  int rdma_alloc_commit_uobject(struct ib_uobject *uobj)
+  {
+ -	struct ib_uverbs_file *ufile = uobj->ufile;
+ -
+  	/* Cleanup is running. Calling this should have been impossible */
+ -	if (!down_read_trylock(&ufile->cleanup_rwsem)) {
+ +	if (!down_read_trylock(&uobj->context->cleanup_rwsem)) {
+  		int ret;
+  
+  		WARN(true, "ib_uverbs: Cleanup is running while allocating an uobject\n");
+@@@ -550,12 -554,13 +584,13 @@@
+  	assert_uverbs_usecnt(uobj, true);
+  	atomic_set(&uobj->usecnt, 0);
+  
+ -	mutex_lock(&ufile->uobjects_lock);
+ -	list_add(&uobj->list, &ufile->uobjects);
+ -	mutex_unlock(&ufile->uobjects_lock);
+ +	mutex_lock(&uobj->context->uobjects_lock);
+ +	list_add(&uobj->list, &uobj->context->uobjects);
+ +	mutex_unlock(&uobj->context->uobjects_lock);
+  
++ 	/* alloc_commit consumes the uobj kref */
+  	uobj->type->type_class->alloc_commit(uobj);
+ -	up_read(&ufile->cleanup_rwsem);
+ +	up_read(&uobj->context->cleanup_rwsem);
+  
+  	return 0;
+  }
+* Unmerged path drivers/infiniband/core/rdma_core.c
