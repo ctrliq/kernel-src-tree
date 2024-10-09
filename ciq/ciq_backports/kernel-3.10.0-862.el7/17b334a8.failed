@@ -1,0 +1,201 @@
+mlxsw: spectrum_switchdev: Don't warn about valid situations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Ido Schimmel <idosch@mellanox.com>
+commit 17b334a876fe121abbd6634ace83ca58deea4bc5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/17b334a8.failed
+
+Some operations in the bridge driver such as MDB deletion are preformed
+in an atomic context and thus deferred to a process context by the
+switchdev infrastructure.
+
+Therefore, by the time the operation is performed by the underlying
+device driver it's possible the bridge port context is already gone.
+This is especially true for removal flows, but theoretically can also be
+invoked during addition.
+
+Remove the warnings in such situations and return normally.
+
+Fixes: c57529e1d5d8 ("mlxsw: spectrum: Replace vPorts with Port-VLAN")
+Fixes: 3922285d96e7 ("net: bridge: Add support for offloading port attributes")
+	Signed-off-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 17b334a876fe121abbd6634ace83ca58deea4bc5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
+index a7736231096b,73d54df89578..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
+@@@ -332,33 -624,25 +332,40 @@@ static int mlxsw_sp_port_attr_br_flags_
+  	if (switchdev_trans_ph_prepare(trans))
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	if ((uc_flood ^ brport_flags) & BR_FLOOD) {
+ +		err = mlxsw_sp_port_flood_table_set(mlxsw_sp_port,
+ +						    MLXSW_SP_FLOOD_TABLE_UC,
+ +						    !mlxsw_sp_port->uc_flood);
+ +		if (err)
+ +			return err;
+ +	}
+++=======
++ 	bridge_port = mlxsw_sp_bridge_port_find(mlxsw_sp_port->mlxsw_sp->bridge,
++ 						orig_dev);
++ 	if (!bridge_port)
++ 		return 0;
+++>>>>>>> 17b334a876fe (mlxsw: spectrum_switchdev: Don't warn about valid situations)
+  
+ -	err = mlxsw_sp_bridge_port_flood_table_set(mlxsw_sp_port, bridge_port,
+ -						   MLXSW_SP_FLOOD_TYPE_UC,
+ -						   brport_flags & BR_FLOOD);
+ -	if (err)
+ -		return err;
+ -
+ -	err = mlxsw_sp_bridge_port_learning_set(mlxsw_sp_port, bridge_port,
+ -						brport_flags & BR_LEARNING);
+ -	if (err)
+ -		return err;
+ +	if ((learning ^ brport_flags) & BR_LEARNING) {
+ +		err = mlxsw_sp_port_learning_set(mlxsw_sp_port,
+ +						 !mlxsw_sp_port->learning);
+ +		if (err)
+ +			goto err_port_learning_set;
+ +	}
+  
+ -	memcpy(&bridge_port->flags, &brport_flags, sizeof(brport_flags));
+ +	mlxsw_sp_port->uc_flood = brport_flags & BR_FLOOD ? 1 : 0;
+ +	mlxsw_sp_port->learning = brport_flags & BR_LEARNING ? 1 : 0;
+ +	mlxsw_sp_port->learning_sync = brport_flags & BR_LEARNING_SYNC ? 1 : 0;
+  
+  	return 0;
+ +
+ +err_port_learning_set:
+ +	if ((uc_flood ^ brport_flags) & BR_FLOOD)
+ +		mlxsw_sp_port_flood_table_set(mlxsw_sp_port,
+ +					      MLXSW_SP_FLOOD_TABLE_UC,
+ +					      mlxsw_sp_port->uc_flood);
+ +	return err;
+  }
+  
+  static int mlxsw_sp_ageing_set(struct mlxsw_sp *mlxsw_sp, u32 ageing_time)
+@@@ -416,11 -707,53 +423,59 @@@ static int mlxsw_sp_port_attr_mc_router
+  	if (switchdev_trans_ph_prepare(trans))
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	mlxsw_sp_port->mc_router = is_port_mc_router;
+ +	if (!mlxsw_sp_port->mc_disabled)
+ +		return mlxsw_sp_port_flood_table_set(mlxsw_sp_port,
+ +						     MLXSW_SP_FLOOD_TABLE_MC,
+ +						     is_port_mc_router);
+++=======
++ 	bridge_port = mlxsw_sp_bridge_port_find(mlxsw_sp_port->mlxsw_sp->bridge,
++ 						orig_dev);
++ 	if (!bridge_port)
++ 		return 0;
++ 
++ 	if (!bridge_port->bridge_device->multicast_enabled)
++ 		return 0;
++ 
++ 	return mlxsw_sp_bridge_port_flood_table_set(mlxsw_sp_port, bridge_port,
++ 						    MLXSW_SP_FLOOD_TYPE_MC,
++ 						    is_port_mc_router);
++ }
++ 
++ static int mlxsw_sp_port_mc_disabled_set(struct mlxsw_sp_port *mlxsw_sp_port,
++ 					 struct switchdev_trans *trans,
++ 					 struct net_device *orig_dev,
++ 					 bool mc_disabled)
++ {
++ 	struct mlxsw_sp *mlxsw_sp = mlxsw_sp_port->mlxsw_sp;
++ 	struct mlxsw_sp_bridge_device *bridge_device;
++ 	struct mlxsw_sp_bridge_port *bridge_port;
++ 	int err;
++ 
++ 	if (switchdev_trans_ph_prepare(trans))
++ 		return 0;
++ 
++ 	/* It's possible we failed to enslave the port, yet this
++ 	 * operation is executed due to it being deferred.
++ 	 */
++ 	bridge_device = mlxsw_sp_bridge_device_find(mlxsw_sp->bridge, orig_dev);
++ 	if (!bridge_device)
++ 		return 0;
++ 
++ 	list_for_each_entry(bridge_port, &bridge_device->ports_list, list) {
++ 		enum mlxsw_sp_flood_type packet_type = MLXSW_SP_FLOOD_TYPE_MC;
++ 		bool member = mc_disabled ? true : bridge_port->mrouter;
++ 
++ 		err = mlxsw_sp_bridge_port_flood_table_set(mlxsw_sp_port,
++ 							   bridge_port,
++ 							   packet_type, member);
++ 		if (err)
++ 			return err;
++ 	}
++ 
++ 	bridge_device->multicast_enabled = !mc_disabled;
+++>>>>>>> 17b334a876fe (mlxsw: spectrum_switchdev: Don't warn about valid situations)
+  
+  	return 0;
+  }
+@@@ -928,9 -1282,22 +983,26 @@@ static int mlxsw_sp_port_mdb_add(struc
+  	if (switchdev_trans_ph_prepare(trans))
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	mid = __mlxsw_sp_mc_get(mlxsw_sp, mdb->addr, fid);
+++=======
++ 	bridge_port = mlxsw_sp_bridge_port_find(mlxsw_sp->bridge, orig_dev);
++ 	if (!bridge_port)
++ 		return 0;
++ 
++ 	bridge_device = bridge_port->bridge_device;
++ 	mlxsw_sp_port_vlan = mlxsw_sp_port_vlan_find_by_bridge(mlxsw_sp_port,
++ 							       bridge_device,
++ 							       mdb->vid);
++ 	if (!mlxsw_sp_port_vlan)
++ 		return 0;
++ 
++ 	fid_index = mlxsw_sp_fid_index(mlxsw_sp_port_vlan->fid);
++ 
++ 	mid = __mlxsw_sp_mc_get(mlxsw_sp, mdb->addr, fid_index);
+++>>>>>>> 17b334a876fe (mlxsw: spectrum_switchdev: Don't warn about valid situations)
+  	if (!mid) {
+ -		mid = __mlxsw_sp_mc_alloc(mlxsw_sp, mdb->addr, fid_index);
+ +		mid = __mlxsw_sp_mc_alloc(mlxsw_sp, mdb->addr, fid);
+  		if (!mid) {
+  			netdev_err(dev, "Unable to allocate MC group\n");
+  			return -ENOMEM;
+@@@ -1063,7 -1406,20 +1135,24 @@@ static int mlxsw_sp_port_mdb_del(struc
+  	u16 mid_idx;
+  	int err = 0;
+  
+++<<<<<<< HEAD
+ +	mid = __mlxsw_sp_mc_get(mlxsw_sp, mdb->addr, fid);
+++=======
++ 	bridge_port = mlxsw_sp_bridge_port_find(mlxsw_sp->bridge, orig_dev);
++ 	if (!bridge_port)
++ 		return 0;
++ 
++ 	bridge_device = bridge_port->bridge_device;
++ 	mlxsw_sp_port_vlan = mlxsw_sp_port_vlan_find_by_bridge(mlxsw_sp_port,
++ 							       bridge_device,
++ 							       mdb->vid);
++ 	if (!mlxsw_sp_port_vlan)
++ 		return 0;
++ 
++ 	fid_index = mlxsw_sp_fid_index(mlxsw_sp_port_vlan->fid);
++ 
++ 	mid = __mlxsw_sp_mc_get(mlxsw_sp, mdb->addr, fid_index);
+++>>>>>>> 17b334a876fe (mlxsw: spectrum_switchdev: Don't warn about valid situations)
+  	if (!mid) {
+  		netdev_err(dev, "Unable to remove port from MC DB\n");
+  		return -EINVAL;
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
