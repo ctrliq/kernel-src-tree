@@ -1,0 +1,295 @@
+md/r5cache: disable write back for degraded array
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [md] r5cache: disable write back for degraded array (Nigel Croxon) [1455932]
+Rebuild_FUZZ: 96.84%
+commit-author Song Liu <songliubraving@fb.com>
+commit 2e38a37f23c98d7fad87ff022670060b8a0e2bf5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/2e38a37f.failed
+
+write-back cache in degraded mode introduces corner cases to the array.
+Although we try to cover all these corner cases, it is safer to just
+disable write-back cache when the array is in degraded mode.
+
+In this patch, we disable writeback cache for degraded mode:
+1. On device failure, if the array enters degraded mode, raid5_error()
+   will submit async job r5c_disable_writeback_async to disable
+   writeback;
+2. In r5c_journal_mode_store(), it is invalid to enable writeback in
+   degraded mode;
+3. In r5c_try_caching_write(), stripes with s->failed>0 will be handled
+   in write-through mode.
+
+	Signed-off-by: Song Liu <songliubraving@fb.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit 2e38a37f23c98d7fad87ff022670060b8a0e2bf5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid5-cache.c
+#	drivers/md/raid5.h
+diff --cc drivers/md/raid5-cache.c
+index 191ad03407b7,302dea3296ba..000000000000
+--- a/drivers/md/raid5-cache.c
++++ b/drivers/md/raid5-cache.c
+@@@ -158,6 -159,11 +158,14 @@@ struct r5l_log 
+  
+  	spinlock_t stripe_in_journal_lock;
+  	atomic_t stripe_in_journal_count;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* to submit async io_units, to fulfill ordering of flush */
++ 	struct work_struct deferred_io_work;
++ 	/* to disable write back during in degraded mode */
++ 	struct work_struct disable_writeback_work;
+++>>>>>>> 2e38a37f23c9 (md/r5cache: disable write back for degraded array)
+  };
+  
+  /*
+@@@ -531,8 -553,81 +539,23 @@@ static void r5l_log_endio(struct bio *b
+  
+  	if (log->need_cache_flush)
+  		md_wakeup_thread(log->rdev->mddev->thread);
+ -
+ -	if (io->has_null_flush) {
+ -		struct bio *bi;
+ -
+ -		WARN_ON(bio_list_empty(&io->flush_barriers));
+ -		while ((bi = bio_list_pop(&io->flush_barriers)) != NULL) {
+ -			bio_endio(bi);
+ -			atomic_dec(&io->pending_stripe);
+ -		}
+ -		if (atomic_read(&io->pending_stripe) == 0)
+ -			__r5l_stripe_write_finished(io);
+ -	}
+ -}
+ -
+ -static void r5l_do_submit_io(struct r5l_log *log, struct r5l_io_unit *io)
+ -{
+ -	unsigned long flags;
+ -
+ -	spin_lock_irqsave(&log->io_list_lock, flags);
+ -	__r5l_set_io_unit_state(io, IO_UNIT_IO_START);
+ -	spin_unlock_irqrestore(&log->io_list_lock, flags);
+ -
+ -	if (io->has_flush)
+ -		io->current_bio->bi_opf |= REQ_PREFLUSH;
+ -	if (io->has_fua)
+ -		io->current_bio->bi_opf |= REQ_FUA;
+ -	submit_bio(io->current_bio);
+ -
+ -	if (!io->split_bio)
+ -		return;
+ -
+ -	if (io->has_flush)
+ -		io->split_bio->bi_opf |= REQ_PREFLUSH;
+ -	if (io->has_fua)
+ -		io->split_bio->bi_opf |= REQ_FUA;
+ -	submit_bio(io->split_bio);
+ -}
+ -
+ -/* deferred io_unit will be dispatched here */
+ -static void r5l_submit_io_async(struct work_struct *work)
+ -{
+ -	struct r5l_log *log = container_of(work, struct r5l_log,
+ -					   deferred_io_work);
+ -	struct r5l_io_unit *io = NULL;
+ -	unsigned long flags;
+ -
+ -	spin_lock_irqsave(&log->io_list_lock, flags);
+ -	if (!list_empty(&log->running_ios)) {
+ -		io = list_first_entry(&log->running_ios, struct r5l_io_unit,
+ -				      log_sibling);
+ -		if (!io->io_deferred)
+ -			io = NULL;
+ -		else
+ -			io->io_deferred = 0;
+ -	}
+ -	spin_unlock_irqrestore(&log->io_list_lock, flags);
+ -	if (io)
+ -		r5l_do_submit_io(log, io);
+  }
+  
++ static void r5c_disable_writeback_async(struct work_struct *work)
++ {
++ 	struct r5l_log *log = container_of(work, struct r5l_log,
++ 					   disable_writeback_work);
++ 	struct mddev *mddev = log->rdev->mddev;
++ 
++ 	if (log->r5c_journal_mode == R5C_JOURNAL_MODE_WRITE_THROUGH)
++ 		return;
++ 	pr_info("md/raid:%s: Disabling writeback cache for degraded array.\n",
++ 		mdname(mddev));
++ 	mddev_suspend(mddev);
++ 	log->r5c_journal_mode = R5C_JOURNAL_MODE_WRITE_THROUGH;
++ 	mddev_resume(mddev);
++ }
++ 
+  static void r5l_submit_current_io(struct r5l_log *log)
+  {
+  	struct r5l_io_unit *io = log->current_io;
+@@@ -2454,13 -2610,23 +2491,26 @@@ ioerr
+  	return ret;
+  }
+  
++ void r5c_update_on_rdev_error(struct mddev *mddev)
++ {
++ 	struct r5conf *conf = mddev->private;
++ 	struct r5l_log *log = conf->log;
++ 
++ 	if (!log)
++ 		return;
++ 
++ 	if (raid5_calc_degraded(conf) > 0 &&
++ 	    conf->log->r5c_journal_mode == R5C_JOURNAL_MODE_WRITE_BACK)
++ 		schedule_work(&log->disable_writeback_work);
++ }
++ 
+  int r5l_init_log(struct r5conf *conf, struct md_rdev *rdev)
+  {
+ -	struct request_queue *q = bdev_get_queue(rdev->bdev);
+  	struct r5l_log *log;
+ +	char b[BDEVNAME_SIZE];
+ +
+ +	pr_debug("md/raid:%s: using device %s as journal\n",
+ +		 mdname(conf->mddev), bdevname(rdev->bdev, b));
+  
+  	if (PAGE_SIZE != 4096)
+  		return -EINVAL;
+@@@ -2528,6 -2694,9 +2578,12 @@@
+  	INIT_LIST_HEAD(&log->no_space_stripes);
+  	spin_lock_init(&log->no_space_stripes_lock);
+  
+++<<<<<<< HEAD
+++=======
++ 	INIT_WORK(&log->deferred_io_work, r5l_submit_io_async);
++ 	INIT_WORK(&log->disable_writeback_work, r5c_disable_writeback_async);
++ 
+++>>>>>>> 2e38a37f23c9 (md/r5cache: disable write back for degraded array)
+  	log->r5c_journal_mode = R5C_JOURNAL_MODE_WRITE_THROUGH;
+  	INIT_LIST_HEAD(&log->stripe_in_journal_list);
+  	spin_lock_init(&log->stripe_in_journal_lock);
+@@@ -2555,13 -2726,9 +2611,17 @@@ io_kc
+  	return -EINVAL;
+  }
+  
+ -void r5l_exit_log(struct r5l_log *log)
+ +void r5l_exit_log(struct r5conf *conf)
+  {
+++<<<<<<< HEAD
+ +	struct r5l_log *log = conf->log;
+ +
+ +	conf->log = NULL;
+ +	synchronize_rcu();
+ +
+++=======
++ 	flush_work(&log->disable_writeback_work);
+++>>>>>>> 2e38a37f23c9 (md/r5cache: disable write back for degraded array)
+  	md_unregister_thread(&log->reclaim_thread);
+  	mempool_destroy(log->meta_pool);
+  	bioset_free(log->bs);
+diff --cc drivers/md/raid5.h
+index 6f49de05938c,1440fa26e296..000000000000
+--- a/drivers/md/raid5.h
++++ b/drivers/md/raid5.h
+@@@ -761,6 -758,16 +761,19 @@@ extern sector_t raid5_compute_sector(st
+  extern struct stripe_head *
+  raid5_get_active_stripe(struct r5conf *conf, sector_t sector,
+  			int previous, int noblock, int noquiesce);
+++<<<<<<< HEAD
+++=======
++ extern int raid5_calc_degraded(struct r5conf *conf);
++ extern int r5l_init_log(struct r5conf *conf, struct md_rdev *rdev);
++ extern void r5l_exit_log(struct r5l_log *log);
++ extern int r5l_write_stripe(struct r5l_log *log, struct stripe_head *head_sh);
++ extern void r5l_write_stripe_run(struct r5l_log *log);
++ extern void r5l_flush_stripe_to_raid(struct r5l_log *log);
++ extern void r5l_stripe_write_finished(struct stripe_head *sh);
++ extern int r5l_handle_flush_request(struct r5l_log *log, struct bio *bio);
++ extern void r5l_quiesce(struct r5l_log *log, int state);
++ extern bool r5l_log_disk_error(struct r5conf *conf);
+++>>>>>>> 2e38a37f23c9 (md/r5cache: disable write back for degraded array)
+  extern bool r5c_is_writeback(struct r5l_log *log);
+  extern int
+  r5c_try_caching_write(struct r5conf *conf, struct stripe_head *sh,
+* Unmerged path drivers/md/raid5-cache.c
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index 1500f218f73e..279cfec26e2e 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -567,7 +567,7 @@ static struct stripe_head *__find_stripe(struct r5conf *conf, sector_t sector,
+  * of the two sections, and some non-in_sync devices may
+  * be insync in the section most affected by failed devices.
+  */
+-static int calc_degraded(struct r5conf *conf)
++int raid5_calc_degraded(struct r5conf *conf)
+ {
+ 	int degraded, degraded2;
+ 	int i;
+@@ -630,7 +630,7 @@ static int has_failed(struct r5conf *conf)
+ 	if (conf->mddev->reshape_position == MaxSector)
+ 		return conf->mddev->degraded > conf->max_degraded;
+ 
+-	degraded = calc_degraded(conf);
++	degraded = raid5_calc_degraded(conf);
+ 	if (degraded > conf->max_degraded)
+ 		return 1;
+ 	return 0;
+@@ -2559,7 +2559,7 @@ static void raid5_error(struct mddev *mddev, struct md_rdev *rdev)
+ 
+ 	spin_lock_irqsave(&conf->device_lock, flags);
+ 	clear_bit(In_sync, &rdev->flags);
+-	mddev->degraded = calc_degraded(conf);
++	mddev->degraded = raid5_calc_degraded(conf);
+ 	spin_unlock_irqrestore(&conf->device_lock, flags);
+ 	set_bit(MD_RECOVERY_INTR, &mddev->recovery);
+ 
+@@ -2573,6 +2573,7 @@ static void raid5_error(struct mddev *mddev, struct md_rdev *rdev)
+ 		bdevname(rdev->bdev, b),
+ 		mdname(mddev),
+ 		conf->raid_disks - mddev->degraded);
++	r5c_update_on_rdev_error(mddev);
+ }
+ 
+ /*
+@@ -7136,7 +7137,7 @@ static int raid5_run(struct mddev *mddev)
+ 	/*
+ 	 * 0 for a fully functional array, 1 or 2 for a degraded array.
+ 	 */
+-	mddev->degraded = calc_degraded(conf);
++	mddev->degraded = raid5_calc_degraded(conf);
+ 
+ 	if (has_failed(conf)) {
+ 		pr_crit("md/raid:%s: not enough operational devices (%d/%d failed)\n",
+@@ -7379,7 +7380,7 @@ static int raid5_spare_active(struct mddev *mddev)
+ 		}
+ 	}
+ 	spin_lock_irqsave(&conf->device_lock, flags);
+-	mddev->degraded = calc_degraded(conf);
++	mddev->degraded = raid5_calc_degraded(conf);
+ 	spin_unlock_irqrestore(&conf->device_lock, flags);
+ 	print_raid5_conf(conf);
+ 	return count;
+@@ -7742,7 +7743,7 @@ static int raid5_start_reshape(struct mddev *mddev)
+ 		 * pre and post number of devices.
+ 		 */
+ 		spin_lock_irqsave(&conf->device_lock, flags);
+-		mddev->degraded = calc_degraded(conf);
++		mddev->degraded = raid5_calc_degraded(conf);
+ 		spin_unlock_irqrestore(&conf->device_lock, flags);
+ 	}
+ 	mddev->raid_disks = conf->raid_disks;
+@@ -7830,7 +7831,7 @@ static void raid5_finish_reshape(struct mddev *mddev)
+ 		} else {
+ 			int d;
+ 			spin_lock_irq(&conf->device_lock);
+-			mddev->degraded = calc_degraded(conf);
++			mddev->degraded = raid5_calc_degraded(conf);
+ 			spin_unlock_irq(&conf->device_lock);
+ 			for (d = conf->raid_disks ;
+ 			     d < conf->raid_disks - mddev->delta_disks;
+* Unmerged path drivers/md/raid5.h
