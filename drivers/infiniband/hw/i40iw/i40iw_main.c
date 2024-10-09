@@ -1421,12 +1421,11 @@ static enum i40iw_status_code i40iw_save_msix_info(struct i40iw_device *iwdev,
  * i40iw_deinit_device - clean up the device resources
  * @iwdev: iwarp device
  * @reset: true if called before reset
- * @del_hdl: true if delete hdl entry
  *
  * Destroy the ib device interface, remove the mac ip entry and ipv4/ipv6 addresses,
  * destroy the device queues and free the pble and the hmc objects
  */
-static void i40iw_deinit_device(struct i40iw_device *iwdev, bool reset, bool del_hdl)
+static void i40iw_deinit_device(struct i40iw_device *iwdev, bool reset)
 {
 	struct i40e_info *ldev = iwdev->ldev;
 
@@ -1491,8 +1490,7 @@ static void i40iw_deinit_device(struct i40iw_device *iwdev, bool reset, bool del
 		break;
 	}
 
-	if (del_hdl)
-		i40iw_del_handler(i40iw_find_i40e_handler(ldev));
+	i40iw_del_handler(i40iw_find_i40e_handler(ldev));
 	kfree(iwdev->hdl);
 }
 
@@ -1657,7 +1655,7 @@ static int i40iw_open(struct i40e_info *ldev, struct i40e_client *client)
 	} while (0);
 
 	i40iw_pr_err("status = %d last completion = %d\n", status, iwdev->init_state);
-	i40iw_deinit_device(iwdev, false, false);
+	i40iw_deinit_device(iwdev, false);
 	return -ERESTART;
 }
 
@@ -1735,7 +1733,7 @@ static void i40iw_close(struct i40e_info *ldev, struct i40e_client *client, bool
 
 	iwdev = &hdl->device;
 	destroy_workqueue(iwdev->virtchnl_wq);
-	i40iw_deinit_device(iwdev, reset, true);
+	i40iw_deinit_device(iwdev, reset);
 }
 
 /**
