@@ -2,7 +2,6 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <stdio.h>
-#include <ctype.h>
 #include <string.h>
 
 #include "parse-events.h"
@@ -15,6 +14,8 @@
 #include "thread.h"
 
 #include "tests.h"
+
+#include "sane_ctype.h"
 
 #define BUFSZ	1024
 #define READLEN	128
