@@ -1,0 +1,131 @@
+seqcount: Rename write_seqcount_barrier()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit a7c6f571ff51cc77d90dd54968f7c5c938c43998
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/a7c6f571.failed
+
+I'll shortly be introducing another seqcount primitive that's useful
+to provide ordering semantics and would like to use the
+write_seqcount_barrier() name for that.
+
+Seeing how there's only one user of the current primitive, lets rename
+it to invalidate, as that appears what its doing.
+
+While there, employ lockdep_assert_held() instead of
+assert_spin_locked() to not generate debug code for regular kernels.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: ktkhai@parallels.com
+	Cc: rostedt@goodmis.org
+	Cc: juri.lelli@gmail.com
+	Cc: pang.xunlei@linaro.org
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Cc: wanpeng.li@linux.intel.com
+	Cc: Paul McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: Al Viro <viro@ZenIV.linux.org.uk>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: umgwanakikbuti@gmail.com
+Link: http://lkml.kernel.org/r/20150611124743.279926217@infradead.org
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit a7c6f571ff51cc77d90dd54968f7c5c938c43998)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dcache.c
+diff --cc fs/dcache.c
+index 1eabedd8b45c,b43a1694d2ca..000000000000
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@@ -332,10 -370,9 +332,16 @@@ static void dentry_unlink_inode(struct 
+  	__releases(dentry->d_inode->i_lock)
+  {
+  	struct inode *inode = dentry->d_inode;
+++<<<<<<< HEAD
+ +	__d_clear_type(dentry);
+ +	dentry->d_inode = NULL;
+ +	hlist_del_init(&dentry->d_alias);
+ +	dentry_rcuwalk_barrier(dentry);
+++=======
++ 	__d_clear_type_and_inode(dentry);
++ 	hlist_del_init(&dentry->d_u.d_alias);
++ 	dentry_rcuwalk_invalidate(dentry);
+++>>>>>>> a7c6f571ff51 (seqcount: Rename write_seqcount_barrier())
+  	spin_unlock(&dentry->d_lock);
+  	spin_unlock(&inode->i_lock);
+  	if (!inode->i_nlink)
+@@@ -434,8 -479,22 +440,27 @@@ static void __d_shrink(struct dentry *d
+  void __d_drop(struct dentry *dentry)
+  {
+  	if (!d_unhashed(dentry)) {
+++<<<<<<< HEAD
+ +		__d_shrink(dentry);
+ +		dentry_rcuwalk_barrier(dentry);
+++=======
++ 		struct hlist_bl_head *b;
++ 		/*
++ 		 * Hashed dentries are normally on the dentry hashtable,
++ 		 * with the exception of those newly allocated by
++ 		 * d_obtain_alias, which are always IS_ROOT:
++ 		 */
++ 		if (unlikely(IS_ROOT(dentry)))
++ 			b = &dentry->d_sb->s_anon;
++ 		else
++ 			b = d_hash(dentry->d_parent, dentry->d_name.hash);
++ 
++ 		hlist_bl_lock(b);
++ 		__hlist_bl_del(&dentry->d_hash);
++ 		dentry->d_hash.pprev = NULL;
++ 		hlist_bl_unlock(b);
++ 		dentry_rcuwalk_invalidate(dentry);
+++>>>>>>> a7c6f571ff51 (seqcount: Rename write_seqcount_barrier())
+  	}
+  }
+  EXPORT_SYMBOL(__d_drop);
+@@@ -1622,14 -1749,12 +1647,20 @@@ static void __d_instantiate(struct dent
+  	unsigned add_flags = d_flags_for_inode(inode);
+  
+  	spin_lock(&dentry->d_lock);
+ +	__d_set_type(dentry, add_flags);
+ +	if (inode)
+++<<<<<<< HEAD
+ +		hlist_add_head(&dentry->d_alias, &inode->i_dentry);
+ +	dentry->d_inode = inode;
+ +	dentry_rcuwalk_barrier(dentry);
+  	if (inode)
+ +		fsnotify_update_flags(dentry);
+++=======
++ 		hlist_add_head(&dentry->d_u.d_alias, &inode->i_dentry);
++ 	__d_set_inode_and_type(dentry, inode, add_flags);
++ 	dentry_rcuwalk_invalidate(dentry);
+++>>>>>>> a7c6f571ff51 (seqcount: Rename write_seqcount_barrier())
+  	spin_unlock(&dentry->d_lock);
+ -	fsnotify_d_instantiate(dentry, inode);
+  }
+  
+  /**
+* Unmerged path fs/dcache.c
+diff --git a/include/linux/seqlock.h b/include/linux/seqlock.h
+index 48f2f69e3867..46a7cefc6a5b 100644
+--- a/include/linux/seqlock.h
++++ b/include/linux/seqlock.h
+@@ -199,13 +199,13 @@ static inline void write_seqcount_end(seqcount_t *s)
+ }
+ 
+ /**
+- * write_seqcount_barrier - invalidate in-progress read-side seq operations
++ * write_seqcount_invalidate - invalidate in-progress read-side seq operations
+  * @s: pointer to seqcount_t
+  *
+- * After write_seqcount_barrier, no read-side seq operations will complete
++ * After write_seqcount_invalidate, no read-side seq operations will complete
+  * successfully and see data older than this.
+  */
+-static inline void write_seqcount_barrier(seqcount_t *s)
++static inline void write_seqcount_invalidate(seqcount_t *s)
+ {
+ 	smp_wmb();
+ 	s->sequence+=2;
