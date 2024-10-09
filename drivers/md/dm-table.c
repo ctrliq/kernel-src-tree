@@ -928,6 +928,11 @@ static int dm_table_set_type(struct dm_table *t)
 	} else
 		t->type = DM_TYPE_REQUEST_BASED;
 
+	if (t->type == DM_TYPE_MQ_REQUEST_BASED && !t->all_blk_mq) {
+		DMERR("table load rejected: all devices are not blk-mq request-stackable");
+		return -EINVAL;
+	}
+
 	return 0;
 }
 
