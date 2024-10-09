@@ -712,7 +712,7 @@ static void nfs4_slot_sequence_acked(struct nfs4_slot *slot,
 	slot->seq_nr_last_acked = seqnr;
 }
 
-static void nfs4_probe_sequence(struct nfs_client *client, const struct cred *cred,
+static void nfs4_probe_sequence(struct nfs_client *client, struct rpc_cred *cred,
 				struct nfs4_slot *slot)
 {
 	struct rpc_task *task = _nfs41_proc_sequence(client, cred, slot, true);
