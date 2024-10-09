@@ -1,0 +1,165 @@
+cpufreq: intel_pstate: Always set max P-state in performance mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [cpufreq] intel_pstate: Always set max P-state in performance mode (Prarit Bhargava) [1465349]
+Rebuild_FUZZ: 92.56%
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit 2f1d407adab026b34a105ed27b1d4d7e910c4448
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/2f1d407a.failed
+
+The only times at which intel_pstate checks the policy set for
+a given CPU is the initialization of that CPU and updates of its
+policy settings from cpufreq when intel_pstate_set_policy() is
+invoked.
+
+That is insufficient, however, because intel_pstate uses the same
+P-state selection function for all CPUs regardless of the policy
+setting for each of them and the P-state limits are shared between
+them.  Thus if the policy is set to "performance" for a particular
+CPU, it may not behave as expected if the cpufreq settings are
+changed subsequently for another CPU.
+
+That can be easily demonstrated by writing "performance" to
+scaling_governor for all CPUs and then switching it to "powersave"
+for one of them in which case all of the CPUs will behave as though
+their scaling_governor were all "powersave" (even though the policy
+still appears to be "performance" for the remaining CPUs).
+
+Fix this problem by modifying intel_pstate_adjust_busy_pstate() to
+always set the P-state to the maximum allowed by the current limits
+for all CPUs whose policy is set to "performance".
+
+Note that it still is recommended to always change the policy setting
+in the same way for all CPUs even with this fix applied to avoid
+confusion.
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 2f1d407adab026b34a105ed27b1d4d7e910c4448)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/intel_pstate.c
+diff --cc drivers/cpufreq/intel_pstate.c
+index 2849fe3729b8,4737520ec823..000000000000
+--- a/drivers/cpufreq/intel_pstate.c
++++ b/drivers/cpufreq/intel_pstate.c
+@@@ -164,7 -179,11 +164,8 @@@ struct _pid 
+  /**
+   * struct cpudata -	Per CPU instance data storage
+   * @cpu:		CPU number for this instance data
++  * @policy:		CPUFreq policy value
+   * @update_util:	CPUFreq utility callback information
+ - * @update_util_set:	CPUFreq utility callback is set
+ - * @iowait_boost:	iowait-related boost fraction
+ - * @last_update:	Time of the last update.
+   * @pstate:		Stores P state limits for this CPU
+   * @vid:		Stores VID limits for this CPU
+   * @pid:		Stores PID parameters for this CPU
+@@@ -183,7 -202,9 +184,13 @@@
+  struct cpudata {
+  	int cpu;
+  
+++<<<<<<< HEAD
+ +	struct timer_list timer;
+++=======
++ 	unsigned int policy;
++ 	struct update_util_data update_util;
++ 	bool   update_util_set;
+++>>>>>>> 2f1d407adab0 (cpufreq: intel_pstate: Always set max P-state in performance mode)
+  
+  	struct pstate_data pstate;
+  	struct vid_data vid;
+@@@ -1287,12 -1339,13 +1294,13 @@@ static inline void intel_pstate_adjust_
+  
+  	from = cpu->pstate.current_pstate;
+  
+- 	target_pstate = pstate_funcs.get_target_pstate(cpu);
++ 	target_pstate = cpu->policy == CPUFREQ_POLICY_PERFORMANCE ?
++ 		cpu->pstate.turbo_pstate : pstate_funcs.get_target_pstate(cpu);
+  
+ -	intel_pstate_update_pstate(cpu, target_pstate);
+ +	intel_pstate_set_pstate(cpu, target_pstate);
+  
+  	sample = &cpu->sample;
+ -	trace_pstate_sample(mul_ext_fp(100, sample->core_avg_perf),
+ +	trace_pstate_sample(fp_toint(sample->core_pct_busy),
+  		fp_toint(sample->busy_scaled),
+  		from,
+  		cpu->pstate.current_pstate,
+@@@ -1424,17 -1506,28 +1432,31 @@@ static int intel_pstate_set_policy(stru
+  	pr_debug("set_policy cpuinfo.max %u policy->max %u\n",
+  		 policy->cpuinfo.max_freq, policy->max);
+  
+++<<<<<<< HEAD
+ +	if (policy->policy == CPUFREQ_POLICY_PERFORMANCE &&
+ +	    policy->max >= policy->cpuinfo.max_freq) {
+ +		pr_debug("intel_pstate: set performance\n");
+++=======
++ 	cpu = all_cpu_data[policy->cpu];
++ 	cpu->policy = policy->policy;
++ 
++ 	if (cpu->pstate.max_pstate_physical > cpu->pstate.max_pstate &&
++ 	    policy->max < policy->cpuinfo.max_freq &&
++ 	    policy->max > cpu->pstate.max_pstate * cpu->pstate.scaling) {
++ 		pr_debug("policy->max > max non turbo frequency\n");
++ 		policy->max = policy->cpuinfo.max_freq;
++ 	}
++ 
++ 	if (cpu->policy == CPUFREQ_POLICY_PERFORMANCE) {
+++>>>>>>> 2f1d407adab0 (cpufreq: intel_pstate: Always set max P-state in performance mode)
+  		limits = &performance_limits;
+ -		if (policy->max >= policy->cpuinfo.max_freq) {
+ -			pr_debug("set performance\n");
+ -			intel_pstate_set_performance_limits(limits);
+ -			goto out;
+ -		}
+ -	} else {
+ -		pr_debug("set powersave\n");
+ -		limits = &powersave_limits;
+ +		if (hwp_active)
+ +			intel_pstate_hwp_set(policy->cpus);
+ +		return 0;
+  	}
+  
+ +	pr_debug("intel_pstate: set powersave\n");
+ +	limits = &powersave_limits;
+  	limits->min_policy_pct = (policy->min * 100) / policy->cpuinfo.max_freq;
+  	limits->min_policy_pct = clamp_t(int, limits->min_policy_pct, 0 , 100);
+  	limits->max_policy_pct = DIV_ROUND_UP(policy->max * 100,
+@@@ -1454,14 -1547,23 +1476,30 @@@
+  	/* Make sure min_perf_pct <= max_perf_pct */
+  	limits->min_perf_pct = min(limits->max_perf_pct, limits->min_perf_pct);
+  
+ -	limits->min_perf = div_fp(limits->min_perf_pct, 100);
+ -	limits->max_perf = div_fp(limits->max_perf_pct, 100);
+ +	limits->min_perf = div_fp(int_tofp(limits->min_perf_pct),
+ +				  int_tofp(100));
+ +	limits->max_perf = div_fp(int_tofp(limits->max_perf_pct),
+ +				  int_tofp(100));
+  	limits->max_perf = round_up(limits->max_perf, FRAC_BITS);
+  
+++<<<<<<< HEAD
+ +	if (hwp_active)
+ +		intel_pstate_hwp_set(policy->cpus);
+++=======
++  out:
++ 	if (cpu->policy == CPUFREQ_POLICY_PERFORMANCE) {
++ 		/*
++ 		 * NOHZ_FULL CPUs need this as the governor callback may not
++ 		 * be invoked on them.
++ 		 */
++ 		intel_pstate_clear_update_util_hook(policy->cpu);
++ 		intel_pstate_max_within_limits(cpu);
++ 	}
++ 
++ 	intel_pstate_set_update_util_hook(policy->cpu);
++ 
++ 	intel_pstate_hwp_set_policy(policy);
+++>>>>>>> 2f1d407adab0 (cpufreq: intel_pstate: Always set max P-state in performance mode)
+  
+  	return 0;
+  }
+* Unmerged path drivers/cpufreq/intel_pstate.c
