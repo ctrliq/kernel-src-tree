@@ -4945,6 +4945,14 @@ long ext4_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 
 	mutex_lock(&inode->i_mutex);
 
+	/*
+	 * We only support preallocation for extent-based files only
+	 */
+	if (!(ext4_test_inode_flag(inode, EXT4_INODE_EXTENTS))) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+
 	if (!(mode & FALLOC_FL_KEEP_SIZE) &&
 	     offset + len > i_size_read(inode)) {
 		new_size = offset + len;
