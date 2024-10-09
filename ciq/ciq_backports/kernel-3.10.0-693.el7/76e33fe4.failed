@@ -1,0 +1,109 @@
+dm mpath: reinstate bio-based support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Mike Snitzer <snitzer@redhat.com>
+commit 76e33fe4e2c4363c2b9f627472bd43dc235c3406
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/76e33fe4.failed
+
+Add "multipath-bio" target that offers a bio-based multipath target as
+an alternative to the request-based "multipath" target -- but in a
+following commit "multipath-bio" will immediately be replaced by a new
+"queue_mode" feature for the "multipath" target which will allow
+bio-based mode to be selected.
+
+When DM multipath was originally converted from bio-based to
+request-based the motivation for the change was better dynamic load
+balancing (by leveraging block core's request-based IO schedulers, for
+merging and sorting, _before_ DM multipath would make the decision on
+where to steer the IO -- based on path load and/or availability).
+
+More background is available in this "Request-based Device-mapper
+multipath and Dynamic load balancing" paper:
+https://www.kernel.org/doc/ols/2007/ols2007v2-pages-235-244.pdf
+
+But we've now come full circle where significantly faster storage
+devices no longer need IOs to be made larger to drive optimal IO
+performance.  And even if they do there have been changes to the block
+and filesystem layers that help ensure upper layers are constructing
+larger IOs.  In addition, SCSI's differentiated IO errors will propagate
+through to bio-based IO completion hooks -- so that eliminates another
+historic justiciation for request-based DM multipath.  Lastly, the block
+layer's immutable biovec changes have made bio cloning cheaper than it
+has ever been; whereas request cloning is still relatively expensive
+(both on a CPU usage and memory footprint level).
+
+As such, bio-based DM multipath offers the promise of a more efficient
+IO path for high IOPs devices that are, or will be, emerging.
+
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 76e33fe4e2c4363c2b9f627472bd43dc235c3406)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-mpath.c
+diff --cc drivers/md/dm-mpath.c
+index d712f8cf8006,f5921661bd99..000000000000
+--- a/drivers/md/dm-mpath.c
++++ b/drivers/md/dm-mpath.c
+@@@ -434,19 -468,22 +471,36 @@@ failed
+   * and multipath_resume() calls and we have no need to check
+   * for the DMF_NOFLUSH_SUSPENDING flag.
+   */
+- static int must_push_back(struct multipath *m)
++ static bool __must_push_back(struct multipath *m)
+  {
++ 	return ((test_bit(MPATHF_QUEUE_IF_NO_PATH, &m->flags) !=
++ 		 test_bit(MPATHF_SAVED_QUEUE_IF_NO_PATH, &m->flags)) &&
++ 		dm_noflush_suspending(m->ti));
++ }
++ 
++ static bool must_push_back_rq(struct multipath *m)
++ {
+++<<<<<<< HEAD
+ +	bool r;
+ +	unsigned long flags;
+ +
+ +	spin_lock_irqsave(&m->lock, flags);
+ +	r = (test_bit(MPATHF_QUEUE_IF_NO_PATH, &m->flags) ||
+ +	     ((test_bit(MPATHF_QUEUE_IF_NO_PATH, &m->flags) !=
+ +	       test_bit(MPATHF_SAVED_QUEUE_IF_NO_PATH, &m->flags)) &&
+ +	      dm_noflush_suspending(m->ti)));
+ +	spin_unlock_irqrestore(&m->lock, flags);
+ +
+ +	return r;
+++=======
++ 	return (test_bit(MPATHF_QUEUE_IF_NO_PATH, &m->flags) ||
++ 		__must_push_back(m));
++ }
++ 
++ static bool must_push_back_bio(struct multipath *m)
++ {
++ 	return __must_push_back(m);
+++>>>>>>> 76e33fe4e2c4 (dm mpath: reinstate bio-based support)
+  }
+  
+  /*
+@@@ -814,13 -947,13 +970,19 @@@ static int parse_hw_handler(struct dm_a
+  	if (!hw_argc)
+  		return 0;
+  
++ 	if (test_bit(MPATHF_BIO_BASED, &m->flags)) {
++ 		dm_consume_args(as, hw_argc);
++ 		DMERR("bio-based multipath doesn't allow hardware handler args");
++ 		return 0;
++ 	}
++ 
+  	m->hw_handler_name = kstrdup(dm_shift_arg(as), GFP_KERNEL);
+ +	if (!try_then_request_module(scsi_dh_handler_exist(m->hw_handler_name),
+ +				     "scsi_dh_%s", m->hw_handler_name)) {
+ +		ti->error = "unknown hardware handler type";
+ +		ret = -EINVAL;
+ +		goto fail;
+ +	}
+  
+  	if (hw_argc > 1) {
+  		char *p;
+* Unmerged path drivers/md/dm-mpath.c
