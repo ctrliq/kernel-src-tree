@@ -423,10 +423,6 @@ static int queue_userspace_packet(struct datapath *dp, struct sk_buff *skb,
 	struct sk_buff *nskb = NULL;
 	struct sk_buff *user_skb = NULL; /* to be queued to userspace */
 	struct nlattr *nla;
-	struct genl_info info = {
-		.dst_sk = ovs_dp_get_net(dp)->genl_sock,
-		.snd_portid = upcall_info->portid,
-	};
 	size_t len;
 	unsigned int hlen;
 	int err, dp_ifindex;
@@ -467,7 +463,7 @@ static int queue_userspace_packet(struct datapath *dp, struct sk_buff *skb,
 		hlen = skb->len;
 
 	len = upcall_msg_size(upcall_info, hlen);
-	user_skb = genlmsg_new_unicast(len, &info, GFP_ATOMIC);
+	user_skb = genlmsg_new(len, GFP_ATOMIC);
 	if (!user_skb) {
 		err = -ENOMEM;
 		goto out;
@@ -880,7 +876,7 @@ static struct sk_buff *ovs_flow_cmd_alloc_info(const struct sw_flow_actions *act
 		return NULL;
 
 	len = ovs_flow_cmd_msg_size(acts, sfid, ufid_flags);
-	skb = genlmsg_new_unicast(len, info, GFP_KERNEL);
+	skb = genlmsg_new(len, GFP_KERNEL);
 	if (!skb)
 		return ERR_PTR(-ENOMEM);
 
@@ -1496,7 +1492,7 @@ error:
 
 static struct sk_buff *ovs_dp_cmd_alloc_info(struct genl_info *info)
 {
-	return genlmsg_new_unicast(ovs_dp_cmd_msg_size(), info, GFP_KERNEL);
+	return genlmsg_new(ovs_dp_cmd_msg_size(), GFP_KERNEL);
 }
 
 /* Called with rcu_read_lock or ovs_mutex. */
