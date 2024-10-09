@@ -1,0 +1,624 @@
+qed - VF tunnelling support [VXLAN/GENEVE/GRE]
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Chopra, Manish <Manish.Chopra@cavium.com>
+commit eaf3c0c6b4e307e5c7e6cbeb8c5a17be7feee249
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/eaf3c0c6.failed
+
+This patch adds hardware channel APIs support between
+VF and PF for tunnelling configuration for the VFs.
+According to that configuration VFs can run VXLAN/GENEVE/GRE
+tunnels over it with tunnel features offloaded.
+
+Using these APIs VF can also request for UDP ports configuration
+to the PF, although PF and it's child VFs share the same port.
+
+	Signed-off-by: Manish Chopra <manish.chopra@cavium.com>
+	Signed-off-by: Yuval Mintz <yuval.mintz@cavium.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit eaf3c0c6b4e307e5c7e6cbeb8c5a17be7feee249)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qed/qed_dev.c
+diff --cc drivers/net/ethernet/qlogic/qed/qed_dev.c
+index e51e75e12183,f168b718594b..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_dev.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_dev.c
+@@@ -1581,8 -1581,35 +1581,37 @@@ static void qed_reset_mb_shadow(struct 
+  	       p_hwfn->mcp_info->mfw_mb_cur, p_hwfn->mcp_info->mfw_mb_length);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void
++ qed_fill_load_req_params(struct qed_load_req_params *p_load_req,
++ 			 struct qed_drv_load_params *p_drv_load)
++ {
++ 	memset(p_load_req, 0, sizeof(*p_load_req));
++ 
++ 	p_load_req->drv_role = p_drv_load->is_crash_kernel ?
++ 			       QED_DRV_ROLE_KDUMP : QED_DRV_ROLE_OS;
++ 	p_load_req->timeout_val = p_drv_load->mfw_timeout_val;
++ 	p_load_req->avoid_eng_reset = p_drv_load->avoid_eng_reset;
++ 	p_load_req->override_force_load = p_drv_load->override_force_load;
++ }
++ 
++ static int qed_vf_start(struct qed_hwfn *p_hwfn,
++ 			struct qed_hw_init_params *p_params)
++ {
++ 	if (p_params->p_tunn) {
++ 		qed_vf_set_vf_start_tunn_update_param(p_params->p_tunn);
++ 		qed_vf_pf_tunnel_param_update(p_hwfn, p_params->p_tunn);
++ 	}
++ 
++ 	p_hwfn->b_int_enabled = 1;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> eaf3c0c6b4e3 (qed - VF tunnelling support [VXLAN/GENEVE/GRE])
+  int qed_hw_init(struct qed_dev *cdev, struct qed_hw_init_params *p_params)
+  {
+ -	struct qed_load_req_params load_req_params;
+  	u32 load_code, param, drv_mb_param;
+  	bool b_default_mtu = true;
+  	struct qed_hwfn *p_hwfn;
+diff --git a/drivers/net/ethernet/qlogic/qed/qed.h b/drivers/net/ethernet/qlogic/qed/qed.h
+index d52c188a91a3..53c4f9c246b3 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed.h
++++ b/drivers/net/ethernet/qlogic/qed/qed.h
+@@ -685,6 +685,7 @@ struct qed_dev {
+ 	u32 rdma_max_sge;
+ 	u32 rdma_max_inline;
+ 	u32 rdma_max_srq_sge;
++	u16 tunn_feature_mask;
+ };
+ 
+ #define NUM_OF_VFS(dev)         (QED_IS_BB(dev) ? MAX_NUM_VFS_BB \
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_dev.c
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_l2.c b/drivers/net/ethernet/qlogic/qed/qed_l2.c
+index b763dc14ae2c..abe14248d6ef 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_l2.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_l2.c
+@@ -2208,9 +2208,6 @@ static int qed_tunn_configure(struct qed_dev *cdev,
+ 	struct qed_tunnel_info tunn_info;
+ 	int i, rc;
+ 
+-	if (IS_VF(cdev))
+-		return 0;
+-
+ 	memset(&tunn_info, 0, sizeof(tunn_info));
+ 	if (tunn_params->update_vxlan_port) {
+ 		tunn_info.vxlan_port.b_update_port = true;
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_main.c b/drivers/net/ethernet/qlogic/qed/qed_main.c
+index 1702ce0e037b..d9762f3b9f6b 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_main.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_main.c
+@@ -974,6 +974,14 @@ static int qed_slowpath_start(struct qed_dev *cdev,
+ 	DP_INFO(cdev,
+ 		"HW initialization and function start completed successfully\n");
+ 
++	if (IS_PF(cdev)) {
++		cdev->tunn_feature_mask = (BIT(QED_MODE_VXLAN_TUNN) |
++					   BIT(QED_MODE_L2GENEVE_TUNN) |
++					   BIT(QED_MODE_IPGENEVE_TUNN) |
++					   BIT(QED_MODE_L2GRE_TUNN) |
++					   BIT(QED_MODE_IPGRE_TUNN));
++	}
++
+ 	/* Allocate LL2 interface if needed */
+ 	if (QED_LEADING_HWFN(cdev)->using_ll2) {
+ 		rc = qed_ll2_alloc_if(cdev);
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_sp_commands.c b/drivers/net/ethernet/qlogic/qed/qed_sp_commands.c
+index afe0faa02f48..745b08c97de4 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_sp_commands.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_sp_commands.c
+@@ -451,6 +451,9 @@ int qed_sp_pf_update_tunn_cfg(struct qed_hwfn *p_hwfn,
+ 	struct qed_sp_init_data init_data;
+ 	int rc = -EINVAL;
+ 
++	if (IS_VF(p_hwfn->cdev))
++		return qed_vf_pf_tunnel_param_update(p_hwfn, p_tunn);
++
+ 	if (!p_tunn)
+ 		return -EINVAL;
+ 
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_sriov.c b/drivers/net/ethernet/qlogic/qed/qed_sriov.c
+index d4129047409e..bdecac09c2f9 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_sriov.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_sriov.c
+@@ -2016,6 +2016,220 @@ out:
+ 	qed_iov_vf_mbx_start_rxq_resp(p_hwfn, p_ptt, vf, status, b_legacy_vf);
+ }
+ 
++static void
++qed_iov_pf_update_tun_response(struct pfvf_update_tunn_param_tlv *p_resp,
++			       struct qed_tunnel_info *p_tun,
++			       u16 tunn_feature_mask)
++{
++	p_resp->tunn_feature_mask = tunn_feature_mask;
++	p_resp->vxlan_mode = p_tun->vxlan.b_mode_enabled;
++	p_resp->l2geneve_mode = p_tun->l2_geneve.b_mode_enabled;
++	p_resp->ipgeneve_mode = p_tun->ip_geneve.b_mode_enabled;
++	p_resp->l2gre_mode = p_tun->l2_gre.b_mode_enabled;
++	p_resp->ipgre_mode = p_tun->l2_gre.b_mode_enabled;
++	p_resp->vxlan_clss = p_tun->vxlan.tun_cls;
++	p_resp->l2gre_clss = p_tun->l2_gre.tun_cls;
++	p_resp->ipgre_clss = p_tun->ip_gre.tun_cls;
++	p_resp->l2geneve_clss = p_tun->l2_geneve.tun_cls;
++	p_resp->ipgeneve_clss = p_tun->ip_geneve.tun_cls;
++	p_resp->geneve_udp_port = p_tun->geneve_port.port;
++	p_resp->vxlan_udp_port = p_tun->vxlan_port.port;
++}
++
++static void
++__qed_iov_pf_update_tun_param(struct vfpf_update_tunn_param_tlv *p_req,
++			      struct qed_tunn_update_type *p_tun,
++			      enum qed_tunn_mode mask, u8 tun_cls)
++{
++	if (p_req->tun_mode_update_mask & BIT(mask)) {
++		p_tun->b_update_mode = true;
++
++		if (p_req->tunn_mode & BIT(mask))
++			p_tun->b_mode_enabled = true;
++	}
++
++	p_tun->tun_cls = tun_cls;
++}
++
++static void
++qed_iov_pf_update_tun_param(struct vfpf_update_tunn_param_tlv *p_req,
++			    struct qed_tunn_update_type *p_tun,
++			    struct qed_tunn_update_udp_port *p_port,
++			    enum qed_tunn_mode mask,
++			    u8 tun_cls, u8 update_port, u16 port)
++{
++	if (update_port) {
++		p_port->b_update_port = true;
++		p_port->port = port;
++	}
++
++	__qed_iov_pf_update_tun_param(p_req, p_tun, mask, tun_cls);
++}
++
++static bool
++qed_iov_pf_validate_tunn_param(struct vfpf_update_tunn_param_tlv *p_req)
++{
++	bool b_update_requested = false;
++
++	if (p_req->tun_mode_update_mask || p_req->update_tun_cls ||
++	    p_req->update_geneve_port || p_req->update_vxlan_port)
++		b_update_requested = true;
++
++	return b_update_requested;
++}
++
++static void qed_pf_validate_tunn_mode(struct qed_tunn_update_type *tun, int *rc)
++{
++	if (tun->b_update_mode && !tun->b_mode_enabled) {
++		tun->b_update_mode = false;
++		*rc = -EINVAL;
++	}
++}
++
++static int
++qed_pf_validate_modify_tunn_config(struct qed_hwfn *p_hwfn,
++				   u16 *tun_features, bool *update,
++				   struct qed_tunnel_info *tun_src)
++{
++	struct qed_eth_cb_ops *ops = p_hwfn->cdev->protocol_ops.eth;
++	struct qed_tunnel_info *tun = &p_hwfn->cdev->tunnel;
++	u16 bultn_vxlan_port, bultn_geneve_port;
++	void *cookie = p_hwfn->cdev->ops_cookie;
++	int i, rc = 0;
++
++	*tun_features = p_hwfn->cdev->tunn_feature_mask;
++	bultn_vxlan_port = tun->vxlan_port.port;
++	bultn_geneve_port = tun->geneve_port.port;
++	qed_pf_validate_tunn_mode(&tun_src->vxlan, &rc);
++	qed_pf_validate_tunn_mode(&tun_src->l2_geneve, &rc);
++	qed_pf_validate_tunn_mode(&tun_src->ip_geneve, &rc);
++	qed_pf_validate_tunn_mode(&tun_src->l2_gre, &rc);
++	qed_pf_validate_tunn_mode(&tun_src->ip_gre, &rc);
++
++	if ((tun_src->b_update_rx_cls || tun_src->b_update_tx_cls) &&
++	    (tun_src->vxlan.tun_cls != QED_TUNN_CLSS_MAC_VLAN ||
++	     tun_src->l2_geneve.tun_cls != QED_TUNN_CLSS_MAC_VLAN ||
++	     tun_src->ip_geneve.tun_cls != QED_TUNN_CLSS_MAC_VLAN ||
++	     tun_src->l2_gre.tun_cls != QED_TUNN_CLSS_MAC_VLAN ||
++	     tun_src->ip_gre.tun_cls != QED_TUNN_CLSS_MAC_VLAN)) {
++		tun_src->b_update_rx_cls = false;
++		tun_src->b_update_tx_cls = false;
++		rc = -EINVAL;
++	}
++
++	if (tun_src->vxlan_port.b_update_port) {
++		if (tun_src->vxlan_port.port == tun->vxlan_port.port) {
++			tun_src->vxlan_port.b_update_port = false;
++		} else {
++			*update = true;
++			bultn_vxlan_port = tun_src->vxlan_port.port;
++		}
++	}
++
++	if (tun_src->geneve_port.b_update_port) {
++		if (tun_src->geneve_port.port == tun->geneve_port.port) {
++			tun_src->geneve_port.b_update_port = false;
++		} else {
++			*update = true;
++			bultn_geneve_port = tun_src->geneve_port.port;
++		}
++	}
++
++	qed_for_each_vf(p_hwfn, i) {
++		qed_iov_bulletin_set_udp_ports(p_hwfn, i, bultn_vxlan_port,
++					       bultn_geneve_port);
++	}
++
++	qed_schedule_iov(p_hwfn, QED_IOV_WQ_BULLETIN_UPDATE_FLAG);
++	ops->ports_update(cookie, bultn_vxlan_port, bultn_geneve_port);
++
++	return rc;
++}
++
++static void qed_iov_vf_mbx_update_tunn_param(struct qed_hwfn *p_hwfn,
++					     struct qed_ptt *p_ptt,
++					     struct qed_vf_info *p_vf)
++{
++	struct qed_tunnel_info *p_tun = &p_hwfn->cdev->tunnel;
++	struct qed_iov_vf_mbx *mbx = &p_vf->vf_mbx;
++	struct pfvf_update_tunn_param_tlv *p_resp;
++	struct vfpf_update_tunn_param_tlv *p_req;
++	u8 status = PFVF_STATUS_SUCCESS;
++	bool b_update_required = false;
++	struct qed_tunnel_info tunn;
++	u16 tunn_feature_mask = 0;
++	int i, rc = 0;
++
++	mbx->offset = (u8 *)mbx->reply_virt;
++
++	memset(&tunn, 0, sizeof(tunn));
++	p_req = &mbx->req_virt->tunn_param_update;
++
++	if (!qed_iov_pf_validate_tunn_param(p_req)) {
++		DP_VERBOSE(p_hwfn, QED_MSG_IOV,
++			   "No tunnel update requested by VF\n");
++		status = PFVF_STATUS_FAILURE;
++		goto send_resp;
++	}
++
++	tunn.b_update_rx_cls = p_req->update_tun_cls;
++	tunn.b_update_tx_cls = p_req->update_tun_cls;
++
++	qed_iov_pf_update_tun_param(p_req, &tunn.vxlan, &tunn.vxlan_port,
++				    QED_MODE_VXLAN_TUNN, p_req->vxlan_clss,
++				    p_req->update_vxlan_port,
++				    p_req->vxlan_port);
++	qed_iov_pf_update_tun_param(p_req, &tunn.l2_geneve, &tunn.geneve_port,
++				    QED_MODE_L2GENEVE_TUNN,
++				    p_req->l2geneve_clss,
++				    p_req->update_geneve_port,
++				    p_req->geneve_port);
++	__qed_iov_pf_update_tun_param(p_req, &tunn.ip_geneve,
++				      QED_MODE_IPGENEVE_TUNN,
++				      p_req->ipgeneve_clss);
++	__qed_iov_pf_update_tun_param(p_req, &tunn.l2_gre,
++				      QED_MODE_L2GRE_TUNN, p_req->l2gre_clss);
++	__qed_iov_pf_update_tun_param(p_req, &tunn.ip_gre,
++				      QED_MODE_IPGRE_TUNN, p_req->ipgre_clss);
++
++	/* If PF modifies VF's req then it should
++	 * still return an error in case of partial configuration
++	 * or modified configuration as opposed to requested one.
++	 */
++	rc = qed_pf_validate_modify_tunn_config(p_hwfn, &tunn_feature_mask,
++						&b_update_required, &tunn);
++
++	if (rc)
++		status = PFVF_STATUS_FAILURE;
++
++	/* If QED client is willing to update anything ? */
++	if (b_update_required) {
++		u16 geneve_port;
++
++		rc = qed_sp_pf_update_tunn_cfg(p_hwfn, &tunn,
++					       QED_SPQ_MODE_EBLOCK, NULL);
++		if (rc)
++			status = PFVF_STATUS_FAILURE;
++
++		geneve_port = p_tun->geneve_port.port;
++		qed_for_each_vf(p_hwfn, i) {
++			qed_iov_bulletin_set_udp_ports(p_hwfn, i,
++						       p_tun->vxlan_port.port,
++						       geneve_port);
++		}
++	}
++
++send_resp:
++	p_resp = qed_add_tlv(p_hwfn, &mbx->offset,
++			     CHANNEL_TLV_UPDATE_TUNN_PARAM, sizeof(*p_resp));
++
++	qed_iov_pf_update_tun_response(p_resp, p_tun, tunn_feature_mask);
++	qed_add_tlv(p_hwfn, &mbx->offset, CHANNEL_TLV_LIST_END,
++		    sizeof(struct channel_list_end_tlv));
++
++	qed_iov_send_response(p_hwfn, p_ptt, p_vf, sizeof(*p_resp), status);
++}
++
+ static void qed_iov_vf_mbx_start_txq_resp(struct qed_hwfn *p_hwfn,
+ 					  struct qed_ptt *p_ptt,
+ 					  struct qed_vf_info *p_vf, u8 status)
+@@ -3233,6 +3447,9 @@ static void qed_iov_process_mbx_req(struct qed_hwfn *p_hwfn,
+ 		case CHANNEL_TLV_RELEASE:
+ 			qed_iov_vf_mbx_release(p_hwfn, p_ptt, p_vf);
+ 			break;
++		case CHANNEL_TLV_UPDATE_TUNN_PARAM:
++			qed_iov_vf_mbx_update_tunn_param(p_hwfn, p_ptt, p_vf);
++			break;
+ 		}
+ 	} else if (qed_iov_tlv_supported(mbx->first_tlv.tl.type)) {
+ 		DP_VERBOSE(p_hwfn, QED_MSG_IOV,
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_vf.c b/drivers/net/ethernet/qlogic/qed/qed_vf.c
+index 56cdd48b1236..422bf43109c7 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_vf.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_vf.c
+@@ -418,6 +418,155 @@ free_p_iov:
+ #define MSTORM_QZONE_START(dev)   (TSTORM_QZONE_START +	\
+ 				   (TSTORM_QZONE_SIZE * NUM_OF_L2_QUEUES(dev)))
+ 
++static void
++__qed_vf_prep_tunn_req_tlv(struct vfpf_update_tunn_param_tlv *p_req,
++			   struct qed_tunn_update_type *p_src,
++			   enum qed_tunn_clss mask, u8 *p_cls)
++{
++	if (p_src->b_update_mode) {
++		p_req->tun_mode_update_mask |= BIT(mask);
++
++		if (p_src->b_mode_enabled)
++			p_req->tunn_mode |= BIT(mask);
++	}
++
++	*p_cls = p_src->tun_cls;
++}
++
++static void
++qed_vf_prep_tunn_req_tlv(struct vfpf_update_tunn_param_tlv *p_req,
++			 struct qed_tunn_update_type *p_src,
++			 enum qed_tunn_clss mask,
++			 u8 *p_cls, struct qed_tunn_update_udp_port *p_port,
++			 u8 *p_update_port, u16 *p_udp_port)
++{
++	if (p_port->b_update_port) {
++		*p_update_port = 1;
++		*p_udp_port = p_port->port;
++	}
++
++	__qed_vf_prep_tunn_req_tlv(p_req, p_src, mask, p_cls);
++}
++
++void qed_vf_set_vf_start_tunn_update_param(struct qed_tunnel_info *p_tun)
++{
++	if (p_tun->vxlan.b_mode_enabled)
++		p_tun->vxlan.b_update_mode = true;
++	if (p_tun->l2_geneve.b_mode_enabled)
++		p_tun->l2_geneve.b_update_mode = true;
++	if (p_tun->ip_geneve.b_mode_enabled)
++		p_tun->ip_geneve.b_update_mode = true;
++	if (p_tun->l2_gre.b_mode_enabled)
++		p_tun->l2_gre.b_update_mode = true;
++	if (p_tun->ip_gre.b_mode_enabled)
++		p_tun->ip_gre.b_update_mode = true;
++
++	p_tun->b_update_rx_cls = true;
++	p_tun->b_update_tx_cls = true;
++}
++
++static void
++__qed_vf_update_tunn_param(struct qed_tunn_update_type *p_tun,
++			   u16 feature_mask, u8 tunn_mode,
++			   u8 tunn_cls, enum qed_tunn_mode val)
++{
++	if (feature_mask & BIT(val)) {
++		p_tun->b_mode_enabled = tunn_mode;
++		p_tun->tun_cls = tunn_cls;
++	} else {
++		p_tun->b_mode_enabled = false;
++	}
++}
++
++static void qed_vf_update_tunn_param(struct qed_hwfn *p_hwfn,
++				     struct qed_tunnel_info *p_tun,
++				     struct pfvf_update_tunn_param_tlv *p_resp)
++{
++	/* Update mode and classes provided by PF */
++	u16 feat_mask = p_resp->tunn_feature_mask;
++
++	__qed_vf_update_tunn_param(&p_tun->vxlan, feat_mask,
++				   p_resp->vxlan_mode, p_resp->vxlan_clss,
++				   QED_MODE_VXLAN_TUNN);
++	__qed_vf_update_tunn_param(&p_tun->l2_geneve, feat_mask,
++				   p_resp->l2geneve_mode,
++				   p_resp->l2geneve_clss,
++				   QED_MODE_L2GENEVE_TUNN);
++	__qed_vf_update_tunn_param(&p_tun->ip_geneve, feat_mask,
++				   p_resp->ipgeneve_mode,
++				   p_resp->ipgeneve_clss,
++				   QED_MODE_IPGENEVE_TUNN);
++	__qed_vf_update_tunn_param(&p_tun->l2_gre, feat_mask,
++				   p_resp->l2gre_mode, p_resp->l2gre_clss,
++				   QED_MODE_L2GRE_TUNN);
++	__qed_vf_update_tunn_param(&p_tun->ip_gre, feat_mask,
++				   p_resp->ipgre_mode, p_resp->ipgre_clss,
++				   QED_MODE_IPGRE_TUNN);
++	p_tun->geneve_port.port = p_resp->geneve_udp_port;
++	p_tun->vxlan_port.port = p_resp->vxlan_udp_port;
++
++	DP_VERBOSE(p_hwfn, QED_MSG_IOV,
++		   "tunn mode: vxlan=0x%x, l2geneve=0x%x, ipgeneve=0x%x, l2gre=0x%x, ipgre=0x%x",
++		   p_tun->vxlan.b_mode_enabled, p_tun->l2_geneve.b_mode_enabled,
++		   p_tun->ip_geneve.b_mode_enabled,
++		   p_tun->l2_gre.b_mode_enabled, p_tun->ip_gre.b_mode_enabled);
++}
++
++int qed_vf_pf_tunnel_param_update(struct qed_hwfn *p_hwfn,
++				  struct qed_tunnel_info *p_src)
++{
++	struct qed_tunnel_info *p_tun = &p_hwfn->cdev->tunnel;
++	struct qed_vf_iov *p_iov = p_hwfn->vf_iov_info;
++	struct pfvf_update_tunn_param_tlv *p_resp;
++	struct vfpf_update_tunn_param_tlv *p_req;
++	int rc;
++
++	p_req = qed_vf_pf_prep(p_hwfn, CHANNEL_TLV_UPDATE_TUNN_PARAM,
++			       sizeof(*p_req));
++
++	if (p_src->b_update_rx_cls && p_src->b_update_tx_cls)
++		p_req->update_tun_cls = 1;
++
++	qed_vf_prep_tunn_req_tlv(p_req, &p_src->vxlan, QED_MODE_VXLAN_TUNN,
++				 &p_req->vxlan_clss, &p_src->vxlan_port,
++				 &p_req->update_vxlan_port,
++				 &p_req->vxlan_port);
++	qed_vf_prep_tunn_req_tlv(p_req, &p_src->l2_geneve,
++				 QED_MODE_L2GENEVE_TUNN,
++				 &p_req->l2geneve_clss, &p_src->geneve_port,
++				 &p_req->update_geneve_port,
++				 &p_req->geneve_port);
++	__qed_vf_prep_tunn_req_tlv(p_req, &p_src->ip_geneve,
++				   QED_MODE_IPGENEVE_TUNN,
++				   &p_req->ipgeneve_clss);
++	__qed_vf_prep_tunn_req_tlv(p_req, &p_src->l2_gre,
++				   QED_MODE_L2GRE_TUNN, &p_req->l2gre_clss);
++	__qed_vf_prep_tunn_req_tlv(p_req, &p_src->ip_gre,
++				   QED_MODE_IPGRE_TUNN, &p_req->ipgre_clss);
++
++	/* add list termination tlv */
++	qed_add_tlv(p_hwfn, &p_iov->offset,
++		    CHANNEL_TLV_LIST_END,
++		    sizeof(struct channel_list_end_tlv));
++
++	p_resp = &p_iov->pf2vf_reply->tunn_param_resp;
++	rc = qed_send_msg2pf(p_hwfn, &p_resp->hdr.status, sizeof(*p_resp));
++
++	if (rc)
++		goto exit;
++
++	if (p_resp->hdr.status != PFVF_STATUS_SUCCESS) {
++		DP_VERBOSE(p_hwfn, QED_MSG_IOV,
++			   "Failed to update tunnel parameters\n");
++		rc = -EINVAL;
++	}
++
++	qed_vf_update_tunn_param(p_hwfn, p_tun, p_resp);
++exit:
++	qed_vf_pf_req_end(p_hwfn, rc);
++	return rc;
++}
++
+ int
+ qed_vf_pf_rxq_start(struct qed_hwfn *p_hwfn,
+ 		    struct qed_queue_cid *p_cid,
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_vf.h b/drivers/net/ethernet/qlogic/qed/qed_vf.h
+index 105c0edd2a01..f1b63d8190b8 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_vf.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_vf.h
+@@ -429,6 +429,43 @@ struct vfpf_ucast_filter_tlv {
+ 	u16 padding[3];
+ };
+ 
++/* tunnel update param tlv */
++struct vfpf_update_tunn_param_tlv {
++	struct vfpf_first_tlv first_tlv;
++
++	u8 tun_mode_update_mask;
++	u8 tunn_mode;
++	u8 update_tun_cls;
++	u8 vxlan_clss;
++	u8 l2gre_clss;
++	u8 ipgre_clss;
++	u8 l2geneve_clss;
++	u8 ipgeneve_clss;
++	u8 update_geneve_port;
++	u8 update_vxlan_port;
++	u16 geneve_port;
++	u16 vxlan_port;
++	u8 padding[2];
++};
++
++struct pfvf_update_tunn_param_tlv {
++	struct pfvf_tlv hdr;
++
++	u16 tunn_feature_mask;
++	u8 vxlan_mode;
++	u8 l2geneve_mode;
++	u8 ipgeneve_mode;
++	u8 l2gre_mode;
++	u8 ipgre_mode;
++	u8 vxlan_clss;
++	u8 l2gre_clss;
++	u8 ipgre_clss;
++	u8 l2geneve_clss;
++	u8 ipgeneve_clss;
++	u16 vxlan_udp_port;
++	u16 geneve_udp_port;
++};
++
+ struct tlv_buffer_size {
+ 	u8 tlv_buffer[TLV_BUFFER_SIZE];
+ };
+@@ -444,6 +481,7 @@ union vfpf_tlvs {
+ 	struct vfpf_vport_start_tlv start_vport;
+ 	struct vfpf_vport_update_tlv vport_update;
+ 	struct vfpf_ucast_filter_tlv ucast_filter;
++	struct vfpf_update_tunn_param_tlv tunn_param_update;
+ 	struct channel_list_end_tlv list_end;
+ 	struct tlv_buffer_size tlv_buf_size;
+ };
+@@ -453,6 +491,7 @@ union pfvf_tlvs {
+ 	struct pfvf_acquire_resp_tlv acquire_resp;
+ 	struct tlv_buffer_size tlv_buf_size;
+ 	struct pfvf_start_queue_resp_tlv queue_start;
++	struct pfvf_update_tunn_param_tlv tunn_param_resp;
+ };
+ 
+ enum qed_bulletin_bit {
+@@ -555,6 +594,7 @@ enum {
+ 	CHANNEL_TLV_VPORT_UPDATE_RSS,
+ 	CHANNEL_TLV_VPORT_UPDATE_ACCEPT_ANY_VLAN,
+ 	CHANNEL_TLV_VPORT_UPDATE_SGE_TPA,
++	CHANNEL_TLV_UPDATE_TUNN_PARAM,
+ 	CHANNEL_TLV_MAX,
+ 
+ 	/* Required for iterating over vport-update tlvs.
+@@ -872,6 +912,9 @@ void __qed_vf_get_link_caps(struct qed_hwfn *p_hwfn,
+ 			    struct qed_bulletin_content *p_bulletin);
+ 
+ void qed_iov_vf_task(struct work_struct *work);
++void qed_vf_set_vf_start_tunn_update_param(struct qed_tunnel_info *p_tun);
++int qed_vf_pf_tunnel_param_update(struct qed_hwfn *p_hwfn,
++				  struct qed_tunnel_info *p_tunn);
+ #else
+ static inline void qed_vf_get_link_params(struct qed_hwfn *p_hwfn,
+ 					  struct qed_mcp_link_params *params)
+@@ -1033,6 +1076,17 @@ __qed_vf_get_link_caps(struct qed_hwfn *p_hwfn,
+ static inline void qed_iov_vf_task(struct work_struct *work)
+ {
+ }
++
++static inline void
++qed_vf_set_vf_start_tunn_update_param(struct qed_tunnel_info *p_tun)
++{
++}
++
++static inline int qed_vf_pf_tunnel_param_update(struct qed_hwfn *p_hwfn,
++						struct qed_tunnel_info *p_tunn)
++{
++	return -EINVAL;
++}
+ #endif
+ 
+ #endif
