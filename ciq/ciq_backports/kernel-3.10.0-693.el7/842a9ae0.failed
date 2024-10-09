@@ -1,0 +1,266 @@
+bridge: Extend Proxy ARP design to allow optional rules for Wi-Fi
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jouni Malinen <jouni@codeaurora.org>
+commit 842a9ae08a25671db3d4f689eed68b4d64be15b5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/842a9ae0.failed
+
+This extends the design in commit 958501163ddd ("bridge: Add support for
+IEEE 802.11 Proxy ARP") with optional set of rules that are needed to
+meet the IEEE 802.11 and Hotspot 2.0 requirements for ProxyARP. The
+previously added BR_PROXYARP behavior is left as-is and a new
+BR_PROXYARP_WIFI alternative is added so that this behavior can be
+configured from user space when required.
+
+In addition, this enables proxyarp functionality for unicast ARP
+requests for both BR_PROXYARP and BR_PROXYARP_WIFI since it is possible
+to use unicast as well as broadcast for these frames.
+
+The key differences in functionality:
+
+BR_PROXYARP:
+- uses the flag on the bridge port on which the request frame was
+  received to determine whether to reply
+- block bridge port flooding completely on ports that enable proxy ARP
+
+BR_PROXYARP_WIFI:
+- uses the flag on the bridge port to which the target device of the
+  request belongs
+- block bridge port flooding selectively based on whether the proxyarp
+  functionality replied
+
+	Signed-off-by: Jouni Malinen <jouni@codeaurora.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 842a9ae08a25671db3d4f689eed68b4d64be15b5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_forward.c
+#	net/bridge/br_input.c
+#	net/bridge/br_netlink.c
+#	net/bridge/br_private.h
+#	net/bridge/br_sysfs_if.c
+diff --cc net/bridge/br_forward.c
+index 20c11b41fe6a,1238fabff874..000000000000
+--- a/net/bridge/br_forward.c
++++ b/net/bridge/br_forward.c
+@@@ -205,6 -184,14 +205,17 @@@ static void br_flood(struct net_bridge 
+  		/* Do not flood unicast traffic to ports that turn it off */
+  		if (unicast && !(p->flags & BR_FLOOD))
+  			continue;
+++<<<<<<< HEAD
+++=======
++ 
++ 		/* Do not flood to ports that enable proxy ARP */
++ 		if (p->flags & BR_PROXYARP)
++ 			continue;
++ 		if ((p->flags & BR_PROXYARP_WIFI) &&
++ 		    BR_INPUT_SKB_CB(skb)->proxyarp_replied)
++ 			continue;
++ 
+++>>>>>>> 842a9ae08a25 (bridge: Extend Proxy ARP design to allow optional rules for Wi-Fi)
+  		prev = maybe_deliver(prev, p, skb, __packet_hook);
+  		if (IS_ERR(prev))
+  			goto out;
+diff --cc net/bridge/br_input.c
+index ddc6cbe6269c,052c5ebbc947..000000000000
+--- a/net/bridge/br_input.c
++++ b/net/bridge/br_input.c
+@@@ -53,9 -55,67 +53,73 @@@ static int br_pass_frame_up(struct sk_b
+  	if (!skb)
+  		return NET_RX_DROP;
+  
+++<<<<<<< HEAD
+ +	return NF_HOOK(NFPROTO_BRIDGE, NF_BR_LOCAL_IN, NULL, skb,
+ +		       indev, NULL,
+ +		       netif_receive_skb_sk);
+++=======
++ 	return NF_HOOK(NFPROTO_BRIDGE, NF_BR_LOCAL_IN, skb, indev, NULL,
++ 		       netif_receive_skb);
++ }
++ 
++ static void br_do_proxy_arp(struct sk_buff *skb, struct net_bridge *br,
++ 			    u16 vid, struct net_bridge_port *p)
++ {
++ 	struct net_device *dev = br->dev;
++ 	struct neighbour *n;
++ 	struct arphdr *parp;
++ 	u8 *arpptr, *sha;
++ 	__be32 sip, tip;
++ 
++ 	BR_INPUT_SKB_CB(skb)->proxyarp_replied = false;
++ 
++ 	if (dev->flags & IFF_NOARP)
++ 		return;
++ 
++ 	if (!pskb_may_pull(skb, arp_hdr_len(dev))) {
++ 		dev->stats.tx_dropped++;
++ 		return;
++ 	}
++ 	parp = arp_hdr(skb);
++ 
++ 	if (parp->ar_pro != htons(ETH_P_IP) ||
++ 	    parp->ar_op != htons(ARPOP_REQUEST) ||
++ 	    parp->ar_hln != dev->addr_len ||
++ 	    parp->ar_pln != 4)
++ 		return;
++ 
++ 	arpptr = (u8 *)parp + sizeof(struct arphdr);
++ 	sha = arpptr;
++ 	arpptr += dev->addr_len;	/* sha */
++ 	memcpy(&sip, arpptr, sizeof(sip));
++ 	arpptr += sizeof(sip);
++ 	arpptr += dev->addr_len;	/* tha */
++ 	memcpy(&tip, arpptr, sizeof(tip));
++ 
++ 	if (ipv4_is_loopback(tip) ||
++ 	    ipv4_is_multicast(tip))
++ 		return;
++ 
++ 	n = neigh_lookup(&arp_tbl, &tip, dev);
++ 	if (n) {
++ 		struct net_bridge_fdb_entry *f;
++ 
++ 		if (!(n->nud_state & NUD_VALID)) {
++ 			neigh_release(n);
++ 			return;
++ 		}
++ 
++ 		f = __br_fdb_get(br, n->ha, vid);
++ 		if (f && ((p->flags & BR_PROXYARP) ||
++ 			  (f->dst && (f->dst->flags & BR_PROXYARP_WIFI)))) {
++ 			arp_send(ARPOP_REPLY, ETH_P_ARP, sip, skb->dev, tip,
++ 				 sha, n->ha, sha);
++ 			BR_INPUT_SKB_CB(skb)->proxyarp_replied = true;
++ 		}
++ 
++ 		neigh_release(n);
++ 	}
+++>>>>>>> 842a9ae08a25 (bridge: Extend Proxy ARP design to allow optional rules for Wi-Fi)
+  }
+  
+  /* note: already called with rcu_read_lock */
+@@@ -98,6 -158,9 +162,12 @@@ int br_handle_frame_finish(struct sock 
+  
+  	dst = NULL;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (IS_ENABLED(CONFIG_INET) && skb->protocol == htons(ETH_P_ARP))
++ 		br_do_proxy_arp(skb, br, vid, p);
++ 
+++>>>>>>> 842a9ae08a25 (bridge: Extend Proxy ARP design to allow optional rules for Wi-Fi)
+  	if (is_broadcast_ether_addr(dest)) {
+  		skb2 = skb;
+  		unicast = false;
+diff --cc net/bridge/br_netlink.c
+index 56317af859ca,8bc6b67457dc..000000000000
+--- a/net/bridge/br_netlink.c
++++ b/net/bridge/br_netlink.c
+@@@ -60,7 -142,10 +60,14 @@@ static int br_port_fill_attrs(struct sk
+  	    nla_put_u8(skb, IFLA_BRPORT_PROTECT, !!(p->flags & BR_ROOT_BLOCK)) ||
+  	    nla_put_u8(skb, IFLA_BRPORT_FAST_LEAVE, !!(p->flags & BR_MULTICAST_FAST_LEAVE)) ||
+  	    nla_put_u8(skb, IFLA_BRPORT_LEARNING, !!(p->flags & BR_LEARNING)) ||
+++<<<<<<< HEAD
+ +	    nla_put_u8(skb, IFLA_BRPORT_UNICAST_FLOOD, !!(p->flags & BR_FLOOD)))
+++=======
++ 	    nla_put_u8(skb, IFLA_BRPORT_UNICAST_FLOOD, !!(p->flags & BR_FLOOD)) ||
++ 	    nla_put_u8(skb, IFLA_BRPORT_PROXYARP, !!(p->flags & BR_PROXYARP)) ||
++ 	    nla_put_u8(skb, IFLA_BRPORT_PROXYARP_WIFI,
++ 		       !!(p->flags & BR_PROXYARP_WIFI)))
+++>>>>>>> 842a9ae08a25 (bridge: Extend Proxy ARP design to allow optional rules for Wi-Fi)
+  		return -EMSGSIZE;
+  
+  	return 0;
+@@@ -473,6 -554,8 +480,11 @@@ static int br_setport(struct net_bridge
+  	br_set_port_flag(p, tb, IFLA_BRPORT_PROTECT, BR_ROOT_BLOCK);
+  	br_set_port_flag(p, tb, IFLA_BRPORT_LEARNING, BR_LEARNING);
+  	br_set_port_flag(p, tb, IFLA_BRPORT_UNICAST_FLOOD, BR_FLOOD);
+++<<<<<<< HEAD
+++=======
++ 	br_set_port_flag(p, tb, IFLA_BRPORT_PROXYARP, BR_PROXYARP);
++ 	br_set_port_flag(p, tb, IFLA_BRPORT_PROXYARP_WIFI, BR_PROXYARP_WIFI);
+++>>>>>>> 842a9ae08a25 (bridge: Extend Proxy ARP design to allow optional rules for Wi-Fi)
+  
+  	if (tb[IFLA_BRPORT_COST]) {
+  		err = br_stp_set_path_cost(p, nla_get_u32(tb[IFLA_BRPORT_COST]));
+diff --cc net/bridge/br_private.h
+index dadd34070a9c,c32e279c62f8..000000000000
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@@ -298,6 -304,12 +298,15 @@@ struct br_input_skb_cb 
+  	int mrouters_only;
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ 	u16 frag_max_size;
++ 	bool proxyarp_replied;
++ 
++ #ifdef CONFIG_BRIDGE_VLAN_FILTERING
++ 	bool vlan_filtered;
++ #endif
+++>>>>>>> 842a9ae08a25 (bridge: Extend Proxy ARP design to allow optional rules for Wi-Fi)
+  };
+  
+  #define BR_INPUT_SKB_CB(__skb)	((struct br_input_skb_cb *)(__skb)->cb)
+diff --cc net/bridge/br_sysfs_if.c
+index 51d2694047c6,4905845a94e9..000000000000
+--- a/net/bridge/br_sysfs_if.c
++++ b/net/bridge/br_sysfs_if.c
+@@@ -169,6 -170,8 +169,11 @@@ BRPORT_ATTR_FLAG(bpdu_guard, BR_BPDU_GU
+  BRPORT_ATTR_FLAG(root_block, BR_ROOT_BLOCK);
+  BRPORT_ATTR_FLAG(learning, BR_LEARNING);
+  BRPORT_ATTR_FLAG(unicast_flood, BR_FLOOD);
+++<<<<<<< HEAD
+++=======
++ BRPORT_ATTR_FLAG(proxyarp, BR_PROXYARP);
++ BRPORT_ATTR_FLAG(proxyarp_wifi, BR_PROXYARP_WIFI);
+++>>>>>>> 842a9ae08a25 (bridge: Extend Proxy ARP design to allow optional rules for Wi-Fi)
+  
+  #ifdef CONFIG_BRIDGE_IGMP_SNOOPING
+  static ssize_t show_multicast_router(struct net_bridge_port *p, char *buf)
+@@@ -212,6 -215,8 +217,11 @@@ static const struct brport_attribute *b
+  	&brport_attr_multicast_router,
+  	&brport_attr_multicast_fast_leave,
+  #endif
+++<<<<<<< HEAD
+++=======
++ 	&brport_attr_proxyarp,
++ 	&brport_attr_proxyarp_wifi,
+++>>>>>>> 842a9ae08a25 (bridge: Extend Proxy ARP design to allow optional rules for Wi-Fi)
+  	NULL
+  };
+  
+diff --git a/include/linux/if_bridge.h b/include/linux/if_bridge.h
+index d66e75e57470..914b4649360f 100644
+--- a/include/linux/if_bridge.h
++++ b/include/linux/if_bridge.h
+@@ -44,6 +44,7 @@ struct br_ip_list {
+ #define BR_PROMISC		BIT(7)
+ #define BR_PROXYARP		BIT(8)
+ #define BR_LEARNING_SYNC	BIT(9)
++#define BR_PROXYARP_WIFI	BIT(10)
+ 
+ /* values as per ieee8021QBridgeFdbAgingTime */
+ #define BR_MIN_AGEING_TIME	(10 * HZ)
+diff --git a/include/uapi/linux/if_link.h b/include/uapi/linux/if_link.h
+index 1b43f8aab560..52d55e8c5530 100644
+--- a/include/uapi/linux/if_link.h
++++ b/include/uapi/linux/if_link.h
+@@ -256,6 +256,7 @@ enum {
+ 	/* RHEL: IFLA_BRPORT_PROXYARP not fully supported yet */
+ 	RESERVED_IFLA_BRPORT_PROXYARP,	/* proxy ARP */
+ 	IFLA_BRPORT_LEARNING_SYNC, /* mac learning sync from device */
++	IFLA_BRPORT_PROXYARP_WIFI, /* proxy ARP for Wi-Fi */
+ 	__IFLA_BRPORT_MAX
+ };
+ #define IFLA_BRPORT_MAX (__IFLA_BRPORT_MAX - 1)
+* Unmerged path net/bridge/br_forward.c
+* Unmerged path net/bridge/br_input.c
+* Unmerged path net/bridge/br_netlink.c
+* Unmerged path net/bridge/br_private.h
+* Unmerged path net/bridge/br_sysfs_if.c
