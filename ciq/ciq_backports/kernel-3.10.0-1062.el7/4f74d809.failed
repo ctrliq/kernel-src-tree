@@ -1,0 +1,77 @@
+bpf: fix kallsyms handling for subprogs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit 4f74d80971bce93d9e608c40324d662c70eb4664
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/4f74d809.failed
+
+Right now kallsyms handling is not working with JITed subprogs.
+The reason is that when in 1c2a088a6626 ("bpf: x64: add JIT support
+for multi-function programs") in jit_subprogs() they are passed
+to bpf_prog_kallsyms_add(), then their prog type is 0, which BPF
+core will think it's a cBPF program as only cBPF programs have a
+0 type. Thus, they need to inherit the type from the main prog.
+
+Once that is fixed, they are indeed added to the BPF kallsyms
+infra, but their tag is 0. Therefore, since intention is to add
+them as bpf_prog_F_<tag>, we need to pass them to bpf_prog_calc_tag()
+first. And once this is resolved, there is a use-after-free on
+prog cleanup: we remove the kallsyms entry from the main prog,
+later walk all subprogs and call bpf_jit_free() on them. However,
+the kallsyms linkage was never released on them. Thus, do that
+for all subprogs right in __bpf_prog_put() when refcount hits 0.
+
+Fixes: 1c2a088a6626 ("bpf: x64: add JIT support for multi-function programs")
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit 4f74d80971bce93d9e608c40324d662c70eb4664)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/syscall.c
+diff --cc kernel/bpf/syscall.c
+index f8f3ed8bef67,30e728dcd35d..000000000000
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@@ -951,8 -937,16 +951,21 @@@ static void __bpf_prog_put_rcu(struct r
+  static void __bpf_prog_put(struct bpf_prog *prog, bool do_idr_lock)
+  {
+  	if (atomic_dec_and_test(&prog->aux->refcnt)) {
+++<<<<<<< HEAD
+ +		/* bpf_prog_free_id() must be called first */
+ +		bpf_prog_free_id(prog, do_idr_lock);
+++=======
++ 		int i;
++ 
++ 		trace_bpf_prog_put_rcu(prog);
++ 		/* bpf_prog_free_id() must be called first */
++ 		bpf_prog_free_id(prog, do_idr_lock);
++ 
++ 		for (i = 0; i < prog->aux->func_cnt; i++)
++ 			bpf_prog_kallsyms_del(prog->aux->func[i]);
++ 		bpf_prog_kallsyms_del(prog);
++ 
+++>>>>>>> 4f74d80971bc (bpf: fix kallsyms handling for subprogs)
+  		call_rcu(&prog->aux->rcu, __bpf_prog_put_rcu);
+  	}
+  }
+* Unmerged path kernel/bpf/syscall.c
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 5cb5e92d5f64..c7899184f856 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -5304,7 +5304,10 @@ static int jit_subprogs(struct bpf_verifier_env *env)
+ 			goto out_free;
+ 		memcpy(func[i]->insnsi, &prog->insnsi[subprog_start],
+ 		       len * sizeof(struct bpf_insn));
++		func[i]->type = prog->type;
+ 		func[i]->len = len;
++		if (bpf_prog_calc_tag(func[i]))
++			goto out_free;
+ 		func[i]->is_func = 1;
+ 		/* Use bpf_prog_F_tag to indicate functions in stack traces.
+ 		 * Long term would need debug info to populate names
