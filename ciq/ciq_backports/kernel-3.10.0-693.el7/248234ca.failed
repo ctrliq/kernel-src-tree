@@ -1,0 +1,202 @@
+bridge: vlan: don't pass flags when creating context only
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+commit 248234ca029710fbad6423c48f98c2a6ea9582fb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/248234ca.failed
+
+We should not pass the original flags when creating a context vlan only
+because they may contain some flags that change behaviour in the bridge.
+The new global context should be with minimal set of flags, so pass 0
+and let br_vlan_add() set the master flag only.
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 248234ca029710fbad6423c48f98c2a6ea9582fb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_vlan.c
+diff --cc net/bridge/br_vlan.c
+index 1122c9d717ea,75214a51cf0e..000000000000
+--- a/net/bridge/br_vlan.c
++++ b/net/bridge/br_vlan.c
+@@@ -63,68 -182,130 +63,92 @@@ static int __vlan_add(struct net_port_v
+  		 * This ensures tagged traffic enters the bridge when
+  		 * promiscuous mode is disabled by br_manage_promisc().
+  		 */
+ -		err = __vlan_vid_add(dev, br, v->vid, flags);
+ +		err = vlan_vid_add(dev, br->vlan_proto, vid);
+  		if (err)
+++<<<<<<< HEAD
+ +			return err;
+++=======
++ 			goto out;
++ 
++ 		/* need to work on the master vlan too */
++ 		if (flags & BRIDGE_VLAN_INFO_MASTER) {
++ 			master_flags |= BRIDGE_VLAN_INFO_BRENTRY;
++ 			err = br_vlan_add(br, v->vid, master_flags);
++ 			if (err)
++ 				goto out_filt;
++ 		}
++ 
++ 		masterv = br_vlan_find(br->vlgrp, v->vid);
++ 		if (!masterv) {
++ 			/* missing global ctx, create it now */
++ 			err = br_vlan_add(br, v->vid, 0);
++ 			if (err)
++ 				goto out_filt;
++ 			masterv = br_vlan_find(br->vlgrp, v->vid);
++ 			WARN_ON(!masterv);
++ 		}
++ 		atomic_inc(&masterv->refcnt);
++ 		v->brvlan = masterv;
+++>>>>>>> 248234ca0297 (bridge: vlan: don't pass flags when creating context only)
+  	}
+  
+ -	/* Add the dev mac only if it's a usable vlan */
+ -	if (br_vlan_should_use(v)) {
+ -		err = br_fdb_insert(br, p, dev->dev_addr, v->vid);
+ -		if (err) {
+ -			br_err(br, "failed insert local address into bridge forwarding table\n");
+ -			goto out_filt;
+ -		}
+ +	err = br_fdb_insert(br, p, dev->dev_addr, vid);
+ +	if (err) {
+ +		br_err(br, "failed insert local address into bridge "
+ +		       "forwarding table\n");
+ +		goto out_filt;
+  	}
+  
+ -	err = rhashtable_lookup_insert_fast(tbl, &v->vnode, br_vlan_rht_params);
+ -	if (err)
+ -		goto out_fdb_insert;
+ -
+ -	__vlan_add_list(v);
+ -	__vlan_add_flags(v, flags);
+ -	if (br_vlan_is_master(v)) {
+ -		if (br_vlan_is_brentry(v))
+ -			br->vlgrp->num_vlans++;
+ -	} else {
+ -		p->vlgrp->num_vlans++;
+ -	}
+ -out:
+ -	return err;
+ +	set_bit(vid, v->vlan_bitmap);
+ +	v->num_vlans++;
+ +	__vlan_add_flags(v, vid, flags);
+  
+ -out_fdb_insert:
+ -	br_fdb_find_delete_local(br, p, br->dev->dev_addr, v->vid);
+ +	return 0;
+  
+  out_filt:
+ -	if (p) {
+ -		__vlan_vid_del(dev, br, v->vid);
+ -		if (masterv) {
+ -			atomic_dec(&masterv->refcnt);
+ -			v->brvlan = NULL;
+ -		}
+ -	}
+ -
+ -	goto out;
+ +	if (p && p->br->vlan_enabled)
+ +		vlan_vid_del(dev, br->vlan_proto, vid);
+ +	return err;
+  }
+  
+ -static int __vlan_del(struct net_bridge_vlan *v)
+ +static int __vlan_del(struct net_port_vlans *v, u16 vid)
+  {
+ -	struct net_bridge_vlan *masterv = v;
+ -	struct net_bridge_vlan_group *vg;
+ -	struct net_bridge_port *p = NULL;
+ -	struct net_bridge *br;
+ -	int err = 0;
+ +	if (!test_bit(vid, v->vlan_bitmap))
+ +		return -EINVAL;
+  
+ -	if (br_vlan_is_master(v)) {
+ -		br = v->br;
+ -		vg = v->br->vlgrp;
+ -	} else {
+ -		p = v->port;
+ -		br = p->br;
+ -		vg = v->port->vlgrp;
+ -		masterv = v->brvlan;
+ -	}
+ +	__vlan_delete_pvid(v, vid);
+ +	clear_bit(vid, v->untagged_bitmap);
+  
+ -	__vlan_delete_pvid(vg, v->vid);
+ -	if (p) {
+ -		err = __vlan_vid_del(p->dev, p->br, v->vid);
+ -		if (err)
+ -			goto out;
+ -	}
+ +	if (v->port_idx) {
+ +		struct net_bridge_port *p = v->parent.port;
+  
+ -	if (br_vlan_is_master(v)) {
+ -		if (br_vlan_is_brentry(v)) {
+ -			v->flags &= ~BRIDGE_VLAN_INFO_BRENTRY;
+ -			br->vlgrp->num_vlans--;
+ -		}
+ -	} else {
+ -		p->vlgrp->num_vlans--;
+ +		/* Toggle HW filters when filtering is enabled */
+ +		if (p->br->vlan_enabled)
+ +			vlan_vid_del(p->dev, p->br->vlan_proto, vid);
+  	}
+  
+ -	if (masterv != v) {
+ -		rhashtable_remove_fast(&vg->vlan_hash, &v->vnode,
+ -				       br_vlan_rht_params);
+ -		__vlan_del_list(v);
+ +	clear_bit(vid, v->vlan_bitmap);
+ +	v->num_vlans--;
+ +	if (bitmap_empty(v->vlan_bitmap, VLAN_N_VID)) {
+ +		if (v->port_idx)
+ +			RCU_INIT_POINTER(v->parent.port->vlan_info, NULL);
+ +		else
+ +			RCU_INIT_POINTER(v->parent.br->vlan_info, NULL);
+  		kfree_rcu(v, rcu);
+  	}
+ -
+ -	if (atomic_dec_and_test(&masterv->refcnt)) {
+ -		rhashtable_remove_fast(&masterv->br->vlgrp->vlan_hash,
+ -				       &masterv->vnode, br_vlan_rht_params);
+ -		__vlan_del_list(masterv);
+ -		kfree_rcu(masterv, rcu);
+ -	}
+ -out:
+ -	return err;
+ +	return 0;
+  }
+  
+ -static void __vlan_flush(struct net_bridge_vlan_group *vlgrp)
+ +static void __vlan_flush(struct net_port_vlans *v)
+  {
+ -	struct net_bridge_vlan *vlan, *tmp;
+ -
+ -	__vlan_delete_pvid(vlgrp, vlgrp->pvid);
+ -	list_for_each_entry_safe(vlan, tmp, &vlgrp->vlan_list, vlist)
+ -		__vlan_del(vlan);
+ -	rhashtable_destroy(&vlgrp->vlan_hash);
+ -	kfree(vlgrp);
+ +	smp_wmb();
+ +	v->pvid = 0;
+ +	bitmap_zero(v->vlan_bitmap, VLAN_N_VID);
+ +	if (v->port_idx)
+ +		RCU_INIT_POINTER(v->parent.port->vlan_info, NULL);
+ +	else
+ +		RCU_INIT_POINTER(v->parent.br->vlan_info, NULL);
+ +	kfree_rcu(v, rcu);
+  }
+  
+  struct sk_buff *br_handle_vlan(struct net_bridge *br,
+* Unmerged path net/bridge/br_vlan.c
