@@ -1,0 +1,199 @@
+md/raid5: use md_write_start to count stripes, not bios
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [md] raid5: use md_write_start to count stripes, not bios (Nigel Croxon) [1506338]
+Rebuild_FUZZ: 97.20%
+commit-author NeilBrown <neilb@suse.com>
+commit 497280509f32340d90feac030bce18006a3e3605
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/49728050.failed
+
+We use md_write_start() to increase the count of pending writes, and
+md_write_end() to decrement the count.  We currently count bios
+submitted to md/raid5.  Change it count stripe_heads that a WRITE bio
+has been attached to.
+
+So now, raid5_make_request() calls md_write_start() and then
+md_write_end() to keep the count elevated during the setup of the
+request.
+
+add_stripe_bio() calls md_write_start() for each stripe_head, and the
+completion routines always call md_write_end(), instead of only
+calling it when raid5_dec_bi_active_stripes() returns 0.
+make_discard_request also calls md_write_start/end().
+
+The parallel between md_write_{start,end} and use of bi_phys_segments
+can be seen in that:
+ Whenever we set bi_phys_segments to 1, we now call md_write_start.
+ Whenever we increment it on non-read requests with
+   raid5_inc_bi_active_stripes(), we now call md_write_start().
+ Whenever we decrement bi_phys_segments on non-read requsts with
+    raid5_dec_bi_active_stripes(), we now call md_write_end().
+
+This reduces our dependence on keeping a per-bio count of active
+stripes in bi_phys_segments.
+
+md_write_inc() is added which parallels md_write_start(), but requires
+that a write has already been started, and is certain never to sleep.
+This can be used inside a spinlocked region when adding to a write
+request.
+
+	Signed-off-by: NeilBrown <neilb@suse.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit 497280509f32340d90feac030bce18006a3e3605)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/md.h
+#	drivers/md/raid5.c
+diff --cc drivers/md/md.h
+index 0d13bf88f41f,0cd12721a536..000000000000
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@@ -649,7 -647,8 +649,12 @@@ extern void md_unregister_thread(struc
+  extern void md_wakeup_thread(struct md_thread *thread);
+  extern void md_check_recovery(struct mddev *mddev);
+  extern void md_reap_sync_thread(struct mddev *mddev);
+++<<<<<<< HEAD
+ +extern bool md_write_start(struct mddev *mddev, struct bio *bi);
+++=======
++ extern void md_write_start(struct mddev *mddev, struct bio *bi);
++ extern void md_write_inc(struct mddev *mddev, struct bio *bi);
+++>>>>>>> 497280509f32 (md/raid5: use md_write_start to count stripes, not bios)
+  extern void md_write_end(struct mddev *mddev);
+  extern void md_done_sync(struct mddev *mddev, int blocks, int ok);
+  extern void md_error(struct mddev *mddev, struct md_rdev *rdev);
+diff --cc drivers/md/raid5.c
+index aa86463a5e50,a684003fc965..000000000000
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@@ -3214,14 -3393,14 +3215,20 @@@ handle_failed_stripe(struct r5conf *con
+  		if (test_and_clear_bit(R5_Overlap, &sh->dev[i].flags))
+  			wake_up(&conf->wait_for_overlap);
+  
+ -		while (bi && bi->bi_iter.bi_sector <
+ +		while (bi && bi->bi_sector <
+  			sh->dev[i].sector + STRIPE_SECTORS) {
+  			struct bio *nextbi = r5_next_bio(bi, sh->dev[i].sector);
+++<<<<<<< HEAD
+ +			clear_bit(BIO_UPTODATE, &bi->bi_flags);
+ +			if (!raid5_dec_bi_active_stripes(bi)) {
+ +				md_write_end(conf->mddev);
+++=======
++ 
++ 			bi->bi_error = -EIO;
++ 			md_write_end(conf->mddev);
++ 			if (!raid5_dec_bi_active_stripes(bi))
+++>>>>>>> 497280509f32 (md/raid5: use md_write_start to count stripes, not bios)
+  				bio_list_add(return_bi, bi);
+- 			}
+  			bi = nextbi;
+  		}
+  		if (bitmap_end)
+@@@ -3237,14 -3416,14 +3244,20 @@@
+  		}
+  
+  		if (bi) bitmap_end = 1;
+ -		while (bi && bi->bi_iter.bi_sector <
+ +		while (bi && bi->bi_sector <
+  		       sh->dev[i].sector + STRIPE_SECTORS) {
+  			struct bio *bi2 = r5_next_bio(bi, sh->dev[i].sector);
+++<<<<<<< HEAD
+ +			clear_bit(BIO_UPTODATE, &bi->bi_flags);
+ +			if (!raid5_dec_bi_active_stripes(bi)) {
+ +				md_write_end(conf->mddev);
+++=======
++ 
++ 			bi->bi_error = -EIO;
++ 			md_write_end(conf->mddev);
++ 			if (!raid5_dec_bi_active_stripes(bi))
+++>>>>>>> 497280509f32 (md/raid5: use md_write_start to count stripes, not bios)
+  				bio_list_add(return_bi, bi);
+- 			}
+  			bi = bi2;
+  		}
+  
+@@@ -3582,13 -3777,12 +3595,12 @@@ returnbi
+  				dev->page = dev->orig_page;
+  				wbi = dev->written;
+  				dev->written = NULL;
+ -				while (wbi && wbi->bi_iter.bi_sector <
+ +				while (wbi && wbi->bi_sector <
+  					dev->sector + STRIPE_SECTORS) {
+  					wbi2 = r5_next_bio(wbi, dev->sector);
+- 					if (!raid5_dec_bi_active_stripes(wbi)) {
+- 						md_write_end(conf->mddev);
++ 					md_write_end(conf->mddev);
++ 					if (!raid5_dec_bi_active_stripes(wbi))
+  						bio_list_add(return_bi, wbi);
+- 					}
+  					wbi = wbi2;
+  				}
+  				bitmap_endwrite(conf->mddev->bitmap, sh->sector,
+@@@ -5354,12 -5555,14 +5368,19 @@@ static void make_discard_request(struc
+  		release_stripe_plug(mddev, sh);
+  	}
+  
++ 	md_write_end(mddev);
+  	remaining = raid5_dec_bi_active_stripes(bi);
+++<<<<<<< HEAD
+ +	if (remaining == 0)
+ +		bio_endio(bi, 0);
+++=======
++ 	if (remaining == 0) {
++ 		bio_endio(bi);
++ 	}
+++>>>>>>> 497280509f32 (md/raid5: use md_write_start to count stripes, not bios)
+  }
+  
+ -static void raid5_make_request(struct mddev *mddev, struct bio * bi)
+ +static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
+  {
+  	struct r5conf *conf = mddev->private;
+  	int dd_idx;
+diff --git a/drivers/md/md.c b/drivers/md/md.c
+index 4c75b0e4a2a4..f56b8cca5bd0 100644
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -7718,6 +7718,23 @@ bool md_write_start(struct mddev *mddev, struct bio *bi)
+ }
+ EXPORT_SYMBOL(md_write_start);
+ 
++/* md_write_inc can only be called when md_write_start() has
++ * already been called at least once of the current request.
++ * It increments the counter and is useful when a single request
++ * is split into several parts.  Each part causes an increment and
++ * so needs a matching md_write_end().
++ * Unlike md_write_start(), it is safe to call md_write_inc() inside
++ * a spinlocked region.
++ */
++void md_write_inc(struct mddev *mddev, struct bio *bi)
++{
++	if (bio_data_dir(bi) != WRITE)
++		return;
++	WARN_ON_ONCE(mddev->in_sync || mddev->ro);
++	atomic_inc(&mddev->writes_pending);
++}
++EXPORT_SYMBOL(md_write_inc);
++
+ void md_write_end(struct mddev *mddev)
+ {
+ 	if (atomic_dec_and_test(&mddev->writes_pending)) {
+* Unmerged path drivers/md/md.h
+diff --git a/drivers/md/raid5-cache.c b/drivers/md/raid5-cache.c
+index 191ad03407b7..3d920e9bf9ad 100644
+--- a/drivers/md/raid5-cache.c
++++ b/drivers/md/raid5-cache.c
+@@ -254,8 +254,8 @@ r5c_return_dev_pending_writes(struct r5conf *conf, struct r5dev *dev,
+ 	while (wbi && wbi->bi_sector <
+ 	       dev->sector + STRIPE_SECTORS) {
+ 		wbi2 = r5_next_bio(wbi, dev->sector);
++		md_write_end(conf->mddev);
+ 		if (!raid5_dec_bi_active_stripes(wbi)) {
+-			md_write_end(conf->mddev);
+ 			bio_list_add(return_bi, wbi);
+ 		}
+ 		wbi = wbi2;
+* Unmerged path drivers/md/raid5.c
