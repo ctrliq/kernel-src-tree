@@ -1,0 +1,520 @@
+iommu/amd: Remove other remains of old address allocator
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [iommu] amd: Remove other remains of old address allocator (Jerry Snitselaar) [1411581]
+Rebuild_FUZZ: 94.34%
+commit-author Joerg Roedel <jroedel@suse.de>
+commit 2d4c515bf06c9bce87b546279413621f847ef6a3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/2d4c515b.failed
+
+There are other remains in the code from the old allocatore.
+Remove them all.
+
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 2d4c515bf06c9bce87b546279413621f847ef6a3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/amd_iommu.c
+diff --cc drivers/iommu/amd_iommu.c
+index c9d79e07ea12,2ba8b464ea1a..000000000000
+--- a/drivers/iommu/amd_iommu.c
++++ b/drivers/iommu/amd_iommu.c
+@@@ -146,16 -140,13 +124,21 @@@ struct dma_ops_domain 
+  	/* generic protection domain information */
+  	struct protection_domain domain;
+  
+++<<<<<<< HEAD
+ +	/* size of the aperture for the mappings */
+ +	unsigned long aperture_size;
+ +
+ +	/* aperture index we start searching for free addresses */
+ +	unsigned long next_index;
+ +
+ +	/* address space relevant data */
+ +	struct aperture_range *aperture[APERTURE_MAX_RANGES];
+++=======
++ 	/* IOVA RB-Tree */
++ 	struct iova_domain iovad;
+++>>>>>>> 2d4c515bf06c (iommu/amd: Remove other remains of old address allocator)
+  };
+  
+ -static struct iova_domain reserved_iova_ranges;
+ -static struct lock_class_key reserved_rbtree_key;
+ -
+  /****************************************************************************
+   *
+   * Helper functions
+@@@ -292,41 -379,6 +275,44 @@@ static bool pdev_pri_erratum(struct pci
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * This function actually applies the mapping to the page table of the
+ + * dma_ops domain.
+ + */
+ +static void alloc_unity_mapping(struct dma_ops_domain *dma_dom,
+ +				struct unity_map_entry *e)
+ +{
+ +	u64 addr;
+ +
+ +	for (addr = e->address_start; addr < e->address_end;
+ +	     addr += PAGE_SIZE) {
+ +		if (addr < dma_dom->aperture_size)
+ +			__set_bit(addr >> PAGE_SHIFT,
+ +				  dma_dom->aperture[0]->bitmap);
+ +	}
+ +}
+ +
+ +/*
+ + * Inits the unity mappings required for a specific device
+ + */
+ +static void init_unity_mappings_for_device(struct device *dev,
+ +					   struct dma_ops_domain *dma_dom)
+ +{
+ +	struct unity_map_entry *e;
+ +	u16 devid;
+ +
+ +	devid = get_device_id(dev);
+ +
+ +	list_for_each_entry(e, &amd_iommu_unity_map, list) {
+ +		if (!(devid >= e->devid_start && devid <= e->devid_end))
+ +			continue;
+ +		alloc_unity_mapping(dma_dom, e);
+ +	}
+ +}
+ +
+ +/*
+++=======
+++>>>>>>> 2d4c515bf06c (iommu/amd: Remove other remains of old address allocator)
+   * This function checks if the driver got a valid device from the caller to
+   * avoid dereferencing invalid pointers.
+   */
+@@@ -1452,289 -1420,33 +1423,144 @@@ static unsigned long iommu_unmap_page(s
+   *
+   ****************************************************************************/
+  
+- /*
+-  * The address allocator core functions.
+-  *
+-  * called with domain->lock held
+-  */
+- 
+- /*
+-  * Used to reserve address ranges in the aperture (e.g. for exclusion
+-  * ranges.
+-  */
+- static void dma_ops_reserve_addresses(struct dma_ops_domain *dom,
+- 				      unsigned long start_page,
+- 				      unsigned int pages)
+- {
+- 	unsigned int i, last_page = dom->aperture_size >> PAGE_SHIFT;
+- 
+- 	if (start_page + pages > last_page)
+- 		pages = last_page - start_page;
+- 
+- 	for (i = start_page; i < start_page + pages; ++i) {
+- 		int index = i / APERTURE_RANGE_PAGES;
+- 		int page  = i % APERTURE_RANGE_PAGES;
+- 		__set_bit(page, dom->aperture[index]->bitmap);
+- 	}
+- }
+- 
+- /*
+-  * This function is used to add a new aperture range to an existing
+-  * aperture in case of dma_ops domain allocation or address allocation
+-  * failure.
+-  */
+- static int alloc_new_range(struct dma_ops_domain *dma_dom,
+- 			   bool populate, gfp_t gfp)
+- {
+- 	int index = dma_dom->aperture_size >> APERTURE_RANGE_SHIFT;
+- 	unsigned long i, old_size, pte_pgsize;
+- 	struct aperture_range *range;
+- 	struct amd_iommu *iommu;
+- 	unsigned long flags;
+- 
+- #ifdef CONFIG_IOMMU_STRESS
+- 	populate = false;
+- #endif
+- 
+- 	if (index >= APERTURE_MAX_RANGES)
+- 		return -ENOMEM;
+- 
+- 	range = kzalloc(sizeof(struct aperture_range), gfp);
+- 	if (!range)
+- 		return -ENOMEM;
+- 
+- 	range->bitmap = (void *)get_zeroed_page(gfp);
+- 	if (!range->bitmap)
+- 		goto out_free;
+- 
+- 	range->offset = dma_dom->aperture_size;
+- 
+- 	spin_lock_init(&range->bitmap_lock);
+- 
+- 	if (populate) {
+- 		unsigned long address = dma_dom->aperture_size;
+- 		int i, num_ptes = APERTURE_RANGE_PAGES / 512;
+- 		u64 *pte, *pte_page;
+- 
+- 		for (i = 0; i < num_ptes; ++i) {
+- 			pte = alloc_pte(&dma_dom->domain, address, PAGE_SIZE,
+- 					&pte_page, gfp);
+- 			if (!pte)
+- 				goto out_free;
+- 
+- 			range->pte_pages[i] = pte_page;
+- 
+- 			address += APERTURE_RANGE_SIZE / 64;
+- 		}
+- 	}
+- 
+- 	spin_lock_irqsave(&dma_dom->domain.lock, flags);
+- 
+- 	/* First take the bitmap_lock and then publish the range */
+- 	spin_lock(&range->bitmap_lock);
+- 
+- 	old_size                 = dma_dom->aperture_size;
+- 	dma_dom->aperture[index] = range;
+- 	dma_dom->aperture_size  += APERTURE_RANGE_SIZE;
+- 
+- 	/* Reserve address range used for MSI messages */
+- 	if (old_size < MSI_ADDR_BASE_LO &&
+- 	    dma_dom->aperture_size > MSI_ADDR_BASE_LO) {
+- 		unsigned long spage;
+- 		int pages;
+- 
+- 		pages = iommu_num_pages(MSI_ADDR_BASE_LO, 0x10000, PAGE_SIZE);
+- 		spage = MSI_ADDR_BASE_LO >> PAGE_SHIFT;
+- 
+- 		dma_ops_reserve_addresses(dma_dom, spage, pages);
+- 	}
+- 
+- 	/* Initialize the exclusion range if necessary */
+- 	for_each_iommu(iommu) {
+- 		if (iommu->exclusion_start &&
+- 		    iommu->exclusion_start >= dma_dom->aperture[index]->offset
+- 		    && iommu->exclusion_start < dma_dom->aperture_size) {
+- 			unsigned long startpage;
+- 			int pages = iommu_num_pages(iommu->exclusion_start,
+- 						    iommu->exclusion_length,
+- 						    PAGE_SIZE);
+- 			startpage = iommu->exclusion_start >> PAGE_SHIFT;
+- 			dma_ops_reserve_addresses(dma_dom, startpage, pages);
+- 		}
+- 	}
+- 
+- 	/*
+- 	 * Check for areas already mapped as present in the new aperture
+- 	 * range and mark those pages as reserved in the allocator. Such
+- 	 * mappings may already exist as a result of requested unity
+- 	 * mappings for devices.
+- 	 */
+- 	for (i = dma_dom->aperture[index]->offset;
+- 	     i < dma_dom->aperture_size;
+- 	     i += pte_pgsize) {
+- 		u64 *pte = fetch_pte(&dma_dom->domain, i, &pte_pgsize);
+- 		if (!pte || !IOMMU_PTE_PRESENT(*pte))
+- 			continue;
+- 
+- 		dma_ops_reserve_addresses(dma_dom, i >> PAGE_SHIFT,
+- 					  pte_pgsize >> 12);
+- 	}
+- 
+- 	update_domain(&dma_dom->domain);
+- 
+- 	spin_unlock(&range->bitmap_lock);
+- 
+- 	spin_unlock_irqrestore(&dma_dom->domain.lock, flags);
+- 
+- 	return 0;
+- 
+- out_free:
+- 	update_domain(&dma_dom->domain);
+- 
+- 	free_page((unsigned long)range->bitmap);
+- 
+- 	kfree(range);
+- 
+- 	return -ENOMEM;
+- }
+  
+ -static unsigned long dma_ops_alloc_iova(struct device *dev,
+ -					struct dma_ops_domain *dma_dom,
+ -					unsigned int pages, u64 dma_mask)
+ +static dma_addr_t dma_ops_aperture_alloc(struct dma_ops_domain *dom,
+ +					 struct aperture_range *range,
+ +					 unsigned long pages,
+ +					 unsigned long dma_mask,
+ +					 unsigned long boundary_size,
+ +					 unsigned long align_mask)
+ +{
+ +	unsigned long offset, limit, flags;
+ +	dma_addr_t address;
+ +	bool flush = false;
+ +
+ +	offset = range->offset >> PAGE_SHIFT;
+ +	limit  = iommu_device_max_index(APERTURE_RANGE_PAGES, offset,
+ +					dma_mask >> PAGE_SHIFT);
+ +
+ +	spin_lock_irqsave(&range->bitmap_lock, flags);
+ +	address = iommu_area_alloc(range->bitmap, limit, range->next_bit,
+ +				   pages, offset, boundary_size, align_mask);
+ +	if (address == -1) {
+ +		/* Nothing found, retry one time */
+ +		address = iommu_area_alloc(range->bitmap, limit,
+ +					   0, pages, offset, boundary_size,
+ +					   align_mask);
+ +		flush = true;
+ +	}
+ +
+ +	if (address != -1)
+ +		range->next_bit = address + pages;
+ +
+ +	spin_unlock_irqrestore(&range->bitmap_lock, flags);
+ +
+ +	if (flush) {
+ +		domain_flush_tlb(&dom->domain);
+ +		domain_flush_complete(&dom->domain);
+ +	}
+ +
+ +	return address;
+ +}
+ +
+ +static unsigned long dma_ops_area_alloc(struct device *dev,
+ +					struct dma_ops_domain *dom,
+ +					unsigned int pages,
+ +					unsigned long align_mask,
+ +					u64 dma_mask)
+ +{
+ +	unsigned long boundary_size, mask;
+ +	unsigned long address = -1;
+ +	int start = dom->next_index;
+ +	int i;
+ +
+ +	mask = dma_get_seg_boundary(dev);
+ +
+ +	boundary_size = mask + 1 ? ALIGN(mask + 1, PAGE_SIZE) >> PAGE_SHIFT :
+ +				   1UL << (BITS_PER_LONG - PAGE_SHIFT);
+ +
+ +	for (i = 0; i < APERTURE_MAX_RANGES; ++i) {
+ +		struct aperture_range *range;
+ +
+ +		range = dom->aperture[(start + i) % APERTURE_MAX_RANGES];
+ +
+ +		if (!range || range->offset >= dma_mask)
+ +			continue;
+ +
+ +		address = dma_ops_aperture_alloc(dom, range, pages,
+ +						 dma_mask, boundary_size,
+ +						 align_mask);
+ +		if (address != -1) {
+ +			address = range->offset + (address << PAGE_SHIFT);
+ +			dom->next_index = i;
+ +			break;
+ +		}
+ +	}
+ +
+ +	return address;
+ +}
+ +
+ +static unsigned long dma_ops_alloc_addresses(struct device *dev,
+ +					     struct dma_ops_domain *dom,
+ +					     unsigned int pages,
+ +					     unsigned long align_mask,
+ +					     u64 dma_mask)
+  {
+ -	unsigned long pfn = 0;
+ +	unsigned long address = -1;
+  
+ -	pages = __roundup_pow_of_two(pages);
+ +#ifdef CONFIG_IOMMU_STRESS
+ +	dom->next_index = 0;
+ +#endif
+ +
+ +	while (address == -1) {
+ +		address = dma_ops_area_alloc(dev, dom, pages,
+ +					     align_mask, dma_mask);
+ +
+ +		if (address == -1 && alloc_new_range(dom, false, GFP_ATOMIC))
+ +			break;
+ +	}
+  
+ -	if (dma_mask > DMA_BIT_MASK(32))
+ -		pfn = alloc_iova_fast(&dma_dom->iovad, pages,
+ -				      IOVA_PFN(DMA_BIT_MASK(32)));
+ +	if (unlikely(address == -1))
+ +		address = DMA_ERROR_CODE;
+  
+ -	if (!pfn)
+ -		pfn = alloc_iova_fast(&dma_dom->iovad, pages, IOVA_PFN(dma_mask));
+ +	WARN_ON((address + (PAGE_SIZE*pages)) > dom->aperture_size);
+  
+ -	return (pfn << PAGE_SHIFT);
+ +	return address;
+  }
+  
+ -static void dma_ops_free_iova(struct dma_ops_domain *dma_dom,
+ -			      unsigned long address,
+ -			      unsigned int pages)
+ +/*
+ + * The address free function.
+ + *
+ + * called with domain->lock held
+ + */
+ +static void dma_ops_free_addresses(struct dma_ops_domain *dom,
+ +				   unsigned long address,
+ +				   unsigned int pages)
+  {
+ -	pages = __roundup_pow_of_two(pages);
+ -	address >>= PAGE_SHIFT;
+ +	unsigned i = address >> APERTURE_RANGE_SHIFT;
+ +	struct aperture_range *range = dom->aperture[i];
+ +	unsigned long flags;
+ +
+ +	BUG_ON(i >= APERTURE_MAX_RANGES || range == NULL);
+ +
+ +#ifdef CONFIG_IOMMU_STRESS
+ +	if (i < 4)
+ +		return;
+ +#endif
+ +
+ +	if (amd_iommu_unmap_flush) {
+ +		domain_flush_tlb(&dom->domain);
+ +		domain_flush_complete(&dom->domain);
+ +	}
+ +
+ +	address = (address % APERTURE_RANGE_SIZE) >> PAGE_SHIFT;
+ +
+ +	spin_lock_irqsave(&range->bitmap_lock, flags);
+ +	if (address + pages > range->next_bit)
+ +		range->next_bit = address + pages;
+ +	bitmap_clear(range->bitmap, address, pages);
+ +	spin_unlock_irqrestore(&range->bitmap_lock, flags);
+  
+ -	free_iova_fast(&dma_dom->iovad, address, pages);
+  }
+  
+  /****************************************************************************
+@@@ -1967,18 -1655,13 +1769,28 @@@ static struct dma_ops_domain *dma_ops_d
+  	if (!dma_dom->domain.pt_root)
+  		goto free_dma_dom;
+  
+++<<<<<<< HEAD
+ +	add_domain_to_list(&dma_dom->domain);
+ +
+ +	if (alloc_new_range(dma_dom, true, GFP_KERNEL))
+ +		goto free_dma_dom;
+ +
+ +	/*
+ +	 * mark the first page as allocated so we never return 0 as
+ +	 * a valid dma-address. So we can use 0 as error value
+ +	 */
+ +	dma_dom->aperture[0]->bitmap[0] = 1;
+ +	dma_dom->next_index = 0;
+ +
+++=======
++ 	init_iova_domain(&dma_dom->iovad, PAGE_SIZE,
++ 			 IOVA_START_PFN, DMA_32BIT_PFN);
++ 
++ 	/* Initialize reserved ranges */
++ 	copy_reserved_iova(&reserved_iova_ranges, &dma_dom->iovad);
+++>>>>>>> 2d4c515bf06c (iommu/amd: Remove other remains of old address allocator)
++ 
++ 	add_domain_to_list(&dma_dom->domain);
+  
+  	return dma_dom;
+  
+@@@ -2790,12 -2458,85 +2570,11 @@@ static struct dma_map_ops amd_iommu_dma
+  	.map_sg		= map_sg,
+  	.unmap_sg	= unmap_sg,
+  	.dma_supported	= amd_iommu_dma_supported,
+- 	.set_dma_mask	= set_dma_mask,
+  };
+  
+ -static int init_reserved_iova_ranges(void)
+ -{
+ -	struct pci_dev *pdev = NULL;
+ -	struct iova *val;
+ -
+ -	init_iova_domain(&reserved_iova_ranges, PAGE_SIZE,
+ -			 IOVA_START_PFN, DMA_32BIT_PFN);
+ -
+ -	lockdep_set_class(&reserved_iova_ranges.iova_rbtree_lock,
+ -			  &reserved_rbtree_key);
+ -
+ -	/* MSI memory range */
+ -	val = reserve_iova(&reserved_iova_ranges,
+ -			   IOVA_PFN(MSI_RANGE_START), IOVA_PFN(MSI_RANGE_END));
+ -	if (!val) {
+ -		pr_err("Reserving MSI range failed\n");
+ -		return -ENOMEM;
+ -	}
+ -
+ -	/* HT memory range */
+ -	val = reserve_iova(&reserved_iova_ranges,
+ -			   IOVA_PFN(HT_RANGE_START), IOVA_PFN(HT_RANGE_END));
+ -	if (!val) {
+ -		pr_err("Reserving HT range failed\n");
+ -		return -ENOMEM;
+ -	}
+ -
+ -	/*
+ -	 * Memory used for PCI resources
+ -	 * FIXME: Check whether we can reserve the PCI-hole completly
+ -	 */
+ -	for_each_pci_dev(pdev) {
+ -		int i;
+ -
+ -		for (i = 0; i < PCI_NUM_RESOURCES; ++i) {
+ -			struct resource *r = &pdev->resource[i];
+ -
+ -			if (!(r->flags & IORESOURCE_MEM))
+ -				continue;
+ -
+ -			val = reserve_iova(&reserved_iova_ranges,
+ -					   IOVA_PFN(r->start),
+ -					   IOVA_PFN(r->end));
+ -			if (!val) {
+ -				pr_err("Reserve pci-resource range failed\n");
+ -				return -ENOMEM;
+ -			}
+ -		}
+ -	}
+ -
+ -	return 0;
+ -}
+ -
+  int __init amd_iommu_init_api(void)
+  {
+ -	int ret, err = 0;
+ -
+ -	ret = iova_cache_get();
+ -	if (ret)
+ -		return ret;
+ -
+ -	ret = init_reserved_iova_ranges();
+ -	if (ret)
+ -		return ret;
+ -
+ -	err = bus_set_iommu(&pci_bus_type, &amd_iommu_ops);
+ -	if (err)
+ -		return err;
+ -#ifdef CONFIG_ARM_AMBA
+ -	err = bus_set_iommu(&amba_bustype, &amd_iommu_ops);
+ -	if (err)
+ -		return err;
+ -#endif
+ -	err = bus_set_iommu(&platform_bus_type, &amd_iommu_ops);
+ -	if (err)
+ -		return err;
+ -	return 0;
+ +	return bus_set_iommu(&pci_bus_type, &amd_iommu_ops);
+  }
+  
+  int __init amd_iommu_init_dma_ops(void)
+* Unmerged path drivers/iommu/amd_iommu.c
