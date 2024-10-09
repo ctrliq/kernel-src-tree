@@ -1,0 +1,195 @@
+scsi: qla2xxx: Relogin to target port on a cable swap
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: Relogin to target port on a cable swap (Himanshu Madhani) [1547714]
+Rebuild_FUZZ: 94.00%
+commit-author Quinn Tran <quinn.tran@cavium.com>
+commit 5ef696aa9f3ccf999552d924c4e21a348f2bbea9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/5ef696aa.failed
+
+If user swaps one target port for another target port for same switch
+port, the new target port is not being recognized by the driver. Current
+code assumes that old Target port has recovered from link down. The fix
+will ask switch what is the WWPN of a specific NportID (GPNID) rather
+than assuming it's the same Target port which has came back.
+
+Fixes: 726b85487067d ("qla2xxx: Add framework for async fabric discovery")
+	Cc: <stable@vger.kernel.org> # 4.10+
+	Signed-off-by: Quinn Tran <quinn.tran@cavium.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 5ef696aa9f3ccf999552d924c4e21a348f2bbea9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_gs.c
+#	drivers/scsi/qla2xxx/qla_os.c
+diff --cc drivers/scsi/qla2xxx/qla_gs.c
+index 194ce61856ea,7d715e58901f..000000000000
+--- a/drivers/scsi/qla2xxx/qla_gs.c
++++ b/drivers/scsi/qla2xxx/qla_gs.c
+@@@ -3208,9 -3336,19 +3301,18 @@@ static void qla2x00_async_gpnid_sp_done
+  	ea.rc = res;
+  	ea.event = FCME_GPNID_DONE;
+  
+ -	spin_lock_irqsave(&vha->hw->tgt.sess_lock, flags);
+ -	list_del(&sp->elem);
+ -	spin_unlock_irqrestore(&vha->hw->tgt.sess_lock, flags);
+ -
+  	if (res) {
+- 		if (res == QLA_FUNCTION_TIMEOUT)
++ 		if (res == QLA_FUNCTION_TIMEOUT) {
+  			qla24xx_post_gpnid_work(sp->vha, &ea.id);
+++<<<<<<< HEAD
+++=======
++ 			sp->free(sp);
++ 			return;
++ 		}
++ 	} else if (sp->gen1) {
++ 		/* There was another RSCN for this Nport ID */
++ 		qla24xx_post_gpnid_work(sp->vha, &ea.id);
+++>>>>>>> 5ef696aa9f3c (scsi: qla2xxx: Relogin to target port on a cable swap)
+  		sp->free(sp);
+  		return;
+  	}
+diff --cc drivers/scsi/qla2xxx/qla_os.c
+index 009f4dc8e948,820d1c185beb..000000000000
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@@ -4800,10 -4760,39 +4800,44 @@@ void qla24xx_create_new_sess(struct scs
+  	spin_unlock_irqrestore(&vha->hw->tgt.sess_lock, flags);
+  
+  	if (fcport) {
+- 		if (pla)
++ 		if (pla) {
+  			qlt_plogi_ack_unref(vha, pla);
+++<<<<<<< HEAD
+ +		else
+ +			qla24xx_async_gnl(vha, fcport);
+++=======
++ 		} else {
++ 			spin_lock_irqsave(&vha->hw->tgt.sess_lock, flags);
++ 			tfcp = qla2x00_find_fcport_by_nportid(vha,
++ 			    &e->u.new_sess.id, 1);
++ 			if (tfcp && (tfcp != fcport)) {
++ 				/*
++ 				 * We have a conflict fcport with same NportID.
++ 				 */
++ 				ql_dbg(ql_dbg_disc, vha, 0xffff,
++ 				    "%s %8phC found conflict b4 add. DS %d LS %d\n",
++ 				    __func__, tfcp->port_name, tfcp->disc_state,
++ 				    tfcp->fw_login_state);
++ 
++ 				switch (tfcp->disc_state) {
++ 				case DSC_DELETED:
++ 					break;
++ 				case DSC_DELETE_PEND:
++ 					fcport->login_pause = 1;
++ 					tfcp->conflict = fcport;
++ 					break;
++ 				default:
++ 					fcport->login_pause = 1;
++ 					tfcp->conflict = fcport;
++ 					qlt_schedule_sess_for_deletion_lock
++ 						(tfcp);
++ 					break;
++ 				}
++ 			}
++ 			spin_unlock_irqrestore(&vha->hw->tgt.sess_lock, flags);
++ 			qla24xx_async_gnl(vha, fcport);
++ 		}
+++>>>>>>> 5ef696aa9f3c (scsi: qla2xxx: Relogin to target port on a cable swap)
+  	}
+  
+  	if (free_fcport) {
+* Unmerged path drivers/scsi/qla2xxx/qla_gs.c
+diff --git a/drivers/scsi/qla2xxx/qla_init.c b/drivers/scsi/qla2xxx/qla_init.c
+index da9c0caf8d85..eedefb2882c4 100644
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@ -818,6 +818,9 @@ void qla24xx_handle_gpdb_event(scsi_qla_host_t *vha, struct event_arg *ea)
+ 		 * must have triggered the session to be re-validate.
+ 		 * session is still valid.
+ 		 */
++		ql_dbg(ql_dbg_disc, vha, 0x20d6,
++		    "%s %d %8phC session revalidate success\n",
++		    __func__, __LINE__, fcport->port_name);
+ 		fcport->disc_state = DSC_LOGIN_COMPLETE;
+ 	}
+ 	spin_unlock_irqrestore(&vha->hw->tgt.sess_lock, flags);
+@@ -942,9 +945,8 @@ void qla24xx_handle_rscn_event(fc_port_t *fcport, struct event_arg *ea)
+ 	switch (fcport->disc_state) {
+ 	case DSC_DELETED:
+ 	case DSC_LOGIN_COMPLETE:
+-		qla24xx_post_gidpn_work(fcport->vha, fcport);
++		qla24xx_post_gpnid_work(fcport->vha, &ea->id);
+ 		break;
+-
+ 	default:
+ 		break;
+ 	}
+* Unmerged path drivers/scsi/qla2xxx/qla_os.c
+diff --git a/drivers/scsi/qla2xxx/qla_target.c b/drivers/scsi/qla2xxx/qla_target.c
+index 9fa71e1cf589..c9e0c07defab 100644
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@ -883,6 +883,17 @@ qlt_plogi_ack_link(struct scsi_qla_host *vha, struct qlt_plogi_ack_t *pla,
+ 		iocb->u.isp24.port_id[1], iocb->u.isp24.port_id[0],
+ 		pla->ref_count, pla, link);
+ 
++	if (link == QLT_PLOGI_LINK_CONFLICT) {
++		switch (sess->disc_state) {
++		case DSC_DELETED:
++		case DSC_DELETE_PEND:
++			pla->ref_count--;
++			return;
++		default:
++			break;
++		}
++	}
++
+ 	if (sess->plogi_link[link])
+ 		qlt_plogi_ack_unref(vha, sess->plogi_link[link]);
+ 
+@@ -4733,6 +4744,10 @@ static int qlt_24xx_handle_els(struct scsi_qla_host *vha,
+ 		sess->d_id = port_id;
+ 		sess->login_gen++;
+ 
++		ql_dbg(ql_dbg_disc, vha, 0x20f9,
++		    "%s %d %8phC  DS %d\n",
++		    __func__, __LINE__, sess->port_name, sess->disc_state);
++
+ 		switch (sess->disc_state) {
+ 		case DSC_DELETED:
+ 			qlt_plogi_ack_unref(vha, pla);
+@@ -4782,12 +4797,20 @@ static int qlt_24xx_handle_els(struct scsi_qla_host *vha,
+ 		}
+ 
+ 		if (conflict_sess) {
+-			ql_dbg(ql_dbg_tgt_mgt, vha, 0xf09b,
+-			    "PRLI with conflicting sess %p port %8phC\n",
+-			    conflict_sess, conflict_sess->port_name);
+-			qlt_send_term_imm_notif(vha, iocb, 1);
+-			res = 0;
+-			break;
++			switch (conflict_sess->disc_state) {
++			case DSC_DELETED:
++			case DSC_DELETE_PEND:
++				break;
++			default:
++				ql_dbg(ql_dbg_tgt_mgt, vha, 0xf09b,
++				    "PRLI with conflicting sess %p port %8phC\n",
++				    conflict_sess, conflict_sess->port_name);
++				conflict_sess->fw_login_state =
++				    DSC_LS_PORT_UNAVAIL;
++				qlt_send_term_imm_notif(vha, iocb, 1);
++				res = 0;
++				break;
++			}
+ 		}
+ 
+ 		if (sess != NULL) {
