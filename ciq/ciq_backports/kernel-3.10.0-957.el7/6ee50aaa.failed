@@ -1,0 +1,266 @@
+platform/x86: wmi: Instantiate all devices before adding them
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [platform] x86: wmi: Instantiate all devices before adding them (Jarod Wilson) [1562200]
+Rebuild_FUZZ: 92.04%
+commit-author Darren Hart (VMware) <dvhart@infradead.org>
+commit 6ee50aaa9a20c7c11c964c249440857ab58ece36
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/6ee50aaa.failed
+
+At some point, we will want sub-drivers to get references to other
+devices on the same WMI bus. This change is needed to avoid races.
+
+This ends up simplifying the setup code and fixing some leaks, too.
+
+This is based on the original work of Andy Lutomirski <luto@kernel.org>,
+but includes several modifications, many in response to review from
+Michał Kępień <kernel@kempniu.pl>:
+
+  https://www.spinics.net/lists/platform-driver-x86/msg08201.html
+
+	Signed-off-by: Darren Hart (VMware) <dvhart@infradead.org>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Mario Limonciello <mario_limonciello@dell.com>
+	Cc: Pali Rohár <pali.rohar@gmail.com>
+	Cc: linux-kernel@vger.kernel.org
+	Cc: platform-driver-x86@vger.kernel.org
+	Cc: linux-acpi@vger.kernel.org
+	Acked-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 6ee50aaa9a20c7c11c964c249440857ab58ece36)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/platform/x86/wmi.c
+diff --cc drivers/platform/x86/wmi.c
+index 84dcc7a04b0a,fbce8765e222..000000000000
+--- a/drivers/platform/x86/wmi.c
++++ b/drivers/platform/x86/wmi.c
+@@@ -671,31 -730,129 +671,95 @@@ static int wmi_dev_uevent(struct devic
+  	return 0;
+  }
+  
+ -static int wmi_dev_probe(struct device *dev)
+ +static void wmi_dev_free(struct device *dev)
+  {
+ -	struct wmi_block *wblock = dev_to_wblock(dev);
+ -	struct wmi_driver *wdriver =
+ -		container_of(dev->driver, struct wmi_driver, driver);
+ -	int ret = 0;
+ -
+ -	if (ACPI_FAILURE(wmi_method_enable(wblock, 1)))
+ -		dev_warn(dev, "failed to enable device -- probing anyway\n");
+ -
+ -	if (wdriver->probe) {
+ -		ret = wdriver->probe(dev_to_wdev(dev));
+ -		if (ret != 0 && ACPI_FAILURE(wmi_method_enable(wblock, 0)))
+ -			dev_warn(dev, "failed to disable device\n");
+ -	}
+ -
+ -	return ret;
+ -}
+ -
+ -static int wmi_dev_remove(struct device *dev)
+ -{
+ -	struct wmi_block *wblock = dev_to_wblock(dev);
+ -	struct wmi_driver *wdriver =
+ -		container_of(dev->driver, struct wmi_driver, driver);
+ -	int ret = 0;
+ +	struct wmi_block *wmi_block = container_of(dev, struct wmi_block, dev);
+  
+ -	if (wdriver->remove)
+ -		ret = wdriver->remove(dev_to_wdev(dev));
+ -
+ -	if (ACPI_FAILURE(wmi_method_enable(wblock, 0)))
+ -		dev_warn(dev, "failed to disable device\n");
+ -
+ -	return ret;
+ +	kfree(wmi_block);
+  }
+  
+ -static struct class wmi_bus_class = {
+ -	.name = "wmi_bus",
+ -};
+ -
+ -static struct bus_type wmi_bus_type = {
+ +static struct class wmi_class = {
+  	.name = "wmi",
+ +	.dev_release = wmi_dev_free,
+ +	.dev_uevent = wmi_dev_uevent,
+  	.dev_groups = wmi_groups,
+ -	.match = wmi_dev_match,
+ -	.uevent = wmi_dev_uevent,
+ -	.probe = wmi_dev_probe,
+ -	.remove = wmi_dev_remove,
+  };
+  
+++<<<<<<< HEAD
+ +static int wmi_create_device(const struct guid_block *gblock,
+++=======
++ static struct device_type wmi_type_event = {
++ 	.name = "event",
++ 	.groups = wmi_event_groups,
++ 	.release = wmi_dev_release,
++ };
++ 
++ static struct device_type wmi_type_method = {
++ 	.name = "method",
++ 	.groups = wmi_method_groups,
++ 	.release = wmi_dev_release,
++ };
++ 
++ static struct device_type wmi_type_data = {
++ 	.name = "data",
++ 	.groups = wmi_data_groups,
++ 	.release = wmi_dev_release,
++ };
++ 
++ static void wmi_create_device(struct device *wmi_bus_dev,
++ 			     const struct guid_block *gblock,
+++>>>>>>> 6ee50aaa9a20 (platform/x86: wmi: Instantiate all devices before adding them)
+  			     struct wmi_block *wblock,
+  			     struct acpi_device *device)
+  {
+ -	wblock->dev.dev.bus = &wmi_bus_type;
+ -	wblock->dev.dev.parent = wmi_bus_dev;
+ +	wblock->dev.class = &wmi_class;
+  
+ -	dev_set_name(&wblock->dev.dev, "%pUL", gblock->guid);
+ +	dev_set_name(&wblock->dev, "%pUL", gblock->guid);
+  
+ -	if (gblock->flags & ACPI_WMI_EVENT) {
+ -		wblock->dev.dev.type = &wmi_type_event;
+ -	} else if (gblock->flags & ACPI_WMI_METHOD) {
+ -		wblock->dev.dev.type = &wmi_type_method;
+ -	} else {
+ -		struct acpi_device_info *info;
+ -		char method[5];
+ -		int result;
+ +	dev_set_drvdata(&wblock->dev, wblock);
+  
+++<<<<<<< HEAD
+ +	return device_register(&wblock->dev);
+++=======
++ 		wblock->dev.dev.type = &wmi_type_data;
++ 
++ 		strcpy(method, "WQ");
++ 		strncat(method, wblock->gblock.object_id, 2);
++ 		result = get_subobj_info(device->handle, method, &info);
++ 
++ 		if (result == 0) {
++ 			wblock->dev.readable = true;
++ 
++ 			/*
++ 			 * The Microsoft documentation specifically states:
++ 			 *
++ 			 *   Data blocks registered with only a single instance
++ 			 *   can ignore the parameter.
++ 			 *
++ 			 * ACPICA will get mad at us if we call the method
++ 			 * with the wrong number of arguments, so check what
++ 			 * our method expects.  (On some Dell laptops, WQxx
++ 			 * may not be a method at all.)
++ 			 */
++ 			if (info->type != ACPI_TYPE_METHOD ||
++ 			    info->param_count == 0)
++ 				wblock->read_takes_no_args = true;
++ 
++ 			kfree(info);
++ 		}
++ 
++ 		strcpy(method, "WS");
++ 		strncat(method, wblock->gblock.object_id, 2);
++ 		result = get_subobj_info(device->handle, method, NULL);
++ 
++ 		if (result == 0) {
++ 			wblock->dev.writeable = true;
++ 		}
++ 
++ 	}
++ 
++ 	device_initialize(&wblock->dev.dev);
+++>>>>>>> 6ee50aaa9a20 (platform/x86: wmi: Instantiate all devices before adding them)
+  }
+  
+  static void wmi_free_devices(struct acpi_device *device)
+@@@ -706,10 -863,7 +770,14 @@@
+  	list_for_each_entry_safe(wblock, next, &wmi_block_list, list) {
+  		if (wblock->acpi_device == device) {
+  			list_del(&wblock->list);
+++<<<<<<< HEAD
+ +			if (wblock->dev.class)
+ +				device_unregister(&wblock->dev);
+ +			else
+ +				kfree(wblock);
+++=======
++ 			device_unregister(&wblock->dev.dev);
+++>>>>>>> 6ee50aaa9a20 (platform/x86: wmi: Instantiate all devices before adding them)
+  		}
+  	}
+  }
+@@@ -739,14 -893,14 +807,14 @@@ static bool guid_already_parsed(struct 
+  /*
+   * Parse the _WDG method for the GUID data blocks
+   */
+ -static int parse_wdg(struct device *wmi_bus_dev, struct acpi_device *device)
+ +static int parse_wdg(struct acpi_device *device)
+  {
+  	struct acpi_buffer out = {ACPI_ALLOCATE_BUFFER, NULL};
+- 	union acpi_object *obj;
+  	const struct guid_block *gblock;
+- 	struct wmi_block *wblock;
++ 	struct wmi_block *wblock, *next;
++ 	union acpi_object *obj;
+  	acpi_status status;
+- 	int retval;
++ 	int retval = 0;
+  	u32 i, total;
+  
+  	status = acpi_evaluate_object(device->handle, "_WDG", NULL, &out);
+@@@ -769,26 -923,25 +837,32 @@@
+  		if (debug_dump_wdg)
+  			wmi_dump_wdg(&gblock[i]);
+  
+ -		/*
+ -		 * Some WMI devices, like those for nVidia hooks, have a
+ -		 * duplicate GUID. It's not clear what we should do in this
+ -		 * case yet, so for now, we'll just ignore the duplicate
+ -		 * for device creation.
+ -		 */
+ -		if (guid_already_parsed(device, gblock[i].guid))
+ -			continue;
+ -
+  		wblock = kzalloc(sizeof(struct wmi_block), GFP_KERNEL);
+- 		if (!wblock)
+- 			return -ENOMEM;
++ 		if (!wblock) {
++ 			retval = -ENOMEM;
++ 			break;
++ 		}
+  
+  		wblock->acpi_device = device;
+  		wblock->gblock = gblock[i];
+  
+++<<<<<<< HEAD
+ +		/*
+ +		  Some WMI devices, like those for nVidia hooks, have a
+ +		  duplicate GUID. It's not clear what we should do in this
+ +		  case yet, so for now, we'll just ignore the duplicate
+ +		  for device creation.
+ +		*/
+ +		if (!guid_already_parsed(device, gblock[i].guid)) {
+ +			retval = wmi_create_device(&gblock[i], wblock, device);
+ +			if (retval) {
+ +				wmi_free_devices(device);
+ +				goto out_free_pointer;
+ +			}
+ +		}
+++=======
++ 		wmi_create_device(wmi_bus_dev, &gblock[i], wblock, device);
+++>>>>>>> 6ee50aaa9a20 (platform/x86: wmi: Instantiate all devices before adding them)
+  
+  		list_add_tail(&wblock->list, &wmi_block_list);
+  
+* Unmerged path drivers/platform/x86/wmi.c
