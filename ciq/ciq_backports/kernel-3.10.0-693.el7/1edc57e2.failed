@@ -1,0 +1,279 @@
+net/mlx5: E-Switch, Implement trust vf ndo
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [netdrv] mlx5: E-Switch, Implement trust vf ndo (Don Dutile) [1383280 1417284]
+Rebuild_FUZZ: 95.00%
+commit-author Mohamad Haj Yahia <mohamad@mellanox.com>
+commit 1edc57e2b3d3bf8672bb1553dbd541cc94f54937
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/1edc57e2.failed
+
+- Add support to configure trusted vf attribute through trust_vf_ndo.
+
+- Upon VF trust setting change we update vport context to refresh
+ allmulti/promisc or any trusted vf attributes that we didn't trust the
+ VF for before.
+
+- Lock the eswitch state lock on vport event in order to synchronise the
+ vport context updates , this will prevent contention with vport trust
+ setting change which will trigger vport mac list update.
+
+	Signed-off-by: Mohamad Haj Yahia <mohamad@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1edc57e2b3d3bf8672bb1553dbd541cc94f54937)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index d634db07bf6d,1c70e518b5c5..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -2386,6 -2438,21 +2386,24 @@@ static int mlx5e_set_vf_vlan(struct net
+  					   vlan, qos);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int mlx5e_set_vf_spoofchk(struct net_device *dev, int vf, bool setting)
++ {
++ 	struct mlx5e_priv *priv = netdev_priv(dev);
++ 	struct mlx5_core_dev *mdev = priv->mdev;
++ 
++ 	return mlx5_eswitch_set_vport_spoofchk(mdev->priv.eswitch, vf + 1, setting);
++ }
++ 
++ static int mlx5e_set_vf_trust(struct net_device *dev, int vf, bool setting)
++ {
++ 	struct mlx5e_priv *priv = netdev_priv(dev);
++ 	struct mlx5_core_dev *mdev = priv->mdev;
++ 
++ 	return mlx5_eswitch_set_vport_trust(mdev->priv.eswitch, vf + 1, setting);
++ }
+++>>>>>>> 1edc57e2b3d3 (net/mlx5: E-Switch, Implement trust vf ndo)
+  static int mlx5_vport_link2ifla(u8 esw_link)
+  {
+  	switch (esw_link) {
+@@@ -2553,6 -2620,10 +2571,11 @@@ static const struct net_device_ops mlx5
+  #endif
+  	.ndo_set_vf_mac          = mlx5e_set_vf_mac,
+  	.ndo_set_vf_vlan         = mlx5e_set_vf_vlan,
+++<<<<<<< HEAD
+++=======
++ 	.ndo_set_vf_spoofchk     = mlx5e_set_vf_spoofchk,
++ 	.ndo_set_vf_trust        = mlx5e_set_vf_trust,
+++>>>>>>> 1edc57e2b3d3 (net/mlx5: E-Switch, Implement trust vf ndo)
+  	.ndo_get_vf_config       = mlx5e_get_vf_config,
+  	.ndo_set_vf_link_state   = mlx5e_set_vf_link_state,
+  	.ndo_get_vf_stats        = mlx5e_get_vf_stats,
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+index 079c11f2567c,b84a6918a700..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+@@@ -744,10 -865,117 +744,121 @@@ out
+  	kfree(mac_list);
+  }
+  
+++<<<<<<< HEAD
+ +static void esw_vport_change_handler(struct work_struct *work)
+++=======
++ /* Sync vport UC/MC list from vport context
++  * Must be called after esw_update_vport_addr_list
++  */
++ static void esw_update_vport_mc_promisc(struct mlx5_eswitch *esw, u32 vport_num)
++ {
++ 	struct mlx5_vport *vport = &esw->vports[vport_num];
++ 	struct l2addr_node *node;
++ 	struct vport_addr *addr;
++ 	struct hlist_head *hash;
++ 	struct hlist_node *tmp;
++ 	int hi;
++ 
++ 	hash = vport->mc_list;
++ 
++ 	for_each_l2hash_node(node, tmp, esw->mc_table, hi) {
++ 		u8 *mac = node->addr;
++ 
++ 		addr = l2addr_hash_find(hash, mac, struct vport_addr);
++ 		if (addr) {
++ 			if (addr->action == MLX5_ACTION_DEL)
++ 				addr->action = MLX5_ACTION_NONE;
++ 			continue;
++ 		}
++ 		addr = l2addr_hash_add(hash, mac, struct vport_addr,
++ 				       GFP_KERNEL);
++ 		if (!addr) {
++ 			esw_warn(esw->dev,
++ 				 "Failed to add allmulti MAC(%pM) to vport[%d] DB\n",
++ 				 mac, vport_num);
++ 			continue;
++ 		}
++ 		addr->vport = vport_num;
++ 		addr->action = MLX5_ACTION_ADD;
++ 		addr->mc_promisc = true;
++ 	}
++ }
++ 
++ /* Apply vport rx mode to HW FDB table */
++ static void esw_apply_vport_rx_mode(struct mlx5_eswitch *esw, u32 vport_num,
++ 				    bool promisc, bool mc_promisc)
++ {
++ 	struct esw_mc_addr *allmulti_addr = esw->mc_promisc;
++ 	struct mlx5_vport *vport = &esw->vports[vport_num];
++ 
++ 	if (IS_ERR_OR_NULL(vport->allmulti_rule) != mc_promisc)
++ 		goto promisc;
++ 
++ 	if (mc_promisc) {
++ 		vport->allmulti_rule =
++ 				esw_fdb_set_vport_allmulti_rule(esw, vport_num);
++ 		if (!allmulti_addr->uplink_rule)
++ 			allmulti_addr->uplink_rule =
++ 				esw_fdb_set_vport_allmulti_rule(esw,
++ 								UPLINK_VPORT);
++ 		allmulti_addr->refcnt++;
++ 	} else if (vport->allmulti_rule) {
++ 		mlx5_del_flow_rule(vport->allmulti_rule);
++ 		vport->allmulti_rule = NULL;
++ 
++ 		if (--allmulti_addr->refcnt > 0)
++ 			goto promisc;
++ 
++ 		if (allmulti_addr->uplink_rule)
++ 			mlx5_del_flow_rule(allmulti_addr->uplink_rule);
++ 		allmulti_addr->uplink_rule = NULL;
++ 	}
++ 
++ promisc:
++ 	if (IS_ERR_OR_NULL(vport->promisc_rule) != promisc)
++ 		return;
++ 
++ 	if (promisc) {
++ 		vport->promisc_rule = esw_fdb_set_vport_promisc_rule(esw,
++ 								     vport_num);
++ 	} else if (vport->promisc_rule) {
++ 		mlx5_del_flow_rule(vport->promisc_rule);
++ 		vport->promisc_rule = NULL;
++ 	}
++ }
++ 
++ /* Sync vport rx mode from vport context */
++ static void esw_update_vport_rx_mode(struct mlx5_eswitch *esw, u32 vport_num)
++ {
++ 	struct mlx5_vport *vport = &esw->vports[vport_num];
++ 	int promisc_all = 0;
++ 	int promisc_uc = 0;
++ 	int promisc_mc = 0;
++ 	int err;
++ 
++ 	err = mlx5_query_nic_vport_promisc(esw->dev,
++ 					   vport_num,
++ 					   &promisc_uc,
++ 					   &promisc_mc,
++ 					   &promisc_all);
++ 	if (err)
++ 		return;
++ 	esw_debug(esw->dev, "vport[%d] context update rx mode promisc_all=%d, all_multi=%d\n",
++ 		  vport_num, promisc_all, promisc_mc);
++ 
++ 	if (!vport->trusted || !vport->enabled) {
++ 		promisc_uc = 0;
++ 		promisc_mc = 0;
++ 		promisc_all = 0;
++ 	}
++ 
++ 	esw_apply_vport_rx_mode(esw, vport_num, promisc_all,
++ 				(promisc_all || promisc_mc));
++ }
++ 
++ static void esw_vport_change_handle_locked(struct mlx5_vport *vport)
+++>>>>>>> 1edc57e2b3d3 (net/mlx5: E-Switch, Implement trust vf ndo)
+  {
+- 	struct mlx5_vport *vport =
+- 		container_of(work, struct mlx5_vport, vport_change_handler);
+  	struct mlx5_core_dev *dev = vport->dev;
+  	struct mlx5_eswitch *esw = dev->priv.eswitch;
+  	u8 mac[ETH_ALEN];
+@@@ -1527,6 -1842,53 +1649,56 @@@ out
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int mlx5_eswitch_set_vport_spoofchk(struct mlx5_eswitch *esw,
++ 				    int vport, bool spoofchk)
++ {
++ 	struct mlx5_vport *evport;
++ 	bool pschk;
++ 	int err = 0;
++ 
++ 	if (!ESW_ALLOWED(esw))
++ 		return -EPERM;
++ 	if (!LEGAL_VPORT(esw, vport))
++ 		return -EINVAL;
++ 
++ 	evport = &esw->vports[vport];
++ 
++ 	mutex_lock(&esw->state_lock);
++ 	pschk = evport->spoofchk;
++ 	evport->spoofchk = spoofchk;
++ 	if (evport->enabled)
++ 		err = esw_vport_ingress_config(esw, evport);
++ 	if (err)
++ 		evport->spoofchk = pschk;
++ 	mutex_unlock(&esw->state_lock);
++ 
++ 	return err;
++ }
++ 
++ int mlx5_eswitch_set_vport_trust(struct mlx5_eswitch *esw,
++ 				 int vport, bool setting)
++ {
++ 	struct mlx5_vport *evport;
++ 
++ 	if (!ESW_ALLOWED(esw))
++ 		return -EPERM;
++ 	if (!LEGAL_VPORT(esw, vport))
++ 		return -EINVAL;
++ 
++ 	evport = &esw->vports[vport];
++ 
++ 	mutex_lock(&esw->state_lock);
++ 	evport->trusted = setting;
++ 	if (evport->enabled)
++ 		esw_vport_change_handle_locked(evport);
++ 	mutex_unlock(&esw->state_lock);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 1edc57e2b3d3 (net/mlx5: E-Switch, Implement trust vf ndo)
+  int mlx5_eswitch_get_vport_stats(struct mlx5_eswitch *esw,
+  				 int vport,
+  				 struct ifla_vf_stats *vf_stats)
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index 6f9da7b7d506,fd6800256d4a..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@@ -162,6 -167,10 +162,13 @@@ int mlx5_eswitch_set_vport_state(struc
+  				 int vport, int link_state);
+  int mlx5_eswitch_set_vport_vlan(struct mlx5_eswitch *esw,
+  				int vport, u16 vlan, u8 qos);
+++<<<<<<< HEAD
+++=======
++ int mlx5_eswitch_set_vport_spoofchk(struct mlx5_eswitch *esw,
++ 				    int vport, bool spoofchk);
++ int mlx5_eswitch_set_vport_trust(struct mlx5_eswitch *esw,
++ 				 int vport_num, bool setting);
+++>>>>>>> 1edc57e2b3d3 (net/mlx5: E-Switch, Implement trust vf ndo)
+  int mlx5_eswitch_get_vport_config(struct mlx5_eswitch *esw,
+  				  int vport, struct ifla_vf_info *ivi);
+  int mlx5_eswitch_get_vport_stats(struct mlx5_eswitch *esw,
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
