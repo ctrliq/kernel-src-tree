@@ -1,0 +1,274 @@
+xfrm/xfrm_policy: fix dst dev null pointer dereference in collect_md mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Hangbin Liu <liuhangbin@gmail.com>
+commit c3b4c3a47e05d5fecf7354d75824a9d1b37f3e84
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/c3b4c3a4.failed
+
+In decode_session{4,6} there is a possibility that the skb dst dev is NULL,
+e,g, with tunnel collect_md mode, which will cause kernel crash.
+Here is what the code path looks like, for GRE:
+
+- ip6gre_tunnel_xmit
+  - ip6gre_xmit_ipv6
+    - __gre6_xmit
+      - ip6_tnl_xmit
+        - if skb->len - t->tun_hlen - eth_hlen > mtu; return -EMSGSIZE
+    - icmpv6_send
+      - icmpv6_route_lookup
+        - xfrm_decode_session_reverse
+          - decode_session4
+            - oif = skb_dst(skb)->dev->ifindex; <-- here
+          - decode_session6
+            - oif = skb_dst(skb)->dev->ifindex; <-- here
+
+The reason is __metadata_dst_init() init dst->dev to NULL by default.
+We could not fix it in __metadata_dst_init() as there is no dev supplied.
+On the other hand, the skb_dst(skb)->dev is actually not needed as we
+called decode_session{4,6} via xfrm_decode_session_reverse(), so oif is not
+used by: fl4->flowi4_oif = reverse ? skb->skb_iif : oif;
+
+So make a dst dev check here should be clean and safe.
+
+v4: No changes.
+
+v3: No changes.
+
+v2: fix the issue in decode_session{4,6} instead of updating shared dst dev
+in {ip_md, ip6}_tunnel_xmit.
+
+Fixes: 8d79266bc48c ("ip6_tunnel: add collect_md mode to IPv6 tunnels")
+	Signed-off-by: Hangbin Liu <liuhangbin@gmail.com>
+	Tested-by: Jonathan Lemon <jonathan.lemon@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c3b4c3a47e05d5fecf7354d75824a9d1b37f3e84)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/xfrm/xfrm_policy.c
+diff --cc net/xfrm/xfrm_policy.c
+index aeaab489f96d,ec94f5795ea4..000000000000
+--- a/net/xfrm/xfrm_policy.c
++++ b/net/xfrm/xfrm_policy.c
+@@@ -2368,6 -3260,214 +2368,217 @@@ xfrm_policy_ok(const struct xfrm_tmpl *
+  	return start;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void
++ decode_session4(struct sk_buff *skb, struct flowi *fl, bool reverse)
++ {
++ 	const struct iphdr *iph = ip_hdr(skb);
++ 	int ihl = iph->ihl;
++ 	u8 *xprth = skb_network_header(skb) + ihl * 4;
++ 	struct flowi4 *fl4 = &fl->u.ip4;
++ 	int oif = 0;
++ 
++ 	if (skb_dst(skb) && skb_dst(skb)->dev)
++ 		oif = skb_dst(skb)->dev->ifindex;
++ 
++ 	memset(fl4, 0, sizeof(struct flowi4));
++ 	fl4->flowi4_mark = skb->mark;
++ 	fl4->flowi4_oif = reverse ? skb->skb_iif : oif;
++ 
++ 	fl4->flowi4_proto = iph->protocol;
++ 	fl4->daddr = reverse ? iph->saddr : iph->daddr;
++ 	fl4->saddr = reverse ? iph->daddr : iph->saddr;
++ 	fl4->flowi4_tos = iph->tos;
++ 
++ 	if (!ip_is_fragment(iph)) {
++ 		switch (iph->protocol) {
++ 		case IPPROTO_UDP:
++ 		case IPPROTO_UDPLITE:
++ 		case IPPROTO_TCP:
++ 		case IPPROTO_SCTP:
++ 		case IPPROTO_DCCP:
++ 			if (xprth + 4 < skb->data ||
++ 			    pskb_may_pull(skb, xprth + 4 - skb->data)) {
++ 				__be16 *ports;
++ 
++ 				xprth = skb_network_header(skb) + ihl * 4;
++ 				ports = (__be16 *)xprth;
++ 
++ 				fl4->fl4_sport = ports[!!reverse];
++ 				fl4->fl4_dport = ports[!reverse];
++ 			}
++ 			break;
++ 		case IPPROTO_ICMP:
++ 			if (xprth + 2 < skb->data ||
++ 			    pskb_may_pull(skb, xprth + 2 - skb->data)) {
++ 				u8 *icmp;
++ 
++ 				xprth = skb_network_header(skb) + ihl * 4;
++ 				icmp = xprth;
++ 
++ 				fl4->fl4_icmp_type = icmp[0];
++ 				fl4->fl4_icmp_code = icmp[1];
++ 			}
++ 			break;
++ 		case IPPROTO_ESP:
++ 			if (xprth + 4 < skb->data ||
++ 			    pskb_may_pull(skb, xprth + 4 - skb->data)) {
++ 				__be32 *ehdr;
++ 
++ 				xprth = skb_network_header(skb) + ihl * 4;
++ 				ehdr = (__be32 *)xprth;
++ 
++ 				fl4->fl4_ipsec_spi = ehdr[0];
++ 			}
++ 			break;
++ 		case IPPROTO_AH:
++ 			if (xprth + 8 < skb->data ||
++ 			    pskb_may_pull(skb, xprth + 8 - skb->data)) {
++ 				__be32 *ah_hdr;
++ 
++ 				xprth = skb_network_header(skb) + ihl * 4;
++ 				ah_hdr = (__be32 *)xprth;
++ 
++ 				fl4->fl4_ipsec_spi = ah_hdr[1];
++ 			}
++ 			break;
++ 		case IPPROTO_COMP:
++ 			if (xprth + 4 < skb->data ||
++ 			    pskb_may_pull(skb, xprth + 4 - skb->data)) {
++ 				__be16 *ipcomp_hdr;
++ 
++ 				xprth = skb_network_header(skb) + ihl * 4;
++ 				ipcomp_hdr = (__be16 *)xprth;
++ 
++ 				fl4->fl4_ipsec_spi = htonl(ntohs(ipcomp_hdr[1]));
++ 			}
++ 			break;
++ 		case IPPROTO_GRE:
++ 			if (xprth + 12 < skb->data ||
++ 			    pskb_may_pull(skb, xprth + 12 - skb->data)) {
++ 				__be16 *greflags;
++ 				__be32 *gre_hdr;
++ 
++ 				xprth = skb_network_header(skb) + ihl * 4;
++ 				greflags = (__be16 *)xprth;
++ 				gre_hdr = (__be32 *)xprth;
++ 
++ 				if (greflags[0] & GRE_KEY) {
++ 					if (greflags[0] & GRE_CSUM)
++ 						gre_hdr++;
++ 					fl4->fl4_gre_key = gre_hdr[1];
++ 				}
++ 			}
++ 			break;
++ 		default:
++ 			fl4->fl4_ipsec_spi = 0;
++ 			break;
++ 		}
++ 	}
++ }
++ 
++ #if IS_ENABLED(CONFIG_IPV6)
++ static void
++ decode_session6(struct sk_buff *skb, struct flowi *fl, bool reverse)
++ {
++ 	struct flowi6 *fl6 = &fl->u.ip6;
++ 	int onlyproto = 0;
++ 	const struct ipv6hdr *hdr = ipv6_hdr(skb);
++ 	u32 offset = sizeof(*hdr);
++ 	struct ipv6_opt_hdr *exthdr;
++ 	const unsigned char *nh = skb_network_header(skb);
++ 	u16 nhoff = IP6CB(skb)->nhoff;
++ 	int oif = 0;
++ 	u8 nexthdr;
++ 
++ 	if (!nhoff)
++ 		nhoff = offsetof(struct ipv6hdr, nexthdr);
++ 
++ 	nexthdr = nh[nhoff];
++ 
++ 	if (skb_dst(skb) && skb_dst(skb)->dev)
++ 		oif = skb_dst(skb)->dev->ifindex;
++ 
++ 	memset(fl6, 0, sizeof(struct flowi6));
++ 	fl6->flowi6_mark = skb->mark;
++ 	fl6->flowi6_oif = reverse ? skb->skb_iif : oif;
++ 
++ 	fl6->daddr = reverse ? hdr->saddr : hdr->daddr;
++ 	fl6->saddr = reverse ? hdr->daddr : hdr->saddr;
++ 
++ 	while (nh + offset + sizeof(*exthdr) < skb->data ||
++ 	       pskb_may_pull(skb, nh + offset + sizeof(*exthdr) - skb->data)) {
++ 		nh = skb_network_header(skb);
++ 		exthdr = (struct ipv6_opt_hdr *)(nh + offset);
++ 
++ 		switch (nexthdr) {
++ 		case NEXTHDR_FRAGMENT:
++ 			onlyproto = 1;
++ 			/* fall through */
++ 		case NEXTHDR_ROUTING:
++ 		case NEXTHDR_HOP:
++ 		case NEXTHDR_DEST:
++ 			offset += ipv6_optlen(exthdr);
++ 			nexthdr = exthdr->nexthdr;
++ 			exthdr = (struct ipv6_opt_hdr *)(nh + offset);
++ 			break;
++ 		case IPPROTO_UDP:
++ 		case IPPROTO_UDPLITE:
++ 		case IPPROTO_TCP:
++ 		case IPPROTO_SCTP:
++ 		case IPPROTO_DCCP:
++ 			if (!onlyproto && (nh + offset + 4 < skb->data ||
++ 			     pskb_may_pull(skb, nh + offset + 4 - skb->data))) {
++ 				__be16 *ports;
++ 
++ 				nh = skb_network_header(skb);
++ 				ports = (__be16 *)(nh + offset);
++ 				fl6->fl6_sport = ports[!!reverse];
++ 				fl6->fl6_dport = ports[!reverse];
++ 			}
++ 			fl6->flowi6_proto = nexthdr;
++ 			return;
++ 		case IPPROTO_ICMPV6:
++ 			if (!onlyproto && (nh + offset + 2 < skb->data ||
++ 			    pskb_may_pull(skb, nh + offset + 2 - skb->data))) {
++ 				u8 *icmp;
++ 
++ 				nh = skb_network_header(skb);
++ 				icmp = (u8 *)(nh + offset);
++ 				fl6->fl6_icmp_type = icmp[0];
++ 				fl6->fl6_icmp_code = icmp[1];
++ 			}
++ 			fl6->flowi6_proto = nexthdr;
++ 			return;
++ #if IS_ENABLED(CONFIG_IPV6_MIP6)
++ 		case IPPROTO_MH:
++ 			offset += ipv6_optlen(exthdr);
++ 			if (!onlyproto && (nh + offset + 3 < skb->data ||
++ 			    pskb_may_pull(skb, nh + offset + 3 - skb->data))) {
++ 				struct ip6_mh *mh;
++ 
++ 				nh = skb_network_header(skb);
++ 				mh = (struct ip6_mh *)(nh + offset);
++ 				fl6->fl6_mh_type = mh->ip6mh_type;
++ 			}
++ 			fl6->flowi6_proto = nexthdr;
++ 			return;
++ #endif
++ 		/* XXX Why are there these headers? */
++ 		case IPPROTO_AH:
++ 		case IPPROTO_ESP:
++ 		case IPPROTO_COMP:
++ 		default:
++ 			fl6->fl6_ipsec_spi = 0;
++ 			fl6->flowi6_proto = nexthdr;
++ 			return;
++ 		}
++ 	}
++ }
++ #endif
++ 
+++>>>>>>> c3b4c3a47e05 (xfrm/xfrm_policy: fix dst dev null pointer dereference in collect_md mode)
+  int __xfrm_decode_session(struct sk_buff *skb, struct flowi *fl,
+  			  unsigned int family, int reverse)
+  {
+* Unmerged path net/xfrm/xfrm_policy.c
