@@ -1,0 +1,841 @@
+direct-io: always call ->end_io if non-NULL
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 187372a3b9faff68ed61c291d0135e6739e0dbdf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/187372a3.failed
+
+This way we can pass back errors to the file system, and allow for
+cleanup required for all direct I/O invocations.
+
+Also allow the ->end_io handlers to return errors on their own, so that
+I/O completion errors can be passed on to the callers.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+
+(cherry picked from commit 187372a3b9faff68ed61c291d0135e6739e0dbdf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+#	fs/direct-io.c
+#	fs/ext4/inode.c
+#	fs/ocfs2/aops.c
+#	fs/xfs/xfs_aops.c
+#	include/linux/fs.h
+diff --cc fs/dax.c
+index 679214f8898b,e38b2c589b54..000000000000
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@@ -315,178 -258,29 +315,188 @@@ restart
+  		}
+  	}
+  
+ -	/* Protects against truncate */
+ -	if (!(flags & DIO_SKIP_DIO_COUNT))
+ -		inode_dio_begin(inode);
+ -
+ -	retval = dax_io(inode, iter, pos, end, get_block, &bh);
+ +	/* No entry for given index? Make sure radix tree is big enough. */
+ +	if (!entry || pmd_downgrade) {
+ +		int err;
+  
+ -	if ((flags & DIO_LOCKING) && iov_iter_rw(iter) == READ)
+ -		inode_unlock(inode);
+ +		if (pmd_downgrade) {
+ +			/*
+ +			 * Make sure 'entry' remains valid while we drop
+ +			 * mapping->tree_lock.
+ +			 */
+ +			entry = lock_slot(mapping, slot);
+ +		}
+  
+ +		spin_unlock_irq(&mapping->tree_lock);
+ +		/*
+ +		 * Besides huge zero pages the only other thing that gets
+ +		 * downgraded are empty entries which don't need to be
+ +		 * unmapped.
+ +		 */
+ +		if (pmd_downgrade && dax_is_zero_entry(entry))
+ +			unmap_mapping_range(mapping,
+ +				(index << PAGE_SHIFT) & PMD_MASK, PMD_SIZE, 0);
+ +
+++<<<<<<< HEAD
+ +		err = radix_tree_preload(
+ +				mapping_gfp_mask(mapping) & ~__GFP_HIGHMEM);
+ +		if (err) {
+ +			if (pmd_downgrade)
+ +				put_locked_mapping_entry(mapping, index, entry);
+ +			return ERR_PTR(err);
+ +		}
+ +		spin_lock_irq(&mapping->tree_lock);
+++=======
++ 	if (end_io) {
++ 		int err;
++ 
++ 		err = end_io(iocb, pos, retval, bh.b_private);
++ 		if (err)
++ 			retval = err;
++ 	}
+++>>>>>>> 187372a3b9fa (direct-io: always call ->end_io if non-NULL)
+  
+ -	if (!(flags & DIO_SKIP_DIO_COUNT))
+ -		inode_dio_end(inode);
+ - out:
+ -	return retval;
+ +		if (!entry) {
+ +			/*
+ +			 * We needed to drop the page_tree lock while calling
+ +			 * radix_tree_preload() and we didn't have an entry to
+ +			 * lock.  See if another thread inserted an entry at
+ +			 * our index during this time.
+ +			 */
+ +			entry = __radix_tree_lookup(&mapping->page_tree, index,
+ +					NULL, &slot);
+ +			if (entry) {
+ +				radix_tree_preload_end();
+ +				spin_unlock_irq(&mapping->tree_lock);
+ +				goto restart;
+ +			}
+ +		}
+ +
+ +		if (pmd_downgrade) {
+ +			radix_tree_delete(&mapping->page_tree, index);
+ +			mapping->nrexceptional--;
+ +			dax_wake_mapping_entry_waiter(mapping, index, entry,
+ +					true);
+ +		}
+ +
+ +		entry = dax_radix_locked_entry(0, size_flag | RADIX_DAX_EMPTY);
+ +
+ +		err = __radix_tree_insert(&mapping->page_tree, index,
+ +				dax_radix_order(entry), entry);
+ +		radix_tree_preload_end();
+ +		if (err) {
+ +			spin_unlock_irq(&mapping->tree_lock);
+ +			/*
+ +			 * Our insertion of a DAX entry failed, most likely
+ +			 * because we were inserting a PMD entry and it
+ +			 * collided with a PTE sized entry at a different
+ +			 * index in the PMD range.  We haven't inserted
+ +			 * anything into the radix tree and have no waiters to
+ +			 * wake.
+ +			 */
+ +			return ERR_PTR(err);
+ +		}
+ +		/* Good, we have inserted empty locked entry into the tree. */
+ +		mapping->nrexceptional++;
+ +		spin_unlock_irq(&mapping->tree_lock);
+ +		return entry;
+ +	}
+ +	/* Normal page in radix tree? */
+ +	if (!radix_tree_exceptional_entry(entry)) {
+ +		struct page *page = entry;
+ +
+ +		get_page(page);
+ +		spin_unlock_irq(&mapping->tree_lock);
+ +		lock_page(page);
+ +		/* Page got truncated? Retry... */
+ +		if (unlikely(page->mapping != mapping)) {
+ +			unlock_page(page);
+ +			page_cache_release(page);
+ +			goto restart;
+ +		}
+ +		return page;
+ +	}
+ +	entry = lock_slot(mapping, slot);
+ + out_unlock:
+ +	spin_unlock_irq(&mapping->tree_lock);
+ +	return entry;
+ +}
+ +
+ +/*
+ + * We do not necessarily hold the mapping->tree_lock when we call this
+ + * function so it is possible that 'entry' is no longer a valid item in the
+ + * radix tree.  This is okay because all we really need to do is to find the
+ + * correct waitqueue where tasks might be waiting for that old 'entry' and
+ + * wake them.
+ + */
+ +void dax_wake_mapping_entry_waiter(struct address_space *mapping,
+ +		pgoff_t index, void *entry, bool wake_all)
+ +{
+ +	struct exceptional_entry_key key;
+ +	wait_queue_head_t *wq;
+ +
+ +	wq = dax_entry_waitqueue(mapping, index, entry, &key);
+ +
+ +	/*
+ +	 * Checking for locked entry and prepare_to_wait_exclusive() happens
+ +	 * under mapping->tree_lock, ditto for entry handling in our callers.
+ +	 * So at this point all tasks that could have seen our entry locked
+ +	 * must be in the waitqueue and the following check will see them.
+ +	 */
+ +	if (waitqueue_active(wq))
+ +		__wake_up(wq, TASK_NORMAL, wake_all ? 0 : 1, &key);
+ +}
+ +
+ +static int __dax_invalidate_mapping_entry(struct address_space *mapping,
+ +					  pgoff_t index, bool trunc)
+ +{
+ +	int ret = 0;
+ +	void *entry;
+ +	struct radix_tree_root *page_tree = &mapping->page_tree;
+ +
+ +	spin_lock_irq(&mapping->tree_lock);
+ +	entry = get_unlocked_mapping_entry(mapping, index, NULL);
+ +	if (!entry || !radix_tree_exceptional_entry(entry))
+ +		goto out;
+ +	if (!trunc &&
+ +	    (radix_tree_tag_get(page_tree, index, PAGECACHE_TAG_DIRTY) ||
+ +	     radix_tree_tag_get(page_tree, index, PAGECACHE_TAG_TOWRITE)))
+ +		goto out;
+ +	radix_tree_delete(page_tree, index);
+ +	mapping->nrexceptional--;
+ +	ret = 1;
+ +out:
+ +	put_unlocked_mapping_entry(mapping, index, entry);
+ +	spin_unlock_irq(&mapping->tree_lock);
+ +	return ret;
+ +}
+ +/*
+ + * Delete exceptional DAX entry at @index from @mapping. Wait for radix tree
+ + * entry to get unlocked before deleting it.
+ + */
+ +int dax_delete_mapping_entry(struct address_space *mapping, pgoff_t index)
+ +{
+ +	int ret = __dax_invalidate_mapping_entry(mapping, index, true);
+ +
+ +	/*
+ +	 * This gets called from truncate / punch_hole path. As such, the caller
+ +	 * must hold locks protecting against concurrent modifications of the
+ +	 * radix tree (usually fs-private i_mmap_sem for writing). Since the
+ +	 * caller has seen exceptional entry for this index, we better find it
+ +	 * at that index as well...
+ +	 */
+ +	WARN_ON_ONCE(!ret);
+ +	return ret;
+ +}
+ +
+ +/*
+ + * Invalidate exceptional DAX entry if it is clean.
+ + */
+ +int dax_invalidate_mapping_entry_sync(struct address_space *mapping,
+ +				      pgoff_t index)
+ +{
+ +	return __dax_invalidate_mapping_entry(mapping, index, false);
+  }
+ -EXPORT_SYMBOL_GPL(dax_do_io);
+  
+  /*
+   * The user has performed a load from a hole in the file.  Allocating
+diff --cc fs/direct-io.c
+index 2cde7d0049a9,9c6f885cc518..000000000000
+--- a/fs/direct-io.c
++++ b/fs/direct-io.c
+@@@ -308,38 -253,30 +308,63 @@@ static ssize_t dio_complete(struct dio 
+  	if (ret == 0)
+  		ret = transferred;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Try again to invalidate clean pages which might have been cached by
+ +	 * non-direct readahead, or faulted in by get_user_pages() if the source
+ +	 * of the write was an mmap'ed region of the file we're writing.  Either
+ +	 * one is a pretty crazy thing to do, so we don't support it 100%.  If
+ +	 * this invalidation fails, tough, the write still worked...
+ +	 */
+ +	if (flags & DIO_COMPLETE_INVALIDATE &&
+ +	    ret > 0 && dio->rw & WRITE &&
+ +	    dio->inode->i_mapping->nrpages) {
+ +		err = invalidate_inode_pages2_range(dio->inode->i_mapping,
+ +					offset >> PAGE_SHIFT,
+ +					(offset + ret - 1) >> PAGE_SHIFT);
+ +		WARN_ON_ONCE(err);
+++=======
++ 	if (dio->end_io) {
++ 		int err;
++ 
++ 		err = dio->end_io(dio->iocb, offset, ret, dio->private);
++ 		if (err)
++ 			ret = err;
++ 	}
++ 
++ 	if (!(dio->flags & DIO_SKIP_DIO_COUNT))
++ 		inode_dio_end(dio->inode);
++ 
++ 	if (is_async) {
++ 		if (dio->rw & WRITE) {
++ 			int err;
++ 
++ 			err = generic_write_sync(dio->iocb->ki_filp, offset,
++ 						 transferred);
++ 			if (err < 0 && ret > 0)
++ 				ret = err;
++ 		}
++ 
++ 		dio->iocb->ki_complete(dio->iocb, ret, 0);
+++>>>>>>> 187372a3b9fa (direct-io: always call ->end_io if non-NULL)
+  	}
+  
+ +	/*
+ +	 * Red Hat only: we have to support two calling conventions for
+ +	 * dio_iodone_t functions:
+ +	 * 1) the original, where the routine will call aio_complete and
+ +	 * 2) the new calling convention, where that is done in the
+ +	 *    generic code.
+ +	 * Differentiate between the two cases using an inode flag that
+ +	 * gets populated for all in-tree file systems.
+ +	 */
+ +	if (flags & DIO_COMPLETE_ASYNC)
+ +		is_async = true;
+ +	if (dio->inode->i_sb->s_type->fs_flags & FS_HAS_DIO_IODONE2)
+ +		dio_iodone2_helper(dio, offset, transferred, ret, is_async);
+ +	else
+ +		dio_iodone_helper(dio, offset, transferred, ret, is_async);
+ +
+  	kmem_cache_free(dio_cache, dio);
+  	return ret;
+  }
+diff --cc fs/ext4/inode.c
+index 83725648daac,9db04dd9b88a..000000000000
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@@ -3241,16 -3159,10 +3241,21 @@@ orphan_del
+  	}
+  	return ret;
+  }
+ -#endif
+  
+ +const struct iomap_ops ext4_iomap_ops = {
+ +	.iomap_begin		= ext4_iomap_begin,
+ +	.iomap_end		= ext4_iomap_end,
+ +};
+ +
+++<<<<<<< HEAD
+ +static void ext4_end_io_dio(struct kiocb *iocb, loff_t offset,
+ +			    ssize_t size, void *private,
+ +			    int __attribute__((unused))ret,
+ +			    bool __attribute__((unused))is_async)
+++=======
++ static int ext4_end_io_dio(struct kiocb *iocb, loff_t offset,
++ 			    ssize_t size, void *private)
+++>>>>>>> 187372a3b9fa (direct-io: always call ->end_io if non-NULL)
+  {
+          ext4_io_end_t *io_end = iocb->private;
+  
+diff --cc fs/ocfs2/aops.c
+index 7fee7b2e1225,5dcc5f5a842e..000000000000
+--- a/fs/ocfs2/aops.c
++++ b/fs/ocfs2/aops.c
+@@@ -562,17 -620,17 +562,20 @@@ bail
+   * particularly interested in the aio/dio case.  We use the rw_lock DLM lock
+   * to protect io on one node from truncation on another.
+   */
+- static void ocfs2_dio_end_io(struct kiocb *iocb,
++ static int ocfs2_dio_end_io(struct kiocb *iocb,
+  			     loff_t offset,
+  			     ssize_t bytes,
+ -			     void *private)
+ +			     void *private,
+ +			     int ret,
+ +			     bool is_async)
+  {
+  	struct inode *inode = file_inode(iocb->ki_filp);
+  	int level;
+ +	wait_queue_head_t *wq = ocfs2_ioend_wq(inode);
+  
++ 	if (bytes <= 0)
++ 		return 0;
++ 
+  	/* this io's submitter should not have unlocked this before we could */
+  	BUG_ON(!ocfs2_iocb_is_rw_locked(iocb));
+  
+@@@ -582,49 -637,354 +585,57 @@@
+  	if (ocfs2_iocb_is_unaligned_aio(iocb)) {
+  		ocfs2_iocb_clear_unaligned_aio(iocb);
+  
+ -		mutex_unlock(&OCFS2_I(inode)->ip_unaligned_aio);
+ +		if (atomic_dec_and_test(&OCFS2_I(inode)->ip_unaligned_aio) &&
+ +		    waitqueue_active(wq)) {
+ +			wake_up_all(wq);
+ +		}
+  	}
+  
+ -	/* Let rw unlock to be done later to protect append direct io write */
+ -	if (offset + bytes <= i_size_read(inode)) {
+ -		ocfs2_iocb_clear_rw_locked(iocb);
+ +	ocfs2_iocb_clear_rw_locked(iocb);
+  
+ -		level = ocfs2_iocb_rw_locked_level(iocb);
+ -		ocfs2_rw_unlock(inode, level);
+ -	}
+++<<<<<<< HEAD
+ +	level = ocfs2_iocb_rw_locked_level(iocb);
+ +	ocfs2_rw_unlock(inode, level);
+  
+ -	return 0;
+ -}
+ -
+ -static int ocfs2_releasepage(struct page *page, gfp_t wait)
+ -{
+ -	if (!page_has_buffers(page))
+ -		return 0;
+ -	return try_to_free_buffers(page);
+ +	inode_dio_done(inode);
+ +	if (is_async)
+ +		aio_complete(iocb, ret, 0);
+  }
+  
+ -static int ocfs2_is_overwrite(struct ocfs2_super *osb,
+ -		struct inode *inode, loff_t offset)
+ +/*
+ + * ocfs2_invalidatepage() and ocfs2_releasepage() are shamelessly stolen
+ + * from ext3.  PageChecked() bits have been removed as OCFS2 does not
+ + * do journalled data.
+ + */
+ +static void ocfs2_invalidatepage(struct page *page, unsigned long offset)
+  {
+ -	int ret = 0;
+ -	u32 v_cpos = 0;
+ -	u32 p_cpos = 0;
+ -	unsigned int num_clusters = 0;
+ -	unsigned int ext_flags = 0;
+ +	journal_t *journal = OCFS2_SB(page->mapping->host->i_sb)->journal->j_journal;
+  
+ -	v_cpos = ocfs2_bytes_to_clusters(osb->sb, offset);
+ -	ret = ocfs2_get_clusters(inode, v_cpos, &p_cpos,
+ -			&num_clusters, &ext_flags);
+ -	if (ret < 0) {
+ -		mlog_errno(ret);
+ -		return ret;
+ +	jbd2_journal_invalidatepage(journal, page, offset,
+ +				    PAGE_CACHE_SIZE - offset);
+++=======
+++		level = ocfs2_iocb_rw_locked_level(iocb);
+++		ocfs2_rw_unlock(inode, level);
++ 	}
++ 
+ -	if (p_cpos && !(ext_flags & OCFS2_EXT_UNWRITTEN))
+ -		return 1;
+ -
++ 	return 0;
+++>>>>>>> 187372a3b9fa (direct-io: always call ->end_io if non-NULL)
+  }
+  
+ -static int ocfs2_direct_IO_zero_extend(struct ocfs2_super *osb,
+ -		struct inode *inode, loff_t offset,
+ -		u64 zero_len, int cluster_align)
+ -{
+ -	u32 p_cpos = 0;
+ -	u32 v_cpos = ocfs2_bytes_to_clusters(osb->sb, i_size_read(inode));
+ -	unsigned int num_clusters = 0;
+ -	unsigned int ext_flags = 0;
+ -	int ret = 0;
+ -
+ -	if (offset <= i_size_read(inode) || cluster_align)
+ -		return 0;
+ -
+ -	ret = ocfs2_get_clusters(inode, v_cpos, &p_cpos, &num_clusters,
+ -			&ext_flags);
+ -	if (ret < 0) {
+ -		mlog_errno(ret);
+ -		return ret;
+ -	}
+ -
+ -	if (p_cpos && !(ext_flags & OCFS2_EXT_UNWRITTEN)) {
+ -		u64 s = i_size_read(inode);
+ -		sector_t sector = ((u64)p_cpos << (osb->s_clustersize_bits - 9)) +
+ -			(do_div(s, osb->s_clustersize) >> 9);
+ -
+ -		ret = blkdev_issue_zeroout(osb->sb->s_bdev, sector,
+ -				zero_len >> 9, GFP_NOFS, false);
+ -		if (ret < 0)
+ -			mlog_errno(ret);
+ -	}
+ -
+ -	return ret;
+ -}
+ -
+ -static int ocfs2_direct_IO_extend_no_holes(struct ocfs2_super *osb,
+ -		struct inode *inode, loff_t offset)
+ +static int ocfs2_releasepage(struct page *page, gfp_t wait)
+  {
+ -	u64 zero_start, zero_len, total_zero_len;
+ -	u32 p_cpos = 0, clusters_to_add;
+ -	u32 v_cpos = ocfs2_bytes_to_clusters(osb->sb, i_size_read(inode));
+ -	unsigned int num_clusters = 0;
+ -	unsigned int ext_flags = 0;
+ -	u32 size_div, offset_div;
+ -	int ret = 0;
+ -
+ -	{
+ -		u64 o = offset;
+ -		u64 s = i_size_read(inode);
+ -
+ -		offset_div = do_div(o, osb->s_clustersize);
+ -		size_div = do_div(s, osb->s_clustersize);
+ -	}
+ +	journal_t *journal = OCFS2_SB(page->mapping->host->i_sb)->journal->j_journal;
+  
+ -	if (offset <= i_size_read(inode))
+ +	if (!page_has_buffers(page))
+  		return 0;
+ -
+ -	clusters_to_add = ocfs2_bytes_to_clusters(inode->i_sb, offset) -
+ -		ocfs2_bytes_to_clusters(inode->i_sb, i_size_read(inode));
+ -	total_zero_len = offset - i_size_read(inode);
+ -	if (clusters_to_add)
+ -		total_zero_len -= offset_div;
+ -
+ -	/* Allocate clusters to fill out holes, and this is only needed
+ -	 * when we add more than one clusters. Otherwise the cluster will
+ -	 * be allocated during direct IO */
+ -	if (clusters_to_add > 1) {
+ -		ret = ocfs2_extend_allocation(inode,
+ -				OCFS2_I(inode)->ip_clusters,
+ -				clusters_to_add - 1, 0);
+ -		if (ret) {
+ -			mlog_errno(ret);
+ -			goto out;
+ -		}
+ -	}
+ -
+ -	while (total_zero_len) {
+ -		ret = ocfs2_get_clusters(inode, v_cpos, &p_cpos, &num_clusters,
+ -				&ext_flags);
+ -		if (ret < 0) {
+ -			mlog_errno(ret);
+ -			goto out;
+ -		}
+ -
+ -		zero_start = ocfs2_clusters_to_bytes(osb->sb, p_cpos) +
+ -			size_div;
+ -		zero_len = ocfs2_clusters_to_bytes(osb->sb, num_clusters) -
+ -			size_div;
+ -		zero_len = min(total_zero_len, zero_len);
+ -
+ -		if (p_cpos && !(ext_flags & OCFS2_EXT_UNWRITTEN)) {
+ -			ret = blkdev_issue_zeroout(osb->sb->s_bdev,
+ -					zero_start >> 9, zero_len >> 9,
+ -					GFP_NOFS, false);
+ -			if (ret < 0) {
+ -				mlog_errno(ret);
+ -				goto out;
+ -			}
+ -		}
+ -
+ -		total_zero_len -= zero_len;
+ -		v_cpos += ocfs2_bytes_to_clusters(osb->sb, zero_len + size_div);
+ -
+ -		/* Only at first iteration can be cluster not aligned.
+ -		 * So set size_div to 0 for the rest */
+ -		size_div = 0;
+ -	}
+ -
+ -out:
+ -	return ret;
+ -}
+ -
+ -static ssize_t ocfs2_direct_IO_write(struct kiocb *iocb,
+ -		struct iov_iter *iter,
+ -		loff_t offset)
+ -{
+ -	ssize_t ret = 0;
+ -	ssize_t written = 0;
+ -	bool orphaned = false;
+ -	int is_overwrite = 0;
+ -	struct file *file = iocb->ki_filp;
+ -	struct inode *inode = file_inode(file)->i_mapping->host;
+ -	struct ocfs2_super *osb = OCFS2_SB(inode->i_sb);
+ -	struct buffer_head *di_bh = NULL;
+ -	size_t count = iter->count;
+ -	journal_t *journal = osb->journal->j_journal;
+ -	u64 zero_len_head, zero_len_tail;
+ -	int cluster_align_head, cluster_align_tail;
+ -	loff_t final_size = offset + count;
+ -	int append_write = offset >= i_size_read(inode) ? 1 : 0;
+ -	unsigned int num_clusters = 0;
+ -	unsigned int ext_flags = 0;
+ -
+ -	{
+ -		u64 o = offset;
+ -		u64 s = i_size_read(inode);
+ -
+ -		zero_len_head = do_div(o, 1 << osb->s_clustersize_bits);
+ -		cluster_align_head = !zero_len_head;
+ -
+ -		zero_len_tail = osb->s_clustersize -
+ -			do_div(s, osb->s_clustersize);
+ -		if ((offset - i_size_read(inode)) < zero_len_tail)
+ -			zero_len_tail = offset - i_size_read(inode);
+ -		cluster_align_tail = !zero_len_tail;
+ -	}
+ -
+ -	/*
+ -	 * when final_size > inode->i_size, inode->i_size will be
+ -	 * updated after direct write, so add the inode to orphan
+ -	 * dir first.
+ -	 */
+ -	if (final_size > i_size_read(inode)) {
+ -		ret = ocfs2_add_inode_to_orphan(osb, inode);
+ -		if (ret < 0) {
+ -			mlog_errno(ret);
+ -			goto out;
+ -		}
+ -		orphaned = true;
+ -	}
+ -
+ -	if (append_write) {
+ -		ret = ocfs2_inode_lock(inode, NULL, 1);
+ -		if (ret < 0) {
+ -			mlog_errno(ret);
+ -			goto clean_orphan;
+ -		}
+ -
+ -		/* zeroing out the previously allocated cluster tail
+ -		 * that but not zeroed */
+ -		if (ocfs2_sparse_alloc(OCFS2_SB(inode->i_sb))) {
+ -			down_read(&OCFS2_I(inode)->ip_alloc_sem);
+ -			ret = ocfs2_direct_IO_zero_extend(osb, inode, offset,
+ -					zero_len_tail, cluster_align_tail);
+ -			up_read(&OCFS2_I(inode)->ip_alloc_sem);
+ -		} else {
+ -			down_write(&OCFS2_I(inode)->ip_alloc_sem);
+ -			ret = ocfs2_direct_IO_extend_no_holes(osb, inode,
+ -					offset);
+ -			up_write(&OCFS2_I(inode)->ip_alloc_sem);
+ -		}
+ -		if (ret < 0) {
+ -			mlog_errno(ret);
+ -			ocfs2_inode_unlock(inode, 1);
+ -			goto clean_orphan;
+ -		}
+ -
+ -		is_overwrite = ocfs2_is_overwrite(osb, inode, offset);
+ -		if (is_overwrite < 0) {
+ -			mlog_errno(is_overwrite);
+ -			ret = is_overwrite;
+ -			ocfs2_inode_unlock(inode, 1);
+ -			goto clean_orphan;
+ -		}
+ -
+ -		ocfs2_inode_unlock(inode, 1);
+ -	}
+ -
+ -	written = __blockdev_direct_IO(iocb, inode, inode->i_sb->s_bdev, iter,
+ -				       offset, ocfs2_direct_IO_get_blocks,
+ -				       ocfs2_dio_end_io, NULL, 0);
+ -	/* overwrite aio may return -EIOCBQUEUED, and it is not an error */
+ -	if ((written < 0) && (written != -EIOCBQUEUED)) {
+ -		loff_t i_size = i_size_read(inode);
+ -
+ -		if (offset + count > i_size) {
+ -			ret = ocfs2_inode_lock(inode, &di_bh, 1);
+ -			if (ret < 0) {
+ -				mlog_errno(ret);
+ -				goto clean_orphan;
+ -			}
+ -
+ -			if (i_size == i_size_read(inode)) {
+ -				ret = ocfs2_truncate_file(inode, di_bh,
+ -						i_size);
+ -				if (ret < 0) {
+ -					if (ret != -ENOSPC)
+ -						mlog_errno(ret);
+ -
+ -					ocfs2_inode_unlock(inode, 1);
+ -					brelse(di_bh);
+ -					di_bh = NULL;
+ -					goto clean_orphan;
+ -				}
+ -			}
+ -
+ -			ocfs2_inode_unlock(inode, 1);
+ -			brelse(di_bh);
+ -			di_bh = NULL;
+ -
+ -			ret = jbd2_journal_force_commit(journal);
+ -			if (ret < 0)
+ -				mlog_errno(ret);
+ -		}
+ -	} else if (written > 0 && append_write && !is_overwrite &&
+ -			!cluster_align_head) {
+ -		/* zeroing out the allocated cluster head */
+ -		u32 p_cpos = 0;
+ -		u32 v_cpos = ocfs2_bytes_to_clusters(osb->sb, offset);
+ -
+ -		ret = ocfs2_inode_lock(inode, NULL, 0);
+ -		if (ret < 0) {
+ -			mlog_errno(ret);
+ -			goto clean_orphan;
+ -		}
+ -
+ -		ret = ocfs2_get_clusters(inode, v_cpos, &p_cpos,
+ -				&num_clusters, &ext_flags);
+ -		if (ret < 0) {
+ -			mlog_errno(ret);
+ -			ocfs2_inode_unlock(inode, 0);
+ -			goto clean_orphan;
+ -		}
+ -
+ -		BUG_ON(!p_cpos || (ext_flags & OCFS2_EXT_UNWRITTEN));
+ -
+ -		ret = blkdev_issue_zeroout(osb->sb->s_bdev,
+ -				(u64)p_cpos << (osb->s_clustersize_bits - 9),
+ -				zero_len_head >> 9, GFP_NOFS, false);
+ -		if (ret < 0)
+ -			mlog_errno(ret);
+ -
+ -		ocfs2_inode_unlock(inode, 0);
+ -	}
+ -
+ -clean_orphan:
+ -	if (orphaned) {
+ -		int tmp_ret;
+ -		int update_isize = written > 0 ? 1 : 0;
+ -		loff_t end = update_isize ? offset + written : 0;
+ -
+ -		tmp_ret = ocfs2_inode_lock(inode, &di_bh, 1);
+ -		if (tmp_ret < 0) {
+ -			ret = tmp_ret;
+ -			mlog_errno(ret);
+ -			goto out;
+ -		}
+ -
+ -		tmp_ret = ocfs2_del_inode_from_orphan(osb, inode, di_bh,
+ -				update_isize, end);
+ -		if (tmp_ret < 0) {
+ -			ret = tmp_ret;
+ -			mlog_errno(ret);
+ -			brelse(di_bh);
+ -			goto out;
+ -		}
+ -
+ -		ocfs2_inode_unlock(inode, 1);
+ -		brelse(di_bh);
+ -
+ -		tmp_ret = jbd2_journal_force_commit(journal);
+ -		if (tmp_ret < 0) {
+ -			ret = tmp_ret;
+ -			mlog_errno(tmp_ret);
+ -		}
+ -	}
+ -
+ -out:
+ -	if (ret >= 0)
+ -		ret = written;
+ -	return ret;
+ +	return jbd2_journal_try_to_free_buffers(journal, page, wait);
+  }
+  
+ -static ssize_t ocfs2_direct_IO(struct kiocb *iocb, struct iov_iter *iter,
+ -			       loff_t offset)
+ +static ssize_t ocfs2_direct_IO(int rw,
+ +			       struct kiocb *iocb,
+ +			       const struct iovec *iov,
+ +			       loff_t offset,
+ +			       unsigned long nr_segs)
+  {
+  	struct file *file = iocb->ki_filp;
+  	struct inode *inode = file_inode(file)->i_mapping->host;
+diff --cc fs/xfs/xfs_aops.c
+index 767102523abf,295aaffea78e..000000000000
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@@ -1523,7 -1645,7 +1523,11 @@@ out_end_io
+   * case the completion can be called in interrupt context, whereas if we have an
+   * ioend we will always be called in task context (i.e. from a workqueue).
+   */
+++<<<<<<< HEAD
+ +void
+++=======
++ STATIC int
+++>>>>>>> 187372a3b9fa (direct-io: always call ->end_io if non-NULL)
+  xfs_end_io_direct_write(
+  	struct kiocb		*iocb,
+  	loff_t			offset,
+@@@ -1544,20 -1667,41 +1551,44 @@@
+  	}
+  
+  	__xfs_end_io_direct_write(inode, ioend, offset, size);
++ 	return 0;
++ }
++ 
+++<<<<<<< HEAD
+++=======
++ static inline ssize_t
++ xfs_vm_do_dio(
++ 	struct inode		*inode,
++ 	struct kiocb		*iocb,
++ 	struct iov_iter		*iter,
++ 	loff_t			offset,
++ 	dio_iodone_t		endio,
++ 	int			flags)
++ {
++ 	struct block_device	*bdev;
++ 
++ 	if (IS_DAX(inode))
++ 		return dax_do_io(iocb, inode, iter, offset,
++ 				 xfs_get_blocks_direct, endio, 0);
++ 
++ 	bdev = xfs_find_bdev_for_inode(inode);
++ 	return  __blockdev_direct_IO(iocb, inode, bdev, iter, offset,
++ 				     xfs_get_blocks_direct, endio, NULL, flags);
+  }
+  
+++>>>>>>> 187372a3b9fa (direct-io: always call ->end_io if non-NULL)
+  STATIC ssize_t
+  xfs_vm_direct_IO(
+ +	int			rw,
+  	struct kiocb		*iocb,
+ -	struct iov_iter		*iter,
+ -	loff_t			offset)
+ +	const struct iovec	*iov,
+ +	loff_t			offset,
+ +	unsigned long		nr_segs)
+  {
+ -	struct inode		*inode = iocb->ki_filp->f_mapping->host;
+ -
+ -	if (iov_iter_rw(iter) == WRITE)
+ -		return xfs_vm_do_dio(inode, iocb, iter, offset,
+ -				     xfs_end_io_direct_write, DIO_ASYNC_EXTEND);
+ -	return xfs_vm_do_dio(inode, iocb, iter, offset, NULL, 0);
+ +	/*
+ +	 * We just need the method present so that open/fcntl allow direct I/O.
+ +	 */
+ +	return -EINVAL;
+  }
+  
+  /*
+diff --cc include/linux/fs.h
+index eb6f99402b9c,d7f37bfcbdce..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -68,9 -70,9 +68,15 @@@ extern int sysctl_protected_hardlinks
+  struct buffer_head;
+  typedef int (get_block_t)(struct inode *inode, sector_t iblock,
+  			struct buffer_head *bh_result, int create);
+++<<<<<<< HEAD
+ +typedef void (dio_iodone_t)(struct kiocb *iocb, loff_t offset,
+ +			ssize_t bytes, void *private, int ret,
+ +			bool is_async);
+++=======
++ typedef int (dio_iodone_t)(struct kiocb *iocb, loff_t offset,
++ 			ssize_t bytes, void *private);
++ typedef void (dax_iodone_t)(struct buffer_head *bh_map, int uptodate);
+++>>>>>>> 187372a3b9fa (direct-io: always call ->end_io if non-NULL)
+  
+  #define MAY_EXEC		0x00000001
+  #define MAY_WRITE		0x00000002
+* Unmerged path fs/dax.c
+* Unmerged path fs/direct-io.c
+* Unmerged path fs/ext4/inode.c
+* Unmerged path fs/ocfs2/aops.c
+* Unmerged path fs/xfs/xfs_aops.c
+* Unmerged path include/linux/fs.h
