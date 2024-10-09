@@ -29,7 +29,7 @@ struct perf_sample_id {
 	u64			period;
 };
 
-struct cgroup_sel;
+struct cgroup;
 
 /*
  * The 'struct perf_evsel_config_term' is used to pass event
@@ -104,7 +104,7 @@ struct perf_evsel {
 	struct perf_stat_evsel  *stats;
 	void			*priv;
 	u64			db_id;
-	struct cgroup_sel	*cgrp;
+	struct cgroup		*cgrp;
 	void			*handler;
 	struct cpu_map		*cpus;
 	struct cpu_map		*own_cpus;
