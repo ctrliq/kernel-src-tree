@@ -1,0 +1,152 @@
+sysfs: merge regular and bin file handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Tejun Heo <tj@kernel.org>
+commit 3124eb1679b28726eacbc8973a891235dca3ed99
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/3124eb16.failed
+
+With the previous changes, sysfs regular file code is ready to handle
+bin files too.  This patch makes bin files share the regular file
+path.
+
+* sysfs_create/remove_bin_file() are moved to fs/sysfs/file.c.
+
+* sysfs_init_inode() is updated to use the new sysfs_bin_operations
+  instead of bin_fops for bin files.
+
+* fs/sysfs/bin.c and the related pieces are removed.
+
+This patch shouldn't introduce any behavior difference to bin file
+accesses.
+
+Overall, this unification reduces the amount of duplicate logic, makes
+behaviors more consistent and paves the road for building simpler and
+more versatile interface which will allow other subsystems to make use
+of sysfs for their pseudo filesystems.
+
+v2: Stale fs/sysfs/bin.c reference dropped from
+    Documentation/DocBook/filesystems.tmpl.  Reported by kbuild test
+    robot.
+
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Cc: Kay Sievers <kay@vrfy.org>
+	Cc: kbuild test robot <fengguang.wu@intel.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 3124eb1679b28726eacbc8973a891235dca3ed99)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/sysfs/bin.c
+#	fs/sysfs/dir.c
+diff --cc fs/sysfs/dir.c
+index fd502d3fc9fc,f6025c81bfd5..000000000000
+--- a/fs/sysfs/dir.c
++++ b/fs/sysfs/dir.c
+@@@ -585,7 -595,7 +585,11 @@@ void sysfs_addrm_finish(struct sysfs_ad
+  		acxt->removed = sd->u.removed_list;
+  
+  		sysfs_deactivate(sd);
+++<<<<<<< HEAD
+ +		unmap_bin_file(sd);
+++=======
++ 		sysfs_unmap_bin_file(sd);
+++>>>>>>> 3124eb1679b2 (sysfs: merge regular and bin file handling)
+  		sysfs_put(sd);
+  	}
+  }
+* Unmerged path fs/sysfs/bin.c
+diff --git a/Documentation/DocBook/filesystems.tmpl b/Documentation/DocBook/filesystems.tmpl
+index 25b58efd955d..4f676838da06 100644
+--- a/Documentation/DocBook/filesystems.tmpl
++++ b/Documentation/DocBook/filesystems.tmpl
+@@ -91,7 +91,6 @@
+      <title>The Filesystem for Exporting Kernel Objects</title>
+ !Efs/sysfs/file.c
+ !Efs/sysfs/symlink.c
+-!Efs/sysfs/bin.c
+   </chapter>
+ 
+   <chapter id="debugfs">
+diff --git a/fs/sysfs/Makefile b/fs/sysfs/Makefile
+index 7a1ceb946b80..8876ac183373 100644
+--- a/fs/sysfs/Makefile
++++ b/fs/sysfs/Makefile
+@@ -2,5 +2,4 @@
+ # Makefile for the sysfs virtual filesystem
+ #
+ 
+-obj-y		:= inode.o file.o dir.o symlink.o mount.o bin.o \
+-		   group.o
++obj-y		:= inode.o file.o dir.o symlink.o mount.o group.o
+* Unmerged path fs/sysfs/bin.c
+* Unmerged path fs/sysfs/dir.c
+diff --git a/fs/sysfs/file.c b/fs/sysfs/file.c
+index d8887c896abc..7957c4e24b53 100644
+--- a/fs/sysfs/file.c
++++ b/fs/sysfs/file.c
+@@ -709,6 +709,32 @@ void sysfs_remove_file_from_group(struct kobject *kobj,
+ }
+ EXPORT_SYMBOL_GPL(sysfs_remove_file_from_group);
+ 
++/**
++ *	sysfs_create_bin_file - create binary file for object.
++ *	@kobj:	object.
++ *	@attr:	attribute descriptor.
++ */
++int sysfs_create_bin_file(struct kobject *kobj,
++			  const struct bin_attribute *attr)
++{
++	BUG_ON(!kobj || !kobj->sd || !attr);
++
++	return sysfs_add_file(kobj->sd, &attr->attr, SYSFS_KOBJ_BIN_ATTR);
++}
++EXPORT_SYMBOL_GPL(sysfs_create_bin_file);
++
++/**
++ *	sysfs_remove_bin_file - remove binary file for object.
++ *	@kobj:	object.
++ *	@attr:	attribute descriptor.
++ */
++void sysfs_remove_bin_file(struct kobject *kobj,
++			   const struct bin_attribute *attr)
++{
++	sysfs_hash_and_remove(kobj->sd, attr->attr.name, NULL);
++}
++EXPORT_SYMBOL_GPL(sysfs_remove_bin_file);
++
+ struct sysfs_schedule_callback_struct {
+ 	struct list_head	workq_list;
+ 	struct kobject		*kobj;
+diff --git a/fs/sysfs/inode.c b/fs/sysfs/inode.c
+index 15a606d56f5d..2cddba7d90b7 100644
+--- a/fs/sysfs/inode.c
++++ b/fs/sysfs/inode.c
+@@ -258,7 +258,7 @@ static void sysfs_init_inode(struct sysfs_dirent *sd, struct inode *inode)
+ 	case SYSFS_KOBJ_BIN_ATTR:
+ 		bin_attr = sd->s_bin_attr.bin_attr;
+ 		inode->i_size = bin_attr->size;
+-		inode->i_fop = &bin_fops;
++		inode->i_fop = &sysfs_bin_operations;
+ 		break;
+ 	case SYSFS_KOBJ_LINK:
+ 		inode->i_op = &sysfs_symlink_inode_operations;
+diff --git a/fs/sysfs/sysfs.h b/fs/sysfs/sysfs.h
+index b6deca3e301d..6f5663d7bb2b 100644
+--- a/fs/sysfs/sysfs.h
++++ b/fs/sysfs/sysfs.h
+@@ -232,12 +232,6 @@ int sysfs_add_file(struct sysfs_dirent *dir_sd,
+ 
+ int sysfs_add_file_mode(struct sysfs_dirent *dir_sd,
+ 			const struct attribute *attr, int type, umode_t amode);
+-/*
+- * bin.c
+- */
+-extern const struct file_operations bin_fops;
+-void unmap_bin_file(struct sysfs_dirent *attr_sd);
+-
+ /*
+  * symlink.c
+  */
