@@ -38,7 +38,7 @@ static int __init fb_logo_late_init(void)
 	return 0;
 }
 
-late_initcall(fb_logo_late_init);
+late_initcall_sync(fb_logo_late_init);
 
 /* logo's are marked __initdata. Use __init_refok to tell
  * modpost that it is intended that this function uses data
