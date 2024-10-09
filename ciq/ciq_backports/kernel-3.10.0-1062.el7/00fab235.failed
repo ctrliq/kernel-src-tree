@@ -1,0 +1,641 @@
+s390/zcrypt: multiple zcrypt device nodes support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [s390] zcrypt: multiple zcrypt device nodes support (Hendrik Brueckner) [1641030]
+Rebuild_FUZZ: 94.62%
+commit-author Harald Freudenberger <freude@linux.ibm.com>
+commit 00fab2350e6b91e57b3cdcd5d9f01056775a921d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/00fab235.failed
+
+This patch is an extension to the zcrypt device driver to provide,
+support and maintain multiple zcrypt device nodes. The individual
+zcrypt device nodes can be restricted in terms of crypto cards,
+domains and available ioctls. Such a device node can be used as a
+base for container solutions like docker to control and restrict
+the access to crypto resources.
+
+The handling is done with a new sysfs subdir /sys/class/zcrypt.
+Echoing a name (or an empty sting) into the attribute "create" creates
+a new zcrypt device node. In /sys/class/zcrypt a new link will appear
+which points to the sysfs device tree of this new device. The
+attribute files "ioctlmask", "apmask" and "aqmask" in this directory
+are used to customize this new zcrypt device node instance. Finally
+the zcrypt device node can be destroyed by echoing the name into
+/sys/class/zcrypt/destroy. The internal structs holding the device
+info are reference counted - so a destroy will not hard remove a
+device but only marks it as removable when the reference counter drops
+to zero.
+
+The mask values are bitmaps in big endian order starting with bit 0.
+So adapter number 0 is the leftmost bit, mask is 0x8000...  The sysfs
+attributes accept 2 different formats:
+* Absolute hex string starting with 0x like "0x12345678" does set
+  the mask starting from left to right. If the given string is shorter
+  than the mask it is padded with 0s on the right. If the string is
+  longer than the mask an error comes back (EINVAL).
+* Relative format - a concatenation (done with ',') of the
+  terms +<bitnr>[-<bitnr>] or -<bitnr>[-<bitnr>]. <bitnr> may be any
+  valid number (hex, decimal or octal) in the range 0...255. Here are
+  some examples:
+    "+0-15,+32,-128,-0xFF"
+    "-0-255,+1-16,+0x128"
+    "+1,+2,+3,+4,-5,-7-10"
+
+A simple usage examples:
+
+  # create new zcrypt device 'my_zcrypt':
+  echo "my_zcrypt" >/sys/class/zcrypt/create
+  # go into the device dir of this new device
+  echo "my_zcrypt" >create
+  cd my_zcrypt/
+  ls -l
+  total 0
+  -rw-r--r-- 1 root root 4096 Jul 20 15:23 apmask
+  -rw-r--r-- 1 root root 4096 Jul 20 15:23 aqmask
+  -r--r--r-- 1 root root 4096 Jul 20 15:23 dev
+  -rw-r--r-- 1 root root 4096 Jul 20 15:23 ioctlmask
+  lrwxrwxrwx 1 root root    0 Jul 20 15:23 subsystem -> ../../../../class/zcrypt
+  ...
+  # customize this zcrypt node clone
+  # enable only adapter 0 and 2
+  echo "0xa0" >apmask
+  # enable only domain 6
+  echo "+6" >aqmask
+  # enable all 256 ioctls
+  echo "+0-255" >ioctls
+  # now the /dev/my_zcrypt may be used
+  # finally destroy it
+  echo "my_zcrypt" >/sys/class/zcrypt/destroy
+
+Please note that a very similar 'filtering behavior' also applies to
+the parent z90crypt device. The two mask attributes apmask and aqmask
+in /sys/bus/ap act the very same for the z90crypt device node. However
+the implementation here is totally different as the ap bus acts on
+bind/unbind of queue devices and associated drivers but the effect is
+still the same. So there are two filters active for each additional
+zcrypt device node: The adapter/domain needs to be enabled on the ap
+bus level and it needs to be active on the zcrypt device node level.
+
+	Signed-off-by: Harald Freudenberger <freude@linux.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 00fab2350e6b91e57b3cdcd5d9f01056775a921d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/ap_bus.c
+#	drivers/s390/crypto/ap_bus.h
+#	drivers/s390/crypto/zcrypt_api.c
+diff --cc drivers/s390/crypto/ap_bus.c
+index eec227533e4a,15bca7583bb9..000000000000
+--- a/drivers/s390/crypto/ap_bus.c
++++ b/drivers/s390/crypto/ap_bus.c
+@@@ -80,6 -65,12 +80,15 @@@ static struct device *ap_root_device
+  DEFINE_SPINLOCK(ap_list_lock);
+  LIST_HEAD(ap_card_list);
+  
+++<<<<<<< HEAD
+++=======
++ /* Default permissions (ioctl, card and domain masking) */
++ struct ap_perms ap_perms;
++ EXPORT_SYMBOL(ap_perms);
++ DEFINE_MUTEX(ap_perms_mutex);
++ EXPORT_SYMBOL(ap_perms_mutex);
++ 
+++>>>>>>> 00fab2350e6b (s390/zcrypt: multiple zcrypt device nodes support)
+  static struct ap_config_info *ap_configuration;
+  static bool initialised;
+  
+@@@ -792,8 -856,132 +801,134 @@@ void ap_bus_force_rescan(void
+  EXPORT_SYMBOL(ap_bus_force_rescan);
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * hex2bitmap() - parse hex mask string and set bitmap.
++  * Valid strings are "0x012345678" with at least one valid hex number.
++  * Rest of the bitmap to the right is padded with 0. No spaces allowed
++  * within the string, the leading 0x may be omitted.
++  * Returns the bitmask with exactly the bits set as given by the hex
++  * string (both in big endian order).
++  */
++ static int hex2bitmap(const char *str, unsigned long *bitmap, int bits)
++ {
++ 	int i, n, b;
++ 
++ 	/* bits needs to be a multiple of 8 */
++ 	if (bits & 0x07)
++ 		return -EINVAL;
++ 
++ 	if (str[0] == '0' && str[1] == 'x')
++ 		str++;
++ 	if (*str == 'x')
++ 		str++;
++ 
++ 	for (i = 0; isxdigit(*str) && i < bits; str++) {
++ 		b = hex_to_bin(*str);
++ 		for (n = 0; n < 4; n++)
++ 			if (b & (0x08 >> n))
++ 				set_bit_inv(i + n, bitmap);
++ 		i += 4;
++ 	}
++ 
++ 	if (*str == '\n')
++ 		str++;
++ 	if (*str)
++ 		return -EINVAL;
++ 	return 0;
++ }
++ 
++ /*
++  * modify_bitmap() - parse bitmask argument and modify an existing
++  * bit mask accordingly. A concatenation (done with ',') of these
++  * terms is recognized:
++  *   +<bitnr>[-<bitnr>] or -<bitnr>[-<bitnr>]
++  * <bitnr> may be any valid number (hex, decimal or octal) in the range
++  * 0...bits-1; the leading + or - is required. Here are some examples:
++  *   +0-15,+32,-128,-0xFF
++  *   -0-255,+1-16,+0x128
++  *   +1,+2,+3,+4,-5,-7-10
++  * Returns the new bitmap after all changes have been applied. Every
++  * positive value in the string will set a bit and every negative value
++  * in the string will clear a bit. As a bit may be touched more than once,
++  * the last 'operation' wins:
++  * +0-255,-128 = first bits 0-255 will be set, then bit 128 will be
++  * cleared again. All other bits are unmodified.
++  */
++ static int modify_bitmap(const char *str, unsigned long *bitmap, int bits)
++ {
++ 	int a, i, z;
++ 	char *np, sign;
++ 
++ 	/* bits needs to be a multiple of 8 */
++ 	if (bits & 0x07)
++ 		return -EINVAL;
++ 
++ 	while (*str) {
++ 		sign = *str++;
++ 		if (sign != '+' && sign != '-')
++ 			return -EINVAL;
++ 		a = z = simple_strtoul(str, &np, 0);
++ 		if (str == np || a >= bits)
++ 			return -EINVAL;
++ 		str = np;
++ 		if (*str == '-') {
++ 			z = simple_strtoul(++str, &np, 0);
++ 			if (str == np || a > z || z >= bits)
++ 				return -EINVAL;
++ 			str = np;
++ 		}
++ 		for (i = a; i <= z; i++)
++ 			if (sign == '+')
++ 				set_bit_inv(i, bitmap);
++ 			else
++ 				clear_bit_inv(i, bitmap);
++ 		while (*str == ',' || *str == '\n')
++ 			str++;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ int ap_parse_mask_str(const char *str,
++ 		      unsigned long *bitmap, int bits,
++ 		      struct mutex *lock)
++ {
++ 	unsigned long *newmap, size;
++ 	int rc;
++ 
++ 	/* bits needs to be a multiple of 8 */
++ 	if (bits & 0x07)
++ 		return -EINVAL;
++ 
++ 	size = BITS_TO_LONGS(bits)*sizeof(unsigned long);
++ 	newmap = kmalloc(size, GFP_KERNEL);
++ 	if (!newmap)
++ 		return -ENOMEM;
++ 	if (mutex_lock_interruptible(lock)) {
++ 		kfree(newmap);
++ 		return -ERESTARTSYS;
++ 	}
++ 
++ 	if (*str == '+' || *str == '-') {
++ 		memcpy(newmap, bitmap, size);
++ 		rc = modify_bitmap(str, newmap, bits);
++ 	} else {
++ 		memset(newmap, 0, size);
++ 		rc = hex2bitmap(str, newmap, bits);
++ 	}
++ 	if (rc == 0)
++ 		memcpy(bitmap, newmap, size);
++ 	mutex_unlock(lock);
++ 	kfree(newmap);
++ 	return rc;
++ }
++ EXPORT_SYMBOL(ap_parse_mask_str);
++ 
++ /*
+++>>>>>>> 00fab2350e6b (s390/zcrypt: multiple zcrypt device nodes support)
+   * AP bus attributes.
+   */
+ -
+  static ssize_t ap_domain_show(struct bus_type *bus, char *buf)
+  {
+  	return snprintf(buf, PAGE_SIZE, "%d\n", ap_domain_index);
+@@@ -940,7 -1127,69 +1075,73 @@@ static ssize_t ap_max_domain_id_show(st
+  	return snprintf(buf, PAGE_SIZE, "%d\n", max_domain_id);
+  }
+  
+++<<<<<<< HEAD
+ +static BUS_ATTR(ap_max_domain_id, 0444, ap_max_domain_id_show, NULL);
+++=======
++ static BUS_ATTR_RO(ap_max_domain_id);
++ 
++ static ssize_t apmask_show(struct bus_type *bus, char *buf)
++ {
++ 	int rc;
++ 
++ 	if (mutex_lock_interruptible(&ap_perms_mutex))
++ 		return -ERESTARTSYS;
++ 	rc = snprintf(buf, PAGE_SIZE,
++ 		      "0x%016lx%016lx%016lx%016lx\n",
++ 		      ap_perms.apm[0], ap_perms.apm[1],
++ 		      ap_perms.apm[2], ap_perms.apm[3]);
++ 	mutex_unlock(&ap_perms_mutex);
++ 
++ 	return rc;
++ }
++ 
++ static ssize_t apmask_store(struct bus_type *bus, const char *buf,
++ 			    size_t count)
++ {
++ 	int rc;
++ 
++ 	rc = ap_parse_mask_str(buf, ap_perms.apm, AP_DEVICES, &ap_perms_mutex);
++ 	if (rc)
++ 		return rc;
++ 
++ 	ap_bus_revise_bindings();
++ 
++ 	return count;
++ }
++ 
++ static BUS_ATTR_RW(apmask);
++ 
++ static ssize_t aqmask_show(struct bus_type *bus, char *buf)
++ {
++ 	int rc;
++ 
++ 	if (mutex_lock_interruptible(&ap_perms_mutex))
++ 		return -ERESTARTSYS;
++ 	rc = snprintf(buf, PAGE_SIZE,
++ 		      "0x%016lx%016lx%016lx%016lx\n",
++ 		      ap_perms.aqm[0], ap_perms.aqm[1],
++ 		      ap_perms.aqm[2], ap_perms.aqm[3]);
++ 	mutex_unlock(&ap_perms_mutex);
++ 
++ 	return rc;
++ }
++ 
++ static ssize_t aqmask_store(struct bus_type *bus, const char *buf,
++ 			    size_t count)
++ {
++ 	int rc;
++ 
++ 	rc = ap_parse_mask_str(buf, ap_perms.aqm, AP_DOMAINS, &ap_perms_mutex);
++ 	if (rc)
++ 		return rc;
++ 
++ 	ap_bus_revise_bindings();
++ 
++ 	return count;
++ }
++ 
++ static BUS_ATTR_RW(aqmask);
+++>>>>>>> 00fab2350e6b (s390/zcrypt: multiple zcrypt device nodes support)
+  
+  static struct bus_attribute *const ap_bus_attrs[] = {
+  	&bus_attr_ap_domain,
+@@@ -1257,9 -1475,26 +1458,30 @@@ int __init ap_debug_init(void
+  	return 0;
+  }
+  
+ -static void __init ap_perms_init(void)
+ +void ap_debug_exit(void)
+  {
+++<<<<<<< HEAD
+ +	debug_unregister(ap_dbf_info);
+++=======
++ 	/* all resources useable if no kernel parameter string given */
++ 	memset(&ap_perms.ioctlm, 0xFF, sizeof(ap_perms.ioctlm));
++ 	memset(&ap_perms.apm, 0xFF, sizeof(ap_perms.apm));
++ 	memset(&ap_perms.aqm, 0xFF, sizeof(ap_perms.aqm));
++ 
++ 	/* apm kernel parameter string */
++ 	if (apm_str) {
++ 		memset(&ap_perms.apm, 0, sizeof(ap_perms.apm));
++ 		ap_parse_mask_str(apm_str, ap_perms.apm, AP_DEVICES,
++ 				  &ap_perms_mutex);
++ 	}
++ 
++ 	/* aqm kernel parameter string */
++ 	if (aqm_str) {
++ 		memset(&ap_perms.aqm, 0, sizeof(ap_perms.aqm));
++ 		ap_parse_mask_str(aqm_str, ap_perms.aqm, AP_DOMAINS,
++ 				  &ap_perms_mutex);
++ 	}
+++>>>>>>> 00fab2350e6b (s390/zcrypt: multiple zcrypt device nodes support)
+  }
+  
+  /**
+@@@ -1281,6 -1516,9 +1503,12 @@@ int __init ap_module_init(void
+  		return -ENODEV;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/* set up the AP permissions (ioctls, ap and aq masks) */
++ 	ap_perms_init();
++ 
+++>>>>>>> 00fab2350e6b (s390/zcrypt: multiple zcrypt device nodes support)
+  	/* Get AP configuration data if available */
+  	ap_init_configuration();
+  
+diff --cc drivers/s390/crypto/ap_bus.h
+index 680817a65f16,3eed1b36c876..000000000000
+--- a/drivers/s390/crypto/ap_bus.h
++++ b/drivers/s390/crypto/ap_bus.h
+@@@ -267,7 -258,51 +268,56 @@@ void ap_queue_resume(struct ap_device *
+  struct ap_card *ap_card_create(int id, int queue_depth, int raw_device_type,
+  			       int comp_device_type, unsigned int functions);
+  
+++<<<<<<< HEAD
+ +int ap_module_init(void);
+ +void ap_module_exit(void);
+++=======
++ struct ap_perms {
++ 	unsigned long ioctlm[BITS_TO_LONGS(AP_IOCTLS)];
++ 	unsigned long apm[BITS_TO_LONGS(AP_DEVICES)];
++ 	unsigned long aqm[BITS_TO_LONGS(AP_DOMAINS)];
++ };
++ extern struct ap_perms ap_perms;
++ extern struct mutex ap_perms_mutex;
++ 
++ /*
++  * check APQN for owned/reserved by ap bus and default driver(s).
++  * Checks if this APQN is or will be in use by the ap bus
++  * and the default set of drivers.
++  * If yes, returns 1, if not returns 0. On error a negative
++  * errno value is returned.
++  */
++ int ap_owned_by_def_drv(int card, int queue);
++ 
++ /*
++  * check 'matrix' of APQNs for owned/reserved by ap bus and
++  * default driver(s).
++  * Checks if there is at least one APQN in the given 'matrix'
++  * marked as owned/reserved by the ap bus and default driver(s).
++  * If such an APQN is found the return value is 1, otherwise
++  * 0 is returned. On error a negative errno value is returned.
++  * The parameter apm is a bitmask which should be declared
++  * as DECLARE_BITMAP(apm, AP_DEVICES), the aqm parameter is
++  * similar, should be declared as DECLARE_BITMAP(aqm, AP_DOMAINS).
++  */
++ int ap_apqn_in_matrix_owned_by_def_drv(unsigned long *apm,
++ 				       unsigned long *aqm);
+++>>>>>>> 00fab2350e6b (s390/zcrypt: multiple zcrypt device nodes support)
++ 
++ /*
++  * ap_parse_mask_str() - helper function to parse a bitmap string
++  * and clear/set the bits in the bitmap accordingly. The string may be
++  * given as absolute value, a hex string like 0x1F2E3D4C5B6A" simple
++  * overwriting the current content of the bitmap. Or as relative string
++  * like "+1-16,-32,-0x40,+128" where only single bits or ranges of
++  * bits are cleared or set. Distinction is done based on the very
++  * first character which may be '+' or '-' for the relative string
++  * and othewise assume to be an absolute value string. If parsing fails
++  * a negative errno value is returned. All arguments and bitmaps are
++  * big endian order.
++  */
++ int ap_parse_mask_str(const char *str,
++ 		      unsigned long *bitmap, int bits,
++ 		      struct mutex *lock);
+  
+  #endif /* _AP_BUS_H_ */
+diff --cc drivers/s390/crypto/zcrypt_api.c
+index 1c1ca46a7f0a,d7e1c7cd2c89..000000000000
+--- a/drivers/s390/crypto/zcrypt_api.c
++++ b/drivers/s390/crypto/zcrypt_api.c
+@@@ -1,7 -1,8 +1,7 @@@
+ -// SPDX-License-Identifier: GPL-2.0+
+  /*
+-  *  zcrypt 2.1.0
++  *  zcrypt 2.2.0
+   *
+-  *  Copyright IBM Corp. 2001, 2012
++  *  Copyright IBM Corp. 2001, 2018
+   *  Author(s): Robert Burroughs
+   *	       Eric Rossman (edrossma@us.ibm.com)
+   *	       Cornelia Huck <cornelia.huck@de.ibm.com>
+@@@ -10,20 -11,7 +10,24 @@@
+   *  Major cleanup & driver split: Martin Schwidefsky <schwidefsky@de.ibm.com>
+   *				  Ralph Wuerthner <rwuerthn@de.ibm.com>
+   *  MSGTYPE restruct:		  Holger Dengler <hd@linux.vnet.ibm.com>
+++<<<<<<< HEAD
+ + *
+ + * This program is free software; you can redistribute it and/or modify
+ + * it under the terms of the GNU General Public License as published by
+ + * the Free Software Foundation; either version 2, or (at your option)
+ + * any later version.
+ + *
+ + * This program is distributed in the hope that it will be useful,
+ + * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ + * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ + * GNU General Public License for more details.
+ + *
+ + * You should have received a copy of the GNU General Public License
+ + * along with this program; if not, write to the Free Software
+ + * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+++=======
++  *  Multiple device nodes: Harald Freudenberger <freude@linux.ibm.com>
+++>>>>>>> 00fab2350e6b (s390/zcrypt: multiple zcrypt device nodes support)
+   */
+  
+  #include <linux/module.h>
+@@@ -36,9 -22,11 +40,11 @@@
+  #include <linux/compat.h>
+  #include <linux/slab.h>
+  #include <linux/atomic.h>
+ -#include <linux/uaccess.h>
+ +#include <asm/uaccess.h>
+  #include <linux/hw_random.h>
+  #include <linux/debugfs.h>
++ #include <linux/cdev.h>
++ #include <linux/ctype.h>
+  #include <asm/debug.h>
+  
+  #define CREATE_TRACE_POINTS
+@@@ -1168,10 -1559,10 +1648,10 @@@ struct compat_ica_xcRB 
+  	compat_uptr_t	reply_data_addr;
+  	unsigned short	priority_window;
+  	unsigned int	status;
+ -} __packed;
+ +} __attribute__((packed));
+  
+- static long trans_xcRB32(struct file *filp, unsigned int cmd,
+- 			 unsigned long arg)
++ static long trans_xcRB32(struct ap_perms *perms, struct file *filp,
++ 			 unsigned int cmd, unsigned long arg)
+  {
+  	struct compat_ica_xcRB __user *uxcRB32 = compat_ptr(arg);
+  	struct compat_ica_xcRB xcRB32;
+@@@ -1558,27 -1815,27 +2107,44 @@@ int __init zcrypt_api_init(void
+  	if (rc)
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	atomic_set(&zcrypt_rescan_req, 0);
+++=======
++ #ifdef CONFIG_ZCRYPT_MULTIDEVNODES
++ 	rc = zcdn_init();
++ 	if (rc)
++ 		goto out;
++ #endif
+++>>>>>>> 00fab2350e6b (s390/zcrypt: multiple zcrypt device nodes support)
+  
+  	/* Register the request sprayer. */
+  	rc = misc_register(&zcrypt_misc_device);
+  	if (rc < 0)
+- 		goto out;
++ 		goto out_misc_register_failed;
+  
+ +	/* Set up the proc file system */
+ +	zcrypt_entry = proc_create("driver/z90crypt", 0644, NULL,
+ +				   &zcrypt_proc_fops);
+ +	if (!zcrypt_entry) {
+ +		rc = -ENOMEM;
+ +		goto out_misc;
+ +	}
+ +
+  	zcrypt_msgtype6_init();
+  	zcrypt_msgtype50_init();
++ 
+  	return 0;
+  
+++<<<<<<< HEAD
+ +out_misc:
+ +	misc_deregister(&zcrypt_misc_device);
+++=======
++ out_misc_register_failed:
++ #ifdef CONFIG_ZCRYPT_MULTIDEVNODES
++ 	zcdn_exit();
++ #endif
++ 	zcrypt_debug_exit();
+++>>>>>>> 00fab2350e6b (s390/zcrypt: multiple zcrypt device nodes support)
+  out:
+  	return rc;
+  }
+@@@ -1590,7 -1847,9 +2156,13 @@@
+   */
+  void __exit zcrypt_api_exit(void)
+  {
+++<<<<<<< HEAD
+ +	remove_proc_entry("driver/z90crypt", NULL);
+++=======
++ #ifdef CONFIG_ZCRYPT_MULTIDEVNODES
++ 	zcdn_exit();
++ #endif
+++>>>>>>> 00fab2350e6b (s390/zcrypt: multiple zcrypt device nodes support)
+  	misc_deregister(&zcrypt_misc_device);
+  	zcrypt_msgtype6_exit();
+  	zcrypt_msgtype50_exit();
+diff --git a/arch/s390/defconfig b/arch/s390/defconfig
+index c7548f968b4c..7b9d01d56126 100644
+--- a/arch/s390/defconfig
++++ b/arch/s390/defconfig
+@@ -166,6 +166,7 @@ CONFIG_CRYPTO_DEFLATE=m
+ CONFIG_CRYPTO_ZLIB=m
+ CONFIG_CRYPTO_LZO=m
+ CONFIG_ZCRYPT=m
++CONFIG_ZCRYPT_MULTIDEVNODES=y
+ CONFIG_PKEY=m
+ CONFIG_CRYPTO_SHA1_S390=m
+ CONFIG_CRYPTO_SHA256_S390=m
+diff --git a/arch/s390/include/uapi/asm/zcrypt.h b/arch/s390/include/uapi/asm/zcrypt.h
+index 79d7131e57ac..91613b76b175 100644
+--- a/arch/s390/include/uapi/asm/zcrypt.h
++++ b/arch/s390/include/uapi/asm/zcrypt.h
+@@ -1,9 +1,9 @@
+ /*
+  *  include/asm-s390/zcrypt.h
+  *
+- *  zcrypt 2.1.0 (user-visible header)
++ *  zcrypt 2.2.0 (user-visible header)
+  *
+- *  Copyright IBM Corp. 2001, 2006
++ *  Copyright IBM Corp. 2001, 2018
+  *  Author(s): Robert Burroughs
+  *	       Eric Rossman (edrossma@us.ibm.com)
+  *
+@@ -28,12 +28,15 @@
+ #define __ASM_S390_ZCRYPT_H
+ 
+ #define ZCRYPT_VERSION 2
+-#define ZCRYPT_RELEASE 1
+-#define ZCRYPT_VARIANT 1
++#define ZCRYPT_RELEASE 2
++#define ZCRYPT_VARIANT 0
+ 
+ #include <linux/ioctl.h>
+ #include <linux/compiler.h>
+ 
++/* Name of the zcrypt device driver. */
++#define ZCRYPT_NAME "zcrypt"
++
+ /**
+  * struct ica_rsa_modexpo
+  *
+@@ -322,6 +325,16 @@ struct zcrypt_device_matrix_ext {
+ #define ZCRYPT_QDEPTH_MASK   _IOR(ZCRYPT_IOCTL_MAGIC, 0x59, char[MAX_ZDEV_CARDIDS_EXT])
+ #define ZCRYPT_PERDEV_REQCNT _IOR(ZCRYPT_IOCTL_MAGIC, 0x5a, int[MAX_ZDEV_CARDIDS_EXT])
+ 
++/*
++ * Support for multiple zcrypt device nodes.
++ */
++
++/* Nr of minor device node numbers to allocate. */
++#define ZCRYPT_MAX_MINOR_NODES 256
++
++/* Max amount of possible ioctls */
++#define MAX_ZDEV_IOCTLS (1 << _IOC_NRBITS)
++
+ /*
+  * Only deprecated defines, structs and ioctls below this line.
+  */
+diff --git a/drivers/crypto/Kconfig b/drivers/crypto/Kconfig
+index c5d57485f4dd..b8589287ebe7 100644
+--- a/drivers/crypto/Kconfig
++++ b/drivers/crypto/Kconfig
+@@ -76,6 +76,17 @@ config ZCRYPT
+ 	  + Crypto Express3 Coprocessor (CEX3C)
+ 	  + Crypto Express3 Accelerator (CEX3A)
+ 
++config ZCRYPT_MULTIDEVNODES
++	bool "Support for multiple zcrypt device nodes"
++	default y
++	depends on S390
++	depends on ZCRYPT
++	help
++	  With this option enabled the zcrypt device driver can
++	  provide multiple devices nodes in /dev. Each device
++	  node can get customized to limit access and narrow
++	  down the use of the available crypto hardware.
++
+ config PKEY
+ 	tristate "Kernel API for protected key handling"
+ 	depends on S390
+* Unmerged path drivers/s390/crypto/ap_bus.c
+* Unmerged path drivers/s390/crypto/ap_bus.h
+* Unmerged path drivers/s390/crypto/zcrypt_api.c
