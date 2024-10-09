@@ -1372,14 +1372,13 @@ static void blk_mq_try_issue_directly(struct request *rq)
 	if (ret == BLK_MQ_RQ_QUEUE_OK)
 		return;
 
-	__blk_mq_requeue_request(rq);
-
 	if (ret == BLK_MQ_RQ_QUEUE_ERROR) {
 		rq->errors = -EIO;
 		blk_mq_end_request(rq, rq->errors);
 		return;
 	}
 
+	__blk_mq_requeue_request(rq);
 insert:
 	blk_mq_insert_request(rq, false, true, true);
 }
