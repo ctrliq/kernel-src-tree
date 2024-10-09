@@ -1,0 +1,352 @@
+ALSA: x86: Allow single period PCM operation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Takashi Iwai <tiwai@suse.de>
+commit 8d48c0163d1ab0f56a18ebe9898a34ebcfdfaa1a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/8d48c016.failed
+
+This is an implementation of PCM streaming with only 1 period.
+Since the hardware requires the refresh of BDs after each BD
+processing finishes, we'd need at least two BDs.  The trick is that
+both BDs point to the same content: the address of the PCM buffer
+head, and the whole buffer size.  Then it loops over to the whole
+buffer again after it finished once.
+
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit 8d48c0163d1ab0f56a18ebe9898a34ebcfdfaa1a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/x86/intel_hdmi_audio.c
+#	sound/x86/intel_hdmi_lpe_audio.h
+diff --cc sound/x86/intel_hdmi_audio.c
+index 3dd33e089501,d2136498defe..000000000000
+--- a/sound/x86/intel_hdmi_audio.c
++++ b/sound/x86/intel_hdmi_audio.c
+@@@ -914,9 -789,207 +914,213 @@@ static int snd_intelhad_prog_n(u32 aud_
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +void snd_intelhad_handle_underrun(struct snd_intelhad *intelhaddata)
+ +{
+ +	u32 hdmi_status, i = 0;
+++=======
++ /*
++  * PCM ring buffer handling
++  *
++  * The hardware provides a ring buffer with the fixed 4 buffer descriptors
++  * (BDs).  The driver maps these 4 BDs onto the PCM ring buffer.  The mapping
++  * moves at each period elapsed.  The below illustrates how it works:
++  *
++  * At time=0
++  *  PCM | 0 | 1 | 2 | 3 | 4 | 5 | .... |n-1|
++  *  BD  | 0 | 1 | 2 | 3 |
++  *
++  * At time=1 (period elapsed)
++  *  PCM | 0 | 1 | 2 | 3 | 4 | 5 | .... |n-1|
++  *  BD      | 1 | 2 | 3 | 0 |
++  *
++  * At time=2 (second period elapsed)
++  *  PCM | 0 | 1 | 2 | 3 | 4 | 5 | .... |n-1|
++  *  BD          | 2 | 3 | 0 | 1 |
++  *
++  * The bd_head field points to the index of the BD to be read.  It's also the
++  * position to be filled at next.  The pcm_head and the pcm_filled fields
++  * point to the indices of the current position and of the next position to
++  * be filled, respectively.  For PCM buffer there are both _head and _filled
++  * because they may be difference when nperiods > 4.  For example, in the
++  * example above at t=1, bd_head=1 and pcm_head=1 while pcm_filled=5:
++  *
++  * pcm_head (=1) --v               v-- pcm_filled (=5)
++  *       PCM | 0 | 1 | 2 | 3 | 4 | 5 | .... |n-1|
++  *       BD      | 1 | 2 | 3 | 0 |
++  *  bd_head (=1) --^               ^-- next to fill (= bd_head)
++  *
++  * For nperiods < 4, the remaining BDs out of 4 are marked as invalid, so that
++  * the hardware skips those BDs in the loop.
++  *
++  * An exceptional setup is the case with nperiods=1.  Since we have to update
++  * BDs after finishing one BD processing, we'd need at least two BDs, where
++  * both BDs point to the same content, the same address, the same size of the
++  * whole PCM buffer.
++  */
++ 
++ #define AUD_BUF_ADDR(x)		(AUD_BUF_A_ADDR + (x) * HAD_REG_WIDTH)
++ #define AUD_BUF_LEN(x)		(AUD_BUF_A_LENGTH + (x) * HAD_REG_WIDTH)
++ 
++ /* Set up a buffer descriptor at the "filled" position */
++ static void had_prog_bd(struct snd_pcm_substream *substream,
++ 			struct snd_intelhad *intelhaddata)
++ {
++ 	int idx = intelhaddata->bd_head;
++ 	int ofs = intelhaddata->pcmbuf_filled * intelhaddata->period_bytes;
++ 	u32 addr = substream->runtime->dma_addr + ofs;
++ 
++ 	addr |= AUD_BUF_VALID | AUD_BUF_INTR_EN;
++ 	had_write_register(intelhaddata, AUD_BUF_ADDR(idx), addr);
++ 	had_write_register(intelhaddata, AUD_BUF_LEN(idx),
++ 			   intelhaddata->period_bytes);
++ 
++ 	/* advance the indices to the next */
++ 	intelhaddata->bd_head++;
++ 	intelhaddata->bd_head %= intelhaddata->num_bds;
++ 	intelhaddata->pcmbuf_filled++;
++ 	intelhaddata->pcmbuf_filled %= substream->runtime->periods;
++ }
++ 
++ /* invalidate a buffer descriptor with the given index */
++ static void had_invalidate_bd(struct snd_intelhad *intelhaddata,
++ 			      int idx)
++ {
++ 	had_write_register(intelhaddata, AUD_BUF_ADDR(idx), 0);
++ 	had_write_register(intelhaddata, AUD_BUF_LEN(idx), 0);
++ }
++ 
++ /* Initial programming of ring buffer */
++ static void had_init_ringbuf(struct snd_pcm_substream *substream,
++ 			     struct snd_intelhad *intelhaddata)
++ {
++ 	struct snd_pcm_runtime *runtime = substream->runtime;
++ 	int i, num_periods;
++ 
++ 	num_periods = runtime->periods;
++ 	intelhaddata->num_bds = min(num_periods, HAD_NUM_OF_RING_BUFS);
++ 	/* set the minimum 2 BDs for num_periods=1 */
++ 	intelhaddata->num_bds = max(intelhaddata->num_bds, 2U);
++ 	intelhaddata->period_bytes =
++ 		frames_to_bytes(runtime, runtime->period_size);
++ 	WARN_ON(intelhaddata->period_bytes & 0x3f);
++ 
++ 	intelhaddata->bd_head = 0;
++ 	intelhaddata->pcmbuf_head = 0;
++ 	intelhaddata->pcmbuf_filled = 0;
++ 
++ 	for (i = 0; i < HAD_NUM_OF_RING_BUFS; i++) {
++ 		if (i < intelhaddata->num_bds)
++ 			had_prog_bd(substream, intelhaddata);
++ 		else /* invalidate the rest */
++ 			had_invalidate_bd(intelhaddata, i);
++ 	}
++ 
++ 	intelhaddata->bd_head = 0; /* reset at head again before starting */
++ }
++ 
++ /* process a bd, advance to the next */
++ static void had_advance_ringbuf(struct snd_pcm_substream *substream,
++ 				struct snd_intelhad *intelhaddata)
++ {
++ 	int num_periods = substream->runtime->periods;
++ 
++ 	/* reprogram the next buffer */
++ 	had_prog_bd(substream, intelhaddata);
++ 
++ 	/* proceed to next */
++ 	intelhaddata->pcmbuf_head++;
++ 	intelhaddata->pcmbuf_head %= num_periods;
++ }
++ 
++ /* process the current BD(s);
++  * returns the current PCM buffer byte position, or -EPIPE for underrun.
++  */
++ static int had_process_ringbuf(struct snd_pcm_substream *substream,
++ 			       struct snd_intelhad *intelhaddata)
++ {
++ 	int len, processed;
++ 	unsigned long flags;
++ 
++ 	processed = 0;
++ 	spin_lock_irqsave(&intelhaddata->had_spinlock, flags);
++ 	for (;;) {
++ 		/* get the remaining bytes on the buffer */
++ 		had_read_register(intelhaddata,
++ 				  AUD_BUF_LEN(intelhaddata->bd_head),
++ 				  &len);
++ 		if (len < 0 || len > intelhaddata->period_bytes) {
++ 			dev_dbg(intelhaddata->dev, "Invalid buf length %d\n",
++ 				len);
++ 			len = -EPIPE;
++ 			goto out;
++ 		}
++ 
++ 		if (len > 0) /* OK, this is the current buffer */
++ 			break;
++ 
++ 		/* len=0 => already empty, check the next buffer */
++ 		if (++processed >= intelhaddata->num_bds) {
++ 			len = -EPIPE; /* all empty? - report underrun */
++ 			goto out;
++ 		}
++ 		had_advance_ringbuf(substream, intelhaddata);
++ 	}
++ 
++ 	len = intelhaddata->period_bytes - len;
++ 	len += intelhaddata->period_bytes * intelhaddata->pcmbuf_head;
++  out:
++ 	spin_unlock_irqrestore(&intelhaddata->had_spinlock, flags);
++ 	return len;
++ }
++ 
++ /* called from irq handler */
++ static void had_process_buffer_done(struct snd_intelhad *intelhaddata)
++ {
++ 	struct snd_pcm_substream *substream;
++ 
++ 	if (!intelhaddata->connected)
++ 		return; /* disconnected? - bail out */
++ 
++ 	substream = had_substream_get(intelhaddata);
++ 	if (!substream)
++ 		return; /* no stream? - bail out */
++ 
++ 	/* process or stop the stream */
++ 	if (had_process_ringbuf(substream, intelhaddata) < 0)
++ 		snd_pcm_stop_xrun(substream);
++ 	else
++ 		snd_pcm_period_elapsed(substream);
++ 
++ 	had_substream_put(intelhaddata);
++ }
++ 
++ #define MAX_CNT			0xFF
++ 
++ /*
++  * The interrupt status 'sticky' bits might not be cleared by
++  * setting '1' to that bit once...
++  */
++ static void wait_clear_underrun_bit(struct snd_intelhad *intelhaddata)
++ {
++ 	int i;
++ 	u32 val;
++ 
++ 	for (i = 0; i < MAX_CNT; i++) {
++ 		/* clear bit30, 31 AUD_HDMI_STATUS */
++ 		had_read_register(intelhaddata, AUD_HDMI_STATUS, &val);
++ 		if (!(val & AUD_HDMI_STATUS_MASK_UNDERRUN))
++ 			return;
++ 		had_write_register(intelhaddata, AUD_HDMI_STATUS, val);
++ 	}
++ 	dev_err(intelhaddata->dev, "Unable to clear UNDERRUN bits\n");
++ }
++ 
++ /* called from irq handler */
++ static void had_process_buffer_underrun(struct snd_intelhad *intelhaddata)
++ {
++ 	struct snd_pcm_substream *substream;
+++>>>>>>> 8d48c0163d1a (ALSA: x86: Allow single period PCM operation)
+  
+  	/* Handle Underrun interrupt within Audio Unit */
+  	had_write_register(intelhaddata, AUD_CONFIG, 0);
+@@@ -1353,64 -1256,24 +1557,74 @@@ static snd_pcm_uframes_t snd_intelhad_p
+  
+  	intelhaddata = snd_pcm_substream_chip(substream);
+  
+ -	if (!intelhaddata->connected)
+ +	if (intelhaddata->flag_underrun) {
+ +		intelhaddata->flag_underrun = 0;
+  		return SNDRV_PCM_POS_XRUN;
+ +	}
+ +
+++<<<<<<< HEAD
+ +	/* Use a hw register to calculate sub-period position reports.
+ +	 * This makes PulseAudio happier.
+ +	 */
+  
+ +	buf_id = intelhaddata->curr_buf % 4;
+ +	had_read_register(intelhaddata,
+ +			  AUD_BUF_A_LENGTH + (buf_id * HAD_REG_WIDTH), &t);
+ +
+ +	if ((t == 0) || (t == ((u32)-1L))) {
+ +		intelhaddata->underrun_count++;
+ +		pr_debug("discovered buffer done for buf %d, count = %d\n",
+ +			 buf_id, intelhaddata->underrun_count);
+ +
+ +		if (intelhaddata->underrun_count > (HAD_MIN_PERIODS/2)) {
+ +			pr_debug("assume audio_codec_reset, underrun = %d - do xrun\n",
+ +				 intelhaddata->underrun_count);
+ +			intelhaddata->underrun_count = 0;
+ +			return SNDRV_PCM_POS_XRUN;
+ +		}
+ +	} else {
+ +		/* Reset Counter */
+ +		intelhaddata->underrun_count = 0;
+ +	}
+ +
+ +	t = intelhaddata->buf_info[buf_id].buf_size - t;
+ +
+ +	if (intelhaddata->stream_info.buffer_rendered)
+ +		div_u64_rem(intelhaddata->stream_info.buffer_rendered,
+ +			intelhaddata->stream_info.ring_buf_size,
+ +			&(bytes_rendered));
+ +
+ +	intelhaddata->stream_info.buffer_ptr = bytes_to_frames(
+ +						substream->runtime,
+ +						bytes_rendered + t);
+ +	return intelhaddata->stream_info.buffer_ptr;
+++=======
++ 	len = had_process_ringbuf(substream, intelhaddata);
++ 	if (len < 0)
++ 		return SNDRV_PCM_POS_XRUN;
++ 	len = bytes_to_frames(substream->runtime, len);
++ 	/* wrapping may happen when periods=1 */
++ 	len %= substream->runtime->buffer_size;
++ 	return len;
+++>>>>>>> 8d48c0163d1a (ALSA: x86: Allow single period PCM operation)
+  }
+  
+ -/*
+ - * ALSA PCM mmap callback
+ +/**
+ + * snd_intelhad_pcm_mmap- mmaps a kernel buffer to user space for copying data
+ + *
+ + * @substream:  substream for which the function is called
+ + * @vma:		struct instance of memory VMM memory area
+ + *
+ + * This function is called by OS when a user space component
+ + * tries to get mmap memory from driver
+   */
+ -static int had_pcm_mmap(struct snd_pcm_substream *substream,
+ -			struct vm_area_struct *vma)
+ +static int snd_intelhad_pcm_mmap(struct snd_pcm_substream *substream,
+ +	struct vm_area_struct *vma)
+  {
+ +
+ +	pr_debug("snd_intelhad_pcm_mmap called\n");
+ +
+ +	pr_debug("entry with prot:%s\n", __func__);
+  	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+  	return remap_pfn_range(vma, vma->vm_start,
+  			substream->dma_buffer.addr >> PAGE_SHIFT,
+diff --cc sound/x86/intel_hdmi_lpe_audio.h
+index a1c3aa0fbc57,477e5153307c..000000000000
+--- a/sound/x86/intel_hdmi_lpe_audio.h
++++ b/sound/x86/intel_hdmi_lpe_audio.h
+@@@ -41,13 -27,13 +41,23 @@@
+  #define HAD_MAX_CHANNEL		8
+  #define HAD_NUM_OF_RING_BUFS	4
+  
+++<<<<<<< HEAD
+ +/* Assume 192KHz, 8channel, 25msec period */
+ +#define HAD_MAX_BUFFER		(600*1024)
+ +#define HAD_MIN_BUFFER		(32*1024)
+ +#define HAD_MAX_PERIODS		4
+ +#define HAD_MIN_PERIODS		4
+ +#define HAD_MAX_PERIOD_BYTES	(HAD_MAX_BUFFER/HAD_MIN_PERIODS)
+ +#define HAD_MIN_PERIOD_BYTES	256
+++=======
++ /* max 20bit address, aligned to 64 */
++ #define HAD_MAX_BUFFER		((1024 * 1024 - 1) & ~0x3f)
++ #define HAD_DEFAULT_BUFFER	(600 * 1024) /* default prealloc size */
++ #define HAD_MAX_PERIODS		256	/* arbitrary, but should suffice */
++ #define HAD_MIN_PERIODS		1
++ #define HAD_MAX_PERIOD_BYTES	((HAD_MAX_BUFFER / HAD_MIN_PERIODS) & ~0x3f)
++ #define HAD_MIN_PERIOD_BYTES	1024	/* might be smaller */
+++>>>>>>> 8d48c0163d1a (ALSA: x86: Allow single period PCM operation)
+  #define HAD_FIFO_SIZE		0 /* fifo not being used */
+  #define MAX_SPEAKERS		8
+  
+* Unmerged path sound/x86/intel_hdmi_audio.c
+* Unmerged path sound/x86/intel_hdmi_lpe_audio.h
