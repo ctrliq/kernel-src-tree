@@ -1,0 +1,100 @@
+bonding: fix state transition issue in link monitoring
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.el7
+commit-author Jay Vosburgh <jay.vosburgh@canonical.com>
+commit 1899bb325149e481de31a4f32b59ea6f24e176ea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.el7/1899bb32.failed
+
+Since de77ecd4ef02 ("bonding: improve link-status update in
+mii-monitoring"), the bonding driver has utilized two separate variables
+to indicate the next link state a particular slave should transition to.
+Each is used to communicate to a different portion of the link state
+change commit logic; one to the bond_miimon_commit function itself, and
+another to the state transition logic.
+
+	Unfortunately, the two variables can become unsynchronized,
+resulting in incorrect link state transitions within bonding.  This can
+cause slaves to become stuck in an incorrect link state until a
+subsequent carrier state transition.
+
+	The issue occurs when a special case in bond_slave_netdev_event
+sets slave->link directly to BOND_LINK_FAIL.  On the next pass through
+bond_miimon_inspect after the slave goes carrier up, the BOND_LINK_FAIL
+case will set the proposed next state (link_new_state) to BOND_LINK_UP,
+but the new_link to BOND_LINK_DOWN.  The setting of the final link state
+from new_link comes after that from link_new_state, and so the slave
+will end up incorrectly in _DOWN state.
+
+	Resolve this by combining the two variables into one.
+
+	Reported-by: Aleksei Zakharov <zakharov.a.g@yandex.ru>
+	Reported-by: Sha Zhang <zhangsha.zhang@huawei.com>
+	Cc: Mahesh Bandewar <maheshb@google.com>
+Fixes: de77ecd4ef02 ("bonding: improve link-status update in mii-monitoring")
+	Signed-off-by: Jay Vosburgh <jay.vosburgh@canonical.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1899bb325149e481de31a4f32b59ea6f24e176ea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_main.c
+diff --cc drivers/net/bonding/bond_main.c
+index 7e3f43ffbe02,62f65573eb04..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -2277,9 -2263,9 +2276,15 @@@ static void bond_miimon_commit(struct b
+  			continue;
+  
+  		default:
+++<<<<<<< HEAD
+ +			netdev_err(bond->dev, "invalid new link %d on slave %s\n",
+ +				   slave->new_link, slave->dev->name);
+ +			slave->new_link = BOND_LINK_NOCHANGE;
+++=======
++ 			slave_err(bond->dev, slave->dev, "invalid new link %d on slave\n",
++ 				  slave->link_new_state);
++ 			bond_propose_link_state(slave, BOND_LINK_NOCHANGE);
+++>>>>>>> 1899bb325149 (bonding: fix state transition issue in link monitoring)
+  
+  			continue;
+  		}
+@@@ -2887,8 -2889,9 +2892,14 @@@ static void bond_ab_arp_commit(struct b
+  			continue;
+  
+  		default:
+++<<<<<<< HEAD
+ +			netdev_err(bond->dev, "impossible: new_link %d on slave %s\n",
+ +				   slave->new_link, slave->dev->name);
+++=======
++ 			slave_err(bond->dev, slave->dev,
++ 				  "impossible: link_new_state %d on slave\n",
++ 				  slave->link_new_state);
+++>>>>>>> 1899bb325149 (bonding: fix state transition issue in link monitoring)
+  			continue;
+  		}
+  
+* Unmerged path drivers/net/bonding/bond_main.c
+diff --git a/include/net/bonding.h b/include/net/bonding.h
+index 96248088642f..64a32aef023f 100644
+--- a/include/net/bonding.h
++++ b/include/net/bonding.h
+@@ -152,7 +152,6 @@ struct slave {
+ 	unsigned long target_last_arp_rx[BOND_MAX_ARP_TARGETS];
+ 	s8     link;		/* one of BOND_LINK_XXXX */
+ 	s8     link_new_state;	/* one of BOND_LINK_XXXX */
+-	s8     new_link;
+ 	u8     backup:1,   /* indicates backup slave. Value corresponds with
+ 			      BOND_STATE_ACTIVE and BOND_STATE_BACKUP */
+ 	       inactive:1, /* indicates inactive slave */
+@@ -564,7 +563,7 @@ static inline void bond_propose_link_state(struct slave *slave, int state)
+ 
+ static inline void bond_commit_link_state(struct slave *slave, bool notify)
+ {
+-	if (slave->link == slave->link_new_state)
++	if (slave->link_new_state == BOND_LINK_NOCHANGE)
+ 		return;
+ 
+ 	slave->link = slave->link_new_state;
