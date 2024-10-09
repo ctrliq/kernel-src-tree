@@ -1,0 +1,175 @@
+addrconf: always initialize sysctl table data
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] ipv6: addrconf: always initialize sysctl table data (Hannes Frederic Sowa) [1418812]
+Rebuild_FUZZ: 93.75%
+commit-author WANG Cong <xiyou.wangcong@gmail.com>
+commit 5449a5ca9bc27dd51a462de7ca0b1cd861cd2bd0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/5449a5ca.failed
+
+When sysctl performs restrict writes, it allows to write from
+a middle position of a sysctl file, which requires us to initialize
+the table data before calling proc_dostring() for the write case.
+
+Fixes: 3d1bec99320d ("ipv6: introduce secret_stable to ipv6_devconf")
+	Reported-by: Sasha Levin <sasha.levin@oracle.com>
+	Acked-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Tested-by: Sasha Levin <sasha.levin@oracle.com>
+	Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5449a5ca9bc27dd51a462de7ca0b1cd861cd2bd0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/addrconf.c
+diff --cc net/ipv6/addrconf.c
+index ce6daf6ce3f6,1f21087accab..000000000000
+--- a/net/ipv6/addrconf.c
++++ b/net/ipv6/addrconf.c
+@@@ -5010,6 -5305,139 +5010,142 @@@ int addrconf_sysctl_disable(struct ctl_
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static
++ int addrconf_sysctl_proxy_ndp(struct ctl_table *ctl, int write,
++ 			      void __user *buffer, size_t *lenp, loff_t *ppos)
++ {
++ 	int *valp = ctl->data;
++ 	int ret;
++ 	int old, new;
++ 
++ 	old = *valp;
++ 	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
++ 	new = *valp;
++ 
++ 	if (write && old != new) {
++ 		struct net *net = ctl->extra2;
++ 
++ 		if (!rtnl_trylock())
++ 			return restart_syscall();
++ 
++ 		if (valp == &net->ipv6.devconf_dflt->proxy_ndp)
++ 			inet6_netconf_notify_devconf(net, NETCONFA_PROXY_NEIGH,
++ 						     NETCONFA_IFINDEX_DEFAULT,
++ 						     net->ipv6.devconf_dflt);
++ 		else if (valp == &net->ipv6.devconf_all->proxy_ndp)
++ 			inet6_netconf_notify_devconf(net, NETCONFA_PROXY_NEIGH,
++ 						     NETCONFA_IFINDEX_ALL,
++ 						     net->ipv6.devconf_all);
++ 		else {
++ 			struct inet6_dev *idev = ctl->extra1;
++ 
++ 			inet6_netconf_notify_devconf(net, NETCONFA_PROXY_NEIGH,
++ 						     idev->dev->ifindex,
++ 						     &idev->cnf);
++ 		}
++ 		rtnl_unlock();
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static int addrconf_sysctl_stable_secret(struct ctl_table *ctl, int write,
++ 					 void __user *buffer, size_t *lenp,
++ 					 loff_t *ppos)
++ {
++ 	int err;
++ 	struct in6_addr addr;
++ 	char str[IPV6_MAX_STRLEN];
++ 	struct ctl_table lctl = *ctl;
++ 	struct net *net = ctl->extra2;
++ 	struct ipv6_stable_secret *secret = ctl->data;
++ 
++ 	if (&net->ipv6.devconf_all->stable_secret == ctl->data)
++ 		return -EIO;
++ 
++ 	lctl.maxlen = IPV6_MAX_STRLEN;
++ 	lctl.data = str;
++ 
++ 	if (!rtnl_trylock())
++ 		return restart_syscall();
++ 
++ 	if (!write && !secret->initialized) {
++ 		err = -EIO;
++ 		goto out;
++ 	}
++ 
++ 	err = snprintf(str, sizeof(str), "%pI6", &secret->secret);
++ 	if (err >= sizeof(str)) {
++ 		err = -EIO;
++ 		goto out;
++ 	}
++ 
++ 	err = proc_dostring(&lctl, write, buffer, lenp, ppos);
++ 	if (err || !write)
++ 		goto out;
++ 
++ 	if (in6_pton(str, -1, addr.in6_u.u6_addr8, -1, NULL) != 1) {
++ 		err = -EIO;
++ 		goto out;
++ 	}
++ 
++ 	secret->initialized = true;
++ 	secret->secret = addr;
++ 
++ 	if (&net->ipv6.devconf_dflt->stable_secret == ctl->data) {
++ 		struct net_device *dev;
++ 
++ 		for_each_netdev(net, dev) {
++ 			struct inet6_dev *idev = __in6_dev_get(dev);
++ 
++ 			if (idev) {
++ 				idev->addr_gen_mode =
++ 					IN6_ADDR_GEN_MODE_STABLE_PRIVACY;
++ 			}
++ 		}
++ 	} else {
++ 		struct inet6_dev *idev = ctl->extra1;
++ 
++ 		idev->addr_gen_mode = IN6_ADDR_GEN_MODE_STABLE_PRIVACY;
++ 	}
++ 
++ out:
++ 	rtnl_unlock();
++ 
++ 	return err;
++ }
++ 
++ static
++ int addrconf_sysctl_ignore_routes_with_linkdown(struct ctl_table *ctl,
++ 						int write,
++ 						void __user *buffer,
++ 						size_t *lenp,
++ 						loff_t *ppos)
++ {
++ 	int *valp = ctl->data;
++ 	int val = *valp;
++ 	loff_t pos = *ppos;
++ 	struct ctl_table lctl;
++ 	int ret;
++ 
++ 	/* ctl->data points to idev->cnf.ignore_routes_when_linkdown
++ 	 * we should not modify it until we get the rtnl lock.
++ 	 */
++ 	lctl = *ctl;
++ 	lctl.data = &val;
++ 
++ 	ret = proc_dointvec(&lctl, write, buffer, lenp, ppos);
++ 
++ 	if (write)
++ 		ret = addrconf_fixup_linkdown(ctl, valp, val);
++ 	if (ret)
++ 		*ppos = pos;
++ 	return ret;
++ }
++ 
+++>>>>>>> 5449a5ca9bc2 (addrconf: always initialize sysctl table data)
+  static struct addrconf_sysctl_table
+  {
+  	struct ctl_table_header *sysctl_header;
+* Unmerged path net/ipv6/addrconf.c
