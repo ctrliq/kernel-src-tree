@@ -1,0 +1,320 @@
+vxlan: refactor verification and application of configuration
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Matthias Schiffer <mschiffer@universe-factory.net>
+commit a985343ba90635cda3f3704f71021254c91cebbd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/a985343b.failed
+
+The vxlan_dev_configure function was mixing validation and application of
+the vxlan configuration; this could easily lead to bugs with the changelink
+operation, as it was hard to see if the function wcould return an error
+after parts of the configuration had already been applied.
+
+This commit splits validation and application out of vxlan_dev_configure as
+separate functions to make it clearer where error returns are allowed and
+where the vxlan_dev or net_device may be configured. Log messages in these
+functions are removed, as it is generally unexpected to find error output
+for netlink requests in the kernel log. Userspace should be able to handle
+errors based on the error codes returned via netlink just fine.
+
+In addition, some validation and initialization is moved to vxlan_validate
+and vxlan_setup respectively to improve grouping of similar settings.
+
+Finally, this also fixes two actual bugs:
+
+* if set, conf->mtu would overwrite dev->mtu in each changelink operation,
+  reverting other changes of dev->mtu
+* the "if (!conf->dst_port)" branch would never be run, as conf->dst_port
+  was set in vxlan_setup before. This caused VXLAN-GPE to use the same
+  default port as other VXLAN sockets instead of the intended IANA-assigned
+  4790.
+
+	Signed-off-by: Matthias Schiffer <mschiffer@universe-factory.net>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a985343ba90635cda3f3704f71021254c91cebbd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+diff --cc drivers/net/vxlan.c
+index 740e6d79f5f2,9139f15a2ec1..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -2785,95 -2877,127 +2796,213 @@@ static int vxlan_sock_add(struct vxlan_
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int vxlan_dev_configure(struct net *src_net, struct net_device *dev,
+ +			       struct vxlan_config *conf)
+++=======
++ static int vxlan_config_validate(struct net *src_net, struct vxlan_config *conf,
++ 				 struct net_device **lower,
++ 				 struct vxlan_dev *old)
+++>>>>>>> a985343ba906 (vxlan: refactor verification and application of configuration)
+  {
+  	struct vxlan_net *vn = net_generic(src_net, vxlan_net_id);
+- 	struct vxlan_dev *vxlan = netdev_priv(dev), *tmp;
++ 	struct vxlan_dev *tmp;
++ 	bool use_ipv6 = false;
++ 
++ 	if (conf->flags & VXLAN_F_GPE) {
++ 		/* For now, allow GPE only together with
++ 		 * COLLECT_METADATA. This can be relaxed later; in such
++ 		 * case, the other side of the PtP link will have to be
++ 		 * provided.
++ 		 */
++ 		if ((conf->flags & ~VXLAN_F_ALLOWED_GPE) ||
++ 		    !(conf->flags & VXLAN_F_COLLECT_METADATA)) {
++ 			return -EINVAL;
++ 		}
++ 	}
++ 
++ 	if (!conf->remote_ip.sa.sa_family)
++ 		conf->remote_ip.sa.sa_family = AF_INET;
++ 
++ 	if (conf->remote_ip.sa.sa_family == AF_INET6 ||
++ 	    conf->saddr.sa.sa_family == AF_INET6) {
++ 		if (!IS_ENABLED(CONFIG_IPV6))
++ 			return -EPFNOSUPPORT;
++ 		use_ipv6 = true;
++ 		conf->flags |= VXLAN_F_IPV6;
++ 	}
++ 
++ 	if (conf->label && !use_ipv6)
++ 		return -EINVAL;
++ 
++ 	if (conf->remote_ifindex) {
++ 		struct net_device *lowerdev;
++ 
++ 		lowerdev = __dev_get_by_index(src_net, conf->remote_ifindex);
++ 		if (!lowerdev)
++ 			return -ENODEV;
++ 
++ #if IS_ENABLED(CONFIG_IPV6)
++ 		if (use_ipv6) {
++ 			struct inet6_dev *idev = __in6_dev_get(lowerdev);
++ 			if (idev && idev->cnf.disable_ipv6)
++ 				return -EPERM;
++ 		}
++ #endif
++ 
++ 		*lower = lowerdev;
++ 	} else {
++ 		if (vxlan_addr_multicast(&conf->remote_ip))
++ 			return -EINVAL;
++ 
++ 		*lower = NULL;
++ 	}
++ 
++ 	if (!conf->dst_port) {
++ 		if (conf->flags & VXLAN_F_GPE)
++ 			conf->dst_port = htons(4790); /* IANA VXLAN-GPE port */
++ 		else
++ 			conf->dst_port = htons(vxlan_port);
++ 	}
++ 
++ 	if (!conf->age_interval)
++ 		conf->age_interval = FDB_AGE_DEFAULT;
++ 
++ 	list_for_each_entry(tmp, &vn->vxlan_list, next) {
++ 		if (tmp == old)
++ 			continue;
++ 
++ 		if (tmp->cfg.vni == conf->vni &&
++ 		    (tmp->default_dst.remote_ip.sa.sa_family == AF_INET6 ||
++ 		     tmp->cfg.saddr.sa.sa_family == AF_INET6) == use_ipv6 &&
++ 		    tmp->cfg.dst_port == conf->dst_port &&
++ 		    (tmp->flags & VXLAN_F_RCV_FLAGS) ==
++ 		    (conf->flags & VXLAN_F_RCV_FLAGS))
++ 			return -EEXIST;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void vxlan_config_apply(struct net_device *dev,
++ 			       struct vxlan_config *conf,
++ 			       struct net_device *lowerdev, bool changelink)
++ {
++ 	struct vxlan_dev *vxlan = netdev_priv(dev);
+  	struct vxlan_rdst *dst = &vxlan->default_dst;
+  	unsigned short needed_headroom = ETH_HLEN;
+++<<<<<<< HEAD
+ +	int err;
+ +	bool use_ipv6 = false;
+ +	__be16 default_port = vxlan->cfg.dst_port;
+ +	struct net_device *lowerdev = NULL;
+ +
+ +	if (conf->flags & VXLAN_F_GPE) {
+ +		/* For now, allow GPE only together with COLLECT_METADATA.
+ +		 * This can be relaxed later; in such case, the other side
+ +		 * of the PtP link will have to be provided.
+ +		 */
+ +		if ((conf->flags & ~VXLAN_F_ALLOWED_GPE) ||
+ +		    !(conf->flags & VXLAN_F_COLLECT_METADATA)) {
+ +			pr_info("unsupported combination of extensions\n");
+ +			return -EINVAL;
+ +		}
+ +
+ +		vxlan_raw_setup(dev);
+ +	} else {
+ +		vxlan_ether_setup(dev);
+++=======
++ 	bool use_ipv6 = !!(conf->flags & VXLAN_F_IPV6);
++ 	int max_mtu = ETH_MAX_MTU;
++ 
++ 	if (!changelink) {
++ 		if (conf->flags & VXLAN_F_GPE)
++ 			vxlan_raw_setup(dev);
++ 		else
++ 			vxlan_ether_setup(dev);
++ 
++ 		if (conf->mtu)
++ 			dev->mtu = conf->mtu;
+++>>>>>>> a985343ba906 (vxlan: refactor verification and application of configuration)
+  	}
+  
+ +	vxlan->net = src_net;
+ +
+  	dst->remote_vni = conf->vni;
+  
+  	memcpy(&dst->remote_ip, &conf->remote_ip, sizeof(conf->remote_ip));
+  
+++<<<<<<< HEAD
+ +	/* Unless IPv6 is explicitly requested, assume IPv4 */
+ +	if (!dst->remote_ip.sa.sa_family)
+ +		dst->remote_ip.sa.sa_family = AF_INET;
+ +
+ +	if (dst->remote_ip.sa.sa_family == AF_INET6 ||
+ +	    vxlan->cfg.saddr.sa.sa_family == AF_INET6) {
+ +		if (!IS_ENABLED(CONFIG_IPV6))
+ +			return -EPFNOSUPPORT;
+ +		use_ipv6 = true;
+ +		vxlan->flags |= VXLAN_F_IPV6;
+ +	}
+ +
+ +	if (conf->label && !use_ipv6) {
+ +		pr_info("label only supported in use with IPv6\n");
+ +		return -EINVAL;
+ +	}
+ +
+ +	if (conf->remote_ifindex) {
+ +		lowerdev = __dev_get_by_index(src_net, conf->remote_ifindex);
+ +		dst->remote_ifindex = conf->remote_ifindex;
+ +
+ +		if (!lowerdev) {
+ +			pr_info("ifindex %d does not exist\n", dst->remote_ifindex);
+ +			return -ENODEV;
+ +		}
+ +
+ +#if IS_ENABLED(CONFIG_IPV6)
+ +		if (use_ipv6) {
+ +			struct inet6_dev *idev = __in6_dev_get(lowerdev);
+ +			if (idev && idev->cnf.disable_ipv6) {
+ +				pr_info("IPv6 is disabled via sysctl\n");
+ +				return -EPERM;
+ +			}
+ +		}
+ +#endif
+ +
+ +		if (!conf->mtu)
+ +			dev->mtu = lowerdev->mtu - (use_ipv6 ? VXLAN6_HEADROOM : VXLAN_HEADROOM);
+ +
+ +		needed_headroom = lowerdev->hard_header_len;
+ +	} else if (vxlan_addr_multicast(&dst->remote_ip)) {
+ +		pr_info("multicast destination requires interface to be specified\n");
+ +		return -EINVAL;
+ +	}
+ +
+ +	if (lowerdev) {
+++=======
++ 	if (lowerdev) {
++ 		dst->remote_ifindex = conf->remote_ifindex;
++ 
+++>>>>>>> a985343ba906 (vxlan: refactor verification and application of configuration)
+  		dev->gso_max_size = lowerdev->gso_max_size;
+  		dev->gso_max_segs = lowerdev->gso_max_segs;
++ 
++ 		needed_headroom = lowerdev->hard_header_len;
++ 
++ 		max_mtu = lowerdev->mtu - (use_ipv6 ? VXLAN6_HEADROOM :
++ 					   VXLAN_HEADROOM);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (conf->mtu) {
+ +		err = __vxlan_change_mtu(dev, lowerdev, dst, conf->mtu, false);
+ +		if (err)
+ +			return err;
+ +	}
+++=======
++ 	if (dev->mtu > max_mtu)
++ 		dev->mtu = max_mtu;
+++>>>>>>> a985343ba906 (vxlan: refactor verification and application of configuration)
+  
+  	if (use_ipv6 || conf->flags & VXLAN_F_COLLECT_METADATA)
+  		needed_headroom += VXLAN6_HEADROOM;
+@@@ -2882,28 -3006,36 +3011,36 @@@
+  	dev->needed_headroom = needed_headroom;
+  
+  	memcpy(&vxlan->cfg, conf, sizeof(*conf));
+- 	if (!vxlan->cfg.dst_port) {
+- 		if (conf->flags & VXLAN_F_GPE)
+- 			vxlan->cfg.dst_port = htons(4790); /* IANA VXLAN-GPE port */
+- 		else
+- 			vxlan->cfg.dst_port = default_port;
+- 	}
+  	vxlan->flags |= conf->flags;
++ }
+  
+- 	if (!vxlan->cfg.age_interval)
+- 		vxlan->cfg.age_interval = FDB_AGE_DEFAULT;
++ static int vxlan_dev_configure(struct net *src_net, struct net_device *dev,
++ 			       struct vxlan_config *conf,
++ 			       bool changelink)
++ {
++ 	struct vxlan_dev *vxlan = netdev_priv(dev);
++ 	struct net_device *lowerdev;
++ 	int ret;
+  
+++<<<<<<< HEAD
+ +	list_for_each_entry(tmp, &vn->vxlan_list, next) {
+ +		if (tmp->cfg.vni == conf->vni &&
+ +		    (tmp->default_dst.remote_ip.sa.sa_family == AF_INET6 ||
+ +		     tmp->cfg.saddr.sa.sa_family == AF_INET6) == use_ipv6 &&
+ +		    tmp->cfg.dst_port == vxlan->cfg.dst_port &&
+ +		    (tmp->flags & VXLAN_F_RCV_FLAGS) ==
+ +		    (vxlan->flags & VXLAN_F_RCV_FLAGS)) {
+ +			pr_info("duplicate VNI %u\n", be32_to_cpu(conf->vni));
+ +			return -EEXIST;
+ +		}
+ +	}
+++=======
++ 	ret = vxlan_config_validate(src_net, conf, &lowerdev, vxlan);
++ 	if (ret)
++ 		return ret;
++ 
++ 	vxlan_config_apply(dev, conf, lowerdev, changelink);
+ -
+ -	return 0;
+ -}
+ -
+ -static int __vxlan_dev_create(struct net *net, struct net_device *dev,
+ -			      struct vxlan_config *conf)
+ -{
+ -	struct vxlan_net *vn = net_generic(net, vxlan_net_id);
+ -	struct vxlan_dev *vxlan = netdev_priv(dev);
+ -	int err;
+ -
+ -	err = vxlan_dev_configure(net, dev, conf, false);
+ -	if (err)
+ -		return err;
+++>>>>>>> a985343ba906 (vxlan: refactor verification and application of configuration)
+  
+  	dev->ethtool_ops = &vxlan_ethtool_ops;
+  
+* Unmerged path drivers/net/vxlan.c
