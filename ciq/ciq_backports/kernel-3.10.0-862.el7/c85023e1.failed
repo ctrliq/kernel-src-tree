@@ -1,0 +1,329 @@
+IB/mlx5: Add raw ethernet local loopback support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Huy Nguyen <huyn@mellanox.com>
+commit c85023e153e3824661d07307138fdeff41f6d86a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c85023e1.failed
+
+Currently, unicast/multicast loopback raw ethernet
+(non-RDMA) packets are sent back to the vport.
+A unicast loopback packet is the packet with destination
+MAC address the same as the source MAC address.
+For multicast, the destination MAC address is in the
+vport's multicast filter list.
+
+Moreover, the local loopback is not needed if
+there is one or none user space context.
+
+After this patch, the raw ethernet unicast and multicast
+local loopback are disabled by default. When there is more
+than one user space context, the local loopback is enabled.
+
+Note that when local loopback is disabled, raw ethernet
+packets are not looped back to the vport and are forwarded
+to the next routing level (eswitch, or multihost switch,
+or out to the wire depending on the configuration).
+
+	Signed-off-by: Huy Nguyen <huyn@mellanox.com>
+	Reviewed-by: Daniel Jurgens <danielj@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leon@kernel.org>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit c85023e153e3824661d07307138fdeff41f6d86a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/main.c
+#	drivers/infiniband/hw/mlx5/mlx5_ib.h
+diff --cc drivers/infiniband/hw/mlx5/main.c
+index 1a12f3b04d4f,85bf17a616d5..000000000000
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@@ -55,6 -57,8 +55,11 @@@
+  #include <linux/mlx5/fs.h>
+  #include <linux/mlx5/vport.h>
+  #include "mlx5_ib.h"
+++<<<<<<< HEAD
+++=======
++ #include "cmd.h"
++ #include <linux/mlx5/vport.h>
+++>>>>>>> c85023e153e3 (IB/mlx5: Add raw ethernet local loopback support)
+  
+  #define DRIVER_NAME "mlx5_ib"
+  #define DRIVER_VERSION "5.0-0"
+@@@ -1064,6 -1108,125 +1069,128 @@@ out
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void print_lib_caps(struct mlx5_ib_dev *dev, u64 caps)
++ {
++ 	mlx5_ib_dbg(dev, "MLX5_LIB_CAP_4K_UAR = %s\n",
++ 		    caps & MLX5_LIB_CAP_4K_UAR ? "y" : "n");
++ }
++ 
++ static int calc_total_bfregs(struct mlx5_ib_dev *dev, bool lib_uar_4k,
++ 			     struct mlx5_ib_alloc_ucontext_req_v2 *req,
++ 			     u32 *num_sys_pages)
++ {
++ 	int uars_per_sys_page;
++ 	int bfregs_per_sys_page;
++ 	int ref_bfregs = req->total_num_bfregs;
++ 
++ 	if (req->total_num_bfregs == 0)
++ 		return -EINVAL;
++ 
++ 	BUILD_BUG_ON(MLX5_MAX_BFREGS % MLX5_NON_FP_BFREGS_IN_PAGE);
++ 	BUILD_BUG_ON(MLX5_MAX_BFREGS < MLX5_NON_FP_BFREGS_IN_PAGE);
++ 
++ 	if (req->total_num_bfregs > MLX5_MAX_BFREGS)
++ 		return -ENOMEM;
++ 
++ 	uars_per_sys_page = get_uars_per_sys_page(dev, lib_uar_4k);
++ 	bfregs_per_sys_page = uars_per_sys_page * MLX5_NON_FP_BFREGS_PER_UAR;
++ 	req->total_num_bfregs = ALIGN(req->total_num_bfregs, bfregs_per_sys_page);
++ 	*num_sys_pages = req->total_num_bfregs / bfregs_per_sys_page;
++ 
++ 	if (req->num_low_latency_bfregs > req->total_num_bfregs - 1)
++ 		return -EINVAL;
++ 
++ 	mlx5_ib_dbg(dev, "uar_4k: fw support %s, lib support %s, user requested %d bfregs, alloated %d, using %d sys pages\n",
++ 		    MLX5_CAP_GEN(dev->mdev, uar_4k) ? "yes" : "no",
++ 		    lib_uar_4k ? "yes" : "no", ref_bfregs,
++ 		    req->total_num_bfregs, *num_sys_pages);
++ 
++ 	return 0;
++ }
++ 
++ static int allocate_uars(struct mlx5_ib_dev *dev, struct mlx5_ib_ucontext *context)
++ {
++ 	struct mlx5_bfreg_info *bfregi;
++ 	int err;
++ 	int i;
++ 
++ 	bfregi = &context->bfregi;
++ 	for (i = 0; i < bfregi->num_sys_pages; i++) {
++ 		err = mlx5_cmd_alloc_uar(dev->mdev, &bfregi->sys_pages[i]);
++ 		if (err)
++ 			goto error;
++ 
++ 		mlx5_ib_dbg(dev, "allocated uar %d\n", bfregi->sys_pages[i]);
++ 	}
++ 	return 0;
++ 
++ error:
++ 	for (--i; i >= 0; i--)
++ 		if (mlx5_cmd_free_uar(dev->mdev, bfregi->sys_pages[i]))
++ 			mlx5_ib_warn(dev, "failed to free uar %d\n", i);
++ 
++ 	return err;
++ }
++ 
++ static int deallocate_uars(struct mlx5_ib_dev *dev, struct mlx5_ib_ucontext *context)
++ {
++ 	struct mlx5_bfreg_info *bfregi;
++ 	int err;
++ 	int i;
++ 
++ 	bfregi = &context->bfregi;
++ 	for (i = 0; i < bfregi->num_sys_pages; i++) {
++ 		err = mlx5_cmd_free_uar(dev->mdev, bfregi->sys_pages[i]);
++ 		if (err) {
++ 			mlx5_ib_warn(dev, "failed to free uar %d\n", i);
++ 			return err;
++ 		}
++ 	}
++ 	return 0;
++ }
++ 
++ static int mlx5_ib_alloc_transport_domain(struct mlx5_ib_dev *dev, u32 *tdn)
++ {
++ 	int err;
++ 
++ 	err = mlx5_core_alloc_transport_domain(dev->mdev, tdn);
++ 	if (err)
++ 		return err;
++ 
++ 	if ((MLX5_CAP_GEN(dev->mdev, port_type) != MLX5_CAP_PORT_TYPE_ETH) ||
++ 	    !MLX5_CAP_GEN(dev->mdev, disable_local_lb))
++ 		return err;
++ 
++ 	mutex_lock(&dev->lb_mutex);
++ 	dev->user_td++;
++ 
++ 	if (dev->user_td == 2)
++ 		err = mlx5_nic_vport_update_local_lb(dev->mdev, true);
++ 
++ 	mutex_unlock(&dev->lb_mutex);
++ 	return err;
++ }
++ 
++ static void mlx5_ib_dealloc_transport_domain(struct mlx5_ib_dev *dev, u32 tdn)
++ {
++ 	mlx5_core_dealloc_transport_domain(dev->mdev, tdn);
++ 
++ 	if ((MLX5_CAP_GEN(dev->mdev, port_type) != MLX5_CAP_PORT_TYPE_ETH) ||
++ 	    !MLX5_CAP_GEN(dev->mdev, disable_local_lb))
++ 		return;
++ 
++ 	mutex_lock(&dev->lb_mutex);
++ 	dev->user_td--;
++ 
++ 	if (dev->user_td < 2)
++ 		mlx5_nic_vport_update_local_lb(dev->mdev, false);
++ 
++ 	mutex_unlock(&dev->lb_mutex);
++ }
++ 
+++>>>>>>> c85023e153e3 (IB/mlx5: Add raw ethernet local loopback support)
+  static struct ib_ucontext *mlx5_ib_alloc_ucontext(struct ib_device *ibdev,
+  						  struct ib_udata *udata)
+  {
+@@@ -1184,11 -1327,17 +1311,10 @@@
+  	context->ibucontext.invalidate_range = &mlx5_ib_invalidate_range;
+  #endif
+  
+ -	context->upd_xlt_page = __get_free_page(GFP_KERNEL);
+ -	if (!context->upd_xlt_page) {
+ -		err = -ENOMEM;
+ -		goto out_uars;
+ -	}
+ -	mutex_init(&context->upd_xlt_page_mutex);
+ -
+  	if (MLX5_CAP_GEN(dev->mdev, log_max_transport_domain)) {
+- 		err = mlx5_core_alloc_transport_domain(dev->mdev,
+- 						       &context->tdn);
++ 		err = mlx5_ib_alloc_transport_domain(dev, &context->tdn);
+  		if (err)
+ -			goto out_page;
+ +			goto out_uars;
+  	}
+  
+  	INIT_LIST_HEAD(&context->vma_private_list);
+@@@ -1246,19 -1401,19 +1372,19 @@@
+  
+  out_td:
+  	if (MLX5_CAP_GEN(dev->mdev, log_max_transport_domain))
+- 		mlx5_core_dealloc_transport_domain(dev->mdev, context->tdn);
++ 		mlx5_ib_dealloc_transport_domain(dev, context->tdn);
+  
+ -out_page:
+ -	free_page(context->upd_xlt_page);
+ -
+  out_uars:
+ -	deallocate_uars(dev, context);
+ +	for (i--; i >= 0; i--)
+ +		mlx5_cmd_free_uar(dev->mdev, uars[i].index);
+ +out_count:
+ +	kfree(uuari->count);
+  
+ -out_sys_pages:
+ -	kfree(bfregi->sys_pages);
+ +out_bitmap:
+ +	kfree(uuari->bitmap);
+  
+ -out_count:
+ -	kfree(bfregi->count);
+ +out_uar_ctx:
+ +	kfree(uars);
+  
+  out_ctx:
+  	kfree(context);
+@@@ -1269,20 -1425,16 +1395,20 @@@ static int mlx5_ib_dealloc_ucontext(str
+  {
+  	struct mlx5_ib_ucontext *context = to_mucontext(ibcontext);
+  	struct mlx5_ib_dev *dev = to_mdev(ibcontext->device);
+ -	struct mlx5_bfreg_info *bfregi;
+ +	struct mlx5_uuar_info *uuari = &context->uuari;
+ +	int i;
+  
+ -	bfregi = &context->bfregi;
+  	if (MLX5_CAP_GEN(dev->mdev, log_max_transport_domain))
+- 		mlx5_core_dealloc_transport_domain(dev->mdev, context->tdn);
++ 		mlx5_ib_dealloc_transport_domain(dev, context->tdn);
+  
+ -	free_page(context->upd_xlt_page);
+ -	deallocate_uars(dev, context);
+ -	kfree(bfregi->sys_pages);
+ -	kfree(bfregi->count);
+ +	for (i = 0; i < uuari->num_uars; i++) {
+ +		if (mlx5_cmd_free_uar(dev->mdev, uuari->uars[i].index))
+ +			mlx5_ib_warn(dev, "failed to free UAR 0x%x\n", uuari->uars[i].index);
+ +	}
+ +
+ +	kfree(uuari->count);
+ +	kfree(uuari->bitmap);
+ +	kfree(uuari->uars);
+  	kfree(context);
+  
+  	return 0;
+diff --cc drivers/infiniband/hw/mlx5/mlx5_ib.h
+index 17ce965b9a6d,d2b27647f939..000000000000
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@@ -653,6 -652,13 +653,16 @@@ struct mlx5_ib_dev 
+  	struct list_head	qp_list;
+  	/* Array with num_ports elements */
+  	struct mlx5_ib_port	*port;
+++<<<<<<< HEAD
+++=======
++ 	struct mlx5_sq_bfreg	bfreg;
++ 	struct mlx5_sq_bfreg	fp_bfreg;
++ 
++ 	/* protect the user_td */
++ 	struct mutex		lb_mutex;
++ 	u32			user_td;
++ 	u8			umr_fence;
+++>>>>>>> c85023e153e3 (IB/mlx5: Add raw ethernet local loopback support)
+  };
+  
+  static inline struct mlx5_ib_cq *to_mibcq(struct mlx5_core_cq *mcq)
+* Unmerged path drivers/infiniband/hw/mlx5/main.c
+* Unmerged path drivers/infiniband/hw/mlx5/mlx5_ib.h
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/main.c b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+index 593e3ff970b9..04b2ae1ef38f 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+@@ -47,6 +47,7 @@
+ #include <linux/debugfs.h>
+ #include <linux/kmod.h>
+ #include <linux/mlx5/mlx5_ifc.h>
++#include <linux/mlx5/vport.h>
+ #ifdef CONFIG_RFS_ACCEL
+ #include <linux/cpu_rmap.h>
+ #endif
+@@ -557,6 +558,18 @@ static int set_hca_ctrl(struct mlx5_core_dev *dev)
+ 	return err;
+ }
+ 
++static int mlx5_core_set_hca_defaults(struct mlx5_core_dev *dev)
++{
++	int ret = 0;
++
++	/* Disable local_lb by default */
++	if ((MLX5_CAP_GEN(dev, port_type) == MLX5_CAP_PORT_TYPE_ETH) &&
++	    MLX5_CAP_GEN(dev, disable_local_lb))
++		ret = mlx5_nic_vport_update_local_lb(dev, false);
++
++	return ret;
++}
++
+ int mlx5_core_enable_hca(struct mlx5_core_dev *dev, u16 func_id)
+ {
+ 	u32 out[MLX5_ST_SZ_DW(enable_hca_out)] = {0};
+@@ -1123,6 +1136,12 @@ static int mlx5_load_one(struct mlx5_core_dev *dev, struct mlx5_priv *priv,
+ 		goto err_fs;
+ 	}
+ 
++	err = mlx5_core_set_hca_defaults(dev);
++	if (err) {
++		dev_err(&pdev->dev, "Failed to set hca defaults\n");
++		goto err_fs;
++	}
++
+ #ifdef CONFIG_MLX5_CORE_EN
+ 	mlx5_eswitch_attach(dev->priv.eswitch);
+ #endif
