@@ -5233,6 +5233,7 @@ static int pqi_passthru_ioctl(struct pqi_ctrl_info *ctrl_info, void __user *arg)
 	case XFER_NONE:
 	case XFER_WRITE:
 	case XFER_READ:
+	case XFER_READ | XFER_WRITE:
 		break;
 	default:
 		return -EINVAL;
@@ -5272,6 +5273,9 @@ static int pqi_passthru_ioctl(struct pqi_ctrl_info *ctrl_info, void __user *arg)
 		break;
 	case XFER_READ:
 		request.data_direction = SOP_READ_FLAG;
+		break;
+	case XFER_READ | XFER_WRITE:
+		request.data_direction = SOP_BIDIRECTIONAL;
 		break;
 	}
 
