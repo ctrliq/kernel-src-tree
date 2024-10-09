@@ -1,0 +1,412 @@
+x86/smpboot: Make logical package management more robust
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 9d85eb9119f4eeeb48e87adfcd71f752655700e9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/9d85eb91.failed
+
+The logical package management has several issues:
+
+ - The APIC ids provided by ACPI are not required to be the same as the
+   initial APIC id which can be retrieved by CPUID. The APIC ids provided
+   by ACPI are those which are written by the BIOS into the APIC. The
+   initial id is set by hardware and can not be changed. The hardware
+   provided ids contain the real hardware package information.
+
+   Especially AMD sets the effective APIC id different from the hardware id
+   as they need to reserve space for the IOAPIC ids starting at id 0.
+
+   As a consequence those machines trigger the currently active firmware
+   bug printouts in dmesg, These are obviously wrong.
+
+ - Virtual machines have their own interesting of enumerating APICs and
+   packages which are not reliably covered by the current implementation.
+
+The sizing of the mapping array has been tweaked to be generously large to
+handle systems which provide a wrong core count when HT is disabled so the
+whole magic which checks for space in the physical hotplug case is not
+needed anymore.
+
+Simplify the whole machinery and do the mapping when the CPU starts and the
+CPUID derived physical package information is available. This solves the
+observed problems on AMD machines and works for the virtualization issues
+as well.
+
+Remove the extra call from XEN cpu bringup code as it is not longer
+required.
+
+Fixes: d49597fd3bc7 ("x86/cpu: Deal with broken firmware (VMWare/XEN)")
+Reported-and-tested-by: Borislav Petkov <bp@suse.de>
+	Tested-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Juergen Gross <jgross@suse.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: M. Vefa Bicakci <m.v.b@runbox.com>
+	Cc: xen-devel <xen-devel@lists.xen.org>
+	Cc: Charles (Chas) Williams <ciwillia@brocade.com>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Alok Kataria <akataria@vmware.com>
+	Cc: stable@vger.kernel.org
+Link: http://lkml.kernel.org/r/alpine.DEB.2.20.1612121102260.3429@nanos
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+(cherry picked from commit 9d85eb9119f4eeeb48e87adfcd71f752655700e9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/apic/apic.c
+#	arch/x86/kernel/cpu/common.c
+#	arch/x86/kernel/smpboot.c
+diff --cc arch/x86/kernel/apic/apic.c
+index e678ff8fb4f1,5b7e43eff139..000000000000
+--- a/arch/x86/kernel/apic/apic.c
++++ b/arch/x86/kernel/apic/apic.c
+@@@ -2203,24 -2148,18 +2203,27 @@@ void generic_processor_info(int apicid
+  		 * for BSP.
+  		 */
+  		cpu = 0;
+ +	} else
+ +		cpu = cpumask_next_zero(-1, cpu_present_mask);
+  
+ -		/* Logical cpuid 0 is reserved for BSP. */
+ -		cpuid_to_apicid[0] = apicid;
+ -	} else {
+ -		cpu = allocate_logical_cpuid(apicid);
+ -		if (cpu < 0) {
+ -			disabled_cpus++;
+ -			return -EINVAL;
+ -		}
+ +	/*
+++<<<<<<< HEAD
+ +	 * This can happen on physical hotplug. The sanity check at boot time
+ +	 * is done from native_smp_prepare_cpus() after num_possible_cpus() is
+ +	 * established.
+ +	 */
+ +	if (topology_update_package_map(apicid, cpu) < 0) {
+ +		int thiscpu = max + disabled_cpus;
+ +
+ +		pr_warning("ACPI: Package limit reached. Processor %d/0x%x ignored.\n",
+ +			   thiscpu, apicid);
+ +		disabled_cpus++;
+ +		return;
+  	}
+  
+  	/*
+++=======
+++>>>>>>> 9d85eb9119f4 (x86/smpboot: Make logical package management more robust)
+  	 * Validate version
+  	 */
+  	if (version == 0x0) {
+diff --cc arch/x86/kernel/cpu/common.c
+index d805b498a12b,1f6b50a449ab..000000000000
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@@ -893,12 -972,31 +893,34 @@@ static void x86_init_cache_qos(struct c
+  	 * in case CQM bits really aren't there in this CPU.
+  	 */
+  	if (c != &boot_cpu_data) {
+ -		boot_cpu_data.x86_cache_max_rmid =
+ -			min(boot_cpu_data.x86_cache_max_rmid,
+ -			    c->x86_cache_max_rmid);
+ -	}
+ -}
+ +		struct rh_cpuinfo_x86 *rh_c = &rh_cpu_data(c->cpu_index);
+  
+++<<<<<<< HEAD
+ +		rh_boot_cpu_data.x86_cache_max_rmid =
+ +			min(rh_boot_cpu_data.x86_cache_max_rmid,
+ +			    rh_c->x86_cache_max_rmid);
+ +	}
+++=======
++ /*
++  * Validate that ACPI/mptables have the same information about the
++  * effective APIC id and update the package map.
++  */
++ static void validate_apic_and_package_id(struct cpuinfo_x86 *c)
++ {
++ #ifdef CONFIG_SMP
++ 	unsigned int apicid, cpu = smp_processor_id();
++ 
++ 	apicid = apic->cpu_present_to_apicid(cpu);
++ 
++ 	if (apicid != c->apicid) {
++ 		pr_err(FW_BUG "CPU%u: APIC id mismatch. Firmware: %x APIC: %x\n",
++ 		       cpu, apicid, c->initial_apicid);
++ 	}
++ 	BUG_ON(topology_update_package_map(c->phys_proc_id, cpu));
++ #else
++ 	c->logical_proc_id = 0;
++ #endif
+++>>>>>>> 9d85eb9119f4 (x86/smpboot: Make logical package management more robust)
+  }
+  
+  /*
+@@@ -1028,18 -1124,39 +1050,21 @@@ static void identify_cpu(struct cpuinfo
+  #ifdef CONFIG_NUMA
+  	numa_add_cpu(smp_processor_id());
+  #endif
+++<<<<<<< HEAD
+ +	/* The boot/hotplug time assigment got cleared, restore it */
+ +	rh_c->logical_proc_id = topology_phys_to_logical_pkg(c->phys_proc_id);
+ +
+++=======
+++>>>>>>> 9d85eb9119f4 (x86/smpboot: Make logical package management more robust)
+  }
+  
+ -/*
+ - * Set up the CPU state needed to execute SYSENTER/SYSEXIT instructions
+ - * on 32-bit kernels:
+ - */
+ -#ifdef CONFIG_X86_32
+ -void enable_sep_cpu(void)
+ +#ifdef CONFIG_X86_64
+ +static void vgetcpu_set_mode(void)
+  {
+ -	struct tss_struct *tss;
+ -	int cpu;
+ -
+ -	if (!boot_cpu_has(X86_FEATURE_SEP))
+ -		return;
+ -
+ -	cpu = get_cpu();
+ -	tss = &per_cpu(cpu_tss, cpu);
+ -
+ -	/*
+ -	 * We cache MSR_IA32_SYSENTER_CS's value in the TSS's ss1 field --
+ -	 * see the big comment in struct x86_hw_tss's definition.
+ -	 */
+ -
+ -	tss->x86_tss.ss1 = __KERNEL_CS;
+ -	wrmsr(MSR_IA32_SYSENTER_CS, tss->x86_tss.ss1, 0);
+ -
+ -	wrmsr(MSR_IA32_SYSENTER_ESP,
+ -	      (unsigned long)tss + offsetofend(struct tss_struct, SYSENTER_stack),
+ -	      0);
+ -
+ -	wrmsr(MSR_IA32_SYSENTER_EIP, (unsigned long)entry_SYSENTER_32, 0);
+ -
+ -	put_cpu();
+ +	if (cpu_has(&boot_cpu_data, X86_FEATURE_RDTSCP))
+ +		vgetcpu_mode = VGETCPU_RDTSCP;
+ +	else
+ +		vgetcpu_mode = VGETCPU_LSL;
+  }
+  #endif
+  
+@@@ -1064,53 -1178,9 +1089,54 @@@ void identify_secondary_cpu(struct cpui
+  	enable_sep_cpu();
+  #endif
+  	mtrr_ap_init();
++ 	validate_apic_and_package_id(c);
+  }
+  
+ +struct msr_range {
+ +	unsigned	min;
+ +	unsigned	max;
+ +};
+ +
+ +static const struct msr_range msr_range_array[] = {
+ +	{ 0x00000000, 0x00000418},
+ +	{ 0xc0000000, 0xc000040b},
+ +	{ 0xc0010000, 0xc0010142},
+ +	{ 0xc0011000, 0xc001103b},
+ +};
+ +
+ +static void __print_cpu_msr(void)
+ +{
+ +	unsigned index_min, index_max;
+ +	unsigned index;
+ +	u64 val;
+ +	int i;
+ +
+ +	for (i = 0; i < ARRAY_SIZE(msr_range_array); i++) {
+ +		index_min = msr_range_array[i].min;
+ +		index_max = msr_range_array[i].max;
+ +
+ +		for (index = index_min; index < index_max; index++) {
+ +			if (rdmsrl_safe(index, &val))
+ +				continue;
+ +			printk(KERN_INFO " MSR%08x: %016llx\n", index, val);
+ +		}
+ +	}
+ +}
+ +
+ +static int show_msr;
+ +
+ +static __init int setup_show_msr(char *arg)
+ +{
+ +	int num;
+ +
+ +	get_option(&arg, &num);
+ +
+ +	if (num > 0)
+ +		show_msr = num;
+ +	return 1;
+ +}
+ +__setup("show_msr=", setup_show_msr);
+ +
+  static __init int setup_noclflush(char *arg)
+  {
+  	setup_clear_cpu_cap(X86_FEATURE_CLFLUSH);
+diff --cc arch/x86/kernel/smpboot.c
+index 3e039aa8dc3c,e09aa58a7603..000000000000
+--- a/arch/x86/kernel/smpboot.c
++++ b/arch/x86/kernel/smpboot.c
+@@@ -113,6 -102,58 +113,61 @@@ static unsigned long *logical_package_m
+  static unsigned int max_physical_pkg_id __read_mostly;
+  unsigned int __max_logical_packages __read_mostly;
+  EXPORT_SYMBOL(__max_logical_packages);
+++<<<<<<< HEAD
+++=======
++ static unsigned int logical_packages __read_mostly;
++ 
++ /* Maximum number of SMT threads on any online core */
++ int __max_smt_threads __read_mostly;
++ 
++ /* Flag to indicate if a complete sched domain rebuild is required */
++ bool x86_topology_update;
++ 
++ int arch_update_cpu_topology(void)
++ {
++ 	int retval = x86_topology_update;
++ 
++ 	x86_topology_update = false;
++ 	return retval;
++ }
++ 
++ static inline void smpboot_setup_warm_reset_vector(unsigned long start_eip)
++ {
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&rtc_lock, flags);
++ 	CMOS_WRITE(0xa, 0xf);
++ 	spin_unlock_irqrestore(&rtc_lock, flags);
++ 	local_flush_tlb();
++ 	pr_debug("1.\n");
++ 	*((volatile unsigned short *)phys_to_virt(TRAMPOLINE_PHYS_HIGH)) =
++ 							start_eip >> 4;
++ 	pr_debug("2.\n");
++ 	*((volatile unsigned short *)phys_to_virt(TRAMPOLINE_PHYS_LOW)) =
++ 							start_eip & 0xf;
++ 	pr_debug("3.\n");
++ }
++ 
++ static inline void smpboot_restore_warm_reset_vector(void)
++ {
++ 	unsigned long flags;
++ 
++ 	/*
++ 	 * Install writable page 0 entry to set BIOS data area.
++ 	 */
++ 	local_flush_tlb();
++ 
++ 	/*
++ 	 * Paranoid:  Set warm reset code and vector here back
++ 	 * to default values.
++ 	 */
++ 	spin_lock_irqsave(&rtc_lock, flags);
++ 	CMOS_WRITE(0, 0xf);
++ 	spin_unlock_irqrestore(&rtc_lock, flags);
++ 
++ 	*((volatile u32 *)phys_to_virt(TRAMPOLINE_PHYS_LOW)) = 0;
++ }
+++>>>>>>> 9d85eb9119f4 (x86/smpboot: Make logical package management more robust)
+  
+  /*
+   * Report back to the Boot Processor during boot time or to the caller processor
+@@@ -240,12 -269,17 +295,17 @@@ static void notrace start_secondary(voi
+  	x86_cpuinit.setup_percpu_clockev();
+  
+  	wmb();
+ -	cpu_startup_entry(CPUHP_AP_ONLINE_IDLE);
+ +	cpu_startup_entry(CPUHP_ONLINE);
+  }
+  
+- int topology_update_package_map(unsigned int apicid, unsigned int cpu)
++ /**
++  * topology_update_package_map - Update the physical to logical package map
++  * @pkg:	The physical package id as retrieved via CPUID
++  * @cpu:	The cpu for which this is updated
++  */
++ int topology_update_package_map(unsigned int pkg, unsigned int cpu)
+  {
+- 	unsigned int new, pkg = apicid >> boot_cpu_data.x86_coreid_bits;
++ 	unsigned int new;
+  
+  	/* Called from early boot ? */
+  	if (!physical_package_map)
+@@@ -258,16 -292,17 +318,30 @@@
+  	if (test_and_set_bit(pkg, physical_package_map))
+  		goto found;
+  
+++<<<<<<< HEAD
+ +	new = find_first_zero_bit(logical_package_map, __max_logical_packages);
+ +	if (new >= __max_logical_packages) {
+ +		physical_to_logical_pkg[pkg] = -1;
+ +		pr_warn("APIC(%x) Package %u exceeds logical package map\n",
+ +			apicid, pkg);
+ +		return -ENOSPC;
+ +	}
+ +	set_bit(new, logical_package_map);
+ +	pr_info("APIC(%x) Converting physical %u to logical package %u\n",
+ +		apicid, pkg, new);
+++=======
++ 	if (logical_packages >= __max_logical_packages) {
++ 		pr_warn("Package %u of CPU %u exceeds BIOS package data %u.\n",
++ 			logical_packages, cpu, __max_logical_packages);
++ 		return -ENOSPC;
++ 	}
++ 
++ 	new = logical_packages++;
++ 	if (new != pkg) {
++ 		pr_info("CPU %u Converting physical %u to logical package %u\n",
++ 			cpu, pkg, new);
++ 	}
+++>>>>>>> 9d85eb9119f4 (x86/smpboot: Make logical package management more robust)
+  	physical_to_logical_pkg[pkg] = new;
+  
+  found:
+@@@ -341,18 -372,7 +415,24 @@@ static void __init smp_init_package_map
+  
+  	pr_info("Max logical packages: %u\n", __max_logical_packages);
+  
+++<<<<<<< HEAD
+ +	for_each_present_cpu(cpu) {
+ +		unsigned int apicid = apic->cpu_present_to_apicid(cpu);
+ +
+ +		if (apicid == BAD_APICID || !apic->apic_id_valid(apicid))
+ +			continue;
+ +		if (!topology_update_package_map(apicid, cpu))
+ +			continue;
+ +		pr_warn("CPU %u APICId %x disabled\n", cpu, apicid);
+ +		per_cpu(x86_bios_cpu_apicid, cpu) = BAD_APICID;
+ +		set_cpu_possible(cpu, false);
+ +		set_cpu_present(cpu, false);
+ +	}
+++=======
+++	pr_info("Max logical packages: %u\n", __max_logical_packages);
+++
++ 	topology_update_package_map(c->phys_proc_id, cpu);
+++>>>>>>> 9d85eb9119f4 (x86/smpboot: Make logical package management more robust)
+  }
+  
+  void __init smp_store_boot_cpu_info(void)
+@@@ -363,8 -382,7 +443,12 @@@
+  
+  	*c = boot_cpu_data;
+  	c->cpu_index = id;
+++<<<<<<< HEAD
+ +	*rh_c = rh_boot_cpu_data;
+ +	smp_init_package_map();
+++=======
++ 	smp_init_package_map(c, id);
+++>>>>>>> 9d85eb9119f4 (x86/smpboot: Make logical package management more robust)
+  }
+  
+  /*
+* Unmerged path arch/x86/kernel/apic/apic.c
+* Unmerged path arch/x86/kernel/cpu/common.c
+* Unmerged path arch/x86/kernel/smpboot.c
