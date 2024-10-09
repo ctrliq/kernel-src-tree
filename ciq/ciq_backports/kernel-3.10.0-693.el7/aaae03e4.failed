@@ -1,0 +1,177 @@
+HID: wacom: Fix touchring value reporting
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [hid] wacom: Fix touchring value reporting (Aristeu Rozanski) [1346348 1388646 1385026]
+Rebuild_FUZZ: 93.51%
+commit-author Jason Gerecke <killertofu@gmail.com>
+commit aaae03e4f7f0c641a258dde855ab677c9b58b155
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/aaae03e4.failed
+
+Commit c7f0522 reports incorrect touchring values to userspace. This is
+due to its incorrect handling of the 'touched' bit present in the 'ring1'
+and 'ring2' variables. Instead of using this bit when determining if a
+value should be sent, the ABS_WHEEL and ABS_INPUT check (different?!)
+portions of the position bits. Furthermore, the full values of 'ring1'
+and 'ring2' are reported to userspace, despite the 'touched' flag
+needing to be trimmed beforehand. This commit addresses both issues.
+
+	Signed-off-by: Jason Gerecke <jason.gerecke@wacom.com>
+	Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+(cherry picked from commit aaae03e4f7f0c641a258dde855ab677c9b58b155)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hid/wacom_wac.c
+diff --cc drivers/hid/wacom_wac.c
+index 98c7d65145c2,23212af7fa76..000000000000
+--- a/drivers/hid/wacom_wac.c
++++ b/drivers/hid/wacom_wac.c
+@@@ -308,6 -436,141 +308,144 @@@ exit
+  	return retval;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void wacom_intuos_schedule_prox_event(struct wacom_wac *wacom_wac)
++ {
++ 	struct wacom *wacom = container_of(wacom_wac, struct wacom, wacom_wac);
++ 	struct hid_report *r;
++ 	struct hid_report_enum *re;
++ 
++ 	re = &(wacom->hdev->report_enum[HID_FEATURE_REPORT]);
++ 	r = re->report_id_hash[WACOM_REPORT_INTUOS_ID1];
++ 	if (r) {
++ 		hid_hw_request(wacom->hdev, r, HID_REQ_GET_REPORT);
++ 	}
++ }
++ 
++ static int wacom_intuos_pad(struct wacom_wac *wacom)
++ {
++ 	struct wacom_features *features = &wacom->features;
++ 	unsigned char *data = wacom->data;
++ 	struct input_dev *input = wacom->pad_input;
++ 	int i;
++ 	int buttons = 0, nbuttons = features->numbered_buttons;
++ 	int keys = 0, nkeys = 0;
++ 	int ring1 = 0, ring2 = 0;
++ 	int strip1 = 0, strip2 = 0;
++ 	bool prox = false;
++ 
++ 	/* pad packets. Works as a second tool and is always in prox */
++ 	if (!(data[0] == WACOM_REPORT_INTUOSPAD || data[0] == WACOM_REPORT_INTUOS5PAD ||
++ 	      data[0] == WACOM_REPORT_CINTIQPAD))
++ 		return 0;
++ 
++ 	if (features->type >= INTUOS4S && features->type <= INTUOS4L) {
++ 		buttons = (data[3] << 1) | (data[2] & 0x01);
++ 		ring1 = data[1];
++ 	} else if (features->type == DTK) {
++ 		buttons = data[6];
++ 	} else if (features->type == WACOM_13HD) {
++ 		buttons = (data[4] << 1) | (data[3] & 0x01);
++ 	} else if (features->type == WACOM_24HD) {
++ 		buttons = (data[8] << 8) | data[6];
++ 		ring1 = data[1];
++ 		ring2 = data[2];
++ 
++ 		/*
++ 		 * Three "buttons" are available on the 24HD which are
++ 		 * physically implemented as a touchstrip. Each button
++ 		 * is approximately 3 bits wide with a 2 bit spacing.
++ 		 * The raw touchstrip bits are stored at:
++ 		 *    ((data[3] & 0x1f) << 8) | data[4])
++ 		 */
++ 		nkeys = 3;
++ 		keys = ((data[3] & 0x1C) ? 1<<2 : 0) |
++ 		       ((data[4] & 0xE0) ? 1<<1 : 0) |
++ 		       ((data[4] & 0x07) ? 1<<0 : 0);
++ 	} else if (features->type == WACOM_27QHD) {
++ 		nkeys = 3;
++ 		keys = data[2] & 0x07;
++ 
++ 		input_report_abs(input, ABS_X, be16_to_cpup((__be16 *)&data[4]));
++ 		input_report_abs(input, ABS_Y, be16_to_cpup((__be16 *)&data[6]));
++ 		input_report_abs(input, ABS_Z, be16_to_cpup((__be16 *)&data[8]));
++ 	} else if (features->type == CINTIQ_HYBRID) {
++ 		/*
++ 		 * Do not send hardware buttons under Android. They
++ 		 * are already sent to the system through GPIO (and
++ 		 * have different meaning).
++ 		 *
++ 		 * d-pad right  -> data[4] & 0x10
++ 		 * d-pad up     -> data[4] & 0x20
++ 		 * d-pad left   -> data[4] & 0x40
++ 		 * d-pad down   -> data[4] & 0x80
++ 		 * d-pad center -> data[3] & 0x01
++ 		 */
++ 		buttons = (data[4] << 1) | (data[3] & 0x01);
++ 	} else if (features->type == CINTIQ_COMPANION_2) {
++ 		/* d-pad right  -> data[4] & 0x10
++ 		 * d-pad up     -> data[4] & 0x20
++ 		 * d-pad left   -> data[4] & 0x40
++ 		 * d-pad down   -> data[4] & 0x80
++ 		 * d-pad center -> data[3] & 0x01
++ 		 */
++ 		buttons = ((data[2] & 0xF0) << 7) |
++ 		          ((data[1] & 0x04) << 6) |
++ 		          ((data[2] & 0x0F) << 2) |
++ 		          (data[1] & 0x03);
++ 	} else if (features->type >= INTUOS5S && features->type <= INTUOSPL) {
++ 		/*
++ 		 * ExpressKeys on Intuos5/Intuos Pro have a capacitive sensor in
++ 		 * addition to the mechanical switch. Switch data is
++ 		 * stored in data[4], capacitive data in data[5].
++ 		 *
++ 		 * Touch ring mode switch (data[3]) has no capacitive sensor
++ 		 */
++ 		buttons = (data[4] << 1) | (data[3] & 0x01);
++ 		ring1 = data[2];
++ 	} else {
++ 		if (features->type == WACOM_21UX2 || features->type == WACOM_22HD) {
++ 			buttons = (data[8] << 10) | ((data[7] & 0x01) << 9) |
++ 			          (data[6] << 1) | (data[5] & 0x01);
++ 
++ 			if (features->type == WACOM_22HD) {
++ 				nkeys = 3;
++ 				keys = data[9] & 0x07;
++ 			}
++ 		} else {
++ 			buttons = ((data[6] & 0x10) << 10) |
++ 			          ((data[5] & 0x10) << 9)  |
++ 			          ((data[6] & 0x0F) << 4)  |
++ 			          (data[5] & 0x0F);
++ 		}
++ 		strip1 = ((data[1] & 0x1f) << 8) | data[2];
++ 		strip2 = ((data[3] & 0x1f) << 8) | data[4];
++ 	}
++ 
++ 	prox = (buttons & ~(~0 << nbuttons)) | (keys & ~(~0 << nkeys)) |
++ 	       (ring1 & 0x80) | (ring2 & 0x80) | strip1 | strip2;
++ 
++ 	wacom_report_numbered_buttons(input, nbuttons, buttons);
++ 
++ 	for (i = 0; i < nkeys; i++)
++ 		input_report_key(input, KEY_PROG1 + i, keys & (1 << i));
++ 
++ 	input_report_abs(input, ABS_RX, strip1);
++ 	input_report_abs(input, ABS_RY, strip2);
++ 
++ 	input_report_abs(input, ABS_WHEEL,    (ring1 & 0x80) ? (ring1 & 0x7f) : 0);
++ 	input_report_abs(input, ABS_THROTTLE, (ring2 & 0x80) ? (ring2 & 0x7f) : 0);
++ 
++ 	input_report_key(input, wacom->tool[1], prox ? 1 : 0);
++ 	input_report_abs(input, ABS_MISC, prox ? PAD_DEVICE_ID : 0);
++ 
++ 	input_event(input, EV_MSC, MSC_SERIAL, 0xffffffff);
++ 
++ 	return 1;
++ }
++ 
+++>>>>>>> aaae03e4f7f0 (HID: wacom: Fix touchring value reporting)
+  static int wacom_intuos_inout(struct wacom_wac *wacom)
+  {
+  	struct wacom_features *features = &wacom->features;
+* Unmerged path drivers/hid/wacom_wac.c
