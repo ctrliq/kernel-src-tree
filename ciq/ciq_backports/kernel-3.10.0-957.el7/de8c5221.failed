@@ -1,0 +1,159 @@
+tcmu: Fix dev_config_store
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Bryant G. Ly <bryantly@linux.vnet.ibm.com>
+commit de8c5221aa003935d6d31becf5850b247dff14a1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/de8c5221.failed
+
+Currently when there is a reconfig, the uio_info->name
+does not get updated to reflect the change in the dev_config
+name change.
+
+On restart tcmu-runner there will be a mismatch between
+the dev_config string in uio and the tcmu structure that contains
+the string. When this occurs it'll reload the one in uio
+and you lose the reconfigured device path.
+
+v2: Created a helper function for the updating of uio_info
+
+	Signed-off-by: Bryant G. Ly <bryantly@linux.vnet.ibm.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit de8c5221aa003935d6d31becf5850b247dff14a1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_user.c
+diff --cc drivers/target/target_core_user.c
+index 747d70975df5,2f1fa927682e..000000000000
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@@ -1175,49 -1418,44 +1175,70 @@@ free_skb
+  	return ret;
+  }
+  
+- static int tcmu_configure_device(struct se_device *dev)
++ static int tcmu_update_uio_info(struct tcmu_dev *udev)
+  {
+- 	struct tcmu_dev *udev = TCMU_DEV(dev);
+  	struct tcmu_hba *hba = udev->hba->hba_ptr;
+  	struct uio_info *info;
+++<<<<<<< HEAD
+ +	struct tcmu_mailbox *mb;
+ +	size_t size;
+ +	size_t used;
+ +	int id, ret = 0;
+++=======
++ 	size_t size, used;
+++>>>>>>> de8c5221aa00 (tcmu: Fix dev_config_store)
+  	char *str;
+  
+ +	mutex_lock(&device_mutex);
+ +	id = idr_alloc_cyclic(&devices_idr, dev, 0, INT_MAX, GFP_KERNEL);
+ +	mutex_unlock(&device_mutex);
+ +	if (id < 0)
+ +		return -ENOMEM;
+ +	udev->dev_index = id;
+ +
+  	info = &udev->uio_info;
+- 
+  	size = snprintf(NULL, 0, "tcm-user/%u/%s/%s", hba->host_id, udev->name,
+  			udev->dev_config);
+  	size += 1; /* for \0 */
+  	str = kmalloc(size, GFP_KERNEL);
+ -	if (!str)
+ -		return -ENOMEM;
+ +	if (!str) {
+ +		ret = -ENOMEM;
+ +		goto err_kmalloc;
+ +	}
+  
+  	used = snprintf(str, size, "tcm-user/%u/%s", hba->host_id, udev->name);
+- 
+  	if (udev->dev_config[0])
+  		snprintf(str + used, size - used, "/%s", udev->dev_config);
+  
+  	info->name = str;
+  
+++<<<<<<< HEAD
+ +	udev->data_bitmap = kzalloc(BITS_TO_LONGS(udev->max_blocks) *
+ +				    sizeof(unsigned long), GFP_KERNEL);
+ +	if (!udev->data_bitmap)
+ +		goto err_bitmap_alloc;
+ +
+ +	udev->ring_size = CMDR_SIZE + (udev->max_blocks * DATA_BLOCK_SIZE);
+ +	udev->mb_addr = vzalloc(udev->ring_size);
+++=======
++ 	return 0;
++ }
++ 
++ static int tcmu_configure_device(struct se_device *dev)
++ {
++ 	struct tcmu_dev *udev = TCMU_DEV(dev);
++ 	struct uio_info *info;
++ 	struct tcmu_mailbox *mb;
++ 	int ret = 0;
++ 
++ 	ret = tcmu_update_uio_info(udev);
++ 	if (ret)
++ 		return ret;
++ 
++ 	info = &udev->uio_info;
++ 
++ 	udev->mb_addr = vzalloc(CMDR_SIZE);
+++>>>>>>> de8c5221aa00 (tcmu: Fix dev_config_store)
+  	if (!udev->mb_addr) {
+  		ret = -ENOMEM;
+  		goto err_vzalloc;
+@@@ -1557,24 -1782,32 +1578,42 @@@ static ssize_t tcmu_qfull_time_out_stor
+  	struct se_dev_attrib *da = container_of(to_config_group(item),
+  						struct se_dev_attrib, da_group);
+  	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
+ -	int ret, len;
+ +	s32 val;
+ +	int ret;
+  
+ -	len = strlen(page);
+ -	if (!len || len > TCMU_CONFIG_LEN - 1)
+ +	ret = kstrtos32(page, 0, &val);
+ +	if (ret < 0)
+ +		return ret;
+ +
+ +	if (val >= 0) {
+ +		udev->qfull_time_out = val * MSEC_PER_SEC;
+ +	} else if (val == -1) {
+ +		udev->qfull_time_out = val;
+ +	} else {
+ +		printk(KERN_ERR "Invalid qfull timeout value %d\n", val);
+  		return -EINVAL;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* Check if device has been configured before */
++ 	if (tcmu_dev_configured(udev)) {
++ 		ret = tcmu_netlink_event(udev, TCMU_CMD_RECONFIG_DEVICE,
++ 					 TCMU_ATTR_DEV_CFG, page);
++ 		if (ret) {
++ 			pr_err("Unable to reconfigure device\n");
++ 			return ret;
++ 		}
++ 		strlcpy(udev->dev_config, page, TCMU_CONFIG_LEN);
++ 
++ 		ret = tcmu_update_uio_info(udev);
++ 		if (ret)
++ 			return ret;
++ 		return count;
+++>>>>>>> de8c5221aa00 (tcmu: Fix dev_config_store)
+  	}
+ -	strlcpy(udev->dev_config, page, TCMU_CONFIG_LEN);
+ -
+  	return count;
+  }
+ -CONFIGFS_ATTR(tcmu_, dev_config);
+ +CONFIGFS_ATTR(tcmu_, qfull_time_out);
+  
+  static ssize_t tcmu_dev_size_show(struct config_item *item, char *page)
+  {
+* Unmerged path drivers/target/target_core_user.c
