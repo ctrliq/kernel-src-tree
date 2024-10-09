@@ -1,0 +1,208 @@
+cifs: Fix stack out-of-bounds in smb{2,3}_create_lease_buf()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [fs] cifs: Fix stack out-of-bounds in smb(2, 3)_create_lease_buf() (Leif Sahlberg) [1598755]
+Rebuild_FUZZ: 95.87%
+commit-author Stefano Brivio <sbrivio@redhat.com>
+commit 729c0c9dd55204f0c9a823ac8a7bfa83d36c7e78
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/729c0c9d.failed
+
+smb{2,3}_create_lease_buf() store a lease key in the lease
+context for later usage on a lease break.
+
+In most paths, the key is currently sourced from data that
+happens to be on the stack near local variables for oplock in
+SMB2_open() callers, e.g. from open_shroot(), whereas
+smb2_open_file() properly allocates space on its stack for it.
+
+The address of those local variables holding the oplock is then
+passed to create_lease_buf handlers via SMB2_open(), and 16
+bytes near oplock are used. This causes a stack out-of-bounds
+access as reported by KASAN on SMB2.1 and SMB3 mounts (first
+out-of-bounds access is shown here):
+
+[  111.528823] BUG: KASAN: stack-out-of-bounds in smb3_create_lease_buf+0x399/0x3b0 [cifs]
+[  111.530815] Read of size 8 at addr ffff88010829f249 by task mount.cifs/985
+[  111.532838] CPU: 3 PID: 985 Comm: mount.cifs Not tainted 4.18.0-rc3+ #91
+[  111.534656] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.10.2-1 04/01/2014
+[  111.536838] Call Trace:
+[  111.537528]  dump_stack+0xc2/0x16b
+[  111.540890]  print_address_description+0x6a/0x270
+[  111.542185]  kasan_report+0x258/0x380
+[  111.544701]  smb3_create_lease_buf+0x399/0x3b0 [cifs]
+[  111.546134]  SMB2_open+0x1ef8/0x4b70 [cifs]
+[  111.575883]  open_shroot+0x339/0x550 [cifs]
+[  111.591969]  smb3_qfs_tcon+0x32c/0x1e60 [cifs]
+[  111.617405]  cifs_mount+0x4f3/0x2fc0 [cifs]
+[  111.674332]  cifs_smb3_do_mount+0x263/0xf10 [cifs]
+[  111.677915]  mount_fs+0x55/0x2b0
+[  111.679504]  vfs_kern_mount.part.22+0xaa/0x430
+[  111.684511]  do_mount+0xc40/0x2660
+[  111.698301]  ksys_mount+0x80/0xd0
+[  111.701541]  do_syscall_64+0x14e/0x4b0
+[  111.711807]  entry_SYSCALL_64_after_hwframe+0x44/0xa9
+[  111.713665] RIP: 0033:0x7f372385b5fa
+[  111.715311] Code: 48 8b 0d 99 78 2c 00 f7 d8 64 89 01 48 83 c8 ff c3 66 2e 0f 1f 84 00 00 00 00 00 0f 1f 44 00 00 49 89 ca b8 a5 00 00 00 0f 05 <48> 3d 01 f0 ff ff 73 01 c3 48 8b 0d 66 78 2c 00 f7 d8 64 89 01 48
+[  111.720330] RSP: 002b:00007ffff27049d8 EFLAGS: 00000206 ORIG_RAX: 00000000000000a5
+[  111.722601] RAX: ffffffffffffffda RBX: 0000000000000000 RCX: 00007f372385b5fa
+[  111.724842] RDX: 000055c2ecdc73b2 RSI: 000055c2ecdc73f9 RDI: 00007ffff270580f
+[  111.727083] RBP: 00007ffff2705804 R08: 000055c2ee976060 R09: 0000000000001000
+[  111.729319] R10: 0000000000000000 R11: 0000000000000206 R12: 00007f3723f4d000
+[  111.731615] R13: 000055c2ee976060 R14: 00007f3723f4f90f R15: 0000000000000000
+
+[  111.735448] The buggy address belongs to the page:
+[  111.737420] page:ffffea000420a7c0 count:0 mapcount:0 mapping:0000000000000000 index:0x0
+[  111.739890] flags: 0x17ffffc0000000()
+[  111.741750] raw: 0017ffffc0000000 0000000000000000 dead000000000200 0000000000000000
+[  111.744216] raw: 0000000000000000 0000000000000000 00000000ffffffff 0000000000000000
+[  111.746679] page dumped because: kasan: bad access detected
+
+[  111.750482] Memory state around the buggy address:
+[  111.752562]  ffff88010829f100: 00 f2 f2 f2 f2 f2 f2 f2 00 00 00 00 00 00 00 00
+[  111.754991]  ffff88010829f180: 00 00 f2 f2 00 00 00 00 00 00 00 00 00 00 00 00
+[  111.757401] >ffff88010829f200: 00 00 00 00 00 f1 f1 f1 f1 01 f2 f2 f2 f2 f2 f2
+[  111.759801]                                               ^
+[  111.762034]  ffff88010829f280: f2 02 f2 f2 f2 f2 f2 f2 f2 00 00 00 00 00 00 00
+[  111.764486]  ffff88010829f300: f2 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+[  111.766913] ==================================================================
+
+Lease keys are however already generated and stored in fid data
+on open and create paths: pass them down to the lease context
+creation handlers and use them.
+
+	Suggested-by: Aurélien Aptel <aaptel@suse.com>
+	Reviewed-by: Aurelien Aptel <aaptel@suse.com>
+Fixes: b8c32dbb0deb ("CIFS: Request SMB2.1 leases")
+	Signed-off-by: Stefano Brivio <sbrivio@redhat.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 729c0c9dd55204f0c9a823ac8a7bfa83d36c7e78)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/smb2file.c
+diff --cc fs/cifs/smb2file.c
+index 12af5dba742b,4ed10dd086e6..000000000000
+--- a/fs/cifs/smb2file.c
++++ b/fs/cifs/smb2file.c
+@@@ -59,12 -59,10 +59,17 @@@ smb2_open_file(const unsigned int xid, 
+  	}
+  
+  	oparms->desired_access |= FILE_READ_ATTRIBUTES;
+- 	*smb2_oplock = SMB2_OPLOCK_LEVEL_BATCH;
++ 	smb2_oplock = SMB2_OPLOCK_LEVEL_BATCH;
+  
+++<<<<<<< HEAD
+ +	if (oparms->tcon->ses->server->capabilities & SMB2_GLOBAL_CAP_LEASING)
+ +		memcpy(smb2_oplock + 1, fid->lease_key, SMB2_LEASE_KEY_SIZE);
+ +
+ +	rc = SMB2_open(xid, oparms, smb2_path, smb2_oplock, smb2_data, NULL);
+++=======
++ 	rc = SMB2_open(xid, oparms, smb2_path, &smb2_oplock, smb2_data, NULL,
++ 		       NULL);
+++>>>>>>> 729c0c9dd552 (cifs: Fix stack out-of-bounds in smb{2,3}_create_lease_buf())
+  	if (rc)
+  		goto out;
+  
+diff --git a/fs/cifs/cifsglob.h b/fs/cifs/cifsglob.h
+index f2a60b34b765..19d2133e1f18 100644
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@ -408,7 +408,7 @@ struct smb_version_operations {
+ 	void (*set_oplock_level)(struct cifsInodeInfo *, __u32, unsigned int,
+ 				 bool *);
+ 	/* create lease context buffer for CREATE request */
+-	char * (*create_lease_buf)(u8 *, u8);
++	char * (*create_lease_buf)(u8 *lease_key, u8 oplock);
+ 	/* parse lease context buffer and return oplock/epoch info */
+ 	__u8 (*parse_lease_buf)(void *buf, unsigned int *epoch, char *lkey);
+ 	ssize_t (*copychunk_range)(const unsigned int,
+* Unmerged path fs/cifs/smb2file.c
+diff --git a/fs/cifs/smb2ops.c b/fs/cifs/smb2ops.c
+index 300ec77cc8e5..7c1cf4e1ab3d 100644
+--- a/fs/cifs/smb2ops.c
++++ b/fs/cifs/smb2ops.c
+@@ -1953,8 +1953,7 @@ smb2_create_lease_buf(u8 *lease_key, u8 oplock)
+ 	if (!buf)
+ 		return NULL;
+ 
+-	buf->lcontext.LeaseKeyLow = cpu_to_le64(*((u64 *)lease_key));
+-	buf->lcontext.LeaseKeyHigh = cpu_to_le64(*((u64 *)(lease_key + 8)));
++	memcpy(&buf->lcontext.LeaseKey, lease_key, SMB2_LEASE_KEY_SIZE);
+ 	buf->lcontext.LeaseState = map_oplock_to_lease(oplock);
+ 
+ 	buf->ccontext.DataOffset = cpu_to_le16(offsetof
+@@ -1980,8 +1979,7 @@ smb3_create_lease_buf(u8 *lease_key, u8 oplock)
+ 	if (!buf)
+ 		return NULL;
+ 
+-	buf->lcontext.LeaseKeyLow = cpu_to_le64(*((u64 *)lease_key));
+-	buf->lcontext.LeaseKeyHigh = cpu_to_le64(*((u64 *)(lease_key + 8)));
++	memcpy(&buf->lcontext.LeaseKey, lease_key, SMB2_LEASE_KEY_SIZE);
+ 	buf->lcontext.LeaseState = map_oplock_to_lease(oplock);
+ 
+ 	buf->ccontext.DataOffset = cpu_to_le16(offsetof
+@@ -2018,8 +2016,7 @@ smb3_parse_lease_buf(void *buf, unsigned int *epoch, char *lease_key)
+ 	if (lc->lcontext.LeaseFlags & SMB2_LEASE_FLAG_BREAK_IN_PROGRESS)
+ 		return SMB2_OPLOCK_LEVEL_NOCHANGE;
+ 	if (lease_key)
+-		memcpy(lease_key, &lc->lcontext.LeaseKeyLow,
+-		       SMB2_LEASE_KEY_SIZE);
++		memcpy(lease_key, &lc->lcontext.LeaseKey, SMB2_LEASE_KEY_SIZE);
+ 	return le32_to_cpu(lc->lcontext.LeaseState);
+ }
+ 
+diff --git a/fs/cifs/smb2pdu.c b/fs/cifs/smb2pdu.c
+index 961743bd65d0..d9f225ab3636 100644
+--- a/fs/cifs/smb2pdu.c
++++ b/fs/cifs/smb2pdu.c
+@@ -1406,12 +1406,12 @@ parse_lease_state(struct TCP_Server_Info *server, struct smb2_create_rsp *rsp,
+ 
+ static int
+ add_lease_context(struct TCP_Server_Info *server, struct kvec *iov,
+-		  unsigned int *num_iovec, __u8 *oplock)
++		  unsigned int *num_iovec, u8 *lease_key, __u8 *oplock)
+ {
+ 	struct smb2_create_req *req = iov[0].iov_base;
+ 	unsigned int num = *num_iovec;
+ 
+-	iov[num].iov_base = server->ops->create_lease_buf(oplock+1, *oplock);
++	iov[num].iov_base = server->ops->create_lease_buf(lease_key, *oplock);
+ 	if (iov[num].iov_base == NULL)
+ 		return -ENOMEM;
+ 	iov[num].iov_len = server->vals->create_lease_size;
+@@ -1713,7 +1713,8 @@ SMB2_open(const unsigned int xid, struct cifs_open_parms *oparms, __le16 *path,
+ 	    *oplock == SMB2_OPLOCK_LEVEL_NONE)
+ 		req->RequestedOplockLevel = *oplock;
+ 	else {
+-		rc = add_lease_context(server, iov, &n_iov, oplock);
++		rc = add_lease_context(server, iov, &n_iov,
++				       oparms->fid->lease_key, oplock);
+ 		if (rc) {
+ 			cifs_small_buf_release(req);
+ 			kfree(copy_path);
+diff --git a/fs/cifs/smb2pdu.h b/fs/cifs/smb2pdu.h
+index c10cefc8d94a..b857e45db271 100644
+--- a/fs/cifs/smb2pdu.h
++++ b/fs/cifs/smb2pdu.h
+@@ -670,16 +670,14 @@ struct create_context {
+ #define SMB2_LEASE_KEY_SIZE 16
+ 
+ struct lease_context {
+-	__le64 LeaseKeyLow;
+-	__le64 LeaseKeyHigh;
++	u8 LeaseKey[SMB2_LEASE_KEY_SIZE];
+ 	__le32 LeaseState;
+ 	__le32 LeaseFlags;
+ 	__le64 LeaseDuration;
+ } __packed;
+ 
+ struct lease_context_v2 {
+-	__le64 LeaseKeyLow;
+-	__le64 LeaseKeyHigh;
++	u8 LeaseKey[SMB2_LEASE_KEY_SIZE];
+ 	__le32 LeaseState;
+ 	__le32 LeaseFlags;
+ 	__le64 LeaseDuration;
