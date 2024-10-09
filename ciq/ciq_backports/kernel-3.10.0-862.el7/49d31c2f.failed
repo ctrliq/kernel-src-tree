@@ -1,0 +1,355 @@
+dentry name snapshots
+
+jira LE-1907
+cve CVE-2017-7533
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit 49d31c2f389acfe83417083e1208422b4091cd9e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/49d31c2f.failed
+
+take_dentry_name_snapshot() takes a safe snapshot of dentry name;
+if the name is a short one, it gets copied into caller-supplied
+structure, otherwise an extra reference to external name is grabbed
+(those are never modified).  In either case the pointer to stable
+string is stored into the same structure.
+
+dentry must be held by the caller of take_dentry_name_snapshot(),
+but may be freely dropped afterwards - the snapshot will stay
+until destroyed by release_dentry_name_snapshot().
+
+Intended use:
+	struct name_snapshot s;
+
+	take_dentry_name_snapshot(&s, dentry);
+	...
+	access s.name
+	...
+	release_dentry_name_snapshot(&s);
+
+Replaces fsnotify_oldname_...(), gets used in fsnotify to obtain the name
+to pass down with event.
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 49d31c2f389acfe83417083e1208422b4091cd9e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dcache.c
+#	fs/debugfs/inode.c
+#	fs/namei.c
+#	include/linux/dcache.h
+diff --cc fs/dcache.c
+index e518a196fb4f,831f3a9a8f05..000000000000
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@@ -224,36 -265,82 +224,103 @@@ static void __d_free(struct rcu_head *h
+  	kmem_cache_free(dentry_cache, dentry); 
+  }
+  
+ -static void __d_free_external(struct rcu_head *head)
+ +/*
+ + * no locks, please.
+ + */
+ +static void d_free(struct dentry *dentry)
+  {
+ -	struct dentry *dentry = container_of(head, struct dentry, d_u.d_rcu);
+ -	kfree(external_name(dentry));
+ -	kmem_cache_free(dentry_cache, dentry); 
+ -}
+ +	struct rcu_head *p = (struct rcu_head *)&dentry->d_alias;
+ +	BUG_ON((int)dentry->d_lockref.count > 0);
+ +	this_cpu_dec(nr_dentry);
+ +	if (dentry->d_op && dentry->d_op->d_release)
+ +		dentry->d_op->d_release(dentry);
+  
+++<<<<<<< HEAD
+++=======
++ static inline int dname_external(const struct dentry *dentry)
++ {
++ 	return dentry->d_name.name != dentry->d_iname;
++ }
++ 
++ void take_dentry_name_snapshot(struct name_snapshot *name, struct dentry *dentry)
++ {
++ 	spin_lock(&dentry->d_lock);
++ 	if (unlikely(dname_external(dentry))) {
++ 		struct external_name *p = external_name(dentry);
++ 		atomic_inc(&p->u.count);
++ 		spin_unlock(&dentry->d_lock);
++ 		name->name = p->name;
++ 	} else {
++ 		memcpy(name->inline_name, dentry->d_iname, DNAME_INLINE_LEN);
++ 		spin_unlock(&dentry->d_lock);
++ 		name->name = name->inline_name;
++ 	}
++ }
++ EXPORT_SYMBOL(take_dentry_name_snapshot);
++ 
++ void release_dentry_name_snapshot(struct name_snapshot *name)
++ {
++ 	if (unlikely(name->name != name->inline_name)) {
++ 		struct external_name *p;
++ 		p = container_of(name->name, struct external_name, name[0]);
++ 		if (unlikely(atomic_dec_and_test(&p->u.count)))
++ 			kfree_rcu(p, u.head);
++ 	}
++ }
++ EXPORT_SYMBOL(release_dentry_name_snapshot);
++ 
++ static inline void __d_set_inode_and_type(struct dentry *dentry,
++ 					  struct inode *inode,
++ 					  unsigned type_flags)
++ {
++ 	unsigned flags;
++ 
++ 	dentry->d_inode = inode;
++ 	flags = READ_ONCE(dentry->d_flags);
++ 	flags &= ~(DCACHE_ENTRY_TYPE | DCACHE_FALLTHRU);
++ 	flags |= type_flags;
++ 	WRITE_ONCE(dentry->d_flags, flags);
++ }
++ 
++ static inline void __d_clear_type_and_inode(struct dentry *dentry)
++ {
++ 	unsigned flags = READ_ONCE(dentry->d_flags);
++ 
++ 	flags &= ~(DCACHE_ENTRY_TYPE | DCACHE_FALLTHRU);
++ 	WRITE_ONCE(dentry->d_flags, flags);
++ 	dentry->d_inode = NULL;
++ }
++ 
++ static void dentry_free(struct dentry *dentry)
++ {
++ 	WARN_ON(!hlist_unhashed(&dentry->d_u.d_alias));
++ 	if (unlikely(dname_external(dentry))) {
++ 		struct external_name *p = external_name(dentry);
++ 		if (likely(atomic_dec_and_test(&p->u.count))) {
++ 			call_rcu(&dentry->d_u.d_rcu, __d_free_external);
++ 			return;
++ 		}
++ 	}
+++>>>>>>> 49d31c2f389a (dentry name snapshots)
+  	/* if dentry was never visible to RCU, immediate free is OK */
+  	if (!(dentry->d_flags & DCACHE_RCUACCESS))
+ -		__d_free(&dentry->d_u.d_rcu);
+ +		__d_free(p);
+  	else
+ -		call_rcu(&dentry->d_u.d_rcu, __d_free);
+ +		call_rcu(p, __d_free);
+ +}
+ +
+ +/**
+ + * dentry_rcuwalk_barrier - invalidate in-progress rcu-walk lookups
+ + * @dentry: the target dentry
+ + * After this call, in-progress rcu-walk path lookup will fail. This
+ + * should be called after unhashing, and after changing d_inode (if
+ + * the dentry has not already been unhashed).
+ + */
+ +static inline void dentry_rcuwalk_barrier(struct dentry *dentry)
+ +{
+ +	assert_spin_locked(&dentry->d_lock);
+ +	/* Go through a barrier */
+ +	write_seqcount_barrier(&dentry->d_seq);
+  }
+  
+  /*
+diff --cc fs/debugfs/inode.c
+index c7c83ff0f752,acd3be2cc691..000000000000
+--- a/fs/debugfs/inode.c
++++ b/fs/debugfs/inode.c
+@@@ -613,22 -778,22 +613,27 @@@ struct dentry *debugfs_rename(struct de
+  		goto exit;
+  	dentry = lookup_one_len(new_name, new_dir, strlen(new_name));
+  	/* Lookup failed, cyclic rename or target exists? */
+ -	if (IS_ERR(dentry) || dentry == trap || d_really_is_positive(dentry))
+ +	if (IS_ERR(dentry) || dentry == trap || dentry->d_inode)
+  		goto exit;
+  
+- 	old_name = fsnotify_oldname_init(old_dentry->d_name.name);
++ 	take_dentry_name_snapshot(&old_name, old_dentry);
+  
+ -	error = simple_rename(d_inode(old_dir), old_dentry, d_inode(new_dir),
+ -			      dentry, 0);
+ +	error = simple_rename(old_dir->d_inode, old_dentry, new_dir->d_inode,
+ +		dentry);
+  	if (error) {
+- 		fsnotify_oldname_free(old_name);
++ 		release_dentry_name_snapshot(&old_name);
+  		goto exit;
+  	}
+  	d_move(old_dentry, dentry);
+++<<<<<<< HEAD
+ +	fsnotify_move(old_dir->d_inode, new_dir->d_inode, old_name,
+ +		S_ISDIR(old_dentry->d_inode->i_mode),
+++=======
++ 	fsnotify_move(d_inode(old_dir), d_inode(new_dir), old_name.name,
++ 		d_is_dir(old_dentry),
+++>>>>>>> 49d31c2f389a (dentry name snapshots)
+  		NULL, old_dentry);
+- 	fsnotify_oldname_free(old_name);
++ 	release_dentry_name_snapshot(&old_name);
+  	unlock_rename(new_dir, old_dir);
+  	dput(dentry);
+  	return old_dentry;
+diff --cc fs/namei.c
+index 01f0ff2e2d1f,c5588e837b15..000000000000
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@@ -4141,13 -4366,9 +4140,17 @@@ int vfs_rename(struct inode *old_dir, s
+  	struct inode *target = new_dentry->d_inode;
+  	bool new_is_dir = false;
+  	unsigned max_links = new_dir->i_sb->s_max_links;
+++<<<<<<< HEAD
+ +	iop_rename2_t rename2;
+++=======
++ 	struct name_snapshot old_name;
+++>>>>>>> 49d31c2f389a (dentry name snapshots)
+  
+ -	if (source == target)
+ +	/*
+ +	 * Check source == target.
+ +	 * On overlayfs need to look at underlying inodes.
+ +	 */
+ +	if (d_real_inode(old_dentry) == d_real_inode(new_dentry))
+  		return 0;
+  
+  	error = may_delete(old_dir, old_dentry, is_dir);
+@@@ -4254,10 -4465,10 +4257,10 @@@ out
+  	if (!is_dir || (flags & RENAME_EXCHANGE))
+  		unlock_two_nondirectories(source, target);
+  	else if (target)
+ -		inode_unlock(target);
+ +		mutex_unlock(&target->i_mutex);
+  	dput(new_dentry);
+  	if (!error) {
+- 		fsnotify_move(old_dir, new_dir, old_name, is_dir,
++ 		fsnotify_move(old_dir, new_dir, old_name.name, is_dir,
+  			      !(flags & RENAME_EXCHANGE) ? target : NULL, old_dentry);
+  		if (flags & RENAME_EXCHANGE) {
+  			fsnotify_move(new_dir, old_dir, old_dentry->d_name.name,
+diff --cc include/linux/dcache.h
+index f0773ba5c120,025727bf6797..000000000000
+--- a/include/linux/dcache.h
++++ b/include/linux/dcache.h
+@@@ -568,4 -557,45 +568,48 @@@ static inline struct dentry *d_backing_
+  	return upper;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * d_real - Return the real dentry
++  * @dentry: the dentry to query
++  * @inode: inode to select the dentry from multiple layers (can be NULL)
++  * @flags: open flags to control copy-up behavior
++  *
++  * If dentry is on a union/overlay, then return the underlying, real dentry.
++  * Otherwise return the dentry itself.
++  *
++  * See also: Documentation/filesystems/vfs.txt
++  */
++ static inline struct dentry *d_real(struct dentry *dentry,
++ 				    const struct inode *inode,
++ 				    unsigned int flags)
++ {
++ 	if (unlikely(dentry->d_flags & DCACHE_OP_REAL))
++ 		return dentry->d_op->d_real(dentry, inode, flags);
++ 	else
++ 		return dentry;
++ }
++ 
++ /**
++  * d_real_inode - Return the real inode
++  * @dentry: The dentry to query
++  *
++  * If dentry is on a union/overlay, then return the underlying, real inode.
++  * Otherwise return d_inode().
++  */
++ static inline struct inode *d_real_inode(const struct dentry *dentry)
++ {
++ 	/* This usage of d_real() results in const dentry */
++ 	return d_backing_inode(d_real((struct dentry *) dentry, NULL, 0));
++ }
++ 
++ struct name_snapshot {
++ 	const char *name;
++ 	char inline_name[DNAME_INLINE_LEN];
++ };
++ void take_dentry_name_snapshot(struct name_snapshot *, struct dentry *);
++ void release_dentry_name_snapshot(struct name_snapshot *);
++ 
+++>>>>>>> 49d31c2f389a (dentry name snapshots)
+  #endif	/* __LINUX_DCACHE_H */
+* Unmerged path fs/dcache.c
+* Unmerged path fs/debugfs/inode.c
+* Unmerged path fs/namei.c
+diff --git a/fs/notify/fsnotify.c b/fs/notify/fsnotify.c
+index 0378955136d1..3e02373820ea 100644
+--- a/fs/notify/fsnotify.c
++++ b/fs/notify/fsnotify.c
+@@ -104,16 +104,20 @@ int __fsnotify_parent(const struct path *path, struct dentry *dentry, __u32 mask
+ 	if (unlikely(!fsnotify_inode_watches_children(p_inode)))
+ 		__fsnotify_update_child_dentry_flags(p_inode);
+ 	else if (p_inode->i_fsnotify_mask & mask) {
++		struct name_snapshot name;
++
+ 		/* we are notifying a parent so come up with the new mask which
+ 		 * specifies these are events which came from a child. */
+ 		mask |= FS_EVENT_ON_CHILD;
+ 
++		take_dentry_name_snapshot(&name, dentry);
+ 		if (path)
+ 			ret = fsnotify(p_inode, mask, path, FSNOTIFY_EVENT_PATH,
+-				       dentry->d_name.name, 0);
++				       name.name, 0);
+ 		else
+ 			ret = fsnotify(p_inode, mask, dentry->d_inode, FSNOTIFY_EVENT_INODE,
+-				       dentry->d_name.name, 0);
++				       name.name, 0);
++		release_dentry_name_snapshot(&name);
+ 	}
+ 
+ 	dput(parent);
+* Unmerged path include/linux/dcache.h
+diff --git a/include/linux/fsnotify.h b/include/linux/fsnotify.h
+index fe48e677497c..87acae2edc5f 100644
+--- a/include/linux/fsnotify.h
++++ b/include/linux/fsnotify.h
+@@ -314,35 +314,4 @@ static inline void fsnotify_change(struct dentry *dentry, unsigned int ia_valid)
+ 	}
+ }
+ 
+-#if defined(CONFIG_FSNOTIFY)	/* notify helpers */
+-
+-/*
+- * fsnotify_oldname_init - save off the old filename before we change it
+- */
+-static inline const unsigned char *fsnotify_oldname_init(const unsigned char *name)
+-{
+-	return kstrdup(name, GFP_KERNEL);
+-}
+-
+-/*
+- * fsnotify_oldname_free - free the name we got from fsnotify_oldname_init
+- */
+-static inline void fsnotify_oldname_free(const unsigned char *old_name)
+-{
+-	kfree(old_name);
+-}
+-
+-#else	/* CONFIG_FSNOTIFY */
+-
+-static inline const char *fsnotify_oldname_init(const unsigned char *name)
+-{
+-	return NULL;
+-}
+-
+-static inline void fsnotify_oldname_free(const unsigned char *old_name)
+-{
+-}
+-
+-#endif	/*  CONFIG_FSNOTIFY */
+-
+ #endif	/* _LINUX_FS_NOTIFY_H */
