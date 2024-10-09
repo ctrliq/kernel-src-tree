@@ -1,0 +1,382 @@
+sunrpc: don't pass on-stack memory to sg_set_buf
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author J. Bruce Fields <bfields@redhat.com>
+commit 2876a34466ce382a76b9ffb34757bb48928ac743
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/2876a344.failed
+
+As of ac4e97abce9b "scatterlist: sg_set_buf() argument must be in linear
+mapping", sg_set_buf hits a BUG when make_checksum_v2->xdr_process_buf,
+among other callers, passes it memory on the stack.
+
+We only need a scatterlist to pass this to the crypto code, and it seems
+like overkill to require kmalloc'd memory just to encrypt a few bytes,
+but for now this seems the best fix.
+
+Many of these callers are in the NFS write paths, so we allocate with
+GFP_NOFS.  It might be possible to do without allocations here entirely,
+but that would probably be a bigger project.
+
+	Cc: Rusty Russell <rusty@rustcorp.com.au>
+	Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+(cherry picked from commit 2876a34466ce382a76b9ffb34757bb48928ac743)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/auth_gss/gss_krb5_crypto.c
+diff --cc net/sunrpc/auth_gss/gss_krb5_crypto.c
+index fee3c15a4b52,90115ceefd49..000000000000
+--- a/net/sunrpc/auth_gss/gss_krb5_crypto.c
++++ b/net/sunrpc/auth_gss/gss_krb5_crypto.c
+@@@ -152,13 -165,13 +152,13 @@@ make_checksum_hmac_md5(struct krb5_ctx 
+  		       struct xdr_buf *body, int body_offset, u8 *cksumkey,
+  		       unsigned int usage, struct xdr_netobj *cksumout)
+  {
+ +	struct hash_desc                desc;
+  	struct scatterlist              sg[1];
+- 	int err;
+- 	u8 checksumdata[GSS_KRB5_MAX_CKSUM_LEN];
++ 	int err = -1;
++ 	u8 *checksumdata;
+  	u8 rc4salt[4];
+ -	struct crypto_ahash *md5;
+ -	struct crypto_ahash *hmac_md5;
+ -	struct ahash_request *req;
+ +	struct crypto_hash *md5;
+ +	struct crypto_hash *hmac_md5;
+  
+  	if (cksumkey == NULL)
+  		return GSS_S_FAILURE;
+@@@ -174,21 -187,26 +174,40 @@@
+  		return GSS_S_FAILURE;
+  	}
+  
+++<<<<<<< HEAD
+ +	md5 = crypto_alloc_hash("md5", 0, CRYPTO_ALG_ASYNC);
+- 	if (IS_ERR(md5))
+++=======
++ 	checksumdata = kmalloc(GSS_KRB5_MAX_CKSUM_LEN, GFP_NOFS);
++ 	if (!checksumdata)
+  		return GSS_S_FAILURE;
+  
++ 	md5 = crypto_alloc_ahash("md5", 0, CRYPTO_ALG_ASYNC);
+++>>>>>>> 2876a34466ce (sunrpc: don't pass on-stack memory to sg_set_buf)
++ 	if (IS_ERR(md5))
++ 		goto out_free_cksum;
++ 
+++<<<<<<< HEAD
+ +	hmac_md5 = crypto_alloc_hash(kctx->gk5e->cksum_name, 0,
+ +				     CRYPTO_ALG_ASYNC);
+ +	if (IS_ERR(hmac_md5)) {
+ +		crypto_free_hash(md5);
+ +		return GSS_S_FAILURE;
+ +	}
+ +
+ +	desc.tfm = md5;
+ +	desc.flags = CRYPTO_TFM_REQ_MAY_SLEEP;
+++=======
++ 	hmac_md5 = crypto_alloc_ahash(kctx->gk5e->cksum_name, 0,
++ 				      CRYPTO_ALG_ASYNC);
++ 	if (IS_ERR(hmac_md5))
++ 		goto out_free_md5;
++ 
++ 	req = ahash_request_alloc(md5, GFP_KERNEL);
++ 	if (!req)
++ 		goto out_free_hmac_md5;
+++>>>>>>> 2876a34466ce (sunrpc: don't pass on-stack memory to sg_set_buf)
+  
+ -	ahash_request_set_callback(req, CRYPTO_TFM_REQ_MAY_SLEEP, NULL, NULL);
+ -
+ -	err = crypto_ahash_init(req);
+ +	err = crypto_hash_init(&desc);
+  	if (err)
+  		goto out;
+  	sg_init_one(sg, rc4salt, 4);
+@@@ -208,13 -229,17 +227,20 @@@
+  	if (err)
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	desc.tfm = hmac_md5;
+ +	desc.flags = CRYPTO_TFM_REQ_MAY_SLEEP;
+++=======
++ 	ahash_request_free(req);
++ 	req = ahash_request_alloc(hmac_md5, GFP_KERNEL);
++ 	if (!req)
++ 		goto out_free_hmac_md5;
+++>>>>>>> 2876a34466ce (sunrpc: don't pass on-stack memory to sg_set_buf)
+  
+ -	ahash_request_set_callback(req, CRYPTO_TFM_REQ_MAY_SLEEP, NULL, NULL);
+ -
+ -	err = crypto_ahash_init(req);
+ +	err = crypto_hash_init(&desc);
+  	if (err)
+  		goto out;
+ -	err = crypto_ahash_setkey(hmac_md5, cksumkey, kctx->gk5e->keylength);
+ +	err = crypto_hash_setkey(hmac_md5, cksumkey, kctx->gk5e->keylength);
+  	if (err)
+  		goto out;
+  
+@@@ -227,8 -253,13 +253,18 @@@
+  	memcpy(cksumout->data, checksumdata, kctx->gk5e->cksumlength);
+  	cksumout->len = kctx->gk5e->cksumlength;
+  out:
+++<<<<<<< HEAD
+ +	crypto_free_hash(md5);
+ +	crypto_free_hash(hmac_md5);
+++=======
++ 	ahash_request_free(req);
++ out_free_hmac_md5:
++ 	crypto_free_ahash(hmac_md5);
++ out_free_md5:
++ 	crypto_free_ahash(md5);
++ out_free_cksum:
++ 	kfree(checksumdata);
+++>>>>>>> 2876a34466ce (sunrpc: don't pass on-stack memory to sg_set_buf)
+  	return err ? GSS_S_FAILURE : 0;
+  }
+  
+@@@ -242,10 -273,11 +278,10 @@@ make_checksum(struct krb5_ctx *kctx, ch
+  	      struct xdr_buf *body, int body_offset, u8 *cksumkey,
+  	      unsigned int usage, struct xdr_netobj *cksumout)
+  {
+ -	struct crypto_ahash *tfm;
+ -	struct ahash_request *req;
+ +	struct hash_desc                desc;
+  	struct scatterlist              sg[1];
+- 	int err;
+- 	u8 checksumdata[GSS_KRB5_MAX_CKSUM_LEN];
++ 	int err = -1;
++ 	u8 *checksumdata;
+  	unsigned int checksumlen;
+  
+  	if (kctx->gk5e->ctype == CKSUMTYPE_HMAC_MD5_ARCFOUR)
+@@@ -259,16 -291,25 +295,35 @@@
+  		return GSS_S_FAILURE;
+  	}
+  
+++<<<<<<< HEAD
+ +	desc.tfm = crypto_alloc_hash(kctx->gk5e->cksum_name, 0, CRYPTO_ALG_ASYNC);
+ +	if (IS_ERR(desc.tfm))
+++=======
++ 	checksumdata = kmalloc(GSS_KRB5_MAX_CKSUM_LEN, GFP_NOFS);
++ 	if (checksumdata == NULL)
+++>>>>>>> 2876a34466ce (sunrpc: don't pass on-stack memory to sg_set_buf)
+  		return GSS_S_FAILURE;
+ +	desc.flags = CRYPTO_TFM_REQ_MAY_SLEEP;
+  
+++<<<<<<< HEAD
+ +	checksumlen = crypto_hash_digestsize(desc.tfm);
+++=======
++ 	tfm = crypto_alloc_ahash(kctx->gk5e->cksum_name, 0, CRYPTO_ALG_ASYNC);
++ 	if (IS_ERR(tfm))
++ 		goto out_free_cksum;
++ 
++ 	req = ahash_request_alloc(tfm, GFP_KERNEL);
++ 	if (!req)
++ 		goto out_free_ahash;
++ 
++ 	ahash_request_set_callback(req, CRYPTO_TFM_REQ_MAY_SLEEP, NULL, NULL);
++ 
++ 	checksumlen = crypto_ahash_digestsize(tfm);
+++>>>>>>> 2876a34466ce (sunrpc: don't pass on-stack memory to sg_set_buf)
+  
+  	if (cksumkey != NULL) {
+ -		err = crypto_ahash_setkey(tfm, cksumkey,
+ -					  kctx->gk5e->keylength);
+ +		err = crypto_hash_setkey(desc.tfm, cksumkey,
+ +					 kctx->gk5e->keylength);
+  		if (err)
+  			goto out;
+  	}
+@@@ -307,7 -350,11 +362,15 @@@
+  	}
+  	cksumout->len = kctx->gk5e->cksumlength;
+  out:
+++<<<<<<< HEAD
+ +	crypto_free_hash(desc.tfm);
+++=======
++ 	ahash_request_free(req);
++ out_free_ahash:
++ 	crypto_free_ahash(tfm);
++ out_free_cksum:
++ 	kfree(checksumdata);
+++>>>>>>> 2876a34466ce (sunrpc: don't pass on-stack memory to sg_set_buf)
+  	return err ? GSS_S_FAILURE : 0;
+  }
+  
+@@@ -323,10 -370,11 +386,10 @@@ make_checksum_v2(struct krb5_ctx *kctx
+  		 struct xdr_buf *body, int body_offset, u8 *cksumkey,
+  		 unsigned int usage, struct xdr_netobj *cksumout)
+  {
+ -	struct crypto_ahash *tfm;
+ -	struct ahash_request *req;
+ +	struct hash_desc desc;
+  	struct scatterlist sg[1];
+- 	int err;
+- 	u8 checksumdata[GSS_KRB5_MAX_CKSUM_LEN];
++ 	int err = -1;
++ 	u8 *checksumdata;
+  	unsigned int checksumlen;
+  
+  	if (kctx->gk5e->keyed_cksum == 0) {
+@@@ -340,14 -388,22 +403,33 @@@
+  		return GSS_S_FAILURE;
+  	}
+  
+++<<<<<<< HEAD
+ +	desc.tfm = crypto_alloc_hash(kctx->gk5e->cksum_name, 0,
+ +							CRYPTO_ALG_ASYNC);
+ +	if (IS_ERR(desc.tfm))
+ +		return GSS_S_FAILURE;
+ +	checksumlen = crypto_hash_digestsize(desc.tfm);
+ +	desc.flags = CRYPTO_TFM_REQ_MAY_SLEEP;
+ +
+ +	err = crypto_hash_setkey(desc.tfm, cksumkey, kctx->gk5e->keylength);
+++=======
++ 	checksumdata = kmalloc(GSS_KRB5_MAX_CKSUM_LEN, GFP_NOFS);
++ 	if (!checksumdata)
++ 		return GSS_S_FAILURE;
++ 
++ 	tfm = crypto_alloc_ahash(kctx->gk5e->cksum_name, 0, CRYPTO_ALG_ASYNC);
++ 	if (IS_ERR(tfm))
++ 		goto out_free_cksum;
++ 	checksumlen = crypto_ahash_digestsize(tfm);
++ 
++ 	req = ahash_request_alloc(tfm, GFP_KERNEL);
++ 	if (!req)
++ 		goto out_free_ahash;
++ 
++ 	ahash_request_set_callback(req, CRYPTO_TFM_REQ_MAY_SLEEP, NULL, NULL);
++ 
++ 	err = crypto_ahash_setkey(tfm, cksumkey, kctx->gk5e->keylength);
+++>>>>>>> 2876a34466ce (sunrpc: don't pass on-stack memory to sg_set_buf)
+  	if (err)
+  		goto out;
+  
+@@@ -381,7 -439,11 +463,15 @@@
+  		break;
+  	}
+  out:
+++<<<<<<< HEAD
+ +	crypto_free_hash(desc.tfm);
+++=======
++ 	ahash_request_free(req);
++ out_free_ahash:
++ 	crypto_free_ahash(tfm);
++ out_free_cksum:
++ 	kfree(checksumdata);
+++>>>>>>> 2876a34466ce (sunrpc: don't pass on-stack memory to sg_set_buf)
+  	return err ? GSS_S_FAILURE : 0;
+  }
+  
+@@@ -599,8 -675,8 +689,13 @@@ gss_krb5_cts_crypt(struct crypto_blkcip
+  {
+  	u32 ret;
+  	struct scatterlist sg[1];
+++<<<<<<< HEAD
+ +	struct blkcipher_desc desc = { .tfm = cipher, .info = iv };
+ +	u8 data[GSS_KRB5_MAX_BLOCKSIZE * 2];
+++=======
++ 	SKCIPHER_REQUEST_ON_STACK(req, cipher);
++ 	u8 *data;
+++>>>>>>> 2876a34466ce (sunrpc: don't pass on-stack memory to sg_set_buf)
+  	struct page **save_pages;
+  	u32 len = buf->len - offset;
+  
+diff --git a/net/sunrpc/auth_gss/auth_gss.c b/net/sunrpc/auth_gss/auth_gss.c
+index b3b6700100eb..160a0fe9e976 100644
+--- a/net/sunrpc/auth_gss/auth_gss.c
++++ b/net/sunrpc/auth_gss/auth_gss.c
+@@ -1614,7 +1614,7 @@ gss_validate(struct rpc_task *task, __be32 *p)
+ {
+ 	struct rpc_cred *cred = task->tk_rqstp->rq_cred;
+ 	struct gss_cl_ctx *ctx = gss_cred_get_ctx(cred);
+-	__be32		seq;
++	__be32		*seq = NULL;
+ 	struct kvec	iov;
+ 	struct xdr_buf	verf_buf;
+ 	struct xdr_netobj mic;
+@@ -1629,9 +1629,12 @@ gss_validate(struct rpc_task *task, __be32 *p)
+ 		goto out_bad;
+ 	if (flav != RPC_AUTH_GSS)
+ 		goto out_bad;
+-	seq = htonl(task->tk_rqstp->rq_seqno);
+-	iov.iov_base = &seq;
+-	iov.iov_len = sizeof(seq);
++	seq = kmalloc(4, GFP_NOFS);
++	if (!seq)
++		goto out_bad;
++	*seq = htonl(task->tk_rqstp->rq_seqno);
++	iov.iov_base = seq;
++	iov.iov_len = 4;
+ 	xdr_buf_from_iov(&iov, &verf_buf);
+ 	mic.data = (u8 *)p;
+ 	mic.len = len;
+@@ -1651,11 +1654,13 @@ gss_validate(struct rpc_task *task, __be32 *p)
+ 	gss_put_ctx(ctx);
+ 	dprintk("RPC: %5u %s: gss_verify_mic succeeded.\n",
+ 			task->tk_pid, __func__);
++	kfree(seq);
+ 	return p + XDR_QUADLEN(len);
+ out_bad:
+ 	gss_put_ctx(ctx);
+ 	dprintk("RPC: %5u %s failed ret %ld.\n", task->tk_pid, __func__,
+ 		PTR_ERR(ret));
++	kfree(seq);
+ 	return ret;
+ }
+ 
+* Unmerged path net/sunrpc/auth_gss/gss_krb5_crypto.c
+diff --git a/net/sunrpc/auth_gss/svcauth_gss.c b/net/sunrpc/auth_gss/svcauth_gss.c
+index b4e7f8f673c4..44979faf03cd 100644
+--- a/net/sunrpc/auth_gss/svcauth_gss.c
++++ b/net/sunrpc/auth_gss/svcauth_gss.c
+@@ -716,30 +716,37 @@ gss_write_null_verf(struct svc_rqst *rqstp)
+ static int
+ gss_write_verf(struct svc_rqst *rqstp, struct gss_ctx *ctx_id, u32 seq)
+ {
+-	__be32			xdr_seq;
++	__be32			*xdr_seq;
+ 	u32			maj_stat;
+ 	struct xdr_buf		verf_data;
+ 	struct xdr_netobj	mic;
+ 	__be32			*p;
+ 	struct kvec		iov;
++	int err = -1;
+ 
+ 	svc_putnl(rqstp->rq_res.head, RPC_AUTH_GSS);
+-	xdr_seq = htonl(seq);
++	xdr_seq = kmalloc(4, GFP_KERNEL);
++	if (!xdr_seq)
++		return -1;
++	*xdr_seq = htonl(seq);
+ 
+-	iov.iov_base = &xdr_seq;
+-	iov.iov_len = sizeof(xdr_seq);
++	iov.iov_base = xdr_seq;
++	iov.iov_len = 4;
+ 	xdr_buf_from_iov(&iov, &verf_data);
+ 	p = rqstp->rq_res.head->iov_base + rqstp->rq_res.head->iov_len;
+ 	mic.data = (u8 *)(p + 1);
+ 	maj_stat = gss_get_mic(ctx_id, &verf_data, &mic);
+ 	if (maj_stat != GSS_S_COMPLETE)
+-		return -1;
++		goto out;
+ 	*p++ = htonl(mic.len);
+ 	memset((u8 *)p + mic.len, 0, round_up_to_quad(mic.len) - mic.len);
+ 	p += XDR_QUADLEN(mic.len);
+ 	if (!xdr_ressize_check(rqstp, p))
+-		return -1;
+-	return 0;
++		goto out;
++	err = 0;
++out:
++	kfree(xdr_seq);
++	return err;
+ }
+ 
+ struct gss_domain {
