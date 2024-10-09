@@ -1,0 +1,255 @@
+vfs: create vfs helper vfs_tmpfile()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Amir Goldstein <amir73il@gmail.com>
+commit af7bd4dc13093bf1477f370722bbab24cf457b91
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/af7bd4dc.failed
+
+Factor out some common vfs bits from do_tmpfile()
+to be used by overlayfs for concurrent copy up.
+
+	Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+	Cc: Al Viro <viro@zeniv.linux.org.uk>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit af7bd4dc13093bf1477f370722bbab24cf457b91)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/namei.c
+diff --cc fs/namei.c
+index 081045d3a2f2,7d87699c3e2e..000000000000
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@@ -3232,125 -3330,114 +3232,178 @@@ finish_open_created
+  	error = may_open(&nd->path, acc_mode, open_flag);
+  	if (error)
+  		goto out;
+ +
+  	BUG_ON(*opened & FILE_OPENED); /* once it's opened, it's opened */
+  	error = vfs_open(&nd->path, file, current_cred());
+ -	if (error)
+ +	if (!error) {
+ +		*opened |= FILE_OPENED;
+ +	} else {
+ +		if (error == -EOPENSTALE)
+ +			goto stale_open;
+  		goto out;
+ -	*opened |= FILE_OPENED;
+ +	}
+  opened:
+  	error = open_check_o_direct(file);
+ -	if (!error)
+ -		error = ima_file_check(file, op->acc_mode, *opened);
+ -	if (!error && will_truncate)
+ +	if (error)
+ +		goto exit_fput;
+ +	error = ima_file_check(file, op->acc_mode);
+ +	if (error)
+ +		goto exit_fput;
+ +
+ +	if (will_truncate) {
+  		error = handle_truncate(file);
+ -out:
+ -	if (unlikely(error) && (*opened & FILE_OPENED))
+ -		fput(file);
+ -	if (unlikely(error > 0)) {
+ -		WARN_ON(1);
+ -		error = -EINVAL;
+ +		if (error)
+ +			goto exit_fput;
+  	}
+ +out:
+  	if (got_write)
+  		mnt_drop_write(nd->path.mnt);
+ +	path_put(&save_parent);
+ +	terminate_walk(nd);
+  	return error;
+ +
+ +exit_dput:
+ +	path_put_conditional(path, nd);
+ +	goto out;
+ +exit_fput:
+ +	fput(file);
+ +	goto out;
+ +
+ +stale_open:
+ +	/* If no saved parent or already retried then can't retry */
+ +	if (!save_parent.dentry || retried)
+ +		goto out;
+ +
+ +	BUG_ON(save_parent.dentry != dir);
+ +	path_put(&nd->path);
+ +	nd->path = save_parent;
+ +	nd->inode = dir->d_inode;
+ +	save_parent.mnt = NULL;
+ +	save_parent.dentry = NULL;
+ +	if (got_write) {
+ +		mnt_drop_write(nd->path.mnt);
+ +		got_write = false;
+ +	}
+ +	retried = true;
+ +	goto retry_lookup;
+  }
+  
+++<<<<<<< HEAD
+ +static int do_tmpfile(int dfd, struct filename *pathname,
+ +		struct nameidata *nd, int flags,
+ +		const struct open_flags *op,
+ +		struct file *file, int *opened)
+ +{
+ +	static const struct qstr name = QSTR_INIT("/", 1);
+ +	struct dentry *dentry, *child;
+ +	struct inode *dir;
+ +	iop_tmpfile_t tmpfile;
+ +	int error = path_lookupat(dfd, pathname->name,
+ +				  flags | LOOKUP_DIRECTORY, nd);
+++=======
++ struct dentry *vfs_tmpfile(struct dentry *dentry, umode_t mode, int open_flag)
++ {
++ 	static const struct qstr name = QSTR_INIT("/", 1);
++ 	struct dentry *child = NULL;
++ 	struct inode *dir = dentry->d_inode;
++ 	struct inode *inode;
++ 	int error;
++ 
++ 	/* we want directory to be writable */
++ 	error = inode_permission(dir, MAY_WRITE | MAY_EXEC);
++ 	if (error)
++ 		goto out_err;
++ 	error = -EOPNOTSUPP;
++ 	if (!dir->i_op->tmpfile)
++ 		goto out_err;
++ 	error = -ENOMEM;
++ 	child = d_alloc(dentry, &name);
++ 	if (unlikely(!child))
++ 		goto out_err;
++ 	error = dir->i_op->tmpfile(dir, child, mode);
++ 	if (error)
++ 		goto out_err;
++ 	error = -ENOENT;
++ 	inode = child->d_inode;
++ 	if (unlikely(!inode))
++ 		goto out_err;
++ 	if (!(open_flag & O_EXCL)) {
++ 		spin_lock(&inode->i_lock);
++ 		inode->i_state |= I_LINKABLE;
++ 		spin_unlock(&inode->i_lock);
++ 	}
++ 	return child;
++ 
++ out_err:
++ 	dput(child);
++ 	return ERR_PTR(error);
++ }
++ EXPORT_SYMBOL(vfs_tmpfile);
++ 
++ static int do_tmpfile(struct nameidata *nd, unsigned flags,
++ 		const struct open_flags *op,
++ 		struct file *file, int *opened)
++ {
++ 	struct dentry *child;
++ 	struct path path;
++ 	int error = path_lookupat(nd, flags | LOOKUP_DIRECTORY, &path);
+++>>>>>>> af7bd4dc1309 (vfs: create vfs helper vfs_tmpfile())
+  	if (unlikely(error))
+  		return error;
+ -	error = mnt_want_write(path.mnt);
+ +	error = mnt_want_write(nd->path.mnt);
+  	if (unlikely(error))
+  		goto out;
+++<<<<<<< HEAD
+ +	/* we want directory to be writable */
+ +	error = inode_permission(nd->inode, MAY_WRITE | MAY_EXEC);
+ +	if (error)
+ +		goto out2;
+ +	dentry = nd->path.dentry;
+ +	dir = dentry->d_inode;
+ +
+ +	tmpfile = get_tmpfile_iop(dir);
+ +
+ +	if (!tmpfile) {
+ +		error = -EOPNOTSUPP;
+ +		goto out2;
+ +	}
+ +	child = d_alloc(dentry, &name);
+ +	if (unlikely(!child)) {
+ +		error = -ENOMEM;
+ +		goto out2;
+ +	}
+ +	nd->flags &= ~LOOKUP_DIRECTORY;
+ +	nd->flags |= op->intent;
+ +	dput(nd->path.dentry);
+ +	nd->path.dentry = child;
+ +	error = tmpfile(dir, nd->path.dentry, op->mode);
+ +	if (error)
+ +		goto out2;
+ +	audit_inode(pathname, nd->path.dentry, 0);
+++=======
++ 	child = vfs_tmpfile(path.dentry, op->mode, op->open_flag);
++ 	error = PTR_ERR(child);
++ 	if (unlikely(IS_ERR(child)))
++ 		goto out2;
++ 	dput(path.dentry);
++ 	path.dentry = child;
++ 	audit_inode(nd->name, child, 0);
+++>>>>>>> af7bd4dc1309 (vfs: create vfs helper vfs_tmpfile())
+  	/* Don't check for other permissions, the inode was just created */
+ -	error = may_open(&path, 0, op->open_flag);
+ +	error = may_open(&nd->path, MAY_OPEN, op->open_flag);
+  	if (error)
+  		goto out2;
+ -	file->f_path.mnt = path.mnt;
+ -	error = finish_open(file, child, NULL, opened);
+ +	file->f_path.mnt = nd->path.mnt;
+ +	error = finish_open(file, nd->path.dentry, NULL, opened);
+  	if (error)
+  		goto out2;
+  	error = open_check_o_direct(file);
+- 	if (error) {
++ 	if (error)
+  		fput(file);
+- 	} else if (!(op->open_flag & O_EXCL)) {
+- 		struct inode *inode = file_inode(file);
+- 		spin_lock(&inode->i_lock);
+- 		inode->i_state |= I_LINKABLE;
+- 		spin_unlock(&inode->i_lock);
+- 	}
+  out2:
+ -	mnt_drop_write(path.mnt);
+ +	mnt_drop_write(nd->path.mnt);
+  out:
+ -	path_put(&path);
+ -	return error;
+ -}
+ -
+ -static int do_o_path(struct nameidata *nd, unsigned flags, struct file *file)
+ -{
+ -	struct path path;
+ -	int error = path_lookupat(nd, flags, &path);
+ -	if (!error) {
+ -		audit_inode(nd->name, path.dentry, 0);
+ -		error = vfs_open(&path, file, current_cred());
+ -		path_put(&path);
+ -	}
+ +	path_put(&nd->path);
+  	return error;
+  }
+  
+* Unmerged path fs/namei.c
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 8faf318cc440..09ccd731b74d 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -1730,6 +1730,9 @@ extern int vfs_unlink(struct inode *, struct dentry *, struct inode **);
+ extern int vfs_rename(struct inode *, struct dentry *, struct inode *, struct dentry *, struct inode **, unsigned int);
+ extern int vfs_whiteout(struct inode *, struct dentry *);
+ 
++extern struct dentry *vfs_tmpfile(struct dentry *dentry, umode_t mode,
++				  int open_flag);
++
+ /*
+  * VFS dentry helper functions.
+  */
