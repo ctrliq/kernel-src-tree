@@ -51,7 +51,6 @@ static u32 dell_wmi_interface_version;
 static bool wmi_requires_smbios_request;
 
 MODULE_ALIAS("wmi:"DELL_EVENT_GUID);
-MODULE_ALIAS("wmi:"DELL_DESCRIPTOR_GUID);
 
 static int __init dmi_matched(const struct dmi_system_id *dmi)
 {
