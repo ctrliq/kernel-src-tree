@@ -1,0 +1,278 @@
+s390/vdso: add vdso support for coarse clocks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.el7
+commit-author Martin Schwidefsky <schwidefsky@de.ibm.com>
+commit b7eacb59cd7fb5e98852186e485c0c865f862645
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.el7/b7eacb59.failed
+
+Add CLOCK_REALTIME_COARSE and CLOCK_MONOTONIC_COARSE optimization to
+the 64-bit and 31-bit vdso.
+
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit b7eacb59cd7fb5e98852186e485c0c865f862645)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kernel/time.c
+#	arch/s390/kernel/vdso32/clock_gettime.S
+diff --cc arch/s390/kernel/time.c
+index acae4315adb1,69e980de0f62..000000000000
+--- a/arch/s390/kernel/time.c
++++ b/arch/s390/kernel/time.c
+@@@ -252,8 -232,21 +252,26 @@@ void update_vsyscall(struct timekeeper 
+  		vdso_data->wtom_clock_nsec -= nsecps;
+  		vdso_data->wtom_clock_sec++;
+  	}
+++<<<<<<< HEAD
+ +	vdso_data->tk_mult = tk->tkr_mono.mult;
+ +	vdso_data->tk_shift = tk->tkr_mono.shift;
+++=======
++ 
++ 	vdso_data->xtime_coarse_sec = tk->xtime_sec;
++ 	vdso_data->xtime_coarse_nsec =
++ 		(long)(tk->tkr.xtime_nsec >> tk->tkr.shift);
++ 	vdso_data->wtom_coarse_sec =
++ 		vdso_data->xtime_coarse_sec + tk->wall_to_monotonic.tv_sec;
++ 	vdso_data->wtom_coarse_nsec =
++ 		vdso_data->xtime_coarse_nsec + tk->wall_to_monotonic.tv_nsec;
++ 	while (vdso_data->wtom_coarse_nsec >= NSEC_PER_SEC) {
++ 		vdso_data->wtom_coarse_nsec -= NSEC_PER_SEC;
++ 		vdso_data->wtom_coarse_sec++;
++ 	}
++ 
++ 	vdso_data->tk_mult = tk->tkr.mult;
++ 	vdso_data->tk_shift = tk->tkr.shift;
+++>>>>>>> b7eacb59cd7f (s390/vdso: add vdso support for coarse clocks)
+  	smp_wmb();
+  	++vdso_data->tb_update_count;
+  }
+diff --cc arch/s390/kernel/vdso32/clock_gettime.S
+index 65fc3979c2f1,48c2206a3956..000000000000
+--- a/arch/s390/kernel/vdso32/clock_gettime.S
++++ b/arch/s390/kernel/vdso32/clock_gettime.S
+@@@ -21,8 -21,12 +21,16 @@@ __kernel_clock_gettime
+  	.cfi_startproc
+  	basr	%r5,0
+  0:	al	%r5,21f-0b(%r5)			/* get &_vdso_data */
++ 	chi	%r2,__CLOCK_REALTIME_COARSE
++ 	je	10f
+  	chi	%r2,__CLOCK_REALTIME
+++<<<<<<< HEAD
+ +	je	10f
+++=======
++ 	je	11f
++ 	chi	%r2,__CLOCK_MONOTONIC_COARSE
++ 	je	9f
+++>>>>>>> b7eacb59cd7f (s390/vdso: add vdso support for coarse clocks)
+  	chi	%r2,__CLOCK_MONOTONIC
+  	jne	19f
+  
+@@@ -67,12 -69,30 +75,32 @@@
+  	j	6b
+  8:	st	%r2,0(%r3)			/* store tp->tv_sec */
+  	st	%r1,4(%r3)			/* store tp->tv_nsec */
+ -	lhi	%r2,0
+ +9:	lhi	%r2,0
+  	br	%r14
+  
++ 	/* CLOCK_MONOTONIC_COARSE */
++ 9:	l	%r4,__VDSO_UPD_COUNT+4(%r5)	/* load update counter */
++ 	tml	%r4,0x0001			/* pending update ? loop */
++ 	jnz	9b
++ 	l	%r2,__VDSO_WTOM_CRS_SEC+4(%r5)
++ 	l	%r1,__VDSO_WTOM_CRS_NSEC+4(%r5)
++ 	cl	%r4,__VDSO_UPD_COUNT+4(%r5)	/* check update counter */
++ 	jne	9b
++ 	j	8b
++ 
++ 	/* CLOCK_REALTIME_COARSE */
++ 10:	l	%r4,__VDSO_UPD_COUNT+4(%r5)	/* load update counter */
++ 	tml	%r4,0x0001			/* pending update ? loop */
++ 	jnz	10b
++ 	l	%r2,__VDSO_XTIME_CRS_SEC+4(%r5)
++ 	l	%r1,__VDSO_XTIME_CRS_NSEC+4(%r5)
++ 	cl	%r4,__VDSO_UPD_COUNT+4(%r5)	/* check update counter */
++ 	jne	10b
++ 	j	17f
++ 
+  	/* CLOCK_REALTIME */
+ +10:	ltr	%r3,%r3				/* tp == NULL */
+ +	jz	18f
+  11:	l	%r4,__VDSO_UPD_COUNT+4(%r5)	/* load update counter */
+  	tml	%r4,0x0001			/* pending update ? loop */
+  	jnz	11b
+diff --git a/arch/s390/include/asm/vdso.h b/arch/s390/include/asm/vdso.h
+index bc9746a7d47c..a62526d09201 100644
+--- a/arch/s390/include/asm/vdso.h
++++ b/arch/s390/include/asm/vdso.h
+@@ -22,13 +22,17 @@ struct vdso_data {
+ 	__u64 xtime_tod_stamp;		/* TOD clock for xtime		0x08 */
+ 	__u64 xtime_clock_sec;		/* Kernel time			0x10 */
+ 	__u64 xtime_clock_nsec;		/*				0x18 */
+-	__u64 wtom_clock_sec;		/* Wall to monotonic clock	0x20 */
+-	__u64 wtom_clock_nsec;		/*				0x28 */
+-	__u32 tz_minuteswest;		/* Minutes west of Greenwich	0x30 */
+-	__u32 tz_dsttime;		/* Type of dst correction	0x34 */
+-	__u32 ectg_available;		/* ECTG instruction present	0x38 */
+-	__u32 tk_mult;			/* Mult. used for xtime_nsec	0x3c */
+-	__u32 tk_shift;			/* Shift used for xtime_nsec	0x40 */
++	__u64 xtime_coarse_sec;		/* Coarse kernel time		0x20 */
++	__u64 xtime_coarse_nsec;	/*				0x28 */
++	__u64 wtom_clock_sec;		/* Wall to monotonic clock	0x30 */
++	__u64 wtom_clock_nsec;		/*				0x38 */
++	__u64 wtom_coarse_sec;		/* Coarse wall to monotonic	0x40 */
++	__u64 wtom_coarse_nsec;		/*				0x48 */
++	__u32 tz_minuteswest;		/* Minutes west of Greenwich	0x50 */
++	__u32 tz_dsttime;		/* Type of dst correction	0x54 */
++	__u32 ectg_available;		/* ECTG instruction present	0x58 */
++	__u32 tk_mult;			/* Mult. used for xtime_nsec	0x5c */
++	__u32 tk_shift;			/* Shift used for xtime_nsec	0x60 */
+ };
+ 
+ struct vdso_per_cpu_data {
+diff --git a/arch/s390/kernel/asm-offsets.c b/arch/s390/kernel/asm-offsets.c
+index 8e7394965c28..20f25303a546 100644
+--- a/arch/s390/kernel/asm-offsets.c
++++ b/arch/s390/kernel/asm-offsets.c
+@@ -60,8 +60,12 @@ int main(void)
+ 	DEFINE(__VDSO_XTIME_STAMP, offsetof(struct vdso_data, xtime_tod_stamp));
+ 	DEFINE(__VDSO_XTIME_SEC, offsetof(struct vdso_data, xtime_clock_sec));
+ 	DEFINE(__VDSO_XTIME_NSEC, offsetof(struct vdso_data, xtime_clock_nsec));
++	DEFINE(__VDSO_XTIME_CRS_SEC, offsetof(struct vdso_data, xtime_coarse_sec));
++	DEFINE(__VDSO_XTIME_CRS_NSEC, offsetof(struct vdso_data, xtime_coarse_nsec));
+ 	DEFINE(__VDSO_WTOM_SEC, offsetof(struct vdso_data, wtom_clock_sec));
+ 	DEFINE(__VDSO_WTOM_NSEC, offsetof(struct vdso_data, wtom_clock_nsec));
++	DEFINE(__VDSO_WTOM_CRS_SEC, offsetof(struct vdso_data, wtom_coarse_sec));
++	DEFINE(__VDSO_WTOM_CRS_NSEC, offsetof(struct vdso_data, wtom_coarse_nsec));
+ 	DEFINE(__VDSO_TIMEZONE, offsetof(struct vdso_data, tz_minuteswest));
+ 	DEFINE(__VDSO_ECTG_OK, offsetof(struct vdso_data, ectg_available));
+ 	DEFINE(__VDSO_TK_MULT, offsetof(struct vdso_data, tk_mult));
+@@ -71,8 +75,11 @@ int main(void)
+ 	/* constants used by the vdso */
+ 	DEFINE(__CLOCK_REALTIME, CLOCK_REALTIME);
+ 	DEFINE(__CLOCK_MONOTONIC, CLOCK_MONOTONIC);
++	DEFINE(__CLOCK_REALTIME_COARSE, CLOCK_REALTIME_COARSE);
++	DEFINE(__CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_COARSE);
+ 	DEFINE(__CLOCK_THREAD_CPUTIME_ID, CLOCK_THREAD_CPUTIME_ID);
+ 	DEFINE(__CLOCK_REALTIME_RES, MONOTONIC_RES_NSEC);
++	DEFINE(__CLOCK_COARSE_RES, LOW_RES_NSEC);
+ 	BLANK();
+ 	/* idle data offsets */
+ 	DEFINE(__CLOCK_IDLE_ENTER, offsetof(struct s390_idle_data, clock_idle_enter));
+* Unmerged path arch/s390/kernel/time.c
+diff --git a/arch/s390/kernel/vdso32/clock_getres.S b/arch/s390/kernel/vdso32/clock_getres.S
+index 36aaa25d05da..eca3f001f081 100644
+--- a/arch/s390/kernel/vdso32/clock_getres.S
++++ b/arch/s390/kernel/vdso32/clock_getres.S
+@@ -19,14 +19,20 @@
+ 	.type  __kernel_clock_getres,@function
+ __kernel_clock_getres:
+ 	.cfi_startproc
++	basr	%r1,0
++	la	%r1,4f-.(%r1)
+ 	chi	%r2,__CLOCK_REALTIME
+ 	je	0f
+ 	chi	%r2,__CLOCK_MONOTONIC
++	je	0f
++	la	%r1,5f-4f(%r1)
++	chi	%r2,__CLOCK_REALTIME_COARSE
++	je	0f
++	chi	%r2,__CLOCK_MONOTONIC_COARSE
+ 	jne	3f
+ 0:	ltr	%r3,%r3
+ 	jz	2f				/* res == NULL */
+-	basr	%r1,0
+-1:	l	%r0,4f-1b(%r1)
++1:	l	%r0,0(%r1)
+ 	xc	0(4,%r3),0(%r3)			/* set tp->tv_sec to zero */
+ 	st	%r0,4(%r3)			/* store tp->tv_usec */
+ 2:	lhi	%r2,0
+@@ -35,5 +41,6 @@ __kernel_clock_getres:
+ 	svc	0
+ 	br	%r14
+ 4:	.long	__CLOCK_REALTIME_RES
++5:	.long	__CLOCK_COARSE_RES
+ 	.cfi_endproc
+ 	.size	__kernel_clock_getres,.-__kernel_clock_getres
+* Unmerged path arch/s390/kernel/vdso32/clock_gettime.S
+diff --git a/arch/s390/kernel/vdso64/clock_getres.S b/arch/s390/kernel/vdso64/clock_getres.S
+index 34deba7c7ed1..c8513deb8c66 100644
+--- a/arch/s390/kernel/vdso64/clock_getres.S
++++ b/arch/s390/kernel/vdso64/clock_getres.S
+@@ -19,6 +19,12 @@
+ 	.type  __kernel_clock_getres,@function
+ __kernel_clock_getres:
+ 	.cfi_startproc
++	larl	%r1,4f
++	cghi	%r2,__CLOCK_REALTIME_COARSE
++	je	0f
++	cghi	%r2,__CLOCK_MONOTONIC_COARSE
++	je	0f
++	larl	%r1,3f
+ 	cghi	%r2,__CLOCK_REALTIME
+ 	je	0f
+ 	cghi	%r2,__CLOCK_MONOTONIC
+@@ -32,7 +38,6 @@ __kernel_clock_getres:
+ 	jz	2f
+ 0:	ltgr	%r3,%r3
+ 	jz	1f				/* res == NULL */
+-	larl	%r1,3f
+ 	lg	%r0,0(%r1)
+ 	xc	0(8,%r3),0(%r3)			/* set tp->tv_sec to zero */
+ 	stg	%r0,8(%r3)			/* store tp->tv_usec */
+@@ -42,5 +47,6 @@ __kernel_clock_getres:
+ 	svc	0
+ 	br	%r14
+ 3:	.quad	__CLOCK_REALTIME_RES
++4:	.quad	__CLOCK_COARSE_RES
+ 	.cfi_endproc
+ 	.size	__kernel_clock_getres,.-__kernel_clock_getres
+diff --git a/arch/s390/kernel/vdso64/clock_gettime.S b/arch/s390/kernel/vdso64/clock_gettime.S
+index f3ed3efb7ef9..b14cf6c6456d 100644
+--- a/arch/s390/kernel/vdso64/clock_gettime.S
++++ b/arch/s390/kernel/vdso64/clock_gettime.S
+@@ -20,10 +20,14 @@
+ __kernel_clock_gettime:
+ 	.cfi_startproc
+ 	larl	%r5,_vdso_data
++	cghi	%r2,__CLOCK_REALTIME_COARSE
++	je	4f
+ 	cghi	%r2,__CLOCK_REALTIME
+ 	je	4f
+ 	cghi	%r2,-3		/* Per-thread CPUCLOCK with PID=0, VIRT=1 */
+ 	je	9f
++	cghi	%r2,__CLOCK_MONOTONIC_COARSE
++	je	3f
+ 	cghi	%r2,__CLOCK_MONOTONIC
+ 	jne	12f
+ 
+@@ -54,6 +58,26 @@ __kernel_clock_gettime:
+ 3:	lghi	%r2,0
+ 	br	%r14
+ 
++	/* CLOCK_MONOTONIC_COARSE */
++3:	lg	%r4,__VDSO_UPD_COUNT(%r5)	/* load update counter */
++	tmll	%r4,0x0001			/* pending update ? loop */
++	jnz	3b
++	lg	%r0,__VDSO_WTOM_CRS_SEC(%r5)
++	lg	%r1,__VDSO_WTOM_CRS_NSEC(%r5)
++	clg	%r4,__VDSO_UPD_COUNT(%r5)	/* check update counter */
++	jne	3b
++	j	2b
++
++	/* CLOCK_REALTIME_COARSE */
++4:	lg	%r4,__VDSO_UPD_COUNT(%r5)	/* load update counter */
++	tmll	%r4,0x0001			/* pending update ? loop */
++	jnz	4b
++	lg	%r0,__VDSO_XTIME_CRS_SEC(%r5)
++	lg	%r1,__VDSO_XTIME_CRS_NSEC(%r5)
++	clg	%r4,__VDSO_UPD_COUNT(%r5)	/* check update counter */
++	jne	4b
++	j	7f
++
+ 	/* CLOCK_REALTIME */
+ 4:	ltr	%r3,%r3				/* tp == NULL */
+ 	jz	8f
