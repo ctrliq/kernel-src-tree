@@ -1,0 +1,127 @@
+cpufreq: intel_pstate: Fix sysfs limits enforcement for performance policy
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [cpufreq] intel_pstate: Fix sysfs limits enforcement for performance policy (Prarit Bhargava) [1465349]
+Rebuild_FUZZ: 93.53%
+commit-author Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+commit 1443ebbacfd7f8d84fbbbf629ef66a12dc8a4b4e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/1443ebba.failed
+
+A side effect of keeping intel_pstate sysfs limits in sync with cpufreq
+is that the now sysfs limits can't enforced under performance policy.
+
+For example, if the max_perf_pct is changed from 100 to 80, this will call
+intel_pstate_set_policy(), which will change the max_perf to 100 again for
+performance policy. Same issue happens, when no_turbo is set.
+
+This change calculates max and min frequency using sysfs performance
+limits in intel_pstate_verify_policy() and adjusts policy limits by
+calling cpufreq_verify_within_limits().
+
+Also, it causes the setting of performance limits to be skipped if
+no_turbo is set.
+
+Fixes: 111b8b3fe4fa (cpufreq: intel_pstate: Always keep all limits settings in sync)
+	Signed-off-by: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 1443ebbacfd7f8d84fbbbf629ef66a12dc8a4b4e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/intel_pstate.c
+diff --cc drivers/cpufreq/intel_pstate.c
+index e5b33d3c3e3c,ed215c5592f6..000000000000
+--- a/drivers/cpufreq/intel_pstate.c
++++ b/drivers/cpufreq/intel_pstate.c
+@@@ -1450,14 -1911,77 +1450,83 @@@ static int intel_pstate_set_policy(stru
+  	/* Make sure min_perf_pct <= max_perf_pct */
+  	limits->min_perf_pct = min(limits->max_perf_pct, limits->min_perf_pct);
+  
+ -	limits->min_perf = div_ext_fp(limits->min_perf_pct, 100);
+ -	limits->max_perf = div_ext_fp(limits->max_perf_pct, 100);
+ -	limits->max_perf = round_up(limits->max_perf, EXT_FRAC_BITS);
+ -	limits->min_perf = round_up(limits->min_perf, EXT_FRAC_BITS);
+ +	limits->min_perf = div_fp(int_tofp(limits->min_perf_pct),
+ +				  int_tofp(100));
+ +	limits->max_perf = div_fp(int_tofp(limits->max_perf_pct),
+ +				  int_tofp(100));
+ +	limits->max_perf = round_up(limits->max_perf, FRAC_BITS);
+  
+++<<<<<<< HEAD
+ +	if (hwp_active)
+ +		intel_pstate_hwp_set(policy->cpus);
+++=======
++ 	pr_debug("cpu:%d max_perf_pct:%d min_perf_pct:%d\n", policy->cpu,
++ 		 limits->max_perf_pct, limits->min_perf_pct);
++ }
++ 
++ static int intel_pstate_set_policy(struct cpufreq_policy *policy)
++ {
++ 	struct cpudata *cpu;
++ 	struct perf_limits *perf_limits = NULL;
++ 
++ 	if (!policy->cpuinfo.max_freq)
++ 		return -ENODEV;
++ 
++ 	pr_debug("set_policy cpuinfo.max %u policy->max %u\n",
++ 		 policy->cpuinfo.max_freq, policy->max);
++ 
++ 	cpu = all_cpu_data[policy->cpu];
++ 	cpu->policy = policy->policy;
++ 
++ 	if (cpu->pstate.max_pstate_physical > cpu->pstate.max_pstate &&
++ 	    policy->max < policy->cpuinfo.max_freq &&
++ 	    policy->max > cpu->pstate.max_pstate * cpu->pstate.scaling) {
++ 		pr_debug("policy->max > max non turbo frequency\n");
++ 		policy->max = policy->cpuinfo.max_freq;
++ 	}
++ 
++ 	if (per_cpu_limits)
++ 		perf_limits = cpu->perf_limits;
++ 
++ 	mutex_lock(&intel_pstate_limits_lock);
++ 
++ 	if (policy->policy == CPUFREQ_POLICY_PERFORMANCE) {
++ 		if (!perf_limits) {
++ 			limits = &performance_limits;
++ 			perf_limits = limits;
++ 		}
++ 		if (policy->max >= policy->cpuinfo.max_freq &&
++ 		    !limits->no_turbo) {
++ 			pr_debug("set performance\n");
++ 			intel_pstate_set_performance_limits(perf_limits);
++ 			goto out;
++ 		}
++ 	} else {
++ 		pr_debug("set powersave\n");
++ 		if (!perf_limits) {
++ 			limits = &powersave_limits;
++ 			perf_limits = limits;
++ 		}
++ 
++ 	}
++ 
++ 	intel_pstate_update_perf_limits(policy, perf_limits);
++  out:
++ 	if (cpu->policy == CPUFREQ_POLICY_PERFORMANCE) {
++ 		/*
++ 		 * NOHZ_FULL CPUs need this as the governor callback may not
++ 		 * be invoked on them.
++ 		 */
++ 		intel_pstate_clear_update_util_hook(policy->cpu);
++ 		intel_pstate_max_within_limits(cpu);
++ 	}
++ 
++ 	intel_pstate_set_update_util_hook(policy->cpu);
++ 
++ 	intel_pstate_hwp_set_policy(policy);
++ 
++ 	mutex_unlock(&intel_pstate_limits_lock);
+++>>>>>>> 1443ebbacfd7 (cpufreq: intel_pstate: Fix sysfs limits enforcement for performance policy)
+  
+  	return 0;
+  }
+* Unmerged path drivers/cpufreq/intel_pstate.c
