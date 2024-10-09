@@ -1,0 +1,450 @@
+blk-mq: don't allocate driver tag upfront for flush rq
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Ming Lei <ming.lei@redhat.com>
+commit 923218f6166a84688973acdc39094f3bee1e9ad4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/923218f6.failed
+
+The idea behind it is simple:
+
+1) for none scheduler, driver tag has to be borrowed for flush rq,
+   otherwise we may run out of tag, and that causes an IO hang. And
+   get/put driver tag is actually noop for none, so reordering tags
+   isn't necessary at all.
+
+2) for a real I/O scheduler, we need not allocate a driver tag upfront
+   for flush rq. It works just fine to follow the same approach as
+   normal requests: allocate driver tag for each rq just before calling
+   ->queue_rq().
+
+One driver visible change is that the driver tag isn't shared in the
+flush request sequence. That won't be a problem, since we always do that
+in legacy path.
+
+Then flush rq need not be treated specially wrt. get/put driver tag.
+This cleans up the code - for instance, reorder_tags_to_front() can be
+removed, and we needn't worry about request ordering in dispatch list
+for avoiding I/O deadlock.
+
+Also we have to put the driver tag before requeueing.
+
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 923218f6166a84688973acdc39094f3bee1e9ad4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-flush.c
+#	block/blk-mq-sched.c
+#	block/blk-mq.c
+diff --cc block/blk-flush.c
+index d39239cb6a4c,f17170675917..000000000000
+--- a/block/blk-flush.c
++++ b/block/blk-flush.c
+@@@ -228,9 -230,14 +228,20 @@@ static void flush_end_io(struct reques
+  
+  		/* release the tag's ownership to the req cloned from */
+  		spin_lock_irqsave(&fq->mq_flush_lock, flags);
+++<<<<<<< HEAD
+ +		hctx = q->mq_ops->map_queue(q, flush_rq->mq_ctx->cpu);
+ +		blk_mq_tag_set_rq(hctx, flush_rq->tag, fq->orig_rq);
+ +		flush_rq->tag = -1;
+++=======
++ 		hctx = blk_mq_map_queue(q, flush_rq->mq_ctx->cpu);
++ 		if (!q->elevator) {
++ 			blk_mq_tag_set_rq(hctx, flush_rq->tag, fq->orig_rq);
++ 			flush_rq->tag = -1;
++ 		} else {
++ 			blk_mq_put_driver_tag_hctx(hctx, flush_rq);
++ 			flush_rq->internal_tag = -1;
++ 		}
+++>>>>>>> 923218f6166a (blk-mq: don't allocate driver tag upfront for flush rq)
+  	}
+  
+  	running = &fq->flush_queue[fq->flush_running_idx];
+@@@ -324,15 -334,19 +338,24 @@@ static bool blk_kick_flush(struct reque
+  		struct blk_mq_hw_ctx *hctx;
+  
+  		flush_rq->mq_ctx = first_rq->mq_ctx;
+- 		flush_rq->tag = first_rq->tag;
+- 		fq->orig_rq = first_rq;
+  
+++<<<<<<< HEAD
+ +		hctx = q->mq_ops->map_queue(q, first_rq->mq_ctx->cpu);
+ +		blk_mq_tag_set_rq(hctx, first_rq->tag, flush_rq);
+++=======
++ 		if (!q->elevator) {
++ 			fq->orig_rq = first_rq;
++ 			flush_rq->tag = first_rq->tag;
++ 			hctx = blk_mq_map_queue(q, first_rq->mq_ctx->cpu);
++ 			blk_mq_tag_set_rq(hctx, first_rq->tag, flush_rq);
++ 		} else {
++ 			flush_rq->internal_tag = first_rq->internal_tag;
++ 		}
+++>>>>>>> 923218f6166a (blk-mq: don't allocate driver tag upfront for flush rq)
+  	}
+  
+ -	flush_rq->cmd_flags = REQ_OP_FLUSH | REQ_PREFLUSH;
+ -	flush_rq->rq_flags |= RQF_FLUSH_SEQ;
+ +	flush_rq->cmd_type = REQ_TYPE_FS;
+ +	flush_rq->cmd_flags = WRITE_FLUSH | REQ_FLUSH_SEQ;
+  	flush_rq->rq_disk = first_rq->rq_disk;
+  	flush_rq->end_io = flush_end_io;
+  
+@@@ -360,8 -404,13 +383,13 @@@ static void mq_flush_data_end_io(struc
+  	unsigned long flags;
+  	struct blk_flush_queue *fq = blk_get_flush_queue(q, ctx);
+  
+ -	hctx = blk_mq_map_queue(q, ctx->cpu);
+ +	hctx = q->mq_ops->map_queue(q, ctx->cpu);
+  
++ 	if (q->elevator) {
++ 		WARN_ON(rq->tag < 0);
++ 		blk_mq_put_driver_tag_hctx(hctx, rq);
++ 	}
++ 
+  	/*
+  	 * After populating an empty queue, kick it to avoid stall.  Read
+  	 * the comment in flush_end_io().
+diff --cc block/blk-mq.c
+index d9bfe0c6bc0e,c501cbd0de93..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -534,7 -653,11 +534,9 @@@ static void __blk_mq_requeue_request(st
+  {
+  	struct request_queue *q = rq->q;
+  
++ 	blk_mq_put_driver_tag(rq);
++ 
+  	trace_block_rq_requeue(q, rq);
+ -	wbt_requeue(q->rq_wb, &rq->issue_stat);
+ -	blk_mq_sched_requeue_request(rq);
+  
+  	if (test_and_clear_bit(REQ_ATOM_STARTED, &rq->atomic_flags)) {
+  		if (q->dma_drain_size && blk_rq_bytes(rq))
+@@@ -825,40 -966,148 +827,129 @@@ static inline unsigned int queued_to_in
+  	return min(BLK_MQ_MAX_DISPATCH_ORDER - 1, ilog2(queued) + 1);
+  }
+  
+ -bool blk_mq_get_driver_tag(struct request *rq, struct blk_mq_hw_ctx **hctx,
+ -			   bool wait)
+ +bool blk_mq_dispatch_rq_list(struct blk_mq_hw_ctx *hctx, struct list_head *list)
+  {
+++<<<<<<< HEAD
+ +	struct request_queue *q = hctx->queue;
+ +	struct request *rq;
+ +	LIST_HEAD(driver_list);
+ +	struct list_head *dptr;
+ +	int errors, queued, ret = BLK_MQ_RQ_QUEUE_OK;
+++=======
++ 	struct blk_mq_alloc_data data = {
++ 		.q = rq->q,
++ 		.hctx = blk_mq_map_queue(rq->q, rq->mq_ctx->cpu),
++ 		.flags = wait ? 0 : BLK_MQ_REQ_NOWAIT,
++ 	};
++ 
++ 	might_sleep_if(wait);
++ 
++ 	if (rq->tag != -1)
++ 		goto done;
++ 
++ 	if (blk_mq_tag_is_reserved(data.hctx->sched_tags, rq->internal_tag))
++ 		data.flags |= BLK_MQ_REQ_RESERVED;
++ 
++ 	rq->tag = blk_mq_get_tag(&data);
++ 	if (rq->tag >= 0) {
++ 		if (blk_mq_tag_busy(data.hctx)) {
++ 			rq->rq_flags |= RQF_MQ_INFLIGHT;
++ 			atomic_inc(&data.hctx->nr_active);
++ 		}
++ 		data.hctx->tags->rqs[rq->tag] = rq;
++ 	}
++ 
++ done:
++ 	if (hctx)
++ 		*hctx = data.hctx;
++ 	return rq->tag != -1;
++ }
++ 
++ static int blk_mq_dispatch_wake(wait_queue_entry_t *wait, unsigned mode, int flags,
++ 				void *key)
++ {
++ 	struct blk_mq_hw_ctx *hctx;
++ 
++ 	hctx = container_of(wait, struct blk_mq_hw_ctx, dispatch_wait);
++ 
++ 	list_del(&wait->entry);
++ 	clear_bit_unlock(BLK_MQ_S_TAG_WAITING, &hctx->state);
++ 	blk_mq_run_hw_queue(hctx, true);
++ 	return 1;
++ }
++ 
++ static bool blk_mq_dispatch_wait_add(struct blk_mq_hw_ctx *hctx)
++ {
++ 	struct sbq_wait_state *ws;
+++>>>>>>> 923218f6166a (blk-mq: don't allocate driver tag upfront for flush rq)
+  
+  	/*
+ -	 * The TAG_WAITING bit serves as a lock protecting hctx->dispatch_wait.
+ -	 * The thread which wins the race to grab this bit adds the hardware
+ -	 * queue to the wait queue.
+ -	 */
+ -	if (test_bit(BLK_MQ_S_TAG_WAITING, &hctx->state) ||
+ -	    test_and_set_bit_lock(BLK_MQ_S_TAG_WAITING, &hctx->state))
+ -		return false;
+ -
+ -	init_waitqueue_func_entry(&hctx->dispatch_wait, blk_mq_dispatch_wake);
+ -	ws = bt_wait_ptr(&hctx->tags->bitmap_tags, hctx);
+ -
+ -	/*
+ -	 * As soon as this returns, it's no longer safe to fiddle with
+ -	 * hctx->dispatch_wait, since a completion can wake up the wait queue
+ -	 * and unlock the bit.
+ +	 * Start off with dptr being NULL, so we start the first request
+ +	 * immediately, even if we have more pending.
+  	 */
+ -	add_wait_queue(&ws->wait, &hctx->dispatch_wait);
+ -	return true;
+ -}
+ -
+ -bool blk_mq_dispatch_rq_list(struct request_queue *q, struct list_head *list,
+ -		bool got_budget)
+ -{
+ -	struct blk_mq_hw_ctx *hctx;
+ -	struct request *rq, *nxt;
+ -	int errors, queued;
+ -
+ -	if (list_empty(list))
+ -		return false;
+ -
+ -	WARN_ON(!list_is_singular(list) && got_budget);
+ +	dptr = NULL;
+  
+  	/*
+  	 * Now process all the entries, sending them to the driver.
+  	 */
+  	errors = queued = 0;
+ -	do {
+ +	while (!list_empty(list)) {
+  		struct blk_mq_queue_data bd;
+ -		blk_status_t ret;
+  
+  		rq = list_first_entry(list, struct request, queuelist);
+++<<<<<<< HEAD
+++=======
++ 		if (!blk_mq_get_driver_tag(rq, &hctx, false)) {
++ 			/*
++ 			 * The initial allocation attempt failed, so we need to
++ 			 * rerun the hardware queue when a tag is freed.
++ 			 */
++ 			if (!blk_mq_dispatch_wait_add(hctx)) {
++ 				if (got_budget)
++ 					blk_mq_put_dispatch_budget(hctx);
++ 				break;
++ 			}
++ 
++ 			/*
++ 			 * It's possible that a tag was freed in the window
++ 			 * between the allocation failure and adding the
++ 			 * hardware queue to the wait queue.
++ 			 */
++ 			if (!blk_mq_get_driver_tag(rq, &hctx, false)) {
++ 				if (got_budget)
++ 					blk_mq_put_dispatch_budget(hctx);
++ 				break;
++ 			}
++ 		}
++ 
++ 		if (!got_budget && !blk_mq_get_dispatch_budget(hctx))
++ 			break;
++ 
+++>>>>>>> 923218f6166a (blk-mq: don't allocate driver tag upfront for flush rq)
+  		list_del_init(&rq->queuelist);
+  
+  		bd.rq = rq;
+ -
+ -		/*
+ -		 * Flag last if we have no more requests, or if we have more
+ -		 * but can't assign a driver tag to it.
+ -		 */
+ -		if (list_empty(list))
+ -			bd.last = true;
+ -		else {
+ -			nxt = list_first_entry(list, struct request, queuelist);
+ -			bd.last = !blk_mq_get_driver_tag(nxt, NULL, false);
+ -		}
+ +		bd.list = dptr;
+ +		bd.last = list_empty(list);
+  
+  		ret = q->mq_ops->queue_rq(hctx, &bd);
+++<<<<<<< HEAD
+ +		switch (ret) {
+ +		case BLK_MQ_RQ_QUEUE_OK:
+ +			queued++;
+ +			break;
+ +		case BLK_MQ_RQ_QUEUE_BUSY:
+++=======
++ 		if (ret == BLK_STS_RESOURCE) {
++ 			/*
++ 			 * If an I/O scheduler has been configured and we got a
++ 			 * driver tag for the next request already, free it again.
++ 			 */
++ 			if (!list_empty(list)) {
++ 				nxt = list_first_entry(list, struct request, queuelist);
++ 				blk_mq_put_driver_tag(nxt);
++ 			}
+++>>>>>>> 923218f6166a (blk-mq: don't allocate driver tag upfront for flush rq)
+  			list_add(&rq->queuelist, list);
+  			__blk_mq_requeue_request(rq);
+  			break;
+@@@ -1409,120 -1647,39 +1500,127 @@@ static void blk_mq_make_request(struct 
+  
+  	if (!is_flush_fua && !blk_queue_nomerges(q) &&
+  	    blk_attempt_plug_merge(q, bio, &request_count, &same_queue_rq))
+ -		return BLK_QC_T_NONE;
+ +		return;
+  
+ -	if (blk_mq_sched_bio_merge(q, bio))
+ -		return BLK_QC_T_NONE;
+ +	rq = blk_mq_map_request(q, bio, &data);
+ +	if (unlikely(!rq))
+ +		return;
+  
+ -	wb_acct = wbt_wait(q->rq_wb, bio, NULL);
+ +	if (unlikely(is_flush_fua)) {
+ +		blk_mq_bio_to_request(rq, bio);
+ +		blk_insert_flush(rq);
+ +		goto run_queue;
+ +	}
+  
+ -	trace_block_getrq(q, bio, bio->bi_opf);
+ +	plug = current->plug;
+ +	/*
+ +	 * If the driver supports defer issued based on 'last', then
+ +	 * queue it up like normal since we can potentially save some
+ +	 * CPU this way.
+ +	 */
+ +	if (((plug && !blk_queue_nomerges(q)) || is_sync) &&
+ +	    !(data.hctx->flags & BLK_MQ_F_DEFER_ISSUE)) {
+ +		struct request *old_rq = NULL;
+  
+ -	rq = blk_mq_get_request(q, bio, bio->bi_opf, &data);
+ -	if (unlikely(!rq)) {
+ -		__wbt_done(q->rq_wb, wb_acct);
+ -		if (bio->bi_opf & REQ_NOWAIT)
+ -			bio_wouldblock_error(bio);
+ -		return BLK_QC_T_NONE;
+ +		blk_mq_bio_to_request(rq, bio);
+ +
+++<<<<<<< HEAD
+ +		/*
+ +		 * We do limited plugging. If the bio can be merged, do that.
+ +		 * Otherwise the existing request in the plug list will be
+ +		 * issued. So the plug list will have one request at most
+ +		 */
+ +		if (plug) {
+ +			/*
+ +			 * The plug list might get flushed before this. If that
+ +			 * happens, same_queue_rq is invalid and plug list is
+ +			 * empty
+ +			 */
+ +			if (same_queue_rq && !list_empty(&plug->mq_list)) {
+ +				old_rq = same_queue_rq;
+ +				list_del_init(&old_rq->queuelist);
+ +			}
+ +			list_add_tail(&rq->queuelist, &plug->mq_list);
+ +		} else /* is_sync */
+ +			old_rq = rq;
+ +		blk_mq_put_ctx(data.ctx);
+ +		if (!old_rq)
+ +			return;
+ +
+ +		if (!(data.hctx->flags & BLK_MQ_F_BLOCKING)) {
+ +			rcu_read_lock();
+ +			blk_mq_try_issue_directly(old_rq);
+ +			rcu_read_unlock();
+ +		} else {
+ +			srcu_idx = srcu_read_lock(&data.hctx->queue_rq_srcu);
+ +			blk_mq_try_issue_directly(old_rq);
+ +			srcu_read_unlock(&data.hctx->queue_rq_srcu, srcu_idx);
+ +		}
+ +		return;
+  	}
+  
+ -	wbt_track(&rq->issue_stat, wb_acct);
+ +	if (!blk_mq_merge_queue_io(data.hctx, data.ctx, rq, bio)) {
+ +		/*
+ +		 * For a SYNC request, send it to the hardware immediately. For
+ +		 * an ASYNC request, just ensure that we run it later on. The
+ +		 * latter allows for merging opportunities and more efficient
+ +		 * dispatching.
+ +		 */
+ +run_queue:
+ +		blk_mq_run_hw_queue(data.hctx, !is_sync || is_flush_fua);
+ +	}
+ +	blk_mq_put_ctx(data.ctx);
+ +}
+ +
+ +/*
+ + * Single hardware queue variant. This will attempt to use any per-process
+ + * plug for merging and IO deferral.
+ + */
+ +static void blk_sq_make_request(struct request_queue *q, struct bio *bio)
+ +{
+ +	const int is_sync = rw_is_sync(bio->bi_rw);
+ +	const int is_flush_fua = bio->bi_rw & (REQ_FLUSH | REQ_FUA);
+ +	struct blk_plug *plug;
+ +	unsigned int request_count = 0;
+ +	struct blk_map_ctx data;
+ +	struct request *rq;
+  
+ -	cookie = request_to_qc_t(data.hctx, rq);
+ +	blk_queue_bounce(q, &bio);
+ +
+ +	if (bio_integrity_enabled(bio) && bio_integrity_prep(bio)) {
+ +		bio_endio(bio, -EIO);
+ +		return;
+ +	}
+ +
+ +	if (!is_flush_fua && !blk_queue_nomerges(q) &&
+ +	    blk_attempt_plug_merge(q, bio, &request_count, NULL))
+ +		return;
+ +
+ +	rq = blk_mq_map_request(q, bio, &data);
+ +	if (unlikely(!rq))
+ +		return;
+  
+ -	plug = current->plug;
+  	if (unlikely(is_flush_fua)) {
+ -		blk_mq_put_ctx(data.ctx);
+  		blk_mq_bio_to_request(rq, bio);
+ +		blk_insert_flush(rq);
+ +		goto run_queue;
+ +	}
+  
+ +	/*
+ +	 * A task plug currently exists. Since this is completely lockless,
+ +	 * utilize that to temporarily store requests until the task is
+ +	 * either done or scheduled away.
+ +	 */
+ +	plug = current->plug;
+ +	if (plug) {
+++=======
++ 		/* bypass scheduler for flush rq */
++ 		blk_insert_flush(rq);
++ 		blk_mq_run_hw_queue(data.hctx, true);
++ 	} else if (plug && q->nr_hw_queues == 1) {
+++>>>>>>> 923218f6166a (blk-mq: don't allocate driver tag upfront for flush rq)
+  		struct request *last = NULL;
+  
+ -		blk_mq_put_ctx(data.ctx);
+  		blk_mq_bio_to_request(rq, bio);
+  
+  		/*
+* Unmerged path block/blk-mq-sched.c
+* Unmerged path block/blk-flush.c
+* Unmerged path block/blk-mq-sched.c
+* Unmerged path block/blk-mq.c
