@@ -1,0 +1,1151 @@
+IB/hfi1: Prepare resource waits for dual leg
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Dennis Dalessandro <dennis.dalessandro@intel.com>
+commit 5da0fc9dbf891a9c9e01a634f2126b5952afb3a6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/5da0fc9d.failed
+
+Current implementation allows each qp to have only one send engine.  As
+such, each qp has only one list to queue prebuilt packets when send engine
+resources are not available. To improve performance, it is desired to
+support multiple send engines for each qp.
+
+This patch creates the framework to support two send engines
+(two legs) for each qp for the TID RDMA protocol, which can be easily
+extended to support more send engines. It achieves the goal by creating a
+leg specific struct, iowait_work in the iowait struct, to hold the
+work_struct and the tx_list as well as a pointer to the parent iowait
+struct.
+
+The hfi1_pkt_state now has an additional field to record the current legs
+work structure and that is now passed to all egress waiters to determine
+the leg that needs to wait via a new iowait helper.  The APIs are adjusted
+to use the new leg specific struct as required.
+
+Many new and modified helpers are added to support this change.
+
+	Reviewed-by: Mitko Haralanov <mitko.haralanov@intel.com>
+	Signed-off-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Signed-off-by: Kaike Wan <kaike.wan@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 5da0fc9dbf891a9c9e01a634f2126b5952afb3a6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hfi1/Makefile
+#	drivers/infiniband/hw/hfi1/sdma.c
+diff --cc drivers/infiniband/hw/hfi1/Makefile
+index 66d538c033b0,ff790390c91a..000000000000
+--- a/drivers/infiniband/hw/hfi1/Makefile
++++ b/drivers/infiniband/hw/hfi1/Makefile
+@@@ -7,13 -8,51 +7,61 @@@
+  #
+  obj-$(CONFIG_INFINIBAND_HFI1) += hfi1.o
+  
+++<<<<<<< HEAD
+ +hfi1-y := affinity.o chip.o device.o driver.o efivar.o \
+ +	eprom.o exp_rcv.o file_ops.o firmware.o \
+ +	init.o intr.o mad.o mmu_rb.o pcie.o pio.o pio_copy.o platform.o \
+ +	qp.o qsfp.o rc.o ruc.o sdma.o sysfs.o trace.o \
+ +	uc.o ud.o user_exp_rcv.o user_pages.o user_sdma.o verbs.o \
+ +	verbs_txreq.o vnic_main.o vnic_sdma.o
+ +hfi1-$(CONFIG_DEBUG_FS) += debugfs.o
+++=======
++ hfi1-y := \
++ 	affinity.o \
++ 	chip.o \
++ 	device.o \
++ 	driver.o \
++ 	efivar.o \
++ 	eprom.o \
++ 	exp_rcv.o \
++ 	file_ops.o \
++ 	firmware.o \
++ 	init.o \
++ 	intr.o \
++ 	iowait.o \
++ 	mad.o \
++ 	mmu_rb.o \
++ 	msix.o \
++ 	pcie.o \
++ 	pio.o \
++ 	pio_copy.o \
++ 	platform.o \
++ 	qp.o \
++ 	qsfp.o \
++ 	rc.o \
++ 	ruc.o \
++ 	sdma.o \
++ 	sysfs.o \
++ 	trace.o \
++ 	uc.o \
++ 	ud.o \
++ 	user_exp_rcv.o \
++ 	user_pages.o \
++ 	user_sdma.o \
++ 	verbs.o \
++ 	verbs_txreq.o \
++ 	vnic_main.o \
++ 	vnic_sdma.o
++ 
++ ifdef CONFIG_DEBUG_FS
++ hfi1-y += debugfs.o
++ ifdef CONFIG_FAULT_INJECTION
++ ifdef CONFIG_FAULT_INJECTION_DEBUG_FS
++ hfi1-y += fault.o
++ endif
++ endif
++ endif
+++>>>>>>> 5da0fc9dbf89 (IB/hfi1: Prepare resource waits for dual leg)
+  
+  CFLAGS_trace.o = -I$(src)
+  ifdef MVERSION
+diff --cc drivers/infiniband/hw/hfi1/sdma.c
+index 7bbb70964ebc,891d2386d1ca..000000000000
+--- a/drivers/infiniband/hw/hfi1/sdma.c
++++ b/drivers/infiniband/hw/hfi1/sdma.c
+@@@ -2447,9 -2432,9 +2437,9 @@@ nodesc
+  /**
+   * sdma_send_txlist() - submit a list of tx req to ring
+   * @sde: sdma engine to use
+-  * @wait: wait structure to use when full (may be NULL)
++  * @wait: SE wait structure to use when full (may be NULL)
+   * @tx_list: list of sdma_txreqs to submit
+ - * @count: pointer to a u16 which, after return will contain the total number of
+ + * @count: pointer to a u32 which, after return will contain the total number of
+   *         sdma_txreqs removed from the tx_list. This will include sdma_txreqs
+   *         whose SDMA descriptors are submitted to the ring and the sdma_txreqs
+   *         which are added to SDMA engine flush list if the SDMA engine state is
+@@@ -2472,8 -2457,8 +2462,13 @@@
+   * -EINVAL - sdma_txreq incomplete, -EBUSY - no space in ring (wait == NULL)
+   * -EIOCBQUEUED - tx queued to iowait, -ECOMM bad sdma state
+   */
+++<<<<<<< HEAD
+ +int sdma_send_txlist(struct sdma_engine *sde, struct iowait *wait,
+ +		     struct list_head *tx_list, u32 *count_out)
+++=======
++ int sdma_send_txlist(struct sdma_engine *sde, struct iowait_work *wait,
++ 		     struct list_head *tx_list, u16 *count_out)
+++>>>>>>> 5da0fc9dbf89 (IB/hfi1: Prepare resource waits for dual leg)
+  {
+  	struct sdma_txreq *tx, *tx_next;
+  	int ret = 0;
+* Unmerged path drivers/infiniband/hw/hfi1/Makefile
+diff --git a/drivers/infiniband/hw/hfi1/iowait.c b/drivers/infiniband/hw/hfi1/iowait.c
+new file mode 100644
+index 000000000000..59dc955f1880
+--- /dev/null
++++ b/drivers/infiniband/hw/hfi1/iowait.c
+@@ -0,0 +1,91 @@
++// SPDX-License-Identifier: (GPL-2.0 OR BSD-3-Clause)
++/*
++ * Copyright(c) 2018 Intel Corporation.
++ *
++ */
++#include "iowait.h"
++
++void iowait_set_flag(struct iowait *wait, u32 flag)
++{
++	set_bit(flag, &wait->flags);
++}
++
++bool iowait_flag_set(struct iowait *wait, u32 flag)
++{
++	return test_bit(flag, &wait->flags);
++}
++
++inline void iowait_clear_flag(struct iowait *wait, u32 flag)
++{
++	clear_bit(flag, &wait->flags);
++}
++
++/**
++ * iowait_init() - initialize wait structure
++ * @wait: wait struct to initialize
++ * @tx_limit: limit for overflow queuing
++ * @func: restart function for workqueue
++ * @sleep: sleep function for no space
++ * @resume: wakeup function for no space
++ *
++ * This function initializes the iowait
++ * structure embedded in the QP or PQ.
++ *
++ */
++void iowait_init(struct iowait *wait, u32 tx_limit,
++		 void (*func)(struct work_struct *work),
++		 void (*tidfunc)(struct work_struct *work),
++		 int (*sleep)(struct sdma_engine *sde,
++			      struct iowait_work *wait,
++			      struct sdma_txreq *tx,
++			      uint seq,
++			      bool pkts_sent),
++		 void (*wakeup)(struct iowait *wait, int reason),
++		 void (*sdma_drained)(struct iowait *wait))
++{
++	int i;
++
++	wait->count = 0;
++	INIT_LIST_HEAD(&wait->list);
++	init_waitqueue_head(&wait->wait_dma);
++	init_waitqueue_head(&wait->wait_pio);
++	atomic_set(&wait->sdma_busy, 0);
++	atomic_set(&wait->pio_busy, 0);
++	wait->tx_limit = tx_limit;
++	wait->sleep = sleep;
++	wait->wakeup = wakeup;
++	wait->sdma_drained = sdma_drained;
++	wait->flags = 0;
++	for (i = 0; i < IOWAIT_SES; i++) {
++		wait->wait[i].iow = wait;
++		INIT_LIST_HEAD(&wait->wait[i].tx_head);
++		if (i == IOWAIT_IB_SE)
++			INIT_WORK(&wait->wait[i].iowork, func);
++		else
++			INIT_WORK(&wait->wait[i].iowork, tidfunc);
++	}
++}
++
++/**
++ * iowait_cancel_work - cancel all work in iowait
++ * @w: the iowait struct
++ */
++void iowait_cancel_work(struct iowait *w)
++{
++	cancel_work_sync(&iowait_get_ib_work(w)->iowork);
++	cancel_work_sync(&iowait_get_tid_work(w)->iowork);
++}
++
++/**
++ * iowait_set_work_flag - set work flag based on leg
++ * @w - the iowait work struct
++ */
++int iowait_set_work_flag(struct iowait_work *w)
++{
++	if (w == &w->iow->wait[IOWAIT_IB_SE]) {
++		iowait_set_flag(w->iow, IOWAIT_PENDING_IB);
++		return IOWAIT_IB_SE;
++	}
++	iowait_set_flag(w->iow, IOWAIT_PENDING_TID);
++	return IOWAIT_TID_SE;
++}
+diff --git a/drivers/infiniband/hw/hfi1/iowait.h b/drivers/infiniband/hw/hfi1/iowait.h
+index 15c67d2d883d..d3cfba5a3af3 100644
+--- a/drivers/infiniband/hw/hfi1/iowait.h
++++ b/drivers/infiniband/hw/hfi1/iowait.h
+@@ -1,7 +1,7 @@
+ #ifndef _HFI1_IOWAIT_H
+ #define _HFI1_IOWAIT_H
+ /*
+- * Copyright(c) 2015, 2016 Intel Corporation.
++ * Copyright(c) 2015 - 2018 Intel Corporation.
+  *
+  * This file is provided under a dual BSD/GPLv2 license.  When using or
+  * redistributing this file, you may do so under either license.
+@@ -49,6 +49,7 @@
+ 
+ #include <linux/list.h>
+ #include <linux/workqueue.h>
++#include <linux/wait.h>
+ #include <linux/sched.h>
+ 
+ #include "sdma_txreq.h"
+@@ -59,16 +60,47 @@
+  */
+ typedef void (*restart_t)(struct work_struct *work);
+ 
++#define IOWAIT_PENDING_IB  0x0
++#define IOWAIT_PENDING_TID 0x1
++
++/*
++ * A QP can have multiple Send Engines (SEs).
++ *
++ * The current use case is for supporting a TID RDMA
++ * packet build/xmit mechanism independent from verbs.
++ */
++#define IOWAIT_SES 2
++#define IOWAIT_IB_SE 0
++#define IOWAIT_TID_SE 1
++
+ struct sdma_txreq;
+ struct sdma_engine;
+ /**
+- * struct iowait - linkage for delayed progress/waiting
++ * @iowork: the work struct
++ * @tx_head: list of prebuilt packets
++ * @iow: the parent iowait structure
++ *
++ * This structure is the work item (process) specific
++ * details associated with the each of the two SEs of the
++ * QP.
++ *
++ * The workstruct and the queued TXs are unique to each
++ * SE.
++ */
++struct iowait;
++struct iowait_work {
++	struct work_struct iowork;
++	struct list_head tx_head;
++	struct iowait *iow;
++};
++
++/**
+  * @list: used to add/insert into QP/PQ wait lists
+- * @lock: uses to record the list head lock
+  * @tx_head: overflow list of sdma_txreq's
+  * @sleep: no space callback
+  * @wakeup: space callback wakeup
+  * @sdma_drained: sdma count drained
++ * @lock: lock protected head of wait queue
+  * @iowork: workqueue overhead
+  * @wait_dma: wait for sdma_busy == 0
+  * @wait_pio: wait for pio_busy == 0
+@@ -76,6 +108,8 @@ struct sdma_engine;
+  * @count: total number of descriptors in tx_head'ed list
+  * @tx_limit: limit for overflow queuing
+  * @tx_count: number of tx entry's in tx_head'ed list
++ * @flags: wait flags (one per QP)
++ * @wait: SE array
+  *
+  * This is to be embedded in user's state structure
+  * (QP or PQ).
+@@ -98,13 +132,11 @@ struct sdma_engine;
+  * Waiters explicity know that, but the destroy
+  * code that unwaits QPs does not.
+  */
+-
+ struct iowait {
+ 	struct list_head list;
+-	struct list_head tx_head;
+ 	int (*sleep)(
+ 		struct sdma_engine *sde,
+-		struct iowait *wait,
++		struct iowait_work *wait,
+ 		struct sdma_txreq *tx,
+ 		uint seq,
+ 		bool pkts_sent
+@@ -112,7 +144,6 @@ struct iowait {
+ 	void (*wakeup)(struct iowait *wait, int reason);
+ 	void (*sdma_drained)(struct iowait *wait);
+ 	seqlock_t *lock;
+-	struct work_struct iowork;
+ 	wait_queue_head_t wait_dma;
+ 	wait_queue_head_t wait_pio;
+ 	atomic_t sdma_busy;
+@@ -121,63 +152,37 @@ struct iowait {
+ 	u32 tx_limit;
+ 	u32 tx_count;
+ 	u8 starved_cnt;
++	unsigned long flags;
++	struct iowait_work wait[IOWAIT_SES];
+ };
+ 
+ #define SDMA_AVAIL_REASON 0
+ 
+-/**
+- * iowait_init() - initialize wait structure
+- * @wait: wait struct to initialize
+- * @tx_limit: limit for overflow queuing
+- * @func: restart function for workqueue
+- * @sleep: sleep function for no space
+- * @resume: wakeup function for no space
+- *
+- * This function initializes the iowait
+- * structure embedded in the QP or PQ.
+- *
+- */
++void iowait_set_flag(struct iowait *wait, u32 flag);
++bool iowait_flag_set(struct iowait *wait, u32 flag);
++void iowait_clear_flag(struct iowait *wait, u32 flag);
+ 
+-static inline void iowait_init(
+-	struct iowait *wait,
+-	u32 tx_limit,
+-	void (*func)(struct work_struct *work),
+-	int (*sleep)(
+-		struct sdma_engine *sde,
+-		struct iowait *wait,
+-		struct sdma_txreq *tx,
+-		uint seq,
+-		bool pkts_sent),
+-	void (*wakeup)(struct iowait *wait, int reason),
+-	void (*sdma_drained)(struct iowait *wait))
+-{
+-	wait->count = 0;
+-	wait->lock = NULL;
+-	INIT_LIST_HEAD(&wait->list);
+-	INIT_LIST_HEAD(&wait->tx_head);
+-	INIT_WORK(&wait->iowork, func);
+-	init_waitqueue_head(&wait->wait_dma);
+-	init_waitqueue_head(&wait->wait_pio);
+-	atomic_set(&wait->sdma_busy, 0);
+-	atomic_set(&wait->pio_busy, 0);
+-	wait->tx_limit = tx_limit;
+-	wait->sleep = sleep;
+-	wait->wakeup = wakeup;
+-	wait->sdma_drained = sdma_drained;
+-}
++void iowait_init(struct iowait *wait, u32 tx_limit,
++		 void (*func)(struct work_struct *work),
++		 void (*tidfunc)(struct work_struct *work),
++		 int (*sleep)(struct sdma_engine *sde,
++			      struct iowait_work *wait,
++			      struct sdma_txreq *tx,
++			      uint seq,
++			      bool pkts_sent),
++		 void (*wakeup)(struct iowait *wait, int reason),
++		 void (*sdma_drained)(struct iowait *wait));
+ 
+ /**
+- * iowait_schedule() - initialize wait structure
++ * iowait_schedule() - schedule the default send engine work
+  * @wait: wait struct to schedule
+  * @wq: workqueue for schedule
+  * @cpu: cpu
+  */
+-static inline void iowait_schedule(
+-	struct iowait *wait,
+-	struct workqueue_struct *wq,
+-	int cpu)
++static inline bool iowait_schedule(struct iowait *wait,
++				   struct workqueue_struct *wq, int cpu)
+ {
+-	queue_work_on(cpu, wq, &wait->iowork);
++	return !!queue_work_on(cpu, wq, &wait->wait[IOWAIT_IB_SE].iowork);
+ }
+ 
+ /**
+@@ -228,6 +233,8 @@ static inline void iowait_sdma_add(struct iowait *wait, int count)
+  */
+ static inline int iowait_sdma_dec(struct iowait *wait)
+ {
++	if (!wait)
++		return 0;
+ 	return atomic_dec_and_test(&wait->sdma_busy);
+ }
+ 
+@@ -267,11 +274,13 @@ static inline void iowait_pio_inc(struct iowait *wait)
+ }
+ 
+ /**
+- * iowait_sdma_dec - note pio complete
++ * iowait_pio_dec - note pio complete
+  * @wait: iowait structure
+  */
+ static inline int iowait_pio_dec(struct iowait *wait)
+ {
++	if (!wait)
++		return 0;
+ 	return atomic_dec_and_test(&wait->pio_busy);
+ }
+ 
+@@ -293,9 +302,9 @@ static inline void iowait_drain_wakeup(struct iowait *wait)
+ /**
+  * iowait_get_txhead() - get packet off of iowait list
+  *
+- * @wait wait struture
++ * @wait iowait_work struture
+  */
+-static inline struct sdma_txreq *iowait_get_txhead(struct iowait *wait)
++static inline struct sdma_txreq *iowait_get_txhead(struct iowait_work *wait)
+ {
+ 	struct sdma_txreq *tx = NULL;
+ 
+@@ -309,6 +318,28 @@ static inline struct sdma_txreq *iowait_get_txhead(struct iowait *wait)
+ 	return tx;
+ }
+ 
++static inline u16 iowait_get_desc(struct iowait_work *w)
++{
++	u16 num_desc = 0;
++	struct sdma_txreq *tx = NULL;
++
++	if (!list_empty(&w->tx_head)) {
++		tx = list_first_entry(&w->tx_head, struct sdma_txreq,
++				      list);
++		num_desc = tx->num_desc;
++	}
++	return num_desc;
++}
++
++static inline u32 iowait_get_all_desc(struct iowait *w)
++{
++	u32 num_desc = 0;
++
++	num_desc = iowait_get_desc(&w->wait[IOWAIT_IB_SE]);
++	num_desc += iowait_get_desc(&w->wait[IOWAIT_TID_SE]);
++	return num_desc;
++}
++
+ /**
+  * iowait_queue - Put the iowait on a wait queue
+  * @pkts_sent: have some packets been sent before queuing?
+@@ -373,12 +404,57 @@ static inline void iowait_starve_find_max(struct iowait *w, u8 *max,
+ }
+ 
+ /**
+- * iowait_packet_queued() - determine if a packet is already built
+- * @wait: the wait structure
++ * iowait_packet_queued() - determine if a packet is queued
++ * @wait: the iowait_work structure
+  */
+-static inline bool iowait_packet_queued(struct iowait *wait)
++static inline bool iowait_packet_queued(struct iowait_work *wait)
+ {
+ 	return !list_empty(&wait->tx_head);
+ }
+ 
++/**
++ * inc_wait_count - increment wait counts
++ * @w: the log work struct
++ * @n: the count
++ */
++static inline void iowait_inc_wait_count(struct iowait_work *w, u16 n)
++{
++	if (!w)
++		return;
++	w->iow->tx_count++;
++	w->iow->count += n;
++}
++
++/**
++ * iowait_get_tid_work - return iowait_work for tid SE
++ * @w: the iowait struct
++ */
++static inline struct iowait_work *iowait_get_tid_work(struct iowait *w)
++{
++	return &w->wait[IOWAIT_TID_SE];
++}
++
++/**
++ * iowait_get_ib_work - return iowait_work for ib SE
++ * @w: the iowait struct
++ */
++static inline struct iowait_work *iowait_get_ib_work(struct iowait *w)
++{
++	return &w->wait[IOWAIT_IB_SE];
++}
++
++/**
++ * iowait_ioww_to_iow - return iowait given iowait_work
++ * @w: the iowait_work struct
++ */
++static inline struct iowait *iowait_ioww_to_iow(struct iowait_work *w)
++{
++	if (likely(w))
++		return w->iow;
++	return NULL;
++}
++
++void iowait_cancel_work(struct iowait *w);
++int iowait_set_work_flag(struct iowait_work *w);
++
+ #endif
+diff --git a/drivers/infiniband/hw/hfi1/qp.c b/drivers/infiniband/hw/hfi1/qp.c
+index 545bda6f1364..3ba71dc92a65 100644
+--- a/drivers/infiniband/hw/hfi1/qp.c
++++ b/drivers/infiniband/hw/hfi1/qp.c
+@@ -66,7 +66,7 @@ MODULE_PARM_DESC(qp_table_size, "QP table size");
+ static void flush_tx_list(struct rvt_qp *qp);
+ static int iowait_sleep(
+ 	struct sdma_engine *sde,
+-	struct iowait *wait,
++	struct iowait_work *wait,
+ 	struct sdma_txreq *stx,
+ 	unsigned int seq,
+ 	bool pkts_sent);
+@@ -134,15 +134,13 @@ const struct rvt_operation_params hfi1_post_parms[RVT_OPERATION_MAX] = {
+ 
+ };
+ 
+-static void flush_tx_list(struct rvt_qp *qp)
++static void flush_list_head(struct list_head *l)
+ {
+-	struct hfi1_qp_priv *priv = qp->priv;
+-
+-	while (!list_empty(&priv->s_iowait.tx_head)) {
++	while (!list_empty(l)) {
+ 		struct sdma_txreq *tx;
+ 
+ 		tx = list_first_entry(
+-			&priv->s_iowait.tx_head,
++			l,
+ 			struct sdma_txreq,
+ 			list);
+ 		list_del_init(&tx->list);
+@@ -151,6 +149,14 @@ static void flush_tx_list(struct rvt_qp *qp)
+ 	}
+ }
+ 
++static void flush_tx_list(struct rvt_qp *qp)
++{
++	struct hfi1_qp_priv *priv = qp->priv;
++
++	flush_list_head(&iowait_get_ib_work(&priv->s_iowait)->tx_head);
++	flush_list_head(&iowait_get_tid_work(&priv->s_iowait)->tx_head);
++}
++
+ static void flush_iowait(struct rvt_qp *qp)
+ {
+ 	struct hfi1_qp_priv *priv = qp->priv;
+@@ -333,7 +339,7 @@ int hfi1_check_send_wqe(struct rvt_qp *qp,
+  * It is only used in the post send, which doesn't hold
+  * the s_lock.
+  */
+-void _hfi1_schedule_send(struct rvt_qp *qp)
++bool _hfi1_schedule_send(struct rvt_qp *qp)
+ {
+ 	struct hfi1_qp_priv *priv = qp->priv;
+ 	struct hfi1_ibport *ibp =
+@@ -341,10 +347,10 @@ void _hfi1_schedule_send(struct rvt_qp *qp)
+ 	struct hfi1_pportdata *ppd = ppd_from_ibp(ibp);
+ 	struct hfi1_devdata *dd = dd_from_ibdev(qp->ibqp.device);
+ 
+-	iowait_schedule(&priv->s_iowait, ppd->hfi1_wq,
+-			priv->s_sde ?
+-			priv->s_sde->cpu :
+-			cpumask_first(cpumask_of_node(dd->node)));
++	return iowait_schedule(&priv->s_iowait, ppd->hfi1_wq,
++			       priv->s_sde ?
++			       priv->s_sde->cpu :
++			       cpumask_first(cpumask_of_node(dd->node)));
+ }
+ 
+ static void qp_pio_drain(struct rvt_qp *qp)
+@@ -372,12 +378,32 @@ static void qp_pio_drain(struct rvt_qp *qp)
+  *
+  * This schedules qp progress and caller should hold
+  * the s_lock.
++ * @return true if the first leg is scheduled;
++ * false if the first leg is not scheduled.
+  */
+-void hfi1_schedule_send(struct rvt_qp *qp)
++bool hfi1_schedule_send(struct rvt_qp *qp)
+ {
+ 	lockdep_assert_held(&qp->s_lock);
+-	if (hfi1_send_ok(qp))
++	if (hfi1_send_ok(qp)) {
+ 		_hfi1_schedule_send(qp);
++		return true;
++	}
++	if (qp->s_flags & HFI1_S_ANY_WAIT_IO)
++		iowait_set_flag(&((struct hfi1_qp_priv *)qp->priv)->s_iowait,
++				IOWAIT_PENDING_IB);
++	return false;
++}
++
++static void hfi1_qp_schedule(struct rvt_qp *qp)
++{
++	struct hfi1_qp_priv *priv = qp->priv;
++	bool ret;
++
++	if (iowait_flag_set(&priv->s_iowait, IOWAIT_PENDING_IB)) {
++		ret = hfi1_schedule_send(qp);
++		if (ret)
++			iowait_clear_flag(&priv->s_iowait, IOWAIT_PENDING_IB);
++	}
+ }
+ 
+ void hfi1_qp_wakeup(struct rvt_qp *qp, u32 flag)
+@@ -388,16 +414,22 @@ void hfi1_qp_wakeup(struct rvt_qp *qp, u32 flag)
+ 	if (qp->s_flags & flag) {
+ 		qp->s_flags &= ~flag;
+ 		trace_hfi1_qpwakeup(qp, flag);
+-		hfi1_schedule_send(qp);
++		hfi1_qp_schedule(qp);
+ 	}
+ 	spin_unlock_irqrestore(&qp->s_lock, flags);
+ 	/* Notify hfi1_destroy_qp() if it is waiting. */
+ 	rvt_put_qp(qp);
+ }
+ 
++void hfi1_qp_unbusy(struct rvt_qp *qp, struct iowait_work *wait)
++{
++	if (iowait_set_work_flag(wait) == IOWAIT_IB_SE)
++		qp->s_flags &= ~RVT_S_BUSY;
++}
++
+ static int iowait_sleep(
+ 	struct sdma_engine *sde,
+-	struct iowait *wait,
++	struct iowait_work *wait,
+ 	struct sdma_txreq *stx,
+ 	uint seq,
+ 	bool pkts_sent)
+@@ -438,7 +470,7 @@ static int iowait_sleep(
+ 			rvt_get_qp(qp);
+ 		}
+ 		write_sequnlock(&dev->iowait_lock);
+-		qp->s_flags &= ~RVT_S_BUSY;
++		hfi1_qp_unbusy(qp, wait);
+ 		spin_unlock_irqrestore(&qp->s_lock, flags);
+ 		ret = -EBUSY;
+ 	} else {
+@@ -638,6 +670,7 @@ void *qp_priv_alloc(struct rvt_dev_info *rdi, struct rvt_qp *qp)
+ 		&priv->s_iowait,
+ 		1,
+ 		_hfi1_do_send,
++		NULL,
+ 		iowait_sleep,
+ 		iowait_wakeup,
+ 		iowait_sdma_drained);
+@@ -687,7 +720,7 @@ void stop_send_queue(struct rvt_qp *qp)
+ {
+ 	struct hfi1_qp_priv *priv = qp->priv;
+ 
+-	cancel_work_sync(&priv->s_iowait.iowork);
++	iowait_cancel_work(&priv->s_iowait);
+ }
+ 
+ void quiesce_qp(struct rvt_qp *qp)
+diff --git a/drivers/infiniband/hw/hfi1/qp.h b/drivers/infiniband/hw/hfi1/qp.h
+index 078cff7560b6..7adb6dff6813 100644
+--- a/drivers/infiniband/hw/hfi1/qp.h
++++ b/drivers/infiniband/hw/hfi1/qp.h
+@@ -57,18 +57,6 @@ extern unsigned int hfi1_qp_table_size;
+ 
+ extern const struct rvt_operation_params hfi1_post_parms[];
+ 
+-/*
+- * Send if not busy or waiting for I/O and either
+- * a RC response is pending or we can process send work requests.
+- */
+-static inline int hfi1_send_ok(struct rvt_qp *qp)
+-{
+-	return !(qp->s_flags & (RVT_S_BUSY | RVT_S_ANY_WAIT_IO)) &&
+-		(verbs_txreq_queued(qp) ||
+-		(qp->s_flags & RVT_S_RESP_PENDING) ||
+-		 !(qp->s_flags & RVT_S_ANY_WAIT_SEND));
+-}
+-
+ /*
+  * Driver specific s_flags starting at bit 31 down to HFI1_S_MIN_BIT_MASK
+  *
+@@ -89,6 +77,20 @@ static inline int hfi1_send_ok(struct rvt_qp *qp)
+ #define HFI1_S_ANY_WAIT_IO (RVT_S_ANY_WAIT_IO | HFI1_S_WAIT_PIO_DRAIN)
+ #define HFI1_S_ANY_WAIT (HFI1_S_ANY_WAIT_IO | RVT_S_ANY_WAIT_SEND)
+ 
++/*
++ * Send if not busy or waiting for I/O and either
++ * a RC response is pending or we can process send work requests.
++ */
++static inline int hfi1_send_ok(struct rvt_qp *qp)
++{
++	struct hfi1_qp_priv *priv = qp->priv;
++
++	return !(qp->s_flags & (RVT_S_BUSY | HFI1_S_ANY_WAIT_IO)) &&
++		(verbs_txreq_queued(iowait_get_ib_work(&priv->s_iowait)) ||
++		(qp->s_flags & RVT_S_RESP_PENDING) ||
++		 !(qp->s_flags & RVT_S_ANY_WAIT_SEND));
++}
++
+ /*
+  * free_ahg - clear ahg from QP
+  */
+@@ -129,8 +131,8 @@ struct send_context *qp_to_send_context(struct rvt_qp *qp, u8 sc5);
+ 
+ void qp_iter_print(struct seq_file *s, struct rvt_qp_iter *iter);
+ 
+-void _hfi1_schedule_send(struct rvt_qp *qp);
+-void hfi1_schedule_send(struct rvt_qp *qp);
++bool _hfi1_schedule_send(struct rvt_qp *qp);
++bool hfi1_schedule_send(struct rvt_qp *qp);
+ 
+ void hfi1_migrate_qp(struct rvt_qp *qp);
+ 
+@@ -150,4 +152,5 @@ void quiesce_qp(struct rvt_qp *qp);
+ u32 mtu_from_qp(struct rvt_dev_info *rdi, struct rvt_qp *qp, u32 pmtu);
+ int mtu_to_path_mtu(u32 mtu);
+ void hfi1_error_port_qps(struct hfi1_ibport *ibp, u8 sl);
++void hfi1_qp_unbusy(struct rvt_qp *qp, struct iowait_work *wait);
+ #endif /* _QP_H */
+diff --git a/drivers/infiniband/hw/hfi1/ruc.c b/drivers/infiniband/hw/hfi1/ruc.c
+index cdb8c22819f8..19ade2ca4cdc 100644
+--- a/drivers/infiniband/hw/hfi1/ruc.c
++++ b/drivers/infiniband/hw/hfi1/ruc.c
+@@ -825,8 +825,8 @@ void hfi1_do_send_from_rvt(struct rvt_qp *qp)
+ 
+ void _hfi1_do_send(struct work_struct *work)
+ {
+-	struct iowait *wait = container_of(work, struct iowait, iowork);
+-	struct rvt_qp *qp = iowait_to_qp(wait);
++	struct iowait_work *w = container_of(work, struct iowait_work, iowork);
++	struct rvt_qp *qp = iowait_to_qp(w->iow);
+ 
+ 	hfi1_do_send(qp, true);
+ }
+@@ -850,6 +850,7 @@ void hfi1_do_send(struct rvt_qp *qp, bool in_thread)
+ 	ps.ibp = to_iport(qp->ibqp.device, qp->port_num);
+ 	ps.ppd = ppd_from_ibp(ps.ibp);
+ 	ps.in_thread = in_thread;
++	ps.wait = iowait_get_ib_work(&priv->s_iowait);
+ 
+ 	trace_hfi1_rc_do_send(qp, in_thread);
+ 
+@@ -883,6 +884,8 @@ void hfi1_do_send(struct rvt_qp *qp, bool in_thread)
+ 
+ 	/* Return if we are already busy processing a work request. */
+ 	if (!hfi1_send_ok(qp)) {
++		if (qp->s_flags & HFI1_S_ANY_WAIT_IO)
++			iowait_set_flag(&priv->s_iowait, IOWAIT_PENDING_IB);
+ 		spin_unlock_irqrestore(&qp->s_lock, ps.flags);
+ 		return;
+ 	}
+@@ -896,7 +899,7 @@ void hfi1_do_send(struct rvt_qp *qp, bool in_thread)
+ 	ps.pkts_sent = false;
+ 
+ 	/* insure a pre-built packet is handled  */
+-	ps.s_txreq = get_waiting_verbs_txreq(qp);
++	ps.s_txreq = get_waiting_verbs_txreq(ps.wait);
+ 	do {
+ 		/* Check for a constructed packet to be sent. */
+ 		if (ps.s_txreq) {
+@@ -907,6 +910,7 @@ void hfi1_do_send(struct rvt_qp *qp, bool in_thread)
+ 			 */
+ 			if (hfi1_verbs_send(qp, &ps))
+ 				return;
++
+ 			/* allow other tasks to run */
+ 			if (schedule_send_yield(qp, &ps))
+ 				return;
+* Unmerged path drivers/infiniband/hw/hfi1/sdma.c
+diff --git a/drivers/infiniband/hw/hfi1/sdma.h b/drivers/infiniband/hw/hfi1/sdma.h
+index b433dd503585..d2bbe0c29792 100644
+--- a/drivers/infiniband/hw/hfi1/sdma.h
++++ b/drivers/infiniband/hw/hfi1/sdma.h
+@@ -1,7 +1,7 @@
+ #ifndef _HFI1_SDMA_H
+ #define _HFI1_SDMA_H
+ /*
+- * Copyright(c) 2015, 2016 Intel Corporation.
++ * Copyright(c) 2015 - 2018 Intel Corporation.
+  *
+  * This file is provided under a dual BSD/GPLv2 license.  When using or
+  * redistributing this file, you may do so under either license.
+@@ -839,14 +839,14 @@ static inline int sdma_txadd_kvaddr(
+ 			dd, SDMA_MAP_SINGLE, tx, addr, len);
+ }
+ 
+-struct iowait;
++struct iowait_work;
+ 
+ int sdma_send_txreq(struct sdma_engine *sde,
+-		    struct iowait *wait,
++		    struct iowait_work *wait,
+ 		    struct sdma_txreq *tx,
+ 		    bool pkts_sent);
+ int sdma_send_txlist(struct sdma_engine *sde,
+-		     struct iowait *wait,
++		     struct iowait_work *wait,
+ 		     struct list_head *tx_list,
+ 		     u32 *count);
+ 
+diff --git a/drivers/infiniband/hw/hfi1/user_sdma.c b/drivers/infiniband/hw/hfi1/user_sdma.c
+index 8f96e0637cd1..874703c71bc0 100644
+--- a/drivers/infiniband/hw/hfi1/user_sdma.c
++++ b/drivers/infiniband/hw/hfi1/user_sdma.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright(c) 2015 - 2017 Intel Corporation.
++ * Copyright(c) 2015 - 2018 Intel Corporation.
+  *
+  * This file is provided under a dual BSD/GPLv2 license.  When using or
+  * redistributing this file, you may do so under either license.
+@@ -101,7 +101,7 @@ static inline u32 get_lrh_len(struct hfi1_pkt_header, u32 len);
+ 
+ static int defer_packet_queue(
+ 	struct sdma_engine *sde,
+-	struct iowait *wait,
++	struct iowait_work *wait,
+ 	struct sdma_txreq *txreq,
+ 	uint seq,
+ 	bool pkts_sent);
+@@ -124,13 +124,13 @@ static struct mmu_rb_ops sdma_rb_ops = {
+ 
+ static int defer_packet_queue(
+ 	struct sdma_engine *sde,
+-	struct iowait *wait,
++	struct iowait_work *wait,
+ 	struct sdma_txreq *txreq,
+ 	uint seq,
+ 	bool pkts_sent)
+ {
+ 	struct hfi1_user_sdma_pkt_q *pq =
+-		container_of(wait, struct hfi1_user_sdma_pkt_q, busy);
++		container_of(wait->iow, struct hfi1_user_sdma_pkt_q, busy);
+ 	struct hfi1_ibdev *dev = &pq->dd->verbs_dev;
+ 	struct user_sdma_txreq *tx =
+ 		container_of(txreq, struct user_sdma_txreq, txreq);
+@@ -193,7 +193,7 @@ int hfi1_user_sdma_alloc_queues(struct hfi1_ctxtdata *uctxt,
+ 	atomic_set(&pq->n_locked, 0);
+ 	pq->mm = fd->mm;
+ 
+-	iowait_init(&pq->busy, 0, NULL, defer_packet_queue,
++	iowait_init(&pq->busy, 0, NULL, NULL, defer_packet_queue,
+ 		    activate_packet_queue, NULL);
+ 	pq->reqidx = 0;
+ 
+@@ -916,7 +916,9 @@ static int user_sdma_send_pkts(struct user_sdma_request *req, unsigned maxpkts)
+ 		npkts++;
+ 	}
+ dosend:
+-	ret = sdma_send_txlist(req->sde, &pq->busy, &req->txps, &count);
++	ret = sdma_send_txlist(req->sde,
++			       iowait_get_ib_work(&pq->busy),
++			       &req->txps, &count);
+ 	req->seqsubmitted += count;
+ 	if (req->seqsubmitted == req->info.npkts) {
+ 		WRITE_ONCE(req->done, 1);
+diff --git a/drivers/infiniband/hw/hfi1/verbs.c b/drivers/infiniband/hw/hfi1/verbs.c
+index 8b1b27b20e68..1cd4b8d569c0 100644
+--- a/drivers/infiniband/hw/hfi1/verbs.c
++++ b/drivers/infiniband/hw/hfi1/verbs.c
+@@ -739,7 +739,7 @@ static int wait_kmem(struct hfi1_ibdev *dev,
+ 	if (ib_rvt_state_ops[qp->state] & RVT_PROCESS_RECV_OK) {
+ 		write_seqlock(&dev->iowait_lock);
+ 		list_add_tail(&ps->s_txreq->txreq.list,
+-			      &priv->s_iowait.tx_head);
++			      &ps->wait->tx_head);
+ 		if (list_empty(&priv->s_iowait.list)) {
+ 			if (list_empty(&dev->memwait))
+ 				mod_timer(&dev->mem_timer, jiffies + 1);
+@@ -750,7 +750,7 @@ static int wait_kmem(struct hfi1_ibdev *dev,
+ 			rvt_get_qp(qp);
+ 		}
+ 		write_sequnlock(&dev->iowait_lock);
+-		qp->s_flags &= ~RVT_S_BUSY;
++		hfi1_qp_unbusy(qp, ps->wait);
+ 		ret = -EBUSY;
+ 	}
+ 	spin_unlock_irqrestore(&qp->s_lock, flags);
+@@ -953,8 +953,7 @@ int hfi1_verbs_send_dma(struct rvt_qp *qp, struct hfi1_pkt_state *ps,
+ 		if (unlikely(ret))
+ 			goto bail_build;
+ 	}
+-	ret =  sdma_send_txreq(tx->sde, &priv->s_iowait, &tx->txreq,
+-			       ps->pkts_sent);
++	ret =  sdma_send_txreq(tx->sde, ps->wait, &tx->txreq, ps->pkts_sent);
+ 	if (unlikely(ret < 0)) {
+ 		if (ret == -ECOMM)
+ 			goto bail_ecomm;
+@@ -1004,7 +1003,7 @@ static int pio_wait(struct rvt_qp *qp,
+ 	if (ib_rvt_state_ops[qp->state] & RVT_PROCESS_RECV_OK) {
+ 		write_seqlock(&dev->iowait_lock);
+ 		list_add_tail(&ps->s_txreq->txreq.list,
+-			      &priv->s_iowait.tx_head);
++			      &ps->wait->tx_head);
+ 		if (list_empty(&priv->s_iowait.list)) {
+ 			struct hfi1_ibdev *dev = &dd->verbs_dev;
+ 			int was_empty;
+@@ -1023,7 +1022,7 @@ static int pio_wait(struct rvt_qp *qp,
+ 				hfi1_sc_wantpiobuf_intr(sc, 1);
+ 		}
+ 		write_sequnlock(&dev->iowait_lock);
+-		qp->s_flags &= ~RVT_S_BUSY;
++		hfi1_qp_unbusy(qp, ps->wait);
+ 		ret = -EBUSY;
+ 	}
+ 	spin_unlock_irqrestore(&qp->s_lock, flags);
+diff --git a/drivers/infiniband/hw/hfi1/verbs.h b/drivers/infiniband/hw/hfi1/verbs.h
+index e7f727ca9212..3a2df74be4cd 100644
+--- a/drivers/infiniband/hw/hfi1/verbs.h
++++ b/drivers/infiniband/hw/hfi1/verbs.h
+@@ -166,11 +166,13 @@ struct hfi1_qp_priv {
+  * This structure is used to hold commonly lookedup and computed values during
+  * the send engine progress.
+  */
++struct iowait_work;
+ struct hfi1_pkt_state {
+ 	struct hfi1_ibdev *dev;
+ 	struct hfi1_ibport *ibp;
+ 	struct hfi1_pportdata *ppd;
+ 	struct verbs_txreq *s_txreq;
++	struct iowait_work *wait;
+ 	unsigned long flags;
+ 	unsigned long timeout;
+ 	unsigned long timeout_int;
+@@ -249,7 +251,7 @@ static inline struct hfi1_ibdev *to_idev(struct ib_device *ibdev)
+ 	return container_of(rdi, struct hfi1_ibdev, rdi);
+ }
+ 
+-static inline struct rvt_qp *iowait_to_qp(struct  iowait *s_iowait)
++static inline struct rvt_qp *iowait_to_qp(struct iowait *s_iowait)
+ {
+ 	struct hfi1_qp_priv *priv;
+ 
+diff --git a/drivers/infiniband/hw/hfi1/verbs_txreq.h b/drivers/infiniband/hw/hfi1/verbs_txreq.h
+index 1c19bbc764b2..2a77af26a231 100644
+--- a/drivers/infiniband/hw/hfi1/verbs_txreq.h
++++ b/drivers/infiniband/hw/hfi1/verbs_txreq.h
+@@ -102,22 +102,19 @@ static inline struct sdma_txreq *get_sdma_txreq(struct verbs_txreq *tx)
+ 	return &tx->txreq;
+ }
+ 
+-static inline struct verbs_txreq *get_waiting_verbs_txreq(struct rvt_qp *qp)
++static inline struct verbs_txreq *get_waiting_verbs_txreq(struct iowait_work *w)
+ {
+ 	struct sdma_txreq *stx;
+-	struct hfi1_qp_priv *priv = qp->priv;
+ 
+-	stx = iowait_get_txhead(&priv->s_iowait);
++	stx = iowait_get_txhead(w);
+ 	if (stx)
+ 		return container_of(stx, struct verbs_txreq, txreq);
+ 	return NULL;
+ }
+ 
+-static inline bool verbs_txreq_queued(struct rvt_qp *qp)
++static inline bool verbs_txreq_queued(struct iowait_work *w)
+ {
+-	struct hfi1_qp_priv *priv = qp->priv;
+-
+-	return iowait_packet_queued(&priv->s_iowait);
++	return iowait_packet_queued(w);
+ }
+ 
+ void hfi1_put_txreq(struct verbs_txreq *tx);
+diff --git a/drivers/infiniband/hw/hfi1/vnic_sdma.c b/drivers/infiniband/hw/hfi1/vnic_sdma.c
+index c3c96c5869ed..97bd940a056a 100644
+--- a/drivers/infiniband/hw/hfi1/vnic_sdma.c
++++ b/drivers/infiniband/hw/hfi1/vnic_sdma.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright(c) 2017 Intel Corporation.
++ * Copyright(c) 2017 - 2018 Intel Corporation.
+  *
+  * This file is provided under a dual BSD/GPLv2 license.  When using or
+  * redistributing this file, you may do so under either license.
+@@ -198,8 +198,8 @@ int hfi1_vnic_send_dma(struct hfi1_devdata *dd, u8 q_idx,
+ 		goto free_desc;
+ 	tx->retry_count = 0;
+ 
+-	ret = sdma_send_txreq(sde, &vnic_sdma->wait, &tx->txreq,
+-			      vnic_sdma->pkts_sent);
++	ret = sdma_send_txreq(sde, iowait_get_ib_work(&vnic_sdma->wait),
++			      &tx->txreq, vnic_sdma->pkts_sent);
+ 	/* When -ECOMM, sdma callback will be called with ABORT status */
+ 	if (unlikely(ret && unlikely(ret != -ECOMM)))
+ 		goto free_desc;
+@@ -230,13 +230,13 @@ tx_err:
+  * become available.
+  */
+ static int hfi1_vnic_sdma_sleep(struct sdma_engine *sde,
+-				struct iowait *wait,
++				struct iowait_work *wait,
+ 				struct sdma_txreq *txreq,
+ 				uint seq,
+ 				bool pkts_sent)
+ {
+ 	struct hfi1_vnic_sdma *vnic_sdma =
+-		container_of(wait, struct hfi1_vnic_sdma, wait);
++		container_of(wait->iow, struct hfi1_vnic_sdma, wait);
+ 	struct hfi1_ibdev *dev = &vnic_sdma->dd->verbs_dev;
+ 	struct vnic_txreq *tx = container_of(txreq, struct vnic_txreq, txreq);
+ 
+@@ -247,7 +247,7 @@ static int hfi1_vnic_sdma_sleep(struct sdma_engine *sde,
+ 	vnic_sdma->state = HFI1_VNIC_SDMA_Q_DEFERRED;
+ 	write_seqlock(&dev->iowait_lock);
+ 	if (list_empty(&vnic_sdma->wait.list))
+-		iowait_queue(pkts_sent, wait, &sde->dmawait);
++		iowait_queue(pkts_sent, wait->iow, &sde->dmawait);
+ 	write_sequnlock(&dev->iowait_lock);
+ 	return -EBUSY;
+ }
+@@ -285,7 +285,8 @@ void hfi1_vnic_sdma_init(struct hfi1_vnic_vport_info *vinfo)
+ 	for (i = 0; i < vinfo->num_tx_q; i++) {
+ 		struct hfi1_vnic_sdma *vnic_sdma = &vinfo->sdma[i];
+ 
+-		iowait_init(&vnic_sdma->wait, 0, NULL, hfi1_vnic_sdma_sleep,
++		iowait_init(&vnic_sdma->wait, 0, NULL, NULL,
++			    hfi1_vnic_sdma_sleep,
+ 			    hfi1_vnic_sdma_wakeup, NULL);
+ 		vnic_sdma->sde = &vinfo->dd->per_sdma[i];
+ 		vnic_sdma->dd = vinfo->dd;
+@@ -295,10 +296,12 @@ void hfi1_vnic_sdma_init(struct hfi1_vnic_vport_info *vinfo)
+ 
+ 		/* Add a free descriptor watermark for wakeups */
+ 		if (vnic_sdma->sde->descq_cnt > HFI1_VNIC_SDMA_DESC_WTRMRK) {
++			struct iowait_work *work;
++
+ 			INIT_LIST_HEAD(&vnic_sdma->stx.list);
+ 			vnic_sdma->stx.num_desc = HFI1_VNIC_SDMA_DESC_WTRMRK;
+-			list_add_tail(&vnic_sdma->stx.list,
+-				      &vnic_sdma->wait.tx_head);
++			work = iowait_get_ib_work(&vnic_sdma->wait);
++			list_add_tail(&vnic_sdma->stx.list, &work->tx_head);
+ 		}
+ 	}
+ }
+diff --git a/drivers/infiniband/hw/qib/qib_verbs.c b/drivers/infiniband/hw/qib/qib_verbs.c
+index 021a776bffe6..3437b992e93c 100644
+--- a/drivers/infiniband/hw/qib/qib_verbs.c
++++ b/drivers/infiniband/hw/qib/qib_verbs.c
+@@ -1720,14 +1720,14 @@ void qib_unregister_ib_device(struct qib_devdata *dd)
+  * It is only used in post send, which doesn't hold
+  * the s_lock.
+  */
+-void _qib_schedule_send(struct rvt_qp *qp)
++bool _qib_schedule_send(struct rvt_qp *qp)
+ {
+ 	struct qib_ibport *ibp =
+ 		to_iport(qp->ibqp.device, qp->port_num);
+ 	struct qib_pportdata *ppd = ppd_from_ibp(ibp);
+ 	struct qib_qp_priv *priv = qp->priv;
+ 
+-	queue_work(ppd->qib_wq, &priv->s_work);
++	return queue_work(ppd->qib_wq, &priv->s_work);
+ }
+ 
+ /**
+@@ -1737,8 +1737,9 @@ void _qib_schedule_send(struct rvt_qp *qp)
+  * This schedules qp progress.  The s_lock
+  * should be held.
+  */
+-void qib_schedule_send(struct rvt_qp *qp)
++bool qib_schedule_send(struct rvt_qp *qp)
+ {
+ 	if (qib_send_ok(qp))
+-		_qib_schedule_send(qp);
++		return _qib_schedule_send(qp);
++	return false;
+ }
+diff --git a/drivers/infiniband/hw/qib/qib_verbs.h b/drivers/infiniband/hw/qib/qib_verbs.h
+index f9a46768a19a..85a4a6b371d5 100644
+--- a/drivers/infiniband/hw/qib/qib_verbs.h
++++ b/drivers/infiniband/hw/qib/qib_verbs.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2012 - 2017 Intel Corporation.  All rights reserved.
++ * Copyright (c) 2012 - 2018 Intel Corporation.  All rights reserved.
+  * Copyright (c) 2006 - 2012 QLogic Corporation. All rights reserved.
+  * Copyright (c) 2005, 2006 PathScale, Inc. All rights reserved.
+  *
+@@ -226,8 +226,8 @@ static inline int qib_send_ok(struct rvt_qp *qp)
+ 		 !(qp->s_flags & RVT_S_ANY_WAIT_SEND));
+ }
+ 
+-void _qib_schedule_send(struct rvt_qp *qp);
+-void qib_schedule_send(struct rvt_qp *qp);
++bool _qib_schedule_send(struct rvt_qp *qp);
++bool qib_schedule_send(struct rvt_qp *qp);
+ 
+ static inline int qib_pkey_ok(u16 pkey1, u16 pkey2)
+ {
+diff --git a/include/rdma/rdma_vt.h b/include/rdma/rdma_vt.h
+index d0e9083f9b9e..575e56781c05 100644
+--- a/include/rdma/rdma_vt.h
++++ b/include/rdma/rdma_vt.h
+@@ -212,8 +212,8 @@ struct rvt_driver_provided {
+ 	 * version requires the s_lock not to be held. The other assumes the
+ 	 * s_lock is held.
+ 	 */
+-	void (*schedule_send)(struct rvt_qp *qp);
+-	void (*schedule_send_no_lock)(struct rvt_qp *qp);
++	bool (*schedule_send)(struct rvt_qp *qp);
++	bool (*schedule_send_no_lock)(struct rvt_qp *qp);
+ 
+ 	/* Driver specific work request checking */
+ 	int (*check_send_wqe)(struct rvt_qp *qp, struct rvt_swqe *wqe);
