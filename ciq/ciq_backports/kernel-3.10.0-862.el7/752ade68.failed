@@ -1,0 +1,2226 @@
+treewide: use kv[mz]alloc* rather than opencoded variants
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Michal Hocko <mhocko@suse.com>
+commit 752ade68cbd81d0321dfecc188f655a945551b25
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/752ade68.failed
+
+There are many code paths opencoding kvmalloc.  Let's use the helper
+instead.  The main difference to kvmalloc is that those users are
+usually not considering all the aspects of the memory allocator.  E.g.
+allocation requests <= 32kB (with 4kB pages) are basically never failing
+and invoke OOM killer to satisfy the allocation.  This sounds too
+disruptive for something that has a reasonable fallback - the vmalloc.
+On the other hand those requests might fallback to vmalloc even when the
+memory allocator would succeed after several more reclaim/compaction
+attempts previously.  There is no guarantee something like that happens
+though.
+
+This patch converts many of those places to kv[mz]alloc* helpers because
+they are more conservative.
+
+Link: http://lkml.kernel.org/r/20170306103327.2766-2-mhocko@kernel.org
+	Signed-off-by: Michal Hocko <mhocko@suse.com>
+	Reviewed-by: Boris Ostrovsky <boris.ostrovsky@oracle.com> # Xen bits
+	Acked-by: Kees Cook <keescook@chromium.org>
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Acked-by: Andreas Dilger <andreas.dilger@intel.com> # Lustre
+	Acked-by: Christian Borntraeger <borntraeger@de.ibm.com> # KVM/s390
+	Acked-by: Dan Williams <dan.j.williams@intel.com> # nvdim
+	Acked-by: David Sterba <dsterba@suse.com> # btrfs
+	Acked-by: Ilya Dryomov <idryomov@gmail.com> # Ceph
+	Acked-by: Tariq Toukan <tariqt@mellanox.com> # mlx4
+	Acked-by: Leon Romanovsky <leonro@mellanox.com> # mlx5
+	Cc: Martin Schwidefsky <schwidefsky@de.ibm.com>
+	Cc: Heiko Carstens <heiko.carstens@de.ibm.com>
+	Cc: Herbert Xu <herbert@gondor.apana.org.au>
+	Cc: Anton Vorontsov <anton@enomsg.org>
+	Cc: Colin Cross <ccross@android.com>
+	Cc: Tony Luck <tony.luck@intel.com>
+	Cc: "Rafael J. Wysocki" <rjw@rjwysocki.net>
+	Cc: Ben Skeggs <bskeggs@redhat.com>
+	Cc: Kent Overstreet <kent.overstreet@gmail.com>
+	Cc: Santosh Raspatur <santosh@chelsio.com>
+	Cc: Hariprasad S <hariprasad@chelsio.com>
+	Cc: Yishai Hadas <yishaih@mellanox.com>
+	Cc: Oleg Drokin <oleg.drokin@intel.com>
+	Cc: "Yan, Zheng" <zyan@redhat.com>
+	Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+	Cc: Alexei Starovoitov <ast@kernel.org>
+	Cc: Eric Dumazet <eric.dumazet@gmail.com>
+	Cc: David Miller <davem@davemloft.net>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 752ade68cbd81d0321dfecc188f655a945551b25)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kvm/kvm-s390.c
+#	crypto/lzo.c
+#	drivers/staging/lustre/lnet/libcfs/linux/linux-mem.c
+#	drivers/xen/evtchn.c
+#	fs/btrfs/ctree.c
+#	fs/btrfs/ioctl.c
+#	include/linux/mm.h
+#	lib/iov_iter.c
+#	mm/frame_vector.c
+#	net/ipv4/inet_hashtables.c
+#	net/ipv4/tcp_metrics.c
+#	net/mpls/af_mpls.c
+#	net/sched/sch_choke.c
+#	net/sched/sch_fq_codel.c
+#	net/sched/sch_hhf.c
+#	security/keys/keyctl.c
+diff --cc arch/s390/kvm/kvm-s390.c
+index 9b2d6973d202,323297e55e80..000000000000
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@@ -203,6 -559,695 +203,698 @@@ static int kvm_vm_ioctl_enable_cap(stru
+  	return r;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int kvm_s390_get_mem_control(struct kvm *kvm, struct kvm_device_attr *attr)
++ {
++ 	int ret;
++ 
++ 	switch (attr->attr) {
++ 	case KVM_S390_VM_MEM_LIMIT_SIZE:
++ 		ret = 0;
++ 		VM_EVENT(kvm, 3, "QUERY: max guest memory: %lu bytes",
++ 			 kvm->arch.mem_limit);
++ 		if (put_user(kvm->arch.mem_limit, (u64 __user *)attr->addr))
++ 			ret = -EFAULT;
++ 		break;
++ 	default:
++ 		ret = -ENXIO;
++ 		break;
++ 	}
++ 	return ret;
++ }
++ 
++ static int kvm_s390_set_mem_control(struct kvm *kvm, struct kvm_device_attr *attr)
++ {
++ 	int ret;
++ 	unsigned int idx;
++ 	switch (attr->attr) {
++ 	case KVM_S390_VM_MEM_ENABLE_CMMA:
++ 		ret = -ENXIO;
++ 		if (!sclp.has_cmma)
++ 			break;
++ 
++ 		ret = -EBUSY;
++ 		VM_EVENT(kvm, 3, "%s", "ENABLE: CMMA support");
++ 		mutex_lock(&kvm->lock);
++ 		if (!kvm->created_vcpus) {
++ 			kvm->arch.use_cmma = 1;
++ 			ret = 0;
++ 		}
++ 		mutex_unlock(&kvm->lock);
++ 		break;
++ 	case KVM_S390_VM_MEM_CLR_CMMA:
++ 		ret = -ENXIO;
++ 		if (!sclp.has_cmma)
++ 			break;
++ 		ret = -EINVAL;
++ 		if (!kvm->arch.use_cmma)
++ 			break;
++ 
++ 		VM_EVENT(kvm, 3, "%s", "RESET: CMMA states");
++ 		mutex_lock(&kvm->lock);
++ 		idx = srcu_read_lock(&kvm->srcu);
++ 		s390_reset_cmma(kvm->arch.gmap->mm);
++ 		srcu_read_unlock(&kvm->srcu, idx);
++ 		mutex_unlock(&kvm->lock);
++ 		ret = 0;
++ 		break;
++ 	case KVM_S390_VM_MEM_LIMIT_SIZE: {
++ 		unsigned long new_limit;
++ 
++ 		if (kvm_is_ucontrol(kvm))
++ 			return -EINVAL;
++ 
++ 		if (get_user(new_limit, (u64 __user *)attr->addr))
++ 			return -EFAULT;
++ 
++ 		if (kvm->arch.mem_limit != KVM_S390_NO_MEM_LIMIT &&
++ 		    new_limit > kvm->arch.mem_limit)
++ 			return -E2BIG;
++ 
++ 		if (!new_limit)
++ 			return -EINVAL;
++ 
++ 		/* gmap_create takes last usable address */
++ 		if (new_limit != KVM_S390_NO_MEM_LIMIT)
++ 			new_limit -= 1;
++ 
++ 		ret = -EBUSY;
++ 		mutex_lock(&kvm->lock);
++ 		if (!kvm->created_vcpus) {
++ 			/* gmap_create will round the limit up */
++ 			struct gmap *new = gmap_create(current->mm, new_limit);
++ 
++ 			if (!new) {
++ 				ret = -ENOMEM;
++ 			} else {
++ 				gmap_remove(kvm->arch.gmap);
++ 				new->private = kvm;
++ 				kvm->arch.gmap = new;
++ 				ret = 0;
++ 			}
++ 		}
++ 		mutex_unlock(&kvm->lock);
++ 		VM_EVENT(kvm, 3, "SET: max guest address: %lu", new_limit);
++ 		VM_EVENT(kvm, 3, "New guest asce: 0x%pK",
++ 			 (void *) kvm->arch.gmap->asce);
++ 		break;
++ 	}
++ 	default:
++ 		ret = -ENXIO;
++ 		break;
++ 	}
++ 	return ret;
++ }
++ 
++ static void kvm_s390_vcpu_crypto_setup(struct kvm_vcpu *vcpu);
++ 
++ static int kvm_s390_vm_set_crypto(struct kvm *kvm, struct kvm_device_attr *attr)
++ {
++ 	struct kvm_vcpu *vcpu;
++ 	int i;
++ 
++ 	if (!test_kvm_facility(kvm, 76))
++ 		return -EINVAL;
++ 
++ 	mutex_lock(&kvm->lock);
++ 	switch (attr->attr) {
++ 	case KVM_S390_VM_CRYPTO_ENABLE_AES_KW:
++ 		get_random_bytes(
++ 			kvm->arch.crypto.crycb->aes_wrapping_key_mask,
++ 			sizeof(kvm->arch.crypto.crycb->aes_wrapping_key_mask));
++ 		kvm->arch.crypto.aes_kw = 1;
++ 		VM_EVENT(kvm, 3, "%s", "ENABLE: AES keywrapping support");
++ 		break;
++ 	case KVM_S390_VM_CRYPTO_ENABLE_DEA_KW:
++ 		get_random_bytes(
++ 			kvm->arch.crypto.crycb->dea_wrapping_key_mask,
++ 			sizeof(kvm->arch.crypto.crycb->dea_wrapping_key_mask));
++ 		kvm->arch.crypto.dea_kw = 1;
++ 		VM_EVENT(kvm, 3, "%s", "ENABLE: DEA keywrapping support");
++ 		break;
++ 	case KVM_S390_VM_CRYPTO_DISABLE_AES_KW:
++ 		kvm->arch.crypto.aes_kw = 0;
++ 		memset(kvm->arch.crypto.crycb->aes_wrapping_key_mask, 0,
++ 			sizeof(kvm->arch.crypto.crycb->aes_wrapping_key_mask));
++ 		VM_EVENT(kvm, 3, "%s", "DISABLE: AES keywrapping support");
++ 		break;
++ 	case KVM_S390_VM_CRYPTO_DISABLE_DEA_KW:
++ 		kvm->arch.crypto.dea_kw = 0;
++ 		memset(kvm->arch.crypto.crycb->dea_wrapping_key_mask, 0,
++ 			sizeof(kvm->arch.crypto.crycb->dea_wrapping_key_mask));
++ 		VM_EVENT(kvm, 3, "%s", "DISABLE: DEA keywrapping support");
++ 		break;
++ 	default:
++ 		mutex_unlock(&kvm->lock);
++ 		return -ENXIO;
++ 	}
++ 
++ 	kvm_for_each_vcpu(i, vcpu, kvm) {
++ 		kvm_s390_vcpu_crypto_setup(vcpu);
++ 		exit_sie(vcpu);
++ 	}
++ 	mutex_unlock(&kvm->lock);
++ 	return 0;
++ }
++ 
++ static int kvm_s390_set_tod_high(struct kvm *kvm, struct kvm_device_attr *attr)
++ {
++ 	u8 gtod_high;
++ 
++ 	if (copy_from_user(&gtod_high, (void __user *)attr->addr,
++ 					   sizeof(gtod_high)))
++ 		return -EFAULT;
++ 
++ 	if (gtod_high != 0)
++ 		return -EINVAL;
++ 	VM_EVENT(kvm, 3, "SET: TOD extension: 0x%x", gtod_high);
++ 
++ 	return 0;
++ }
++ 
++ static int kvm_s390_set_tod_low(struct kvm *kvm, struct kvm_device_attr *attr)
++ {
++ 	u64 gtod;
++ 
++ 	if (copy_from_user(&gtod, (void __user *)attr->addr, sizeof(gtod)))
++ 		return -EFAULT;
++ 
++ 	kvm_s390_set_tod_clock(kvm, gtod);
++ 	VM_EVENT(kvm, 3, "SET: TOD base: 0x%llx", gtod);
++ 	return 0;
++ }
++ 
++ static int kvm_s390_set_tod(struct kvm *kvm, struct kvm_device_attr *attr)
++ {
++ 	int ret;
++ 
++ 	if (attr->flags)
++ 		return -EINVAL;
++ 
++ 	switch (attr->attr) {
++ 	case KVM_S390_VM_TOD_HIGH:
++ 		ret = kvm_s390_set_tod_high(kvm, attr);
++ 		break;
++ 	case KVM_S390_VM_TOD_LOW:
++ 		ret = kvm_s390_set_tod_low(kvm, attr);
++ 		break;
++ 	default:
++ 		ret = -ENXIO;
++ 		break;
++ 	}
++ 	return ret;
++ }
++ 
++ static int kvm_s390_get_tod_high(struct kvm *kvm, struct kvm_device_attr *attr)
++ {
++ 	u8 gtod_high = 0;
++ 
++ 	if (copy_to_user((void __user *)attr->addr, &gtod_high,
++ 					 sizeof(gtod_high)))
++ 		return -EFAULT;
++ 	VM_EVENT(kvm, 3, "QUERY: TOD extension: 0x%x", gtod_high);
++ 
++ 	return 0;
++ }
++ 
++ static int kvm_s390_get_tod_low(struct kvm *kvm, struct kvm_device_attr *attr)
++ {
++ 	u64 gtod;
++ 
++ 	gtod = kvm_s390_get_tod_clock_fast(kvm);
++ 	if (copy_to_user((void __user *)attr->addr, &gtod, sizeof(gtod)))
++ 		return -EFAULT;
++ 	VM_EVENT(kvm, 3, "QUERY: TOD base: 0x%llx", gtod);
++ 
++ 	return 0;
++ }
++ 
++ static int kvm_s390_get_tod(struct kvm *kvm, struct kvm_device_attr *attr)
++ {
++ 	int ret;
++ 
++ 	if (attr->flags)
++ 		return -EINVAL;
++ 
++ 	switch (attr->attr) {
++ 	case KVM_S390_VM_TOD_HIGH:
++ 		ret = kvm_s390_get_tod_high(kvm, attr);
++ 		break;
++ 	case KVM_S390_VM_TOD_LOW:
++ 		ret = kvm_s390_get_tod_low(kvm, attr);
++ 		break;
++ 	default:
++ 		ret = -ENXIO;
++ 		break;
++ 	}
++ 	return ret;
++ }
++ 
++ static int kvm_s390_set_processor(struct kvm *kvm, struct kvm_device_attr *attr)
++ {
++ 	struct kvm_s390_vm_cpu_processor *proc;
++ 	u16 lowest_ibc, unblocked_ibc;
++ 	int ret = 0;
++ 
++ 	mutex_lock(&kvm->lock);
++ 	if (kvm->created_vcpus) {
++ 		ret = -EBUSY;
++ 		goto out;
++ 	}
++ 	proc = kzalloc(sizeof(*proc), GFP_KERNEL);
++ 	if (!proc) {
++ 		ret = -ENOMEM;
++ 		goto out;
++ 	}
++ 	if (!copy_from_user(proc, (void __user *)attr->addr,
++ 			    sizeof(*proc))) {
++ 		kvm->arch.model.cpuid = proc->cpuid;
++ 		lowest_ibc = sclp.ibc >> 16 & 0xfff;
++ 		unblocked_ibc = sclp.ibc & 0xfff;
++ 		if (lowest_ibc && proc->ibc) {
++ 			if (proc->ibc > unblocked_ibc)
++ 				kvm->arch.model.ibc = unblocked_ibc;
++ 			else if (proc->ibc < lowest_ibc)
++ 				kvm->arch.model.ibc = lowest_ibc;
++ 			else
++ 				kvm->arch.model.ibc = proc->ibc;
++ 		}
++ 		memcpy(kvm->arch.model.fac_list, proc->fac_list,
++ 		       S390_ARCH_FAC_LIST_SIZE_BYTE);
++ 		VM_EVENT(kvm, 3, "SET: guest ibc: 0x%4.4x, guest cpuid: 0x%16.16llx",
++ 			 kvm->arch.model.ibc,
++ 			 kvm->arch.model.cpuid);
++ 		VM_EVENT(kvm, 3, "SET: guest faclist: 0x%16.16llx.%16.16llx.%16.16llx",
++ 			 kvm->arch.model.fac_list[0],
++ 			 kvm->arch.model.fac_list[1],
++ 			 kvm->arch.model.fac_list[2]);
++ 	} else
++ 		ret = -EFAULT;
++ 	kfree(proc);
++ out:
++ 	mutex_unlock(&kvm->lock);
++ 	return ret;
++ }
++ 
++ static int kvm_s390_set_processor_feat(struct kvm *kvm,
++ 				       struct kvm_device_attr *attr)
++ {
++ 	struct kvm_s390_vm_cpu_feat data;
++ 	int ret = -EBUSY;
++ 
++ 	if (copy_from_user(&data, (void __user *)attr->addr, sizeof(data)))
++ 		return -EFAULT;
++ 	if (!bitmap_subset((unsigned long *) data.feat,
++ 			   kvm_s390_available_cpu_feat,
++ 			   KVM_S390_VM_CPU_FEAT_NR_BITS))
++ 		return -EINVAL;
++ 
++ 	mutex_lock(&kvm->lock);
++ 	if (!atomic_read(&kvm->online_vcpus)) {
++ 		bitmap_copy(kvm->arch.cpu_feat, (unsigned long *) data.feat,
++ 			    KVM_S390_VM_CPU_FEAT_NR_BITS);
++ 		ret = 0;
++ 	}
++ 	mutex_unlock(&kvm->lock);
++ 	return ret;
++ }
++ 
++ static int kvm_s390_set_processor_subfunc(struct kvm *kvm,
++ 					  struct kvm_device_attr *attr)
++ {
++ 	/*
++ 	 * Once supported by kernel + hw, we have to store the subfunctions
++ 	 * in kvm->arch and remember that user space configured them.
++ 	 */
++ 	return -ENXIO;
++ }
++ 
++ static int kvm_s390_set_cpu_model(struct kvm *kvm, struct kvm_device_attr *attr)
++ {
++ 	int ret = -ENXIO;
++ 
++ 	switch (attr->attr) {
++ 	case KVM_S390_VM_CPU_PROCESSOR:
++ 		ret = kvm_s390_set_processor(kvm, attr);
++ 		break;
++ 	case KVM_S390_VM_CPU_PROCESSOR_FEAT:
++ 		ret = kvm_s390_set_processor_feat(kvm, attr);
++ 		break;
++ 	case KVM_S390_VM_CPU_PROCESSOR_SUBFUNC:
++ 		ret = kvm_s390_set_processor_subfunc(kvm, attr);
++ 		break;
++ 	}
++ 	return ret;
++ }
++ 
++ static int kvm_s390_get_processor(struct kvm *kvm, struct kvm_device_attr *attr)
++ {
++ 	struct kvm_s390_vm_cpu_processor *proc;
++ 	int ret = 0;
++ 
++ 	proc = kzalloc(sizeof(*proc), GFP_KERNEL);
++ 	if (!proc) {
++ 		ret = -ENOMEM;
++ 		goto out;
++ 	}
++ 	proc->cpuid = kvm->arch.model.cpuid;
++ 	proc->ibc = kvm->arch.model.ibc;
++ 	memcpy(&proc->fac_list, kvm->arch.model.fac_list,
++ 	       S390_ARCH_FAC_LIST_SIZE_BYTE);
++ 	VM_EVENT(kvm, 3, "GET: guest ibc: 0x%4.4x, guest cpuid: 0x%16.16llx",
++ 		 kvm->arch.model.ibc,
++ 		 kvm->arch.model.cpuid);
++ 	VM_EVENT(kvm, 3, "GET: guest faclist: 0x%16.16llx.%16.16llx.%16.16llx",
++ 		 kvm->arch.model.fac_list[0],
++ 		 kvm->arch.model.fac_list[1],
++ 		 kvm->arch.model.fac_list[2]);
++ 	if (copy_to_user((void __user *)attr->addr, proc, sizeof(*proc)))
++ 		ret = -EFAULT;
++ 	kfree(proc);
++ out:
++ 	return ret;
++ }
++ 
++ static int kvm_s390_get_machine(struct kvm *kvm, struct kvm_device_attr *attr)
++ {
++ 	struct kvm_s390_vm_cpu_machine *mach;
++ 	int ret = 0;
++ 
++ 	mach = kzalloc(sizeof(*mach), GFP_KERNEL);
++ 	if (!mach) {
++ 		ret = -ENOMEM;
++ 		goto out;
++ 	}
++ 	get_cpu_id((struct cpuid *) &mach->cpuid);
++ 	mach->ibc = sclp.ibc;
++ 	memcpy(&mach->fac_mask, kvm->arch.model.fac_mask,
++ 	       S390_ARCH_FAC_LIST_SIZE_BYTE);
++ 	memcpy((unsigned long *)&mach->fac_list, S390_lowcore.stfle_fac_list,
++ 	       sizeof(S390_lowcore.stfle_fac_list));
++ 	VM_EVENT(kvm, 3, "GET: host ibc:  0x%4.4x, host cpuid:  0x%16.16llx",
++ 		 kvm->arch.model.ibc,
++ 		 kvm->arch.model.cpuid);
++ 	VM_EVENT(kvm, 3, "GET: host facmask:  0x%16.16llx.%16.16llx.%16.16llx",
++ 		 mach->fac_mask[0],
++ 		 mach->fac_mask[1],
++ 		 mach->fac_mask[2]);
++ 	VM_EVENT(kvm, 3, "GET: host faclist:  0x%16.16llx.%16.16llx.%16.16llx",
++ 		 mach->fac_list[0],
++ 		 mach->fac_list[1],
++ 		 mach->fac_list[2]);
++ 	if (copy_to_user((void __user *)attr->addr, mach, sizeof(*mach)))
++ 		ret = -EFAULT;
++ 	kfree(mach);
++ out:
++ 	return ret;
++ }
++ 
++ static int kvm_s390_get_processor_feat(struct kvm *kvm,
++ 				       struct kvm_device_attr *attr)
++ {
++ 	struct kvm_s390_vm_cpu_feat data;
++ 
++ 	bitmap_copy((unsigned long *) data.feat, kvm->arch.cpu_feat,
++ 		    KVM_S390_VM_CPU_FEAT_NR_BITS);
++ 	if (copy_to_user((void __user *)attr->addr, &data, sizeof(data)))
++ 		return -EFAULT;
++ 	return 0;
++ }
++ 
++ static int kvm_s390_get_machine_feat(struct kvm *kvm,
++ 				     struct kvm_device_attr *attr)
++ {
++ 	struct kvm_s390_vm_cpu_feat data;
++ 
++ 	bitmap_copy((unsigned long *) data.feat,
++ 		    kvm_s390_available_cpu_feat,
++ 		    KVM_S390_VM_CPU_FEAT_NR_BITS);
++ 	if (copy_to_user((void __user *)attr->addr, &data, sizeof(data)))
++ 		return -EFAULT;
++ 	return 0;
++ }
++ 
++ static int kvm_s390_get_processor_subfunc(struct kvm *kvm,
++ 					  struct kvm_device_attr *attr)
++ {
++ 	/*
++ 	 * Once we can actually configure subfunctions (kernel + hw support),
++ 	 * we have to check if they were already set by user space, if so copy
++ 	 * them from kvm->arch.
++ 	 */
++ 	return -ENXIO;
++ }
++ 
++ static int kvm_s390_get_machine_subfunc(struct kvm *kvm,
++ 					struct kvm_device_attr *attr)
++ {
++ 	if (copy_to_user((void __user *)attr->addr, &kvm_s390_available_subfunc,
++ 	    sizeof(struct kvm_s390_vm_cpu_subfunc)))
++ 		return -EFAULT;
++ 	return 0;
++ }
++ static int kvm_s390_get_cpu_model(struct kvm *kvm, struct kvm_device_attr *attr)
++ {
++ 	int ret = -ENXIO;
++ 
++ 	switch (attr->attr) {
++ 	case KVM_S390_VM_CPU_PROCESSOR:
++ 		ret = kvm_s390_get_processor(kvm, attr);
++ 		break;
++ 	case KVM_S390_VM_CPU_MACHINE:
++ 		ret = kvm_s390_get_machine(kvm, attr);
++ 		break;
++ 	case KVM_S390_VM_CPU_PROCESSOR_FEAT:
++ 		ret = kvm_s390_get_processor_feat(kvm, attr);
++ 		break;
++ 	case KVM_S390_VM_CPU_MACHINE_FEAT:
++ 		ret = kvm_s390_get_machine_feat(kvm, attr);
++ 		break;
++ 	case KVM_S390_VM_CPU_PROCESSOR_SUBFUNC:
++ 		ret = kvm_s390_get_processor_subfunc(kvm, attr);
++ 		break;
++ 	case KVM_S390_VM_CPU_MACHINE_SUBFUNC:
++ 		ret = kvm_s390_get_machine_subfunc(kvm, attr);
++ 		break;
++ 	}
++ 	return ret;
++ }
++ 
++ static int kvm_s390_vm_set_attr(struct kvm *kvm, struct kvm_device_attr *attr)
++ {
++ 	int ret;
++ 
++ 	switch (attr->group) {
++ 	case KVM_S390_VM_MEM_CTRL:
++ 		ret = kvm_s390_set_mem_control(kvm, attr);
++ 		break;
++ 	case KVM_S390_VM_TOD:
++ 		ret = kvm_s390_set_tod(kvm, attr);
++ 		break;
++ 	case KVM_S390_VM_CPU_MODEL:
++ 		ret = kvm_s390_set_cpu_model(kvm, attr);
++ 		break;
++ 	case KVM_S390_VM_CRYPTO:
++ 		ret = kvm_s390_vm_set_crypto(kvm, attr);
++ 		break;
++ 	default:
++ 		ret = -ENXIO;
++ 		break;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static int kvm_s390_vm_get_attr(struct kvm *kvm, struct kvm_device_attr *attr)
++ {
++ 	int ret;
++ 
++ 	switch (attr->group) {
++ 	case KVM_S390_VM_MEM_CTRL:
++ 		ret = kvm_s390_get_mem_control(kvm, attr);
++ 		break;
++ 	case KVM_S390_VM_TOD:
++ 		ret = kvm_s390_get_tod(kvm, attr);
++ 		break;
++ 	case KVM_S390_VM_CPU_MODEL:
++ 		ret = kvm_s390_get_cpu_model(kvm, attr);
++ 		break;
++ 	default:
++ 		ret = -ENXIO;
++ 		break;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static int kvm_s390_vm_has_attr(struct kvm *kvm, struct kvm_device_attr *attr)
++ {
++ 	int ret;
++ 
++ 	switch (attr->group) {
++ 	case KVM_S390_VM_MEM_CTRL:
++ 		switch (attr->attr) {
++ 		case KVM_S390_VM_MEM_ENABLE_CMMA:
++ 		case KVM_S390_VM_MEM_CLR_CMMA:
++ 			ret = sclp.has_cmma ? 0 : -ENXIO;
++ 			break;
++ 		case KVM_S390_VM_MEM_LIMIT_SIZE:
++ 			ret = 0;
++ 			break;
++ 		default:
++ 			ret = -ENXIO;
++ 			break;
++ 		}
++ 		break;
++ 	case KVM_S390_VM_TOD:
++ 		switch (attr->attr) {
++ 		case KVM_S390_VM_TOD_LOW:
++ 		case KVM_S390_VM_TOD_HIGH:
++ 			ret = 0;
++ 			break;
++ 		default:
++ 			ret = -ENXIO;
++ 			break;
++ 		}
++ 		break;
++ 	case KVM_S390_VM_CPU_MODEL:
++ 		switch (attr->attr) {
++ 		case KVM_S390_VM_CPU_PROCESSOR:
++ 		case KVM_S390_VM_CPU_MACHINE:
++ 		case KVM_S390_VM_CPU_PROCESSOR_FEAT:
++ 		case KVM_S390_VM_CPU_MACHINE_FEAT:
++ 		case KVM_S390_VM_CPU_MACHINE_SUBFUNC:
++ 			ret = 0;
++ 			break;
++ 		/* configuring subfunctions is not supported yet */
++ 		case KVM_S390_VM_CPU_PROCESSOR_SUBFUNC:
++ 		default:
++ 			ret = -ENXIO;
++ 			break;
++ 		}
++ 		break;
++ 	case KVM_S390_VM_CRYPTO:
++ 		switch (attr->attr) {
++ 		case KVM_S390_VM_CRYPTO_ENABLE_AES_KW:
++ 		case KVM_S390_VM_CRYPTO_ENABLE_DEA_KW:
++ 		case KVM_S390_VM_CRYPTO_DISABLE_AES_KW:
++ 		case KVM_S390_VM_CRYPTO_DISABLE_DEA_KW:
++ 			ret = 0;
++ 			break;
++ 		default:
++ 			ret = -ENXIO;
++ 			break;
++ 		}
++ 		break;
++ 	default:
++ 		ret = -ENXIO;
++ 		break;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static long kvm_s390_get_skeys(struct kvm *kvm, struct kvm_s390_skeys *args)
++ {
++ 	uint8_t *keys;
++ 	uint64_t hva;
++ 	int i, r = 0;
++ 
++ 	if (args->flags != 0)
++ 		return -EINVAL;
++ 
++ 	/* Is this guest using storage keys? */
++ 	if (!mm_use_skey(current->mm))
++ 		return KVM_S390_GET_SKEYS_NONE;
++ 
++ 	/* Enforce sane limit on memory allocation */
++ 	if (args->count < 1 || args->count > KVM_S390_SKEYS_MAX)
++ 		return -EINVAL;
++ 
++ 	keys = kvmalloc_array(args->count, sizeof(uint8_t), GFP_KERNEL);
++ 	if (!keys)
++ 		return -ENOMEM;
++ 
++ 	down_read(&current->mm->mmap_sem);
++ 	for (i = 0; i < args->count; i++) {
++ 		hva = gfn_to_hva(kvm, args->start_gfn + i);
++ 		if (kvm_is_error_hva(hva)) {
++ 			r = -EFAULT;
++ 			break;
++ 		}
++ 
++ 		r = get_guest_storage_key(current->mm, hva, &keys[i]);
++ 		if (r)
++ 			break;
++ 	}
++ 	up_read(&current->mm->mmap_sem);
++ 
++ 	if (!r) {
++ 		r = copy_to_user((uint8_t __user *)args->skeydata_addr, keys,
++ 				 sizeof(uint8_t) * args->count);
++ 		if (r)
++ 			r = -EFAULT;
++ 	}
++ 
++ 	kvfree(keys);
++ 	return r;
++ }
++ 
++ static long kvm_s390_set_skeys(struct kvm *kvm, struct kvm_s390_skeys *args)
++ {
++ 	uint8_t *keys;
++ 	uint64_t hva;
++ 	int i, r = 0;
++ 
++ 	if (args->flags != 0)
++ 		return -EINVAL;
++ 
++ 	/* Enforce sane limit on memory allocation */
++ 	if (args->count < 1 || args->count > KVM_S390_SKEYS_MAX)
++ 		return -EINVAL;
++ 
++ 	keys = kvmalloc_array(args->count, sizeof(uint8_t), GFP_KERNEL);
++ 	if (!keys)
++ 		return -ENOMEM;
++ 
++ 	r = copy_from_user(keys, (uint8_t __user *)args->skeydata_addr,
++ 			   sizeof(uint8_t) * args->count);
++ 	if (r) {
++ 		r = -EFAULT;
++ 		goto out;
++ 	}
++ 
++ 	/* Enable storage key handling for the guest */
++ 	r = s390_enable_skey();
++ 	if (r)
++ 		goto out;
++ 
++ 	down_read(&current->mm->mmap_sem);
++ 	for (i = 0; i < args->count; i++) {
++ 		hva = gfn_to_hva(kvm, args->start_gfn + i);
++ 		if (kvm_is_error_hva(hva)) {
++ 			r = -EFAULT;
++ 			break;
++ 		}
++ 
++ 		/* Lowest order bit is reserved */
++ 		if (keys[i] & 0x01) {
++ 			r = -EINVAL;
++ 			break;
++ 		}
++ 
++ 		r = set_guest_storage_key(current->mm, hva, keys[i], 0);
++ 		if (r)
++ 			break;
++ 	}
++ 	up_read(&current->mm->mmap_sem);
++ out:
++ 	kvfree(keys);
++ 	return r;
++ }
++ 
+++>>>>>>> 752ade68cbd8 (treewide: use kv[mz]alloc* rather than opencoded variants)
+  long kvm_arch_vm_ioctl(struct file *filp,
+  		       unsigned int ioctl, unsigned long arg)
+  {
+diff --cc crypto/lzo.c
+index d1ff69404353,218567d717d6..000000000000
+--- a/crypto/lzo.c
++++ b/crypto/lzo.c
+@@@ -26,6 -28,17 +26,20 @@@ struct lzo_ctx 
+  	void *lzo_comp_mem;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static void *lzo_alloc_ctx(struct crypto_scomp *tfm)
++ {
++ 	void *ctx;
++ 
++ 	ctx = kvmalloc(LZO1X_MEM_COMPRESS, GFP_KERNEL);
++ 	if (!ctx)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	return ctx;
++ }
++ 
+++>>>>>>> 752ade68cbd8 (treewide: use kv[mz]alloc* rather than opencoded variants)
+  static int lzo_init(struct crypto_tfm *tfm)
+  {
+  	struct lzo_ctx *ctx = crypto_tfm_ctx(tfm);
+diff --cc drivers/xen/evtchn.c
+index b6165e047f48,10f1ef582659..000000000000
+--- a/drivers/xen/evtchn.c
++++ b/drivers/xen/evtchn.c
+@@@ -69,56 -74,105 +69,67 @@@ struct per_user_data 
+  	wait_queue_head_t evtchn_wait;
+  	struct fasync_struct *evtchn_async_queue;
+  	const char *name;
+ -
+ -	domid_t restrict_domid;
+  };
+  
+ -#define UNRESTRICTED_DOMID ((domid_t)-1)
+ +/*
+ + * Who's bound to each port?  This is logically an array of struct
+ + * per_user_data *, but we encode the current enabled-state in bit 0.
+ + */
+ +static unsigned long *port_user;
+ +static DEFINE_SPINLOCK(port_user_lock); /* protects port_user[] and ring_prod */
+ +
+++<<<<<<< HEAD
+ +static inline struct per_user_data *get_port_user(unsigned port)
+ +{
+ +	return (struct per_user_data *)(port_user[port] & ~1);
+ +}
+  
+ +static inline void set_port_user(unsigned port, struct per_user_data *u)
+++=======
++ struct user_evtchn {
++ 	struct rb_node node;
++ 	struct per_user_data *user;
++ 	unsigned port;
++ 	bool enabled;
++ };
++ 
++ static void evtchn_free_ring(evtchn_port_t *ring)
+++>>>>>>> 752ade68cbd8 (treewide: use kv[mz]alloc* rather than opencoded variants)
+  {
+ -	kvfree(ring);
+ -}
+ -
+ -static unsigned int evtchn_ring_offset(struct per_user_data *u,
+ -				       unsigned int idx)
+ -{
+ -	return idx & (u->ring_size - 1);
+ -}
+ -
+ -static evtchn_port_t *evtchn_ring_entry(struct per_user_data *u,
+ -					unsigned int idx)
+ -{
+ -	return u->ring + evtchn_ring_offset(u, idx);
+ +	port_user[port] = (unsigned long)u;
+  }
+  
+ -static int add_evtchn(struct per_user_data *u, struct user_evtchn *evtchn)
+ +static inline bool get_port_enabled(unsigned port)
+  {
+ -	struct rb_node **new = &(u->evtchns.rb_node), *parent = NULL;
+ -
+ -	u->nr_evtchns++;
+ -
+ -	while (*new) {
+ -		struct user_evtchn *this;
+ -
+ -		this = rb_entry(*new, struct user_evtchn, node);
+ -
+ -		parent = *new;
+ -		if (this->port < evtchn->port)
+ -			new = &((*new)->rb_left);
+ -		else if (this->port > evtchn->port)
+ -			new = &((*new)->rb_right);
+ -		else
+ -			return -EEXIST;
+ -	}
+ -
+ -	/* Add new node and rebalance tree. */
+ -	rb_link_node(&evtchn->node, parent, new);
+ -	rb_insert_color(&evtchn->node, &u->evtchns);
+ -
+ -	return 0;
+ +	return port_user[port] & 1;
+  }
+  
+ -static void del_evtchn(struct per_user_data *u, struct user_evtchn *evtchn)
+ +static inline void set_port_enabled(unsigned port, bool enabled)
+  {
+ -	u->nr_evtchns--;
+ -	rb_erase(&evtchn->node, &u->evtchns);
+ -	kfree(evtchn);
+ +	if (enabled)
+ +		port_user[port] |= 1;
+ +	else
+ +		port_user[port] &= ~1;
+  }
+  
+ -static struct user_evtchn *find_evtchn(struct per_user_data *u, unsigned port)
+ +static irqreturn_t evtchn_interrupt(int irq, void *data)
+  {
+ -	struct rb_node *node = u->evtchns.rb_node;
+ -
+ -	while (node) {
+ -		struct user_evtchn *evtchn;
+ -
+ -		evtchn = rb_entry(node, struct user_evtchn, node);
+ +	unsigned int port = (unsigned long)data;
+ +	struct per_user_data *u;
+  
+ -		if (evtchn->port < port)
+ -			node = node->rb_left;
+ -		else if (evtchn->port > port)
+ -			node = node->rb_right;
+ -		else
+ -			return evtchn;
+ -	}
+ -	return NULL;
+ -}
+ +	spin_lock(&port_user_lock);
+  
+ -static irqreturn_t evtchn_interrupt(int irq, void *data)
+ -{
+ -	struct user_evtchn *evtchn = data;
+ -	struct per_user_data *u = evtchn->user;
+ +	u = get_port_user(port);
+  
+ -	WARN(!evtchn->enabled,
+ +	WARN(!get_port_enabled(port),
+  	     "Interrupt for port %d, but apparently not enabled; per-user %p\n",
+ -	     evtchn->port, u);
+ +	     port, u);
+  
+  	disable_irq_nosync(irq);
+ -	evtchn->enabled = false;
+ -
+ -	spin_lock(&u->ring_prod_lock);
+ +	set_port_enabled(port, false);
+  
+ -	if ((u->ring_prod - u->ring_cons) < u->ring_size) {
+ -		*evtchn_ring_entry(u, u->ring_prod) = evtchn->port;
+ +	if ((u->ring_prod - u->ring_cons) < EVTCHN_RING_SIZE) {
+ +		u->ring[EVTCHN_RING_MASK(u->ring_prod)] = port;
+  		wmb(); /* Ensure ring contents visible */
+  		if (u->ring_cons == u->ring_prod++) {
+  			wake_up_interruptible(&u->evtchn_wait);
+@@@ -251,8 -305,66 +262,67 @@@ static ssize_t evtchn_write(struct fil
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int evtchn_resize_ring(struct per_user_data *u)
++ {
++ 	unsigned int new_size;
++ 	evtchn_port_t *new_ring, *old_ring;
++ 
++ 	/*
++ 	 * Ensure the ring is large enough to capture all possible
++ 	 * events. i.e., one free slot for each bound event.
++ 	 */
++ 	if (u->nr_evtchns <= u->ring_size)
++ 		return 0;
++ 
++ 	if (u->ring_size == 0)
++ 		new_size = 64;
++ 	else
++ 		new_size = 2 * u->ring_size;
++ 
++ 	new_ring = kvmalloc(new_size * sizeof(*new_ring), GFP_KERNEL);
++ 	if (!new_ring)
++ 		return -ENOMEM;
++ 
++ 	old_ring = u->ring;
++ 
++ 	/*
++ 	 * Access to the ring contents is serialized by either the
++ 	 * prod /or/ cons lock so take both when resizing.
++ 	 */
++ 	mutex_lock(&u->ring_cons_mutex);
++ 	spin_lock_irq(&u->ring_prod_lock);
++ 
++ 	/*
++ 	 * Copy the old ring contents to the new ring.
++ 	 *
++ 	 * To take care of wrapping, a full ring, and the new index
++ 	 * pointing into the second half, simply copy the old contents
++ 	 * twice.
++ 	 *
++ 	 * +---------+    +------------------+
++ 	 * |34567  12| -> |34567  1234567  12|
++ 	 * +-----p-c-+    +-------c------p---+
++ 	 */
++ 	memcpy(new_ring, old_ring, u->ring_size * sizeof(*u->ring));
++ 	memcpy(new_ring + u->ring_size, old_ring,
++ 	       u->ring_size * sizeof(*u->ring));
++ 
++ 	u->ring = new_ring;
++ 	u->ring_size = new_size;
++ 
++ 	spin_unlock_irq(&u->ring_prod_lock);
++ 	mutex_unlock(&u->ring_cons_mutex);
++ 
++ 	evtchn_free_ring(old_ring);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 752ade68cbd8 (treewide: use kv[mz]alloc* rather than opencoded variants)
+  static int evtchn_bind_to_user(struct per_user_data *u, int port)
+  {
+ -	struct user_evtchn *evtchn;
+ -	struct evtchn_close close;
+  	int rc = 0;
+  
+  	/*
+diff --cc fs/btrfs/ctree.c
+index 5dab128d8697,1c3b6c54d5ee..000000000000
+--- a/fs/btrfs/ctree.c
++++ b/fs/btrfs/ctree.c
+@@@ -5380,13 -5392,10 +5380,20 @@@ int btrfs_compare_trees(struct btrfs_ro
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	tmp_buf = kmalloc(left_root->nodesize, GFP_KERNEL | __GFP_NOWARN);
+ +	if (!tmp_buf) {
+ +		tmp_buf = vmalloc(left_root->nodesize);
+ +		if (!tmp_buf) {
+ +			ret = -ENOMEM;
+ +			goto out;
+ +		}
+++=======
++ 	tmp_buf = kvmalloc(fs_info->nodesize, GFP_KERNEL);
++ 	if (!tmp_buf) {
++ 		ret = -ENOMEM;
++ 		goto out;
+++>>>>>>> 752ade68cbd8 (treewide: use kv[mz]alloc* rather than opencoded variants)
+  	}
+  
+  	left_path->search_commit_root = 1;
+diff --cc fs/btrfs/ioctl.c
+index a52468b4edad,922a66fce401..000000000000
+--- a/fs/btrfs/ioctl.c
++++ b/fs/btrfs/ioctl.c
+@@@ -3624,12 -3539,9 +3624,18 @@@ static int btrfs_clone(struct inode *sr
+  	u64 last_dest_end = destoff;
+  
+  	ret = -ENOMEM;
+++<<<<<<< HEAD
+ +	buf = kmalloc(root->nodesize, GFP_KERNEL | __GFP_NOWARN);
+ +	if (!buf) {
+ +		buf = vmalloc(root->nodesize);
+ +		if (!buf)
+ +			return ret;
+ +	}
+++=======
++ 	buf = kvmalloc(fs_info->nodesize, GFP_KERNEL);
++ 	if (!buf)
++ 		return ret;
+++>>>>>>> 752ade68cbd8 (treewide: use kv[mz]alloc* rather than opencoded variants)
+  
+  	path = btrfs_alloc_path();
+  	if (!path) {
+diff --cc include/linux/mm.h
+index 3416fff96060,7cb17c6b97de..000000000000
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@@ -406,41 -518,40 +406,66 @@@ static inline int is_vmalloc_or_module_
+  }
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ extern void *kvmalloc_node(size_t size, gfp_t flags, int node);
++ static inline void *kvmalloc(size_t size, gfp_t flags)
++ {
++ 	return kvmalloc_node(size, flags, NUMA_NO_NODE);
++ }
++ static inline void *kvzalloc_node(size_t size, gfp_t flags, int node)
++ {
++ 	return kvmalloc_node(size, flags | __GFP_ZERO, node);
++ }
++ static inline void *kvzalloc(size_t size, gfp_t flags)
++ {
++ 	return kvmalloc(size, flags | __GFP_ZERO);
++ }
++ 
++ static inline void *kvmalloc_array(size_t n, size_t size, gfp_t flags)
++ {
++ 	if (size != 0 && n > SIZE_MAX / size)
++ 		return NULL;
++ 
++ 	return kvmalloc(n * size, flags);
++ }
++ 
+++>>>>>>> 752ade68cbd8 (treewide: use kv[mz]alloc* rather than opencoded variants)
+  extern void kvfree(const void *addr);
+  
+ -static inline atomic_t *compound_mapcount_ptr(struct page *page)
+ +static inline void compound_lock(struct page *page)
+ +{
+ +#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ +	VM_BUG_ON_PAGE(PageSlab(page), page);
+ +	bit_spin_lock(PG_compound_lock, &page->flags);
+ +#endif
+ +}
+ +
+ +static inline void compound_unlock(struct page *page)
+  {
+ -	return &page[1].compound_mapcount;
+ +#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ +	VM_BUG_ON_PAGE(PageSlab(page), page);
+ +	bit_spin_unlock(PG_compound_lock, &page->flags);
+ +#endif
+  }
+  
+ -static inline int compound_mapcount(struct page *page)
+ +static inline unsigned long compound_lock_irqsave(struct page *page)
+  {
+ -	VM_BUG_ON_PAGE(!PageCompound(page), page);
+ -	page = compound_head(page);
+ -	return atomic_read(compound_mapcount_ptr(page)) + 1;
+ +	unsigned long uninitialized_var(flags);
+ +#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ +	local_irq_save(flags);
+ +	compound_lock(page);
+ +#endif
+ +	return flags;
+ +}
+ +
+ +static inline void compound_unlock_irqrestore(struct page *page,
+ +					      unsigned long flags)
+ +{
+ +#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ +	compound_unlock(page);
+ +	local_irq_restore(flags);
+ +#endif
+  }
+  
+  /*
+diff --cc net/ipv4/inet_hashtables.c
+index 94ae743db486,e9a59d2d91d4..000000000000
+--- a/net/ipv4/inet_hashtables.c
++++ b/net/ipv4/inet_hashtables.c
+@@@ -602,11 -658,34 +602,39 @@@ void inet_hashinfo_init(struct inet_has
+  {
+  	int i;
+  
+ +	atomic_set(&h->bsockets, 0);
+  	for (i = 0; i < INET_LHTABLE_SIZE; i++) {
+  		spin_lock_init(&h->listening_hash[i].lock);
+ -		INIT_HLIST_HEAD(&h->listening_hash[i].head);
+ -	}
+ +		INIT_HLIST_NULLS_HEAD(&h->listening_hash[i].head,
+ +				      i + LISTENING_NULLS_BASE);
+ +		}
+  }
+  EXPORT_SYMBOL_GPL(inet_hashinfo_init);
+++<<<<<<< HEAD
+++=======
++ 
++ int inet_ehash_locks_alloc(struct inet_hashinfo *hashinfo)
++ {
++ 	unsigned int locksz = sizeof(spinlock_t);
++ 	unsigned int i, nblocks = 1;
++ 
++ 	if (locksz != 0) {
++ 		/* allocate 2 cache lines or at least one spinlock per cpu */
++ 		nblocks = max(2U * L1_CACHE_BYTES / locksz, 1U);
++ 		nblocks = roundup_pow_of_two(nblocks * num_possible_cpus());
++ 
++ 		/* no more locks than number of hash buckets */
++ 		nblocks = min(nblocks, hashinfo->ehash_mask + 1);
++ 
++ 		hashinfo->ehash_locks = kvmalloc_array(nblocks, locksz, GFP_KERNEL);
++ 		if (!hashinfo->ehash_locks)
++ 			return -ENOMEM;
++ 
++ 		for (i = 0; i < nblocks; i++)
++ 			spin_lock_init(&hashinfo->ehash_locks[i]);
++ 	}
++ 	hashinfo->ehash_locks_mask = nblocks - 1;
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(inet_ehash_locks_alloc);
+++>>>>>>> 752ade68cbd8 (treewide: use kv[mz]alloc* rather than opencoded variants)
+diff --cc net/ipv4/tcp_metrics.c
+index af7c5919cddc,653bbd67e3a3..000000000000
+--- a/net/ipv4/tcp_metrics.c
++++ b/net/ipv4/tcp_metrics.c
+@@@ -1137,14 -1008,11 +1137,19 @@@ static int __net_init tcp_net_metrics_i
+  			slots = 8 * 1024;
+  	}
+  
+ -	tcp_metrics_hash_log = order_base_2(slots);
+ -	size = sizeof(struct tcpm_hash_bucket) << tcp_metrics_hash_log;
+ +	net->ipv4.tcp_metrics_hash_log = order_base_2(slots);
+ +	size = sizeof(struct tcpm_hash_bucket) << net->ipv4.tcp_metrics_hash_log;
+ +
+++<<<<<<< HEAD
+ +	net->ipv4.tcp_metrics_hash = kzalloc(size, GFP_KERNEL | __GFP_NOWARN);
+ +	if (!net->ipv4.tcp_metrics_hash)
+ +		net->ipv4.tcp_metrics_hash = vzalloc(size);
+  
+ +	if (!net->ipv4.tcp_metrics_hash)
+++=======
++ 	tcp_metrics_hash = kvzalloc(size, GFP_KERNEL);
++ 	if (!tcp_metrics_hash)
+++>>>>>>> 752ade68cbd8 (treewide: use kv[mz]alloc* rather than opencoded variants)
+  		return -ENOMEM;
+  
+  	return 0;
+diff --cc net/sched/sch_choke.c
+index f71e148f3849,b30a2c70bd48..000000000000
+--- a/net/sched/sch_choke.c
++++ b/net/sched/sch_choke.c
+@@@ -400,9 -376,7 +400,13 @@@ static int choke_change(struct Qdisc *s
+  	if (mask != q->tab_mask) {
+  		struct sk_buff **ntab;
+  
+++<<<<<<< HEAD
+ +		ntab = kcalloc(mask + 1, sizeof(struct sk_buff *), GFP_KERNEL);
+ +		if (!ntab)
+ +			ntab = vzalloc((mask + 1) * sizeof(struct sk_buff *));
+++=======
++ 		ntab = kvmalloc_array((mask + 1), sizeof(struct sk_buff *), GFP_KERNEL | __GFP_ZERO);
+++>>>>>>> 752ade68cbd8 (treewide: use kv[mz]alloc* rather than opencoded variants)
+  		if (!ntab)
+  			return -ENOMEM;
+  
+diff --cc net/sched/sch_fq_codel.c
+index 7d8847dc1983,9201abce928c..000000000000
+--- a/net/sched/sch_fq_codel.c
++++ b/net/sched/sch_fq_codel.c
+@@@ -449,25 -446,6 +449,28 @@@ static int fq_codel_change(struct Qdis
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static void *fq_codel_zalloc(size_t sz)
+ +{
+ +	void *ptr = kzalloc(sz, GFP_KERNEL | __GFP_NOWARN);
+ +
+ +	if (!ptr)
+ +		ptr = vzalloc(sz);
+ +	return ptr;
+ +}
+ +
+ +static void fq_codel_free(void *addr)
+ +{
+ +	if (addr) {
+ +		if (is_vmalloc_addr(addr))
+ +			vfree(addr);
+ +		else
+ +			kfree(addr);
+ +	}
+ +}
+ +
+++=======
+++>>>>>>> 752ade68cbd8 (treewide: use kv[mz]alloc* rather than opencoded variants)
+  static void fq_codel_destroy(struct Qdisc *sch)
+  {
+  	struct fq_codel_sched_data *q = qdisc_priv(sch);
+diff --cc net/sched/sch_hhf.c
+index f2b10daa7eec,51d3ba682af9..000000000000
+--- a/net/sched/sch_hhf.c
++++ b/net/sched/sch_hhf.c
+@@@ -474,39 -467,16 +474,42 @@@ static void hhf_reset(struct Qdisc *sch
+  		rtnl_kfree_skbs(skb, skb);
+  }
+  
+++<<<<<<< HEAD
+ +static void *hhf_zalloc(size_t sz)
+ +{
+ +	void *ptr = kzalloc(sz, GFP_KERNEL | __GFP_NOWARN);
+ +
+ +	if (!ptr)
+ +		ptr = vzalloc(sz);
+ +
+ +	return ptr;
+ +}
+ +
+ +static void hhf_free(void *addr)
+ +{
+ +	if (addr) {
+ +		if (is_vmalloc_addr(addr))
+ +			vfree(addr);
+ +		else
+ +			kfree(addr);
+ +	}
+ +}
+ +
+++=======
+++>>>>>>> 752ade68cbd8 (treewide: use kv[mz]alloc* rather than opencoded variants)
+  static void hhf_destroy(struct Qdisc *sch)
+  {
+  	int i;
+  	struct hhf_sched_data *q = qdisc_priv(sch);
+  
+  	for (i = 0; i < HHF_ARRAYS_CNT; i++) {
+- 		hhf_free(q->hhf_arrays[i]);
+- 		hhf_free(q->hhf_valid_bits[i]);
++ 		kvfree(q->hhf_arrays[i]);
++ 		kvfree(q->hhf_valid_bits[i]);
+  	}
+  
+ +	if (!q->hh_flows)
+ +		return;
+ +
+  	for (i = 0; i < HH_FLOWS_CNT; i++) {
+  		struct hh_flow_state *flow, *next;
+  		struct list_head *head = &q->hh_flows[i];
+diff --cc security/keys/keyctl.c
+index fdd28abe22f7,447a7d5cee0f..000000000000
+--- a/security/keys/keyctl.c
++++ b/security/keys/keyctl.c
+@@@ -1062,20 -1064,14 +1057,26 @@@ long keyctl_instantiate_key_common(key_
+  	/* pull the payload in if one was supplied */
+  	payload = NULL;
+  
+ -	if (from) {
+ +	if (payload_iov) {
+  		ret = -ENOMEM;
+++<<<<<<< HEAD
+ +		payload = kmalloc(plen, GFP_KERNEL);
+ +		if (!payload) {
+ +			if (plen <= PAGE_SIZE)
+ +				goto error;
+ +			vm = true;
+ +			payload = vmalloc(plen);
+ +			if (!payload)
+ +				goto error;
+ +		}
+++=======
++ 		payload = kvmalloc(plen, GFP_KERNEL);
++ 		if (!payload)
++ 			goto error;
+++>>>>>>> 752ade68cbd8 (treewide: use kv[mz]alloc* rather than opencoded variants)
+  
+ -		ret = -EFAULT;
+ -		if (!copy_from_iter_full(payload, plen, from))
+ +		ret = copy_from_user_iovec(payload, payload_iov, ioc);
+ +		if (ret < 0)
+  			goto error2;
+  	}
+  
+* Unmerged path drivers/staging/lustre/lnet/libcfs/linux/linux-mem.c
+* Unmerged path lib/iov_iter.c
+* Unmerged path mm/frame_vector.c
+* Unmerged path net/mpls/af_mpls.c
+* Unmerged path arch/s390/kvm/kvm-s390.c
+* Unmerged path crypto/lzo.c
+diff --git a/drivers/acpi/apei/erst.c b/drivers/acpi/apei/erst.c
+index 8c83407ea78f..807c001df182 100644
+--- a/drivers/acpi/apei/erst.c
++++ b/drivers/acpi/apei/erst.c
+@@ -514,7 +514,7 @@ retry:
+ 	if (i < erst_record_id_cache.len)
+ 		goto retry;
+ 	if (erst_record_id_cache.len >= erst_record_id_cache.size) {
+-		int new_size, alloc_size;
++		int new_size;
+ 		u64 *new_entries;
+ 
+ 		new_size = erst_record_id_cache.size * 2;
+@@ -526,11 +526,7 @@ retry:
+ 					   "too many record ID!\n");
+ 			return 0;
+ 		}
+-		alloc_size = new_size * sizeof(entries[0]);
+-		if (alloc_size < PAGE_SIZE)
+-			new_entries = kmalloc(alloc_size, GFP_KERNEL);
+-		else
+-			new_entries = vmalloc(alloc_size);
++		new_entries = kvmalloc(new_size * sizeof(entries[0]), GFP_KERNEL);
+ 		if (!new_entries)
+ 			return -ENOMEM;
+ 		memcpy(new_entries, entries,
+diff --git a/drivers/char/agp/generic.c b/drivers/char/agp/generic.c
+index f002fa5d1887..bdf418cac8ef 100644
+--- a/drivers/char/agp/generic.c
++++ b/drivers/char/agp/generic.c
+@@ -88,13 +88,7 @@ static int agp_get_key(void)
+ 
+ void agp_alloc_page_array(size_t size, struct agp_memory *mem)
+ {
+-	mem->pages = NULL;
+-
+-	if (size <= 2*PAGE_SIZE)
+-		mem->pages = kmalloc(size, GFP_KERNEL | __GFP_NOWARN);
+-	if (mem->pages == NULL) {
+-		mem->pages = vmalloc(size);
+-	}
++	mem->pages = kvmalloc(size, GFP_KERNEL);
+ }
+ EXPORT_SYMBOL(agp_alloc_page_array);
+ 
+diff --git a/drivers/gpu/drm/nouveau/nouveau_gem.c b/drivers/gpu/drm/nouveau/nouveau_gem.c
+index 201b52b750dd..77dd73ff126f 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_gem.c
++++ b/drivers/gpu/drm/nouveau/nouveau_gem.c
+@@ -568,9 +568,7 @@ u_memcpya(uint64_t user, unsigned nmemb, unsigned size)
+ 
+ 	size *= nmemb;
+ 
+-	mem = kmalloc(size, GFP_KERNEL | __GFP_NOWARN);
+-	if (!mem)
+-		mem = vmalloc(size);
++	mem = kvmalloc(size, GFP_KERNEL);
+ 	if (!mem)
+ 		return ERR_PTR(-ENOMEM);
+ 
+diff --git a/drivers/md/bcache/util.h b/drivers/md/bcache/util.h
+index 43fd78affcea..e3bc49f92dde 100644
+--- a/drivers/md/bcache/util.h
++++ b/drivers/md/bcache/util.h
+@@ -51,11 +51,7 @@ static inline void SET_##name(type *k, uint64_t v)		\
+ 	(heap)->used = 0;						\
+ 	(heap)->size = (_size);						\
+ 	_bytes = (heap)->size * sizeof(*(heap)->data);			\
+-	(heap)->data = NULL;						\
+-	if (_bytes < KMALLOC_MAX_SIZE)					\
+-		(heap)->data = kmalloc(_bytes, (gfp));			\
+-	if ((!(heap)->data) && ((gfp) & GFP_KERNEL))			\
+-		(heap)->data = vmalloc(_bytes);				\
++	(heap)->data = kvmalloc(_bytes, (gfp) & GFP_KERNEL);		\
+ 	(heap)->data;							\
+ })
+ 
+@@ -147,12 +143,8 @@ do {									\
+ 									\
+ 	(fifo)->mask = _allocated_size - 1;				\
+ 	(fifo)->front = (fifo)->back = 0;				\
+-	(fifo)->data = NULL;						\
+ 									\
+-	if (_bytes < KMALLOC_MAX_SIZE)					\
+-		(fifo)->data = kmalloc(_bytes, (gfp));			\
+-	if ((!(fifo)->data) && ((gfp) & GFP_KERNEL))			\
+-		(fifo)->data = vmalloc(_bytes);				\
++	(fifo)->data = kvmalloc(_bytes, (gfp) & GFP_KERNEL);		\
+ 	(fifo)->data;							\
+ })
+ 
+diff --git a/drivers/net/ethernet/chelsio/cxgb3/cxgb3_defs.h b/drivers/net/ethernet/chelsio/cxgb3/cxgb3_defs.h
+index 920d918ed193..f04e81f33795 100644
+--- a/drivers/net/ethernet/chelsio/cxgb3/cxgb3_defs.h
++++ b/drivers/net/ethernet/chelsio/cxgb3/cxgb3_defs.h
+@@ -41,9 +41,6 @@
+ 
+ #define VALIDATE_TID 1
+ 
+-void *cxgb_alloc_mem(unsigned long size);
+-void cxgb_free_mem(void *addr);
+-
+ /*
+  * Map an ATID or STID to their entries in the corresponding TID tables.
+  */
+diff --git a/drivers/net/ethernet/chelsio/cxgb3/cxgb3_offload.c b/drivers/net/ethernet/chelsio/cxgb3/cxgb3_offload.c
+index c560f5f30f73..100d3ab3a969 100644
+--- a/drivers/net/ethernet/chelsio/cxgb3/cxgb3_offload.c
++++ b/drivers/net/ethernet/chelsio/cxgb3/cxgb3_offload.c
+@@ -1151,27 +1151,6 @@ static void cxgb_redirect(struct dst_entry *old, struct dst_entry *new,
+ 	l2t_release(tdev, e);
+ }
+ 
+-/*
+- * Allocate a chunk of memory using kmalloc or, if that fails, vmalloc.
+- * The allocated memory is cleared.
+- */
+-void *cxgb_alloc_mem(unsigned long size)
+-{
+-	void *p = kzalloc(size, GFP_KERNEL | __GFP_NOWARN);
+-
+-	if (!p)
+-		p = vzalloc(size);
+-	return p;
+-}
+-
+-/*
+- * Free memory allocated through t3_alloc_mem().
+- */
+-void cxgb_free_mem(void *addr)
+-{
+-	kvfree(addr);
+-}
+-
+ /*
+  * Allocate and initialize the TID tables.  Returns 0 on success.
+  */
+@@ -1182,7 +1161,7 @@ static int init_tid_tabs(struct tid_info *t, unsigned int ntids,
+ 	unsigned long size = ntids * sizeof(*t->tid_tab) +
+ 	    natids * sizeof(*t->atid_tab) + nstids * sizeof(*t->stid_tab);
+ 
+-	t->tid_tab = cxgb_alloc_mem(size);
++	t->tid_tab = kvzalloc(size, GFP_KERNEL);
+ 	if (!t->tid_tab)
+ 		return -ENOMEM;
+ 
+@@ -1218,7 +1197,7 @@ static int init_tid_tabs(struct tid_info *t, unsigned int ntids,
+ 
+ static void free_tid_maps(struct tid_info *t)
+ {
+-	cxgb_free_mem(t->tid_tab);
++	kvfree(t->tid_tab);
+ }
+ 
+ static inline void add_adapter(struct adapter *adap)
+@@ -1293,7 +1272,7 @@ int cxgb3_offload_activate(struct adapter *adapter)
+ 	return 0;
+ 
+ out_free_l2t:
+-	t3_free_l2t(l2td);
++	kvfree(l2td);
+ out_free:
+ 	kfree(t);
+ 	return err;
+@@ -1302,7 +1281,7 @@ out_free:
+ static void clean_l2_data(struct rcu_head *head)
+ {
+ 	struct l2t_data *d = container_of(head, struct l2t_data, rcu_head);
+-	t3_free_l2t(d);
++	kvfree(d);
+ }
+ 
+ 
+diff --git a/drivers/net/ethernet/chelsio/cxgb3/l2t.c b/drivers/net/ethernet/chelsio/cxgb3/l2t.c
+index 8d53438638b2..51e02dbd0e2b 100644
+--- a/drivers/net/ethernet/chelsio/cxgb3/l2t.c
++++ b/drivers/net/ethernet/chelsio/cxgb3/l2t.c
+@@ -444,7 +444,7 @@ struct l2t_data *t3_init_l2t(unsigned int l2t_capacity)
+ 	struct l2t_data *d;
+ 	int i, size = sizeof(*d) + l2t_capacity * sizeof(struct l2t_entry);
+ 
+-	d = cxgb_alloc_mem(size);
++	d = kvzalloc(size, GFP_KERNEL);
+ 	if (!d)
+ 		return NULL;
+ 
+@@ -462,9 +462,3 @@ struct l2t_data *t3_init_l2t(unsigned int l2t_capacity)
+ 	}
+ 	return d;
+ }
+-
+-void t3_free_l2t(struct l2t_data *d)
+-{
+-	cxgb_free_mem(d);
+-}
+-
+diff --git a/drivers/net/ethernet/chelsio/cxgb3/l2t.h b/drivers/net/ethernet/chelsio/cxgb3/l2t.h
+index 8cffcdfd5678..c2fd323c4078 100644
+--- a/drivers/net/ethernet/chelsio/cxgb3/l2t.h
++++ b/drivers/net/ethernet/chelsio/cxgb3/l2t.h
+@@ -115,7 +115,6 @@ int t3_l2t_send_slow(struct t3cdev *dev, struct sk_buff *skb,
+ 		     struct l2t_entry *e);
+ void t3_l2t_send_event(struct t3cdev *dev, struct l2t_entry *e);
+ struct l2t_data *t3_init_l2t(unsigned int l2t_capacity);
+-void t3_free_l2t(struct l2t_data *d);
+ 
+ int cxgb3_ofld_send(struct t3cdev *dev, struct sk_buff *skb);
+ 
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/clip_tbl.c b/drivers/net/ethernet/chelsio/cxgb4/clip_tbl.c
+index 1da56ecb3fda..15b6ac8f2c30 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/clip_tbl.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/clip_tbl.c
+@@ -287,8 +287,8 @@ struct clip_tbl *t4_init_clip_tbl(unsigned int clipt_start,
+ 	if (clipt_size < CLIPT_MIN_HASH_BUCKETS)
+ 		return NULL;
+ 
+-	ctbl = t4_alloc_mem(sizeof(*ctbl) +
+-			    clipt_size*sizeof(struct list_head));
++	ctbl = kvzalloc(sizeof(*ctbl) +
++			    clipt_size*sizeof(struct list_head), GFP_KERNEL);
+ 	if (!ctbl)
+ 		return NULL;
+ 
+@@ -302,9 +302,9 @@ struct clip_tbl *t4_init_clip_tbl(unsigned int clipt_start,
+ 	for (i = 0; i < ctbl->clipt_size; ++i)
+ 		INIT_LIST_HEAD(&ctbl->hash_list[i]);
+ 
+-	cl_list = t4_alloc_mem(clipt_size*sizeof(struct clip_entry));
++	cl_list = kvzalloc(clipt_size*sizeof(struct clip_entry), GFP_KERNEL);
+ 	if (!cl_list) {
+-		t4_free_mem(ctbl);
++		kvfree(ctbl);
+ 		return NULL;
+ 	}
+ 	ctbl->cl_list = (void *)cl_list;
+@@ -323,8 +323,8 @@ void t4_cleanup_clip_tbl(struct adapter *adap)
+ 
+ 	if (ctbl) {
+ 		if (ctbl->cl_list)
+-			t4_free_mem(ctbl->cl_list);
+-		t4_free_mem(ctbl);
++			kvfree(ctbl->cl_list);
++		kvfree(ctbl);
+ 	}
+ }
+ EXPORT_SYMBOL(t4_cleanup_clip_tbl);
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+index 340dd7351b2d..97c3a47170bf 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+@@ -1300,8 +1300,6 @@ extern const char cxgb4_driver_version[];
+ void t4_os_portmod_changed(const struct adapter *adap, int port_id);
+ void t4_os_link_changed(struct adapter *adap, int port_id, int link_stat);
+ 
+-void *t4_alloc_mem(size_t size);
+-
+ void t4_free_sge_resources(struct adapter *adap);
+ void t4_free_ofld_rxqs(struct adapter *adap, int n, struct sge_ofld_rxq *q);
+ irq_handler_t t4_intr_handler(struct adapter *adap);
+@@ -1684,7 +1682,6 @@ int t4_sched_params(struct adapter *adapter, int type, int level, int mode,
+ 		    int rateunit, int ratemode, int channel, int class,
+ 		    int minrate, int maxrate, int weight, int pktsize);
+ void t4_sge_decode_idma_state(struct adapter *adapter, int state);
+-void t4_free_mem(void *addr);
+ void t4_idma_monitor_init(struct adapter *adapter,
+ 			  struct sge_idma_monitor_state *idma);
+ void t4_idma_monitor(struct adapter *adapter,
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_debugfs.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_debugfs.c
+index bc7c596dc8e9..7e7319ab6923 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_debugfs.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_debugfs.c
+@@ -2634,7 +2634,7 @@ static ssize_t mem_read(struct file *file, char __user *buf, size_t count,
+ 	if (count > avail - pos)
+ 		count = avail - pos;
+ 
+-	data = t4_alloc_mem(count);
++	data = kvzalloc(count, GFP_KERNEL);
+ 	if (!data)
+ 		return -ENOMEM;
+ 
+@@ -2642,12 +2642,12 @@ static ssize_t mem_read(struct file *file, char __user *buf, size_t count,
+ 	ret = t4_memory_rw(adap, 0, mem, pos, count, data, T4_MEMORY_READ);
+ 	spin_unlock(&adap->win0_lock);
+ 	if (ret) {
+-		t4_free_mem(data);
++		kvfree(data);
+ 		return ret;
+ 	}
+ 	ret = copy_to_user(buf, data, count);
+ 
+-	t4_free_mem(data);
++	kvfree(data);
+ 	if (ret)
+ 		return -EFAULT;
+ 
+@@ -2770,7 +2770,7 @@ static ssize_t blocked_fl_read(struct file *filp, char __user *ubuf,
+ 		       adap->sge.egr_sz, adap->sge.blocked_fl);
+ 	len += sprintf(buf + len, "\n");
+ 	size = simple_read_from_buffer(ubuf, count, ppos, buf, len);
+-	t4_free_mem(buf);
++	kvfree(buf);
+ 	return size;
+ }
+ 
+@@ -2790,7 +2790,7 @@ static ssize_t blocked_fl_write(struct file *filp, const char __user *ubuf,
+ 		return err;
+ 
+ 	bitmap_copy(adap->sge.blocked_fl, t, adap->sge.egr_sz);
+-	t4_free_mem(t);
++	kvfree(t);
+ 	return count;
+ }
+ 
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_ethtool.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_ethtool.c
+index 9cec36d9e4bd..80a79834e843 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_ethtool.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_ethtool.c
+@@ -997,7 +997,7 @@ static int get_eeprom(struct net_device *dev, struct ethtool_eeprom *e,
+ {
+ 	int i, err = 0;
+ 	struct adapter *adapter = netdev2adap(dev);
+-	u8 *buf = t4_alloc_mem(EEPROMSIZE);
++	u8 *buf = kvzalloc(EEPROMSIZE, GFP_KERNEL);
+ 
+ 	if (!buf)
+ 		return -ENOMEM;
+@@ -1008,7 +1008,7 @@ static int get_eeprom(struct net_device *dev, struct ethtool_eeprom *e,
+ 
+ 	if (!err)
+ 		memcpy(data, buf + e->offset, e->len);
+-	t4_free_mem(buf);
++	kvfree(buf);
+ 	return err;
+ }
+ 
+@@ -1037,7 +1037,7 @@ static int set_eeprom(struct net_device *dev, struct ethtool_eeprom *eeprom,
+ 	if (aligned_offset != eeprom->offset || aligned_len != eeprom->len) {
+ 		/* RMW possibly needed for first or last words.
+ 		 */
+-		buf = t4_alloc_mem(aligned_len);
++		buf = kvzalloc(aligned_len, GFP_KERNEL);
+ 		if (!buf)
+ 			return -ENOMEM;
+ 		err = eeprom_rd_phys(adapter, aligned_offset, (u32 *)buf);
+@@ -1065,7 +1065,7 @@ static int set_eeprom(struct net_device *dev, struct ethtool_eeprom *eeprom,
+ 		err = t4_seeprom_wp(adapter, true);
+ out:
+ 	if (buf != data)
+-		t4_free_mem(buf);
++		kvfree(buf);
+ 	return err;
+ }
+ 
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+index 7eb2bfa69942..e4085f679e43 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+@@ -890,27 +890,6 @@ freeout:
+ 	return err;
+ }
+ 
+-/*
+- * Allocate a chunk of memory using kmalloc or, if that fails, vmalloc.
+- * The allocated memory is cleared.
+- */
+-void *t4_alloc_mem(size_t size)
+-{
+-	void *p = kzalloc(size, GFP_KERNEL | __GFP_NOWARN);
+-
+-	if (!p)
+-		p = vzalloc(size);
+-	return p;
+-}
+-
+-/*
+- * Free memory allocated through alloc_mem().
+- */
+-void t4_free_mem(void *addr)
+-{
+-	kvfree(addr);
+-}
+-
+ static u16 cxgb_select_queue(struct net_device *dev, struct sk_buff *skb,
+ 			     void *accel_priv, select_queue_fallback_t fallback)
+ {
+@@ -1319,7 +1298,7 @@ static int tid_init(struct tid_info *t)
+ 	       max_ftids * sizeof(*t->ftid_tab) +
+ 	       ftid_bmap_size * sizeof(long);
+ 
+-	t->tid_tab = t4_alloc_mem(size);
++	t->tid_tab = kvzalloc(size, GFP_KERNEL);
+ 	if (!t->tid_tab)
+ 		return -ENOMEM;
+ 
+@@ -3493,7 +3472,7 @@ static int adap_init0(struct adapter *adap)
+ 		/* allocate memory to read the header of the firmware on the
+ 		 * card
+ 		 */
+-		card_fw = t4_alloc_mem(sizeof(*card_fw));
++		card_fw = kvzalloc(sizeof(*card_fw), GFP_KERNEL);
+ 
+ 		/* Get FW from from /lib/firmware/ */
+ 		ret = request_firmware(&fw, fw_info->fw_mod_name,
+@@ -3513,7 +3492,7 @@ static int adap_init0(struct adapter *adap)
+ 
+ 		/* Cleaning up */
+ 		release_firmware(fw);
+-		t4_free_mem(card_fw);
++		kvfree(card_fw);
+ 
+ 		if (ret < 0)
+ 			goto bye;
+@@ -4473,9 +4452,9 @@ static void free_some_resources(struct adapter *adapter)
+ {
+ 	unsigned int i;
+ 
+-	t4_free_mem(adapter->l2t);
++	kvfree(adapter->l2t);
+ 	t4_cleanup_sched(adapter);
+-	t4_free_mem(adapter->tids.tid_tab);
++	kvfree(adapter->tids.tid_tab);
+ 	cxgb4_cleanup_tc_u32(adapter);
+ 	kfree(adapter->sge.egr_map);
+ 	kfree(adapter->sge.ingr_map);
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_u32.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_u32.c
+index 82a33ea38f03..1fb609ce752d 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_u32.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_u32.c
+@@ -431,9 +431,9 @@ void cxgb4_cleanup_tc_u32(struct adapter *adap)
+ 	for (i = 0; i < t->size; i++) {
+ 		struct cxgb4_link *link = &t->table[i];
+ 
+-		t4_free_mem(link->tid_map);
++		kvfree(link->tid_map);
+ 	}
+-	t4_free_mem(adap->tc_u32);
++	kvfree(adap->tc_u32);
+ }
+ 
+ struct cxgb4_tc_u32_table *cxgb4_init_tc_u32(struct adapter *adap)
+@@ -445,8 +445,8 @@ struct cxgb4_tc_u32_table *cxgb4_init_tc_u32(struct adapter *adap)
+ 	if (!max_tids)
+ 		return NULL;
+ 
+-	t = t4_alloc_mem(sizeof(*t) +
+-			 (max_tids * sizeof(struct cxgb4_link)));
++	t = kvzalloc(sizeof(*t) +
++			 (max_tids * sizeof(struct cxgb4_link)), GFP_KERNEL);
+ 	if (!t)
+ 		return NULL;
+ 
+@@ -457,7 +457,7 @@ struct cxgb4_tc_u32_table *cxgb4_init_tc_u32(struct adapter *adap)
+ 		unsigned int bmap_size;
+ 
+ 		bmap_size = BITS_TO_LONGS(max_tids);
+-		link->tid_map = t4_alloc_mem(sizeof(unsigned long) * bmap_size);
++		link->tid_map = kvzalloc(sizeof(unsigned long) * bmap_size, GFP_KERNEL);
+ 		if (!link->tid_map)
+ 			goto out_no_mem;
+ 		bitmap_zero(link->tid_map, max_tids);
+@@ -470,11 +470,11 @@ out_no_mem:
+ 		struct cxgb4_link *link = &t->table[i];
+ 
+ 		if (link->tid_map)
+-			t4_free_mem(link->tid_map);
++			kvfree(link->tid_map);
+ 	}
+ 
+ 	if (t)
+-		t4_free_mem(t);
++		kvfree(t);
+ 
+ 	return NULL;
+ }
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/l2t.c b/drivers/net/ethernet/chelsio/cxgb4/l2t.c
+index 60a26037a1c6..fb593a1a751e 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/l2t.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/l2t.c
+@@ -646,7 +646,7 @@ struct l2t_data *t4_init_l2t(unsigned int l2t_start, unsigned int l2t_end)
+ 	if (l2t_size < L2T_MIN_HASH_BUCKETS)
+ 		return NULL;
+ 
+-	d = t4_alloc_mem(sizeof(*d) + l2t_size * sizeof(struct l2t_entry));
++	d = kvzalloc(sizeof(*d) + l2t_size * sizeof(struct l2t_entry), GFP_KERNEL);
+ 	if (!d)
+ 		return NULL;
+ 
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/sched.c b/drivers/net/ethernet/chelsio/cxgb4/sched.c
+index 7dc5b3f7c773..9148abb7994c 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/sched.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/sched.c
+@@ -177,7 +177,7 @@ static int t4_sched_queue_unbind(struct port_info *pi, struct ch_sched_queue *p)
+ 		}
+ 
+ 		list_del(&qe->list);
+-		t4_free_mem(qe);
++		kvfree(qe);
+ 		if (atomic_dec_and_test(&e->refcnt)) {
+ 			e->state = SCHED_STATE_UNUSED;
+ 			memset(&e->info, 0, sizeof(e->info));
+@@ -201,7 +201,7 @@ static int t4_sched_queue_bind(struct port_info *pi, struct ch_sched_queue *p)
+ 	if (p->queue < 0 || p->queue >= pi->nqsets)
+ 		return -ERANGE;
+ 
+-	qe = t4_alloc_mem(sizeof(struct sched_queue_entry));
++	qe = kvzalloc(sizeof(struct sched_queue_entry), GFP_KERNEL);
+ 	if (!qe)
+ 		return -ENOMEM;
+ 
+@@ -211,7 +211,7 @@ static int t4_sched_queue_bind(struct port_info *pi, struct ch_sched_queue *p)
+ 	/* Unbind queue from any existing class */
+ 	err = t4_sched_queue_unbind(pi, p);
+ 	if (err) {
+-		t4_free_mem(qe);
++		kvfree(qe);
+ 		goto out;
+ 	}
+ 
+@@ -224,7 +224,7 @@ static int t4_sched_queue_bind(struct port_info *pi, struct ch_sched_queue *p)
+ 	spin_lock(&e->lock);
+ 	err = t4_sched_bind_unbind_op(pi, (void *)qe, SCHED_QUEUE, true);
+ 	if (err) {
+-		t4_free_mem(qe);
++		kvfree(qe);
+ 		spin_unlock(&e->lock);
+ 		goto out;
+ 	}
+@@ -512,7 +512,7 @@ struct sched_table *t4_init_sched(unsigned int sched_size)
+ 	struct sched_table *s;
+ 	unsigned int i;
+ 
+-	s = t4_alloc_mem(sizeof(*s) + sched_size * sizeof(struct sched_class));
++	s = kvzalloc(sizeof(*s) + sched_size * sizeof(struct sched_class), GFP_KERNEL);
+ 	if (!s)
+ 		return NULL;
+ 
+@@ -548,6 +548,6 @@ void t4_cleanup_sched(struct adapter *adap)
+ 				t4_sched_class_free(pi, e);
+ 			write_unlock(&s->rw_lock);
+ 		}
+-		t4_free_mem(s);
++		kvfree(s);
+ 	}
+ }
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_tx.c b/drivers/net/ethernet/mellanox/mlx4/en_tx.c
+index db739cbc5e74..f4dda73a515d 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_tx.c
+@@ -70,13 +70,10 @@ int mlx4_en_create_tx_ring(struct mlx4_en_priv *priv,
+ 	ring->full_size = ring->size - HEADROOM - MAX_DESC_TXBBS;
+ 
+ 	tmp = size * sizeof(struct mlx4_en_tx_info);
+-	ring->tx_info = kmalloc_node(tmp, GFP_KERNEL | __GFP_NOWARN, node);
++	ring->tx_info = kvmalloc_node(tmp, GFP_KERNEL, node);
+ 	if (!ring->tx_info) {
+-		ring->tx_info = vmalloc(tmp);
+-		if (!ring->tx_info) {
+-			err = -ENOMEM;
+-			goto err_ring;
+-		}
++		err = -ENOMEM;
++		goto err_ring;
+ 	}
+ 
+ 	en_dbg(DRV, priv, "Allocated tx_info ring at addr:%p size:%d\n",
+diff --git a/drivers/net/ethernet/mellanox/mlx4/mr.c b/drivers/net/ethernet/mellanox/mlx4/mr.c
+index fb66db0ec596..9d504e401631 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/mr.c
++++ b/drivers/net/ethernet/mellanox/mlx4/mr.c
+@@ -116,12 +116,9 @@ static int mlx4_buddy_init(struct mlx4_buddy *buddy, int max_order)
+ 
+ 	for (i = 0; i <= buddy->max_order; ++i) {
+ 		s = BITS_TO_LONGS(1 << (buddy->max_order - i));
+-		buddy->bits[i] = kcalloc(s, sizeof (long), GFP_KERNEL | __GFP_NOWARN);
+-		if (!buddy->bits[i]) {
+-			buddy->bits[i] = vzalloc(s * sizeof(long));
+-			if (!buddy->bits[i])
+-				goto err_out_free;
+-		}
++		buddy->bits[i] = kvmalloc_array(s, sizeof(long), GFP_KERNEL | __GFP_ZERO);
++		if (!buddy->bits[i])
++			goto err_out_free;
+ 	}
+ 
+ 	set_bit(0, buddy->bits[buddy->max_order]);
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index 0eedc49e0d47..3bd332b167d9 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -102,10 +102,7 @@ int nvdimm_init_config_data(struct nvdimm_drvdata *ndd)
+ 		return -ENXIO;
+ 	}
+ 
+-	ndd->data = kmalloc(ndd->nsarea.config_size, GFP_KERNEL);
+-	if (!ndd->data)
+-		ndd->data = vmalloc(ndd->nsarea.config_size);
+-
++	ndd->data = kvmalloc(ndd->nsarea.config_size, GFP_KERNEL);
+ 	if (!ndd->data)
+ 		return -ENOMEM;
+ 
+* Unmerged path drivers/staging/lustre/lnet/libcfs/linux/linux-mem.c
+* Unmerged path drivers/xen/evtchn.c
+* Unmerged path fs/btrfs/ctree.c
+* Unmerged path fs/btrfs/ioctl.c
+diff --git a/fs/btrfs/send.c b/fs/btrfs/send.c
+index 3074ec74470a..cb57c601aa59 100644
+--- a/fs/btrfs/send.c
++++ b/fs/btrfs/send.c
+@@ -6217,22 +6217,16 @@ long btrfs_ioctl_send(struct file *mnt_file, void __user *arg_)
+ 	sctx->clone_roots_cnt = arg->clone_sources_count;
+ 
+ 	sctx->send_max_size = BTRFS_SEND_BUF_SIZE;
+-	sctx->send_buf = kmalloc(sctx->send_max_size, GFP_KERNEL | __GFP_NOWARN);
++	sctx->send_buf = kvmalloc(sctx->send_max_size, GFP_KERNEL);
+ 	if (!sctx->send_buf) {
+-		sctx->send_buf = vmalloc(sctx->send_max_size);
+-		if (!sctx->send_buf) {
+-			ret = -ENOMEM;
+-			goto out;
+-		}
++		ret = -ENOMEM;
++		goto out;
+ 	}
+ 
+-	sctx->read_buf = kmalloc(BTRFS_SEND_READ_SIZE, GFP_KERNEL | __GFP_NOWARN);
++	sctx->read_buf = kvmalloc(BTRFS_SEND_READ_SIZE, GFP_KERNEL);
+ 	if (!sctx->read_buf) {
+-		sctx->read_buf = vmalloc(BTRFS_SEND_READ_SIZE);
+-		if (!sctx->read_buf) {
+-			ret = -ENOMEM;
+-			goto out;
+-		}
++		ret = -ENOMEM;
++		goto out;
+ 	}
+ 
+ 	sctx->pending_dir_moves = RB_ROOT;
+@@ -6253,13 +6247,10 @@ long btrfs_ioctl_send(struct file *mnt_file, void __user *arg_)
+ 	alloc_size = arg->clone_sources_count * sizeof(*arg->clone_sources);
+ 
+ 	if (arg->clone_sources_count) {
+-		clone_sources_tmp = kmalloc(alloc_size, GFP_KERNEL | __GFP_NOWARN);
++		clone_sources_tmp = kvmalloc(alloc_size, GFP_KERNEL);
+ 		if (!clone_sources_tmp) {
+-			clone_sources_tmp = vmalloc(alloc_size);
+-			if (!clone_sources_tmp) {
+-				ret = -ENOMEM;
+-				goto out;
+-			}
++			ret = -ENOMEM;
++			goto out;
+ 		}
+ 
+ 		ret = copy_from_user(clone_sources_tmp, arg->clone_sources,
+diff --git a/fs/ceph/file.c b/fs/ceph/file.c
+index 86e182f4bbfc..ebdf7fa23202 100644
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@ -74,12 +74,9 @@ dio_get_pages_alloc(const struct iov_iter *it, size_t nbytes,
+ 	align = (unsigned long)(it->iov->iov_base + it->iov_offset) &
+ 		(PAGE_SIZE - 1);
+ 	npages = calc_pages_for(align, nbytes);
+-	pages = kmalloc(sizeof(*pages) * npages, GFP_KERNEL);
+-	if (!pages) {
+-		pages = vmalloc(sizeof(*pages) * npages);
+-		if (!pages)
+-			return ERR_PTR(-ENOMEM);
+-	}
++	pages = kvmalloc(sizeof(*pages) * npages, GFP_KERNEL);
++	if (!pages)
++		return ERR_PTR(-ENOMEM);
+ 
+ 	for (idx = 0; idx < npages; ) {
+ 		void __user *data = tmp_it.iov->iov_base + tmp_it.iov_offset;
+diff --git a/fs/select.c b/fs/select.c
+index af453e96dd54..0d775cffd01a 100644
+--- a/fs/select.c
++++ b/fs/select.c
+@@ -583,10 +583,7 @@ int core_sys_select(int n, fd_set __user *inp, fd_set __user *outp,
+ 			goto out_nofds;
+ 
+ 		alloc_size = 6 * size;
+-		bits = kmalloc(alloc_size, GFP_KERNEL|__GFP_NOWARN);
+-		if (!bits && alloc_size > PAGE_SIZE)
+-			bits = vmalloc(alloc_size);
+-
++		bits = kvmalloc(alloc_size, GFP_KERNEL);
+ 		if (!bits)
+ 			goto out_nofds;
+ 	}
+diff --git a/fs/xattr.c b/fs/xattr.c
+index 58b3ccae7837..069373f68aa1 100644
+--- a/fs/xattr.c
++++ b/fs/xattr.c
+@@ -338,12 +338,9 @@ setxattr(struct dentry *d, const char __user *name, const void __user *value,
+ 	if (size) {
+ 		if (size > XATTR_SIZE_MAX)
+ 			return -E2BIG;
+-		kvalue = kmalloc(size, GFP_KERNEL | __GFP_NOWARN);
+-		if (!kvalue) {
+-			kvalue = vmalloc(size);
+-			if (!kvalue)
+-				return -ENOMEM;
+-		}
++		kvalue = kvmalloc(size, GFP_KERNEL);
++		if (!kvalue)
++			return -ENOMEM;
+ 		if (copy_from_user(kvalue, value, size)) {
+ 			error = -EFAULT;
+ 			goto out;
+@@ -448,12 +445,9 @@ getxattr(struct dentry *d, const char __user *name, void __user *value,
+ 	if (size) {
+ 		if (size > XATTR_SIZE_MAX)
+ 			size = XATTR_SIZE_MAX;
+-		kvalue = kzalloc(size, GFP_KERNEL | __GFP_NOWARN);
+-		if (!kvalue) {
+-			kvalue = vzalloc(size);
+-			if (!kvalue)
+-				return -ENOMEM;
+-		}
++		kvalue = kvzalloc(size, GFP_KERNEL);
++		if (!kvalue)
++			return -ENOMEM;
+ 	}
+ 
+ 	error = vfs_getxattr(d, kname, kvalue, size);
+@@ -538,12 +532,9 @@ listxattr(struct dentry *d, char __user *list, size_t size)
+ 	if (size) {
+ 		if (size > XATTR_LIST_MAX)
+ 			size = XATTR_LIST_MAX;
+-		klist = kmalloc(size, __GFP_NOWARN | GFP_KERNEL);
+-		if (!klist) {
+-			klist = vmalloc(size);
+-			if (!klist)
+-				return -ENOMEM;
+-		}
++		klist = kvmalloc(size, GFP_KERNEL);
++		if (!klist)
++			return -ENOMEM;
+ 	}
+ 
+ 	error = vfs_listxattr(d, klist, size);
+diff --git a/include/linux/mlx5/driver.h b/include/linux/mlx5/driver.h
+index a9905f6fdc14..1b84cade0135 100644
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@ -812,12 +812,7 @@ static inline u16 cmdif_rev(struct mlx5_core_dev *dev)
+ 
+ static inline void *mlx5_vzalloc(unsigned long size)
+ {
+-	void *rtn;
+-
+-	rtn = kzalloc(size, GFP_KERNEL | __GFP_NOWARN);
+-	if (!rtn)
+-		rtn = vzalloc(size);
+-	return rtn;
++	return kvzalloc(size, GFP_KERNEL);
+ }
+ 
+ static inline u32 mlx5_base_mkey(const u32 key)
+* Unmerged path include/linux/mm.h
+* Unmerged path lib/iov_iter.c
+* Unmerged path mm/frame_vector.c
+* Unmerged path net/ipv4/inet_hashtables.c
+* Unmerged path net/ipv4/tcp_metrics.c
+* Unmerged path net/mpls/af_mpls.c
+diff --git a/net/netfilter/x_tables.c b/net/netfilter/x_tables.c
+index 95ed02c7f7d6..8461e7b9470c 100644
+--- a/net/netfilter/x_tables.c
++++ b/net/netfilter/x_tables.c
+@@ -730,17 +730,8 @@ EXPORT_SYMBOL(xt_check_entry_offsets);
+  */
+ unsigned int *xt_alloc_entry_offsets(unsigned int size)
+ {
+-	unsigned int *off;
++	return kvmalloc_array(size, sizeof(unsigned int), GFP_KERNEL | __GFP_ZERO);
+ 
+-	off = kcalloc(size, sizeof(unsigned int), GFP_KERNEL | __GFP_NOWARN);
+-
+-	if (off)
+-		return off;
+-
+-	if (size < (SIZE_MAX / sizeof(unsigned int)))
+-		off = vmalloc(size * sizeof(unsigned int));
+-
+-	return off;
+ }
+ EXPORT_SYMBOL(xt_alloc_entry_offsets);
+ 
+@@ -1054,7 +1045,7 @@ static int xt_jumpstack_alloc(struct xt_table_info *i)
+ 
+ 	size = sizeof(void **) * nr_cpu_ids;
+ 	if (size > PAGE_SIZE)
+-		i->jumpstack = vzalloc(size);
++		i->jumpstack = kvzalloc(size, GFP_KERNEL);
+ 	else
+ 		i->jumpstack = kzalloc(size, GFP_KERNEL);
+ 	if (i->jumpstack == NULL)
+@@ -1063,12 +1054,8 @@ static int xt_jumpstack_alloc(struct xt_table_info *i)
+ 	i->stacksize *= xt_jumpstack_multiplier;
+ 	size = sizeof(void *) * i->stacksize;
+ 	for_each_possible_cpu(cpu) {
+-		if (size > PAGE_SIZE)
+-			i->jumpstack[cpu] = vmalloc_node(size,
+-				cpu_to_node(cpu));
+-		else
+-			i->jumpstack[cpu] = kmalloc_node(size,
+-				GFP_KERNEL, cpu_to_node(cpu));
++		i->jumpstack[cpu] = kvmalloc_node(size, GFP_KERNEL,
++			cpu_to_node(cpu));
+ 		if (i->jumpstack[cpu] == NULL)
+ 			/*
+ 			 * Freeing will be done later on by the callers. The
+diff --git a/net/netfilter/xt_recent.c b/net/netfilter/xt_recent.c
+index 1e657cf715c4..667c4a7e7cba 100644
+--- a/net/netfilter/xt_recent.c
++++ b/net/netfilter/xt_recent.c
+@@ -371,10 +371,7 @@ static int recent_mt_check(const struct xt_mtchk_param *par,
+ 	}
+ 
+ 	sz = sizeof(*t) + sizeof(t->iphash[0]) * ip_list_hash_size;
+-	if (sz <= PAGE_SIZE)
+-		t = kzalloc(sz, GFP_KERNEL);
+-	else
+-		t = vzalloc(sz);
++	t = kvzalloc(sz, GFP_KERNEL);
+ 	if (t == NULL) {
+ 		ret = -ENOMEM;
+ 		goto out;
+* Unmerged path net/sched/sch_choke.c
+* Unmerged path net/sched/sch_fq_codel.c
+* Unmerged path net/sched/sch_hhf.c
+diff --git a/net/sched/sch_netem.c b/net/sched/sch_netem.c
+index 272a7b1221d2..c955e8b1d766 100644
+--- a/net/sched/sch_netem.c
++++ b/net/sched/sch_netem.c
+@@ -720,15 +720,11 @@ static int get_dist_table(struct Qdisc *sch, const struct nlattr *attr)
+ 	spinlock_t *root_lock;
+ 	struct disttable *d;
+ 	int i;
+-	size_t s;
+ 
+ 	if (n > NETEM_DIST_MAX)
+ 		return -EINVAL;
+ 
+-	s = sizeof(struct disttable) + n * sizeof(s16);
+-	d = kmalloc(s, GFP_KERNEL | __GFP_NOWARN);
+-	if (!d)
+-		d = vmalloc(s);
++	d = kvmalloc(sizeof(struct disttable) + n * sizeof(s16), GFP_KERNEL);
+ 	if (!d)
+ 		return -ENOMEM;
+ 
+diff --git a/net/sched/sch_sfq.c b/net/sched/sch_sfq.c
+index fa59fff16a4d..c03e55c847d6 100644
+--- a/net/sched/sch_sfq.c
++++ b/net/sched/sch_sfq.c
+@@ -693,11 +693,7 @@ static int sfq_change(struct Qdisc *sch, struct nlattr *opt)
+ 
+ static void *sfq_alloc(size_t sz)
+ {
+-	void *ptr = kmalloc(sz, GFP_KERNEL | __GFP_NOWARN);
+-
+-	if (!ptr)
+-		ptr = vmalloc(sz);
+-	return ptr;
++	return  kvmalloc(sz, GFP_KERNEL);
+ }
+ 
+ static void sfq_free(void *addr)
+* Unmerged path security/keys/keyctl.c
