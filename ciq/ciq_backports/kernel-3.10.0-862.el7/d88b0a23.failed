@@ -1,0 +1,167 @@
+nfp: disallow mixing vNICs with and without NSP port entry
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit d88b0a233fafa4abda3b3aa5a69d46574e4c793e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/d88b0a23.failed
+
+We only support core NIC apps which have vNICs for each physical port/
+split and no representors right now.  Enforce that either each vNIC has
+a NSP eth_table entry or if NSP port table is not available none do.
+
+One scenario this will prevent from happening is user force-loading
+wrong firmware file if FW app requires different firmwares per media
+config.
+
+While at it move some code to nfp_net_pf_alloc_vnic() to make it
+counter-match nfp_net_pf_free_vnic() better.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Simon Horman <simon.horman@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d88b0a233fafa4abda3b3aa5a69d46574e4c793e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+index acc8cfe284f3,8f267b1534e2..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+@@@ -281,9 -286,10 +281,16 @@@ static void nfp_net_pf_free_netdevs(str
+  }
+  
+  static struct nfp_net *
+++<<<<<<< HEAD
+ +nfp_net_pf_alloc_port_netdev(struct nfp_pf *pf, void __iomem *ctrl_bar,
+ +			     void __iomem *tx_bar, void __iomem *rx_bar,
+ +			     int stride, struct nfp_net_fw_version *fw_ver)
+++=======
++ nfp_net_pf_alloc_vnic(struct nfp_pf *pf, void __iomem *ctrl_bar,
++ 		      void __iomem *tx_bar, void __iomem *rx_bar,
++ 		      int stride, struct nfp_net_fw_version *fw_ver,
++ 		      unsigned int eth_id)
+++>>>>>>> d88b0a233faf (nfp: disallow mixing vNICs with and without NSP port entry)
+  {
+  	u32 n_tx_rings, n_rx_rings;
+  	struct nfp_net *nn;
+@@@ -296,14 -302,18 +303,21 @@@
+  	if (IS_ERR(nn))
+  		return nn;
+  
+ -	nn->app = pf->app;
+ +	nn->cpp = pf->cpp;
+  	nn->fw_ver = *fw_ver;
+ -	nn->dp.ctrl_bar = ctrl_bar;
+ +	nn->ctrl_bar = ctrl_bar;
+  	nn->tx_bar = tx_bar;
+  	nn->rx_bar = rx_bar;
+ -	nn->dp.is_vf = 0;
+ +	nn->is_vf = 0;
+  	nn->stride_rx = stride;
+  	nn->stride_tx = stride;
+++<<<<<<< HEAD
+++=======
++ 	nn->eth_port = nfp_net_find_port(pf->eth_tbl, eth_id);
++ 
++ 	pf->num_vnics++;
++ 	list_add_tail(&nn->vnic_list, &pf->vnics);
+++>>>>>>> d88b0a233faf (nfp: disallow mixing vNICs with and without NSP port entry)
+  
+  	return nn;
+  }
+@@@ -355,17 -370,31 +375,34 @@@ nfp_net_pf_alloc_netdevs(struct nfp_pf 
+  		prev_tx_base = tgt_tx_base;
+  		prev_rx_base = tgt_rx_base;
+  
+++<<<<<<< HEAD
+ +		nn = nfp_net_pf_alloc_port_netdev(pf, ctrl_bar, tx_bar, rx_bar,
+ +						  stride, fw_ver);
+++=======
++ 		nn = nfp_net_pf_alloc_vnic(pf, ctrl_bar, tx_bar, rx_bar,
++ 					   stride, fw_ver, i);
+++>>>>>>> d88b0a233faf (nfp: disallow mixing vNICs with and without NSP port entry)
+  		if (IS_ERR(nn)) {
+  			err = PTR_ERR(nn);
+  			goto err_free_prev;
+  		}
+ +		list_add_tail(&nn->port_list, &pf->ports);
+  
+  		ctrl_bar += NFP_PF_CSR_SLICE_SIZE;
++ 
++ 		/* Check if vNIC has external port associated and cfg is OK */
++ 		if (pf->eth_tbl && !nn->eth_port) {
++ 			nfp_err(pf->cpp, "NSP port entries don't match vNICs (no entry for port #%d)\n", i);
++ 			err = -EINVAL;
++ 			goto err_free_prev;
++ 		}
++ 		if (nn->eth_port && nn->eth_port->override_changed) {
++ 			nfp_warn(pf->cpp, "Config changed for port #%d, reboot required before port will be operational\n", i);
++ 			nfp_net_pf_free_vnic(pf, nn);
++ 			continue;
++ 		}
+  	}
+  
+ -	if (list_empty(&pf->vnics))
+ -		return -ENODEV;
+ -
+  	return 0;
+  
+  err_free_prev:
+@@@ -463,20 -506,41 +500,49 @@@ static void nfp_net_refresh_netdevs(str
+  {
+  	struct nfp_pf *pf = container_of(work, struct nfp_pf,
+  					 port_refresh_work);
+ -	struct nfp_eth_table *eth_table;
+  	struct nfp_net *nn, *next;
+  
+ -	mutex_lock(&pf->lock);
+ +	mutex_lock(&pf->port_lock);
+  
+  	/* Check for nfp_net_pci_remove() racing against us */
+ -	if (list_empty(&pf->vnics))
+ +	if (list_empty(&pf->ports))
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	list_for_each_entry_safe(nn, next, &pf->ports, port_list) {
+ +		if (!nn->eth_port) {
+ +			nfp_warn(pf->cpp, "Warning: port not present after reconfig\n");
+ +			continue;
+ +		}
+ +		if (!nn->eth_port->override_changed)
+++=======
++ 	list_for_each_entry(nn, &pf->vnics, vnic_list)
++ 		nfp_net_link_changed_read_clear(nn);
++ 
++ 	eth_table = nfp_eth_read_ports(pf->cpp);
++ 	if (!eth_table) {
++ 		nfp_err(pf->cpp, "Error refreshing port config!\n");
++ 		goto out;
++ 	}
++ 
++ 	rtnl_lock();
++ 	list_for_each_entry(nn, &pf->vnics, vnic_list) {
++ 		if (!nn->eth_port)
++ 			continue;
++ 		nn->eth_port = nfp_net_find_port(eth_table,
++ 						 nn->eth_port->eth_index);
++ 		if (!nn->eth_port)
++ 			nfp_err(pf->cpp,
++ 				"Warning: port disappeared after reconfig\n");
++ 	}
++ 	rtnl_unlock();
++ 
++ 	kfree(pf->eth_tbl);
++ 	pf->eth_tbl = eth_table;
++ 
++ 	list_for_each_entry_safe(nn, next, &pf->vnics, vnic_list) {
++ 		if (nn->eth_port && !nn->eth_port->override_changed)
+++>>>>>>> d88b0a233faf (nfp: disallow mixing vNICs with and without NSP port entry)
+  			continue;
+  
+  		nn_warn(nn, "Port config changed, unregistering. Reboot required before port will be operational again.\n");
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_main.c
