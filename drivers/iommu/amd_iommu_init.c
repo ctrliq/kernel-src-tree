@@ -1948,6 +1948,7 @@ static void __init free_iommu_resources(void)
 	kmemleak_free(irq_lookup_table);
 	free_pages((unsigned long)irq_lookup_table,
 		   get_order(rlookup_table_size));
+	irq_lookup_table = NULL;
 
 	if (amd_iommu_irq_cache) {
 		kmem_cache_destroy(amd_iommu_irq_cache);
@@ -1957,12 +1958,15 @@ static void __init free_iommu_resources(void)
 
 	free_pages((unsigned long)amd_iommu_rlookup_table,
 		   get_order(rlookup_table_size));
+	amd_iommu_rlookup_table = NULL;
 
 	free_pages((unsigned long)amd_iommu_alias_table,
 		   get_order(alias_table_size));
+	amd_iommu_alias_table = NULL;
 
 	free_pages((unsigned long)amd_iommu_dev_table,
 		   get_order(dev_table_size));
+	amd_iommu_dev_table = NULL;
 
 	free_iommu_all();
 
@@ -2032,6 +2036,7 @@ static void __init free_dma_resources(void)
 {
 	free_pages((unsigned long)amd_iommu_pd_alloc_bitmap,
 		   get_order(MAX_DOMAIN_ID/8));
+	amd_iommu_pd_alloc_bitmap = NULL;
 
 	free_unity_maps();
 }
