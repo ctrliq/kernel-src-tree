@@ -1,0 +1,88 @@
+nvmet-fc: fix target sgl list on large transfers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author James Smart <jsmart2021@gmail.com>
+commit d082dc1562a2ff0947b214796f12faaa87e816a9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/d082dc15.failed
+
+The existing code to carve up the sg list expected an sg element-per-page
+which can be very incorrect with iommu's remapping multiple memory pages
+to fewer bus addresses. To hit this error required a large io payload
+(greater than 256k) and a system that maps on a per-page basis. It's
+possible that large ios could get by fine if the system condensed the
+sgl list into the first 64 elements.
+
+This patch corrects the sg list handling by specifically walking the
+sg list element by element and attempting to divide the transfer up
+on a per-sg element boundary. While doing so, it still tries to keep
+sequences under 256k, but will exceed that rule if a single sg element
+is larger than 256k.
+
+Fixes: 48fa362b6c3f ("nvmet-fc: simplify sg list handling")
+	Cc: <stable@vger.kernel.org> # 4.14
+	Signed-off-by: James Smart <james.smart@broadcom.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit d082dc1562a2ff0947b214796f12faaa87e816a9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/target/fc.c
+diff --cc drivers/nvme/target/fc.c
+index 1f88d2000bd5,29b4b236afd8..000000000000
+--- a/drivers/nvme/target/fc.c
++++ b/drivers/nvme/target/fc.c
+@@@ -74,9 -74,9 +74,10 @@@ struct nvmet_fc_fcp_iod 
+  	struct nvme_fc_cmd_iu		cmdiubuf;
+  	struct nvme_fc_ersp_iu		rspiubuf;
+  	dma_addr_t			rspdma;
++ 	struct scatterlist		*next_sg;
+  	struct scatterlist		*data_sg;
+  	int				data_sg_cnt;
+ +	u32				total_length;
+  	u32				offset;
+  	enum nvmet_fcp_datadir		io_dir;
+  	bool				active;
+@@@ -1907,8 -1877,34 +1910,39 @@@ nvmet_fc_transfer_fcp_data(struct nvmet
+  	fcpreq->offset = fod->offset;
+  	fcpreq->timeout = NVME_FC_TGTOP_TIMEOUT_SEC;
+  
+++<<<<<<< HEAD
+ +	tlen = min_t(u32, tgtport->max_sg_cnt * PAGE_SIZE,
+ +			(fod->total_length - fod->offset));
+++=======
++ 	/*
++ 	 * for next sequence:
++ 	 *  break at a sg element boundary
++ 	 *  attempt to keep sequence length capped at
++ 	 *    NVMET_FC_MAX_SEQ_LENGTH but allow sequence to
++ 	 *    be longer if a single sg element is larger
++ 	 *    than that amount. This is done to avoid creating
++ 	 *    a new sg list to use for the tgtport api.
++ 	 */
++ 	fcpreq->sg = sg;
++ 	fcpreq->sg_cnt = 0;
++ 	while (tlen < remaininglen &&
++ 	       fcpreq->sg_cnt < tgtport->max_sg_cnt &&
++ 	       tlen + sg_dma_len(sg) < NVMET_FC_MAX_SEQ_LENGTH) {
++ 		fcpreq->sg_cnt++;
++ 		tlen += sg_dma_len(sg);
++ 		sg = sg_next(sg);
++ 	}
++ 	if (tlen < remaininglen && fcpreq->sg_cnt == 0) {
++ 		fcpreq->sg_cnt++;
++ 		tlen += min_t(u32, sg_dma_len(sg), remaininglen);
++ 		sg = sg_next(sg);
++ 	}
++ 	if (tlen < remaininglen)
++ 		fod->next_sg = sg;
++ 	else
++ 		fod->next_sg = NULL;
++ 
+++>>>>>>> d082dc1562a2 (nvmet-fc: fix target sgl list on large transfers)
+  	fcpreq->transfer_length = tlen;
+  	fcpreq->transferred_length = 0;
+  	fcpreq->fcp_error = 0;
+* Unmerged path drivers/nvme/target/fc.c
