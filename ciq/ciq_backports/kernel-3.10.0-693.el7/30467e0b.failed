@@ -1,0 +1,365 @@
+mm, hotplug: fix concurrent memory hot-add deadlock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [mm] hotplug: fix concurrent memory hot-add deadlock (Jeff Moyer) [1438579]
+Rebuild_FUZZ: 95.92%
+commit-author David Rientjes <rientjes@google.com>
+commit 30467e0b3be83c286d60039f8267dd421128ca74
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/30467e0b.failed
+
+There's a deadlock when concurrently hot-adding memory through the probe
+interface and switching a memory block from offline to online.
+
+When hot-adding memory via the probe interface, add_memory() first takes
+mem_hotplug_begin() and then device_lock() is later taken when registering
+the newly initialized memory block.  This creates a lock dependency of (1)
+mem_hotplug.lock (2) dev->mutex.
+
+When switching a memory block from offline to online, dev->mutex is first
+grabbed in device_online() when the write(2) transitions an existing
+memory block from offline to online, and then online_pages() will take
+mem_hotplug_begin().
+
+This creates a lock inversion between mem_hotplug.lock and dev->mutex.
+Vitaly reports that this deadlock can happen when kworker handling a probe
+event races with systemd-udevd switching a memory block's state.
+
+This patch requires the state transition to take mem_hotplug_begin()
+before dev->mutex.  Hot-adding memory via the probe interface creates a
+memory block while holding mem_hotplug_begin(), there is no way to take
+dev->mutex first in this case.
+
+online_pages() and offline_pages() are only called when transitioning
+memory block state.  We now require that mem_hotplug_begin() is taken
+before calling them -- this requires exporting the mem_hotplug_begin() and
+mem_hotplug_done() to generic code.  In all hot-add and hot-remove cases,
+mem_hotplug_begin() is done prior to device_online().  This is all that is
+needed to avoid the deadlock.
+
+	Signed-off-by: David Rientjes <rientjes@google.com>
+	Reported-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Tested-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: "Rafael J. Wysocki" <rjw@rjwysocki.net>
+	Cc: "K. Y. Srinivasan" <kys@microsoft.com>
+	Cc: Yasuaki Ishimatsu <isimatu.yasuaki@jp.fujitsu.com>
+	Cc: Tang Chen <tangchen@cn.fujitsu.com>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Zhang Zhen <zhenzhang.zhang@huawei.com>
+	Cc: Vladimir Davydov <vdavydov@parallels.com>
+	Cc: Wang Nan <wangnan0@huawei.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 30467e0b3be83c286d60039f8267dd421128ca74)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/base/memory.c
+#	mm/memory_hotplug.c
+diff --cc drivers/base/memory.c
+index 79b3863829bf,2804aed3f416..000000000000
+--- a/drivers/base/memory.c
++++ b/drivers/base/memory.c
+@@@ -294,8 -285,9 +295,9 @@@ static int memory_subsys_online(struct 
+  	 * attribute and need to set the online_type.
+  	 */
+  	if (mem->online_type < 0)
+ -		mem->online_type = MMOP_ONLINE_KEEP;
+ +		mem->online_type = ONLINE_KEEP;
+  
++ 	/* Already under protection of mem_hotplug_begin() */
+  	ret = memory_block_change_state(mem, MEM_ONLINE, MEM_OFFLINE);
+  
+  	/* clear online_type */
+@@@ -338,17 -330,19 +340,32 @@@ store_mem_state(struct device *dev
+  		goto err;
+  	}
+  
++ 	/*
++ 	 * Memory hotplug needs to hold mem_hotplug_begin() for probe to find
++ 	 * the correct memory block to online before doing device_online(dev),
++ 	 * which will take dev->mutex.  Take the lock early to prevent an
++ 	 * inversion, memory_subsys_online() callbacks will be implemented by
++ 	 * assuming it's already protected.
++ 	 */
++ 	mem_hotplug_begin();
++ 
+  	switch (online_type) {
+++<<<<<<< HEAD
+ +	case ONLINE_KERNEL:
+ +	case ONLINE_MOVABLE:
+ +	case ONLINE_KEEP:
+ +		/*
+ +		 * mem->online_type is not protected so there can be a
+ +		 * race here.  However, when racing online, the first
+ +		 * will succeed and the second will just return as the
+ +		 * block will already be online.  The online type
+ +		 * could be either one, but that is expected.
+ +		 */
+++=======
++ 	case MMOP_ONLINE_KERNEL:
++ 	case MMOP_ONLINE_MOVABLE:
++ 	case MMOP_ONLINE_KEEP:
+++>>>>>>> 30467e0b3be8 (mm, hotplug: fix concurrent memory hot-add deadlock)
+  		mem->online_type = online_type;
+  		ret = device_online(&mem->dev);
+  		break;
+diff --cc mm/memory_hotplug.c
+index 53747167957f,e2e8014fb755..000000000000
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@@ -49,19 -47,84 +49,43 @@@
+  static void generic_online_page(struct page *page);
+  
+  static online_page_callback_t online_page_callback = generic_online_page;
+ -static DEFINE_MUTEX(online_page_callback_lock);
+ -
+ -/* The same as the cpu_hotplug lock, but for memory hotplug. */
+ -static struct {
+ -	struct task_struct *active_writer;
+ -	struct mutex lock; /* Synchronizes accesses to refcount, */
+ -	/*
+ -	 * Also blocks the new readers during
+ -	 * an ongoing mem hotplug operation.
+ -	 */
+ -	int refcount;
+  
+ -#ifdef CONFIG_DEBUG_LOCK_ALLOC
+ -	struct lockdep_map dep_map;
+ -#endif
+ -} mem_hotplug = {
+ -	.active_writer = NULL,
+ -	.lock = __MUTEX_INITIALIZER(mem_hotplug.lock),
+ -	.refcount = 0,
+ -#ifdef CONFIG_DEBUG_LOCK_ALLOC
+ -	.dep_map = {.name = "mem_hotplug.lock" },
+ -#endif
+ -};
+ -
+ -/* Lockdep annotations for get/put_online_mems() and mem_hotplug_begin/end() */
+ -#define memhp_lock_acquire_read() lock_map_acquire_read(&mem_hotplug.dep_map)
+ -#define memhp_lock_acquire()      lock_map_acquire(&mem_hotplug.dep_map)
+ -#define memhp_lock_release()      lock_map_release(&mem_hotplug.dep_map)
+ +DEFINE_MUTEX(mem_hotplug_mutex);
+  
+ -void get_online_mems(void)
+ +void lock_memory_hotplug(void)
+  {
+ -	might_sleep();
+ -	if (mem_hotplug.active_writer == current)
+ -		return;
+ -	memhp_lock_acquire_read();
+ -	mutex_lock(&mem_hotplug.lock);
+ -	mem_hotplug.refcount++;
+ -	mutex_unlock(&mem_hotplug.lock);
+ -
+ +	mutex_lock(&mem_hotplug_mutex);
+  }
+  
+ -void put_online_mems(void)
+ +void unlock_memory_hotplug(void)
+  {
+ -	if (mem_hotplug.active_writer == current)
+ -		return;
+ -	mutex_lock(&mem_hotplug.lock);
+ -
+ -	if (WARN_ON(!mem_hotplug.refcount))
+ -		mem_hotplug.refcount++; /* try to fix things up */
+ -
+ -	if (!--mem_hotplug.refcount && unlikely(mem_hotplug.active_writer))
+ -		wake_up_process(mem_hotplug.active_writer);
+ -	mutex_unlock(&mem_hotplug.lock);
+ -	memhp_lock_release();
+ -
+ +	mutex_unlock(&mem_hotplug_mutex);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void mem_hotplug_begin(void)
++ {
++ 	mem_hotplug.active_writer = current;
++ 
++ 	memhp_lock_acquire();
++ 	for (;;) {
++ 		mutex_lock(&mem_hotplug.lock);
++ 		if (likely(!mem_hotplug.refcount))
++ 			break;
++ 		__set_current_state(TASK_UNINTERRUPTIBLE);
++ 		mutex_unlock(&mem_hotplug.lock);
++ 		schedule();
++ 	}
++ }
++ 
++ void mem_hotplug_done(void)
++ {
++ 	mem_hotplug.active_writer = NULL;
++ 	mutex_unlock(&mem_hotplug.lock);
++ 	memhp_lock_release();
++ }
+++>>>>>>> 30467e0b3be8 (mm, hotplug: fix concurrent memory hot-add deadlock)
+  
+  /* add this memory to iomem resource */
+  static struct resource *register_memory_resource(u64 start, u64 size)
+@@@ -948,8 -959,10 +972,9 @@@ static void node_states_set_node(int no
+  }
+  
+  
++ /* Must be protected by mem_hotplug_begin() */
+  int __ref online_pages(unsigned long pfn, unsigned long nr_pages, int online_type)
+  {
+ -	unsigned long flags;
+  	unsigned long onlined_pages = 0;
+  	struct zone *zone;
+  	int need_zonelists_rebuild = 0;
+@@@ -957,7 -970,6 +982,10 @@@
+  	int ret;
+  	struct memory_notify arg;
+  
+++<<<<<<< HEAD
+ +	lock_memory_hotplug();
+++=======
+++>>>>>>> 30467e0b3be8 (mm, hotplug: fix concurrent memory hot-add deadlock)
+  	/*
+  	 * This doesn't need a lock to do pfn_to_page().
+  	 * The section can't be removed here because of the
+@@@ -965,23 -977,20 +993,40 @@@
+  	 */
+  	zone = page_zone(pfn_to_page(pfn));
+  
+++<<<<<<< HEAD
+ +	if ((zone_idx(zone) > ZONE_NORMAL || online_type == ONLINE_MOVABLE) &&
+ +	    !can_online_high_movable(zone)) {
+ +		unlock_memory_hotplug();
+ +		return -1;
+ +	}
+ +
+ +	if (online_type == ONLINE_KERNEL && zone_idx(zone) == ZONE_MOVABLE) {
+ +		if (move_pfn_range_left(zone - 1, zone, pfn, pfn + nr_pages)) {
+ +			unlock_memory_hotplug();
+ +			return -1;
+ +		}
+ +	}
+ +	if (online_type == ONLINE_MOVABLE && zone_idx(zone) == ZONE_MOVABLE - 1) {
+ +		if (move_pfn_range_right(zone, zone + 1, pfn, pfn + nr_pages)) {
+ +			unlock_memory_hotplug();
+ +			return -1;
+ +		}
+++=======
++ 	if ((zone_idx(zone) > ZONE_NORMAL ||
++ 	    online_type == MMOP_ONLINE_MOVABLE) &&
++ 	    !can_online_high_movable(zone))
++ 		return -EINVAL;
++ 
++ 	if (online_type == MMOP_ONLINE_KERNEL &&
++ 	    zone_idx(zone) == ZONE_MOVABLE) {
++ 		if (move_pfn_range_left(zone - 1, zone, pfn, pfn + nr_pages))
++ 			return -EINVAL;
++ 	}
++ 	if (online_type == MMOP_ONLINE_MOVABLE &&
++ 	    zone_idx(zone) == ZONE_MOVABLE - 1) {
++ 		if (move_pfn_range_right(zone, zone + 1, pfn, pfn + nr_pages))
++ 			return -EINVAL;
+++>>>>>>> 30467e0b3be8 (mm, hotplug: fix concurrent memory hot-add deadlock)
+  	}
+  
+  	/* Previous code may changed the zone of the pfn range */
+@@@ -997,7 -1006,6 +1042,10 @@@
+  	ret = notifier_to_errno(ret);
+  	if (ret) {
+  		memory_notify(MEM_CANCEL_ONLINE, &arg);
+++<<<<<<< HEAD
+ +		unlock_memory_hotplug();
+++=======
+++>>>>>>> 30467e0b3be8 (mm, hotplug: fix concurrent memory hot-add deadlock)
+  		return ret;
+  	}
+  	/*
+@@@ -1022,7 -1030,6 +1070,10 @@@
+  		       (((unsigned long long) pfn + nr_pages)
+  			    << PAGE_SHIFT) - 1);
+  		memory_notify(MEM_CANCEL_ONLINE, &arg);
+++<<<<<<< HEAD
+ +		unlock_memory_hotplug();
+++=======
+++>>>>>>> 30467e0b3be8 (mm, hotplug: fix concurrent memory hot-add deadlock)
+  		return ret;
+  	}
+  
+@@@ -1049,8 -1060,6 +1100,11 @@@
+  
+  	if (onlined_pages)
+  		memory_notify(MEM_ONLINE, &arg);
+++<<<<<<< HEAD
+ +	unlock_memory_hotplug();
+ +
+++=======
+++>>>>>>> 30467e0b3be8 (mm, hotplug: fix concurrent memory hot-add deadlock)
+  	return 0;
+  }
+  #endif /* CONFIG_MEMORY_HOTPLUG_SPARSE */
+@@@ -1697,8 -1685,6 +1751,11 @@@ static int __ref __offline_pages(unsign
+  	if (!test_pages_in_a_zone(start_pfn, end_pfn))
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	lock_memory_hotplug();
+ +
+++=======
+++>>>>>>> 30467e0b3be8 (mm, hotplug: fix concurrent memory hot-add deadlock)
+  	zone = page_zone(pfn_to_page(start_pfn));
+  	node = zone_to_nid(zone);
+  	nr_pages = end_pfn - start_pfn;
+@@@ -1801,7 -1789,6 +1857,10 @@@ repeat
+  	writeback_set_ratelimit();
+  
+  	memory_notify(MEM_OFFLINE, &arg);
+++<<<<<<< HEAD
+ +	unlock_memory_hotplug();
+++=======
+++>>>>>>> 30467e0b3be8 (mm, hotplug: fix concurrent memory hot-add deadlock)
+  	return 0;
+  
+  failed_removal:
+@@@ -1811,9 -1798,6 +1870,12 @@@
+  	memory_notify(MEM_CANCEL_OFFLINE, &arg);
+  	/* pushback to free area */
+  	undo_isolate_page_range(start_pfn, end_pfn, MIGRATE_MOVABLE);
+++<<<<<<< HEAD
+ +
+ +out:
+ +	unlock_memory_hotplug();
+++=======
+++>>>>>>> 30467e0b3be8 (mm, hotplug: fix concurrent memory hot-add deadlock)
+  	return ret;
+  }
+  
+* Unmerged path drivers/base/memory.c
+diff --git a/include/linux/memory_hotplug.h b/include/linux/memory_hotplug.h
+index b74828398ae5..050d84fc91d4 100644
+--- a/include/linux/memory_hotplug.h
++++ b/include/linux/memory_hotplug.h
+@@ -196,6 +196,9 @@ extern void get_page_bootmem(unsigned long ingo, struct page *page,
+ void lock_memory_hotplug(void);
+ void unlock_memory_hotplug(void);
+ 
++void mem_hotplug_begin(void);
++void mem_hotplug_done(void);
++
+ #else /* ! CONFIG_MEMORY_HOTPLUG */
+ /*
+  * Stub functions for when hotplug is off
+@@ -235,6 +238,9 @@ static inline int try_online_node(int nid)
+ static inline void lock_memory_hotplug(void) {}
+ static inline void unlock_memory_hotplug(void) {}
+ 
++static inline void mem_hotplug_begin(void) {}
++static inline void mem_hotplug_done(void) {}
++
+ #endif /* ! CONFIG_MEMORY_HOTPLUG */
+ 
+ #ifdef CONFIG_MEMORY_HOTREMOVE
+* Unmerged path mm/memory_hotplug.c
