@@ -1,0 +1,147 @@
+IB/core: Refactor GID modify code for RoCE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Parav Pandit <parav@mellanox.com>
+commit 598ff6bae689453aa894bc38f3f1bb78eb131a61
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/598ff6ba.failed
+
+Code is refactored to prepare separate functions for RoCE which can do more
+complex operations related to reference counting, while still
+maintainining code readability. This includes
+(a) Simplification to not perform netdevice checks and modifications
+for IB link layer.
+(b) Do not add RoCE GID entry which has NULL netdevice; instead return
+an error.
+(c) If GID addition fails at provider level add_gid(), do not add the
+entry in the cache and keep the entry marked as INVALID.
+(d) Simplify and reuse the ib_cache_gid_add()/del() routines so that they
+can be used even for modifying default GIDs. This avoid some code
+duplication in modifying default GIDs.
+(e) find_gid() routine refers to the data entry flags to qualify a GID
+as valid or invalid GID rather than depending on attributes and zeroness
+of the GID content.
+(f) gid_table_reserve_default() sets the GID default attribute at
+beginning while setting up the GID table. There is no need to use
+default_gid flag in low level functions such as write_gid(), add_gid(),
+del_gid(), as they never need to update the DEFAULT property of the GID
+entry while during GID table update.
+
+As as result of this refactor, reserved GID 0:0:0:0:0:0:0:0 is no longer
+searchable as described below.
+
+A unicast GID entry of 0:0:0:0:0:0:0:0 is Reserved GID as per the IB
+spec version 1.3 section 4.1.1, point (6) whose snippet is below.
+
+"The unicast GID address 0:0:0:0:0:0:0:0 is reserved - referred to as
+the Reserved GID. It shall never be assigned to any endport. It shall
+not be used as a destination address or in a global routing header
+(GRH)."
+
+GID table cache now only stores valid GID entries. Before this patch,
+Reserved GID 0:0:0:0:0:0:0:0 was searchable in the GID table using
+ib_find_cached_gid_by_port() and other similar find routines.
+
+Zero GID is no longer searchable as it shall not to be present in GRH or
+path recored entry as described in IB spec version 1.3 section 4.1.1,
+point (6), section 12.7.10 and section 12.7.20.
+
+ib_cache_update() is simplified to check link layer once, use unified
+locking scheme for all link layers, removed temporary gid table
+allocation/free logic.
+
+Additionally,
+(a) Expand ib_gid_attr to store port and index so that GID query
+routines can get port and index information from the attribute structure.
+(b) Expand ib_gid_attr to store device as well so that in future code when
+GID reference counting is done, device is used to reach back to the GID
+table entry.
+
+	Signed-off-by: Parav Pandit <parav@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 598ff6bae689453aa894bc38f3f1bb78eb131a61)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/cache.c
+diff --cc drivers/infiniband/core/cache.c
+index 8ce9acd96a1f,045ca11fa135..000000000000
+--- a/drivers/infiniband/core/cache.c
++++ b/drivers/infiniband/core/cache.c
+@@@ -1114,18 -1159,6 +1159,21 @@@ static void ib_cache_update(struct ib_d
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	if (!use_roce_gid_table) {
+ +		for (i = 0;  i < gid_cache->table_len; ++i) {
+ +			ret = ib_query_gid(device, port, i,
+ +					   gid_cache->table + i, NULL);
+ +			if (ret) {
+ +				pr_warn("ib_query_gid failed (%d) for %s (index %d)\n",
+ +					ret, device->name, i);
+ +				goto err;
+ +			}
+ +		}
+ +	}
+ +
+++=======
+++>>>>>>> 598ff6bae689 (IB/core: Refactor GID modify code for RoCE)
+  	write_lock_irq(&device->cache.lock);
+  
+  	old_pkey_cache = device->cache.ports[port -
+* Unmerged path drivers/infiniband/core/cache.c
+diff --git a/drivers/infiniband/core/sysfs.c b/drivers/infiniband/core/sysfs.c
+index 9b0fbab41dc6..31c7efaf8e7a 100644
+--- a/drivers/infiniband/core/sysfs.c
++++ b/drivers/infiniband/core/sysfs.c
+@@ -389,14 +389,26 @@ static ssize_t show_port_gid(struct ib_port *p, struct port_attribute *attr,
+ {
+ 	struct port_table_attribute *tab_attr =
+ 		container_of(attr, struct port_table_attribute, attr);
++	union ib_gid *pgid;
+ 	union ib_gid gid;
+ 	ssize_t ret;
+ 
+ 	ret = ib_query_gid(p->ibdev, p->port_num, tab_attr->index, &gid, NULL);
+-	if (ret)
+-		return ret;
+ 
+-	return sprintf(buf, "%pI6\n", gid.raw);
++	/* If reading GID fails, it is likely due to GID entry being empty
++	 * (invalid) or reserved GID in the table.
++	 * User space expects to read GID table entries as long as it given
++	 * index is within GID table size.
++	 * Administrative/debugging tool fails to query rest of the GID entries
++	 * if it hits error while querying a GID of the given index.
++	 * To avoid user space throwing such error on fail to read gid, return
++	 * zero GID as before. This maintains backward compatibility.
++	 */
++	if (ret)
++		pgid = &zgid;
++	else
++		pgid = &gid;
++	return sprintf(buf, "%pI6\n", pgid->raw);
+ }
+ 
+ static ssize_t show_port_gid_attr_ndev(struct ib_port *p,
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index 08df66968a0f..53684e9e7df6 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -89,8 +89,11 @@ enum ib_gid_type {
+ 
+ #define ROCE_V2_UDP_DPORT      4791
+ struct ib_gid_attr {
+-	enum ib_gid_type	gid_type;
+ 	struct net_device	*ndev;
++	struct ib_device	*device;
++	enum ib_gid_type	gid_type;
++	u16			index;
++	u8			port_num;
+ };
+ 
+ enum rdma_node_type {
