@@ -231,7 +231,6 @@ int perf_quiet_option(void)
 		var++;
 	}
 
-	quiet = true;
 	return 0;
 }
 
