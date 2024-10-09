@@ -1,0 +1,193 @@
+nfp: implement .ndo_get_phys_port_name()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 47465aed3220c3b95646bd53d3a6fd11cbf1ebfe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/47465aed.failed
+
+NSP reports to us port labels.  First id is the id of the physical
+port, the other one tells us which logical interface is it within a
+split port.  Instead of printing them as string keep them in integer
+format.  Compute which interfaces are part of port split.
+
+On netdev side use port labels and split information to provide a
+.ndo_get_phys_port_name() implementation.  We follow the name format
+of mlxsw which is also suggested in "Port Netdev Naming" section
+of Documentation/networking/switchdev.txt.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 47465aed3220c3b95646bd53d3a6fd11cbf1ebfe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index de17d3265a77,5c34f79053f7..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@@ -61,8 -64,10 +61,9 @@@
+  
+  #include <linux/ktime.h>
+  
+ -#include <net/pkt_cls.h>
+  #include <net/vxlan.h>
+  
++ #include "nfpcore/nfp_nsp_eth.h"
+  #include "nfp_net_ctrl.h"
+  #include "nfp_net.h"
+  
+@@@ -2608,8 -3030,10 +2629,15 @@@ static const struct net_device_ops nfp_
+  	.ndo_set_mac_address	= eth_mac_addr,
+  	.ndo_set_features	= nfp_net_set_features,
+  	.ndo_features_check	= nfp_net_features_check,
+++<<<<<<< HEAD
+ +	.extended.ndo_udp_tunnel_add	= nfp_net_add_vxlan_port,
+ +	.extended.ndo_udp_tunnel_del	= nfp_net_del_vxlan_port,
+++=======
++ 	.ndo_get_phys_port_name	= nfp_net_get_phys_port_name,
++ 	.ndo_udp_tunnel_add	= nfp_net_add_vxlan_port,
++ 	.ndo_udp_tunnel_del	= nfp_net_del_vxlan_port,
++ 	.ndo_xdp		= nfp_net_xdp,
+++>>>>>>> 47465aed3220 (nfp: implement .ndo_get_phys_port_name())
+  };
+  
+  /**
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net.h b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+index 1826ee93d1da..f983e966144e 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+@@ -109,6 +109,7 @@
+ 
+ /* Forward declarations */
+ struct nfp_cpp;
++struct nfp_eth_table_port;
+ struct nfp_net;
+ struct nfp_net_r_vector;
+ 
+@@ -472,6 +473,7 @@ static inline bool nfp_net_fw_ver_eq(struct nfp_net_fw_version *fw_ver,
+  * @ethtool_dump_flag:	Ethtool dump flag
+  * @port_list:		Entry on device port list
+  * @cpp:		CPP device handle if available
++ * @eth_port:		Translated ETH Table port entry
+  */
+ struct nfp_net {
+ 	struct pci_dev *pdev;
+@@ -553,6 +555,8 @@ struct nfp_net {
+ 	struct list_head port_list;
+ 
+ 	struct nfp_cpp *cpp;
++
++	struct nfp_eth_table_port *eth_port;
+ };
+ 
+ struct nfp_net_ring_set {
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net_main.c b/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+index 3afcdc11480c..f04d0b8e84ad 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+@@ -178,6 +178,8 @@ nfp_net_get_mac_addr(struct nfp_net *nn, struct nfp_pf *pf, unsigned int id)
+ 		if (pf->eth_tbl->ports[i].eth_index == id) {
+ 			const u8 *mac_addr = pf->eth_tbl->ports[i].mac_addr;
+ 
++			nn->eth_port = &pf->eth_tbl->ports[i];
++
+ 			ether_addr_copy(nn->netdev->dev_addr, mac_addr);
+ 			ether_addr_copy(nn->netdev->perm_addr, mac_addr);
+ 			return;
+diff --git a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c
+index 1ece1f8ae4b3..10a0c8392d2b 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c
++++ b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c
+@@ -134,9 +134,32 @@ nfp_eth_port_translate(const struct eth_table_entry *src, unsigned int index,
+ 
+ 	nfp_eth_copy_mac_reverse(dst->mac_addr, src->mac_addr);
+ 
+-	snprintf(dst->label, sizeof(dst->label) - 1, "%llu.%llu",
+-		 FIELD_GET(NSP_ETH_PORT_PHYLABEL, port),
+-		 FIELD_GET(NSP_ETH_PORT_LABEL, port));
++	dst->label_port = FIELD_GET(NSP_ETH_PORT_PHYLABEL, port);
++	dst->label_subport = FIELD_GET(NSP_ETH_PORT_LABEL, port);
++}
++
++static void
++nfp_eth_mark_split_ports(struct nfp_cpp *cpp, struct nfp_eth_table *table)
++{
++	unsigned int i, j;
++
++	for (i = 0; i < table->count; i++)
++		for (j = 0; j < table->count; j++) {
++			if (i == j)
++				continue;
++			if (table->ports[i].label_port !=
++			    table->ports[j].label_port)
++				continue;
++			if (table->ports[i].label_subport ==
++			    table->ports[j].label_subport)
++				nfp_warn(cpp,
++					 "Port %d subport %d is a duplicate\n",
++					 table->ports[i].label_port,
++					 table->ports[i].label_subport);
++
++			table->ports[i].is_split = true;
++			break;
++		}
+ }
+ 
+ /**
+@@ -203,6 +226,8 @@ __nfp_eth_read_ports(struct nfp_cpp *cpp, struct nfp_nsp *nsp)
+ 			nfp_eth_port_translate(&entries[i], i,
+ 					       &table->ports[j++]);
+ 
++	nfp_eth_mark_split_ports(cpp, table);
++
+ 	kfree(entries);
+ 
+ 	return table;
+diff --git a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.h b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.h
+index edf703d319c8..325e841ca90a 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.h
++++ b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.h
+@@ -49,10 +49,13 @@
+  * @lanes:	number of channels
+  * @speed:	interface speed (in Mbps)
+  * @mac_addr:	interface MAC address
+- * @label:	interface id string
++ * @label_port:	port id
++ * @label_subport:  id of interface within port (for split ports)
+  * @enabled:	is enabled?
+  * @tx_enabled:	is TX enabled?
+  * @rx_enabled:	is RX enabled?
++ *
++ * @is_split:	is interface part of a split port
+  */
+ struct nfp_eth_table {
+ 	unsigned int count;
+@@ -65,14 +68,22 @@ struct nfp_eth_table {
+ 		unsigned int speed;
+ 
+ 		u8 mac_addr[ETH_ALEN];
+-		char label[8];
++
++		u8 label_port;
++		u8 label_subport;
+ 
+ 		bool enabled;
+ 		bool tx_enabled;
+ 		bool rx_enabled;
++
++		/* Computed fields */
++		bool is_split;
+ 	} ports[0];
+ };
+ 
++struct nfp_cpp;
++struct nfp_nsp;
++
+ struct nfp_eth_table *nfp_eth_read_ports(struct nfp_cpp *cpp);
+ struct nfp_eth_table *
+ __nfp_eth_read_ports(struct nfp_cpp *cpp, struct nfp_nsp *nsp);
