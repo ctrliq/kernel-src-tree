@@ -1,0 +1,174 @@
+dax: Remove i_mmap_lock protection
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jan Kara <jack@suse.cz>
+commit 4d9a2c8746671efbb0c27d3ae28c7474597a7aad
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/4d9a2c87.failed
+
+Currently faults are protected against truncate by filesystem specific
+i_mmap_sem and page lock in case of hole page. Cow faults are protected
+DAX radix tree entry locking. So there's no need for i_mmap_lock in DAX
+code. Remove it.
+
+	Reviewed-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+(cherry picked from commit 4d9a2c8746671efbb0c27d3ae28c7474597a7aad)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+#	mm/memory.c
+diff --cc fs/dax.c
+index 3ad95e9ec809,6dbe6021cab7..000000000000
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@@ -570,51 -793,24 +570,67 @@@ static int dax_insert_mapping(struct in
+  			struct vm_area_struct *vma, struct vm_fault *vmf)
+  {
+  	unsigned long vaddr = (unsigned long)vmf->virtual_address;
+ +	struct address_space *mapping = inode->i_mapping;
+  	struct block_device *bdev = bh->b_bdev;
+  	struct blk_dax_ctl dax = {
+ -		.sector = to_sector(bh, mapping->host),
+ +		.sector = to_sector(bh, inode),
+  		.size = bh->b_size,
+  	};
+++<<<<<<< HEAD
+ +	pgoff_t size;
+ +	int error;
+ +
+ +	mutex_lock(&mapping->i_mmap_mutex);
+ +
+ +	/*
+ +	 * Check truncate didn't happen while we were allocating a block.
+ +	 * If it did, this block may or may not be still allocated to the
+ +	 * file.  We can't tell the filesystem to free it because we can't
+ +	 * take i_mutex here.  In the worst case, the file still has blocks
+ +	 * allocated past the end of the file.
+ +	 */
+ +	size = (i_size_read(inode) + PAGE_SIZE - 1) >> PAGE_SHIFT;
+ +	if (unlikely(vmf->pgoff >= size)) {
+ +		error = -EIO;
+ +		goto out;
+ +	}
+ +
+ +	if (dax_map_atomic(bdev, &dax) < 0) {
+ +		error = PTR_ERR(dax.addr);
+ +		goto out;
+ +	}
+ +
+ +	if (buffer_unwritten(bh) || buffer_new(bh)) {
+ +		clear_pmem(dax.addr, PAGE_SIZE);
+ +	}
+ +	dax_unmap_atomic(bdev, &dax);
+ +
+ +	error = dax_radix_entry(mapping, vmf->pgoff, dax.sector, false,
+ +			vmf->flags & FAULT_FLAG_WRITE);
+ +	if (error)
+ +		goto out;
+ +
+ +	error = vm_insert_mixed(vma, vaddr, dax.pfn);
+ +
+ + out:
+ +	mutex_unlock(&mapping->i_mmap_mutex);
+ +
+ +	return error;
+++=======
++ 	void *ret;
++ 	void *entry = *entryp;
++ 
++ 	if (dax_map_atomic(bdev, &dax) < 0)
++ 		return PTR_ERR(dax.addr);
++ 	dax_unmap_atomic(bdev, &dax);
++ 
++ 	ret = dax_insert_mapping_entry(mapping, vmf, entry, dax.sector);
++ 	if (IS_ERR(ret))
++ 		return PTR_ERR(ret);
++ 	*entryp = ret;
++ 
++ 	return vm_insert_mixed(vma, vaddr, dax.pfn);
+++>>>>>>> 4d9a2c874667 (dax: Remove i_mmap_lock protection)
+  }
+  
+  /**
+@@@ -879,32 -1048,6 +895,35 @@@ int __dax_pmd_fault(struct vm_area_stru
+  		truncate_pagecache_range(inode, lstart, lend);
+  	}
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&mapping->i_mmap_mutex);
+ +
+ +	/*
+ +	 * If we allocated new storage, make sure no process has any
+ +	 * zero pages covering this hole
+ +	 */
+ +	if (buffer_new(&bh)) {
+ +		mutex_unlock(&mapping->i_mmap_mutex);
+ +		unmap_mapping_range(mapping, pgoff << PAGE_SHIFT, PMD_SIZE, 0);
+ +		mutex_lock(&mapping->i_mmap_mutex);
+ +	}
+ +
+ +	/*
+ +	 * If a truncate happened while we were allocating blocks, we may
+ +	 * leave blocks allocated to the file that are beyond EOF.  We can't
+ +	 * take i_mutex here, so just leave them hanging; they'll be freed
+ +	 * when the file is deleted.
+ +	 */
+ +	size = (i_size_read(inode) + PAGE_SIZE - 1) >> PAGE_SHIFT;
+ +	if (pgoff >= size) {
+ +		result = VM_FAULT_SIGBUS;
+ +		goto out;
+ +	}
+ +	if ((pgoff | PG_PMD_COLOUR) >= size)
+ +		goto fallback;
+ +
+++=======
+++>>>>>>> 4d9a2c874667 (dax: Remove i_mmap_lock protection)
+  	if (!write && !buffer_mapped(&bh)) {
+  		spinlock_t *ptl;
+  		pmd_t entry;
+@@@ -985,11 -1136,6 +1004,14 @@@
+  	}
+  
+   out:
+++<<<<<<< HEAD
+ +	mutex_unlock(&mapping->i_mmap_mutex);
+ +
+ +	if (buffer_unwritten(&bh))
+ +		complete_unwritten(&bh, !(result & VM_FAULT_ERROR));
+ +
+++=======
+++>>>>>>> 4d9a2c874667 (dax: Remove i_mmap_lock protection)
+  	return result;
+  
+   fallback:
+diff --cc mm/memory.c
+index e63691293747,06f552504e79..000000000000
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@@ -2498,14 -2453,10 +2498,18 @@@ void unmap_mapping_range(struct address
+  	if (details.last_index < details.first_index)
+  		details.last_index = ULONG_MAX;
+  
+++<<<<<<< HEAD
+ +
+ +	/* DAX uses i_mmap_lock to serialise file truncate vs page fault */
+ +	mutex_lock(&mapping->i_mmap_mutex);
+++=======
++ 	i_mmap_lock_write(mapping);
+++>>>>>>> 4d9a2c874667 (dax: Remove i_mmap_lock protection)
+  	if (unlikely(!RB_EMPTY_ROOT(&mapping->i_mmap)))
+  		unmap_mapping_range_tree(&mapping->i_mmap, &details);
+ -	i_mmap_unlock_write(mapping);
+ +	if (unlikely(!list_empty(&mapping->i_mmap_nonlinear)))
+ +		unmap_mapping_range_list(&mapping->i_mmap_nonlinear, &details);
+ +	mutex_unlock(&mapping->i_mmap_mutex);
+  }
+  EXPORT_SYMBOL(unmap_mapping_range);
+  
+* Unmerged path fs/dax.c
+* Unmerged path mm/memory.c
