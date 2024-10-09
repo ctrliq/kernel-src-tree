@@ -1450,7 +1450,7 @@ int mlx5_eswitch_set_vport_mac(struct mlx5_eswitch *esw,
 
 	if (!ESW_ALLOWED(esw))
 		return -EPERM;
-	if (!LEGAL_VPORT(esw, vport))
+	if (!LEGAL_VPORT(esw, vport) || is_multicast_ether_addr(mac))
 		return -EINVAL;
 
 	err = mlx5_modify_nic_vport_mac_address(esw->dev, vport, mac);
