@@ -310,6 +310,7 @@ enum rtattr_type_t {
 	RTA_ENCAP_TYPE,
 	RTA_ENCAP,
 	RTA_EXPIRES,
+	RTA_PAD,
 	__RTA_MAX
 };
 
