@@ -1,0 +1,345 @@
+target: Obtain se_node_acl->acl_kref during get_initiator_node_acl
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [target] Obtain se_node_acl->acl_kref during get_initiator_node_acl (Maurizio Lombardi) [1366062]
+Rebuild_FUZZ: 93.55%
+commit-author Nicholas Bellinger <nab@linux-iscsi.org>
+commit 21aaa23b0ebbd19334fa461370c03cbb076b3295
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/21aaa23b.failed
+
+This patch addresses a long standing race where obtaining
+se_node_acl->acl_kref in __transport_register_session()
+happens a bit too late, and leaves open the potential
+for core_tpg_del_initiator_node_acl() to hit a NULL
+pointer dereference.
+
+Instead, take ->acl_kref in core_tpg_get_initiator_node_acl()
+while se_portal_group->acl_node_mutex is held, and move the
+final target_put_nacl() from transport_deregister_session()
+into transport_free_session() so that fabric driver login
+failure handling using the modern method to still work
+as expected.
+
+Also, update core_tpg_get_initiator_node_acl() to take
+an extra reference for dynamically generated acls for
+demo-mode, before returning to fabric caller.  Also
+update iscsi-target sendtargets special case handling
+to use target_tpg_has_node_acl() when checking if
+demo_mode_discovery == true during discovery lookup.
+
+Note the existing wait_for_completion(&acl->acl_free_comp)
+in core_tpg_del_initiator_node_acl() does not change.
+
+	Cc: Sagi Grimberg <sagig@mellanox.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Hannes Reinecke <hare@suse.de>
+	Cc: Andy Grover <agrover@redhat.com>
+	Cc: Mike Christie <michaelc@cs.wisc.edu>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 21aaa23b0ebbd19334fa461370c03cbb076b3295)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_tpg.c
+#	drivers/target/target_core_transport.c
+diff --cc drivers/target/target_core_tpg.c
+index 0696de9553d3,3608b1b5ecf7..000000000000
+--- a/drivers/target/target_core_tpg.c
++++ b/drivers/target/target_core_tpg.c
+@@@ -110,10 -75,22 +110,29 @@@ struct se_node_acl *core_tpg_get_initia
+  	unsigned char *initiatorname)
+  {
+  	struct se_node_acl *acl;
+++<<<<<<< HEAD
+ +
+ +	spin_lock_irq(&tpg->acl_node_lock);
+ +	acl = __core_tpg_get_initiator_node_acl(tpg, initiatorname);
+ +	spin_unlock_irq(&tpg->acl_node_lock);
+++=======
++ 	/*
++ 	 * Obtain se_node_acl->acl_kref using fabric driver provided
++ 	 * initiatorname[] during node acl endpoint lookup driven by
++ 	 * new se_session login.
++ 	 *
++ 	 * The reference is held until se_session shutdown -> release
++ 	 * occurs via fabric driver invoked transport_deregister_session()
++ 	 * or transport_free_session() code.
++ 	 */
++ 	mutex_lock(&tpg->acl_node_mutex);
++ 	acl = __core_tpg_get_initiator_node_acl(tpg, initiatorname);
++ 	if (acl) {
++ 		if (!kref_get_unless_zero(&acl->acl_kref))
++ 			acl = NULL;
++ 	}
++ 	mutex_unlock(&tpg->acl_node_mutex);
+++>>>>>>> 21aaa23b0ebb (target: Obtain se_node_acl->acl_kref during get_initiator_node_acl)
+  
+  	return acl;
+  }
+@@@ -193,71 -181,80 +212,93 @@@ static int core_set_queue_depth_for_nod
+  			acl->initiatorname);
+  		acl->queue_depth = 1;
+  	}
+ +
+ +	return 0;
+  }
+  
+ -static struct se_node_acl *target_alloc_node_acl(struct se_portal_group *tpg,
+ -		const unsigned char *initiatorname)
+ +void array_free(void *array, int n)
+  {
+ -	struct se_node_acl *acl;
+ -	u32 queue_depth;
+ +	void **a = array;
+ +	int i;
+  
+ -	acl = kzalloc(max(sizeof(*acl), tpg->se_tpg_tfo->node_acl_size),
+ -			GFP_KERNEL);
+ -	if (!acl)
+ -		return NULL;
+ -
+ -	INIT_LIST_HEAD(&acl->acl_list);
+ -	INIT_LIST_HEAD(&acl->acl_sess_list);
+ -	INIT_HLIST_HEAD(&acl->lun_entry_hlist);
+ -	kref_init(&acl->acl_kref);
+ -	init_completion(&acl->acl_free_comp);
+ -	spin_lock_init(&acl->nacl_sess_lock);
+ -	mutex_init(&acl->lun_entry_mutex);
+ -	atomic_set(&acl->acl_pr_ref_count, 0);
+ -
+ -	if (tpg->se_tpg_tfo->tpg_get_default_depth)
+ -		queue_depth = tpg->se_tpg_tfo->tpg_get_default_depth(tpg);
+ -	else
+ -		queue_depth = 1;
+ -	target_set_nacl_queue_depth(tpg, acl, queue_depth);
+ -
+ -	snprintf(acl->initiatorname, TRANSPORT_IQN_LEN, "%s", initiatorname);
+ -	acl->se_tpg = tpg;
+ -	acl->acl_index = scsi_get_new_index(SCSI_AUTH_INTR_INDEX);
+ +	for (i = 0; i < n; i++)
+ +		kfree(a[i]);
+ +	kfree(a);
+ +}
+  
+ -	tpg->se_tpg_tfo->set_default_node_attributes(acl);
+ +static void *array_zalloc(int n, size_t size, gfp_t flags)
+ +{
+ +	void **a;
+ +	int i;
+  
+ -	return acl;
+ +	a = kzalloc(n * sizeof(void*), flags);
+ +	if (!a)
+ +		return NULL;
+ +	for (i = 0; i < n; i++) {
+ +		a[i] = kzalloc(size, flags);
+ +		if (!a[i]) {
+ +			array_free(a, n);
+ +			return NULL;
+ +		}
+ +	}
+ +	return a;
+  }
+  
+ -static void target_add_node_acl(struct se_node_acl *acl)
+ +/*      core_create_device_list_for_node():
+ + *
+ + *
+ + */
+ +static int core_create_device_list_for_node(struct se_node_acl *nacl)
+  {
+ -	struct se_portal_group *tpg = acl->se_tpg;
+ -
+ -	mutex_lock(&tpg->acl_node_mutex);
+ -	list_add_tail(&acl->acl_list, &tpg->acl_node_list);
+ -	mutex_unlock(&tpg->acl_node_mutex);
+ +	struct se_dev_entry *deve;
+ +	int i;
+ +
+ +	nacl->device_list = array_zalloc(TRANSPORT_MAX_LUNS_PER_TPG,
+ +			sizeof(struct se_dev_entry), GFP_KERNEL);
+ +	if (!nacl->device_list) {
+ +		pr_err("Unable to allocate memory for"
+ +			" struct se_node_acl->device_list\n");
+ +		return -ENOMEM;
+ +	}
+ +	for (i = 0; i < TRANSPORT_MAX_LUNS_PER_TPG; i++) {
+ +		deve = nacl->device_list[i];
+ +
+ +		atomic_set(&deve->ua_count, 0);
+ +		atomic_set(&deve->pr_ref_count, 0);
+ +		spin_lock_init(&deve->ua_lock);
+ +		INIT_LIST_HEAD(&deve->alua_port_list);
+ +		INIT_LIST_HEAD(&deve->ua_list);
+ +	}
+  
+ -	pr_debug("%s_TPG[%hu] - Added %s ACL with TCQ Depth: %d for %s"
+ -		" Initiator Node: %s\n",
+ -		tpg->se_tpg_tfo->get_fabric_name(),
+ -		tpg->se_tpg_tfo->tpg_get_tag(tpg),
+ -		acl->dynamic_node_acl ? "DYNAMIC" : "",
+ -		acl->queue_depth,
+ -		tpg->se_tpg_tfo->get_fabric_name(),
+ -		acl->initiatorname);
+ +	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +/*	core_tpg_check_initiator_node_acl()
+ + *
+ + *
+ + */
+++=======
++ bool target_tpg_has_node_acl(struct se_portal_group *tpg,
++ 			     const char *initiatorname)
++ {
++ 	struct se_node_acl *acl;
++ 	bool found = false;
++ 
++ 	mutex_lock(&tpg->acl_node_mutex);
++ 	list_for_each_entry(acl, &tpg->acl_node_list, acl_list) {
++ 		if (!strcmp(acl->initiatorname, initiatorname)) {
++ 			found = true;
++ 			break;
++ 		}
++ 	}
++ 	mutex_unlock(&tpg->acl_node_mutex);
++ 
++ 	return found;
++ }
++ EXPORT_SYMBOL(target_tpg_has_node_acl);
++ 
+++>>>>>>> 21aaa23b0ebb (target: Obtain se_node_acl->acl_kref during get_initiator_node_acl)
+  struct se_node_acl *core_tpg_check_initiator_node_acl(
+  	struct se_portal_group *tpg,
+  	unsigned char *initiatorname)
+@@@ -271,35 -268,20 +312,47 @@@
+  	if (!tpg->se_tpg_tfo->tpg_check_demo_mode(tpg))
+  		return NULL;
+  
+ -	acl = target_alloc_node_acl(tpg, initiatorname);
+ +	acl =  tpg->se_tpg_tfo->tpg_alloc_fabric_acl(tpg);
+  	if (!acl)
+  		return NULL;
+++<<<<<<< HEAD
+ +
+ +	INIT_LIST_HEAD(&acl->acl_list);
+ +	INIT_LIST_HEAD(&acl->acl_sess_list);
+ +	kref_init(&acl->acl_kref);
+ +	init_completion(&acl->acl_free_comp);
+ +	spin_lock_init(&acl->device_list_lock);
+ +	spin_lock_init(&acl->nacl_sess_lock);
+ +	atomic_set(&acl->acl_pr_ref_count, 0);
+ +	acl->queue_depth = tpg->se_tpg_tfo->tpg_get_default_depth(tpg);
+ +	snprintf(acl->initiatorname, TRANSPORT_IQN_LEN, "%s", initiatorname);
+ +	acl->se_tpg = tpg;
+ +	acl->acl_index = scsi_get_new_index(SCSI_AUTH_INTR_INDEX);
+++=======
++ 	/*
++ 	 * When allocating a dynamically generated node_acl, go ahead
++ 	 * and take the extra kref now before returning to the fabric
++ 	 * driver caller.
++ 	 *
++ 	 * Note this reference will be released at session shutdown
++ 	 * time within transport_free_session() code.
++ 	 */
++ 	kref_get(&acl->acl_kref);
+++>>>>>>> 21aaa23b0ebb (target: Obtain se_node_acl->acl_kref during get_initiator_node_acl)
+  	acl->dynamic_node_acl = 1;
+  
+ +	tpg->se_tpg_tfo->set_default_node_attributes(acl);
+ +
+ +	if (core_create_device_list_for_node(acl) < 0) {
+ +		tpg->se_tpg_tfo->tpg_release_fabric_acl(tpg, acl);
+ +		return NULL;
+ +	}
+ +
+ +	if (core_set_queue_depth_for_node(tpg, acl) < 0) {
+ +		core_free_device_list_for_node(acl, tpg);
+ +		tpg->se_tpg_tfo->tpg_release_fabric_acl(tpg, acl);
+ +		return NULL;
+ +	}
+  	/*
+  	 * Here we only create demo-mode MappedLUNs from the active
+  	 * TPG LUNs if the fabric is not explicitly asking for
+diff --cc drivers/target/target_core_transport.c
+index cf7ad6dd6620,a7c1bb54cf72..000000000000
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@@ -496,10 -484,10 +505,14 @@@ EXPORT_SYMBOL(transport_free_session)
+  void transport_deregister_session(struct se_session *se_sess)
+  {
+  	struct se_portal_group *se_tpg = se_sess->se_tpg;
+ -	const struct target_core_fabric_ops *se_tfo;
+ +	struct target_core_fabric_ops *se_tfo;
+  	struct se_node_acl *se_nacl;
+  	unsigned long flags;
+++<<<<<<< HEAD
+ +	bool comp_nacl = true;
+++=======
++ 	bool drop_nacl = false;
+++>>>>>>> 21aaa23b0ebb (target: Obtain se_node_acl->acl_kref during get_initiator_node_acl)
+  
+  	if (!se_tpg) {
+  		transport_free_session(se_sess);
+@@@ -523,18 -511,17 +536,27 @@@
+  	if (se_nacl && se_nacl->dynamic_node_acl) {
+  		if (!se_tfo->tpg_check_demo_mode_cache(se_tpg)) {
+  			list_del(&se_nacl->acl_list);
+ -			drop_nacl = true;
+ +			se_tpg->num_node_acls--;
+ +			spin_unlock_irqrestore(&se_tpg->acl_node_lock, flags);
+ +			core_tpg_wait_for_nacl_pr_ref(se_nacl);
+ +			core_free_device_list_for_node(se_nacl, se_tpg);
+ +			se_tfo->tpg_release_fabric_acl(se_tpg, se_nacl);
+ +
+ +			comp_nacl = false;
+ +			spin_lock_irqsave(&se_tpg->acl_node_lock, flags);
+  		}
+  	}
+ -	mutex_unlock(&se_tpg->acl_node_mutex);
+ +	spin_unlock_irqrestore(&se_tpg->acl_node_lock, flags);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (drop_nacl) {
++ 		core_tpg_wait_for_nacl_pr_ref(se_nacl);
++ 		core_free_device_list_for_node(se_nacl, se_tpg);
++ 		se_sess->se_node_acl = NULL;
++ 		kfree(se_nacl);
++ 	}
+++>>>>>>> 21aaa23b0ebb (target: Obtain se_node_acl->acl_kref during get_initiator_node_acl)
+  	pr_debug("TARGET_CORE[%s]: Deregistered fabric_sess\n",
+  		se_tpg->se_tpg_tfo->get_fabric_name());
+  	/*
+diff --git a/drivers/target/iscsi/iscsi_target.c b/drivers/target/iscsi/iscsi_target.c
+index eaa0803bafc9..46399b8d84ff 100644
+--- a/drivers/target/iscsi/iscsi_target.c
++++ b/drivers/target/iscsi/iscsi_target.c
+@@ -3382,7 +3382,7 @@ iscsit_build_sendtargets_response(struct iscsi_cmd *cmd,
+ 
+ 			if ((tpg->tpg_attrib.generate_node_acls == 0) &&
+ 			    (tpg->tpg_attrib.demo_mode_discovery == 0) &&
+-			    (!core_tpg_get_initiator_node_acl(&tpg->tpg_se_tpg,
++			    (!target_tpg_has_node_acl(&tpg->tpg_se_tpg,
+ 				cmd->conn->sess->sess_ops->InitiatorName))) {
+ 				continue;
+ 			}
+* Unmerged path drivers/target/target_core_tpg.c
+* Unmerged path drivers/target/target_core_transport.c
+diff --git a/include/target/target_core_fabric.h b/include/target/target_core_fabric.h
+index 990942f22016..7f2f1a0840be 100644
+--- a/include/target/target_core_fabric.h
++++ b/include/target/target_core_fabric.h
+@@ -151,6 +151,8 @@ int	transport_lookup_tmr_lun(struct se_cmd *, u32);
+ 
+ struct se_node_acl *core_tpg_get_initiator_node_acl(struct se_portal_group *tpg,
+ 		unsigned char *);
++bool	target_tpg_has_node_acl(struct se_portal_group *tpg,
++		const char *);
+ struct se_node_acl *core_tpg_check_initiator_node_acl(struct se_portal_group *,
+ 		unsigned char *);
+ void	core_tpg_clear_object_luns(struct se_portal_group *);
