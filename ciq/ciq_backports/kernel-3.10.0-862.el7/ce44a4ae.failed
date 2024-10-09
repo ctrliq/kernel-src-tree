@@ -1,0 +1,376 @@
+vxlan: improve validation of address family configuration
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Matthias Schiffer <mschiffer@universe-factory.net>
+commit ce44a4aea5e4203147013759a363c17b2ee5132b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/ce44a4ae.failed
+
+Address families of source and destination addresses must match, and
+changelink operations can't change the address family.
+
+In addition, always use the VXLAN_F_IPV6 to check if a VXLAN device uses
+IPv4 or IPv6.
+
+	Signed-off-by: Matthias Schiffer <mschiffer@universe-factory.net>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ce44a4aea5e4203147013759a363c17b2ee5132b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+diff --cc drivers/net/vxlan.c
+index 740e6d79f5f2,00680cc597ac..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -2411,7 -2484,20 +2411,24 @@@ static int vxlan_change_mtu(struct net_
+  	struct vxlan_rdst *dst = &vxlan->default_dst;
+  	struct net_device *lowerdev = __dev_get_by_index(vxlan->net,
+  							 dst->remote_ifindex);
+++<<<<<<< HEAD
+ +	return __vxlan_change_mtu(dev, lowerdev, dst, new_mtu, true);
+++=======
++ 	bool use_ipv6 = !!(vxlan->cfg.flags & VXLAN_F_IPV6);
++ 
++ 	/* This check is different than dev->max_mtu, because it looks at
++ 	 * the lowerdev->mtu, rather than the static dev->max_mtu
++ 	 */
++ 	if (lowerdev) {
++ 		int max_mtu = lowerdev->mtu -
++ 			      (use_ipv6 ? VXLAN6_HEADROOM : VXLAN_HEADROOM);
++ 		if (new_mtu > max_mtu)
++ 			return -EINVAL;
++ 	}
++ 
++ 	dev->mtu = new_mtu;
++ 	return 0;
+++>>>>>>> ce44a4aea5e4 (vxlan: improve validation of address family configuration)
+  }
+  
+  static int vxlan_fill_metadata_dst(struct net_device *dev, struct sk_buff *skb)
+@@@ -2804,16 -2890,99 +2821,104 @@@ static int vxlan_dev_configure(struct n
+  		 */
+  		if ((conf->flags & ~VXLAN_F_ALLOWED_GPE) ||
+  		    !(conf->flags & VXLAN_F_COLLECT_METADATA)) {
+ +			pr_info("unsupported combination of extensions\n");
+  			return -EINVAL;
+  		}
+ -	}
+  
+++<<<<<<< HEAD
+ +		vxlan_raw_setup(dev);
+++=======
++ 	if (!conf->remote_ip.sa.sa_family && !conf->saddr.sa.sa_family) {
++ 		/* Unless IPv6 is explicitly requested, assume IPv4 */
++ 		conf->remote_ip.sa.sa_family = AF_INET;
++ 		conf->saddr.sa.sa_family = AF_INET;
++ 	} else if (!conf->remote_ip.sa.sa_family) {
++ 		conf->remote_ip.sa.sa_family = conf->saddr.sa.sa_family;
++ 	} else if (!conf->saddr.sa.sa_family) {
++ 		conf->saddr.sa.sa_family = conf->remote_ip.sa.sa_family;
++ 	}
++ 
++ 	if (conf->saddr.sa.sa_family != conf->remote_ip.sa.sa_family)
++ 		return -EINVAL;
++ 
++ 	if (conf->saddr.sa.sa_family == AF_INET6) {
++ 		if (!IS_ENABLED(CONFIG_IPV6))
++ 			return -EPFNOSUPPORT;
++ 		use_ipv6 = true;
++ 		conf->flags |= VXLAN_F_IPV6;
++ 	}
++ 
++ 	if (conf->label && !use_ipv6)
++ 		return -EINVAL;
++ 
++ 	if (conf->remote_ifindex) {
++ 		struct net_device *lowerdev;
++ 
++ 		lowerdev = __dev_get_by_index(src_net, conf->remote_ifindex);
++ 		if (!lowerdev)
++ 			return -ENODEV;
++ 
++ #if IS_ENABLED(CONFIG_IPV6)
++ 		if (use_ipv6) {
++ 			struct inet6_dev *idev = __in6_dev_get(lowerdev);
++ 			if (idev && idev->cnf.disable_ipv6)
++ 				return -EPERM;
++ 		}
++ #endif
++ 
++ 		*lower = lowerdev;
+++>>>>>>> ce44a4aea5e4 (vxlan: improve validation of address family configuration)
+  	} else {
+ -		if (vxlan_addr_multicast(&conf->remote_ip))
+ -			return -EINVAL;
+ -
+ -		*lower = NULL;
+ +		vxlan_ether_setup(dev);
+  	}
+  
+++<<<<<<< HEAD
+ +	vxlan->net = src_net;
+++=======
++ 	if (!conf->dst_port) {
++ 		if (conf->flags & VXLAN_F_GPE)
++ 			conf->dst_port = htons(4790); /* IANA VXLAN-GPE port */
++ 		else
++ 			conf->dst_port = htons(vxlan_port);
++ 	}
++ 
++ 	if (!conf->age_interval)
++ 		conf->age_interval = FDB_AGE_DEFAULT;
++ 
++ 	list_for_each_entry(tmp, &vn->vxlan_list, next) {
++ 		if (tmp == old)
++ 			continue;
++ 
++ 		if (tmp->cfg.vni == conf->vni &&
++ 		    tmp->cfg.dst_port == conf->dst_port &&
++ 		    (tmp->cfg.flags & (VXLAN_F_RCV_FLAGS | VXLAN_F_IPV6)) ==
++ 		    (conf->flags & (VXLAN_F_RCV_FLAGS | VXLAN_F_IPV6)))
++ 			return -EEXIST;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void vxlan_config_apply(struct net_device *dev,
++ 			       struct vxlan_config *conf,
++ 			       struct net_device *lowerdev, bool changelink)
++ {
++ 	struct vxlan_dev *vxlan = netdev_priv(dev);
++ 	struct vxlan_rdst *dst = &vxlan->default_dst;
++ 	unsigned short needed_headroom = ETH_HLEN;
++ 	bool use_ipv6 = !!(conf->flags & VXLAN_F_IPV6);
++ 	int max_mtu = ETH_MAX_MTU;
++ 
++ 	if (!changelink) {
++ 		if (conf->flags & VXLAN_F_GPE)
++ 			vxlan_raw_setup(dev);
++ 		else
++ 			vxlan_ether_setup(dev);
++ 
++ 		if (conf->mtu)
++ 			dev->mtu = conf->mtu;
++ 	}
+++>>>>>>> ce44a4aea5e4 (vxlan: improve validation of address family configuration)
+  
+  	dst->remote_vni = conf->vni;
+  
+@@@ -2928,6 -3064,209 +3033,212 @@@
+  	}
+  
+  	list_add(&vxlan->next, &vn->vxlan_list);
+++<<<<<<< HEAD
+++=======
++ 	return 0;
++ }
++ 
++ static int vxlan_nl2conf(struct nlattr *tb[], struct nlattr *data[],
++ 			 struct net_device *dev, struct vxlan_config *conf,
++ 			 bool changelink)
++ {
++ 	struct vxlan_dev *vxlan = netdev_priv(dev);
++ 
++ 	memset(conf, 0, sizeof(*conf));
++ 
++ 	/* if changelink operation, start with old existing cfg */
++ 	if (changelink)
++ 		memcpy(conf, &vxlan->cfg, sizeof(*conf));
++ 
++ 	if (data[IFLA_VXLAN_ID]) {
++ 		__be32 vni = cpu_to_be32(nla_get_u32(data[IFLA_VXLAN_ID]));
++ 
++ 		if (changelink && (vni != conf->vni))
++ 			return -EOPNOTSUPP;
++ 		conf->vni = cpu_to_be32(nla_get_u32(data[IFLA_VXLAN_ID]));
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_GROUP]) {
++ 		if (changelink && (conf->remote_ip.sa.sa_family != AF_INET))
++ 			return -EOPNOTSUPP;
++ 
++ 		conf->remote_ip.sin.sin_addr.s_addr = nla_get_in_addr(data[IFLA_VXLAN_GROUP]);
++ 		conf->remote_ip.sa.sa_family = AF_INET;
++ 	} else if (data[IFLA_VXLAN_GROUP6]) {
++ 		if (!IS_ENABLED(CONFIG_IPV6))
++ 			return -EPFNOSUPPORT;
++ 
++ 		if (changelink && (conf->remote_ip.sa.sa_family != AF_INET6))
++ 			return -EOPNOTSUPP;
++ 
++ 		conf->remote_ip.sin6.sin6_addr = nla_get_in6_addr(data[IFLA_VXLAN_GROUP6]);
++ 		conf->remote_ip.sa.sa_family = AF_INET6;
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_LOCAL]) {
++ 		if (changelink && (conf->saddr.sa.sa_family != AF_INET))
++ 			return -EOPNOTSUPP;
++ 
++ 		conf->saddr.sin.sin_addr.s_addr = nla_get_in_addr(data[IFLA_VXLAN_LOCAL]);
++ 		conf->saddr.sa.sa_family = AF_INET;
++ 	} else if (data[IFLA_VXLAN_LOCAL6]) {
++ 		if (!IS_ENABLED(CONFIG_IPV6))
++ 			return -EPFNOSUPPORT;
++ 
++ 		if (changelink && (conf->saddr.sa.sa_family != AF_INET6))
++ 			return -EOPNOTSUPP;
++ 
++ 		/* TODO: respect scope id */
++ 		conf->saddr.sin6.sin6_addr = nla_get_in6_addr(data[IFLA_VXLAN_LOCAL6]);
++ 		conf->saddr.sa.sa_family = AF_INET6;
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_LINK])
++ 		conf->remote_ifindex = nla_get_u32(data[IFLA_VXLAN_LINK]);
++ 
++ 	if (data[IFLA_VXLAN_TOS])
++ 		conf->tos  = nla_get_u8(data[IFLA_VXLAN_TOS]);
++ 
++ 	if (data[IFLA_VXLAN_TTL])
++ 		conf->ttl = nla_get_u8(data[IFLA_VXLAN_TTL]);
++ 
++ 	if (data[IFLA_VXLAN_LABEL])
++ 		conf->label = nla_get_be32(data[IFLA_VXLAN_LABEL]) &
++ 			     IPV6_FLOWLABEL_MASK;
++ 
++ 	if (data[IFLA_VXLAN_LEARNING]) {
++ 		if (nla_get_u8(data[IFLA_VXLAN_LEARNING]))
++ 			conf->flags |= VXLAN_F_LEARN;
++ 		else
++ 			conf->flags &= ~VXLAN_F_LEARN;
++ 	} else if (!changelink) {
++ 		/* default to learn on a new device */
++ 		conf->flags |= VXLAN_F_LEARN;
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_AGEING]) {
++ 		if (changelink)
++ 			return -EOPNOTSUPP;
++ 		conf->age_interval = nla_get_u32(data[IFLA_VXLAN_AGEING]);
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_PROXY]) {
++ 		if (changelink)
++ 			return -EOPNOTSUPP;
++ 		if (nla_get_u8(data[IFLA_VXLAN_PROXY]))
++ 			conf->flags |= VXLAN_F_PROXY;
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_RSC]) {
++ 		if (changelink)
++ 			return -EOPNOTSUPP;
++ 		if (nla_get_u8(data[IFLA_VXLAN_RSC]))
++ 			conf->flags |= VXLAN_F_RSC;
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_L2MISS]) {
++ 		if (changelink)
++ 			return -EOPNOTSUPP;
++ 		if (nla_get_u8(data[IFLA_VXLAN_L2MISS]))
++ 			conf->flags |= VXLAN_F_L2MISS;
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_L3MISS]) {
++ 		if (changelink)
++ 			return -EOPNOTSUPP;
++ 		if (nla_get_u8(data[IFLA_VXLAN_L3MISS]))
++ 			conf->flags |= VXLAN_F_L3MISS;
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_LIMIT]) {
++ 		if (changelink)
++ 			return -EOPNOTSUPP;
++ 		conf->addrmax = nla_get_u32(data[IFLA_VXLAN_LIMIT]);
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_COLLECT_METADATA]) {
++ 		if (changelink)
++ 			return -EOPNOTSUPP;
++ 		if (nla_get_u8(data[IFLA_VXLAN_COLLECT_METADATA]))
++ 			conf->flags |= VXLAN_F_COLLECT_METADATA;
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_PORT_RANGE]) {
++ 		if (!changelink) {
++ 			const struct ifla_vxlan_port_range *p
++ 				= nla_data(data[IFLA_VXLAN_PORT_RANGE]);
++ 			conf->port_min = ntohs(p->low);
++ 			conf->port_max = ntohs(p->high);
++ 		} else {
++ 			return -EOPNOTSUPP;
++ 		}
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_PORT]) {
++ 		if (changelink)
++ 			return -EOPNOTSUPP;
++ 		conf->dst_port = nla_get_be16(data[IFLA_VXLAN_PORT]);
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_UDP_CSUM]) {
++ 		if (changelink)
++ 			return -EOPNOTSUPP;
++ 		if (!nla_get_u8(data[IFLA_VXLAN_UDP_CSUM]))
++ 			conf->flags |= VXLAN_F_UDP_ZERO_CSUM_TX;
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_UDP_ZERO_CSUM6_TX]) {
++ 		if (changelink)
++ 			return -EOPNOTSUPP;
++ 		if (nla_get_u8(data[IFLA_VXLAN_UDP_ZERO_CSUM6_TX]))
++ 			conf->flags |= VXLAN_F_UDP_ZERO_CSUM6_TX;
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_UDP_ZERO_CSUM6_RX]) {
++ 		if (changelink)
++ 			return -EOPNOTSUPP;
++ 		if (nla_get_u8(data[IFLA_VXLAN_UDP_ZERO_CSUM6_RX]))
++ 			conf->flags |= VXLAN_F_UDP_ZERO_CSUM6_RX;
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_REMCSUM_TX]) {
++ 		if (changelink)
++ 			return -EOPNOTSUPP;
++ 		if (nla_get_u8(data[IFLA_VXLAN_REMCSUM_TX]))
++ 			conf->flags |= VXLAN_F_REMCSUM_TX;
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_REMCSUM_RX]) {
++ 		if (changelink)
++ 			return -EOPNOTSUPP;
++ 		if (nla_get_u8(data[IFLA_VXLAN_REMCSUM_RX]))
++ 			conf->flags |= VXLAN_F_REMCSUM_RX;
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_GBP]) {
++ 		if (changelink)
++ 			return -EOPNOTSUPP;
++ 		conf->flags |= VXLAN_F_GBP;
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_GPE]) {
++ 		if (changelink)
++ 			return -EOPNOTSUPP;
++ 		conf->flags |= VXLAN_F_GPE;
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_REMCSUM_NOPARTIAL]) {
++ 		if (changelink)
++ 			return -EOPNOTSUPP;
++ 		conf->flags |= VXLAN_F_REMCSUM_NOPARTIAL;
++ 	}
++ 
++ 	if (tb[IFLA_MTU]) {
++ 		if (changelink)
++ 			return -EOPNOTSUPP;
++ 		conf->mtu = nla_get_u32(tb[IFLA_MTU]);
++ 	}
+++>>>>>>> ce44a4aea5e4 (vxlan: improve validation of address family configuration)
+  
+  	return 0;
+  }
+* Unmerged path drivers/net/vxlan.c
