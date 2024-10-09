@@ -1,0 +1,174 @@
+net/mlx5: E-Switch, Use two priorities for SRIOV offloads mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [netdrv] mlx5: E-Switch, Use two priorities for SRIOV offloads mode (Don Dutile) [1385330 1417284]
+Rebuild_FUZZ: 96.67%
+commit-author Or Gerlitz <ogerlitz@mellanox.com>
+commit 1033665e63b6d98e91c1b938bad2dc624a72c137
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/1033665e.failed
+
+In the offloads mode, some slow path rules are added by the driver (e.g
+send-to-vport), while offloaded rules are to be added from upper layers.
+
+The slow path rules have lower priority and we don't want matching on
+offloaded rules to suffer from extra steering hops related to the slow
+path rules.
+
+We use two priorities, one for offloaded rules (fast path), and one for
+the control rules (slow path). To allow for that, we enable two priorities
+for the FDB namespace in the FS core code.
+
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1033665e63b6d98e91c1b938bad2dc624a72c137)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+#	drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index 6f9da7b7d506,035e536a9911..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@@ -130,9 -137,49 +130,55 @@@ struct mlx5_l2_table 
+  
+  struct mlx5_eswitch_fdb {
+  	void *fdb;
+++<<<<<<< HEAD
+ +	struct mlx5_flow_group *addr_grp;
+ +	struct mlx5_flow_group *allmulti_grp;
+ +	struct mlx5_flow_group *promisc_grp;
+++=======
++ 	union {
++ 		struct legacy_fdb {
++ 			struct mlx5_flow_group *addr_grp;
++ 			struct mlx5_flow_group *allmulti_grp;
++ 			struct mlx5_flow_group *promisc_grp;
++ 		} legacy;
++ 
++ 		struct offloads_fdb {
++ 			struct mlx5_flow_table *fdb;
++ 			struct mlx5_flow_group *send_to_vport_grp;
++ 			struct mlx5_flow_group *miss_grp;
++ 			struct mlx5_flow_rule  *miss_rule;
++ 		} offloads;
++ 	};
++ };
++ 
++ enum {
++ 	SRIOV_NONE,
++ 	SRIOV_LEGACY,
++ 	SRIOV_OFFLOADS
++ };
++ 
++ struct mlx5_esw_sq {
++ 	struct mlx5_flow_rule	*send_to_vport_rule;
++ 	struct list_head	 list;
++ };
++ 
++ struct mlx5_eswitch_rep {
++ 	int		       (*load)(struct mlx5_eswitch *esw,
++ 				       struct mlx5_eswitch_rep *rep);
++ 	void		       (*unload)(struct mlx5_eswitch *esw,
++ 					 struct mlx5_eswitch_rep *rep);
++ 	u16		       vport;
++ 	struct mlx5_flow_rule *vport_rx_rule;
++ 	void		      *priv_data;
++ 	struct list_head       vport_sqs_list;
++ 	bool		       valid;
++ };
++ 
++ struct mlx5_esw_offload {
++ 	struct mlx5_flow_table *ft_offloads;
++ 	struct mlx5_flow_group *vport_rx_group;
++ 	struct mlx5_eswitch_rep *vport_reps;
+++>>>>>>> 1033665e63b6 (net/mlx5: E-Switch, Use two priorities for SRIOV offloads mode)
+  };
+  
+  struct mlx5_eswitch {
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+index 3b6147aebe10,1a377b403321..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+@@@ -1693,18 -1708,59 +1693,36 @@@ static int init_fdb_root_ns(struct mlx5
+  {
+  	struct fs_prio *prio;
+  
+ -	steering->fdb_root_ns = create_root_ns(steering, FS_FT_FDB);
+ -	if (!steering->fdb_root_ns)
+ +	dev->priv.fdb_root_ns = create_root_ns(dev, FS_FT_FDB);
+ +	if (!dev->priv.fdb_root_ns)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	/* Create single prio */
+ +	prio = fs_create_prio(&dev->priv.fdb_root_ns->ns, 0, 1);
+ +	if (IS_ERR(prio)) {
+ +		cleanup_single_prio_root_ns(dev, dev->priv.fdb_root_ns);
+ +		return PTR_ERR(prio);
+ +	} else {
+ +		return 0;
+ +	}
+++=======
++ 	prio = fs_create_prio(&steering->fdb_root_ns->ns, 0, 1);
++ 	if (IS_ERR(prio))
++ 		goto out_err;
++ 
++ 	prio = fs_create_prio(&steering->fdb_root_ns->ns, 1, 1);
++ 	if (IS_ERR(prio))
++ 		goto out_err;
++ 
++ 	set_prio_attrs(steering->fdb_root_ns);
++ 	return 0;
++ 
++ out_err:
++ 	cleanup_root_ns(steering->fdb_root_ns);
++ 	steering->fdb_root_ns = NULL;
++ 	return PTR_ERR(prio);
+ -}
+ -
+ -static int init_ingress_acl_root_ns(struct mlx5_flow_steering *steering)
+ -{
+ -	struct fs_prio *prio;
+ -
+ -	steering->esw_egress_root_ns = create_root_ns(steering, FS_FT_ESW_EGRESS_ACL);
+ -	if (!steering->esw_egress_root_ns)
+ -		return -ENOMEM;
+ -
+ -	/* create 1 prio*/
+ -	prio = fs_create_prio(&steering->esw_egress_root_ns->ns, 0,
+ -			      MLX5_TOTAL_VPORTS(steering->dev));
+ -	if (IS_ERR(prio))
+ -		return PTR_ERR(prio);
+ -	else
+ -		return 0;
+ -}
+ -
+ -static int init_egress_acl_root_ns(struct mlx5_flow_steering *steering)
+ -{
+ -	struct fs_prio *prio;
+ -
+ -	steering->esw_ingress_root_ns = create_root_ns(steering, FS_FT_ESW_INGRESS_ACL);
+ -	if (!steering->esw_ingress_root_ns)
+ -		return -ENOMEM;
+ -
+ -	/* create 1 prio*/
+ -	prio = fs_create_prio(&steering->esw_ingress_root_ns->ns, 0,
+ -			      MLX5_TOTAL_VPORTS(steering->dev));
+ -	if (IS_ERR(prio))
+ -		return PTR_ERR(prio);
+ -	else
+ -		return 0;
+++>>>>>>> 1033665e63b6 (net/mlx5: E-Switch, Use two priorities for SRIOV offloads mode)
+  }
+  
+  int mlx5_init_fs(struct mlx5_core_dev *dev)
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
