@@ -3271,7 +3271,7 @@ static int snd_soc_component_initialize(struct snd_soc_component *component,
 	component->set_pll = component->driver->set_pll;
 	component->set_jack = component->driver->set_jack;
 
-	dapm = &component->dapm;
+	dapm = snd_soc_component_get_dapm(component);
 	dapm->dev = dev;
 	dapm->component = component;
 	dapm->bias_level = SND_SOC_BIAS_OFF;
