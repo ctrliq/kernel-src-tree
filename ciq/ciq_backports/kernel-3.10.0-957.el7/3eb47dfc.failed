@@ -1,0 +1,270 @@
+nfp: protect each repr pointer individually with RCU
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 3eb47dfca0b245d88a4c30b8e41204036e0882e4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/3eb47dfc.failed
+
+Representors are grouped in sets by type.  Currently the whole
+sets are under RCU protection, but individual representor pointers
+are not.  This causes some inconveniences when representors have
+to be destroyed, because we have to allocate new sets to remove
+any representors.  Protect the individual pointers with RCU.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Dirk van der Merwe <dirk.vandermerwe@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3eb47dfca0b245d88a4c30b8e41204036e0882e4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/flower/main.c
+#	drivers/net/ethernet/netronome/nfp/nfp_net_repr.c
+diff --cc drivers/net/ethernet/netronome/nfp/flower/main.c
+index eb91dc71da8d,3c05bffff637..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/main.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/main.c
+@@@ -102,6 -103,56 +102,59 @@@ nfp_flower_repr_get(struct nfp_app *app
+  }
+  
+  static int
+++<<<<<<< HEAD
+++=======
++ nfp_flower_reprs_reify(struct nfp_app *app, enum nfp_repr_type type,
++ 		       bool exists)
++ {
++ 	struct nfp_reprs *reprs;
++ 	int i, err, count = 0;
++ 
++ 	reprs = rcu_dereference_protected(app->reprs[type],
++ 					  lockdep_is_held(&app->pf->lock));
++ 	if (!reprs)
++ 		return 0;
++ 
++ 	for (i = 0; i < reprs->num_reprs; i++) {
++ 		struct net_device *netdev;
++ 
++ 		netdev = nfp_repr_get_locked(app, reprs, i);
++ 		if (netdev) {
++ 			struct nfp_repr *repr = netdev_priv(netdev);
++ 
++ 			err = nfp_flower_cmsg_portreify(repr, exists);
++ 			if (err)
++ 				return err;
++ 			count++;
++ 		}
++ 	}
++ 
++ 	return count;
++ }
++ 
++ static int
++ nfp_flower_wait_repr_reify(struct nfp_app *app, atomic_t *replies, int tot_repl)
++ {
++ 	struct nfp_flower_priv *priv = app->priv;
++ 	int err;
++ 
++ 	if (!tot_repl)
++ 		return 0;
++ 
++ 	lockdep_assert_held(&app->pf->lock);
++ 	err = wait_event_interruptible_timeout(priv->reify_wait_queue,
++ 					       atomic_read(replies) >= tot_repl,
++ 					       msecs_to_jiffies(10));
++ 	if (err <= 0) {
++ 		nfp_warn(app->cpp, "Not all reprs responded to reify\n");
++ 		return -EIO;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int
+++>>>>>>> 3eb47dfca0b2 (nfp: protect each repr pointer individually with RCU)
+  nfp_flower_repr_netdev_open(struct nfp_app *app, struct nfp_repr *repr)
+  {
+  	int err;
+@@@ -194,9 -281,23 +249,9 @@@ nfp_flower_spawn_vnic_reprs(struct nfp_
+  
+  	nfp_app_reprs_set(app, repr_type, reprs);
+  
+ -	atomic_set(replies, 0);
+ -	reify_cnt = nfp_flower_reprs_reify(app, repr_type, true);
+ -	if (reify_cnt < 0) {
+ -		err = reify_cnt;
+ -		nfp_warn(app->cpp, "Failed to notify firmware about repr creation\n");
+ -		goto err_reprs_remove;
+ -	}
+ -
+ -	err = nfp_flower_wait_repr_reify(app, replies, reify_cnt);
+ -	if (err)
+ -		goto err_reprs_remove;
+ -
+  	return 0;
+ -err_reprs_remove:
+ -	reprs = nfp_app_reprs_set(app, repr_type, NULL);
+  err_reprs_clean:
+- 	nfp_reprs_clean_and_free(reprs);
++ 	nfp_reprs_clean_and_free(app, reprs);
+  	return err;
+  }
+  
+@@@ -286,8 -389,22 +342,8 @@@ nfp_flower_spawn_phy_reprs(struct nfp_a
+  	nfp_ctrl_tx(app->ctrl, ctrl_skb);
+  
+  	return 0;
+ -err_reprs_remove:
+ -	reprs = nfp_app_reprs_set(app, NFP_REPR_TYPE_PHYS_PORT, NULL);
+  err_reprs_clean:
+- 	nfp_reprs_clean_and_free(reprs);
++ 	nfp_reprs_clean_and_free(app, reprs);
+  err_free_ctrl_skb:
+  	kfree_skb(ctrl_skb);
+  	return err;
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_repr.c
+index 82a6593712ce,f67da6bde9da..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_repr.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_repr.c
+@@@ -366,17 -391,30 +376,35 @@@ void nfp_reprs_clean_and_free(struct nf
+  }
+  
+  void
+- nfp_reprs_clean_and_free_by_type(struct nfp_app *app,
+- 				 enum nfp_repr_type type)
++ nfp_reprs_clean_and_free_by_type(struct nfp_app *app, enum nfp_repr_type type)
+  {
++ 	struct net_device *netdev;
+  	struct nfp_reprs *reprs;
+++<<<<<<< HEAD
+++=======
++ 	int i;
++ 
++ 	reprs = rcu_dereference_protected(app->reprs[type],
++ 					  lockdep_is_held(&app->pf->lock));
++ 	if (!reprs)
++ 		return;
++ 
++ 	/* Preclean must happen before we remove the reprs reference from the
++ 	 * app below.
++ 	 */
++ 	for (i = 0; i < reprs->num_reprs; i++) {
++ 		netdev = nfp_repr_get_locked(app, reprs, i);
++ 		if (netdev)
++ 			nfp_app_repr_preclean(app, netdev);
++ 	}
+++>>>>>>> 3eb47dfca0b2 (nfp: protect each repr pointer individually with RCU)
+  
+  	reprs = nfp_app_reprs_set(app, type, NULL);
+ +	if (!reprs)
+ +		return;
+  
+  	synchronize_rcu();
+- 	nfp_reprs_clean_and_free(reprs);
++ 	nfp_reprs_clean_and_free(app, reprs);
+  }
+  
+  struct nfp_reprs *nfp_reprs_alloc(unsigned int num_reprs)
+@@@ -398,38 -437,22 +427,45 @@@ int nfp_reprs_resync_phys_ports(struct 
+  	struct nfp_repr *repr;
+  	int i;
+  
+- 	old_reprs = nfp_reprs_get_locked(app, NFP_REPR_TYPE_PHYS_PORT);
+- 	if (!old_reprs)
+- 		return 0;
+- 
+- 	reprs = nfp_reprs_alloc(old_reprs->num_reprs);
++ 	reprs = nfp_reprs_get_locked(app, NFP_REPR_TYPE_PHYS_PORT);
+  	if (!reprs)
+- 		return -ENOMEM;
++ 		return 0;
+  
+- 	for (i = 0; i < old_reprs->num_reprs; i++) {
+- 		if (!old_reprs->reprs[i])
++ 	for (i = 0; i < reprs->num_reprs; i++) {
++ 		netdev = nfp_repr_get_locked(app, reprs, i);
++ 		if (!netdev)
+  			continue;
+  
+++<<<<<<< HEAD
+ +		repr = netdev_priv(old_reprs->reprs[i]);
+ +		if (repr->port->type == NFP_PORT_INVALID)
+ +			continue;
+ +
+ +		reprs->reprs[i] = old_reprs->reprs[i];
+ +	}
+ +
+ +	old_reprs = nfp_app_reprs_set(app, NFP_REPR_TYPE_PHYS_PORT, reprs);
+ +	synchronize_rcu();
+ +
+ +	/* Now we free up removed representors */
+ +	for (i = 0; i < old_reprs->num_reprs; i++) {
+ +		if (!old_reprs->reprs[i])
+ +			continue;
+ +
+ +		repr = netdev_priv(old_reprs->reprs[i]);
+ +		if (repr->port->type != NFP_PORT_INVALID)
+ +			continue;
+ +
+ +		nfp_app_repr_stop(app, repr);
+++=======
++ 		repr = netdev_priv(netdev);
++ 		if (repr->port->type != NFP_PORT_INVALID)
++ 			continue;
++ 
++ 		nfp_app_repr_preclean(app, netdev);
++ 		rcu_assign_pointer(reprs->reprs[i], NULL);
++ 		synchronize_rcu();
+++>>>>>>> 3eb47dfca0b2 (nfp: protect each repr pointer individually with RCU)
+  		nfp_repr_clean(repr);
+  	}
+  
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/main.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_repr.c
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net_repr.h b/drivers/net/ethernet/netronome/nfp/nfp_net_repr.h
+index 5d4d897bc9c6..ab0c9d3eb30f 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_repr.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_repr.h
+@@ -35,6 +35,7 @@
+ #define NFP_NET_REPR_H
+ 
+ struct metadata_dst;
++struct nfp_app;
+ struct nfp_net;
+ struct nfp_port;
+ 
+@@ -47,7 +48,7 @@ struct nfp_port;
+  */
+ struct nfp_reprs {
+ 	unsigned int num_reprs;
+-	struct net_device *reprs[0];
++	struct net_device __rcu *reprs[0];
+ };
+ 
+ /**
+@@ -113,16 +114,18 @@ static inline int nfp_repr_get_port_id(struct net_device *netdev)
+ 	return priv->dst->u.port_info.port_id;
+ }
+ 
++struct net_device *
++nfp_repr_get_locked(struct nfp_app *app, struct nfp_reprs *set,
++		    unsigned int id);
++
+ void nfp_repr_inc_rx_stats(struct net_device *netdev, unsigned int len);
+ int nfp_repr_init(struct nfp_app *app, struct net_device *netdev,
+ 		  u32 cmsg_port_id, struct nfp_port *port,
+ 		  struct net_device *pf_netdev);
+ struct net_device *nfp_repr_alloc(struct nfp_app *app);
+-void
+-nfp_reprs_clean_and_free(struct nfp_reprs *reprs);
+-void
+-nfp_reprs_clean_and_free_by_type(struct nfp_app *app,
+-				 enum nfp_repr_type type);
++void nfp_reprs_clean_and_free(struct nfp_app *app, struct nfp_reprs *reprs);
++void nfp_reprs_clean_and_free_by_type(struct nfp_app *app,
++				      enum nfp_repr_type type);
+ struct nfp_reprs *nfp_reprs_alloc(unsigned int num_reprs);
+ int nfp_reprs_resync_phys_ports(struct nfp_app *app);
+ 
