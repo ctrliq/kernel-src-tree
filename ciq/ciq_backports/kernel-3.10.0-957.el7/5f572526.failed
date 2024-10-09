@@ -1,0 +1,117 @@
+qla2xxx: Fix incorrect tcm_qla2xxx_free_cmd use during TMR ABORT
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Nicholas Bellinger <nab@linux-iscsi.org>
+commit 5f572526a18418258bfa137e3353656c25439500
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/5f572526.failed
+
+This patch drops two incorrect usages of tcm_qla2xxx_free_cmd()
+during TMR ABORT within tcm_qla2xxx_handle_data_work() and
+tcm_qla2xxx_aborted_task(), which where attempting to dispatch
+into workqueue context to do tcm_qla2xxx_complete_free() and
+subsequently invoke transport_generic_free_cmd().
+
+This is incorrect because during TMR ABORT target-core will
+drop the outstanding se_cmd->cmd_kref references once it has
+quiesced the se_cmd via transport_wait_for_tasks(), and in
+the case of qla2xxx it should not attempt to do it's own
+transport_generic_free_cmd() once the abort has occured.
+
+As reported by Pascal, this was originally manifesting as a
+BUG_ON(cmd->cmd_in_wq) in qlt_free_cmd() during TMR ABORT,
+with a LIO backend that had sufficently high enough WRITE
+latency to trigger a host side TMR ABORT_TASK.
+
+In addition, for the case in tcm_qla2xxx_write_pending_status()
+and tcm_qla2xxx_handle_data_work() that waits for outstanding
+FCP WRITE data transfer to complete before preceeding with a
+TMR ABORT, avoid se_cmd->t_transport_stop_comp that is already
+used by transport_wait_for_tasks() and use a qla2xxx internal
+struct completion instead.
+
+	Reported-by: Pascal de Bruijn <p.debruijn@unilogic.nl>
+	Tested-by: Pascal de Bruijn <p.debruijn@unilogic.nl>
+	Acked-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Cc: Quinn Tran <quinn.tran@cavium.com>
+	Cc: <stable@vger.kernel.org> # 3.10+
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 5f572526a18418258bfa137e3353656c25439500)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_target.c
+#	drivers/scsi/qla2xxx/tcm_qla2xxx.c
+diff --cc drivers/scsi/qla2xxx/qla_target.c
+index 81866eb6821f,8f8ece900801..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@@ -4173,7 -4078,9 +4173,13 @@@ static struct qla_tgt_cmd *qlt_get_tag(
+  
+  	cmd = &((struct qla_tgt_cmd *)se_sess->sess_cmd_map)[tag];
+  	memset(cmd, 0, sizeof(struct qla_tgt_cmd));
+++<<<<<<< HEAD
+ +	cmd->cmd_type = TYPE_TGT_CMD;
+++=======
++ 
++ 	init_completion(&cmd->write_pending_abort_comp);
++ 
+++>>>>>>> 5f572526a184 (qla2xxx: Fix incorrect tcm_qla2xxx_free_cmd use during TMR ABORT)
+  	memcpy(&cmd->atio, atio, sizeof(*atio));
+  	cmd->state = QLA_TGT_STATE_NEW;
+  	cmd->tgt = vha->vha_tgt.qla_tgt;
+diff --cc drivers/scsi/qla2xxx/tcm_qla2xxx.c
+index 09f5e5812e98,8c1bf9b14bb2..000000000000
+--- a/drivers/scsi/qla2xxx/tcm_qla2xxx.c
++++ b/drivers/scsi/qla2xxx/tcm_qla2xxx.c
+@@@ -523,18 -508,7 +522,22 @@@ static void tcm_qla2xxx_handle_data_wor
+  	 */
+  	cmd->cmd_in_wq = 0;
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&cmd->cmd_lock, flags);
+ +	cmd->data_work = 1;
+ +	if (cmd->aborted) {
+ +		cmd->data_work_free = 1;
+ +		spin_unlock_irqrestore(&cmd->cmd_lock, flags);
+ +
+ +		tcm_qla2xxx_free_cmd(cmd);
+ +		return;
+ +	}
+ +	spin_unlock_irqrestore(&cmd->cmd_lock, flags);
+ +
+ +	cmd->qpair->tgt_counters.qla_core_ret_ctio++;
+++=======
++ 	cmd->vha->tgt_counters.qla_core_ret_ctio++;
+++>>>>>>> 5f572526a184 (qla2xxx: Fix incorrect tcm_qla2xxx_free_cmd use during TMR ABORT)
+  	if (!cmd->write_data_transferred) {
+  		/*
+  		 * Check if se_cmd has already been aborted via LUN_RESET, and
+@@@ -777,8 -741,6 +780,11 @@@ static void tcm_qla2xxx_queue_tm_rsp(st
+  	qlt_xmit_tm_rsp(mcmd);
+  }
+  
+++<<<<<<< HEAD
+ +
+ +#define DATA_WORK_NOT_FREE(_cmd) (_cmd->data_work && !_cmd->data_work_free)
+++=======
+++>>>>>>> 5f572526a184 (qla2xxx: Fix incorrect tcm_qla2xxx_free_cmd use during TMR ABORT)
+  static void tcm_qla2xxx_aborted_task(struct se_cmd *se_cmd)
+  {
+  	struct qla_tgt_cmd *cmd = container_of(se_cmd,
+* Unmerged path drivers/scsi/qla2xxx/qla_target.c
+diff --git a/drivers/scsi/qla2xxx/qla_target.h b/drivers/scsi/qla2xxx/qla_target.h
+index b93b39992329..241f09fd7748 100644
+--- a/drivers/scsi/qla2xxx/qla_target.h
++++ b/drivers/scsi/qla2xxx/qla_target.h
+@@ -889,6 +889,7 @@ struct qla_tgt_cmd {
+ 	unsigned char sense_buffer[TRANSPORT_SENSE_BUFFER];
+ 
+ 	spinlock_t cmd_lock;
++	struct completion write_pending_abort_comp;
+ 	/* to save extra sess dereferences */
+ 	unsigned int conf_compl_supported:1;
+ 	unsigned int sg_mapped:1;
+* Unmerged path drivers/scsi/qla2xxx/tcm_qla2xxx.c
