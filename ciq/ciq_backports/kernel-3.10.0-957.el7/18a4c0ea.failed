@@ -1,0 +1,639 @@
+net: add rb_to_skb() and other rb tree helpers
+
+jira LE-1907
+cve CVE-2018-5390
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [net] add rb_to_skb() and other rb tree helpers (Paolo Abeni) [1611369] {CVE-2018-5390}
+Rebuild_FUZZ: 94.25%
+commit-author Eric Dumazet <edumazet@google.com>
+commit 18a4c0eab2623cc95be98a1e6af1ad18e7695977
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/18a4c0ea.failed
+
+Geeralize private netem_rb_to_skb()
+
+TCP rtx queue will soon be converted to rb-tree,
+so we will need skb_rbtree_walk() helpers.
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 18a4c0eab2623cc95be98a1e6af1ad18e7695977)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/skbuff.h
+#	net/ipv4/tcp_fastopen.c
+#	net/ipv4/tcp_input.c
+#	net/sched/sch_netem.c
+diff --cc include/linux/skbuff.h
+index 6ad965e15f51,03634ec2f918..000000000000
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@@ -3032,6 -3143,27 +3032,30 @@@ static inline int pskb_trim_rcsum(struc
+  	return __pskb_trim(skb, len);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline int __skb_trim_rcsum(struct sk_buff *skb, unsigned int len)
++ {
++ 	if (skb->ip_summed == CHECKSUM_COMPLETE)
++ 		skb->ip_summed = CHECKSUM_NONE;
++ 	__skb_trim(skb, len);
++ 	return 0;
++ }
++ 
++ static inline int __skb_grow_rcsum(struct sk_buff *skb, unsigned int len)
++ {
++ 	if (skb->ip_summed == CHECKSUM_COMPLETE)
++ 		skb->ip_summed = CHECKSUM_NONE;
++ 	return __skb_grow(skb, len);
++ }
++ 
++ #define rb_to_skb(rb) rb_entry_safe(rb, struct sk_buff, rbnode)
++ #define skb_rb_first(root) rb_to_skb(rb_first(root))
++ #define skb_rb_last(root)  rb_to_skb(rb_last(root))
++ #define skb_rb_next(skb)   rb_to_skb(rb_next(&(skb)->rbnode))
++ #define skb_rb_prev(skb)   rb_to_skb(rb_prev(&(skb)->rbnode))
++ 
+++>>>>>>> 18a4c0eab262 (net: add rb_to_skb() and other rb tree helpers)
+  #define skb_queue_walk(queue, skb) \
+  		for (skb = (queue)->next;					\
+  		     skb != (struct sk_buff *)(queue);				\
+diff --cc net/ipv4/tcp_fastopen.c
+index 39316c1633b4,7ee4aadcdd71..000000000000
+--- a/net/ipv4/tcp_fastopen.c
++++ b/net/ipv4/tcp_fastopen.c
+@@@ -300,6 -339,151 +300,95 @@@ fastopen
+  
+  	valid_foc.exp = foc->exp;
+  	*foc = valid_foc;
+ -	return NULL;
+ -}
+ -
+ -bool tcp_fastopen_cookie_check(struct sock *sk, u16 *mss,
+ -			       struct tcp_fastopen_cookie *cookie)
+ -{
+ -	unsigned long last_syn_loss = 0;
+ -	int syn_loss = 0;
+ -
+ -	tcp_fastopen_cache_get(sk, mss, cookie, &syn_loss, &last_syn_loss);
+ -
+ -	/* Recurring FO SYN losses: no cookie or data in SYN */
+ -	if (syn_loss > 1 &&
+ -	    time_before(jiffies, last_syn_loss + (60*HZ << syn_loss))) {
+ -		cookie->len = -1;
+ -		return false;
+ -	}
+ -
+ -	/* Firewall blackhole issue check */
+ -	if (tcp_fastopen_active_should_disable(sk)) {
+ -		cookie->len = -1;
+ -		return false;
+ -	}
+ -
+ -	if (sock_net(sk)->ipv4.sysctl_tcp_fastopen & TFO_CLIENT_NO_COOKIE) {
+ -		cookie->len = -1;
+ -		return true;
+ -	}
+ -	return cookie->len > 0;
+ -}
+ -
+ -/* This function checks if we want to defer sending SYN until the first
+ - * write().  We defer under the following conditions:
+ - * 1. fastopen_connect sockopt is set
+ - * 2. we have a valid cookie
+ - * Return value: return true if we want to defer until application writes data
+ - *               return false if we want to send out SYN immediately
+ - */
+ -bool tcp_fastopen_defer_connect(struct sock *sk, int *err)
+ -{
+ -	struct tcp_fastopen_cookie cookie = { .len = 0 };
+ -	struct tcp_sock *tp = tcp_sk(sk);
+ -	u16 mss;
+ -
+ -	if (tp->fastopen_connect && !tp->fastopen_req) {
+ -		if (tcp_fastopen_cookie_check(sk, &mss, &cookie)) {
+ -			inet_sk(sk)->defer_connect = 1;
+ -			return true;
+ -		}
+ -
+ -		/* Alloc fastopen_req in order for FO option to be included
+ -		 * in SYN
+ -		 */
+ -		tp->fastopen_req = kzalloc(sizeof(*tp->fastopen_req),
+ -					   sk->sk_allocation);
+ -		if (tp->fastopen_req)
+ -			tp->fastopen_req->cookie = cookie;
+ -		else
+ -			*err = -ENOBUFS;
+ -	}
+  	return false;
+  }
+++<<<<<<< HEAD
+ +EXPORT_SYMBOL(tcp_try_fastopen);
+++=======
++ EXPORT_SYMBOL(tcp_fastopen_defer_connect);
++ 
++ /*
++  * The following code block is to deal with middle box issues with TFO:
++  * Middlebox firewall issues can potentially cause server's data being
++  * blackholed after a successful 3WHS using TFO.
++  * The proposed solution is to disable active TFO globally under the
++  * following circumstances:
++  *   1. client side TFO socket receives out of order FIN
++  *   2. client side TFO socket receives out of order RST
++  * We disable active side TFO globally for 1hr at first. Then if it
++  * happens again, we disable it for 2h, then 4h, 8h, ...
++  * And we reset the timeout back to 1hr when we see a successful active
++  * TFO connection with data exchanges.
++  */
++ 
++ /* Disable active TFO and record current jiffies and
++  * tfo_active_disable_times
++  */
++ void tcp_fastopen_active_disable(struct sock *sk)
++ {
++ 	struct net *net = sock_net(sk);
++ 
++ 	atomic_inc(&net->ipv4.tfo_active_disable_times);
++ 	net->ipv4.tfo_active_disable_stamp = jiffies;
++ 	NET_INC_STATS(net, LINUX_MIB_TCPFASTOPENBLACKHOLE);
++ }
++ 
++ /* Calculate timeout for tfo active disable
++  * Return true if we are still in the active TFO disable period
++  * Return false if timeout already expired and we should use active TFO
++  */
++ bool tcp_fastopen_active_should_disable(struct sock *sk)
++ {
++ 	unsigned int tfo_bh_timeout = sock_net(sk)->ipv4.sysctl_tcp_fastopen_blackhole_timeout;
++ 	int tfo_da_times = atomic_read(&sock_net(sk)->ipv4.tfo_active_disable_times);
++ 	unsigned long timeout;
++ 	int multiplier;
++ 
++ 	if (!tfo_da_times)
++ 		return false;
++ 
++ 	/* Limit timout to max: 2^6 * initial timeout */
++ 	multiplier = 1 << min(tfo_da_times - 1, 6);
++ 	timeout = multiplier * tfo_bh_timeout * HZ;
++ 	if (time_before(jiffies, sock_net(sk)->ipv4.tfo_active_disable_stamp + timeout))
++ 		return true;
++ 
++ 	/* Mark check bit so we can check for successful active TFO
++ 	 * condition and reset tfo_active_disable_times
++ 	 */
++ 	tcp_sk(sk)->syn_fastopen_ch = 1;
++ 	return false;
++ }
++ 
++ /* Disable active TFO if FIN is the only packet in the ofo queue
++  * and no data is received.
++  * Also check if we can reset tfo_active_disable_times if data is
++  * received successfully on a marked active TFO sockets opened on
++  * a non-loopback interface
++  */
++ void tcp_fastopen_active_disable_ofo_check(struct sock *sk)
++ {
++ 	struct tcp_sock *tp = tcp_sk(sk);
++ 	struct dst_entry *dst;
++ 	struct sk_buff *skb;
++ 
++ 	if (!tp->syn_fastopen)
++ 		return;
++ 
++ 	if (!tp->data_segs_in) {
++ 		skb = skb_rb_first(&tp->out_of_order_queue);
++ 		if (skb && !skb_rb_next(skb)) {
++ 			if (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN) {
++ 				tcp_fastopen_active_disable(sk);
++ 				return;
++ 			}
++ 		}
++ 	} else if (tp->syn_fastopen_ch &&
++ 		   atomic_read(&sock_net(sk)->ipv4.tfo_active_disable_times)) {
++ 		dst = sk_dst_get(sk);
++ 		if (!(dst && dst->dev && (dst->dev->flags & IFF_LOOPBACK)))
++ 			atomic_set(&sock_net(sk)->ipv4.tfo_active_disable_times, 0);
++ 		dst_release(dst);
++ 	}
++ }
+++>>>>>>> 18a4c0eab262 (net: add rb_to_skb() and other rb tree helpers)
+diff --cc net/ipv4/tcp_input.c
+index 4ec1e4f8ab44,90afe4143596..000000000000
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@@ -4233,10 -4329,13 +4233,16 @@@ static void tcp_ofo_queue(struct sock *
+  {
+  	struct tcp_sock *tp = tcp_sk(sk);
+  	__u32 dsack_high = tp->rcv_nxt;
+ -	bool fin, fragstolen, eaten;
+  	struct sk_buff *skb, *tail;
+ -	struct rb_node *p;
+ +	bool fragstolen, eaten;
+  
+++<<<<<<< HEAD
+ +	while ((skb = skb_peek(&tp->out_of_order_queue)) != NULL) {
+++=======
++ 	p = rb_first(&tp->out_of_order_queue);
++ 	while (p) {
++ 		skb = rb_to_skb(p);
+++>>>>>>> 18a4c0eab262 (net: add rb_to_skb() and other rb tree helpers)
+  		if (after(TCP_SKB_CB(skb)->seq, tp->rcv_nxt))
+  			break;
+  
+@@@ -4295,14 -4399,16 +4301,18 @@@ static int tcp_try_rmem_schedule(struc
+  static void tcp_data_queue_ofo(struct sock *sk, struct sk_buff *skb)
+  {
+  	struct tcp_sock *tp = tcp_sk(sk);
+++<<<<<<< HEAD
+++=======
++ 	struct rb_node **p, *parent;
+++>>>>>>> 18a4c0eab262 (net: add rb_to_skb() and other rb tree helpers)
+  	struct sk_buff *skb1;
+  	u32 seq, end_seq;
+ -	bool fragstolen;
+  
+ -	tcp_ecn_check_ce(tp, skb);
+ +	TCP_ECN_check_ce(tp, skb);
+  
+  	if (unlikely(tcp_try_rmem_schedule(sk, skb, skb->truesize))) {
+ -		NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPOFODROP);
+ -		tcp_drop(sk, skb);
+ +		NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPOFODROP);
+ +		__kfree_skb(skb);
+  		return;
+  	}
+  
+@@@ -4327,73 -4436,74 +4337,90 @@@
+  		goto end;
+  	}
+  
+ -	/* In the typical case, we are adding an skb to the end of the list.
+ -	 * Use of ooo_last_skb avoids the O(Log(N)) rbtree lookup.
+ -	 */
+ -	if (tcp_try_coalesce(sk, tp->ooo_last_skb,
+ -			     skb, &fragstolen)) {
+ -coalesce_done:
+ -		tcp_grow_window(sk, skb);
+ -		kfree_skb_partial(skb, fragstolen);
+ -		skb = NULL;
+ -		goto add_sack;
+ -	}
+ -	/* Can avoid an rbtree lookup if we are adding skb after ooo_last_skb */
+ -	if (!before(seq, TCP_SKB_CB(tp->ooo_last_skb)->end_seq)) {
+ -		parent = &tp->ooo_last_skb->rbnode;
+ -		p = &parent->rb_right;
+ -		goto insert;
+ +	seq = TCP_SKB_CB(skb)->seq;
+ +	end_seq = TCP_SKB_CB(skb)->end_seq;
+ +
+ +	if (seq == TCP_SKB_CB(skb1)->end_seq) {
+ +		bool fragstolen;
+ +
+ +		if (!tcp_try_coalesce(sk, skb1, skb, &fragstolen)) {
+ +			__skb_queue_after(&tp->out_of_order_queue, skb1, skb);
+ +		} else {
+ +			tcp_grow_window(sk, skb);
+ +			kfree_skb_partial(skb, fragstolen);
+ +			skb = NULL;
+ +		}
+ +
+ +		if (!tp->rx_opt.num_sacks ||
+ +		    tp->selective_acks[0].end_seq != seq)
+ +			goto add_sack;
+ +
+ +		/* Common case: data arrive in order after hole. */
+ +		tp->selective_acks[0].end_seq = end_seq;
+ +		goto end;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* Find place to insert this segment. */
+ +	while (1) {
+ +		if (!after(TCP_SKB_CB(skb1)->seq, seq))
+ +			break;
+ +		if (skb_queue_is_first(&tp->out_of_order_queue, skb1)) {
+ +			skb1 = NULL;
+ +			break;
+++=======
++ 	/* Find place to insert this segment. Handle overlaps on the way. */
++ 	parent = NULL;
++ 	while (*p) {
++ 		parent = *p;
++ 		skb1 = rb_to_skb(parent);
++ 		if (before(seq, TCP_SKB_CB(skb1)->seq)) {
++ 			p = &parent->rb_left;
++ 			continue;
+++>>>>>>> 18a4c0eab262 (net: add rb_to_skb() and other rb tree helpers)
+  		}
+ -		if (before(seq, TCP_SKB_CB(skb1)->end_seq)) {
+ -			if (!after(end_seq, TCP_SKB_CB(skb1)->end_seq)) {
+ -				/* All the bits are present. Drop. */
+ -				NET_INC_STATS(sock_net(sk),
+ -					      LINUX_MIB_TCPOFOMERGE);
+ -				__kfree_skb(skb);
+ -				skb = NULL;
+ -				tcp_dsack_set(sk, seq, end_seq);
+ -				goto add_sack;
+ -			}
+ -			if (after(seq, TCP_SKB_CB(skb1)->seq)) {
+ -				/* Partial overlap. */
+ -				tcp_dsack_set(sk, seq, TCP_SKB_CB(skb1)->end_seq);
+ -			} else {
+ -				/* skb's seq == skb1's seq and skb covers skb1.
+ -				 * Replace skb1 with skb.
+ -				 */
+ -				rb_replace_node(&skb1->rbnode, &skb->rbnode,
+ -						&tp->out_of_order_queue);
+ -				tcp_dsack_extend(sk,
+ -						 TCP_SKB_CB(skb1)->seq,
+ -						 TCP_SKB_CB(skb1)->end_seq);
+ -				NET_INC_STATS(sock_net(sk),
+ -					      LINUX_MIB_TCPOFOMERGE);
+ -				__kfree_skb(skb1);
+ -				goto merge_right;
+ -			}
+ -		} else if (tcp_try_coalesce(sk, skb1,
+ -					    skb, &fragstolen)) {
+ -			goto coalesce_done;
+ +		skb1 = skb_queue_prev(&tp->out_of_order_queue, skb1);
+ +	}
+ +
+++<<<<<<< HEAD
+ +	/* Do skb overlap to previous one? */
+ +	if (skb1 && before(seq, TCP_SKB_CB(skb1)->end_seq)) {
+ +		if (!after(end_seq, TCP_SKB_CB(skb1)->end_seq)) {
+ +			/* All the bits are present. Drop. */
+ +			NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPOFOMERGE);
+ +			__kfree_skb(skb);
+ +			skb = NULL;
+ +			tcp_dsack_set(sk, seq, end_seq);
+ +			goto add_sack;
+ +		}
+ +		if (after(seq, TCP_SKB_CB(skb1)->seq)) {
+ +			/* Partial overlap. */
+ +			tcp_dsack_set(sk, seq,
+ +				      TCP_SKB_CB(skb1)->end_seq);
+ +		} else {
+ +			if (skb_queue_is_first(&tp->out_of_order_queue,
+ +					       skb1))
+ +				skb1 = NULL;
+ +			else
+ +				skb1 = skb_queue_prev(
+ +					&tp->out_of_order_queue,
+ +					skb1);
+  		}
+ -		p = &parent->rb_right;
+  	}
+ -insert:
+ -	/* Insert segment into RB tree. */
+ -	rb_link_node(&skb->rbnode, parent, p);
+ -	rb_insert_color(&skb->rbnode, &tp->out_of_order_queue);
+ +	if (!skb1)
+ +		__skb_queue_head(&tp->out_of_order_queue, skb);
+ +	else
+ +		__skb_queue_after(&tp->out_of_order_queue, skb1, skb);
+ +
+ +	/* And clean segments covered by new one as whole. */
+ +	while (!skb_queue_is_last(&tp->out_of_order_queue, skb)) {
+ +		skb1 = skb_queue_next(&tp->out_of_order_queue, skb);
+  
+++=======
++ merge_right:
++ 	/* Remove other segments covered by skb. */
++ 	while ((skb1 = skb_rb_next(skb)) != NULL) {
+++>>>>>>> 18a4c0eab262 (net: add rb_to_skb() and other rb tree helpers)
+  		if (!after(end_seq, TCP_SKB_CB(skb1)->seq))
+  			break;
+  		if (before(end_seq, TCP_SKB_CB(skb1)->end_seq)) {
+@@@ -4401,12 -4511,15 +4428,18 @@@
+  					 end_seq);
+  			break;
+  		}
+ -		rb_erase(&skb1->rbnode, &tp->out_of_order_queue);
+ +		__skb_unlink(skb1, &tp->out_of_order_queue);
+  		tcp_dsack_extend(sk, TCP_SKB_CB(skb1)->seq,
+  				 TCP_SKB_CB(skb1)->end_seq);
+ -		NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPOFOMERGE);
+ -		tcp_drop(sk, skb1);
+ +		NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPOFOMERGE);
+ +		__kfree_skb(skb1);
+  	}
+++<<<<<<< HEAD
+++=======
++ 	/* If there is no skb after us, we are the last_skb ! */
++ 	if (!skb1)
++ 		tp->ooo_last_skb = skb;
+++>>>>>>> 18a4c0eab262 (net: add rb_to_skb() and other rb tree helpers)
+  
+  add_sack:
+  	if (tcp_is_sack(tp))
+@@@ -4588,21 -4699,50 +4621,54 @@@ drop
+  	tcp_data_queue_ofo(sk, skb);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct sk_buff *tcp_skb_next(struct sk_buff *skb, struct sk_buff_head *list)
++ {
++ 	if (list)
++ 		return !skb_queue_is_last(list, skb) ? skb->next : NULL;
++ 
++ 	return skb_rb_next(skb);
++ }
++ 
+++>>>>>>> 18a4c0eab262 (net: add rb_to_skb() and other rb tree helpers)
+  static struct sk_buff *tcp_collapse_one(struct sock *sk, struct sk_buff *skb,
+ -					struct sk_buff_head *list,
+ -					struct rb_root *root)
+ +					struct sk_buff_head *list)
+  {
+ -	struct sk_buff *next = tcp_skb_next(skb, list);
+ +	struct sk_buff *next = NULL;
+  
+ -	if (list)
+ -		__skb_unlink(skb, list);
+ -	else
+ -		rb_erase(&skb->rbnode, root);
+ +	if (!skb_queue_is_last(list, skb))
+ +		next = skb_queue_next(list, skb);
+  
+ +	__skb_unlink(skb, list);
+  	__kfree_skb(skb);
+ -	NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPRCVCOLLAPSED);
+ +	NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPRCVCOLLAPSED);
+  
+  	return next;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Insert skb into rb tree, ordered by TCP_SKB_CB(skb)->seq */
++ static void tcp_rbtree_insert(struct rb_root *root, struct sk_buff *skb)
++ {
++ 	struct rb_node **p = &root->rb_node;
++ 	struct rb_node *parent = NULL;
++ 	struct sk_buff *skb1;
++ 
++ 	while (*p) {
++ 		parent = *p;
++ 		skb1 = rb_to_skb(parent);
++ 		if (before(TCP_SKB_CB(skb)->seq, TCP_SKB_CB(skb1)->seq))
++ 			p = &parent->rb_left;
++ 		else
++ 			p = &parent->rb_right;
++ 	}
++ 	rb_link_node(&skb->rbnode, parent, p);
++ 	rb_insert_color(&skb->rbnode, root);
++ }
++ 
+++>>>>>>> 18a4c0eab262 (net: add rb_to_skb() and other rb tree helpers)
+  /* Collapse contiguous sequence of skbs head..tail with
+   * sequence numbers start..end.
+   *
+@@@ -4707,26 -4851,24 +4773,41 @@@ restart
+  static void tcp_collapse_ofo_queue(struct sock *sk)
+  {
+  	struct tcp_sock *tp = tcp_sk(sk);
+++<<<<<<< HEAD
+ +	struct sk_buff *skb = skb_peek(&tp->out_of_order_queue);
+ +	struct sk_buff *head;
+ +	u32 start, end;
+ +
+ +	if (skb == NULL)
+++=======
++ 	struct sk_buff *skb, *head;
++ 	u32 start, end;
++ 
++ 	skb = skb_rb_first(&tp->out_of_order_queue);
++ new_range:
++ 	if (!skb) {
++ 		tp->ooo_last_skb = skb_rb_last(&tp->out_of_order_queue);
+++>>>>>>> 18a4c0eab262 (net: add rb_to_skb() and other rb tree helpers)
+  		return;
+ -	}
+ +
+  	start = TCP_SKB_CB(skb)->seq;
+  	end = TCP_SKB_CB(skb)->end_seq;
+ +	head = skb;
+  
+++<<<<<<< HEAD
+ +	for (;;) {
+ +		struct sk_buff *next = NULL;
+++=======
++ 	for (head = skb;;) {
++ 		skb = skb_rb_next(skb);
+++>>>>>>> 18a4c0eab262 (net: add rb_to_skb() and other rb tree helpers)
+  
+ -		/* Range is terminated when we see a gap or when
+ -		 * we are at the queue end.
+ -		 */
+ +		if (!skb_queue_is_last(&tp->out_of_order_queue, skb))
+ +			next = skb_queue_next(&tp->out_of_order_queue, skb);
+ +		skb = next;
+ +
+ +		/* Segment is terminated when we see gap or when
+ +		 * we are at the end of all the queue. */
+  		if (!skb ||
+  		    after(TCP_SKB_CB(skb)->seq, end) ||
+  		    before(TCP_SKB_CB(skb)->end_seq, start)) {
+@@@ -4754,23 -4897,33 +4835,48 @@@
+  static bool tcp_prune_ofo_queue(struct sock *sk)
+  {
+  	struct tcp_sock *tp = tcp_sk(sk);
+ -	struct rb_node *node, *prev;
+ +	bool res = false;
+  
+ -	if (RB_EMPTY_ROOT(&tp->out_of_order_queue))
+ -		return false;
+ +	if (!skb_queue_empty(&tp->out_of_order_queue)) {
+ +		NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_OFOPRUNED);
+ +		__skb_queue_purge(&tp->out_of_order_queue);
+  
+++<<<<<<< HEAD
+ +		/* Reset SACK state.  A conforming SACK implementation will
+ +		 * do the same at a timeout based retransmit.  When a connection
+ +		 * is in a sad state like this, we care only about integrity
+ +		 * of the connection not performance.
+ +		 */
+ +		if (tp->rx_opt.sack_ok)
+ +			tcp_sack_reset(&tp->rx_opt);
+ +		sk_mem_reclaim(sk);
+ +		res = true;
+ +	}
+ +	return res;
+++=======
++ 	NET_INC_STATS(sock_net(sk), LINUX_MIB_OFOPRUNED);
++ 	node = &tp->ooo_last_skb->rbnode;
++ 	do {
++ 		prev = rb_prev(node);
++ 		rb_erase(node, &tp->out_of_order_queue);
++ 		tcp_drop(sk, rb_to_skb(node));
++ 		sk_mem_reclaim(sk);
++ 		if (atomic_read(&sk->sk_rmem_alloc) <= sk->sk_rcvbuf &&
++ 		    !tcp_under_memory_pressure(sk))
++ 			break;
++ 		node = prev;
++ 	} while (node);
++ 	tp->ooo_last_skb = rb_to_skb(prev);
++ 
++ 	/* Reset SACK state.  A conforming SACK implementation will
++ 	 * do the same at a timeout based retransmit.  When a connection
++ 	 * is in a sad state like this, we care only about integrity
++ 	 * of the connection not performance.
++ 	 */
++ 	if (tp->rx_opt.sack_ok)
++ 		tcp_sack_reset(&tp->rx_opt);
++ 	return true;
+++>>>>>>> 18a4c0eab262 (net: add rb_to_skb() and other rb tree helpers)
+  }
+  
+  /* Reduce allocated memory if we can, trying to get
+diff --cc net/sched/sch_netem.c
+index 1a00ab99d0a9,db0228a65e8c..000000000000
+--- a/net/sched/sch_netem.c
++++ b/net/sched/sch_netem.c
+@@@ -146,15 -146,8 +146,9 @@@ struct netem_sched_data 
+   */
+  struct netem_skb_cb {
+  	psched_time_t	time_to_send;
+ +	ktime_t		tstamp_save;
+  };
+  
+- 
+- static struct sk_buff *netem_rb_to_skb(struct rb_node *rb)
+- {
+- 	return rb_entry(rb, struct sk_buff, rbnode);
+- }
+- 
+  static inline struct netem_skb_cb *netem_skb_cb(struct sk_buff *skb)
+  {
+  	/* we assume we can use skb next/prev/tstamp as storage for rb_node */
+@@@ -362,12 -355,13 +356,17 @@@ static psched_time_t packet_len_2_sched
+  static void tfifo_reset(struct Qdisc *sch)
+  {
+  	struct netem_sched_data *q = qdisc_priv(sch);
+ -	struct rb_node *p = rb_first(&q->t_root);
+ +	struct rb_node *p;
+  
+++<<<<<<< HEAD
+ +	while ((p = rb_first(&q->t_root))) {
+ +		struct sk_buff *skb = netem_rb_to_skb(p);
+++=======
++ 	while (p) {
++ 		struct sk_buff *skb = rb_to_skb(p);
+++>>>>>>> 18a4c0eab262 (net: add rb_to_skb() and other rb tree helpers)
+  
+ -		p = rb_next(p);
+ -		rb_erase(&skb->rbnode, &q->t_root);
+ +		rb_erase(p, &q->t_root);
+  		rtnl_kfree_skbs(skb, skb);
+  	}
+  }
+* Unmerged path include/linux/skbuff.h
+* Unmerged path net/ipv4/tcp_fastopen.c
+* Unmerged path net/ipv4/tcp_input.c
+* Unmerged path net/sched/sch_netem.c
