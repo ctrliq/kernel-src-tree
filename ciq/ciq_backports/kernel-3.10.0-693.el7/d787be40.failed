@@ -1,0 +1,220 @@
+md: reduce the number of synchronize_rcu() calls when multiple devices fail.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [md] reduce the number of synchronize_rcu() calls when multiple devices fail (Jes Sorensen) [1380016]
+Rebuild_FUZZ: 96.60%
+commit-author NeilBrown <neilb@suse.com>
+commit d787be4092e27728cb4c012bee9762098ef3c662
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/d787be40.failed
+
+Every time a device is removed with ->hot_remove_disk() a synchronize_rcu() call is made
+which can delay several milliseconds in some case.
+If lots of devices fail at once - as could happen with a large RAID10 where one set
+of devices are removed all at once - these delays can add up to be very inconcenient.
+
+As failure is not reversible we can check for that first, setting a
+separate flag if it is found, and then all synchronize_rcu() once for
+all the flagged devices.  Then ->hot_remove_disk() function can skip the
+synchronize_rcu() step if the flag is set.
+
+fix build error(Shaohua)
+	Signed-off-by: NeilBrown <neilb@suse.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit d787be4092e27728cb4c012bee9762098ef3c662)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/md.h
+diff --cc drivers/md/md.h
+index 9287b20d130c,dc65ca65b26e..000000000000
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@@ -163,6 -162,12 +163,15 @@@ enum flag_bits 
+  				 * Usually, this device should be faster
+  				 * than other devices in the array
+  				 */
+++<<<<<<< HEAD
+++=======
++ 	ClusterRemove,
++ 	RemoveSynchronized,	/* synchronize_rcu() was called after
++ 				 * this device was known to be faulty,
++ 				 * so it is safe to remove without
++ 				 * another synchronize_rcu() call.
++ 				 */
+++>>>>>>> d787be4092e2 (md: reduce the number of synchronize_rcu() calls when multiple devices fail.)
+  };
+  
+  static inline int is_badblock(struct md_rdev *rdev, sector_t s, int sectors,
+diff --git a/drivers/md/md.c b/drivers/md/md.c
+index 56d38fdbae6d..6ae09eb413ed 100644
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -7944,15 +7944,34 @@ static int remove_and_add_spares(struct mddev *mddev,
+ 	struct md_rdev *rdev;
+ 	int spares = 0;
+ 	int removed = 0;
++	bool remove_some = false;
+ 
+-	rdev_for_each(rdev, mddev)
++	rdev_for_each(rdev, mddev) {
++		if ((this == NULL || rdev == this) &&
++		    rdev->raid_disk >= 0 &&
++		    !test_bit(Blocked, &rdev->flags) &&
++		    test_bit(Faulty, &rdev->flags) &&
++		    atomic_read(&rdev->nr_pending)==0) {
++			/* Faulty non-Blocked devices with nr_pending == 0
++			 * never get nr_pending incremented,
++			 * never get Faulty cleared, and never get Blocked set.
++			 * So we can synchronize_rcu now rather than once per device
++			 */
++			remove_some = true;
++			set_bit(RemoveSynchronized, &rdev->flags);
++		}
++	}
++
++	if (remove_some)
++		synchronize_rcu();
++	rdev_for_each(rdev, mddev) {
+ 		if ((this == NULL || rdev == this) &&
+ 		    rdev->raid_disk >= 0 &&
+ 		    !test_bit(Blocked, &rdev->flags) &&
+-		    (test_bit(Faulty, &rdev->flags) ||
++		    ((test_bit(RemoveSynchronized, &rdev->flags) ||
+ 		     (!test_bit(In_sync, &rdev->flags) &&
+ 		      !test_bit(Journal, &rdev->flags))) &&
+-		    atomic_read(&rdev->nr_pending)==0) {
++		    atomic_read(&rdev->nr_pending)==0)) {
+ 			if (mddev->pers->hot_remove_disk(
+ 				    mddev, rdev) == 0) {
+ 				sysfs_unlink_rdev(mddev, rdev);
+@@ -7960,6 +7979,10 @@ static int remove_and_add_spares(struct mddev *mddev,
+ 				removed++;
+ 			}
+ 		}
++		if (remove_some && test_bit(RemoveSynchronized, &rdev->flags))
++			clear_bit(RemoveSynchronized, &rdev->flags);
++	}
++
+ 	if (removed && mddev->kobj.sd)
+ 		sysfs_notify(&mddev->kobj, NULL, "degraded");
+ 
+* Unmerged path drivers/md/md.h
+diff --git a/drivers/md/multipath.c b/drivers/md/multipath.c
+index 2469a87c423b..4cf93f10e44b 100644
+--- a/drivers/md/multipath.c
++++ b/drivers/md/multipath.c
+@@ -307,12 +307,14 @@ static int multipath_remove_disk(struct mddev *mddev, struct md_rdev *rdev)
+ 			goto abort;
+ 		}
+ 		p->rdev = NULL;
+-		synchronize_rcu();
+-		if (atomic_read(&rdev->nr_pending)) {
+-			/* lost the race, try later */
+-			err = -EBUSY;
+-			p->rdev = rdev;
+-			goto abort;
++		if (!test_bit(RemoveSynchronized, &rdev->flags)) {
++			synchronize_rcu();
++			if (atomic_read(&rdev->nr_pending)) {
++				/* lost the race, try later */
++				err = -EBUSY;
++				p->rdev = rdev;
++				goto abort;
++			}
+ 		}
+ 		err = md_integrity_register(mddev);
+ 	}
+diff --git a/drivers/md/raid1.c b/drivers/md/raid1.c
+index 61555b115942..e27565aa5bf0 100644
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@ -1689,13 +1689,16 @@ static int raid1_remove_disk(struct mddev *mddev, struct md_rdev *rdev)
+ 			goto abort;
+ 		}
+ 		p->rdev = NULL;
+-		synchronize_rcu();
+-		if (atomic_read(&rdev->nr_pending)) {
+-			/* lost the race, try later */
+-			err = -EBUSY;
+-			p->rdev = rdev;
+-			goto abort;
+-		} else if (conf->mirrors[conf->raid_disks + number].rdev) {
++		if (!test_bit(RemoveSynchronized, &rdev->flags)) {
++			synchronize_rcu();
++			if (atomic_read(&rdev->nr_pending)) {
++				/* lost the race, try later */
++				err = -EBUSY;
++				p->rdev = rdev;
++				goto abort;
++			}
++		}
++		if (conf->mirrors[conf->raid_disks + number].rdev) {
+ 			/* We just removed a device that is being replaced.
+ 			 * Move down the replacement.  We drain all IO before
+ 			 * doing this to avoid confusion.
+diff --git a/drivers/md/raid10.c b/drivers/md/raid10.c
+index 62cb2179657b..126df35629c3 100644
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@ -1892,7 +1892,7 @@ static int raid10_remove_disk(struct mddev *mddev, struct md_rdev *rdev)
+ 		err = -EBUSY;
+ 		goto abort;
+ 	}
+-	/* Only remove faulty devices if recovery
++	/* Only remove non-faulty devices if recovery
+ 	 * is not possible.
+ 	 */
+ 	if (!test_bit(Faulty, &rdev->flags) &&
+@@ -1904,13 +1904,16 @@ static int raid10_remove_disk(struct mddev *mddev, struct md_rdev *rdev)
+ 		goto abort;
+ 	}
+ 	*rdevp = NULL;
+-	synchronize_rcu();
+-	if (atomic_read(&rdev->nr_pending)) {
+-		/* lost the race, try later */
+-		err = -EBUSY;
+-		*rdevp = rdev;
+-		goto abort;
+-	} else if (p->replacement) {
++	if (!test_bit(RemoveSynchronized, &rdev->flags)) {
++		synchronize_rcu();
++		if (atomic_read(&rdev->nr_pending)) {
++			/* lost the race, try later */
++			err = -EBUSY;
++			*rdevp = rdev;
++			goto abort;
++		}
++	}
++	if (p->replacement) {
+ 		/* We must have just cleared 'rdev' */
+ 		p->rdev = p->replacement;
+ 		clear_bit(Replacement, &p->replacement->flags);
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index a03d70b85c08..825d4bf3b3c8 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -7221,12 +7221,15 @@ static int raid5_remove_disk(struct mddev *mddev, struct md_rdev *rdev)
+ 		goto abort;
+ 	}
+ 	*rdevp = NULL;
+-	synchronize_rcu();
+-	if (atomic_read(&rdev->nr_pending)) {
+-		/* lost the race, try later */
+-		err = -EBUSY;
+-		*rdevp = rdev;
+-	} else if (p->replacement) {
++	if (!test_bit(RemoveSynchronized, &rdev->flags)) {
++		synchronize_rcu();
++		if (atomic_read(&rdev->nr_pending)) {
++			/* lost the race, try later */
++			err = -EBUSY;
++			*rdevp = rdev;
++		}
++	}
++	if (p->replacement) {
+ 		/* We must have just cleared 'rdev' */
+ 		p->rdev = p->replacement;
+ 		clear_bit(Replacement, &p->replacement->flags);
