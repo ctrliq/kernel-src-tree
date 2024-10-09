@@ -1,0 +1,568 @@
+IB/mlx5: Use blue flame register allocator in mlx5_ib
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Eli Cohen <eli@mellanox.com>
+commit 5fe9dec0d045437e48f112b8fa705197bd7bc3c0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/5fe9dec0.failed
+
+Make use of the blue flame registers allocator at mlx5_ib. Since blue
+flame was not really supported we remove all the code that is related to
+blue flame and we let all consumers to use the same blue flame register.
+Once blue flame is supported we will add the code. As part of this patch
+we also move the definition of struct mlx5_bf to mlx5_ib.h as it is only
+used by mlx5_ib.
+
+	Signed-off-by: Eli Cohen <eli@mellanox.com>
+	Reviewed-by: Matan Barak <matanb@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leon@kernel.org>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 5fe9dec0d045437e48f112b8fa705197bd7bc3c0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/cq.c
+#	drivers/infiniband/hw/mlx5/main.c
+#	drivers/infiniband/hw/mlx5/qp.c
+#	drivers/net/ethernet/mellanox/mlx5/core/main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/uar.c
+#	include/linux/mlx5/driver.h
+diff --cc drivers/infiniband/hw/mlx5/cq.c
+index b3ef47c3ab73,a28ec33b82ed..000000000000
+--- a/drivers/infiniband/hw/mlx5/cq.c
++++ b/drivers/infiniband/hw/mlx5/cq.c
+@@@ -689,7 -689,7 +689,11 @@@ int mlx5_ib_arm_cq(struct ib_cq *ibcq, 
+  {
+  	struct mlx5_core_dev *mdev = to_mdev(ibcq->device)->mdev;
+  	struct mlx5_ib_cq *cq = to_mcq(ibcq);
+++<<<<<<< HEAD
+ +	void __iomem *uar_page = mdev->priv.uuari.uars[0].map;
+++=======
++ 	void __iomem *uar_page = mdev->priv.uar->map;
+++>>>>>>> 5fe9dec0d045 (IB/mlx5: Use blue flame register allocator in mlx5_ib)
+  	unsigned long irq_flags;
+  	int ret = 0;
+  
+@@@ -886,7 -884,7 +888,11 @@@ static int create_cq_kernel(struct mlx5
+  	MLX5_SET(cqc, cqc, log_page_size,
+  		 cq->buf.buf.page_shift - MLX5_ADAPTER_PAGE_SHIFT);
+  
+++<<<<<<< HEAD
+ +	*index = dev->mdev->priv.uuari.uars[0].index;
+++=======
++ 	*index = dev->mdev->priv.uar->index;
+++>>>>>>> 5fe9dec0d045 (IB/mlx5: Use blue flame register allocator in mlx5_ib)
+  
+  	return 0;
+  
+diff --cc drivers/infiniband/hw/mlx5/main.c
+index 9454bdb12197,e9f0830eca1c..000000000000
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@@ -3262,15 -3245,25 +3260,27 @@@ static void *mlx5_ib_add(struct mlx5_co
+  	if (err)
+  		goto err_rsrc;
+  
+ -	err = mlx5_ib_alloc_q_counters(dev);
+ -	if (err)
+ -		goto err_odp;
+ +	if (MLX5_CAP_GEN(dev->mdev, max_qp_cnt)) {
+ +		err = mlx5_ib_alloc_q_counters(dev);
+ +		if (err)
+ +			goto err_odp;
+ +	}
+  
++ 	dev->mdev->priv.uar = mlx5_get_uars_page(dev->mdev);
++ 	if (!dev->mdev->priv.uar)
++ 		goto err_q_cnt;
++ 
++ 	err = mlx5_alloc_bfreg(dev->mdev, &dev->bfreg, false, false);
++ 	if (err)
++ 		goto err_uar_page;
++ 
++ 	err = mlx5_alloc_bfreg(dev->mdev, &dev->fp_bfreg, false, true);
++ 	if (err)
++ 		goto err_bfreg;
++ 
+  	err = ib_register_device(&dev->ib_dev, NULL);
+  	if (err)
+- 		goto err_q_cnt;
++ 		goto err_fp_bfreg;
+  
+  	err = create_umr_res(dev);
+  	if (err)
+@@@ -3293,9 -3286,17 +3303,18 @@@ err_umrc
+  err_dev:
+  	ib_unregister_device(&dev->ib_dev);
+  
++ err_fp_bfreg:
++ 	mlx5_free_bfreg(dev->mdev, &dev->fp_bfreg);
++ 
++ err_bfreg:
++ 	mlx5_free_bfreg(dev->mdev, &dev->bfreg);
++ 
++ err_uar_page:
++ 	mlx5_put_uars_page(dev->mdev, dev->mdev->priv.uar);
++ 
+  err_q_cnt:
+ -	mlx5_ib_dealloc_q_counters(dev);
+ +	if (MLX5_CAP_GEN(dev->mdev, max_qp_cnt))
+ +		mlx5_ib_dealloc_q_counters(dev);
+  
+  err_odp:
+  	mlx5_ib_odp_remove_one(dev);
+@@@ -3325,8 -3326,10 +3344,15 @@@ static void mlx5_ib_remove(struct mlx5_
+  
+  	mlx5_remove_netdev_notifier(dev);
+  	ib_unregister_device(&dev->ib_dev);
+++<<<<<<< HEAD
+ +	if (MLX5_CAP_GEN(dev->mdev, max_qp_cnt))
+ +		mlx5_ib_dealloc_q_counters(dev);
+++=======
++ 	mlx5_free_bfreg(dev->mdev, &dev->fp_bfreg);
++ 	mlx5_free_bfreg(dev->mdev, &dev->bfreg);
++ 	mlx5_put_uars_page(dev->mdev, mdev->priv.uar);
++ 	mlx5_ib_dealloc_q_counters(dev);
+++>>>>>>> 5fe9dec0d045 (IB/mlx5: Use blue flame register allocator in mlx5_ib)
+  	destroy_umrc_res(dev);
+  	mlx5_ib_odp_remove_one(dev);
+  	destroy_dev_resources(&dev->devr);
+diff --cc drivers/infiniband/hw/mlx5/qp.c
+index 65e5d668d1be,fce1c6db393b..000000000000
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@@ -905,14 -909,10 +905,21 @@@ static int create_kernel_qp(struct mlx5
+  			    u32 **in, int *inlen,
+  			    struct mlx5_ib_qp_base *base)
+  {
+++<<<<<<< HEAD
+ +	enum mlx5_ib_latency_class lc = MLX5_IB_LATENCY_CLASS_LOW;
+ +	struct mlx5_uuar_info *uuari;
+ +	int uar_index;
+ +	void *qpc;
+ +	int uuarn;
+ +	int err;
+ +
+ +	uuari = &dev->mdev->priv.uuari;
+++=======
++ 	int uar_index;
++ 	void *qpc;
++ 	int err;
++ 
+++>>>>>>> 5fe9dec0d045 (IB/mlx5: Use blue flame register allocator in mlx5_ib)
+  	if (init_attr->create_flags & ~(IB_QP_CREATE_SIGNATURE_EN |
+  					IB_QP_CREATE_BLOCK_MULTICAST_LOOPBACK |
+  					IB_QP_CREATE_IPOIB_UD_LSO |
+@@@ -920,21 -920,17 +927,32 @@@
+  		return -EINVAL;
+  
+  	if (init_attr->qp_type == MLX5_IB_QPT_REG_UMR)
+- 		lc = MLX5_IB_LATENCY_CLASS_FAST_PATH;
++ 		qp->bf.bfreg = &dev->fp_bfreg;
++ 	else
++ 		qp->bf.bfreg = &dev->bfreg;
+  
+++<<<<<<< HEAD
+ +	uuarn = alloc_uuar(uuari, lc);
+ +	if (uuarn < 0) {
+ +		mlx5_ib_dbg(dev, "\n");
+ +		return -ENOMEM;
+ +	}
+ +
+ +	qp->bf = &uuari->bfs[uuarn];
+ +	uar_index = qp->bf->uar->index;
+++=======
++ 	qp->bf.buf_size = 1 << MLX5_CAP_GEN(dev->mdev, log_bf_reg_size);
++ 	uar_index = qp->bf.bfreg->index;
+++>>>>>>> 5fe9dec0d045 (IB/mlx5: Use blue flame register allocator in mlx5_ib)
+  
+  	err = calc_sq_size(dev, init_attr, qp);
+  	if (err < 0) {
+  		mlx5_ib_dbg(dev, "err %d\n", err);
+++<<<<<<< HEAD
+ +		goto err_uuar;
+++=======
++ 		return err;
+++>>>>>>> 5fe9dec0d045 (IB/mlx5: Use blue flame register allocator in mlx5_ib)
+  	}
+  
+  	qp->rq.offset = 0;
+@@@ -944,7 -940,7 +962,11 @@@
+  	err = mlx5_buf_alloc(dev->mdev, base->ubuffer.buf_size, &qp->buf);
+  	if (err) {
+  		mlx5_ib_dbg(dev, "err %d\n", err);
+++<<<<<<< HEAD
+ +		goto err_uuar;
+++=======
++ 		return err;
+++>>>>>>> 5fe9dec0d045 (IB/mlx5: Use blue flame register allocator in mlx5_ib)
+  	}
+  
+  	qp->sq.qend = mlx5_get_send_wqe(qp, qp->sq.wqe_cnt);
+@@@ -1006,9 -1002,6 +1028,12 @@@ err_free
+  
+  err_buf:
+  	mlx5_buf_free(dev->mdev, &qp->buf);
+++<<<<<<< HEAD
+ +
+ +err_uuar:
+ +	free_uuar(&dev->mdev->priv.uuari, uuarn);
+++=======
+++>>>>>>> 5fe9dec0d045 (IB/mlx5: Use blue flame register allocator in mlx5_ib)
+  	return err;
+  }
+  
+@@@ -1021,7 -1014,6 +1046,10 @@@ static void destroy_qp_kernel(struct ml
+  	kfree(qp->rq.wrid);
+  	mlx5_db_free(dev->mdev, &qp->db);
+  	mlx5_buf_free(dev->mdev, &qp->buf);
+++<<<<<<< HEAD
+ +	free_uuar(&dev->mdev->priv.uuari, qp->bf->uuarn);
+++=======
+++>>>>>>> 5fe9dec0d045 (IB/mlx5: Use blue flame register allocator in mlx5_ib)
+  }
+  
+  static u32 get_rx_type(struct mlx5_ib_qp *qp, struct ib_qp_init_attr *attr)
+@@@ -4155,28 -4100,13 +4165,33 @@@ out
+  		 * we hit doorbell */
+  		wmb();
+  
+++<<<<<<< HEAD
+ +		if (bf->need_lock)
+ +			spin_lock(&bf->lock);
+ +		else
+ +			__acquire(&bf->lock);
+ +
+ +		/* TBD enable WC */
+ +		if (0 && nreq == 1 && bf->uuarn && inl && size > 1 && size <= bf->buf_size / 16) {
+ +			mlx5_bf_copy(bf->reg + bf->offset, (u64 *)ctrl, ALIGN(size * 16, 64), qp);
+ +			/* wc_wmb(); */
+ +		} else {
+ +			mlx5_write64((__be32 *)ctrl, bf->regreg + bf->offset,
+ +				     MLX5_GET_DOORBELL_LOCK(&bf->lock32));
+ +			/* Make sure doorbells don't leak out of SQ spinlock
+ +			 * and reach the HCA out of order.
+ +			 */
+ +			mmiowb();
+ +		}
+++=======
++ 		/* currently we support only regular doorbells */
++ 		mlx5_write64((__be32 *)ctrl, bf->bfreg->map + bf->offset, NULL);
++ 		/* Make sure doorbells don't leak out of SQ spinlock
++ 		 * and reach the HCA out of order.
++ 		 */
++ 		mmiowb();
+++>>>>>>> 5fe9dec0d045 (IB/mlx5: Use blue flame register allocator in mlx5_ib)
+  		bf->offset ^= bf->buf_size;
+- 		if (bf->need_lock)
+- 			spin_unlock(&bf->lock);
+- 		else
+- 			__release(&bf->lock);
+  	}
+  
+  	spin_unlock_irqrestore(&qp->sq.lock, flags);
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/main.c
+index ddd26354b516,ff1f14498c22..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+@@@ -1147,8 -1166,8 +1145,13 @@@ err_affinity_hints
+  err_stop_eqs:
+  	mlx5_stop_eqs(dev);
+  
+++<<<<<<< HEAD
+ +err_free_uar:
+ +	mlx5_free_uuars(dev, &priv->uuari);
+++=======
++ err_put_uars:
++ 	mlx5_put_uars_page(dev, priv->uar);
+++>>>>>>> 5fe9dec0d045 (IB/mlx5: Use blue flame register allocator in mlx5_ib)
+  
+  err_disable_msix:
+  	mlx5_disable_msix(dev);
+@@@ -1211,7 -1227,7 +1214,11 @@@ static int mlx5_unload_one(struct mlx5_
+  	mlx5_irq_clear_affinity_hints(dev);
+  	free_comp_eqs(dev);
+  	mlx5_stop_eqs(dev);
+++<<<<<<< HEAD
+ +	mlx5_free_uuars(dev, &priv->uuari);
+++=======
++ 	mlx5_put_uars_page(dev, priv->uar);
+++>>>>>>> 5fe9dec0d045 (IB/mlx5: Use blue flame register allocator in mlx5_ib)
+  	mlx5_disable_msix(dev);
+  	if (cleanup)
+  		mlx5_cleanup_once(dev);
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/uar.c
+index ab0b896621a0,07b273cccc26..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/uar.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/uar.c
+@@@ -67,120 -67,6 +67,123 @@@ int mlx5_cmd_free_uar(struct mlx5_core_
+  }
+  EXPORT_SYMBOL(mlx5_cmd_free_uar);
+  
+++<<<<<<< HEAD
+ +static int need_uuar_lock(int uuarn)
+ +{
+ +	int tot_uuars = NUM_DRIVER_UARS * MLX5_BF_REGS_PER_PAGE;
+ +
+ +	if (uuarn == 0 || tot_uuars - NUM_LOW_LAT_UUARS)
+ +		return 0;
+ +
+ +	return 1;
+ +}
+ +
+ +int mlx5_alloc_uuars(struct mlx5_core_dev *dev, struct mlx5_uuar_info *uuari)
+ +{
+ +	int tot_uuars = NUM_DRIVER_UARS * MLX5_BF_REGS_PER_PAGE;
+ +	struct mlx5_bf *bf;
+ +	phys_addr_t addr;
+ +	int err;
+ +	int i;
+ +
+ +	uuari->num_uars = NUM_DRIVER_UARS;
+ +	uuari->num_low_latency_uuars = NUM_LOW_LAT_UUARS;
+ +
+ +	mutex_init(&uuari->lock);
+ +	uuari->uars = kcalloc(uuari->num_uars, sizeof(*uuari->uars), GFP_KERNEL);
+ +	if (!uuari->uars)
+ +		return -ENOMEM;
+ +
+ +	uuari->bfs = kcalloc(tot_uuars, sizeof(*uuari->bfs), GFP_KERNEL);
+ +	if (!uuari->bfs) {
+ +		err = -ENOMEM;
+ +		goto out_uars;
+ +	}
+ +
+ +	uuari->bitmap = kcalloc(BITS_TO_LONGS(tot_uuars), sizeof(*uuari->bitmap),
+ +				GFP_KERNEL);
+ +	if (!uuari->bitmap) {
+ +		err = -ENOMEM;
+ +		goto out_bfs;
+ +	}
+ +
+ +	uuari->count = kcalloc(tot_uuars, sizeof(*uuari->count), GFP_KERNEL);
+ +	if (!uuari->count) {
+ +		err = -ENOMEM;
+ +		goto out_bitmap;
+ +	}
+ +
+ +	for (i = 0; i < uuari->num_uars; i++) {
+ +		err = mlx5_cmd_alloc_uar(dev, &uuari->uars[i].index);
+ +		if (err)
+ +			goto out_count;
+ +
+ +		addr = dev->iseg_base + ((phys_addr_t)(uuari->uars[i].index) << PAGE_SHIFT);
+ +		uuari->uars[i].map = ioremap(addr, PAGE_SIZE);
+ +		if (!uuari->uars[i].map) {
+ +			mlx5_cmd_free_uar(dev, uuari->uars[i].index);
+ +			err = -ENOMEM;
+ +			goto out_count;
+ +		}
+ +		mlx5_core_dbg(dev, "allocated uar index 0x%x, mmaped at %p\n",
+ +			      uuari->uars[i].index, uuari->uars[i].map);
+ +	}
+ +
+ +	for (i = 0; i < tot_uuars; i++) {
+ +		bf = &uuari->bfs[i];
+ +
+ +		bf->buf_size = (1 << MLX5_CAP_GEN(dev, log_bf_reg_size)) / 2;
+ +		bf->uar = &uuari->uars[i / MLX5_BF_REGS_PER_PAGE];
+ +		bf->regreg = uuari->uars[i / MLX5_BF_REGS_PER_PAGE].map;
+ +		bf->reg = NULL; /* Add WC support */
+ +		bf->offset = (i % MLX5_BF_REGS_PER_PAGE) *
+ +			     (1 << MLX5_CAP_GEN(dev, log_bf_reg_size)) +
+ +			     MLX5_BF_OFFSET;
+ +		bf->need_lock = need_uuar_lock(i);
+ +		spin_lock_init(&bf->lock);
+ +		spin_lock_init(&bf->lock32);
+ +		bf->uuarn = i;
+ +	}
+ +
+ +	return 0;
+ +
+ +out_count:
+ +	for (i--; i >= 0; i--) {
+ +		iounmap(uuari->uars[i].map);
+ +		mlx5_cmd_free_uar(dev, uuari->uars[i].index);
+ +	}
+ +	kfree(uuari->count);
+ +
+ +out_bitmap:
+ +	kfree(uuari->bitmap);
+ +
+ +out_bfs:
+ +	kfree(uuari->bfs);
+ +
+ +out_uars:
+ +	kfree(uuari->uars);
+ +	return err;
+ +}
+ +
+ +int mlx5_free_uuars(struct mlx5_core_dev *dev, struct mlx5_uuar_info *uuari)
+ +{
+ +	int i = uuari->num_uars;
+ +
+ +	for (i--; i >= 0; i--) {
+ +		iounmap(uuari->uars[i].map);
+ +		mlx5_cmd_free_uar(dev, uuari->uars[i].index);
+ +	}
+ +
+ +	kfree(uuari->count);
+ +	kfree(uuari->bitmap);
+ +	kfree(uuari->bfs);
+ +	kfree(uuari->uars);
+ +
+ +	return 0;
+ +}
+ +
+++=======
+++>>>>>>> 5fe9dec0d045 (IB/mlx5: Use blue flame register allocator in mlx5_ib)
+  int mlx5_alloc_map_uar(struct mlx5_core_dev *mdev, struct mlx5_uar *uar,
+  		       bool map_wc)
+  {
+diff --cc include/linux/mlx5/driver.h
+index 1fa4d48e24be,bb362f506a2e..000000000000
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@@ -198,23 -203,6 +198,26 @@@ struct mlx5_uuar_info 
+  	u32			ver;
+  };
+  
+++<<<<<<< HEAD
+ +struct mlx5_bf {
+ +	void __iomem	       *reg;
+ +	void __iomem	       *regreg;
+ +	int			buf_size;
+ +	struct mlx5_uar	       *uar;
+ +	unsigned long		offset;
+ +	int			need_lock;
+ +	/* protect blue flame buffer selection when needed
+ +	 */
+ +	spinlock_t		lock;
+ +
+ +	/* serialize 64 bit writes when done as two 32 bit accesses
+ +	 */
+ +	spinlock_t		lock32;
+ +	int			uuarn;
+ +};
+ +
+++=======
+++>>>>>>> 5fe9dec0d045 (IB/mlx5: Use blue flame register allocator in mlx5_ib)
+  struct mlx5_cmd_first {
+  	__be32		data[4];
+  };
+@@@ -554,8 -595,6 +557,11 @@@ struct mlx5_priv 
+  	struct mlx5_eq_table	eq_table;
+  	struct msix_entry	*msix_arr;
+  	struct mlx5_irq_info	*irq_info;
+++<<<<<<< HEAD
+ +	struct mlx5_uuar_info	uuari;
+ +	MLX5_DECLARE_DOORBELL_LOCK(cq_uar_lock);
+++=======
+++>>>>>>> 5fe9dec0d045 (IB/mlx5: Use blue flame register allocator in mlx5_ib)
+  
+  	/* pages stuff */
+  	struct workqueue_struct *pg_wq;
+* Unmerged path drivers/infiniband/hw/mlx5/cq.c
+* Unmerged path drivers/infiniband/hw/mlx5/main.c
+diff --git a/drivers/infiniband/hw/mlx5/mlx5_ib.h b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+index dfad8ddf0c5a..459210398b31 100644
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@ -341,6 +341,12 @@ struct mlx5_ib_raw_packet_qp {
+ 	struct mlx5_ib_rq rq;
+ };
+ 
++struct mlx5_bf {
++	int			buf_size;
++	unsigned long		offset;
++	struct mlx5_sq_bfreg   *bfreg;
++};
++
+ struct mlx5_ib_qp {
+ 	struct ib_qp		ibqp;
+ 	union {
+@@ -366,7 +372,7 @@ struct mlx5_ib_qp {
+ 	int			wq_sig;
+ 	int			scat_cqe;
+ 	int			max_inline_data;
+-	struct mlx5_bf	       *bf;
++	struct mlx5_bf	        bf;
+ 	int			has_rq;
+ 
+ 	/* only for user space QPs. For kernel
+@@ -623,7 +629,6 @@ struct mlx5_ib_dev {
+ 	struct ib_device		ib_dev;
+ 	struct mlx5_core_dev		*mdev;
+ 	struct mlx5_roce		roce;
+-	MLX5_DECLARE_DOORBELL_LOCK(uar_lock);
+ 	int				num_ports;
+ 	/* serialize update of capability mask
+ 	 */
+@@ -653,6 +658,8 @@ struct mlx5_ib_dev {
+ 	struct list_head	qp_list;
+ 	/* Array with num_ports elements */
+ 	struct mlx5_ib_port	*port;
++	struct mlx5_sq_bfreg     bfreg;
++	struct mlx5_sq_bfreg     fp_bfreg;
+ };
+ 
+ static inline struct mlx5_ib_cq *to_mibcq(struct mlx5_core_cq *mcq)
+* Unmerged path drivers/infiniband/hw/mlx5/qp.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 4c31ddc19756..4d9e3caa4dab 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -817,7 +817,7 @@ static inline void mlx5e_cq_arm(struct mlx5e_cq *cq)
+ 	struct mlx5_core_cq *mcq;
+ 
+ 	mcq = &cq->mcq;
+-	mlx5_cq_arm(mcq, MLX5_CQ_DB_REQ_NOT, mcq->uar->map, NULL, cq->wq.cc);
++	mlx5_cq_arm(mcq, MLX5_CQ_DB_REQ_NOT, mcq->uar->map, cq->wq.cc);
+ }
+ 
+ static inline u32 mlx5e_get_wqe_mtt_offset(struct mlx5e_rq *rq, u16 wqe_ix)
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/main.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/uar.c
+diff --git a/include/linux/mlx5/cq.h b/include/linux/mlx5/cq.h
+index 7c3c0d3aca37..996863381bc8 100644
+--- a/include/linux/mlx5/cq.h
++++ b/include/linux/mlx5/cq.h
+@@ -144,7 +144,6 @@ enum {
+ 
+ static inline void mlx5_cq_arm(struct mlx5_core_cq *cq, u32 cmd,
+ 			       void __iomem *uar_page,
+-			       spinlock_t *doorbell_lock,
+ 			       u32 cons_index)
+ {
+ 	__be32 doorbell[2];
+@@ -164,7 +163,7 @@ static inline void mlx5_cq_arm(struct mlx5_core_cq *cq, u32 cmd,
+ 	doorbell[0] = cpu_to_be32(sn << 28 | cmd | ci);
+ 	doorbell[1] = cpu_to_be32(cq->cqn);
+ 
+-	mlx5_write64(doorbell, uar_page + MLX5_CQ_DOORBELL, doorbell_lock);
++	mlx5_write64(doorbell, uar_page + MLX5_CQ_DOORBELL, NULL);
+ }
+ 
+ int mlx5_init_cq_table(struct mlx5_core_dev *dev);
+diff --git a/include/linux/mlx5/doorbell.h b/include/linux/mlx5/doorbell.h
+index afc78a3f4462..0787de28f2fc 100644
+--- a/include/linux/mlx5/doorbell.h
++++ b/include/linux/mlx5/doorbell.h
+@@ -68,10 +68,12 @@ static inline void mlx5_write64(__be32 val[2], void __iomem *dest,
+ {
+ 	unsigned long flags;
+ 
+-	spin_lock_irqsave(doorbell_lock, flags);
++	if (doorbell_lock)
++		spin_lock_irqsave(doorbell_lock, flags);
+ 	__raw_writel((__force u32) val[0], dest);
+ 	__raw_writel((__force u32) val[1], dest + 4);
+-	spin_unlock_irqrestore(doorbell_lock, flags);
++	if (doorbell_lock)
++		spin_unlock_irqrestore(doorbell_lock, flags);
+ }
+ 
+ #endif
+* Unmerged path include/linux/mlx5/driver.h
