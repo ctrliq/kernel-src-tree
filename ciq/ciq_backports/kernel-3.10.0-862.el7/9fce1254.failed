@@ -1,0 +1,168 @@
+qla2xxx: fix command initialization in target mode.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: fix command initialization in target mode (Himanshu Madhani) [1327621]
+Rebuild_FUZZ: 99.01%
+commit-author Kanoj Sarcar <kanoj.sarcar@qlogic.com>
+commit 9fce12540cb9f91e7f1f539a80b70f0b388bdae0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/9fce1254.failed
+
+	Cc: <stable@vger.kernel.org> # v3.18+
+	Signed-off-by: Kanoj Sarcar <kanoj.sarcar@qlogic.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@qlogic.com>
+	Reviewed-by: Nicholas Bellinger <nab@linux-iscsi.org>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 9fce12540cb9f91e7f1f539a80b70f0b388bdae0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_target.c
+diff --cc drivers/scsi/qla2xxx/qla_target.c
+index 4e0d4c3c5146,17d656b3af6a..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@@ -2715,12 -3303,116 +2715,98 @@@ out_term
+  	 * cmd has not sent to target yet, so pass NULL as the second
+  	 * argument to qlt_send_term_exchange() and free the memory here.
+  	 */
+ -	cmd->cmd_flags |= BIT_2;
+  	spin_lock_irqsave(&ha->hardware_lock, flags);
+  	qlt_send_term_exchange(vha, NULL, &cmd->atio, 1);
+ -
+ -	qlt_decr_num_pend_cmds(vha);
+ -	percpu_ida_free(&sess->se_sess->sess_tag_pool, cmd->se_cmd.map_tag);
+ -	ha->tgt.tgt_ops->put_sess(sess);
+ +	kmem_cache_free(qla_tgt_cmd_cachep, cmd);
+  	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+++<<<<<<< HEAD
+ +	if (sess)
+++=======
++ }
++ 
++ static void qlt_do_work(struct work_struct *work)
++ {
++ 	struct qla_tgt_cmd *cmd = container_of(work, struct qla_tgt_cmd, work);
++ 
++ 	__qlt_do_work(cmd);
++ }
++ 
++ static struct qla_tgt_cmd *qlt_get_tag(scsi_qla_host_t *vha,
++ 				       struct qla_tgt_sess *sess,
++ 				       struct atio_from_isp *atio)
++ {
++ 	struct se_session *se_sess = sess->se_sess;
++ 	struct qla_tgt_cmd *cmd;
++ 	int tag;
++ 
++ 	tag = percpu_ida_alloc(&se_sess->sess_tag_pool, TASK_RUNNING);
++ 	if (tag < 0)
++ 		return NULL;
++ 
++ 	cmd = &((struct qla_tgt_cmd *)se_sess->sess_cmd_map)[tag];
++ 	memset(cmd, 0, sizeof(struct qla_tgt_cmd));
++ 
++ 	memcpy(&cmd->atio, atio, sizeof(*atio));
++ 	cmd->state = QLA_TGT_STATE_NEW;
++ 	cmd->tgt = vha->vha_tgt.qla_tgt;
++ 	qlt_incr_num_pend_cmds(vha);
++ 	cmd->vha = vha;
++ 	cmd->se_cmd.map_tag = tag;
++ 	cmd->sess = sess;
++ 	cmd->loop_id = sess->loop_id;
++ 	cmd->conf_compl_supported = sess->conf_compl_supported;
++ 
++ 	cmd->cmd_flags = 0;
++ 	cmd->jiffies_at_alloc = get_jiffies_64();
++ 
++ 	cmd->reset_count = vha->hw->chip_reset;
++ 
++ 	return cmd;
++ }
++ 
++ static void qlt_send_busy(struct scsi_qla_host *, struct atio_from_isp *,
++ 			  uint16_t);
++ 
++ static void qlt_create_sess_from_atio(struct work_struct *work)
++ {
++ 	struct qla_tgt_sess_op *op = container_of(work,
++ 					struct qla_tgt_sess_op, work);
++ 	scsi_qla_host_t *vha = op->vha;
++ 	struct qla_hw_data *ha = vha->hw;
++ 	struct qla_tgt_sess *sess;
++ 	struct qla_tgt_cmd *cmd;
++ 	unsigned long flags;
++ 	uint8_t *s_id = op->atio.u.isp24.fcp_hdr.s_id;
++ 
++ 	ql_dbg(ql_dbg_tgt_mgt, vha, 0xf022,
++ 		"qla_target(%d): Unable to find wwn login"
++ 		" (s_id %x:%x:%x), trying to create it manually\n",
++ 		vha->vp_idx, s_id[0], s_id[1], s_id[2]);
++ 
++ 	if (op->atio.u.raw.entry_count > 1) {
++ 		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf023,
++ 		        "Dropping multy entry atio %p\n", &op->atio);
++ 		goto out_term;
++ 	}
++ 
++ 	mutex_lock(&vha->vha_tgt.tgt_mutex);
++ 	sess = qlt_make_local_sess(vha, s_id);
++ 	/* sess has an extra creation ref. */
++ 	mutex_unlock(&vha->vha_tgt.tgt_mutex);
++ 
++ 	if (!sess)
++ 		goto out_term;
++ 	/*
++ 	 * Now obtain a pre-allocated session tag using the original op->atio
++ 	 * packet header, and dispatch into __qlt_do_work() using the existing
++ 	 * process context.
++ 	 */
++ 	cmd = qlt_get_tag(vha, sess, &op->atio);
++ 	if (!cmd) {
++ 		spin_lock_irqsave(&ha->hardware_lock, flags);
++ 		qlt_send_busy(vha, &op->atio, SAM_STAT_BUSY);
+++>>>>>>> 9fce12540cb9 (qla2xxx: fix command initialization in target mode.)
+  		ha->tgt.tgt_ops->put_sess(sess);
+ -		spin_unlock_irqrestore(&ha->hardware_lock, flags);
+ -		kfree(op);
+ -		return;
+ -	}
+ -	/*
+ -	 * __qlt_do_work() will call ha->tgt.tgt_ops->put_sess() to release
+ -	 * the extra reference taken above by qlt_make_local_sess()
+ -	 */
+ -	__qlt_do_work(cmd);
+ -	kfree(op);
+ -	return;
+ -
+ -out_term:
+ -	spin_lock_irqsave(&ha->hardware_lock, flags);
+ -	qlt_send_term_exchange(vha, NULL, &op->atio, 1);
+ -	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+ -	kfree(op);
+ -
+  }
+  
+  /* ha->hardware_lock supposed to be held on entry */
+@@@ -2744,13 -3455,9 +2830,18 @@@ static int qlt_handle_cmd_for_atio(stru
+  		return -ENOMEM;
+  	}
+  
+++<<<<<<< HEAD
+ +	INIT_LIST_HEAD(&cmd->cmd_list);
+ +
+ +	memcpy(&cmd->atio, atio, sizeof(*atio));
+ +	cmd->state = QLA_TGT_STATE_NEW;
+ +	cmd->tgt = ha->tgt.qla_tgt;
+ +	cmd->vha = vha;
+ +
+++=======
++ 	cmd->cmd_in_wq = 1;
++ 	cmd->cmd_flags |= BIT_0;
+++>>>>>>> 9fce12540cb9 (qla2xxx: fix command initialization in target mode.)
+  	INIT_WORK(&cmd->work, qlt_do_work);
+  	queue_work(qla_tgt_wq, &cmd->work);
+  	return 0;
+* Unmerged path drivers/scsi/qla2xxx/qla_target.c
