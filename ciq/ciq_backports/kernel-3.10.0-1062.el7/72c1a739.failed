@@ -1,0 +1,161 @@
+xfs: xfs_shift_file_space can be static
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author kbuild test robot <fengguang.wu@intel.com>
+commit 72c1a73993cfa3572e45e1a878ff7acf31d14fc8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/72c1a739.failed
+
+	Signed-off-by: Fengguang Wu <fengguang.wu@intel.com>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 72c1a73993cfa3572e45e1a878ff7acf31d14fc8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_bmap_util.c
+diff --cc fs/xfs/xfs_bmap_util.c
+index b512c688c5f3,e86757358d5b..000000000000
+--- a/fs/xfs/xfs_bmap_util.c
++++ b/fs/xfs/xfs_bmap_util.c
+@@@ -1249,6 -1376,133 +1249,136 @@@ out
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * @next_fsb will keep track of the extent currently undergoing shift.
++  * @stop_fsb will keep track of the extent at which we have to stop.
++  * If we are shifting left, we will start with block (offset + len) and
++  * shift each extent till last extent.
++  * If we are shifting right, we will start with last extent inside file space
++  * and continue until we reach the block corresponding to offset.
++  */
++ static int
++ xfs_shift_file_space(
++ 	struct xfs_inode        *ip,
++ 	xfs_off_t               offset,
++ 	xfs_off_t               len,
++ 	enum shift_direction	direction)
++ {
++ 	int			done = 0;
++ 	struct xfs_mount	*mp = ip->i_mount;
++ 	struct xfs_trans	*tp;
++ 	int			error;
++ 	struct xfs_bmap_free	free_list;
++ 	xfs_fsblock_t		first_block;
++ 	int			committed;
++ 	xfs_fileoff_t		stop_fsb;
++ 	xfs_fileoff_t		next_fsb;
++ 	xfs_fileoff_t		shift_fsb;
++ 
++ 	ASSERT(direction == SHIFT_LEFT || direction == SHIFT_RIGHT);
++ 
++ 	if (direction == SHIFT_LEFT) {
++ 		next_fsb = XFS_B_TO_FSB(mp, offset + len);
++ 		stop_fsb = XFS_B_TO_FSB(mp, VFS_I(ip)->i_size);
++ 	} else {
++ 		/*
++ 		 * If right shift, delegate the work of initialization of
++ 		 * next_fsb to xfs_bmap_shift_extent as it has ilock held.
++ 		 */
++ 		next_fsb = NULLFSBLOCK;
++ 		stop_fsb = XFS_B_TO_FSB(mp, offset);
++ 	}
++ 
++ 	shift_fsb = XFS_B_TO_FSB(mp, len);
++ 
++ 	/*
++ 	 * Trim eofblocks to avoid shifting uninitialized post-eof preallocation
++ 	 * into the accessible region of the file.
++ 	 */
++ 	if (xfs_can_free_eofblocks(ip, true)) {
++ 		error = xfs_free_eofblocks(mp, ip, false);
++ 		if (error)
++ 			return error;
++ 	}
++ 
++ 	/*
++ 	 * Writeback and invalidate cache for the remainder of the file as we're
++ 	 * about to shift down every extent from offset to EOF.
++ 	 */
++ 	error = filemap_write_and_wait_range(VFS_I(ip)->i_mapping,
++ 					     offset, -1);
++ 	if (error)
++ 		return error;
++ 	error = invalidate_inode_pages2_range(VFS_I(ip)->i_mapping,
++ 					offset >> PAGE_CACHE_SHIFT, -1);
++ 	if (error)
++ 		return error;
++ 
++ 	/*
++ 	 * The extent shiting code works on extent granularity. So, if
++ 	 * stop_fsb is not the starting block of extent, we need to split
++ 	 * the extent at stop_fsb.
++ 	 */
++ 	if (direction == SHIFT_RIGHT) {
++ 		error = xfs_bmap_split_extent(ip, stop_fsb);
++ 		if (error)
++ 			return error;
++ 	}
++ 
++ 	while (!error && !done) {
++ 		tp = xfs_trans_alloc(mp, XFS_TRANS_DIOSTRAT);
++ 		/*
++ 		 * We would need to reserve permanent block for transaction.
++ 		 * This will come into picture when after shifting extent into
++ 		 * hole we found that adjacent extents can be merged which
++ 		 * may lead to freeing of a block during record update.
++ 		 */
++ 		error = xfs_trans_reserve(tp, &M_RES(mp)->tr_write,
++ 				XFS_DIOSTRAT_SPACE_RES(mp, 0), 0);
++ 		if (error) {
++ 			xfs_trans_cancel(tp, 0);
++ 			break;
++ 		}
++ 
++ 		xfs_ilock(ip, XFS_ILOCK_EXCL);
++ 		error = xfs_trans_reserve_quota(tp, mp, ip->i_udquot,
++ 				ip->i_gdquot, ip->i_pdquot,
++ 				XFS_DIOSTRAT_SPACE_RES(mp, 0), 0,
++ 				XFS_QMOPT_RES_REGBLKS);
++ 		if (error)
++ 			goto out;
++ 
++ 		xfs_trans_ijoin(tp, ip, XFS_ILOCK_EXCL);
++ 
++ 		xfs_bmap_init(&free_list, &first_block);
++ 
++ 		/*
++ 		 * We are using the write transaction in which max 2 bmbt
++ 		 * updates are allowed
++ 		 */
++ 		error = xfs_bmap_shift_extents(tp, ip, &next_fsb, shift_fsb,
++ 				&done, stop_fsb, &first_block, &free_list,
++ 				direction, XFS_BMAP_MAX_SHIFT_EXTENTS);
++ 		if (error)
++ 			goto out;
++ 
++ 		error = xfs_bmap_finish(&tp, &free_list, &committed);
++ 		if (error)
++ 			goto out;
++ 
++ 		error = xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
++ 	}
++ 
++ 	return error;
++ 
++ out:
++ 	xfs_trans_cancel(tp, XFS_TRANS_RELEASE_LOG_RES | XFS_TRANS_ABORT);
++ 	return error;
++ }
++ 
++ /*
+++>>>>>>> 72c1a73993cf (xfs: xfs_shift_file_space can be static)
+   * xfs_collapse_file_space()
+   *	This routine frees disk space and shift extent for the given file.
+   *	The first thing we do is to free data blocks in the specified range
+* Unmerged path fs/xfs/xfs_bmap_util.c
