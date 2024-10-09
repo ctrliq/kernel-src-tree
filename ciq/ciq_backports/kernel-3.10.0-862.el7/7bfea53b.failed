@@ -1,0 +1,318 @@
+target: Move passthrough CDB parsing into a common function
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [target] Move passthrough CDB parsing into a common function (Maurizio Lombardi) [1366062]
+Rebuild_FUZZ: 92.73%
+commit-author Andy Grover <agrover@redhat.com>
+commit 7bfea53b5c936d706d0bf60ec218fa72cde77121
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/7bfea53b.failed
+
+Aside from whether they handle BIDI ops or not, parsing of the CDB by
+kernel and user SCSI passthrough modules should be identical. Move this
+into a new passthrough_parse_cdb() and call it from tcm-pscsi and tcm-user.
+
+	Reported-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Ilias Tsitsimpis <iliastsi@arrikto.com>
+	Signed-off-by: Andy Grover <agrover@redhat.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 7bfea53b5c936d706d0bf60ec218fa72cde77121)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_user.c
+diff --cc drivers/target/target_core_user.c
+index 7dc2f05f8e5e,2768ea2cfd7a..000000000000
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@@ -1360,104 -1036,22 +1360,108 @@@ static sector_t tcmu_get_blocks(struct 
+  }
+  
+  static sense_reason_t
+ -tcmu_pass_op(struct se_cmd *se_cmd)
+ +tcmu_parse_cdb(struct se_cmd *cmd)
+  {
+ -	int ret = tcmu_queue_cmd(se_cmd);
+++<<<<<<< HEAD
+ +	unsigned char *cdb = cmd->t_task_cdb;
+  
+ -	if (ret != 0)
+ -		return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+ -	else
+ +	/*
+ +	 * Clear a lun set in the cdb if the initiator talking to use spoke
+ +	 * and old standards version, as we can't assume the underlying device
+ +	 * won't choke up on it.
+ +	 */
+ +	switch (cdb[0]) {
+ +	case READ_10: /* SBC - RDProtect */
+ +	case READ_12: /* SBC - RDProtect */
+ +	case READ_16: /* SBC - RDProtect */
+ +	case SEND_DIAGNOSTIC: /* SPC - SELF-TEST Code */
+ +	case VERIFY: /* SBC - VRProtect */
+ +	case VERIFY_16: /* SBC - VRProtect */
+ +	case WRITE_VERIFY: /* SBC - VRProtect */
+ +	case WRITE_VERIFY_12: /* SBC - VRProtect */
+ +	case MAINTENANCE_IN: /* SPC - Parameter Data Format for SA RTPG */
+ +		break;
+ +	default:
+ +		cdb[1] &= 0x1f; /* clear logical unit number */
+ +		break;
+ +	}
+ +
+ +	/*
+ +	 * For REPORT LUNS we always need to emulate the response, for everything
+ +	 * else, pass it up.
+ +	 */
+ +	if (cdb[0] == REPORT_LUNS) {
+ +		cmd->execute_cmd = spc_emulate_report_luns;
+  		return TCM_NO_SENSE;
+ +	}
+ +
+ +	/* Set DATA_CDB flag for ops that should have it */
+ +	switch (cdb[0]) {
+ +	case READ_6:
+ +	case READ_10:
+ +	case READ_12:
+ +	case READ_16:
+ +	case WRITE_6:
+ +	case WRITE_10:
+ +	case WRITE_12:
+ +	case WRITE_16:
+ +	case WRITE_VERIFY:
+ +	case WRITE_VERIFY_12:
+ +	case 0x8e: /* WRITE_VERIFY_16 */
+ +	case COMPARE_AND_WRITE:
+ +	case XDWRITEREAD_10:
+ +		cmd->se_cmd_flags |= SCF_SCSI_DATA_CDB;
+ +		break;
+ +	case VARIABLE_LENGTH_CMD:
+ +		switch (get_unaligned_be16(&cdb[8])) {
+ +		case READ_32:
+ +		case WRITE_32:
+ +		case 0x0c: /* WRITE_VERIFY_32 */
+ +		case XDWRITEREAD_32:
+ +			cmd->se_cmd_flags |= SCF_SCSI_DATA_CDB;
+ +			break;
+ +		}
+ +	}
+ +
+ +	cmd->execute_cmd = tcmu_queue_cmd;
+ +
+ +	return TCM_NO_SENSE;
+++=======
+++	return passthrough_parse_cdb(cmd, tcmu_pass_op);
+++>>>>>>> 7bfea53b5c93 (target: Move passthrough CDB parsing into a common function)
+  }
+  
+ -static sense_reason_t
+ -tcmu_parse_cdb(struct se_cmd *cmd)
+ +static ssize_t tcmu_dev_show_attr_cmd_time_out(struct se_dev_attrib *da,
+ +					       char *page)
+  {
+ -	return passthrough_parse_cdb(cmd, tcmu_pass_op);
+ +	struct tcmu_dev *udev = container_of(da->da_dev,
+ +					struct tcmu_dev, se_dev);
+ +
+ +	return snprintf(page, PAGE_SIZE, "%lu\n", udev->cmd_time_out / MSEC_PER_SEC);
+  }
+  
+ +static ssize_t tcmu_dev_store_attr_cmd_time_out(struct se_dev_attrib *da,
+ +						const char *page, size_t count)
+ +{
+ +	struct tcmu_dev *udev = container_of(da->da_dev,
+ +					struct tcmu_dev, se_dev);
+ +	u32 val;
+ +	int ret;
+ +
+ +	if (da->da_dev->export_count) {
+ +		pr_err("Unable to set tcmu cmd_time_out while exports exist\n");
+ +		return -EINVAL;
+ +	}
+ +
+ +	ret = kstrtou32(page, 0, &val);
+ +	if (ret < 0)
+ +		return ret;
+ +
+ +	udev->cmd_time_out = val * MSEC_PER_SEC;
+ +	return count;
+ +}
+ +TB_DEV_ATTR(tcmu, cmd_time_out, S_IRUGO | S_IWUSR);
+ +
+  DEF_TB_DEV_ATTRIB_RO(tcmu, hw_pi_prot_type);
+  TB_DEV_ATTR_RO(tcmu, hw_pi_prot_type);
+  
+diff --git a/drivers/target/target_core_device.c b/drivers/target/target_core_device.c
+index c928bd18ec1b..bc6bb62864ff 100644
+--- a/drivers/target/target_core_device.c
++++ b/drivers/target/target_core_device.c
+@@ -33,6 +33,7 @@
+ #include <linux/kthread.h>
+ #include <linux/in.h>
+ #include <linux/export.h>
++#include <asm/unaligned.h>
+ #include <net/sock.h>
+ #include <net/tcp.h>
+ #include <scsi/scsi.h>
+@@ -1711,3 +1712,76 @@ void core_dev_release_virtual_lun0(void)
+ 		target_free_device(g_lun0_dev);
+ 	core_delete_hba(hba);
+ }
++
++/*
++ * Common CDB parsing for kernel and user passthrough.
++ */
++sense_reason_t
++passthrough_parse_cdb(struct se_cmd *cmd,
++	sense_reason_t (*exec_cmd)(struct se_cmd *cmd))
++{
++	unsigned char *cdb = cmd->t_task_cdb;
++
++	/*
++	 * Clear a lun set in the cdb if the initiator talking to use spoke
++	 * and old standards version, as we can't assume the underlying device
++	 * won't choke up on it.
++	 */
++	switch (cdb[0]) {
++	case READ_10: /* SBC - RDProtect */
++	case READ_12: /* SBC - RDProtect */
++	case READ_16: /* SBC - RDProtect */
++	case SEND_DIAGNOSTIC: /* SPC - SELF-TEST Code */
++	case VERIFY: /* SBC - VRProtect */
++	case VERIFY_16: /* SBC - VRProtect */
++	case WRITE_VERIFY: /* SBC - VRProtect */
++	case WRITE_VERIFY_12: /* SBC - VRProtect */
++	case MAINTENANCE_IN: /* SPC - Parameter Data Format for SA RTPG */
++		break;
++	default:
++		cdb[1] &= 0x1f; /* clear logical unit number */
++		break;
++	}
++
++	/*
++	 * For REPORT LUNS we always need to emulate the response, for everything
++	 * else, pass it up.
++	 */
++	if (cdb[0] == REPORT_LUNS) {
++		cmd->execute_cmd = spc_emulate_report_luns;
++		return TCM_NO_SENSE;
++	}
++
++	/* Set DATA_CDB flag for ops that should have it */
++	switch (cdb[0]) {
++	case READ_6:
++	case READ_10:
++	case READ_12:
++	case READ_16:
++	case WRITE_6:
++	case WRITE_10:
++	case WRITE_12:
++	case WRITE_16:
++	case WRITE_VERIFY:
++	case WRITE_VERIFY_12:
++	case 0x8e: /* WRITE_VERIFY_16 */
++	case COMPARE_AND_WRITE:
++	case XDWRITEREAD_10:
++		cmd->se_cmd_flags |= SCF_SCSI_DATA_CDB;
++		break;
++	case VARIABLE_LENGTH_CMD:
++		switch (get_unaligned_be16(&cdb[8])) {
++		case READ_32:
++		case WRITE_32:
++		case 0x0c: /* WRITE_VERIFY_32 */
++		case XDWRITEREAD_32:
++			cmd->se_cmd_flags |= SCF_SCSI_DATA_CDB;
++			break;
++		}
++	}
++
++	cmd->execute_cmd = exec_cmd;
++
++	return TCM_NO_SENSE;
++}
++EXPORT_SYMBOL(passthrough_parse_cdb);
+diff --git a/drivers/target/target_core_pscsi.c b/drivers/target/target_core_pscsi.c
+index 59a8a2963c0e..66687620e478 100644
+--- a/drivers/target/target_core_pscsi.c
++++ b/drivers/target/target_core_pscsi.c
+@@ -973,64 +973,13 @@ fail:
+ 	return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+ }
+ 
+-/*
+- * Clear a lun set in the cdb if the initiator talking to use spoke
+- * and old standards version, as we can't assume the underlying device
+- * won't choke up on it.
+- */
+-static inline void pscsi_clear_cdb_lun(unsigned char *cdb)
+-{
+-	switch (cdb[0]) {
+-	case READ_10: /* SBC - RDProtect */
+-	case READ_12: /* SBC - RDProtect */
+-	case READ_16: /* SBC - RDProtect */
+-	case SEND_DIAGNOSTIC: /* SPC - SELF-TEST Code */
+-	case VERIFY: /* SBC - VRProtect */
+-	case VERIFY_16: /* SBC - VRProtect */
+-	case WRITE_VERIFY: /* SBC - VRProtect */
+-	case WRITE_VERIFY_12: /* SBC - VRProtect */
+-	case MAINTENANCE_IN: /* SPC - Parameter Data Format for SA RTPG */
+-		break;
+-	default:
+-		cdb[1] &= 0x1f; /* clear logical unit number */
+-		break;
+-	}
+-}
+-
+ static sense_reason_t
+ pscsi_parse_cdb(struct se_cmd *cmd)
+ {
+-	unsigned char *cdb = cmd->t_task_cdb;
+-
+ 	if (cmd->se_cmd_flags & SCF_BIDI)
+ 		return TCM_UNSUPPORTED_SCSI_OPCODE;
+ 
+-	pscsi_clear_cdb_lun(cdb);
+-
+-	/*
+-	 * For REPORT LUNS we always need to emulate the response, for everything
+-	 * else the default for pSCSI is to pass the command to the underlying
+-	 * LLD / physical hardware.
+-	 */
+-	switch (cdb[0]) {
+-	case REPORT_LUNS:
+-		cmd->execute_cmd = spc_emulate_report_luns;
+-		return 0;
+-	case READ_6:
+-	case READ_10:
+-	case READ_12:
+-	case READ_16:
+-	case WRITE_6:
+-	case WRITE_10:
+-	case WRITE_12:
+-	case WRITE_16:
+-	case WRITE_VERIFY:
+-		cmd->se_cmd_flags |= SCF_SCSI_DATA_CDB;
+-		/* FALLTHROUGH*/
+-	default:
+-		cmd->execute_cmd = pscsi_execute_cmd;
+-		return 0;
+-	}
++	return passthrough_parse_cdb(cmd, pscsi_execute_cmd);
+ }
+ 
+ static sense_reason_t
+* Unmerged path drivers/target/target_core_user.c
+diff --git a/include/target/target_core_backend.h b/include/target/target_core_backend.h
+index 448598f38c8b..eb6aec996f08 100644
+--- a/include/target/target_core_backend.h
++++ b/include/target/target_core_backend.h
+@@ -143,5 +143,7 @@ int	se_dev_set_queue_depth(struct se_device *, u32);
+ int	se_dev_set_max_sectors(struct se_device *, u32);
+ int	se_dev_set_optimal_sectors(struct se_device *, u32);
+ int	se_dev_set_block_size(struct se_device *, u32);
++sense_reason_t passthrough_parse_cdb(struct se_cmd *cmd,
++	sense_reason_t (*exec_cmd)(struct se_cmd *cmd));
+ 
+ #endif /* TARGET_CORE_BACKEND_H */
