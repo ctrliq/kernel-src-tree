@@ -1,0 +1,248 @@
+rcu: sysctl: Panic on RCU Stall
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Daniel Bristot de Oliveira <bristot@redhat.com>
+commit 088e9d253d3a4ab7e058dd84bb532c32dadf1882
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/088e9d25.failed
+
+It is not always easy to determine the cause of an RCU stall just by
+analysing the RCU stall messages, mainly when the problem is caused
+by the indirect starvation of rcu threads. For example, when preempt_rcu
+is not awakened due to the starvation of a timer softirq.
+
+We have been hard coding panic() in the RCU stall functions for
+some time while testing the kernel-rt. But this is not possible in
+some scenarios, like when supporting customers.
+
+This patch implements the sysctl kernel.panic_on_rcu_stall. If
+set to 1, the system will panic() when an RCU stall takes place,
+enabling the capture of a vmcore. The vmcore provides a way to analyze
+all kernel/tasks states, helping out to point to the culprit and the
+solution for the stall.
+
+The kernel.panic_on_rcu_stall sysctl is disabled by default.
+
+Changes from v1:
+- Fixed a typo in the git log
+- The if(sysctl_panic_on_rcu_stall) panic() is in a static function
+- Fixed the CONFIG_TINY_RCU compilation issue
+- The var sysctl_panic_on_rcu_stall is now __read_mostly
+
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: "Paul E. McKenney" <paulmck@linux.vnet.ibm.com>
+	Cc: Josh Triplett <josh@joshtriplett.org>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+	Cc: Lai Jiangshan <jiangshanlai@gmail.com>
+	Acked-by: Christian Borntraeger <borntraeger@de.ibm.com>
+	Reviewed-by: Josh Triplett <josh@joshtriplett.org>
+	Reviewed-by: Arnaldo Carvalho de Melo <acme@kernel.org>
+	Tested-by: "Luis Claudio R. Goncalves" <lgoncalv@redhat.com>
+	Signed-off-by: Daniel Bristot de Oliveira <bristot@redhat.com>
+	Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+(cherry picked from commit 088e9d253d3a4ab7e058dd84bb532c32dadf1882)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/rcutree.c
+#	kernel/sysctl.c
+diff --cc kernel/rcutree.c
+index 35f4580f37dc,e5ca15a461b9..000000000000
+--- a/kernel/rcutree.c
++++ b/kernel/rcutree.c
+@@@ -74,33 -100,33 +74,35 @@@ static struct lock_class_key rcu_fqs_cl
+  	.orphan_nxttail = &sname##_state.orphan_nxtlist, \
+  	.orphan_donetail = &sname##_state.orphan_donelist, \
+  	.barrier_mutex = __MUTEX_INITIALIZER(sname##_state.barrier_mutex), \
+ -	.name = RCU_STATE_NAME(sname), \
+ +	.onoff_mutex = __MUTEX_INITIALIZER(sname##_state.onoff_mutex), \
+ +	.name = #sname, \
+  	.abbr = sabbr, \
+ -	.exp_mutex = __MUTEX_INITIALIZER(sname##_state.exp_mutex), \
+ -	.exp_wake_mutex = __MUTEX_INITIALIZER(sname##_state.exp_wake_mutex), \
+  }
+  
+ -RCU_STATE_INITIALIZER(rcu_sched, 's', call_rcu_sched);
+ -RCU_STATE_INITIALIZER(rcu_bh, 'b', call_rcu_bh);
+ +struct rcu_state rcu_sched_state =
+ +	RCU_STATE_INITIALIZER(rcu_sched, 's', call_rcu_sched);
+ +DEFINE_PER_CPU(struct rcu_data, rcu_sched_data);
+ +
+ +struct rcu_state rcu_bh_state = RCU_STATE_INITIALIZER(rcu_bh, 'b', call_rcu_bh);
+ +DEFINE_PER_CPU(struct rcu_data, rcu_bh_data);
+  
+ -static struct rcu_state *const rcu_state_p;
+ +static struct rcu_state *rcu_state;
+  LIST_HEAD(rcu_struct_flavors);
+  
+ -/* Dump rcu_node combining tree at boot to verify correct setup. */
+ -static bool dump_tree;
+ -module_param(dump_tree, bool, 0444);
+ -/* Control rcu_node-tree auto-balancing at boot time. */
+ -static bool rcu_fanout_exact;
+ -module_param(rcu_fanout_exact, bool, 0444);
+ -/* Increase (but not decrease) the RCU_FANOUT_LEAF at boot time. */
+ -static int rcu_fanout_leaf = RCU_FANOUT_LEAF;
+ +/* Increase (but not decrease) the CONFIG_RCU_FANOUT_LEAF at boot time. */
+ +static int rcu_fanout_leaf = CONFIG_RCU_FANOUT_LEAF;
+  module_param(rcu_fanout_leaf, int, 0444);
+  int rcu_num_lvls __read_mostly = RCU_NUM_LVLS;
+ -/* Number of rcu_nodes at specified level. */
+ -static int num_rcu_lvl[] = NUM_RCU_LVL_INIT;
+ +static int num_rcu_lvl[] = {  /* Number of rcu_nodes at specified level. */
+ +	NUM_RCU_LVL_0,
+ +	NUM_RCU_LVL_1,
+ +	NUM_RCU_LVL_2,
+ +	NUM_RCU_LVL_3,
+ +	NUM_RCU_LVL_4,
+ +};
+  int rcu_num_nodes __read_mostly = NUM_RCU_NODES; /* Total # rcu_nodes in use. */
++ /* panic() on RCU Stall sysctl. */
++ int sysctl_panic_on_rcu_stall __read_mostly;
+  
+  /*
+   * The rcu_scheduler_active variable transitions from zero to one just
+@@@ -955,9 -1395,12 +963,11 @@@ static void print_other_cpu_stall(struc
+  	}
+  
+  	/* Complain about tasks blocking the grace period. */
+ -	rcu_print_detail_task_stall(rsp);
+  
+ -	rcu_check_gp_kthread_starvation(rsp);
+ +	rcu_print_detail_task_stall(rsp);
+  
++ 	panic_on_rcu_stall();
++ 
+  	force_quiescent_state(rsp);  /* Kick them all. */
+  }
+  
+@@@ -982,15 -1430,27 +992,28 @@@ static void print_cpu_stall(struct rcu_
+  	pr_cont(" (t=%lu jiffies g=%ld c=%ld q=%lu)\n",
+  		jiffies - rsp->gp_start,
+  		(long)rsp->gpnum, (long)rsp->completed, totqlen);
+ -
+ -	rcu_check_gp_kthread_starvation(rsp);
+ -
+  	rcu_dump_cpu_stacks(rsp);
+  
+ -	raw_spin_lock_irqsave_rcu_node(rnp, flags);
+ -	if (ULONG_CMP_GE(jiffies, READ_ONCE(rsp->jiffies_stall)))
+ -		WRITE_ONCE(rsp->jiffies_stall,
+ -			   jiffies + 3 * rcu_jiffies_till_stall_check() + 3);
+ -	raw_spin_unlock_irqrestore_rcu_node(rnp, flags);
+ +	raw_spin_lock_irqsave(&rnp->lock, flags);
+ +	if (ULONG_CMP_GE(jiffies, ACCESS_ONCE(rsp->jiffies_stall)))
+ +		ACCESS_ONCE(rsp->jiffies_stall) = jiffies +
+ +				     3 * rcu_jiffies_till_stall_check() + 3;
+ +	raw_spin_unlock_irqrestore(&rnp->lock, flags);
+  
+++<<<<<<< HEAD:kernel/rcutree.c
+ +	set_need_resched();  /* kick ourselves to get things going. */
+++=======
++ 	panic_on_rcu_stall();
++ 
++ 	/*
++ 	 * Attempt to revive the RCU machinery by forcing a context switch.
++ 	 *
++ 	 * A context switch would normally allow the RCU state machine to make
++ 	 * progress and it could be we're stuck in kernel space without context
++ 	 * switches for an entirely unreasonable amount of time.
++ 	 */
++ 	resched_cpu(smp_processor_id());
+++>>>>>>> 088e9d253d3a (rcu: sysctl: Panic on RCU Stall):kernel/rcu/tree.c
+  }
+  
+  static void check_cpu_stall(struct rcu_state *rsp, struct rcu_data *rdp)
+diff --cc kernel/sysctl.c
+index 0acfbc51c2f2,35f0dcb1cb4f..000000000000
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
+@@@ -1167,6 -1184,38 +1167,41 @@@ static struct ctl_table kern_table[] = 
+  		.extra1		= &zero,
+  		.extra2		= &one,
+  	},
+++<<<<<<< HEAD
+++=======
++ #if defined(CONFIG_SMP) && defined(CONFIG_NO_HZ_COMMON)
++ 	{
++ 		.procname	= "timer_migration",
++ 		.data		= &sysctl_timer_migration,
++ 		.maxlen		= sizeof(unsigned int),
++ 		.mode		= 0644,
++ 		.proc_handler	= timer_migration_handler,
++ 	},
++ #endif
++ #ifdef CONFIG_BPF_SYSCALL
++ 	{
++ 		.procname	= "unprivileged_bpf_disabled",
++ 		.data		= &sysctl_unprivileged_bpf_disabled,
++ 		.maxlen		= sizeof(sysctl_unprivileged_bpf_disabled),
++ 		.mode		= 0644,
++ 		/* only handle a transition from default "0" to "1" */
++ 		.proc_handler	= proc_dointvec_minmax,
++ 		.extra1		= &one,
++ 		.extra2		= &one,
++ 	},
++ #endif
++ #if defined(CONFIG_TREE_RCU) || defined(CONFIG_PREEMPT_RCU)
++ 	{
++ 		.procname	= "panic_on_rcu_stall",
++ 		.data		= &sysctl_panic_on_rcu_stall,
++ 		.maxlen		= sizeof(sysctl_panic_on_rcu_stall),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec_minmax,
++ 		.extra1		= &zero,
++ 		.extra2		= &one,
++ 	},
++ #endif
+++>>>>>>> 088e9d253d3a (rcu: sysctl: Panic on RCU Stall)
+  	{ }
+  };
+  
+diff --git a/Documentation/sysctl/kernel.txt b/Documentation/sysctl/kernel.txt
+index a0237c1a0a62..64cf0afac2fa 100644
+--- a/Documentation/sysctl/kernel.txt
++++ b/Documentation/sysctl/kernel.txt
+@@ -54,6 +54,7 @@ show up in /proc/sys/kernel:
+ - panic_on_stackoverflow
+ - panic_on_unrecovered_nmi
+ - panic_on_warn
++- panic_on_rcu_stall
+ - perf_cpu_time_max_percent
+ - perf_event_paranoid
+ - pid_max
+@@ -559,6 +560,17 @@ a kernel rebuild when attempting to kdump at the location of a WARN().
+ 
+ ==============================================================
+ 
++panic_on_rcu_stall:
++
++When set to 1, calls panic() after RCU stall detection messages. This
++is useful to define the root cause of RCU stalls using a vmcore.
++
++0: do not panic() when RCU stall takes place, default behavior.
++
++1: panic() after printing RCU stall messages.
++
++==============================================================
++
+ perf_cpu_time_max_percent:
+ 
+ Hints to the kernel how much CPU time it should be allowed to
+diff --git a/include/linux/kernel.h b/include/linux/kernel.h
+index 4ee809347a72..6f93c84e6591 100644
+--- a/include/linux/kernel.h
++++ b/include/linux/kernel.h
+@@ -443,6 +443,7 @@ extern int panic_on_oops;
+ extern int panic_on_unrecovered_nmi;
+ extern int panic_on_io_nmi;
+ extern int panic_on_warn;
++extern int sysctl_panic_on_rcu_stall;
+ extern int sysctl_panic_on_stackoverflow;
+ /*
+  * panic_cpu is used for synchronizing panic() and crash_kexec() execution. It
+* Unmerged path kernel/rcutree.c
+* Unmerged path kernel/sysctl.c
