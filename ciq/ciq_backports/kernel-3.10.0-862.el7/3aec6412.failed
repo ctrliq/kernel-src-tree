@@ -1,0 +1,244 @@
+aquantia: Fix Tx queue hangups
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Igor Russkikh <igor.russkikh@aquantia.com>
+commit 3aec6412e007b294d4c135f5c7ed5e5ecf37dd2e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/3aec6412.failed
+
+Driver did a poor job in managing its Tx queues: Sometimes it could stop
+tx queues due to link down condition in aq_nic_xmit - but never waked up
+them. That led to Tx path total suspend.
+This patch fixes this and improves generic queue management:
+- introduces queue restart counter
+- uses generic netif_ interface to disable and enable tx path
+- refactors link up/down condition and introduces dmesg log event when
+  link changes.
+- introduces new constant for minimum descriptors count required for queue
+  wakeup
+
+	Signed-off-by: Pavel Belous <Pavel.Belous@aquantia.com>
+	Signed-off-by: Igor Russkikh <igor.russkikh@aquantia.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3aec6412e007b294d4c135f5c7ed5e5ecf37dd2e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+diff --cc drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+index 315b49f79c74,072a55029f04..000000000000
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_nic.c
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+@@@ -130,28 -160,13 +159,36 @@@ static void aq_nic_service_timer_cb(uns
+  	if (aq_utils_obj_test(&self->header.flags, AQ_NIC_FLAGS_IS_NOT_READY))
+  		goto err_exit;
+  
+++<<<<<<< HEAD
+ +	err = self->aq_hw_ops.hw_get_link_status(self->aq_hw, &link_status);
+ +	if (err < 0)
+++=======
++ 	err = aq_nic_update_link_status(self);
++ 	if (err)
+++>>>>>>> 3aec6412e007 (aquantia: Fix Tx queue hangups)
+  		goto err_exit;
+  
+  	self->aq_hw_ops.hw_interrupt_moderation_set(self->aq_hw,
+ -		    self->aq_nic_cfg.is_interrupt_moderation);
+ +			    self->aq_nic_cfg.is_interrupt_moderation);
+ +
+++<<<<<<< HEAD
+ +	if (memcmp(&link_status, &self->link_status, sizeof(link_status))) {
+ +		if (link_status.mbps) {
+ +			aq_utils_obj_set(&self->header.flags,
+ +					 AQ_NIC_FLAG_STARTED);
+ +			aq_utils_obj_clear(&self->header.flags,
+ +					   AQ_NIC_LINK_DOWN);
+ +			netif_carrier_on(self->ndev);
+ +		} else {
+ +			netif_carrier_off(self->ndev);
+ +			aq_utils_obj_set(&self->header.flags, AQ_NIC_LINK_DOWN);
+ +		}
+  
+ +		self->link_status = link_status;
+ +	}
+ +
+++=======
+++>>>>>>> 3aec6412e007 (aquantia: Fix Tx queue hangups)
+  	memset(&stats_rx, 0U, sizeof(struct aq_ring_stats_rx_s));
+  	memset(&stats_tx, 0U, sizeof(struct aq_ring_stats_tx_s));
+  	for (i = AQ_DIMOF(self->aq_vec); i--;) {
+@@@ -604,9 -599,7 +623,8 @@@ __acquires(&ring->lock
+  	unsigned int frags = 0U;
+  	unsigned int vec = skb->queue_mapping % self->aq_nic_cfg.vecs;
+  	unsigned int tc = 0U;
+ +	unsigned int trys = AQ_CFG_LOCK_TRYS;
+  	int err = NETDEV_TX_OK;
+- 	bool is_nic_in_bad_state;
+  
+  	frags = skb_shinfo(skb)->nr_frags + 1;
+  
+@@@ -628,36 -618,18 +643,46 @@@
+  		goto err_exit;
+  	}
+  
+ -	frags = aq_nic_map_skb(self, skb, ring);
+ +	do {
+ +		if (spin_trylock(&ring->header.lock)) {
+ +			frags = aq_nic_map_skb(self, skb, ring);
+ +
+++<<<<<<< HEAD
+ +			if (likely(frags)) {
+ +				err = self->aq_hw_ops.hw_ring_tx_xmit(
+ +								self->aq_hw,
+ +								ring, frags);
+ +				if (err >= 0) {
+ +					if (aq_ring_avail_dx(ring) <
+ +					    AQ_CFG_SKB_FRAGS_MAX + 1)
+ +						aq_nic_ndev_queue_stop(
+ +								self,
+ +								ring->idx);
+ +
+ +					++ring->stats.tx.packets;
+ +					ring->stats.tx.bytes += skb->len;
+ +				}
+ +			} else {
+ +				err = NETDEV_TX_BUSY;
+ +			}
+  
+ +			spin_unlock(&ring->header.lock);
+ +			break;
+++=======
++ 	if (likely(frags)) {
++ 		err = self->aq_hw_ops.hw_ring_tx_xmit(self->aq_hw,
++ 						      ring,
++ 						      frags);
++ 		if (err >= 0) {
++ 			++ring->stats.tx.packets;
++ 			ring->stats.tx.bytes += skb->len;
+++>>>>>>> 3aec6412e007 (aquantia: Fix Tx queue hangups)
+  		}
+ -	} else {
+ +	} while (--trys);
+ +
+ +	if (!trys) {
+  		err = NETDEV_TX_BUSY;
+ +		goto err_exit;
+  	}
+  
+  err_exit:
+diff --git a/drivers/net/ethernet/aquantia/atlantic/aq_cfg.h b/drivers/net/ethernet/aquantia/atlantic/aq_cfg.h
+index 214986436ece..0fdaaa643073 100644
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_cfg.h
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_cfg.h
+@@ -51,6 +51,10 @@
+ 
+ #define AQ_CFG_SKB_FRAGS_MAX   32U
+ 
++/* Number of descriptors available in one ring to resume this ring queue
++ */
++#define AQ_CFG_RESTART_DESC_THRES   (AQ_CFG_SKB_FRAGS_MAX * 2)
++
+ #define AQ_CFG_NAPI_WEIGHT     64U
+ 
+ #define AQ_CFG_MULTICAST_ADDRESS_MAX     32U
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+diff --git a/drivers/net/ethernet/aquantia/atlantic/aq_nic.h b/drivers/net/ethernet/aquantia/atlantic/aq_nic.h
+index 7fc2a5ecb2b7..0ddd556ff901 100644
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_nic.h
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_nic.h
+@@ -83,8 +83,6 @@ struct net_device *aq_nic_get_ndev(struct aq_nic_s *self);
+ int aq_nic_init(struct aq_nic_s *self);
+ int aq_nic_cfg_start(struct aq_nic_s *self);
+ int aq_nic_ndev_register(struct aq_nic_s *self);
+-void aq_nic_ndev_queue_start(struct aq_nic_s *self, unsigned int idx);
+-void aq_nic_ndev_queue_stop(struct aq_nic_s *self, unsigned int idx);
+ void aq_nic_ndev_free(struct aq_nic_s *self);
+ int aq_nic_start(struct aq_nic_s *self);
+ int aq_nic_xmit(struct aq_nic_s *self, struct sk_buff *skb);
+diff --git a/drivers/net/ethernet/aquantia/atlantic/aq_ring.c b/drivers/net/ethernet/aquantia/atlantic/aq_ring.c
+index c2f095db277a..4acc85f38f21 100644
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_ring.c
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_ring.c
+@@ -105,6 +105,32 @@ int aq_ring_init(struct aq_ring_s *self)
+ 	return 0;
+ }
+ 
++void aq_ring_update_queue_state(struct aq_ring_s *ring)
++{
++	if (aq_ring_avail_dx(ring) <= AQ_CFG_SKB_FRAGS_MAX)
++		aq_ring_queue_stop(ring);
++	else if (aq_ring_avail_dx(ring) > AQ_CFG_RESTART_DESC_THRES)
++		aq_ring_queue_wake(ring);
++}
++
++void aq_ring_queue_wake(struct aq_ring_s *ring)
++{
++	struct net_device *ndev = aq_nic_get_ndev(ring->aq_nic);
++
++	if (__netif_subqueue_stopped(ndev, ring->idx)) {
++		netif_wake_subqueue(ndev, ring->idx);
++		ring->stats.tx.queue_restarts++;
++	}
++}
++
++void aq_ring_queue_stop(struct aq_ring_s *ring)
++{
++	struct net_device *ndev = aq_nic_get_ndev(ring->aq_nic);
++
++	if (!__netif_subqueue_stopped(ndev, ring->idx))
++		netif_stop_subqueue(ndev, ring->idx);
++}
++
+ void aq_ring_tx_clean(struct aq_ring_s *self)
+ {
+ 	struct device *dev = aq_nic_get_dev(self->aq_nic);
+diff --git a/drivers/net/ethernet/aquantia/atlantic/aq_ring.h b/drivers/net/ethernet/aquantia/atlantic/aq_ring.h
+index 782176c5f4f8..24523b5ac68c 100644
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_ring.h
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_ring.h
+@@ -94,6 +94,7 @@ struct aq_ring_stats_tx_s {
+ 	u64 errors;
+ 	u64 packets;
+ 	u64 bytes;
++	u64 queue_restarts;
+ };
+ 
+ union aq_ring_stats_s {
+@@ -147,6 +148,9 @@ struct aq_ring_s *aq_ring_rx_alloc(struct aq_ring_s *self,
+ int aq_ring_init(struct aq_ring_s *self);
+ void aq_ring_rx_deinit(struct aq_ring_s *self);
+ void aq_ring_free(struct aq_ring_s *self);
++void aq_ring_update_queue_state(struct aq_ring_s *ring);
++void aq_ring_queue_wake(struct aq_ring_s *ring);
++void aq_ring_queue_stop(struct aq_ring_s *ring);
+ void aq_ring_tx_clean(struct aq_ring_s *self);
+ int aq_ring_rx_clean(struct aq_ring_s *self,
+ 		     struct napi_struct *napi,
+diff --git a/drivers/net/ethernet/aquantia/atlantic/aq_vec.c b/drivers/net/ethernet/aquantia/atlantic/aq_vec.c
+index ec390c5eed35..f565139426dd 100644
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_vec.c
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_vec.c
+@@ -61,12 +61,7 @@ __acquires(&self->lock)
+ 			if (ring[AQ_VEC_TX_ID].sw_head !=
+ 			    ring[AQ_VEC_TX_ID].hw_head) {
+ 				aq_ring_tx_clean(&ring[AQ_VEC_TX_ID]);
+-
+-				if (aq_ring_avail_dx(&ring[AQ_VEC_TX_ID]) >
+-				    AQ_CFG_SKB_FRAGS_MAX) {
+-					aq_nic_ndev_queue_start(self->aq_nic,
+-						ring[AQ_VEC_TX_ID].idx);
+-				}
++				aq_ring_update_queue_state(&ring[AQ_VEC_TX_ID]);
+ 				was_tx_cleaned = true;
+ 			}
+ 
+@@ -371,6 +366,7 @@ void aq_vec_add_stats(struct aq_vec_s *self,
+ 		stats_tx->packets += tx->packets;
+ 		stats_tx->bytes += tx->bytes;
+ 		stats_tx->errors += tx->errors;
++		stats_tx->queue_restarts += tx->queue_restarts;
+ 	}
+ }
+ 
