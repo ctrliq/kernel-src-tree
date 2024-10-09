@@ -1,0 +1,582 @@
+KVM: VMX: make MSR bitmaps per-VCPU
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 904e14fb7cb96401a7dc803ca2863fd5ba32ffe6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/904e14fb.failed
+
+Place the MSR bitmap in struct loaded_vmcs, and update it in place
+every time the x2apic or APICv state can change.  This is rare and
+the loop can handle 64 MSRs per iteration, in a similar fashion as
+nested_vmx_prepare_msr_bitmap.
+
+This prepares for choosing, on a per-VM basis, whether to intercept
+the SPEC_CTRL and PRED_CMD MSRs.
+
+	Cc: stable@vger.kernel.org       # prereq for Spectre mitigation
+	Suggested-by: Jim Mattson <jmattson@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 904e14fb7cb96401a7dc803ca2863fd5ba32ffe6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index 553a3a9096ee,896af99a8606..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -106,8 -109,25 +106,16 @@@ module_param(nested, bool, S_IRUGO)
+  static bool __read_mostly enable_pml = 1;
+  module_param_named(pml, enable_pml, bool, S_IRUGO);
+  
++ #define MSR_TYPE_R	1
++ #define MSR_TYPE_W	2
++ #define MSR_TYPE_RW	3
++ 
++ #define MSR_BITMAP_MODE_X2APIC		1
++ #define MSR_BITMAP_MODE_X2APIC_APICV	2
++ #define MSR_BITMAP_MODE_LM		4
++ 
+  #define KVM_VMX_TSC_MULTIPLIER_MAX     0xffffffffffffffffULL
+  
+ -/* Guest_tsc -> host_tsc conversion requires 64-bit division.  */
+ -static int __read_mostly cpu_preemption_timer_multi;
+ -static bool __read_mostly enable_preemption_timer = 1;
+ -#ifdef CONFIG_X86_64
+ -module_param_named(preemption_timer, enable_preemption_timer, bool, S_IRUGO);
+ -#endif
+ -
+  #define KVM_GUEST_CR0_MASK (X86_CR0_NW | X86_CR0_CD)
+  #define KVM_VM_CR0_ALWAYS_ON_UNRESTRICTED_GUEST (X86_CR0_WP | X86_CR0_NE)
+  #define KVM_VM_CR0_ALWAYS_ON						\
+@@@ -186,7 -209,15 +194,19 @@@ struct loaded_vmcs 
+  	struct vmcs *vmcs;
+  	struct vmcs *shadow_vmcs;
+  	int cpu;
+++<<<<<<< HEAD
+ +	int launched;
+++=======
++ 	bool launched;
++ 	bool nmi_known_unmasked;
++ 	unsigned long vmcs_host_cr3;	/* May not match real cr3 */
++ 	unsigned long vmcs_host_cr4;	/* May not match real cr4 */
++ 	/* Support for vnmi-less CPUs */
++ 	int soft_vnmi_blocked;
++ 	ktime_t entry_time;
++ 	s64 vnmi_blocked_time;
++ 	unsigned long *msr_bitmap;
+++>>>>>>> 904e14fb7cb9 (KVM: VMX: make MSR bitmaps per-VCPU)
+  	struct list_head loaded_vmcss_on_cpu_link;
+  };
+  
+@@@ -889,9 -930,12 +908,17 @@@ static void vmx_get_segment(struct kvm_
+  			    struct kvm_segment *var, int seg);
+  static bool guest_state_valid(struct kvm_vcpu *vcpu);
+  static u32 vmx_segment_access_rights(struct kvm_segment *var);
+ +static void copy_vmcs12_to_shadow(struct vcpu_vmx *vmx);
+  static void copy_shadow_to_vmcs12(struct vcpu_vmx *vmx);
+++<<<<<<< HEAD
+ +static int alloc_identity_pagetable(struct kvm *kvm);
+++=======
++ static bool vmx_get_nmi_mask(struct kvm_vcpu *vcpu);
++ static void vmx_set_nmi_mask(struct kvm_vcpu *vcpu, bool masked);
++ static bool nested_vmx_is_page_fault_vmexit(struct vmcs12 *vmcs12,
++ 					    u16 error_code);
++ static void vmx_update_msr_bitmap(struct kvm_vcpu *vcpu);
+++>>>>>>> 904e14fb7cb9 (KVM: VMX: make MSR bitmaps per-VCPU)
+  
+  static DEFINE_PER_CPU(struct vmcs *, vmxarea);
+  static DEFINE_PER_CPU(struct vmcs *, current_vmcs);
+@@@ -909,14 -952,20 +936,31 @@@ static DEFINE_PER_CPU(struct desc_ptr, 
+  static DEFINE_PER_CPU(struct list_head, blocked_vcpu_on_cpu);
+  static DEFINE_PER_CPU(spinlock_t, blocked_vcpu_on_cpu_lock);
+  
+++<<<<<<< HEAD
+ +static unsigned long *vmx_io_bitmap_a;
+ +static unsigned long *vmx_io_bitmap_b;
+ +static unsigned long *vmx_msr_bitmap_legacy;
+ +static unsigned long *vmx_msr_bitmap_longmode;
+ +static unsigned long *vmx_msr_bitmap_legacy_x2apic;
+ +static unsigned long *vmx_msr_bitmap_longmode_x2apic;
+ +static unsigned long *vmx_vmread_bitmap;
+ +static unsigned long *vmx_vmwrite_bitmap;
+++=======
++ enum {
++ 	VMX_IO_BITMAP_A,
++ 	VMX_IO_BITMAP_B,
++ 	VMX_VMREAD_BITMAP,
++ 	VMX_VMWRITE_BITMAP,
++ 	VMX_BITMAP_NR
++ };
++ 
++ static unsigned long *vmx_bitmap[VMX_BITMAP_NR];
++ 
++ #define vmx_io_bitmap_a                      (vmx_bitmap[VMX_IO_BITMAP_A])
++ #define vmx_io_bitmap_b                      (vmx_bitmap[VMX_IO_BITMAP_B])
++ #define vmx_vmread_bitmap                    (vmx_bitmap[VMX_VMREAD_BITMAP])
++ #define vmx_vmwrite_bitmap                   (vmx_bitmap[VMX_VMWRITE_BITMAP])
+++>>>>>>> 904e14fb7cb9 (KVM: VMX: make MSR bitmaps per-VCPU)
+  
+  static bool cpu_has_load_ia32_efer;
+  static bool cpu_has_load_perf_global_ctrl;
+@@@ -2383,27 -2561,6 +2427,30 @@@ static void move_msr_up(struct vcpu_vm
+  	vmx->guest_msrs[from] = tmp;
+  }
+  
+++<<<<<<< HEAD
+ +static void vmx_set_msr_bitmap(struct kvm_vcpu *vcpu)
+ +{
+ +	unsigned long *msr_bitmap;
+ +
+ +	if (is_guest_mode(vcpu))
+ +		msr_bitmap = to_vmx(vcpu)->nested.msr_bitmap;
+ +	else if (vcpu->arch.apic_base & X2APIC_ENABLE) {
+ +		if (is_long_mode(vcpu))
+ +			msr_bitmap = vmx_msr_bitmap_longmode_x2apic;
+ +		else
+ +			msr_bitmap = vmx_msr_bitmap_legacy_x2apic;
+ +	} else {
+ +		if (is_long_mode(vcpu))
+ +			msr_bitmap = vmx_msr_bitmap_longmode;
+ +		else
+ +			msr_bitmap = vmx_msr_bitmap_legacy;
+ +	}
+ +
+ +	vmcs_write64(MSR_BITMAP, __pa(msr_bitmap));
+ +}
+ +
+++=======
+++>>>>>>> 904e14fb7cb9 (KVM: VMX: make MSR bitmaps per-VCPU)
+  /*
+   * Set up the vmcs to automatically save and restore system
+   * msrs.  Don't touch the 64-bit msrs if the guest is in legacy
+@@@ -3372,6 -3816,33 +3421,36 @@@ static void free_loaded_vmcs(struct loa
+  	WARN_ON(loaded_vmcs->shadow_vmcs != NULL);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct vmcs *alloc_vmcs(void)
++ {
++ 	return alloc_vmcs_cpu(raw_smp_processor_id());
++ }
++ 
++ static int alloc_loaded_vmcs(struct loaded_vmcs *loaded_vmcs)
++ {
++ 	loaded_vmcs->vmcs = alloc_vmcs();
++ 	if (!loaded_vmcs->vmcs)
++ 		return -ENOMEM;
++ 
++ 	loaded_vmcs->shadow_vmcs = NULL;
++ 	loaded_vmcs_init(loaded_vmcs);
++ 
++ 	if (cpu_has_vmx_msr_bitmap()) {
++ 		loaded_vmcs->msr_bitmap = (unsigned long *)__get_free_page(GFP_KERNEL);
++ 		if (!loaded_vmcs->msr_bitmap)
++ 			goto out_vmcs;
++ 		memset(loaded_vmcs->msr_bitmap, 0xff, PAGE_SIZE);
++ 	}
++ 	return 0;
++ 
++ out_vmcs:
++ 	free_loaded_vmcs(loaded_vmcs);
++ 	return -ENOMEM;
++ }
++ 
+++>>>>>>> 904e14fb7cb9 (KVM: VMX: make MSR bitmaps per-VCPU)
+  static void free_kvm_area(void)
+  {
+  	int cpu;
+@@@ -4432,8 -4936,8 +4509,13 @@@ static void __always_inline vmx_disable
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static void __vmx_enable_intercept_for_msr(unsigned long *msr_bitmap,
+ +						u32 msr, int type)
+++=======
++ static void __always_inline vmx_enable_intercept_for_msr(unsigned long *msr_bitmap,
++ 							 u32 msr, int type)
+++>>>>>>> 904e14fb7cb9 (KVM: VMX: make MSR bitmaps per-VCPU)
+  {
+  	int f = sizeof(unsigned long);
+  
+@@@ -4467,6 -4971,15 +4549,18 @@@
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void __always_inline vmx_set_intercept_for_msr(unsigned long *msr_bitmap,
++ 			     			      u32 msr, int type, bool value)
++ {
++ 	if (value)
++ 		vmx_enable_intercept_for_msr(msr_bitmap, msr, type);
++ 	else
++ 		vmx_disable_intercept_for_msr(msr_bitmap, msr, type);
++ }
++ 
+++>>>>>>> 904e14fb7cb9 (KVM: VMX: make MSR bitmaps per-VCPU)
+  /*
+   * If a msr is allowed by L0, we should check whether it is allowed by L1.
+   * The corresponding bit will be cleared unless both of L0 and L1 allow it.
+@@@ -4513,37 -5026,68 +4607,93 @@@ static void nested_vmx_disable_intercep
+  	}
+  }
+  
+- static void vmx_disable_intercept_for_msr(u32 msr, bool longmode_only)
++ static u8 vmx_msr_bitmap_mode(struct kvm_vcpu *vcpu)
+  {
+- 	if (!longmode_only)
+- 		__vmx_disable_intercept_for_msr(vmx_msr_bitmap_legacy,
+- 						msr, MSR_TYPE_R | MSR_TYPE_W);
+- 	__vmx_disable_intercept_for_msr(vmx_msr_bitmap_longmode,
+- 						msr, MSR_TYPE_R | MSR_TYPE_W);
++ 	u8 mode = 0;
++ 
++ 	if (cpu_has_secondary_exec_ctrls() &&
++ 	    (vmcs_read32(SECONDARY_VM_EXEC_CONTROL) &
++ 	     SECONDARY_EXEC_VIRTUALIZE_X2APIC_MODE)) {
++ 		mode |= MSR_BITMAP_MODE_X2APIC;
++ 		if (enable_apicv && kvm_vcpu_apicv_active(vcpu))
++ 			mode |= MSR_BITMAP_MODE_X2APIC_APICV;
++ 	}
++ 
++ 	if (is_long_mode(vcpu))
++ 		mode |= MSR_BITMAP_MODE_LM;
++ 
++ 	return mode;
+  }
+  
+++<<<<<<< HEAD
+ +static void vmx_enable_intercept_msr_read_x2apic(u32 msr)
+ +{
+ +	__vmx_enable_intercept_for_msr(vmx_msr_bitmap_legacy_x2apic,
+ +			msr, MSR_TYPE_R);
+ +	__vmx_enable_intercept_for_msr(vmx_msr_bitmap_longmode_x2apic,
+ +			msr, MSR_TYPE_R);
+ +}
+ +
+ +static void vmx_disable_intercept_msr_read_x2apic(u32 msr)
+ +{
+ +	__vmx_disable_intercept_for_msr(vmx_msr_bitmap_legacy_x2apic,
+ +			msr, MSR_TYPE_R);
+ +	__vmx_disable_intercept_for_msr(vmx_msr_bitmap_longmode_x2apic,
+ +			msr, MSR_TYPE_R);
+ +}
+ +
+ +static void vmx_disable_intercept_msr_write_x2apic(u32 msr)
+ +{
+ +	__vmx_disable_intercept_for_msr(vmx_msr_bitmap_legacy_x2apic,
+ +			msr, MSR_TYPE_W);
+ +	__vmx_disable_intercept_for_msr(vmx_msr_bitmap_longmode_x2apic,
+ +			msr, MSR_TYPE_W);
+++=======
++ #define X2APIC_MSR(r) (APIC_BASE_MSR + ((r) >> 4))
++ 
++ static void vmx_update_msr_bitmap_x2apic(unsigned long *msr_bitmap,
++ 					 u8 mode)
++ {
++ 	int msr;
++ 
++ 	for (msr = 0x800; msr <= 0x8ff; msr += BITS_PER_LONG) {
++ 		unsigned word = msr / BITS_PER_LONG;
++ 		msr_bitmap[word] = (mode & MSR_BITMAP_MODE_X2APIC_APICV) ? 0 : ~0;
++ 		msr_bitmap[word + (0x800 / sizeof(long))] = ~0;
++ 	}
++ 
++ 	if (mode & MSR_BITMAP_MODE_X2APIC) {
++ 		/*
++ 		 * TPR reads and writes can be virtualized even if virtual interrupt
++ 		 * delivery is not in use.
++ 		 */
++ 		vmx_disable_intercept_for_msr(msr_bitmap, X2APIC_MSR(APIC_TASKPRI), MSR_TYPE_RW);
++ 		if (mode & MSR_BITMAP_MODE_X2APIC_APICV) {
++ 			vmx_enable_intercept_for_msr(msr_bitmap, X2APIC_MSR(APIC_TMCCT), MSR_TYPE_R);
++ 			vmx_disable_intercept_for_msr(msr_bitmap, X2APIC_MSR(APIC_EOI), MSR_TYPE_W);
++ 			vmx_disable_intercept_for_msr(msr_bitmap, X2APIC_MSR(APIC_SELF_IPI), MSR_TYPE_W);
++ 		}
++ 	}
++ }
++ 
++ static void vmx_update_msr_bitmap(struct kvm_vcpu *vcpu)
++ {
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 	unsigned long *msr_bitmap = vmx->vmcs01.msr_bitmap;
++ 	u8 mode = vmx_msr_bitmap_mode(vcpu);
++ 	u8 changed = mode ^ vmx->msr_bitmap_mode;
++ 
++ 	if (!changed)
++ 		return;
++ 
++ 	vmx_set_intercept_for_msr(msr_bitmap, MSR_KERNEL_GS_BASE, MSR_TYPE_RW,
++ 				  !(mode & MSR_BITMAP_MODE_LM));
++ 
++ 	if (changed & (MSR_BITMAP_MODE_X2APIC | MSR_BITMAP_MODE_X2APIC_APICV))
++ 		vmx_update_msr_bitmap_x2apic(msr_bitmap, mode);
++ 
++ 	vmx->msr_bitmap_mode = mode;
+++>>>>>>> 904e14fb7cb9 (KVM: VMX: make MSR bitmaps per-VCPU)
+  }
+  
+  static bool vmx_get_enable_apicv(struct kvm_vcpu *vcpu)
+@@@ -4771,6 -5327,19 +4921,22 @@@ static void vmx_refresh_apicv_exec_ctrl
+  	struct vcpu_vmx *vmx = to_vmx(vcpu);
+  
+  	vmcs_write32(PIN_BASED_VM_EXEC_CONTROL, vmx_pin_based_exec_ctrl(vmx));
+++<<<<<<< HEAD
+++=======
++ 	if (cpu_has_secondary_exec_ctrls()) {
++ 		if (kvm_vcpu_apicv_active(vcpu))
++ 			vmcs_set_bits(SECONDARY_VM_EXEC_CONTROL,
++ 				      SECONDARY_EXEC_APIC_REGISTER_VIRT |
++ 				      SECONDARY_EXEC_VIRTUAL_INTR_DELIVERY);
++ 		else
++ 			vmcs_clear_bits(SECONDARY_VM_EXEC_CONTROL,
++ 					SECONDARY_EXEC_APIC_REGISTER_VIRT |
++ 					SECONDARY_EXEC_VIRTUAL_INTR_DELIVERY);
++ 	}
++ 
++ 	if (cpu_has_vmx_msr_bitmap())
++ 		vmx_update_msr_bitmap(vcpu);
+++>>>>>>> 904e14fb7cb9 (KVM: VMX: make MSR bitmaps per-VCPU)
+  }
+  
+  static u32 vmx_exec_control(struct vcpu_vmx *vmx)
+@@@ -6160,9 -6794,22 +6326,9 @@@ static void wakeup_handler(void
+  	spin_unlock(&per_cpu(blocked_vcpu_on_cpu_lock, cpu));
+  }
+  
+ -void vmx_enable_tdp(void)
+ -{
+ -	kvm_mmu_set_mask_ptes(VMX_EPT_READABLE_MASK,
+ -		enable_ept_ad_bits ? VMX_EPT_ACCESS_BIT : 0ull,
+ -		enable_ept_ad_bits ? VMX_EPT_DIRTY_BIT : 0ull,
+ -		0ull, VMX_EPT_EXECUTABLE_MASK,
+ -		cpu_has_vmx_ept_execute_only() ? 0ull : VMX_EPT_READABLE_MASK,
+ -		VMX_EPT_RWX_MASK, 0ull);
+ -
+ -	ept_set_mmio_spte_mask();
+ -	kvm_enable_tdp();
+ -}
+ -
+  static __init int hardware_setup(void)
+  {
+- 	int r = -ENOMEM, i, msr;
++ 	int r = -ENOMEM, i;
+  
+  	rdmsrl_safe(MSR_EFER, &host_efer);
+  
+@@@ -6210,12 -6829,9 +6376,9 @@@
+  
+  	memset(vmx_io_bitmap_b, 0xff, PAGE_SIZE);
+  
+- 	memset(vmx_msr_bitmap_legacy, 0xff, PAGE_SIZE);
+- 	memset(vmx_msr_bitmap_longmode, 0xff, PAGE_SIZE);
+- 
+  	if (setup_vmcs_config(&vmcs_config) < 0) {
+  		r = -EIO;
+ -		goto out;
+ +		goto out8;
+  	}
+  
+  	if (boot_cpu_has(X86_FEATURE_NX))
+@@@ -6272,48 -6897,11 +6435,56 @@@
+  		kvm_tsc_scaling_ratio_frac_bits = 48;
+  	}
+  
+++<<<<<<< HEAD
+ +	vmx_disable_intercept_for_msr(MSR_FS_BASE, false);
+ +	vmx_disable_intercept_for_msr(MSR_GS_BASE, false);
+ +	vmx_disable_intercept_for_msr(MSR_KERNEL_GS_BASE, true);
+ +	vmx_disable_intercept_for_msr(MSR_IA32_SYSENTER_CS, false);
+ +	vmx_disable_intercept_for_msr(MSR_IA32_SYSENTER_ESP, false);
+ +	vmx_disable_intercept_for_msr(MSR_IA32_SYSENTER_EIP, false);
+ +
+ +	memcpy(vmx_msr_bitmap_legacy_x2apic,
+ +			vmx_msr_bitmap_legacy, PAGE_SIZE);
+ +	memcpy(vmx_msr_bitmap_longmode_x2apic,
+ +			vmx_msr_bitmap_longmode, PAGE_SIZE);
+ +
+ +	set_bit(0, vmx_vpid_bitmap); /* 0 is reserved for host */
+ +
+ +	if (enable_apicv) {
+ +		for (msr = 0x800; msr <= 0x8ff; msr++)
+ +			vmx_disable_intercept_msr_read_x2apic(msr);
+ +
+ +		/* According SDM, in x2apic mode, the whole id reg is used.
+ +		 * But in KVM, it only use the highest eight bits. Need to
+ +		 * intercept it */
+ +		vmx_enable_intercept_msr_read_x2apic(0x802);
+ +		/* TMCCT */
+ +		vmx_enable_intercept_msr_read_x2apic(0x839);
+ +		/* TPR */
+ +		vmx_disable_intercept_msr_write_x2apic(0x808);
+ +		/* EOI */
+ +		vmx_disable_intercept_msr_write_x2apic(0x80b);
+ +		/* SELF-IPI */
+ +		vmx_disable_intercept_msr_write_x2apic(0x83f);
+ +	}
+ +
+ +	if (enable_ept) {
+ +		kvm_mmu_set_mask_ptes(VMX_EPT_READABLE_MASK,
+ +			(enable_ept_ad_bits) ? VMX_EPT_ACCESS_BIT : 0ull,
+ +			(enable_ept_ad_bits) ? VMX_EPT_DIRTY_BIT : 0ull,
+ +			0ull, VMX_EPT_EXECUTABLE_MASK,
+ +			cpu_has_vmx_ept_execute_only() ?
+ +				      0ull : VMX_EPT_READABLE_MASK);
+ +		ept_set_mmio_spte_mask();
+ +		kvm_enable_tdp();
+ +	} else
+++=======
++ 	set_bit(0, vmx_vpid_bitmap); /* 0 is reserved for host */
++ 
++ 	if (enable_ept)
++ 		vmx_enable_tdp();
++ 	else
+++>>>>>>> 904e14fb7cb9 (KVM: VMX: make MSR bitmaps per-VCPU)
+  		kvm_disable_tdp();
+  
+  	update_ple_window_actual_max();
+@@@ -6811,49 -7261,43 +6982,48 @@@ static int handle_vmon(struct kvm_vcpu 
+  		return 1;
+  	}
+  
+- 	if (cpu_has_vmx_msr_bitmap()) {
+- 		vmx->nested.msr_bitmap =
+- 				(unsigned long *)__get_free_page(GFP_KERNEL);
+- 		if (!vmx->nested.msr_bitmap)
+- 			goto out_msr_bitmap;
+- 	}
+- 
+ -	if (nested_vmx_get_vmptr(vcpu, &vmptr))
+ -		return 1;
+ +	vmx->nested.cached_vmcs12 = kmalloc(VMCS12_SIZE, GFP_KERNEL);
+ +	if (!vmx->nested.cached_vmcs12)
+ +		goto out_cached_vmcs12;
+  
+ -	/*
+ -	 * SDM 3: 24.11.5
+ -	 * The first 4 bytes of VMXON region contain the supported
+ -	 * VMCS revision identifier
+ -	 *
+ -	 * Note - IA32_VMX_BASIC[48] will never be 1 for the nested case;
+ -	 * which replaces physical address width with 32
+ -	 */
+ -	if (!PAGE_ALIGNED(vmptr) || (vmptr >> cpuid_maxphyaddr(vcpu))) {
+ -		nested_vmx_failInvalid(vcpu);
+ -		return kvm_skip_emulated_instruction(vcpu);
+ +	if (enable_shadow_vmcs) {
+ +		shadow_vmcs = alloc_vmcs();
+ +		if (!shadow_vmcs)
+ +			goto out_shadow_vmcs;
+ +		/* mark vmcs as shadow */
+ +		shadow_vmcs->revision_id |= (1u << 31);
+ +		/* init shadow vmcs */
+ +		vmcs_clear(shadow_vmcs);
+ +		vmx->vmcs01.shadow_vmcs = shadow_vmcs;
+  	}
+  
+ -	page = kvm_vcpu_gpa_to_page(vcpu, vmptr);
+ -	if (is_error_page(page)) {
+ -		nested_vmx_failInvalid(vcpu);
+ -		return kvm_skip_emulated_instruction(vcpu);
+ -	}
+ -	if (*(u32 *)kmap(page) != VMCS12_REVISION) {
+ -		kunmap(page);
+ -		kvm_release_page_clean(page);
+ -		nested_vmx_failInvalid(vcpu);
+ -		return kvm_skip_emulated_instruction(vcpu);
+ -	}
+ -	kunmap(page);
+ -	kvm_release_page_clean(page);
+ +	INIT_LIST_HEAD(&(vmx->nested.vmcs02_pool));
+ +	vmx->nested.vmcs02_num = 0;
+  
+ -	vmx->nested.vmxon_ptr = vmptr;
+ -	ret = enter_vmx_operation(vcpu);
+ -	if (ret)
+ -		return ret;
+ +	hrtimer_init(&vmx->nested.preemption_timer, CLOCK_MONOTONIC,
+ +		     HRTIMER_MODE_REL);
+ +	vmx->nested.preemption_timer.function = vmx_preemption_timer_fn;
+ +
+ +	vmx->nested.vmxon = true;
+  
+ +	skip_emulated_instruction(vcpu);
+  	nested_vmx_succeed(vcpu);
+ -	return kvm_skip_emulated_instruction(vcpu);
+ +	return 1;
+ +
+ +out_shadow_vmcs:
+ +	kfree(vmx->nested.cached_vmcs12);
+ +
+ +out_cached_vmcs12:
+++<<<<<<< HEAD
+ +	free_page((unsigned long)vmx->nested.msr_bitmap);
+ +
+ +out_msr_bitmap:
+++=======
+++	free_loaded_vmcs(&vmx->nested.vmcs02);
+++
+++out_vmcs02:
+++>>>>>>> 904e14fb7cb9 (KVM: VMX: make MSR bitmaps per-VCPU)
+ +	return -ENOMEM;
+  }
+  
+  /*
+@@@ -8902,17 -9567,20 +9069,33 @@@ static struct kvm_vcpu *vmx_create_vcpu
+  	if (!vmx->guest_msrs)
+  		goto free_pml;
+  
+++<<<<<<< HEAD
+++=======
++ 	err = alloc_loaded_vmcs(&vmx->vmcs01);
++ 	if (err < 0)
++ 		goto free_msrs;
++ 
++ 	msr_bitmap = vmx->vmcs01.msr_bitmap;
++ 	vmx_disable_intercept_for_msr(msr_bitmap, MSR_FS_BASE, MSR_TYPE_RW);
++ 	vmx_disable_intercept_for_msr(msr_bitmap, MSR_GS_BASE, MSR_TYPE_RW);
++ 	vmx_disable_intercept_for_msr(msr_bitmap, MSR_KERNEL_GS_BASE, MSR_TYPE_RW);
++ 	vmx_disable_intercept_for_msr(msr_bitmap, MSR_IA32_SYSENTER_CS, MSR_TYPE_RW);
++ 	vmx_disable_intercept_for_msr(msr_bitmap, MSR_IA32_SYSENTER_ESP, MSR_TYPE_RW);
++ 	vmx_disable_intercept_for_msr(msr_bitmap, MSR_IA32_SYSENTER_EIP, MSR_TYPE_RW);
++ 	vmx->msr_bitmap_mode = 0;
++ 
+++>>>>>>> 904e14fb7cb9 (KVM: VMX: make MSR bitmaps per-VCPU)
+  	vmx->loaded_vmcs = &vmx->vmcs01;
+ +	vmx->loaded_vmcs->vmcs = alloc_vmcs();
+ +	vmx->loaded_vmcs->shadow_vmcs = NULL;
+ +	if (!vmx->loaded_vmcs->vmcs)
+ +		goto free_msrs;
+ +	if (!vmm_exclusive)
+ +		kvm_cpu_vmxon(__pa(per_cpu(vmxarea, raw_smp_processor_id())));
+ +	loaded_vmcs_init(vmx->loaded_vmcs);
+ +	if (!vmm_exclusive)
+ +		kvm_cpu_vmxoff();
+ +
+  	cpu = get_cpu();
+  	vmx_vcpu_load(&vmx->vcpu, cpu);
+  	vmx->vcpu.cpu = cpu;
+@@@ -9873,9 -10617,12 +10056,16 @@@ static int prepare_vmcs02(struct kvm_vc
+  			vcpu->arch.tsc_offset + vmcs12->tsc_offset);
+  	else
+  		vmcs_write64(TSC_OFFSET, vcpu->arch.tsc_offset);
+ +
+  	if (kvm_has_tsc_control)
+  		decache_tsc_multiplier(vmx);
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (cpu_has_vmx_msr_bitmap())
++ 		vmcs_write64(MSR_BITMAP, __pa(vmx->nested.vmcs02.msr_bitmap));
++ 
+++>>>>>>> 904e14fb7cb9 (KVM: VMX: make MSR bitmaps per-VCPU)
+  	if (enable_vpid) {
+  		/*
+  		 * There is no direct mapping between vpid02 and vpid12, the
+* Unmerged path arch/x86/kvm/vmx.c
