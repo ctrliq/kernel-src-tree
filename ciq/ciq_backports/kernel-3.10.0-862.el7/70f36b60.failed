@@ -1,0 +1,175 @@
+blk-mq: allow resize of scheduler requests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jens Axboe <axboe@fb.com>
+commit 70f36b6001bf596eb411c4b302e84c4824ae8730
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/70f36b60.failed
+
+Add support for growing the tags associated with a hardware queue, for
+the scheduler tags. Currently we only support resizing within the
+limits of the original depth, change that so we can grow it as well by
+allocating and replacing the existing scheduler tag set.
+
+This is similar to how we could increase the software queue depth with
+the legacy IO stack and schedulers.
+
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+	Reviewed-by: Omar Sandoval <osandov@fb.com>
+(cherry picked from commit 70f36b6001bf596eb411c4b302e84c4824ae8730)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq-tag.c
+#	block/blk-mq-tag.h
+#	block/blk-mq.c
+diff --cc block/blk-mq-tag.c
+index 7e6885bccaac,a49ec77c415a..000000000000
+--- a/block/blk-mq-tag.c
++++ b/block/blk-mq-tag.c
+@@@ -679,25 -387,56 +679,76 @@@ void blk_mq_free_tags(struct blk_mq_tag
+  	kfree(tags);
+  }
+  
+++<<<<<<< HEAD
+ +void blk_mq_tag_init_last_tag(struct blk_mq_tags *tags, unsigned int *tag)
+ +{
+ +	unsigned int depth = tags->nr_tags - tags->nr_reserved_tags;
+ +
+ +	*tag = prandom_u32() % depth;
+ +}
+ +
+ +int blk_mq_tag_update_depth(struct blk_mq_tags *tags, unsigned int tdepth)
+++=======
++ int blk_mq_tag_update_depth(struct blk_mq_hw_ctx *hctx,
++ 			    struct blk_mq_tags **tagsptr, unsigned int tdepth,
++ 			    bool can_grow)
+++>>>>>>> 70f36b6001bf (blk-mq: allow resize of scheduler requests)
+  {
+- 	tdepth -= tags->nr_reserved_tags;
+- 	if (tdepth > tags->nr_tags)
++ 	struct blk_mq_tags *tags = *tagsptr;
++ 
++ 	if (tdepth <= tags->nr_reserved_tags)
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Don't need (or can't) update reserved tags here, they remain
+ +	 * static and should never need resizing.
+ +	 */
+ +	bt_update_count(&tags->bitmap_tags, tdepth);
+ +	blk_mq_tag_wakeup_all(tags, false);
+++=======
++ 	tdepth -= tags->nr_reserved_tags;
++ 
++ 	/*
++ 	 * If we are allowed to grow beyond the original size, allocate
++ 	 * a new set of tags before freeing the old one.
++ 	 */
++ 	if (tdepth > tags->nr_tags) {
++ 		struct blk_mq_tag_set *set = hctx->queue->tag_set;
++ 		struct blk_mq_tags *new;
++ 		bool ret;
++ 
++ 		if (!can_grow)
++ 			return -EINVAL;
++ 
++ 		/*
++ 		 * We need some sort of upper limit, set it high enough that
++ 		 * no valid use cases should require more.
++ 		 */
++ 		if (tdepth > 16 * BLKDEV_MAX_RQ)
++ 			return -EINVAL;
++ 
++ 		new = blk_mq_alloc_rq_map(set, hctx->queue_num, tdepth, 0);
++ 		if (!new)
++ 			return -ENOMEM;
++ 		ret = blk_mq_alloc_rqs(set, new, hctx->queue_num, tdepth);
++ 		if (ret) {
++ 			blk_mq_free_rq_map(new);
++ 			return -ENOMEM;
++ 		}
++ 
++ 		blk_mq_free_rqs(set, *tagsptr, hctx->queue_num);
++ 		blk_mq_free_rq_map(*tagsptr);
++ 		*tagsptr = new;
++ 	} else {
++ 		/*
++ 		 * Don't need (or can't) update reserved tags here, they
++ 		 * remain static and should never need resizing.
++ 		 */
++ 		sbitmap_queue_resize(&tags->bitmap_tags, tdepth);
++ 	}
++ 
+++>>>>>>> 70f36b6001bf (blk-mq: allow resize of scheduler requests)
+  	return 0;
+  }
+  
+diff --cc block/blk-mq-tag.h
+index 5cdeb865c8ff,ac22878462e7..000000000000
+--- a/block/blk-mq-tag.h
++++ b/block/blk-mq-tag.h
+@@@ -51,11 -25,13 +51,17 @@@ extern struct blk_mq_tags *blk_mq_init_
+  extern void blk_mq_free_tags(struct blk_mq_tags *tags);
+  
+  extern unsigned int blk_mq_get_tag(struct blk_mq_alloc_data *data);
+ -extern void blk_mq_put_tag(struct blk_mq_hw_ctx *hctx, struct blk_mq_tags *tags,
+ -			   struct blk_mq_ctx *ctx, unsigned int tag);
+ +extern void blk_mq_put_tag(struct blk_mq_hw_ctx *hctx, unsigned int tag, unsigned int *last_tag);
+  extern bool blk_mq_has_free_tags(struct blk_mq_tags *tags);
+  extern ssize_t blk_mq_tag_sysfs_show(struct blk_mq_tags *tags, char *page);
+++<<<<<<< HEAD
+ +extern void blk_mq_tag_init_last_tag(struct blk_mq_tags *tags, unsigned int *last_tag);
+ +extern int blk_mq_tag_update_depth(struct blk_mq_tags *tags, unsigned int depth);
+++=======
++ extern int blk_mq_tag_update_depth(struct blk_mq_hw_ctx *hctx,
++ 					struct blk_mq_tags **tags,
++ 					unsigned int depth, bool can_grow);
+++>>>>>>> 70f36b6001bf (blk-mq: allow resize of scheduler requests)
+  extern void blk_mq_tag_wakeup_all(struct blk_mq_tags *tags, bool);
+  void blk_mq_queue_tag_busy_iter(struct request_queue *q, busy_iter_fn *fn,
+  		void *priv);
+diff --cc block/blk-mq.c
+index 3b21482b7f01,ee69e5e89769..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -2500,14 -2558,28 +2500,32 @@@ int blk_mq_update_nr_requests(struct re
+  	struct blk_mq_hw_ctx *hctx;
+  	int i, ret;
+  
+ -	if (!set)
+ +	if (!set || nr > set->queue_depth)
+  		return -EINVAL;
+  
++ 	blk_mq_freeze_queue(q);
++ 	blk_mq_quiesce_queue(q);
++ 
+  	ret = 0;
+  	queue_for_each_hw_ctx(q, hctx, i) {
+  		if (!hctx->tags)
+  			continue;
+++<<<<<<< HEAD
+ +		ret = blk_mq_tag_update_depth(hctx->tags, nr);
+++=======
++ 		/*
++ 		 * If we're using an MQ scheduler, just update the scheduler
++ 		 * queue depth. This is similar to what the old code would do.
++ 		 */
++ 		if (!hctx->sched_tags) {
++ 			ret = blk_mq_tag_update_depth(hctx, &hctx->tags,
++ 							min(nr, set->queue_depth),
++ 							false);
++ 		} else {
++ 			ret = blk_mq_tag_update_depth(hctx, &hctx->sched_tags,
++ 							nr, true);
++ 		}
+++>>>>>>> 70f36b6001bf (blk-mq: allow resize of scheduler requests)
+  		if (ret)
+  			break;
+  	}
+* Unmerged path block/blk-mq-tag.c
+* Unmerged path block/blk-mq-tag.h
+* Unmerged path block/blk-mq.c
