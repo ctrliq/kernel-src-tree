@@ -1,0 +1,228 @@
+perf stat: Get rid of extra clock display function
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jiri Olsa <jolsa@kernel.org>
+commit 0aa802a79469a86ebe143019144cd4df8ae852e4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/0aa802a7.failed
+
+There's no reason to have separate function to display clock events.
+It's only purpose was to convert the nanosecond value into microseconds.
+We do that now in generic code, if the unit and scale values are
+properly set, which this patch do for clock events.
+
+The output differs in the unit field being displayed in its columns
+rather than having it added as a suffix of the event name. Plus the
+value is rounded into 2 decimal numbers as for any other event.
+
+Before:
+
+  # perf stat  -e cpu-clock,task-clock -C 0 sleep 3
+
+   Performance counter stats for 'CPU(s) 0':
+
+       3001.123137      cpu-clock (msec)          #    1.000 CPUs utilized
+       3001.133250      task-clock (msec)         #    1.000 CPUs utilized
+
+       3.001159813 seconds time elapsed
+
+Now:
+
+  # perf stat  -e cpu-clock,task-clock -C 0 sleep 3
+
+   Performance counter stats for 'CPU(s) 0':
+
+          3,001.05 msec cpu-clock                 #    1.000 CPUs utilized
+          3,001.05 msec task-clock                #    1.000 CPUs utilized
+
+       3.001077794 seconds time elapsed
+
+There's a small difference in csv output, as we now output the unit
+field, which was empty before. It's in the proper spot, so there's no
+compatibility issue.
+
+Before:
+
+  # perf stat  -e cpu-clock,task-clock -C 0 -x, sleep 3
+  3001.065177,,cpu-clock,3001064187,100.00,1.000,CPUs utilized
+  3001.077085,,task-clock,3001077085,100.00,1.000,CPUs utilized
+
+  # perf stat  -e cpu-clock,task-clock -C 0 -x, sleep 3
+  3000.80,msec,cpu-clock,3000799026,100.00,1.000,CPUs utilized
+  3000.80,msec,task-clock,3000799550,100.00,1.000,CPUs utilized
+
+Add perf_evsel__is_clock to replace nsec_counter.
+
+	Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+	Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/20180720110036.32251-2-jolsa@kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 0aa802a79469a86ebe143019144cd4df8ae852e4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/evsel.c
+#	tools/perf/util/evsel.h
+diff --cc tools/perf/util/evsel.c
+index 21347cec82a4,5285da0417c5..000000000000
+--- a/tools/perf/util/evsel.c
++++ b/tools/perf/util/evsel.c
+@@@ -253,6 -254,23 +253,26 @@@ struct perf_evsel *perf_evsel__new_idx(
+  	if (evsel != NULL)
+  		perf_evsel__init(evsel, attr, idx);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (perf_evsel__is_bpf_output(evsel)) {
++ 		evsel->attr.sample_type |= (PERF_SAMPLE_RAW | PERF_SAMPLE_TIME |
++ 					    PERF_SAMPLE_CPU | PERF_SAMPLE_PERIOD),
++ 		evsel->attr.sample_period = 1;
++ 	}
++ 
++ 	if (perf_evsel__is_clock(evsel)) {
++ 		/*
++ 		 * The evsel->unit points to static alias->unit
++ 		 * so it's ok to use static string in here.
++ 		 */
++ 		static const char *unit = "msec";
++ 
++ 		evsel->unit = unit;
++ 		evsel->scale = 1e-6;
++ 	}
++ 
+++>>>>>>> 0aa802a79469 (perf stat: Get rid of extra clock display function)
+  	return evsel;
+  }
+  
+diff --cc tools/perf/util/evsel.h
+index 90c15ad9578f,973c03167947..000000000000
+--- a/tools/perf/util/evsel.h
++++ b/tools/perf/util/evsel.h
+@@@ -395,6 -400,17 +395,20 @@@ static inline bool perf_evsel__is_group
+  
+  bool perf_evsel__is_function_event(struct perf_evsel *evsel);
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool perf_evsel__is_bpf_output(struct perf_evsel *evsel)
++ {
++ 	return perf_evsel__match(evsel, SOFTWARE, SW_BPF_OUTPUT);
++ }
++ 
++ static inline bool perf_evsel__is_clock(struct perf_evsel *evsel)
++ {
++ 	return perf_evsel__match(evsel, SOFTWARE, SW_CPU_CLOCK) ||
++ 	       perf_evsel__match(evsel, SOFTWARE, SW_TASK_CLOCK);
++ }
++ 
+++>>>>>>> 0aa802a79469 (perf stat: Get rid of extra clock display function)
+  struct perf_attr_details {
+  	bool freq;
+  	bool verbose;
+diff --git a/tools/perf/builtin-stat.c b/tools/perf/builtin-stat.c
+index 88e61516b248..d8fe200a35d0 100644
+--- a/tools/perf/builtin-stat.c
++++ b/tools/perf/builtin-stat.c
+@@ -296,18 +296,6 @@ static int create_perf_stat_counter(struct perf_evsel *evsel)
+ 	return perf_evsel__open_per_thread(evsel, evsel_list->threads);
+ }
+ 
+-/*
+- * Does the counter have nsecs as a unit?
+- */
+-static inline int nsec_counter(struct perf_evsel *evsel)
+-{
+-	if (perf_evsel__match(evsel, SOFTWARE, SW_CPU_CLOCK) ||
+-	    perf_evsel__match(evsel, SOFTWARE, SW_TASK_CLOCK))
+-		return 1;
+-
+-	return 0;
+-}
+-
+ static int process_synthesized_event(struct perf_tool *tool __maybe_unused,
+ 				     union perf_event *event,
+ 				     struct perf_sample *sample __maybe_unused,
+@@ -1058,34 +1046,6 @@ static void print_metric_header(void *ctx, const char *color __maybe_unused,
+ 		fprintf(os->fh, "%*s ", metric_only_len, unit);
+ }
+ 
+-static void nsec_printout(int id, int nr, struct perf_evsel *evsel, double avg)
+-{
+-	FILE *output = stat_config.output;
+-	double msecs = avg / NSEC_PER_MSEC;
+-	const char *fmt_v, *fmt_n;
+-	char name[25];
+-
+-	fmt_v = csv_output ? "%.6f%s" : "%18.6f%s";
+-	fmt_n = csv_output ? "%s" : "%-25s";
+-
+-	aggr_printout(evsel, id, nr);
+-
+-	scnprintf(name, sizeof(name), "%s%s",
+-		  perf_evsel__name(evsel), csv_output ? "" : " (msec)");
+-
+-	fprintf(output, fmt_v, msecs, csv_sep);
+-
+-	if (csv_output)
+-		fprintf(output, "%s%s", evsel->unit, csv_sep);
+-	else
+-		fprintf(output, "%-*s%s", unit_width, evsel->unit, csv_sep);
+-
+-	fprintf(output, fmt_n, name);
+-
+-	if (evsel->cgrp)
+-		fprintf(output, "%s%s", csv_sep, evsel->cgrp->name);
+-}
+-
+ static int first_shadow_cpu(struct perf_evsel *evsel, int id)
+ {
+ 	int i;
+@@ -1240,11 +1200,7 @@ static void printout(int id, int nr, struct perf_evsel *counter, double uval,
+ 		return;
+ 	}
+ 
+-	if (metric_only)
+-		/* nothing */;
+-	else if (nsec_counter(counter))
+-		nsec_printout(id, nr, counter, uval);
+-	else
++	if (!metric_only)
+ 		abs_printout(id, nr, counter, uval);
+ 
+ 	out.print_metric = pm;
+@@ -1329,7 +1285,7 @@ static void collect_all_aliases(struct perf_evsel *counter,
+ 		    alias->scale != counter->scale ||
+ 		    alias->cgrp != counter->cgrp ||
+ 		    strcmp(alias->unit, counter->unit) ||
+-		    nsec_counter(alias) != nsec_counter(counter))
++		    perf_evsel__is_clock(alias) != perf_evsel__is_clock(counter))
+ 			break;
+ 		alias->merged_stat = true;
+ 		cb(alias, data, false);
+* Unmerged path tools/perf/util/evsel.c
+* Unmerged path tools/perf/util/evsel.h
+diff --git a/tools/perf/util/stat-shadow.c b/tools/perf/util/stat-shadow.c
+index b29877d9b2f4..995ff48b1017 100644
+--- a/tools/perf/util/stat-shadow.c
++++ b/tools/perf/util/stat-shadow.c
+@@ -865,11 +865,10 @@ void perf_stat__print_shadow_stats(struct perf_evsel *evsel,
+ 			ratio = total / avg;
+ 
+ 		print_metric(ctxp, NULL, "%8.0f", "cycles / elision", ratio);
+-	} else if (perf_evsel__match(evsel, SOFTWARE, SW_TASK_CLOCK) ||
+-		   perf_evsel__match(evsel, SOFTWARE, SW_CPU_CLOCK)) {
++	} else if (perf_evsel__is_clock(evsel)) {
+ 		if ((ratio = avg_stats(&walltime_nsecs_stats)) != 0)
+ 			print_metric(ctxp, NULL, "%8.3f", "CPUs utilized",
+-				     avg / ratio);
++				     avg / (ratio * evsel->scale));
+ 		else
+ 			print_metric(ctxp, NULL, NULL, "CPUs utilized", 0);
+ 	} else if (perf_stat_evsel__is(evsel, TOPDOWN_FETCH_BUBBLES)) {
