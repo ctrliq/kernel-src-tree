@@ -2323,6 +2323,10 @@ static int sbridge_get_onedevice(struct pci_dev **prev,
 
 	sbridge_dev = get_sbridge_dev(bus, multi_bus);
 	if (!sbridge_dev) {
+
+		if (dev_descr->dom == SOCK)
+			goto out_imc;
+
 		sbridge_dev = alloc_sbridge_dev(bus, dev_descr->dom, table);
 		if (!sbridge_dev) {
 			pci_dev_put(pdev);
@@ -2341,6 +2345,7 @@ static int sbridge_get_onedevice(struct pci_dev **prev,
 
 	sbridge_dev->pdev[devno] = pdev;
 
+out_imc:
 	/* Be sure that the device is enabled */
 	if (unlikely(pci_enable_device(pdev) < 0)) {
 		sbridge_printk(KERN_ERR,
