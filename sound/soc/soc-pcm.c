@@ -483,7 +483,7 @@ static int soc_pcm_open(struct snd_pcm_substream *substream)
 	mutex_lock_nested(&rtd->pcm_mutex, rtd->pcm_subclass);
 
 	/* startup the audio subsystem */
-	if (cpu_dai->driver->ops && cpu_dai->driver->ops->startup) {
+	if (cpu_dai->driver->ops->startup) {
 		ret = cpu_dai->driver->ops->startup(substream, cpu_dai);
 		if (ret < 0) {
 			dev_err(cpu_dai->dev, "ASoC: can't open interface"
@@ -503,7 +503,7 @@ static int soc_pcm_open(struct snd_pcm_substream *substream)
 
 	for (i = 0; i < rtd->num_codecs; i++) {
 		codec_dai = rtd->codec_dais[i];
-		if (codec_dai->driver->ops && codec_dai->driver->ops->startup) {
+		if (codec_dai->driver->ops->startup) {
 			ret = codec_dai->driver->ops->startup(substream,
 							      codec_dai);
 			if (ret < 0) {
@@ -780,7 +780,7 @@ static int soc_pcm_prepare(struct snd_pcm_substream *substream)
 
 	for (i = 0; i < rtd->num_codecs; i++) {
 		codec_dai = rtd->codec_dais[i];
-		if (codec_dai->driver->ops && codec_dai->driver->ops->prepare) {
+		if (codec_dai->driver->ops->prepare) {
 			ret = codec_dai->driver->ops->prepare(substream,
 							      codec_dai);
 			if (ret < 0) {
@@ -792,7 +792,7 @@ static int soc_pcm_prepare(struct snd_pcm_substream *substream)
 		}
 	}
 
-	if (cpu_dai->driver->ops && cpu_dai->driver->ops->prepare) {
+	if (cpu_dai->driver->ops->prepare) {
 		ret = cpu_dai->driver->ops->prepare(substream, cpu_dai);
 		if (ret < 0) {
 			dev_err(cpu_dai->dev,
@@ -838,7 +838,7 @@ int soc_dai_hw_params(struct snd_pcm_substream *substream,
 {
 	int ret;
 
-	if (dai->driver->ops && dai->driver->ops->hw_params) {
+	if (dai->driver->ops->hw_params) {
 		ret = dai->driver->ops->hw_params(substream, params, dai);
 		if (ret < 0) {
 			dev_err(dai->dev, "ASoC: can't set %s hw params: %d\n",
@@ -943,7 +943,7 @@ out:
 	return ret;
 
 platform_err:
-	if (cpu_dai->driver->ops && cpu_dai->driver->ops->hw_free)
+	if (cpu_dai->driver->ops->hw_free)
 		cpu_dai->driver->ops->hw_free(substream, cpu_dai);
 
 interface_err:
@@ -952,7 +952,7 @@ interface_err:
 codec_err:
 	while (--i >= 0) {
 		struct snd_soc_dai *codec_dai = rtd->codec_dais[i];
-		if (codec_dai->driver->ops && codec_dai->driver->ops->hw_free)
+		if (codec_dai->driver->ops->hw_free)
 			codec_dai->driver->ops->hw_free(substream, codec_dai);
 		codec_dai->rate = 0;
 	}
@@ -1013,11 +1013,11 @@ static int soc_pcm_hw_free(struct snd_pcm_substream *substream)
 	/* now free hw params for the DAIs  */
 	for (i = 0; i < rtd->num_codecs; i++) {
 		codec_dai = rtd->codec_dais[i];
-		if (codec_dai->driver->ops && codec_dai->driver->ops->hw_free)
+		if (codec_dai->driver->ops->hw_free)
 			codec_dai->driver->ops->hw_free(substream, codec_dai);
 	}
 
-	if (cpu_dai->driver->ops && cpu_dai->driver->ops->hw_free)
+	if (cpu_dai->driver->ops->hw_free)
 		cpu_dai->driver->ops->hw_free(substream, cpu_dai);
 
 	mutex_unlock(&rtd->pcm_mutex);
@@ -1034,7 +1034,7 @@ static int soc_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 
 	for (i = 0; i < rtd->num_codecs; i++) {
 		codec_dai = rtd->codec_dais[i];
-		if (codec_dai->driver->ops && codec_dai->driver->ops->trigger) {
+		if (codec_dai->driver->ops->trigger) {
 			ret = codec_dai->driver->ops->trigger(substream,
 							      cmd, codec_dai);
 			if (ret < 0)
@@ -1048,7 +1048,7 @@ static int soc_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 			return ret;
 	}
 
-	if (cpu_dai->driver->ops && cpu_dai->driver->ops->trigger) {
+	if (cpu_dai->driver->ops->trigger) {
 		ret = cpu_dai->driver->ops->trigger(substream, cmd, cpu_dai);
 		if (ret < 0)
 			return ret;
@@ -1073,8 +1073,7 @@ static int soc_pcm_bespoke_trigger(struct snd_pcm_substream *substream,
 
 	for (i = 0; i < rtd->num_codecs; i++) {
 		codec_dai = rtd->codec_dais[i];
-		if (codec_dai->driver->ops &&
-		    codec_dai->driver->ops->bespoke_trigger) {
+		if (codec_dai->driver->ops->bespoke_trigger) {
 			ret = codec_dai->driver->ops->bespoke_trigger(substream,
 								cmd, codec_dai);
 			if (ret < 0)
@@ -1082,7 +1081,7 @@ static int soc_pcm_bespoke_trigger(struct snd_pcm_substream *substream,
 		}
 	}
 
-	if (cpu_dai->driver->ops && cpu_dai->driver->ops->bespoke_trigger) {
+	if (cpu_dai->driver->ops->bespoke_trigger) {
 		ret = cpu_dai->driver->ops->bespoke_trigger(substream, cmd, cpu_dai);
 		if (ret < 0)
 			return ret;
@@ -1109,12 +1108,12 @@ static snd_pcm_uframes_t soc_pcm_pointer(struct snd_pcm_substream *substream)
 	if (platform->driver->ops && platform->driver->ops->pointer)
 		offset = platform->driver->ops->pointer(substream);
 
-	if (cpu_dai->driver->ops && cpu_dai->driver->ops->delay)
+	if (cpu_dai->driver->ops->delay)
 		delay += cpu_dai->driver->ops->delay(substream, cpu_dai);
 
 	for (i = 0; i < rtd->num_codecs; i++) {
 		codec_dai = rtd->codec_dais[i];
-		if (codec_dai->driver->ops && codec_dai->driver->ops->delay)
+		if (codec_dai->driver->ops->delay)
 			codec_delay = max(codec_delay,
 					codec_dai->driver->ops->delay(substream,
 								    codec_dai));
