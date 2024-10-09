@@ -1369,6 +1369,8 @@ gf100_grctx_generate_floorsweep(struct gf100_gr *gr)
 		func->r406500(gr);
 	if (func->gpc_tpc_nr)
 		func->gpc_tpc_nr(gr);
+	if (func->r419f78)
+		func->r419f78(gr);
 }
 
 void
