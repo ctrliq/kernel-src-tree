@@ -1,0 +1,127 @@
+scsi: lpfc: Fix NVMEI's handling of NVMET's PRLI response attributes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] lpfc: Fix NVMEI's handling of NVMET's PRLI response attributes (Dick Kennedy) [1385844 1461977 1387768]
+Rebuild_FUZZ: 95.38%
+commit-author James Smart <jsmart2021@gmail.com>
+commit dc53a61852279f25909d99dad4638b4aee0b2d82
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/dc53a618.failed
+
+Code review of NVMEI's FC_PORT_ROLE_NVME_DISCOVERY looked wrong.
+
+Discussions with storage architecture team clarified NVMEI's audit of
+the PRLI response port roles.  Following up discussion with code review
+showed a few minor corrections were required - especially in
+anticipation of NVME auto discovery.
+
+During PRLI, NVMEI should sent prli_init - which it it does.  NVMET
+should send prli_tgt and prli_disc - which it does.  When NVMEI receives
+a PRLI Response now, it audits the incoming target bits and stores the
+attributes in the corresponding NDLP.  Later, when NVMEI registers the
+NVME rport, it uses the stored ndlp attributes to set the rport
+port_roles correctly.
+
+	Signed-off-by: Dick Kennedy <dick.kennedy@broadcom.com>
+	Signed-off-by: James Smart <james.smart@broadcom.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit dc53a61852279f25909d99dad4638b4aee0b2d82)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/lpfc/lpfc_disc.h
+#	drivers/scsi/lpfc/lpfc_nportdisc.c
+diff --cc drivers/scsi/lpfc/lpfc_disc.h
+index 361f5b3d9d93,094c97b9e5f7..000000000000
+--- a/drivers/scsi/lpfc/lpfc_disc.h
++++ b/drivers/scsi/lpfc/lpfc_disc.h
+@@@ -86,6 -88,18 +86,21 @@@ struct lpfc_nodelist 
+  #define NLP_FABRIC         0x4			/* entry rep a Fabric entity */
+  #define NLP_FCP_TARGET     0x8			/* entry is an FCP target */
+  #define NLP_FCP_INITIATOR  0x10			/* entry is an FCP Initiator */
+++<<<<<<< HEAD
+++=======
++ #define NLP_NVME_TARGET    0x20			/* entry is a NVME Target */
++ #define NLP_NVME_INITIATOR 0x40			/* entry is a NVME Initiator */
++ #define NLP_NVME_DISCOVERY 0x80                 /* entry has NVME disc srvc */
++ 
++ 	uint16_t	nlp_fc4_type;		/* FC types node supports. */
++ 						/* Assigned from GID_FF, only
++ 						 * FCP (0x8) and NVME (0x28)
++ 						 * supported.
++ 						 */
++ #define NLP_FC4_NONE	0x0
++ #define NLP_FC4_FCP	0x1			/* FC4 Type FCP (value x8)) */
++ #define NLP_FC4_NVME	0x2			/* FC4 TYPE NVME (value x28) */
+++>>>>>>> dc53a6185227 (scsi: lpfc: Fix NVMEI's handling of NVMET's PRLI response attributes)
+  
+  	uint16_t        nlp_rpi;
+  	uint16_t        nlp_state;		/* state transition indicator */
+diff --cc drivers/scsi/lpfc/lpfc_nportdisc.c
+index 56a3df4fddb0,bff3de053df4..000000000000
+--- a/drivers/scsi/lpfc/lpfc_nportdisc.c
++++ b/drivers/scsi/lpfc/lpfc_nportdisc.c
+@@@ -1770,6 -1929,55 +1770,58 @@@ lpfc_cmpl_prli_prli_issue(struct lpfc_v
+  		}
+  		if (npr->Retry)
+  			ndlp->nlp_fcp_info |= NLP_FCP_2_DEVICE;
+++<<<<<<< HEAD
+++=======
++ 
++ 		/* PRLI completed.  Decrement count. */
++ 		ndlp->fc4_prli_sent--;
++ 	} else if (nvpr &&
++ 		   (bf_get_be32(prli_acc_rsp_code, nvpr) ==
++ 		    PRLI_REQ_EXECUTED) &&
++ 		   (bf_get_be32(prli_type_code, nvpr) ==
++ 		    PRLI_NVME_TYPE)) {
++ 
++ 		/* Complete setting up the remote ndlp personality. */
++ 		if (bf_get_be32(prli_init, nvpr))
++ 			ndlp->nlp_type |= NLP_NVME_INITIATOR;
++ 
++ 		/* Target driver cannot solicit NVME FB. */
++ 		if (bf_get_be32(prli_tgt, nvpr)) {
++ 			/* Complete the nvme target roles.  The transport
++ 			 * needs to know if the rport is capable of
++ 			 * discovery in addition to its role.
++ 			 */
++ 			ndlp->nlp_type |= NLP_NVME_TARGET;
++ 			if (bf_get_be32(prli_disc, nvpr))
++ 				ndlp->nlp_type |= NLP_NVME_DISCOVERY;
++ 			if ((bf_get_be32(prli_fba, nvpr) == 1) &&
++ 			    (bf_get_be32(prli_fb_sz, nvpr) > 0) &&
++ 			    (phba->cfg_nvme_enable_fb) &&
++ 			    (!phba->nvmet_support)) {
++ 				/* Both sides support FB. The target's first
++ 				 * burst size is a 512 byte encoded value.
++ 				 */
++ 				ndlp->nlp_flag |= NLP_FIRSTBURST;
++ 				ndlp->nvme_fb_size = bf_get_be32(prli_fb_sz,
++ 								 nvpr);
++ 			}
++ 		}
++ 
++ 		if (bf_get_be32(prli_recov, nvpr))
++ 			ndlp->nlp_fcp_info |= NLP_FCP_2_DEVICE;
++ 
++ 		lpfc_printf_vlog(vport, KERN_INFO, LOG_NVME_DISC,
++ 				 "6029 NVME PRLI Cmpl w1 x%08x "
++ 				 "w4 x%08x w5 x%08x flag x%x, "
++ 				 "fcp_info x%x nlp_type x%x\n",
++ 				 be32_to_cpu(nvpr->word1),
++ 				 be32_to_cpu(nvpr->word4),
++ 				 be32_to_cpu(nvpr->word5),
++ 				 ndlp->nlp_flag, ndlp->nlp_fcp_info,
++ 				 ndlp->nlp_type);
++ 		/* PRLI completed.  Decrement count. */
++ 		ndlp->fc4_prli_sent--;
+++>>>>>>> dc53a6185227 (scsi: lpfc: Fix NVMEI's handling of NVMET's PRLI response attributes)
+  	}
+  	if (!(ndlp->nlp_type & NLP_FCP_TARGET) &&
+  	    (vport->port_type == LPFC_NPIV_PORT) &&
+* Unmerged path drivers/scsi/lpfc/lpfc_disc.h
+* Unmerged path drivers/scsi/lpfc/lpfc_nportdisc.c
