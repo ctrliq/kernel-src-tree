@@ -1,0 +1,407 @@
+memcg, slab: do not schedule cache destruction when last page goes away
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Vladimir Davydov <vdavydov@parallels.com>
+commit 1e32e77f95d60b121b6072e3e3a650a7f93068f9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/1e32e77f.failed
+
+This patchset is a part of preparations for kmemcg re-parenting.  It
+targets at simplifying kmemcg work-flows and synchronization.
+
+First, it removes async per memcg cache destruction (see patches 1, 2).
+Now caches are only destroyed on memcg offline.  That means the caches
+that are not empty on memcg offline will be leaked.  However, they are
+already leaked, because memcg_cache_params::nr_pages normally never drops
+to 0 so the destruction work is never scheduled except kmem_cache_shrink
+is called explicitly.  In the future I'm planning reaping such dead caches
+on vmpressure or periodically.
+
+Second, it substitutes per memcg slab_caches_mutex's with the global
+memcg_slab_mutex, which should be taken during the whole per memcg cache
+creation/destruction path before the slab_mutex (see patch 3).  This
+greatly simplifies synchronization among various per memcg cache
+creation/destruction paths.
+
+I'm still not quite sure about the end picture, in particular I don't know
+whether we should reap dead memcgs' kmem caches periodically or try to
+merge them with their parents (see https://lkml.org/lkml/2014/4/20/38 for
+more details), but whichever way we choose, this set looks like a
+reasonable change to me, because it greatly simplifies kmemcg work-flows
+and eases further development.
+
+This patch (of 3):
+
+After a memcg is offlined, we mark its kmem caches that cannot be deleted
+right now due to pending objects as dead by setting the
+memcg_cache_params::dead flag, so that memcg_release_pages will schedule
+cache destruction (memcg_cache_params::destroy) as soon as the last slab
+of the cache is freed (memcg_cache_params::nr_pages drops to zero).
+
+I guess the idea was to destroy the caches as soon as possible, i.e.
+immediately after freeing the last object.  However, it just doesn't work
+that way, because kmem caches always preserve some pages for the sake of
+performance, so that nr_pages never gets to zero unless the cache is
+shrunk explicitly using kmem_cache_shrink.  Of course, we could account
+the total number of objects on the cache or check if all the slabs
+allocated for the cache are empty on kmem_cache_free and schedule
+destruction if so, but that would be too costly.
+
+Thus we have a piece of code that works only when we explicitly call
+kmem_cache_shrink, but complicates the whole picture a lot.  Moreover,
+it's racy in fact.  For instance, kmem_cache_shrink may free the last slab
+and thus schedule cache destruction before it finishes checking that the
+cache is empty, which can lead to use-after-free.
+
+So I propose to remove this async cache destruction from
+memcg_release_pages, and check if the cache is empty explicitly after
+calling kmem_cache_shrink instead.  This will simplify things a lot w/o
+introducing any functional changes.
+
+And regarding dead memcg caches (i.e.  those that are left hanging around
+after memcg offline for they have objects), I suppose we should reap them
+either periodically or on vmpressure as Glauber suggested initially.  I'm
+going to implement this later.
+
+	Signed-off-by: Vladimir Davydov <vdavydov@parallels.com>
+	Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Michal Hocko <mhocko@suse.cz>
+	Cc: Glauber Costa <glommer@gmail.com>
+	Cc: Pekka Enberg <penberg@kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 1e32e77f95d60b121b6072e3e3a650a7f93068f9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/memcontrol.h
+#	include/linux/slab.h
+#	mm/memcontrol.c
+diff --cc include/linux/memcontrol.h
+index 5cb1a6d66642,087a45314181..000000000000
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@@ -496,7 -506,9 +496,13 @@@ void memcg_update_array_size(int num_gr
+  struct kmem_cache *
+  __memcg_kmem_get_cache(struct kmem_cache *cachep, gfp_t gfp);
+  
+++<<<<<<< HEAD
+ +void mem_cgroup_destroy_cache(struct kmem_cache *cachep);
+++=======
++ int memcg_charge_kmem(struct mem_cgroup *memcg, gfp_t gfp, u64 size);
++ void memcg_uncharge_kmem(struct mem_cgroup *memcg, u64 size);
++ 
+++>>>>>>> 1e32e77f95d6 (memcg, slab: do not schedule cache destruction when last page goes away)
+  int __kmem_cache_destroy_memcg_children(struct kmem_cache *s);
+  
+  /**
+diff --cc include/linux/slab.h
+index eab8fa5b7846,905541dd3778..000000000000
+--- a/include/linux/slab.h
++++ b/include/linux/slab.h
+@@@ -419,15 -440,128 +419,135 @@@ void print_slabinfo_header(struct seq_f
+   * for general use, and so are not documented here. For a full list of
+   * potential flags, always refer to linux/gfp.h.
+   */
+++<<<<<<< HEAD
+++=======
++ static __always_inline void *kmalloc(size_t size, gfp_t flags)
++ {
++ 	if (__builtin_constant_p(size)) {
++ 		if (size > KMALLOC_MAX_CACHE_SIZE)
++ 			return kmalloc_large(size, flags);
++ #ifndef CONFIG_SLOB
++ 		if (!(flags & GFP_DMA)) {
++ 			int index = kmalloc_index(size);
++ 
++ 			if (!index)
++ 				return ZERO_SIZE_PTR;
++ 
++ 			return kmem_cache_alloc_trace(kmalloc_caches[index],
++ 					flags, size);
++ 		}
++ #endif
++ 	}
++ 	return __kmalloc(size, flags);
++ }
++ 
++ /*
++  * Determine size used for the nth kmalloc cache.
++  * return size or 0 if a kmalloc cache for that
++  * size does not exist
++  */
++ static __always_inline int kmalloc_size(int n)
++ {
++ #ifndef CONFIG_SLOB
++ 	if (n > 2)
++ 		return 1 << n;
++ 
++ 	if (n == 1 && KMALLOC_MIN_SIZE <= 32)
++ 		return 96;
++ 
++ 	if (n == 2 && KMALLOC_MIN_SIZE <= 64)
++ 		return 192;
++ #endif
++ 	return 0;
++ }
++ 
++ static __always_inline void *kmalloc_node(size_t size, gfp_t flags, int node)
++ {
++ #ifndef CONFIG_SLOB
++ 	if (__builtin_constant_p(size) &&
++ 		size <= KMALLOC_MAX_CACHE_SIZE && !(flags & GFP_DMA)) {
++ 		int i = kmalloc_index(size);
++ 
++ 		if (!i)
++ 			return ZERO_SIZE_PTR;
++ 
++ 		return kmem_cache_alloc_node_trace(kmalloc_caches[i],
++ 						flags, node, size);
++ 	}
++ #endif
++ 	return __kmalloc_node(size, flags, node);
++ }
++ 
++ /*
++  * Setting ARCH_SLAB_MINALIGN in arch headers allows a different alignment.
++  * Intended for arches that get misalignment faults even for 64 bit integer
++  * aligned buffers.
++  */
++ #ifndef ARCH_SLAB_MINALIGN
++ #define ARCH_SLAB_MINALIGN __alignof__(unsigned long long)
++ #endif
++ /*
++  * This is the main placeholder for memcg-related information in kmem caches.
++  * struct kmem_cache will hold a pointer to it, so the memory cost while
++  * disabled is 1 pointer. The runtime cost while enabled, gets bigger than it
++  * would otherwise be if that would be bundled in kmem_cache: we'll need an
++  * extra pointer chase. But the trade off clearly lays in favor of not
++  * penalizing non-users.
++  *
++  * Both the root cache and the child caches will have it. For the root cache,
++  * this will hold a dynamically allocated array large enough to hold
++  * information about the currently limited memcgs in the system. To allow the
++  * array to be accessed without taking any locks, on relocation we free the old
++  * version only after a grace period.
++  *
++  * Child caches will hold extra metadata needed for its operation. Fields are:
++  *
++  * @memcg: pointer to the memcg this cache belongs to
++  * @list: list_head for the list of all caches in this memcg
++  * @root_cache: pointer to the global, root cache, this cache was derived from
++  * @nr_pages: number of pages that belongs to this cache.
++  * @destroy: worker to be called whenever we are ready, or believe we may be
++  *           ready, to destroy this cache.
++  */
++ struct memcg_cache_params {
++ 	bool is_root_cache;
++ 	union {
++ 		struct {
++ 			struct rcu_head rcu_head;
++ 			struct kmem_cache *memcg_caches[0];
++ 		};
++ 		struct {
++ 			struct mem_cgroup *memcg;
++ 			struct list_head list;
++ 			struct kmem_cache *root_cache;
++ 			atomic_t nr_pages;
++ 			struct work_struct destroy;
++ 		};
++ 	};
++ };
++ 
++ int memcg_update_all_caches(int num_memcgs);
++ 
++ struct seq_file;
++ int cache_show(struct kmem_cache *s, struct seq_file *m);
++ void print_slabinfo_header(struct seq_file *m);
++ 
++ /**
++  * kmalloc_array - allocate memory for an array.
++  * @n: number of elements.
++  * @size: element size.
++  * @flags: the type of memory to allocate (see kmalloc).
++  */
+++>>>>>>> 1e32e77f95d6 (memcg, slab: do not schedule cache destruction when last page goes away)
+  static inline void *kmalloc_array(size_t n, size_t size, gfp_t flags)
+  {
+ -	if (size != 0 && n > SIZE_MAX / size)
+ +	size_t bytes;
+ +
+ +	if (unlikely(check_mul_overflow(n, size, &bytes)))
+  		return NULL;
+ -	return __kmalloc(n * size, flags);
+ +	if (__builtin_constant_p(n) && __builtin_constant_p(size))
+ +		return kmalloc(bytes, flags);
+ +	return __kmalloc(bytes, flags);
+  }
+  
+  /**
+diff --cc mm/memcontrol.c
+index c2be36e1df50,6b1c45ced733..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -3319,132 -3277,11 +3319,140 @@@ static void kmem_cache_destroy_work_fun
+  
+  	cachep = memcg_params_to_cache(p);
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * If we get down to 0 after shrink, we could delete right away.
+ +	 * However, memcg_release_pages() already puts us back in the workqueue
+ +	 * in that case. If we proceed deleting, we'll get a dangling
+ +	 * reference, and removing the object from the workqueue in that case
+ +	 * is unnecessary complication. We are not a fast path.
+ +	 *
+ +	 * Note that this case is fundamentally different from racing with
+ +	 * shrink_slab(): if memcg_cgroup_destroy_cache() is called in
+ +	 * kmem_cache_shrink, not only we would be reinserting a dead cache
+ +	 * into the queue, but doing so from inside the worker racing to
+ +	 * destroy it.
+ +	 *
+ +	 * So if we aren't down to zero, we'll just schedule a worker and try
+ +	 * again
+ +	 */
+ +	if (atomic_read(&cachep->memcg_params->nr_pages) != 0) {
+ +		kmem_cache_shrink(cachep);
+ +		if (atomic_read(&cachep->memcg_params->nr_pages) == 0)
+ +			return;
+ +	} else
+ +		kmem_cache_destroy(cachep);
+ +}
+ +
+ +void mem_cgroup_destroy_cache(struct kmem_cache *cachep)
+ +{
+ +	if (!cachep->memcg_params->dead)
+ +		return;
+ +
+ +	/*
+ +	 * There are many ways in which we can get here.
+ +	 *
+ +	 * We can get to a memory-pressure situation while the delayed work is
+ +	 * still pending to run. The vmscan shrinkers can then release all
+ +	 * cache memory and get us to destruction. If this is the case, we'll
+ +	 * be executed twice, which is a bug (the second time will execute over
+ +	 * bogus data). In this case, cancelling the work should be fine.
+ +	 *
+ +	 * But we can also get here from the worker itself, if
+ +	 * kmem_cache_shrink is enough to shake all the remaining objects and
+ +	 * get the page count to 0. In this case, we'll deadlock if we try to
+ +	 * cancel the work (the worker runs with an internal lock held, which
+ +	 * is the same lock we would hold for cancel_work_sync().)
+ +	 *
+ +	 * Since we can't possibly know who got us here, just refrain from
+ +	 * running if there is already work pending
+ +	 */
+ +	if (work_pending(&cachep->memcg_params->destroy))
+ +		return;
+ +	/*
+ +	 * We have to defer the actual destroying to a workqueue, because
+ +	 * we might currently be in a context that cannot sleep.
+ +	 */
+ +	schedule_work(&cachep->memcg_params->destroy);
+ +}
+ +
+ +/*
+ + * This lock protects updaters, not readers. We want readers to be as fast as
+ + * they can, and they will either see NULL or a valid cache value. Our model
+ + * allow them to see NULL, in which case the root memcg will be selected.
+ + *
+ + * We need this lock because multiple allocations to the same cache from a non
+ + * will span more than one worker. Only one of them can create the cache.
+ + */
+ +static DEFINE_MUTEX(memcg_cache_mutex);
+ +
+ +/*
+ + * Called with memcg_cache_mutex held
+ + */
+ +static struct kmem_cache *kmem_cache_dup(struct mem_cgroup *memcg,
+ +					 struct kmem_cache *s)
+ +{
+ +	struct kmem_cache *new;
+ +	static char *tmp_name = NULL;
+ +
+ +	lockdep_assert_held(&memcg_cache_mutex);
+ +
+ +	/*
+ +	 * kmem_cache_create_memcg duplicates the given name and
+ +	 * cgroup_name for this name requires RCU context.
+ +	 * This static temporary buffer is used to prevent from
+ +	 * pointless shortliving allocation.
+ +	 */
+ +	if (!tmp_name) {
+ +		tmp_name = kmalloc(PATH_MAX, GFP_KERNEL);
+ +		if (!tmp_name)
+ +			return NULL;
+ +	}
+ +
+ +	rcu_read_lock();
+ +	snprintf(tmp_name, PATH_MAX, "%s(%d:%s)", s->name,
+ +			 memcg_cache_id(memcg), cgroup_name(memcg->css.cgroup));
+ +	rcu_read_unlock();
+ +
+ +	new = kmem_cache_create_memcg(memcg, tmp_name, s->object_size, s->align,
+ +				      (s->flags & ~SLAB_PANIC), s->ctor, s);
+ +
+ +	if (new)
+ +		new->allocflags |= __GFP_KMEMCG;
+ +
+ +	return new;
+ +}
+ +
+ +static struct kmem_cache *memcg_create_kmem_cache(struct mem_cgroup *memcg,
+ +						  struct kmem_cache *cachep)
+ +{
+ +	struct kmem_cache *new_cachep;
+ +
+ +	BUG_ON(!memcg_can_account_kmem(memcg));
+ +
+ +	mutex_lock(&memcg_cache_mutex);
+ +
+ +	new_cachep = kmem_cache_dup(memcg, cachep);
+ +	if (new_cachep == NULL) {
+ +		new_cachep = cachep;
+ +		goto out;
+ +	}
+ +
+ +	mem_cgroup_get(memcg);
+ +out:
+ +	mutex_unlock(&memcg_cache_mutex);
+ +	return new_cachep;
+ +}
+ +
+ +static DEFINE_MUTEX(memcg_limit_mutex);
+ +
+++=======
++ 	kmem_cache_shrink(cachep);
++ 	if (atomic_read(&cachep->memcg_params->nr_pages) == 0)
++ 		kmem_cache_destroy(cachep);
++ }
++ 
+++>>>>>>> 1e32e77f95d6 (memcg, slab: do not schedule cache destruction when last page goes away)
+  int __kmem_cache_destroy_memcg_children(struct kmem_cache *s)
+  {
+  	struct kmem_cache *c;
+* Unmerged path include/linux/memcontrol.h
+* Unmerged path include/linux/slab.h
+* Unmerged path mm/memcontrol.c
+diff --git a/mm/slab.h b/mm/slab.h
+index 6a02fdac0ff7..a60b147d063f 100644
+--- a/mm/slab.h
++++ b/mm/slab.h
+@@ -136,11 +136,8 @@ static inline void memcg_bind_pages(struct kmem_cache *s, int order)
+ 
+ static inline void memcg_release_pages(struct kmem_cache *s, int order)
+ {
+-	if (is_root_cache(s))
+-		return;
+-
+-	if (atomic_sub_and_test((1 << order), &s->memcg_params->nr_pages))
+-		mem_cgroup_destroy_cache(s);
++	if (!is_root_cache(s))
++		atomic_sub(1 << order, &s->memcg_params->nr_pages);
+ }
+ 
+ static inline bool slab_equal_or_root(struct kmem_cache *s,
