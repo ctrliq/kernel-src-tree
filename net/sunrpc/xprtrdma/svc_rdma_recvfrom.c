@@ -655,6 +655,8 @@ int svc_rdma_recvfrom(struct svc_rqst *rqstp)
 	ret = svc_rdma_xdr_decode_req(rmsgp, rqstp);
 	if (ret < 0)
 		goto out_err;
+	if (ret == 0)
+		goto out_drop;
 	rqstp->rq_xprt_hlen = ret;
 
 	if (svc_rdma_is_backchannel_reply(xprt, rmsgp)) {
@@ -708,6 +710,8 @@ out_err:
 defer:
 	return 0;
 
+out_drop:
+	svc_rdma_put_context(ctxt, 1);
 repost:
 	return svc_rdma_repost_recv(rdma_xprt, GFP_KERNEL);
 }
