@@ -1,0 +1,176 @@
+sched/preempt, locking: Rework local_bh_{dis,en}able()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [kernel] sched/preempt, locking: Rework local_bh_{dis, en}able() (Lauro Ramos Venancio) [1403356]
+Rebuild_FUZZ: 99.08%
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 0bd3a173d711857fc9f583eb5825386cc08f3948
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/0bd3a173.failed
+
+Currently local_bh_disable() is out-of-line for no apparent reason.
+So inline it to save a few cycles on call/return nonsense, the
+function body is a single add on x86 (a few loads and store extra on
+load/store archs).
+
+Also expose two new local_bh functions:
+
+  __local_bh_{dis,en}able_ip(unsigned long ip, unsigned int cnt);
+
+Which implement the actual local_bh_{dis,en}able() behaviour.
+
+The next patch uses the exposed @cnt argument to optimize bh lock
+functions.
+
+With build fixes from Jacob Pan.
+
+	Cc: rjw@rjwysocki.net
+	Cc: rui.zhang@intel.com
+	Cc: jacob.jun.pan@linux.intel.com
+	Cc: Mike Galbraith <bitbucket@online.de>
+	Cc: hpa@zytor.com
+	Cc: Arjan van de Ven <arjan@linux.intel.com>
+	Cc: lenb@kernel.org
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/20131119151338.GF3694@twins.programming.kicks-ass.net
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 0bd3a173d711857fc9f583eb5825386cc08f3948)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/softirq.c
+diff --cc kernel/softirq.c
+index 1400bd7e3c55,9e368ef35f9a..000000000000
+--- a/kernel/softirq.c
++++ b/kernel/softirq.c
+@@@ -115,29 -114,16 +115,26 @@@ void __local_bh_disable_ip(unsigned lon
+  	if (preempt_count() == cnt)
+  		trace_preempt_off(CALLER_ADDR0, get_parent_ip(CALLER_ADDR1));
+  }
+++<<<<<<< HEAD
+ +#else /* !CONFIG_TRACE_IRQFLAGS */
+ +static inline void __local_bh_disable(unsigned long ip, unsigned int cnt)
+ +{
+ +	add_preempt_count(cnt);
+ +	barrier();
+ +}
+++=======
++ EXPORT_SYMBOL(__local_bh_disable_ip);
+++>>>>>>> 0bd3a173d711 (sched/preempt, locking: Rework local_bh_{dis,en}able())
+  #endif /* CONFIG_TRACE_IRQFLAGS */
+  
+- void local_bh_disable(void)
+- {
+- 	__local_bh_disable(_RET_IP_, SOFTIRQ_DISABLE_OFFSET);
+- }
+- 
+- EXPORT_SYMBOL(local_bh_disable);
+- 
+  static void __local_bh_enable(unsigned int cnt)
+  {
+ +	WARN_ON_ONCE(in_irq());
+  	WARN_ON_ONCE(!irqs_disabled());
+  
+ -	if (softirq_count() == (cnt & SOFTIRQ_MASK))
+ +	if (softirq_count() == cnt)
+  		trace_softirqs_on(_RET_IP_);
+ -	preempt_count_sub(cnt);
+ +	sub_preempt_count(cnt);
+  }
+  
+  /*
+@@@ -167,12 -154,17 +164,16 @@@ void __local_bh_enable_ip(unsigned lon
+  	 * Keep preemption disabled until we are done with
+  	 * softirq processing:
+   	 */
+++<<<<<<< HEAD
+ +	sub_preempt_count(SOFTIRQ_DISABLE_OFFSET - 1);
+++=======
++ 	preempt_count_sub(cnt - 1);
+++>>>>>>> 0bd3a173d711 (sched/preempt, locking: Rework local_bh_{dis,en}able())
+  
+ -	if (unlikely(!in_interrupt() && local_softirq_pending())) {
+ -		/*
+ -		 * Run softirq if any pending. And do it in its own stack
+ -		 * as we may be calling this deep in a task call stack already.
+ -		 */
+ +	if (unlikely(!in_interrupt() && local_softirq_pending()))
+  		do_softirq();
+ -	}
+  
+ -	preempt_count_dec();
+ +	dec_preempt_count();
+  #ifdef CONFIG_TRACE_IRQFLAGS
+  	local_irq_enable();
+  #endif
+diff --git a/include/linux/bottom_half.h b/include/linux/bottom_half.h
+index 27b1bcffe408..86c12c93e3cf 100644
+--- a/include/linux/bottom_half.h
++++ b/include/linux/bottom_half.h
+@@ -1,9 +1,35 @@
+ #ifndef _LINUX_BH_H
+ #define _LINUX_BH_H
+ 
+-extern void local_bh_disable(void);
++#include <linux/preempt.h>
++#include <linux/preempt_mask.h>
++
++#ifdef CONFIG_TRACE_IRQFLAGS
++extern void __local_bh_disable_ip(unsigned long ip, unsigned int cnt);
++#else
++static __always_inline void __local_bh_disable_ip(unsigned long ip, unsigned int cnt)
++{
++	preempt_count_add(cnt);
++	barrier();
++}
++#endif
++
++static inline void local_bh_disable(void)
++{
++	__local_bh_disable_ip(_THIS_IP_, SOFTIRQ_DISABLE_OFFSET);
++}
++
+ extern void _local_bh_enable(void);
+-extern void local_bh_enable(void);
+-extern void local_bh_enable_ip(unsigned long ip);
++extern void __local_bh_enable_ip(unsigned long ip, unsigned int cnt);
++
++static inline void local_bh_enable_ip(unsigned long ip)
++{
++	__local_bh_enable_ip(ip, SOFTIRQ_DISABLE_OFFSET);
++}
++
++static inline void local_bh_enable(void)
++{
++	__local_bh_enable_ip(_THIS_IP_, SOFTIRQ_DISABLE_OFFSET);
++}
+ 
+ #endif /* _LINUX_BH_H */
+diff --git a/include/linux/hardirq.h b/include/linux/hardirq.h
+index 131bbd790b0e..39e166d63b50 100644
+--- a/include/linux/hardirq.h
++++ b/include/linux/hardirq.h
+@@ -5,6 +5,7 @@
+ #include <linux/lockdep.h>
+ #include <linux/ftrace_irq.h>
+ #include <linux/vtime.h>
++#include <asm/hardirq.h>
+ 
+ 
+ #if defined(CONFIG_SMP) || defined(CONFIG_GENERIC_HARDIRQS)
+diff --git a/include/linux/preempt_mask.h b/include/linux/preempt_mask.h
+index 931bc616219f..b681556620c8 100644
+--- a/include/linux/preempt_mask.h
++++ b/include/linux/preempt_mask.h
+@@ -2,7 +2,6 @@
+ #define LINUX_PREEMPT_MASK_H
+ 
+ #include <linux/preempt.h>
+-#include <asm/hardirq.h>
+ 
+ /*
+  * We put the hardirq and softirq counter into the preemption
+* Unmerged path kernel/softirq.c
