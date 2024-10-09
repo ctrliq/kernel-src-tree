@@ -1,0 +1,165 @@
+nvme-pci: consistencly use ctrl->device for logging
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [nvme] pci: consistencly use ctrl->device for logging (David Milburn) [1457880 1456486 1454365]
+Rebuild_FUZZ: 94.85%
+commit-author Christoph Hellwig <hch@lst.de>
+commit 9bdcfb10f221e796c9619fe48655e0f1272f1d92
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/9bdcfb10.failed
+
+This is what most of the code already does and gives much more useful
+prefixes than the device embedded in the pci_dev.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Keith Busch <keith.busch@intel.com>
+(cherry picked from commit 9bdcfb10f221e796c9619fe48655e0f1272f1d92)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/pci.c
+diff --cc drivers/nvme/host/pci.c
+index 98f199a372c5,bf8bec39c017..000000000000
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@@ -169,6 -189,112 +169,115 @@@ static inline void _nvme_check_size(voi
+  	BUILD_BUG_ON(sizeof(struct nvme_id_ns) != 4096);
+  	BUILD_BUG_ON(sizeof(struct nvme_lba_range_type) != 64);
+  	BUILD_BUG_ON(sizeof(struct nvme_smart_log) != 512);
+++<<<<<<< HEAD
+++=======
++ 	BUILD_BUG_ON(sizeof(struct nvme_dbbuf) != 64);
++ }
++ 
++ static inline unsigned int nvme_dbbuf_size(u32 stride)
++ {
++ 	return ((num_possible_cpus() + 1) * 8 * stride);
++ }
++ 
++ static int nvme_dbbuf_dma_alloc(struct nvme_dev *dev)
++ {
++ 	unsigned int mem_size = nvme_dbbuf_size(dev->db_stride);
++ 
++ 	if (dev->dbbuf_dbs)
++ 		return 0;
++ 
++ 	dev->dbbuf_dbs = dma_alloc_coherent(dev->dev, mem_size,
++ 					    &dev->dbbuf_dbs_dma_addr,
++ 					    GFP_KERNEL);
++ 	if (!dev->dbbuf_dbs)
++ 		return -ENOMEM;
++ 	dev->dbbuf_eis = dma_alloc_coherent(dev->dev, mem_size,
++ 					    &dev->dbbuf_eis_dma_addr,
++ 					    GFP_KERNEL);
++ 	if (!dev->dbbuf_eis) {
++ 		dma_free_coherent(dev->dev, mem_size,
++ 				  dev->dbbuf_dbs, dev->dbbuf_dbs_dma_addr);
++ 		dev->dbbuf_dbs = NULL;
++ 		return -ENOMEM;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void nvme_dbbuf_dma_free(struct nvme_dev *dev)
++ {
++ 	unsigned int mem_size = nvme_dbbuf_size(dev->db_stride);
++ 
++ 	if (dev->dbbuf_dbs) {
++ 		dma_free_coherent(dev->dev, mem_size,
++ 				  dev->dbbuf_dbs, dev->dbbuf_dbs_dma_addr);
++ 		dev->dbbuf_dbs = NULL;
++ 	}
++ 	if (dev->dbbuf_eis) {
++ 		dma_free_coherent(dev->dev, mem_size,
++ 				  dev->dbbuf_eis, dev->dbbuf_eis_dma_addr);
++ 		dev->dbbuf_eis = NULL;
++ 	}
++ }
++ 
++ static void nvme_dbbuf_init(struct nvme_dev *dev,
++ 			    struct nvme_queue *nvmeq, int qid)
++ {
++ 	if (!dev->dbbuf_dbs || !qid)
++ 		return;
++ 
++ 	nvmeq->dbbuf_sq_db = &dev->dbbuf_dbs[sq_idx(qid, dev->db_stride)];
++ 	nvmeq->dbbuf_cq_db = &dev->dbbuf_dbs[cq_idx(qid, dev->db_stride)];
++ 	nvmeq->dbbuf_sq_ei = &dev->dbbuf_eis[sq_idx(qid, dev->db_stride)];
++ 	nvmeq->dbbuf_cq_ei = &dev->dbbuf_eis[cq_idx(qid, dev->db_stride)];
++ }
++ 
++ static void nvme_dbbuf_set(struct nvme_dev *dev)
++ {
++ 	struct nvme_command c;
++ 
++ 	if (!dev->dbbuf_dbs)
++ 		return;
++ 
++ 	memset(&c, 0, sizeof(c));
++ 	c.dbbuf.opcode = nvme_admin_dbbuf;
++ 	c.dbbuf.prp1 = cpu_to_le64(dev->dbbuf_dbs_dma_addr);
++ 	c.dbbuf.prp2 = cpu_to_le64(dev->dbbuf_eis_dma_addr);
++ 
++ 	if (nvme_submit_sync_cmd(dev->ctrl.admin_q, &c, NULL, 0)) {
++ 		dev_warn(dev->ctrl.device, "unable to set dbbuf\n");
++ 		/* Free memory and continue on */
++ 		nvme_dbbuf_dma_free(dev);
++ 	}
++ }
++ 
++ static inline int nvme_dbbuf_need_event(u16 event_idx, u16 new_idx, u16 old)
++ {
++ 	return (u16)(new_idx - event_idx - 1) < (u16)(new_idx - old);
++ }
++ 
++ /* Update dbbuf and return true if an MMIO is required */
++ static bool nvme_dbbuf_update_and_check_event(u16 value, u32 *dbbuf_db,
++ 					      volatile u32 *dbbuf_ei)
++ {
++ 	if (dbbuf_db) {
++ 		u16 old_value;
++ 
++ 		/*
++ 		 * Ensure that the queue is written before updating
++ 		 * the doorbell in memory
++ 		 */
++ 		wmb();
++ 
++ 		old_value = *dbbuf_db;
++ 		*dbbuf_db = value;
++ 
++ 		if (!nvme_dbbuf_need_event(*dbbuf_ei, value, old_value))
++ 			return false;
++ 	}
++ 
++ 	return true;
+++>>>>>>> 9bdcfb10f221 (nvme-pci: consistencly use ctrl->device for logging)
+  }
+  
+  /*
+@@@ -1521,6 -1733,18 +1630,21 @@@ static int nvme_pci_enable(struct nvme_
+  	dev->q_depth = min_t(int, NVME_CAP_MQES(cap) + 1, NVME_Q_DEPTH);
+  	dev->db_stride = 1 << NVME_CAP_STRIDE(cap);
+  	dev->dbs = dev->bar + 4096;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/*
++ 	 * Temporary fix for the Apple controller found in the MacBook8,1 and
++ 	 * some MacBook7,1 to avoid controller resets and data loss.
++ 	 */
++ 	if (pdev->vendor == PCI_VENDOR_ID_APPLE && pdev->device == 0x2001) {
++ 		dev->q_depth = 2;
++ 		dev_warn(dev->ctrl.device, "detected Apple NVMe controller, "
++ 			"set queue depth=%u to work around controller resets\n",
++ 			dev->q_depth);
++ 	}
++ 
+++>>>>>>> 9bdcfb10f221 (nvme-pci: consistencly use ctrl->device for logging)
+  	/*
+  	 * CMBs can currently only exist on >=1.2 PCIe devices. We only
+  	 * populate sysfs if a CMB is implemented. Note that we add the
+* Unmerged path drivers/nvme/host/pci.c
