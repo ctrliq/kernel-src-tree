@@ -1980,17 +1980,17 @@ static inline void update_tsk_thread_flag(struct task_struct *tsk, int flag,
 	update_ti_thread_flag(task_thread_info(tsk), flag, value);
 }
 
-static inline bool test_and_set_tsk_thread_flag(struct task_struct *tsk, int flag)
+static inline int test_and_set_tsk_thread_flag(struct task_struct *tsk, int flag)
 {
 	return test_and_set_ti_thread_flag(task_thread_info(tsk), flag);
 }
 
-static inline bool test_and_clear_tsk_thread_flag(struct task_struct *tsk, int flag)
+static inline int test_and_clear_tsk_thread_flag(struct task_struct *tsk, int flag)
 {
 	return test_and_clear_ti_thread_flag(task_thread_info(tsk), flag);
 }
 
-static inline bool test_tsk_thread_flag(struct task_struct *tsk, int flag)
+static inline int test_tsk_thread_flag(struct task_struct *tsk, int flag)
 {
 	return test_ti_thread_flag(task_thread_info(tsk), flag);
 }
@@ -2002,12 +2002,11 @@ static inline void set_tsk_need_resched(struct task_struct *tsk)
 
 static inline void clear_tsk_need_resched(struct task_struct *tsk)
 {
-	clear_tsk_thread_flag(tsk,TIF_NEED_RESCHED);
-	if (IS_ENABLED(CONFIG_PREEMPT_BUILD_AUTO))
-		clear_tsk_thread_flag(tsk, TIF_NEED_RESCHED_LAZY);
+	atomic_long_andnot(_TIF_NEED_RESCHED | _TIF_NEED_RESCHED_LAZY,
+			   (atomic_long_t *)&task_thread_info(tsk)->flags);
 }
 
-static inline bool test_tsk_need_resched(struct task_struct *tsk)
+static inline int test_tsk_need_resched(struct task_struct *tsk)
 {
 	return unlikely(test_tsk_thread_flag(tsk,TIF_NEED_RESCHED));
 }
@@ -2107,7 +2106,7 @@ extern int __cond_resched_rwlock_write(rwlock_t *lock);
 
 static __always_inline bool need_resched(void)
 {
-	return unlikely(tif_need_resched_lazy() || tif_need_resched());
+	return unlikely(tif_need_resched());
 }
 
 /*
