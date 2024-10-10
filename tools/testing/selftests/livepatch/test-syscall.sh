@@ -36,7 +36,7 @@ done
 disable_lp $MOD_SYSCALL
 unload_lp $MOD_SYSCALL
 
-check_result "% insmod $MOD_SYSCALL.ko klp_pids=$pid_list
+check_result "% modprobe $MOD_SYSCALL klp_pids=$pid_list
 livepatch: enabling patch '$MOD_SYSCALL'
 livepatch: '$MOD_SYSCALL': initializing patching transition
 livepatch: '$MOD_SYSCALL': starting patching transition
