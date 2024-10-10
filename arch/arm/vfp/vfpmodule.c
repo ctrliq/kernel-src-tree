@@ -58,7 +58,7 @@ union vfp_state *vfp_current_hw_state[NR_CPUS];
 /*
  * Claim ownership of the VFP unit.
  *
- * The caller may change VFP registers until vfp_unlock() is called.
+ * The caller may change VFP registers until vfp_state_release() is called.
  *
  * local_bh_disable() is used to disable preemption and to disable VFP
  * processing in softirq context. On PREEMPT_RT kernels local_bh_disable() is
@@ -67,7 +67,7 @@ union vfp_state *vfp_current_hw_state[NR_CPUS];
  * choice here as bottom half processing is always in thread context on RT
  * kernels so it implicitly prevents bottom half processing as well.
  */
-static void vfp_lock(void)
+static void vfp_state_hold(void)
 {
 	if (!IS_ENABLED(CONFIG_PREEMPT_RT))
 		local_bh_disable();
@@ -75,7 +75,7 @@ static void vfp_lock(void)
 		preempt_disable();
 }
 
-static void vfp_unlock(void)
+static void vfp_state_release(void)
 {
 	if (!IS_ENABLED(CONFIG_PREEMPT_RT))
 		local_bh_enable();
@@ -443,7 +443,7 @@ static void VFP_bounce(u32 trigger, u32 fpexc, struct pt_regs *regs)
 	if (exceptions)
 		si_code = vfp_raise_exceptions(exceptions, trigger, orig_fpscr);
 exit:
-	vfp_unlock();
+	vfp_state_release();
 	if (si_code2)
 		vfp_raise_sigfpe(si_code2, regs);
 	if (si_code)
@@ -546,7 +546,7 @@ static inline void vfp_pm_init(void) { }
  */
 void vfp_sync_hwstate(struct thread_info *thread)
 {
-	vfp_lock();
+	vfp_state_hold();
 
 	if (vfp_state_in_hw(raw_smp_processor_id(), thread)) {
 		u32 fpexc = fmrx(FPEXC);
@@ -559,7 +559,7 @@ void vfp_sync_hwstate(struct thread_info *thread)
 		fmxr(FPEXC, fpexc);
 	}
 
-	vfp_unlock();
+	vfp_state_release();
 }
 
 /* Ensure that the thread reloads the hardware VFP state on the next use. */
@@ -714,7 +714,7 @@ static int vfp_support_entry(struct pt_regs *regs, u32 trigger)
 	if (!user_mode(regs))
 		return vfp_kmode_exception(regs, trigger);
 
-	vfp_lock();
+	vfp_state_hold();
 	fpexc = fmrx(FPEXC);
 
 	/*
@@ -779,7 +779,7 @@ static int vfp_support_entry(struct pt_regs *regs, u32 trigger)
 		 * replay the instruction that trapped.
 		 */
 		fmxr(FPEXC, fpexc);
-		vfp_unlock();
+		vfp_state_release();
 	} else {
 		/* Check for synchronous or asynchronous exceptions */
 		if (!(fpexc & (FPEXC_EX | FPEXC_DEX))) {
@@ -794,14 +794,14 @@ static int vfp_support_entry(struct pt_regs *regs, u32 trigger)
 			if (!(fpscr & FPSCR_IXE)) {
 				if (!(fpscr & FPSCR_LENGTH_MASK)) {
 					pr_debug("not VFP\n");
-					vfp_unlock();
+					vfp_state_release();
 					return -ENOEXEC;
 				}
 				fpexc |= FPEXC_DEX;
 			}
 		}
 bounce:		regs->ARM_pc += 4;
-		/* VFP_bounce() will invoke vfp_unlock() */
+		/* VFP_bounce() will invoke vfp_state_release() */
 		VFP_bounce(trigger, fpexc, regs);
 	}
 
@@ -869,7 +869,7 @@ void kernel_neon_begin(void)
 	unsigned int cpu;
 	u32 fpexc;
 
-	vfp_lock();
+	vfp_state_hold();
 
 	/*
 	 * Kernel mode NEON is only allowed outside of hardirq context with
@@ -900,7 +900,7 @@ void kernel_neon_end(void)
 {
 	/* Disable the NEON/VFP unit. */
 	fmxr(FPEXC, fmrx(FPEXC) & ~FPEXC_EN);
-	vfp_unlock();
+	vfp_state_release();
 }
 EXPORT_SYMBOL(kernel_neon_end);
 
