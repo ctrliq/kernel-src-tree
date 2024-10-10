@@ -28,6 +28,8 @@
 #define IOMMU_PAGE_MASK(tblptr) (~((1 << (tblptr)->it_page_shift) - 1))
 #define IOMMU_PAGE_ALIGN(addr, tblptr) ALIGN(addr, IOMMU_PAGE_SIZE(tblptr))
 
+#define	MIN_DDW_VPMEM_DMA_WINDOW	SZ_2G
+
 /* Boot time flags */
 extern int iommu_is_off;
 extern int iommu_force_on;
