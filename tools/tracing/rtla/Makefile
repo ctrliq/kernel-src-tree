@@ -64,7 +64,7 @@ DOCSRC	=	$(SRCTREE)/../../../Documentation/tools/rtla/
 endif
 
 LIBTRACEEVENT_MIN_VERSION = 1.5
-LIBTRACEFS_MIN_VERSION = 1.3
+LIBTRACEFS_MIN_VERSION = 1.6
 
 .PHONY:	all warnings show_warnings
 all:	warnings rtla

@@ -42,6 +42,7 @@ struct osnoise_top_params {
 	int			hk_cpus;
 	int			warmup;
 	int			pretty_output;
+	int			buffer_size;
 	cpu_set_t		hk_cpu_set;
 	struct sched_attr	sched_param;
 	struct trace_events	*events;
@@ -317,6 +318,7 @@ static void osnoise_top_usage(struct osnoise_top_params *params, char *usage)
 		"		d:runtime[us|ms|s]:period[us|ms|s] - use SCHED_DEADLINE with runtime and period",
 		"						       in nanoseconds",
 		"	     --warm-up s: let the workload run for s seconds before collecting data",
+		"	     --trace-buffer-size kB: set the per-cpu trace buffer size in kB",
 		NULL,
 	};
 
@@ -392,13 +394,14 @@ struct osnoise_top_params *osnoise_top_parse_args(int argc, char **argv)
 			{"trigger",		required_argument,	0, '0'},
 			{"filter",		required_argument,	0, '1'},
 			{"warm-up",		required_argument,	0, '2'},
+			{"trace-buffer-size",	required_argument,	0, '3'},
 			{0, 0, 0, 0}
 		};
 
 		/* getopt_long stores the option index here. */
 		int option_index = 0;
 
-		c = getopt_long(argc, argv, "a:c:C::d:De:hH:p:P:qr:s:S:t::T:0:1:2:",
+		c = getopt_long(argc, argv, "a:c:C::d:De:hH:p:P:qr:s:S:t::T:0:1:2:3:",
 				 long_options, &option_index);
 
 		/* Detect the end of the options. */
@@ -528,6 +531,9 @@ struct osnoise_top_params *osnoise_top_parse_args(int argc, char **argv)
 			break;
 		case '2':
 			params->warmup = get_llong_from_str(optarg);
+			break;
+		case '3':
+			params->buffer_size = get_llong_from_str(optarg);
 			break;
 		default:
 			osnoise_top_usage(params, "Invalid option");
@@ -737,6 +743,12 @@ int osnoise_top_main(int argc, char **argv)
 
 		if (params->events) {
 			retval = trace_events_enable(&record->trace, params->events);
+			if (retval)
+				goto out_top;
+		}
+
+		if (params->buffer_size > 0) {
+			retval = trace_set_buffer_size(&record->trace, params->buffer_size);
 			if (retval)
 				goto out_top;
 		}
