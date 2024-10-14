@@ -7,6 +7,12 @@
 
 set -e
 
+# This script requires the `gitlab` command to locate `Include in Releases` content.
+if ! command -v gitlab > /dev/null 2>&1 ; then
+	echo "Required command 'gitlab' (from python-gitlab package) not present."
+	exit 1
+fi
+
 # source common CI functions and variables
 # shellcheck disable=SC1091
 . "$(dirname "$0")"/ark-ci-env.sh
