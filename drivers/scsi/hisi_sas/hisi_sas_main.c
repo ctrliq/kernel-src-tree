@@ -2490,7 +2490,8 @@ int hisi_sas_alloc(struct hisi_hba *hisi_hba)
 	hisi_sas_slot_index_init(hisi_hba);
 	hisi_hba->last_slot_index = HISI_SAS_UNRESERVED_IPTT;
 
-	hisi_hba->wq = create_singlethread_workqueue(dev_name(dev));
+	hisi_hba->wq =
+		alloc_ordered_workqueue("%s", WQ_MEM_RECLAIM, dev_name(dev));
 	if (!hisi_hba->wq) {
 		dev_err(dev, "sas_alloc: failed to create workqueue\n");
 		goto err_out;
