@@ -1827,6 +1827,21 @@ static void bnxt_deliver_skb(struct bnxt *bp, struct bnxt_napi *bnapi,
 	napi_gro_receive(&bnapi->napi, skb);
 }
 
+static bool bnxt_rx_ts_valid(struct bnxt *bp, u32 flags,
+			     struct rx_cmp_ext *rxcmp1, u32 *cmpl_ts)
+{
+	u32 ts = le32_to_cpu(rxcmp1->rx_cmp_timestamp);
+
+	if (BNXT_PTP_RX_TS_VALID(flags))
+		goto ts_valid;
+	if (!bp->ptp_all_rx_tstamp || !ts || !BNXT_ALL_RX_TS_VALID(flags))
+		return false;
+
+ts_valid:
+	*cmpl_ts = ts;
+	return true;
+}
+
 static struct sk_buff *bnxt_rx_vlan(struct sk_buff *skb, u8 cmp_type,
 				    struct rx_cmp *rxcmp,
 				    struct rx_cmp_ext *rxcmp1)
@@ -1883,21 +1898,6 @@ static enum pkt_hash_types bnxt_rss_ext_op(struct bnxt *bp,
 	default:
 		return PKT_HASH_TYPE_L3;
 	}
-}
-
-static bool bnxt_rx_ts_valid(struct bnxt *bp, u32 flags,
-			     struct rx_cmp_ext *rxcmp1, u32 *cmpl_ts)
-{
-	u32 ts = le32_to_cpu(rxcmp1->rx_cmp_timestamp);
-
-	if (BNXT_PTP_RX_TS_VALID(flags))
-		goto ts_valid;
-	if (!bp->ptp_all_rx_tstamp || !ts || !BNXT_ALL_RX_TS_VALID(flags))
-		return false;
-
-ts_valid:
-	*cmpl_ts = ts;
-	return true;
 }
 
 /* returns the following:
