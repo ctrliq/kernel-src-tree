@@ -42,6 +42,7 @@
 #include "xfs_xattr.h"
 #include "xfs_iunlink_item.h"
 #include "xfs_dahash_test.h"
+#include "scrub/stats.h"
 
 #include <linux/magic.h>
 #include <linux/fs_context.h>
@@ -1149,6 +1150,7 @@ xfs_fs_put_super(
 	xfs_unmountfs(mp);
 
 	xfs_freesb(mp);
+	xchk_mount_stats_free(mp);
 	free_percpu(mp->m_stats.xs_stats);
 	xfs_inodegc_free_percpu(mp);
 	xfs_destroy_percpu_counters(mp);
@@ -1565,9 +1567,13 @@ xfs_fs_fill_super(
 		goto out_destroy_inodegc;
 	}
 
-	error = xfs_readsb(mp, flags);
+	error = xchk_mount_stats_alloc(mp);
 	if (error)
 		goto out_free_stats;
+
+	error = xfs_readsb(mp, flags);
+	if (error)
+		goto out_free_scrub_stats;
 
 	error = xfs_finish_flags(mp);
 	if (error)
@@ -1746,6 +1752,8 @@ xfs_fs_fill_super(
 	xfs_filestream_unmount(mp);
  out_free_sb:
 	xfs_freesb(mp);
+ out_free_scrub_stats:
+	xchk_mount_stats_free(mp);
  out_free_stats:
 	free_percpu(mp->m_stats.xs_stats);
  out_destroy_inodegc:
@@ -2350,11 +2358,15 @@ init_xfs_fs(void)
 	if (error)
 		goto out_free_stats;
 
+	error = xchk_global_stats_setup(xfs_debugfs);
+	if (error)
+		goto out_remove_stats_kobj;
+
 #ifdef DEBUG
 	xfs_dbg_kobj.kobject.kset = xfs_kset;
 	error = xfs_sysfs_init(&xfs_dbg_kobj, &xfs_dbg_ktype, NULL, "debug");
 	if (error)
-		goto out_remove_stats_kobj;
+		goto out_remove_scrub_stats;
 #endif
 
 	error = xfs_qm_init();
@@ -2371,8 +2383,10 @@ init_xfs_fs(void)
  out_remove_dbg_kobj:
 #ifdef DEBUG
 	xfs_sysfs_del(&xfs_dbg_kobj);
- out_remove_stats_kobj:
+ out_remove_scrub_stats:
 #endif
+	xchk_global_stats_teardown();
+ out_remove_stats_kobj:
 	xfs_sysfs_del(&xfsstats.xs_kobj);
  out_free_stats:
 	free_percpu(xfsstats.xs_stats);
@@ -2401,6 +2415,7 @@ exit_xfs_fs(void)
 #ifdef DEBUG
 	xfs_sysfs_del(&xfs_dbg_kobj);
 #endif
+	xchk_global_stats_teardown();
 	xfs_sysfs_del(&xfsstats.xs_kobj);
 	free_percpu(xfsstats.xs_stats);
 	kset_unregister(xfs_kset);
