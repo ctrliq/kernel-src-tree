@@ -49,6 +49,7 @@
 
 static const struct super_operations xfs_super_operations;
 
+static struct dentry *xfs_debugfs;	/* top-level xfs debugfs dir */
 static struct kset *xfs_kset;		/* top-level xfs sysfs dir */
 #ifdef DEBUG
 static struct xfs_kobj xfs_dbg_kobj;	/* global debug sysfs attrs */
@@ -756,6 +757,8 @@ static void
 xfs_mount_free(
 	struct xfs_mount	*mp)
 {
+	debugfs_remove(mp->m_debugfs);
+
 	/*
 	 * Free the buftargs here because blkdev_put needs to be called outside
 	 * of sb->s_umount, which is held around the call to ->put_super.
@@ -1479,6 +1482,21 @@ xfs_fs_validate_params(
 	return 0;
 }
 
+struct dentry *
+xfs_debugfs_mkdir(
+	const char	*name,
+	struct dentry	*parent)
+{
+	struct dentry	*child;
+
+	/* Apparently we're expected to ignore error returns?? */
+	child = debugfs_create_dir(name, parent);
+	if (IS_ERR(child))
+		return NULL;
+
+	return child;
+}
+
 static int
 xfs_fs_fill_super(
 	struct super_block	*sb,
@@ -1520,6 +1538,13 @@ xfs_fs_fill_super(
 	error = xfs_open_devices(mp);
 	if (error)
 		return error;
+
+	if (xfs_debugfs) {
+		mp->m_debugfs = xfs_debugfs_mkdir(mp->m_super->s_id,
+						  xfs_debugfs);
+	} else {
+		mp->m_debugfs = NULL;
+	}
 
 	error = xfs_init_mount_workqueues(mp);
 	if (error)
@@ -2304,10 +2329,12 @@ init_xfs_fs(void)
 	if (error)
 		goto out_cleanup_procfs;
 
+	xfs_debugfs = xfs_debugfs_mkdir("xfs", NULL);
+
 	xfs_kset = kset_create_and_add("xfs", NULL, fs_kobj);
 	if (!xfs_kset) {
 		error = -ENOMEM;
-		goto out_sysctl_unregister;
+		goto out_debugfs_unregister;
 	}
 
 	xfsstats.xs_kobj.kobject.kset = xfs_kset;
@@ -2351,7 +2378,8 @@ init_xfs_fs(void)
 	free_percpu(xfsstats.xs_stats);
  out_kset_unregister:
 	kset_unregister(xfs_kset);
- out_sysctl_unregister:
+ out_debugfs_unregister:
+	debugfs_remove(xfs_debugfs);
 	xfs_sysctl_unregister();
  out_cleanup_procfs:
 	xfs_cleanup_procfs();
@@ -2376,6 +2404,7 @@ exit_xfs_fs(void)
 	xfs_sysfs_del(&xfsstats.xs_kobj);
 	free_percpu(xfsstats.xs_stats);
 	kset_unregister(xfs_kset);
+	debugfs_remove(xfs_debugfs);
 	xfs_sysctl_unregister();
 	xfs_cleanup_procfs();
 	xfs_mru_cache_uninit();
