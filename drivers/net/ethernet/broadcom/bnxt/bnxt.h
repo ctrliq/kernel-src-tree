@@ -2304,6 +2304,7 @@ struct bnxt {
 
 	struct bnxt_irq	*irq_tbl;
 	int			total_irqs;
+	int			ulp_num_msix_want;
 	u8			mac_addr[ETH_ALEN];
 
 #ifdef CONFIG_BNXT_DCB
