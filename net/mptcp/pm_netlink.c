@@ -17,6 +17,7 @@
 
 #include "protocol.h"
 #include "mib.h"
+#include "mptcp_pm_gen.h"
 
 /* forward declaration */
 static struct genl_family mptcp_genl_family;
