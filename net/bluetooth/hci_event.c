@@ -1,7 +1,7 @@
 /*
    BlueZ - Bluetooth protocol stack for Linux
    Copyright (c) 2000-2001, 2010, Code Aurora Forum. All rights reserved.
-   Copyright 2023 NXP
+   Copyright 2023-2024 NXP
 
    Written 2000,2001 by Maxim Krasnyansky <maxk@qualcomm.com>
 
@@ -943,6 +943,9 @@ static u8 hci_cc_read_buffer_size(struct hci_dev *hdev, void *data,
 	BT_DBG("%s acl mtu %d:%d sco mtu %d:%d", hdev->name, hdev->acl_mtu,
 	       hdev->acl_pkts, hdev->sco_mtu, hdev->sco_pkts);
 
+	if (!hdev->acl_mtu || !hdev->acl_pkts)
+		return HCI_ERROR_INVALID_PARAMETERS;
+
 	return rp->status;
 }
 
@@ -1205,6 +1208,9 @@ static u8 hci_cc_le_read_buffer_size(struct hci_dev *hdev, void *data,
 	hdev->le_cnt = hdev->le_pkts;
 
 	BT_DBG("%s le mtu %d:%d", hdev->name, hdev->le_mtu, hdev->le_pkts);
+
+	if (hdev->le_mtu && hdev->le_mtu < HCI_MIN_LE_MTU)
+		return HCI_ERROR_INVALID_PARAMETERS;
 
 	return rp->status;
 }
@@ -2290,8 +2296,8 @@ static void hci_cs_create_conn(struct hci_dev *hdev, __u8 status)
 		if (!conn) {
 			conn = hci_conn_add_unset(hdev, ACL_LINK, &cp->bdaddr,
 						  HCI_ROLE_MASTER);
-			if (!conn)
-				bt_dev_err(hdev, "no memory for new connection");
+			if (IS_ERR(conn))
+				bt_dev_err(hdev, "connection err: %ld", PTR_ERR(conn));
 		}
 	}
 
@@ -2463,9 +2469,7 @@ static void hci_check_pending_name(struct hci_dev *hdev, struct hci_conn *conn,
 	 * Only those in BT_CONFIG or BT_CONNECTED states can be
 	 * considered connected.
 	 */
-	if (conn &&
-	    (conn->state == BT_CONFIG || conn->state == BT_CONNECTED) &&
-	    !test_and_set_bit(HCI_CONN_MGMT_CONNECTED, &conn->flags))
+	if (conn && (conn->state == BT_CONFIG || conn->state == BT_CONNECTED))
 		mgmt_device_connected(hdev, conn, name, name_len);
 
 	if (discov->state == DISCOVERY_STOPPED)
@@ -3106,8 +3110,8 @@ static void hci_conn_complete_evt(struct hci_dev *hdev, void *data,
 						      BDADDR_BREDR)) {
 			conn = hci_conn_add_unset(hdev, ev->link_type,
 						  &ev->bdaddr, HCI_ROLE_SLAVE);
-			if (!conn) {
-				bt_dev_err(hdev, "no memory for new conn");
+			if (IS_ERR(conn)) {
+				bt_dev_err(hdev, "connection err: %ld", PTR_ERR(conn));
 				goto unlock;
 			}
 		} else {
@@ -3272,8 +3276,8 @@ static void hci_conn_request_evt(struct hci_dev *hdev, void *data,
 	if (!conn) {
 		conn = hci_conn_add_unset(hdev, ev->link_type, &ev->bdaddr,
 					  HCI_ROLE_SLAVE);
-		if (!conn) {
-			bt_dev_err(hdev, "no memory for new connection");
+		if (IS_ERR(conn)) {
+			bt_dev_err(hdev, "connection err: %ld", PTR_ERR(conn));
 			goto unlock;
 		}
 	}
@@ -3699,8 +3703,9 @@ static void hci_remote_features_evt(struct hci_dev *hdev, void *data,
 		bacpy(&cp.bdaddr, &conn->dst);
 		cp.pscan_rep_mode = 0x02;
 		hci_send_cmd(hdev, HCI_OP_REMOTE_NAME_REQ, sizeof(cp), &cp);
-	} else if (!test_and_set_bit(HCI_CONN_MGMT_CONNECTED, &conn->flags))
+	} else {
 		mgmt_device_connected(hdev, conn, NULL, 0);
+	}
 
 	if (!hci_outgoing_auth_needed(hdev, conn)) {
 		conn->state = BT_CONNECTED;
@@ -3750,6 +3755,9 @@ static u8 hci_cc_le_read_buffer_size_v2(struct hci_dev *hdev, void *data,
 
 	BT_DBG("%s acl mtu %d:%d iso mtu %d:%d", hdev->name, hdev->acl_mtu,
 	       hdev->acl_pkts, hdev->iso_mtu, hdev->iso_pkts);
+
+	if (hdev->le_mtu && hdev->le_mtu < HCI_MIN_LE_MTU)
+		return HCI_ERROR_INVALID_PARAMETERS;
 
 	return rp->status;
 }
@@ -3873,6 +3881,11 @@ static u8 hci_cc_le_setup_iso_path(struct hci_dev *hdev, void *data,
 		 * last.
 		 */
 		hci_connect_cfm(conn, rp->status);
+
+		/* Notify device connected in case it is a BIG Sync */
+		if (!rp->status && test_bit(HCI_CONN_BIG_SYNC, &conn->flags))
+			mgmt_device_connected(hdev, conn, NULL, 0);
+
 		break;
 	}
 
@@ -4864,8 +4877,9 @@ static void hci_remote_ext_features_evt(struct hci_dev *hdev, void *data,
 		bacpy(&cp.bdaddr, &conn->dst);
 		cp.pscan_rep_mode = 0x02;
 		hci_send_cmd(hdev, HCI_OP_REMOTE_NAME_REQ, sizeof(cp), &cp);
-	} else if (!test_and_set_bit(HCI_CONN_MGMT_CONNECTED, &conn->flags))
+	} else {
 		mgmt_device_connected(hdev, conn, NULL, 0);
+	}
 
 	if (!hci_outgoing_auth_needed(hdev, conn)) {
 		conn->state = BT_CONNECTED;
@@ -5609,8 +5623,8 @@ static void le_conn_complete_evt(struct hci_dev *hdev, u8 status,
 			goto unlock;
 
 		conn = hci_conn_add_unset(hdev, LE_LINK, bdaddr, role);
-		if (!conn) {
-			bt_dev_err(hdev, "no memory for new connection");
+		if (IS_ERR(conn)) {
+			bt_dev_err(hdev, "connection err: %ld", PTR_ERR(conn));
 			goto unlock;
 		}
 
@@ -5694,8 +5708,7 @@ static void le_conn_complete_evt(struct hci_dev *hdev, u8 status,
 		goto unlock;
 	}
 
-	if (!test_and_set_bit(HCI_CONN_MGMT_CONNECTED, &conn->flags))
-		mgmt_device_connected(hdev, conn, NULL, 0);
+	mgmt_device_connected(hdev, conn, NULL, 0);
 
 	conn->sec_level = BT_SECURITY_LOW;
 	conn->state = BT_CONFIG;
@@ -6331,14 +6344,16 @@ static void hci_le_pa_sync_estabilished_evt(struct hci_dev *hdev, void *data,
 	if (!(flags & HCI_PROTO_DEFER))
 		goto unlock;
 
+	/* Add connection to indicate PA sync event */
+	pa_sync = hci_conn_add_unset(hdev, ISO_LINK, BDADDR_ANY,
+				     HCI_ROLE_SLAVE);
+
+	if (IS_ERR(pa_sync))
+		goto unlock;
+
+	pa_sync->sync_handle = le16_to_cpu(ev->handle);
+
 	if (ev->status) {
-		/* Add connection to indicate the failed PA sync event */
-		pa_sync = hci_conn_add_unset(hdev, ISO_LINK, BDADDR_ANY,
-					     HCI_ROLE_SLAVE);
-
-		if (!pa_sync)
-			goto unlock;
-
 		set_bit(HCI_CONN_PA_SYNC_FAILED, &pa_sync->flags);
 
 		/* Notify iso layer */
@@ -6355,6 +6370,7 @@ static void hci_le_per_adv_report_evt(struct hci_dev *hdev, void *data,
 	struct hci_ev_le_per_adv_report *ev = data;
 	int mask = hdev->link_mode;
 	__u8 flags = 0;
+	struct hci_conn *pa_sync;
 
 	bt_dev_dbg(hdev, "sync_handle 0x%4.4x", le16_to_cpu(ev->sync_handle));
 
@@ -6362,8 +6378,28 @@ static void hci_le_per_adv_report_evt(struct hci_dev *hdev, void *data,
 
 	mask |= hci_proto_connect_ind(hdev, BDADDR_ANY, ISO_LINK, &flags);
 	if (!(mask & HCI_LM_ACCEPT))
-		hci_le_pa_term_sync(hdev, ev->sync_handle);
+		goto unlock;
 
+	if (!(flags & HCI_PROTO_DEFER))
+		goto unlock;
+
+	pa_sync = hci_conn_hash_lookup_pa_sync_handle
+			(hdev,
+			le16_to_cpu(ev->sync_handle));
+
+	if (!pa_sync)
+		goto unlock;
+
+	if (ev->data_status == LE_PA_DATA_COMPLETE &&
+	    !test_and_set_bit(HCI_CONN_PA_SYNC, &pa_sync->flags)) {
+		/* Notify iso layer */
+		hci_connect_cfm(pa_sync, 0);
+
+		/* Notify MGMT layer */
+		mgmt_device_connected(hdev, pa_sync, NULL, 0);
+	}
+
+unlock:
 	hci_dev_unlock(hdev);
 }
 
@@ -6736,7 +6772,7 @@ static void hci_le_cis_req_evt(struct hci_dev *hdev, void *data,
 	if (!cis) {
 		cis = hci_conn_add(hdev, ISO_LINK, &acl->dst, HCI_ROLE_SLAVE,
 				   cis_handle);
-		if (!cis) {
+		if (IS_ERR(cis)) {
 			hci_le_reject_cis(hdev, ev->cis_handle);
 			goto unlock;
 		}
@@ -6849,7 +6885,7 @@ static void hci_le_big_sync_established_evt(struct hci_dev *hdev, void *data,
 			}
 			bis = hci_conn_add(hdev, ISO_LINK, BDADDR_ANY,
 					   HCI_ROLE_SLAVE, handle);
-			if (!bis)
+			if (IS_ERR(bis))
 				continue;
 		}
 
@@ -6900,10 +6936,8 @@ static void hci_le_big_info_adv_report_evt(struct hci_dev *hdev, void *data,
 	hci_dev_lock(hdev);
 
 	mask |= hci_proto_connect_ind(hdev, BDADDR_ANY, ISO_LINK, &flags);
-	if (!(mask & HCI_LM_ACCEPT)) {
-		hci_le_pa_term_sync(hdev, ev->sync_handle);
+	if (!(mask & HCI_LM_ACCEPT))
 		goto unlock;
-	}
 
 	if (!(flags & HCI_PROTO_DEFER))
 		goto unlock;
@@ -6912,21 +6946,11 @@ static void hci_le_big_info_adv_report_evt(struct hci_dev *hdev, void *data,
 			(hdev,
 			le16_to_cpu(ev->sync_handle));
 
-	if (pa_sync)
-		goto unlock;
-
-	/* Add connection to indicate the PA sync event */
-	pa_sync = hci_conn_add_unset(hdev, ISO_LINK, BDADDR_ANY,
-				     HCI_ROLE_SLAVE);
-
 	if (!pa_sync)
 		goto unlock;
 
-	pa_sync->sync_handle = le16_to_cpu(ev->sync_handle);
-	set_bit(HCI_CONN_PA_SYNC, &pa_sync->flags);
-
 	/* Notify iso layer */
-	hci_connect_cfm(pa_sync, 0x00);
+	hci_connect_cfm(pa_sync, 0);
 
 unlock:
 	hci_dev_unlock(hdev);
