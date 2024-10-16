@@ -187,7 +187,7 @@ void bnxt_ulp_stop(struct bnxt *bp)
 
 		adev = &aux_priv->aux_dev;
 		if (adev->dev.driver) {
-			struct auxiliary_driver *adrv;
+			const struct auxiliary_driver *adrv;
 			pm_message_t pm = {};
 
 			adrv = to_auxiliary_drv(adev->dev.driver);
@@ -215,7 +215,7 @@ void bnxt_ulp_start(struct bnxt *bp, int err)
 
 		adev = &aux_priv->aux_dev;
 		if (adev->dev.driver) {
-			struct auxiliary_driver *adrv;
+			const struct auxiliary_driver *adrv;
 
 			adrv = to_auxiliary_drv(adev->dev.driver);
 			edev->en_state = bp->state;
