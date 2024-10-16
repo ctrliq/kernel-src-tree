@@ -851,9 +851,22 @@ int rtnl_put_cacheinfo(struct sk_buff *skb, struct dst_entry *dst, u32 id,
 }
 EXPORT_SYMBOL_GPL(rtnl_put_cacheinfo);
 
+void netdev_set_operstate(struct net_device *dev, int newstate)
+{
+	unsigned int old = READ_ONCE(dev->operstate);
+
+	do {
+		if (old == newstate)
+			return;
+	} while (!try_cmpxchg(&dev->operstate, &old, newstate));
+
+	netdev_state_change(dev);
+}
+EXPORT_SYMBOL(netdev_set_operstate);
+
 static void set_operstate(struct net_device *dev, unsigned char transition)
 {
-	unsigned char operstate = dev->operstate;
+	unsigned char operstate = READ_ONCE(dev->operstate);
 
 	switch (transition) {
 	case IF_OPER_UP:
@@ -875,12 +888,7 @@ static void set_operstate(struct net_device *dev, unsigned char transition)
 		break;
 	}
 
-	if (dev->operstate != operstate) {
-		write_lock(&dev_base_lock);
-		dev->operstate = operstate;
-		write_unlock(&dev_base_lock);
-		netdev_state_change(dev);
-	}
+	netdev_set_operstate(dev, operstate);
 }
 
 static unsigned int rtnl_dev_get_flags(const struct net_device *dev)
@@ -2998,11 +3006,9 @@ static int do_setlink(const struct sk_buff *skb,
 	if (tb[IFLA_LINKMODE]) {
 		unsigned char value = nla_get_u8(tb[IFLA_LINKMODE]);
 
-		write_lock(&dev_base_lock);
 		if (dev->link_mode ^ value)
 			status |= DO_SETLINK_NOTIFY;
-		dev->link_mode = value;
-		write_unlock(&dev_base_lock);
+		WRITE_ONCE(dev->link_mode, value);
 	}
 
 	if (tb[IFLA_VFINFO_LIST]) {
@@ -3864,6 +3870,14 @@ static int rtnl_getlink(struct sk_buff *skb, struct nlmsghdr *nlh,
 	nskb = nlmsg_new_large(if_nlmsg_size(dev, ext_filter_mask));
 	if (nskb == NULL)
 		goto out;
+
+	/* Synchronize the carrier state so we don't report a state
+	 * that we're not actually going to honour immediately; if
+	 * the driver just did a carrier off->on transition, we can
+	 * only TX if link watch work has run, but without this we'd
+	 * already report carrier on, even if it doesn't work yet.
+	 */
+	linkwatch_sync_dev(dev);
 
 	err = rtnl_fill_ifinfo(nskb, dev, net,
 			       RTM_NEWLINK, NETLINK_CB(skb).portid,
