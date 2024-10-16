@@ -2817,7 +2817,8 @@ void __init devinet_init(void)
 	register_pernet_subsys(&devinet_ops);
 	register_netdevice_notifier(&ip_netdev_notifier);
 
-	rtnl_af_register(&inet_af_ops);
+	if (rtnl_af_register(&inet_af_ops))
+		panic("Unable to register inet_af_ops\n");
 
 	rtnl_register(PF_INET, RTM_NEWADDR, inet_rtm_newaddr, NULL, 0);
 	rtnl_register(PF_INET, RTM_DELADDR, inet_rtm_deladdr, NULL, 0);
