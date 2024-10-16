@@ -6898,7 +6898,6 @@ int tcp_conn_request(struct request_sock_ops *rsk_ops,
 		     struct sock *sk, struct sk_buff *skb)
 {
 	struct tcp_fastopen_cookie foc = { .len = -1 };
-	__u32 isn = TCP_SKB_CB(skb)->tcp_tw_isn;
 	struct tcp_options_received tmp_opt;
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct net *net = sock_net(sk);
@@ -6908,17 +6907,24 @@ int tcp_conn_request(struct request_sock_ops *rsk_ops,
 	struct dst_entry *dst;
 	struct flowi fl;
 	u8 syncookies;
+	u32 isn;
 
-	syncookies = READ_ONCE(net->ipv4.sysctl_tcp_syncookies);
+	isn = __this_cpu_read(tcp_tw_isn);
+	if (isn) {
+		/* TW buckets are converted to open requests without
+		 * limitations, they conserve resources and peer is
+		 * evidently real one.
+		 */
+		__this_cpu_write(tcp_tw_isn, 0);
+	} else {
+		syncookies = READ_ONCE(net->ipv4.sysctl_tcp_syncookies);
 
-	/* TW buckets are converted to open requests without
-	 * limitations, they conserve resources and peer is
-	 * evidently real one.
-	 */
-	if ((syncookies == 2 || inet_csk_reqsk_queue_is_full(sk)) && !isn) {
-		want_cookie = tcp_syn_flood_action(sk, rsk_ops->slab_name);
-		if (!want_cookie)
-			goto drop;
+		if (syncookies == 2 || inet_csk_reqsk_queue_is_full(sk)) {
+			want_cookie = tcp_syn_flood_action(sk,
+							   rsk_ops->slab_name);
+			if (!want_cookie)
+				goto drop;
+		}
 	}
 
 	if (sk_acceptq_is_full(sk)) {
