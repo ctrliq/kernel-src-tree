@@ -4630,7 +4630,8 @@ static int nf_tables_fill_setelem(struct sk_buff *skb,
 	if (nest == NULL)
 		goto nla_put_failure;
 
-	if (nft_data_dump(skb, NFTA_SET_ELEM_KEY, nft_set_ext_key(ext),
+	if (nft_set_ext_exists(ext, NFT_SET_EXT_KEY) &&
+	    nft_data_dump(skb, NFTA_SET_ELEM_KEY, nft_set_ext_key(ext),
 			  NFT_DATA_VALUE, set->klen) < 0)
 		goto nla_put_failure;
 
@@ -5224,6 +5225,13 @@ err_elem_expr_setup:
 	return -ENOMEM;
 }
 
+static void nft_setelem_remove(const struct net *net,
+			       const struct nft_set *set,
+			       const struct nft_set_elem *elem)
+{
+	set->ops->remove(net, set, elem);
+}
+
 static bool nft_setelem_valid_key_end(const struct nft_set *set,
                       struct nlattr **nla, u32 flags)
 {
@@ -5577,7 +5585,7 @@ static int nft_add_set_elem(struct nft_ctx *ctx, struct nft_set *set,
 	return 0;
 
 err_set_full:
-	set->ops->remove(ctx->net, set, &elem);
+	nft_setelem_remove(ctx->net, set, &elem);
 err_element_clash:
 	kfree(trans);
 err_elem_expr:
