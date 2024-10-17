@@ -4630,7 +4630,8 @@ static int nf_tables_fill_setelem(struct sk_buff *skb,
 	if (nest == NULL)
 		goto nla_put_failure;
 
-	if (nft_data_dump(skb, NFTA_SET_ELEM_KEY, nft_set_ext_key(ext),
+	if (nft_set_ext_exists(ext, NFT_SET_EXT_KEY) &&
+	    nft_data_dump(skb, NFTA_SET_ELEM_KEY, nft_set_ext_key(ext),
 			  NFT_DATA_VALUE, set->klen) < 0)
 		goto nla_put_failure;
 
@@ -5093,7 +5094,8 @@ void *nft_set_elem_init(const struct nft_set *set,
 	ext = nft_set_elem_ext(set, elem);
 	nft_set_ext_init(ext, tmpl);
 
-	memcpy(nft_set_ext_key(ext), key, set->klen);
+	if (nft_set_ext_exists(ext, NFT_SET_EXT_KEY))
+		memcpy(nft_set_ext_key(ext), key, set->klen);
 	if (nft_set_ext_exists(ext, NFT_SET_EXT_KEY_END))
 		memcpy(nft_set_ext_key_end(ext), key_end, set->klen);
 	if (nft_set_ext_exists(ext, NFT_SET_EXT_DATA))
