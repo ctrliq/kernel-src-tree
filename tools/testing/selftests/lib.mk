@@ -28,6 +28,10 @@ endif
 # subdir in $(TOOLS_INCLUDE).
 TOOLS_INCLUDES := -isystem $(top_srcdir)/tools/include/uapi
 
+ifeq ($(KHDR_INCLUDES),)
+KHDR_INCLUDES := -isystem $(top_srcdir)/usr/include
+endif
+
 # The following are built by lib.mk common compile rules.
 # TEST_CUSTOM_PROGS should be used by tests that require
 # custom build rule and prevent common build rule use.
