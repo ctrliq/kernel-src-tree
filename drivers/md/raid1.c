@@ -1902,9 +1902,6 @@ static int raid1_add_disk(struct mddev *mddev, struct md_rdev *rdev)
 	if (mddev->recovery_disabled == conf->recovery_disabled)
 		return -EBUSY;
 
-	if (md_integrity_add_rdev(rdev, mddev))
-		return -ENXIO;
-
 	if (rdev->raid_disk >= 0)
 		first = last = rdev->raid_disk;
 
@@ -1921,12 +1918,11 @@ static int raid1_add_disk(struct mddev *mddev, struct md_rdev *rdev)
 	for (mirror = first; mirror <= last; mirror++) {
 		p = conf->mirrors + mirror;
 		if (!p->rdev) {
-			if (!mddev_is_dm(mddev))
-				disk_stack_limits(mddev->gendisk, rdev->bdev,
-						  rdev->data_offset << 9);
+			err = mddev_stack_new_rdev(mddev, rdev);
+			if (err)
+				return err;
 
 			raid1_add_conf(conf, rdev, mirror, false);
-			err = 0;
 			/* As all devices are equivalent, we don't need a full recovery
 			 * if this was recently any drive of the array
 			 */
@@ -3189,12 +3185,26 @@ static struct r1conf *setup_conf(struct mddev *mddev)
 	return ERR_PTR(err);
 }
 
+static int raid1_set_limits(struct mddev *mddev)
+{
+	struct queue_limits lim;
+	int err;
+
+	md_init_stacking_limits(&lim);
+	lim.max_write_zeroes_sectors = 0;
+	err = mddev_stack_rdev_limits(mddev, &lim, MDDEV_STACK_INTEGRITY);
+	if (err) {
+		queue_limits_cancel_update(mddev->gendisk->queue);
+		return err;
+	}
+	return queue_limits_set(mddev->gendisk->queue, &lim);
+}
+
 static void raid1_free(struct mddev *mddev, void *priv);
 static int raid1_run(struct mddev *mddev)
 {
 	struct r1conf *conf;
 	int i;
-	struct md_rdev *rdev;
 	int ret;
 
 	if (mddev->level != 1) {
@@ -3222,10 +3232,9 @@ static int raid1_run(struct mddev *mddev)
 		return PTR_ERR(conf);
 
 	if (!mddev_is_dm(mddev)) {
-		blk_queue_max_write_zeroes_sectors(mddev->queue, 0);
-		rdev_for_each(rdev, mddev)
-			disk_stack_limits(mddev->gendisk, rdev->bdev,
-					  rdev->data_offset << 9);
+		ret = raid1_set_limits(mddev);
+		if (ret)
+			goto abort;
 	}
 
 	mddev->degraded = 0;

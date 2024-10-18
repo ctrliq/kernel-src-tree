@@ -27,6 +27,7 @@
 
 #define UFSHCD "ufshcd"
 
+struct scsi_device;
 struct ufs_hba;
 
 enum dev_cmd_type {
@@ -583,11 +584,6 @@ enum ufshcd_quirks {
 	 * before power mode change
 	 */
 	UFSHCD_QUIRK_SKIP_DEF_UNIPRO_TIMEOUT_SETTING = 1 << 13,
-
-	/*
-	 * Align DMA SG entries on a 4 KiB boundary.
-	 */
-	UFSHCD_QUIRK_4KB_DMA_ALIGNMENT			= 1 << 14,
 
 	/*
 	 * This quirk needs to be enabled if the host controller does not

@@ -36,7 +36,7 @@ static inline int zonefs_zone_mgmt(struct inode *inode, enum req_op op)
 
 	trace_zonefs_zone_mgmt(inode, op);
 	ret = blkdev_zone_mgmt(inode->i_sb->s_bdev, op, zi->i_zsector,
-			       zi->i_zone_size >> SECTOR_SHIFT, GFP_NOFS);
+			       zi->i_zone_size >> SECTOR_SHIFT);
 	if (ret) {
 		zonefs_err(inode->i_sb,
 			   "Zone management operation %s at %llu failed %d\n",

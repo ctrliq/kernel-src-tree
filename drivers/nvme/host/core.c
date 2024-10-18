@@ -943,6 +943,36 @@ static inline blk_status_t nvme_setup_write_zeroes(struct nvme_ns *ns,
 	return BLK_STS_OK;
 }
 
+/*
+ * NVMe does not support a dedicated command to issue an atomic write. A write
+ * which does adhere to the device atomic limits will silently be executed
+ * non-atomically. The request issuer should ensure that the write is within
+ * the queue atomic writes limits, but just validate this in case it is not.
+ */
+static bool nvme_valid_atomic_write(struct request *req)
+{
+	struct request_queue *q = req->q;
+	u32 boundary_bytes = queue_atomic_write_boundary_bytes(q);
+
+	if (blk_rq_bytes(req) > queue_atomic_write_unit_max_bytes(q))
+		return false;
+
+	if (boundary_bytes) {
+		u64 mask = boundary_bytes - 1, imask = ~mask;
+		u64 start = blk_rq_pos(req) << SECTOR_SHIFT;
+		u64 end = start + blk_rq_bytes(req) - 1;
+
+		/* If greater then must be crossing a boundary */
+		if (blk_rq_bytes(req) > boundary_bytes)
+			return false;
+
+		if ((start & imask) != (end & imask))
+			return false;
+	}
+
+	return true;
+}
+
 static inline blk_status_t nvme_setup_rw(struct nvme_ns *ns,
 		struct request *req, struct nvme_command *cmnd,
 		enum nvme_opcode op)
@@ -957,6 +987,9 @@ static inline blk_status_t nvme_setup_rw(struct nvme_ns *ns,
 
 	if (req->cmd_flags & REQ_RAHEAD)
 		dsmgmt |= NVME_RW_DSM_FREQ_PREFETCH;
+
+	if (req->cmd_flags & REQ_ATOMIC && !nvme_valid_atomic_write(req))
+		return BLK_STS_INVAL;
 
 	cmnd->rw.opcode = op;
 	cmnd->rw.flags = 0;
@@ -1740,27 +1773,38 @@ int nvme_getgeo(struct block_device *bdev, struct hd_geometry *geo)
 	return 0;
 }
 
-#ifdef CONFIG_BLK_DEV_INTEGRITY
-static void nvme_init_integrity(struct gendisk *disk,
-		struct nvme_ns_head *head, u32 max_integrity_segments)
+static bool nvme_init_integrity(struct gendisk *disk, struct nvme_ns_head *head,
+		struct queue_limits *lim)
 {
-	struct blk_integrity integrity = { };
+	struct blk_integrity *bi = &lim->integrity;
+
+	memset(bi, 0, sizeof(*bi));
+
+	if (!head->ms)
+		return true;
+
+	/*
+	 * PI can always be supported as we can ask the controller to simply
+	 * insert/strip it, which is not possible for other kinds of metadata.
+	 */
+	if (!IS_ENABLED(CONFIG_BLK_DEV_INTEGRITY) ||
+	    !(head->features & NVME_NS_METADATA_SUPPORTED))
+		return nvme_ns_has_pi(head);
 
 	switch (head->pi_type) {
 	case NVME_NS_DPS_PI_TYPE3:
 		switch (head->guard_type) {
 		case NVME_NVM_NS_16B_GUARD:
-			integrity.profile = &t10_pi_type3_crc;
-			integrity.tag_size = sizeof(u16) + sizeof(u32);
-			integrity.flags |= BLK_INTEGRITY_DEVICE_CAPABLE;
+			bi->csum_type = BLK_INTEGRITY_CSUM_CRC;
+			bi->tag_size = sizeof(u16) + sizeof(u32);
+			bi->flags |= BLK_INTEGRITY_DEVICE_CAPABLE;
 			break;
 		case NVME_NVM_NS_64B_GUARD:
-			integrity.profile = &ext_pi_type3_crc64;
-			integrity.tag_size = sizeof(u16) + 6;
-			integrity.flags |= BLK_INTEGRITY_DEVICE_CAPABLE;
+			bi->csum_type = BLK_INTEGRITY_CSUM_CRC64;
+			bi->tag_size = sizeof(u16) + 6;
+			bi->flags |= BLK_INTEGRITY_DEVICE_CAPABLE;
 			break;
 		default:
-			integrity.profile = NULL;
 			break;
 		}
 		break;
@@ -1768,73 +1812,51 @@ static void nvme_init_integrity(struct gendisk *disk,
 	case NVME_NS_DPS_PI_TYPE2:
 		switch (head->guard_type) {
 		case NVME_NVM_NS_16B_GUARD:
-			integrity.profile = &t10_pi_type1_crc;
-			integrity.tag_size = sizeof(u16);
-			integrity.flags |= BLK_INTEGRITY_DEVICE_CAPABLE;
+			bi->csum_type = BLK_INTEGRITY_CSUM_CRC;
+			bi->tag_size = sizeof(u16);
+			bi->flags |= BLK_INTEGRITY_DEVICE_CAPABLE |
+				     BLK_INTEGRITY_REF_TAG;
 			break;
 		case NVME_NVM_NS_64B_GUARD:
-			integrity.profile = &ext_pi_type1_crc64;
-			integrity.tag_size = sizeof(u16);
-			integrity.flags |= BLK_INTEGRITY_DEVICE_CAPABLE;
+			bi->csum_type = BLK_INTEGRITY_CSUM_CRC64;
+			bi->tag_size = sizeof(u16);
+			bi->flags |= BLK_INTEGRITY_DEVICE_CAPABLE |
+				     BLK_INTEGRITY_REF_TAG;
 			break;
 		default:
-			integrity.profile = NULL;
 			break;
 		}
 		break;
 	default:
-		integrity.profile = NULL;
 		break;
 	}
 
-	integrity.tuple_size = head->ms;
-	blk_integrity_register(disk, &integrity);
-	blk_queue_max_integrity_segments(disk->queue, max_integrity_segments);
+	bi->tuple_size = head->ms;
+	bi->pi_offset = head->pi_offset;
+	return true;
 }
-#else
-static void nvme_init_integrity(struct gendisk *disk,
-		struct nvme_ns_head *head, u32 max_integrity_segments)
-{
-}
-#endif /* CONFIG_BLK_DEV_INTEGRITY */
 
-static void nvme_config_discard(struct nvme_ctrl *ctrl, struct gendisk *disk,
-		struct nvme_ns_head *head)
+static void nvme_config_discard(struct nvme_ns *ns, struct queue_limits *lim)
 {
-	struct request_queue *queue = disk->queue;
-	u32 max_discard_sectors;
-
-	if (ctrl->dmrsl && ctrl->dmrsl <= nvme_sect_to_lba(head, UINT_MAX)) {
-		max_discard_sectors = nvme_lba_to_sect(head, ctrl->dmrsl);
-	} else if (ctrl->oncs & NVME_CTRL_ONCS_DSM) {
-		max_discard_sectors = UINT_MAX;
-	} else {
-		blk_queue_max_discard_sectors(queue, 0);
-		return;
-	}
+	struct nvme_ctrl *ctrl = ns->ctrl;
 
 	BUILD_BUG_ON(PAGE_SIZE / sizeof(struct nvme_dsm_range) <
 			NVME_DSM_MAX_RANGES);
 
-	/*
-	 * If discard is already enabled, don't reset queue limits.
-	 *
-	 * This works around the fact that the block layer can't cope well with
-	 * updating the hardware limits when overridden through sysfs.  This is
-	 * harmless because discard limits in NVMe are purely advisory.
-	 */
-	if (queue->limits.max_discard_sectors)
-		return;
-
-	blk_queue_max_discard_sectors(queue, max_discard_sectors);
-	if (ctrl->dmrl)
-		blk_queue_max_discard_segments(queue, ctrl->dmrl);
+	if (ctrl->dmrsl && ctrl->dmrsl <= nvme_sect_to_lba(ns->head, UINT_MAX))
+		lim->max_hw_discard_sectors =
+			nvme_lba_to_sect(ns->head, ctrl->dmrsl);
+	else if (ctrl->oncs & NVME_CTRL_ONCS_DSM)
+		lim->max_hw_discard_sectors = UINT_MAX;
 	else
-		blk_queue_max_discard_segments(queue, NVME_DSM_MAX_RANGES);
-	queue->limits.discard_granularity = queue_logical_block_size(queue);
+		lim->max_hw_discard_sectors = 0;
 
-	if (ctrl->quirks & NVME_QUIRK_DEALLOCATE_ZEROES)
-		blk_queue_max_write_zeroes_sectors(queue, UINT_MAX);
+	lim->discard_granularity = lim->logical_block_size;
+
+	if (ctrl->dmrl)
+		lim->max_discard_segments = ctrl->dmrl;
+	else
+		lim->max_discard_segments = NVME_DSM_MAX_RANGES;
 }
 
 static bool nvme_ns_ids_equal(struct nvme_ns_ids *a, struct nvme_ns_ids *b)
@@ -1845,42 +1867,38 @@ static bool nvme_ns_ids_equal(struct nvme_ns_ids *a, struct nvme_ns_ids *b)
 		a->csi == b->csi;
 }
 
-static int nvme_init_ms(struct nvme_ctrl *ctrl, struct nvme_ns_head *head,
-		struct nvme_id_ns *id)
+static int nvme_identify_ns_nvm(struct nvme_ctrl *ctrl, unsigned int nsid,
+		struct nvme_id_ns_nvm **nvmp)
 {
-	bool first = id->dps & NVME_NS_DPS_PI_FIRST;
-	unsigned lbaf = nvme_lbaf_index(id->flbas);
-	struct nvme_command c = { };
+	struct nvme_command c = {
+		.identify.opcode	= nvme_admin_identify,
+		.identify.nsid		= cpu_to_le32(nsid),
+		.identify.cns		= NVME_ID_CNS_CS_NS,
+		.identify.csi		= NVME_CSI_NVM,
+	};
 	struct nvme_id_ns_nvm *nvm;
-	int ret = 0;
-	u32 elbaf;
-
-	head->pi_size = 0;
-	head->ms = le16_to_cpu(id->lbaf[lbaf].ms);
-	if (!(ctrl->ctratt & NVME_CTRL_ATTR_ELBAS)) {
-		head->pi_size = sizeof(struct t10_pi_tuple);
-		head->guard_type = NVME_NVM_NS_16B_GUARD;
-		goto set_pi;
-	}
+	int ret;
 
 	nvm = kzalloc(sizeof(*nvm), GFP_KERNEL);
 	if (!nvm)
 		return -ENOMEM;
 
-	c.identify.opcode = nvme_admin_identify;
-	c.identify.nsid = cpu_to_le32(head->ns_id);
-	c.identify.cns = NVME_ID_CNS_CS_NS;
-	c.identify.csi = NVME_CSI_NVM;
-
 	ret = nvme_submit_sync_cmd(ctrl->admin_q, &c, nvm, sizeof(*nvm));
 	if (ret)
-		goto free_data;
+		kfree(nvm);
+	else
+		*nvmp = nvm;
+	return ret;
+}
 
-	elbaf = le32_to_cpu(nvm->elbaf[lbaf]);
+static void nvme_configure_pi_elbas(struct nvme_ns_head *head,
+		struct nvme_id_ns *id, struct nvme_id_ns_nvm *nvm)
+{
+	u32 elbaf = le32_to_cpu(nvm->elbaf[nvme_lbaf_index(id->flbas)]);
 
 	/* no support for storage tag formats right now */
 	if (nvme_elbaf_sts(elbaf))
-		goto free_data;
+		return;
 
 	head->guard_type = nvme_elbaf_guard_type(elbaf);
 	switch (head->guard_type) {
@@ -1893,30 +1911,31 @@ static int nvme_init_ms(struct nvme_ctrl *ctrl, struct nvme_ns_head *head,
 	default:
 		break;
 	}
-
-free_data:
-	kfree(nvm);
-set_pi:
-	if (head->pi_size && (first || head->ms == head->pi_size))
-		head->pi_type = id->dps & NVME_NS_DPS_PI_MASK;
-	else
-		head->pi_type = 0;
-
-	return ret;
 }
 
-static int nvme_configure_metadata(struct nvme_ctrl *ctrl,
-		struct nvme_ns_head *head, struct nvme_id_ns *id)
+static void nvme_configure_metadata(struct nvme_ctrl *ctrl,
+		struct nvme_ns_head *head, struct nvme_id_ns *id,
+		struct nvme_id_ns_nvm *nvm)
 {
-	int ret;
-
-	ret = nvme_init_ms(ctrl, head, id);
-	if (ret)
-		return ret;
-
 	head->features &= ~(NVME_NS_METADATA_SUPPORTED | NVME_NS_EXT_LBAS);
+	head->pi_type = 0;
+	head->pi_size = 0;
+	head->pi_offset = 0;
+	head->ms = le16_to_cpu(id->lbaf[nvme_lbaf_index(id->flbas)].ms);
 	if (!head->ms || !(ctrl->ops->flags & NVME_F_METADATA_SUPPORTED))
-		return 0;
+		return;
+
+	if (nvm && (ctrl->ctratt & NVME_CTRL_ATTR_ELBAS)) {
+		nvme_configure_pi_elbas(head, id, nvm);
+	} else {
+		head->pi_size = sizeof(struct t10_pi_tuple);
+		head->guard_type = NVME_NVM_NS_16B_GUARD;
+	}
+
+	if (head->pi_size && head->ms >= head->pi_size)
+		head->pi_type = id->dps & NVME_NS_DPS_PI_MASK;
+	if (!(id->dps & NVME_NS_DPS_PI_FIRST))
+		head->pi_offset = head->ms - head->pi_size;
 
 	if (ctrl->ops->flags & NVME_F_FABRICS) {
 		/*
@@ -1925,7 +1944,7 @@ static int nvme_configure_metadata(struct nvme_ctrl *ctrl,
 		 * remap the separate metadata buffer from the block layer.
 		 */
 		if (WARN_ON_ONCE(!(id->flbas & NVME_NS_FLBAS_META_EXT)))
-			return 0;
+			return;
 
 		head->features |= NVME_NS_EXT_LBAS;
 
@@ -1952,33 +1971,49 @@ static int nvme_configure_metadata(struct nvme_ctrl *ctrl,
 		else
 			head->features |= NVME_NS_METADATA_SUPPORTED;
 	}
-	return 0;
 }
 
-static void nvme_set_queue_limits(struct nvme_ctrl *ctrl,
-		struct request_queue *q)
+
+static void nvme_update_atomic_write_disk_info(struct nvme_ns *ns,
+			struct nvme_id_ns *id, struct queue_limits *lim,
+			u32 bs, u32 atomic_bs)
 {
-	bool vwc = ctrl->vwc & NVME_CTRL_VWC_PRESENT;
+	unsigned int boundary = 0;
 
-	if (ctrl->max_hw_sectors) {
-		u32 max_segments =
-			(ctrl->max_hw_sectors / (NVME_CTRL_PAGE_SIZE >> 9)) + 1;
-
-		max_segments = min_not_zero(max_segments, ctrl->max_segments);
-		blk_queue_max_hw_sectors(q, ctrl->max_hw_sectors);
-		blk_queue_max_segments(q, min_t(u32, max_segments, USHRT_MAX));
+	if (id->nsfeat & NVME_NS_FEAT_ATOMICS && id->nawupf) {
+		if (le16_to_cpu(id->nabspf))
+			boundary = (le16_to_cpu(id->nabspf) + 1) * bs;
 	}
-	blk_queue_virt_boundary(q, NVME_CTRL_PAGE_SIZE - 1);
-	blk_queue_dma_alignment(q, 3);
-	blk_queue_write_cache(q, vwc, vwc);
+	lim->atomic_write_hw_max = atomic_bs;
+	lim->atomic_write_hw_boundary = boundary;
+	lim->atomic_write_hw_unit_min = bs;
+	lim->atomic_write_hw_unit_max = rounddown_pow_of_two(atomic_bs);
 }
 
-static void nvme_update_disk_info(struct nvme_ctrl *ctrl, struct gendisk *disk,
-		struct nvme_ns_head *head, struct nvme_id_ns *id)
+static u32 nvme_max_drv_segments(struct nvme_ctrl *ctrl)
 {
-	sector_t capacity = nvme_lba_to_sect(head, le64_to_cpu(id->nsze));
+	return ctrl->max_hw_sectors / (NVME_CTRL_PAGE_SIZE >> SECTOR_SHIFT) + 1;
+}
+
+static void nvme_set_ctrl_limits(struct nvme_ctrl *ctrl,
+		struct queue_limits *lim)
+{
+	lim->max_hw_sectors = ctrl->max_hw_sectors;
+	lim->max_segments = min_t(u32, USHRT_MAX,
+		min_not_zero(nvme_max_drv_segments(ctrl), ctrl->max_segments));
+	lim->max_integrity_segments = ctrl->max_integrity_segments;
+	lim->virt_boundary_mask = NVME_CTRL_PAGE_SIZE - 1;
+	lim->max_segment_size = UINT_MAX;
+	lim->dma_alignment = 3;
+}
+
+static bool nvme_update_disk_info(struct nvme_ns *ns, struct nvme_id_ns *id,
+		struct queue_limits *lim)
+{
+	struct nvme_ns_head *head = ns->head;
 	u32 bs = 1U << head->lba_shift;
 	u32 atomic_bs, phys_bs, io_opt = 0;
+	bool valid = true;
 
 	/*
 	 * The block layer can't support LBA sizes larger than the page size
@@ -1986,11 +2021,9 @@ static void nvme_update_disk_info(struct nvme_ctrl *ctrl, struct gendisk *disk,
 	 * allow block I/O.
 	 */
 	if (head->lba_shift > PAGE_SHIFT || head->lba_shift < SECTOR_SHIFT) {
-		capacity = 0;
 		bs = (1 << 9);
+		valid = false;
 	}
-
-	blk_integrity_unregister(disk);
 
 	atomic_bs = phys_bs = bs;
 	if (id->nabo == 0) {
@@ -2002,46 +2035,33 @@ static void nvme_update_disk_info(struct nvme_ctrl *ctrl, struct gendisk *disk,
 		if (id->nsfeat & NVME_NS_FEAT_ATOMICS && id->nawupf)
 			atomic_bs = (1 + le16_to_cpu(id->nawupf)) * bs;
 		else
-			atomic_bs = (1 + ctrl->subsys->awupf) * bs;
+			atomic_bs = (1 + ns->ctrl->subsys->awupf) * bs;
+
+		nvme_update_atomic_write_disk_info(ns, id, lim, bs, atomic_bs);
 	}
 
 	if (id->nsfeat & NVME_NS_FEAT_IO_OPT) {
 		/* NPWG = Namespace Preferred Write Granularity */
 		phys_bs = bs * (1 + le16_to_cpu(id->npwg));
 		/* NOWS = Namespace Optimal Write Size */
-		io_opt = bs * (1 + le16_to_cpu(id->nows));
+		if (id->nows)
+			io_opt = bs * (1 + le16_to_cpu(id->nows));
 	}
 
-	blk_queue_logical_block_size(disk->queue, bs);
 	/*
 	 * Linux filesystems assume writing a single physical block is
 	 * an atomic operation. Hence limit the physical block size to the
 	 * value of the Atomic Write Unit Power Fail parameter.
 	 */
-	blk_queue_physical_block_size(disk->queue, min(phys_bs, atomic_bs));
-	blk_queue_io_min(disk->queue, phys_bs);
-	blk_queue_io_opt(disk->queue, io_opt);
-
-	/*
-	 * Register a metadata profile for PI, or the plain non-integrity NVMe
-	 * metadata masquerading as Type 0 if supported, otherwise reject block
-	 * I/O to namespaces with metadata except when the namespace supports
-	 * PI, as it can strip/insert in that case.
-	 */
-	if (head->ms) {
-		if (IS_ENABLED(CONFIG_BLK_DEV_INTEGRITY) &&
-		    (head->features & NVME_NS_METADATA_SUPPORTED))
-			nvme_init_integrity(disk, head,
-					    ctrl->max_integrity_segments);
-		else if (!nvme_ns_has_pi(head))
-			capacity = 0;
-	}
-
-	set_capacity_and_notify(disk, capacity);
-
-	nvme_config_discard(ctrl, disk, head);
-	blk_queue_max_write_zeroes_sectors(disk->queue,
-					   ctrl->max_zeroes_sectors);
+	lim->logical_block_size = bs;
+	lim->physical_block_size = min(phys_bs, atomic_bs);
+	lim->io_min = phys_bs;
+	lim->io_opt = io_opt;
+	if (ns->ctrl->quirks & NVME_QUIRK_DEALLOCATE_ZEROES)
+		lim->max_write_zeroes_sectors = UINT_MAX;
+	else
+		lim->max_write_zeroes_sectors = ns->ctrl->max_zeroes_sectors;
+	return valid;
 }
 
 static bool nvme_ns_is_readonly(struct nvme_ns *ns, struct nvme_ns_info *info)
@@ -2055,7 +2075,8 @@ static inline bool nvme_first_scan(struct gendisk *disk)
 	return !disk_live(disk);
 }
 
-static void nvme_set_chunk_sectors(struct nvme_ns *ns, struct nvme_id_ns *id)
+static void nvme_set_chunk_sectors(struct nvme_ns *ns, struct nvme_id_ns *id,
+		struct queue_limits *lim)
 {
 	struct nvme_ctrl *ctrl = ns->ctrl;
 	u32 iob;
@@ -2083,38 +2104,36 @@ static void nvme_set_chunk_sectors(struct nvme_ns *ns, struct nvme_id_ns *id)
 		return;
 	}
 
-	blk_queue_chunk_sectors(ns->queue, iob);
+	lim->chunk_sectors = iob;
 }
 
 static int nvme_update_ns_info_generic(struct nvme_ns *ns,
 		struct nvme_ns_info *info)
 {
+	struct queue_limits lim;
+	int ret;
+
 	blk_mq_freeze_queue(ns->disk->queue);
-	nvme_set_queue_limits(ns->ctrl, ns->queue);
+	lim = queue_limits_start_update(ns->disk->queue);
+	nvme_set_ctrl_limits(ns->ctrl, &lim);
+	ret = queue_limits_commit_update(ns->disk->queue, &lim);
 	set_disk_ro(ns->disk, nvme_ns_is_readonly(ns, info));
 	blk_mq_unfreeze_queue(ns->disk->queue);
 
-	if (nvme_ns_head_multipath(ns->head)) {
-		blk_mq_freeze_queue(ns->head->disk->queue);
-		set_disk_ro(ns->head->disk, nvme_ns_is_readonly(ns, info));
-		nvme_mpath_revalidate_paths(ns);
-		blk_stack_limits(&ns->head->disk->queue->limits,
-				 &ns->queue->limits, 0);
-		ns->head->disk->flags |= GENHD_FL_HIDDEN;
-		blk_mq_unfreeze_queue(ns->head->disk->queue);
-	}
-
 	/* Hide the block-interface for these devices */
-	ns->disk->flags |= GENHD_FL_HIDDEN;
-	set_bit(NVME_NS_READY, &ns->flags);
-
-	return 0;
+	if (!ret)
+		ret = -ENODEV;
+	return ret;
 }
 
 static int nvme_update_ns_info_block(struct nvme_ns *ns,
 		struct nvme_ns_info *info)
 {
+	struct queue_limits lim;
+	struct nvme_id_ns_nvm *nvm = NULL;
+	struct nvme_zone_info zi = {};
 	struct nvme_id_ns *id;
+	sector_t capacity;
 	unsigned lbaf;
 	int ret;
 
@@ -2125,31 +2144,61 @@ static int nvme_update_ns_info_block(struct nvme_ns *ns,
 	if (id->ncap == 0) {
 		/* namespace not allocated or attached */
 		info->is_removed = true;
-		ret = -ENODEV;
-		goto error;
+		ret = -ENXIO;
+		goto out;
+	}
+	lbaf = nvme_lbaf_index(id->flbas);
+
+	if (ns->ctrl->ctratt & NVME_CTRL_ATTR_ELBAS) {
+		ret = nvme_identify_ns_nvm(ns->ctrl, info->nsid, &nvm);
+		if (ret < 0)
+			goto out;
+	}
+
+	if (IS_ENABLED(CONFIG_BLK_DEV_ZONED) &&
+	    ns->head->ids.csi == NVME_CSI_ZNS) {
+		ret = nvme_query_zone_info(ns, lbaf, &zi);
+		if (ret < 0)
+			goto out;
 	}
 
 	blk_mq_freeze_queue(ns->disk->queue);
-	lbaf = nvme_lbaf_index(id->flbas);
 	ns->head->lba_shift = id->lbaf[lbaf].ds;
 	ns->head->nuse = le64_to_cpu(id->nuse);
-	nvme_set_queue_limits(ns->ctrl, ns->queue);
+	capacity = nvme_lba_to_sect(ns->head, le64_to_cpu(id->nsze));
 
-	ret = nvme_configure_metadata(ns->ctrl, ns->head, id);
-	if (ret < 0) {
+	lim = queue_limits_start_update(ns->disk->queue);
+	nvme_set_ctrl_limits(ns->ctrl, &lim);
+	nvme_configure_metadata(ns->ctrl, ns->head, id, nvm);
+	nvme_set_chunk_sectors(ns, id, &lim);
+	if (!nvme_update_disk_info(ns, id, &lim))
+		capacity = 0;
+	nvme_config_discard(ns, &lim);
+	if (IS_ENABLED(CONFIG_BLK_DEV_ZONED) &&
+	    ns->head->ids.csi == NVME_CSI_ZNS)
+		nvme_update_zone_info(ns, &lim, &zi);
+
+	if (ns->ctrl->vwc & NVME_CTRL_VWC_PRESENT)
+		lim.features |= BLK_FEAT_WRITE_CACHE | BLK_FEAT_FUA;
+	else
+		lim.features &= ~(BLK_FEAT_WRITE_CACHE | BLK_FEAT_FUA);
+
+	/*
+	 * Register a metadata profile for PI, or the plain non-integrity NVMe
+	 * metadata masquerading as Type 0 if supported, otherwise reject block
+	 * I/O to namespaces with metadata except when the namespace supports
+	 * PI, as it can strip/insert in that case.
+	 */
+	if (!nvme_init_integrity(ns->disk, ns->head, &lim))
+		capacity = 0;
+
+	ret = queue_limits_commit_update(ns->disk->queue, &lim);
+	if (ret) {
 		blk_mq_unfreeze_queue(ns->disk->queue);
 		goto out;
 	}
-	nvme_set_chunk_sectors(ns, id);
-	nvme_update_disk_info(ns->ctrl, ns->disk, ns->head, id);
 
-	if (ns->head->ids.csi == NVME_CSI_ZNS) {
-		ret = nvme_update_zone_info(ns, lbaf);
-		if (ret) {
-			blk_mq_unfreeze_queue(ns->disk->queue);
-			goto out;
-		}
-	}
+	set_capacity_and_notify(ns->disk, capacity);
 
 	/*
 	 * Only set the DEAC bit if the device guarantees that reads from
@@ -2164,24 +2213,45 @@ static int nvme_update_ns_info_block(struct nvme_ns *ns,
 	blk_mq_unfreeze_queue(ns->disk->queue);
 
 	if (blk_queue_is_zoned(ns->queue)) {
-		ret = nvme_revalidate_zones(ns);
+		ret = blk_revalidate_disk_zones(ns->disk);
 		if (ret && !nvme_first_scan(ns->disk))
 			goto out;
 	}
 
-	if (nvme_ns_head_multipath(ns->head)) {
-		blk_mq_freeze_queue(ns->head->disk->queue);
-		nvme_update_disk_info(ns->ctrl, ns->head->disk, ns->head, id);
-		set_disk_ro(ns->head->disk, nvme_ns_is_readonly(ns, info));
-		nvme_mpath_revalidate_paths(ns);
-		blk_stack_limits(&ns->head->disk->queue->limits,
-				 &ns->queue->limits, 0);
-		disk_update_readahead(ns->head->disk);
-		blk_mq_unfreeze_queue(ns->head->disk->queue);
-	}
-
 	ret = 0;
 out:
+	kfree(nvm);
+	kfree(id);
+	return ret;
+}
+
+static int nvme_update_ns_info(struct nvme_ns *ns, struct nvme_ns_info *info)
+{
+	bool unsupported = false;
+	int ret;
+
+	switch (info->ids.csi) {
+	case NVME_CSI_ZNS:
+		if (!IS_ENABLED(CONFIG_BLK_DEV_ZONED)) {
+			dev_info(ns->ctrl->device,
+	"block device for nsid %u not supported without CONFIG_BLK_DEV_ZONED\n",
+				info->nsid);
+			ret = nvme_update_ns_info_generic(ns, info);
+			break;
+		}
+		ret = nvme_update_ns_info_block(ns, info);
+		break;
+	case NVME_CSI_NVM:
+		ret = nvme_update_ns_info_block(ns, info);
+		break;
+	default:
+		dev_info(ns->ctrl->device,
+			"block device for nsid %u not supported (csi %u)\n",
+			info->nsid, info->ids.csi);
+		ret = nvme_update_ns_info_generic(ns, info);
+		break;
+	}
+
 	/*
 	 * If probing fails due an unsupported feature, hide the block device,
 	 * but still allow other access.
@@ -2189,33 +2259,51 @@ out:
 	if (ret == -ENODEV) {
 		ns->disk->flags |= GENHD_FL_HIDDEN;
 		set_bit(NVME_NS_READY, &ns->flags);
+		unsupported = true;
 		ret = 0;
 	}
 
-error:
-	kfree(id);
-	return ret;
-}
+	if (!ret && nvme_ns_head_multipath(ns->head)) {
+		struct queue_limits *ns_lim = &ns->disk->queue->limits;
+		struct queue_limits lim;
 
-static int nvme_update_ns_info(struct nvme_ns *ns, struct nvme_ns_info *info)
-{
-	switch (info->ids.csi) {
-	case NVME_CSI_ZNS:
-		if (!IS_ENABLED(CONFIG_BLK_DEV_ZONED)) {
-			dev_info(ns->ctrl->device,
-	"block device for nsid %u not supported without CONFIG_BLK_DEV_ZONED\n",
-				info->nsid);
-			return nvme_update_ns_info_generic(ns, info);
-		}
-		return nvme_update_ns_info_block(ns, info);
-	case NVME_CSI_NVM:
-		return nvme_update_ns_info_block(ns, info);
-	default:
-		dev_info(ns->ctrl->device,
-			"block device for nsid %u not supported (csi %u)\n",
-			info->nsid, info->ids.csi);
-		return nvme_update_ns_info_generic(ns, info);
+		blk_mq_freeze_queue(ns->head->disk->queue);
+		/*
+		 * queue_limits mixes values that are the hardware limitations
+		 * for bio splitting with what is the device configuration.
+		 *
+		 * For NVMe the device configuration can change after e.g. a
+		 * Format command, and we really want to pick up the new format
+		 * value here.  But we must still stack the queue limits to the
+		 * least common denominator for multipathing to split the bios
+		 * properly.
+		 *
+		 * To work around this, we explicitly set the device
+		 * configuration to those that we just queried, but only stack
+		 * the splitting limits in to make sure we still obey possibly
+		 * lower limitations of other controllers.
+		 */
+		lim = queue_limits_start_update(ns->head->disk->queue);
+		lim.logical_block_size = ns_lim->logical_block_size;
+		lim.physical_block_size = ns_lim->physical_block_size;
+		lim.io_min = ns_lim->io_min;
+		lim.io_opt = ns_lim->io_opt;
+		queue_limits_stack_bdev(&lim, ns->disk->part0, 0,
+					ns->head->disk->disk_name);
+		if (unsupported)
+			ns->head->disk->flags |= GENHD_FL_HIDDEN;
+		else
+			nvme_init_integrity(ns->head->disk, ns->head, &lim);
+		ret = queue_limits_commit_update(ns->head->disk->queue, &lim);
+
+		set_capacity_and_notify(ns->head->disk, get_capacity(ns->disk));
+		set_disk_ro(ns->head->disk, nvme_ns_is_readonly(ns, info));
+		nvme_mpath_revalidate_paths(ns);
+
+		blk_mq_unfreeze_queue(ns->head->disk->queue);
 	}
+
+	return ret;
 }
 
 #ifdef CONFIG_BLK_SED_OPAL
@@ -3140,6 +3228,7 @@ static int nvme_check_ctrl_fabric_info(struct nvme_ctrl *ctrl, struct nvme_id_ct
 
 static int nvme_init_identify(struct nvme_ctrl *ctrl)
 {
+	struct queue_limits lim;
 	struct nvme_id_ctrl *id;
 	u32 max_hw_sectors;
 	bool prev_apst_enabled;
@@ -3206,7 +3295,12 @@ static int nvme_init_identify(struct nvme_ctrl *ctrl)
 	ctrl->max_hw_sectors =
 		min_not_zero(ctrl->max_hw_sectors, max_hw_sectors);
 
-	nvme_set_queue_limits(ctrl, ctrl->admin_q);
+	lim = queue_limits_start_update(ctrl->admin_q);
+	nvme_set_ctrl_limits(ctrl, &lim);
+	ret = queue_limits_commit_update(ctrl->admin_q, &lim);
+	if (ret)
+		goto out_free;
+
 	ctrl->sgls = le32_to_cpu(id->sgls);
 	ctrl->kas = le16_to_cpu(id->kas);
 	ctrl->max_namespaces = le32_to_cpu(id->mnan);
@@ -3695,6 +3789,7 @@ static void nvme_ns_add_to_ctrl_list(struct nvme_ns *ns)
 
 static void nvme_alloc_ns(struct nvme_ctrl *ctrl, struct nvme_ns_info *info)
 {
+	struct queue_limits lim = { };
 	struct nvme_ns *ns;
 	struct gendisk *disk;
 	int node = ctrl->numa_node;
@@ -3703,7 +3798,13 @@ static void nvme_alloc_ns(struct nvme_ctrl *ctrl, struct nvme_ns_info *info)
 	if (!ns)
 		return;
 
-	disk = blk_mq_alloc_disk(ctrl->tagset, ns);
+	if (ctrl->opts && ctrl->opts->data_digest)
+		lim.features |= BLK_FEAT_STABLE_WRITES;
+	if (ctrl->ops->supports_pci_p2pdma &&
+	    ctrl->ops->supports_pci_p2pdma(ctrl))
+		lim.features |= BLK_FEAT_PCI_P2PDMA;
+
+	disk = blk_mq_alloc_disk(ctrl->tagset, &lim, ns);
 	if (IS_ERR(disk))
 		goto out_free_ns;
 	disk->fops = &nvme_bdev_ops;
@@ -3711,15 +3812,6 @@ static void nvme_alloc_ns(struct nvme_ctrl *ctrl, struct nvme_ns_info *info)
 
 	ns->disk = disk;
 	ns->queue = disk->queue;
-
-	if (ctrl->opts && ctrl->opts->data_digest)
-		blk_queue_flag_set(QUEUE_FLAG_STABLE_WRITES, ns->queue);
-
-	blk_queue_flag_set(QUEUE_FLAG_NONROT, ns->queue);
-	if (ctrl->ops->supports_pci_p2pdma &&
-	    ctrl->ops->supports_pci_p2pdma(ctrl))
-		blk_queue_flag_set(QUEUE_FLAG_PCI_P2PDMA, ns->queue);
-
 	ns->ctrl = ctrl;
 	kref_init(&ns->kref);
 
@@ -4370,6 +4462,7 @@ EXPORT_SYMBOL_GPL(nvme_complete_async_event);
 int nvme_alloc_admin_tag_set(struct nvme_ctrl *ctrl, struct blk_mq_tag_set *set,
 		const struct blk_mq_ops *ops, unsigned int cmd_size)
 {
+	struct queue_limits lim = {};
 	int ret;
 
 	memset(set, 0, sizeof(*set));
@@ -4390,14 +4483,14 @@ int nvme_alloc_admin_tag_set(struct nvme_ctrl *ctrl, struct blk_mq_tag_set *set,
 	if (ret)
 		return ret;
 
-	ctrl->admin_q = blk_mq_init_queue(set);
+	ctrl->admin_q = blk_mq_alloc_queue(set, &lim, NULL);
 	if (IS_ERR(ctrl->admin_q)) {
 		ret = PTR_ERR(ctrl->admin_q);
 		goto out_free_tagset;
 	}
 
 	if (ctrl->ops->flags & NVME_F_FABRICS) {
-		ctrl->fabrics_q = blk_mq_init_queue(set);
+		ctrl->fabrics_q = blk_mq_alloc_queue(set, NULL, NULL);
 		if (IS_ERR(ctrl->fabrics_q)) {
 			ret = PTR_ERR(ctrl->fabrics_q);
 			goto out_cleanup_admin_q;
@@ -4462,13 +4555,15 @@ int nvme_alloc_io_tag_set(struct nvme_ctrl *ctrl, struct blk_mq_tag_set *set,
 		return ret;
 
 	if (ctrl->ops->flags & NVME_F_FABRICS) {
-		ctrl->connect_q = blk_mq_init_queue(set);
+		struct queue_limits lim = {
+			.features	= BLK_FEAT_SKIP_TAGSET_QUIESCE,
+		};
+
+		ctrl->connect_q = blk_mq_alloc_queue(set, &lim, NULL);
         	if (IS_ERR(ctrl->connect_q)) {
 			ret = PTR_ERR(ctrl->connect_q);
 			goto out_free_tag_set;
 		}
-		blk_queue_flag_set(QUEUE_FLAG_SKIP_TAGSET_QUIESCE,
-				   ctrl->connect_q);
 	}
 
 	ctrl->tagset = set;

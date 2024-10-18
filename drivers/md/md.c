@@ -2348,36 +2348,10 @@ static LIST_HEAD(pending_raid_disks);
  */
 int md_integrity_register(struct mddev *mddev)
 {
-	struct md_rdev *rdev, *reference = NULL;
-
 	if (list_empty(&mddev->disks))
 		return 0; /* nothing to do */
-	if (mddev_is_dm(mddev) || blk_get_integrity(mddev->gendisk))
-		return 0; /* shouldn't register, or already is */
-	rdev_for_each(rdev, mddev) {
-		/* skip spares and non-functional disks */
-		if (test_bit(Faulty, &rdev->flags))
-			continue;
-		if (rdev->raid_disk < 0)
-			continue;
-		if (!reference) {
-			/* Use the first rdev as the reference */
-			reference = rdev;
-			continue;
-		}
-		/* does this rdev's profile match the reference profile? */
-		if (blk_integrity_compare(reference->bdev->bd_disk,
-				rdev->bdev->bd_disk) < 0)
-			return -EINVAL;
-	}
-	if (!reference || !bdev_get_integrity(reference->bdev))
-		return 0;
-	/*
-	 * All component devices are integrity capable and have matching
-	 * profiles, register the common profile for the md device.
-	 */
-	blk_integrity_register(mddev->gendisk,
-			       bdev_get_integrity(reference->bdev));
+	if (mddev_is_dm(mddev) || !blk_get_integrity(mddev->gendisk))
+		return 0; /* shouldn't register */
 
 	pr_debug("md: data integrity enabled on %s\n", mdname(mddev));
 	if (bioset_integrity_create(&mddev->bio_set, BIO_POOL_SIZE) ||
@@ -2396,32 +2370,6 @@ int md_integrity_register(struct mddev *mddev)
 	return 0;
 }
 EXPORT_SYMBOL(md_integrity_register);
-
-/*
- * Attempt to add an rdev, but only if it is consistent with the current
- * integrity profile
- */
-int md_integrity_add_rdev(struct md_rdev *rdev, struct mddev *mddev)
-{
-	struct blk_integrity *bi_mddev;
-
-	if (mddev_is_dm(mddev))
-		return 0;
-
-	bi_mddev = blk_get_integrity(mddev->gendisk);
-
-	if (!bi_mddev) /* nothing to do */
-		return 0;
-
-	if (blk_integrity_compare(mddev->gendisk, rdev->bdev->bd_disk) != 0) {
-		pr_err("%s: incompatible integrity profile for %pg\n",
-		       mdname(mddev), rdev->bdev);
-		return -ENXIO;
-	}
-
-	return 0;
-}
-EXPORT_SYMBOL(md_integrity_add_rdev);
 
 static bool rdev_read_only(struct md_rdev *rdev)
 {
@@ -4115,7 +4063,6 @@ level_store(struct mddev *mddev, const char *buf, size_t len)
 		mddev->in_sync = 1;
 		del_timer_sync(&mddev->safemode_timer);
 	}
-	blk_set_stacking_limits(&mddev->queue->limits);
 	pers->run(mddev);
 	set_bit(MD_SB_CHANGE_DEVS, &mddev->sb_flags);
 	if (!mddev->thread)
@@ -5812,12 +5759,79 @@ static const struct kobj_type md_ktype = {
 
 int mdp_major = 0;
 
+/* stack the limit for all rdevs into lim */
+int mddev_stack_rdev_limits(struct mddev *mddev, struct queue_limits *lim,
+		unsigned int flags)
+{
+	struct md_rdev *rdev;
+
+	rdev_for_each(rdev, mddev) {
+		queue_limits_stack_bdev(lim, rdev->bdev, rdev->data_offset,
+					mddev->gendisk->disk_name);
+		if ((flags & MDDEV_STACK_INTEGRITY) &&
+		    !queue_limits_stack_integrity_bdev(lim, rdev->bdev))
+			return -EINVAL;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(mddev_stack_rdev_limits);
+
+/* apply the extra stacking limits from a new rdev into mddev */
+int mddev_stack_new_rdev(struct mddev *mddev, struct md_rdev *rdev)
+{
+	struct queue_limits lim;
+
+	if (mddev_is_dm(mddev))
+		return 0;
+
+	lim = queue_limits_start_update(mddev->gendisk->queue);
+	queue_limits_stack_bdev(&lim, rdev->bdev, rdev->data_offset,
+				mddev->gendisk->disk_name);
+
+	if (!queue_limits_stack_integrity_bdev(&lim, rdev->bdev)) {
+		pr_err("%s: incompatible integrity profile for %pg\n",
+		       mdname(mddev), rdev->bdev);
+		queue_limits_cancel_update(mddev->gendisk->queue);
+		return -ENXIO;
+	}
+
+	return queue_limits_commit_update(mddev->gendisk->queue, &lim);
+}
+EXPORT_SYMBOL_GPL(mddev_stack_new_rdev);
+
+/* update the optimal I/O size after a reshape */
+void mddev_update_io_opt(struct mddev *mddev, unsigned int nr_stripes)
+{
+	struct queue_limits lim;
+
+	if (mddev_is_dm(mddev))
+		return;
+
+	/* don't bother updating io_opt if we can't suspend the array */
+	if (mddev_suspend(mddev, false) < 0)
+		return;
+	lim = queue_limits_start_update(mddev->gendisk->queue);
+	lim.io_opt = lim.io_min * nr_stripes;
+	queue_limits_commit_update(mddev->gendisk->queue, &lim);
+	mddev_resume(mddev);
+}
+EXPORT_SYMBOL_GPL(mddev_update_io_opt);
+
 static void mddev_delayed_delete(struct work_struct *ws)
 {
 	struct mddev *mddev = container_of(ws, struct mddev, del_work);
 
 	kobject_put(&mddev->kobj);
 }
+
+void md_init_stacking_limits(struct queue_limits *lim)
+{
+	blk_set_stacking_limits(lim);
+	lim->features = BLK_FEAT_WRITE_CACHE | BLK_FEAT_FUA |
+			BLK_FEAT_IO_STAT | BLK_FEAT_NOWAIT;
+}
+EXPORT_SYMBOL_GPL(md_init_stacking_limits);
 
 struct mddev *md_alloc(dev_t dev, char *name)
 {
@@ -5836,7 +5850,7 @@ struct mddev *md_alloc(dev_t dev, char *name)
 	int partitioned;
 	int shift;
 	int unit;
-	int error ;
+	int error;
 
 	/*
 	 * Wait for any previous instance of this device to be completely
@@ -5876,10 +5890,11 @@ struct mddev *md_alloc(dev_t dev, char *name)
 		 */
 		mddev->hold_active = UNTIL_STOP;
 
-	error = -ENOMEM;
-	disk = blk_alloc_disk(NUMA_NO_NODE);
-	if (!disk)
+	disk = blk_alloc_disk(NULL, NUMA_NO_NODE);
+	if (IS_ERR(disk)) {
+		error = PTR_ERR(disk);
 		goto out_free_mddev;
+	}
 
 	disk->major = MAJOR(mddev->unit);
 	disk->first_minor = unit << shift;
@@ -5893,9 +5908,6 @@ struct mddev *md_alloc(dev_t dev, char *name)
 	disk->fops = &md_fops;
 	disk->private_data = mddev;
 
-	mddev->queue = disk->queue;
-	blk_set_stacking_limits(&mddev->queue->limits);
-	blk_queue_write_cache(mddev->queue, true, true);
 	disk->events |= DISK_EVENT_MEDIA_CHANGE;
 	mddev->gendisk = disk;
 	error = add_disk(disk);
@@ -6193,27 +6205,6 @@ int md_run(struct mddev *mddev)
 		}
 	}
 
-	if (!mddev_is_dm(mddev)) {
-		bool nonrot = true;
-
-		rdev_for_each(rdev, mddev) {
-			if (rdev->raid_disk >= 0 && !bdev_nonrot(rdev->bdev)) {
-				nonrot = false;
-				break;
-			}
-		}
-		if (mddev->degraded)
-			nonrot = false;
-		if (nonrot)
-			blk_queue_flag_set(QUEUE_FLAG_NONROT, mddev->queue);
-		else
-			blk_queue_flag_clear(QUEUE_FLAG_NONROT, mddev->queue);
-		blk_queue_flag_set(QUEUE_FLAG_IO_STAT, mddev->queue);
-
-		/* Set the NOWAIT flags if all underlying devices support it */
-		if (nowait)
-			blk_queue_flag_set(QUEUE_FLAG_NOWAIT, mddev->queue);
-	}
 	if (pers->sync_request) {
 		if (mddev->kobj.sd &&
 		    sysfs_create_group(&mddev->kobj, &md_redundancy_group))
@@ -6460,8 +6451,10 @@ static void mddev_detach(struct mddev *mddev)
 		mddev->pers->quiesce(mddev, 0);
 	}
 	md_unregister_thread(mddev, &mddev->thread);
+
+	/* the unplug fn references 'conf' */
 	if (!mddev_is_dm(mddev))
-		blk_sync_queue(mddev->queue); /* the unplug fn references 'conf'*/
+		blk_sync_queue(mddev->gendisk->queue);
 }
 
 static void __md_stop(struct mddev *mddev)
@@ -7173,15 +7166,6 @@ static int hot_add_disk(struct mddev *mddev, dev_t dev)
 	set_bit(MD_SB_CHANGE_DEVS, &mddev->sb_flags);
 	if (!mddev->thread)
 		md_update_sb(mddev, 1);
-	/*
-	 * If the new disk does not support REQ_NOWAIT,
-	 * disable on the whole MD.
-	 */
-	if (!bdev_nowait(rdev->bdev)) {
-		pr_info("%s: Disabling nowait because %pg does not support nowait\n",
-			mdname(mddev), rdev->bdev);
-		blk_queue_flag_clear(QUEUE_FLAG_NOWAIT, mddev->queue);
-	}
 	/*
 	 * Kick recovery, maybe this spare has to be added to the
 	 * array immediately.

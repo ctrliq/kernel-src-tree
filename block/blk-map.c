@@ -272,6 +272,7 @@ static struct bio *blk_rq_map_bio_alloc(struct request *rq,
 static int bio_map_user_iov(struct request *rq, struct iov_iter *iter,
 		gfp_t gfp_mask)
 {
+	iov_iter_extraction_t extraction_flags = 0;
 	unsigned int max_sectors = queue_max_hw_sectors(rq->q);
 	unsigned int nr_vecs = iov_iter_npages(iter, BIO_MAX_VECS);
 	struct bio *bio;
@@ -285,6 +286,9 @@ static int bio_map_user_iov(struct request *rq, struct iov_iter *iter,
 	if (bio == NULL)
 		return -ENOMEM;
 
+	if (blk_queue_pci_p2pdma(rq->q))
+		extraction_flags |= ITER_ALLOW_P2PDMA;
+
 	while (iov_iter_count(iter)) {
 		struct page **pages, *stack_pages[UIO_FASTIOV];
 		ssize_t bytes;
@@ -293,11 +297,11 @@ static int bio_map_user_iov(struct request *rq, struct iov_iter *iter,
 
 		if (nr_vecs <= ARRAY_SIZE(stack_pages)) {
 			pages = stack_pages;
-			bytes = iov_iter_get_pages2(iter, pages, LONG_MAX,
-							nr_vecs, &offs);
+			bytes = iov_iter_get_pages(iter, pages, LONG_MAX,
+						   nr_vecs, &offs, extraction_flags);
 		} else {
-			bytes = iov_iter_get_pages_alloc2(iter, &pages,
-							LONG_MAX, &offs);
+			bytes = iov_iter_get_pages_alloc(iter, &pages,
+						LONG_MAX, &offs, extraction_flags);
 		}
 		if (unlikely(bytes <= 0)) {
 			ret = bytes ? bytes : -EFAULT;
@@ -631,7 +635,7 @@ int blk_rq_map_user_iov(struct request_queue *q, struct request *rq,
 			const struct iov_iter *iter, gfp_t gfp_mask)
 {
 	bool copy = false, map_bvec = false;
-	unsigned long align = q->dma_pad_mask | queue_dma_alignment(q);
+	unsigned long align = blk_lim_dma_alignment_and_pad(&q->limits);
 	struct bio *bio = NULL;
 	struct iov_iter i;
 	int ret = -EINVAL;
@@ -753,6 +757,9 @@ int blk_rq_unmap_user(struct bio *bio)
 		} else {
 			bio_release_pages(bio, bio_data_dir(bio) == READ);
 		}
+
+		if (bio_integrity(bio))
+			bio_integrity_unmap_user(bio);
 
 		next_bio = bio;
 		bio = bio->bi_next;

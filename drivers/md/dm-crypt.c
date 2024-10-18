@@ -1190,8 +1190,8 @@ static int crypt_integrity_ctr(struct crypt_config *cc, struct dm_target *ti)
 	struct blk_integrity *bi = blk_get_integrity(cc->dev->bdev->bd_disk);
 	struct mapped_device *md = dm_table_get_md(ti->table);
 
-	/* From now we require underlying device with our integrity profile */
-	if (!bi || strcasecmp(bi->profile->name, "DM-DIF-EXT-TAG")) {
+	/* We require an underlying device with non-PI metadata */
+	if (!bi || bi->csum_type != BLK_INTEGRITY_CSUM_NONE) {
 		ti->error = "Integrity profile not supported.";
 		return -EINVAL;
 	}
@@ -1671,8 +1671,8 @@ static void crypt_free_buffer_pages(struct crypt_config *cc, struct bio *clone);
 
 /*
  * Generate a new unfragmented bio with the given size
- * This should never violate the device limitations (but only because
- * max_segment_size is being constrained to PAGE_SIZE).
+ * This should never violate the device limitations (but if it did then block
+ * core should split the bio as needed).
  *
  * This function may be called concurrently. If we allocate from the mempool
  * concurrently, there is a possibility of deadlock. For example, if we have
@@ -3703,14 +3703,6 @@ static int crypt_iterate_devices(struct dm_target *ti,
 static void crypt_io_hints(struct dm_target *ti, struct queue_limits *limits)
 {
 	struct crypt_config *cc = ti->private;
-
-	/*
-	 * Unfortunate constraint that is required to avoid the potential
-	 * for exceeding underlying device's max_segments limits -- due to
-	 * crypt_alloc_buffer() possibly allocating pages for the encryption
-	 * bio that are not as physically contiguous as the original bio.
-	 */
-	limits->max_segment_size = PAGE_SIZE;
 
 	limits->logical_block_size =
 		max_t(unsigned int, limits->logical_block_size, cc->sector_size);

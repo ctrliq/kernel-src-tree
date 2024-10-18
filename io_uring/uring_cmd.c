@@ -13,6 +13,37 @@
 #include "rsrc.h"
 #include "uring_cmd.h"
 
+bool io_uring_try_cancel_uring_cmd(struct io_ring_ctx *ctx,
+				   struct task_struct *task, bool cancel_all)
+{
+	struct hlist_node *tmp;
+	struct io_kiocb *req;
+	bool ret = false;
+
+	lockdep_assert_held(&ctx->uring_lock);
+
+	hlist_for_each_entry_safe(req, tmp, &ctx->cancelable_uring_cmd,
+			hash_node) {
+		struct io_uring_cmd *cmd = io_kiocb_to_cmd(req,
+				struct io_uring_cmd);
+		struct file *file = req->file;
+
+		if (!cancel_all && req->task != task)
+			continue;
+
+		if (cmd->flags & IORING_URING_CMD_CANCELABLE) {
+			/* ->sqe isn't available if no async data */
+			if (!req_has_async_data(req))
+				cmd->sqe = NULL;
+			file->f_op->uring_cmd(cmd, IO_URING_F_CANCEL |
+						   IO_URING_F_COMPLETE_DEFER);
+			ret = true;
+		}
+	}
+	io_submit_flush_completions(ctx);
+	return ret;
+}
+
 static void io_uring_cmd_del_cancelable(struct io_uring_cmd *cmd,
 		unsigned int issue_flags)
 {
@@ -55,7 +86,11 @@ EXPORT_SYMBOL_GPL(io_uring_cmd_mark_cancelable);
 static void io_uring_cmd_work(struct io_kiocb *req, struct io_tw_state *ts)
 {
 	struct io_uring_cmd *ioucmd = io_kiocb_to_cmd(req, struct io_uring_cmd);
-	unsigned issue_flags = ts->locked ? 0 : IO_URING_F_UNLOCKED;
+	unsigned issue_flags = IO_URING_F_UNLOCKED;
+
+	/* locked task_work executor checks the deffered list completion */
+	if (ts->locked)
+		issue_flags = IO_URING_F_COMPLETE_DEFER;
 
 	ioucmd->task_work_cb(ioucmd, issue_flags);
 }
@@ -99,11 +134,13 @@ void io_uring_cmd_done(struct io_uring_cmd *ioucmd, ssize_t ret, ssize_t res2,
 	if (req->ctx->flags & IORING_SETUP_IOPOLL) {
 		/* order with io_iopoll_req_issued() checking ->iopoll_complete */
 		smp_store_release(&req->iopoll_completed, 1);
+	} else if (issue_flags & IO_URING_F_COMPLETE_DEFER) {
+		if (WARN_ON_ONCE(issue_flags & IO_URING_F_UNLOCKED))
+			return;
+		io_req_complete_defer(req);
 	} else {
-		struct io_tw_state ts = {
-			.locked = !(issue_flags & IO_URING_F_UNLOCKED),
-		};
-		io_req_task_complete(req, &ts);
+		req->io_task_work.func = io_req_task_complete;
+		io_req_task_work_add(req);
 	}
 }
 EXPORT_SYMBOL_GPL(io_uring_cmd_done);
@@ -169,7 +206,6 @@ int io_uring_cmd(struct io_kiocb *req, unsigned int issue_flags)
 			return -EOPNOTSUPP;
 		issue_flags |= IO_URING_F_IOPOLL;
 		req->iopoll_completed = 0;
-		WRITE_ONCE(ioucmd->cookie, NULL);
 	}
 
 	ret = file->f_op->uring_cmd(ioucmd, issue_flags);
