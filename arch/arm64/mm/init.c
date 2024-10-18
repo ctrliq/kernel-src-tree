@@ -211,6 +211,9 @@ retry:
 
 static phys_addr_t __init max_zone_phys(phys_addr_t zone_limit)
 {
+	if (zone_limit == PHYS_ADDR_MAX)
+		zone_limit = U32_MAX;
+
 	return min(zone_limit, memblock_end_of_DRAM() - 1) + 1;
 }
 
