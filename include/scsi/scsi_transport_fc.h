@@ -709,7 +709,6 @@ struct fc_function_template {
 	int  	(*vport_delete)(struct fc_vport *);
 
 	/* bsg support */
-	u32				max_bsg_segments;
 	int	(*bsg_request)(struct bsg_job *);
 	int	(*bsg_timeout)(struct bsg_job *);
 
@@ -766,6 +765,7 @@ struct fc_function_template {
 	unsigned long	show_host_system_hostname:1;
 
 	unsigned long	disable_target_scan:1;
+	RH_KABI_FILL_HOLE(unsigned long max_bsg_segments:1)	/* only ever set to 1 in ibmvfc.c */
 };
 
 /**
