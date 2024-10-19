@@ -1654,12 +1654,14 @@ void tcp_cleanup_rbuf(struct sock *sk, int copied)
 
 static void tcp_eat_recv_skb(struct sock *sk, struct sk_buff *skb)
 {
+	__skb_unlink(skb, &sk->sk_receive_queue);
 	if (likely(skb->destructor == sock_rfree)) {
 		sock_rfree(skb);
 		skb->destructor = NULL;
 		skb->sk = NULL;
+		return skb_attempt_defer_free(skb);
 	}
-	sk_eat_skb(sk, skb);
+	__kfree_skb(skb);
 }
 
 struct sk_buff *tcp_recv_skb(struct sock *sk, u32 seq, u32 *off)
@@ -2617,13 +2619,12 @@ static int tcp_recvmsg_locked(struct sock *sk, struct msghdr *msg, size_t len,
 			}
 		}
 
-		tcp_cleanup_rbuf(sk, copied);
-
 		if (copied >= target) {
 			/* Do not sleep, just process backlog. */
 			release_sock(sk);
 			lock_sock(sk);
 		} else {
+			tcp_cleanup_rbuf(sk, copied);
 			err = sk_wait_data(sk, &timeo, last);
 			if (err < 0) {
 				err = copied ? : err;
@@ -3278,7 +3279,6 @@ int tcp_disconnect(struct sock *sk, int flags)
 		sk->sk_frag.page = NULL;
 		sk->sk_frag.offset = 0;
 	}
-
 	sk_error_report(sk);
 	return 0;
 }
