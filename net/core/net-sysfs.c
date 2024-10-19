@@ -235,7 +235,7 @@ static ssize_t speed_show(struct device *dev,
 	if (!rtnl_trylock())
 		return restart_syscall();
 
-	if (netif_running(netdev) && netif_device_present(netdev)) {
+	if (netif_running(netdev)) {
 		struct ethtool_link_ksettings cmd;
 
 		if (!__ethtool_get_link_ksettings(netdev, &cmd))
@@ -615,13 +615,13 @@ static ssize_t threaded_show(struct device *dev,
 	struct net_device *netdev = to_net_dev(dev);
 	ssize_t ret = -EINVAL;
 
-	if (!rtnl_trylock())
-		return restart_syscall();
+	rcu_read_lock();
 
 	if (dev_isalive(netdev))
-		ret = sysfs_emit(buf, fmt_dec, netdev->threaded);
+		ret = sysfs_emit(buf, fmt_dec, READ_ONCE(netdev->threaded));
 
-	rtnl_unlock();
+	rcu_read_unlock();
+
 	return ret;
 }
 
