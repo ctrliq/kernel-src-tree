@@ -145,9 +145,24 @@ static inline void nft_reg_store16(u32 *dreg, u16 val)
 	*(u16 *)dreg = val;
 }
 
+static inline void nft_reg_store_be16(u32 *dreg, __be16 val)
+{
+	nft_reg_store16(dreg, (__force __u16)val);
+}
+
 static inline u16 nft_reg_load16(const u32 *sreg)
 {
 	return *(u16 *)sreg;
+}
+
+static inline __be16 nft_reg_load_be16(const u32 *sreg)
+{
+	return (__force __be16)nft_reg_load16(sreg);
+}
+
+static inline __be32 nft_reg_load_be32(const u32 *sreg)
+{
+	return *(__force __be32 *)sreg;
 }
 
 static inline void nft_reg_store64(u64 *dreg, u64 val)
@@ -791,7 +806,7 @@ static inline bool __nft_set_elem_expired(const struct nft_set_ext *ext,
 					  u64 tstamp)
 {
 	return nft_set_ext_exists(ext, NFT_SET_EXT_EXPIRATION) &&
-	       time_after_eq64(tstamp, *nft_set_ext_expiration(ext));
+	       time_after_eq64(tstamp, READ_ONCE(*nft_set_ext_expiration(ext)));
 }
 
 static inline bool nft_set_elem_expired(const struct nft_set_ext *ext)
@@ -1562,6 +1577,7 @@ struct nft_trans_rule {
 	(((struct nft_trans_rule *)trans->data)->bound)
 
 struct nft_trans_set {
+	struct list_head		list_trans_newset;
 	struct nft_set			*set;
 	u32				set_id;
 	u32				gc_int;
@@ -1710,6 +1726,7 @@ static inline int nft_request_module(struct net *net, const char *fmt, ...) { re
 struct nftables_pernet {
 	struct list_head	tables;
 	struct list_head	commit_list;
+	struct list_head	commit_set_list;
 	struct list_head	binding_list;
 	struct list_head	module_list;
 	struct list_head	notify_list;
