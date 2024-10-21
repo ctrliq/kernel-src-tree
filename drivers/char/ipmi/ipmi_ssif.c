@@ -2073,7 +2073,7 @@ static int ssif_platform_probe(struct platform_device *dev)
 	return dmi_ipmi_probe(dev);
 }
 
-static int ssif_platform_remove(struct platform_device *dev)
+static void ssif_platform_remove(struct platform_device *dev)
 {
 	struct ssif_addr_info *addr_info = dev_get_drvdata(&dev->dev);
 
@@ -2081,7 +2081,6 @@ static int ssif_platform_remove(struct platform_device *dev)
 	list_del(&addr_info->link);
 	kfree(addr_info);
 	mutex_unlock(&ssif_infos_mutex);
-	return 0;
 }
 
 static const struct platform_device_id ssif_plat_ids[] = {
@@ -2094,7 +2093,7 @@ static struct platform_driver ipmi_driver = {
 		.name = DEVICE_NAME,
 	},
 	.probe		= ssif_platform_probe,
-	.remove		= ssif_platform_remove,
+	.remove_new	= ssif_platform_remove,
 	.id_table       = ssif_plat_ids
 };
 
