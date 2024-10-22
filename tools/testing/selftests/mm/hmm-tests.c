@@ -159,6 +159,10 @@ FIXTURE_TEARDOWN(hmm)
 {
 	int ret = close(self->fd);
 
+	if (ret != 0) {
+		fprintf(stderr, "close returned (%d) fd is (%d)\n", ret, self->fd);
+		exit(1);
+	}
 	ASSERT_EQ(ret, 0);
 	self->fd = -1;
 }
