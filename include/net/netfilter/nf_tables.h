@@ -13,6 +13,7 @@
 #include <net/netfilter/nf_flow_table.h>
 #include <net/netlink.h>
 #include <net/flow_offload.h>
+#include <net/netns/generic.h>
 
 struct module;
 
@@ -1561,4 +1562,16 @@ __printf(2, 3) int nft_request_module(struct net *net, const char *fmt, ...);
 #else
 static inline int nft_request_module(struct net *net, const char *fmt, ...) { return -ENOENT; }
 #endif
+
+struct nftables_pernet {
+	unsigned int            gc_seq;
+};
+
+extern unsigned int nf_tables_net_id;
+
+static inline struct nftables_pernet *nft_pernet(const struct net *net)
+{
+	return net_generic(net, nf_tables_net_id);
+}
+
 #endif /* _NET_NF_TABLES_H */

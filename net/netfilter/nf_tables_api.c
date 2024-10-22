@@ -28,6 +28,9 @@
 
 #define NFT_MODULE_AUTOLOAD_LIMIT (MODULE_NAME_LEN - sizeof("nft-expr-255-"))
 
+unsigned int nf_tables_net_id __read_mostly;
+EXPORT_SYMBOL_GPL(nf_tables_net_id);
+
 static LIST_HEAD(nf_tables_expressions);
 static LIST_HEAD(nf_tables_objects);
 static LIST_HEAD(nf_tables_flowtables);
@@ -3593,8 +3596,8 @@ static struct nft_set *nft_set_lookup_byid(const struct net *net,
 					   const struct nft_table *table,
 					   const struct nlattr *nla, u8 genmask)
 {
-	struct nft_trans *trans;
 	u32 id = ntohl(nla_get_be32(nla));
+	struct nft_trans *trans;
 
 	list_for_each_entry(trans, &net->nft.commit_list, list) {
 		if (trans->msg_type == NFT_MSG_NEWSET) {
@@ -3837,8 +3840,8 @@ static void nf_tables_set_notify(const struct nft_ctx *ctx,
 				 const struct nft_set *set, int event,
 			         gfp_t gfp_flags)
 {
-	u32 portid = ctx->portid;
 	struct sk_buff *skb;
+	u32 portid = ctx->portid;
 	u16 flags = 0;
 	int err;
 
@@ -4786,7 +4789,7 @@ static int nf_tables_dump_set(struct sk_buff *skb, struct netlink_callback *cb)
 	rcu_read_lock();
 	cb->seq = READ_ONCE(net->nft.base_seq);
 
-    list_for_each_entry_rcu(table, &net->nft.tables, list) {
+	list_for_each_entry_rcu(table, &net->nft.tables, list) {
 		if (dump_ctx->ctx.family != NFPROTO_UNSPEC &&
 		    dump_ctx->ctx.family != table->family)
 			continue;
@@ -7964,6 +7967,7 @@ static void nft_set_commit_update(struct list_head *set_update_list)
 
 static int nf_tables_commit(struct net *net, struct sk_buff *skb)
 {
+	struct nftables_pernet *nft_net = nft_pernet(net);
 	struct nft_trans *trans, *next;
 	LIST_HEAD(set_update_list);
 	struct nft_trans_elem *te;
@@ -8398,7 +8402,7 @@ static void nf_tables_cleanup(struct net *net)
 static int nf_tables_abort(struct net *net, struct sk_buff *skb,
 			   enum nfnl_abort_action action)
 {
-	int ret = __nf_tables_abort(net, action);
+	struct nftables_pernet *nft_net = nft_pernet(net);
 
 	mutex_unlock(&net->nft_commit_mutex);
 
@@ -8407,6 +8411,7 @@ static int nf_tables_abort(struct net *net, struct sk_buff *skb,
 
 static bool nf_tables_valid_genid(struct net *net, u32 genid)
 {
+	struct nftables_pernet *nft_net = nft_pernet(net);
 	bool genid_ok;
 
 	mutex_lock(&net->nft_commit_mutex);
@@ -9019,6 +9024,8 @@ static void __nft_release_tables(struct net *net)
 
 static int __net_init nf_tables_init_net(struct net *net)
 {
+	struct nftables_pernet *nft_net = nft_pernet(net);
+
 	INIT_LIST_HEAD(&net->nft.tables);
 	INIT_LIST_HEAD(&net->nft.commit_list);
 	INIT_LIST_HEAD(&net->nft_module_list);
@@ -9039,11 +9046,16 @@ static void __net_exit nf_tables_pre_exit_net(struct net *net)
 
 static void __net_exit nf_tables_exit_net(struct net *net)
 {
+	struct nftables_pernet *nft_net = nft_pernet(net);
+
 	mutex_lock(&net->nft_commit_mutex);
+
 	if (!list_empty(&net->nft.commit_list) ||
 	    !list_empty(&net->nft_module_list))
 		__nf_tables_abort(net, NFNL_ABORT_NONE);
+
 	__nft_release_tables(net);
+
 	mutex_unlock(&net->nft_commit_mutex);
 	WARN_ON_ONCE(!list_empty(&net->nft.tables));
 	WARN_ON_ONCE(!list_empty(&net->nft_module_list));
