@@ -28,6 +28,9 @@
 
 #define NFT_MODULE_AUTOLOAD_LIMIT (MODULE_NAME_LEN - sizeof("nft-expr-255-"))
 
+unsigned int nf_tables_net_id __read_mostly;
+EXPORT_SYMBOL_GPL(nf_tables_net_id);
+
 static LIST_HEAD(nf_tables_expressions);
 static LIST_HEAD(nf_tables_objects);
 static LIST_HEAD(nf_tables_flowtables);
@@ -3593,8 +3596,8 @@ static struct nft_set *nft_set_lookup_byid(const struct net *net,
 					   const struct nft_table *table,
 					   const struct nlattr *nla, u8 genmask)
 {
-	struct nft_trans *trans;
 	u32 id = ntohl(nla_get_be32(nla));
+	struct nft_trans *trans;
 
 	list_for_each_entry(trans, &net->nft.commit_list, list) {
 		if (trans->msg_type == NFT_MSG_NEWSET) {
@@ -3837,8 +3840,8 @@ static void nf_tables_set_notify(const struct nft_ctx *ctx,
 				 const struct nft_set *set, int event,
 			         gfp_t gfp_flags)
 {
-	u32 portid = ctx->portid;
 	struct sk_buff *skb;
+	u32 portid = ctx->portid;
 	u16 flags = 0;
 	int err;
 
@@ -4783,7 +4786,7 @@ static int nf_tables_dump_set(struct sk_buff *skb, struct netlink_callback *cb)
 	rcu_read_lock();
 	cb->seq = READ_ONCE(net->nft.base_seq);
 
-    list_for_each_entry_rcu(table, &net->nft.tables, list) {
+	list_for_each_entry_rcu(table, &net->nft.tables, list) {
 		if (dump_ctx->ctx.family != NFPROTO_UNSPEC &&
 		    dump_ctx->ctx.family != table->family)
 			continue;
@@ -7957,14 +7960,31 @@ static void nft_set_commit_update(struct list_head *set_update_list)
 	}
 }
 
+static unsigned int nft_gc_seq_begin(struct nftables_pernet *nft_net)
+{
+        unsigned int gc_seq;
+
+        /* Bump gc counter, it becomes odd, this is the busy mark. */
+        gc_seq = READ_ONCE(nft_net->gc_seq);
+        WRITE_ONCE(nft_net->gc_seq, ++gc_seq);
+
+        return gc_seq;
+}
+
+static void nft_gc_seq_end(struct nftables_pernet *nft_net, unsigned int gc_seq)
+{
+        WRITE_ONCE(nft_net->gc_seq, ++gc_seq);
+}
+
 static int nf_tables_commit(struct net *net, struct sk_buff *skb)
 {
+	struct nftables_pernet *nft_net = nft_pernet(net);
 	struct nft_trans *trans, *next;
+	unsigned int base_seq, gc_seq;
 	LIST_HEAD(set_update_list);
 	struct nft_trans_elem *te;
 	struct nft_chain *chain;
 	struct nft_table *table;
-	unsigned int base_seq;
 	LIST_HEAD(adl);
 	int err;
 
@@ -8014,6 +8034,8 @@ static int nf_tables_commit(struct net *net, struct sk_buff *skb)
 		;
 
 	WRITE_ONCE(net->nft.base_seq, base_seq);
+
+	gc_seq = nft_gc_seq_begin(nft_net);
 
 	/* step 3. Start new generation, rules_gen_X now in use. */
 	net->nft.gencursor = nft_gencursor_next(net);
@@ -8393,8 +8415,13 @@ static void nf_tables_cleanup(struct net *net)
 static int nf_tables_abort(struct net *net, struct sk_buff *skb,
 			   enum nfnl_abort_action action)
 {
-	int ret = __nf_tables_abort(net, action);
+	struct nftables_pernet *nft_net = nft_pernet(net);
+	unsigned int gc_seq;
+	int ret;
 
+	gc_seq = nft_gc_seq_begin(nft_net);
+        ret = __nf_tables_abort(net, action);
+        nft_gc_seq_end(nft_net, gc_seq);
 	mutex_unlock(&net->nft_commit_mutex);
 
 	return ret;
@@ -8402,9 +8429,11 @@ static int nf_tables_abort(struct net *net, struct sk_buff *skb,
 
 static bool nf_tables_valid_genid(struct net *net, u32 genid)
 {
+	struct nftables_pernet *nft_net = nft_pernet(net);
 	bool genid_ok;
 
 	mutex_lock(&net->nft_commit_mutex);
+	nft_net->tstamp = get_jiffies_64();
 
 	genid_ok = genid == 0 || net->nft.base_seq == genid;
 	if (!genid_ok)
@@ -9014,6 +9043,8 @@ static void __nft_release_tables(struct net *net)
 
 static int __net_init nf_tables_init_net(struct net *net)
 {
+	struct nftables_pernet *nft_net = nft_pernet(net);
+
 	INIT_LIST_HEAD(&net->nft.tables);
 	INIT_LIST_HEAD(&net->nft.commit_list);
 	INIT_LIST_HEAD(&net->nft_module_list);
@@ -9021,6 +9052,7 @@ static int __net_init nf_tables_init_net(struct net *net)
 	mutex_init(&net->nft_commit_mutex);
 	net->nft.base_seq = 1;
 	net->nft.validate_state = NFT_VALIDATE_SKIP;
+	nft_net->gc_seq = 0;
 
 	return 0;
 }
@@ -9034,11 +9066,21 @@ static void __net_exit nf_tables_pre_exit_net(struct net *net)
 
 static void __net_exit nf_tables_exit_net(struct net *net)
 {
+	struct nftables_pernet *nft_net = nft_pernet(net);
+	unsigned int gc_seq;
+
 	mutex_lock(&net->nft_commit_mutex);
+
+	gc_seq = nft_gc_seq_begin(nft_net);
+
 	if (!list_empty(&net->nft.commit_list) ||
 	    !list_empty(&net->nft_module_list))
 		__nf_tables_abort(net, NFNL_ABORT_NONE);
+
 	__nft_release_tables(net);
+
+	nft_gc_seq_end(nft_net, gc_seq);
+
 	mutex_unlock(&net->nft_commit_mutex);
 	WARN_ON_ONCE(!list_empty(&net->nft.tables));
 	WARN_ON_ONCE(!list_empty(&net->nft_module_list));
