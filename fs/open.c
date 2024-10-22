@@ -176,7 +176,7 @@ long do_ftruncate(struct file *file, loff_t length, int small)
 	if (IS_APPEND(file_inode(file)))
 		return -EPERM;
 	sb_start_write(inode->i_sb);
-	error = security_path_truncate(&file->f_path);
+	error = security_file_truncate(file);
 	if (!error)
 		error = do_truncate(file_mnt_idmap(file), dentry, length,
 				    ATTR_MTIME | ATTR_CTIME, file);
