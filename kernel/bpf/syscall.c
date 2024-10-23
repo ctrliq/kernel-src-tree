@@ -576,6 +576,7 @@ void btf_record_free(struct btf_record *rec)
 		case BPF_SPIN_LOCK:
 		case BPF_TIMER:
 		case BPF_REFCOUNT:
+		case BPF_WORKQUEUE:
 			/* Nothing to release */
 			break;
 		default:
@@ -625,6 +626,7 @@ struct btf_record *btf_record_dup(const struct btf_record *rec)
 		case BPF_SPIN_LOCK:
 		case BPF_TIMER:
 		case BPF_REFCOUNT:
+		case BPF_WORKQUEUE:
 			/* Nothing to acquire */
 			break;
 		default:
@@ -695,6 +697,8 @@ void bpf_obj_free_fields(const struct btf_record *rec, void *obj)
 			break;
 		case BPF_TIMER:
 			bpf_timer_cancel_and_free(field_ptr);
+			break;
+		case BPF_WORKQUEUE:
 			break;
 		case BPF_KPTR_UNREF:
 			WRITE_ONCE(*(u64 *)field_ptr, 0);
@@ -1102,7 +1106,7 @@ static int map_check_btf(struct bpf_map *map, struct bpf_token *token,
 
 	map->record = btf_parse_fields(btf, value_type,
 				       BPF_SPIN_LOCK | BPF_TIMER | BPF_KPTR | BPF_LIST_HEAD |
-				       BPF_RB_ROOT | BPF_REFCOUNT,
+				       BPF_RB_ROOT | BPF_REFCOUNT | BPF_WORKQUEUE,
 				       map->value_size);
 	if (!IS_ERR_OR_NULL(map->record)) {
 		int i;
