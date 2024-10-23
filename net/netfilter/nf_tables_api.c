@@ -5778,6 +5778,7 @@ void nft_setelem_data_deactivate(const struct net *net,
 	if (nft_set_ext_exists(ext, NFT_SET_EXT_OBJREF))
 		nft_use_dec(&(*nft_set_ext_obj(ext))->use);
 }
+EXPORT_SYMBOL_GPL(nft_setelem_data_deactivate);
 
 static int nft_del_setelem(struct nft_ctx *ctx, struct nft_set *set,
 			   const struct nlattr *attr)
@@ -7846,6 +7847,7 @@ void nft_trans_gc_destroy(struct nft_trans_gc *trans)
 	put_net(trans->net);
 	kfree(trans);
 }
+EXPORT_SYMBOL_GPL(nft_trans_gc_destroy);
 
 static void nft_trans_gc_trans_free(struct rcu_head *rcu)
 {
@@ -7933,11 +7935,13 @@ struct nft_trans_gc *nft_trans_gc_alloc(struct nft_set *set,
 
 	return trans;
 }
+EXPORT_SYMBOL_GPL(nft_trans_gc_alloc);
 
 void nft_trans_gc_elem_add(struct nft_trans_gc *trans, void *priv)
 {
 	trans->priv[trans->count++] = priv;
 }
+EXPORT_SYMBOL_GPL(nft_trans_gc_elem_add);
 
 static void nft_trans_gc_queue_work(struct nft_trans_gc *trans)
 {
@@ -7963,6 +7967,7 @@ struct nft_trans_gc *nft_trans_gc_queue_async(struct nft_trans_gc *gc,
 
 	return nft_trans_gc_alloc(gc->set, gc_seq, gfp);
 }
+EXPORT_SYMBOL_GPL(nft_trans_gc_queue_async);
 
 void nft_trans_gc_queue_async_done(struct nft_trans_gc *trans)
 {
@@ -7973,6 +7978,7 @@ void nft_trans_gc_queue_async_done(struct nft_trans_gc *trans)
 
 	nft_trans_gc_queue_work(trans);
 }
+EXPORT_SYMBOL_GPL(nft_trans_gc_queue_async_done);
 
 struct nft_trans_gc *nft_trans_gc_queue_sync(struct nft_trans_gc *gc, gfp_t gfp)
 {
@@ -7986,6 +7992,7 @@ struct nft_trans_gc *nft_trans_gc_queue_sync(struct nft_trans_gc *gc, gfp_t gfp)
 
 	return nft_trans_gc_alloc(gc->set, 0, gfp);
 }
+EXPORT_SYMBOL_GPL(nft_trans_gc_queue_sync);
 
 void nft_trans_gc_queue_sync_done(struct nft_trans_gc *trans)
 {
@@ -7998,6 +8005,7 @@ void nft_trans_gc_queue_sync_done(struct nft_trans_gc *trans)
 
 	call_rcu(&trans->rcu, nft_trans_gc_trans_free);
 }
+EXPORT_SYMBOL_GPL(nft_trans_gc_queue_sync_done);
 
 static void nf_tables_module_autoload_cleanup(struct net *net)
 {
