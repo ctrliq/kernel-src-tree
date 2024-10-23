@@ -922,7 +922,8 @@ static void __exit cxl_acpi_exit(void)
 	cxl_bus_drain();
 }
 
-module_init(cxl_acpi_init);
+/* load before dax_hmem sees 'Soft Reserved' CXL ranges */
+subsys_initcall(cxl_acpi_init);
 
 /*
  * Arrange for host-bridge ports to be active synchronous with
