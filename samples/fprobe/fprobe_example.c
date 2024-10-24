@@ -39,6 +39,7 @@ static void show_backtrace(void)
 }
 
 static int sample_entry_handler(struct fprobe *fp, unsigned long ip,
+				unsigned long ret_ip,
 				struct pt_regs *regs, void *data)
 {
 	pr_info("Enter <%pS> ip = 0x%p\n", (void *)ip, (void *)ip);
@@ -47,10 +48,11 @@ static int sample_entry_handler(struct fprobe *fp, unsigned long ip,
 	return 0;
 }
 
-static void sample_exit_handler(struct fprobe *fp, unsigned long ip, struct pt_regs *regs,
+static void sample_exit_handler(struct fprobe *fp, unsigned long ip,
+				unsigned long ret_ip, struct pt_regs *regs,
 				void *data)
 {
-	unsigned long rip = instruction_pointer(regs);
+	unsigned long rip = ret_ip;
 
 	pr_info("Return from <%pS> ip = 0x%p to rip = 0x%p (%pS)\n",
 		(void *)ip, (void *)ip, (void *)rip, (void *)rip);
