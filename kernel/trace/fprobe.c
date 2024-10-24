@@ -28,6 +28,7 @@ static inline void __fprobe_handler(unsigned long ip, unsigned long parent_ip,
 	struct rethook_node *rh = NULL;
 	struct fprobe *fp;
 	void *entry_data = NULL;
+	int ret;
 
 	fp = container_of(ops, struct fprobe, ops);
 
@@ -45,10 +46,15 @@ static inline void __fprobe_handler(unsigned long ip, unsigned long parent_ip,
 	}
 
 	if (fp->entry_handler)
-		fp->entry_handler(fp, ip, ftrace_get_regs(fregs), entry_data);
+		ret = fp->entry_handler(fp, ip, ftrace_get_regs(fregs), entry_data);
 
-	if (rh)
-		rethook_hook(rh, ftrace_get_regs(fregs), true);
+	/* If entry_handler returns !0, nmissed is not counted. */
+	if (rh) {
+		if (ret)
+			rethook_recycle(rh);
+		else
+			rethook_hook(rh, ftrace_get_regs(fregs), true);
+	}
 }
 
 static void fprobe_handler(unsigned long ip, unsigned long parent_ip,
