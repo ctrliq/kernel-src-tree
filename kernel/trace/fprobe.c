@@ -28,7 +28,7 @@ static inline void __fprobe_handler(unsigned long ip, unsigned long parent_ip,
 	struct rethook_node *rh = NULL;
 	struct fprobe *fp;
 	void *entry_data = NULL;
-	int ret;
+	int ret = 0;
 
 	fp = container_of(ops, struct fprobe, ops);
 
