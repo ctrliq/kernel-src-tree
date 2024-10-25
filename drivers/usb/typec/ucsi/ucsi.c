@@ -989,7 +989,8 @@ static int ucsi_register_cable(struct ucsi_connector *con)
 		break;
 	}
 
-	desc.identity = &con->cable_identity;
+	if (con->ucsi->cap.features & UCSI_CAP_GET_PD_MESSAGE)
+		desc.identity = &con->cable_identity;
 	desc.active = !!(UCSI_CABLE_PROP_FLAG_ACTIVE_CABLE & cable_prop.flags);
 
 	if (con->ucsi->version >= UCSI_VERSION_2_1)
@@ -1090,7 +1091,8 @@ static int ucsi_register_partner(struct ucsi_connector *con)
 	if (pwr_opmode == UCSI_CONSTAT_PWR_OPMODE_PD)
 		ucsi_register_device_pdos(con);
 
-	desc.identity = &con->partner_identity;
+	if (con->ucsi->cap.features & UCSI_CAP_GET_PD_MESSAGE)
+		desc.identity = &con->partner_identity;
 	desc.usb_pd = pwr_opmode == UCSI_CONSTAT_PWR_OPMODE_PD;
 
 	partner = typec_register_partner(con->port, &desc);
