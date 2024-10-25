@@ -540,7 +540,7 @@ static int max_tcpci_remove(struct i2c_client *client)
 }
 
 static const struct i2c_device_id max_tcpci_id[] = {
-	{ "maxtcpc", 0 },
+	{ "maxtcpc" },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, max_tcpci_id);
