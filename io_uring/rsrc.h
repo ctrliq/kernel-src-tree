@@ -2,6 +2,8 @@
 #ifndef IOU_RSRC_H
 #define IOU_RSRC_H
 
+#include <linux/nospec.h>
+
 #define IO_NODE_ALLOC_CACHE_MAX 32
 
 #define IO_RSRC_TAG_TABLE_SHIFT	(PAGE_SHIFT - 3)
@@ -69,6 +71,14 @@ int io_register_rsrc(struct io_ring_ctx *ctx, void __user *arg,
 
 extern const struct io_rsrc_node empty_node;
 #define rsrc_empty_node	(struct io_rsrc_node *) &empty_node
+
+static inline struct io_rsrc_node *io_rsrc_node_lookup(struct io_rsrc_data *data,
+						       int index)
+{
+	if (index < data->nr)
+		return data->nodes[array_index_nospec(index, data->nr)];
+	return NULL;
+}
 
 static inline void io_put_rsrc_node(struct io_rsrc_node *node)
 {
