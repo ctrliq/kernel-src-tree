@@ -709,13 +709,14 @@ static void check_lifetime(struct work_struct *work)
 
 		rcu_read_lock();
 		hlist_for_each_entry_rcu(ifa, &inet_addr_lst[i], hash) {
-			unsigned long age;
+			unsigned long age, tstamp;
 
 			if (ifa->ifa_flags & IFA_F_PERMANENT)
 				continue;
 
+			tstamp = READ_ONCE(ifa->ifa_tstamp);
 			/* We try to batch several events at once. */
-			age = (now - ifa->ifa_tstamp +
+			age = (now - tstamp +
 			       ADDRCONF_TIMER_FUZZ_MINUS) / HZ;
 
 			if (ifa->ifa_valid_lft != INFINITY_LIFE_TIME &&
@@ -725,17 +726,17 @@ static void check_lifetime(struct work_struct *work)
 				   INFINITY_LIFE_TIME) {
 				continue;
 			} else if (age >= ifa->ifa_preferred_lft) {
-				if (time_before(ifa->ifa_tstamp +
+				if (time_before(tstamp +
 						ifa->ifa_valid_lft * HZ, next))
-					next = ifa->ifa_tstamp +
+					next = tstamp +
 					       ifa->ifa_valid_lft * HZ;
 
 				if (!(ifa->ifa_flags & IFA_F_DEPRECATED))
 					change_needed = true;
-			} else if (time_before(ifa->ifa_tstamp +
+			} else if (time_before(tstamp +
 					       ifa->ifa_preferred_lft * HZ,
 					       next)) {
-				next = ifa->ifa_tstamp +
+				next = tstamp +
 				       ifa->ifa_preferred_lft * HZ;
 			}
 		}
@@ -815,9 +816,9 @@ static void set_ifa_lifetime(struct in_ifaddr *ifa, __u32 valid_lft,
 			ifa->ifa_flags |= IFA_F_DEPRECATED;
 		ifa->ifa_preferred_lft = timeout;
 	}
-	ifa->ifa_tstamp = jiffies;
+	WRITE_ONCE(ifa->ifa_tstamp, jiffies);
 	if (!ifa->ifa_cstamp)
-		ifa->ifa_cstamp = ifa->ifa_tstamp;
+		WRITE_ONCE(ifa->ifa_cstamp, ifa->ifa_tstamp);
 }
 
 static struct in_ifaddr *rtm_to_ifaddr(struct net *net, struct nlmsghdr *nlh,
@@ -1665,6 +1666,7 @@ static int inet_fill_ifaddr(struct sk_buff *skb, struct in_ifaddr *ifa,
 {
 	struct ifaddrmsg *ifm;
 	struct nlmsghdr  *nlh;
+	unsigned long tstamp;
 	u32 preferred, valid;
 
 	nlh = nlmsg_put(skb, args->portid, args->seq, args->event, sizeof(*ifm),
@@ -1683,11 +1685,12 @@ static int inet_fill_ifaddr(struct sk_buff *skb, struct in_ifaddr *ifa,
 	    nla_put_s32(skb, IFA_TARGET_NETNSID, args->netnsid))
 		goto nla_put_failure;
 
+	tstamp = READ_ONCE(ifa->ifa_tstamp);
 	if (!(ifm->ifa_flags & IFA_F_PERMANENT)) {
 		preferred = ifa->ifa_preferred_lft;
 		valid = ifa->ifa_valid_lft;
 		if (preferred != INFINITY_LIFE_TIME) {
-			long tval = (jiffies - ifa->ifa_tstamp) / HZ;
+			long tval = (jiffies - tstamp) / HZ;
 
 			if (preferred > tval)
 				preferred -= tval;
@@ -1715,7 +1718,7 @@ static int inet_fill_ifaddr(struct sk_buff *skb, struct in_ifaddr *ifa,
 	    nla_put_u32(skb, IFA_FLAGS, ifa->ifa_flags) ||
 	    (ifa->ifa_rt_priority &&
 	     nla_put_u32(skb, IFA_RT_PRIORITY, ifa->ifa_rt_priority)) ||
-	    put_cacheinfo(skb, ifa->ifa_cstamp, ifa->ifa_tstamp,
+	    put_cacheinfo(skb, READ_ONCE(ifa->ifa_cstamp), tstamp,
 			  preferred, valid))
 		goto nla_put_failure;
 
