@@ -3593,6 +3593,13 @@ int ext4_feature_set_ok(struct super_block *sb, int readonly)
 			~EXT4_FEATURE_INCOMPAT_SUPP));
 		return 0;
 	}
+	if (EXT4_SB(sb)->s_es->s_def_hash_version == DX_HASH_SIPHASH &&
+	    !ext4_has_feature_casefold(sb)) {
+		ext4_msg(sb, KERN_ERR,
+			 "Filesystem without casefold feature cannot be "
+			 "mounted with siphash");
+		return 0;
+	}
 
 #ifndef CONFIG_UNICODE
 	if (ext4_has_feature_casefold(sb)) {
