@@ -3504,9 +3504,8 @@ userspace_tests()
 		chk_add_nr 1 1
 		chk_mptcp_info subflows 1 subflows 1
 		chk_mptcp_info add_addr_signal 1 add_addr_accepted 1
-		userspace_pm_rm_addr $ns1 10
 		userspace_pm_rm_sf $ns1 "::ffff:10.0.2.1" $SUB_ESTABLISHED
-		chk_rm_nr 1 1 invert
+		chk_rm_nr 0 1 invert
 		chk_mptcp_info subflows 0 subflows 0
 		kill_events_pids
 		wait $tests_pid
@@ -3524,9 +3523,8 @@ userspace_tests()
 		userspace_pm_add_sf $ns2 10.0.3.2 20
 		chk_join_nr 1 1 1
 		chk_mptcp_info subflows 1 subflows 1
-		userspace_pm_rm_addr $ns2 20
 		userspace_pm_rm_sf $ns2 10.0.3.2 $SUB_ESTABLISHED
-		chk_rm_nr 1 1
+		chk_rm_nr 0 1
 		chk_mptcp_info subflows 0 subflows 0
 		kill_events_pids
 		wait $tests_pid
