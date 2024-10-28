@@ -1359,7 +1359,7 @@ static int ipv6_create_tempaddr(struct inet6_ifaddr *ifp, bool block)
 
 retry:
 	in6_dev_hold(idev);
-	if (idev->cnf.use_tempaddr <= 0) {
+	if (READ_ONCE(idev->cnf.use_tempaddr) <= 0) {
 		write_unlock_bh(&idev->lock);
 		pr_info("%s: use_tempaddr is disabled\n", __func__);
 		in6_dev_put(idev);
@@ -1367,8 +1367,8 @@ retry:
 		goto out;
 	}
 	spin_lock_bh(&ifp->lock);
-	if (ifp->regen_count++ >= idev->cnf.regen_max_retry) {
-		idev->cnf.use_tempaddr = -1;	/*XXX*/
+	if (ifp->regen_count++ >= READ_ONCE(idev->cnf.regen_max_retry)) {
+		WRITE_ONCE(idev->cnf.use_tempaddr, -1);	/*XXX*/
 		spin_unlock_bh(&ifp->lock);
 		write_unlock_bh(&idev->lock);
 		pr_warn("%s: regeneration time exceeded - disabled temporary address support\n",
@@ -1383,8 +1383,8 @@ retry:
 
 	age = (now - ifp->tstamp) / HZ;
 
-	regen_advance = idev->cnf.regen_max_retry *
-			idev->cnf.dad_transmits *
+	regen_advance = READ_ONCE(idev->cnf.regen_max_retry) *
+			READ_ONCE(idev->cnf.dad_transmits) *
 			max(NEIGH_VAR(idev->nd_parms, RETRANS_TIME), HZ/100) / HZ;
 
 	/* recalculate max_desync_factor each time and update
@@ -1392,7 +1392,7 @@ retry:
 	 */
 	cnf_temp_preferred_lft = READ_ONCE(idev->cnf.temp_prefered_lft);
 	max_desync_factor = min_t(long,
-				  idev->cnf.max_desync_factor,
+				  READ_ONCE(idev->cnf.max_desync_factor),
 				  cnf_temp_preferred_lft - regen_advance);
 
 	if (unlikely(idev->desync_factor > max_desync_factor)) {
@@ -1407,7 +1407,7 @@ retry:
 
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.valid_lft = min_t(__u32, ifp->valid_lft,
-			      idev->cnf.temp_valid_lft + age);
+			      READ_ONCE(idev->cnf.temp_valid_lft) + age);
 	cfg.preferred_lft = cnf_temp_preferred_lft + age - idev->desync_factor;
 	cfg.preferred_lft = min_t(__u32, ifp->prefered_lft, cfg.preferred_lft);
 
@@ -1637,7 +1637,7 @@ static int ipv6_get_saddr_eval(struct net *net,
 		 */
 		int preftmp = dst->prefs & (IPV6_PREFER_SRC_PUBLIC|IPV6_PREFER_SRC_TMP) ?
 				!!(dst->prefs & IPV6_PREFER_SRC_TMP) :
-				score->ifa->idev->cnf.use_tempaddr >= 2;
+				READ_ONCE(score->ifa->idev->cnf.use_tempaddr) >= 2;
 		ret = (!(score->ifa->flags & IFA_F_TEMPORARY)) ^ preftmp;
 		break;
 	    }
@@ -2125,6 +2125,7 @@ void addrconf_dad_failure(struct sk_buff *skb, struct inet6_ifaddr *ifp)
 {
 	struct inet6_dev *idev = ifp->idev;
 	struct net *net = dev_net(ifp->idev->dev);
+	int max_addresses;
 
 	if (addrconf_dad_end(ifp)) {
 		in6_ifa_put(ifp);
@@ -2162,9 +2163,9 @@ void addrconf_dad_failure(struct sk_buff *skb, struct inet6_ifaddr *ifp)
 
 		spin_unlock_bh(&ifp->lock);
 
-		if (idev->cnf.max_addresses &&
-		    ipv6_count_addresses(idev) >=
-		    idev->cnf.max_addresses)
+		max_addresses = READ_ONCE(idev->cnf.max_addresses);
+		if (max_addresses &&
+		    ipv6_count_addresses(idev) >= max_addresses)
 			goto lock_errdad;
 
 		net_info_ratelimited("%s: generating new stable privacy address because of DAD conflict\n",
@@ -2561,11 +2562,11 @@ static void manage_tempaddrs(struct inet6_dev *idev,
 		 * (TEMP_PREFERRED_LIFETIME - DESYNC_FACTOR), respectively.
 		 */
 		age = (now - ift->cstamp) / HZ;
-		max_valid = idev->cnf.temp_valid_lft - age;
+		max_valid = READ_ONCE(idev->cnf.temp_valid_lft) - age;
 		if (max_valid < 0)
 			max_valid = 0;
 
-		max_prefered = idev->cnf.temp_prefered_lft -
+		max_prefered = READ_ONCE(idev->cnf.temp_prefered_lft) -
 			       idev->desync_factor - age;
 		if (max_prefered < 0)
 			max_prefered = 0;
@@ -2598,7 +2599,7 @@ static void manage_tempaddrs(struct inet6_dev *idev,
 	if (list_empty(&idev->tempaddr_list) && (valid_lft || prefered_lft))
 		create = true;
 
-	if (create && idev->cnf.use_tempaddr > 0) {
+	if (create && READ_ONCE(idev->cnf.use_tempaddr) > 0) {
 		/* When a new public address is created as described
 		 * in [ADDRCONF], also create a new temporary address.
 		 */
@@ -2626,7 +2627,7 @@ int addrconf_prefix_rcv_add_addr(struct net *net, struct net_device *dev,
 	int create = 0, update_lft = 0;
 
 	if (!ifp && valid_lft) {
-		int max_addresses = in6_dev->cnf.max_addresses;
+		int max_addresses = READ_ONCE(in6_dev->cnf.max_addresses);
 		struct ifa6_config cfg = {
 			.pfx = addr,
 			.plen = pinfo->prefix_len,
@@ -3950,6 +3951,7 @@ static void addrconf_rs_timer(struct timer_list *t)
 	struct inet6_dev *idev = from_timer(idev, t, rs_timer);
 	struct net_device *dev = idev->dev;
 	struct in6_addr lladdr;
+	int rtr_solicits;
 
 	write_lock(&idev->lock);
 	if (idev->dead || !(idev->if_flags & IF_READY))
@@ -3962,7 +3964,9 @@ static void addrconf_rs_timer(struct timer_list *t)
 	if (idev->if_flags & IF_RA_RCVD)
 		goto out;
 
-	if (idev->rs_probes++ < idev->cnf.rtr_solicits || idev->cnf.rtr_solicits < 0) {
+	rtr_solicits = READ_ONCE(idev->cnf.rtr_solicits);
+
+	if (idev->rs_probes++ < rtr_solicits || rtr_solicits < 0) {
 		write_unlock(&idev->lock);
 		if (!ipv6_get_lladdr(dev, &lladdr, IFA_F_TENTATIVE))
 			ndisc_send_rs(dev, &lladdr,
@@ -3972,11 +3976,12 @@ static void addrconf_rs_timer(struct timer_list *t)
 
 		write_lock(&idev->lock);
 		idev->rs_interval = rfc3315_s14_backoff_update(
-			idev->rs_interval, idev->cnf.rtr_solicit_max_interval);
+				idev->rs_interval,
+				READ_ONCE(idev->cnf.rtr_solicit_max_interval));
 		/* The wait after the last probe can be shorter */
 		addrconf_mod_rs_timer(idev, (idev->rs_probes ==
-					     idev->cnf.rtr_solicits) ?
-				      idev->cnf.rtr_solicit_delay :
+					     READ_ONCE(idev->cnf.rtr_solicits)) ?
+				      READ_ONCE(idev->cnf.rtr_solicit_delay) :
 				      idev->rs_interval);
 	} else {
 		/*
@@ -3997,24 +4002,24 @@ put:
  */
 static void addrconf_dad_kick(struct inet6_ifaddr *ifp)
 {
-	unsigned long rand_num;
 	struct inet6_dev *idev = ifp->idev;
+	unsigned long rand_num;
 	u64 nonce;
 
 	if (ifp->flags & IFA_F_OPTIMISTIC)
 		rand_num = 0;
 	else
-		rand_num = prandom_u32() % (idev->cnf.rtr_solicit_delay ? : 1);
+		rand_num = prandom_u32() % (READ_ONCE(idev->cnf.rtr_solicit_delay) ? : 1);
 
 	nonce = 0;
-	if (idev->cnf.enhanced_dad ||
-	    dev_net(idev->dev)->ipv6.devconf_all->enhanced_dad) {
+	if (READ_ONCE(idev->cnf.enhanced_dad) ||
+	    READ_ONCE(dev_net(idev->dev)->ipv6.devconf_all->enhanced_dad)) {
 		do
 			get_random_bytes(&nonce, 6);
 		while (nonce == 0);
 	}
 	ifp->dad_nonce = nonce;
-	ifp->dad_probes = idev->cnf.dad_transmits;
+	ifp->dad_probes = READ_ONCE(idev->cnf.dad_transmits);
 	addrconf_mod_dad_work(ifp, rand_num);
 }
 
@@ -4253,7 +4258,7 @@ static void addrconf_dad_completed(struct inet6_ifaddr *ifp, bool bump_id,
 	send_mld = ifp->scope == IFA_LINK && ipv6_lonely_lladdr(ifp);
 	send_rs = send_mld &&
 		  ipv6_accept_ra(ifp->idev) &&
-		  ifp->idev->cnf.rtr_solicits != 0 &&
+		  READ_ONCE(ifp->idev->cnf.rtr_solicits) != 0 &&
 		  (dev->flags & IFF_LOOPBACK) == 0 &&
 		  (dev->type != ARPHRD_TUNNEL) &&
 		  !netif_is_team_port(dev);
@@ -4288,7 +4293,7 @@ static void addrconf_dad_completed(struct inet6_ifaddr *ifp, bool bump_id,
 		write_lock_bh(&ifp->idev->lock);
 		spin_lock(&ifp->lock);
 		ifp->idev->rs_interval = rfc3315_s14_backoff_init(
-			ifp->idev->cnf.rtr_solicit_interval);
+			READ_ONCE(ifp->idev->cnf.rtr_solicit_interval));
 		ifp->idev->rs_probes = 1;
 		ifp->idev->if_flags |= IF_RS_SENT;
 		addrconf_mod_rs_timer(ifp->idev, ifp->idev->rs_interval);
@@ -4607,8 +4612,9 @@ restart:
 				}
 			} else if ((ifp->flags&IFA_F_TEMPORARY) &&
 				   !(ifp->flags&IFA_F_TENTATIVE)) {
-				unsigned long regen_advance = ifp->idev->cnf.regen_max_retry *
-					ifp->idev->cnf.dad_transmits *
+				unsigned long regen_advance =
+					READ_ONCE(ifp->idev->cnf.regen_max_retry) *
+					READ_ONCE(ifp->idev->cnf.dad_transmits) *
 					max(NEIGH_VAR(ifp->idev->nd_parms, RETRANS_TIME), HZ/100) / HZ;
 
 				if (age >= ifp->prefered_lft - regen_advance) {
@@ -5808,7 +5814,7 @@ static int inet6_set_iftoken(struct inet6_dev *idev, struct in6_addr *token,
 		return -EINVAL;
 	}
 
-	if (idev->cnf.rtr_solicits == 0) {
+	if (READ_ONCE(idev->cnf.rtr_solicits) == 0) {
 		NL_SET_ERR_MSG(extack,
 			       "Router solicitation is disabled on device");
 		return -EINVAL;
@@ -5841,7 +5847,7 @@ update_lft:
 	if (update_rs) {
 		idev->if_flags |= IF_RS_SENT;
 		idev->rs_interval = rfc3315_s14_backoff_init(
-			idev->cnf.rtr_solicit_interval);
+			READ_ONCE(idev->cnf.rtr_solicit_interval));
 		idev->rs_probes = 1;
 		addrconf_mod_rs_timer(idev, idev->rs_interval);
 	}
