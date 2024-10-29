@@ -654,7 +654,7 @@ static inline void __irq_exit_rcu(void)
 	if (!in_interrupt() && local_softirq_pending())
 		invoke_softirq();
 
-	if (IS_ENABLED(CONFIG_PREEMPT_RT) && local_pending_timers() &&
+	if (IS_ENABLED(CONFIG_PREEMPT_RT) && local_timers_pending() &&
 	    !(in_nmi() | in_hardirq()))
 		wake_timersd();
 
@@ -996,12 +996,20 @@ static struct smp_hotplug_thread softirq_threads = {
 #ifdef CONFIG_PREEMPT_RT
 static void timersd_setup(unsigned int cpu)
 {
+	/* Above SCHED_NORMAL to handle timers before regular tasks. */
 	sched_set_fifo_low(current);
 }
 
 static int timersd_should_run(unsigned int cpu)
 {
-	return local_pending_timers();
+	return local_timers_pending();
+}
+
+void raise_ktimers_thread(unsigned int nr)
+{
+	lockdep_assert_in_irq();
+	trace_softirq_raise(nr);
+	__this_cpu_or(pending_timer_softirq, 1 << nr);
 }
 
 static void run_timersd(unsigned int cpu)
@@ -1010,34 +1018,13 @@ static void run_timersd(unsigned int cpu)
 
 	ksoftirqd_run_begin();
 
-	timer_si = local_pending_timers();
+	timer_si = local_timers_pending();
 	__this_cpu_write(pending_timer_softirq, 0);
 	or_softirq_pending(timer_si);
 
 	__do_softirq();
 
 	ksoftirqd_run_end();
-}
-
-static void raise_ktimers_thread(unsigned int nr)
-{
-	trace_softirq_raise(nr);
-	__this_cpu_or(pending_timer_softirq, 1 << nr);
-}
-
-void raise_hrtimer_softirq(void)
-{
-	raise_ktimers_thread(HRTIMER_SOFTIRQ);
-}
-
-void raise_timer_softirq(void)
-{
-	unsigned long flags;
-
-	local_irq_save(flags);
-	raise_ktimers_thread(TIMER_SOFTIRQ);
-	wake_timersd();
-	local_irq_restore(flags);
 }
 
 static struct smp_hotplug_thread timer_threads = {
