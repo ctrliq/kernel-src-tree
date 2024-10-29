@@ -3155,6 +3155,12 @@ static int ext4_da_write_end(struct file *file,
 	if (unlikely(copied < len) && !PageUptodate(page))
 		copied = 0;
 
+	if (unlikely(!page_has_buffers(page))) {
+		unlock_page(page);
+		put_page(page);
+		return -EIO;
+	}
+
 	start = pos & (PAGE_SIZE - 1);
 	end = start + copied - 1;
 
