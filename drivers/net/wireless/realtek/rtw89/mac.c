@@ -3651,6 +3651,7 @@ static int set_host_rpr_ax(struct rtw89_dev *rtwdev)
 
 static int trx_init_ax(struct rtw89_dev *rtwdev)
 {
+	enum rtw89_core_chip_id chip_id = rtwdev->chip->chip_id;
 	enum rtw89_qta_mode qta_mode = rtwdev->mac.qta_mode;
 	int ret;
 
@@ -3693,6 +3694,10 @@ static int trx_init_ax(struct rtw89_dev *rtwdev)
 		rtw89_err(rtwdev, "[ERR] set host rpr %d\n", ret);
 		return ret;
 	}
+
+	if (chip_id == RTL8852C)
+		rtw89_write32_clr(rtwdev, R_AX_RSP_CHK_SIG,
+				  B_AX_RSP_STATIC_RTS_CHK_SERV_BW_EN);
 
 	return 0;
 }
