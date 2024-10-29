@@ -3,6 +3,7 @@
 %global include_fedora 1
 %global include_rhel 1
 %global include_rt 1
+%global include_automotive 1
 %global patchlist_changelog 1
 %global released_kernel 0
 %define buildid .test
