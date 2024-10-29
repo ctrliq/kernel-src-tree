@@ -6425,7 +6425,7 @@ static inline bool rtw89_is_rtl885xb(struct rtw89_dev *rtwdev)
 {
 	enum rtw89_core_chip_id chip_id = rtwdev->chip->chip_id;
 
-	if (chip_id == RTL8852B || chip_id == RTL8851B)
+	if (chip_id == RTL8852B || chip_id == RTL8851B || chip_id == RTL8852BT)
 		return true;
 
 	return false;
