@@ -1085,6 +1085,7 @@ bool ____mt76_poll_msec(struct mt76_dev *dev, u32 offset, u32 mask, u32 val,
 
 void mt76_mmio_init(struct mt76_dev *dev, void __iomem *regs);
 void mt76_pci_disable_aspm(struct pci_dev *pdev);
+bool mt76_pci_aspm_supported(struct pci_dev *pdev);
 
 #ifdef CONFIG_NET_MEDIATEK_SOC_WED
 int mt76_net_setup_tc(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
