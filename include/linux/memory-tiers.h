@@ -24,6 +24,8 @@ struct memory_tier;
 struct memory_dev_type {
 	/* list of memory types that are part of same tier as this type */
 	struct list_head tier_sibling;
+	/* list of memory types that are managed by one driver */
+	struct list_head list;
 	/* abstract distance for this specific memory type */
 	int adistance;
 	/* Nodes of same abstract distance */
@@ -37,7 +39,7 @@ struct access_coordinate;
 extern bool numa_demotion_enabled;
 extern struct memory_dev_type *default_dram_type;
 struct memory_dev_type *alloc_memory_type(int adistance);
-void destroy_memory_type(struct memory_dev_type *memtype);
+void put_memory_type(struct memory_dev_type *memtype);
 void init_node_memory_type(int node, struct memory_dev_type *default_type);
 void clear_node_memory_type(int node, struct memory_dev_type *memtype);
 int register_mt_adistance_algorithm(struct notifier_block *nb);
@@ -46,6 +48,9 @@ int mt_calc_adistance(int node, int *adist);
 int mt_set_default_dram_perf(int nid, struct access_coordinate *perf,
 			     const char *source);
 int mt_perf_to_adistance(struct access_coordinate *perf, int *adist);
+struct memory_dev_type *mt_find_alloc_memory_type(int adist,
+						  struct list_head *memory_types);
+void mt_put_memory_types(struct list_head *memory_types);
 #ifdef CONFIG_MIGRATION
 int next_demotion_node(int node);
 void node_get_allowed_targets(pg_data_t *pgdat, nodemask_t *targets);
@@ -79,7 +84,7 @@ static inline struct memory_dev_type *alloc_memory_type(int adistance)
 	return NULL;
 }
 
-static inline void destroy_memory_type(struct memory_dev_type *memtype)
+static inline void put_memory_type(struct memory_dev_type *memtype)
 {
 
 }
@@ -133,6 +138,16 @@ static inline int mt_set_default_dram_perf(int nid, struct access_coordinate *pe
 static inline int mt_perf_to_adistance(struct access_coordinate *perf, int *adist)
 {
 	return -EIO;
+}
+
+static inline struct memory_dev_type *mt_find_alloc_memory_type(int adist,
+								struct list_head *memory_types)
+{
+	return NULL;
+}
+
+static inline void mt_put_memory_types(struct list_head *memory_types)
+{
 }
 #endif	/* CONFIG_NUMA */
 #endif  /* _LINUX_MEMORY_TIERS_H */
