@@ -1411,14 +1411,14 @@ __bpf_kfunc int bpf_verify_pkcs7_signature(struct bpf_dynptr_kern *data_ptr,
 
 __bpf_kfunc_end_defs();
 
-BTF_SET8_START(key_sig_kfunc_set)
+BTF_KFUNCS_START(key_sig_kfunc_set)
 BTF_ID_FLAGS(func, bpf_lookup_user_key, KF_ACQUIRE | KF_RET_NULL | KF_SLEEPABLE)
 BTF_ID_FLAGS(func, bpf_lookup_system_key, KF_ACQUIRE | KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_key_put, KF_RELEASE)
 #ifdef CONFIG_SYSTEM_DATA_VERIFICATION
 BTF_ID_FLAGS(func, bpf_verify_pkcs7_signature, KF_SLEEPABLE)
 #endif
-BTF_SET8_END(key_sig_kfunc_set)
+BTF_KFUNCS_END(key_sig_kfunc_set)
 
 static const struct btf_kfunc_id_set bpf_key_sig_kfunc_set = {
 	.owner = THIS_MODULE,
@@ -1562,7 +1562,7 @@ bpf_tracing_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 	case BPF_FUNC_trace_vprintk:
 		return bpf_get_trace_vprintk_proto();
 	default:
-		return bpf_base_func_proto(func_id);
+		return bpf_base_func_proto(func_id, prog);
 	}
 }
 
@@ -2612,12 +2612,15 @@ static void bpf_kprobe_multi_link_dealloc(struct bpf_link *link)
 static int bpf_kprobe_multi_link_fill_link_info(const struct bpf_link *link,
 						struct bpf_link_info *info)
 {
+	u64 __user *ucookies = u64_to_user_ptr(info->kprobe_multi.cookies);
 	u64 __user *uaddrs = u64_to_user_ptr(info->kprobe_multi.addrs);
 	struct bpf_kprobe_multi_link *kmulti_link;
 	u32 ucount = info->kprobe_multi.count;
 	int err = 0, i;
 
 	if (!uaddrs ^ !ucount)
+		return -EINVAL;
+	if (ucookies && !ucount)
 		return -EINVAL;
 
 	kmulti_link = container_of(link, struct bpf_kprobe_multi_link, link);
@@ -2631,6 +2634,18 @@ static int bpf_kprobe_multi_link_fill_link_info(const struct bpf_link *link,
 		err = -ENOSPC;
 	else
 		ucount = kmulti_link->cnt;
+
+	if (ucookies) {
+		if (kmulti_link->cookies) {
+			if (copy_to_user(ucookies, kmulti_link->cookies, ucount * sizeof(u64)))
+				return -EFAULT;
+		} else {
+			for (i = 0; i < ucount; i++) {
+				if (put_user(0, ucookies + i))
+					return -EFAULT;
+			}
+		}
+	}
 
 	if (kallsyms_show_value(current_cred())) {
 		if (copy_to_user(uaddrs, kmulti_link->addrs, ucount * sizeof(u64)))
@@ -2646,7 +2661,7 @@ static int bpf_kprobe_multi_link_fill_link_info(const struct bpf_link *link,
 
 static const struct bpf_link_ops bpf_kprobe_multi_link_lops = {
 	.release = bpf_kprobe_multi_link_release,
-	.dealloc = bpf_kprobe_multi_link_dealloc,
+	.dealloc_deferred = bpf_kprobe_multi_link_dealloc,
 	.fill_link_info = bpf_kprobe_multi_link_fill_link_info,
 };
 
@@ -3062,6 +3077,9 @@ static void bpf_uprobe_multi_link_release(struct bpf_link *link)
 
 	umulti_link = container_of(link, struct bpf_uprobe_multi_link, link);
 	bpf_uprobe_unregister(&umulti_link->path, umulti_link->uprobes, umulti_link->cnt);
+	if (umulti_link->task)
+		put_task_struct(umulti_link->task);
+	path_put(&umulti_link->path);
 }
 
 static void bpf_uprobe_multi_link_dealloc(struct bpf_link *link)
@@ -3069,9 +3087,6 @@ static void bpf_uprobe_multi_link_dealloc(struct bpf_link *link)
 	struct bpf_uprobe_multi_link *umulti_link;
 
 	umulti_link = container_of(link, struct bpf_uprobe_multi_link, link);
-	if (umulti_link->task)
-		put_task_struct(umulti_link->task);
-	path_put(&umulti_link->path);
 	kvfree(umulti_link->uprobes);
 	kfree(umulti_link);
 }
@@ -3147,7 +3162,7 @@ static int bpf_uprobe_multi_link_fill_link_info(const struct bpf_link *link,
 
 static const struct bpf_link_ops bpf_uprobe_multi_link_lops = {
 	.release = bpf_uprobe_multi_link_release,
-	.dealloc = bpf_uprobe_multi_link_dealloc,
+	.dealloc_deferred = bpf_uprobe_multi_link_dealloc,
 	.fill_link_info = bpf_uprobe_multi_link_fill_link_info,
 };
 
@@ -3161,7 +3176,7 @@ static int uprobe_prog_run(struct bpf_uprobe *uprobe,
 		.uprobe = uprobe,
 	};
 	struct bpf_prog *prog = link->link.prog;
-	bool sleepable = prog->aux->sleepable;
+	bool sleepable = prog->sleepable;
 	struct bpf_run_ctx *old_run_ctx;
 	int err = 0;
 
