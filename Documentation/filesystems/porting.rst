@@ -937,6 +937,17 @@ finish_open_simple()).
 
 **mandatory**
 
+Calling convention for ->huge_fault has changed.  It now takes a page
+order instead of an enum page_entry_size, and it may be called without the
+mmap_lock held.  All in-tree users have been audited and do not seem to
+depend on the mmap_lock being held, but out of tree users should verify
+for themselves.  If they do need it, they can return VM_FAULT_RETRY to
+be called with the mmap_lock held.
+
+---
+
+**mandatory**
+
 The list of children anchored in parent dentry got turned into hlist now.
 Field names got changed (->d_children/->d_sib instead of ->d_subdirs/->d_child
 for anchor/entries resp.), so any affected places will be immediately caught
