@@ -5894,17 +5894,13 @@ static int nft_flush_set(const struct nft_ctx *ctx,
 			 struct nft_set_elem *elem)
 {
 	struct nft_trans *trans;
-	int err;
 
 	trans = nft_trans_alloc_gfp(ctx, NFT_MSG_DELSETELEM,
 				    sizeof(struct nft_trans_elem), GFP_ATOMIC);
 	if (!trans)
 		return -ENOMEM;
 
-	if (!set->ops->flush(ctx->net, set, elem->priv)) {
-		err = -ENOENT;
-		goto err1;
-	}
+	set->ops->flush(ctx->net, set, elem->priv);
 	set->ndeact++;
 
 	nft_setelem_data_deactivate(ctx->net, set, elem);
@@ -5913,9 +5909,6 @@ static int nft_flush_set(const struct nft_ctx *ctx,
 	list_add_tail(&trans->list, &ctx->net->nft.commit_list);
 
 	return 0;
-err1:
-	kfree(trans);
-	return err;
 }
 
 static int nf_tables_delsetelem(struct net *net, struct sock *nlsk,
