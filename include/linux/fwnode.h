@@ -16,6 +16,12 @@
 
 #include <linux/rh_kabi.h>
 
+enum dev_dma_attr {
+	DEV_DMA_NOT_SUPPORTED,
+	DEV_DMA_NON_COHERENT,
+	DEV_DMA_COHERENT,
+};
+
 struct fwnode_operations;
 struct device;
 
