@@ -51,6 +51,8 @@ extern struct inet_hashinfo tcp_hashinfo;
 DECLARE_PER_CPU(unsigned int, tcp_orphan_count);
 int tcp_orphan_count_sum(void);
 
+DECLARE_PER_CPU(u32, tcp_tw_isn);
+
 void tcp_time_wait(struct sock *sk, int state, int timeo);
 
 #define MAX_TCP_HEADER	L1_CACHE_ALIGN(128 + MAX_HEADER)
@@ -385,7 +387,8 @@ enum tcp_tw_status {
 
 enum tcp_tw_status tcp_timewait_state_process(struct inet_timewait_sock *tw,
 					      struct sk_buff *skb,
-					      const struct tcphdr *th);
+					      const struct tcphdr *th,
+					      u32 *tw_isn);
 struct sock *tcp_check_req(struct sock *sk, struct sk_buff *skb,
 			   struct request_sock *req, bool fastopen,
 			   bool *lost_race);
@@ -859,13 +862,10 @@ struct tcp_skb_cb {
 	__u32		seq;		/* Starting sequence number	*/
 	__u32		end_seq;	/* SEQ + FIN + SYN + datalen	*/
 	union {
-		/* Note : tcp_tw_isn is used in input path only
-		 *	  (isn chosen by tcp_timewait_state_process())
-		 *
+		/* Note :
 		 * 	  tcp_gso_segs/size are used in write queue only,
 		 *	  cf tcp_skb_pcount()/tcp_skb_mss()
 		 */
-		__u32		tcp_tw_isn;
 		struct {
 			u16	tcp_gso_segs;
 			u16	tcp_gso_size;
@@ -1461,11 +1461,10 @@ static inline int tcp_space_from_win(const struct sock *sk, int win)
 	return __tcp_space_from_win(tcp_sk(sk)->scaling_ratio, win);
 }
 
-/* Assume a conservative default of 1200 bytes of payload per 4K page.
+/* Assume a 50% default for skb->len/skb->truesize ratio.
  * This may be adjusted later in tcp_measure_rcv_mss().
  */
-#define TCP_DEFAULT_SCALING_RATIO ((1200 << TCP_RMEM_TO_WIN_SCALE) / \
-				   SKB_TRUESIZE(4096))
+#define TCP_DEFAULT_SCALING_RATIO (1 << (TCP_RMEM_TO_WIN_SCALE - 1))
 
 static inline void tcp_scaling_ratio_init(struct sock *sk)
 {
@@ -2125,7 +2124,8 @@ struct tcp_request_sock_ops {
 	struct dst_entry *(*route_req)(const struct sock *sk,
 				       struct sk_buff *skb,
 				       struct flowi *fl,
-				       struct request_sock *req);
+				       struct request_sock *req,
+				       u32 tw_isn);
 	u32 (*init_seq)(const struct sk_buff *skb);
 	u32 (*init_ts_off)(const struct net *net, const struct sk_buff *skb);
 	int (*send_synack)(const struct sock *sk, struct dst_entry *dst,
@@ -2179,9 +2179,26 @@ static inline s64 tcp_rto_delta_us(const struct sock *sk)
 {
 	const struct sk_buff *skb = tcp_rtx_queue_head(sk);
 	u32 rto = inet_csk(sk)->icsk_rto;
-	u64 rto_time_stamp_us = tcp_skb_timestamp_us(skb) + jiffies_to_usecs(rto);
 
-	return rto_time_stamp_us - tcp_sk(sk)->tcp_mstamp;
+	if (likely(skb)) {
+		u64 rto_time_stamp_us = tcp_skb_timestamp_us(skb) + jiffies_to_usecs(rto);
+
+		return rto_time_stamp_us - tcp_sk(sk)->tcp_mstamp;
+	} else {
+		WARN_ONCE(1,
+			"rtx queue emtpy: "
+			"out:%u sacked:%u lost:%u retrans:%u "
+			"tlp_high_seq:%u sk_state:%u ca_state:%u "
+			"advmss:%u mss_cache:%u pmtu:%u\n",
+			tcp_sk(sk)->packets_out, tcp_sk(sk)->sacked_out,
+			tcp_sk(sk)->lost_out, tcp_sk(sk)->retrans_out,
+			tcp_sk(sk)->tlp_high_seq, sk->sk_state,
+			inet_csk(sk)->icsk_ca_state,
+			tcp_sk(sk)->advmss, tcp_sk(sk)->mss_cache,
+			inet_csk(sk)->icsk_pmtu_cookie);
+		return jiffies_to_usecs(rto);
+	}
+
 }
 
 /*
