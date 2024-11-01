@@ -8,6 +8,7 @@
 #include <linux/pci.h>
 #include <linux/etherdevice.h>
 #include <linux/vmalloc.h>
+#include <net/netdev_queues.h>
 
 #include "octep_vf_config.h"
 #include "octep_vf_main.h"
@@ -86,12 +87,10 @@ int octep_vf_iq_process_completions(struct octep_vf_iq *iq, u16 budget)
 	iq->stats.sgentry_sent += compl_sg;
 	iq->flush_index = fi;
 
-	netdev_tx_completed_queue(iq->netdev_q, compl_pkts, compl_bytes);
+	netif_subqueue_completed_wake(iq->netdev, iq->q_no, compl_pkts,
+				      compl_bytes, IQ_INSTR_SPACE(iq),
+				      OCTEP_VF_WAKE_QUEUE_THRESHOLD);
 
-	if (unlikely(__netif_subqueue_stopped(iq->netdev, iq->q_no)) &&
-	    (IQ_INSTR_SPACE(iq) >
-	     OCTEP_VF_WAKE_QUEUE_THRESHOLD))
-		netif_wake_subqueue(iq->netdev, iq->q_no);
 	return !budget;
 }
 

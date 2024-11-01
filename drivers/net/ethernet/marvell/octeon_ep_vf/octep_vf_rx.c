@@ -27,7 +27,7 @@ static void octep_vf_oq_reset_indices(struct octep_vf_oq *oq)
  * @oq: Octeon Rx queue data structure.
  *
  * Return: 0, if successfully filled receive buffers for all descriptors.
- *         -1, if failed to allocate a buffer or failed to map for DMA.
+ *         -ENOMEM, if failed to allocate a buffer or failed to map for DMA.
  */
 static int octep_vf_oq_fill_ring_buffers(struct octep_vf_oq *oq)
 {
@@ -48,7 +48,6 @@ static int octep_vf_oq_fill_ring_buffers(struct octep_vf_oq *oq)
 			dev_err(oq->dev,
 				"OQ-%d buffer alloc: DMA mapping error!\n",
 				oq->q_no);
-			put_page(page);
 			goto dma_map_err;
 		}
 		oq->buff_info[i].page = page;
@@ -57,6 +56,7 @@ static int octep_vf_oq_fill_ring_buffers(struct octep_vf_oq *oq)
 	return 0;
 
 dma_map_err:
+	put_page(page);
 rx_buf_alloc_err:
 	while (i) {
 		i--;
@@ -65,7 +65,7 @@ rx_buf_alloc_err:
 		oq->buff_info[i].page = NULL;
 	}
 
-	return -1;
+	return -ENOMEM;
 }
 
 /**
@@ -186,7 +186,7 @@ desc_dma_alloc_err:
 	vfree(oq);
 	oct->oq[q_no] = NULL;
 create_oq_fail:
-	return -1;
+	return -ENOMEM;
 }
 
 /**
@@ -230,8 +230,7 @@ static int octep_vf_free_oq(struct octep_vf_oq *oq)
 
 	octep_vf_oq_free_ring_buffers(oq);
 
-	if (oq->buff_info)
-		vfree(oq->buff_info);
+	vfree(oq->buff_info);
 
 	if (oq->desc_ring)
 		dma_free_coherent(oq->dev,
@@ -271,7 +270,7 @@ oq_setup_err:
 		i--;
 		octep_vf_free_oq(oct->oq[i]);
 	}
-	return -1;
+	return retval;
 }
 
 /**
@@ -398,7 +397,7 @@ static int __octep_vf_oq_process_rx(struct octep_vf_device *oct,
 		rx_bytes += buff_info->len;
 
 		if (buff_info->len <= oq->max_single_buffer_size) {
-			skb = build_skb((void *)resp_hw, PAGE_SIZE);
+			skb = napi_build_skb((void *)resp_hw, PAGE_SIZE);
 			skb_reserve(skb, data_offset);
 			skb_put(skb, buff_info->len);
 			read_idx++;
@@ -409,7 +408,7 @@ static int __octep_vf_oq_process_rx(struct octep_vf_device *oct,
 			struct skb_shared_info *shinfo;
 			u16 data_len;
 
-			skb = build_skb((void *)resp_hw, PAGE_SIZE);
+			skb = napi_build_skb((void *)resp_hw, PAGE_SIZE);
 			skb_reserve(skb, data_offset);
 			/* Head fragment includes response header(s);
 			 * subsequent fragments contains only data.
@@ -448,7 +447,7 @@ static int __octep_vf_oq_process_rx(struct octep_vf_device *oct,
 		}
 
 		skb->dev = oq->netdev;
-		skb->protocol =  eth_type_trans(skb, skb->dev);
+		skb->protocol = eth_type_trans(skb, skb->dev);
 		if (feat & NETIF_F_RXCSUM &&
 		    OCTEP_VF_RX_CSUM_VERIFIED(rx_ol_flags))
 			skb->ip_summed = CHECKSUM_UNNECESSARY;

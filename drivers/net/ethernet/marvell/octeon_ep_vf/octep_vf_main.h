@@ -40,10 +40,6 @@
 				  (iq_)->max_count - IQ_INSTR_PENDING(iq_); \
 				})
 
-#ifndef UINT64_MAX
-#define UINT64_MAX		((u64)(~((u64)0)))        /* 0xFFFFFFFFFFFFFFFF */
-#endif
-
 /* PCI address space mapping information.
  * Each of the 3 address spaces given by BAR0, BAR2 and BAR4 of
  * Octeon gets mapped to different physical address spaces in

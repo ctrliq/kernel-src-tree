@@ -13,14 +13,8 @@
 #include "octep_vf_main.h"
 
 static const char octep_vf_gstrings_global_stats[][ETH_GSTRING_LEN] = {
-	"rx_packets",
-	"tx_packets",
-	"rx_bytes",
-	"tx_bytes",
 	"rx_alloc_errors",
 	"tx_busy_errors",
-	"rx_dropped",
-	"tx_dropped",
 	"tx_hw_pkts",
 	"tx_hw_octs",
 	"tx_hw_bcast",
@@ -28,10 +22,7 @@ static const char octep_vf_gstrings_global_stats[][ETH_GSTRING_LEN] = {
 	"rx_hw_pkts",
 	"rx_hw_bytes",
 	"rx_hw_bcast",
-	"rx_hw_mcast",
-	"rx_dropped_pkts_fifo_full",
 	"rx_dropped_bytes_fifo_full",
-	"rx_err_pkts",
 };
 
 #define OCTEP_VF_GLOBAL_STATS_CNT (sizeof(octep_vf_gstrings_global_stats) / ETH_GSTRING_LEN)
@@ -121,20 +112,10 @@ static void octep_vf_get_ethtool_stats(struct net_device *netdev,
 	struct octep_vf_iface_tx_stats *iface_tx_stats;
 	struct octep_vf_iface_rx_stats *iface_rx_stats;
 	u64 rx_alloc_errors, tx_busy_errors;
-	u64 rx_packets, rx_bytes;
-	u64 tx_packets, tx_bytes;
 	int q, i;
 
-	rx_packets = 0;
-	rx_bytes = 0;
-	tx_packets = 0;
-	tx_bytes = 0;
 	rx_alloc_errors = 0;
 	tx_busy_errors = 0;
-	tx_packets = 0;
-	tx_bytes = 0;
-	rx_packets = 0;
-	rx_bytes = 0;
 
 	octep_vf_get_if_stats(oct);
 	iface_tx_stats = &oct->iface_tx_stats;
@@ -144,35 +125,20 @@ static void octep_vf_get_ethtool_stats(struct net_device *netdev,
 		struct octep_vf_iq *iq = oct->iq[q];
 		struct octep_vf_oq *oq = oct->oq[q];
 
-		tx_packets += iq->stats.instr_completed;
-		tx_bytes += iq->stats.bytes_sent;
 		tx_busy_errors += iq->stats.tx_busy;
-
-		rx_packets += oq->stats.packets;
-		rx_bytes += oq->stats.bytes;
 		rx_alloc_errors += oq->stats.alloc_failures;
 	}
 	i = 0;
-	data[i++] = rx_packets;
-	data[i++] = tx_packets;
-	data[i++] = rx_bytes;
-	data[i++] = tx_bytes;
 	data[i++] = rx_alloc_errors;
 	data[i++] = tx_busy_errors;
-	data[i++] = iface_rx_stats->dropped_pkts_fifo_full +
-		    iface_rx_stats->err_pkts;
-	data[i++] = iface_tx_stats->dropped;
 	data[i++] = iface_tx_stats->pkts;
 	data[i++] = iface_tx_stats->octs;
 	data[i++] = iface_tx_stats->bcst;
 	data[i++] = iface_tx_stats->mcst;
 	data[i++] = iface_rx_stats->pkts;
 	data[i++] = iface_rx_stats->octets;
-	data[i++] = iface_rx_stats->mcast_pkts;
 	data[i++] = iface_rx_stats->bcast_pkts;
-	data[i++] = iface_rx_stats->dropped_pkts_fifo_full;
 	data[i++] = iface_rx_stats->dropped_octets_fifo_full;
-	data[i++] = iface_rx_stats->err_pkts;
 
 	/* Per Tx Queue stats */
 	for (q = 0; q < oct->num_iqs; q++) {

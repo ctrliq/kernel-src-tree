@@ -7,6 +7,8 @@
 #include <linux/irq.h>
 #include <linux/pci.h>
 #include <linux/irqdomain.h>
+/* RHEL-55507 needs cpuhotplug */
+#include <linux/cpuhotplug.h>
 
 #include <asm/hw_irq.h>
 #include <asm/irq_remapping.h>
