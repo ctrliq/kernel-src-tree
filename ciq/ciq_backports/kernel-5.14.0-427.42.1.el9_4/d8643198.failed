@@ -1,0 +1,151 @@
+net/sched: act_api: fix possible infinite loop in tcf_idr_check_alloc()
+
+jira LE-2015
+cve CVE-2024-40995
+Rebuild_History Non-Buildable kernel-5.14.0-427.42.1.el9_4
+commit-author David Ruth <druth@chromium.org>
+commit d864319871b05fadd153e0aede4811ca7008f5d6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-427.42.1.el9_4/d8643198.failed
+
+syzbot found hanging tasks waiting on rtnl_lock [1]
+
+A reproducer is available in the syzbot bug.
+
+When a request to add multiple actions with the same index is sent, the
+second request will block forever on the first request. This holds
+rtnl_lock, and causes tasks to hang.
+
+Return -EAGAIN to prevent infinite looping, while keeping documented
+behavior.
+
+[1]
+
+INFO: task kworker/1:0:5088 blocked for more than 143 seconds.
+Not tainted 6.9.0-rc4-syzkaller-00173-g3cdb45594619 #0
+"echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+task:kworker/1:0 state:D stack:23744 pid:5088 tgid:5088 ppid:2 flags:0x00004000
+Workqueue: events_power_efficient reg_check_chans_work
+Call Trace:
+<TASK>
+context_switch kernel/sched/core.c:5409 [inline]
+__schedule+0xf15/0x5d00 kernel/sched/core.c:6746
+__schedule_loop kernel/sched/core.c:6823 [inline]
+schedule+0xe7/0x350 kernel/sched/core.c:6838
+schedule_preempt_disabled+0x13/0x30 kernel/sched/core.c:6895
+__mutex_lock_common kernel/locking/mutex.c:684 [inline]
+__mutex_lock+0x5b8/0x9c0 kernel/locking/mutex.c:752
+wiphy_lock include/net/cfg80211.h:5953 [inline]
+reg_leave_invalid_chans net/wireless/reg.c:2466 [inline]
+reg_check_chans_work+0x10a/0x10e0 net/wireless/reg.c:2481
+
+Fixes: 0190c1d452a9 ("net: sched: atomically check-allocate action")
+	Reported-by: syzbot+b87c222546179f4513a7@syzkaller.appspotmail.com
+Closes: https://syzkaller.appspot.com/bug?extid=b87c222546179f4513a7
+	Signed-off-by: David Ruth <druth@chromium.org>
+	Reviewed-by: Jamal Hadi Salim <jhs@mojatatu.com>
+Link: https://lore.kernel.org/r/20240614190326.1349786-1-druth@chromium.org
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+
+(cherry picked from commit d864319871b05fadd153e0aede4811ca7008f5d6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/act_api.c
+diff --cc net/sched/act_api.c
+index 9d3f26bf0440,2520708b06a1..000000000000
+--- a/net/sched/act_api.c
++++ b/net/sched/act_api.c
+@@@ -824,43 -827,60 +824,53 @@@ int tcf_idr_check_alloc(struct tc_actio
+  	struct tcf_idrinfo *idrinfo = tn->idrinfo;
+  	struct tc_action *p;
+  	int ret;
+ -	u32 max;
+  
+++<<<<<<< HEAD
+ +again:
+ +	mutex_lock(&idrinfo->lock);
+ +	if (*index) {
+++=======
++ 	if (*index) {
++ 		rcu_read_lock();
+++>>>>>>> d864319871b0 (net/sched: act_api: fix possible infinite loop in tcf_idr_check_alloc())
+  		p = idr_find(&idrinfo->action_idr, *index);
+ -
+  		if (IS_ERR(p)) {
+  			/* This means that another process allocated
+  			 * index but did not assign the pointer yet.
+  			 */
+++<<<<<<< HEAD
+ +			mutex_unlock(&idrinfo->lock);
+ +			goto again;
+++=======
++ 			rcu_read_unlock();
++ 			return -EAGAIN;
+++>>>>>>> d864319871b0 (net/sched: act_api: fix possible infinite loop in tcf_idr_check_alloc())
+  		}
+  
+ -		if (!p) {
+ -			/* Empty slot, try to allocate it */
+ -			max = *index;
+ -			rcu_read_unlock();
+ -			goto new;
+ -		}
+ -
+ -		if (!refcount_inc_not_zero(&p->tcfa_refcnt)) {
+ -			/* Action was deleted in parallel */
+ -			rcu_read_unlock();
+ -			return -EAGAIN;
+ +		if (p) {
+ +			refcount_inc(&p->tcfa_refcnt);
+ +			if (bind)
+ +				atomic_inc(&p->tcfa_bindcnt);
+ +			*a = p;
+ +			ret = 1;
+ +		} else {
+ +			*a = NULL;
+ +			ret = idr_alloc_u32(&idrinfo->action_idr, NULL, index,
+ +					    *index, GFP_KERNEL);
+ +			if (!ret)
+ +				idr_replace(&idrinfo->action_idr,
+ +					    ERR_PTR(-EBUSY), *index);
+  		}
+ -
+ -		if (bind)
+ -			atomic_inc(&p->tcfa_bindcnt);
+ -		*a = p;
+ -
+ -		rcu_read_unlock();
+ -
+ -		return 1;
+  	} else {
+ -		/* Find a slot */
+  		*index = 1;
+ -		max = UINT_MAX;
+ +		*a = NULL;
+ +		ret = idr_alloc_u32(&idrinfo->action_idr, NULL, index,
+ +				    UINT_MAX, GFP_KERNEL);
+ +		if (!ret)
+ +			idr_replace(&idrinfo->action_idr, ERR_PTR(-EBUSY),
+ +				    *index);
+  	}
+ -
+ -new:
+ -	*a = NULL;
+ -
+ -	mutex_lock(&idrinfo->lock);
+ -	ret = idr_alloc_u32(&idrinfo->action_idr, ERR_PTR(-EBUSY), index, max,
+ -			    GFP_KERNEL);
+  	mutex_unlock(&idrinfo->lock);
+ -
+ -	/* N binds raced for action allocation,
+ -	 * retry for all the ones that failed.
+ -	 */
+ -	if (ret == -ENOSPC && *index == max)
+ -		ret = -EAGAIN;
+ -
+  	return ret;
+  }
+  EXPORT_SYMBOL(tcf_idr_check_alloc);
+* Unmerged path net/sched/act_api.c
