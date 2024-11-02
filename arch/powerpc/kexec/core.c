@@ -43,10 +43,12 @@ void machine_kexec_mask_interrupts(void) {
 	}
 }
 
+#ifdef CONFIG_CRASH_DUMP
 void machine_crash_shutdown(struct pt_regs *regs)
 {
 	default_machine_crash_shutdown(regs);
 }
+#endif
 
 void machine_kexec_cleanup(struct kimage *image)
 {
@@ -76,6 +78,7 @@ void machine_kexec(struct kimage *image)
 	for(;;);
 }
 
+#ifdef CONFIG_CRASH_RESERVE
 void __init reserve_crashkernel(void)
 {
 	unsigned long long crash_size, crash_base, total_mem_sz;
@@ -250,3 +253,4 @@ static int __init kexec_setup(void)
 	return 0;
 }
 late_initcall(kexec_setup);
+#endif /* CONFIG_CRASH_RESERVE */
