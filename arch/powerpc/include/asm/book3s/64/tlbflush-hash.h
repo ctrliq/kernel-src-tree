@@ -62,13 +62,11 @@ extern void flush_hash_hugepage(unsigned long vsid, unsigned long addr,
 
 struct mmu_gather;
 extern void hash__tlb_flush(struct mmu_gather *tlb);
-void flush_tlb_pmd_range(struct mm_struct *mm, pmd_t *pmd, unsigned long addr);
 
 #ifdef CONFIG_PPC_64S_HASH_MMU
 /* Private function for use by PCI IO mapping code */
 extern void __flush_hash_table_range(unsigned long start, unsigned long end);
-extern void flush_tlb_pmd_range(struct mm_struct *mm, pmd_t *pmd,
-				unsigned long addr);
+void flush_hash_table_pmd_range(struct mm_struct *mm, pmd_t *pmd, unsigned long addr);
 #else
 static inline void __flush_hash_table_range(unsigned long start, unsigned long end) { }
 #endif
