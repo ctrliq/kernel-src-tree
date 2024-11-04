@@ -414,7 +414,7 @@ void *arch_memremap_wb(phys_addr_t phys_addr, size_t size)
 						   __builtin_return_address(0));
 }
 
-void __iounmap(volatile void __iomem *io_addr)
+void iounmap(volatile void __iomem *io_addr)
 {
 	void *addr = (void *)(PAGE_MASK & (unsigned long)io_addr);
 	struct static_vm *svm;
@@ -443,12 +443,6 @@ void __iounmap(volatile void __iomem *io_addr)
 	vunmap(addr);
 }
 
-void (*arch_iounmap)(volatile void __iomem *) = __iounmap;
-
-void iounmap(volatile void __iomem *cookie)
-{
-	arch_iounmap(cookie);
-}
 EXPORT_SYMBOL(iounmap);
 
 #ifdef CONFIG_PCI
