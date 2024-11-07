@@ -3,7 +3,7 @@
 #include <test_progs.h>
 #include <network_helpers.h>
 #include "tailcall_poke.skel.h"
-
+#include "tailcall_fail.skel.h"
 
 /* test_tailcall_1 checks basic functionality by patching multiple locations
  * in a single program for a single tail call slot with nop->jmp, jmp->nop
@@ -1187,6 +1187,11 @@ out:
 	tailcall_poke__destroy(call);
 }
 
+static void test_tailcall_failure()
+{
+	RUN_TESTS(tailcall_fail);
+}
+
 void test_tailcalls(void)
 {
 	if (test__start_subtest("tailcall_1"))
@@ -1223,4 +1228,6 @@ void test_tailcalls(void)
 		test_tailcall_bpf2bpf_fentry_entry();
 	if (test__start_subtest("tailcall_poke"))
 		test_tailcall_poke();
+	if (test__start_subtest("tailcall_failure"))
+		test_tailcall_failure();
 }
