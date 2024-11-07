@@ -85,7 +85,7 @@ static void sticon_putcs(struct vc_data *conp, const u16 *s, unsigned int count,
     }
 }
 
-static void sticon_cursor(struct vc_data *conp, int mode)
+static void sticon_cursor(struct vc_data *conp, bool enable)
 {
     unsigned short car1;
 
@@ -94,7 +94,7 @@ static void sticon_cursor(struct vc_data *conp, int mode)
 	return;
 
     car1 = conp->vc_screenbuf[conp->state.x + conp->state.y * conp->vc_cols];
-    if (mode == CM_ERASE) {
+    if (!enable) {
 	sti_putc(sticon_sti, car1, conp->state.y, conp->state.x,
 		 font_data[conp->vc_num]);
 	return;
@@ -120,7 +120,7 @@ static bool sticon_scroll(struct vc_data *conp, unsigned int t,
     if (vga_is_gfx)
         return false;
 
-    sticon_cursor(conp, CM_ERASE);
+    sticon_cursor(conp, false);
 
     switch (dir) {
     case SM_UP:
