@@ -742,4 +742,5 @@ static struct gio_driver newport_driver = {
 };
 module_driver(newport_driver, gio_register_driver, gio_unregister_driver);
 
+MODULE_DESCRIPTION("SGI Newport console driver");
 MODULE_LICENSE("GPL");
