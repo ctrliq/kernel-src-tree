@@ -2145,7 +2145,7 @@ int dasd_flush_device_queue(struct dasd_device *device)
 		case DASD_CQR_IN_IO:
 			rc = device->discipline->term_IO(cqr);
 			if (rc) {
-				/* unable to terminate requeust */
+				/* unable to terminate request */
 				dev_err(&device->cdev->dev,
 					"Flushing the DASD request queue "
 					"failed for request %p\n", cqr);
