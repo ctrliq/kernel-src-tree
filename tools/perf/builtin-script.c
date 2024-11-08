@@ -2401,7 +2401,7 @@ static bool filter_cpu(struct perf_sample *sample)
 	return false;
 }
 
-static int process_sample_event(struct perf_tool *tool,
+static int process_sample_event(const struct perf_tool *tool,
 				union perf_event *event,
 				struct perf_sample *sample,
 				struct evsel *evsel,
@@ -2488,7 +2488,7 @@ out_put:
 // Used when scr->per_event_dump is not set
 static struct evsel_script es_stdout;
 
-static int process_attr(struct perf_tool *tool, union perf_event *event,
+static int process_attr(const struct perf_tool *tool, union perf_event *event,
 			struct evlist **pevlist)
 {
 	struct perf_script *scr = container_of(tool, struct perf_script, tool);
@@ -2554,7 +2554,7 @@ static int process_attr(struct perf_tool *tool, union perf_event *event,
 	return 0;
 }
 
-static int print_event_with_time(struct perf_tool *tool,
+static int print_event_with_time(const struct perf_tool *tool,
 				 union perf_event *event,
 				 struct perf_sample *sample,
 				 struct machine *machine,
@@ -2590,14 +2590,14 @@ static int print_event_with_time(struct perf_tool *tool,
 	return 0;
 }
 
-static int print_event(struct perf_tool *tool, union perf_event *event,
+static int print_event(const struct perf_tool *tool, union perf_event *event,
 		       struct perf_sample *sample, struct machine *machine,
 		       pid_t pid, pid_t tid)
 {
 	return print_event_with_time(tool, event, sample, machine, pid, tid, 0);
 }
 
-static int process_comm_event(struct perf_tool *tool,
+static int process_comm_event(const struct perf_tool *tool,
 			      union perf_event *event,
 			      struct perf_sample *sample,
 			      struct machine *machine)
@@ -2609,7 +2609,7 @@ static int process_comm_event(struct perf_tool *tool,
 			   event->comm.tid);
 }
 
-static int process_namespaces_event(struct perf_tool *tool,
+static int process_namespaces_event(const struct perf_tool *tool,
 				    union perf_event *event,
 				    struct perf_sample *sample,
 				    struct machine *machine)
@@ -2621,7 +2621,7 @@ static int process_namespaces_event(struct perf_tool *tool,
 			   event->namespaces.tid);
 }
 
-static int process_cgroup_event(struct perf_tool *tool,
+static int process_cgroup_event(const struct perf_tool *tool,
 				union perf_event *event,
 				struct perf_sample *sample,
 				struct machine *machine)
@@ -2633,7 +2633,7 @@ static int process_cgroup_event(struct perf_tool *tool,
 			    sample->tid);
 }
 
-static int process_fork_event(struct perf_tool *tool,
+static int process_fork_event(const struct perf_tool *tool,
 			      union perf_event *event,
 			      struct perf_sample *sample,
 			      struct machine *machine)
@@ -2645,7 +2645,7 @@ static int process_fork_event(struct perf_tool *tool,
 				     event->fork.pid, event->fork.tid,
 				     event->fork.time);
 }
-static int process_exit_event(struct perf_tool *tool,
+static int process_exit_event(const struct perf_tool *tool,
 			      union perf_event *event,
 			      struct perf_sample *sample,
 			      struct machine *machine)
@@ -2658,7 +2658,7 @@ static int process_exit_event(struct perf_tool *tool,
 	return perf_event__process_exit(tool, event, sample, machine);
 }
 
-static int process_mmap_event(struct perf_tool *tool,
+static int process_mmap_event(const struct perf_tool *tool,
 			      union perf_event *event,
 			      struct perf_sample *sample,
 			      struct machine *machine)
@@ -2670,7 +2670,7 @@ static int process_mmap_event(struct perf_tool *tool,
 			   event->mmap.tid);
 }
 
-static int process_mmap2_event(struct perf_tool *tool,
+static int process_mmap2_event(const struct perf_tool *tool,
 			      union perf_event *event,
 			      struct perf_sample *sample,
 			      struct machine *machine)
@@ -2682,7 +2682,7 @@ static int process_mmap2_event(struct perf_tool *tool,
 			   event->mmap2.tid);
 }
 
-static int process_switch_event(struct perf_tool *tool,
+static int process_switch_event(const struct perf_tool *tool,
 				union perf_event *event,
 				struct perf_sample *sample,
 				struct machine *machine)
@@ -2714,7 +2714,7 @@ static int process_auxtrace_error(struct perf_session *session,
 }
 
 static int
-process_lost_event(struct perf_tool *tool,
+process_lost_event(const struct perf_tool *tool,
 		   union perf_event *event,
 		   struct perf_sample *sample,
 		   struct machine *machine)
@@ -2724,7 +2724,7 @@ process_lost_event(struct perf_tool *tool,
 }
 
 static int
-process_throttle_event(struct perf_tool *tool __maybe_unused,
+process_throttle_event(const struct perf_tool *tool __maybe_unused,
 		       union perf_event *event,
 		       struct perf_sample *sample,
 		       struct machine *machine)
@@ -2735,7 +2735,7 @@ process_throttle_event(struct perf_tool *tool __maybe_unused,
 }
 
 static int
-process_finished_round_event(struct perf_tool *tool __maybe_unused,
+process_finished_round_event(const struct perf_tool *tool __maybe_unused,
 			     union perf_event *event,
 			     struct ordered_events *oe __maybe_unused)
 
@@ -2745,7 +2745,7 @@ process_finished_round_event(struct perf_tool *tool __maybe_unused,
 }
 
 static int
-process_bpf_events(struct perf_tool *tool __maybe_unused,
+process_bpf_events(const struct perf_tool *tool __maybe_unused,
 		   union perf_event *event,
 		   struct perf_sample *sample,
 		   struct machine *machine)
@@ -2757,7 +2757,7 @@ process_bpf_events(struct perf_tool *tool __maybe_unused,
 			   sample->tid);
 }
 
-static int process_text_poke_events(struct perf_tool *tool,
+static int process_text_poke_events(const struct perf_tool *tool,
 				    union perf_event *event,
 				    struct perf_sample *sample,
 				    struct machine *machine)
@@ -3759,7 +3759,7 @@ static
 int process_thread_map_event(struct perf_session *session,
 			     union perf_event *event)
 {
-	struct perf_tool *tool = session->tool;
+	const struct perf_tool *tool = session->tool;
 	struct perf_script *script = container_of(tool, struct perf_script, tool);
 
 	if (dump_trace)
@@ -3781,7 +3781,7 @@ static
 int process_cpu_map_event(struct perf_session *session,
 			  union perf_event *event)
 {
-	struct perf_tool *tool = session->tool;
+	const struct perf_tool *tool = session->tool;
 	struct perf_script *script = container_of(tool, struct perf_script, tool);
 
 	if (dump_trace)
@@ -3811,11 +3811,10 @@ static int process_feature_event(struct perf_session *session,
 static int perf_script__process_auxtrace_info(struct perf_session *session,
 					      union perf_event *event)
 {
-	struct perf_tool *tool = session->tool;
-
 	int ret = perf_event__process_auxtrace_info(session, event);
 
 	if (ret == 0) {
+		const struct perf_tool *tool = session->tool;
 		struct perf_script *script = container_of(tool, struct perf_script, tool);
 
 		ret = perf_script__setup_per_event_dump(script);
