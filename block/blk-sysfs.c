@@ -133,6 +133,7 @@ QUEUE_SYSFS_LIMIT_SHOW_SECTORS_TO_BYTES(max_hw_discard_sectors)
 QUEUE_SYSFS_LIMIT_SHOW_SECTORS_TO_BYTES(max_write_zeroes_sectors)
 QUEUE_SYSFS_LIMIT_SHOW_SECTORS_TO_BYTES(atomic_write_max_sectors)
 QUEUE_SYSFS_LIMIT_SHOW_SECTORS_TO_BYTES(atomic_write_boundary_sectors)
+QUEUE_SYSFS_LIMIT_SHOW_SECTORS_TO_BYTES(max_zone_append_sectors)
 
 #define QUEUE_SYSFS_LIMIT_SHOW_SECTORS_TO_KB(_field)			\
 static ssize_t queue_##_field##_show(struct gendisk *disk, char *page)	\
@@ -172,18 +173,6 @@ static int queue_max_discard_sectors_store(struct gendisk *disk,
 
 	lim->max_user_discard_sectors = max_discard_bytes >> SECTOR_SHIFT;
 	return 0;
-}
-
-/*
- * For zone append queue_max_zone_append_sectors does not just return the
- * underlying queue limits, but actually contains a calculation.  Because of
- * that we can't simply use QUEUE_SYSFS_LIMIT_SHOW_SECTORS_TO_BYTES here.
- */
-static ssize_t queue_zone_append_max_show(struct gendisk *disk, char *page)
-{
-	return sprintf(page, "%llu\n",
-		(u64)queue_max_zone_append_sectors(disk->queue) <<
-			SECTOR_SHIFT);
 }
 
 static int
@@ -473,7 +462,7 @@ QUEUE_RO_ENTRY(queue_atomic_write_unit_min, "atomic_write_unit_min_bytes");
 
 QUEUE_RO_ENTRY(queue_write_same_max, "write_same_max_bytes");
 QUEUE_RO_ENTRY(queue_max_write_zeroes_sectors, "write_zeroes_max_bytes");
-QUEUE_RO_ENTRY(queue_zone_append_max, "zone_append_max_bytes");
+QUEUE_RO_ENTRY(queue_max_zone_append_sectors, "zone_append_max_bytes");
 QUEUE_RO_ENTRY(queue_zone_write_granularity, "zone_write_granularity");
 
 QUEUE_RO_ENTRY(queue_zoned, "zoned");
@@ -601,7 +590,7 @@ static struct attribute *queue_attrs[] = {
 	&queue_atomic_write_unit_max_entry.attr,
 	&queue_write_same_max_entry.attr,
 	&queue_max_write_zeroes_sectors_entry.attr,
-	&queue_zone_append_max_entry.attr,
+	&queue_max_zone_append_sectors_entry.attr,
 	&queue_zone_write_granularity_entry.attr,
 	&queue_rotational_entry.attr,
 	&queue_zoned_entry.attr,
