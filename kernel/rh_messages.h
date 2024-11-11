@@ -266,6 +266,7 @@ static const struct pci_device_id rh_disabled_pci_devices[] = {
 	{ 0x15B3, 0x100e, PCI_ANY_ID, PCI_ANY_ID },
 	{ 0x15B3, 0x100f, PCI_ANY_ID, PCI_ANY_ID },
 	{ 0x15B3, 0x1010, PCI_ANY_ID, PCI_ANY_ID },
+	{ 0x15B3, 0xA2DF, PCI_ANY_ID, PCI_ANY_ID },
 	{ 0x1000, 0x0064, PCI_ANY_ID, PCI_ANY_ID },
 	{ 0x1000, 0x0065, PCI_ANY_ID, PCI_ANY_ID },
 	{ 0x1000, 0x0070, PCI_ANY_ID, PCI_ANY_ID },
