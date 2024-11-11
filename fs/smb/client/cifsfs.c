@@ -346,7 +346,7 @@ static long cifs_fallocate(struct file *file, int mode, loff_t off, loff_t len)
 	return -EOPNOTSUPP;
 }
 
-static int cifs_permission(struct user_namespace *mnt_userns,
+static int cifs_permission(struct mnt_idmap *idmap,
 			   struct inode *inode, int mask)
 {
 	struct cifs_sb_info *cifs_sb;
@@ -362,7 +362,7 @@ static int cifs_permission(struct user_namespace *mnt_userns,
 		on the client (above and beyond ACL on servers) for
 		servers which do not support setting and viewing mode bits,
 		so allowing client to check permissions is useful */
-		return generic_permission(&init_user_ns, inode, mask);
+		return generic_permission(&nop_mnt_idmap, inode, mask);
 }
 
 static struct kmem_cache *cifs_inode_cachep;
@@ -1154,6 +1154,8 @@ const struct inode_operations cifs_dir_inode_ops = {
 	.symlink = cifs_symlink,
 	.mknod   = cifs_mknod,
 	.listxattr = cifs_listxattr,
+	.get_acl = cifs_get_acl,
+	.set_acl = cifs_set_acl,
 };
 
 const struct inode_operations cifs_file_inode_ops = {
@@ -1162,6 +1164,8 @@ const struct inode_operations cifs_file_inode_ops = {
 	.permission = cifs_permission,
 	.listxattr = cifs_listxattr,
 	.fiemap = cifs_fiemap,
+	.get_acl = cifs_get_acl,
+	.set_acl = cifs_set_acl,
 };
 
 const char *cifs_get_link(struct dentry *dentry, struct inode *inode,

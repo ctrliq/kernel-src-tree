@@ -357,7 +357,7 @@ struct inode *erofs_iget(struct super_block *sb,
 	return inode;
 }
 
-int erofs_getattr(struct user_namespace *mnt_userns, const struct path *path,
+int erofs_getattr(struct mnt_idmap *idmap, const struct path *path,
 		  struct kstat *stat, u32 request_mask,
 		  unsigned int query_flags)
 {
@@ -370,26 +370,26 @@ int erofs_getattr(struct user_namespace *mnt_userns, const struct path *path,
 	stat->attributes_mask |= (STATX_ATTR_COMPRESSED |
 				  STATX_ATTR_IMMUTABLE);
 
-	generic_fillattr(&init_user_ns, inode, stat);
+	generic_fillattr(idmap, inode, stat);
 	return 0;
 }
 
 const struct inode_operations erofs_generic_iops = {
 	.getattr = erofs_getattr,
 	.listxattr = erofs_listxattr,
-	.get_acl = erofs_get_acl,
+	.get_inode_acl = erofs_get_acl,
 };
 
 const struct inode_operations erofs_symlink_iops = {
 	.get_link = page_get_link,
 	.getattr = erofs_getattr,
 	.listxattr = erofs_listxattr,
-	.get_acl = erofs_get_acl,
+	.get_inode_acl = erofs_get_acl,
 };
 
 const struct inode_operations erofs_fast_symlink_iops = {
 	.get_link = simple_get_link,
 	.getattr = erofs_getattr,
 	.listxattr = erofs_listxattr,
-	.get_acl = erofs_get_acl,
+	.get_inode_acl = erofs_get_acl,
 };

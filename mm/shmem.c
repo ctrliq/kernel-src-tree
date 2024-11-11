@@ -1145,7 +1145,7 @@ void shmem_truncate_range(struct inode *inode, loff_t lstart, loff_t lend)
 }
 EXPORT_SYMBOL_GPL(shmem_truncate_range);
 
-static int shmem_getattr(struct user_namespace *mnt_userns,
+static int shmem_getattr(struct mnt_idmap *idmap,
 			 const struct path *path, struct kstat *stat,
 			 u32 request_mask, unsigned int query_flags)
 {
@@ -1164,7 +1164,7 @@ static int shmem_getattr(struct user_namespace *mnt_userns,
 	stat->attributes_mask |= (STATX_ATTR_APPEND |
 			STATX_ATTR_IMMUTABLE |
 			STATX_ATTR_NODUMP);
-	generic_fillattr(mnt_userns, inode, stat);
+	generic_fillattr(idmap, inode, stat);
 
 	if (shmem_is_huge(inode, 0, false, NULL, 0))
 		stat->blksize = HPAGE_PMD_SIZE;
@@ -1178,7 +1178,7 @@ static int shmem_getattr(struct user_namespace *mnt_userns,
 	return 0;
 }
 
-static int shmem_setattr(struct user_namespace *mnt_userns,
+static int shmem_setattr(struct mnt_idmap *idmap,
 			 struct dentry *dentry, struct iattr *attr)
 {
 	struct inode *inode = d_inode(dentry);
@@ -1187,7 +1187,7 @@ static int shmem_setattr(struct user_namespace *mnt_userns,
 	bool update_mtime = false;
 	bool update_ctime = true;
 
-	error = setattr_prepare(mnt_userns, dentry, attr);
+	error = setattr_prepare(idmap, dentry, attr);
 	if (error)
 		return error;
 
@@ -1231,23 +1231,23 @@ static int shmem_setattr(struct user_namespace *mnt_userns,
 		}
 	}
 
-	if (is_quota_modification(inode, attr)) {
+	if (is_quota_modification(idmap, inode, attr)) {
 		error = dquot_initialize(inode);
 		if (error)
 			return error;
 	}
 
 	/* Transfer quota accounting */
-	if ((attr->ia_valid & ATTR_UID && !uid_eq(attr->ia_uid, inode->i_uid)) ||
-	    (attr->ia_valid & ATTR_GID && !gid_eq(attr->ia_gid, inode->i_gid))) {
-		error = dquot_transfer(inode, attr);
+	if (i_uid_needs_update(idmap, attr, inode) ||
+	    i_gid_needs_update(idmap, attr, inode)) {
+		error = dquot_transfer(idmap, inode, attr);
 		if (error)
 			return error;
 	}
 
-	setattr_copy(mnt_userns, inode, attr);
+	setattr_copy(idmap, inode, attr);
 	if (attr->ia_valid & ATTR_MODE)
-		error = posix_acl_chmod(mnt_userns, inode, inode->i_mode);
+		error = posix_acl_chmod(idmap, dentry, inode->i_mode);
 	if (!error && update_ctime) {
 		inode_set_ctime_current(inode);
 		if (update_mtime)
@@ -2451,7 +2451,7 @@ static void shmem_set_inode_flags(struct inode *inode, unsigned int fsflags)
 #define shmem_initxattrs NULL
 #endif
 
-static struct inode *__shmem_get_inode(struct user_namespace *mnt_userns,
+static struct inode *__shmem_get_inode(struct mnt_idmap *idmap,
 				       struct super_block *sb,
 				       struct inode *dir, umode_t mode,
 				       dev_t dev, unsigned long flags)
@@ -2473,7 +2473,7 @@ static struct inode *__shmem_get_inode(struct user_namespace *mnt_userns,
 	}
 
 	inode->i_ino = ino;
-	inode_init_owner(mnt_userns, inode, dir, mode);
+	inode_init_owner(idmap, inode, dir, mode);
 	inode->i_blocks = 0;
 	inode->i_atime = inode->i_mtime = inode_set_ctime_current(inode);
 	inode->i_generation = get_random_u32();
@@ -2530,14 +2530,14 @@ static struct inode *__shmem_get_inode(struct user_namespace *mnt_userns,
 }
 
 #ifdef CONFIG_TMPFS_QUOTA
-static struct inode *shmem_get_inode(struct user_namespace *mnt_userns,
+static struct inode *shmem_get_inode(struct mnt_idmap *idmap,
 				     struct super_block *sb, struct inode *dir,
 				     umode_t mode, dev_t dev, unsigned long flags)
 {
 	int err;
 	struct inode *inode;
 
-	inode = __shmem_get_inode(mnt_userns, sb, dir, mode, dev, flags);
+	inode = __shmem_get_inode(idmap, sb, dir, mode, dev, flags);
 	if (IS_ERR(inode))
 		return inode;
 
@@ -2558,11 +2558,11 @@ errout:
 	return ERR_PTR(err);
 }
 #else
-static inline struct inode *shmem_get_inode(struct user_namespace *mnt_userns,
+static inline struct inode *shmem_get_inode(struct mnt_idmap *idmap,
 				     struct super_block *sb, struct inode *dir,
 				     umode_t mode, dev_t dev, unsigned long flags)
 {
-	return __shmem_get_inode(mnt_userns, sb, dir, mode, dev, flags);
+	return __shmem_get_inode(idmap, sb, dir, mode, dev, flags);
 }
 #endif /* CONFIG_TMPFS_QUOTA */
 
@@ -3224,14 +3224,13 @@ static int shmem_statfs(struct dentry *dentry, struct kstatfs *buf)
  * File creation. Allocate an inode, and we're done..
  */
 static int
-shmem_mknod(struct user_namespace *mnt_userns, struct inode *dir,
+shmem_mknod(struct mnt_idmap *idmap, struct inode *dir,
 	    struct dentry *dentry, umode_t mode, dev_t dev)
 {
 	struct inode *inode;
 	int error;
 
-	inode = shmem_get_inode(mnt_userns, dir->i_sb, dir, mode, dev, VM_NORESERVE);
-
+	inode = shmem_get_inode(idmap, dir->i_sb, dir, mode, dev, VM_NORESERVE);
 	if (IS_ERR(inode))
 		return PTR_ERR(inode);
 
@@ -3258,21 +3257,18 @@ out_iput:
 }
 
 static int
-shmem_tmpfile(struct user_namespace *mnt_userns, struct inode *dir,
+shmem_tmpfile(struct mnt_idmap *idmap, struct inode *dir,
 	      struct file *file, umode_t mode)
 {
 	struct inode *inode;
 	int error;
 
-	inode = shmem_get_inode(mnt_userns, dir->i_sb, dir, mode, 0, VM_NORESERVE);
-
+	inode = shmem_get_inode(idmap, dir->i_sb, dir, mode, 0, VM_NORESERVE);
 	if (IS_ERR(inode)) {
 		error = PTR_ERR(inode);
 		goto err_out;
 	}
-
-	error = security_inode_init_security(inode, dir,
-					     NULL,
+	error = security_inode_init_security(inode, dir, NULL,
 					     shmem_initxattrs, NULL);
 	if (error && error != -EOPNOTSUPP)
 		goto out_iput;
@@ -3288,22 +3284,22 @@ out_iput:
 	return error;
 }
 
-static int shmem_mkdir(struct user_namespace *mnt_userns, struct inode *dir,
+static int shmem_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 		       struct dentry *dentry, umode_t mode)
 {
 	int error;
 
-	error = shmem_mknod(mnt_userns, dir, dentry, mode | S_IFDIR, 0);
+	error = shmem_mknod(idmap, dir, dentry, mode | S_IFDIR, 0);
 	if (error)
 		return error;
 	inc_nlink(dir);
 	return 0;
 }
 
-static int shmem_create(struct user_namespace *mnt_userns, struct inode *dir,
+static int shmem_create(struct mnt_idmap *idmap, struct inode *dir,
 			struct dentry *dentry, umode_t mode, bool excl)
 {
-	return shmem_mknod(mnt_userns, dir, dentry, mode | S_IFREG, 0);
+	return shmem_mknod(idmap, dir, dentry, mode | S_IFREG, 0);
 }
 
 /*
@@ -3365,7 +3361,7 @@ static int shmem_rmdir(struct inode *dir, struct dentry *dentry)
 	return shmem_unlink(dir, dentry);
 }
 
-static int shmem_whiteout(struct user_namespace *mnt_userns,
+static int shmem_whiteout(struct mnt_idmap *idmap,
 			  struct inode *old_dir, struct dentry *old_dentry)
 {
 	struct dentry *whiteout;
@@ -3375,7 +3371,7 @@ static int shmem_whiteout(struct user_namespace *mnt_userns,
 	if (!whiteout)
 		return -ENOMEM;
 
-	error = shmem_mknod(mnt_userns, old_dir, whiteout,
+	error = shmem_mknod(idmap, old_dir, whiteout,
 			    S_IFCHR | WHITEOUT_MODE, WHITEOUT_DEV);
 	dput(whiteout);
 	if (error)
@@ -3398,7 +3394,7 @@ static int shmem_whiteout(struct user_namespace *mnt_userns,
  * it exists so that the VFS layer correctly free's it when it
  * gets overwritten.
  */
-static int shmem_rename2(struct user_namespace *mnt_userns,
+static int shmem_rename2(struct mnt_idmap *idmap,
 			 struct inode *old_dir, struct dentry *old_dentry,
 			 struct inode *new_dir, struct dentry *new_dentry,
 			 unsigned int flags)
@@ -3418,7 +3414,7 @@ static int shmem_rename2(struct user_namespace *mnt_userns,
 	if (flags & RENAME_WHITEOUT) {
 		int error;
 
-		error = shmem_whiteout(mnt_userns, old_dir, old_dentry);
+		error = shmem_whiteout(idmap, old_dir, old_dentry);
 		if (error)
 			return error;
 	}
@@ -3442,7 +3438,7 @@ static int shmem_rename2(struct user_namespace *mnt_userns,
 	return 0;
 }
 
-static int shmem_symlink(struct user_namespace *mnt_userns, struct inode *dir,
+static int shmem_symlink(struct mnt_idmap *idmap, struct inode *dir,
 			 struct dentry *dentry, const char *symname)
 {
 	int error;
@@ -3454,7 +3450,7 @@ static int shmem_symlink(struct user_namespace *mnt_userns, struct inode *dir,
 	if (len > PAGE_SIZE)
 		return -ENAMETOOLONG;
 
-	inode = shmem_get_inode(mnt_userns, dir->i_sb, dir, S_IFLNK | 0777, 0,
+	inode = shmem_get_inode(idmap, dir->i_sb, dir, S_IFLNK | 0777, 0,
 				VM_NORESERVE);
 
 	if (IS_ERR(inode))
@@ -3548,7 +3544,7 @@ static int shmem_fileattr_get(struct dentry *dentry, struct fileattr *fa)
 	return 0;
 }
 
-static int shmem_fileattr_set(struct user_namespace *mnt_userns,
+static int shmem_fileattr_set(struct mnt_idmap *idmap,
 			      struct dentry *dentry, struct fileattr *fa)
 {
 	struct inode *inode = d_inode(dentry);
@@ -3622,7 +3618,7 @@ static int shmem_xattr_handler_get(const struct xattr_handler *handler,
 }
 
 static int shmem_xattr_handler_set(const struct xattr_handler *handler,
-				   struct user_namespace *mnt_userns,
+				   struct mnt_idmap *idmap,
 				   struct dentry *unused, struct inode *inode,
 				   const char *name, const void *value,
 				   size_t size, int flags)
@@ -4311,7 +4307,7 @@ static int shmem_fill_super(struct super_block *sb, struct fs_context *fc)
 	}
 #endif /* CONFIG_TMPFS_QUOTA */
 
-	inode = shmem_get_inode(&init_user_ns, sb, NULL, S_IFDIR | sbinfo->mode, 0,
+	inode = shmem_get_inode(&nop_mnt_idmap, sb, NULL, S_IFDIR | sbinfo->mode, 0,
 				VM_NORESERVE);
 	if (IS_ERR(inode)) {
 		error = PTR_ERR(inode);
@@ -4713,7 +4709,7 @@ EXPORT_SYMBOL_GPL(shmem_truncate_range);
 #define shmem_acct_size(flags, size)		0
 #define shmem_unacct_size(flags, size)		do {} while (0)
 
-static inline struct inode *shmem_get_inode(struct user_namespace *mnt_userns, struct super_block *sb, struct inode *dir,
+static inline struct inode *shmem_get_inode(struct mnt_idmap *idmap, struct super_block *sb, struct inode *dir,
 					    umode_t mode, dev_t dev, unsigned long flags)
 {
 	struct inode *inode = ramfs_get_inode(sb, dir, mode, dev);
@@ -4742,7 +4738,7 @@ static struct file *__shmem_file_setup(struct vfsmount *mnt, const char *name, l
 	if (is_idmapped_mnt(mnt))
 		return ERR_PTR(-EINVAL);
 
-	inode = shmem_get_inode(&init_user_ns, mnt->mnt_sb, NULL,
+	inode = shmem_get_inode(&nop_mnt_idmap, mnt->mnt_sb, NULL,
 				S_IFREG | S_IRWXUGO, 0, flags);
 
 	if (IS_ERR(inode)) {

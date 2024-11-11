@@ -777,7 +777,7 @@ xfs_inode_inherit_flags2(
  */
 int
 xfs_init_new_inode(
-	struct user_namespace	*mnt_userns,
+	struct mnt_idmap	*idmap,
 	struct xfs_trans	*tp,
 	struct xfs_inode	*pip,
 	xfs_ino_t		ino,
@@ -823,11 +823,11 @@ xfs_init_new_inode(
 	ip->i_projid = prid;
 
 	if (dir && !(dir->i_mode & S_ISGID) && xfs_has_grpid(mp)) {
-		inode_fsuid_set(inode, mnt_userns);
+		inode_fsuid_set(inode, idmap);
 		inode->i_gid = dir->i_gid;
 		inode->i_mode = mode;
 	} else {
-		inode_init_owner(mnt_userns, inode, dir, mode);
+		inode_init_owner(idmap, inode, dir, mode);
 	}
 
 	/*
@@ -836,7 +836,7 @@ xfs_init_new_inode(
 	 * (and only if the irix_sgid_inherit compatibility variable is set).
 	 */
 	if (irix_sgid_inherit && (inode->i_mode & S_ISGID) &&
-	    !vfsgid_in_group_p(i_gid_into_vfsgid(mnt_userns, inode)))
+	    !vfsgid_in_group_p(i_gid_into_vfsgid(idmap, inode)))
 		inode->i_mode &= ~S_ISGID;
 
 	ip->i_disk_size = 0;
@@ -946,7 +946,7 @@ xfs_bumplink(
 
 int
 xfs_create(
-	struct user_namespace	*mnt_userns,
+	struct mnt_idmap	*idmap,
 	xfs_inode_t		*dp,
 	struct xfs_name		*name,
 	umode_t			mode,
@@ -976,10 +976,12 @@ xfs_create(
 	prid = xfs_get_initial_prid(dp);
 
 	/*
-	 * Make sure that we have allocated dquot(s) on disk.
+	 * Make sure that we have allocated dquot(s) on disk.  The uid/gid
+	 * computation code must match what the VFS uses to assign i_[ug]id.
+	 * INHERIT adjusts the gid computation for setgid/grpid systems.
 	 */
-	error = xfs_qm_vop_dqalloc(dp, mapped_fsuid(mnt_userns, &init_user_ns),
-			mapped_fsgid(mnt_userns, &init_user_ns), prid,
+	error = xfs_qm_vop_dqalloc(dp, mapped_fsuid(idmap, i_user_ns(VFS_I(dp))),
+			mapped_fsgid(idmap, i_user_ns(VFS_I(dp))), prid,
 			XFS_QMOPT_QUOTALL | XFS_QMOPT_INHERIT,
 			&udqp, &gdqp, &pdqp);
 	if (error)
@@ -1020,7 +1022,7 @@ xfs_create(
 	 */
 	error = xfs_dialloc(&tp, dp->i_ino, mode, &ino);
 	if (!error)
-		error = xfs_init_new_inode(mnt_userns, tp, dp, ino, mode,
+		error = xfs_init_new_inode(idmap, tp, dp, ino, mode,
 				is_dir ? 2 : 1, rdev, prid, init_xattrs, &ip);
 	if (error)
 		goto out_trans_cancel;
@@ -1102,7 +1104,7 @@ xfs_create(
 
 int
 xfs_create_tmpfile(
-	struct user_namespace	*mnt_userns,
+	struct mnt_idmap	*idmap,
 	struct xfs_inode	*dp,
 	umode_t			mode,
 	struct xfs_inode	**ipp)
@@ -1125,10 +1127,12 @@ xfs_create_tmpfile(
 	prid = xfs_get_initial_prid(dp);
 
 	/*
-	 * Make sure that we have allocated dquot(s) on disk.
+	 * Make sure that we have allocated dquot(s) on disk.  The uid/gid
+	 * computation code must match what the VFS uses to assign i_[ug]id.
+	 * INHERIT adjusts the gid computation for setgid/grpid systems.
 	 */
-	error = xfs_qm_vop_dqalloc(dp, mapped_fsuid(mnt_userns, &init_user_ns),
-			mapped_fsgid(mnt_userns, &init_user_ns), prid,
+	error = xfs_qm_vop_dqalloc(dp, mapped_fsuid(idmap, i_user_ns(VFS_I(dp))),
+			mapped_fsgid(idmap, i_user_ns(VFS_I(dp))), prid,
 			XFS_QMOPT_QUOTALL | XFS_QMOPT_INHERIT,
 			&udqp, &gdqp, &pdqp);
 	if (error)
@@ -1144,7 +1148,7 @@ xfs_create_tmpfile(
 
 	error = xfs_dialloc(&tp, dp->i_ino, mode, &ino);
 	if (!error)
-		error = xfs_init_new_inode(mnt_userns, tp, dp, ino, mode,
+		error = xfs_init_new_inode(idmap, tp, dp, ino, mode,
 				0, 0, prid, false, &ip);
 	if (error)
 		goto out_trans_cancel;
@@ -2792,7 +2796,7 @@ out_trans_abort:
  */
 static int
 xfs_rename_alloc_whiteout(
-	struct user_namespace	*mnt_userns,
+	struct mnt_idmap	*idmap,
 	struct xfs_name		*src_name,
 	struct xfs_inode	*dp,
 	struct xfs_inode	**wip)
@@ -2801,7 +2805,7 @@ xfs_rename_alloc_whiteout(
 	struct qstr		name;
 	int			error;
 
-	error = xfs_create_tmpfile(mnt_userns, dp, S_IFCHR | WHITEOUT_MODE,
+	error = xfs_create_tmpfile(idmap, dp, S_IFCHR | WHITEOUT_MODE,
 				   &tmpfile);
 	if (error)
 		return error;
@@ -2833,7 +2837,7 @@ xfs_rename_alloc_whiteout(
  */
 int
 xfs_rename(
-	struct user_namespace	*mnt_userns,
+	struct mnt_idmap	*idmap,
 	struct xfs_inode	*src_dp,
 	struct xfs_name		*src_name,
 	struct xfs_inode	*src_ip,
@@ -2865,7 +2869,7 @@ xfs_rename(
 	 * appropriately.
 	 */
 	if (flags & RENAME_WHITEOUT) {
-		error = xfs_rename_alloc_whiteout(mnt_userns, src_name,
+		error = xfs_rename_alloc_whiteout(idmap, src_name,
 						  target_dp, &wip);
 		if (error)
 			return error;

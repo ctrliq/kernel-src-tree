@@ -1420,15 +1420,15 @@ EXPORT_SYMBOL(begin_new_exec);
 void would_dump(struct linux_binprm *bprm, struct file *file)
 {
 	struct inode *inode = file_inode(file);
-	struct user_namespace *mnt_userns = file_mnt_user_ns(file);
-	if (inode_permission(mnt_userns, inode, MAY_READ) < 0) {
+	struct mnt_idmap *idmap = file_mnt_idmap(file);
+	if (inode_permission(idmap, inode, MAY_READ) < 0) {
 		struct user_namespace *old, *user_ns;
 		bprm->interp_flags |= BINPRM_FLAGS_ENFORCE_NONDUMP;
 
 		/* Ensure mm->user_ns contains the executable */
 		user_ns = old = bprm->mm->user_ns;
 		while ((user_ns != &init_user_ns) &&
-		       !privileged_wrt_inode_uidgid(user_ns, mnt_userns, inode))
+		       !privileged_wrt_inode_uidgid(user_ns, idmap, inode))
 			user_ns = user_ns->parent;
 
 		if (old != user_ns) {
@@ -1596,11 +1596,11 @@ static void check_unsafe_exec(struct linux_binprm *bprm)
 static void bprm_fill_uid(struct linux_binprm *bprm, struct file *file)
 {
 	/* Handle suid and sgid on files */
-	struct user_namespace *mnt_userns;
-	struct inode *inode;
+	struct mnt_idmap *idmap;
+	struct inode *inode = file_inode(file);
 	unsigned int mode;
-	kuid_t uid;
-	kgid_t gid;
+	vfsuid_t vfsuid;
+	vfsgid_t vfsgid;
 
 	if (!mnt_may_suid(file->f_path.mnt))
 		return;
@@ -1608,35 +1608,34 @@ static void bprm_fill_uid(struct linux_binprm *bprm, struct file *file)
 	if (task_no_new_privs(current))
 		return;
 
-	inode = file->f_path.dentry->d_inode;
 	mode = READ_ONCE(inode->i_mode);
 	if (!(mode & (S_ISUID|S_ISGID)))
 		return;
 
-	mnt_userns = file_mnt_user_ns(file);
+	idmap = file_mnt_idmap(file);
 
 	/* Be careful if suid/sgid is set */
 	inode_lock(inode);
 
 	/* reload atomically mode/uid/gid now that lock held */
 	mode = inode->i_mode;
-	uid = i_uid_into_mnt(mnt_userns, inode);
-	gid = i_gid_into_mnt(mnt_userns, inode);
+	vfsuid = i_uid_into_vfsuid(idmap, inode);
+	vfsgid = i_gid_into_vfsgid(idmap, inode);
 	inode_unlock(inode);
 
 	/* We ignore suid/sgid if there are no mappings for them in the ns */
-	if (!kuid_has_mapping(bprm->cred->user_ns, uid) ||
-		 !kgid_has_mapping(bprm->cred->user_ns, gid))
+	if (!vfsuid_has_mapping(bprm->cred->user_ns, vfsuid) ||
+	    !vfsgid_has_mapping(bprm->cred->user_ns, vfsgid))
 		return;
 
 	if (mode & S_ISUID) {
 		bprm->per_clear |= PER_CLEAR_ON_SETID;
-		bprm->cred->euid = uid;
+		bprm->cred->euid = vfsuid_into_kuid(vfsuid);
 	}
 
 	if ((mode & (S_ISGID | S_IXGRP)) == (S_ISGID | S_IXGRP)) {
 		bprm->per_clear |= PER_CLEAR_ON_SETID;
-		bprm->cred->egid = gid;
+		bprm->cred->egid = vfsgid_into_kgid(vfsgid);
 	}
 }
 

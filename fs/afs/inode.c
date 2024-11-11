@@ -574,7 +574,7 @@ error:
 /*
  * read the attributes of an inode
  */
-int afs_getattr(struct user_namespace *mnt_userns, const struct path *path,
+int afs_getattr(struct mnt_idmap *idmap, const struct path *path,
 		struct kstat *stat, u32 request_mask, unsigned int query_flags)
 {
 	struct inode *inode = d_inode(path->dentry);
@@ -598,7 +598,7 @@ int afs_getattr(struct user_namespace *mnt_userns, const struct path *path,
 
 	do {
 		seq = read_seqbegin(&vnode->cb_lock);
-		generic_fillattr(&init_user_ns, inode, stat);
+		generic_fillattr(&nop_mnt_idmap, inode, stat);
 		if (test_bit(AFS_VNODE_SILLY_DELETED, &vnode->flags) &&
 		    stat->nlink > 0)
 			stat->nlink -= 1;
@@ -713,7 +713,7 @@ static const struct afs_operation_ops afs_setattr_operation = {
 /*
  * set the attributes of an inode
  */
-int afs_setattr(struct user_namespace *mnt_userns, struct dentry *dentry,
+int afs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		struct iattr *attr)
 {
 	const unsigned int supported =

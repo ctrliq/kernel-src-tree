@@ -224,9 +224,10 @@ static int common_perm(const char *op, const struct path *path, u32 mask,
  */
 static int common_perm_cond(const char *op, const struct path *path, u32 mask)
 {
-	struct user_namespace *mnt_userns = mnt_user_ns(path->mnt);
+	vfsuid_t vfsuid = i_uid_into_vfsuid(mnt_idmap(path->mnt),
+					    d_backing_inode(path->dentry));
 	struct path_cond cond = {
-		i_uid_into_mnt(mnt_userns, d_backing_inode(path->dentry)),
+		vfsuid_into_kuid(vfsuid),
 		d_backing_inode(path->dentry)->i_mode
 	};
 
@@ -268,13 +269,14 @@ static int common_perm_rm(const char *op, const struct path *dir,
 			  struct dentry *dentry, u32 mask)
 {
 	struct inode *inode = d_backing_inode(dentry);
-	struct user_namespace *mnt_userns = mnt_user_ns(dir->mnt);
 	struct path_cond cond = { };
+	vfsuid_t vfsuid;
 
 	if (!inode || !path_mediated_fs(dentry))
 		return 0;
 
-	cond.uid = i_uid_into_mnt(mnt_userns, inode);
+	vfsuid = i_uid_into_vfsuid(mnt_idmap(dir->mnt), inode);
+	cond.uid = vfsuid_into_kuid(vfsuid);
 	cond.mode = inode->i_mode;
 
 	return common_perm_dir_dentry(op, dir, dentry, mask, &cond);
@@ -354,30 +356,53 @@ static int apparmor_path_link(struct dentry *old_dentry, const struct path *new_
 }
 
 static int apparmor_path_rename(const struct path *old_dir, struct dentry *old_dentry,
-				const struct path *new_dir, struct dentry *new_dentry)
+				const struct path *new_dir, struct dentry *new_dentry,
+				const unsigned int flags)
 {
 	struct aa_label *label;
 	int error = 0;
 
 	if (!path_mediated_fs(old_dentry))
 		return 0;
+	if ((flags & RENAME_EXCHANGE) && !path_mediated_fs(new_dentry))
+		return 0;
 
 	label = begin_current_label_crit_section();
 	if (!unconfined(label)) {
-		struct user_namespace *mnt_userns = mnt_user_ns(old_dir->mnt);
+		struct mnt_idmap *idmap = mnt_idmap(old_dir->mnt);
+		vfsuid_t vfsuid;
 		struct path old_path = { .mnt = old_dir->mnt,
 					 .dentry = old_dentry };
 		struct path new_path = { .mnt = new_dir->mnt,
 					 .dentry = new_dentry };
 		struct path_cond cond = {
-			i_uid_into_mnt(mnt_userns, d_backing_inode(old_dentry)),
-			d_backing_inode(old_dentry)->i_mode
+			.mode = d_backing_inode(old_dentry)->i_mode
 		};
+		vfsuid = i_uid_into_vfsuid(idmap, d_backing_inode(old_dentry));
+		cond.uid = vfsuid_into_kuid(vfsuid);
 
-		error = aa_path_perm(OP_RENAME_SRC, label, &old_path, 0,
-				     MAY_READ | AA_MAY_GETATTR | MAY_WRITE |
-				     AA_MAY_SETATTR | AA_MAY_DELETE,
-				     &cond);
+		if (flags & RENAME_EXCHANGE) {
+			struct path_cond cond_exchange = {
+				.mode = d_backing_inode(new_dentry)->i_mode,
+			};
+			vfsuid = i_uid_into_vfsuid(idmap, d_backing_inode(old_dentry));
+			cond_exchange.uid = vfsuid_into_kuid(vfsuid);
+
+			error = aa_path_perm(OP_RENAME_SRC, label, &new_path, 0,
+					     MAY_READ | AA_MAY_GETATTR | MAY_WRITE |
+					     AA_MAY_SETATTR | AA_MAY_DELETE,
+					     &cond_exchange);
+			if (!error)
+				error = aa_path_perm(OP_RENAME_DEST, label, &old_path,
+						     0, MAY_WRITE | AA_MAY_SETATTR |
+						     AA_MAY_CREATE, &cond_exchange);
+		}
+
+		if (!error)
+			error = aa_path_perm(OP_RENAME_SRC, label, &old_path, 0,
+					     MAY_READ | AA_MAY_GETATTR | MAY_WRITE |
+					     AA_MAY_SETATTR | AA_MAY_DELETE,
+					     &cond);
 		if (!error)
 			error = aa_path_perm(OP_RENAME_DEST, label, &new_path,
 					     0, MAY_WRITE | AA_MAY_SETATTR |
@@ -425,12 +450,14 @@ static int apparmor_file_open(struct file *file)
 
 	label = aa_get_newest_cred_label(file->f_cred);
 	if (!unconfined(label)) {
-		struct user_namespace *mnt_userns = file_mnt_user_ns(file);
+		struct mnt_idmap *idmap = file_mnt_idmap(file);
 		struct inode *inode = file_inode(file);
+		vfsuid_t vfsuid;
 		struct path_cond cond = {
-			i_uid_into_mnt(mnt_userns, inode),
-			inode->i_mode
+			.mode = inode->i_mode,
 		};
+		vfsuid = i_uid_into_vfsuid(idmap, inode);
+		cond.uid = vfsuid_into_kuid(vfsuid);
 
 		error = aa_path_perm(OP_OPEN, label, &file->f_path, 0,
 				     aa_map_file_to_perms(file), &cond);
