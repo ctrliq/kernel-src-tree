@@ -174,30 +174,118 @@
 #define CPACF_KLMD_DUFOP	0x4000
 #define CPACF_KLMD_NIP		0x8000
 
-typedef struct { unsigned char bytes[16]; } cpacf_mask_t;
-
-/**
- * cpacf_query() - check if a specific CPACF function is available
- * @opcode: the opcode of the crypto instruction
- * @func: the function code to test for
- *
- * Executes the query function for the given crypto instruction @opcode
- * and checks if @func is available
- *
- * Returns 1 if @func is available for @opcode, 0 otherwise
+/*
+ * Function codes for KDSA (COMPUTE DIGITAL SIGNATURE AUTHENTICATION)
+ * instruction
  */
-static __always_inline void __cpacf_query(unsigned int opcode, cpacf_mask_t *mask)
+#define CPACF_KDSA_QUERY 0x00
+#define CPACF_KDSA_ECDSA_VERIFY_P256 0x01
+#define CPACF_KDSA_ECDSA_VERIFY_P384 0x02
+#define CPACF_KDSA_ECDSA_VERIFY_P521 0x03
+#define CPACF_KDSA_ECDSA_SIGN_P256 0x09
+#define CPACF_KDSA_ECDSA_SIGN_P384 0x0a
+#define CPACF_KDSA_ECDSA_SIGN_P521 0x0b
+#define CPACF_KDSA_ENC_ECDSA_SIGN_P256 0x11
+#define CPACF_KDSA_ENC_ECDSA_SIGN_P384 0x12
+#define CPACF_KDSA_ENC_ECDSA_SIGN_P521 0x13
+#define CPACF_KDSA_EDDSA_VERIFY_ED25519 0x20
+#define CPACF_KDSA_EDDSA_VERIFY_ED448 0x24
+#define CPACF_KDSA_EDDSA_SIGN_ED25519 0x28
+#define CPACF_KDSA_EDDSA_SIGN_ED448 0x2c
+#define CPACF_KDSA_ENC_EDDSA_SIGN_ED25519 0x30
+#define CPACF_KDSA_ENC_EDDSA_SIGN_ED448 0x34
+
+#define CPACF_FC_QUERY 0x00
+#define CPACF_FC_QUERY_AUTH_INFO 0x7F
+
+typedef struct { unsigned char bytes[16]; } cpacf_mask_t;
+typedef struct { unsigned char bytes[256]; } cpacf_qai_t;
+
+/*
+ * Prototype for a not existing function to produce a link
+ * error if __cpacf_query() or __cpacf_check_opcode() is used
+ * with an invalid compile time const opcode.
+ */
+void __cpacf_bad_opcode(void);
+
+static __always_inline void __cpacf_query_rre(u32 opc, u8 r1, u8 r2,
+					      u8 *pb, u8 fc)
 {
 	asm volatile(
-		"	lghi	0,0\n" /* query function */
-		"	lgr	1,%[mask]\n"
-		"	spm	0\n" /* pckmo doesn't change the cc */
-		/* Parameter regs are ignored, but must be nonzero and unique */
-		"0:	.insn	rrf,%[opc] << 16,2,4,6,0\n"
-		"	brc	1,0b\n"	/* handle partial completion */
-		: "=m" (*mask)
-		: [mask] "d" ((unsigned long)mask), [opc] "i" (opcode)
-		: "cc", "0", "1");
+		"	la	%%r1,%[pb]\n"
+		"	lghi	%%r0,%[fc]\n"
+		"	.insn	rre,%[opc] << 16,%[r1],%[r2]\n"
+		: [pb] "=R" (*pb)
+		: [opc] "i" (opc), [fc] "i" (fc),
+		  [r1] "i" (r1), [r2] "i" (r2)
+		: "cc", "memory", "r0", "r1");
+}
+
+static __always_inline void __cpacf_query_rrf(u32 opc, u8 r1, u8 r2, u8 r3,
+					      u8 m4, u8 *pb, u8 fc)
+{
+	asm volatile(
+		"	la	%%r1,%[pb]\n"
+		"	lghi	%%r0,%[fc]\n"
+		"	.insn	rrf,%[opc] << 16,%[r1],%[r2],%[r3],%[m4]\n"
+		: [pb] "=R" (*pb)
+		: [opc] "i" (opc), [fc] "i" (fc), [r1] "i" (r1),
+		  [r2] "i" (r2), [r3] "i" (r3), [m4] "i" (m4)
+		: "cc", "memory", "r0", "r1");
+}
+
+static __always_inline void __cpacf_query_insn(unsigned int opcode, void *pb,
+					       u8 fc)
+{
+	switch (opcode) {
+	case CPACF_KDSA:
+		__cpacf_query_rre(CPACF_KDSA, 0, 2, pb, fc);
+		break;
+	case CPACF_KIMD:
+		__cpacf_query_rre(CPACF_KIMD, 0, 2, pb, fc);
+		break;
+	case CPACF_KLMD:
+		__cpacf_query_rre(CPACF_KLMD, 0, 2, pb, fc);
+		break;
+	case CPACF_KM:
+		__cpacf_query_rre(CPACF_KM, 2, 4, pb, fc);
+		break;
+	case CPACF_KMA:
+		__cpacf_query_rrf(CPACF_KMA, 2, 4, 6, 0, pb, fc);
+		break;
+	case CPACF_KMAC:
+		__cpacf_query_rre(CPACF_KMAC, 0, 2, pb, fc);
+		break;
+	case CPACF_KMC:
+		__cpacf_query_rre(CPACF_KMC, 2, 4, pb, fc);
+		break;
+	case CPACF_KMCTR:
+		__cpacf_query_rrf(CPACF_KMCTR, 2, 4, 6, 0, pb, fc);
+		break;
+	case CPACF_KMF:
+		__cpacf_query_rre(CPACF_KMF, 2, 4, pb, fc);
+		break;
+	case CPACF_KMO:
+		__cpacf_query_rre(CPACF_KMO, 2, 4, pb, fc);
+		break;
+	case CPACF_PCC:
+		__cpacf_query_rre(CPACF_PCC, 0, 0, pb, fc);
+		break;
+	case CPACF_PCKMO:
+		__cpacf_query_rre(CPACF_PCKMO, 0, 0, pb, fc);
+		break;
+	case CPACF_PRNO:
+		__cpacf_query_rre(CPACF_PRNO, 2, 4, pb, fc);
+		break;
+	default:
+		__cpacf_bad_opcode();
+	}
+}
+
+static __always_inline void __cpacf_query(unsigned int opcode,
+					  cpacf_mask_t *mask)
+{
+	__cpacf_query_insn(opcode, mask, CPACF_FC_QUERY);
 }
 
 static __always_inline int __cpacf_check_opcode(unsigned int opcode)
@@ -220,11 +308,25 @@ static __always_inline int __cpacf_check_opcode(unsigned int opcode)
 		return test_facility(57);	/* check for MSA5 */
 	case CPACF_KMA:
 		return test_facility(146);	/* check for MSA8 */
+	case CPACF_KDSA:
+		return test_facility(155);	/* check for MSA9 */
 	default:
-		BUG();
+		__cpacf_bad_opcode();
+		return 0;
 	}
 }
 
+/**
+ * cpacf_query() - Query the function code mask for this CPACF opcode
+ * @opcode: the opcode of the crypto instruction
+ * @mask: ptr to struct cpacf_mask_t
+ *
+ * Executes the query function for the given crypto instruction @opcode
+ * and checks if @func is available
+ *
+ * On success 1 is returned and the mask is filled with the function
+ * code mask for this CPACF opcode, otherwise 0 is returned.
+ */
 static __always_inline int cpacf_query(unsigned int opcode, cpacf_mask_t *mask)
 {
 	if (__cpacf_check_opcode(opcode)) {
@@ -240,12 +342,39 @@ static inline int cpacf_test_func(cpacf_mask_t *mask, unsigned int func)
 	return (mask->bytes[func >> 3] & (0x80 >> (func & 7))) != 0;
 }
 
-static __always_inline int cpacf_query_func(unsigned int opcode, unsigned int func)
+static __always_inline int cpacf_query_func(unsigned int opcode,
+					    unsigned int func)
 {
 	cpacf_mask_t mask;
 
 	if (cpacf_query(opcode, &mask))
 		return cpacf_test_func(&mask, func);
+	return 0;
+}
+
+static __always_inline void __cpacf_qai(unsigned int opcode, cpacf_qai_t *qai)
+{
+	__cpacf_query_insn(opcode, qai, CPACF_FC_QUERY_AUTH_INFO);
+}
+
+/**
+ * cpacf_qai() - Get the query authentication information for a CPACF opcode
+ * @opcode: the opcode of the crypto instruction
+ * @mask: ptr to struct cpacf_qai_t
+ *
+ * Executes the query authentication information function for the given crypto
+ * instruction @opcode and checks if @func is available
+ *
+ * On success 1 is returned and the mask is filled with the query authentication
+ * information for this CPACF opcode, otherwise 0 is returned.
+ */
+static __always_inline int cpacf_qai(unsigned int opcode, cpacf_qai_t *qai)
+{
+	if (cpacf_query_func(opcode, CPACF_FC_QUERY_AUTH_INFO)) {
+		__cpacf_qai(opcode, qai);
+		return 1;
+	}
+	memset(qai, 0, sizeof(*qai));
 	return 0;
 }
 
