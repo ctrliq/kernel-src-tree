@@ -3529,9 +3529,7 @@ int tcp_sock_set_keepintvl(struct sock *sk, int val)
 	if (val < 1 || val > MAX_TCP_KEEPINTVL)
 		return -EINVAL;
 
-	lock_sock(sk);
 	WRITE_ONCE(tcp_sk(sk)->keepalive_intvl, val * HZ);
-	release_sock(sk);
 	return 0;
 }
 EXPORT_SYMBOL(tcp_sock_set_keepintvl);
@@ -3651,6 +3649,8 @@ int do_tcp_setsockopt(struct sock *sk, int level, int optname,
 		return tcp_sock_set_syncnt(sk, val);
 	case TCP_USER_TIMEOUT:
 		return tcp_sock_set_user_timeout(sk, val);
+	case TCP_KEEPINTVL:
+		return tcp_sock_set_keepintvl(sk, val);
 	}
 
 	sockopt_lock_sock(sk);
@@ -3747,12 +3747,6 @@ int do_tcp_setsockopt(struct sock *sk, int level, int optname,
 
 	case TCP_KEEPIDLE:
 		err = tcp_sock_set_keepidle_locked(sk, val);
-		break;
-	case TCP_KEEPINTVL:
-		if (val < 1 || val > MAX_TCP_KEEPINTVL)
-			err = -EINVAL;
-		else
-			WRITE_ONCE(tp->keepalive_intvl, val * HZ);
 		break;
 	case TCP_KEEPCNT:
 		if (val < 1 || val > MAX_TCP_KEEPCNT)
