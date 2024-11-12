@@ -3539,10 +3539,8 @@ int tcp_sock_set_keepcnt(struct sock *sk, int val)
 	if (val < 1 || val > MAX_TCP_KEEPCNT)
 		return -EINVAL;
 
-	lock_sock(sk);
 	/* Paired with READ_ONCE() in keepalive_probes() */
 	WRITE_ONCE(tcp_sk(sk)->keepalive_probes, val);
-	release_sock(sk);
 	return 0;
 }
 EXPORT_SYMBOL(tcp_sock_set_keepcnt);
@@ -3651,6 +3649,8 @@ int do_tcp_setsockopt(struct sock *sk, int level, int optname,
 		return tcp_sock_set_user_timeout(sk, val);
 	case TCP_KEEPINTVL:
 		return tcp_sock_set_keepintvl(sk, val);
+	case TCP_KEEPCNT:
+		return tcp_sock_set_keepcnt(sk, val);
 	}
 
 	sockopt_lock_sock(sk);
@@ -3747,12 +3747,6 @@ int do_tcp_setsockopt(struct sock *sk, int level, int optname,
 
 	case TCP_KEEPIDLE:
 		err = tcp_sock_set_keepidle_locked(sk, val);
-		break;
-	case TCP_KEEPCNT:
-		if (val < 1 || val > MAX_TCP_KEEPCNT)
-			err = -EINVAL;
-		else
-			WRITE_ONCE(tp->keepalive_probes, val);
 		break;
 	case TCP_SAVE_SYN:
 		/* 0: disable, 1: enable, 2: start from ether_header */
