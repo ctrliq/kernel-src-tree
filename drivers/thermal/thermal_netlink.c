@@ -443,7 +443,6 @@ static int thermal_genl_cmd_tz_get_trip(struct param *p)
 {
 	struct sk_buff *msg = p->msg;
 	const struct thermal_trip *trip;
-	struct thermal_zone_device *tz;
 	struct nlattr *start_trip;
 	int id;
 
@@ -452,7 +451,7 @@ static int thermal_genl_cmd_tz_get_trip(struct param *p)
 
 	id = nla_get_u32(p->attrs[THERMAL_GENL_ATTR_TZ_ID]);
 
-	tz = thermal_zone_get_by_id(id);
+	CLASS(thermal_zone_get_by_id, tz)(id);
 	if (!tz)
 		return -EINVAL;
 
@@ -486,7 +485,6 @@ out_cancel_nest:
 static int thermal_genl_cmd_tz_get_temp(struct param *p)
 {
 	struct sk_buff *msg = p->msg;
-	struct thermal_zone_device *tz;
 	int temp, ret, id;
 
 	if (!p->attrs[THERMAL_GENL_ATTR_TZ_ID])
@@ -494,7 +492,7 @@ static int thermal_genl_cmd_tz_get_temp(struct param *p)
 
 	id = nla_get_u32(p->attrs[THERMAL_GENL_ATTR_TZ_ID]);
 
-	tz = thermal_zone_get_by_id(id);
+	CLASS(thermal_zone_get_by_id, tz)(id);
 	if (!tz)
 		return -EINVAL;
 
@@ -512,7 +510,6 @@ static int thermal_genl_cmd_tz_get_temp(struct param *p)
 static int thermal_genl_cmd_tz_get_gov(struct param *p)
 {
 	struct sk_buff *msg = p->msg;
-	struct thermal_zone_device *tz;
 	int id, ret = 0;
 
 	if (!p->attrs[THERMAL_GENL_ATTR_TZ_ID])
@@ -520,7 +517,7 @@ static int thermal_genl_cmd_tz_get_gov(struct param *p)
 
 	id = nla_get_u32(p->attrs[THERMAL_GENL_ATTR_TZ_ID]);
 
-	tz = thermal_zone_get_by_id(id);
+	CLASS(thermal_zone_get_by_id, tz)(id);
 	if (!tz)
 		return -EINVAL;
 
