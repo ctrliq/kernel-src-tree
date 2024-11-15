@@ -4019,7 +4019,7 @@ static int tg3_power_up(struct tg3 *tp)
 
 static int tg3_setup_phy(struct tg3 *, bool);
 
-static int tg3_power_down_prepare(struct tg3 *tp)
+static void tg3_power_down_prepare(struct tg3 *tp)
 {
 	u32 misc_host_ctrl;
 	bool device_should_wake, do_low_power;
@@ -4263,7 +4263,7 @@ static int tg3_power_down_prepare(struct tg3 *tp)
 
 	tg3_ape_driver_state_change(tp, RESET_KIND_SHUTDOWN);
 
-	return 0;
+	return;
 }
 
 static void tg3_power_down(struct tg3 *tp)
@@ -4354,21 +4354,12 @@ static int tg3_phy_autoneg_cfg(struct tg3 *tp, u32 advertise, u32 flowctrl)
 	if (!err) {
 		u32 err2;
 
-		val = 0;
-		/* Advertise 100-BaseTX EEE ability */
-		if (advertise & ADVERTISED_100baseT_Full)
-			val |= MDIO_AN_EEE_ADV_100TX;
-		/* Advertise 1000-BaseT EEE ability */
-		if (advertise & ADVERTISED_1000baseT_Full)
-			val |= MDIO_AN_EEE_ADV_1000T;
-
-		if (!tp->eee.eee_enabled) {
+		if (!tp->eee.eee_enabled)
 			val = 0;
-			linkmode_zero(tp->eee.advertised);
-		} else {
-			mii_eee_cap1_mod_linkmode_t(tp->eee.advertised, val);
-		}
+		else
+			val = ethtool_adv_to_mmd_eee_adv_t(advertise);
 
+		mii_eee_cap1_mod_linkmode_t(tp->eee.advertised, val);
 		err = tg3_phy_cl45_write(tp, MDIO_MMD_AN, MDIO_AN_EEE_ADV, val);
 		if (err)
 			val = 0;
@@ -18089,7 +18080,6 @@ static int tg3_suspend(struct device *device)
 {
 	struct net_device *dev = dev_get_drvdata(device);
 	struct tg3 *tp = netdev_priv(dev);
-	int err = 0;
 
 	rtnl_lock();
 
@@ -18113,32 +18103,11 @@ static int tg3_suspend(struct device *device)
 	tg3_flag_clear(tp, INIT_COMPLETE);
 	tg3_full_unlock(tp);
 
-	err = tg3_power_down_prepare(tp);
-	if (err) {
-		int err2;
-
-		tg3_full_lock(tp, 0);
-
-		tg3_flag_set(tp, INIT_COMPLETE);
-		err2 = tg3_restart_hw(tp, true);
-		if (err2)
-			goto out;
-
-		tg3_timer_start(tp);
-
-		netif_device_attach(dev);
-		tg3_netif_start(tp);
-
-out:
-		tg3_full_unlock(tp);
-
-		if (!err2)
-			tg3_phy_start(tp);
-	}
+	tg3_power_down_prepare(tp);
 
 unlock:
 	rtnl_unlock();
-	return err;
+	return 0;
 }
 
 static int tg3_resume(struct device *device)
