@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause */
 /*
- * Copyright (C) 2012-2014, 2018-2023 Intel Corporation
+ * Copyright (C) 2012-2014, 2018-2024 Intel Corporation
  * Copyright (C) 2013-2014 Intel Mobile Communications GmbH
  * Copyright (C) 2015-2017 Intel Deutschland GmbH
  */
@@ -462,7 +462,7 @@ struct iwl_per_chain_offset {
 } __packed; /* PER_CHAIN_LIMIT_OFFSET_PER_CHAIN_S_VER_1 */
 
 /**
- * struct iwl_geo_tx_power_profile_cmd_v1 - struct for PER_CHAIN_LIMIT_OFFSET_CMD cmd.
+ * struct iwl_geo_tx_power_profiles_cmd_v1 - struct for PER_CHAIN_LIMIT_OFFSET_CMD cmd.
  * @ops: operations, value from &enum iwl_geo_per_chain_offset_operation
  * @table: offset profile per band.
  */
@@ -472,7 +472,7 @@ struct iwl_geo_tx_power_profiles_cmd_v1 {
 } __packed; /* PER_CHAIN_LIMIT_OFFSET_CMD_VER_1 */
 
 /**
- * struct iwl_geo_tx_power_profile_cmd_v2 - struct for PER_CHAIN_LIMIT_OFFSET_CMD cmd.
+ * struct iwl_geo_tx_power_profiles_cmd_v2 - struct for PER_CHAIN_LIMIT_OFFSET_CMD cmd.
  * @ops: operations, value from &enum iwl_geo_per_chain_offset_operation
  * @table: offset profile per band.
  * @table_revision: 0 for not-South Korea, 1 for South Korea (the name is misleading)
@@ -484,7 +484,7 @@ struct iwl_geo_tx_power_profiles_cmd_v2 {
 } __packed; /* PER_CHAIN_LIMIT_OFFSET_CMD_VER_2 */
 
 /**
- * struct iwl_geo_tx_power_profile_cmd_v3 - struct for PER_CHAIN_LIMIT_OFFSET_CMD cmd.
+ * struct iwl_geo_tx_power_profiles_cmd_v3 - struct for PER_CHAIN_LIMIT_OFFSET_CMD cmd.
  * @ops: operations, value from &enum iwl_geo_per_chain_offset_operation
  * @table: offset profile per band.
  * @table_revision: 0 for not-South Korea, 1 for South Korea (the name is misleading)
@@ -496,7 +496,7 @@ struct iwl_geo_tx_power_profiles_cmd_v3 {
 } __packed; /* PER_CHAIN_LIMIT_OFFSET_CMD_VER_3 */
 
 /**
- * struct iwl_geo_tx_power_profile_cmd_v4 - struct for PER_CHAIN_LIMIT_OFFSET_CMD cmd.
+ * struct iwl_geo_tx_power_profiles_cmd_v4 - struct for PER_CHAIN_LIMIT_OFFSET_CMD cmd.
  * @ops: operations, value from &enum iwl_geo_per_chain_offset_operation
  * @table: offset profile per band.
  * @table_revision: 0 for not-South Korea, 1 for South Korea (the name is misleading)
@@ -508,7 +508,7 @@ struct iwl_geo_tx_power_profiles_cmd_v4 {
 } __packed; /* PER_CHAIN_LIMIT_OFFSET_CMD_VER_4 */
 
 /**
- * struct iwl_geo_tx_power_profile_cmd_v5 - struct for PER_CHAIN_LIMIT_OFFSET_CMD cmd.
+ * struct iwl_geo_tx_power_profiles_cmd_v5 - struct for PER_CHAIN_LIMIT_OFFSET_CMD cmd.
  * @ops: operations, value from &enum iwl_geo_per_chain_offset_operation
  * @table: offset profile per band.
  * @table_revision: 0 for not-South Korea, 1 for South Korea (the name is misleading)
@@ -567,11 +567,14 @@ enum iwl_ppag_flags {
  * union iwl_ppag_table_cmd - union for all versions of PPAG command
  * @v1: version 1
  * @v2: version 2
- * version 3, 4 and 5 are the same structure as v2,
+ * version 3, 4, 5 and 6 are the same structure as v2,
  *	but has a different format of the flags bitmap
- * @flags: values from &enum iwl_ppag_flags
- * @gain: table of antenna gain values per chain and sub-band
- * @reserved: reserved
+ * @v1.flags: values from &enum iwl_ppag_flags
+ * @v1.gain: table of antenna gain values per chain and sub-band
+ * @v1.reserved: reserved
+ * @v2.flags: values from &enum iwl_ppag_flags
+ * @v2.gain: table of antenna gain values per chain and sub-band
+ * @v2.reserved: reserved
  */
 union iwl_ppag_table_cmd {
 	struct {
@@ -732,4 +735,44 @@ struct iwl_beacon_filter_cmd {
 
 #define IWL_BF_CMD_CONFIG_DEFAULTS IWL_BF_CMD_CONFIG(_DEFAULT)
 #define IWL_BF_CMD_CONFIG_D0I3 IWL_BF_CMD_CONFIG(_D0I3)
+
+#define DEFAULT_TPE_TX_POWER 0x7F
+
+/*
+ *  Bandwidth: 20/40/80/(160/80+80)/320
+ */
+#define IWL_MAX_TX_EIRP_PWR_MAX_SIZE 5
+#define IWL_MAX_TX_EIRP_PSD_PWR_MAX_SIZE 16
+
+enum iwl_6ghz_ap_type {
+	IWL_6GHZ_AP_TYPE_LPI,
+	IWL_6GHZ_AP_TYPE_SP,
+	IWL_6GHZ_AP_TYPE_VLP,
+}; /* PHY_AP_TYPE_API_E_VER_1 */
+
+/**
+ * struct iwl_txpower_constraints_cmd
+ * AP_TX_POWER_CONSTRAINTS_CMD
+ * Used for VLP/LPI/AFC Access Point power constraints for 6GHz channels
+ * @link_id: linkId
+ * @ap_type: see &enum iwl_ap_type
+ * @eirp_pwr: 8-bit 2s complement signed integer in the range
+ *	-64 dBm to 63 dBm with a 0.5 dB step
+ *	default &DEFAULT_TPE_TX_POWER (no maximum limit)
+ * @psd_pwr: 8-bit 2s complement signed integer in the range
+ *	-63.5 to +63 dBm/MHz with a 0.5 step
+ *	value - 128 indicates that the corresponding 20
+ *	MHz channel cannot be used for transmission.
+ *	value +127 indicates that no maximum PSD limit
+ *	is specified for the corresponding 20 MHz channel
+ *	default &DEFAULT_TPE_TX_POWER (no maximum limit)
+ * @reserved: reserved (padding)
+ */
+struct iwl_txpower_constraints_cmd {
+	__le16 link_id;
+	__le16 ap_type;
+	__s8 eirp_pwr[IWL_MAX_TX_EIRP_PWR_MAX_SIZE];
+	__s8 psd_pwr[IWL_MAX_TX_EIRP_PSD_PWR_MAX_SIZE];
+	u8 reserved[3];
+} __packed; /* PHY_AP_TX_POWER_CONSTRAINTS_CMD_API_S_VER_1 */
 #endif /* __iwl_fw_api_power_h__ */
