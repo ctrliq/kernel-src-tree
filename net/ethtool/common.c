@@ -6,6 +6,7 @@
 #include <linux/rtnetlink.h>
 #include <linux/ptp_clock_kernel.h>
 
+#include "netlink.h"
 #include "common.h"
 
 const char netdev_features_strings[NETDEV_FEATURE_COUNT][ETH_GSTRING_LEN] = {
@@ -536,7 +537,7 @@ static int ethtool_get_rxnfc_rule_count(struct net_device *dev)
 	return info.rule_cnt;
 }
 
-int ethtool_get_max_rxnfc_channel(struct net_device *dev, u64 *max)
+static int ethtool_get_max_rxnfc_channel(struct net_device *dev, u64 *max)
 {
 	const struct ethtool_ops *ops = dev->ethtool_ops;
 	struct ethtool_rxnfc *info;
@@ -606,7 +607,7 @@ static u32 ethtool_get_max_rss_ctx_channel(struct net_device *dev)
 	return max_ring;
 }
 
-u32 ethtool_get_max_rxfh_channel(struct net_device *dev)
+static u32 ethtool_get_max_rxfh_channel(struct net_device *dev)
 {
 	struct ethtool_rxfh_param rxfh = {};
 	u32 dev_size, current_max;
@@ -647,9 +648,38 @@ out_free:
 	return current_max;
 }
 
+int ethtool_check_max_channel(struct net_device *dev,
+			      struct ethtool_channels channels,
+			      struct genl_info *info)
+{
+	u64 max_rxnfc_in_use;
+	u32 max_rxfh_in_use;
+
+	/* ensure the new Rx count fits within the configured Rx flow
+	 * indirection table/rxnfc settings
+	 */
+	if (ethtool_get_max_rxnfc_channel(dev, &max_rxnfc_in_use))
+		max_rxnfc_in_use = 0;
+	max_rxfh_in_use = ethtool_get_max_rxfh_channel(dev);
+	if (channels.combined_count + channels.rx_count <= max_rxfh_in_use) {
+		if (info)
+			GENL_SET_ERR_MSG_FMT(info, "requested channel counts are too low for existing indirection table (%d)", max_rxfh_in_use);
+		return -EINVAL;
+	}
+	if (channels.combined_count + channels.rx_count <= max_rxnfc_in_use) {
+		if (info)
+			GENL_SET_ERR_MSG(info, "requested channel counts are too low for existing ntuple filter settings");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 int ethtool_check_ops(const struct ethtool_ops *ops)
 {
 	if (WARN_ON(ops->set_coalesce && !ops->supported_coalesce_params))
+		return -EINVAL;
+	if (WARN_ON(ops->rxfh_max_num_contexts == 1))
 		return -EINVAL;
 	/* NOTE: sufficiently insane drivers may swap ethtool_ops at runtime,
 	 * the fact that ops are checked at registration time does not
@@ -662,20 +692,21 @@ int __ethtool_get_ts_info(struct net_device *dev, struct kernel_ethtool_ts_info 
 {
 	const struct ethtool_ops *ops = dev->ethtool_ops;
 	struct phy_device *phydev = dev->phydev;
+	int err = 0;
 
 	memset(info, 0, sizeof(*info));
 	info->cmd = ETHTOOL_GET_TS_INFO;
-
-	if (phy_is_default_hwtstamp(phydev) && phy_has_tsinfo(phydev))
-		return phy_ts_info(phydev, info);
-	if (ops->get_ts_info)
-		return ops->get_ts_info(dev, info);
-
-	info->so_timestamping = SOF_TIMESTAMPING_RX_SOFTWARE |
-				SOF_TIMESTAMPING_SOFTWARE;
 	info->phc_index = -1;
 
-	return 0;
+	if (phy_is_default_hwtstamp(phydev) && phy_has_tsinfo(phydev))
+		err = phy_ts_info(phydev, info);
+	else if (ops->get_ts_info)
+		err = ops->get_ts_info(dev, info);
+
+	info->so_timestamping |= SOF_TIMESTAMPING_RX_SOFTWARE |
+				 SOF_TIMESTAMPING_SOFTWARE;
+
+	return err;
 }
 
 int ethtool_get_phc_vclocks(struct net_device *dev, int **vclock_index)

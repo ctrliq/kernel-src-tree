@@ -3182,8 +3182,6 @@ static int gem_get_ts_info(struct net_device *dev,
 
 	info->so_timestamping =
 		SOF_TIMESTAMPING_TX_SOFTWARE |
-		SOF_TIMESTAMPING_RX_SOFTWARE |
-		SOF_TIMESTAMPING_SOFTWARE |
 		SOF_TIMESTAMPING_TX_HARDWARE |
 		SOF_TIMESTAMPING_RX_HARDWARE |
 		SOF_TIMESTAMPING_RAW_HARDWARE;
@@ -3195,7 +3193,8 @@ static int gem_get_ts_info(struct net_device *dev,
 		(1 << HWTSTAMP_FILTER_NONE) |
 		(1 << HWTSTAMP_FILTER_ALL);
 
-	info->phc_index = bp->ptp_clock ? ptp_clock_index(bp->ptp_clock) : -1;
+	if (bp->ptp_clock)
+		info->phc_index = ptp_clock_index(bp->ptp_clock);
 
 	return 0;
 }

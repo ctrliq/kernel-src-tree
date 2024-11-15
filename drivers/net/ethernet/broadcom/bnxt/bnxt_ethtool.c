@@ -5036,11 +5036,8 @@ static int bnxt_get_ts_info(struct net_device *dev,
 	struct bnxt_ptp_cfg *ptp;
 
 	ptp = bp->ptp_cfg;
-	info->so_timestamping = SOF_TIMESTAMPING_TX_SOFTWARE |
-				SOF_TIMESTAMPING_RX_SOFTWARE |
-				SOF_TIMESTAMPING_SOFTWARE;
+	info->so_timestamping = SOF_TIMESTAMPING_TX_SOFTWARE;
 
-	info->phc_index = -1;
 	if (!ptp)
 		return 0;
 
@@ -5285,7 +5282,7 @@ void bnxt_ethtool_free(struct bnxt *bp)
 
 const struct ethtool_ops bnxt_ethtool_ops = {
 	.cap_link_lanes_supported	= 1,
-	.cap_rss_ctx_supported		= 1,
+	.rxfh_per_ctx_key		= 1,
 	.rxfh_max_num_contexts		= BNXT_MAX_ETH_RSS_CTX + 1,
 	.rxfh_indir_space		= BNXT_MAX_RSS_TABLE_ENTRIES_P5,
 	.rxfh_priv_size			= sizeof(struct bnxt_rss_ctx),
