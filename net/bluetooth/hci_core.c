@@ -3055,7 +3055,7 @@ int hci_send_cmd(struct hci_dev *hdev, __u16 opcode, __u32 plen,
 
 	BT_DBG("%s opcode 0x%4.4x plen %d", hdev->name, opcode, plen);
 
-	skb = hci_prepare_cmd(hdev, opcode, plen, param);
+	skb = hci_cmd_sync_alloc(hdev, opcode, plen, param, NULL);
 	if (!skb) {
 		bt_dev_err(hdev, "no memory for command");
 		return -ENOMEM;
@@ -3090,7 +3090,7 @@ int __hci_cmd_send(struct hci_dev *hdev, u16 opcode, u32 plen,
 		return -EINVAL;
 	}
 
-	skb = hci_prepare_cmd(hdev, opcode, plen, param);
+	skb = hci_cmd_sync_alloc(hdev, opcode, plen, param, NULL);
 	if (!skb) {
 		bt_dev_err(hdev, "no memory for command (opcode 0x%4.4x)",
 			   opcode);
