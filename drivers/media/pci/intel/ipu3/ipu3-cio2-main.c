@@ -1314,7 +1314,7 @@ static int cio2_video_link_validate(struct media_link *link)
 	struct v4l2_subdev_format source_fmt;
 	int ret;
 
-	if (!media_entity_remote_pad(link->sink->entity->pads)) {
+	if (!media_pad_remote_pad_first(link->sink->entity->pads)) {
 		dev_info(&cio2->pci_dev->dev,
 			 "video node %s pad not connected\n", vd->name);
 		return -ENOTCONN;

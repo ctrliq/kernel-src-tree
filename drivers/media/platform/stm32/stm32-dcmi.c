@@ -589,7 +589,7 @@ static struct media_entity *dcmi_find_source(struct stm32_dcmi *dcmi)
 		if (!(pad->flags & MEDIA_PAD_FL_SINK))
 			break;
 
-		pad = media_entity_remote_pad(pad);
+		pad = media_pad_remote_pad_first(pad);
 		if (!pad || !is_media_entity_v4l2_subdev(pad->entity))
 			break;
 
@@ -660,7 +660,7 @@ static int dcmi_pipeline_s_fmt(struct stm32_dcmi *dcmi,
 		}
 
 		/* Walk to next entity */
-		sink_pad = media_entity_remote_pad(src_pad);
+		sink_pad = media_pad_remote_pad_first(src_pad);
 		if (!sink_pad || !is_media_entity_v4l2_subdev(sink_pad->entity))
 			break;
 
@@ -684,7 +684,7 @@ static int dcmi_pipeline_s_stream(struct stm32_dcmi *dcmi, int state)
 		if (!(pad->flags & MEDIA_PAD_FL_SINK))
 			break;
 
-		pad = media_entity_remote_pad(pad);
+		pad = media_pad_remote_pad_first(pad);
 		if (!pad || !is_media_entity_v4l2_subdev(pad->entity))
 			break;
 

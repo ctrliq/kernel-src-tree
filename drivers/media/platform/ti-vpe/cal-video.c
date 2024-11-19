@@ -654,7 +654,6 @@ static int cal_video_check_format(struct cal_ctx *ctx)
 	const struct v4l2_mbus_framefmt *format;
 
 	format = &ctx->phy->formats[CAL_CAMERARX_PAD_SOURCE];
-
 	if (ctx->fmtinfo->code != format->code ||
 	    ctx->v_fmt.fmt.pix.height != format->height ||
 	    ctx->v_fmt.fmt.pix.width != format->width ||
