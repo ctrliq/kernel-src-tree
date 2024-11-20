@@ -1154,6 +1154,7 @@ xchk_metadata_inode_subtype(
 	unsigned int		scrub_type)
 {
 	__u32			smtype = sc->sm->sm_type;
+	unsigned int		sick_mask = sc->sick_mask;
 	int			error;
 
 	sc->sm->sm_type = scrub_type;
@@ -1171,6 +1172,7 @@ xchk_metadata_inode_subtype(
 		break;
 	}
 
+	sc->sick_mask = sick_mask;
 	sc->sm->sm_type = smtype;
 	return error;
 }
