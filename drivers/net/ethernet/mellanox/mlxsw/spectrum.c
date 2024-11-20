@@ -3198,10 +3198,10 @@ static int mlxsw_sp_init(struct mlxsw_core *mlxsw_core,
 		goto err_lag_init;
 	}
 
-	err = mlxsw_sp_fids_init(mlxsw_sp);
+	err = mlxsw_sp->fid_core_ops->init(mlxsw_sp);
 	if (err) {
 		dev_err(mlxsw_sp->bus_info->dev, "Failed to initialize FIDs\n");
-		goto err_fids_init;
+		goto err_fid_core_init;
 	}
 
 	err = mlxsw_sp_policers_init(mlxsw_sp);
@@ -3387,8 +3387,8 @@ err_devlink_traps_init:
 err_traps_init:
 	mlxsw_sp_policers_fini(mlxsw_sp);
 err_policers_init:
-	mlxsw_sp_fids_fini(mlxsw_sp);
-err_fids_init:
+	mlxsw_sp->fid_core_ops->fini(mlxsw_sp);
+err_fid_core_init:
 	mlxsw_sp_lag_fini(mlxsw_sp);
 err_lag_init:
 	mlxsw_sp_pgt_fini(mlxsw_sp);
@@ -3424,7 +3424,7 @@ static int mlxsw_sp1_init(struct mlxsw_core *mlxsw_core,
 	mlxsw_sp->router_ops = &mlxsw_sp1_router_ops;
 	mlxsw_sp->listeners = mlxsw_sp1_listener;
 	mlxsw_sp->listeners_count = ARRAY_SIZE(mlxsw_sp1_listener);
-	mlxsw_sp->fid_family_arr = mlxsw_sp1_fid_family_arr;
+	mlxsw_sp->fid_core_ops = &mlxsw_sp1_fid_core_ops;
 	mlxsw_sp->lowest_shaper_bs = MLXSW_REG_QEEC_LOWEST_SHAPER_BS_SP1;
 	mlxsw_sp->pgt_smpe_index_valid = true;
 
@@ -3458,7 +3458,7 @@ static int mlxsw_sp2_init(struct mlxsw_core *mlxsw_core,
 	mlxsw_sp->router_ops = &mlxsw_sp2_router_ops;
 	mlxsw_sp->listeners = mlxsw_sp2_listener;
 	mlxsw_sp->listeners_count = ARRAY_SIZE(mlxsw_sp2_listener);
-	mlxsw_sp->fid_family_arr = mlxsw_sp2_fid_family_arr;
+	mlxsw_sp->fid_core_ops = &mlxsw_sp2_fid_core_ops;
 	mlxsw_sp->lowest_shaper_bs = MLXSW_REG_QEEC_LOWEST_SHAPER_BS_SP2;
 	mlxsw_sp->pgt_smpe_index_valid = false;
 
@@ -3492,7 +3492,7 @@ static int mlxsw_sp3_init(struct mlxsw_core *mlxsw_core,
 	mlxsw_sp->router_ops = &mlxsw_sp2_router_ops;
 	mlxsw_sp->listeners = mlxsw_sp2_listener;
 	mlxsw_sp->listeners_count = ARRAY_SIZE(mlxsw_sp2_listener);
-	mlxsw_sp->fid_family_arr = mlxsw_sp2_fid_family_arr;
+	mlxsw_sp->fid_core_ops = &mlxsw_sp2_fid_core_ops;
 	mlxsw_sp->lowest_shaper_bs = MLXSW_REG_QEEC_LOWEST_SHAPER_BS_SP3;
 	mlxsw_sp->pgt_smpe_index_valid = false;
 
@@ -3526,7 +3526,7 @@ static int mlxsw_sp4_init(struct mlxsw_core *mlxsw_core,
 	mlxsw_sp->router_ops = &mlxsw_sp2_router_ops;
 	mlxsw_sp->listeners = mlxsw_sp2_listener;
 	mlxsw_sp->listeners_count = ARRAY_SIZE(mlxsw_sp2_listener);
-	mlxsw_sp->fid_family_arr = mlxsw_sp2_fid_family_arr;
+	mlxsw_sp->fid_core_ops = &mlxsw_sp2_fid_core_ops;
 	mlxsw_sp->lowest_shaper_bs = MLXSW_REG_QEEC_LOWEST_SHAPER_BS_SP4;
 	mlxsw_sp->pgt_smpe_index_valid = false;
 
@@ -3560,7 +3560,7 @@ static void mlxsw_sp_fini(struct mlxsw_core *mlxsw_core)
 	mlxsw_sp_devlink_traps_fini(mlxsw_sp);
 	mlxsw_sp_traps_fini(mlxsw_sp);
 	mlxsw_sp_policers_fini(mlxsw_sp);
-	mlxsw_sp_fids_fini(mlxsw_sp);
+	mlxsw_sp->fid_core_ops->fini(mlxsw_sp);
 	mlxsw_sp_lag_fini(mlxsw_sp);
 	mlxsw_sp_pgt_fini(mlxsw_sp);
 	mlxsw_sp_kvdl_fini(mlxsw_sp);
