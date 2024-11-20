@@ -486,8 +486,8 @@ struct ice_repr *ice_repr_create_vf(struct ice_vf *vf)
 		return ERR_PTR(-EINVAL);
 
 	repr = ice_repr_create(vsi);
-	if (!repr)
-		return ERR_PTR(-ENOMEM);
+	if (IS_ERR(repr))
+		return repr;
 
 	repr->type = ICE_REPR_TYPE_VF;
 	repr->vf = vf;
@@ -535,8 +535,8 @@ struct ice_repr *ice_repr_create_sf(struct ice_dynamic_port *sf)
 {
 	struct ice_repr *repr = ice_repr_create(sf->vsi);
 
-	if (!repr)
-		return ERR_PTR(-ENOMEM);
+	if (IS_ERR(repr))
+		return repr;
 
 	repr->type = ICE_REPR_TYPE_SF;
 	repr->sf = sf;
