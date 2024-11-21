@@ -23,6 +23,7 @@
 #include <drm/drm_panic.h>
 #include <drm/drm_print.h>
 
+#include "mgag200_ddc.h"
 #include "mgag200_drv.h"
 
 /*
@@ -110,12 +111,12 @@ static inline void mga_wait_vsync(struct mga_device *mdev)
 	unsigned int status = 0;
 
 	do {
-		status = RREG32(MGAREG_Status);
+		status = RREG32(MGAREG_STATUS);
 	} while ((status & 0x08) && time_before(jiffies, timeout));
 	timeout = jiffies + HZ/10;
 	status = 0;
 	do {
-		status = RREG32(MGAREG_Status);
+		status = RREG32(MGAREG_STATUS);
 	} while (!(status & 0x08) && time_before(jiffies, timeout));
 }
 
@@ -124,7 +125,7 @@ static inline void mga_wait_busy(struct mga_device *mdev)
 	unsigned long timeout = jiffies + HZ;
 	unsigned int status = 0;
 	do {
-		status = RREG8(MGAREG_Status + 2);
+		status = RREG8(MGAREG_STATUS + 2);
 	} while ((status & 0x01) && time_before(jiffies, timeout));
 }
 
@@ -726,32 +727,6 @@ void mgag200_crtc_atomic_destroy_state(struct drm_crtc *crtc, struct drm_crtc_st
 
 	__drm_atomic_helper_crtc_destroy_state(&mgag200_crtc_state->base);
 	kfree(mgag200_crtc_state);
-}
-
-/*
- * Connector
- */
-
-int mgag200_vga_connector_helper_get_modes(struct drm_connector *connector)
-{
-	struct mga_device *mdev = to_mga_device(connector->dev);
-	const struct drm_edid *drm_edid;
-	int count;
-
-	/*
-	 * Protect access to I/O registers from concurrent modesetting
-	 * by acquiring the I/O-register lock.
-	 */
-	mutex_lock(&mdev->rmmio_lock);
-
-	drm_edid = drm_edid_read(connector);
-	drm_edid_connector_update(connector, drm_edid);
-	count = drm_edid_connector_add_modes(connector);
-	drm_edid_free(drm_edid);
-
-	mutex_unlock(&mdev->rmmio_lock);
-
-	return count;
 }
 
 /*
