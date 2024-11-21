@@ -28,8 +28,7 @@
 	.poll		= drm_poll,\
 	.read		= drm_read,\
 	.llseek		= noop_llseek, \
-	.mmap		= drm_gem_mmap, \
-	.fop_flags	= FOP_UNSIGNED_OFFSET
+	.mmap		= drm_gem_mmap
 
 /**
  * DEFINE_DRM_ACCEL_FOPS() - macro to generate file operations for accelerators drivers
