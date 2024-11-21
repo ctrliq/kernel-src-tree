@@ -31,7 +31,7 @@ DECLARE_EVENT_CLASS(xe_guc_ct_flow_control,
 			     ),
 
 		    TP_fast_assign(
-			   __assign_str(dev);
+			   __assign_str(dev, __dev_name_xe(xe));
 			   __entry->_head = _head;
 			   __entry->_tail = _tail;
 			   __entry->size = size;
@@ -72,7 +72,7 @@ DECLARE_EVENT_CLASS(xe_guc_ctb,
 		    ),
 
 		    TP_fast_assign(
-			    __assign_str(dev);
+			    __assign_str(dev, __dev_name_xe(xe));
 			    __entry->gt_id = gt_id;
 			    __entry->action = action;
 			    __entry->len = len;

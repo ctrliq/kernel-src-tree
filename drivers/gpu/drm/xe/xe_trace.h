@@ -35,7 +35,7 @@ DECLARE_EVENT_CLASS(xe_gt_tlb_invalidation_fence,
 			     ),
 
 		    TP_fast_assign(
-			   __assign_str(dev);
+			   __assign_str(dev, __dev_name_xe(xe));
 			   __entry->fence = fence;
 			   __entry->seqno = fence->seqno;
 			   ),
@@ -96,7 +96,7 @@ DECLARE_EVENT_CLASS(xe_exec_queue,
 			     ),
 
 		    TP_fast_assign(
-			   __assign_str(dev);
+			   __assign_str(dev, __dev_name_eq(q));
 			   __entry->class = q->class;
 			   __entry->logical_mask = q->logical_mask;
 			   __entry->gt_id = q->gt->info.id;
@@ -219,7 +219,7 @@ DECLARE_EVENT_CLASS(xe_sched_job,
 			     ),
 
 		    TP_fast_assign(
-			   __assign_str(dev);
+			   __assign_str(dev, __dev_name_eq(job->q));
 			   __entry->seqno = xe_sched_job_seqno(job);
 			   __entry->lrc_seqno = xe_sched_job_lrc_seqno(job);
 			   __entry->guc_id = job->q->guc->id;
@@ -284,7 +284,7 @@ DECLARE_EVENT_CLASS(xe_sched_msg,
 			     ),
 
 		    TP_fast_assign(
-			   __assign_str(dev);
+			   __assign_str(dev, __dev_name_eq(((struct xe_exec_queue *)msg->private_data)));
 			   __entry->opcode = msg->opcode;
 			   __entry->guc_id =
 			   ((struct xe_exec_queue *)msg->private_data)->guc->id;
@@ -316,7 +316,7 @@ DECLARE_EVENT_CLASS(xe_hw_fence,
 			     ),
 
 		    TP_fast_assign(
-			   __assign_str(dev);
+			   __assign_str(dev, __dev_name_xe(fence->xe));
 			   __entry->ctx = fence->dma.context;
 			   __entry->seqno = fence->dma.seqno;
 			   __entry->fence = fence;
@@ -355,7 +355,7 @@ TRACE_EVENT(xe_reg_rw,
 		),
 
 	TP_fast_assign(
-		__assign_str(dev);
+		__assign_str(dev, __dev_name_gt(gt));
 		__entry->val = val;
 		__entry->reg = reg;
 		__entry->write = write;
