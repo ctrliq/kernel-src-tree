@@ -379,7 +379,7 @@ DECLARE_EVENT_CLASS(xe_pm_runtime,
 			     ),
 
 		    TP_fast_assign(
-			   __assign_str(dev);
+			   __assign_str(dev, __dev_name_xe(xe));
 			   __entry->caller = caller;
 			   ),
 
