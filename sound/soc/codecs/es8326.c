@@ -1078,12 +1078,13 @@ static int es8326_suspend(struct snd_soc_component *component)
 	regmap_write(es8326->regmap, ES8326_ANA_PDN, 0x3b);
 	regmap_write(es8326->regmap, ES8326_CLK_CTL, ES8326_CLK_OFF);
 	regcache_cache_only(es8326->regmap, true);
-	regcache_mark_dirty(es8326->regmap);
 
 	/* reset register value to default */
 	regmap_write(es8326->regmap, ES8326_CSM_I2C_STA, 0x01);
 	usleep_range(1000, 3000);
 	regmap_write(es8326->regmap, ES8326_CSM_I2C_STA, 0x00);
+
+	regcache_mark_dirty(es8326->regmap);
 	return 0;
 }
 
@@ -1169,8 +1170,13 @@ static int es8326_set_jack(struct snd_soc_component *component,
 
 static void es8326_remove(struct snd_soc_component *component)
 {
+	struct es8326_priv *es8326 = snd_soc_component_get_drvdata(component);
+
 	es8326_disable_jack_detect(component);
 	es8326_set_bias_level(component, SND_SOC_BIAS_OFF);
+	regmap_write(es8326->regmap, ES8326_CSM_I2C_STA, 0x01);
+	usleep_range(1000, 3000);
+	regmap_write(es8326->regmap, ES8326_CSM_I2C_STA, 0x00);
 }
 
 static const struct snd_soc_component_driver soc_component_dev_es8326 = {
@@ -1242,6 +1248,30 @@ static int es8326_i2c_probe(struct i2c_client *i2c)
 					&es8326_dai, 1);
 }
 
+
+static void es8326_i2c_shutdown(struct i2c_client *i2c)
+{
+	struct snd_soc_component *component;
+	struct es8326_priv *es8326;
+
+	es8326 = i2c_get_clientdata(i2c);
+	component = es8326->component;
+	dev_dbg(component->dev, "Enter into %s\n", __func__);
+	cancel_delayed_work_sync(&es8326->jack_detect_work);
+	cancel_delayed_work_sync(&es8326->button_press_work);
+
+	regmap_write(es8326->regmap, ES8326_CSM_I2C_STA, 0x01);
+	usleep_range(1000, 3000);
+	regmap_write(es8326->regmap, ES8326_CSM_I2C_STA, 0x00);
+
+}
+
+static int es8326_i2c_remove(struct i2c_client *i2c)
+{
+	es8326_i2c_shutdown(i2c);
+	return 0;
+}
+
 static const struct i2c_device_id es8326_i2c_id[] = {
 	{"es8326", 0 },
 	{}
@@ -1271,6 +1301,8 @@ static struct i2c_driver es8326_i2c_driver = {
 		.of_match_table = of_match_ptr(es8326_of_match),
 	},
 	.probe_new = es8326_i2c_probe,
+	.shutdown = es8326_i2c_shutdown,
+	.remove = es8326_i2c_remove,
 	.id_table = es8326_i2c_id,
 };
 module_i2c_driver(es8326_i2c_driver);
