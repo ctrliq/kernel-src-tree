@@ -10,7 +10,7 @@
  * Tomasz Figa <t.figa@samsung.com>
  */
 
-#include <linux/unaligned.h>
+#include <asm/unaligned.h>
 
 #include <linux/clk.h>
 #include <linux/delay.h>

@@ -32,7 +32,7 @@
 #include <linux/slab.h>
 #include <linux/string_helpers.h>
 
-#include <linux/unaligned.h>
+#include <asm/unaligned.h>
 
 #include <drm/drm_crtc.h>
 #include <drm/drm_edid.h>
