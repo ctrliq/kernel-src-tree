@@ -27,7 +27,7 @@
 
 #include <linux/math64.h>
 #include <linux/types.h>
-#include <linux/wordpart.h>
+#include <linux/bitops.h>
 
 typedef union dfixed {
 	u32 full;
