@@ -4,7 +4,7 @@
  */
 
 #include <linux/string_choices.h>
-#include <linux/wordpart.h>
+#include <linux/bitops.h>
 
 #include "abi/guc_actions_sriov_abi.h"
 #include "abi/guc_klvs_abi.h"
