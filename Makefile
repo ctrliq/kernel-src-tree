@@ -8,8 +8,8 @@ NAME = Opossums on Parade
 # DRM backport version
 #
 RHEL_DRM_VERSION = 6
-RHEL_DRM_PATCHLEVEL = 9
-RHEL_DRM_SUBLEVEL = 11
+RHEL_DRM_PATCHLEVEL = 10
+RHEL_DRM_SUBLEVEL = 
 
 # *DOCUMENTATION*
 # To see a list of typical targets execute "make help"
