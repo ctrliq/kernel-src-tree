@@ -217,7 +217,6 @@ struct scsi_host_template {
 	 * Note: slave_configure is the legacy version, use device_configure for
 	 * all new code.  A driver must never define both.
 	 */
-	int (* device_configure)(struct scsi_device *, struct queue_limits *lim);
 	int (* slave_configure)(struct scsi_device *);
 
 	/*
@@ -417,8 +416,6 @@ struct scsi_host_template {
 	 */
 	unsigned int max_segment_size;
 
-	unsigned int dma_alignment;
-
 	/*
 	 * DMA scatter gather segment boundary limit. A segment crossing this
 	 * boundary will be split in two.
@@ -534,8 +531,8 @@ struct scsi_host_template {
 	 * allow extending the structure while preserving ABI.
 	 */
 
-	RH_KABI_RESERVE(1)
-	RH_KABI_RESERVE(2)
+	RH_KABI_USE_SPLIT(1, unsigned int dma_alignment)
+	RH_KABI_USE(2, int (* device_configure)(struct scsi_device *, struct queue_limits *lim))
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)
 };
@@ -658,7 +655,6 @@ struct Scsi_Host {
 	short unsigned int sg_prot_tablesize;
 	unsigned int max_sectors;
 	unsigned int max_segment_size;
-	unsigned int dma_alignment;
 	unsigned long dma_boundary;
 	unsigned long virt_boundary_mask;
 	/*
@@ -710,12 +706,12 @@ struct Scsi_Host {
 	/* The transport requires the LUN bits NOT to be stored in CDB[1] */
 	unsigned no_scsi2_lun_in_cdb:1;
 
-	unsigned no_highmem:1;
+	RH_KABI_FILL_HOLE(unsigned no_highmem:1)
 
 	/*
 	 * Optional work queue to be utilized by the transport
 	 */
-	char work_q_name[20];
+	RH_KABI_DEPRECATE(char, work_q_name[20])
 	struct workqueue_struct *work_q;
 
 	/*
@@ -766,7 +762,7 @@ struct Scsi_Host {
 	 */
 
 	RH_KABI_USE_SPLIT(2, unsigned int opt_sectors)
-	RH_KABI_RESERVE(3)
+	RH_KABI_USE_SPLIT(3, unsigned int dma_alignment)
 	RH_KABI_RESERVE(4)
 	RH_KABI_RESERVE(5)
 	RH_KABI_RESERVE(6)

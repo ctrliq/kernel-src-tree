@@ -114,6 +114,12 @@ struct scsi_disk {
 	u32		zones_optimal_open;
 	u32		zones_optimal_nonseq;
 	u32		zones_max_open;
+	RH_KABI_DEPRECATE(u32 *,		zones_wp_offset)
+	RH_KABI_DEPRECATE(spinlock_t,		zones_wp_offset_lock)
+	RH_KABI_DEPRECATE(u32 *,		rev_wp_offset)
+	RH_KABI_DEPRECATE(struct mutex,		rev_mutex)
+	RH_KABI_DEPRECATE(struct work_struct,	zone_wp_offset_work)
+	RH_KABI_DEPRECATE(char *,		zone_wp_update_buf)
 #endif
 	atomic_t	openers;
 	sector_t	capacity;	/* size in logical blocks */
@@ -124,13 +130,6 @@ struct scsi_disk {
 	u32		max_unmap_blocks;
 	u32		unmap_granularity;
 	u32		unmap_alignment;
-
-	u32		max_atomic;
-	u32		atomic_alignment;
-	u32		atomic_granularity;
-	u32		max_atomic_with_boundary;
-	u32		max_atomic_boundary;
-
 	u32		index;
 	unsigned int	physical_block_size;
 	unsigned int	max_medium_access_timeouts;
@@ -160,7 +159,7 @@ struct scsi_disk {
 	unsigned	urswrz : 1;
 	unsigned	security : 1;
 	unsigned	ignore_medium_access_errors : 1;
-	unsigned	use_atomic_write_boundary : 1;
+	RH_KABI_FILL_HOLE(unsigned use_atomic_write_boundary:1)
 
 	RH_KABI_FILL_HOLE(bool suspended)	/* Disk is suspended (stopped) */
 
@@ -174,9 +173,9 @@ struct scsi_disk {
 	 * between zone starting LBAs is constant.
 	 */
 	RH_KABI_USE(1, u32 zone_starting_lba_gran)
-	RH_KABI_USE(2, u32 min_xfer_blocks)
-	RH_KABI_RESERVE(3)
-	RH_KABI_RESERVE(4)
+	RH_KABI_USE_SPLIT(2, u32 min_xfer_blocks, u32 max_atomic)
+	RH_KABI_USE_SPLIT(3, u32 atomic_alignment, u32 atomic_granularity)
+	RH_KABI_USE_SPLIT(4, u32 max_atomic_with_boundary, u32 max_atomic_boundary)
 };
 #define to_scsi_disk(obj) container_of(obj, struct scsi_disk, disk_dev)
 
