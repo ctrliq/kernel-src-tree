@@ -2223,24 +2223,21 @@ static int rtnl_valid_dump_ifinfo_req(const struct nlmsghdr *nlh,
 
 static int rtnl_dump_ifinfo(struct sk_buff *skb, struct netlink_callback *cb)
 {
+	const struct rtnl_link_ops *kind_ops = NULL;
 	struct netlink_ext_ack *extack = cb->extack;
 	const struct nlmsghdr *nlh = cb->nlh;
 	struct net *net = sock_net(skb->sk);
-	struct net *tgt_net = net;
-	int h, s_h;
-	int idx = 0, s_idx;
-	struct net_device *dev;
-	struct hlist_head *head;
-	struct nlattr *tb[IFLA_MAX+1];
-	u32 ext_filter_mask = 0;
-	const struct rtnl_link_ops *kind_ops = NULL;
 	unsigned int flags = NLM_F_MULTI;
+	struct nlattr *tb[IFLA_MAX+1];
+	struct {
+		unsigned long ifindex;
+	} *ctx = (void *)cb->ctx;
+	struct net *tgt_net = net;
+	u32 ext_filter_mask = 0;
+	struct net_device *dev;
 	int master_idx = 0;
 	int netnsid = -1;
 	int err, i;
-
-	s_h = cb->args[0];
-	s_idx = cb->args[1];
 
 	err = rtnl_valid_dump_ifinfo_req(nlh, cb->strict_check, tb, extack);
 	if (err < 0) {
@@ -2285,36 +2282,21 @@ static int rtnl_dump_ifinfo(struct sk_buff *skb, struct netlink_callback *cb)
 		flags |= NLM_F_DUMP_FILTERED;
 
 walk_entries:
-	for (h = s_h; h < NETDEV_HASHENTRIES; h++, s_idx = 0) {
-		idx = 0;
-		head = &tgt_net->dev_index_head[h];
-		hlist_for_each_entry(dev, head, index_hlist) {
-			if (link_dump_filtered(dev, master_idx, kind_ops))
-				goto cont;
-			if (idx < s_idx)
-				goto cont;
-			err = rtnl_fill_ifinfo(skb, dev, net,
-					       RTM_NEWLINK,
-					       NETLINK_CB(cb->skb).portid,
-					       nlh->nlmsg_seq, 0, flags,
-					       ext_filter_mask, 0, NULL, 0,
-					       netnsid, GFP_KERNEL);
-
-			if (err < 0) {
-				if (likely(skb->len))
-					goto out;
-
-				goto out_err;
-			}
-cont:
-			idx++;
+	err = 0;
+	for_each_netdev_dump(tgt_net, dev, ctx->ifindex) {
+		if (link_dump_filtered(dev, master_idx, kind_ops))
+			continue;
+		err = rtnl_fill_ifinfo(skb, dev, net, RTM_NEWLINK,
+				       NETLINK_CB(cb->skb).portid,
+				       nlh->nlmsg_seq, 0, flags,
+				       ext_filter_mask, 0, NULL, 0,
+				       netnsid, GFP_KERNEL);
+		if (err < 0) {
+			if (likely(skb->len))
+				err = skb->len;
+			break;
 		}
 	}
-out:
-	err = skb->len;
-out_err:
-	cb->args[1] = idx;
-	cb->args[0] = h;
 	cb->seq = tgt_net->dev_base_seq;
 	nl_dump_check_consistent(cb, nlmsg_hdr(skb));
 	if (netnsid >= 0)
@@ -6530,6 +6512,46 @@ static int rtnl_mdb_del(struct sk_buff *skb, struct nlmsghdr *nlh,
 
 /* Process one rtnetlink message. */
 
+static int rtnl_dumpit(struct sk_buff *skb, struct netlink_callback *cb)
+{
+	rtnl_dumpit_func dumpit = cb->data;
+	int err;
+
+	/* Previous iteration have already finished, avoid calling->dumpit()
+	 * again, it may not expect to be called after it reached the end.
+	 */
+	if (!dumpit)
+		return 0;
+
+	err = dumpit(skb, cb);
+
+	/* Old dump handlers used to send NLM_DONE as in a separate recvmsg().
+	 * Some applications which parse netlink manually depend on this.
+	 */
+	if (cb->flags & RTNL_FLAG_DUMP_SPLIT_NLM_DONE) {
+		if (err < 0 && err != -EMSGSIZE)
+			return err;
+		if (!err)
+			cb->data = NULL;
+
+		return skb->len;
+	}
+	return err;
+}
+
+static int rtnetlink_dump_start(struct sock *ssk, struct sk_buff *skb,
+				const struct nlmsghdr *nlh,
+				struct netlink_dump_control *control)
+{
+	if (control->flags & RTNL_FLAG_DUMP_SPLIT_NLM_DONE) {
+		WARN_ON(control->data);
+		control->data = control->dump;
+		control->dump = rtnl_dumpit;
+	}
+
+	return netlink_dump_start(ssk, skb, nlh, control);
+}
+
 static int rtnetlink_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
 			     struct netlink_ext_ack *extack)
 {
@@ -6594,7 +6616,7 @@ static int rtnetlink_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
 				.module		= owner,
 				.flags		= flags,
 			};
-			err = netlink_dump_start(rtnl, skb, nlh, &c);
+			err = rtnetlink_dump_start(rtnl, skb, nlh, &c);
 			/* netlink_dump_start() will keep a reference on
 			 * module if dump is still in progress.
 			 */
@@ -6740,7 +6762,7 @@ void __init rtnetlink_init(void)
 	register_netdevice_notifier(&rtnetlink_dev_notifier);
 
 	rtnl_register(PF_UNSPEC, RTM_GETLINK, rtnl_getlink,
-		      rtnl_dump_ifinfo, 0);
+		      rtnl_dump_ifinfo, RTNL_FLAG_DUMP_SPLIT_NLM_DONE);
 	rtnl_register(PF_UNSPEC, RTM_SETLINK, rtnl_setlink, NULL, 0);
 	rtnl_register(PF_UNSPEC, RTM_NEWLINK, rtnl_newlink, NULL, 0);
 	rtnl_register(PF_UNSPEC, RTM_DELLINK, rtnl_dellink, NULL, 0);
