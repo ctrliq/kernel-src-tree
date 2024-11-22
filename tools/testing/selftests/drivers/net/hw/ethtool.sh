@@ -10,7 +10,8 @@ ALL_TESTS="
 	different_speeds_autoneg_on
 "
 NUM_NETIFS=2
-source lib.sh
+lib_dir=$(dirname "$0")
+source "$lib_dir"/../../../net/forwarding/lib.sh
 source ethtool_lib.sh
 
 h1_create()
@@ -64,9 +65,8 @@ same_speeds_autoneg_off()
 		setup_wait_dev_with_timeout $h1
 		setup_wait_dev_with_timeout $h2
 		ping_do $h1 192.0.2.2
-		check_err $? "speed $speed autoneg off"
-		log_test "force of same speed autoneg off"
-		log_info "speed = $speed"
+		check_err $? "ping with speed $speed autoneg off"
+		log_test "force speed $speed on both ends"
 	done
 
 	ethtool -s $h2 autoneg on
@@ -111,9 +111,8 @@ combination_of_neg_on_and_off()
 		setup_wait_dev_with_timeout $h1
 		setup_wait_dev_with_timeout $h2
 		ping_do $h1 192.0.2.2
-		check_err $? "h1-speed=$speed autoneg off, h2 autoneg on"
-		log_test "one side with autoneg off and another with autoneg on"
-		log_info "force speed = $speed"
+		check_err $? "ping with h1-speed=$speed autoneg off, h2 autoneg on"
+		log_test "force speed $speed vs. autoneg"
 	done
 
 	ethtool -s $h1 autoneg on
@@ -206,10 +205,9 @@ advertise_subset_of_speeds()
 		setup_wait_dev_with_timeout $h1
 		setup_wait_dev_with_timeout $h2
 		ping_do $h1 192.0.2.2
-		check_err $? "h1=$speed_1_to_advertise, h2=$speed_2_to_advertise ($speed_value)"
+		check_err $? "ping with h1=$speed_1_to_advertise, h2=$speed_2_to_advertise ($speed_value)"
 
-		log_test "advertise subset of speeds"
-		log_info "h1=$speed_1_to_advertise, h2=$speed_2_to_advertise"
+		log_test "advertise $speed_1_to_advertise vs. $speed_2_to_advertise"
 	done
 
 	ethtool -s $h2 autoneg on
@@ -285,8 +283,6 @@ different_speeds_autoneg_on()
 	ethtool -s $h2 autoneg on
 	ethtool -s $h1 autoneg on
 }
-
-skip_on_veth
 
 trap cleanup EXIT
 

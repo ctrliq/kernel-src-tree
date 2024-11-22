@@ -209,6 +209,15 @@ check_tc_action_hw_stats_support()
 	fi
 }
 
+check_tc_fp_support()
+{
+	tc qdisc add dev lo mqprio help 2>&1 | grep -q "fp "
+	if [[ $? -ne 0 ]]; then
+		echo "SKIP: iproute2 too old; tc is missing frame preemption support"
+		exit $ksft_skip
+	fi
+}
+
 check_ethtool_lanes_support()
 {
 	ethtool --help 2>&1| grep lanes &> /dev/null
@@ -216,6 +225,33 @@ check_ethtool_lanes_support()
 		echo "SKIP: ethtool too old; it is missing lanes support"
 		exit $ksft_skip
 	fi
+}
+
+check_ethtool_mm_support()
+{
+	ethtool --help 2>&1| grep -- '--show-mm' &> /dev/null
+	if [[ $? -ne 0 ]]; then
+		echo "SKIP: ethtool too old; it is missing MAC Merge layer support"
+		exit $ksft_skip
+	fi
+}
+
+check_ethtool_counter_group_support()
+{
+	ethtool --help 2>&1| grep -- '--all-groups' &> /dev/null
+	if [[ $? -ne 0 ]]; then
+		echo "SKIP: ethtool too old; it is missing standard counter group support"
+		exit $ksft_skip
+	fi
+}
+
+check_ethtool_pmac_std_stats_support()
+{
+	local dev=$1; shift
+	local grp=$1; shift
+
+	[ 0 -ne $(ethtool --json -S $dev --all-groups --src pmac 2>/dev/null \
+		| jq ".[].\"$grp\" | length") ]
 }
 
 check_locked_port_support()
@@ -234,21 +270,22 @@ check_port_mab_support()
 	fi
 }
 
-skip_on_veth()
-{
-	local kind=$(ip -j -d link show dev ${NETIFS[p1]} |
-		jq -r '.[].linkinfo.info_kind')
-
-	if [[ $kind == veth ]]; then
-		echo "SKIP: Test cannot be run with veth pairs"
-		exit $ksft_skip
-	fi
-}
-
 if [[ "$(id -u)" -ne 0 ]]; then
 	echo "SKIP: need root privileges"
 	exit $ksft_skip
 fi
+
+check_driver()
+{
+	local dev=$1; shift
+	local expected=$1; shift
+	local driver_name=`driver_name_get $dev`
+
+	if [[ $driver_name != $expected ]]; then
+		echo "SKIP: expected driver $expected for $dev, got $driver_name instead"
+		exit $ksft_skip
+	fi
+}
 
 if [[ "$CHECK_TC" = "yes" ]]; then
 	check_tc_version
@@ -463,9 +500,28 @@ check_err_fail()
 	fi
 }
 
+xfail()
+{
+	FAIL_TO_XFAIL=yes "$@"
+}
+
 xfail_on_slow()
 {
 	if [[ $KSFT_MACHINE_SLOW = yes ]]; then
+		FAIL_TO_XFAIL=yes "$@"
+	else
+		"$@"
+	fi
+}
+
+xfail_on_veth()
+{
+	local dev=$1; shift
+	local kind
+
+	kind=$(ip -j -d link show dev $dev |
+			jq -r '.[].linkinfo.info_kind')
+	if [[ $kind = veth ]]; then
 		FAIL_TO_XFAIL=yes "$@"
 	else
 		"$@"
@@ -554,6 +610,15 @@ log_test()
 log_test_skip()
 {
 	RET=$ksft_skip retmsg= log_test "$@"
+}
+
+log_test_xfail()
+{
+	local test_name=$1
+	local opt_str=$2
+
+	printf "TEST: %-60s  [XFAIL]\n" "$test_name $opt_str"
+	return 0
 }
 
 log_info()
@@ -660,6 +725,19 @@ setup_wait()
 
 	# Make sure links are ready.
 	sleep $WAIT_TIME
+}
+
+wait_for_dev()
+{
+        local dev=$1; shift
+        local timeout=${1:-$WAIT_TIMEOUT}; shift
+
+        slowwait $timeout ip link show dev $dev &> /dev/null
+        if (( $? )); then
+                check_err 1
+                log_test wait_for_dev "Interface $dev did not appear."
+                exit $EXIT_STATUS
+        fi
 }
 
 cmd_jq()
@@ -1044,6 +1122,39 @@ mac_get()
 	ip -j link show dev $if_name | jq -r '.[]["address"]'
 }
 
+ether_addr_to_u64()
+{
+	local addr="$1"
+	local order="$((1 << 40))"
+	local val=0
+	local byte
+
+	addr="${addr//:/ }"
+
+	for byte in $addr; do
+		byte="0x$byte"
+		val=$((val + order * byte))
+		order=$((order >> 8))
+	done
+
+	printf "0x%x" $val
+}
+
+u64_to_ether_addr()
+{
+	local val=$1
+	local byte
+	local i
+
+	for ((i = 40; i >= 0; i -= 8)); do
+		byte=$(((val & (0xff << i)) >> i))
+		printf "%02x" $byte
+		if [ $i -ne 0 ]; then
+			printf ":"
+		fi
+	done
+}
+
 ipv6_lladdr_get()
 {
 	local if_name=$1
@@ -1154,22 +1265,6 @@ trap_uninstall()
 	local direction=$1; shift
 
 	tc filter del dev $dev $direction pref 1 flower
-}
-
-slow_path_trap_install()
-{
-	# For slow-path testing, we need to install a trap to get to
-	# slow path the packets that would otherwise be switched in HW.
-	if [ "${tcflags/skip_hw}" != "$tcflags" ]; then
-		trap_install "$@"
-	fi
-}
-
-slow_path_trap_uninstall()
-{
-	if [ "${tcflags/skip_hw}" != "$tcflags" ]; then
-		trap_uninstall "$@"
-	fi
 }
 
 __icmp_capture_add_del()
@@ -2175,4 +2270,23 @@ absval()
 	local v=$1; shift
 
 	echo $((v > 0 ? v : -v))
+}
+
+has_unicast_flt()
+{
+	local dev=$1; shift
+	local mac_addr=$(mac_get $dev)
+	local tmp=$(ether_addr_to_u64 $mac_addr)
+	local promisc
+
+	ip link set $dev up
+	ip link add link $dev name macvlan-tmp type macvlan mode private
+	ip link set macvlan-tmp address $(u64_to_ether_addr $((tmp + 1)))
+	ip link set macvlan-tmp up
+
+	promisc=$(ip -j -d link show dev $dev | jq -r '.[].promiscuity')
+
+	ip link del macvlan-tmp
+
+	[[ $promisc == 1 ]] && echo "no" || echo "yes"
 }

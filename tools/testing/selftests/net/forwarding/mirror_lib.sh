@@ -44,14 +44,17 @@ mirror_test()
 		local type="icmp echoreq"
 	fi
 
+	if [[ -z ${expect//[[:digit:]]/} ]]; then
+		expect="== $expect"
+	fi
+
 	local t0=$(tc_rule_stats_get $dev $pref)
 	$MZ $proto $vrf_name ${sip:+-A $sip} -B $dip -a own -b bc -q \
 	    -c 10 -d 100msec -t $type
 	sleep 0.5
 	local t1=$(tc_rule_stats_get $dev $pref)
 	local delta=$((t1 - t0))
-	# Tolerate a couple stray extra packets.
-	((expect <= delta && delta <= expect + 2))
+	((delta $expect))
 	check_err $? "Expected to capture $expect packets, got $delta."
 }
 
@@ -59,12 +62,16 @@ do_test_span_dir_ips()
 {
 	local expect=$1; shift
 	local dev=$1; shift
-	local direction=$1; shift
 	local ip1=$1; shift
 	local ip2=$1; shift
+	local forward_type=${1-8}; shift
+	local backward_type=${1-0}; shift
 
-	icmp_capture_install $dev
+	icmp_capture_install $dev "type $forward_type"
 	mirror_test v$h1 $ip1 $ip2 $dev 100 $expect
+	icmp_capture_uninstall $dev
+
+	icmp_capture_install $dev "type $backward_type"
 	mirror_test v$h2 $ip2 $ip1 $dev 100 $expect
 	icmp_capture_uninstall $dev
 }
@@ -72,33 +79,25 @@ do_test_span_dir_ips()
 quick_test_span_dir_ips()
 {
 	local dev=$1; shift
-	local direction=$1; shift
 	local ip1=$1; shift
 	local ip2=$1; shift
+	local forward_type=${1-8}; shift
+	local backward_type=${1-0}; shift
 
-	do_test_span_dir_ips 10 "$dev" "$direction" "$ip1" "$ip2"
-}
-
-fail_test_span_dir_ips()
-{
-	local dev=$1; shift
-	local direction=$1; shift
-	local ip1=$1; shift
-	local ip2=$1; shift
-
-	do_test_span_dir_ips 0 "$dev" "$direction" "$ip1" "$ip2"
+	do_test_span_dir_ips 10 "$dev" "$ip1" "$ip2" \
+			     "$forward_type" "$backward_type"
 }
 
 test_span_dir_ips()
 {
 	local dev=$1; shift
-	local direction=$1; shift
 	local forward_type=$1; shift
 	local backward_type=$1; shift
 	local ip1=$1; shift
 	local ip2=$1; shift
 
-	quick_test_span_dir_ips "$dev" "$direction" "$ip1" "$ip2"
+	quick_test_span_dir_ips "$dev" "$ip1" "$ip2" \
+				"$forward_type" "$backward_type"
 
 	icmp_capture_install $dev "type $forward_type"
 	mirror_test v$h1 $ip1 $ip2 $dev 100 10
@@ -109,22 +108,13 @@ test_span_dir_ips()
 	icmp_capture_uninstall $dev
 }
 
-fail_test_span_dir()
-{
-	local dev=$1; shift
-	local direction=$1; shift
-
-	fail_test_span_dir_ips "$dev" "$direction" 192.0.2.1 192.0.2.2
-}
-
 test_span_dir()
 {
 	local dev=$1; shift
-	local direction=$1; shift
 	local forward_type=$1; shift
 	local backward_type=$1; shift
 
-	test_span_dir_ips "$dev" "$direction" "$forward_type" "$backward_type" \
+	test_span_dir_ips "$dev" "$forward_type" "$backward_type" \
 			  192.0.2.1 192.0.2.2
 }
 
@@ -133,7 +123,6 @@ do_test_span_vlan_dir_ips()
 	local expect=$1; shift
 	local dev=$1; shift
 	local vid=$1; shift
-	local direction=$1; shift
 	local ul_proto=$1; shift
 	local ip1=$1; shift
 	local ip2=$1; shift
@@ -142,8 +131,8 @@ do_test_span_vlan_dir_ips()
 	# The traffic is meant for local box anyway, so will be trapped to
 	# kernel.
 	vlan_capture_install $dev "skip_hw vlan_id $vid vlan_ethtype $ul_proto"
-	mirror_test v$h1 $ip1 $ip2 $dev 100 $expect
-	mirror_test v$h2 $ip2 $ip1 $dev 100 $expect
+	mirror_test v$h1 $ip1 $ip2 $dev 100 "$expect"
+	mirror_test v$h2 $ip2 $ip1 $dev 100 "$expect"
 	vlan_capture_uninstall $dev
 }
 
@@ -151,12 +140,11 @@ quick_test_span_vlan_dir_ips()
 {
 	local dev=$1; shift
 	local vid=$1; shift
-	local direction=$1; shift
 	local ul_proto=$1; shift
 	local ip1=$1; shift
 	local ip2=$1; shift
 
-	do_test_span_vlan_dir_ips 10 "$dev" "$vid" "$direction" "$ul_proto" \
+	do_test_span_vlan_dir_ips '>= 10' "$dev" "$vid" "$ul_proto" \
 				  "$ip1" "$ip2"
 }
 
@@ -164,23 +152,20 @@ fail_test_span_vlan_dir_ips()
 {
 	local dev=$1; shift
 	local vid=$1; shift
-	local direction=$1; shift
 	local ul_proto=$1; shift
 	local ip1=$1; shift
 	local ip2=$1; shift
 
-	do_test_span_vlan_dir_ips 0 "$dev" "$vid" "$direction" "$ul_proto" \
-				  "$ip1" "$ip2"
+	do_test_span_vlan_dir_ips 0 "$dev" "$vid" "$ul_proto" "$ip1" "$ip2"
 }
 
 quick_test_span_vlan_dir()
 {
 	local dev=$1; shift
 	local vid=$1; shift
-	local direction=$1; shift
 	local ul_proto=$1; shift
 
-	quick_test_span_vlan_dir_ips "$dev" "$vid" "$direction" "$ul_proto" \
+	quick_test_span_vlan_dir_ips "$dev" "$vid" "$ul_proto" \
 				     192.0.2.1 192.0.2.2
 }
 
@@ -188,9 +173,8 @@ fail_test_span_vlan_dir()
 {
 	local dev=$1; shift
 	local vid=$1; shift
-	local direction=$1; shift
 	local ul_proto=$1; shift
 
-	fail_test_span_vlan_dir_ips "$dev" "$vid" "$direction" "$ul_proto" \
+	fail_test_span_vlan_dir_ips "$dev" "$vid" "$ul_proto" \
 				    192.0.2.1 192.0.2.2
 }
