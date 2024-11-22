@@ -45,4 +45,6 @@ void *bpf_cast_to_kern_ctx(void *) __ksym;
 
 extern void *bpf_rdonly_cast(const void *obj, __u32 btf_id) __ksym __weak;
 
+extern bool bpf_session_is_return(void) __ksym __weak;
+extern __u64 *bpf_session_cookie(void) __ksym __weak;
 #endif
