@@ -1,6 +1,6 @@
 require 'open3'
 
-requestors = { "gvrose8192" => "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" }
+requestors = { "gvrose8192" => "" }
 
 def file_prepend(file, str)
   new_contents = ""
