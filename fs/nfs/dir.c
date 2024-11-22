@@ -1438,7 +1438,7 @@ static void nfs_set_verifier_locked(struct dentry *dentry, unsigned long verf)
 
 	if (!dir || !nfs_verify_change_attribute(dir, verf))
 		return;
-	if (inode && NFS_PROTO(inode)->have_delegation(inode, FMODE_READ))
+	if (inode && NFS_PROTO(inode)->have_delegation(inode, FMODE_READ, 0))
 		nfs_set_verifier_delegated(&verf);
 	dentry->d_time = verf;
 }

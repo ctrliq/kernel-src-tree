@@ -1793,6 +1793,7 @@ EXPORT_SYMBOL(bmap);
 static int relatime_need_update(struct vfsmount *mnt, struct inode *inode,
 			     struct timespec64 now)
 {
+	struct timespec64 ctime;
 
 	if (!(mnt->mnt_flags & MNT_RELATIME))
 		return 1;
@@ -1804,7 +1805,8 @@ static int relatime_need_update(struct vfsmount *mnt, struct inode *inode,
 	/*
 	 * Is ctime younger than atime? If yes, update atime:
 	 */
-	if (timespec64_compare(&inode->i_ctime, &inode->i_atime) >= 0)
+	ctime = inode_get_ctime(inode);
+	if (timespec64_compare(&ctime, &inode->i_atime) >= 0)
 		return 1;
 
 	/*
@@ -1819,29 +1821,76 @@ static int relatime_need_update(struct vfsmount *mnt, struct inode *inode,
 	return 0;
 }
 
-int generic_update_time(struct inode *inode, struct timespec64 *time, int flags)
+/**
+ * inode_update_timestamps - update the timestamps on the inode
+ * @inode: inode to be updated
+ * @flags: S_* flags that needed to be updated
+ *
+ * The update_time function is called when an inode's timestamps need to be
+ * updated for a read or write operation. This function handles updating the
+ * actual timestamps. It's up to the caller to ensure that the inode is marked
+ * dirty appropriately.
+ *
+ * In the case where any of S_MTIME, S_CTIME, or S_VERSION need to be updated,
+ * attempt to update all three of them. S_ATIME updates can be handled
+ * independently of the rest.
+ *
+ * Returns a set of S_* flags indicating which values changed.
+ */
+int inode_update_timestamps(struct inode *inode, int flags)
 {
-	int dirty_flags = 0;
+	int updated = 0;
+	struct timespec64 now;
 
-	if (flags & (S_ATIME | S_CTIME | S_MTIME)) {
-		if (flags & S_ATIME)
-			inode->i_atime = *time;
-		if (flags & S_CTIME)
-			inode->i_ctime = *time;
-		if (flags & S_MTIME)
-			inode->i_mtime = *time;
+	if (flags & (S_MTIME|S_CTIME|S_VERSION)) {
+		struct timespec64 ctime = inode_get_ctime(inode);
 
-		if (inode->i_sb->s_flags & SB_LAZYTIME)
-			dirty_flags |= I_DIRTY_TIME;
-		else
-			dirty_flags |= I_DIRTY_SYNC;
+		now = inode_set_ctime_current(inode);
+		if (!timespec64_equal(&now, &ctime))
+			updated |= S_CTIME;
+		if (!timespec64_equal(&now, &inode->i_mtime)) {
+			inode->i_mtime = now;
+			updated |= S_MTIME;
+		}
+		if (IS_I_VERSION(inode) && inode_maybe_inc_iversion(inode, updated))
+			updated |= S_VERSION;
+	} else {
+		now = current_time(inode);
 	}
 
-	if ((flags & S_VERSION) && inode_maybe_inc_iversion(inode, false))
-		dirty_flags |= I_DIRTY_SYNC;
+	if (flags & S_ATIME) {
+		if (!timespec64_equal(&now, &inode->i_atime)) {
+			inode->i_atime = now;
+			updated |= S_ATIME;
+		}
+	}
+	return updated;
+}
+EXPORT_SYMBOL(inode_update_timestamps);
 
+/**
+ * generic_update_time - update the timestamps on the inode
+ * @inode: inode to be updated
+ * @flags: S_* flags that needed to be updated
+ *
+ * The update_time function is called when an inode's timestamps need to be
+ * updated for a read or write operation. In the case where any of S_MTIME, S_CTIME,
+ * or S_VERSION need to be updated we attempt to update all three of them. S_ATIME
+ * updates can be handled done independently of the rest.
+ *
+ * Returns a S_* mask indicating which fields were updated.
+ */
+int generic_update_time(struct inode *inode, int flags)
+{
+	int updated = inode_update_timestamps(inode, flags);
+	int dirty_flags = 0;
+
+	if (updated & (S_ATIME|S_MTIME|S_CTIME))
+		dirty_flags = inode->i_sb->s_flags & SB_LAZYTIME ? I_DIRTY_TIME : I_DIRTY_SYNC;
+	if (updated & S_VERSION)
+		dirty_flags |= I_DIRTY_SYNC;
 	__mark_inode_dirty(inode, dirty_flags);
-	return 0;
+	return updated;
 }
 EXPORT_SYMBOL(generic_update_time);
 
@@ -1853,7 +1902,8 @@ static int update_time(struct inode *inode, struct timespec64 *time, int flags)
 {
 	if (inode->i_op->update_time)
 		return inode->i_op->update_time(inode, time, flags);
-	return generic_update_time(inode, time, flags);
+	generic_update_time(inode, flags);
+	return 0;
 }
 
 /**
@@ -2012,6 +2062,7 @@ EXPORT_SYMBOL(file_remove_privs);
 static int inode_needs_update_time(struct inode *inode, struct timespec64 *now)
 {
 	int sync_it = 0;
+	struct timespec64 ctime;
 
 	/* First try to exhaust all avenues to not sync */
 	if (IS_NOCMTIME(inode))
@@ -2020,7 +2071,8 @@ static int inode_needs_update_time(struct inode *inode, struct timespec64 *now)
 	if (!timespec64_equal(&inode->i_mtime, now))
 		sync_it = S_MTIME;
 
-	if (!timespec64_equal(&inode->i_ctime, now))
+	ctime = inode_get_ctime(inode);
+	if (!timespec64_equal(&ctime, now))
 		sync_it |= S_CTIME;
 
 	if (IS_I_VERSION(inode) && inode_iversion_need_inc(inode))

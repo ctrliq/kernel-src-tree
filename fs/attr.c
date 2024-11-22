@@ -311,7 +311,7 @@ void setattr_copy(struct mnt_idmap *idmap, struct inode *inode,
 	if (ia_valid & ATTR_MTIME)
 		inode->i_mtime = attr->ia_mtime;
 	if (ia_valid & ATTR_CTIME)
-		inode->i_ctime = attr->ia_ctime;
+		inode_set_ctime_to_ts(inode, attr->ia_ctime);
 	if (ia_valid & ATTR_MODE) {
 		umode_t mode = attr->ia_mode;
 		if (!in_group_or_capable(idmap, inode,
@@ -490,9 +490,17 @@ int notify_change(struct mnt_idmap *idmap, struct dentry *dentry,
 	error = security_inode_setattr(idmap, dentry, attr);
 	if (error)
 		return error;
-	error = try_break_deleg(inode, delegated_inode);
-	if (error)
-		return error;
+
+	/*
+	 * If ATTR_DELEG is set, then these attributes are being set on
+	 * behalf of the holder of a write delegation. We want to avoid
+	 * breaking the delegation in this case.
+	 */
+	if (!(ia_valid & ATTR_DELEG)) {
+		error = try_break_deleg(inode, delegated_inode);
+		if (error)
+			return error;
+	}
 
 	if (inode->i_op->setattr)
 		error = inode->i_op->setattr(idmap, dentry, attr);

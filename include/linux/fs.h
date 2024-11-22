@@ -207,6 +207,7 @@ typedef int (dio_iodone_t)(struct kiocb *iocb, loff_t offset,
 #define ATTR_OPEN	(1 << 15) /* Truncating from open(O_TRUNC) */
 #define ATTR_TIMES_SET	(1 << 16)
 #define ATTR_TOUCH	(1 << 17)
+#define ATTR_DELEG	(1 << 18) /* Delegated attrs. Don't break write delegations */
 
 /*
  * Whiteout is represented by a char device.  The following constants define the
@@ -2744,7 +2745,8 @@ extern int current_umask(void);
 
 extern void ihold(struct inode * inode);
 extern void iput(struct inode *);
-extern int generic_update_time(struct inode *, struct timespec64 *, int);
+int inode_update_timestamps(struct inode *inode, int flags);
+int generic_update_time(struct inode *, int);
 
 /* /sys/fs */
 extern struct kobject *fs_kobj;
