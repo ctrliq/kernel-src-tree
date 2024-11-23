@@ -1365,7 +1365,7 @@ static int fsl_xcvr_remove(struct platform_device *pdev)
 	return 0;
 }
 
-static __maybe_unused int fsl_xcvr_runtime_suspend(struct device *dev)
+static int fsl_xcvr_runtime_suspend(struct device *dev)
 {
 	struct fsl_xcvr *xcvr = dev_get_drvdata(dev);
 	int ret;
@@ -1399,7 +1399,7 @@ static __maybe_unused int fsl_xcvr_runtime_suspend(struct device *dev)
 	return 0;
 }
 
-static __maybe_unused int fsl_xcvr_runtime_resume(struct device *dev)
+static int fsl_xcvr_runtime_resume(struct device *dev)
 {
 	struct fsl_xcvr *xcvr = dev_get_drvdata(dev);
 	int ret;
@@ -1484,9 +1484,7 @@ stop_ipg_clk:
 }
 
 static const struct dev_pm_ops fsl_xcvr_pm_ops = {
-	SET_RUNTIME_PM_OPS(fsl_xcvr_runtime_suspend,
-			   fsl_xcvr_runtime_resume,
-			   NULL)
+	RUNTIME_PM_OPS(fsl_xcvr_runtime_suspend, fsl_xcvr_runtime_resume, NULL)
 	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
 				pm_runtime_force_resume)
 };
@@ -1495,7 +1493,7 @@ static struct platform_driver fsl_xcvr_driver = {
 	.probe = fsl_xcvr_probe,
 	.driver = {
 		.name = "fsl,imx8mp-audio-xcvr",
-		.pm = &fsl_xcvr_pm_ops,
+		.pm = pm_ptr(&fsl_xcvr_pm_ops),
 		.of_match_table = fsl_xcvr_dt_ids,
 	},
 	.remove = fsl_xcvr_remove,
