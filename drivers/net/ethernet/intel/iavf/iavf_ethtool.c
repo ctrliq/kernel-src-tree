@@ -319,6 +319,8 @@ static int iavf_get_sset_count(struct net_device *netdev, int sset)
 		return IAVF_STATS_LEN +
 			(IAVF_QUEUE_STATS_LEN * 2 *
 			 netdev->real_num_tx_queues);
+	else if (sset == ETH_SS_PRIV_FLAGS)
+		return 1; /* RHEL 9: Deprecated "legacy-rx" flag */
 	else
 		return -EINVAL;
 }
@@ -361,6 +363,19 @@ static void iavf_get_ethtool_stats(struct net_device *netdev,
 }
 
 /**
+ * iavf_get_priv_flag_strings - Get private flag strings
+ * @netdev: network interface device structure
+ * @data: buffer for string data
+ *
+ * Builds the private flags string table
+ * RHEL 9: Only for the deprecated "legacy-rx" priv flag
+ **/
+static void iavf_get_priv_flag_strings(struct net_device *netdev, u8 *data)
+{
+	ethtool_puts(&data, "legacy-rx");
+}
+
+/**
  * iavf_get_stat_strings - Get stat strings
  * @netdev: network interface device structure
  * @data: buffer for string data
@@ -398,9 +413,37 @@ static void iavf_get_strings(struct net_device *netdev, u32 sset, u8 *data)
 	case ETH_SS_STATS:
 		iavf_get_stat_strings(netdev, data);
 		break;
+	case ETH_SS_PRIV_FLAGS:
+		iavf_get_priv_flag_strings(netdev, data);
+		break;
 	default:
 		break;
 	}
+}
+
+/**
+ * iavf_get_priv_flags - report device private flags
+ * @netdev: network interface device structure
+ *
+ * Returns a u32 bitmap of flags.
+ **/
+static u32 iavf_get_priv_flags(struct net_device *netdev)
+{
+	/* RHEL 9: Deprecated "legacy-rx" flag. Always off. */
+	return 0;
+}
+
+/**
+ * iavf_set_priv_flags - set private flags
+ * @netdev: network interface device structure
+ * @flags: bit flags to be set
+ **/
+static int iavf_set_priv_flags(struct net_device *netdev, u32 flags)
+{
+	/* RHEL 9: Deprecated "legacy-rx" flag */
+	if (flags & 1)
+		netdev_warn_once(netdev, "iavf private flag 'legacy-rx' is deprecated. Setting it has no effect.\n");
+	return 0;
 }
 
 /**
@@ -448,6 +491,7 @@ static void iavf_get_drvinfo(struct net_device *netdev,
 	strscpy(drvinfo->driver, iavf_driver_name, 32);
 	strscpy(drvinfo->fw_version, "N/A", 4);
 	strscpy(drvinfo->bus_info, pci_name(adapter->pdev), 32);
+	drvinfo->n_priv_flags = 1;  /* RHEL 9: Deprecated "legacy-rx" flag */
 }
 
 /**
@@ -1857,6 +1901,8 @@ static const struct ethtool_ops iavf_ethtool_ops = {
 	.get_strings		= iavf_get_strings,
 	.get_ethtool_stats	= iavf_get_ethtool_stats,
 	.get_sset_count		= iavf_get_sset_count,
+	.get_priv_flags		= iavf_get_priv_flags,
+	.set_priv_flags		= iavf_set_priv_flags,
 	.get_msglevel		= iavf_get_msglevel,
 	.set_msglevel		= iavf_set_msglevel,
 	.get_coalesce		= iavf_get_coalesce,
