@@ -61,6 +61,9 @@ void simple_util_parse_convert(struct device_node *np,
 {
 	char prop[128];
 
+	if (!np)
+		return;
+
 	if (!prefix)
 		prefix = "";
 
