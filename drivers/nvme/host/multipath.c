@@ -1040,7 +1040,8 @@ int nvme_mpath_init_identify(struct nvme_ctrl *ctrl, struct nvme_id_ctrl *id)
 	int error = 0;
 
 	/* check if multipath is enabled and we have the capability */
-	if (!ctrl->subsys || !(ctrl->subsys->cmic & NVME_CTRL_CMIC_ANA))
+	if (!multipath || !ctrl->subsys ||
+	    !(ctrl->subsys->cmic & NVME_CTRL_CMIC_ANA))
 		return 0;
 
 	/* initialize this in the identify path to cover controller resets */
