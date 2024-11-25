@@ -456,8 +456,6 @@ void nvme_end_req(struct request *req)
 
 static inline void nvme_failup_req(struct request *req)
 {
-	nvme_update_ana(req);
-
 	nvme_req(req)->status = NVME_SC_HOST_PATH_ERROR;
 	nvme_end_req(req);
 }
