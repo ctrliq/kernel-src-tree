@@ -1570,7 +1570,7 @@ static int anx7411_i2c_remove(struct i2c_client *client)
 }
 
 static const struct i2c_device_id anx7411_id[] = {
-	{"anx7411", 0},
+	{ "anx7411" },
 	{}
 };
 
