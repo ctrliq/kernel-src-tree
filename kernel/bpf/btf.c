@@ -3537,7 +3537,8 @@ static int btf_repeat_fields(struct btf_field_info *info,
 
 static int btf_find_struct_field(const struct btf *btf,
 				 const struct btf_type *t, u32 field_mask,
-				 struct btf_field_info *info, int info_cnt);
+				 struct btf_field_info *info, int info_cnt,
+				 u32 level);
 
 /* Find special fields in the struct type of a field.
  *
@@ -3548,11 +3549,15 @@ static int btf_find_struct_field(const struct btf *btf,
 static int btf_find_nested_struct(const struct btf *btf, const struct btf_type *t,
 				  u32 off, u32 nelems,
 				  u32 field_mask, struct btf_field_info *info,
-				  int info_cnt)
+				  int info_cnt, u32 level)
 {
 	int ret, err, i;
 
-	ret = btf_find_struct_field(btf, t, field_mask, info, info_cnt);
+	level++;
+	if (level >= MAX_RESOLVE_DEPTH)
+		return -E2BIG;
+
+	ret = btf_find_struct_field(btf, t, field_mask, info, info_cnt, level);
 
 	if (ret <= 0)
 		return ret;
@@ -3580,7 +3585,8 @@ static int btf_find_field_one(const struct btf *btf,
 			      int var_idx,
 			      u32 off, u32 expected_size,
 			      u32 field_mask, u32 *seen_mask,
-			      struct btf_field_info *info, int info_cnt)
+			      struct btf_field_info *info, int info_cnt,
+			      u32 level)
 {
 	int ret, align, sz, field_type;
 	struct btf_field_info tmp;
@@ -3608,7 +3614,7 @@ static int btf_find_field_one(const struct btf *btf,
 		if (expected_size && expected_size != sz * nelems)
 			return 0;
 		ret = btf_find_nested_struct(btf, var_type, off, nelems, field_mask,
-					     &info[0], info_cnt);
+					     &info[0], info_cnt, level);
 		return ret;
 	}
 
@@ -3669,7 +3675,8 @@ static int btf_find_field_one(const struct btf *btf,
 
 static int btf_find_struct_field(const struct btf *btf,
 				 const struct btf_type *t, u32 field_mask,
-				 struct btf_field_info *info, int info_cnt)
+				 struct btf_field_info *info, int info_cnt,
+				 u32 level)
 {
 	int ret, idx = 0;
 	const struct btf_member *member;
@@ -3688,7 +3695,7 @@ static int btf_find_struct_field(const struct btf *btf,
 		ret = btf_find_field_one(btf, t, member_type, i,
 					 off, 0,
 					 field_mask, &seen_mask,
-					 &info[idx], info_cnt - idx);
+					 &info[idx], info_cnt - idx, level);
 		if (ret < 0)
 			return ret;
 		idx += ret;
@@ -3698,7 +3705,7 @@ static int btf_find_struct_field(const struct btf *btf,
 
 static int btf_find_datasec_var(const struct btf *btf, const struct btf_type *t,
 				u32 field_mask, struct btf_field_info *info,
-				int info_cnt)
+				int info_cnt, u32 level)
 {
 	int ret, idx = 0;
 	const struct btf_var_secinfo *vsi;
@@ -3711,7 +3718,8 @@ static int btf_find_datasec_var(const struct btf *btf, const struct btf_type *t,
 		off = vsi->offset;
 		ret = btf_find_field_one(btf, var, var_type, -1, off, vsi->size,
 					 field_mask, &seen_mask,
-					 &info[idx], info_cnt - idx);
+					 &info[idx], info_cnt - idx,
+					 level);
 		if (ret < 0)
 			return ret;
 		idx += ret;
@@ -3724,9 +3732,9 @@ static int btf_find_field(const struct btf *btf, const struct btf_type *t,
 			  int info_cnt)
 {
 	if (__btf_type_is_struct(t))
-		return btf_find_struct_field(btf, t, field_mask, info, info_cnt);
+		return btf_find_struct_field(btf, t, field_mask, info, info_cnt, 0);
 	else if (btf_type_is_datasec(t))
-		return btf_find_datasec_var(btf, t, field_mask, info, info_cnt);
+		return btf_find_datasec_var(btf, t, field_mask, info, info_cnt, 0);
 	return -EINVAL;
 }
 
