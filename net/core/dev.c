@@ -9713,11 +9713,11 @@ static void dev_index_release(struct net *net, int ifindex)
 /* Delayed registration/unregisteration */
 LIST_HEAD(net_todo_list);
 DECLARE_WAIT_QUEUE_HEAD(netdev_unregistering_wq);
+atomic_t dev_unreg_count = ATOMIC_INIT(0);
 
 static void net_set_todo(struct net_device *dev)
 {
 	list_add_tail(&dev->todo_list, &net_todo_list);
-	atomic_inc(&dev_net(dev)->dev_unreg_count);
 }
 
 static netdev_features_t netdev_sync_upper_features(struct net_device *lower,
@@ -10568,6 +10568,7 @@ void netdev_run_todo(void)
 {
 	struct net_device *dev, *tmp;
 	struct list_head list;
+	int cnt;
 #ifdef CONFIG_LOCKDEP
 	struct list_head unlink_list;
 
@@ -10602,6 +10603,7 @@ void netdev_run_todo(void)
 		linkwatch_sync_dev(dev);
 	}
 
+	cnt = 0;
 	while (!list_empty(&list)) {
 		dev = netdev_wait_allrefs_any(&list);
 		list_del(&dev->todo_list);
@@ -10622,12 +10624,13 @@ void netdev_run_todo(void)
 		if (dev->needs_free_netdev)
 			free_netdev(dev);
 
-		if (atomic_dec_and_test(&dev_net(dev)->dev_unreg_count))
-			wake_up(&netdev_unregistering_wq);
+		cnt++;
 
 		/* Free network device */
 		kobject_put(&dev->dev.kobj);
 	}
+	if (cnt && atomic_sub_and_test(cnt, &dev_unreg_count))
+		wake_up(&netdev_unregistering_wq);
 }
 
 /* Convert net_device_stats to rtnl_link_stats64. rtnl_link_stats64 has
@@ -11103,6 +11106,7 @@ void unregister_netdevice_many_notify(struct list_head *head,
 {
 	struct net_device *dev, *tmp;
 	LIST_HEAD(close_head);
+	int cnt = 0;
 
 	BUG_ON(dev_boot_phase);
 	ASSERT_RTNL();
@@ -11201,7 +11205,9 @@ void unregister_netdevice_many_notify(struct list_head *head,
 	list_for_each_entry(dev, head, unreg_list) {
 		netdev_put(dev, &dev->dev_registered_tracker);
 		net_set_todo(dev);
+		cnt++;
 	}
+	atomic_add(cnt, &dev_unreg_count);
 
 	list_del(head);
 }
@@ -11667,36 +11673,6 @@ static void __net_exit default_device_exit_net(struct net *net)
 	}
 }
 
-static void __net_exit rtnl_lock_unregistering(struct list_head *net_list)
-{
-	/* Return (with the rtnl_lock held) when there are no network
-	 * devices unregistering in any network namespace in net_list.
-	 */
-	DEFINE_WAIT_FUNC(wait, woken_wake_function);
-	bool unregistering;
-	struct net *net;
-
-	ASSERT_RTNL();
-	add_wait_queue(&netdev_unregistering_wq, &wait);
-	for (;;) {
-		unregistering = false;
-
-		list_for_each_entry(net, net_list, exit_list) {
-			if (atomic_read(&net->dev_unreg_count) > 0) {
-				unregistering = true;
-				break;
-			}
-		}
-		if (!unregistering)
-			break;
-		__rtnl_unlock();
-
-		wait_woken(&wait, TASK_UNINTERRUPTIBLE, MAX_SCHEDULE_TIMEOUT);
-		rtnl_lock();
-	}
-	remove_wait_queue(&netdev_unregistering_wq, &wait);
-}
-
 static void __net_exit default_device_exit_batch(struct list_head *net_list)
 {
 	/* At exit all network devices most be removed from a network
@@ -11713,18 +11689,6 @@ static void __net_exit default_device_exit_batch(struct list_head *net_list)
 		default_device_exit_net(net);
 		cond_resched();
 	}
-	/* To prevent network device cleanup code from dereferencing
-	 * loopback devices or network devices that have been freed
-	 * wait here for all pending unregistrations to complete,
-	 * before unregistring the loopback device and allowing the
-	 * network namespace be freed.
-	 *
-	 * The netdev todo list containing all network devices
-	 * unregistrations that happen in default_device_exit_batch
-	 * will run in the rtnl_unlock() at the end of
-	 * default_device_exit_batch.
-	 */
-	rtnl_lock_unregistering(net_list);
 
 	list_for_each_entry(net, net_list, exit_list) {
 		for_each_netdev_reverse(net, dev) {
