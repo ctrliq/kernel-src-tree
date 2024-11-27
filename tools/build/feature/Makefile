@@ -37,6 +37,7 @@ FILES=                                          \
          test-libslang.bin                      \
          test-libslang-include-subdir.bin       \
          test-libtraceevent.bin                 \
+         test-libcpupower.bin                   \
          test-libtracefs.bin                    \
          test-libcrypto.bin                     \
          test-libunwind.bin                     \
@@ -241,6 +242,9 @@ $(OUTPUT)test-libslang-include-subdir.bin:
 
 $(OUTPUT)test-libtraceevent.bin:
 	$(BUILD) -ltraceevent
+
+$(OUTPUT)test-libcpupower.bin:
+	$(BUILD) -lcpupower
 
 $(OUTPUT)test-libtracefs.bin:
 	 $(BUILD) $(shell $(PKG_CONFIG) --cflags libtracefs 2>/dev/null) -ltracefs
