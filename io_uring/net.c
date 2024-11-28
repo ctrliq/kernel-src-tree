@@ -301,7 +301,7 @@ static int io_sendmsg_copy_hdr(struct io_kiocb *req,
 	if (unlikely(req->ctx->compat)) {
 		struct compat_msghdr cmsg;
 
-		ret = io_compat_msg_copy_hdr(req, iomsg, &cmsg, WRITE);
+		ret = io_compat_msg_copy_hdr(req, iomsg, &cmsg, ITER_SOURCE);
 		if (unlikely(ret))
 			return ret;
 
@@ -309,7 +309,7 @@ static int io_sendmsg_copy_hdr(struct io_kiocb *req,
 	}
 #endif
 
-	ret = io_msg_copy_hdr(req, iomsg, &msg, WRITE);
+	ret = io_msg_copy_hdr(req, iomsg, &msg, ITER_SOURCE);
 	if (unlikely(ret))
 		return ret;
 
@@ -513,7 +513,7 @@ int io_send(struct io_kiocb *req, unsigned int issue_flags)
 	if (unlikely(!sock))
 		return -ENOTSOCK;
 
-	ret = import_ubuf(WRITE, sr->buf, sr->len, &msg.msg_iter);
+	ret = import_ubuf(ITER_SOURCE, sr->buf, sr->len, &msg.msg_iter);
 	if (unlikely(ret))
 		return ret;
 
@@ -586,7 +586,7 @@ static int io_recvmsg_copy_hdr(struct io_kiocb *req,
 	if (unlikely(req->ctx->compat)) {
 		struct compat_msghdr cmsg;
 
-		ret = io_compat_msg_copy_hdr(req, iomsg, &cmsg, READ);
+		ret = io_compat_msg_copy_hdr(req, iomsg, &cmsg, ITER_DEST);
 		if (unlikely(ret))
 			return ret;
 
@@ -599,7 +599,7 @@ static int io_recvmsg_copy_hdr(struct io_kiocb *req,
 	}
 #endif
 
-	ret = io_msg_copy_hdr(req, iomsg, &msg, READ);
+	ret = io_msg_copy_hdr(req, iomsg, &msg, ITER_DEST);
 	if (unlikely(ret))
 		return ret;
 
@@ -869,7 +869,7 @@ retry_multishot:
 			}
 		}
 
-		iov_iter_ubuf(&kmsg->msg.msg_iter, READ, buf, len);
+		iov_iter_ubuf(&kmsg->msg.msg_iter, ITER_DEST, buf, len);
 	}
 
 	kmsg->msg.msg_get_inq = 1;
@@ -966,7 +966,7 @@ retry_multishot:
 		sr->len = len;
 	}
 
-	ret = import_ubuf(READ, sr->buf, len, &msg.msg_iter);
+	ret = import_ubuf(ITER_DEST, sr->buf, len, &msg.msg_iter);
 	if (unlikely(ret))
 		goto out_free;
 
@@ -1199,14 +1199,14 @@ int io_send_zc(struct io_kiocb *req, unsigned int issue_flags)
 		return io_setup_async_addr(req, &__address, issue_flags);
 
 	if (zc->flags & IORING_RECVSEND_FIXED_BUF) {
-		ret = io_import_fixed(WRITE, &msg.msg_iter, req->imu,
+		ret = io_import_fixed(ITER_SOURCE, &msg.msg_iter, req->imu,
 					(u64)(uintptr_t)zc->buf, zc->len);
 		if (unlikely(ret))
 			return ret;
 		msg.sg_from_iter = io_sg_from_iter;
 	} else {
 		io_notif_set_extended(zc->notif);
-		ret = import_ubuf(WRITE, zc->buf, zc->len, &msg.msg_iter);
+		ret = import_ubuf(ITER_SOURCE, zc->buf, zc->len, &msg.msg_iter);
 		if (unlikely(ret))
 			return ret;
 		ret = io_notif_account_mem(zc->notif, zc->len);
