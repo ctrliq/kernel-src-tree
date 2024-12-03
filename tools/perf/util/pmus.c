@@ -69,7 +69,7 @@ size_t pmu_name_len_no_suffix(const char *str)
 
 int pmu_name_cmp(const char *lhs_pmu_name, const char *rhs_pmu_name)
 {
-	unsigned long lhs_num = 0, rhs_num = 0;
+	unsigned long long lhs_num = 0, rhs_num = 0;
 	size_t lhs_pmu_name_len = pmu_name_len_no_suffix(lhs_pmu_name);
 	size_t rhs_pmu_name_len = pmu_name_len_no_suffix(rhs_pmu_name);
 	int ret = strncmp(lhs_pmu_name, rhs_pmu_name,
@@ -79,9 +79,9 @@ int pmu_name_cmp(const char *lhs_pmu_name, const char *rhs_pmu_name)
 		return ret;
 
 	if (lhs_pmu_name_len + 1 < strlen(lhs_pmu_name))
-		lhs_num = strtoul(&lhs_pmu_name[lhs_pmu_name_len + 1], NULL, 16);
+		lhs_num = strtoull(&lhs_pmu_name[lhs_pmu_name_len + 1], NULL, 16);
 	if (rhs_pmu_name_len + 1 < strlen(rhs_pmu_name))
-		rhs_num = strtoul(&rhs_pmu_name[rhs_pmu_name_len + 1], NULL, 16);
+		rhs_num = strtoull(&rhs_pmu_name[rhs_pmu_name_len + 1], NULL, 16);
 
 	return lhs_num < rhs_num ? -1 : (lhs_num > rhs_num ? 1 : 0);
 }
@@ -719,4 +719,15 @@ struct perf_pmu *perf_pmus__add_test_pmu(int test_sysfs_dirfd, const char *name)
 	 * format files.
 	 */
 	return perf_pmu__lookup(&other_pmus, test_sysfs_dirfd, name, /*eager_load=*/true);
+}
+
+struct perf_pmu *perf_pmus__fake_pmu(void)
+{
+	static struct perf_pmu fake = {
+		.name = "fake",
+		.type = PERF_PMU_TYPE_FAKE,
+		.format = LIST_HEAD_INIT(fake.format),
+	};
+
+	return &fake;
 }
