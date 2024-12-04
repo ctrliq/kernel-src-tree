@@ -37,6 +37,7 @@ obj-$(CONFIG_INTEL_TURBO_MAX_3)		+= intel_turbo_max_3.o
 # TPMI drivers
 intel_vsec_tpmi-y			:= tpmi.o
 obj-$(CONFIG_INTEL_TPMI)		+= intel_vsec_tpmi.o
+obj-$(CONFIG_INTEL_PLR_TPMI)		+= intel_plr_tpmi.o
 
 # Intel input drivers
 intel-hid-y				:= hid.o
