@@ -73,6 +73,7 @@ Contents:
    mpls-sysctl
    mptcp-sysctl
    multiqueue
+   multi-pf-netdev
    net_cachelines/index
    netconsole
    netdev-features
