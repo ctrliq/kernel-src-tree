@@ -658,6 +658,11 @@ static void bpf_testmod_test_2(int a, int b)
 {
 }
 
+static int bpf_testmod_tramp(int value)
+{
+	return 0;
+}
+
 static int bpf_testmod_ops__test_maybe_null(int dummy,
 					    struct task_struct *task__nullable)
 {
@@ -714,6 +719,7 @@ static int bpf_testmod_init(void)
 			.kfunc_btf_id	= bpf_testmod_dtor_ids[1]
 		},
 	};
+	void **tramp;
 	int ret;
 
 	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_UNSPEC, &bpf_testmod_common_kfunc_set);
@@ -729,7 +735,18 @@ static int bpf_testmod_init(void)
 		return ret;
 	if (bpf_fentry_test1(0) < 0)
 		return -EINVAL;
-	return sysfs_create_bin_file(kernel_kobj, &bin_attr_bpf_testmod_file);
+	ret = sysfs_create_bin_file(kernel_kobj, &bin_attr_bpf_testmod_file);
+	if (ret < 0)
+		return ret;
+
+	/* Ensure nothing is between tramp_1..tramp_40 */
+	BUILD_BUG_ON(offsetof(struct bpf_testmod_ops, tramp_1) + 40 * sizeof(long) !=
+		     offsetofend(struct bpf_testmod_ops, tramp_40));
+	tramp = (void **)&__bpf_testmod_ops.tramp_1;
+	while (tramp <= (void **)&__bpf_testmod_ops.tramp_40)
+		*tramp++ = bpf_testmod_tramp;
+
+	return 0;
 }
 
 static void bpf_testmod_exit(void)
