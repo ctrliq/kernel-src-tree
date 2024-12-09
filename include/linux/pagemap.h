@@ -203,10 +203,11 @@ enum mapping_flags {
 	/* writeback related tags are not used */
 	AS_NO_WRITEBACK_TAGS = 5,
 	AS_LARGE_FOLIO_SUPPORT = 6,
-	AS_RELEASE_ALWAYS = 7,	/* Call ->release_folio(), even if no private data */
-	AS_STABLE_WRITES = 8,	/* must wait for writeback before modifying
+	AS_RELEASE_ALWAYS,	/* Call ->release_folio(), even if no private data */
+	AS_STABLE_WRITES,	/* must wait for writeback before modifying
 				   folio contents */
-	AS_UNMOVABLE	= 9,	/* The mapping cannot be moved, ever */
+	AS_UNMOVABLE,		/* The mapping cannot be moved, ever */
+	AS_INACCESSIBLE,	/* Do not attempt direct R/W access to the mapping */
 };
 
 /**
