@@ -882,9 +882,6 @@ static long hugetlbfs_fallocate(struct file *file, int mode, loff_t offset,
 			break;
 		}
 
-		/* Set numa allocation policy based on index */
-		hugetlb_set_vma_policy(&pseudo_vma, inode, index);
-
 		/* addr is the offset within the file (zero based) */
 		addr = index * hpage_size;
 
@@ -897,7 +894,6 @@ static long hugetlbfs_fallocate(struct file *file, int mode, loff_t offset,
 		if (!IS_ERR(folio)) {
 			folio_put(folio);
 			mutex_unlock(&hugetlb_fault_mutex_table[hash]);
-			hugetlb_drop_vma_policy(&pseudo_vma);
 			continue;
 		}
 
@@ -909,6 +905,7 @@ static long hugetlbfs_fallocate(struct file *file, int mode, loff_t offset,
 		 * folios in these areas, we need to consume the reserves
 		 * to keep reservation accounting consistent.
 		 */
+		hugetlb_set_vma_policy(&pseudo_vma, inode, index);
 		folio = alloc_hugetlb_folio(&pseudo_vma, addr, 0);
 		hugetlb_drop_vma_policy(&pseudo_vma);
 		if (IS_ERR(folio)) {
