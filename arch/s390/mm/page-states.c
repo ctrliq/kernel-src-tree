@@ -29,7 +29,7 @@ static void mark_kernel_pmd(pud_t *pud, unsigned long addr, unsigned long end)
 	pmd = pmd_offset(pud, addr);
 	do {
 		next = pmd_addr_end(addr, end);
-		if (pmd_none(*pmd) || pmd_large(*pmd))
+		if (pmd_none(*pmd) || pmd_leaf(*pmd))
 			continue;
 		page = phys_to_page(pmd_val(*pmd));
 		set_bit(PG_arch_1, &page->flags);
