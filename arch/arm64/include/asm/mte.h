@@ -101,6 +101,7 @@ long set_mte_ctrl(struct task_struct *task, unsigned long arg);
 long get_mte_ctrl(struct task_struct *task);
 int mte_ptrace_copy_tags(struct task_struct *child, long request,
 			 unsigned long addr, unsigned long data);
+size_t mte_probe_user_range(const char __user *uaddr, size_t size);
 
 #else /* CONFIG_ARM64_MTE */
 
@@ -181,7 +182,7 @@ void mte_check_tfsr_el1(void);
 
 static inline void mte_check_tfsr_entry(void)
 {
-	if (!system_supports_mte())
+	if (!kasan_hw_tags_enabled())
 		return;
 
 	mte_check_tfsr_el1();
@@ -189,7 +190,7 @@ static inline void mte_check_tfsr_entry(void)
 
 static inline void mte_check_tfsr_exit(void)
 {
-	if (!system_supports_mte())
+	if (!kasan_hw_tags_enabled())
 		return;
 
 	/*
