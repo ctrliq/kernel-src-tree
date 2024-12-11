@@ -3084,6 +3084,7 @@ static const struct media_entity_operations ccs_entity_ops = {
 };
 
 static const struct v4l2_subdev_internal_ops ccs_internal_src_ops = {
+	.init_state = ccs_init_state,
 	.registered = ccs_registered,
 	.unregistered = ccs_unregistered,
 	.open = ccs_open,
