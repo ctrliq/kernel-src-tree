@@ -91,7 +91,7 @@ void bpf_verifier_vlog(struct bpf_verifier_log *log, const char *fmt,
 			goto fail;
 	} else {
 		u64 new_end, new_start;
-		u32 buf_start, buf_end, new_n;
+		u32 buf_start, buf_end;
 
 		new_end = log->end_pos + n;
 		if (new_end - log->start_pos >= log->len_total)
@@ -688,8 +688,7 @@ static void print_reg_state(struct bpf_verifier_env *env,
 	if (t == SCALAR_VALUE && reg->precise)
 		verbose(env, "P");
 	if (t == SCALAR_VALUE && tnum_is_const(reg->var_off)) {
-		/* reg->off should be 0 for SCALAR_VALUE */
-		verbose_snum(env, reg->var_off.value + reg->off);
+		verbose_snum(env, reg->var_off.value);
 		return;
 	}
 
@@ -708,7 +707,9 @@ static void print_reg_state(struct bpf_verifier_env *env,
 		verbose(env, "%s", btf_type_name(reg->btf, reg->btf_id));
 	verbose(env, "(");
 	if (reg->id)
-		verbose_a("id=%d", reg->id);
+		verbose_a("id=%d", reg->id & ~BPF_ADD_CONST);
+	if (reg->id & BPF_ADD_CONST)
+		verbose(env, "%+d", reg->off);
 	if (reg->ref_obj_id)
 		verbose_a("ref_obj_id=%d", reg->ref_obj_id);
 	if (type_is_non_owning_ref(reg->type))
