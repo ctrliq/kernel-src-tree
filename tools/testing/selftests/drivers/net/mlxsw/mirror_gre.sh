@@ -15,6 +15,13 @@ source $lib_dir/mirror_lib.sh
 source $lib_dir/mirror_gre_lib.sh
 source $lib_dir/mirror_gre_topo_lib.sh
 
+ALL_TESTS="
+	test_keyful
+	test_soft
+	test_tos_fixed
+	test_ttl_inherit
+"
+
 setup_keyful()
 {
 	tunnel_create gt6-key ip6gretap 2001:db8:3::1 2001:db8:3::2 \
@@ -150,38 +157,37 @@ test_span_gre_tos_fixed()
 
 test_span_failable()
 {
-	local should_fail=$1; shift
 	local tundev=$1; shift
 	local what=$1; shift
 
 	RET=0
 
 	mirror_install $swp1 ingress $tundev "matchall"
-	if ((should_fail)); then
-	    fail_test_span_gre_dir  $tundev
-	else
-	    quick_test_span_gre_dir $tundev
-	fi
+	fail_test_span_gre_dir  $tundev
 	mirror_uninstall $swp1 ingress
 
-	log_test "$what: should_fail=$should_fail"
+	log_test "fail $what"
 }
 
-test_failable()
+test_keyful()
 {
-	local should_fail=$1; shift
-
-	test_span_failable $should_fail gt6-key "mirror to keyful gretap"
-	test_span_failable $should_fail gt6-soft "mirror to gretap w/ soft underlay"
+	test_span_failable gt6-key "mirror to keyful gretap"
 }
 
-test_hw()
+test_soft()
 {
-	test_failable 1
+	test_span_failable gt6-soft "mirror to gretap w/ soft underlay"
+}
 
+test_tos_fixed()
+{
 	test_span_gre_tos_fixed gt4 gretap "mirror to gretap"
 	test_span_gre_tos_fixed gt6 ip6gretap "mirror to ip6gretap"
+}
 
+
+test_ttl_inherit()
+{
 	test_span_gre_ttl_inherit gt4 gretap "mirror to gretap"
 	test_span_gre_ttl_inherit gt6 ip6gretap "mirror to ip6gretap"
 }
@@ -191,6 +197,6 @@ trap cleanup EXIT
 setup_prepare
 setup_wait
 
-test_hw
+tests_run
 
 exit $EXIT_STATUS
