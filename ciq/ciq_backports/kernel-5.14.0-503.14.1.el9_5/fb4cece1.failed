@@ -1,0 +1,87 @@
+scsi: smartpqi: Fix logical volume rescan race condition
+
+jira LE-2157
+Rebuild_History Non-Buildable kernel-5.14.0-503.14.1.el9_5
+commit-author Mahesh Rajashekhara <mahesh.rajashekhara@microchip.com>
+commit fb4cece17b4583f55b34a8538e27a4adc833c9d4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-503.14.1.el9_5/fb4cece1.failed
+
+Correct rescan flag race condition.
+
+Multiple conditions are being evaluated before notifying OS to do a rescan.
+
+Driver will skip rescanning the device if any one of the following
+conditions are met:
+
+ - Devices that have not yet been added to the OS or devices that have been
+   removed.
+
+ - Devices which are already marked for removal or in the phase of removal.
+
+Under very rare conditions, after logical volume size expansion, the OS
+still sees the size of the logical volume which was before expansion.
+
+The rescan flag in the driver is used to signal the need for a logical
+volume rescan. A race condition can occur in the driver, and it leads to
+one thread overwriting the flag inadvertently. As a result, driver is not
+notifying the OS SML to rescan the logical volume.
+
+Move device->rescan update into new function pqi_mark_volumes_for_rescan()
+and protect with a spin lock.
+
+Move check for device->rescan into new function pqi_volume_rescan_needed()
+and protect function call with a spin_lock.
+
+	Reviewed-by: Scott Teel <scott.teel@microchip.com>
+	Reviewed-by: Scott Benesh <scott.benesh@microchip.com>
+	Reviewed-by: Mike McGowen <mike.mcgowen@microchip.com>
+	Reviewed-by: Kevin Barnett <kevin.barnett@microchip.com>
+Co-developed-by: Murthy Bhat <Murthy.Bhat@microchip.com>
+	Signed-off-by: Murthy Bhat <Murthy.Bhat@microchip.com>
+	Signed-off-by: Mahesh Rajashekhara <mahesh.rajashekhara@microchip.com>
+	Signed-off-by: Don Brace <don.brace@microchip.com>
+Link: https://lore.kernel.org/r/20231219193653.277553-3-don.brace@microchip.com
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit fb4cece17b4583f55b34a8538e27a4adc833c9d4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/smartpqi/smartpqi_init.c
+diff --cc drivers/scsi/smartpqi/smartpqi_init.c
+index aafd7f17269d,081bb2c09806..000000000000
+--- a/drivers/scsi/smartpqi/smartpqi_init.c
++++ b/drivers/scsi/smartpqi/smartpqi_init.c
+@@@ -2285,9 -2296,13 +2297,18 @@@ static void pqi_update_device_list(stru
+  		if (device->sdev && device->queue_depth != device->advertised_queue_depth) {
+  			device->advertised_queue_depth = device->queue_depth;
+  			scsi_change_queue_depth(device->sdev, device->advertised_queue_depth);
+++<<<<<<< HEAD
+ +			if (device->rescan) {
+ +				scsi_rescan_device(&device->sdev->sdev_gendev);
+++=======
++ 			spin_lock_irqsave(&ctrl_info->scsi_device_list_lock, flags);
++ 			if (pqi_volume_rescan_needed(device)) {
+++>>>>>>> fb4cece17b45 (scsi: smartpqi: Fix logical volume rescan race condition)
+  				device->rescan = false;
++ 				spin_unlock_irqrestore(&ctrl_info->scsi_device_list_lock, flags);
++ 				scsi_rescan_device(device->sdev);
++ 			} else {
++ 				spin_unlock_irqrestore(&ctrl_info->scsi_device_list_lock, flags);
+  			}
+  		}
+  	}
+diff --git a/drivers/scsi/smartpqi/smartpqi.h b/drivers/scsi/smartpqi/smartpqi.h
+index eea90b3ae782..1cb4df29d1e1 100644
+--- a/drivers/scsi/smartpqi/smartpqi.h
++++ b/drivers/scsi/smartpqi/smartpqi.h
+@@ -1347,7 +1347,6 @@ struct pqi_ctrl_info {
+ 	bool		controller_online;
+ 	bool		block_requests;
+ 	bool		scan_blocked;
+-	u8		logical_volume_rescan_needed : 1;
+ 	u8		inbound_spanning_supported : 1;
+ 	u8		outbound_spanning_supported : 1;
+ 	u8		pqi_mode_enabled : 1;
+* Unmerged path drivers/scsi/smartpqi/smartpqi_init.c
