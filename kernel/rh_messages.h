@@ -43,8 +43,8 @@
 			"Please review provided documentation for " \
 			"limitations.\n"
 
-#define RH_PARTNER_SUPPORTED "Warning: %s is a Partner supported GPL " \
-			     "module and not supported directly by Red Hat.\n"
+#define RH_PARTNER_SUPPORTED "Warning: %s is a Red Hat Partner supported GPL " \
+			     "module and not supported directly by Rocky Linux nor Red Hat.\n"
 
 static const char *rh_deprecated_drivers[] = {
 	"aacraid",

@@ -878,7 +878,7 @@ asmlinkage __visible void __init __no_sanitize_address __noreturn start_kernel(v
 	boot_cpu_init();
 	page_address_init();
 	pr_notice("%s", linux_banner);
-	pr_notice("The list of certified hardware and cloud instances for Red Hat Enterprise Linux 9 can be viewed at the Red Hat Ecosystem Catalog, https://catalog.redhat.com.\n");
+	pr_notice("The list of certified hardware and cloud instances for Enterprise Linux 9 can be viewed at the Red Hat Ecosystem Catalog, https://catalog.redhat.com.\n");
 	early_security_init();
 	setup_arch(&command_line);
 	setup_boot_config();

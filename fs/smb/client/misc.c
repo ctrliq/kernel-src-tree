@@ -141,6 +141,9 @@ tcon_info_alloc(bool dir_leases_enabled)
 #ifdef CONFIG_CIFS_FSCACHE
 	mutex_init(&ret_buf->fscache_lock);
 #endif
+#ifdef CONFIG_CIFS_DFS_UPCALL
+	INIT_LIST_HEAD(&ret_buf->dfs_ses_list);
+#endif
 
 	return ret_buf;
 }
@@ -1261,7 +1264,8 @@ static void tcon_super_cb(struct super_block *sb, void *arg)
 	t2 = cifs_sb_master_tcon(cifs_sb);
 
 	spin_lock(&t2->tc_lock);
-	if (t1->ses == t2->ses &&
+	if ((t1->ses == t2->ses ||
+	     t1->ses->dfs_root_ses == t2->ses->dfs_root_ses) &&
 	    t1->ses->server == t2->ses->server &&
 	    t2->origin_fullpath &&
 	    dfs_src_pathname_equal(t2->origin_fullpath, t1->origin_fullpath))
