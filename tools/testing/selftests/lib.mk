@@ -15,6 +15,10 @@ endif
 selfdir = $(realpath $(dir $(filter %/lib.mk,$(MAKEFILE_LIST))))
 top_srcdir = $(selfdir)/../../..
 
+ifeq ($(KHDR_INCLUDES),)
+KHDR_INCLUDES := -isystem $(top_srcdir)/usr/include
+endif
+
 # In order to use newer items that haven't yet been added to the user's system
 # header files, add $(TOOLS_INCLUDES) to the compiler invocation in each
 # each selftest.
