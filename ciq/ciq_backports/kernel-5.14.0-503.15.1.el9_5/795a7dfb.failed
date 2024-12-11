@@ -1,0 +1,85 @@
+net: tcp: accept old ack during closing
+
+jira LE-2157
+Rebuild_History Non-Buildable kernel-5.14.0-503.15.1.el9_5
+commit-author Menglong Dong <menglong8.dong@gmail.com>
+commit 795a7dfbc3d95e4c7c09569f319f026f8c7f5a9c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-503.15.1.el9_5/795a7dfb.failed
+
+For now, the packet with an old ack is not accepted if we are in
+FIN_WAIT1 state, which can cause retransmission. Taking the following
+case as an example:
+
+    Client                               Server
+      |                                    |
+  FIN_WAIT1(Send FIN, seq=10)          FIN_WAIT1(Send FIN, seq=20, ack=10)
+      |                                    |
+      |                                Send ACK(seq=21, ack=11)
+   Recv ACK(seq=21, ack=11)
+      |
+   Recv FIN(seq=20, ack=10)
+
+In the case above, simultaneous close is happening, and the FIN and ACK
+packet that send from the server is out of order. Then, the FIN will be
+dropped by the client, as it has an old ack. Then, the server has to
+retransmit the FIN, which can cause delay if the server has set the
+SO_LINGER on the socket.
+
+Old ack is accepted in the ESTABLISHED and TIME_WAIT state, and I think
+it should be better to keep the same logic.
+
+In this commit, we accept old ack in FIN_WAIT1/FIN_WAIT2/CLOSING/LAST_ACK
+states. Maybe we should limit it to FIN_WAIT1 for now?
+
+	Signed-off-by: Menglong Dong <menglong8.dong@gmail.com>
+	Reviewed-by: Simon Horman <horms@kernel.org>
+	Reviewed-by: Eric Dumazet <edumazet@google.com>
+Link: https://lore.kernel.org/r/20240126040519.1846345-1-menglong8.dong@gmail.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 795a7dfbc3d95e4c7c09569f319f026f8c7f5a9c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp_input.c
+diff --cc net/ipv4/tcp_input.c
+index 4d370936acb2,2d20edf652e6..000000000000
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@@ -6504,18 -6699,21 +6504,31 @@@ tcp_rcv_state_process(struct sock *sk, 
+  		return 0;
+  
+  	/* step 5: check the ACK field */
+- 	acceptable = tcp_ack(sk, skb, FLAG_SLOWPATH |
+- 				      FLAG_UPDATE_TS_RECENT |
+- 				      FLAG_NO_CHALLENGE_ACK) > 0;
++ 	reason = tcp_ack(sk, skb, FLAG_SLOWPATH |
++ 				  FLAG_UPDATE_TS_RECENT |
++ 				  FLAG_NO_CHALLENGE_ACK);
+  
+++<<<<<<< HEAD
+ +	if (!acceptable) {
+ +		/* send one RST */
+ +		if (sk->sk_state == TCP_SYN_RECV)
+ +			return SKB_DROP_REASON_TCP_OLD_ACK;
+ +		tcp_send_challenge_ack(sk);
+ +		SKB_DR_SET(reason, TCP_OLD_ACK);
+ +		goto discard;
+++=======
++ 	if ((int)reason <= 0) {
++ 		if (sk->sk_state == TCP_SYN_RECV)
++ 			return 1;	/* send one RST */
++ 		/* accept old ack during closing */
++ 		if ((int)reason < 0) {
++ 			tcp_send_challenge_ack(sk);
++ 			reason = -reason;
++ 			goto discard;
++ 		}
+++>>>>>>> 795a7dfbc3d9 (net: tcp: accept old ack during closing)
+  	}
++ 	SKB_DR_SET(reason, NOT_SPECIFIED);
+  	switch (sk->sk_state) {
+  	case TCP_SYN_RECV:
+  		tp->delivered++; /* SYN-ACK delivery isn't tracked in tcp_ack */
+* Unmerged path net/ipv4/tcp_input.c
