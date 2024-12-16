@@ -97,6 +97,18 @@ static inline bool device_is_compatible(const struct device *dev, const char *co
 	return fwnode_device_is_compatible(dev_fwnode(dev), compat);
 }
 
+int fwnode_property_match_property_string(const struct fwnode_handle *fwnode,
+					  const char *propname,
+					  const char * const *array, size_t n);
+
+static inline
+int device_property_match_property_string(const struct device *dev,
+					  const char *propname,
+					  const char * const *array, size_t n)
+{
+	return fwnode_property_match_property_string(dev_fwnode(dev), propname, array, n);
+}
+
 int fwnode_property_get_reference_args(const struct fwnode_handle *fwnode,
 				       const char *prop, const char *nargs_prop,
 				       unsigned int nargs, unsigned int index,
@@ -152,7 +164,19 @@ struct fwnode_handle *device_get_named_child_node(const struct device *dev,
 						  const char *childname);
 
 struct fwnode_handle *fwnode_handle_get(struct fwnode_handle *fwnode);
-void fwnode_handle_put(struct fwnode_handle *fwnode);
+
+/**
+ * fwnode_handle_put - Drop reference to a device node
+ * @fwnode: Pointer to the device node to drop the reference to.
+ *
+ * This has to be used when terminating device_for_each_child_node() iteration
+ * with break or return to prevent stale device node references from being left
+ * behind.
+ */
+static inline void fwnode_handle_put(struct fwnode_handle *fwnode)
+{
+	fwnode_call_void_op(fwnode, put);
+}
 
 DEFINE_FREE(fwnode_handle, struct fwnode_handle *, fwnode_handle_put(_T))
 
