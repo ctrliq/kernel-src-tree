@@ -1,0 +1,141 @@
+gfs2: Invert the GLF_INITIAL flag
+
+jira LE-2169
+Rebuild_History Non-Buildable kernel-4.18.0-553.32.1.el8_10
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit c8758ad005c98b15cd8b7a559dc51f8ddbc56d0a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.32.1.el8_10/c8758ad0.failed
+
+Invert the meaning of the GLF_INITIAL flag: right now, when GLF_INITIAL
+is set, a DLM lock exists and we have a valid identifier for it; when
+GLF_INITIAL is cleared, no DLM lock exists (yet).  This is confusing.
+In addition, it makes more sense to highlight the exceptional case
+(i.e., no DLM lock exists yet) in glock dumps and trace points than to
+highlight the common case.
+
+To avoid confusion between the "old" and the "new" meaning of the flag,
+use 'a' instead of 'I' to represent the flag.
+
+For improved code consistency, check if the GLF_INITIAL flag is cleared
+to determine whether a DLM lock exists instead of checking if the lock
+identifier is non-zero.
+
+Document what the flag is used for.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit c8758ad005c98b15cd8b7a559dc51f8ddbc56d0a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/glock.c
+#	fs/gfs2/trace_gfs2.h
+diff --cc fs/gfs2/glock.c
+index a9684efd290d,5fed5a22a8e7..000000000000
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@@ -2267,11 -2362,11 +2269,16 @@@ static const char *gflags2str(char *buf
+  		*p++ = 'f';
+  	if (test_bit(GLF_INVALIDATE_IN_PROGRESS, gflags))
+  		*p++ = 'i';
+ -	if (test_bit(GLF_HAVE_REPLY, gflags))
+ +	if (test_bit(GLF_REPLY_PENDING, gflags))
+  		*p++ = 'r';
+  	if (test_bit(GLF_INITIAL, gflags))
+++<<<<<<< HEAD
+ +		*p++ = 'I';
+ +	if (test_bit(GLF_FROZEN, gflags))
+++=======
++ 		*p++ = 'a';
++ 	if (test_bit(GLF_HAVE_FROZEN_REPLY, gflags))
+++>>>>>>> c8758ad005c9 (gfs2: Invert the GLF_INITIAL flag)
+  		*p++ = 'F';
+  	if (!list_empty(&gl->gl_holders))
+  		*p++ = 'q';
+diff --cc fs/gfs2/trace_gfs2.h
+index a5deb9f86831,8eae8d62a413..000000000000
+--- a/fs/gfs2/trace_gfs2.h
++++ b/fs/gfs2/trace_gfs2.h
+@@@ -53,9 -53,9 +53,15 @@@
+  	{(1UL << GLF_DIRTY),			"y" },		\
+  	{(1UL << GLF_LFLUSH),			"f" },		\
+  	{(1UL << GLF_INVALIDATE_IN_PROGRESS),	"i" },		\
+++<<<<<<< HEAD
+ +	{(1UL << GLF_REPLY_PENDING),		"r" },		\
+ +	{(1UL << GLF_INITIAL),			"I" },		\
+ +	{(1UL << GLF_FROZEN),			"F" },		\
+++=======
++ 	{(1UL << GLF_HAVE_REPLY),		"r" },		\
++ 	{(1UL << GLF_INITIAL),			"a" },		\
++ 	{(1UL << GLF_HAVE_FROZEN_REPLY),	"F" },		\
+++>>>>>>> c8758ad005c9 (gfs2: Invert the GLF_INITIAL flag)
+  	{(1UL << GLF_LRU),			"L" },		\
+  	{(1UL << GLF_OBJECT),			"o" },		\
+  	{(1UL << GLF_BLOCKING),			"b" })
+* Unmerged path fs/gfs2/glock.c
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index 5518bd3eb31d..29eb3d167807 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -163,11 +163,21 @@ static void gdlm_ast(void *arg)
+ 			BUG();
+ 	}
+ 
+-	set_bit(GLF_INITIAL, &gl->gl_flags);
++	/*
++	 * The GLF_INITIAL flag is initially set for new glocks.  Upon the
++	 * first successful new (non-conversion) request, we clear this flag to
++	 * indicate that a DLM lock exists and that gl->gl_lksb.sb_lkid is the
++	 * identifier to use for identifying it.
++	 *
++	 * Any failed initial requests do not create a DLM lock, so we ignore
++	 * the gl->gl_lksb.sb_lkid values that come with such requests.
++	 */
++
++	clear_bit(GLF_INITIAL, &gl->gl_flags);
+ 	gfs2_glock_complete(gl, ret);
+ 	return;
+ out:
+-	if (!test_bit(GLF_INITIAL, &gl->gl_flags))
++	if (test_bit(GLF_INITIAL, &gl->gl_flags))
+ 		gl->gl_lksb.sb_lkid = 0;
+ 	gfs2_glock_complete(gl, ret);
+ }
+@@ -244,7 +254,7 @@ static u32 make_flags(struct gfs2_glock *gl, const unsigned int gfs_flags,
+ 			BUG();
+ 	}
+ 
+-	if (gl->gl_lksb.sb_lkid != 0) {
++	if (!test_bit(GLF_INITIAL, &gl->gl_flags)) {
+ 		lkf |= DLM_LKF_CONVERT;
+ 		if (test_bit(GLF_BLOCKING, &gl->gl_flags))
+ 			lkf |= DLM_LKF_QUECVT;
+@@ -275,14 +285,14 @@ static int gdlm_lock(struct gfs2_glock *gl, unsigned int req_state,
+ 	lkf = make_flags(gl, flags, req);
+ 	gfs2_glstats_inc(gl, GFS2_LKS_DCOUNT);
+ 	gfs2_sbstats_inc(gl, GFS2_LKS_DCOUNT);
+-	if (gl->gl_lksb.sb_lkid) {
+-		gfs2_update_request_times(gl);
+-	} else {
++	if (test_bit(GLF_INITIAL, &gl->gl_flags)) {
+ 		memset(strname, ' ', GDLM_STRNAME_BYTES - 1);
+ 		strname[GDLM_STRNAME_BYTES - 1] = '\0';
+ 		gfs2_reverse_hex(strname + 7, gl->gl_name.ln_type);
+ 		gfs2_reverse_hex(strname + 23, gl->gl_name.ln_number);
+ 		gl->gl_dstamp = ktime_get_real();
++	} else {
++		gfs2_update_request_times(gl);
+ 	}
+ 	/*
+ 	 * Submit the actual lock request.
+@@ -306,7 +316,7 @@ static void gdlm_put_lock(struct gfs2_glock *gl)
+ 
+ 	BUG_ON(!__lockref_is_dead(&gl->gl_lockref));
+ 
+-	if (gl->gl_lksb.sb_lkid == 0) {
++	if (test_bit(GLF_INITIAL, &gl->gl_flags)) {
+ 		gfs2_glock_free(gl);
+ 		return;
+ 	}
+* Unmerged path fs/gfs2/trace_gfs2.h
