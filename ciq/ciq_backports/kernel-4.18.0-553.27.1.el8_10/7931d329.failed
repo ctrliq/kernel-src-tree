@@ -1,0 +1,137 @@
+netfilter: nf_tables: fully validate NFT_DATA_VALUE on store to data registers
+
+jira LE-2169
+cve CVE-2024-42070
+Rebuild_History Non-Buildable kernel-4.18.0-553.27.1.el8_10
+commit-author Pablo Neira Ayuso <pablo@netfilter.org>
+commit 7931d32955e09d0a11b1fe0b6aac1bfa061c005c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.27.1.el8_10/7931d329.failed
+
+register store validation for NFT_DATA_VALUE is conditional, however,
+the datatype is always either NFT_DATA_VALUE or NFT_DATA_VERDICT. This
+only requires a new helper function to infer the register type from the
+set datatype so this conditional check can be removed. Otherwise,
+pointer to chain object can be leaked through the registers.
+
+Fixes: 96518518cc41 ("netfilter: add nftables")
+	Reported-by: Linus Torvalds <torvalds@linuxfoundation.org>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 7931d32955e09d0a11b1fe0b6aac1bfa061c005c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_tables_api.c
+#	net/netfilter/nft_lookup.c
+diff --cc net/netfilter/nf_tables_api.c
+index a8d03cec29c3,e8dcf41d360d..000000000000
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@@ -9015,23 -11071,42 +9014,28 @@@ int nft_validate_register_store(const s
+  		}
+  
+  		return 0;
+++<<<<<<< HEAD
+ +	case NFT_REG_1...NFT_REG32_15:
+++=======
++ 	default:
++ 		if (type != NFT_DATA_VALUE)
++ 			return -EINVAL;
++ 
+++>>>>>>> 7931d32955e0 (netfilter: nf_tables: fully validate NFT_DATA_VALUE on store to data registers)
+  		if (reg < NFT_REG_1 * NFT_REG_SIZE / NFT_REG32_SIZE)
+  			return -EINVAL;
+  		if (len == 0)
+  			return -EINVAL;
+  		if (reg * NFT_REG32_SIZE + len >
+ -		    sizeof_field(struct nft_regs, data))
+ +		    FIELD_SIZEOF(struct nft_regs, data))
+  			return -ERANGE;
+  
+- 		if (data != NULL && type != NFT_DATA_VALUE)
+- 			return -EINVAL;
+  		return 0;
+ +	default:
+ +		return -ERANGE;
+  	}
+  }
+ -
+ -int nft_parse_register_store(const struct nft_ctx *ctx,
+ -			     const struct nlattr *attr, u8 *dreg,
+ -			     const struct nft_data *data,
+ -			     enum nft_data_types type, unsigned int len)
+ -{
+ -	int err;
+ -	u32 reg;
+ -
+ -	err = nft_parse_register(attr, &reg);
+ -	if (err < 0)
+ -		return err;
+ -
+ -	err = nft_validate_register_store(ctx, reg, data, type, len);
+ -	if (err < 0)
+ -		return err;
+ -
+ -	*dreg = reg;
+ -	return 0;
+ -}
+ -EXPORT_SYMBOL_GPL(nft_parse_register_store);
+ +EXPORT_SYMBOL_GPL(nft_validate_register_store);
+  
+  static const struct nla_policy nft_verdict_policy[NFTA_VERDICT_MAX + 1] = {
+  	[NFTA_VERDICT_CODE]	= { .type = NLA_U32 },
+diff --cc net/netfilter/nft_lookup.c
+index 828f87bb9145,f3080fa1b226..000000000000
+--- a/net/netfilter/nft_lookup.c
++++ b/net/netfilter/nft_lookup.c
+@@@ -103,13 -131,23 +103,20 @@@ static int nft_lookup_init(const struc
+  		if (!(set->flags & NFT_SET_MAP))
+  			return -EINVAL;
+  
+++<<<<<<< HEAD
+ +		priv->dreg = nft_parse_register(tb[NFTA_LOOKUP_DREG]);
+ +		err = nft_validate_register_store(ctx, priv->dreg, NULL,
+ +						  set->dtype, set->dlen);
+++=======
++ 		err = nft_parse_register_store(ctx, tb[NFTA_LOOKUP_DREG],
++ 					       &priv->dreg, NULL,
++ 					       nft_set_datatype(set),
++ 					       set->dlen);
+++>>>>>>> 7931d32955e0 (netfilter: nf_tables: fully validate NFT_DATA_VALUE on store to data registers)
+  		if (err < 0)
+  			return err;
+ -		priv->dreg_set = true;
+ -	} else if (set->flags & NFT_SET_MAP) {
+ -		/* Map given, but user asks for lookup only (i.e. to
+ -		 * ignore value assoicated with key).
+ -		 *
+ -		 * This makes no sense for anonymous maps since they are
+ -		 * scoped to the rule, but for named sets this can be useful.
+ -		 */
+ -		if (set->flags & NFT_SET_ANONYMOUS)
+ -			return -EINVAL;
+ -	}
+ +	} else if (set->flags & NFT_SET_MAP)
+ +		return -EINVAL;
+  
+  	priv->binding.flags = set->flags & NFT_SET_MAP;
+  
+diff --git a/include/net/netfilter/nf_tables.h b/include/net/netfilter/nf_tables.h
+index dc1113771aec..e26d3b30a12d 100644
+--- a/include/net/netfilter/nf_tables.h
++++ b/include/net/netfilter/nf_tables.h
+@@ -518,6 +518,11 @@ static inline void *nft_set_priv(const struct nft_set *set)
+ 	return (void *)set->data;
+ }
+ 
++static inline enum nft_data_types nft_set_datatype(const struct nft_set *set)
++{
++	return set->dtype == NFT_DATA_VERDICT ? NFT_DATA_VERDICT : NFT_DATA_VALUE;
++}
++
+ static inline bool nft_set_gc_is_pending(const struct nft_set *s)
+ {
+ 	return refcount_read(&s->refs) != 1;
+* Unmerged path net/netfilter/nf_tables_api.c
+* Unmerged path net/netfilter/nft_lookup.c
