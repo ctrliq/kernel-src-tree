@@ -1,0 +1,311 @@
+netfilter: nft_set_pipapo: walk over current view on netlink dump
+
+jira LE-2169
+cve CVE-2024-27017
+Rebuild_History Non-Buildable kernel-4.18.0-553.27.1.el8_10
+commit-author Pablo Neira Ayuso <pablo@netfilter.org>
+commit 29b359cf6d95fd60730533f7f10464e95bd17c73
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.27.1.el8_10/29b359cf.failed
+
+The generation mask can be updated while netlink dump is in progress.
+The pipapo set backend walk iterator cannot rely on it to infer what
+view of the datastructure is to be used. Add notation to specify if user
+wants to read/update the set.
+
+Based on patch from Florian Westphal.
+
+Fixes: 2b84e215f874 ("netfilter: nft_set_pipapo: .walk does not deal with generations")
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 29b359cf6d95fd60730533f7f10464e95bd17c73)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netfilter/nf_tables.h
+#	net/netfilter/nf_tables_api.c
+#	net/netfilter/nft_set_pipapo.c
+diff --cc include/net/netfilter/nf_tables.h
+index dc1113771aec,3f1ed467f951..000000000000
+--- a/include/net/netfilter/nf_tables.h
++++ b/include/net/netfilter/nf_tables.h
+@@@ -246,9 -295,31 +246,30 @@@ struct nft_set_elem 
+  		u32		buf[NFT_DATA_VALUE_MAXLEN / sizeof(u32)];
+  		struct nft_data	val;
+  	} key_end;
+ -	union {
+ -		u32		buf[NFT_DATA_VALUE_MAXLEN / sizeof(u32)];
+ -		struct nft_data val;
+ -	} data;
+ -	struct nft_elem_priv	*priv;
+ +	void			*priv;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static inline void *nft_elem_priv_cast(const struct nft_elem_priv *priv)
++ {
++ 	return (void *)priv;
++ }
++ 
++ 
++ /**
++  * enum nft_iter_type - nftables set iterator type
++  *
++  * @NFT_ITER_READ: read-only iteration over set elements
++  * @NFT_ITER_UPDATE: iteration under mutex to update set element state
++  */
++ enum nft_iter_type {
++ 	NFT_ITER_UNSPEC,
++ 	NFT_ITER_READ,
++ 	NFT_ITER_UPDATE,
++ };
++ 
+++>>>>>>> 29b359cf6d95 (netfilter: nft_set_pipapo: walk over current view on netlink dump)
+  struct nft_set;
+  struct nft_set_iter {
+  	u8		genmask;
+diff --cc net/netfilter/nf_tables_api.c
+index a8d03cec29c3,a7a34db62ea9..000000000000
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@@ -490,6 -583,59 +490,62 @@@ static int nft_trans_set_add(const stru
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int nft_trans_set_add(const struct nft_ctx *ctx, int msg_type,
++ 			     struct nft_set *set)
++ {
++ 	return __nft_trans_set_add(ctx, msg_type, set, NULL);
++ }
++ 
++ static int nft_mapelem_deactivate(const struct nft_ctx *ctx,
++ 				  struct nft_set *set,
++ 				  const struct nft_set_iter *iter,
++ 				  struct nft_elem_priv *elem_priv)
++ {
++ 	nft_setelem_data_deactivate(ctx->net, set, elem_priv);
++ 
++ 	return 0;
++ }
++ 
++ struct nft_set_elem_catchall {
++ 	struct list_head	list;
++ 	struct rcu_head		rcu;
++ 	struct nft_elem_priv	*elem;
++ };
++ 
++ static void nft_map_catchall_deactivate(const struct nft_ctx *ctx,
++ 					struct nft_set *set)
++ {
++ 	u8 genmask = nft_genmask_next(ctx->net);
++ 	struct nft_set_elem_catchall *catchall;
++ 	struct nft_set_ext *ext;
++ 
++ 	list_for_each_entry(catchall, &set->catchall_list, list) {
++ 		ext = nft_set_elem_ext(set, catchall->elem);
++ 		if (!nft_set_elem_active(ext, genmask))
++ 			continue;
++ 
++ 		nft_setelem_data_deactivate(ctx->net, set, catchall->elem);
++ 		break;
++ 	}
++ }
++ 
++ static void nft_map_deactivate(const struct nft_ctx *ctx, struct nft_set *set)
++ {
++ 	struct nft_set_iter iter = {
++ 		.genmask	= nft_genmask_next(ctx->net),
++ 		.type		= NFT_ITER_UPDATE,
++ 		.fn		= nft_mapelem_deactivate,
++ 	};
++ 
++ 	set->ops->walk(ctx, set, &iter);
++ 	WARN_ON_ONCE(iter.err);
++ 
++ 	nft_map_catchall_deactivate(ctx, set);
++ }
++ 
+++>>>>>>> 29b359cf6d95 (netfilter: nft_set_pipapo: walk over current view on netlink dump)
+  static int nft_delset(const struct nft_ctx *ctx, struct nft_set *set)
+  {
+  	int err;
+@@@ -4586,7 -5484,51 +4643,55 @@@ void nf_tables_unbind_set(const struct 
+  					     GFP_KERNEL);
+  	}
+  }
+++<<<<<<< HEAD
+ +EXPORT_SYMBOL_GPL(nf_tables_unbind_set);
+++=======
++ 
++ static void nft_setelem_data_activate(const struct net *net,
++ 				      const struct nft_set *set,
++ 				      struct nft_elem_priv *elem_priv);
++ 
++ static int nft_mapelem_activate(const struct nft_ctx *ctx,
++ 				struct nft_set *set,
++ 				const struct nft_set_iter *iter,
++ 				struct nft_elem_priv *elem_priv)
++ {
++ 	nft_setelem_data_activate(ctx->net, set, elem_priv);
++ 
++ 	return 0;
++ }
++ 
++ static void nft_map_catchall_activate(const struct nft_ctx *ctx,
++ 				      struct nft_set *set)
++ {
++ 	u8 genmask = nft_genmask_next(ctx->net);
++ 	struct nft_set_elem_catchall *catchall;
++ 	struct nft_set_ext *ext;
++ 
++ 	list_for_each_entry(catchall, &set->catchall_list, list) {
++ 		ext = nft_set_elem_ext(set, catchall->elem);
++ 		if (!nft_set_elem_active(ext, genmask))
++ 			continue;
++ 
++ 		nft_setelem_data_activate(ctx->net, set, catchall->elem);
++ 		break;
++ 	}
++ }
++ 
++ static void nft_map_activate(const struct nft_ctx *ctx, struct nft_set *set)
++ {
++ 	struct nft_set_iter iter = {
++ 		.genmask	= nft_genmask_next(ctx->net),
++ 		.type		= NFT_ITER_UPDATE,
++ 		.fn		= nft_mapelem_activate,
++ 	};
++ 
++ 	set->ops->walk(ctx, set, &iter);
++ 	WARN_ON_ONCE(iter.err);
++ 
++ 	nft_map_catchall_activate(ctx, set);
++ }
+++>>>>>>> 29b359cf6d95 (netfilter: nft_set_pipapo: walk over current view on netlink dump)
+  
+  void nf_tables_activate_set(const struct nft_ctx *ctx, struct nft_set *set)
+  {
+@@@ -4925,7 -5893,9 +5030,8 @@@ static int nf_tables_dump_set(struct sk
+  
+  	args.cb			= cb;
+  	args.skb		= skb;
+ -	args.reset		= dump_ctx->reset;
+  	args.iter.genmask	= nft_genmask_cur(net);
++ 	args.iter.type		= NFT_ITER_READ;
+  	args.iter.skip		= cb->args[0];
+  	args.iter.count		= 0;
+  	args.iter.err		= 0;
+@@@ -5978,13 -7335,72 +6084,76 @@@ static int nft_flush_set(const struct n
+  	return 0;
+  }
+  
+ -static int __nft_set_catchall_flush(const struct nft_ctx *ctx,
+ -				    struct nft_set *set,
+ -				    struct nft_elem_priv *elem_priv)
+ +static int nf_tables_delsetelem(struct net *net, struct sock *nlsk,
+ +				struct sk_buff *skb, const struct nlmsghdr *nlh,
+ +				const struct nlattr * const nla[],
+ +				struct netlink_ext_ack *extack)
+  {
+++<<<<<<< HEAD
+ +	u8 genmask = nft_genmask_next(net);
+++=======
++ 	struct nft_trans *trans;
++ 
++ 	trans = nft_trans_alloc_gfp(ctx, NFT_MSG_DELSETELEM,
++ 				    sizeof(struct nft_trans_elem), GFP_KERNEL);
++ 	if (!trans)
++ 		return -ENOMEM;
++ 
++ 	nft_setelem_data_deactivate(ctx->net, set, elem_priv);
++ 	nft_trans_elem_set(trans) = set;
++ 	nft_trans_elem_priv(trans) = elem_priv;
++ 	nft_trans_commit_list_add_tail(ctx->net, trans);
++ 
++ 	return 0;
++ }
++ 
++ static int nft_set_catchall_flush(const struct nft_ctx *ctx,
++ 				  struct nft_set *set)
++ {
++ 	u8 genmask = nft_genmask_next(ctx->net);
++ 	struct nft_set_elem_catchall *catchall;
++ 	struct nft_set_ext *ext;
++ 	int ret = 0;
++ 
++ 	list_for_each_entry_rcu(catchall, &set->catchall_list, list) {
++ 		ext = nft_set_elem_ext(set, catchall->elem);
++ 		if (!nft_set_elem_active(ext, genmask))
++ 			continue;
++ 
++ 		ret = __nft_set_catchall_flush(ctx, set, catchall->elem);
++ 		if (ret < 0)
++ 			break;
++ 		nft_set_elem_change_active(ctx->net, set, ext);
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static int nft_set_flush(struct nft_ctx *ctx, struct nft_set *set, u8 genmask)
++ {
++ 	struct nft_set_iter iter = {
++ 		.genmask	= genmask,
++ 		.type		= NFT_ITER_UPDATE,
++ 		.fn		= nft_setelem_flush,
++ 	};
++ 
++ 	set->ops->walk(ctx, set, &iter);
++ 	if (!iter.err)
++ 		iter.err = nft_set_catchall_flush(ctx, set);
++ 
++ 	return iter.err;
++ }
++ 
++ static int nf_tables_delsetelem(struct sk_buff *skb,
++ 				const struct nfnl_info *info,
++ 				const struct nlattr * const nla[])
++ {
++ 	struct netlink_ext_ack *extack = info->extack;
++ 	u8 genmask = nft_genmask_next(info->net);
++ 	u8 family = info->nfmsg->nfgen_family;
++ 	struct net *net = info->net;
+++>>>>>>> 29b359cf6d95 (netfilter: nft_set_pipapo: walk over current view on netlink dump)
+  	const struct nlattr *attr;
+ -	struct nft_table *table;
+  	struct nft_set *set;
+  	struct nft_ctx ctx;
+  	int rem, err = 0;
+diff --cc net/netfilter/nft_set_pipapo.c
+index 4b6a6667d72b,11e44e4dfb1f..000000000000
+--- a/net/netfilter/nft_set_pipapo.c
++++ b/net/netfilter/nft_set_pipapo.c
+@@@ -1908,13 -2115,14 +1908,21 @@@ static void nft_pipapo_walk(const struc
+  			    struct nft_set_iter *iter)
+  {
+  	struct nft_pipapo *priv = nft_set_priv(set);
+++<<<<<<< HEAD
+ +	struct net *net = read_pnet(&set->net);
+ +	struct nft_pipapo_match *m;
+ +	struct nft_pipapo_field *f;
+ +	int i, r;
+++=======
++ 	const struct nft_pipapo_match *m;
++ 	const struct nft_pipapo_field *f;
++ 	unsigned int i, r;
+++>>>>>>> 29b359cf6d95 (netfilter: nft_set_pipapo: walk over current view on netlink dump)
++ 
++ 	WARN_ON_ONCE(iter->type == NFT_ITER_UNSPEC);
+  
+  	rcu_read_lock();
+- 	if (iter->genmask == nft_genmask_cur(net))
++ 	if (iter->type == NFT_ITER_READ)
+  		m = rcu_dereference(priv->match);
+  	else
+  		m = priv->clone;
+* Unmerged path include/net/netfilter/nf_tables.h
+* Unmerged path net/netfilter/nf_tables_api.c
+* Unmerged path net/netfilter/nft_set_pipapo.c
