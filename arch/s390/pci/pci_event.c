@@ -332,7 +332,10 @@ static void __zpci_event_availability(struct zpci_ccdf_avail *ccdf)
 			zdev = zpci_create_device(ccdf->fid, ccdf->fh, ZPCI_FN_STATE_CONFIGURED);
 			if (IS_ERR(zdev))
 				break;
-			zpci_add_device(zdev);
+			if (zpci_add_device(zdev)) {
+				kfree(zdev);
+				break;
+			}
 		} else {
 			/* the configuration request may be stale */
 			if (zdev->state != ZPCI_FN_STATE_STANDBY)
@@ -346,7 +349,10 @@ static void __zpci_event_availability(struct zpci_ccdf_avail *ccdf)
 			zdev = zpci_create_device(ccdf->fid, ccdf->fh, ZPCI_FN_STATE_STANDBY);
 			if (IS_ERR(zdev))
 				break;
-			zpci_add_device(zdev);
+			if (zpci_add_device(zdev)) {
+				kfree(zdev);
+				break;
+			}
 		} else {
 			zpci_update_fh(zdev, ccdf->fh);
 		}
