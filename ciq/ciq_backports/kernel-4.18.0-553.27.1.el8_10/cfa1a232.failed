@@ -1,0 +1,133 @@
+bpf: Fix overrunning reservations in ringbuf
+
+jira LE-2169
+cve CVE-2024-41009
+Rebuild_History Non-Buildable kernel-4.18.0-553.27.1.el8_10
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit cfa1a2329a691ffd991fcf7248a57d752e712881
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.27.1.el8_10/cfa1a232.failed
+
+The BPF ring buffer internally is implemented as a power-of-2 sized circular
+buffer, with two logical and ever-increasing counters: consumer_pos is the
+consumer counter to show which logical position the consumer consumed the
+data, and producer_pos which is the producer counter denoting the amount of
+data reserved by all producers.
+
+Each time a record is reserved, the producer that "owns" the record will
+successfully advance producer counter. In user space each time a record is
+read, the consumer of the data advanced the consumer counter once it finished
+processing. Both counters are stored in separate pages so that from user
+space, the producer counter is read-only and the consumer counter is read-write.
+
+One aspect that simplifies and thus speeds up the implementation of both
+producers and consumers is how the data area is mapped twice contiguously
+back-to-back in the virtual memory, allowing to not take any special measures
+for samples that have to wrap around at the end of the circular buffer data
+area, because the next page after the last data page would be first data page
+again, and thus the sample will still appear completely contiguous in virtual
+memory.
+
+Each record has a struct bpf_ringbuf_hdr { u32 len; u32 pg_off; } header for
+book-keeping the length and offset, and is inaccessible to the BPF program.
+Helpers like bpf_ringbuf_reserve() return `(void *)hdr + BPF_RINGBUF_HDR_SZ`
+for the BPF program to use. Bing-Jhong and Muhammad reported that it is however
+possible to make a second allocated memory chunk overlapping with the first
+chunk and as a result, the BPF program is now able to edit first chunk's
+header.
+
+For example, consider the creation of a BPF_MAP_TYPE_RINGBUF map with size
+of 0x4000. Next, the consumer_pos is modified to 0x3000 /before/ a call to
+bpf_ringbuf_reserve() is made. This will allocate a chunk A, which is in
+[0x0,0x3008], and the BPF program is able to edit [0x8,0x3008]. Now, lets
+allocate a chunk B with size 0x3000. This will succeed because consumer_pos
+was edited ahead of time to pass the `new_prod_pos - cons_pos > rb->mask`
+check. Chunk B will be in range [0x3008,0x6010], and the BPF program is able
+to edit [0x3010,0x6010]. Due to the ring buffer memory layout mentioned
+earlier, the ranges [0x0,0x4000] and [0x4000,0x8000] point to the same data
+pages. This means that chunk B at [0x4000,0x4008] is chunk A's header.
+bpf_ringbuf_submit() / bpf_ringbuf_discard() use the header's pg_off to then
+locate the bpf_ringbuf itself via bpf_ringbuf_restore_from_rec(). Once chunk
+B modified chunk A's header, then bpf_ringbuf_commit() refers to the wrong
+page and could cause a crash.
+
+Fix it by calculating the oldest pending_pos and check whether the range
+from the oldest outstanding record to the newest would span beyond the ring
+buffer size. If that is the case, then reject the request. We've tested with
+the ring buffer benchmark in BPF selftests (./benchs/run_bench_ringbufs.sh)
+before/after the fix and while it seems a bit slower on some benchmarks, it
+is still not significantly enough to matter.
+
+Fixes: 457f44363a88 ("bpf: Implement BPF ring buffer and verifier support for it")
+	Reported-by: Bing-Jhong Billy Jheng <billy@starlabs.sg>
+	Reported-by: Muhammad Ramdhan <ramdhan@starlabs.sg>
+Co-developed-by: Bing-Jhong Billy Jheng <billy@starlabs.sg>
+Co-developed-by: Andrii Nakryiko <andrii@kernel.org>
+	Signed-off-by: Bing-Jhong Billy Jheng <billy@starlabs.sg>
+	Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Link: https://lore.kernel.org/bpf/20240621140828.18238-1-daniel@iogearbox.net
+(cherry picked from commit cfa1a2329a691ffd991fcf7248a57d752e712881)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/ringbuf.c
+diff --cc kernel/bpf/ringbuf.c
+index 638d7fd7b375,e20b90c36131..000000000000
+--- a/kernel/bpf/ringbuf.c
++++ b/kernel/bpf/ringbuf.c
+@@@ -37,10 -30,44 +37,51 @@@ struct bpf_ringbuf 
+  	struct page **pages;
+  	int nr_pages;
+  	spinlock_t spinlock ____cacheline_aligned_in_smp;
+++<<<<<<< HEAD
+ +	/* Consumer and producer counters are put into separate pages to allow
+ +	 * mapping consumer page as r/w, but restrict producer page to r/o.
+ +	 * This protects producer position from being modified by user-space
+ +	 * application and ruining in-kernel position tracking.
+++=======
++ 	/* For user-space producer ring buffers, an atomic_t busy bit is used
++ 	 * to synchronize access to the ring buffers in the kernel, rather than
++ 	 * the spinlock that is used for kernel-producer ring buffers. This is
++ 	 * done because the ring buffer must hold a lock across a BPF program's
++ 	 * callback:
++ 	 *
++ 	 *    __bpf_user_ringbuf_peek() // lock acquired
++ 	 * -> program callback_fn()
++ 	 * -> __bpf_user_ringbuf_sample_release() // lock released
++ 	 *
++ 	 * It is unsafe and incorrect to hold an IRQ spinlock across what could
++ 	 * be a long execution window, so we instead simply disallow concurrent
++ 	 * access to the ring buffer by kernel consumers, and return -EBUSY from
++ 	 * __bpf_user_ringbuf_peek() if the busy bit is held by another task.
++ 	 */
++ 	atomic_t busy ____cacheline_aligned_in_smp;
++ 	/* Consumer and producer counters are put into separate pages to
++ 	 * allow each position to be mapped with different permissions.
++ 	 * This prevents a user-space application from modifying the
++ 	 * position and ruining in-kernel tracking. The permissions of the
++ 	 * pages depend on who is producing samples: user-space or the
++ 	 * kernel. Note that the pending counter is placed in the same
++ 	 * page as the producer, so that it shares the same cache line.
++ 	 *
++ 	 * Kernel-producer
++ 	 * ---------------
++ 	 * The producer position and data pages are mapped as r/o in
++ 	 * userspace. For this approach, bits in the header of samples are
++ 	 * used to signal to user-space, and to other producers, whether a
++ 	 * sample is currently being written.
++ 	 *
++ 	 * User-space producer
++ 	 * -------------------
++ 	 * Only the page containing the consumer position is mapped r/o in
++ 	 * user-space. User-space producers also use bits of the header to
++ 	 * communicate to the kernel, but the kernel must carefully check and
++ 	 * validate each sample to ensure that they're correctly formatted, and
++ 	 * fully contained within the ring buffer.
+++>>>>>>> cfa1a2329a69 (bpf: Fix overrunning reservations in ringbuf)
+  	 */
+  	unsigned long consumer_pos __aligned(PAGE_SIZE);
+  	unsigned long producer_pos __aligned(PAGE_SIZE);
+* Unmerged path kernel/bpf/ringbuf.c
