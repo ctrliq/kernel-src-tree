@@ -1,0 +1,173 @@
+cifs: Get rid of unneeded conditional in the smb2_get_aead_req()
+
+jira LE-2169
+Rebuild_History Non-Buildable kernel-4.18.0-553.27.1.el8_10
+commit-author Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+commit d4fba63fe1f78dba749cf7aa04c1dff4b8666eb1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.27.1.el8_10/d4fba63f.failed
+
+In the smb2_get_aead_req() the skip variable is used only for
+the very first iteration of the two nested loops, which means
+it's basically in invariant to those loops. Hence, instead of
+using conditional on each iteration, unconditionally assign
+the 'skip' variable before the loops and at the end of the
+inner loop.
+
+	Signed-off-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+	Reviewed-by: Paulo Alcantara (SUSE) <pc@cjr.nz>
+	Reviewed-by: David Howells <dhowells@redhat.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit d4fba63fe1f78dba749cf7aa04c1dff4b8666eb1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/smb2ops.c
+diff --cc fs/cifs/smb2ops.c
+index 17d6d311b30b,157a19f371d6..000000000000
+--- a/fs/cifs/smb2ops.c
++++ b/fs/cifs/smb2ops.c
+@@@ -4286,69 -4225,86 +4286,98 @@@ fill_transform_hdr(struct smb2_transfor
+  	memcpy(&tr_hdr->SessionId, &shdr->SessionId, 8);
+  }
+  
+ -static void *smb2_aead_req_alloc(struct crypto_aead *tfm, const struct smb_rqst *rqst,
+ -				 int num_rqst, const u8 *sig, u8 **iv,
+ -				 struct aead_request **req, struct scatterlist **sgl,
+ -				 unsigned int *num_sgs)
+ +/* We can not use the normal sg_set_buf() as we will sometimes pass a
+ + * stack object as buf.
+ + */
+ +static inline void smb2_sg_set_buf(struct scatterlist *sg, const void *buf,
+ +				   unsigned int buflen)
+  {
+ -	unsigned int req_size = sizeof(**req) + crypto_aead_reqsize(tfm);
+ -	unsigned int iv_size = crypto_aead_ivsize(tfm);
+ -	unsigned int len;
+ -	u8 *p;
+ -
+ -	*num_sgs = cifs_get_num_sgs(rqst, num_rqst, sig);
+ -
+ -	len = iv_size;
+ -	len += crypto_aead_alignmask(tfm) & ~(crypto_tfm_ctx_alignment() - 1);
+ -	len = ALIGN(len, crypto_tfm_ctx_alignment());
+ -	len += req_size;
+ -	len = ALIGN(len, __alignof__(struct scatterlist));
+ -	len += *num_sgs * sizeof(**sgl);
+ -
+ -	p = kmalloc(len, GFP_ATOMIC);
+ -	if (!p)
+ -		return NULL;
+ -
+ -	*iv = (u8 *)PTR_ALIGN(p, crypto_aead_alignmask(tfm) + 1);
+ -	*req = (struct aead_request *)PTR_ALIGN(*iv + iv_size,
+ -						crypto_tfm_ctx_alignment());
+ -	*sgl = (struct scatterlist *)PTR_ALIGN((u8 *)*req + req_size,
+ -					       __alignof__(struct scatterlist));
+ -	return p;
+ +	void *addr;
+ +	/*
+ +	 * VMAP_STACK (at least) puts stack into the vmalloc address space
+ +	 */
+ +	if (is_vmalloc_addr(buf))
+ +		addr = vmalloc_to_page(buf);
+ +	else
+ +		addr = virt_to_page(buf);
+ +	sg_set_page(sg, addr, buflen, offset_in_page(buf));
+  }
+  
+ -static void *smb2_get_aead_req(struct crypto_aead *tfm, const struct smb_rqst *rqst,
+ -			       int num_rqst, const u8 *sig, u8 **iv,
+ -			       struct aead_request **req, struct scatterlist **sgl)
+ +/* Assumes the first rqst has a transform header as the first iov.
+ + * I.e.
+ + * rqst[0].rq_iov[0]  is transform header
+ + * rqst[0].rq_iov[1+] data to be encrypted/decrypted
+ + * rqst[1+].rq_iov[0+] data to be encrypted/decrypted
+ + */
+ +static struct scatterlist *
+ +init_sg(int num_rqst, struct smb_rqst *rqst, u8 *sign)
+  {
+ -	unsigned int off, len, skip;
+ +	unsigned int sg_len;
+  	struct scatterlist *sg;
+ -	unsigned int num_sgs;
+ -	unsigned long addr;
+ -	int i, j;
+ -	void *p;
+ +	unsigned int i;
+ +	unsigned int j;
+ +	unsigned int idx = 0;
+ +	int skip;
+ +
+ +	sg_len = 1;
+ +	for (i = 0; i < num_rqst; i++)
+ +		sg_len += rqst[i].rq_nvec + rqst[i].rq_npages;
+  
+ -	p = smb2_aead_req_alloc(tfm, rqst, num_rqst, sig, iv, req, sgl, &num_sgs);
+ -	if (!p)
+ +	sg = kmalloc_array(sg_len, sizeof(struct scatterlist), GFP_KERNEL);
+ +	if (!sg)
+  		return NULL;
+  
+++<<<<<<< HEAD
+ +	sg_init_table(sg, sg_len);
+ +	for (i = 0; i < num_rqst; i++) {
+ +		for (j = 0; j < rqst[i].rq_nvec; j++) {
+ +			/*
+ +			 * The first rqst has a transform header where the
+ +			 * first 20 bytes are not part of the encrypted blob
+ +			 */
+ +			skip = (i == 0) && (j == 0) ? 20 : 0;
+ +			smb2_sg_set_buf(&sg[idx++],
+ +					rqst[i].rq_iov[j].iov_base + skip,
+ +					rqst[i].rq_iov[j].iov_len - skip);
+ +			}
+ +
+++=======
++ 	sg_init_table(*sgl, num_sgs);
++ 	sg = *sgl;
++ 
++ 	/*
++ 	 * The first rqst has a transform header where the
++ 	 * first 20 bytes are not part of the encrypted blob.
++ 	 */
++ 	skip = 20;
++ 
++ 	/* Assumes the first rqst has a transform header as the first iov.
++ 	 * I.e.
++ 	 * rqst[0].rq_iov[0]  is transform header
++ 	 * rqst[0].rq_iov[1+] data to be encrypted/decrypted
++ 	 * rqst[1+].rq_iov[0+] data to be encrypted/decrypted
++ 	 */
++ 	for (i = 0; i < num_rqst; i++) {
++ 		for (j = 0; j < rqst[i].rq_nvec; j++) {
++ 			struct kvec *iov = &rqst[i].rq_iov[j];
++ 
++ 			addr = (unsigned long)iov->iov_base + skip;
++ 			len = iov->iov_len - skip;
++ 			sg = cifs_sg_set_buf(sg, (void *)addr, len);
++ 
++ 			/* See the above comment on the 'skip' assignment */
++ 			skip = 0;
++ 		}
+++>>>>>>> d4fba63fe1f7 (cifs: Get rid of unneeded conditional in the smb2_get_aead_req())
+  		for (j = 0; j < rqst[i].rq_npages; j++) {
+ -			rqst_page_get_length(&rqst[i], j, &len, &off);
+ -			sg_set_page(sg++, rqst[i].rq_pages[j], len, off);
+ +			unsigned int len, offset;
+ +
+ +			rqst_page_get_length(&rqst[i], j, &len, &offset);
+ +			sg_set_page(&sg[idx++], rqst[i].rq_pages[j], len, offset);
+  		}
+  	}
+ -	cifs_sg_set_buf(sg, sig, SMB2_SIGNATURE_SIZE);
+ -
+ -	return p;
+ +	smb2_sg_set_buf(&sg[idx], sign, SMB2_SIGNATURE_SIZE);
+ +	return sg;
+  }
+  
+  static int
+* Unmerged path fs/cifs/smb2ops.c
