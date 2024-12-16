@@ -1,0 +1,369 @@
+cifs: remove useless DeleteMidQEntry()
+
+jira LE-2169
+Rebuild_History Non-Buildable kernel-4.18.0-553.30.1.el8_10
+commit-author Enzo Matsumiya <ematsumiya@suse.de>
+commit 70f08f914a37a0881a7f17068e03ff5a5024822d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.30.1.el8_10/70f08f91.failed
+
+DeleteMidQEntry() was just a proxy for cifs_mid_q_entry_release().
+
+- remove DeleteMidQEntry()
+- rename cifs_mid_q_entry_release() to release_mid()
+- rename kref_put() callback _cifs_mid_q_entry_release to __release_mid
+- rename AllocMidQEntry() to alloc_mid()
+- rename cifs_delete_mid() to delete_mid()
+
+Update callers to use new names.
+
+	Signed-off-by: Enzo Matsumiya <ematsumiya@suse.de>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 70f08f914a37a0881a7f17068e03ff5a5024822d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/transport.c
+diff --cc fs/cifs/transport.c
+index 4d40492f744e,dc69ac9dad60..000000000000
+--- a/fs/cifs/transport.c
++++ b/fs/cifs/transport.c
+@@@ -155,29 -153,26 +155,32 @@@ static void __release_mid(struct kref *
+  	mempool_free(midEntry, cifs_mid_poolp);
+  }
+  
+- void cifs_mid_q_entry_release(struct mid_q_entry *midEntry)
++ void release_mid(struct mid_q_entry *mid)
+  {
+++<<<<<<< HEAD
+ +	spin_lock(&GlobalMid_Lock);
+ +	kref_put(&midEntry->refcount, _cifs_mid_q_entry_release);
+ +	spin_unlock(&GlobalMid_Lock);
+- }
+++=======
++ 	struct TCP_Server_Info *server = mid->server;
+  
+- void DeleteMidQEntry(struct mid_q_entry *midEntry)
+- {
+- 	cifs_mid_q_entry_release(midEntry);
++ 	spin_lock(&server->mid_lock);
++ 	kref_put(&mid->refcount, __release_mid);
++ 	spin_unlock(&server->mid_lock);
+++>>>>>>> 70f08f914a37 (cifs: remove useless DeleteMidQEntry())
+  }
+  
+  void
+- cifs_delete_mid(struct mid_q_entry *mid)
++ delete_mid(struct mid_q_entry *mid)
+  {
+ -	spin_lock(&mid->server->mid_lock);
+ +	spin_lock(&GlobalMid_Lock);
+  	if (!(mid->mid_flags & MID_DELETED)) {
+  		list_del_init(&mid->qhead);
+  		mid->mid_flags |= MID_DELETED;
+  	}
+ -	spin_unlock(&mid->server->mid_lock);
+ +	spin_unlock(&GlobalMid_Lock);
+  
+- 	DeleteMidQEntry(mid);
++ 	release_mid(mid);
+  }
+  
+  /*
+@@@ -752,19 -732,23 +755,19 @@@ static int allocate_mid(struct cifs_se
+  		/* else ok - we are setting up session */
+  	}
+  
+ -	if (ses->ses_status == SES_EXITING) {
+ +	if (ses->status == CifsExiting) {
+  		/* check if SMB session is bad because we are setting it up */
+ -		if (in_buf->Command != SMB_COM_LOGOFF_ANDX) {
+ -			spin_unlock(&ses->ses_lock);
+ +		if (in_buf->Command != SMB_COM_LOGOFF_ANDX)
+  			return -EAGAIN;
+ -		}
+  		/* else ok - we are shutting down session */
+  	}
+ -	spin_unlock(&ses->ses_lock);
+  
+- 	*ppmidQ = AllocMidQEntry(in_buf, ses->server);
++ 	*ppmidQ = alloc_mid(in_buf, ses->server);
+  	if (*ppmidQ == NULL)
+  		return -ENOMEM;
+ -	spin_lock(&ses->server->mid_lock);
+ +	spin_lock(&GlobalMid_Lock);
+  	list_add_tail(&(*ppmidQ)->qhead, &ses->server->pending_mid_q);
+ -	spin_unlock(&ses->server->mid_lock);
+ +	spin_unlock(&GlobalMid_Lock);
+  	return 0;
+  }
+  
+@@@ -880,10 -863,10 +883,10 @@@ cifs_call_async(struct TCP_Server_Info 
+  	if (rc < 0) {
+  		revert_current_mid(server, mid->credits);
+  		server->sequence_number -= 2;
+- 		cifs_delete_mid(mid);
++ 		delete_mid(mid);
+  	}
+  
+ -	cifs_server_unlock(server);
+ +	mutex_unlock(&server->srv_mutex);
+  
+  	if (rc == 0)
+  		return 0;
+@@@ -950,9 -933,9 +953,9 @@@ cifs_sync_mid_result(struct mid_q_entr
+  			 __func__, mid->mid, mid->mid_state);
+  		rc = -EIO;
+  	}
+ -	spin_unlock(&server->mid_lock);
+ +	spin_unlock(&GlobalMid_Lock);
+  
+- 	DeleteMidQEntry(mid);
++ 	release_mid(mid);
+  	return rc;
+  }
+  
+@@@ -1149,8 -1128,8 +1152,13 @@@ compound_send_recv(const unsigned int x
+  		if (IS_ERR(midQ[i])) {
+  			revert_current_mid(server, i);
+  			for (j = 0; j < i; j++)
+++<<<<<<< HEAD
+ +				cifs_delete_mid(midQ[j]);
+ +			mutex_unlock(&server->srv_mutex);
+++=======
++ 				delete_mid(midQ[j]);
++ 			cifs_server_unlock(server);
+++>>>>>>> 70f08f914a37 (cifs: remove useless DeleteMidQEntry())
+  
+  			/* Update # of requests on wire to server */
+  			for (j = 0; j < num_rqst; j++)
+@@@ -1426,12 -1417,11 +1434,17 @@@ SendReceive(const unsigned int xid, str
+  	rc = wait_for_response(server, midQ);
+  	if (rc != 0) {
+  		send_cancel(server, &rqst, midQ);
+ -		spin_lock(&server->mid_lock);
+ -		if (midQ->mid_state == MID_REQUEST_SUBMITTED) {
+ +		spin_lock(&GlobalMid_Lock);
+ +		if (midQ->mid_state == MID_REQUEST_SUBMITTED ||
+ +		    midQ->mid_state == MID_RESPONSE_RECEIVED) {
+  			/* no longer considered to be "in-flight" */
+++<<<<<<< HEAD
+ +			midQ->callback = DeleteMidQEntry;
+ +			spin_unlock(&GlobalMid_Lock);
+++=======
++ 			midQ->callback = release_mid;
++ 			spin_unlock(&server->mid_lock);
+++>>>>>>> 70f08f914a37 (cifs: remove useless DeleteMidQEntry())
+  			add_credits(server, &credits, 0);
+  			return rc;
+  		}
+@@@ -1544,8 -1538,8 +1557,13 @@@ SendReceiveBlockingLock(const unsigned 
+  
+  	rc = cifs_sign_smb(in_buf, server, &midQ->sequence_number);
+  	if (rc) {
+++<<<<<<< HEAD
+ +		cifs_delete_mid(midQ);
+ +		mutex_unlock(&server->srv_mutex);
+++=======
++ 		delete_mid(midQ);
++ 		cifs_server_unlock(server);
+++>>>>>>> 70f08f914a37 (cifs: remove useless DeleteMidQEntry())
+  		return rc;
+  	}
+  
+@@@ -1558,10 -1552,10 +1576,10 @@@
+  	if (rc < 0)
+  		server->sequence_number -= 2;
+  
+ -	cifs_server_unlock(server);
+ +	mutex_unlock(&server->srv_mutex);
+  
+  	if (rc < 0) {
+- 		cifs_delete_mid(midQ);
++ 		delete_mid(midQ);
+  		return rc;
+  	}
+  
+@@@ -1604,15 -1598,14 +1622,20 @@@
+  		rc = wait_for_response(server, midQ);
+  		if (rc) {
+  			send_cancel(server, &rqst, midQ);
+ -			spin_lock(&server->mid_lock);
+ -			if (midQ->mid_state == MID_REQUEST_SUBMITTED) {
+ +			spin_lock(&GlobalMid_Lock);
+ +			if (midQ->mid_state == MID_REQUEST_SUBMITTED ||
+ +			    midQ->mid_state == MID_RESPONSE_RECEIVED) {
+  				/* no longer considered to be "in-flight" */
+++<<<<<<< HEAD
+ +				midQ->callback = DeleteMidQEntry;
+ +				spin_unlock(&GlobalMid_Lock);
+++=======
++ 				midQ->callback = release_mid;
++ 				spin_unlock(&server->mid_lock);
+++>>>>>>> 70f08f914a37 (cifs: remove useless DeleteMidQEntry())
+  				return rc;
+  			}
+ -			spin_unlock(&server->mid_lock);
+ +			spin_unlock(&GlobalMid_Lock);
+  		}
+  
+  		/* We got the response - restart system call. */
+diff --git a/fs/cifs/cifsproto.h b/fs/cifs/cifsproto.h
+index 7f8e1bfc462e..697d1d6ab799 100644
+--- a/fs/cifs/cifsproto.h
++++ b/fs/cifs/cifsproto.h
+@@ -79,11 +79,10 @@ extern char *cifs_compose_mount_options(const char *sb_mountdata,
+ 		const char *fullpath, const struct dfs_info3_param *ref,
+ 		char **devname);
+ /* extern void renew_parental_timestamps(struct dentry *direntry);*/
+-extern struct mid_q_entry *AllocMidQEntry(const struct smb_hdr *smb_buffer,
+-					struct TCP_Server_Info *server);
+-extern void DeleteMidQEntry(struct mid_q_entry *midEntry);
+-extern void cifs_delete_mid(struct mid_q_entry *mid);
+-extern void cifs_mid_q_entry_release(struct mid_q_entry *midEntry);
++extern struct mid_q_entry *alloc_mid(const struct smb_hdr *,
++				     struct TCP_Server_Info *);
++extern void delete_mid(struct mid_q_entry *mid);
++extern void release_mid(struct mid_q_entry *mid);
+ extern void cifs_wake_up_task(struct mid_q_entry *mid);
+ extern int cifs_handle_standard(struct TCP_Server_Info *server,
+ 				struct mid_q_entry *mid);
+diff --git a/fs/cifs/cifssmb.c b/fs/cifs/cifssmb.c
+index 031af258a3f0..dc85830a3bcd 100644
+--- a/fs/cifs/cifssmb.c
++++ b/fs/cifs/cifssmb.c
+@@ -738,7 +738,7 @@ cifs_echo_callback(struct mid_q_entry *mid)
+ 	struct TCP_Server_Info *server = mid->callback_data;
+ 	struct cifs_credits credits = { .value = 1, .instance = 0 };
+ 
+-	DeleteMidQEntry(mid);
++	release_mid(mid);
+ 	add_credits(server, &credits, CIFS_ECHO_OP);
+ }
+ 
+@@ -1652,7 +1652,7 @@ cifs_readv_callback(struct mid_q_entry *mid)
+ 	}
+ 
+ 	queue_work(cifsiod_wq, &rdata->work);
+-	DeleteMidQEntry(mid);
++	release_mid(mid);
+ 	add_credits(server, &credits, 0);
+ }
+ 
+@@ -2180,7 +2180,7 @@ cifs_writev_callback(struct mid_q_entry *mid)
+ 	}
+ 
+ 	queue_work(cifsiod_wq, &wdata->work);
+-	DeleteMidQEntry(mid);
++	release_mid(mid);
+ 	add_credits(tcon->ses->server, &credits, 0);
+ }
+ 
+diff --git a/fs/cifs/connect.c b/fs/cifs/connect.c
+index 0d5a58c8694e..cf6b84d152c8 100644
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@ -239,7 +239,7 @@ static void cifs_mark_tcp_ses_conns_for_reconnect(struct TCP_Server_Info *server
+ 	list_for_each_entry_safe(mid, nmid, &retry_list, qhead) {
+ 		list_del_init(&mid->qhead);
+ 		mid->callback(mid);
+-		cifs_mid_q_entry_release(mid);
++		release_mid(mid);
+ 	}
+ 
+ 	if (cifs_rdma_enabled(server)) {
+@@ -819,7 +819,7 @@ static void clean_demultiplex_info(struct TCP_Server_Info *server)
+ 			cifs_dbg(FYI, "Callback mid %llu\n", mid_entry->mid);
+ 			list_del_init(&mid_entry->qhead);
+ 			mid_entry->callback(mid_entry);
+-			cifs_mid_q_entry_release(mid_entry);
++			release_mid(mid_entry);
+ 		}
+ 		/* 1/8th of sec is more than enough time for them to exit */
+ 		msleep(125);
+@@ -1061,7 +1061,7 @@ cifs_demultiplex_thread(void *p)
+ 		if (length < 0) {
+ 			for (i = 0; i < num_mids; i++)
+ 				if (mids[i])
+-					cifs_mid_q_entry_release(mids[i]);
++					release_mid(mids[i]);
+ 			continue;
+ 		}
+ 
+@@ -1090,7 +1090,7 @@ cifs_demultiplex_thread(void *p)
+ 				if (!mids[i]->multiRsp || mids[i]->multiEnd)
+ 					mids[i]->callback(mids[i]);
+ 
+-				cifs_mid_q_entry_release(mids[i]);
++				release_mid(mids[i]);
+ 			} else if (server->ops->is_oplock_break &&
+ 				   server->ops->is_oplock_break(bufs[i],
+ 								server)) {
+diff --git a/fs/cifs/smb2ops.c b/fs/cifs/smb2ops.c
+index 645430921ef9..c5b07584f853 100644
+--- a/fs/cifs/smb2ops.c
++++ b/fs/cifs/smb2ops.c
+@@ -4891,7 +4891,7 @@ static void smb2_decrypt_offload(struct work_struct *work)
+ 				spin_unlock(&GlobalMid_Lock);
+ 			}
+ 		}
+-		cifs_mid_q_entry_release(mid);
++		release_mid(mid);
+ 	}
+ 
+ free_pages:
+diff --git a/fs/cifs/smb2pdu.c b/fs/cifs/smb2pdu.c
+index 0090c0a17099..1365585e3021 100644
+--- a/fs/cifs/smb2pdu.c
++++ b/fs/cifs/smb2pdu.c
+@@ -3731,7 +3731,7 @@ smb2_echo_callback(struct mid_q_entry *mid)
+ 		credits.instance = server->reconnect_instance;
+ 	}
+ 
+-	DeleteMidQEntry(mid);
++	release_mid(mid);
+ 	add_credits(server, &credits, CIFS_ECHO_OP);
+ }
+ 
+@@ -4102,7 +4102,7 @@ smb2_readv_callback(struct mid_q_entry *mid)
+ 				     rdata->offset, rdata->got_bytes);
+ 
+ 	queue_work(cifsiod_wq, &rdata->work);
+-	DeleteMidQEntry(mid);
++	release_mid(mid);
+ 	add_credits(server, &credits, 0);
+ }
+ 
+@@ -4341,7 +4341,7 @@ smb2_writev_callback(struct mid_q_entry *mid)
+ 				      wdata->offset, wdata->bytes);
+ 
+ 	queue_work(cifsiod_wq, &wdata->work);
+-	DeleteMidQEntry(mid);
++	release_mid(mid);
+ 	add_credits(server, &credits, 0);
+ }
+ 
+diff --git a/fs/cifs/smb2transport.c b/fs/cifs/smb2transport.c
+index d75ccf409af0..e04bf6fbeb8d 100644
+--- a/fs/cifs/smb2transport.c
++++ b/fs/cifs/smb2transport.c
+@@ -807,7 +807,7 @@ smb2_setup_request(struct cifs_ses *ses, struct TCP_Server_Info *server,
+ 	rc = smb2_sign_rqst(rqst, server);
+ 	if (rc) {
+ 		revert_current_mid_from_hdr(server, shdr);
+-		cifs_delete_mid(mid);
++		delete_mid(mid);
+ 		return ERR_PTR(rc);
+ 	}
+ 
+@@ -837,7 +837,7 @@ smb2_setup_async_request(struct TCP_Server_Info *server, struct smb_rqst *rqst)
+ 	rc = smb2_sign_rqst(rqst, server);
+ 	if (rc) {
+ 		revert_current_mid_from_hdr(server, shdr);
+-		DeleteMidQEntry(mid);
++		release_mid(mid);
+ 		return ERR_PTR(rc);
+ 	}
+ 
+* Unmerged path fs/cifs/transport.c
