@@ -1,0 +1,1622 @@
+memcg: protect concurrent access to mem_cgroup_idr
+
+jira LE-2169
+cve CVE-2024-43892
+Rebuild_History Non-Buildable kernel-4.18.0-553.27.1.el8_10
+commit-author Shakeel Butt <shakeel.butt@linux.dev>
+commit 9972605a238339b85bd16b084eed5f18414d22db
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.27.1.el8_10/9972605a.failed
+
+Commit 73f576c04b94 ("mm: memcontrol: fix cgroup creation failure after
+many small jobs") decoupled the memcg IDs from the CSS ID space to fix the
+cgroup creation failures.  It introduced IDR to maintain the memcg ID
+space.  The IDR depends on external synchronization mechanisms for
+modifications.  For the mem_cgroup_idr, the idr_alloc() and idr_replace()
+happen within css callback and thus are protected through cgroup_mutex
+from concurrent modifications.  However idr_remove() for mem_cgroup_idr
+was not protected against concurrency and can be run concurrently for
+different memcgs when they hit their refcnt to zero.  Fix that.
+
+We have been seeing list_lru based kernel crashes at a low frequency in
+our fleet for a long time.  These crashes were in different part of
+list_lru code including list_lru_add(), list_lru_del() and reparenting
+code.  Upon further inspection, it looked like for a given object (dentry
+and inode), the super_block's list_lru didn't have list_lru_one for the
+memcg of that object.  The initial suspicions were either the object is
+not allocated through kmem_cache_alloc_lru() or somehow
+memcg_list_lru_alloc() failed to allocate list_lru_one() for a memcg but
+returned success.  No evidence were found for these cases.
+
+Looking more deeply, we started seeing situations where valid memcg's id
+is not present in mem_cgroup_idr and in some cases multiple valid memcgs
+have same id and mem_cgroup_idr is pointing to one of them.  So, the most
+reasonable explanation is that these situations can happen due to race
+between multiple idr_remove() calls or race between
+idr_alloc()/idr_replace() and idr_remove().  These races are causing
+multiple memcgs to acquire the same ID and then offlining of one of them
+would cleanup list_lrus on the system for all of them.  Later access from
+other memcgs to the list_lru cause crashes due to missing list_lru_one.
+
+Link: https://lkml.kernel.org/r/20240802235822.1830976-1-shakeel.butt@linux.dev
+Fixes: 73f576c04b94 ("mm: memcontrol: fix cgroup creation failure after many small jobs")
+	Signed-off-by: Shakeel Butt <shakeel.butt@linux.dev>
+	Acked-by: Muchun Song <muchun.song@linux.dev>
+	Reviewed-by: Roman Gushchin <roman.gushchin@linux.dev>
+	Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit 9972605a238339b85bd16b084eed5f18414d22db)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memcontrol.c
+diff --cc mm/memcontrol.c
+index e99be5abe033,f29157288b7d..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -4245,1479 -3350,65 +4245,1512 @@@ static int memcg_stat_show(struct seq_f
+  	return 0;
+  }
+  
+ -static void memcg_wb_domain_exit(struct mem_cgroup *memcg)
+ +static u64 mem_cgroup_swappiness_read(struct cgroup_subsys_state *css,
+ +				      struct cftype *cft)
+  {
+ +	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+ +
+ +	return mem_cgroup_swappiness(memcg);
+  }
+  
+ -static void memcg_wb_domain_size_changed(struct mem_cgroup *memcg)
+ +static int mem_cgroup_swappiness_write(struct cgroup_subsys_state *css,
+ +				       struct cftype *cft, u64 val)
+  {
+ -}
+ +	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+  
+ -#endif	/* CONFIG_CGROUP_WRITEBACK */
+ +	if (val > 200)
+ +		return -EINVAL;
+  
+ -/*
+ - * Private memory cgroup IDR
+ - *
+ - * Swap-out records and page cache shadow entries need to store memcg
+ - * references in constrained space, so we maintain an ID space that is
+ - * limited to 16 bit (MEM_CGROUP_ID_MAX), limiting the total number of
+ - * memory-controlled cgroups to 64k.
+ - *
+ - * However, there usually are many references to the offline CSS after
+ - * the cgroup has been destroyed, such as page cache or reclaimable
+ - * slab objects, that don't need to hang on to the ID. We want to keep
+ - * those dead CSS from occupying IDs, or we might quickly exhaust the
+ - * relatively small ID space and prevent the creation of new cgroups
+ - * even when there are much fewer than 64k cgroups - possibly none.
+ - *
+ - * Maintain a private 16-bit ID space for memcg, and allow the ID to
+ - * be freed and recycled when it's no longer needed, which is usually
+ - * when the CSS is offlined.
+ - *
+ - * The only exception to that are records of swapped out tmpfs/shmem
+ - * pages that need to be attributed to live ancestors on swapin. But
+ - * those references are manageable from userspace.
+ - */
+ +	if (!mem_cgroup_is_root(memcg))
+ +		memcg->swappiness = val;
+ +	else
+ +		vm_swappiness = val;
+  
+ -#define MEM_CGROUP_ID_MAX	((1UL << MEM_CGROUP_ID_SHIFT) - 1)
+ -static DEFINE_IDR(mem_cgroup_idr);
+ -static DEFINE_SPINLOCK(memcg_idr_lock);
+ +	return 0;
+ +}
+  
+ -static int mem_cgroup_alloc_id(void)
+ +static void __mem_cgroup_threshold(struct mem_cgroup *memcg, bool swap)
+  {
+ -	int ret;
+ +	struct mem_cgroup_threshold_ary *t;
+ +	unsigned long usage;
+ +	int i;
+  
+ -	idr_preload(GFP_KERNEL);
+ -	spin_lock(&memcg_idr_lock);
+ -	ret = idr_alloc(&mem_cgroup_idr, NULL, 1, MEM_CGROUP_ID_MAX + 1,
+ -			GFP_NOWAIT);
+ -	spin_unlock(&memcg_idr_lock);
+ -	idr_preload_end();
+ -	return ret;
+ -}
+ +	rcu_read_lock();
+ +	if (!swap)
+ +		t = rcu_dereference(memcg->thresholds.primary);
+ +	else
+ +		t = rcu_dereference(memcg->memsw_thresholds.primary);
+ +
+ +	if (!t)
+ +		goto unlock;
+ +
+ +	usage = mem_cgroup_usage(memcg, swap);
+ +
+ +	/*
+ +	 * current_threshold points to threshold just below or equal to usage.
+ +	 * If it's not true, a threshold was crossed after last
+ +	 * call of __mem_cgroup_threshold().
+ +	 */
+ +	i = t->current_threshold;
+ +
+ +	/*
+ +	 * Iterate backward over array of thresholds starting from
+ +	 * current_threshold and check if a threshold is crossed.
+ +	 * If none of thresholds below usage is crossed, we read
+ +	 * only one element of the array here.
+ +	 */
+ +	for (; i >= 0 && unlikely(t->entries[i].threshold > usage); i--)
+ +		eventfd_signal(t->entries[i].eventfd, 1);
+ +
+ +	/* i = current_threshold + 1 */
+ +	i++;
+ +
+ +	/*
+ +	 * Iterate forward over array of thresholds starting from
+ +	 * current_threshold+1 and check if a threshold is crossed.
+ +	 * If none of thresholds above usage is crossed, we read
+ +	 * only one element of the array here.
+ +	 */
+ +	for (; i < t->size && unlikely(t->entries[i].threshold <= usage); i++)
+ +		eventfd_signal(t->entries[i].eventfd, 1);
+ +
+ +	/* Update current_threshold */
+ +	t->current_threshold = i - 1;
+ +unlock:
+ +	rcu_read_unlock();
+ +}
+ +
+ +static void mem_cgroup_threshold(struct mem_cgroup *memcg)
+ +{
+ +	while (memcg) {
+ +		__mem_cgroup_threshold(memcg, false);
+ +		if (do_memsw_account())
+ +			__mem_cgroup_threshold(memcg, true);
+ +
+ +		memcg = parent_mem_cgroup(memcg);
+ +	}
+ +}
+ +
+ +static int compare_thresholds(const void *a, const void *b)
+ +{
+ +	const struct mem_cgroup_threshold *_a = a;
+ +	const struct mem_cgroup_threshold *_b = b;
+ +
+ +	if (_a->threshold > _b->threshold)
+ +		return 1;
+ +
+ +	if (_a->threshold < _b->threshold)
+ +		return -1;
+ +
+ +	return 0;
+ +}
+ +
+ +static int mem_cgroup_oom_notify_cb(struct mem_cgroup *memcg)
+ +{
+ +	struct mem_cgroup_eventfd_list *ev;
+ +
+ +	spin_lock(&memcg_oom_lock);
+ +
+ +	list_for_each_entry(ev, &memcg->oom_notify, list)
+ +		eventfd_signal(ev->eventfd, 1);
+ +
+ +	spin_unlock(&memcg_oom_lock);
+ +	return 0;
+ +}
+ +
+ +static void mem_cgroup_oom_notify(struct mem_cgroup *memcg)
+ +{
+ +	struct mem_cgroup *iter;
+ +
+ +	for_each_mem_cgroup_tree(iter, memcg)
+ +		mem_cgroup_oom_notify_cb(iter);
+ +}
+ +
+ +static int __mem_cgroup_usage_register_event(struct mem_cgroup *memcg,
+ +	struct eventfd_ctx *eventfd, const char *args, enum res_type type)
+ +{
+ +	struct mem_cgroup_thresholds *thresholds;
+ +	struct mem_cgroup_threshold_ary *new;
+ +	unsigned long threshold;
+ +	unsigned long usage;
+ +	int i, size, ret;
+ +
+ +	ret = page_counter_memparse(args, "-1", &threshold);
+ +	if (ret)
+ +		return ret;
+ +
+ +	mutex_lock(&memcg->thresholds_lock);
+ +
+ +	if (type == _MEM) {
+ +		thresholds = &memcg->thresholds;
+ +		usage = mem_cgroup_usage(memcg, false);
+ +	} else if (type == _MEMSWAP) {
+ +		thresholds = &memcg->memsw_thresholds;
+ +		usage = mem_cgroup_usage(memcg, true);
+ +	} else
+ +		BUG();
+ +
+ +	/* Check if a threshold crossed before adding a new one */
+ +	if (thresholds->primary)
+ +		__mem_cgroup_threshold(memcg, type == _MEMSWAP);
+ +
+ +	size = thresholds->primary ? thresholds->primary->size + 1 : 1;
+ +
+ +	/* Allocate memory for new array of thresholds */
+ +	new = kmalloc(sizeof(*new) + size * sizeof(struct mem_cgroup_threshold),
+ +			GFP_KERNEL);
+ +	if (!new) {
+ +		ret = -ENOMEM;
+ +		goto unlock;
+ +	}
+ +	new->size = size;
+ +
+ +	/* Copy thresholds (if any) to new array */
+ +	if (thresholds->primary) {
+ +		memcpy(new->entries, thresholds->primary->entries, (size - 1) *
+ +				sizeof(struct mem_cgroup_threshold));
+ +	}
+ +
+ +	/* Add new threshold */
+ +	new->entries[size - 1].eventfd = eventfd;
+ +	new->entries[size - 1].threshold = threshold;
+ +
+ +	/* Sort thresholds. Registering of new threshold isn't time-critical */
+ +	sort(new->entries, size, sizeof(struct mem_cgroup_threshold),
+ +			compare_thresholds, NULL);
+ +
+ +	/* Find current threshold */
+ +	new->current_threshold = -1;
+ +	for (i = 0; i < size; i++) {
+ +		if (new->entries[i].threshold <= usage) {
+ +			/*
+ +			 * new->current_threshold will not be used until
+ +			 * rcu_assign_pointer(), so it's safe to increment
+ +			 * it here.
+ +			 */
+ +			++new->current_threshold;
+ +		} else
+ +			break;
+ +	}
+ +
+ +	/* Free old spare buffer and save old primary buffer as spare */
+ +	kfree(thresholds->spare);
+ +	thresholds->spare = thresholds->primary;
+ +
+ +	rcu_assign_pointer(thresholds->primary, new);
+ +
+ +	/* To be sure that nobody uses thresholds */
+ +	synchronize_rcu();
+ +
+ +unlock:
+ +	mutex_unlock(&memcg->thresholds_lock);
+ +
+ +	return ret;
+ +}
+ +
+ +static int mem_cgroup_usage_register_event(struct mem_cgroup *memcg,
+ +	struct eventfd_ctx *eventfd, const char *args)
+ +{
+ +	return __mem_cgroup_usage_register_event(memcg, eventfd, args, _MEM);
+ +}
+ +
+ +static int memsw_cgroup_usage_register_event(struct mem_cgroup *memcg,
+ +	struct eventfd_ctx *eventfd, const char *args)
+ +{
+ +	return __mem_cgroup_usage_register_event(memcg, eventfd, args, _MEMSWAP);
+ +}
+ +
+ +static void __mem_cgroup_usage_unregister_event(struct mem_cgroup *memcg,
+ +	struct eventfd_ctx *eventfd, enum res_type type)
+ +{
+ +	struct mem_cgroup_thresholds *thresholds;
+ +	struct mem_cgroup_threshold_ary *new;
+ +	unsigned long usage;
+ +	int i, j, size, entries;
+ +
+ +	mutex_lock(&memcg->thresholds_lock);
+ +
+ +	if (type == _MEM) {
+ +		thresholds = &memcg->thresholds;
+ +		usage = mem_cgroup_usage(memcg, false);
+ +	} else if (type == _MEMSWAP) {
+ +		thresholds = &memcg->memsw_thresholds;
+ +		usage = mem_cgroup_usage(memcg, true);
+ +	} else
+ +		BUG();
+ +
+ +	if (!thresholds->primary)
+ +		goto unlock;
+ +
+ +	/* Check if a threshold crossed before removing */
+ +	__mem_cgroup_threshold(memcg, type == _MEMSWAP);
+ +
+ +	/* Calculate new number of threshold */
+ +	size = entries = 0;
+ +	for (i = 0; i < thresholds->primary->size; i++) {
+ +		if (thresholds->primary->entries[i].eventfd != eventfd)
+ +			size++;
+ +		else
+ +			entries++;
+ +	}
+ +
+ +	new = thresholds->spare;
+ +
+ +	/* If no items related to eventfd have been cleared, nothing to do */
+ +	if (!entries)
+ +		goto unlock;
+ +
+ +	/* Set thresholds array to NULL if we don't have thresholds */
+ +	if (!size) {
+ +		kfree(new);
+ +		new = NULL;
+ +		goto swap_buffers;
+ +	}
+ +
+ +	new->size = size;
+ +
+ +	/* Copy thresholds and find current threshold */
+ +	new->current_threshold = -1;
+ +	for (i = 0, j = 0; i < thresholds->primary->size; i++) {
+ +		if (thresholds->primary->entries[i].eventfd == eventfd)
+ +			continue;
+ +
+ +		new->entries[j] = thresholds->primary->entries[i];
+ +		if (new->entries[j].threshold <= usage) {
+ +			/*
+ +			 * new->current_threshold will not be used
+ +			 * until rcu_assign_pointer(), so it's safe to increment
+ +			 * it here.
+ +			 */
+ +			++new->current_threshold;
+ +		}
+ +		j++;
+ +	}
+ +
+ +swap_buffers:
+ +	/* Swap primary and spare array */
+ +	thresholds->spare = thresholds->primary;
+ +
+ +	rcu_assign_pointer(thresholds->primary, new);
+ +
+ +	/* To be sure that nobody uses thresholds */
+ +	synchronize_rcu();
+ +
+ +	/* If all events are unregistered, free the spare array */
+ +	if (!new) {
+ +		kfree(thresholds->spare);
+ +		thresholds->spare = NULL;
+ +	}
+ +unlock:
+ +	mutex_unlock(&memcg->thresholds_lock);
+ +}
+ +
+ +static void mem_cgroup_usage_unregister_event(struct mem_cgroup *memcg,
+ +	struct eventfd_ctx *eventfd)
+ +{
+ +	return __mem_cgroup_usage_unregister_event(memcg, eventfd, _MEM);
+ +}
+ +
+ +static void memsw_cgroup_usage_unregister_event(struct mem_cgroup *memcg,
+ +	struct eventfd_ctx *eventfd)
+ +{
+ +	return __mem_cgroup_usage_unregister_event(memcg, eventfd, _MEMSWAP);
+ +}
+ +
+ +static int mem_cgroup_oom_register_event(struct mem_cgroup *memcg,
+ +	struct eventfd_ctx *eventfd, const char *args)
+ +{
+ +	struct mem_cgroup_eventfd_list *event;
+ +
+ +	event = kmalloc(sizeof(*event),	GFP_KERNEL);
+ +	if (!event)
+ +		return -ENOMEM;
+ +
+ +	spin_lock(&memcg_oom_lock);
+ +
+ +	event->eventfd = eventfd;
+ +	list_add(&event->list, &memcg->oom_notify);
+ +
+ +	/* already in OOM ? */
+ +	if (memcg->under_oom)
+ +		eventfd_signal(eventfd, 1);
+ +	spin_unlock(&memcg_oom_lock);
+ +
+ +	return 0;
+ +}
+ +
+ +static void mem_cgroup_oom_unregister_event(struct mem_cgroup *memcg,
+ +	struct eventfd_ctx *eventfd)
+ +{
+ +	struct mem_cgroup_eventfd_list *ev, *tmp;
+ +
+ +	spin_lock(&memcg_oom_lock);
+ +
+ +	list_for_each_entry_safe(ev, tmp, &memcg->oom_notify, list) {
+ +		if (ev->eventfd == eventfd) {
+ +			list_del(&ev->list);
+ +			kfree(ev);
+ +		}
+ +	}
+ +
+ +	spin_unlock(&memcg_oom_lock);
+ +}
+ +
+ +static int mem_cgroup_oom_control_read(struct seq_file *sf, void *v)
+ +{
+ +	struct mem_cgroup *memcg = mem_cgroup_from_seq(sf);
+ +
+ +	seq_printf(sf, "oom_kill_disable %d\n", memcg->oom_kill_disable);
+ +	seq_printf(sf, "under_oom %d\n", (bool)memcg->under_oom);
+ +	seq_printf(sf, "oom_kill %lu\n",
+ +		   atomic_long_read(&memcg->memory_events[MEMCG_OOM_KILL]));
+ +	return 0;
+ +}
+ +
+ +static int mem_cgroup_oom_control_write(struct cgroup_subsys_state *css,
+ +	struct cftype *cft, u64 val)
+ +{
+ +	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+ +
+ +	/* cannot set to root cgroup and only 0 and 1 are allowed */
+ +	if (mem_cgroup_is_root(memcg) || !((val == 0) || (val == 1)))
+ +		return -EINVAL;
+ +
+ +	memcg->oom_kill_disable = val;
+ +	if (!val)
+ +		memcg_oom_recover(memcg);
+ +
+ +	return 0;
+ +}
+ +
+ +#ifdef CONFIG_CGROUP_WRITEBACK
+ +
+ +#include <trace/events/writeback.h>
+ +
+ +static int memcg_wb_domain_init(struct mem_cgroup *memcg, gfp_t gfp)
+ +{
+ +	return wb_domain_init(&memcg->cgwb_domain, gfp);
+ +}
+ +
+ +static void memcg_wb_domain_exit(struct mem_cgroup *memcg)
+ +{
+ +	wb_domain_exit(&memcg->cgwb_domain);
+ +}
+ +
+ +static void memcg_wb_domain_size_changed(struct mem_cgroup *memcg)
+ +{
+ +	wb_domain_size_changed(&memcg->cgwb_domain);
+ +}
+ +
+ +struct wb_domain *mem_cgroup_wb_domain(struct bdi_writeback *wb)
+ +{
+ +	struct mem_cgroup *memcg = mem_cgroup_from_css(wb->memcg_css);
+ +
+ +	if (!memcg->css.parent)
+ +		return NULL;
+ +
+ +	return &memcg->cgwb_domain;
+ +}
+ +
+ +/**
+ + * mem_cgroup_wb_stats - retrieve writeback related stats from its memcg
+ + * @wb: bdi_writeback in question
+ + * @pfilepages: out parameter for number of file pages
+ + * @pheadroom: out parameter for number of allocatable pages according to memcg
+ + * @pdirty: out parameter for number of dirty pages
+ + * @pwriteback: out parameter for number of pages under writeback
+ + *
+ + * Determine the numbers of file, headroom, dirty, and writeback pages in
+ + * @wb's memcg.  File, dirty and writeback are self-explanatory.  Headroom
+ + * is a bit more involved.
+ + *
+ + * A memcg's headroom is "min(max, high) - used".  In the hierarchy, the
+ + * headroom is calculated as the lowest headroom of itself and the
+ + * ancestors.  Note that this doesn't consider the actual amount of
+ + * available memory in the system.  The caller should further cap
+ + * *@pheadroom accordingly.
+ + */
+ +void mem_cgroup_wb_stats(struct bdi_writeback *wb, unsigned long *pfilepages,
+ +			 unsigned long *pheadroom, unsigned long *pdirty,
+ +			 unsigned long *pwriteback)
+ +{
+ +	struct mem_cgroup *memcg = mem_cgroup_from_css(wb->memcg_css);
+ +	struct mem_cgroup *parent;
+ +
+ +	mem_cgroup_flush_stats();
+ +
+ +	*pdirty = memcg_page_state(memcg, NR_FILE_DIRTY);
+ +	*pwriteback = memcg_page_state(memcg, NR_WRITEBACK);
+ +	*pfilepages = memcg_page_state(memcg, NR_INACTIVE_FILE) +
+ +			memcg_page_state(memcg, NR_ACTIVE_FILE);
+ +
+ +	*pheadroom = PAGE_COUNTER_MAX;
+ +	while ((parent = parent_mem_cgroup(memcg))) {
+ +		unsigned long ceiling = min(READ_ONCE(memcg->memory.max),
+ +					    READ_ONCE(memcg->memory.high));
+ +		unsigned long used = page_counter_read(&memcg->memory);
+ +
+ +		*pheadroom = min(*pheadroom, ceiling - min(ceiling, used));
+ +		memcg = parent;
+ +	}
+ +}
+ +
+ +/*
+ + * Foreign dirty flushing
+ + *
+ + * There's an inherent mismatch between memcg and writeback.  The former
+ + * tracks ownership per-page while the latter per-inode.  This was a
+ + * deliberate design decision because honoring per-page ownership in the
+ + * writeback path is complicated, may lead to higher CPU and IO overheads
+ + * and deemed unnecessary given that write-sharing an inode across
+ + * different cgroups isn't a common use-case.
+ + *
+ + * Combined with inode majority-writer ownership switching, this works well
+ + * enough in most cases but there are some pathological cases.  For
+ + * example, let's say there are two cgroups A and B which keep writing to
+ + * different but confined parts of the same inode.  B owns the inode and
+ + * A's memory is limited far below B's.  A's dirty ratio can rise enough to
+ + * trigger balance_dirty_pages() sleeps but B's can be low enough to avoid
+ + * triggering background writeback.  A will be slowed down without a way to
+ + * make writeback of the dirty pages happen.
+ + *
+ + * Conditions like the above can lead to a cgroup getting repeatedly and
+ + * severely throttled after making some progress after each
+ + * dirty_expire_interval while the underlying IO device is almost
+ + * completely idle.
+ + *
+ + * Solving this problem completely requires matching the ownership tracking
+ + * granularities between memcg and writeback in either direction.  However,
+ + * the more egregious behaviors can be avoided by simply remembering the
+ + * most recent foreign dirtying events and initiating remote flushes on
+ + * them when local writeback isn't enough to keep the memory clean enough.
+ + *
+ + * The following two functions implement such mechanism.  When a foreign
+ + * page - a page whose memcg and writeback ownerships don't match - is
+ + * dirtied, mem_cgroup_track_foreign_dirty() records the inode owning
+ + * bdi_writeback on the page owning memcg.  When balance_dirty_pages()
+ + * decides that the memcg needs to sleep due to high dirty ratio, it calls
+ + * mem_cgroup_flush_foreign() which queues writeback on the recorded
+ + * foreign bdi_writebacks which haven't expired.  Both the numbers of
+ + * recorded bdi_writebacks and concurrent in-flight foreign writebacks are
+ + * limited to MEMCG_CGWB_FRN_CNT.
+ + *
+ + * The mechanism only remembers IDs and doesn't hold any object references.
+ + * As being wrong occasionally doesn't matter, updates and accesses to the
+ + * records are lockless and racy.
+ + */
+ +void mem_cgroup_track_foreign_dirty_slowpath(struct page *page,
+ +					     struct bdi_writeback *wb)
+ +{
+ +	struct mem_cgroup *memcg = page_memcg(page);
+ +	struct memcg_cgwb_frn *frn;
+ +	u64 now = get_jiffies_64();
+ +	u64 oldest_at = now;
+ +	int oldest = -1;
+ +	int i;
+ +
+ +	trace_track_foreign_dirty(page, wb);
+ +
+ +	/*
+ +	 * Pick the slot to use.  If there is already a slot for @wb, keep
+ +	 * using it.  If not replace the oldest one which isn't being
+ +	 * written out.
+ +	 */
+ +	for (i = 0; i < MEMCG_CGWB_FRN_CNT; i++) {
+ +		frn = &memcg->cgwb_frn[i];
+ +		if (frn->bdi_id == wb->bdi->id &&
+ +		    frn->memcg_id == wb->memcg_css->id)
+ +			break;
+ +		if (time_before64(frn->at, oldest_at) &&
+ +		    atomic_read(&frn->done.cnt) == 1) {
+ +			oldest = i;
+ +			oldest_at = frn->at;
+ +		}
+ +	}
+ +
+ +	if (i < MEMCG_CGWB_FRN_CNT) {
+ +		/*
+ +		 * Re-using an existing one.  Update timestamp lazily to
+ +		 * avoid making the cacheline hot.  We want them to be
+ +		 * reasonably up-to-date and significantly shorter than
+ +		 * dirty_expire_interval as that's what expires the record.
+ +		 * Use the shorter of 1s and dirty_expire_interval / 8.
+ +		 */
+ +		unsigned long update_intv =
+ +			min_t(unsigned long, HZ,
+ +			      msecs_to_jiffies(dirty_expire_interval * 10) / 8);
+ +
+ +		if (time_before64(frn->at, now - update_intv))
+ +			frn->at = now;
+ +	} else if (oldest >= 0) {
+ +		/* replace the oldest free one */
+ +		frn = &memcg->cgwb_frn[oldest];
+ +		frn->bdi_id = wb->bdi->id;
+ +		frn->memcg_id = wb->memcg_css->id;
+ +		frn->at = now;
+ +	}
+ +}
+ +
+ +/* issue foreign writeback flushes for recorded foreign dirtying events */
+ +void mem_cgroup_flush_foreign(struct bdi_writeback *wb)
+ +{
+ +	struct mem_cgroup *memcg = mem_cgroup_from_css(wb->memcg_css);
+ +	unsigned long intv = msecs_to_jiffies(dirty_expire_interval * 10);
+ +	u64 now = jiffies_64;
+ +	int i;
+ +
+ +	for (i = 0; i < MEMCG_CGWB_FRN_CNT; i++) {
+ +		struct memcg_cgwb_frn *frn = &memcg->cgwb_frn[i];
+ +
+ +		/*
+ +		 * If the record is older than dirty_expire_interval,
+ +		 * writeback on it has already started.  No need to kick it
+ +		 * off again.  Also, don't start a new one if there's
+ +		 * already one in flight.
+ +		 */
+ +		if (time_after64(frn->at, now - intv) &&
+ +		    atomic_read(&frn->done.cnt) == 1) {
+ +			frn->at = 0;
+ +			trace_flush_foreign(wb, frn->bdi_id, frn->memcg_id);
+ +			cgroup_writeback_by_id(frn->bdi_id, frn->memcg_id,
+ +					       WB_REASON_FOREIGN_FLUSH,
+ +					       &frn->done);
+ +		}
+ +	}
+ +}
+ +
+ +#else	/* CONFIG_CGROUP_WRITEBACK */
+ +
+ +static int memcg_wb_domain_init(struct mem_cgroup *memcg, gfp_t gfp)
+ +{
+ +	return 0;
+ +}
+ +
+ +static void memcg_wb_domain_exit(struct mem_cgroup *memcg)
+ +{
+ +}
+ +
+ +static void memcg_wb_domain_size_changed(struct mem_cgroup *memcg)
+ +{
+ +}
+ +
+ +#endif	/* CONFIG_CGROUP_WRITEBACK */
+ +
+ +/*
+ + * DO NOT USE IN NEW FILES.
+ + *
+ + * "cgroup.event_control" implementation.
+ + *
+ + * This is way over-engineered.  It tries to support fully configurable
+ + * events for each user.  Such level of flexibility is completely
+ + * unnecessary especially in the light of the planned unified hierarchy.
+ + *
+ + * Please deprecate this and replace with something simpler if at all
+ + * possible.
+ + */
+ +
+ +/*
+ + * Unregister event and free resources.
+ + *
+ + * Gets called from workqueue.
+ + */
+ +static void memcg_event_remove(struct work_struct *work)
+ +{
+ +	struct mem_cgroup_event *event =
+ +		container_of(work, struct mem_cgroup_event, remove);
+ +	struct mem_cgroup *memcg = event->memcg;
+ +
+ +	remove_wait_queue(event->wqh, &event->wait);
+ +
+ +	event->unregister_event(memcg, event->eventfd);
+ +
+ +	/* Notify userspace the event is going away. */
+ +	eventfd_signal(event->eventfd, 1);
+ +
+ +	eventfd_ctx_put(event->eventfd);
+ +	kfree(event);
+ +	css_put(&memcg->css);
+ +}
+ +
+ +/*
+ + * Gets called on EPOLLHUP on eventfd when user closes it.
+ + *
+ + * Called with wqh->lock held and interrupts disabled.
+ + */
+ +static int memcg_event_wake(wait_queue_entry_t *wait, unsigned mode,
+ +			    int sync, void *key)
+ +{
+ +	struct mem_cgroup_event *event =
+ +		container_of(wait, struct mem_cgroup_event, wait);
+ +	struct mem_cgroup *memcg = event->memcg;
+ +	__poll_t flags = key_to_poll(key);
+ +
+ +	if (flags & EPOLLHUP) {
+ +		/*
+ +		 * If the event has been detached at cgroup removal, we
+ +		 * can simply return knowing the other side will cleanup
+ +		 * for us.
+ +		 *
+ +		 * We can't race against event freeing since the other
+ +		 * side will require wqh->lock via remove_wait_queue(),
+ +		 * which we hold.
+ +		 */
+ +		spin_lock(&memcg->event_list_lock);
+ +		if (!list_empty(&event->list)) {
+ +			list_del_init(&event->list);
+ +			/*
+ +			 * We are in atomic context, but cgroup_event_remove()
+ +			 * may sleep, so we have to call it in workqueue.
+ +			 */
+ +			schedule_work(&event->remove);
+ +		}
+ +		spin_unlock(&memcg->event_list_lock);
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+ +static void memcg_event_ptable_queue_proc(struct file *file,
+ +		wait_queue_head_t *wqh, poll_table *pt)
+ +{
+ +	struct mem_cgroup_event *event =
+ +		container_of(pt, struct mem_cgroup_event, pt);
+ +
+ +	event->wqh = wqh;
+ +	add_wait_queue(wqh, &event->wait);
+ +}
+ +
+ +/*
+ + * DO NOT USE IN NEW FILES.
+ + *
+ + * Parse input and register new cgroup event handler.
+ + *
+ + * Input must be in format '<event_fd> <control_fd> <args>'.
+ + * Interpretation of args is defined by control file implementation.
+ + */
+ +static ssize_t memcg_write_event_control(struct kernfs_open_file *of,
+ +					 char *buf, size_t nbytes, loff_t off)
+ +{
+ +	struct cgroup_subsys_state *css = of_css(of);
+ +	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+ +	struct mem_cgroup_event *event;
+ +	struct cgroup_subsys_state *cfile_css;
+ +	unsigned int efd, cfd;
+ +	struct fd efile;
+ +	struct fd cfile;
+ +	struct dentry *cdentry;
+ +	const char *name;
+ +	char *endp;
+ +	int ret;
+ +
+ +	buf = strstrip(buf);
+ +
+ +	efd = simple_strtoul(buf, &endp, 10);
+ +	if (*endp != ' ')
+ +		return -EINVAL;
+ +	buf = endp + 1;
+ +
+ +	cfd = simple_strtoul(buf, &endp, 10);
+ +	if ((*endp != ' ') && (*endp != '\0'))
+ +		return -EINVAL;
+ +	buf = endp + 1;
+ +
+ +	event = kzalloc(sizeof(*event), GFP_KERNEL);
+ +	if (!event)
+ +		return -ENOMEM;
+ +
+ +	event->memcg = memcg;
+ +	INIT_LIST_HEAD(&event->list);
+ +	init_poll_funcptr(&event->pt, memcg_event_ptable_queue_proc);
+ +	init_waitqueue_func_entry(&event->wait, memcg_event_wake);
+ +	INIT_WORK(&event->remove, memcg_event_remove);
+ +
+ +	efile = fdget(efd);
+ +	if (!efile.file) {
+ +		ret = -EBADF;
+ +		goto out_kfree;
+ +	}
+ +
+ +	event->eventfd = eventfd_ctx_fileget(efile.file);
+ +	if (IS_ERR(event->eventfd)) {
+ +		ret = PTR_ERR(event->eventfd);
+ +		goto out_put_efile;
+ +	}
+ +
+ +	cfile = fdget(cfd);
+ +	if (!cfile.file) {
+ +		ret = -EBADF;
+ +		goto out_put_eventfd;
+ +	}
+ +
+ +	/* the process need read permission on control file */
+ +	/* AV: shouldn't we check that it's been opened for read instead? */
+ +	ret = inode_permission(file_inode(cfile.file), MAY_READ);
+ +	if (ret < 0)
+ +		goto out_put_cfile;
+ +
+ +	/*
+ +	 * The control file must be a regular cgroup1 file. As a regular cgroup
+ +	 * file can't be renamed, it's safe to access its name afterwards.
+ +	 */
+ +	cdentry = cfile.file->f_path.dentry;
+ +	if (cdentry->d_sb->s_type != &cgroup_fs_type || !d_is_reg(cdentry)) {
+ +		ret = -EINVAL;
+ +		goto out_put_cfile;
+ +	}
+ +
+ +	/*
+ +	 * Determine the event callbacks and set them in @event.  This used
+ +	 * to be done via struct cftype but cgroup core no longer knows
+ +	 * about these events.  The following is crude but the whole thing
+ +	 * is for compatibility anyway.
+ +	 *
+ +	 * DO NOT ADD NEW FILES.
+ +	 */
+ +	name = cdentry->d_name.name;
+ +
+ +	if (!strcmp(name, "memory.usage_in_bytes")) {
+ +		event->register_event = mem_cgroup_usage_register_event;
+ +		event->unregister_event = mem_cgroup_usage_unregister_event;
+ +	} else if (!strcmp(name, "memory.oom_control")) {
+ +		event->register_event = mem_cgroup_oom_register_event;
+ +		event->unregister_event = mem_cgroup_oom_unregister_event;
+ +	} else if (!strcmp(name, "memory.pressure_level")) {
+ +		event->register_event = vmpressure_register_event;
+ +		event->unregister_event = vmpressure_unregister_event;
+ +	} else if (!strcmp(name, "memory.memsw.usage_in_bytes")) {
+ +		event->register_event = memsw_cgroup_usage_register_event;
+ +		event->unregister_event = memsw_cgroup_usage_unregister_event;
+ +	} else {
+ +		ret = -EINVAL;
+ +		goto out_put_cfile;
+ +	}
+ +
+ +	/*
+ +	 * Verify @cfile should belong to @css.  Also, remaining events are
+ +	 * automatically removed on cgroup destruction but the removal is
+ +	 * asynchronous, so take an extra ref on @css.
+ +	 */
+ +	cfile_css = css_tryget_online_from_dir(cdentry->d_parent,
+ +					       &memory_cgrp_subsys);
+ +	ret = -EINVAL;
+ +	if (IS_ERR(cfile_css))
+ +		goto out_put_cfile;
+ +	if (cfile_css != css) {
+ +		css_put(cfile_css);
+ +		goto out_put_cfile;
+ +	}
+ +
+ +	ret = event->register_event(memcg, event->eventfd, buf);
+ +	if (ret)
+ +		goto out_put_css;
+ +
+ +	vfs_poll(efile.file, &event->pt);
+ +
+ +	spin_lock(&memcg->event_list_lock);
+ +	list_add(&event->list, &memcg->event_list);
+ +	spin_unlock(&memcg->event_list_lock);
+ +
+ +	fdput(cfile);
+ +	fdput(efile);
+ +
+ +	return nbytes;
+ +
+ +out_put_css:
+ +	css_put(css);
+ +out_put_cfile:
+ +	fdput(cfile);
+ +out_put_eventfd:
+ +	eventfd_ctx_put(event->eventfd);
+ +out_put_efile:
+ +	fdput(efile);
+ +out_kfree:
+ +	kfree(event);
+ +
+ +	return ret;
+ +}
+ +
+ +static struct cftype mem_cgroup_legacy_files[] = {
+ +	{
+ +		.name = "usage_in_bytes",
+ +		.private = MEMFILE_PRIVATE(_MEM, RES_USAGE),
+ +		.read_u64 = mem_cgroup_read_u64,
+ +	},
+ +	{
+ +		.name = "max_usage_in_bytes",
+ +		.private = MEMFILE_PRIVATE(_MEM, RES_MAX_USAGE),
+ +		.write = mem_cgroup_reset,
+ +		.read_u64 = mem_cgroup_read_u64,
+ +	},
+ +	{
+ +		.name = "limit_in_bytes",
+ +		.private = MEMFILE_PRIVATE(_MEM, RES_LIMIT),
+ +		.write = mem_cgroup_write,
+ +		.read_u64 = mem_cgroup_read_u64,
+ +	},
+ +	{
+ +		.name = "soft_limit_in_bytes",
+ +		.private = MEMFILE_PRIVATE(_MEM, RES_SOFT_LIMIT),
+ +		.write = mem_cgroup_write,
+ +		.read_u64 = mem_cgroup_read_u64,
+ +	},
+ +	{
+ +		.name = "failcnt",
+ +		.private = MEMFILE_PRIVATE(_MEM, RES_FAILCNT),
+ +		.write = mem_cgroup_reset,
+ +		.read_u64 = mem_cgroup_read_u64,
+ +	},
+ +	{
+ +		.name = "stat",
+ +		.seq_show = memcg_stat_show,
+ +	},
+ +	{
+ +		.name = "force_empty",
+ +		.write = mem_cgroup_force_empty_write,
+ +	},
+ +	{
+ +		.name = "use_hierarchy",
+ +		.write_u64 = mem_cgroup_hierarchy_write,
+ +		.read_u64 = mem_cgroup_hierarchy_read,
+ +	},
+ +	{
+ +		.name = "cgroup.event_control",		/* XXX: for compat */
+ +		.write = memcg_write_event_control,
+ +		.flags = CFTYPE_NO_PREFIX | CFTYPE_WORLD_WRITABLE,
+ +	},
+ +	{
+ +		.name = "swappiness",
+ +		.read_u64 = mem_cgroup_swappiness_read,
+ +		.write_u64 = mem_cgroup_swappiness_write,
+ +	},
+ +	{
+ +		.name = "move_charge_at_immigrate",
+ +		.read_u64 = mem_cgroup_move_charge_read,
+ +		.write_u64 = mem_cgroup_move_charge_write,
+ +	},
+ +	{
+ +		.name = "oom_control",
+ +		.seq_show = mem_cgroup_oom_control_read,
+ +		.write_u64 = mem_cgroup_oom_control_write,
+ +		.private = MEMFILE_PRIVATE(_OOM_TYPE, OOM_CONTROL),
+ +	},
+ +	{
+ +		.name = "pressure_level",
+ +	},
+ +#ifdef CONFIG_NUMA
+ +	{
+ +		.name = "numa_stat",
+ +		.seq_show = memcg_numa_stat_show,
+ +	},
+ +#endif
+ +	{
+ +		.name = "kmem.limit_in_bytes",
+ +		.private = MEMFILE_PRIVATE(_KMEM, RES_LIMIT),
+ +		.write = mem_cgroup_write,
+ +		.read_u64 = mem_cgroup_read_u64,
+ +	},
+ +	{
+ +		.name = "kmem.usage_in_bytes",
+ +		.private = MEMFILE_PRIVATE(_KMEM, RES_USAGE),
+ +		.read_u64 = mem_cgroup_read_u64,
+ +	},
+ +	{
+ +		.name = "kmem.failcnt",
+ +		.private = MEMFILE_PRIVATE(_KMEM, RES_FAILCNT),
+ +		.write = mem_cgroup_reset,
+ +		.read_u64 = mem_cgroup_read_u64,
+ +	},
+ +	{
+ +		.name = "kmem.max_usage_in_bytes",
+ +		.private = MEMFILE_PRIVATE(_KMEM, RES_MAX_USAGE),
+ +		.write = mem_cgroup_reset,
+ +		.read_u64 = mem_cgroup_read_u64,
+ +	},
+ +#if defined(CONFIG_MEMCG_KMEM) && \
+ +	(defined(CONFIG_SLAB) || defined(CONFIG_SLUB_DEBUG))
+ +	{
+ +		.name = "kmem.slabinfo",
+ +		.seq_show = memcg_slab_show,
+ +	},
+ +#endif
+ +	{
+ +		.name = "kmem.tcp.limit_in_bytes",
+ +		.private = MEMFILE_PRIVATE(_TCP, RES_LIMIT),
+ +		.write = mem_cgroup_write,
+ +		.read_u64 = mem_cgroup_read_u64,
+ +	},
+ +	{
+ +		.name = "kmem.tcp.usage_in_bytes",
+ +		.private = MEMFILE_PRIVATE(_TCP, RES_USAGE),
+ +		.read_u64 = mem_cgroup_read_u64,
+ +	},
+ +	{
+ +		.name = "kmem.tcp.failcnt",
+ +		.private = MEMFILE_PRIVATE(_TCP, RES_FAILCNT),
+ +		.write = mem_cgroup_reset,
+ +		.read_u64 = mem_cgroup_read_u64,
+ +	},
+ +	{
+ +		.name = "kmem.tcp.max_usage_in_bytes",
+ +		.private = MEMFILE_PRIVATE(_TCP, RES_MAX_USAGE),
+ +		.write = mem_cgroup_reset,
+ +		.read_u64 = mem_cgroup_read_u64,
+ +	},
+ +	{ },	/* terminate */
+ +};
+ +
+ +/*
+ + * Private memory cgroup IDR
+ + *
+ + * Swap-out records and page cache shadow entries need to store memcg
+ + * references in constrained space, so we maintain an ID space that is
+ + * limited to 16 bit (MEM_CGROUP_ID_MAX), limiting the total number of
+ + * memory-controlled cgroups to 64k.
+ + *
+ + * However, there usually are many references to the offline CSS after
+ + * the cgroup has been destroyed, such as page cache or reclaimable
+ + * slab objects, that don't need to hang on to the ID. We want to keep
+ + * those dead CSS from occupying IDs, or we might quickly exhaust the
+ + * relatively small ID space and prevent the creation of new cgroups
+ + * even when there are much fewer than 64k cgroups - possibly none.
+ + *
+ + * Maintain a private 16-bit ID space for memcg, and allow the ID to
+ + * be freed and recycled when it's no longer needed, which is usually
+ + * when the CSS is offlined.
+ + *
+ + * The only exception to that are records of swapped out tmpfs/shmem
+ + * pages that need to be attributed to live ancestors on swapin. But
+ + * those references are manageable from userspace.
+ + */
+ +
+ +#define MEM_CGROUP_ID_MAX	((1UL << MEM_CGROUP_ID_SHIFT) - 1)
+ +static DEFINE_IDR(mem_cgroup_idr);
+++static DEFINE_SPINLOCK(memcg_idr_lock);
+++
+++static int mem_cgroup_alloc_id(void)
+++{
+++	int ret;
+++
+++	idr_preload(GFP_KERNEL);
+++	spin_lock(&memcg_idr_lock);
+++	ret = idr_alloc(&mem_cgroup_idr, NULL, 1, MEM_CGROUP_ID_MAX + 1,
+++			GFP_NOWAIT);
+++	spin_unlock(&memcg_idr_lock);
+++	idr_preload_end();
+++	return ret;
+++}
+ +
+ +static void mem_cgroup_id_remove(struct mem_cgroup *memcg)
+ +{
+ +	if (memcg->id.id > 0) {
+++		spin_lock(&memcg_idr_lock);
+ +		idr_remove(&mem_cgroup_idr, memcg->id.id);
+++		spin_unlock(&memcg_idr_lock);
+++
+ +		memcg->id.id = 0;
+ +	}
+ +}
+ +
+ +static void __maybe_unused mem_cgroup_id_get_many(struct mem_cgroup *memcg,
+ +						  unsigned int n)
+ +{
+ +	refcount_add(n, &memcg->id.ref);
+ +}
+ +
+ +static void mem_cgroup_id_put_many(struct mem_cgroup *memcg, unsigned int n)
+ +{
+ +	if (refcount_sub_and_test(n, &memcg->id.ref)) {
+ +		mem_cgroup_id_remove(memcg);
+ +
+ +		/* Memcg ID pins CSS */
+ +		css_put(&memcg->css);
+ +	}
+ +}
+ +
+ +static inline void mem_cgroup_id_put(struct mem_cgroup *memcg)
+ +{
+ +	mem_cgroup_id_put_many(memcg, 1);
+ +}
+ +
+ +/**
+ + * mem_cgroup_from_id - look up a memcg from a memcg id
+ + * @id: the memcg id to look up
+ + *
+ + * Caller must hold rcu_read_lock().
+ + */
+ +struct mem_cgroup *mem_cgroup_from_id(unsigned short id)
+ +{
+ +	WARN_ON_ONCE(!rcu_read_lock_held());
+ +	return idr_find(&mem_cgroup_idr, id);
+ +}
+ +
+ +#ifdef CONFIG_SHRINKER_DEBUG
+ +struct mem_cgroup *mem_cgroup_get_from_ino(unsigned long ino)
+ +{
+ +	struct cgroup *cgrp;
+ +	struct cgroup_subsys_state *css;
+ +	struct mem_cgroup *memcg;
+ +
+ +	cgrp = cgroup_get_from_id(ino);
+ +	if (IS_ERR(cgrp))
+ +		return ERR_CAST(cgrp);
+ +
+ +	css = cgroup_get_e_css(cgrp, &memory_cgrp_subsys);
+ +	if (css)
+ +		memcg = container_of(css, struct mem_cgroup, css);
+ +	else
+ +		memcg = ERR_PTR(-ENOENT);
+ +
+ +	cgroup_put(cgrp);
+ +
+ +	return memcg;
+ +}
+ +#endif
+ +
+ +static int alloc_mem_cgroup_per_node_info(struct mem_cgroup *memcg, int node)
+ +{
+ +	struct mem_cgroup_per_node *pn;
+ +	int tmp = node;
+ +	/*
+ +	 * This routine is called against possible nodes.
+ +	 * But it's BUG to call kmalloc() against offline node.
+ +	 *
+ +	 * TODO: this routine can waste much memory for nodes which will
+ +	 *       never be onlined. It's better to use memory hotplug callback
+ +	 *       function.
+ +	 */
+ +	if (!node_state(node, N_NORMAL_MEMORY))
+ +		tmp = -1;
+ +	pn = kzalloc_node(sizeof(*pn), GFP_KERNEL, tmp);
+ +	if (!pn)
+ +		return 1;
+ +
+ +	pn->lruvec_stats_percpu = alloc_percpu_gfp(struct lruvec_stats_percpu,
+ +						   GFP_KERNEL_ACCOUNT);
+ +	if (!pn->lruvec_stats_percpu) {
+ +		kfree(pn);
+ +		return 1;
+ +	}
+ +
+ +	lruvec_init(&pn->lruvec);
+ +	pn->usage_in_excess = 0;
+ +	pn->on_tree = false;
+ +	pn->memcg = memcg;
+ +	pn->nid = node;
+ +
+ +	memcg->nodeinfo[node] = pn;
+ +	return 0;
+ +}
+ +
+ +static void free_mem_cgroup_per_node_info(struct mem_cgroup *memcg, int node)
+ +{
+ +	struct mem_cgroup_per_node *pn = memcg->nodeinfo[node];
+ +
+ +	if (!pn)
+ +		return;
+ +
+ +	kfree(pn);
+ +}
+ +
+ +static void __mem_cgroup_free(struct mem_cgroup *memcg)
+ +{
+ +	int node;
+ +
+ +	for_each_node(node)
+ +		free_mem_cgroup_per_node_info(memcg, node);
+ +	kfree(memcg->vmstats);
+ +	kfree(memcg);
+ +}
+ +
+ +static void mem_cgroup_free(struct mem_cgroup *memcg)
+ +{
+ +	memcg_wb_domain_exit(memcg);
+ +	__mem_cgroup_free(memcg);
+ +}
+ +
+ +static struct mem_cgroup *mem_cgroup_alloc(void)
+ +{
+ +	struct mem_cgroup *memcg;
+ +	unsigned int size;
+ +	int node;
+ +	int __maybe_unused i;
+ +	long error = -ENOMEM;
+ +
+ +	size = sizeof(struct mem_cgroup);
+ +	size += nr_node_ids * sizeof(struct mem_cgroup_per_node *);
+ +
+ +	memcg = kzalloc(size, GFP_KERNEL);
+ +	if (!memcg)
+ +		return ERR_PTR(error);
+ +
+- 	memcg->id.id = idr_alloc(&mem_cgroup_idr, NULL,
+- 				 1, MEM_CGROUP_ID_MAX + 1, GFP_KERNEL);
+++	memcg->id.id = mem_cgroup_alloc_id();
+ +	if (memcg->id.id < 0) {
+ +		error = memcg->id.id;
+ +		goto fail;
+ +	}
+ +
+ +	memcg->vmstats = kzalloc(sizeof(struct memcg_vmstats), GFP_KERNEL);
+ +	if (!memcg->vmstats)
+ +		goto fail;
+ +
+ +	memcg->vmstats_percpu = alloc_percpu_gfp(struct memcg_vmstats_percpu,
+ +						 GFP_KERNEL_ACCOUNT);
+ +	if (!memcg->vmstats_percpu)
+ +		goto fail;
+ +
+ +	for_each_node(node)
+ +		if (alloc_mem_cgroup_per_node_info(memcg, node))
+ +			goto fail;
+ +
+ +	if (memcg_wb_domain_init(memcg, GFP_KERNEL))
+ +		goto fail;
+ +
+ +	INIT_WORK(&memcg->high_work, high_work_func);
+ +	INIT_LIST_HEAD(&memcg->oom_notify);
+ +	mutex_init(&memcg->thresholds_lock);
+ +	spin_lock_init(&memcg->move_lock);
+ +	vmpressure_init(&memcg->vmpressure);
+ +	INIT_LIST_HEAD(&memcg->event_list);
+ +	spin_lock_init(&memcg->event_list_lock);
+ +	memcg->socket_pressure = jiffies;
+ +#ifdef CONFIG_MEMCG_KMEM
+ +	memcg->kmemcg_id = -1;
+ +	INIT_LIST_HEAD(&memcg->objcg_list);
+ +#endif
+ +#ifdef CONFIG_CGROUP_WRITEBACK
+ +	INIT_LIST_HEAD(&memcg->cgwb_list);
+ +	for (i = 0; i < MEMCG_CGWB_FRN_CNT; i++)
+ +		memcg->cgwb_frn[i].done =
+ +			__WB_COMPLETION_INIT(&memcg_cgwb_frn_waitq);
+ +#endif
+ +#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ +	spin_lock_init(&memcg->deferred_split_queue.split_queue_lock);
+ +	INIT_LIST_HEAD(&memcg->deferred_split_queue.split_queue);
+ +	memcg->deferred_split_queue.split_queue_len = 0;
+ +#endif
+ +	idr_replace(&mem_cgroup_idr, memcg, memcg->id.id);
+ +	return memcg;
+ +fail:
+ +	mem_cgroup_id_remove(memcg);
+ +	__mem_cgroup_free(memcg);
+ +	return ERR_PTR(error);
+ +}
+ +
+ +/*
+ + * Flush and free the percpu stats
+ + */
+ +static void percpu_stats_free_rwork_fn(struct work_struct *work)
+ +{
+ +	struct mem_cgroup *memcg = container_of(to_rcu_work(work),
+ +						struct mem_cgroup,
+ +						percpu_stats_rwork);
+ +	int node;
+ +
+ +	if (cmpxchg(&memcg->percpu_stats_disabled, MEMCG_PERCPU_STATS_DISABLED,
+ +		    MEMCG_PERCPU_STATS_FLUSHING) != MEMCG_PERCPU_STATS_DISABLED) {
+ +		static DEFINE_RATELIMIT_STATE(_rs,
+ +					      DEFAULT_RATELIMIT_INTERVAL,
+ +					      DEFAULT_RATELIMIT_BURST);
+ +
+ +		if (__ratelimit(&_rs))
+ +			WARN(1, "percpu_stats_free_rwork_fn() called more than once!\n");
+ +		return;
+ +	}
+ +
+ +	cgroup_rstat_flush_hold(memcg->css.cgroup);
+ +	WRITE_ONCE(memcg->percpu_stats_disabled, MEMCG_PERCPU_STATS_FLUSHED);
+ +	cgroup_rstat_flush_release();
+ +
+ +	for_each_node(node) {
+ +		struct mem_cgroup_per_node *pn = memcg->nodeinfo[node];
+ +
+ +		if (pn)
+ +			free_percpu(pn->lruvec_stats_percpu);
+ +	}
+ +	free_percpu(memcg->vmstats_percpu);
+ +	WRITE_ONCE(memcg->percpu_stats_disabled, MEMCG_PERCPU_STATS_FREED);
+ +	css_put(&memcg->css);
+ +}
+ +
+ +static void memcg_percpu_stats_disable(struct mem_cgroup *memcg)
+ +{
+ +	/*
+ +	 * Block memcg from being freed before percpu_stats_free_rwork_fn()
+ +	 * is called. css_get() will succeed before a potential final
+ +	 * css_put() in mem_cgroup_id_put().
+ +	 */
+ +	css_get(&memcg->css);
+ +	mem_cgroup_id_put(memcg);
+ +	memcg->percpu_stats_disabled = MEMCG_PERCPU_STATS_DISABLED;
+ +	INIT_RCU_WORK(&memcg->percpu_stats_rwork, percpu_stats_free_rwork_fn);
+ +	queue_rcu_work(system_wq, &memcg->percpu_stats_rwork);
+ +}
+ +
+ +static struct cgroup_subsys_state * __ref
+ +mem_cgroup_css_alloc(struct cgroup_subsys_state *parent_css)
+ +{
+ +	struct mem_cgroup *parent = mem_cgroup_from_css(parent_css);
+ +	struct mem_cgroup *memcg, *old_memcg;
+ +	long error = -ENOMEM;
+ +
+ +	old_memcg = set_active_memcg(parent);
+ +	memcg = mem_cgroup_alloc();
+ +	set_active_memcg(old_memcg);
+ +	if (IS_ERR(memcg))
+ +		return ERR_CAST(memcg);
+ +
+ +	page_counter_set_high(&memcg->memory, PAGE_COUNTER_MAX);
+ +	memcg->soft_limit = PAGE_COUNTER_MAX;
+ +	page_counter_set_high(&memcg->swap, PAGE_COUNTER_MAX);
+ +	if (parent) {
+ +		memcg->swappiness = mem_cgroup_swappiness(parent);
+ +		memcg->oom_kill_disable = parent->oom_kill_disable;
+ +
+ +		page_counter_init(&memcg->memory, &parent->memory);
+ +		page_counter_init(&memcg->swap, &parent->swap);
+ +		page_counter_init(&memcg->kmem, &parent->kmem);
+ +		page_counter_init(&memcg->tcpmem, &parent->tcpmem);
+ +	} else {
+ +		init_memcg_events();
+ +		page_counter_init(&memcg->memory, NULL);
+ +		page_counter_init(&memcg->swap, NULL);
+ +		page_counter_init(&memcg->kmem, NULL);
+ +		page_counter_init(&memcg->tcpmem, NULL);
+ +
+ +		root_mem_cgroup = memcg;
+ +		return &memcg->css;
+ +	}
+ +
+ +	/* The following stuff does not apply to the root */
+ +	error = memcg_online_kmem(memcg);
+ +	if (error)
+ +		goto fail;
+ +
+ +	if (cgroup_subsys_on_dfl(memory_cgrp_subsys) && !cgroup_memory_nosocket)
+ +		static_branch_inc(&memcg_sockets_enabled_key);
+ +
+ +	return &memcg->css;
+ +fail:
+ +	mem_cgroup_id_remove(memcg);
+ +	mem_cgroup_free(memcg);
+ +	return ERR_PTR(error);
+ +}
+ +
+ +static int mem_cgroup_css_online(struct cgroup_subsys_state *css)
+ +{
+ +	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+ +
+ +	/*
+ +	 * A memcg must be visible for expand_shrinker_info()
+ +	 * by the time the maps are allocated. So, we allocate maps
+ +	 * here, when for_each_mem_cgroup() can't skip it.
+ +	 */
+ +	if (alloc_shrinker_info(memcg)) {
+ +		mem_cgroup_id_remove(memcg);
+ +		return -ENOMEM;
+ +	}
+ +
+ +	/* Online state pins memcg ID, memcg ID pins CSS */
+ +	refcount_set(&memcg->id.ref, 1);
+ +	css_get(css);
+ +
+++<<<<<<< HEAD
+ +	if (unlikely(mem_cgroup_is_root(memcg)))
+ +		queue_delayed_work(system_unbound_wq, &stats_flush_dwork,
+ +				   2UL*HZ);
+++=======
+++	/*
+++	 * Ensure mem_cgroup_from_id() works once we're fully online.
+++	 *
+++	 * We could do this earlier and require callers to filter with
+++	 * css_tryget_online(). But right now there are no users that
+++	 * need earlier access, and the workingset code relies on the
+++	 * cgroup tree linkage (mem_cgroup_get_nr_swap_pages()). So
+++	 * publish it here at the end of onlining. This matches the
+++	 * regular ID destruction during offlining.
+++	 */
+++	spin_lock(&memcg_idr_lock);
+++	idr_replace(&mem_cgroup_idr, memcg, memcg->id.id);
+++	spin_unlock(&memcg_idr_lock);
+++
+++>>>>>>> 9972605a2383 (memcg: protect concurrent access to mem_cgroup_idr)
+ +	return 0;
+ +}
+ +
+ +static void mem_cgroup_css_offline(struct cgroup_subsys_state *css)
+ +{
+ +	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+ +	struct mem_cgroup_event *event, *tmp;
+ +
+ +	/*
+ +	 * Unregister events and notify userspace.
+ +	 * Notify userspace about cgroup removing only after rmdir of cgroup
+ +	 * directory to avoid race between userspace and kernelspace.
+ +	 */
+ +	spin_lock(&memcg->event_list_lock);
+ +	list_for_each_entry_safe(event, tmp, &memcg->event_list, list) {
+ +		list_del_init(&event->list);
+ +		schedule_work(&event->remove);
+ +	}
+ +	spin_unlock(&memcg->event_list_lock);
+ +
+ +	page_counter_set_min(&memcg->memory, 0);
+ +	page_counter_set_low(&memcg->memory, 0);
+ +
+ +	memcg_offline_kmem(memcg);
+ +	reparent_shrinker_deferred(memcg);
+ +	wb_memcg_offline(memcg);
+ +
+ +	drain_all_stock(memcg);
+ +
+ +	memcg_percpu_stats_disable(memcg);
+ +}
+ +
+ +static void mem_cgroup_css_released(struct cgroup_subsys_state *css)
+ +{
+ +	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+ +
+ +	invalidate_reclaim_iterators(memcg);
+ +}
+ +
+ +static void mem_cgroup_css_free(struct cgroup_subsys_state *css)
+ +{
+ +	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+ +	int __maybe_unused i;
+ +
+ +#ifdef CONFIG_CGROUP_WRITEBACK
+ +	for (i = 0; i < MEMCG_CGWB_FRN_CNT; i++)
+ +		wb_wait_for_completion(&memcg->cgwb_frn[i].done);
+ +#endif
+ +	if (cgroup_subsys_on_dfl(memory_cgrp_subsys) && !cgroup_memory_nosocket)
+ +		static_branch_dec(&memcg_sockets_enabled_key);
+ +
+ +	if (!cgroup_subsys_on_dfl(memory_cgrp_subsys) && memcg->tcpmem_active)
+ +		static_branch_dec(&memcg_sockets_enabled_key);
+ +
+ +	vmpressure_cleanup(&memcg->vmpressure);
+ +	cancel_work_sync(&memcg->high_work);
+ +	mem_cgroup_remove_from_trees(memcg);
+ +	free_shrinker_info(memcg);
+ +	memcg_free_kmem(memcg);
+ +	mem_cgroup_free(memcg);
+ +}
+ +
+ +/**
+ + * mem_cgroup_css_reset - reset the states of a mem_cgroup
+ + * @css: the target css
+ + *
+ + * Reset the states of the mem_cgroup associated with @css.  This is
+ + * invoked when the userland requests disabling on the default hierarchy
+ + * but the memcg is pinned through dependency.  The memcg should stop
+ + * applying policies and should revert to the vanilla state as it may be
+ + * made visible again.
+ + *
+ + * The current implementation only resets the essential configurations.
+ + * This needs to be expanded to cover all the visible parts.
+ + */
+ +static void mem_cgroup_css_reset(struct cgroup_subsys_state *css)
+ +{
+ +	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+ +
+ +	page_counter_set_max(&memcg->memory, PAGE_COUNTER_MAX);
+ +	page_counter_set_max(&memcg->swap, PAGE_COUNTER_MAX);
+ +	page_counter_set_max(&memcg->kmem, PAGE_COUNTER_MAX);
+ +	page_counter_set_max(&memcg->tcpmem, PAGE_COUNTER_MAX);
+ +	page_counter_set_min(&memcg->memory, 0);
+ +	page_counter_set_low(&memcg->memory, 0);
+ +	page_counter_set_high(&memcg->memory, PAGE_COUNTER_MAX);
+ +	memcg->soft_limit = PAGE_COUNTER_MAX;
+ +	page_counter_set_high(&memcg->swap, PAGE_COUNTER_MAX);
+ +	memcg_wb_domain_size_changed(memcg);
+ +}
+ +
+ +static void mem_cgroup_css_rstat_flush(struct cgroup_subsys_state *css, int cpu)
+ +{
+ +	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+ +	struct mem_cgroup *parent = parent_mem_cgroup(memcg);
+ +	struct memcg_vmstats_percpu *statc;
+ +	long delta, v;
+ +	int i, nid;
+ +
+ +	if (memcg_percpu_stats_flushed(memcg))
+ +		return;
+ +
+ +	statc = per_cpu_ptr(memcg->vmstats_percpu, cpu);
+ +
+ +	for (i = 0; i < MEMCG_NR_STAT; i++) {
+ +		/*
+ +		 * Collect the aggregated propagation counts of groups
+ +		 * below us. We're in a per-cpu loop here and this is
+ +		 * a global counter, so the first cycle will get them.
+ +		 */
+ +		delta = memcg->vmstats->state_pending[i];
+ +		if (delta)
+ +			memcg->vmstats->state_pending[i] = 0;
+ +
+ +		/* Add CPU changes on this level since the last flush */
+ +		v = READ_ONCE(statc->state[i]);
+ +		if (v != statc->state_prev[i]) {
+ +			delta += v - statc->state_prev[i];
+ +			statc->state_prev[i] = v;
+ +		}
+ +
+ +		if (!delta)
+ +			continue;
+ +
+ +		/* Aggregate counts on this level and propagate upwards */
+ +		memcg->vmstats->state[i] += delta;
+ +		if (parent)
+ +			parent->vmstats->state_pending[i] += delta;
+ +	}
+ +
+ +	for (i = 0; i < NR_MEMCG_EVENTS; i++) {
+ +		delta = memcg->vmstats->events_pending[i];
+ +		if (delta)
+ +			memcg->vmstats->events_pending[i] = 0;
+ +
+ +		v = READ_ONCE(statc->events[i]);
+ +		if (v != statc->events_prev[i]) {
+ +			delta += v - statc->events_prev[i];
+ +			statc->events_prev[i] = v;
+ +		}
+ +
+ +		if (!delta)
+ +			continue;
+ +
+ +		memcg->vmstats->events[i] += delta;
+ +		if (parent)
+ +			parent->vmstats->events_pending[i] += delta;
+ +	}
+ +
+ +	for_each_node_state(nid, N_MEMORY) {
+ +		struct mem_cgroup_per_node *pn = memcg->nodeinfo[nid];
+ +		struct mem_cgroup_per_node *ppn = NULL;
+ +		struct lruvec_stats_percpu *lstatc;
+ +
+ +		if (parent)
+ +			ppn = parent->nodeinfo[nid];
+ +
+ +		lstatc = per_cpu_ptr(pn->lruvec_stats_percpu, cpu);
+ +
+ +		for (i = 0; i < NR_VM_NODE_STAT_ITEMS; i++) {
+ +			delta = pn->lruvec_stats.state_pending[i];
+ +			if (delta)
+ +				pn->lruvec_stats.state_pending[i] = 0;
+  
+ -static void mem_cgroup_id_remove(struct mem_cgroup *memcg)
+ -{
+ -	if (memcg->id.id > 0) {
+ -		spin_lock(&memcg_idr_lock);
+ -		idr_remove(&mem_cgroup_idr, memcg->id.id);
+ -		spin_unlock(&memcg_idr_lock);
+ +			v = READ_ONCE(lstatc->state[i]);
+ +			if (v != lstatc->state_prev[i]) {
+ +				delta += v - lstatc->state_prev[i];
+ +				lstatc->state_prev[i] = v;
+ +			}
+  
+ -		memcg->id.id = 0;
+ +			if (!delta)
+ +				continue;
+ +
+ +			pn->lruvec_stats.state[i] += delta;
+ +			if (ppn)
+ +				ppn->lruvec_stats.state_pending[i] += delta;
+ +		}
+  	}
+  }
+  
+* Unmerged path mm/memcontrol.c
