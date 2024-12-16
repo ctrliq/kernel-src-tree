@@ -324,9 +324,9 @@ enum {
 	GLF_DIRTY			= 6,
 	GLF_LFLUSH			= 7,
 	GLF_INVALIDATE_IN_PROGRESS	= 8,
-	GLF_REPLY_PENDING		= 9,
+	GLF_HAVE_REPLY			= 9,
 	GLF_INITIAL			= 10,
-	GLF_FROZEN			= 11,
+	GLF_HAVE_FROZEN_REPLY		= 11,
 	GLF_INSTANTIATE_IN_PROG		= 12, /* instantiate happening now */
 	GLF_LRU				= 13,
 	GLF_OBJECT			= 14, /* Used only for tracing */
@@ -775,6 +775,7 @@ struct gfs2_sbd {
 
 	/* Workqueue stuff */
 
+	struct workqueue_struct *sd_glock_wq;
 	struct workqueue_struct *sd_delete_wq;
 
 	/* Daemon stuff */
