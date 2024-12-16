@@ -1,0 +1,137 @@
+cifs: return ENOENT for DFS lookup_cache_entry()
+
+jira LE-2169
+Rebuild_History Non-Buildable kernel-4.18.0-553.32.1.el8_10
+commit-author Enzo Matsumiya <ematsumiya@suse.de>
+commit 337b8b0e4343567221ef8d88aac5e418208d4ac1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.32.1.el8_10/337b8b0e.failed
+
+EEXIST didn't make sense to use when dfs_cache_find() couldn't find a
+cache entry nor retrieve a referral target.
+
+It also doesn't make sense cifs_dfs_query_info_nonascii_quirk() to
+emulate ENOENT anymore.
+
+	Signed-off-by: Enzo Matsumiya <ematsumiya@suse.de>
+	Reviewed-by: Paulo Alcantara (SUSE) <pc@cjr.nz>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 337b8b0e4343567221ef8d88aac5e418208d4ac1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/misc.c
+diff --cc fs/cifs/misc.c
+index 4d5f12505aa8,a5b5b15e658a..000000000000
+--- a/fs/cifs/misc.c
++++ b/fs/cifs/misc.c
+@@@ -1151,4 -1302,49 +1151,52 @@@ int cifs_update_super_prepath(struct ci
+  	cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_USE_PREFIX_PATH;
+  	return 0;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /** cifs_dfs_query_info_nonascii_quirk
++  * Handle weird Windows SMB server behaviour. It responds with
++  * STATUS_OBJECT_NAME_INVALID code to SMB2 QUERY_INFO request
++  * for "\<server>\<dfsname>\<linkpath>" DFS reference,
++  * where <dfsname> contains non-ASCII unicode symbols.
++  *
++  * Check such DFS reference.
++  */
++ int cifs_dfs_query_info_nonascii_quirk(const unsigned int xid,
++ 				       struct cifs_tcon *tcon,
++ 				       struct cifs_sb_info *cifs_sb,
++ 				       const char *linkpath)
++ {
++ 	char *treename, *dfspath, sep;
++ 	int treenamelen, linkpathlen, rc;
++ 
++ 	treename = tcon->treeName;
++ 	/* MS-DFSC: All paths in REQ_GET_DFS_REFERRAL and RESP_GET_DFS_REFERRAL
++ 	 * messages MUST be encoded with exactly one leading backslash, not two
++ 	 * leading backslashes.
++ 	 */
++ 	sep = CIFS_DIR_SEP(cifs_sb);
++ 	if (treename[0] == sep && treename[1] == sep)
++ 		treename++;
++ 	linkpathlen = strlen(linkpath);
++ 	treenamelen = strnlen(treename, MAX_TREE_SIZE + 1);
++ 	dfspath = kzalloc(treenamelen + linkpathlen + 1, GFP_KERNEL);
++ 	if (!dfspath)
++ 		return -ENOMEM;
++ 	if (treenamelen)
++ 		memcpy(dfspath, treename, treenamelen);
++ 	memcpy(dfspath + treenamelen, linkpath, linkpathlen);
++ 	rc = dfs_cache_find(xid, tcon->ses, cifs_sb->local_nls,
++ 			    cifs_remap(cifs_sb), dfspath, NULL, NULL);
++ 	if (rc == 0) {
++ 		cifs_dbg(FYI, "DFS ref '%s' is found, emulate -EREMOTE\n",
++ 			 dfspath);
++ 		rc = -EREMOTE;
++ 	} else {
++ 		cifs_dbg(FYI, "%s: dfs_cache_find returned %d\n", __func__, rc);
++ 	}
++ 	kfree(dfspath);
++ 	return rc;
++ }
+++>>>>>>> 337b8b0e4343 (cifs: return ENOENT for DFS lookup_cache_entry())
+  #endif
+diff --git a/fs/cifs/connect.c b/fs/cifs/connect.c
+index 496ee4de783d..82f4847cffef 100644
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@ -3299,8 +3299,9 @@ cifs_are_all_path_components_accessible(struct TCP_Server_Info *server,
+ }
+ 
+ /*
+- * Check if path is remote (e.g. a DFS share). Return -EREMOTE if it is,
+- * otherwise 0.
++ * Check if path is remote (i.e. a DFS share).
++ *
++ * Return -EREMOTE if it is, otherwise 0 or -errno.
+  */
+ static int is_path_remote(struct mount_ctx *mnt_ctx)
+ {
+@@ -3577,6 +3578,7 @@ int cifs_mount(struct cifs_sb_info *cifs_sb, struct smb3_fs_context *ctx)
+ 	if (!isdfs)
+ 		goto out;
+ 
++	/* proceed as DFS mount */
+ 	uuid_gen(&mnt_ctx.mount_id);
+ 	rc = connect_dfs_root(&mnt_ctx, &tl);
+ 	dfs_cache_free_tgts(&tl);
+diff --git a/fs/cifs/dfs_cache.c b/fs/cifs/dfs_cache.c
+index 2f1a4ada8f06..d9922f8aab4a 100644
+--- a/fs/cifs/dfs_cache.c
++++ b/fs/cifs/dfs_cache.c
+@@ -653,7 +653,7 @@ static struct cache_entry *__lookup_cache_entry(const char *path, unsigned int h
+ 			return ce;
+ 		}
+ 	}
+-	return ERR_PTR(-EEXIST);
++	return ERR_PTR(-ENOENT);
+ }
+ 
+ /*
+@@ -661,7 +661,7 @@ static struct cache_entry *__lookup_cache_entry(const char *path, unsigned int h
+  *
+  * Use whole path components in the match.  Must be called with htable_rw_lock held.
+  *
+- * Return ERR_PTR(-EEXIST) if the entry is not found.
++ * Return ERR_PTR(-ENOENT) if the entry is not found.
+  */
+ static struct cache_entry *lookup_cache_entry(const char *path)
+ {
+@@ -709,7 +709,7 @@ static struct cache_entry *lookup_cache_entry(const char *path)
+ 		while (e > s && *e != sep)
+ 			e--;
+ 	}
+-	return ERR_PTR(-EEXIST);
++	return ERR_PTR(-ENOENT);
+ }
+ 
+ /**
+* Unmerged path fs/cifs/misc.c
