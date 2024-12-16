@@ -1,0 +1,169 @@
+gfs2: Rename handle_callback to request_demote
+
+jira LE-2169
+Rebuild_History Non-Buildable kernel-4.18.0-553.32.1.el8_10
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit edeb180f1c8cfe2e789109766b636430adb5a0a3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.32.1.el8_10/edeb180f.failed
+
+Function handle_callback() is used to request a glock demote.  This
+often happens in response to a conflicting remote locking request and
+subsequent bast callback from DLM, but there are other reasons for
+triggering a demote request as well, such as when trying to release a
+glock in response to memory pressure.  To clarify that, rename the
+function to request_demote().
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit edeb180f1c8cfe2e789109766b636430adb5a0a3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/glock.c
+diff --cc fs/gfs2/glock.c
+index a9684efd290d,c583ba05e8f5..000000000000
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@@ -62,7 -61,8 +62,12 @@@ struct gfs2_glock_iter 
+  typedef void (*glock_examiner) (struct gfs2_glock * gl);
+  
+  static void do_xmote(struct gfs2_glock *gl, struct gfs2_holder *gh, unsigned int target);
+++<<<<<<< HEAD
+ +static void __gfs2_glock_dq(struct gfs2_holder *gh);
+++=======
++ static void request_demote(struct gfs2_glock *gl, unsigned int state,
++ 			   unsigned long delay, bool remote);
+++>>>>>>> edeb180f1c8c (gfs2: Rename handle_callback to request_demote)
+  
+  static struct dentry *gfs2_root;
+  static struct workqueue_struct *glock_workqueue;
+@@@ -763,13 -805,30 +768,34 @@@ skip_inval
+  	 * gfs2_gl_hash_clear calls clear_glock) and recovery is complete
+  	 * then it's okay to tell dlm to unlock it.
+  	 */
+ -	if (unlikely(sdp->sd_log_error) && !gfs2_withdrawing_or_withdrawn(sdp))
+ +	if (unlikely(sdp->sd_log_error && !gfs2_withdrawn(sdp)))
+  		gfs2_withdraw_delayed(sdp);
+++<<<<<<< HEAD
+ +	if (glock_blocked_by_withdraw(gl)) {
+ +		if (target != LM_ST_UNLOCKED ||
+ +		    test_bit(SDF_WITHDRAW_RECOVERY, &sdp->sd_flags)) {
+++=======
++ 	if (glock_blocked_by_withdraw(gl) &&
++ 	    (target != LM_ST_UNLOCKED ||
++ 	     test_bit(SDF_WITHDRAW_RECOVERY, &sdp->sd_flags))) {
++ 		if (!is_system_glock(gl)) {
++ 			request_demote(gl, LM_ST_UNLOCKED, 0, false);
++ 			/*
++ 			 * Ordinarily, we would call dlm and its callback would call
++ 			 * finish_xmote, which would call state_change() to the new state.
++ 			 * Since we withdrew, we won't call dlm, so call state_change
++ 			 * manually, but to the UNLOCKED state we desire.
++ 			 */
++ 			state_change(gl, LM_ST_UNLOCKED);
++ 			/*
++ 			 * We skip telling dlm to do the locking, so we won't get a
++ 			 * reply that would otherwise clear GLF_LOCK. So we clear it here.
++ 			 */
++ 			clear_bit(GLF_LOCK, &gl->gl_flags);
++ 			clear_bit(GLF_DEMOTE_IN_PROGRESS, &gl->gl_flags);
+++>>>>>>> edeb180f1c8c (gfs2: Rename handle_callback to request_demote)
+  			gfs2_glock_queue_work(gl, GL_GLOCK_DFT_HOLD);
+ -			return;
+ -		} else {
+ -			clear_bit(GLF_INVALIDATE_IN_PROGRESS, &gl->gl_flags);
+ +			goto out;
+  		}
+  	}
+  
+@@@ -1376,18 -1459,23 +1402,18 @@@ out
+  }
+  
+  /**
+-  * handle_callback - process a demote request
++  * request_demote - process a demote request
+   * @gl: the glock
+   * @state: the state the caller wants us to change to
+ - * @delay: zero to demote immediately; otherwise pending demote
+ - * @remote: true if this came from a different cluster node
+   *
+   * There are only two requests that we are going to see in actual
+   * practise: LM_ST_SHARED and LM_ST_UNLOCKED
+   */
+  
+- static void handle_callback(struct gfs2_glock *gl, unsigned int state,
+- 			    unsigned long delay, bool remote)
++ static void request_demote(struct gfs2_glock *gl, unsigned int state,
++ 			   unsigned long delay, bool remote)
+  {
+ -	if (delay)
+ -		set_bit(GLF_PENDING_DEMOTE, &gl->gl_flags);
+ -	else
+ -		gfs2_set_demote(gl);
+ +	gfs2_set_demote(delay ? GLF_PENDING_DEMOTE : GLF_DEMOTE, gl);
+  	if (gl->gl_demote_state == LM_ST_EXCLUSIVE) {
+  		gl->gl_demote_state = state;
+  		gl->gl_demote_time = jiffies;
+@@@ -1576,11 -1682,11 +1602,11 @@@ static void __gfs2_glock_dq(struct gfs2
+  
+  	/*
+  	 * This holder should not be cached, so mark it for demote.
+ -	 * Note: this should be done before the check for needs_demote
+ -	 * below.
+ +	 * Note: this should be done before the glock_needs_demote
+ +	 * check below.
+  	 */
+  	if (gh->gh_flags & GL_NOCACHE)
+- 		handle_callback(gl, LM_ST_UNLOCKED, 0, false);
++ 		request_demote(gl, LM_ST_UNLOCKED, 0, false);
+  
+  	list_del_init(&gh->gh_list);
+  	clear_bit(HIF_HOLDER, &gh->gh_iflags);
+@@@ -1827,11 -1930,11 +1853,16 @@@ void gfs2_glock_cb(struct gfs2_glock *g
+  	    gl->gl_name.ln_type == LM_TYPE_INODE) {
+  		if (time_before(now, holdtime))
+  			delay = holdtime - now;
+ -		if (test_bit(GLF_HAVE_REPLY, &gl->gl_flags))
+ +		if (test_bit(GLF_REPLY_PENDING, &gl->gl_flags))
+  			delay = gl->gl_hold_time;
+  	}
+++<<<<<<< HEAD
+ +	handle_callback(gl, state, delay, true);
+ +	__gfs2_glock_queue_work(gl, delay);
+++=======
++ 	request_demote(gl, state, delay, true);
++ 	gfs2_glock_queue_work(gl, delay);
+++>>>>>>> edeb180f1c8c (gfs2: Rename handle_callback to request_demote)
+  	spin_unlock(&gl->gl_lockref.lock);
+  }
+  
+@@@ -1958,8 -2062,8 +1989,13 @@@ add_back_to_lru
+  		freed++;
+  		gl->gl_lockref.count++;
+  		if (demote_ok(gl))
+++<<<<<<< HEAD
+ +			handle_callback(gl, LM_ST_UNLOCKED, 0, false);
+ +		__gfs2_glock_queue_work(gl, 0);
+++=======
++ 			request_demote(gl, LM_ST_UNLOCKED, 0, false);
++ 		gfs2_glock_queue_work(gl, 0);
+++>>>>>>> edeb180f1c8c (gfs2: Rename handle_callback to request_demote)
+  		spin_unlock(&gl->gl_lockref.lock);
+  		cond_resched_lock(&lru_lock);
+  	}
+@@@ -2105,8 -2205,8 +2141,13 @@@ static void clear_glock(struct gfs2_glo
+  	if (!__lockref_is_dead(&gl->gl_lockref)) {
+  		gl->gl_lockref.count++;
+  		if (gl->gl_state != LM_ST_UNLOCKED)
+++<<<<<<< HEAD
+ +			handle_callback(gl, LM_ST_UNLOCKED, 0, false);
+ +		__gfs2_glock_queue_work(gl, 0);
+++=======
++ 			request_demote(gl, LM_ST_UNLOCKED, 0, false);
++ 		gfs2_glock_queue_work(gl, 0);
+++>>>>>>> edeb180f1c8c (gfs2: Rename handle_callback to request_demote)
+  	}
+  	spin_unlock(&gl->gl_lockref.lock);
+  }
+* Unmerged path fs/gfs2/glock.c
