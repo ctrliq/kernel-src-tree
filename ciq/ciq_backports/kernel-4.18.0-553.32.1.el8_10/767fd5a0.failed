@@ -1,0 +1,247 @@
+gfs2: Revise glock reference counting model
+
+jira LE-2169
+Rebuild_History Non-Buildable kernel-4.18.0-553.32.1.el8_10
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 767fd5a0160774178a597b7a7b6e07915fe00efa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.32.1.el8_10/767fd5a0.failed
+
+In the current glock reference counting model, a bias of one is added to
+a glock's refcount when it is locked (gl->gl_state != LM_ST_UNLOCKED).
+A glock is removed from the lru_list when it is enqueued, and added back
+when it is dequeued.  This isn't a very appropriate model because most
+glocks are held for long periods of time (for example, the inode "owns"
+references to its inode and iopen glocks as long as the inode is cached
+even when the glock state changes to LM_ST_UNLOCKED), and they can only
+be freed when they are no longer referenced, anyway.
+
+Fix this by getting rid of the refcount bias for locked glocks.  That
+way, we can use lockref_put_or_lock() to efficiently drop all but the
+last glock reference, and put the glock onto the lru_list when the last
+reference is dropped.  When find_insert_glock() returns a reference to a
+cached glock, it removes the glock from the lru_list.
+
+Dumping the "glocks" and "glstats" debugfs files also takes glock
+references, but instead of removing the glocks from the lru_list in that
+case as well, we leave them on the list.  This ensures that dumping
+those files won't perturb the order of the glocks on the lru_list.
+
+In addition, when the last reference to an *unlocked* glock is dropped,
+we immediately free it; this preserves the preexisting behavior.  If it
+later turns out that caching unlocked glocks is useful in some
+situations, we can change the caching strategy.
+
+It is currently unclear if a glock that has no active references can
+have the GLF_LFLUSH flag set.  To make sure that such a glock won't
+accidentally be evicted due to memory pressure, we add a GLF_LFLUSH
+check to gfs2_dispose_glock_lru().
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 767fd5a0160774178a597b7a7b6e07915fe00efa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/glock.c
+#	fs/gfs2/glock.h
+diff --cc fs/gfs2/glock.c
+index 7d0a91100c66,e2a72c21194a..000000000000
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@@ -310,12 -305,18 +310,27 @@@ static void __gfs2_glock_put(struct gfs
+  	sdp->sd_lockstruct.ls_ops->lm_put_lock(gl);
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Cause the glock to be put in work queue context.
+ + */
+ +void gfs2_glock_queue_put(struct gfs2_glock *gl)
+ +{
+ +	gfs2_glock_queue_work(gl, 0);
+++=======
++ static bool __gfs2_glock_put_or_lock(struct gfs2_glock *gl)
++ {
++ 	if (lockref_put_or_lock(&gl->gl_lockref))
++ 		return true;
++ 	GLOCK_BUG_ON(gl, gl->gl_lockref.count != 1);
++ 	if (gl->gl_state != LM_ST_UNLOCKED) {
++ 		gl->gl_lockref.count--;
++ 		gfs2_glock_add_to_lru(gl);
++ 		spin_unlock(&gl->gl_lockref.lock);
++ 		return true;
++ 	}
++ 	return false;
+++>>>>>>> 767fd5a01607 (gfs2: Revise glock reference counting model)
+  }
+  
+  /**
+@@@ -332,6 -333,22 +347,25 @@@ void gfs2_glock_put(struct gfs2_glock *
+  	__gfs2_glock_put(gl);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * gfs2_glock_put_async - Decrement reference count without sleeping
++  * @gl: The glock to put
++  *
++  * Decrement the reference count on glock immediately unless it is the last
++  * reference.  Defer putting the last reference to work queue context.
++  */
++ void gfs2_glock_put_async(struct gfs2_glock *gl)
++ {
++ 	if (__gfs2_glock_put_or_lock(gl))
++ 		return;
++ 
++ 	gfs2_glock_queue_work(gl, 0);
++ 	spin_unlock(&gl->gl_lockref.lock);
++ }
++ 
+++>>>>>>> 767fd5a01607 (gfs2: Revise glock reference counting model)
+  /**
+   * may_grant - check if it's ok to grant a new lock
+   * @gl: The glock
+@@@ -1050,18 -1136,18 +1072,26 @@@ static void glock_work_func(struct work
+  		drop_refs--;
+  		if (gl->gl_name.ln_type != LM_TYPE_INODE)
+  			delay = 0;
+ -		gfs2_glock_queue_work(gl, delay);
+ +		__gfs2_glock_queue_work(gl, delay);
+  	}
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Drop the remaining glock references manually here. (Mind that
+ +	 * __gfs2_glock_queue_work depends on the lockref spinlock begin held
+ +	 * here as well.)
+ +	 */
+++=======
++ 	/* Drop the remaining glock references manually. */
++ 	GLOCK_BUG_ON(gl, gl->gl_lockref.count < drop_refs);
+++>>>>>>> 767fd5a01607 (gfs2: Revise glock reference counting model)
+  	gl->gl_lockref.count -= drop_refs;
+  	if (!gl->gl_lockref.count) {
+- 		__gfs2_glock_put(gl);
+- 		return;
++ 		if (gl->gl_state == LM_ST_UNLOCKED) {
++ 			__gfs2_glock_put(gl);
++ 			return;
++ 		}
++ 		gfs2_glock_add_to_lru(gl);
+  	}
+  	spin_unlock(&gl->gl_lockref.lock);
+  }
+@@@ -1528,8 -1614,24 +1560,29 @@@ int gfs2_glock_nq(struct gfs2_holder *g
+  	if (glock_blocked_by_withdraw(gl) && !(gh->gh_flags & LM_FLAG_NOEXP))
+  		return -EIO;
+  
+++<<<<<<< HEAD
+ +	if (test_bit(GLF_LRU, &gl->gl_flags))
+ +		gfs2_glock_remove_from_lru(gl);
+++=======
++ 	if (gh->gh_flags & GL_NOBLOCK) {
++ 		struct gfs2_holder *current_gh;
++ 
++ 		error = -ECHILD;
++ 		spin_lock(&gl->gl_lockref.lock);
++ 		if (find_last_waiter(gl))
++ 			goto unlock;
++ 		current_gh = find_first_holder(gl);
++ 		if (!may_grant(gl, current_gh, gh))
++ 			goto unlock;
++ 		set_bit(HIF_HOLDER, &gh->gh_iflags);
++ 		list_add_tail(&gh->gh_list, &gl->gl_holders);
++ 		trace_gfs2_promote(gh);
++ 		error = 0;
++ unlock:
++ 		spin_unlock(&gl->gl_lockref.lock);
++ 		return error;
++ 	}
+++>>>>>>> 767fd5a01607 (gfs2: Revise glock reference counting model)
+  
+  	gh->gh_error = 0;
+  	spin_lock(&gl->gl_lockref.lock);
+@@@ -2078,9 -2180,10 +2130,10 @@@ static void thaw_glock(struct gfs2_gloc
+  	if (!lockref_get_not_dead(&gl->gl_lockref))
+  		return;
+  
++ 	gfs2_glock_remove_from_lru(gl);
+  	spin_lock(&gl->gl_lockref.lock);
+ -	set_bit(GLF_HAVE_REPLY, &gl->gl_flags);
+ -	gfs2_glock_queue_work(gl, 0);
+ +	set_bit(GLF_REPLY_PENDING, &gl->gl_flags);
+ +	__gfs2_glock_queue_work(gl, 0);
+  	spin_unlock(&gl->gl_lockref.lock);
+  }
+  
+diff --cc fs/gfs2/glock.h
+index be4bc9edf46d,adf0091cc98f..000000000000
+--- a/fs/gfs2/glock.h
++++ b/fs/gfs2/glock.h
+@@@ -252,29 -242,27 +252,42 @@@ static inline int gfs2_glock_nq_init(st
+  	return error;
+  }
+  
+++<<<<<<< HEAD
+ +extern void gfs2_glock_cb(struct gfs2_glock *gl, unsigned int state);
+ +extern void gfs2_glock_complete(struct gfs2_glock *gl, int ret);
+ +extern bool gfs2_queue_try_to_evict(struct gfs2_glock *gl);
+ +extern bool gfs2_queue_verify_delete(struct gfs2_glock *gl);
+ +extern void gfs2_cancel_delete_work(struct gfs2_glock *gl);
+ +extern void gfs2_flush_delete_work(struct gfs2_sbd *sdp);
+ +extern void gfs2_gl_hash_clear(struct gfs2_sbd *sdp);
+ +extern void gfs2_gl_dq_holders(struct gfs2_sbd *sdp);
+ +extern void gfs2_glock_thaw(struct gfs2_sbd *sdp);
+ +extern void gfs2_glock_add_to_lru(struct gfs2_glock *gl);
+ +extern void gfs2_glock_free(struct gfs2_glock *gl);
+ +extern void gfs2_glock_free_later(struct gfs2_glock *gl);
+++=======
++ void gfs2_glock_cb(struct gfs2_glock *gl, unsigned int state);
++ void gfs2_glock_complete(struct gfs2_glock *gl, int ret);
++ bool gfs2_queue_try_to_evict(struct gfs2_glock *gl);
++ void gfs2_cancel_delete_work(struct gfs2_glock *gl);
++ void gfs2_flush_delete_work(struct gfs2_sbd *sdp);
++ void gfs2_gl_hash_clear(struct gfs2_sbd *sdp);
++ void gfs2_gl_dq_holders(struct gfs2_sbd *sdp);
++ void gfs2_glock_thaw(struct gfs2_sbd *sdp);
++ void gfs2_glock_free(struct gfs2_glock *gl);
++ void gfs2_glock_free_later(struct gfs2_glock *gl);
+++>>>>>>> 767fd5a01607 (gfs2: Revise glock reference counting model)
+  
+ -int __init gfs2_glock_init(void);
+ -void gfs2_glock_exit(void);
+ +extern int __init gfs2_glock_init(void);
+ +extern void gfs2_glock_exit(void);
+  
+ -void gfs2_create_debugfs_file(struct gfs2_sbd *sdp);
+ -void gfs2_delete_debugfs_file(struct gfs2_sbd *sdp);
+ -void gfs2_register_debugfs(void);
+ -void gfs2_unregister_debugfs(void);
+ +extern void gfs2_create_debugfs_file(struct gfs2_sbd *sdp);
+ +extern void gfs2_delete_debugfs_file(struct gfs2_sbd *sdp);
+ +extern void gfs2_register_debugfs(void);
+ +extern void gfs2_unregister_debugfs(void);
+  
+ -void glock_set_object(struct gfs2_glock *gl, void *object);
+ -void glock_clear_object(struct gfs2_glock *gl, void *object);
+ +extern void glock_set_object(struct gfs2_glock *gl, void *object);
+ +extern void glock_clear_object(struct gfs2_glock *gl, void *object);
+  
+  extern const struct lm_lockops gfs2_dlm_ops;
+  
+* Unmerged path fs/gfs2/glock.c
+* Unmerged path fs/gfs2/glock.h
+diff --git a/fs/gfs2/super.c b/fs/gfs2/super.c
+index a0ec4e506f04..9438aeb6ca90 100644
+--- a/fs/gfs2/super.c
++++ b/fs/gfs2/super.c
+@@ -1574,7 +1574,6 @@ static void gfs2_evict_inode(struct inode *inode)
+ 	if (ip->i_gl) {
+ 		glock_clear_object(ip->i_gl, ip);
+ 		wait_on_bit_io(&ip->i_flags, GIF_GLOP_PENDING, TASK_UNINTERRUPTIBLE);
+-		gfs2_glock_add_to_lru(ip->i_gl);
+ 		gfs2_glock_put_eventually(ip->i_gl);
+ 		ip->i_gl = NULL;
+ 	}
