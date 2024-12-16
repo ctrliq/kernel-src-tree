@@ -1068,7 +1068,7 @@ static int gfs2_drop_inode(struct inode *inode)
 		gfs2_glock_hold(gl);
 		if (!gfs2_queue_try_to_evict(gl))
 			gfs2_glock_queue_put(gl);
-		return false;
+		return 0;
 	}
 
 	/*
