@@ -358,10 +358,3 @@ int io_uring_sync_msg_ring(struct io_uring_sqe *sqe)
 	}
 	return ret;
 }
-
-void io_msg_cache_free(const void *entry)
-{
-	struct io_kiocb *req = (struct io_kiocb *) entry;
-
-	kmem_cache_free(req_cachep, req);
-}
