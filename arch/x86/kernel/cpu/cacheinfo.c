@@ -33,16 +33,16 @@
 #define LVL_3		4
 #define LVL_TRACE	5
 
-static cpumask_var_t cpu_cacheinfo_mask;
-
-/* Kernel controls MTRR and/or PAT MSRs. */
-unsigned int memory_caching_control __ro_after_init;
-
 /* Shared last level cache maps */
 DEFINE_PER_CPU_READ_MOSTLY(cpumask_var_t, cpu_llc_shared_map);
 
 /* Shared L2 cache maps */
 DEFINE_PER_CPU_READ_MOSTLY(cpumask_var_t, cpu_l2c_shared_map);
+
+static cpumask_var_t cpu_cacheinfo_mask;
+
+/* Kernel controls MTRR and/or PAT MSRs. */
+unsigned int memory_caching_control __ro_after_init;
 
 struct _cache_table {
 	unsigned char descriptor;
@@ -1118,15 +1118,16 @@ static void cache_cpu_init(void)
 	unsigned long flags;
 
 	local_irq_save(flags);
-	cache_disable();
 
-	if (memory_caching_control & CACHE_MTRR)
+	if (memory_caching_control & CACHE_MTRR) {
+		cache_disable();
 		mtrr_generic_set_state();
+		cache_enable();
+	}
 
 	if (memory_caching_control & CACHE_PAT)
 		pat_cpu_init();
 
-	cache_enable();
 	local_irq_restore(flags);
 }
 
