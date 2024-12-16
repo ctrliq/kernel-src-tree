@@ -1,0 +1,231 @@
+cifs: fix oops during encryption
+
+jira LE-2169
+Rebuild_History Non-Buildable kernel-4.18.0-553.27.1.el8_10
+commit-author Paulo Alcantara <pc@cjr.nz>
+commit f7f291e14dde32a07b1f0aa06921d28f875a7b54
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.27.1.el8_10/f7f291e1.failed
+
+When running xfstests against Azure the following oops occurred on an
+arm64 system
+
+  Unable to handle kernel write to read-only memory at virtual address
+  ffff0001221cf000
+  Mem abort info:
+    ESR = 0x9600004f
+    EC = 0x25: DABT (current EL), IL = 32 bits
+    SET = 0, FnV = 0
+    EA = 0, S1PTW = 0
+    FSC = 0x0f: level 3 permission fault
+  Data abort info:
+    ISV = 0, ISS = 0x0000004f
+    CM = 0, WnR = 1
+  swapper pgtable: 4k pages, 48-bit VAs, pgdp=00000000294f3000
+  [ffff0001221cf000] pgd=18000001ffff8003, p4d=18000001ffff8003,
+  pud=18000001ff82e003, pmd=18000001ff71d003, pte=00600001221cf787
+  Internal error: Oops: 9600004f [#1] PREEMPT SMP
+  ...
+  pstate: 80000005 (Nzcv daif -PAN -UAO -TCO BTYPE=--)
+  pc : __memcpy+0x40/0x230
+  lr : scatterwalk_copychunks+0xe0/0x200
+  sp : ffff800014e92de0
+  x29: ffff800014e92de0 x28: ffff000114f9de80 x27: 0000000000000008
+  x26: 0000000000000008 x25: ffff800014e92e78 x24: 0000000000000008
+  x23: 0000000000000001 x22: 0000040000000000 x21: ffff000000000000
+  x20: 0000000000000001 x19: ffff0001037c4488 x18: 0000000000000014
+  x17: 235e1c0d6efa9661 x16: a435f9576b6edd6c x15: 0000000000000058
+  x14: 0000000000000001 x13: 0000000000000008 x12: ffff000114f2e590
+  x11: ffffffffffffffff x10: 0000040000000000 x9 : ffff8000105c3580
+  x8 : 2e9413b10000001a x7 : 534b4410fb86b005 x6 : 534b4410fb86b005
+  x5 : ffff0001221cf008 x4 : ffff0001037c4490 x3 : 0000000000000001
+  x2 : 0000000000000008 x1 : ffff0001037c4488 x0 : ffff0001221cf000
+  Call trace:
+   __memcpy+0x40/0x230
+   scatterwalk_map_and_copy+0x98/0x100
+   crypto_ccm_encrypt+0x150/0x180
+   crypto_aead_encrypt+0x2c/0x40
+   crypt_message+0x750/0x880
+   smb3_init_transform_rq+0x298/0x340
+   smb_send_rqst.part.11+0xd8/0x180
+   smb_send_rqst+0x3c/0x100
+   compound_send_recv+0x534/0xbc0
+   smb2_query_info_compound+0x32c/0x440
+   smb2_set_ea+0x438/0x4c0
+   cifs_xattr_set+0x5d4/0x7c0
+
+This is because in scatterwalk_copychunks(), we attempted to write to
+a buffer (@sign) that was allocated in the stack (vmalloc area) by
+crypt_message() and thus accessing its remaining 8 (x2) bytes ended up
+crossing a page boundary.
+
+To simply fix it, we could just pass @sign kmalloc'd from
+crypt_message() and then we're done.  Luckily, we don't seem to pass
+any other vmalloc'd buffers in smb_rqst::rq_iov...
+
+Instead, let's map the correct pages and offsets from vmalloc buffers
+as well in cifs_sg_set_buf() and then avoiding such oopses.
+
+	Signed-off-by: Paulo Alcantara (SUSE) <pc@cjr.nz>
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit f7f291e14dde32a07b1f0aa06921d28f875a7b54)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/cifsglob.h
+#	fs/cifs/smb2ops.c
+diff --cc fs/cifs/cifsglob.h
+index e6643c9be310,703685e2db5e..000000000000
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@@ -2003,4 -2132,80 +2005,83 @@@ static inline size_t ntlmssp_workstatio
+  	return sizeof(ses->workstation_name);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline void move_cifs_info_to_smb2(struct smb2_file_all_info *dst, const FILE_ALL_INFO *src)
++ {
++ 	memcpy(dst, src, (size_t)((u8 *)&src->AccessFlags - (u8 *)src));
++ 	dst->AccessFlags = src->AccessFlags;
++ 	dst->CurrentByteOffset = src->CurrentByteOffset;
++ 	dst->Mode = src->Mode;
++ 	dst->AlignmentRequirement = src->AlignmentRequirement;
++ 	dst->FileNameLength = src->FileNameLength;
++ }
++ 
++ static inline unsigned int cifs_get_num_sgs(const struct smb_rqst *rqst,
++ 					    int num_rqst,
++ 					    const u8 *sig)
++ {
++ 	unsigned int len, skip;
++ 	unsigned int nents = 0;
++ 	unsigned long addr;
++ 	int i, j;
++ 
++ 	/* Assumes the first rqst has a transform header as the first iov.
++ 	 * I.e.
++ 	 * rqst[0].rq_iov[0]  is transform header
++ 	 * rqst[0].rq_iov[1+] data to be encrypted/decrypted
++ 	 * rqst[1+].rq_iov[0+] data to be encrypted/decrypted
++ 	 */
++ 	for (i = 0; i < num_rqst; i++) {
++ 		/*
++ 		 * The first rqst has a transform header where the
++ 		 * first 20 bytes are not part of the encrypted blob.
++ 		 */
++ 		for (j = 0; j < rqst[i].rq_nvec; j++) {
++ 			struct kvec *iov = &rqst[i].rq_iov[j];
++ 
++ 			skip = (i == 0) && (j == 0) ? 20 : 0;
++ 			addr = (unsigned long)iov->iov_base + skip;
++ 			if (unlikely(is_vmalloc_addr((void *)addr))) {
++ 				len = iov->iov_len - skip;
++ 				nents += DIV_ROUND_UP(offset_in_page(addr) + len,
++ 						      PAGE_SIZE);
++ 			} else {
++ 				nents++;
++ 			}
++ 		}
++ 		nents += rqst[i].rq_npages;
++ 	}
++ 	nents += DIV_ROUND_UP(offset_in_page(sig) + SMB2_SIGNATURE_SIZE, PAGE_SIZE);
++ 	return nents;
++ }
++ 
++ /* We can not use the normal sg_set_buf() as we will sometimes pass a
++  * stack object as buf.
++  */
++ static inline struct scatterlist *cifs_sg_set_buf(struct scatterlist *sg,
++ 						  const void *buf,
++ 						  unsigned int buflen)
++ {
++ 	unsigned long addr = (unsigned long)buf;
++ 	unsigned int off = offset_in_page(addr);
++ 
++ 	addr &= PAGE_MASK;
++ 	if (unlikely(is_vmalloc_addr((void *)addr))) {
++ 		do {
++ 			unsigned int len = min_t(unsigned int, buflen, PAGE_SIZE - off);
++ 
++ 			sg_set_page(sg++, vmalloc_to_page((void *)addr), len, off);
++ 
++ 			off = 0;
++ 			addr += PAGE_SIZE;
++ 			buflen -= len;
++ 		} while (buflen);
++ 	} else {
++ 		sg_set_page(sg++, virt_to_page(addr), buflen, off);
++ 	}
++ 	return sg;
++ }
++ 
+++>>>>>>> f7f291e14dde (cifs: fix oops during encryption)
+  #endif	/* _CIFS_GLOB_H */
+diff --cc fs/cifs/smb2ops.c
+index 17d6d311b30b,6e772b31e02a..000000000000
+--- a/fs/cifs/smb2ops.c
++++ b/fs/cifs/smb2ops.c
+@@@ -4390,10 -4325,9 +4403,9 @@@ crypt_message(struct TCP_Server_Info *s
+  	int rc = 0;
+  	struct scatterlist *sg;
+  	u8 sign[SMB2_SIGNATURE_SIZE] = {};
+ -	u8 key[SMB3_ENC_DEC_KEY_SIZE];
+ +	u8 key[SMB3_SIGN_KEY_SIZE];
+  	struct aead_request *req;
+- 	char *iv;
+- 	unsigned int iv_len;
++ 	u8 *iv;
+  	DECLARE_CRYPTO_WAIT(wait);
+  	struct crypto_aead *tfm;
+  	unsigned int crypt_len = le32_to_cpu(tr_hdr->OriginalMessageSize);
+@@@ -4476,11 -4395,7 +4473,15 @@@
+  	if (!rc && enc)
+  		memcpy(&tr_hdr->Signature, sign, SMB2_SIGNATURE_SIZE);
+  
+++<<<<<<< HEAD
+ +	kfree(iv);
+ +free_sg:
+ +	kfree(sg);
+ +free_req:
+ +	kfree(req);
+++=======
++ 	kfree_sensitive(creq);
+++>>>>>>> f7f291e14dde (cifs: fix oops during encryption)
+  	return rc;
+  }
+  
+* Unmerged path fs/cifs/cifsglob.h
+diff --git a/fs/cifs/cifsproto.h b/fs/cifs/cifsproto.h
+index 9f6f148a6c61..7f8e1bfc462e 100644
+--- a/fs/cifs/cifsproto.h
++++ b/fs/cifs/cifsproto.h
+@@ -586,8 +586,8 @@ int cifs_alloc_hash(const char *name, struct crypto_shash **shash,
+ 		    struct sdesc **sdesc);
+ void cifs_free_hash(struct crypto_shash **shash, struct sdesc **sdesc);
+ 
+-extern void rqst_page_get_length(struct smb_rqst *rqst, unsigned int page,
+-				unsigned int *len, unsigned int *offset);
++void rqst_page_get_length(const struct smb_rqst *rqst, unsigned int page,
++			  unsigned int *len, unsigned int *offset);
+ struct cifs_chan *
+ cifs_ses_find_chan(struct cifs_ses *ses, struct TCP_Server_Info *server);
+ int cifs_try_adding_channels(struct cifs_sb_info *cifs_sb, struct cifs_ses *ses);
+diff --git a/fs/cifs/misc.c b/fs/cifs/misc.c
+index ca211fc3b749..4d5f12505aa8 100644
+--- a/fs/cifs/misc.c
++++ b/fs/cifs/misc.c
+@@ -973,8 +973,8 @@ cifs_free_hash(struct crypto_shash **shash, struct sdesc **sdesc)
+  * @len: Where to store the length for this page:
+  * @offset: Where to store the offset for this page
+  */
+-void rqst_page_get_length(struct smb_rqst *rqst, unsigned int page,
+-				unsigned int *len, unsigned int *offset)
++void rqst_page_get_length(const struct smb_rqst *rqst, unsigned int page,
++			  unsigned int *len, unsigned int *offset)
+ {
+ 	*len = rqst->rq_pagesz;
+ 	*offset = (page == 0) ? rqst->rq_offset : 0;
+* Unmerged path fs/cifs/smb2ops.c
