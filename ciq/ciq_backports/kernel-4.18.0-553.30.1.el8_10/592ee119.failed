@@ -1,0 +1,337 @@
+blk-mq: fix missing blk_account_io_done() in error path
+
+jira LE-2169
+Rebuild_History Non-Buildable kernel-4.18.0-553.30.1.el8_10
+commit-author Yu Kuai <yukuai3@huawei.com>
+commit 592ee1197f78b30bd60c87db9b6c8c045c8d8314
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.30.1.el8_10/592ee119.failed
+
+If blk_mq_request_issue_directly() failed from
+blk_insert_cloned_request(), the request will be accounted start.
+Currently, blk_insert_cloned_request() is only called by dm, and such
+request won't be accounted done by dm.
+
+In normal path, io will be accounted start from blk_mq_bio_to_request(),
+when the request is allocated, and such io will be accounted done from
+__blk_mq_end_request_acct() whether it succeeded or failed. Thus add
+blk_account_io_done() to fix the problem.
+
+	Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+Link: https://lore.kernel.org/r/20220126012132.3111551-1-yukuai3@huawei.com
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 592ee1197f78b30bd60c87db9b6c8c045c8d8314)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index 910d3b9bdae2,1adfe4824ef5..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -2344,86 -2812,230 +2344,240 @@@ blk_qc_t blk_mq_make_request(struct req
+  
+  	rq_qos_track(q, rq, bio);
+  
+ -	blk_mq_bio_to_request(rq, bio, nr_segs);
+ +	cookie = request_to_qc_t(data.hctx, rq);
+  
+ -	ret = blk_crypto_init_request(rq);
+ -	if (ret != BLK_STS_OK) {
+ -		bio->bi_status = ret;
+ -		bio_endio(bio);
+ -		blk_mq_free_request(rq);
+ -		return;
+ -	}
+ +	blk_mq_bio_to_request(rq, bio);
+  
+ -	if (op_is_flush(bio->bi_opf)) {
+ +	plug = blk_mq_plug(q, bio);
+ +	if (unlikely(is_flush_fua)) {
+ +		/* Bypass scheduler for flush requests */
+  		blk_insert_flush(rq);
+ -		return;
+ -	}
+ -
+ -	if (plug)
+ -		blk_add_rq_to_plug(plug, rq);
+ -	else if ((rq->rq_flags & RQF_ELV) ||
+ -		 (rq->mq_hctx->dispatch_busy &&
+ -		  (q->nr_hw_queues == 1 || !is_sync)))
+ -		blk_mq_sched_insert_request(rq, false, true, true);
+ -	else
+ -		blk_mq_run_dispatch_ops(rq->q,
+ -				blk_mq_try_issue_directly(rq->mq_hctx, rq));
+ -}
+ -
+ -/**
+ - * blk_cloned_rq_check_limits - Helper function to check a cloned request
+ - *                              for the new queue limits
+ - * @q:  the queue
+ - * @rq: the request being checked
+ - *
+ - * Description:
+ - *    @rq may have been made based on weaker limitations of upper-level queues
+ - *    in request stacking drivers, and it may violate the limitation of @q.
+ - *    Since the block layer and the underlying device driver trust @rq
+ - *    after it is inserted to @q, it should be checked against @q before
+ - *    the insertion using this generic function.
+ - *
+ - *    Request stacking drivers like request-based dm may change the queue
+ - *    limits when retrying requests on other queues. Those requests need
+ - *    to be checked against the new queue limits again during dispatch.
+ - */
+ -static blk_status_t blk_cloned_rq_check_limits(struct request_queue *q,
+ -				      struct request *rq)
+ -{
+ -	unsigned int max_sectors = blk_queue_get_max_sectors(q, req_op(rq));
+ -
+ -	if (blk_rq_sectors(rq) > max_sectors) {
+ +		blk_mq_run_hw_queue(data.hctx, true);
+ +	} else if (plug && (q->nr_hw_queues == 1 ||
+ +		   blk_mq_is_sbitmap_shared(rq->mq_hctx->flags) ||
+ +		   q->mq_ops->commit_rqs || !blk_queue_nonrot(q))) {
+  		/*
+ -		 * SCSI device does not have a good way to return if
+ -		 * Write Same/Zero is actually supported. If a device rejects
+ -		 * a non-read/write command (discard, write same,etc.) the
+ -		 * low-level device driver will set the relevant queue limit to
+ -		 * 0 to prevent blk-lib from issuing more of the offending
+ -		 * operations. Commands queued prior to the queue limit being
+ -		 * reset need to be completed with BLK_STS_NOTSUPP to avoid I/O
+ -		 * errors being propagated to upper layers.
+ +		 * Use plugging if we have a ->commit_rqs() hook as well, as
+ +		 * we know the driver uses bd->last in a smart fashion.
+ +		 *
+ +		 * Use normal plugging if this disk is slow HDD, as sequential
+ +		 * IO may benefit a lot from plug merging.
+  		 */
+ -		if (max_sectors == 0)
+ -			return BLK_STS_NOTSUPP;
+ +		unsigned int request_count = plug->rq_count;
+ +		struct request *last = NULL;
+  
+++<<<<<<< HEAD
+ +		if (!request_count)
+ +			trace_block_plug(q);
+++=======
++ 		printk(KERN_ERR "%s: over max size limit. (%u > %u)\n",
++ 			__func__, blk_rq_sectors(rq), max_sectors);
++ 		return BLK_STS_IOERR;
++ 	}
++ 
++ 	/*
++ 	 * The queue settings related to segment counting may differ from the
++ 	 * original queue.
++ 	 */
++ 	rq->nr_phys_segments = blk_recalc_rq_segments(rq);
++ 	if (rq->nr_phys_segments > queue_max_segments(q)) {
++ 		printk(KERN_ERR "%s: over max segments limit. (%hu > %hu)\n",
++ 			__func__, rq->nr_phys_segments, queue_max_segments(q));
++ 		return BLK_STS_IOERR;
++ 	}
++ 
++ 	return BLK_STS_OK;
++ }
++ 
++ /**
++  * blk_insert_cloned_request - Helper for stacking drivers to submit a request
++  * @q:  the queue to submit the request
++  * @rq: the request being queued
++  */
++ blk_status_t blk_insert_cloned_request(struct request_queue *q, struct request *rq)
++ {
++ 	blk_status_t ret;
++ 
++ 	ret = blk_cloned_rq_check_limits(q, rq);
++ 	if (ret != BLK_STS_OK)
++ 		return ret;
++ 
++ 	if (rq->q->disk &&
++ 	    should_fail_request(rq->q->disk->part0, blk_rq_bytes(rq)))
++ 		return BLK_STS_IOERR;
++ 
++ 	if (blk_crypto_insert_cloned_request(rq))
++ 		return BLK_STS_IOERR;
++ 
++ 	blk_account_io_start(rq);
++ 
++ 	/*
++ 	 * Since we have a scheduler attached on the top device,
++ 	 * bypass a potential scheduler on the bottom device for
++ 	 * insert.
++ 	 */
++ 	blk_mq_run_dispatch_ops(rq->q,
++ 			ret = blk_mq_request_issue_directly(rq, true));
++ 	if (ret)
++ 		blk_account_io_done(rq, ktime_get_ns());
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(blk_insert_cloned_request);
++ 
++ /**
++  * blk_rq_unprep_clone - Helper function to free all bios in a cloned request
++  * @rq: the clone request to be cleaned up
++  *
++  * Description:
++  *     Free all bios in @rq for a cloned request.
++  */
++ void blk_rq_unprep_clone(struct request *rq)
++ {
++ 	struct bio *bio;
++ 
++ 	while ((bio = rq->bio) != NULL) {
++ 		rq->bio = bio->bi_next;
++ 
++ 		bio_put(bio);
++ 	}
++ }
++ EXPORT_SYMBOL_GPL(blk_rq_unprep_clone);
++ 
++ /**
++  * blk_rq_prep_clone - Helper function to setup clone request
++  * @rq: the request to be setup
++  * @rq_src: original request to be cloned
++  * @bs: bio_set that bios for clone are allocated from
++  * @gfp_mask: memory allocation mask for bio
++  * @bio_ctr: setup function to be called for each clone bio.
++  *           Returns %0 for success, non %0 for failure.
++  * @data: private data to be passed to @bio_ctr
++  *
++  * Description:
++  *     Clones bios in @rq_src to @rq, and copies attributes of @rq_src to @rq.
++  *     Also, pages which the original bios are pointing to are not copied
++  *     and the cloned bios just point same pages.
++  *     So cloned bios must be completed before original bios, which means
++  *     the caller must complete @rq before @rq_src.
++  */
++ int blk_rq_prep_clone(struct request *rq, struct request *rq_src,
++ 		      struct bio_set *bs, gfp_t gfp_mask,
++ 		      int (*bio_ctr)(struct bio *, struct bio *, void *),
++ 		      void *data)
++ {
++ 	struct bio *bio, *bio_src;
++ 
++ 	if (!bs)
++ 		bs = &fs_bio_set;
++ 
++ 	__rq_for_each_bio(bio_src, rq_src) {
++ 		bio = bio_clone_fast(bio_src, gfp_mask, bs);
++ 		if (!bio)
++ 			goto free_and_out;
++ 		bio->bi_bdev = rq->q->disk->part0;
++ 
++ 		if (bio_ctr && bio_ctr(bio, bio_src, data))
++ 			goto free_and_out;
++ 
++ 		if (rq->bio) {
++ 			rq->biotail->bi_next = bio;
++ 			rq->biotail = bio;
++ 		} else {
++ 			rq->bio = rq->biotail = bio;
++ 		}
++ 		bio = NULL;
++ 	}
++ 
++ 	/* Copy attributes of the original request to the clone request. */
++ 	rq->__sector = blk_rq_pos(rq_src);
++ 	rq->__data_len = blk_rq_bytes(rq_src);
++ 	if (rq_src->rq_flags & RQF_SPECIAL_PAYLOAD) {
++ 		rq->rq_flags |= RQF_SPECIAL_PAYLOAD;
++ 		rq->special_vec = rq_src->special_vec;
++ 	}
++ 	rq->nr_phys_segments = rq_src->nr_phys_segments;
++ 	rq->ioprio = rq_src->ioprio;
++ 
++ 	if (rq->bio && blk_crypto_rq_bio_prep(rq, rq->bio, gfp_mask) < 0)
++ 		goto free_and_out;
++ 
++ 	return 0;
++ 
++ free_and_out:
++ 	if (bio)
++ 		bio_put(bio);
++ 	blk_rq_unprep_clone(rq);
++ 
++ 	return -ENOMEM;
++ }
++ EXPORT_SYMBOL_GPL(blk_rq_prep_clone);
++ 
++ /*
++  * Steal bios from a request and add them to a bio list.
++  * The request must not have been partially completed before.
++  */
++ void blk_steal_bios(struct bio_list *list, struct request *rq)
++ {
++ 	if (rq->bio) {
++ 		if (list->tail)
++ 			list->tail->bi_next = rq->bio;
+++>>>>>>> 592ee1197f78 (blk-mq: fix missing blk_account_io_done() in error path)
+  		else
+ -			list->head = rq->bio;
+ -		list->tail = rq->biotail;
+ +			last = list_entry_rq(plug->mq_list.prev);
+ +
+ +		if (request_count >= blk_plug_max_rq_count(plug) || (last &&
+ +		    blk_rq_bytes(last) >= BLK_PLUG_FLUSH_SIZE)) {
+ +			blk_flush_plug_list(plug, false);
+ +			trace_block_plug(q);
+ +		}
+ +
+ +		blk_add_rq_to_plug(plug, rq);
+ +	} else if (q->elevator) {
+ +		/* Insert the request at the IO scheduler queue */
+ +		blk_mq_sched_insert_request(rq, false, true, true);
+ +	} else if (plug && !blk_queue_nomerges(q)) {
+ +		/*
+ +		 * We do limited plugging. If the bio can be merged, do that.
+ +		 * Otherwise the existing request in the plug list will be
+ +		 * issued. So the plug list will have one request at most
+ +		 * The plug list might get flushed before this. If that happens,
+ +		 * the plug list is empty, and same_queue_rq is invalid.
+ +		 */
+ +		if (list_empty(&plug->mq_list))
+ +			same_queue_rq = NULL;
+ +		if (same_queue_rq) {
+ +			list_del_init(&same_queue_rq->queuelist);
+ +			plug->rq_count--;
+ +		}
+ +		blk_add_rq_to_plug(plug, rq);
+ +		trace_block_plug(q);
+  
+ -		rq->bio = NULL;
+ -		rq->biotail = NULL;
+ +		if (same_queue_rq) {
+ +			data.hctx = same_queue_rq->mq_hctx;
+ +			trace_block_unplug(q, 1, true);
+ +			blk_mq_try_issue_directly(data.hctx, same_queue_rq,
+ +					&cookie);
+ +		}
+ +	} else if ((q->nr_hw_queues > 1 && is_sync) ||
+ +			!data.hctx->dispatch_busy) {
+ +		/*
+ +		 * There is no scheduler and we can try to send directly
+ +		 * to the hardware.
+ +		 */
+ +		blk_mq_try_issue_directly(data.hctx, rq, &cookie);
+ +	} else {
+ +		/* Default case. */
+ +		blk_mq_sched_insert_request(rq, false, true, true);
+  	}
+  
+ -	rq->__data_len = 0;
+ +	if (!hipri)
+ +		return BLK_QC_T_NONE;
+ +	return cookie;
+ +queue_exit:
+ +	blk_queue_exit(q);
+ +	return BLK_QC_T_NONE;
+  }
+ -EXPORT_SYMBOL_GPL(blk_steal_bios);
+ +EXPORT_SYMBOL_GPL(blk_mq_make_request);
+  
+  static size_t order_to_size(unsigned int order)
+  {
+* Unmerged path block/blk-mq.c
