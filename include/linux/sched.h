@@ -1466,6 +1466,10 @@ struct task_struct {
 	RH_KABI_EXCLUDE(struct mem_cgroup *active_memcg)
 #endif
 
+#ifdef CONFIG_MEMCG_KMEM
+	struct obj_cgroup		*objcg;
+#endif
+
 #ifdef CONFIG_BLK_CGROUP
 	struct gendisk			*throttle_disk;
 #endif
