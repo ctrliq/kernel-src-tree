@@ -1,0 +1,176 @@
+smb: client: fix potential deadlock when releasing mids
+
+jira LE-2169
+Rebuild_History Non-Buildable kernel-4.18.0-553.30.1.el8_10
+commit-author Paulo Alcantara <pc@manguebit.com>
+commit e6322fd177c6885a21dd4609dc5e5c973d1a2eb7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.30.1.el8_10/e6322fd1.failed
+
+All release_mid() callers seem to hold a reference of @mid so there is
+no need to call kref_put(&mid->refcount, __release_mid) under
+@server->mid_lock spinlock.  If they don't, then an use-after-free bug
+would have occurred anyways.
+
+By getting rid of such spinlock also fixes a potential deadlock as
+shown below
+
+CPU 0                                CPU 1
+------------------------------------------------------------------
+cifs_demultiplex_thread()            cifs_debug_data_proc_show()
+ release_mid()
+  spin_lock(&server->mid_lock);
+                                     spin_lock(&cifs_tcp_ses_lock)
+				      spin_lock(&server->mid_lock)
+  __release_mid()
+   smb2_find_smb_tcon()
+    spin_lock(&cifs_tcp_ses_lock) *deadlock*
+
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Paulo Alcantara (SUSE) <pc@manguebit.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit e6322fd177c6885a21dd4609dc5e5c973d1a2eb7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/cifsproto.h
+#	fs/cifs/transport.c
+diff --cc fs/cifs/cifsproto.h
+index 7f8e1bfc462e,890ceddae07e..000000000000
+--- a/fs/cifs/cifsproto.h
++++ b/fs/cifs/cifsproto.h
+@@@ -75,15 -79,9 +75,21 @@@ extern char *cifs_build_path_to_root(st
+  				     struct cifs_tcon *tcon,
+  				     int add_treename);
+  extern char *build_wildcard_path_from_dentry(struct dentry *direntry);
+++<<<<<<< HEAD:fs/cifs/cifsproto.h
+ +extern char *cifs_compose_mount_options(const char *sb_mountdata,
+ +		const char *fullpath, const struct dfs_info3_param *ref,
+ +		char **devname);
+ +/* extern void renew_parental_timestamps(struct dentry *direntry);*/
+ +extern struct mid_q_entry *AllocMidQEntry(const struct smb_hdr *smb_buffer,
+ +					struct TCP_Server_Info *server);
+ +extern void DeleteMidQEntry(struct mid_q_entry *midEntry);
+ +extern void cifs_delete_mid(struct mid_q_entry *mid);
+ +extern void cifs_mid_q_entry_release(struct mid_q_entry *midEntry);
+++=======
++ char *cifs_build_devname(char *nodename, const char *prepath);
++ extern void delete_mid(struct mid_q_entry *mid);
++ void __release_mid(struct kref *refcount);
+++>>>>>>> e6322fd177c6 (smb: client: fix potential deadlock when releasing mids):fs/smb/client/cifsproto.h
+  extern void cifs_wake_up_task(struct mid_q_entry *mid);
+  extern int cifs_handle_standard(struct TCP_Server_Info *server,
+  				struct mid_q_entry *mid);
+@@@ -633,5 -697,52 +639,10 @@@ static inline int cifs_create_options(s
+  
+  struct super_block *cifs_get_tcon_super(struct cifs_tcon *tcon);
+  void cifs_put_tcon_super(struct super_block *sb);
+ -int cifs_wait_for_server_reconnect(struct TCP_Server_Info *server, bool retry);
+ -
+ -/* Put references of @ses and @ses->dfs_root_ses */
+ -static inline void cifs_put_smb_ses(struct cifs_ses *ses)
+ -{
+ -	struct cifs_ses *rses = ses->dfs_root_ses;
+ -
+ -	__cifs_put_smb_ses(ses);
+ -	if (rses)
+ -		__cifs_put_smb_ses(rses);
+ -}
+ -
+ -/* Get an active reference of @ses and @ses->dfs_root_ses.
+ - *
+ - * NOTE: make sure to call this function when incrementing reference count of
+ - * @ses to ensure that any DFS root session attached to it (@ses->dfs_root_ses)
+ - * will also get its reference count incremented.
+ - *
+ - * cifs_put_smb_ses() will put both references, so call it when you're done.
+ - */
+ -static inline void cifs_smb_ses_inc_refcount(struct cifs_ses *ses)
+ -{
+ -	lockdep_assert_held(&cifs_tcp_ses_lock);
+ -
+ -	ses->ses_count++;
+ -	if (ses->dfs_root_ses)
+ -		ses->dfs_root_ses->ses_count++;
+ -}
+ -
+ -static inline bool dfs_src_pathname_equal(const char *s1, const char *s2)
+ -{
+ -	if (strlen(s1) != strlen(s2))
+ -		return false;
+ -	for (; *s1; s1++, s2++) {
+ -		if (*s1 == '/' || *s1 == '\\') {
+ -			if (*s2 != '/' && *s2 != '\\')
+ -				return false;
+ -		} else if (tolower(*s1) != tolower(*s2))
+ -			return false;
+ -	}
+ -	return true;
+ -}
+  
++ static inline void release_mid(struct mid_q_entry *mid)
++ {
++ 	kref_put(&mid->refcount, __release_mid);
++ }
++ 
+  #endif			/* _CIFSPROTO_H */
+diff --cc fs/cifs/transport.c
+index 4d40492f744e,d553b7a54621..000000000000
+--- a/fs/cifs/transport.c
++++ b/fs/cifs/transport.c
+@@@ -75,7 -76,7 +75,11 @@@ AllocMidQEntry(const struct smb_hdr *sm
+  	return temp;
+  }
+  
+++<<<<<<< HEAD:fs/cifs/transport.c
+ +static void _cifs_mid_q_entry_release(struct kref *refcount)
+++=======
++ void __release_mid(struct kref *refcount)
+++>>>>>>> e6322fd177c6 (smb: client: fix potential deadlock when releasing mids):fs/smb/client/transport.c
+  {
+  	struct mid_q_entry *midEntry =
+  			container_of(refcount, struct mid_q_entry, refcount);
+@@@ -155,22 -156,10 +159,25 @@@
+  	mempool_free(midEntry, cifs_mid_poolp);
+  }
+  
+++<<<<<<< HEAD:fs/cifs/transport.c
+ +void cifs_mid_q_entry_release(struct mid_q_entry *midEntry)
+ +{
+ +	spin_lock(&GlobalMid_Lock);
+ +	kref_put(&midEntry->refcount, _cifs_mid_q_entry_release);
+ +	spin_unlock(&GlobalMid_Lock);
+ +}
+ +
+ +void DeleteMidQEntry(struct mid_q_entry *midEntry)
+ +{
+ +	cifs_mid_q_entry_release(midEntry);
+ +}
+ +
+++=======
+++>>>>>>> e6322fd177c6 (smb: client: fix potential deadlock when releasing mids):fs/smb/client/transport.c
+  void
+ -delete_mid(struct mid_q_entry *mid)
+ +cifs_delete_mid(struct mid_q_entry *mid)
+  {
+ -	spin_lock(&mid->server->mid_lock);
+ +	spin_lock(&GlobalMid_Lock);
+  	if (!(mid->mid_flags & MID_DELETED)) {
+  		list_del_init(&mid->qhead);
+  		mid->mid_flags |= MID_DELETED;
+* Unmerged path fs/cifs/cifsproto.h
+diff --git a/fs/cifs/smb2misc.c b/fs/cifs/smb2misc.c
+index c363c4accc2e..0fa907d36b30 100644
+--- a/fs/cifs/smb2misc.c
++++ b/fs/cifs/smb2misc.c
+@@ -782,7 +782,7 @@ __smb2_handle_cancelled_cmd(struct cifs_tcon *tcon, __u16 cmd, __u64 mid,
+ {
+ 	struct close_cancelled_open *cancelled;
+ 
+-	cancelled = kzalloc(sizeof(*cancelled), GFP_ATOMIC);
++	cancelled = kzalloc(sizeof(*cancelled), GFP_KERNEL);
+ 	if (!cancelled)
+ 		return -ENOMEM;
+ 
+* Unmerged path fs/cifs/transport.c
