@@ -162,6 +162,7 @@ static int clp_store_query_pci_fn(struct zpci_dev *zdev,
 	zdev->pft = response->pft;
 	zdev->vfn = response->vfn;
 	zdev->port = response->port;
+	zdev->fidparm = response->fidparm;
 	zdev->uid = response->uid;
 	zdev->fmb_length = sizeof(u32) * response->fmb_len;
 	zdev->rid_available = response->rid_avail;
