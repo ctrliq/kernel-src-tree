@@ -463,18 +463,24 @@ struct l2cap_le_credits {
 #define L2CAP_ECRED_MAX_CID		5
 
 struct l2cap_ecred_conn_req {
-	__le16 psm;
-	__le16 mtu;
-	__le16 mps;
-	__le16 credits;
+	/* New members must be added within the struct_group() macro below. */
+	__struct_group(l2cap_ecred_conn_req_hdr, hdr, __packed,
+		__le16 psm;
+		__le16 mtu;
+		__le16 mps;
+		__le16 credits;
+	);
 	__le16 scid[];
 } __packed;
 
 struct l2cap_ecred_conn_rsp {
-	__le16 mtu;
-	__le16 mps;
-	__le16 credits;
-	__le16 result;
+	/* New members must be added within the struct_group() macro below. */
+	struct_group_tagged(l2cap_ecred_conn_rsp_hdr, hdr,
+		__le16 mtu;
+		__le16 mps;
+		__le16 credits;
+		__le16 result;
+	);
 	__le16 dcid[];
 };
 
@@ -962,10 +968,6 @@ void l2cap_chan_list(struct l2cap_conn *conn, l2cap_chan_func_t func,
 		     void *data);
 void l2cap_chan_del(struct l2cap_chan *chan, int err);
 void l2cap_send_conn_req(struct l2cap_chan *chan);
-void l2cap_move_start(struct l2cap_chan *chan);
-void l2cap_logical_cfm(struct l2cap_chan *chan, struct hci_chan *hchan,
-		       u8 status);
-void __l2cap_physical_cfm(struct l2cap_chan *chan, int result);
 
 struct l2cap_conn *l2cap_conn_get(struct l2cap_conn *conn);
 void l2cap_conn_put(struct l2cap_conn *conn);
