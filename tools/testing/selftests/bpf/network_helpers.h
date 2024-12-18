@@ -11,6 +11,7 @@ typedef __u16 __sum16;
 #include <linux/ipv6.h>
 #include <netinet/tcp.h>
 #include <bpf/bpf_endian.h>
+#include <net/if.h>
 
 #define MAGIC_VAL 0x1234
 #define NUM_ITER 100000
