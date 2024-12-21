@@ -130,7 +130,7 @@ KERNEL_ATTR_RW(kexec_crash_size);
 
 #endif /* CONFIG_KEXEC_CORE */
 
-#ifdef CONFIG_CRASH_CORE
+#ifdef CONFIG_VMCORE_INFO
 
 static ssize_t vmcoreinfo_show(struct kobject *kobj,
 			       struct kobj_attribute *attr, char *buf)
@@ -153,7 +153,7 @@ KERNEL_ATTR_RO(crash_elfcorehdr_size);
 
 #endif
 
-#endif /* CONFIG_CRASH_CORE */
+#endif /* CONFIG_VMCORE_INFO */
 
 #if defined(CONFIG_PREEMPT_RT)
 static ssize_t realtime_show(struct kobject *kobj,
@@ -248,7 +248,7 @@ static struct attribute * kernel_attrs[] = {
 	&kexec_crash_loaded_attr.attr,
 	&kexec_crash_size_attr.attr,
 #endif
-#ifdef CONFIG_CRASH_CORE
+#ifdef CONFIG_VMCORE_INFO
 	&vmcoreinfo_attr.attr,
 #ifdef CONFIG_CRASH_HOTPLUG
 	&crash_elfcorehdr_size_attr.attr,
