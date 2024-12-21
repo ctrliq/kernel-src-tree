@@ -12,10 +12,10 @@
 
 void erofs_unmap_metabuf(struct erofs_buf *buf)
 {
-	if (buf->kmap_type == EROFS_KMAP)
-		kunmap_local(buf->base);
+	if (!buf->base)
+		return;
+	kunmap_local(buf->base);
 	buf->base = NULL;
-	buf->kmap_type = EROFS_NO_KMAP;
 }
 
 void erofs_put_metabuf(struct erofs_buf *buf)
@@ -54,14 +54,8 @@ void *erofs_bread(struct erofs_buf *buf, struct inode *inode,
 		page = folio_file_page(folio, index);
 		buf->page = page;
 	}
-	if (buf->kmap_type == EROFS_NO_KMAP) {
-		if (type == EROFS_KMAP)
-			buf->base = kmap_local_page(page);
-		buf->kmap_type = type;
-	} else if (buf->kmap_type != type) {
-		DBG_BUGON(1);
-		return ERR_PTR(-EFAULT);
-	}
+	if (!buf->base && type == EROFS_KMAP)
+		buf->base = kmap_local_page(page);
 	if (type == EROFS_NO_KMAP)
 		return NULL;
 	return buf->base + (offset & ~PAGE_MASK);
@@ -313,7 +307,6 @@ static int erofs_iomap_end(struct inode *inode, loff_t pos, loff_t length,
 		struct erofs_buf buf = {
 			.page = kmap_to_page(ptr),
 			.base = ptr,
-			.kmap_type = EROFS_KMAP,
 		};
 
 		DBG_BUGON(iomap->type != IOMAP_INLINE);

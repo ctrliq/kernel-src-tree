@@ -246,7 +246,6 @@ enum erofs_kmap_type {
 struct erofs_buf {
 	struct page *page;
 	void *base;
-	enum erofs_kmap_type kmap_type;
 };
 #define __EROFS_BUF_INITIALIZER	((struct erofs_buf){ .page = NULL })
 
