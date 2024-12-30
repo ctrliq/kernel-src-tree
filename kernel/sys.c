@@ -2388,6 +2388,13 @@ static inline int prctl_set_mdwe(unsigned long bits, unsigned long arg3,
 	if (bits & PR_MDWE_NO_INHERIT && !(bits & PR_MDWE_REFUSE_EXEC_GAIN))
 		return -EINVAL;
 
+	/*
+	 * EOPNOTSUPP might be more appropriate here in principle, but
+	 * existing userspace depends on EINVAL specifically.
+	 */
+	if (!arch_memory_deny_write_exec_supported())
+		return -EINVAL;
+
 	current_bits = get_current_mdwe();
 	if (current_bits && current_bits != bits)
 		return -EPERM; /* Cannot unset the flags */
