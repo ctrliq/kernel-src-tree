@@ -376,9 +376,7 @@ static struct request *blk_mq_rq_ctx_init(struct blk_mq_alloc_data *data,
 	rq->io_start_time_ns = 0;
 	rq->stats_sectors = 0;
 	rq->nr_phys_segments = 0;
-#if defined(CONFIG_BLK_DEV_INTEGRITY)
 	rq->nr_integrity_segments = 0;
-#endif
 	rq->end_io = NULL;
 	rq->end_io_data = NULL;
 
@@ -2545,6 +2543,9 @@ static void blk_mq_bio_to_request(struct request *rq, struct bio *bio,
 
 	rq->__sector = bio->bi_iter.bi_sector;
 	blk_rq_bio_prep(rq, bio, nr_segs);
+	if (bio_integrity(bio))
+		rq->nr_integrity_segments = blk_rq_count_integrity_sg(rq->q,
+								      bio);
 
 	/* This can't fail, since GFP_NOIO includes __GFP_DIRECT_RECLAIM. */
 	err = blk_crypto_rq_bio_prep(rq, bio, GFP_NOIO);
@@ -2752,6 +2753,7 @@ static void blk_mq_dispatch_plug_list(struct blk_plug *plug, bool from_sched)
 void blk_mq_flush_plug_list(struct blk_plug *plug, bool from_schedule)
 {
 	struct request *rq;
+	unsigned int depth;
 
 	/*
 	 * We may have been called recursively midway through handling
@@ -2762,6 +2764,7 @@ void blk_mq_flush_plug_list(struct blk_plug *plug, bool from_schedule)
 	 */
 	if (plug->rq_count == 0)
 		return;
+	depth = plug->rq_count;
 	plug->rq_count = 0;
 
 	if (!plug->multiple_queues && !plug->has_elevator && !from_schedule) {
@@ -2769,6 +2772,7 @@ void blk_mq_flush_plug_list(struct blk_plug *plug, bool from_schedule)
 
 		rq = rq_list_peek(&plug->mq_list);
 		q = rq->q;
+		trace_block_unplug(q, depth, true);
 
 		/*
 		 * Peek first request and see if we have a ->queue_rqs() hook.
@@ -2938,7 +2942,7 @@ void blk_mq_submit_bio(struct bio *bio)
 	struct blk_plug *plug = current->plug;
 	const int is_sync = op_is_sync(bio->bi_opf);
 	struct blk_mq_hw_ctx *hctx;
-	unsigned int nr_segs = 1;
+	unsigned int nr_segs;
 	struct request *rq;
 	blk_status_t ret;
 
@@ -2980,11 +2984,10 @@ void blk_mq_submit_bio(struct bio *bio)
 		goto queue_exit;
 	}
 
-	if (unlikely(bio_may_exceed_limits(bio, &q->limits))) {
-		bio = __bio_split_to_limits(bio, &q->limits, &nr_segs);
-		if (!bio)
-			goto queue_exit;
-	}
+	bio = __bio_split_to_limits(bio, &q->limits, &nr_segs);
+	if (!bio)
+		goto queue_exit;
+
 	if (!bio_integrity_prep(bio))
 		goto queue_exit;
 

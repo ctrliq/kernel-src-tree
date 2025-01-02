@@ -255,11 +255,9 @@ struct bio {
 	struct bio_crypt_ctx	*bi_crypt_context;
 #endif
 
-	union {
 #if defined(CONFIG_BLK_DEV_INTEGRITY)
-		struct bio_integrity_payload *bi_integrity; /* data integrity */
+	struct bio_integrity_payload *bi_integrity; /* data integrity */
 #endif
-	};
 
 	unsigned short		bi_vcnt;	/* how many bio_vec's */
 
@@ -293,7 +291,8 @@ struct bio {
  * bio flags
  */
 enum {
-	BIO_NO_PAGE_REF,	/* don't put release vec pages */
+	BIO_PAGE_PINNED,	/* Unpin pages in bio_release_pages() */
+	BIO_PAGE_REFFED,	/* put pages in bio_release_pages() */
 	BIO_CLONED,		/* doesn't own data */
 	BIO_BOUNCED,		/* bio is a bounce bio */
 	BIO_QUIET,		/* Make BIO Quiet */
