@@ -3160,7 +3160,7 @@ static struct scsi_host_template sht_v3_hw = {
 	.compat_ioctl		= sas_ioctl,
 #endif
 	.shost_attrs		= host_attrs_v3_hw,
-	.tag_alloc_policy	= BLK_TAG_ALLOC_RR,
+	.tag_alloc_policy_rr	= true,
 	.host_reset             = hisi_sas_host_reset,
 	.host_tagset		= 1,
 };
