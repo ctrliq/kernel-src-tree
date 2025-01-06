@@ -32,6 +32,7 @@
  *  "But they come in a choice of three flavours!"
  */
 #include <linux/compat.h>
+#include <linux/debugfs.h>
 #include <linux/jhash.h>
 #include <linux/pagemap.h>
 #include <linux/memblock.h>

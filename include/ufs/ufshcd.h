@@ -15,6 +15,7 @@
 #include <linux/bitfield.h>
 #include <linux/blk-crypto-profile.h>
 #include <linux/blk-mq.h>
+#include <linux/debugfs.h>
 #include <linux/devfreq.h>
 #include <linux/msi.h>
 #include <linux/pm_runtime.h>
