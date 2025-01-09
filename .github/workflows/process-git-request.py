@@ -5,8 +5,6 @@ import sys
 import subprocess
 import os
 
-requestors = {"gvrose8192": ""}
-
 def file_prepend(file, str):
     with open(file, 'r') as fd:
         contents = fd.read()
@@ -33,8 +31,7 @@ def process_git_request(fname, target_branch, source_branch, prj_dir):
             print(f"Command error output is {err}")
             file.write(f"Command error output is {err}")
             file.close()
-            retcode = 0
-            return retcode
+            return 1
             
         output_lines = out.split()
         # we just want the commit sha IDs
@@ -47,6 +44,7 @@ def process_git_request(fname, target_branch, source_branch, prj_dir):
         print(f"Error executing git command: {str(e)}")
         file.close()
         return 1
+    return 0
 
 first_arg, *argv_in = sys.argv[1:]  # Skip script name in sys.argv
 
@@ -69,7 +67,7 @@ requestor = str(argv_in[4])
 
 retcode = process_git_request(fname, target_branch, source_branch, prj_dir)
 
-if retcode != 200:
+if retcode != 0:
     with open(fname, 'r') as fd:
         contents = fd.read()
         print(contents)
