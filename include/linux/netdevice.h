@@ -633,8 +633,8 @@ struct netdev_queue {
 	struct net_device	*dev;
 	netdevice_tracker	dev_tracker;
 
-	RH_KABI_EXCLUDE(struct Qdisc __rcu	*qdisc)
-	RH_KABI_EXCLUDE(struct Qdisc __rcu	*qdisc_sleeping)
+	struct Qdisc __rcu	*qdisc;
+	struct Qdisc __rcu	*qdisc_sleeping;
 #ifdef CONFIG_SYSFS
 	struct kobject		kobj;
 #endif
@@ -1449,9 +1449,9 @@ struct net_device_ops {
 	int			(*ndo_set_vf_rss_query_en)(
 						   struct net_device *dev,
 						   int vf, bool setting);
-	RH_KABI_EXCLUDE(int	(*ndo_setup_tc)(struct net_device *dev,
+	int			(*ndo_setup_tc)(struct net_device *dev,
 						enum tc_setup_type type,
-						void *type_data))
+						void *type_data);
 #if IS_ENABLED(CONFIG_FCOE)
 	int			(*ndo_fcoe_enable)(struct net_device *dev);
 	int			(*ndo_fcoe_disable)(struct net_device *dev);
@@ -2118,7 +2118,7 @@ struct net_device {
 	struct nf_hook_entries __rcu *nf_hooks_egress;
 #endif
 #ifdef CONFIG_NET_XGRESS
-	RH_KABI_EXCLUDE(struct bpf_mprog_entry __rcu *tcx_egress)
+	struct bpf_mprog_entry __rcu *tcx_egress;
 #endif
 	__cacheline_group_end(net_device_read_tx);
 
@@ -2154,7 +2154,7 @@ struct net_device {
 	struct netpoll_info __rcu	*npinfo;
 #endif
 #ifdef CONFIG_NET_XGRESS
-	RH_KABI_EXCLUDE(struct bpf_mprog_entry __rcu *tcx_ingress)
+	struct bpf_mprog_entry __rcu *tcx_ingress;
 #endif
 	__cacheline_group_end(net_device_read_rx);
 
@@ -2341,7 +2341,7 @@ struct net_device {
  * Cache lines mostly used on transmit path
  */
 	unsigned int		num_tx_queues;
-	RH_KABI_EXCLUDE(struct Qdisc __rcu	*qdisc)
+	struct Qdisc __rcu	*qdisc;
 	unsigned int		tx_queue_len;
 	spinlock_t		tx_global_lock;
 
@@ -3323,8 +3323,8 @@ struct softnet_data {
 #ifdef CONFIG_NET_FLOW_LIMIT
 	struct sd_flow_limit __rcu *flow_limit;
 #endif
-	RH_KABI_EXCLUDE(struct Qdisc		*output_queue)
-	RH_KABI_EXCLUDE(struct Qdisc		**output_queue_tailp)
+	struct Qdisc		*output_queue;
+	struct Qdisc		**output_queue_tailp;
 	struct sk_buff		*completion_queue;
 #ifdef CONFIG_XFRM_OFFLOAD
 	struct sk_buff_head	xfrm_backlog;
