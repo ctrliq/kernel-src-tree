@@ -14,13 +14,13 @@ def file_prepend(file, str):
         fd.write(new_contents)
 
 def process_git_request(fname, target_branch, source_branch, prj_dir):
-    retcode = 200  # presume success
-    # print(f"Opening file {fname}")
+    retcode = 0  # presume success
+    print(f"Opening file {fname}")
     file = open(fname, "w")
     working_dir = prj_dir
-    # print(f"Working Dir : {working_dir}")
+    print(f"Working Dir : {working_dir}")
     os.chdir(working_dir)
-    # print(f"pwd : {os.getcwd()}")
+    print(f"pwd : {os.getcwd()}")
     git_cmd = f"git log --oneline --no-abbrev-commit origin/{target_branch}..origin/{source_branch}"
     print(git_cmd)
     try:
@@ -30,7 +30,7 @@ def process_git_request(fname, target_branch, source_branch, prj_dir):
             print(f"Command error output is {err}")
             file.write(f"Command error output is {err}")
             file.close()
-            retcode = 201
+            retcode = 0
             return retcode
             
         output_lines = out.split()
@@ -43,7 +43,7 @@ def process_git_request(fname, target_branch, source_branch, prj_dir):
     except Exception as e:
         print(f"Error executing git command: {str(e)}")
         file.close()
-        return 201
+        return 1
 
 first_arg, *argv_in = sys.argv[1:]  # Skip script name in sys.argv
 
