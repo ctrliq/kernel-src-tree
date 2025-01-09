@@ -44,8 +44,6 @@
 #include <linux/notifier.h>
 #include <linux/xarray.h>
 
-#include <linux/rh_kabi.h>
-
 struct user_namespace;
 struct proc_dir_entry;
 struct net_device;
@@ -157,7 +155,7 @@ struct net {
 	struct net_generic __rcu	*gen;
 
 	/* Used to store attached BPF programs */
-	RH_KABI_EXCLUDE_WITH_SIZE(struct netns_bpf	bpf, 128)
+	struct netns_bpf	bpf;
 
 	/* Note : following structs are cache line aligned */
 #ifdef CONFIG_XFRM
@@ -176,7 +174,7 @@ struct net {
 	struct netns_can	can;
 #endif
 #ifdef CONFIG_XDP_SOCKETS
-	RH_KABI_EXCLUDE_WITH_SIZE(struct netns_xdp	xdp, 32)
+	struct netns_xdp	xdp;
 #endif
 #if IS_ENABLED(CONFIG_CRYPTO_USER)
 	struct sock		*crypto_nlsk;

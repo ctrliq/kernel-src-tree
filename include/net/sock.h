@@ -540,7 +540,7 @@ struct sock {
 	void                    (*sk_destruct)(struct sock *sk);
 	RH_KABI_EXCLUDE(struct sock_reuseport __rcu	*sk_reuseport_cb)
 #ifdef CONFIG_BPF_SYSCALL
-	RH_KABI_EXCLUDE(struct bpf_local_storage __rcu	*sk_bpf_storage)
+	struct bpf_local_storage __rcu	*sk_bpf_storage;
 #endif
 	struct rcu_head		sk_rcu;
 	netns_tracker		ns_tracker;

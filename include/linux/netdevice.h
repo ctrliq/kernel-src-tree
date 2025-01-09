@@ -651,7 +651,7 @@ struct netdev_queue {
 	/* Subordinate device that the queue has been assigned to */
 	struct net_device	*sb_dev;
 #ifdef CONFIG_XDP_SOCKETS
-	RH_KABI_EXCLUDE(struct xsk_buff_pool    *pool)
+	struct xsk_buff_pool    *pool;
 #endif
 	/* NAPI instance for the queue
 	 * Readers and writers must hold RTNL
@@ -1577,15 +1577,15 @@ struct net_device_ops {
 						       struct sk_buff *skb);
 	void			(*ndo_set_rx_headroom)(struct net_device *dev,
 						       int needed_headroom);
-	RH_KABI_EXCLUDE(int	(*ndo_bpf)(struct net_device *dev,
-					   struct netdev_bpf *bpf))
-	RH_KABI_EXCLUDE(int	(*ndo_xdp_xmit)(struct net_device *dev, int n,
+	int			(*ndo_bpf)(struct net_device *dev,
+					   struct netdev_bpf *bpf);
+	int			(*ndo_xdp_xmit)(struct net_device *dev, int n,
 						struct xdp_frame **xdp,
-						u32 flags))
-	RH_KABI_EXCLUDE(struct net_device *	(*ndo_xdp_get_xmit_slave)(struct net_device *dev,
-									  struct xdp_buff *xdp))
-	RH_KABI_EXCLUDE(int	(*ndo_xsk_wakeup)(struct net_device *dev,
-						  u32 queue_id, u32 flags))
+						u32 flags);
+	struct net_device *	(*ndo_xdp_get_xmit_slave)(struct net_device *dev,
+							  struct xdp_buff *xdp);
+	int			(*ndo_xsk_wakeup)(struct net_device *dev,
+						  u32 queue_id, u32 flags);
 	struct devlink_port *	(*__rh_deprecated_ndo_get_devlink_port)(struct net_device *dev);
 	int			(*ndo_tunnel_ctl)(struct net_device *dev,
 						  struct ip_tunnel_parm_kern *p,
@@ -2138,7 +2138,7 @@ struct net_device {
 
 	/* RX read-mostly hotpath */
 	__cacheline_group_begin(net_device_read_rx);
-	RH_KABI_EXCLUDE(struct bpf_prog __rcu	*xdp_prog)
+	struct bpf_prog __rcu	*xdp_prog;
 	struct list_head	ptype_specific;
 	int			ifindex;
 	unsigned int		real_num_rx_queues;
@@ -2189,8 +2189,8 @@ struct net_device {
 
 	/* Read-mostly cache-line for fast-path access */
 	xdp_features_t		xdp_features;
-	RH_KABI_EXCLUDE(const struct xdp_metadata_ops *xdp_metadata_ops)
-	RH_KABI_EXCLUDE(const struct xsk_tx_metadata_ops *xsk_tx_metadata_ops)
+	const struct xsk_tx_metadata_ops *xsk_tx_metadata_ops;
+	const struct xdp_metadata_ops *xdp_metadata_ops;
 	unsigned short		gflags;
 
 	unsigned short		needed_tailroom;
@@ -2345,7 +2345,7 @@ struct net_device {
 	unsigned int		tx_queue_len;
 	spinlock_t		tx_global_lock;
 
-	RH_KABI_EXCLUDE(struct xdp_dev_bulk_queue __percpu *xdp_bulkq)
+	struct xdp_dev_bulk_queue __percpu *xdp_bulkq;
 
 #ifdef CONFIG_NET_SCHED
 	DECLARE_HASHTABLE	(qdisc_hash, 4);
@@ -2454,7 +2454,7 @@ struct net_device {
 	struct ethtool_netdev_state *ethtool;
 
 	/* protected by rtnl_lock */
-	RH_KABI_EXCLUDE_WITH_SIZE(struct bpf_xdp_entity	xdp_state[__MAX_XDP_MODE], 24)
+	struct bpf_xdp_entity	xdp_state[__MAX_XDP_MODE];
 
 	netdevice_tracker	linkwatch_dev_tracker;
 	netdevice_tracker	watchdog_dev_tracker;
