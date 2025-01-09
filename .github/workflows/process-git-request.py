@@ -22,7 +22,7 @@ def process_git_request(fname, target_branch, source_branch, prj_dir):
     os.chdir(working_dir)
     # print(f"pwd : {os.getcwd()}")
     git_cmd = f"git log --oneline --no-abbrev-commit origin/{target_branch}..origin/{source_branch}"
-    # print(git_cmd)
+    print(git_cmd)
     try:
         out, err = subprocess.Popen(git_cmd, shell=True, stdout=subprocess.PIPE, 
                                   stderr=subprocess.PIPE, text=True).communicate()
