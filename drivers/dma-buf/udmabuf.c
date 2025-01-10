@@ -224,7 +224,7 @@ static const struct dma_buf_ops udmabuf_ops = {
 };
 
 #define SEALS_WANTED (F_SEAL_SHRINK)
-#define SEALS_DENIED (F_SEAL_WRITE)
+#define SEALS_DENIED (F_SEAL_WRITE|F_SEAL_FUTURE_WRITE)
 
 static int handle_hugetlb_pages(struct udmabuf *ubuf, struct file *memfd,
 				pgoff_t offset, pgoff_t pgcnt,
