@@ -15,7 +15,7 @@
  * To explore any of the IUCV functions, one must first register their
  * program using iucv_register(). Once your program has successfully
  * completed a register, it can exploit the other functions.
- * For furthur reference on all IUCV functionality, refer to the
+ * For further reference on all IUCV functionality, refer to the
  * CP Programming Services book, also available on the web thru
  * www.vm.ibm.com/pubs, manual # SC24-6084
  *
@@ -81,7 +81,7 @@ struct iucv_array {
 	u32 length;
 } __attribute__ ((aligned (8)));
 
-extern struct bus_type iucv_bus;
+extern const struct bus_type iucv_bus;
 extern struct device *iucv_root;
 
 struct device_driver;
@@ -496,7 +496,7 @@ struct iucv_interface {
 	int (*path_sever)(struct iucv_path *path, u8 userdata[16]);
 	int (*iucv_register)(struct iucv_handler *handler, int smp);
 	void (*iucv_unregister)(struct iucv_handler *handler, int smp);
-	struct bus_type *bus;
+	const struct bus_type *bus;
 	struct device *root;
 };
 
