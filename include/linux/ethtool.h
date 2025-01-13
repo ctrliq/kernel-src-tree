@@ -276,6 +276,9 @@ struct ethtool_keee {
 	bool	tx_lpi_enabled;
 	bool	eee_active;
 	bool	eee_enabled;
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
 };
 
 struct kernel_ethtool_coalesce {
