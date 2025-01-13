@@ -20,7 +20,7 @@ static void *io_mem_alloc_compound(struct page **pages, int nr_pages,
 	int i, order;
 
 	order = get_order(size);
-	if (order > MAX_ORDER)
+	if (order > MAX_PAGE_ORDER)
 		return ERR_PTR(-ENOMEM);
 	else if (order)
 		gfp |= __GFP_COMP;
