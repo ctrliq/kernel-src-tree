@@ -677,7 +677,7 @@ struct kmap_ctrl {
 #endif
 };
 
-struct task_struct // oops only breaks
+struct task_struct; // oops only breaks
 
 struct task_struct_rh {
 	/* Empty if CONFIG_POSIX_CPUTIMERS=n */
