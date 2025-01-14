@@ -675,7 +675,7 @@ static int hook_file_open(struct file *const file)
 	return check_access_path(dom, &file->f_path, get_file_access(file));
 }
 
-static struct security_hook_list landlock_hooks[] __lsm_ro_after_init = {
+static struct security_hook_list landlock_hooks[] __ro_after_init = {
 	LSM_HOOK_INIT(inode_free_security, hook_inode_free_security),
 
 	LSM_HOOK_INIT(sb_delete, hook_sb_delete),
@@ -699,5 +699,5 @@ static struct security_hook_list landlock_hooks[] __lsm_ro_after_init = {
 __init void landlock_add_fs_hooks(void)
 {
 	security_add_hooks(landlock_hooks, ARRAY_SIZE(landlock_hooks),
-			   LANDLOCK_NAME);
+			   &landlock_lsmid);
 }

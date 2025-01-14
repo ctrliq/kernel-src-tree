@@ -895,8 +895,11 @@ asmlinkage __visible void __init __no_sanitize_address __noreturn start_kernel(v
 	page_address_init();
 	pr_notice("%s", linux_banner);
 	pr_notice("The list of certified hardware and cloud instances for Red Hat Enterprise Linux 9 can be viewed at the Red Hat Ecosystem Catalog, https://catalog.redhat.com.\n");
-	early_security_init();
 	setup_arch(&command_line);
+	/* Static keys and static calls are needed by LSMs */
+	jump_label_init();
+	static_call_init();
+	early_security_init();
 	setup_boot_config();
 	setup_command_line(command_line);
 	setup_nr_cpu_ids();
@@ -906,7 +909,6 @@ asmlinkage __visible void __init __no_sanitize_address __noreturn start_kernel(v
 
 	pr_notice("Kernel command line: %s\n", saved_command_line);
 	/* parameters may set static keys */
-	jump_label_init();
 	parse_early_param();
 	after_dashes = parse_args("Booting kernel",
 				  static_command_line, __start___param,

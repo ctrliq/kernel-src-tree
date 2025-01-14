@@ -93,6 +93,7 @@
 #include <linux/fsnotify.h>
 #include <linux/fanotify.h>
 #include <linux/io_uring/cmd.h>
+#include <uapi/linux/lsm.h>
 
 #include "avc.h"
 #include "objsec.h"
@@ -104,6 +105,8 @@
 #include "netlabel.h"
 #include "audit.h"
 #include "avc_ss.h"
+
+#define SELINUX_INODE_INIT_XATTRS 1
 
 struct selinux_state selinux_state;
 
@@ -2912,11 +2915,11 @@ static int selinux_dentry_create_files_as(struct dentry *dentry, int mode,
 
 static int selinux_inode_init_security(struct inode *inode, struct inode *dir,
 				       const struct qstr *qstr,
-				       const char **name,
-				       void **value, size_t *len)
+				       struct xattr *xattrs, int *xattr_count)
 {
 	const struct task_security_struct *tsec = selinux_cred(current_cred());
 	struct superblock_security_struct *sbsec;
+	struct xattr *xattr = lsm_get_xattr_slot(xattrs, xattr_count);
 	u32 newsid, clen;
 	int rc;
 	char *context;
@@ -2943,16 +2946,14 @@ static int selinux_inode_init_security(struct inode *inode, struct inode *dir,
 	    !(sbsec->flags & SBLABEL_MNT))
 		return -EOPNOTSUPP;
 
-	if (name)
-		*name = XATTR_SELINUX_SUFFIX;
-
-	if (value && len) {
+	if (xattr) {
 		rc = security_sid_to_context_force(&selinux_state, newsid,
 						   &context, &clen);
 		if (rc)
 			return rc;
-		*value = context;
-		*len = clen;
+		xattr->value = context;
+		xattr->value_len = clen;
+		xattr->name = XATTR_SELINUX_SUFFIX;
 	}
 
 	return 0;
@@ -6988,13 +6989,14 @@ static void selinux_bpf_token_free(struct bpf_token *token)
 }
 #endif
 
-struct lsm_blob_sizes selinux_blob_sizes __lsm_ro_after_init = {
+struct lsm_blob_sizes selinux_blob_sizes __ro_after_init = {
 	.lbs_cred = sizeof(struct task_security_struct),
 	.lbs_file = sizeof(struct file_security_struct),
 	.lbs_inode = sizeof(struct inode_security_struct),
 	.lbs_ipc = sizeof(struct ipc_security_struct),
 	.lbs_msg_msg = sizeof(struct msg_security_struct),
 	.lbs_superblock = sizeof(struct superblock_security_struct),
+	.lbs_xattr_count = SELINUX_INODE_INIT_XATTRS,
 };
 
 #ifdef CONFIG_PERF_EVENTS
@@ -7109,6 +7111,11 @@ static int selinux_uring_cmd(struct io_uring_cmd *ioucmd)
 }
 #endif /* CONFIG_IO_URING */
 
+const struct lsm_id selinux_lsmid = {
+	.name = "selinux",
+	.id = LSM_ID_SELINUX,
+};
+
 /*
  * IMPORTANT NOTE: When adding new hooks, please be careful to keep this order:
  * 1. any hooks that don't belong to (2.) or (3.) below,
@@ -7119,12 +7126,8 @@ static int selinux_uring_cmd(struct io_uring_cmd *ioucmd)
  *    hooks ("allocating" hooks).
  *
  * Please follow block comment delimiters in the list to keep this order.
- *
- * This ordering is needed for SELinux runtime disable to work at least somewhat
- * safely. Breaking the ordering rules above might lead to NULL pointer derefs
- * when disabling SELinux at runtime.
  */
-static struct security_hook_list selinux_hooks[] __lsm_ro_after_init = {
+static struct security_hook_list selinux_hooks[] __ro_after_init = {
 	LSM_HOOK_INIT(binder_set_context_mgr, selinux_binder_set_context_mgr),
 	LSM_HOOK_INIT(binder_transaction, selinux_binder_transaction),
 	LSM_HOOK_INIT(binder_transfer_binder, selinux_binder_transfer_binder),
@@ -7432,7 +7435,8 @@ static __init int selinux_init(void)
 
 	hashtab_cache_init();
 
-	security_add_hooks(selinux_hooks, ARRAY_SIZE(selinux_hooks), "selinux");
+	security_add_hooks(selinux_hooks, ARRAY_SIZE(selinux_hooks),
+			   &selinux_lsmid);
 
 	if (avc_add_callback(selinux_netcache_avc_callback, AVC_CALLBACK_RESET))
 		panic("SELinux: Unable to register AVC netcache callback\n");
@@ -7475,7 +7479,6 @@ DEFINE_LSM(selinux) = {
 };
 
 #if defined(CONFIG_NETFILTER)
-
 static const struct nf_hook_ops selinux_nf_ops[] = {
 	{
 		.hook =		selinux_ip_postroute,
@@ -7550,56 +7553,4 @@ static int __init selinux_nf_ip_init(void)
 	return 0;
 }
 __initcall(selinux_nf_ip_init);
-
-#ifdef CONFIG_SECURITY_SELINUX_DISABLE
-static void selinux_nf_ip_exit(void)
-{
-	pr_debug("SELinux:  Unregistering netfilter hooks\n");
-
-	unregister_pernet_subsys(&selinux_net_ops);
-}
-#endif
-
-#else /* CONFIG_NETFILTER */
-
-#ifdef CONFIG_SECURITY_SELINUX_DISABLE
-#define selinux_nf_ip_exit()
-#endif
-
 #endif /* CONFIG_NETFILTER */
-
-#ifdef CONFIG_SECURITY_SELINUX_DISABLE
-int selinux_disable(struct selinux_state *state)
-{
-	if (selinux_initialized(state)) {
-		/* Not permitted after initial policy load. */
-		return -EINVAL;
-	}
-
-	if (selinux_disabled(state)) {
-		/* Only do this once. */
-		return -EINVAL;
-	}
-
-	selinux_mark_disabled(state);
-
-	pr_info("SELinux:  Disabled at runtime.\n");
-
-	/*
-	 * Unregister netfilter hooks.
-	 * Must be done before security_delete_hooks() to avoid breaking
-	 * runtime disable.
-	 */
-	selinux_nf_ip_exit();
-
-	security_delete_hooks(selinux_hooks, ARRAY_SIZE(selinux_hooks));
-
-	/* Try to destroy the avc node cache */
-	avc_disable();
-
-	/* Unregister selinuxfs. */
-	exit_sel_fs();
-
-	return 0;
-}
-#endif
