@@ -2010,7 +2010,7 @@ static inline bool __init deferred_pfn_valid(unsigned long pfn)
 
 /*
  * Free pages to buddy allocator. Try to free aligned pages in
- * pageblock_nr_pages sizes.
+ * MAX_ORDER_NR_PAGES sizes.
  */
 static void __init deferred_free_pages(unsigned long pfn,
 				       unsigned long end_pfn)
@@ -2021,7 +2021,7 @@ static void __init deferred_free_pages(unsigned long pfn,
 		if (!deferred_pfn_valid(pfn)) {
 			deferred_free_range(pfn - nr_free, nr_free);
 			nr_free = 0;
-		} else if (pageblock_aligned(pfn)) {
+		} else if (IS_MAX_ORDER_ALIGNED(pfn)) {
 			deferred_free_range(pfn - nr_free, nr_free);
 			nr_free = 1;
 		} else {
@@ -2034,7 +2034,7 @@ static void __init deferred_free_pages(unsigned long pfn,
 
 /*
  * Initialize struct pages.  We minimize pfn page lookups and scheduler checks
- * by performing it only once every pageblock_nr_pages.
+ * by performing it only once every MAX_ORDER_NR_PAGES.
  * Return number of pages initialized.
  */
 static unsigned long  __init deferred_init_pages(struct zone *zone,
@@ -2265,8 +2265,7 @@ zone_empty:
  * it is called from a __ref function _deferred_grow_zone. This way we are
  * making sure that it is not inlined into permanent text section.
  */
-bool __init
-deferred_grow_zone(struct zone *zone, unsigned int order)
+bool __init deferred_grow_zone(struct zone *zone, unsigned int order)
 {
 	unsigned long nr_pages_needed = ALIGN(1 << order, PAGES_PER_SECTION);
 	pg_data_t *pgdat = zone->zone_pgdat;
@@ -2325,6 +2324,7 @@ deferred_grow_zone(struct zone *zone, unsigned int order)
 
 	return nr_pages > 0;
 }
+
 #endif /* CONFIG_DEFERRED_STRUCT_PAGE_INIT */
 
 #ifdef CONFIG_CMA
