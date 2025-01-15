@@ -2977,11 +2977,11 @@ int addrconf_set_dstaddr(struct net *net, void __user *arg)
 	if (copy_from_user(&ireq, arg, sizeof(struct in6_ifreq)))
 		return -EFAULT;
 
-	rtnl_lock();
+	rtnl_net_lock(net);
 	dev = __dev_get_by_index(net, ireq.ifr6_ifindex);
 	if (dev && dev->type == ARPHRD_SIT)
 		err = addrconf_set_sit_dstaddr(net, dev, &ireq);
-	rtnl_unlock();
+	rtnl_net_unlock(net);
 	return err;
 }
 
@@ -3175,7 +3175,7 @@ int addrconf_add_ifaddr(struct net *net, void __user *arg)
 	cfg.pfx = &ireq.ifr6_addr;
 	cfg.plen = ireq.ifr6_prefixlen;
 
-	rtnl_lock();
+	rtnl_net_lock(net);
 	dev = __dev_get_by_index(net, ireq.ifr6_ifindex);
 	if (dev) {
 		netdev_lock_ops(dev);
@@ -3184,7 +3184,7 @@ int addrconf_add_ifaddr(struct net *net, void __user *arg)
 	} else {
 		err = -ENODEV;
 	}
-	rtnl_unlock();
+	rtnl_net_unlock(net);
 	return err;
 }
 
@@ -3199,10 +3199,10 @@ int addrconf_del_ifaddr(struct net *net, void __user *arg)
 	if (copy_from_user(&ireq, arg, sizeof(struct in6_ifreq)))
 		return -EFAULT;
 
-	rtnl_lock();
+	rtnl_net_lock(net);
 	err = inet6_addr_del(net, ireq.ifr6_ifindex, 0, &ireq.ifr6_addr,
 			     ireq.ifr6_prefixlen, NULL);
-	rtnl_unlock();
+	rtnl_net_unlock(net);
 	return err;
 }
 
