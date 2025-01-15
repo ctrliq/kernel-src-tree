@@ -700,7 +700,7 @@ struct task_struct_rh {
 #endif
 
 	/* pointer back to the main task_struct */
-	struct task_struct		*task_struct; // ooops only break;
+	struct task_struct		*task_struct // ooops only break;
 	int				trc_reader_nesting;
 	int				trc_ipi_to_cpu;
 	union rcu_special		trc_reader_special;
