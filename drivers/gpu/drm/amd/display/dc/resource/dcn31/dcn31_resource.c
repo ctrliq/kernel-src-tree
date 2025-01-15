@@ -75,7 +75,6 @@
 #include "dcn30/dcn30_dwb.h"
 #include "dcn30/dcn30_mmhubbub.h"
 
-// TODO: change include headers /amd/include/asic_reg after upstream
 #include "yellow_carp_offset.h"
 #include "dcn/dcn_3_1_2_offset.h"
 #include "dcn/dcn_3_1_2_sh_mask.h"
@@ -1647,7 +1646,7 @@ int dcn31_populate_dml_pipes_from_context(
 {
 	int i, pipe_cnt;
 	struct resource_context *res_ctx = &context->res_ctx;
-	struct pipe_ctx *pipe;
+	struct pipe_ctx *pipe = 0;
 	bool upscaled = false;
 
 	DC_FP_START();
@@ -1776,7 +1775,7 @@ bool dcn31_validate_bandwidth(struct dc *dc,
 	out = dcn30_internal_validate_bw(dc, context, pipes, &pipe_cnt, &vlevel, fast_validate, true);
 	DC_FP_END();
 
-	// Disable fast_validate to set min dcfclk in alculate_wm_and_dlg
+	// Disable fast_validate to set min dcfclk in calculate_wm_and_dlg
 	if (pipe_cnt == 0)
 		fast_validate = false;
 
@@ -1865,6 +1864,7 @@ static struct clock_source *dcn30_clock_source_create(
 		return &clk_src->base;
 	}
 
+	kfree(clk_src);
 	BREAK_TO_DEBUGGER();
 	return NULL;
 }
@@ -1948,6 +1948,7 @@ static bool dcn31_resource_construct(
 
 	/* Use pipe context based otg sync logic */
 	dc->config.use_pipe_ctx_sync_logic = true;
+	dc->config.disable_hbr_audio_dp2 = true;
 
 	/* read VBIOS LTTPR caps */
 	{

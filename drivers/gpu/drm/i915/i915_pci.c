@@ -24,9 +24,8 @@
 
 #include <drm/drm_color_mgmt.h>
 #include <drm/drm_drv.h>
-#include <drm/i915_pciids.h>
+#include <drm/intel/i915_pciids.h>
 
-#include "display/intel_display.h"
 #include "display/intel_display_driver.h"
 #include "gt/intel_gt_regs.h"
 #include "gt/intel_sa_media.h"
@@ -37,6 +36,9 @@
 #include "i915_pci.h"
 #include "i915_reg.h"
 #include "intel_pci_config.h"
+
+__diag_push();
+__diag_ignore_all("-Woverride-init", "Allow field initialization overrides for device info");
 
 #define PLATFORM(x) .platform = (x)
 #define GEN(x) \
@@ -59,14 +61,6 @@
 		[I915_CACHE_WT]     = 2, \
 	}
 
-#define PVC_CACHELEVEL \
-	.cachelevel_to_pat = { \
-		[I915_CACHE_NONE]   = 0, \
-		[I915_CACHE_LLC]    = 3, \
-		[I915_CACHE_L3_LLC] = 3, \
-		[I915_CACHE_WT]     = 2, \
-	}
-
 #define MTL_CACHELEVEL \
 	.cachelevel_to_pat = { \
 		[I915_CACHE_NONE]   = 2, \
@@ -81,7 +75,7 @@
 	.__runtime.page_sizes = I915_GTT_PAGE_SIZE_4K
 
 #define GEN_DEFAULT_REGIONS \
-	.memory_regions = REGION_SMEM | REGION_STOLEN_SMEM
+	.memory_regions = BIT(INTEL_REGION_SMEM) | BIT(INTEL_REGION_STOLEN_SMEM)
 
 #define I830_FEATURES \
 	GEN(2), \
@@ -660,7 +654,7 @@ static const struct intel_device_info rkl_info = {
 };
 
 #define DGFX_FEATURES \
-	.memory_regions = REGION_SMEM | REGION_LMEM | REGION_STOLEN_LMEM, \
+	.memory_regions = BIT(INTEL_REGION_SMEM) | BIT(INTEL_REGION_LMEM_0) | BIT(INTEL_REGION_STOLEN_LMEM), \
 	.has_llc = 0, \
 	.has_pxp = 0, \
 	.has_snoop = 1, \
@@ -705,8 +699,6 @@ static const struct intel_device_info adl_p_info = {
 		I915_GTT_PAGE_SIZE_2M
 
 #define XE_HP_FEATURES \
-	.__runtime.graphics.ip.ver = 12, \
-	.__runtime.graphics.ip.rel = 50, \
 	XE_HP_PAGE_SIZES, \
 	TGL_CACHELEVEL, \
 	.dma_mask_size = 46, \
@@ -730,32 +722,12 @@ static const struct intel_device_info adl_p_info = {
 	.__runtime.ppgtt_size = 48, \
 	.__runtime.ppgtt_type = INTEL_PPGTT_FULL
 
-#define XE_HPM_FEATURES \
-	.__runtime.media.ip.ver = 12, \
-	.__runtime.media.ip.rel = 50
-
-__maybe_unused
-static const struct intel_device_info xehpsdv_info = {
-	XE_HP_FEATURES,
-	XE_HPM_FEATURES,
-	DGFX_FEATURES,
-	PLATFORM(INTEL_XEHPSDV),
-	.has_64k_pages = 1,
-	.has_media_ratio_mode = 1,
-	.platform_engine_mask =
-		BIT(RCS0) | BIT(BCS0) |
-		BIT(VECS0) | BIT(VECS1) | BIT(VECS2) | BIT(VECS3) |
-		BIT(VCS0) | BIT(VCS1) | BIT(VCS2) | BIT(VCS3) |
-		BIT(VCS4) | BIT(VCS5) | BIT(VCS6) | BIT(VCS7) |
-		BIT(CCS0) | BIT(CCS1) | BIT(CCS2) | BIT(CCS3),
-	.require_force_probe = 1,
-};
-
 #define DG2_FEATURES \
 	XE_HP_FEATURES, \
-	XE_HPM_FEATURES, \
 	DGFX_FEATURES, \
+	.__runtime.graphics.ip.ver = 12, \
 	.__runtime.graphics.ip.rel = 55, \
+	.__runtime.media.ip.ver = 12, \
 	.__runtime.media.ip.rel = 55, \
 	PLATFORM(INTEL_DG2), \
 	.has_64k_pages = 1, \
@@ -776,33 +748,6 @@ static const struct intel_device_info ats_m_info = {
 	DG2_FEATURES,
 	.require_force_probe = 1,
 	.tuning_thread_rr_after_dep = 1,
-};
-
-#define XE_HPC_FEATURES \
-	XE_HP_FEATURES, \
-	.dma_mask_size = 52, \
-	.has_3d_pipeline = 0, \
-	.has_guc_deprivilege = 1, \
-	.has_l3_ccs_read = 1, \
-	.has_mslice_steering = 0, \
-	.has_one_eu_per_fuse_bit = 1
-
-__maybe_unused
-static const struct intel_device_info pvc_info = {
-	XE_HPC_FEATURES,
-	XE_HPM_FEATURES,
-	DGFX_FEATURES,
-	.__runtime.graphics.ip.rel = 60,
-	.__runtime.media.ip.rel = 60,
-	PLATFORM(INTEL_PONTEVECCHIO),
-	.has_flat_ccs = 0,
-	.max_pat_index = 7,
-	.platform_engine_mask =
-		BIT(BCS0) |
-		BIT(VCS0) |
-		BIT(CCS0) | BIT(CCS1) | BIT(CCS2) | BIT(CCS3),
-	.require_force_probe = 1,
-	PVC_CACHELEVEL,
 };
 
 static const struct intel_gt_definition xelpmp_extra_gt[] = {
@@ -835,12 +780,14 @@ static const struct intel_device_info mtl_info = {
 	.has_snoop = 1,
 	.max_pat_index = 4,
 	.has_pxp = 1,
-	.memory_regions = REGION_SMEM | REGION_STOLEN_LMEM,
+	.memory_regions = BIT(INTEL_REGION_SMEM) | BIT(INTEL_REGION_STOLEN_LMEM),
 	.platform_engine_mask = BIT(RCS0) | BIT(BCS0) | BIT(CCS0),
 	MTL_CACHELEVEL,
 };
 
 #undef PLATFORM
+
+__diag_pop();
 
 /*
  * Make sure any device matches here are from most specific to most
@@ -932,7 +879,7 @@ static void i915_pci_remove(struct pci_dev *pdev)
 {
 	struct drm_i915_private *i915;
 
-	i915 = pci_get_drvdata(pdev);
+	i915 = pdev_to_i915(pdev);
 	if (!i915) /* driver load aborted, nothing to cleanup */
 		return;
 
@@ -1055,7 +1002,7 @@ static int i915_pci_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	if (err)
 		return err;
 
-	if (i915_inject_probe_failure(pci_get_drvdata(pdev))) {
+	if (i915_inject_probe_failure(pdev_to_i915(pdev))) {
 		i915_pci_remove(pdev);
 		return -ENODEV;
 	}
@@ -1077,7 +1024,7 @@ static int i915_pci_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 static void i915_pci_shutdown(struct pci_dev *pdev)
 {
-	struct drm_i915_private *i915 = pci_get_drvdata(pdev);
+	struct drm_i915_private *i915 = pdev_to_i915(pdev);
 
 	i915_driver_shutdown(i915);
 }
