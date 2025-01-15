@@ -3012,7 +3012,7 @@ static int inet6_addr_add(struct net *net, struct net_device *dev,
 	struct inet6_ifaddr *ifp;
 	struct inet6_dev *idev;
 
-	ASSERT_RTNL();
+	ASSERT_RTNL_NET(net);
 
 	if (cfg->plen > 128) {
 		NL_SET_ERR_MSG_MOD(extack, "Invalid prefix length");
@@ -4853,7 +4853,7 @@ static int inet6_addr_modify(struct net *net, struct inet6_ifaddr *ifp,
 	bool new_peer = false;
 	bool had_prefixroute;
 
-	ASSERT_RTNL();
+	ASSERT_RTNL_NET(net);
 
 	if (cfg->ifa_flags & IFA_F_MANAGETEMPADDR &&
 	    (ifp->flags & IFA_F_TEMPORARY || ifp->prefix_len != 64))
@@ -5023,10 +5023,13 @@ inet6_rtm_newaddr(struct sk_buff *skb, struct nlmsghdr *nlh,
 		}
 	}
 
+	rtnl_net_lock(net);
+
 	dev =  __dev_get_by_index(net, ifm->ifa_index);
 	if (!dev) {
 		NL_SET_ERR_MSG_MOD(extack, "Unable to find the interface");
-		return -ENODEV;
+		err = -ENODEV;
+		goto unlock_rtnl;
 	}
 
 	netdev_lock_ops(dev);
@@ -5065,9 +5068,10 @@ inet6_rtm_newaddr(struct sk_buff *skb, struct nlmsghdr *nlh,
 	}
 
 	in6_ifa_put(ifa);
-
 unlock:
 	netdev_unlock_ops(dev);
+unlock_rtnl:
+	rtnl_net_unlock(net);
 
 	return err;
 }
@@ -7425,7 +7429,7 @@ static const struct rtnl_msg_handler addrconf_rtnl_msg_handlers[] __initconst_or
 	{.owner = THIS_MODULE, .protocol = PF_INET6, .msgtype = RTM_GETLINK,
 	 .dumpit = inet6_dump_ifinfo, .flags = RTNL_FLAG_DUMP_UNLOCKED},
 	{.owner = THIS_MODULE, .protocol = PF_INET6, .msgtype = RTM_NEWADDR,
-	 .doit = inet6_rtm_newaddr},
+	 .doit = inet6_rtm_newaddr, .flags = RTNL_FLAG_DOIT_PERNET},
 	{.owner = THIS_MODULE, .protocol = PF_INET6, .msgtype = RTM_DELADDR,
 	 .doit = inet6_rtm_deladdr},
 	{.owner = THIS_MODULE, .protocol = PF_INET6, .msgtype = RTM_GETADDR,
