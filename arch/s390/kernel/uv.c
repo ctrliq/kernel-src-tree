@@ -33,6 +33,7 @@ int gmap_fault(struct gmap *gmap, unsigned long gaddr,
 
 /* the bootdata_preserved fields come from ones in arch/s390/boot/uv.c */
 int __bootdata_preserved(prot_virt_guest);
+EXPORT_SYMBOL(prot_virt_guest);
 
 /*
  * uv_info contains both host and guest information but it's currently only
