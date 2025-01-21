@@ -7,6 +7,7 @@ top_srcdir = ../../../../..
 
 
 include ../../lib.mk
+include ../flags.mk
 
 CFLAGS += -I../../../../../usr/include
 

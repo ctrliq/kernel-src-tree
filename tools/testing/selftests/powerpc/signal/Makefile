@@ -8,6 +8,7 @@ TEST_FILES := settings
 
 top_srcdir = ../../../../..
 include ../../lib.mk
+include ../flags.mk
 
 CFLAGS += -maltivec
 
