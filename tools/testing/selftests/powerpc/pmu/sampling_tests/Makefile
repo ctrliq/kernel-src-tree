@@ -9,5 +9,6 @@ top_srcdir = ../../../../../..
 include ../../../lib.mk
 
 CFLAGS += -m64
+include ../../flags.mk
 
 $(TEST_GEN_PROGS): ../../harness.c ../../utils.c ../event.c ../lib.c misc.c misc.h ../loop.S
