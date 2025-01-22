@@ -3,7 +3,7 @@
  *
  *  Implementation of primary alsa driver code base for Intel HD Audio.
  *
- *  Copyright(c) 2004 Intel Corporation. All rights reserved.
+ *  Copyright(c) 2004 Intel Corporation
  *
  *  Copyright (c) 2004 Takashi Iwai <tiwai@suse.de>
  *                     PeiSen Hou <pshou@realtek.com.tw>
@@ -275,8 +275,7 @@ static int azx_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 	spin_lock(&bus->reg_lock);
 	/* reset SYNC bits */
 	snd_hdac_stream_sync_trigger(hstr, false, sbits, sync_reg);
-	if (start)
-		snd_hdac_stream_timecounter_init(hstr, sbits);
+	snd_hdac_stream_timecounter_init(hstr, sbits, start);
 	spin_unlock(&bus->reg_lock);
 	return 0;
 }
@@ -1076,11 +1075,9 @@ irqreturn_t azx_interrupt(int irq, void *dev_id)
 	bool active, handled = false;
 	int repeat = 0; /* count for avoiding endless loop */
 
-#ifdef CONFIG_PM
 	if (azx_has_pm_runtime(chip))
 		if (!pm_runtime_active(chip->card->dev))
 			return IRQ_NONE;
-#endif
 
 	spin_lock(&bus->reg_lock);
 
