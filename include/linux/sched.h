@@ -756,7 +756,7 @@ struct task_struct {
 	 */
 	struct thread_info		thread_info;
 #endif
-	unsigned int			__state //ooops all breaks
+	unsigned int			__state;
 
 #ifdef CONFIG_PREEMPT_RT
 	/* saved state for "spinlock sleepers" */
