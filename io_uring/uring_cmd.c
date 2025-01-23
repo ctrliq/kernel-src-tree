@@ -174,9 +174,10 @@ static int io_uring_cmd_prep_setup(struct io_kiocb *req,
 	struct io_uring_cmd *ioucmd = io_kiocb_to_cmd(req, struct io_uring_cmd);
 	struct io_uring_cmd_data *cache;
 
-	cache = io_uring_alloc_async_data(&req->ctx->uring_cache, req, NULL);
+	cache = io_uring_alloc_async_data(&req->ctx->uring_cache, req);
 	if (!cache)
 		return -ENOMEM;
+	cache->op_data = NULL;
 
 	if (!(req->flags & REQ_F_FORCE_ASYNC)) {
 		/* defer memcpy until we need it */
