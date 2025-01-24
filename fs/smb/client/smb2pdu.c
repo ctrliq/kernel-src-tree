@@ -40,6 +40,7 @@
 #include "dfs_cache.h"
 #endif
 #include "cached_dir.h"
+#include "compress.h"
 
 /*
  *  The following table defines the expected "StructureSize" of SMB2 requests
@@ -4987,6 +4988,10 @@ smb2_async_writev(struct cifs_writedata *wdata,
 
 		flags |= CIFS_HAS_CREDITS;
 	}
+
+	/* XXX: compression + encryption is unsupported for now */
+	if (((flags & CIFS_TRANSFORM_REQ) != CIFS_TRANSFORM_REQ) && should_compress(tcon, &rqst))
+		flags |= CIFS_COMPRESS_REQ;
 
 	kref_get(&wdata->refcount);
 	rc = cifs_call_async(server, &rqst, NULL, smb2_writev_callback, NULL,
