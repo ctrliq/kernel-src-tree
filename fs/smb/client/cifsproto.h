@@ -629,8 +629,7 @@ void cifs_free_hash(struct shash_desc **sdesc);
 
 void rqst_page_get_length(const struct smb_rqst *rqst, unsigned int page,
 			  unsigned int *len, unsigned int *offset);
-struct cifs_chan *
-cifs_ses_find_chan(struct cifs_ses *ses, struct TCP_Server_Info *server);
+
 int cifs_try_adding_channels(struct cifs_ses *ses);
 bool is_server_using_iface(struct TCP_Server_Info *server,
 			   struct cifs_server_iface *iface);
@@ -646,9 +645,6 @@ cifs_chan_set_in_reconnect(struct cifs_ses *ses,
 void
 cifs_chan_clear_in_reconnect(struct cifs_ses *ses,
 			       struct TCP_Server_Info *server);
-bool
-cifs_chan_in_reconnect(struct cifs_ses *ses,
-			  struct TCP_Server_Info *server);
 void
 cifs_chan_set_need_reconnect(struct cifs_ses *ses,
 			     struct TCP_Server_Info *server);
