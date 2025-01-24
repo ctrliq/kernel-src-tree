@@ -11892,10 +11892,7 @@ static int __init bpf_kfunc_init(void)
 }
 late_initcall(bpf_kfunc_init);
 
-/* Disables missing prototype warnings */
-__diag_push();
-__diag_ignore_all("-Wmissing-prototypes",
-		  "Global functions as their definitions will be in vmlinux BTF");
+__bpf_kfunc_start_defs();
 
 /* bpf_sock_destroy: Destroy the given socket with ECONNABORTED error code.
  *
@@ -11929,11 +11926,11 @@ __bpf_kfunc int bpf_sock_destroy(struct sock_common *sock)
 	return sk->sk_prot->diag_destroy(sk, ECONNABORTED);
 }
 
-__diag_pop()
+__bpf_kfunc_end_defs();
 
-BTF_SET8_START(bpf_sk_iter_kfunc_ids)
+BTF_KFUNCS_START(bpf_sk_iter_kfunc_ids)
 BTF_ID_FLAGS(func, bpf_sock_destroy, KF_TRUSTED_ARGS)
-BTF_SET8_END(bpf_sk_iter_kfunc_ids)
+BTF_KFUNCS_END(bpf_sk_iter_kfunc_ids)
 
 static int tracing_iter_filter(const struct bpf_prog *prog, u32 kfunc_id)
 {
