@@ -82,6 +82,7 @@ struct netns_ipv4 {
 
 	/* Please keep tcp_death_row at first field in netns_ipv4 */
 	struct inet_timewait_death_row tcp_death_row ____cacheline_aligned_in_smp;
+	struct udp_table *udp_table;
 
 #ifdef CONFIG_SYSCTL
 	struct ctl_table_header	*forw_hdr;
