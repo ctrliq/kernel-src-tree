@@ -80,8 +80,8 @@ static const char *rh_unmaintained_drivers[] = {
 	"nft_compat",
 	"nicpf",
 	"nicvf",
-	"nvmet-fc",
-	"nvmet-tcp",
+	"nvmet_fc",
+	"nvmet_tcp",
 	"team",
 	0     /* Terminating entry */
 };
@@ -266,6 +266,7 @@ static const struct pci_device_id rh_disabled_pci_devices[] = {
 	{ 0x15B3, 0x100e, PCI_ANY_ID, PCI_ANY_ID },
 	{ 0x15B3, 0x100f, PCI_ANY_ID, PCI_ANY_ID },
 	{ 0x15B3, 0x1010, PCI_ANY_ID, PCI_ANY_ID },
+	{ 0x15B3, 0x1025, PCI_ANY_ID, PCI_ANY_ID },
 	{ 0x15B3, 0xA2DF, PCI_ANY_ID, PCI_ANY_ID },
 	{ 0x1000, 0x0064, PCI_ANY_ID, PCI_ANY_ID },
 	{ 0x1000, 0x0065, PCI_ANY_ID, PCI_ANY_ID },
@@ -302,7 +303,6 @@ static const struct pci_device_id rh_unmaintained_pci_devices[] = {
 	{ 0x1000, 0x0071, PCI_ANY_ID, PCI_ANY_ID },
 	{ 0x1000, 0x0073, PCI_ANY_ID, PCI_ANY_ID },
 	{ 0x1000, 0x0079, PCI_ANY_ID, PCI_ANY_ID },
-	{ 0x15B3, 0xA2DC, PCI_ANY_ID, PCI_ANY_ID },
 	{ 0x1000, 0x006E, PCI_ANY_ID, PCI_ANY_ID },
 	{ 0x1000, 0x0080, PCI_ANY_ID, PCI_ANY_ID },
 	{ 0x1000, 0x0081, PCI_ANY_ID, PCI_ANY_ID },
