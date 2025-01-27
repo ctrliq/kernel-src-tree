@@ -258,7 +258,7 @@ static int vmx_setup_l1d_flush(enum vmx_l1d_flush_state l1tf)
 		return 0;
 	}
 
-	if (host_arch_capabilities & ARCH_CAP_SKIP_VMENTRY_L1DFLUSH) {
+	if (kvm_host.arch_capabilities & ARCH_CAP_SKIP_VMENTRY_L1DFLUSH) {
 		l1tf_vmx_mitigation = VMENTER_L1D_FLUSH_NOT_REQUIRED;
 		return 0;
 	}
@@ -403,7 +403,7 @@ static void vmx_update_fb_clear_dis(struct kvm_vcpu *vcpu, struct vcpu_vmx *vmx)
 	 * and VM-Exit.
 	 */
 	vmx->disable_fb_clear = !cpu_feature_enabled(X86_FEATURE_CLEAR_CPU_BUF) &&
-				(host_arch_capabilities & ARCH_CAP_FB_CLEAR_CTRL) &&
+				(kvm_host.arch_capabilities & ARCH_CAP_FB_CLEAR_CTRL) &&
 				!boot_cpu_has_bug(X86_BUG_MDS) &&
 				!boot_cpu_has_bug(X86_BUG_TAA);
 
@@ -753,7 +753,7 @@ fault:
 	return -EIO;
 }
 
-static void vmx_emergency_disable(void)
+void vmx_emergency_disable_virtualization_cpu(void)
 {
 	int cpu = raw_smp_processor_id();
 	struct loaded_vmcs *v;
@@ -1122,12 +1122,12 @@ static bool update_transition_efer(struct vcpu_vmx *vmx)
 	 * atomically, since it's faster than switching it manually.
 	 */
 	if (cpu_has_load_ia32_efer() ||
-	    (enable_ept && ((vmx->vcpu.arch.efer ^ host_efer) & EFER_NX))) {
+	    (enable_ept && ((vmx->vcpu.arch.efer ^ kvm_host.efer) & EFER_NX))) {
 		if (!(guest_efer & EFER_LMA))
 			guest_efer &= ~EFER_LME;
-		if (guest_efer != host_efer)
+		if (guest_efer != kvm_host.efer)
 			add_atomic_switch_msr(vmx, MSR_EFER,
-					      guest_efer, host_efer, false);
+					      guest_efer, kvm_host.efer, false);
 		else
 			clear_atomic_switch_msr(vmx, MSR_EFER);
 		return false;
@@ -1140,7 +1140,7 @@ static bool update_transition_efer(struct vcpu_vmx *vmx)
 	clear_atomic_switch_msr(vmx, MSR_EFER);
 
 	guest_efer &= ~ignore_bits;
-	guest_efer |= host_efer & ignore_bits;
+	guest_efer |= kvm_host.efer & ignore_bits;
 
 	vmx->guest_uret_msrs[i].data = guest_efer;
 	vmx->guest_uret_msrs[i].mask = ~ignore_bits;
@@ -1961,13 +1961,13 @@ static inline bool is_vmx_feature_control_msr_valid(struct vcpu_vmx *vmx,
 	return !(msr->data & ~valid_bits);
 }
 
-int vmx_get_msr_feature(struct kvm_msr_entry *msr)
+int vmx_get_feature_msr(u32 msr, u64 *data)
 {
-	switch (msr->index) {
+	switch (msr) {
 	case KVM_FIRST_EMULATED_VMX_MSR ... KVM_LAST_EMULATED_VMX_MSR:
 		if (!nested)
 			return 1;
-		return vmx_get_vmx_msr(&vmcs_config.nested, msr->index, &msr->data);
+		return vmx_get_vmx_msr(&vmcs_config.nested, msr, data);
 	default:
 		return KVM_MSR_RET_INVALID;
 	}
@@ -2809,7 +2809,7 @@ fault:
 	return -EFAULT;
 }
 
-int vmx_hardware_enable(void)
+int vmx_enable_virtualization_cpu(void)
 {
 	int cpu = raw_smp_processor_id();
 	u64 phys_addr = __pa(per_cpu(vmxarea, cpu));
@@ -2846,7 +2846,7 @@ static void vmclear_local_loaded_vmcss(void)
 		__loaded_vmcs_clear(v);
 }
 
-void vmx_hardware_disable(void)
+void vmx_disable_virtualization_cpu(void)
 {
 	vmclear_local_loaded_vmcss();
 
@@ -3537,16 +3537,29 @@ u64 vmx_get_segment_base(struct kvm_vcpu *vcpu, int seg)
 	return vmx_read_guest_seg_base(to_vmx(vcpu), seg);
 }
 
-int vmx_get_cpl(struct kvm_vcpu *vcpu)
+static int __vmx_get_cpl(struct kvm_vcpu *vcpu, bool no_cache)
 {
 	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	int ar;
 
 	if (unlikely(vmx->rmode.vm86_active))
 		return 0;
-	else {
-		int ar = vmx_read_guest_seg_ar(vmx, VCPU_SREG_SS);
-		return VMX_AR_DPL(ar);
-	}
+
+	if (no_cache)
+		ar = vmcs_read32(GUEST_SS_AR_BYTES);
+	else
+		ar = vmx_read_guest_seg_ar(vmx, VCPU_SREG_SS);
+	return VMX_AR_DPL(ar);
+}
+
+int vmx_get_cpl(struct kvm_vcpu *vcpu)
+{
+	return __vmx_get_cpl(vcpu, false);
+}
+
+int vmx_get_cpl_no_cache(struct kvm_vcpu *vcpu)
+{
+	return __vmx_get_cpl(vcpu, true);
 }
 
 static u32 vmx_segment_access_rights(struct kvm_segment *var)
@@ -4333,7 +4346,7 @@ void vmx_set_constant_host_state(struct vcpu_vmx *vmx)
 	}
 
 	if (cpu_has_load_ia32_efer())
-		vmcs_write64(HOST_IA32_EFER, host_efer);
+		vmcs_write64(HOST_IA32_EFER, kvm_host.efer);
 }
 
 void set_cr4_guest_host_mask(struct vcpu_vmx *vmx)
@@ -5772,8 +5785,6 @@ static int handle_ept_violation(struct kvm_vcpu *vcpu)
 	if (error_code & EPT_VIOLATION_GVA_IS_VALID)
 		error_code |= (exit_qualification & EPT_VIOLATION_GVA_TRANSLATED) ?
 			      PFERR_GUEST_FINAL_MASK : PFERR_GUEST_PAGE_MASK;
-
-	vcpu->arch.exit_qualification = exit_qualification;
 
 	/*
 	 * Check that the GPA doesn't exceed physical memory limits, as that is
@@ -8603,8 +8614,6 @@ static void __vmx_exit(void)
 {
 	allow_smaller_maxphyaddr = false;
 
-	cpu_emergency_unregister_virt_callback(vmx_emergency_disable);
-
 	vmx_cleanup_l1d_flush();
 }
 
@@ -8650,8 +8659,6 @@ static int __init vmx_init(void)
 
 		pi_init_cpu(cpu);
 	}
-
-	cpu_emergency_register_virt_callback(vmx_emergency_disable);
 
 	vmx_check_vmcs12_offsets();
 

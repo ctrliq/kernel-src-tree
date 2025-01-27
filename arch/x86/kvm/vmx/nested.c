@@ -410,18 +410,30 @@ static void nested_ept_inject_page_fault(struct kvm_vcpu *vcpu,
 {
 	struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
 	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	unsigned long exit_qualification;
 	u32 vm_exit_reason;
-	unsigned long exit_qualification = vcpu->arch.exit_qualification;
 
 	if (vmx->nested.pml_full) {
 		vm_exit_reason = EXIT_REASON_PML_FULL;
 		vmx->nested.pml_full = false;
-		exit_qualification &= INTR_INFO_UNBLOCK_NMI;
+
+		/*
+		 * PML Full and EPT Violation VM-Exits both use bit 12 to report
+		 * "NMI unblocking due to IRET", i.e. the bit can be propagated
+		 * as-is from the original EXIT_QUALIFICATION.
+		 */
+		exit_qualification = vmx_get_exit_qual(vcpu) & INTR_INFO_UNBLOCK_NMI;
 	} else {
-		if (fault->error_code & PFERR_RSVD_MASK)
+		if (fault->error_code & PFERR_RSVD_MASK) {
 			vm_exit_reason = EXIT_REASON_EPT_MISCONFIG;
-		else
+			exit_qualification = 0;
+		} else {
+			exit_qualification = fault->exit_qualification;
+			exit_qualification |= vmx_get_exit_qual(vcpu) &
+					      (EPT_VIOLATION_GVA_IS_VALID |
+					       EPT_VIOLATION_GVA_TRANSLATED);
 			vm_exit_reason = EXIT_REASON_EPT_VIOLATION;
+		}
 
 		/*
 		 * Although the caller (kvm_inject_emulated_page_fault) would
@@ -2404,7 +2416,7 @@ static void prepare_vmcs02_early(struct vcpu_vmx *vmx, struct loaded_vmcs *vmcs0
 	if (cpu_has_load_ia32_efer()) {
 		if (guest_efer & EFER_LMA)
 			exec_control |= VM_ENTRY_IA32E_MODE;
-		if (guest_efer != host_efer)
+		if (guest_efer != kvm_host.efer)
 			exec_control |= VM_ENTRY_LOAD_IA32_EFER;
 	}
 	vm_entry_controls_set(vmx, exec_control);
@@ -2417,7 +2429,7 @@ static void prepare_vmcs02_early(struct vcpu_vmx *vmx, struct loaded_vmcs *vmcs0
 	 * bits may be modified by vmx_set_efer() in prepare_vmcs02().
 	 */
 	exec_control = __vm_exit_controls_get(vmcs01);
-	if (cpu_has_load_ia32_efer() && guest_efer != host_efer)
+	if (cpu_has_load_ia32_efer() && guest_efer != kvm_host.efer)
 		exec_control |= VM_EXIT_LOAD_IA32_EFER;
 	else
 		exec_control &= ~VM_EXIT_LOAD_IA32_EFER;
@@ -4680,7 +4692,7 @@ static inline u64 nested_vmx_get_vmcs01_guest_efer(struct vcpu_vmx *vmx)
 		return vmcs_read64(GUEST_IA32_EFER);
 
 	if (cpu_has_load_ia32_efer())
-		return host_efer;
+		return kvm_host.efer;
 
 	for (i = 0; i < vmx->msr_autoload.guest.nr; ++i) {
 		if (vmx->msr_autoload.guest.val[i].index == MSR_EFER)
@@ -4691,7 +4703,7 @@ static inline u64 nested_vmx_get_vmcs01_guest_efer(struct vcpu_vmx *vmx)
 	if (efer_msr)
 		return efer_msr->data;
 
-	return host_efer;
+	return kvm_host.efer;
 }
 
 static void nested_vmx_restore_host_state(struct kvm_vcpu *vcpu)

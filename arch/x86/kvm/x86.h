@@ -33,6 +33,13 @@ struct kvm_caps {
 	u64 supported_perf_cap;
 };
 
+struct kvm_host_values {
+	u64 efer;
+	u64 xcr0;
+	u64 xss;
+	u64 arch_capabilities;
+};
+
 void kvm_spurious_fault(void);
 
 #define KVM_NESTED_VMENTER_CONSISTENCY_CHECK(consistency_check)		\
@@ -165,7 +172,7 @@ static inline bool is_64_bit_mode(struct kvm_vcpu *vcpu)
 
 	if (!is_long_mode(vcpu))
 		return false;
-	static_call(kvm_x86_get_cs_db_l_bits)(vcpu, &cs_db, &cs_l);
+	kvm_x86_call(get_cs_db_l_bits)(vcpu, &cs_db, &cs_l);
 	return cs_l;
 }
 
@@ -331,11 +338,8 @@ int x86_emulate_instruction(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
 			    int emulation_type, void *insn, int insn_len);
 fastpath_t handle_fastpath_set_msr_irqoff(struct kvm_vcpu *vcpu);
 
-extern u64 host_xcr0;
-extern u64 host_xss;
-extern u64 host_arch_capabilities;
-
 extern struct kvm_caps kvm_caps;
+extern struct kvm_host_values kvm_host;
 
 extern bool enable_pmu;
 

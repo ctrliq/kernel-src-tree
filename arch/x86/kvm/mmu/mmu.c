@@ -1869,10 +1869,14 @@ static bool sp_has_gptes(struct kvm_mmu_page *sp)
 		if (is_obsolete_sp((_kvm), (_sp))) {			\
 		} else
 
-#define for_each_gfn_valid_sp_with_gptes(_kvm, _sp, _gfn)		\
+#define for_each_gfn_valid_sp(_kvm, _sp, _gfn)				\
 	for_each_valid_sp(_kvm, _sp,					\
 	  &(_kvm)->arch.mmu_page_hash[kvm_page_table_hashfn(_gfn)])	\
-		if ((_sp)->gfn != (_gfn) || !sp_has_gptes(_sp)) {} else
+		if ((_sp)->gfn != (_gfn)) {} else
+
+#define for_each_gfn_valid_sp_with_gptes(_kvm, _sp, _gfn)		\
+	for_each_gfn_valid_sp(_kvm, _sp, _gfn)				\
+		if (!sp_has_gptes(_sp)) {} else
 
 static bool kvm_sync_page_check(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp)
 {
@@ -3448,7 +3452,7 @@ static int fast_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
 		u64 new_spte;
 
 		if (tdp_mmu_enabled)
-			sptep = kvm_tdp_mmu_fast_pf_get_last_sptep(vcpu, fault->addr, &spte);
+			sptep = kvm_tdp_mmu_fast_pf_get_last_sptep(vcpu, fault->gfn, &spte);
 		else
 			sptep = fast_pf_get_last_sptep(vcpu, fault->addr, &spte);
 
@@ -3458,7 +3462,7 @@ static int fast_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
 		 * available as the vCPU holds a reference to its root(s).
 		 */
 		if (WARN_ON_ONCE(!sptep))
-			spte = REMOVED_SPTE;
+			spte = FROZEN_SPTE;
 
 		if (!is_shadow_present_pte(spte))
 			break;
@@ -4332,11 +4336,11 @@ static u8 kvm_max_private_mapping_level(struct kvm *kvm, kvm_pfn_t pfn,
 	if (max_level == PG_LEVEL_4K)
 		return PG_LEVEL_4K;
 
-	req_max_level = static_call(kvm_x86_private_max_mapping_level)(kvm, pfn);
+	req_max_level = kvm_x86_call(private_max_mapping_level)(kvm, pfn);
 	if (req_max_level)
 		max_level = min(max_level, req_max_level);
 
-	return req_max_level;
+	return max_level;
 }
 
 static int kvm_faultin_pfn_private(struct kvm_vcpu *vcpu,
@@ -4609,7 +4613,10 @@ int kvm_handle_page_fault(struct kvm_vcpu *vcpu, u64 error_code,
 	if (WARN_ON_ONCE(error_code >> 32))
 		error_code = lower_32_bits(error_code);
 
-	/* Ensure the above sanity check also covers KVM-defined flags. */
+	/*
+	 * Restrict KVM-defined flags to bits 63:32 so that it's impossible for
+	 * them to conflict with #PF error codes, which are limited to 32 bits.
+	 */
 	BUILD_BUG_ON(lower_32_bits(PFERR_SYNTHETIC_MASK));
 
 	vcpu->arch.l1tf_flush_l1d = true;
@@ -5759,7 +5766,7 @@ int kvm_mmu_load(struct kvm_vcpu *vcpu)
 	 * stale entries.  Flushing on alloc also allows KVM to skip the TLB
 	 * flush when freeing a root (see kvm_tdp_mmu_put_root()).
 	 */
-	static_call(kvm_x86_flush_tlb_current)(vcpu);
+	kvm_x86_call(flush_tlb_current)(vcpu);
 out:
 	return r;
 }
@@ -6131,7 +6138,7 @@ void kvm_mmu_invalidate_addr(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu,
 		if (is_noncanonical_address(addr, vcpu))
 			return;
 
-		static_call(kvm_x86_flush_tlb_gva)(vcpu, addr);
+		kvm_x86_call(flush_tlb_gva)(vcpu, addr);
 	}
 
 	if (!mmu->sync_spte)
@@ -7012,10 +7019,70 @@ void kvm_arch_flush_shadow_all(struct kvm *kvm)
 	kvm_mmu_zap_all(kvm);
 }
 
+static void kvm_mmu_zap_memslot_pages_and_flush(struct kvm *kvm,
+						struct kvm_memory_slot *slot,
+						bool flush)
+{
+	LIST_HEAD(invalid_list);
+	unsigned long i;
+
+	if (list_empty(&kvm->arch.active_mmu_pages))
+		goto out_flush;
+
+	/*
+	 * Since accounting information is stored in struct kvm_arch_memory_slot,
+	 * shadow pages deletion (e.g. unaccount_shadowed()) requires that all
+	 * gfns with a shadow page have a corresponding memslot.  Do so before
+	 * the memslot goes away.
+	 */
+	for (i = 0; i < slot->npages; i++) {
+		struct kvm_mmu_page *sp;
+		gfn_t gfn = slot->base_gfn + i;
+
+		for_each_gfn_valid_sp(kvm, sp, gfn)
+			kvm_mmu_prepare_zap_page(kvm, sp, &invalid_list);
+
+		if (need_resched() || rwlock_needbreak(&kvm->mmu_lock)) {
+			kvm_mmu_remote_flush_or_zap(kvm, &invalid_list, flush);
+			flush = false;
+			cond_resched_rwlock_write(&kvm->mmu_lock);
+		}
+	}
+
+out_flush:
+	kvm_mmu_remote_flush_or_zap(kvm, &invalid_list, flush);
+}
+
+static void kvm_mmu_zap_memslot(struct kvm *kvm,
+				struct kvm_memory_slot *slot)
+{
+	struct kvm_gfn_range range = {
+		.slot = slot,
+		.start = slot->base_gfn,
+		.end = slot->base_gfn + slot->npages,
+		.may_block = true,
+	};
+	bool flush;
+
+	write_lock(&kvm->mmu_lock);
+	flush = kvm_unmap_gfn_range(kvm, &range);
+	kvm_mmu_zap_memslot_pages_and_flush(kvm, slot, flush);
+	write_unlock(&kvm->mmu_lock);
+}
+
+static inline bool kvm_memslot_flush_zap_all(struct kvm *kvm)
+{
+	return kvm->arch.vm_type == KVM_X86_DEFAULT_VM &&
+	       kvm_check_has_quirk(kvm, KVM_X86_QUIRK_SLOT_ZAP_ALL);
+}
+
 void kvm_arch_flush_shadow_memslot(struct kvm *kvm,
 				   struct kvm_memory_slot *slot)
 {
-	kvm_mmu_zap_all_fast(kvm);
+	if (kvm_memslot_flush_zap_all(kvm))
+		kvm_mmu_zap_all_fast(kvm);
+	else
+		kvm_mmu_zap_memslot(kvm, slot);
 }
 
 void kvm_mmu_invalidate_mmio_sptes(struct kvm *kvm, u64 gen)
