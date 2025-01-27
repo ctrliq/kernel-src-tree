@@ -972,20 +972,22 @@ static void gfs2_glock_poke(struct gfs2_glock *gl)
 	gfs2_holder_uninit(&gh);
 }
 
-static bool gfs2_try_evict(struct gfs2_glock *gl)
+static void gfs2_try_evict(struct gfs2_glock *gl)
 {
 	struct gfs2_inode *ip;
-	bool evicted = false;
 
 	/*
 	 * If there is contention on the iopen glock and we have an inode, try
-	 * to grab and release the inode so that it can be evicted.  This will
-	 * allow the remote node to go ahead and delete the inode without us
-	 * having to do it, which will avoid rgrp glock thrashing.
+	 * to grab and release the inode so that it can be evicted.  The
+	 * GIF_DEFER_DELETE flag indicates to gfs2_evict_inode() that the inode
+	 * should not be deleted locally.  This will allow the remote node to
+	 * go ahead and delete the inode without us having to do it, which will
+	 * avoid rgrp glock thrashing.
 	 *
 	 * The remote node is likely still holding the corresponding inode
 	 * glock, so it will run before we get to verify that the delete has
-	 * happened below.
+	 * happened below.  (Verification is triggered by the call to
+	 * gfs2_queue_verify_delete() in gfs2_evict_inode().)
 	 */
 	spin_lock(&gl->gl_lockref.lock);
 	ip = gl->gl_object;
@@ -1017,9 +1019,7 @@ static bool gfs2_try_evict(struct gfs2_glock *gl)
 			gfs2_glock_poke(ip->i_gl);
 			iput(&ip->i_inode);
 		}
-		evicted = !ip;
 	}
-	return evicted;
 }
 
 bool gfs2_queue_try_to_evict(struct gfs2_glock *gl)
@@ -1031,7 +1031,7 @@ bool gfs2_queue_try_to_evict(struct gfs2_glock *gl)
 	return !mod_delayed_work(sdp->sd_delete_wq, &gl->gl_delete, 0);
 }
 
-static bool gfs2_queue_verify_delete(struct gfs2_glock *gl, bool later)
+bool gfs2_queue_verify_delete(struct gfs2_glock *gl, bool later)
 {
 	struct gfs2_sbd *sdp = gl->gl_name.ln_sbd;
 	unsigned long delay;
@@ -1049,32 +1049,8 @@ static void delete_work_func(struct work_struct *work)
 	struct gfs2_sbd *sdp = gl->gl_name.ln_sbd;
 	bool verify_delete = test_and_clear_bit(GLF_VERIFY_DELETE, &gl->gl_flags);
 
-	if (test_and_clear_bit(GLF_TRY_TO_EVICT, &gl->gl_flags)) {
-		/*
-		 * If we can evict the inode, give the remote node trying to
-		 * delete the inode some time before verifying that the delete
-		 * has happened.  Otherwise, if we cause contention on the inode glock
-		 * immediately, the remote node will think that we still have
-		 * the inode in use, and so it will give up waiting.
-		 *
-		 * If we can't evict the inode, signal to the remote node that
-		 * the inode is still in use.  We'll later try to delete the
-		 * inode locally in gfs2_evict_inode.
-		 *
-		 * FIXME: We only need to verify that the remote node has
-		 * deleted the inode because nodes before this remote delete
-		 * rework won't cooperate.  At a later time, when we no longer
-		 * care about compatibility with such nodes, we can skip this
-		 * step entirely.
-		 */
-		if (gfs2_try_evict(gl)) {
-			if (!test_bit(SDF_KILL, &sdp->sd_flags)) {
-				gfs2_glock_hold(gl);
-				if (!gfs2_queue_verify_delete(gl, true))
-					gfs2_glock_put(gl);
-			}
-		}
-	}
+	if (test_and_clear_bit(GLF_TRY_TO_EVICT, &gl->gl_flags))
+		gfs2_try_evict(gl);
 
 	if (verify_delete) {
 		u64 no_addr = gl->gl_name.ln_number;
