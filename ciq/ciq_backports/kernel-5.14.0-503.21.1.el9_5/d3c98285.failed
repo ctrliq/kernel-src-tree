@@ -1,0 +1,412 @@
+bnxt_en: Add function to calculate Toeplitz hash
+
+jira LE-2290
+Rebuild_History Non-Buildable kernel-5.14.0-503.21.1.el9_5
+commit-author Pavan Chebbi <pavan.chebbi@broadcom.com>
+commit d3c982851c15ff1c5187a6188710daa7d0db7fe4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-503.21.1.el9_5/d3c98285.failed
+
+For ntuple filters added by aRFS, the Toeplitz hash calculated by our
+NIC is available and is used to store the ntuple filter for quick
+retrieval.  In the next patches, user defined ntuple filter support
+will be added and we need to calculate the same hash for these
+filters.  The same hash function needs to be used so we can detect
+duplicates.
+
+Add the function bnxt_toeplitz() to calculate the Toeplitz hash for
+user defined ntuple filters.  bnxt_toeplitz() uses the same Toeplitz
+key and the same key length as the NIC.
+
+bnxt_get_ntp_filter_idx() is added to return the hash index.  For
+aRFS, the hash comes from the NIC.  For user defined ntuple, we call
+bnxt_toeplitz() to calculate the hash index.
+
+	Reviewed-by: Andy Gospodarek <andrew.gospodarek@broadcom.com>
+	Signed-off-by: Pavan Chebbi <pavan.chebbi@broadcom.com>
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d3c982851c15ff1c5187a6188710daa7d0db7fe4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.c
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.h
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index e15f15706158,e9b382832a14..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@@ -5252,6 -5338,278 +5261,281 @@@ static int bnxt_hwrm_cfa_l2_set_rx_mask
+  	return hwrm_req_send_silent(bp, req);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void bnxt_del_l2_filter(struct bnxt *bp, struct bnxt_l2_filter *fltr)
++ {
++ 	if (!atomic_dec_and_test(&fltr->refcnt))
++ 		return;
++ 	spin_lock_bh(&bp->ntp_fltr_lock);
++ 	hlist_del_rcu(&fltr->base.hash);
++ 	if (fltr->base.flags) {
++ 		clear_bit(fltr->base.sw_id, bp->ntp_fltr_bmap);
++ 		bp->ntp_fltr_count--;
++ 	}
++ 	spin_unlock_bh(&bp->ntp_fltr_lock);
++ 	kfree_rcu(fltr, base.rcu);
++ }
++ 
++ static struct bnxt_l2_filter *__bnxt_lookup_l2_filter(struct bnxt *bp,
++ 						      struct bnxt_l2_key *key,
++ 						      u32 idx)
++ {
++ 	struct hlist_head *head = &bp->l2_fltr_hash_tbl[idx];
++ 	struct bnxt_l2_filter *fltr;
++ 
++ 	hlist_for_each_entry_rcu(fltr, head, base.hash) {
++ 		struct bnxt_l2_key *l2_key = &fltr->l2_key;
++ 
++ 		if (ether_addr_equal(l2_key->dst_mac_addr, key->dst_mac_addr) &&
++ 		    l2_key->vlan == key->vlan)
++ 			return fltr;
++ 	}
++ 	return NULL;
++ }
++ 
++ static struct bnxt_l2_filter *bnxt_lookup_l2_filter(struct bnxt *bp,
++ 						    struct bnxt_l2_key *key,
++ 						    u32 idx)
++ {
++ 	struct bnxt_l2_filter *fltr = NULL;
++ 
++ 	rcu_read_lock();
++ 	fltr = __bnxt_lookup_l2_filter(bp, key, idx);
++ 	if (fltr)
++ 		atomic_inc(&fltr->refcnt);
++ 	rcu_read_unlock();
++ 	return fltr;
++ }
++ 
++ #define BNXT_IPV4_4TUPLE(bp, fkeys)					\
++ 	(((fkeys)->basic.ip_proto == IPPROTO_TCP &&			\
++ 	  (bp)->rss_hash_cfg & VNIC_RSS_CFG_REQ_HASH_TYPE_TCP_IPV4) ||	\
++ 	 ((fkeys)->basic.ip_proto == IPPROTO_UDP &&			\
++ 	  (bp)->rss_hash_cfg & VNIC_RSS_CFG_REQ_HASH_TYPE_UDP_IPV4))
++ 
++ #define BNXT_IPV6_4TUPLE(bp, fkeys)					\
++ 	(((fkeys)->basic.ip_proto == IPPROTO_TCP &&			\
++ 	  (bp)->rss_hash_cfg & VNIC_RSS_CFG_REQ_HASH_TYPE_TCP_IPV6) ||	\
++ 	 ((fkeys)->basic.ip_proto == IPPROTO_UDP &&			\
++ 	  (bp)->rss_hash_cfg & VNIC_RSS_CFG_REQ_HASH_TYPE_UDP_IPV6))
++ 
++ static u32 bnxt_get_rss_flow_tuple_len(struct bnxt *bp, struct flow_keys *fkeys)
++ {
++ 	if (fkeys->basic.n_proto == htons(ETH_P_IP)) {
++ 		if (BNXT_IPV4_4TUPLE(bp, fkeys))
++ 			return sizeof(fkeys->addrs.v4addrs) +
++ 			       sizeof(fkeys->ports);
++ 
++ 		if (bp->rss_hash_cfg & VNIC_RSS_CFG_REQ_HASH_TYPE_IPV4)
++ 			return sizeof(fkeys->addrs.v4addrs);
++ 	}
++ 
++ 	if (fkeys->basic.n_proto == htons(ETH_P_IPV6)) {
++ 		if (BNXT_IPV6_4TUPLE(bp, fkeys))
++ 			return sizeof(fkeys->addrs.v6addrs) +
++ 			       sizeof(fkeys->ports);
++ 
++ 		if (bp->rss_hash_cfg & VNIC_RSS_CFG_REQ_HASH_TYPE_IPV6)
++ 			return sizeof(fkeys->addrs.v6addrs);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static u32 bnxt_toeplitz(struct bnxt *bp, struct flow_keys *fkeys,
++ 			 const unsigned char *key)
++ {
++ 	u64 prefix = bp->toeplitz_prefix, hash = 0;
++ 	struct bnxt_ipv4_tuple tuple4;
++ 	struct bnxt_ipv6_tuple tuple6;
++ 	int i, j, len = 0;
++ 	u8 *four_tuple;
++ 
++ 	len = bnxt_get_rss_flow_tuple_len(bp, fkeys);
++ 	if (!len)
++ 		return 0;
++ 
++ 	if (fkeys->basic.n_proto == htons(ETH_P_IP)) {
++ 		tuple4.v4addrs = fkeys->addrs.v4addrs;
++ 		tuple4.ports = fkeys->ports;
++ 		four_tuple = (unsigned char *)&tuple4;
++ 	} else {
++ 		tuple6.v6addrs = fkeys->addrs.v6addrs;
++ 		tuple6.ports = fkeys->ports;
++ 		four_tuple = (unsigned char *)&tuple6;
++ 	}
++ 
++ 	for (i = 0, j = 8; i < len; i++, j++) {
++ 		u8 byte = four_tuple[i];
++ 		int bit;
++ 
++ 		for (bit = 0; bit < 8; bit++, prefix <<= 1, byte <<= 1) {
++ 			if (byte & 0x80)
++ 				hash ^= prefix;
++ 		}
++ 		prefix |= (j < HW_HASH_KEY_SIZE) ? key[j] : 0;
++ 	}
++ 
++ 	/* The valid part of the hash is in the upper 32 bits. */
++ 	return (hash >> 32) & BNXT_NTP_FLTR_HASH_MASK;
++ }
++ 
++ #ifdef CONFIG_RFS_ACCEL
++ static struct bnxt_l2_filter *
++ bnxt_lookup_l2_filter_from_key(struct bnxt *bp, struct bnxt_l2_key *key)
++ {
++ 	struct bnxt_l2_filter *fltr;
++ 	u32 idx;
++ 
++ 	idx = jhash2(&key->filter_key, BNXT_L2_KEY_SIZE, bp->hash_seed) &
++ 	      BNXT_L2_FLTR_HASH_MASK;
++ 	fltr = bnxt_lookup_l2_filter(bp, key, idx);
++ 	return fltr;
++ }
++ #endif
++ 
++ static int bnxt_init_l2_filter(struct bnxt *bp, struct bnxt_l2_filter *fltr,
++ 			       struct bnxt_l2_key *key, u32 idx)
++ {
++ 	struct hlist_head *head;
++ 
++ 	ether_addr_copy(fltr->l2_key.dst_mac_addr, key->dst_mac_addr);
++ 	fltr->l2_key.vlan = key->vlan;
++ 	fltr->base.type = BNXT_FLTR_TYPE_L2;
++ 	if (fltr->base.flags) {
++ 		int bit_id;
++ 
++ 		bit_id = bitmap_find_free_region(bp->ntp_fltr_bmap,
++ 						 BNXT_MAX_FLTR, 0);
++ 		if (bit_id < 0)
++ 			return -ENOMEM;
++ 		fltr->base.sw_id = (u16)bit_id;
++ 	}
++ 	head = &bp->l2_fltr_hash_tbl[idx];
++ 	hlist_add_head_rcu(&fltr->base.hash, head);
++ 	atomic_set(&fltr->refcnt, 1);
++ 	return 0;
++ }
++ 
++ static struct bnxt_l2_filter *bnxt_alloc_l2_filter(struct bnxt *bp,
++ 						   struct bnxt_l2_key *key,
++ 						   gfp_t gfp)
++ {
++ 	struct bnxt_l2_filter *fltr;
++ 	u32 idx;
++ 	int rc;
++ 
++ 	idx = jhash2(&key->filter_key, BNXT_L2_KEY_SIZE, bp->hash_seed) &
++ 	      BNXT_L2_FLTR_HASH_MASK;
++ 	fltr = bnxt_lookup_l2_filter(bp, key, idx);
++ 	if (fltr)
++ 		return fltr;
++ 
++ 	fltr = kzalloc(sizeof(*fltr), gfp);
++ 	if (!fltr)
++ 		return ERR_PTR(-ENOMEM);
++ 	spin_lock_bh(&bp->ntp_fltr_lock);
++ 	rc = bnxt_init_l2_filter(bp, fltr, key, idx);
++ 	spin_unlock_bh(&bp->ntp_fltr_lock);
++ 	if (rc) {
++ 		bnxt_del_l2_filter(bp, fltr);
++ 		fltr = ERR_PTR(rc);
++ 	}
++ 	return fltr;
++ }
++ 
++ static u16 bnxt_vf_target_id(struct bnxt_pf_info *pf, u16 vf_idx)
++ {
++ #ifdef CONFIG_BNXT_SRIOV
++ 	struct bnxt_vf_info *vf = &pf->vf[vf_idx];
++ 
++ 	return vf->fw_fid;
++ #else
++ 	return INVALID_HW_RING_ID;
++ #endif
++ }
++ 
++ int bnxt_hwrm_l2_filter_free(struct bnxt *bp, struct bnxt_l2_filter *fltr)
++ {
++ 	struct hwrm_cfa_l2_filter_free_input *req;
++ 	u16 target_id = 0xffff;
++ 	int rc;
++ 
++ 	if (fltr->base.flags & BNXT_ACT_FUNC_DST) {
++ 		struct bnxt_pf_info *pf = &bp->pf;
++ 
++ 		if (fltr->base.vf_idx >= pf->active_vfs)
++ 			return -EINVAL;
++ 
++ 		target_id = bnxt_vf_target_id(pf, fltr->base.vf_idx);
++ 		if (target_id == INVALID_HW_RING_ID)
++ 			return -EINVAL;
++ 	}
++ 
++ 	rc = hwrm_req_init(bp, req, HWRM_CFA_L2_FILTER_FREE);
++ 	if (rc)
++ 		return rc;
++ 
++ 	req->target_id = cpu_to_le16(target_id);
++ 	req->l2_filter_id = fltr->base.filter_id;
++ 	return hwrm_req_send(bp, req);
++ }
++ 
++ int bnxt_hwrm_l2_filter_alloc(struct bnxt *bp, struct bnxt_l2_filter *fltr)
++ {
++ 	struct hwrm_cfa_l2_filter_alloc_output *resp;
++ 	struct hwrm_cfa_l2_filter_alloc_input *req;
++ 	u16 target_id = 0xffff;
++ 	int rc;
++ 
++ 	if (fltr->base.flags & BNXT_ACT_FUNC_DST) {
++ 		struct bnxt_pf_info *pf = &bp->pf;
++ 
++ 		if (fltr->base.vf_idx >= pf->active_vfs)
++ 			return -EINVAL;
++ 
++ 		target_id = bnxt_vf_target_id(pf, fltr->base.vf_idx);
++ 	}
++ 	rc = hwrm_req_init(bp, req, HWRM_CFA_L2_FILTER_ALLOC);
++ 	if (rc)
++ 		return rc;
++ 
++ 	req->target_id = cpu_to_le16(target_id);
++ 	req->flags = cpu_to_le32(CFA_L2_FILTER_ALLOC_REQ_FLAGS_PATH_RX);
++ 
++ 	if (!BNXT_CHIP_TYPE_NITRO_A0(bp))
++ 		req->flags |=
++ 			cpu_to_le32(CFA_L2_FILTER_ALLOC_REQ_FLAGS_OUTERMOST);
++ 	req->dst_id = cpu_to_le16(fltr->base.fw_vnic_id);
++ 	req->enables =
++ 		cpu_to_le32(CFA_L2_FILTER_ALLOC_REQ_ENABLES_L2_ADDR |
++ 			    CFA_L2_FILTER_ALLOC_REQ_ENABLES_DST_ID |
++ 			    CFA_L2_FILTER_ALLOC_REQ_ENABLES_L2_ADDR_MASK);
++ 	ether_addr_copy(req->l2_addr, fltr->l2_key.dst_mac_addr);
++ 	eth_broadcast_addr(req->l2_addr_mask);
++ 
++ 	if (fltr->l2_key.vlan) {
++ 		req->enables |=
++ 			cpu_to_le32(CFA_L2_FILTER_ALLOC_REQ_ENABLES_L2_IVLAN |
++ 				CFA_L2_FILTER_ALLOC_REQ_ENABLES_L2_IVLAN_MASK |
++ 				CFA_L2_FILTER_ALLOC_REQ_ENABLES_NUM_VLANS);
++ 		req->num_vlans = 1;
++ 		req->l2_ivlan = cpu_to_le16(fltr->l2_key.vlan);
++ 		req->l2_ivlan_mask = cpu_to_le16(0xfff);
++ 	}
++ 
++ 	resp = hwrm_req_hold(bp, req);
++ 	rc = hwrm_req_send(bp, req);
++ 	if (!rc) {
++ 		fltr->base.filter_id = resp->l2_filter_id;
++ 		set_bit(BNXT_FLTR_VALID, &fltr->base.state);
++ 	}
++ 	hwrm_req_drop(bp, req);
++ 	return rc;
++ }
++ 
+++>>>>>>> d3c982851c15 (bnxt_en: Add function to calculate Toeplitz hash)
+  #ifdef CONFIG_RFS_ACCEL
+  static int bnxt_hwrm_cfa_ntuple_filter_free(struct bnxt *bp,
+  					    struct bnxt_ntuple_filter *fltr)
+@@@ -13557,15 -13958,14 +13853,15 @@@ static int bnxt_rx_flow_steer(struct ne
+  		goto err_free;
+  	}
+  
+ -	new_fltr->l2_fltr = l2_fltr;
+ +	memcpy(new_fltr->dst_mac_addr, eth->h_dest, ETH_ALEN);
+ +	memcpy(new_fltr->src_mac_addr, eth->h_source, ETH_ALEN);
+  
+- 	idx = skb_get_hash_raw(skb) & BNXT_NTP_FLTR_HASH_MASK;
++ 	idx = bnxt_get_ntp_filter_idx(bp, fkeys, skb);
+  	head = &bp->ntp_fltr_hash_tbl[idx];
+  	rcu_read_lock();
+ -	hlist_for_each_entry_rcu(fltr, head, base.hash) {
+ +	hlist_for_each_entry_rcu(fltr, head, hash) {
+  		if (bnxt_fltr_match(fltr, new_fltr)) {
+ -			rc = fltr->base.sw_id;
+ +			rc = fltr->sw_id;
+  			rcu_read_unlock();
+  			goto err_free;
+  		}
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.h
+index 936229d39a0f,3f4e4708f7d8..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@@ -1345,6 -1349,43 +1345,46 @@@ struct bnxt_ntuple_filter 
+  	unsigned long		state;
+  #define BNXT_FLTR_VALID		0
+  #define BNXT_FLTR_UPDATE	1
+++<<<<<<< HEAD
+++=======
++ 
++ 	struct rcu_head         rcu;
++ };
++ 
++ struct bnxt_ntuple_filter {
++ 	struct bnxt_filter_base	base;
++ 	struct flow_keys	fkeys;
++ 	struct bnxt_l2_filter	*l2_fltr;
++ 	u32			flow_id;
++ };
++ 
++ struct bnxt_l2_key {
++ 	union {
++ 		struct {
++ 			u8	dst_mac_addr[ETH_ALEN];
++ 			u16	vlan;
++ 		};
++ 		u32	filter_key;
++ 	};
++ };
++ 
++ struct bnxt_ipv4_tuple {
++ 	struct flow_dissector_key_ipv4_addrs v4addrs;
++ 	struct flow_dissector_key_ports ports;
++ };
++ 
++ struct bnxt_ipv6_tuple {
++ 	struct flow_dissector_key_ipv6_addrs v6addrs;
++ 	struct flow_dissector_key_ports ports;
++ };
++ 
++ #define BNXT_L2_KEY_SIZE	(sizeof(struct bnxt_l2_key) / 4)
++ 
++ struct bnxt_l2_filter {
++ 	struct bnxt_filter_base	base;
++ 	struct bnxt_l2_key	l2_key;
++ 	atomic_t		refcnt;
+++>>>>>>> d3c982851c15 (bnxt_en: Add function to calculate Toeplitz hash)
+  };
+  
+  struct bnxt_link_info {
+@@@ -2371,6 -2417,14 +2411,17 @@@ struct bnxt 
+  	unsigned long		*ntp_fltr_bmap;
+  	int			ntp_fltr_count;
+  
+++<<<<<<< HEAD
+++=======
++ #define BNXT_L2_FLTR_MAX_FLTR	1024
++ #define BNXT_L2_FLTR_HASH_SIZE	32
++ #define BNXT_L2_FLTR_HASH_MASK	(BNXT_L2_FLTR_HASH_SIZE - 1)
++ 	struct hlist_head	l2_fltr_hash_tbl[BNXT_L2_FLTR_HASH_SIZE];
++ 
++ 	u32			hash_seed;
++ 	u64			toeplitz_prefix;
++ 
+++>>>>>>> d3c982851c15 (bnxt_en: Add function to calculate Toeplitz hash)
+  	/* To protect link related settings during link changes and
+  	 * ethtool settings changes.
+  	 */
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.c
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.h
