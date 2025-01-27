@@ -89,7 +89,7 @@ const char *mptcp_get_scheduler(const struct net *net)
 
 static void mptcp_pernet_set_defaults(struct mptcp_pernet *pernet)
 {
-	pernet->mptcp_enabled = 1;
+	pernet->mptcp_enabled = 0;
 	pernet->add_addr_timeout = TCP_RTO_MAX;
 	pernet->blackhole_timeout = 3600;
 	atomic_set(&pernet->active_disable_times, 0);
