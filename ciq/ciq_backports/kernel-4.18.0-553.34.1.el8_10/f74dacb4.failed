@@ -1,0 +1,243 @@
+dlm: fix recovery of middle conversions
+
+jira LE-2289
+Rebuild_History Non-Buildable kernel-4.18.0-553.34.1.el8_10
+commit-author Alexander Aring <aahringo@redhat.com>
+commit f74dacb4c81164d7578a11d5f8b660ad87059e6a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.34.1.el8_10/f74dacb4.failed
+
+In one special case, recovery is unable to reliably rebuild
+lock state by simply recreating lkb structs as sent from the
+lock holders.  That case is when the lkb's include conversions
+between PR and CW modes.
+
+The recovery code has always recognized this special case,
+but the implemention has always been broken, and would set
+invalid modes in recovered lkb's.  Unpredictable or bogus
+errors could then be returned for further locking calls on
+these locks.
+
+This bug has gone unnoticed for so long due to some
+combination of:
+- applications never or infrequently converting between PR/CW
+- recovery not occuring during these conversions
+- if the recovery bug does occur, the caller may not notice,
+  depending on what further locking calls are made, e.g. if
+  the lock is simply unlocked it may go unnoticed
+
+However, a core analysis from a recent gfs2 bug report points
+to this broken code.
+
+PR = Protected Read
+CW = Concurrent Write
+PR and CW are incompatible
+PR and PR are compatible
+CW and CW are compatible
+
+Example 1
+
+node C, resource R
+granted: PR node A
+granted: PR node B
+granted: NL node C
+granted: NL node D
+
+- A sends convert PR->CW to C
+- C fails before A gets a reply
+- recovery occurs
+
+At this point, A does not know if it still holds
+the lock in PR, or if its conversion to CW was granted:
+- If A's conversion to CW was granted, then another
+  node's CW lock may also have been granted.
+- If A's conversion to CW was not granted, it still
+  holds a PR lock, and other nodes may also hold PR locks.
+
+So, the new master of R cannot simply recreate the lock
+from A using granted mode PR and requested mode CW.
+The new master must look at all the recovered locks to
+determine the correct granted modes, and ensure that all
+the recovered locks are recreated in compatible states.
+
+The correct lock recovery steps in this example are:
+- node D becomes the new master of R
+- node B sends D its lkb, granted PR
+- node A sends D its lkb, convert PR->CW
+- D determines the correct lock state is:
+  granted: PR node B
+  convert: PR->CW node A
+
+The lkb sent by each node was recreated without
+any change on the new master node.
+
+Example 2
+
+node C, resource R
+granted: PR node A
+granted: NL node C
+granted: NL node D
+waiting: CW node B
+
+- A sends convert PR->CW to C
+- C grants the conversion to CW for A
+- C grants the waiting request for CW to B
+- C sends granted message to B, but fails
+  before it can send the granted message to A
+- B receives the granted message from C
+
+At this point:
+- A believes it is converting PR->CW
+- B believes it is holding a CW lock
+
+The correct lock recovery steps in this example are:
+- node D becomes the new master of R
+- node A sends D its lkb, convert PR->CW
+- node B sends D its lkb, granted CW
+- D determins the correct lock state is:
+  granted: CW node B
+  granted: CW node A
+
+The lkb sent by B is recreated without change,
+but the lkb sent by A is changed because the
+granted mode was not compatible.
+
+Fixes to make this work correctly:
+
+recover_convert_waiter: should not make any changes
+to a converting lkb that is still waiting for a reply
+message.  It was previously setting grmode to IV, which
+is invalid state, so the lkb would not be handled
+correctly by other code.
+
+receive_rcom_lock_args: was checking the wrong lkb field
+(wait_type instead of status) to determine if the lkb is
+being converted, and in need of inspection for this special
+recovery.  It was also setting grmode to IV in the lkb,
+causing it to be mishandled by other code.
+Now, this function just puts the lkb, directly as sent,
+onto the convert queue of the resource being recovered,
+and corrects it in recover_conversion() later, if needed.
+
+recover_conversion: the job of this function is to detect
+and correct lkb states for the special PR/CW conversions.
+The new code now checks for recovered lkbs on the granted
+queue with grmode PR or CW, and takes the real grmode from
+that.  Then it looks for lkbs on the convert queue with an
+incompatible grmode (i.e. grmode PR when the real grmode is
+CW, or v.v.)  These converting lkbs need to be fixed.
+They are fixed by temporarily setting their grmode to NL,
+so that grmodes are not incompatible and won't confuse other
+locking code.  The converting lkb will then be granted at
+the end of recovery, replacing the temporary NL grmode.
+
+	Signed-off-by: Alexander Aring <aahringo@redhat.com>
+	Signed-off-by: David Teigland <teigland@redhat.com>
+(cherry picked from commit f74dacb4c81164d7578a11d5f8b660ad87059e6a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dlm/lock.c
+diff --cc fs/dlm/lock.c
+index 9933ec3c213f,fc1d710166e9..000000000000
+--- a/fs/dlm/lock.c
++++ b/fs/dlm/lock.c
+@@@ -5082,20 -4996,22 +5082,35 @@@ void dlm_receive_buffer(union dlm_packe
+  }
+  
+  static void recover_convert_waiter(struct dlm_ls *ls, struct dlm_lkb *lkb,
+ -				   struct dlm_message *ms_local)
+ +				   struct dlm_message *ms_stub)
+  {
+  	if (middle_conversion(lkb)) {
++ 		log_rinfo(ls, "%s %x middle convert in progress", __func__,
++ 			 lkb->lkb_id);
++ 
++ 		/* We sent this lock to the new master. The new master will
++ 		 * tell us when it's granted.  We no longer need a reply, so
++ 		 * use a fake reply to put the lkb into the right state.
++ 		 */
+  		hold_lkb(lkb);
+++<<<<<<< HEAD
+ +		memset(ms_stub, 0, sizeof(struct dlm_message));
+ +		ms_stub->m_flags = DLM_IFL_STUB_MS;
+ +		ms_stub->m_type = DLM_MSG_CONVERT_REPLY;
+ +		ms_stub->m_result = -EINPROGRESS;
+ +		ms_stub->m_header.h_nodeid = lkb->lkb_nodeid;
+ +		_receive_convert_reply(lkb, ms_stub);
+ +
+ +		/* Same special case as in receive_rcom_lock_args() */
+ +		lkb->lkb_grmode = DLM_LOCK_IV;
+ +		rsb_set_flag(lkb->lkb_resource, RSB_RECOVER_CONVERT);
+++=======
++ 		memset(ms_local, 0, sizeof(struct dlm_message));
++ 		ms_local->m_type = cpu_to_le32(DLM_MSG_CONVERT_REPLY);
++ 		ms_local->m_result = cpu_to_le32(to_dlm_errno(-EINPROGRESS));
++ 		ms_local->m_header.h_nodeid = cpu_to_le32(lkb->lkb_nodeid);
++ 		_receive_convert_reply(lkb, ms_local, true);
+++>>>>>>> f74dacb4c811 (dlm: fix recovery of middle conversions)
+  		unhold_lkb(lkb);
+  
+  	} else if (lkb->lkb_rqmode >= lkb->lkb_grmode) {
+* Unmerged path fs/dlm/lock.c
+diff --git a/fs/dlm/recover.c b/fs/dlm/recover.c
+index 98b710cc9cf3..400cb8e9487f 100644
+--- a/fs/dlm/recover.c
++++ b/fs/dlm/recover.c
+@@ -815,33 +815,42 @@ static void recover_lvb(struct dlm_rsb *r)
+ }
+ 
+ /* All master rsb's flagged RECOVER_CONVERT need to be looked at.  The locks
+-   converting PR->CW or CW->PR need to have their lkb_grmode set. */
++ * converting PR->CW or CW->PR may need to have their lkb_grmode changed.
++ */
+ 
+ static void recover_conversion(struct dlm_rsb *r)
+ {
+ 	struct dlm_ls *ls = r->res_ls;
++	uint32_t other_lkid = 0;
++	int other_grmode = -1;
+ 	struct dlm_lkb *lkb;
+-	int grmode = -1;
+ 
+ 	list_for_each_entry(lkb, &r->res_grantqueue, lkb_statequeue) {
+ 		if (lkb->lkb_grmode == DLM_LOCK_PR ||
+ 		    lkb->lkb_grmode == DLM_LOCK_CW) {
+-			grmode = lkb->lkb_grmode;
++			other_grmode = lkb->lkb_grmode;
++			other_lkid = lkb->lkb_id;
+ 			break;
+ 		}
+ 	}
+ 
++	if (other_grmode == -1)
++		return;
++
+ 	list_for_each_entry(lkb, &r->res_convertqueue, lkb_statequeue) {
+-		if (lkb->lkb_grmode != DLM_LOCK_IV)
+-			continue;
+-		if (grmode == -1) {
+-			log_debug(ls, "recover_conversion %x set gr to rq %d",
+-				  lkb->lkb_id, lkb->lkb_rqmode);
+-			lkb->lkb_grmode = lkb->lkb_rqmode;
+-		} else {
+-			log_debug(ls, "recover_conversion %x set gr %d",
+-				  lkb->lkb_id, grmode);
+-			lkb->lkb_grmode = grmode;
++		/* Lock recovery created incompatible granted modes, so
++		 * change the granted mode of the converting lock to
++		 * NL. The rqmode of the converting lock should be CW,
++		 * which means the converting lock should be granted at
++		 * the end of recovery.
++		 */
++		if (((lkb->lkb_grmode == DLM_LOCK_PR) && (other_grmode == DLM_LOCK_CW)) ||
++		    ((lkb->lkb_grmode == DLM_LOCK_CW) && (other_grmode == DLM_LOCK_PR))) {
++			log_limit(ls, "%s %x gr %d rq %d, remote %d %x, other_lkid %u, other gr %d, set gr=NL",
++				  __func__, lkb->lkb_id, lkb->lkb_grmode,
++				  lkb->lkb_rqmode, lkb->lkb_nodeid,
++				  lkb->lkb_remid, other_lkid, other_grmode);
++			lkb->lkb_grmode = DLM_LOCK_NL;
+ 		}
+ 	}
+ }
