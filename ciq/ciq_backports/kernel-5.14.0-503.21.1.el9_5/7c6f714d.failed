@@ -1,0 +1,124 @@
+gfs2: Fix unlinked inode cleanup
+
+jira LE-2290
+Rebuild_History Non-Buildable kernel-5.14.0-503.21.1.el9_5
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 7c6f714d88475ceae5342264858a641eafa19632
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-503.21.1.el9_5/7c6f714d.failed
+
+Before commit f0e56edc2ec7 ("gfs2: Split the two kinds of glock "delete"
+work"), function delete_work_func() was used to trigger the eviction of
+in-memory inodes from remote as well as deleting unlinked inodes at a
+later point.  These two kinds of work were then split into two kinds of
+work, and the two places in the code were deferred deletion of inodes is
+required accidentally ended up queuing the wrong kind of work.  This
+caused unlinked inodes to be left behind, which could in the worst case
+fill up filesystems and require a filesystem check to recover.
+
+Fix that by queuing the right kind of work in try_rgrp_unlink() and
+gfs2_drop_inode().
+
+Fixes: f0e56edc2ec7 ("gfs2: Split the two kinds of glock "delete" work")
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 7c6f714d88475ceae5342264858a641eafa19632)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/glock.h
+diff --cc fs/gfs2/glock.h
+index 944705747cd3,63e101d448e9..000000000000
+--- a/fs/gfs2/glock.h
++++ b/fs/gfs2/glock.h
+@@@ -265,28 -242,28 +265,42 @@@ static inline int gfs2_glock_nq_init(st
+  	return error;
+  }
+  
+++<<<<<<< HEAD
+ +extern void gfs2_glock_cb(struct gfs2_glock *gl, unsigned int state);
+ +extern void gfs2_glock_complete(struct gfs2_glock *gl, int ret);
+ +extern bool gfs2_queue_try_to_evict(struct gfs2_glock *gl);
+ +extern void gfs2_cancel_delete_work(struct gfs2_glock *gl);
+ +extern void gfs2_flush_delete_work(struct gfs2_sbd *sdp);
+ +extern void gfs2_gl_hash_clear(struct gfs2_sbd *sdp);
+ +extern void gfs2_gl_dq_holders(struct gfs2_sbd *sdp);
+ +extern void gfs2_glock_thaw(struct gfs2_sbd *sdp);
+ +extern void gfs2_glock_add_to_lru(struct gfs2_glock *gl);
+ +extern void gfs2_glock_free(struct gfs2_glock *gl);
+ +extern void gfs2_glock_free_later(struct gfs2_glock *gl);
+++=======
++ void gfs2_glock_cb(struct gfs2_glock *gl, unsigned int state);
++ void gfs2_glock_complete(struct gfs2_glock *gl, int ret);
++ bool gfs2_queue_try_to_evict(struct gfs2_glock *gl);
++ bool gfs2_queue_verify_delete(struct gfs2_glock *gl, bool later);
++ void gfs2_cancel_delete_work(struct gfs2_glock *gl);
++ void gfs2_flush_delete_work(struct gfs2_sbd *sdp);
++ void gfs2_gl_hash_clear(struct gfs2_sbd *sdp);
++ void gfs2_gl_dq_holders(struct gfs2_sbd *sdp);
++ void gfs2_glock_thaw(struct gfs2_sbd *sdp);
++ void gfs2_glock_free(struct gfs2_glock *gl);
++ void gfs2_glock_free_later(struct gfs2_glock *gl);
+++>>>>>>> 7c6f714d8847 (gfs2: Fix unlinked inode cleanup)
+  
+ -int __init gfs2_glock_init(void);
+ -void gfs2_glock_exit(void);
+ +extern int __init gfs2_glock_init(void);
+ +extern void gfs2_glock_exit(void);
+  
+ -void gfs2_create_debugfs_file(struct gfs2_sbd *sdp);
+ -void gfs2_delete_debugfs_file(struct gfs2_sbd *sdp);
+ -void gfs2_register_debugfs(void);
+ -void gfs2_unregister_debugfs(void);
+ +extern void gfs2_create_debugfs_file(struct gfs2_sbd *sdp);
+ +extern void gfs2_delete_debugfs_file(struct gfs2_sbd *sdp);
+ +extern void gfs2_register_debugfs(void);
+ +extern void gfs2_unregister_debugfs(void);
+  
+ -void glock_set_object(struct gfs2_glock *gl, void *object);
+ -void glock_clear_object(struct gfs2_glock *gl, void *object);
+ +extern void glock_set_object(struct gfs2_glock *gl, void *object);
+ +extern void glock_clear_object(struct gfs2_glock *gl, void *object);
+  
+  extern const struct lm_lockops gfs2_dlm_ops;
+  
+diff --git a/fs/gfs2/glock.c b/fs/gfs2/glock.c
+index 49ea756972ba..d7deca54d1f5 100644
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@ -1024,7 +1024,7 @@ bool gfs2_queue_try_to_evict(struct gfs2_glock *gl)
+ 				  &gl->gl_delete, 0);
+ }
+ 
+-static bool gfs2_queue_verify_delete(struct gfs2_glock *gl, bool later)
++bool gfs2_queue_verify_delete(struct gfs2_glock *gl, bool later)
+ {
+ 	struct gfs2_sbd *sdp = gl->gl_name.ln_sbd;
+ 	unsigned long delay;
+* Unmerged path fs/gfs2/glock.h
+diff --git a/fs/gfs2/rgrp.c b/fs/gfs2/rgrp.c
+index c79c74121ec0..7df5f97de167 100644
+--- a/fs/gfs2/rgrp.c
++++ b/fs/gfs2/rgrp.c
+@@ -1881,7 +1881,7 @@ static void try_rgrp_unlink(struct gfs2_rgrpd *rgd, u64 *last_unlinked, u64 skip
+ 		 */
+ 		ip = gl->gl_object;
+ 
+-		if (ip || !gfs2_queue_try_to_evict(gl))
++		if (ip || !gfs2_queue_verify_delete(gl, false))
+ 			gfs2_glock_put(gl);
+ 		else
+ 			found++;
+diff --git a/fs/gfs2/super.c b/fs/gfs2/super.c
+index 0812e1b86fed..406ce2690606 100644
+--- a/fs/gfs2/super.c
++++ b/fs/gfs2/super.c
+@@ -1053,7 +1053,7 @@ static int gfs2_drop_inode(struct inode *inode)
+ 		struct gfs2_glock *gl = ip->i_iopen_gh.gh_gl;
+ 
+ 		gfs2_glock_hold(gl);
+-		if (!gfs2_queue_try_to_evict(gl))
++		if (!gfs2_queue_verify_delete(gl, true))
+ 			gfs2_glock_put_async(gl);
+ 		return 0;
+ 	}
