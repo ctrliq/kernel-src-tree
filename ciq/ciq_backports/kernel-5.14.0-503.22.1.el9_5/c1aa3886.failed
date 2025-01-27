@@ -1,0 +1,133 @@
+netfilter: nf_tables: store new sets in dedicated list
+
+jira LE-2290
+Rebuild_History Non-Buildable kernel-5.14.0-503.22.1.el9_5
+commit-author Florian Westphal <fw@strlen.de>
+commit c1aa38866b9c58dc6cf7a5fc6a3e1ca75565169e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-503.22.1.el9_5/c1aa3886.failed
+
+nft_set_lookup_byid() is very slow when transaction becomes large, due to
+walk of the transaction list.
+
+Add a dedicated list that contains only the new sets.
+
+Before: nft -f ruleset 0.07s user 0.00s system 0% cpu 1:04.84 total
+After: nft -f ruleset 0.07s user 0.00s system 0% cpu 30.115 total
+
+.. where ruleset contains ~10 sets with ~100k elements.
+The above number is for a combined flush+reload of the ruleset.
+
+With previous flush, even the first NEWELEM has to walk through a few
+hundred thousands of DELSET(ELEM) transactions before the first NEWSET
+object. To cope with random-order-newset-newsetelem we'd need to replace
+commit_set_list with a hashtable.
+
+Expectation is that a NEWELEM operation refers to the most recently added
+set, so last entry of the dedicated list should be the set we want.
+
+NB: This is not a bug fix per se (functionality is fine), but with
+larger transaction batches list search takes forever, so it would be
+nice to speed this up for -stable too, hence adding a "fixes" tag.
+
+Fixes: 958bee14d071 ("netfilter: nf_tables: use new transaction infrastructure to handle sets")
+	Reported-by: Nadia Pinaeva <n.m.pinaeva@gmail.com>
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit c1aa38866b9c58dc6cf7a5fc6a3e1ca75565169e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netfilter/nf_tables.h
+#	net/netfilter/nf_tables_api.c
+diff --cc include/net/netfilter/nf_tables.h
+index f3d24766182f,2be4738eae1c..000000000000
+--- a/include/net/netfilter/nf_tables.h
++++ b/include/net/netfilter/nf_tables.h
+@@@ -1552,16 -1659,22 +1552,21 @@@ struct nft_trans_rule 
+  	bool				bound;
+  };
+  
+ -#define nft_trans_container_rule(trans)			\
+ -	container_of(trans, struct nft_trans_rule, nft_trans)
+ -#define nft_trans_rule(trans)				\
+ -	nft_trans_container_rule(trans)->rule
+ -#define nft_trans_flow_rule(trans)			\
+ -	nft_trans_container_rule(trans)->flow
+ -#define nft_trans_rule_id(trans)			\
+ -	nft_trans_container_rule(trans)->rule_id
+ -#define nft_trans_rule_bound(trans)			\
+ -	nft_trans_container_rule(trans)->bound
+ -#define nft_trans_rule_chain(trans)	\
+ -	nft_trans_container_rule(trans)->chain
+ +#define nft_trans_rule(trans)	\
+ +	(((struct nft_trans_rule *)trans->data)->rule)
+ +#define nft_trans_flow_rule(trans)	\
+ +	(((struct nft_trans_rule *)trans->data)->flow)
+ +#define nft_trans_rule_id(trans)	\
+ +	(((struct nft_trans_rule *)trans->data)->rule_id)
+ +#define nft_trans_rule_bound(trans)	\
+ +	(((struct nft_trans_rule *)trans->data)->bound)
+  
+  struct nft_trans_set {
+++<<<<<<< HEAD
+++=======
++ 	struct nft_trans_binding	nft_trans_binding;
++ 	struct list_head		list_trans_newset;
+++>>>>>>> c1aa38866b9c (netfilter: nf_tables: store new sets in dedicated list)
+  	struct nft_set			*set;
+  	u32				set_id;
+  	u32				gc_int;
+diff --cc net/netfilter/nf_tables_api.c
+index c82ad7ab90a7,3ea5d0163510..000000000000
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@@ -374,12 -392,24 +374,31 @@@ static void nf_tables_unregister_hook(s
+  static void nft_trans_commit_list_add_tail(struct net *net, struct nft_trans *trans)
+  {
+  	struct nftables_pernet *nft_net = nft_pernet(net);
+++<<<<<<< HEAD
+++=======
++ 	struct nft_trans_binding *binding;
++ 	struct nft_trans_set *trans_set;
++ 
++ 	list_add_tail(&trans->list, &nft_net->commit_list);
++ 
++ 	binding = nft_trans_get_binding(trans);
++ 	if (!binding)
++ 		return;
+++>>>>>>> c1aa38866b9c (netfilter: nf_tables: store new sets in dedicated list)
+  
+  	switch (trans->msg_type) {
+  	case NFT_MSG_NEWSET:
++ 		trans_set = nft_trans_container_set(trans);
++ 
+  		if (!nft_trans_set_update(trans) &&
+  		    nft_set_is_anonymous(nft_trans_set(trans)))
+++<<<<<<< HEAD
+ +			list_add_tail(&trans->binding_list, &nft_net->binding_list);
+++=======
++ 			list_add_tail(&binding->binding_list, &nft_net->binding_list);
++ 
++ 		list_add_tail(&trans_set->list_trans_newset, &nft_net->commit_set_list);
+++>>>>>>> c1aa38866b9c (netfilter: nf_tables: store new sets in dedicated list)
+  		break;
+  	case NFT_MSG_NEWCHAIN:
+  		if (!nft_trans_chain_update(trans) &&
+@@@ -568,6 -614,10 +587,13 @@@ static int __nft_trans_set_add(const st
+  	if (trans == NULL)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+++=======
++ 	trans_set = nft_trans_container_set(trans);
++ 	INIT_LIST_HEAD(&trans_set->nft_trans_binding.binding_list);
++ 	INIT_LIST_HEAD(&trans_set->list_trans_newset);
++ 
+++>>>>>>> c1aa38866b9c (netfilter: nf_tables: store new sets in dedicated list)
+  	if (msg_type == NFT_MSG_NEWSET && ctx->nla[NFTA_SET_ID] && !desc) {
+  		nft_trans_set_id(trans) =
+  			ntohl(nla_get_be32(ctx->nla[NFTA_SET_ID]));
+* Unmerged path include/net/netfilter/nf_tables.h
+* Unmerged path net/netfilter/nf_tables_api.c
