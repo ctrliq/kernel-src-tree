@@ -591,7 +591,9 @@ static void io_worker_handle_work(struct io_wq_acct *acct,
 		/* handle a whole dependent link */
 		do {
 			struct io_wq_work *next_hashed, *linked;
-			unsigned int hash = io_get_work_hash(work);
+			unsigned int hash = io_wq_is_hashed(work)
+				? io_get_work_hash(work)
+				: -1U;
 
 			next_hashed = wq_next_work(work);
 
