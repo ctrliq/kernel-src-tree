@@ -46,6 +46,7 @@ do
 			echo "building ${destdir}/$varfilename"
 
 			# Ignored Makefile variables:
+                        # BUILD_TARGET changes every minor release
 			# CURDIR is a make special target and cannot be easily changed.
 			# UPSTREAM is the base merge commit and can change from day-to-day as
 			# the tree is changed.
@@ -56,6 +57,7 @@ do
 			# VARS is a list of variables added for the 'dist-dump-variables' target
 			# and can be ignored.
 			make RHSELFTESTDATA=1 DIST="${DIST}" DISTRO="${DISTRO}" HEAD=${commit} dist-dump-variables | grep "=" |\
+				grep -v -w BUILD_TARGET |\
 				grep -v -w CURDIR |\
 				grep -v -w UPSTREAM |\
 				grep -v -w RHEL_RELEASE |\
