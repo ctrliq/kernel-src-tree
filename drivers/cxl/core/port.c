@@ -2104,11 +2104,18 @@ static void cxl_bus_remove(struct device *dev)
 
 static struct workqueue_struct *cxl_bus_wq;
 
+static int cxl_rescan_attach(struct device *dev, void *data)
+{
+	int rc = device_attach(dev);
+
+	dev_vdbg(dev, "rescan: %s\n", rc ? "attach" : "detached");
+
+	return 0;
+}
+
 static void cxl_bus_rescan_queue(struct work_struct *w)
 {
-	int rc = bus_rescan_devices(&cxl_bus_type);
-
-	pr_debug("CXL bus rescan result: %d\n", rc);
+	bus_for_each_dev(&cxl_bus_type, NULL, NULL, cxl_rescan_attach);
 }
 
 void cxl_bus_rescan(void)
@@ -2256,6 +2263,26 @@ int cxl_endpoint_get_perf_coordinates(struct cxl_port *port,
 	return 0;
 }
 EXPORT_SYMBOL_NS_GPL(cxl_endpoint_get_perf_coordinates, CXL);
+
+int cxl_port_get_switch_dport_bandwidth(struct cxl_port *port,
+					struct access_coordinate *c)
+{
+	struct cxl_dport *dport = port->parent_dport;
+
+	/* Check this port is connected to a switch DSP and not an RP */
+	if (parent_port_is_cxl_root(to_cxl_port(port->dev.parent)))
+		return -ENODEV;
+
+	if (!coordinates_valid(dport->coord))
+		return -EINVAL;
+
+	for (int i = 0; i < ACCESS_COORDINATE_MAX; i++) {
+		c[i].read_bandwidth = dport->coord[i].read_bandwidth;
+		c[i].write_bandwidth = dport->coord[i].write_bandwidth;
+	}
+
+	return 0;
+}
 
 /* for user tooling to ensure port disable work has completed */
 static ssize_t flush_store(const struct bus_type *bus, const char *buf, size_t count)
