@@ -327,6 +327,9 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 
 	paging_init();
 
+	if (IS_ENABLED(CONFIG_PREEMPT_RT))
+		mark_tech_preview("RHEL-RT on ARM64", NULL);
+
 	acpi_table_upgrade();
 
 	/* Parse the ACPI tables for possible boot-time configuration */
