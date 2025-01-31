@@ -286,6 +286,8 @@ extern struct device_node *of_get_next_child(const struct device_node *node,
 					     struct device_node *prev);
 extern struct device_node *of_get_next_available_child(
 	const struct device_node *node, struct device_node *prev);
+extern struct device_node *of_get_next_reserved_child(
+	const struct device_node *node, struct device_node *prev);
 
 extern struct device_node *of_get_compatible_child(const struct device_node *parent,
 					const char *compatible);
@@ -528,6 +530,12 @@ static inline struct device_node *of_get_next_child(
 }
 
 static inline struct device_node *of_get_next_available_child(
+	const struct device_node *node, struct device_node *prev)
+{
+	return NULL;
+}
+
+static inline struct device_node *of_get_next_reserved_child(
 	const struct device_node *node, struct device_node *prev)
 {
 	return NULL;
@@ -1404,6 +1412,9 @@ static inline int of_property_read_s32(const struct device_node *np,
 #define for_each_available_child_of_node(parent, child) \
 	for (child = of_get_next_available_child(parent, NULL); child != NULL; \
 	     child = of_get_next_available_child(parent, child))
+#define for_each_reserved_child_of_node(parent, child)			\
+	for (child = of_get_next_reserved_child(parent, NULL); child != NULL; \
+	     child = of_get_next_reserved_child(parent, child))
 
 #define for_each_available_child_of_node_scoped(parent, child) \
 	for (struct device_node *child __free(device_node) =		\
