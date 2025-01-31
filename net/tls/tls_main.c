@@ -983,6 +983,9 @@ static void tls_update(struct sock *sk, struct proto *p,
 
 	WARN_ON_ONCE(sk->sk_prot == p);
 
+	if (sk->sk_prot == p)
+		return;
+
 	ctx = tls_get_ctx(sk);
 	if (likely(ctx)) {
 		ctx->sk_write_space = write_space;
