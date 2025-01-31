@@ -320,6 +320,7 @@ static __net_init int setup_net(struct net *net, struct user_namespace *user_ns)
 
 	refcount_set(&net->ns.count, 1);
 	ref_tracker_dir_init(&net->refcnt_tracker, 128, "net refcnt");
+	ref_tracker_dir_init(&net->notrefcnt_tracker, 128, "net notrefcnt");
 
 	refcount_set(&net->passive, 1);
 	get_random_bytes(&net->hash_mix, sizeof(u32));
@@ -464,6 +465,9 @@ static void net_free(struct net *net)
 {
 	if (refcount_dec_and_test(&net->passive)) {
 		kfree(rcu_access_pointer(net->gen));
+
+		/* There should not be any trackers left there. */
+		ref_tracker_dir_exit(&net->notrefcnt_tracker);
 
 		/* Wait for an extra rcu_barrier() before final free. */
 		llist_add(&net->defer_free_list, &defer_free_list);
