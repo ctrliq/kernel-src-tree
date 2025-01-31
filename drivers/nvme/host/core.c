@@ -2119,15 +2119,16 @@ static int nvme_update_ns_info_generic(struct nvme_ns *ns,
 		struct nvme_ns_info *info)
 {
 	struct queue_limits lim;
+	unsigned int memflags;
 	int ret;
 
 	lim = queue_limits_start_update(ns->disk->queue);
 	nvme_set_ctrl_limits(ns->ctrl, &lim);
 
-	blk_mq_freeze_queue(ns->disk->queue);
+	memflags = blk_mq_freeze_queue(ns->disk->queue);
 	ret = queue_limits_commit_update(ns->disk->queue, &lim);
 	set_disk_ro(ns->disk, nvme_ns_is_readonly(ns, info));
-	blk_mq_unfreeze_queue(ns->disk->queue);
+	blk_mq_unfreeze_queue(ns->disk->queue, memflags);
 
 	/* Hide the block-interface for these devices */
 	if (!ret)
@@ -2142,6 +2143,7 @@ static int nvme_update_ns_info_block(struct nvme_ns *ns,
 	struct nvme_id_ns_nvm *nvm = NULL;
 	struct nvme_zone_info zi = {};
 	struct nvme_id_ns *id;
+	unsigned int memflags;
 	sector_t capacity;
 	unsigned lbaf;
 	int ret;
@@ -2173,7 +2175,7 @@ static int nvme_update_ns_info_block(struct nvme_ns *ns,
 
 	lim = queue_limits_start_update(ns->disk->queue);
 
-	blk_mq_freeze_queue(ns->disk->queue);
+	memflags = blk_mq_freeze_queue(ns->disk->queue);
 	ns->head->lba_shift = id->lbaf[lbaf].ds;
 	ns->head->nuse = le64_to_cpu(id->nuse);
 	capacity = nvme_lba_to_sect(ns->head, le64_to_cpu(id->nsze));
@@ -2203,7 +2205,7 @@ static int nvme_update_ns_info_block(struct nvme_ns *ns,
 
 	ret = queue_limits_commit_update(ns->disk->queue, &lim);
 	if (ret) {
-		blk_mq_unfreeze_queue(ns->disk->queue);
+		blk_mq_unfreeze_queue(ns->disk->queue, memflags);
 		goto out;
 	}
 
@@ -2219,7 +2221,7 @@ static int nvme_update_ns_info_block(struct nvme_ns *ns,
 		ns->head->features |= NVME_NS_DEAC;
 	set_disk_ro(ns->disk, nvme_ns_is_readonly(ns, info));
 	set_bit(NVME_NS_READY, &ns->flags);
-	blk_mq_unfreeze_queue(ns->disk->queue);
+	blk_mq_unfreeze_queue(ns->disk->queue, memflags);
 
 	if (blk_queue_is_zoned(ns->queue)) {
 		ret = blk_revalidate_disk_zones(ns->disk);
@@ -2275,9 +2277,10 @@ static int nvme_update_ns_info(struct nvme_ns *ns, struct nvme_ns_info *info)
 	if (!ret && nvme_ns_head_multipath(ns->head)) {
 		struct queue_limits *ns_lim = &ns->disk->queue->limits;
 		struct queue_limits lim;
+		unsigned int memflags;
 
 		lim = queue_limits_start_update(ns->head->disk->queue);
-		blk_mq_freeze_queue(ns->head->disk->queue);
+		memflags = blk_mq_freeze_queue(ns->head->disk->queue);
 		/*
 		 * queue_limits mixes values that are the hardware limitations
 		 * for bio splitting with what is the device configuration.
@@ -2309,7 +2312,7 @@ static int nvme_update_ns_info(struct nvme_ns *ns, struct nvme_ns_info *info)
 		set_disk_ro(ns->head->disk, nvme_ns_is_readonly(ns, info));
 		nvme_mpath_revalidate_paths(ns);
 
-		blk_mq_unfreeze_queue(ns->head->disk->queue);
+		blk_mq_unfreeze_queue(ns->head->disk->queue, memflags);
 	}
 
 	return ret;
