@@ -17,7 +17,7 @@ static void pci_free_resources(struct pci_dev *dev)
 	}
 }
 
-static void pci_pwrctl_unregister(struct device *dev)
+static void pci_pwrctrl_unregister(struct device *dev)
 {
 	struct platform_device *pdev;
 
