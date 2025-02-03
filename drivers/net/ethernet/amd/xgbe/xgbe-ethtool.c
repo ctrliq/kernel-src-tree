@@ -314,10 +314,15 @@ static int xgbe_get_link_ksettings(struct net_device *netdev,
 
 	cmd->base.phy_address = pdata->phy.address;
 
-	cmd->base.autoneg = pdata->phy.autoneg;
-	cmd->base.speed = pdata->phy.speed;
-	cmd->base.duplex = pdata->phy.duplex;
+	if (netif_carrier_ok(netdev)) {
+		cmd->base.speed = pdata->phy.speed;
+		cmd->base.duplex = pdata->phy.duplex;
+	} else {
+		cmd->base.speed = SPEED_UNKNOWN;
+		cmd->base.duplex = DUPLEX_UNKNOWN;
+	}
 
+	cmd->base.autoneg = pdata->phy.autoneg;
 	cmd->base.port = PORT_NONE;
 
 	XGBE_LM_COPY(cmd, supported, lks, supported);
@@ -369,9 +374,8 @@ static int xgbe_set_link_ksettings(struct net_device *netdev,
 		  __ETHTOOL_LINK_MODE_MASK_NBITS, cmd->link_modes.advertising,
 		  __ETHTOOL_LINK_MODE_MASK_NBITS, lks->link_modes.supported);
 
-	bitmap_and(advertising,
-		   cmd->link_modes.advertising, lks->link_modes.supported,
-		   __ETHTOOL_LINK_MODE_MASK_NBITS);
+	linkmode_and(advertising, cmd->link_modes.advertising,
+		     lks->link_modes.supported);
 
 	if ((cmd->base.autoneg == AUTONEG_ENABLE) &&
 	    bitmap_empty(advertising, __ETHTOOL_LINK_MODE_MASK_NBITS)) {
@@ -384,8 +388,7 @@ static int xgbe_set_link_ksettings(struct net_device *netdev,
 	pdata->phy.autoneg = cmd->base.autoneg;
 	pdata->phy.speed = speed;
 	pdata->phy.duplex = cmd->base.duplex;
-	bitmap_copy(lks->link_modes.advertising, advertising,
-		    __ETHTOOL_LINK_MODE_MASK_NBITS);
+	linkmode_copy(lks->link_modes.advertising, advertising);
 
 	if (cmd->base.autoneg == AUTONEG_ENABLE)
 		XGBE_SET_ADV(lks, Autoneg);
