@@ -121,6 +121,12 @@ EXPORT_SYMBOL(rng_is_initialized);
 static void __cold crng_set_ready(struct work_struct *work)
 {
 	static_branch_enable(&crng_is_ready);
+#ifdef CONFIG_RHEL_DIFFERENCES
+#ifdef CONFIG_VDSO_GETRANDOM
+	if (!fips_enabled)
+		WRITE_ONCE(__arch_get_k_vdso_rng_data()->is_ready, true);
+#endif
+#endif
 }
 
 /* Used by wait_for_random_bytes(), and considered an entropy collector, below. */
@@ -749,9 +755,10 @@ static void __cold _credit_init_bits(size_t bits)
 		if (static_key_initialized && system_unbound_wq)
 			queue_work(system_unbound_wq, &set_ready);
 		atomic_notifier_call_chain(&random_ready_notifier, 0, NULL);
+#ifndef CONFIG_RHEL_DIFFERENCES
 #ifdef CONFIG_VDSO_GETRANDOM
-		if (!fips_enabled)
-			WRITE_ONCE(__arch_get_k_vdso_rng_data()->is_ready, true);
+		WRITE_ONCE(__arch_get_k_vdso_rng_data()->is_ready, true);
+#endif
 #endif
 		wake_up_interruptible(&crng_init_wait);
 		kill_fasync(&fasync, SIGIO, POLL_IN);
