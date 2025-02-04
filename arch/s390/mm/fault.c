@@ -307,13 +307,14 @@ static void do_fault_error(struct pt_regs *regs, vm_fault_t fault)
 				do_no_context(regs);
 			else
 				do_sigsegv(regs, SEGV_MAPERR);
-		} else if (fault & VM_FAULT_SIGBUS) {
+		} else if (fault & (VM_FAULT_SIGBUS | VM_FAULT_HWPOISON)) {
 			/* Kernel mode? Handle exceptions or die */
 			if (!user_mode(regs))
 				do_no_context(regs);
 			else
 				do_sigbus(regs);
 		} else {
+			pr_emerg("Unexpected fault flags: %08x\n", fault);
 			BUG();
 		}
 		break;
