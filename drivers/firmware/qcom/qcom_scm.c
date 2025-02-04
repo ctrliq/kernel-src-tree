@@ -2,29 +2,38 @@
 /* Copyright (c) 2010,2015,2019 The Linux Foundation. All rights reserved.
  * Copyright (C) 2015 Linaro Ltd.
  */
-#include <linux/platform_device.h>
-#include <linux/init.h>
-#include <linux/interrupt.h>
+
+#include <linux/arm-smccc.h>
+#include <linux/bitfield.h>
+#include <linux/bits.h>
+#include <linux/cleanup.h>
+#include <linux/clk.h>
 #include <linux/completion.h>
 #include <linux/cpumask.h>
-#include <linux/export.h>
 #include <linux/dma-mapping.h>
-#include <linux/interconnect.h>
-#include <linux/module.h>
-#include <linux/types.h>
+#include <linux/err.h>
+#include <linux/export.h>
 #include <linux/firmware/qcom/qcom_scm.h>
+#include <linux/firmware/qcom/qcom_tzmem.h>
+#include <linux/init.h>
+#include <linux/interconnect.h>
+#include <linux/interrupt.h>
+#include <linux/kstrtox.h>
+#include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_irq.h>
 #include <linux/of_platform.h>
-#include <linux/clk.h>
+#include <linux/of_reserved_mem.h>
+#include <linux/platform_device.h>
 #include <linux/reset-controller.h>
-#include <linux/arm-smccc.h>
+#include <linux/sizes.h>
+#include <linux/types.h>
 
 #include "qcom_scm.h"
+#include "qcom_tzmem.h"
 
-static bool download_mode = IS_ENABLED(CONFIG_QCOM_SCM_DOWNLOAD_MODE_DEFAULT);
-module_param(download_mode, bool, 0);
+static u32 download_mode;
 
 #define SCM_HAS_CORE_CLK	BIT(0)
 #define SCM_HAS_IFACE_CLK	BIT(1)
@@ -44,6 +53,8 @@ struct qcom_scm {
 	int scm_vote_count;
 
 	u64 dload_mode_addr;
+
+	struct qcom_tzmem_pool *mempool;
 };
 
 struct qcom_scm_current_perm_info {
@@ -59,6 +70,54 @@ struct qcom_scm_mem_map_info {
 	__le64 mem_size;
 };
 
+/**
+ * struct qcom_scm_qseecom_resp - QSEECOM SCM call response.
+ * @result:    Result or status of the SCM call. See &enum qcom_scm_qseecom_result.
+ * @resp_type: Type of the response. See &enum qcom_scm_qseecom_resp_type.
+ * @data:      Response data. The type of this data is given in @resp_type.
+ */
+struct qcom_scm_qseecom_resp {
+	u64 result;
+	u64 resp_type;
+	u64 data;
+};
+
+enum qcom_scm_qseecom_result {
+	QSEECOM_RESULT_SUCCESS			= 0,
+	QSEECOM_RESULT_INCOMPLETE		= 1,
+	QSEECOM_RESULT_BLOCKED_ON_LISTENER	= 2,
+	QSEECOM_RESULT_FAILURE			= 0xFFFFFFFF,
+};
+
+enum qcom_scm_qseecom_resp_type {
+	QSEECOM_SCM_RES_APP_ID			= 0xEE01,
+	QSEECOM_SCM_RES_QSEOS_LISTENER_ID	= 0xEE02,
+};
+
+enum qcom_scm_qseecom_tz_owner {
+	QSEECOM_TZ_OWNER_SIP			= 2,
+	QSEECOM_TZ_OWNER_TZ_APPS		= 48,
+	QSEECOM_TZ_OWNER_QSEE_OS		= 50
+};
+
+enum qcom_scm_qseecom_tz_svc {
+	QSEECOM_TZ_SVC_APP_ID_PLACEHOLDER	= 0,
+	QSEECOM_TZ_SVC_APP_MGR			= 1,
+	QSEECOM_TZ_SVC_INFO			= 6,
+};
+
+enum qcom_scm_qseecom_tz_cmd_app {
+	QSEECOM_TZ_CMD_APP_SEND			= 1,
+	QSEECOM_TZ_CMD_APP_LOOKUP		= 3,
+};
+
+enum qcom_scm_qseecom_tz_cmd_info {
+	QSEECOM_TZ_CMD_INFO_VERSION		= 3,
+};
+
+#define QSEECOM_MAX_APP_NAME_SIZE		64
+#define SHMBRIDGE_RESULT_NOTSUPP		4
+
 /* Each bit configures cold/warm boot address for one of the 4 CPUs */
 static const u8 qcom_scm_cpu_cold_bits[QCOM_SCM_BOOT_MAX_CPUS] = {
 	0, BIT(0), BIT(3), BIT(5)
@@ -70,11 +129,24 @@ static const u8 qcom_scm_cpu_warm_bits[QCOM_SCM_BOOT_MAX_CPUS] = {
 #define QCOM_SMC_WAITQ_FLAG_WAKE_ONE	BIT(0)
 #define QCOM_SMC_WAITQ_FLAG_WAKE_ALL	BIT(1)
 
+#define QCOM_DLOAD_MASK		GENMASK(5, 4)
+#define QCOM_DLOAD_NODUMP	0
+#define QCOM_DLOAD_FULLDUMP	1
+#define QCOM_DLOAD_MINIDUMP	2
+#define QCOM_DLOAD_BOTHDUMP	3
+
 static const char * const qcom_scm_convention_names[] = {
 	[SMC_CONVENTION_UNKNOWN] = "unknown",
 	[SMC_CONVENTION_ARM_32] = "smc arm 32",
 	[SMC_CONVENTION_ARM_64] = "smc arm 64",
 	[SMC_CONVENTION_LEGACY] = "smc legacy",
+};
+
+static const char * const download_mode_name[] = {
+	[QCOM_DLOAD_NODUMP]	= "off",
+	[QCOM_DLOAD_FULLDUMP]	= "full",
+	[QCOM_DLOAD_MINIDUMP]	= "mini",
+	[QCOM_DLOAD_BOTHDUMP]	= "full,mini",
 };
 
 static struct qcom_scm *__scm;
@@ -150,6 +222,14 @@ static void qcom_scm_bw_disable(void)
 
 enum qcom_scm_convention qcom_scm_convention = SMC_CONVENTION_UNKNOWN;
 static DEFINE_SPINLOCK(scm_query_lock);
+
+struct qcom_tzmem_pool *qcom_scm_get_tzmem_pool(void)
+{
+	if (!qcom_scm_is_available())
+		return NULL;
+
+	return __scm->mempool;
+}
 
 static enum qcom_scm_convention __get_convention(void)
 {
@@ -351,7 +431,7 @@ int qcom_scm_set_warm_boot_addr(void *entry)
 		return qcom_scm_set_boot_addr(entry, qcom_scm_cpu_warm_bits);
 	return 0;
 }
-EXPORT_SYMBOL(qcom_scm_set_warm_boot_addr);
+EXPORT_SYMBOL_GPL(qcom_scm_set_warm_boot_addr);
 
 /**
  * qcom_scm_set_cold_boot_addr() - Set the cold boot address for all cpus
@@ -364,7 +444,7 @@ int qcom_scm_set_cold_boot_addr(void *entry)
 		return qcom_scm_set_boot_addr(entry, qcom_scm_cpu_cold_bits);
 	return 0;
 }
-EXPORT_SYMBOL(qcom_scm_set_cold_boot_addr);
+EXPORT_SYMBOL_GPL(qcom_scm_set_cold_boot_addr);
 
 /**
  * qcom_scm_cpu_power_down() - Power down the cpu
@@ -386,7 +466,7 @@ void qcom_scm_cpu_power_down(u32 flags)
 
 	qcom_scm_call_atomic(__scm ? __scm->dev : NULL, &desc, NULL);
 }
-EXPORT_SYMBOL(qcom_scm_cpu_power_down);
+EXPORT_SYMBOL_GPL(qcom_scm_cpu_power_down);
 
 int qcom_scm_set_remote_state(u32 state, u32 id)
 {
@@ -405,7 +485,30 @@ int qcom_scm_set_remote_state(u32 state, u32 id)
 
 	return ret ? : res.result[0];
 }
-EXPORT_SYMBOL(qcom_scm_set_remote_state);
+EXPORT_SYMBOL_GPL(qcom_scm_set_remote_state);
+
+static int qcom_scm_disable_sdi(void)
+{
+	int ret;
+	struct qcom_scm_desc desc = {
+		.svc = QCOM_SCM_SVC_BOOT,
+		.cmd = QCOM_SCM_BOOT_SDI_CONFIG,
+		.args[0] = 1, /* Disable watchdog debug */
+		.args[1] = 0, /* Disable SDI */
+		.arginfo = QCOM_SCM_ARGS(2),
+		.owner = ARM_SMCCC_OWNER_SIP,
+	};
+	struct qcom_scm_res res;
+
+	ret = qcom_scm_clk_enable();
+	if (ret)
+		return ret;
+	ret = qcom_scm_call(__scm->dev, &desc, &res);
+
+	qcom_scm_clk_disable();
+
+	return ret ? : res.result[0];
+}
 
 static int __qcom_scm_set_dload_mode(struct device *dev, bool enable)
 {
@@ -422,20 +525,32 @@ static int __qcom_scm_set_dload_mode(struct device *dev, bool enable)
 	return qcom_scm_call_atomic(__scm->dev, &desc, NULL);
 }
 
-static void qcom_scm_set_download_mode(bool enable)
+static int qcom_scm_io_rmw(phys_addr_t addr, unsigned int mask, unsigned int val)
 {
-	bool avail;
+	unsigned int old;
+	unsigned int new;
+	int ret;
+
+	ret = qcom_scm_io_readl(addr, &old);
+	if (ret)
+		return ret;
+
+	new = (old & ~mask) | (val & mask);
+
+	return qcom_scm_io_writel(addr, new);
+}
+
+static void qcom_scm_set_download_mode(u32 dload_mode)
+{
 	int ret = 0;
 
-	avail = __qcom_scm_is_call_available(__scm->dev,
-					     QCOM_SCM_SVC_BOOT,
-					     QCOM_SCM_BOOT_SET_DLOAD_MODE);
-	if (avail) {
-		ret = __qcom_scm_set_dload_mode(__scm->dev, enable);
-	} else if (__scm->dload_mode_addr) {
-		ret = qcom_scm_io_writel(__scm->dload_mode_addr,
-				enable ? QCOM_SCM_BOOT_SET_DLOAD_MODE : 0);
-	} else {
+	if (__scm->dload_mode_addr) {
+		ret = qcom_scm_io_rmw(__scm->dload_mode_addr, QCOM_DLOAD_MASK,
+				      FIELD_PREP(QCOM_DLOAD_MASK, dload_mode));
+	} else if (__qcom_scm_is_call_available(__scm->dev, QCOM_SCM_SVC_BOOT,
+						QCOM_SCM_BOOT_SET_DLOAD_MODE)) {
+		ret = __qcom_scm_set_dload_mode(__scm->dev, !!dload_mode);
+	} else if (dload_mode) {
 		dev_err(__scm->dev,
 			"No available mechanism for setting download mode\n");
 	}
@@ -480,13 +595,19 @@ int qcom_scm_pas_init_image(u32 peripheral, const void *metadata, size_t size,
 	 * During the scm call memory protection will be enabled for the meta
 	 * data blob, so make sure it's physically contiguous, 4K aligned and
 	 * non-cachable to avoid XPU violations.
+	 *
+	 * For PIL calls the hypervisor creates SHM Bridges for the blob
+	 * buffers on behalf of Linux so we must not do it ourselves hence
+	 * not using the TZMem allocator here.
+	 *
+	 * If we pass a buffer that is already part of an SHM Bridge to this
+	 * call, it will fail.
 	 */
 	mdata_buf = dma_alloc_coherent(__scm->dev, size, &mdata_phys,
 				       GFP_KERNEL);
-	if (!mdata_buf) {
-		dev_err(__scm->dev, "Allocation of metadata buffer failed.\n");
+	if (!mdata_buf)
 		return -ENOMEM;
-	}
+
 	memcpy(mdata_buf, metadata, size);
 
 	ret = qcom_scm_clk_enable();
@@ -515,7 +636,7 @@ out:
 
 	return ret ? : res.result[0];
 }
-EXPORT_SYMBOL(qcom_scm_pas_init_image);
+EXPORT_SYMBOL_GPL(qcom_scm_pas_init_image);
 
 /**
  * qcom_scm_pas_metadata_release() - release metadata context
@@ -532,7 +653,7 @@ void qcom_scm_pas_metadata_release(struct qcom_scm_pas_metadata *ctx)
 	ctx->phys = 0;
 	ctx->size = 0;
 }
-EXPORT_SYMBOL(qcom_scm_pas_metadata_release);
+EXPORT_SYMBOL_GPL(qcom_scm_pas_metadata_release);
 
 /**
  * qcom_scm_pas_mem_setup() - Prepare the memory related to a given peripheral
@@ -571,7 +692,7 @@ int qcom_scm_pas_mem_setup(u32 peripheral, phys_addr_t addr, phys_addr_t size)
 
 	return ret ? : res.result[0];
 }
-EXPORT_SYMBOL(qcom_scm_pas_mem_setup);
+EXPORT_SYMBOL_GPL(qcom_scm_pas_mem_setup);
 
 /**
  * qcom_scm_pas_auth_and_reset() - Authenticate the given peripheral firmware
@@ -606,7 +727,7 @@ int qcom_scm_pas_auth_and_reset(u32 peripheral)
 
 	return ret ? : res.result[0];
 }
-EXPORT_SYMBOL(qcom_scm_pas_auth_and_reset);
+EXPORT_SYMBOL_GPL(qcom_scm_pas_auth_and_reset);
 
 /**
  * qcom_scm_pas_shutdown() - Shut down the remote processor
@@ -641,7 +762,7 @@ int qcom_scm_pas_shutdown(u32 peripheral)
 
 	return ret ? : res.result[0];
 }
-EXPORT_SYMBOL(qcom_scm_pas_shutdown);
+EXPORT_SYMBOL_GPL(qcom_scm_pas_shutdown);
 
 /**
  * qcom_scm_pas_supported() - Check if the peripheral authentication service is
@@ -670,7 +791,7 @@ bool qcom_scm_pas_supported(u32 peripheral)
 
 	return ret ? false : !!res.result[0];
 }
-EXPORT_SYMBOL(qcom_scm_pas_supported);
+EXPORT_SYMBOL_GPL(qcom_scm_pas_supported);
 
 static int __qcom_scm_pas_mss_reset(struct device *dev, bool reset)
 {
@@ -732,7 +853,7 @@ int qcom_scm_io_readl(phys_addr_t addr, unsigned int *val)
 
 	return ret < 0 ? ret : 0;
 }
-EXPORT_SYMBOL(qcom_scm_io_readl);
+EXPORT_SYMBOL_GPL(qcom_scm_io_readl);
 
 int qcom_scm_io_writel(phys_addr_t addr, unsigned int val)
 {
@@ -747,7 +868,7 @@ int qcom_scm_io_writel(phys_addr_t addr, unsigned int val)
 
 	return qcom_scm_call_atomic(__scm->dev, &desc, NULL);
 }
-EXPORT_SYMBOL(qcom_scm_io_writel);
+EXPORT_SYMBOL_GPL(qcom_scm_io_writel);
 
 /**
  * qcom_scm_restore_sec_cfg_available() - Check if secure environment
@@ -760,7 +881,7 @@ bool qcom_scm_restore_sec_cfg_available(void)
 	return __qcom_scm_is_call_available(__scm->dev, QCOM_SCM_SVC_MP,
 					    QCOM_SCM_MP_RESTORE_SEC_CFG);
 }
-EXPORT_SYMBOL(qcom_scm_restore_sec_cfg_available);
+EXPORT_SYMBOL_GPL(qcom_scm_restore_sec_cfg_available);
 
 int qcom_scm_restore_sec_cfg(u32 device_id, u32 spare)
 {
@@ -779,7 +900,7 @@ int qcom_scm_restore_sec_cfg(u32 device_id, u32 spare)
 
 	return ret ? : res.result[0];
 }
-EXPORT_SYMBOL(qcom_scm_restore_sec_cfg);
+EXPORT_SYMBOL_GPL(qcom_scm_restore_sec_cfg);
 
 int qcom_scm_iommu_secure_ptbl_size(u32 spare, size_t *size)
 {
@@ -800,7 +921,7 @@ int qcom_scm_iommu_secure_ptbl_size(u32 spare, size_t *size)
 
 	return ret ? : res.result[1];
 }
-EXPORT_SYMBOL(qcom_scm_iommu_secure_ptbl_size);
+EXPORT_SYMBOL_GPL(qcom_scm_iommu_secure_ptbl_size);
 
 int qcom_scm_iommu_secure_ptbl_init(u64 addr, u32 size, u32 spare)
 {
@@ -824,7 +945,7 @@ int qcom_scm_iommu_secure_ptbl_init(u64 addr, u32 size, u32 spare)
 
 	return ret;
 }
-EXPORT_SYMBOL(qcom_scm_iommu_secure_ptbl_init);
+EXPORT_SYMBOL_GPL(qcom_scm_iommu_secure_ptbl_init);
 
 int qcom_scm_iommu_set_cp_pool_size(u32 spare, u32 size)
 {
@@ -839,7 +960,7 @@ int qcom_scm_iommu_set_cp_pool_size(u32 spare, u32 size)
 
 	return qcom_scm_call(__scm->dev, &desc, NULL);
 }
-EXPORT_SYMBOL(qcom_scm_iommu_set_cp_pool_size);
+EXPORT_SYMBOL_GPL(qcom_scm_iommu_set_cp_pool_size);
 
 int qcom_scm_mem_protect_video_var(u32 cp_start, u32 cp_size,
 				   u32 cp_nonpixel_start,
@@ -863,7 +984,7 @@ int qcom_scm_mem_protect_video_var(u32 cp_start, u32 cp_size,
 
 	return ret ? : res.result[0];
 }
-EXPORT_SYMBOL(qcom_scm_mem_protect_video_var);
+EXPORT_SYMBOL_GPL(qcom_scm_mem_protect_video_var);
 
 static int __qcom_scm_assign_mem(struct device *dev, phys_addr_t mem_region,
 				 size_t mem_sz, phys_addr_t src, size_t src_sz,
@@ -913,14 +1034,13 @@ int qcom_scm_assign_mem(phys_addr_t mem_addr, size_t mem_sz,
 	struct qcom_scm_mem_map_info *mem_to_map;
 	phys_addr_t mem_to_map_phys;
 	phys_addr_t dest_phys;
-	dma_addr_t ptr_phys;
+	phys_addr_t ptr_phys;
 	size_t mem_to_map_sz;
 	size_t dest_sz;
 	size_t src_sz;
 	size_t ptr_sz;
 	int next_vm;
 	__le32 *src;
-	void *ptr;
 	int ret, i, b;
 	u64 srcvm_bits = *srcvm;
 
@@ -930,9 +1050,12 @@ int qcom_scm_assign_mem(phys_addr_t mem_addr, size_t mem_sz,
 	ptr_sz = ALIGN(src_sz, SZ_64) + ALIGN(mem_to_map_sz, SZ_64) +
 			ALIGN(dest_sz, SZ_64);
 
-	ptr = dma_alloc_coherent(__scm->dev, ptr_sz, &ptr_phys, GFP_KERNEL);
+	void *ptr __free(qcom_tzmem) = qcom_tzmem_alloc(__scm->mempool,
+							ptr_sz, GFP_KERNEL);
 	if (!ptr)
 		return -ENOMEM;
+
+	ptr_phys = qcom_tzmem_to_phys(ptr);
 
 	/* Fill source vmid detail */
 	src = ptr;
@@ -962,7 +1085,6 @@ int qcom_scm_assign_mem(phys_addr_t mem_addr, size_t mem_sz,
 
 	ret = __qcom_scm_assign_mem(__scm->dev, mem_to_map_phys, mem_to_map_sz,
 				    ptr_phys, src_sz, dest_phys, dest_sz);
-	dma_free_coherent(__scm->dev, ptr_sz, ptr, ptr_phys);
 	if (ret) {
 		dev_err(__scm->dev,
 			"Assign memory protection call failed %d\n", ret);
@@ -972,7 +1094,7 @@ int qcom_scm_assign_mem(phys_addr_t mem_addr, size_t mem_sz,
 	*srcvm = next_vm;
 	return 0;
 }
-EXPORT_SYMBOL(qcom_scm_assign_mem);
+EXPORT_SYMBOL_GPL(qcom_scm_assign_mem);
 
 /**
  * qcom_scm_ocmem_lock_available() - is OCMEM lock/unlock interface available
@@ -982,7 +1104,7 @@ bool qcom_scm_ocmem_lock_available(void)
 	return __qcom_scm_is_call_available(__scm->dev, QCOM_SCM_SVC_OCMEM,
 					    QCOM_SCM_OCMEM_LOCK_CMD);
 }
-EXPORT_SYMBOL(qcom_scm_ocmem_lock_available);
+EXPORT_SYMBOL_GPL(qcom_scm_ocmem_lock_available);
 
 /**
  * qcom_scm_ocmem_lock() - call OCMEM lock interface to assign an OCMEM
@@ -1008,7 +1130,7 @@ int qcom_scm_ocmem_lock(enum qcom_scm_ocmem_client id, u32 offset, u32 size,
 
 	return qcom_scm_call(__scm->dev, &desc, NULL);
 }
-EXPORT_SYMBOL(qcom_scm_ocmem_lock);
+EXPORT_SYMBOL_GPL(qcom_scm_ocmem_lock);
 
 /**
  * qcom_scm_ocmem_unlock() - call OCMEM unlock interface to release an OCMEM
@@ -1031,7 +1153,7 @@ int qcom_scm_ocmem_unlock(enum qcom_scm_ocmem_client id, u32 offset, u32 size)
 
 	return qcom_scm_call(__scm->dev, &desc, NULL);
 }
-EXPORT_SYMBOL(qcom_scm_ocmem_unlock);
+EXPORT_SYMBOL_GPL(qcom_scm_ocmem_unlock);
 
 /**
  * qcom_scm_ice_available() - Is the ICE key programming interface available?
@@ -1046,7 +1168,7 @@ bool qcom_scm_ice_available(void)
 		__qcom_scm_is_call_available(__scm->dev, QCOM_SCM_SVC_ES,
 					     QCOM_SCM_ES_CONFIG_SET_ICE_KEY);
 }
-EXPORT_SYMBOL(qcom_scm_ice_available);
+EXPORT_SYMBOL_GPL(qcom_scm_ice_available);
 
 /**
  * qcom_scm_ice_invalidate_key() - Invalidate an inline encryption key
@@ -1072,7 +1194,7 @@ int qcom_scm_ice_invalidate_key(u32 index)
 
 	return qcom_scm_call(__scm->dev, &desc, NULL);
 }
-EXPORT_SYMBOL(qcom_scm_ice_invalidate_key);
+EXPORT_SYMBOL_GPL(qcom_scm_ice_invalidate_key);
 
 /**
  * qcom_scm_ice_set_key() - Set an inline encryption key
@@ -1110,35 +1232,24 @@ int qcom_scm_ice_set_key(u32 index, const u8 *key, u32 key_size,
 		.args[4] = data_unit_size,
 		.owner = ARM_SMCCC_OWNER_SIP,
 	};
-	void *keybuf;
-	dma_addr_t key_phys;
+
 	int ret;
 
-	/*
-	 * 'key' may point to vmalloc()'ed memory, but we need to pass a
-	 * physical address that's been properly flushed.  The sanctioned way to
-	 * do this is by using the DMA API.  But as is best practice for crypto
-	 * keys, we also must wipe the key after use.  This makes kmemdup() +
-	 * dma_map_single() not clearly correct, since the DMA API can use
-	 * bounce buffers.  Instead, just use dma_alloc_coherent().  Programming
-	 * keys is normally rare and thus not performance-critical.
-	 */
-
-	keybuf = dma_alloc_coherent(__scm->dev, key_size, &key_phys,
-				    GFP_KERNEL);
+	void *keybuf __free(qcom_tzmem) = qcom_tzmem_alloc(__scm->mempool,
+							   key_size,
+							   GFP_KERNEL);
 	if (!keybuf)
 		return -ENOMEM;
 	memcpy(keybuf, key, key_size);
-	desc.args[1] = key_phys;
+	desc.args[1] = qcom_tzmem_to_phys(keybuf);
 
 	ret = qcom_scm_call(__scm->dev, &desc, NULL);
 
 	memzero_explicit(keybuf, key_size);
 
-	dma_free_coherent(__scm->dev, key_size, keybuf, key_phys);
 	return ret;
 }
-EXPORT_SYMBOL(qcom_scm_ice_set_key);
+EXPORT_SYMBOL_GPL(qcom_scm_ice_set_key);
 
 /**
  * qcom_scm_hdcp_available() - Check if secure environment supports HDCP.
@@ -1160,7 +1271,7 @@ bool qcom_scm_hdcp_available(void)
 
 	return avail;
 }
-EXPORT_SYMBOL(qcom_scm_hdcp_available);
+EXPORT_SYMBOL_GPL(qcom_scm_hdcp_available);
 
 /**
  * qcom_scm_hdcp_req() - Send HDCP request.
@@ -1207,7 +1318,7 @@ int qcom_scm_hdcp_req(struct qcom_scm_hdcp_req *req, u32 req_cnt, u32 *resp)
 
 	return ret;
 }
-EXPORT_SYMBOL(qcom_scm_hdcp_req);
+EXPORT_SYMBOL_GPL(qcom_scm_hdcp_req);
 
 int qcom_scm_iommu_set_pt_format(u32 sec_id, u32 ctx_num, u32 pt_fmt)
 {
@@ -1223,7 +1334,7 @@ int qcom_scm_iommu_set_pt_format(u32 sec_id, u32 ctx_num, u32 pt_fmt)
 
 	return qcom_scm_call(__scm->dev, &desc, NULL);
 }
-EXPORT_SYMBOL(qcom_scm_iommu_set_pt_format);
+EXPORT_SYMBOL_GPL(qcom_scm_iommu_set_pt_format);
 
 int qcom_scm_qsmmu500_wait_safe_toggle(bool en)
 {
@@ -1239,13 +1350,83 @@ int qcom_scm_qsmmu500_wait_safe_toggle(bool en)
 
 	return qcom_scm_call_atomic(__scm->dev, &desc, NULL);
 }
-EXPORT_SYMBOL(qcom_scm_qsmmu500_wait_safe_toggle);
+EXPORT_SYMBOL_GPL(qcom_scm_qsmmu500_wait_safe_toggle);
 
 bool qcom_scm_lmh_dcvsh_available(void)
 {
 	return __qcom_scm_is_call_available(__scm->dev, QCOM_SCM_SVC_LMH, QCOM_SCM_LMH_LIMIT_DCVSH);
 }
-EXPORT_SYMBOL(qcom_scm_lmh_dcvsh_available);
+EXPORT_SYMBOL_GPL(qcom_scm_lmh_dcvsh_available);
+
+int qcom_scm_shm_bridge_enable(void)
+{
+	int ret;
+
+	struct qcom_scm_desc desc = {
+		.svc = QCOM_SCM_SVC_MP,
+		.cmd = QCOM_SCM_MP_SHM_BRIDGE_ENABLE,
+		.owner = ARM_SMCCC_OWNER_SIP
+	};
+
+	struct qcom_scm_res res;
+
+	if (!__qcom_scm_is_call_available(__scm->dev, QCOM_SCM_SVC_MP,
+					  QCOM_SCM_MP_SHM_BRIDGE_ENABLE))
+		return -EOPNOTSUPP;
+
+	ret = qcom_scm_call(__scm->dev, &desc, &res);
+
+	if (ret)
+		return ret;
+
+	if (res.result[0] == SHMBRIDGE_RESULT_NOTSUPP)
+		return -EOPNOTSUPP;
+
+	return res.result[0];
+}
+EXPORT_SYMBOL_GPL(qcom_scm_shm_bridge_enable);
+
+int qcom_scm_shm_bridge_create(struct device *dev, u64 pfn_and_ns_perm_flags,
+			       u64 ipfn_and_s_perm_flags, u64 size_and_flags,
+			       u64 ns_vmids, u64 *handle)
+{
+	struct qcom_scm_desc desc = {
+		.svc = QCOM_SCM_SVC_MP,
+		.cmd = QCOM_SCM_MP_SHM_BRIDGE_CREATE,
+		.owner = ARM_SMCCC_OWNER_SIP,
+		.args[0] = pfn_and_ns_perm_flags,
+		.args[1] = ipfn_and_s_perm_flags,
+		.args[2] = size_and_flags,
+		.args[3] = ns_vmids,
+		.arginfo = QCOM_SCM_ARGS(4, QCOM_SCM_VAL, QCOM_SCM_VAL,
+					 QCOM_SCM_VAL, QCOM_SCM_VAL),
+	};
+
+	struct qcom_scm_res res;
+	int ret;
+
+	ret = qcom_scm_call(__scm->dev, &desc, &res);
+
+	if (handle && !ret)
+		*handle = res.result[1];
+
+	return ret ?: res.result[0];
+}
+EXPORT_SYMBOL_GPL(qcom_scm_shm_bridge_create);
+
+int qcom_scm_shm_bridge_delete(struct device *dev, u64 handle)
+{
+	struct qcom_scm_desc desc = {
+		.svc = QCOM_SCM_SVC_MP,
+		.cmd = QCOM_SCM_MP_SHM_BRIDGE_DELETE,
+		.owner = ARM_SMCCC_OWNER_SIP,
+		.args[0] = handle,
+		.arginfo = QCOM_SCM_ARGS(1, QCOM_SCM_VAL),
+	};
+
+	return qcom_scm_call(__scm->dev, &desc, NULL);
+}
+EXPORT_SYMBOL_GPL(qcom_scm_shm_bridge_delete);
 
 int qcom_scm_lmh_profile_change(u32 profile_id)
 {
@@ -1259,13 +1440,11 @@ int qcom_scm_lmh_profile_change(u32 profile_id)
 
 	return qcom_scm_call(__scm->dev, &desc, NULL);
 }
-EXPORT_SYMBOL(qcom_scm_lmh_profile_change);
+EXPORT_SYMBOL_GPL(qcom_scm_lmh_profile_change);
 
 int qcom_scm_lmh_dcvsh(u32 payload_fn, u32 payload_reg, u32 payload_val,
 		       u64 limit_node, u32 node_id, u64 version)
 {
-	dma_addr_t payload_phys;
-	u32 *payload_buf;
 	int ret, payload_size = 5 * sizeof(u32);
 
 	struct qcom_scm_desc desc = {
@@ -1280,7 +1459,9 @@ int qcom_scm_lmh_dcvsh(u32 payload_fn, u32 payload_reg, u32 payload_val,
 		.owner = ARM_SMCCC_OWNER_SIP,
 	};
 
-	payload_buf = dma_alloc_coherent(__scm->dev, payload_size, &payload_phys, GFP_KERNEL);
+	u32 *payload_buf __free(qcom_tzmem) = qcom_tzmem_alloc(__scm->mempool,
+							       payload_size,
+							       GFP_KERNEL);
 	if (!payload_buf)
 		return -ENOMEM;
 
@@ -1290,14 +1471,27 @@ int qcom_scm_lmh_dcvsh(u32 payload_fn, u32 payload_reg, u32 payload_val,
 	payload_buf[3] = 1;
 	payload_buf[4] = payload_val;
 
-	desc.args[0] = payload_phys;
+	desc.args[0] = qcom_tzmem_to_phys(payload_buf);
 
 	ret = qcom_scm_call(__scm->dev, &desc, NULL);
 
-	dma_free_coherent(__scm->dev, payload_size, payload_buf, payload_phys);
 	return ret;
 }
-EXPORT_SYMBOL(qcom_scm_lmh_dcvsh);
+EXPORT_SYMBOL_GPL(qcom_scm_lmh_dcvsh);
+
+int qcom_scm_gpu_init_regs(u32 gpu_req)
+{
+	struct qcom_scm_desc desc = {
+		.svc = QCOM_SCM_SVC_GPU,
+		.cmd = QCOM_SCM_SVC_GPU_INIT_REGS,
+		.arginfo = QCOM_SCM_ARGS(1),
+		.args[0] = gpu_req,
+		.owner = ARM_SMCCC_OWNER_SIP,
+	};
+
+	return qcom_scm_call(__scm->dev, &desc, NULL);
+}
+EXPORT_SYMBOL_GPL(qcom_scm_gpu_init_regs);
 
 static int qcom_scm_find_dload_address(struct device *dev, u64 *addr)
 {
@@ -1325,14 +1519,319 @@ static int qcom_scm_find_dload_address(struct device *dev, u64 *addr)
 	return 0;
 }
 
+#ifdef CONFIG_QCOM_QSEECOM
+
+/* Lock for QSEECOM SCM call executions */
+static DEFINE_MUTEX(qcom_scm_qseecom_call_lock);
+
+static int __qcom_scm_qseecom_call(const struct qcom_scm_desc *desc,
+				   struct qcom_scm_qseecom_resp *res)
+{
+	struct qcom_scm_res scm_res = {};
+	int status;
+
+	/*
+	 * QSEECOM SCM calls should not be executed concurrently. Therefore, we
+	 * require the respective call lock to be held.
+	 */
+	lockdep_assert_held(&qcom_scm_qseecom_call_lock);
+
+	status = qcom_scm_call(__scm->dev, desc, &scm_res);
+
+	res->result = scm_res.result[0];
+	res->resp_type = scm_res.result[1];
+	res->data = scm_res.result[2];
+
+	if (status)
+		return status;
+
+	return 0;
+}
+
+/**
+ * qcom_scm_qseecom_call() - Perform a QSEECOM SCM call.
+ * @desc: SCM call descriptor.
+ * @res:  SCM call response (output).
+ *
+ * Performs the QSEECOM SCM call described by @desc, returning the response in
+ * @rsp.
+ *
+ * Return: Zero on success, nonzero on failure.
+ */
+static int qcom_scm_qseecom_call(const struct qcom_scm_desc *desc,
+				 struct qcom_scm_qseecom_resp *res)
+{
+	int status;
+
+	/*
+	 * Note: Multiple QSEECOM SCM calls should not be executed same time,
+	 * so lock things here. This needs to be extended to callback/listener
+	 * handling when support for that is implemented.
+	 */
+
+	mutex_lock(&qcom_scm_qseecom_call_lock);
+	status = __qcom_scm_qseecom_call(desc, res);
+	mutex_unlock(&qcom_scm_qseecom_call_lock);
+
+	dev_dbg(__scm->dev, "%s: owner=%x, svc=%x, cmd=%x, result=%lld, type=%llx, data=%llx\n",
+		__func__, desc->owner, desc->svc, desc->cmd, res->result,
+		res->resp_type, res->data);
+
+	if (status) {
+		dev_err(__scm->dev, "qseecom: scm call failed with error %d\n", status);
+		return status;
+	}
+
+	/*
+	 * TODO: Handle incomplete and blocked calls:
+	 *
+	 * Incomplete and blocked calls are not supported yet. Some devices
+	 * and/or commands require those, some don't. Let's warn about them
+	 * prominently in case someone attempts to try these commands with a
+	 * device/command combination that isn't supported yet.
+	 */
+	WARN_ON(res->result == QSEECOM_RESULT_INCOMPLETE);
+	WARN_ON(res->result == QSEECOM_RESULT_BLOCKED_ON_LISTENER);
+
+	return 0;
+}
+
+/**
+ * qcom_scm_qseecom_get_version() - Query the QSEECOM version.
+ * @version: Pointer where the QSEECOM version will be stored.
+ *
+ * Performs the QSEECOM SCM querying the QSEECOM version currently running in
+ * the TrustZone.
+ *
+ * Return: Zero on success, nonzero on failure.
+ */
+static int qcom_scm_qseecom_get_version(u32 *version)
+{
+	struct qcom_scm_desc desc = {};
+	struct qcom_scm_qseecom_resp res = {};
+	u32 feature = 10;
+	int ret;
+
+	desc.owner = QSEECOM_TZ_OWNER_SIP;
+	desc.svc = QSEECOM_TZ_SVC_INFO;
+	desc.cmd = QSEECOM_TZ_CMD_INFO_VERSION;
+	desc.arginfo = QCOM_SCM_ARGS(1, QCOM_SCM_VAL);
+	desc.args[0] = feature;
+
+	ret = qcom_scm_qseecom_call(&desc, &res);
+	if (ret)
+		return ret;
+
+	*version = res.result;
+	return 0;
+}
+
+/**
+ * qcom_scm_qseecom_app_get_id() - Query the app ID for a given QSEE app name.
+ * @app_name: The name of the app.
+ * @app_id:   The returned app ID.
+ *
+ * Query and return the application ID of the SEE app identified by the given
+ * name. This returned ID is the unique identifier of the app required for
+ * subsequent communication.
+ *
+ * Return: Zero on success, nonzero on failure, -ENOENT if the app has not been
+ * loaded or could not be found.
+ */
+int qcom_scm_qseecom_app_get_id(const char *app_name, u32 *app_id)
+{
+	unsigned long name_buf_size = QSEECOM_MAX_APP_NAME_SIZE;
+	unsigned long app_name_len = strlen(app_name);
+	struct qcom_scm_desc desc = {};
+	struct qcom_scm_qseecom_resp res = {};
+	int status;
+
+	if (app_name_len >= name_buf_size)
+		return -EINVAL;
+
+	char *name_buf __free(qcom_tzmem) = qcom_tzmem_alloc(__scm->mempool,
+							     name_buf_size,
+							     GFP_KERNEL);
+	if (!name_buf)
+		return -ENOMEM;
+
+	memcpy(name_buf, app_name, app_name_len);
+
+	desc.owner = QSEECOM_TZ_OWNER_QSEE_OS;
+	desc.svc = QSEECOM_TZ_SVC_APP_MGR;
+	desc.cmd = QSEECOM_TZ_CMD_APP_LOOKUP;
+	desc.arginfo = QCOM_SCM_ARGS(2, QCOM_SCM_RW, QCOM_SCM_VAL);
+	desc.args[0] = qcom_tzmem_to_phys(name_buf);
+	desc.args[1] = app_name_len;
+
+	status = qcom_scm_qseecom_call(&desc, &res);
+
+	if (status)
+		return status;
+
+	if (res.result == QSEECOM_RESULT_FAILURE)
+		return -ENOENT;
+
+	if (res.result != QSEECOM_RESULT_SUCCESS)
+		return -EINVAL;
+
+	if (res.resp_type != QSEECOM_SCM_RES_APP_ID)
+		return -EINVAL;
+
+	*app_id = res.data;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(qcom_scm_qseecom_app_get_id);
+
+/**
+ * qcom_scm_qseecom_app_send() - Send to and receive data from a given QSEE app.
+ * @app_id:   The ID of the target app.
+ * @req:      Request buffer sent to the app (must be TZ memory)
+ * @req_size: Size of the request buffer.
+ * @rsp:      Response buffer, written to by the app (must be TZ memory)
+ * @rsp_size: Size of the response buffer.
+ *
+ * Sends a request to the QSEE app associated with the given ID and read back
+ * its response. The caller must provide two DMA memory regions, one for the
+ * request and one for the response, and fill out the @req region with the
+ * respective (app-specific) request data. The QSEE app reads this and returns
+ * its response in the @rsp region.
+ *
+ * Return: Zero on success, nonzero on failure.
+ */
+int qcom_scm_qseecom_app_send(u32 app_id, void *req, size_t req_size,
+			      void *rsp, size_t rsp_size)
+{
+	struct qcom_scm_qseecom_resp res = {};
+	struct qcom_scm_desc desc = {};
+	phys_addr_t req_phys;
+	phys_addr_t rsp_phys;
+	int status;
+
+	req_phys = qcom_tzmem_to_phys(req);
+	rsp_phys = qcom_tzmem_to_phys(rsp);
+
+	desc.owner = QSEECOM_TZ_OWNER_TZ_APPS;
+	desc.svc = QSEECOM_TZ_SVC_APP_ID_PLACEHOLDER;
+	desc.cmd = QSEECOM_TZ_CMD_APP_SEND;
+	desc.arginfo = QCOM_SCM_ARGS(5, QCOM_SCM_VAL,
+				     QCOM_SCM_RW, QCOM_SCM_VAL,
+				     QCOM_SCM_RW, QCOM_SCM_VAL);
+	desc.args[0] = app_id;
+	desc.args[1] = req_phys;
+	desc.args[2] = req_size;
+	desc.args[3] = rsp_phys;
+	desc.args[4] = rsp_size;
+
+	status = qcom_scm_qseecom_call(&desc, &res);
+
+	if (status)
+		return status;
+
+	if (res.result != QSEECOM_RESULT_SUCCESS)
+		return -EIO;
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(qcom_scm_qseecom_app_send);
+
+/*
+ * We do not yet support re-entrant calls via the qseecom interface. To prevent
+ + any potential issues with this, only allow validated machines for now.
+ */
+static const struct of_device_id qcom_scm_qseecom_allowlist[] __maybe_unused = {
+	{ .compatible = "lenovo,thinkpad-x13s", },
+	{ }
+};
+
+static bool qcom_scm_qseecom_machine_is_allowed(void)
+{
+	struct device_node *np;
+	bool match;
+
+	np = of_find_node_by_path("/");
+	if (!np)
+		return false;
+
+	match = of_match_node(qcom_scm_qseecom_allowlist, np);
+	of_node_put(np);
+
+	return match;
+}
+
+static void qcom_scm_qseecom_free(void *data)
+{
+	struct platform_device *qseecom_dev = data;
+
+	platform_device_del(qseecom_dev);
+	platform_device_put(qseecom_dev);
+}
+
+static int qcom_scm_qseecom_init(struct qcom_scm *scm)
+{
+	struct platform_device *qseecom_dev;
+	u32 version;
+	int ret;
+
+	/*
+	 * Note: We do two steps of validation here: First, we try to query the
+	 * QSEECOM version as a check to see if the interface exists on this
+	 * device. Second, we check against known good devices due to current
+	 * driver limitations (see comment in qcom_scm_qseecom_allowlist).
+	 *
+	 * Note that we deliberately do the machine check after the version
+	 * check so that we can log potentially supported devices. This should
+	 * be safe as downstream sources indicate that the version query is
+	 * neither blocking nor reentrant.
+	 */
+	ret = qcom_scm_qseecom_get_version(&version);
+	if (ret)
+		return 0;
+
+	dev_info(scm->dev, "qseecom: found qseecom with version 0x%x\n", version);
+
+	if (!qcom_scm_qseecom_machine_is_allowed()) {
+		dev_info(scm->dev, "qseecom: untested machine, skipping\n");
+		return 0;
+	}
+
+	/*
+	 * Set up QSEECOM interface device. All application clients will be
+	 * set up and managed by the corresponding driver for it.
+	 */
+	qseecom_dev = platform_device_alloc("qcom_qseecom", -1);
+	if (!qseecom_dev)
+		return -ENOMEM;
+
+	qseecom_dev->dev.parent = scm->dev;
+
+	ret = platform_device_add(qseecom_dev);
+	if (ret) {
+		platform_device_put(qseecom_dev);
+		return ret;
+	}
+
+	return devm_add_action_or_reset(scm->dev, qcom_scm_qseecom_free, qseecom_dev);
+}
+
+#else /* CONFIG_QCOM_QSEECOM */
+
+static int qcom_scm_qseecom_init(struct qcom_scm *scm)
+{
+	return 0;
+}
+
+#endif /* CONFIG_QCOM_QSEECOM */
+
 /**
  * qcom_scm_is_available() - Checks if SCM is available
  */
 bool qcom_scm_is_available(void)
 {
-	return !!__scm;
+	/* Paired with smp_store_release() in qcom_scm_probe */
+	return !!smp_load_acquire(&__scm);
 }
-EXPORT_SYMBOL(qcom_scm_is_available);
+EXPORT_SYMBOL_GPL(qcom_scm_is_available);
 
 static int qcom_scm_assert_valid_wq_ctx(u32 wq_ctx)
 {
@@ -1361,7 +1860,7 @@ int qcom_scm_wait_for_wq_completion(u32 wq_ctx)
 	return 0;
 }
 
-static int qcom_scm_waitq_wakeup(struct qcom_scm *scm, unsigned int wq_ctx)
+static int qcom_scm_waitq_wakeup(unsigned int wq_ctx)
 {
 	int ret;
 
@@ -1393,7 +1892,7 @@ static irqreturn_t qcom_scm_irq_handler(int irq, void *data)
 			goto out;
 		}
 
-		ret = qcom_scm_waitq_wakeup(scm, wq_ctx);
+		ret = qcom_scm_waitq_wakeup(wq_ctx);
 		if (ret)
 			goto out;
 	} while (more_pending);
@@ -1402,8 +1901,48 @@ out:
 	return IRQ_HANDLED;
 }
 
+static int get_download_mode(char *buffer, const struct kernel_param *kp)
+{
+	if (download_mode >= ARRAY_SIZE(download_mode_name))
+		return sysfs_emit(buffer, "unknown mode\n");
+
+	return sysfs_emit(buffer, "%s\n", download_mode_name[download_mode]);
+}
+
+static int set_download_mode(const char *val, const struct kernel_param *kp)
+{
+	bool tmp;
+	int ret;
+
+	ret = sysfs_match_string(download_mode_name, val);
+	if (ret < 0) {
+		ret = kstrtobool(val, &tmp);
+		if (ret < 0) {
+			pr_err("qcom_scm: err: %d\n", ret);
+			return ret;
+		}
+
+		ret = tmp ? 1 : 0;
+	}
+
+	download_mode = ret;
+	if (__scm)
+		qcom_scm_set_download_mode(download_mode);
+
+	return 0;
+}
+
+static const struct kernel_param_ops download_mode_param_ops = {
+	.get = get_download_mode,
+	.set = set_download_mode,
+};
+
+module_param_cb(download_mode, &download_mode_param_ops, NULL, 0644);
+MODULE_PARM_DESC(download_mode, "download mode: off/0/N for no dump mode, full/on/1/Y for full dump mode, mini for minidump mode and full,mini for both full and minidump mode together are acceptable values");
+
 static int qcom_scm_probe(struct platform_device *pdev)
 {
+	struct qcom_tzmem_pool_config pool_config;
 	struct qcom_scm *scm;
 	unsigned long clks;
 	int irq, ret;
@@ -1412,10 +1951,12 @@ static int qcom_scm_probe(struct platform_device *pdev)
 	if (!scm)
 		return -ENOMEM;
 
+	scm->dev = &pdev->dev;
 	ret = qcom_scm_find_dload_address(&pdev->dev, &scm->dload_mode_addr);
 	if (ret < 0)
 		return ret;
 
+	init_completion(&scm->waitq_comp);
 	mutex_init(&scm->scm_bw_lock);
 
 	clks = (unsigned long)of_device_get_match_data(&pdev->dev);
@@ -1476,39 +2017,91 @@ static int qcom_scm_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	__scm = scm;
-	__scm->dev = &pdev->dev;
-
-	init_completion(&__scm->waitq_comp);
+	/* Paired with smp_load_acquire() in qcom_scm_is_available(). */
+	smp_store_release(&__scm, scm);
 
 	irq = platform_get_irq_optional(pdev, 0);
 	if (irq < 0) {
-		if (irq != -ENXIO)
-			return irq;
+		if (irq != -ENXIO) {
+			ret = irq;
+			goto err;
+		}
 	} else {
 		ret = devm_request_threaded_irq(__scm->dev, irq, NULL, qcom_scm_irq_handler,
 						IRQF_ONESHOT, "qcom-scm", __scm);
-		if (ret < 0)
-			return dev_err_probe(scm->dev, ret, "Failed to request qcom-scm irq\n");
+		if (ret < 0) {
+			dev_err_probe(scm->dev, ret, "Failed to request qcom-scm irq\n");
+			goto err;
+		}
 	}
 
 	__get_convention();
 
 	/*
-	 * If requested enable "download mode", from this point on warmboot
+	 * If "download mode" is requested, from this point on warmboot
 	 * will cause the boot stages to enter download mode, unless
 	 * disabled below by a clean shutdown/reboot.
 	 */
-	if (download_mode)
-		qcom_scm_set_download_mode(true);
+	qcom_scm_set_download_mode(download_mode);
+
+	/*
+	 * Disable SDI if indicated by DT that it is enabled by default.
+	 */
+	if (of_property_read_bool(pdev->dev.of_node, "qcom,sdi-enabled") || !download_mode)
+		qcom_scm_disable_sdi();
+
+	ret = of_reserved_mem_device_init(__scm->dev);
+	if (ret && ret != -ENODEV) {
+		dev_err_probe(__scm->dev, ret,
+			      "Failed to setup the reserved memory region for TZ mem\n");
+		goto err;
+	}
+
+	ret = qcom_tzmem_enable(__scm->dev);
+	if (ret) {
+		dev_err_probe(__scm->dev, ret,
+			      "Failed to enable the TrustZone memory allocator\n");
+		goto err;
+	}
+
+	memset(&pool_config, 0, sizeof(pool_config));
+	pool_config.initial_size = 0;
+	pool_config.policy = QCOM_TZMEM_POLICY_ON_DEMAND;
+	pool_config.max_size = SZ_256K;
+
+	__scm->mempool = devm_qcom_tzmem_pool_new(__scm->dev, &pool_config);
+	if (IS_ERR(__scm->mempool)) {
+		dev_err_probe(__scm->dev, PTR_ERR(__scm->mempool),
+			      "Failed to create the SCM memory pool\n");
+		goto err;
+	}
+
+	/*
+	 * Initialize the QSEECOM interface.
+	 *
+	 * Note: QSEECOM is fairly self-contained and this only adds the
+	 * interface device (the driver of which does most of the heavy
+	 * lifting). So any errors returned here should be either -ENOMEM or
+	 * -EINVAL (with the latter only in case there's a bug in our code).
+	 * This means that there is no need to bring down the whole SCM driver.
+	 * Just log the error instead and let SCM live.
+	 */
+	ret = qcom_scm_qseecom_init(scm);
+	WARN(ret < 0, "failed to initialize qseecom: %d\n", ret);
 
 	return 0;
+
+err:
+	/* Paired with smp_load_acquire() in qcom_scm_is_available(). */
+	smp_store_release(&__scm, NULL);
+
+	return ret;
 }
 
 static void qcom_scm_shutdown(struct platform_device *pdev)
 {
 	/* Clean shutdown, disable download mode to allow normal restart */
-	qcom_scm_set_download_mode(false);
+	qcom_scm_set_download_mode(QCOM_DLOAD_NODUMP);
 }
 
 static const struct of_device_id qcom_scm_dt_match[] = {
