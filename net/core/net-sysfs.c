@@ -1189,7 +1189,6 @@ static void rx_queue_get_ownership(const struct kobject *kobj,
 static const struct kobj_type rx_queue_ktype = {
 	.sysfs_ops = &rx_queue_sysfs_ops,
 	.release = rx_queue_release,
-	.default_groups = rx_queue_default_groups,
 	.namespace = rx_queue_namespace,
 	.get_ownership = rx_queue_get_ownership,
 };
@@ -1223,20 +1222,27 @@ static int rx_queue_add_kobject(struct net_device *dev, int index)
 	if (error)
 		goto err;
 
+	queue->groups = rx_queue_default_groups;
+	error = sysfs_create_groups(kobj, queue->groups);
+	if (error)
+		goto err;
+
 	if (dev->sysfs_rx_queue_group) {
 		error = sysfs_create_group(kobj, dev->sysfs_rx_queue_group);
 		if (error)
-			goto err;
+			goto err_default_groups;
 	}
 
 	error = rx_queue_default_mask(dev, queue);
 	if (error)
-		goto err;
+		goto err_default_groups;
 
 	kobject_uevent(kobj, KOBJ_ADD);
 
 	return error;
 
+err_default_groups:
+	sysfs_remove_groups(kobj, queue->groups);
 err:
 	kobject_put(kobj);
 	return error;
@@ -1281,12 +1287,14 @@ net_rx_queue_update_kobjects(struct net_device *dev, int old_num, int new_num)
 	}
 
 	while (--i >= new_num) {
-		struct kobject *kobj = &dev->_rx[i].kobj;
+		struct netdev_rx_queue *queue = &dev->_rx[i];
+		struct kobject *kobj = &queue->kobj;
 
 		if (!refcount_read(&dev_net(dev)->ns.count))
 			kobj->uevent_suppress = 1;
 		if (dev->sysfs_rx_queue_group)
 			sysfs_remove_group(kobj, dev->sysfs_rx_queue_group);
+		sysfs_remove_groups(kobj, queue->groups);
 		kobject_put(kobj);
 	}
 
@@ -1875,7 +1883,6 @@ static void netdev_queue_get_ownership(const struct kobject *kobj,
 static const struct kobj_type netdev_queue_ktype = {
 	.sysfs_ops = &netdev_queue_sysfs_ops,
 	.release = netdev_queue_release,
-	.default_groups = netdev_queue_default_groups,
 	.namespace = netdev_queue_namespace,
 	.get_ownership = netdev_queue_get_ownership,
 };
@@ -1905,15 +1912,22 @@ static int netdev_queue_add_kobject(struct net_device *dev, int index)
 	if (error)
 		goto err;
 
+	queue->groups = netdev_queue_default_groups;
+	error = sysfs_create_groups(kobj, queue->groups);
+	if (error)
+		goto err;
+
 	if (netdev_uses_bql(dev)) {
 		error = sysfs_create_group(kobj, &dql_group);
 		if (error)
-			goto err;
+			goto err_default_groups;
 	}
 
 	kobject_uevent(kobj, KOBJ_ADD);
 	return 0;
 
+err_default_groups:
+	sysfs_remove_groups(kobj, queue->groups);
 err:
 	kobject_put(kobj);
 	return error;
@@ -1968,6 +1982,7 @@ netdev_queue_update_kobjects(struct net_device *dev, int old_num, int new_num)
 		if (netdev_uses_bql(dev))
 			sysfs_remove_group(&queue->kobj, &dql_group);
 
+		sysfs_remove_groups(&queue->kobj, queue->groups);
 		kobject_put(&queue->kobj);
 	}
 
