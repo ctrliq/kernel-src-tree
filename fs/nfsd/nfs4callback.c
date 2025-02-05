@@ -605,7 +605,7 @@ static int nfs4_xdr_dec_cb_getattr(struct rpc_rqst *rqstp,
 		return status;
 
 	status = decode_cb_op_status(xdr, OP_CB_GETATTR, &cb->cb_status);
-	if (status)
+	if (unlikely(status || cb->cb_seq_status))
 		return status;
 	if (xdr_stream_decode_uint32_array(xdr, bitmap, 3) < 0)
 		return -NFSERR_BAD_XDR;
@@ -1336,8 +1336,9 @@ static void nfsd4_cb_done(struct rpc_task *task, void *calldata)
 		return;
 
 	if (cb->cb_status) {
-		WARN_ONCE(task->tk_status, "cb_status=%d tk_status=%d",
-			  cb->cb_status, task->tk_status);
+		WARN_ONCE(task->tk_status,
+			  "cb_status=%d tk_status=%d cb_opcode=%d",
+			  cb->cb_status, task->tk_status, cb->cb_ops->opcode);
 		task->tk_status = cb->cb_status;
 	}
 
