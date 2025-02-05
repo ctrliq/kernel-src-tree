@@ -435,6 +435,7 @@ timerlat_print_stats(struct timerlat_top_params *params, struct osnoise_tool *to
 
 	trace_seq_do_printf(trace->seq);
 	trace_seq_reset(trace->seq);
+	osnoise_report_missed_events(top);
 }
 
 /*
@@ -900,9 +901,20 @@ out_err:
 }
 
 static int stop_tracing;
+static struct trace_instance *top_inst = NULL;
 static void stop_top(int sig)
 {
+	if (stop_tracing) {
+		/*
+		 * Stop requested twice in a row; abort event processing and
+		 * exit immediately
+		 */
+		tracefs_iterate_stop(top_inst->inst);
+		return;
+	}
 	stop_tracing = 1;
+	if (top_inst)
+		trace_instance_stop(top_inst);
 }
 
 /*
@@ -950,6 +962,13 @@ int timerlat_top_main(int argc, char *argv[])
 	}
 
 	trace = &top->trace;
+	/*
+	* Save trace instance into global variable so that SIGINT can stop
+	* the timerlat tracer.
+	* Otherwise, rtla could loop indefinitely when overloaded.
+	*/
+	top_inst = trace;
+
 
 	retval = enable_timerlat(trace);
 	if (retval) {
@@ -1093,7 +1112,7 @@ int timerlat_top_main(int argc, char *argv[])
 	while (!stop_tracing) {
 		sleep(params->sleep_time);
 
-		if (params->aa_only && !trace_is_off(&top->trace, &record->trace))
+		if (params->aa_only && !osnoise_trace_is_off(top, record))
 			continue;
 
 		retval = tracefs_iterate_raw_events(trace->tep,
@@ -1110,7 +1129,7 @@ int timerlat_top_main(int argc, char *argv[])
 		if (!params->quiet)
 			timerlat_print_stats(params, top);
 
-		if (trace_is_off(&top->trace, &record->trace))
+		if (osnoise_trace_is_off(top, record))
 			break;
 
 		/* is there still any user-threads ? */
@@ -1131,7 +1150,7 @@ int timerlat_top_main(int argc, char *argv[])
 
 	return_value = 0;
 
-	if (trace_is_off(&top->trace, &record->trace)) {
+	if (osnoise_trace_is_off(top, record) && !stop_tracing) {
 		printf("rtla timerlat hit stop tracing\n");
 
 		if (!params->no_aa)
