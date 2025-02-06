@@ -89,7 +89,7 @@ static int afs_inode_init_from_status(struct afs_operation *op,
 	vnode->status = *status;
 
 	t = status->mtime_client;
-	inode->i_ctime = t;
+	inode_set_ctime_to_ts(inode, t);
 	inode->i_mtime = t;
 	inode->i_atime = t;
 	inode->i_flags |= S_NOATIME;
@@ -204,7 +204,7 @@ static void afs_apply_status(struct afs_operation *op,
 	t = status->mtime_client;
 	inode->i_mtime = t;
 	if (vp->update_ctime)
-		inode->i_ctime = op->ctime;
+		inode_set_ctime_to_ts(inode, op->ctime);
 
 	if (vnode->status.data_version != status->data_version)
 		data_changed = true;
@@ -251,7 +251,7 @@ static void afs_apply_status(struct afs_operation *op,
 		vnode->netfs.remote_i_size = status->size;
 		if (change_size) {
 			afs_set_i_size(vnode, status->size);
-			inode->i_ctime = t;
+			inode_set_ctime_to_ts(inode, t);
 			inode->i_atime = t;
 		}
 	}
