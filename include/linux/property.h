@@ -10,6 +10,8 @@
 #ifndef _LINUX_PROPERTY_H_
 #define _LINUX_PROPERTY_H_
 
+#include <linux/args.h>
+#include <linux/array_size.h>
 #include <linux/bits.h>
 #include <linux/cleanup.h>
 #include <linux/fwnode.h>
@@ -24,12 +26,6 @@ enum dev_prop_type {
 	DEV_PROP_U64,
 	DEV_PROP_STRING,
 	DEV_PROP_REF,
-};
-
-enum dev_dma_attr {
-	DEV_DMA_NOT_SUPPORTED,
-	DEV_DMA_NON_COHERENT,
-	DEV_DMA_COHERENT,
 };
 
 const struct fwnode_handle *__dev_fwnode_const(const struct device *dev);
@@ -319,7 +315,7 @@ struct software_node_ref_args {
 #define SOFTWARE_NODE_REFERENCE(_ref_, ...)			\
 (const struct software_node_ref_args) {				\
 	.node = _ref_,						\
-	.nargs = ARRAY_SIZE(((u64[]){ 0, ##__VA_ARGS__ })) - 1,	\
+	.nargs = COUNT_ARGS(__VA_ARGS__),			\
 	.args = { __VA_ARGS__ },				\
 }
 
