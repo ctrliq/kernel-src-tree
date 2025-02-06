@@ -24,6 +24,8 @@
 #include <net/ip6_route.h>
 #endif
 
+#include <linux/rh_kabi.h>
+
 /* Keep error state on tunnel for 30 sec */
 #define IPTUNNEL_ERR_TIMEO	(30*HZ)
 
@@ -136,6 +138,11 @@ struct ip_tunnel_parm_kern {
 	__be32			o_key;
 	int			link;
 	struct iphdr		iph;
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
 };
 
 struct ip_tunnel {

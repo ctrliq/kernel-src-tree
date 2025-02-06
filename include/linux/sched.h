@@ -1509,9 +1509,9 @@ struct task_struct {
 #endif
 #ifdef CONFIG_BPF_SYSCALL
 	/* Used by BPF task local storage */
-	RH_KABI_EXCLUDE(struct bpf_local_storage __rcu	*bpf_storage)
+	struct bpf_local_storage __rcu	*bpf_storage;
 	/* Used for BPF run context */
-	RH_KABI_EXCLUDE(struct bpf_run_ctx		*bpf_ctx)
+	struct bpf_run_ctx		*bpf_ctx;
 #endif
 
 #ifdef CONFIG_GCC_PLUGIN_STACKLEAK

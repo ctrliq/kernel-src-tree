@@ -1529,6 +1529,15 @@ struct devlink_ops {
 	enum devlink_selftest_status
 	(*selftest_run)(struct devlink *devlink, unsigned int id,
 			struct netlink_ext_ack *extack);
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
+	RH_KABI_RESERVE(5)
+	RH_KABI_RESERVE(6)
+	RH_KABI_RESERVE(7)
+	RH_KABI_RESERVE(8)
 };
 
 void *devlink_priv(struct devlink *devlink);

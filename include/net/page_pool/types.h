@@ -7,6 +7,8 @@
 #include <linux/ptr_ring.h>
 #include <linux/types.h>
 
+#include <linux/rh_kabi.h>
+
 #define PP_FLAG_DMA_MAP		BIT(0) /* Should page_pool do the DMA
 					* map/unmap
 					*/
@@ -68,6 +70,8 @@ struct page_pool_params {
 		enum dma_data_direction dma_dir;
 		unsigned int	max_len;
 		unsigned int	offset;
+		RH_KABI_RESERVE(1)
+		RH_KABI_RESERVE(2)
 	);
 	struct_group_tagged(page_pool_params_slow, slow,
 		struct net_device *netdev;
@@ -75,7 +79,11 @@ struct page_pool_params {
 /* private: used by test code only */
 		void (*init_callback)(struct page *page, void *arg);
 		void *init_arg;
+		RH_KABI_RESERVE(3)
+		RH_KABI_RESERVE(4)
 	);
+	RH_KABI_RESERVE(5)
+	RH_KABI_RESERVE(6)
 };
 
 #ifdef CONFIG_PAGE_POOL_STATS
@@ -96,6 +104,8 @@ struct page_pool_alloc_stats {
 	u64 empty;
 	u64 refill;
 	u64 waive;
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
 };
 
 /**
@@ -112,6 +122,8 @@ struct page_pool_recycle_stats {
 	u64 ring;
 	u64 ring_full;
 	u64 released_refcnt;
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
 };
 
 /**

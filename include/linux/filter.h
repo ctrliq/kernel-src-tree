@@ -28,8 +28,6 @@
 #include <asm/byteorder.h>
 #include <uapi/linux/filter.h>
 
-#include <linux/rh_kabi.h>
-
 struct sk_buff;
 struct sock;
 struct seccomp_data;
@@ -663,7 +661,7 @@ struct bpf_prog_stats {
 struct sk_filter {
 	refcount_t	refcnt;
 	struct rcu_head	rcu;
-	RH_KABI_EXCLUDE(struct bpf_prog	*prog)
+	struct bpf_prog	*prog;
 };
 
 DECLARE_STATIC_KEY_FALSE(bpf_stats_enabled_key);
