@@ -570,35 +570,19 @@ static int fib_nl2rule(struct net *net, struct nlmsghdr *nlh,
 	if (tb[FRA_PRIORITY]) {
 		nlrule->pref = nla_get_u32(tb[FRA_PRIORITY]);
 		*user_priority = true;
-	} else {
-		nlrule->pref = fib_default_rule_pref(ops);
 	}
 
 	nlrule->proto = tb[FRA_PROTOCOL] ?
 		nla_get_u8(tb[FRA_PROTOCOL]) : RTPROT_UNSPEC;
 
 	if (tb[FRA_IIFNAME]) {
-		struct net_device *dev;
-
 		nlrule->iifindex = -1;
 		nla_strscpy(nlrule->iifname, tb[FRA_IIFNAME], IFNAMSIZ);
-		dev = __dev_get_by_name(net, nlrule->iifname);
-		if (dev) {
-			nlrule->iifindex = dev->ifindex;
-			nlrule->iif_is_l3_master = netif_is_l3_master(dev);
-		}
 	}
 
 	if (tb[FRA_OIFNAME]) {
-		struct net_device *dev;
-
 		nlrule->oifindex = -1;
 		nla_strscpy(nlrule->oifname, tb[FRA_OIFNAME], IFNAMSIZ);
-		dev = __dev_get_by_name(net, nlrule->oifname);
-		if (dev) {
-			nlrule->oifindex = dev->ifindex;
-			nlrule->oif_is_l3_master = netif_is_l3_master(dev);
-		}
 	}
 
 	if (tb[FRA_FWMARK]) {
@@ -640,11 +624,6 @@ static int fib_nl2rule(struct net *net, struct nlmsghdr *nlh,
 		}
 
 		nlrule->target = nla_get_u32(tb[FRA_GOTO]);
-		/* Backward jumps are prohibited to avoid endless loops */
-		if (nlrule->target <= nlrule->pref) {
-			NL_SET_ERR_MSG(extack, "Backward goto not supported");
-			goto errout_free;
-		}
 	} else if (nlrule->action == FR_ACT_GOTO) {
 		NL_SET_ERR_MSG(extack, "Missing goto target for action goto");
 		goto errout_free;
@@ -702,6 +681,43 @@ errout_free:
 	kfree(nlrule);
 errout:
 	return err;
+}
+
+static int fib_nl2rule_rtnl(struct fib_rule *nlrule,
+			    struct fib_rules_ops *ops,
+			    struct nlattr *tb[],
+			    struct netlink_ext_ack *extack)
+{
+	if (!tb[FRA_PRIORITY])
+		nlrule->pref = fib_default_rule_pref(ops);
+
+	/* Backward jumps are prohibited to avoid endless loops */
+	if (tb[FRA_GOTO] && nlrule->target <= nlrule->pref) {
+		NL_SET_ERR_MSG(extack, "Backward goto not supported");
+		return -EINVAL;
+	}
+
+	if (tb[FRA_IIFNAME]) {
+		struct net_device *dev;
+
+		dev = __dev_get_by_name(nlrule->fr_net, nlrule->iifname);
+		if (dev) {
+			nlrule->iifindex = dev->ifindex;
+			nlrule->iif_is_l3_master = netif_is_l3_master(dev);
+		}
+	}
+
+	if (tb[FRA_OIFNAME]) {
+		struct net_device *dev;
+
+		dev = __dev_get_by_name(nlrule->fr_net, nlrule->oifname);
+		if (dev) {
+			nlrule->oifindex = dev->ifindex;
+			nlrule->oif_is_l3_master = netif_is_l3_master(dev);
+		}
+	}
+
+	return 0;
 }
 
 static int rule_exists(struct fib_rules_ops *ops, struct fib_rule_hdr *frh,
@@ -824,6 +840,10 @@ int fib_nl_newrule(struct sk_buff *skb, struct nlmsghdr *nlh,
 	if (err)
 		goto errout;
 
+	err = fib_nl2rule_rtnl(rule, ops, tb, extack);
+	if (err)
+		goto errout_free;
+
 	if ((nlh->nlmsg_flags & NLM_F_EXCL) &&
 	    rule_exists(ops, frh, tb, rule)) {
 		err = -EEXIST;
@@ -929,6 +949,10 @@ int fib_nl_delrule(struct sk_buff *skb, struct nlmsghdr *nlh,
 	}
 
 	err = fib_nl2rule(net, nlh, extack, ops, tb, &nlrule, &user_priority);
+	if (err)
+		goto errout;
+
+	err = fib_nl2rule_rtnl(nlrule, ops, tb, extack);
 	if (err)
 		goto errout;
 
