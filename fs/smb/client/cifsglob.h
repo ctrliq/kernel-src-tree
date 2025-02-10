@@ -152,6 +152,12 @@ enum securityEnum {
 	Kerberos,		/* Kerberos via SPNEGO */
 };
 
+enum upcall_target_enum {
+	UPTARGET_UNSPECIFIED, /* not specified, defaults to app */
+	UPTARGET_MOUNT, /* upcall to the mount namespace */
+	UPTARGET_APP, /* upcall to the application namespace which did the mount */
+};
+
 enum cifs_reparse_type {
 	CIFS_REPARSE_TYPE_NFS,
 	CIFS_REPARSE_TYPE_WSL,
@@ -177,7 +183,6 @@ struct session_key {
 
 /* crypto hashing related structure/fields, not specific to a sec mech */
 struct cifs_secmech {
-	struct shash_desc *hmacmd5; /* hmacmd5 hash function, for NTLMv2/CR1 hashes */
 	struct shash_desc *md5; /* md5 hash function, for CIFS/SMB1 signatures */
 	struct shash_desc *hmacsha256; /* hmac-sha256 hash function, for SMB2 signatures */
 	struct shash_desc *sha512; /* sha512 hash function, for SMB3.1.1 preauth hash */
@@ -201,10 +206,10 @@ struct cifs_cred {
 	int gid;
 	int mode;
 	int cecount;
-	struct cifs_sid osid;
-	struct cifs_sid gsid;
+	struct smb_sid osid;
+	struct smb_sid gsid;
 	struct cifs_ntace *ntaces;
-	struct cifs_ace *aces;
+	struct smb_ace *aces;
 };
 
 struct cifs_open_info_data {
@@ -230,8 +235,8 @@ struct cifs_open_info_data {
 		unsigned int	eas_len;
 	} wsl;
 	char *symlink_target;
-	struct cifs_sid posix_owner;
-	struct cifs_sid posix_group;
+	struct smb_sid posix_owner;
+	struct smb_sid posix_group;
 	union {
 		struct smb2_file_all_info fi;
 		struct smb311_posix_qinfo posix_fi;
@@ -486,7 +491,7 @@ struct smb_version_operations {
 			__u16 net_fid, struct cifsInodeInfo *cifs_inode);
 	/* query remote filesystem */
 	int (*queryfs)(const unsigned int, struct cifs_tcon *,
-		       struct cifs_sb_info *, struct kstatfs *);
+		       const char *, struct cifs_sb_info *, struct kstatfs *);
 	/* send mandatory brlock to the server */
 	int (*mand_lock)(const unsigned int, struct cifsFileInfo *, __u64,
 			 __u64, __u32, int, int, bool);
@@ -540,12 +545,12 @@ struct smb_version_operations {
 	int (*set_EA)(const unsigned int, struct cifs_tcon *, const char *,
 			const char *, const void *, const __u16,
 			const struct nls_table *, struct cifs_sb_info *);
-	struct cifs_ntsd * (*get_acl)(struct cifs_sb_info *, struct inode *,
-			const char *, u32 *, u32);
-	struct cifs_ntsd * (*get_acl_by_fid)(struct cifs_sb_info *,
-			const struct cifs_fid *, u32 *, u32);
-	int (*set_acl)(struct cifs_ntsd *, __u32, struct inode *, const char *,
-			int);
+	struct smb_ntsd * (*get_acl)(struct cifs_sb_info *cifssb, struct inode *ino,
+			const char *patch, u32 *plen, u32 info);
+	struct smb_ntsd * (*get_acl_by_fid)(struct cifs_sb_info *cifssmb,
+			const struct cifs_fid *pfid, u32 *plen, u32 info);
+	int (*set_acl)(struct smb_ntsd *pntsd, __u32 len, struct inode *ino, const char *path,
+			int flag);
 	/* writepages retry size */
 	unsigned int (*wp_retry_size)(struct inode *);
 	/* get mtu credits */
@@ -559,7 +564,7 @@ struct smb_version_operations {
 	bool (*dir_needs_close)(struct cifsFileInfo *);
 	long (*fallocate)(struct file *, struct cifs_tcon *, int, loff_t,
 			  loff_t);
-	/* init transform request - used for encryption for now */
+	/* init transform (compress/encrypt) request */
 	int (*init_transform_rq)(struct TCP_Server_Info *, int num_rqst,
 				 struct smb_rqst *, struct smb_rqst *);
 	int (*is_transform_hdr)(void *buf);
@@ -593,6 +598,7 @@ struct smb_version_operations {
 	/* Check for STATUS_NETWORK_NAME_DELETED */
 	bool (*is_network_name_deleted)(char *buf, struct TCP_Server_Info *srv);
 	int (*parse_reparse_point)(struct cifs_sb_info *cifs_sb,
+				   const char *full_path,
 				   struct kvec *rsp_iov,
 				   struct cifs_open_info_data *data);
 	int (*create_reparse_symlink)(const unsigned int xid,
@@ -780,7 +786,7 @@ struct TCP_Server_Info {
 	} compression;
 	__u16	signing_algorithm;
 	__le16	cipher_type;
-	 /* save initital negprot hash */
+	 /* save initial negprot hash */
 	__u8	preauth_sha_hash[SMB2_PREAUTH_HASH_SIZE];
 	bool	signing_negotiated; /* true if valid signing context rcvd from server */
 	bool	posix_ext_supported;
@@ -1085,6 +1091,7 @@ struct cifs_ses {
 	struct session_key auth_key;
 	struct ntlmssp_auth *ntlmssp; /* ciphertext, flags, server challenge */
 	enum securityEnum sectype; /* what security flavor was specified? */
+	enum upcall_target_enum upcall_target; /* what upcall target was specified? */
 	bool sign;		/* is signing required? */
 	bool domainAuto:1;
 	bool expired_pwd;  /* track if access denied or expired pwd so can know if need to update */
@@ -1612,7 +1619,6 @@ struct cifsInodeInfo {
 	spinlock_t writers_lock;
 	unsigned int writers;		/* Number of writers on this inode */
 	unsigned long time;		/* jiffies of last update of inode */
-	u64  server_eof;		/* current file size on server -- protected by i_lock */
 	u64  uniqueid;			/* server inode number */
 	u64  createtime;		/* creation time on server */
 	__u8 lease_key[SMB2_LEASE_KEY_SIZE];	/* lease key for this inode */
@@ -1933,6 +1939,7 @@ static inline bool is_replayable_error(int error)
 #define   CIFS_HAS_CREDITS        0x0400 /* already has credits */
 #define   CIFS_TRANSFORM_REQ      0x0800 /* transform request before sending */
 #define   CIFS_NO_SRV_RSP         0x1000 /* there is no server response */
+#define   CIFS_COMPRESS_REQ       0x4000 /* compress request before sending */
 
 /* Security Flags: indicate type of session setup needed */
 #define   CIFSSEC_MAY_SIGN	0x00001
@@ -2038,7 +2045,7 @@ require use of the stronger protocol */
  * cifsInodeInfo->lock_sem	cifsInodeInfo->llist		cifs_init_once
  *				->can_cache_brlcks
  * cifsInodeInfo->deferred_lock	cifsInodeInfo->deferred_closes	cifsInodeInfo_alloc
- * cached_fid->fid_mutex		cifs_tcon->crfid		tcon_info_alloc
+ * cached_fids->cfid_list_lock	cifs_tcon->cfids->entries	 init_cached_dirs
  * cifsFileInfo->fh_mutex		cifsFileInfo			cifs_new_fileinfo
  * cifsFileInfo->file_info_lock	cifsFileInfo->count		cifs_new_fileinfo
  *				->invalidHandle			initiate_cifs_search
@@ -2127,6 +2134,7 @@ extern struct workqueue_struct *fileinfo_put_wq;
 extern struct workqueue_struct *cifsoplockd_wq;
 extern struct workqueue_struct *deferredclose_wq;
 extern struct workqueue_struct *serverclose_wq;
+extern struct workqueue_struct *cfid_put_wq;
 extern __u32 cifs_lock_secret;
 
 extern mempool_t *cifs_sm_req_poolp;
@@ -2259,7 +2267,7 @@ static inline unsigned int cifs_get_num_sgs(const struct smb_rqst *rqst,
 			struct kvec *iov = &rqst[i].rq_iov[j];
 
 			addr = (unsigned long)iov->iov_base + skip;
-			if (unlikely(is_vmalloc_addr((void *)addr))) {
+			if (is_vmalloc_or_module_addr((void *)addr)) {
 				len = iov->iov_len - skip;
 				nents += DIV_ROUND_UP(offset_in_page(addr) + len,
 						      PAGE_SIZE);
@@ -2285,7 +2293,7 @@ static inline struct scatterlist *cifs_sg_set_buf(struct scatterlist *sg,
 	unsigned int off = offset_in_page(addr);
 
 	addr &= PAGE_MASK;
-	if (unlikely(is_vmalloc_addr((void *)addr))) {
+	if (is_vmalloc_or_module_addr((void *)addr)) {
 		do {
 			unsigned int len = min_t(unsigned int, buflen, PAGE_SIZE - off);
 

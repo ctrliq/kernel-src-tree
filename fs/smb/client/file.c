@@ -679,7 +679,11 @@ int cifs_open(struct inode *inode, struct file *file)
 	}
 
 	/* Get the cached handle as SMB2 close is deferred */
-	rc = cifs_get_readable_path(tcon, full_path, &cfile);
+	if (OPEN_FMODE(file->f_flags) & FMODE_WRITE) {
+		rc = cifs_get_writable_path(tcon, full_path, FIND_WR_FSUID_ONLY, &cfile);
+	} else {
+		rc = cifs_get_readable_path(tcon, full_path, &cfile);
+	}
 	if (rc == 0) {
 		if (file->f_flags == cfile->f_flags) {
 			file->private_data = cfile;
@@ -2083,8 +2087,8 @@ cifs_update_eof(struct cifsInodeInfo *cifsi, loff_t offset,
 {
 	loff_t end_of_write = offset + bytes_written;
 
-	if (end_of_write > cifsi->server_eof)
-		cifsi->server_eof = end_of_write;
+	if (end_of_write > cifsi->netfs.remote_i_size)
+		netfs_resize_file(&cifsi->netfs, end_of_write);
 }
 
 static ssize_t
@@ -2263,7 +2267,7 @@ refind_writable:
 			}
 		}
 	}
-	/* couldn't find useable FH with same pid, try any available */
+	/* couldn't find usable FH with same pid, try any available */
 	if (!any_available) {
 		any_available = true;
 		goto refind_writable;
@@ -3247,8 +3251,8 @@ cifs_uncached_writev_complete(struct work_struct *work)
 
 	spin_lock(&inode->i_lock);
 	cifs_update_eof(cifsi, wdata->offset, wdata->bytes);
-	if (cifsi->server_eof > inode->i_size)
-		i_size_write(inode, cifsi->server_eof);
+	if (cifsi->netfs.remote_i_size > inode->i_size)
+		i_size_write(inode, cifsi->netfs.remote_i_size);
 	spin_unlock(&inode->i_lock);
 
 	complete(&wdata->done);
@@ -4729,7 +4733,7 @@ readpages_fill_pages(struct TCP_Server_Info *server,
 	unsigned int page_offset = rdata->page_offset;
 
 	/* determine the eof that the server (probably) has */
-	eof = CIFS_I(rdata->mapping->host)->server_eof;
+	eof = CIFS_I(rdata->mapping->host)->netfs.remote_i_size;
 	eof_index = eof ? (eof - 1) >> PAGE_SHIFT : 0;
 	cifs_dbg(FYI, "eof=%llu eof_index=%lu\n", eof, eof_index);
 

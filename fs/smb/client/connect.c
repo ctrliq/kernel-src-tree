@@ -1046,6 +1046,7 @@ clean_demultiplex_info(struct TCP_Server_Info *server)
 	/* Release netns reference for this server. */
 	put_net(cifs_net_ns(server));
 	kfree(server->leaf_fullpath);
+	kfree(server->hostname);
 	kfree(server);
 
 	length = atomic_dec_return(&tcpSesAllocCount);
@@ -1672,8 +1673,6 @@ cifs_put_tcp_session(struct TCP_Server_Info *server, int from_reconnect)
 	kfree_sensitive(server->session_key.response);
 	server->session_key.response = NULL;
 	server->session_key.len = 0;
-	kfree(server->hostname);
-	server->hostname = NULL;
 
 	task = xchg(&server->tsk, NULL);
 	if (task)
@@ -1909,11 +1908,35 @@ static int match_session(struct cifs_ses *ses,
 			    CIFS_MAX_USERNAME_LEN))
 			return 0;
 		if ((ctx->username && strlen(ctx->username) != 0) &&
-		    ses->password != NULL &&
-		    strncmp(ses->password,
-			    ctx->password ? ctx->password : "",
-			    CIFS_MAX_PASSWORD_LEN))
-			return 0;
+		    ses->password != NULL) {
+
+			/* New mount can only share sessions with an existing mount if:
+			 * 1. Both password and password2 match, or
+			 * 2. password2 of the old mount matches password of the new mount
+			 *    and password of the old mount matches password2 of the new
+			 *	  mount
+			 */
+			if (ses->password2 != NULL && ctx->password2 != NULL) {
+				if (!((strncmp(ses->password, ctx->password ?
+					ctx->password : "", CIFS_MAX_PASSWORD_LEN) == 0 &&
+					strncmp(ses->password2, ctx->password2,
+					CIFS_MAX_PASSWORD_LEN) == 0) ||
+					(strncmp(ses->password, ctx->password2,
+					CIFS_MAX_PASSWORD_LEN) == 0 &&
+					strncmp(ses->password2, ctx->password ?
+					ctx->password : "", CIFS_MAX_PASSWORD_LEN) == 0)))
+					return 0;
+
+			} else if ((ses->password2 == NULL && ctx->password2 != NULL) ||
+				(ses->password2 != NULL && ctx->password2 == NULL)) {
+				return 0;
+
+			} else {
+				if (strncmp(ses->password, ctx->password ?
+					ctx->password : "", CIFS_MAX_PASSWORD_LEN))
+					return 0;
+			}
+		}
 	}
 
 	if (strcmp(ctx->local_nls->charset, ses->local_nls->charset))
@@ -2256,6 +2279,7 @@ struct cifs_ses *
 cifs_get_smb_ses(struct TCP_Server_Info *server, struct smb3_fs_context *ctx)
 {
 	int rc = 0;
+	int retries = 0;
 	unsigned int xid;
 	struct cifs_ses *ses;
 	struct sockaddr_in *addr = (struct sockaddr_in *)&server->dstaddr;
@@ -2274,6 +2298,8 @@ cifs_get_smb_ses(struct TCP_Server_Info *server, struct smb3_fs_context *ctx)
 			cifs_dbg(FYI, "Session needs reconnect\n");
 
 			mutex_lock(&ses->session_mutex);
+
+retry_old_session:
 			rc = cifs_negotiate_protocol(xid, ses, server);
 			if (rc) {
 				mutex_unlock(&ses->session_mutex);
@@ -2286,6 +2312,13 @@ cifs_get_smb_ses(struct TCP_Server_Info *server, struct smb3_fs_context *ctx)
 			rc = cifs_setup_session(xid, ses, server,
 						ctx->local_nls);
 			if (rc) {
+				if (((rc == -EACCES) || (rc == -EKEYEXPIRED) ||
+					(rc == -EKEYREVOKED)) && !retries && ses->password2) {
+					retries++;
+					cifs_dbg(FYI, "Session reconnect failed, retrying with alternate password\n");
+					swap(ses->password, ses->password2);
+					goto retry_old_session;
+				}
 				mutex_unlock(&ses->session_mutex);
 				/* problem -- put our reference */
 				cifs_put_smb_ses(ses);
@@ -2351,6 +2384,26 @@ cifs_get_smb_ses(struct TCP_Server_Info *server, struct smb3_fs_context *ctx)
 
 	ses->sectype = ctx->sectype;
 	ses->sign = ctx->sign;
+
+	/*
+	 *Explicitly marking upcall_target mount option for easier handling
+	 * by cifs_spnego.c and eventually cifs.upcall.c
+	 */
+
+	switch (ctx->upcall_target) {
+	case UPTARGET_UNSPECIFIED: /* default to app */
+	case UPTARGET_APP:
+		ses->upcall_target = UPTARGET_APP;
+		break;
+	case UPTARGET_MOUNT:
+		ses->upcall_target = UPTARGET_MOUNT;
+		break;
+	default:
+		// should never happen
+		ses->upcall_target = UPTARGET_APP;
+		break;
+	}
+
 	ses->local_nls = load_nls(ctx->local_nls->charset);
 
 	/* add server as first channel */
@@ -2361,6 +2414,7 @@ cifs_get_smb_ses(struct TCP_Server_Info *server, struct smb3_fs_context *ctx)
 	ses->chans_need_reconnect = 1;
 	spin_unlock(&ses->chan_lock);
 
+retry_new_session:
 	mutex_lock(&ses->session_mutex);
 	rc = cifs_negotiate_protocol(xid, ses, server);
 	if (!rc)
@@ -2373,8 +2427,16 @@ cifs_get_smb_ses(struct TCP_Server_Info *server, struct smb3_fs_context *ctx)
 	       sizeof(ses->smb3signingkey));
 	spin_unlock(&ses->chan_lock);
 
-	if (rc)
-		goto get_ses_fail;
+	if (rc) {
+		if (((rc == -EACCES) || (rc == -EKEYEXPIRED) ||
+			(rc == -EKEYREVOKED)) && !retries && ses->password2) {
+			retries++;
+			cifs_dbg(FYI, "Session setup failed, retrying with alternate password\n");
+			swap(ses->password, ses->password2);
+			goto retry_new_session;
+		} else
+			goto get_ses_fail;
+	}
 
 	/*
 	 * success, put it on the list and add it as first channel
@@ -2561,7 +2623,7 @@ cifs_get_tcon(struct cifs_ses *ses, struct smb3_fs_context *ctx)
 
 	if (ses->server->dialect >= SMB20_PROT_ID &&
 	    (ses->server->capabilities & SMB2_GLOBAL_CAP_DIRECTORY_LEASING))
-		nohandlecache = ctx->nohandlecache;
+		nohandlecache = ctx->nohandlecache || !dir_cache_timeout;
 	else
 		nohandlecache = true;
 	tcon = tcon_info_alloc(!nohandlecache, netfs_trace_tcon_ref_new);

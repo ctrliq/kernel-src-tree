@@ -148,8 +148,17 @@ again:
 	spin_unlock(&ses->ses_lock);
 
 	rc = cifs_negotiate_protocol(0, ses, server);
-	if (!rc)
+	if (!rc) {
 		rc = cifs_setup_session(0, ses, server, ses->local_nls);
+		if ((rc == -EACCES) || (rc == -EHOSTDOWN) || (rc == -EKEYREVOKED)) {
+			/*
+			 * Try alternate password for next reconnect if an alternate
+			 * password is available.
+			 */
+			if (ses->password2)
+				swap(ses->password2, ses->password);
+		}
+	}
 
 	/* do we need to reconnect tcon? */
 	if (rc || !tcon->need_reconnect) {
@@ -1069,8 +1078,8 @@ OldOpenRetry:
 	pSMB->OpenFlags |= cpu_to_le16(REQ_MORE_INFO);
 	pSMB->Mode = cpu_to_le16(access_flags_to_smbopen_mode(access_flags));
 	pSMB->Mode |= cpu_to_le16(0x40); /* deny none */
-	/* set file as system file if special file such
-	   as fifo and server expecting SFU style and
+	/* set file as system file if special file such as fifo,
+	 * socket, char or block and server expecting SFU style and
 	   no Unix extensions */
 
 	if (create_options & CREATE_OPTION_SPECIAL)
@@ -1186,8 +1195,8 @@ openRetry:
 	req->AllocationSize = 0;
 
 	/*
-	 * Set file as system file if special file such as fifo and server
-	 * expecting SFU style and no Unix extensions.
+	 * Set file as system file if special file such as fifo, socket, char
+	 * or block and server expecting SFU style and no Unix extensions.
 	 */
 	if (create_options & CREATE_OPTION_SPECIAL)
 		req->FileAttributes = cpu_to_le32(ATTR_SYSTEM);
@@ -1208,7 +1217,7 @@ openRetry:
 	req->CreateDisposition = cpu_to_le32(disposition);
 	req->CreateOptions = cpu_to_le32(create_options & CREATE_OPTIONS_MASK);
 
-	/* BB Expirement with various impersonation levels and verify */
+	/* BB Experiment with various impersonation levels and verify */
 	req->ImpersonationLevel = cpu_to_le32(SECURITY_IMPERSONATION);
 	req->SecurityFlags = SECURITY_CONTEXT_TRACKING|SECURITY_EFFECTIVE_ONLY;
 
@@ -2299,69 +2308,6 @@ int CIFSSMBRenameOpenFile(const unsigned int xid, struct cifs_tcon *pTcon,
 }
 
 int
-CIFSSMBCopy(const unsigned int xid, struct cifs_tcon *tcon,
-	    const char *fromName, const __u16 target_tid, const char *toName,
-	    const int flags, const struct nls_table *nls_codepage, int remap)
-{
-	int rc = 0;
-	COPY_REQ *pSMB = NULL;
-	COPY_RSP *pSMBr = NULL;
-	int bytes_returned;
-	int name_len, name_len2;
-	__u16 count;
-
-	cifs_dbg(FYI, "In CIFSSMBCopy\n");
-copyRetry:
-	rc = smb_init(SMB_COM_COPY, 1, tcon, (void **) &pSMB,
-			(void **) &pSMBr);
-	if (rc)
-		return rc;
-
-	pSMB->BufferFormat = 0x04;
-	pSMB->Tid2 = target_tid;
-
-	pSMB->Flags = cpu_to_le16(flags & COPY_TREE);
-
-	if (pSMB->hdr.Flags2 & SMBFLG2_UNICODE) {
-		name_len = cifsConvertToUTF16((__le16 *) pSMB->OldFileName,
-					      fromName, PATH_MAX, nls_codepage,
-					      remap);
-		name_len++;     /* trailing null */
-		name_len *= 2;
-		pSMB->OldFileName[name_len] = 0x04;     /* pad */
-		/* protocol requires ASCII signature byte on Unicode string */
-		pSMB->OldFileName[name_len + 1] = 0x00;
-		name_len2 =
-		    cifsConvertToUTF16((__le16 *)&pSMB->OldFileName[name_len+2],
-				       toName, PATH_MAX, nls_codepage, remap);
-		name_len2 += 1 /* trailing null */  + 1 /* Signature word */ ;
-		name_len2 *= 2; /* convert to bytes */
-	} else {
-		name_len = copy_path_name(pSMB->OldFileName, fromName);
-		pSMB->OldFileName[name_len] = 0x04;  /* 2nd buffer format */
-		name_len2 = copy_path_name(pSMB->OldFileName+name_len+1, toName);
-		name_len2++;    /* signature byte */
-	}
-
-	count = 1 /* 1st signature byte */  + name_len + name_len2;
-	inc_rfc1001_len(pSMB, count);
-	pSMB->ByteCount = cpu_to_le16(count);
-
-	rc = SendReceive(xid, tcon->ses, (struct smb_hdr *) pSMB,
-		(struct smb_hdr *) pSMBr, &bytes_returned, 0);
-	if (rc) {
-		cifs_dbg(FYI, "Send error in copy = %d with %d files copied\n",
-			 rc, le16_to_cpu(pSMBr->CopyCount));
-	}
-	cifs_buf_release(pSMB);
-
-	if (rc == -EAGAIN)
-		goto copyRetry;
-
-	return rc;
-}
-
-int
 CIFSUnixCreateSymLink(const unsigned int xid, struct cifs_tcon *tcon,
 		      const char *fromName, const char *toName,
 		      const struct nls_table *nls_codepage, int remap)
@@ -2977,7 +2923,7 @@ static void cifs_init_ace(struct cifs_posix_ace *cifs_ace,
 
 /**
  * posix_acl_to_cifs - convert ACLs from POSIX ACL to cifs format
- * @parm_data: ACLs in cifs format to conver to
+ * @parm_data: ACLs in cifs format to convert to
  * @acl: ACLs in POSIX ACL format to convert from
  * @acl_type: the type of POSIX ACLs stored in @acl
  *
@@ -3386,7 +3332,7 @@ validate_ntransact(char *buf, char **ppparm, char **ppdata,
 /* Get Security Descriptor (by handle) from remote server for a file or dir */
 int
 CIFSSMBGetCIFSACL(const unsigned int xid, struct cifs_tcon *tcon, __u16 fid,
-		  struct cifs_ntsd **acl_inf, __u32 *pbuflen)
+		  struct smb_ntsd **acl_inf, __u32 *pbuflen)
 {
 	int rc = 0;
 	int buf_type = 0;
@@ -3456,7 +3402,7 @@ CIFSSMBGetCIFSACL(const unsigned int xid, struct cifs_tcon *tcon, __u16 fid,
 
 		/* check if buffer is big enough for the acl
 		   header followed by the smallest SID */
-		if ((*pbuflen < sizeof(struct cifs_ntsd) + 8) ||
+		if ((*pbuflen < sizeof(struct smb_ntsd) + 8) ||
 		    (*pbuflen >= 64 * 1024)) {
 			cifs_dbg(VFS, "bad acl length %d\n", *pbuflen);
 			rc = -EINVAL;
@@ -3476,7 +3422,7 @@ qsec_out:
 
 int
 CIFSSMBSetCIFSACL(const unsigned int xid, struct cifs_tcon *tcon, __u16 fid,
-			struct cifs_ntsd *pntsd, __u32 acllen, int aclflag)
+			struct smb_ntsd *pntsd, __u32 acllen, int aclflag)
 {
 	__u16 byte_count, param_count, data_count, param_offset, data_offset;
 	int rc = 0;
@@ -3954,7 +3900,7 @@ findFirstRetry:
 		name_len =
 		    cifsConvertToUTF16((__le16 *) pSMB->FileName, searchName,
 				       PATH_MAX, nls_codepage, remap);
-		/* We can not add the asterik earlier in case
+		/* We can not add the asterisk earlier in case
 		it got remapped to 0xF03A as if it were part of the
 		directory name instead of a wildcard */
 		name_len *= 2;
@@ -5365,7 +5311,7 @@ SetTimesRetry:
 	param_offset = offsetof(struct smb_com_transaction2_spi_req,
 				InformationLevel) - 4;
 	offset = param_offset + params;
-	data_offset = (char *) (&pSMB->hdr.Protocol) + offset;
+	data_offset = (char *)pSMB + offsetof(typeof(*pSMB), hdr.Protocol) + offset;
 	pSMB->ParameterOffset = cpu_to_le16(param_offset);
 	pSMB->DataOffset = cpu_to_le16(offset);
 	pSMB->SetupCount = 1;
