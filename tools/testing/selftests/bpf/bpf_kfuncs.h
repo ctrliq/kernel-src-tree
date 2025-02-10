@@ -45,6 +45,10 @@ void *bpf_cast_to_kern_ctx(void *) __ksym;
 
 extern void *bpf_rdonly_cast(const void *obj, __u32 btf_id) __ksym __weak;
 
+extern int bpf_get_file_xattr(struct file *file, const char *name,
+			      struct bpf_dynptr *value_ptr) __ksym;
+extern int bpf_get_fsverity_digest(struct file *file, struct bpf_dynptr *digest_ptr) __ksym;
+
 extern bool bpf_session_is_return(void) __ksym __weak;
 extern __u64 *bpf_session_cookie(void) __ksym __weak;
 #endif
