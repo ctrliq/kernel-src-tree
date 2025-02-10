@@ -701,7 +701,6 @@ static int erofs_fc_fill_super(struct super_block *sb, struct fs_context *fc)
 	struct inode *inode;
 	struct erofs_sb_info *sbi;
 	struct erofs_fs_context *ctx = fc->fs_private;
-	static bool printed = false;
 	int err;
 
 	sb->s_magic = EROFS_SUPER_MAGIC;
@@ -820,10 +819,6 @@ static int erofs_fc_fill_super(struct super_block *sb, struct fs_context *fc)
 		return err;
 
 	erofs_info(sb, "mounted with root inode @ nid %llu.", ROOT_NID(sbi));
-	if (!printed) {
-		mark_tech_preview("EROFS filesystem", NULL);
-		printed = true;
-	}
 	return 0;
 }
 
