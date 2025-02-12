@@ -284,7 +284,7 @@ static int ufshcd_parse_operating_points(struct ufs_hba *hba)
  * @dev_max: pointer to device attributes
  * @agreed_pwr: returned agreed attributes
  *
- * Returns 0 on success, non-zero value on failure
+ * Return: 0 on success, non-zero value on failure.
  */
 int ufshcd_negotiate_pwr_params(const struct ufs_host_params *host_params,
 				const struct ufs_pa_layer_attr *dev_max,
@@ -397,7 +397,7 @@ EXPORT_SYMBOL_GPL(ufshcd_init_host_params);
  * @pdev: pointer to Platform device handle
  * @vops: pointer to variant ops
  *
- * Returns 0 on success, non-zero value on failure
+ * Return: 0 on success, non-zero value on failure.
  */
 int ufshcd_pltfrm_init(struct platform_device *pdev,
 		       const struct ufs_hba_variant_ops *vops)
