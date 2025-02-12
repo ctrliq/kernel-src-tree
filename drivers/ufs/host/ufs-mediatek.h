@@ -253,4 +253,7 @@ static void _ufs_mtk_smc(struct ufs_mtk_smc_arg s)
 #define ufs_mtk_device_pwr_ctrl(on, ufs_ver, res) \
 	ufs_mtk_smc(UFS_MTK_SIP_DEVICE_PWR_CTRL, &(res), on, ufs_ver)
 
+/* MTK RTT support number */
+#define MTK_MAX_NUM_RTT 2
+
 #endif /* !_UFS_MEDIATEK_H */
