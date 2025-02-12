@@ -884,35 +884,7 @@ static inline u32 ufshcd_get_dme_attr_val(struct ufs_hba *hba)
 static inline enum upiu_response_transaction
 ufshcd_get_req_rsp(struct utp_upiu_rsp *ucd_rsp_ptr)
 {
-	return be32_to_cpu(ucd_rsp_ptr->header.dword_0) >> 24;
-}
-
-/**
- * ufshcd_get_rsp_upiu_result - Get the result from response UPIU
- * @ucd_rsp_ptr: pointer to response UPIU
- *
- * This function gets the response status and scsi_status from response UPIU
- *
- * Return: the response result code.
- */
-static inline int
-ufshcd_get_rsp_upiu_result(struct utp_upiu_rsp *ucd_rsp_ptr)
-{
-	return be32_to_cpu(ucd_rsp_ptr->header.dword_1) & MASK_RSP_UPIU_RESULT;
-}
-
-/*
- * ufshcd_get_rsp_upiu_data_seg_len - Get the data segment length
- *				from response UPIU
- * @ucd_rsp_ptr: pointer to response UPIU
- *
- * Return: the data segment length.
- */
-static inline unsigned int
-ufshcd_get_rsp_upiu_data_seg_len(struct utp_upiu_rsp *ucd_rsp_ptr)
-{
-	return be32_to_cpu(ucd_rsp_ptr->header.dword_2) &
-		MASK_RSP_UPIU_DATA_SEG_LEN;
+	return ucd_rsp_ptr->header.transaction_code;
 }
 
 /**
@@ -926,8 +898,7 @@ ufshcd_get_rsp_upiu_data_seg_len(struct utp_upiu_rsp *ucd_rsp_ptr)
  */
 static inline bool ufshcd_is_exception_event(struct utp_upiu_rsp *ucd_rsp_ptr)
 {
-	return be32_to_cpu(ucd_rsp_ptr->header.dword_2) &
-			MASK_RSP_EXCEPTION_EVENT;
+	return ucd_rsp_ptr->header.device_information & 1;
 }
 
 /**
@@ -2321,10 +2292,11 @@ void ufshcd_send_command(struct ufs_hba *hba, unsigned int task_tag,
 static inline void ufshcd_copy_sense_data(struct ufshcd_lrb *lrbp)
 {
 	u8 *const sense_buffer = lrbp->cmd->sense_buffer;
+	u16 resp_len;
 	int len;
 
-	if (sense_buffer &&
-	    ufshcd_get_rsp_upiu_data_seg_len(lrbp->ucd_rsp_ptr)) {
+	resp_len = be16_to_cpu(lrbp->ucd_rsp_ptr->header.data_segment_length);
+	if (sense_buffer && resp_len) {
 		int len_to_copy;
 
 		len = be16_to_cpu(lrbp->ucd_rsp_ptr->sr.sense_data_len);
@@ -2359,8 +2331,8 @@ int ufshcd_copy_query_response(struct ufs_hba *hba, struct ufshcd_lrb *lrbp)
 		u16 buf_len;
 
 		/* data segment length */
-		resp_len = be32_to_cpu(lrbp->ucd_rsp_ptr->header.dword_2) &
-						MASK_QUERY_DATA_SEG_LEN;
+		resp_len = be16_to_cpu(lrbp->ucd_rsp_ptr->header
+				       .data_segment_length);
 		buf_len = be16_to_cpu(
 				hba->dev_cmd.query.request.upiu_req.length);
 		if (likely(buf_len >= resp_len)) {
@@ -2733,15 +2705,13 @@ void ufshcd_prepare_utp_scsi_cmd_upiu(struct ufshcd_lrb *lrbp, u8 upiu_flags)
 	struct utp_upiu_req *ucd_req_ptr = lrbp->ucd_req_ptr;
 	unsigned short cdb_len;
 
-	/* command descriptor fields */
-	ucd_req_ptr->header.dword_0 = upiu_header_dword(
-				UPIU_TRANSACTION_COMMAND, upiu_flags,
-				lrbp->lun, lrbp->task_tag);
-	ucd_req_ptr->header.dword_1 = upiu_header_dword(
-				UPIU_COMMAND_SET_TYPE_SCSI, 0, 0, 0);
-
-	/* Total EHS length and Data segment length will be zero */
-	ucd_req_ptr->header.dword_2 = 0;
+	ucd_req_ptr->header = (struct utp_upiu_header){
+		.transaction_code = UPIU_TRANSACTION_COMMAND,
+		.flags = upiu_flags,
+		.lun = lrbp->lun,
+		.task_tag = lrbp->task_tag,
+		.command_set_type = UPIU_COMMAND_SET_TYPE_SCSI,
+	};
 
 	ucd_req_ptr->sc.exp_data_transfer_len = cpu_to_be32(cmd->sdb.length);
 
@@ -2766,18 +2736,19 @@ static void ufshcd_prepare_utp_query_req_upiu(struct ufs_hba *hba,
 	u16 len = be16_to_cpu(query->request.upiu_req.length);
 
 	/* Query request header */
-	ucd_req_ptr->header.dword_0 = upiu_header_dword(
-			UPIU_TRANSACTION_QUERY_REQ, upiu_flags,
-			lrbp->lun, lrbp->task_tag);
-	ucd_req_ptr->header.dword_1 = upiu_header_dword(
-			0, query->request.query_func, 0, 0);
-
-	/* Data segment length only need for WRITE_DESC */
-	if (query->request.upiu_req.opcode == UPIU_QUERY_OPCODE_WRITE_DESC)
-		ucd_req_ptr->header.dword_2 =
-			upiu_header_dword(0, 0, len >> 8, (u8)len);
-	else
-		ucd_req_ptr->header.dword_2 = 0;
+	ucd_req_ptr->header = (struct utp_upiu_header){
+		.transaction_code = UPIU_TRANSACTION_QUERY_REQ,
+		.flags = upiu_flags,
+		.lun = lrbp->lun,
+		.task_tag = lrbp->task_tag,
+		.query_function = query->request.query_func,
+		/* Data segment length only need for WRITE_DESC */
+		.data_segment_length =
+			query->request.upiu_req.opcode ==
+					UPIU_QUERY_OPCODE_WRITE_DESC ?
+				cpu_to_be16(len) :
+				0,
+	};
 
 	/* Copy the Query Request buffer as is */
 	memcpy(&ucd_req_ptr->qr, &query->request.upiu_req,
@@ -2796,12 +2767,10 @@ static inline void ufshcd_prepare_utp_nop_upiu(struct ufshcd_lrb *lrbp)
 
 	memset(ucd_req_ptr, 0, sizeof(struct utp_upiu_req));
 
-	/* command descriptor fields */
-	ucd_req_ptr->header.dword_0 = upiu_header_dword(
-			UPIU_TRANSACTION_NOP_OUT, 0, 0, lrbp->task_tag);
-	/* clear rest of the fields of basic header */
-	ucd_req_ptr->header.dword_1 = 0;
-	ucd_req_ptr->header.dword_2 = 0;
+	ucd_req_ptr->header = (struct utp_upiu_header){
+		.transaction_code = UPIU_TRANSACTION_NOP_OUT,
+		.task_tag = lrbp->task_tag,
+	};
 
 	memset(lrbp->ucd_rsp_ptr, 0, sizeof(struct utp_upiu_rsp));
 }
@@ -3105,13 +3074,6 @@ static int ufshcd_clear_cmd(struct ufs_hba *hba, u32 task_tag)
 					mask, ~mask, 1000, 1000);
 }
 
-static int
-ufshcd_check_query_response(struct ufs_hba *hba, struct ufshcd_lrb *lrbp)
-{
-	return ufshcd_get_rsp_upiu_result(lrbp->ucd_rsp_ptr) >>
-				UPIU_RSP_CODE_OFFSET;
-}
-
 /**
  * ufshcd_dev_cmd_completion() - handles device management command responses
  * @hba: per adapter instance
@@ -3136,11 +3098,13 @@ ufshcd_dev_cmd_completion(struct ufs_hba *hba, struct ufshcd_lrb *lrbp)
 					__func__, resp);
 		}
 		break;
-	case UPIU_TRANSACTION_QUERY_RSP:
-		err = ufshcd_check_query_response(hba, lrbp);
-		if (!err)
+	case UPIU_TRANSACTION_QUERY_RSP: {
+		u8 response = lrbp->ucd_rsp_ptr->header.response;
+
+		if (response == 0)
 			err = ufshcd_copy_query_response(hba, lrbp);
 		break;
+	}
 	case UPIU_TRANSACTION_REJECT_UPIU:
 		/* TODO: handle Reject UPIU Response */
 		err = -EPERM;
@@ -5342,7 +5306,7 @@ ufshcd_transfer_rsp_status(struct ufs_hba *hba, struct ufshcd_lrb *lrbp,
 	u8 upiu_flags;
 	u32 resid;
 
-	upiu_flags = be32_to_cpu(lrbp->ucd_rsp_ptr->header.dword_0) >> 16;
+	upiu_flags = lrbp->ucd_rsp_ptr->header.flags;
 	resid = be32_to_cpu(lrbp->ucd_rsp_ptr->sr.residual_transfer_count);
 	/*
 	 * Test !overflow instead of underflow to support UFS devices that do
@@ -5355,8 +5319,8 @@ ufshcd_transfer_rsp_status(struct ufs_hba *hba, struct ufshcd_lrb *lrbp,
 	ocs = ufshcd_get_tr_ocs(lrbp, cqe);
 
 	if (hba->quirks & UFSHCD_QUIRK_BROKEN_OCS_FATAL_ERROR) {
-		if (be32_to_cpu(lrbp->ucd_rsp_ptr->header.dword_1) &
-					MASK_RSP_UPIU_RESULT)
+		if (lrbp->ucd_rsp_ptr->header.response ||
+		    lrbp->ucd_rsp_ptr->header.status)
 			ocs = OCS_SUCCESS;
 	}
 
@@ -5366,16 +5330,10 @@ ufshcd_transfer_rsp_status(struct ufs_hba *hba, struct ufshcd_lrb *lrbp,
 		switch (ufshcd_get_req_rsp(lrbp->ucd_rsp_ptr)) {
 		case UPIU_TRANSACTION_RESPONSE:
 			/*
-			 * get the response UPIU result to extract
-			 * the SCSI command status
-			 */
-			result = ufshcd_get_rsp_upiu_result(lrbp->ucd_rsp_ptr);
-
-			/*
 			 * get the result based on SCSI status response
 			 * to notify the SCSI midlayer of the command status
 			 */
-			scsi_status = result & MASK_SCSI_STATUS;
+			scsi_status = lrbp->ucd_rsp_ptr->header.status;
 			result = ufshcd_scsi_cmd_status(lrbp, scsi_status);
 
 			/*
@@ -7065,7 +7023,7 @@ static int __ufshcd_issue_tm_cmd(struct ufs_hba *hba,
 	WARN_ONCE(task_tag < 0 || task_tag >= hba->nutmrs, "Invalid tag %d\n",
 		  task_tag);
 	hba->tmf_rqs[req->tag] = req;
-	treq->upiu_req.req_header.dword_0 |= cpu_to_be32(task_tag);
+	treq->upiu_req.req_header.task_tag = task_tag;
 
 	memcpy(hba->utmrdl_base_addr + task_tag, treq, sizeof(*treq));
 	ufshcd_vops_setup_task_mgmt(hba, task_tag, tm_function);
@@ -7132,9 +7090,9 @@ static int ufshcd_issue_tm_cmd(struct ufs_hba *hba, int lun_id, int task_id,
 	treq.header.ocs = OCS_INVALID_COMMAND_STATUS;
 
 	/* Configure task request UPIU */
-	treq.upiu_req.req_header.dword_0 = cpu_to_be32(lun_id << 8) |
-				  cpu_to_be32(UPIU_TRANSACTION_TASK_REQ << 24);
-	treq.upiu_req.req_header.dword_1 = cpu_to_be32(tm_function << 16);
+	treq.upiu_req.req_header.transaction_code = UPIU_TRANSACTION_TASK_REQ;
+	treq.upiu_req.req_header.lun = lun_id;
+	treq.upiu_req.req_header.tm_function = tm_function;
 
 	/*
 	 * The host shall provide the same value for LUN field in the basic
@@ -7208,7 +7166,7 @@ static int ufshcd_issue_devman_upiu_cmd(struct ufs_hba *hba,
 		lrbp->command_type = UTP_CMD_TYPE_UFS_STORAGE;
 
 	/* update the task tag in the request upiu */
-	req_upiu->header.dword_0 |= cpu_to_be32(tag);
+	req_upiu->header.task_tag = tag;
 
 	ufshcd_prepare_req_desc_hdr(lrbp, &upiu_flags, DMA_NONE, 0);
 
@@ -7241,8 +7199,8 @@ static int ufshcd_issue_devman_upiu_cmd(struct ufs_hba *hba,
 	memcpy(rsp_upiu, lrbp->ucd_rsp_ptr, sizeof(*rsp_upiu));
 	if (desc_buff && desc_op == UPIU_QUERY_OPCODE_READ_DESC) {
 		u8 *descp = (u8 *)lrbp->ucd_rsp_ptr + sizeof(*rsp_upiu);
-		u16 resp_len = be32_to_cpu(lrbp->ucd_rsp_ptr->header.dword_2) &
-			       MASK_QUERY_DATA_SEG_LEN;
+		u16 resp_len = be16_to_cpu(lrbp->ucd_rsp_ptr->header
+					   .data_segment_length);
 
 		if (*buff_len >= resp_len) {
 			memcpy(desc_buff, descp, resp_len);
@@ -7290,7 +7248,7 @@ int ufshcd_exec_raw_upiu_cmd(struct ufs_hba *hba,
 	enum dev_cmd_type cmd_type = DEV_CMD_TYPE_QUERY;
 	struct utp_task_req_desc treq = { };
 	enum utp_ocs ocs_value;
-	u8 tm_f = be32_to_cpu(req_upiu->header.dword_1) >> 16 & MASK_TM_FUNC;
+	u8 tm_f = req_upiu->header.tm_function;
 
 	switch (msgcode) {
 	case UPIU_TRANSACTION_NOP_OUT:
@@ -7382,7 +7340,9 @@ int ufshcd_advanced_rpmb_req_handler(struct ufs_hba *hba, struct utp_upiu_req *r
 	ufshcd_prepare_req_desc_hdr(lrbp, &upiu_flags, dir, 2);
 
 	/* update the task tag and LUN in the request upiu */
-	req_upiu->header.dword_0 |= cpu_to_be32(upiu_flags << 16 | UFS_UPIU_RPMB_WLUN << 8 | tag);
+	req_upiu->header.flags = upiu_flags;
+	req_upiu->header.lun = UFS_UPIU_RPMB_WLUN;
+	req_upiu->header.task_tag = tag;
 
 	/* copy the UPIU(contains CDB) request as it is */
 	memcpy(lrbp->ucd_req_ptr, req_upiu, sizeof(*lrbp->ucd_req_ptr));
@@ -7404,9 +7364,10 @@ int ufshcd_advanced_rpmb_req_handler(struct ufs_hba *hba, struct utp_upiu_req *r
 		/* Just copy the upiu response as it is */
 		memcpy(rsp_upiu, lrbp->ucd_rsp_ptr, sizeof(*rsp_upiu));
 		/* Get the response UPIU result */
-		result = ufshcd_get_rsp_upiu_result(lrbp->ucd_rsp_ptr);
+		result = (lrbp->ucd_rsp_ptr->header.response << 8) |
+			lrbp->ucd_rsp_ptr->header.status;
 
-		ehs_len = be32_to_cpu(lrbp->ucd_rsp_ptr->header.dword_2) >> 24;
+		ehs_len = lrbp->ucd_rsp_ptr->header.ehs_length;
 		/*
 		 * Since the bLength in EHS indicates the total size of the EHS Header and EHS Data
 		 * in 32 Byte units, the value of the bLength Request/Response for Advanced RPMB
@@ -10748,6 +10709,12 @@ static void ufshcd_check_header_layout(void)
 	BUILD_BUG_ON(((__le32 *)&(struct request_desc_header){
 				.dunu = cpu_to_le32(0xbadcafe)})[3] !=
 		cpu_to_le32(0xbadcafe));
+
+	BUILD_BUG_ON(((u8 *)&(struct utp_upiu_header){
+			     .iid = 0xf })[4] != 0xf0);
+
+	BUILD_BUG_ON(((u8 *)&(struct utp_upiu_header){
+			     .command_set_type = 0xf })[4] != 0xf);
 }
 
 /*
