@@ -21,6 +21,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/dma-direction.h>
 #include <scsi/scsi_device.h>
+#include <scsi/scsi_host.h>
 #include <ufs/unipro.h>
 #include <ufs/ufs.h>
 #include <ufs/ufs_quirks.h>
