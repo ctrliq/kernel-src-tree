@@ -27,6 +27,8 @@ TEST_PROGS += nft_synproxy.sh
 TEST_PROGS += nft_zones_many.sh
 TEST_PROGS += rpath.sh
 
+TEST_PROGS_EXTENDED = nft_concat_range_perf.sh
+
 TEST_GEN_FILES = audit_logread
 TEST_GEN_FILES += connect_close nf_queue
 TEST_GEN_FILES += sctp_collision
