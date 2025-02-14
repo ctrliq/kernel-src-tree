@@ -374,19 +374,23 @@ SYM_FUNC_END(call_depth_return_thunk)
  * 'JMP __x86_return_thunk' sites are changed to something else by
  * apply_returns().
  *
- * This should be converted eventually to call a warning function which
- * should scream loudly when the default return thunk is called after
- * alternatives have been applied.
- *
- * That warning function cannot BUG() because the bug splat cannot be
- * displayed in all possible configurations, leading to users not really
- * knowing why the machine froze.
+ * The ALTERNATIVE below adds a really loud warning to catch the case
+ * where the insufficient default return thunk ends up getting used for
+ * whatever reason like miscompilation or failure of
+ * objtool/alternatives/etc to patch all the return sites.
  */
 SYM_CODE_START(__x86_return_thunk)
 	UNWIND_HINT_FUNC
 	ANNOTATE_NOENDBR
+#if defined(CONFIG_MITIGATION_UNRET_ENTRY) || \
+    defined(CONFIG_MITIGATION_SRSO) || \
+    defined(CONFIG_MITIGATION_CALL_DEPTH_TRACKING)
+	ALTERNATIVE __stringify(ANNOTATE_UNRET_SAFE; ret), \
+		   "jmp warn_thunk_thunk", X86_FEATURE_ALWAYS
+#else
 	ANNOTATE_UNRET_SAFE
 	ret
+#endif
 	int3
 SYM_CODE_END(__x86_return_thunk)
 EXPORT_SYMBOL(__x86_return_thunk)
