@@ -35,3 +35,8 @@ include ../../lib.mk
 
 $(OUTPUT)/nf_queue: CFLAGS += $(MNL_CFLAGS)
 $(OUTPUT)/nf_queue: LDLIBS += $(MNL_LDLIBS)
+
+TEST_FILES := lib.sh
+
+TEST_INCLUDES := \
+	../lib.sh
