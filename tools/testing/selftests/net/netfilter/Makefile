@@ -29,6 +29,7 @@ TEST_PROGS += nft_tproxy_tcp.sh
 TEST_PROGS += nft_tproxy_udp.sh
 TEST_PROGS += nft_zones_many.sh
 TEST_PROGS += rpath.sh
+TEST_PROGS += vxlan_mtu_frag.sh
 
 TEST_PROGS_EXTENDED = nft_concat_range_perf.sh
 
