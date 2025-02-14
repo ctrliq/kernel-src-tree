@@ -16,39 +16,35 @@ obj-$(CONFIG_INTEL_WMI)			+= wmi/
 obj-$(CONFIG_INTEL_UNCORE_FREQ_CONTROL)	+= uncore-frequency/
 
 # Intel input drivers
-intel-hid-y				:= hid.o
-obj-$(CONFIG_INTEL_HID_EVENT)		+= intel-hid.o
-intel-vbtn-y				:= vbtn.o
-obj-$(CONFIG_INTEL_VBTN)		+= intel-vbtn.o
+intel-target-$(CONFIG_INTEL_HID_EVENT)		+= hid.o
+intel-target-$(CONFIG_INTEL_VBTN)		+= vbtn.o
 
 # Intel miscellaneous drivers
-obj-$(CONFIG_INTEL_ISHTP_ECLITE)	+= ishtp_eclite.o
-intel_int0002_vgpio-y			:= int0002_vgpio.o
-obj-$(CONFIG_INTEL_INT0002_VGPIO)	+= intel_int0002_vgpio.o
-intel_oaktrail-y			:= oaktrail.o
-obj-$(CONFIG_INTEL_OAKTRAIL)		+= intel_oaktrail.o
-intel_sdsi-y				:= sdsi.o
-obj-$(CONFIG_INTEL_SDSI)		+= intel_sdsi.o
-intel_vsec-y				:= vsec.o
-obj-$(CONFIG_INTEL_VSEC)		+= intel_vsec.o
+intel-target-$(CONFIG_INTEL_INT0002_VGPIO)	+= int0002_vgpio.o
+intel-target-$(CONFIG_INTEL_ISHTP_ECLITE)	+= ishtp_eclite.o
+intel-target-$(CONFIG_INTEL_OAKTRAIL)		+= oaktrail.o
+intel-target-$(CONFIG_INTEL_SDSI)		+= sdsi.o
+intel-target-$(CONFIG_INTEL_VSEC)		+= vsec.o
 
 # Intel PMIC / PMC / P-Unit drivers
 obj-$(CONFIG_INTEL_CHT_INT33FE)		+= int33fe/
 
 # TPMI drivers
-intel_vsec_tpmi-y			:= tpmi.o
-obj-$(CONFIG_INTEL_TPMI)		+= intel_vsec_tpmi.o
-obj-$(CONFIG_INTEL_PLR_TPMI)		+= intel_plr_tpmi.o
-
-intel_tpmi_power_domains-y		:= tpmi_power_domains.o
-obj-$(CONFIG_INTEL_TPMI_POWER_DOMAINS)	+= intel_tpmi_power_domains.o
+intel-target-$(CONFIG_INTEL_PLR_TPMI)		+= plr_tpmi.o
+intel-target-$(CONFIG_INTEL_TPMI_POWER_DOMAINS)	+= tpmi_power_domains.o
+intel-target-$(CONFIG_INTEL_TPMI)		+= vsec_tpmi.o
 
 # Intel Uncore drivers
-intel-rst-y				:= rst.o
-obj-$(CONFIG_INTEL_RST)			+= intel-rst.o
-intel-smartconnect-y			:= smartconnect.o
-obj-$(CONFIG_INTEL_SMARTCONNECT)	+= intel-smartconnect.o
-intel_turbo_max_3-y			:= turbo_max_3.o
-obj-$(CONFIG_INTEL_TURBO_MAX_3)		+= intel_turbo_max_3.o
+intel-target-$(CONFIG_INTEL_RST)		+= rst.o
+intel-target-$(CONFIG_INTEL_SMARTCONNECT)	+= smartconnect.o
+intel-target-$(CONFIG_INTEL_TURBO_MAX_3)	+= turbo_max_3.o
 
+# Add 'intel' prefix to each module listed in intel-target-*
+define INTEL_OBJ_TARGET
+intel-$(1)-y := $(1).o
+obj-$(2) += intel-$(1).o
+endef
+
+$(foreach target, $(basename $(intel-target-y)), $(eval $(call INTEL_OBJ_TARGET,$(target),y)))
+$(foreach target, $(basename $(intel-target-m)), $(eval $(call INTEL_OBJ_TARGET,$(target),m)))
 
