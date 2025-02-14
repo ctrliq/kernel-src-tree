@@ -1,0 +1,251 @@
+arm64/sve: Discard stale CPU state when handling SVE traps
+
+jira LE-2349
+cve CVE-2024-50275
+Rebuild_History Non-Buildable kernel-4.18.0-553.37.1.el8_10
+commit-author Mark Brown <broonie@kernel.org>
+commit 751ecf6afd6568adc98f2a6052315552c0483d18
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.37.1.el8_10/751ecf6a.failed
+
+The logic for handling SVE traps manipulates saved FPSIMD/SVE state
+incorrectly, and a race with preemption can result in a task having
+TIF_SVE set and TIF_FOREIGN_FPSTATE clear even though the live CPU state
+is stale (e.g. with SVE traps enabled). This has been observed to result
+in warnings from do_sve_acc() where SVE traps are not expected while
+TIF_SVE is set:
+
+|         if (test_and_set_thread_flag(TIF_SVE))
+|                 WARN_ON(1); /* SVE access shouldn't have trapped */
+
+Warnings of this form have been reported intermittently, e.g.
+
+  https://lore.kernel.org/linux-arm-kernel/CA+G9fYtEGe_DhY2Ms7+L7NKsLYUomGsgqpdBj+QwDLeSg=JhGg@mail.gmail.com/
+  https://lore.kernel.org/linux-arm-kernel/000000000000511e9a060ce5a45c@google.com/
+
+The race can occur when the SVE trap handler is preempted before and
+after manipulating the saved FPSIMD/SVE state, starting and ending on
+the same CPU, e.g.
+
+| void do_sve_acc(unsigned long esr, struct pt_regs *regs)
+| {
+|         // Trap on CPU 0 with TIF_SVE clear, SVE traps enabled
+|         // task->fpsimd_cpu is 0.
+|         // per_cpu_ptr(&fpsimd_last_state, 0) is task.
+|
+|         ...
+|
+|         // Preempted; migrated from CPU 0 to CPU 1.
+|         // TIF_FOREIGN_FPSTATE is set.
+|
+|         get_cpu_fpsimd_context();
+|
+|         if (test_and_set_thread_flag(TIF_SVE))
+|                 WARN_ON(1); /* SVE access shouldn't have trapped */
+|
+|         sve_init_regs() {
+|                 if (!test_thread_flag(TIF_FOREIGN_FPSTATE)) {
+|                         ...
+|                 } else {
+|                         fpsimd_to_sve(current);
+|                         current->thread.fp_type = FP_STATE_SVE;
+|                 }
+|         }
+|
+|         put_cpu_fpsimd_context();
+|
+|         // Preempted; migrated from CPU 1 to CPU 0.
+|         // task->fpsimd_cpu is still 0
+|         // If per_cpu_ptr(&fpsimd_last_state, 0) is still task then:
+|         // - Stale HW state is reused (with SVE traps enabled)
+|         // - TIF_FOREIGN_FPSTATE is cleared
+|         // - A return to userspace skips HW state restore
+| }
+
+Fix the case where the state is not live and TIF_FOREIGN_FPSTATE is set
+by calling fpsimd_flush_task_state() to detach from the saved CPU
+state. This ensures that a subsequent context switch will not reuse the
+stale CPU state, and will instead set TIF_FOREIGN_FPSTATE, forcing the
+new state to be reloaded from memory prior to a return to userspace.
+
+Fixes: cccb78ce89c4 ("arm64/sve: Rework SVE access trap to convert state in registers")
+	Reported-by: Mark Rutland <mark.rutland@arm.com>
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+	Cc: stable@vger.kernel.org
+	Reviewed-by: Mark Rutland <mark.rutland@arm.com>
+Link: https://lore.kernel.org/r/20241030-arm64-fpsimd-foreign-flush-v1-1-bd7bd66905a2@kernel.org
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit 751ecf6afd6568adc98f2a6052315552c0483d18)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/kernel/fpsimd.c
+diff --cc arch/arm64/kernel/fpsimd.c
+index 48f6b77fdece,6d21971ae559..000000000000
+--- a/arch/arm64/kernel/fpsimd.c
++++ b/arch/arm64/kernel/fpsimd.c
+@@@ -934,6 -1218,159 +934,162 @@@ void fpsimd_release_task(struct task_st
+  
+  #endif /* CONFIG_ARM64_SVE */
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_ARM64_SME
++ 
++ /*
++  * Ensure that task->thread.sme_state is allocated and sufficiently large.
++  *
++  * This function should be used only in preparation for replacing
++  * task->thread.sme_state with new data.  The memory is always zeroed
++  * here to prevent stale data from showing through: this is done in
++  * the interest of testability and predictability, the architecture
++  * guarantees that when ZA is enabled it will be zeroed.
++  */
++ void sme_alloc(struct task_struct *task, bool flush)
++ {
++ 	if (task->thread.sme_state) {
++ 		if (flush)
++ 			memset(task->thread.sme_state, 0,
++ 			       sme_state_size(task));
++ 		return;
++ 	}
++ 
++ 	/* This could potentially be up to 64K. */
++ 	task->thread.sme_state =
++ 		kzalloc(sme_state_size(task), GFP_KERNEL);
++ }
++ 
++ static void sme_free(struct task_struct *task)
++ {
++ 	kfree(task->thread.sme_state);
++ 	task->thread.sme_state = NULL;
++ }
++ 
++ void cpu_enable_sme(const struct arm64_cpu_capabilities *__always_unused p)
++ {
++ 	/* Set priority for all PEs to architecturally defined minimum */
++ 	write_sysreg_s(read_sysreg_s(SYS_SMPRI_EL1) & ~SMPRI_EL1_PRIORITY_MASK,
++ 		       SYS_SMPRI_EL1);
++ 
++ 	/* Allow SME in kernel */
++ 	write_sysreg(read_sysreg(CPACR_EL1) | CPACR_EL1_SMEN_EL1EN, CPACR_EL1);
++ 	isb();
++ 
++ 	/* Ensure all bits in SMCR are set to known values */
++ 	write_sysreg_s(0, SYS_SMCR_EL1);
++ 
++ 	/* Allow EL0 to access TPIDR2 */
++ 	write_sysreg(read_sysreg(SCTLR_EL1) | SCTLR_ELx_ENTP2, SCTLR_EL1);
++ 	isb();
++ }
++ 
++ void cpu_enable_sme2(const struct arm64_cpu_capabilities *__always_unused p)
++ {
++ 	/* This must be enabled after SME */
++ 	BUILD_BUG_ON(ARM64_SME2 <= ARM64_SME);
++ 
++ 	/* Allow use of ZT0 */
++ 	write_sysreg_s(read_sysreg_s(SYS_SMCR_EL1) | SMCR_ELx_EZT0_MASK,
++ 		       SYS_SMCR_EL1);
++ }
++ 
++ void cpu_enable_fa64(const struct arm64_cpu_capabilities *__always_unused p)
++ {
++ 	/* This must be enabled after SME */
++ 	BUILD_BUG_ON(ARM64_SME_FA64 <= ARM64_SME);
++ 
++ 	/* Allow use of FA64 */
++ 	write_sysreg_s(read_sysreg_s(SYS_SMCR_EL1) | SMCR_ELx_FA64_MASK,
++ 		       SYS_SMCR_EL1);
++ }
++ 
++ void __init sme_setup(void)
++ {
++ 	struct vl_info *info = &vl_info[ARM64_VEC_SME];
++ 	int min_bit, max_bit;
++ 
++ 	if (!system_supports_sme())
++ 		return;
++ 
++ 	/*
++ 	 * SME doesn't require any particular vector length be
++ 	 * supported but it does require at least one.  We should have
++ 	 * disabled the feature entirely while bringing up CPUs but
++ 	 * let's double check here.  The bitmap is SVE_VQ_MAP sized for
++ 	 * sharing with SVE.
++ 	 */
++ 	WARN_ON(bitmap_empty(info->vq_map, SVE_VQ_MAX));
++ 
++ 	min_bit = find_last_bit(info->vq_map, SVE_VQ_MAX);
++ 	info->min_vl = sve_vl_from_vq(__bit_to_vq(min_bit));
++ 
++ 	max_bit = find_first_bit(info->vq_map, SVE_VQ_MAX);
++ 	info->max_vl = sve_vl_from_vq(__bit_to_vq(max_bit));
++ 
++ 	WARN_ON(info->min_vl > info->max_vl);
++ 
++ 	/*
++ 	 * For the default VL, pick the maximum supported value <= 32
++ 	 * (256 bits) if there is one since this is guaranteed not to
++ 	 * grow the signal frame when in streaming mode, otherwise the
++ 	 * minimum available VL will be used.
++ 	 */
++ 	set_sme_default_vl(find_supported_vector_length(ARM64_VEC_SME, 32));
++ 
++ 	pr_info("SME: minimum available vector length %u bytes per vector\n",
++ 		info->min_vl);
++ 	pr_info("SME: maximum available vector length %u bytes per vector\n",
++ 		info->max_vl);
++ 	pr_info("SME: default vector length %u bytes per vector\n",
++ 		get_sme_default_vl());
++ }
++ 
++ void sme_suspend_exit(void)
++ {
++ 	u64 smcr = 0;
++ 
++ 	if (!system_supports_sme())
++ 		return;
++ 
++ 	if (system_supports_fa64())
++ 		smcr |= SMCR_ELx_FA64;
++ 	if (system_supports_sme2())
++ 		smcr |= SMCR_ELx_EZT0;
++ 
++ 	write_sysreg_s(smcr, SYS_SMCR_EL1);
++ 	write_sysreg_s(0, SYS_SMPRI_EL1);
++ }
++ 
++ #endif /* CONFIG_ARM64_SME */
++ 
++ static void sve_init_regs(void)
++ {
++ 	/*
++ 	 * Convert the FPSIMD state to SVE, zeroing all the state that
++ 	 * is not shared with FPSIMD. If (as is likely) the current
++ 	 * state is live in the registers then do this there and
++ 	 * update our metadata for the current task including
++ 	 * disabling the trap, otherwise update our in-memory copy.
++ 	 * We are guaranteed to not be in streaming mode, we can only
++ 	 * take a SVE trap when not in streaming mode and we can't be
++ 	 * in streaming mode when taking a SME trap.
++ 	 */
++ 	if (!test_thread_flag(TIF_FOREIGN_FPSTATE)) {
++ 		unsigned long vq_minus_one =
++ 			sve_vq_from_vl(task_get_sve_vl(current)) - 1;
++ 		sve_set_vq(vq_minus_one);
++ 		sve_flush_live(true, vq_minus_one);
++ 		fpsimd_bind_task_to_cpu();
++ 	} else {
++ 		fpsimd_to_sve(current);
++ 		current->thread.fp_type = FP_STATE_SVE;
++ 		fpsimd_flush_task_state(current);
++ 	}
++ }
++ 
+++>>>>>>> 751ecf6afd65 (arm64/sve: Discard stale CPU state when handling SVE traps)
+  /*
+   * Trapped SVE access
+   *
+* Unmerged path arch/arm64/kernel/fpsimd.c
