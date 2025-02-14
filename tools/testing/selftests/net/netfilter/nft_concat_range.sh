@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # SPDX-License-Identifier: GPL-2.0
 #
 # nft_concat_range.sh - Tests for sets with concatenation of ranged fields
@@ -7,10 +7,10 @@
 #
 # Author: Stefano Brivio <sbrivio@redhat.com>
 #
-# shellcheck disable=SC2154,SC2034,SC2016,SC2030,SC2031
+# shellcheck disable=SC2154,SC2034,SC2016,SC2030,SC2031,SC2317
 # ^ Configuration and templates sourced with eval, counters reused in subshells
 
-KSELFTEST_SKIP=4
+source lib.sh
 
 # Available test groups:
 # - reported_issues: check for issues that were reported in the past
@@ -489,8 +489,6 @@ setup_veth() {
 	B() {
 		ip netns exec B "$@" >/dev/null 2>&1
 	}
-
-	sleep 2
 }
 
 # Fill in set template and initialise set
@@ -695,10 +693,17 @@ setup_send_udp6() {
 	fi
 }
 
+listener_ready()
+{
+	port="$1"
+	ss -lnt -o "sport = :$port" | grep -q "$port"
+}
+
 # Set up function to send TCP traffic on IPv4
 setup_flood_tcp() {
 	if command -v iperf3 >/dev/null; then
 		flood_tcp() {
+			local n_port="${dst_port}"
 			[ -n "${dst_port}" ] && dst_port="-p ${dst_port}"
 			if [ -n "${src_addr4}" ]; then
 				B ip addr add "${src_addr4}/16" dev veth_b
@@ -715,7 +720,7 @@ setup_flood_tcp() {
 
 			# shellcheck disable=SC2086 # this needs split options
 			iperf3 -s -DB "${dst_addr4}" ${dst_port} >/dev/null 2>&1
-			sleep 2
+			busywait "$BUSYWAIT_TIMEOUT" listener_ready "$n_port"
 
 			# shellcheck disable=SC2086 # this needs split options
 			B iperf3 -c "${dst_addr4}" ${dst_port} ${src_port} \
@@ -727,6 +732,7 @@ setup_flood_tcp() {
 		}
 	elif command -v iperf >/dev/null; then
 		flood_tcp() {
+			local n_port="${dst_port}"
 			[ -n "${dst_port}" ] && dst_port="-p ${dst_port}"
 			if [ -n "${src_addr4}" ]; then
 				B ip addr add "${src_addr4}/16" dev veth_b
@@ -743,7 +749,7 @@ setup_flood_tcp() {
 
 			# shellcheck disable=SC2086 # this needs split options
 			iperf -s -DB "${dst_addr4}" ${dst_port} >/dev/null 2>&1
-			sleep 2
+			busywait "$BUSYWAIT_TIMEOUT" listener_ready "$n_port"
 
 			# shellcheck disable=SC2086 # this needs split options
 			B iperf -c "${dst_addr4}" ${dst_port} ${src_addr4} \
@@ -755,6 +761,7 @@ setup_flood_tcp() {
 		}
 	elif command -v netperf >/dev/null; then
 		flood_tcp() {
+			local n_port="${dst_port}"
 			[ -n "${dst_port}" ] && dst_port="-p ${dst_port}"
 			if [ -n "${src_addr4}" ]; then
 				B ip addr add "${src_addr4}/16" dev veth_b
@@ -771,7 +778,7 @@ setup_flood_tcp() {
 			# shellcheck disable=SC2086 # this needs split options
 			netserver -4 ${dst_port} -L "${dst_addr4}" \
 				>/dev/null 2>&1
-			sleep 2
+			busywait "$BUSYWAIT_TIMEOUT" listener_ready "${n_port}"
 
 			# shellcheck disable=SC2086 # this needs split options
 			B netperf -4 -H "${dst_addr4}" ${dst_port} \
@@ -790,6 +797,7 @@ setup_flood_tcp() {
 setup_flood_tcp6() {
 	if command -v iperf3 >/dev/null; then
 		flood_tcp6() {
+			local n_port="${dst_port}"
 			[ -n "${dst_port}" ] && dst_port="-p ${dst_port}"
 			if [ -n "${src_addr6}" ]; then
 				B ip addr add "${src_addr6}" dev veth_b nodad
@@ -806,7 +814,7 @@ setup_flood_tcp6() {
 
 			# shellcheck disable=SC2086 # this needs split options
 			iperf3 -s -DB "${dst_addr6}" ${dst_port} >/dev/null 2>&1
-			sleep 2
+			busywait "$BUSYWAIT_TIMEOUT" listener_ready "${n_port}"
 
 			# shellcheck disable=SC2086 # this needs split options
 			B iperf3 -c "${dst_addr6}" ${dst_port} \
@@ -818,6 +826,7 @@ setup_flood_tcp6() {
 		}
 	elif command -v iperf >/dev/null; then
 		flood_tcp6() {
+			local n_port="${dst_port}"
 			[ -n "${dst_port}" ] && dst_port="-p ${dst_port}"
 			if [ -n "${src_addr6}" ]; then
 				B ip addr add "${src_addr6}" dev veth_b nodad
@@ -834,7 +843,7 @@ setup_flood_tcp6() {
 
 			# shellcheck disable=SC2086 # this needs split options
 			iperf -s -VDB "${dst_addr6}" ${dst_port} >/dev/null 2>&1
-			sleep 2
+			busywait "$BUSYWAIT_TIMEOUT" listener_ready "$n_port"
 
 			# shellcheck disable=SC2086 # this needs split options
 			B iperf -c "${dst_addr6}" -V ${dst_port} \
@@ -846,6 +855,7 @@ setup_flood_tcp6() {
 		}
 	elif command -v netperf >/dev/null; then
 		flood_tcp6() {
+			local n_port="${dst_port}"
 			[ -n "${dst_port}" ] && dst_port="-p ${dst_port}"
 			if [ -n "${src_addr6}" ]; then
 				B ip addr add "${src_addr6}" dev veth_b nodad
@@ -862,7 +872,7 @@ setup_flood_tcp6() {
 			# shellcheck disable=SC2086 # this needs split options
 			netserver -6 ${dst_port} -L "${dst_addr6}" \
 				>/dev/null 2>&1
-			sleep 2
+			busywait "$BUSYWAIT_TIMEOUT" listener_ready "$n_port"
 
 			# shellcheck disable=SC2086 # this needs split options
 			B netperf -6 -H "${dst_addr6}" ${dst_port} \
@@ -881,6 +891,7 @@ setup_flood_tcp6() {
 setup_flood_udp() {
 	if command -v iperf3 >/dev/null; then
 		flood_udp() {
+			local n_port="${dst_port}"
 			[ -n "${dst_port}" ] && dst_port="-p ${dst_port}"
 			if [ -n "${src_addr4}" ]; then
 				B ip addr add "${src_addr4}/16" dev veth_b
@@ -897,7 +908,7 @@ setup_flood_udp() {
 
 			# shellcheck disable=SC2086 # this needs split options
 			iperf3 -s -DB "${dst_addr4}" ${dst_port}
-			sleep 2
+			busywait "$BUSYWAIT_TIMEOUT" listener_ready "$n_port"
 
 			# shellcheck disable=SC2086 # this needs split options
 			B iperf3 -u -c "${dst_addr4}" -Z -b 100M -l16 -t1000 \
@@ -909,6 +920,7 @@ setup_flood_udp() {
 		}
 	elif command -v iperf >/dev/null; then
 		flood_udp() {
+			local n_port="${dst_port}"
 			[ -n "${dst_port}" ] && dst_port="-p ${dst_port}"
 			if [ -n "${src_addr4}" ]; then
 				B ip addr add "${src_addr4}/16" dev veth_b
@@ -925,7 +937,7 @@ setup_flood_udp() {
 
 			# shellcheck disable=SC2086 # this needs split options
 			iperf -u -sDB "${dst_addr4}" ${dst_port} >/dev/null 2>&1
-			sleep 2
+			busywait "$BUSYWAIT_TIMEOUT" listener_ready "$n_port"
 
 			# shellcheck disable=SC2086 # this needs split options
 			B iperf -u -c "${dst_addr4}" -b 100M -l1 -t1000 \
@@ -937,6 +949,7 @@ setup_flood_udp() {
 		}
 	elif command -v netperf >/dev/null; then
 		flood_udp() {
+			local n_port="${dst_port}"
 			[ -n "${dst_port}" ] && dst_port="-p ${dst_port}"
 			if [ -n "${src_addr4}" ]; then
 				B ip addr add "${src_addr4}/16" dev veth_b
@@ -953,7 +966,7 @@ setup_flood_udp() {
 			# shellcheck disable=SC2086 # this needs split options
 			netserver -4 ${dst_port} -L "${dst_addr4}" \
 				>/dev/null 2>&1
-			sleep 2
+			busywait "$BUSYWAIT_TIMEOUT" listener_ready "$n_port"
 
 			# shellcheck disable=SC2086 # this needs split options
 			B netperf -4 -H "${dst_addr4}" ${dst_port} \
@@ -1006,14 +1019,13 @@ cleanup() {
 	killall netperf				2>/dev/null
 	killall netserver			2>/dev/null
 	rm -f ${tmp}
-	sleep 2
 }
 
 # Entry point for setup functions
 setup() {
 	if [ "$(id -u)" -ne 0 ]; then
 		echo "  need to run as root"
-		exit ${KSELFTEST_SKIP}
+		exit ${ksft_skip}
 	fi
 
 	cleanup
@@ -1274,7 +1286,7 @@ send_nomatch() {
 # - check that packets outside range don't match it
 # - remove some elements, check that packets don't match anymore
 test_correctness() {
-	setup veth send_"${proto}" set || return ${KSELFTEST_SKIP}
+	setup veth send_"${proto}" set || return ${ksft_skip}
 
 	range_size=1
 	for i in $(seq "${start}" $((start + count))); do
@@ -1323,7 +1335,7 @@ test_concurrency() {
 	proto=${flood_proto}
 	tools=${flood_tools}
 	chain_spec=${flood_spec}
-	setup veth flood_"${proto}" set || return ${KSELFTEST_SKIP}
+	setup veth flood_"${proto}" set || return ${ksft_skip}
 
 	range_size=1
 	cstart=${start}
@@ -1341,7 +1353,7 @@ test_concurrency() {
 		start=$((end + range_size))
 	done
 
-	sleep 10
+	sleep $((RANDOM%10))
 
 	pids=
 	for c in $(seq 1 "$(nproc)"); do (
@@ -1423,7 +1435,7 @@ test_concurrency() {
 # - add all the elements with 3s timeout while checking that packets match
 # - wait 3s after the last insertion, check that packets don't match any entry
 test_timeout() {
-	setup veth send_"${proto}" set || return ${KSELFTEST_SKIP}
+	setup veth send_"${proto}" set || return ${ksft_skip}
 
 	timeout=3
 	range_size=1
@@ -1466,7 +1478,7 @@ test_performance() {
 	chain_spec=${perf_spec}
 	dst="${perf_dst}"
 	src="${perf_src}"
-	setup veth perf set || return ${KSELFTEST_SKIP}
+	setup veth perf set || return ${ksft_skip}
 
 	first=${start}
 	range_size=1
@@ -1539,7 +1551,7 @@ test_bug_flush_remove_add() {
 	elem1='{ 10.0.0.1 . 22-25, 10.0.0.1 . 10-20 }'
 	elem2='{ 10.0.0.1 . 10-20, 10.0.0.1 . 22-25 }'
 	for i in `seq 1 100`; do
-		nft add table t ${set_cmd}	|| return ${KSELFTEST_SKIP}
+		nft add table t ${set_cmd}	|| return ${ksft_skip}
 		nft add element t s ${elem1}	2>/dev/null || return 1
 		nft flush set t s		2>/dev/null || return 1
 		nft add element t s ${elem2}	2>/dev/null || return 1
@@ -1550,7 +1562,7 @@ test_bug_flush_remove_add() {
 # - add ranged element, check that packets match it
 # - reload the set, check packets still match
 test_bug_reload() {
-	setup veth send_"${proto}" set || return ${KSELFTEST_SKIP}
+	setup veth send_"${proto}" set || return ${ksft_skip}
 	rstart=${start}
 
 	range_size=1
@@ -1709,11 +1721,11 @@ for name in ${TESTS}; do
 			printf "[FAIL]\n"
 			err_flush
 			exit 1
-		elif [ $ret -eq ${KSELFTEST_SKIP} ]; then
+		elif [ $ret -eq ${ksft_skip} ]; then
 			printf "[SKIP]\n"
 			err_flush
 		fi
 	done
 done
 
-[ ${passed} -eq 0 ] && exit ${KSELFTEST_SKIP} || exit 0
+[ ${passed} -eq 0 ] && exit ${ksft_skip} || exit 0
