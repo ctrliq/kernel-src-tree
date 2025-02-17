@@ -10,6 +10,8 @@
 #define _ASM_S390_HUGETLB_H
 
 #include <linux/pgtable.h>
+#include <linux/swap.h>
+#include <linux/swapops.h>
 #include <asm/page.h>
 
 #define hugetlb_free_pgd_range			free_pgd_range
@@ -91,7 +93,7 @@ static inline int huge_pte_none(pte_t pte)
 
 static inline int huge_pte_none_mostly(pte_t pte)
 {
-	return huge_pte_none(pte);
+	return huge_pte_none(pte) || is_pte_marker(pte);
 }
 
 static inline int huge_pte_write(pte_t pte)
