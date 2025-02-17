@@ -1141,3 +1141,11 @@ pointer are gone.
 
 set_blocksize() takes opened struct file instead of struct block_device now
 and it *must* be opened exclusive.
+
+---
+
+** recommended**
+
+kern_path_locked() and user_path_locked() no longer return a negative
+dentry so this doesn't need to be checked.  If the name cannot be found,
+ERR_PTR(-ENOENT) is returned.
