@@ -1246,9 +1246,6 @@ void bdev_statx(struct inode *backing_inode, struct kstat *stat,
 {
 	struct block_device *bdev;
 
-	if (!(request_mask & (STATX_DIOALIGN | STATX_WRITE_ATOMIC)))
-		return;
-
 	/*
 	 * Note that backing_inode is the inode of a block device node file,
 	 * not the block device's internal inode.  Therefore it is *not* valid
@@ -1272,6 +1269,8 @@ void bdev_statx(struct inode *backing_inode, struct kstat *stat,
 			queue_atomic_write_unit_min_bytes(bd_queue),
 			queue_atomic_write_unit_max_bytes(bd_queue));
 	}
+
+	stat->blksize = bdev_io_min(bdev);
 
 	blkdev_put_no_open(bdev);
 }
