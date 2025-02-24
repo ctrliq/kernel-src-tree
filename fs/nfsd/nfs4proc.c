@@ -38,6 +38,7 @@
 #include <linux/slab.h>
 #include <linux/kthread.h>
 #include <linux/namei.h>
+#include <linux/moduleparam.h>
 
 #include <linux/sunrpc/addr.h>
 #include <linux/nfs_ssc.h>
@@ -52,8 +53,29 @@
 #include "pnfs.h"
 #include "trace.h"
 
+static int param_set_inter_copy_offload(const char *val,
+					const struct kernel_param *kp)
+{
+	bool enable;
+	int ret;
+
+	ret = kstrtobool(val, &enable);
+	if (ret)
+		return ret;
+
+	if (enable)
+		mark_tech_preview("Inter server-to-server copy offload", NULL);
+
+	return param_set_bool(val, kp);
+}
+
+static const struct kernel_param_ops param_ops_inter_copy_offload = {
+	.set = param_set_inter_copy_offload,
+	.get = param_get_bool,
+};
+#define param_check_inter_copy_offload(name, p) __param_check(name, p, bool)
 static bool inter_copy_offload_enable;
-module_param(inter_copy_offload_enable, bool, 0644);
+module_param(inter_copy_offload_enable, inter_copy_offload, 0644);
 MODULE_PARM_DESC(inter_copy_offload_enable,
 		 "Enable inter server to server copy offload. Default: false");
 
