@@ -16,8 +16,6 @@ enum bip_flags {
 };
 
 struct bio_integrity_payload {
-	struct bio		*bip_bio;	/* parent bio */
-
 	struct bvec_iter	bip_iter;
 
 	unsigned short		bip_vcnt;	/* # of integrity bio_vecs */
@@ -25,16 +23,10 @@ struct bio_integrity_payload {
 	unsigned short		bip_flags;	/* control flags */
 	u16			app_tag;	/* application tag value */
 
-	struct bvec_iter	bio_iter;	/* for rewinding parent bio */
-
-	struct work_struct	bip_work;	/* I/O completion */
-
 	struct bio_vec		*bip_vec;
 
 	RH_KABI_RESERVE(1)
 	RH_KABI_RESERVE(2)
-
-	struct bio_vec		bip_inline_vecs[];/* embedded bvec array */
 };
 
 #define BIP_CLONE_FLAGS (BIP_MAPPED_INTEGRITY | BIP_IP_CHECKSUM | \
@@ -78,6 +70,8 @@ static inline void bip_set_seed(struct bio_integrity_payload *bip,
 	bip->bip_iter.bi_sector = seed;
 }
 
+void bio_integrity_init(struct bio *bio, struct bio_integrity_payload *bip,
+		struct bio_vec *bvecs, unsigned int nr_vecs);
 struct bio_integrity_payload *bio_integrity_alloc(struct bio *bio, gfp_t gfp,
 		unsigned int nr);
 int bio_integrity_add_page(struct bio *bio, struct page *page, unsigned int len,
@@ -89,24 +83,12 @@ bool bio_integrity_prep(struct bio *bio);
 void bio_integrity_advance(struct bio *bio, unsigned int bytes_done);
 void bio_integrity_trim(struct bio *bio);
 int bio_integrity_clone(struct bio *bio, struct bio *bio_src, gfp_t gfp_mask);
-int bioset_integrity_create(struct bio_set *bs, int pool_size);
-void bioset_integrity_free(struct bio_set *bs);
-void bio_integrity_init(void);
 
 #else /* CONFIG_BLK_DEV_INTEGRITY */
 
 static inline struct bio_integrity_payload *bio_integrity(struct bio *bio)
 {
 	return NULL;
-}
-
-static inline int bioset_integrity_create(struct bio_set *bs, int pool_size)
-{
-	return 0;
-}
-
-static inline void bioset_integrity_free(struct bio_set *bs)
-{
 }
 
 static int bio_integrity_map_user(struct bio *bio, struct iov_iter *iter)
@@ -140,10 +122,6 @@ static inline void bio_integrity_advance(struct bio *bio,
 }
 
 static inline void bio_integrity_trim(struct bio *bio)
-{
-}
-
-static inline void bio_integrity_init(void)
 {
 }
 
