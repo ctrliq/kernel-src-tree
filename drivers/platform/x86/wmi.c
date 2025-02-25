@@ -778,7 +778,7 @@ static void wmi_dev_release(struct device *dev)
 	kfree(wblock);
 }
 
-static int wmi_dev_match(struct device *dev, struct device_driver *driver)
+static int wmi_dev_match(struct device *dev, const struct device_driver *driver)
 {
 	const struct wmi_driver *wmi_driver =
 		container_of_const(driver, const struct wmi_driver, driver);
