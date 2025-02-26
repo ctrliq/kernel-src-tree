@@ -479,11 +479,11 @@ int trace_print_lat_fmt(struct trace_seq *s, struct trace_entry *entry)
 	case TRACE_FLAG_NEED_RESCHED:
 		need_resched = 'n';
 		break;
-	case TRACE_FLAG_PREEMPT_RESCHED:
-		need_resched = 'p';
-		break;
 	case TRACE_FLAG_NEED_RESCHED_LAZY:
 		need_resched = 'l';
+		break;
+	case TRACE_FLAG_PREEMPT_RESCHED:
+		need_resched = 'p';
 		break;
 	default:
 		need_resched = '.';

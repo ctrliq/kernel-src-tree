@@ -245,12 +245,11 @@ static ssize_t sched_dynamic_write(struct file *filp, const char __user *ubuf,
 static int sched_dynamic_show(struct seq_file *m, void *v)
 {
 	static const char * preempt_modes[] = {
-		"none", "voluntary", "full", "lazy", "laziest",
+		"none", "voluntary", "full"
 	};
-	int j = ARRAY_SIZE(preempt_modes) - 2*!IS_ENABLED(CONFIG_ARCH_HAS_PREEMPT_LAZY);
-	int i = IS_ENABLED(CONFIG_PREEMPT_RT) * 2;
+	int i;
 
-	for (; i < j; i++) {
+	for (i = 0; i < ARRAY_SIZE(preempt_modes); i++) {
 		if (preempt_dynamic_mode == i)
 			seq_puts(m, "(");
 		seq_puts(m, preempt_modes[i]);
@@ -470,6 +469,23 @@ static const struct file_operations fair_server_period_fops = {
 	.release	= single_release,
 };
 
+static ssize_t sched_hog_write(struct file *filp, const char __user *ubuf,
+			       size_t cnt, loff_t *ppos)
+{
+	unsigned long end = jiffies + 60 * HZ;
+
+	for (; time_before(jiffies, end) && !signal_pending(current);)
+		cpu_relax();
+
+	return cnt;
+}
+
+static const struct file_operations sched_hog_fops = {
+	.write		= sched_hog_write,
+	.open		= simple_open,
+	.llseek		= default_llseek,
+};
+
 static struct dentry *debugfs_sched;
 
 static void debugfs_fair_server_init(void)
@@ -531,6 +547,8 @@ static __init int sched_init_debug(void)
 #endif
 
 	debugfs_create_file("debug", 0444, debugfs_sched, NULL, &sched_debug_fops);
+
+	debugfs_create_file("hog", 0200, debugfs_sched, NULL, &sched_hog_fops);
 
 	debugfs_fair_server_init();
 

@@ -486,8 +486,6 @@ DEFINE_LOCK_GUARD_0(migrate, migrate_disable(), migrate_enable())
 extern bool preempt_model_none(void);
 extern bool preempt_model_voluntary(void);
 extern bool preempt_model_full(void);
-extern bool preempt_model_lazy(void);
-extern bool preempt_model_laziest(void);
 
 #else
 
@@ -502,15 +500,6 @@ static inline bool preempt_model_voluntary(void)
 static inline bool preempt_model_full(void)
 {
 	return IS_ENABLED(CONFIG_PREEMPT);
-}
-
-static inline bool preempt_model_lazy(void)
-{
-	return IS_ENABLED(CONFIG_PREEMPT_LAZY);
-}
-static inline bool preempt_model_laziest(void)
-{
-	return IS_ENABLED(CONFIG_PREEMPT_LAZIEST);
 }
 
 #endif
@@ -530,10 +519,7 @@ static inline bool preempt_model_rt(void)
  */
 static inline bool preempt_model_preemptible(void)
 {
-	return preempt_model_full() ||
-	       preempt_model_lazy() ||
-	       preempt_model_laziest() ||
-	       preempt_model_rt();
+	return preempt_model_full() || preempt_model_rt();
 }
 
 #endif /* __LINUX_PREEMPT_H */
