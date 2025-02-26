@@ -909,6 +909,12 @@ void iommu_set_dma_strict(void);
 extern int report_iommu_fault(struct iommu_domain *domain, struct device *dev,
 			      unsigned long iova, int flags);
 
+static inline void iommu_flush_iotlb_all(struct iommu_domain *domain)
+{
+	if (domain->ops->flush_iotlb_all)
+		domain->ops->flush_iotlb_all(domain);
+}
+
 static inline void iommu_iotlb_sync(struct iommu_domain *domain,
 				  struct iommu_iotlb_gather *iotlb_gather)
 {
@@ -1193,6 +1199,10 @@ static inline ssize_t iommu_map_sg(struct iommu_domain *domain,
 				   unsigned int nents, int prot, gfp_t gfp)
 {
 	return -ENODEV;
+}
+
+static inline void iommu_flush_iotlb_all(struct iommu_domain *domain)
+{
 }
 
 static inline void iommu_iotlb_sync(struct iommu_domain *domain,
