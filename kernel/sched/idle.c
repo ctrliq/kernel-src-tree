@@ -57,7 +57,8 @@ static noinline int __cpuidle cpu_idle_poll(void)
 	ct_cpuidle_enter();
 
 	raw_local_irq_enable();
-	while (!need_resched() && (cpu_idle_force_poll || tick_check_broadcast_expired()))
+	while (!tif_need_resched() &&
+	       (cpu_idle_force_poll || tick_check_broadcast_expired()))
 		cpu_relax();
 	raw_local_irq_disable();
 

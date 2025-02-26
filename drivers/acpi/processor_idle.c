@@ -107,7 +107,7 @@ static const struct dmi_system_id processor_power_dmi_table[] = {
  */
 static void __cpuidle acpi_safe_halt(void)
 {
-	if (!need_resched()) {
+	if (!tif_need_resched()) {
 		raw_safe_halt();
 		raw_local_irq_disable();
 	}
