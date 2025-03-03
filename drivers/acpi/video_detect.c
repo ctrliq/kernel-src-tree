@@ -52,6 +52,8 @@ static void acpi_video_parse_cmdline(void)
 		acpi_backlight_cmdline = acpi_backlight_native;
 	if (!strcmp("nvidia_wmi_ec", acpi_video_backlight_string))
 		acpi_backlight_cmdline = acpi_backlight_nvidia_wmi_ec;
+	 if (!strcmp("dell_uart", acpi_video_backlight_string))
+		acpi_backlight_cmdline = acpi_backlight_dell_uart;
 	if (!strcmp("none", acpi_video_backlight_string))
 		acpi_backlight_cmdline = acpi_backlight_none;
 }
@@ -759,6 +761,7 @@ enum acpi_backlight_type __acpi_video_get_backlight_type(bool native, bool *auto
 {
 	static DEFINE_MUTEX(init_mutex);
 	static bool nvidia_wmi_ec_present;
+	static bool dell_uart_present;
 	static bool native_available;
 	static bool init_done;
 	static long video_caps;
@@ -772,6 +775,7 @@ enum acpi_backlight_type __acpi_video_get_backlight_type(bool native, bool *auto
 				    ACPI_UINT32_MAX, find_video, NULL,
 				    &video_caps, NULL);
 		nvidia_wmi_ec_present = nvidia_wmi_ec_supported();
+		dell_uart_present = acpi_dev_present("DELL0501", NULL, -1);
 		init_done = true;
 	}
 	if (native)
@@ -798,6 +802,9 @@ enum acpi_backlight_type __acpi_video_get_backlight_type(bool native, bool *auto
 
 	if (auto_detect)
 		*auto_detect = true;
+
+	if (dell_uart_present)
+		return acpi_backlight_dell_uart;
 
 	/* Use ACPI video if available, except when native should be preferred. */
 	if ((video_caps & ACPI_VIDEO_BACKLIGHT) &&
