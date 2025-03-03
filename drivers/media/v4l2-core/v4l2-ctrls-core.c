@@ -406,9 +406,9 @@ void v4l2_ctrl_type_op_log(const struct v4l2_ctrl *ctrl)
 		break;
 
 	case V4L2_CTRL_TYPE_RECT:
-		pr_cont("%ux%u@%dx%d",
-			ptr.p_rect->width, ptr.p_rect->height,
-			ptr.p_rect->left, ptr.p_rect->top);
+		pr_cont("(%d,%d)/%ux%u",
+			ptr.p_rect->left, ptr.p_rect->top,
+			ptr.p_rect->width, ptr.p_rect->height);
 		break;
 
 	default:
