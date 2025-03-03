@@ -448,41 +448,19 @@ static const struct dmi_system_id irq1_level_low_skip_override[] = {
 		}
 	},
 	{
-		/* "Asus ExpertBook B1402CBA" */
+		/* Asus ExpertBook B1402CBA */
 		.matches = {
 			DMI_MATCH(DMI_SYS_VENDOR, "ASUSTeK COMPUTER INC."),
 			DMI_MATCH(DMI_BOARD_NAME, "B1402CBA"),
 		}
 	},
 	{
-		/* Asus ExpertBook B1402CVA */
+		/* Asus ExpertBook B1502C */
 		.matches = {
 			DMI_MATCH(DMI_SYS_VENDOR, "ASUSTeK COMPUTER INC."),
-			DMI_MATCH(DMI_BOARD_NAME, "B1402CVA"),
+			DMI_MATCH(DMI_BOARD_NAME, "B1502C"),
 		},
 	},
-	{
-		.ident = "Asus ExpertBook B1502CBA",
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "ASUSTeK COMPUTER INC."),
-			DMI_MATCH(DMI_BOARD_NAME, "B1502CBA"),
-		},
-	},
-        {
-                /* Asus ExpertBook B1502CVA */
-                .matches = {
-                        DMI_MATCH(DMI_SYS_VENDOR, "ASUSTeK COMPUTER INC."),
-                        DMI_MATCH(DMI_BOARD_NAME, "B1502CVA"),
-                },
-        },
-	{
-		/* Asus ExpertBook B1502CGA */
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "ASUSTeK COMPUTER INC."),
-			DMI_MATCH(DMI_BOARD_NAME, "B1502CGA"),
-		},
-	},
-
 	{
 		/* "Asus ExpertBook B2402" */
 		.matches = {
