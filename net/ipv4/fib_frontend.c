@@ -806,7 +806,7 @@ static int rtm_to_fib_config(struct net *net, struct sk_buff *skb,
 		case RTA_MULTIPATH:
 			err = lwtunnel_valid_encap_type_attr(nla_data(attr),
 							     nla_len(attr),
-							     extack);
+							     extack, false);
 			if (err < 0)
 				goto errout;
 			cfg->fc_mp = nla_data(attr);
@@ -824,7 +824,7 @@ static int rtm_to_fib_config(struct net *net, struct sk_buff *skb,
 		case RTA_ENCAP_TYPE:
 			cfg->fc_encap_type = nla_get_u16(attr);
 			err = lwtunnel_valid_encap_type(cfg->fc_encap_type,
-							extack);
+							extack, false);
 			if (err < 0)
 				goto errout;
 			break;
