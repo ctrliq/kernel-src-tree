@@ -1460,7 +1460,8 @@ static unsigned long zap_pte_range(struct mmu_gather *tlb,
 						force_flush = 1;
 					}
 				}
-				if (pte_young(ptent) && likely(vma_has_recency(vma)))
+				if (pte_young(ptent) &&
+				    likely(!(vma->vm_flags & VM_SEQ_READ)))
 					mark_page_accessed(page);
 			}
 			rss[mm_counter(page)]--;
@@ -5252,8 +5253,8 @@ static inline void mm_account_fault(struct mm_struct *mm, struct pt_regs *regs,
 #ifdef CONFIG_LRU_GEN
 static void lru_gen_enter_fault(struct vm_area_struct *vma)
 {
-	/* the LRU algorithm only applies to accesses with recency */
-	current->in_lru_fault = vma_has_recency(vma);
+	/* the LRU algorithm doesn't apply to sequential or random reads */
+	current->in_lru_fault = !(vma->vm_flags & (VM_SEQ_READ | VM_RAND_READ));
 }
 
 static void lru_gen_exit_fault(void)
