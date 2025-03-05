@@ -52,7 +52,7 @@ struct shrink_control {
 	unsigned long nr_scanned;
 
 	/* current memcg being shrunk (for memcg aware shrinkers) */
-	struct mem_cgroup *memcg;
+	RH_KABI_EXCLUDE(struct mem_cgroup *memcg)
 };
 
 #define SHRINK_STOP (~0UL)

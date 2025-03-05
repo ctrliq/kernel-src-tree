@@ -1026,7 +1026,7 @@ struct mm_struct {
 			unsigned long bitmap;
 #ifdef CONFIG_MEMCG
 			/* points to the memcg of "owner" above */
-			struct mem_cgroup *memcg;
+			RH_KABI_EXCLUDE(struct mem_cgroup *memcg)
 #endif
 		} lru_gen;
 #endif /* CONFIG_LRU_GEN_WALKS_MMU */
