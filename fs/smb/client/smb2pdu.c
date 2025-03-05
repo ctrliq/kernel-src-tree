@@ -210,10 +210,9 @@ static int
 smb2_reconnect(__le16 smb2_command, struct cifs_tcon *tcon,
 	       struct TCP_Server_Info *server, bool from_reconnect)
 {
-	int rc = 0;
-	struct nls_table *nls_codepage = NULL;
 	struct cifs_ses *ses;
 	int xid;
+	int rc = 0;
 
 	/*
 	 * SMB2s NegProt, SessSetup, Logoff do not have tcon yet so
@@ -328,8 +327,6 @@ again:
 	}
 	spin_unlock(&server->srv_lock);
 
-	nls_codepage = ses->local_nls;
-
 	/*
 	 * need to prevent multiple threads trying to simultaneously
 	 * reconnect the same SMB session
@@ -366,7 +363,7 @@ again:
 			}
 		}
 
-		rc = cifs_setup_session(0, ses, server, nls_codepage);
+		rc = cifs_setup_session(0, ses, server, ses->local_nls);
 		if ((rc == -EACCES) || (rc == -EKEYEXPIRED) || (rc == -EKEYREVOKED)) {
 			/*
 			 * Try alternate password for next reconnect (key rotation
@@ -400,7 +397,7 @@ skip_sess_setup:
 	if (tcon->use_persistent)
 		tcon->need_reopen_files = true;
 
-	rc = cifs_tree_connect(0, tcon, nls_codepage);
+	rc = cifs_tree_connect(0, tcon);
 
 	cifs_dbg(FYI, "reconnect tcon rc = %d\n", rc);
 	if (rc) {
