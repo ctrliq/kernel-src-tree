@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # SPDX-License-Identifier: GPL-2.0
 #
 # nft_concat_range.sh - Tests for sets with concatenation of ranged fields
@@ -7,10 +7,10 @@
 #
 # Author: Stefano Brivio <sbrivio@redhat.com>
 #
-# shellcheck disable=SC2154,SC2034,SC2016,SC2030,SC2031
+# shellcheck disable=SC2154,SC2034,SC2016,SC2030,SC2031,SC2317
 # ^ Configuration and templates sourced with eval, counters reused in subshells
 
-KSELFTEST_SKIP=4
+source lib.sh
 
 # Available test groups:
 # - reported_issues: check for issues that were reported in the past
@@ -19,7 +19,7 @@ KSELFTEST_SKIP=4
 # - timeout: check that packets match entries until they expire
 # - performance: estimate matching rate, compare with rbtree and hash baselines
 TESTS="reported_issues correctness concurrency timeout"
-[ "${quicktest}" != "1" ] && TESTS="${TESTS} performance"
+[ -n "$NFT_CONCAT_RANGE_TESTS" ] && TESTS="${NFT_CONCAT_RANGE_TESTS}"
 
 # Set types, defined by TYPE_ variables below
 TYPES="net_port port_net net6_port port_proto net6_port_mac net6_port_mac_proto
@@ -31,7 +31,7 @@ BUGS="flush_remove_add reload net_port_proto_match"
 
 # List of possible paths to pktgen script from kernel tree for performance tests
 PKTGEN_SCRIPT_PATHS="
-	../../../../samples/pktgen/pktgen_bench_xmit_mode_netif_receive.sh
+	../../../../../samples/pktgen/pktgen_bench_xmit_mode_netif_receive.sh
 	pktgen/pktgen_bench_xmit_mode_netif_receive.sh"
 
 # Definition of set types:
@@ -66,7 +66,7 @@ src
 start		1
 count		5
 src_delta	2000
-tools		sendip nc bash
+tools		sendip bash
 proto		udp
 
 race_repeat	3
@@ -91,7 +91,7 @@ src
 start		1
 count		5
 src_delta	2000
-tools		sendip nc bash
+tools		sendip socat bash
 proto		udp
 
 race_repeat	3
@@ -116,7 +116,7 @@ src
 start		10
 count		5
 src_delta	2000
-tools		sendip nc bash
+tools		sendip socat bash
 proto		udp6
 
 race_repeat	3
@@ -141,7 +141,7 @@ src
 start		1
 count		5
 src_delta	2000
-tools		sendip nc bash
+tools		sendip socat bash
 proto		udp
 
 race_repeat	0
@@ -163,7 +163,7 @@ src		mac
 start		10
 count		5
 src_delta	2000
-tools		sendip nc bash
+tools		sendip socat bash
 proto		udp6
 
 race_repeat	0
@@ -185,7 +185,7 @@ src		mac proto
 start		10
 count		5
 src_delta	2000
-tools		sendip nc bash
+tools		sendip socat bash
 proto		udp6
 
 race_repeat	0
@@ -207,7 +207,7 @@ src		addr4
 start		1
 count		5
 src_delta	2000
-tools		sendip nc bash
+tools		sendip socat bash
 proto		udp
 
 race_repeat	3
@@ -227,7 +227,7 @@ src		addr6 port
 start		10
 count		5
 src_delta	2000
-tools		sendip nc
+tools		sendip socat
 proto		udp6
 
 race_repeat	3
@@ -247,7 +247,7 @@ src		mac proto addr4
 start		1
 count		5
 src_delta	2000
-tools		sendip nc bash
+tools		sendip socat bash
 proto		udp
 
 race_repeat	0
@@ -264,7 +264,7 @@ src		mac
 start		1
 count		5
 src_delta	2000
-tools		sendip nc bash
+tools		sendip socat bash
 proto		udp
 
 race_repeat	0
@@ -286,7 +286,7 @@ src		mac addr4
 start		1
 count		5
 src_delta	2000
-tools		sendip nc bash
+tools		sendip socat bash
 proto		udp
 
 race_repeat	0
@@ -337,7 +337,7 @@ src		addr4
 start		1
 count		5
 src_delta	2000
-tools		sendip nc
+tools		sendip socat
 proto		udp
 
 race_repeat	3
@@ -363,7 +363,7 @@ src		mac
 start		1
 count		1
 src_delta	2000
-tools		sendip nc bash
+tools		sendip socat bash
 proto		udp
 
 race_repeat	0
@@ -489,8 +489,6 @@ setup_veth() {
 	B() {
 		ip netns exec B "$@" >/dev/null 2>&1
 	}
-
-	sleep 2
 }
 
 # Fill in set template and initialise set
@@ -504,12 +502,6 @@ check_tools() {
 
 	__tools=
 	for tool in ${tools}; do
-		if [ "${tool}" = "nc" ] && [ "${proto}" = "udp6" ] && \
-		   ! nc -u -w0 1.1.1.1 1 2>/dev/null; then
-			# Some GNU netcat builds might not support IPv6
-			__tools="${__tools} netcat-openbsd"
-			continue
-		fi
 		__tools="${__tools} ${tool}"
 
 		command -v "${tool}" >/dev/null && return 0
@@ -557,25 +549,20 @@ setup_send_udp() {
 			dst_port=
 			src_addr4=
 		}
-	elif command -v nc >/dev/null; then
-		if nc -u -w0 1.1.1.1 1 2>/dev/null; then
-			# OpenBSD netcat
-			nc_opt="-w0"
-		else
-			# GNU netcat
-			nc_opt="-q0"
-		fi
-
+	elif command -v socat -v >/dev/null; then
 		send_udp() {
 			if [ -n "${src_addr4}" ]; then
 				B ip addr add "${src_addr4}" dev veth_b
-				__src_addr4="-s ${src_addr4}"
+				__socatbind=",bind=${src_addr4}"
+				if [ -n "${src_port}" ];then
+					__socatbind="${__socatbind}:${src_port}"
+				fi
 			fi
-			ip addr add "${dst_addr4}" dev veth_a 2>/dev/null
-			[ -n "${src_port}" ] && src_port="-p ${src_port}"
 
-			echo "" | B nc -u "${nc_opt}" "${__src_addr4}" \
-				  "${src_port}" "${dst_addr4}" "${dst_port}"
+			ip addr add "${dst_addr4}" dev veth_a 2>/dev/null
+			[ -z "${dst_port}" ] && dst_port=12345
+
+			echo "test4" | B socat -t 0.01 STDIN UDP4-DATAGRAM:"$dst_addr4":"$dst_port""${__socatbind}"
 
 			src_addr4=
 			src_port=
@@ -622,24 +609,24 @@ setup_send_udp6() {
 			dst_port=
 			src_addr6=
 		}
-	elif command -v nc >/dev/null && nc -u -w0 1.1.1.1 1 2>/dev/null; then
-		# GNU netcat might not work with IPv6, try next tool
+	elif command -v socat -v >/dev/null; then
 		send_udp6() {
 			ip -6 addr add "${dst_addr6}" dev veth_a nodad \
 				2>/dev/null
+
+			__socatbind6=
+
 			if [ -n "${src_addr6}" ]; then
 				B ip addr add "${src_addr6}" dev veth_b nodad
-			else
-				src_addr6="2001:db8::2"
+
+				__socatbind6=",bind=[${src_addr6}]"
+
+				if [ -n "${src_port}" ] ;then
+					__socatbind6="${__socatbind6}:${src_port}"
+				fi
 			fi
-			[ -n "${src_port}" ] && src_port="-p ${src_port}"
 
-			# shellcheck disable=SC2086 # this needs split options
-			echo "" | B nc -u w0 "-s${src_addr6}" ${src_port} \
-					       ${dst_addr6} ${dst_port}
-
-			src_addr6=
-			src_port=
+			echo "test6" | B socat -t 0.01 STDIN UDP6-DATAGRAM:["$dst_addr6"]:"$dst_port""${__socatbind6}"
 		}
 	elif [ -z "$(bash -c 'type -p')" ]; then
 		send_udp6() {
@@ -654,10 +641,17 @@ setup_send_udp6() {
 	fi
 }
 
+listener_ready()
+{
+	port="$1"
+	ss -lnt -o "sport = :$port" | grep -q "$port"
+}
+
 # Set up function to send TCP traffic on IPv4
 setup_flood_tcp() {
 	if command -v iperf3 >/dev/null; then
 		flood_tcp() {
+			local n_port="${dst_port}"
 			[ -n "${dst_port}" ] && dst_port="-p ${dst_port}"
 			if [ -n "${src_addr4}" ]; then
 				B ip addr add "${src_addr4}/16" dev veth_b
@@ -674,7 +668,7 @@ setup_flood_tcp() {
 
 			# shellcheck disable=SC2086 # this needs split options
 			iperf3 -s -DB "${dst_addr4}" ${dst_port} >/dev/null 2>&1
-			sleep 2
+			busywait "$BUSYWAIT_TIMEOUT" listener_ready "$n_port"
 
 			# shellcheck disable=SC2086 # this needs split options
 			B iperf3 -c "${dst_addr4}" ${dst_port} ${src_port} \
@@ -686,6 +680,7 @@ setup_flood_tcp() {
 		}
 	elif command -v iperf >/dev/null; then
 		flood_tcp() {
+			local n_port="${dst_port}"
 			[ -n "${dst_port}" ] && dst_port="-p ${dst_port}"
 			if [ -n "${src_addr4}" ]; then
 				B ip addr add "${src_addr4}/16" dev veth_b
@@ -702,7 +697,7 @@ setup_flood_tcp() {
 
 			# shellcheck disable=SC2086 # this needs split options
 			iperf -s -DB "${dst_addr4}" ${dst_port} >/dev/null 2>&1
-			sleep 2
+			busywait "$BUSYWAIT_TIMEOUT" listener_ready "$n_port"
 
 			# shellcheck disable=SC2086 # this needs split options
 			B iperf -c "${dst_addr4}" ${dst_port} ${src_addr4} \
@@ -714,6 +709,7 @@ setup_flood_tcp() {
 		}
 	elif command -v netperf >/dev/null; then
 		flood_tcp() {
+			local n_port="${dst_port}"
 			[ -n "${dst_port}" ] && dst_port="-p ${dst_port}"
 			if [ -n "${src_addr4}" ]; then
 				B ip addr add "${src_addr4}/16" dev veth_b
@@ -730,7 +726,7 @@ setup_flood_tcp() {
 			# shellcheck disable=SC2086 # this needs split options
 			netserver -4 ${dst_port} -L "${dst_addr4}" \
 				>/dev/null 2>&1
-			sleep 2
+			busywait "$BUSYWAIT_TIMEOUT" listener_ready "${n_port}"
 
 			# shellcheck disable=SC2086 # this needs split options
 			B netperf -4 -H "${dst_addr4}" ${dst_port} \
@@ -749,6 +745,7 @@ setup_flood_tcp() {
 setup_flood_tcp6() {
 	if command -v iperf3 >/dev/null; then
 		flood_tcp6() {
+			local n_port="${dst_port}"
 			[ -n "${dst_port}" ] && dst_port="-p ${dst_port}"
 			if [ -n "${src_addr6}" ]; then
 				B ip addr add "${src_addr6}" dev veth_b nodad
@@ -765,7 +762,7 @@ setup_flood_tcp6() {
 
 			# shellcheck disable=SC2086 # this needs split options
 			iperf3 -s -DB "${dst_addr6}" ${dst_port} >/dev/null 2>&1
-			sleep 2
+			busywait "$BUSYWAIT_TIMEOUT" listener_ready "${n_port}"
 
 			# shellcheck disable=SC2086 # this needs split options
 			B iperf3 -c "${dst_addr6}" ${dst_port} \
@@ -777,6 +774,7 @@ setup_flood_tcp6() {
 		}
 	elif command -v iperf >/dev/null; then
 		flood_tcp6() {
+			local n_port="${dst_port}"
 			[ -n "${dst_port}" ] && dst_port="-p ${dst_port}"
 			if [ -n "${src_addr6}" ]; then
 				B ip addr add "${src_addr6}" dev veth_b nodad
@@ -793,7 +791,7 @@ setup_flood_tcp6() {
 
 			# shellcheck disable=SC2086 # this needs split options
 			iperf -s -VDB "${dst_addr6}" ${dst_port} >/dev/null 2>&1
-			sleep 2
+			busywait "$BUSYWAIT_TIMEOUT" listener_ready "$n_port"
 
 			# shellcheck disable=SC2086 # this needs split options
 			B iperf -c "${dst_addr6}" -V ${dst_port} \
@@ -805,6 +803,7 @@ setup_flood_tcp6() {
 		}
 	elif command -v netperf >/dev/null; then
 		flood_tcp6() {
+			local n_port="${dst_port}"
 			[ -n "${dst_port}" ] && dst_port="-p ${dst_port}"
 			if [ -n "${src_addr6}" ]; then
 				B ip addr add "${src_addr6}" dev veth_b nodad
@@ -821,7 +820,7 @@ setup_flood_tcp6() {
 			# shellcheck disable=SC2086 # this needs split options
 			netserver -6 ${dst_port} -L "${dst_addr6}" \
 				>/dev/null 2>&1
-			sleep 2
+			busywait "$BUSYWAIT_TIMEOUT" listener_ready "$n_port"
 
 			# shellcheck disable=SC2086 # this needs split options
 			B netperf -6 -H "${dst_addr6}" ${dst_port} \
@@ -840,6 +839,7 @@ setup_flood_tcp6() {
 setup_flood_udp() {
 	if command -v iperf3 >/dev/null; then
 		flood_udp() {
+			local n_port="${dst_port}"
 			[ -n "${dst_port}" ] && dst_port="-p ${dst_port}"
 			if [ -n "${src_addr4}" ]; then
 				B ip addr add "${src_addr4}/16" dev veth_b
@@ -856,7 +856,7 @@ setup_flood_udp() {
 
 			# shellcheck disable=SC2086 # this needs split options
 			iperf3 -s -DB "${dst_addr4}" ${dst_port}
-			sleep 2
+			busywait "$BUSYWAIT_TIMEOUT" listener_ready "$n_port"
 
 			# shellcheck disable=SC2086 # this needs split options
 			B iperf3 -u -c "${dst_addr4}" -Z -b 100M -l16 -t1000 \
@@ -868,6 +868,7 @@ setup_flood_udp() {
 		}
 	elif command -v iperf >/dev/null; then
 		flood_udp() {
+			local n_port="${dst_port}"
 			[ -n "${dst_port}" ] && dst_port="-p ${dst_port}"
 			if [ -n "${src_addr4}" ]; then
 				B ip addr add "${src_addr4}/16" dev veth_b
@@ -884,7 +885,7 @@ setup_flood_udp() {
 
 			# shellcheck disable=SC2086 # this needs split options
 			iperf -u -sDB "${dst_addr4}" ${dst_port} >/dev/null 2>&1
-			sleep 2
+			busywait "$BUSYWAIT_TIMEOUT" listener_ready "$n_port"
 
 			# shellcheck disable=SC2086 # this needs split options
 			B iperf -u -c "${dst_addr4}" -b 100M -l1 -t1000 \
@@ -896,6 +897,7 @@ setup_flood_udp() {
 		}
 	elif command -v netperf >/dev/null; then
 		flood_udp() {
+			local n_port="${dst_port}"
 			[ -n "${dst_port}" ] && dst_port="-p ${dst_port}"
 			if [ -n "${src_addr4}" ]; then
 				B ip addr add "${src_addr4}/16" dev veth_b
@@ -912,7 +914,7 @@ setup_flood_udp() {
 			# shellcheck disable=SC2086 # this needs split options
 			netserver -4 ${dst_port} -L "${dst_addr4}" \
 				>/dev/null 2>&1
-			sleep 2
+			busywait "$BUSYWAIT_TIMEOUT" listener_ready "$n_port"
 
 			# shellcheck disable=SC2086 # this needs split options
 			B netperf -4 -H "${dst_addr4}" ${dst_port} \
@@ -957,6 +959,7 @@ cleanup() {
 	ip link del dummy0			2>/dev/null
 	ip route del default			2>/dev/null
 	ip -6 route del default			2>/dev/null
+	ip netns pids B				2>/dev/null | xargs kill 2>/dev/null
 	ip netns del B				2>/dev/null
 	ip link del veth_a			2>/dev/null
 	timeout=
@@ -964,15 +967,18 @@ cleanup() {
 	killall iperf				2>/dev/null
 	killall netperf				2>/dev/null
 	killall netserver			2>/dev/null
-	rm -f ${tmp}
-	sleep 2
+}
+
+cleanup_exit() {
+	cleanup
+	rm -f "$tmp"
 }
 
 # Entry point for setup functions
 setup() {
 	if [ "$(id -u)" -ne 0 ]; then
 		echo "  need to run as root"
-		exit ${KSELFTEST_SKIP}
+		exit ${ksft_skip}
 	fi
 
 	cleanup
@@ -1233,7 +1239,7 @@ send_nomatch() {
 # - check that packets outside range don't match it
 # - remove some elements, check that packets don't match anymore
 test_correctness() {
-	setup veth send_"${proto}" set || return ${KSELFTEST_SKIP}
+	setup veth send_"${proto}" set || return ${ksft_skip}
 
 	range_size=1
 	for i in $(seq "${start}" $((start + count))); do
@@ -1248,7 +1254,7 @@ test_correctness() {
 		srcend=$((end + src_delta))
 
 		add "$(format)" || return 1
-		for j in $(seq ${start} $((range_size / 2 + 1)) ${end}); do
+		for j in $(seq "$start" $((range_size / 2 + 1)) ${end}); do
 			send_match "${j}" $((j + src_delta)) || return 1
 		done
 		send_nomatch $((end + 1)) $((end + 1 + src_delta)) || return 1
@@ -1256,7 +1262,7 @@ test_correctness() {
 		# Delete elements now and then
 		if [ $((i % 3)) -eq 0 ]; then
 			del "$(format)" || return 1
-			for j in $(seq ${start} \
+			for j in $(seq "$start" \
 				   $((range_size / 2 + 1)) ${end}); do
 				send_nomatch "${j}" $((j + src_delta)) \
 					|| return 1
@@ -1282,12 +1288,12 @@ test_concurrency() {
 	proto=${flood_proto}
 	tools=${flood_tools}
 	chain_spec=${flood_spec}
-	setup veth flood_"${proto}" set || return ${KSELFTEST_SKIP}
+	setup veth flood_"${proto}" set || return ${ksft_skip}
 
 	range_size=1
 	cstart=${start}
 	flood_pids=
-	for i in $(seq ${start} $((start + count))); do
+	for i in $(seq "$start" $((start + count))); do
 		end=$((start + range_size))
 		srcstart=$((start + src_delta))
 		srcend=$((end + src_delta))
@@ -1300,7 +1306,7 @@ test_concurrency() {
 		start=$((end + range_size))
 	done
 
-	sleep 10
+	sleep $((RANDOM%10))
 
 	pids=
 	for c in $(seq 1 "$(nproc)"); do (
@@ -1310,7 +1316,7 @@ test_concurrency() {
 			# $start needs to be local to this subshell
 			# shellcheck disable=SC2030
 			start=${cstart}
-			for i in $(seq ${start} $((start + count))); do
+			for i in $(seq "$start" $((start + count))); do
 				end=$((start + range_size))
 				srcstart=$((start + src_delta))
 				srcend=$((end + src_delta))
@@ -1325,7 +1331,7 @@ test_concurrency() {
 
 			range_size=1
 			start=${cstart}
-			for i in $(seq ${start} $((start + count))); do
+			for i in $(seq "$start" $((start + count))); do
 				end=$((start + range_size))
 				srcstart=$((start + src_delta))
 				srcend=$((end + src_delta))
@@ -1341,7 +1347,7 @@ test_concurrency() {
 
 			range_size=1
 			start=${cstart}
-			for i in $(seq ${start} $((start + count))); do
+			for i in $(seq "$start" $((start + count))); do
 				end=$((start + range_size))
 				srcstart=$((start + src_delta))
 				srcend=$((end + src_delta))
@@ -1354,7 +1360,7 @@ test_concurrency() {
 
 			range_size=1
 			start=${cstart}
-			for i in $(seq ${start} $((start + count))); do
+			for i in $(seq "$start" $((start + count))); do
 				end=$((start + range_size))
 				srcstart=$((start + src_delta))
 				srcend=$((end + src_delta))
@@ -1382,31 +1388,34 @@ test_concurrency() {
 # - add all the elements with 3s timeout while checking that packets match
 # - wait 3s after the last insertion, check that packets don't match any entry
 test_timeout() {
-	setup veth send_"${proto}" set || return ${KSELFTEST_SKIP}
+	setup veth send_"${proto}" set || return ${ksft_skip}
 
 	timeout=3
+
+	[ "$KSFT_MACHINE_SLOW" = "yes" ] && timeout=8
+
 	range_size=1
-	for i in $(seq "${start}" $((start + count))); do
+	for i in $(seq "$start" $((start + count))); do
 		end=$((start + range_size))
 		srcstart=$((start + src_delta))
 		srcend=$((end + src_delta))
 
 		add "$(format)" || return 1
 
-		for j in $(seq ${start} $((range_size / 2 + 1)) ${end}); do
+		for j in $(seq "$start" $((range_size / 2 + 1)) ${end}); do
 			send_match "${j}" $((j + src_delta)) || return 1
 		done
 
 		range_size=$((range_size + 1))
 		start=$((end + range_size))
 	done
-	sleep 3
-	for i in $(seq ${start} $((start + count))); do
+	sleep $timeout
+	for i in $(seq "$start" $((start + count))); do
 		end=$((start + range_size))
 		srcstart=$((start + src_delta))
 		srcend=$((end + src_delta))
 
-		for j in $(seq ${start} $((range_size / 2 + 1)) ${end}); do
+		for j in $(seq "$start" $((range_size / 2 + 1)) ${end}); do
 			send_nomatch "${j}" $((j + src_delta)) || return 1
 		done
 
@@ -1425,13 +1434,13 @@ test_performance() {
 	chain_spec=${perf_spec}
 	dst="${perf_dst}"
 	src="${perf_src}"
-	setup veth perf set || return ${KSELFTEST_SKIP}
+	setup veth perf set || return ${ksft_skip}
 
 	first=${start}
 	range_size=1
 	for set in test norange noconcat; do
 		start=${first}
-		for i in $(seq ${start} $((start + perf_entries))); do
+		for i in $(seq "$start" $((start + perf_entries))); do
 			end=$((start + range_size))
 			srcstart=$((start + src_delta))
 			srcend=$((end + src_delta))
@@ -1439,7 +1448,7 @@ test_performance() {
 			if [ $((end / 65534)) -gt $((start / 65534)) ]; then
 				start=${end}
 				end=$((end + 1))
-			elif [ ${start} -eq ${end} ]; then
+			elif [ "$start" -eq "$end" ]; then
 				end=$((start + 1))
 			fi
 
@@ -1450,7 +1459,7 @@ test_performance() {
 		nft -f "${tmp}"
 	done
 
-	perf $((end - 1)) ${srcstart}
+	perf $((end - 1)) "$srcstart"
 
 	sleep 2
 
@@ -1494,14 +1503,17 @@ test_performance() {
 }
 
 test_bug_flush_remove_add() {
+	rounds=100
+	[ "$KSFT_MACHINE_SLOW" = "yes" ] && rounds=10
+
 	set_cmd='{ set s { type ipv4_addr . inet_service; flags interval; }; }'
 	elem1='{ 10.0.0.1 . 22-25, 10.0.0.1 . 10-20 }'
 	elem2='{ 10.0.0.1 . 10-20, 10.0.0.1 . 22-25 }'
-	for i in `seq 1 100`; do
-		nft add table t ${set_cmd}	|| return ${KSELFTEST_SKIP}
-		nft add element t s ${elem1}	2>/dev/null || return 1
+	for i in $(seq 1 $rounds); do
+		nft add table t "$set_cmd"	|| return ${ksft_skip}
+		nft add element t s "$elem1"	2>/dev/null || return 1
 		nft flush set t s		2>/dev/null || return 1
-		nft add element t s ${elem2}	2>/dev/null || return 1
+		nft add element t s "$elem2"	2>/dev/null || return 1
 	done
 	nft flush ruleset
 }
@@ -1509,7 +1521,7 @@ test_bug_flush_remove_add() {
 # - add ranged element, check that packets match it
 # - reload the set, check packets still match
 test_bug_reload() {
-	setup veth send_"${proto}" set || return ${KSELFTEST_SKIP}
+	setup veth send_"${proto}" set || return ${ksft_skip}
 	rstart=${start}
 
 	range_size=1
@@ -1548,7 +1560,7 @@ test_bug_reload() {
 		srcstart=$((start + src_delta))
 		srcend=$((end + src_delta))
 
-		for j in $(seq ${start} $((range_size / 2 + 1)) ${end}); do
+		for j in $(seq "$start" $((range_size / 2 + 1)) ${end}); do
 			send_match "${j}" $((j + src_delta)) || return 1
 		done
 
@@ -1624,12 +1636,12 @@ test_reported_issues() {
 # Run everything in a separate network namespace
 [ "${1}" != "run" ] && { unshare -n "${0}" run; exit $?; }
 tmp="$(mktemp)"
-trap cleanup EXIT
+trap cleanup_exit EXIT
 
 # Entry point for test runs
 passed=0
 for name in ${TESTS}; do
-	printf "TEST: %s\n" "$(echo ${name} | tr '_' ' ')"
+	printf "TEST: %s\n" "$(echo "$name" | tr '_' ' ')"
 	if [ "${name}" = "reported_issues" ]; then
 		SUBTESTS="${BUGS}"
 	else
@@ -1656,9 +1668,15 @@ for name in ${TESTS}; do
 			continue
 		fi
 
-		printf "  %-60s  " "${display}"
+		[ "$KSFT_MACHINE_SLOW" = "yes" ] && count=1
+
+		printf "  %-32s  " "${display}"
+		tthen=$(date +%s)
 		eval test_"${name}"
 		ret=$?
+
+		tnow=$(date +%s)
+		printf "%5ds%-30s" $((tnow-tthen))
 
 		if [ $ret -eq 0 ]; then
 			printf "[ OK ]\n"
@@ -1668,11 +1686,11 @@ for name in ${TESTS}; do
 			printf "[FAIL]\n"
 			err_flush
 			exit 1
-		elif [ $ret -eq ${KSELFTEST_SKIP} ]; then
+		elif [ $ret -eq ${ksft_skip} ]; then
 			printf "[SKIP]\n"
 			err_flush
 		fi
 	done
 done
 
-[ ${passed} -eq 0 ] && exit ${KSELFTEST_SKIP} || exit 0
+[ ${passed} -eq 0 ] && exit ${ksft_skip} || exit 0
