@@ -1289,6 +1289,9 @@ struct memory_failure_stats {
 	unsigned long failed;
 	unsigned long delayed;
 	unsigned long recovered;
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
 };
 #endif
 
