@@ -1251,7 +1251,7 @@ struct task_struct {
 	struct io_context		*io_context;
 
 #ifdef CONFIG_COMPACTION
-	struct capture_control		*capture_control;
+	RH_KABI_EXCLUDE(struct capture_control *capture_control)
 #endif
 	/* Ptrace state: */
 	unsigned long			ptrace_message;
