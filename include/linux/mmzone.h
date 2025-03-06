@@ -1259,6 +1259,8 @@ struct deferred_split {
 	spinlock_t split_queue_lock;
 	struct list_head split_queue;
 	unsigned long split_queue_len;
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
 };
 #endif
 
