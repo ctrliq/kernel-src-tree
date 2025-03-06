@@ -2413,6 +2413,7 @@ struct follow_pfnmap_args {
 	pgprot_t pgprot;
 	bool writable;
 	bool special;
+	RH_KABI_RESERVE(1)
 };
 int follow_pfnmap_start(struct follow_pfnmap_args *args);
 void follow_pfnmap_end(struct follow_pfnmap_args *args);
