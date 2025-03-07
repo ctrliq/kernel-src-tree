@@ -1010,6 +1010,11 @@ struct zone {
 	/* Zone statistics */
 	atomic_long_t		vm_stat[NR_VM_ZONE_STAT_ITEMS];
 	atomic_long_t		vm_numa_event[NR_VM_NUMA_EVENT_ITEMS];
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
 } ____cacheline_internodealigned_in_smp;
 
 enum pgdat_flags {
@@ -1265,6 +1270,9 @@ struct zoneref {
  */
 struct zonelist {
 	struct zoneref _zonerefs[MAX_ZONES_PER_ZONELIST + 1];
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
 };
 
 /*
