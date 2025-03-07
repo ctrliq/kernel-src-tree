@@ -648,6 +648,11 @@ struct lruvec {
 	struct pglist_data *pgdat;
 #endif
 	struct zswap_lruvec_state zswap_lruvec_state;
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
 };
 
 /* Isolate for asynchronous migration */
