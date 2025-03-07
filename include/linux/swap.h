@@ -256,6 +256,8 @@ struct swap_cluster_info {
 	u8 flags;
 	u8 order;
 	struct list_head list;
+	
+	RH_KABI_RESERVE(1)
 };
 #define CLUSTER_FLAG_FREE 1 /* This cluster is free */
 #define CLUSTER_FLAG_NONFULL 2 /* This cluster is on nonfull list */
