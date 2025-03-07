@@ -1031,7 +1031,10 @@ struct mm_struct {
 		} lru_gen;
 #endif /* CONFIG_LRU_GEN_WALKS_MMU */
 	} __randomize_layout;
-
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
 	/*
 	 * The mm_cpumask needs to be at the end of mm_struct, because it
 	 * is dynamically sized based on nr_cpu_ids.
