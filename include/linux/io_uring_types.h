@@ -108,6 +108,11 @@ struct io_uring_task {
 	} ____cacheline_aligned_in_smp;
 };
 
+struct iou_vec {
+	struct iovec		*iovec;
+	unsigned		nr;
+};
+
 struct io_uring {
 	u32 head;
 	u32 tail;
