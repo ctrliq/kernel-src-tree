@@ -1073,6 +1073,7 @@ struct wait_page_queue {
 	struct folio *folio;
 	int bit_nr;
 	wait_queue_entry_t wait;
+	RH_KABI_RESERVE(1)
 };
 
 static inline bool wake_page_match(struct wait_page_queue *wait_page,
