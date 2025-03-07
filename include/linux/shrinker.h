@@ -53,6 +53,10 @@ struct shrink_control {
 
 	/* current memcg being shrunk (for memcg aware shrinkers) */
 	RH_KABI_EXCLUDE(struct mem_cgroup *memcg)
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
 };
 
 #define SHRINK_STOP (~0UL)
