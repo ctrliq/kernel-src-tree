@@ -699,6 +699,10 @@ struct per_cpu_pages {
 
 	/* Lists of pages, one per migrate type stored on the pcp-lists */
 	struct list_head lists[NR_PCP_LISTS];
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
 } ____cacheline_aligned_in_smp;
 
 struct per_cpu_zonestat {
@@ -719,6 +723,8 @@ struct per_cpu_zonestat {
 struct per_cpu_nodestat {
 	s8 stat_threshold;
 	s8 vm_node_stat_diff[NR_VM_NODE_STAT_ITEMS];
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
 };
 
 #endif /* !__GENERATING_BOUNDS.H */
