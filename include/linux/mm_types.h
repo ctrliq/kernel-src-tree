@@ -555,6 +555,7 @@ struct page_frag_cache {
 	 */
 	unsigned int		pagecnt_bias;
 	bool pfmemalloc;
+	RH_KABI_RESERVE(1)
 };
 
 typedef unsigned long vm_flags_t;
