@@ -477,6 +477,10 @@ static void __init ordered_lsm_init(void)
 int __init early_security_init(void)
 {
 	struct lsm_info *lsm;
+	static bool early_security_initialized;
+
+	if (early_security_initialized)
+		return 0;
 
 	for (lsm = __start_early_lsm_info; lsm < __end_early_lsm_info; lsm++) {
 		if (!lsm->enabled)
@@ -485,6 +489,7 @@ int __init early_security_init(void)
 		initialize_lsm(lsm);
 	}
 
+	early_security_initialized = true;
 	return 0;
 }
 
