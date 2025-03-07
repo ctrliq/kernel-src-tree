@@ -516,6 +516,41 @@ const struct io_issue_def io_issue_defs[] = {
 		.prep			= io_eopnotsupp_prep,
 #endif
 	},
+	[IORING_OP_RECV_ZC] = {
+		.prep			= io_eopnotsupp_prep,
+	},
+	[IORING_OP_EPOLL_WAIT] = {
+		.prep			= io_eopnotsupp_prep,
+	},
+	[IORING_OP_READV_FIXED] = {
+		.needs_file		= 1,
+		.unbound_nonreg_file	= 1,
+		.pollin			= 1,
+		.plug			= 1,
+		.audit_skip		= 1,
+		.ioprio			= 1,
+		.iopoll			= 1,
+		.iopoll_queue		= 1,
+		.vectored		= 1,
+		.async_size		= sizeof(struct io_async_rw),
+		.prep			= io_prep_readv_fixed,
+		.issue			= io_read,
+	},
+	[IORING_OP_WRITEV_FIXED] = {
+		.needs_file		= 1,
+		.hash_reg_file		= 1,
+		.unbound_nonreg_file	= 1,
+		.pollout		= 1,
+		.plug			= 1,
+		.audit_skip		= 1,
+		.ioprio			= 1,
+		.iopoll			= 1,
+		.iopoll_queue		= 1,
+		.vectored		= 1,
+		.async_size		= sizeof(struct io_async_rw),
+		.prep			= io_prep_writev_fixed,
+		.issue			= io_write,
+	},
 };
 
 const struct io_cold_def io_cold_defs[] = {
@@ -744,6 +779,22 @@ const struct io_cold_def io_cold_defs[] = {
 	},
 	[IORING_OP_LISTEN] = {
 		.name			= "LISTEN",
+	},
+	[IORING_OP_RECV_ZC] = {
+		.name			= "RECV_ZC_unsupported",
+	},
+	[IORING_OP_EPOLL_WAIT] = {
+		.name			= "EPOLL_WAIT_unsupported",
+	},
+	[IORING_OP_READV_FIXED] = {
+		.name			= "READV_FIXED",
+		.cleanup		= io_readv_writev_cleanup,
+		.fail			= io_rw_fail,
+	},
+	[IORING_OP_WRITEV_FIXED] = {
+		.name			= "WRITEV_FIXED",
+		.cleanup		= io_readv_writev_cleanup,
+		.fail			= io_rw_fail,
 	},
 };
 
