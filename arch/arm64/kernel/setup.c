@@ -32,6 +32,7 @@
 #include <linux/sched/task.h>
 #include <linux/scs.h>
 #include <linux/mm.h>
+#include <linux/security.h>
 
 #include <asm/acpi.h>
 #include <asm/fixmap.h>
@@ -294,6 +295,10 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 	 */
 	jump_label_init();
 	parse_early_param();
+
+	/* Initialize the lockdown LSM */
+	static_call_init();
+	early_security_init();
 
 	dynamic_scs_init();
 
