@@ -176,6 +176,9 @@ static void blk_validate_atomic_write_limits(struct queue_limits *lim)
 {
 	unsigned int boundary_sectors;
 
+	if (!(lim->features & BLK_FEAT_ATOMIC_WRITES))
+		goto unsupported;
+
 	if (!lim->atomic_write_hw_max)
 		goto unsupported;
 
@@ -589,7 +592,7 @@ static bool blk_stack_atomic_writes_head(struct queue_limits *t,
 static void blk_stack_atomic_writes_limits(struct queue_limits *t,
 				struct queue_limits *b, sector_t start)
 {
-	if (!(t->features & BLK_FEAT_ATOMIC_WRITES_STACKED))
+	if (!(b->features & BLK_FEAT_ATOMIC_WRITES))
 		goto unsupported;
 
 	if (!b->atomic_write_unit_min)
@@ -617,7 +620,6 @@ unsupported:
 	t->atomic_write_hw_unit_max = 0;
 	t->atomic_write_hw_unit_min = 0;
 	t->atomic_write_hw_boundary = 0;
-	t->features &= ~BLK_FEAT_ATOMIC_WRITES_STACKED;
 }
 
 /**
