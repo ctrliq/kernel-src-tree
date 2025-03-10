@@ -1278,7 +1278,6 @@ static void acpi_battery_remove(struct acpi_device *device)
 	sysfs_remove_battery(battery);
 }
 
-#ifdef CONFIG_PM_SLEEP
 /* this is needed to learn about changes made in suspended state */
 static int acpi_battery_resume(struct device *dev)
 {
@@ -1295,11 +1294,8 @@ static int acpi_battery_resume(struct device *dev)
 	acpi_battery_update(battery, true);
 	return 0;
 }
-#else
-#define acpi_battery_resume NULL
-#endif
 
-static SIMPLE_DEV_PM_OPS(acpi_battery_pm, NULL, acpi_battery_resume);
+static DEFINE_SIMPLE_DEV_PM_OPS(acpi_battery_pm, NULL, acpi_battery_resume);
 
 static struct acpi_driver acpi_battery_driver = {
 	.name = "battery",
@@ -1309,7 +1305,7 @@ static struct acpi_driver acpi_battery_driver = {
 		.add = acpi_battery_add,
 		.remove = acpi_battery_remove,
 		},
-	.drv.pm = &acpi_battery_pm,
+	.drv.pm = pm_sleep_ptr(&acpi_battery_pm),
 	.drv.probe_type = PROBE_PREFER_ASYNCHRONOUS,
 };
 
