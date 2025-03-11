@@ -1,0 +1,167 @@
+ip6mr: fix tables suspicious RCU usage
+
+jira LE-2522
+Rebuild_History Non-Buildable kernel-5.14.0-503.29.1.el9_5
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit f1553c9894b4dbeb10a2ab15ab1aa113b3b4047c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-503.29.1.el9_5/f1553c98.failed
+
+Several places call ip6mr_get_table() with no RCU nor RTNL lock.
+Add RCU protection inside such helper and provide a lockless variant
+for the few callers that already acquired the relevant lock.
+
+Note that some users additionally reference the table outside the RCU
+lock. That is actually safe as the table deletion can happen only
+after all table accesses are completed.
+
+Fixes: e2d57766e674 ("net: Provide compat support for SIOCGETMIFCNT_IN6 and SIOCGETSGCNT_IN6.")
+Fixes: d7c31cbde4bc ("net: ip6mr: add RTM_GETROUTE netlink op")
+	Reviewed-by: David Ahern <dsahern@kernel.org>
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+(cherry picked from commit f1553c9894b4dbeb10a2ab15ab1aa113b3b4047c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/ip6mr.c
+diff --cc net/ipv6/ip6mr.c
+index d690d9627206,4147890fe98f..000000000000
+--- a/net/ipv6/ip6mr.c
++++ b/net/ipv6/ip6mr.c
+@@@ -429,7 -446,6 +444,10 @@@ static void *ip6mr_vif_seq_start(struc
+  
+  	iter->mrt = mrt;
+  
+++<<<<<<< HEAD
+ +	read_lock(&mrt_lock);
+++=======
+++>>>>>>> f1553c9894b4 (ip6mr: fix tables suspicious RCU usage)
+  	return mr_vif_seq_start(seq, pos);
+  }
+  
+@@@ -2275,13 -2304,15 +2293,23 @@@ int ip6mr_get_route(struct net *net, st
+  	int err;
+  	struct mr_table *mrt;
+  	struct mfc6_cache *cache;
+ -	struct rt6_info *rt = dst_rt6_info(skb_dst(skb));
+ +	struct rt6_info *rt = (struct rt6_info *)skb_dst(skb);
+  
+++<<<<<<< HEAD
+ +	mrt = ip6mr_get_table(net, RT6_TABLE_DFLT);
+ +	if (!mrt)
+ +		return -ENOENT;
+ +
+ +	read_lock(&mrt_lock);
+++=======
++ 	rcu_read_lock();
++ 	mrt = __ip6mr_get_table(net, RT6_TABLE_DFLT);
++ 	if (!mrt) {
++ 		rcu_read_unlock();
++ 		return -ENOENT;
++ 	}
++ 
+++>>>>>>> f1553c9894b4 (ip6mr: fix tables suspicious RCU usage)
+  	cache = ip6mr_cache_find(mrt, &rt->rt6i_src.addr, &rt->rt6i_dst.addr);
+  	if (!cache && skb->dev) {
+  		int vif = ip6mr_find_vif(mrt, skb->dev);
+@@@ -2502,6 -2532,95 +2530,98 @@@ errout
+  	rtnl_set_sk_err(net, RTNLGRP_IPV6_MROUTE_R, -ENOBUFS);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static const struct nla_policy ip6mr_getroute_policy[RTA_MAX + 1] = {
++ 	[RTA_SRC]		= NLA_POLICY_EXACT_LEN(sizeof(struct in6_addr)),
++ 	[RTA_DST]		= NLA_POLICY_EXACT_LEN(sizeof(struct in6_addr)),
++ 	[RTA_TABLE]		= { .type = NLA_U32 },
++ };
++ 
++ static int ip6mr_rtm_valid_getroute_req(struct sk_buff *skb,
++ 					const struct nlmsghdr *nlh,
++ 					struct nlattr **tb,
++ 					struct netlink_ext_ack *extack)
++ {
++ 	struct rtmsg *rtm;
++ 	int err;
++ 
++ 	err = nlmsg_parse(nlh, sizeof(*rtm), tb, RTA_MAX, ip6mr_getroute_policy,
++ 			  extack);
++ 	if (err)
++ 		return err;
++ 
++ 	rtm = nlmsg_data(nlh);
++ 	if ((rtm->rtm_src_len && rtm->rtm_src_len != 128) ||
++ 	    (rtm->rtm_dst_len && rtm->rtm_dst_len != 128) ||
++ 	    rtm->rtm_tos || rtm->rtm_table || rtm->rtm_protocol ||
++ 	    rtm->rtm_scope || rtm->rtm_type || rtm->rtm_flags) {
++ 		NL_SET_ERR_MSG_MOD(extack,
++ 				   "Invalid values in header for multicast route get request");
++ 		return -EINVAL;
++ 	}
++ 
++ 	if ((tb[RTA_SRC] && !rtm->rtm_src_len) ||
++ 	    (tb[RTA_DST] && !rtm->rtm_dst_len)) {
++ 		NL_SET_ERR_MSG_MOD(extack, "rtm_src_len and rtm_dst_len must be 128 for IPv6");
++ 		return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int ip6mr_rtm_getroute(struct sk_buff *in_skb, struct nlmsghdr *nlh,
++ 			      struct netlink_ext_ack *extack)
++ {
++ 	struct net *net = sock_net(in_skb->sk);
++ 	struct in6_addr src = {}, grp = {};
++ 	struct nlattr *tb[RTA_MAX + 1];
++ 	struct mfc6_cache *cache;
++ 	struct mr_table *mrt;
++ 	struct sk_buff *skb;
++ 	u32 tableid;
++ 	int err;
++ 
++ 	err = ip6mr_rtm_valid_getroute_req(in_skb, nlh, tb, extack);
++ 	if (err < 0)
++ 		return err;
++ 
++ 	if (tb[RTA_SRC])
++ 		src = nla_get_in6_addr(tb[RTA_SRC]);
++ 	if (tb[RTA_DST])
++ 		grp = nla_get_in6_addr(tb[RTA_DST]);
++ 	tableid = nla_get_u32_default(tb[RTA_TABLE], 0);
++ 
++ 	mrt = __ip6mr_get_table(net, tableid ?: RT_TABLE_DEFAULT);
++ 	if (!mrt) {
++ 		NL_SET_ERR_MSG_MOD(extack, "MR table does not exist");
++ 		return -ENOENT;
++ 	}
++ 
++ 	/* entries are added/deleted only under RTNL */
++ 	rcu_read_lock();
++ 	cache = ip6mr_cache_find(mrt, &src, &grp);
++ 	rcu_read_unlock();
++ 	if (!cache) {
++ 		NL_SET_ERR_MSG_MOD(extack, "MR cache entry not found");
++ 		return -ENOENT;
++ 	}
++ 
++ 	skb = nlmsg_new(mr6_msgsize(false, mrt->maxvif), GFP_KERNEL);
++ 	if (!skb)
++ 		return -ENOBUFS;
++ 
++ 	err = ip6mr_fill_mroute(mrt, skb, NETLINK_CB(in_skb).portid,
++ 				nlh->nlmsg_seq, cache, RTM_NEWROUTE, 0);
++ 	if (err < 0) {
++ 		kfree_skb(skb);
++ 		return err;
++ 	}
++ 
++ 	return rtnl_unicast(skb, net, NETLINK_CB(in_skb).portid);
++ }
++ 
+++>>>>>>> f1553c9894b4 (ip6mr: fix tables suspicious RCU usage)
+  static int ip6mr_rtm_dumproute(struct sk_buff *skb, struct netlink_callback *cb)
+  {
+  	const struct nlmsghdr *nlh = cb->nlh;
+* Unmerged path net/ipv6/ip6mr.c
