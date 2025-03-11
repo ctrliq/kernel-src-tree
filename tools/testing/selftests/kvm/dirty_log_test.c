@@ -100,6 +100,7 @@ static void guest_code(void)
 	uint64_t addr;
 	int i;
 
+#ifdef __s390x__
 	/*
 	 * On s390x, all pages of a 1M segment are initially marked as dirty
 	 * when a page of the segment is written to for the very first time.
@@ -110,6 +111,7 @@ static void guest_code(void)
 		addr = guest_test_virt_mem + i * guest_page_size;
 		vcpu_arch_put_guest(*(uint64_t *)addr, READ_ONCE(iteration));
 	}
+#endif
 
 	while (true) {
 		for (i = 0; i < TEST_PAGES_PER_LOOP; i++) {
