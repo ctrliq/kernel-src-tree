@@ -6,6 +6,7 @@
 #include <linux/types.h>
 #include <linux/refcount.h>
 #include <linux/completion.h>
+#include <linux/rh_kabi.h>
 
 #define SHRINKER_UNIT_BITS	BITS_PER_LONG
 
