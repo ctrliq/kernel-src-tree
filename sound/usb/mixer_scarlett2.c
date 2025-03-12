@@ -5377,6 +5377,8 @@ static int scarlett2_compressor_ctl_put(
 	int index = elem->control;
 	int channel = index / SCARLETT2_COMPRESSOR_PARAM_COUNT;
 	int param_index = index % SCARLETT2_COMPRESSOR_PARAM_COUNT;
+	const struct compressor_param *param = &compressor_params[param_index];
+
 	int oval, val, err;
 	s32 scaled_val;
 
@@ -5397,8 +5399,6 @@ static int scarlett2_compressor_ctl_put(
 		goto unlock;
 
 	private->compressor_values[index] = val;
-
-	const struct compressor_param *param = &compressor_params[param_index];
 
 	scaled_val = val << param->scale_bits;
 
