@@ -66,10 +66,9 @@ static int linear_set_limits(struct mddev *mddev)
 
 	md_init_stacking_limits(&lim);
 	err = mddev_stack_rdev_limits(mddev, &lim, MDDEV_STACK_INTEGRITY);
-	if (err) {
-		queue_limits_cancel_update(mddev->gendisk->queue);
+	if (err)
 		return err;
-	}
+
 	return queue_limits_set(mddev->gendisk->queue, &lim);
 }
 
@@ -189,10 +188,9 @@ static int linear_add(struct mddev *mddev, struct md_rdev *rdev)
 	rdev->raid_disk = rdev->saved_raid_disk;
 	rdev->saved_raid_disk = -1;
 
-	newconf = linear_conf(mddev,mddev->raid_disks+1);
-
-	if (!newconf)
-		return -ENOMEM;
+	newconf = linear_conf(mddev, mddev->raid_disks + 1);
+	if (IS_ERR(newconf))
+		return PTR_ERR(newconf);
 
 	/* newconf->raid_disks already keeps a copy of * the increased
 	 * value of mddev->raid_disks, WARN_ONCE() is just used to make

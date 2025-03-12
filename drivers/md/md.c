@@ -547,6 +547,26 @@ static int mddev_set_closing_and_sync_blockdev(struct mddev *mddev, int opener_n
 	return 0;
 }
 
+/*
+ * The only difference from bio_chain_endio() is that the current
+ * bi_status of bio does not affect the bi_status of parent.
+ */
+static void md_end_flush(struct bio *bio)
+{
+	struct bio *parent = bio->bi_private;
+
+	/*
+	 * If any flush io error before the power failure,
+	 * disk data may be lost.
+	 */
+	if (bio->bi_status)
+		pr_err("md: %pg flush io error %d\n", bio->bi_bdev,
+			blk_status_to_errno(bio->bi_status));
+
+	bio_put(bio);
+	bio_endio(parent);
+}
+
 bool md_flush_request(struct mddev *mddev, struct bio *bio)
 {
 	struct md_rdev *rdev;
@@ -566,7 +586,9 @@ bool md_flush_request(struct mddev *mddev, struct bio *bio)
 		new = bio_alloc_bioset(rdev->bdev, 0,
 				       REQ_OP_WRITE | REQ_PREFLUSH, GFP_NOIO,
 				       &mddev->bio_set);
-		bio_chain(new, bio);
+		new->bi_private = bio;
+		new->bi_end_io = md_end_flush;
+		bio_inc_remaining(bio);
 		submit_bio(new);
 	}
 
@@ -8380,6 +8402,10 @@ static int md_seq_show(struct seq_file *seq, void *v)
 		return 0;
 
 	spin_unlock(&all_mddevs_lock);
+
+	/* prevent bitmap to be freed after checking */
+	mutex_lock(&mddev->bitmap_info.mutex);
+
 	spin_lock(&mddev->lock);
 	if (mddev->pers || mddev->raid_disks || !list_empty(&mddev->disks)) {
 		seq_printf(seq, "%s : ", mdname(mddev));
@@ -8455,6 +8481,7 @@ static int md_seq_show(struct seq_file *seq, void *v)
 		seq_printf(seq, "\n");
 	}
 	spin_unlock(&mddev->lock);
+	mutex_unlock(&mddev->bitmap_info.mutex);
 	spin_lock(&all_mddevs_lock);
 
 	if (mddev == list_last_entry(&all_mddevs, struct mddev, all_mddevs))
@@ -8749,11 +8776,31 @@ void md_submit_discard_bio(struct mddev *mddev, struct md_rdev *rdev,
 }
 EXPORT_SYMBOL_GPL(md_submit_discard_bio);
 
+static void md_bitmap_start(struct mddev *mddev,
+			    struct md_io_clone *md_io_clone)
+{
+	if (mddev->pers->bitmap_sector)
+		mddev->pers->bitmap_sector(mddev, &md_io_clone->offset,
+					   &md_io_clone->sectors);
+
+	mddev->bitmap_ops->startwrite(mddev, md_io_clone->offset,
+				      md_io_clone->sectors);
+}
+
+static void md_bitmap_end(struct mddev *mddev, struct md_io_clone *md_io_clone)
+{
+	mddev->bitmap_ops->endwrite(mddev, md_io_clone->offset,
+				    md_io_clone->sectors);
+}
+
 static void md_end_clone_io(struct bio *bio)
 {
 	struct md_io_clone *md_io_clone = bio->bi_private;
 	struct bio *orig_bio = md_io_clone->orig_bio;
 	struct mddev *mddev = md_io_clone->mddev;
+
+	if (bio_data_dir(orig_bio) == WRITE && mddev->bitmap)
+		md_bitmap_end(mddev, md_io_clone);
 
 	if (bio->bi_status && !orig_bio->bi_status)
 		orig_bio->bi_status = bio->bi_status;
@@ -8779,6 +8826,12 @@ static void md_clone_bio(struct mddev *mddev, struct bio **bio)
 	if (blk_queue_io_stat(bdev->bd_disk->queue))
 		md_io_clone->start_time = bio_start_io_acct(*bio);
 
+	if (bio_data_dir(*bio) == WRITE && mddev->bitmap) {
+		md_io_clone->offset = (*bio)->bi_iter.bi_sector;
+		md_io_clone->sectors = bio_sectors(*bio);
+		md_bitmap_start(mddev, md_io_clone);
+	}
+
 	clone->bi_end_io = md_end_clone_io;
 	clone->bi_private = md_io_clone;
 	*bio = clone;
@@ -8796,6 +8849,9 @@ void md_free_cloned_bio(struct bio *bio)
 	struct md_io_clone *md_io_clone = bio->bi_private;
 	struct bio *orig_bio = md_io_clone->orig_bio;
 	struct mddev *mddev = md_io_clone->mddev;
+
+	if (bio_data_dir(orig_bio) == WRITE && mddev->bitmap)
+		md_bitmap_end(mddev, md_io_clone);
 
 	if (bio->bi_status && !orig_bio->bi_status)
 		orig_bio->bi_status = bio->bi_status;
@@ -9788,9 +9844,7 @@ EXPORT_SYMBOL(md_reap_sync_thread);
 void md_wait_for_blocked_rdev(struct md_rdev *rdev, struct mddev *mddev)
 {
 	sysfs_notify_dirent_safe(rdev->sysfs_state);
-	wait_event_timeout(rdev->blocked_wait,
-			   !test_bit(Blocked, &rdev->flags) &&
-			   !test_bit(BlockedBadBlocks, &rdev->flags),
+	wait_event_timeout(rdev->blocked_wait, !rdev_blocked(rdev),
 			   msecs_to_jiffies(5000));
 	rdev_dec_pending(rdev, mddev);
 }
@@ -9819,6 +9873,17 @@ int rdev_set_badblocks(struct md_rdev *rdev, sector_t s, int sectors,
 {
 	struct mddev *mddev = rdev->mddev;
 	int rv;
+
+	/*
+	 * Recording new badblocks for faulty rdev will force unnecessary
+	 * super block updating. This is fragile for external management because
+	 * userspace daemon may trying to remove this device and deadlock may
+	 * occur. This will be probably solved in the mdadm, but it is safer to
+	 * avoid it.
+	 */
+	if (test_bit(Faulty, &rdev->flags))
+		return 1;
+
 	if (is_new)
 		s += rdev->new_data_offset;
 	else
