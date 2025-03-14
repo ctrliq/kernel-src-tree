@@ -114,8 +114,8 @@ static int ovl_real_fdget_meta(const struct file *file, struct fd *real,
 	if (allow_meta) {
 		ovl_path_real(dentry, &realpath);
 	} else {
-		/* lazy lookup and verify of lowerdata */
-		err = ovl_verify_lowerdata(dentry);
+		/* lazy lookup of lowerdata */
+		err = ovl_maybe_lookup_lowerdata(dentry);
 		if (err)
 			return err;
 
@@ -158,8 +158,8 @@ static int ovl_open(struct inode *inode, struct file *file)
 	struct path realpath;
 	int err;
 
-	/* lazy lookup and verify lowerdata */
-	err = ovl_verify_lowerdata(dentry);
+	/* lazy lookup of lowerdata */
+	err = ovl_maybe_lookup_lowerdata(dentry);
 	if (err)
 		return err;
 
