@@ -44,26 +44,26 @@ static int ovl_xattr_set(struct dentry *dentry, struct inode *inode, const char 
 	struct path realpath;
 	const struct cred *old_cred;
 
-	err = ovl_want_write(dentry);
-	if (err)
-		goto out;
-
 	if (!value && !upperdentry) {
 		ovl_path_lower(dentry, &realpath);
 		old_cred = ovl_override_creds(dentry->d_sb);
 		err = vfs_getxattr(mnt_idmap(realpath.mnt), realdentry, name, NULL, 0);
 		revert_creds(old_cred);
 		if (err < 0)
-			goto out_drop_write;
+			goto out;
 	}
 
 	if (!upperdentry) {
 		err = ovl_copy_up(dentry);
 		if (err)
-			goto out_drop_write;
+			goto out;
 
 		realdentry = ovl_dentry_upper(dentry);
 	}
+
+	err = ovl_want_write(dentry);
+	if (err)
+		goto out;
 
 	old_cred = ovl_override_creds(dentry->d_sb);
 	if (value) {
@@ -74,12 +74,10 @@ static int ovl_xattr_set(struct dentry *dentry, struct inode *inode, const char 
 		err = ovl_do_removexattr(ofs, realdentry, name);
 	}
 	revert_creds(old_cred);
+	ovl_drop_write(dentry);
 
 	/* copy c/mtime */
 	ovl_copyattr(inode);
-
-out_drop_write:
-	ovl_drop_write(dentry);
 out:
 	return err;
 }
