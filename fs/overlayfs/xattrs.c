@@ -19,7 +19,7 @@ static bool ovl_is_escaped_xattr(struct super_block *sb, const char *name)
 
 static bool ovl_is_own_xattr(struct super_block *sb, const char *name)
 {
-	struct ovl_fs *ofs = sb->s_fs_info;
+	struct ovl_fs *ofs = OVL_FS(sb);
 
 	if (ofs->config.userxattr)
 		return strncmp(name, OVL_XATTR_USER_PREFIX,
