@@ -254,7 +254,7 @@ static const struct xattr_handler ovl_other_xattr_handler = {
 	.set = ovl_other_xattr_set,
 };
 
-static const struct xattr_handler *ovl_trusted_xattr_handlers[] = {
+static const struct xattr_handler * const ovl_trusted_xattr_handlers[] = {
 #ifdef CONFIG_FS_POSIX_ACL
 	&posix_acl_access_xattr_handler,
 	&posix_acl_default_xattr_handler,
@@ -264,7 +264,7 @@ static const struct xattr_handler *ovl_trusted_xattr_handlers[] = {
 	NULL
 };
 
-static const struct xattr_handler *ovl_user_xattr_handlers[] = {
+static const struct xattr_handler * const ovl_user_xattr_handlers[] = {
 #ifdef CONFIG_FS_POSIX_ACL
 	&posix_acl_access_xattr_handler,
 	&posix_acl_default_xattr_handler,
@@ -274,7 +274,7 @@ static const struct xattr_handler *ovl_user_xattr_handlers[] = {
 	NULL
 };
 
-const struct xattr_handler **ovl_xattr_handlers(struct ovl_fs *ofs)
+const struct xattr_handler * const *ovl_xattr_handlers(struct ovl_fs *ofs)
 {
 	return ofs->config.userxattr ? ovl_user_xattr_handlers :
 		ovl_trusted_xattr_handlers;
