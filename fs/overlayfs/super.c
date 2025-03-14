@@ -1415,7 +1415,7 @@ int ovl_fill_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_xattr = ovl_xattr_handlers(ofs);
 	sb->s_fs_info = ofs;
 	sb->s_flags |= SB_POSIXACL;
-	sb->s_iflags |= SB_I_SKIP_SYNC;
+	sb->s_iflags |= SB_I_SKIP_SYNC | SB_I_IMA_UNVERIFIABLE_SIGNATURE;
 	sb->s_iflags |= SB_I_EVM_UNSUPPORTED;
 
 	err = -ENOMEM;
