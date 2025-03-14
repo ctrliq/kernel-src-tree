@@ -92,12 +92,7 @@ void kvm_arch_vcpu_load_fp(struct kvm_vcpu *vcpu)
 		}
 	}
 
-	/*
-	 * If normal guests gain SME support, maintain this behavior for pKVM
-	 * guests, which don't support SME.
-	 */
-	WARN_ON(is_protected_kvm_enabled() && system_supports_sme() &&
-		read_sysreg_s(SYS_SVCR));
+	WARN_ON_ONCE(system_supports_sme() && read_sysreg_s(SYS_SVCR));
 }
 
 /*
