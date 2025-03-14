@@ -120,7 +120,7 @@ static bool ovl_calc_d_ino(struct ovl_readdir_data *rdd,
 		return false;
 
 	/* Always recalc d_ino when remapping lower inode numbers */
-	if (ovl_xino_bits(rdd->dentry->d_sb))
+	if (ovl_xino_bits(OVL_FS(rdd->dentry->d_sb)))
 		return true;
 
 	/* Always recalc d_ino for parent */
@@ -470,13 +470,14 @@ static int ovl_cache_update(const struct path *path, struct ovl_cache_entry *p, 
 
 {
 	struct dentry *dir = path->dentry;
+	struct ovl_fs *ofs = OVL_FS(dir->d_sb);
 	struct dentry *this = NULL;
 	enum ovl_path_type type;
 	u64 ino = p->real_ino;
-	int xinobits = ovl_xino_bits(dir->d_sb);
+	int xinobits = ovl_xino_bits(ofs);
 	int err = 0;
 
-	if (!ovl_same_dev(dir->d_sb) && !p->check_xwhiteout)
+	if (!ovl_same_dev(ofs) && !p->check_xwhiteout)
 		goto out;
 
 	if (p->name[0] == '.') {
@@ -504,7 +505,7 @@ static int ovl_cache_update(const struct path *path, struct ovl_cache_entry *p, 
 	}
 
 get:
-	if (!ovl_same_dev(dir->d_sb) || !update_ino)
+	if (!ovl_same_dev(ofs) || !update_ino)
 		goto out;
 
 	type = ovl_path_type(this);
@@ -529,7 +530,7 @@ get:
 		ino = ovl_remap_lower_ino(ino, xinobits,
 					  ovl_layer_lower(this)->fsid,
 					  p->name, p->len,
-					  ovl_xino_warn(dir->d_sb));
+					  ovl_xino_warn(ofs));
 	}
 
 out:
@@ -708,12 +709,13 @@ static int ovl_iterate_real(struct file *file, struct dir_context *ctx)
 	int err;
 	struct ovl_dir_file *od = file->private_data;
 	struct dentry *dir = file->f_path.dentry;
+	struct ovl_fs *ofs = OVL_FS(dir->d_sb);
 	const struct ovl_layer *lower_layer = ovl_layer_lower(dir);
 	struct ovl_readdir_translate rdt = {
 		.ctx.actor = ovl_fill_real,
 		.orig_ctx = ctx,
-		.xinobits = ovl_xino_bits(dir->d_sb),
-		.xinowarn = ovl_xino_warn(dir->d_sb),
+		.xinobits = ovl_xino_bits(ofs),
+		.xinowarn = ovl_xino_warn(ofs),
 	};
 
 	if (rdt.xinobits && lower_layer)
@@ -749,6 +751,7 @@ static int ovl_iterate(struct file *file, struct dir_context *ctx)
 {
 	struct ovl_dir_file *od = file->private_data;
 	struct dentry *dentry = file->f_path.dentry;
+	struct ovl_fs *ofs = OVL_FS(dentry->d_sb);
 	struct ovl_cache_entry *p;
 	const struct cred *old_cred;
 	int err;
@@ -763,8 +766,8 @@ static int ovl_iterate(struct file *file, struct dir_context *ctx)
 		 * dir is impure then need to adjust d_ino for copied up
 		 * entries.
 		 */
-		if (ovl_xino_bits(dentry->d_sb) ||
-		    (ovl_same_fs(dentry->d_sb) &&
+		if (ovl_xino_bits(ofs) ||
+		    (ovl_same_fs(ofs) &&
 		     (ovl_is_impure_dir(file) ||
 		      OVL_TYPE_MERGE(ovl_path_type(dentry->d_parent))))) {
 			err = ovl_iterate_real(file, ctx);
