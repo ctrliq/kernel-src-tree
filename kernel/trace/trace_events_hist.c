@@ -2489,7 +2489,8 @@ static struct hist_field *parse_expr(struct hist_trigger_data *hist_data,
 	operand1_str = str;
 	str = sep+1;
 
-	if (!operand1_str || !str)
+	/* Binary operator requires both operands */
+	if (*operand1_str == '\0' || *str == '\0')
 		goto free;
 
 	operand_flags = 0;
