@@ -906,11 +906,6 @@ static int acpi_cpufreq_cpu_init(struct cpufreq_policy *policy)
 	policy->fast_switch_possible = !acpi_pstate_strict &&
 		!(policy_is_shared(policy) && policy->shared_type != CPUFREQ_SHARED_TYPE_ANY);
 
-	if (acpi_cpufreq_driver.set_boost) {
-		set_boost(policy, acpi_cpufreq_driver.boost_enabled);
-		policy->boost_enabled = acpi_cpufreq_driver.boost_enabled;
-	}
-
 	return result;
 
 err_unreg:
