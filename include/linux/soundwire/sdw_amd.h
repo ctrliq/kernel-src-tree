@@ -31,6 +31,7 @@
 
 struct acp_sdw_pdata {
 	u16 instance;
+	u32 acp_rev;
 	/* mutex to protect acp common register access */
 	struct mutex *acp_sdw_lock;
 };
@@ -67,6 +68,7 @@ struct sdw_amd_dai_runtime {
  * @instance: SoundWire manager instance
  * @quirks: SoundWire manager quirks
  * @wake_en_mask: wake enable mask per SoundWire manager
+ * @acp_rev: acp pci device revision id
  * @clk_stopped: flag set to true when clock is stopped
  * @power_mode_mask: flag interprets amd SoundWire manager power mode
  * @dai_runtime_array: dai runtime array
@@ -95,6 +97,7 @@ struct amd_sdw_manager {
 	u32 quirks;
 	u32 wake_en_mask;
 	u32 power_mode_mask;
+	u32 acp_rev;
 	bool clk_stopped;
 
 	struct sdw_amd_dai_runtime **dai_runtime_array;
@@ -135,6 +138,7 @@ struct sdw_amd_ctx {
  * struct sdw_amd_res - Soundwire AMD global resource structure,
  * typically populated by the DSP driver/Legacy driver
  *
+ * @acp_rev: acp pci device revision id
  * @addr: acp pci device resource start address
  * @reg_range: ACP register range
  * @link_mask: bit-wise mask listing links selected by the DSP driver/
@@ -147,6 +151,7 @@ struct sdw_amd_ctx {
  * @acp_lock: mutex protecting acp common registers access
  */
 struct sdw_amd_res {
+	u32 acp_rev;
 	u32 addr;
 	u32 reg_range;
 	u32 link_mask;
