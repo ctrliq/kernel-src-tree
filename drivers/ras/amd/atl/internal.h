@@ -249,6 +249,9 @@ static inline unsigned long prm_umc_norm_to_sys_addr(u8 socket_id, u64 umc_bank_
 }
 #endif
 
+u64 add_base_and_hole(struct addr_ctx *ctx, u64 addr);
+u64 remove_base_and_hole(struct addr_ctx *ctx, u64 addr);
+
 /*
  * Make a gap in @data that is @num_bits long starting at @bit_num.
  * e.g. data		= 11111111'b
