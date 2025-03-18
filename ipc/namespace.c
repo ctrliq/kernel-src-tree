@@ -64,7 +64,7 @@ static struct ipc_namespace *create_ipc_ns(struct user_namespace *user_ns,
 		goto fail_put;
 
 	if (!setup_ipc_sysctls(ns))
-		goto fail_put;
+		goto fail_mq;
 
 	err = msg_init_ns(ns);
 	if (err)
@@ -74,6 +74,9 @@ static struct ipc_namespace *create_ipc_ns(struct user_namespace *user_ns,
 	shm_init_ns(ns);
 
 	return ns;
+
+fail_mq:
+	retire_mq_sysctls(ns);
 
 fail_put:
 	put_user_ns(ns->user_ns);
