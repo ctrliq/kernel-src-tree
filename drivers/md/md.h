@@ -31,6 +31,8 @@ enum md_submodule_type {
 
 enum md_submodule_id {
 	ID_LINEAR	= LEVEL_LINEAR,
+	ID_FAULTY	= LEVEL_FAULTY,
+	ID_MULTIPATH	= LEVEL_MULTIPATH,
 	ID_RAID0	= 0,
 	ID_RAID1	= 1,
 	ID_RAID4	= 4,
