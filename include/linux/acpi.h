@@ -1549,4 +1549,9 @@ static inline bool acpi_node_backed_by_real_pxm(int nid)
 }
 #endif
 
+static inline void acpi_use_parent_companion(struct device *dev)
+{
+	ACPI_COMPANION_SET(dev, ACPI_COMPANION(dev->parent));
+}
+
 #endif	/*_LINUX_ACPI_H*/
