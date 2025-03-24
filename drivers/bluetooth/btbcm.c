@@ -541,11 +541,10 @@ static const struct bcm_subver_table bcm_usb_subver_table[] = {
 static const char *btbcm_get_board_name(struct device *dev)
 {
 #ifdef CONFIG_OF
-	struct device_node *root;
+	struct device_node *root __free(device_node) = of_find_node_by_path("/");
 	char *board_type;
 	const char *tmp;
 
-	root = of_find_node_by_path("/");
 	if (!root)
 		return NULL;
 
@@ -558,7 +557,6 @@ static const char *btbcm_get_board_name(struct device *dev)
 		return NULL;
 
 	strreplace(board_type, '/', '-');
-	of_node_put(root);
 
 	return board_type;
 #else
