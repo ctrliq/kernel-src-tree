@@ -32,8 +32,8 @@ static void resend_irqs(struct tasklet_struct *unused)
 	struct irq_desc *desc;
 	int irq;
 
-	while (!bitmap_empty(irqs_resend, nr_irqs)) {
-		irq = find_first_bit(irqs_resend, nr_irqs);
+	while (!bitmap_empty(irqs_resend, irq_get_nr_irqs())) {
+		irq = find_first_bit(irqs_resend, irq_get_nr_irqs());
 		clear_bit(irq, irqs_resend);
 		desc = irq_to_desc(irq);
 		if (!desc)
