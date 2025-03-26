@@ -1436,7 +1436,7 @@ reg_pernet_fail:
 	return err;
 }
 
-void ip6_mr_cleanup(void)
+void __init ip6_mr_cleanup(void)
 {
 	rtnl_unregister(RTNL_FAMILY_IP6MR, RTM_GETROUTE);
 #ifdef CONFIG_IPV6_PIMSM_V2
