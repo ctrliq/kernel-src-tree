@@ -24,7 +24,10 @@
 #define PTP_PPS_EVENT PPS_CAPTUREASSERT
 #define PTP_PPS_MODE (PTP_PPS_DEFAULTS | PPS_CANWAIT | PPS_TSFMT_TSPEC)
 
-struct class *ptp_class;
+const struct class ptp_class = {
+	.name = "ptp",
+	.dev_groups = ptp_groups
+};
 
 /* private globals */
 
@@ -300,7 +303,7 @@ struct ptp_clock *ptp_clock_register(struct ptp_clock_info *info,
 	/* Initialize a new device of our class in our clock structure. */
 	device_initialize(&ptp->dev);
 	ptp->dev.devt = ptp->devid;
-	ptp->dev.class = ptp_class;
+	ptp->dev.class = &ptp_class;
 	ptp->dev.parent = parent;
 	ptp->dev.groups = ptp->pin_attr_groups;
 	ptp->dev.release = ptp_clock_release;
@@ -457,7 +460,7 @@ EXPORT_SYMBOL(ptp_cancel_worker_sync);
 
 static void __exit ptp_exit(void)
 {
-	class_destroy(ptp_class);
+	class_unregister(&ptp_class);
 	unregister_chrdev_region(ptp_devt, MINORMASK + 1);
 	ida_destroy(&ptp_clocks_map);
 }
@@ -466,10 +469,10 @@ static int __init ptp_init(void)
 {
 	int err;
 
-	ptp_class = class_create("ptp");
-	if (IS_ERR(ptp_class)) {
+	err = class_register(&ptp_class);
+	if (err) {
 		pr_err("ptp: failed to allocate class\n");
-		return PTR_ERR(ptp_class);
+		return err;
 	}
 
 	err = alloc_chrdev_region(&ptp_devt, 0, MINORMASK + 1, "ptp");
@@ -478,12 +481,11 @@ static int __init ptp_init(void)
 		goto no_region;
 	}
 
-	ptp_class->dev_groups = ptp_groups;
 	pr_info("PTP clock support registered\n");
 	return 0;
 
 no_region:
-	class_destroy(ptp_class);
+	class_unregister(&ptp_class);
 	return err;
 }
 
