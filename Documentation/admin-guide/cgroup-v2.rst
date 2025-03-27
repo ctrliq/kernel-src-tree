@@ -1710,6 +1710,8 @@ PAGE_SIZE multiple when read back.
 
 	Note that this is subtly different from setting memory.swap.max to
 	0, as it still allows for pages to be written to the zswap pool.
+	This setting has no effect if zswap is disabled, and swapping
+	is allowed unless memory.swap.max is set to 0.
 
   memory.pressure
 	A read-only nested-keyed file.
