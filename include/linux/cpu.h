@@ -137,7 +137,7 @@ static inline int add_cpu(unsigned int cpu) { return 0;}
 static inline int arch_cpu_rescan_dead_smt_siblings(void) { return 0; }
 
 #endif /* CONFIG_SMP */
-extern struct bus_type cpu_subsys;
+extern const struct bus_type cpu_subsys;
 
 #ifdef CONFIG_PM_SLEEP_SMP
 extern int freeze_secondary_cpus(int primary);
