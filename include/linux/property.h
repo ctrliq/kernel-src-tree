@@ -36,6 +36,7 @@ struct fwnode_handle *__dev_fwnode(struct device *dev);
 		 struct device *: __dev_fwnode)(dev)
 
 bool device_property_present(const struct device *dev, const char *propname);
+bool device_property_read_bool(const struct device *dev, const char *propname);
 int device_property_read_u8_array(const struct device *dev, const char *propname,
 				  u8 *val, size_t nval);
 int device_property_read_u16_array(const struct device *dev, const char *propname,
@@ -52,6 +53,8 @@ int device_property_match_string(const struct device *dev,
 				 const char *propname, const char *string);
 
 bool fwnode_property_present(const struct fwnode_handle *fwnode,
+			     const char *propname);
+bool fwnode_property_read_bool(const struct fwnode_handle *fwnode,
 			     const char *propname);
 int fwnode_property_read_u8_array(const struct fwnode_handle *fwnode,
 				  const char *propname, u8 *val,
@@ -185,12 +188,6 @@ static inline unsigned int device_get_child_node_count(const struct device *dev)
 	return fwnode_get_child_node_count(dev_fwnode(dev));
 }
 
-static inline bool device_property_read_bool(const struct device *dev,
-					     const char *propname)
-{
-	return device_property_present(dev, propname);
-}
-
 static inline int device_property_read_u8(const struct device *dev,
 					  const char *propname, u8 *val)
 {
@@ -239,12 +236,6 @@ static inline int device_property_string_array_count(const struct device *dev,
 						     const char *propname)
 {
 	return device_property_read_string_array(dev, propname, NULL, 0);
-}
-
-static inline bool fwnode_property_read_bool(const struct fwnode_handle *fwnode,
-					     const char *propname)
-{
-	return fwnode_property_present(fwnode, propname);
 }
 
 static inline int fwnode_property_read_u8(const struct fwnode_handle *fwnode,
