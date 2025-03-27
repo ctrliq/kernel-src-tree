@@ -1206,7 +1206,7 @@ static void dpm_superior_set_must_resume(struct device *dev)
 }
 
 /**
- * __device_suspend_noirq - Execute a "noirq suspend" callback for given device.
+ * device_suspend_noirq - Execute a "noirq suspend" callback for given device.
  * @dev: Device to handle.
  * @state: PM transition of the system being carried out.
  * @async: If true, the device is being suspended asynchronously.
@@ -1214,7 +1214,7 @@ static void dpm_superior_set_must_resume(struct device *dev)
  * The driver of @dev will not receive interrupts while this function is being
  * executed.
  */
-static int __device_suspend_noirq(struct device *dev, pm_message_t state, bool async)
+static int device_suspend_noirq(struct device *dev, pm_message_t state, bool async)
 {
 	pm_callback_t callback = NULL;
 	const char *info = NULL;
@@ -1291,16 +1291,8 @@ static void async_suspend_noirq(void *data, async_cookie_t cookie)
 {
 	struct device *dev = data;
 
-	__device_suspend_noirq(dev, pm_transition, true);
+	device_suspend_noirq(dev, pm_transition, true);
 	put_device(dev);
-}
-
-static int device_suspend_noirq(struct device *dev)
-{
-	if (dpm_async_fn(dev, async_suspend_noirq))
-		return 0;
-
-	return __device_suspend_noirq(dev, pm_transition, false);
 }
 
 static int dpm_noirq_suspend_devices(pm_message_t state)
@@ -1319,10 +1311,15 @@ static int dpm_noirq_suspend_devices(pm_message_t state)
 		struct device *dev = to_device(dpm_late_early_list.prev);
 
 		list_move(&dev->power.entry, &dpm_noirq_list);
+
+		if (dpm_async_fn(dev, async_suspend_noirq))
+			continue;
+
 		get_device(dev);
+
 		mutex_unlock(&dpm_list_mtx);
 
-		error = device_suspend_noirq(dev);
+		error = device_suspend_noirq(dev, state, false);
 
 		put_device(dev);
 
@@ -1383,14 +1380,14 @@ static void dpm_propagate_wakeup_to_parent(struct device *dev)
 }
 
 /**
- * __device_suspend_late - Execute a "late suspend" callback for given device.
+ * device_suspend_late - Execute a "late suspend" callback for given device.
  * @dev: Device to handle.
  * @state: PM transition of the system being carried out.
  * @async: If true, the device is being suspended asynchronously.
  *
  * Runtime PM is disabled for @dev while this function is being executed.
  */
-static int __device_suspend_late(struct device *dev, pm_message_t state, bool async)
+static int device_suspend_late(struct device *dev, pm_message_t state, bool async)
 {
 	pm_callback_t callback = NULL;
 	const char *info = NULL;
@@ -1461,16 +1458,8 @@ static void async_suspend_late(void *data, async_cookie_t cookie)
 {
 	struct device *dev = data;
 
-	__device_suspend_late(dev, pm_transition, true);
+	device_suspend_late(dev, pm_transition, true);
 	put_device(dev);
-}
-
-static int device_suspend_late(struct device *dev)
-{
-	if (dpm_async_fn(dev, async_suspend_late))
-		return 0;
-
-	return __device_suspend_late(dev, pm_transition, false);
 }
 
 /**
@@ -1495,11 +1484,15 @@ int dpm_suspend_late(pm_message_t state)
 		struct device *dev = to_device(dpm_suspended_list.prev);
 
 		list_move(&dev->power.entry, &dpm_late_early_list);
+
+		if (dpm_async_fn(dev, async_suspend_late))
+			continue;
+
 		get_device(dev);
 
 		mutex_unlock(&dpm_list_mtx);
 
-		error = device_suspend_late(dev);
+		error = device_suspend_late(dev, state, false);
 
 		put_device(dev);
 
@@ -1596,12 +1589,12 @@ static void dpm_clear_superiors_direct_complete(struct device *dev)
 }
 
 /**
- * __device_suspend - Execute "suspend" callbacks for given device.
+ * device_suspend - Execute "suspend" callbacks for given device.
  * @dev: Device to handle.
  * @state: PM transition of the system being carried out.
  * @async: If true, the device is being suspended asynchronously.
  */
-static int __device_suspend(struct device *dev, pm_message_t state, bool async)
+static int device_suspend(struct device *dev, pm_message_t state, bool async)
 {
 	pm_callback_t callback = NULL;
 	const char *info = NULL;
@@ -1730,16 +1723,8 @@ static void async_suspend(void *data, async_cookie_t cookie)
 {
 	struct device *dev = data;
 
-	__device_suspend(dev, pm_transition, true);
+	device_suspend(dev, pm_transition, true);
 	put_device(dev);
-}
-
-static int device_suspend(struct device *dev)
-{
-	if (dpm_async_fn(dev, async_suspend))
-		return 0;
-
-	return __device_suspend(dev, pm_transition, false);
 }
 
 /**
@@ -1766,11 +1751,15 @@ int dpm_suspend(pm_message_t state)
 		struct device *dev = to_device(dpm_prepared_list.prev);
 
 		list_move(&dev->power.entry, &dpm_suspended_list);
+
+		if (dpm_async_fn(dev, async_suspend))
+			continue;
+
 		get_device(dev);
 
 		mutex_unlock(&dpm_list_mtx);
 
-		error = device_suspend(dev);
+		error = device_suspend(dev, state, false);
 
 		put_device(dev);
 
