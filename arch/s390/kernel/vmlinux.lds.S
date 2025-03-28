@@ -63,7 +63,9 @@ SECTIONS
 		*(.data.rel.ro .data.rel.ro.*)
 	}
 	.got : {
+		__got_start = .;
 		*(.got)
+		__got_end = .;
 	}
 
 	. = ALIGN(PAGE_SIZE);
@@ -192,6 +194,7 @@ SECTIONS
 
 	PERCPU_SECTION(0x100)
 
+#ifdef CONFIG_PIE_BUILD
 	.dynsym ALIGN(8) : {
 		__dynsym_start = .;
 		*(.dynsym)
@@ -208,6 +211,7 @@ SECTIONS
 	.dynstr ALIGN(8) : {
 		*(.dynstr)
 	}
+#endif
 	.hash ALIGN(8) : {
 		*(.hash)
 	}
@@ -237,9 +241,14 @@ SECTIONS
 		QUAD(__boot_data_preserved_start)		/* bootdata_preserved_off */
 		QUAD(__boot_data_preserved_end -
 		     __boot_data_preserved_start)		/* bootdata_preserved_size */
+#ifdef CONFIG_PIE_BUILD
 		QUAD(__dynsym_start)				/* dynsym_start */
 		QUAD(__rela_dyn_start)				/* rela_dyn_start */
 		QUAD(__rela_dyn_end)				/* rela_dyn_end */
+#else
+		QUAD(__got_start)				/* got_off */
+		QUAD(__got_end - __got_start)			/* got_size */
+#endif
 		QUAD(_eamode31 - _samode31)			/* amode31_size */
 		QUAD(init_mm)
 		QUAD(swapper_pg_dir)
@@ -270,6 +279,12 @@ SECTIONS
 		*(.plt) *(.plt.*) *(.iplt) *(.igot .igot.plt)
 	}
 	ASSERT(SIZEOF(.plt) == 0, "Unexpected run-time procedure linkages detected!")
+#ifndef CONFIG_PIE_BUILD
+	.rela.dyn : {
+		*(.rela.*) *(.rela_*)
+	}
+	ASSERT(SIZEOF(.rela.dyn) == 0, "Unexpected run-time relocations (.rela) detected!")
+#endif
 
 	/* Sections to be discarded */
 	DISCARDS
