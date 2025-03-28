@@ -88,6 +88,11 @@ struct io_sr_msg {
  */
 #define MULTISHOT_MAX_RETRY	32
 
+static int io_sg_from_iter_iovec(struct sk_buff *skb,
+				 struct iov_iter *from, size_t length);
+static int io_sg_from_iter(struct sk_buff *skb,
+			   struct iov_iter *from, size_t length);
+
 int io_shutdown_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 {
 	struct io_shutdown *shutdown = io_kiocb_to_cmd(req, struct io_shutdown);
@@ -1190,6 +1195,7 @@ int io_send_zc_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 {
 	struct io_sr_msg *zc = io_kiocb_to_cmd(req, struct io_sr_msg);
 	struct io_ring_ctx *ctx = req->ctx;
+	struct io_async_msghdr *iomsg;
 	struct io_kiocb *notif;
 	int ret;
 
@@ -1232,8 +1238,15 @@ int io_send_zc_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	if (io_is_compat(req->ctx))
 		zc->msg_flags |= MSG_CMSG_COMPAT;
 
-	if (unlikely(!io_msg_alloc_async(req)))
+	iomsg = io_msg_alloc_async(req);
+	if (unlikely(!iomsg))
 		return -ENOMEM;
+
+	if (zc->flags & IORING_RECVSEND_FIXED_BUF)
+		iomsg->msg.sg_from_iter = io_sg_from_iter;
+	else
+		iomsg->msg.sg_from_iter = io_sg_from_iter_iovec;
+
 	if (req->opcode == IORING_OP_SEND_ZC) {
 		req->flags |= REQ_F_IMPORT_BUFFER;
 		return io_send_setup(req, sqe);
@@ -1244,11 +1257,8 @@ int io_send_zc_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	if (unlikely(ret))
 		return ret;
 
-	if (!(zc->flags & IORING_RECVSEND_FIXED_BUF)) {
-		struct io_async_msghdr *iomsg = req->async_data;
-
+	if (!(zc->flags & IORING_RECVSEND_FIXED_BUF))
 		return io_notif_account_mem(zc->notif, iomsg->msg.msg_iter.count);
-	}
 	return 0;
 }
 
@@ -1315,7 +1325,6 @@ static int io_send_zc_import(struct io_kiocb *req, unsigned int issue_flags)
 					ITER_SOURCE, issue_flags);
 		if (unlikely(ret))
 			return ret;
-		kmsg->msg.sg_from_iter = io_sg_from_iter;
 	} else {
 		ret = import_ubuf(ITER_SOURCE, sr->buf, sr->len, &kmsg->msg.msg_iter);
 		if (unlikely(ret))
@@ -1323,7 +1332,6 @@ static int io_send_zc_import(struct io_kiocb *req, unsigned int issue_flags)
 		ret = io_notif_account_mem(sr->notif, sr->len);
 		if (unlikely(ret))
 			return ret;
-		kmsg->msg.sg_from_iter = io_sg_from_iter_iovec;
 	}
 
 	return ret;
@@ -1407,8 +1415,6 @@ int io_sendmsg_zc(struct io_kiocb *req, unsigned int issue_flags)
 	unsigned flags;
 	int ret, min_ret = 0;
 
-	kmsg->msg.sg_from_iter = io_sg_from_iter_iovec;
-
 	if (req->flags & REQ_F_IMPORT_BUFFER) {
 		unsigned uvec_segs = kmsg->msg.msg_iter.nr_segs;
 		int ret;
@@ -1417,7 +1423,6 @@ int io_sendmsg_zc(struct io_kiocb *req, unsigned int issue_flags)
 					&kmsg->vec, uvec_segs, issue_flags);
 		if (unlikely(ret))
 			return ret;
-		kmsg->msg.sg_from_iter = io_sg_from_iter;
 		req->flags &= ~REQ_F_IMPORT_BUFFER;
 	}
 
