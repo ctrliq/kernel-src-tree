@@ -94,6 +94,7 @@ void folio_migrate_ksm(struct folio *newfolio, struct folio *folio);
 void collect_procs_ksm(struct folio *folio, struct page *page,
 		struct list_head *to_kill, int force_early);
 long ksm_process_profit(struct mm_struct *);
+bool ksm_process_mergeable(struct mm_struct *mm);
 
 #else  /* !CONFIG_KSM */
 
