@@ -1006,7 +1006,7 @@ int numa_migrate_prep(struct folio *folio, struct vm_area_struct *vma,
 int __must_check try_grab_folio(struct folio *folio, int refs,
 				unsigned int flags);
 void free_zone_device_page(struct page *page);
-int migrate_device_coherent_page(struct page *page);
+int migrate_device_coherent_folio(struct folio *folio);
 
 /*
  * mm/huge_memory.c
