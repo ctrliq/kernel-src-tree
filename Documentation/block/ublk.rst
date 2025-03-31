@@ -351,5 +351,3 @@ References
 .. [#userspace_readme] https://github.com/ming1/ubdsrv/blob/master/README
 
 .. [#stefan] https://lore.kernel.org/linux-block/YoOr6jBfgVm8GvWg@stefanha-x1.localdomain/
-
-.. [#xiaoguang] https://lore.kernel.org/linux-block/YoOr6jBfgVm8GvWg@stefanha-x1.localdomain/
