@@ -868,7 +868,7 @@ static int sii902x_audio_codec_init(struct sii902x *sii902x,
 	u8 lanes[4];
 	int num_lanes, i;
 
-	if (!of_property_read_bool(dev->of_node, "#sound-dai-cells")) {
+	if (!of_property_present(dev->of_node, "#sound-dai-cells")) {
 		dev_dbg(dev, "%s: No \"#sound-dai-cells\", no audio\n",
 			__func__);
 		return 0;
@@ -1240,8 +1240,8 @@ static const struct of_device_id sii902x_dt_ids[] = {
 MODULE_DEVICE_TABLE(of, sii902x_dt_ids);
 
 static const struct i2c_device_id sii902x_i2c_ids[] = {
-	{ "sii9022", 0 },
-	{ },
+	{ "sii9022" },
+	{ }
 };
 MODULE_DEVICE_TABLE(i2c, sii902x_i2c_ids);
 

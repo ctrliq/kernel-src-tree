@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 
-#ifndef DRM_FBDEV_CLIENT_H
-#define DRM_FBDEV_CLIENT_H
+#ifndef DRM_CLIENT_INTERNAL_H
+#define DRM_CLIENT_INTERNAL_H
 
 struct drm_device;
 struct drm_format_info;
@@ -14,6 +14,12 @@ static inline int drm_fbdev_client_setup(struct drm_device *dev,
 {
 	return 0;
 }
+#endif
+
+#ifdef CONFIG_DRM_CLIENT_LOG
+void drm_log_register(struct drm_device *dev);
+#else
+static inline void drm_log_register(struct drm_device *dev) {}
 #endif
 
 #endif
