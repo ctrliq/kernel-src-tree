@@ -366,6 +366,7 @@ static unsigned long migrate_device_unmap(unsigned long *src_pfns,
 
 	for (i = 0; i < npages; i++) {
 		struct page *page = migrate_pfn_to_page(src_pfns[i]);
+		struct folio *folio;
 
 		if (!page) {
 			if (src_pfns[i] & MIGRATE_PFN_MIGRATE)
@@ -391,8 +392,9 @@ static unsigned long migrate_device_unmap(unsigned long *src_pfns,
 			put_page(page);
 		}
 
-		if (page_mapped(page))
-			try_to_migrate(page_folio(page), 0);
+		folio = page_folio(page);
+		if (folio_mapped(folio))
+			try_to_migrate(folio, 0);
 
 		if (page_mapped(page) ||
 		    !migrate_vma_check_page(page, fault_page)) {
