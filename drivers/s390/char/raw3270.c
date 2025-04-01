@@ -148,7 +148,8 @@ struct raw3270_request *raw3270_request_alloc(size_t size)
 	/*
 	 * Setup ccw.
 	 */
-	rq->ccw.cda = virt_to_dma32(rq->buffer);
+	if (rq->buffer)
+		rq->ccw.cda = virt_to_dma32(rq->buffer);
 	rq->ccw.flags = CCW_FLAG_SLI;
 
 	return rq;
@@ -171,7 +172,8 @@ void raw3270_request_reset(struct raw3270_request *rq)
 	BUG_ON(!list_empty(&rq->list));
 	rq->ccw.cmd_code = 0;
 	rq->ccw.count = 0;
-	rq->ccw.cda = virt_to_dma32(rq->buffer);
+	if (rq->buffer)
+		rq->ccw.cda = virt_to_dma32(rq->buffer);
 	rq->ccw.flags = CCW_FLAG_SLI;
 	rq->rescnt = 0;
 	rq->rc = 0;
