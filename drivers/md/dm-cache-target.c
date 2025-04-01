@@ -3201,8 +3201,6 @@ static int parse_cblock_range(struct cache *cache, const char *str,
 	 * Try and parse form (ii) first.
 	 */
 	r = sscanf(str, "%llu-%llu%c", &b, &e, &dummy);
-	if (r < 0)
-		return r;
 
 	if (r == 2) {
 		result->begin = to_cblock(b);
@@ -3214,8 +3212,6 @@ static int parse_cblock_range(struct cache *cache, const char *str,
 	 * That didn't work, try form (i).
 	 */
 	r = sscanf(str, "%llu%c", &b, &dummy);
-	if (r < 0)
-		return r;
 
 	if (r == 1) {
 		result->begin = to_cblock(b);
