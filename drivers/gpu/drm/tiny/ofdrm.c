@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
+#include <linux/aperture.h>
 #include <linux/of_address.h>
 #include <linux/pci.h>
 #include <linux/platform_device.h>
 
-#include <drm/drm_aperture.h>
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_state_helper.h>
+#include <drm/drm_client_setup.h>
 #include <drm/drm_connector.h>
 #include <drm/drm_damage_helper.h>
 #include <drm/drm_device.h>
@@ -1218,7 +1219,7 @@ static struct ofdrm_device *ofdrm_device_create(struct drm_driver *drv,
 	fb_pgbase = round_down(fb_base, PAGE_SIZE);
 	fb_pgsize = fb_base - fb_pgbase + round_up(fb_size, PAGE_SIZE);
 
-	ret = devm_aperture_acquire_from_firmware(dev, fb_pgbase, fb_pgsize);
+	ret = devm_aperture_acquire_for_platform_device(pdev, fb_pgbase, fb_pgsize);
 	if (ret) {
 		drm_err(dev, "could not acquire memory range %pr: error %d\n", &res, ret);
 		return ERR_PTR(ret);
@@ -1343,6 +1344,7 @@ DEFINE_DRM_GEM_FOPS(ofdrm_fops);
 
 static struct drm_driver ofdrm_driver = {
 	DRM_GEM_SHMEM_DRIVER_OPS,
+	DRM_FBDEV_SHMEM_DRIVER_OPS,
 	.name			= DRIVER_NAME,
 	.desc			= DRIVER_DESC,
 	.major			= DRIVER_MAJOR,
@@ -1359,7 +1361,6 @@ static int ofdrm_probe(struct platform_device *pdev)
 {
 	struct ofdrm_device *odev;
 	struct drm_device *dev;
-	unsigned int color_mode;
 	int ret;
 
 	odev = ofdrm_device_create(&ofdrm_driver, pdev);
@@ -1371,11 +1372,7 @@ static int ofdrm_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	color_mode = drm_format_info_bpp(odev->format, 0);
-	if (color_mode == 16)
-		color_mode = odev->format->depth; // can be 15 or 16
-
-	drm_fbdev_shmem_setup(dev, color_mode);
+	drm_client_setup(dev, odev->format);
 
 	return 0;
 }
@@ -1399,7 +1396,7 @@ static struct platform_driver ofdrm_platform_driver = {
 		.of_match_table = ofdrm_of_match_display,
 	},
 	.probe = ofdrm_probe,
-	.remove_new = ofdrm_remove,
+	.remove = ofdrm_remove,
 };
 
 module_platform_driver(ofdrm_platform_driver);
