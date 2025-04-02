@@ -260,4 +260,8 @@ static inline unsigned long __phys_addr(unsigned long x, bool is_31bit)
 #include <asm-generic/memory_model.h>
 #include <asm-generic/getorder.h>
 
+#define KERNEL_IMAGE_SIZE	(512 * 1024 * 1024)
+#define __NO_KASLR_START_KERNEL	CONFIG_KERNEL_IMAGE_BASE
+#define __NO_KASLR_END_KERNEL	(__NO_KASLR_START_KERNEL + KERNEL_IMAGE_SIZE)
+
 #endif /* _S390_PAGE_H */
