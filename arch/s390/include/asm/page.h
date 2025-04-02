@@ -176,6 +176,20 @@ static inline int devmem_is_allowed(unsigned long pfn)
 int arch_make_page_accessible(struct page *page);
 #define HAVE_ARCH_MAKE_PAGE_ACCESSIBLE
 
+extern unsigned long __kaslr_offset;
+static inline unsigned long kaslr_offset(void)
+{
+	return __kaslr_offset;
+}
+
+extern int __kaslr_enabled;
+static inline int kaslr_enabled(void)
+{
+	if (IS_ENABLED(CONFIG_RANDOMIZE_BASE))
+		return __kaslr_enabled;
+	return 0;
+}
+
 #define __PAGE_OFFSET		0x0UL
 #define PAGE_OFFSET		0x0UL
 
