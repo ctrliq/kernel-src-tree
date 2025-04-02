@@ -4206,17 +4206,6 @@ static void update_msg_rx_state(struct drm_dp_mst_topology_mgr *mgr)
 	mutex_unlock(&mgr->lock);
 }
 
-static void update_msg_rx_state(struct drm_dp_mst_topology_mgr *mgr)
-{
-	mutex_lock(&mgr->lock);
-	if (mgr->reset_rx_state) {
-		mgr->reset_rx_state = false;
-		reset_msg_rx_state(&mgr->down_rep_recv);
-		reset_msg_rx_state(&mgr->up_req_recv);
-	}
-	mutex_unlock(&mgr->lock);
-}
-
 /**
  * drm_dp_mst_hpd_irq_handle_event() - MST hotplug IRQ handle MST event
  * @mgr: manager to notify irq for.
