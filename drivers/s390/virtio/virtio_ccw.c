@@ -699,6 +699,7 @@ static int virtio_ccw_find_vqs(struct virtio_device *vdev, unsigned nvqs,
 	dma64_t *indicatorp = NULL;
 	int ret, i, queue_idx = 0;
 	struct ccw1 *ccw;
+	dma32_t indicatorp_dma = 0;
 
 	ccw = ccw_device_dma_zalloc(vcdev->cdev, sizeof(*ccw), NULL);
 	if (!ccw)
@@ -726,7 +727,7 @@ static int virtio_ccw_find_vqs(struct virtio_device *vdev, unsigned nvqs,
 	*/
 	indicatorp = ccw_device_dma_zalloc(vcdev->cdev,
 					   sizeof(*indicatorp),
-					   &ccw->cda);
+					   &indicatorp_dma);
 	if (!indicatorp)
 		goto out;
 	*indicatorp = indicators_dma(vcdev);
@@ -736,6 +737,7 @@ static int virtio_ccw_find_vqs(struct virtio_device *vdev, unsigned nvqs,
 			/* no error, just fall back to legacy interrupts */
 			vcdev->is_thinint = false;
 	}
+	ccw->cda = indicatorp_dma;
 	if (!vcdev->is_thinint) {
 		/* Register queue indicators with host. */
 		*indicators(vcdev) = 0;
