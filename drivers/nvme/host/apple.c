@@ -599,7 +599,8 @@ static inline void apple_nvme_handle_cqe(struct apple_nvme_queue *q,
 	}
 
 	if (!nvme_try_complete_req(req, cqe->status, cqe->result) &&
-	    !blk_mq_add_to_batch(req, iob, nvme_req(req)->status,
+	    !blk_mq_add_to_batch(req, iob,
+				 nvme_req(req)->status != NVME_SC_SUCCESS,
 				 apple_nvme_complete_batch))
 		apple_nvme_complete_rq(req);
 }
@@ -649,7 +650,7 @@ static bool apple_nvme_handle_cq(struct apple_nvme_queue *q, bool force)
 
 	found = apple_nvme_poll_cq(q, &iob);
 
-	if (!rq_list_empty(iob.req_list))
+	if (!rq_list_empty(&iob.req_list))
 		apple_nvme_complete_batch(&iob);
 
 	return found;
@@ -1252,7 +1253,6 @@ static int apple_nvme_alloc_tagsets(struct apple_nvme *anv)
 	anv->admin_tagset.timeout = NVME_ADMIN_TIMEOUT;
 	anv->admin_tagset.numa_node = NUMA_NO_NODE;
 	anv->admin_tagset.cmd_size = sizeof(struct apple_nvme_iod);
-	anv->admin_tagset.flags = BLK_MQ_F_NO_SCHED;
 	anv->admin_tagset.driver_data = &anv->adminq;
 
 	ret = blk_mq_alloc_tag_set(&anv->admin_tagset);
@@ -1276,7 +1276,6 @@ static int apple_nvme_alloc_tagsets(struct apple_nvme *anv)
 	anv->tagset.timeout = NVME_IO_TIMEOUT;
 	anv->tagset.numa_node = NUMA_NO_NODE;
 	anv->tagset.cmd_size = sizeof(struct apple_nvme_iod);
-	anv->tagset.flags = BLK_MQ_F_SHOULD_MERGE;
 	anv->tagset.driver_data = &anv->ioq;
 
 	ret = blk_mq_alloc_tag_set(&anv->tagset);
