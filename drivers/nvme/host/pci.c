@@ -923,9 +923,6 @@ static void nvme_queue_rqs(struct rq_list *rqlist)
 }
 
 
-/*
- * NOTE: ns is NULL when called on the admin queue.
- */
 static blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
 			 const struct blk_mq_queue_data *bd)
 {
