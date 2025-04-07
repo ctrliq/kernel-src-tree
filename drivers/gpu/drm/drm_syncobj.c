@@ -712,14 +712,16 @@ static int drm_syncobj_fd_to_handle(struct drm_file *file_private,
 				    int fd, u32 *handle)
 {
 	struct drm_syncobj *syncobj;
-	CLASS(fd, f)(fd);
+	struct fd f = fdget(fd);
 	int ret;
 
-	if (fd_empty(f))
+	if (!fd_file(f))
 		return -EINVAL;
 
-	if (fd_file(f)->f_op != &drm_syncobj_file_fops)
+	if (fd_file(f)->f_op != &drm_syncobj_file_fops) {
+		fdput(f);
 		return -EINVAL;
+	}
 
 	/* take a reference to put in the idr */
 	syncobj = f.file->private_data;
@@ -737,6 +739,7 @@ static int drm_syncobj_fd_to_handle(struct drm_file *file_private,
 	} else
 		drm_syncobj_put(syncobj);
 
+	fdput(f);
 	return ret;
 }
 
