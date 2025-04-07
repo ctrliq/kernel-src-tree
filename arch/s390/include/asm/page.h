@@ -263,8 +263,9 @@ static inline unsigned long __phys_addr(unsigned long x, bool is_31bit)
 #define AMODE31_SIZE		(3 * PAGE_SIZE)
 
 #define KERNEL_IMAGE_SIZE	(512 * 1024 * 1024)
-#define __START_KERNEL		0x100000
 #define __NO_KASLR_START_KERNEL	CONFIG_KERNEL_IMAGE_BASE
 #define __NO_KASLR_END_KERNEL	(__NO_KASLR_START_KERNEL + KERNEL_IMAGE_SIZE)
+
+#define TEXT_OFFSET		0x100000
 
 #endif /* _S390_PAGE_H */
