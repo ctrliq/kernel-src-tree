@@ -204,6 +204,35 @@ static inline void __deactivate_traps_hfgxtr(struct kvm_vcpu *vcpu)
 		__deactivate_fgt(hctxt, vcpu, kvm, HAFGRTR_EL2);
 }
 
+static inline void  __activate_traps_mpam(struct kvm_vcpu *vcpu)
+{
+	u64 r = MPAM2_EL2_TRAPMPAM0EL1 | MPAM2_EL2_TRAPMPAM1EL1;
+
+	if (!system_supports_mpam())
+		return;
+
+	/* trap guest access to MPAMIDR_EL1 */
+	if (system_supports_mpam_hcr()) {
+		write_sysreg_s(MPAMHCR_EL2_TRAP_MPAMIDR_EL1, SYS_MPAMHCR_EL2);
+	} else {
+		/* From v1.1 TIDR can trap MPAMIDR, set it unconditionally */
+		r |= MPAM2_EL2_TIDR;
+	}
+
+	write_sysreg_s(r, SYS_MPAM2_EL2);
+}
+
+static inline void __deactivate_traps_mpam(void)
+{
+	if (!system_supports_mpam())
+		return;
+
+	write_sysreg_s(0, SYS_MPAM2_EL2);
+
+	if (system_supports_mpam_hcr())
+		write_sysreg_s(MPAMHCR_HOST_FLAGS, SYS_MPAMHCR_EL2);
+}
+
 static inline void __activate_traps_common(struct kvm_vcpu *vcpu)
 {
 	/* Trap on AArch32 cp15 c15 (impdef sysregs) accesses (EL1 or EL0) */
@@ -244,6 +273,7 @@ static inline void __activate_traps_common(struct kvm_vcpu *vcpu)
 	}
 
 	__activate_traps_hfgxtr(vcpu);
+	__activate_traps_mpam(vcpu);
 }
 
 static inline void __deactivate_traps_common(struct kvm_vcpu *vcpu)
@@ -263,6 +293,7 @@ static inline void __deactivate_traps_common(struct kvm_vcpu *vcpu)
 		write_sysreg_s(HCRX_HOST_FLAGS, SYS_HCRX_EL2);
 
 	__deactivate_traps_hfgxtr(vcpu);
+	__deactivate_traps_mpam();
 }
 
 static inline void ___activate_traps(struct kvm_vcpu *vcpu, u64 hcr)
@@ -470,7 +501,25 @@ static inline bool handle_tx2_tvm(struct kvm_vcpu *vcpu)
 	return true;
 }
 
-static bool kvm_hyp_handle_cntpct(struct kvm_vcpu *vcpu)
+/* Open-coded version of timer_get_offset() to allow for kern_hyp_va() */
+static inline u64 hyp_timer_get_offset(struct arch_timer_context *ctxt)
+{
+	u64 offset = 0;
+
+	if (ctxt->offset.vm_offset)
+		offset += *kern_hyp_va(ctxt->offset.vm_offset);
+	if (ctxt->offset.vcpu_offset)
+		offset += *kern_hyp_va(ctxt->offset.vcpu_offset);
+
+	return offset;
+}
+
+static inline u64 compute_counter_value(struct arch_timer_context *ctxt)
+{
+	return arch_timer_read_cntpct_el0() - hyp_timer_get_offset(ctxt);
+}
+
+static bool kvm_handle_cntxct(struct kvm_vcpu *vcpu)
 {
 	struct arch_timer_context *ctxt;
 	u32 sysreg;
@@ -480,18 +529,19 @@ static bool kvm_hyp_handle_cntpct(struct kvm_vcpu *vcpu)
 	 * We only get here for 64bit guests, 32bit guests will hit
 	 * the long and winding road all the way to the standard
 	 * handling. Yes, it sucks to be irrelevant.
+	 *
+	 * Also, we only deal with non-hypervisor context here (either
+	 * an EL1 guest, or a non-HYP context of an EL2 guest).
 	 */
+	if (is_hyp_ctxt(vcpu))
+		return false;
+
 	sysreg = esr_sys64_to_sysreg(kvm_vcpu_get_esr(vcpu));
 
 	switch (sysreg) {
 	case SYS_CNTPCT_EL0:
 	case SYS_CNTPCTSS_EL0:
 		if (vcpu_has_nv(vcpu)) {
-			if (is_hyp_ctxt(vcpu)) {
-				ctxt = vcpu_hptimer(vcpu);
-				break;
-			}
-
 			/* Check for guest hypervisor trapping */
 			val = __vcpu_sys_reg(vcpu, CNTHCTL_EL2);
 			if (!vcpu_el2_e2h_is_set(vcpu))
@@ -503,16 +553,23 @@ static bool kvm_hyp_handle_cntpct(struct kvm_vcpu *vcpu)
 
 		ctxt = vcpu_ptimer(vcpu);
 		break;
+	case SYS_CNTVCT_EL0:
+	case SYS_CNTVCTSS_EL0:
+		if (vcpu_has_nv(vcpu)) {
+			/* Check for guest hypervisor trapping */
+			val = __vcpu_sys_reg(vcpu, CNTHCTL_EL2);
+
+			if (val & CNTHCTL_EL1TVCT)
+				return false;
+		}
+
+		ctxt = vcpu_vtimer(vcpu);
+		break;
 	default:
 		return false;
 	}
 
-	val = arch_timer_read_cntpct_el0();
-
-	if (ctxt->offset.vm_offset)
-		val -= *kern_hyp_va(ctxt->offset.vm_offset);
-	if (ctxt->offset.vcpu_offset)
-		val -= *kern_hyp_va(ctxt->offset.vcpu_offset);
+	val = compute_counter_value(ctxt);
 
 	vcpu_set_reg(vcpu, kvm_vcpu_sys_get_rt(vcpu), val);
 	__kvm_skip_instr(vcpu);
@@ -557,7 +614,7 @@ static bool kvm_hyp_handle_sysreg(struct kvm_vcpu *vcpu, u64 *exit_code)
 	    __vgic_v3_perform_cpuif_access(vcpu) == 1)
 		return true;
 
-	if (kvm_hyp_handle_cntpct(vcpu))
+	if (kvm_handle_cntxct(vcpu))
 		return true;
 
 	return false;
