@@ -1420,7 +1420,7 @@ void kvm_arch_mmu_enable_log_dirty_pt_masked(struct kvm *kvm,
 	}
 
 	/* Now handle 4K PTEs.  */
-	if (kvm_x86_ops.cpu_dirty_log_size)
+	if (kvm->arch.cpu_dirty_log_size)
 		kvm_mmu_clear_dirty_pt_masked(kvm, slot, gfn_offset, mask);
 	else
 		kvm_mmu_write_protect_pt_masked(kvm, slot, gfn_offset, mask);
@@ -1428,7 +1428,7 @@ void kvm_arch_mmu_enable_log_dirty_pt_masked(struct kvm *kvm,
 
 int kvm_cpu_dirty_log_size(struct kvm *kvm)
 {
-	return kvm_x86_ops.cpu_dirty_log_size;
+	return kvm->arch.cpu_dirty_log_size;
 }
 
 bool kvm_mmu_slot_gfn_write_protect(struct kvm *kvm,
