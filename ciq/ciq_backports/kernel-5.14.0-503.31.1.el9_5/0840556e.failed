@@ -1,0 +1,86 @@
+net: Protect dev->name by seqlock.
+
+jira LE-2742
+Rebuild_History Non-Buildable kernel-5.14.0-503.31.1.el9_5
+commit-author Kuniyuki Iwashima <kuniyu@amazon.com>
+commit 0840556e5a3a331b6932ef17dd4bc94445df3297
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-503.31.1.el9_5/0840556e.failed
+
+We will convert ioctl(SIOCGARP) to RCU, and then we need to copy
+dev->name which is currently protected by rtnl_lock().
+
+This patch does the following:
+
+  1) Add seqlock netdev_rename_lock to protect dev->name
+
+  2) Add netdev_copy_name() that copies dev->name to buffer
+     under netdev_rename_lock
+
+  3) Use netdev_copy_name() in netdev_get_name() and drop
+     devnet_rename_sem
+
+	Suggested-by: Eric Dumazet <edumazet@google.com>
+Link: https://lore.kernel.org/netdev/CANn89iJEWs7AYSJqGCUABeVqOCTkErponfZdT5kV-iD=-SajnQ@mail.gmail.com/
+	Signed-off-by: Kuniyuki Iwashima <kuniyu@amazon.com>
+Link: https://lore.kernel.org/r/20240430015813.71143-7-kuniyu@amazon.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 0840556e5a3a331b6932ef17dd4bc94445df3297)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/dev.c
+diff --cc net/core/dev.c
+index a4af81272b39,e02d2363347e..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -1241,9 -1270,11 +1254,11 @@@ rollback
+  		if (err >= 0) {
+  			err = ret;
+  			down_write(&devnet_rename_sem);
++ 			write_seqlock(&netdev_rename_lock);
+  			memcpy(dev->name, oldname, IFNAMSIZ);
++ 			write_sequnlock(&netdev_rename_lock);
+  			memcpy(oldname, newname, IFNAMSIZ);
+ -			WRITE_ONCE(dev->name_assign_type, old_assign_type);
+ +			dev->name_assign_type = old_assign_type;
+  			old_assign_type = NET_NAME_RENAMED;
+  			goto rollback;
+  		} else {
+@@@ -11075,6 -11418,19 +11090,22 @@@ int __dev_change_net_namespace(struct n
+  	dev_net_set(dev, net);
+  	dev->ifindex = new_ifindex;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (new_name[0]) {
++ 		/* Rename the netdev to prepared name */
++ 		write_seqlock(&netdev_rename_lock);
++ 		strscpy(dev->name, new_name, IFNAMSIZ);
++ 		write_sequnlock(&netdev_rename_lock);
++ 	}
++ 
++ 	/* Fixup kobjects */
++ 	dev_set_uevent_suppress(&dev->dev, 1);
++ 	err = device_rename(&dev->dev, dev->name);
++ 	dev_set_uevent_suppress(&dev->dev, 0);
++ 	WARN_ON(err);
++ 
+++>>>>>>> 0840556e5a3a (net: Protect dev->name by seqlock.)
+  	/* Send a netdev-add uevent to the new namespace */
+  	kobject_uevent(&dev->dev.kobj, KOBJ_ADD);
+  	netdev_adjacent_add_links(dev);
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 46c83f63545d..de505c2ad012 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -3192,6 +3192,7 @@ struct net_device *netdev_get_by_name(struct net *net, const char *name,
+ 				      netdevice_tracker *tracker, gfp_t gfp);
+ struct net_device *dev_get_by_index_rcu(struct net *net, int ifindex);
+ struct net_device *dev_get_by_napi_id(unsigned int napi_id);
++void netdev_copy_name(struct net_device *dev, char *name);
+ 
+ static inline int dev_hard_header(struct sk_buff *skb, struct net_device *dev,
+ 				  unsigned short type,
+* Unmerged path net/core/dev.c
