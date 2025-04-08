@@ -553,7 +553,7 @@ int snd_usb_create_quirk(struct snd_usb_audio *chip,
 static int snd_usb_extigy_boot_quirk(struct usb_device *dev, struct usb_interface *intf)
 {
 	struct usb_host_config *config = dev->actconfig;
-	struct usb_device_descriptor *new_device_descriptor __free(kfree) = NULL;
+	struct usb_device_descriptor *new_device_descriptor = NULL;
 	int err;
 
 	if (le16_to_cpu(get_cfg_desc(config)->wTotalLength) == EXTIGY_FIRMWARE_SIZE_OLD ||
@@ -577,6 +577,7 @@ static int snd_usb_extigy_boot_quirk(struct usb_device *dev, struct usb_interfac
 				new_device_descriptor->bNumConfigurations);
 		else
 			memcpy(&dev->descriptor, new_device_descriptor, sizeof(dev->descriptor));
+		kfree(new_device_descriptor);
 		err = usb_reset_configuration(dev);
 		if (err < 0)
 			dev_dbg(&dev->dev, "error usb_reset_configuration: %d\n", err);
@@ -908,7 +909,7 @@ static void mbox2_setup_48_24_magic(struct usb_device *dev)
 static int snd_usb_mbox2_boot_quirk(struct usb_device *dev)
 {
 	struct usb_host_config *config = dev->actconfig;
-	struct usb_device_descriptor *new_device_descriptor __free(kfree) = NULL;
+	struct usb_device_descriptor *new_device_descriptor = NULL;
 	int err;
 	u8 bootresponse[0x12];
 	int fwsize;
@@ -956,6 +957,7 @@ static int snd_usb_mbox2_boot_quirk(struct usb_device *dev)
 			new_device_descriptor->bNumConfigurations);
 	else
 		memcpy(&dev->descriptor, new_device_descriptor, sizeof(dev->descriptor));
+	kfree(new_device_descriptor);
 
 	err = usb_reset_configuration(dev);
 	if (err < 0)
@@ -1265,7 +1267,7 @@ static void mbox3_setup_defaults(struct usb_device *dev)
 static int snd_usb_mbox3_boot_quirk(struct usb_device *dev)
 {
 	struct usb_host_config *config = dev->actconfig;
-	struct usb_device_descriptor *new_device_descriptor __free(kfree) = NULL;
+	struct usb_device_descriptor *new_device_descriptor = NULL;
 	int err;
 	int descriptor_size;
 
@@ -1291,6 +1293,7 @@ static int snd_usb_mbox3_boot_quirk(struct usb_device *dev)
 			new_device_descriptor->bNumConfigurations);
 	else
 		memcpy(&dev->descriptor, new_device_descriptor, sizeof(dev->descriptor));
+	kfree(new_device_descriptor);
 
 	err = usb_reset_configuration(dev);
 	if (err < 0)
