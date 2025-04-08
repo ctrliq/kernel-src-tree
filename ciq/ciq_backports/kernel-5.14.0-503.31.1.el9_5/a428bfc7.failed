@@ -1,0 +1,207 @@
+arp: Get dev after calling arp_req_(delete|set|get)().
+
+jira LE-2742
+Rebuild_History Non-Buildable kernel-5.14.0-503.31.1.el9_5
+commit-author Kuniyuki Iwashima <kuniyu@amazon.com>
+commit a428bfc77a4dd4ba19b7646e887fa655fcfee5a0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-503.31.1.el9_5/a428bfc7.failed
+
+arp_ioctl() holds rtnl_lock() first regardless of cmd (SIOCDARP,
+SIOCSARP, and SIOCGARP) to get net_device by __dev_get_by_name()
+and copy dev->name safely.
+
+In the SIOCGARP path, arp_req_get() calls neigh_lookup(), which
+looks up a neighbour entry under RCU.
+
+We will extend the RCU section not to take rtnl_lock() and instead
+use dev_get_by_name_rcu() for SIOCGARP.
+
+As a preparation, let's move __dev_get_by_name() into another
+function and call it from arp_req_delete(), arp_req_set(), and
+arp_req_get().
+
+	Signed-off-by: Kuniyuki Iwashima <kuniyu@amazon.com>
+Link: https://lore.kernel.org/r/20240430015813.71143-6-kuniyu@amazon.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit a428bfc77a4dd4ba19b7646e887fa655fcfee5a0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/arp.c
+diff --cc net/ipv4/arp.c
+index 58c3109e7758,5034920be85a..000000000000
+--- a/net/ipv4/arp.c
++++ b/net/ipv4/arp.c
+@@@ -981,6 -1003,51 +981,54 @@@ out_of_mem
+   *	User level interface (ioctl)
+   */
+  
+++<<<<<<< HEAD
+++=======
++ static struct net_device *arp_req_dev_by_name(struct net *net, struct arpreq *r)
++ {
++ 	struct net_device *dev;
++ 
++ 	dev = __dev_get_by_name(net, r->arp_dev);
++ 	if (!dev)
++ 		return ERR_PTR(-ENODEV);
++ 
++ 	/* Mmmm... It is wrong... ARPHRD_NETROM == 0 */
++ 	if (!r->arp_ha.sa_family)
++ 		r->arp_ha.sa_family = dev->type;
++ 
++ 	if ((r->arp_flags & ATF_COM) && r->arp_ha.sa_family != dev->type)
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	return dev;
++ }
++ 
++ static struct net_device *arp_req_dev(struct net *net, struct arpreq *r)
++ {
++ 	struct net_device *dev;
++ 	struct rtable *rt;
++ 	__be32 ip;
++ 
++ 	if (r->arp_dev[0])
++ 		return arp_req_dev_by_name(net, r);
++ 
++ 	if (r->arp_flags & ATF_PUBL)
++ 		return NULL;
++ 
++ 	ip = ((struct sockaddr_in *)&r->arp_pa)->sin_addr.s_addr;
++ 
++ 	rt = ip_route_output(net, ip, 0, 0, 0, RT_SCOPE_LINK);
++ 	if (IS_ERR(rt))
++ 		return ERR_CAST(rt);
++ 
++ 	dev = rt->dst.dev;
++ 	ip_rt_put(rt);
++ 
++ 	if (!dev)
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	return dev;
++ }
++ 
+++>>>>>>> a428bfc77a4d (arp: Get dev after calling arp_req_(delete|set|get)().)
+  /*
+   *	Set (create) an ARP cache entry.
+   */
+@@@ -1020,28 -1087,20 +1068,39 @@@ static int arp_req_set_public(struct ne
+  	return arp_req_set_proxy(net, dev, 1);
+  }
+  
+- static int arp_req_set(struct net *net, struct arpreq *r,
+- 		       struct net_device *dev)
++ static int arp_req_set(struct net *net, struct arpreq *r)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct neighbour *neigh;
++ 	struct net_device *dev;
+++>>>>>>> a428bfc77a4d (arp: Get dev after calling arp_req_(delete|set|get)().)
+  	__be32 ip;
+ +	struct neighbour *neigh;
+  	int err;
+  
++ 	dev = arp_req_dev(net, r);
++ 	if (IS_ERR(dev))
++ 		return PTR_ERR(dev);
++ 
+  	if (r->arp_flags & ATF_PUBL)
+  		return arp_req_set_public(net, r, dev);
+  
+++<<<<<<< HEAD
+ +	ip = ((struct sockaddr_in *)&r->arp_pa)->sin_addr.s_addr;
+ +
+ +	if (!dev) {
+ +		struct rtable *rt = ip_route_output(net, ip, 0, RTO_ONLINK, 0);
+ +
+ +		if (IS_ERR(rt))
+ +			return PTR_ERR(rt);
+ +		dev = rt->dst.dev;
+ +		ip_rt_put(rt);
+ +		if (!dev)
+ +			return -EINVAL;
+ +	}
+++=======
+++>>>>>>> a428bfc77a4d (arp: Get dev after calling arp_req_(delete|set|get)().)
+  	switch (dev->type) {
+  #if IS_ENABLED(CONFIG_FDDI)
+  	case ARPHRD_FDDI:
+@@@ -1100,23 -1161,36 +1159,34 @@@ static int arp_req_get(struct net *net
+  {
+  	__be32 ip = ((struct sockaddr_in *) &r->arp_pa)->sin_addr.s_addr;
+  	struct neighbour *neigh;
+++<<<<<<< HEAD
+ +	int err = -ENXIO;
+++=======
++ 	struct net_device *dev;
++ 
++ 	if (!r->arp_dev[0])
++ 		return -ENODEV;
++ 
++ 	dev = arp_req_dev_by_name(net, r);
++ 	if (IS_ERR(dev))
++ 		return PTR_ERR(dev);
+++>>>>>>> a428bfc77a4d (arp: Get dev after calling arp_req_(delete|set|get)().)
+  
+  	neigh = neigh_lookup(&arp_tbl, &ip, dev);
+ -	if (!neigh)
+ -		return -ENXIO;
+ -
+ -	if (READ_ONCE(neigh->nud_state) & NUD_NOARP) {
+ +	if (neigh) {
+ +		if (!(READ_ONCE(neigh->nud_state) & NUD_NOARP)) {
+ +			read_lock_bh(&neigh->lock);
+ +			memcpy(r->arp_ha.sa_data, neigh->ha,
+ +			       min((size_t)dev->addr_len, sizeof(r->arp_ha.sa_data)));
+ +			r->arp_flags = arp_state_to_flags(neigh);
+ +			read_unlock_bh(&neigh->lock);
+ +			r->arp_ha.sa_family = dev->type;
+ +			strlcpy(r->arp_dev, dev->name, sizeof(r->arp_dev));
+ +			err = 0;
+ +		}
+  		neigh_release(neigh);
+ -		return -ENXIO;
+  	}
+ -
+ -	read_lock_bh(&neigh->lock);
+ -	memcpy(r->arp_ha.sa_data, neigh->ha,
+ -	       min(dev->addr_len, sizeof(r->arp_ha.sa_data_min)));
+ -	r->arp_flags = arp_state_to_flags(neigh);
+ -	read_unlock_bh(&neigh->lock);
+ -
+ -	neigh_release(neigh);
+ -
+ -	r->arp_ha.sa_family = dev->type;
+ -	strscpy(r->arp_dev, dev->name, sizeof(r->arp_dev));
+ -
+ -	return 0;
+ +	return err;
+  }
+  
+  int arp_invalidate(struct net_device *dev, __be32 ip, bool force)
+@@@ -1167,15 -1245,7 +1241,19 @@@ static int arp_req_delete(struct net *n
+  		return arp_req_delete_public(net, r, dev);
+  
+  	ip = ((struct sockaddr_in *)&r->arp_pa)->sin_addr.s_addr;
+++<<<<<<< HEAD
+ +	if (!dev) {
+ +		struct rtable *rt = ip_route_output(net, ip, 0, RTO_ONLINK, 0);
+ +		if (IS_ERR(rt))
+ +			return PTR_ERR(rt);
+ +		dev = rt->dst.dev;
+ +		ip_rt_put(rt);
+ +		if (!dev)
+ +			return -EINVAL;
+ +	}
+++=======
++ 
+++>>>>>>> a428bfc77a4d (arp: Get dev after calling arp_req_(delete|set|get)().)
+  	return arp_invalidate(dev, ip, true);
+  }
+  
+* Unmerged path net/ipv4/arp.c
