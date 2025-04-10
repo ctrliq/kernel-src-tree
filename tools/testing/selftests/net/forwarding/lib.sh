@@ -69,6 +69,7 @@ declare -A NETIFS=(
 : "${REQUIRE_JQ:=yes}"
 : "${REQUIRE_MZ:=yes}"
 : "${REQUIRE_MTOOLS:=no}"
+: "${REQUIRE_TEAMD:=no}"
 
 # Whether to override MAC addresses on interfaces participating in the test.
 : "${STABLE_MAC_ADDRS:=no}"
@@ -321,6 +322,9 @@ if [[ "$REQUIRE_JQ" = "yes" ]]; then
 fi
 if [[ "$REQUIRE_MZ" = "yes" ]]; then
 	require_command $MZ
+fi
+if [[ "$REQUIRE_TEAMD" = "yes" ]]; then
+	require_command $TEAMD
 fi
 if [[ "$REQUIRE_MTOOLS" = "yes" ]]; then
 	# https://github.com/troglobit/mtools
