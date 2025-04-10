@@ -45,7 +45,7 @@ struct nfs_local_fsync_ctx {
 	struct completion	*done;
 };
 
-static bool localio_enabled __read_mostly = true;
+static bool localio_enabled __read_mostly = false;
 module_param(localio_enabled, bool, 0644);
 
 static inline bool nfs_client_is_local(const struct nfs_client *clp)
