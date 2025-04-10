@@ -3092,13 +3092,13 @@ static ssize_t shmem_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	int error = 0;
 	ssize_t retval = 0;
 
-	offset = iocb->ki_pos & ~PAGE_MASK;
-
 	for (;;) {
 		struct folio *folio = NULL;
 		struct page *page = NULL;
 		unsigned long nr, ret;
 		loff_t end_offset, i_size = i_size_read(inode);
+		bool fallback_page_copy = false;
+		size_t fsize;
 
 		if (unlikely(iocb->ki_pos >= i_size))
 			break;
@@ -3119,6 +3119,10 @@ static ssize_t shmem_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 				error = -EIO;
 				break;
 			}
+
+			if (folio_test_large(folio) &&
+			    folio_test_has_hwpoisoned(folio))
+				fallback_page_copy = true;
 		}
 
 		/*
@@ -3132,7 +3136,12 @@ static ssize_t shmem_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 			break;
 		}
 		end_offset = min_t(loff_t, i_size, iocb->ki_pos + to->count);
-		nr = min_t(loff_t, end_offset - iocb->ki_pos, PAGE_SIZE - offset);
+		if (folio && likely(!fallback_page_copy))
+			fsize = folio_size(folio);
+		else
+			fsize = PAGE_SIZE;
+		offset = iocb->ki_pos & (fsize - 1);
+		nr = min_t(loff_t, end_offset - iocb->ki_pos, fsize - offset);
 
 		if (folio) {
 			/*
@@ -3140,10 +3149,15 @@ static ssize_t shmem_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 			 * virtual addresses, take care about potential aliasing
 			 * before reading the page on the kernel side.
 			 */
-			if (mapping_writably_mapped(mapping))
-				flush_dcache_page(page);
+			if (mapping_writably_mapped(mapping)) {
+				if (likely(!fallback_page_copy))
+					flush_dcache_folio(folio);
+				else
+					flush_dcache_page(page);
+			}
+
 			/*
-			 * Mark the page accessed if we read the beginning.
+			 * Mark the folio accessed if we read the beginning.
 			 */
 			if (!offset)
 				folio_mark_accessed(folio);
@@ -3151,9 +3165,11 @@ static ssize_t shmem_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 			 * Ok, we have the page, and it's up-to-date, so
 			 * now we can copy it to user space...
 			 */
-			ret = copy_page_to_iter(page, offset, nr, to);
+			if (likely(!fallback_page_copy))
+				ret = copy_folio_to_iter(folio, offset, nr, to);
+			else
+				ret = copy_page_to_iter(page, offset, nr, to);
 			folio_put(folio);
-
 		} else if (user_backed_iter(to)) {
 			/*
 			 * Copy to user tends to be so well optimized, but
@@ -3171,8 +3187,6 @@ static ssize_t shmem_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		}
 
 		retval += ret;
-		offset += ret;
-		offset &= ~PAGE_MASK;
 		iocb->ki_pos += ret;
 
 		if (!iov_iter_count(to))
