@@ -10,6 +10,8 @@
 #define _ASM_S390_HUGETLB_H
 
 #include <linux/pgtable.h>
+#include <linux/swap.h>
+#include <linux/swapops.h>
 #include <asm/page.h>
 
 #define hugepages_supported()			(MACHINE_HAS_EDAT1)
