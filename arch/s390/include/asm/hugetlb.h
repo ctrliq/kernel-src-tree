@@ -78,7 +78,7 @@ static inline int huge_pte_none(pte_t pte)
 #define __HAVE_ARCH_HUGE_PTE_NONE_MOSTLY
 static inline int huge_pte_none_mostly(pte_t pte)
 {
-	return huge_pte_none(pte);
+	return huge_pte_none(pte) || is_pte_marker(pte);
 }
 
 #define __HAVE_ARCH_HUGE_PTE_MKUFFD_WP
