@@ -140,6 +140,7 @@ static inline struct bcm_sock *bcm_sk(const struct sock *sk)
 /*
  * procfs functions
  */
+#if IS_ENABLED(CONFIG_PROC_FS)
 static char *bcm_proc_getifname(char *result, int ifindex)
 {
 	struct net_device *dev;
@@ -236,6 +237,7 @@ static const struct file_operations bcm_proc_fops = {
 	.llseek		= seq_lseek,
 	.release	= single_release,
 };
+#endif /* CONFIG_PROC_FS */
 
 /*
  * bcm_can_tx - send the (next) CAN frame to the appropriate CAN interface
@@ -1474,9 +1476,11 @@ static int bcm_release(struct socket *sock)
 		bcm_remove_op(op);
 	}
 
+#if IS_ENABLED(CONFIG_PROC_FS)
 	/* remove procfs entry */
 	if (proc_dir && bo->bcm_proc_read)
 		remove_proc_entry(bo->procname, proc_dir);
+#endif /* CONFIG_PROC_FS */
 
 	/* remove device reference */
 	if (bo->bound) {
@@ -1534,6 +1538,7 @@ static int bcm_connect(struct socket *sock, struct sockaddr *uaddr, int len,
 		bo->ifindex = 0;
 	}
 
+#if IS_ENABLED(CONFIG_PROC_FS)
 	if (proc_dir) {
 		/* unique socket address as filename */
 		sprintf(bo->procname, "%lu", sock_i_ino(sk));
@@ -1545,6 +1550,7 @@ static int bcm_connect(struct socket *sock, struct sockaddr *uaddr, int len,
 			goto fail;
 		}
 	}
+#endif /* CONFIG_PROC_FS */
 
 	bo->bound = 1;
 
@@ -1636,8 +1642,10 @@ static int __init bcm_module_init(void)
 		return err;
 	}
 
+#if IS_ENABLED(CONFIG_PROC_FS)
 	/* create /proc/net/can-bcm directory */
 	proc_dir = proc_mkdir("can-bcm", init_net.proc_net);
+#endif /* CONFIG_PROC_FS */
 	return 0;
 }
 
@@ -1645,8 +1653,10 @@ static void __exit bcm_module_exit(void)
 {
 	can_proto_unregister(&bcm_can_proto);
 
+#if IS_ENABLED(CONFIG_PROC_FS)
 	if (proc_dir)
 		remove_proc_entry("can-bcm", init_net.proc_net);
+#endif /* CONFIG_PROC_FS */
 }
 
 module_init(bcm_module_init);
