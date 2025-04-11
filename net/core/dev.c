@@ -952,7 +952,6 @@ EXPORT_SYMBOL(netdev_get_by_index);
  *	its reference counter increased so the caller must be careful
  *	about locking. The caller must hold RCU lock.
  */
-
 struct net_device *dev_get_by_napi_id(unsigned int napi_id)
 {
 	struct napi_struct *napi;
@@ -966,7 +965,6 @@ struct net_device *dev_get_by_napi_id(unsigned int napi_id)
 
 	return napi ? napi->dev : NULL;
 }
-EXPORT_SYMBOL(dev_get_by_napi_id);
 
 static DEFINE_SEQLOCK(netdev_rename_lock);
 
