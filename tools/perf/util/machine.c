@@ -1345,7 +1345,7 @@ static int maps__set_module_path(struct maps *maps, const char *path, struct kmo
 	 * we need to update the symtab_type if needed.
 	 */
 	if (m->comp && is_kmod_dso(dso)) {
-		dso__set_symtab_type(dso, dso__symtab_type(dso));
+		dso__set_symtab_type(dso, dso__symtab_type(dso)+1);
 		dso__set_comp(dso, m->comp);
 	}
 	map__put(map);
@@ -1467,6 +1467,8 @@ static int machine__create_modules(struct machine *machine)
 
 	if (modules__parse(modules, machine, machine__create_module))
 		return -1;
+
+	maps__fixup_end(machine__kernel_maps(machine));
 
 	if (!machine__set_modules_path(machine))
 		return 0;
