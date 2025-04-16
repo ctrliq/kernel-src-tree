@@ -83,6 +83,11 @@ BUILD_TARGET_USERDEF:=$(BUILD_TARGET)
 
 ifndef DIST
   DIST := $(shell $(RPMBUILD) --eval '%{?dist}')
+else
+  # automotive uses a different dist tag
+  ifeq ($(DIST)iv, $(shell $(RPMBUILD) --eval '%{?dist}'))
+    DIST:=$(shell $(RPMBUILD) --eval '%{?dist}')
+  endif
 endif
 
 ifndef DISTRO
