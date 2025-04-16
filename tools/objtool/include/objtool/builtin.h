@@ -38,6 +38,7 @@ struct opts {
 	const char *output;
 	bool sec_address;
 	bool stats;
+	bool werror;
 };
 
 extern struct opts opts;

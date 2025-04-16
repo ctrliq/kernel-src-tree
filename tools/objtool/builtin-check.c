@@ -99,6 +99,7 @@ const struct option check_options[] = {
 	OPT_STRING('o',  "output", &opts.output, "file", "output file name"),
 	OPT_BOOLEAN(0,   "sec-address", &opts.sec_address, "print section addresses in warnings"),
 	OPT_BOOLEAN(0,   "stats", &opts.stats, "print statistics"),
+	OPT_BOOLEAN(0,   "Werror", &opts.werror, "return error on warnings"),
 
 	OPT_END(),
 };
