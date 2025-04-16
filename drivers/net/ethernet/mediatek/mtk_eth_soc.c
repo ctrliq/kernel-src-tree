@@ -2305,7 +2305,7 @@ static int mtk_open(struct net_device *dev)
 		if (err)
 			return err;
 
-		if (eth->soc->offload_version && mtk_ppe_start(&eth->ppe) == 0)
+		if (eth->soc->offload_version && mtk_ppe_start(eth->ppe) == 0)
 			gdm_config = MTK_GDMA_TO_PPE;
 
 		mtk_gdm_config(eth, gdm_config);
@@ -2379,7 +2379,7 @@ static int mtk_stop(struct net_device *dev)
 	mtk_dma_free(eth);
 
 	if (eth->soc->offload_version)
-		mtk_ppe_stop(&eth->ppe);
+		mtk_ppe_stop(eth->ppe);
 
 	return 0;
 }
@@ -3271,10 +3271,11 @@ static int mtk_probe(struct platform_device *pdev)
 	}
 
 	if (eth->soc->offload_version) {
-		err = mtk_ppe_init(&eth->ppe, eth->dev,
-				   eth->base + MTK_ETH_PPE_BASE, 2);
-		if (err)
+		eth->ppe = mtk_ppe_init(eth->dev, eth->base + MTK_ETH_PPE_BASE, 2);
+		if (!eth->ppe) {
+			err = -ENOMEM;
 			goto err_free_dev;
+		}
 
 		err = mtk_eth_offload_init(eth);
 		if (err)
