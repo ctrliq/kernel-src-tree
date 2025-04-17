@@ -1178,9 +1178,6 @@ static struct css_set *find_css_set(struct css_set *old_cset,
 	unsigned long key;
 	int ssid;
 
-	if (!CGROUP_HAS_SUBSYS_CONFIG)
-		return NULL;
-
 	lockdep_assert_held(&cgroup_mutex);
 
 	/* First see if we already have a cgroup group that matches
@@ -6160,9 +6157,6 @@ int __init cgroup_init(void)
 {
 	struct cgroup_subsys *ss;
 	int ssid;
-
-	if (!CGROUP_HAS_SUBSYS_CONFIG)
-		return -EINVAL;
 
 	BUILD_BUG_ON(CGROUP_SUBSYS_COUNT > 16);
 	BUG_ON(cgroup_init_cftypes(NULL, cgroup_base_files));
