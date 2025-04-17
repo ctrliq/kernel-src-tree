@@ -430,9 +430,6 @@ static struct net_device *bond_ipsec_dev(struct xfrm_state *xs)
 	struct bonding *bond;
 	struct slave *slave;
 
-	if (!bond_dev)
-		return NULL;
-
 	bond = netdev_priv(bond_dev);
 	if (BOND_MODE(bond) != BOND_MODE_ACTIVEBACKUP)
 		return NULL;
@@ -1006,6 +1003,8 @@ static void bond_hw_addr_swap(struct bonding *bond, struct slave *new_active,
 
 		if (bond->dev->flags & IFF_UP)
 			bond_hw_addr_flush(bond->dev, old_active->dev);
+
+		bond_slave_ns_maddrs_add(bond, old_active);
 	}
 
 	if (new_active) {
@@ -1022,6 +1021,8 @@ static void bond_hw_addr_swap(struct bonding *bond, struct slave *new_active,
 			dev_mc_sync(new_active->dev, bond->dev);
 			netif_addr_unlock_bh(bond->dev);
 		}
+
+		bond_slave_ns_maddrs_del(bond, new_active);
 	}
 }
 
@@ -2355,6 +2356,11 @@ int bond_enslave(struct net_device *bond_dev, struct net_device *slave_dev,
 	bond_compute_features(bond);
 	bond_set_carrier(bond);
 
+	/* Needs to be called before bond_select_active_slave(), which will
+	 * remove the maddrs if the slave is selected as active slave.
+	 */
+	bond_slave_ns_maddrs_add(bond, new_slave);
+
 	if (bond_uses_primary(bond)) {
 		block_netpoll_tx();
 		bond_select_active_slave(bond);
@@ -2363,7 +2369,6 @@ int bond_enslave(struct net_device *bond_dev, struct net_device *slave_dev,
 
 	if (bond_mode_can_use_xmit_hash(bond))
 		bond_update_slave_arr(bond, NULL);
-
 
 	if (!slave_dev->netdev_ops->ndo_bpf ||
 	    !slave_dev->netdev_ops->ndo_xdp_xmit) {
@@ -2548,7 +2553,7 @@ static int __bond_release_one(struct net_device *bond_dev,
 
 	RCU_INIT_POINTER(bond->current_arp_slave, NULL);
 
-	if (!all && (!bond->params.fail_over_mac ||
+	if (!all && (bond->params.fail_over_mac != BOND_FOM_ACTIVE ||
 		     BOND_MODE(bond) != BOND_MODE_ACTIVEBACKUP)) {
 		if (ether_addr_equal_64bits(bond_dev->dev_addr, slave->perm_hwaddr) &&
 		    bond_has_slaves(bond))
@@ -2561,6 +2566,12 @@ static int __bond_release_one(struct net_device *bond_dev,
 
 	if (oldcurrent == slave)
 		bond_change_active_slave(bond, NULL);
+
+	/* Must be called after bond_change_active_slave () as the slave
+	 * might change from an active slave to a backup slave. Then it is
+	 * necessary to clear the maddrs on the backup slave.
+	 */
+	bond_slave_ns_maddrs_del(bond, slave);
 
 	if (bond_is_lb(bond)) {
 		/* Must be called only after the slave has been
@@ -6476,7 +6487,8 @@ static int bond_init(struct net_device *bond_dev)
 
 	netdev_dbg(bond_dev, "Begin bond_init\n");
 
-	bond->wq = alloc_ordered_workqueue(bond_dev->name, WQ_MEM_RECLAIM);
+	bond->wq = alloc_ordered_workqueue("%s", WQ_MEM_RECLAIM,
+					   bond_dev->name);
 	if (!bond->wq)
 		return -ENOMEM;
 
