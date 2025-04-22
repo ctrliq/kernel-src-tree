@@ -42,7 +42,6 @@
 #include <linux/file.h>
 #include <linux/module.h>
 #include <linux/atomic.h>
-#include <linux/cgroup_dmem.h>
 #include <linux/dma-resv.h>
 
 #include "ttm_module.h"
@@ -500,13 +499,6 @@ struct ttm_bo_evict_walk {
 	struct ttm_resource **res;
 	/** @evicted: Number of successful evictions. */
 	unsigned long evicted;
-
-	/** @limit_pool: Which pool limit we should test against */
-	struct dmem_cgroup_pool_state *limit_pool;
-	/** @try_low: Whether we should attempt to evict BO's with low watermark threshold */
-	bool try_low;
-	/** @hit_low: If we cannot evict a bo when @try_low is false (first pass) */
-	bool hit_low;
 };
 
 static s64 ttm_bo_evict_cb(struct ttm_lru_walk *walk, struct ttm_buffer_object *bo)
@@ -514,10 +506,6 @@ static s64 ttm_bo_evict_cb(struct ttm_lru_walk *walk, struct ttm_buffer_object *
 	struct ttm_bo_evict_walk *evict_walk =
 		container_of(walk, typeof(*evict_walk), walk);
 	s64 lret;
-
-	if (!dmem_cgroup_state_evict_valuable(evict_walk->limit_pool, bo->resource->css,
-					      evict_walk->try_low, &evict_walk->hit_low))
-		return 0;
 
 	if (bo->pin_count || !bo->bdev->funcs->eviction_valuable(bo, evict_walk->place))
 		return 0;
@@ -536,7 +524,7 @@ static s64 ttm_bo_evict_cb(struct ttm_lru_walk *walk, struct ttm_buffer_object *
 	evict_walk->evicted++;
 	if (evict_walk->res)
 		lret = ttm_resource_alloc(evict_walk->evictor, evict_walk->place,
-					  evict_walk->res, NULL);
+					  evict_walk->res);
 	if (lret == 0)
 		return 1;
 out:
@@ -557,8 +545,7 @@ static int ttm_bo_evict_alloc(struct ttm_device *bdev,
 			      struct ttm_buffer_object *evictor,
 			      struct ttm_operation_ctx *ctx,
 			      struct ww_acquire_ctx *ticket,
-			      struct ttm_resource **res,
-			      struct dmem_cgroup_pool_state *limit_pool)
+			      struct ttm_resource **res)
 {
 	struct ttm_bo_evict_walk evict_walk = {
 		.walk = {
@@ -569,39 +556,22 @@ static int ttm_bo_evict_alloc(struct ttm_device *bdev,
 		.place = place,
 		.evictor = evictor,
 		.res = res,
-		.limit_pool = limit_pool,
 	};
 	s64 lret;
 
 	evict_walk.walk.trylock_only = true;
 	lret = ttm_lru_walk_for_evict(&evict_walk.walk, bdev, man, 1);
-
-	/* One more attempt if we hit low limit? */
-	if (!lret && evict_walk.hit_low) {
-		evict_walk.try_low = true;
-		lret = ttm_lru_walk_for_evict(&evict_walk.walk, bdev, man, 1);
-	}
 	if (lret || !ticket)
 		goto out;
 
-	/* Reset low limit */
-	evict_walk.try_low = evict_walk.hit_low = false;
 	/* If ticket-locking, repeat while making progress. */
 	evict_walk.walk.trylock_only = false;
-
-retry:
 	do {
 		/* The walk may clear the evict_walk.walk.ticket field */
 		evict_walk.walk.ticket = ticket;
 		evict_walk.evicted = 0;
 		lret = ttm_lru_walk_for_evict(&evict_walk.walk, bdev, man, 1);
 	} while (!lret && evict_walk.evicted);
-
-	/* We hit the low limit? Try once more */
-	if (!lret && evict_walk.hit_low && !evict_walk.try_low) {
-		evict_walk.try_low = true;
-		goto retry;
-	}
 out:
 	if (lret < 0)
 		return lret;
@@ -719,7 +689,6 @@ static int ttm_bo_alloc_resource(struct ttm_buffer_object *bo,
 
 	for (i = 0; i < placement->num_placement; ++i) {
 		const struct ttm_place *place = &placement->placement[i];
-		struct dmem_cgroup_pool_state *limit_pool = NULL;
 		struct ttm_resource_manager *man;
 		bool may_evict;
 
@@ -732,20 +701,15 @@ static int ttm_bo_alloc_resource(struct ttm_buffer_object *bo,
 			continue;
 
 		may_evict = (force_space && place->mem_type != TTM_PL_SYSTEM);
-		ret = ttm_resource_alloc(bo, place, res, force_space ? &limit_pool : NULL);
+		ret = ttm_resource_alloc(bo, place, res);
 		if (ret) {
-			if (ret != -ENOSPC && ret != -EAGAIN) {
-				dmem_cgroup_pool_state_put(limit_pool);
+			if (ret != -ENOSPC)
 				return ret;
-			}
-			if (!may_evict) {
-				dmem_cgroup_pool_state_put(limit_pool);
+			if (!may_evict)
 				continue;
-			}
 
 			ret = ttm_bo_evict_alloc(bdev, man, place, bo, ctx,
-						 ticket, res, limit_pool);
-			dmem_cgroup_pool_state_put(limit_pool);
+						 ticket, res);
 			if (ret == -EBUSY)
 				continue;
 			if (ret)
@@ -1092,8 +1056,6 @@ struct ttm_bo_swapout_walk {
 	struct ttm_lru_walk walk;
 	/** @gfp_flags: The gfp flags to use for ttm_tt_swapout() */
 	gfp_t gfp_flags;
-
-	bool hit_low, evict_low;
 };
 
 static s64
@@ -1144,7 +1106,7 @@ ttm_bo_swapout_cb(struct ttm_lru_walk *walk, struct ttm_buffer_object *bo)
 
 		memset(&hop, 0, sizeof(hop));
 		place.mem_type = TTM_PL_SYSTEM;
-		ret = ttm_resource_alloc(bo, &place, &evict_mem, NULL);
+		ret = ttm_resource_alloc(bo, &place, &evict_mem);
 		if (ret)
 			goto out;
 
