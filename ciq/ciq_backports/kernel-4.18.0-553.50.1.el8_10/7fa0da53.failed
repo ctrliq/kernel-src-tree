@@ -1,0 +1,430 @@
+x86/xen: remove hypercall page
+
+jira LE-2815
+cve CVE-2024-53241
+Rebuild_History Non-Buildable kernel-4.18.0-553.50.1.el8_10
+commit-author Juergen Gross <jgross@suse.com>
+commit 7fa0da5373685e7ed249af3fa317ab1e1ba8b0a6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.50.1.el8_10/7fa0da53.failed
+
+The hypercall page is no longer needed. It can be removed, as from the
+Xen perspective it is optional.
+
+But, from Linux's perspective, it removes naked RET instructions that
+escape the speculative protections that Call Depth Tracking and/or
+Untrain Ret are trying to achieve.
+
+This is part of XSA-466 / CVE-2024-53241.
+
+	Reported-by: Andrew Cooper <andrew.cooper3@citrix.com>
+	Signed-off-by: Juergen Gross <jgross@suse.com>
+	Reviewed-by: Andrew Cooper <andrew.cooper3@citrix.com>
+	Reviewed-by: Jan Beulich <jbeulich@suse.com>
+(cherry picked from commit 7fa0da5373685e7ed249af3fa317ab1e1ba8b0a6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/xen/hypercall.h
+#	arch/x86/kernel/callthunks.c
+#	arch/x86/kernel/vmlinux.lds.S
+#	arch/x86/xen/enlighten.c
+#	arch/x86/xen/enlighten_pvh.c
+#	arch/x86/xen/xen-head.S
+diff --cc arch/x86/include/asm/xen/hypercall.h
+index dcf9353a662a,97771b9d33af..000000000000
+--- a/arch/x86/include/asm/xen/hypercall.h
++++ b/arch/x86/include/asm/xen/hypercall.h
+@@@ -86,11 -88,20 +86,28 @@@ struct xen_dm_op_buf
+   * there aren't more than 5 arguments...)
+   */
+  
+++<<<<<<< HEAD
+ +extern struct { char _entry[32]; } hypercall_page[];
+ +
+ +#define __HYPERCALL		"call hypercall_page+%c[offset]"
+ +#define __HYPERCALL_ENTRY(x)						\
+ +	[offset] "i" (__HYPERVISOR_##x * sizeof(hypercall_page[0]))
+++=======
++ void xen_hypercall_func(void);
++ DECLARE_STATIC_CALL(xen_hypercall, xen_hypercall_func);
++ 
++ #ifdef MODULE
++ #define __ADDRESSABLE_xen_hypercall
++ #else
++ #define __ADDRESSABLE_xen_hypercall __ADDRESSABLE_ASM_STR(__SCK__xen_hypercall)
++ #endif
++ 
++ #define __HYPERCALL					\
++ 	__ADDRESSABLE_xen_hypercall			\
++ 	"call __SCT__xen_hypercall"
++ 
++ #define __HYPERCALL_ENTRY(x)	"a" (x)
+++>>>>>>> 7fa0da537368 (x86/xen: remove hypercall page)
+  
+  #ifdef CONFIG_X86_32
+  #define __HYPERCALL_RETREG	"eax"
+diff --cc arch/x86/kernel/vmlinux.lds.S
+index 8286344639c2,6a17396c8174..000000000000
+--- a/arch/x86/kernel/vmlinux.lds.S
++++ b/arch/x86/kernel/vmlinux.lds.S
+@@@ -473,12 -511,19 +473,28 @@@ INIT_PER_CPU(irq_stack_backing_store)
+  		"SRSO function pair won't alias");
+  #endif
+  
+ -#endif /* CONFIG_X86_64 */
+ +#endif /* CONFIG_X86_32 */
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_KEXEC_CORE
+ +#include <asm/kexec.h>
+ +
+ +. = ASSERT(kexec_control_code_size <= KEXEC_CONTROL_CODE_MAX_SIZE,
+ +           "kexec control code size is too big");
+++=======
++ /*
++  * The symbols below are referenced using relative relocations in the
++  * respective ELF notes. This produces build time constants that the
++  * linker will never mark as relocatable. (Using just ABSOLUTE() is not
++  * sufficient for that).
++  */
++ #ifdef CONFIG_XEN_PV
++ xen_elfnote_entry_value =
++ 	ABSOLUTE(xen_elfnote_entry) + ABSOLUTE(startup_xen);
++ #endif
++ #ifdef CONFIG_PVH
++ xen_elfnote_phys32_entry_value =
++ 	ABSOLUTE(xen_elfnote_phys32_entry) + ABSOLUTE(pvh_start_xen - LOAD_OFFSET);
+++>>>>>>> 7fa0da537368 (x86/xen: remove hypercall page)
+  #endif
+ +
+diff --cc arch/x86/xen/enlighten.c
+index a8b0218ac5ee,43dcd8c7badc..000000000000
+--- a/arch/x86/xen/enlighten.c
++++ b/arch/x86/xen/enlighten.c
+@@@ -14,12 -18,12 +14,17 @@@
+  #include <asm/xen/hypervisor.h>
+  #include <asm/cpu.h>
+  #include <asm/e820/api.h> 
+ -#include <asm/setup.h>
+  
+  #include "xen-ops.h"
+ +#include "smp.h"
+ +#include "pmu.h"
+  
+++<<<<<<< HEAD
+ +EXPORT_SYMBOL_GPL(hypercall_page);
+++=======
++ DEFINE_STATIC_CALL(xen_hypercall, xen_hypercall_hvm);
++ EXPORT_STATIC_CALL_TRAMP(xen_hypercall);
+++>>>>>>> 7fa0da537368 (x86/xen: remove hypercall page)
+  
+  /*
+   * Pointer to the xen_vcpu_info structure or
+diff --cc arch/x86/xen/enlighten_pvh.c
+index 02e3ab7ff242,0e3d930bcb89..000000000000
+--- a/arch/x86/xen/enlighten_pvh.c
++++ b/arch/x86/xen/enlighten_pvh.c
+@@@ -18,91 -23,146 +18,129 @@@
+  /*
+   * PVH variables.
+   *
+ - * The variable xen_pvh needs to live in a data segment since it is used
+ - * after startup_{32|64} is invoked, which will clear the .bss segment.
+ + * xen_pvh pvh_bootparams and pvh_start_info need to live in data segment
+ + * since they are used after startup_{32|64}, which clear .bss, are invoked.
+   */
+ -bool __ro_after_init xen_pvh;
+ -EXPORT_SYMBOL_GPL(xen_pvh);
+ +bool xen_pvh __attribute__((section(".data"))) = 0;
+ +struct boot_params pvh_bootparams __attribute__((section(".data")));
+ +struct hvm_start_info pvh_start_info __attribute__((section(".data")));
+  
+ -#ifdef CONFIG_XEN_DOM0
+ -int xen_pvh_setup_gsi(int gsi, int trigger, int polarity)
+ -{
+ -	int ret;
+ -	struct physdev_setup_gsi setup_gsi;
+ +unsigned int pvh_start_info_sz = sizeof(pvh_start_info);
+  
+ -	setup_gsi.gsi = gsi;
+ -	setup_gsi.triggering = (trigger == ACPI_EDGE_SENSITIVE ? 0 : 1);
+ -	setup_gsi.polarity = (polarity == ACPI_ACTIVE_HIGH ? 0 : 1);
+ -
+ -	ret = HYPERVISOR_physdev_op(PHYSDEVOP_setup_gsi, &setup_gsi);
+ -	if (ret == -EEXIST) {
+ -		xen_raw_printk("Already setup the GSI :%d\n", gsi);
+ -		ret = 0;
+ -	} else if (ret)
+ -		xen_raw_printk("Fail to setup GSI (%d)!\n", gsi);
+ -
+ -	return ret;
+ +static u64 pvh_get_root_pointer(void)
+ +{
+ +	return pvh_start_info.rsdp_paddr;
+  }
+ -EXPORT_SYMBOL_GPL(xen_pvh_setup_gsi);
+ -#endif
+  
+ -/*
+ - * Reserve e820 UNUSABLE regions to inflate the memory balloon.
+ - *
+ - * On PVH dom0 the host memory map is used, RAM regions available to dom0 are
+ - * located as the same place as in the native memory map, but since dom0 gets
+ - * less memory than the total amount of host RAM the ranges that can't be
+ - * populated are converted from RAM -> UNUSABLE.  Use such regions (up to the
+ - * ratio signaled in EXTRA_MEM_RATIO) in order to inflate the balloon driver at
+ - * boot.  Doing so prevents the guest (even if just temporary) from using holes
+ - * in the memory map in order to map grants or foreign addresses, and
+ - * hopefully limits the risk of a clash with a device MMIO region.  Ideally the
+ - * hypervisor should notify us which memory ranges are suitable for creating
+ - * foreign mappings, but that's not yet implemented.
+ - */
+ -static void __init pvh_reserve_extra_memory(void)
+ +static void __init init_pvh_bootparams(void)
+  {
+ -	struct boot_params *bootp = &boot_params;
+ -	unsigned int i, ram_pages = 0, extra_pages;
+ +	struct xen_memory_map memmap;
+ +	int rc;
+  
+ -	for (i = 0; i < bootp->e820_entries; i++) {
+ -		struct boot_e820_entry *e = &bootp->e820_table[i];
+ +	memset(&pvh_bootparams, 0, sizeof(pvh_bootparams));
+  
+ -		if (e->type != E820_TYPE_RAM)
+ -			continue;
+ -		ram_pages += PFN_DOWN(e->addr + e->size) - PFN_UP(e->addr);
+ +	memmap.nr_entries = ARRAY_SIZE(pvh_bootparams.e820_table);
+ +	set_xen_guest_handle(memmap.buffer, pvh_bootparams.e820_table);
+ +	rc = HYPERVISOR_memory_op(XENMEM_memory_map, &memmap);
+ +	if (rc) {
+ +		xen_raw_printk("XENMEM_memory_map failed (%d)\n", rc);
+ +		BUG();
+ +	}
+ +	pvh_bootparams.e820_entries = memmap.nr_entries;
+ +
+ +	if (pvh_bootparams.e820_entries < E820_MAX_ENTRIES_ZEROPAGE - 1) {
+ +		pvh_bootparams.e820_table[pvh_bootparams.e820_entries].addr =
+ +			ISA_START_ADDRESS;
+ +		pvh_bootparams.e820_table[pvh_bootparams.e820_entries].size =
+ +			ISA_END_ADDRESS - ISA_START_ADDRESS;
+ +		pvh_bootparams.e820_table[pvh_bootparams.e820_entries].type =
+ +			E820_TYPE_RESERVED;
+ +		pvh_bootparams.e820_entries++;
+ +	} else
+ +		xen_raw_printk("Warning: Can fit ISA range into e820\n");
+ +
+ +	pvh_bootparams.hdr.cmd_line_ptr =
+ +		pvh_start_info.cmdline_paddr;
+ +
+ +	/* The first module is always ramdisk. */
+ +	if (pvh_start_info.nr_modules) {
+ +		struct hvm_modlist_entry *modaddr =
+ +			__va(pvh_start_info.modlist_paddr);
+ +		pvh_bootparams.hdr.ramdisk_image = modaddr->paddr;
+ +		pvh_bootparams.hdr.ramdisk_size = modaddr->size;
+  	}
+ -
+ -	/* Max amount of extra memory. */
+ -	extra_pages = EXTRA_MEM_RATIO * ram_pages;
+  
+  	/*
+ -	 * Convert UNUSABLE ranges to RAM and reserve them for foreign mapping
+ -	 * purposes.
+ +	 * See Documentation/x86/boot.txt.
+ +	 *
+ +	 * Version 2.12 supports Xen entry point but we will use default x86/PC
+ +	 * environment (i.e. hardware_subarch 0).
+  	 */
+ -	for (i = 0; i < bootp->e820_entries && extra_pages; i++) {
+ -		struct boot_e820_entry *e = &bootp->e820_table[i];
+ -		unsigned long pages;
+ -
+ -		if (e->type != E820_TYPE_UNUSABLE)
+ -			continue;
+ -
+ -		pages = min(extra_pages,
+ -			PFN_DOWN(e->addr + e->size) - PFN_UP(e->addr));
+ -
+ -		if (pages != (PFN_DOWN(e->addr + e->size) - PFN_UP(e->addr))) {
+ -			struct boot_e820_entry *next;
+ -
+ -			if (bootp->e820_entries ==
+ -			    ARRAY_SIZE(bootp->e820_table))
+ -				/* No space left to split - skip region. */
+ -				continue;
+ -
+ -			/* Split entry. */
+ -			next = e + 1;
+ -			memmove(next, e,
+ -				(bootp->e820_entries - i) * sizeof(*e));
+ -			bootp->e820_entries++;
+ -			next->addr = PAGE_ALIGN(e->addr) + PFN_PHYS(pages);
+ -			e->size = next->addr - e->addr;
+ -			next->size -= e->size;
+ -		}
+ -		e->type = E820_TYPE_RAM;
+ -		extra_pages -= pages;
+ -
+ -		xen_add_extra_mem(PFN_UP(e->addr), pages);
+ -	}
+ +	pvh_bootparams.hdr.version = (2 << 8) | 12;
+ +	pvh_bootparams.hdr.type_of_loader = (9 << 4) | 0; /* Xen loader */
+ +
+ +	x86_init.acpi.get_root_pointer = pvh_get_root_pointer;
+  }
+  
+ -static void __init pvh_arch_setup(void)
+ +/*
+ + * This routine (and those that it might call) should not use
+ + * anything that lives in .bss since that segment will be cleared later.
+ + */
+ +void __init xen_prepare_pvh(void)
+  {
+ -	pvh_reserve_extra_memory();
+++<<<<<<< HEAD
+ +	u32 msr;
+ +	u64 pfn;
+  
+ -	if (xen_initial_domain())
+ -		xen_add_preferred_consoles();
+ -}
+ +	if (pvh_start_info.magic != XEN_HVM_START_MAGIC_VALUE) {
+ +		xen_raw_printk("Error: Unexpected magic value (0x%08x)\n",
+ +				pvh_start_info.magic);
+ +		BUG();
+ +	}
+  
+ -void __init xen_pvh_init(struct boot_params *boot_params)
+ -{
+++=======
+++>>>>>>> 7fa0da537368 (x86/xen: remove hypercall page)
+  	xen_pvh = 1;
+ -	xen_domain_type = XEN_HVM_DOMAIN;
+  	xen_start_flags = pvh_start_info.flags;
+  
+++<<<<<<< HEAD
+ +	msr = cpuid_ebx(xen_cpuid_base() + 2);
+ +	pfn = __pa(hypercall_page);
+ +	wrmsr_safe(msr, (u32)pfn, (u32)(pfn >> 32));
+ +
+ +	init_pvh_bootparams();
+++=======
++ 	x86_init.oem.arch_setup = pvh_arch_setup;
++ 	x86_init.oem.banner = xen_banner;
++ 
++ 	xen_efi_init(boot_params);
++ 
++ 	if (xen_initial_domain()) {
++ 		struct xen_platform_op op = {
++ 			.cmd = XENPF_get_dom0_console,
++ 		};
++ 		int ret = HYPERVISOR_platform_op(&op);
++ 
++ 		if (ret > 0)
++ 			xen_init_vga(&op.u.dom0_console,
++ 				     min(ret * sizeof(char),
++ 					 sizeof(op.u.dom0_console)),
++ 				     &boot_params->screen_info);
++ 	}
++ }
++ 
++ void __init mem_map_via_hcall(struct boot_params *boot_params_p)
++ {
++ 	struct xen_memory_map memmap;
++ 	int rc;
++ 
++ 	memmap.nr_entries = ARRAY_SIZE(boot_params_p->e820_table);
++ 	set_xen_guest_handle(memmap.buffer, boot_params_p->e820_table);
++ 	rc = HYPERVISOR_memory_op(XENMEM_memory_map, &memmap);
++ 	if (rc) {
++ 		xen_raw_printk("XENMEM_memory_map failed (%d)\n", rc);
++ 		BUG();
++ 	}
++ 	boot_params_p->e820_entries = memmap.nr_entries;
+++>>>>>>> 7fa0da537368 (x86/xen: remove hypercall page)
+  }
+diff --cc arch/x86/xen/xen-head.S
+index 1d0cee3163e4,9252652afe59..000000000000
+--- a/arch/x86/xen/xen-head.S
++++ b/arch/x86/xen/xen-head.S
+@@@ -81,24 -155,31 +81,46 @@@ SYM_CODE_END(hypercall_page
+  	ELFNOTE(Xen, XEN_ELFNOTE_VIRT_BASE,      _ASM_PTR __START_KERNEL_map)
+  	/* Map the p2m table to a 512GB-aligned user address. */
+  	ELFNOTE(Xen, XEN_ELFNOTE_INIT_P2M,       .quad (PUD_SIZE * PTRS_PER_PUD))
+ -	ELFNOTE(Xen, XEN_ELFNOTE_ENTRY,          .globl xen_elfnote_entry;
+ -		xen_elfnote_entry: _ASM_PTR xen_elfnote_entry_value - .)
+ -	ELFNOTE(Xen, XEN_ELFNOTE_FEATURES,       .ascii "!writable_page_tables")
+ +#endif
+ +#ifdef CONFIG_XEN_PV
+ +	ELFNOTE(Xen, XEN_ELFNOTE_ENTRY,          _ASM_PTR startup_xen)
+ +#endif
+ +	ELFNOTE(Xen, XEN_ELFNOTE_HYPERCALL_PAGE, _ASM_PTR hypercall_page)
+ +	ELFNOTE(Xen, XEN_ELFNOTE_FEATURES,
+ +		.ascii "!writable_page_tables|pae_pgdir_above_4gb")
+ +	ELFNOTE(Xen, XEN_ELFNOTE_SUPPORTED_FEATURES,
+ +		.long (1 << XENFEAT_writable_page_tables) |       \
+ +		      (1 << XENFEAT_dom0) |                       \
+ +		      (1 << XENFEAT_linux_rsdp_unrestricted))
+  	ELFNOTE(Xen, XEN_ELFNOTE_PAE_MODE,       .asciz "yes")
+ +	ELFNOTE(Xen, XEN_ELFNOTE_LOADER,         .asciz "generic")
+  	ELFNOTE(Xen, XEN_ELFNOTE_L1_MFN_VALID,
+  		.quad _PAGE_PRESENT; .quad _PAGE_PRESENT)
+++<<<<<<< HEAD
+++=======
++ 	ELFNOTE(Xen, XEN_ELFNOTE_MOD_START_PFN,  .long 1)
++ 	ELFNOTE(Xen, XEN_ELFNOTE_PADDR_OFFSET,   _ASM_PTR 0)
++ # define FEATURES_PV (1 << XENFEAT_writable_page_tables)
++ #else
++ # define FEATURES_PV 0
++ #endif
++ #ifdef CONFIG_XEN_PVH
++ # define FEATURES_PVH (1 << XENFEAT_linux_rsdp_unrestricted)
++ #else
++ # define FEATURES_PVH 0
++ #endif
++ #ifdef CONFIG_XEN_DOM0
++ # define FEATURES_DOM0 (1 << XENFEAT_dom0)
++ #else
++ # define FEATURES_DOM0 0
++ #endif
++ 	ELFNOTE(Xen, XEN_ELFNOTE_SUPPORTED_FEATURES,
++ 		.long FEATURES_PV | FEATURES_PVH | FEATURES_DOM0)
++ 	ELFNOTE(Xen, XEN_ELFNOTE_LOADER,         .asciz "generic")
+++>>>>>>> 7fa0da537368 (x86/xen: remove hypercall page)
+  	ELFNOTE(Xen, XEN_ELFNOTE_SUSPEND_CANCEL, .long 1)
+ +	ELFNOTE(Xen, XEN_ELFNOTE_MOD_START_PFN,  .long 1)
+ +	ELFNOTE(Xen, XEN_ELFNOTE_HV_START_LOW,   _ASM_PTR __HYPERVISOR_VIRT_START)
+ +	ELFNOTE(Xen, XEN_ELFNOTE_PADDR_OFFSET,   _ASM_PTR 0)
+  
+  #endif /*CONFIG_XEN */
+* Unmerged path arch/x86/kernel/callthunks.c
+* Unmerged path arch/x86/include/asm/xen/hypercall.h
+* Unmerged path arch/x86/kernel/callthunks.c
+* Unmerged path arch/x86/kernel/vmlinux.lds.S
+* Unmerged path arch/x86/xen/enlighten.c
+diff --git a/arch/x86/xen/enlighten_hvm.c b/arch/x86/xen/enlighten_hvm.c
+index 19c1ff542387..ae0b39b5de90 100644
+--- a/arch/x86/xen/enlighten_hvm.c
++++ b/arch/x86/xen/enlighten_hvm.c
+@@ -97,15 +97,8 @@ static void __init init_hvm_pv_info(void)
+ 	/* PVH set up hypercall page in xen_prepare_pvh(). */
+ 	if (xen_pvh_domain())
+ 		pv_info.name = "Xen PVH";
+-	else {
+-		u64 pfn;
+-		uint32_t msr;
+-
++	else
+ 		pv_info.name = "Xen HVM";
+-		msr = cpuid_ebx(base + 2);
+-		pfn = __pa(hypercall_page);
+-		wrmsr_safe(msr, (u32)pfn, (u32)(pfn >> 32));
+-	}
+ 
+ 	xen_setup_features();
+ 
+* Unmerged path arch/x86/xen/enlighten_pvh.c
+* Unmerged path arch/x86/xen/xen-head.S
