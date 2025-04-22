@@ -1361,7 +1361,8 @@ static enum evict_behavior evict_should_delete(struct inode *inode,
 	if (unlikely(test_bit(GIF_ALLOC_FAILED, &ip->i_flags)))
 		goto should_delete;
 
-	if (test_bit(GIF_DEFER_DELETE, &ip->i_flags))
+	if (gfs2_holder_initialized(&ip->i_iopen_gh) &&
+	    test_bit(GLF_DEFER_DELETE, &ip->i_iopen_gh.gh_gl->gl_flags))
 		return EVICT_SHOULD_DEFER_DELETE;
 
 	/* Deletes should never happen under memory pressure anymore.  */
@@ -1509,6 +1510,7 @@ static void gfs2_evict_inode(struct inode *inode)
 	enum evict_behavior behavior;
 	int ret;
 
+	gfs2_holder_mark_uninitialized(&gh);
 	if (inode->i_nlink || sb_rdonly(sb) || !ip->i_no_addr)
 		goto out;
 
@@ -1520,7 +1522,6 @@ static void gfs2_evict_inode(struct inode *inode)
 	if (!sdp->sd_jdesc)
 		goto out;
 
-	gfs2_holder_mark_uninitialized(&gh);
 	behavior = evict_should_delete(inode, &gh);
 	if (behavior == EVICT_SHOULD_DEFER_DELETE) {
 		struct gfs2_glock *io_gl = ip->i_iopen_gh.gh_gl;
@@ -1541,12 +1542,11 @@ static void gfs2_evict_inode(struct inode *inode)
 	if (gfs2_rs_active(&ip->i_res))
 		gfs2_rs_deltree(&ip->i_res);
 
-	if (gfs2_holder_initialized(&gh))
-		gfs2_glock_dq_uninit(&gh);
 	if (ret && ret != GLR_TRYFAILED && ret != -EROFS)
 		fs_warn(sdp, "gfs2_evict_inode: %d\n", ret);
 out:
-	/* Case 3 starts here */
+	if (gfs2_holder_initialized(&gh))
+		gfs2_glock_dq_uninit(&gh);
 	truncate_inode_pages_final(&inode->i_data);
 	if (ip->i_qadata)
 		gfs2_assert_warn(sdp, ip->i_qadata->qa_ref == 0);
