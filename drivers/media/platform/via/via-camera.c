@@ -1305,7 +1305,7 @@ static struct platform_driver viacam_driver = {
 		.name = "viafb-camera",
 	},
 	.probe = viacam_probe,
-	.remove_new = viacam_remove,
+	.remove = viacam_remove,
 };
 
 module_platform_driver(viacam_driver);

@@ -900,7 +900,7 @@ static void emmaprp_remove(struct platform_device *pdev)
 
 static struct platform_driver emmaprp_pdrv = {
 	.probe		= emmaprp_probe,
-	.remove_new	= emmaprp_remove,
+	.remove		= emmaprp_remove,
 	.driver		= {
 		.name	= MEM2MEM_NAME,
 	},
