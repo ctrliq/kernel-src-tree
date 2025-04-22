@@ -1,0 +1,257 @@
+ice: add ice_adapter for shared data across PFs on the same NIC
+
+jira LE-2815
+Rebuild_History Non-Buildable kernel-4.18.0-553.50.1.el8_10
+commit-author Michal Schmidt <mschmidt@redhat.com>
+commit 0e2bddf9e5f926ce32ed635012d0f8a0b54075d5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.50.1.el8_10/0e2bddf9.failed
+
+There is a need for synchronization between ice PFs on the same physical
+adapter.
+
+Add a "struct ice_adapter" for holding data shared between PFs of the
+same multifunction PCI device. The struct is refcounted - each ice_pf
+holds a reference to it.
+
+Its first use will be for PTP. I expect it will be useful also to
+improve the ugliness that is ice_prot_id_tbl.
+
+	Reviewed-by: Przemek Kitszel <przemyslaw.kitszel@intel.com>
+	Signed-off-by: Michal Schmidt <mschmidt@redhat.com>
+	Tested-by: Pucha Himasekhar Reddy <himasekharx.reddy.pucha@intel.com> (A Contingent worker at Intel)
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit 0e2bddf9e5f926ce32ed635012d0f8a0b54075d5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/Makefile
+#	drivers/net/ethernet/intel/ice/ice.h
+diff --cc drivers/net/ethernet/intel/ice/Makefile
+index 2a22d89656c8,4fa09c321440..000000000000
+--- a/drivers/net/ethernet/intel/ice/Makefile
++++ b/drivers/net/ethernet/intel/ice/Makefile
+@@@ -33,7 -34,10 +33,14 @@@ ice-y := ice_main.o	
+  	 ice_lag.o	\
+  	 ice_ethtool.o  \
+  	 ice_repr.o	\
+++<<<<<<< HEAD
+ +	 ice_tc_lib.o
+++=======
++ 	 ice_tc_lib.o	\
++ 	 ice_fwlog.o	\
++ 	 ice_debugfs.o  \
++ 	 ice_adapter.o
+++>>>>>>> 0e2bddf9e5f9 (ice: add ice_adapter for shared data across PFs on the same NIC)
+  ice-$(CONFIG_PCI_IOV) +=	\
+  	ice_sriov.o		\
+  	ice_virtchnl.o		\
+diff --cc drivers/net/ethernet/intel/ice/ice.h
+index 5bd1ba0a91d3,a7e88d797d4c..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice.h
++++ b/drivers/net/ethernet/intel/ice/ice.h
+@@@ -74,6 -75,9 +74,12 @@@
+  #include "ice_lag.h"
+  #include "ice_vsi_vlan_ops.h"
+  #include "ice_gnss.h"
+++<<<<<<< HEAD
+++=======
++ #include "ice_irq.h"
++ #include "ice_dpll.h"
++ #include "ice_adapter.h"
+++>>>>>>> 0e2bddf9e5f9 (ice: add ice_adapter for shared data across PFs on the same NIC)
+  
+  #define ICE_BAR0		0
+  #define ICE_REQ_DESC_MULTIPLE	32
+* Unmerged path drivers/net/ethernet/intel/ice/Makefile
+* Unmerged path drivers/net/ethernet/intel/ice/ice.h
+diff --git a/drivers/net/ethernet/intel/ice/ice_adapter.c b/drivers/net/ethernet/intel/ice/ice_adapter.c
+new file mode 100644
+index 000000000000..f00ab998e853
+--- /dev/null
++++ b/drivers/net/ethernet/intel/ice/ice_adapter.c
+@@ -0,0 +1,114 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// SPDX-FileCopyrightText: Copyright Red Hat
++
++#include <linux/bitfield.h>
++#include <linux/cleanup.h>
++#include <linux/mutex.h>
++#include <linux/pci.h>
++#include <linux/slab.h>
++#include <linux/xarray.h>
++#include "ice_adapter.h"
++
++static DEFINE_XARRAY(ice_adapters);
++
++/* PCI bus number is 8 bits. Slot is 5 bits. Domain can have the rest. */
++#define INDEX_FIELD_DOMAIN GENMASK(BITS_PER_LONG - 1, 13)
++#define INDEX_FIELD_BUS    GENMASK(12, 5)
++#define INDEX_FIELD_SLOT   GENMASK(4, 0)
++
++static unsigned long ice_adapter_index(const struct pci_dev *pdev)
++{
++	unsigned int domain = pci_domain_nr(pdev->bus);
++
++	WARN_ON(domain > FIELD_MAX(INDEX_FIELD_DOMAIN));
++
++	return FIELD_PREP(INDEX_FIELD_DOMAIN, domain) |
++	       FIELD_PREP(INDEX_FIELD_BUS,    pdev->bus->number) |
++	       FIELD_PREP(INDEX_FIELD_SLOT,   PCI_SLOT(pdev->devfn));
++}
++
++static struct ice_adapter *ice_adapter_new(void)
++{
++	struct ice_adapter *adapter;
++
++	adapter = kzalloc(sizeof(*adapter), GFP_KERNEL);
++	if (!adapter)
++		return NULL;
++
++	refcount_set(&adapter->refcount, 1);
++
++	return adapter;
++}
++
++static void ice_adapter_free(struct ice_adapter *adapter)
++{
++	kfree(adapter);
++}
++
++DEFINE_FREE(ice_adapter_free, struct ice_adapter*, if (_T) ice_adapter_free(_T))
++
++/**
++ * ice_adapter_get - Get a shared ice_adapter structure.
++ * @pdev: Pointer to the pci_dev whose driver is getting the ice_adapter.
++ *
++ * Gets a pointer to a shared ice_adapter structure. Physical functions (PFs)
++ * of the same multi-function PCI device share one ice_adapter structure.
++ * The ice_adapter is reference-counted. The PF driver must use ice_adapter_put
++ * to release its reference.
++ *
++ * Context: Process, may sleep.
++ * Return:  Pointer to ice_adapter on success.
++ *          ERR_PTR() on error. -ENOMEM is the only possible error.
++ */
++struct ice_adapter *ice_adapter_get(const struct pci_dev *pdev)
++{
++	struct ice_adapter *ret, __free(ice_adapter_free) *adapter = NULL;
++	unsigned long index = ice_adapter_index(pdev);
++
++	adapter = ice_adapter_new();
++	if (!adapter)
++		return ERR_PTR(-ENOMEM);
++
++	xa_lock(&ice_adapters);
++	ret = __xa_cmpxchg(&ice_adapters, index, NULL, adapter, GFP_KERNEL);
++	if (xa_is_err(ret)) {
++		ret = ERR_PTR(xa_err(ret));
++		goto unlock;
++	}
++	if (ret) {
++		refcount_inc(&ret->refcount);
++		goto unlock;
++	}
++	ret = no_free_ptr(adapter);
++unlock:
++	xa_unlock(&ice_adapters);
++	return ret;
++}
++
++/**
++ * ice_adapter_put - Release a reference to the shared ice_adapter structure.
++ * @pdev: Pointer to the pci_dev whose driver is releasing the ice_adapter.
++ *
++ * Releases the reference to ice_adapter previously obtained with
++ * ice_adapter_get.
++ *
++ * Context: Any.
++ */
++void ice_adapter_put(const struct pci_dev *pdev)
++{
++	unsigned long index = ice_adapter_index(pdev);
++	struct ice_adapter *adapter;
++
++	xa_lock(&ice_adapters);
++	adapter = xa_load(&ice_adapters, index);
++	if (WARN_ON(!adapter))
++		goto unlock;
++
++	if (!refcount_dec_and_test(&adapter->refcount))
++		goto unlock;
++
++	WARN_ON(__xa_erase(&ice_adapters, index) != adapter);
++	ice_adapter_free(adapter);
++unlock:
++	xa_unlock(&ice_adapters);
++}
+diff --git a/drivers/net/ethernet/intel/ice/ice_adapter.h b/drivers/net/ethernet/intel/ice/ice_adapter.h
+new file mode 100644
+index 000000000000..cb5a02eb24c1
+--- /dev/null
++++ b/drivers/net/ethernet/intel/ice/ice_adapter.h
+@@ -0,0 +1,22 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* SPDX-FileCopyrightText: Copyright Red Hat */
++
++#ifndef _ICE_ADAPTER_H_
++#define _ICE_ADAPTER_H_
++
++#include <linux/refcount_types.h>
++
++struct pci_dev;
++
++/**
++ * struct ice_adapter - PCI adapter resources shared across PFs
++ * @refcount: Reference count. struct ice_pf objects hold the references.
++ */
++struct ice_adapter {
++	refcount_t refcount;
++};
++
++struct ice_adapter *ice_adapter_get(const struct pci_dev *pdev);
++void ice_adapter_put(const struct pci_dev *pdev);
++
++#endif /* _ICE_ADAPTER_H */
+diff --git a/drivers/net/ethernet/intel/ice/ice_main.c b/drivers/net/ethernet/intel/ice/ice_main.c
+index 629fbb51283b..290a34179398 100644
+--- a/drivers/net/ethernet/intel/ice/ice_main.c
++++ b/drivers/net/ethernet/intel/ice/ice_main.c
+@@ -5225,6 +5225,7 @@ static int
+ ice_probe(struct pci_dev *pdev, const struct pci_device_id __always_unused *ent)
+ {
+ 	struct device *dev = &pdev->dev;
++	struct ice_adapter *adapter;
+ 	struct ice_pf *pf;
+ 	struct ice_hw *hw;
+ 	int err;
+@@ -5277,7 +5278,12 @@ ice_probe(struct pci_dev *pdev, const struct pci_device_id __always_unused *ent)
+ 
+ 	pci_set_master(pdev);
+ 
++	adapter = ice_adapter_get(pdev);
++	if (IS_ERR(adapter))
++		return PTR_ERR(adapter);
++
+ 	pf->pdev = pdev;
++	pf->adapter = adapter;
+ 	pci_set_drvdata(pdev, pf);
+ 	set_bit(ICE_DOWN, pf->state);
+ 	/* Disable service task until DOWN bit is cleared */
+@@ -5332,6 +5338,7 @@ ice_probe(struct pci_dev *pdev, const struct pci_device_id __always_unused *ent)
+ err_init_eth:
+ 	ice_deinit(pf);
+ err_init:
++	ice_adapter_put(pdev);
+ 	pci_disable_device(pdev);
+ 	return err;
+ }
+@@ -5434,6 +5441,7 @@ static void ice_remove(struct pci_dev *pdev)
+ 	ice_setup_mc_magic_wake(pf);
+ 	ice_set_wake(pf);
+ 
++	ice_adapter_put(pdev);
+ 	pci_disable_device(pdev);
+ }
+ 
