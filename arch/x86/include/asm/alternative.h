@@ -100,7 +100,6 @@ extern void apply_fineibt(s32 *start_retpoline, s32 *end_retpoine,
 
 struct callthunk_sites {
 	s32				*call_start, *call_end;
-	struct alt_instr		*alt_start, *alt_end;
 };
 
 #ifdef CONFIG_CALL_THUNKS
