@@ -33,8 +33,8 @@ TRACE_EVENT(xe_lrc_update_timestamp,
 		   __entry->lrc	= lrc;
 		   __entry->old = old;
 		   __entry->new = lrc->ctx_timestamp;
-		   __assign_str(name);
-		   __assign_str(device_id);
+		   __assign_str(name, lrc->fence_ctx.name);
+		   __assign_str(device_id, __dev_name_lrc(lrc));
 		   ),
 	    TP_printk("lrc=:%p lrc->name=%s old=%u new=%u device_id:%s",
 		      __entry->lrc, __get_str(name),
