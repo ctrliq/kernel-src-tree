@@ -342,7 +342,7 @@ Printing the list of all available tests
 
 .. code:: shell
 
-   for col in $(make --print-data-base -C tools/testing/selftests --dry-run clean \
+   for col in $(make --print-data-base -C tools/testing/selftests SKIP_TARGETS= --dry-run clean \
                     | grep '^TARGETS :\?=' \
                     | sed -e 's/.*:\?=//g'); do
        make --silent COLLECTION=${col} -C tools/testing/selftests/${col} emit_tests
@@ -356,6 +356,10 @@ Explanation:
    ``--print-data-base``
       Prints the value of ``TARGETS`` variable (among many other
       information)
+   ``SKIP_TARGETS=``
+      Demands explicitly to **not** remove any positions from the
+      ``TARGETS`` variable (yes, the Makefile may decide for the user to
+      skip some targets, eg. ``bpf`` on ``ciqlts9_2``)
    ``clean``
       Any valid target will do, ``clean`` just takes least time.
    ``--dry-run``
