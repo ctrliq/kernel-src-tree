@@ -310,7 +310,7 @@ static const unsigned long *const_folio_flags(const struct folio *folio,
 {
 	const struct page *page = &folio->page;
 
-	VM_BUG_ON_PGFLAGS(PageTail(page), page);
+	VM_BUG_ON_PGFLAGS(page->compound_head & 1, page);
 	VM_BUG_ON_PGFLAGS(n > 0 && !test_bit(PG_head, &page->flags), page);
 	return &page[n].flags;
 }
@@ -319,7 +319,7 @@ static unsigned long *folio_flags(struct folio *folio, unsigned n)
 {
 	struct page *page = &folio->page;
 
-	VM_BUG_ON_PGFLAGS(PageTail(page), page);
+	VM_BUG_ON_PGFLAGS(page->compound_head & 1, page);
 	VM_BUG_ON_PGFLAGS(n > 0 && !test_bit(PG_head, &page->flags), page);
 	return &page[n].flags;
 }
@@ -861,7 +861,7 @@ static inline void ClearPageCompound(struct page *page)
 }
 PAGEFLAG(LargeRmappable, large_rmappable, PF_SECOND)
 #else
-TESTPAGEFLAG_FALSE(LargeRmappable, large_rmappable)
+PAGEFLAG_FALSE(LargeRmappable, large_rmappable)
 #endif
 
 #define PG_head_mask ((1UL << PG_head))
