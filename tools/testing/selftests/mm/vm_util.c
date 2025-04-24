@@ -256,6 +256,30 @@ unsigned long get_free_hugepages(void)
 	return fhp;
 }
 
+bool check_vmflag_io(void *addr)
+{
+	char buffer[MAX_LINE_LENGTH];
+	const char *flags;
+	size_t flaglen;
+
+	flags = __get_smap_entry(addr, "VmFlags:", buffer, sizeof(buffer));
+	if (!flags)
+		ksft_exit_fail_msg("%s: No VmFlags for %p\n", __func__, addr);
+
+	while (true) {
+		flags += strspn(flags, " ");
+
+		flaglen = strcspn(flags, " ");
+		if (!flaglen)
+			return false;
+
+		if (flaglen == strlen("io") && !memcmp(flags, "io", flaglen))
+			return true;
+
+		flags += flaglen;
+	}
+}
+
 int detect_hugetlb_page_sizes(size_t sizes[], int max)
 {
 	DIR *dir = opendir("/sys/kernel/mm/hugepages/");
