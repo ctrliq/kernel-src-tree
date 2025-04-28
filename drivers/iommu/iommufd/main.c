@@ -442,7 +442,7 @@ void iommufd_ctx_get(struct iommufd_ctx *ictx)
 {
 	get_file(ictx->file);
 }
-EXPORT_SYMBOL_NS_GPL(iommufd_ctx_get, IOMMUFD);
+EXPORT_SYMBOL_NS_GPL(iommufd_ctx_get, "IOMMUFD");
 
 /**
  * iommufd_ctx_from_file - Acquires a reference to the iommufd context
@@ -462,7 +462,7 @@ struct iommufd_ctx *iommufd_ctx_from_file(struct file *file)
 	iommufd_ctx_get(ictx);
 	return ictx;
 }
-EXPORT_SYMBOL_NS_GPL(iommufd_ctx_from_file, IOMMUFD);
+EXPORT_SYMBOL_NS_GPL(iommufd_ctx_from_file, "IOMMUFD");
 
 /**
  * iommufd_ctx_from_fd - Acquires a reference to the iommufd context
@@ -486,7 +486,7 @@ struct iommufd_ctx *iommufd_ctx_from_fd(int fd)
 	/* fget is the same as iommufd_ctx_get() */
 	return file->private_data;
 }
-EXPORT_SYMBOL_NS_GPL(iommufd_ctx_from_fd, IOMMUFD);
+EXPORT_SYMBOL_NS_GPL(iommufd_ctx_from_fd, "IOMMUFD");
 
 /**
  * iommufd_ctx_put - Put back a reference
@@ -496,7 +496,7 @@ void iommufd_ctx_put(struct iommufd_ctx *ictx)
 {
 	fput(ictx->file);
 }
-EXPORT_SYMBOL_NS_GPL(iommufd_ctx_put, IOMMUFD);
+EXPORT_SYMBOL_NS_GPL(iommufd_ctx_put, "IOMMUFD");
 
 static const struct iommufd_object_ops iommufd_object_ops[] = {
 	[IOMMUFD_OBJ_ACCESS] = {
@@ -584,7 +584,7 @@ module_exit(iommufd_exit);
 MODULE_ALIAS_MISCDEV(VFIO_MINOR);
 MODULE_ALIAS("devname:vfio/vfio");
 #endif
-MODULE_IMPORT_NS(IOMMUFD_INTERNAL);
-MODULE_IMPORT_NS(IOMMUFD);
+MODULE_IMPORT_NS("IOMMUFD_INTERNAL");
+MODULE_IMPORT_NS("IOMMUFD");
 MODULE_DESCRIPTION("I/O Address Space Management for passthrough devices");
 MODULE_LICENSE("GPL");

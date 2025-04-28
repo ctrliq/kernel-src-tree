@@ -132,7 +132,7 @@ int acp_machine_select(struct acp_dev_data *adata)
 		dev_warn(adata->dev, "Unable to register Machine device\n");
 	return 0;
 }
-EXPORT_SYMBOL_NS_GPL(acp_machine_select, SND_SOC_ACP_COMMON);
+EXPORT_SYMBOL_NS_GPL(acp_machine_select, "SND_SOC_ACP_COMMON");
 
 static irqreturn_t i2s_irq_handler(int irq, void *data)
 {
@@ -193,7 +193,7 @@ void config_pte_for_stream(struct acp_dev_data *adata, struct acp_stream *stream
 
 	writel(0x01, adata->acp_base + ACPAXI2AXI_ATU_CTRL);
 }
-EXPORT_SYMBOL_NS_GPL(config_pte_for_stream, SND_SOC_ACP_COMMON);
+EXPORT_SYMBOL_NS_GPL(config_pte_for_stream, "SND_SOC_ACP_COMMON");
 
 void config_acp_dma(struct acp_dev_data *adata, struct acp_stream *stream, int size)
 {
@@ -252,7 +252,7 @@ void config_acp_dma(struct acp_dev_data *adata, struct acp_stream *stream, int s
 		addr += PAGE_SIZE;
 	}
 }
-EXPORT_SYMBOL_NS_GPL(config_acp_dma, SND_SOC_ACP_COMMON);
+EXPORT_SYMBOL_NS_GPL(config_acp_dma, "SND_SOC_ACP_COMMON");
 
 static int acp_dma_open(struct snd_soc_component *component, struct snd_pcm_substream *substream)
 {
@@ -416,7 +416,7 @@ int acp_platform_register(struct device *dev)
 
 	return 0;
 }
-EXPORT_SYMBOL_NS_GPL(acp_platform_register, SND_SOC_ACP_COMMON);
+EXPORT_SYMBOL_NS_GPL(acp_platform_register, "SND_SOC_ACP_COMMON");
 
 int acp_platform_unregister(struct device *dev)
 {
@@ -426,7 +426,7 @@ int acp_platform_unregister(struct device *dev)
 		platform_device_unregister(adata->mach_dev);
 	return 0;
 }
-EXPORT_SYMBOL_NS_GPL(acp_platform_unregister, SND_SOC_ACP_COMMON);
+EXPORT_SYMBOL_NS_GPL(acp_platform_unregister, "SND_SOC_ACP_COMMON");
 
 MODULE_DESCRIPTION("AMD ACP PCM Driver");
 MODULE_LICENSE("Dual BSD/GPL");
