@@ -10,6 +10,7 @@ TEST_PROGS = devlink.sh \
 	ethtool-ring.sh \
 	fib.sh \
 	hw_stats_l3.sh \
+	macsec-offload.sh \
 	nexthop.sh \
 	peer.sh \
 	psample.sh \
