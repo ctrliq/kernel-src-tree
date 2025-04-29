@@ -508,6 +508,7 @@ struct fb_info {
 	void *par;
 
 	bool skip_vt_switch; /* no VT switch on suspend/resume required */
+	bool skip_panic; /* Do not write to the fb after a panic */
 };
 
 /* This will go away
