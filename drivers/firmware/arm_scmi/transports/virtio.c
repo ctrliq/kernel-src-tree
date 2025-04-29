@@ -4,7 +4,7 @@
  * (SCMI).
  *
  * Copyright (C) 2020-2022 OpenSynergy.
- * Copyright (C) 2021-2022 ARM Ltd.
+ * Copyright (C) 2021-2024 ARM Ltd.
  */
 
 /**
@@ -19,6 +19,7 @@
 
 #include <linux/completion.h>
 #include <linux/errno.h>
+#include <linux/platform_device.h>
 #include <linux/refcount.h>
 #include <linux/slab.h>
 #include <linux/virtio.h>
@@ -27,12 +28,12 @@
 #include <uapi/linux/virtio_ids.h>
 #include <uapi/linux/virtio_scmi.h>
 
-#include "common.h"
+#include "../common.h"
 
 #define VIRTIO_MAX_RX_TIMEOUT_MS	60000
 #define VIRTIO_SCMI_MAX_MSG_SIZE 128 /* Value may be increased. */
-#define VIRTIO_SCMI_MAX_PDU_SIZE \
-	(VIRTIO_SCMI_MAX_MSG_SIZE + SCMI_MSG_MAX_PROT_OVERHEAD)
+#define VIRTIO_SCMI_MAX_PDU_SIZE(ci) \
+	((ci)->max_msg_size + SCMI_MSG_MAX_PROT_OVERHEAD)
 #define DESCRIPTORS_PER_TX_MSG 2
 
 /**
@@ -89,6 +90,7 @@ enum poll_states {
  * @input: SDU used for (delayed) responses and notifications
  * @list: List which scmi_vio_msg may be part of
  * @rx_len: Input SDU size in bytes, once input has been received
+ * @max_len: Maximumm allowed SDU size in bytes
  * @poll_idx: Last used index registered for polling purposes if this message
  *	      transaction reply was configured for polling.
  * @poll_status: Polling state for this message.
@@ -101,12 +103,15 @@ struct scmi_vio_msg {
 	struct scmi_msg_payld *input;
 	struct list_head list;
 	unsigned int rx_len;
+	unsigned int max_len;
 	unsigned int poll_idx;
 	enum poll_states poll_status;
 	/* Lock to protect access to poll_status */
 	spinlock_t poll_lock;
 	refcount_t users;
 };
+
+static struct scmi_transport_core_operations *core;
 
 /* Only one SCMI VirtIO device can possibly exist */
 static struct virtio_device *scmi_vdev;
@@ -231,7 +236,7 @@ static int scmi_vio_feed_vq_rx(struct scmi_vio_channel *vioch,
 	unsigned long flags;
 	struct device *dev = &vioch->vqueue->vdev->dev;
 
-	sg_init_one(&sg_in, msg->input, VIRTIO_SCMI_MAX_PDU_SIZE);
+	sg_init_one(&sg_in, msg->input, msg->max_len);
 
 	spin_lock_irqsave(&vioch->lock, flags);
 
@@ -294,8 +299,9 @@ static void scmi_vio_complete_cb(struct virtqueue *vqueue)
 
 		if (msg) {
 			msg->rx_len = length;
-			scmi_rx_callback(vioch->cinfo,
-					 msg_read_header(msg->input), msg);
+			core->rx_callback(vioch->cinfo,
+					  core->msg->read_header(msg->input),
+					  msg);
 
 			scmi_finalize_message(vioch, msg);
 		}
@@ -339,8 +345,9 @@ static void scmi_vio_deferred_tx_worker(struct work_struct *work)
 		 * is no more processed elsewhere so no poll_lock needed.
 		 */
 		if (msg->poll_status == VIO_MSG_NOT_POLLED)
-			scmi_rx_callback(vioch->cinfo,
-					 msg_read_header(msg->input), msg);
+			core->rx_callback(vioch->cinfo,
+					  core->msg->read_header(msg->input),
+					  msg);
 
 		/* Free the processed message once done */
 		scmi_vio_msg_release(vioch, msg);
@@ -366,23 +373,6 @@ static unsigned int virtio_get_max_msg(struct scmi_chan_info *base_cinfo)
 	struct scmi_vio_channel *vioch = base_cinfo->transport_info;
 
 	return vioch->max_msg;
-}
-
-static int virtio_link_supplier(struct device *dev)
-{
-	if (!scmi_vdev) {
-		dev_notice(dev,
-			   "Deferring probe after not finding a bound scmi-virtio device\n");
-		return -EPROBE_DEFER;
-	}
-
-	if (!device_link_add(dev, &scmi_vdev->dev,
-			     DL_FLAG_AUTOREMOVE_CONSUMER)) {
-		dev_err(dev, "Adding link to supplier virtio device failed\n");
-		return -ECANCELED;
-	}
-
-	return 0;
 }
 
 static bool virtio_chan_available(struct device_node *of_node, int idx)
@@ -453,9 +443,9 @@ static int virtio_chan_setup(struct scmi_chan_info *cinfo, struct device *dev,
 		if (!msg)
 			return -ENOMEM;
 
+		msg->max_len = VIRTIO_SCMI_MAX_PDU_SIZE(cinfo);
 		if (tx) {
-			msg->request = devm_kzalloc(dev,
-						    VIRTIO_SCMI_MAX_PDU_SIZE,
+			msg->request = devm_kzalloc(dev, msg->max_len,
 						    GFP_KERNEL);
 			if (!msg->request)
 				return -ENOMEM;
@@ -463,8 +453,7 @@ static int virtio_chan_setup(struct scmi_chan_info *cinfo, struct device *dev,
 			refcount_set(&msg->users, 1);
 		}
 
-		msg->input = devm_kzalloc(dev, VIRTIO_SCMI_MAX_PDU_SIZE,
-					  GFP_KERNEL);
+		msg->input = devm_kzalloc(dev, msg->max_len, GFP_KERNEL);
 		if (!msg->input)
 			return -ENOMEM;
 
@@ -512,10 +501,10 @@ static int virtio_send_message(struct scmi_chan_info *cinfo,
 		return -EBUSY;
 	}
 
-	msg_tx_prepare(msg->request, xfer);
+	core->msg->tx_prepare(msg->request, xfer);
 
-	sg_init_one(&sg_out, msg->request, msg_command_size(xfer));
-	sg_init_one(&sg_in, msg->input, msg_response_size(xfer));
+	sg_init_one(&sg_out, msg->request, core->msg->command_size(xfer));
+	sg_init_one(&sg_in, msg->input, core->msg->response_size(xfer));
 
 	spin_lock_irqsave(&vioch->lock, flags);
 
@@ -562,7 +551,7 @@ static void virtio_fetch_response(struct scmi_chan_info *cinfo,
 	struct scmi_vio_msg *msg = xfer->priv;
 
 	if (msg)
-		msg_fetch_response(msg->input, msg->rx_len, xfer);
+		core->msg->fetch_response(msg->input, msg->rx_len, xfer);
 }
 
 static void virtio_fetch_notification(struct scmi_chan_info *cinfo,
@@ -571,7 +560,8 @@ static void virtio_fetch_notification(struct scmi_chan_info *cinfo,
 	struct scmi_vio_msg *msg = xfer->priv;
 
 	if (msg)
-		msg_fetch_notification(msg->input, msg->rx_len, max_len, xfer);
+		core->msg->fetch_notification(msg->input, msg->rx_len,
+					      max_len, xfer);
 }
 
 /**
@@ -671,7 +661,7 @@ static void virtio_mark_txdone(struct scmi_chan_info *cinfo, int ret,
  * the message we are polling for could be alternatively delivered via usual
  * IRQs callbacks on another core which happened to have IRQs enabled while we
  * are actively polling for it here: in such a case it will be handled as such
- * by scmi_rx_callback() and the polling loop in the SCMI Core TX path will be
+ * by rx_callback() and the polling loop in the SCMI Core TX path will be
  * transparently terminated anyway.
  *
  * Return: True once polling has successfully completed.
@@ -792,7 +782,6 @@ static bool virtio_poll_done(struct scmi_chan_info *cinfo,
 }
 
 static const struct scmi_transport_ops scmi_virtio_ops = {
-	.link_supplier = virtio_link_supplier,
 	.chan_available = virtio_chan_available,
 	.chan_setup = virtio_chan_setup,
 	.chan_free = virtio_chan_free,
@@ -803,6 +792,23 @@ static const struct scmi_transport_ops scmi_virtio_ops = {
 	.mark_txdone = virtio_mark_txdone,
 	.poll_done = virtio_poll_done,
 };
+
+static struct scmi_desc scmi_virtio_desc = {
+	.ops = &scmi_virtio_ops,
+	/* for non-realtime virtio devices */
+	.max_rx_timeout_ms = VIRTIO_MAX_RX_TIMEOUT_MS,
+	.max_msg = 0, /* overridden by virtio_get_max_msg() */
+	.max_msg_size = VIRTIO_SCMI_MAX_MSG_SIZE,
+	.atomic_enabled = IS_ENABLED(CONFIG_ARM_SCMI_TRANSPORT_VIRTIO_ATOMIC_ENABLE),
+};
+
+static const struct of_device_id scmi_of_match[] = {
+	{ .compatible = "arm,scmi-virtio" },
+	{ /* Sentinel */ },
+};
+
+DEFINE_SCMI_TRANSPORT_DRIVER(scmi_virtio, scmi_virtio_driver, scmi_virtio_desc,
+			     scmi_of_match, core);
 
 static int scmi_vio_probe(struct virtio_device *vdev)
 {
@@ -864,14 +870,27 @@ static int scmi_vio_probe(struct virtio_device *vdev)
 	}
 
 	vdev->priv = channels;
+
 	/* Ensure initialized scmi_vdev is visible */
 	smp_store_mb(scmi_vdev, vdev);
+
+	ret = platform_driver_register(&scmi_virtio_driver);
+	if (ret) {
+		vdev->priv = NULL;
+		vdev->config->del_vqs(vdev);
+		/* Ensure NULLified scmi_vdev is visible */
+		smp_store_mb(scmi_vdev, NULL);
+
+		return ret;
+	}
 
 	return 0;
 }
 
 static void scmi_vio_remove(struct virtio_device *vdev)
 {
+	platform_driver_unregister(&scmi_virtio_driver);
+
 	/*
 	 * Once we get here, virtio_chan_free() will have already been called by
 	 * the SCMI core for any existing channel and, as a consequence, all the
@@ -905,6 +924,7 @@ static const struct virtio_device_id id_table[] = {
 	{ VIRTIO_ID_SCMI, VIRTIO_DEV_ANY_ID },
 	{ 0 }
 };
+MODULE_DEVICE_TABLE(virtio, id_table);
 
 static struct virtio_driver virtio_scmi_driver = {
 	.driver.name = "scmi-virtio",
@@ -917,23 +937,10 @@ static struct virtio_driver virtio_scmi_driver = {
 	.validate = scmi_vio_validate,
 };
 
-static int __init virtio_scmi_init(void)
-{
-	return register_virtio_driver(&virtio_scmi_driver);
-}
+module_virtio_driver(virtio_scmi_driver);
 
-static void virtio_scmi_exit(void)
-{
-	unregister_virtio_driver(&virtio_scmi_driver);
-}
-
-const struct scmi_desc scmi_virtio_desc = {
-	.transport_init = virtio_scmi_init,
-	.transport_exit = virtio_scmi_exit,
-	.ops = &scmi_virtio_ops,
-	/* for non-realtime virtio devices */
-	.max_rx_timeout_ms = VIRTIO_MAX_RX_TIMEOUT_MS,
-	.max_msg = 0, /* overridden by virtio_get_max_msg() */
-	.max_msg_size = VIRTIO_SCMI_MAX_MSG_SIZE,
-	.atomic_enabled = IS_ENABLED(CONFIG_ARM_SCMI_TRANSPORT_VIRTIO_ATOMIC_ENABLE),
-};
+MODULE_AUTHOR("Igor Skalkin <igor.skalkin@opensynergy.com>");
+MODULE_AUTHOR("Peter Hilber <peter.hilber@opensynergy.com>");
+MODULE_AUTHOR("Cristian Marussi <cristian.marussi@arm.com>");
+MODULE_DESCRIPTION("SCMI VirtIO Transport driver");
+MODULE_LICENSE("GPL");
