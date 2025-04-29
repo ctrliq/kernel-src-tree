@@ -451,7 +451,6 @@ static int efifb_probe(struct platform_device *dev)
 		err = -ENOMEM;
 		goto err_release_mem;
 	}
-	platform_set_drvdata(dev, info);
 	par = info->par;
 	info->pseudo_palette = par->pseudo_palette;
 
@@ -574,7 +573,7 @@ static int efifb_probe(struct platform_device *dev)
 		pr_err("efifb: cannot acquire aperture\n");
 		goto err_fb_dealloc_cmap;
 	}
-	err = register_framebuffer(info);
+	err = devm_register_framebuffer(&dev->dev, info);
 	if (err < 0) {
 		pr_err("efifb: cannot register framebuffer\n");
 		goto err_fb_dealloc_cmap;
@@ -597,21 +596,12 @@ err_release_mem:
 	return err;
 }
 
-static void efifb_remove(struct platform_device *pdev)
-{
-	struct fb_info *info = platform_get_drvdata(pdev);
-
-	/* efifb_destroy takes care of info cleanup */
-	unregister_framebuffer(info);
-}
-
 static struct platform_driver efifb_driver = {
 	.driver = {
 		.name = "efi-framebuffer",
 		.dev_groups = efifb_groups,
 	},
 	.probe = efifb_probe,
-	.remove_new = efifb_remove,
 };
 
 builtin_platform_driver(efifb_driver);
