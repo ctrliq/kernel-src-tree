@@ -111,7 +111,6 @@ static const struct drm_driver tidss_driver = {
 	DRM_GEM_DMA_DRIVER_OPS_VMAP,
 	.name			= "tidss",
 	.desc			= "TI Keystone DSS",
-	.date			= "20180215",
 	.major			= 1,
 	.minor			= 0,
 };

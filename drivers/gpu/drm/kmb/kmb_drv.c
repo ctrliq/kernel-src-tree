@@ -443,7 +443,6 @@ static const struct drm_driver kmb_driver = {
 	DRM_GEM_DMA_DRIVER_OPS_VMAP,
 	.name = "kmb-drm",
 	.desc = "KEEMBAY DISPLAY DRIVER",
-	.date = DRIVER_DATE,
 	.major = DRIVER_MAJOR,
 	.minor = DRIVER_MINOR,
 };
