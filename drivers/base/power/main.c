@@ -496,6 +496,7 @@ struct dpm_watchdog {
 	struct device		*dev;
 	struct task_struct	*tsk;
 	struct timer_list	timer;
+	bool			fatal;
 };
 
 #define DECLARE_DPM_WATCHDOG_ON_STACK(wd) \
@@ -512,11 +513,23 @@ struct dpm_watchdog {
 static void dpm_watchdog_handler(struct timer_list *t)
 {
 	struct dpm_watchdog *wd = from_timer(wd, t, timer);
+	struct timer_list *timer = &wd->timer;
+	unsigned int time_left;
 
-	dev_emerg(wd->dev, "**** DPM device timeout ****\n");
-	show_stack(wd->tsk, NULL, KERN_EMERG);
-	panic("%s %s: unrecoverable failure\n",
-		dev_driver_string(wd->dev), dev_name(wd->dev));
+	if (wd->fatal) {
+		dev_emerg(wd->dev, "**** DPM device timeout ****\n");
+		show_stack(wd->tsk, NULL, KERN_EMERG);
+		panic("%s %s: unrecoverable failure\n",
+			dev_driver_string(wd->dev), dev_name(wd->dev));
+	}
+
+	time_left = CONFIG_DPM_WATCHDOG_TIMEOUT - CONFIG_DPM_WATCHDOG_WARNING_TIMEOUT;
+	dev_warn(wd->dev, "**** DPM device timeout after %u seconds; %u seconds until panic ****\n",
+		 CONFIG_DPM_WATCHDOG_WARNING_TIMEOUT, time_left);
+	show_stack(wd->tsk, NULL, KERN_WARNING);
+
+	wd->fatal = true;
+	mod_timer(timer, jiffies + HZ * time_left);
 }
 
 /**
@@ -530,10 +543,11 @@ static void dpm_watchdog_set(struct dpm_watchdog *wd, struct device *dev)
 
 	wd->dev = dev;
 	wd->tsk = current;
+	wd->fatal = CONFIG_DPM_WATCHDOG_TIMEOUT == CONFIG_DPM_WATCHDOG_WARNING_TIMEOUT;
 
 	timer_setup_on_stack(timer, dpm_watchdog_handler, 0);
 	/* use same timeout value for both suspend and resume */
-	timer->expires = jiffies + HZ * CONFIG_DPM_WATCHDOG_TIMEOUT;
+	timer->expires = jiffies + HZ * CONFIG_DPM_WATCHDOG_WARNING_TIMEOUT;
 	add_timer(timer);
 }
 
@@ -642,12 +656,12 @@ static void device_resume_noirq(struct device *dev, pm_message_t state, bool asy
 	 * so change its status accordingly.
 	 *
 	 * Otherwise, the device is going to be resumed, so set its PM-runtime
-	 * status to "active", but do that only if DPM_FLAG_SMART_SUSPEND is set
-	 * to avoid confusing drivers that don't use it.
+	 * status to "active" unless its power.smart_suspend flag is clear, in
+	 * which case it is not necessary to update its PM-runtime status.
 	 */
 	if (skip_resume)
 		pm_runtime_set_suspended(dev);
-	else if (dev_pm_skip_suspend(dev))
+	else if (dev_pm_smart_suspend(dev))
 		pm_runtime_set_active(dev);
 
 	if (dev->pm_domain) {
@@ -914,7 +928,7 @@ static void device_resume(struct device *dev, pm_message_t state, bool async)
 		goto Complete;
 
 	if (dev->power.direct_complete) {
-		/* Match the pm_runtime_disable() in __device_suspend(). */
+		/* Match the pm_runtime_disable() in device_suspend(). */
 		pm_runtime_enable(dev);
 		goto Complete;
 	}
@@ -1093,6 +1107,8 @@ static void device_complete(struct device *dev, pm_message_t state)
 	device_unlock(dev);
 
 out:
+	/* If enabling runtime PM for the device is blocked, unblock it. */
+	pm_runtime_unblock(dev);
 	pm_runtime_put(dev);
 }
 
@@ -1382,6 +1398,10 @@ static int device_suspend_late(struct device *dev, pm_message_t state, bool asyn
 	TRACE_DEVICE(dev);
 	TRACE_SUSPEND(0);
 
+	/*
+	 * Disable runtime PM for the device without checking if there is a
+	 * pending resume request for it.
+	 */
 	__pm_runtime_disable(dev, false);
 
 	dpm_wait_for_subordinate(dev, async);
@@ -1769,6 +1789,47 @@ int dpm_suspend(pm_message_t state)
 	return error;
 }
 
+static void device_prepare_smart_suspend(struct device *dev)
+{
+	struct device_link *link;
+	int idx;
+
+	/*
+	 * The "smart suspend" feature is enabled for devices whose drivers ask
+	 * for it and for devices without PM callbacks.
+	 *
+	 * However, if "smart suspend" is not enabled for the device's parent
+	 * or any of its suppliers that take runtime PM into account, it cannot
+	 * be enabled for the device either.
+	 */
+	dev->power.smart_suspend = dev->power.no_pm_callbacks ||
+		dev_pm_test_driver_flags(dev, DPM_FLAG_SMART_SUSPEND);
+
+	if (!dev_pm_smart_suspend(dev))
+		return;
+
+	if (dev->parent && !dev_pm_smart_suspend(dev->parent) &&
+	    !dev->parent->power.ignore_children && !pm_runtime_blocked(dev->parent)) {
+		dev->power.smart_suspend = false;
+		return;
+	}
+
+	idx = device_links_read_lock();
+
+	list_for_each_entry_rcu_locked(link, &dev->links.suppliers, c_node) {
+		if (!(link->flags & DL_FLAG_PM_RUNTIME))
+			continue;
+
+		if (!dev_pm_smart_suspend(link->supplier) &&
+		    !pm_runtime_blocked(link->supplier)) {
+			dev->power.smart_suspend = false;
+			break;
+		}
+	}
+
+	device_links_read_unlock(idx);
+}
+
 /**
  * device_prepare - Prepare a device for system power transition.
  * @dev: Device to handle.
@@ -1780,6 +1841,7 @@ int dpm_suspend(pm_message_t state)
 static int device_prepare(struct device *dev, pm_message_t state)
 {
 	int (*callback)(struct device *) = NULL;
+	bool no_runtime_pm;
 	int ret = 0;
 
 	/*
@@ -1789,6 +1851,13 @@ static int device_prepare(struct device *dev, pm_message_t state)
 	 * it again during the complete phase.
 	 */
 	pm_runtime_get_noresume(dev);
+	/*
+	 * If runtime PM is disabled for the device at this point and it has
+	 * never been enabled so far, it should not be enabled until this system
+	 * suspend-resume cycle is complete, so prepare to trigger a warning on
+	 * subsequent attempts to enable it.
+	 */
+	no_runtime_pm = pm_runtime_block_if_disabled(dev);
 
 	if (dev->power.syscore)
 		return 0;
@@ -1823,6 +1892,10 @@ unlock:
 		pm_runtime_put(dev);
 		return ret;
 	}
+	/* Do not enable "smart suspend" for devices without runtime PM. */
+	if (!no_runtime_pm)
+		device_prepare_smart_suspend(dev);
+
 	/*
 	 * A positive return value from ->prepare() means "this device appears
 	 * to be runtime-suspended and its state is fine, so if it really is
@@ -1998,6 +2071,5 @@ void device_pm_check_callbacks(struct device *dev)
 
 bool dev_pm_skip_suspend(struct device *dev)
 {
-	return dev_pm_test_driver_flags(dev, DPM_FLAG_SMART_SUSPEND) &&
-		pm_runtime_status_suspended(dev);
+	return dev_pm_smart_suspend(dev) && pm_runtime_status_suspended(dev);
 }
