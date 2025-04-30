@@ -45,14 +45,6 @@ collections rich in tests, like ``bpf`` with around 45 of them, as well
 as containing only a single one, like ``zram`` with ``zram: zram.sh``,
 and everything in between.
 
-The *tests* map directly to the files with the same name in the
-``tools/testing/selftests/`` subdirectory. For example the
-``net:ip_defrag.sh`` is realized by the
-``tools/testing/selftests/net/ip_defrag.sh`` script. Every test maps to
-an executable file in ``tools/testing/selftests/``, but not every
-executable file in ``tools/testing/selftests/`` maps to a test (eg.
-``tools/testing/selftests/rcutorture/bin/parse-build.sh``)
-
 The *collections* map directly to the subdirectories in
 ``tools/testing/selftests/``. For example the ``net`` collection refers
 to the ``tools/testing/selftests/net/`` subdir. All collections map to
@@ -73,6 +65,21 @@ by ``net``. This may be a bit confusing, as the ``net`` collection now
 doesn't contain "all network-related tests" but rather "all
 network-related tests which aren't already contained by some more
 specific collections".
+
+The *tests* map directly to the files with the same name in the
+``tools/testing/selftests/`` subdirectory. For example the
+``net:ip_defrag.sh`` is realized by the
+``tools/testing/selftests/net/ip_defrag.sh`` script. Every test maps to
+an executable file in ``tools/testing/selftests/``, but not every
+executable file in ``tools/testing/selftests/`` maps to a test (eg.
+``tools/testing/selftests/rcutorture/bin/parse-build.sh``). The
+executable is usually contained directly in its collection's directory,
+but **not always** - the tests of the ``kvm`` collection being the
+exception, with, for example, ``kvm:userspace_io_test`` having its
+binary in ``tools/testing/selftests/kvm/x86_64/userspace_io_test``
+instead of ``tools/testing/selftests/kvm/userspace_io_test``. It's not
+100% clear whether this is allowed or if it's ``kvm`` breaking the
+rules. Probably the latter.
 
 To get the explicit list of all fully qualified test names provided by
 the releaes relate to `Printing the list of all available tests`_.
@@ -219,7 +226,9 @@ selftests and cannot be used directly from the source as it's done with
 `tools/testing/selftests/kselftest-list.txt`_ file, which must be
 created first (see `Printing the list of all available tests`_ and
 `Running a specific set of tests`_). Once it's in place this script is
-the preferred method to conduct testing.
+the preferred method to conduct testing (Note: it's **not** preferred
+for running ``kvm`` tests - see a note in {{Printing the list of all
+available tests}} for details).
 
 From the technical viewpoint the script serves as a wrapper of
 `tools/testing/selftests/kselftest/runner.sh`_, transforming the
@@ -391,6 +400,49 @@ Note that the resulting list may contain tests which cannot be run
 because they weren't compiled. The list is meant to show all the tests
 that *may* be run, provided all the prerequisites are met and the tests
 were actually built..
+
+Note: This way of printing tests fails for the ``arm64`` collection on
+``ciqlts9_2`` (at least) - no ``arm64`` tests will be printed. To
+investigate how to work around this.
+
+Note 1: The names of tests emited by the ``kvm`` collection don't take
+into account that the corresponding programs are not contained directly
+in the collection's directory, but are dir-prefixed with the
+architecture. For example the test ``kvm:userspace_io_test`` compiled on
+x86_64 has its binary in
+``tools/testing/selftests/kvm/x86_64/userspace_io_test``, **not** in
+``tools/testing/selftests/kvm/userspace_io_test``. This confuses the
+``run_kselftest.sh`` script which, upon invoking like
+
+.. code:: shell
+
+   tools/testing/selftests/run_kselftest.sh --test kvm:userspace_io_test
+
+raises the following warning and fails:
+
+::
+
+   TAP version 13
+   1..1
+   # selftests: kvm: userspace_io_test
+   # Warning: file userspace_io_test is missing!
+   not ok 1 selftests: kvm: userspace_io_test
+
+This can be ad-hoc fixed by prefixing the test's name with ``x86_64/``
+
+.. code:: shell
+
+   tools/testing/selftests/run_kselftest.sh --test kvm:x86_64/userspace_io_test
+
+::
+
+   TAP version 13
+   1..1
+   # selftests: kvm: userspace_io_test
+   ok 1 selftests: kvm: userspace_io_test
+
+(Assuming the resulting name ``kvm:x86_64/userspace_io_test`` was added
+to ``tools/testing/selftests/kselftest-list.txt``)
 
 Running a specific set of tests
 -------------------------------
