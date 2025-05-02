@@ -3965,6 +3965,7 @@ void lpfc_poll_eratt(struct timer_list *t)
 		/* Tell the worker thread there is work to do */
 		lpfc_worker_wake_up(phba);
 	else
+restart_timer:
 		/* Restart the timer for next eratt poll */
 		mod_timer(&phba->eratt_poll,
 			  jiffies +
