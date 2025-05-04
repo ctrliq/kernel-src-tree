@@ -2162,6 +2162,7 @@ migrate_longterm_unpinnable_folios(struct list_head *movable_folio_list,
 		struct migration_target_control mtc = {
 			.nid = NUMA_NO_NODE,
 			.gfp_mask = GFP_USER | __GFP_NOWARN,
+			.reason = MR_LONGTERM_PIN,
 		};
 
 		if (migrate_pages(movable_folio_list, alloc_migration_target,
