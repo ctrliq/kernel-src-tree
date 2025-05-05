@@ -132,6 +132,7 @@ struct elevator_queue
 };
 
 #define ELEVATOR_FLAG_REGISTERED	0
+#define ELEVATOR_FLAG_DYING		1
 
 /*
  * block elevator interface
