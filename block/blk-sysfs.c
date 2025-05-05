@@ -563,7 +563,7 @@ static ssize_t queue_wb_lat_show(struct gendisk *disk, char *page)
 	ssize_t ret;
 	struct request_queue *q = disk->queue;
 
-	mutex_lock(&q->elevator_lock);
+	mutex_lock(&disk->rqos_state_mutex);
 	if (!wbt_rq_qos(q)) {
 		ret = -EINVAL;
 		goto out;
@@ -576,7 +576,7 @@ static ssize_t queue_wb_lat_show(struct gendisk *disk, char *page)
 
 	ret = sysfs_emit(page, "%llu\n", div_u64(wbt_get_min_lat(q), 1000));
 out:
-	mutex_unlock(&q->elevator_lock);
+	mutex_unlock(&disk->rqos_state_mutex);
 	return ret;
 }
 
@@ -596,7 +596,6 @@ static ssize_t queue_wb_lat_store(struct gendisk *disk, const char *page,
 		return -EINVAL;
 
 	memflags = blk_mq_freeze_queue(q);
-	mutex_lock(&q->elevator_lock);
 
 	rqos = wbt_rq_qos(q);
 	if (!rqos) {
@@ -621,11 +620,12 @@ static ssize_t queue_wb_lat_store(struct gendisk *disk, const char *page,
 	 */
 	blk_mq_quiesce_queue(q);
 
+	mutex_lock(&disk->rqos_state_mutex);
 	wbt_set_min_lat(q, val);
+	mutex_unlock(&disk->rqos_state_mutex);
 
 	blk_mq_unquiesce_queue(q);
 out:
-	mutex_unlock(&q->elevator_lock);
 	blk_mq_unfreeze_queue(q, memflags);
 
 	return ret;
@@ -878,9 +878,7 @@ int blk_register_queue(struct gendisk *disk)
 
 	if (queue_is_mq(q))
 		elevator_set_default(q);
-	mutex_lock(&q->elevator_lock);
 	wbt_enable_default(disk);
-	mutex_unlock(&q->elevator_lock);
 
 	blk_queue_flag_set(QUEUE_FLAG_REGISTERED, q);
 

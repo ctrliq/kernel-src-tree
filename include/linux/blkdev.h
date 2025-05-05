@@ -221,6 +221,8 @@ struct gendisk {
 	 * devices that do not have multiple independent access ranges.
 	 */
 	struct blk_independent_access_ranges *ia_ranges;
+
+	struct mutex rqos_state_mutex;	/* rqos state change mutex */
 };
 
 static inline bool disk_live(struct gendisk *disk)
