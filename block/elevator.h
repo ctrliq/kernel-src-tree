@@ -132,7 +132,6 @@ struct elevator_queue
 };
 
 #define ELEVATOR_FLAG_REGISTERED	0
-#define ELEVATOR_FLAG_DISABLE_WBT	1
 
 /*
  * block elevator interface
