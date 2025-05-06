@@ -1105,8 +1105,6 @@ struct efivar_entry {
 	struct efi_variable var;
 	struct list_head list;
 	struct kobject kobj;
-	bool scanning;
-	bool deleting;
 };
 
 static inline void
@@ -1126,6 +1124,7 @@ int efivar_init(int (*func)(efi_char16_t *, efi_guid_t, unsigned long, void *),
 		void *data, bool duplicates, struct list_head *head);
 
 int efivar_entry_add(struct efivar_entry *entry, struct list_head *head);
+void __efivar_entry_add(struct efivar_entry *entry, struct list_head *head);
 int efivar_entry_remove(struct efivar_entry *entry);
 
 int __efivar_entry_delete(struct efivar_entry *entry);
@@ -1159,6 +1158,26 @@ bool efivar_validate(efi_guid_t vendor, efi_char16_t *var_name, u8 *data,
 		     unsigned long data_size);
 bool efivar_variable_is_removable(efi_guid_t vendor, const char *name,
 				  size_t len);
+
+int efivar_lock(void);
+int efivar_trylock(void);
+void efivar_unlock(void);
+
+efi_status_t efivar_get_variable(efi_char16_t *name, efi_guid_t *vendor,
+				 u32 *attr, unsigned long *size, void *data);
+
+efi_status_t efivar_get_next_variable(unsigned long *name_size,
+				      efi_char16_t *name, efi_guid_t *vendor);
+
+efi_status_t efivar_set_variable_locked(efi_char16_t *name, efi_guid_t *vendor,
+					u32 attr, unsigned long data_size,
+					void *data, bool nonblocking);
+
+efi_status_t efivar_set_variable(efi_char16_t *name, efi_guid_t *vendor,
+				 u32 attr, unsigned long data_size, void *data);
+
+efi_status_t check_var_size(u32 attributes, unsigned long size);
+efi_status_t check_var_size_nonblocking(u32 attributes, unsigned long size);
 
 efi_status_t efivar_query_variable_info(u32 attr, u64 *storage_space,
 					u64 *remaining_space,
