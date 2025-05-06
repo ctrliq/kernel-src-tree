@@ -2025,8 +2025,8 @@ bool kvm_cpuid(struct kvm_vcpu *vcpu, u32 *eax, u32 *ebx,
 				kvm_guest_time_update(vcpu);
 
 			if (index == 1) {
-				*ecx = vcpu->arch.hv_clock.tsc_to_system_mul;
-				*edx = vcpu->arch.hv_clock.tsc_shift;
+				*ecx = vcpu->arch.pvclock_tsc_mul;
+				*edx = vcpu->arch.pvclock_tsc_shift;
 			} else if (index == 2) {
 				*eax = vcpu->arch.hw_tsc_khz;
 			}

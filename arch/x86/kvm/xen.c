@@ -176,8 +176,8 @@ static int xen_get_guest_pvclock(struct kvm_vcpu *vcpu,
 	 * Sanity check TSC shift+multiplier to verify the guest's view of time
 	 * is more or less consistent.
 	 */
-	if (hv_clock->tsc_shift != vcpu->arch.hv_clock.tsc_shift ||
-	    hv_clock->tsc_to_system_mul != vcpu->arch.hv_clock.tsc_to_system_mul)
+	if (hv_clock->tsc_shift != vcpu->arch.pvclock_tsc_shift ||
+	    hv_clock->tsc_to_system_mul != vcpu->arch.pvclock_tsc_mul)
 		return -EINVAL;
 
 	return 0;
