@@ -3946,7 +3946,6 @@ static int sev_snp_ap_creation(struct vcpu_svm *svm)
 	struct vcpu_svm *target_svm;
 	unsigned int request;
 	unsigned int apic_id;
-	int ret;
 
 	request = lower_32_bits(svm->vmcb->control.exit_info_1);
 	apic_id = upper_32_bits(svm->vmcb->control.exit_info_1);
@@ -3959,11 +3958,9 @@ static int sev_snp_ap_creation(struct vcpu_svm *svm)
 		return -EINVAL;
 	}
 
-	ret = 0;
-
 	target_svm = to_svm(target_vcpu);
 
-	mutex_lock(&target_svm->sev_es.snp_vmsa_mutex);
+	guard(mutex)(&target_svm->sev_es.snp_vmsa_mutex);
 
 	switch (request) {
 	case SVM_VMGEXIT_AP_CREATE_ON_INIT:
@@ -3971,15 +3968,13 @@ static int sev_snp_ap_creation(struct vcpu_svm *svm)
 		if (vcpu->arch.regs[VCPU_REGS_RAX] != sev->vmsa_features) {
 			vcpu_unimpl(vcpu, "vmgexit: mismatched AP sev_features [%#lx] != [%#llx] from guest\n",
 				    vcpu->arch.regs[VCPU_REGS_RAX], sev->vmsa_features);
-			ret = -EINVAL;
-			goto out;
+			return -EINVAL;
 		}
 
 		if (!page_address_valid(vcpu, svm->vmcb->control.exit_info_2)) {
 			vcpu_unimpl(vcpu, "vmgexit: invalid AP VMSA address [%#llx] from guest\n",
 				    svm->vmcb->control.exit_info_2);
-			ret = -EINVAL;
-			goto out;
+			return -EINVAL;
 		}
 
 		/*
@@ -3993,8 +3988,7 @@ static int sev_snp_ap_creation(struct vcpu_svm *svm)
 			vcpu_unimpl(vcpu,
 				    "vmgexit: AP VMSA address [%llx] from guest is unsafe as it is 2M aligned\n",
 				    svm->vmcb->control.exit_info_2);
-			ret = -EINVAL;
-			goto out;
+			return -EINVAL;
 		}
 
 		target_svm->sev_es.snp_vmsa_gpa = svm->vmcb->control.exit_info_2;
@@ -4005,8 +3999,7 @@ static int sev_snp_ap_creation(struct vcpu_svm *svm)
 	default:
 		vcpu_unimpl(vcpu, "vmgexit: invalid AP creation request [%#x] from guest\n",
 			    request);
-		ret = -EINVAL;
-		goto out;
+		return -EINVAL;
 	}
 
 	target_svm->sev_es.snp_ap_waiting_for_reset = true;
@@ -4020,10 +4013,7 @@ static int sev_snp_ap_creation(struct vcpu_svm *svm)
 		kvm_vcpu_kick(target_vcpu);
 	}
 
-out:
-	mutex_unlock(&target_svm->sev_es.snp_vmsa_mutex);
-
-	return ret;
+	return 0;
 }
 
 static int snp_handle_guest_req(struct vcpu_svm *svm, gpa_t req_gpa, gpa_t resp_gpa)
