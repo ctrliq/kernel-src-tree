@@ -1183,8 +1183,20 @@ static struct folio *new_folio(struct folio *src, unsigned long start)
 		return NULL;
 
 	if (folio_test_hugetlb(src)) {
-		return alloc_hugetlb_folio_vma(folio_hstate(src),
-				vma, address);
+		struct mempolicy *mpol;
+		nodemask_t *nodemask;
+		struct folio *folio;
+		struct hstate *h;
+		gfp_t gfp;
+		int nid;
+
+		h = folio_hstate(src);
+		gfp = htlb_alloc_mask(h);
+		nid = huge_node(vma, address, gfp, &mpol, &nodemask);
+		folio = alloc_hugetlb_folio_nodemask(h, nid, nodemask, gfp,
+				htlb_allow_alloc_fallback(MR_MEMPOLICY_MBIND));
+		mpol_cond_put(mpol);
+		return folio;
 	}
 
 	if (folio_test_large(src))
