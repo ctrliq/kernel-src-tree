@@ -409,6 +409,8 @@ struct queue_limits {
 	unsigned short		max_integrity_segments;
 	unsigned short		max_discard_segments;
 
+	unsigned short		max_write_streams;
+
 	unsigned int		max_open_zones;
 	unsigned int		max_active_zones;
 
@@ -1273,6 +1275,13 @@ static inline unsigned int
 bdev_max_zone_append_sectors(struct block_device *bdev)
 {
 	return bdev_limits(bdev)->max_zone_append_sectors;
+}
+
+static inline unsigned short bdev_max_write_streams(struct block_device *bdev)
+{
+	if (bdev_is_partition(bdev))
+		return 0;
+	return bdev_limits(bdev)->max_write_streams;
 }
 
 static inline unsigned queue_logical_block_size(const struct request_queue *q)
