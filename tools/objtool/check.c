@@ -188,6 +188,7 @@ static bool __dead_end_function(struct objtool_file *file, struct symbol *func,
 		"__stack_chk_fail",
 		"__tdx_hypercall_failed",
 		"__ubsan_handle_builtin_unreachable",
+		"acpi_processor_ffh_play_dead",
 		"arch_call_rest_init",
 		"cpu_bringup_and_idle",
 		"cpu_startup_entry",
@@ -4507,8 +4508,10 @@ int check(struct objtool_file *file)
 	init_cfi_state(&force_undefined_cfi);
 	force_undefined_cfi.force_undefined = true;
 
-	if (!cfi_hash_alloc(1UL << (file->elf->symbol_bits - 3)))
+	if (!cfi_hash_alloc(1UL << (file->elf->symbol_bits - 3))) {
+		ret = -1;
 		goto out;
+	}
 
 	cfi_hash_add(&init_cfi);
 	cfi_hash_add(&func_cfi);
@@ -4525,7 +4528,7 @@ int check(struct objtool_file *file)
 	if (opts.retpoline) {
 		ret = validate_retpoline(file);
 		if (ret < 0)
-			return ret;
+			goto out;
 		warnings += ret;
 	}
 
@@ -4561,7 +4564,7 @@ int check(struct objtool_file *file)
 		 */
 		ret = validate_unrets(file);
 		if (ret < 0)
-			return ret;
+			goto out;
 		warnings += ret;
 	}
 
@@ -4638,9 +4641,18 @@ int check(struct objtool_file *file)
 
 out:
 	/*
-	 *  For now, don't fail the kernel build on fatal warnings.  These
-	 *  errors are still fairly common due to the growing matrix of
-	 *  supported toolchains and their recent pace of change.
+	 * CONFIG_OBJTOOL_WERROR upgrades all warnings (and errors) to actual
+	 * errors.
+	 *
+	 * Note that even "fatal" type errors don't actually return an error
+	 * without CONFIG_OBJTOOL_WERROR.  That probably needs improved at some
+	 * point.
 	 */
+	if (opts.werror && (ret || warnings)) {
+		if (warnings)
+			WARN("%d warning(s) upgraded to errors", warnings);
+		return 1;
+	}
+
 	return 0;
 }
