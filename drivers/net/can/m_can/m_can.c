@@ -1724,7 +1724,8 @@ static int m_can_close(struct net_device *dev)
 		napi_disable(&cdev->napi);
 
 	m_can_stop(dev);
-	free_irq(dev->irq, dev);
+	if (dev->irq)
+		free_irq(dev->irq, dev);
 
 	m_can_clean(dev);
 
