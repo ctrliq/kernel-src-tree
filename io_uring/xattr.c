@@ -117,7 +117,7 @@ int io_fgetxattr(struct io_kiocb *req, unsigned int issue_flags)
 			&ix->ctx);
 
 	io_xattr_finish(req, ret);
-	return IOU_OK;
+	return IOU_COMPLETE;
 }
 
 int io_getxattr(struct io_kiocb *req, unsigned int issue_flags)
@@ -142,7 +142,7 @@ retry:
 	}
 
 	io_xattr_finish(req, ret);
-	return IOU_OK;
+	return IOU_COMPLETE;
 }
 
 static int __io_setxattr_prep(struct io_kiocb *req,
@@ -226,7 +226,7 @@ int io_fsetxattr(struct io_kiocb *req, unsigned int issue_flags)
 
 	ret = __io_setxattr(req, issue_flags, &req->file->f_path);
 	io_xattr_finish(req, ret);
-	return IOU_OK;
+	return IOU_COMPLETE;
 }
 
 int io_setxattr(struct io_kiocb *req, unsigned int issue_flags)
@@ -250,5 +250,5 @@ retry:
 	}
 
 	io_xattr_finish(req, ret);
-	return IOU_OK;
+	return IOU_COMPLETE;
 }

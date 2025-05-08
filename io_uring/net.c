@@ -122,7 +122,7 @@ int io_shutdown(struct io_kiocb *req, unsigned int issue_flags)
 
 	ret = __sys_shutdown_sock(sock, shutdown->how);
 	io_req_set_res(req, ret, 0);
-	return IOU_OK;
+	return IOU_COMPLETE;
 }
 
 static bool io_net_retry(struct socket *sock, int flags)
@@ -523,7 +523,7 @@ static inline bool io_send_finish(struct io_kiocb *req, int *ret,
 	/* Otherwise stop bundle and use the current result. */
 finish:
 	io_req_set_res(req, *ret, cflags);
-	*ret = IOU_OK;
+	*ret = IOU_COMPLETE;
 	return true;
 }
 
@@ -574,7 +574,7 @@ int io_sendmsg(struct io_kiocb *req, unsigned int issue_flags)
 	else if (sr->done_io)
 		ret = sr->done_io;
 	io_req_set_res(req, ret, 0);
-	return IOU_OK;
+	return IOU_COMPLETE;
 }
 
 static int io_send_select_buffer(struct io_kiocb *req, unsigned int issue_flags,
@@ -1478,7 +1478,7 @@ int io_send_zc(struct io_kiocb *req, unsigned int issue_flags)
 		io_req_msg_cleanup(req, 0);
 	}
 	io_req_set_res(req, ret, IORING_CQE_F_MORE);
-	return IOU_OK;
+	return IOU_COMPLETE;
 }
 
 int io_sendmsg_zc(struct io_kiocb *req, unsigned int issue_flags)
@@ -1539,7 +1539,7 @@ int io_sendmsg_zc(struct io_kiocb *req, unsigned int issue_flags)
 		io_req_msg_cleanup(req, 0);
 	}
 	io_req_set_res(req, ret, IORING_CQE_F_MORE);
-	return IOU_OK;
+	return IOU_COMPLETE;
 }
 
 void io_sendrecv_fail(struct io_kiocb *req)
@@ -1642,7 +1642,7 @@ retry:
 
 	if (!(req->flags & REQ_F_APOLL_MULTISHOT)) {
 		io_req_set_res(req, ret, cflags);
-		return IOU_OK;
+		return IOU_COMPLETE;
 	}
 
 	if (ret < 0)
@@ -1708,7 +1708,7 @@ int io_socket(struct io_kiocb *req, unsigned int issue_flags)
 					    sock->file_slot);
 	}
 	io_req_set_res(req, ret, 0);
-	return IOU_OK;
+	return IOU_COMPLETE;
 }
 
 int io_connect_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
@@ -1779,7 +1779,7 @@ out:
 		req_set_fail(req);
 	io_req_msg_cleanup(req, issue_flags);
 	io_req_set_res(req, ret, 0);
-	return IOU_OK;
+	return IOU_COMPLETE;
 }
 
 int io_bind_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
