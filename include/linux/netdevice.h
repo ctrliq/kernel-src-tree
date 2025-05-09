@@ -343,6 +343,15 @@ struct gro_list {
 #define GRO_HASH_BUCKETS	8
 
 /*
+ * Structure for per-NAPI config
+ */
+struct napi_config {
+	u64 gro_flush_timeout;
+	u32 defer_hard_irqs;
+	unsigned int napi_id;
+};
+
+/*
  * Structure for NAPI scheduling similar to tasklet but with weighting
  */
 struct napi_struct {
@@ -373,10 +382,14 @@ struct napi_struct {
 	unsigned int		napi_id;
 	struct hrtimer		timer;
 	struct task_struct	*thread;
+	unsigned long		gro_flush_timeout;
+	u32			defer_hard_irqs;
 	/* control-path-only fields follow */
 	struct list_head	dev_list;
 	struct hlist_node	napi_hash_node;
 	int			irq;
+	int			index;
+	struct napi_config	*config;
 };
 
 enum {
@@ -1858,9 +1871,6 @@ enum netdev_reg_state {
  *				allocated at register_netdev() time
  *	@real_num_rx_queues: 	Number of RX queues currently active in device
  *	@xdp_prog:		XDP sockets filter program pointer
- *	@gro_flush_timeout:	timeout for GRO layer in NAPI
- *	@napi_defer_hard_irqs:	If not zero, provides a counter that would
- *				allow to avoid NIC hard IRQ, on busy queues.
  *
  *	@rx_handler:		handler for received packets
  *	@rx_handler_data: 	XXX: need comments on this one
@@ -2009,6 +2019,12 @@ enum netdev_reg_state {
  *	@dpll_pin: Pointer to the SyncE source pin of a DPLL subsystem,
  *		   where the clock is recovered.
  *
+ *	@napi_config: An array of napi_config structures containing per-NAPI
+ *		      settings.
+ *	@gro_flush_timeout:	timeout for GRO layer in NAPI
+ *	@napi_defer_hard_irqs:	If not zero, provides a counter that would
+ *				allow to avoid NIC hard IRQ, on busy queues.
+ *
  *	FIXME: cleanup struct net_device such that network protocol info
  *	moves out.
  */
@@ -2074,8 +2090,6 @@ struct net_device {
 	int			ifindex;
 	unsigned int		real_num_rx_queues;
 	struct netdev_rx_queue	*_rx;
-	unsigned long		gro_flush_timeout;
-	u32			napi_defer_hard_irqs;
 	unsigned int		gro_max_size;
 	unsigned int		gro_ipv4_max_size;
 	rx_handler_func_t __rcu	*rx_handler;
@@ -2399,6 +2413,10 @@ struct net_device {
 	/** @irq_moder: dim parameters used if IS_ENABLED(CONFIG_DIMLIB). */
 	struct dim_irq_moder	*irq_moder;
 
+	struct napi_config	*napi_config;
+	unsigned long		gro_flush_timeout;
+	u32			napi_defer_hard_irqs;
+
 	u8			priv[] ____cacheline_aligned
 				       __counted_by(priv_len);
 } ____cacheline_aligned;
@@ -2652,6 +2670,22 @@ netif_napi_add_tx_weight(struct net_device *dev,
 {
 	set_bit(NAPI_STATE_NO_BUSY_POLL, &napi->state);
 	netif_napi_add_weight(dev, napi, poll, weight);
+}
+
+/**
+ * netif_napi_add_config - initialize a NAPI context with persistent config
+ * @dev: network device
+ * @napi: NAPI context
+ * @poll: polling function
+ * @index: the NAPI index
+ */
+static inline void
+netif_napi_add_config(struct net_device *dev, struct napi_struct *napi,
+		      int (*poll)(struct napi_struct *, int), int index)
+{
+	napi->index = index;
+	napi->config = &dev->napi_config[index];
+	netif_napi_add_weight(dev, napi, poll, NAPI_POLL_WEIGHT);
 }
 
 /**
@@ -3142,7 +3176,6 @@ struct net_device *netdev_get_by_index(struct net *net, int ifindex,
 struct net_device *netdev_get_by_name(struct net *net, const char *name,
 				      netdevice_tracker *tracker, gfp_t gfp);
 struct net_device *dev_get_by_index_rcu(struct net *net, int ifindex);
-struct net_device *dev_get_by_napi_id(unsigned int napi_id);
 void netdev_copy_name(struct net_device *dev, char *name);
 
 static inline int dev_hard_header(struct sk_buff *skb, struct net_device *dev,
