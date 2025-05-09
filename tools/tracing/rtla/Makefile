@@ -43,12 +43,6 @@ FEATURE_DISPLAY	+= libbpf
 FEATURE_DISPLAY	+= clang-bpf-co-re
 FEATURE_DISPLAY	+= bpftool-skeletons
 
-ifeq ($(V),1)
-  Q		=
-else
-  Q		= @
-endif
-
 all: $(RTLA)
 
 include $(srctree)/tools/build/Makefile.include
