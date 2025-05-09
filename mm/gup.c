@@ -763,7 +763,7 @@ struct page *follow_page(struct vm_area_struct *vma, unsigned long address,
 	struct follow_page_context ctx = { NULL };
 	struct page *page;
 
-	if (vma_is_secretmem(vma))
+	if (vma_is_secretmem(vma) || (vma->vm_flags & VM_PFNMAP))
 		return NULL;
 
 	if (WARN_ON_ONCE(foll_flags & FOLL_PIN))
