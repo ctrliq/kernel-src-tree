@@ -181,3 +181,6 @@ netdevice_tracker                   dev_registered_tracker
 struct_rtnl_hw_stats64*             offload_xstats_l3                                               
 struct_devlink_port*                devlink_port                                                    
 struct_dpll_pin*                    dpll_pin                                                        
+struct_napi_config*                 napi_config
+unsigned_long                       gro_flush_timeout
+u32                                 napi_defer_hard_irqs
