@@ -11179,6 +11179,7 @@ struct net_device *alloc_netdev_mqs(int sizeof_priv, const char *name,
 	dev->cfg = kzalloc(sizeof(*dev->cfg), GFP_KERNEL_ACCOUNT);
 	if (!dev->cfg)
 		goto free_all;
+	dev->cfg_pending = dev->cfg;
 
 	napi_config_sz = array_size(maxqs, sizeof(*dev->napi_config));
 	dev->napi_config = kvzalloc(napi_config_sz, GFP_KERNEL_ACCOUNT);
@@ -11236,6 +11237,7 @@ void free_netdev(struct net_device *dev)
 
 	mutex_destroy(&dev->lock);
 
+	WARN_ON(dev->cfg != dev->cfg_pending);
 	kfree(dev->cfg);
 	kfree(dev->ethtool);
 	netif_free_tx_queues(dev);
