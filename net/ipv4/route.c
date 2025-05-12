@@ -2479,6 +2479,7 @@ martian_destination:
 		net_warn_ratelimited("martian destination %pI4 from %pI4, dev %s\n",
 				     &daddr, &saddr, dev->name);
 #endif
+	goto out;
 
 e_nobufs:
 	reason = SKB_DROP_REASON_NOMEM;
