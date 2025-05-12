@@ -4323,7 +4323,9 @@ static enum skb_drop_reason tcp_disordered_ack_check(const struct sock *sk,
 
 	/* 2. Is its sequence not the expected one ? */
 	if (seq != tp->rcv_nxt)
-		return reason;
+		return before(seq, tp->rcv_nxt) ?
+			SKB_DROP_REASON_TCP_RFC7323_PAWS_ACK :
+			reason;
 
 	/* 3. Is this not a duplicate ACK ? */
 	if (ack != tp->snd_una)
@@ -5752,6 +5754,12 @@ static bool tcp_validate_incoming(struct sock *sk, struct sk_buff *skb,
 	/* Reset is accepted even if it did not pass PAWS. */
 	if (th->rst)
 		goto step1;
+
+	/* Old ACK are common, do not change PAWSESTABREJECTED
+	 * and do not send a dupack.
+	 */
+	if (reason == SKB_DROP_REASON_TCP_RFC7323_PAWS_ACK)
+		goto discard;
 
 	NET_INC_STATS(sock_net(sk), LINUX_MIB_PAWSESTABREJECTED);
 	if (!tcp_oow_rate_limited(sock_net(sk), skb,
