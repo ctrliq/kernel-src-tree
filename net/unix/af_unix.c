@@ -2056,13 +2056,11 @@ static int unix_stream_sendmsg(struct socket *sock, struct msghdr *msg,
 			       size_t len)
 {
 	struct sock *sk = sock->sk;
+	struct sk_buff *skb = NULL;
 	struct sock *other = NULL;
-	int err, size;
-	struct sk_buff *skb;
-	int sent = 0;
 	struct scm_cookie scm;
 	bool fds_sent = false;
-	int data_len;
+	int err, sent = 0;
 
 	wait_for_unix_gc();
 	err = scm_send(sock, msg, &scm, false);
@@ -2085,16 +2083,12 @@ static int unix_stream_sendmsg(struct socket *sock, struct msghdr *msg,
 		}
 	}
 
-	if (READ_ONCE(sk->sk_shutdown) & SEND_SHUTDOWN) {
-		if (!(msg->msg_flags & MSG_NOSIGNAL))
-			send_sig(SIGPIPE, current, 0);
-
-		err = -EPIPE;
-		goto out_err;
-	}
+	if (READ_ONCE(sk->sk_shutdown) & SEND_SHUTDOWN)
+		goto out_pipe;
 
 	while (sent < len) {
-		size = len - sent;
+		int size = len - sent;
+		int data_len;
 
 		/* Keep two messages in the pipe so it schedules better */
 		size = min_t(int, size, (sk->sk_sndbuf >> 1) - 64);
@@ -2130,7 +2124,7 @@ static int unix_stream_sendmsg(struct socket *sock, struct msghdr *msg,
 
 		if (sock_flag(other, SOCK_DEAD) ||
 		    (other->sk_shutdown & RCV_SHUTDOWN))
-			goto out_pipe;
+			goto out_pipe_unlock;
 
 		maybe_add_creds(skb, sock, other);
 		scm_stat_add(other, skb);
@@ -2144,8 +2138,9 @@ static int unix_stream_sendmsg(struct socket *sock, struct msghdr *msg,
 
 	return sent;
 
-out_pipe:
+out_pipe_unlock:
 	unix_state_unlock(other);
+out_pipe:
 	if (!sent && !(msg->msg_flags & MSG_NOSIGNAL))
 		send_sig(SIGPIPE, current, 0);
 	err = -EPIPE;
