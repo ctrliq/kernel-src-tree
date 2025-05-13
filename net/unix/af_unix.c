@@ -1584,7 +1584,7 @@ out_unlock:
 	unix_state_unlock(other);
 	sock_put(other);
 out_free_skb:
-	kfree_skb(skb);
+	consume_skb(skb);
 out_free_sk:
 	unix_release_sock(newsk, 0);
 out:
@@ -2039,7 +2039,7 @@ out_unlock:
 		unix_state_unlock(sk);
 	unix_state_unlock(other);
 out_free:
-	kfree_skb(skb);
+	consume_skb(skb);
 out:
 	if (other)
 		sock_put(other);
@@ -2145,7 +2145,7 @@ out_pipe:
 		send_sig(SIGPIPE, current, 0);
 	err = -EPIPE;
 out_free:
-	kfree_skb(skb);
+	consume_skb(skb);
 out_err:
 	scm_destroy(&scm);
 	return sent ? : err;
