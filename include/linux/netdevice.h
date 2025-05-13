@@ -1245,8 +1245,11 @@ struct netdev_net_notifier {
  *	notification(s). Otherwise core will send a generic one.
  * int (*ndo_fdb_del)(struct ndmsg *ndm, struct nlattr *tb[],
  *		      struct net_device *dev,
- *		      const unsigned char *addr, u16 vid)
+ *		      const unsigned char *addr, u16 vid
+ *		      bool *notified, struct netlink_ext_ack *extack);
  *	Deletes the FDB entry from dev coresponding to addr.
+ *	Callee shall set *notified to true if it sent any appropriate
+ *	notification(s). Otherwise core will send a generic one.
  * int (*ndo_fdb_del_bulk)(struct nlmsghdr *nlh, struct net_device *dev,
  *			   struct netlink_ext_ack *extack);
  * int (*ndo_fdb_dump)(struct sk_buff *skb, struct netlink_callback *cb,
@@ -1528,7 +1531,9 @@ struct net_device_ops {
 					       struct nlattr *tb[],
 					       struct net_device *dev,
 					       const unsigned char *addr,
-					       u16 vid, struct netlink_ext_ack *extack);
+					       u16 vid,
+					       bool *notified,
+					       struct netlink_ext_ack *extack);
 	int			(*ndo_fdb_del_bulk)(struct nlmsghdr *nlh,
 						    struct net_device *dev,
 						    struct netlink_ext_ack *extack);
