@@ -2069,18 +2069,20 @@ static int unix_stream_sendmsg(struct socket *sock, struct msghdr *msg,
 	if (err < 0)
 		return err;
 
-	err = -EOPNOTSUPP;
-	if (msg->msg_flags&MSG_OOB)
+	if (msg->msg_flags & MSG_OOB) {
+		err = -EOPNOTSUPP;
 		goto out_err;
+	}
 
 	if (msg->msg_namelen) {
 		err = sk->sk_state == TCP_ESTABLISHED ? -EISCONN : -EOPNOTSUPP;
 		goto out_err;
 	} else {
-		err = -ENOTCONN;
 		other = unix_peer(sk);
-		if (!other)
+		if (!other) {
+			err = -ENOTCONN;
 			goto out_err;
+		}
 	}
 
 	if (READ_ONCE(sk->sk_shutdown) & SEND_SHUTDOWN)
