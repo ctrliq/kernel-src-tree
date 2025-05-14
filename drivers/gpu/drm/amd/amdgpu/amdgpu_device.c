@@ -245,7 +245,7 @@ static void amdgpu_device_attr_sysfs_fini(struct amdgpu_device *adev)
 }
 
 static ssize_t amdgpu_sysfs_reg_state_get(struct file *f, struct kobject *kobj,
-					  const struct bin_attribute *attr, char *buf,
+					  struct bin_attribute *attr, char *buf,
 					  loff_t ppos, size_t count)
 {
 	struct device *dev = kobj_to_dev(kobj);
@@ -281,8 +281,8 @@ static ssize_t amdgpu_sysfs_reg_state_get(struct file *f, struct kobject *kobj,
 	return bytes_read;
 }
 
-static const BIN_ATTR(reg_state, 0444, amdgpu_sysfs_reg_state_get, NULL,
-		      AMDGPU_SYS_REG_STATE_END);
+BIN_ATTR(reg_state, 0444, amdgpu_sysfs_reg_state_get, NULL,
+	 AMDGPU_SYS_REG_STATE_END);
 
 int amdgpu_reg_state_sysfs_init(struct amdgpu_device *adev)
 {
