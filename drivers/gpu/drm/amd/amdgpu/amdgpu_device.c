@@ -4809,7 +4809,6 @@ void amdgpu_device_fini_hw(struct amdgpu_device *adev)
 void amdgpu_device_fini_sw(struct amdgpu_device *adev)
 {
 	int i, idx;
-	bool px;
 
 	amdgpu_device_ip_fini(adev);
 	amdgpu_fence_driver_sw_fini(adev);
@@ -4833,16 +4832,9 @@ void amdgpu_device_fini_sw(struct amdgpu_device *adev)
 		amdgpu_bios_release(adev);
 	}
 
-	kfree(adev->fru_info);
-	adev->fru_info = NULL;
-
-	kfree(adev->xcp_mgr);
-	adev->xcp_mgr = NULL;
-
-	px = amdgpu_device_supports_px(adev_to_drm(adev));
-
-	if (px || (!dev_is_removable(&adev->pdev->dev) &&
-				apple_gmux_detect(NULL, NULL)))
+	kfree(adev->bios);
+	adev->bios = NULL;
+	if (amdgpu_device_supports_px(adev_to_drm(adev))) {
 		vga_switcheroo_unregister_client(adev->pdev);
 		vga_switcheroo_fini_domain_pm_ops(adev->dev);
 	}
