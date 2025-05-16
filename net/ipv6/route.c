@@ -3836,6 +3836,7 @@ err:
 
 static int ip6_route_info_create_nh(struct fib6_info *rt,
 				    struct fib6_config *cfg,
+				    gfp_t gfp_flags,
 				    struct netlink_ext_ack *extack)
 {
 	struct net *net = cfg->fc_nlinfo.nl_net;
@@ -3871,7 +3872,7 @@ static int ip6_route_info_create_nh(struct fib6_info *rt,
 	} else {
 		int addr_type;
 
-		err = fib6_nh_init(net, rt->fib6_nh, cfg, GFP_ATOMIC, extack);
+		err = fib6_nh_init(net, rt->fib6_nh, cfg, gfp_flags, extack);
 		if (err)
 			goto out_release;
 
@@ -3919,7 +3920,7 @@ int ip6_route_add(struct fib6_config *cfg, gfp_t gfp_flags,
 	if (IS_ERR(rt))
 		return PTR_ERR(rt);
 
-	err = ip6_route_info_create_nh(rt, cfg, extack);
+	err = ip6_route_info_create_nh(rt, cfg, gfp_flags, extack);
 	if (err)
 		return err;
 
@@ -4710,7 +4711,7 @@ struct fib6_info *addrconf_f6i_alloc(struct net *net,
 	if (IS_ERR(f6i))
 		return f6i;
 
-	err = ip6_route_info_create_nh(f6i, &cfg, extack);
+	err = ip6_route_info_create_nh(f6i, &cfg, gfp_flags, extack);
 	if (err)
 		return ERR_PTR(err);
 
@@ -5468,7 +5469,7 @@ static int ip6_route_multipath_add(struct fib6_config *cfg,
 			goto cleanup;
 		}
 
-		err = ip6_route_info_create_nh(rt, &r_cfg, extack);
+		err = ip6_route_info_create_nh(rt, &r_cfg, GFP_KERNEL, extack);
 		if (err) {
 			rt = NULL;
 			goto cleanup;
