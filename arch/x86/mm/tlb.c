@@ -7,6 +7,7 @@
 #include <linux/export.h>
 #include <linux/cpu.h>
 #include <linux/debugfs.h>
+#include <linux/mmu_notifier.h>
 
 #include <asm/tlbflush.h>
 #include <asm/mmu_context.h>
@@ -748,6 +749,7 @@ void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch)
 	cpumask_clear(&batch->cpumask);
 
 	put_cpu();
+	mmu_notifier_invalidate_range(mm, start, end);
 }
 
 static ssize_t tlbflush_read_file(struct file *file, char __user *user_buf,
