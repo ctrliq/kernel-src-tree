@@ -21,6 +21,8 @@
 
 static int links_per_lgr_min = SMC_LINKS_ADD_LNK_MIN;
 static int links_per_lgr_max = SMC_LINKS_ADD_LNK_MAX;
+static int conns_per_lgr_min = SMC_CONN_PER_LGR_MIN;
+static int conns_per_lgr_max = SMC_CONN_PER_LGR_MAX;
 
 static struct ctl_table smc_table[] = {
 	{
@@ -55,6 +57,15 @@ static struct ctl_table smc_table[] = {
 		.extra1		= &links_per_lgr_min,
 		.extra2		= &links_per_lgr_max,
 	},
+	{
+		.procname	= "smcr_max_conns_per_lgr",
+		.data		= &init_net.smc.sysctl_max_conns_per_lgr,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &conns_per_lgr_min,
+		.extra2		= &conns_per_lgr_max,
+	},
 	{  }
 };
 
@@ -82,6 +93,7 @@ int __net_init smc_sysctl_net_init(struct net *net)
 	net->smc.sysctl_smcr_buf_type = SMCR_PHYS_CONT_BUFS;
 	net->smc.sysctl_smcr_testlink_time = SMC_LLC_TESTLINK_DEFAULT_TIME;
 	net->smc.sysctl_max_links_per_lgr = SMC_LINKS_PER_LGR_MAX_PREFER;
+	net->smc.sysctl_max_conns_per_lgr = SMC_CONN_PER_LGR_PREFER;
 
 	return 0;
 
