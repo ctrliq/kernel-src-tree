@@ -1669,7 +1669,7 @@ static int parse_nla_srh(struct nlattr **attrs, struct seg6_local_lwt *slwt,
 	if (!seg6_validate_srh(srh, len, false))
 		return -EINVAL;
 
-	slwt->srh = kmemdup(srh, len, GFP_ATOMIC);
+	slwt->srh = kmemdup(srh, len, GFP_KERNEL);
 	if (!slwt->srh)
 		return -ENOMEM;
 
@@ -1909,7 +1909,7 @@ static int parse_nla_bpf(struct nlattr **attrs, struct seg6_local_lwt *slwt,
 	if (!tb[SEG6_LOCAL_BPF_PROG] || !tb[SEG6_LOCAL_BPF_PROG_NAME])
 		return -EINVAL;
 
-	slwt->bpf.name = nla_memdup(tb[SEG6_LOCAL_BPF_PROG_NAME], GFP_ATOMIC);
+	slwt->bpf.name = nla_memdup(tb[SEG6_LOCAL_BPF_PROG_NAME], GFP_KERNEL);
 	if (!slwt->bpf.name)
 		return -ENOMEM;
 
@@ -1992,7 +1992,7 @@ static int parse_nla_counters(struct nlattr **attrs,
 		return -EINVAL;
 
 	/* counters are always zero initialized */
-	pcounters = seg6_local_alloc_pcpu_counters(GFP_ATOMIC);
+	pcounters = seg6_local_alloc_pcpu_counters(GFP_KERNEL);
 	if (!pcounters)
 		return -ENOMEM;
 
