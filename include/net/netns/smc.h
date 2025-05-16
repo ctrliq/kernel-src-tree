@@ -20,5 +20,6 @@ struct netns_smc {
 	unsigned int			sysctl_autocorking_size;
 	unsigned int			sysctl_smcr_buf_type;
 	int				sysctl_smcr_testlink_time;
+	int				sysctl_max_links_per_lgr;
 };
 #endif
