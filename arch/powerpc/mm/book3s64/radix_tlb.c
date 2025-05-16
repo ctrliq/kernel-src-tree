@@ -732,6 +732,7 @@ local:
 		_tlbiel_pid(pid, RIC_FLUSH_TLB);
 	}
 	preempt_enable();
+	mmu_notifier_invalidate_range(mm, 0, -1UL);
 }
 EXPORT_SYMBOL(radix__flush_tlb_mm);
 
@@ -770,6 +771,7 @@ local:
 		_tlbiel_pid(pid, RIC_FLUSH_ALL);
 	}
 	preempt_enable();
+	mmu_notifier_invalidate_range(mm, 0, -1UL);
 }
 
 void radix__flush_all_mm(struct mm_struct *mm)
@@ -997,6 +999,7 @@ is_local:
 		}
 	}
 	preempt_enable();
+	mmu_notifier_invalidate_range(mm, start, end);
 }
 
 void radix__flush_tlb_range(struct vm_area_struct *vma, unsigned long start,
@@ -1201,6 +1204,7 @@ is_local:
 					start, end, pid, page_size, psize, also_pwc);
 	}
 	preempt_enable();
+	mmu_notifier_invalidate_range(mm, start, end);
 }
 
 void radix__flush_tlb_range_psize(struct mm_struct *mm, unsigned long start,
