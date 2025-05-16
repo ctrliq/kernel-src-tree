@@ -35,6 +35,7 @@ void radix__flush_hugetlb_tlb_range(struct vm_area_struct *vma, unsigned long st
 
 	psize = hstate_get_psize(hstate);
 	radix__flush_tlb_range_psize(vma->vm_mm, start, end, psize);
+	mmu_notifier_invalidate_range(vma->vm_mm, start, end);
 }
 
 /*
