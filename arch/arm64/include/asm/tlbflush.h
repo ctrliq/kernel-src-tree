@@ -24,7 +24,12 @@
 #include <linux/bitfield.h>
 #include <linux/mm_types.h>
 #include <linux/sched.h>
+#ifdef __GENKSYMS__
 #include <asm/cputype.h>
+#else
+#include <linux/mmu_notifier.h>
+#include <asm/cputype.h>
+#endif
 #include <asm/mmu.h>
 
 /*
@@ -317,6 +322,12 @@ static inline void flush_tlb_mm(struct mm_struct *mm)
 
 		break;
 	}
+#ifndef __GENKSYMS__
+	if (flush == TLB_FLUSH_NO)
+		return;
+
+	mmu_notifier_invalidate_range(mm, 0, -1UL);
+#endif
 }
 
 static inline void flush_tlb_page_nosync(struct vm_area_struct *vma,
@@ -328,6 +339,10 @@ static inline void flush_tlb_page_nosync(struct vm_area_struct *vma,
 	addr = __TLBI_VADDR(uaddr, ASID(vma->vm_mm));
 	__tlbi(vale1is, addr);
 	__tlbi_user(vale1is, addr);
+#ifndef __GENKSYMS__
+	mmu_notifier_invalidate_range(vma->vm_mm, uaddr & PAGE_MASK,
+						(uaddr & PAGE_MASK) + PAGE_SIZE);
+#endif
 }
 
 static inline void flush_tlb_page(struct vm_area_struct *vma,
@@ -362,6 +377,13 @@ static inline void flush_tlb_page(struct vm_area_struct *vma,
 
 		break;
 	}
+#ifndef __GENKSYMS__
+	if (flush == TLB_FLUSH_NO)
+		return;
+
+	mmu_notifier_invalidate_range(mm, uaddr & PAGE_MASK,
+						(uaddr & PAGE_MASK) + PAGE_SIZE);
+#endif
 }
 
 /*
@@ -461,6 +483,12 @@ static inline void __flush_tlb_range(struct vm_area_struct *vma,
 		dsb(ish);
 		break;
 	}
+#ifndef __GENKSYMS__
+	if (flush == TLB_FLUSH_NO)
+		return;
+
+	mmu_notifier_invalidate_range(vma->vm_mm, start, end);
+#endif
 }
 
 static inline void flush_tlb_range(struct vm_area_struct *vma,
@@ -506,6 +534,9 @@ static inline void __flush_tlb_pgtable(struct mm_struct *mm,
 	__tlbi(vae1is, addr);
 	__tlbi_user(vae1is, addr);
 	dsb(ish);
+#ifndef __GENKSYMS__
+	mmu_notifier_invalidate_range(mm, 0, -1UL);
+#endif
 }
 
 static inline void __flush_tlb_kernel_pgtable(unsigned long kaddr)

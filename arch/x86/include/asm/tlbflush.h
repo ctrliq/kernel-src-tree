@@ -3,8 +3,12 @@
 #define _ASM_X86_TLBFLUSH_H
 
 #include <linux/mm.h>
+#ifdef __GENKSYMS__
 #include <linux/sched.h>
-
+#else
+#include <linux/mmu_notifier.h>
+#include <linux/sched.h>
+#endif
 #include <asm/processor.h>
 #include <asm/cpufeature.h>
 #include <asm/special_insns.h>
@@ -603,6 +607,7 @@ static inline void arch_tlbbatch_add_mm(struct arch_tlbflush_unmap_batch *batch,
 {
 	inc_mm_tlb_gen(mm);
 	cpumask_or(&batch->cpumask, &batch->cpumask, mm_cpumask(mm));
+	mmu_notifier_invalidate_range(mm, 0, -1UL);
 }
 
 extern void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch);

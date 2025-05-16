@@ -7,6 +7,7 @@
 #include <linux/export.h>
 #include <linux/cpu.h>
 #include <linux/debugfs.h>
+#include <linux/mmu_notifier.h>
 
 #include <asm/tlbflush.h>
 #include <asm/mmu_context.h>
@@ -685,6 +686,7 @@ void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
 		flush_tlb_others(mm_cpumask(mm), &info);
 
 	put_cpu();
+	mmu_notifier_invalidate_range(mm, start, end);
 }
 
 
