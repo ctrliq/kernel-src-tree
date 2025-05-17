@@ -480,8 +480,12 @@ extern int __mmu_notifier_test_young(struct mm_struct *mm,
 extern void __mmu_notifier_change_pte(struct mm_struct *mm,
 				      unsigned long address, pte_t pte);
 extern int __mmu_notifier_invalidate_range_start(struct mmu_notifier_range *r);
+#ifdef __GENKSYMS__
 extern void __mmu_notifier_invalidate_range_end(struct mmu_notifier_range *r,
-				  bool only_end);
+				bool only_end);
+#else
+extern void __mmu_notifier_invalidate_range_end(struct mmu_notifier_range *r);
+#endif
 extern void __mmu_notifier_invalidate_range(struct mm_struct *mm,
 				  unsigned long start, unsigned long end);
 extern bool
@@ -561,15 +565,17 @@ static inline void
 mmu_notifier_invalidate_range_end(struct mmu_notifier_range *range)
 {
 	if (mm_has_notifiers(range->mm))
-		__mmu_notifier_invalidate_range_end(range, false);
+		__mmu_notifier_invalidate_range_end(range);
 }
 
+#ifdef __GENKSYMS__
 static inline void
 mmu_notifier_invalidate_range_only_end(struct mmu_notifier_range *range)
 {
 	if (mm_has_notifiers(range->mm))
 		__mmu_notifier_invalidate_range_end(range, true);
 }
+#endif
 
 static inline void mmu_notifier_invalidate_range(struct mm_struct *mm,
 				  unsigned long start, unsigned long end)
@@ -664,44 +670,46 @@ static inline void mmu_notifier_range_init_migrate(
 	__young;							\
 })
 
-#define	ptep_clear_flush_notify(__vma, __address, __ptep)		\
+#ifdef __GENKSYMS__
+#define   ptep_clear_flush_notify(__vma, __address, __ptep)		\
 ({									\
-	unsigned long ___addr = __address & PAGE_MASK;			\
-	struct mm_struct *___mm = (__vma)->vm_mm;			\
-	pte_t ___pte;							\
+  unsigned long ___addr = __address & PAGE_MASK;			\
+  struct mm_struct *___mm = (__vma)->vm_mm;				\
+  pte_t ___pte;								\
 									\
-	___pte = ptep_clear_flush(__vma, __address, __ptep);		\
-	mmu_notifier_invalidate_range(___mm, ___addr,			\
-					___addr + PAGE_SIZE);		\
+  ___pte = ptep_clear_flush(__vma, __address, __ptep);			\
+  mmu_notifier_invalidate_range(___mm, ___addr,				\
+                                  ___addr + PAGE_SIZE);			\
 									\
-	___pte;								\
+  ___pte;								\
 })
 
 #define pmdp_huge_clear_flush_notify(__vma, __haddr, __pmd)		\
 ({									\
-	unsigned long ___haddr = __haddr & HPAGE_PMD_MASK;		\
-	struct mm_struct *___mm = (__vma)->vm_mm;			\
-	pmd_t ___pmd;							\
+  unsigned long ___haddr = __haddr & HPAGE_PMD_MASK;			\
+  struct mm_struct *___mm = (__vma)->vm_mm;				\
+  pmd_t ___pmd;								\
 									\
-	___pmd = pmdp_huge_clear_flush(__vma, __haddr, __pmd);		\
-	mmu_notifier_invalidate_range(___mm, ___haddr,			\
-				      ___haddr + HPAGE_PMD_SIZE);	\
+  ___pmd = pmdp_huge_clear_flush(__vma, __haddr, __pmd);		\
+  mmu_notifier_invalidate_range(___mm, ___haddr,			\
+                                ___haddr + HPAGE_PMD_SIZE);		\
 									\
-	___pmd;								\
+  ___pmd;								\
 })
 
 #define pudp_huge_clear_flush_notify(__vma, __haddr, __pud)		\
 ({									\
-	unsigned long ___haddr = __haddr & HPAGE_PUD_MASK;		\
-	struct mm_struct *___mm = (__vma)->vm_mm;			\
-	pud_t ___pud;							\
+  unsigned long ___haddr = __haddr & HPAGE_PUD_MASK;			\
+  struct mm_struct *___mm = (__vma)->vm_mm;				\
+  pud_t ___pud;								\
 									\
-	___pud = pudp_huge_clear_flush(__vma, __haddr, __pud);		\
-	mmu_notifier_invalidate_range(___mm, ___haddr,			\
-				      ___haddr + HPAGE_PUD_SIZE);	\
+  ___pud = pudp_huge_clear_flush(__vma, __haddr, __pud);		\
+  mmu_notifier_invalidate_range(___mm, ___haddr,			\
+                                ___haddr + HPAGE_PUD_SIZE);		\
 									\
-	___pud;								\
+  ___pud;								\
 })
+#endif
 
 /*
  * set_pte_at_notify() sets the pte _after_ running the notifier.
@@ -796,10 +804,12 @@ mmu_notifier_invalidate_range_end(struct mmu_notifier_range *range)
 {
 }
 
+#ifdef __GENKSYMS__
 static inline void
 mmu_notifier_invalidate_range_only_end(struct mmu_notifier_range *range)
 {
 }
+#endif
 
 static inline void mmu_notifier_invalidate_range(struct mm_struct *mm,
 				  unsigned long start, unsigned long end)
