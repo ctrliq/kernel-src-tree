@@ -38,6 +38,7 @@
 #include "mixer_us16x08.h"
 #include "mixer_s1810c.h"
 #include "helper.h"
+#include "fcp.h"
 
 struct std_mono_table {
 	unsigned int unitid, control, cmask;
@@ -3687,8 +3688,7 @@ static const char *snd_djm_get_label(u8 device_idx, u16 wvalue, u16 windex)
 
 // common DJM capture level option values
 static const u16 snd_djm_opts_cap_level[] = {
-	0x0000, 0x0100, 0x0200, 0x0300, 0x400, 0x500 };
-
+	0x0000, 0x0100, 0x0200, 0x0300 };
 
 // DJM-250MK2
 static const u16 snd_djm_opts_250mk2_cap1[] = {
@@ -3830,6 +3830,8 @@ static const struct snd_djm_ctl snd_djm_ctls_750mk2[] = {
 
 
 // DJM-A9
+static const u16 snd_djm_opts_a9_cap_level[] = {
+	0x0000, 0x0100, 0x0200, 0x0300, 0x0400, 0x0500 };
 static const u16 snd_djm_opts_a9_cap1[] = {
 	0x0107, 0x0108, 0x0109, 0x010a, 0x010e,
 	0x111, 0x112, 0x113, 0x114, 0x0131, 0x132, 0x133, 0x134 };
@@ -3843,7 +3845,7 @@ static const u16 snd_djm_opts_a9_cap5[] = {
 	0x0501, 0x0502, 0x0503, 0x0505, 0x0506, 0x0507, 0x0508, 0x0509, 0x050a, 0x050e };
 
 static const struct snd_djm_ctl snd_djm_ctls_a9[] = {
-	SND_DJM_CTL("Capture Level", cap_level, 0, SND_DJM_WINDEX_CAPLVL),
+	SND_DJM_CTL("Capture Level", a9_cap_level, 0, SND_DJM_WINDEX_CAPLVL),
 	SND_DJM_CTL("Master Input",  a9_cap1, 3, SND_DJM_WINDEX_CAP),
 	SND_DJM_CTL("Ch1 Input",     a9_cap2, 2, SND_DJM_WINDEX_CAP),
 	SND_DJM_CTL("Ch2 Input",     a9_cap3, 2, SND_DJM_WINDEX_CAP),
@@ -4088,6 +4090,12 @@ int snd_usb_mixer_apply_create_quirk(struct usb_mixer_interface *mixer)
 	case USB_ID(0x1235, 0x820b): /* Focusrite Clarett+ 4Pre */
 	case USB_ID(0x1235, 0x820c): /* Focusrite Clarett+ 8Pre */
 		err = snd_scarlett2_init(mixer);
+		break;
+
+	case USB_ID(0x1235, 0x821b): /* Focusrite Scarlett 16i16 4th Gen */
+	case USB_ID(0x1235, 0x821c): /* Focusrite Scarlett 18i16 4th Gen */
+	case USB_ID(0x1235, 0x821d): /* Focusrite Scarlett 18i20 4th Gen */
+		err = snd_fcp_init(mixer);
 		break;
 
 	case USB_ID(0x041e, 0x323b): /* Creative Sound Blaster E1 */
