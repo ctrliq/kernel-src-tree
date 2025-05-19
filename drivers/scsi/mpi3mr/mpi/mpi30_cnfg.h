@@ -19,6 +19,7 @@
 #define MPI3_CONFIG_PAGETYPE_PCIE_SWITCH                (0x31)
 #define MPI3_CONFIG_PAGETYPE_PCIE_LINK                  (0x33)
 #define MPI3_CONFIG_PAGEATTR_MASK                       (0xf0)
+#define MPI3_CONFIG_PAGEATTR_SHIFT			(4)
 #define MPI3_CONFIG_PAGEATTR_READ_ONLY                  (0x00)
 #define MPI3_CONFIG_PAGEATTR_CHANGEABLE                 (0x10)
 #define MPI3_CONFIG_PAGEATTR_PERSISTENT                 (0x20)
@@ -29,10 +30,13 @@
 #define MPI3_CONFIG_ACTION_READ_PERSISTENT              (0x04)
 #define MPI3_CONFIG_ACTION_WRITE_PERSISTENT             (0x05)
 #define MPI3_DEVICE_PGAD_FORM_MASK                      (0xf0000000)
+#define MPI3_DEVICE_PGAD_FORM_SHIFT			(28)
 #define MPI3_DEVICE_PGAD_FORM_GET_NEXT_HANDLE           (0x00000000)
 #define MPI3_DEVICE_PGAD_FORM_HANDLE                    (0x20000000)
 #define MPI3_DEVICE_PGAD_HANDLE_MASK                    (0x0000ffff)
+#define MPI3_DEVICE_PGAD_HANDLE_SHIFT			(0)
 #define MPI3_SAS_EXPAND_PGAD_FORM_MASK                  (0xf0000000)
+#define MPI3_SAS_EXPAND_PGAD_FORM_SHIFT			(28)
 #define MPI3_SAS_EXPAND_PGAD_FORM_GET_NEXT_HANDLE       (0x00000000)
 #define MPI3_SAS_EXPAND_PGAD_FORM_HANDLE_PHY_NUM        (0x10000000)
 #define MPI3_SAS_EXPAND_PGAD_FORM_HANDLE                (0x20000000)
@@ -1590,16 +1594,13 @@ struct mpi3_sas_io_unit0_phy_data {
 	__le32             reserved10;
 };
 
-#ifndef MPI3_SAS_IO_UNIT0_PHY_MAX
-#define MPI3_SAS_IO_UNIT0_PHY_MAX           (1)
-#endif
 struct mpi3_sas_io_unit_page0 {
 	struct mpi3_config_page_header         header;
 	__le32                             reserved08;
 	u8                                 num_phys;
 	u8                                 init_status;
 	__le16                             reserved0e;
-	struct mpi3_sas_io_unit0_phy_data      phy_data[MPI3_SAS_IO_UNIT0_PHY_MAX];
+	struct mpi3_sas_io_unit0_phy_data      phy_data[];
 };
 
 #define MPI3_SASIOUNIT0_PAGEVERSION                          (0x00)
@@ -1631,9 +1632,6 @@ struct mpi3_sas_io_unit1_phy_data {
 	__le32             reserved08;
 };
 
-#ifndef MPI3_SAS_IO_UNIT1_PHY_MAX
-#define MPI3_SAS_IO_UNIT1_PHY_MAX           (1)
-#endif
 struct mpi3_sas_io_unit_page1 {
 	struct mpi3_config_page_header         header;
 	__le16                             control_flags;
@@ -1643,7 +1641,7 @@ struct mpi3_sas_io_unit_page1 {
 	u8                                 num_phys;
 	u8                                 sata_max_q_depth;
 	__le16                             reserved12;
-	struct mpi3_sas_io_unit1_phy_data      phy_data[MPI3_SAS_IO_UNIT1_PHY_MAX];
+	struct mpi3_sas_io_unit1_phy_data      phy_data[];
 };
 
 #define MPI3_SASIOUNIT1_PAGEVERSION                                 (0x00)
