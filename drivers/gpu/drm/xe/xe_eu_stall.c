@@ -4,6 +4,7 @@
  */
 
 #include <linux/anon_inodes.h>
+#include <linux/nospec.h>
 #include <linux/fs.h>
 #include <linux/poll.h>
 #include <linux/types.h>
