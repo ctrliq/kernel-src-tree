@@ -63,6 +63,11 @@ static void __activate_cptr_traps(struct kvm_vcpu *vcpu)
 		if (!guest_owns_fp_regs())
 			val |= CPTR_EL2_TFP;
 	}
+
+	if (!guest_owns_fp_regs())
+		__activate_traps_fpsimd32(vcpu);
+
+	kvm_write_cptr_el2(val);
 }
 
 static void __activate_traps(struct kvm_vcpu *vcpu)
