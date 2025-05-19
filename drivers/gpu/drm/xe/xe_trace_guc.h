@@ -124,8 +124,8 @@ TRACE_EVENT(xe_guc_engine_activity,
 	    ),
 
 	    TP_fast_assign(
-			__assign_str(dev);
-			__assign_str(name);
+			__assign_str(dev, __dev_name_xe(xe));
+			__assign_str(name, name);
 			__entry->global_change_num = ea->metadata.global_change_num;
 			__entry->guc_tsc_frequency_hz = ea->metadata.guc_tsc_frequency_hz;
 			__entry->lag_latency_usec = ea->metadata.lag_latency_usec;

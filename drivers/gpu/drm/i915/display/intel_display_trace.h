@@ -423,8 +423,8 @@ TRACE_EVENT(intel_plane_update_noarm,
 			     ),
 
 	    TP_fast_assign(
-			   __assign_str(dev, __dev_name_kms(plane));
-			   __assign_str(name, plane->base.name);
+			   __assign_str(dev, __dev_name_drm(plane_state->uapi.plane));
+			   __assign_str(name, plane_state->uapi.plane->name);
 			   __entry->pipe_name = pipe_name(crtc->pipe);
 			   __entry->frame = intel_crtc_get_vblank_counter(crtc);
 			   __entry->scanline = intel_get_crtc_scanline(crtc);
@@ -456,8 +456,8 @@ TRACE_EVENT(intel_plane_update_arm,
 			     ),
 
 	    TP_fast_assign(
-			   __assign_str(dev, __dev_name_kms(plane));
-			   __assign_str(name, plane->base.name);
+			   __assign_str(dev, __dev_name_drm(plane_state->uapi.plane));
+			   __assign_str(name, plane_state->uapi.plane->name);
 			   __entry->pipe_name = pipe_name(crtc->pipe);
 			   __entry->frame = intel_crtc_get_vblank_counter(crtc);
 			   __entry->scanline = intel_get_crtc_scanline(crtc);
@@ -519,8 +519,8 @@ TRACE_EVENT(intel_plane_scaler_update_arm,
 	    TP_fast_assign(
 			   struct intel_display *display = to_intel_display(plane);
 			   struct intel_crtc *crtc = intel_crtc_for_pipe(display, plane->pipe);
-			   __assign_str(dev);
-			   __assign_str(name);
+			   __assign_str(dev, __dev_name_kms(plane));
+			   __assign_str(name, plane->base.name);
 			   __entry->pipe_name = pipe_name(crtc->pipe);
 			   __entry->scaler_id = scaler_id;
 			   __entry->frame = intel_crtc_get_vblank_counter(crtc);
@@ -555,7 +555,7 @@ TRACE_EVENT(intel_pipe_scaler_update_arm,
 			     ),
 
 	    TP_fast_assign(
-			   __assign_str(dev);
+			   __assign_str(dev, __dev_name_kms(crtc));
 			   __entry->pipe_name = pipe_name(crtc->pipe);
 			   __entry->scaler_id = scaler_id;
 			   __entry->frame = intel_crtc_get_vblank_counter(crtc);
@@ -585,7 +585,7 @@ TRACE_EVENT(intel_scaler_disable_arm,
 			     ),
 
 	    TP_fast_assign(
-			   __assign_str(dev);
+			   __assign_str(dev, __dev_name_kms(crtc));
 			   __entry->pipe_name = pipe_name(crtc->pipe);
 			   __entry->scaler_id = scaler_id;
 			   __entry->frame = intel_crtc_get_vblank_counter(crtc);
