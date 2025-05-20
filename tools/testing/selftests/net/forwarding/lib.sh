@@ -621,11 +621,7 @@ log_test_skip()
 
 log_test_xfail()
 {
-	local test_name=$1
-	local opt_str=$2
-
-	printf "TEST: %-60s  [XFAIL]\n" "$test_name $opt_str"
-	return 0
+	RET=$ksft_xfail retmsg= log_test "$@"
 }
 
 log_info()
