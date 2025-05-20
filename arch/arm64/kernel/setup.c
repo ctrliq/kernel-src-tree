@@ -31,6 +31,7 @@
 #include <linux/psci.h>
 #include <linux/sched/task.h>
 #include <linux/mm.h>
+#include <linux/security.h>
 
 #include <asm/acpi.h>
 #include <asm/fixmap.h>
@@ -293,6 +294,10 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 	setup_machine_fdt(__fdt_pointer);
 
 	parse_early_param();
+
+	/* Initialize the lockdown LSM */
+	static_call_init();
+	early_security_init();
 
 	/*
 	 * The primary CPU enters the kernel with all DAIF exceptions masked.
