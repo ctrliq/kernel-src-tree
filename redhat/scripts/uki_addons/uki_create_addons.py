@@ -26,14 +26,6 @@
 # json['virt']['common']['test.addon'] = ['test2'], any other uki except virt
 # will have a test.addon.efi with text "test1", and virt will have a
 # test.addon.efi with "test2"
-#
-# sbat.conf
-#----------
-# This dict is containing the sbat string for *all* addons being created.
-# This dict is optional, but when used has to be put in a sub-dict with
-# { 'sbat' : { 'sbat.conf' : ['your text here'] }}
-# It follows the same syntax as the addon files, meaning '#' is comment and
-# the rest is taken as sbat string and feed to ukify.
 
 import os
 import sys
@@ -62,9 +54,8 @@ def check_clean_arguments(input_json, out_dir):
 UKICmdlineAddon = collections.namedtuple('UKICmdlineAddon', ['name', 'cmdline'])
 uki_addons_list = []
 uki_addons = {}
-addon_sbat_string = None
 
-def parse_lines(lines, rstrip=True):
+def parse_lines(lines):
     cmdline = ''
     for l in lines:
         l = l.lstrip()
@@ -72,26 +63,16 @@ def parse_lines(lines, rstrip=True):
             continue
         if l[0] == '#':
             continue
-        # rstrip is used only for addons cmdline, not sbat.conf, as it replaces
-        # return lines with spaces.
-        if rstrip:
-            l = l.rstrip() + ' '
-        cmdline += l
+        cmdline += l.rstrip() + ' '
     if cmdline == '':
         return ''
     return cmdline
 
 def parse_all_addons(in_obj):
-    global addon_sbat_string
-
     for el in in_obj.keys():
         # addon found: copy it in our global dict uki_addons
         if el.endswith('.addon'):
             uki_addons[el] = in_obj[el]
-
-    if 'sbat' in in_obj and 'sbat.conf' in in_obj['sbat']:
-        # sbat.conf found: override sbat with the most specific one found
-        addon_sbat_string = parse_lines(in_obj['sbat']['sbat.conf'], rstrip=False)
 
 def recursively_find_addons(in_obj, folder_list):
     # end of recursion, leaf directory. Search all addons here
@@ -128,8 +109,6 @@ def create_addons(out_dir):
             f'{UKIFY_PATH}', 'build',
             '--cmdline', uki_addon.cmdline,
             '--output', out_path]
-        if addon_sbat_string:
-            cmd.extend(['--sbat', addon_sbat_string.rstrip()])
 
         subprocess.check_call(cmd, text=True)
 
