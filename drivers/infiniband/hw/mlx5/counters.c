@@ -543,7 +543,7 @@ static int mlx5_ib_counter_dealloc(struct rdma_counter *counter)
 }
 
 static int mlx5_ib_counter_bind_qp(struct rdma_counter *counter,
-				   struct ib_qp *qp)
+				   struct ib_qp *qp, u32 port)
 {
 	struct mlx5_ib_dev *dev = to_mdev(qp->device);
 	int err;
@@ -575,7 +575,7 @@ fail_set_counter:
 	return err;
 }
 
-static int mlx5_ib_counter_unbind_qp(struct ib_qp *qp)
+static int mlx5_ib_counter_unbind_qp(struct ib_qp *qp, u32 port)
 {
 	return mlx5_ib_qp_set_counter(qp, NULL);
 }
@@ -1025,6 +1025,8 @@ static int mlx5_ib_modify_stat(struct ib_device *device, u32 port,
 	return 0;
 }
 
+static void mlx5_ib_counter_init(struct rdma_counter *counter) {}
+
 static const struct ib_device_ops hw_stats_ops = {
 	.alloc_hw_port_stats = mlx5_ib_alloc_hw_port_stats,
 	.get_hw_stats = mlx5_ib_get_hw_stats,
@@ -1035,6 +1037,9 @@ static const struct ib_device_ops hw_stats_ops = {
 	.counter_update_stats = mlx5_ib_counter_update_stats,
 	.modify_hw_stat = IS_ENABLED(CONFIG_INFINIBAND_USER_ACCESS) ?
 			  mlx5_ib_modify_stat : NULL,
+	.counter_init = mlx5_ib_counter_init,
+
+	INIT_RDMA_OBJ_SIZE(rdma_counter, mlx5_rdma_counter, rdma_counter),
 };
 
 static const struct ib_device_ops hw_switchdev_vport_op = {
@@ -1049,6 +1054,9 @@ static const struct ib_device_ops hw_switchdev_stats_ops = {
 	.counter_dealloc = mlx5_ib_counter_dealloc,
 	.counter_alloc_stats = mlx5_ib_counter_alloc_stats,
 	.counter_update_stats = mlx5_ib_counter_update_stats,
+	.counter_init = mlx5_ib_counter_init,
+
+	INIT_RDMA_OBJ_SIZE(rdma_counter, mlx5_rdma_counter, rdma_counter),
 };
 
 static const struct ib_device_ops counters_ops = {
