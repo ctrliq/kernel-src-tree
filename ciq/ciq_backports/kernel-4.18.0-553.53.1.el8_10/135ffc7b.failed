@@ -1,0 +1,170 @@
+bpf, vsock: Invoke proto::close on close()
+
+jira LE-3064
+cve CVE-2025-21756
+Rebuild_History Non-Buildable kernel-4.18.0-553.53.1.el8_10
+commit-author Michal Luczaj <mhal@rbox.co>
+commit 135ffc7becc82cfb84936ae133da7969220b43b2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.53.1.el8_10/135ffc7b.failed
+
+vsock defines a BPF callback to be invoked when close() is called. However,
+this callback is never actually executed. As a result, a closed vsock
+socket is not automatically removed from the sockmap/sockhash.
+
+Introduce a dummy vsock_close() and make vsock_release() call proto::close.
+
+Note: changes in __vsock_release() look messy, but it's only due to indent
+level reduction and variables xmas tree reorder.
+
+Fixes: 634f1a7110b4 ("vsock: support sockmap")
+	Signed-off-by: Michal Luczaj <mhal@rbox.co>
+	Reviewed-by: Stefano Garzarella <sgarzare@redhat.com>
+	Reviewed-by: Luigi Leonardi <leonardi@redhat.com>
+Link: https://lore.kernel.org/r/20241118-vsock-bpf-poll-close-v1-3-f1b9669cacdc@rbox.co
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: John Fastabend <john.fastabend@gmail.com>
+(cherry picked from commit 135ffc7becc82cfb84936ae133da7969220b43b2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/vmw_vsock/af_vsock.c
+diff --cc net/vmw_vsock/af_vsock.c
+index a7713138d061,5cf8109f672a..000000000000
+--- a/net/vmw_vsock/af_vsock.c
++++ b/net/vmw_vsock/af_vsock.c
+@@@ -113,12 -117,17 +113,20 @@@
+  static int __vsock_bind(struct sock *sk, struct sockaddr_vm *addr);
+  static void vsock_sk_destruct(struct sock *sk);
+  static int vsock_queue_rcv_skb(struct sock *sk, struct sk_buff *skb);
++ static void vsock_close(struct sock *sk, long timeout);
+  
+  /* Protocol family. */
+ -struct proto vsock_proto = {
+ +static struct proto vsock_proto = {
+  	.name = "AF_VSOCK",
+  	.owner = THIS_MODULE,
+  	.obj_size = sizeof(struct vsock_sock),
+++<<<<<<< HEAD
+++=======
++ 	.close = vsock_close,
++ #ifdef CONFIG_BPF_SYSCALL
++ 	.psock_update_sk_prot = vsock_bpf_update_proto,
++ #endif
+++>>>>>>> 135ffc7becc8 (bpf, vsock: Invoke proto::close on close())
+  };
+  
+  /* The default peer timeout indicates how long we will wait for a peer response
+@@@ -773,41 -792,44 +781,46 @@@ static struct sock *__vsock_create(stru
+  	return sk;
+  }
+  
+ -static bool sock_type_connectible(u16 type)
+ -{
+ -	return (type == SOCK_STREAM) || (type == SOCK_SEQPACKET);
+ -}
+ -
+  static void __vsock_release(struct sock *sk, int level)
+  {
+- 	if (sk) {
+- 		struct sock *pending;
+- 		struct vsock_sock *vsk;
++ 	struct vsock_sock *vsk;
++ 	struct sock *pending;
+  
+- 		vsk = vsock_sk(sk);
+- 		pending = NULL;	/* Compiler warning. */
++ 	vsk = vsock_sk(sk);
++ 	pending = NULL;	/* Compiler warning. */
+  
+- 		/* When "level" is SINGLE_DEPTH_NESTING, use the nested
+- 		 * version to avoid the warning "possible recursive locking
+- 		 * detected". When "level" is 0, lock_sock_nested(sk, level)
+- 		 * is the same as lock_sock(sk).
+- 		 */
+- 		lock_sock_nested(sk, level);
++ 	/* When "level" is SINGLE_DEPTH_NESTING, use the nested
++ 	 * version to avoid the warning "possible recursive locking
++ 	 * detected". When "level" is 0, lock_sock_nested(sk, level)
++ 	 * is the same as lock_sock(sk).
++ 	 */
++ 	lock_sock_nested(sk, level);
+  
+++<<<<<<< HEAD
+ +		if (vsk->transport)
+ +			vsk->transport->release(vsk);
+ +		else if (sk->sk_type == SOCK_STREAM)
+ +			vsock_remove_sock(vsk);
+++=======
++ 	if (vsk->transport)
++ 		vsk->transport->release(vsk);
++ 	else if (sock_type_connectible(sk->sk_type))
++ 		vsock_remove_sock(vsk);
+++>>>>>>> 135ffc7becc8 (bpf, vsock: Invoke proto::close on close())
+  
+- 		sock_orphan(sk);
+- 		sk->sk_shutdown = SHUTDOWN_MASK;
++ 	sock_orphan(sk);
++ 	sk->sk_shutdown = SHUTDOWN_MASK;
+  
+- 		skb_queue_purge(&sk->sk_receive_queue);
++ 	skb_queue_purge(&sk->sk_receive_queue);
+  
+- 		/* Clean up any sockets that never were accepted. */
+- 		while ((pending = vsock_dequeue_accept(sk)) != NULL) {
+- 			__vsock_release(pending, SINGLE_DEPTH_NESTING);
+- 			sock_put(pending);
+- 		}
+- 
+- 		release_sock(sk);
+- 		sock_put(sk);
++ 	/* Clean up any sockets that never were accepted. */
++ 	while ((pending = vsock_dequeue_accept(sk)) != NULL) {
++ 		__vsock_release(pending, SINGLE_DEPTH_NESTING);
++ 		sock_put(pending);
+  	}
++ 
++ 	release_sock(sk);
++ 	sock_put(sk);
+  }
+  
+  static void vsock_sk_destruct(struct sock *sk)
+@@@ -855,9 -891,32 +868,35 @@@ s64 vsock_stream_has_space(struct vsock
+  }
+  EXPORT_SYMBOL_GPL(vsock_stream_has_space);
+  
+++<<<<<<< HEAD
+++=======
++ void vsock_data_ready(struct sock *sk)
++ {
++ 	struct vsock_sock *vsk = vsock_sk(sk);
++ 
++ 	if (vsock_stream_has_data(vsk) >= sk->sk_rcvlowat ||
++ 	    sock_flag(sk, SOCK_DONE))
++ 		sk->sk_data_ready(sk);
++ }
++ EXPORT_SYMBOL_GPL(vsock_data_ready);
++ 
++ /* Dummy callback required by sockmap.
++  * See unconditional call of saved_close() in sock_map_close().
++  */
++ static void vsock_close(struct sock *sk, long timeout)
++ {
++ }
++ 
+++>>>>>>> 135ffc7becc8 (bpf, vsock: Invoke proto::close on close())
+  static int vsock_release(struct socket *sock)
+  {
+- 	__vsock_release(sock->sk, 0);
++ 	struct sock *sk = sock->sk;
++ 
++ 	if (!sk)
++ 		return 0;
++ 
++ 	sk->sk_prot->close(sk, 0);
++ 	__vsock_release(sk, 0);
+  	sock->sk = NULL;
+  	sock->state = SS_FREE;
+  
+* Unmerged path net/vmw_vsock/af_vsock.c
