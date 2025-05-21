@@ -1,0 +1,117 @@
+cgroup/cpuset: Fix race between newly created partition and dying one
+
+jira NONE_AUTOMATION
+Rebuild_History Non-Buildable kernel-5.14.0-570.17.1.el9_6
+commit-author Waiman Long <longman@redhat.com>
+commit a22b3d54de94f82ca057cc2ebf9496fa91ebf698
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-570.17.1.el9_6/a22b3d54.failed
+
+There is a possible race between removing a cgroup diectory that is
+a partition root and the creation of a new partition.  The partition
+to be removed can be dying but still online, it doesn't not currently
+participate in checking for exclusive CPUs conflict, but the exclusive
+CPUs are still there in subpartitions_cpus and isolated_cpus. These
+two cpumasks are global states that affect the operation of cpuset
+partitions. The exclusive CPUs in dying cpusets will only be removed
+when cpuset_css_offline() function is called after an RCU delay.
+
+As a result, it is possible that a new partition can be created with
+exclusive CPUs that overlap with those of a dying one. When that dying
+partition is finally offlined, it removes those overlapping exclusive
+CPUs from subpartitions_cpus and maybe isolated_cpus resulting in an
+incorrect CPU configuration.
+
+This bug was found when a warning was triggered in
+remote_partition_disable() during testing because the subpartitions_cpus
+mask was empty.
+
+One possible way to fix this is to iterate the dying cpusets as well and
+avoid using the exclusive CPUs in those dying cpusets. However, this
+can still cause random partition creation failures or other anomalies
+due to racing. A better way to fix this race is to reset the partition
+state at the moment when a cpuset is being killed.
+
+Introduce a new css_killed() CSS function pointer and call it, if
+defined, before setting CSS_DYING flag in kill_css(). Also update the
+css_is_dying() helper to use the CSS_DYING flag introduced by commit
+33c35aa48178 ("cgroup: Prevent kill_css() from being called more than
+once") for proper synchronization.
+
+Add a new cpuset_css_killed() function to reset the partition state of
+a valid partition root if it is being killed.
+
+Fixes: ee8dde0cd2ce ("cpuset: Add new v2 cpuset.sched.partition flag")
+	Signed-off-by: Waiman Long <longman@redhat.com>
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+(cherry picked from commit a22b3d54de94f82ca057cc2ebf9496fa91ebf698)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/cgroup/cpuset.c
+diff --cc kernel/cgroup/cpuset.c
+index 77ce168d9431,306b60430091..000000000000
+--- a/kernel/cgroup/cpuset.c
++++ b/kernel/cgroup/cpuset.c
+@@@ -4172,12 -3536,8 +4172,17 @@@ static void cpuset_css_offline(struct c
+  	cpus_read_lock();
+  	mutex_lock(&cpuset_mutex);
+  
+++<<<<<<< HEAD
+ +	if (is_partition_valid(cs))
+ +		update_prstate(cs, 0);
+ +
+ +	if (!cgroup_subsys_on_dfl(cpuset_cgrp_subsys) &&
+ +	    is_sched_load_balance(cs))
+ +		update_flag(CS_SCHED_LOAD_BALANCE, cs, 0);
+++=======
++ 	if (!cpuset_v2() && is_sched_load_balance(cs))
++ 		cpuset_update_flag(CS_SCHED_LOAD_BALANCE, cs, 0);
+++>>>>>>> a22b3d54de94 (cgroup/cpuset: Fix race between newly created partition and dying one)
+  
+  	cpuset_dec();
+  	clear_bit(CS_ONLINE, &cs->flags);
+diff --git a/include/linux/cgroup-defs.h b/include/linux/cgroup-defs.h
+index 6523035f4d7e..5b61f4cd7791 100644
+--- a/include/linux/cgroup-defs.h
++++ b/include/linux/cgroup-defs.h
+@@ -708,6 +708,7 @@ struct cgroup_subsys {
+ 	void (*css_released)(struct cgroup_subsys_state *css);
+ 	void (*css_free)(struct cgroup_subsys_state *css);
+ 	void (*css_reset)(struct cgroup_subsys_state *css);
++	void (*css_killed)(struct cgroup_subsys_state *css);
+ 	void (*css_rstat_flush)(struct cgroup_subsys_state *css, int cpu);
+ 	int (*css_extra_stat_show)(struct seq_file *seq,
+ 				   struct cgroup_subsys_state *css);
+diff --git a/include/linux/cgroup.h b/include/linux/cgroup.h
+index c60ba0ab1462..893786eab081 100644
+--- a/include/linux/cgroup.h
++++ b/include/linux/cgroup.h
+@@ -342,7 +342,7 @@ static inline u64 cgroup_id(const struct cgroup *cgrp)
+  */
+ static inline bool css_is_dying(struct cgroup_subsys_state *css)
+ {
+-	return !(css->flags & CSS_NO_REF) && percpu_ref_is_dying(&css->refcnt);
++	return css->flags & CSS_DYING;
+ }
+ 
+ static inline void cgroup_get(struct cgroup *cgrp)
+diff --git a/kernel/cgroup/cgroup.c b/kernel/cgroup/cgroup.c
+index 244ec600b4d8..2537dfa11a7e 100644
+--- a/kernel/cgroup/cgroup.c
++++ b/kernel/cgroup/cgroup.c
+@@ -5902,6 +5902,12 @@ static void kill_css(struct cgroup_subsys_state *css)
+ 	if (css->flags & CSS_DYING)
+ 		return;
+ 
++	/*
++	 * Call css_killed(), if defined, before setting the CSS_DYING flag
++	 */
++	if (css->ss->css_killed)
++		css->ss->css_killed(css);
++
+ 	css->flags |= CSS_DYING;
+ 
+ 	/*
+* Unmerged path kernel/cgroup/cpuset.c
