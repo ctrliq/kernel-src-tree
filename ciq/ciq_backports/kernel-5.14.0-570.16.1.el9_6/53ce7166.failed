@@ -1,0 +1,206 @@
+ice: ensure periodic output start time is in the future
+
+jira NONE_AUTOMATION
+Rebuild_History Non-Buildable kernel-5.14.0-570.16.1.el9_6
+commit-author Karol Kolacinski <karol.kolacinski@intel.com>
+commit 53ce7166cbffd2b8f3bd821fd3918be665afd4c6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-570.16.1.el9_6/53ce7166.failed
+
+On E800 series hardware, if the start time for a periodic output signal is
+programmed into GLTSYN_TGT_H and GLTSYN_TGT_L registers, the hardware logic
+locks up and the periodic output signal never starts. Any future attempt to
+reprogram the clock function is futile as the hardware will not reset until
+a power on.
+
+The ice_ptp_cfg_perout function has logic to prevent this, as it checks if
+the requested start time is in the past. If so, a new start time is
+calculated by rounding up.
+
+Since commit d755a7e129a5 ("ice: Cache perout/extts requests and check
+flags"), the rounding is done to the nearest multiple of the clock period,
+rather than to a full second. This is more accurate, since it ensures the
+signal matches the user request precisely.
+
+Unfortunately, there is a race condition with this rounding logic. If the
+current time is close to the multiple of the period, we could calculate a
+target time that is extremely soon. It takes time for the software to
+program the registers, during which time this requested start time could
+become a start time in the past. If that happens, the periodic output
+signal will lock up.
+
+For large enough periods, or for the logic prior to the mentioned commit,
+this is unlikely. However, with the new logic rounding to the period and
+with a small enough period, this becomes inevitable.
+
+For example, attempting to enable a 10MHz signal requires a period of 100
+nanoseconds. This means in the *best* case, we have 99 nanoseconds to
+program the clock output. This is essentially impossible, and thus such a
+small period practically guarantees that the clock output function will
+lock up.
+
+To fix this, add some slop to the clock time used to check if the start
+time is in the past. Because it is not critical that output signals start
+immediately, but it *is* critical that we do not brick the function, 0.5
+seconds is selected. This does mean that any requested output will be
+delayed by at least 0.5 seconds.
+
+This slop is applied before rounding, so that we always round up to the
+nearest multiple of the period that is at least 0.5 seconds in the future,
+ensuring a minimum of 0.5 seconds to program the clock output registers.
+
+Finally, to ensure that the hardware registers programming the clock output
+complete in a timely manner, add a write flush to the end of
+ice_ptp_write_perout. This ensures we don't risk any issue with PCIe
+transaction batching.
+
+Strictly speaking, this fixes a race condition all the way back at the
+initial implementation of periodic output programming, as it is
+theoretically possible to trigger this bug even on the old logic when
+always rounding to a full second. However, the window is narrow, and the
+code has been refactored heavily since then, making a direct backport not
+apply cleanly.
+
+Fixes: d755a7e129a5 ("ice: Cache perout/extts requests and check flags")
+	Signed-off-by: Karol Kolacinski <karol.kolacinski@intel.com>
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Tested-by: Rinitha S <sx.rinitha@intel.com> (A Contingent worker at Intel)
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit 53ce7166cbffd2b8f3bd821fd3918be665afd4c6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_ptp.c
+diff --cc drivers/net/ethernet/intel/ice/ice_ptp.c
+index b35b1df94e79,a99e0fbd0b8b..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_ptp.c
++++ b/drivers/net/ethernet/intel/ice/ice_ptp.c
+@@@ -1940,39 -1777,101 +1940,114 @@@ static int ice_ptp_cfg_clkout(struct ic
+  	wr32(hw, GLTSYN_AUX_OUT(chan, tmr_idx), val);
+  
+  	/* 4. write GPIO CTL reg */
+ -	val = GLGEN_GPIO_CTL_PIN_DIR_M;
+ -	if (!!period)
+ -		val |= FIELD_PREP(GLGEN_GPIO_CTL_PIN_FUNC_M,
+ -				  8 + chan + (tmr_idx * 4));
+ -
+ +	func = 8 + chan + (tmr_idx * 4);
+ +	val = GLGEN_GPIO_CTL_PIN_DIR_M |
+ +	      FIELD_PREP(GLGEN_GPIO_CTL_PIN_FUNC_M, func);
+  	wr32(hw, GLGEN_GPIO_CTL(gpio_pin), val);
++ 	ice_flush(hw);
+  
+ +	/* Store the value if requested */
+ +	if (store) {
+ +		memcpy(&pf->ptp.perout_channels[chan], config,
+ +		       sizeof(struct ice_perout_channel));
+ +		pf->ptp.perout_channels[chan].start_time = phase;
+ +	}
+ +
+  	return 0;
+ +err:
+ +	dev_err(ice_pf_to_dev(pf), "PTP failed to cfg per_clk\n");
+ +	return -EFAULT;
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * ice_ptp_disable_all_clkout - Disable all currently configured outputs
+ + * @pf: pointer to the PF structure
+++=======
++  * ice_ptp_cfg_perout - Configure clock to generate periodic wave
++  * @pf: Board private structure
++  * @rq: Periodic output request
++  * @on: Enable/disable flag
++  *
++  * Configure the internal clock generator modules to generate the clock wave of
++  * specified period.
++  *
++  * Return: 0 on success, negative error code otherwise
++  */
++ static int ice_ptp_cfg_perout(struct ice_pf *pf, struct ptp_perout_request *rq,
++ 			      int on)
++ {
++ 	unsigned int gpio_pin, prop_delay_ns;
++ 	u64 clk, period, start, phase;
++ 	struct ice_hw *hw = &pf->hw;
++ 	int pin_desc_idx;
++ 
++ 	if (rq->flags & ~PTP_PEROUT_PHASE)
++ 		return -EOPNOTSUPP;
++ 
++ 	pin_desc_idx = ice_ptp_find_pin_idx(pf, PTP_PF_PEROUT, rq->index);
++ 	if (pin_desc_idx < 0)
++ 		return -EIO;
++ 
++ 	gpio_pin = pf->ptp.ice_pin_desc[pin_desc_idx].gpio[1];
++ 	prop_delay_ns = pf->ptp.ice_pin_desc[pin_desc_idx].delay[1];
++ 	period = rq->period.sec * NSEC_PER_SEC + rq->period.nsec;
++ 
++ 	/* If we're disabling the output or period is 0, clear out CLKO and TGT
++ 	 * and keep output level low.
++ 	 */
++ 	if (!on || !period)
++ 		return ice_ptp_write_perout(hw, rq->index, gpio_pin, 0, 0);
++ 
++ 	if (strncmp(pf->ptp.pin_desc[pin_desc_idx].name, "1PPS", 64) == 0 &&
++ 	    period != NSEC_PER_SEC && hw->ptp.phy_model == ICE_PHY_E82X) {
++ 		dev_err(ice_pf_to_dev(pf), "1PPS pin supports only 1 s period\n");
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	if (period & 0x1) {
++ 		dev_err(ice_pf_to_dev(pf), "CLK Period must be an even value\n");
++ 		return -EIO;
++ 	}
++ 
++ 	start = rq->start.sec * NSEC_PER_SEC + rq->start.nsec;
++ 
++ 	/* If PTP_PEROUT_PHASE is set, rq has phase instead of start time */
++ 	if (rq->flags & PTP_PEROUT_PHASE)
++ 		phase = start;
++ 	else
++ 		div64_u64_rem(start, period, &phase);
++ 
++ 	/* If we have only phase or start time is in the past, start the timer
++ 	 * at the next multiple of period, maintaining phase at least 0.5 second
++ 	 * from now, so we have time to write it to HW.
++ 	 */
++ 	clk = ice_ptp_read_src_clk_reg(pf, NULL) + NSEC_PER_MSEC * 500;
++ 	if (rq->flags & PTP_PEROUT_PHASE || start <= clk - prop_delay_ns)
++ 		start = div64_u64(clk + period - 1, period) * period + phase;
++ 
++ 	/* Compensate for propagation delay from the generator to the pin. */
++ 	start -= prop_delay_ns;
++ 
++ 	return ice_ptp_write_perout(hw, rq->index, gpio_pin, start, period);
++ }
++ 
++ /**
++  * ice_ptp_disable_all_perout - Disable all currently configured outputs
++  * @pf: Board private structure
+++>>>>>>> 53ce7166cbff (ice: ensure periodic output start time is in the future)
+   *
+   * Disable all currently configured clock outputs. This is necessary before
+ - * certain changes to the PTP hardware clock. Use ice_ptp_enable_all_perout to
+ + * certain changes to the PTP hardware clock. Use ice_ptp_enable_all_clkout to
+   * re-enable the clocks again.
+   */
+ -static void ice_ptp_disable_all_perout(struct ice_pf *pf)
+ +static void ice_ptp_disable_all_clkout(struct ice_pf *pf)
+  {
+ -	for (unsigned int i = 0; i < pf->ptp.info.n_per_out; i++)
+ -		if (pf->ptp.perout_rqs[i].period.sec ||
+ -		    pf->ptp.perout_rqs[i].period.nsec)
+ -			ice_ptp_cfg_perout(pf, &pf->ptp.perout_rqs[i],
+ -					   false);
+ +	uint i;
+ +
+ +	for (i = 0; i < pf->ptp.info.n_per_out; i++)
+ +		if (pf->ptp.perout_channels[i].ena)
+ +			ice_ptp_cfg_clkout(pf, i, NULL, false);
+  }
+  
+  /**
+* Unmerged path drivers/net/ethernet/intel/ice/ice_ptp.c
