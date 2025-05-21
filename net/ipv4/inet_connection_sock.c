@@ -920,6 +920,7 @@ int inet_csk_listen_start(struct sock *sk, int backlog)
 	if (unlikely(err))
 		return err;
 
+	err = -EADDRINUSE;
 	reqsk_queue_alloc(&icsk->icsk_accept_queue);
 
 	sk->sk_ack_backlog = 0;
