@@ -1,0 +1,147 @@
+ice: Enable 1PPS out from CGU for E825C products
+
+jira NONE_AUTOMATION
+Rebuild_History Non-Buildable kernel-5.14.0-570.16.1.el9_6
+commit-author Sergey Temerkhanov <sergey.temerkhanov@intel.com>
+commit 5a4f45c435fadecd09497a7b9931f668a93db3cf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-570.16.1.el9_6/5a4f45c4.failed
+
+Implement configuring 1PPS signal output from CGU. Use maximal amplitude
+because Linux PTP pin API does not have any way for user to set signal
+level.
+
+This change is necessary for E825C products to properly output any
+signal from 1PPS pin.
+
+	Reviewed-by: Arkadiusz Kubalewski <arkadiusz.kubalewski@intel.com>
+	Signed-off-by: Sergey Temerkhanov <sergey.temerkhanov@intel.com>
+Co-developed-by: Karol Kolacinski <karol.kolacinski@intel.com>
+	Signed-off-by: Karol Kolacinski <karol.kolacinski@intel.com>
+	Reviewed-by: Simon Horman <horms@kernel.org>
+	Tested-by: Pucha Himasekhar Reddy <himasekharx.reddy.pucha@intel.com> (A Contingent worker at Intel)
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit 5a4f45c435fadecd09497a7b9931f668a93db3cf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_ptp.c
+diff --cc drivers/net/ethernet/intel/ice/ice_ptp.c
+index 0d0c1b2cbd01,382aa8d9a23a..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_ptp.c
++++ b/drivers/net/ethernet/intel/ice/ice_ptp.c
+@@@ -1863,45 -1700,29 +1864,60 @@@ static int ice_ptp_cfg_clkout(struct ic
+  	/* 0. Reset mode & out_en in AUX_OUT */
+  	wr32(hw, GLTSYN_AUX_OUT(chan, tmr_idx), 0);
+  
+++<<<<<<< HEAD
+ +	/* If we're disabling the output, clear out CLKO and TGT and keep
+ +	 * output level low
+++=======
++ 	if (ice_is_e825c(hw)) {
++ 		int err;
++ 
++ 		/* Enable/disable CGU 1PPS output for E825C */
++ 		err = ice_cgu_cfg_pps_out(hw, !!period);
++ 		if (err)
++ 			return err;
++ 	}
++ 
++ 	/* 1. Write perout with half of required period value.
++ 	 * HW toggles output when source clock hits the TGT and then adds
++ 	 * GLTSYN_CLKO value to the target, so it ends up with 50% duty cycle.
+++>>>>>>> 5a4f45c435fa (ice: Enable 1PPS out from CGU for E825C products)
+  	 */
+ +	if (!config || !config->ena) {
+ +		wr32(hw, GLTSYN_CLKO(chan, tmr_idx), 0);
+ +		wr32(hw, GLTSYN_TGT_L(chan, tmr_idx), 0);
+ +		wr32(hw, GLTSYN_TGT_H(chan, tmr_idx), 0);
+ +
+ +		val = GLGEN_GPIO_CTL_PIN_DIR_M;
+ +		gpio_pin = pf->ptp.perout_channels[chan].gpio_pin;
+ +		wr32(hw, GLGEN_GPIO_CTL(gpio_pin), val);
+ +
+ +		/* Store the value if requested */
+ +		if (store)
+ +			memset(&pf->ptp.perout_channels[chan], 0,
+ +			       sizeof(struct ice_perout_channel));
+ +
+ +		return 0;
+ +	}
+ +	period = config->period;
+ +	start_time = config->start_time;
+ +	div64_u64_rem(start_time, period, &phase);
+ +	gpio_pin = config->gpio_pin;
+ +
+ +	/* 1. Write clkout with half of required period value */
+ +	if (period & 0x1) {
+ +		dev_err(ice_pf_to_dev(pf), "CLK Period must be an even value\n");
+ +		goto err;
+ +	}
+ +
+  	period >>= 1;
+  
+ -	/* For proper operation, GLTSYN_CLKO must be larger than clock tick and
+ -	 * period has to fit in 32 bit register.
+ +	/* For proper operation, the GLTSYN_CLKO must be larger than clock tick
+  	 */
+  #define MIN_PULSE 3
+ -	if (!!period && (period <= MIN_PULSE || period > U32_MAX)) {
+ -		dev_err(ice_hw_to_dev(hw), "CLK period ticks must be >= %d && <= 2^32",
+ -			MIN_PULSE);
+ -		return -EIO;
+ +	if (period <= MIN_PULSE || period > U32_MAX) {
+ +		dev_err(ice_pf_to_dev(pf), "CLK Period must be > %d && < 2^33",
+ +			MIN_PULSE * 2);
+ +		goto err;
+  	}
+  
+  	wr32(hw, GLTSYN_CLKO(chan, tmr_idx), lower_32_bits(period));
+* Unmerged path drivers/net/ethernet/intel/ice/ice_ptp.c
+diff --git a/drivers/net/ethernet/intel/ice/ice_ptp_hw.c b/drivers/net/ethernet/intel/ice/ice_ptp_hw.c
+index 5696f70f0e13..0abe5fc62c09 100644
+--- a/drivers/net/ethernet/intel/ice/ice_ptp_hw.c
++++ b/drivers/net/ethernet/intel/ice/ice_ptp_hw.c
+@@ -659,6 +659,29 @@ static int ice_cfg_cgu_pll_e825c(struct ice_hw *hw,
+ 	return 0;
+ }
+ 
++#define ICE_ONE_PPS_OUT_AMP_MAX 3
++
++/**
++ * ice_cgu_cfg_pps_out - Configure 1PPS output from CGU
++ * @hw: pointer to the HW struct
++ * @enable: true to enable 1PPS output, false to disable it
++ *
++ * Return: 0 on success, other negative error code when CGU read/write failed
++ */
++int ice_cgu_cfg_pps_out(struct ice_hw *hw, bool enable)
++{
++	union nac_cgu_dword9 dw9;
++	int err;
++
++	err = ice_read_cgu_reg_e82x(hw, NAC_CGU_DWORD9, &dw9.val);
++	if (err)
++		return err;
++
++	dw9.one_pps_out_en = enable;
++	dw9.one_pps_out_amp = enable * ICE_ONE_PPS_OUT_AMP_MAX;
++	return ice_write_cgu_reg_e82x(hw, NAC_CGU_DWORD9, dw9.val);
++}
++
+ /**
+  * ice_cfg_cgu_pll_dis_sticky_bits_e82x - disable TS PLL sticky bits
+  * @hw: pointer to the HW struct
+diff --git a/drivers/net/ethernet/intel/ice/ice_ptp_hw.h b/drivers/net/ethernet/intel/ice/ice_ptp_hw.h
+index 6a2a64d886c1..a67bd483ce9b 100644
+--- a/drivers/net/ethernet/intel/ice/ice_ptp_hw.h
++++ b/drivers/net/ethernet/intel/ice/ice_ptp_hw.h
+@@ -330,6 +330,7 @@ extern const struct ice_vernier_info_e82x e822_vernier[NUM_ICE_PTP_LNK_SPD];
+ 
+ /* Device agnostic functions */
+ u8 ice_get_ptp_src_clock_index(struct ice_hw *hw);
++int ice_cgu_cfg_pps_out(struct ice_hw *hw, bool enable);
+ bool ice_ptp_lock(struct ice_hw *hw);
+ void ice_ptp_unlock(struct ice_hw *hw);
+ void ice_ptp_src_cmd(struct ice_hw *hw, enum ice_ptp_tmr_cmd cmd);
