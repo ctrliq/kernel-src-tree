@@ -1547,7 +1547,7 @@ out:
 	return rc;
 out_kfree_skb:
 	rc = -EINVAL;
-	kfree_skb(skb);
+	kfree_skb_reason(skb, SKB_DROP_REASON_NEIGH_HH_FILLFAIL);
 	goto out;
 }
 EXPORT_SYMBOL(neigh_resolve_output);
@@ -1571,7 +1571,7 @@ int neigh_connected_output(struct neighbour *neigh, struct sk_buff *skb)
 		err = dev_queue_xmit(skb);
 	else {
 		err = -EINVAL;
-		kfree_skb(skb);
+		kfree_skb_reason(skb, SKB_DROP_REASON_NEIGH_HH_FILLFAIL);
 	}
 	return err;
 }
