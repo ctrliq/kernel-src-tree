@@ -9,37 +9,6 @@
 
 #include "ice_ptp_hw.h"
 
-enum ice_ptp_pin_e810 {
-	GPIO_20 = 0,
-	GPIO_21,
-	GPIO_22,
-	GPIO_23,
-	NUM_PTP_PIN_E810
-};
-
-enum ice_ptp_pin_e810t {
-	GNSS = 0,
-	SMA1,
-	UFL1,
-	SMA2,
-	UFL2,
-	NUM_PTP_PINS_E810T
-};
-
-struct ice_perout_channel {
-	bool ena;
-	u32 gpio_pin;
-	u32 flags;
-	u64 period;
-	u64 start_time;
-};
-
-struct ice_extts_channel {
-	bool ena;
-	u32 gpio_pin;
-	u32 flags;
-};
-
 /* The ice hardware captures Tx hardware timestamps in the PHY. The timestamp
  * is stored in a buffer of registers. Depending on the specific hardware,
  * this buffer might be shared across multiple PHY ports.
@@ -212,6 +181,16 @@ enum ice_ptp_pin {
 	ONE_PPS
 };
 
+enum ice_ptp_pin_nvm {
+	GNSS = 0,
+	SMA1,
+	UFL1,
+	SMA2,
+	UFL2,
+	NUM_PTP_PINS_NVM,
+	GPIO_NA = 9
+};
+
 /* Per-channel register definitions */
 #define GLTSYN_AUX_OUT(_chan, _idx)	(GLTSYN_AUX_OUT_0(_idx) + ((_chan) * 8))
 #define GLTSYN_AUX_IN(_chan, _idx)	(GLTSYN_AUX_IN_0(_idx) + ((_chan) * 8))
@@ -223,9 +202,8 @@ enum ice_ptp_pin {
 #define GLTSYN_EVNT_H_IDX_MAX		3
 
 /* Pin definitions for PTP */
-#define PPS_CLK_GEN_CHAN		3
-#define PPS_PIN_INDEX			5
 #define ICE_N_PINS_MAX			6
+#define ICE_SMA_PINS_NUM		4
 #define ICE_PIN_DESC_ARR_LEN(_arr)	(sizeof(_arr) / \
 					 sizeof(struct ice_ptp_pin_desc))
 
@@ -251,13 +229,12 @@ struct ice_ptp_pin_desc {
  * @work: delayed work function for periodic tasks
  * @cached_phc_time: a cached copy of the PHC time for timestamp extension
  * @cached_phc_jiffies: jiffies when cached_phc_time was last updated
- * @ext_ts_chan: the external timestamp channel in use
+ * @kworker: kwork thread for handling periodic work
  * @ext_ts_irq: the external timestamp IRQ in use
  * @pin_desc: structure defining pins
  * @ice_pin_desc: internal structure describing pin relations
- * @kworker: kwork thread for handling periodic work
- * @perout_channels: periodic output data
- * @extts_channels: channels for external timestamps
+ * @perout_rqs: cached periodic output requests
+ * @extts_rqs: cached external timestamp requests
  * @info: structure defining PTP hardware capabilities
  * @clock: pointer to registered PTP clock device
  * @tstamp_config: hardware timestamping configuration
@@ -276,13 +253,12 @@ struct ice_ptp {
 	struct kthread_delayed_work work;
 	u64 cached_phc_time;
 	unsigned long cached_phc_jiffies;
-	u8 ext_ts_chan;
-	u8 ext_ts_irq;
 	struct kthread_worker *kworker;
+	u8 ext_ts_irq;
 	struct ptp_pin_desc pin_desc[ICE_N_PINS_MAX];
 	const struct ice_ptp_pin_desc *ice_pin_desc;
-	struct ice_perout_channel perout_channels[GLTSYN_TGT_H_IDX_MAX];
-	struct ice_extts_channel extts_channels[GLTSYN_TGT_H_IDX_MAX];
+	struct ptp_perout_request perout_rqs[GLTSYN_TGT_H_IDX_MAX];
+	struct ptp_extts_request extts_rqs[GLTSYN_EVNT_H_IDX_MAX];
 	struct ptp_clock_info info;
 	struct ptp_clock *clock;
 	struct hwtstamp_config tstamp_config;
