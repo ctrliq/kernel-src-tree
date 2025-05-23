@@ -262,7 +262,7 @@ arm_smmu_mmu_notifier_get(struct arm_smmu_domain *smmu_domain,
 	struct arm_smmu_mmu_notifier *smmu_mn;
 
 	list_for_each_entry(smmu_mn, &smmu_domain->mmu_notifiers, list) {
-		if (smmu_mn->mn.mm == mm) {
+		if (smmu_mn->mn._rh->mm == mm) {
 			refcount_inc(&smmu_mn->refs);
 			return smmu_mn;
 		}
@@ -306,7 +306,7 @@ err_free_cd:
 
 static void arm_smmu_mmu_notifier_put(struct arm_smmu_mmu_notifier *smmu_mn)
 {
-	struct mm_struct *mm = smmu_mn->mn.mm;
+	struct mm_struct *mm = smmu_mn->mn._rh->mm;
 	struct arm_smmu_ctx_desc *cd = smmu_mn->cd;
 	struct arm_smmu_domain *smmu_domain = smmu_mn->domain;
 
