@@ -646,6 +646,8 @@ void ice_free_vfs(struct ice_pf *pf)
 			set_bit(ICE_VF_STATE_DIS, pf->vf[i].vf_states);
 			ice_free_vf_res(&pf->vf[i]);
 		}
+
+		mutex_destroy(&pf->vf[i].cfg_lock);
 	}
 
 	if (ice_sriov_free_msix_res(pf))
@@ -1891,6 +1893,8 @@ static void ice_set_dflt_settings_vfs(struct ice_pf *pf)
 		 */
 		ice_vf_ctrl_invalidate_vsi(vf);
 		ice_vf_fdir_init(vf);
+
+		mutex_init(&vf->cfg_lock);
 	}
 }
 
@@ -2947,6 +2951,7 @@ bool ice_is_any_vf_in_promisc(struct ice_pf *pf)
 static int ice_vc_cfg_promiscuous_mode_msg(struct ice_vf *vf, u8 *msg)
 {
 	enum virtchnl_status_code v_ret = VIRTCHNL_STATUS_SUCCESS;
+	enum ice_status mcast_status = 0, ucast_status = 0;
 	bool rm_promisc, alluni = false, allmulti = false;
 	struct virtchnl_promisc_info *info =
 	    (struct virtchnl_promisc_info *)msg;
@@ -2988,23 +2993,6 @@ static int ice_vc_cfg_promiscuous_mode_msg(struct ice_vf *vf, u8 *msg)
 	rm_promisc = !allmulti && !alluni;
 
 	if (vsi->num_vlan || vf->port_vlan_info) {
-		struct ice_vsi *pf_vsi = ice_get_main_vsi(pf);
-		struct net_device *pf_netdev;
-
-		if (!pf_vsi) {
-			v_ret = VIRTCHNL_STATUS_ERR_PARAM;
-			goto error_param;
-		}
-
-		pf_netdev = pf_vsi->netdev;
-
-		ret = ice_set_vf_spoofchk(pf_netdev, vf->vf_id, rm_promisc);
-		if (ret) {
-			dev_err(dev, "Failed to update spoofchk to %s for VF %d VSI %d when setting promiscuous mode\n",
-				rm_promisc ? "ON" : "OFF", vf->vf_id,
-				vsi->vsi_num);
-			v_ret = VIRTCHNL_STATUS_ERR_PARAM;
-		}
 
 		ret = ice_cfg_vlan_pruning(vsi, true, !rm_promisc);
 		if (ret) {
@@ -3036,52 +3024,51 @@ static int ice_vc_cfg_promiscuous_mode_msg(struct ice_vf *vf, u8 *msg)
 			goto error_param;
 		}
 	} else {
-		enum ice_status status;
-		u8 promisc_m;
+		u8 mcast_m, ucast_m;
 
-		if (alluni) {
-			if (vf->port_vlan_info || vsi->num_vlan)
-				promisc_m = ICE_UCAST_VLAN_PROMISC_BITS;
-			else
-				promisc_m = ICE_UCAST_PROMISC_BITS;
-		} else if (allmulti) {
-			if (vf->port_vlan_info || vsi->num_vlan)
-				promisc_m = ICE_MCAST_VLAN_PROMISC_BITS;
-			else
-				promisc_m = ICE_MCAST_PROMISC_BITS;
+		if (vf->port_vlan_info || vsi->num_vlan > 1) {
+			mcast_m = ICE_MCAST_VLAN_PROMISC_BITS;
+			ucast_m = ICE_UCAST_VLAN_PROMISC_BITS;
 		} else {
-			if (vf->port_vlan_info || vsi->num_vlan)
-				promisc_m = ICE_UCAST_VLAN_PROMISC_BITS;
-			else
-				promisc_m = ICE_UCAST_PROMISC_BITS;
+			mcast_m = ICE_MCAST_PROMISC_BITS;
+			ucast_m = ICE_UCAST_PROMISC_BITS;
 		}
 
-		/* Configure multicast/unicast with or without VLAN promiscuous
-		 * mode
-		 */
-		status = ice_vf_set_vsi_promisc(vf, vsi, promisc_m, rm_promisc);
-		if (status) {
-			dev_err(dev, "%sable Tx/Rx filter promiscuous mode on VF-%d failed, error: %s\n",
-				rm_promisc ? "dis" : "en", vf->vf_id,
-				ice_stat_str(status));
-			v_ret = ice_err_to_virt_err(status);
-			goto error_param;
-		} else {
-			dev_dbg(dev, "%sable Tx/Rx filter promiscuous mode on VF-%d succeeded\n",
-				rm_promisc ? "dis" : "en", vf->vf_id);
+		ucast_status = ice_vf_set_vsi_promisc(vf, vsi, ucast_m,
+						      !alluni);
+		if (ucast_status) {
+			dev_err(dev, "%sable Tx/Rx filter promiscuous mode on VF-%d failed\n",
+				alluni ? "en" : "dis", vf->vf_id);
+			v_ret = ice_err_to_virt_err(ucast_status);
+		}
+
+		mcast_status = ice_vf_set_vsi_promisc(vf, vsi, mcast_m,
+						      !allmulti);
+		if (mcast_status) {
+			dev_err(dev, "%sable Tx/Rx filter promiscuous mode on VF-%d failed\n",
+				allmulti ? "en" : "dis", vf->vf_id);
+			v_ret = ice_err_to_virt_err(mcast_status);
 		}
 	}
 
-	if (allmulti &&
-	    !test_and_set_bit(ICE_VF_STATE_MC_PROMISC, vf->vf_states))
-		dev_info(dev, "VF %u successfully set multicast promiscuous mode\n", vf->vf_id);
-	else if (!allmulti && test_and_clear_bit(ICE_VF_STATE_MC_PROMISC, vf->vf_states))
-		dev_info(dev, "VF %u successfully unset multicast promiscuous mode\n", vf->vf_id);
+	if (!mcast_status) {
+		if (allmulti &&
+		    !test_and_set_bit(ICE_VF_STATE_MC_PROMISC, vf->vf_states))
+			dev_info(dev, "VF %u successfully set multicast promiscuous mode\n",
+				 vf->vf_id);
+		else if (!allmulti && test_and_clear_bit(ICE_VF_STATE_MC_PROMISC, vf->vf_states))
+			dev_info(dev, "VF %u successfully unset multicast promiscuous mode\n",
+				 vf->vf_id);
+	}
 
-	if (alluni && !test_and_set_bit(ICE_VF_STATE_UC_PROMISC, vf->vf_states))
-		dev_info(dev, "VF %u successfully set unicast promiscuous mode\n", vf->vf_id);
-	else if (!alluni && test_and_clear_bit(ICE_VF_STATE_UC_PROMISC, vf->vf_states))
-		dev_info(dev, "VF %u successfully unset unicast promiscuous mode\n", vf->vf_id);
+	if (!ucast_status) {
+		if (alluni && !test_and_set_bit(ICE_VF_STATE_UC_PROMISC, vf->vf_states))
+			dev_info(dev, "VF %u successfully set unicast promiscuous mode\n",
+				 vf->vf_id);
+		else if (!alluni && test_and_clear_bit(ICE_VF_STATE_UC_PROMISC, vf->vf_states))
+			dev_info(dev, "VF %u successfully unset unicast promiscuous mode\n",
+				 vf->vf_id);
+	}
 
 error_param:
 	return ice_vc_send_msg_to_vf(vf, VIRTCHNL_OP_CONFIG_PROMISCUOUS_MODE,
@@ -3953,6 +3940,8 @@ ice_set_vf_port_vlan(struct net_device *netdev, int vf_id, u16 vlan_id, u8 qos,
 		return 0;
 	}
 
+	mutex_lock(&vf->cfg_lock);
+
 	vf->port_vlan_info = vlanprio;
 
 	if (vf->port_vlan_info)
@@ -3962,6 +3951,7 @@ ice_set_vf_port_vlan(struct net_device *netdev, int vf_id, u16 vlan_id, u8 qos,
 		dev_info(dev, "Clearing port VLAN on VF %d\n", vf_id);
 
 	ice_vc_reset_vf(vf);
+	mutex_unlock(&vf->cfg_lock);
 
 	return 0;
 }
@@ -4336,6 +4326,15 @@ error_handler:
 		return;
 	}
 
+	/* VF is being configured in another context that triggers a VFR, so no
+	 * need to process this message
+	 */
+	if (!mutex_trylock(&vf->cfg_lock)) {
+		dev_info(dev, "VF %u is being configured in another context that will trigger a VFR, so there is no need to handle this message\n",
+			 vf->vf_id);
+		return;
+	}
+
 	switch (v_opcode) {
 	case VIRTCHNL_OP_VERSION:
 		err = ice_vc_get_ver_msg(vf, msg);
@@ -4424,6 +4423,8 @@ error_handler:
 		dev_info(dev, "PF failed to honor VF %d, opcode %d, error %d\n",
 			 vf_id, v_opcode, err);
 	}
+
+	mutex_unlock(&vf->cfg_lock);
 }
 
 /**
@@ -4538,6 +4539,8 @@ int ice_set_vf_mac(struct net_device *netdev, int vf_id, u8 *mac)
 		return -EINVAL;
 	}
 
+	mutex_lock(&vf->cfg_lock);
+
 	/* VF is notified of its new MAC via the PF's response to the
 	 * VIRTCHNL_OP_GET_VF_RESOURCES message after the VF has been reset
 	 */
@@ -4555,6 +4558,7 @@ int ice_set_vf_mac(struct net_device *netdev, int vf_id, u8 *mac)
 	}
 
 	ice_vc_reset_vf(vf);
+	mutex_unlock(&vf->cfg_lock);
 	return 0;
 }
 
@@ -4584,10 +4588,14 @@ int ice_set_vf_trust(struct net_device *netdev, int vf_id, bool trusted)
 	if (trusted == vf->trusted)
 		return 0;
 
+	mutex_lock(&vf->cfg_lock);
+
 	vf->trusted = trusted;
 	ice_vc_reset_vf(vf);
 	dev_info(ice_pf_to_dev(pf), "VF %u is now %strusted\n",
 		 vf_id, trusted ? "" : "un");
+
+	mutex_unlock(&vf->cfg_lock);
 
 	return 0;
 }
