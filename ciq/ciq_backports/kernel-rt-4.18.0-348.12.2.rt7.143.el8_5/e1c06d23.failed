@@ -1,0 +1,182 @@
+x86/mce: Rename kill_it to kill_current_task
+
+jira NONE_AUTOMATION
+Rebuild_History Non-Buildable kernel-rt-4.18.0-348.12.2.rt7.143.el8_5
+commit-author Gabriele Paoloni <gabriele.paoloni@intel.com>
+commit e1c06d2366e743475b91045ef0c2ce1bbd028cb6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-rt-4.18.0-348.12.2.rt7.143.el8_5/e1c06d23.failed
+
+Currently, if an MCE happens in user-mode or while the kernel is copying
+data from user space, 'kill_it' is used to check if execution of the
+interrupted task can be recovered or not; the flag name however is not
+very meaningful, hence rename it to match its goal.
+
+ [ bp: Massage commit message, rename the queue_task_work() arg too. ]
+
+	Signed-off-by: Gabriele Paoloni <gabriele.paoloni@intel.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20201127161819.3106432-6-gabriele.paoloni@intel.com
+(cherry picked from commit e1c06d2366e743475b91045ef0c2ce1bbd028cb6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/mce/core.c
+diff --cc arch/x86/kernel/cpu/mce/core.c
+index 88eb3cb77d26,6af6a3c0698f..000000000000
+--- a/arch/x86/kernel/cpu/mce/core.c
++++ b/arch/x86/kernel/cpu/mce/core.c
+@@@ -1203,6 -1236,51 +1203,54 @@@ static void __mc_scan_banks(struct mce 
+  	*m = *final;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void kill_me_now(struct callback_head *ch)
++ {
++ 	force_sig(SIGBUS);
++ }
++ 
++ static void kill_me_maybe(struct callback_head *cb)
++ {
++ 	struct task_struct *p = container_of(cb, struct task_struct, mce_kill_me);
++ 	int flags = MF_ACTION_REQUIRED;
++ 
++ 	pr_err("Uncorrected hardware memory error in user-access at %llx", p->mce_addr);
++ 
++ 	if (!p->mce_ripv)
++ 		flags |= MF_MUST_KILL;
++ 
++ 	if (!memory_failure(p->mce_addr >> PAGE_SHIFT, flags) &&
++ 	    !(p->mce_kflags & MCE_IN_KERNEL_COPYIN)) {
++ 		set_mce_nospec(p->mce_addr >> PAGE_SHIFT, p->mce_whole_page);
++ 		sync_core();
++ 		return;
++ 	}
++ 
++ 	if (p->mce_vaddr != (void __user *)-1l) {
++ 		force_sig_mceerr(BUS_MCEERR_AR, p->mce_vaddr, PAGE_SHIFT);
++ 	} else {
++ 		pr_err("Memory error not recovered");
++ 		kill_me_now(cb);
++ 	}
++ }
++ 
++ static void queue_task_work(struct mce *m, int kill_current_task)
++ {
++ 	current->mce_addr = m->addr;
++ 	current->mce_kflags = m->kflags;
++ 	current->mce_ripv = !!(m->mcgstatus & MCG_STATUS_RIPV);
++ 	current->mce_whole_page = whole_page(m);
++ 
++ 	if (kill_current_task)
++ 		current->mce_kill_me.func = kill_me_now;
++ 	else
++ 		current->mce_kill_me.func = kill_me_maybe;
++ 
++ 	task_work_add(current, &current->mce_kill_me, TWA_RESUME);
++ }
++ 
+++>>>>>>> e1c06d2366e7 (x86/mce: Rename kill_it to kill_current_task)
+  /*
+   * The actual machine check handler. This only handles real
+   * exceptions when something got corrupted coming in through int 18.
+@@@ -1273,13 -1351,13 +1321,17 @@@ void do_machine_check(struct pt_regs *r
+  	 * severity is MCE_AR_SEVERITY we have other options.
+  	 */
+  	if (!(m.mcgstatus & MCG_STATUS_RIPV))
+++<<<<<<< HEAD
+ +		kill_it = 1;
+ +
+++=======
++ 		kill_current_task = (cfg->tolerant == 3) ? 0 : 1;
+++>>>>>>> e1c06d2366e7 (x86/mce: Rename kill_it to kill_current_task)
+  	/*
+  	 * Check if this MCE is signaled to only this logical processor,
+ -	 * on Intel, Zhaoxin only.
+ +	 * on Intel only.
+  	 */
+ -	if (m.cpuvendor == X86_VENDOR_INTEL ||
+ -	    m.cpuvendor == X86_VENDOR_ZHAOXIN)
+ +	if (m.cpuvendor == X86_VENDOR_INTEL)
+  		lmce = m.mcgstatus & MCG_STATUS_LMCES;
+  
+  	/*
+@@@ -1323,45 -1406,36 +1375,73 @@@
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * If tolerant is at an insane level we drop requests to kill
+ +	 * processes and continue even when there is no way out.
+ +	 */
+ +	if (cfg->tolerant == 3)
+ +		kill_it = 0;
+ +	else if (no_way_out)
+ +		mce_panic("Fatal machine check on current CPU", &m, msg);
+ +
+ +	if (worst > 0)
+ +		mce_report_event(regs);
+ +	mce_wrmsrl(MSR_IA32_MCG_STATUS, 0);
+ +
+ +	sync_core();
+ +
+ +	if (worst != MCE_AR_SEVERITY && !kill_it)
+ +		goto out_ist;
+++=======
++ 	if (worst != MCE_AR_SEVERITY && !kill_current_task)
++ 		goto out;
+++>>>>>>> e1c06d2366e7 (x86/mce: Rename kill_it to kill_current_task)
+  
+  	/* Fault was in user mode and we need to take some action */
+  	if ((m.cs & 3) == 3) {
+  		/* If this triggers there is no way to recover. Die hard. */
+  		BUG_ON(!on_thread_stack() || !user_mode(regs));
+ +		local_irq_enable();
+ +		preempt_enable();
+  
+++<<<<<<< HEAD
+ +		current->task_struct_rh->mce_ripv = !!(m.mcgstatus & MCG_STATUS_RIPV);
+ +		current->task_struct_rh->mce_whole_page = whole_page(&m);
+++=======
++ 		queue_task_work(&m, kill_current_task);
+++>>>>>>> e1c06d2366e7 (x86/mce: Rename kill_it to kill_current_task)
+  
+ +		if (kill_it || do_memory_failure(&m))
+ +			force_sig(SIGBUS, current);
+ +		preempt_disable();
+ +		local_irq_disable();
+  	} else {
+++<<<<<<< HEAD
+ +		if (!fixup_exception(regs, X86_TRAP_MC))
+ +			mce_panic("Failed kernel mode recovery", &m, NULL);
+++=======
++ 		/*
++ 		 * Handle an MCE which has happened in kernel space but from
++ 		 * which the kernel can recover: ex_has_fault_handler() has
++ 		 * already verified that the rIP at which the error happened is
++ 		 * a rIP from which the kernel can recover (by jumping to
++ 		 * recovery code specified in _ASM_EXTABLE_FAULT()) and the
++ 		 * corresponding exception handler which would do that is the
++ 		 * proper one.
++ 		 */
++ 		if (m.kflags & MCE_IN_KERNEL_RECOV) {
++ 			if (!fixup_exception(regs, X86_TRAP_MC, 0, 0))
++ 				mce_panic("Failed kernel mode recovery", &m, msg);
++ 		}
++ 
++ 		if (m.kflags & MCE_IN_KERNEL_COPYIN)
++ 			queue_task_work(&m, kill_current_task);
+++>>>>>>> e1c06d2366e7 (x86/mce: Rename kill_it to kill_current_task)
+  	}
+ -out:
+ -	mce_wrmsrl(MSR_IA32_MCG_STATUS, 0);
+ +
+ +out_ist:
+ +	nmi_exit();
+  }
+  EXPORT_SYMBOL_GPL(do_machine_check);
+  
+* Unmerged path arch/x86/kernel/cpu/mce/core.c
