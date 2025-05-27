@@ -1,0 +1,132 @@
+sched/core: Wait for tasks being pushed away on hotplug
+
+jira NONE_AUTOMATION
+Rebuild_History Non-Buildable kernel-rt-4.18.0-348.7.1.rt7.137.el8_5
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit f2469a1fb43f85d243ce72638367fb6e15c33491
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-rt-4.18.0-348.7.1.rt7.137.el8_5/f2469a1f.failed
+
+RT kernels need to ensure that all tasks which are not per CPU kthreads
+have left the outgoing CPU to guarantee that no tasks are force migrated
+within a migrate disabled section.
+
+There is also some desire to (ab)use fine grained CPU hotplug control to
+clear a CPU from active state to force migrate tasks which are not per CPU
+kthreads away for power control purposes.
+
+Add a mechanism which waits until all tasks which should leave the CPU
+after the CPU active flag is cleared have moved to a different online CPU.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Valentin Schneider <valentin.schneider@arm.com>
+	Reviewed-by: Daniel Bristot de Oliveira <bristot@redhat.com>
+Link: https://lkml.kernel.org/r/20201023102346.377836842@infradead.org
+(cherry picked from commit f2469a1fb43f85d243ce72638367fb6e15c33491)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/sched.h
+diff --cc kernel/sched/sched.h
+index a3c2d842c581,c6f707a6d9d4..000000000000
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@@ -958,7 -1004,11 +958,15 @@@ struct rq 
+  
+  	/* This is used to determine avg_idle's max value */
+  	u64			max_idle_balance_cost;
+++<<<<<<< HEAD
+ +#endif
+++=======
++ 
++ #ifdef CONFIG_HOTPLUG_CPU
++ 	struct rcuwait		hotplug_wait;
++ #endif
++ #endif /* CONFIG_SMP */
+++>>>>>>> f2469a1fb43f (sched/core: Wait for tasks being pushed away on hotplug)
+  
+  #ifdef CONFIG_IRQ_TIME_ACCOUNTING
+  	u64			prev_irq_time;
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 6068e0ed9d1c..63a4e73bb41f 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -6422,8 +6422,21 @@ static void balance_push(struct rq *rq)
+ 	 * Both the cpu-hotplug and stop task are in this case and are
+ 	 * required to complete the hotplug process.
+ 	 */
+-	if (is_per_cpu_kthread(push_task))
++	if (is_per_cpu_kthread(push_task)) {
++		/*
++		 * If this is the idle task on the outgoing CPU try to wake
++		 * up the hotplug control thread which might wait for the
++		 * last task to vanish. The rcuwait_active() check is
++		 * accurate here because the waiter is pinned on this CPU
++		 * and can't obviously be running in parallel.
++		 */
++		if (!rq->nr_running && rcuwait_active(&rq->hotplug_wait)) {
++			raw_spin_unlock(&rq->lock);
++			rcuwait_wake_up(&rq->hotplug_wait);
++			raw_spin_lock(&rq->lock);
++		}
+ 		return;
++	}
+ 
+ 	get_task_struct(push_task);
+ 	/*
+@@ -6454,6 +6467,20 @@ static void balance_push_set(int cpu, bool on)
+ 	rq_unlock_irqrestore(rq, &rf);
+ }
+ 
++/*
++ * Invoked from a CPUs hotplug control thread after the CPU has been marked
++ * inactive. All tasks which are not per CPU kernel threads are either
++ * pushed off this CPU now via balance_push() or placed on a different CPU
++ * during wakeup. Wait until the CPU is quiescent.
++ */
++static void balance_hotplug_wait(void)
++{
++	struct rq *rq = this_rq();
++
++	rcuwait_wait_event(&rq->hotplug_wait, rq->nr_running == 1,
++			   TASK_UNINTERRUPTIBLE);
++}
++
+ #else
+ 
+ static inline void balance_push(struct rq *rq)
+@@ -6464,6 +6491,10 @@ static inline void balance_push_set(int cpu, bool on)
+ {
+ }
+ 
++static inline void balance_hotplug_wait(void)
++{
++}
++
+ #endif /* CONFIG_HOTPLUG_CPU */
+ 
+ void set_rq_online(struct rq *rq)
+@@ -6618,6 +6649,10 @@ int sched_cpu_deactivate(unsigned int cpu)
+ 		return ret;
+ 	}
+ 	sched_domains_numa_masks_clear(cpu);
++
++	/* Wait for all non per CPU kernel threads to vanish. */
++	balance_hotplug_wait();
++
+ 	return 0;
+ }
+ 
+@@ -6850,6 +6885,9 @@ void __init sched_init(void)
+ 		rq->last_blocked_load_update_tick = jiffies;
+ 		atomic_set(&rq->nohz_flags, 0);
+ #endif
++#ifdef CONFIG_HOTPLUG_CPU
++		rcuwait_init(&rq->hotplug_wait);
++#endif
+ #endif /* CONFIG_SMP */
+ 		hrtick_rq_init(rq);
+ 		atomic_set(&rq->nr_iowait, 0);
+* Unmerged path kernel/sched/sched.h
