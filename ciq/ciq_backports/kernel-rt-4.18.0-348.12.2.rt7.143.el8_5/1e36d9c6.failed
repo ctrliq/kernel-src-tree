@@ -1,0 +1,157 @@
+x86/mce: Delay clearing IA32_MCG_STATUS to the end of do_machine_check()
+
+jira NONE_AUTOMATION
+Rebuild_History Non-Buildable kernel-rt-4.18.0-348.12.2.rt7.143.el8_5
+commit-author Tony Luck <tony.luck@intel.com>
+commit 1e36d9c6886849c6f3d3c836370563e6bc1a6ddd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-rt-4.18.0-348.12.2.rt7.143.el8_5/1e36d9c6.failed
+
+A long time ago, Linux cleared IA32_MCG_STATUS at the very end of machine
+check processing.
+
+Then, some fancy recovery and IST manipulation was added in:
+
+  d4812e169de4 ("x86, mce: Get rid of TIF_MCE_NOTIFY and associated mce tricks")
+
+and clearing IA32_MCG_STATUS was pulled earlier in the function.
+
+Next change moved the actual recovery out of do_machine_check() and
+just used task_work_add() to schedule it later (before returning to the
+user):
+
+  5567d11c21a1 ("x86/mce: Send #MC singal from task work")
+
+Most recently the fancy IST footwork was removed as no longer needed:
+
+  b052df3da821 ("x86/entry: Get rid of ist_begin/end_non_atomic()")
+
+At this point there is no reason remaining to clear IA32_MCG_STATUS early.
+It can move back to the very end of the function.
+
+Also move sync_core(). The comments for this function say that it should
+only be called when instructions have been changed/re-mapped. Recovery
+for an instruction fetch may change the physical address. But that
+doesn't happen until the scheduled work runs (which could be on another
+CPU).
+
+ [ bp: Massage commit message. ]
+
+	Reported-by: Gabriele Paoloni <gabriele.paoloni@intel.com>
+	Signed-off-by: Tony Luck <tony.luck@intel.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20200824221237.5397-1-tony.luck@intel.com
+(cherry picked from commit 1e36d9c6886849c6f3d3c836370563e6bc1a6ddd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/mce/core.c
+diff --cc arch/x86/kernel/cpu/mce/core.c
+index 88eb3cb77d26,0ba24dfffdb2..000000000000
+--- a/arch/x86/kernel/cpu/mce/core.c
++++ b/arch/x86/kernel/cpu/mce/core.c
+@@@ -1203,6 -1173,31 +1203,34 @@@ static void __mc_scan_banks(struct mce 
+  	*m = *final;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void kill_me_now(struct callback_head *ch)
++ {
++ 	force_sig(SIGBUS);
++ }
++ 
++ static void kill_me_maybe(struct callback_head *cb)
++ {
++ 	struct task_struct *p = container_of(cb, struct task_struct, mce_kill_me);
++ 	int flags = MF_ACTION_REQUIRED;
++ 
++ 	pr_err("Uncorrected hardware memory error in user-access at %llx", p->mce_addr);
++ 
++ 	if (!p->mce_ripv)
++ 		flags |= MF_MUST_KILL;
++ 
++ 	if (!memory_failure(p->mce_addr >> PAGE_SHIFT, flags)) {
++ 		set_mce_nospec(p->mce_addr >> PAGE_SHIFT, p->mce_whole_page);
++ 		sync_core();
++ 		return;
++ 	}
++ 
++ 	pr_err("Memory error not recovered");
++ 	kill_me_now(cb);
++ }
++ 
+++>>>>>>> 1e36d9c68868 (x86/mce: Delay clearing IA32_MCG_STATUS to the end of do_machine_check())
+  /*
+   * The actual machine check handler. This only handles real
+   * exceptions when something got corrupted coming in through int 18.
+@@@ -1333,35 -1329,40 +1361,47 @@@ void do_machine_check(struct pt_regs *r
+  		mce_panic("Fatal machine check on current CPU", &m, msg);
+  
+  	if (worst > 0)
+++<<<<<<< HEAD
+ +		mce_report_event(regs);
+ +	mce_wrmsrl(MSR_IA32_MCG_STATUS, 0);
+ +
+ +	sync_core();
+ +
+ +	if (worst != MCE_AR_SEVERITY && !kill_it)
+ +		goto out_ist;
+++=======
++ 		irq_work_queue(&mce_irq_work);
++ 
++ 	if (worst != MCE_AR_SEVERITY && !kill_it)
++ 		goto out;
+++>>>>>>> 1e36d9c68868 (x86/mce: Delay clearing IA32_MCG_STATUS to the end of do_machine_check())
+  
+  	/* Fault was in user mode and we need to take some action */
+  	if ((m.cs & 3) == 3) {
+  		/* If this triggers there is no way to recover. Die hard. */
+  		BUG_ON(!on_thread_stack() || !user_mode(regs));
+ +		local_irq_enable();
+ +		preempt_enable();
+ +
+ +		current->task_struct_rh->mce_ripv = !!(m.mcgstatus & MCG_STATUS_RIPV);
+ +		current->task_struct_rh->mce_whole_page = whole_page(&m);
+  
+ -		current->mce_addr = m.addr;
+ -		current->mce_ripv = !!(m.mcgstatus & MCG_STATUS_RIPV);
+ -		current->mce_whole_page = whole_page(&m);
+ -		current->mce_kill_me.func = kill_me_maybe;
+ -		if (kill_it)
+ -			current->mce_kill_me.func = kill_me_now;
+ -		task_work_add(current, &current->mce_kill_me, true);
+ +		if (kill_it || do_memory_failure(&m))
+ +			force_sig(SIGBUS, current);
+ +		preempt_disable();
+ +		local_irq_disable();
+  	} else {
+ -		/*
+ -		 * Handle an MCE which has happened in kernel space but from
+ -		 * which the kernel can recover: ex_has_fault_handler() has
+ -		 * already verified that the rIP at which the error happened is
+ -		 * a rIP from which the kernel can recover (by jumping to
+ -		 * recovery code specified in _ASM_EXTABLE_FAULT()) and the
+ -		 * corresponding exception handler which would do that is the
+ -		 * proper one.
+ -		 */
+ -		if (m.kflags & MCE_IN_KERNEL_RECOV) {
+ -			if (!fixup_exception(regs, X86_TRAP_MC, 0, 0))
+ -				mce_panic("Failed kernel mode recovery", &m, msg);
+ -		}
+ +		if (!fixup_exception(regs, X86_TRAP_MC))
+ +			mce_panic("Failed kernel mode recovery", &m, NULL);
+  	}
+++<<<<<<< HEAD
+ +
+ +out_ist:
+ +	nmi_exit();
+++=======
++ out:
++ 	mce_wrmsrl(MSR_IA32_MCG_STATUS, 0);
+++>>>>>>> 1e36d9c68868 (x86/mce: Delay clearing IA32_MCG_STATUS to the end of do_machine_check())
+  }
+  EXPORT_SYMBOL_GPL(do_machine_check);
+  
+* Unmerged path arch/x86/kernel/cpu/mce/core.c
