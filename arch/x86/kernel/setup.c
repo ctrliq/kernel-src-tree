@@ -808,7 +808,7 @@ static void rh_check_supported(void)
 	if (((boot_cpu_data.x86_max_cores * smp_num_siblings) == 1) &&
 	    !guest && is_kdump_kernel()) {
 		pr_crit("Detected single cpu native boot.\n");
-		pr_crit("Important:  In Red Hat Enterprise Linux 8, single threaded, single CPU 64-bit physical systems are unsupported by Red Hat. Please contact your Red Hat support representative for a list of certified and supported systems.");
+		pr_crit("Important:  In Rocky Linux 8, single threaded, single CPU 64-bit physical systems are unsupported. Please see http://wiki.centos.org/FAQ for more information");
 	}
 
 	/*

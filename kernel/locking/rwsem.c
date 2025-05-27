@@ -30,6 +30,7 @@
 #include <linux/rwsem.h>
 #include <linux/atomic.h>
 
+#ifndef CONFIG_PREEMPT_RT
 #include "lock_events.h"
 
 #ifndef RWSEM_INIT_ONLY
@@ -330,7 +331,9 @@ void __init_rwsem(struct rw_semaphore *sem, const char *name,
 }
 EXPORT_SYMBOL(__init_rwsem);
 
+#endif  /* !CONFIG_PREEMPT_RT */
 #ifndef RWSEM_INIT_ONLY
+#ifndef CONFIG_PREEMPT_RT
 
 enum rwsem_waiter_type {
 	RWSEM_WAITING_FOR_WRITE,
@@ -1351,6 +1354,7 @@ static inline void __downgrade_write(struct rw_semaphore *sem)
 	if (tmp & RWSEM_FLAG_WAITERS)
 		rwsem_downgrade_wake(sem);
 }
+#endif /* !CONFIG_PREEMPT_RT */
 
 /*
  * lock for reading
@@ -1514,7 +1518,9 @@ void down_read_non_owner(struct rw_semaphore *sem)
 {
 	might_sleep();
 	__down_read(sem);
+#ifndef CONFIG_PREEMPT_RT
 	__rwsem_set_reader_owned(sem, NULL);
+#endif
 }
 EXPORT_SYMBOL(down_read_non_owner);
 
@@ -1543,7 +1549,9 @@ EXPORT_SYMBOL(down_write_killable_nested);
 
 void up_read_non_owner(struct rw_semaphore *sem)
 {
+#ifndef CONFIG_PREEMPT_RT
 	DEBUG_RWSEMS_WARN_ON(!is_rwsem_reader_owned(sem), sem);
+#endif
 	__up_read(sem);
 }
 EXPORT_SYMBOL(up_read_non_owner);

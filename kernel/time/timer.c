@@ -42,6 +42,7 @@
 #include <linux/sched/sysctl.h>
 #include <linux/sched/nohz.h>
 #include <linux/sched/debug.h>
+#include <linux/sched/isolation.h>
 #include <linux/slab.h>
 #include <linux/compat.h>
 #include <linux/random.h>
@@ -60,6 +61,8 @@
 __visible u64 jiffies_64 __cacheline_aligned_in_smp = INITIAL_JIFFIES;
 
 EXPORT_SYMBOL(jiffies_64);
+
+static int ktimer_ll_check;
 
 /*
  * The timer wheel has LVL_DEPTH array levels. Each level provides an array of
@@ -207,6 +210,7 @@ struct timer_base {
 	unsigned long		next_expiry;
 	unsigned int		cpu;
 	bool			is_idle;
+	bool			pending_map_clear;
 	DECLARE_BITMAP(pending_map, WHEEL_SIZE);
 	struct hlist_head	vectors[WHEEL_SIZE];
 } ____cacheline_aligned;
@@ -581,6 +585,7 @@ static void enqueue_timer(struct timer_base *base, struct timer_list *timer,
 
 	hlist_add_head(&timer->entry, base->vectors + idx);
 	__set_bit(idx, base->pending_map);
+	base->pending_map_clear = false;
 	timer_set_idx(timer, idx);
 
 	trace_timer_start(timer, timer->expires, timer->flags);
@@ -913,6 +918,12 @@ static inline void forward_timer_base(struct timer_base *base)
 	}
 }
 
+static DEFINE_PER_CPU(call_single_data_t, raise_timer_csd);
+
+static void raise_timer_softirq(void *arg)
+{
+	raise_softirq(TIMER_SOFTIRQ);
+}
 
 /*
  * We are using hashed locking: Holding per_cpu(timer_bases[x]).lock means
@@ -1060,6 +1071,18 @@ __mod_timer(struct timer_list *timer, unsigned long expires, unsigned int option
 	else
 		internal_add_timer(base, timer);
 
+	if (!housekeeping_cpu(base->cpu, HK_FLAG_TIMER) &&
+	    !(timer->flags & TIMER_DEFERRABLE) &&
+	     ktimer_ll_check) {
+		call_single_data_t *c;
+
+		c = per_cpu_ptr(&raise_timer_csd, base->cpu);
+
+		/* Make sure bitmap updates are visible on remote CPUs */
+		smp_wmb();
+		smp_call_function_single_async(base->cpu, c);
+	}
+
 out_unlock:
 	raw_spin_unlock_irqrestore(&base->lock, flags);
 
@@ -1179,6 +1202,18 @@ void add_timer_on(struct timer_list *timer, int cpu)
 
 	debug_timer_activate(timer);
 	internal_add_timer(base, timer);
+
+	if (!housekeeping_cpu(base->cpu, HK_FLAG_TIMER) &&
+	    !(timer->flags & TIMER_DEFERRABLE) &&
+	     ktimer_ll_check) {
+		call_single_data_t *c;
+
+		c = per_cpu_ptr(&raise_timer_csd, base->cpu);
+
+		/* Make sure bitmap updates are visible on remote CPUs */
+		smp_wmb();
+		smp_call_function_single_async(base->cpu, c);
+	}
 	raw_spin_unlock_irqrestore(&base->lock, flags);
 }
 EXPORT_SYMBOL_GPL(add_timer_on);
@@ -1284,7 +1319,7 @@ static void del_timer_wait_running(struct timer_list *timer)
 	u32 tf;
 
 	tf = READ_ONCE(timer->flags);
-	if (!(tf & TIMER_MIGRATING)) {
+	if (!(tf & (TIMER_MIGRATING | TIMER_IRQSAFE))) {
 		struct timer_base *base = get_timer_base(tf);
 
 		/*
@@ -1367,6 +1402,13 @@ int del_timer_sync(struct timer_list *timer)
 	 * could lead to deadlock.
 	 */
 	WARN_ON(in_irq() && !(timer->flags & TIMER_IRQSAFE));
+
+	/*
+	 * Must be able to sleep on PREEMPT_RT because of the slowpath in
+	 * del_timer_wait_running().
+	 */
+	if (IS_ENABLED(CONFIG_PREEMPT_RT) && !(timer->flags & TIMER_IRQSAFE))
+		lockdep_assert_preemption_enabled();
 
 	do {
 		ret = try_to_del_timer_sync(timer);
@@ -1741,6 +1783,9 @@ static inline void __run_timers(struct timer_base *base)
 		while (levels--)
 			expire_timers(base, heads + levels);
 	}
+	if (!housekeeping_cpu(base->cpu, HK_FLAG_TIMER) &&
+	    bitmap_empty(base->pending_map, WHEEL_SIZE))
+		base->pending_map_clear = true;
 	raw_spin_unlock_irq(&base->lock);
 	timer_base_unlock_expiry(base);
 }
@@ -1751,6 +1796,8 @@ static inline void __run_timers(struct timer_base *base)
 static __latent_entropy void run_timer_softirq(struct softirq_action *h)
 {
 	struct timer_base *base = this_cpu_ptr(&timer_bases[BASE_STD]);
+
+	irq_work_tick_soft();
 
 	__run_timers(base);
 	if (IS_ENABLED(CONFIG_NO_HZ_COMMON))
@@ -1774,6 +1821,28 @@ void run_local_timers(void)
 		if (time_before(jiffies, base->next_expiry))
 			return;
 	}
+
+#ifdef CONFIG_PREEMPT_RT
+/* On RT, irq work runs from softirq */
+	if (irq_work_needs_cpu())
+		goto raise;
+#endif
+	base = this_cpu_ptr(&timer_bases[BASE_STD]);
+	if (!housekeeping_cpu(base->cpu, HK_FLAG_TIMER)) {
+		if (!base->pending_map_clear)
+			goto raise;
+
+		if (!IS_ENABLED(CONFIG_NO_HZ_COMMON))
+			return;
+
+		base++;
+		if (!base->pending_map_clear)
+			goto raise;
+
+		return;
+	}
+
+raise:
 	raise_softirq(TIMER_SOFTIRQ);
 }
 
@@ -1995,6 +2064,15 @@ static void __init init_timer_cpus(void)
 {
 	int cpu;
 
+	for_each_possible_cpu(cpu) {
+		call_single_data_t *c;
+
+		c = per_cpu_ptr(&raise_timer_csd, cpu);
+		c->func = raise_timer_softirq;
+		c->info = NULL;
+		c->flags = 0;
+	}
+
 	for_each_possible_cpu(cpu)
 		init_timer_cpu(cpu);
 }
@@ -2002,6 +2080,7 @@ static void __init init_timer_cpus(void)
 void __init init_timers(void)
 {
 	init_timer_cpus();
+	posix_cputimers_init_work();
 	open_softirq(TIMER_SOFTIRQ, run_timer_softirq);
 }
 
@@ -2058,3 +2137,57 @@ void __sched usleep_range(unsigned long min, unsigned long max)
 	}
 }
 EXPORT_SYMBOL(usleep_range);
+
+static ssize_t store_ktimer_ll_check(struct kobject *kobj,
+				     struct kobj_attribute *attr,
+				     const char *buf, size_t count)
+{
+	unsigned int val;
+	ssize_t ret;
+
+	ret = kstrtouint(buf, 10, &val);
+	if (ret)
+		return ret;
+
+	if (val != 0 && val != 1)
+		return -EINVAL;
+
+	ktimer_ll_check = val;
+	return count;
+}
+
+static ssize_t show_ktimer_ll_check(struct kobject *kobj,
+				    struct kobj_attribute *attr,
+				    char *buf)
+{
+	ssize_t ret;
+
+	ret = sprintf(buf, "%d\n", ktimer_ll_check);
+
+	return ret;
+}
+
+static struct kobj_attribute ktimer_attr =
+	__ATTR(ktimer_lockless_check, 0644, show_ktimer_ll_check,
+	       store_ktimer_ll_check);
+
+static struct attribute *ktimer_attrs[] = {
+	&ktimer_attr.attr,
+	NULL,
+};
+
+static const struct attribute_group ktimer_attr_group = {
+	.attrs = ktimer_attrs,
+};
+
+static int __init ktimer_lockless_check_init(void)
+{
+	int error;
+
+	error = sysfs_create_group(kernel_kobj, &ktimer_attr_group);
+	if (error)
+		return error;
+	return 0;
+}
+postcore_initcall(ktimer_lockless_check_init);
+

@@ -1835,13 +1835,14 @@ static void __hrtimer_init_sleeper(struct hrtimer_sleeper *sl,
 	 * expiry.
 	 */
 	if (IS_ENABLED(CONFIG_PREEMPT_RT)) {
-		if (task_is_realtime(current) && !(mode & HRTIMER_MODE_SOFT))
-			mode |= HRTIMER_MODE_HARD;
+		if ((task_is_realtime(current) && !(mode & HRTIMER_MODE_SOFT)) || system_state != SYSTEM_RUNNING)
+			mode |= HRTIMER_MODE_PINNED_HARD;
 	}
 
 	__hrtimer_init(&sl->timer, clock_id, mode);
 	sl->timer.function = hrtimer_wakeup;
 	sl->task = current;
+	sl->mode = mode;
 }
 
 /**
@@ -1878,19 +1879,19 @@ int nanosleep_copyout(struct restart_block *restart, struct timespec64 *ts)
 	return -ERESTART_RESTARTBLOCK;
 }
 
-static int __sched do_nanosleep(struct hrtimer_sleeper *t, enum hrtimer_mode mode)
+static int __sched do_nanosleep(struct hrtimer_sleeper *t)
 {
 	struct restart_block *restart;
 
 	do {
 		set_current_state(TASK_INTERRUPTIBLE);
-		hrtimer_sleeper_start_expires(t, mode);
+		hrtimer_sleeper_start_expires(t, t->mode);
 
 		if (likely(t->task))
 			freezable_schedule();
 
 		hrtimer_cancel(&t->timer);
-		mode = HRTIMER_MODE_ABS;
+		t->mode = HRTIMER_MODE_ABS;
 
 	} while (t->task && !signal_pending(current));
 
@@ -1921,7 +1922,7 @@ static long __sched hrtimer_nanosleep_restart(struct restart_block *restart)
 	hrtimer_init_sleeper_on_stack(&t, restart->nanosleep.clockid,
 				      HRTIMER_MODE_ABS);
 	hrtimer_set_expires_tv64(&t.timer, restart->nanosleep.expires);
-	ret = do_nanosleep(&t, HRTIMER_MODE_ABS);
+	ret = do_nanosleep(&t);
 	destroy_hrtimer_on_stack(&t.timer);
 	return ret;
 }
@@ -1940,7 +1941,7 @@ long hrtimer_nanosleep(ktime_t rqtp, const enum hrtimer_mode mode,
 
 	hrtimer_init_sleeper_on_stack(&t, clockid, mode);
 	hrtimer_set_expires_range_ns(&t.timer, rqtp, slack);
-	ret = do_nanosleep(&t, mode);
+	ret = do_nanosleep(&t);
 	if (ret != -ERESTART_RESTARTBLOCK)
 		goto out;
 
@@ -1998,6 +1999,38 @@ COMPAT_SYSCALL_DEFINE2(nanosleep, struct compat_timespec __user *, rqtp,
 	return hrtimer_nanosleep(timespec64_to_ktime(tu), HRTIMER_MODE_REL,
 				 CLOCK_MONOTONIC);
 }
+#endif
+
+#ifdef CONFIG_PREEMPT_RT
+/*
+ * Sleep for 1 ms in hope whoever holds what we want will let it go.
+ */
+void cpu_chill(void)
+{
+	unsigned int freeze_flag = current->flags & PF_NOFREEZE;
+	struct task_struct *self = current;
+	ktime_t chill_time;
+
+	raw_spin_lock_irq(&self->pi_lock);
+	self->saved_state = self->state;
+	__set_current_state_no_track(TASK_UNINTERRUPTIBLE);
+	raw_spin_unlock_irq(&self->pi_lock);
+
+	chill_time = ktime_set(0, NSEC_PER_MSEC);
+
+	current->flags |= PF_NOFREEZE;
+	sleeping_lock_inc();
+	schedule_hrtimeout(&chill_time, HRTIMER_MODE_REL_HARD);
+	sleeping_lock_dec();
+	if (!freeze_flag)
+		current->flags &= ~PF_NOFREEZE;
+
+	raw_spin_lock_irq(&self->pi_lock);
+	__set_current_state_no_track(self->saved_state);
+	self->saved_state = TASK_RUNNING;
+	raw_spin_unlock_irq(&self->pi_lock);
+}
+EXPORT_SYMBOL(cpu_chill);
 #endif
 
 /*

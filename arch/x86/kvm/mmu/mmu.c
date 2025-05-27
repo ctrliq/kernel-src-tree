@@ -57,11 +57,13 @@
 
 extern bool itlb_multihit_kvm_mitigation;
 
-static int __read_mostly nx_huge_pages = -1;
 #ifdef CONFIG_PREEMPT_RT
+/* Using shattered 4K pages can cause TLB misses which can ruin latency */
+static int __read_mostly nx_huge_pages = 0;
 /* Recovery can cause latency spikes, disable it for PREEMPT_RT.  */
 static uint __read_mostly nx_huge_pages_recovery_ratio = 0;
 #else
+static int __read_mostly nx_huge_pages = -1;
 static uint __read_mostly nx_huge_pages_recovery_ratio = 60;
 #endif
 

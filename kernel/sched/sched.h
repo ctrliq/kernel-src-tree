@@ -1033,6 +1033,9 @@ struct rq {
 	RH_KABI_EXTEND(u64 clock_task ____cacheline_aligned)
 	RH_KABI_EXTEND(u64 clock_pelt)
 	RH_KABI_EXTEND(unsigned long lost_idle_time)
+#if defined(CONFIG_PREEMPT_RT) && defined(CONFIG_SMP)
+	int			nr_pinned;
+#endif
 };
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
@@ -1692,9 +1695,10 @@ static inline int task_on_rq_migrating(struct task_struct *p)
 #define WF_FORK     0x08 /* Wakeup after fork; maps to SD_BALANCE_FORK */
 #define WF_TTWU     0x10 /* Wakeup;            maps to SD_BALANCE_WAKE */
 
-#define WF_SYNC     0x02 /* Waker goes to sleep after wakeup */
-#define WF_MIGRATED 0x20 /* Internal use, task got migrated */
-#define WF_ON_CPU   0x40 /* Wakee is on_cpu */
+#define WF_SYNC     		0x02 /* Waker goes to sleep after wakeup */
+#define WF_MIGRATED 		0x20 /* Internal use, task got migrated */
+#define WF_ON_CPU   		0x40 /* Wakee is on_cpu */
+#define WF_LOCK_SLEEPER		0x80 /* Wakeup spinlock "sleeper" */
 
 #ifdef CONFIG_SMP
 static_assert(WF_EXEC == SD_BALANCE_EXEC);
@@ -1923,6 +1927,15 @@ extern void reweight_task(struct task_struct *p, int prio);
 
 extern void resched_curr(struct rq *rq);
 extern void resched_cpu(int cpu);
+
+#ifdef CONFIG_PREEMPT_LAZY
+extern void resched_curr_lazy(struct rq *rq);
+#else
+static inline void resched_curr_lazy(struct rq *rq)
+{
+	resched_curr(rq);
+}
+#endif
 
 extern struct rt_bandwidth def_rt_bandwidth;
 extern void init_rt_bandwidth(struct rt_bandwidth *rt_b, u64 period, u64 runtime);

@@ -3810,7 +3810,7 @@ static void bond_get_stats(struct net_device *bond_dev,
 	struct rtnl_link_stats64 temp;
 	struct list_head *iter;
 	struct slave *slave;
-	int nest_level = 0;
+	int __maybe_unused nest_level = 0;
 
 
 	rcu_read_lock();

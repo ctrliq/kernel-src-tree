@@ -77,31 +77,37 @@
 /* preempt_count() and related functions, depends on PREEMPT_NEED_RESCHED */
 #include <asm/preempt.h>
 
+#define nmi_count()	(preempt_count() & NMI_MASK)
 #define hardirq_count()	(preempt_count() & HARDIRQ_MASK)
-#define softirq_count()	(preempt_count() & SOFTIRQ_MASK)
-#define irq_count()	(preempt_count() & (HARDIRQ_MASK | SOFTIRQ_MASK \
-				 | NMI_MASK))
+#ifdef CONFIG_PREEMPT_RT
+# define softirq_count()	(current->softirq_disable_cnt & SOFTIRQ_MASK)
+#else
+# define softirq_count()	(preempt_count() & SOFTIRQ_MASK)
+#endif
+#define irq_count()	(nmi_count() | hardirq_count() | softirq_count())
 
 /*
- * Are we doing bottom half or hardware interrupt processing?
+ * Macros to retrieve the current execution context:
  *
- * in_irq()       - We're in (hard) IRQ context
+ * in_nmi()		- We're in NMI context
+ * in_hardirq()		- We're in hard IRQ context
+ * in_serving_softirq()	- We're in softirq context
+ * in_task()		- We're in task context
+ */
+#define in_nmi()		(nmi_count())
+#define in_hardirq()		(hardirq_count())
+#define in_serving_softirq()	(softirq_count() & SOFTIRQ_OFFSET)
+#define in_task()		(!(in_nmi() | in_hardirq() | in_serving_softirq()))
+
+/*
+ * The following macros are deprecated and should not be used in new code:
+ * in_irq()       - Obsolete version of in_hardirq()
  * in_softirq()   - We have BH disabled, or are processing softirqs
  * in_interrupt() - We're in NMI,IRQ,SoftIRQ context or have BH disabled
- * in_serving_softirq() - We're in softirq context
- * in_nmi()       - We're in NMI context
- * in_task()	  - We're in task context
- *
- * Note: due to the BH disabled confusion: in_softirq(),in_interrupt() really
- *       should not be used in new code.
  */
 #define in_irq()		(hardirq_count())
 #define in_softirq()		(softirq_count())
 #define in_interrupt()		(irq_count())
-#define in_serving_softirq()	(softirq_count() & SOFTIRQ_OFFSET)
-#define in_nmi()		(preempt_count() & NMI_MASK)
-#define in_task()		(!(preempt_count() & \
-				   (NMI_MASK | HARDIRQ_MASK | SOFTIRQ_OFFSET)))
 
 /*
  * The preempt_count offset after preempt_disable();
@@ -115,7 +121,11 @@
 /*
  * The preempt_count offset after spin_lock()
  */
+#if !defined(CONFIG_PREEMPT_RT)
 #define PREEMPT_LOCK_OFFSET	PREEMPT_DISABLE_OFFSET
+#else
+#define PREEMPT_LOCK_OFFSET	0
+#endif
 
 /*
  * The preempt_count offset needed for things like:
@@ -164,11 +174,31 @@ extern void preempt_count_sub(int val);
 #define preempt_count_inc() preempt_count_add(1)
 #define preempt_count_dec() preempt_count_sub(1)
 
+#ifdef CONFIG_PREEMPT_LAZY
+#define add_preempt_lazy_count(val)	do { preempt_lazy_count() += (val); } while (0)
+#define sub_preempt_lazy_count(val)	do { preempt_lazy_count() -= (val); } while (0)
+#define inc_preempt_lazy_count()	add_preempt_lazy_count(1)
+#define dec_preempt_lazy_count()	sub_preempt_lazy_count(1)
+#define preempt_lazy_count()		(current_thread_info()->preempt_lazy_count)
+#else
+#define add_preempt_lazy_count(val)	do { } while (0)
+#define sub_preempt_lazy_count(val)	do { } while (0)
+#define inc_preempt_lazy_count()	do { } while (0)
+#define dec_preempt_lazy_count()	do { } while (0)
+#define preempt_lazy_count()		(0)
+#endif
+
 #ifdef CONFIG_PREEMPT_COUNT
 
 #define preempt_disable() \
 do { \
 	preempt_count_inc(); \
+	barrier(); \
+} while (0)
+
+#define preempt_lazy_disable() \
+do { \
+	inc_preempt_lazy_count(); \
 	barrier(); \
 } while (0)
 
@@ -178,7 +208,13 @@ do { \
 	preempt_count_dec(); \
 } while (0)
 
-#define preempt_enable_no_resched() sched_preempt_enable_no_resched()
+#ifdef CONFIG_PREEMPT_RT
+# define preempt_enable_no_resched() sched_preempt_enable_no_resched()
+# define preempt_check_resched_rt() preempt_check_resched()
+#else
+# define preempt_enable_no_resched() preempt_enable()
+# define preempt_check_resched_rt() barrier();
+#endif
 
 #define preemptible()	(preempt_count() == 0 && !irqs_disabled())
 
@@ -203,11 +239,24 @@ do { \
 		__preempt_schedule(); \
 } while (0)
 
+#define preempt_lazy_enable() \
+do { \
+	dec_preempt_lazy_count(); \
+	barrier(); \
+	preempt_check_resched(); \
+} while (0)
+
 #else /* !CONFIG_PREEMPTION */
 #define preempt_enable() \
 do { \
 	barrier(); \
 	preempt_count_dec(); \
+} while (0)
+
+#define preempt_lazy_enable() \
+do { \
+	dec_preempt_lazy_count(); \
+	barrier(); \
 } while (0)
 
 #define preempt_enable_notrace() \
@@ -248,7 +297,11 @@ do { \
 #define preempt_disable_notrace()		barrier()
 #define preempt_enable_no_resched_notrace()	barrier()
 #define preempt_enable_notrace()		barrier()
+#define preempt_check_resched_rt()		barrier()
 #define preemptible()				0
+
+#define preempt_lazy_disable()			barrier()
+#define preempt_lazy_enable()			barrier()
 
 #endif /* CONFIG_PREEMPT_COUNT */
 
@@ -268,9 +321,21 @@ do { \
 } while (0)
 #define preempt_fold_need_resched() \
 do { \
-	if (tif_need_resched()) \
+	if (tif_need_resched_now()) \
 		set_preempt_need_resched(); \
 } while (0)
+
+#ifdef CONFIG_PREEMPT_RT
+# define preempt_disable_rt()		preempt_disable()
+# define preempt_enable_rt()		preempt_enable()
+# define preempt_disable_nort()		barrier()
+# define preempt_enable_nort()		barrier()
+#else
+# define preempt_disable_rt()		barrier()
+# define preempt_enable_rt()		barrier()
+# define preempt_disable_nort()		preempt_disable()
+# define preempt_enable_nort()		preempt_enable()
+#endif
 
 #ifdef CONFIG_PREEMPT_NOTIFIERS
 
@@ -322,6 +387,23 @@ static inline void preempt_notifier_init(struct preempt_notifier *notifier,
 
 #endif
 
+#if defined(CONFIG_SMP) && defined(CONFIG_PREEMPT_RT)
+
+extern void migrate_disable(void);
+extern void migrate_enable(void);
+
+int __migrate_disabled(struct task_struct *p);
+
+#elif !defined(CONFIG_SMP) && defined(CONFIG_PREEMPT_RT)
+
+extern void migrate_disable(void);
+extern void migrate_enable(void);
+static inline int __migrate_disabled(struct task_struct *p)
+{
+	return 0;
+}
+
+#else
 /**
  * migrate_disable - Prevent migration of the current task
  *
@@ -352,4 +434,9 @@ static __always_inline void migrate_enable(void)
 	preempt_enable();
 }
 
+static inline int __migrate_disabled(struct task_struct *p)
+{
+	return 0;
+}
+#endif
 #endif /* __LINUX_PREEMPT_H */

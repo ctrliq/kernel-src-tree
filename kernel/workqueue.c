@@ -2291,7 +2291,7 @@ __acquires(&pool->lock)
 	}
 
 	/*
-	 * The following prevents a kworker from hogging CPU on !PREEMPT
+	 * The following prevents a kworker from hogging CPU on !PREEMPTION
 	 * kernels, where a requeueing work item waiting for something to
 	 * happen could deadlock with stop_machine as such work item could
 	 * indefinitely requeue itself while all other CPUs are trapped in
@@ -4397,8 +4397,8 @@ void destroy_workqueue(struct workqueue_struct *wq)
 	for_each_pwq(pwq, wq) {
 		raw_spin_lock_irq(&pwq->pool->lock);
 		if (WARN_ON(pwq_busy(pwq))) {
-			pr_warn("%s: %s has the following busy pwq\n",
-				__func__, wq->name);
+			pr_warning("%s: %s has the following busy pwq (refcnt=%d)\n",
+				   __func__, wq->name, pwq->refcnt);
 			show_pwq(pwq);
 			raw_spin_unlock_irq(&pwq->pool->lock);
 			mutex_unlock(&wq->mutex);
