@@ -1,0 +1,128 @@
+kthread: Fix PF_KTHREAD vs to_kthread() race
+
+jira NONE_AUTOMATION
+Rebuild_History Non-Buildable kernel-rt-4.18.0-348.7.1.rt7.137.el8_5
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 3a7956e25e1d7b3c148569e78895e1f3178122a9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-rt-4.18.0-348.7.1.rt7.137.el8_5/3a7956e2.failed
+
+The kthread_is_per_cpu() construct relies on only being called on
+PF_KTHREAD tasks (per the WARN in to_kthread). This gives rise to the
+following usage pattern:
+
+	if ((p->flags & PF_KTHREAD) && kthread_is_per_cpu(p))
+
+However, as reported by syzcaller, this is broken. The scenario is:
+
+	CPU0				CPU1 (running p)
+
+	(p->flags & PF_KTHREAD) // true
+
+					begin_new_exec()
+					  me->flags &= ~(PF_KTHREAD|...);
+	kthread_is_per_cpu(p)
+	  to_kthread(p)
+	    WARN(!(p->flags & PF_KTHREAD) <-- *SPLAT*
+
+Introduce __to_kthread() that omits the WARN and is sure to check both
+values.
+
+Use this to remove the problematic pattern for kthread_is_per_cpu()
+and fix a number of other kthread_*() functions that have similar
+issues but are currently not used in ways that would expose the
+problem.
+
+Notably kthread_func() is only ever called on 'current', while
+kthread_probe_data() is only used for PF_WQ_WORKER, which implies the
+task is from kthread_create*().
+
+Fixes: ac687e6e8c26 ("kthread: Extract KTHREAD_IS_PER_CPU")
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Valentin Schneider <Valentin.Schneider@arm.com>
+Link: https://lkml.kernel.org/r/YH6WJc825C4P0FCK@hirez.programming.kicks-ass.net
+(cherry picked from commit 3a7956e25e1d7b3c148569e78895e1f3178122a9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/kthread.c
+#	kernel/sched/core.c
+diff --cc kernel/kthread.c
+index cbdf9f49ad09,6d3c488a0f82..000000000000
+--- a/kernel/kthread.c
++++ b/kernel/kthread.c
+@@@ -225,10 -219,11 +245,15 @@@ EXPORT_SYMBOL_GPL(kthread_data)
+   */
+  void *kthread_probe_data(struct task_struct *task)
+  {
+- 	struct kthread *kthread = to_kthread(task);
++ 	struct kthread *kthread = __to_kthread(task);
+  	void *data = NULL;
+  
+++<<<<<<< HEAD
+ +	probe_kernel_read(&data, &kthread->data, sizeof(data));
+++=======
++ 	if (kthread)
++ 		copy_from_kernel_nofault(&data, &kthread->data, sizeof(data));
+++>>>>>>> 3a7956e25e1d (kthread: Fix PF_KTHREAD vs to_kthread() race)
+  	return data;
+  }
+  
+diff --cc kernel/sched/core.c
+index 6068e0ed9d1c,4a0668acd876..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -6421,9 -7656,39 +6421,33 @@@ static void balance_push(struct rq *rq
+  	/*
+  	 * Both the cpu-hotplug and stop task are in this case and are
+  	 * required to complete the hotplug process.
+ -	 *
+ -	 * XXX: the idle task does not match kthread_is_per_cpu() due to
+ -	 * histerical raisins.
+  	 */
+++<<<<<<< HEAD
+ +	if (is_per_cpu_kthread(push_task))
+++=======
++ 	if (rq->idle == push_task ||
++ 	    kthread_is_per_cpu(push_task) ||
++ 	    is_migration_disabled(push_task)) {
++ 
++ 		/*
++ 		 * If this is the idle task on the outgoing CPU try to wake
++ 		 * up the hotplug control thread which might wait for the
++ 		 * last task to vanish. The rcuwait_active() check is
++ 		 * accurate here because the waiter is pinned on this CPU
++ 		 * and can't obviously be running in parallel.
++ 		 *
++ 		 * On RT kernels this also has to check whether there are
++ 		 * pinned and scheduled out tasks on the runqueue. They
++ 		 * need to leave the migrate disabled section first.
++ 		 */
++ 		if (!rq->nr_running && !rq_has_pinned_tasks(rq) &&
++ 		    rcuwait_active(&rq->hotplug_wait)) {
++ 			raw_spin_unlock(&rq->lock);
++ 			rcuwait_wake_up(&rq->hotplug_wait);
++ 			raw_spin_lock(&rq->lock);
++ 		}
+++>>>>>>> 3a7956e25e1d (kthread: Fix PF_KTHREAD vs to_kthread() race)
+  		return;
+ -	}
+  
+  	get_task_struct(push_task);
+  	/*
+* Unmerged path kernel/kthread.c
+* Unmerged path kernel/sched/core.c
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 78ffcae6645c..79389fd8a8a3 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -7461,7 +7461,7 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
+ 		return 0;
+ 
+ 	/* Disregard pcpu kthreads; they are where they need to be. */
+-	if ((p->flags & PF_KTHREAD) && kthread_is_per_cpu(p))
++	if (kthread_is_per_cpu(p))
+ 		return 0;
+ 
+ 	if (!cpumask_test_cpu(env->dst_cpu, p->cpus_ptr)) {
