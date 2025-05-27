@@ -1,0 +1,178 @@
+x86/mce: Recover from poison found while copying from user space
+
+jira NONE_AUTOMATION
+Rebuild_History Non-Buildable kernel-rt-4.18.0-348.12.2.rt7.143.el8_5
+commit-author Tony Luck <tony.luck@intel.com>
+commit c0ab7ffce275d3f83bd253c70889c28821d4a41d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-rt-4.18.0-348.12.2.rt7.143.el8_5/c0ab7ffc.failed
+
+Existing kernel code can only recover from a machine check on code that
+is tagged in the exception table with a fault handling recovery path.
+
+Add two new fields in the task structure to pass information from
+machine check handler to the "task_work" that is queued to run before
+the task returns to user mode:
+
++ mce_vaddr: will be initialized to the user virtual address of the fault
+  in the case where the fault occurred in the kernel copying data from
+  a user address.  This is so that kill_me_maybe() can provide that
+  information to the user SIGBUS handler.
+
++ mce_kflags: copy of the struct mce.kflags needed by kill_me_maybe()
+  to determine if mce_vaddr is applicable to this error.
+
+Add code to recover from a machine check while copying data from user
+space to the kernel. Action for this case is the same as if the user
+touched the poison directly; unmap the page and send a SIGBUS to the task.
+
+Use a new helper function to share common code between the "fault
+in user mode" case and the "fault while copying from user" case.
+
+New code paths will be activated by the next patch which sets
+MCE_IN_KERNEL_COPYIN.
+
+	Suggested-by: Borislav Petkov <bp@alien8.de>
+	Signed-off-by: Tony Luck <tony.luck@intel.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20201006210910.21062-6-tony.luck@intel.com
+(cherry picked from commit c0ab7ffce275d3f83bd253c70889c28821d4a41d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/mce/core.c
+#	include/linux/sched.h
+diff --cc arch/x86/kernel/cpu/mce/core.c
+index 88eb3cb77d26,5c423c4bab68..000000000000
+--- a/arch/x86/kernel/cpu/mce/core.c
++++ b/arch/x86/kernel/cpu/mce/core.c
+@@@ -1203,6 -1235,46 +1203,49 @@@ static void __mc_scan_banks(struct mce 
+  	*m = *final;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void kill_me_now(struct callback_head *ch)
++ {
++ 	force_sig(SIGBUS);
++ }
++ 
++ static void kill_me_maybe(struct callback_head *cb)
++ {
++ 	struct task_struct *p = container_of(cb, struct task_struct, mce_kill_me);
++ 	int flags = MF_ACTION_REQUIRED;
++ 
++ 	pr_err("Uncorrected hardware memory error in user-access at %llx", p->mce_addr);
++ 
++ 	if (!p->mce_ripv)
++ 		flags |= MF_MUST_KILL;
++ 
++ 	if (!memory_failure(p->mce_addr >> PAGE_SHIFT, flags)) {
++ 		set_mce_nospec(p->mce_addr >> PAGE_SHIFT, p->mce_whole_page);
++ 		sync_core();
++ 		return;
++ 	}
++ 
++ 	pr_err("Memory error not recovered");
++ 	kill_me_now(cb);
++ }
++ 
++ static void queue_task_work(struct mce *m, int kill_it)
++ {
++ 	current->mce_addr = m->addr;
++ 	current->mce_kflags = m->kflags;
++ 	current->mce_ripv = !!(m->mcgstatus & MCG_STATUS_RIPV);
++ 	current->mce_whole_page = whole_page(m);
++ 
++ 	if (kill_it)
++ 		current->mce_kill_me.func = kill_me_now;
++ 	else
++ 		current->mce_kill_me.func = kill_me_maybe;
++ 
++ 	task_work_add(current, &current->mce_kill_me, true);
++ }
++ 
+++>>>>>>> c0ab7ffce275 (x86/mce: Recover from poison found while copying from user space)
+  /*
+   * The actual machine check handler. This only handles real
+   * exceptions when something got corrupted coming in through int 18.
+@@@ -1345,23 -1415,29 +1388,45 @@@ void do_machine_check(struct pt_regs *r
+  	if ((m.cs & 3) == 3) {
+  		/* If this triggers there is no way to recover. Die hard. */
+  		BUG_ON(!on_thread_stack() || !user_mode(regs));
+ +		local_irq_enable();
+ +		preempt_enable();
+  
+++<<<<<<< HEAD
+ +		current->task_struct_rh->mce_ripv = !!(m.mcgstatus & MCG_STATUS_RIPV);
+ +		current->task_struct_rh->mce_whole_page = whole_page(&m);
+ +
+ +		if (kill_it || do_memory_failure(&m))
+ +			force_sig(SIGBUS, current);
+ +		preempt_disable();
+ +		local_irq_disable();
+ +	} else {
+ +		if (!fixup_exception(regs, X86_TRAP_MC))
+ +			mce_panic("Failed kernel mode recovery", &m, NULL);
+++=======
++ 		queue_task_work(&m, kill_it);
++ 
++ 	} else {
++ 		/*
++ 		 * Handle an MCE which has happened in kernel space but from
++ 		 * which the kernel can recover: ex_has_fault_handler() has
++ 		 * already verified that the rIP at which the error happened is
++ 		 * a rIP from which the kernel can recover (by jumping to
++ 		 * recovery code specified in _ASM_EXTABLE_FAULT()) and the
++ 		 * corresponding exception handler which would do that is the
++ 		 * proper one.
++ 		 */
++ 		if (m.kflags & MCE_IN_KERNEL_RECOV) {
++ 			if (!fixup_exception(regs, X86_TRAP_MC, 0, 0))
++ 				mce_panic("Failed kernel mode recovery", &m, msg);
++ 		}
++ 
++ 		if (m.kflags & MCE_IN_KERNEL_COPYIN)
++ 			queue_task_work(&m, kill_it);
+++>>>>>>> c0ab7ffce275 (x86/mce: Recover from poison found while copying from user space)
+  	}
+ -out:
+ -	mce_wrmsrl(MSR_IA32_MCG_STATUS, 0);
+ +
+ +out_ist:
+ +	nmi_exit();
+  }
+  EXPORT_SYMBOL_GPL(do_machine_check);
+  
+diff --cc include/linux/sched.h
+index 15101f992863,2cbba3e2b150..000000000000
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@@ -1331,6 -1302,21 +1331,24 @@@ struct task_struct 
+  	void				*security;
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_GCC_PLUGIN_STACKLEAK
++ 	unsigned long			lowest_stack;
++ 	unsigned long			prev_lowest_stack;
++ #endif
++ 
++ #ifdef CONFIG_X86_MCE
++ 	void __user			*mce_vaddr;
++ 	__u64				mce_kflags;
++ 	u64				mce_addr;
++ 	__u64				mce_ripv : 1,
++ 					mce_whole_page : 1,
++ 					__mce_reserved : 62;
++ 	struct callback_head		mce_kill_me;
++ #endif
++ 
+++>>>>>>> c0ab7ffce275 (x86/mce: Recover from poison found while copying from user space)
+  	/*
+  	 * New fields for task_struct should be added above here, so that
+  	 * they are included in the randomized portion of task_struct.
+* Unmerged path arch/x86/kernel/cpu/mce/core.c
+* Unmerged path include/linux/sched.h
