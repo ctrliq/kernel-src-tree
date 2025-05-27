@@ -1,0 +1,154 @@
+hugetlbfs: fix potential over/underflow setting node specific nr_hugepages
+
+jira NONE_AUTOMATION
+Rebuild_History Non-Buildable kernel-rt-4.18.0-348.20.1.rt7.150.el8_5
+commit-author Mike Kravetz <mike.kravetz@oracle.com>
+commit fd875dca7c71744cbb0ebbcde7d45e5ee05b7637
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-rt-4.18.0-348.20.1.rt7.150.el8_5/fd875dca.failed
+
+The number of node specific huge pages can be set via a file such as:
+/sys/devices/system/node/node1/hugepages/hugepages-2048kB/nr_hugepages
+When a node specific value is specified, the global number of huge pages
+must also be adjusted.  This adjustment is calculated as the specified
+node specific value + (global value - current node value).  If the node
+specific value provided by the user is large enough, this calculation
+could overflow an unsigned long leading to a smaller than expected number
+of huge pages.
+
+To fix, check the calculation for overflow.  If overflow is detected, use
+ULONG_MAX as the requested value.  This is inline with the user request to
+allocate as many huge pages as possible.
+
+It was also noticed that the above calculation was done outside the
+hugetlb_lock.  Therefore, the values could be inconsistent and result in
+underflow.  To fix, the calculation is moved within the routine
+set_max_huge_pages() where the lock is held.
+
+In addition, the code in __nr_hugepages_store_common() which tries to
+handle the case of not being able to allocate a node mask would likely
+result in incorrect behavior.  Luckily, it is very unlikely we will ever
+take this path.  If we do, simply return ENOMEM.
+
+Link: http://lkml.kernel.org/r/20190328220533.19884-1-mike.kravetz@oracle.com
+	Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
+	Reported-by: Jing Xiangfeng <jingxiangfeng@huawei.com>
+	Reviewed-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Reviewed-by: Oscar Salvador <osalvador@suse.de>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Alex Ghiti <alex@ghiti.fr>
+	Cc: Jing Xiangfeng <jingxiangfeng@huawei.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit fd875dca7c71744cbb0ebbcde7d45e5ee05b7637)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hugetlb.c
+diff --cc mm/hugetlb.c
+index f0e3d20fabc2,a81f2a8556c8..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -2394,25 -2288,46 +2394,58 @@@ found
+  }
+  
+  #define persistent_huge_pages(h) (h->nr_huge_pages - h->surplus_huge_pages)
+++<<<<<<< HEAD
+ +static unsigned long set_max_huge_pages(struct hstate *h, unsigned long count,
+ +						nodemask_t *nodes_allowed)
+++=======
++ static int set_max_huge_pages(struct hstate *h, unsigned long count, int nid,
++ 			      nodemask_t *nodes_allowed)
+++>>>>>>> fd875dca7c71 (hugetlbfs: fix potential over/underflow setting node specific nr_hugepages)
+  {
+  	unsigned long min_count, ret;
+ -
+ -	spin_lock(&hugetlb_lock);
+ +	NODEMASK_ALLOC(nodemask_t, node_alloc_noretry, GFP_KERNEL);
+  
+  	/*
+++<<<<<<< HEAD
+ +	 * Bit mask controlling how hard we retry per-node allocations.
+ +	 * If we can not allocate the bit mask, do not attempt to allocate
+ +	 * the requested huge pages.
+++=======
++ 	 * Check for a node specific request.
++ 	 * Changing node specific huge page count may require a corresponding
++ 	 * change to the global count.  In any case, the passed node mask
++ 	 * (nodes_allowed) will restrict alloc/free to the specified node.
++ 	 */
++ 	if (nid != NUMA_NO_NODE) {
++ 		unsigned long old_count = count;
++ 
++ 		count += h->nr_huge_pages - h->nr_huge_pages_node[nid];
++ 		/*
++ 		 * User may have specified a large count value which caused the
++ 		 * above calculation to overflow.  In this case, they wanted
++ 		 * to allocate as many huge pages as possible.  Set count to
++ 		 * largest possible value to align with their intention.
++ 		 */
++ 		if (count < old_count)
++ 			count = ULONG_MAX;
++ 	}
++ 
++ 	/*
++ 	 * Gigantic pages runtime allocation depend on the capability for large
++ 	 * page range allocation.
++ 	 * If the system does not provide this feature, return an error when
++ 	 * the user tries to allocate gigantic pages but let the user free the
++ 	 * boottime allocated gigantic pages.
+++>>>>>>> fd875dca7c71 (hugetlbfs: fix potential over/underflow setting node specific nr_hugepages)
+  	 */
+ -	if (hstate_is_gigantic(h) && !IS_ENABLED(CONFIG_CONTIG_ALLOC)) {
+ -		if (count > persistent_huge_pages(h)) {
+ -			spin_unlock(&hugetlb_lock);
+ -			return -EINVAL;
+ -		}
+ -		/* Fall through to decrease pool */
+ +	if (node_alloc_noretry)
+ +		nodes_clear(*node_alloc_noretry);
+ +	else
+ +		return -ENOMEM;
+ +
+ +	if (hstate_is_gigantic(h) && !gigantic_page_supported()) {
+ +		NODEMASK_FREE(node_alloc_noretry);
+ +		return h->max_huge_pages;
+  	}
+  
+  	/*
+@@@ -2553,16 -2466,24 +2586,27 @@@ static ssize_t __nr_hugepages_store_com
+  		}
+  	} else if (nodes_allowed) {
+  		/*
+- 		 * per node hstate attribute: adjust count to global,
+- 		 * but restrict alloc/free to the specified node.
++ 		 * Node specific request.  count adjustment happens in
++ 		 * set_max_huge_pages() after acquiring hugetlb_lock.
+  		 */
+- 		count += h->nr_huge_pages - h->nr_huge_pages_node[nid];
+  		init_nodemask_of_node(nodes_allowed, nid);
+- 	} else
+- 		nodes_allowed = &node_states[N_MEMORY];
++ 	} else {
++ 		/*
++ 		 * Node specific request, but we could not allocate the few
++ 		 * words required for a node mask.  We are unlikely to hit
++ 		 * this condition.  Since we can not pass down the appropriate
++ 		 * node mask, just return ENOMEM.
++ 		 */
++ 		err = -ENOMEM;
++ 		goto out;
++ 	}
+  
+++<<<<<<< HEAD
+ +	h->max_huge_pages = set_max_huge_pages(h, count, nodes_allowed);
+++=======
++ 	err = set_max_huge_pages(h, count, nid, nodes_allowed);
+++>>>>>>> fd875dca7c71 (hugetlbfs: fix potential over/underflow setting node specific nr_hugepages)
+  
+ -out:
+  	if (nodes_allowed != &node_states[N_MEMORY])
+  		NODEMASK_FREE(nodes_allowed);
+  
+* Unmerged path mm/hugetlb.c
