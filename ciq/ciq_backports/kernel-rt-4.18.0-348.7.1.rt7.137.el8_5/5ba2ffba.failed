@@ -1,0 +1,136 @@
+sched: Fix CPU hotplug / tighten is_per_cpu_kthread()
+
+jira NONE_AUTOMATION
+Rebuild_History Non-Buildable kernel-rt-4.18.0-348.7.1.rt7.137.el8_5
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 5ba2ffba13a1e24e7b153683e97300f9cc6f605a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-rt-4.18.0-348.7.1.rt7.137.el8_5/5ba2ffba.failed
+
+Prior to commit 1cf12e08bc4d ("sched/hotplug: Consolidate task
+migration on CPU unplug") we'd leave any task on the dying CPU and
+break affinity and force them off at the very end.
+
+This scheme had to change in order to enable migrate_disable(). One
+cannot wait for migrate_disable() to complete while stuck in
+stop_machine(). Furthermore, since we need at the very least: idle,
+hotplug and stop threads at any point before stop_machine, we can't
+break affinity and/or push those away.
+
+Under the assumption that all per-cpu kthreads are sanely handled by
+CPU hotplug, the new code no long breaks affinity or migrates any of
+them (which then includes the critical ones above).
+
+However, there's an important difference between per-cpu kthreads and
+kthreads that happen to have a single CPU affinity which is lost. The
+latter class very much relies on the forced affinity breaking and
+migration semantics previously provided.
+
+Use the new kthread_is_per_cpu() infrastructure to tighten
+is_per_cpu_kthread() and fix the hot-unplug problems stemming from the
+change.
+
+Fixes: 1cf12e08bc4d ("sched/hotplug: Consolidate task migration on CPU unplug")
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Valentin Schneider <valentin.schneider@arm.com>
+	Tested-by: Valentin Schneider <valentin.schneider@arm.com>
+Link: https://lkml.kernel.org/r/20210121103507.102416009@infradead.org
+(cherry picked from commit 5ba2ffba13a1e24e7b153683e97300f9cc6f605a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/core.c
+diff --cc kernel/sched/core.c
+index 82971ea56d64,56b09628692a..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -1100,10 -1800,24 +1101,28 @@@ static inline bool is_cpu_allowed(struc
+  	if (!cpumask_test_cpu(cpu, p->cpus_ptr))
+  		return false;
+  
+++<<<<<<< HEAD
+ +	if (is_per_cpu_kthread(p) || __migrate_disabled(p))
+++=======
++ 	/* migrate_disabled() must be allowed to finish. */
++ 	if (is_migration_disabled(p))
+++>>>>>>> 5ba2ffba13a1 (sched: Fix CPU hotplug / tighten is_per_cpu_kthread())
+  		return cpu_online(cpu);
+  
+- 	return cpu_active(cpu);
++ 	/* Non kernel threads are not allowed during either online or offline. */
++ 	if (!(p->flags & PF_KTHREAD))
++ 		return cpu_active(cpu);
++ 
++ 	/* KTHREAD_IS_PER_CPU is always allowed. */
++ 	if (kthread_is_per_cpu(p))
++ 		return cpu_online(cpu);
++ 
++ 	/* Regular kernel threads don't get to stay during offline. */
++ 	if (cpu_rq(cpu)->balance_push)
++ 		return false;
++ 
++ 	/* But are allowed during online. */
++ 	return cpu_online(cpu);
+  }
+  
+  /*
+@@@ -6421,9 -7298,33 +6447,36 @@@ static void balance_push(struct rq *rq
+  	/*
+  	 * Both the cpu-hotplug and stop task are in this case and are
+  	 * required to complete the hotplug process.
++ 	 *
++ 	 * XXX: the idle task does not match kthread_is_per_cpu() due to
++ 	 * histerical raisins.
+  	 */
+++<<<<<<< HEAD
+ +	if (is_per_cpu_kthread(push_task))
+++=======
++ 	if (rq->idle == push_task ||
++ 	    ((push_task->flags & PF_KTHREAD) && kthread_is_per_cpu(push_task)) ||
++ 	    is_migration_disabled(push_task)) {
++ 
++ 		/*
++ 		 * If this is the idle task on the outgoing CPU try to wake
++ 		 * up the hotplug control thread which might wait for the
++ 		 * last task to vanish. The rcuwait_active() check is
++ 		 * accurate here because the waiter is pinned on this CPU
++ 		 * and can't obviously be running in parallel.
++ 		 *
++ 		 * On RT kernels this also has to check whether there are
++ 		 * pinned and scheduled out tasks on the runqueue. They
++ 		 * need to leave the migrate disabled section first.
++ 		 */
++ 		if (!rq->nr_running && !rq_has_pinned_tasks(rq) &&
++ 		    rcuwait_active(&rq->hotplug_wait)) {
++ 			raw_spin_unlock(&rq->lock);
++ 			rcuwait_wake_up(&rq->hotplug_wait);
++ 			raw_spin_lock(&rq->lock);
++ 		}
+++>>>>>>> 5ba2ffba13a1 (sched: Fix CPU hotplug / tighten is_per_cpu_kthread())
+  		return;
+ -	}
+  
+  	get_task_struct(push_task);
+  	/*
+@@@ -6595,11 -7516,18 +6648,14 @@@ int sched_cpu_deactivate(unsigned int c
+  	int ret;
+  
+  	set_cpu_active(cpu, false);
+ -	balance_push_set(cpu, true);
+ -
+  	/*
+ -	 * We've cleared cpu_active_mask / set balance_push, wait for all
+ -	 * preempt-disabled and RCU users of this state to go away such that
+ -	 * all new such users will observe it.
+ +	 * We've cleared cpu_active_mask, wait for all preempt-disabled and RCU
+ +	 * users of this state to go away such that all new such users will
+ +	 * observe it.
+  	 *
++ 	 * Specifically, we rely on ttwu to no longer target this CPU, see
++ 	 * ttwu_queue_cond() and is_cpu_allowed().
++ 	 *
+  	 * Do sync before park smpboot threads to take care the rcu boost case.
+  	 */
+  	synchronize_rcu();
+* Unmerged path kernel/sched/core.c
