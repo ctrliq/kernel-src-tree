@@ -1,0 +1,225 @@
+selftests: netfilter: add nfqueue TCP_NEW_SYN_RECV socket race test
+
+jira NONE_AUTOMATION
+Rebuild_History Non-Buildable kernel-rt-4.18.0-348.23.1.rt7.153.el8_5
+commit-author Florian Westphal <fw@strlen.de>
+commit 2e78855d311c401083df9776aa450d32d716e83e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-rt-4.18.0-348.23.1.rt7.153.el8_5/2e78855d.failed
+
+causes:
+BUG: KASAN: slab-out-of-bounds in sk_free+0x25/0x80
+Write of size 4 at addr ffff888106df0284 by task nf-queue/1459
+ sk_free+0x25/0x80
+ nf_queue_entry_release_refs+0x143/0x1a0
+ nf_reinject+0x233/0x770
+
+... without 'netfilter: nf_queue: don't assume sk is full socket'.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+(cherry picked from commit 2e78855d311c401083df9776aa450d32d716e83e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/netfilter/.gitignore
+* Unmerged path tools/testing/selftests/netfilter/.gitignore
+* Unmerged path tools/testing/selftests/netfilter/.gitignore
+diff --git a/tools/testing/selftests/netfilter/Makefile b/tools/testing/selftests/netfilter/Makefile
+index 0e08196e44f4..184e18ebb296 100644
+--- a/tools/testing/selftests/netfilter/Makefile
++++ b/tools/testing/selftests/netfilter/Makefile
+@@ -7,6 +7,6 @@ TEST_PROGS := nft_trans_stress.sh nft_nat.sh \
+ 	conntrack_tcp_unreplied.sh
+ 
+ LDLIBS = -lmnl
+-TEST_GEN_FILES =  nf-queue
++TEST_GEN_FILES =  nf-queue connect_close
+ 
+ include ../lib.mk
+diff --git a/tools/testing/selftests/netfilter/connect_close.c b/tools/testing/selftests/netfilter/connect_close.c
+new file mode 100644
+index 000000000000..1c3b0add54c4
+--- /dev/null
++++ b/tools/testing/selftests/netfilter/connect_close.c
+@@ -0,0 +1,136 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <fcntl.h>
++#include <string.h>
++#include <unistd.h>
++#include <signal.h>
++
++#include <arpa/inet.h>
++#include <sys/socket.h>
++
++#define PORT 12345
++#define RUNTIME 10
++
++static struct {
++	unsigned int timeout;
++	unsigned int port;
++} opts = {
++	.timeout = RUNTIME,
++	.port = PORT,
++};
++
++static void handler(int sig)
++{
++	_exit(sig == SIGALRM ? 0 : 1);
++}
++
++static void set_timeout(void)
++{
++	struct sigaction action = {
++		.sa_handler = handler,
++	};
++
++	sigaction(SIGALRM, &action, NULL);
++
++	alarm(opts.timeout);
++}
++
++static void do_connect(const struct sockaddr_in *dst)
++{
++	int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
++
++	if (s >= 0)
++		fcntl(s, F_SETFL, O_NONBLOCK);
++
++	connect(s, (struct sockaddr *)dst, sizeof(*dst));
++	close(s);
++}
++
++static void do_accept(const struct sockaddr_in *src)
++{
++	int c, one = 1, s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
++
++	if (s < 0)
++		return;
++
++	setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
++	setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
++
++	bind(s, (struct sockaddr *)src, sizeof(*src));
++
++	listen(s, 16);
++
++	c = accept(s, NULL, NULL);
++	if (c >= 0)
++		close(c);
++
++	close(s);
++}
++
++static int accept_loop(void)
++{
++	struct sockaddr_in src = {
++		.sin_family = AF_INET,
++		.sin_port = htons(opts.port),
++	};
++
++	inet_pton(AF_INET, "127.0.0.1", &src.sin_addr);
++
++	set_timeout();
++
++	for (;;)
++		do_accept(&src);
++
++	return 1;
++}
++
++static int connect_loop(void)
++{
++	struct sockaddr_in dst = {
++		.sin_family = AF_INET,
++		.sin_port = htons(opts.port),
++	};
++
++	inet_pton(AF_INET, "127.0.0.1", &dst.sin_addr);
++
++	set_timeout();
++
++	for (;;)
++		do_connect(&dst);
++
++	return 1;
++}
++
++static void parse_opts(int argc, char **argv)
++{
++	int c;
++
++	while ((c = getopt(argc, argv, "t:p:")) != -1) {
++		switch (c) {
++		case 't':
++			opts.timeout = atoi(optarg);
++			break;
++		case 'p':
++			opts.port = atoi(optarg);
++			break;
++		}
++	}
++}
++
++int main(int argc, char *argv[])
++{
++	pid_t p;
++
++	parse_opts(argc, argv);
++
++	p = fork();
++	if (p < 0)
++		return 111;
++
++	if (p > 0)
++		return accept_loop();
++
++	return connect_loop();
++}
+diff --git a/tools/testing/selftests/netfilter/nft_queue.sh b/tools/testing/selftests/netfilter/nft_queue.sh
+index 3d202b90b33d..e5c6a0c9a024 100755
+--- a/tools/testing/selftests/netfilter/nft_queue.sh
++++ b/tools/testing/selftests/netfilter/nft_queue.sh
+@@ -109,6 +109,7 @@ table inet $name {
+ 	chain output {
+ 		type filter hook output priority $prio; policy accept;
+ 		tcp dport 12345 queue num 3
++		tcp sport 23456 queue num 3
+ 		jump nfq
+ 	}
+ 	chain post {
+@@ -292,6 +293,23 @@ test_tcp_localhost()
+ 	wait 2>/dev/null
+ }
+ 
++test_tcp_localhost_connectclose()
++{
++	tmpfile=$(mktemp) || exit 1
++
++	ip netns exec ${nsrouter} ./connect_close -p 23456 -t $timeout &
++
++	ip netns exec ${nsrouter} ./nf-queue -q 3 -t $timeout &
++	local nfqpid=$!
++
++	sleep 1
++	rm -f "$tmpfile"
++
++	wait $rpid
++	[ $? -eq 0 ] && echo "PASS: tcp via loopback with connect/close"
++	wait 2>/dev/null
++}
++
+ test_tcp_localhost_requeue()
+ {
+ ip netns exec ${nsrouter} nft -f /dev/stdin <<EOF
+@@ -371,6 +389,7 @@ test_queue 20
+ 
+ test_tcp_forward
+ test_tcp_localhost
++test_tcp_localhost_connectclose
+ test_tcp_localhost_requeue
+ 
+ exit $ret
