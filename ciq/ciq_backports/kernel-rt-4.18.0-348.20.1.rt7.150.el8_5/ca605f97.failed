@@ -1,0 +1,157 @@
+crypto: qat - power up 4xxx device
+
+jira NONE_AUTOMATION
+Rebuild_History Non-Buildable kernel-rt-4.18.0-348.20.1.rt7.150.el8_5
+commit-author Giovanni Cabiddu <giovanni.cabiddu@intel.com>
+commit ca605f97dae4bf070b7c584aec23c1c922e4d823
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-rt-4.18.0-348.20.1.rt7.150.el8_5/ca605f97.failed
+
+After reset or boot, QAT 4xxx devices are inactive and require to be
+explicitly activated.
+This is done by writing the DRV_ACTIVE bit in the PM_INTERRUPT register
+and polling the PM_INIT_STATE to make sure that the transaction has
+completed properly.
+
+If this is not done, the driver will fail the initialization sequence
+reporting the following message:
+    [   22.081193] 4xxx 0000:f7:00.0: enabling device (0140 -> 0142)
+    [   22.720285] QAT: AE0 is inactive!!
+    [   22.720287] QAT: failed to get device out of reset
+    [   22.720288] 4xxx 0000:f7:00.0: qat_hal_clr_reset error
+    [   22.720290] 4xxx 0000:f7:00.0: Failed to init the AEs
+    [   22.720290] 4xxx 0000:f7:00.0: Failed to initialise Acceleration Engine
+    [   22.720789] 4xxx 0000:f7:00.0: Resetting device qat_dev0
+    [   22.825099] 4xxx: probe of 0000:f7:00.0 failed with error -14
+
+The patch also temporarily disables the power management source of
+interrupt, to avoid possible spurious interrupts as the power management
+feature is not fully supported.
+
+The device init function has been added to adf_dev_init(), and not in the
+probe of 4xxx to make sure that the device is re-enabled in case of
+reset.
+
+Note that the error code reported by hw_data->init_device() in
+adf_dev_init() has been shadowed for consistency with the other calls
+in the same function.
+
+Fixes: 8c8268166e83 ("crypto: qat - add qat_4xxx driver")
+	Signed-off-by: Giovanni Cabiddu <giovanni.cabiddu@intel.com>
+	Reviewed-by: Wojciech Ziemba <wojciech.ziemba@intel.com>
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit ca605f97dae4bf070b7c584aec23c1c922e4d823)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/crypto/qat/qat_4xxx/adf_4xxx_hw_data.c
+diff --cc drivers/crypto/qat/qat_4xxx/adf_4xxx_hw_data.c
+index 3524ddd48930,88c0ded411f1..000000000000
+--- a/drivers/crypto/qat/qat_4xxx/adf_4xxx_hw_data.c
++++ b/drivers/crypto/qat/qat_4xxx/adf_4xxx_hw_data.c
+@@@ -161,7 -162,36 +162,40 @@@ static void adf_enable_ints(struct adf_
+  	ADF_CSR_WR(addr, ADF_4XXX_SMIAPF_MASK_OFFSET, 0);
+  }
+  
+++<<<<<<< HEAD
+ +static int adf_pf_enable_vf2pf_comms(struct adf_accel_dev *accel_dev)
+++=======
++ static int adf_init_device(struct adf_accel_dev *accel_dev)
++ {
++ 	void __iomem *addr;
++ 	u32 status;
++ 	u32 csr;
++ 	int ret;
++ 
++ 	addr = (&GET_BARS(accel_dev)[ADF_4XXX_PMISC_BAR])->virt_addr;
++ 
++ 	/* Temporarily mask PM interrupt */
++ 	csr = ADF_CSR_RD(addr, ADF_4XXX_ERRMSK2);
++ 	csr |= ADF_4XXX_PM_SOU;
++ 	ADF_CSR_WR(addr, ADF_4XXX_ERRMSK2, csr);
++ 
++ 	/* Set DRV_ACTIVE bit to power up the device */
++ 	ADF_CSR_WR(addr, ADF_4XXX_PM_INTERRUPT, ADF_4XXX_PM_DRV_ACTIVE);
++ 
++ 	/* Poll status register to make sure the device is powered up */
++ 	ret = read_poll_timeout(ADF_CSR_RD, status,
++ 				status & ADF_4XXX_PM_INIT_STATE,
++ 				ADF_4XXX_PM_POLL_DELAY_US,
++ 				ADF_4XXX_PM_POLL_TIMEOUT_US, true, addr,
++ 				ADF_4XXX_PM_STATUS);
++ 	if (ret)
++ 		dev_err(&GET_DEV(accel_dev), "Failed to power up the device\n");
++ 
++ 	return ret;
++ }
++ 
++ static int adf_enable_pf2vf_comms(struct adf_accel_dev *accel_dev)
+++>>>>>>> ca605f97dae4 (crypto: qat - power up 4xxx device)
+  {
+  	return 0;
+  }
+@@@ -216,9 -245,8 +250,13 @@@ void adf_init_hw_data_4xxx(struct adf_h
+  	hw_data->exit_arb = adf_exit_arb;
+  	hw_data->get_arb_mapping = adf_get_arbiter_mapping;
+  	hw_data->enable_ints = adf_enable_ints;
+++<<<<<<< HEAD
+ +	hw_data->enable_vf2pf_comms = adf_pf_enable_vf2pf_comms;
+++=======
++ 	hw_data->init_device = adf_init_device;
+++>>>>>>> ca605f97dae4 (crypto: qat - power up 4xxx device)
+  	hw_data->reset_device = adf_reset_flr;
+ +	hw_data->min_iov_compat_ver = ADF_PFVF_COMPATIBILITY_VERSION;
+  	hw_data->admin_ae_mask = ADF_4XXX_ADMIN_AE_MASK;
+  	hw_data->uof_get_num_objs = uof_get_num_objs;
+  	hw_data->uof_get_name = uof_get_name;
+* Unmerged path drivers/crypto/qat/qat_4xxx/adf_4xxx_hw_data.c
+diff --git a/drivers/crypto/qat/qat_4xxx/adf_4xxx_hw_data.h b/drivers/crypto/qat/qat_4xxx/adf_4xxx_hw_data.h
+index 4fe2a776293c..924bac6feb37 100644
+--- a/drivers/crypto/qat/qat_4xxx/adf_4xxx_hw_data.h
++++ b/drivers/crypto/qat/qat_4xxx/adf_4xxx_hw_data.h
+@@ -62,6 +62,16 @@
+ #define ADF_4XXX_ADMINMSGLR_OFFSET	(0x500578)
+ #define ADF_4XXX_MAILBOX_BASE_OFFSET	(0x600970)
+ 
++/* Power management */
++#define ADF_4XXX_PM_POLL_DELAY_US	20
++#define ADF_4XXX_PM_POLL_TIMEOUT_US	USEC_PER_SEC
++#define ADF_4XXX_PM_STATUS		(0x50A00C)
++#define ADF_4XXX_PM_INTERRUPT		(0x50A028)
++#define ADF_4XXX_PM_DRV_ACTIVE		BIT(20)
++#define ADF_4XXX_PM_INIT_STATE		BIT(21)
++/* Power management source in ERRSOU2 and ERRMSK2 */
++#define ADF_4XXX_PM_SOU			BIT(18)
++
+ /* Firmware Binaries */
+ #define ADF_4XXX_FW		"qat_4xxx.bin"
+ #define ADF_4XXX_MMP		"qat_4xxx_mmp.bin"
+diff --git a/drivers/crypto/qat/qat_common/adf_accel_devices.h b/drivers/crypto/qat/qat_common/adf_accel_devices.h
+index ac435b44f1d2..8c6e73e3f01d 100644
+--- a/drivers/crypto/qat/qat_common/adf_accel_devices.h
++++ b/drivers/crypto/qat/qat_common/adf_accel_devices.h
+@@ -169,6 +169,7 @@ struct adf_hw_device_data {
+ 	int (*init_arb)(struct adf_accel_dev *accel_dev);
+ 	void (*exit_arb)(struct adf_accel_dev *accel_dev);
+ 	const u32 *(*get_arb_mapping)(void);
++	int (*init_device)(struct adf_accel_dev *accel_dev);
+ 	void (*disable_iov)(struct adf_accel_dev *accel_dev);
+ 	void (*configure_iov_threads)(struct adf_accel_dev *accel_dev,
+ 				      bool enable);
+diff --git a/drivers/crypto/qat/qat_common/adf_init.c b/drivers/crypto/qat/qat_common/adf_init.c
+index 744c40351428..8636f0a521fe 100644
+--- a/drivers/crypto/qat/qat_common/adf_init.c
++++ b/drivers/crypto/qat/qat_common/adf_init.c
+@@ -78,6 +78,11 @@ int adf_dev_init(struct adf_accel_dev *accel_dev)
+ 		return -EFAULT;
+ 	}
+ 
++	if (hw_data->init_device && hw_data->init_device(accel_dev)) {
++		dev_err(&GET_DEV(accel_dev), "Failed to initialize device\n");
++		return -EFAULT;
++	}
++
+ 	if (hw_data->init_admin_comms && hw_data->init_admin_comms(accel_dev)) {
+ 		dev_err(&GET_DEV(accel_dev), "Failed initialize admin comms\n");
+ 		return -EFAULT;
