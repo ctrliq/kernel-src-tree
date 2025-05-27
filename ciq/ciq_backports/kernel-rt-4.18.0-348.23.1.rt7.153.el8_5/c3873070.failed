@@ -1,0 +1,100 @@
+netfilter: nf_queue: fix possible use-after-free
+
+jira NONE_AUTOMATION
+Rebuild_History Non-Buildable kernel-rt-4.18.0-348.23.1.rt7.153.el8_5
+commit-author Florian Westphal <fw@strlen.de>
+commit c3873070247d9e3c7a6b0cf9bf9b45e8018427b1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-rt-4.18.0-348.23.1.rt7.153.el8_5/c3873070.failed
+
+Eric Dumazet says:
+  The sock_hold() side seems suspect, because there is no guarantee
+  that sk_refcnt is not already 0.
+
+On failure, we cannot queue the packet and need to indicate an
+error.  The packet will be dropped by the caller.
+
+v2: split skb prefetch hunk into separate change
+
+Fixes: 271b72c7fa82c ("udp: RCU handling for Unicast packets.")
+	Reported-by: Eric Dumazet <eric.dumazet@gmail.com>
+	Reviewed-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+(cherry picked from commit c3873070247d9e3c7a6b0cf9bf9b45e8018427b1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_queue.c
+diff --cc net/netfilter/nf_queue.c
+index 2d10990a9beb,e39549c55945..000000000000
+--- a/net/netfilter/nf_queue.c
++++ b/net/netfilter/nf_queue.c
+@@@ -104,19 -100,17 +104,28 @@@ bool nf_queue_entry_get_refs(struct nf_
+  {
+  	struct nf_hook_state *state = &entry->state;
+  
+++<<<<<<< HEAD
+ +	if (state->in)
+ +		dev_hold(state->in);
+ +	if (state->out)
+ +		dev_hold(state->out);
+ +	if (state->sk)
+ +		sock_hold(state->sk);
+++=======
++ 	if (state->sk && !refcount_inc_not_zero(&state->sk->sk_refcnt))
++ 		return false;
++ 
++ 	dev_hold(state->in);
++ 	dev_hold(state->out);
+++>>>>>>> c3873070247d (netfilter: nf_queue: fix possible use-after-free)
+  
+  #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+ -	dev_hold(entry->physin);
+ -	dev_hold(entry->physout);
+ +	if (entry->physin)
+ +		dev_hold(entry->physin);
+ +	if (entry->physout)
+ +		dev_hold(entry->physout);
+  #endif
++ 	return true;
+  }
+  EXPORT_SYMBOL_GPL(nf_queue_entry_get_refs);
+  
+diff --git a/include/net/netfilter/nf_queue.h b/include/net/netfilter/nf_queue.h
+index 4a83f371d430..7dc77375b9dd 100644
+--- a/include/net/netfilter/nf_queue.h
++++ b/include/net/netfilter/nf_queue.h
+@@ -35,7 +35,7 @@ void nf_register_queue_handler(struct net *net, const struct nf_queue_handler *q
+ void nf_unregister_queue_handler(struct net *net);
+ void nf_reinject(struct nf_queue_entry *entry, unsigned int verdict);
+ 
+-void nf_queue_entry_get_refs(struct nf_queue_entry *entry);
++bool nf_queue_entry_get_refs(struct nf_queue_entry *entry);
+ void nf_queue_entry_free(struct nf_queue_entry *entry);
+ 
+ static inline void init_hashrandom(u32 *jhash_initval)
+* Unmerged path net/netfilter/nf_queue.c
+diff --git a/net/netfilter/nfnetlink_queue.c b/net/netfilter/nfnetlink_queue.c
+index 9bf9ef505cd5..7fd763196b29 100644
+--- a/net/netfilter/nfnetlink_queue.c
++++ b/net/netfilter/nfnetlink_queue.c
+@@ -715,9 +715,15 @@ static struct nf_queue_entry *
+ nf_queue_entry_dup(struct nf_queue_entry *e)
+ {
+ 	struct nf_queue_entry *entry = kmemdup(e, e->size, GFP_ATOMIC);
+-	if (entry)
+-		nf_queue_entry_get_refs(entry);
+-	return entry;
++
++	if (!entry)
++		return NULL;
++
++	if (nf_queue_entry_get_refs(entry))
++		return entry;
++
++	kfree(entry);
++	return NULL;
+ }
+ 
+ #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
