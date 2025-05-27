@@ -1,0 +1,262 @@
+x86/mce: Avoid infinite loop for copy from user recovery
+
+jira NONE_AUTOMATION
+Rebuild_History Non-Buildable kernel-rt-4.18.0-348.12.2.rt7.143.el8_5
+commit-author Tony Luck <tony.luck@intel.com>
+commit 81065b35e2486c024c7aa86caed452e1f01a59d4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-rt-4.18.0-348.12.2.rt7.143.el8_5/81065b35.failed
+
+There are two cases for machine check recovery:
+
+1) The machine check was triggered by ring3 (application) code.
+   This is the simpler case. The machine check handler simply queues
+   work to be executed on return to user. That code unmaps the page
+   from all users and arranges to send a SIGBUS to the task that
+   triggered the poison.
+
+2) The machine check was triggered in kernel code that is covered by
+   an exception table entry. In this case the machine check handler
+   still queues a work entry to unmap the page, etc. but this will
+   not be called right away because the #MC handler returns to the
+   fix up code address in the exception table entry.
+
+Problems occur if the kernel triggers another machine check before the
+return to user processes the first queued work item.
+
+Specifically, the work is queued using the ->mce_kill_me callback
+structure in the task struct for the current thread. Attempting to queue
+a second work item using this same callback results in a loop in the
+linked list of work functions to call. So when the kernel does return to
+user, it enters an infinite loop processing the same entry for ever.
+
+There are some legitimate scenarios where the kernel may take a second
+machine check before returning to the user.
+
+1) Some code (e.g. futex) first tries a get_user() with page faults
+   disabled. If this fails, the code retries with page faults enabled
+   expecting that this will resolve the page fault.
+
+2) Copy from user code retries a copy in byte-at-time mode to check
+   whether any additional bytes can be copied.
+
+On the other side of the fence are some bad drivers that do not check
+the return value from individual get_user() calls and may access
+multiple user addresses without noticing that some/all calls have
+failed.
+
+Fix by adding a counter (current->mce_count) to keep track of repeated
+machine checks before task_work() is called. First machine check saves
+the address information and calls task_work_add(). Subsequent machine
+checks before that task_work call back is executed check that the address
+is in the same page as the first machine check (since the callback will
+offline exactly one page).
+
+Expected worst case is four machine checks before moving on (e.g. one
+user access with page faults disabled, then a repeat to the same address
+with page faults enabled ... repeat in copy tail bytes). Just in case
+there is some code that loops forever enforce a limit of 10.
+
+ [ bp: Massage commit message, drop noinstr, fix typo, extend panic
+   messages. ]
+
+Fixes: 5567d11c21a1 ("x86/mce: Send #MC singal from task work")
+	Signed-off-by: Tony Luck <tony.luck@intel.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Cc: <stable@vger.kernel.org>
+Link: https://lkml.kernel.org/r/YT/IJ9ziLqmtqEPu@agluck-desk2.amr.corp.intel.com
+(cherry picked from commit 81065b35e2486c024c7aa86caed452e1f01a59d4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/mce/core.c
+#	include/linux/sched.h
+diff --cc arch/x86/kernel/cpu/mce/core.c
+index 88eb3cb77d26,193204aee880..000000000000
+--- a/arch/x86/kernel/cpu/mce/core.c
++++ b/arch/x86/kernel/cpu/mce/core.c
+@@@ -1203,6 -1251,81 +1203,84 @@@ static void __mc_scan_banks(struct mce 
+  	*m = *final;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void kill_me_now(struct callback_head *ch)
++ {
++ 	struct task_struct *p = container_of(ch, struct task_struct, mce_kill_me);
++ 
++ 	p->mce_count = 0;
++ 	force_sig(SIGBUS);
++ }
++ 
++ static void kill_me_maybe(struct callback_head *cb)
++ {
++ 	struct task_struct *p = container_of(cb, struct task_struct, mce_kill_me);
++ 	int flags = MF_ACTION_REQUIRED;
++ 	int ret;
++ 
++ 	p->mce_count = 0;
++ 	pr_err("Uncorrected hardware memory error in user-access at %llx", p->mce_addr);
++ 
++ 	if (!p->mce_ripv)
++ 		flags |= MF_MUST_KILL;
++ 
++ 	ret = memory_failure(p->mce_addr >> PAGE_SHIFT, flags);
++ 	if (!ret && !(p->mce_kflags & MCE_IN_KERNEL_COPYIN)) {
++ 		set_mce_nospec(p->mce_addr >> PAGE_SHIFT, p->mce_whole_page);
++ 		sync_core();
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * -EHWPOISON from memory_failure() means that it already sent SIGBUS
++ 	 * to the current process with the proper error info, so no need to
++ 	 * send SIGBUS here again.
++ 	 */
++ 	if (ret == -EHWPOISON)
++ 		return;
++ 
++ 	if (p->mce_vaddr != (void __user *)-1l) {
++ 		force_sig_mceerr(BUS_MCEERR_AR, p->mce_vaddr, PAGE_SHIFT);
++ 	} else {
++ 		pr_err("Memory error not recovered");
++ 		kill_me_now(cb);
++ 	}
++ }
++ 
++ static void queue_task_work(struct mce *m, char *msg, int kill_current_task)
++ {
++ 	int count = ++current->mce_count;
++ 
++ 	/* First call, save all the details */
++ 	if (count == 1) {
++ 		current->mce_addr = m->addr;
++ 		current->mce_kflags = m->kflags;
++ 		current->mce_ripv = !!(m->mcgstatus & MCG_STATUS_RIPV);
++ 		current->mce_whole_page = whole_page(m);
++ 
++ 		if (kill_current_task)
++ 			current->mce_kill_me.func = kill_me_now;
++ 		else
++ 			current->mce_kill_me.func = kill_me_maybe;
++ 	}
++ 
++ 	/* Ten is likely overkill. Don't expect more than two faults before task_work() */
++ 	if (count > 10)
++ 		mce_panic("Too many consecutive machine checks while accessing user data", m, msg);
++ 
++ 	/* Second or later call, make sure page address matches the one from first call */
++ 	if (count > 1 && (current->mce_addr >> PAGE_SHIFT) != (m->addr >> PAGE_SHIFT))
++ 		mce_panic("Consecutive machine checks to different user pages", m, msg);
++ 
++ 	/* Do not call task_work_add() more than once */
++ 	if (count > 1)
++ 		return;
++ 
++ 	task_work_add(current, &current->mce_kill_me, TWA_RESUME);
++ }
++ 
+++>>>>>>> 81065b35e248 (x86/mce: Avoid infinite loop for copy from user recovery)
+  /*
+   * The actual machine check handler. This only handles real
+   * exceptions when something got corrupted coming in through int 18.
+@@@ -1345,23 -1458,29 +1423,46 @@@ void do_machine_check(struct pt_regs *r
+  	if ((m.cs & 3) == 3) {
+  		/* If this triggers there is no way to recover. Die hard. */
+  		BUG_ON(!on_thread_stack() || !user_mode(regs));
+ +		local_irq_enable();
+ +		preempt_enable();
+  
+++<<<<<<< HEAD
+ +		current->task_struct_rh->mce_ripv = !!(m.mcgstatus & MCG_STATUS_RIPV);
+ +		current->task_struct_rh->mce_whole_page = whole_page(&m);
+++=======
++ 		queue_task_work(&m, msg, kill_current_task);
+++>>>>>>> 81065b35e248 (x86/mce: Avoid infinite loop for copy from user recovery)
+  
+ +		if (kill_it || do_memory_failure(&m))
+ +			force_sig(SIGBUS, current);
+ +		preempt_disable();
+ +		local_irq_disable();
+  	} else {
+++<<<<<<< HEAD
+ +		if (!fixup_exception(regs, X86_TRAP_MC))
+ +			mce_panic("Failed kernel mode recovery", &m, NULL);
+++=======
++ 		/*
++ 		 * Handle an MCE which has happened in kernel space but from
++ 		 * which the kernel can recover: ex_has_fault_handler() has
++ 		 * already verified that the rIP at which the error happened is
++ 		 * a rIP from which the kernel can recover (by jumping to
++ 		 * recovery code specified in _ASM_EXTABLE_FAULT()) and the
++ 		 * corresponding exception handler which would do that is the
++ 		 * proper one.
++ 		 */
++ 		if (m.kflags & MCE_IN_KERNEL_RECOV) {
++ 			if (!fixup_exception(regs, X86_TRAP_MC, 0, 0))
++ 				mce_panic("Failed kernel mode recovery", &m, msg);
++ 		}
++ 
++ 		if (m.kflags & MCE_IN_KERNEL_COPYIN)
++ 			queue_task_work(&m, msg, kill_current_task);
+++>>>>>>> 81065b35e248 (x86/mce: Avoid infinite loop for copy from user recovery)
+  	}
+ -out:
+ -	mce_wrmsrl(MSR_IA32_MCG_STATUS, 0);
+ +
+ +out_ist:
+ +	nmi_exit();
+  }
+  EXPORT_SYMBOL_GPL(do_machine_check);
+  
+diff --cc include/linux/sched.h
+index 15101f992863,361c7bc72cbb..000000000000
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@@ -1330,6 -1450,40 +1330,43 @@@ struct task_struct 
+  	/* Used by LSM modules for access restriction: */
+  	void				*security;
+  #endif
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_BPF_SYSCALL
++ 	/* Used by BPF task local storage */
++ 	struct bpf_local_storage __rcu	*bpf_storage;
++ #endif
++ 
++ #ifdef CONFIG_GCC_PLUGIN_STACKLEAK
++ 	unsigned long			lowest_stack;
++ 	unsigned long			prev_lowest_stack;
++ #endif
++ 
++ #ifdef CONFIG_X86_MCE
++ 	void __user			*mce_vaddr;
++ 	__u64				mce_kflags;
++ 	u64				mce_addr;
++ 	__u64				mce_ripv : 1,
++ 					mce_whole_page : 1,
++ 					__mce_reserved : 62;
++ 	struct callback_head		mce_kill_me;
++ 	int				mce_count;
++ #endif
++ 
++ #ifdef CONFIG_KRETPROBES
++ 	struct llist_head               kretprobe_instances;
++ #endif
++ 
++ #ifdef CONFIG_ARCH_HAS_PARANOID_L1D_FLUSH
++ 	/*
++ 	 * If L1D flush is supported on mm context switch
++ 	 * then we use this callback head to queue kill work
++ 	 * to kill tasks that are not running on SMT disabled
++ 	 * cores
++ 	 */
++ 	struct callback_head		l1d_flush_kill;
++ #endif
+++>>>>>>> 81065b35e248 (x86/mce: Avoid infinite loop for copy from user recovery)
+  
+  	/*
+  	 * New fields for task_struct should be added above here, so that
+* Unmerged path arch/x86/kernel/cpu/mce/core.c
+* Unmerged path include/linux/sched.h
