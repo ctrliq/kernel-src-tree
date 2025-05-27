@@ -2138,7 +2138,7 @@ void __sched __rt_mutex_init(struct rt_mutex *lock, const char *name,
 
 	__rt_mutex_basic_init(lock);
 }
-EXPORT_SYMBOL_GPL(__rt_mutex_init);
+EXPORT_SYMBOL(__rt_mutex_init);
 
 /**
  * rt_mutex_init_proxy_locked - initialize and lock a rt_mutex on behalf of a

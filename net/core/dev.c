@@ -5667,6 +5667,9 @@ static void gro_list_prepare(struct napi_struct *napi, struct sk_buff *skb)
 #ifdef CONFIG_SKB_EXTENSIONS
 			   skb->active_extensions ||
 #endif
+#ifdef CONFIG_XFRM
+			   skb->sp ||
+#endif
 			   skb_get_nfct(skb));
 
 	list_for_each_entry(p, &napi->gro_list, list) {
