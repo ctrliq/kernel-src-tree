@@ -1,0 +1,520 @@
+drm/i915: Flush TLBs before releasing backing store
+
+jira NONE_AUTOMATION
+cve CVE-2022-0330
+Rebuild_History Non-Buildable kernel-rt-4.18.0-348.20.1.rt7.150.el8_5
+commit-author Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+commit 7938d61591d33394a21bdd7797a245b65428f44c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-rt-4.18.0-348.20.1.rt7.150.el8_5/7938d615.failed
+
+We need to flush TLBs before releasing backing store otherwise userspace
+is able to encounter stale entries if a) it is not declaring access to
+certain buffers and b) it races with the backing store release from a
+such undeclared execution already executing on the GPU in parallel.
+
+The approach taken is to mark any buffer objects which were ever bound
+to the GPU and to trigger a serialized TLB flush when their backing
+store is released.
+
+Alternatively the flushing could be done on VMA unbind, at which point
+we would be able to ascertain whether there is potential a parallel GPU
+execution (which could race), but essentially it boils down to paying
+the cost of TLB flushes potentially needlessly at VMA unbind time (when
+the backing store is not known to be going away so not needed for
+safety), versus potentially needlessly at backing store relase time
+(since we at that point cannot tell whether there is anything executing
+on the GPU which uses that object).
+
+Thereforce simplicity of implementation has been chosen for now with
+scope to benchmark and refine later as required.
+
+	Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+	Reported-by: Sushma Venkatesh Reddy <sushma.venkatesh.reddy@intel.com>
+	Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+	Acked-by: Dave Airlie <airlied@redhat.com>
+	Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+	Cc: Jon Bloomfield <jon.bloomfield@intel.com>
+	Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+	Cc: Jani Nikula <jani.nikula@intel.com>
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 7938d61591d33394a21bdd7797a245b65428f44c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/gem/i915_gem_object_types.h
+#	drivers/gpu/drm/i915/gt/intel_gt.h
+#	drivers/gpu/drm/i915/gt/intel_gt_types.h
+#	drivers/gpu/drm/i915/intel_uncore.c
+diff --cc drivers/gpu/drm/i915/gem/i915_gem_object_types.h
+index 0438e00d4ca7,0dd107dcecc2..000000000000
+--- a/drivers/gpu/drm/i915/gem/i915_gem_object_types.h
++++ b/drivers/gpu/drm/i915/gem/i915_gem_object_types.h
+@@@ -169,20 -294,174 +169,56 @@@ struct drm_i915_gem_object 
+  	I915_SELFTEST_DECLARE(struct list_head st_link);
+  
+  	unsigned long flags;
+++<<<<<<< HEAD
+ +#define I915_BO_ALLOC_CONTIGUOUS BIT(0)
+ +#define I915_BO_ALLOC_VOLATILE   BIT(1)
+ +#define I915_BO_ALLOC_FLAGS (I915_BO_ALLOC_CONTIGUOUS | I915_BO_ALLOC_VOLATILE)
+ +#define I915_BO_READONLY         BIT(2)
+ +#define I915_TILING_QUIRK_BIT    3 /* unknown swizzling; do not release! */
+ +
+ +	/*
+ +	 * Is the object to be mapped as read-only to the GPU
+ +	 * Only honoured if hardware has relevant pte bit
+++=======
++ #define I915_BO_ALLOC_CONTIGUOUS  BIT(0)
++ #define I915_BO_ALLOC_VOLATILE    BIT(1)
++ #define I915_BO_ALLOC_CPU_CLEAR   BIT(2)
++ #define I915_BO_ALLOC_USER        BIT(3)
++ /* Object is allowed to lose its contents on suspend / resume, even if pinned */
++ #define I915_BO_ALLOC_PM_VOLATILE BIT(4)
++ /* Object needs to be restored early using memcpy during resume */
++ #define I915_BO_ALLOC_PM_EARLY    BIT(5)
++ #define I915_BO_ALLOC_FLAGS (I915_BO_ALLOC_CONTIGUOUS | \
++ 			     I915_BO_ALLOC_VOLATILE | \
++ 			     I915_BO_ALLOC_CPU_CLEAR | \
++ 			     I915_BO_ALLOC_USER | \
++ 			     I915_BO_ALLOC_PM_VOLATILE | \
++ 			     I915_BO_ALLOC_PM_EARLY)
++ #define I915_BO_READONLY          BIT(6)
++ #define I915_TILING_QUIRK_BIT     7 /* unknown swizzling; do not release! */
++ #define I915_BO_PROTECTED         BIT(8)
++ #define I915_BO_WAS_BOUND_BIT     9
++ 	/**
++ 	 * @mem_flags - Mutable placement-related flags
++ 	 *
++ 	 * These are flags that indicate specifics of the memory region
++ 	 * the object is currently in. As such they are only stable
++ 	 * either under the object lock or if the object is pinned.
++ 	 */
++ 	unsigned int mem_flags;
++ #define I915_BO_FLAG_STRUCT_PAGE BIT(0) /* Object backed by struct pages */
++ #define I915_BO_FLAG_IOMEM       BIT(1) /* Object backed by IO memory */
++ 	/**
++ 	 * @cache_level: The desired GTT caching level.
++ 	 *
++ 	 * See enum i915_cache_level for possible values, along with what
++ 	 * each does.
+++>>>>>>> 7938d61591d3 (drm/i915: Flush TLBs before releasing backing store)
+  	 */
+  	unsigned int cache_level:3;
+ -	/**
+ -	 * @cache_coherent:
+ -	 *
+ -	 * Track whether the pages are coherent with the GPU if reading or
+ -	 * writing through the CPU caches. The largely depends on the
+ -	 * @cache_level setting.
+ -	 *
+ -	 * On platforms which don't have the shared LLC(HAS_SNOOP), like on Atom
+ -	 * platforms, coherency must be explicitly requested with some special
+ -	 * GTT caching bits(see enum i915_cache_level). When enabling coherency
+ -	 * it does come at a performance and power cost on such platforms. On
+ -	 * the flip side the kernel does not need to manually flush any buffers
+ -	 * which need to be coherent with the GPU, if the object is not coherent
+ -	 * i.e @cache_coherent is zero.
+ -	 *
+ -	 * On platforms that share the LLC with the CPU(HAS_LLC), all GT memory
+ -	 * access will automatically snoop the CPU caches(even with CACHE_NONE).
+ -	 * The one exception is when dealing with the display engine, like with
+ -	 * scanout surfaces. To handle this the kernel will always flush the
+ -	 * surface out of the CPU caches when preparing it for scanout.  Also
+ -	 * note that since scanout surfaces are only ever read by the display
+ -	 * engine we only need to care about flushing any writes through the CPU
+ -	 * cache, reads on the other hand will always be coherent.
+ -	 *
+ -	 * Something strange here is why @cache_coherent is not a simple
+ -	 * boolean, i.e coherent vs non-coherent. The reasoning for this is back
+ -	 * to the display engine not being fully coherent. As a result scanout
+ -	 * surfaces will either be marked as I915_CACHE_NONE or I915_CACHE_WT.
+ -	 * In the case of seeing I915_CACHE_NONE the kernel makes the assumption
+ -	 * that this is likely a scanout surface, and will set @cache_coherent
+ -	 * as only I915_BO_CACHE_COHERENT_FOR_READ, on platforms with the shared
+ -	 * LLC. The kernel uses this to always flush writes through the CPU
+ -	 * cache as early as possible, where it can, in effect keeping
+ -	 * @cache_dirty clean, so we can potentially avoid stalling when
+ -	 * flushing the surface just before doing the scanout.  This does mean
+ -	 * we might unnecessarily flush non-scanout objects in some places, but
+ -	 * the default assumption is that all normal objects should be using
+ -	 * I915_CACHE_LLC, at least on platforms with the shared LLC.
+ -	 *
+ -	 * Supported values:
+ -	 *
+ -	 * I915_BO_CACHE_COHERENT_FOR_READ:
+ -	 *
+ -	 * On shared LLC platforms, we use this for special scanout surfaces,
+ -	 * where the display engine is not coherent with the CPU cache. As such
+ -	 * we need to ensure we flush any writes before doing the scanout. As an
+ -	 * optimisation we try to flush any writes as early as possible to avoid
+ -	 * stalling later.
+ -	 *
+ -	 * Thus for scanout surfaces using I915_CACHE_NONE, on shared LLC
+ -	 * platforms, we use:
+ -	 *
+ -	 *	cache_coherent = I915_BO_CACHE_COHERENT_FOR_READ
+ -	 *
+ -	 * While for normal objects that are fully coherent, including special
+ -	 * scanout surfaces marked as I915_CACHE_WT, we use:
+ -	 *
+ -	 *	cache_coherent = I915_BO_CACHE_COHERENT_FOR_READ |
+ -	 *			 I915_BO_CACHE_COHERENT_FOR_WRITE
+ -	 *
+ -	 * And then for objects that are not coherent at all we use:
+ -	 *
+ -	 *	cache_coherent = 0
+ -	 *
+ -	 * I915_BO_CACHE_COHERENT_FOR_WRITE:
+ -	 *
+ -	 * When writing through the CPU cache, the GPU is still coherent. Note
+ -	 * that this also implies I915_BO_CACHE_COHERENT_FOR_READ.
+ -	 */
+ +	unsigned int cache_coherent:2;
+  #define I915_BO_CACHE_COHERENT_FOR_READ BIT(0)
+  #define I915_BO_CACHE_COHERENT_FOR_WRITE BIT(1)
+ -	unsigned int cache_coherent:2;
+ -
+ -	/**
+ -	 * @cache_dirty:
+ -	 *
+ -	 * Track if we are we dirty with writes through the CPU cache for this
+ -	 * object. As a result reading directly from main memory might yield
+ -	 * stale data.
+ -	 *
+ -	 * This also ties into whether the kernel is tracking the object as
+ -	 * coherent with the GPU, as per @cache_coherent, as it determines if
+ -	 * flushing might be needed at various points.
+ -	 *
+ -	 * Another part of @cache_dirty is managing flushing when first
+ -	 * acquiring the pages for system memory, at this point the pages are
+ -	 * considered foreign, so the default assumption is that the cache is
+ -	 * dirty, for example the page zeroing done by the kernel might leave
+ -	 * writes though the CPU cache, or swapping-in, while the actual data in
+ -	 * main memory is potentially stale.  Note that this is a potential
+ -	 * security issue when dealing with userspace objects and zeroing. Now,
+ -	 * whether we actually need apply the big sledgehammer of flushing all
+ -	 * the pages on acquire depends on if @cache_coherent is marked as
+ -	 * I915_BO_CACHE_COHERENT_FOR_WRITE, i.e that the GPU will be coherent
+ -	 * for both reads and writes though the CPU cache.
+ -	 *
+ -	 * Note that on shared LLC platforms we still apply the heavy flush for
+ -	 * I915_CACHE_NONE objects, under the assumption that this is going to
+ -	 * be used for scanout.
+ -	 *
+ -	 * Update: On some hardware there is now also the 'Bypass LLC' MOCS
+ -	 * entry, which defeats our @cache_coherent tracking, since userspace
+ -	 * can freely bypass the CPU cache when touching the pages with the GPU,
+ -	 * where the kernel is completely unaware. On such platform we need
+ -	 * apply the sledgehammer-on-acquire regardless of the @cache_coherent.
+ -	 *
+ -	 * Special care is taken on non-LLC platforms, to prevent potential
+ -	 * information leak. The driver currently ensures:
+ -	 *
+ -	 *   1. All userspace objects, by default, have @cache_level set as
+ -	 *   I915_CACHE_NONE. The only exception is userptr objects, where we
+ -	 *   instead force I915_CACHE_LLC, but we also don't allow userspace to
+ -	 *   ever change the @cache_level for such objects. Another special case
+ -	 *   is dma-buf, which doesn't rely on @cache_dirty,  but there we
+ -	 *   always do a forced flush when acquiring the pages, if there is a
+ -	 *   chance that the pages can be read directly from main memory with
+ -	 *   the GPU.
+ -	 *
+ -	 *   2. All I915_CACHE_NONE objects have @cache_dirty initially true.
+ -	 *
+ -	 *   3. All swapped-out objects(i.e shmem) have @cache_dirty set to
+ -	 *   true.
+ -	 *
+ -	 *   4. The @cache_dirty is never freely reset before the initial
+ -	 *   flush, even if userspace adjusts the @cache_level through the
+ -	 *   i915_gem_set_caching_ioctl.
+ -	 *
+ -	 *   5. All @cache_dirty objects(including swapped-in) are initially
+ -	 *   flushed with a synchronous call to drm_clflush_sg in
+ -	 *   __i915_gem_object_set_pages. The @cache_dirty can be freely reset
+ -	 *   at this point. All further asynchronous clfushes are never security
+ -	 *   critical, i.e userspace is free to race against itself.
+ -	 */
+  	unsigned int cache_dirty:1;
+  
+  	/**
+diff --cc drivers/gpu/drm/i915/gt/intel_gt.h
+index 9157c7411f60,a913fb6ffec3..000000000000
+--- a/drivers/gpu/drm/i915/gt/intel_gt.h
++++ b/drivers/gpu/drm/i915/gt/intel_gt.h
+@@@ -77,4 -81,16 +77,11 @@@ static inline bool intel_gt_is_wedged(c
+  void intel_gt_info_print(const struct intel_gt_info *info,
+  			 struct drm_printer *p);
+  
+++<<<<<<< HEAD
+++=======
++ void intel_gt_watchdog_work(struct work_struct *work);
++ 
++ void intel_gt_invalidate_tlbs(struct intel_gt *gt);
++ 
+++>>>>>>> 7938d61591d3 (drm/i915: Flush TLBs before releasing backing store)
+  #endif /* __INTEL_GT_H__ */
+diff --cc drivers/gpu/drm/i915/gt/intel_gt_types.h
+index a83d3e18254d,f20687796490..000000000000
+--- a/drivers/gpu/drm/i915/gt/intel_gt_types.h
++++ b/drivers/gpu/drm/i915/gt/intel_gt_types.h
+@@@ -36,6 -73,10 +36,13 @@@ struct intel_gt 
+  
+  	struct intel_uc uc;
+  
+++<<<<<<< HEAD
+++=======
++ 	struct mutex tlb_invalidate_lock;
++ 
++ 	struct i915_wa_list wa_list;
++ 
+++>>>>>>> 7938d61591d3 (drm/i915: Flush TLBs before releasing backing store)
+  	struct intel_gt_timelines {
+  		spinlock_t lock; /* protects active_list */
+  		struct list_head active_list;
+diff --cc drivers/gpu/drm/i915/intel_uncore.c
+index 9ac501bcfdad,778da3179b3c..000000000000
+--- a/drivers/gpu/drm/i915/intel_uncore.c
++++ b/drivers/gpu/drm/i915/intel_uncore.c
+@@@ -709,7 -740,11 +710,15 @@@ static void __intel_uncore_forcewake_pu
+  			continue;
+  		}
+  
+++<<<<<<< HEAD
+ +		uncore->funcs.force_wake_put(uncore, domain->mask);
+++=======
++ 		if (delayed &&
++ 		    !(domain->uncore->fw_domains_timer & domain->mask))
++ 			fw_domain_arm_timer(domain);
++ 		else
++ 			fw_domains_put(uncore, domain->mask);
+++>>>>>>> 7938d61591d3 (drm/i915: Flush TLBs before releasing backing store)
+  	}
+  }
+  
+@@@ -769,10 -817,10 +791,10 @@@ void intel_uncore_forcewake_put__locked
+  {
+  	lockdep_assert_held(&uncore->lock);
+  
+ -	if (!uncore->fw_get_funcs)
+ +	if (!uncore->funcs.force_wake_put)
+  		return;
+  
+- 	__intel_uncore_forcewake_put(uncore, fw_domains);
++ 	__intel_uncore_forcewake_put(uncore, fw_domains, false);
+  }
+  
+  void assert_forcewakes_inactive(struct intel_uncore *uncore)
+* Unmerged path drivers/gpu/drm/i915/gem/i915_gem_object_types.h
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_pages.c b/drivers/gpu/drm/i915/gem/i915_gem_pages.c
+index 76574e245916..d4d72c160ad4 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_pages.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_pages.c
+@@ -10,6 +10,8 @@
+ #include "i915_gem_lmem.h"
+ #include "i915_gem_mman.h"
+ 
++#include "gt/intel_gt.h"
++
+ void __i915_gem_object_set_pages(struct drm_i915_gem_object *obj,
+ 				 struct sg_table *pages,
+ 				 unsigned int sg_page_sizes)
+@@ -195,6 +197,14 @@ __i915_gem_object_unset_pages(struct drm_i915_gem_object *obj)
+ 	__i915_gem_object_reset_page_iter(obj);
+ 	obj->mm.page_sizes.phys = obj->mm.page_sizes.sg = 0;
+ 
++	if (test_and_clear_bit(I915_BO_WAS_BOUND_BIT, &obj->flags)) {
++		struct drm_i915_private *i915 = to_i915(obj->base.dev);
++		intel_wakeref_t wakeref;
++
++		with_intel_runtime_pm_if_active(&i915->runtime_pm, wakeref)
++			intel_gt_invalidate_tlbs(to_gt(i915));
++	}
++
+ 	return pages;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index d8e1ab412634..a7628e808273 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -26,6 +26,8 @@ void intel_gt_init_early(struct intel_gt *gt, struct drm_i915_private *i915)
+ 
+ 	spin_lock_init(&gt->irq_lock);
+ 
++	mutex_init(&gt->tlb_invalidate_lock);
++
+ 	INIT_LIST_HEAD(&gt->closed_vma);
+ 	spin_lock_init(&gt->closed_lock);
+ 
+@@ -662,3 +664,109 @@ void intel_gt_info_print(const struct intel_gt_info *info,
+ 
+ 	intel_sseu_dump(&info->sseu, p);
+ }
++
++struct reg_and_bit {
++	i915_reg_t reg;
++	u32 bit;
++};
++
++static struct reg_and_bit
++get_reg_and_bit(const struct intel_engine_cs *engine, const bool gen8,
++		const i915_reg_t *regs, const unsigned int num)
++{
++	const unsigned int class = engine->class;
++	struct reg_and_bit rb = { };
++
++	if (drm_WARN_ON_ONCE(&engine->i915->drm,
++			     class >= num || !regs[class].reg))
++		return rb;
++
++	rb.reg = regs[class];
++	if (gen8 && class == VIDEO_DECODE_CLASS)
++		rb.reg.reg += 4 * engine->instance; /* GEN8_M2TCR */
++	else
++		rb.bit = engine->instance;
++
++	rb.bit = BIT(rb.bit);
++
++	return rb;
++}
++
++void intel_gt_invalidate_tlbs(struct intel_gt *gt)
++{
++	static const i915_reg_t gen8_regs[] = {
++		[RENDER_CLASS]			= GEN8_RTCR,
++		[VIDEO_DECODE_CLASS]		= GEN8_M1TCR, /* , GEN8_M2TCR */
++		[VIDEO_ENHANCEMENT_CLASS]	= GEN8_VTCR,
++		[COPY_ENGINE_CLASS]		= GEN8_BTCR,
++	};
++	static const i915_reg_t gen12_regs[] = {
++		[RENDER_CLASS]			= GEN12_GFX_TLB_INV_CR,
++		[VIDEO_DECODE_CLASS]		= GEN12_VD_TLB_INV_CR,
++		[VIDEO_ENHANCEMENT_CLASS]	= GEN12_VE_TLB_INV_CR,
++		[COPY_ENGINE_CLASS]		= GEN12_BLT_TLB_INV_CR,
++	};
++	struct drm_i915_private *i915 = gt->i915;
++	struct intel_uncore *uncore = gt->uncore;
++	struct intel_engine_cs *engine;
++	enum intel_engine_id id;
++	const i915_reg_t *regs;
++	unsigned int num = 0;
++
++	if (I915_SELFTEST_ONLY(gt->awake == -ENODEV))
++		return;
++
++	if (GRAPHICS_VER(i915) == 12) {
++		regs = gen12_regs;
++		num = ARRAY_SIZE(gen12_regs);
++	} else if (GRAPHICS_VER(i915) >= 8 && GRAPHICS_VER(i915) <= 11) {
++		regs = gen8_regs;
++		num = ARRAY_SIZE(gen8_regs);
++	} else if (GRAPHICS_VER(i915) < 8) {
++		return;
++	}
++
++	if (drm_WARN_ONCE(&i915->drm, !num,
++			  "Platform does not implement TLB invalidation!"))
++		return;
++
++	GEM_TRACE("\n");
++
++	assert_rpm_wakelock_held(&i915->runtime_pm);
++
++	mutex_lock(&gt->tlb_invalidate_lock);
++	intel_uncore_forcewake_get(uncore, FORCEWAKE_ALL);
++
++	for_each_engine(engine, gt, id) {
++		/*
++		 * HW architecture suggest typical invalidation time at 40us,
++		 * with pessimistic cases up to 100us and a recommendation to
++		 * cap at 1ms. We go a bit higher just in case.
++		 */
++		const unsigned int timeout_us = 100;
++		const unsigned int timeout_ms = 4;
++		struct reg_and_bit rb;
++
++		rb = get_reg_and_bit(engine, regs == gen8_regs, regs, num);
++		if (!i915_mmio_reg_offset(rb.reg))
++			continue;
++
++		intel_uncore_write_fw(uncore, rb.reg, rb.bit);
++		if (__intel_wait_for_register_fw(uncore,
++						 rb.reg, rb.bit, 0,
++						 timeout_us, timeout_ms,
++						 NULL))
++			drm_err_ratelimited(&gt->i915->drm,
++					    "%s TLB invalidation did not complete in %ums!\n",
++					    engine->name, timeout_ms);
++	}
++
++	/*
++	 * Use delayed put since a) we mostly expect a flurry of TLB
++	 * invalidations so it is good to avoid paying the forcewake cost and
++	 * b) it works around a bug in Icelake which cannot cope with too rapid
++	 * transitions.
++	 */
++	intel_uncore_forcewake_put_delayed(uncore, FORCEWAKE_ALL);
++	mutex_unlock(&gt->tlb_invalidate_lock);
++}
+* Unmerged path drivers/gpu/drm/i915/gt/intel_gt.h
+* Unmerged path drivers/gpu/drm/i915/gt/intel_gt_types.h
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index e96989dea1ef..e65e394c2c30 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -2646,6 +2646,12 @@ static inline bool i915_mmio_reg_valid(i915_reg_t reg)
+ #define   GAMT_CHKN_DISABLE_DYNAMIC_CREDIT_SHARING	(1 << 28)
+ #define   GAMT_CHKN_DISABLE_I2M_CYCLE_ON_WR_PORT	(1 << 24)
+ 
++#define GEN8_RTCR	_MMIO(0x4260)
++#define GEN8_M1TCR	_MMIO(0x4264)
++#define GEN8_M2TCR	_MMIO(0x4268)
++#define GEN8_BTCR	_MMIO(0x426c)
++#define GEN8_VTCR	_MMIO(0x4270)
++
+ #if 0
+ #define PRB0_TAIL	_MMIO(0x2030)
+ #define PRB0_HEAD	_MMIO(0x2034)
+@@ -2738,6 +2744,11 @@ static inline bool i915_mmio_reg_valid(i915_reg_t reg)
+ #define   FAULT_VA_HIGH_BITS		(0xf << 0)
+ #define   FAULT_GTT_SEL			(1 << 4)
+ 
++#define GEN12_GFX_TLB_INV_CR	_MMIO(0xced8)
++#define GEN12_VD_TLB_INV_CR	_MMIO(0xcedc)
++#define GEN12_VE_TLB_INV_CR	_MMIO(0xcee0)
++#define GEN12_BLT_TLB_INV_CR	_MMIO(0xcee4)
++
+ #define GEN12_AUX_ERR_DBG		_MMIO(0x43f4)
+ 
+ #define FPGA_DBG		_MMIO(0x42300)
+diff --git a/drivers/gpu/drm/i915/i915_vma.c b/drivers/gpu/drm/i915/i915_vma.c
+index caa9b041616b..50a86fd89d00 100644
+--- a/drivers/gpu/drm/i915/i915_vma.c
++++ b/drivers/gpu/drm/i915/i915_vma.c
+@@ -439,6 +439,9 @@ int i915_vma_bind(struct i915_vma *vma,
+ 		vma->ops->bind_vma(vma->vm, NULL, vma, cache_level, bind_flags);
+ 	}
+ 
++	if (vma->obj)
++		set_bit(I915_BO_WAS_BOUND_BIT, &vma->obj->flags);
++
+ 	atomic_or(bind_flags, &vma->flags);
+ 	return 0;
+ }
+* Unmerged path drivers/gpu/drm/i915/intel_uncore.c
+diff --git a/drivers/gpu/drm/i915/intel_uncore.h b/drivers/gpu/drm/i915/intel_uncore.h
+index 59f0da8f1fbb..1a8e1017f936 100644
+--- a/drivers/gpu/drm/i915/intel_uncore.h
++++ b/drivers/gpu/drm/i915/intel_uncore.h
+@@ -211,6 +211,8 @@ void intel_uncore_forcewake_get(struct intel_uncore *uncore,
+ 				enum forcewake_domains domains);
+ void intel_uncore_forcewake_put(struct intel_uncore *uncore,
+ 				enum forcewake_domains domains);
++void intel_uncore_forcewake_put_delayed(struct intel_uncore *uncore,
++					enum forcewake_domains domains);
+ void intel_uncore_forcewake_flush(struct intel_uncore *uncore,
+ 				  enum forcewake_domains fw_domains);
+ 
