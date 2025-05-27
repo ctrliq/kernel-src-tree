@@ -1,0 +1,511 @@
+security: pass asoc to sctp_assoc_request and sctp_sk_clone
+
+jira NONE_AUTOMATION
+Rebuild_History Non-Buildable kernel-rt-4.18.0-348.20.1.rt7.150.el8_5
+commit-author Xin Long <lucien.xin@gmail.com>
+commit c081d53f97a1a90a38e4296dd3d6fda5e38dca2c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-rt-4.18.0-348.20.1.rt7.150.el8_5/c081d53f.failed
+
+This patch is to move secid and peer_secid from endpoint to association,
+and pass asoc to sctp_assoc_request and sctp_sk_clone instead of ep. As
+ep is the local endpoint and asoc represents a connection, and in SCTP
+one sk/ep could have multiple asoc/connection, saving secid/peer_secid
+for new asoc will overwrite the old asoc's.
+
+Note that since asoc can be passed as NULL, security_sctp_assoc_request()
+is moved to the place right after the new_asoc is created in
+sctp_sf_do_5_1B_init() and sctp_sf_do_unexpected_init().
+
+v1->v2:
+  - fix the description of selinux_netlbl_skbuff_setsid(), as Jakub noticed.
+  - fix the annotation in selinux_sctp_assoc_request(), as Richard Noticed.
+
+Fixes: 72e89f50084c ("security: Add support for SCTP security hooks")
+	Reported-by: Prashanth Prahlad <pprahlad@redhat.com>
+	Reviewed-by: Richard Haines <richard_c_haines@btinternet.com>
+	Tested-by: Richard Haines <richard_c_haines@btinternet.com>
+	Signed-off-by: Xin Long <lucien.xin@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c081d53f97a1a90a38e4296dd3d6fda5e38dca2c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sctp/structs.h
+diff --cc include/net/sctp/structs.h
+index 08237803d2df,899c29c326ba..000000000000
+--- a/include/net/sctp/structs.h
++++ b/include/net/sctp/structs.h
+@@@ -2107,6 -2093,18 +2097,21 @@@ struct sctp_association 
+  
+  	__u64 abandoned_unsent[SCTP_PR_INDEX(MAX) + 1];
+  	__u64 abandoned_sent[SCTP_PR_INDEX(MAX) + 1];
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* Security identifiers from incoming (INIT). These are set by
++ 	 * security_sctp_assoc_request(). These will only be used by
++ 	 * SCTP TCP type sockets and peeled off connections as they
++ 	 * cause a new socket to be generated. security_sctp_sk_clone()
++ 	 * will then plug these into the new socket.
++ 	 */
++ 
++ 	u32 secid;
++ 	u32 peer_secid;
++ 
++ 	struct rcu_head rcu;
+++>>>>>>> c081d53f97a1 (security: pass asoc to sctp_assoc_request and sctp_sk_clone)
+  };
+  
+  
+diff --git a/Documentation/security/SCTP.rst b/Documentation/security/SCTP.rst
+index d903eb97fcf3..eee2879e4de0 100644
+--- a/Documentation/security/SCTP.rst
++++ b/Documentation/security/SCTP.rst
+@@ -26,11 +26,11 @@ described in the `SCTP SELinux Support`_ chapter.
+ 
+ security_sctp_assoc_request()
+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-Passes the ``@ep`` and ``@chunk->skb`` of the association INIT packet to the
++Passes the ``@asoc`` and ``@chunk->skb`` of the association INIT packet to the
+ security module. Returns 0 on success, error on failure.
+ ::
+ 
+-    @ep - pointer to sctp endpoint structure.
++    @asoc - pointer to sctp association structure.
+     @skb - pointer to skbuff of association packet.
+ 
+ 
+@@ -117,9 +117,9 @@ Called whenever a new socket is created by **accept**\(2)
+ calls **sctp_peeloff**\(3).
+ ::
+ 
+-    @ep - pointer to current sctp endpoint structure.
++    @asoc - pointer to current sctp association structure.
+     @sk - pointer to current sock structure.
+-    @sk - pointer to new sock structure.
++    @newsk - pointer to new sock structure.
+ 
+ 
+ security_inet_conn_established()
+@@ -200,22 +200,22 @@ hooks with the SELinux specifics expanded below::
+ 
+ security_sctp_assoc_request()
+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-Passes the ``@ep`` and ``@chunk->skb`` of the association INIT packet to the
++Passes the ``@asoc`` and ``@chunk->skb`` of the association INIT packet to the
+ security module. Returns 0 on success, error on failure.
+ ::
+ 
+-    @ep - pointer to sctp endpoint structure.
++    @asoc - pointer to sctp association structure.
+     @skb - pointer to skbuff of association packet.
+ 
+ The security module performs the following operations:
+-     IF this is the first association on ``@ep->base.sk``, then set the peer
++     IF this is the first association on ``@asoc->base.sk``, then set the peer
+      sid to that in ``@skb``. This will ensure there is only one peer sid
+-     assigned to ``@ep->base.sk`` that may support multiple associations.
++     assigned to ``@asoc->base.sk`` that may support multiple associations.
+ 
+-     ELSE validate the ``@ep->base.sk peer_sid`` against the ``@skb peer sid``
++     ELSE validate the ``@asoc->base.sk peer_sid`` against the ``@skb peer sid``
+      to determine whether the association should be allowed or denied.
+ 
+-     Set the sctp ``@ep sid`` to socket's sid (from ``ep->base.sk``) with
++     Set the sctp ``@asoc sid`` to socket's sid (from ``asoc->base.sk``) with
+      MLS portion taken from ``@skb peer sid``. This will be used by SCTP
+      TCP style sockets and peeled off connections as they cause a new socket
+      to be generated.
+@@ -259,13 +259,13 @@ security_sctp_sk_clone()
+ Called whenever a new socket is created by **accept**\(2) (i.e. a TCP style
+ socket) or when a socket is 'peeled off' e.g userspace calls
+ **sctp_peeloff**\(3). ``security_sctp_sk_clone()`` will set the new
+-sockets sid and peer sid to that contained in the ``@ep sid`` and
+-``@ep peer sid`` respectively.
++sockets sid and peer sid to that contained in the ``@asoc sid`` and
++``@asoc peer sid`` respectively.
+ ::
+ 
+-    @ep - pointer to current sctp endpoint structure.
++    @asoc - pointer to current sctp association structure.
+     @sk - pointer to current sock structure.
+-    @sk - pointer to new sock structure.
++    @newsk - pointer to new sock structure.
+ 
+ 
+ security_inet_conn_established()
+diff --git a/include/linux/lsm_hook_defs.h b/include/linux/lsm_hook_defs.h
+index cadd0184a87f..acb0e2206663 100644
+--- a/include/linux/lsm_hook_defs.h
++++ b/include/linux/lsm_hook_defs.h
+@@ -303,11 +303,11 @@ LSM_HOOK(int, 0, tun_dev_create, void)
+ LSM_HOOK(int, 0, tun_dev_attach_queue, void *security)
+ LSM_HOOK(int, 0, tun_dev_attach, struct sock *sk, void *security)
+ LSM_HOOK(int, 0, tun_dev_open, void *security)
+-LSM_HOOK(int, 0, sctp_assoc_request, struct sctp_endpoint *ep,
++LSM_HOOK(int, 0, sctp_assoc_request, struct sctp_association *asoc,
+ 	 struct sk_buff *skb)
+ LSM_HOOK(int, 0, sctp_bind_connect, struct sock *sk, int optname,
+ 	 struct sockaddr *address, int addrlen)
+-LSM_HOOK(void, LSM_RET_VOID, sctp_sk_clone, struct sctp_endpoint *ep,
++LSM_HOOK(void, LSM_RET_VOID, sctp_sk_clone, struct sctp_association *asoc,
+ 	 struct sock *sk, struct sock *newsk)
+ #endif /* CONFIG_SECURITY_NETWORK */
+ 
+diff --git a/include/linux/lsm_hooks.h b/include/linux/lsm_hooks.h
+index 021d496e375e..94dbd6e613b5 100644
+--- a/include/linux/lsm_hooks.h
++++ b/include/linux/lsm_hooks.h
+@@ -958,9 +958,9 @@
+  * Security hooks for SCTP
+  *
+  * @sctp_assoc_request:
+- *	Passes the @ep and @chunk->skb of the association INIT packet to
++ *	Passes the @asoc and @chunk->skb of the association INIT packet to
+  *	the security module.
+- *	@ep pointer to sctp endpoint structure.
++ *	@asoc pointer to sctp association structure.
+  *	@skb pointer to skbuff of association packet.
+  *	Return 0 on success, error on failure.
+  * @sctp_bind_connect:
+@@ -978,9 +978,9 @@
+  *	Called whenever a new socket is created by accept(2) (i.e. a TCP
+  *	style socket) or when a socket is 'peeled off' e.g userspace
+  *	calls sctp_peeloff(3).
+- *	@ep pointer to current sctp endpoint structure.
++ *	@asoc pointer to current sctp association structure.
+  *	@sk pointer to current sock structure.
+- *	@sk pointer to new sock structure.
++ *	@newsk pointer to new sock structure.
+  *
+  * Security hooks for Infiniband
+  *
+diff --git a/include/linux/security.h b/include/linux/security.h
+index db504cd9f8e7..004766b5a81b 100644
+--- a/include/linux/security.h
++++ b/include/linux/security.h
+@@ -118,7 +118,7 @@ struct xfrm_policy;
+ struct xfrm_state;
+ struct xfrm_user_sec_ctx;
+ struct seq_file;
+-struct sctp_endpoint;
++struct sctp_association;
+ 
+ #ifdef CONFIG_MMU
+ extern unsigned long mmap_min_addr;
+@@ -1258,10 +1258,10 @@ int security_tun_dev_create(void);
+ int security_tun_dev_attach_queue(void *security);
+ int security_tun_dev_attach(struct sock *sk, void *security);
+ int security_tun_dev_open(void *security);
+-int security_sctp_assoc_request(struct sctp_endpoint *ep, struct sk_buff *skb);
++int security_sctp_assoc_request(struct sctp_association *asoc, struct sk_buff *skb);
+ int security_sctp_bind_connect(struct sock *sk, int optname,
+ 			       struct sockaddr *address, int addrlen);
+-void security_sctp_sk_clone(struct sctp_endpoint *ep, struct sock *sk,
++void security_sctp_sk_clone(struct sctp_association *asoc, struct sock *sk,
+ 			    struct sock *newsk);
+ 
+ #else	/* CONFIG_SECURITY_NETWORK */
+@@ -1462,7 +1462,7 @@ static inline int security_tun_dev_open(void *security)
+ 	return 0;
+ }
+ 
+-static inline int security_sctp_assoc_request(struct sctp_endpoint *ep,
++static inline int security_sctp_assoc_request(struct sctp_association *asoc,
+ 					      struct sk_buff *skb)
+ {
+ 	return 0;
+@@ -1475,7 +1475,7 @@ static inline int security_sctp_bind_connect(struct sock *sk, int optname,
+ 	return 0;
+ }
+ 
+-static inline void security_sctp_sk_clone(struct sctp_endpoint *ep,
++static inline void security_sctp_sk_clone(struct sctp_association *asoc,
+ 					  struct sock *sk,
+ 					  struct sock *newsk)
+ {
+* Unmerged path include/net/sctp/structs.h
+diff --git a/net/sctp/sm_statefuns.c b/net/sctp/sm_statefuns.c
+index 1031b88f0c6e..5e0e0f613e6a 100644
+--- a/net/sctp/sm_statefuns.c
++++ b/net/sctp/sm_statefuns.c
+@@ -335,11 +335,6 @@ enum sctp_disposition sctp_sf_do_5_1B_init(struct net *net,
+ 	struct sctp_packet *packet;
+ 	int len;
+ 
+-	/* Update socket peer label if first association. */
+-	if (security_sctp_assoc_request((struct sctp_endpoint *)ep,
+-					chunk->skb))
+-		return sctp_sf_pdiscard(net, ep, asoc, type, arg, commands);
+-
+ 	/* 6.10 Bundling
+ 	 * An endpoint MUST NOT bundle INIT, INIT ACK or
+ 	 * SHUTDOWN COMPLETE with any other chunks.
+@@ -424,6 +419,12 @@ enum sctp_disposition sctp_sf_do_5_1B_init(struct net *net,
+ 	if (!new_asoc)
+ 		goto nomem;
+ 
++	/* Update socket peer label if first association. */
++	if (security_sctp_assoc_request(new_asoc, chunk->skb)) {
++		sctp_association_free(new_asoc);
++		return sctp_sf_pdiscard(net, ep, asoc, type, arg, commands);
++	}
++
+ 	if (sctp_assoc_set_bind_addr_from_ep(new_asoc,
+ 					     sctp_scope(sctp_source(chunk)),
+ 					     GFP_ATOMIC) < 0)
+@@ -785,7 +786,6 @@ enum sctp_disposition sctp_sf_do_5_1D_ce(struct net *net,
+ 		}
+ 	}
+ 
+-
+ 	/* Delay state machine commands until later.
+ 	 *
+ 	 * Re-build the bind address for the association is done in
+@@ -1485,11 +1485,6 @@ static enum sctp_disposition sctp_sf_do_unexpected_init(
+ 	struct sctp_packet *packet;
+ 	int len;
+ 
+-	/* Update socket peer label if first association. */
+-	if (security_sctp_assoc_request((struct sctp_endpoint *)ep,
+-					chunk->skb))
+-		return sctp_sf_pdiscard(net, ep, asoc, type, arg, commands);
+-
+ 	/* 6.10 Bundling
+ 	 * An endpoint MUST NOT bundle INIT, INIT ACK or
+ 	 * SHUTDOWN COMPLETE with any other chunks.
+@@ -1566,6 +1561,12 @@ static enum sctp_disposition sctp_sf_do_unexpected_init(
+ 	if (!new_asoc)
+ 		goto nomem;
+ 
++	/* Update socket peer label if first association. */
++	if (security_sctp_assoc_request(new_asoc, chunk->skb)) {
++		sctp_association_free(new_asoc);
++		return sctp_sf_pdiscard(net, ep, asoc, type, arg, commands);
++	}
++
+ 	if (sctp_assoc_set_bind_addr_from_ep(new_asoc,
+ 				sctp_scope(sctp_source(chunk)), GFP_ATOMIC) < 0)
+ 		goto nomem;
+@@ -2225,8 +2226,7 @@ enum sctp_disposition sctp_sf_do_5_2_4_dupcook(
+ 	}
+ 
+ 	/* Update socket peer label if first association. */
+-	if (security_sctp_assoc_request((struct sctp_endpoint *)ep,
+-					chunk->skb)) {
++	if (security_sctp_assoc_request(new_asoc, chunk->skb)) {
+ 		sctp_association_free(new_asoc);
+ 		return sctp_sf_pdiscard(net, ep, asoc, type, arg, commands);
+ 	}
+diff --git a/net/sctp/socket.c b/net/sctp/socket.c
+index 9ab6f35b15d4..ec399de92e5d 100644
+--- a/net/sctp/socket.c
++++ b/net/sctp/socket.c
+@@ -9544,7 +9544,6 @@ void sctp_copy_sock(struct sock *newsk, struct sock *sk,
+ 	struct inet_sock *inet = inet_sk(sk);
+ 	struct inet_sock *newinet;
+ 	struct sctp_sock *sp = sctp_sk(sk);
+-	struct sctp_endpoint *ep = sp->ep;
+ 
+ 	newsk->sk_type = sk->sk_type;
+ 	newsk->sk_bound_dev_if = sk->sk_bound_dev_if;
+@@ -9589,9 +9588,9 @@ void sctp_copy_sock(struct sock *newsk, struct sock *sk,
+ 		net_enable_timestamp();
+ 
+ 	/* Set newsk security attributes from original sk and connection
+-	 * security attribute from ep.
++	 * security attribute from asoc.
+ 	 */
+-	security_sctp_sk_clone(ep, sk, newsk);
++	security_sctp_sk_clone(asoc, sk, newsk);
+ }
+ 
+ static inline void sctp_copy_descendant(struct sock *sk_to,
+diff --git a/security/security.c b/security/security.c
+index 3186ac8031f0..991c12ca9bcb 100644
+--- a/security/security.c
++++ b/security/security.c
+@@ -2188,9 +2188,9 @@ int security_tun_dev_open(void *security)
+ }
+ EXPORT_SYMBOL(security_tun_dev_open);
+ 
+-int security_sctp_assoc_request(struct sctp_endpoint *ep, struct sk_buff *skb)
++int security_sctp_assoc_request(struct sctp_association *asoc, struct sk_buff *skb)
+ {
+-	return call_int_hook(sctp_assoc_request, 0, ep, skb);
++	return call_int_hook(sctp_assoc_request, 0, asoc, skb);
+ }
+ EXPORT_SYMBOL(security_sctp_assoc_request);
+ 
+@@ -2202,10 +2202,10 @@ int security_sctp_bind_connect(struct sock *sk, int optname,
+ }
+ EXPORT_SYMBOL(security_sctp_bind_connect);
+ 
+-void security_sctp_sk_clone(struct sctp_endpoint *ep, struct sock *sk,
++void security_sctp_sk_clone(struct sctp_association *asoc, struct sock *sk,
+ 			    struct sock *newsk)
+ {
+-	call_void_hook(sctp_sk_clone, ep, sk, newsk);
++	call_void_hook(sctp_sk_clone, asoc, sk, newsk);
+ }
+ EXPORT_SYMBOL(security_sctp_sk_clone);
+ 
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index 97342403aade..bafadad9e516 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -5285,10 +5285,10 @@ static void selinux_sock_graft(struct sock *sk, struct socket *parent)
+  * connect(2), sctp_connectx(3) or sctp_sendmsg(3) (with no association
+  * already present).
+  */
+-static int selinux_sctp_assoc_request(struct sctp_endpoint *ep,
++static int selinux_sctp_assoc_request(struct sctp_association *asoc,
+ 				      struct sk_buff *skb)
+ {
+-	struct sk_security_struct *sksec = ep->base.sk->sk_security;
++	struct sk_security_struct *sksec = asoc->base.sk->sk_security;
+ 	struct common_audit_data ad;
+ 	struct lsm_network_audit net = {0,};
+ 	u8 peerlbl_active;
+@@ -5305,7 +5305,7 @@ static int selinux_sctp_assoc_request(struct sctp_endpoint *ep,
+ 		/* This will return peer_sid = SECSID_NULL if there are
+ 		 * no peer labels, see security_net_peersid_resolve().
+ 		 */
+-		err = selinux_skb_peerlbl_sid(skb, ep->base.sk->sk_family,
++		err = selinux_skb_peerlbl_sid(skb, asoc->base.sk->sk_family,
+ 					      &peer_sid);
+ 		if (err)
+ 			return err;
+@@ -5329,7 +5329,7 @@ static int selinux_sctp_assoc_request(struct sctp_endpoint *ep,
+ 		 */
+ 		ad.type = LSM_AUDIT_DATA_NET;
+ 		ad.u.net = &net;
+-		ad.u.net->sk = ep->base.sk;
++		ad.u.net->sk = asoc->base.sk;
+ 		err = avc_has_perm(&selinux_state,
+ 				   sksec->peer_sid, peer_sid, sksec->sclass,
+ 				   SCTP_SOCKET__ASSOCIATION, &ad);
+@@ -5338,7 +5338,7 @@ static int selinux_sctp_assoc_request(struct sctp_endpoint *ep,
+ 	}
+ 
+ 	/* Compute the MLS component for the connection and store
+-	 * the information in ep. This will be used by SCTP TCP type
++	 * the information in asoc. This will be used by SCTP TCP type
+ 	 * sockets and peeled off connections as they cause a new
+ 	 * socket to be generated. selinux_sctp_sk_clone() will then
+ 	 * plug this into the new socket.
+@@ -5347,11 +5347,11 @@ static int selinux_sctp_assoc_request(struct sctp_endpoint *ep,
+ 	if (err)
+ 		return err;
+ 
+-	ep->secid = conn_sid;
+-	ep->peer_secid = peer_sid;
++	asoc->secid = conn_sid;
++	asoc->peer_secid = peer_sid;
+ 
+ 	/* Set any NetLabel labels including CIPSO/CALIPSO options. */
+-	return selinux_netlbl_sctp_assoc_request(ep, skb);
++	return selinux_netlbl_sctp_assoc_request(asoc, skb);
+ }
+ 
+ /* Check if sctp IPv4/IPv6 addresses are valid for binding or connecting
+@@ -5436,7 +5436,7 @@ static int selinux_sctp_bind_connect(struct sock *sk, int optname,
+ }
+ 
+ /* Called whenever a new socket is created by accept(2) or sctp_peeloff(3). */
+-static void selinux_sctp_sk_clone(struct sctp_endpoint *ep, struct sock *sk,
++static void selinux_sctp_sk_clone(struct sctp_association *asoc, struct sock *sk,
+ 				  struct sock *newsk)
+ {
+ 	struct sk_security_struct *sksec = sk->sk_security;
+@@ -5448,8 +5448,8 @@ static void selinux_sctp_sk_clone(struct sctp_endpoint *ep, struct sock *sk,
+ 	if (!selinux_policycap_extsockclass())
+ 		return selinux_sk_clone_security(sk, newsk);
+ 
+-	newsksec->sid = ep->secid;
+-	newsksec->peer_sid = ep->peer_secid;
++	newsksec->sid = asoc->secid;
++	newsksec->peer_sid = asoc->peer_secid;
+ 	newsksec->sclass = sksec->sclass;
+ 	selinux_netlbl_sctp_sk_clone(sk, newsk);
+ }
+diff --git a/security/selinux/include/netlabel.h b/security/selinux/include/netlabel.h
+index 23138ee5d000..26169909d635 100644
+--- a/security/selinux/include/netlabel.h
++++ b/security/selinux/include/netlabel.h
+@@ -53,7 +53,7 @@ int selinux_netlbl_skbuff_getsid(struct sk_buff *skb,
+ int selinux_netlbl_skbuff_setsid(struct sk_buff *skb,
+ 				 u16 family,
+ 				 u32 sid);
+-int selinux_netlbl_sctp_assoc_request(struct sctp_endpoint *ep,
++int selinux_netlbl_sctp_assoc_request(struct sctp_association *asoc,
+ 				     struct sk_buff *skb);
+ int selinux_netlbl_inet_conn_request(struct request_sock *req, u16 family);
+ void selinux_netlbl_inet_csk_clone(struct sock *sk, u16 family);
+@@ -112,7 +112,7 @@ static inline int selinux_netlbl_skbuff_setsid(struct sk_buff *skb,
+ 	return 0;
+ }
+ 
+-static inline int selinux_netlbl_sctp_assoc_request(struct sctp_endpoint *ep,
++static inline int selinux_netlbl_sctp_assoc_request(struct sctp_association *asoc,
+ 						    struct sk_buff *skb)
+ {
+ 	return 0;
+diff --git a/security/selinux/netlabel.c b/security/selinux/netlabel.c
+index 6fd9954e1c08..2bc80ca4fef7 100644
+--- a/security/selinux/netlabel.c
++++ b/security/selinux/netlabel.c
+@@ -274,30 +274,30 @@ int selinux_netlbl_skbuff_setsid(struct sk_buff *skb,
+ 
+ /**
+  * selinux_netlbl_sctp_assoc_request - Label an incoming sctp association.
+- * @ep: incoming association endpoint.
++ * @asoc: incoming association.
+  * @skb: the packet.
+  *
+  * Description:
+- * A new incoming connection is represented by @ep, ......
++ * A new incoming connection is represented by @asoc, ......
+  * Returns zero on success, negative values on failure.
+  *
+  */
+-int selinux_netlbl_sctp_assoc_request(struct sctp_endpoint *ep,
++int selinux_netlbl_sctp_assoc_request(struct sctp_association *asoc,
+ 				     struct sk_buff *skb)
+ {
+ 	int rc;
+ 	struct netlbl_lsm_secattr secattr;
+-	struct sk_security_struct *sksec = ep->base.sk->sk_security;
++	struct sk_security_struct *sksec = asoc->base.sk->sk_security;
+ 	struct sockaddr_in addr4;
+ 	struct sockaddr_in6 addr6;
+ 
+-	if (ep->base.sk->sk_family != PF_INET &&
+-				ep->base.sk->sk_family != PF_INET6)
++	if (asoc->base.sk->sk_family != PF_INET &&
++	    asoc->base.sk->sk_family != PF_INET6)
+ 		return 0;
+ 
+ 	netlbl_secattr_init(&secattr);
+ 	rc = security_netlbl_sid_to_secattr(&selinux_state,
+-					    ep->secid, &secattr);
++					    asoc->secid, &secattr);
+ 	if (rc != 0)
+ 		goto assoc_request_return;
+ 
+@@ -307,11 +307,11 @@ int selinux_netlbl_sctp_assoc_request(struct sctp_endpoint *ep,
+ 	if (ip_hdr(skb)->version == 4) {
+ 		addr4.sin_family = AF_INET;
+ 		addr4.sin_addr.s_addr = ip_hdr(skb)->saddr;
+-		rc = netlbl_conn_setattr(ep->base.sk, (void *)&addr4, &secattr);
++		rc = netlbl_conn_setattr(asoc->base.sk, (void *)&addr4, &secattr);
+ 	} else if (IS_ENABLED(CONFIG_IPV6) && ip_hdr(skb)->version == 6) {
+ 		addr6.sin6_family = AF_INET6;
+ 		addr6.sin6_addr = ipv6_hdr(skb)->saddr;
+-		rc = netlbl_conn_setattr(ep->base.sk, (void *)&addr6, &secattr);
++		rc = netlbl_conn_setattr(asoc->base.sk, (void *)&addr6, &secattr);
+ 	} else {
+ 		rc = -EAFNOSUPPORT;
+ 	}
