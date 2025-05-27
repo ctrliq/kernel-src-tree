@@ -918,7 +918,7 @@ u64 kcpustat_field(struct kernel_cpustat *kcpustat,
 
 	/* Only support sys vtime for now */
 	if (usage != CPUTIME_SYSTEM)
-		return cpustat[usage];
+		return val;
 
 	rq = cpu_rq(cpu);
 
