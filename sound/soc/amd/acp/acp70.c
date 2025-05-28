@@ -119,14 +119,14 @@ static struct snd_soc_dai_driver acp70_dai[] = {
 },
 };
 
-static int acp70_i2s_master_clock_generate(struct acp_dev_data *adata)
+static int acp70_i2s_master_clock_generate(int acp_rev)
 {
 	struct pci_dev *smn_dev;
 	u32 device_id;
 
-	if (adata->acp_rev == ACP70_PCI_ID)
+	if (acp_rev == ACP70_PCI_ID)
 		device_id = 0x1507;
-	else if (adata->acp_rev == ACP71_PCI_ID)
+	else if (acp_rev == ACP71_PCI_ID)
 		device_id = 0x1122;
 	else
 		return -ENODEV;
@@ -167,7 +167,7 @@ static int acp_acp70_audio_probe(struct platform_device *pdev)
 	chip->dai_driver = acp70_dai;
 	chip->num_dai = ARRAY_SIZE(acp70_dai);
 
-	ret = acp70_i2s_master_clock_generate(adata);
+	ret = acp70_i2s_master_clock_generate(chip->acp_rev);
 	if (ret) {
 		dev_err(&pdev->dev, "Failed to set I2S master clock as 196.608MHz\n");
 		return ret;
