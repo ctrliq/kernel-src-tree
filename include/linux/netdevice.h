@@ -846,6 +846,7 @@ enum net_device_path_type {
 	DEV_PATH_BRIDGE,
 	DEV_PATH_PPPOE,
 	DEV_PATH_DSA,
+	DEV_PATH_MTK_WDMA,
 };
 
 struct net_device_path {
@@ -871,6 +872,12 @@ struct net_device_path {
 			int port;
 			u16 proto;
 		} dsa;
+		struct {
+			u8 wdma_idx;
+			u8 queue;
+			u16 wcid;
+			u8 bss;
+		} mtk_wdma;
 	};
 };
 
@@ -1857,7 +1864,6 @@ enum netdev_reg_state {
  *	@wireless_handlers:	List of functions to handle Wireless Extensions,
  *				instead of ioctl,
  *				see <net/iw_handler.h> for details.
- *	@wireless_data:	Instance data managed by the core of wireless extensions
  *
  *	@netdev_ops:	Includes several pointers to callbacks,
  *			if one wants to override the ndo_*() functions
@@ -2233,7 +2239,6 @@ struct net_device {
 
 #ifdef CONFIG_WIRELESS_EXT
 	const struct iw_handler_def *wireless_handlers;
-	struct iw_public_data	*wireless_data;
 #endif
 	const struct ethtool_ops *ethtool_ops;
 #ifdef CONFIG_NET_L3_MASTER_DEV

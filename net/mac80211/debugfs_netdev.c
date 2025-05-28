@@ -221,10 +221,9 @@ static ssize_t ieee80211_if_fmt_##name(					\
 }
 
 #define _IEEE80211_IF_FILE_OPS(name, _read, _write)			\
-static const struct file_operations name##_ops = {			\
+static const struct debugfs_short_fops name##_ops = {				\
 	.read = (_read),						\
 	.write = (_write),						\
-	.open = simple_open,						\
 	.llseek = generic_file_llseek,					\
 }
 
@@ -728,7 +727,7 @@ static ssize_t ieee80211_if_parse_active_links(struct ieee80211_sub_if_data *sda
 {
 	u16 active_links;
 
-	if (kstrtou16(buf, 0, &active_links))
+	if (kstrtou16(buf, 0, &active_links) || !active_links)
 		return -EINVAL;
 
 	return ieee80211_set_active_links(&sdata->vif, active_links) ?: buflen;
