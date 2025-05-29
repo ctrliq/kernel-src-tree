@@ -293,7 +293,8 @@ struct scsi_device {
 	RH_KABI_USE(2, struct scsi_vpd __rcu *vpd_pgb1)
 	RH_KABI_USE(3, struct scsi_vpd __rcu *vpd_pgb2)
 	RH_KABI_USE(4, struct scsi_vpd __rcu *vpd_pgb7)
-	RH_KABI_RESERVE(5)
+	RH_KABI_USE_SPLIT(5, unsigned int ua_new_media_ctr,	/* Counter for New Media UNIT ATTENTIONs */
+			     unsigned int ua_por_ctr)		/* Counter for Power On / Reset UAs */
 	RH_KABI_RESERVE(6)
 
 	unsigned long		sdev_data[];
