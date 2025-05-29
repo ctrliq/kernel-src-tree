@@ -392,12 +392,12 @@ static int shmem_reserve_inode(struct super_block *sb, ino_t *inop)
 	return 0;
 }
 
-static void shmem_free_inode(struct super_block *sb)
+static void shmem_free_inode(struct super_block *sb, size_t freed_ispace)
 {
 	struct shmem_sb_info *sbinfo = SHMEM_SB(sb);
 	if (sbinfo->max_inodes) {
 		raw_spin_lock(&sbinfo->stat_lock);
-		sbinfo->free_ispace += BOGO_INODE_SIZE;
+		sbinfo->free_ispace += BOGO_INODE_SIZE + freed_ispace;
 		raw_spin_unlock(&sbinfo->stat_lock);
 	}
 }
@@ -1238,6 +1238,7 @@ static void shmem_evict_inode(struct inode *inode)
 {
 	struct shmem_inode_info *info = SHMEM_I(inode);
 	struct shmem_sb_info *sbinfo = SHMEM_SB(inode->i_sb);
+	size_t freed = 0;
 
 	if (shmem_mapping(inode->i_mapping)) {
 		shmem_unacct_size(info->flags, inode->i_size);
@@ -1264,9 +1265,9 @@ static void shmem_evict_inode(struct inode *inode)
 		}
 	}
 
-	simple_xattrs_free(&info->xattrs);
+	simple_xattrs_free(&info->xattrs, sbinfo->max_inodes ? &freed : NULL);
+	shmem_free_inode(inode->i_sb, freed);
 	WARN_ON(inode->i_blocks);
-	shmem_free_inode(inode->i_sb);
 	clear_inode(inode);
 #ifdef CONFIG_TMPFS_QUOTA
 	dquot_free_inode(inode);
@@ -2471,7 +2472,7 @@ static struct inode *__shmem_get_inode(struct mnt_idmap *idmap,
 
 	inode = new_inode(sb);
 	if (!inode) {
-		shmem_free_inode(sb);
+		shmem_free_inode(sb, 0);
 		return ERR_PTR(-ENOSPC);
 	}
 
@@ -3345,7 +3346,7 @@ static int shmem_unlink(struct inode *dir, struct dentry *dentry)
 	struct inode *inode = d_inode(dentry);
 
 	if (inode->i_nlink > 1 && !S_ISDIR(inode->i_mode))
-		shmem_free_inode(inode->i_sb);
+		shmem_free_inode(inode->i_sb, 0);
 
 	dir->i_size -= BOGO_DIRENT_SIZE;
 	dir->i_mtime = inode_set_ctime_to_ts(dir,
@@ -3583,21 +3584,40 @@ static int shmem_initxattrs(struct inode *inode,
 			    void *fs_info)
 {
 	struct shmem_inode_info *info = SHMEM_I(inode);
+	struct shmem_sb_info *sbinfo = SHMEM_SB(inode->i_sb);
 	const struct xattr *xattr;
 	struct simple_xattr *new_xattr;
+	size_t ispace = 0;
 	size_t len;
+
+	if (sbinfo->max_inodes) {
+		for (xattr = xattr_array; xattr->name != NULL; xattr++) {
+			ispace += simple_xattr_space(xattr->name,
+				xattr->value_len + XATTR_SECURITY_PREFIX_LEN);
+		}
+		if (ispace) {
+			raw_spin_lock(&sbinfo->stat_lock);
+			if (sbinfo->free_ispace < ispace)
+				ispace = 0;
+			else
+				sbinfo->free_ispace -= ispace;
+			raw_spin_unlock(&sbinfo->stat_lock);
+			if (!ispace)
+				return -ENOSPC;
+		}
+	}
 
 	for (xattr = xattr_array; xattr->name != NULL; xattr++) {
 		new_xattr = simple_xattr_alloc(xattr->value, xattr->value_len);
 		if (!new_xattr)
-			return -ENOMEM;
+			break;
 
 		len = strlen(xattr->name) + 1;
 		new_xattr->name = kmalloc(XATTR_SECURITY_PREFIX_LEN + len,
 					  GFP_KERNEL);
 		if (!new_xattr->name) {
 			kvfree(new_xattr);
-			return -ENOMEM;
+			break;
 		}
 
 		memcpy(new_xattr->name, XATTR_SECURITY_PREFIX,
@@ -3606,6 +3626,16 @@ static int shmem_initxattrs(struct inode *inode,
 		       xattr->name, len);
 
 		simple_xattr_add(&info->xattrs, new_xattr);
+	}
+
+	if (xattr->name != NULL) {
+		if (ispace) {
+			raw_spin_lock(&sbinfo->stat_lock);
+			sbinfo->free_ispace += ispace;
+			raw_spin_unlock(&sbinfo->stat_lock);
+		}
+		simple_xattrs_free(&info->xattrs, NULL);
+		return -ENOMEM;
 	}
 
 	return 0;
@@ -3628,15 +3658,38 @@ static int shmem_xattr_handler_set(const struct xattr_handler *handler,
 				   size_t size, int flags)
 {
 	struct shmem_inode_info *info = SHMEM_I(inode);
+	struct shmem_sb_info *sbinfo = SHMEM_SB(inode->i_sb);
 	struct simple_xattr *old_xattr;
+	size_t ispace = 0;
 
 	name = xattr_full_name(handler, name);
+	if (value && sbinfo->max_inodes) {
+		ispace = simple_xattr_space(name, size);
+		raw_spin_lock(&sbinfo->stat_lock);
+		if (sbinfo->free_ispace < ispace)
+			ispace = 0;
+		else
+			sbinfo->free_ispace -= ispace;
+		raw_spin_unlock(&sbinfo->stat_lock);
+		if (!ispace)
+			return -ENOSPC;
+	}
+
 	old_xattr = simple_xattr_set(&info->xattrs, name, value, size, flags);
 	if (!IS_ERR(old_xattr)) {
+		ispace = 0;
+		if (old_xattr && sbinfo->max_inodes)
+			ispace = simple_xattr_space(old_xattr->name,
+						    old_xattr->size);
 		simple_xattr_free(old_xattr);
 		old_xattr = NULL;
 		inode_set_ctime_current(inode);
 		inode_inc_iversion(inode);
+	}
+	if (ispace) {
+		raw_spin_lock(&sbinfo->stat_lock);
+		sbinfo->free_ispace += ispace;
+		raw_spin_unlock(&sbinfo->stat_lock);
 	}
 	return PTR_ERR(old_xattr);
 }
@@ -3653,6 +3706,12 @@ static const struct xattr_handler shmem_trusted_xattr_handler = {
 	.set = shmem_xattr_handler_set,
 };
 
+static const struct xattr_handler shmem_user_xattr_handler = {
+	.prefix = XATTR_USER_PREFIX,
+	.get = shmem_xattr_handler_get,
+	.set = shmem_xattr_handler_set,
+};
+
 static const struct xattr_handler *shmem_xattr_handlers[] = {
 #ifdef CONFIG_TMPFS_POSIX_ACL
 	&posix_acl_access_xattr_handler,
@@ -3660,6 +3719,7 @@ static const struct xattr_handler *shmem_xattr_handlers[] = {
 #endif
 	&shmem_security_xattr_handler,
 	&shmem_trusted_xattr_handler,
+	&shmem_user_xattr_handler,
 	NULL
 };
 
