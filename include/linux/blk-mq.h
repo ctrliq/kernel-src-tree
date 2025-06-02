@@ -28,7 +28,7 @@ typedef enum rq_end_io_ret (rq_end_io_fn)(struct request *, blk_status_t);
 typedef __u32 __bitwise req_flags_t;
 
 /* Keep rqf_name[] in sync with the definitions below */
-enum {
+enum rqf_flags {
 	/* drive already may have started this one */
 	__RQF_STARTED,
 	/* request for flush sequence */
@@ -1173,14 +1173,13 @@ static inline unsigned short blk_rq_nr_discard_segments(struct request *rq)
 	return max_t(unsigned short, rq->nr_phys_segments, 1);
 }
 
-int __blk_rq_map_sg(struct request_queue *q, struct request *rq,
-		struct scatterlist *sglist, struct scatterlist **last_sg);
-static inline int blk_rq_map_sg(struct request_queue *q, struct request *rq,
-		struct scatterlist *sglist)
+int __blk_rq_map_sg(struct request *rq, struct scatterlist *sglist,
+		struct scatterlist **last_sg);
+static inline int blk_rq_map_sg(struct request *rq, struct scatterlist *sglist)
 {
 	struct scatterlist *last_sg = NULL;
 
-	return __blk_rq_map_sg(q, rq, sglist, &last_sg);
+	return __blk_rq_map_sg(rq, sglist, &last_sg);
 }
 void blk_dump_rq_flags(struct request *, char *);
 
