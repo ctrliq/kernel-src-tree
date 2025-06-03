@@ -6,7 +6,7 @@
 #include <linux/slab.h>
 
 /**
- * x86_match_cpu - match current CPU again an array of x86_cpu_ids
+ * x86_match_cpu - match current CPU against an array of x86_cpu_ids
  * @match: Pointer to array of x86_cpu_ids. Last entry terminated with
  *         {}.
  *
@@ -86,3 +86,14 @@ bool x86_cpu_has_min_microcode_rev(const struct x86_cpu_desc *table)
 	return true;
 }
 EXPORT_SYMBOL_GPL(x86_cpu_has_min_microcode_rev);
+
+bool x86_match_min_microcode_rev(const struct x86_cpu_id *table)
+{
+	const struct x86_cpu_id *res = x86_match_cpu(table);
+
+	if (!res || res->driver_data > boot_cpu_data.microcode)
+		return false;
+
+	return true;
+}
+EXPORT_SYMBOL_GPL(x86_match_min_microcode_rev);
