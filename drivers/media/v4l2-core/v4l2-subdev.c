@@ -2193,6 +2193,9 @@ int v4l2_subdev_enable_streams(struct v4l2_subdev *sd, u32 pad,
 	bool use_s_stream;
 	int ret;
 
+	dev_dbg(dev, "enable streams \"%s\":%u/%#llx\n", sd->entity.name, pad,
+		streams_mask);
+
 	/* A few basic sanity checks first. */
 	if (pad >= sd->entity.num_pads)
 		return -EINVAL;
@@ -2240,8 +2243,6 @@ int v4l2_subdev_enable_streams(struct v4l2_subdev *sd, u32 pad,
 		goto done;
 	}
 
-	dev_dbg(dev, "enable streams %u:%#llx\n", pad, streams_mask);
-
 	already_streaming = v4l2_subdev_is_streaming(sd);
 
 	if (!use_s_stream) {
@@ -2282,6 +2283,9 @@ int v4l2_subdev_disable_streams(struct v4l2_subdev *sd, u32 pad,
 	u64 found_streams;
 	bool use_s_stream;
 	int ret;
+
+	dev_dbg(dev, "disable streams \"%s\":%u/%#llx\n", sd->entity.name, pad,
+		streams_mask);
 
 	/* A few basic sanity checks first. */
 	if (pad >= sd->entity.num_pads)
@@ -2329,8 +2333,6 @@ int v4l2_subdev_disable_streams(struct v4l2_subdev *sd, u32 pad,
 		ret = -EALREADY;
 		goto done;
 	}
-
-	dev_dbg(dev, "disable streams %u:%#llx\n", pad, streams_mask);
 
 	if (!use_s_stream) {
 		/* Call the .disable_streams() operation. */
