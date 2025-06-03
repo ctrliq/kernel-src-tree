@@ -853,7 +853,7 @@ static struct xfrm_state *xfrm_state_construct(struct net *net,
 		x->nat_keepalive_interval =
 			nla_get_u32(attrs[XFRMA_NAT_KEEPALIVE_INTERVAL]);
 
-	err = __xfrm_init_state(x, false, extack);
+	err = __xfrm_init_state(x, extack);
 	if (err)
 		goto error;
 
