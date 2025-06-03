@@ -45,4 +45,5 @@ $(OUTPUT)/nf_queue: LDLIBS += $(MNL_LDLIBS)
 TEST_FILES := lib.sh
 
 TEST_INCLUDES := \
-	../lib.sh
+	../lib.sh \
+	$(wildcard ../lib/sh/*.sh)
