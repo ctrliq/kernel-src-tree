@@ -24,7 +24,6 @@
 #include "iommu.h"
 #include "../irq_remapping.h"
 #include "../iommu-pages.h"
-#include "cap_audit.h"
 
 enum irq_mode {
 	IRQ_REMAPPING,
@@ -312,7 +311,7 @@ static int set_ioapic_sid(struct irte *irte, int apic)
 
 	for (i = 0; i < MAX_IO_APICS; i++) {
 		if (ir_ioapic[i].iommu && ir_ioapic[i].id == apic) {
-			sid = (ir_ioapic[i].bus << 8) | ir_ioapic[i].devfn;
+			sid = PCI_DEVID(ir_ioapic[i].bus, ir_ioapic[i].devfn);
 			break;
 		}
 	}
@@ -337,7 +336,7 @@ static int set_hpet_sid(struct irte *irte, u8 id)
 
 	for (i = 0; i < MAX_HPET_TBS; i++) {
 		if (ir_hpet[i].iommu && ir_hpet[i].id == id) {
-			sid = (ir_hpet[i].bus << 8) | ir_hpet[i].devfn;
+			sid = PCI_DEVID(ir_hpet[i].bus, ir_hpet[i].devfn);
 			break;
 		}
 	}
@@ -725,9 +724,6 @@ static int __init intel_prepare_irq_remapping(void)
 	}
 
 	if (dmar_table_init() < 0)
-		return -ENODEV;
-
-	if (intel_cap_audit(CAP_AUDIT_STATIC_IRQR, NULL))
 		return -ENODEV;
 
 	if (!dmar_ir_support())
@@ -1533,10 +1529,6 @@ static int dmar_ir_add(struct dmar_drhd_unit *dmaru, struct intel_iommu *iommu)
 {
 	int ret;
 	int eim = x2apic_enabled();
-
-	ret = intel_cap_audit(CAP_AUDIT_HOTPLUG_IRQR, iommu);
-	if (ret)
-		return ret;
 
 	if (eim && !ecap_eim_support(iommu->ecap)) {
 		pr_info("DRHD %Lx: EIM not supported by DRHD, ecap %Lx\n",
