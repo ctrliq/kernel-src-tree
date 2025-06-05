@@ -915,7 +915,6 @@ static const struct drm_driver repaper_driver = {
 	DRM_GEM_DMA_DRIVER_OPS_VMAP,
 	.name			= "repaper",
 	.desc			= "Pervasive Displays RePaper e-ink panels",
-	.date			= "20170405",
 	.major			= 1,
 	.minor			= 0,
 };

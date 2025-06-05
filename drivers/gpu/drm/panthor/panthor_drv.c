@@ -1407,7 +1407,6 @@ static const struct drm_driver panthor_drm_driver = {
 	.fops = &panthor_drm_driver_fops,
 	.name = "panthor",
 	.desc = "Panthor DRM driver",
-	.date = "20230801",
 	.major = 1,
 	.minor = 0,
 

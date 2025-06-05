@@ -33,7 +33,6 @@
 
 #define DRIVER_NAME	"vkms"
 #define DRIVER_DESC	"Virtual Kernel Mode Setting"
-#define DRIVER_DATE	"20180514"
 #define DRIVER_MAJOR	1
 #define DRIVER_MINOR	0
 
@@ -115,7 +114,6 @@ static const struct drm_driver vkms_driver = {
 
 	.name			= DRIVER_NAME,
 	.desc			= DRIVER_DESC,
-	.date			= DRIVER_DATE,
 	.major			= DRIVER_MAJOR,
 	.minor			= DRIVER_MINOR,
 };
