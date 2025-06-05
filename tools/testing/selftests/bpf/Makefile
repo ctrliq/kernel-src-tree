@@ -131,7 +131,6 @@ TEST_PROGS := test_kmod.sh \
 	test_xdp_redirect_multi.sh \
 	test_xdp_meta.sh \
 	test_tunnel.sh \
-	test_lwt_seg6local.sh \
 	test_lirc_mode2.sh \
 	test_flow_dissector.sh \
 	test_xdp_vlan_mode_generic.sh \
