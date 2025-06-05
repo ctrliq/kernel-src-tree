@@ -20,7 +20,7 @@
 #include "ivpu_mmu.h"
 #include "ivpu_mmu_context.h"
 
-MODULE_IMPORT_NS("DMA_BUF");
+MODULE_IMPORT_NS(DMA_BUF);
 
 static const struct drm_gem_object_funcs ivpu_gem_funcs;
 
