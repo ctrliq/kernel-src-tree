@@ -484,6 +484,9 @@ int __ethtool_get_link_ksettings(struct net_device *dev,
 		return err;
 	}
 
+	if (!netif_device_present(dev))
+		return -ENODEV;
+
 	memset(link_ksettings, 0, sizeof(*link_ksettings));
 	return __rh_call_get_link_ksettings(dev, link_ksettings);
 }
