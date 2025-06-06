@@ -49,7 +49,7 @@ LIST_HEAD(reset_fnic_list);
 DEFINE_SPINLOCK(reset_fnic_list_lock);
 
 /* Supported devices by fnic module */
-static struct pci_device_id fnic_id_table[] = {
+static const struct pci_device_id fnic_id_table[] = {
 	{ PCI_DEVICE(PCI_VENDOR_ID_CISCO, PCI_DEVICE_ID_CISCO_FNIC) },
 	{ 0, }
 };
