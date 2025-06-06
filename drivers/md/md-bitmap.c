@@ -224,7 +224,7 @@ static unsigned int bitmap_io_size(unsigned int io_size, unsigned int opt_size,
 }
 
 static int __write_sb_page(struct md_rdev *rdev, struct bitmap *bitmap,
-			   struct page *page)
+			    unsigned long pg_index, struct page *page)
 {
 	struct block_device *bdev;
 	struct mddev *mddev = bitmap->mddev;
@@ -278,7 +278,8 @@ static int __write_sb_page(struct md_rdev *rdev, struct bitmap *bitmap,
 	return 0;
 }
 
-static void write_sb_page(struct bitmap *bitmap, struct page *page, int wait)
+static void write_sb_page(struct bitmap *bitmap, unsigned long pg_index,
+			  struct page *page, int wait)
 {
 	struct mddev *mddev = bitmap->mddev;
 
@@ -286,7 +287,7 @@ static void write_sb_page(struct bitmap *bitmap, struct page *page, int wait)
 		struct md_rdev *rdev = NULL;
 
 		while ((rdev = next_active_rdev(rdev, mddev)) != NULL) {
-			if (__write_sb_page(rdev, bitmap, page) < 0) {
+			if (__write_sb_page(rdev, bitmap, pg_index, page) < 0) {
 				set_bit(BITMAP_WRITE_ERROR, &bitmap->flags);
 				return;
 			}
@@ -298,12 +299,13 @@ static void md_bitmap_file_kick(struct bitmap *bitmap);
 /*
  * write out a page to a file
  */
-static void write_page(struct bitmap *bitmap, struct page *page, int wait)
+static void write_page(struct bitmap *bitmap, unsigned long pg_index,
+		       struct page *page, int wait)
 {
 	struct buffer_head *bh;
 
 	if (bitmap->storage.file == NULL) {
-		write_sb_page(bitmap, page, wait);
+		write_sb_page(bitmap, pg_index, page, wait);
 	} else {
 
 		bh = page_buffers(page);
@@ -486,7 +488,7 @@ void md_bitmap_update_sb(struct bitmap *bitmap)
 	sb->sectors_reserved = cpu_to_le32(bitmap->mddev->
 					   bitmap_info.space);
 	kunmap_atomic(sb);
-	write_page(bitmap, bitmap->storage.sb_page, 1);
+	write_page(bitmap, 0, bitmap->storage.sb_page, 1);
 }
 EXPORT_SYMBOL(md_bitmap_update_sb);
 
@@ -1028,7 +1030,7 @@ void md_bitmap_unplug(struct bitmap *bitmap)
 							  "md bitmap_unplug");
 			}
 			clear_page_attr(bitmap, i, BITMAP_PAGE_PENDING);
-			write_page(bitmap, bitmap->storage.filemap[i], 0);
+			write_page(bitmap, i, bitmap->storage.filemap[i], 0);
 			writing = 1;
 		}
 	}
@@ -1167,7 +1169,7 @@ static int md_bitmap_init_from_disk(struct bitmap *bitmap, sector_t start)
 				memset(paddr + offset, 0xff,
 				       PAGE_SIZE - offset);
 				kunmap_atomic(paddr);
-				write_page(bitmap, page, 1);
+				write_page(bitmap, 0, page, 1);
 
 				ret = -EIO;
 				if (test_bit(BITMAP_WRITE_ERROR,
@@ -1377,7 +1379,7 @@ void md_bitmap_daemon_work(struct mddev *mddev)
 		if (bitmap->storage.filemap &&
 		    test_and_clear_page_attr(bitmap, j,
 					     BITMAP_PAGE_NEEDWRITE)) {
-			write_page(bitmap, bitmap->storage.filemap[j], 0);
+			write_page(bitmap, j, bitmap->storage.filemap[j], 0);
 		}
 	}
 
