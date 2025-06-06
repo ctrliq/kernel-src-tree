@@ -1,0 +1,131 @@
+bpf: Use raw_spinlock_t in ringbuf
+
+jira LE-3201
+cve CVE-2024-50138
+Rebuild_History Non-Buildable kernel-rt-4.18.0-553.47.1.rt7.388.el8_10
+commit-author Wander Lairson Costa <wander.lairson@gmail.com>
+commit 8b62645b09f870d70c7910e7550289d444239a46
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-rt-4.18.0-553.47.1.rt7.388.el8_10/8b62645b.failed
+
+The function __bpf_ringbuf_reserve is invoked from a tracepoint, which
+disables preemption. Using spinlock_t in this context can lead to a
+"sleep in atomic" warning in the RT variant. This issue is illustrated
+in the example below:
+
+BUG: sleeping function called from invalid context at kernel/locking/spinlock_rt.c:48
+in_atomic(): 1, irqs_disabled(): 0, non_block: 0, pid: 556208, name: test_progs
+preempt_count: 1, expected: 0
+RCU nest depth: 1, expected: 1
+INFO: lockdep is turned off.
+Preemption disabled at:
+[<ffffd33a5c88ea44>] migrate_enable+0xc0/0x39c
+CPU: 7 PID: 556208 Comm: test_progs Tainted: G
+Hardware name: Qualcomm SA8775P Ride (DT)
+Call trace:
+ dump_backtrace+0xac/0x130
+ show_stack+0x1c/0x30
+ dump_stack_lvl+0xac/0xe8
+ dump_stack+0x18/0x30
+ __might_resched+0x3bc/0x4fc
+ rt_spin_lock+0x8c/0x1a4
+ __bpf_ringbuf_reserve+0xc4/0x254
+ bpf_ringbuf_reserve_dynptr+0x5c/0xdc
+ bpf_prog_ac3d15160d62622a_test_read_write+0x104/0x238
+ trace_call_bpf+0x238/0x774
+ perf_call_bpf_enter.isra.0+0x104/0x194
+ perf_syscall_enter+0x2f8/0x510
+ trace_sys_enter+0x39c/0x564
+ syscall_trace_enter+0x220/0x3c0
+ do_el0_svc+0x138/0x1dc
+ el0_svc+0x54/0x130
+ el0t_64_sync_handler+0x134/0x150
+ el0t_64_sync+0x17c/0x180
+
+Switch the spinlock to raw_spinlock_t to avoid this error.
+
+Fixes: 457f44363a88 ("bpf: Implement BPF ring buffer and verifier support for it")
+	Reported-by: Brian Grech <bgrech@redhat.com>
+	Signed-off-by: Wander Lairson Costa <wander.lairson@gmail.com>
+	Signed-off-by: Wander Lairson Costa <wander@redhat.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Daniel Borkmann <daniel@iogearbox.net>
+Link: https://lore.kernel.org/r/20240920190700.617253-1-wander@redhat.com
+(cherry picked from commit 8b62645b09f870d70c7910e7550289d444239a46)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/ringbuf.c
+diff --cc kernel/bpf/ringbuf.c
+index 3b4d274cfe03,de3b681d1d13..000000000000
+--- a/kernel/bpf/ringbuf.c
++++ b/kernel/bpf/ringbuf.c
+@@@ -36,11 -29,45 +36,53 @@@ struct bpf_ringbuf 
+  	u64 mask;
+  	struct page **pages;
+  	int nr_pages;
+++<<<<<<< HEAD
+ +	spinlock_t spinlock ____cacheline_aligned_in_smp;
+ +	/* Consumer and producer counters are put into separate pages to allow
+ +	 * mapping consumer page as r/w, but restrict producer page to r/o.
+ +	 * This protects producer position from being modified by user-space
+ +	 * application and ruining in-kernel position tracking.
+++=======
++ 	raw_spinlock_t spinlock ____cacheline_aligned_in_smp;
++ 	/* For user-space producer ring buffers, an atomic_t busy bit is used
++ 	 * to synchronize access to the ring buffers in the kernel, rather than
++ 	 * the spinlock that is used for kernel-producer ring buffers. This is
++ 	 * done because the ring buffer must hold a lock across a BPF program's
++ 	 * callback:
++ 	 *
++ 	 *    __bpf_user_ringbuf_peek() // lock acquired
++ 	 * -> program callback_fn()
++ 	 * -> __bpf_user_ringbuf_sample_release() // lock released
++ 	 *
++ 	 * It is unsafe and incorrect to hold an IRQ spinlock across what could
++ 	 * be a long execution window, so we instead simply disallow concurrent
++ 	 * access to the ring buffer by kernel consumers, and return -EBUSY from
++ 	 * __bpf_user_ringbuf_peek() if the busy bit is held by another task.
++ 	 */
++ 	atomic_t busy ____cacheline_aligned_in_smp;
++ 	/* Consumer and producer counters are put into separate pages to
++ 	 * allow each position to be mapped with different permissions.
++ 	 * This prevents a user-space application from modifying the
++ 	 * position and ruining in-kernel tracking. The permissions of the
++ 	 * pages depend on who is producing samples: user-space or the
++ 	 * kernel. Note that the pending counter is placed in the same
++ 	 * page as the producer, so that it shares the same cache line.
++ 	 *
++ 	 * Kernel-producer
++ 	 * ---------------
++ 	 * The producer position and data pages are mapped as r/o in
++ 	 * userspace. For this approach, bits in the header of samples are
++ 	 * used to signal to user-space, and to other producers, whether a
++ 	 * sample is currently being written.
++ 	 *
++ 	 * User-space producer
++ 	 * -------------------
++ 	 * Only the page containing the consumer position is mapped r/o in
++ 	 * user-space. User-space producers also use bits of the header to
++ 	 * communicate to the kernel, but the kernel must carefully check and
++ 	 * validate each sample to ensure that they're correctly formatted, and
++ 	 * fully contained within the ring buffer.
+++>>>>>>> 8b62645b09f8 (bpf: Use raw_spinlock_t in ringbuf)
+  	 */
+  	unsigned long consumer_pos __aligned(PAGE_SIZE);
+  	unsigned long producer_pos __aligned(PAGE_SIZE);
+@@@ -135,7 -173,8 +177,12 @@@ static struct bpf_ringbuf *bpf_ringbuf_
+  	if (!rb)
+  		return NULL;
+  
+++<<<<<<< HEAD
+ +	spin_lock_init(&rb->spinlock);
+++=======
++ 	raw_spin_lock_init(&rb->spinlock);
++ 	atomic_set(&rb->busy, 0);
+++>>>>>>> 8b62645b09f8 (bpf: Use raw_spinlock_t in ringbuf)
+  	init_waitqueue_head(&rb->waitq);
+  	init_irq_work(&rb->work, bpf_ringbuf_notify);
+  
+* Unmerged path kernel/bpf/ringbuf.c
