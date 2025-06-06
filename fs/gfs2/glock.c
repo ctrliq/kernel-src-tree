@@ -1015,6 +1015,8 @@ static void delete_work_func(struct work_struct *work)
 		 * step entirely.
 		 */
 		if (gfs2_try_evict(gl)) {
+			if (test_bit(SDF_DEACTIVATING, &sdp->sd_flags))
+				goto out;
 			if (gfs2_queue_verify_evict(gl))
 				return;
 		}
@@ -1026,6 +1028,7 @@ static void delete_work_func(struct work_struct *work)
 					    GFS2_BLKST_UNLINKED);
 		if (IS_ERR(inode)) {
 			if (PTR_ERR(inode) == -EAGAIN &&
+			    !test_bit(SDF_DEACTIVATING, &sdp->sd_flags) &&
 			    gfs2_queue_verify_evict(gl))
 				return;
 		} else {
