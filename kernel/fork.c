@@ -910,6 +910,9 @@ void __init fork_init(void)
 	task_struct_whitelist(&useroffset, &usersize);
 	task_struct_cachep = kmem_cache_create_usercopy("task_struct",
 			arch_task_struct_size, align,
+#ifdef RT_MUTEX_BUILD_SPINLOCKS
+			SLAB_TYPESAFE_BY_RCU |
+#endif
 			SLAB_PANIC|SLAB_ACCOUNT,
 			useroffset, usersize, NULL);
 #endif

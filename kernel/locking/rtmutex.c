@@ -1206,6 +1206,7 @@ static int __sched task_blocks_on_rt_mutex(struct rt_mutex_base *lock,
 		top_waiter = rt_mutex_top_waiter(lock);
 	rt_mutex_enqueue(lock, waiter);
 
+	WARN_ON(task->pi_blocked_on);
 	task->pi_blocked_on = waiter;
 
 	raw_spin_unlock(&task->pi_lock);
@@ -1603,7 +1604,7 @@ static int __sched rt_mutex_slowlock_block(struct rt_mutex_base *lock,
 		raw_spin_unlock_irq(&lock->wait_lock);
 
 		if (!owner || !rtmutex_spin_on_owner(lock, waiter, owner))
-			schedule();
+			rt_mutex_schedule();
 
 		raw_spin_lock_irq(&lock->wait_lock);
 		set_current_state(state);
@@ -1628,7 +1629,7 @@ static void __sched rt_mutex_handle_deadlock(int res, int detect_deadlock,
 
 	while (1) {
 		set_current_state(TASK_INTERRUPTIBLE);
-		schedule();
+		rt_mutex_schedule();
 	}
 }
 
@@ -1720,6 +1721,15 @@ static int __sched rt_mutex_slowlock(struct rt_mutex_base *lock,
 	int ret;
 
 	/*
+	 * Do all pre-schedule work here, before we queue a waiter and invoke
+	 * PI -- any such work that trips on rtlock (PREEMPT_RT spinlock) would
+	 * otherwise recurse back into task_blocks_on_rt_mutex() through
+	 * rtlock_slowlock() and will then enqueue a second waiter for this
+	 * same task and things get really confusing real fast.
+	 */
+	rt_mutex_pre_schedule();
+
+	/*
 	 * Technically we could use raw_spin_[un]lock_irq() here, but this can
 	 * be called in early boot if the cmpxchg() fast path is disabled
 	 * (debug, no architecture support). In this case we will acquire the
@@ -1730,6 +1740,7 @@ static int __sched rt_mutex_slowlock(struct rt_mutex_base *lock,
 	raw_spin_lock_irqsave(&lock->wait_lock, flags);
 	ret = __rt_mutex_slowlock_locked(lock, ww_ctx, state);
 	raw_spin_unlock_irqrestore(&lock->wait_lock, flags);
+	rt_mutex_post_schedule();
 
 	return ret;
 }

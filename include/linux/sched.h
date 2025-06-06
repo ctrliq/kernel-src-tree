@@ -926,6 +926,10 @@ struct task_struct {
 	/* delay due to memory thrashing */
 	RH_KABI_FILL_HOLE(unsigned	in_thrashing:1)
 #endif
+#ifdef CONFIG_RT_MUTEXES
+	RH_KABI_FILL_HOLE(unsigned	sched_rt_mutex:1)
+#endif
+
 	unsigned long			atomic_flags; /* Flags requiring atomic access. */
 
 	struct restart_block		restart_block;
