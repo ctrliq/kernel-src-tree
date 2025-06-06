@@ -76,6 +76,7 @@ struct mem_cgroup_reclaim_cookie {
 #ifdef CONFIG_MEMCG
 
 #define MEM_CGROUP_ID_SHIFT	16
+#define MEM_CGROUP_ID_MAX	((1UL << MEM_CGROUP_ID_SHIFT) - 1)
 
 #ifdef __GENKSYMS__
 #define mem_cgroup_per_node	__mem_cgroup_per_node
@@ -1152,6 +1153,7 @@ unsigned long mem_cgroup_soft_limit_reclaim(pg_data_t *pgdat, int order,
 #else /* CONFIG_MEMCG */
 
 #define MEM_CGROUP_ID_SHIFT	0
+#define MEM_CGROUP_ID_MAX	0
 
 static inline struct mem_cgroup *page_memcg(struct page *page)
 {

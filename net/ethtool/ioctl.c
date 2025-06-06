@@ -463,6 +463,9 @@ int __ethtool_get_link_ksettings(struct net_device *dev,
 {
 	ASSERT_RTNL();
 
+	if (!netif_device_present(dev))
+		return -ENODEV;
+
 	if (!__rh_has_get_link_ksettings(dev)) {
 		struct ethtool_cmd cmd;
 		int err;
@@ -483,9 +486,6 @@ int __ethtool_get_link_ksettings(struct net_device *dev,
 		convert_legacy_settings_to_link_ksettings(link_ksettings, &cmd);
 		return err;
 	}
-
-	if (!netif_device_present(dev))
-		return -ENODEV;
 
 	memset(link_ksettings, 0, sizeof(*link_ksettings));
 	return __rh_call_get_link_ksettings(dev, link_ksettings);

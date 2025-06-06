@@ -30,11 +30,12 @@ nvkm_object_search(struct nvkm_client *client, u64 handle,
 		   const struct nvkm_object_func *func)
 {
 	struct nvkm_object *object;
+	struct rb_node *node = NULL;
 	unsigned long flags;
 
 	if (handle) {
 		spin_lock_irqsave(&client->obj_lock, flags);
-		struct rb_node *node = client->objroot.rb_node;
+		node = client->objroot.rb_node;
 		while (node) {
 			object = rb_entry(node, typeof(*object), node);
 			if (handle < object->object)
