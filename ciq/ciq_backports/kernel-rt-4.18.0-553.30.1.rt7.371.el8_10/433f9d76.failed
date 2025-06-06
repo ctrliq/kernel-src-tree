@@ -1,0 +1,260 @@
+autofs: add per dentry expire timeout
+
+jira LE-3201
+Rebuild_History Non-Buildable kernel-rt-4.18.0-553.30.1.rt7.371.el8_10
+commit-author Ian Kent <raven@themaw.net>
+commit 433f9d76a01056dfeaefc15167b11e514e56f956
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-rt-4.18.0-553.30.1.rt7.371.el8_10/433f9d76.failed
+
+Add ability to set per-dentry mount expire timeout to autofs.
+
+There are two fairly well known automounter map formats, the autofs
+format and the amd format (more or less System V and Berkley).
+
+Some time ago Linux autofs added an amd map format parser that
+implemented a fair amount of the amd functionality. This was done
+within the autofs infrastructure and some functionality wasn't
+implemented because it either didn't make sense or required extra
+kernel changes. The idea was to restrict changes to be within the
+existing autofs functionality as much as possible and leave changes
+with a wider scope to be considered later.
+
+One of these changes is implementing the amd options:
+1) "unmount", expire this mount according to a timeout (same as the
+   current autofs default).
+2) "nounmount", don't expire this mount (same as setting the autofs
+   timeout to 0 except only for this specific mount) .
+3) "utimeout=<seconds>", expire this mount using the specified
+   timeout (again same as setting the autofs timeout but only for
+   this mount).
+
+To implement these options per-dentry expire timeouts need to be
+implemented for autofs indirect mounts. This is because all map keys
+(mounts) for autofs indirect mounts use an expire timeout stored in
+the autofs mount super block info. structure and all indirect mounts
+use the same expire timeout.
+
+Now I have a request to add the "nounmount" option so I need to add
+the per-dentry expire handling to the kernel implementation to do this.
+
+The implementation uses the trailing path component to identify the
+mount (and is also used as the autofs map key) which is passed in the
+autofs_dev_ioctl structure path field. The expire timeout is passed
+in autofs_dev_ioctl timeout field (well, of the timeout union).
+
+If the passed in timeout is equal to -1 the per-dentry timeout and
+flag are cleared providing for the "unmount" option. If the timeout
+is greater than or equal to 0 the timeout is set to the value and the
+flag is also set. If the dentry timeout is 0 the dentry will not expire
+by timeout which enables the implementation of the "nounmount" option
+for the specific mount. When the dentry timeout is greater than zero it
+allows for the implementation of the "utimeout=<seconds>" option.
+
+	Signed-off-by: Ian Kent <raven@themaw.net>
+Link: https://lore.kernel.org/r/20240814090231.963520-1-raven@themaw.net
+	Signed-off-by: Christian Brauner <brauner@kernel.org>
+(cherry picked from commit 433f9d76a01056dfeaefc15167b11e514e56f956)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/autofs/inode.c
+diff --cc fs/autofs/inode.c
+index 6d0658cbce39,ee2edccaef70..000000000000
+--- a/fs/autofs/inode.c
++++ b/fs/autofs/inode.c
+@@@ -24,6 -19,8 +24,11 @@@ struct autofs_info *autofs_new_ino(stru
+  		INIT_LIST_HEAD(&ino->expiring);
+  		ino->last_used = jiffies;
+  		ino->sbi = sbi;
+++<<<<<<< HEAD
+++=======
++ 		ino->exp_timeout = -1;
++ 		ino->count = 1;
+++>>>>>>> 433f9d76a010 (autofs: add per dentry expire timeout)
+  	}
+  	return ino;
+  }
+diff --git a/fs/autofs/autofs_i.h b/fs/autofs/autofs_i.h
+index d1e1a1b2b174..ec6d8f74f253 100644
+--- a/fs/autofs/autofs_i.h
++++ b/fs/autofs/autofs_i.h
+@@ -65,6 +65,7 @@ struct autofs_info {
+ 	struct list_head expiring;
+ 
+ 	struct autofs_sb_info *sbi;
++	unsigned long exp_timeout;
+ 	unsigned long last_used;
+ 	atomic_t count;
+ 
+@@ -83,6 +84,9 @@ struct autofs_info {
+ 					*/
+ #define AUTOFS_INF_PENDING	(1<<2) /* dentry pending mount */
+ 
++#define AUTOFS_INF_EXPIRE_SET	(1<<3) /* per-dentry expire timeout set for
++					  this mount point.
++					*/
+ struct autofs_wait_queue {
+ 	wait_queue_head_t queue;
+ 	struct autofs_wait_queue *next;
+diff --git a/fs/autofs/dev-ioctl.c b/fs/autofs/dev-ioctl.c
+index e9fe74d1541b..47fcb982a4d9 100644
+--- a/fs/autofs/dev-ioctl.c
++++ b/fs/autofs/dev-ioctl.c
+@@ -129,7 +129,13 @@ static int validate_dev_ioctl(int cmd, struct autofs_dev_ioctl *param)
+ 			goto out;
+ 		}
+ 
++		/* Setting the per-dentry expire timeout requires a trailing
++		 * path component, ie. no '/', so invert the logic of the
++		 * check_name() return for AUTOFS_DEV_IOCTL_TIMEOUT_CMD.
++		 */
+ 		err = check_name(param->path);
++		if (cmd == AUTOFS_DEV_IOCTL_TIMEOUT_CMD)
++			err = err ? 0 : -EINVAL;
+ 		if (err) {
+ 			pr_warn("invalid path supplied for cmd(0x%08x)\n",
+ 				cmd);
+@@ -397,16 +403,97 @@ static int autofs_dev_ioctl_catatonic(struct file *fp,
+ 	return 0;
+ }
+ 
+-/* Set the autofs mount timeout */
++/*
++ * Set the autofs mount expire timeout.
++ *
++ * There are two places an expire timeout can be set, in the autofs
++ * super block info. (this is all that's needed for direct and offset
++ * mounts because there's a distinct mount corresponding to each of
++ * these) and per-dentry within within the dentry info. If a per-dentry
++ * timeout is set it will override the expire timeout set in the parent
++ * autofs super block info.
++ *
++ * If setting the autofs super block expire timeout the autofs_dev_ioctl
++ * size field will be equal to the autofs_dev_ioctl structure size. If
++ * setting the per-dentry expire timeout the mount point name is passed
++ * in the autofs_dev_ioctl path field and the size field updated to
++ * reflect this.
++ *
++ * Setting the autofs mount expire timeout sets the timeout in the super
++ * block info. struct. Setting the per-dentry timeout does a little more.
++ * If the timeout is equal to -1 the per-dentry timeout (and flag) is
++ * cleared which reverts to using the super block timeout, otherwise if
++ * timeout is 0 the timeout is set to this value and the flag is left
++ * set which disables expiration for the mount point, lastly the flag
++ * and the timeout are set enabling the dentry to use this timeout.
++ */
+ static int autofs_dev_ioctl_timeout(struct file *fp,
+ 				    struct autofs_sb_info *sbi,
+ 				    struct autofs_dev_ioctl *param)
+ {
+-	unsigned long timeout;
++	unsigned long timeout = param->timeout.timeout;
++
++	/* If setting the expire timeout for an individual indirect
++	 * mount point dentry the mount trailing component path is
++	 * placed in param->path and param->size adjusted to account
++	 * for it otherwise param->size it is set to the structure
++	 * size.
++	 */
++	if (param->size == AUTOFS_DEV_IOCTL_SIZE) {
++		param->timeout.timeout = sbi->exp_timeout / HZ;
++		sbi->exp_timeout = timeout * HZ;
++	} else {
++		struct dentry *base = fp->f_path.dentry;
++		struct inode *inode = base->d_inode;
++		int path_len = param->size - AUTOFS_DEV_IOCTL_SIZE - 1;
++		struct dentry *dentry;
++		struct autofs_info *ino;
++
++		if (!autofs_type_indirect(sbi->type))
++			return -EINVAL;
++
++		/* An expire timeout greater than the superblock timeout
++		 * could be a problem at shutdown but the super block
++		 * timeout itself can change so all we can really do is
++		 * warn the user.
++		 */
++		if (timeout >= sbi->exp_timeout)
++			pr_warn("per-mount expire timeout is greater than "
++				"the parent autofs mount timeout which could "
++				"prevent shutdown\n");
++
++		inode_lock_shared(inode);
++		dentry = try_lookup_one_len(param->path, base, path_len);
++		inode_unlock_shared(inode);
++		if (IS_ERR_OR_NULL(dentry))
++			return dentry ? PTR_ERR(dentry) : -ENOENT;
++		ino = autofs_dentry_ino(dentry);
++		if (!ino) {
++			dput(dentry);
++			return -ENOENT;
++		}
++
++		if (ino->exp_timeout && ino->flags & AUTOFS_INF_EXPIRE_SET)
++			param->timeout.timeout = ino->exp_timeout / HZ;
++		else
++			param->timeout.timeout = sbi->exp_timeout / HZ;
++
++		if (timeout == -1) {
++			/* Revert to using the super block timeout */
++			ino->flags &= ~AUTOFS_INF_EXPIRE_SET;
++			ino->exp_timeout = 0;
++		} else {
++			/* Set the dentry expire flag and timeout.
++			 *
++			 * If timeout is 0 it will prevent the expire
++			 * of this particular automount.
++			 */
++			ino->flags |= AUTOFS_INF_EXPIRE_SET;
++			ino->exp_timeout = timeout * HZ;
++		}
++		dput(dentry);
++	}
+ 
+-	timeout = param->timeout.timeout;
+-	param->timeout.timeout = sbi->exp_timeout / HZ;
+-	sbi->exp_timeout = timeout * HZ;
+ 	return 0;
+ }
+ 
+diff --git a/fs/autofs/expire.c b/fs/autofs/expire.c
+index d441244b79df..a4a2b5b639ce 100644
+--- a/fs/autofs/expire.c
++++ b/fs/autofs/expire.c
+@@ -474,8 +474,6 @@ static struct dentry *autofs_expire_indirect(struct super_block *sb,
+ 	if (!root)
+ 		return NULL;
+ 
+-	timeout = sbi->exp_timeout;
+-
+ 	dentry = NULL;
+ 	while ((dentry = get_next_positive_subdir(dentry, root))) {
+ 		spin_lock(&sbi->fs_lock);
+@@ -486,6 +484,11 @@ static struct dentry *autofs_expire_indirect(struct super_block *sb,
+ 		}
+ 		spin_unlock(&sbi->fs_lock);
+ 
++		if (ino->flags & AUTOFS_INF_EXPIRE_SET)
++			timeout = ino->exp_timeout;
++		else
++			timeout = sbi->exp_timeout;
++
+ 		expired = should_expire(dentry, mnt, timeout, how);
+ 		if (!expired)
+ 			continue;
+* Unmerged path fs/autofs/inode.c
+diff --git a/include/uapi/linux/auto_fs.h b/include/uapi/linux/auto_fs.h
+index 1f7925afad2d..8081df849743 100644
+--- a/include/uapi/linux/auto_fs.h
++++ b/include/uapi/linux/auto_fs.h
+@@ -23,7 +23,7 @@
+ #define AUTOFS_MIN_PROTO_VERSION	3
+ #define AUTOFS_MAX_PROTO_VERSION	5
+ 
+-#define AUTOFS_PROTO_SUBVERSION		5
++#define AUTOFS_PROTO_SUBVERSION		6
+ 
+ /*
+  * The wait_queue_token (autofs_wqt_t) is part of a structure which is passed
