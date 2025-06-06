@@ -489,7 +489,6 @@ nextobj:
 
 err_attr_init:
 	mutex_unlock(&wmi_priv.mutex);
-	release_attributes_data();
 	kfree(obj);
 	return retval;
 }
