@@ -1,0 +1,139 @@
+sched: Provide rt_mutex specific scheduler helpers
+
+jira LE-3201
+Rebuild_History Non-Buildable kernel-rt-4.18.0-553.30.1.rt7.371.el8_10
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 6b596e62ed9f90c4a97e68ae1f7b1af5beeb3c05
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-rt-4.18.0-553.30.1.rt7.371.el8_10/6b596e62.failed
+
+With PREEMPT_RT there is a rt_mutex recursion problem where
+sched_submit_work() can use an rtlock (aka spinlock_t). More
+specifically what happens is:
+
+  mutex_lock() /* really rt_mutex */
+    ...
+      __rt_mutex_slowlock_locked()
+	task_blocks_on_rt_mutex()
+          // enqueue current task as waiter
+          // do PI chain walk
+        rt_mutex_slowlock_block()
+          schedule()
+            sched_submit_work()
+              ...
+              spin_lock() /* really rtlock */
+                ...
+                  __rt_mutex_slowlock_locked()
+                    task_blocks_on_rt_mutex()
+                      // enqueue current task as waiter *AGAIN*
+                      // *CONFUSION*
+
+Fix this by making rt_mutex do the sched_submit_work() early, before
+it enqueues itself as a waiter -- before it even knows *if* it will
+wait.
+
+[[ basically Thomas' patch but with different naming and a few asserts
+   added ]]
+
+Originally-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20230908162254.999499-5-bigeasy@linutronix.de
+(cherry picked from commit 6b596e62ed9f90c4a97e68ae1f7b1af5beeb3c05)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sched.h
+#	kernel/sched/core.c
+diff --cc include/linux/sched.h
+index e77e7ceb990a,67623ffd4a8e..000000000000
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@@ -910,10 -910,39 +910,43 @@@ struct task_struct 
+  	 * guarantees all stores of 'current' are visible before
+  	 * ->sched_remote_wakeup gets used, so it can be in this word.
+  	 */
+++<<<<<<< HEAD
+ +	RH_KABI_FILL_HOLE(unsigned	sched_remote_wakeup:1)
+++=======
++ 	unsigned			sched_remote_wakeup:1;
++ #ifdef CONFIG_RT_MUTEXES
++ 	unsigned			sched_rt_mutex:1;
++ #endif
++ 
++ 	/* Bit to tell LSMs we're in execve(): */
++ 	unsigned			in_execve:1;
++ 	unsigned			in_iowait:1;
++ #ifndef TIF_RESTORE_SIGMASK
++ 	unsigned			restore_sigmask:1;
++ #endif
++ #ifdef CONFIG_MEMCG
++ 	unsigned			in_user_fault:1;
++ #endif
++ #ifdef CONFIG_LRU_GEN
++ 	/* whether the LRU algorithm may apply to this access */
++ 	unsigned			in_lru_fault:1;
++ #endif
++ #ifdef CONFIG_COMPAT_BRK
++ 	unsigned			brk_randomized:1;
++ #endif
++ #ifdef CONFIG_CGROUPS
++ 	/* disallow userland-initiated cgroup migration */
++ 	unsigned			no_cgroup_migration:1;
++ 	/* task is frozen/stopped (used by the cgroup freezer) */
++ 	unsigned			frozen:1;
++ #endif
++ #ifdef CONFIG_BLK_CGROUP
++ 	unsigned			use_memdelay:1;
++ #endif
+++>>>>>>> 6b596e62ed9f (sched: Provide rt_mutex specific scheduler helpers)
+  #ifdef CONFIG_PSI
+  	/* Stalled due to lack of memory */
+ -	unsigned			in_memstall:1;
+ +	RH_KABI_FILL_HOLE(unsigned	in_memstall:1)
+  #endif
+  #ifdef CONFIG_PAGE_OWNER
+  	/* Used by page_owner=on to detect recursion in page tracking. */
+diff --cc kernel/sched/core.c
+index 40d40c6ccf8d,58d0346d1bb3..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -4640,10 -6720,14 +4640,18 @@@ void __noreturn do_task_dead(void
+  
+  static inline void sched_submit_work(struct task_struct *tsk)
+  {
+ -	static DEFINE_WAIT_OVERRIDE_MAP(sched_map, LD_WAIT_CONFIG);
+  	unsigned int task_flags;
+  
+++<<<<<<< HEAD
+ +	if (task_is_running(tsk))
+ +		return;
+++=======
++ 	/*
++ 	 * Establish LD_WAIT_CONFIG context to ensure none of the code called
++ 	 * will use a blocking primitive -- which would lead to recursion.
++ 	 */
++ 	lock_map_acquire_try(&sched_map);
+++>>>>>>> 6b596e62ed9f (sched: Provide rt_mutex specific scheduler helpers)
+  
+  	task_flags = tsk->flags;
+  	/*
+* Unmerged path include/linux/sched.h
+diff --git a/include/linux/sched/rt.h b/include/linux/sched/rt.h
+index 994c25640e15..b2b9e6eb9683 100644
+--- a/include/linux/sched/rt.h
++++ b/include/linux/sched/rt.h
+@@ -30,6 +30,10 @@ static inline bool task_is_realtime(struct task_struct *tsk)
+ }
+ 
+ #ifdef CONFIG_RT_MUTEXES
++extern void rt_mutex_pre_schedule(void);
++extern void rt_mutex_schedule(void);
++extern void rt_mutex_post_schedule(void);
++
+ /*
+  * Must hold either p->pi_lock or task_rq(p)->lock.
+  */
+* Unmerged path kernel/sched/core.c
