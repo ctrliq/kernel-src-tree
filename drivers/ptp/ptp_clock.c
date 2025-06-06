@@ -293,8 +293,6 @@ struct ptp_clock *ptp_clock_register(struct ptp_clock_info *info,
 	        if (ptp->pps_source)
 	                pps_unregister_source(ptp->pps_source);
 
-		kfree(ptp->vclock_index);
-
 		if (ptp->kworker)
 	                kthread_destroy_worker(ptp->kworker);
 

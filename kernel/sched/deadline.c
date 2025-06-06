@@ -1546,8 +1546,7 @@ static void enqueue_task_dl(struct rq *rq, struct task_struct *p, int flags)
 			 * If the timer callback was running (hrtimer_try_to_cancel == -1),
 			 * it will eventually call put_task_struct().
 			 */
-			if (hrtimer_try_to_cancel(&p->dl.dl_timer) == 1 &&
-			    !dl_server(&p->dl))
+			if (hrtimer_try_to_cancel(&p->dl.dl_timer) == 1)
 				put_task_struct(p);
 			p->dl.dl_throttled = 0;
 		}

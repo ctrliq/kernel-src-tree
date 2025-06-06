@@ -2306,7 +2306,7 @@ int cipso_v4_skbuff_delattr(struct sk_buff *skb)
 	opt->is_changed = 1;
 	if (hdr_len_delta != 0) {
 		iph->ihl = new_hdr_len >> 2;
-		iph_set_totlen(iph, skb->len);
+		iph->tot_len = htons(skb->len);
 	}
 	ip_send_check(iph);
 
