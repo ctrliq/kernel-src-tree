@@ -269,6 +269,7 @@ static void thermal_throttle_remove_dev(struct device *dev)
 static int thermal_throttle_online(unsigned int cpu)
 {
 	struct device *dev = get_cpu_device(cpu);
+	u32 l;
 
 	/*
 	 * The first CPU coming online will enable the HFI. Usually this causes
@@ -276,6 +277,10 @@ static int thermal_throttle_online(unsigned int cpu)
 	 * the CPU once we enable the thermal vector in the local APIC.
 	 */
 	intel_hfi_online(cpu);
+
+	/* Unmask the thermal vector after the above workqueues are initialized. */
+	l = apic_read(APIC_LVTTHMR);
+	apic_write(APIC_LVTTHMR, l & ~APIC_LVT_MASKED);
 
 	return thermal_throttle_add_dev(dev, cpu);
 }
@@ -532,10 +537,6 @@ void intel_init_thermal(struct cpuinfo_x86 *c)
 
 	rdmsr(MSR_IA32_MISC_ENABLE, l, h);
 	wrmsr(MSR_IA32_MISC_ENABLE, l | MSR_IA32_MISC_ENABLE_TM1, h);
-
-	/* Unmask the thermal vector: */
-	l = apic_read(APIC_LVTTHMR);
-	apic_write(APIC_LVTTHMR, l & ~APIC_LVT_MASKED);
 
 	pr_info_once("CPU0: Thermal monitoring enabled (%s)\n",
 		      tm2 ? "TM2" : "TM1");
