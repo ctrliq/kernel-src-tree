@@ -1053,8 +1053,7 @@ static void hda_generic_machine_select(struct snd_sof_dev *sdev,
 			 * make a local copy of the match array since we might
 			 * be modifying it
 			 */
-			hda_mach = devm_kmemdup_array(sdev->dev,
-					snd_soc_acpi_intel_hda_machines,
+			hda_mach = devm_kmalloc_array(sdev->dev,
 					2, /* we have one entry + sentinel in the array */
 					sizeof(snd_soc_acpi_intel_hda_machines[0]),
 					GFP_KERNEL);
@@ -1064,6 +1063,7 @@ static void hda_generic_machine_select(struct snd_sof_dev *sdev,
 					__func__);
 				return;
 			}
+			memcpy(hda_mach, snd_soc_acpi_intel_hda_machines, 2 * sizeof(snd_soc_acpi_intel_hda_machines[0]));
 
 			dev_info(bus->dev, "using HDA machine driver %s now\n",
 				 hda_mach->drv_name);
