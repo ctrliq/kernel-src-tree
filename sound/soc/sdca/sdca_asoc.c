@@ -947,7 +947,9 @@ static int populate_control(struct device *dev,
 	}
 
 	mc->min = 0;
-	mc->max = clamp((0x1ull << control->nbits) - 1, 0, type_max(mc->max));
+	/* type_max does not work here, use temporary code for int type */
+	cn = (1ul << 31) - 1; // type_max(mc->max)
+	mc->max = clamp((0x1ull << control->nbits) - 1, 0, cn);
 
 	(*kctl)->name = control_name;
 	(*kctl)->private_value = (unsigned long)mc;
