@@ -1050,7 +1050,7 @@ static int azx_suspend(struct device *dev)
 	return 0;
 }
 
-static int __maybe_unused azx_resume(struct device *dev)
+static int azx_resume(struct device *dev)
 {
 	struct snd_card *card = dev_get_drvdata(dev);
 	struct azx *chip;
@@ -1097,7 +1097,7 @@ static int azx_thaw_noirq(struct device *dev)
 	return 0;
 }
 
-static int __maybe_unused azx_runtime_suspend(struct device *dev)
+static int azx_runtime_suspend(struct device *dev)
 {
 	struct snd_card *card = dev_get_drvdata(dev);
 	struct azx *chip;
@@ -1114,7 +1114,7 @@ static int __maybe_unused azx_runtime_suspend(struct device *dev)
 	return 0;
 }
 
-static int __maybe_unused azx_runtime_resume(struct device *dev)
+static int azx_runtime_resume(struct device *dev)
 {
 	struct snd_card *card = dev_get_drvdata(dev);
 	struct azx *chip;
@@ -1131,7 +1131,7 @@ static int __maybe_unused azx_runtime_resume(struct device *dev)
 	return 0;
 }
 
-static int __maybe_unused azx_runtime_idle(struct device *dev)
+static int azx_runtime_idle(struct device *dev)
 {
 	struct snd_card *card = dev_get_drvdata(dev);
 	struct azx *chip;
@@ -1162,7 +1162,7 @@ static const struct dev_pm_ops azx_pm = {
 	.complete = pm_sleep_ptr(azx_complete),
 	.freeze_noirq = pm_sleep_ptr(azx_freeze_noirq),
 	.thaw_noirq = pm_sleep_ptr(azx_thaw_noirq),
-	SET_RUNTIME_PM_OPS(azx_runtime_suspend, azx_runtime_resume, azx_runtime_idle)
+	RUNTIME_PM_OPS(azx_runtime_suspend, azx_runtime_resume, azx_runtime_idle)
 };
 
 
@@ -2798,7 +2798,7 @@ static struct pci_driver azx_driver = {
 	.remove = azx_remove,
 	.shutdown = azx_shutdown,
 	.driver = {
-		.pm = &azx_pm,
+		.pm = pm_ptr(&azx_pm),
 	},
 };
 
