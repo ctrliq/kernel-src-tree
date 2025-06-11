@@ -49,11 +49,14 @@
 static const char *rh_deprecated_drivers[] = {
 	"aacraid",
 	"af_key",
+	"ahci_seattle",
+	"ahci_xgene",
 	"bnx2fc",
 	"bnx2i",
 	"bnx2x",
 	"cnic",
 	"firewire_core",
+	"hisi_sas_main",
 	"qla4xxx",
 	"team",
 	0     /* Terminating entry */
@@ -69,6 +72,9 @@ static const char *rh_deprecated_init_fns[] = {
 	"bnx2x_init",
 	"bnx2fc_mod_init",
 	"bnx2i_mod_init",
+	"ahci_seattle_probe",
+	"xgene_ahci_probe",
+	"hisi_sas_init",
 	0     /* Terminating entry */
 };
 
