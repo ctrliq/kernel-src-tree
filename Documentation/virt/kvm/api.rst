@@ -8484,7 +8484,7 @@ type KVM_SYSTEM_EVENT_SUSPEND to process the guest suspend request.
 :Architectures: arm64
 :Target: VM
 :Parameters: None
-:Returns: 0 on success, -EBUSY if vCPUs have been created before enabling this
+:Returns: 0 on success, -EINVAL if vCPUs have been created before enabling this
           capability.
 
 This capability changes the behavior of the registers that identify a PE
