@@ -38,6 +38,15 @@ struct ftr_set_desc {
 
 #define FIELD(n, s, f)	{ .name = n, .shift = s, .width = 4, .filter = f }
 
+static const struct ftr_set_desc mmfr0 __prel64_initconst = {
+	.name		= "id_aa64mmfr0",
+	.override	= &id_aa64mmfr0_override,
+	.fields		= {
+		FIELD("ecv", ID_AA64MMFR0_EL1_ECV_SHIFT, NULL),
+		{}
+	},
+};
+
 static bool __init mmfr1_vh_filter(u64 val)
 {
 	/*
@@ -74,6 +83,15 @@ static bool __init mmfr2_varange_filter(u64 val)
 		id_aa64mmfr0_override.val |=
 			(ID_AA64MMFR0_EL1_TGRAN_LPA2 - 1) << ID_AA64MMFR0_EL1_TGRAN_SHIFT;
 		id_aa64mmfr0_override.mask |= 0xfU << ID_AA64MMFR0_EL1_TGRAN_SHIFT;
+
+		/*
+		 * Override PARange to 48 bits - the override will just be
+		 * ignored if the actual PARange is smaller, but this is
+		 * unlikely to be the case for LPA2 capable silicon.
+		 */
+		id_aa64mmfr0_override.val |=
+			ID_AA64MMFR0_EL1_PARANGE_48 << ID_AA64MMFR0_EL1_PARANGE_SHIFT;
+		id_aa64mmfr0_override.mask |= 0xfU << ID_AA64MMFR0_EL1_PARANGE_SHIFT;
 	}
 #endif
 	return true;
@@ -197,6 +215,7 @@ static const struct ftr_set_desc sw_features __prel64_initconst = {
 
 static const
 PREL64(const struct ftr_set_desc, reg) regs[] __prel64_initconst = {
+	{ &mmfr0	},
 	{ &mmfr1	},
 	{ &mmfr2	},
 	{ &pfr0 	},

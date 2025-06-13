@@ -41,6 +41,9 @@ to automatically locate and size all RAM, or it may use knowledge of
 the RAM in the machine, or any other method the boot loader designer
 sees fit.)
 
+For Arm Confidential Compute Realms this includes ensuring that all
+protected RAM has a Realm IPA state (RIPAS) of "RAM".
+
 
 2. Setup the device tree
 -------------------------
@@ -384,6 +387,9 @@ Before jumping into the kernel, the following conditions must be met:
   - If the kernel is entered at EL1 and EL2 is present:
 
     - HCRX_EL2.MSCEn (bit 11) must be initialised to 0b1.
+
+    - HCRX_EL2.MCE2 (bit 10) must be initialised to 0b1 and the hypervisor
+      must handle MOPS exceptions as described in :ref:`arm64_mops_hyp`.
 
   For CPUs with the Extended Translation Control Register feature (FEAT_TCR2):
 
