@@ -766,10 +766,8 @@ static struct io_rsrc_node *io_sqe_buffer_register(struct io_ring_ctx *ctx,
 		goto done;
 
 	ret = io_buffer_account_pin(ctx, pages, nr_pages, imu, last_hpage);
-	if (ret) {
-		unpin_user_pages(pages, nr_pages);
+	if (ret)
 		goto done;
-	}
 
 	size = iov->iov_len;
 	/* store original address for later verification */
@@ -795,6 +793,8 @@ static struct io_rsrc_node *io_sqe_buffer_register(struct io_ring_ctx *ctx,
 done:
 	if (ret) {
 		kvfree(imu);
+		if (pages)
+			unpin_user_pages(pages, nr_pages);
 		if (node)
 			io_put_rsrc_node(ctx, node);
 		node = ERR_PTR(ret);
