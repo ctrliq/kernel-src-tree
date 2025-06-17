@@ -371,6 +371,15 @@ struct adf_hw_device_data {
 /* CSR write macro */
 #define ADF_CSR_WR(csr_base, csr_offset, val) \
 	__raw_writel(val, csr_base + csr_offset)
+/*
+ * CSR write macro to handle cases where the high and low
+ * offsets are sparsely located.
+ */
+#define ADF_CSR_WR64_LO_HI(csr_base, csr_low_offset, csr_high_offset, val)	\
+do {										\
+	ADF_CSR_WR(csr_base, csr_low_offset, lower_32_bits(val));		\
+	ADF_CSR_WR(csr_base, csr_high_offset, upper_32_bits(val));		\
+} while (0)
 
 /* CSR read macro */
 #define ADF_CSR_RD(csr_base, csr_offset) __raw_readl(csr_base + csr_offset)
