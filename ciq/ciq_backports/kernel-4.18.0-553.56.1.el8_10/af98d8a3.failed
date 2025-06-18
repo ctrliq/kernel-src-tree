@@ -1,0 +1,119 @@
+sched/fair: Fix CPU bandwidth limit bypass during CPU hotplug
+
+jira LE-3255
+Rebuild_History Non-Buildable kernel-4.18.0-553.56.1.el8_10
+commit-author Vishal Chourasia <vishalc@linux.ibm.com>
+commit af98d8a36a963e758e84266d152b92c7b51d4ecb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.56.1.el8_10/af98d8a3.failed
+
+CPU controller limits are not properly enforced during CPU hotplug
+operations, particularly during CPU offline. When a CPU goes offline,
+throttled processes are unintentionally being unthrottled across all CPUs
+in the system, allowing them to exceed their assigned quota limits.
+
+Consider below for an example,
+
+Assigning 6.25% bandwidth limit to a cgroup
+in a 8 CPU system, where, workload is running 8 threads for 20 seconds at
+100% CPU utilization, expected (user+sys) time = 10 seconds.
+
+$ cat /sys/fs/cgroup/test/cpu.max
+50000 100000
+
+$ ./ebizzy -t 8 -S 20        // non-hotplug case
+real 20.00 s
+user 10.81 s                 // intended behaviour
+sys   0.00 s
+
+$ ./ebizzy -t 8 -S 20        // hotplug case
+real 20.00 s
+user 14.43 s                 // Workload is able to run for 14 secs
+sys   0.00 s                 // when it should have only run for 10 secs
+
+During CPU hotplug, scheduler domains are rebuilt and cpu_attach_domain
+is called for every active CPU to update the root domain. That ends up
+calling rq_offline_fair which un-throttles any throttled hierarchies.
+
+Unthrottling should only occur for the CPU being hotplugged to allow its
+throttled processes to become runnable and get migrated to other CPUs.
+
+With current patch applied,
+$ ./ebizzy -t 8 -S 20        // hotplug case
+real 21.00 s
+user 10.16 s                 // intended behaviour
+sys   0.00 s
+
+This also has another symptom, when a CPU goes offline, and if the cfs_rq
+is not in throttled state and the runtime_remaining still had plenty
+remaining, it gets reset to 1 here, causing the runtime_remaining of
+cfs_rq to be quickly depleted.
+
+Note: hotplug operation (online, offline) was performed in while(1) loop
+
+v3: https://lore.kernel.org/all/20241210102346.228663-2-vishalc@linux.ibm.com
+v2: https://lore.kernel.org/all/20241207052730.1746380-2-vishalc@linux.ibm.com
+v1: https://lore.kernel.org/all/20241126064812.809903-2-vishalc@linux.ibm.com
+	Suggested-by: Zhang Qiao <zhangqiao22@huawei.com>
+	Signed-off-by: Vishal Chourasia <vishalc@linux.ibm.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Acked-by: Vincent Guittot <vincent.guittot@linaro.org>
+	Tested-by: Madadi Vineeth Reddy <vineethr@linux.ibm.com>
+	Tested-by: Samir Mulani <samir@linux.ibm.com>
+Link: https://lore.kernel.org/r/20241212043102.584863-2-vishalc@linux.ibm.com
+(cherry picked from commit af98d8a36a963e758e84266d152b92c7b51d4ecb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/fair.c
+diff --cc kernel/sched/fair.c
+index b6174edca38c,8f641c9e74a8..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -5512,7 -6694,18 +5512,22 @@@ static void __maybe_unused unthrottle_o
+  {
+  	struct task_group *tg;
+  
+++<<<<<<< HEAD
+ +	lockdep_assert_held(&rq->lock);
+++=======
++ 	lockdep_assert_rq_held(rq);
++ 
++ 	// Do not unthrottle for an active CPU
++ 	if (cpumask_test_cpu(cpu_of(rq), cpu_active_mask))
++ 		return;
++ 
++ 	/*
++ 	 * The rq clock has already been updated in the
++ 	 * set_rq_offline(), so we should skip updating
++ 	 * the rq clock again in unthrottle_cfs_rq().
++ 	 */
++ 	rq_clock_start_loop_update(rq);
+++>>>>>>> af98d8a36a96 (sched/fair: Fix CPU bandwidth limit bypass during CPU hotplug)
+  
+  	rcu_read_lock();
+  	list_for_each_entry_rcu(tg, &task_groups, list) {
+@@@ -5532,10 -6720,19 +5542,17 @@@
+  		 */
+  		cfs_rq->runtime_enabled = 0;
+  
+- 		if (cfs_rq_throttled(cfs_rq))
+- 			unthrottle_cfs_rq(cfs_rq);
++ 		if (!cfs_rq_throttled(cfs_rq))
++ 			continue;
++ 
++ 		/*
++ 		 * clock_task is not advancing so we just need to make sure
++ 		 * there's some valid quota amount
++ 		 */
++ 		cfs_rq->runtime_remaining = 1;
++ 		unthrottle_cfs_rq(cfs_rq);
+  	}
+  	rcu_read_unlock();
+ -
+ -	rq_clock_stop_loop_update(rq);
+  }
+  
+  bool cfs_task_bw_constrained(struct task_struct *p)
+* Unmerged path kernel/sched/fair.c
