@@ -1,0 +1,66 @@
+name: Automated kernel build and test
+on: [push]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+
+    # Host deps + KVM / FUSE validation
+    - name: Install host dependencies & verify KVM/FUSE
+      run: |
+        set -euxo pipefail
+        sudo apt-get update
+        sudo apt-get install -y fuse3 cpu-checker podman
+        sudo modprobe fuse # guarantee /dev/fuse
+        if ! sudo kvm-ok ; then
+          echo "::error::KVM acceleration not available on this runner."
+          exit 1
+        fi
+
+    # Kernel build inside CIQ builder
+    - name: Build kernel inside CIQ builder container
+      run: |
+        set -euxo pipefail
+        mkdir -p output
+        df -h
+        ls -l .* -d
+        podman run --rm --pull=always \
+          --privileged \
+          --device=/dev/fuse \
+          --device=/dev/kvm \
+          -v "$PWD":/src \
+          -v "$PWD/output":/output \
+          --security-opt label=disable \
+          pulp.prod.ciq.dev/ciq/cicd/lts-images/builder \
+          build_kernel.sh
+
+    # Artifacts: qcow2 + metadata
+    - name: Upload QCOW2 and metadata
+      uses: actions/upload-artifact@v4
+      with:
+        name: kernel-build
+        path: |
+          output/*.qcow2
+          output/last_build_image.txt
+        retention-days: 7
+        if-no-files-found: warn
+
+    # Artifacts: logs
+    - name: Upload build & dmesg logs
+      uses: actions/upload-artifact@v4
+      with:
+        name: kernel-logs
+        path: |
+          output/*.log
+        retention-days: 7
+        if-no-files-found: warn
