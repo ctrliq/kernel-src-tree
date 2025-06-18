@@ -28,6 +28,7 @@
 #include "kfd_topology.h"
 #include "amdgpu.h"
 #include "amdgpu_amdkfd.h"
+#include "amdgpu_xgmi.h"
 
 /* GPU Processor ID base for dGPUs for which VCRAT needs to be created.
  * GPU processor ID are expressed with Bit[31]=1.
@@ -1638,6 +1639,7 @@ int kfd_get_gpu_cache_info(struct kfd_node *kdev, struct kfd_gpu_cache_info **pc
 			break;
 		case IP_VERSION(9, 4, 3):
 		case IP_VERSION(9, 4, 4):
+		case IP_VERSION(9, 5, 0):
 			num_of_cache_types =
 				kfd_fill_gpu_cache_info_from_gfx_config_v2(kdev->kfd,
 									*pcache_info);
@@ -2352,6 +2354,8 @@ static int kfd_create_vcrat_image_gpu(void *pcrat_image,
 			if (!peer_dev->gpu)
 				continue;
 			if (peer_dev->gpu->kfd->hive_id != kdev->kfd->hive_id)
+				continue;
+			if (!amdgpu_xgmi_get_is_sharing_enabled(kdev->adev, peer_dev->gpu->adev))
 				continue;
 			sub_type_hdr = (typeof(sub_type_hdr))(
 				(char *)sub_type_hdr +

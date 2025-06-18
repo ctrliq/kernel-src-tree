@@ -162,6 +162,8 @@ void dcn314_update_odm(struct dc *dc, struct dc_state *context, struct pipe_ctx 
 	int opp_inst[MAX_PIPES] = {0};
 	int odm_slice_width = resource_get_odm_slice_dst_width(pipe_ctx, false);
 	int last_odm_slice_width = resource_get_odm_slice_dst_width(pipe_ctx, true);
+	struct mpc *mpc = dc->res_pool->mpc;
+	int i;
 
 	opp_cnt = get_odm_config(pipe_ctx, opp_inst);
 
@@ -173,6 +175,16 @@ void dcn314_update_odm(struct dc *dc, struct dc_state *context, struct pipe_ctx 
 	else
 		pipe_ctx->stream_res.tg->funcs->set_odm_bypass(
 				pipe_ctx->stream_res.tg, &pipe_ctx->stream->timing);
+
+	if (mpc->funcs->set_out_rate_control) {
+		for (i = 0; i < opp_cnt; ++i) {
+			mpc->funcs->set_out_rate_control(
+					mpc, opp_inst[i],
+					false,
+					0,
+					NULL);
+		}
+	}
 
 	for (odm_pipe = pipe_ctx->next_odm_pipe; odm_pipe; odm_pipe = odm_pipe->next_odm_pipe) {
 		odm_pipe->stream_res.opp->funcs->opp_pipe_clock_control(
@@ -496,7 +508,7 @@ void dcn314_disable_link_output(struct dc_link *link,
 	 * from enable/disable link output and only call edp panel control
 	 * in enable_link_dp and disable_link_dp once.
 	 */
-	if (dmcu != NULL && dmcu->funcs->lock_phy)
+	if (dmcu != NULL && dmcu->funcs->unlock_phy)
 		dmcu->funcs->unlock_phy(dmcu);
 	dc->link_srv->dp_trace_source_sequence(link, DPCD_SOURCE_SEQ_AFTER_DISABLE_LINK_PHY);
 

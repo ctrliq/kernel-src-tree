@@ -1286,6 +1286,7 @@ void dcn10_plane_atomic_power_down(struct dc *dc,
 		if (hws->funcs.hubp_pg_control)
 			hws->funcs.hubp_pg_control(hws, hubp->inst, false);
 
+		hubp->funcs->hubp_reset(hubp);
 		dpp->funcs->dpp_reset(dpp);
 
 		REG_SET(DC_IP_REQUEST_CNTL, 0,
@@ -1447,6 +1448,7 @@ void dcn10_init_pipes(struct dc *dc, struct dc_state *context)
 		/* Disable on the current state so the new one isn't cleared. */
 		pipe_ctx = &dc->current_state->res_ctx.pipe_ctx[i];
 
+		hubp->funcs->hubp_reset(hubp);
 		dpp->funcs->dpp_reset(dpp);
 
 		pipe_ctx->stream_res.tg = tg;
@@ -3453,7 +3455,6 @@ static bool dcn10_can_pipe_disable_cursor(struct pipe_ctx *pipe_ctx)
 		r2 = test_pipe->plane_res.scl_data.recout;
 		r2_r = r2.x + r2.width;
 		r2_b = r2.y + r2.height;
-		split_pipe = test_pipe;
 
 		/**
 		 * There is another half plane on same layer because of
