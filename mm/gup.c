@@ -3360,6 +3360,34 @@ int pin_user_pages_fast(unsigned long start, int nr_pages,
 EXPORT_SYMBOL_GPL(pin_user_pages_fast);
 
 /**
+ * pin_user_pages_fast_only() - pin user pages in memory
+ * @start:      starting user address
+ * @nr_pages:   number of pages from start to pin
+ * @gup_flags:  flags modifying pin behaviour
+ * @pages:      array that receives pointers to the pages pinned.
+ *              Should be at least nr_pages long.
+ *
+ * Like pin_user_pages_fast() except it's IRQ-safe in that it won't fall back to
+ * the regular GUP.
+ *
+ * If the architecture does not support this function, simply return with no
+ * pages pinned.
+ *
+ * Careful, careful! COW breaking can go either way, so a non-write
+ * access can get ambiguous page results. If you call this function without
+ * 'write' set, you'd better be sure that you're ok with that ambiguity.
+ */
+int pin_user_pages_fast_only(unsigned long start, int nr_pages,
+			     unsigned int gup_flags, struct page **pages)
+{
+	if (!is_valid_gup_args(pages, NULL, &gup_flags,
+			       FOLL_PIN | FOLL_FAST_ONLY))
+		return -EINVAL;
+	return internal_get_user_pages_fast(start, nr_pages, gup_flags, pages);
+}
+EXPORT_SYMBOL_GPL(pin_user_pages_fast_only);
+
+/**
  * pin_user_pages_remote() - pin pages of a remote process
  *
  * @mm:		mm_struct of target mm
