@@ -2657,7 +2657,7 @@ static struct platform_driver mhdp_driver = {
 		.of_match_table	= mhdp_ids,
 	},
 	.probe	= cdns_mhdp_probe,
-	.remove = cdns_mhdp_remove,
+	.remove_new = cdns_mhdp_remove,
 };
 module_platform_driver(mhdp_driver);
 

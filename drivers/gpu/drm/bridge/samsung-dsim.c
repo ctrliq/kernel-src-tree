@@ -2138,7 +2138,7 @@ MODULE_DEVICE_TABLE(of, samsung_dsim_of_match);
 
 static struct platform_driver samsung_dsim_driver = {
 	.probe = samsung_dsim_probe,
-	.remove = samsung_dsim_remove,
+	.remove_new = samsung_dsim_remove,
 	.driver = {
 		   .name = "samsung-dsim",
 		   .pm = pm_ptr(&samsung_dsim_pm_ops),
