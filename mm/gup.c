@@ -3491,6 +3491,20 @@ int pin_user_pages_fast(unsigned long start, int nr_pages,
 }
 EXPORT_SYMBOL_GPL(pin_user_pages_fast);
 
+/*
+ * This is the FOLL_PIN equivalent of get_user_pages_fast_only(). Behavior is
+ * the same, except that this one sets FOLL_PIN instead of FOLL_GET.
+ */
+int pin_user_pages_fast_only(unsigned long start, int nr_pages,
+			     unsigned int gup_flags, struct page **pages)
+{
+	if (!is_valid_gup_args(pages, NULL, &gup_flags,
+			       FOLL_PIN | FOLL_FAST_ONLY))
+		return -EINVAL;
+	return internal_get_user_pages_fast(start, nr_pages, gup_flags, pages);
+}
+EXPORT_SYMBOL_GPL(pin_user_pages_fast_only);
+
 /**
  * pin_user_pages_remote() - pin pages of a remote process
  *
