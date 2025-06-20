@@ -2190,7 +2190,6 @@ static int __ublk_ch_uring_cmd(struct io_uring_cmd *cmd,
 			       const struct ublksrv_io_cmd *ub_cmd)
 {
 	struct ublk_device *ub = cmd->file->private_data;
-	struct task_struct *task;
 	struct ublk_queue *ubq;
 	struct ublk_io *io;
 	u32 cmd_op = cmd->cmd_op;
@@ -2226,8 +2225,7 @@ static int __ublk_ch_uring_cmd(struct io_uring_cmd *cmd,
 		return -EIOCBQUEUED;
 	}
 
-	task = READ_ONCE(io->task);
-	if (task != current)
+	if (READ_ONCE(io->task) != current)
 		goto out;
 
 	/* there is pending io cmd, something must be wrong */
