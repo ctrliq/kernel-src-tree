@@ -1166,7 +1166,7 @@ int __kvm_arm_vcpu_set_events(struct kvm_vcpu *vcpu,
 void kvm_arm_halt_guest(struct kvm *kvm);
 void kvm_arm_resume_guest(struct kvm *kvm);
 
-#define vcpu_has_run_once(vcpu)	!!rcu_access_pointer((vcpu)->pid)
+#define vcpu_has_run_once(vcpu)	(!!READ_ONCE((vcpu)->pid))
 
 #ifndef __KVM_NVHE_HYPERVISOR__
 #define kvm_call_hyp_nvhe(f, ...)						\
@@ -1345,8 +1345,6 @@ static inline bool kvm_system_needs_idmapped_vectors(void)
 {
 	return cpus_have_final_cap(ARM64_SPECTRE_V3A);
 }
-
-static inline void kvm_arch_sync_events(struct kvm *kvm) {}
 
 void kvm_init_host_debug_data(void);
 void kvm_vcpu_load_debug(struct kvm_vcpu *vcpu);
@@ -1554,5 +1552,10 @@ void kvm_set_vm_id_reg(struct kvm *kvm, u32 reg, u64 val);
 
 #define kvm_has_s1poe(k)				\
 	(kvm_has_feat((k), ID_AA64MMFR3_EL1, S1POE, IMP))
+
+static inline bool kvm_arch_has_irq_bypass(void)
+{
+	return true;
+}
 
 #endif /* __ARM64_KVM_HOST_H__ */
