@@ -315,6 +315,11 @@ static const struct pci_device_id intel_th_pci_id_table[] = {
 		.driver_data = (kernel_ulong_t)&intel_th_2x,
 	},
 	{
+		/* Granite Rapids */
+		PCI_DEVICE(PCI_VENDOR_ID_INTEL, 0x0963),
+		.driver_data = (kernel_ulong_t)&intel_th_2x,
+	},
+	{
 		/* Granite Rapids SOC */
 		PCI_DEVICE(PCI_VENDOR_ID_INTEL, 0x3256),
 		.driver_data = (kernel_ulong_t)&intel_th_2x,
