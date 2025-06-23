@@ -10,6 +10,7 @@ TEST_PROGS = \
 	hw_stats_l3_gre.sh \
 	loopback.sh \
 	rss_ctx.py \
+	rss_input_xfrm.py \
 	#
 
 TEST_FILES := \
