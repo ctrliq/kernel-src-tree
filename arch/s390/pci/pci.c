@@ -28,6 +28,7 @@
 #include <linux/jump_label.h>
 #include <linux/pci.h>
 #include <linux/printk.h>
+#include <linux/lockdep.h>
 #include <linux/list_sort.h>
 
 #include <asm/isc.h>
@@ -727,12 +728,12 @@ EXPORT_SYMBOL_GPL(zpci_disable_device);
  * equivalent to its state during boot when first probing a driver.
  * Consequently after reset the PCI function requires re-initialization via the
  * common PCI code including re-enabling IRQs via pci_alloc_irq_vectors()
- * and enabling the function via e.g.pci_enablde_device_flags().The caller
+ * and enabling the function via e.g. pci_enable_device_flags(). The caller
  * must guard against concurrent reset attempts.
  *
  * In most cases this function should not be called directly but through
  * pci_reset_function() or pci_reset_bus() which handle the save/restore and
- * locking.
+ * locking - asserted by lockdep.
  *
  * Return: 0 on success and an error value otherwise
  */
@@ -741,6 +742,7 @@ int zpci_hot_reset_device(struct zpci_dev *zdev)
 	u8 status;
 	int rc;
 
+	lockdep_assert_held(&zdev->state_lock);
 	zpci_dbg(3, "rst fid:%x, fh:%x\n", zdev->fid, zdev->fh);
 	if (zdev_enabled(zdev)) {
 		/* Disables device access, DMAs and IRQs (reset state) */
@@ -802,7 +804,8 @@ struct zpci_dev *zpci_create_device(u32 fid, u32 fh, enum zpci_state state)
 		goto error;
 	zdev->state =  state;
 
-	mutex_init(&zdev->lock);
+	mutex_init(&zdev->state_lock);
+	mutex_init(&zdev->fmb_lock);
 	mutex_init(&zdev->kzdev_lock);
 
 	return zdev;
@@ -889,6 +892,10 @@ int zpci_deconfigure_device(struct zpci_dev *zdev)
 {
 	int rc;
 
+	lockdep_assert_held(&zdev->state_lock);
+	if (zdev->state != ZPCI_FN_STATE_CONFIGURED)
+		return 0;
+
 	if (zdev->zbus->bus)
 		zpci_bus_remove_device(zdev, false);
 
@@ -918,8 +925,6 @@ int zpci_deconfigure_device(struct zpci_dev *zdev)
  */
 void zpci_device_reserved(struct zpci_dev *zdev)
 {
-	if (zdev->has_hp_slot)
-		zpci_exit_slot(zdev);
 	/*
 	 * Remove device from zpci_list as it is going away. This also
 	 * makes sure we ignore subsequent zPCI events for this device.
@@ -935,7 +940,8 @@ void zpci_device_reserved(struct zpci_dev *zdev)
 void zpci_release_device(struct kref *kref)
 {
 	struct zpci_dev *zdev = container_of(kref, struct zpci_dev, kref);
-	int ret;
+
+	WARN_ON(zdev->state != ZPCI_FN_STATE_RESERVED);
 
 	if (zdev->zbus->bus)
 		zpci_bus_remove_device(zdev, false);
@@ -943,28 +949,14 @@ void zpci_release_device(struct kref *kref)
 	if (zdev_enabled(zdev))
 		zpci_disable_device(zdev);
 
-	switch (zdev->state) {
-	case ZPCI_FN_STATE_CONFIGURED:
-		ret = sclp_pci_deconfigure(zdev->fid);
-		zpci_dbg(3, "deconf fid:%x, rc:%d\n", zdev->fid, ret);
-		fallthrough;
-	case ZPCI_FN_STATE_STANDBY:
-		if (zdev->has_hp_slot)
-			zpci_exit_slot(zdev);
-		spin_lock(&zpci_list_lock);
-		list_del(&zdev->entry);
-		spin_unlock(&zpci_list_lock);
-		zpci_dbg(3, "rsv fid:%x\n", zdev->fid);
-		fallthrough;
-	case ZPCI_FN_STATE_RESERVED:
-		if (zdev->has_resources)
-			zpci_cleanup_bus_resources(zdev);
-		zpci_bus_device_unregister(zdev);
-		zpci_destroy_iommu(zdev);
-		fallthrough;
-	default:
-		break;
-	}
+	if (zdev->has_hp_slot)
+		zpci_exit_slot(zdev);
+
+	if (zdev->has_resources)
+		zpci_cleanup_bus_resources(zdev);
+
+	zpci_bus_device_unregister(zdev);
+	zpci_destroy_iommu(zdev);
 	zpci_dbg(3, "rem fid:%x\n", zdev->fid);
 	kfree_rcu(zdev, rcu);
 }
