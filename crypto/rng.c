@@ -14,8 +14,8 @@
 #include <linux/fips.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
-#include <linux/mutex.h>
 #include <linux/random.h>
+#include <linux/rtmutex.h>
 #include <linux/seq_file.h>
 #include <linux/sched.h>
 #include <linux/sched/signal.h>
@@ -26,9 +26,9 @@
 
 #include "internal.h"
 
-static ____cacheline_aligned_in_smp DEFINE_MUTEX(crypto_reseed_rng_lock);
+static ____cacheline_aligned_in_smp DEFINE_RT_MUTEX(crypto_reseed_rng_lock);
 static struct crypto_rng *crypto_reseed_rng;
-static ____cacheline_aligned_in_smp DEFINE_MUTEX(crypto_default_rng_lock);
+static ____cacheline_aligned_in_smp DEFINE_RT_MUTEX(crypto_default_rng_lock);
 struct crypto_rng *crypto_default_rng;
 EXPORT_SYMBOL_GPL(crypto_default_rng);
 static unsigned int crypto_default_rng_refcnt;
@@ -145,11 +145,11 @@ int crypto_get_default_rng(void)
 {
 	int err;
 
-	mutex_lock(&crypto_default_rng_lock);
+	rt_mutex_lock(&crypto_default_rng_lock);
 	err = crypto_get_rng(&crypto_default_rng);
 	if (!err)
 		crypto_default_rng_refcnt++;
-	mutex_unlock(&crypto_default_rng_lock);
+	rt_mutex_unlock(&crypto_default_rng_lock);
 
 	return err;
 }
@@ -157,19 +157,19 @@ EXPORT_SYMBOL_GPL(crypto_get_default_rng);
 
 void crypto_put_default_rng(void)
 {
-	mutex_lock(&crypto_default_rng_lock);
+	rt_mutex_lock(&crypto_default_rng_lock);
 	crypto_default_rng_refcnt--;
-	mutex_unlock(&crypto_default_rng_lock);
+	rt_mutex_unlock(&crypto_default_rng_lock);
 }
 EXPORT_SYMBOL_GPL(crypto_put_default_rng);
 
 #if defined(CONFIG_CRYPTO_RNG) || defined(CONFIG_CRYPTO_RNG_MODULE)
 static int crypto_del_rng(struct crypto_rng **rngp, unsigned int *refcntp,
-		      struct mutex *lock)
+			  struct rt_mutex *lock)
 {
 	int err = -EBUSY;
 
-	mutex_lock(lock);
+	rt_mutex_lock(lock);
 	if (refcntp && *refcntp)
 		goto out;
 
@@ -179,7 +179,7 @@ static int crypto_del_rng(struct crypto_rng **rngp, unsigned int *refcntp,
 	err = 0;
 
 out:
-	mutex_unlock(lock);
+	rt_mutex_unlock(lock);
 
 	return err;
 }
@@ -264,7 +264,7 @@ static ssize_t crypto_devrandom_read_iter(struct iov_iter *iter, bool reseed)
 		 * a separate mutex (drbg->drbg_mutex) around the
 		 * reseed-and-generate operation.
 		 */
-		mutex_lock(&crypto_reseed_rng_lock);
+		rt_mutex_lock(&crypto_reseed_rng_lock);
 
 		/* If crypto_default_rng is not set, it will be seeded
 		 * at creation in __crypto_get_default_rng and thus no
@@ -275,7 +275,7 @@ static ssize_t crypto_devrandom_read_iter(struct iov_iter *iter, bool reseed)
 
 		ret = crypto_get_rng(&crypto_reseed_rng);
 		if (ret) {
-			mutex_unlock(&crypto_reseed_rng_lock);
+			rt_mutex_unlock(&crypto_reseed_rng_lock);
 			return ret;
 		}
 
@@ -314,7 +314,7 @@ static ssize_t crypto_devrandom_read_iter(struct iov_iter *iter, bool reseed)
 	}
 
 	if (reseed)
-		mutex_unlock(&crypto_reseed_rng_lock);
+		rt_mutex_unlock(&crypto_reseed_rng_lock);
 	else
 		crypto_put_default_rng();
 	memzero_explicit(tmp, sizeof(tmp));
