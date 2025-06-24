@@ -31,7 +31,7 @@ static struct crypto_rng *crypto_reseed_rng;
 static ____cacheline_aligned_in_smp DEFINE_MUTEX(crypto_default_rng_lock);
 struct crypto_rng *crypto_default_rng;
 EXPORT_SYMBOL_GPL(crypto_default_rng);
-static int crypto_default_rng_refcnt;
+static unsigned int crypto_default_rng_refcnt;
 
 int crypto_rng_reset(struct crypto_rng *tfm, const u8 *seed, unsigned int slen)
 {
@@ -164,7 +164,7 @@ void crypto_put_default_rng(void)
 EXPORT_SYMBOL_GPL(crypto_put_default_rng);
 
 #if defined(CONFIG_CRYPTO_RNG) || defined(CONFIG_CRYPTO_RNG_MODULE)
-static int crypto_del_rng(struct crypto_rng **rngp, int *refcntp,
+static int crypto_del_rng(struct crypto_rng **rngp, unsigned int *refcntp,
 		      struct mutex *lock)
 {
 	int err = -EBUSY;
