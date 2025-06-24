@@ -441,9 +441,11 @@ int kvm_vgic_v4_set_forwarding(struct kvm *kvm, int virq,
 				 irq_entry->msi.data, &irq))
 		return 0;
 
+	raw_spin_lock_irqsave(&irq->irq_lock, flags);
+
 	/* Silently exit if the vLPI is already mapped */
 	if (irq->hw)
-		return 0;
+		goto out_unlock_irq;
 
 	/*
 	 * Emit the mapping request. If it fails, the ITS probably
@@ -463,30 +465,30 @@ int kvm_vgic_v4_set_forwarding(struct kvm *kvm, int virq,
 
 	ret = its_map_vlpi(virq, &map);
 	if (ret)
-		return ret;
+		goto out_unlock_irq;
 
 	irq->hw		= true;
 	irq->host_irq	= virq;
 	atomic_inc(&map.vpe->vlpi_count);
 
 	/* Transfer pending state */
-	raw_spin_lock_irqsave(&irq->irq_lock, flags);
-	if (irq->pending_latch) {
-		ret = irq_set_irqchip_state(irq->host_irq,
-					    IRQCHIP_STATE_PENDING,
-					    irq->pending_latch);
-		WARN_RATELIMIT(ret, "IRQ %d", irq->host_irq);
+	if (!irq->pending_latch)
+		goto out_unlock_irq;
 
-		/*
-		 * Clear pending_latch and communicate this state
-		 * change via vgic_queue_irq_unlock.
-		 */
-		irq->pending_latch = false;
-		vgic_queue_irq_unlock(kvm, irq, flags);
-	} else {
-		raw_spin_unlock_irqrestore(&irq->irq_lock, flags);
-	}
+	ret = irq_set_irqchip_state(irq->host_irq, IRQCHIP_STATE_PENDING,
+				    irq->pending_latch);
+	WARN_RATELIMIT(ret, "IRQ %d", irq->host_irq);
 
+	/*
+	 * Clear pending_latch and communicate this state
+	 * change via vgic_queue_irq_unlock.
+	 */
+	irq->pending_latch = false;
+	vgic_queue_irq_unlock(kvm, irq, flags);
+	return ret;
+
+out_unlock_irq:
+	raw_spin_unlock_irqrestore(&irq->irq_lock, flags);
 	return ret;
 }
 
@@ -495,7 +497,8 @@ int kvm_vgic_v4_unset_forwarding(struct kvm *kvm, int virq,
 {
 	struct vgic_its *its;
 	struct vgic_irq *irq;
-	int ret;
+	unsigned long flags;
+	int ret = 0;
 
 	if (!vgic_supports_direct_msis(kvm))
 		return 0;
@@ -515,6 +518,7 @@ int kvm_vgic_v4_unset_forwarding(struct kvm *kvm, int virq,
 	if (ret)
 		goto out;
 
+	raw_spin_lock_irqsave(&irq->irq_lock, flags);
 	WARN_ON(irq->hw && irq->host_irq != virq);
 	if (irq->hw) {
 		atomic_dec(&irq->target_vcpu->arch.vgic_cpu.vgic_v3.its_vpe.vlpi_count);
@@ -522,6 +526,7 @@ int kvm_vgic_v4_unset_forwarding(struct kvm *kvm, int virq,
 		ret = its_unmap_vlpi(virq);
 	}
 
+	raw_spin_unlock_irqrestore(&irq->irq_lock, flags);
 out:
 	mutex_unlock(&its->its_lock);
 	return ret;
