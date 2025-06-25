@@ -336,7 +336,7 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 
 	paging_init();
 
-	if (IS_ENABLED(CONFIG_PREEMPT_RT))
+	if (IS_ENABLED(CONFIG_PREEMPT_RT) && !IS_ENABLED(CONFIG_RH_AUTOMOTIVE))
 		mark_tech_preview("RHEL-RT on ARM64", NULL);
 
 	acpi_table_upgrade();
