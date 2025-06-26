@@ -906,6 +906,7 @@ struct ice_hw {
 	u8 revision_id;
 
 	u8 pf_id;		/* device profile info */
+	u8 logical_pf_id;
 
 	u16 max_burst_size;	/* driver sets this value */
 
@@ -1215,5 +1216,10 @@ struct ice_aq_get_set_rss_lut_params {
 #define ICE_FW_API_REPORT_DFLT_CFG_MAJ		1
 #define ICE_FW_API_REPORT_DFLT_CFG_MIN		7
 #define ICE_FW_API_REPORT_DFLT_CFG_PATCH	3
+
+/* AQ API version for Health Status support */
+#define ICE_FW_API_HEALTH_REPORT_MAJ		1
+#define ICE_FW_API_HEALTH_REPORT_MIN		7
+#define ICE_FW_API_HEALTH_REPORT_PATCH		6
 
 #endif /* _ICE_TYPE_H_ */
