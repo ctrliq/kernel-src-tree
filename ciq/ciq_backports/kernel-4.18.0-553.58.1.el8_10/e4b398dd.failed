@@ -1,0 +1,166 @@
+idpf: fix netdev Tx queue stop/wake
+
+jira LE-3467
+Rebuild_History Non-Buildable kernel-4.18.0-553.58.1.el8_10
+commit-author Michal Kubiak <michal.kubiak@intel.com>
+commit e4b398dd82f5d5867bc5f442c43abc8fba30ed2c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.58.1.el8_10/e4b398dd.failed
+
+netif_txq_maybe_stop() returns -1, 0, or 1, while
+idpf_tx_maybe_stop_common() says it returns 0 or -EBUSY. As a result,
+there sometimes are Tx queue timeout warnings despite that the queue
+is empty or there is at least enough space to restart it.
+Make idpf_tx_maybe_stop_common() inline and returning true or false,
+handling the return of netif_txq_maybe_stop() properly. Use a correct
+goto in idpf_tx_maybe_stop_splitq() to avoid stopping the queue or
+incrementing the stops counter twice.
+
+Fixes: 6818c4d5b3c2 ("idpf: add splitq start_xmit")
+Fixes: a5ab9ee0df0b ("idpf: add singleq start_xmit and napi poll")
+	Cc: stable@vger.kernel.org # 6.7+
+	Signed-off-by: Michal Kubiak <michal.kubiak@intel.com>
+	Reviewed-by: Przemek Kitszel <przemyslaw.kitszel@intel.com>
+	Signed-off-by: Alexander Lobakin <aleksander.lobakin@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit e4b398dd82f5d5867bc5f442c43abc8fba30ed2c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/idpf/idpf_txrx.c
+#	drivers/net/ethernet/intel/idpf/idpf_txrx.h
+diff --cc drivers/net/ethernet/intel/idpf/idpf_txrx.c
+index c176fd614eda,5d74f324bcd4..000000000000
+--- a/drivers/net/ethernet/intel/idpf/idpf_txrx.c
++++ b/drivers/net/ethernet/intel/idpf/idpf_txrx.c
+@@@ -1972,29 -2133,6 +1972,32 @@@ void idpf_tx_splitq_build_flow_desc(uni
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * idpf_tx_maybe_stop_common - 1st level check for common Tx stop conditions
+ + * @tx_q: the queue to be checked
+ + * @size: number of descriptors we want to assure is available
+ + *
+ + * Returns 0 if stop is not needed
+ + */
+ +int idpf_tx_maybe_stop_common(struct idpf_queue *tx_q, unsigned int size)
+ +{
+ +	struct netdev_queue *nq;
+ +
+ +	if (likely(IDPF_DESC_UNUSED(tx_q) >= size))
+ +		return 0;
+ +
+ +	u64_stats_update_begin(&tx_q->stats_sync);
+ +	u64_stats_inc(&tx_q->q_stats.tx.q_busy);
+ +	u64_stats_update_end(&tx_q->stats_sync);
+ +
+ +	nq = netdev_get_tx_queue(tx_q->vport->netdev, tx_q->idx);
+ +
+ +	return netif_txq_maybe_stop(nq, IDPF_DESC_UNUSED(tx_q), size, size);
+ +}
+ +
+ +/**
+++=======
+++>>>>>>> e4b398dd82f5 (idpf: fix netdev Tx queue stop/wake)
+   * idpf_tx_maybe_stop_splitq - 1st level check for Tx splitq stop conditions
+   * @tx_q: the queue to be checked
+   * @descs_needed: number of descriptors required for this packet
+@@@ -2024,10 -2162,12 +2027,16 @@@ static int idpf_tx_maybe_stop_splitq(st
+  	return 0;
+  
+  splitq_stop:
++ 	netif_stop_subqueue(tx_q->netdev, tx_q->idx);
++ 
++ out:
+  	u64_stats_update_begin(&tx_q->stats_sync);
+ -	u64_stats_inc(&tx_q->q_stats.q_busy);
+ +	u64_stats_inc(&tx_q->q_stats.tx.q_busy);
+  	u64_stats_update_end(&tx_q->stats_sync);
+++<<<<<<< HEAD
+ +	netif_stop_subqueue(tx_q->vport->netdev, tx_q->idx);
+++=======
+++>>>>>>> e4b398dd82f5 (idpf: fix netdev Tx queue stop/wake)
+  
+  	return -EBUSY;
+  }
+@@@ -2047,10 -2187,14 +2056,14 @@@ void idpf_tx_buf_hw_update(struct idpf_
+  {
+  	struct netdev_queue *nq;
+  
+ -	nq = netdev_get_tx_queue(tx_q->netdev, tx_q->idx);
+ +	nq = netdev_get_tx_queue(tx_q->vport->netdev, tx_q->idx);
+  	tx_q->next_to_use = val;
+  
+- 	idpf_tx_maybe_stop_common(tx_q, IDPF_TX_DESC_NEEDED);
++ 	if (idpf_tx_maybe_stop_common(tx_q, IDPF_TX_DESC_NEEDED)) {
++ 		u64_stats_update_begin(&tx_q->stats_sync);
++ 		u64_stats_inc(&tx_q->q_stats.q_busy);
++ 		u64_stats_update_end(&tx_q->stats_sync);
++ 	}
+  
+  	/* Force memory writes to complete before letting h/w
+  	 * know there are new descriptors to fetch.  (Only
+diff --cc drivers/net/ethernet/intel/idpf/idpf_txrx.h
+index 1669bf01ba1d,33305de06975..000000000000
+--- a/drivers/net/ethernet/intel/idpf/idpf_txrx.h
++++ b/drivers/net/ethernet/intel/idpf/idpf_txrx.h
+@@@ -1031,28 -1009,20 +1031,31 @@@ void idpf_deinit_rss(struct idpf_vport 
+  int idpf_rx_bufs_init_all(struct idpf_vport *vport);
+  void idpf_rx_add_frag(struct idpf_rx_buf *rx_buf, struct sk_buff *skb,
+  		      unsigned int size);
+ -struct sk_buff *idpf_rx_build_skb(const struct libeth_fqe *buf, u32 size);
+ -void idpf_tx_buf_hw_update(struct idpf_tx_queue *tx_q, u32 val,
+ +struct sk_buff *idpf_rx_construct_skb(struct idpf_queue *rxq,
+ +				      struct idpf_rx_buf *rx_buf,
+ +				      unsigned int size);
+ +bool idpf_init_rx_buf_hw_alloc(struct idpf_queue *rxq, struct idpf_rx_buf *buf);
+ +void idpf_rx_buf_hw_update(struct idpf_queue *rxq, u32 val);
+ +void idpf_tx_buf_hw_update(struct idpf_queue *tx_q, u32 val,
+  			   bool xmit_more);
+  unsigned int idpf_size_to_txd_count(unsigned int size);
+ -netdev_tx_t idpf_tx_drop_skb(struct idpf_tx_queue *tx_q, struct sk_buff *skb);
+ -void idpf_tx_dma_map_error(struct idpf_tx_queue *txq, struct sk_buff *skb,
+ +netdev_tx_t idpf_tx_drop_skb(struct idpf_queue *tx_q, struct sk_buff *skb);
+ +void idpf_tx_dma_map_error(struct idpf_queue *txq, struct sk_buff *skb,
+  			   struct idpf_tx_buf *first, u16 ring_idx);
+ -unsigned int idpf_tx_desc_count_required(struct idpf_tx_queue *txq,
+ +unsigned int idpf_tx_desc_count_required(struct idpf_queue *txq,
+  					 struct sk_buff *skb);
+++<<<<<<< HEAD
+ +bool idpf_chk_linearize(struct sk_buff *skb, unsigned int max_bufs,
+ +			unsigned int count);
+ +int idpf_tx_maybe_stop_common(struct idpf_queue *tx_q, unsigned int size);
+++=======
+++>>>>>>> e4b398dd82f5 (idpf: fix netdev Tx queue stop/wake)
+  void idpf_tx_timeout(struct net_device *netdev, unsigned int txqueue);
+ -netdev_tx_t idpf_tx_singleq_frame(struct sk_buff *skb,
+ -				  struct idpf_tx_queue *tx_q);
+ -netdev_tx_t idpf_tx_start(struct sk_buff *skb, struct net_device *netdev);
+ -bool idpf_rx_singleq_buf_hw_alloc_all(struct idpf_rx_queue *rxq,
+ +netdev_tx_t idpf_tx_splitq_start(struct sk_buff *skb,
+ +				 struct net_device *netdev);
+ +netdev_tx_t idpf_tx_singleq_start(struct sk_buff *skb,
+ +				  struct net_device *netdev);
+ +bool idpf_rx_singleq_buf_hw_alloc_all(struct idpf_queue *rxq,
+  				      u16 cleaned_count);
+  int idpf_tso(struct sk_buff *skb, struct idpf_tx_offload_params *off);
+  
+diff --git a/drivers/net/ethernet/intel/idpf/idpf_singleq_txrx.c b/drivers/net/ethernet/intel/idpf/idpf_singleq_txrx.c
+index 5c3d34d3de8a..729830b5f531 100644
+--- a/drivers/net/ethernet/intel/idpf/idpf_singleq_txrx.c
++++ b/drivers/net/ethernet/intel/idpf/idpf_singleq_txrx.c
+@@ -369,6 +369,10 @@ static netdev_tx_t idpf_tx_singleq_frame(struct sk_buff *skb,
+ 				      IDPF_TX_DESCS_FOR_CTX)) {
+ 		idpf_tx_buf_hw_update(tx_q, tx_q->next_to_use, false);
+ 
++		u64_stats_update_begin(&tx_q->stats_sync);
++		u64_stats_inc(&tx_q->q_stats.q_busy);
++		u64_stats_update_end(&tx_q->stats_sync);
++
+ 		return NETDEV_TX_BUSY;
+ 	}
+ 
+* Unmerged path drivers/net/ethernet/intel/idpf/idpf_txrx.c
+* Unmerged path drivers/net/ethernet/intel/idpf/idpf_txrx.h
