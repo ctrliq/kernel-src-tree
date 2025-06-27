@@ -1,0 +1,185 @@
+idpf: compile singleq code only under default-n CONFIG_IDPF_SINGLEQ
+
+jira LE-3467
+Rebuild_History Non-Buildable kernel-4.18.0-553.58.1.el8_10
+commit-author Alexander Lobakin <aleksander.lobakin@intel.com>
+commit f771314d6b75181de7079c3c7d666293e4ed2b22
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.58.1.el8_10/f771314d.failed
+
+Currently, all HW supporting idpf supports the singleq model, but none
+of it advertises it by default, as splitq is supported and preferred
+for multiple reasons. Still, this almost dead code often times adds
+hotpath branches and redundant cacheline accesses.
+While it can't currently be removed, add CONFIG_IDPF_SINGLEQ and build
+the singleq code only when it's enabled manually. This corresponds to
+-10 Kb of object code size and a good bunch of hotpath checks.
+idpf_is_queue_model_split() works as a gate and compiles out to `true`
+when the config option is disabled.
+
+	Reviewed-by: Przemek Kitszel <przemyslaw.kitszel@intel.com>
+	Signed-off-by: Alexander Lobakin <aleksander.lobakin@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit f771314d6b75181de7079c3c7d666293e4ed2b22)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/Kconfig
+diff --cc drivers/net/ethernet/intel/Kconfig
+index ea88ce9ff84f,0375c7448a57..000000000000
+--- a/drivers/net/ethernet/intel/Kconfig
++++ b/drivers/net/ethernet/intel/Kconfig
+@@@ -354,17 -375,15 +354,30 @@@ config IG
+  
+  	  To compile this driver as a module, choose M here. The module
+  	  will be called igc.
+++<<<<<<< HEAD
+ +config IDPF
+ +	tristate "Intel(R) Infrastructure Data Path Function Support"
+ +	depends on PCI_MSI
+ +	select DIMLIB
+ +	select PAGE_POOL
+ +	select PAGE_POOL_STATS
+ +	help
+ +	  This driver supports Intel(R) Infrastructure Data Path Function
+ +	  devices.
+ +
+ +	  To compile this driver as a module, choose M here. The module
+ +	  will be called idpf.
+++=======
++ 
++ config IGC_LEDS
++ 	def_bool LEDS_TRIGGER_NETDEV
++ 	depends on IGC && LEDS_CLASS
++ 	depends on LEDS_CLASS=y || IGC=m
++ 	help
++ 	  Optional support for controlling the NIC LED's with the netdev
++ 	  LED trigger.
++ 
++ source "drivers/net/ethernet/intel/idpf/Kconfig"
+++>>>>>>> f771314d6b75 (idpf: compile singleq code only under default-n CONFIG_IDPF_SINGLEQ)
+  
+  endif # NET_VENDOR_INTEL
+* Unmerged path drivers/net/ethernet/intel/Kconfig
+diff --git a/drivers/net/ethernet/intel/idpf/Kconfig b/drivers/net/ethernet/intel/idpf/Kconfig
+new file mode 100644
+index 000000000000..9082c16edb7e
+--- /dev/null
++++ b/drivers/net/ethernet/intel/idpf/Kconfig
+@@ -0,0 +1,27 @@
++# SPDX-License-Identifier: GPL-2.0-only
++# Copyright (C) 2024 Intel Corporation
++
++config IDPF
++	tristate "Intel(R) Infrastructure Data Path Function Support"
++	depends on PCI_MSI
++	select DIMLIB
++	select PAGE_POOL
++	select PAGE_POOL_STATS
++	help
++	  This driver supports Intel(R) Infrastructure Data Path Function
++	  devices.
++
++	  To compile this driver as a module, choose M here. The module
++	  will be called idpf.
++
++if IDPF
++
++config IDPF_SINGLEQ
++	bool "idpf singleq support"
++	help
++	  This option enables support for legacy single Rx/Tx queues w/no
++	  completion and fill queues. Only enable if you have hardware which
++	  wants to work in this mode as it increases the driver size and adds
++	  runtme checks on hotpath.
++
++endif # IDPF
+diff --git a/drivers/net/ethernet/intel/idpf/Makefile b/drivers/net/ethernet/intel/idpf/Makefile
+index 6844ead2f3ac..2ce01a0b5898 100644
+--- a/drivers/net/ethernet/intel/idpf/Makefile
++++ b/drivers/net/ethernet/intel/idpf/Makefile
+@@ -12,7 +12,8 @@ idpf-y := \
+ 	idpf_ethtool.o		\
+ 	idpf_lib.o		\
+ 	idpf_main.o		\
+-	idpf_singleq_txrx.o	\
+ 	idpf_txrx.o		\
+ 	idpf_virtchnl.o 	\
+ 	idpf_vf_dev.o
++
++idpf-$(CONFIG_IDPF_SINGLEQ)	+= idpf_singleq_txrx.o
+diff --git a/drivers/net/ethernet/intel/idpf/idpf.h b/drivers/net/ethernet/intel/idpf/idpf.h
+index 8e39fae179a6..67b7a10fb685 100644
+--- a/drivers/net/ethernet/intel/idpf/idpf.h
++++ b/drivers/net/ethernet/intel/idpf/idpf.h
+@@ -600,7 +600,8 @@ struct idpf_adapter {
+  */
+ static inline int idpf_is_queue_model_split(u16 q_model)
+ {
+-	return q_model == VIRTCHNL2_QUEUE_MODEL_SPLIT;
++	return !IS_ENABLED(CONFIG_IDPF_SINGLEQ) ||
++	       q_model == VIRTCHNL2_QUEUE_MODEL_SPLIT;
+ }
+ 
+ #define idpf_is_cap_ena(adapter, field, flag) \
+diff --git a/drivers/net/ethernet/intel/idpf/idpf_txrx.c b/drivers/net/ethernet/intel/idpf/idpf_txrx.c
+index 4a7062c55fcb..28be16ae7190 100644
+--- a/drivers/net/ethernet/intel/idpf/idpf_txrx.c
++++ b/drivers/net/ethernet/intel/idpf/idpf_txrx.c
+@@ -1141,7 +1141,7 @@ static void idpf_vport_calc_numq_per_grp(struct idpf_vport *vport,
+  */
+ static void idpf_rxq_set_descids(struct idpf_vport *vport, struct idpf_queue *q)
+ {
+-	if (vport->rxq_model == VIRTCHNL2_QUEUE_MODEL_SPLIT) {
++	if (idpf_is_queue_model_split(vport->rxq_model)) {
+ 		q->rxdids = VIRTCHNL2_RXDID_2_FLEX_SPLITQ_M;
+ 	} else {
+ 		if (vport->base_rxd)
+diff --git a/drivers/net/ethernet/intel/idpf/idpf_virtchnl.c b/drivers/net/ethernet/intel/idpf/idpf_virtchnl.c
+index 3b849b668ede..6dc810dac975 100644
+--- a/drivers/net/ethernet/intel/idpf/idpf_virtchnl.c
++++ b/drivers/net/ethernet/intel/idpf/idpf_virtchnl.c
+@@ -1264,12 +1264,12 @@ int idpf_send_create_vport_msg(struct idpf_adapter *adapter,
+ 	vport_msg->vport_type = cpu_to_le16(VIRTCHNL2_VPORT_TYPE_DEFAULT);
+ 	vport_msg->vport_index = cpu_to_le16(idx);
+ 
+-	if (adapter->req_tx_splitq)
++	if (adapter->req_tx_splitq || !IS_ENABLED(CONFIG_IDPF_SINGLEQ))
+ 		vport_msg->txq_model = cpu_to_le16(VIRTCHNL2_QUEUE_MODEL_SPLIT);
+ 	else
+ 		vport_msg->txq_model = cpu_to_le16(VIRTCHNL2_QUEUE_MODEL_SINGLE);
+ 
+-	if (adapter->req_rx_splitq)
++	if (adapter->req_rx_splitq || !IS_ENABLED(CONFIG_IDPF_SINGLEQ))
+ 		vport_msg->rxq_model = cpu_to_le16(VIRTCHNL2_QUEUE_MODEL_SPLIT);
+ 	else
+ 		vport_msg->rxq_model = cpu_to_le16(VIRTCHNL2_QUEUE_MODEL_SINGLE);
+@@ -1331,10 +1331,17 @@ int idpf_check_supported_desc_ids(struct idpf_vport *vport)
+ 
+ 	vport_msg = adapter->vport_params_recvd[vport->idx];
+ 
++	if (!IS_ENABLED(CONFIG_IDPF_SINGLEQ) &&
++	    (vport_msg->rxq_model == VIRTCHNL2_QUEUE_MODEL_SINGLE ||
++	     vport_msg->txq_model == VIRTCHNL2_QUEUE_MODEL_SINGLE)) {
++		pci_err(adapter->pdev, "singleq mode requested, but not compiled-in\n");
++		return -EOPNOTSUPP;
++	}
++
+ 	rx_desc_ids = le64_to_cpu(vport_msg->rx_desc_ids);
+ 	tx_desc_ids = le64_to_cpu(vport_msg->tx_desc_ids);
+ 
+-	if (vport->rxq_model == VIRTCHNL2_QUEUE_MODEL_SPLIT) {
++	if (idpf_is_queue_model_split(vport->rxq_model)) {
+ 		if (!(rx_desc_ids & VIRTCHNL2_RXDID_2_FLEX_SPLITQ_M)) {
+ 			dev_info(&adapter->pdev->dev, "Minimum RX descriptor support not provided, using the default\n");
+ 			vport_msg->rx_desc_ids = cpu_to_le64(VIRTCHNL2_RXDID_2_FLEX_SPLITQ_M);
+@@ -1344,7 +1351,7 @@ int idpf_check_supported_desc_ids(struct idpf_vport *vport)
+ 			vport->base_rxd = true;
+ 	}
+ 
+-	if (vport->txq_model != VIRTCHNL2_QUEUE_MODEL_SPLIT)
++	if (!idpf_is_queue_model_split(vport->txq_model))
+ 		return 0;
+ 
+ 	if ((tx_desc_ids & MIN_SUPPORT_TXDID) != MIN_SUPPORT_TXDID) {
