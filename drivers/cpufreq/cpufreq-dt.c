@@ -114,22 +114,9 @@ static int cpufreq_init(struct cpufreq_policy *policy)
 	policy->cpuinfo.transition_latency = transition_latency;
 	policy->dvfs_possible_from_any_cpu = true;
 
-	/* Support turbo/boost mode */
-	if (policy_has_boost_freq(policy)) {
-		/* This gets disabled by core on driver unregister */
-		ret = cpufreq_enable_boost_support();
-		if (ret)
-			goto out_clk_put;
-	}
-
 	dev_pm_opp_of_register_em(cpu_dev, policy->cpus);
 
 	return 0;
-
-out_clk_put:
-	clk_put(cpu_clk);
-
-	return ret;
 }
 
 static int cpufreq_online(struct cpufreq_policy *policy)
@@ -163,6 +150,7 @@ static struct cpufreq_driver dt_cpufreq_driver = {
 	.online = cpufreq_online,
 	.offline = cpufreq_offline,
 	.name = "cpufreq-dt",
+	.set_boost = cpufreq_boost_set_sw,
 	.suspend = cpufreq_generic_suspend,
 };
 
