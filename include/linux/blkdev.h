@@ -121,6 +121,7 @@ struct blk_integrity {
 	unsigned char				interval_exp;
 	unsigned char				tag_size;
 
+	unsigned char				pi_tuple_size;
 	RH_KABI_RESERVE(1)
 	RH_KABI_RESERVE(2)
 };
