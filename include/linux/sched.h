@@ -14,6 +14,7 @@
 #include <linux/thread_info.h>
 #include <linux/preempt.h>
 #include <linux/cpumask_types.h>
+#include <linux/rh_kabi.h>
 
 #include <linux/cache.h>
 #include <linux/irqflags_types.h>
@@ -1250,7 +1251,7 @@ struct task_struct {
 	struct io_context		*io_context;
 
 #ifdef CONFIG_COMPACTION
-	struct capture_control		*capture_control;
+	RH_KABI_EXCLUDE(struct capture_control *capture_control)
 #endif
 	/* Ptrace state: */
 	unsigned long			ptrace_message;
@@ -1490,7 +1491,7 @@ struct task_struct {
 #endif
 
 #ifdef CONFIG_MEMCG_V1
-	struct mem_cgroup		*memcg_in_oom;
+	RH_KABI_EXCLUDE(struct mem_cgroup *memcg_in_oom)
 #endif
 
 #ifdef CONFIG_MEMCG
@@ -1498,10 +1499,10 @@ struct task_struct {
 	unsigned int			memcg_nr_pages_over_high;
 
 	/* Used by memcontrol for targeted memcg charge: */
-	struct mem_cgroup		*active_memcg;
+	RH_KABI_EXCLUDE(struct mem_cgroup *active_memcg)
 
 	/* Cache for current->cgroups->memcg->objcg lookups: */
-	struct obj_cgroup		*objcg;
+	RH_KABI_EXCLUDE(struct obj_cgroup *objcg)
 #endif
 
 #ifdef CONFIG_BLK_CGROUP

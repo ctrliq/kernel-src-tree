@@ -304,7 +304,7 @@ else ifeq ("$(DISTRO)", "centos")
   PATCHLIST_URL:=none
   RHPKG_BIN:=centpkg
 else
-  RHDISTGIT_BRANCH:=rhel-$(RHEL_MAJOR).$(RHEL_MINOR).0
+  RHDISTGIT_BRANCH:=rhel-$(RHEL_MAJOR).$(RHEL_MINOR)
   ifndef BUILD_TARGET
     ifeq ("$(DIST)", ".eln")
       BUILD_TARGET:=eln

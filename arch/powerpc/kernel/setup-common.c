@@ -923,6 +923,12 @@ void __init setup_arch(char **cmdline_p)
 	 * just cputable (on ppc32).
 	 */
 	initialize_cache_info();
+
+	/* Initialize the lockdown LSM */
+	jump_label_init();
+	static_call_init();
+	early_security_init();
+
 	/*
 	 * Lock down the kernel if booted in secure mode. This is required to
 	 * maintain kernel integrity.
