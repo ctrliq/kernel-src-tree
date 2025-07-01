@@ -1,0 +1,97 @@
+ice: ensure periodic output start time is in the future
+
+jira LE-3460
+Rebuild_History Non-Buildable kernel-6.12.0-55.11.1.el10_0
+commit-author Karol Kolacinski <karol.kolacinski@intel.com>
+commit 53ce7166cbffd2b8f3bd821fd3918be665afd4c6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-55.11.1.el10_0/53ce7166.failed
+
+On E800 series hardware, if the start time for a periodic output signal is
+programmed into GLTSYN_TGT_H and GLTSYN_TGT_L registers, the hardware logic
+locks up and the periodic output signal never starts. Any future attempt to
+reprogram the clock function is futile as the hardware will not reset until
+a power on.
+
+The ice_ptp_cfg_perout function has logic to prevent this, as it checks if
+the requested start time is in the past. If so, a new start time is
+calculated by rounding up.
+
+Since commit d755a7e129a5 ("ice: Cache perout/extts requests and check
+flags"), the rounding is done to the nearest multiple of the clock period,
+rather than to a full second. This is more accurate, since it ensures the
+signal matches the user request precisely.
+
+Unfortunately, there is a race condition with this rounding logic. If the
+current time is close to the multiple of the period, we could calculate a
+target time that is extremely soon. It takes time for the software to
+program the registers, during which time this requested start time could
+become a start time in the past. If that happens, the periodic output
+signal will lock up.
+
+For large enough periods, or for the logic prior to the mentioned commit,
+this is unlikely. However, with the new logic rounding to the period and
+with a small enough period, this becomes inevitable.
+
+For example, attempting to enable a 10MHz signal requires a period of 100
+nanoseconds. This means in the *best* case, we have 99 nanoseconds to
+program the clock output. This is essentially impossible, and thus such a
+small period practically guarantees that the clock output function will
+lock up.
+
+To fix this, add some slop to the clock time used to check if the start
+time is in the past. Because it is not critical that output signals start
+immediately, but it *is* critical that we do not brick the function, 0.5
+seconds is selected. This does mean that any requested output will be
+delayed by at least 0.5 seconds.
+
+This slop is applied before rounding, so that we always round up to the
+nearest multiple of the period that is at least 0.5 seconds in the future,
+ensuring a minimum of 0.5 seconds to program the clock output registers.
+
+Finally, to ensure that the hardware registers programming the clock output
+complete in a timely manner, add a write flush to the end of
+ice_ptp_write_perout. This ensures we don't risk any issue with PCIe
+transaction batching.
+
+Strictly speaking, this fixes a race condition all the way back at the
+initial implementation of periodic output programming, as it is
+theoretically possible to trigger this bug even on the old logic when
+always rounding to a full second. However, the window is narrow, and the
+code has been refactored heavily since then, making a direct backport not
+apply cleanly.
+
+Fixes: d755a7e129a5 ("ice: Cache perout/extts requests and check flags")
+	Signed-off-by: Karol Kolacinski <karol.kolacinski@intel.com>
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Tested-by: Rinitha S <sx.rinitha@intel.com> (A Contingent worker at Intel)
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit 53ce7166cbffd2b8f3bd821fd3918be665afd4c6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_ptp.c
+diff --cc drivers/net/ethernet/intel/ice/ice_ptp.c
+index 2ce37de3ccea,a99e0fbd0b8b..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_ptp.c
++++ b/drivers/net/ethernet/intel/ice/ice_ptp.c
+@@@ -1813,10 -1844,11 +1814,16 @@@ static int ice_ptp_cfg_perout(struct ic
+  		div64_u64_rem(start, period, &phase);
+  
+  	/* If we have only phase or start time is in the past, start the timer
+- 	 * at the next multiple of period, maintaining phase.
++ 	 * at the next multiple of period, maintaining phase at least 0.5 second
++ 	 * from now, so we have time to write it to HW.
+  	 */
+++<<<<<<< HEAD
+ +	clk = ice_ptp_read_src_clk_reg(pf, NULL);
+ +	if (rq->flags & PTP_PEROUT_PHASE || start <= clk - ice_prop_delay(hw))
+++=======
++ 	clk = ice_ptp_read_src_clk_reg(pf, NULL) + NSEC_PER_MSEC * 500;
++ 	if (rq->flags & PTP_PEROUT_PHASE || start <= clk - prop_delay_ns)
+++>>>>>>> 53ce7166cbff (ice: ensure periodic output start time is in the future)
+  		start = div64_u64(clk + period - 1, period) * period + phase;
+  
+  	/* Compensate for propagation delay from the generator to the pin. */
+* Unmerged path drivers/net/ethernet/intel/ice/ice_ptp.c
