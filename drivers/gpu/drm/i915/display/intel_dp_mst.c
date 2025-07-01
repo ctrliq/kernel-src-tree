@@ -152,7 +152,7 @@ static int intel_dp_mst_dsc_get_slice_count(const struct intel_connector *connec
 {
 	const struct drm_display_mode *adjusted_mode =
 		&crtc_state->hw.adjusted_mode;
-	int num_joined_pipes = crtc_state->joiner_pipes;
+	int num_joined_pipes = intel_crtc_num_joined_pipes(crtc_state);
 
 	return intel_dp_dsc_get_slice_count(connector,
 					    adjusted_mode->clock,
@@ -1521,14 +1521,14 @@ intel_dp_mst_mode_valid_ctx(struct drm_connector *connector,
 								    max_lanes,
 								    target_clock,
 								    mode->hdisplay,
-								    joiner,
+								    num_joined_pipes,
 								    INTEL_OUTPUT_FORMAT_RGB,
 								    pipe_bpp, 64);
 			dsc_slice_count =
 				intel_dp_dsc_get_slice_count(intel_connector,
 							     target_clock,
 							     mode->hdisplay,
-							     joiner);
+							     num_joined_pipes);
 		}
 
 		dsc = dsc_max_compressed_bpp && dsc_slice_count;
