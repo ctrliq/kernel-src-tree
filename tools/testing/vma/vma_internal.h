@@ -1033,4 +1033,9 @@ static inline int mmap_file(struct file *, struct vm_area_struct *)
 	return 0;
 }
 
+static inline void fixup_hugetlb_reservations(struct vm_area_struct *vma)
+{
+	(void)vma;
+}
+
 #endif	/* __MM_VMA_INTERNAL_H */
