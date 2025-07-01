@@ -491,7 +491,6 @@ static struct cpufreq_driver ve_spc_cpufreq_driver = {
 	.init			= ve_spc_cpufreq_init,
 	.exit			= ve_spc_cpufreq_exit,
 	.ready			= ve_spc_cpufreq_ready,
-	.attr			= cpufreq_generic_attr,
 };
 
 #ifdef CONFIG_BL_SWITCHER
