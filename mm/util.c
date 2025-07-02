@@ -614,10 +614,6 @@ void *kvmalloc_node(size_t size, gfp_t flags, int node)
 	if (!gfpflags_allow_blocking(flags))
 		return NULL;
 
-	/* non-sleeping allocations are not supported by vmalloc */
-	if (!gfpflags_allow_blocking(flags))
-		return NULL;
-
 	/* Don't even allow crazy sizes */
 	if (unlikely(size > INT_MAX)) {
 		WARN_ON_ONCE(!(flags & __GFP_NOWARN));
