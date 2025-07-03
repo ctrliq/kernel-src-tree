@@ -2566,25 +2566,6 @@ check:
 	return false;
 }
 
-static bool evsel__handle_error_quirks(struct evsel *evsel, int error)
-{
-	/*
-	 * AMD core PMU tries to forward events with precise_ip to IBS PMU
-	 * implicitly.  But IBS PMU has more restrictions so it can fail with
-	 * supported event attributes.  Let's forward it back to the core PMU
-	 * by clearing precise_ip only if it's from precise_max (:P).
-	 */
-	if ((error == -EINVAL || error == -ENOENT) && x86__is_amd_cpu() &&
-	    evsel->core.attr.precise_ip && evsel->precise_max) {
-		evsel->core.attr.precise_ip = 0;
-		pr_debug2_peo("removing precise_ip on AMD\n");
-		display_attr(&evsel->core.attr);
-		return true;
-	}
-
-	return false;
-}
-
 static int evsel__open_cpu(struct evsel *evsel, struct perf_cpu_map *cpus,
 		struct perf_thread_map *threads,
 		int start_cpu_map_idx, int end_cpu_map_idx)
@@ -2728,9 +2709,6 @@ try_fallback:
 		goto fallback_missing_features;
 
 	if (evsel__precise_ip_fallback(evsel))
-		goto retry_open;
-
-	if (evsel__handle_error_quirks(evsel, err))
 		goto retry_open;
 
 out_close:
@@ -3188,17 +3166,19 @@ int evsel__parse_sample(struct evsel *evsel, union perf_event *event,
 	}
 
 	if (type & PERF_SAMPLE_REGS_USER) {
+		struct regs_dump *regs = perf_sample__user_regs(data);
+
 		OVERFLOW_CHECK_u64(array);
-		data->user_regs.abi = *array;
+		regs->abi = *array;
 		array++;
 
-		if (data->user_regs.abi) {
+		if (regs->abi) {
 			u64 mask = evsel->core.attr.sample_regs_user;
 
 			sz = hweight64(mask) * sizeof(u64);
 			OVERFLOW_CHECK(array, sz, max_size);
-			data->user_regs.mask = mask;
-			data->user_regs.regs = (u64 *)array;
+			regs->mask = mask;
+			regs->regs = (u64 *)array;
 			array = (void *)array + sz;
 		}
 	}
@@ -3242,19 +3222,20 @@ int evsel__parse_sample(struct evsel *evsel, union perf_event *event,
 		array++;
 	}
 
-	data->intr_regs.abi = PERF_SAMPLE_REGS_ABI_NONE;
 	if (type & PERF_SAMPLE_REGS_INTR) {
+		struct regs_dump *regs = perf_sample__intr_regs(data);
+
 		OVERFLOW_CHECK_u64(array);
-		data->intr_regs.abi = *array;
+		regs->abi = *array;
 		array++;
 
-		if (data->intr_regs.abi != PERF_SAMPLE_REGS_ABI_NONE) {
+		if (regs->abi != PERF_SAMPLE_REGS_ABI_NONE) {
 			u64 mask = evsel->core.attr.sample_regs_intr;
 
 			sz = hweight64(mask) * sizeof(u64);
 			OVERFLOW_CHECK(array, sz, max_size);
-			data->intr_regs.mask = mask;
-			data->intr_regs.regs = (u64 *)array;
+			regs->mask = mask;
+			regs->regs = (u64 *)array;
 			array = (void *)array + sz;
 		}
 	}
