@@ -10,6 +10,7 @@
 
 #include <acpi/video.h>
 
+#include "i915_drv.h"
 #include "i915_reg.h"
 #include "intel_backlight.h"
 #include "intel_backlight_regs.h"
@@ -40,8 +41,9 @@ static u32 scale(u32 source_val,
 {
 	u64 target_val;
 
-	WARN_ON(source_min > source_max);
-	WARN_ON(target_min > target_max);
+	if (WARN_ON(source_min >= source_max) ||
+	    WARN_ON(target_min > target_max))
+		return target_min;
 
 	/* defensive */
 	source_val = clamp(source_val, source_min, source_max);
@@ -949,7 +951,7 @@ int intel_backlight_device_register(struct intel_connector *connector)
 	else
 		props.power = BACKLIGHT_POWER_OFF;
 
-	name = kstrdup_const("intel_backlight", GFP_KERNEL);
+	name = kstrdup("intel_backlight", GFP_KERNEL);
 	if (!name)
 		return -ENOMEM;
 
@@ -963,7 +965,7 @@ int intel_backlight_device_register(struct intel_connector *connector)
 		 * compatibility. Use unique names for subsequent backlight devices as a
 		 * fallback when the default name already exists.
 		 */
-		kfree_const(name);
+		kfree(name);
 		name = kasprintf(GFP_KERNEL, "card%d-%s-backlight",
 				 i915->drm.primary->index, connector->base.name);
 		if (!name)
@@ -987,7 +989,7 @@ int intel_backlight_device_register(struct intel_connector *connector)
 		    connector->base.base.id, connector->base.name, name);
 
 out:
-	kfree_const(name);
+	kfree(name);
 
 	return ret;
 }

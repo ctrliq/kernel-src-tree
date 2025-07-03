@@ -706,7 +706,6 @@ static const struct resource_caps res_cap_nv14 = {
 static const struct dc_debug_options debug_defaults_drv = {
 		.disable_dmcu = false,
 		.force_abm_enable = false,
-		.timing_trace = false,
 		.clock_trace = true,
 		.disable_pplib_clock_request = true,
 		.pipe_split_policy = MPC_SPLIT_AVOID_MULT_DISP,
@@ -920,7 +919,7 @@ struct link_encoder *dcn20_link_encoder_create(
 		kzalloc(sizeof(struct dcn20_link_encoder), GFP_KERNEL);
 	int link_regs_id;
 
-	if (!enc20)
+	if (!enc20 || enc_init_data->hpd_source >= ARRAY_SIZE(link_enc_hpd_regs))
 		return NULL;
 
 	link_regs_id =
@@ -1510,60 +1509,9 @@ bool dcn20_split_stream_for_odm(
 	next_odm_pipe->prev_odm_pipe = prev_odm_pipe;
 
 	if (prev_odm_pipe->plane_state) {
-		struct scaler_data *sd = &prev_odm_pipe->plane_res.scl_data;
-		struct output_pixel_processor *opp = next_odm_pipe->stream_res.opp;
-		int new_width;
-
-		/* HACTIVE halved for odm combine */
-		sd->h_active /= 2;
-		/* Calculate new vp and recout for left pipe */
-		/* Need at least 16 pixels width per side */
-		if (sd->recout.x + 16 >= sd->h_active)
-			return false;
-		new_width = sd->h_active - sd->recout.x;
-		sd->viewport.width -= dc_fixpt_floor(dc_fixpt_mul_int(
-				sd->ratios.horz, sd->recout.width - new_width));
-		sd->viewport_c.width -= dc_fixpt_floor(dc_fixpt_mul_int(
-				sd->ratios.horz_c, sd->recout.width - new_width));
-		sd->recout.width = new_width;
-
-		/* Calculate new vp and recout for right pipe */
-		sd = &next_odm_pipe->plane_res.scl_data;
-		/* HACTIVE halved for odm combine */
-		sd->h_active /= 2;
-		/* Need at least 16 pixels width per side */
-		if (new_width <= 16)
-			return false;
-		new_width = sd->recout.width + sd->recout.x - sd->h_active;
-		sd->viewport.width -= dc_fixpt_floor(dc_fixpt_mul_int(
-				sd->ratios.horz, sd->recout.width - new_width));
-		sd->viewport_c.width -= dc_fixpt_floor(dc_fixpt_mul_int(
-				sd->ratios.horz_c, sd->recout.width - new_width));
-		sd->recout.width = new_width;
-		sd->viewport.x += dc_fixpt_floor(dc_fixpt_mul_int(
-				sd->ratios.horz, sd->h_active - sd->recout.x));
-		sd->viewport_c.x += dc_fixpt_floor(dc_fixpt_mul_int(
-				sd->ratios.horz_c, sd->h_active - sd->recout.x));
-		sd->recout.x = 0;
-
-		/*
-		 * When odm is used in YcbCr422 or 420 colour space, a split screen
-		 * will be seen with the previous calculations since the extra left
-		 *  edge pixel is accounted for in fmt but not in viewport.
-		 *
-		 * Below are calculations which fix the split by fixing the calculations
-		 * if there is an extra left edge pixel.
-		 */
-		if (opp && opp->funcs->opp_get_left_edge_extra_pixel_count
-				&& opp->funcs->opp_get_left_edge_extra_pixel_count(
-					opp, next_odm_pipe->stream->timing.pixel_encoding,
-					resource_is_pipe_type(next_odm_pipe, OTG_MASTER)) == 1) {
-			sd->h_active += 1;
-			sd->recout.width += 1;
-			sd->viewport.x -= dc_fixpt_ceil(dc_fixpt_mul_int(sd->ratios.horz, 1));
-			sd->viewport_c.x -= dc_fixpt_ceil(dc_fixpt_mul_int(sd->ratios.horz, 1));
-			sd->viewport_c.width += dc_fixpt_ceil(dc_fixpt_mul_int(sd->ratios.horz, 1));
-			sd->viewport.width += dc_fixpt_ceil(dc_fixpt_mul_int(sd->ratios.horz, 1));
+		if (!resource_build_scaling_params(prev_odm_pipe) ||
+			!resource_build_scaling_params(next_odm_pipe)) {
+				return false;
 		}
 	}
 
@@ -2281,7 +2229,8 @@ static const struct resource_funcs dcn20_res_pool_funcs = {
 	.patch_unknown_plane_state = dcn20_patch_unknown_plane_state,
 	.set_mcif_arb_params = dcn20_set_mcif_arb_params,
 	.populate_dml_pipes = dcn20_populate_dml_pipes_from_context,
-	.find_first_free_match_stream_enc_for_link = dcn10_find_first_free_match_stream_enc_for_link
+	.find_first_free_match_stream_enc_for_link = dcn10_find_first_free_match_stream_enc_for_link,
+	.get_vstartup_for_pipe = dcn10_get_vstartup_for_pipe
 };
 
 bool dcn20_dwbc_create(struct dc_context *ctx, struct resource_pool *pool)

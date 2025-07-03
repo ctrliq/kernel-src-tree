@@ -13,6 +13,7 @@
 #include <linux/regmap.h>
 #include <linux/reset.h>
 
+#include <drm/clients/drm_client_setup.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_device.h>
 #include <drm/drm_fbdev_dma.h>
@@ -247,6 +248,7 @@ DEFINE_DRM_GEM_DMA_FOPS(fops);
 static const struct drm_driver aspeed_gfx_driver = {
 	.driver_features        = DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC,
 	DRM_GEM_DMA_DRIVER_OPS,
+	DRM_FBDEV_DMA_DRIVER_OPS,
 	.fops = &fops,
 	.name = "aspeed-gfx-drm",
 	.desc = "ASPEED GFX DRM",
@@ -338,7 +340,7 @@ static int aspeed_gfx_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_unload;
 
-	drm_fbdev_dma_setup(&priv->drm, 32);
+	drm_client_setup(&priv->drm, NULL);
 	return 0;
 
 err_unload:
