@@ -386,7 +386,8 @@ PCI
 
 PHY
   devm_usb_get_phy()
-  devm_usb_put_phy()
+  devm_usb_get_phy_by_node()
+  devm_usb_get_phy_by_phandle()
 
 PINCTRL
   devm_pinctrl_get()
