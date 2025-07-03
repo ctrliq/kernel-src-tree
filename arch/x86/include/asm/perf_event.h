@@ -140,6 +140,12 @@
 #define PEBS_DATACFG_XMMS	BIT_ULL(2)
 #define PEBS_DATACFG_LBRS	BIT_ULL(3)
 #define PEBS_DATACFG_LBR_SHIFT	24
+#define PEBS_DATACFG_CNTR	BIT_ULL(4)
+#define PEBS_DATACFG_CNTR_SHIFT	32
+#define PEBS_DATACFG_CNTR_MASK	GENMASK_ULL(15, 0)
+#define PEBS_DATACFG_FIX_SHIFT	48
+#define PEBS_DATACFG_FIX_MASK	GENMASK_ULL(7, 0)
+#define PEBS_DATACFG_METRICS	BIT_ULL(5)
 
 /* Steal the highest bit of pebs_data_cfg for SW usage */
 #define PEBS_UPDATE_DS_SW	BIT_ULL(63)
@@ -422,7 +428,9 @@ static inline bool is_topdown_idx(int idx)
  */
 
 struct pebs_basic {
-	u64 format_size;
+	u64 format_group:32,
+	    retire_latency:16,
+	    format_size:16;
 	u64 ip;
 	u64 applicable_counters;
 	u64 tsc;
@@ -431,7 +439,17 @@ struct pebs_basic {
 struct pebs_meminfo {
 	u64 address;
 	u64 aux;
-	u64 latency;
+	union {
+		/* pre Alder Lake */
+		u64 mem_latency;
+		/* Alder Lake and later */
+		struct {
+			u64 instr_latency:16;
+			u64 pad2:16;
+			u64 cache_latency:16;
+			u64 pad3:16;
+		};
+	};
 	u64 tsx_tuning;
 };
 
@@ -443,6 +461,15 @@ struct pebs_gprs {
 struct pebs_xmm {
 	u64 xmm[16*2];	/* two entries for each register */
 };
+
+struct pebs_cntr_header {
+	u32 cntr;
+	u32 fixed;
+	u32 metrics;
+	u32 reserved;
+};
+
+#define INTEL_CNTR_METRICS		0x3
 
 /*
  * AMD Extended Performance Monitoring and Debug cpuid feature detection
