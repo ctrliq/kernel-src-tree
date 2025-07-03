@@ -38,7 +38,7 @@
 
 	orr	x0, x0, #HCR_E2H
 .LnVHE_\@:
-	msr	hcr_el2, x0
+	msr_hcr_el2 x0
 	isb
 .endm
 
@@ -105,7 +105,7 @@
 		      1 << PMSCR_EL2_PA_SHIFT)
 	msr_s	SYS_PMSCR_EL2, x0		// addresses and physical counter
 .Lskip_spe_el2_\@:
-	mov	x0, #(MDCR_EL2_E2PB_MASK << MDCR_EL2_E2PB_SHIFT)
+	mov	x0, #MDCR_EL2_E2PB_MASK
 	orr	x2, x2, x0			// If we don't have VHE, then
 						// use EL1&0 translation.
 
@@ -118,7 +118,7 @@
 	and	x0, x0, TRBIDR_EL1_P
 	cbnz	x0, .Lskip_trace_\@		// If TRBE is available at EL2
 
-	mov	x0, #(MDCR_EL2_E2TB_MASK << MDCR_EL2_E2TB_SHIFT)
+	mov	x0, #MDCR_EL2_E2TB_MASK
 	orr	x2, x2, x0			// allow the EL1&0 translation
 						// to own it.
 
@@ -291,6 +291,16 @@
 #endif
 
 .macro finalise_el2_state
+	check_override id_aa64pfr0, ID_AA64PFR0_EL1_MPAM_SHIFT, .Linit_mpam_\@, .Lskip_mpam_\@, x1, x2
+
+.Linit_mpam_\@:
+	msr_s	SYS_MPAM2_EL2, xzr		// use the default partition
+						// and disable lower traps
+	mrs_s	x0, SYS_MPAMIDR_EL1
+	tbz	x0, #MPAMIDR_EL1_HAS_HCR_SHIFT, .Lskip_mpam_\@  // skip if no MPAMHCR reg
+	msr_s   SYS_MPAMHCR_EL2, xzr		// clear TRAP_MPAMIDR_EL1 -> EL2
+
+.Lskip_mpam_\@:
 	check_override id_aa64pfr0, ID_AA64PFR0_EL1_SVE_SHIFT, .Linit_sve_\@, .Lskip_sve_\@, x1, x2
 
 .Linit_sve_\@:	/* SVE register access */

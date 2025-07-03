@@ -306,7 +306,7 @@ int __pkvm_prot_finalize(void)
 	 */
 	kvm_flush_dcache_to_poc(params, sizeof(*params));
 
-	write_sysreg(params->hcr_el2, hcr_el2);
+	write_sysreg_hcr(params->hcr_el2);
 	__load_stage2(&host_mmu.arch.mmu, &host_mmu.arch);
 
 	/*
@@ -541,7 +541,14 @@ void handle_host_mem_abort(struct kvm_cpu_context *host_ctxt)
 		return;
 	}
 
-	addr = (fault.hpfar_el2 & HPFAR_MASK) << 8;
+
+	/*
+	 * Yikes, we couldn't resolve the fault IPA. This should reinject an
+	 * abort into the host when we figure out how to do that.
+	 */
+	BUG_ON(!(fault.hpfar_el2 & HPFAR_EL2_NS));
+	addr = FIELD_GET(HPFAR_EL2_FIPA, fault.hpfar_el2) << 12;
+
 	ret = host_stage2_idmap(addr);
 	BUG_ON(ret && ret != -EAGAIN);
 }

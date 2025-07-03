@@ -173,7 +173,7 @@ static void __deactivate_traps(struct kvm_vcpu *vcpu)
 
 	___deactivate_traps(vcpu);
 
-	write_sysreg(HCR_HOST_VHE_FLAGS, hcr_el2);
+	write_sysreg_hcr(HCR_HOST_VHE_FLAGS);
 
 	if (has_cntpoff()) {
 		struct timer_map map;
@@ -486,6 +486,9 @@ static int __kvm_vcpu_run_vhe(struct kvm_vcpu *vcpu)
 	sysreg_save_guest_state_vhe(guest_ctxt);
 
 	__deactivate_traps(vcpu);
+
+	/* Ensure CPTR trap deactivation has taken effect */
+	isb();
 
 	fpsimd_lazy_switch_to_host(vcpu);
 
