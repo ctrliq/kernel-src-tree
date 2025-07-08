@@ -190,6 +190,8 @@ struct page_pool {
 #endif
 	u32 xdp_mem_id;
 
+	RH_KABI_FILL_HOLE(struct xarray dma_mapped)
+
 	/*
 	 * Data structure for allocation side
 	 *
@@ -219,8 +221,6 @@ struct page_pool {
 	struct ptr_ring ring;
 
 	void *mp_priv;
-
-	struct xarray dma_mapped;
 
 #ifdef CONFIG_PAGE_POOL_STATS
 	/* recycle stats are per-cpu to avoid locking */
