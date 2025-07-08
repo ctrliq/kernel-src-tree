@@ -1287,7 +1287,8 @@ svc_process_common(struct svc_rqst *rqstp, struct kvec *argv, struct kvec *resv)
 	case SVC_OK:
 		break;
 	case SVC_GARBAGE:
-		goto err_garbage;
+		rqstp->rq_auth_stat = rpc_autherr_badcred;
+		goto err_bad_auth;
 	case SVC_SYSERR:
 		rpc_stat = rpc_system_err;
 		goto err_bad;
@@ -1416,10 +1417,6 @@ err_bad_proc:
 	svc_putnl(resv, RPC_PROC_UNAVAIL);
 	goto sendit;
 
-err_garbage:
-	svc_printk(rqstp, "failed to decode args\n");
-
-	rpc_stat = rpc_garbage_args;
 err_bad:
 	serv->sv_stats->rpcbadfmt++;
 	svc_putnl(resv, ntohl(rpc_stat));
