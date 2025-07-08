@@ -834,7 +834,8 @@ skip_inval:
 			 */
 		} else {
 			fs_err(sdp, "lm_lock ret %d\n", ret);
-			target = gl->gl_state | LM_OUT_ERROR;
+			GLOCK_BUG_ON(gl, !gfs2_withdrawing_or_withdrawn(sdp));
+			return;
 		}
 	}
 
