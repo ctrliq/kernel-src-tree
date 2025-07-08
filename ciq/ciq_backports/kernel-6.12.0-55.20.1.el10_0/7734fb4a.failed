@@ -1,0 +1,216 @@
+dm mpath: Interface for explicit probing of active paths
+
+jira LE-3526
+Rebuild_History Non-Buildable kernel-6.12.0-55.20.1.el10_0
+commit-author Kevin Wolf <kwolf@redhat.com>
+commit 7734fb4ad98c3fdaf0fde82978ef8638195a5285
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-55.20.1.el10_0/7734fb4a.failed
+
+Multipath cannot directly provide failover for ioctls in the kernel
+because it doesn't know what each ioctl means and which result could
+indicate a path error. Userspace generally knows what the ioctl it
+issued means and if it might be a path error, but neither does it know
+which path the ioctl took nor does it necessarily have the privileges to
+fail a path using the control device.
+
+In order to allow userspace to address this situation, implement a
+DM_MPATH_PROBE_PATHS ioctl that prompts the dm-mpath driver to probe all
+active paths in the current path group to see whether they still work,
+and fail them if not. If this returns success, userspace can retry the
+ioctl and expect that the previously hit bad path is now failed (or
+working again).
+
+The immediate motivation for this is the use of SG_IO in QEMU for SCSI
+passthrough. Following a failed SG_IO ioctl, QEMU will trigger probing
+to ensure that all active paths are actually alive, so that retrying
+SG_IO at least has a lower chance of failing due to a path error.
+However, the problem is broader than just SG_IO (it affects any ioctl),
+and if applications need failover support for other ioctls, the same
+probing can be used.
+
+This is not implemented on the DM control device, but on the DM mpath
+block devices, to allow all users who have access to such a block device
+to make use of this interface, specifically to implement failover for
+ioctls. For the same reason, it is also unprivileged. Its implementation
+is effectively just a bunch of reads, which could already be issued by
+userspace, just without any guarantee that all the rights paths are
+selected.
+
+The probing implemented here is done fully synchronously path by path;
+probing all paths concurrently is left as an improvement for the future.
+
+Co-developed-by: Hanna Czenczek <hreitz@redhat.com>
+	Signed-off-by: Hanna Czenczek <hreitz@redhat.com>
+	Signed-off-by: Kevin Wolf <kwolf@redhat.com>
+	Reviewed-by: Benjamin Marzinski <bmarzins@redhat.com>
+	Signed-off-by: Benjamin Marzinski <bmarzins@redhat.com>
+	Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+(cherry picked from commit 7734fb4ad98c3fdaf0fde82978ef8638195a5285)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/dm-ioctl.h
+diff --cc include/uapi/linux/dm-ioctl.h
+index 1990b5700f69,3225e025e30e..000000000000
+--- a/include/uapi/linux/dm-ioctl.h
++++ b/include/uapi/linux/dm-ioctl.h
+@@@ -285,10 -287,13 +287,19 @@@ enum 
+  #define DM_TARGET_MSG	 _IOWR(DM_IOCTL, DM_TARGET_MSG_CMD, struct dm_ioctl)
+  #define DM_DEV_SET_GEOMETRY	_IOWR(DM_IOCTL, DM_DEV_SET_GEOMETRY_CMD, struct dm_ioctl)
+  
++ /* Block device ioctls */
++ #define DM_MPATH_PROBE_PATHS _IO(DM_IOCTL, DM_MPATH_PROBE_PATHS_CMD)
++ 
+  #define DM_VERSION_MAJOR	4
+++<<<<<<< HEAD
+ +#define DM_VERSION_MINOR	48
+ +#define DM_VERSION_PATCHLEVEL	0
+ +#define DM_VERSION_EXTRA	"-ioctl (2023-03-01)"
+++=======
++ #define DM_VERSION_MINOR	50
++ #define DM_VERSION_PATCHLEVEL	0
++ #define DM_VERSION_EXTRA	"-ioctl (2025-04-28)"
+++>>>>>>> 7734fb4ad98c (dm mpath: Interface for explicit probing of active paths)
+  
+  /* Status bits */
+  #define DM_READONLY_FLAG	(1 << 0) /* In/Out */
+diff --git a/drivers/md/dm-ioctl.c b/drivers/md/dm-ioctl.c
+index f299ff393a6a..d51088980bea 100644
+--- a/drivers/md/dm-ioctl.c
++++ b/drivers/md/dm-ioctl.c
+@@ -1885,6 +1885,7 @@ static ioctl_fn lookup_ioctl(unsigned int cmd, int *ioctl_flags)
+ 		{DM_DEV_SET_GEOMETRY_CMD, 0, dev_set_geometry},
+ 		{DM_DEV_ARM_POLL_CMD, IOCTL_FLAGS_NO_PARAMS, dev_arm_poll},
+ 		{DM_GET_TARGET_VERSION_CMD, 0, get_target_version},
++		{DM_MPATH_PROBE_PATHS_CMD, 0, NULL}, /* block device ioctl */
+ 	};
+ 
+ 	if (unlikely(cmd >= ARRAY_SIZE(_ioctls)))
+diff --git a/drivers/md/dm-mpath.c b/drivers/md/dm-mpath.c
+index 368606afb6f0..4dca7382e6bd 100644
+--- a/drivers/md/dm-mpath.c
++++ b/drivers/md/dm-mpath.c
+@@ -2021,6 +2021,94 @@ static int multipath_message(struct dm_target *ti, unsigned int argc, char **arg
+ 	return r;
+ }
+ 
++/*
++ * Perform a minimal read from the given path to find out whether the
++ * path still works.  If a path error occurs, fail it.
++ */
++static int probe_path(struct pgpath *pgpath)
++{
++	struct block_device *bdev = pgpath->path.dev->bdev;
++	unsigned int read_size = bdev_logical_block_size(bdev);
++	struct page *page;
++	struct bio *bio;
++	blk_status_t status;
++	int r = 0;
++
++	if (WARN_ON_ONCE(read_size > PAGE_SIZE))
++		return -EINVAL;
++
++	page = alloc_page(GFP_KERNEL);
++	if (!page)
++		return -ENOMEM;
++
++	/* Perform a minimal read: Sector 0, length read_size */
++	bio = bio_alloc(bdev, 1, REQ_OP_READ, GFP_KERNEL);
++	if (!bio) {
++		r = -ENOMEM;
++		goto out;
++	}
++
++	bio->bi_iter.bi_sector = 0;
++	__bio_add_page(bio, page, read_size, 0);
++	submit_bio_wait(bio);
++	status = bio->bi_status;
++	bio_put(bio);
++
++	if (status && blk_path_error(status))
++		fail_path(pgpath);
++
++out:
++	__free_page(page);
++	return r;
++}
++
++/*
++ * Probe all active paths in current_pg to find out whether they still work.
++ * Fail all paths that do not work.
++ *
++ * Return -ENOTCONN if no valid path is left (even outside of current_pg). We
++ * cannot probe paths in other pgs without switching current_pg, so if valid
++ * paths are only in different pgs, they may or may not work. Additionally
++ * we should not probe paths in a pathgroup that is in the process of
++ * Initializing. Userspace can submit a request and we'll switch and wait
++ * for the pathgroup to be initialized. If the request fails, it may need to
++ * probe again.
++ */
++static int probe_active_paths(struct multipath *m)
++{
++	struct pgpath *pgpath;
++	struct priority_group *pg;
++	unsigned long flags;
++	int r = 0;
++
++	mutex_lock(&m->work_mutex);
++
++	spin_lock_irqsave(&m->lock, flags);
++	if (test_bit(MPATHF_QUEUE_IO, &m->flags))
++		pg = NULL;
++	else
++		pg = m->current_pg;
++	spin_unlock_irqrestore(&m->lock, flags);
++
++	if (pg) {
++		list_for_each_entry(pgpath, &pg->pgpaths, list) {
++			if (!pgpath->is_active)
++				continue;
++
++			r = probe_path(pgpath);
++			if (r < 0)
++				goto out;
++		}
++	}
++
++	if (!atomic_read(&m->nr_valid_paths))
++		r = -ENOTCONN;
++
++out:
++	mutex_unlock(&m->work_mutex);
++	return r;
++}
++
+ static int multipath_prepare_ioctl(struct dm_target *ti,
+ 				   struct block_device **bdev,
+ 				   unsigned int cmd, unsigned long arg,
+@@ -2031,6 +2119,16 @@ static int multipath_prepare_ioctl(struct dm_target *ti,
+ 	unsigned long flags;
+ 	int r;
+ 
++	if (_IOC_TYPE(cmd) == DM_IOCTL) {
++		*forward = false;
++		switch (cmd) {
++		case DM_MPATH_PROBE_PATHS:
++			return probe_active_paths(m);
++		default:
++			return -ENOTTY;
++		}
++	}
++
+ 	pgpath = READ_ONCE(m->current_pgpath);
+ 	if (!pgpath || !mpath_double_check_test_bit(MPATHF_QUEUE_IO, m))
+ 		pgpath = choose_pgpath(m, 0);
+@@ -2182,7 +2280,7 @@ static int multipath_busy(struct dm_target *ti)
+  */
+ static struct target_type multipath_target = {
+ 	.name = "multipath",
+-	.version = {1, 14, 0},
++	.version = {1, 15, 0},
+ 	.features = DM_TARGET_SINGLETON | DM_TARGET_IMMUTABLE |
+ 		    DM_TARGET_PASSES_INTEGRITY,
+ 	.module = THIS_MODULE,
+* Unmerged path include/uapi/linux/dm-ioctl.h
