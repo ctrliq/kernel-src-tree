@@ -2410,6 +2410,12 @@ static int virtnet_tx_resize(struct virtnet_info *vi,
 	struct netdev_queue *txq;
 	int err, qindex;
 
+	if (ring_num <= MAX_SKB_FRAGS + 2) {
+		netdev_err(vi->dev, "tx size (%d) cannot be smaller than %d\n",
+			   ring_num, (int)MAX_SKB_FRAGS + 2);
+		return -EINVAL;
+	}
+
 	qindex = sq - vi->sq;
 
 	if (running)
