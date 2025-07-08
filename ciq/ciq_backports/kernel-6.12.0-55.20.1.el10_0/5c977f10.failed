@@ -1,0 +1,180 @@
+dm-mpath: Don't grab work_mutex while probing paths
+
+jira LE-3526
+Rebuild_History Non-Buildable kernel-6.12.0-55.20.1.el10_0
+commit-author Benjamin Marzinski <bmarzins@redhat.com>
+commit 5c977f1023156938915c57d362fddde8fad2b052
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-55.20.1.el10_0/5c977f10.failed
+
+Grabbing the work_mutex keeps probe_active_paths() from running at the
+same time as multipath_message(). The only messages that could interfere
+with probing the paths are "disable_group", "enable_group", and
+"switch_group". These messages could force multipath to pick a new
+pathgroup while probe_active_paths() was probing the current pathgroup.
+If the multipath device has a hardware handler, and it switches active
+pathgroups while there is outstanding IO to a path device, it's possible
+that IO to the path will fail, even if the path would be usable if it
+was in the active pathgroup. To avoid this, do not clear the current
+pathgroup for the *_group messages while probe_active_paths() is
+running. Instead set a flag, and probe_active_paths() will clear the
+current pathgroup when it finishes probing the paths. For this to work
+correctly, multipath needs to check current_pg before next_pg in
+choose_pgpath(), but before this patch next_pg was only ever set when
+current_pg was cleared, so this doesn't change the current behavior when
+paths aren't being probed. Even with this change, it is still possible
+to switch pathgroups while the probe is running, but only if all the
+paths have failed, and the probe function will skip them as well in this
+case.
+
+If multiple DM_MPATH_PROBE_PATHS requests are received at once, there is
+no point in repeatedly issuing test IOs. Instead, the later probes
+should wait for the current probe to complete. If current pathgroup is
+still the same as the one that was just checked, the other probes should
+skip probing and just check the number of valid paths.  Finally, probing
+the paths should quit early if the multipath device is trying to
+suspend, instead of continuing to issue test IOs, delaying the suspend.
+
+While this patch will not change the behavior of existing multipath
+users which don't use the DM_MPATH_PROBE_PATHS ioctl, when that ioctl
+is used, the behavior of the "disable_group", "enable_group", and
+"switch_group" messages can change subtly. When these messages return,
+the next IO to the multipath device will no longer be guaranteed to
+choose a new pathgroup. Instead, choosing a new pathgroup could be
+delayed by an in-progress DM_MPATH_PROBE_PATHS ioctl. The userspace
+multipath tools make no assumptions about what will happen to IOs after
+sending these messages, so this change will not effect already released
+versions of them, even if the DM_MPATH_PROBE_PATHS ioctl is run
+alongside them.
+
+	Signed-off-by: Benjamin Marzinski <bmarzins@redhat.com>
+	Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+(cherry picked from commit 5c977f1023156938915c57d362fddde8fad2b052)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-mpath.c
+diff --cc drivers/md/dm-mpath.c
+index 368606afb6f0,12b7bcae490c..000000000000
+--- a/drivers/md/dm-mpath.c
++++ b/drivers/md/dm-mpath.c
+@@@ -2021,6 -2039,114 +2039,117 @@@ out
+  	return r;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Perform a minimal read from the given path to find out whether the
++  * path still works.  If a path error occurs, fail it.
++  */
++ static int probe_path(struct pgpath *pgpath)
++ {
++ 	struct block_device *bdev = pgpath->path.dev->bdev;
++ 	unsigned int read_size = bdev_logical_block_size(bdev);
++ 	struct page *page;
++ 	struct bio *bio;
++ 	blk_status_t status;
++ 	int r = 0;
++ 
++ 	if (WARN_ON_ONCE(read_size > PAGE_SIZE))
++ 		return -EINVAL;
++ 
++ 	page = alloc_page(GFP_KERNEL);
++ 	if (!page)
++ 		return -ENOMEM;
++ 
++ 	/* Perform a minimal read: Sector 0, length read_size */
++ 	bio = bio_alloc(bdev, 1, REQ_OP_READ, GFP_KERNEL);
++ 	if (!bio) {
++ 		r = -ENOMEM;
++ 		goto out;
++ 	}
++ 
++ 	bio->bi_iter.bi_sector = 0;
++ 	__bio_add_page(bio, page, read_size, 0);
++ 	submit_bio_wait(bio);
++ 	status = bio->bi_status;
++ 	bio_put(bio);
++ 
++ 	if (status && blk_path_error(status))
++ 		fail_path(pgpath);
++ 
++ out:
++ 	__free_page(page);
++ 	return r;
++ }
++ 
++ /*
++  * Probe all active paths in current_pg to find out whether they still work.
++  * Fail all paths that do not work.
++  *
++  * Return -ENOTCONN if no valid path is left (even outside of current_pg). We
++  * cannot probe paths in other pgs without switching current_pg, so if valid
++  * paths are only in different pgs, they may or may not work. Additionally
++  * we should not probe paths in a pathgroup that is in the process of
++  * Initializing. Userspace can submit a request and we'll switch and wait
++  * for the pathgroup to be initialized. If the request fails, it may need to
++  * probe again.
++  */
++ static int probe_active_paths(struct multipath *m)
++ {
++ 	struct pgpath *pgpath;
++ 	struct priority_group *pg = NULL;
++ 	unsigned long flags;
++ 	int r = 0;
++ 
++ 	spin_lock_irqsave(&m->lock, flags);
++ 	if (test_bit(MPATHF_DELAY_PG_SWITCH, &m->flags)) {
++ 		wait_event_lock_irq(m->probe_wait,
++ 				    !test_bit(MPATHF_DELAY_PG_SWITCH, &m->flags),
++ 				    m->lock);
++ 		/*
++ 		 * if we waited because a probe was already in progress,
++ 		 * and it probed the current active pathgroup, don't
++ 		 * reprobe. Just return the number of valid paths
++ 		 */
++ 		if (m->current_pg == m->last_probed_pg)
++ 			goto skip_probe;
++ 	}
++ 	if (!m->current_pg || m->is_suspending ||
++ 	    test_bit(MPATHF_QUEUE_IO, &m->flags))
++ 		goto skip_probe;
++ 	set_bit(MPATHF_DELAY_PG_SWITCH, &m->flags);
++ 	pg = m->last_probed_pg = m->current_pg;
++ 	spin_unlock_irqrestore(&m->lock, flags);
++ 
++ 	list_for_each_entry(pgpath, &pg->pgpaths, list) {
++ 		if (pg != READ_ONCE(m->current_pg) ||
++ 		    READ_ONCE(m->is_suspending))
++ 			goto out;
++ 		if (!pgpath->is_active)
++ 			continue;
++ 
++ 		r = probe_path(pgpath);
++ 		if (r < 0)
++ 			goto out;
++ 	}
++ 
++ out:
++ 	spin_lock_irqsave(&m->lock, flags);
++ 	clear_bit(MPATHF_DELAY_PG_SWITCH, &m->flags);
++ 	if (test_and_clear_bit(MPATHF_NEED_PG_SWITCH, &m->flags)) {
++ 		m->current_pgpath = NULL;
++ 		m->current_pg = NULL;
++ 	}
++ skip_probe:
++ 	if (r == 0 && !atomic_read(&m->nr_valid_paths))
++ 		r = -ENOTCONN;
++ 	spin_unlock_irqrestore(&m->lock, flags);
++ 	if (pg)
++ 		wake_up(&m->probe_wait);
++ 	return r;
++ }
++ 
+++>>>>>>> 5c977f102315 (dm-mpath: Don't grab work_mutex while probing paths)
+  static int multipath_prepare_ioctl(struct dm_target *ti,
+  				   struct block_device **bdev,
+  				   unsigned int cmd, unsigned long arg,
+* Unmerged path drivers/md/dm-mpath.c
