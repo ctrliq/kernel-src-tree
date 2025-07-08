@@ -802,7 +802,7 @@ static void check_sq_full_and_disable(struct virtnet_info *vi,
 	 * Since most packets only take 1 or 2 ring slots, stopping the queue
 	 * early means 16 slots are typically wasted.
 	 */
-	if (sq->vq->num_free < 2+MAX_SKB_FRAGS) {
+	if (sq->vq->num_free < MAX_SKB_FRAGS + 2) {
 		netif_stop_subqueue(dev, qnum);
 		if (use_napi) {
 			if (unlikely(!virtqueue_enable_cb_delayed(sq->vq)))
@@ -810,7 +810,7 @@ static void check_sq_full_and_disable(struct virtnet_info *vi,
 		} else if (unlikely(!virtqueue_enable_cb_delayed(sq->vq))) {
 			/* More just got used, free them then recheck. */
 			free_old_xmit_skbs(sq, false);
-			if (sq->vq->num_free >= 2+MAX_SKB_FRAGS) {
+			if (sq->vq->num_free >= MAX_SKB_FRAGS + 2) {
 				netif_start_subqueue(dev, qnum);
 				virtqueue_disable_cb(sq->vq);
 			}
@@ -2129,7 +2129,7 @@ static void virtnet_poll_cleantx(struct receive_queue *rq)
 			free_old_xmit_skbs(sq, true);
 		} while (unlikely(!virtqueue_enable_cb_delayed(sq->vq)));
 
-		if (sq->vq->num_free >= 2 + MAX_SKB_FRAGS)
+		if (sq->vq->num_free >= MAX_SKB_FRAGS + 2)
 			netif_tx_wake_queue(txq);
 
 		__netif_tx_unlock(txq);
@@ -2250,7 +2250,7 @@ static int virtnet_poll_tx(struct napi_struct *napi, int budget)
 	virtqueue_disable_cb(sq->vq);
 	free_old_xmit_skbs(sq, true);
 
-	if (sq->vq->num_free >= 2 + MAX_SKB_FRAGS)
+	if (sq->vq->num_free >= MAX_SKB_FRAGS + 2)
 		netif_tx_wake_queue(txq);
 
 	opaque = virtqueue_enable_cb_prepare(sq->vq);
