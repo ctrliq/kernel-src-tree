@@ -84,14 +84,39 @@ int kvm_vgic_create(struct kvm *kvm, u32 type)
 		!kvm_vgic_global_state.can_emulate_gicv2)
 		return -ENODEV;
 
-	/* Must be held to avoid race with vCPU creation */
+	/*
+	 * Ensure mutual exclusion with vCPU creation and any vCPU ioctls by:
+	 *
+	 *  - Holding kvm->lock to prevent KVM_CREATE_VCPU from reaching
+	 *    kvm_arch_vcpu_precreate() and ensuring created_vcpus is stable.
+	 *    This alone is insufficient, as kvm_vm_ioctl_create_vcpu() drops
+	 *    the kvm->lock before completing the vCPU creation.
+	 */
 	lockdep_assert_held(&kvm->lock);
 
+	/*
+	 *  - Acquiring the vCPU mutex for every *online* vCPU to prevent
+	 *    concurrent vCPU ioctls for vCPUs already visible to userspace.
+	 */
 	ret = -EBUSY;
 	if (kvm_trylock_all_vcpus(kvm))
 		return ret;
 
+	/*
+	 *  - Taking the config_lock which protects VGIC data structures such
+	 *    as the per-vCPU arrays of private IRQs (SGIs, PPIs).
+	 */
 	mutex_lock(&kvm->arch.config_lock);
+
+	/*
+	 * - Bailing on the entire thing if a vCPU is in the middle of creation,
+	 *   dropped the kvm->lock, but hasn't reached kvm_arch_vcpu_create().
+	 *
+	 * The whole combination of this guarantees that no vCPU can get into
+	 * KVM with a VGIC configuration inconsistent with the VM's VGIC.
+	 */
+	if (kvm->created_vcpus != atomic_read(&kvm->online_vcpus))
+		goto out_unlock;
 
 	if (irqchip_in_kernel(kvm)) {
 		ret = -EEXIST;
@@ -196,6 +221,27 @@ static int kvm_vgic_dist_init(struct kvm *kvm, unsigned int nr_spis)
 		}
 	}
 	return 0;
+}
+
+/* Default GICv3 Maintenance Interrupt INTID, as per SBSA */
+#define DEFAULT_MI_INTID	25
+
+int kvm_vgic_vcpu_nv_init(struct kvm_vcpu *vcpu)
+{
+	int ret;
+
+	guard(mutex)(&vcpu->kvm->arch.config_lock);
+
+	/*
+	 * Matching the tradition established with the timers, provide
+	 * a default PPI for the maintenance interrupt. It makes
+	 * things easier to reason about.
+	 */
+	if (vcpu->kvm->arch.vgic.mi_intid == 0)
+		vcpu->kvm->arch.vgic.mi_intid = DEFAULT_MI_INTID;
+	ret = kvm_vgic_set_owner(vcpu, vcpu->kvm->arch.vgic.mi_intid, vcpu);
+
+	return ret;
 }
 
 static int vgic_allocate_private_irqs_locked(struct kvm_vcpu *vcpu, u32 type)
@@ -588,12 +634,20 @@ void kvm_vgic_cpu_down(void)
 
 static irqreturn_t vgic_maintenance_handler(int irq, void *data)
 {
+	struct kvm_vcpu *vcpu = *(struct kvm_vcpu **)data;
+
 	/*
 	 * We cannot rely on the vgic maintenance interrupt to be
 	 * delivered synchronously. This means we can only use it to
 	 * exit the VM, and we perform the handling of EOIed
 	 * interrupts on the exit path (see vgic_fold_lr_state).
+	 *
+	 * Of course, NV throws a wrench in this plan, and needs
+	 * something special.
 	 */
+	if (vcpu && vgic_state_is_nested(vcpu))
+		vgic_v3_handle_nested_maint_irq(vcpu);
+
 	return IRQ_HANDLED;
 }
 
