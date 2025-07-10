@@ -66,7 +66,7 @@ static __always_inline int ct_dynticks_cpu(int cpu)
 	return atomic_read(&ct->state) & CT_DYNTICKS_MASK;
 }
 
-static __always_inline int ct_dynticks_cpu_acquire(int cpu)
+static __always_inline int ct_rcu_watching_cpu_acquire(int cpu)
 {
 	struct context_tracking *ct = per_cpu_ptr(&context_tracking, cpu);
 
