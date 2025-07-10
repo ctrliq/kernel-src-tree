@@ -10,6 +10,7 @@
 #include <linux/kvm_para.h>
 #include <linux/rcu_notifier.h>
 #include <linux/console.h>
+#include <linux/smp.h>
 
 //////////////////////////////////////////////////////////////////////////////
 //
@@ -726,6 +727,9 @@ static void print_cpu_stall(unsigned long gps)
 	set_preempt_need_resched();
 }
 
+static bool csd_lock_suppress_rcu_stall;
+module_param(csd_lock_suppress_rcu_stall, bool, 0644);
+
 static void check_cpu_stall(struct rcu_data *rdp)
 {
 	bool self_detected;
@@ -798,7 +802,9 @@ static void check_cpu_stall(struct rcu_data *rdp)
 			return;
 
 		rcu_stall_notifier_call_chain(RCU_STALL_NOTIFY_NORM, (void *)j - gps);
-		if (self_detected) {
+		if (READ_ONCE(csd_lock_suppress_rcu_stall) && csd_lock_is_stuck()) {
+			pr_err("INFO: %s detected stall, but suppressed full report due to a stuck CSD-lock.\n", rcu_state.name);
+		} else if (self_detected) {
 			/* We haven't checked in, so go dump stack. */
 			print_cpu_stall(gps);
 		} else {
