@@ -1211,6 +1211,10 @@ xfs_dir_open(
 	return error;
 }
 
+/*
+ * Don't bother propagating errors.  We're just doing cleanup, and the caller
+ * ignores the return value anyway.
+ */
 STATIC int
 xfs_file_release(
 	struct inode		*inode,
@@ -1218,7 +1222,6 @@ xfs_file_release(
 {
 	struct xfs_inode	*ip = XFS_I(inode);
 	struct xfs_mount	*mp = ip->i_mount;
-	int			error;
 
 	/* If this is a read-only mount, don't generate I/O */
 	if (xfs_is_readonly(mp))
@@ -1236,11 +1239,8 @@ xfs_file_release(
 	if (!xfs_is_shutdown(mp) &&
 	    xfs_iflags_test_and_clear(ip, XFS_ITRUNCATED)) {
 		xfs_iflags_clear(ip, XFS_IDIRTY_RELEASE);
-		if (ip->i_delayed_blks > 0) {
-			error = filemap_flush(inode->i_mapping);
-			if (error)
-				return error;
-		}
+		if (ip->i_delayed_blks > 0)
+			filemap_flush(inode->i_mapping);
 	}
 
 	/*
@@ -1274,14 +1274,14 @@ xfs_file_release(
 			 * dirty close we will still remove the speculative
 			 * allocation, but after that we will leave it in place.
 			 */
-			error = xfs_free_eofblocks(ip);
-			if (!error && ip->i_delayed_blks)
+			xfs_free_eofblocks(ip);
+			if (ip->i_delayed_blks)
 				xfs_iflags_set(ip, XFS_IDIRTY_RELEASE);
 		}
 		xfs_iunlock(ip, XFS_IOLOCK_EXCL);
 	}
 
-	return error;
+	return 0;
 }
 
 STATIC int
