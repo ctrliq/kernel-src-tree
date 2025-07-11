@@ -1996,10 +1996,6 @@ xfs_setsize_buftarg(
 		return -EINVAL;
 	}
 
-	/* Set up device logical sector size mask */
-	btp->bt_logical_sectorsize = bdev_logical_block_size(btp->bt_bdev);
-	btp->bt_logical_sectormask = bdev_logical_block_size(btp->bt_bdev) - 1;
-
 	return 0;
 }
 
@@ -2029,6 +2025,10 @@ xfs_alloc_buftarg(
 	 */
 	if (xfs_setsize_buftarg(btp, bdev_logical_block_size(btp->bt_bdev)))
 		goto error_free;
+
+	/* Set up device logical sector size mask */
+	btp->bt_logical_sectorsize = bdev_logical_block_size(btp->bt_bdev);
+	btp->bt_logical_sectormask = bdev_logical_block_size(btp->bt_bdev) - 1;
 
 	/*
 	 * Buffer IO error rate limiting. Limit it to no more than 10 messages
