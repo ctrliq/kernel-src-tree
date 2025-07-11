@@ -952,7 +952,7 @@ xfs_attr_lookup(
  * Make a change to the xattr structure.
  *
  * The caller must have initialized @args, attached dquots, and must not hold
- * any ILOCKs.
+ * any ILOCKs.  Reserved data blocks may be used if @rsvd is set.
  *
  * Returns -EEXIST for XFS_ATTRUPDATE_CREATE if the name already exists.
  * Returns -ENOATTR for XFS_ATTRUPDATE_REMOVE if the name does not exist.
@@ -961,33 +961,15 @@ xfs_attr_lookup(
 int
 xfs_attr_set(
 	struct xfs_da_args	*args,
-	enum xfs_attr_update	op)
+	enum xfs_attr_update	op,
+	bool			rsvd)
 {
 	struct xfs_inode	*dp = args->dp;
 	struct xfs_mount	*mp = dp->i_mount;
 	struct xfs_trans_res	tres;
-	bool			rsvd;
 	int			error, local;
 	int			rmt_blks = 0;
 	unsigned int		total;
-
-	/*
-	 * Some xattrs must be resistant to allocation failure at ENOSPC, e.g.
-	 * creating an inode with ACLs or security attributes requires the
-	 * allocation of the xattr holding that information to succeed. Hence
-	 * we allow xattrs in the VFS TRUSTED, SYSTEM, POSIX_ACL and SECURITY
-	 * (LSM xattr) namespaces to dip into the reserve block pool to allow
-	 * manipulation of these xattrs when at ENOSPC. These VFS xattr
-	 * namespaces translate to the XFS_ATTR_ROOT and XFS_ATTR_SECURE on-disk
-	 * namespaces.
-	 *
-	 * For most of these cases, these special xattrs will fit in the inode
-	 * itself and so consume no extra space or only require temporary extra
-	 * space while an overwrite is being made. Hence the use of the reserved
-	 * pool is largely to avoid the worst case reservation from preventing
-	 * the xattr from being created at ENOSPC.
-	 */
-	rsvd = (args->attr_filter & (XFS_ATTR_ROOT | XFS_ATTR_SECURE));
 
 	ASSERT(!args->trans);
 
