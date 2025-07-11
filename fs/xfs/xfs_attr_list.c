@@ -240,6 +240,10 @@ xfs_attr_node_list_lookup(
 			goto out_corruptbuf;
 		}
 
+		fa = xfs_da3_node_header_check(bp, dp->i_ino);
+		if (fa)
+			goto out_corruptbuf;
+
 		xfs_da3_node_hdr_from_disk(mp, &nodehdr, node);
 
 		/* Tree taller than we can handle; bail out! */
@@ -336,6 +340,11 @@ xfs_attr_node_list(
 		case XFS_DA_NODE_MAGIC:
 		case XFS_DA3_NODE_MAGIC:
 			trace_xfs_attr_list_wrong_blk(context);
+			fa = xfs_da3_node_header_check(bp, dp->i_ino);
+			if (fa) {
+				__xfs_buf_mark_corrupt(bp, fa);
+				xfs_dirattr_mark_sick(dp, XFS_ATTR_FORK);
+			}
 			xfs_trans_brelse(context->tp, bp);
 			bp = NULL;
 			break;
