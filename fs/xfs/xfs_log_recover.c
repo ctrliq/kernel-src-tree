@@ -3543,6 +3543,7 @@ xlog_recover_finish(
 		 * and AIL.
 		 */
 		xlog_force_shutdown(log, SHUTDOWN_LOG_IO_ERROR);
+		error = 0;
 		goto out_error;
 	}
 
