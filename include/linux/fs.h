@@ -1907,6 +1907,8 @@ struct file_operations {
 #define FOP_MMAP_SYNC		((__force fop_flags_t)(1 << 2))
 /* Supports non-exclusive O_DIRECT writes from multiple threads */
 #define FOP_DIO_PARALLEL_WRITE	((__force fop_flags_t)(1 << 3))
+/* Supports asynchronous lock callbacks */
+#define FOP_ASYNC_LOCK		((__force fop_flags_t)(1 << 5))
 
 struct inode_operations {
 	struct dentry * (*lookup) (struct inode *,struct dentry *, unsigned int);

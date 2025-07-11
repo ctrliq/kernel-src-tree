@@ -149,6 +149,11 @@ int fcntl_setlk64(unsigned int, struct file *, unsigned int,
 int fcntl_setlease(unsigned int fd, struct file *filp, long arg);
 int fcntl_getlease(struct file *filp);
 
+static inline bool locks_can_async_lock(const struct file_operations *fops)
+{
+	return !fops->lock || fops->fop_flags & FOP_ASYNC_LOCK;
+}
+
 /* fs/locks.c */
 void locks_free_lock_context(struct inode *inode);
 void locks_free_lock(struct file_lock *fl);
