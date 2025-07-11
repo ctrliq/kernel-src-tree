@@ -79,7 +79,8 @@ xfs_attr_want_log_assist(
  */
 int
 xfs_attr_change(
-	struct xfs_da_args	*args)
+	struct xfs_da_args	*args,
+	enum xfs_attr_update	op)
 {
 	struct xfs_mount	*mp = args->dp->i_mount;
 	int			error;
@@ -94,7 +95,7 @@ xfs_attr_change(
 		args->op_flags |= XFS_DA_OP_LOGGED;
 	}
 
-	return xfs_attr_set(args);
+	return xfs_attr_set(args, op);
 }
 
 
@@ -121,6 +122,17 @@ xfs_xattr_get(const struct xattr_handler *handler, struct dentry *unused,
 	return args.valuelen;
 }
 
+static inline enum xfs_attr_update
+xfs_xattr_flags_to_op(
+	int		flags)
+{
+	if (flags & XATTR_CREATE)
+		return XFS_ATTRUPDATE_CREATE;
+	if (flags & XATTR_REPLACE)
+		return XFS_ATTRUPDATE_REPLACE;
+	return XFS_ATTRUPDATE_UPSERTR;
+}
+
 static int
 xfs_xattr_set(const struct xattr_handler *handler,
 	      struct mnt_idmap *idmap, struct dentry *unused,
@@ -130,7 +142,6 @@ xfs_xattr_set(const struct xattr_handler *handler,
 	struct xfs_da_args	args = {
 		.dp		= XFS_I(inode),
 		.attr_filter	= handler->flags,
-		.attr_flags	= flags,
 		.name		= name,
 		.namelen	= strlen(name),
 		.value		= (void *)value,
@@ -138,7 +149,7 @@ xfs_xattr_set(const struct xattr_handler *handler,
 	};
 	int			error;
 
-	error = xfs_attr_change(&args);
+	error = xfs_attr_change(&args, xfs_xattr_flags_to_op(flags));
 	if (!error && (handler->flags & XFS_ATTR_ROOT))
 		xfs_forget_acl(inode, name);
 	return error;
