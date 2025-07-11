@@ -3471,12 +3471,19 @@ xlog_recover(
  * part of recovery so that the root and real-time bitmap inodes can be read in
  * from disk in between the two stages.  This is necessary so that we can free
  * space in the real-time portion of the file system.
+ *
+ * We run this whole process under GFP_NOFS allocation context. We do a
+ * combination of non-transactional and transactional work, yet we really don't
+ * want to recurse into the filesystem from direct reclaim during any of this
+ * processing. This allows all the recovery code run here not to care about the
+ * memory allocation context it is running in.
  */
 int
 xlog_recover_finish(
 	struct xlog	*log)
 {
-	int	error;
+	unsigned int	nofs_flags = memalloc_nofs_save();
+	int		error;
 
 	error = xlog_recover_process_intents(log);
 	if (error) {
@@ -3490,7 +3497,7 @@ xlog_recover_finish(
 		xlog_recover_cancel_intents(log);
 		xfs_alert(log->l_mp, "Failed to recover intents");
 		xlog_force_shutdown(log, SHUTDOWN_LOG_IO_ERROR);
-		return error;
+		goto out_error;
 	}
 
 	/*
@@ -3511,7 +3518,7 @@ xlog_recover_finish(
 		if (error < 0) {
 			xfs_alert(log->l_mp,
 	"Failed to clear log incompat features on recovery");
-			return error;
+			goto out_error;
 		}
 	}
 
@@ -3536,9 +3543,12 @@ xlog_recover_finish(
 		 * and AIL.
 		 */
 		xlog_force_shutdown(log, SHUTDOWN_LOG_IO_ERROR);
+		goto out_error;
 	}
 
-	return 0;
+out_error:
+	memalloc_nofs_restore(nofs_flags);
+	return error;
 }
 
 void
