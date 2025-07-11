@@ -1883,28 +1883,28 @@ DEFINE_ALLOC_EVENT(xfs_alloc_vextent_near_bno);
 DEFINE_ALLOC_EVENT(xfs_alloc_vextent_finish);
 
 TRACE_EVENT(xfs_alloc_cur_check,
-	TP_PROTO(struct xfs_mount *mp, xfs_btnum_t btnum, xfs_agblock_t bno,
+	TP_PROTO(struct xfs_btree_cur *cur, xfs_agblock_t bno,
 		 xfs_extlen_t len, xfs_extlen_t diff, bool new),
-	TP_ARGS(mp, btnum, bno, len, diff, new),
+	TP_ARGS(cur, bno, len, diff, new),
 	TP_STRUCT__entry(
 		__field(dev_t, dev)
-		__field(xfs_btnum_t, btnum)
+		__string(name, cur->bc_ops->name)
 		__field(xfs_agblock_t, bno)
 		__field(xfs_extlen_t, len)
 		__field(xfs_extlen_t, diff)
 		__field(bool, new)
 	),
 	TP_fast_assign(
-		__entry->dev = mp->m_super->s_dev;
-		__entry->btnum = btnum;
+		__entry->dev = cur->bc_mp->m_super->s_dev;
+		__assign_str(name, cur->bc_ops->name);
 		__entry->bno = bno;
 		__entry->len = len;
 		__entry->diff = diff;
 		__entry->new = new;
 	),
-	TP_printk("dev %d:%d btree %s agbno 0x%x fsbcount 0x%x diff 0x%x new %d",
+	TP_printk("dev %d:%d %sbt agbno 0x%x fsbcount 0x%x diff 0x%x new %d",
 		  MAJOR(__entry->dev), MINOR(__entry->dev),
-		  __print_symbolic(__entry->btnum, XFS_BTNUM_STRINGS),
+		  __get_str(name),
 		  __entry->bno, __entry->len, __entry->diff, __entry->new)
 )
 
@@ -2459,7 +2459,7 @@ DECLARE_EVENT_CLASS(xfs_btree_cur_class,
 	TP_ARGS(cur, level, bp),
 	TP_STRUCT__entry(
 		__field(dev_t, dev)
-		__field(xfs_btnum_t, btnum)
+		__string(name, cur->bc_ops->name)
 		__field(int, level)
 		__field(int, nlevels)
 		__field(int, ptr)
@@ -2467,15 +2467,15 @@ DECLARE_EVENT_CLASS(xfs_btree_cur_class,
 	),
 	TP_fast_assign(
 		__entry->dev = cur->bc_mp->m_super->s_dev;
-		__entry->btnum = cur->bc_btnum;
+		__assign_str(name, cur->bc_ops->name);
 		__entry->level = level;
 		__entry->nlevels = cur->bc_nlevels;
 		__entry->ptr = cur->bc_levels[level].ptr;
 		__entry->daddr = bp ? xfs_buf_daddr(bp) : -1;
 	),
-	TP_printk("dev %d:%d btree %s level %d/%d ptr %d daddr 0x%llx",
+	TP_printk("dev %d:%d %sbt level %d/%d ptr %d daddr 0x%llx",
 		  MAJOR(__entry->dev), MINOR(__entry->dev),
-		  __print_symbolic(__entry->btnum, XFS_BTNUM_STRINGS),
+		  __get_str(name),
 		  __entry->level,
 		  __entry->nlevels,
 		  __entry->ptr,
@@ -2497,7 +2497,7 @@ TRACE_EVENT(xfs_btree_alloc_block,
 		__field(dev_t, dev)
 		__field(xfs_agnumber_t, agno)
 		__field(xfs_ino_t, ino)
-		__field(xfs_btnum_t, btnum)
+		__string(name, cur->bc_ops->name)
 		__field(int, error)
 		__field(xfs_agblock_t, agbno)
 	),
@@ -2510,7 +2510,7 @@ TRACE_EVENT(xfs_btree_alloc_block,
 			__entry->agno = cur->bc_ag.pag->pag_agno;
 			__entry->ino = 0;
 		}
-		__entry->btnum = cur->bc_btnum;
+		__assign_str(name, cur->bc_ops->name);
 		__entry->error = error;
 		if (!error && stat) {
 			if (cur->bc_ops->ptr_len == XFS_BTREE_LONG_PTR_LEN) {
@@ -2527,9 +2527,9 @@ TRACE_EVENT(xfs_btree_alloc_block,
 			__entry->agbno = NULLAGBLOCK;
 		}
 	),
-	TP_printk("dev %d:%d btree %s agno 0x%x ino 0x%llx agbno 0x%x error %d",
+	TP_printk("dev %d:%d %sbt agno 0x%x ino 0x%llx agbno 0x%x error %d",
 		  MAJOR(__entry->dev), MINOR(__entry->dev),
-		  __print_symbolic(__entry->btnum, XFS_BTNUM_STRINGS),
+		  __get_str(name),
 		  __entry->agno,
 		  __entry->ino,
 		  __entry->agbno,
@@ -2543,7 +2543,7 @@ TRACE_EVENT(xfs_btree_free_block,
 		__field(dev_t, dev)
 		__field(xfs_agnumber_t, agno)
 		__field(xfs_ino_t, ino)
-		__field(xfs_btnum_t, btnum)
+		__string(name, cur->bc_ops->name)
 		__field(xfs_agblock_t, agbno)
 	),
 	TP_fast_assign(
@@ -2554,13 +2554,13 @@ TRACE_EVENT(xfs_btree_free_block,
 			__entry->ino = cur->bc_ino.ip->i_ino;
 		else
 			__entry->ino = 0;
-		__entry->btnum = cur->bc_btnum;
+		__assign_str(name, cur->bc_ops->name);
 		__entry->agbno = xfs_daddr_to_agbno(cur->bc_mp,
 							xfs_buf_daddr(bp));
 	),
-	TP_printk("dev %d:%d btree %s agno 0x%x ino 0x%llx agbno 0x%x",
+	TP_printk("dev %d:%d %sbt agno 0x%x ino 0x%llx agbno 0x%x",
 		  MAJOR(__entry->dev), MINOR(__entry->dev),
-		  __print_symbolic(__entry->btnum, XFS_BTNUM_STRINGS),
+		  __get_str(name),
 		  __entry->agno,
 		  __entry->ino,
 		  __entry->agbno)
@@ -4137,7 +4137,7 @@ TRACE_EVENT(xfs_btree_commit_afakeroot,
 	TP_ARGS(cur),
 	TP_STRUCT__entry(
 		__field(dev_t, dev)
-		__field(xfs_btnum_t, btnum)
+		__string(name, cur->bc_ops->name)
 		__field(xfs_agnumber_t, agno)
 		__field(xfs_agblock_t, agbno)
 		__field(unsigned int, levels)
@@ -4145,15 +4145,15 @@ TRACE_EVENT(xfs_btree_commit_afakeroot,
 	),
 	TP_fast_assign(
 		__entry->dev = cur->bc_mp->m_super->s_dev;
-		__entry->btnum = cur->bc_btnum;
+		__assign_str(name, cur->bc_ops->name);
 		__entry->agno = cur->bc_ag.pag->pag_agno;
 		__entry->agbno = cur->bc_ag.afake->af_root;
 		__entry->levels = cur->bc_ag.afake->af_levels;
 		__entry->blocks = cur->bc_ag.afake->af_blocks;
 	),
-	TP_printk("dev %d:%d btree %s agno 0x%x levels %u blocks %u root %u",
+	TP_printk("dev %d:%d %sbt agno 0x%x levels %u blocks %u root %u",
 		  MAJOR(__entry->dev), MINOR(__entry->dev),
-		  __print_symbolic(__entry->btnum, XFS_BTNUM_STRINGS),
+		  __get_str(name),
 		  __entry->agno,
 		  __entry->levels,
 		  __entry->blocks,
@@ -4165,7 +4165,7 @@ TRACE_EVENT(xfs_btree_commit_ifakeroot,
 	TP_ARGS(cur),
 	TP_STRUCT__entry(
 		__field(dev_t, dev)
-		__field(xfs_btnum_t, btnum)
+		__string(name, cur->bc_ops->name)
 		__field(xfs_agnumber_t, agno)
 		__field(xfs_agino_t, agino)
 		__field(unsigned int, levels)
@@ -4174,7 +4174,7 @@ TRACE_EVENT(xfs_btree_commit_ifakeroot,
 	),
 	TP_fast_assign(
 		__entry->dev = cur->bc_mp->m_super->s_dev;
-		__entry->btnum = cur->bc_btnum;
+		__assign_str(name, cur->bc_ops->name);
 		__entry->agno = XFS_INO_TO_AGNO(cur->bc_mp,
 					cur->bc_ino.ip->i_ino);
 		__entry->agino = XFS_INO_TO_AGINO(cur->bc_mp,
@@ -4183,9 +4183,9 @@ TRACE_EVENT(xfs_btree_commit_ifakeroot,
 		__entry->blocks = cur->bc_ino.ifake->if_blocks;
 		__entry->whichfork = cur->bc_ino.whichfork;
 	),
-	TP_printk("dev %d:%d btree %s agno 0x%x agino 0x%x whichfork %s levels %u blocks %u",
+	TP_printk("dev %d:%d %sbt agno 0x%x agino 0x%x whichfork %s levels %u blocks %u",
 		  MAJOR(__entry->dev), MINOR(__entry->dev),
-		  __print_symbolic(__entry->btnum, XFS_BTNUM_STRINGS),
+		  __get_str(name),
 		  __entry->agno,
 		  __entry->agino,
 		  __print_symbolic(__entry->whichfork, XFS_WHICHFORK_STRINGS),
@@ -4202,7 +4202,7 @@ TRACE_EVENT(xfs_btree_bload_level_geometry,
 		blocks_with_extra),
 	TP_STRUCT__entry(
 		__field(dev_t, dev)
-		__field(xfs_btnum_t, btnum)
+		__string(name, cur->bc_ops->name)
 		__field(unsigned int, level)
 		__field(unsigned int, nlevels)
 		__field(uint64_t, nr_this_level)
@@ -4213,7 +4213,7 @@ TRACE_EVENT(xfs_btree_bload_level_geometry,
 	),
 	TP_fast_assign(
 		__entry->dev = cur->bc_mp->m_super->s_dev;
-		__entry->btnum = cur->bc_btnum;
+		__assign_str(name, cur->bc_ops->name);
 		__entry->level = level;
 		__entry->nlevels = cur->bc_nlevels;
 		__entry->nr_this_level = nr_this_level;
@@ -4222,9 +4222,9 @@ TRACE_EVENT(xfs_btree_bload_level_geometry,
 		__entry->blocks = blocks;
 		__entry->blocks_with_extra = blocks_with_extra;
 	),
-	TP_printk("dev %d:%d btree %s level %u/%u nr_this_level %llu nr_per_block %u desired_npb %u blocks %llu blocks_with_extra %llu",
+	TP_printk("dev %d:%d %sbt level %u/%u nr_this_level %llu nr_per_block %u desired_npb %u blocks %llu blocks_with_extra %llu",
 		  MAJOR(__entry->dev), MINOR(__entry->dev),
-		  __print_symbolic(__entry->btnum, XFS_BTNUM_STRINGS),
+		  __get_str(name),
 		  __entry->level,
 		  __entry->nlevels,
 		  __entry->nr_this_level,
@@ -4241,7 +4241,7 @@ TRACE_EVENT(xfs_btree_bload_block,
 	TP_ARGS(cur, level, block_idx, nr_blocks, ptr, nr_records),
 	TP_STRUCT__entry(
 		__field(dev_t, dev)
-		__field(xfs_btnum_t, btnum)
+		__string(name, cur->bc_ops->name)
 		__field(unsigned int, level)
 		__field(unsigned long long, block_idx)
 		__field(unsigned long long, nr_blocks)
@@ -4251,7 +4251,7 @@ TRACE_EVENT(xfs_btree_bload_block,
 	),
 	TP_fast_assign(
 		__entry->dev = cur->bc_mp->m_super->s_dev;
-		__entry->btnum = cur->bc_btnum;
+		__assign_str(name, cur->bc_ops->name);
 		__entry->level = level;
 		__entry->block_idx = block_idx;
 		__entry->nr_blocks = nr_blocks;
@@ -4266,9 +4266,9 @@ TRACE_EVENT(xfs_btree_bload_block,
 		}
 		__entry->nr_records = nr_records;
 	),
-	TP_printk("dev %d:%d btree %s level %u block %llu/%llu agno 0x%x agbno 0x%x recs %u",
+	TP_printk("dev %d:%d %sbt level %u block %llu/%llu agno 0x%x agbno 0x%x recs %u",
 		  MAJOR(__entry->dev), MINOR(__entry->dev),
-		  __print_symbolic(__entry->btnum, XFS_BTNUM_STRINGS),
+		  __get_str(name),
 		  __entry->level,
 		  __entry->block_idx,
 		  __entry->nr_blocks,
