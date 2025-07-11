@@ -983,4 +983,3 @@ void aq_nic_shutdown(struct aq_nic_s *self)
 err_exit:
 	rtnl_unlock();
 }
-
