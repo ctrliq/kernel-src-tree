@@ -361,8 +361,6 @@ struct ffa_mem_region {
 	(offsetof(struct ffa_mem_region, ep_mem_access[x]))
 #define CONSTITUENTS_OFFSET(x)	\
 	(offsetof(struct ffa_composite_mem_region, constituents[x]))
-#define COMPOSITE_CONSTITUENTS_OFFSET(x, y)	\
-	(COMPOSITE_OFFSET(x) + CONSTITUENTS_OFFSET(y))
 
 static inline u32
 ffa_mem_desc_offset(struct ffa_mem_region *buf, int count, u32 ffa_version)
