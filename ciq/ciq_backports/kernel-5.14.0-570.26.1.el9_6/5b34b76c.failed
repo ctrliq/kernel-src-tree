@@ -1,0 +1,148 @@
+mm: move follow_phys to arch/x86/mm/pat/memtype.c
+
+jira LE-3557
+Rebuild_History Non-Buildable kernel-5.14.0-570.26.1.el9_6
+commit-author Christoph Hellwig <hch@lst.de>
+commit 5b34b76cb0cd8a21dee5c7677eae98480b0d05cc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-570.26.1.el9_6/5b34b76c.failed
+
+follow_phys is only used by two callers in arch/x86/mm/pat/memtype.c. 
+Move it there and hardcode the two arguments that get the same values
+passed by both callers.
+
+[david@redhat.com: conflict resolutions]
+Link: https://lkml.kernel.org/r/20240403212131.929421-4-david@redhat.com
+Link: https://lkml.kernel.org/r/20240324234542.2038726-4-hch@lst.de
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: David Hildenbrand <david@redhat.com>
+	Reviewed-by: David Hildenbrand <david@redhat.com>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Dave Hansen <dave.hansen@linux.intel.com>
+	Cc: Fei Li <fei1.li@intel.com>
+	Cc: Ingo Molnar <mingo@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Nathan Chancellor <nathan@kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit 5b34b76cb0cd8a21dee5c7677eae98480b0d05cc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mm.h
+diff --cc include/linux/mm.h
+index 196c481ec160,5dc65618e386..000000000000
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@@ -2429,10 -2424,6 +2429,13 @@@ in
+  copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma);
+  int follow_pte(struct mm_struct *mm, unsigned long address,
+  	       pte_t **ptepp, spinlock_t **ptlp);
+++<<<<<<< HEAD
+ +int follow_pfn(struct vm_area_struct *vma, unsigned long address,
+ +	unsigned long *pfn);
+ +int follow_phys(struct vm_area_struct *vma, unsigned long address,
+ +		unsigned int flags, unsigned long *prot, resource_size_t *phys);
+++=======
+++>>>>>>> 5b34b76cb0cd (mm: move follow_phys to arch/x86/mm/pat/memtype.c)
+  int generic_access_phys(struct vm_area_struct *vma, unsigned long addr,
+  			void *buf, int len, int write);
+  
+diff --git a/arch/x86/mm/pat/memtype.c b/arch/x86/mm/pat/memtype.c
+index 36b603d0cdde..d01c3b0bd6eb 100644
+--- a/arch/x86/mm/pat/memtype.c
++++ b/arch/x86/mm/pat/memtype.c
+@@ -39,6 +39,7 @@
+ #include <linux/pfn_t.h>
+ #include <linux/slab.h>
+ #include <linux/mm.h>
++#include <linux/highmem.h>
+ #include <linux/fs.h>
+ #include <linux/rbtree.h>
+ 
+@@ -947,6 +948,32 @@ static void free_pfn_range(u64 paddr, unsigned long size)
+ 		memtype_free(paddr, paddr + size);
+ }
+ 
++static int follow_phys(struct vm_area_struct *vma, unsigned long *prot,
++		resource_size_t *phys)
++{
++	pte_t *ptep, pte;
++	spinlock_t *ptl;
++
++	if (!(vma->vm_flags & (VM_IO | VM_PFNMAP)))
++		return -EINVAL;
++
++	if (follow_pte(vma->vm_mm, vma->vm_start, &ptep, &ptl))
++		return -EINVAL;
++
++	pte = ptep_get(ptep);
++
++	/* Never return PFNs of anon folios in COW mappings. */
++	if (vm_normal_folio(vma, vma->vm_start, pte)) {
++		pte_unmap_unlock(ptep, ptl);
++		return -EINVAL;
++	}
++
++	*prot = pgprot_val(pte_pgprot(pte));
++	*phys = (resource_size_t)pte_pfn(pte) << PAGE_SHIFT;
++	pte_unmap_unlock(ptep, ptl);
++	return 0;
++}
++
+ static int get_pat_info(struct vm_area_struct *vma, resource_size_t *paddr,
+ 		pgprot_t *pgprot)
+ {
+@@ -964,7 +991,7 @@ static int get_pat_info(struct vm_area_struct *vma, resource_size_t *paddr,
+ 	 * detect the PFN. If we need the cachemode as well, we're out of luck
+ 	 * for now and have to fail fork().
+ 	 */
+-	if (!follow_phys(vma, vma->vm_start, 0, &prot, paddr)) {
++	if (!follow_phys(vma, &prot, paddr)) {
+ 		if (pgprot)
+ 			*pgprot = __pgprot(prot);
+ 		return 0;
+* Unmerged path include/linux/mm.h
+diff --git a/mm/memory.c b/mm/memory.c
+index e2794e3b8919..257618e95c0e 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -5699,38 +5699,6 @@ int follow_pfn(struct vm_area_struct *vma, unsigned long address,
+ EXPORT_SYMBOL(follow_pfn);
+ 
+ #ifdef CONFIG_HAVE_IOREMAP_PROT
+-int follow_phys(struct vm_area_struct *vma,
+-		unsigned long address, unsigned int flags,
+-		unsigned long *prot, resource_size_t *phys)
+-{
+-	int ret = -EINVAL;
+-	pte_t *ptep, pte;
+-	spinlock_t *ptl;
+-
+-	if (!(vma->vm_flags & (VM_IO | VM_PFNMAP)))
+-		goto out;
+-
+-	if (follow_pte(vma->vm_mm, address, &ptep, &ptl))
+-		goto out;
+-	pte = ptep_get(ptep);
+-
+-	/* Never return PFNs of anon folios in COW mappings. */
+-	if (vm_normal_folio(vma, address, pte))
+-		goto unlock;
+-
+-	if ((flags & FOLL_WRITE) && !pte_write(pte))
+-		goto unlock;
+-
+-	*prot = pgprot_val(pte_pgprot(pte));
+-	*phys = (resource_size_t)pte_pfn(pte) << PAGE_SHIFT;
+-
+-	ret = 0;
+-unlock:
+-	pte_unmap_unlock(ptep, ptl);
+-out:
+-	return ret;
+-}
+-
+ /**
+  * generic_access_phys - generic implementation for iomem mmap access
+  * @vma: the vma to access
