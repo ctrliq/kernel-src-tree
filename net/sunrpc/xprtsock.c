@@ -859,6 +859,8 @@ static int xs_local_send_request(struct rpc_rqst *req)
 		xprt_force_disconnect(xprt);
 		return -ENOTCONN;
 	}
+	if (!transport->inet)
+		return -ENOTCONN;
 
 	xs_pktdump("packet data:",
 			req->rq_svec->iov_base, req->rq_svec->iov_len);
