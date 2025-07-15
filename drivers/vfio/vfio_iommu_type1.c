@@ -523,14 +523,12 @@ static void vfio_batch_fini(struct vfio_batch *batch)
 
 static int follow_fault_pfn(struct vm_area_struct *vma, struct mm_struct *mm,
 			    unsigned long vaddr, unsigned long *pfn,
-			    bool write_fault)
+			    unsigned long *addr_mask, bool write_fault)
 {
-	pte_t *ptep;
-	pte_t pte;
-	spinlock_t *ptl;
+	struct follow_pfnmap_args args = { .vma = vma, .address = vaddr };
 	int ret;
 
-	ret = follow_pte(vma->vm_mm, vaddr, &ptep, &ptl);
+	ret = follow_pfnmap_start(&args);
 	if (ret) {
 		bool unlocked = false;
 
@@ -544,19 +542,19 @@ static int follow_fault_pfn(struct vm_area_struct *vma, struct mm_struct *mm,
 		if (ret)
 			return ret;
 
-		ret = follow_pte(vma->vm_mm, vaddr, &ptep, &ptl);
+		ret = follow_pfnmap_start(&args);
 		if (ret)
 			return ret;
 	}
 
-	pte = ptep_get(ptep);
-
-	if (write_fault && !pte_write(pte))
+	if (write_fault && !args.writable) {
 		ret = -EFAULT;
-	else
-		*pfn = pte_pfn(pte);
+	} else {
+		*pfn = args.pfn;
+		*addr_mask = args.addr_mask;
+	}
 
-	pte_unmap_unlock(ptep, ptl);
+	follow_pfnmap_end(&args);
 	return ret;
 }
 
@@ -597,15 +595,22 @@ retry:
 	vma = vma_lookup(mm, vaddr);
 
 	if (vma && vma->vm_flags & VM_PFNMAP) {
-		ret = follow_fault_pfn(vma, mm, vaddr, pfn, prot & IOMMU_WRITE);
+		unsigned long addr_mask;
+
+		ret = follow_fault_pfn(vma, mm, vaddr, pfn, &addr_mask,
+				       prot & IOMMU_WRITE);
 		if (ret == -EAGAIN)
 			goto retry;
 
 		if (!ret) {
-			if (is_invalid_reserved_pfn(*pfn))
-				ret = 1;
-			else
+			if (is_invalid_reserved_pfn(*pfn)) {
+				unsigned long epfn;
+
+				epfn = (*pfn | (~addr_mask >> PAGE_SHIFT)) + 1;
+				ret = min_t(long, npages, epfn - *pfn);
+			} else {
 				ret = -EFAULT;
+			}
 		}
 	}
 done:
