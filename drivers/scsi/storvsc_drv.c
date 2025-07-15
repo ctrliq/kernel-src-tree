@@ -171,6 +171,12 @@ do {								\
 		dev_warn(&(dev)->device, fmt, ##__VA_ARGS__);	\
 } while (0)
 
+#define storvsc_log_ratelimited(dev, level, fmt, ...)				\
+do {										\
+	if (do_logging(level))							\
+		dev_warn_ratelimited(&(dev)->device, fmt, ##__VA_ARGS__);	\
+} while (0)
+
 struct vmscsi_request {
 	u16 length;
 	u8 srb_status;
@@ -669,7 +675,7 @@ static u64 storvsc_next_request_id(struct vmbus_channel *channel, u64 rqst_addr)
 	 * Cannot return an ID of 0, which is reserved for an unsolicited
 	 * message from Hyper-V.
 	 */
-	return (u64)blk_mq_unique_tag(request->cmd->request) + 1;
+	return (u64)blk_mq_unique_tag(scsi_cmd_to_rq(request->cmd)) + 1;
 }
 
 static void handle_sc_creation(struct vmbus_channel *new_sc)
@@ -770,7 +776,7 @@ static void  handle_multichannel_storage(struct hv_device *device, int max_chns)
 
 	if (vstor_packet->operation != VSTOR_OPERATION_COMPLETE_IO ||
 	    vstor_packet->status != 0) {
-		dev_err(dev, "Failed to create sub-channel: op=%d, sts=%d\n",
+		dev_err(dev, "Failed to create sub-channel: op=%d, host=0x%x\n",
 			vstor_packet->operation, vstor_packet->status);
 		return;
 	}
@@ -917,14 +923,13 @@ static int storvsc_channel_init(struct hv_device *device, bool is_fc)
 
 	/*
 	 * Allocate state to manage the sub-channels.
-	 * We allocate an array based on the numbers of possible CPUs
-	 * (Hyper-V does not support cpu online/offline).
-	 * This Array will be sparseley populated with unique
-	 * channels - primary + sub-channels.
-	 * We will however populate all the slots to evenly distribute
-	 * the load.
+	 * We allocate an array based on the number of CPU ids. This array
+	 * is initially sparsely populated for the CPUs assigned to channels:
+	 * primary + sub-channels. As I/Os are initiated by different CPUs,
+	 * the slots for all online CPUs are populated to evenly distribute
+	 * the load across all channels.
 	 */
-	stor_device->stor_chns = kcalloc(num_possible_cpus(), sizeof(void *),
+	stor_device->stor_chns = kcalloc(nr_cpu_ids, sizeof(void *),
 					 GFP_KERNEL);
 	if (stor_device->stor_chns == NULL)
 		return -ENOMEM;
@@ -1177,9 +1182,9 @@ static void storvsc_on_io_completion(struct storvsc_device *stor_device,
 		int loglevel = (stor_pkt->vm_srb.cdb[0] == TEST_UNIT_READY) ?
 			STORVSC_LOGGING_WARN : STORVSC_LOGGING_ERROR;
 
-		storvsc_log(device, loglevel,
-			"tag#%d cmd 0x%x status: scsi 0x%x srb 0x%x hv 0x%x\n",
-			request->cmd->request->tag,
+		storvsc_log_ratelimited(device, loglevel,
+			"tag#%d cmd 0x%x status: scsi 0x%x srb 0x%x host 0x%x\n",
+			scsi_cmd_to_rq(request->cmd)->tag,
 			stor_pkt->vm_srb.cdb[0],
 			vstor_packet->vm_srb.scsi_status,
 			vstor_packet->vm_srb.srb_status,
@@ -1813,6 +1818,7 @@ static int storvsc_queuecommand(struct Scsi_Host *host, struct scsi_cmnd *scmnd)
 				return SCSI_MLQUEUE_DEVICE_BUSY;
 		}
 
+		payload->rangecount = 1;
 		payload->range.len = length;
 		payload->range.offset = offset_in_hvpg;
 

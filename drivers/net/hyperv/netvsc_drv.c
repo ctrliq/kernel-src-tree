@@ -325,43 +325,10 @@ static u16 netvsc_select_queue(struct net_device *ndev, struct sk_buff *skb,
 	return txq;
 }
 
-static u32 fill_pg_buf(unsigned long hvpfn, u32 offset, u32 len,
-		       struct hv_page_buffer *pb)
-{
-	int j = 0;
-
-	hvpfn += offset >> HV_HYP_PAGE_SHIFT;
-	offset = offset & ~HV_HYP_PAGE_MASK;
-
-	while (len > 0) {
-		unsigned long bytes;
-
-		bytes = HV_HYP_PAGE_SIZE - offset;
-		if (bytes > len)
-			bytes = len;
-		pb[j].pfn = hvpfn;
-		pb[j].offset = offset;
-		pb[j].len = bytes;
-
-		offset += bytes;
-		len -= bytes;
-
-		if (offset == HV_HYP_PAGE_SIZE && len) {
-			hvpfn++;
-			offset = 0;
-			j++;
-		}
-	}
-
-	return j + 1;
-}
-
 static u32 init_page_array(void *hdr, u32 len, struct sk_buff *skb,
 			   struct hv_netvsc_packet *packet,
 			   struct hv_page_buffer *pb)
 {
-	u32 slots_used = 0;
-	char *data = skb->data;
 	int frags = skb_shinfo(skb)->nr_frags;
 	int i;
 
@@ -370,28 +337,27 @@ static u32 init_page_array(void *hdr, u32 len, struct sk_buff *skb,
 	 * 2. skb linear data
 	 * 3. skb fragment data
 	 */
-	slots_used += fill_pg_buf(virt_to_hvpfn(hdr),
-				  offset_in_hvpage(hdr),
-				  len,
-				  &pb[slots_used]);
 
+	pb[0].offset = offset_in_hvpage(hdr);
+	pb[0].len = len;
+	pb[0].pfn = virt_to_hvpfn(hdr);
 	packet->rmsg_size = len;
-	packet->rmsg_pgcnt = slots_used;
 
-	slots_used += fill_pg_buf(virt_to_hvpfn(data),
-				  offset_in_hvpage(data),
-				  skb_headlen(skb),
-				  &pb[slots_used]);
+	pb[1].offset = offset_in_hvpage(skb->data);
+	pb[1].len = skb_headlen(skb);
+	pb[1].pfn = virt_to_hvpfn(skb->data);
 
 	for (i = 0; i < frags; i++) {
 		skb_frag_t *frag = skb_shinfo(skb)->frags + i;
+		struct hv_page_buffer *cur_pb = &pb[i + 2];
+		u64 pfn = page_to_hvpfn(skb_frag_page(frag));
+		u32 offset = skb_frag_off(frag);
 
-		slots_used += fill_pg_buf(page_to_hvpfn(skb_frag_page(frag)),
-					  skb_frag_off(frag),
-					  skb_frag_size(frag),
-					  &pb[slots_used]);
+		cur_pb->offset = offset_in_hvpage(offset);
+		cur_pb->len = skb_frag_size(frag);
+		cur_pb->pfn = pfn + (offset >> HV_HYP_PAGE_SHIFT);
 	}
-	return slots_used;
+	return frags + 2;
 }
 
 static int count_skb_frag_slots(struct sk_buff *skb)
@@ -482,7 +448,7 @@ static int netvsc_xmit(struct sk_buff *skb, struct net_device *net, bool xdp_tx)
 	struct net_device *vf_netdev;
 	u32 rndis_msg_size;
 	u32 hash;
-	struct hv_page_buffer pb[MAX_PAGE_BUFFER_COUNT];
+	struct hv_page_buffer pb[MAX_DATA_RANGES];
 
 	/* If VF is present and up then redirect packets to it.
 	 * Skip the VF if it is marked down or has no carrier.
@@ -987,7 +953,8 @@ struct netvsc_device_info *netvsc_devinfo_get(struct netvsc_device *nvdev)
 			dev_info->bprog = prog;
 		}
 	} else {
-		dev_info->num_chn = VRSS_CHANNEL_DEFAULT;
+		dev_info->num_chn = max(VRSS_CHANNEL_DEFAULT,
+					netif_get_num_default_rss_queues());
 		dev_info->send_sections = NETVSC_DEFAULT_TX;
 		dev_info->send_section_size = NETVSC_SEND_SECTION_SIZE;
 		dev_info->recv_sections = NETVSC_DEFAULT_RX;
@@ -1556,7 +1523,7 @@ static void netvsc_get_ethtool_stats(struct net_device *dev,
 		data[i++] = xdp_tx;
 	}
 
-	pcpu_sum = kvmalloc_array(num_possible_cpus(),
+	pcpu_sum = kvmalloc_array(nr_cpu_ids,
 				  sizeof(struct netvsc_ethtool_pcpu_stats),
 				  GFP_KERNEL);
 	if (!pcpu_sum)
@@ -2460,6 +2427,21 @@ static int netvsc_vf_changed(struct net_device *vf_netdev, unsigned long event)
 	} else {
 		netdev_info(ndev, "Data path switched %s VF: %s\n",
 			    vf_is_up ? "to" : "from", vf_netdev->name);
+
+		/* In Azure, when accelerated networking in enabled, other NICs
+		 * like MANA, MLX, are configured as a bonded nic with
+		 * Netvsc(failover) NIC. For bonded NICs, the min of the max
+		 * pkt aggregate size of the members is propagated in the stack.
+		 * In order to allow these NICs (MANA/MLX) to use up to
+		 * GSO_MAX_SIZE gso packet size, we need to allow Netvsc NIC to
+		 * also support this in the guest.
+		 * This value is only increased for netvsc NIC when datapath is
+		 * switched over to the VF
+		 */
+		if (vf_is_up)
+			netif_set_tso_max_size(ndev, vf_netdev->tso_max_size);
+		else
+			netif_set_tso_max_size(ndev, netvsc_dev->netvsc_gso_max_size);
 	}
 
 	return NOTIFY_OK;
@@ -2797,6 +2779,31 @@ static struct  hv_driver netvsc_drv = {
 	},
 };
 
+/* Set VF's namespace same as the synthetic NIC */
+static void netvsc_event_set_vf_ns(struct net_device *ndev)
+{
+	struct net_device_context *ndev_ctx = netdev_priv(ndev);
+	struct net_device *vf_netdev;
+	int ret;
+
+	vf_netdev = rtnl_dereference(ndev_ctx->vf_netdev);
+	if (!vf_netdev)
+		return;
+
+	if (!net_eq(dev_net(ndev), dev_net(vf_netdev))) {
+		ret = dev_change_net_namespace(vf_netdev, dev_net(ndev),
+					       "eth%d");
+		if (ret)
+			netdev_err(vf_netdev,
+				   "Cannot move to same namespace as %s: %d\n",
+				   ndev->name, ret);
+		else
+			netdev_info(vf_netdev,
+				    "Moved VF to namespace with: %s\n",
+				    ndev->name);
+	}
+}
+
 /*
  * On Hyper-V, every VF interface is matched with a corresponding
  * synthetic interface. The synthetic interface is presented first
@@ -2808,6 +2815,11 @@ static int netvsc_netdev_event(struct notifier_block *this,
 {
 	struct net_device *event_dev = netdev_notifier_info_to_dev(ptr);
 	int ret = 0;
+
+	if (event_dev->netdev_ops == &device_ops && event == NETDEV_REGISTER) {
+		netvsc_event_set_vf_ns(event_dev);
+		return NOTIFY_DONE;
+	}
 
 	ret = check_dev_is_matching_vf(event_dev);
 	if (ret != 0)
