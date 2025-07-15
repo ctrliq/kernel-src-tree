@@ -1,0 +1,229 @@
+vfio/pci: implement huge_fault support
+
+jira LE-3557
+Rebuild_History Non-Buildable kernel-5.14.0-570.26.1.el9_6
+commit-author Alex Williamson <alex.williamson@redhat.com>
+commit f9e54c3a2f5b79ecc57c7bc7d0d3521e461a2101
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-570.26.1.el9_6/f9e54c3a.failed
+
+With the addition of pfnmap support in vmf_insert_pfn_{pmd,pud}() we can
+take advantage of PMD and PUD faults to PCI BAR mmaps and create more
+efficient mappings.  PCI BARs are always a power of two and will typically
+get at least PMD alignment without userspace even trying.  Userspace
+alignment for PUD mappings is also not too difficult.
+
+Consolidate faults through a single handler with a new wrapper for
+standard single page faults.  The pre-faulting behavior of commit
+d71a989cf5d9 ("vfio/pci: Insert full vma on mmap'd MMIO fault") is removed
+in this refactoring since huge_fault will cover the bulk of the faults and
+results in more efficient page table usage.  We also want to avoid that
+pre-faulted single page mappings preempt huge page mappings.
+
+Link: https://lkml.kernel.org/r/20240826204353.2228736-20-peterx@redhat.com
+	Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+	Signed-off-by: Peter Xu <peterx@redhat.com>
+	Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+	Cc: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
+	Cc: Dave Hansen <dave.hansen@linux.intel.com>
+	Cc: David Hildenbrand <david@redhat.com>
+	Cc: Gavin Shan <gshan@redhat.com>
+	Cc: Gerald Schaefer <gerald.schaefer@linux.ibm.com>
+	Cc: Heiko Carstens <hca@linux.ibm.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Jason Gunthorpe <jgg@nvidia.com>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Niklas Schnelle <schnelle@linux.ibm.com>
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: Ryan Roberts <ryan.roberts@arm.com>
+	Cc: Sean Christopherson <seanjc@google.com>
+	Cc: Sven Schnelle <svens@linux.ibm.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Vasily Gorbik <gor@linux.ibm.com>
+	Cc: Will Deacon <will@kernel.org>
+	Cc: Zi Yan <ziy@nvidia.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit f9e54c3a2f5b79ecc57c7bc7d0d3521e461a2101)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/vfio/pci/vfio_pci_core.c
+diff --cc drivers/vfio/pci/vfio_pci_core.c
+index ffda816e0119,2d7478e9a62d..000000000000
+--- a/drivers/vfio/pci/vfio_pci_core.c
++++ b/drivers/vfio/pci/vfio_pci_core.c
+@@@ -1725,100 -1646,82 +1726,161 @@@ void vfio_pci_memory_unlock_and_restore
+  	up_write(&vdev->memory_lock);
+  }
+  
+ -static unsigned long vma_to_pfn(struct vm_area_struct *vma)
+ +/* Caller holds vma_lock */
+ +static int __vfio_pci_add_vma(struct vfio_pci_core_device *vdev,
+ +			      struct vm_area_struct *vma)
+  {
+ -	struct vfio_pci_core_device *vdev = vma->vm_private_data;
+ -	int index = vma->vm_pgoff >> (VFIO_PCI_OFFSET_SHIFT - PAGE_SHIFT);
+ -	u64 pgoff;
+ +	struct vfio_pci_mmap_vma *mmap_vma;
+  
+ -	pgoff = vma->vm_pgoff &
+ -		((1U << (VFIO_PCI_OFFSET_SHIFT - PAGE_SHIFT)) - 1);
+ +	mmap_vma = kmalloc(sizeof(*mmap_vma), GFP_KERNEL_ACCOUNT);
+ +	if (!mmap_vma)
+ +		return -ENOMEM;
+ +
+ +	mmap_vma->vma = vma;
+ +	list_add(&mmap_vma->vma_next, &vdev->vma_list);
+ +
+ +	return 0;
+ +}
+ +
+ +/*
+ + * Zap mmaps on open so that we can fault them in on access and therefore
+ + * our vma_list only tracks mappings accessed since last zap.
+ + */
+ +static void vfio_pci_mmap_open(struct vm_area_struct *vma)
+ +{
+ +	zap_vma_ptes(vma, vma->vm_start, vma->vm_end - vma->vm_start);
+ +}
+ +
+ +static void vfio_pci_mmap_close(struct vm_area_struct *vma)
+ +{
+ +	struct vfio_pci_core_device *vdev = vma->vm_private_data;
+ +	struct vfio_pci_mmap_vma *mmap_vma;
+  
+ -	return (pci_resource_start(vdev->pdev, index) >> PAGE_SHIFT) + pgoff;
+ +	mutex_lock(&vdev->vma_lock);
+ +	list_for_each_entry(mmap_vma, &vdev->vma_list, vma_next) {
+ +		if (mmap_vma->vma == vma) {
+ +			list_del(&mmap_vma->vma_next);
+ +			kfree(mmap_vma);
+ +			break;
+ +		}
+ +	}
+ +	mutex_unlock(&vdev->vma_lock);
+  }
+  
+- static vm_fault_t vfio_pci_mmap_fault(struct vm_fault *vmf)
++ static vm_fault_t vfio_pci_mmap_huge_fault(struct vm_fault *vmf,
++ 					   unsigned int order)
+  {
+  	struct vm_area_struct *vma = vmf->vma;
+  	struct vfio_pci_core_device *vdev = vma->vm_private_data;
+++<<<<<<< HEAD
+ +	struct vfio_pci_mmap_vma *mmap_vma;
+ +	vm_fault_t ret = VM_FAULT_NOPAGE;
+++=======
++ 	unsigned long pfn, pgoff = vmf->pgoff - vma->vm_pgoff;
++ 	vm_fault_t ret = VM_FAULT_SIGBUS;
++ 
++ 	if (order && (vmf->address & ((PAGE_SIZE << order) - 1) ||
++ 		      vmf->address + (PAGE_SIZE << order) > vma->vm_end)) {
++ 		ret = VM_FAULT_FALLBACK;
++ 		goto out;
++ 	}
++ 
++ 	pfn = vma_to_pfn(vma);
+++>>>>>>> f9e54c3a2f5b (vfio/pci: implement huge_fault support)
+  
+ +	mutex_lock(&vdev->vma_lock);
+  	down_read(&vdev->memory_lock);
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Memory region cannot be accessed if the low power feature is engaged
+ +	 * or memory access is disabled.
+ +	 */
+ +	if (vdev->pm_runtime_engaged || !__vfio_pci_memory_enabled(vdev)) {
+ +		ret = VM_FAULT_SIGBUS;
+ +		goto up_out;
+ +	}
+ +
+ +	/*
+ +	 * We populate the whole vma on fault, so we need to test whether
+ +	 * the vma has already been mapped, such as for concurrent faults
+ +	 * to the same vma.  io_remap_pfn_range() will trigger a BUG_ON if
+ +	 * we ask it to fill the same range again.
+ +	 */
+ +	list_for_each_entry(mmap_vma, &vdev->vma_list, vma_next) {
+ +		if (mmap_vma->vma == vma)
+ +			goto up_out;
+ +	}
+++=======
++ 	if (vdev->pm_runtime_engaged || !__vfio_pci_memory_enabled(vdev))
++ 		goto out_unlock;
++ 
++ 	switch (order) {
++ 	case 0:
++ 		ret = vmf_insert_pfn(vma, vmf->address, pfn + pgoff);
++ 		break;
++ #ifdef CONFIG_ARCH_SUPPORTS_PMD_PFNMAP
++ 	case PMD_ORDER:
++ 		ret = vmf_insert_pfn_pmd(vmf, __pfn_to_pfn_t(pfn + pgoff,
++ 							     PFN_DEV), false);
++ 		break;
++ #endif
++ #ifdef CONFIG_ARCH_SUPPORTS_PUD_PFNMAP
++ 	case PUD_ORDER:
++ 		ret = vmf_insert_pfn_pud(vmf, __pfn_to_pfn_t(pfn + pgoff,
++ 							     PFN_DEV), false);
++ 		break;
++ #endif
++ 	default:
++ 		ret = VM_FAULT_FALLBACK;
++ 	}
++ 
++ out_unlock:
++ 	up_read(&vdev->memory_lock);
++ out:
++ 	dev_dbg_ratelimited(&vdev->pdev->dev,
++ 			   "%s(,order = %d) BAR %ld page offset 0x%lx: 0x%x\n",
++ 			    __func__, order,
++ 			    vma->vm_pgoff >>
++ 				(VFIO_PCI_OFFSET_SHIFT - PAGE_SHIFT),
++ 			    pgoff, (unsigned int)ret);
+++>>>>>>> f9e54c3a2f5b (vfio/pci: implement huge_fault support)
+ +
+ +	if (io_remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff,
+ +			       vma->vm_end - vma->vm_start,
+ +			       vma->vm_page_prot)) {
+ +		ret = VM_FAULT_SIGBUS;
+ +		zap_vma_ptes(vma, vma->vm_start, vma->vm_end - vma->vm_start);
+ +		goto up_out;
+ +	}
+ +
+ +	if (__vfio_pci_add_vma(vdev, vma)) {
+ +		ret = VM_FAULT_OOM;
+ +		zap_vma_ptes(vma, vma->vm_start, vma->vm_end - vma->vm_start);
+ +	}
+  
+ +up_out:
+ +	up_read(&vdev->memory_lock);
+ +	mutex_unlock(&vdev->vma_lock);
+  	return ret;
+  }
+  
++ static vm_fault_t vfio_pci_mmap_page_fault(struct vm_fault *vmf)
++ {
++ 	return vfio_pci_mmap_huge_fault(vmf, 0);
++ }
++ 
+  static const struct vm_operations_struct vfio_pci_mmap_ops = {
+++<<<<<<< HEAD
+ +	.open = vfio_pci_mmap_open,
+ +	.close = vfio_pci_mmap_close,
+ +	.fault = vfio_pci_mmap_fault,
+++=======
++ 	.fault = vfio_pci_mmap_page_fault,
++ #ifdef CONFIG_ARCH_SUPPORTS_HUGE_PFNMAP
++ 	.huge_fault = vfio_pci_mmap_huge_fault,
++ #endif
+++>>>>>>> f9e54c3a2f5b (vfio/pci: implement huge_fault support)
+  };
+  
+  int vfio_pci_core_mmap(struct vfio_device *core_vdev, struct vm_area_struct *vma)
+* Unmerged path drivers/vfio/pci/vfio_pci_core.c
