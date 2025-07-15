@@ -474,12 +474,12 @@ static int put_pfn(unsigned long pfn, int prot)
 
 #define VFIO_BATCH_MAX_CAPACITY (PAGE_SIZE / sizeof(struct page *))
 
-static void vfio_batch_init(struct vfio_batch *batch)
+static void __vfio_batch_init(struct vfio_batch *batch, bool single)
 {
 	batch->size = 0;
 	batch->offset = 0;
 
-	if (unlikely(disable_hugepages))
+	if (single || unlikely(disable_hugepages))
 		goto fallback;
 
 	batch->pages = (struct page **) __get_free_page(GFP_KERNEL);
@@ -492,6 +492,16 @@ static void vfio_batch_init(struct vfio_batch *batch)
 fallback:
 	batch->pages = &batch->fallback_page;
 	batch->capacity = 1;
+}
+
+static void vfio_batch_init(struct vfio_batch *batch)
+{
+	__vfio_batch_init(batch, false);
+}
+
+static void vfio_batch_init_single(struct vfio_batch *batch)
+{
+	__vfio_batch_init(batch, true);
 }
 
 static void vfio_batch_unpin(struct vfio_batch *batch, struct vfio_dma *dma)
@@ -737,7 +747,7 @@ static long vfio_unpin_pages_remote(struct vfio_dma *dma, dma_addr_t iova,
 static int vfio_pin_page_external(struct vfio_dma *dma, unsigned long vaddr,
 				  unsigned long *pfn_base, bool do_accounting)
 {
-	struct page *pages[1];
+	struct vfio_batch batch;
 	struct mm_struct *mm;
 	int ret;
 
@@ -745,7 +755,9 @@ static int vfio_pin_page_external(struct vfio_dma *dma, unsigned long vaddr,
 	if (!mmget_not_zero(mm))
 		return -ENODEV;
 
-	ret = vaddr_get_pfns(mm, vaddr, 1, dma->prot, pfn_base, pages);
+	vfio_batch_init_single(&batch);
+
+	ret = vaddr_get_pfns(mm, vaddr, 1, dma->prot, pfn_base, batch.pages);
 	if (ret != 1)
 		goto out;
 
@@ -764,6 +776,7 @@ static int vfio_pin_page_external(struct vfio_dma *dma, unsigned long vaddr,
 	}
 
 out:
+	vfio_batch_fini(&batch);
 	mmput(mm);
 	return ret;
 }
