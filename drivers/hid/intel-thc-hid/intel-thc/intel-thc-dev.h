@@ -10,6 +10,19 @@
 
 #include "intel-thc-dma.h"
 
+/*
+ * Following is for RHEL 9 only:
+ * commit cdd30ebb1b9f module: Convert symbol namespace to string literal
+ * is missing so we locally overwrite the defines to not differ
+ * too much from upstream
+ */
+#undef MODULE_IMPORT_NS
+#define MODULE_IMPORT_NS(ns)     MODULE_INFO(import_ns, ns)
+#undef EXPORT_SYMBOL_NS_GPL
+#define EXPORT_SYMBOL_NS_GPL(sym, ns)	__EXPORT_SYMBOL(sym, "GPL", ns)
+
+/* End of RHEL 9 customization */
+
 #define THC_REGMAP_COMMON_OFFSET  0x10
 #define THC_REGMAP_MMIO_OFFSET    0x1000
 
