@@ -1,0 +1,287 @@
+mm: pass VMA instead of MM to follow_pte()
+
+jira LE-3557
+Rebuild_History Non-Buildable kernel-5.14.0-570.26.1.el9_6
+commit-author David Hildenbrand <david@redhat.com>
+commit 29ae7d96d166fa08c7232daf8a314ef5ba1efd20
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-570.26.1.el9_6/29ae7d96.failed
+
+... and centralize the VM_IO/VM_PFNMAP sanity check in there. We'll
+now also perform these sanity checks for direct follow_pte()
+invocations.
+
+For generic_access_phys(), we might now check multiple times: nothing to
+worry about, really.
+
+Link: https://lkml.kernel.org/r/20240410155527.474777-3-david@redhat.com
+	Signed-off-by: David Hildenbrand <david@redhat.com>
+	Acked-by: Sean Christopherson <seanjc@google.com>	[KVM]
+	Cc: Alex Williamson <alex.williamson@redhat.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Fei Li <fei1.li@intel.com>
+	Cc: Gerald Schaefer <gerald.schaefer@linux.ibm.com>
+	Cc: Heiko Carstens <hca@linux.ibm.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: Yonghua Huang <yonghua.huang@intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit 29ae7d96d166fa08c7232daf8a314ef5ba1efd20)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/mm/pat/memtype.c
+#	drivers/virt/acrn/mm.c
+diff --cc arch/x86/mm/pat/memtype.c
+index 36b603d0cdde,bdc2a240c2aa..000000000000
+--- a/arch/x86/mm/pat/memtype.c
++++ b/arch/x86/mm/pat/memtype.c
+@@@ -947,6 -948,29 +947,32 @@@ static void free_pfn_range(u64 paddr, u
+  		memtype_free(paddr, paddr + size);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int follow_phys(struct vm_area_struct *vma, unsigned long *prot,
++ 		resource_size_t *phys)
++ {
++ 	pte_t *ptep, pte;
++ 	spinlock_t *ptl;
++ 
++ 	if (follow_pte(vma, vma->vm_start, &ptep, &ptl))
++ 		return -EINVAL;
++ 
++ 	pte = ptep_get(ptep);
++ 
++ 	/* Never return PFNs of anon folios in COW mappings. */
++ 	if (vm_normal_folio(vma, vma->vm_start, pte)) {
++ 		pte_unmap_unlock(ptep, ptl);
++ 		return -EINVAL;
++ 	}
++ 
++ 	*prot = pgprot_val(pte_pgprot(pte));
++ 	*phys = (resource_size_t)pte_pfn(pte) << PAGE_SHIFT;
++ 	pte_unmap_unlock(ptep, ptl);
++ 	return 0;
++ }
++ 
+++>>>>>>> 29ae7d96d166 (mm: pass VMA instead of MM to follow_pte())
+  static int get_pat_info(struct vm_area_struct *vma, resource_size_t *paddr,
+  		pgprot_t *pgprot)
+  {
+diff --cc drivers/virt/acrn/mm.c
+index c4f2e15c8a2b,db8ff1d0ac23..000000000000
+--- a/drivers/virt/acrn/mm.c
++++ b/drivers/virt/acrn/mm.c
+@@@ -168,7 -170,69 +168,73 @@@ int acrn_vm_ram_map(struct acrn_vm *vm
+  
+  	/* Get the page number of the map region */
+  	nr_pages = memmap->len >> PAGE_SHIFT;
+++<<<<<<< HEAD
+ +	pages = vzalloc(nr_pages * sizeof(struct page *));
+++=======
++ 	if (!nr_pages)
++ 		return -EINVAL;
++ 
++ 	mmap_read_lock(current->mm);
++ 	vma = vma_lookup(current->mm, memmap->vma_base);
++ 	if (vma && ((vma->vm_flags & VM_PFNMAP) != 0)) {
++ 		unsigned long start_pfn, cur_pfn;
++ 		spinlock_t *ptl;
++ 		bool writable;
++ 		pte_t *ptep;
++ 
++ 		if ((memmap->vma_base + memmap->len) > vma->vm_end) {
++ 			mmap_read_unlock(current->mm);
++ 			return -EINVAL;
++ 		}
++ 
++ 		for (i = 0; i < nr_pages; i++) {
++ 			ret = follow_pte(vma, memmap->vma_base + i * PAGE_SIZE,
++ 					 &ptep, &ptl);
++ 			if (ret)
++ 				break;
++ 
++ 			cur_pfn = pte_pfn(ptep_get(ptep));
++ 			if (i == 0)
++ 				start_pfn = cur_pfn;
++ 			writable = !!pte_write(ptep_get(ptep));
++ 			pte_unmap_unlock(ptep, ptl);
++ 
++ 			/* Disallow write access if the PTE is not writable. */
++ 			if (!writable &&
++ 			    (memmap->attr & ACRN_MEM_ACCESS_WRITE)) {
++ 				ret = -EFAULT;
++ 				break;
++ 			}
++ 
++ 			/* Disallow refcounted pages. */
++ 			if (pfn_valid(cur_pfn) &&
++ 			    !PageReserved(pfn_to_page(cur_pfn))) {
++ 				ret = -EFAULT;
++ 				break;
++ 			}
++ 
++ 			/* Disallow non-contiguous ranges. */
++ 			if (cur_pfn != start_pfn + i) {
++ 				ret = -EINVAL;
++ 				break;
++ 			}
++ 		}
++ 		mmap_read_unlock(current->mm);
++ 
++ 		if (ret) {
++ 			dev_dbg(acrn_dev.this_device,
++ 				"Failed to lookup PFN at VMA:%pK.\n", (void *)memmap->vma_base);
++ 			return ret;
++ 		}
++ 
++ 		return acrn_mm_region_add(vm, memmap->user_vm_pa,
++ 			 PFN_PHYS(start_pfn), memmap->len,
++ 			 ACRN_MEM_TYPE_WB, memmap->attr);
++ 	}
++ 	mmap_read_unlock(current->mm);
++ 
++ 	pages = vzalloc(array_size(nr_pages, sizeof(*pages)));
+++>>>>>>> 29ae7d96d166 (mm: pass VMA instead of MM to follow_pte())
+  	if (!pages)
+  		return -ENOMEM;
+  
+diff --git a/arch/s390/pci/pci_mmio.c b/arch/s390/pci/pci_mmio.c
+index 588089332931..bca6af2ee723 100644
+--- a/arch/s390/pci/pci_mmio.c
++++ b/arch/s390/pci/pci_mmio.c
+@@ -169,7 +169,7 @@ SYSCALL_DEFINE3(s390_pci_mmio_write, unsigned long, mmio_addr,
+ 	if (!(vma->vm_flags & VM_WRITE))
+ 		goto out_unlock_mmap;
+ 
+-	ret = follow_pte(vma->vm_mm, mmio_addr, &ptep, &ptl);
++	ret = follow_pte(vma, mmio_addr, &ptep, &ptl);
+ 	if (ret)
+ 		goto out_unlock_mmap;
+ 
+@@ -308,7 +308,7 @@ SYSCALL_DEFINE3(s390_pci_mmio_read, unsigned long, mmio_addr,
+ 	if (!(vma->vm_flags & VM_WRITE))
+ 		goto out_unlock_mmap;
+ 
+-	ret = follow_pte(vma->vm_mm, mmio_addr, &ptep, &ptl);
++	ret = follow_pte(vma, mmio_addr, &ptep, &ptl);
+ 	if (ret)
+ 		goto out_unlock_mmap;
+ 
+* Unmerged path arch/x86/mm/pat/memtype.c
+diff --git a/drivers/vfio/vfio_iommu_type1.c b/drivers/vfio/vfio_iommu_type1.c
+index 6c6586af7953..ec4d0003ba2f 100644
+--- a/drivers/vfio/vfio_iommu_type1.c
++++ b/drivers/vfio/vfio_iommu_type1.c
+@@ -520,7 +520,7 @@ static int follow_fault_pfn(struct vm_area_struct *vma, struct mm_struct *mm,
+ 	spinlock_t *ptl;
+ 	int ret;
+ 
+-	ret = follow_pte(vma->vm_mm, vaddr, &ptep, &ptl);
++	ret = follow_pte(vma, vaddr, &ptep, &ptl);
+ 	if (ret) {
+ 		bool unlocked = false;
+ 
+@@ -534,7 +534,7 @@ static int follow_fault_pfn(struct vm_area_struct *vma, struct mm_struct *mm,
+ 		if (ret)
+ 			return ret;
+ 
+-		ret = follow_pte(vma->vm_mm, vaddr, &ptep, &ptl);
++		ret = follow_pte(vma, vaddr, &ptep, &ptl);
+ 		if (ret)
+ 			return ret;
+ 	}
+* Unmerged path drivers/virt/acrn/mm.c
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 196c481ec160..b85fd05660e5 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -2427,7 +2427,7 @@ void free_pgd_range(struct mmu_gather *tlb, unsigned long addr,
+ 		unsigned long end, unsigned long floor, unsigned long ceiling);
+ int
+ copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma);
+-int follow_pte(struct mm_struct *mm, unsigned long address,
++int follow_pte(struct vm_area_struct *vma, unsigned long address,
+ 	       pte_t **ptepp, spinlock_t **ptlp);
+ int follow_pfn(struct vm_area_struct *vma, unsigned long address,
+ 	unsigned long *pfn);
+diff --git a/mm/memory.c b/mm/memory.c
+index e2794e3b8919..6706b9830402 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -5609,7 +5609,7 @@ int __pmd_alloc(struct mm_struct *mm, pud_t *pud, unsigned long address)
+ 
+ /**
+  * follow_pte - look up PTE at a user virtual address
+- * @mm: the mm_struct of the target address space
++ * @vma: the memory mapping
+  * @address: user virtual address
+  * @ptepp: location to store found PTE
+  * @ptlp: location to store the lock for the PTE
+@@ -5628,15 +5628,19 @@ int __pmd_alloc(struct mm_struct *mm, pud_t *pud, unsigned long address)
+  *
+  * Return: zero on success, -ve otherwise.
+  */
+-int follow_pte(struct mm_struct *mm, unsigned long address,
++int follow_pte(struct vm_area_struct *vma, unsigned long address,
+ 	       pte_t **ptepp, spinlock_t **ptlp)
+ {
++	struct mm_struct *mm = vma->vm_mm;
+ 	pgd_t *pgd;
+ 	p4d_t *p4d;
+ 	pud_t *pud;
+ 	pmd_t *pmd;
+ 	pte_t *ptep;
+ 
++	if (!(vma->vm_flags & (VM_IO | VM_PFNMAP)))
++		goto out;
++
+ 	pgd = pgd_offset(mm, address);
+ 	if (pgd_none(*pgd) || unlikely(pgd_bad(*pgd)))
+ 		goto out;
+@@ -5754,11 +5758,8 @@ int generic_access_phys(struct vm_area_struct *vma, unsigned long addr,
+ 	int offset = offset_in_page(addr);
+ 	int ret = -EINVAL;
+ 
+-	if (!(vma->vm_flags & (VM_IO | VM_PFNMAP)))
+-		return -EINVAL;
+-
+ retry:
+-	if (follow_pte(vma->vm_mm, addr, &ptep, &ptl))
++	if (follow_pte(vma, addr, &ptep, &ptl))
+ 		return -EINVAL;
+ 	pte = ptep_get(ptep);
+ 	pte_unmap_unlock(ptep, ptl);
+@@ -5773,7 +5774,7 @@ int generic_access_phys(struct vm_area_struct *vma, unsigned long addr,
+ 	if (!maddr)
+ 		return -ENOMEM;
+ 
+-	if (follow_pte(vma->vm_mm, addr, &ptep, &ptl))
++	if (follow_pte(vma, addr, &ptep, &ptl))
+ 		goto out_unmap;
+ 
+ 	if (!pte_same(pte, ptep_get(ptep))) {
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index b163a079fe65..acd8c5aee080 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -2884,7 +2884,7 @@ static int hva_to_pfn_remapped(struct vm_area_struct *vma,
+ 	spinlock_t *ptl;
+ 	int r;
+ 
+-	r = follow_pte(vma->vm_mm, addr, &ptep, &ptl);
++	r = follow_pte(vma, addr, &ptep, &ptl);
+ 	if (r) {
+ 		/*
+ 		 * get_user_pages fails for VM_IO and VM_PFNMAP vmas and does
+@@ -2899,7 +2899,7 @@ static int hva_to_pfn_remapped(struct vm_area_struct *vma,
+ 		if (r)
+ 			return r;
+ 
+-		r = follow_pte(vma->vm_mm, addr, &ptep, &ptl);
++		r = follow_pte(vma, addr, &ptep, &ptl);
+ 		if (r)
+ 			return r;
+ 	}
