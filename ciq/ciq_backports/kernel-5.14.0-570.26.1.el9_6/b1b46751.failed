@@ -1,0 +1,209 @@
+mm: fix follow_pfnmap API lockdep assert
+
+jira LE-3557
+Rebuild_History Non-Buildable kernel-5.14.0-570.26.1.el9_6
+commit-author Linus Torvalds <torvalds@linux-foundation.org>
+commit b1b46751671be5a426982f037a47ae05f37ff80b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-570.26.1.el9_6/b1b46751.failed
+
+The lockdep asserts for the new follow_pfnmap() API "knows" that a
+pfnmap always has a vma->vm_file, since that's the only way to create
+such a mapping.
+
+And that's actually true for all the normal cases.  But not for the mmap
+failure case, where the incomplete mapping is torn down and we have
+cleared vma->vm_file because the failure occured before the file was
+linked to the vma.
+
+So this codepath does actually need to check for vm_file being NULL.
+
+	Reported-by: Jann Horn <jannh@google.com>
+Fixes: 6da8e9634bb7 ("mm: new follow_pfnmap API")
+	Cc: Peter Xu <peterx@redhat.com>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit b1b46751671be5a426982f037a47ae05f37ff80b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memory.c
+diff --cc mm/memory.c
+index e2794e3b8919,3ccee51adfbb..000000000000
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@@ -5607,60 -6333,136 +5607,91 @@@ int __pmd_alloc(struct mm_struct *mm, p
+  }
+  #endif /* __PAGETABLE_PMD_FOLDED */
+  
+++<<<<<<< HEAD
+++=======
++ static inline void pfnmap_args_setup(struct follow_pfnmap_args *args,
++ 				     spinlock_t *lock, pte_t *ptep,
++ 				     pgprot_t pgprot, unsigned long pfn_base,
++ 				     unsigned long addr_mask, bool writable,
++ 				     bool special)
++ {
++ 	args->lock = lock;
++ 	args->ptep = ptep;
++ 	args->pfn = pfn_base + ((args->address & ~addr_mask) >> PAGE_SHIFT);
++ 	args->pgprot = pgprot;
++ 	args->writable = writable;
++ 	args->special = special;
++ }
++ 
++ static inline void pfnmap_lockdep_assert(struct vm_area_struct *vma)
++ {
++ #ifdef CONFIG_LOCKDEP
++ 	struct file *file = vma->vm_file;
++ 	struct address_space *mapping = file ? file->f_mapping : NULL;
++ 
++ 	if (mapping)
++ 		lockdep_assert(lockdep_is_held(&vma->vm_file->f_mapping->i_mmap_rwsem) ||
++ 			       lockdep_is_held(&vma->vm_mm->mmap_lock));
++ 	else
++ 		lockdep_assert(lockdep_is_held(&vma->vm_mm->mmap_lock));
++ #endif
++ }
++ 
+++>>>>>>> b1b46751671b (mm: fix follow_pfnmap API lockdep assert)
+  /**
+ - * follow_pfnmap_start() - Look up a pfn mapping at a user virtual address
+ - * @args: Pointer to struct @follow_pfnmap_args
+ - *
+ - * The caller needs to setup args->vma and args->address to point to the
+ - * virtual address as the target of such lookup.  On a successful return,
+ - * the results will be put into other output fields.
+ - *
+ - * After the caller finished using the fields, the caller must invoke
+ - * another follow_pfnmap_end() to proper releases the locks and resources
+ - * of such look up request.
+ - *
+ - * During the start() and end() calls, the results in @args will be valid
+ - * as proper locks will be held.  After the end() is called, all the fields
+ - * in @follow_pfnmap_args will be invalid to be further accessed.  Further
+ - * use of such information after end() may require proper synchronizations
+ - * by the caller with page table updates, otherwise it can create a
+ - * security bug.
+ + * follow_pte - look up PTE at a user virtual address
+ + * @mm: the mm_struct of the target address space
+ + * @address: user virtual address
+ + * @ptepp: location to store found PTE
+ + * @ptlp: location to store the lock for the PTE
+   *
+ - * If the PTE maps a refcounted page, callers are responsible to protect
+ - * against invalidation with MMU notifiers; otherwise access to the PFN at
+ - * a later point in time can trigger use-after-free.
+ + * On a successful return, the pointer to the PTE is stored in @ptepp;
+ + * the corresponding lock is taken and its location is stored in @ptlp.
+ + * The contents of the PTE are only stable until @ptlp is released;
+ + * any further use, if any, must be protected against invalidation
+ + * with MMU notifiers.
+   *
+   * Only IO mappings and raw PFN mappings are allowed.  The mmap semaphore
+ - * should be taken for read, and the mmap semaphore cannot be released
+ - * before the end() is invoked.
+ + * should be taken for read.
+   *
+ - * This function must not be used to modify PTE content.
+ + * KVM uses this function.  While it is arguably less bad than ``follow_pfn``,
+ + * it is not a good general-purpose API.
+   *
+ - * Return: zero on success, negative otherwise.
+ + * Return: zero on success, -ve otherwise.
+   */
+ -int follow_pfnmap_start(struct follow_pfnmap_args *args)
+ +int follow_pte(struct mm_struct *mm, unsigned long address,
+ +	       pte_t **ptepp, spinlock_t **ptlp)
+  {
+ -	struct vm_area_struct *vma = args->vma;
+ -	unsigned long address = args->address;
+ -	struct mm_struct *mm = vma->vm_mm;
+ -	spinlock_t *lock;
+ -	pgd_t *pgdp;
+ -	p4d_t *p4dp, p4d;
+ -	pud_t *pudp, pud;
+ -	pmd_t *pmdp, pmd;
+ -	pte_t *ptep, pte;
+ -
+ -	pfnmap_lockdep_assert(vma);
+ -
+ -	if (unlikely(address < vma->vm_start || address >= vma->vm_end))
+ -		goto out;
+ +	pgd_t *pgd;
+ +	p4d_t *p4d;
+ +	pud_t *pud;
+ +	pmd_t *pmd;
+ +	pte_t *ptep;
+  
+ -	if (!(vma->vm_flags & (VM_IO | VM_PFNMAP)))
+ -		goto out;
+ -retry:
+ -	pgdp = pgd_offset(mm, address);
+ -	if (pgd_none(*pgdp) || unlikely(pgd_bad(*pgdp)))
+ +	pgd = pgd_offset(mm, address);
+ +	if (pgd_none(*pgd) || unlikely(pgd_bad(*pgd)))
+  		goto out;
+  
+ -	p4dp = p4d_offset(pgdp, address);
+ -	p4d = READ_ONCE(*p4dp);
+ -	if (p4d_none(p4d) || unlikely(p4d_bad(p4d)))
+ +	p4d = p4d_offset(pgd, address);
+ +	if (p4d_none(*p4d) || unlikely(p4d_bad(*p4d)))
+  		goto out;
+  
+ -	pudp = pud_offset(p4dp, address);
+ -	pud = READ_ONCE(*pudp);
+ -	if (pud_none(pud))
+ +	pud = pud_offset(p4d, address);
+ +	if (pud_none(*pud) || unlikely(pud_bad(*pud)))
+  		goto out;
+ -	if (pud_leaf(pud)) {
+ -		lock = pud_lock(mm, pudp);
+ -		if (!unlikely(pud_leaf(pud))) {
+ -			spin_unlock(lock);
+ -			goto retry;
+ -		}
+ -		pfnmap_args_setup(args, lock, NULL, pud_pgprot(pud),
+ -				  pud_pfn(pud), PUD_MASK, pud_write(pud),
+ -				  pud_special(pud));
+ -		return 0;
+ -	}
+  
+ -	pmdp = pmd_offset(pudp, address);
+ -	pmd = pmdp_get_lockless(pmdp);
+ -	if (pmd_leaf(pmd)) {
+ -		lock = pmd_lock(mm, pmdp);
+ -		if (!unlikely(pmd_leaf(pmd))) {
+ -			spin_unlock(lock);
+ -			goto retry;
+ -		}
+ -		pfnmap_args_setup(args, lock, NULL, pmd_pgprot(pmd),
+ -				  pmd_pfn(pmd), PMD_MASK, pmd_write(pmd),
+ -				  pmd_special(pmd));
+ -		return 0;
+ -	}
+ +	pmd = pmd_offset(pud, address);
+ +	VM_BUG_ON(pmd_trans_huge(*pmd));
+  
+ -	ptep = pte_offset_map_lock(mm, pmdp, address, &lock);
+ +	ptep = pte_offset_map_lock(mm, pmd, address, ptlp);
+  	if (!ptep)
+  		goto out;
+ -	pte = ptep_get(ptep);
+ -	if (!pte_present(pte))
+ +	if (!pte_present(ptep_get(ptep)))
+  		goto unlock;
+ -	pfnmap_args_setup(args, lock, ptep, pte_pgprot(pte),
+ -			  pte_pfn(pte), PAGE_MASK, pte_write(pte),
+ -			  pte_special(pte));
+ +	*ptepp = ptep;
+  	return 0;
+  unlock:
+ -	pte_unmap_unlock(ptep, lock);
+ +	pte_unmap_unlock(ptep, *ptlp);
+  out:
+  	return -EINVAL;
+  }
+* Unmerged path mm/memory.c
