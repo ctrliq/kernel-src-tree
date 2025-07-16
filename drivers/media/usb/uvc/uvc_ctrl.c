@@ -2790,14 +2790,15 @@ int uvc_ctrl_init_device(struct uvc_device *dev)
 void uvc_ctrl_cleanup_fh(struct uvc_fh *handle)
 {
 	struct uvc_entity *entity;
+	unsigned int i;
 
-	guard(mutex)(&handle->chain->ctrl_mutex);
+	mutex_lock(&handle->chain->ctrl_mutex);
 
 	if (!handle->pending_async_ctrls)
-		return;
+		goto done;
 
 	list_for_each_entry(entity, &handle->chain->dev->entities, list) {
-		for (unsigned int i = 0; i < entity->ncontrols; ++i) {
+		for (i = 0; i < entity->ncontrols; ++i) {
 			if (entity->controls[i].handle != handle)
 				continue;
 			uvc_ctrl_set_handle(handle, &entity->controls[i], NULL);
@@ -2805,6 +2806,10 @@ void uvc_ctrl_cleanup_fh(struct uvc_fh *handle)
 	}
 
 	WARN_ON(handle->pending_async_ctrls);
+
+done:
+	mutex_unlock(&handle->chain->ctrl_mutex);
+	return;
 }
 
 /*
