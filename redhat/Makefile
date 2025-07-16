@@ -363,7 +363,7 @@ ifeq ($(AUTOMOTIVE_BUILD), 1)
   else
     $(error "Error: the distro '$(DISTRO)' does not support automotive.")
   endif
-  BUILDOPTS += +automotiveonly
+  BUILDOPTS += +automotive_build
   INCLUDE_FEDORA_FILES:=0
   INCLUDE_RHEL_FILES:=0
   INCLUDE_RT_FILES:=0
