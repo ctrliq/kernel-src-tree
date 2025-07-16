@@ -778,24 +778,27 @@ struct pneigh_entry *pneigh_lookup(struct neigh_table *tbl,
 }
 EXPORT_IPV6_MOD(pneigh_lookup);
 
-struct pneigh_entry *pneigh_create(struct neigh_table *tbl,
-				   struct net *net, const void *pkey,
-				   struct net_device *dev)
+int pneigh_create(struct neigh_table *tbl, struct net *net,
+		  const void *pkey, struct net_device *dev,
+		  u32 flags, u8 protocol)
 {
 	struct pneigh_entry *n;
 	unsigned int key_len;
 	u32 hash_val;
+	int err = 0;
 
 	mutex_lock(&tbl->phash_lock);
 
 	n = pneigh_lookup(tbl, net, pkey, dev);
 	if (n)
-		goto out;
+		goto update;
 
 	key_len = tbl->key_len;
 	n = kzalloc(sizeof(*n) + key_len, GFP_KERNEL);
-	if (!n)
+	if (!n) {
+		err = -ENOBUFS;
 		goto out;
+	}
 
 	write_pnet(&n->net, net);
 	memcpy(n->key, pkey, key_len);
@@ -805,16 +808,19 @@ struct pneigh_entry *pneigh_create(struct neigh_table *tbl,
 	if (tbl->pconstructor && tbl->pconstructor(n)) {
 		netdev_put(dev, &n->dev_tracker);
 		kfree(n);
-		n = NULL;
+		err = -ENOBUFS;
 		goto out;
 	}
 
 	hash_val = pneigh_hash(pkey, key_len);
 	n->next = tbl->phash_buckets[hash_val];
 	rcu_assign_pointer(tbl->phash_buckets[hash_val], n);
+update:
+	WRITE_ONCE(n->flags, flags);
+	WRITE_ONCE(n->protocol, protocol);
 out:
 	mutex_unlock(&tbl->phash_lock);
-	return n;
+	return err;
 }
 
 static void pneigh_destroy(struct rcu_head *rcu)
@@ -2047,21 +2053,12 @@ static int neigh_add(struct sk_buff *skb, struct nlmsghdr *nlh,
 	if (tb[NDA_PROTOCOL])
 		protocol = nla_get_u8(tb[NDA_PROTOCOL]);
 	if (ndm_flags & NTF_PROXY) {
-		struct pneigh_entry *pn;
-
 		if (ndm_flags & NTF_MANAGED) {
 			NL_SET_ERR_MSG(extack, "Invalid NTF_* flag combination");
 			goto out;
 		}
 
-		err = -ENOBUFS;
-		pn = pneigh_create(tbl, net, dst, dev);
-		if (pn) {
-			WRITE_ONCE(pn->flags, ndm_flags);
-			if (protocol)
-				WRITE_ONCE(pn->protocol, protocol);
-			err = 0;
-		}
+		err = pneigh_create(tbl, net, dst, dev, ndm_flags, protocol);
 		goto out;
 	}
 
