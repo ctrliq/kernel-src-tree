@@ -1765,7 +1765,7 @@ static void __dev_close(struct net_device *dev)
 	list_del(&single);
 }
 
-void dev_close_many(struct list_head *head, bool unlink)
+void netif_close_many(struct list_head *head, bool unlink)
 {
 	struct net_device *dev, *tmp;
 
@@ -1783,7 +1783,7 @@ void dev_close_many(struct list_head *head, bool unlink)
 			list_del_init(&dev->close_list);
 	}
 }
-EXPORT_SYMBOL(dev_close_many);
+EXPORT_SYMBOL_NS_GPL(netif_close_many, "NETDEV_INTERNAL");
 
 void netif_close(struct net_device *dev)
 {
@@ -1791,7 +1791,7 @@ void netif_close(struct net_device *dev)
 		LIST_HEAD(single);
 
 		list_add(&dev->close_list, &single);
-		dev_close_many(&single, true);
+		netif_close_many(&single, true);
 		list_del(&single);
 	}
 }
@@ -11994,7 +11994,7 @@ static void netif_close_many_and_unlock(struct list_head *close_head)
 {
 	struct net_device *dev, *tmp;
 
-	dev_close_many(close_head, false);
+	netif_close_many(close_head, false);
 
 	/* ... now unlock them */
 	list_for_each_entry_safe(dev, tmp, close_head, close_list) {
@@ -12064,7 +12064,7 @@ void unregister_netdevice_many_notify(struct list_head *head,
 		if (!netdev_need_ops_lock(dev))
 			list_add_tail(&dev->close_list, &close_head);
 	}
-	dev_close_many(&close_head, true);
+	netif_close_many(&close_head, true);
 
 	list_for_each_entry(dev, head, unreg_list) {
 		/* And unlink it from device chain. */
