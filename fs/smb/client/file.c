@@ -4185,8 +4185,10 @@ cifs_send_async_read(loff_t offset, size_t len, struct cifsFileInfo *open_file,
 				break;
 		}
 
-		cifs_negotiate_rsize(server, cifs_sb->ctx,
-				     tlink_tcon(open_file->tlink));
+		if (cifs_sb->ctx->rsize == 0) {
+			cifs_negotiate_rsize(server, cifs_sb->ctx,
+					     tlink_tcon(open_file->tlink));
+		}
 
 		rc = server->ops->wait_mtu_credits(server, cifs_sb->ctx->rsize,
 						   &rsize, credits);
