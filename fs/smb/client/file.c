@@ -2869,6 +2869,10 @@ retry:
 		if (rc)
 			get_file_rc = rc;
 
+		if (cifs_sb->ctx->wsize == 0)
+			cifs_negotiate_wsize(server, cifs_sb->ctx,
+					     cifs_sb_master_tcon(cifs_sb));
+
 		rc = server->ops->wait_mtu_credits(server, cifs_sb->ctx->wsize,
 						   &wsize, credits);
 		if (rc != 0) {
@@ -3443,6 +3447,10 @@ cifs_write_from_iter(loff_t offset, size_t len, struct iov_iter *from,
 			else if (rc)
 				break;
 		}
+
+		if (cifs_sb->ctx->wsize == 0)
+			cifs_negotiate_wsize(server, cifs_sb->ctx,
+					     tlink_tcon(open_file->tlink));
 
 		rc = server->ops->wait_mtu_credits(server, cifs_sb->ctx->wsize,
 						   &wsize, credits);
@@ -4185,10 +4193,9 @@ cifs_send_async_read(loff_t offset, size_t len, struct cifsFileInfo *open_file,
 				break;
 		}
 
-		if (cifs_sb->ctx->rsize == 0) {
+		if (cifs_sb->ctx->rsize == 0)
 			cifs_negotiate_rsize(server, cifs_sb->ctx,
 					     tlink_tcon(open_file->tlink));
-		}
 
 		rc = server->ops->wait_mtu_credits(server, cifs_sb->ctx->rsize,
 						   &rsize, credits);
