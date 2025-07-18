@@ -3493,8 +3493,6 @@ static long smb3_simple_falloc(struct file *file, struct cifs_tcon *tcon,
 		if (rc == 0) {
 			netfs_resize_file(&cifsi->netfs, new_eof);
 			cifs_setsize(inode, new_eof);
-			cifs_truncate_page(inode->i_mapping, inode->i_size);
-			truncate_setsize(inode, new_eof);
 		}
 		goto out;
 	}
