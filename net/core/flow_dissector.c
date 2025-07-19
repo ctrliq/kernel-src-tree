@@ -106,7 +106,7 @@ int flow_dissector_bpf_prog_attach_check(struct net *net,
 #endif /* CONFIG_BPF_SYSCALL */
 
 /**
- * __skb_flow_get_ports - extract the upper layer ports and return them
+ * skb_flow_get_ports - extract the upper layer ports and return them
  * @skb: sk_buff to extract the ports from
  * @thoff: transport header offset
  * @ip_proto: protocol for which to get port offset
@@ -116,8 +116,8 @@ int flow_dissector_bpf_prog_attach_check(struct net *net,
  * The function will try to retrieve the ports at offset thoff + poff where poff
  * is the protocol port offset returned from proto_ports_offset
  */
-__be32 __skb_flow_get_ports(const struct sk_buff *skb, int thoff, u8 ip_proto,
-			    const void *data, int hlen)
+__be32 skb_flow_get_ports(const struct sk_buff *skb, int thoff, u8 ip_proto,
+			  const void *data, int hlen)
 {
 	int poff = proto_ports_offset(ip_proto);
 
@@ -137,7 +137,7 @@ __be32 __skb_flow_get_ports(const struct sk_buff *skb, int thoff, u8 ip_proto,
 
 	return 0;
 }
-EXPORT_SYMBOL(__skb_flow_get_ports);
+EXPORT_SYMBOL(skb_flow_get_ports);
 
 static bool icmp_has_id(u8 type)
 {
@@ -870,7 +870,7 @@ __skb_flow_dissect_ports(const struct sk_buff *skb,
 	if (!key_ports && !key_ports_range)
 		return;
 
-	ports = __skb_flow_get_ports(skb, nhoff, ip_proto, data, hlen);
+	ports = skb_flow_get_ports(skb, nhoff, ip_proto, data, hlen);
 
 	if (key_ports)
 		key_ports->ports = ports;
@@ -931,6 +931,7 @@ static void __skb_flow_bpf_to_target(const struct bpf_flow_keys *flow_keys,
 				     struct flow_dissector *flow_dissector,
 				     void *target_container)
 {
+	struct flow_dissector_key_ports_range *key_ports_range = NULL;
 	struct flow_dissector_key_ports *key_ports = NULL;
 	struct flow_dissector_key_control *key_control;
 	struct flow_dissector_key_basic *key_basic;
@@ -975,19 +976,20 @@ static void __skb_flow_bpf_to_target(const struct bpf_flow_keys *flow_keys,
 		key_control->addr_type = FLOW_DISSECTOR_KEY_IPV6_ADDRS;
 	}
 
-	if (dissector_uses_key(flow_dissector, FLOW_DISSECTOR_KEY_PORTS))
+	if (dissector_uses_key(flow_dissector, FLOW_DISSECTOR_KEY_PORTS)) {
 		key_ports = skb_flow_dissector_target(flow_dissector,
 						      FLOW_DISSECTOR_KEY_PORTS,
 						      target_container);
-	else if (dissector_uses_key(flow_dissector,
-				    FLOW_DISSECTOR_KEY_PORTS_RANGE))
-		key_ports = skb_flow_dissector_target(flow_dissector,
-						      FLOW_DISSECTOR_KEY_PORTS_RANGE,
-						      target_container);
-
-	if (key_ports) {
 		key_ports->src = flow_keys->sport;
 		key_ports->dst = flow_keys->dport;
+	}
+	if (dissector_uses_key(flow_dissector,
+			       FLOW_DISSECTOR_KEY_PORTS_RANGE)) {
+		key_ports_range = skb_flow_dissector_target(flow_dissector,
+							    FLOW_DISSECTOR_KEY_PORTS_RANGE,
+							    target_container);
+		key_ports_range->tp.src = flow_keys->sport;
+		key_ports_range->tp.dst = flow_keys->dport;
 	}
 
 	if (dissector_uses_key(flow_dissector,
