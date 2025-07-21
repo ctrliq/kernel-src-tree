@@ -1322,7 +1322,6 @@ int br_fdb_delete(struct ndmsg *ndm, struct nlattr *tb[],
 {
 	struct net_bridge_vlan_group *vg;
 	struct net_bridge_port *p = NULL;
-	struct net_bridge_vlan *v;
 	struct net_bridge *br;
 	int err;
 
@@ -1341,14 +1340,10 @@ int br_fdb_delete(struct ndmsg *ndm, struct nlattr *tb[],
 	}
 
 	if (vid) {
-		v = br_vlan_find(vg, vid);
-		if (!v) {
-			pr_info("bridge: RTM_DELNEIGH with unconfigured vlan %d on %s\n", vid, dev->name);
-			return -EINVAL;
-		}
-
 		err = __br_fdb_delete(br, p, addr, vid, notified);
 	} else {
+		struct net_bridge_vlan *v;
+
 		err = -ENOENT;
 		err &= __br_fdb_delete(br, p, addr, 0, notified);
 		if (!vg || !vg->num_vlans)
