@@ -1663,7 +1663,7 @@ ssize_t generic_write_checks(struct kiocb *iocb, struct iov_iter *from)
 
 	if ((iocb->ki_flags & IOCB_NOWAIT) &&
 	    !((iocb->ki_flags & IOCB_DIRECT) ||
-	      (file->f_mode & FMODE_BUF_WASYNC)))
+	      (file->f_op->fop_flags & FOP_BUFFER_WASYNC)))
 		return -EINVAL;
 
 	count = iov_iter_count(from);
