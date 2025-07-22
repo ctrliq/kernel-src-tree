@@ -79,7 +79,6 @@ struct phylink {
 	unsigned int pcs_state;
 
 	bool mac_link_dropped;
-	bool using_mac_select_pcs;
 
 	struct sfp_bus *sfp_bus;
 	bool sfp_may_have_phy;
@@ -672,7 +671,7 @@ static int phylink_validate_mac_and_pcs(struct phylink *pl,
 	int ret;
 
 	/* Get the PCS for this interface mode */
-	if (pl->using_mac_select_pcs) {
+	if (pl->mac_ops->mac_select_pcs) {
 		pcs = pl->mac_ops->mac_select_pcs(pl->config, state->interface);
 		if (IS_ERR(pcs))
 			return PTR_ERR(pcs);
@@ -1185,7 +1184,7 @@ static void phylink_major_config(struct phylink *pl, bool restart,
 						state->interface,
 						state->advertising);
 
-	if (pl->using_mac_select_pcs) {
+	if (pl->mac_ops->mac_select_pcs) {
 		pcs = pl->mac_ops->mac_select_pcs(pl->config, state->interface);
 		if (IS_ERR(pcs)) {
 			phylink_err(pl,
@@ -1701,7 +1700,6 @@ struct phylink *phylink_create(struct phylink_config *config,
 			       phy_interface_t iface,
 			       const struct phylink_mac_ops *mac_ops)
 {
-	bool using_mac_select_pcs = false;
 	struct phylink *pl;
 	int ret;
 
@@ -1711,11 +1709,6 @@ struct phylink *phylink_create(struct phylink_config *config,
 			"phylink: error: empty supported_interfaces\n");
 		return ERR_PTR(-EINVAL);
 	}
-
-	if (mac_ops->mac_select_pcs &&
-	    mac_ops->mac_select_pcs(config, PHY_INTERFACE_MODE_NA) !=
-	      ERR_PTR(-EOPNOTSUPP))
-		using_mac_select_pcs = true;
 
 	pl = kzalloc(sizeof(*pl), GFP_KERNEL);
 	if (!pl)
@@ -1735,7 +1728,6 @@ struct phylink *phylink_create(struct phylink_config *config,
 		return ERR_PTR(-EINVAL);
 	}
 
-	pl->using_mac_select_pcs = using_mac_select_pcs;
 	pl->phy_state.interface = iface;
 	pl->link_interface = iface;
 	if (iface == PHY_INTERFACE_MODE_MOCA)
