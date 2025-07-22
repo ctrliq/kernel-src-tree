@@ -668,7 +668,7 @@ static int phylink_validate_mac_and_pcs(struct phylink *pl,
 					unsigned long *supported,
 					struct phylink_link_state *state)
 {
-	struct phylink_pcs *pcs;
+	struct phylink_pcs *pcs = NULL;
 	int ret;
 
 	/* Get the PCS for this interface mode */
@@ -676,8 +676,6 @@ static int phylink_validate_mac_and_pcs(struct phylink *pl,
 		pcs = pl->mac_ops->mac_select_pcs(pl->config, state->interface);
 		if (IS_ERR(pcs))
 			return PTR_ERR(pcs);
-	} else {
-		pcs = pl->pcs;
 	}
 
 	if (pcs) {
