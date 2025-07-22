@@ -42,6 +42,7 @@
 #include <linux/unistd.h>
 
 #include "phylib-internal.h"
+#include "phy-caps.h"
 
 MODULE_DESCRIPTION("PHY library");
 MODULE_AUTHOR("Andy Fleming");
@@ -3513,6 +3514,10 @@ static int __init phy_init(void)
 	rc = mdio_bus_init();
 	if (rc)
 		goto err_ethtool_phy_ops;
+
+	rc = phy_caps_init();
+	if (rc)
+		goto err_mdio_bus;
 
 	features_init();
 
