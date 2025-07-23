@@ -29,7 +29,6 @@ static struct cached_fid *find_or_create_cached_dir(struct cached_fids *cfids,
 {
 	struct cached_fid *cfid;
 
-	spin_lock(&cfids->cfid_list_lock);
 	list_for_each_entry(cfid, &cfids->entries, entry) {
 		if (!strcmp(cfid->path, path)) {
 			/*
@@ -38,25 +37,20 @@ static struct cached_fid *find_or_create_cached_dir(struct cached_fids *cfids,
 			 * being deleted due to a lease break.
 			 */
 			if (!cfid->time || !cfid->has_lease) {
-				spin_unlock(&cfids->cfid_list_lock);
 				return NULL;
 			}
 			kref_get(&cfid->refcount);
-			spin_unlock(&cfids->cfid_list_lock);
 			return cfid;
 		}
 	}
 	if (lookup_only) {
-		spin_unlock(&cfids->cfid_list_lock);
 		return NULL;
 	}
 	if (cfids->num_entries >= max_cached_dirs) {
-		spin_unlock(&cfids->cfid_list_lock);
 		return NULL;
 	}
 	cfid = init_cached_dir(path);
 	if (cfid == NULL) {
-		spin_unlock(&cfids->cfid_list_lock);
 		return NULL;
 	}
 	cfid->cfids = cfids;
@@ -74,7 +68,6 @@ static struct cached_fid *find_or_create_cached_dir(struct cached_fids *cfids,
 	 */
 	cfid->has_lease = true;
 
-	spin_unlock(&cfids->cfid_list_lock);
 	return cfid;
 }
 
@@ -161,6 +154,7 @@ int open_cached_dir(unsigned int xid, struct cifs_tcon *tcon,
 	struct cached_fids *cfids;
 	const char *npath;
 	int retries = 0, cur_sleep = 1;
+	__le32 lease_flags = 0;
 
 	if (cifs_sb->root == NULL)
 		return -ENOENT;
@@ -187,8 +181,10 @@ replay_again:
 	if (!utf16_path)
 		return -ENOMEM;
 
+	spin_lock(&cfids->cfid_list_lock);
 	cfid = find_or_create_cached_dir(cfids, path, lookup_only, tcon->max_cached_dirs);
 	if (cfid == NULL) {
+		spin_unlock(&cfids->cfid_list_lock);
 		kfree(utf16_path);
 		return -ENOENT;
 	}
@@ -197,7 +193,6 @@ replay_again:
 	 * Otherwise, it is either a new entry or laundromat worker removed it
 	 * from @cfids->entries.  Caller will put last reference if the latter.
 	 */
-	spin_lock(&cfids->cfid_list_lock);
 	if (cfid->has_lease && cfid->time) {
 		spin_unlock(&cfids->cfid_list_lock);
 		*ret_cfid = cfid;
@@ -205,6 +200,8 @@ replay_again:
 		return 0;
 	}
 	spin_unlock(&cfids->cfid_list_lock);
+
+	pfid = &cfid->fid;
 
 	/*
 	 * Skip any prefix paths in @path as lookup_positive_unlocked() ends up
@@ -227,6 +224,25 @@ replay_again:
 			rc = -ENOENT;
 			goto out;
 		}
+		if (dentry->d_parent && server->dialect >= SMB30_PROT_ID) {
+			struct cached_fid *parent_cfid;
+
+			spin_lock(&cfids->cfid_list_lock);
+			list_for_each_entry(parent_cfid, &cfids->entries, entry) {
+				if (parent_cfid->dentry == dentry->d_parent) {
+					cifs_dbg(FYI, "found a parent cached file handle\n");
+					if (parent_cfid->has_lease && parent_cfid->time) {
+						lease_flags
+							|= SMB2_LEASE_FLAG_PARENT_LEASE_KEY_SET_LE;
+						memcpy(pfid->parent_lease_key,
+						       parent_cfid->fid.lease_key,
+						       SMB2_LEASE_KEY_SIZE);
+					}
+					break;
+				}
+			}
+			spin_unlock(&cfids->cfid_list_lock);
+		}
 	}
 	cfid->dentry = dentry;
 	cfid->tcon = tcon;
@@ -241,7 +257,6 @@ replay_again:
 	if (smb3_encryption_required(tcon))
 		flags |= CIFS_TRANSFORM_REQ;
 
-	pfid = &cfid->fid;
 	server->ops->new_lease_key(pfid);
 
 	memset(rqst, 0, sizeof(rqst));
@@ -261,6 +276,7 @@ replay_again:
 				   FILE_READ_EA,
 		.disposition = FILE_OPEN,
 		.fid = pfid,
+		.lease_flags = lease_flags,
 		.replay = !!(retries),
 	};
 
