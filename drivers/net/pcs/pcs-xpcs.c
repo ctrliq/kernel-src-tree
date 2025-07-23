@@ -1191,7 +1191,7 @@ static void xpcs_an_restart(struct phylink_pcs *pcs)
 	}
 }
 
-static int xpcs_get_id(struct dw_xpcs *xpcs)
+static int xpcs_read_ids(struct dw_xpcs *xpcs)
 {
 	int ret;
 	u32 id;
@@ -1406,7 +1406,7 @@ static int xpcs_init_id(struct dw_xpcs *xpcs)
 		xpcs->info = *info;
 	}
 
-	ret = xpcs_get_id(xpcs);
+	ret = xpcs_read_ids(xpcs);
 	if (ret < 0)
 		return ret;
 
