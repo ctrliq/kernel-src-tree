@@ -87,16 +87,16 @@ extern struct alt_instr __alt_instructions[], __alt_instructions_end[];
  * instructions were patched in already:
  */
 extern int alternatives_patched;
-struct module;
 
 extern void alternative_instructions(void);
-extern void apply_alternatives(struct alt_instr *start, struct alt_instr *end,
-			       struct module *mod);
-extern void apply_retpolines(s32 *start, s32 *end, struct module *mod);
-extern void apply_returns(s32 *start, s32 *end, struct module *mod);
-extern void apply_seal_endbr(s32 *start, s32 *end, struct module *mod);
+extern void apply_alternatives(struct alt_instr *start, struct alt_instr *end);
+extern void apply_retpolines(s32 *start, s32 *end);
+extern void apply_returns(s32 *start, s32 *end);
+extern void apply_seal_endbr(s32 *start, s32 *end);
 extern void apply_fineibt(s32 *start_retpoline, s32 *end_retpoine,
-			  s32 *start_cfi, s32 *end_cfi, struct module *mod);
+			  s32 *start_cfi, s32 *end_cfi);
+
+struct module;
 
 struct callthunk_sites {
 	s32				*call_start, *call_end;
@@ -121,6 +121,30 @@ static __always_inline int x86_call_depth_emit_accounting(u8 **pprog,
 							  void *func, void *ip)
 {
 	return 0;
+}
+#endif
+
+#ifdef CONFIG_MITIGATION_ITS
+extern void its_init_mod(struct module *mod);
+extern void its_fini_mod(struct module *mod);
+extern void its_free_mod(struct module *mod);
+#else /* CONFIG_MITIGATION_ITS */
+static inline void its_init_mod(struct module *mod) { }
+static inline void its_fini_mod(struct module *mod) { }
+static inline void its_free_mod(struct module *mod) { }
+#endif
+
+#if defined(CONFIG_MITIGATION_RETHUNK) && defined(CONFIG_OBJTOOL)
+extern bool cpu_wants_rethunk(void);
+extern bool cpu_wants_rethunk_at(void *addr);
+#else
+static __always_inline bool cpu_wants_rethunk(void)
+{
+	return false;
+}
+static __always_inline bool cpu_wants_rethunk_at(void *addr)
+{
+	return false;
 }
 #endif
 
