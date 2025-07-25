@@ -32,6 +32,7 @@ static ____cacheline_aligned_in_smp DEFINE_RT_MUTEX(crypto_default_rng_lock);
 struct crypto_rng *crypto_default_rng;
 EXPORT_SYMBOL_GPL(crypto_default_rng);
 static unsigned int crypto_default_rng_refcnt;
+static bool drbg_registered __ro_after_init;
 
 /*
  * Per-CPU RNG instances are only used by crypto_devrandom_rng. The global RNG,
@@ -215,6 +216,19 @@ int crypto_register_rng(struct rng_alg *alg)
 	if (alg->seedsize > PAGE_SIZE / 8)
 		return -EINVAL;
 
+	/*
+	 * In FIPS mode, the DRBG must take precedence over all other "stdrng"
+	 * algorithms. Therefore, forbid registration of a non-DRBG stdrng in
+	 * FIPS mode. All of the DRBG's driver names are prefixed with "drbg_".
+	 * This also stops new stdrng instances from getting registered after it
+	 * is known that the DRBG is registered, so a new module can't come in
+	 * and pretend to be the DRBG. And when CONFIG_CRYPTO_FIPS is enabled,
+	 * the DRBG is built into the kernel directly; it can't be a module.
+	 */
+	if (fips_enabled && !strcmp(base->cra_name, "stdrng") &&
+	    (drbg_registered || strncmp(base->cra_driver_name, "drbg_", 5)))
+		return -EINVAL;
+
 	base->cra_type = &crypto_rng_type;
 	base->cra_flags &= ~CRYPTO_ALG_TYPE_MASK;
 	base->cra_flags |= CRYPTO_ALG_TYPE_RNG;
@@ -238,6 +252,18 @@ int crypto_register_rngs(struct rng_alg *algs, int count)
 		if (ret)
 			goto err;
 	}
+
+	/*
+	 * Track when the DRBG is registered in FIPS mode. The DRBG calls
+	 * crypto_register_rngs() to register its stdrng instances, and since
+	 * crypto_register_rng() only allows stdrng instances from the DRBG in
+	 * FIPS mode, a successful stdrng registration means it was the DRBG.
+	 * Just check the first alg in the array to see if it's called "stdrng",
+	 * since all of the DRBG's algorithms are named "stdrng". Once
+	 * drbg_registered is set to true, this if-statement is always false.
+	 */
+	if (fips_enabled && !strcmp(algs->base.cra_name, "stdrng"))
+		drbg_registered = true;
 
 	return 0;
 
