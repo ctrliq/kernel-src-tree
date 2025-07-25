@@ -142,6 +142,8 @@ do {								\
 	((++(txq)->compl_tag_cur_gen) >= (txq)->compl_tag_gen_max ? \
 	0 : (txq)->compl_tag_cur_gen)
 
+#define IDPF_TXBUF_NULL			U32_MAX
+
 #define IDPF_TXD_LAST_DESC_CMD (IDPF_TX_DESC_CMD_EOP | IDPF_TX_DESC_CMD_RS)
 
 #define IDPF_TX_FLAGS_TSO		BIT(0)
@@ -201,6 +203,8 @@ struct idpf_tx_offload_params {
  * @td_tag: Descriptor tunneling tag
  * @offload: Offload parameters
  * @prev_ntu: stored TxQ next_to_use in case of rollback
+ * @prev_refill_ntc: stored refillq next_to_clean in case of packet rollback
+ * @prev_refill_gen: stored refillq generation bit in case of packet rollback
  */
 struct idpf_tx_splitq_params {
 	enum idpf_tx_desc_dtype_value dtype;
@@ -213,6 +217,8 @@ struct idpf_tx_splitq_params {
 	struct idpf_tx_offload_params offload;
 
 	u16 prev_ntu;
+	u16 prev_refill_ntc;
+	bool prev_refill_gen;
 };
 
 enum idpf_tx_ctx_desc_eipt_offload {
@@ -720,6 +726,7 @@ struct idpf_rx_queue {
  * @size: Length of descriptor ring in bytes
  * @dma: Physical address of ring
  * @q_vector: Backreference to associated vector
+ * @buf_pool_size: Total number of idpf_tx_buf
  */
 struct idpf_tx_queue {
 	union {
@@ -771,6 +778,7 @@ struct idpf_tx_queue {
 	dma_addr_t dma;
 
 	struct idpf_q_vector *q_vector;
+	u32 buf_pool_size;
 } ____cacheline_aligned;
 
 /**
