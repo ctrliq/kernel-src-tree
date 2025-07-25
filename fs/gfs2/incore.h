@@ -377,7 +377,6 @@ enum {
 	GIF_QD_LOCKED		= 1,
 	GIF_ALLOC_FAILED	= 2,
 	GIF_SW_PAGED		= 3,
-	GIF_FREE_VFS_INODE      = 5,
 	GIF_GLOP_PENDING	= 6,
 };
 
