@@ -257,8 +257,7 @@ int gfs2_meta_read(struct gfs2_glock *gl, u64 blkno, int flags,
 	struct buffer_head *bh, *bhs[2];
 	int num = 0;
 
-	if (gfs2_withdrawn(sdp) &&
-	    !gfs2_withdraw_in_prog(sdp)) {
+	if (gfs2_withdrawn(sdp)) {
 		*bhp = NULL;
 		return -EIO;
 	}
@@ -316,8 +315,7 @@ int gfs2_meta_read(struct gfs2_glock *gl, u64 blkno, int flags,
 
 int gfs2_meta_wait(struct gfs2_sbd *sdp, struct buffer_head *bh)
 {
-	if (gfs2_withdrawn(sdp) &&
-	    !gfs2_withdraw_in_prog(sdp))
+	if (gfs2_withdrawn(sdp))
 		return -EIO;
 
 	wait_on_buffer(bh);
@@ -328,8 +326,7 @@ int gfs2_meta_wait(struct gfs2_sbd *sdp, struct buffer_head *bh)
 			gfs2_io_error_bh(sdp, bh);
 		return -EIO;
 	}
-	if (gfs2_withdrawn(sdp) &&
-	    !gfs2_withdraw_in_prog(sdp))
+	if (gfs2_withdrawn(sdp))
 		return -EIO;
 
 	return 0;
