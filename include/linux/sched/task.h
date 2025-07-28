@@ -119,11 +119,17 @@ static inline void put_task_struct(struct task_struct *t)
 		return;
 
 	/*
-	 * under PREEMPT_RT, we can't call put_task_struct
+	 * Under PREEMPT_RT, we can't call __put_task_struct
 	 * in atomic context because it will indirectly
-	 * acquire sleeping locks.
+	 * acquire sleeping locks. The same is true if the
+	 * current process has a mutex enqueued (blocked on
+	 * a PI chain).
 	 *
-	 * call_rcu() will schedule delayed_put_task_struct_rcu()
+	 * In !RT, it is always safe to call __put_task_struct().
+	 * Though, in order to simplify the code, resort to the
+	 * deferred call too.
+	 *
+	 * call_rcu() will schedule __put_task_struct_rcu_cb()
 	 * to be called in process context.
 	 *
 	 * __put_task_struct() is called when
@@ -136,12 +142,9 @@ static inline void put_task_struct(struct task_struct *t)
 	 *
 	 * delayed_free_task() also uses ->rcu, but it is only called
 	 * when it fails to fork a process. Therefore, there is no
-	 * way it can conflict with put_task_struct().
+	 * way it can conflict with __put_task_struct().
 	 */
-	if (IS_ENABLED(CONFIG_PREEMPT_RT) && !preemptible())
-		call_rcu(&t->rcu, __put_task_struct_rcu_cb);
-	else
-		__put_task_struct(t);
+	call_rcu(&t->rcu, __put_task_struct_rcu_cb);
 }
 
 DEFINE_FREE(put_task, struct task_struct *, if (_T) put_task_struct(_T))
