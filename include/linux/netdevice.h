@@ -64,6 +64,7 @@ struct dsa_port;
 struct ip_tunnel_parm_kern;
 struct macsec_context;
 struct macsec_ops;
+struct netdev_config;
 struct netdev_name_node;
 struct sd_flow_limit;
 struct sfp_bus;
@@ -81,6 +82,7 @@ struct xdp_buff;
 struct xdp_md;
 struct ethtool_netdev_state;
 struct phy_link_topology;
+struct hwtstamp_provider;
 
 void synchronize_net(void);
 void netdev_set_default_ethtool_ops(struct net_device *dev,
@@ -2116,6 +2118,7 @@ enum netdev_reg_state {
  *	@gro_flush_timeout:	timeout for GRO layer in NAPI
  *	@napi_defer_hard_irqs:	If not zero, provides a counter that would
  *				allow to avoid NIC hard IRQ, on busy queues.
+ *	@hwprov: Tracks which PTP performs hardware packet time stamping.
  *
  *	FIXME: cleanup struct net_device such that network protocol info
  *	moves out.
@@ -2487,6 +2490,14 @@ struct net_device {
 	const struct udp_tunnel_nic_info	*udp_tunnel_nic_info;
 	struct udp_tunnel_nic	*udp_tunnel_nic;
 
+	/** @cfg: net_device queue-related configuration */
+	struct netdev_config	*cfg;
+	/**
+	 * @cfg_pending: same as @cfg but when device is being actively
+	 *	reconfigured includes any changes to the configuration
+	 *	requested by the user, but which may or may not be rejected.
+	 */
+	struct netdev_config	*cfg_pending;
 	struct ethtool_netdev_state *ethtool;
 
 	/* protected by rtnl_lock */
@@ -2527,6 +2538,8 @@ struct net_device {
 	 */
 	struct net_shaper_hierarchy *net_shaper_hierarchy;
 #endif
+
+	struct hwtstamp_provider __rcu	*hwprov;
 
 	RH_KABI_RESERVE(1)
 	RH_KABI_RESERVE(2)
@@ -4127,9 +4140,6 @@ int generic_hwtstamp_get_lower(struct net_device *dev,
 int generic_hwtstamp_set_lower(struct net_device *dev,
 			       struct kernel_hwtstamp_config *kernel_cfg,
 			       struct netlink_ext_ack *extack);
-int dev_set_hwtstamp_phylib(struct net_device *dev,
-			    struct kernel_hwtstamp_config *cfg,
-			    struct netlink_ext_ack *extack);
 int dev_ethtool(struct net *net, struct ifreq *ifr, void __user *userdata);
 unsigned int dev_get_flags(const struct net_device *);
 int __dev_change_flags(struct net_device *dev, unsigned int flags,
@@ -4165,6 +4175,7 @@ struct sk_buff *dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev,
 
 int bpf_xdp_link_attach(const union bpf_attr *attr, struct bpf_prog *prog);
 u8 dev_xdp_prog_count(struct net_device *dev);
+u8 dev_xdp_sb_prog_count(struct net_device *dev);
 u32 dev_xdp_prog_id(struct net_device *dev, enum bpf_xdp_mode mode);
 
 int __dev_forward_skb(struct net_device *dev, struct sk_buff *skb);

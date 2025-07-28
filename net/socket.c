@@ -901,6 +901,7 @@ void __sock_recv_timestamp(struct msghdr *msg, struct sock *sk,
 		skb_hwtstamps(skb);
 	int if_index;
 	ktime_t hwtstamp;
+	u32 tsflags;
 
 	/* Race occurred between timestamp enabling and packet
 	   receiving.  Fill in the current time for now. */
@@ -942,11 +943,18 @@ void __sock_recv_timestamp(struct msghdr *msg, struct sock *sk,
 	}
 
 	memset(&tss, 0, sizeof(tss));
-	if ((sk->sk_tsflags & SOF_TIMESTAMPING_SOFTWARE) &&
+	tsflags = READ_ONCE(sk->sk_tsflags);
+	if ((tsflags & SOF_TIMESTAMPING_SOFTWARE &&
+	     (tsflags & SOF_TIMESTAMPING_RX_SOFTWARE ||
+	      skb_is_err_queue(skb) ||
+	      !(tsflags & SOF_TIMESTAMPING_OPT_RX_FILTER))) &&
 	    ktime_to_timespec64_cond(skb->tstamp, tss.ts + 0))
 		empty = 0;
 	if (shhwtstamps &&
-	    (sk->sk_tsflags & SOF_TIMESTAMPING_RAW_HARDWARE) &&
+	    (tsflags & SOF_TIMESTAMPING_RAW_HARDWARE &&
+	     (tsflags & SOF_TIMESTAMPING_RX_HARDWARE ||
+	      skb_is_err_queue(skb) ||
+	      !(tsflags & SOF_TIMESTAMPING_OPT_RX_FILTER))) &&
 	    !skb_is_swtx_tstamp(skb, false_tstamp)) {
 		if_index = 0;
 		if (skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP_NETDEV)
