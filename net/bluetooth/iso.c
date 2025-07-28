@@ -1281,6 +1281,42 @@ static int iso_sock_accept(struct socket *sock, struct socket *newsock,
 
 	BT_DBG("new socket %p", ch);
 
+	/* A Broadcast Sink might require BIG sync to be terminated
+	 * and re-established multiple times, while keeping the same
+	 * PA sync handle active. To allow this, once all BIS
+	 * connections have been accepted on a PA sync parent socket,
+	 * "reset" socket state, to allow future BIG re-sync procedures.
+	 */
+	if (test_bit(BT_SK_PA_SYNC, &iso_pi(sk)->flags)) {
+		/* Iterate through the list of bound BIS indices
+		 * and clear each BIS as they are accepted by the
+		 * user space, one by one.
+		 */
+		for (int i = 0; i < iso_pi(sk)->bc_num_bis; i++) {
+			if (iso_pi(sk)->bc_bis[i] > 0) {
+				iso_pi(sk)->bc_bis[i] = 0;
+				iso_pi(sk)->bc_num_bis--;
+				break;
+			}
+		}
+
+		if (iso_pi(sk)->bc_num_bis == 0) {
+			/* Once the last BIS was accepted, reset parent
+			 * socket parameters to mark that the listening
+			 * process for BIS connections has been completed:
+			 *
+			 * 1. Reset the DEFER setup flag on the parent sk.
+			 * 2. Clear the flag marking that the BIG create
+			 *    sync command is pending.
+			 * 3. Transition socket state from BT_LISTEN to
+			 *    BT_CONNECTED.
+			 */
+			set_bit(BT_SK_DEFER_SETUP, &bt_sk(sk)->flags);
+			clear_bit(BT_SK_BIG_SYNC, &iso_pi(sk)->flags);
+			sk->sk_state = BT_CONNECTED;
+		}
+	}
+
 done:
 	release_sock(sk);
 	return err;
@@ -1414,14 +1450,13 @@ static void iso_conn_big_sync(struct sock *sk)
 	lock_sock(sk);
 
 	if (!test_and_set_bit(BT_SK_BIG_SYNC, &iso_pi(sk)->flags)) {
-		err = hci_le_big_create_sync(hdev, iso_pi(sk)->conn->hcon,
-					     &iso_pi(sk)->qos,
-					     iso_pi(sk)->sync_handle,
-					     iso_pi(sk)->bc_num_bis,
-					     iso_pi(sk)->bc_bis);
+		err = hci_conn_big_create_sync(hdev, iso_pi(sk)->conn->hcon,
+					       &iso_pi(sk)->qos,
+					       iso_pi(sk)->sync_handle,
+					       iso_pi(sk)->bc_num_bis,
+					       iso_pi(sk)->bc_bis);
 		if (err)
-			bt_dev_err(hdev, "hci_le_big_create_sync: %d",
-				   err);
+			bt_dev_err(hdev, "hci_big_create_sync: %d", err);
 	}
 
 	release_sock(sk);
@@ -1870,7 +1905,7 @@ static void iso_conn_ready(struct iso_conn *conn)
 					      hcon);
 		} else if (test_bit(HCI_CONN_BIG_SYNC_FAILED, &hcon->flags)) {
 			ev = hci_recv_event_data(hcon->hdev,
-						 HCI_EVT_LE_BIG_SYNC_ESTABILISHED);
+						 HCI_EVT_LE_BIG_SYNC_ESTABLISHED);
 
 			/* Get reference to PA sync parent socket, if it exists */
 			parent = iso_get_sock(&hcon->src, &hcon->dst,
@@ -2061,12 +2096,11 @@ int iso_connect_ind(struct hci_dev *hdev, bdaddr_t *bdaddr, __u8 *flags)
 
 			if (!test_bit(BT_SK_DEFER_SETUP, &bt_sk(sk)->flags) &&
 			    !test_and_set_bit(BT_SK_BIG_SYNC, &iso_pi(sk)->flags)) {
-				err = hci_le_big_create_sync(hdev,
-							     hcon,
-							     &iso_pi(sk)->qos,
-							     iso_pi(sk)->sync_handle,
-							     iso_pi(sk)->bc_num_bis,
-							     iso_pi(sk)->bc_bis);
+				err = hci_conn_big_create_sync(hdev, hcon,
+							       &iso_pi(sk)->qos,
+							       iso_pi(sk)->sync_handle,
+							       iso_pi(sk)->bc_num_bis,
+							       iso_pi(sk)->bc_bis);
 				if (err) {
 					bt_dev_err(hdev, "hci_le_big_create_sync: %d",
 						   err);
@@ -2149,11 +2183,6 @@ done:
 	sock_put(sk);
 
 	return HCI_LM_ACCEPT;
-}
-
-static bool iso_match(struct hci_conn *hcon)
-{
-	return hcon->type == ISO_LINK || hcon->type == LE_LINK;
 }
 
 static void iso_connect_cfm(struct hci_conn *hcon, __u8 status)
@@ -2337,7 +2366,6 @@ drop:
 
 static struct hci_cb iso_cb = {
 	.name		= "ISO",
-	.match		= iso_match,
 	.connect_cfm	= iso_connect_cfm,
 	.disconn_cfm	= iso_disconn_cfm,
 };
