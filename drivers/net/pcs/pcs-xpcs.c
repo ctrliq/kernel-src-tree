@@ -1240,8 +1240,8 @@ static const struct phylink_pcs_ops xpcs_phylink_ops = {
 	.pcs_link_up = xpcs_link_up,
 };
 
-struct dw_xpcs *xpcs_create(struct mdio_device *mdiodev,
-			    phy_interface_t interface)
+static struct dw_xpcs *xpcs_create(struct mdio_device *mdiodev,
+				   phy_interface_t interface)
 {
 	struct dw_xpcs *xpcs;
 	u32 xpcs_id;
@@ -1289,7 +1289,6 @@ out:
 
 	return ERR_PTR(ret);
 }
-EXPORT_SYMBOL_GPL(xpcs_create);
 
 void xpcs_destroy(struct dw_xpcs *xpcs)
 {
