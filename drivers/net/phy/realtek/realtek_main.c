@@ -16,10 +16,6 @@
 #include <linux/clk.h>
 #include <linux/string_choices.h>
 
-#define RTL821x_PHYSR				0x11
-#define RTL821x_PHYSR_DUPLEX			BIT(13)
-#define RTL821x_PHYSR_SPEED			GENMASK(15, 14)
-
 #define RTL8201F_IER				0x13
 
 #define RTL8201F_ISR				0x1e
