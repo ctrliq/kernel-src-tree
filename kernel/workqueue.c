@@ -4961,6 +4961,7 @@ void show_one_workqueue(struct workqueue_struct *wq)
 	for_each_pwq(pwq, wq) {
 		raw_spin_lock_irqsave(&pwq->pool->lock, flags);
 		if (pwq->nr_active || !list_empty(&pwq->inactive_works)) {
+#ifndef	CONFIG_PREEMPT_RT
 			/*
 			 * Defer printing to avoid deadlocks in console
 			 * drivers that queue work while holding locks
@@ -4969,6 +4970,9 @@ void show_one_workqueue(struct workqueue_struct *wq)
 			printk_deferred_enter();
 			show_pwq(pwq);
 			printk_deferred_exit();
+#else
+			show_pwq(pwq);
+#endif
 		}
 		raw_spin_unlock_irqrestore(&pwq->pool->lock, flags);
 		/*
@@ -4994,12 +4998,14 @@ static void show_one_worker_pool(struct worker_pool *pool)
 	raw_spin_lock_irqsave(&pool->lock, flags);
 	if (pool->nr_workers == pool->nr_idle)
 		goto next_pool;
+#ifndef	CONFIG_PREEMPT_RT
 	/*
 	 * Defer printing to avoid deadlocks in console drivers that
 	 * queue work while holding locks also taken in their write
 	 * paths.
 	 */
 	printk_deferred_enter();
+#endif
 	pr_info("pool %d:", pool->id);
 	pr_cont_pool_info(pool);
 	pr_cont(" hung=%us workers=%d",
@@ -5014,7 +5020,9 @@ static void show_one_worker_pool(struct worker_pool *pool)
 		first = false;
 	}
 	pr_cont("\n");
+#ifndef	CONFIG_PREEMPT_RT
 	printk_deferred_exit();
+#endif
 next_pool:
 	raw_spin_unlock_irqrestore(&pool->lock, flags);
 	/*
