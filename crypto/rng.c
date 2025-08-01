@@ -322,8 +322,7 @@ static ssize_t crypto_devrandom_read_iter(struct iov_iter *iter, bool reseed)
 }
 
 static const struct random_extrng crypto_devrandom_rng = {
-	.extrng_read_iter = crypto_devrandom_read_iter,
-	.owner = THIS_MODULE,
+	.extrng_read_iter = crypto_devrandom_read_iter
 };
 
 static int __init crypto_rng_init(void)
@@ -333,13 +332,7 @@ static int __init crypto_rng_init(void)
 	return 0;
 }
 
-static void __exit crypto_rng_exit(void)
-{
-	random_unregister_extrng();
-}
-
 late_initcall(crypto_rng_init);
-module_exit(crypto_rng_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Random Number Generator");
