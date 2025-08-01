@@ -71,9 +71,6 @@ enum {
 
 	/* Cgroup is frozen. */
 	CGRP_FROZEN,
-
-	/* Control group has to be killed. */
-	CGRP_KILL,
 };
 
 /* cgroup_root->flags */
@@ -327,6 +324,7 @@ struct cgroup_base_stat {
 #ifdef CONFIG_SCHED_CORE
 	u64 forceidle_sum;
 #endif
+	u64 ntime;
 };
 
 /*
@@ -397,7 +395,7 @@ struct cgroup_freezer_state {
 	bool freeze;
 
 	/* Should the cgroup actually be frozen? */
-	int e_freeze;
+	bool e_freeze;
 
 	/* Fields below are protected by css_set_lock */
 
@@ -459,6 +457,9 @@ struct cgroup {
 	int nr_populated_threaded_children;
 
 	int nr_threaded_children;	/* # of live threaded child cgroups */
+
+	/* sequence number for cgroup.kill, serialized by css_set_lock. */
+	unsigned int kill_seq;
 
 	struct kernfs_node *kn;		/* cgroup kernfs entry */
 	struct cgroup_file procs_file;	/* handle for "cgroup.procs" */
