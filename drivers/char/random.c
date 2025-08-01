@@ -55,7 +55,6 @@
 #include <linux/siphash.h>
 #include <linux/sched/isolation.h>
 #include <linux/fips.h>
-#include <linux/rcupdate.h>
 #include <crypto/chacha.h>
 #include <crypto/blake2s.h>
 #ifdef CONFIG_VDSO_GETRANDOM
@@ -328,7 +327,7 @@ static void crng_fast_key_erasure(u8 key[CHACHA_KEY_SIZE],
 /*
  * Hook for external RNG.
  */
-static const struct random_extrng __rcu *extrng;
+static const struct random_extrng *extrng __ro_after_init;
 
 /*
  * This function returns a ChaCha state that you may use for generating
@@ -982,18 +981,12 @@ void __init add_bootloader_randomness(const void *buf, size_t len)
 		credit_init_bits(len * 8);
 }
 
-void random_register_extrng(const struct random_extrng *rng)
+void __init random_register_extrng(const struct random_extrng *rng)
 {
-	rcu_assign_pointer(extrng, rng);
+	/* Don't allow the registered extrng to be overridden */
+	BUG_ON(extrng);
+	extrng = rng;
 }
-EXPORT_SYMBOL_GPL(random_register_extrng);
-
-void random_unregister_extrng(void)
-{
-	RCU_INIT_POINTER(extrng, NULL);
-	synchronize_rcu();
-}
-EXPORT_SYMBOL_GPL(random_unregister_extrng);
 
 #if IS_ENABLED(CONFIG_VMGENID)
 static BLOCKING_NOTIFIER_HEAD(vmfork_chain);
@@ -1409,7 +1402,6 @@ SYSCALL_DEFINE3(getrandom, char __user *, ubuf, size_t, len, unsigned int, flags
 {
 	struct iov_iter iter;
 	int ret;
-	const struct random_extrng *rng;
 
 	if (flags & ~(GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE))
 		return -EINVAL;
@@ -1421,19 +1413,11 @@ SYSCALL_DEFINE3(getrandom, char __user *, ubuf, size_t, len, unsigned int, flags
 	if ((flags & (GRND_INSECURE | GRND_RANDOM)) == (GRND_INSECURE | GRND_RANDOM))
 		return -EINVAL;
 
-	rcu_read_lock();
-	rng = rcu_dereference(extrng);
-	if (rng && !try_module_get(rng->owner))
-		rng = NULL;
-	rcu_read_unlock();
-
-	if (rng) {
+	if (extrng) {
 		ret = import_ubuf(ITER_DEST, ubuf, len, &iter);
 		if (unlikely(ret))
 			return ret;
-		ret = rng->extrng_read_iter(&iter, !!(flags & GRND_RANDOM));
-		module_put(rng->owner);
-		return ret;
+		return extrng->extrng_read_iter(&iter, !!(flags & GRND_RANDOM));
 	}
 
 	if (!crng_ready() && !(flags & GRND_INSECURE)) {
@@ -1604,52 +1588,24 @@ static int random_fasync(int fd, struct file *filp, int on)
 
 static int random_open(struct inode *inode, struct file *filp)
 {
-	const struct random_extrng *rng;
-
-	rcu_read_lock();
-	rng = rcu_dereference(extrng);
-	if (rng && !try_module_get(rng->owner))
-		rng = NULL;
-	rcu_read_unlock();
-
-	if (!rng)
-		return 0;
-
-	filp->f_op = &extrng_random_fops;
-	filp->private_data = rng->owner;
+	if (extrng)
+		filp->f_op = &extrng_random_fops;
 
 	return 0;
 }
 
 static int urandom_open(struct inode *inode, struct file *filp)
 {
-	const struct random_extrng *rng;
+	if (extrng)
+		filp->f_op = &extrng_urandom_fops;
 
-	rcu_read_lock();
-	rng = rcu_dereference(extrng);
-	if (rng && !try_module_get(rng->owner))
-		rng = NULL;
-	rcu_read_unlock();
-
-	if (!rng)
-		return 0;
-
-	filp->f_op = &extrng_urandom_fops;
-	filp->private_data = rng->owner;
-
-	return 0;
-}
-
-static int extrng_release(struct inode *inode, struct file *filp)
-{
-	module_put(filp->private_data);
 	return 0;
 }
 
 static ssize_t
 extrng_read_iter(struct kiocb *kiocb, struct iov_iter *iter)
 {
-	return rcu_dereference_raw(extrng)->extrng_read_iter(iter, false);
+	return extrng->extrng_read_iter(iter, false);
 }
 
 const struct file_operations random_fops = {
@@ -1686,7 +1642,6 @@ static const struct file_operations extrng_random_fops = {
 	.compat_ioctl = compat_ptr_ioctl,
 	.fasync = random_fasync,
 	.llseek = noop_llseek,
-	.release = extrng_release,
 	.splice_read = copy_splice_read,
 	.splice_write = iter_file_splice_write,
 };
@@ -1699,7 +1654,6 @@ static const struct file_operations extrng_urandom_fops = {
 	.compat_ioctl = compat_ptr_ioctl,
 	.fasync = random_fasync,
 	.llseek = noop_llseek,
-	.release = extrng_release,
 	.splice_read = copy_splice_read,
 	.splice_write = iter_file_splice_write,
 };
