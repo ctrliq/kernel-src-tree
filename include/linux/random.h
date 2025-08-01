@@ -9,12 +9,6 @@
 
 #include <uapi/linux/random.h>
 
-struct iov_iter;
-struct random_extrng {
-	ssize_t (*extrng_read_iter)(struct iov_iter *, bool reseed);
-	struct module *owner;
-};
-
 struct notifier_block;
 
 void add_device_randomness(const void *buf, size_t len);
@@ -41,9 +35,6 @@ int unregister_random_vmfork_notifier(struct notifier_block *nb);
 static inline int register_random_vmfork_notifier(struct notifier_block *nb) { return 0; }
 static inline int unregister_random_vmfork_notifier(struct notifier_block *nb) { return 0; }
 #endif
-
-void random_register_extrng(const struct random_extrng *rng);
-void random_unregister_extrng(void);
 
 void get_random_bytes(void *buf, size_t len);
 u8 get_random_u8(void);
@@ -173,6 +164,13 @@ int random_online_cpu(unsigned int cpu);
 
 #ifndef MODULE
 extern const struct file_operations random_fops, urandom_fops;
+
+struct iov_iter;
+struct random_extrng {
+	ssize_t (*extrng_read_iter)(struct iov_iter *iter, bool reseed);
+};
+
+void __init random_register_extrng(const struct random_extrng *rng);
 #endif
 
 #endif /* _LINUX_RANDOM_H */
