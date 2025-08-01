@@ -637,8 +637,7 @@ up_rwsem:
 }
 
 static const struct random_extrng crypto_devrandom_rng = {
-	.extrng_read_iter = crypto_devrandom_read_iter,
-	.owner = THIS_MODULE,
+	.extrng_read_iter = crypto_devrandom_read_iter
 };
 
 static void free_pcpu_inst(struct cpu_rng_inst __percpu *pcri)
@@ -700,15 +699,7 @@ free_pcpu_default:
 	return ret;
 }
 
-static void __exit crypto_rng_exit(void)
-{
-	random_unregister_extrng();
-	free_pcpu_inst(&pcpu_default_rng);
-	free_pcpu_inst(&pcpu_reseed_rng);
-}
-
 late_initcall(crypto_rng_init);
-module_exit(crypto_rng_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Random Number Generator");
