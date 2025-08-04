@@ -611,6 +611,8 @@ struct perf_event {
 #endif
 	RH_KABI_EXTEND(unsigned long			rcu_batches)
 	RH_KABI_EXTEND(int				rcu_pending)
+
+	RH_KABI_EXTEND(unsigned int			group_generation)
 #endif /* CONFIG_PERF_EVENTS */
 };
 
