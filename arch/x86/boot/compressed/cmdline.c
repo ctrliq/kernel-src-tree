@@ -2,7 +2,8 @@
 #include "misc.h"
 
 static unsigned long fs;
-static inline void set_fs(unsigned long seg)
+#define set_fs(seg) _set_fs(seg)
+static inline void _set_fs(unsigned long seg)
 {
 	fs = seg << 4;  /* shift it back */
 }
