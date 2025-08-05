@@ -306,6 +306,10 @@ __visible void do_syscall_64(unsigned long nr, struct pt_regs *regs)
 }
 #endif
 
+#ifdef CONFIG_IA32_EMULATION
+bool __ia32_enabled __ro_after_init = true;
+#endif
+
 #if defined(CONFIG_X86_32) || defined(CONFIG_IA32_EMULATION)
 /*
  * Does a 32-bit syscall.  Called with IRQs on in CONTEXT_KERNEL.  Does
