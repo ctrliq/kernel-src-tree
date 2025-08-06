@@ -9,7 +9,7 @@ NAME = Baby Opossum Posse
 #
 RHEL_DRM_VERSION = 6
 RHEL_DRM_PATCHLEVEL = 15
-RHEL_DRM_SUBLEVEL =
+RHEL_DRM_SUBLEVEL = 5
 
 # *DOCUMENTATION*
 # To see a list of typical targets execute "make help"
