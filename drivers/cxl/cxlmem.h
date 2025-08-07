@@ -417,6 +417,7 @@ struct cxl_dpa_partition {
  * @serial: PCIe Device Serial Number
  * @type: Generic Memory Class device or Vendor Specific Memory device
  * @cxl_mbox: CXL mailbox context
+ * @cxlfs: CXL features context
  */
 struct cxl_dev_state {
 	struct device *dev;
@@ -432,6 +433,9 @@ struct cxl_dev_state {
 	u64 serial;
 	enum cxl_devtype type;
 	struct cxl_mailbox cxl_mbox;
+#ifdef CONFIG_CXL_FEATURES
+	struct cxl_features_state *cxlfs;
+#endif
 };
 
 static inline resource_size_t cxl_pmem_size(struct cxl_dev_state *cxlds)
