@@ -1102,8 +1102,10 @@ int cxl_store_rec_gen_media(struct cxl_memdev *cxlmd, union cxl_event *evt)
 	old_rec = xa_store(&array_rec->rec_gen_media,
 			   le64_to_cpu(rec->media_hdr.phys_addr), rec,
 			   GFP_KERNEL);
-	if (xa_is_err(old_rec))
+	if (xa_is_err(old_rec)) {
+		kfree(rec);
 		return xa_err(old_rec);
+	}
 
 	kfree(old_rec);
 
@@ -1130,8 +1132,10 @@ int cxl_store_rec_dram(struct cxl_memdev *cxlmd, union cxl_event *evt)
 	old_rec = xa_store(&array_rec->rec_dram,
 			   le64_to_cpu(rec->media_hdr.phys_addr), rec,
 			   GFP_KERNEL);
-	if (xa_is_err(old_rec))
+	if (xa_is_err(old_rec)) {
+		kfree(rec);
 		return xa_err(old_rec);
+	}
 
 	kfree(old_rec);
 
