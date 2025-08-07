@@ -59,6 +59,7 @@ struct perf_guest_info_callbacks {
 #include <linux/cgroup.h>
 #include <linux/refcount.h>
 #include <linux/security.h>
+#include <linux/rh_kabi.h>
 #include <asm/local.h>
 
 struct perf_callchain_entry {
@@ -811,6 +812,8 @@ struct perf_event {
 	RH_KABI_BROKEN_INSERT(void *security)
 #endif
 	struct list_head		sb_list;
+
+	RH_KABI_EXTEND(unsigned int	group_generation)
 #endif /* CONFIG_PERF_EVENTS */
 };
 
