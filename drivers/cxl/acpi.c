@@ -423,15 +423,14 @@ static int cxl_parse_cfmws(union acpi_subtable_headers *header, void *arg,
 	rc = cxl_decoder_add(cxld, target_map);
 	if (rc)
 		return rc;
+
+
 	rc = cxl_root_decoder_autoremove(dev, no_free_ptr(cxlrd));
-	if (rc) {
-		dev_err(dev, "Failed to add decode range: %pr", res);
+	if (rc)
 		return rc;
-	}
-	dev_dbg(dev, "add: %s node: %d range [%#llx - %#llx]\n",
-		dev_name(&cxld->dev),
-		phys_to_target_node(cxld->hpa_range.start),
-		cxld->hpa_range.start, cxld->hpa_range.end);
+
+	dev_dbg(root_port->dev.parent, "%s added to %s\n",
+		dev_name(&cxld->dev), dev_name(&root_port->dev));
 
 	return 0;
 }
