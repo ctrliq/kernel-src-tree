@@ -1135,6 +1135,8 @@ int ice_init_hw(struct ice_hw *hw)
 		}
 	}
 
+	hw->lane_num = ice_get_phy_lane_number(hw);
+
 	return 0;
 err_unroll_fltr_mgmt_struct:
 	ice_cleanup_fltr_mgmt_struct(hw);
@@ -2299,12 +2301,12 @@ ice_parse_1588_func_caps(struct ice_hw *hw, struct ice_hw_func_caps *func_p,
 		info->clk_freq = FIELD_GET(ICE_TS_CLK_FREQ_M, number);
 		info->clk_src = ((number & ICE_TS_CLK_SRC_M) != 0);
 	} else {
-		info->clk_freq = ICE_TIME_REF_FREQ_156_250;
-		info->clk_src = ICE_CLK_SRC_TCXO;
+		info->clk_freq = ICE_TSPLL_FREQ_156_250;
+		info->clk_src = ICE_CLK_SRC_TIME_REF;
 	}
 
-	if (info->clk_freq < NUM_ICE_TIME_REF_FREQ) {
-		info->time_ref = (enum ice_time_ref_freq)info->clk_freq;
+	if (info->clk_freq < NUM_ICE_TSPLL_FREQ) {
+		info->time_ref = (enum ice_tspll_freq)info->clk_freq;
 	} else {
 		/* Unknown clock frequency, so assume a (probably incorrect)
 		 * default to avoid out-of-bounds look ups of frequency
@@ -2312,7 +2314,7 @@ ice_parse_1588_func_caps(struct ice_hw *hw, struct ice_hw_func_caps *func_p,
 		 */
 		ice_debug(hw, ICE_DBG_INIT, "1588 func caps: unknown clock frequency %u\n",
 			  info->clk_freq);
-		info->time_ref = ICE_TIME_REF_FREQ_25_000;
+		info->time_ref = ICE_TSPLL_FREQ_25_000;
 	}
 
 	ice_debug(hw, ICE_DBG_INIT, "func caps: ieee_1588 = %u\n",
@@ -3434,7 +3436,7 @@ int ice_aq_get_fec_stats(struct ice_hw *hw, u16 pcs_quad, u16 pcs_port,
 	msg.msg_addr_low = lower_16_bits(reg_offset);
 	msg.msg_addr_high = receiver_id;
 	msg.opcode = ice_sbq_msg_rd;
-	msg.dest_dev = rmn_0;
+	msg.dest_dev = ice_sbq_dev_phy_0;
 
 	err = ice_sbq_rw_reg(hw, &msg, flag);
 	if (err)
@@ -4082,10 +4084,12 @@ int ice_get_phy_lane_number(struct ice_hw *hw)
 			continue;
 
 		if (hw->pf_id == lport) {
+			if (hw->mac_type == ICE_MAC_GENERIC_3K_E825 &&
+			    ice_is_dual(hw) && !ice_is_primary(hw))
+				lane += ICE_PORTS_PER_QUAD;
 			kfree(options);
 			return lane;
 		}
-
 		lport++;
 	}
 
@@ -6095,4 +6099,65 @@ u32 ice_get_link_speed(u16 index)
 		return 0;
 
 	return ice_aq_to_link_speed[index];
+}
+
+/**
+ * ice_read_cgu_reg - Read a CGU register
+ * @hw: Pointer to the HW struct
+ * @addr: Register address to read
+ * @val: Storage for register value read
+ *
+ * Read the contents of a register of the Clock Generation Unit. Only
+ * applicable to E82X devices.
+ *
+ * Return: 0 on success, other error codes when failed to read from CGU.
+ */
+int ice_read_cgu_reg(struct ice_hw *hw, u32 addr, u32 *val)
+{
+	struct ice_sbq_msg_input cgu_msg = {
+		.opcode = ice_sbq_msg_rd,
+		.dest_dev = ice_sbq_dev_cgu,
+		.msg_addr_low = addr
+	};
+	int err;
+
+	err = ice_sbq_rw_reg(hw, &cgu_msg, ICE_AQ_FLAG_RD);
+	if (err) {
+		ice_debug(hw, ICE_DBG_PTP, "Failed to read CGU register 0x%04x, err %d\n",
+			  addr, err);
+		return err;
+	}
+
+	*val = cgu_msg.data;
+
+	return 0;
+}
+
+/**
+ * ice_write_cgu_reg - Write a CGU register
+ * @hw: Pointer to the HW struct
+ * @addr: Register address to write
+ * @val: Value to write into the register
+ *
+ * Write the specified value to a register of the Clock Generation Unit. Only
+ * applicable to E82X devices.
+ *
+ * Return: 0 on success, other error codes when failed to write to CGU.
+ */
+int ice_write_cgu_reg(struct ice_hw *hw, u32 addr, u32 val)
+{
+	struct ice_sbq_msg_input cgu_msg = {
+		.opcode = ice_sbq_msg_wr,
+		.dest_dev = ice_sbq_dev_cgu,
+		.msg_addr_low = addr,
+		.data = val
+	};
+	int err;
+
+	err = ice_sbq_rw_reg(hw, &cgu_msg, ICE_AQ_FLAG_RD);
+	if (err)
+		ice_debug(hw, ICE_DBG_PTP, "Failed to write CGU register 0x%04x, err %d\n",
+			  addr, err);
+
+	return err;
 }

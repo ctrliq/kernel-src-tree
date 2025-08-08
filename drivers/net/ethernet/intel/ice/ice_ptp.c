@@ -4,7 +4,6 @@
 #include "ice.h"
 #include "ice_lib.h"
 #include "ice_trace.h"
-#include "ice_cgu_regs.h"
 
 static const char ice_pin_names[][64] = {
 	"SDP0",
@@ -304,6 +303,9 @@ u64 ice_ptp_read_src_clk_reg(struct ice_pf *pf,
 	struct ice_hw *hw = &pf->hw;
 	u32 hi, lo, lo2;
 	u8 tmr_idx;
+
+	if (!ice_is_primary(hw))
+		hw = ice_get_primary_hw(pf);
 
 	tmr_idx = ice_get_ptp_src_clock_index(hw);
 	guard(spinlock)(&pf->adapter->ptp_gltsyn_time_lock);
@@ -1739,7 +1741,7 @@ static int ice_ptp_write_perout(struct ice_hw *hw, unsigned int chan,
 		int err;
 
 		/* Enable/disable CGU 1PPS output for E825C */
-		err = ice_cgu_cfg_pps_out(hw, !!period);
+		err = ice_tspll_cfg_pps_out_e825c(hw, !!period);
 		if (err)
 			return err;
 	}
@@ -2987,6 +2989,32 @@ static void ice_ptp_periodic_work(struct kthread_work *work)
 }
 
 /**
+ * ice_ptp_prepare_rebuild_sec - Prepare second NAC for PTP reset or rebuild
+ * @pf: Board private structure
+ * @rebuild: rebuild if true, prepare if false
+ * @reset_type: the reset type being performed
+ */
+static void ice_ptp_prepare_rebuild_sec(struct ice_pf *pf, bool rebuild,
+					enum ice_reset_req reset_type)
+{
+	struct list_head *entry;
+
+	list_for_each(entry, &pf->adapter->ports.ports) {
+		struct ice_ptp_port *port = list_entry(entry,
+						       struct ice_ptp_port,
+						       list_node);
+		struct ice_pf *peer_pf = ptp_port_to_pf(port);
+
+		if (!ice_is_primary(&peer_pf->hw)) {
+			if (rebuild)
+				ice_ptp_rebuild(peer_pf, reset_type);
+			else
+				ice_ptp_prepare_for_reset(peer_pf, reset_type);
+		}
+	}
+}
+
+/**
  * ice_ptp_prepare_for_reset - Prepare PTP for reset
  * @pf: Board private structure
  * @reset_type: the reset type being performed
@@ -2994,6 +3022,7 @@ static void ice_ptp_periodic_work(struct kthread_work *work)
 void ice_ptp_prepare_for_reset(struct ice_pf *pf, enum ice_reset_req reset_type)
 {
 	struct ice_ptp *ptp = &pf->ptp;
+	struct ice_hw *hw = &pf->hw;
 	u8 src_tmr;
 
 	if (ptp->state != ICE_PTP_READY)
@@ -3008,6 +3037,9 @@ void ice_ptp_prepare_for_reset(struct ice_pf *pf, enum ice_reset_req reset_type)
 
 	if (reset_type == ICE_RESET_PFR)
 		return;
+
+	if (ice_pf_src_tmr_owned(pf) && hw->mac_type == ICE_MAC_GENERIC_3K_E825)
+		ice_ptp_prepare_rebuild_sec(pf, false, reset_type);
 
 	ice_ptp_release_tx_tracker(pf, &pf->ptp.port.tx);
 
@@ -3039,6 +3071,10 @@ static int ice_ptp_rebuild_owner(struct ice_pf *pf)
 	int err;
 
 	err = ice_ptp_init_phc(hw);
+	if (err)
+		return err;
+
+	err = ice_tspll_init(hw);
 	if (err)
 		return err;
 
@@ -3130,13 +3166,6 @@ err:
 	dev_err(ice_pf_to_dev(pf), "PTP reset failed %d\n", err);
 }
 
-static bool ice_is_primary(struct ice_hw *hw)
-{
-	return hw->mac_type == ICE_MAC_GENERIC_3K_E825 && ice_is_dual(hw) ?
-		       !!(hw->dev_caps.nac_topo.mode & ICE_NAC_TOPO_PRIMARY_M) :
-		       true;
-}
-
 static int ice_ptp_setup_adapter(struct ice_pf *pf)
 {
 	if (!ice_pf_src_tmr_owned(pf) || !ice_is_primary(&pf->hw))
@@ -3212,6 +3241,13 @@ static int ice_ptp_init_owner(struct ice_pf *pf)
 	err = ice_ptp_init_phc(hw);
 	if (err) {
 		dev_err(ice_pf_to_dev(pf), "Failed to initialize PHC, err %d\n",
+			err);
+		return err;
+	}
+
+	err = ice_tspll_init(hw);
+	if (err) {
+		dev_err(ice_pf_to_dev(pf), "Failed to initialize CGU, status %d\n",
 			err);
 		return err;
 	}
@@ -3356,17 +3392,16 @@ void ice_ptp_init(struct ice_pf *pf)
 {
 	struct ice_ptp *ptp = &pf->ptp;
 	struct ice_hw *hw = &pf->hw;
-	int lane_num, err;
+	int err;
 
 	ptp->state = ICE_PTP_INITIALIZING;
 
-	lane_num = ice_get_phy_lane_number(hw);
-	if (lane_num < 0) {
-		err = lane_num;
+	if (hw->lane_num < 0) {
+		err = hw->lane_num;
 		goto err_exit;
 	}
+	ptp->port.port_num = hw->lane_num;
 
-	ptp->port.port_num = (u8)lane_num;
 	ice_ptp_init_hw(hw);
 
 	ice_ptp_init_tx_interrupt_mode(pf);
