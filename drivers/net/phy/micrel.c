@@ -2011,7 +2011,7 @@ static int ksz9477_config_init(struct phy_device *phydev)
 	 * in this switch shall be regarded as broken.
 	 */
 	if (phydev->dev_flags & MICREL_NO_EEE)
-		phydev->eee_broken_modes = -1;
+		linkmode_fill(phydev->eee_broken_modes);
 
 	err = genphy_restart_aneg(phydev);
 	if (err)
