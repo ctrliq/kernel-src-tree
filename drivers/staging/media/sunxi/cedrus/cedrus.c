@@ -269,7 +269,6 @@ static int cedrus_open(struct file *file)
 	}
 
 	v4l2_fh_init(&ctx->fh, video_devdata(file));
-	file->private_data = &ctx->fh;
 	ctx->dev = dev;
 
 	ret = cedrus_init_ctrls(dev, ctx);
@@ -293,7 +292,7 @@ static int cedrus_open(struct file *file)
 	ctx->src_fmt.height = ctx->dst_fmt.height;
 	cedrus_prepare_format(&ctx->src_fmt);
 
-	v4l2_fh_add(&ctx->fh);
+	v4l2_fh_add(&ctx->fh, file);
 
 	mutex_unlock(&dev->dev_mutex);
 

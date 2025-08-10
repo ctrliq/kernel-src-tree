@@ -2362,7 +2362,7 @@ static int vpe_open(struct file *file)
 		goto exit_fh;
 	}
 
-	v4l2_fh_add(&ctx->fh);
+	v4l2_fh_add(&ctx->fh, file);
 
 	/*
 	 * for now, just report the creation of the first instance, we can later
