@@ -1127,7 +1127,7 @@ err_load_vpu:
 error_m2m_ctx:
 	v4l2_ctrl_handler_free(&ctx->ctrl_handler);
 error_ctrls:
-	v4l2_fh_del(&ctx->fh);
+	v4l2_fh_del(&ctx->fh, file);
 	v4l2_fh_exit(&ctx->fh);
 	mutex_unlock(&mdp->lock);
 err_lock:
@@ -1145,7 +1145,7 @@ static int mtk_mdp_m2m_release(struct file *file)
 	mutex_lock(&mdp->lock);
 	v4l2_m2m_ctx_release(ctx->m2m_ctx);
 	v4l2_ctrl_handler_free(&ctx->ctrl_handler);
-	v4l2_fh_del(&ctx->fh);
+	v4l2_fh_del(&ctx->fh, file);
 	v4l2_fh_exit(&ctx->fh);
 	mtk_mdp_vpu_deinit(&ctx->vpu);
 	mdp->ctx_num--;

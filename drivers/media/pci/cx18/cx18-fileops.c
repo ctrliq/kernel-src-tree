@@ -804,7 +804,7 @@ static int cx18_serialized_open(struct cx18_stream *s, struct file *filp)
 			if (atomic_read(&cx->ana_capturing) > 0) {
 				/* switching to radio while capture is
 				   in progress is not polite */
-				v4l2_fh_del(&item->fh);
+				v4l2_fh_del(&item->fh, filp);
 				v4l2_fh_exit(&item->fh);
 				kfree(item);
 				return -EBUSY;

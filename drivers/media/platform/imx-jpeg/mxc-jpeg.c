@@ -1486,7 +1486,7 @@ static int mxc_jpeg_open(struct file *file)
 	return 0;
 
 error:
-	v4l2_fh_del(&ctx->fh);
+	v4l2_fh_del(&ctx->fh, file);
 	v4l2_fh_exit(&ctx->fh);
 	mutex_unlock(&mxc_jpeg->lock);
 free:
@@ -1868,7 +1868,7 @@ static int mxc_jpeg_release(struct file *file)
 		dev_dbg(dev, "Release JPEG encoder instance on slot %d.",
 			ctx->slot);
 	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
-	v4l2_fh_del(&ctx->fh);
+	v4l2_fh_del(&ctx->fh, file);
 	v4l2_fh_exit(&ctx->fh);
 	kfree(ctx);
 	mutex_unlock(&mxc_jpeg->lock);
