@@ -1532,7 +1532,7 @@ int genphy_c45_ethtool_get_eee(struct phy_device *phydev,
 	if (ret < 0)
 		return ret;
 
-	data->eee_active = ret;
+	data->eee_active = phydev->eee_active;
 	linkmode_copy(data->supported, phydev->supported_eee);
 
 	return 0;
