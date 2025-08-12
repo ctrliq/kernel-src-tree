@@ -437,6 +437,8 @@ static int appletb_kbd_probe(struct hid_device *hdev, const struct hid_device_id
 unregister_handler:
 	input_unregister_handler(&kbd->inp_handler);
 close_hw:
+	if (kbd->backlight_dev)
+		put_device(&kbd->backlight_dev->dev);
 	hid_hw_close(hdev);
 stop_hw:
 	hid_hw_stop(hdev);
@@ -451,6 +453,9 @@ static void appletb_kbd_remove(struct hid_device *hdev)
 
 	input_unregister_handler(&kbd->inp_handler);
 	del_timer_sync(&kbd->inactivity_timer);
+
+	if (kbd->backlight_dev)
+		put_device(&kbd->backlight_dev->dev);
 
 	hid_hw_close(hdev);
 	hid_hw_stop(hdev);
