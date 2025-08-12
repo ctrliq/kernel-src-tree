@@ -220,7 +220,7 @@ int can_rx_offload_irq_offload_fifo(struct can_rx_offload *offload)
 EXPORT_SYMBOL_GPL(can_rx_offload_irq_offload_fifo);
 
 int can_rx_offload_queue_timestamp(struct can_rx_offload *offload,
-				struct sk_buff *skb, u32 timestamp)
+				   struct sk_buff *skb, u32 timestamp)
 {
 	struct can_rx_offload_cb *cb;
 
@@ -355,7 +355,7 @@ static int can_rx_offload_init_queue(struct net_device *dev,
 {
 	offload->dev = dev;
 
-	/* Limit queue len to 4x the weight (rounted to next power of two) */
+	/* Limit queue len to 4x the weight (rounded to next power of two) */
 	offload->skb_queue_len_max = 2 << fls(weight);
 	offload->skb_queue_len_max *= 4;
 	skb_queue_head_init(&offload->skb_queue);
