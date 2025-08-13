@@ -2910,9 +2910,19 @@ static inline void skb_reset_inner_headers(struct sk_buff *skb)
 	skb->inner_transport_header = skb->transport_header;
 }
 
+static inline int skb_mac_header_was_set(const struct sk_buff *skb)
+{
+	return skb->mac_header != (typeof(skb->mac_header))~0U;
+}
+
 static inline void skb_reset_mac_len(struct sk_buff *skb)
 {
-	skb->mac_len = skb->network_header - skb->mac_header;
+	if (!skb_mac_header_was_set(skb)) {
+		DEBUG_NET_WARN_ON_ONCE(1);
+		skb->mac_len = 0;
+	} else {
+		skb->mac_len = skb->network_header - skb->mac_header;
+	}
 }
 
 static inline unsigned char *skb_inner_transport_header(const struct sk_buff
@@ -3015,11 +3025,6 @@ static inline void skb_set_network_header(struct sk_buff *skb, const int offset)
 	skb->network_header += offset;
 }
 
-static inline int skb_mac_header_was_set(const struct sk_buff *skb)
-{
-	return skb->mac_header != (typeof(skb->mac_header))~0U;
-}
-
 static inline unsigned char *skb_mac_header(const struct sk_buff *skb)
 {
 	DEBUG_NET_WARN_ON_ONCE(!skb_mac_header_was_set(skb));
@@ -3044,7 +3049,10 @@ static inline void skb_unset_mac_header(struct sk_buff *skb)
 
 static inline void skb_reset_mac_header(struct sk_buff *skb)
 {
-	skb->mac_header = skb->data - skb->head;
+	long offset = skb->data - skb->head;
+
+	DEBUG_NET_WARN_ON_ONCE(offset != (typeof(skb->mac_header))offset);
+	skb->mac_header = offset;
 }
 
 static inline void skb_set_mac_header(struct sk_buff *skb, const int offset)
