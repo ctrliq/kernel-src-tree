@@ -102,7 +102,7 @@ $(obj)/signing_key.pem: $(obj)/x509.genkey
 	@$(kecho) "###"
 
 quiet_cmd_copy_x509_config = COPY    $@
-      cmd_copy_x509_config = cat $(srctree)/$(src)/default_x509.genkey > $@
+      cmd_copy_x509_config = cat $(src)/default_x509.genkey > $@
 
 # You can provide your own config file. If not present, copy the default one.
 $(obj)/x509.genkey:
