@@ -90,7 +90,7 @@ smb2_add_credits(struct TCP_Server_Info *server,
 	if (*val > 65000) {
 		*val = 65000; /* Don't get near 64K credits, avoid srv bugs */
 		pr_warn_once("server overflowed SMB3 credits\n");
-		trace_smb3_overflow_credits(server->CurrentMid,
+		trace_smb3_overflow_credits(server->current_mid,
 					    server->conn_id, server->hostname, *val,
 					    add, server->in_flight);
 	}
@@ -121,7 +121,7 @@ smb2_add_credits(struct TCP_Server_Info *server,
 	wake_up(&server->request_q);
 
 	if (reconnect_detected) {
-		trace_smb3_reconnect_detected(server->CurrentMid,
+		trace_smb3_reconnect_detected(server->current_mid,
 			server->conn_id, server->hostname, scredits, add, in_flight);
 
 		cifs_dbg(FYI, "trying to put %d credits from the old server instance %d\n",
@@ -129,7 +129,7 @@ smb2_add_credits(struct TCP_Server_Info *server,
 	}
 
 	if (reconnect_with_invalid_credits) {
-		trace_smb3_reconnect_with_invalid_credits(server->CurrentMid,
+		trace_smb3_reconnect_with_invalid_credits(server->current_mid,
 			server->conn_id, server->hostname, scredits, add, in_flight);
 		cifs_dbg(FYI, "Negotiate operation when server credits is non-zero. Optype: %d, server credits: %d, credits added: %d\n",
 			 optype, scredits, add);
@@ -161,7 +161,7 @@ smb2_add_credits(struct TCP_Server_Info *server,
 		break;
 	}
 
-	trace_smb3_add_credits(server->CurrentMid,
+	trace_smb3_add_credits(server->current_mid,
 			server->conn_id, server->hostname, scredits, add, in_flight);
 	cifs_dbg(FYI, "%s: added %u credits total=%d\n", __func__, add, scredits);
 }
@@ -188,7 +188,7 @@ smb2_set_credits(struct TCP_Server_Info *server, const int val)
 	in_flight = server->in_flight;
 	spin_unlock(&server->req_lock);
 
-	trace_smb3_set_credits(server->CurrentMid,
+	trace_smb3_set_credits(server->current_mid,
 			server->conn_id, server->hostname, scredits, val, in_flight);
 	cifs_dbg(FYI, "%s: set %u credits\n", __func__, val);
 
@@ -273,7 +273,7 @@ smb2_wait_mtu_credits(struct TCP_Server_Info *server, unsigned int size,
 	in_flight = server->in_flight;
 	spin_unlock(&server->req_lock);
 
-	trace_smb3_wait_credits(server->CurrentMid,
+	trace_smb3_wait_credits(server->current_mid,
 			server->conn_id, server->hostname, scredits, -(credits->value), in_flight);
 	cifs_dbg(FYI, "%s: removed %u credits total=%d\n",
 			__func__, credits->value, scredits);
@@ -293,7 +293,7 @@ smb2_adjust_credits(struct TCP_Server_Info *server,
 		return 0;
 
 	if (credits->value < new_val) {
-		trace_smb3_too_many_credits(server->CurrentMid,
+		trace_smb3_too_many_credits(server->current_mid,
 				server->conn_id, server->hostname, 0, credits->value - new_val, 0);
 		cifs_server_dbg(VFS, "request has less credits (%d) than required (%d)",
 				credits->value, new_val);
@@ -308,7 +308,7 @@ smb2_adjust_credits(struct TCP_Server_Info *server,
 		in_flight = server->in_flight;
 		spin_unlock(&server->req_lock);
 
-		trace_smb3_reconnect_detected(server->CurrentMid,
+		trace_smb3_reconnect_detected(server->current_mid,
 			server->conn_id, server->hostname, scredits,
 			credits->value - new_val, in_flight);
 		cifs_server_dbg(VFS, "trying to return %d credits to old session\n",
@@ -322,7 +322,7 @@ smb2_adjust_credits(struct TCP_Server_Info *server,
 	spin_unlock(&server->req_lock);
 	wake_up(&server->request_q);
 
-	trace_smb3_adj_credits(server->CurrentMid,
+	trace_smb3_adj_credits(server->current_mid,
 			server->conn_id, server->hostname, scredits,
 			credits->value - new_val, in_flight);
 	cifs_dbg(FYI, "%s: adjust added %u credits total=%d\n",
@@ -338,19 +338,19 @@ smb2_get_next_mid(struct TCP_Server_Info *server)
 {
 	__u64 mid;
 	/* for SMB2 we need the current value */
-	spin_lock(&server->mid_queue_lock);
-	mid = server->CurrentMid++;
-	spin_unlock(&server->mid_queue_lock);
+	spin_lock(&server->mid_counter_lock);
+	mid = server->current_mid++;
+	spin_unlock(&server->mid_counter_lock);
 	return mid;
 }
 
 static void
 smb2_revert_current_mid(struct TCP_Server_Info *server, const unsigned int val)
 {
-	spin_lock(&server->mid_queue_lock);
-	if (server->CurrentMid >= val)
-		server->CurrentMid -= val;
-	spin_unlock(&server->mid_queue_lock);
+	spin_lock(&server->mid_counter_lock);
+	if (server->current_mid >= val)
+		server->current_mid -= val;
+	spin_unlock(&server->mid_counter_lock);
 }
 
 static struct mid_q_entry *
@@ -424,9 +424,9 @@ smb2_negotiate(const unsigned int xid,
 {
 	int rc;
 
-	spin_lock(&server->mid_queue_lock);
-	server->CurrentMid = 0;
-	spin_unlock(&server->mid_queue_lock);
+	spin_lock(&server->mid_counter_lock);
+	server->current_mid = 0;
+	spin_unlock(&server->mid_counter_lock);
 	rc = SMB2_negotiate(xid, ses, server);
 	return rc;
 }
@@ -2453,7 +2453,7 @@ smb2_is_status_pending(char *buf, struct TCP_Server_Info *server)
 		spin_unlock(&server->req_lock);
 		wake_up(&server->request_q);
 
-		trace_smb3_pend_credits(server->CurrentMid,
+		trace_smb3_pend_credits(server->current_mid,
 				server->conn_id, server->hostname, scredits,
 				le16_to_cpu(shdr->CreditRequest), in_flight);
 		cifs_dbg(FYI, "%s: status pending add %u credits total=%d\n",
