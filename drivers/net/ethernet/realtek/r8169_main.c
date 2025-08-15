@@ -5209,6 +5209,33 @@ static int r8169_mdio_write_reg(struct mii_bus *mii_bus, int phyaddr,
 	return 0;
 }
 
+static int r8169_mdio_read_reg_c45(struct mii_bus *mii_bus, int addr,
+				   int devnum, int regnum)
+{
+	struct rtl8169_private *tp = mii_bus->priv;
+
+	if (addr > 0)
+		return -ENODEV;
+
+	if (devnum == MDIO_MMD_VEND2 && regnum > MDIO_STAT2)
+		return r8168_phy_ocp_read(tp, regnum);
+
+	return 0;
+}
+
+static int r8169_mdio_write_reg_c45(struct mii_bus *mii_bus, int addr,
+				    int devnum, int regnum, u16 val)
+{
+	struct rtl8169_private *tp = mii_bus->priv;
+
+	if (addr > 0 || devnum != MDIO_MMD_VEND2 || regnum <= MDIO_STAT2)
+		return -ENODEV;
+
+	r8168_phy_ocp_write(tp, regnum, val);
+
+	return 0;
+}
+
 static int r8169_mdio_register(struct rtl8169_private *tp)
 {
 	struct pci_dev *pdev = tp->pci_dev;
@@ -5239,6 +5266,11 @@ static int r8169_mdio_register(struct rtl8169_private *tp)
 	new_bus->read = r8169_mdio_read_reg;
 	new_bus->write = r8169_mdio_write_reg;
 
+	if (tp->mac_version >= RTL_GIGA_MAC_VER_40) {
+		new_bus->read_c45 = r8169_mdio_read_reg_c45;
+		new_bus->write_c45 = r8169_mdio_write_reg_c45;
+	}
+
 	ret = devm_mdiobus_register(&pdev->dev, new_bus);
 	if (ret)
 		return ret;
@@ -5259,6 +5291,12 @@ static int r8169_mdio_register(struct rtl8169_private *tp)
 	if (rtl_supports_eee(tp))
 		phy_support_eee(tp->phydev);
 	phy_support_asym_pause(tp->phydev);
+
+	/* mimic behavior of r8125/r8126 vendor drivers */
+	if (tp->mac_version == RTL_GIGA_MAC_VER_61)
+		phy_disable_eee_mode(tp->phydev,
+				     ETHTOOL_LINK_MODE_2500baseT_Full_BIT);
+	phy_disable_eee_mode(tp->phydev, ETHTOOL_LINK_MODE_5000baseT_Full_BIT);
 
 	/* PHY will be woken up in rtl_open() */
 	phy_suspend(tp->phydev);
