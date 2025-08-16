@@ -1,0 +1,150 @@
+smb: client: Fix netns refcount imbalance causing leaks and use-after-free
+
+jira LE-3845
+Rebuild_History Non-Buildable kernel-4.18.0-553.66.1.el8_10
+commit-author Wang Zhaolong <wangzhaolong1@huawei.com>
+commit 4e7f1644f2ac6d01dc584f6301c3b1d5aac4eaef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.66.1.el8_10/4e7f1644.failed
+
+Commit ef7134c7fc48 ("smb: client: Fix use-after-free of network
+namespace.") attempted to fix a netns use-after-free issue by manually
+adjusting reference counts via sk->sk_net_refcnt and sock_inuse_add().
+
+However, a later commit e9f2517a3e18 ("smb: client: fix TCP timers deadlock
+after rmmod") pointed out that the approach of manually setting
+sk->sk_net_refcnt in the first commit was technically incorrect, as
+sk->sk_net_refcnt should only be set for user sockets. It led to issues
+like TCP timers not being cleared properly on close. The second commit
+moved to a model of just holding an extra netns reference for
+server->ssocket using get_net(), and dropping it when the server is torn
+down.
+
+But there remain some gaps in the get_net()/put_net() balancing added by
+these commits. The incomplete reference handling in these fixes results
+in two issues:
+
+1. Netns refcount leaks[1]
+
+The problem process is as follows:
+
+```
+mount.cifs                        cifsd
+
+cifs_do_mount
+  cifs_mount
+    cifs_mount_get_session
+      cifs_get_tcp_session
+        get_net()  /* First get net. */
+        ip_connect
+          generic_ip_connect /* Try port 445 */
+            get_net()
+            ->connect() /* Failed */
+            put_net()
+          generic_ip_connect /* Try port 139 */
+            get_net() /* Missing matching put_net() for this get_net().*/
+      cifs_get_smb_ses
+        cifs_negotiate_protocol
+          smb2_negotiate
+            SMB2_negotiate
+              cifs_send_recv
+                wait_for_response
+                                 cifs_demultiplex_thread
+                                   cifs_read_from_socket
+                                     cifs_readv_from_socket
+                                       cifs_reconnect
+                                         cifs_abort_connection
+                                           sock_release();
+                                           server->ssocket = NULL;
+                                           /* Missing put_net() here. */
+                                           generic_ip_connect
+                                             get_net()
+                                             ->connect() /* Failed */
+                                             put_net()
+                                             sock_release();
+                                             server->ssocket = NULL;
+          free_rsp_buf
+    ...
+                                   clean_demultiplex_info
+                                     /* It's only called once here. */
+                                     put_net()
+```
+
+When cifs_reconnect() is triggered, the server->ssocket is released
+without a corresponding put_net() for the reference acquired in
+generic_ip_connect() before. it ends up calling generic_ip_connect()
+again to retry get_net(). After that, server->ssocket is set to NULL
+in the error path of generic_ip_connect(), and the net count cannot be
+released in the final clean_demultiplex_info() function.
+
+2. Potential use-after-free
+
+The current refcounting scheme can lead to a potential use-after-free issue
+in the following scenario:
+
+```
+ cifs_do_mount
+   cifs_mount
+     cifs_mount_get_session
+       cifs_get_tcp_session
+         get_net()  /* First get net */
+           ip_connect
+             generic_ip_connect
+               get_net()
+               bind_socket
+	         kernel_bind /* failed */
+               put_net()
+         /* after out_err_crypto_release label */
+         put_net()
+         /* after out_err label */
+         put_net()
+```
+
+In the exception handling process where binding the socket fails, the
+get_net() and put_net() calls are unbalanced, which may cause the
+server->net reference count to drop to zero and be prematurely released.
+
+To address both issues, this patch ties the netns reference counting to
+the server->ssocket and server lifecycles. The extra reference is now
+acquired when the server or socket is created, and released when the
+socket is destroyed or the server is torn down.
+
+[1]: https://bugzilla.kernel.org/show_bug.cgi?id=219792
+
+Fixes: ef7134c7fc48 ("smb: client: Fix use-after-free of network namespace.")
+Fixes: e9f2517a3e18 ("smb: client: fix TCP timers deadlock after rmmod")
+	Signed-off-by: Wang Zhaolong <wangzhaolong1@huawei.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 4e7f1644f2ac6d01dc584f6301c3b1d5aac4eaef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/connect.c
+diff --cc fs/cifs/connect.c
+index bd2ad3b69c7e,2e23a4e04798..000000000000
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@@ -2719,6 -3263,18 +2720,21 @@@ generic_ip_connect(struct TCP_Server_In
+  			return rc;
+  		}
+  
+++<<<<<<< HEAD:fs/cifs/connect.c
+++=======
++ 		/*
++ 		 * Grab netns reference for the socket.
++ 		 *
++ 		 * This reference will be released in several situations:
++ 		 * - In the failure path before the cifsd thread is started.
++ 		 * - In the all place where server->socket is released, it is
++ 		 *   also set to NULL.
++ 		 * - Ultimately in clean_demultiplex_info(), during the final
++ 		 *   teardown.
++ 		 */
++ 		get_net(net);
++ 
+++>>>>>>> 4e7f1644f2ac (smb: client: Fix netns refcount imbalance causing leaks and use-after-free):fs/smb/client/connect.c
+  		/* BB other socket options to set KEEPALIVE, NODELAY? */
+  		cifs_dbg(FYI, "Socket created\n");
+  		socket = server->ssocket;
+* Unmerged path fs/cifs/connect.c
