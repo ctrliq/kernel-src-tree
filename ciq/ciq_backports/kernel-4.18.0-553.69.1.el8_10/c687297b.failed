@@ -1,0 +1,148 @@
+md: also clone new io if io accounting is disabled
+
+jira LE-3845
+Rebuild_History Non-Buildable kernel-4.18.0-553.69.1.el8_10
+commit-author Yu Kuai <yukuai3@huawei.com>
+commit c687297b884507a4737b747957eda567063901df
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.69.1.el8_10/c687297b.failed
+
+Currently, 'active_io' is grabbed before make_reqeust() is called, and
+it's dropped immediately make_reqeust() returns. Hence 'active_io'
+actually means io is dispatching, not io is inflight.
+
+For raid0 and raid456 that io accounting is enabled, 'active_io' will
+also be grabbed when bio is cloned for io accounting, and this 'active_io'
+is dropped until io is done.
+
+Always clone new bio so that 'active_io' will mean that io is inflight,
+raid1 and raid10 will switch to use this method in later patches.
+
+Now that bio will be cloned even if io accounting is disabled, also
+rename related structure from '*_acct_*' to '*_clone_*'.
+
+	Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+	Reviewed-by: Xiao Ni <xni@redhat.com>
+	Signed-off-by: Song Liu <song@kernel.org>
+Link: https://lore.kernel.org/r/20230621165110.1498313-3-yukuai1@huaweicloud.com
+(cherry picked from commit c687297b884507a4737b747957eda567063901df)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/md.c
+#	drivers/md/raid5.c
+diff --cc drivers/md/md.c
+index d05a2ca0fccd,abb616720393..000000000000
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@@ -8782,31 -8667,29 +8784,48 @@@ static void md_end_clone_io(struct bio 
+  	percpu_ref_put(&mddev->active_io);
+  }
+  
+- /*
+-  * Used by personalities that don't already clone the bio and thus can't
+-  * easily add the timestamp to their extended bio structure.
+-  */
+- void md_account_bio(struct mddev *mddev, struct bio **bio)
++ static void md_clone_bio(struct mddev *mddev, struct bio **bio)
+  {
+++<<<<<<< HEAD
+ +	struct md_io_acct *md_io_acct;
+ +	struct bio *clone;
+ +
+ +	if (!blk_queue_io_stat((*bio)->bi_disk->queue))
+ +		return;
+ +
+ +	percpu_ref_get(&mddev->active_io);
+ +
+ +	clone = bio_clone_fast(*bio, GFP_NOIO, &mddev->io_acct_set);
+ +	md_io_acct = container_of(clone, struct md_io_acct, bio_clone);
+ +	md_io_acct->orig_bio = *bio;
+ +	md_io_acct->start_time = bio_start_io_acct(*bio);
+ +	md_io_acct->mddev = mddev;
+ +
+ +	clone->bi_end_io = md_end_io_acct;
+ +	clone->bi_private = md_io_acct;
+++=======
++ 	struct block_device *bdev = (*bio)->bi_bdev;
++ 	struct md_io_clone *md_io_clone;
++ 	struct bio *clone =
++ 		bio_alloc_clone(bdev, *bio, GFP_NOIO, &mddev->io_clone_set);
++ 
++ 	md_io_clone = container_of(clone, struct md_io_clone, bio_clone);
++ 	md_io_clone->orig_bio = *bio;
++ 	md_io_clone->mddev = mddev;
++ 	if (blk_queue_io_stat(bdev->bd_disk->queue))
++ 		md_io_clone->start_time = bio_start_io_acct(*bio);
++ 
++ 	clone->bi_end_io = md_end_clone_io;
++ 	clone->bi_private = md_io_clone;
+++>>>>>>> c687297b8845 (md: also clone new io if io accounting is disabled)
+  	*bio = clone;
+  }
++ 
++ void md_account_bio(struct mddev *mddev, struct bio **bio)
++ {
++ 	percpu_ref_get(&mddev->active_io);
++ 	md_clone_bio(mddev, bio);
++ }
+  EXPORT_SYMBOL_GPL(md_account_bio);
+  
+  /* md_allow_write(mddev)
+diff --cc drivers/md/raid5.c
+index a8595925e153,1da9dd3e2f18..000000000000
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@@ -5597,16 -5543,16 +5597,26 @@@ static int raid5_read_one_chunk(struct 
+  		return 0;
+  	}
+  
+++<<<<<<< HEAD
+ +	align_bio = bio_clone_fast(raid_bio, GFP_NOIO, &mddev->io_acct_set);
+ +	md_io_acct = container_of(align_bio, struct md_io_acct, bio_clone);
+ +	raid_bio->bi_next = (void *)rdev;
+ +	if (blk_queue_io_stat(raid_bio->bi_disk->queue))
+ +		md_io_acct->start_time = bio_start_io_acct(raid_bio);
+ +	md_io_acct->orig_bio = raid_bio;
+++=======
++ 	align_bio = bio_alloc_clone(rdev->bdev, raid_bio, GFP_NOIO,
++ 				    &mddev->io_clone_set);
++ 	md_io_clone = container_of(align_bio, struct md_io_clone, bio_clone);
++ 	raid_bio->bi_next = (void *)rdev;
++ 	if (blk_queue_io_stat(raid_bio->bi_bdev->bd_disk->queue))
++ 		md_io_clone->start_time = bio_start_io_acct(raid_bio);
++ 	md_io_clone->orig_bio = raid_bio;
+++>>>>>>> c687297b8845 (md: also clone new io if io accounting is disabled)
+  
+ +	bio_set_dev(align_bio, rdev->bdev);
+  	align_bio->bi_end_io = raid5_align_endio;
+- 	align_bio->bi_private = md_io_acct;
++ 	align_bio->bi_private = md_io_clone;
+  	align_bio->bi_iter.bi_sector = sector;
+  
+  	/* No reshape active, so we can trust rdev->data_offset */
+* Unmerged path drivers/md/md.c
+diff --git a/drivers/md/md.h b/drivers/md/md.h
+index 40ddb28bd403..74d04e059f43 100644
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@ -517,7 +517,7 @@ struct mddev {
+ 	struct bio_set			sync_set; /* for sync operations like
+ 						   * metadata and bitmap writes
+ 						   */
+-	struct bio_set			io_acct_set; /* for raid0 and raid5 io accounting */
++	struct bio_set			io_clone_set;
+ 
+ 	/* Generic flush handling.
+ 	 * The last to finish preflush schedules a worker to submit
+@@ -740,7 +740,7 @@ struct md_thread {
+ 	void			*private;
+ };
+ 
+-struct md_io_acct {
++struct md_io_clone {
+ 	struct mddev	*mddev;
+ 	struct bio	*orig_bio;
+ 	unsigned long	start_time;
+* Unmerged path drivers/md/raid5.c
