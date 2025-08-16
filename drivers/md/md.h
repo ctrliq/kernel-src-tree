@@ -517,7 +517,7 @@ struct mddev {
 	struct bio_set			sync_set; /* for sync operations like
 						   * metadata and bitmap writes
 						   */
-	struct bio_set			io_acct_set; /* for raid0 and raid5 io accounting */
+	struct bio_set			io_clone_set;
 
 	/* Generic flush handling.
 	 * The last to finish preflush schedules a worker to submit
@@ -743,10 +743,12 @@ struct md_thread {
 	void			*private;
 };
 
-struct md_io_acct {
+struct md_io_clone {
 	struct mddev	*mddev;
 	struct bio	*orig_bio;
 	unsigned long	start_time;
+	sector_t	offset;
+	unsigned long	sectors;
 	struct bio	bio_clone;
 };
 
