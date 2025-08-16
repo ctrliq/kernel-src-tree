@@ -1,0 +1,100 @@
+md/raid5: recheck if reshape has finished with device_lock held
+
+jira LE-3845
+Rebuild_History Non-Buildable kernel-4.18.0-553.69.1.el8_10
+commit-author Benjamin Marzinski <bmarzins@redhat.com>
+commit 25b3a8237a03ec0b67b965b52d74862e77ef7115
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.69.1.el8_10/25b3a823.failed
+
+When handling an IO request, MD checks if a reshape is currently
+happening, and if so, where the IO sector is in relation to the reshape
+progress. MD uses conf->reshape_progress for both of these tasks.  When
+the reshape finishes, conf->reshape_progress is set to MaxSector.  If
+this occurs after MD checks if the reshape is currently happening but
+before it calls ahead_of_reshape(), then ahead_of_reshape() will end up
+comparing the IO sector against MaxSector. During a backwards reshape,
+this will make MD think the IO sector is in the area not yet reshaped,
+causing it to use the previous configuration, and map the IO to the
+sector where that data was before the reshape.
+
+This bug can be triggered by running the lvm2
+lvconvert-raid-reshape-linear_to_raid6-single-type.sh test in a loop,
+although it's very hard to reproduce.
+
+Fix this by factoring the code that checks where the IO sector is in
+relation to the reshape out to a helper called get_reshape_loc(),
+which reads reshape_progress and reshape_safe while holding the
+device_lock, and then rechecks if the reshape has finished before
+calling ahead_of_reshape with the saved values.
+
+Also use the helper during the REQ_NOWAIT check to see if the location
+is inside of the reshape region.
+
+Fixes: fef9c61fdfabf ("md/raid5: change reshape-progress measurement to cope with reshaping backwards.")
+	Signed-off-by: Benjamin Marzinski <bmarzins@redhat.com>
+	Signed-off-by: Song Liu <song@kernel.org>
+Link: https://lore.kernel.org/r/20240702151802.1632010-1-bmarzins@redhat.com
+(cherry picked from commit 25b3a8237a03ec0b67b965b52d74862e77ef7115)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid5.c
+diff --cc drivers/md/raid5.c
+index a8595925e153,c14cf2410365..000000000000
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@@ -6020,17 -5899,37 +6020,51 @@@ out
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static bool reshape_inprogress(struct mddev *mddev)
+ +{
+ +	return test_bit(MD_RECOVERY_RESHAPE, &mddev->recovery) &&
+ +	       test_bit(MD_RECOVERY_RUNNING, &mddev->recovery) &&
+ +	       !test_bit(MD_RECOVERY_DONE, &mddev->recovery) &&
+ +	       !test_bit(MD_RECOVERY_INTR, &mddev->recovery);
+ +}
+ +
+ +static bool reshape_disabled(struct mddev *mddev)
+ +{
+ +	return is_md_suspended(mddev) || !md_is_rdwr(mddev);
+++=======
++ enum reshape_loc {
++ 	LOC_NO_RESHAPE,
++ 	LOC_AHEAD_OF_RESHAPE,
++ 	LOC_INSIDE_RESHAPE,
++ 	LOC_BEHIND_RESHAPE,
++ };
++ 
++ static enum reshape_loc get_reshape_loc(struct mddev *mddev,
++ 		struct r5conf *conf, sector_t logical_sector)
++ {
++ 	sector_t reshape_progress, reshape_safe;
++ 	/*
++ 	 * Spinlock is needed as reshape_progress may be
++ 	 * 64bit on a 32bit platform, and so it might be
++ 	 * possible to see a half-updated value
++ 	 * Of course reshape_progress could change after
++ 	 * the lock is dropped, so once we get a reference
++ 	 * to the stripe that we think it is, we will have
++ 	 * to check again.
++ 	 */
++ 	spin_lock_irq(&conf->device_lock);
++ 	reshape_progress = conf->reshape_progress;
++ 	reshape_safe = conf->reshape_safe;
++ 	spin_unlock_irq(&conf->device_lock);
++ 	if (reshape_progress == MaxSector)
++ 		return LOC_NO_RESHAPE;
++ 	if (ahead_of_reshape(mddev, logical_sector, reshape_progress))
++ 		return LOC_AHEAD_OF_RESHAPE;
++ 	if (ahead_of_reshape(mddev, logical_sector, reshape_safe))
++ 		return LOC_INSIDE_RESHAPE;
++ 	return LOC_BEHIND_RESHAPE;
+++>>>>>>> 25b3a8237a03 (md/raid5: recheck if reshape has finished with device_lock held)
+  }
+  
+  static enum stripe_result make_stripe_request(struct mddev *mddev,
+* Unmerged path drivers/md/raid5.c
