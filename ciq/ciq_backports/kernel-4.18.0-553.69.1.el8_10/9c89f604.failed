@@ -1,0 +1,185 @@
+md/raid5: implement pers->bitmap_sector()
+
+jira LE-3845
+Rebuild_History Non-Buildable kernel-4.18.0-553.69.1.el8_10
+commit-author Yu Kuai <yukuai3@huawei.com>
+commit 9c89f604476cf15c31fbbdb043cff7fbf1dbe0cb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.69.1.el8_10/9c89f604.failed
+
+Bitmap is used for the whole array for raid1/raid10, hence IO for the
+array can be used directly for bitmap. However, bitmap is used for
+underlying disks for raid5, hence IO for the array can't be used
+directly for bitmap.
+
+Implement pers->bitmap_sector() for raid5 to convert IO ranges from the
+array to the underlying disks.
+
+	Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Link: https://lore.kernel.org/r/20250109015145.158868-5-yukuai1@huaweicloud.com
+	Signed-off-by: Song Liu <song@kernel.org>
+(cherry picked from commit 9c89f604476cf15c31fbbdb043cff7fbf1dbe0cb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid5.c
+diff --cc drivers/md/raid5.c
+index a8595925e153,a08f49b47b7e..000000000000
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@@ -6015,24 -5881,91 +6015,72 @@@ static int add_all_stripe_bios(struct r
+  			  RAID5_STRIPE_SHIFT(conf), ctx->sectors_to_do);
+  	}
+  
+ +out:
+  	spin_unlock_irq(&sh->stripe_lock);
+ -	return 1;
+ +	return ret;
+  }
+  
+ -enum reshape_loc {
+ -	LOC_NO_RESHAPE,
+ -	LOC_AHEAD_OF_RESHAPE,
+ -	LOC_INSIDE_RESHAPE,
+ -	LOC_BEHIND_RESHAPE,
+ -};
+ +static bool reshape_inprogress(struct mddev *mddev)
+ +{
+ +	return test_bit(MD_RECOVERY_RESHAPE, &mddev->recovery) &&
+ +	       test_bit(MD_RECOVERY_RUNNING, &mddev->recovery) &&
+ +	       !test_bit(MD_RECOVERY_DONE, &mddev->recovery) &&
+ +	       !test_bit(MD_RECOVERY_INTR, &mddev->recovery);
+ +}
+  
+ -static enum reshape_loc get_reshape_loc(struct mddev *mddev,
+ -		struct r5conf *conf, sector_t logical_sector)
+ +static bool reshape_disabled(struct mddev *mddev)
+  {
+ -	sector_t reshape_progress, reshape_safe;
+ -	/*
+ -	 * Spinlock is needed as reshape_progress may be
+ -	 * 64bit on a 32bit platform, and so it might be
+ -	 * possible to see a half-updated value
+ -	 * Of course reshape_progress could change after
+ -	 * the lock is dropped, so once we get a reference
+ -	 * to the stripe that we think it is, we will have
+ -	 * to check again.
+ -	 */
+ -	spin_lock_irq(&conf->device_lock);
+ -	reshape_progress = conf->reshape_progress;
+ -	reshape_safe = conf->reshape_safe;
+ -	spin_unlock_irq(&conf->device_lock);
+ -	if (reshape_progress == MaxSector)
+ -		return LOC_NO_RESHAPE;
+ -	if (ahead_of_reshape(mddev, logical_sector, reshape_progress))
+ -		return LOC_AHEAD_OF_RESHAPE;
+ -	if (ahead_of_reshape(mddev, logical_sector, reshape_safe))
+ -		return LOC_INSIDE_RESHAPE;
+ -	return LOC_BEHIND_RESHAPE;
+ +	return is_md_suspended(mddev) || !md_is_rdwr(mddev);
+  }
+  
++ static void raid5_bitmap_sector(struct mddev *mddev, sector_t *offset,
++ 				unsigned long *sectors)
++ {
++ 	struct r5conf *conf = mddev->private;
++ 	sector_t start = *offset;
++ 	sector_t end = start + *sectors;
++ 	sector_t prev_start = start;
++ 	sector_t prev_end = end;
++ 	int sectors_per_chunk;
++ 	enum reshape_loc loc;
++ 	int dd_idx;
++ 
++ 	sectors_per_chunk = conf->chunk_sectors *
++ 		(conf->raid_disks - conf->max_degraded);
++ 	start = round_down(start, sectors_per_chunk);
++ 	end = round_up(end, sectors_per_chunk);
++ 
++ 	start = raid5_compute_sector(conf, start, 0, &dd_idx, NULL);
++ 	end = raid5_compute_sector(conf, end, 0, &dd_idx, NULL);
++ 
++ 	/*
++ 	 * For LOC_INSIDE_RESHAPE, this IO will wait for reshape to make
++ 	 * progress, hence it's the same as LOC_BEHIND_RESHAPE.
++ 	 */
++ 	loc = get_reshape_loc(mddev, conf, prev_start);
++ 	if (likely(loc != LOC_AHEAD_OF_RESHAPE)) {
++ 		*offset = start;
++ 		*sectors = end - start;
++ 		return;
++ 	}
++ 
++ 	sectors_per_chunk = conf->prev_chunk_sectors *
++ 		(conf->previous_raid_disks - conf->max_degraded);
++ 	prev_start = round_down(prev_start, sectors_per_chunk);
++ 	prev_end = round_down(prev_end, sectors_per_chunk);
++ 
++ 	prev_start = raid5_compute_sector(conf, prev_start, 1, &dd_idx, NULL);
++ 	prev_end = raid5_compute_sector(conf, prev_end, 1, &dd_idx, NULL);
++ 
++ 	/*
++ 	 * for LOC_AHEAD_OF_RESHAPE, reshape can make progress before this IO
++ 	 * is handled in make_stripe_request(), we can't know this here hence
++ 	 * we set bits for both.
++ 	 */
++ 	*offset = min(start, prev_start);
++ 	*sectors = max(end, prev_end) - *offset;
++ }
++ 
+  static enum stripe_result make_stripe_request(struct mddev *mddev,
+  		struct r5conf *conf, struct stripe_request_ctx *ctx,
+  		sector_t logical_sector, struct bio *bi)
+@@@ -9153,11 -9010,11 +9201,16 @@@ static struct md_personality raid6_pers
+  	.check_reshape	= raid6_check_reshape,
+  	.start_reshape  = raid5_start_reshape,
+  	.finish_reshape = raid5_finish_reshape,
+ +	.prepare_suspend = raid5_prepare_suspend,
+  	.quiesce	= raid5_quiesce,
+  	.takeover	= raid6_takeover,
+ +	.congested	= raid5_congested,
+  	.change_consistency_policy = raid5_change_consistency_policy,
+++<<<<<<< HEAD
+++=======
++ 	.prepare_suspend = raid5_prepare_suspend,
++ 	.bitmap_sector	= raid5_bitmap_sector,
+++>>>>>>> 9c89f604476c (md/raid5: implement pers->bitmap_sector())
+  };
+  static struct md_personality raid5_personality =
+  {
+@@@ -9179,11 -9036,11 +9232,16 @@@
+  	.check_reshape	= raid5_check_reshape,
+  	.start_reshape  = raid5_start_reshape,
+  	.finish_reshape = raid5_finish_reshape,
+ +	.prepare_suspend = raid5_prepare_suspend,
+  	.quiesce	= raid5_quiesce,
+  	.takeover	= raid5_takeover,
+ +	.congested	= raid5_congested,
+  	.change_consistency_policy = raid5_change_consistency_policy,
+++<<<<<<< HEAD
+++=======
++ 	.prepare_suspend = raid5_prepare_suspend,
++ 	.bitmap_sector	= raid5_bitmap_sector,
+++>>>>>>> 9c89f604476c (md/raid5: implement pers->bitmap_sector())
+  };
+  
+  static struct md_personality raid4_personality =
+@@@ -9206,11 -9063,11 +9264,16 @@@
+  	.check_reshape	= raid5_check_reshape,
+  	.start_reshape  = raid5_start_reshape,
+  	.finish_reshape = raid5_finish_reshape,
+ +	.prepare_suspend = raid5_prepare_suspend,
+  	.quiesce	= raid5_quiesce,
+  	.takeover	= raid4_takeover,
+ +	.congested	= raid5_congested,
+  	.change_consistency_policy = raid5_change_consistency_policy,
+++<<<<<<< HEAD
+++=======
++ 	.prepare_suspend = raid5_prepare_suspend,
++ 	.bitmap_sector	= raid5_bitmap_sector,
+++>>>>>>> 9c89f604476c (md/raid5: implement pers->bitmap_sector())
+  };
+  
+  static int __init raid5_init(void)
+* Unmerged path drivers/md/raid5.c
