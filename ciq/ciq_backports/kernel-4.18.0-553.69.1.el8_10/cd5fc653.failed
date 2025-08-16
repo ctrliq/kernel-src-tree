@@ -1,0 +1,461 @@
+md/md-bitmap: move bitmap_{start, end}write to md upper layer
+
+jira LE-3845
+Rebuild_History Non-Buildable kernel-4.18.0-553.69.1.el8_10
+commit-author Yu Kuai <yukuai3@huawei.com>
+commit cd5fc653381811f1e0ba65f5d169918cab61476f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.69.1.el8_10/cd5fc653.failed
+
+There are two BUG reports that raid5 will hang at
+bitmap_startwrite([1],[2]), root cause is that bitmap start write and end
+write is unbalanced, it's not quite clear where, and while reviewing raid5
+code, it's found that bitmap operations can be optimized. For example,
+for a 4 disks raid5, with chunksize=8k, if user issue a IO (0 + 48k) to
+the array:
+
+┌────────────────────────────────────────────────────────────┐
+│chunk 0                                                     │
+│      ┌────────────┬─────────────┬─────────────┬────────────┼
+│  sh0 │A0: 0 + 4k  │A1: 8k + 4k  │A2: 16k + 4k │A3: P       │
+│      ┼────────────┼─────────────┼─────────────┼────────────┼
+│  sh1 │B0: 4k + 4k │B1: 12k + 4k │B2: 20k + 4k │B3: P       │
+┼──────┴────────────┴─────────────┴─────────────┴────────────┼
+│chunk 1                                                     │
+│      ┌────────────┬─────────────┬─────────────┬────────────┤
+│  sh2 │C0: 24k + 4k│C1: 32k + 4k │C2: P        │C3: 40k + 4k│
+│      ┼────────────┼─────────────┼─────────────┼────────────┼
+│  sh3 │D0: 28k + 4k│D1: 36k + 4k │D2: P        │D3: 44k + 4k│
+└──────┴────────────┴─────────────┴─────────────┴────────────┘
+
+Before this patch, 4 stripe head will be used, and each sh will attach
+bio for 3 disks, and each attached bio will trigger
+bitmap_startwrite() once, which means total 12 times.
+ - 3 times (0 + 4k), for (A0, A1 and A2)
+ - 3 times (4 + 4k), for (B0, B1 and B2)
+ - 3 times (8 + 4k), for (C0, C1 and C3)
+ - 3 times (12 + 4k), for (D0, D1 and D3)
+
+After this patch, md upper layer will calculate that IO range (0 + 48k)
+is corresponding to the bitmap (0 + 16k), and call bitmap_startwrite()
+just once.
+
+Noted that this patch will align bitmap ranges to the chunks, for example,
+if user issue a IO (0 + 4k) to array:
+
+- Before this patch, 1 time (0 + 4k), for A0;
+- After this patch, 1 time (0 + 8k) for chunk 0;
+
+Usually, one bitmap bit will represent more than one disk chunk, and this
+doesn't have any difference. And even if user really created a array
+that one chunk contain multiple bits, the overhead is that more data
+will be recovered after power failure.
+
+Also remove STRIPE_BITMAP_PENDING since it's not used anymore.
+
+[1] https://lore.kernel.org/all/CAJpMwyjmHQLvm6zg1cmQErttNNQPDAAXPKM3xgTjMhbfts986Q@mail.gmail.com/
+[2] https://lore.kernel.org/all/ADF7D720-5764-4AF3-B68E-1845988737AA@flyingcircus.io/
+
+	Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Link: https://lore.kernel.org/r/20250109015145.158868-6-yukuai1@huaweicloud.com
+	Signed-off-by: Song Liu <song@kernel.org>
+(cherry picked from commit cd5fc653381811f1e0ba65f5d169918cab61476f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/md.c
+#	drivers/md/raid1.c
+#	drivers/md/raid10.c
+#	drivers/md/raid5-cache.c
+#	drivers/md/raid5.c
+diff --cc drivers/md/md.c
+index d05a2ca0fccd,866015b681af..000000000000
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@@ -8768,47 -8745,94 +8768,129 @@@ void md_submit_discard_bio(struct mdde
+  }
+  EXPORT_SYMBOL_GPL(md_submit_discard_bio);
+  
+++<<<<<<< HEAD
+ +static void md_end_io_acct(struct bio *bio)
+++=======
++ static void md_bitmap_start(struct mddev *mddev,
++ 			    struct md_io_clone *md_io_clone)
++ {
++ 	if (mddev->pers->bitmap_sector)
++ 		mddev->pers->bitmap_sector(mddev, &md_io_clone->offset,
++ 					   &md_io_clone->sectors);
++ 
++ 	mddev->bitmap_ops->startwrite(mddev, md_io_clone->offset,
++ 				      md_io_clone->sectors);
++ }
++ 
++ static void md_bitmap_end(struct mddev *mddev, struct md_io_clone *md_io_clone)
++ {
++ 	mddev->bitmap_ops->endwrite(mddev, md_io_clone->offset,
++ 				    md_io_clone->sectors);
++ }
++ 
++ static void md_end_clone_io(struct bio *bio)
+++>>>>>>> cd5fc6533818 (md/md-bitmap: move bitmap_{start, end}write to md upper layer)
+  {
+ -	struct md_io_clone *md_io_clone = bio->bi_private;
+ -	struct bio *orig_bio = md_io_clone->orig_bio;
+ -	struct mddev *mddev = md_io_clone->mddev;
+ +	struct md_io_acct *md_io_acct = bio->bi_private;
+ +	struct bio *orig_bio = md_io_acct->orig_bio;
+ +	struct mddev *mddev = md_io_acct->mddev;
+  
+++<<<<<<< HEAD
+ +	orig_bio->bi_status = bio->bi_status;
+++=======
++ 	if (bio_data_dir(orig_bio) == WRITE && mddev->bitmap)
++ 		md_bitmap_end(mddev, md_io_clone);
++ 
++ 	if (bio->bi_status && !orig_bio->bi_status)
++ 		orig_bio->bi_status = bio->bi_status;
++ 
++ 	if (md_io_clone->start_time)
++ 		bio_end_io_acct(orig_bio, md_io_clone->start_time);
+++>>>>>>> cd5fc6533818 (md/md-bitmap: move bitmap_{start, end}write to md upper layer)
+  
+ +	bio_end_io_acct(orig_bio, md_io_acct->start_time);
+  	bio_put(bio);
+  	bio_endio(orig_bio);
+ +
+  	percpu_ref_put(&mddev->active_io);
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Used by personalities that don't already clone the bio and thus can't
+ + * easily add the timestamp to their extended bio structure.
+ + */
+++=======
++ static void md_clone_bio(struct mddev *mddev, struct bio **bio)
++ {
++ 	struct block_device *bdev = (*bio)->bi_bdev;
++ 	struct md_io_clone *md_io_clone;
++ 	struct bio *clone =
++ 		bio_alloc_clone(bdev, *bio, GFP_NOIO, &mddev->io_clone_set);
++ 
++ 	md_io_clone = container_of(clone, struct md_io_clone, bio_clone);
++ 	md_io_clone->orig_bio = *bio;
++ 	md_io_clone->mddev = mddev;
++ 	if (blk_queue_io_stat(bdev->bd_disk->queue))
++ 		md_io_clone->start_time = bio_start_io_acct(*bio);
++ 
++ 	if (bio_data_dir(*bio) == WRITE && mddev->bitmap) {
++ 		md_io_clone->offset = (*bio)->bi_iter.bi_sector;
++ 		md_io_clone->sectors = bio_sectors(*bio);
++ 		md_bitmap_start(mddev, md_io_clone);
++ 	}
++ 
++ 	clone->bi_end_io = md_end_clone_io;
++ 	clone->bi_private = md_io_clone;
++ 	*bio = clone;
++ }
++ 
+++>>>>>>> cd5fc6533818 (md/md-bitmap: move bitmap_{start, end}write to md upper layer)
+  void md_account_bio(struct mddev *mddev, struct bio **bio)
+  {
+ +	struct md_io_acct *md_io_acct;
+ +	struct bio *clone;
+ +
+ +	if (!blk_queue_io_stat((*bio)->bi_disk->queue))
+ +		return;
+ +
+  	percpu_ref_get(&mddev->active_io);
+ -	md_clone_bio(mddev, bio);
+ +
+ +	clone = bio_clone_fast(*bio, GFP_NOIO, &mddev->io_acct_set);
+ +	md_io_acct = container_of(clone, struct md_io_acct, bio_clone);
+ +	md_io_acct->orig_bio = *bio;
+ +	md_io_acct->start_time = bio_start_io_acct(*bio);
+ +	md_io_acct->mddev = mddev;
+ +
+ +	clone->bi_end_io = md_end_io_acct;
+ +	clone->bi_private = md_io_acct;
+ +	*bio = clone;
+  }
+  EXPORT_SYMBOL_GPL(md_account_bio);
+  
+++<<<<<<< HEAD
+++=======
++ void md_free_cloned_bio(struct bio *bio)
++ {
++ 	struct md_io_clone *md_io_clone = bio->bi_private;
++ 	struct bio *orig_bio = md_io_clone->orig_bio;
++ 	struct mddev *mddev = md_io_clone->mddev;
++ 
++ 	if (bio_data_dir(orig_bio) == WRITE && mddev->bitmap)
++ 		md_bitmap_end(mddev, md_io_clone);
++ 
++ 	if (bio->bi_status && !orig_bio->bi_status)
++ 		orig_bio->bi_status = bio->bi_status;
++ 
++ 	if (md_io_clone->start_time)
++ 		bio_end_io_acct(orig_bio, md_io_clone->start_time);
++ 
++ 	bio_put(bio);
++ 	percpu_ref_put(&mddev->active_io);
++ }
++ EXPORT_SYMBOL_GPL(md_free_cloned_bio);
++ 
+++>>>>>>> cd5fc6533818 (md/md-bitmap: move bitmap_{start, end}write to md upper layer)
+  /* md_allow_write(mddev)
+   * Calling this ensures that the array is marked 'active' so that writes
+   * may proceed without blocking.  It is important to call this before
+diff --cc drivers/md/raid1.c
+index be9f5fe29baa,a5cd6522fc2d..000000000000
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@@ -426,12 -419,10 +426,19 @@@ static void close_write(struct r1bio *r
+  		bio_put(r1_bio->behind_master_bio);
+  		r1_bio->behind_master_bio = NULL;
+  	}
+++<<<<<<< HEAD
+ +	/* clear the bitmap if all writes complete successfully */
+ +	md_bitmap_endwrite(r1_bio->mddev->bitmap, r1_bio->sector,
+ +			   r1_bio->sectors,
+ +			   !test_bit(R1BIO_Degraded, &r1_bio->state),
+ +			   test_bit(R1BIO_BehindIO, &r1_bio->state));
+ +	md_write_end(r1_bio->mddev);
+++=======
++ 
++ 	if (test_bit(R1BIO_BehindIO, &r1_bio->state))
++ 		mddev->bitmap_ops->end_behind_write(mddev);
++ 	md_write_end(mddev);
+++>>>>>>> cd5fc6533818 (md/md-bitmap: move bitmap_{start, end}write to md upper layer)
+  }
+  
+  static void r1_bio_write_done(struct r1bio *r1_bio)
+@@@ -1563,15 -1623,13 +1570,20 @@@ static void raid1_write_request(struct 
+  			 * Not if there are too many, or cannot
+  			 * allocate memory, or a reader on WriteMostly
+  			 * is waiting for behind writes to flush */
+ -			err = mddev->bitmap_ops->get_stats(mddev->bitmap, &stats);
+ -			if (!err && write_behind && !stats.behind_wait &&
+ -			    stats.behind_writes < max_write_behind)
+ +			if (bitmap && write_behind &&
+ +			    (atomic_read(&bitmap->behind_writes)
+ +			     < mddev->bitmap_info.max_write_behind) &&
+ +			    !waitqueue_active(&bitmap->behind_wait)) {
+  				alloc_behind_master_bio(r1_bio, bio);
+ +			}
+  
+++<<<<<<< HEAD
+ +			md_bitmap_startwrite(bitmap, r1_bio->sector, r1_bio->sectors,
+ +					     test_bit(R1BIO_BehindIO, &r1_bio->state));
+++=======
++ 			if (test_bit(R1BIO_BehindIO, &r1_bio->state))
++ 				mddev->bitmap_ops->start_behind_write(mddev);
+++>>>>>>> cd5fc6533818 (md/md-bitmap: move bitmap_{start, end}write to md upper layer)
+  			first_clone = 0;
+  		}
+  
+diff --cc drivers/md/raid10.c
+index b1a170bf1f6a,e1e6cd7fb125..000000000000
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@@ -432,12 -426,9 +432,18 @@@ static void raid10_end_read_request(str
+  
+  static void close_write(struct r10bio *r10_bio)
+  {
+++<<<<<<< HEAD
+ +	/* clear the bitmap if all writes complete successfully */
+ +	md_bitmap_endwrite(r10_bio->mddev->bitmap, r10_bio->sector,
+ +			   r10_bio->sectors,
+ +			   !test_bit(R10BIO_Degraded, &r10_bio->state),
+ +			   0);
+ +	md_write_end(r10_bio->mddev);
+++=======
++ 	struct mddev *mddev = r10_bio->mddev;
++ 
++ 	md_write_end(mddev);
+++>>>>>>> cd5fc6533818 (md/md-bitmap: move bitmap_{start, end}write to md upper layer)
+  }
+  
+  static void one_write_done(struct r10bio *r10_bio)
+@@@ -1587,10 -1501,9 +1593,13 @@@ static void raid10_write_request(struc
+  		r10_bio->master_bio = bio;
+  	}
+  
+ -	md_account_bio(mddev, &bio);
+ -	r10_bio->master_bio = bio;
+ +	if (blk_queue_io_stat(bio->bi_disk->queue))
+ +		r10_bio->start_time = bio_start_io_acct(bio);
+  	atomic_set(&r10_bio->remaining, 1);
+++<<<<<<< HEAD
+ +	md_bitmap_startwrite(mddev->bitmap, r10_bio->sector, r10_bio->sectors, 0);
+++=======
+++>>>>>>> cd5fc6533818 (md/md-bitmap: move bitmap_{start, end}write to md upper layer)
+  
+  	for (i = 0; i < conf->copies; i++) {
+  		if (r10_bio->devs[i].bio)
+diff --cc drivers/md/raid5-cache.c
+index b96cdbb7b148,e530271cb86b..000000000000
+--- a/drivers/md/raid5-cache.c
++++ b/drivers/md/raid5-cache.c
+@@@ -322,10 -313,6 +322,13 @@@ void r5c_handle_cached_data_endio(struc
+  		if (sh->dev[i].written) {
+  			set_bit(R5_UPTODATE, &sh->dev[i].flags);
+  			r5c_return_dev_pending_writes(conf, &sh->dev[i]);
+++<<<<<<< HEAD
+ +			md_bitmap_endwrite(conf->mddev->bitmap, sh->sector,
+ +					   RAID5_STRIPE_SECTORS(conf),
+ +					   !test_bit(STRIPE_DEGRADED, &sh->state),
+ +					   0);
+++=======
+++>>>>>>> cd5fc6533818 (md/md-bitmap: move bitmap_{start, end}write to md upper layer)
+  		}
+  	}
+  }
+diff --cc drivers/md/raid5.c
+index a8595925e153,5c79429acc64..000000000000
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@@ -3616,29 -3544,9 +3615,35 @@@ static void __add_stripe_bio(struct str
+  		 (*bip)->bi_iter.bi_sector, sh->sector, dd_idx,
+  		 sh->dev[dd_idx].sector);
+  
+++<<<<<<< HEAD
+ +	if (conf->mddev->bitmap && firstwrite) {
+ +		/* Cannot hold spinlock over bitmap_startwrite,
+ +		 * but must ensure this isn't added to a batch until
+ +		 * we have added to the bitmap and set bm_seq.
+ +		 * So set STRIPE_BITMAP_PENDING to prevent
+ +		 * batching.
+ +		 * If multiple __add_stripe_bio() calls race here they
+ +		 * much all set STRIPE_BITMAP_PENDING.  So only the first one
+ +		 * to complete "bitmap_startwrite" gets to set
+ +		 * STRIPE_BIT_DELAY.  This is important as once a stripe
+ +		 * is added to a batch, STRIPE_BIT_DELAY cannot be changed
+ +		 * any more.
+ +		 */
+ +		set_bit(STRIPE_BITMAP_PENDING, &sh->state);
+ +		spin_unlock_irq(&sh->stripe_lock);
+ +		md_bitmap_startwrite(conf->mddev->bitmap, sh->sector,
+ +				     RAID5_STRIPE_SECTORS(conf), 0);
+ +		spin_lock_irq(&sh->stripe_lock);
+ +		clear_bit(STRIPE_BITMAP_PENDING, &sh->state);
+ +		if (!sh->batch_head) {
+ +			sh->bm_seq = conf->seq_flush+1;
+ +			set_bit(STRIPE_BIT_DELAY, &sh->state);
+ +		}
+++=======
++ 	if (conf->mddev->bitmap && firstwrite && !sh->batch_head) {
++ 		sh->bm_seq = conf->seq_flush+1;
++ 		set_bit(STRIPE_BIT_DELAY, &sh->state);
+++>>>>>>> cd5fc6533818 (md/md-bitmap: move bitmap_{start, end}write to md upper layer)
+  	}
+  }
+  
+@@@ -3689,12 -3597,10 +3694,11 @@@ handle_failed_stripe(struct r5conf *con
+  	BUG_ON(sh->batch_head);
+  	for (i = disks; i--; ) {
+  		struct bio *bi;
+- 		int bitmap_end = 0;
+  
+  		if (test_bit(R5_ReadError, &sh->dev[i].flags)) {
+ -			struct md_rdev *rdev = conf->disks[i].rdev;
+ -
+ +			struct md_rdev *rdev;
+ +			rcu_read_lock();
+ +			rdev = rcu_dereference(conf->disks[i].rdev);
+  			if (rdev && test_bit(In_sync, &rdev->flags) &&
+  			    !test_bit(Faulty, &rdev->flags))
+  				atomic_inc(&rdev->nr_pending);
+@@@ -3732,10 -3635,6 +3734,13 @@@
+  			bio_io_error(bi);
+  			bi = nextbi;
+  		}
+++<<<<<<< HEAD
+ +		if (bitmap_end)
+ +			md_bitmap_endwrite(conf->mddev->bitmap, sh->sector,
+ +					   RAID5_STRIPE_SECTORS(conf), 0, 0);
+ +		bitmap_end = 0;
+++=======
+++>>>>>>> cd5fc6533818 (md/md-bitmap: move bitmap_{start, end}write to md upper layer)
+  		/* and fail all 'written' */
+  		bi = sh->dev[i].written;
+  		sh->dev[i].written = NULL;
+@@@ -3778,9 -3676,6 +3782,12 @@@
+  				bi = nextbi;
+  			}
+  		}
+++<<<<<<< HEAD
+ +		if (bitmap_end)
+ +			md_bitmap_endwrite(conf->mddev->bitmap, sh->sector,
+ +					   RAID5_STRIPE_SECTORS(conf), 0, 0);
+++=======
+++>>>>>>> cd5fc6533818 (md/md-bitmap: move bitmap_{start, end}write to md upper layer)
+  		/* If we were in the middle of a write the parity block might
+  		 * still be locked - so just clear all R5_LOCKED flags
+  		 */
+@@@ -4131,10 -4024,7 +4138,14 @@@ returnbi
+  					bio_endio(wbi);
+  					wbi = wbi2;
+  				}
+ -
+++<<<<<<< HEAD
+ +				md_bitmap_endwrite(conf->mddev->bitmap, sh->sector,
+ +						   RAID5_STRIPE_SECTORS(conf),
+ +						   !test_bit(STRIPE_DEGRADED, &sh->state),
+ +						   0);
+++=======
+++
+++>>>>>>> cd5fc6533818 (md/md-bitmap: move bitmap_{start, end}write to md upper layer)
+  				if (head_sh->batch_head) {
+  					sh = list_first_entry(&sh->batch_list,
+  							      struct stripe_head,
+@@@ -5909,13 -5740,6 +5919,16 @@@ static void make_discard_request(struc
+  		}
+  		spin_unlock_irq(&sh->stripe_lock);
+  		if (conf->mddev->bitmap) {
+++<<<<<<< HEAD
+ +			for (d = 0;
+ +			     d < conf->raid_disks - conf->max_degraded;
+ +			     d++)
+ +				md_bitmap_startwrite(mddev->bitmap,
+ +						     sh->sector,
+ +						     RAID5_STRIPE_SECTORS(conf),
+ +						     0);
+++=======
+++>>>>>>> cd5fc6533818 (md/md-bitmap: move bitmap_{start, end}write to md upper layer)
+  			sh->bm_seq = conf->seq_flush + 1;
+  			set_bit(STRIPE_BIT_DELAY, &sh->state);
+  		}
+* Unmerged path drivers/md/md.c
+diff --git a/drivers/md/md.h b/drivers/md/md.h
+index ee5438225393..22f04984c75f 100644
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@ -747,6 +747,8 @@ struct md_io_acct {
+ 	struct mddev	*mddev;
+ 	struct bio	*orig_bio;
+ 	unsigned long	start_time;
++	sector_t	offset;
++	unsigned long	sectors;
+ 	struct bio	bio_clone;
+ };
+ 
+* Unmerged path drivers/md/raid1.c
+* Unmerged path drivers/md/raid10.c
+* Unmerged path drivers/md/raid5-cache.c
+* Unmerged path drivers/md/raid5.c
+diff --git a/drivers/md/raid5.h b/drivers/md/raid5.h
+index daddd305349a..0efdeb820da6 100644
+--- a/drivers/md/raid5.h
++++ b/drivers/md/raid5.h
+@@ -372,9 +372,6 @@ enum {
+ 	STRIPE_ON_RELEASE_LIST,
+ 	STRIPE_BATCH_READY,
+ 	STRIPE_BATCH_ERR,
+-	STRIPE_BITMAP_PENDING,	/* Being added to bitmap, don't add
+-				 * to batch yet.
+-				 */
+ 	STRIPE_LOG_TRAPPED,	/* trapped into log (see raid5-cache.c)
+ 				 * this bit is used in two scenarios:
+ 				 *
