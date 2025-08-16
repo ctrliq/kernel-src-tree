@@ -1,0 +1,515 @@
+md/md-bitmap: factor behind write counters out from bitmap_{start/end}write()
+
+jira LE-3845
+Rebuild_History Non-Buildable kernel-4.18.0-553.69.1.el8_10
+commit-author Yu Kuai <yukuai3@huawei.com>
+commit 08c50142a128dcb2d7060aa3b4c5db8837f7a46a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.69.1.el8_10/08c50142.failed
+
+behind_write is only used in raid1, prepare to refactor
+bitmap_{start/end}write(), there are no functional changes.
+
+	Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+	Reviewed-by: Xiao Ni <xni@redhat.com>
+Link: https://lore.kernel.org/r/20250109015145.158868-2-yukuai1@huaweicloud.com
+	Signed-off-by: Song Liu <song@kernel.org>
+(cherry picked from commit 08c50142a128dcb2d7060aa3b4c5db8837f7a46a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/md-bitmap.c
+#	drivers/md/md-bitmap.h
+#	drivers/md/raid1.c
+#	drivers/md/raid10.c
+#	drivers/md/raid5-cache.c
+#	drivers/md/raid5.c
+diff --cc drivers/md/md-bitmap.c
+index 7f6620cf22e7,e1d3970c300d..000000000000
+--- a/drivers/md/md-bitmap.c
++++ b/drivers/md/md-bitmap.c
+@@@ -1439,8 -1670,11 +1439,13 @@@ __acquires(bitmap->lock
+  			&(bitmap->bp[page].map[pageoff]);
+  }
+  
+++<<<<<<< HEAD
+ +int md_bitmap_startwrite(struct bitmap *bitmap, sector_t offset, unsigned long sectors, int behind)
+++=======
++ static int bitmap_startwrite(struct mddev *mddev, sector_t offset,
++ 			     unsigned long sectors)
+++>>>>>>> 08c50142a128 (md/md-bitmap: factor behind write counters out from bitmap_{start/end}write())
+  {
+ -	struct bitmap *bitmap = mddev->bitmap;
+ -
+  	if (!bitmap)
+  		return 0;
+  
+@@@ -1501,20 -1724,14 +1495,28 @@@
+  	}
+  	return 0;
+  }
+ +EXPORT_SYMBOL(md_bitmap_startwrite);
+  
+++<<<<<<< HEAD
+ +void md_bitmap_endwrite(struct bitmap *bitmap, sector_t offset,
+ +			unsigned long sectors, int success, int behind)
+++=======
++ static void bitmap_endwrite(struct mddev *mddev, sector_t offset,
++ 			    unsigned long sectors, bool success)
+++>>>>>>> 08c50142a128 (md/md-bitmap: factor behind write counters out from bitmap_{start/end}write())
+  {
+ -	struct bitmap *bitmap = mddev->bitmap;
+ -
+  	if (!bitmap)
+  		return;
+++<<<<<<< HEAD
+ +	if (behind) {
+ +		if (atomic_dec_and_test(&bitmap->behind_writes))
+ +			wake_up(&bitmap->behind_wait);
+ +		pr_debug("dec write-behind count %d/%lu\n",
+ +			 atomic_read(&bitmap->behind_writes),
+ +			 bitmap->mddev->bitmap_info.max_write_behind);
+ +	}
+++=======
+++>>>>>>> 08c50142a128 (md/md-bitmap: factor behind write counters out from bitmap_{start/end}write())
+  
+  	while (sectors) {
+  		sector_t blocks;
+@@@ -1814,9 -2042,39 +1816,44 @@@ void md_bitmap_free(struct bitmap *bitm
+  	kfree(bp);
+  	kfree(bitmap);
+  }
+ +EXPORT_SYMBOL(md_bitmap_free);
+  
+++<<<<<<< HEAD
+ +void md_bitmap_wait_behind_writes(struct mddev *mddev)
+++=======
++ static void bitmap_start_behind_write(struct mddev *mddev)
++ {
++ 	struct bitmap *bitmap = mddev->bitmap;
++ 	int bw;
++ 
++ 	if (!bitmap)
++ 		return;
++ 
++ 	atomic_inc(&bitmap->behind_writes);
++ 	bw = atomic_read(&bitmap->behind_writes);
++ 	if (bw > bitmap->behind_writes_used)
++ 		bitmap->behind_writes_used = bw;
++ 
++ 	pr_debug("inc write-behind count %d/%lu\n",
++ 		 bw, bitmap->mddev->bitmap_info.max_write_behind);
++ }
++ 
++ static void bitmap_end_behind_write(struct mddev *mddev)
++ {
++ 	struct bitmap *bitmap = mddev->bitmap;
++ 
++ 	if (!bitmap)
++ 		return;
++ 
++ 	if (atomic_dec_and_test(&bitmap->behind_writes))
++ 		wake_up(&bitmap->behind_wait);
++ 	pr_debug("dec write-behind count %d/%lu\n",
++ 		 atomic_read(&bitmap->behind_writes),
++ 		 bitmap->mddev->bitmap_info.max_write_behind);
++ }
++ 
++ static void bitmap_wait_behind_writes(struct mddev *mddev)
+++>>>>>>> 08c50142a128 (md/md-bitmap: factor behind write counters out from bitmap_{start/end}write())
+  {
+  	struct bitmap *bitmap = mddev->bitmap;
+  
+@@@ -2687,3 -2981,41 +2724,44 @@@ const struct attribute_group md_bitmap_
+  	.name = "bitmap",
+  	.attrs = md_bitmap_attrs,
+  };
+++<<<<<<< HEAD
+++=======
++ 
++ static struct bitmap_operations bitmap_ops = {
++ 	.enabled		= bitmap_enabled,
++ 	.create			= bitmap_create,
++ 	.resize			= bitmap_resize,
++ 	.load			= bitmap_load,
++ 	.destroy		= bitmap_destroy,
++ 	.flush			= bitmap_flush,
++ 	.write_all		= bitmap_write_all,
++ 	.dirty_bits		= bitmap_dirty_bits,
++ 	.unplug			= bitmap_unplug,
++ 	.daemon_work		= bitmap_daemon_work,
++ 
++ 	.start_behind_write	= bitmap_start_behind_write,
++ 	.end_behind_write	= bitmap_end_behind_write,
++ 	.wait_behind_writes	= bitmap_wait_behind_writes,
++ 
++ 	.startwrite		= bitmap_startwrite,
++ 	.endwrite		= bitmap_endwrite,
++ 	.start_sync		= bitmap_start_sync,
++ 	.end_sync		= bitmap_end_sync,
++ 	.cond_end_sync		= bitmap_cond_end_sync,
++ 	.close_sync		= bitmap_close_sync,
++ 
++ 	.update_sb		= bitmap_update_sb,
++ 	.get_stats		= bitmap_get_stats,
++ 
++ 	.sync_with_cluster	= bitmap_sync_with_cluster,
++ 	.get_from_slot		= bitmap_get_from_slot,
++ 	.copy_from_slot		= bitmap_copy_from_slot,
++ 	.set_pages		= bitmap_set_pages,
++ 	.free			= md_bitmap_free,
++ };
++ 
++ void mddev_set_bitmap_ops(struct mddev *mddev)
++ {
++ 	mddev->bitmap_ops = &bitmap_ops;
++ }
+++>>>>>>> 08c50142a128 (md/md-bitmap: factor behind write counters out from bitmap_{start/end}write())
+diff --cc drivers/md/md-bitmap.h
+index 8a3788c9bfef,e87a1f493d3c..000000000000
+--- a/drivers/md/md-bitmap.h
++++ b/drivers/md/md-bitmap.h
+@@@ -152,85 -58,58 +152,110 @@@ typedef struct bitmap_super_s 
+   *    devices.  For raid10 it is the size of the array.
+   */
+  
+ -struct md_bitmap_stats {
+ -	u64		events_cleared;
+ -	int		behind_writes;
+ -	bool		behind_wait;
+ +#ifdef __KERNEL__
+  
+ -	unsigned long	missing_pages;
+ -	unsigned long	file_pages;
+ -	unsigned long	sync_size;
+ -	unsigned long	pages;
+ -	struct file	*file;
+ +/* the in-memory bitmap is represented by bitmap_pages */
+ +struct bitmap_page {
+ +	/*
+ +	 * map points to the actual memory page
+ +	 */
+ +	char *map;
+ +	/*
+ +	 * in emergencies (when map cannot be alloced), hijack the map
+ +	 * pointer and use it as two counters itself
+ +	 */
+ +	unsigned int hijacked:1;
+ +	/*
+ +	 * If any counter in this page is '1' or '2' - and so could be
+ +	 * cleared then that page is marked as 'pending'
+ +	 */
+ +	unsigned int pending:1;
+ +	/*
+ +	 * count of dirty bits on the page
+ +	 */
+ +	unsigned int  count:30;
+  };
+  
+ -struct bitmap_operations {
+ -	bool (*enabled)(struct mddev *mddev);
+ -	int (*create)(struct mddev *mddev, int slot);
+ -	int (*resize)(struct mddev *mddev, sector_t blocks, int chunksize,
+ -		      bool init);
+ +/* the main bitmap structure - one per mddev */
+ +struct bitmap {
+  
+++<<<<<<< HEAD
+ +	struct bitmap_counts {
+ +		spinlock_t lock;
+ +		struct bitmap_page *bp;
+ +		unsigned long pages;		/* total number of pages
+ +						 * in the bitmap */
+ +		unsigned long missing_pages;	/* number of pages
+ +						 * not yet allocated */
+ +		unsigned long chunkshift;	/* chunksize = 2^chunkshift
+ +						 * (for bitops) */
+ +		unsigned long chunks;		/* Total number of data
+ +						 * chunks for the array */
+ +	} counts;
+ +
+ +	struct mddev *mddev; /* the md device that the bitmap is for */
+++=======
++ 	int (*load)(struct mddev *mddev);
++ 	void (*destroy)(struct mddev *mddev);
++ 	void (*flush)(struct mddev *mddev);
++ 	void (*write_all)(struct mddev *mddev);
++ 	void (*dirty_bits)(struct mddev *mddev, unsigned long s,
++ 			   unsigned long e);
++ 	void (*unplug)(struct mddev *mddev, bool sync);
++ 	void (*daemon_work)(struct mddev *mddev);
++ 
++ 	void (*start_behind_write)(struct mddev *mddev);
++ 	void (*end_behind_write)(struct mddev *mddev);
++ 	void (*wait_behind_writes)(struct mddev *mddev);
++ 
++ 	int (*startwrite)(struct mddev *mddev, sector_t offset,
++ 			  unsigned long sectors);
++ 	void (*endwrite)(struct mddev *mddev, sector_t offset,
++ 			 unsigned long sectors, bool success);
++ 	bool (*start_sync)(struct mddev *mddev, sector_t offset,
++ 			   sector_t *blocks, bool degraded);
++ 	void (*end_sync)(struct mddev *mddev, sector_t offset, sector_t *blocks);
++ 	void (*cond_end_sync)(struct mddev *mddev, sector_t sector, bool force);
++ 	void (*close_sync)(struct mddev *mddev);
+++>>>>>>> 08c50142a128 (md/md-bitmap: factor behind write counters out from bitmap_{start/end}write())
+ +
+ +	__u64	events_cleared;
+ +	int need_sync;
+ +
+ +	struct bitmap_storage {
+ +		struct file *file;		/* backing disk file */
+ +		struct page *sb_page;		/* cached copy of the bitmap
+ +						 * file superblock */
+ +		struct page **filemap;		/* list of cache pages for
+ +						 * the file */
+ +		unsigned long *filemap_attr;	/* attributes associated
+ +						 * w/ filemap pages */
+ +		unsigned long file_pages;	/* number of pages in the file*/
+ +		unsigned long bytes;		/* total bytes in the bitmap */
+ +	} storage;
+ +
+ +	unsigned long flags;
+ +
+ +	int allclean;
+ +
+ +	atomic_t behind_writes;
+ +	unsigned long behind_writes_used; /* highest actual value at runtime */
+  
+ -	void (*update_sb)(void *data);
+ -	int (*get_stats)(void *data, struct md_bitmap_stats *stats);
+ -
+ -	void (*sync_with_cluster)(struct mddev *mddev,
+ -				  sector_t old_lo, sector_t old_hi,
+ -				  sector_t new_lo, sector_t new_hi);
+ -	void *(*get_from_slot)(struct mddev *mddev, int slot);
+ -	int (*copy_from_slot)(struct mddev *mddev, int slot, sector_t *lo,
+ -			      sector_t *hi, bool clear_bits);
+ -	void (*set_pages)(void *data, unsigned long pages);
+ -	void (*free)(void *data);
+ +	/*
+ +	 * the bitmap daemon - periodically wakes up and sweeps the bitmap
+ +	 * file, cleaning up bits and flushing out pages to disk as necessary
+ +	 */
+ +	unsigned long daemon_lastrun; /* jiffies of last run */
+ +	unsigned long last_end_sync; /* when we lasted called end_sync to
+ +				      * update bitmap with resync progress */
+ +
+ +	atomic_t pending_writes; /* pending writes to the bitmap file */
+ +	wait_queue_head_t write_wait;
+ +	wait_queue_head_t overflow_wait;
+ +	wait_queue_head_t behind_wait;
+ +
+ +	struct kernfs_node *sysfs_can_clear;
+ +	int cluster_slot;		/* Slot offset for clustered env */
+  };
+  
+  /* the bitmap API */
+diff --cc drivers/md/raid1.c
+index be9f5fe29baa,15ba7a001f30..000000000000
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@@ -426,12 -419,13 +426,22 @@@ static void close_write(struct r1bio *r
+  		bio_put(r1_bio->behind_master_bio);
+  		r1_bio->behind_master_bio = NULL;
+  	}
+++<<<<<<< HEAD
+ +	/* clear the bitmap if all writes complete successfully */
+ +	md_bitmap_endwrite(r1_bio->mddev->bitmap, r1_bio->sector,
+ +			   r1_bio->sectors,
+ +			   !test_bit(R1BIO_Degraded, &r1_bio->state),
+ +			   test_bit(R1BIO_BehindIO, &r1_bio->state));
+ +	md_write_end(r1_bio->mddev);
+++=======
++ 
++ 	if (test_bit(R1BIO_BehindIO, &r1_bio->state))
++ 		mddev->bitmap_ops->end_behind_write(mddev);
++ 	/* clear the bitmap if all writes complete successfully */
++ 	mddev->bitmap_ops->endwrite(mddev, r1_bio->sector, r1_bio->sectors,
++ 				    !test_bit(R1BIO_Degraded, &r1_bio->state));
++ 	md_write_end(mddev);
+++>>>>>>> 08c50142a128 (md/md-bitmap: factor behind write counters out from bitmap_{start/end}write())
+  }
+  
+  static void r1_bio_write_done(struct r1bio *r1_bio)
+@@@ -1563,15 -1641,15 +1573,22 @@@ static void raid1_write_request(struct 
+  			 * Not if there are too many, or cannot
+  			 * allocate memory, or a reader on WriteMostly
+  			 * is waiting for behind writes to flush */
+ -			err = mddev->bitmap_ops->get_stats(mddev->bitmap, &stats);
+ -			if (!err && write_behind && !stats.behind_wait &&
+ -			    stats.behind_writes < max_write_behind)
+ +			if (bitmap && write_behind &&
+ +			    (atomic_read(&bitmap->behind_writes)
+ +			     < mddev->bitmap_info.max_write_behind) &&
+ +			    !waitqueue_active(&bitmap->behind_wait)) {
+  				alloc_behind_master_bio(r1_bio, bio);
+ +			}
+  
+++<<<<<<< HEAD
+ +			md_bitmap_startwrite(bitmap, r1_bio->sector, r1_bio->sectors,
+ +					     test_bit(R1BIO_BehindIO, &r1_bio->state));
+++=======
++ 			if (test_bit(R1BIO_BehindIO, &r1_bio->state))
++ 				mddev->bitmap_ops->start_behind_write(mddev);
++ 			mddev->bitmap_ops->startwrite(mddev, r1_bio->sector,
++ 						      r1_bio->sectors);
+++>>>>>>> 08c50142a128 (md/md-bitmap: factor behind write counters out from bitmap_{start/end}write())
+  			first_clone = 0;
+  		}
+  
+diff --cc drivers/md/raid10.c
+index b1a170bf1f6a,c3a93b2a26a6..000000000000
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@@ -432,12 -426,12 +432,18 @@@ static void raid10_end_read_request(str
+  
+  static void close_write(struct r10bio *r10_bio)
+  {
+ -	struct mddev *mddev = r10_bio->mddev;
+ -
+  	/* clear the bitmap if all writes complete successfully */
+++<<<<<<< HEAD
+ +	md_bitmap_endwrite(r10_bio->mddev->bitmap, r10_bio->sector,
+ +			   r10_bio->sectors,
+ +			   !test_bit(R10BIO_Degraded, &r10_bio->state),
+ +			   0);
+ +	md_write_end(r10_bio->mddev);
+++=======
++ 	mddev->bitmap_ops->endwrite(mddev, r10_bio->sector, r10_bio->sectors,
++ 				    !test_bit(R10BIO_Degraded, &r10_bio->state));
++ 	md_write_end(mddev);
+++>>>>>>> 08c50142a128 (md/md-bitmap: factor behind write counters out from bitmap_{start/end}write())
+  }
+  
+  static void one_write_done(struct r10bio *r10_bio)
+@@@ -1587,10 -1515,10 +1593,14 @@@ static void raid10_write_request(struc
+  		r10_bio->master_bio = bio;
+  	}
+  
+ -	md_account_bio(mddev, &bio);
+ -	r10_bio->master_bio = bio;
+ +	if (blk_queue_io_stat(bio->bi_disk->queue))
+ +		r10_bio->start_time = bio_start_io_acct(bio);
+  	atomic_set(&r10_bio->remaining, 1);
+++<<<<<<< HEAD
+ +	md_bitmap_startwrite(mddev->bitmap, r10_bio->sector, r10_bio->sectors, 0);
+++=======
++ 	mddev->bitmap_ops->startwrite(mddev, r10_bio->sector, r10_bio->sectors);
+++>>>>>>> 08c50142a128 (md/md-bitmap: factor behind write counters out from bitmap_{start/end}write())
+  
+  	for (i = 0; i < conf->copies; i++) {
+  		if (r10_bio->devs[i].bio)
+diff --cc drivers/md/raid5-cache.c
+index b96cdbb7b148,1ac33d82bf8c..000000000000
+--- a/drivers/md/raid5-cache.c
++++ b/drivers/md/raid5-cache.c
+@@@ -322,10 -313,9 +322,16 @@@ void r5c_handle_cached_data_endio(struc
+  		if (sh->dev[i].written) {
+  			set_bit(R5_UPTODATE, &sh->dev[i].flags);
+  			r5c_return_dev_pending_writes(conf, &sh->dev[i]);
+++<<<<<<< HEAD
+ +			md_bitmap_endwrite(conf->mddev->bitmap, sh->sector,
+ +					   RAID5_STRIPE_SECTORS(conf),
+ +					   !test_bit(STRIPE_DEGRADED, &sh->state),
+ +					   0);
+++=======
++ 			conf->mddev->bitmap_ops->endwrite(conf->mddev,
++ 					sh->sector, RAID5_STRIPE_SECTORS(conf),
++ 					!test_bit(STRIPE_DEGRADED, &sh->state));
+++>>>>>>> 08c50142a128 (md/md-bitmap: factor behind write counters out from bitmap_{start/end}write())
+  		}
+  	}
+  }
+diff --cc drivers/md/raid5.c
+index a8595925e153,93cc7e252dd4..000000000000
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@@ -3631,8 -3563,8 +3631,13 @@@ static void __add_stripe_bio(struct str
+  		 */
+  		set_bit(STRIPE_BITMAP_PENDING, &sh->state);
+  		spin_unlock_irq(&sh->stripe_lock);
+++<<<<<<< HEAD
+ +		md_bitmap_startwrite(conf->mddev->bitmap, sh->sector,
+ +				     RAID5_STRIPE_SECTORS(conf), 0);
+++=======
++ 		conf->mddev->bitmap_ops->startwrite(conf->mddev, sh->sector,
++ 					RAID5_STRIPE_SECTORS(conf));
+++>>>>>>> 08c50142a128 (md/md-bitmap: factor behind write counters out from bitmap_{start/end}write())
+  		spin_lock_irq(&sh->stripe_lock);
+  		clear_bit(STRIPE_BITMAP_PENDING, &sh->state);
+  		if (!sh->batch_head) {
+@@@ -3733,8 -3663,9 +3738,14 @@@ handle_failed_stripe(struct r5conf *con
+  			bi = nextbi;
+  		}
+  		if (bitmap_end)
+++<<<<<<< HEAD
+ +			md_bitmap_endwrite(conf->mddev->bitmap, sh->sector,
+ +					   RAID5_STRIPE_SECTORS(conf), 0, 0);
+++=======
++ 			conf->mddev->bitmap_ops->endwrite(conf->mddev,
++ 					sh->sector, RAID5_STRIPE_SECTORS(conf),
++ 					false);
+++>>>>>>> 08c50142a128 (md/md-bitmap: factor behind write counters out from bitmap_{start/end}write())
+  		bitmap_end = 0;
+  		/* and fail all 'written' */
+  		bi = sh->dev[i].written;
+@@@ -3779,8 -3710,9 +3790,14 @@@
+  			}
+  		}
+  		if (bitmap_end)
+++<<<<<<< HEAD
+ +			md_bitmap_endwrite(conf->mddev->bitmap, sh->sector,
+ +					   RAID5_STRIPE_SECTORS(conf), 0, 0);
+++=======
++ 			conf->mddev->bitmap_ops->endwrite(conf->mddev,
++ 					sh->sector, RAID5_STRIPE_SECTORS(conf),
++ 					false);
+++>>>>>>> 08c50142a128 (md/md-bitmap: factor behind write counters out from bitmap_{start/end}write())
+  		/* If we were in the middle of a write the parity block might
+  		 * still be locked - so just clear all R5_LOCKED flags
+  		 */
+@@@ -4131,10 -4061,9 +4148,16 @@@ returnbi
+  					bio_endio(wbi);
+  					wbi = wbi2;
+  				}
+++<<<<<<< HEAD
+ +				md_bitmap_endwrite(conf->mddev->bitmap, sh->sector,
+ +						   RAID5_STRIPE_SECTORS(conf),
+ +						   !test_bit(STRIPE_DEGRADED, &sh->state),
+ +						   0);
+++=======
++ 				conf->mddev->bitmap_ops->endwrite(conf->mddev,
++ 					sh->sector, RAID5_STRIPE_SECTORS(conf),
++ 					!test_bit(STRIPE_DEGRADED, &sh->state));
+++>>>>>>> 08c50142a128 (md/md-bitmap: factor behind write counters out from bitmap_{start/end}write())
+  				if (head_sh->batch_head) {
+  					sh = list_first_entry(&sh->batch_list,
+  							      struct stripe_head,
+@@@ -5909,13 -5783,10 +5932,18 @@@ static void make_discard_request(struc
+  		}
+  		spin_unlock_irq(&sh->stripe_lock);
+  		if (conf->mddev->bitmap) {
+ -			for (d = 0; d < conf->raid_disks - conf->max_degraded;
+ +			for (d = 0;
+ +			     d < conf->raid_disks - conf->max_degraded;
+  			     d++)
+++<<<<<<< HEAD
+ +				md_bitmap_startwrite(mddev->bitmap,
+ +						     sh->sector,
+ +						     RAID5_STRIPE_SECTORS(conf),
+ +						     0);
+++=======
++ 				mddev->bitmap_ops->startwrite(mddev, sh->sector,
++ 					RAID5_STRIPE_SECTORS(conf));
+++>>>>>>> 08c50142a128 (md/md-bitmap: factor behind write counters out from bitmap_{start/end}write())
+  			sh->bm_seq = conf->seq_flush + 1;
+  			set_bit(STRIPE_BIT_DELAY, &sh->state);
+  		}
+* Unmerged path drivers/md/md-bitmap.c
+* Unmerged path drivers/md/md-bitmap.h
+* Unmerged path drivers/md/raid1.c
+* Unmerged path drivers/md/raid10.c
+* Unmerged path drivers/md/raid5-cache.c
+* Unmerged path drivers/md/raid5.c
