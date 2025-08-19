@@ -1863,10 +1863,10 @@ static int enic_change_mtu(struct net_device *netdev, int new_mtu)
 	if (enic_is_dynamic(enic) || enic_is_sriov_vf(enic))
 		return -EOPNOTSUPP;
 
-	if (netdev->mtu > enic->port_mtu)
+	if (new_mtu > enic->port_mtu)
 		netdev_warn(netdev,
 			    "interface MTU (%d) set higher than port MTU (%d)\n",
-			    netdev->mtu, enic->port_mtu);
+			    new_mtu, enic->port_mtu);
 
 	return _enic_change_mtu(netdev, new_mtu);
 }
@@ -2295,7 +2295,8 @@ static int enic_adjust_resources(struct enic *enic)
 		 * used based on which resource is the most constrained
 		 */
 		wq_avail = min(enic->wq_avail, ENIC_WQ_MAX);
-		rq_default = netif_get_num_default_rss_queues();
+		rq_default = max(netif_get_num_default_rss_queues(),
+				 ENIC_RQ_MIN_DEFAULT);
 		rq_avail = min3(enic->rq_avail, ENIC_RQ_MAX, rq_default);
 		max_queues = min(enic->cq_avail,
 				 enic->intr_avail - ENIC_MSIX_RESERVED_INTR);
