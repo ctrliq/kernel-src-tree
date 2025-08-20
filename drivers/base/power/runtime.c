@@ -448,8 +448,19 @@ static int rpm_callback(int (*cb)(struct device *), struct device *dev)
 		retval = __rpm_callback(cb, dev);
 	}
 
-	dev->power.runtime_error = retval;
-	return retval != -EACCES ? retval : -EIO;
+	/*
+	 * Since -EACCES means that runtime PM is disabled for the given device,
+	 * it should not be returned by runtime PM callbacks.  If it is returned
+	 * nevertheless, assume it to be a transient error and convert it to
+	 * -EAGAIN.
+	 */
+	if (retval == -EACCES)
+		retval = -EAGAIN;
+
+	if (retval != -EAGAIN && retval != -EBUSY)
+		dev->power.runtime_error = retval;
+
+	return retval;
 }
 
 /**
@@ -725,21 +736,18 @@ static int rpm_suspend(struct device *dev, int rpmflags)
 	dev->power.deferred_resume = false;
 	wake_up_all(&dev->power.wait_queue);
 
-	if (retval == -EAGAIN || retval == -EBUSY) {
-		dev->power.runtime_error = 0;
+	/*
+	 * On transient errors, if the callback routine failed an autosuspend,
+	 * and if the last_busy time has been updated so that there is a new
+	 * autosuspend expiration time, automatically reschedule another
+	 * autosuspend.
+	 */
+	if (!dev->power.runtime_error && (rpmflags & RPM_AUTO) &&
+	    pm_runtime_autosuspend_expiration(dev) != 0)
+		goto repeat;
 
-		/*
-		 * If the callback routine failed an autosuspend, and
-		 * if the last_busy time has been updated so that there
-		 * is a new autosuspend expiration time, automatically
-		 * reschedule another autosuspend.
-		 */
-		if ((rpmflags & RPM_AUTO) &&
-		    pm_runtime_autosuspend_expiration(dev) != 0)
-			goto repeat;
-	} else {
-		pm_runtime_cancel_pending(dev);
-	}
+	pm_runtime_cancel_pending(dev);
+
 	goto out;
 }
 
@@ -1466,8 +1474,8 @@ bool pm_runtime_block_if_disabled(struct device *dev)
 
 	spin_lock_irq(&dev->power.lock);
 
-	ret = dev->power.disable_depth && dev->power.last_status == RPM_INVALID;
-	if (ret)
+	ret = !pm_runtime_enabled(dev);
+	if (ret && dev->power.last_status == RPM_INVALID)
 		dev->power.last_status = RPM_BLOCKED;
 
 	spin_unlock_irq(&dev->power.lock);
@@ -1559,23 +1567,6 @@ out:
 	spin_unlock_irqrestore(&dev->power.lock, flags);
 }
 EXPORT_SYMBOL_GPL(pm_runtime_enable);
-
-bool pm_runtime_blocked(struct device *dev)
-{
-	bool ret;
-
-	/*
-	 * dev->power.last_status is a bit field, so in case it is updated via
-	 * RMW, read it under the spin lock.
-	 */
-	spin_lock_irq(&dev->power.lock);
-
-	ret = dev->power.last_status == RPM_BLOCKED;
-
-	spin_unlock_irq(&dev->power.lock);
-
-	return ret;
-}
 
 static void pm_runtime_disable_action(void *data)
 {
@@ -1796,8 +1787,8 @@ void pm_runtime_init(struct device *dev)
 	INIT_WORK(&dev->power.work, pm_runtime_work);
 
 	dev->power.timer_expires = 0;
-	hrtimer_init(&dev->power.suspend_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
-	dev->power.suspend_timer.function = pm_suspend_timer_fn;
+	hrtimer_setup(&dev->power.suspend_timer, pm_suspend_timer_fn, CLOCK_MONOTONIC,
+		      HRTIMER_MODE_ABS);
 
 	init_waitqueue_head(&dev->power.wait_queue);
 }
@@ -1906,7 +1897,7 @@ void pm_runtime_drop_link(struct device_link *link)
 	pm_request_idle(link->supplier);
 }
 
-static bool pm_runtime_need_not_resume(struct device *dev)
+bool pm_runtime_need_not_resume(struct device *dev)
 {
 	return atomic_read(&dev->power.usage_count) <= 1 &&
 		(atomic_read(&dev->power.child_count) == 0 ||
@@ -1991,7 +1982,7 @@ int pm_runtime_force_resume(struct device *dev)
 	int (*callback)(struct device *);
 	int ret = 0;
 
-	if (!pm_runtime_status_suspended(dev) || !dev->power.needs_force_resume)
+	if (!dev->power.needs_force_resume)
 		goto out;
 
 	/*

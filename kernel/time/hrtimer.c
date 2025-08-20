@@ -1630,21 +1630,23 @@ void hrtimer_setup(struct hrtimer *timer, enum hrtimer_restart (*function)(struc
 EXPORT_SYMBOL_GPL(hrtimer_setup);
 
 /**
- * hrtimer_init_on_stack - initialize a timer in stack memory
+ * hrtimer_setup_on_stack - initialize a timer on stack memory
  * @timer:	The timer to be initialized
+ * @function:	the callback function
  * @clock_id:	The clock to be used
  * @mode:       The timer mode
  *
- * Similar to hrtimer_init(), except that this one must be used if struct hrtimer is in stack
+ * Similar to hrtimer_setup(), except that this one must be used if struct hrtimer is in stack
  * memory.
  */
-void hrtimer_init_on_stack(struct hrtimer *timer, clockid_t clock_id,
-			   enum hrtimer_mode mode)
+void hrtimer_setup_on_stack(struct hrtimer *timer,
+			    enum hrtimer_restart (*function)(struct hrtimer *),
+			    clockid_t clock_id, enum hrtimer_mode mode)
 {
 	debug_init_on_stack(timer, clock_id, mode);
-	__hrtimer_init(timer, clock_id, mode);
+	__hrtimer_setup(timer, function, clock_id, mode);
 }
-EXPORT_SYMBOL_GPL(hrtimer_init_on_stack);
+EXPORT_SYMBOL_GPL(hrtimer_setup_on_stack);
 
 /*
  * A timer is active, when it is enqueued into the rbtree or the
@@ -2033,18 +2035,18 @@ static void __hrtimer_init_sleeper(struct hrtimer_sleeper *sl,
 }
 
 /**
- * hrtimer_init_sleeper_on_stack - initialize a sleeper in stack memory
+ * hrtimer_setup_sleeper_on_stack - initialize a sleeper in stack memory
  * @sl:		sleeper to be initialized
  * @clock_id:	the clock to be used
  * @mode:	timer mode abs/rel
  */
-void hrtimer_init_sleeper_on_stack(struct hrtimer_sleeper *sl,
-				   clockid_t clock_id, enum hrtimer_mode mode)
+void hrtimer_setup_sleeper_on_stack(struct hrtimer_sleeper *sl,
+				    clockid_t clock_id, enum hrtimer_mode mode)
 {
 	debug_init_on_stack(&sl->timer, clock_id, mode);
 	__hrtimer_init_sleeper(sl, clock_id, mode);
 }
-EXPORT_SYMBOL_GPL(hrtimer_init_sleeper_on_stack);
+EXPORT_SYMBOL_GPL(hrtimer_setup_sleeper_on_stack);
 
 int nanosleep_copyout(struct restart_block *restart, struct timespec64 *ts)
 {
@@ -2105,8 +2107,7 @@ static long __sched hrtimer_nanosleep_restart(struct restart_block *restart)
 	struct hrtimer_sleeper t;
 	int ret;
 
-	hrtimer_init_sleeper_on_stack(&t, restart->nanosleep.clockid,
-				      HRTIMER_MODE_ABS);
+	hrtimer_setup_sleeper_on_stack(&t, restart->nanosleep.clockid, HRTIMER_MODE_ABS);
 	hrtimer_set_expires_tv64(&t.timer, restart->nanosleep.expires);
 	ret = do_nanosleep(&t, HRTIMER_MODE_ABS);
 	destroy_hrtimer_on_stack(&t.timer);
@@ -2120,7 +2121,7 @@ long hrtimer_nanosleep(ktime_t rqtp, const enum hrtimer_mode mode,
 	struct hrtimer_sleeper t;
 	int ret = 0;
 
-	hrtimer_init_sleeper_on_stack(&t, clockid, mode);
+	hrtimer_setup_sleeper_on_stack(&t, clockid, mode);
 	hrtimer_set_expires_range_ns(&t.timer, rqtp, current->timer_slack_ns);
 	ret = do_nanosleep(&t, mode);
 	if (ret != -ERESTART_RESTARTBLOCK)
@@ -2318,7 +2319,7 @@ schedule_hrtimeout_range_clock(ktime_t *expires, u64 delta,
 		return -EINTR;
 	}
 
-	hrtimer_init_sleeper_on_stack(&t, clock_id, mode);
+	hrtimer_setup_sleeper_on_stack(&t, clock_id, mode);
 	hrtimer_set_expires_range_ns(&t.timer, *expires, delta);
 	hrtimer_sleeper_start_expires(&t, mode);
 
