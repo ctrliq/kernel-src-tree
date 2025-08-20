@@ -425,7 +425,7 @@ static inline void fp_user_discard(void)
  * accidentally schedule in exception context and it will force a warning
  * if we somehow manage to schedule by accident.
  */
-void debug_exception_enter(struct pt_regs *regs)
+static void debug_exception_enter(struct pt_regs *regs)
 {
 	preempt_disable();
 
@@ -434,7 +434,7 @@ void debug_exception_enter(struct pt_regs *regs)
 }
 NOKPROBE_SYMBOL(debug_exception_enter);
 
-void debug_exception_exit(struct pt_regs *regs)
+static void debug_exception_exit(struct pt_regs *regs)
 {
 	preempt_enable_no_resched();
 }
