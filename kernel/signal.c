@@ -1993,7 +1993,7 @@ ret:
 	return ret;
 }
 
-static void do_notify_pidfd(struct task_struct *task)
+void do_notify_pidfd(struct task_struct *task)
 {
 	struct pid *pid;
 
@@ -2025,7 +2025,8 @@ bool do_notify_parent(struct task_struct *tsk, int sig)
 	WARN_ON_ONCE(!tsk->ptrace &&
 	       (tsk->group_leader != tsk || !thread_group_empty(tsk)));
 	/*
-	 * tsk is a group leader and has no threads, wake up the pidfd waiters.
+	 * tsk is a group leader and has no threads, wake up the
+	 * non-PIDFD_THREAD waiters.
 	 */
 	if (thread_group_empty(tsk))
 		do_notify_pidfd(tsk);
@@ -3887,6 +3888,7 @@ SYSCALL_DEFINE4(pidfd_send_signal, int, pidfd, int, sig,
 		prepare_kill_siginfo(sig, &kinfo);
 	}
 
+	/* TODO: respect PIDFD_THREAD */
 	ret = kill_pid_info(sig, &kinfo, pid);
 
 err:
