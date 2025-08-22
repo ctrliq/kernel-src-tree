@@ -1895,15 +1895,18 @@ int force_sig_ptrace_errno_trap(int errno, void __user *addr)
 	return force_sig_info(&info);
 }
 
-int kill_pgrp(struct pid *pid, int sig, int priv)
+static int kill_pgrp_info(int sig, struct kernel_siginfo *info, struct pid *pgrp)
 {
 	int ret;
-
 	read_lock(&tasklist_lock);
-	ret = __kill_pgrp_info(sig, __si_special(priv), pid);
+	ret = __kill_pgrp_info(sig, info, pgrp);
 	read_unlock(&tasklist_lock);
-
 	return ret;
+}
+
+int kill_pgrp(struct pid *pid, int sig, int priv)
+{
+	return kill_pgrp_info(sig, __si_special(priv), pid);
 }
 EXPORT_SYMBOL(kill_pgrp);
 
@@ -3834,6 +3837,10 @@ static struct pid *pidfd_to_pid(const struct file *file)
 	return tgid_pidfd_to_pid(file);
 }
 
+#define PIDFD_SEND_SIGNAL_FLAGS                            \
+	(PIDFD_SIGNAL_THREAD | PIDFD_SIGNAL_THREAD_GROUP | \
+	 PIDFD_SIGNAL_PROCESS_GROUP)
+
 /**
  * sys_pidfd_send_signal - Signal a process through a pidfd
  * @pidfd:  file descriptor of the process
@@ -3858,7 +3865,11 @@ SYSCALL_DEFINE4(pidfd_send_signal, int, pidfd, int, sig,
 	enum pid_type type;
 
 	/* Enforce flags be set to 0 until we add an extension. */
-	if (flags)
+	if (flags & ~PIDFD_SEND_SIGNAL_FLAGS)
+		return -EINVAL;
+
+	/* Ensure that only a single signal scope determining flag is set. */
+	if (hweight32(flags & PIDFD_SEND_SIGNAL_FLAGS) > 1)
 		return -EINVAL;
 
 	f = fdget(pidfd);
@@ -3876,10 +3887,24 @@ SYSCALL_DEFINE4(pidfd_send_signal, int, pidfd, int, sig,
 	if (!access_pidfd_pidns(pid))
 		goto err;
 
-	if (f.file->f_flags & PIDFD_THREAD)
+	switch (flags) {
+	case 0:
+		/* Infer scope from the type of pidfd. */
+		if (f.file->f_flags & PIDFD_THREAD)
+			type = PIDTYPE_PID;
+		else
+			type = PIDTYPE_TGID;
+		break;
+	case PIDFD_SIGNAL_THREAD:
 		type = PIDTYPE_PID;
-	else
+		break;
+	case PIDFD_SIGNAL_THREAD_GROUP:
 		type = PIDTYPE_TGID;
+		break;
+	case PIDFD_SIGNAL_PROCESS_GROUP:
+		type = PIDTYPE_PGID;
+		break;
+	}
 
 	if (info) {
 		ret = copy_siginfo_from_user_any(&kinfo, info);
@@ -3892,14 +3917,17 @@ SYSCALL_DEFINE4(pidfd_send_signal, int, pidfd, int, sig,
 
 		/* Only allow sending arbitrary signals to yourself. */
 		ret = -EPERM;
-		if ((task_pid(current) != pid) &&
+		if ((task_pid(current) != pid || type > PIDTYPE_TGID) &&
 		    (kinfo.si_code >= 0 || kinfo.si_code == SI_TKILL))
 			goto err;
 	} else {
 		prepare_kill_siginfo(sig, &kinfo, type);
 	}
 
-	ret = kill_pid_info_type(sig, &kinfo, pid, type);
+	if (type == PIDTYPE_PGID)
+		ret = kill_pgrp_info(sig, &kinfo, pid);
+	else
+		ret = kill_pid_info_type(sig, &kinfo, pid, type);
 err:
 	fdput(f);
 	return ret;
