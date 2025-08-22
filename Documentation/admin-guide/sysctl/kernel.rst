@@ -170,6 +170,7 @@ core_pattern
 	%E		executable path
 	%c		maximum size of core file by resource limit RLIMIT_CORE
 	%C		CPU the task ran on
+	%F		pidfd number
 	%<OTHER>	both are dropped
 	========	==========================================
 
