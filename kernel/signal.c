@@ -3754,12 +3754,13 @@ COMPAT_SYSCALL_DEFINE4(rt_sigtimedwait_time32, compat_sigset_t __user *, uthese,
 #endif
 #endif
 
-static inline void prepare_kill_siginfo(int sig, struct kernel_siginfo *info)
+static void prepare_kill_siginfo(int sig, struct kernel_siginfo *info,
+				 enum pid_type type)
 {
 	clear_siginfo(info);
 	info->si_signo = sig;
 	info->si_errno = 0;
-	info->si_code = SI_USER;
+	info->si_code = (type == PIDTYPE_PID) ? SI_TKILL : SI_USER;
 	info->si_pid = task_tgid_vnr(current);
 	info->si_uid = from_kuid_munged(current_user_ns(), current_uid());
 }
@@ -3773,7 +3774,7 @@ SYSCALL_DEFINE2(kill, pid_t, pid, int, sig)
 {
 	struct kernel_siginfo info;
 
-	prepare_kill_siginfo(sig, &info);
+	prepare_kill_siginfo(sig, &info, PIDTYPE_TGID);
 
 	return kill_something_info(sig, &info, pid);
 }
@@ -3886,7 +3887,7 @@ SYSCALL_DEFINE4(pidfd_send_signal, int, pidfd, int, sig,
 		    (kinfo.si_code >= 0 || kinfo.si_code == SI_TKILL))
 			goto err;
 	} else {
-		prepare_kill_siginfo(sig, &kinfo);
+		prepare_kill_siginfo(sig, &kinfo, PIDTYPE_TGID);
 	}
 
 	/* TODO: respect PIDFD_THREAD */
@@ -3931,12 +3932,7 @@ static int do_tkill(pid_t tgid, pid_t pid, int sig)
 {
 	struct kernel_siginfo info;
 
-	clear_siginfo(&info);
-	info.si_signo = sig;
-	info.si_errno = 0;
-	info.si_code = SI_TKILL;
-	info.si_pid = task_tgid_vnr(current);
-	info.si_uid = from_kuid_munged(current_user_ns(), current_uid());
+	prepare_kill_siginfo(sig, &info, PIDTYPE_PID);
 
 	return do_send_specific(tgid, pid, sig, &info);
 }
