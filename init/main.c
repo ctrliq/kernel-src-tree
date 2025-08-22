@@ -99,6 +99,7 @@
 #include <linux/kcsan.h>
 #include <linux/init_syscalls.h>
 #include <linux/stackdepot.h>
+#include <linux/pidfs.h>
 #include <net/net_namespace.h>
 
 #include <linux/maple_tree.h>
@@ -1063,6 +1064,7 @@ asmlinkage __visible void __init __no_sanitize_address __noreturn start_kernel(v
 	seq_file_init();
 	proc_root_init();
 	nsfs_init();
+	pidfs_init();
 	cpuset_init();
 	cgroup_init();
 	taskstats_init_early();
