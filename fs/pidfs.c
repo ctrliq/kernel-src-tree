@@ -708,6 +708,7 @@ struct file *pidfs_alloc_file(struct pid *pid, unsigned int flags)
 	if (ret < 0)
 		return ERR_PTR(ret);
 
+	flags |= O_RDWR;
 	pidfd_file = dentry_open(&path, flags, current_cred());
 	path_put(&path);
 	return pidfd_file;
