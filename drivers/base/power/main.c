@@ -781,7 +781,7 @@ Out:
 	TRACE_RESUME(error);
 
 	if (error) {
-		async_error = error;
+		WRITE_ONCE(async_error, error);
 		dpm_save_failed_dev(dev_name(dev));
 		pm_dev_err(dev, state, async ? " async noirq" : " noirq", error);
 	}
@@ -838,7 +838,7 @@ static void dpm_noirq_resume_devices(pm_message_t state)
 	mutex_unlock(&dpm_list_mtx);
 	async_synchronize_full();
 	dpm_show_time(starttime, state, 0, "noirq");
-	if (async_error)
+	if (READ_ONCE(async_error))
 		dpm_save_failed_step(SUSPEND_RESUME_NOIRQ);
 
 	trace_suspend_resume(TPS("dpm_resume_noirq"), state.event, false);
@@ -924,7 +924,7 @@ Out:
 	complete_all(&dev->power.completion);
 
 	if (error) {
-		async_error = error;
+		WRITE_ONCE(async_error, error);
 		dpm_save_failed_dev(dev_name(dev));
 		pm_dev_err(dev, state, async ? " async early" : " early", error);
 	}
@@ -985,7 +985,7 @@ void dpm_resume_early(pm_message_t state)
 	mutex_unlock(&dpm_list_mtx);
 	async_synchronize_full();
 	dpm_show_time(starttime, state, 0, "early");
-	if (async_error)
+	if (READ_ONCE(async_error))
 		dpm_save_failed_step(SUSPEND_RESUME_EARLY);
 
 	trace_suspend_resume(TPS("dpm_resume_early"), state.event, false);
@@ -1100,7 +1100,7 @@ static void device_resume(struct device *dev, pm_message_t state, bool async)
 	TRACE_RESUME(error);
 
 	if (error) {
-		async_error = error;
+		WRITE_ONCE(async_error, error);
 		dpm_save_failed_dev(dev_name(dev));
 		pm_dev_err(dev, state, async ? " async" : "", error);
 	}
@@ -1164,7 +1164,7 @@ void dpm_resume(pm_message_t state)
 	mutex_unlock(&dpm_list_mtx);
 	async_synchronize_full();
 	dpm_show_time(starttime, state, 0, NULL);
-	if (async_error)
+	if (READ_ONCE(async_error))
 		dpm_save_failed_step(SUSPEND_RESUME);
 
 	cpufreq_resume();
@@ -1400,7 +1400,7 @@ static void async_suspend_noirq(void *data, async_cookie_t cookie);
  * The driver of @dev will not receive interrupts while this function is being
  * executed.
  */
-static int device_suspend_noirq(struct device *dev, pm_message_t state, bool async)
+static void device_suspend_noirq(struct device *dev, pm_message_t state, bool async)
 {
 	pm_callback_t callback = NULL;
 	const char *info = NULL;
@@ -1411,7 +1411,7 @@ static int device_suspend_noirq(struct device *dev, pm_message_t state, bool asy
 
 	dpm_wait_for_subordinate(dev, async);
 
-	if (async_error)
+	if (READ_ONCE(async_error))
 		goto Complete;
 
 	if (dev->power.syscore || dev->power.direct_complete)
@@ -1444,7 +1444,7 @@ static int device_suspend_noirq(struct device *dev, pm_message_t state, bool asy
 Run:
 	error = dpm_run_callback(callback, dev, state, info);
 	if (error) {
-		async_error = error;
+		WRITE_ONCE(async_error, error);
 		dpm_save_failed_dev(dev_name(dev));
 		pm_dev_err(dev, state, async ? " async noirq" : " noirq", error);
 		goto Complete;
@@ -1470,12 +1470,10 @@ Complete:
 	complete_all(&dev->power.completion);
 	TRACE_SUSPEND(error);
 
-	if (error || async_error)
-		return error;
+	if (error || READ_ONCE(async_error))
+		return;
 
 	dpm_async_suspend_superior(dev, async_suspend_noirq);
-
-	return 0;
 }
 
 static void async_suspend_noirq(void *data, async_cookie_t cookie)
@@ -1490,7 +1488,7 @@ static int dpm_noirq_suspend_devices(pm_message_t state)
 {
 	ktime_t starttime = ktime_get();
 	struct device *dev;
-	int error = 0;
+	int error;
 
 	trace_suspend_resume(TPS("dpm_suspend_noirq"), state.event, true);
 
@@ -1521,13 +1519,13 @@ static int dpm_noirq_suspend_devices(pm_message_t state)
 
 		mutex_unlock(&dpm_list_mtx);
 
-		error = device_suspend_noirq(dev, state, false);
+		device_suspend_noirq(dev, state, false);
 
 		put_device(dev);
 
 		mutex_lock(&dpm_list_mtx);
 
-		if (error || async_error) {
+		if (READ_ONCE(async_error)) {
 			dpm_async_suspend_complete_all(&dpm_late_early_list);
 			/*
 			 * Move all devices to the target list to resume them
@@ -1541,9 +1539,8 @@ static int dpm_noirq_suspend_devices(pm_message_t state)
 	mutex_unlock(&dpm_list_mtx);
 
 	async_synchronize_full();
-	if (!error)
-		error = async_error;
 
+	error = READ_ONCE(async_error);
 	if (error)
 		dpm_save_failed_step(SUSPEND_SUSPEND_NOIRQ);
 
@@ -1598,7 +1595,7 @@ static void async_suspend_late(void *data, async_cookie_t cookie);
  *
  * Runtime PM is disabled for @dev while this function is being executed.
  */
-static int device_suspend_late(struct device *dev, pm_message_t state, bool async)
+static void device_suspend_late(struct device *dev, pm_message_t state, bool async)
 {
 	pm_callback_t callback = NULL;
 	const char *info = NULL;
@@ -1615,11 +1612,11 @@ static int device_suspend_late(struct device *dev, pm_message_t state, bool asyn
 
 	dpm_wait_for_subordinate(dev, async);
 
-	if (async_error)
+	if (READ_ONCE(async_error))
 		goto Complete;
 
 	if (pm_wakeup_pending()) {
-		async_error = -EBUSY;
+		WRITE_ONCE(async_error, -EBUSY);
 		goto Complete;
 	}
 
@@ -1653,7 +1650,7 @@ static int device_suspend_late(struct device *dev, pm_message_t state, bool asyn
 Run:
 	error = dpm_run_callback(callback, dev, state, info);
 	if (error) {
-		async_error = error;
+		WRITE_ONCE(async_error, error);
 		dpm_save_failed_dev(dev_name(dev));
 		pm_dev_err(dev, state, async ? " async late" : " late", error);
 		goto Complete;
@@ -1667,12 +1664,10 @@ Complete:
 	TRACE_SUSPEND(error);
 	complete_all(&dev->power.completion);
 
-	if (error || async_error)
-		return error;
+	if (error || READ_ONCE(async_error))
+		return;
 
 	dpm_async_suspend_superior(dev, async_suspend_late);
-
-	return 0;
 }
 
 static void async_suspend_late(void *data, async_cookie_t cookie)
@@ -1691,7 +1686,7 @@ int dpm_suspend_late(pm_message_t state)
 {
 	ktime_t starttime = ktime_get();
 	struct device *dev;
-	int error = 0;
+	int error;
 
 	trace_suspend_resume(TPS("dpm_suspend_late"), state.event, true);
 
@@ -1724,13 +1719,13 @@ int dpm_suspend_late(pm_message_t state)
 
 		mutex_unlock(&dpm_list_mtx);
 
-		error = device_suspend_late(dev, state, false);
+		device_suspend_late(dev, state, false);
 
 		put_device(dev);
 
 		mutex_lock(&dpm_list_mtx);
 
-		if (error || async_error) {
+		if (READ_ONCE(async_error)) {
 			dpm_async_suspend_complete_all(&dpm_suspended_list);
 			/*
 			 * Move all devices to the target list to resume them
@@ -1744,9 +1739,8 @@ int dpm_suspend_late(pm_message_t state)
 	mutex_unlock(&dpm_list_mtx);
 
 	async_synchronize_full();
-	if (!error)
-		error = async_error;
 
+	error = READ_ONCE(async_error);
 	if (error) {
 		dpm_save_failed_step(SUSPEND_SUSPEND_LATE);
 		dpm_resume_early(resume_event(state));
@@ -1835,7 +1829,7 @@ static void async_suspend(void *data, async_cookie_t cookie);
  * @state: PM transition of the system being carried out.
  * @async: If true, the device is being suspended asynchronously.
  */
-static int device_suspend(struct device *dev, pm_message_t state, bool async)
+static void device_suspend(struct device *dev, pm_message_t state, bool async)
 {
 	pm_callback_t callback = NULL;
 	const char *info = NULL;
@@ -1847,7 +1841,7 @@ static int device_suspend(struct device *dev, pm_message_t state, bool async)
 
 	dpm_wait_for_subordinate(dev, async);
 
-	if (async_error) {
+	if (READ_ONCE(async_error)) {
 		dev->power.direct_complete = false;
 		goto Complete;
 	}
@@ -1867,7 +1861,7 @@ static int device_suspend(struct device *dev, pm_message_t state, bool async)
 
 	if (pm_wakeup_pending()) {
 		dev->power.direct_complete = false;
-		async_error = -EBUSY;
+		WRITE_ONCE(async_error, -EBUSY);
 		goto Complete;
 	}
 
@@ -1951,7 +1945,7 @@ static int device_suspend(struct device *dev, pm_message_t state, bool async)
 
  Complete:
 	if (error) {
-		async_error = error;
+		WRITE_ONCE(async_error, error);
 		dpm_save_failed_dev(dev_name(dev));
 		pm_dev_err(dev, state, async ? " async" : "", error);
 	}
@@ -1959,12 +1953,10 @@ static int device_suspend(struct device *dev, pm_message_t state, bool async)
 	complete_all(&dev->power.completion);
 	TRACE_SUSPEND(error);
 
-	if (error || async_error)
-		return error;
+	if (error || READ_ONCE(async_error))
+		return;
 
 	dpm_async_suspend_superior(dev, async_suspend);
-
-	return 0;
 }
 
 static void async_suspend(void *data, async_cookie_t cookie)
@@ -1983,7 +1975,7 @@ int dpm_suspend(pm_message_t state)
 {
 	ktime_t starttime = ktime_get();
 	struct device *dev;
-	int error = 0;
+	int error;
 
 	trace_suspend_resume(TPS("dpm_suspend"), state.event, true);
 	might_sleep();
@@ -2018,13 +2010,13 @@ int dpm_suspend(pm_message_t state)
 
 		mutex_unlock(&dpm_list_mtx);
 
-		error = device_suspend(dev, state, false);
+		device_suspend(dev, state, false);
 
 		put_device(dev);
 
 		mutex_lock(&dpm_list_mtx);
 
-		if (error || async_error) {
+		if (READ_ONCE(async_error)) {
 			dpm_async_suspend_complete_all(&dpm_prepared_list);
 			/*
 			 * Move all devices to the target list to resume them
@@ -2038,9 +2030,8 @@ int dpm_suspend(pm_message_t state)
 	mutex_unlock(&dpm_list_mtx);
 
 	async_synchronize_full();
-	if (!error)
-		error = async_error;
 
+	error = READ_ONCE(async_error);
 	if (error)
 		dpm_save_failed_step(SUSPEND_SUSPEND);
 
