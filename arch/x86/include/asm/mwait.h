@@ -117,14 +117,9 @@ static __always_inline void __sti_mwait(unsigned long eax, unsigned long ecx)
 static __always_inline void mwait_idle_with_hints(unsigned long eax, unsigned long ecx)
 {
 	if (static_cpu_has_bug(X86_BUG_MONITOR) || !current_set_polling_and_test()) {
+		const void *addr = &current_thread_info()->flags;
 		bool ibrs_disabled = false;
 		u64 spec_ctrl;
-
-		if (static_cpu_has_bug(X86_BUG_CLFLUSH_MONITOR)) {
-			mb();
-			clflush((void *)&current_thread_info()->flags);
-			mb();
-		}
 
 		if (irqs_disabled() && (ecx & 1) &&
 		    cpu_feature_enabled(X86_FEATURE_KERNEL_IBRS)) {
@@ -135,7 +130,8 @@ static __always_inline void mwait_idle_with_hints(unsigned long eax, unsigned lo
 			native_wrmsrl(MSR_IA32_SPEC_CTRL, 0);
 		}
 
-		__monitor((void *)&current_thread_info()->flags, 0, 0);
+		alternative_input("", "clflush (%[addr])", X86_BUG_CLFLUSH_MONITOR, [addr] "a" (addr));
+		__monitor(addr, 0, 0);
 
 		if (!need_resched()) {
 			if (ecx & 1) {
