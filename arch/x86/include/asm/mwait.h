@@ -36,8 +36,8 @@ static __always_inline void __monitor(const void *eax, unsigned long ecx,
 static __always_inline void __monitorx(const void *eax, unsigned long ecx,
 			      unsigned long edx)
 {
-	/* "monitorx %eax, %ecx, %edx;" */
-	asm volatile(".byte 0x0f, 0x01, 0xfa;"
+	/* "monitorx %eax, %ecx, %edx" */
+	asm volatile(".byte 0x0f, 0x01, 0xfa"
 		     :: "a" (eax), "c" (ecx), "d"(edx));
 }
 
@@ -81,8 +81,8 @@ static __always_inline void __mwaitx(unsigned long eax, unsigned long ebx,
 {
 	/* No MDS buffer clear as this is AMD/HYGON only */
 
-	/* "mwaitx %eax, %ebx, %ecx;" */
-	asm volatile(".byte 0x0f, 0x01, 0xfb;"
+	/* "mwaitx %eax, %ebx, %ecx" */
+	asm volatile(".byte 0x0f, 0x01, 0xfb"
 		     :: "a" (eax), "b" (ebx), "c" (ecx));
 }
 
@@ -141,13 +141,13 @@ static __always_inline void mwait_idle_with_hints(unsigned long eax, unsigned lo
  */
 static inline void __tpause(u32 ecx, u32 edx, u32 eax)
 {
-	/* "tpause %ecx, %edx, %eax;" */
+	/* "tpause %ecx, %edx, %eax" */
 	#ifdef CONFIG_AS_TPAUSE
-	asm volatile("tpause %%ecx\n"
+	asm volatile("tpause %%ecx"
 		     :
 		     : "c"(ecx), "d"(edx), "a"(eax));
 	#else
-	asm volatile(".byte 0x66, 0x0f, 0xae, 0xf1\t\n"
+	asm volatile(".byte 0x66, 0x0f, 0xae, 0xf1"
 		     :
 		     : "c"(ecx), "d"(edx), "a"(eax));
 	#endif
