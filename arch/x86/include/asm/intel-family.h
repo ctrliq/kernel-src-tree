@@ -159,6 +159,8 @@
 #define INTEL_FAM6_GRANITERAPIDS_D	0xAE
 #define INTEL_GRANITERAPIDS_D		IFM(6, 0xAE)
 
+#define INTEL_BARTLETTLAKE		IFM(6, 0xD7) /* Raptor Cove */
+
 /* "Hybrid" Processors (P-Core/E-Core) */
 
 #define INTEL_FAM6_LAKEFIELD		0x8A	/* Sunny Cove / Tremont */
@@ -194,6 +196,11 @@
 #define INTEL_FAM6_ARROWLAKE		0xC6
 
 #define INTEL_PANTHERLAKE_L		IFM(6, 0xCC)
+
+#define INTEL_WILDCATLAKE_L		IFM(6, 0xD5)
+
+#define INTEL_NOVALAKE			IFM(18, 0x01)
+#define INTEL_NOVALAKE_L		IFM(18, 0x03)
 
 /* "Small Core" Processors (Atom/E-Core) */
 
