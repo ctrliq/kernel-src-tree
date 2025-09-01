@@ -957,6 +957,7 @@ void __mmdrop(struct mm_struct *mm)
 	put_user_ns(mm->user_ns);
 	mm_pasid_drop(mm);
 	percpu_counter_destroy_many(mm->rss_stat, NR_MM_COUNTERS);
+	futex_hash_free(mm);
 
 	free_mm(mm);
 }
@@ -1382,7 +1383,6 @@ static inline void __mmput(struct mm_struct *mm)
 	if (mm->binfmt)
 		module_put(mm->binfmt->module);
 	lru_gen_del_mm(mm);
-	futex_hash_free(mm);
 	mmdrop(mm);
 }
 
