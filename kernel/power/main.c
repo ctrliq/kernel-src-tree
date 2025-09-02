@@ -608,7 +608,8 @@ bool pm_debug_messages_on __read_mostly;
 
 bool pm_debug_messages_should_print(void)
 {
-	return pm_debug_messages_on && pm_suspend_in_progress();
+	return pm_debug_messages_on && (pm_suspend_in_progress() ||
+		hibernation_in_progress());
 }
 EXPORT_SYMBOL_GPL(pm_debug_messages_should_print);
 
