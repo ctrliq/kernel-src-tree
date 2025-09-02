@@ -22,7 +22,7 @@ def process_git_request(fname, target_branch, source_branch, prj_dir)
 #  puts "Working Dir : " + working_dir
   Dir.chdir working_dir
 #  puts "pwd : " + Dir.pwd
-  git_cmd = "git log --oneline --no-abbrev-commit origin/" + target_branch + ".." + "origin/" + source_branch
+  git_cmd = "git log --oneline --no-abbrev-commit base_repo/" + target_branch + ".." + "origin/" + source_branch
 #  puts git_cmd
   out, err, status = Open3.capture3(git_cmd)
   if status.exitstatus != 0
