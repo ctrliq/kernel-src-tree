@@ -2195,13 +2195,8 @@ static inline void __set_task_cpu(struct task_struct *p, unsigned int cpu)
 }
 
 /*
- * Tunables that become constants when CONFIG_SCHED_DEBUG is off:
+ * Tunables:
  */
-#ifdef CONFIG_SCHED_DEBUG
-# define const_debug __read_mostly
-#else
-# define const_debug const
-#endif
 
 #define SCHED_FEAT(name, enabled)	\
 	__SCHED_FEAT_##name ,
@@ -2219,7 +2214,7 @@ enum {
  * To support run-time toggling of sched features, all the translation units
  * (but core.c) reference the sysctl_sched_features defined in core.c.
  */
-extern const_debug unsigned int sysctl_sched_features;
+extern __read_mostly unsigned int sysctl_sched_features;
 
 #ifdef CONFIG_JUMP_LABEL
 
@@ -2250,7 +2245,7 @@ extern struct static_key sched_feat_keys[__SCHED_FEAT_NR];
  */
 #define SCHED_FEAT(name, enabled)	\
 	(1UL << __SCHED_FEAT_##name) * enabled |
-static const_debug __maybe_unused unsigned int sysctl_sched_features =
+static __read_mostly __maybe_unused unsigned int sysctl_sched_features =
 #include "features.h"
 	0;
 #undef SCHED_FEAT
@@ -2838,8 +2833,8 @@ extern void wakeup_preempt(struct rq *rq, struct task_struct *p, int flags);
 # define SCHED_NR_MIGRATE_BREAK 32
 #endif
 
-extern const_debug unsigned int sysctl_sched_nr_migrate;
-extern const_debug unsigned int sysctl_sched_migration_cost;
+extern __read_mostly unsigned int sysctl_sched_nr_migrate;
+extern __read_mostly unsigned int sysctl_sched_migration_cost;
 
 extern unsigned int sysctl_sched_base_slice;
 
