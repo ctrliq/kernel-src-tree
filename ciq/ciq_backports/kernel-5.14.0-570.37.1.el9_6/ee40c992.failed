@@ -1,0 +1,421 @@
+mm: fix copy_vma() error handling for hugetlb mappings
+
+jira LE-4018
+Rebuild_History Non-Buildable kernel-5.14.0-570.37.1.el9_6
+commit-author Ricardo Cañuelo Navarro <rcn@igalia.com>
+commit ee40c9920ac286c5bfe7c811e66ff899266d2582
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-570.37.1.el9_6/ee40c992.failed
+
+If, during a mremap() operation for a hugetlb-backed memory mapping,
+copy_vma() fails after the source vma has been duplicated and opened (ie. 
+vma_link() fails), the error is handled by closing the new vma.  This
+updates the hugetlbfs reservation counter of the reservation map which at
+this point is referenced by both the source vma and the new copy.  As a
+result, once the new vma has been freed and copy_vma() returns, the
+reservation counter for the source vma will be incorrect.
+
+This patch addresses this corner case by clearing the hugetlb private page
+reservation reference for the new vma and decrementing the reference
+before closing the vma, so that vma_close() won't update the reservation
+counter.  This is also what copy_vma_and_data() does with the source vma
+if copy_vma() succeeds, so a helper function has been added to do the
+fixup in both functions.
+
+The issue was reported by a private syzbot instance and can be reproduced
+using the C reproducer in [1].  It's also a possible duplicate of public
+syzbot report [2].  The WARNING report is:
+
+============================================================
+page_counter underflow: -1024 nr_pages=1024
+WARNING: CPU: 0 PID: 3287 at mm/page_counter.c:61 page_counter_cancel+0xf6/0x120
+Modules linked in:
+CPU: 0 UID: 0 PID: 3287 Comm: repro__WARNING_ Not tainted 6.15.0-rc7+ #54 NONE
+Hardware name: QEMU Standard PC (Q35 + ICH9, 2009), BIOS rel-1.16.3-2-gc13ff2cd-prebuilt.qemu.org 04/01/2014
+RIP: 0010:page_counter_cancel+0xf6/0x120
+Code: ff 5b 41 5e 41 5f 5d c3 cc cc cc cc e8 f3 4f 8f ff c6 05 64 01 27 06 01 48 c7 c7 60 15 f8 85 48 89 de 4c 89 fa e8 2a a7 51 ff <0f> 0b e9 66 ff ff ff 44 89 f9 80 e1 07 38 c1 7c 9d 4c 81
+RSP: 0018:ffffc900025df6a0 EFLAGS: 00010246
+RAX: 2edfc409ebb44e00 RBX: fffffffffffffc00 RCX: ffff8880155f0000
+RDX: 0000000000000000 RSI: 0000000000000001 RDI: 0000000000000000
+RBP: dffffc0000000000 R08: ffffffff81c4a23c R09: 1ffff1100330482a
+R10: dffffc0000000000 R11: ffffed100330482b R12: 0000000000000000
+R13: ffff888058a882c0 R14: ffff888058a882c0 R15: 0000000000000400
+FS:  0000000000000000(0000) GS:ffff88808fc53000(0000) knlGS:0000000000000000
+CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+CR2: 00000000004b33e0 CR3: 00000000076d6000 CR4: 00000000000006f0
+Call Trace:
+ <TASK>
+ page_counter_uncharge+0x33/0x80
+ hugetlb_cgroup_uncharge_counter+0xcb/0x120
+ hugetlb_vm_op_close+0x579/0x960
+ ? __pfx_hugetlb_vm_op_close+0x10/0x10
+ remove_vma+0x88/0x130
+ exit_mmap+0x71e/0xe00
+ ? __pfx_exit_mmap+0x10/0x10
+ ? __mutex_unlock_slowpath+0x22e/0x7f0
+ ? __pfx_exit_aio+0x10/0x10
+ ? __up_read+0x256/0x690
+ ? uprobe_clear_state+0x274/0x290
+ ? mm_update_next_owner+0xa9/0x810
+ __mmput+0xc9/0x370
+ exit_mm+0x203/0x2f0
+ ? __pfx_exit_mm+0x10/0x10
+ ? taskstats_exit+0x32b/0xa60
+ do_exit+0x921/0x2740
+ ? do_raw_spin_lock+0x155/0x3b0
+ ? __pfx_do_exit+0x10/0x10
+ ? __pfx_do_raw_spin_lock+0x10/0x10
+ ? _raw_spin_lock_irq+0xc5/0x100
+ do_group_exit+0x20c/0x2c0
+ get_signal+0x168c/0x1720
+ ? __pfx_get_signal+0x10/0x10
+ ? schedule+0x165/0x360
+ arch_do_signal_or_restart+0x8e/0x7d0
+ ? __pfx_arch_do_signal_or_restart+0x10/0x10
+ ? __pfx___se_sys_futex+0x10/0x10
+ syscall_exit_to_user_mode+0xb8/0x2c0
+ do_syscall_64+0x75/0x120
+ entry_SYSCALL_64_after_hwframe+0x76/0x7e
+RIP: 0033:0x422dcd
+Code: Unable to access opcode bytes at 0x422da3.
+RSP: 002b:00007ff266cdb208 EFLAGS: 00000246 ORIG_RAX: 00000000000000ca
+RAX: 0000000000000001 RBX: 00007ff266cdbcdc RCX: 0000000000422dcd
+RDX: 00000000000f4240 RSI: 0000000000000081 RDI: 00000000004c7bec
+RBP: 00007ff266cdb220 R08: 203a6362696c6720 R09: 203a6362696c6720
+R10: 0000200000c00000 R11: 0000000000000246 R12: ffffffffffffffd0
+R13: 0000000000000002 R14: 00007ffe1cb5f520 R15: 00007ff266cbb000
+ </TASK>
+============================================================
+
+Link: https://lkml.kernel.org/r/20250523-warning_in_page_counter_cancel-v2-1-b6df1a8cfefd@igalia.com
+Link: https://people.igalia.com/rcn/kernel_logs/20250422__WARNING_in_page_counter_cancel__repro.c [1]
+Link: https://lore.kernel.org/all/67000a50.050a0220.49194.048d.GAE@google.com/ [2]
+	Signed-off-by: Ricardo Cañuelo Navarro <rcn@igalia.com>
+	Suggested-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+	Reviewed-by: Liam R. Howlett <Liam.Howlett@oracle.com>
+	Cc: Florent Revest <revest@google.com>
+	Cc: Jann Horn <jannh@google.com>
+	Cc: Oscar Salvador <osalvador@suse.de>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit ee40c9920ac286c5bfe7c811e66ff899266d2582)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hugetlb.c
+#	mm/mremap.c
+#	mm/vma.c
+diff --cc mm/hugetlb.c
+index 9bd3d9ecf80c,6a3cf7935c14..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -7439,155 -7940,16 +7439,171 @@@ void hugetlb_unshare_all_pmds(struct vm
+  			ALIGN_DOWN(vma->vm_end, PUD_SIZE));
+  }
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_CMA
+ +static bool cma_reserve_called __initdata;
+ +
+ +static int __init cmdline_parse_hugetlb_cma(char *p)
+ +{
+ +	int nid, count = 0;
+ +	unsigned long tmp;
+ +	char *s = p;
+ +
+ +	while (*s) {
+ +		if (sscanf(s, "%lu%n", &tmp, &count) != 1)
+ +			break;
+ +
+ +		if (s[count] == ':') {
+ +			if (tmp >= MAX_NUMNODES)
+ +				break;
+ +			nid = array_index_nospec(tmp, MAX_NUMNODES);
+ +
+ +			s += count + 1;
+ +			tmp = memparse(s, &s);
+ +			hugetlb_cma_size_in_node[nid] = tmp;
+ +			hugetlb_cma_size += tmp;
+ +
+ +			/*
+ +			 * Skip the separator if have one, otherwise
+ +			 * break the parsing.
+ +			 */
+ +			if (*s == ',')
+ +				s++;
+ +			else
+ +				break;
+ +		} else {
+ +			hugetlb_cma_size = memparse(p, &p);
+ +			break;
+ +		}
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+ +early_param("hugetlb_cma", cmdline_parse_hugetlb_cma);
+ +
+ +void __init hugetlb_cma_reserve(int order)
+ +{
+ +	unsigned long size, reserved, per_node;
+ +	bool node_specific_cma_alloc = false;
+ +	int nid;
+ +
+ +	cma_reserve_called = true;
+ +
+ +	if (!hugetlb_cma_size)
+ +		return;
+ +
+ +	for (nid = 0; nid < MAX_NUMNODES; nid++) {
+ +		if (hugetlb_cma_size_in_node[nid] == 0)
+ +			continue;
+ +
+ +		if (!node_online(nid)) {
+ +			pr_warn("hugetlb_cma: invalid node %d specified\n", nid);
+ +			hugetlb_cma_size -= hugetlb_cma_size_in_node[nid];
+ +			hugetlb_cma_size_in_node[nid] = 0;
+ +			continue;
+ +		}
+ +
+ +		if (hugetlb_cma_size_in_node[nid] < (PAGE_SIZE << order)) {
+ +			pr_warn("hugetlb_cma: cma area of node %d should be at least %lu MiB\n",
+ +				nid, (PAGE_SIZE << order) / SZ_1M);
+ +			hugetlb_cma_size -= hugetlb_cma_size_in_node[nid];
+ +			hugetlb_cma_size_in_node[nid] = 0;
+ +		} else {
+ +			node_specific_cma_alloc = true;
+ +		}
+ +	}
+ +
+ +	/* Validate the CMA size again in case some invalid nodes specified. */
+ +	if (!hugetlb_cma_size)
+ +		return;
+ +
+ +	if (hugetlb_cma_size < (PAGE_SIZE << order)) {
+ +		pr_warn("hugetlb_cma: cma area should be at least %lu MiB\n",
+ +			(PAGE_SIZE << order) / SZ_1M);
+ +		hugetlb_cma_size = 0;
+ +		return;
+ +	}
+ +
+ +	if (!node_specific_cma_alloc) {
+ +		/*
+ +		 * If 3 GB area is requested on a machine with 4 numa nodes,
+ +		 * let's allocate 1 GB on first three nodes and ignore the last one.
+ +		 */
+ +		per_node = DIV_ROUND_UP(hugetlb_cma_size, nr_online_nodes);
+ +		pr_info("hugetlb_cma: reserve %lu MiB, up to %lu MiB per node\n",
+ +			hugetlb_cma_size / SZ_1M, per_node / SZ_1M);
+ +	}
+ +
+ +	reserved = 0;
+ +	for_each_online_node(nid) {
+ +		int res;
+ +		char name[CMA_MAX_NAME];
+ +
+ +		if (node_specific_cma_alloc) {
+ +			if (hugetlb_cma_size_in_node[nid] == 0)
+ +				continue;
+ +
+ +			size = hugetlb_cma_size_in_node[nid];
+ +		} else {
+ +			size = min(per_node, hugetlb_cma_size - reserved);
+ +		}
+ +
+ +		size = round_up(size, PAGE_SIZE << order);
+ +
+ +		snprintf(name, sizeof(name), "hugetlb%d", nid);
+ +		/*
+ +		 * Note that 'order per bit' is based on smallest size that
+ +		 * may be returned to CMA allocator in the case of
+ +		 * huge page demotion.
+ +		 */
+ +		res = cma_declare_contiguous_nid(0, size, 0,
+ +					PAGE_SIZE << order,
+ +					HUGETLB_PAGE_ORDER, false, name,
+ +					&hugetlb_cma[nid], nid);
+ +		if (res) {
+ +			pr_warn("hugetlb_cma: reservation failed: err %d, node %d",
+ +				res, nid);
+ +			continue;
+ +		}
+ +
+ +		reserved += size;
+ +		pr_info("hugetlb_cma: reserved %lu MiB on node %d\n",
+ +			size / SZ_1M, nid);
+ +
+ +		if (reserved >= hugetlb_cma_size)
+ +			break;
+ +	}
+ +
+ +	if (!reserved)
+ +		/*
+ +		 * hugetlb_cma_size is used to determine if allocations from
+ +		 * cma are possible.  Set to zero if no cma regions are set up.
+ +		 */
+ +		hugetlb_cma_size = 0;
+ +}
+ +
+ +static void __init hugetlb_cma_check(void)
+ +{
+ +	if (!hugetlb_cma_size || cma_reserve_called)
+ +		return;
+ +
+ +	pr_warn("hugetlb_cma: the option isn't supported by current arch\n");
+ +}
+ +
+ +#endif /* CONFIG_CMA */
+++=======
++ /*
++  * For hugetlb, mremap() is an odd edge case - while the VMA copying is
++  * performed, we permit both the old and new VMAs to reference the same
++  * reservation.
++  *
++  * We fix this up after the operation succeeds, or if a newly allocated VMA
++  * is closed as a result of a failure to allocate memory.
++  */
++ void fixup_hugetlb_reservations(struct vm_area_struct *vma)
++ {
++ 	if (is_vm_hugetlb_page(vma))
++ 		clear_vma_resv_huge_pages(vma);
++ }
+++>>>>>>> ee40c9920ac2 (mm: fix copy_vma() error handling for hugetlb mappings)
+diff --cc mm/mremap.c
+index 69f5c26eb2d4,0d4948b720e2..000000000000
+--- a/mm/mremap.c
++++ b/mm/mremap.c
+@@@ -666,28 -1178,83 +666,32 @@@ static unsigned long move_vma(struct vm
+  		 * which will succeed since page tables still there,
+  		 * and then proceed to unmap new area instead of old.
+  		 */
+ -		pmc_revert.need_rmap_locks = true;
+ -		move_page_tables(&pmc_revert);
+ -
+ -		vrm->vma = new_vma;
+ -		vrm->old_len = vrm->new_len;
+ -		vrm->addr = vrm->new_addr;
+ +		move_page_tables(new_vma, new_addr, vma, old_addr, moved_len,
+ +				 true);
+ +		vma = new_vma;
+ +		old_len = new_len;
+ +		old_addr = new_addr;
+ +		new_addr = err;
+  	} else {
+ -		mremap_userfaultfd_prep(new_vma, vrm->uf);
+ +		mremap_userfaultfd_prep(new_vma, uf);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (is_vm_hugetlb_page(vma)) {
+ +		clear_vma_resv_huge_pages(vma);
+ +	}
+++=======
++ 	fixup_hugetlb_reservations(vma);
+++>>>>>>> ee40c9920ac2 (mm: fix copy_vma() error handling for hugetlb mappings)
+  
+ -	/* Tell pfnmap has moved from this vma */
+ -	if (unlikely(vma->vm_flags & VM_PFNMAP))
+ -		untrack_pfn_clear(vma);
+ -
+ -	*new_vma_ptr = new_vma;
+ -	return err;
+ -}
+ -
+ -/*
+ - * Perform final tasks for MADV_DONTUNMAP operation, clearing mlock() and
+ - * account flags on remaining VMA by convention (it cannot be mlock()'d any
+ - * longer, as pages in range are no longer mapped), and removing anon_vma_chain
+ - * links from it (if the entire VMA was copied over).
+ - */
+ -static void dontunmap_complete(struct vma_remap_struct *vrm,
+ -			       struct vm_area_struct *new_vma)
+ -{
+ -	unsigned long start = vrm->addr;
+ -	unsigned long end = vrm->addr + vrm->old_len;
+ -	unsigned long old_start = vrm->vma->vm_start;
+ -	unsigned long old_end = vrm->vma->vm_end;
+ -
+ -	/*
+ -	 * We always clear VM_LOCKED[ONFAULT] | VM_ACCOUNT on the old
+ -	 * vma.
+ -	 */
+ -	vm_flags_clear(vrm->vma, VM_LOCKED_MASK | VM_ACCOUNT);
+ -
+ -	/*
+ -	 * anon_vma links of the old vma is no longer needed after its page
+ -	 * table has been moved.
+ -	 */
+ -	if (new_vma != vrm->vma && start == old_start && end == old_end)
+ -		unlink_anon_vmas(vrm->vma);
+ -
+ -	/* Because we won't unmap we don't need to touch locked_vm. */
+ -}
+ -
+ -static unsigned long move_vma(struct vma_remap_struct *vrm)
+ -{
+ -	struct mm_struct *mm = current->mm;
+ -	struct vm_area_struct *new_vma;
+ -	unsigned long hiwater_vm;
+ -	int err;
+ -
+ -	err = prep_move_vma(vrm);
+ -	if (err)
+ -		return err;
+ -
+ -	/* If accounted, charge the number of bytes the operation will use. */
+ -	if (!vrm_charge(vrm))
+ -		return -ENOMEM;
+ -
+ -	/* We don't want racing faults. */
+ -	vma_start_write(vrm->vma);
+ -
+ -	/* Perform copy step. */
+ -	err = copy_vma_and_data(vrm, &new_vma);
+ -	/*
+ -	 * If we established the copied-to VMA, we attempt to recover from the
+ -	 * error by setting the destination VMA to the source VMA and unmapping
+ -	 * it below.
+ -	 */
+ -	if (err && !new_vma)
+ -		return err;
+ +	/* Conceal VM_ACCOUNT so old reservation is not undone */
+ +	if (vm_flags & VM_ACCOUNT && !(flags & MREMAP_DONTUNMAP)) {
+ +		vm_flags_clear(vma, VM_ACCOUNT);
+ +		if (vma->vm_start < old_addr)
+ +			account_start = vma->vm_start;
+ +		if (vma->vm_end > old_addr + old_len)
+ +			account_end = vma->vm_end;
+ +	}
+  
+  	/*
+  	 * If we failed to move page tables we still do total_vm increment
+* Unmerged path mm/vma.c
+diff --git a/include/linux/hugetlb.h b/include/linux/hugetlb.h
+index c496739b6dc1..625ed4301042 100644
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@ -281,6 +281,7 @@ long hugetlb_change_protection(struct vm_area_struct *vma,
+ 
+ bool is_hugetlb_entry_migration(pte_t pte);
+ void hugetlb_unshare_all_pmds(struct vm_area_struct *vma);
++void fixup_hugetlb_reservations(struct vm_area_struct *vma);
+ 
+ #else /* !CONFIG_HUGETLB_PAGE */
+ 
+@@ -490,6 +491,10 @@ static inline vm_fault_t hugetlb_fault(struct mm_struct *mm,
+ 
+ static inline void hugetlb_unshare_all_pmds(struct vm_area_struct *vma) { }
+ 
++static inline void fixup_hugetlb_reservations(struct vm_area_struct *vma)
++{
++}
++
+ #endif /* !CONFIG_HUGETLB_PAGE */
+ /*
+  * hugepages at page global directory. If arch support
+* Unmerged path mm/hugetlb.c
+* Unmerged path mm/mremap.c
+* Unmerged path mm/vma.c
