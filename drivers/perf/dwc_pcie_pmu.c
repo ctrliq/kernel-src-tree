@@ -13,6 +13,7 @@
 #include <linux/errno.h>
 #include <linux/kernel.h>
 #include <linux/list.h>
+#include <linux/pcie-dwc.h>
 #include <linux/perf_event.h>
 #include <linux/pci.h>
 #include <linux/platform_device.h>
@@ -20,7 +21,6 @@
 #include <linux/sysfs.h>
 #include <linux/types.h>
 
-#define DWC_PCIE_VSEC_RAS_DES_ID		0x02
 #define DWC_PCIE_EVENT_CNT_CTL			0x8
 
 /*
@@ -99,16 +99,6 @@ struct dwc_pcie_dev_info {
 	struct platform_device *plat_dev;
 	struct pci_dev *pdev;
 	struct list_head dev_node;
-};
-
-struct dwc_pcie_vendor_id {
-	int vendor_id;
-};
-
-static const struct dwc_pcie_vendor_id dwc_pcie_vendor_ids[] = {
-	{.vendor_id = PCI_VENDOR_ID_ALIBABA },
-	{.vendor_id = PCI_VENDOR_ID_QCOM },
-	{} /* terminator */
 };
 
 static ssize_t cpumask_show(struct device *dev,
@@ -199,8 +189,8 @@ static struct attribute *dwc_pcie_pmu_time_event_attrs[] = {
 	DWC_PCIE_PMU_TIME_BASE_EVENT_ATTR(L1_1, 0x05),
 	DWC_PCIE_PMU_TIME_BASE_EVENT_ATTR(L1_2, 0x06),
 	DWC_PCIE_PMU_TIME_BASE_EVENT_ATTR(CFG_RCVRY, 0x07),
-	DWC_PCIE_PMU_TIME_BASE_EVENT_ATTR(TX_RX_L0S, 0x08),
-	DWC_PCIE_PMU_TIME_BASE_EVENT_ATTR(L1_AUX, 0x09),
+	DWC_PCIE_PMU_TIME_BASE_EVENT_ATTR(L1_AUX, 0x08),
+	DWC_PCIE_PMU_TIME_BASE_EVENT_ATTR(TX_RX_L0S, 0x09),
 
 	/* Group #1 */
 	DWC_PCIE_PMU_TIME_BASE_EVENT_ATTR(Tx_PCIe_TLP_Data_Payload, 0x20),
@@ -216,9 +206,9 @@ static struct attribute *dwc_pcie_pmu_time_event_attrs[] = {
 	DWC_PCIE_PMU_LANE_EVENT_ATTR(tx_update_fc_dllp, 0x601),
 	DWC_PCIE_PMU_LANE_EVENT_ATTR(rx_ack_dllp, 0x602),
 	DWC_PCIE_PMU_LANE_EVENT_ATTR(rx_update_fc_dllp, 0x603),
-	DWC_PCIE_PMU_LANE_EVENT_ATTR(rx_nulified_tlp, 0x604),
-	DWC_PCIE_PMU_LANE_EVENT_ATTR(tx_nulified_tlp, 0x605),
-	DWC_PCIE_PMU_LANE_EVENT_ATTR(rx_duplicate_tl, 0x606),
+	DWC_PCIE_PMU_LANE_EVENT_ATTR(rx_nullified_tlp, 0x604),
+	DWC_PCIE_PMU_LANE_EVENT_ATTR(tx_nullified_tlp, 0x605),
+	DWC_PCIE_PMU_LANE_EVENT_ATTR(rx_duplicate_tlp, 0x606),
 	DWC_PCIE_PMU_LANE_EVENT_ATTR(tx_memory_write, 0x700),
 	DWC_PCIE_PMU_LANE_EVENT_ATTR(tx_memory_read, 0x701),
 	DWC_PCIE_PMU_LANE_EVENT_ATTR(tx_configuration_write, 0x702),
@@ -519,31 +509,28 @@ static void dwc_pcie_unregister_pmu(void *data)
 	perf_pmu_unregister(&pcie_pmu->pmu);
 }
 
-static bool dwc_pcie_match_des_cap(struct pci_dev *pdev)
+static u16 dwc_pcie_des_cap(struct pci_dev *pdev)
 {
-	const struct dwc_pcie_vendor_id *vid;
-	u16 vsec = 0;
+	const struct dwc_pcie_vsec_id *vid;
+	u16 vsec;
 	u32 val;
 
 	if (!pci_is_pcie(pdev) || !(pci_pcie_type(pdev) == PCI_EXP_TYPE_ROOT_PORT))
-		return false;
+		return 0;
 
-	for (vid = dwc_pcie_vendor_ids; vid->vendor_id; vid++) {
+	for (vid = dwc_pcie_rasdes_vsec_ids; vid->vendor_id; vid++) {
 		vsec = pci_find_vsec_capability(pdev, vid->vendor_id,
-						DWC_PCIE_VSEC_RAS_DES_ID);
-		if (vsec)
-			break;
+						vid->vsec_id);
+		if (vsec) {
+			pci_read_config_dword(pdev, vsec + PCI_VNDR_HEADER,
+					      &val);
+			if (PCI_VNDR_HEADER_REV(val) == vid->vsec_rev) {
+				pci_dbg(pdev, "Detected PCIe Vendor-Specific Extended Capability RAS DES\n");
+				return vsec;
+			}
+		}
 	}
-	if (!vsec)
-		return false;
-
-	pci_read_config_dword(pdev, vsec + PCI_VNDR_HEADER, &val);
-	if (PCI_VNDR_HEADER_REV(val) != 0x04)
-		return false;
-
-	pci_dbg(pdev,
-		"Detected PCIe Vendor-Specific Extended Capability RAS DES\n");
-	return true;
+	return 0;
 }
 
 static void dwc_pcie_unregister_dev(struct dwc_pcie_dev_info *dev_info)
@@ -587,7 +574,7 @@ static int dwc_pcie_pmu_notifier(struct notifier_block *nb,
 
 	switch (action) {
 	case BUS_NOTIFY_ADD_DEVICE:
-		if (!dwc_pcie_match_des_cap(pdev))
+		if (!dwc_pcie_des_cap(pdev))
 			return NOTIFY_DONE;
 		if (dwc_pcie_register_dev(pdev))
 			return NOTIFY_BAD;
@@ -612,13 +599,14 @@ static int dwc_pcie_pmu_probe(struct platform_device *plat_dev)
 	struct pci_dev *pdev = plat_dev->dev.platform_data;
 	struct dwc_pcie_pmu *pcie_pmu;
 	char *name;
-	u32 sbdf, val;
+	u32 sbdf;
 	u16 vsec;
 	int ret;
 
-	vsec = pci_find_vsec_capability(pdev, pdev->vendor,
-					DWC_PCIE_VSEC_RAS_DES_ID);
-	pci_read_config_dword(pdev, vsec + PCI_VNDR_HEADER, &val);
+	vsec = dwc_pcie_des_cap(pdev);
+	if (!vsec)
+		return -ENODEV;
+
 	sbdf = plat_dev->id;
 	name = devm_kasprintf(&plat_dev->dev, GFP_KERNEL, "dwc_rootport_%x", sbdf);
 	if (!name)
@@ -730,7 +718,7 @@ static int __init dwc_pcie_pmu_init(void)
 	int ret;
 
 	for_each_pci_dev(pdev) {
-		if (!dwc_pcie_match_des_cap(pdev))
+		if (!dwc_pcie_des_cap(pdev))
 			continue;
 
 		ret = dwc_pcie_register_dev(pdev);
