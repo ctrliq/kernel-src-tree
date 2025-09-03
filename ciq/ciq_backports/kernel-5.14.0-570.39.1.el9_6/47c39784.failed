@@ -1,0 +1,69 @@
+s390/pci: Prevent self deletion in disable_slot()
+
+jira LE-4018
+Rebuild_History Non-Buildable kernel-5.14.0-570.39.1.el9_6
+commit-author Niklas Schnelle <schnelle@linux.ibm.com>
+commit 47c397844869ad0e6738afb5879c7492f4691122
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-570.39.1.el9_6/47c39784.failed
+
+As disable_slot() takes a struct zpci_dev from the Configured to the
+Standby state. In Standby there is still a hotplug slot so this is not
+usually a case of sysfs self deletion. This is important because self
+deletion gets very hairy in terms of locking (see for example
+recover_store() in arch/s390/pci/pci_sysfs.c).
+
+Because the pci_dev_put() is not within the critical section of the
+zdev->state_lock however, disable_slot() can turn into a case of self
+deletion if zPCI device event handling slips between the mutex_unlock()
+and the pci_dev_put(). If the latter is the last put and
+zpci_release_device() is called this then tries to remove the hotplug
+slot via zpci_exit_slot() which will try to remove the hotplug slot
+directory the disable_slot() is part of i.e. self deletion.
+
+Prevent this by widening the zdev->state_lock critical section to
+include the pci_dev_put() which is then guaranteed to happen with the
+struct zpci_dev still in Standby state ensuring it will not lead to
+a zpci_release_device() call as at least the zPCI event handling code
+still holds a reference.
+
+	Cc: stable@vger.kernel.org
+Fixes: a46044a92add ("s390/pci: fix zpci_zdev_put() on reserve")
+	Reviewed-by: Gerd Bayer <gbayer@linux.ibm.com>
+	Tested-by: Gerd Bayer <gbayer@linux.ibm.com>
+	Signed-off-by: Niklas Schnelle <schnelle@linux.ibm.com>
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+(cherry picked from commit 47c397844869ad0e6738afb5879c7492f4691122)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/hotplug/s390_pci_hpc.c
+diff --cc drivers/pci/hotplug/s390_pci_hpc.c
+index a89b7de72dcf,3d26d273f29d..000000000000
+--- a/drivers/pci/hotplug/s390_pci_hpc.c
++++ b/drivers/pci/hotplug/s390_pci_hpc.c
+@@@ -50,11 -60,16 +50,20 @@@ static int disable_slot(struct hotplug_
+  	pdev = pci_get_slot(zdev->zbus->bus, zdev->devfn);
+  	if (pdev && pci_num_vf(pdev)) {
+  		pci_dev_put(pdev);
+ -		rc = -EBUSY;
+ -		goto out;
+ +		return -EBUSY;
+  	}
+ +	pci_dev_put(pdev);
+  
+++<<<<<<< HEAD
+ +	return zpci_deconfigure_device(zdev);
+++=======
++ 	rc = zpci_deconfigure_device(zdev);
++ out:
++ 	if (pdev)
++ 		pci_dev_put(pdev);
++ 	mutex_unlock(&zdev->state_lock);
++ 	return rc;
+++>>>>>>> 47c397844869 (s390/pci: Prevent self deletion in disable_slot())
+  }
+  
+  static int reset_slot(struct hotplug_slot *hotplug_slot, bool probe)
+* Unmerged path drivers/pci/hotplug/s390_pci_hpc.c
