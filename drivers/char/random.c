@@ -1356,6 +1356,8 @@ static void __cold try_to_generate_entropy(void)
 	destroy_timer_on_stack(&stack->timer);
 }
 
+/* extrng is the hook for an external RNG */
+static const struct random_extrng *extrng __ro_after_init;
 
 /**********************************************************************
  *
@@ -1399,6 +1401,13 @@ SYSCALL_DEFINE3(getrandom, char __user *, ubuf, size_t, len, unsigned int, flags
 	 */
 	if ((flags & (GRND_INSECURE | GRND_RANDOM)) == (GRND_INSECURE | GRND_RANDOM))
 		return -EINVAL;
+
+	if (extrng) {
+		ret = import_ubuf(ITER_DEST, ubuf, len, &iter);
+		if (unlikely(ret))
+			return ret;
+		return extrng->extrng_read_iter(&iter, !!(flags & GRND_RANDOM));
+	}
 
 	if (!crng_ready() && !(flags & GRND_INSECURE)) {
 		if (flags & GRND_NONBLOCK)
@@ -1560,7 +1569,72 @@ static int random_fasync(int fd, struct file *filp, int on)
 	return fasync_helper(fd, filp, on, &fasync);
 }
 
+/* External RNG plumbing */
+static const struct file_operations extrng_random_fops;
+static const struct file_operations extrng_urandom_fops;
+
+void __init random_register_extrng(const struct random_extrng *rng)
+{
+	/* Don't allow the registered extrng to be overridden */
+	BUG_ON(extrng);
+	extrng = rng;
+}
+
+static int random_open(struct inode *inode, struct file *filp)
+{
+	if (extrng)
+		filp->f_op = &extrng_random_fops;
+
+	return 0;
+}
+
+static int urandom_open(struct inode *inode, struct file *filp)
+{
+	if (extrng)
+		filp->f_op = &extrng_urandom_fops;
+
+	return 0;
+}
+
+static ssize_t
+extrng_read_iter(struct kiocb *kiocb, struct iov_iter *iter)
+{
+	return extrng->extrng_read_iter(iter, false);
+}
+
+static __poll_t extrng_poll(struct file *file, poll_table * wait)
+{
+	/* extrng pool is always full, always read, no writes */
+	return EPOLLIN | EPOLLRDNORM;
+}
+
+static const struct file_operations extrng_random_fops = {
+	.open = random_open,
+	.read_iter = extrng_read_iter,
+	.write_iter = random_write_iter,
+	.poll = extrng_poll,
+	.unlocked_ioctl = random_ioctl,
+	.compat_ioctl = compat_ptr_ioctl,
+	.fasync = random_fasync,
+	.llseek = noop_llseek,
+	.splice_read = copy_splice_read,
+	.splice_write = iter_file_splice_write,
+};
+
+static const struct file_operations extrng_urandom_fops = {
+	.open = urandom_open,
+	.read_iter = extrng_read_iter,
+	.write_iter = random_write_iter,
+	.unlocked_ioctl = random_ioctl,
+	.compat_ioctl = compat_ptr_ioctl,
+	.fasync = random_fasync,
+	.llseek = noop_llseek,
+	.splice_read = copy_splice_read,
+	.splice_write = iter_file_splice_write,
+};
+
 const struct file_operations random_fops = {
+	.open = random_open,
 	.read_iter = random_read_iter,
 	.write_iter = random_write_iter,
 	.poll = random_poll,
@@ -1573,6 +1647,7 @@ const struct file_operations random_fops = {
 };
 
 const struct file_operations urandom_fops = {
+	.open = urandom_open,
 	.read_iter = urandom_read_iter,
 	.write_iter = random_write_iter,
 	.unlocked_ioctl = random_ioctl,

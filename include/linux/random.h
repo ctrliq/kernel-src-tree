@@ -159,6 +159,13 @@ int random_online_cpu(unsigned int cpu);
 
 #ifndef MODULE
 extern const struct file_operations random_fops, urandom_fops;
+
+struct iov_iter;
+struct random_extrng {
+	ssize_t (*extrng_read_iter)(struct iov_iter *iter, bool reseed);
+};
+
+void __init random_register_extrng(const struct random_extrng *rng);
 #endif
 
 #endif /* _LINUX_RANDOM_H */
