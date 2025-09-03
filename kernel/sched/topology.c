@@ -17,8 +17,6 @@ void sched_domains_mutex_unlock(void)
 	mutex_unlock(&sched_domains_mutex);
 }
 
-#ifdef CONFIG_SMP
-
 /* Protected by sched_domains_mutex: */
 static cpumask_var_t sched_domains_tmpmask;
 static cpumask_var_t sched_domains_tmpmask2;
@@ -1337,11 +1335,10 @@ next:
 	update_group_capacity(sd, cpu);
 }
 
-#ifdef CONFIG_SMP
-
 /* Update the "asym_prefer_cpu" when arch_asym_cpu_priority() changes. */
 void sched_update_asym_prefer_cpu(int cpu, int old_prio, int new_prio)
 {
+#ifdef CONFIG_SMP
 	int asym_prefer_cpu = cpu;
 	struct sched_domain *sd;
 
@@ -1391,9 +1388,8 @@ void sched_update_asym_prefer_cpu(int cpu, int old_prio, int new_prio)
 
 		WRITE_ONCE(sg->asym_prefer_cpu, asym_prefer_cpu);
 	}
-}
-
 #endif /* CONFIG_SMP */
+}
 
 /*
  * Set of available CPUs grouped by their corresponding capacities
@@ -2840,5 +2836,3 @@ void partition_sched_domains(int ndoms_new, cpumask_var_t doms_new[],
 	partition_sched_domains_locked(ndoms_new, doms_new, dattr_new);
 	sched_domains_mutex_unlock();
 }
-
-#endif /* CONFIG_SMP */
