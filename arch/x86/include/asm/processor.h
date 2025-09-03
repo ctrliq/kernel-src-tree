@@ -111,7 +111,9 @@ struct cpuinfo_topology {
 	// Cache level topology IDs
 	u32			llc_id;
 	u32			l2c_id;
+};
 
+struct cpuinfo_topology_rh {
 	// Hardware defined CPU-type
 	union {
 		u32		cpu_type;
@@ -197,7 +199,8 @@ struct cpuinfo_x86 {
 	/* Address space bits used by the cache internally */
 	u8			x86_cache_bits;
 	unsigned		initialized : 1;
-	RH_KABI_RESERVE(1)
+
+	RH_KABI_USE(1, struct cpuinfo_topology_rh topo_rh)
 	RH_KABI_RESERVE(2)
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)
