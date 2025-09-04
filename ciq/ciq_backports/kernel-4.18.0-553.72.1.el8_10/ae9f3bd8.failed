@@ -1,0 +1,180 @@
+gfs2: replace sd_aspace with sd_inode
+
+jira LE-4066
+Rebuild_History Non-Buildable kernel-4.18.0-553.72.1.el8_10
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit ae9f3bd8259a0a8f67be2420e66bb05fbb95af48
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.72.1.el8_10/ae9f3bd8.failed
+
+Currently, sdp->sd_aspace and the per-inode metadata address spaces use
+sb->s_bdev->bd_mapping->host as their ->host; folios in those address
+spaces will thus appear to be on bdev rather than on gfs2 filesystems.
+This is a problem because gfs2 doesn't support cgroup writeback
+(SB_I_CGROUPWB), but bdev does.
+
+Fix that by using a "dummy" gfs2 inode as ->host in those address
+spaces.  When coming from a folio, folio->mapping->host->i_sb will then
+be a gfs2 super block and the SB_I_CGROUPWB flag will not be set in
+sb->s_iflags.
+
+Based on a previous version from Bob Peterson from several years ago.
+Thanks to Tetsuo Handa, Jan Kara, and Rafael Aquini for helping figure
+this out.
+
+Fixes: aaa2cacf8184 ("writeback: add lockdep annotation to inode_to_wb()")
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit ae9f3bd8259a0a8f67be2420e66bb05fbb95af48)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/glock.c
+#	fs/gfs2/ops_fstype.c
+diff --cc fs/gfs2/glock.c
+index d4ed72da24eb,ba25b884169e..000000000000
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@@ -1232,10 -1228,10 +1231,14 @@@ int gfs2_glock_get(struct gfs2_sbd *sdp
+  	mapping = gfs2_glock2aspace(gl);
+  	if (mapping) {
+                  mapping->a_ops = &gfs2_meta_aops;
+++<<<<<<< HEAD
+ +		mapping->host = s->s_bdev->bd_inode;
+++=======
++ 		mapping->host = sdp->sd_inode;
+++>>>>>>> ae9f3bd8259a (gfs2: replace sd_aspace with sd_inode)
+  		mapping->flags = 0;
+  		mapping_set_gfp_mask(mapping, GFP_NOFS);
+ -		mapping->i_private_data = NULL;
+ +		mapping->private_data = NULL;
+  		mapping->writeback_index = 0;
+  	}
+  
+diff --cc fs/gfs2/ops_fstype.c
+index 980420dd685c,6ce475e1c6d6..000000000000
+--- a/fs/gfs2/ops_fstype.c
++++ b/fs/gfs2/ops_fstype.c
+@@@ -111,16 -108,6 +110,19 @@@ static struct gfs2_sbd *init_sbd(struc
+  
+  	INIT_LIST_HEAD(&sdp->sd_sc_inodes_list);
+  
+++<<<<<<< HEAD
+ +	mapping = &sdp->sd_aspace;
+ +
+ +	address_space_init_once(mapping);
+ +	mapping->a_ops = &gfs2_rgrp_aops;
+ +	mapping->host = sb->s_bdev->bd_inode;
+ +	mapping->flags = 0;
+ +	mapping_set_gfp_mask(mapping, GFP_NOFS);
+ +	mapping->private_data = NULL;
+ +	mapping->writeback_index = 0;
+ +
+++=======
+++>>>>>>> ae9f3bd8259a (gfs2: replace sd_aspace with sd_inode)
+  	spin_lock_init(&sdp->sd_log_lock);
+  	atomic_set(&sdp->sd_log_pinned, 0);
+  	INIT_LIST_HEAD(&sdp->sd_log_revokes);
+@@@ -1138,9 -1146,9 +1141,10 @@@ static int gfs2_fill_super(struct super
+  	sb->s_flags |= SB_NOSEC;
+  	sb->s_magic = GFS2_MAGIC;
+  	sb->s_op = &gfs2_super_ops;
++ 
+  	sb->s_d_op = &gfs2_dops;
+  	sb->s_export_op = &gfs2_export_ops;
+ +	sb->s_xattr = gfs2_xattr_handlers;
+  	sb->s_qcop = &gfs2_quotactl_ops;
+  	sb->s_quota_types = QTYPE_MASK_USR | QTYPE_MASK_GRP;
+  	sb_dqopt(sb)->flags |= DQUOT_QUOTA_SYS_FILE;
+* Unmerged path fs/gfs2/glock.c
+diff --git a/fs/gfs2/glops.c b/fs/gfs2/glops.c
+index f5c1a620d310..df719586d089 100644
+--- a/fs/gfs2/glops.c
++++ b/fs/gfs2/glops.c
+@@ -167,7 +167,7 @@ void gfs2_ail_flush(struct gfs2_glock *gl, bool fsync)
+ static int gfs2_rgrp_metasync(struct gfs2_glock *gl)
+ {
+ 	struct gfs2_sbd *sdp = gl->gl_name.ln_sbd;
+-	struct address_space *metamapping = &sdp->sd_aspace;
++	struct address_space *metamapping = gfs2_aspace(sdp);
+ 	struct gfs2_rgrpd *rgd = gfs2_glock2rgrp(gl);
+ 	const unsigned bsize = sdp->sd_sb.sb_bsize;
+ 	loff_t start = (rgd->rd_addr * bsize) & PAGE_MASK;
+@@ -224,7 +224,7 @@ static int rgrp_go_sync(struct gfs2_glock *gl)
+ static void rgrp_go_inval(struct gfs2_glock *gl, int flags)
+ {
+ 	struct gfs2_sbd *sdp = gl->gl_name.ln_sbd;
+-	struct address_space *mapping = &sdp->sd_aspace;
++	struct address_space *mapping = gfs2_aspace(sdp);
+ 	struct gfs2_rgrpd *rgd = gfs2_glock2rgrp(gl);
+ 	const unsigned bsize = sdp->sd_sb.sb_bsize;
+ 	loff_t start, end;
+diff --git a/fs/gfs2/incore.h b/fs/gfs2/incore.h
+index e4434b496578..6eca783f0691 100644
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@ -800,7 +800,7 @@ struct gfs2_sbd {
+ 
+ 	/* Log stuff */
+ 
+-	struct address_space sd_aspace;
++	struct inode *sd_inode;
+ 
+ 	spinlock_t sd_log_lock;
+ 
+@@ -856,6 +856,13 @@ struct gfs2_sbd {
+ 	unsigned long sd_glock_dqs_held;
+ };
+ 
++#define GFS2_BAD_INO 1
++
++static inline struct address_space *gfs2_aspace(struct gfs2_sbd *sdp)
++{
++	return sdp->sd_inode->i_mapping;
++}
++
+ static inline void gfs2_glstats_inc(struct gfs2_glock *gl, int which)
+ {
+ 	gl->gl_stats.stats[which]++;
+diff --git a/fs/gfs2/meta_io.c b/fs/gfs2/meta_io.c
+index cc86e32b1636..6ca7376b181d 100644
+--- a/fs/gfs2/meta_io.c
++++ b/fs/gfs2/meta_io.c
+@@ -121,7 +121,7 @@ struct buffer_head *gfs2_getbuf(struct gfs2_glock *gl, u64 blkno, int create)
+ 	unsigned int bufnum;
+ 
+ 	if (mapping == NULL)
+-		mapping = &sdp->sd_aspace;
++		mapping = gfs2_aspace(sdp);
+ 
+ 	shift = PAGE_SHIFT - sdp->sd_sb.sb_bsize_shift;
+ 	index = blkno >> shift;             /* convert block to page */
+diff --git a/fs/gfs2/meta_io.h b/fs/gfs2/meta_io.h
+index 2feef0568ae8..bb592a912aa8 100644
+--- a/fs/gfs2/meta_io.h
++++ b/fs/gfs2/meta_io.h
+@@ -47,9 +47,7 @@ static inline struct gfs2_sbd *gfs2_mapping2sbd(struct address_space *mapping)
+ 		struct gfs2_glock_aspace *gla =
+ 			container_of(mapping, struct gfs2_glock_aspace, mapping);
+ 		return gla->glock.gl_name.ln_sbd;
+-	} else if (mapping->a_ops == &gfs2_rgrp_aops)
+-		return container_of(mapping, struct gfs2_sbd, sd_aspace);
+-	else
++	} else
+ 		return inode->i_sb->s_fs_info;
+ }
+ 
+* Unmerged path fs/gfs2/ops_fstype.c
+diff --git a/fs/gfs2/super.c b/fs/gfs2/super.c
+index aa37649ec01f..9243f0cab306 100644
+--- a/fs/gfs2/super.c
++++ b/fs/gfs2/super.c
+@@ -670,7 +670,7 @@ static void gfs2_put_super(struct super_block *sb)
+ 	gfs2_jindex_free(sdp);
+ 	/*  Take apart glock structures and buffer lists  */
+ 	gfs2_gl_hash_clear(sdp);
+-	truncate_inode_pages_final(&sdp->sd_aspace);
++	iput(sdp->sd_inode);
+ 	gfs2_delete_debugfs_file(sdp);
+ 
+ 	gfs2_sys_fs_del(sdp);
