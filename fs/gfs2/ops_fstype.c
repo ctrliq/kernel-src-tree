@@ -66,7 +66,10 @@ static void gfs2_tune_init(struct gfs2_tune *gt)
 
 void free_sbd(struct gfs2_sbd *sdp)
 {
+	struct super_block *sb = sdp->sd_vfs;
+
 	free_percpu(sdp->sd_lkstats);
+	sb->s_fs_info = NULL;
 	kfree(sdp);
 }
 
@@ -1297,7 +1300,6 @@ fail_glock_wq:
 		destroy_workqueue(sdp->sd_glock_wq);
 fail_free:
 	free_sbd(sdp);
-	sb->s_fs_info = NULL;
 	return error;
 }
 
