@@ -1,0 +1,194 @@
+sbitmap: fix batching wakeup
+
+jira LE-4066
+Rebuild_History Non-Buildable kernel-4.18.0-553.72.1.el8_10
+commit-author David Jeffery <djeffery@redhat.com>
+commit 106397376c0369fcc01c58dd189ff925a2724a57
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.72.1.el8_10/10639737.failed
+
+Current code supposes that it is enough to provide forward progress by
+just waking up one wait queue after one completion batch is done.
+
+Unfortunately this way isn't enough, cause waiter can be added to wait
+queue just after it is woken up.
+
+Follows one example(64 depth, wake_batch is 8)
+
+1) all 64 tags are active
+
+2) in each wait queue, there is only one single waiter
+
+3) each time one completion batch(8 completions) wakes up just one
+   waiter in each wait queue, then immediately one new sleeper is added
+   to this wait queue
+
+4) after 64 completions, 8 waiters are wakeup, and there are still 8
+   waiters in each wait queue
+
+5) after another 8 active tags are completed, only one waiter can be
+   wakeup, and the other 7 can't be waken up anymore.
+
+Turns out it isn't easy to fix this problem, so simply wakeup enough
+waiters for single batch.
+
+	Cc: Kemeng Shi <shikemeng@huaweicloud.com>
+	Cc: Chengming Zhou <zhouchengming@bytedance.com>
+	Cc: Jan Kara <jack@suse.cz>
+	Signed-off-by: David Jeffery <djeffery@redhat.com>
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Reviewed-by: Gabriel Krisman Bertazi <krisman@suse.de>
+	Reviewed-by: Keith Busch <kbusch@kernel.org>
+Link: https://lore.kernel.org/r/20230721095715.232728-1-ming.lei@redhat.com
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 106397376c0369fcc01c58dd189ff925a2724a57)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/sbitmap.c
+diff --cc lib/sbitmap.c
+index 082298015b44,d0a5081dfd12..000000000000
+--- a/lib/sbitmap.c
++++ b/lib/sbitmap.c
+@@@ -566,106 -548,55 +566,115 @@@ void sbitmap_queue_min_shallow_depth(st
+  }
+  EXPORT_SYMBOL_GPL(sbitmap_queue_min_shallow_depth);
+  
+ -static void __sbitmap_queue_wake_up(struct sbitmap_queue *sbq, int nr)
+ +static struct sbq_wait_state *sbq_wake_ptr(struct sbitmap_queue *sbq)
+  {
+- 	int i, wake_index;
++ 	int i, wake_index, woken;
+  
+  	if (!atomic_read(&sbq->ws_active))
+ -		return;
+ +		return NULL;
+  
+  	wake_index = atomic_read(&sbq->wake_index);
+  	for (i = 0; i < SBQ_WAIT_QUEUES; i++) {
+  		struct sbq_wait_state *ws = &sbq->ws[wake_index];
+  
+ -		/*
+ -		 * Advance the index before checking the current queue.
+ -		 * It improves fairness, by ensuring the queue doesn't
+ -		 * need to be fully emptied before trying to wake up
+ -		 * from the next one.
+ -		 */
+ -		wake_index = sbq_index_inc(wake_index);
+ +		if (waitqueue_active(&ws->wait) && atomic_read(&ws->wait_cnt)) {
+ +			if (wake_index != atomic_read(&sbq->wake_index))
+ +				atomic_set(&sbq->wake_index, wake_index);
+ +			return ws;
+ +		}
+  
+++<<<<<<< HEAD
+ +		wake_index = sbq_index_inc(wake_index);
+++=======
++ 		if (waitqueue_active(&ws->wait)) {
++ 			woken = wake_up_nr(&ws->wait, nr);
++ 			if (woken == nr)
++ 				break;
++ 			nr -= woken;
++ 		}
+++>>>>>>> 106397376c03 (sbitmap: fix batching wakeup)
+  	}
+  
+ -	if (wake_index != atomic_read(&sbq->wake_index))
+ -		atomic_set(&sbq->wake_index, wake_index);
+ +	return NULL;
+  }
+  
+ -void sbitmap_queue_wake_up(struct sbitmap_queue *sbq, int nr)
+ +static bool __sbq_wake_up(struct sbitmap_queue *sbq, int *nr)
+  {
+ -	unsigned int wake_batch = READ_ONCE(sbq->wake_batch);
+ -	unsigned int wakeups;
+ +	struct sbq_wait_state *ws;
+ +	unsigned int wake_batch;
+ +	int wait_cnt, cur, sub;
+ +	bool ret;
+  
+ -	if (!atomic_read(&sbq->ws_active))
+ -		return;
+ +	if (*nr <= 0)
+ +		return false;
+  
+ -	atomic_add(nr, &sbq->completion_cnt);
+ -	wakeups = atomic_read(&sbq->wakeup_cnt);
+ +	ws = sbq_wake_ptr(sbq);
+ +	if (!ws)
+ +		return false;
+  
+ +	cur = atomic_read(&ws->wait_cnt);
+  	do {
+ -		if (atomic_read(&sbq->completion_cnt) - wakeups < wake_batch)
+ -			return;
+ -	} while (!atomic_try_cmpxchg(&sbq->wakeup_cnt,
+ -				     &wakeups, wakeups + wake_batch));
+ +		/*
+ +		 * For concurrent callers of this, callers should call this
+ +		 * function again to wakeup a new batch on a different 'ws'.
+ +		 */
+ +		if (cur == 0)
+ +			return true;
+ +		sub = min(*nr, cur);
+ +		wait_cnt = cur - sub;
+ +	} while (!atomic_try_cmpxchg(&ws->wait_cnt, &cur, wait_cnt));
+ +
+ +	/*
+ +	 * If we decremented queue without waiters, retry to avoid lost
+ +	 * wakeups.
+ +	 */
+ +	if (wait_cnt > 0)
+ +		return !waitqueue_active(&ws->wait);
+ +
+ +	*nr -= sub;
+ +
+ +	/*
+ +	 * When wait_cnt == 0, we have to be particularly careful as we are
+ +	 * responsible to reset wait_cnt regardless whether we've actually
+ +	 * woken up anybody. But in case we didn't wakeup anybody, we still
+ +	 * need to retry.
+ +	 */
+ +	ret = !waitqueue_active(&ws->wait);
+ +	wake_batch = READ_ONCE(sbq->wake_batch);
+ +
+ +	/*
+ +	 * Wake up first in case that concurrent callers decrease wait_cnt
+ +	 * while waitqueue is empty.
+ +	 */
+ +	wake_up_nr(&ws->wait, wake_batch);
+ +
+ +	/*
+ +	 * Pairs with the memory barrier in sbitmap_queue_resize() to
+ +	 * ensure that we see the batch size update before the wait
+ +	 * count is reset.
+ +	 *
+ +	 * Also pairs with the implicit barrier between decrementing wait_cnt
+ +	 * and checking for waitqueue_active() to make sure waitqueue_active()
+ +	 * sees result of the wakeup if atomic_dec_return() has seen the result
+ +	 * of atomic_set().
+ +	 */
+ +	smp_mb__before_atomic();
+ +
+ +	/*
+ +	 * Increase wake_index before updating wait_cnt, otherwise concurrent
+ +	 * callers can see valid wait_cnt in old waitqueue, which can cause
+ +	 * invalid wakeup on the old waitqueue.
+ +	 */
+ +	sbq_index_atomic_inc(&sbq->wake_index);
+ +	atomic_set(&ws->wait_cnt, wake_batch);
+ +
+ +	return ret || *nr;
+ +}
+  
+ -	__sbitmap_queue_wake_up(sbq, wake_batch);
+ +void sbitmap_queue_wake_up(struct sbitmap_queue *sbq, int nr)
+ +{
+ +	while (__sbq_wake_up(sbq, &nr))
+ +		;
+  }
+  EXPORT_SYMBOL_GPL(sbitmap_queue_wake_up);
+  
+* Unmerged path lib/sbitmap.c
