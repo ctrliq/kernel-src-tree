@@ -1,0 +1,204 @@
+blk-mq: fix potential io hang by wrong 'wake_batch'
+
+jira LE-4066
+Rebuild_History Non-Buildable kernel-4.18.0-553.72.1.el8_10
+commit-author Yu Kuai <yukuai3@huawei.com>
+commit 4f1731df60f9033669f024d06ae26a6301260b55
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.72.1.el8_10/4f1731df.failed
+
+In __blk_mq_tag_busy/idle(), updating 'active_queues' and calculating
+'wake_batch' is not atomic:
+
+t1:			t2:
+_blk_mq_tag_busy	blk_mq_tag_busy
+inc active_queues
+// assume 1->2
+			inc active_queues
+			// 2 -> 3
+			blk_mq_update_wake_batch
+			// calculate based on 3
+blk_mq_update_wake_batch
+/* calculate based on 2, while active_queues is actually 3. */
+
+Fix this problem by protecting them wih 'tags->lock', this is not a hot
+path, so performance should not be concerned. And now that all writers
+are inside the lock, switch 'actives_queues' from atomic to unsigned
+int.
+
+Fixes: 180dccb0dba4 ("blk-mq: fix tag_get wait task can't be awakened")
+	Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20230610023043.2559121-1-yukuai1@huaweicloud.com
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 4f1731df60f9033669f024d06ae26a6301260b55)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq-tag.c
+#	block/blk-mq.h
+#	include/linux/blk-mq.h
+diff --cc block/blk-mq-tag.c
+index 21f98a7c6b8a,426197312069..000000000000
+--- a/block/blk-mq-tag.c
++++ b/block/blk-mq-tag.c
+@@@ -21,22 -35,28 +21,37 @@@
+   * to get tag when first time, the other shared-tag users could reserve
+   * budget for it.
+   */
+ -void __blk_mq_tag_busy(struct blk_mq_hw_ctx *hctx)
+ +bool __blk_mq_tag_busy(struct blk_mq_hw_ctx *hctx)
+  {
+++<<<<<<< HEAD
+ +	if (blk_mq_is_sbitmap_shared(hctx->flags)) {
+++=======
++ 	unsigned int users;
++ 	struct blk_mq_tags *tags = hctx->tags;
++ 
++ 	if (blk_mq_is_shared_tags(hctx->flags)) {
+++>>>>>>> 4f1731df60f9 (blk-mq: fix potential io hang by wrong 'wake_batch')
+  		struct request_queue *q = hctx->queue;
+ +		struct blk_mq_tag_set *set = q->tag_set;
+  
+ -		if (test_bit(QUEUE_FLAG_HCTX_ACTIVE, &q->queue_flags))
+ -			return;
+ -		set_bit(QUEUE_FLAG_HCTX_ACTIVE, &q->queue_flags);
+ +		if (!test_bit(QUEUE_FLAG_HCTX_ACTIVE, &q->queue_flags) &&
+ +		    !test_and_set_bit(QUEUE_FLAG_HCTX_ACTIVE, &q->queue_flags))
+ +			atomic_inc(&set->active_queues_shared_sbitmap);
+  	} else {
+ -		if (test_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state))
+ -			return;
+ -		set_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state);
+ +		if (!test_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state) &&
+ +		    !test_and_set_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state))
+ +			atomic_inc(&hctx->tags->active_queues);
+  	}
+  
+++<<<<<<< HEAD
+ +	return true;
+++=======
++ 	spin_lock_irq(&tags->lock);
++ 	users = tags->active_queues + 1;
++ 	WRITE_ONCE(tags->active_queues, users);
++ 	blk_mq_update_wake_batch(tags, users);
++ 	spin_unlock_irq(&tags->lock);
+++>>>>>>> 4f1731df60f9 (blk-mq: fix potential io hang by wrong 'wake_batch')
+  }
+  
+  /*
+@@@ -67,9 -87,14 +82,18 @@@ void __blk_mq_tag_idle(struct blk_mq_hw
+  	} else {
+  		if (!test_and_clear_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state))
+  			return;
+ +		atomic_dec(&tags->active_queues);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	spin_lock_irq(&tags->lock);
++ 	users = tags->active_queues - 1;
++ 	WRITE_ONCE(tags->active_queues, users);
++ 	blk_mq_update_wake_batch(tags, users);
++ 	spin_unlock_irq(&tags->lock);
++ 
+++>>>>>>> 4f1731df60f9 (blk-mq: fix potential io hang by wrong 'wake_batch')
+  	blk_mq_tag_wakeup_all(tags, false);
+  }
+  
+diff --cc block/blk-mq.h
+index c12b86d8c632,1743857e0b01..000000000000
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@@ -347,9 -410,9 +347,13 @@@ static inline bool hctx_may_queue(struc
+  	} else {
+  		if (!test_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state))
+  			return true;
+ +		users = atomic_read(&hctx->tags->active_queues);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	users = READ_ONCE(hctx->tags->active_queues);
+++>>>>>>> 4f1731df60f9 (blk-mq: fix potential io hang by wrong 'wake_batch')
+  	if (!users)
+  		return true;
+  
+diff --cc include/linux/blk-mq.h
+index 62c0a67b5e72,f401067ac03a..000000000000
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@@ -371,16 -723,48 +371,52 @@@ enum 
+  	BLK_MQ_REQ_NOWAIT	= (__force blk_mq_req_flags_t)(1 << 0),
+  	/* allocate from reserved pool */
+  	BLK_MQ_REQ_RESERVED	= (__force blk_mq_req_flags_t)(1 << 1),
+ -	/* set RQF_PM */
+ -	BLK_MQ_REQ_PM		= (__force blk_mq_req_flags_t)(1 << 2),
+ +	/* set RQF_PREEMPT */
+ +	BLK_MQ_REQ_PREEMPT	= (__force blk_mq_req_flags_t)(1 << 3),
+  };
+  
+ -struct request *blk_mq_alloc_request(struct request_queue *q, blk_opf_t opf,
+ +struct request *blk_mq_alloc_request(struct request_queue *q, unsigned int op,
+  		blk_mq_req_flags_t flags);
+  struct request *blk_mq_alloc_request_hctx(struct request_queue *q,
+ -		blk_opf_t opf, blk_mq_req_flags_t flags,
+ +		unsigned int op, blk_mq_req_flags_t flags,
+  		unsigned int hctx_idx);
+++<<<<<<< HEAD
+ +struct request *blk_mq_tag_to_rq(struct blk_mq_tags *tags, unsigned int tag);
+++=======
++ 
++ /*
++  * Tag address space map.
++  */
++ struct blk_mq_tags {
++ 	unsigned int nr_tags;
++ 	unsigned int nr_reserved_tags;
++ 	unsigned int active_queues;
++ 
++ 	struct sbitmap_queue bitmap_tags;
++ 	struct sbitmap_queue breserved_tags;
++ 
++ 	struct request **rqs;
++ 	struct request **static_rqs;
++ 	struct list_head page_list;
++ 
++ 	/*
++ 	 * used to clear request reference in rqs[] before freeing one
++ 	 * request pool
++ 	 */
++ 	spinlock_t lock;
++ };
++ 
++ static inline struct request *blk_mq_tag_to_rq(struct blk_mq_tags *tags,
++ 					       unsigned int tag)
++ {
++ 	if (tag < tags->nr_tags) {
++ 		prefetch(tags->rqs[tag]);
++ 		return tags->rqs[tag];
++ 	}
++ 
++ 	return NULL;
++ }
+++>>>>>>> 4f1731df60f9 (blk-mq: fix potential io hang by wrong 'wake_batch')
+  
+  enum {
+  	BLK_MQ_UNIQUE_TAG_BITS = 16,
+diff --git a/block/blk-mq-debugfs.c b/block/blk-mq-debugfs.c
+index deea36cb6960..249cccf5675b 100644
+--- a/block/blk-mq-debugfs.c
++++ b/block/blk-mq-debugfs.c
+@@ -461,7 +461,7 @@ static void blk_mq_debugfs_tags_show(struct seq_file *m,
+ 	seq_printf(m, "nr_tags=%u\n", tags->nr_tags);
+ 	seq_printf(m, "nr_reserved_tags=%u\n", tags->nr_reserved_tags);
+ 	seq_printf(m, "active_queues=%d\n",
+-		   atomic_read(&tags->active_queues));
++		   READ_ONCE(tags->active_queues));
+ 
+ 	seq_puts(m, "\nbitmap_tags:\n");
+ 	sbitmap_queue_show(tags->bitmap_tags, m);
+* Unmerged path block/blk-mq-tag.c
+* Unmerged path block/blk-mq.h
+* Unmerged path include/linux/blk-mq.h
