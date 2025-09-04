@@ -142,7 +142,7 @@ static int __wake_up_common_lock(struct wait_queue_head *wq_head, unsigned int m
 }
 
 /**
- * __wake_up - wake up threads blocked on a waitqueue.
+ * __wake_up_rh - wake up threads blocked on a waitqueue.
  * @wq_head: the waitqueue
  * @mode: which threads
  * @nr_exclusive: how many wake-one or wake-many threads to wake up
@@ -152,10 +152,27 @@ static int __wake_up_common_lock(struct wait_queue_head *wq_head, unsigned int m
  * before accessing the task state.  Returns the number of exclusive
  * tasks that were awaken.
  */
-int __wake_up(struct wait_queue_head *wq_head, unsigned int mode,
+int __wake_up_rh(struct wait_queue_head *wq_head, unsigned int mode,
 	      int nr_exclusive, void *key)
 {
 	return __wake_up_common_lock(wq_head, mode, nr_exclusive, 0, key);
+}
+EXPORT_SYMBOL(__wake_up_rh);
+
+/**
+ * __wake_up - wake up threads blocked on a waitqueue.
+ * @wq_head: the waitqueue
+ * @mode: which threads
+ * @nr_exclusive: how many wake-one or wake-many threads to wake up
+ * @key: is directly passed to the wakeup function
+ *
+ * If this function wakes up a task, it executes a full memory barrier before
+ * accessing the task state.
+ */
+void __wake_up(struct wait_queue_head *wq_head, unsigned int mode,
+			int nr_exclusive, void *key)
+{
+	__wake_up_common_lock(wq_head, mode, nr_exclusive, 0, key);
 }
 EXPORT_SYMBOL(__wake_up);
 

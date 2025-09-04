@@ -29,10 +29,12 @@ struct seq_file;
  * struct sbitmap_word - Word in a &struct sbitmap.
  */
 struct sbitmap_word {
+	RH_KABI_DEPRECATE(unsigned long, depth)
+
 	/**
 	 * @word: word holding free bits
 	 */
-	unsigned long word;
+	unsigned long word ____cacheline_aligned_in_smp;
 
 	/**
 	 * @cleared: word holding cleared bits
@@ -42,7 +44,11 @@ struct sbitmap_word {
 	/**
 	 * @swap_lock: Held while swapping word <-> cleared
 	 */
-	RH_KABI_DEPRECATE(spinlock_t, swap_lock)
+#ifdef __GENKSYMS__
+	spinlock_t swap_lock;
+#else
+	raw_spinlock_t swap_lock;
+#endif
 } ____cacheline_aligned_in_smp;
 
 /**
@@ -91,7 +97,7 @@ struct sbq_wait_state {
 	/**
 	 * @wait_cnt: Number of frees remaining before we wake up.
 	 */
-	atomic_t wait_cnt;
+	RH_KABI_DEPRECATE(atomic_t, wait_cnt)
 
 	/**
 	 * @wait: Wait queue.
@@ -120,7 +126,16 @@ struct sbitmap_queue {
 	 * This is per-cpu, which allows multiple users to stick to different
 	 * cachelines until the map is exhausted.
 	 */
-	RH_KABI_DEPRECATE(unsigned int __percpu *, alloc_hint)
+	RH_KABI_REPLACE_SPLIT(unsigned int __percpu * alloc_hint,
+		/**
+		 * @completion_cnt: Number of bits cleared passed to the
+		 * wakeup function.
+		 */
+		atomic_t completion_cnt,
+		/**
+		 * @wakeup_cnt: Number of thread wake ups issued.
+		 */
+		atomic_t wakeup_cnt)
 
 	/**
 	 * @wake_batch: Number of bits which must be freed before we wake up any
@@ -444,6 +459,17 @@ static inline void sbitmap_queue_free(struct sbitmap_queue *sbq)
 	kfree(sbq->ws);
 	sbitmap_free(&sbq->sb);
 }
+
+/**
+ * sbitmap_queue_recalculate_wake_batch() - Recalculate wake batch
+ * @sbq: Bitmap queue to recalculate wake batch.
+ * @users: Number of shares.
+ *
+ * Like sbitmap_queue_update_wake_batch(), this will calculate wake batch
+ * by depth. This interface is for HCTX shared tags or queue shared tags.
+ */
+void sbitmap_queue_recalculate_wake_batch(struct sbitmap_queue *sbq,
+					    unsigned int users);
 
 /**
  * sbitmap_queue_resize() - Resize a &struct sbitmap_queue.
