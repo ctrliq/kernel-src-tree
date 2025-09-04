@@ -1,0 +1,89 @@
+sbitmap: correct wake_batch recalculation to avoid potential IO hung
+
+jira LE-4066
+Rebuild_History Non-Buildable kernel-4.18.0-553.72.1.el8_10
+commit-author Kemeng Shi <shikemeng@huaweicloud.com>
+commit b5fcf7871acb7f9a3a8ed341a68bd86aba3e254a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.72.1.el8_10/b5fcf787.failed
+
+Commit 180dccb0dba4f ("blk-mq: fix tag_get wait task can't be awakened")
+mentioned that in case of shared tags, there could be just one real
+active hctx(queue) because of lazy detection of tag idle. Then driver tag
+allocation may wait forever on this real active hctx(queue) if wake_batch
+is > hctx_max_depth where hctx_max_depth is available tags depth for the
+actve hctx(queue). However, the condition wake_batch > hctx_max_depth is
+not strong enough to avoid IO hung as the sbitmap_queue_wake_up will only
+wake up one wait queue for each wake_batch even though there is only one
+waiter in the woken wait queue. After this, there is only one tag to free
+and wake_batch may not be reached anymore. Commit 180dccb0dba4f ("blk-mq:
+fix tag_get wait task can't be awakened") methioned that driver tag
+allocation may wait forever. Actually, the inactive hctx(queue) will be
+truely idle after at most 30 seconds and will call blk_mq_tag_wakeup_all
+to wake one waiter per wait queue to break the hung. But IO hung for 30
+seconds is also not acceptable. Set batch size to small enough that depth
+of the shared hctx(queue) is enough to wake up all of the queues like
+sbq_calc_wake_batch do to fix this potential IO hung.
+
+Although hctx_max_depth will be clamped to at least 4 while wake_batch
+recalculation does not do the clamp, the wake_batch will be always
+recalculated to 1 when hctx_max_depth <= 4.
+
+Fixes: 180dccb0dba4 ("blk-mq: fix tag_get wait task can't be awakened")
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Kemeng Shi <shikemeng@huaweicloud.com>
+Link: https://lore.kernel.org/r/20230116205059.3821738-6-shikemeng@huaweicloud.com
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit b5fcf7871acb7f9a3a8ed341a68bd86aba3e254a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/sbitmap.c
+diff --cc lib/sbitmap.c
+index 082298015b44,eff4e42c425a..000000000000
+--- a/lib/sbitmap.c
++++ b/lib/sbitmap.c
+@@@ -468,22 -446,26 +468,38 @@@ EXPORT_SYMBOL_GPL(sbitmap_queue_init_no
+  static void sbitmap_queue_update_wake_batch(struct sbitmap_queue *sbq,
+  					    unsigned int depth)
+  {
+ -	unsigned int wake_batch;
+ +	unsigned int wake_batch = sbq_calc_wake_batch(sbq, depth);
+ +	int i;
+  
+ -	wake_batch = sbq_calc_wake_batch(sbq, depth);
+ -	if (sbq->wake_batch != wake_batch)
+ +	if (sbq->wake_batch != wake_batch) {
+  		WRITE_ONCE(sbq->wake_batch, wake_batch);
+ +		/*
+ +		 * Pairs with the memory barrier in sbitmap_queue_wake_up()
+ +		 * to ensure that the batch size is updated before the wait
+ +		 * counts.
+ +		 */
+ +		smp_mb();
+ +		for (i = 0; i < SBQ_WAIT_QUEUES; i++)
+ +			atomic_set(&sbq->ws[i].wait_cnt, 1);
+ +	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void sbitmap_queue_recalculate_wake_batch(struct sbitmap_queue *sbq,
++ 					    unsigned int users)
++ {
++ 	unsigned int wake_batch;
++ 	unsigned int depth = (sbq->sb.depth + users - 1) / users;
++ 
++ 	wake_batch = clamp_val(depth / SBQ_WAIT_QUEUES,
++ 			1, SBQ_WAKE_BATCH);
++ 
++ 	WRITE_ONCE(sbq->wake_batch, wake_batch);
++ }
++ EXPORT_SYMBOL_GPL(sbitmap_queue_recalculate_wake_batch);
++ 
+++>>>>>>> b5fcf7871acb (sbitmap: correct wake_batch recalculation to avoid potential IO hung)
+  void sbitmap_queue_resize(struct sbitmap_queue *sbq, unsigned int depth)
+  {
+  	sbitmap_queue_update_wake_batch(sbq, depth);
+* Unmerged path lib/sbitmap.c
