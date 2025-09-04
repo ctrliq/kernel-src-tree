@@ -1,0 +1,130 @@
+lib/sbitmap: define swap_lock as raw_spinlock_t
+
+jira LE-4066
+Rebuild_History Non-Buildable kernel-4.18.0-553.72.1.el8_10
+commit-author Ming Lei <ming.lei@redhat.com>
+commit 65f666c6203600053478ce8e34a1db269a8701c9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.72.1.el8_10/65f666c6.failed
+
+When called from sbitmap_queue_get(), sbitmap_deferred_clear() may be run
+with preempt disabled. In RT kernel, spin_lock() can sleep, then warning
+of "BUG: sleeping function called from invalid context" can be triggered.
+
+Fix it by replacing it with raw_spin_lock.
+
+	Cc: Yang Yang <yang.yang@vivo.com>
+Fixes: 72d04bdcf3f7 ("sbitmap: fix io hung due to race on sbitmap_word::cleared")
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Reviewed-by: Yang Yang <yang.yang@vivo.com>
+Link: https://lore.kernel.org/r/20240919021709.511329-1-ming.lei@redhat.com
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 65f666c6203600053478ce8e34a1db269a8701c9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sbitmap.h
+#	lib/sbitmap.c
+diff --cc include/linux/sbitmap.h
+index c5364c7c3ae5,189140bf11fc..000000000000
+--- a/include/linux/sbitmap.h
++++ b/include/linux/sbitmap.h
+@@@ -40,9 -38,9 +40,13 @@@ struct sbitmap_word 
+  	unsigned long cleared ____cacheline_aligned_in_smp;
+  
+  	/**
+ -	 * @swap_lock: serializes simultaneous updates of ->word and ->cleared
+ +	 * @swap_lock: Held while swapping word <-> cleared
+  	 */
+++<<<<<<< HEAD
+ +	RH_KABI_DEPRECATE(spinlock_t, swap_lock)
+++=======
++ 	raw_spinlock_t swap_lock;
+++>>>>>>> 65f666c62036 (lib/sbitmap: define swap_lock as raw_spinlock_t)
+  } ____cacheline_aligned_in_smp;
+  
+  /**
+diff --cc lib/sbitmap.c
+index 59f985b64b05,d3412984170c..000000000000
+--- a/lib/sbitmap.c
++++ b/lib/sbitmap.c
+@@@ -76,12 -60,30 +76,34 @@@ static inline void update_alloc_hint_af
+  /*
+   * See if we have deferred clears that we can batch move
+   */
+ -static inline bool sbitmap_deferred_clear(struct sbitmap_word *map,
+ -		unsigned int depth, unsigned int alloc_hint, bool wrap)
+ +static inline bool sbitmap_deferred_clear(struct sbitmap_word *map)
+  {
+ -	unsigned long mask, word_mask;
+ +	unsigned long mask;
+  
+++<<<<<<< HEAD
+ +	if (!READ_ONCE(map->cleared))
+ +		return false;
+++=======
++ 	guard(raw_spinlock_irqsave)(&map->swap_lock);
++ 
++ 	if (!map->cleared) {
++ 		if (depth == 0)
++ 			return false;
++ 
++ 		word_mask = (~0UL) >> (BITS_PER_LONG - depth);
++ 		/*
++ 		 * The current behavior is to always retry after moving
++ 		 * ->cleared to word, and we change it to retry in case
++ 		 * of any free bits. To avoid an infinite loop, we need
++ 		 * to take wrap & alloc_hint into account, otherwise a
++ 		 * soft lockup may occur.
++ 		 */
++ 		if (!wrap && alloc_hint)
++ 			word_mask &= ~((1UL << alloc_hint) - 1);
++ 
++ 		return (READ_ONCE(map->word) & word_mask) != word_mask;
++ 	}
+++>>>>>>> 65f666c62036 (lib/sbitmap: define swap_lock as raw_spinlock_t)
+  
+  	/*
+  	 * First get a stable cleared mask, setting the old mask to 0.
+@@@ -119,24 -122,21 +141,29 @@@ int sbitmap_init_node(struct sbitmap *s
+  		return 0;
+  	}
+  
+ -	if (alloc_hint) {
+ -		if (init_alloc_hint(sb, flags))
+ -			return -ENOMEM;
+ -	} else {
+ -		sb->alloc_hint = NULL;
+ -	}
+ -
+ -	sb->map = kvzalloc_node(sb->map_nr * sizeof(*sb->map), flags, node);
+ +	/*
+ +	 * RHEL8: sb->alloc_hint is kept in an additional sb->map array element prior
+ +         * to the actual sb->map due to KABI (it was not possible to add it to struct sbitmap)
+ +	 */
+ +	sb->map = kvzalloc_node((sb->map_nr + 1) * sizeof(*sb->map), flags, node);
+  	if (!sb->map) {
+ -		free_percpu(sb->alloc_hint);
+  		return -ENOMEM;
+  	}
+ +	sb->map++;
+  
+++<<<<<<< HEAD
+ +	if (alloc_hint) {
+ +		if (init_alloc_hint(sb, flags)) {
+ +			kfree(--sb->map);
+ +			return -ENOMEM;
+ +		}
+ +	} else {
+ +		*SB_ALLOC_HINT_PTR(sb) = NULL;
+ +	}
+++=======
++ 	for (i = 0; i < sb->map_nr; i++)
++ 		raw_spin_lock_init(&sb->map[i].swap_lock);
+++>>>>>>> 65f666c62036 (lib/sbitmap: define swap_lock as raw_spinlock_t)
+  
+  	return 0;
+  }
+* Unmerged path include/linux/sbitmap.h
+* Unmerged path lib/sbitmap.c
