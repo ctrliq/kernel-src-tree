@@ -99,12 +99,14 @@ static void stdio_restore_cleanup(void)
 	fflush(stdout);
 
 	if (env.subtest_state) {
-		fclose(env.subtest_state->stdout_saved);
+		if (env.subtest_state->stdout_saved)
+			fclose(env.subtest_state->stdout_saved);
 		env.subtest_state->stdout_saved = NULL;
 		stdout = env.test_state->stdout_saved;
 		stderr = env.test_state->stdout_saved;
 	} else {
-		fclose(env.test_state->stdout_saved);
+		if (env.test_state->stdout_saved)
+			fclose(env.test_state->stdout_saved);
 		env.test_state->stdout_saved = NULL;
 	}
 #endif
