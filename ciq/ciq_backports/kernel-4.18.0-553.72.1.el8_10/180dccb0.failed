@@ -1,0 +1,182 @@
+blk-mq: fix tag_get wait task can't be awakened
+
+jira LE-4066
+Rebuild_History Non-Buildable kernel-4.18.0-553.72.1.el8_10
+commit-author Laibin Qiu <qiulaibin@huawei.com>
+commit 180dccb0dba4f5e84a4a70c1be1d34cbb6528b32
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.72.1.el8_10/180dccb0.failed
+
+In case of shared tags, there might be more than one hctx which
+allocates from the same tags, and each hctx is limited to allocate at
+most:
+        hctx_max_depth = max((bt->sb.depth + users - 1) / users, 4U);
+
+tag idle detection is lazy, and may be delayed for 30sec, so there
+could be just one real active hctx(queue) but all others are actually
+idle and still accounted as active because of the lazy idle detection.
+Then if wake_batch is > hctx_max_depth, driver tag allocation may wait
+forever on this real active hctx.
+
+Fix this by recalculating wake_batch when inc or dec active_queues.
+
+Fixes: 0d2602ca30e41 ("blk-mq: improve support for shared tags maps")
+	Suggested-by: Ming Lei <ming.lei@redhat.com>
+	Suggested-by: John Garry <john.garry@huawei.com>
+	Signed-off-by: Laibin Qiu <qiulaibin@huawei.com>
+	Reviewed-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+Link: https://lore.kernel.org/r/20220113025536.1479653-1-qiulaibin@huawei.com
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 180dccb0dba4f5e84a4a70c1be1d34cbb6528b32)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq-tag.c
+diff --cc block/blk-mq-tag.c
+index 21f98a7c6b8a,845f74e8dd7b..000000000000
+--- a/block/blk-mq-tag.c
++++ b/block/blk-mq-tag.c
+@@@ -23,19 -39,26 +38,37 @@@ static void blk_mq_update_wake_batch(st
+   */
+  bool __blk_mq_tag_busy(struct blk_mq_hw_ctx *hctx)
+  {
+++<<<<<<< HEAD
+ +	if (blk_mq_is_sbitmap_shared(hctx->flags)) {
+++=======
++ 	unsigned int users;
++ 
++ 	if (blk_mq_is_shared_tags(hctx->flags)) {
+++>>>>>>> 180dccb0dba4 (blk-mq: fix tag_get wait task can't be awakened)
+  		struct request_queue *q = hctx->queue;
+ +		struct blk_mq_tag_set *set = q->tag_set;
+  
+++<<<<<<< HEAD
+ +		if (!test_bit(QUEUE_FLAG_HCTX_ACTIVE, &q->queue_flags) &&
+ +		    !test_and_set_bit(QUEUE_FLAG_HCTX_ACTIVE, &q->queue_flags))
+ +			atomic_inc(&set->active_queues_shared_sbitmap);
+++=======
++ 		if (test_bit(QUEUE_FLAG_HCTX_ACTIVE, &q->queue_flags) ||
++ 		    test_and_set_bit(QUEUE_FLAG_HCTX_ACTIVE, &q->queue_flags)) {
++ 			return true;
++ 		}
+++>>>>>>> 180dccb0dba4 (blk-mq: fix tag_get wait task can't be awakened)
+  	} else {
+- 		if (!test_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state) &&
+- 		    !test_and_set_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state))
+- 			atomic_inc(&hctx->tags->active_queues);
++ 		if (test_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state) ||
++ 		    test_and_set_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state)) {
++ 			return true;
++ 		}
+  	}
+  
++ 	users = atomic_inc_return(&hctx->tags->active_queues);
++ 
++ 	blk_mq_update_wake_batch(hctx->tags, users);
++ 
+  	return true;
+  }
+  
+@@@ -56,10 -79,11 +89,14 @@@ void blk_mq_tag_wakeup_all(struct blk_m
+  void __blk_mq_tag_idle(struct blk_mq_hw_ctx *hctx)
+  {
+  	struct blk_mq_tags *tags = hctx->tags;
+++<<<<<<< HEAD
+ +	struct request_queue *q = hctx->queue;
+ +	struct blk_mq_tag_set *set = q->tag_set;
+++=======
++ 	unsigned int users;
+++>>>>>>> 180dccb0dba4 (blk-mq: fix tag_get wait task can't be awakened)
+  
+ -	if (blk_mq_is_shared_tags(hctx->flags)) {
+ -		struct request_queue *q = hctx->queue;
+ -
+ +	if (blk_mq_is_sbitmap_shared(hctx->flags)) {
+  		if (!test_and_clear_bit(QUEUE_FLAG_HCTX_ACTIVE,
+  					&q->queue_flags))
+  			return;
+@@@ -67,9 -90,12 +104,16 @@@
+  	} else {
+  		if (!test_and_clear_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state))
+  			return;
+ +		atomic_dec(&tags->active_queues);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	users = atomic_dec_return(&tags->active_queues);
++ 
++ 	blk_mq_update_wake_batch(tags, users);
++ 
+++>>>>>>> 180dccb0dba4 (blk-mq: fix tag_get wait task can't be awakened)
+  	blk_mq_tag_wakeup_all(tags, false);
+  }
+  
+* Unmerged path block/blk-mq-tag.c
+diff --git a/include/linux/sbitmap.h b/include/linux/sbitmap.h
+index b4856b4b2b45..69d1233400a8 100644
+--- a/include/linux/sbitmap.h
++++ b/include/linux/sbitmap.h
+@@ -442,6 +442,17 @@ static inline void sbitmap_queue_free(struct sbitmap_queue *sbq)
+ 	sbitmap_free(&sbq->sb);
+ }
+ 
++/**
++ * sbitmap_queue_recalculate_wake_batch() - Recalculate wake batch
++ * @sbq: Bitmap queue to recalculate wake batch.
++ * @users: Number of shares.
++ *
++ * Like sbitmap_queue_update_wake_batch(), this will calculate wake batch
++ * by depth. This interface is for HCTX shared tags or queue shared tags.
++ */
++void sbitmap_queue_recalculate_wake_batch(struct sbitmap_queue *sbq,
++					    unsigned int users);
++
+ /**
+  * sbitmap_queue_resize() - Resize a &struct sbitmap_queue.
+  * @sbq: Bitmap queue to resize.
+diff --git a/lib/sbitmap.c b/lib/sbitmap.c
+index 0956b5ca3935..d136f689390c 100644
+--- a/lib/sbitmap.c
++++ b/lib/sbitmap.c
+@@ -479,10 +479,9 @@ int sbitmap_queue_init_node(struct sbitmap_queue *sbq, unsigned int depth,
+ }
+ EXPORT_SYMBOL_GPL(sbitmap_queue_init_node);
+ 
+-static void sbitmap_queue_update_wake_batch(struct sbitmap_queue *sbq,
+-					    unsigned int depth)
++static inline void __sbitmap_queue_update_wake_batch(struct sbitmap_queue *sbq,
++					    unsigned int wake_batch)
+ {
+-	unsigned int wake_batch = sbq_calc_wake_batch(sbq, depth);
+ 	int i;
+ 
+ 	if (sbq->wake_batch != wake_batch) {
+@@ -498,6 +497,26 @@ static void sbitmap_queue_update_wake_batch(struct sbitmap_queue *sbq,
+ 	}
+ }
+ 
++static void sbitmap_queue_update_wake_batch(struct sbitmap_queue *sbq,
++					    unsigned int depth)
++{
++	unsigned int wake_batch;
++
++	wake_batch = sbq_calc_wake_batch(sbq, depth);
++	__sbitmap_queue_update_wake_batch(sbq, wake_batch);
++}
++
++void sbitmap_queue_recalculate_wake_batch(struct sbitmap_queue *sbq,
++					    unsigned int users)
++{
++	unsigned int wake_batch;
++
++	wake_batch = clamp_val((sbq->sb.depth + users - 1) /
++			users, 4, SBQ_WAKE_BATCH);
++	__sbitmap_queue_update_wake_batch(sbq, wake_batch);
++}
++EXPORT_SYMBOL_GPL(sbitmap_queue_recalculate_wake_batch);
++
+ void sbitmap_queue_resize(struct sbitmap_queue *sbq, unsigned int depth)
+ {
+ 	sbitmap_queue_update_wake_batch(sbq, depth);
