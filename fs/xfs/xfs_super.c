@@ -1761,12 +1761,10 @@ xfs_fs_fill_super(
 	}
 
 	if (xfs_has_exchange_range(mp))
-		xfs_warn(mp,
-	"EXPERIMENTAL exchange-range feature enabled. Use at your own risk!");
+		xfs_warn_experimental(mp, XFS_EXPERIMENTAL_EXCHRANGE);
 
 	if (xfs_has_parent(mp))
-		xfs_warn(mp,
-	"EXPERIMENTAL parent pointer feature enabled. Use at your own risk!");
+		xfs_warn_experimental(mp, XFS_EXPERIMENTAL_PPTR);
 
 	error = xfs_mountfs(mp);
 	if (error)
