@@ -35,6 +35,7 @@ to_display_connector(struct drm_bridge *bridge)
 }
 
 static int display_connector_attach(struct drm_bridge *bridge,
+				    struct drm_encoder *encoder,
 				    enum drm_bridge_attach_flags flags)
 {
 	return flags & DRM_BRIDGE_ATTACH_NO_CONNECTOR ? 0 : -EINVAL;
@@ -210,9 +211,10 @@ static int display_connector_probe(struct platform_device *pdev)
 	const char *label = NULL;
 	int ret;
 
-	conn = devm_kzalloc(&pdev->dev, sizeof(*conn), GFP_KERNEL);
-	if (!conn)
-		return -ENOMEM;
+	conn = devm_drm_bridge_alloc(&pdev->dev, struct display_connector, bridge,
+				     &display_connector_bridge_funcs);
+	if (IS_ERR(conn))
+		return PTR_ERR(conn);
 
 	platform_set_drvdata(pdev, conn);
 
@@ -362,7 +364,6 @@ static int display_connector_probe(struct platform_device *pdev)
 		}
 	}
 
-	conn->bridge.funcs = &display_connector_bridge_funcs;
 	conn->bridge.of_node = pdev->dev.of_node;
 
 	if (conn->bridge.ddc)

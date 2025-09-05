@@ -468,6 +468,11 @@ void *__devm_drm_dev_alloc(struct device *parent,
 
 struct drm_device *drm_dev_alloc(const struct drm_driver *driver,
 				 struct device *parent);
+
+void *__drm_dev_alloc(struct device *parent,
+		      const struct drm_driver *driver,
+		      size_t size, size_t offset);
+
 int drm_dev_register(struct drm_device *dev, unsigned long flags);
 void drm_dev_unregister(struct drm_device *dev);
 
