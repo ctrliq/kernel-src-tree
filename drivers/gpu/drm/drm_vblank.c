@@ -487,8 +487,7 @@ out:
 
 static void vblank_disable_fn(struct timer_list *t)
 {
-	struct drm_vblank_crtc *vblank = timer_container_of(vblank, t,
-							    disable_timer);
+	struct drm_vblank_crtc *vblank = from_timer(vblank, t, disable_timer);
 	struct drm_device *dev = vblank->dev;
 	unsigned int pipe = vblank->pipe;
 	unsigned long irqflags;
