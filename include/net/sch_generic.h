@@ -16,6 +16,7 @@
 #include <linux/rwsem.h>
 #include <linux/atomic.h>
 #include <linux/hashtable.h>
+#include <linux/rh_kabi.h>
 #include <net/gen_stats.h>
 #include <net/rtnetlink.h>
 #include <net/flow_offload.h>
@@ -376,6 +377,10 @@ struct tcf_proto_ops {
 						struct nlattr **tca,
 						struct netlink_ext_ack *extack);
 	void			(*tmplt_destroy)(void *tmplt_priv);
+	RH_KABI_BROKEN_INSERT(void	(*tmplt_reoffload)(struct tcf_chain *chain,
+						   bool add,
+						   flow_setup_cb_t *cb,
+						   void *cb_priv))
 	struct tcf_exts *	(*get_exts)(const struct tcf_proto *tp,
 					    u32 handle);
 
