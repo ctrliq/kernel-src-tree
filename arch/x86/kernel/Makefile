@@ -40,7 +40,7 @@ KMSAN_SANITIZE_nmi.o					:= n
 # first second.
 KCOV_INSTRUMENT_head$(BITS).o				:= n
 
-CFLAGS_irq.o := -I $(srctree)/$(src)/../include/asm/trace
+CFLAGS_irq.o := -I $(src)/../include/asm/trace
 
 obj-y			+= process_$(BITS).o signal.o signal_$(BITS).o
 obj-y			+= traps.o idt.o irq.o irq_$(BITS).o dumpstack_$(BITS).o
