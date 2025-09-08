@@ -8,7 +8,7 @@
  * Copyright (C) 2009 Bernie Thompson <bernie@plugable.com>
  */
 
-#include <linux/unaligned.h>
+#include <asm-generic/unaligned.h>
 
 #include <drm/drm.h>
 #include <drm/drm_print.h>

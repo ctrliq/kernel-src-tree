@@ -5,7 +5,7 @@
 #include <rm/rm.h>
 #include <rm/rpc.h>
 
-#include <asm-generic/video.h>
+#include <asm-generic/fb.h>
 
 #include "nvrm/gsp.h"
 #include "nvrm/rpcfn.h"
