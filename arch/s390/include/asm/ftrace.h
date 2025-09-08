@@ -82,8 +82,9 @@ static __always_inline unsigned long fgraph_ret_regs_frame_pointer(struct fgraph
 }
 #endif /* CONFIG_FUNCTION_GRAPH_TRACER */
 
-static __always_inline void ftrace_instruction_pointer_set(struct ftrace_regs *fregs,
-							   unsigned long ip)
+static __always_inline void
+ftrace_regs_set_instruction_pointer(struct ftrace_regs *fregs,
+				    unsigned long ip)
 {
 	fregs->regs.psw.addr = ip;
 }
