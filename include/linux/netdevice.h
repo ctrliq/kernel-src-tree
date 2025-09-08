@@ -386,6 +386,7 @@ struct napi_struct {
 	struct task_struct	*thread; /* protected by netdev_lock */
 	unsigned long		gro_flush_timeout;
 	u32			defer_hard_irqs;
+	/* all fields past this point are write-protected by netdev_lock */
 	/* control-path-only fields follow */
 	struct list_head	dev_list;
 	struct hlist_node	napi_hash_node;
@@ -2715,9 +2716,16 @@ static inline void netdev_assert_locked_or_invisible(struct net_device *dev)
 		netdev_assert_locked(dev);
 }
 
-static inline void netif_napi_set_irq(struct napi_struct *napi, int irq)
+static inline void netif_napi_set_irq_locked(struct napi_struct *napi, int irq)
 {
 	napi->irq = irq;
+}
+
+static inline void netif_napi_set_irq(struct napi_struct *napi, int irq)
+{
+	netdev_lock(napi->dev);
+	netif_napi_set_irq_locked(napi, irq);
+	netdev_unlock(napi->dev);
 }
 
 /* Default NAPI poll() weight
