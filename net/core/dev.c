@@ -11557,8 +11557,6 @@ void free_netdev(struct net_device *dev)
 		return;
 	}
 
-	mutex_destroy(&dev->lock);
-
 	WARN_ON(dev->cfg != dev->cfg_pending);
 	kfree(dev->cfg);
 	kfree(dev->ethtool);
@@ -11586,6 +11584,8 @@ void free_netdev(struct net_device *dev)
 	dev->xdp_bulkq = NULL;
 
 	netdev_free_phy_link_topology(dev);
+
+	mutex_destroy(&dev->lock);
 
 	/*  Compatibility with error handling in drivers */
 	if (dev->reg_state == NETREG_UNINITIALIZED ||
