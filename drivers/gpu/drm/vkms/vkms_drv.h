@@ -232,13 +232,13 @@ struct vkms_config;
  * struct vkms_device - Description of a VKMS device
  *
  * @drm - Base device in DRM
- * @faux_dev - Associated faux device
+ * @platform - Associated platform device
  * @output - Configuration and sub-components of the VKMS device
  * @config: Configuration used in this VKMS device
  */
 struct vkms_device {
 	struct drm_device drm;
-	struct faux_device *faux_dev;
+	struct platform_device *platform;
 	const struct vkms_config *config;
 };
 
