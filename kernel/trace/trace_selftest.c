@@ -827,7 +827,8 @@ static struct ftrace_ops direct;
 	 * and make sure we get graph trace.
 	 */
 	ftrace_set_filter_ip(&direct, (unsigned long)DYN_FTRACE_TEST_NAME, 0, 0);
-	ret = register_ftrace_direct_multi(&direct, (unsigned long)ftrace_stub_direct_tramp);
+	ret = register_ftrace_direct(&direct,
+				     (unsigned long)ftrace_stub_direct_tramp);
 	if (ret)
 		goto out;
 
@@ -847,9 +848,9 @@ static struct ftrace_ops direct;
 
 	unregister_ftrace_graph(&fgraph_ops);
 
-	ret = unregister_ftrace_direct_multi(&direct,
-					     (unsigned long)ftrace_stub_direct_tramp,
-					     true);
+	ret = unregister_ftrace_direct(&direct,
+				       (unsigned long)ftrace_stub_direct_tramp,
+				       true);
 	if (ret)
 		goto out;
 
