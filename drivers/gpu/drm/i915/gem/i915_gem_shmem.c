@@ -6,6 +6,7 @@
 #include <linux/pagevec.h>
 #include <linux/shmem_fs.h>
 #include <linux/swap.h>
+#include <linux/uio.h>
 
 #include <drm/drm_cache.h>
 
@@ -302,7 +303,6 @@ void __shmem_writeback(size_t size, struct address_space *mapping)
 		.nr_to_write = SWAP_CLUSTER_MAX,
 		.range_start = 0,
 		.range_end = LLONG_MAX,
-		.for_reclaim = 1,
 	};
 	unsigned long i;
 
@@ -416,11 +416,12 @@ static int
 shmem_pwrite(struct drm_i915_gem_object *obj,
 	     const struct drm_i915_gem_pwrite *arg)
 {
-	struct address_space *mapping = obj->base.filp->f_mapping;
-	const struct address_space_operations *aops = mapping->a_ops;
 	char __user *user_data = u64_to_user_ptr(arg->data_ptr);
-	u64 remain, offset;
-	unsigned int pg;
+	struct file *file = obj->base.filp;
+	struct kiocb kiocb;
+	struct iov_iter iter;
+	ssize_t written;
+	u64 size = arg->size;
 
 	/* Caller already validated user args */
 	GEM_BUG_ON(!access_ok(user_data, arg->size));
@@ -443,65 +444,24 @@ shmem_pwrite(struct drm_i915_gem_object *obj,
 	if (obj->mm.madv != I915_MADV_WILLNEED)
 		return -EFAULT;
 
-	/*
-	 * Before the pages are instantiated the object is treated as being
-	 * in the CPU domain. The pages will be clflushed as required before
-	 * use, and we can freely write into the pages directly. If userspace
-	 * races pwrite with any other operation; corruption will ensue -
-	 * that is userspace's prerogative!
-	 */
+	if (size > MAX_RW_COUNT)
+		return -EFBIG;
 
-	remain = arg->size;
-	offset = arg->offset;
-	pg = offset_in_page(offset);
+	if (!file->f_op->write_iter)
+		return -EINVAL;
 
-	do {
-		unsigned int len, unwritten;
-		struct page *page;
-		void *data, *vaddr;
-		int err;
-		char __maybe_unused c;
+	init_sync_kiocb(&kiocb, file);
+	kiocb.ki_pos = arg->offset;
+	iov_iter_ubuf(&iter, ITER_SOURCE, (void __user *)user_data, size);
 
-		len = PAGE_SIZE - pg;
-		if (len > remain)
-			len = remain;
+	written = file->f_op->write_iter(&kiocb, &iter);
+	BUG_ON(written == -EIOCBQUEUED);
 
-		/* Prefault the user page to reduce potential recursion */
-		err = __get_user(c, user_data);
-		if (err)
-			return err;
+	if (written != size)
+		return -EIO;
 
-		err = __get_user(c, user_data + len - 1);
-		if (err)
-			return err;
-
-		err = aops->write_begin(obj->base.filp, mapping, offset, len,
-					&page, &data);
-		if (err < 0)
-			return err;
-
-		vaddr = kmap_local_page(page);
-		pagefault_disable();
-		unwritten = __copy_from_user_inatomic(vaddr + pg,
-						      user_data,
-						      len);
-		pagefault_enable();
-		kunmap_local(vaddr);
-
-		err = aops->write_end(obj->base.filp, mapping, offset, len,
-				      len - unwritten, page, data);
-		if (err < 0)
-			return err;
-
-		/* We don't handle -EFAULT, leave it to the caller to check */
-		if (unwritten)
-			return -ENODEV;
-
-		remain -= len;
-		user_data += len;
-		offset += len;
-		pg = 0;
-	} while (remain);
+	if (written < 0)
+		return written;
 
 	return 0;
 }
@@ -654,9 +614,8 @@ i915_gem_object_create_shmem_from_data(struct drm_i915_private *i915,
 {
 	struct drm_i915_gem_object *obj;
 	struct file *file;
-	const struct address_space_operations *aops;
-	resource_size_t offset;
-	int err;
+	loff_t pos = 0;
+	ssize_t err;
 
 	GEM_WARN_ON(IS_DGFX(i915));
 	obj = i915_gem_object_create_shmem(i915, round_up(size, PAGE_SIZE));
@@ -666,31 +625,15 @@ i915_gem_object_create_shmem_from_data(struct drm_i915_private *i915,
 	GEM_BUG_ON(obj->write_domain != I915_GEM_DOMAIN_CPU);
 
 	file = obj->base.filp;
-	aops = file->f_mapping->a_ops;
-	offset = 0;
-	do {
-		unsigned int len = min_t(typeof(size), size, PAGE_SIZE);
-		struct page *page;
-		void *pgdata, *vaddr;
+	err = kernel_write(file, data, size, &pos);
 
-		err = aops->write_begin(file, file->f_mapping, offset, len,
-					&page, &pgdata);
-		if (err < 0)
-			goto fail;
+	if (err < 0)
+		goto fail;
 
-		vaddr = kmap(page);
-		memcpy(vaddr, data, len);
-		kunmap(page);
-
-		err = aops->write_end(file, file->f_mapping, offset, len, len,
-				      page, pgdata);
-		if (err < 0)
-			goto fail;
-
-		size -= len;
-		data += len;
-		offset += len;
-	} while (size);
+	if (err != size) {
+		err = -EIO;
+		goto fail;
+	}
 
 	return obj;
 
