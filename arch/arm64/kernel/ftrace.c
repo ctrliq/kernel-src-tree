@@ -60,7 +60,6 @@ int ftrace_regs_query_register_offset(const char *name)
 }
 #endif
 
-#ifdef CONFIG_DYNAMIC_FTRACE
 /*
  * Replace a single instruction, which may be a branch or NOP.
  * If @validate == true, a replaced instruction is checked against 'old'.
@@ -266,7 +265,6 @@ void arch_ftrace_update_code(int command)
 	command |= FTRACE_MAY_SLEEP;
 	ftrace_modify_all_code(command);
 }
-#endif /* CONFIG_DYNAMIC_FTRACE */
 
 #ifdef CONFIG_FUNCTION_GRAPH_TRACER
 /*
@@ -296,8 +294,6 @@ void prepare_ftrace_return(unsigned long self_addr, unsigned long *parent,
 		*parent = return_hooker;
 	}
 }
-
-#ifdef CONFIG_DYNAMIC_FTRACE
 
 #ifdef CONFIG_DYNAMIC_FTRACE_WITH_ARGS
 void ftrace_graph_func(unsigned long ip, unsigned long parent_ip,
@@ -336,5 +332,4 @@ int ftrace_disable_ftrace_graph_caller(void)
 	return ftrace_modify_graph_caller(false);
 }
 #endif /* CONFIG_DYNAMIC_FTRACE_WITH_ARGS */
-#endif /* CONFIG_DYNAMIC_FTRACE */
 #endif /* CONFIG_FUNCTION_GRAPH_TRACER */
