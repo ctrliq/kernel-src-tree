@@ -788,6 +788,9 @@ struct devlink_health_reporter_ops {
 			struct netlink_ext_ack *extack);
 	int (*test)(struct devlink_health_reporter *reporter,
 		    struct netlink_ext_ack *extack);
+
+        RH_KABI_RESERVE(1)
+        RH_KABI_RESERVE(2)
 };
 
 /**
