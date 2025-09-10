@@ -721,6 +721,9 @@ struct devlink_region_ops {
 		    struct netlink_ext_ack *extack,
 		    u64 offset, u32 size, u8 *data);
 	void *priv;
+
+        RH_KABI_RESERVE(1)
+        RH_KABI_RESERVE(2)
 };
 
 /**
