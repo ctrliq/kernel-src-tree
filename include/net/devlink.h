@@ -516,6 +516,9 @@ struct devlink_param {
 	int (*validate)(struct devlink *devlink, u32 id,
 			union devlink_param_value val,
 			struct netlink_ext_ack *extack);
+
+        RH_KABI_RESERVE(1)
+        RH_KABI_RESERVE(2)
 };
 
 struct devlink_param_item {
