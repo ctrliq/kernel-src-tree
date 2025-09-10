@@ -1738,6 +1738,15 @@ struct devlink_port_ops {
 	int (*port_fn_max_io_eqs_set)(struct devlink_port *devlink_port,
 				      u32 max_eqs,
 				      struct netlink_ext_ack *extack);
+
+        RH_KABI_RESERVE(1)
+        RH_KABI_RESERVE(2)
+        RH_KABI_RESERVE(3)
+        RH_KABI_RESERVE(4)
+        RH_KABI_RESERVE(5)
+        RH_KABI_RESERVE(6)
+        RH_KABI_RESERVE(7)
+        RH_KABI_RESERVE(8)
 };
 
 void devlink_port_init(struct devlink *devlink,
