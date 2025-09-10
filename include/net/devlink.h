@@ -396,6 +396,9 @@ struct devlink_dpipe_table_ops {
 			    struct devlink_dpipe_dump_ctx *dump_ctx);
 	int (*counters_set_update)(void *priv, bool enable);
 	u64 (*size_get)(void *priv);
+
+        RH_KABI_RESERVE(1)
+        RH_KABI_RESERVE(2)
 };
 
 /**
