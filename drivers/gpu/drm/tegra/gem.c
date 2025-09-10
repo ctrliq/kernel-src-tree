@@ -515,20 +515,19 @@ void tegra_bo_free_object(struct drm_gem_object *gem)
 				dev_name(mapping->dev));
 	}
 
-	if (tegra->domain) {
+	if (tegra->domain)
 		tegra_bo_iommu_unmap(tegra, bo);
 
-		if (drm_gem_is_imported(gem)) {
-			dma_buf_unmap_attachment_unlocked(gem->import_attach, bo->sgt,
-							  DMA_TO_DEVICE);
-			dma_buf_detach(gem->import_attach->dmabuf, gem->import_attach);
-		}
+	if (gem->import_attach) {
+		struct dma_buf *dmabuf = gem->import_attach->dmabuf;
+
+		dma_buf_unmap_attachment_unlocked(gem->import_attach, bo->sgt,
+						  DMA_TO_DEVICE);
+		dma_buf_detach(dmabuf, gem->import_attach);
+		dma_buf_put(dmabuf);
+	} else {
+		tegra_bo_free(gem->dev, bo);
 	}
-
-	tegra_bo_free(gem->dev, bo);
-
-	if (bo->dma_buf)
-		dma_buf_put(bo->dma_buf);
 
 	drm_gem_object_release(gem);
 	kfree(bo);
