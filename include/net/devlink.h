@@ -216,6 +216,9 @@ struct devlink_linecard_ops {
 	void (*types_get)(struct devlink_linecard *linecard,
 			  void *priv, unsigned int index, const char **type,
 			  const void **type_priv);
+
+        RH_KABI_RESERVE(1)
+        RH_KABI_RESERVE(2)
 };
 
 struct devlink_sb_pool_info {
