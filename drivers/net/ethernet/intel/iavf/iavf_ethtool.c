@@ -1258,7 +1258,6 @@ static int iavf_add_fdir_ethtool(struct iavf_adapter *adapter, struct ethtool_rx
 {
 	struct ethtool_rx_flow_spec *fsp = &cmd->fs;
 	struct iavf_fdir_fltr *fltr;
-	int count = 50;
 	int err;
 
 	netdev_assert_locked(adapter->netdev);
@@ -1281,14 +1280,6 @@ static int iavf_add_fdir_ethtool(struct iavf_adapter *adapter, struct ethtool_rx
 	if (!fltr)
 		return -ENOMEM;
 
-	while (!mutex_trylock(&adapter->crit_lock)) {
-		if (--count == 0) {
-			kfree(fltr);
-			return -EINVAL;
-		}
-		udelay(1);
-	}
-
 	err = iavf_add_fdir_fltr_info(adapter, fsp, fltr);
 	if (!err)
 		err = iavf_fdir_add_fltr(adapter, fltr);
@@ -1296,7 +1287,6 @@ static int iavf_add_fdir_ethtool(struct iavf_adapter *adapter, struct ethtool_rx
 	if (err)
 		kfree(fltr);
 
-	mutex_unlock(&adapter->crit_lock);
 	return err;
 }
 
@@ -1420,9 +1410,9 @@ iavf_set_rxfh_fields(struct net_device *netdev,
 	struct iavf_adapter *adapter = netdev_priv(netdev);
 	struct iavf_adv_rss *rss_old, *rss_new;
 	bool rss_new_add = false;
-	int count = 50, err = 0;
 	bool symm = false;
 	u64 hash_flds;
+	int err = 0;
 	u32 hdrs;
 
 	netdev_assert_locked(adapter->netdev);
@@ -1448,15 +1438,6 @@ iavf_set_rxfh_fields(struct net_device *netdev,
 				      symm)) {
 		kfree(rss_new);
 		return -EINVAL;
-	}
-
-	while (!mutex_trylock(&adapter->crit_lock)) {
-		if (--count == 0) {
-			kfree(rss_new);
-			return -EINVAL;
-		}
-
-		udelay(1);
 	}
 
 	spin_lock_bh(&adapter->adv_rss_lock);
@@ -1486,8 +1467,6 @@ iavf_set_rxfh_fields(struct net_device *netdev,
 
 	if (!err)
 		iavf_schedule_aq_request(adapter, IAVF_FLAG_AQ_ADD_ADV_RSS_CFG);
-
-	mutex_unlock(&adapter->crit_lock);
 
 	if (!rss_new_add)
 		kfree(rss_new);
