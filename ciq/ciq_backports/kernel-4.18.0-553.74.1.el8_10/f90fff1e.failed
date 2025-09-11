@@ -1,0 +1,106 @@
+posix-cpu-timers: fix race between handle_posix_cpu_timers() and posix_cpu_timer_del()
+
+jira LE-4107
+cve CVE-2025-38352
+Rebuild_History Non-Buildable kernel-4.18.0-553.74.1.el8_10
+commit-author Oleg Nesterov <oleg@redhat.com>
+commit f90fff1e152dedf52b932240ebbd670d83330eca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.74.1.el8_10/f90fff1e.failed
+
+If an exiting non-autoreaping task has already passed exit_notify() and
+calls handle_posix_cpu_timers() from IRQ, it can be reaped by its parent
+or debugger right after unlock_task_sighand().
+
+If a concurrent posix_cpu_timer_del() runs at that moment, it won't be
+able to detect timer->it.cpu.firing != 0: cpu_timer_task_rcu() and/or
+lock_task_sighand() will fail.
+
+Add the tsk->exit_state check into run_posix_cpu_timers() to fix this.
+
+This fix is not needed if CONFIG_POSIX_CPU_TIMERS_TASK_WORK=y, because
+exit_task_work() is called before exit_notify(). But the check still
+makes sense, task_work_add(&tsk->posix_cputimers_work.work) will fail
+anyway in this case.
+
+	Cc: stable@vger.kernel.org
+	Reported-by: Benoît Sevens <bsevens@google.com>
+Fixes: 0bdd2ed4138e ("sched: run_posix_cpu_timers: Don't check ->exit_state, use lock_task_sighand()")
+	Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit f90fff1e152dedf52b932240ebbd670d83330eca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/time/posix-cpu-timers.c
+diff --cc kernel/time/posix-cpu-timers.c
+index d6378f9d0ea5,2e5b89d7d866..000000000000
+--- a/kernel/time/posix-cpu-timers.c
++++ b/kernel/time/posix-cpu-timers.c
+@@@ -1165,17 -1373,62 +1165,57 @@@ void run_posix_cpu_timers(void
+  		spin_lock(&timer->it_lock);
+  		list_del_init(&timer->it.cpu.elist);
+  		cpu_firing = timer->it.cpu.firing;
+ -		timer->it.cpu.firing = false;
+ +		timer->it.cpu.firing = 0;
+  		/*
+ -		 * If the firing flag is cleared then this raced with a
+ -		 * timer rearm/delete operation. So don't generate an
+ -		 * event.
+ +		 * The firing flag is -1 if we collided with a reset
+ +		 * of the timer, which already reported this
+ +		 * almost-firing as an overrun.  So don't generate an event.
+  		 */
+ -		if (likely(cpu_firing))
+ +		if (likely(cpu_firing >= 0))
+  			cpu_timer_fire(timer);
+ -		/* See posix_cpu_timer_wait_running() */
+ -		rcu_assign_pointer(timer->it.cpu.handling, NULL);
+  		spin_unlock(&timer->it_lock);
+  	}
+++<<<<<<< HEAD
+ +	lockdep_posixtimer_exit();
+++=======
++ }
++ 
++ /*
++  * This is called from the timer interrupt handler.  The irq handler has
++  * already updated our counts.  We need to check if any timers fire now.
++  * Interrupts are disabled.
++  */
++ void run_posix_cpu_timers(void)
++ {
++ 	struct task_struct *tsk = current;
++ 
++ 	lockdep_assert_irqs_disabled();
++ 
++ 	/*
++ 	 * Ensure that release_task(tsk) can't happen while
++ 	 * handle_posix_cpu_timers() is running. Otherwise, a concurrent
++ 	 * posix_cpu_timer_del() may fail to lock_task_sighand(tsk) and
++ 	 * miss timer->it.cpu.firing != 0.
++ 	 */
++ 	if (tsk->exit_state)
++ 		return;
++ 
++ 	/*
++ 	 * If the actual expiry is deferred to task work context and the
++ 	 * work is already scheduled there is no point to do anything here.
++ 	 */
++ 	if (posix_cpu_timers_work_scheduled(tsk))
++ 		return;
++ 
++ 	/*
++ 	 * The fast path checks that there are no expired thread or thread
++ 	 * group timers.  If that's so, just return.
++ 	 */
++ 	if (!fastpath_timer_check(tsk))
++ 		return;
++ 
++ 	__run_posix_cpu_timers(tsk);
+++>>>>>>> f90fff1e152d (posix-cpu-timers: fix race between handle_posix_cpu_timers() and posix_cpu_timer_del())
+  }
+  
+  /*
+* Unmerged path kernel/time/posix-cpu-timers.c
