@@ -7,6 +7,5 @@
 
 #define GTTMMADR_BAR			0 /* MMIO + GTT */
 #define LMEM_BAR			2 /* VRAM */
-#define VF_LMEM_BAR			9 /* VF VRAM */
 
 #endif
