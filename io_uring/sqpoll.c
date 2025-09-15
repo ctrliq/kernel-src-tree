@@ -20,7 +20,7 @@
 #include "sqpoll.h"
 
 #define IORING_SQPOLL_CAP_ENTRIES_VALUE 8
-#define IORING_TW_CAP_ENTRIES_VALUE	8
+#define IORING_TW_CAP_ENTRIES_VALUE	32
 
 enum {
 	IO_SQ_THREAD_SHOULD_STOP = 0,
@@ -40,6 +40,7 @@ void io_sq_thread_unpark(struct io_sq_data *sqd)
 	if (atomic_dec_return(&sqd->park_pending))
 		set_bit(IO_SQ_THREAD_SHOULD_PARK, &sqd->state);
 	mutex_unlock(&sqd->lock);
+	wake_up(&sqd->wait);
 }
 
 void io_sq_thread_park(struct io_sq_data *sqd)
@@ -215,7 +216,7 @@ static bool io_sqd_handle_event(struct io_sq_data *sqd)
 		mutex_unlock(&sqd->lock);
 		if (signal_pending(current))
 			did_sig = get_signal(&ksig);
-		cond_resched();
+		wait_event(sqd->wait, !atomic_read(&sqd->park_pending));
 		mutex_lock(&sqd->lock);
 		sqd->sq_cpu = raw_smp_processor_id();
 	}
@@ -416,6 +417,7 @@ void io_sqpoll_wait_sq(struct io_ring_ctx *ctx)
 __cold int io_sq_offload_create(struct io_ring_ctx *ctx,
 				struct io_uring_params *p)
 {
+	struct task_struct *task_to_put = NULL;
 	int ret;
 
 	/* Retain compatibility with failing for an invalid attach attempt */
@@ -496,6 +498,7 @@ __cold int io_sq_offload_create(struct io_ring_ctx *ctx,
 		}
 
 		sqd->thread = tsk;
+		task_to_put = get_task_struct(tsk);
 		ret = io_uring_alloc_task_context(tsk, ctx);
 		wake_up_new_task(tsk);
 		if (ret)
@@ -506,11 +509,15 @@ __cold int io_sq_offload_create(struct io_ring_ctx *ctx,
 		goto err;
 	}
 
+	if (task_to_put)
+		put_task_struct(task_to_put);
 	return 0;
 err_sqpoll:
 	complete(&ctx->sq_data->exited);
 err:
 	io_sq_thread_finish(ctx);
+	if (task_to_put)
+		put_task_struct(task_to_put);
 	return ret;
 }
 
