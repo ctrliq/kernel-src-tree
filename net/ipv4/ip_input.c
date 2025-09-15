@@ -329,7 +329,6 @@ static int ip_rcv_finish_core(struct net *net, struct sock *sk,
 			goto drop_error;
 	}
 
-	drop_reason = SKB_DROP_REASON_NOT_SPECIFIED;
 	if (READ_ONCE(net->ipv4.sysctl_ip_early_demux) &&
 	    !skb_dst(skb) &&
 	    !skb->sk &&
@@ -348,7 +347,6 @@ static int ip_rcv_finish_core(struct net *net, struct sock *sk,
 				drop_reason = udp_v4_early_demux(skb);
 				if (unlikely(drop_reason))
 					goto drop_error;
-				drop_reason = SKB_DROP_REASON_NOT_SPECIFIED;
 
 				/* must reload iph, skb->head might have changed */
 				iph = ip_hdr(skb);
@@ -366,7 +364,6 @@ static int ip_rcv_finish_core(struct net *net, struct sock *sk,
 						   iph->tos, dev);
 		if (unlikely(drop_reason))
 			goto drop_error;
-		drop_reason = SKB_DROP_REASON_NOT_SPECIFIED;
 	} else {
 		struct in_device *in_dev = __in_dev_get_rcu(dev);
 
@@ -385,8 +382,10 @@ static int ip_rcv_finish_core(struct net *net, struct sock *sk,
 	}
 #endif
 
-	if (iph->ihl > 5 && ip_rcv_options(skb, dev))
+	if (iph->ihl > 5 && ip_rcv_options(skb, dev)) {
+		drop_reason = SKB_DROP_REASON_NOT_SPECIFIED;
 		goto drop;
+	}
 
 	rt = skb_rtable(skb);
 	if (rt->rt_type == RTN_MULTICAST) {
