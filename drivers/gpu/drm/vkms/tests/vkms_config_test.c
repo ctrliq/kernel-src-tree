@@ -4,7 +4,7 @@
 
 #include "../vkms_config.h"
 
-MODULE_IMPORT_NS("EXPORTED_FOR_KUNIT_TESTING");
+MODULE_IMPORT_NS(EXPORTED_FOR_KUNIT_TESTING);
 
 static size_t vkms_config_get_num_planes(struct vkms_config *config)
 {
@@ -148,7 +148,7 @@ static void vkms_config_test_default_config(struct kunit *test)
 			n_overlays++;
 			break;
 		default:
-			KUNIT_FAIL_AND_ABORT(test, "Unknown plane type");
+			KUNIT_ASSERT_FAILURE(test, "Unknown plane type");
 		}
 	}
 	KUNIT_EXPECT_EQ(test, n_primaries, 1);
