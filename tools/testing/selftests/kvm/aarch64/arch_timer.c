@@ -10,6 +10,7 @@
 #include "gic.h"
 #include "processor.h"
 #include "timer_test.h"
+#include "ucall_common.h"
 #include "vgic.h"
 
 enum guest_stage {
