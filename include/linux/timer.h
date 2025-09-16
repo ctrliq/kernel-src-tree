@@ -202,7 +202,7 @@ static inline int del_timer(struct timer_list *timer)
 	return timer_delete(timer);
 }
 
-extern void init_timers(void);
+extern void timers_init(void);
 struct hrtimer;
 extern enum hrtimer_restart it_real_fn(struct hrtimer *);
 
