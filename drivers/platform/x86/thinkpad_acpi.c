@@ -10372,7 +10372,7 @@ static void dytc_profile_exit(void)
 {
 	if (dytc_profile_available) {
 		dytc_profile_available = false;
-		platform_profile_remove();
+		platform_profile_remove(&dytc_profile);
 	}
 }
 
