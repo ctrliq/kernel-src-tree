@@ -586,7 +586,7 @@ static void snd_korg1212_SendStopAndWait(struct snd_korg1212 *korg1212)
 /* timer callback for checking the ack of stop request */
 static void snd_korg1212_timer_func(struct timer_list *t)
 {
-	struct snd_korg1212 *korg1212 = from_timer(korg1212, t, timer);
+	struct snd_korg1212 *korg1212 = timer_container_of(korg1212, t, timer);
 	unsigned long flags;
 	
 	spin_lock_irqsave(&korg1212->lock, flags);
