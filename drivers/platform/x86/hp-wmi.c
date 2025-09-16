@@ -941,7 +941,7 @@ static int platform_profile_set(struct platform_profile_handler *pprof,
 	return 0;
 }
 
-static int thermal_profile_setup(void)
+static int thermal_profile_setup(struct platform_device *device)
 {
 	int err, tp;
 
@@ -960,6 +960,7 @@ static int thermal_profile_setup(void)
 	platform_profile_handler.profile_get = platform_profile_get,
 	platform_profile_handler.profile_set = platform_profile_set,
 	platform_profile_handler.name = "hp-wmi",
+	platform_profile_handler.dev = &device->dev,
 
 	set_bit(PLATFORM_PROFILE_COOL, platform_profile_handler.choices);
 	set_bit(PLATFORM_PROFILE_BALANCED, platform_profile_handler.choices);
@@ -985,7 +986,7 @@ static int __init hp_wmi_bios_setup(struct platform_device *device)
 	if (hp_wmi_rfkill_setup(device))
 		hp_wmi_rfkill2_setup(device);
 
-	thermal_profile_setup();
+	thermal_profile_setup(device);
 
 	return 0;
 }

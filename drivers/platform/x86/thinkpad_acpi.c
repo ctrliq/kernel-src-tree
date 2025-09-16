@@ -10351,6 +10351,7 @@ static int tpacpi_dytc_profile_init(struct ibm_init_struct *iibm)
 			if (!err && ((output & DYTC_ERR_MASK) == DYTC_ERR_SUCCESS))
 				dytc_mmc_get_available = true;
 		}
+		dytc_profile.dev = &tpacpi_pdev->dev;
 		/* Create platform_profile structure and register */
 		err = platform_profile_register(&dytc_profile);
 		/*
