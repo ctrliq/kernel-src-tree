@@ -206,7 +206,7 @@ static int mv88e6xxx_phy_ppu_access_get(struct mv88e6xxx_chip *chip)
 		}
 		chip->ppu_disabled = 1;
 	} else {
-		del_timer(&chip->ppu_timer);
+		timer_delete(&chip->ppu_timer);
 		ret = 0;
 	}
 

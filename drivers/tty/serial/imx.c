@@ -1607,7 +1607,7 @@ static void imx_uart_shutdown(struct uart_port *port)
 	/*
 	 * Stop our timer.
 	 */
-	del_timer_sync(&sport->timer);
+	timer_delete_sync(&sport->timer);
 
 	/*
 	 * Disable all interrupts, port and break condition.
@@ -1740,7 +1740,7 @@ imx_uart_set_termios(struct uart_port *port, struct ktermios *termios,
 		old_csize = CS8;
 	}
 
-	del_timer_sync(&sport->timer);
+	timer_delete_sync(&sport->timer);
 
 	/*
 	 * Ask the core to calculate the divisor for us.

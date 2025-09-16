@@ -30,7 +30,7 @@
  *
  * @TIMER_IRQSAFE: An irqsafe timer is executed with IRQ disabled and
  * it's safe to wait for the completion of the running instance from
- * IRQ handlers, for example, by calling del_timer_sync().
+ * IRQ handlers, for example, by calling timer_delete_sync().
  *
  * Note: The irq disabled callback execution is a special case for
  * workqueue locking issues. It's not meant for executing random crap

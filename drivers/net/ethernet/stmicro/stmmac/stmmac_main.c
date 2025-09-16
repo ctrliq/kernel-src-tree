@@ -7855,7 +7855,7 @@ int stmmac_suspend(struct device *dev)
 
 	if (priv->eee_enabled) {
 		priv->tx_path_in_lpi_mode = false;
-		del_timer_sync(&priv->eee_ctrl_timer);
+		timer_delete_sync(&priv->eee_ctrl_timer);
 	}
 
 	/* Stop TX/RX DMA */

@@ -5635,9 +5635,9 @@ static int nv_close(struct net_device *dev)
 	nv_napi_disable(dev);
 	synchronize_irq(np->pci_dev->irq);
 
-	del_timer_sync(&np->oom_kick);
-	del_timer_sync(&np->nic_poll);
-	del_timer_sync(&np->stats_poll);
+	timer_delete_sync(&np->oom_kick);
+	timer_delete_sync(&np->nic_poll);
+	timer_delete_sync(&np->stats_poll);
 
 	netif_stop_queue(dev);
 	spin_lock_irq(&np->lock);
