@@ -1,0 +1,195 @@
+crypto: engine - Remove prepare/unprepare request
+
+jira LE-4159
+Rebuild_History Non-Buildable kernel-5.14.0-570.41.1.el9_6
+commit-author Herbert Xu <herbert@gondor.apana.org.au>
+commit bcd6e41d983621954dfc3f1f64249a55838b3e6a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-570.41.1.el9_6/bcd6e41d.failed
+
+The callbacks for prepare and unprepare request in crypto_engine
+is superfluous.  They can be done directly from do_one_request.
+
+Move the code into do_one_request and remove the unused callbacks.
+
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit bcd6e41d983621954dfc3f1f64249a55838b3e6a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	crypto/crypto_engine.c
+#	include/crypto/engine.h
+diff --cc crypto/crypto_engine.c
+index 5c4b4f02100a,17f7955500a0..000000000000
+--- a/crypto/crypto_engine.c
++++ b/crypto/crypto_engine.c
+@@@ -59,16 -40,8 +55,21 @@@ static void crypto_finalize_request(str
+  		spin_unlock_irqrestore(&engine->queue_lock, flags);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (finalize_req || engine->retry_support) {
+ +		enginectx = crypto_tfm_ctx(req->tfm);
+ +		if (enginectx->op.prepare_request &&
+ +		    enginectx->op.unprepare_request) {
+ +			ret = enginectx->op.unprepare_request(engine, req);
+ +			if (ret)
+ +				dev_err(engine->dev, "failed to unprepare request\n");
+ +		}
+ +	}
+ +	req->complete(req, err);
+++=======
++ 	lockdep_assert_in_softirq();
++ 	crypto_request_complete(req, err);
+++>>>>>>> bcd6e41d9836 (crypto: engine - Remove prepare/unprepare request)
+  
+  	kthread_queue_work(engine->kworker, &engine->pump_requests);
+  }
+@@@ -164,30 -132,15 +165,37 @@@ start_request
+  		}
+  	}
+  
+ -	enginectx = crypto_tfm_ctx(async_req->tfm);
+ -
+ +	if (async_req->tfm->__crt_alg->cra_flags & CRYPTO_ALG_ENGINE) {
+ +		alg = container_of(async_req->tfm->__crt_alg,
+ +				   struct crypto_engine_alg, base);
+ +		op = &alg->op;
+ +	} else {
+ +		enginectx = crypto_tfm_ctx(async_req->tfm);
+ +		op = &enginectx->op;
+ +
+++<<<<<<< HEAD
+ +		if (op->prepare_request) {
+ +			ret = op->prepare_request(engine, async_req);
+ +			if (ret) {
+ +				dev_err(engine->dev, "failed to prepare request: %d\n",
+ +					ret);
+ +				goto req_err_2;
+ +			}
+ +		}
+ +		if (!op->do_one_request) {
+ +			dev_err(engine->dev, "failed to do request\n");
+ +			ret = -EINVAL;
+ +			goto req_err_1;
+ +		}
+++=======
++ 	if (!enginectx->op.do_one_request) {
++ 		dev_err(engine->dev, "failed to do request\n");
++ 		ret = -EINVAL;
++ 		goto req_err_1;
+++>>>>>>> bcd6e41d9836 (crypto: engine - Remove prepare/unprepare request)
+  	}
+  
+ -	ret = enginectx->op.do_one_request(engine, async_req);
+ +	ret = op->do_one_request(engine, async_req);
+  
+  	/* Request unsuccessfully executed by hardware */
+  	if (ret < 0) {
+@@@ -230,16 -171,12 +226,20 @@@
+  	goto retry;
+  
+  req_err_1:
+++<<<<<<< HEAD
+ +	if (enginectx->op.unprepare_request) {
+ +		ret = enginectx->op.unprepare_request(engine, async_req);
+ +		if (ret)
+ +			dev_err(engine->dev, "failed to unprepare request\n");
+ +	}
+ +
+ +req_err_2:
+ +	async_req->complete(async_req, ret);
+++=======
++ 	crypto_request_complete(async_req, ret);
+++>>>>>>> bcd6e41d9836 (crypto: engine - Remove prepare/unprepare request)
+  
+  retry:
+ -	if (backlog)
+ -		crypto_request_complete(backlog, -EINPROGRESS);
+ -
+  	/* If retry mechanism is supported, send new requests to engine */
+  	if (engine->retry_support) {
+  		spin_lock_irqsave(&engine->queue_lock, flags);
+diff --cc include/crypto/engine.h
+index 7db1bae33021,1b02f69e0a79..000000000000
+--- a/include/crypto/engine.h
++++ b/include/crypto/engine.h
+@@@ -10,17 -10,74 +10,20 @@@
+  #include <crypto/aead.h>
+  #include <crypto/akcipher.h>
+  #include <crypto/hash.h>
+ -#include <crypto/skcipher.h>
+  #include <crypto/kpp.h>
+ +#include <crypto/skcipher.h>
+ +#include <linux/types.h>
+  
+ +struct crypto_engine;
+  struct device;
+  
+ -#define ENGINE_NAME_LEN	30
+ -/*
+ - * struct crypto_engine - crypto hardware engine
+ - * @name: the engine name
+ - * @idling: the engine is entering idle state
+ - * @busy: request pump is busy
+ - * @running: the engine is on working
+ - * @retry_support: indication that the hardware allows re-execution
+ - * of a failed backlog request
+ - * crypto-engine, in head position to keep order
+ - * @list: link with the global crypto engine list
+ - * @queue_lock: spinlock to synchronise access to request queue
+ - * @queue: the crypto queue of the engine
+ - * @rt: whether this queue is set to run as a realtime task
+ - * @prepare_crypt_hardware: a request will soon arrive from the queue
+ - * so the subsystem requests the driver to prepare the hardware
+ - * by issuing this call
+ - * @unprepare_crypt_hardware: there are currently no more requests on the
+ - * queue so the subsystem notifies the driver that it may relax the
+ - * hardware by issuing this call
+ - * @do_batch_requests: execute a batch of requests. Depends on multiple
+ - * requests support.
+ - * @kworker: kthread worker struct for request pump
+ - * @pump_requests: work struct for scheduling work to the request pump
+ - * @priv_data: the engine private data
+ - * @cur_req: the current request which is on processing
+ - */
+ -struct crypto_engine {
+ -	char			name[ENGINE_NAME_LEN];
+ -	bool			idling;
+ -	bool			busy;
+ -	bool			running;
+ -
+ -	bool			retry_support;
+ -
+ -	struct list_head	list;
+ -	spinlock_t		queue_lock;
+ -	struct crypto_queue	queue;
+ -	struct device		*dev;
+ -
+ -	bool			rt;
+ -
+ -	int (*prepare_crypt_hardware)(struct crypto_engine *engine);
+ -	int (*unprepare_crypt_hardware)(struct crypto_engine *engine);
+ -	int (*do_batch_requests)(struct crypto_engine *engine);
+ -
+ -
+ -	struct kthread_worker           *kworker;
+ -	struct kthread_work             pump_requests;
+ -
+ -	void				*priv_data;
+ -	struct crypto_async_request	*cur_req;
+ -};
+ -
+  /*
+   * struct crypto_engine_op - crypto hardware engine operations
+++<<<<<<< HEAD
+ + * @prepare__request: do some prepare if need before handle the current request
+ + * @unprepare_request: undo any work done by prepare_request()
+++=======
+++>>>>>>> bcd6e41d9836 (crypto: engine - Remove prepare/unprepare request)
+   * @do_one_request: do encryption for current request
+   */
+  struct crypto_engine_op {
+* Unmerged path crypto/crypto_engine.c
+* Unmerged path include/crypto/engine.h
