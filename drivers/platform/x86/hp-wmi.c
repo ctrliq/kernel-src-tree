@@ -889,7 +889,7 @@ static int thermal_profile_set(int thermal_profile)
 							   sizeof(thermal_profile), 0);
 }
 
-static int platform_profile_get(struct device *dev,
+static int hp_wmi_platform_profile_get(struct device *dev,
 				enum platform_profile_option *profile)
 {
 	int tp;
@@ -915,7 +915,7 @@ static int platform_profile_get(struct device *dev,
 	return 0;
 }
 
-static int platform_profile_set(struct device *dev,
+static int hp_wmi_platform_profile_set(struct device *dev,
 				enum platform_profile_option profile)
 {
 	int err, tp;
@@ -941,7 +941,16 @@ static int platform_profile_set(struct device *dev,
 	return 0;
 }
 
+static int hp_wmi_platform_profile_probe(void *drvdata, unsigned long *choices)
+{
+	set_bit(PLATFORM_PROFILE_COOL, choices);
+	set_bit(PLATFORM_PROFILE_BALANCED, choices);
+	set_bit(PLATFORM_PROFILE_PERFORMANCE, choices);
+	return 0;
+}
+
 static const struct platform_profile_ops hp_wmi_platform_profile_ops = {
+	.probe = hp_wmi_platform_profile_probe,
 	.profile_get = hp_wmi_platform_profile_get,
 	.profile_set = hp_wmi_platform_profile_set,
 };
@@ -962,13 +971,9 @@ static int thermal_profile_setup(struct platform_device *device)
 	if (err)
 		return err;
 
-	platform_profile_handler.name = "hp-wmi",
-	platform_profile_handler.dev = &device->dev,
-	platform_profile_handler.ops = &hp_wmi_platform_profile_ops,
-
-	set_bit(PLATFORM_PROFILE_COOL, platform_profile_handler.choices);
-	set_bit(PLATFORM_PROFILE_BALANCED, platform_profile_handler.choices);
-	set_bit(PLATFORM_PROFILE_PERFORMANCE, platform_profile_handler.choices);
+	platform_profile_handler.name = "hp-wmi";
+	platform_profile_handler.dev = &device->dev;
+	platform_profile_handler.ops = &hp_wmi_platform_profile_ops;
 
 	err = platform_profile_register(&platform_profile_handler, NULL);
 	if (err)
