@@ -177,16 +177,7 @@ static int surface_platform_profile_probe(struct ssam_device *sdev)
 	set_bit(PLATFORM_PROFILE_BALANCED_PERFORMANCE, tpd->handler.choices);
 	set_bit(PLATFORM_PROFILE_PERFORMANCE, tpd->handler.choices);
 
-	platform_profile_register(&tpd->handler, tpd);
-	return 0;
-}
-
-static void surface_platform_profile_remove(struct ssam_device *sdev)
-{
-	struct ssam_platform_profile_device *tpd;
-
-	tpd = ssam_device_get_drvdata(sdev);
-	platform_profile_remove(&tpd->handler);
+	return devm_platform_profile_register(&tpd->handler, tpd);
 }
 
 static const struct ssam_device_id ssam_platform_profile_match[] = {
@@ -197,7 +188,6 @@ MODULE_DEVICE_TABLE(ssam, ssam_platform_profile_match);
 
 static struct ssam_device_driver surface_platform_profile = {
 	.probe = surface_platform_profile_probe,
-	.remove = surface_platform_profile_remove,
 	.match_table = ssam_platform_profile_match,
 	.driver = {
 		.name = "surface_platform_profile",
