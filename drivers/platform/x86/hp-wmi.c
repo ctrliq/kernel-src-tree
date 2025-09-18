@@ -941,6 +941,11 @@ static int platform_profile_set(struct device *dev,
 	return 0;
 }
 
+static const struct platform_profile_ops hp_wmi_platform_profile_ops = {
+	.profile_get = hp_wmi_platform_profile_get,
+	.profile_set = hp_wmi_platform_profile_set,
+};
+
 static int thermal_profile_setup(struct platform_device *device)
 {
 	int err, tp;
@@ -957,10 +962,9 @@ static int thermal_profile_setup(struct platform_device *device)
 	if (err)
 		return err;
 
-	platform_profile_handler.profile_get = platform_profile_get,
-	platform_profile_handler.profile_set = platform_profile_set,
 	platform_profile_handler.name = "hp-wmi",
 	platform_profile_handler.dev = &device->dev,
+	platform_profile_handler.ops = &hp_wmi_platform_profile_ops,
 
 	set_bit(PLATFORM_PROFILE_COOL, platform_profile_handler.choices);
 	set_bit(PLATFORM_PROFILE_BALANCED, platform_profile_handler.choices);
