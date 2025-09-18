@@ -166,7 +166,7 @@ static const struct key_entry hp_wmi_keymap[] = {
 
 static struct input_dev *hp_wmi_input_dev;
 static struct platform_device *hp_wmi_platform_dev;
-static struct platform_profile_handler platform_profile_handler;
+static struct device *platform_profile_device;
 static bool platform_profile_support;
 
 static struct rfkill *wifi_rfkill;
@@ -957,6 +957,7 @@ static const struct platform_profile_ops hp_wmi_platform_profile_ops = {
 
 static int thermal_profile_setup(struct platform_device *device)
 {
+	const struct platform_profile_ops *ops;
 	int err, tp;
 
 	tp = thermal_profile_get();
@@ -971,13 +972,12 @@ static int thermal_profile_setup(struct platform_device *device)
 	if (err)
 		return err;
 
-	platform_profile_handler.name = "hp-wmi";
-	platform_profile_handler.dev = &device->dev;
-	platform_profile_handler.ops = &hp_wmi_platform_profile_ops;
+	ops = &hp_wmi_platform_profile_ops;
 
-	err = devm_platform_profile_register(&platform_profile_handler, NULL);
-	if (err)
-		return err;
+	platform_profile_device = devm_platform_profile_register(&device->dev, "hp-wmi",
+								 NULL, ops);
+	if (IS_ERR(platform_profile_device))
+		return PTR_ERR(platform_profile_device);
 
 	platform_profile_support = true;
 

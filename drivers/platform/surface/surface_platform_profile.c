@@ -29,7 +29,7 @@ struct ssam_tmp_profile_info {
 
 struct ssam_tmp_profile_device {
 	struct ssam_device *sdev;
-	struct platform_profile_handler handler;
+	struct device *ppdev;
 };
 
 SSAM_DEFINE_SYNC_REQUEST_CL_R(__ssam_tmp_profile_get, struct ssam_tmp_profile_info, {
@@ -168,16 +168,15 @@ static int surface_platform_profile_probe(struct ssam_device *sdev)
 	tpd->sdev = sdev;
 	ssam_device_set_drvdata(sdev, tpd);
 
-	tpd->handler.name = "Surface Platform Profile";
-	tpd->handler.dev = &sdev->dev;
-	tpd->handler.ops = &ssam_platform_profile_ops;
-
 	set_bit(PLATFORM_PROFILE_LOW_POWER, tpd->handler.choices);
 	set_bit(PLATFORM_PROFILE_BALANCED, tpd->handler.choices);
 	set_bit(PLATFORM_PROFILE_BALANCED_PERFORMANCE, tpd->handler.choices);
 	set_bit(PLATFORM_PROFILE_PERFORMANCE, tpd->handler.choices);
 
-	return devm_platform_profile_register(&tpd->handler, tpd);
+	tpd->ppdev = devm_platform_profile_register(&sdev->dev, "Surface Platform Profile",
+						    tpd, &ssam_platform_profile_ops);
+
+	return PTR_ERR_OR_ZERO(tpd->ppdev);
 }
 
 static const struct ssam_device_id ssam_platform_profile_match[] = {
