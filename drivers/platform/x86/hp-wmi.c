@@ -889,7 +889,7 @@ static int thermal_profile_set(int thermal_profile)
 							   sizeof(thermal_profile), 0);
 }
 
-static int platform_profile_get(struct platform_profile_handler *pprof,
+static int platform_profile_get(struct device *dev,
 				enum platform_profile_option *profile)
 {
 	int tp;
@@ -915,7 +915,7 @@ static int platform_profile_get(struct platform_profile_handler *pprof,
 	return 0;
 }
 
-static int platform_profile_set(struct platform_profile_handler *pprof,
+static int platform_profile_set(struct device *dev,
 				enum platform_profile_option profile)
 {
 	int err, tp;
