@@ -245,6 +245,11 @@ struct scsi_device {
 	 */
 	RH_KABI_FILL_HOLE(unsigned force_runtime_start_on_system_start:1)
 
+	/*
+	 * Set if the device is an ATA device.
+	 */
+	RH_KABI_FILL_HOLE(unsigned is_ata:1)
+
 	unsigned int queue_stopped;	/* request queue is quiesced */
 	bool offline_already;		/* Device offline message logged */
 
