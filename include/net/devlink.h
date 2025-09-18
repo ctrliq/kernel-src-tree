@@ -80,6 +80,9 @@ struct devlink_port_pci_sf_attrs {
  * @flavour: flavour of the port
  * @split: indicates if this is split port
  * @splittable: indicates if the port can be split.
+ * @no_phys_port_name: skip automatic phys_port_name generation; for
+ *		       compatibility only, newly added driver/port instance
+ *		       should never set this.
  * @lanes: maximum number of lanes the port supports. 0 value is not passed to netlink.
  * @switch_id: if the port is part of switch, this is buffer with ID, otherwise this is NULL
  * @phys: physical port attributes
@@ -89,7 +92,8 @@ struct devlink_port_pci_sf_attrs {
  */
 struct devlink_port_attrs {
 	u8 split:1,
-	   splittable:1;
+	   splittable:1,
+	   no_phys_port_name:1;
 	u32 lanes;
 	enum devlink_port_flavour flavour;
 	struct netdev_phys_item_id switch_id;
@@ -216,6 +220,9 @@ struct devlink_linecard_ops {
 	void (*types_get)(struct devlink_linecard *linecard,
 			  void *priv, unsigned int index, const char **type,
 			  const void **type_priv);
+
+        RH_KABI_RESERVE(1)
+        RH_KABI_RESERVE(2)
 };
 
 struct devlink_sb_pool_info {
@@ -393,6 +400,9 @@ struct devlink_dpipe_table_ops {
 			    struct devlink_dpipe_dump_ctx *dump_ctx);
 	int (*counters_set_update)(void *priv, bool enable);
 	u64 (*size_get)(void *priv);
+
+        RH_KABI_RESERVE(1)
+        RH_KABI_RESERVE(2)
 };
 
 /**
@@ -510,6 +520,9 @@ struct devlink_param {
 	int (*validate)(struct devlink *devlink, u32 id,
 			union devlink_param_value val,
 			struct netlink_ext_ack *extack);
+
+        RH_KABI_RESERVE(1)
+        RH_KABI_RESERVE(2)
 };
 
 struct devlink_param_item {
@@ -712,6 +725,9 @@ struct devlink_region_ops {
 		    struct netlink_ext_ack *extack,
 		    u64 offset, u32 size, u8 *data);
 	void *priv;
+
+        RH_KABI_RESERVE(1)
+        RH_KABI_RESERVE(2)
 };
 
 /**
@@ -740,6 +756,9 @@ struct devlink_port_region_ops {
 		    struct netlink_ext_ack *extack,
 		    u64 offset, u32 size, u8 *data);
 	void *priv;
+
+        RH_KABI_RESERVE(1)
+        RH_KABI_RESERVE(2)
 };
 
 struct devlink_fmsg;
@@ -773,6 +792,9 @@ struct devlink_health_reporter_ops {
 			struct netlink_ext_ack *extack);
 	int (*test)(struct devlink_health_reporter *reporter,
 		    struct netlink_ext_ack *extack);
+
+        RH_KABI_RESERVE(1)
+        RH_KABI_RESERVE(2)
 };
 
 /**
@@ -1720,6 +1742,15 @@ struct devlink_port_ops {
 	int (*port_fn_max_io_eqs_set)(struct devlink_port *devlink_port,
 				      u32 max_eqs,
 				      struct netlink_ext_ack *extack);
+
+        RH_KABI_RESERVE(1)
+        RH_KABI_RESERVE(2)
+        RH_KABI_RESERVE(3)
+        RH_KABI_RESERVE(4)
+        RH_KABI_RESERVE(5)
+        RH_KABI_RESERVE(6)
+        RH_KABI_RESERVE(7)
+        RH_KABI_RESERVE(8)
 };
 
 void devlink_port_init(struct devlink *devlink,
