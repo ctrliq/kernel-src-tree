@@ -671,7 +671,7 @@ static void ext4_handle_error(struct super_block *sb, bool force_ro, int error,
 		 * defer superblock flushing to a workqueue.
 		 */
 		if (continue_fs && journal)
-			schedule_work(&EXT4_SB(sb)->s_error_work);
+			schedule_work(&EXT4_SB(sb)->s_sb_upd_work);
 		else
 			ext4_commit_super(sb);
 	}
@@ -698,10 +698,10 @@ static void ext4_handle_error(struct super_block *sb, bool force_ro, int error,
 	sb->s_flags |= SB_RDONLY;
 }
 
-static void flush_stashed_error_work(struct work_struct *work)
+static void update_super_work(struct work_struct *work)
 {
 	struct ext4_sb_info *sbi = container_of(work, struct ext4_sb_info,
-						s_error_work);
+						s_sb_upd_work);
 	journal_t *journal = sbi->s_journal;
 	handle_t *handle;
 
@@ -1011,7 +1011,7 @@ __acquires(bitlock)
 		if (!bdev_read_only(sb->s_bdev)) {
 			save_error_info(sb, EFSCORRUPTED, ino, block, function,
 					line);
-			schedule_work(&EXT4_SB(sb)->s_error_work);
+			schedule_work(&EXT4_SB(sb)->s_sb_upd_work);
 		}
 		return;
 	}
@@ -1189,10 +1189,10 @@ static void ext4_put_super(struct super_block *sb)
 	 * Unregister sysfs before destroying jbd2 journal.
 	 * Since we could still access attr_journal_task attribute via sysfs
 	 * path which could have sbi->s_journal->j_task as NULL
-	 * Unregister sysfs before flush sbi->s_error_work.
+	 * Unregister sysfs before flush sbi->s_sb_upd_work.
 	 * Since user may read /proc/fs/ext4/xx/mb_groups during umount, If
 	 * read metadata verify failed then will queue error work.
-	 * flush_stashed_error_work will call start_this_handle may trigger
+	 * update_super_work will call start_this_handle may trigger
 	 * BUG_ON.
 	 */
 	ext4_unregister_sysfs(sb);
@@ -1203,7 +1203,7 @@ static void ext4_put_super(struct super_block *sb)
 	ext4_unregister_li_request(sb);
 	ext4_quota_off_umount(sb);
 
-	flush_work(&sbi->s_error_work);
+	flush_work(&sbi->s_sb_upd_work);
 	destroy_workqueue(sbi->rsv_conversion_wq);
 	ext4_release_orphan_info(sb);
 
@@ -4892,8 +4892,8 @@ static int ext4_load_and_init_journal(struct super_block *sb,
 	return 0;
 
 out:
-	/* flush s_error_work before journal destroy. */
-	flush_work(&sbi->s_error_work);
+	/* flush s_sb_upd_work before destroying the journal. */
+	flush_work(&sbi->s_sb_upd_work);
 	jbd2_journal_destroy(sbi->s_journal);
 	sbi->s_journal = NULL;
 	return -EINVAL;
@@ -5241,7 +5241,7 @@ static int __ext4_fill_super(struct fs_context *fc, struct super_block *sb)
 
 	timer_setup(&sbi->s_err_report, print_daily_error_info, 0);
 	spin_lock_init(&sbi->s_error_lock);
-	INIT_WORK(&sbi->s_error_work, flush_stashed_error_work);
+	INIT_WORK(&sbi->s_sb_upd_work, update_super_work);
 
 	/* Register extent status tree shrinker */
 	if (ext4_es_register_shrinker(sbi))
@@ -5601,16 +5601,16 @@ failed_mount_wq:
 	sbi->s_ea_block_cache = NULL;
 
 	if (sbi->s_journal) {
-		/* flush s_error_work before journal destroy. */
-		flush_work(&sbi->s_error_work);
+		/* flush s_sb_upd_work before journal destroy. */
+		flush_work(&sbi->s_sb_upd_work);
 		jbd2_journal_destroy(sbi->s_journal);
 		sbi->s_journal = NULL;
 	}
 failed_mount3a:
 	ext4_es_unregister_shrinker(sbi);
 failed_mount3:
-	/* flush s_error_work before sbi destroy */
-	flush_work(&sbi->s_error_work);
+	/* flush s_sb_upd_work before sbi destroy */
+	flush_work(&sbi->s_sb_upd_work);
 	del_timer_sync(&sbi->s_err_report);
 	ext4_stop_mmpd(sbi);
 	ext4_group_desc_free(sbi);
@@ -6426,7 +6426,7 @@ static int __ext4_remount(struct fs_context *fc, struct super_block *sb)
 	}
 
 	/* Flush outstanding errors before changing fs state */
-	flush_work(&sbi->s_error_work);
+	flush_work(&sbi->s_sb_upd_work);
 
 	if ((bool)(fc->sb_flags & SB_RDONLY) != sb_rdonly(sb)) {
 		if (ext4_test_mount_flag(sb, EXT4_MF_FS_ABORTED)) {
