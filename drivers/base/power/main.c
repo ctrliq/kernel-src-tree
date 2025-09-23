@@ -526,7 +526,7 @@ struct dpm_watchdog {
  */
 static void dpm_watchdog_handler(struct timer_list *t)
 {
-	struct dpm_watchdog *wd = from_timer(wd, t, timer);
+	struct dpm_watchdog *wd = timer_container_of(wd, t, timer);
 
 	dev_emerg(wd->dev, "**** DPM device timeout ****\n");
 	show_stack(wd->tsk, NULL, KERN_EMERG);

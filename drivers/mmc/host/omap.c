@@ -638,7 +638,7 @@ static void mmc_omap_abort_command(struct work_struct *work)
 static void
 mmc_omap_cmd_timer(struct timer_list *t)
 {
-	struct mmc_omap_host *host = from_timer(host, t, cmd_abort_timer);
+	struct mmc_omap_host *host = timer_container_of(host, t, cmd_abort_timer);
 	unsigned long flags;
 
 	spin_lock_irqsave(&host->slot_lock, flags);
@@ -667,7 +667,7 @@ mmc_omap_sg_to_buf(struct mmc_omap_host *host)
 static void
 mmc_omap_clk_timer(struct timer_list *t)
 {
-	struct mmc_omap_host *host = from_timer(host, t, clk_timer);
+	struct mmc_omap_host *host = timer_container_of(host, t, clk_timer);
 
 	mmc_omap_fclk_enable(host, 0);
 }
@@ -887,7 +887,7 @@ void omap_mmc_notify_cover_event(struct device *dev, int num, int is_closed)
 
 static void mmc_omap_cover_timer(struct timer_list *t)
 {
-	struct mmc_omap_slot *slot = from_timer(slot, t, cover_timer);
+	struct mmc_omap_slot *slot = timer_container_of(slot, t, cover_timer);
 	tasklet_schedule(&slot->cover_tasklet);
 }
 

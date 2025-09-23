@@ -486,7 +486,7 @@ int rsi_prepare_beacon(struct rsi_common *common, struct sk_buff *skb)
 
 static void bl_cmd_timeout(struct timer_list *t)
 {
-	struct rsi_hw *adapter = from_timer(adapter, t, bl_cmd_timer);
+	struct rsi_hw *adapter = timer_container_of(adapter, t, bl_cmd_timer);
 
 	adapter->blcmd_timer_expired = true;
 	del_timer(&adapter->bl_cmd_timer);

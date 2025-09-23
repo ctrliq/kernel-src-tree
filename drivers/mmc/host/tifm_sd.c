@@ -776,7 +776,7 @@ static void tifm_sd_end_cmd(struct tasklet_struct *t)
 
 static void tifm_sd_abort(struct timer_list *t)
 {
-	struct tifm_sd *host = from_timer(host, t, timer);
+	struct tifm_sd *host = timer_container_of(host, t, timer);
 
 	pr_err("%s : card failed to respond for a long period of time "
 	       "(%x, %x)\n",
