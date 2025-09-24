@@ -6319,7 +6319,7 @@ const struct attribute_group *lpfc_vport_groups[] = {
  **/
 static ssize_t
 sysfs_ctlreg_write(struct file *filp, struct kobject *kobj,
-		   struct bin_attribute *bin_attr,
+		   const struct bin_attribute *bin_attr,
 		   char *buf, loff_t off, size_t count)
 {
 	size_t buf_off;
@@ -6378,7 +6378,7 @@ sysfs_ctlreg_write(struct file *filp, struct kobject *kobj,
  **/
 static ssize_t
 sysfs_ctlreg_read(struct file *filp, struct kobject *kobj,
-		  struct bin_attribute *bin_attr,
+		  const struct bin_attribute *bin_attr,
 		  char *buf, loff_t off, size_t count)
 {
 	size_t buf_off;
@@ -6414,14 +6414,14 @@ sysfs_ctlreg_read(struct file *filp, struct kobject *kobj,
 	return count;
 }
 
-static struct bin_attribute sysfs_ctlreg_attr = {
+static const struct bin_attribute sysfs_ctlreg_attr = {
 	.attr = {
 		.name = "ctlreg",
 		.mode = S_IRUSR | S_IWUSR,
 	},
 	.size = 256,
-	.read = sysfs_ctlreg_read,
-	.write = sysfs_ctlreg_write,
+	.read_new = sysfs_ctlreg_read,
+	.write_new = sysfs_ctlreg_write,
 };
 
 /**
@@ -6442,7 +6442,7 @@ static struct bin_attribute sysfs_ctlreg_attr = {
  **/
 static ssize_t
 sysfs_mbox_write(struct file *filp, struct kobject *kobj,
-		 struct bin_attribute *bin_attr,
+		 const struct bin_attribute *bin_attr,
 		 char *buf, loff_t off, size_t count)
 {
 	return -EPERM;
@@ -6466,20 +6466,20 @@ sysfs_mbox_write(struct file *filp, struct kobject *kobj,
  **/
 static ssize_t
 sysfs_mbox_read(struct file *filp, struct kobject *kobj,
-		struct bin_attribute *bin_attr,
+		const struct bin_attribute *bin_attr,
 		char *buf, loff_t off, size_t count)
 {
 	return -EPERM;
 }
 
-static struct bin_attribute sysfs_mbox_attr = {
+static const struct bin_attribute sysfs_mbox_attr = {
 	.attr = {
 		.name = "mbox",
 		.mode = S_IRUSR | S_IWUSR,
 	},
 	.size = MAILBOX_SYSFS_MAX,
-	.read = sysfs_mbox_read,
-	.write = sysfs_mbox_write,
+	.read_new = sysfs_mbox_read,
+	.write_new = sysfs_mbox_write,
 };
 
 /**
