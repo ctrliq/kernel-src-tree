@@ -36,6 +36,7 @@
 #include <linux/rcupdate_trace.h>
 #include <linux/memcontrol.h>
 #include <linux/trace_events.h>
+#include <linux/overflow.h>
 
 #include <net/netfilter/nf_bpf_link.h>
 #include <net/netkit.h>
@@ -710,7 +711,7 @@ struct btf_record *btf_record_dup(const struct btf_record *rec)
 
 	if (IS_ERR_OR_NULL(rec))
 		return NULL;
-	size = offsetof(struct btf_record, fields[rec->cnt]);
+	size = struct_size(rec, fields, rec->cnt);
 	new_rec = kmemdup(rec, size, GFP_KERNEL | __GFP_NOWARN);
 	if (!new_rec)
 		return ERR_PTR(-ENOMEM);
@@ -765,7 +766,7 @@ bool btf_record_equal(const struct btf_record *rec_a, const struct btf_record *r
 		return false;
 	if (rec_a->cnt != rec_b->cnt)
 		return false;
-	size = offsetof(struct btf_record, fields[rec_a->cnt]);
+	size = struct_size(rec_a, fields, rec_a->cnt);
 	/* btf_parse_fields uses kzalloc to allocate a btf_record, so unused
 	 * members are zeroed out. So memcmp is safe to do without worrying
 	 * about padding/unused fields.
