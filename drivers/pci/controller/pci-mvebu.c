@@ -1168,48 +1168,27 @@ static void __iomem *mvebu_pcie_map_registers(struct platform_device *pdev,
 	return devm_ioremap_resource(&pdev->dev, &port->regs);
 }
 
-#define DT_FLAGS_TO_TYPE(flags)       (((flags) >> 24) & 0x03)
-#define    DT_TYPE_IO                 0x1
-#define    DT_TYPE_MEM32              0x2
-#define DT_CPUADDR_TO_TARGET(cpuaddr) (((cpuaddr) >> 56) & 0xFF)
-#define DT_CPUADDR_TO_ATTR(cpuaddr)   (((cpuaddr) >> 48) & 0xFF)
-
 static int mvebu_get_tgt_attr(struct device_node *np, int devfn,
 			      unsigned long type,
 			      unsigned int *tgt,
 			      unsigned int *attr)
 {
-	const int na = 3, ns = 2;
-	const __be32 *range;
-	int rlen, nranges, rangesz, pna, i;
+	struct of_range range;
+	struct of_range_parser parser;
 
 	*tgt = -1;
 	*attr = -1;
 
-	range = of_get_property(np, "ranges", &rlen);
-	if (!range)
+	if (of_pci_range_parser_init(&parser, np))
 		return -EINVAL;
 
-	pna = of_n_addr_cells(np);
-	rangesz = pna + na + ns;
-	nranges = rlen / sizeof(__be32) / rangesz;
+	for_each_of_range(&parser, &range) {
+		u32 slot = upper_32_bits(range.bus_addr);
 
-	for (i = 0; i < nranges; i++, range += rangesz) {
-		u32 flags = of_read_number(range, 1);
-		u32 slot = of_read_number(range + 1, 1);
-		u64 cpuaddr = of_read_number(range + na, pna);
-		unsigned long rtype;
-
-		if (DT_FLAGS_TO_TYPE(flags) == DT_TYPE_IO)
-			rtype = IORESOURCE_IO;
-		else if (DT_FLAGS_TO_TYPE(flags) == DT_TYPE_MEM32)
-			rtype = IORESOURCE_MEM;
-		else
-			continue;
-
-		if (slot == PCI_SLOT(devfn) && type == rtype) {
-			*tgt = DT_CPUADDR_TO_TARGET(cpuaddr);
-			*attr = DT_CPUADDR_TO_ATTR(cpuaddr);
+		if (slot == PCI_SLOT(devfn) &&
+		    type == (range.flags & IORESOURCE_TYPE_BITS)) {
+			*tgt = (range.parent_bus_addr >> 56) & 0xFF;
+			*attr = (range.parent_bus_addr >> 48) & 0xFF;
 			return 0;
 		}
 	}
