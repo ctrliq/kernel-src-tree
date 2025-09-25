@@ -681,8 +681,6 @@ static enum counter_recovery stat_handle_error(struct evsel *counter)
 	if (child_pid != -1)
 		kill(child_pid, SIGTERM);
 
-	tpebs_delete();
-
 	return COUNTER_FATAL;
 }
 
@@ -1856,7 +1854,7 @@ static int add_default_events(void)
 		 * will use this approach. To determine transaction support
 		 * on an architecture test for such a metric name.
 		 */
-		if (!metricgroup__has_metric(pmu, "transaction")) {
+		if (!metricgroup__has_metric_or_groups(pmu, "transaction")) {
 			pr_err("Missing transaction metrics\n");
 			ret = -1;
 			goto out;
@@ -1867,8 +1865,7 @@ static int add_default_events(void)
 						stat_config.metric_no_threshold,
 						stat_config.user_requested_cpu_list,
 						stat_config.system_wide,
-						stat_config.hardware_aware_grouping,
-						&stat_config.metric_events);
+						stat_config.hardware_aware_grouping);
 		goto out;
 	}
 
@@ -1890,7 +1887,7 @@ static int add_default_events(void)
 			smi_reset = true;
 		}
 
-		if (!metricgroup__has_metric(pmu, "smi")) {
+		if (!metricgroup__has_metric_or_groups(pmu, "smi")) {
 			pr_err("Missing smi metrics\n");
 			ret = -1;
 			goto out;
@@ -1905,8 +1902,7 @@ static int add_default_events(void)
 						stat_config.metric_no_threshold,
 						stat_config.user_requested_cpu_list,
 						stat_config.system_wide,
-						stat_config.hardware_aware_grouping,
-						&stat_config.metric_events);
+						stat_config.hardware_aware_grouping);
 		goto out;
 	}
 
@@ -1943,8 +1939,7 @@ static int add_default_events(void)
 						/*metric_no_threshold=*/true,
 						stat_config.user_requested_cpu_list,
 						stat_config.system_wide,
-						stat_config.hardware_aware_grouping,
-						&stat_config.metric_events) < 0) {
+						stat_config.hardware_aware_grouping) < 0) {
 			ret = -1;
 			goto out;
 		}
@@ -1980,7 +1975,7 @@ static int add_default_events(void)
 		 * Add TopdownL1 metrics if they exist. To minimize
 		 * multiplexing, don't request threshold computation.
 		 */
-		if (metricgroup__has_metric(pmu, "Default")) {
+		if (metricgroup__has_metric_or_groups(pmu, "Default")) {
 			struct evlist *metric_evlist = evlist__new();
 
 			if (!metric_evlist) {
@@ -1993,8 +1988,7 @@ static int add_default_events(void)
 							/*metric_no_threshold=*/true,
 							stat_config.user_requested_cpu_list,
 							stat_config.system_wide,
-							stat_config.hardware_aware_grouping,
-							&stat_config.metric_events) < 0) {
+							stat_config.hardware_aware_grouping) < 0) {
 				ret = -1;
 				goto out;
 			}
@@ -2003,6 +1997,9 @@ static int add_default_events(void)
 				evsel->default_metricgroup = true;
 
 			evlist__splice_list_tail(evlist, &metric_evlist->core.entries);
+			metricgroup__copy_metric_events(evlist, /*cgrp=*/NULL,
+							&evlist->metric_events,
+							&metric_evlist->metric_events);
 			evlist__delete(metric_evlist);
 		}
 	}
@@ -2057,6 +2054,9 @@ out:
 	}
 	parse_events_error__exit(&err);
 	evlist__splice_list_tail(evsel_list, &evlist->core.entries);
+	metricgroup__copy_metric_events(evsel_list, /*cgrp=*/NULL,
+					&evsel_list->metric_events,
+					&evlist->metric_events);
 	evlist__delete(evlist);
 	return ret;
 }
@@ -2329,6 +2329,32 @@ static void setup_system_wide(int forks)
 	}
 }
 
+#ifdef HAVE_ARCH_X86_64_SUPPORT
+static int parse_tpebs_mode(const struct option *opt, const char *str,
+			    int unset __maybe_unused)
+{
+	enum tpebs_mode *mode = opt->value;
+
+	if (!strcasecmp("mean", str)) {
+		*mode = TPEBS_MODE__MEAN;
+		return 0;
+	}
+	if (!strcasecmp("min", str)) {
+		*mode = TPEBS_MODE__MIN;
+		return 0;
+	}
+	if (!strcasecmp("max", str)) {
+		*mode = TPEBS_MODE__MAX;
+		return 0;
+	}
+	if (!strcasecmp("last", str)) {
+		*mode = TPEBS_MODE__LAST;
+		return 0;
+	}
+	return -1;
+}
+#endif // HAVE_ARCH_X86_64_SUPPORT
+
 int cmd_stat(int argc, const char **argv)
 {
 	struct opt_aggr_mode opt_mode = {};
@@ -2433,6 +2459,9 @@ int cmd_stat(int argc, const char **argv)
 #ifdef HAVE_ARCH_X86_64_SUPPORT
 		OPT_BOOLEAN(0, "record-tpebs", &tpebs_recording,
 			"enable recording for tpebs when retire_latency required"),
+		OPT_CALLBACK(0, "tpebs-mode", &tpebs_mode, "tpebs-mode",
+			"Mode of TPEBS recording: mean, min or max",
+			parse_tpebs_mode),
 #endif
 		OPT_UINTEGER(0, "td-level", &stat_config.topdown_level,
 			"Set the metrics level for the top-down statistics (0: max level)"),
@@ -2714,8 +2743,7 @@ int cmd_stat(int argc, const char **argv)
 						stat_config.metric_no_threshold,
 						stat_config.user_requested_cpu_list,
 						stat_config.system_wide,
-						stat_config.hardware_aware_grouping,
-						&stat_config.metric_events);
+						stat_config.hardware_aware_grouping);
 
 		zfree(&metrics);
 		if (ret) {
@@ -2735,8 +2763,7 @@ int cmd_stat(int argc, const char **argv)
 			goto out;
 		}
 
-		if (evlist__expand_cgroup(evsel_list, stat_config.cgroup_list,
-					  &stat_config.metric_events, true) < 0) {
+		if (evlist__expand_cgroup(evsel_list, stat_config.cgroup_list, true) < 0) {
 			parse_options_usage(stat_usage, stat_options,
 					    "for-each-cgroup", 0);
 			goto out;
@@ -2911,7 +2938,6 @@ out:
 
 	evlist__delete(evsel_list);
 
-	metricgroup__rblist_exit(&stat_config.metric_events);
 	evlist__close_control(stat_config.ctl_fd, stat_config.ctl_fd_ack, &stat_config.ctl_fd_close);
 
 	return status;
