@@ -19,6 +19,7 @@ enum cpuid_regs_idx {
 	CPUID_EDX,
 };
 
+#define CPUID_MWAIT_LEAF		5
 #define CPUID_TSC_LEAF         0x15
 
 #ifdef CONFIG_X86_32
