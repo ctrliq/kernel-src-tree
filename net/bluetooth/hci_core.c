@@ -1603,6 +1603,19 @@ struct adv_info *hci_find_adv_instance(struct hci_dev *hdev, u8 instance)
 }
 
 /* This function requires the caller holds hdev->lock */
+struct adv_info *hci_find_adv_sid(struct hci_dev *hdev, u8 sid)
+{
+	struct adv_info *adv;
+
+	list_for_each_entry(adv, &hdev->adv_instances, list) {
+		if (adv->sid == sid)
+			return adv;
+	}
+
+	return NULL;
+}
+
+/* This function requires the caller holds hdev->lock */
 struct adv_info *hci_get_next_instance(struct hci_dev *hdev, u8 instance)
 {
 	struct adv_info *cur_instance;
@@ -1754,7 +1767,7 @@ struct adv_info *hci_add_adv_instance(struct hci_dev *hdev, u8 instance,
 }
 
 /* This function requires the caller holds hdev->lock */
-struct adv_info *hci_add_per_instance(struct hci_dev *hdev, u8 instance,
+struct adv_info *hci_add_per_instance(struct hci_dev *hdev, u8 instance, u8 sid,
 				      u32 flags, u8 data_len, u8 *data,
 				      u32 min_interval, u32 max_interval)
 {
@@ -1766,6 +1779,7 @@ struct adv_info *hci_add_per_instance(struct hci_dev *hdev, u8 instance,
 	if (IS_ERR(adv))
 		return adv;
 
+	adv->sid = sid;
 	adv->periodic = true;
 	adv->per_adv_data_len = data_len;
 
@@ -1895,10 +1909,8 @@ void hci_free_adv_monitor(struct hci_dev *hdev, struct adv_monitor *monitor)
 	if (monitor->handle)
 		idr_remove(&hdev->adv_monitors_idr, monitor->handle);
 
-	if (monitor->state != ADV_MONITOR_STATE_NOT_REGISTERED) {
+	if (monitor->state != ADV_MONITOR_STATE_NOT_REGISTERED)
 		hdev->adv_monitors_cnt--;
-		mgmt_adv_monitor_removed(hdev, monitor->handle);
-	}
 
 	kfree(monitor);
 }
@@ -2510,6 +2522,7 @@ struct hci_dev *hci_alloc_dev_priv(int sizeof_priv)
 
 	mutex_init(&hdev->lock);
 	mutex_init(&hdev->req_lock);
+	mutex_init(&hdev->mgmt_pending_lock);
 
 	ida_init(&hdev->unset_handle_ida);
 
@@ -2641,7 +2654,7 @@ int hci_register_dev(struct hci_dev *hdev)
 	/* Devices that are marked for raw-only usage are unconfigured
 	 * and should not be included in normal operation.
 	 */
-	if (test_bit(HCI_QUIRK_RAW_DEVICE, &hdev->quirks))
+	if (hci_test_quirk(hdev, HCI_QUIRK_RAW_DEVICE))
 		hci_dev_set_flag(hdev, HCI_UNCONFIGURED);
 
 	/* Mark Remote Wakeup connection flag as supported if driver has wakeup
@@ -2771,7 +2784,7 @@ int hci_register_suspend_notifier(struct hci_dev *hdev)
 	int ret = 0;
 
 	if (!hdev->suspend_notifier.notifier_call &&
-	    !test_bit(HCI_QUIRK_NO_SUSPEND_NOTIFIER, &hdev->quirks)) {
+	    !hci_test_quirk(hdev, HCI_QUIRK_NO_SUSPEND_NOTIFIER)) {
 		hdev->suspend_notifier.notifier_call = hci_suspend_notifier;
 		ret = register_pm_notifier(&hdev->suspend_notifier);
 	}
@@ -2924,12 +2937,15 @@ int hci_recv_frame(struct hci_dev *hdev, struct sk_buff *skb)
 		break;
 	case HCI_ACLDATA_PKT:
 		/* Detect if ISO packet has been sent as ACL */
-		if (hci_conn_num(hdev, ISO_LINK)) {
+		if (hci_conn_num(hdev, CIS_LINK) ||
+		    hci_conn_num(hdev, BIS_LINK) ||
+			hci_conn_num(hdev, PA_LINK)) {
 			__u16 handle = __le16_to_cpu(hci_acl_hdr(skb)->handle);
 			__u8 type;
 
 			type = hci_conn_lookup_type(hdev, hci_handle(handle));
-			if (type == ISO_LINK)
+			if (type == CIS_LINK || type == BIS_LINK ||
+			    type == PA_LINK)
 				hci_skb_pkt_type(skb) = HCI_ISODATA_PKT;
 		}
 		break;
@@ -3382,7 +3398,9 @@ static inline void hci_quote_sent(struct hci_conn *conn, int num, int *quote)
 	case LE_LINK:
 		cnt = hdev->le_mtu ? hdev->le_cnt : hdev->acl_cnt;
 		break;
-	case ISO_LINK:
+	case CIS_LINK:
+	case BIS_LINK:
+	case PA_LINK:
 		cnt = hdev->iso_mtu ? hdev->iso_cnt :
 			hdev->le_mtu ? hdev->le_cnt : hdev->acl_cnt;
 		break;
@@ -3408,7 +3426,8 @@ static struct hci_conn *hci_low_sent(struct hci_dev *hdev, __u8 type,
 	rcu_read_lock();
 
 	list_for_each_entry_rcu(c, &h->list, list) {
-		if (c->type != type || skb_queue_empty(&c->data_q))
+		if (c->type != type ||
+		    skb_queue_empty(&c->data_q))
 			continue;
 
 		if (c->state != BT_CONNECTED && c->state != BT_CONFIG)
@@ -3440,23 +3459,18 @@ static void hci_link_tx_to(struct hci_dev *hdev, __u8 type)
 
 	bt_dev_err(hdev, "link tx timeout");
 
-	rcu_read_lock();
+	hci_dev_lock(hdev);
 
 	/* Kill stalled connections */
-	list_for_each_entry_rcu(c, &h->list, list) {
+	list_for_each_entry(c, &h->list, list) {
 		if (c->type == type && c->sent) {
 			bt_dev_err(hdev, "killing stalled connection %pMR",
 				   &c->dst);
-			/* hci_disconnect might sleep, so, we have to release
-			 * the RCU read lock before calling it.
-			 */
-			rcu_read_unlock();
 			hci_disconnect(c, HCI_ERROR_REMOTE_USER_TERM);
-			rcu_read_lock();
 		}
 	}
 
-	rcu_read_unlock();
+	hci_dev_unlock(hdev);
 }
 
 static struct hci_chan *hci_chan_sent(struct hci_dev *hdev, __u8 type,
@@ -3735,8 +3749,8 @@ static void hci_sched_le(struct hci_dev *hdev)
 		hci_prio_recalculate(hdev, LE_LINK);
 }
 
-/* Schedule CIS */
-static void hci_sched_iso(struct hci_dev *hdev)
+/* Schedule iso */
+static void hci_sched_iso(struct hci_dev *hdev, __u8 type)
 {
 	struct hci_conn *conn;
 	struct sk_buff *skb;
@@ -3744,12 +3758,12 @@ static void hci_sched_iso(struct hci_dev *hdev)
 
 	BT_DBG("%s", hdev->name);
 
-	if (!hci_conn_num(hdev, ISO_LINK))
+	if (!hci_conn_num(hdev, type))
 		return;
 
 	cnt = hdev->iso_pkts ? &hdev->iso_cnt :
 		hdev->le_pkts ? &hdev->le_cnt : &hdev->acl_cnt;
-	while (*cnt && (conn = hci_low_sent(hdev, ISO_LINK, &quote))) {
+	while (*cnt && (conn = hci_low_sent(hdev, type, &quote))) {
 		while (quote-- && (skb = skb_dequeue(&conn->data_q))) {
 			BT_DBG("skb %p len %d", skb, skb->len);
 			hci_send_conn_frame(hdev, conn, skb);
@@ -3774,7 +3788,9 @@ static void hci_tx_work(struct work_struct *work)
 		/* Schedule queues and send stuff to HCI driver */
 		hci_sched_sco(hdev, SCO_LINK);
 		hci_sched_sco(hdev, ESCO_LINK);
-		hci_sched_iso(hdev);
+		hci_sched_iso(hdev, CIS_LINK);
+		hci_sched_iso(hdev, BIS_LINK);
+		hci_sched_iso(hdev, PA_LINK);
 		hci_sched_acl(hdev);
 		hci_sched_le(hdev);
 	}
@@ -4094,10 +4110,13 @@ static void hci_send_cmd_sync(struct hci_dev *hdev, struct sk_buff *skb)
 		return;
 	}
 
-	err = hci_send_frame(hdev, skb);
-	if (err < 0) {
-		hci_cmd_sync_cancel_sync(hdev, -err);
-		return;
+	if (hci_skb_opcode(skb) != HCI_OP_NOP) {
+		err = hci_send_frame(hdev, skb);
+		if (err < 0) {
+			hci_cmd_sync_cancel_sync(hdev, -err);
+			return;
+		}
+		atomic_dec(&hdev->cmd_cnt);
 	}
 
 	if (hdev->req_status == HCI_REQ_PEND &&
@@ -4105,8 +4124,6 @@ static void hci_send_cmd_sync(struct hci_dev *hdev, struct sk_buff *skb)
 		kfree_skb(hdev->req_skb);
 		hdev->req_skb = skb_clone(hdev->sent_cmd, GFP_KERNEL);
 	}
-
-	atomic_dec(&hdev->cmd_cnt);
 }
 
 static void hci_cmd_work(struct work_struct *work)
