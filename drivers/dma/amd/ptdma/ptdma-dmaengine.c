@@ -566,7 +566,6 @@ int pt_dmaengine_register(struct pt_device *pt)
 	struct ae4_device *ae4 = NULL;
 	struct pt_dma_chan *chan;
 	char *desc_cache_name;
-	char *cmd_cache_name;
 	int ret, i;
 
 	if (pt->ver == AE4_DMA_VERSION)
@@ -580,12 +579,6 @@ int pt_dmaengine_register(struct pt_device *pt)
 					       GFP_KERNEL);
 
 	if (!pt->pt_dma_chan)
-		return -ENOMEM;
-
-	cmd_cache_name = devm_kasprintf(pt->dev, GFP_KERNEL,
-					"%s-dmaengine-cmd-cache",
-					dev_name(pt->dev));
-	if (!cmd_cache_name)
 		return -ENOMEM;
 
 	desc_cache_name = devm_kasprintf(pt->dev, GFP_KERNEL,
