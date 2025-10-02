@@ -2668,7 +2668,7 @@ static int __init nfs_init_keyring(void)
 	return PTR_ERR_OR_ZERO(nfs_keyring);
 }
 
-static void __exit nfs_exit_keyring(void)
+static void nfs_exit_keyring(void)
 {
 	key_put(nfs_keyring);
 }
