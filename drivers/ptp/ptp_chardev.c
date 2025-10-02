@@ -262,6 +262,8 @@ long ptp_ioctl(struct posix_clock *pc, unsigned int cmd, unsigned long arg)
 			err = -EINVAL;
 			break;
 		}
+		if (req.perout.flags & ~ptp->info->supported_perout_flags)
+			return -EOPNOTSUPP;
 		req.type = PTP_CLK_REQ_PEROUT;
 		enable = req.perout.period.sec || req.perout.period.nsec;
 		if (mutex_lock_interruptible(&ptp->pincfg_mux))
