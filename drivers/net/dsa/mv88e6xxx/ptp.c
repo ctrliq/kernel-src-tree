@@ -273,13 +273,6 @@ static int mv88e6352_ptp_enable_extts(struct mv88e6xxx_chip *chip,
 	int pin;
 	int err;
 
-	/* Reject requests with unsupported flags */
-	if (rq->extts.flags & ~(PTP_ENABLE_FEATURE |
-				PTP_RISING_EDGE |
-				PTP_FALLING_EDGE |
-				PTP_STRICT_FLAGS))
-		return -EOPNOTSUPP;
-
 	/* Reject requests to enable time stamping on both edges. */
 	if ((rq->extts.flags & PTP_STRICT_FLAGS) &&
 	    (rq->extts.flags & PTP_ENABLE_FEATURE) &&
@@ -490,6 +483,10 @@ int mv88e6xxx_ptp_setup(struct mv88e6xxx_chip *chip)
 	chip->ptp_clock_info.enable	= ptp_ops->ptp_enable;
 	chip->ptp_clock_info.verify	= ptp_ops->ptp_verify;
 	chip->ptp_clock_info.do_aux_work = mv88e6xxx_hwtstamp_work;
+
+	chip->ptp_clock_info.supported_extts_flags = PTP_RISING_EDGE |
+						     PTP_FALLING_EDGE |
+						     PTP_STRICT_FLAGS;
 
 	chip->ptp_clock = ptp_clock_register(&chip->ptp_clock_info, chip->dev);
 	if (IS_ERR(chip->ptp_clock))
