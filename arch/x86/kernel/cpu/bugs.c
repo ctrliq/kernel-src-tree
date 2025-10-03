@@ -83,6 +83,9 @@ static void __init l1d_flush_select_mitigation(void);
 static void __init srso_select_mitigation(void);
 static void __init gds_select_mitigation(void);
 static void __init gds_apply_mitigation(void);
+static void __init bhi_select_mitigation(void);
+static void __init bhi_update_mitigation(void);
+static void __init bhi_apply_mitigation(void);
 static void __init its_select_mitigation(void);
 static void __init tsa_select_mitigation(void);
 static void __init tsa_apply_mitigation(void);
@@ -231,6 +234,7 @@ void __init cpu_select_mitigations(void)
 	 */
 	srso_select_mitigation();
 	gds_select_mitigation();
+	bhi_select_mitigation();
 	its_select_mitigation();
 	tsa_select_mitigation();
 	tsa_apply_mitigation();
@@ -254,6 +258,7 @@ void __init cpu_select_mitigations(void)
 	taa_update_mitigation();
 	mmio_update_mitigation();
 	rfds_update_mitigation();
+	bhi_update_mitigation();
 
 	spectre_v1_apply_mitigation();
 	retbleed_apply_mitigation();
@@ -264,6 +269,7 @@ void __init cpu_select_mitigations(void)
 	rfds_apply_mitigation();
 	srbds_apply_mitigation();
 	gds_apply_mitigation();
+	bhi_apply_mitigation();
 }
 
 /*
@@ -2056,12 +2062,13 @@ static bool __init spec_ctrl_bhi_dis(void)
 
 enum bhi_mitigations {
 	BHI_MITIGATION_OFF,
+	BHI_MITIGATION_AUTO,
 	BHI_MITIGATION_ON,
 	BHI_MITIGATION_VMEXIT_ONLY,
 };
 
 static enum bhi_mitigations bhi_mitigation __ro_after_init =
-	IS_ENABLED(CONFIG_MITIGATION_SPECTRE_BHI) ? BHI_MITIGATION_ON : BHI_MITIGATION_OFF;
+	IS_ENABLED(CONFIG_MITIGATION_SPECTRE_BHI) ? BHI_MITIGATION_AUTO : BHI_MITIGATION_OFF;
 
 static int __init spectre_bhi_parse_cmdline(char *str)
 {
@@ -2082,6 +2089,25 @@ static int __init spectre_bhi_parse_cmdline(char *str)
 early_param("spectre_bhi", spectre_bhi_parse_cmdline);
 
 static void __init bhi_select_mitigation(void)
+{
+	if (!boot_cpu_has(X86_BUG_BHI) || cpu_mitigations_off())
+		bhi_mitigation = BHI_MITIGATION_OFF;
+
+	if (bhi_mitigation == BHI_MITIGATION_AUTO)
+		bhi_mitigation = BHI_MITIGATION_ON;
+}
+
+static void __init bhi_update_mitigation(void)
+{
+	if (spectre_v2_cmd == SPECTRE_V2_CMD_NONE)
+		bhi_mitigation = BHI_MITIGATION_OFF;
+
+	if (!boot_cpu_has_bug(X86_BUG_SPECTRE_V2) &&
+	     spectre_v2_cmd == SPECTRE_V2_CMD_AUTO)
+		bhi_mitigation = BHI_MITIGATION_OFF;
+}
+
+static void __init bhi_apply_mitigation(void)
 {
 	if (bhi_mitigation == BHI_MITIGATION_OFF)
 		return;
@@ -2222,9 +2248,6 @@ static void __init spectre_v2_select_mitigation(void)
 	    mode == SPECTRE_V2_EIBRS_RETPOLINE ||
 	    mode == SPECTRE_V2_RETPOLINE)
 		spec_ctrl_disable_kernel_rrsba();
-
-	if (boot_cpu_has(X86_BUG_BHI))
-		bhi_select_mitigation();
 
 	spectre_v2_enabled = mode;
 	pr_info("%s\n", spectre_v2_strings[mode]);
