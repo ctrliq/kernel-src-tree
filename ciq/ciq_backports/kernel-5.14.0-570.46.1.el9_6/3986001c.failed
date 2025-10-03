@@ -1,0 +1,165 @@
+scsi: fnic: Return appropriate error code from failure of scsi drv init
+
+jira LE-4311
+Rebuild_History Non-Buildable kernel-5.14.0-570.46.1.el9_6
+commit-author Karan Tilak Kumar <kartilak@cisco.com>
+commit 3986001ca11ec630d631467d788aac513c61cb52
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-570.46.1.el9_6/3986001c.failed
+
+Return appropriate error code from fnic_probe caused by failure of
+fnic_scsi_drv_init. Fix bug report.
+
+	Suggested-by: Dan Carpenter <dan.carpenter@linaro.org>
+	Reviewed-by: Sesidhar Baddela <sebaddel@cisco.com>
+	Reviewed-by: Arulprabhu Ponnusamy <arulponn@cisco.com>
+	Reviewed-by: Gian Carlo Boffa <gcboffa@cisco.com>
+	Reviewed-by: Arun Easi <aeasi@cisco.com>
+	Signed-off-by: Karan Tilak Kumar <kartilak@cisco.com>
+Link: https://lore.kernel.org/r/20250110091842.17711-1-kartilak@cisco.com
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 3986001ca11ec630d631467d788aac513c61cb52)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/fnic/fnic_main.c
+diff --cc drivers/scsi/fnic/fnic_main.c
+index 06fd7b543b33,9ed42d5819d5..000000000000
+--- a/drivers/scsi/fnic/fnic_main.c
++++ b/drivers/scsi/fnic/fnic_main.c
+@@@ -854,58 -967,90 +854,85 @@@ static int fnic_probe(struct pci_dev *p
+  		}
+  	}
+  
+ -	init_completion(&fnic->reset_completion_wait);
+ +	/*
+ +	 * Initialization done with PCI system, hardware, firmware.
+ +	 * Add host to SCSI
+ +	 */
+ +	err = scsi_add_host(lp->host, &pdev->dev);
+ +	if (err) {
+ +		shost_printk(KERN_ERR, fnic->lport->host,
+ +			     "fnic: scsi_add_host failed...exiting\n");
+ +		goto err_out_free_rq_buf;
+ +	}
+  
+ -	/* Start local port initialization */
+ -	iport->max_flogi_retries = fnic->config.flogi_retries;
+ -	iport->max_plogi_retries = fnic->config.plogi_retries;
+ -	iport->plogi_timeout = fnic->config.plogi_timeout;
+ -	iport->service_params =
+ -		(FNIC_FCP_SP_INITIATOR | FNIC_FCP_SP_RD_XRDY_DIS |
+ -		 FNIC_FCP_SP_CONF_CMPL);
+ -	if (fnic->config.flags & VFCF_FCP_SEQ_LVL_ERR)
+ -		iport->service_params |= FNIC_FCP_SP_RETRY;
+ +	/* Start local port initiatialization */
+  
+ -	iport->boot_time = jiffies;
+ -	iport->e_d_tov = fnic->config.ed_tov;
+ -	iport->r_a_tov = fnic->config.ra_tov;
+ -	iport->link_supported_speeds = FNIC_PORTSPEED_10GBIT;
+ -	iport->wwpn = fnic->config.port_wwn;
+ -	iport->wwnn = fnic->config.node_wwn;
+ +	lp->link_up = 0;
+  
+ -	iport->max_payload_size = fnic->config.maxdatafieldsize;
+ +	lp->max_retry_count = fnic->config.flogi_retries;
+ +	lp->max_rport_retry_count = fnic->config.plogi_retries;
+ +	lp->service_params = (FCP_SPPF_INIT_FCN | FCP_SPPF_RD_XRDY_DIS |
+ +			      FCP_SPPF_CONF_COMPL);
+ +	if (fnic->config.flags & VFCF_FCP_SEQ_LVL_ERR)
+ +		lp->service_params |= FCP_SPPF_RETRY;
+  
+ -	if ((iport->max_payload_size < FNIC_MIN_DATA_FIELD_SIZE) ||
+ -		(iport->max_payload_size > FNIC_FC_MAX_PAYLOAD_LEN) ||
+ -		((iport->max_payload_size % 4) != 0)) {
+ -		iport->max_payload_size = FNIC_FC_MAX_PAYLOAD_LEN;
+ -	}
+ +	lp->boot_time = jiffies;
+ +	lp->e_d_tov = fnic->config.ed_tov;
+ +	lp->r_a_tov = fnic->config.ra_tov;
+ +	lp->link_supported_speeds = FC_PORTSPEED_10GBIT;
+ +	fc_set_wwnn(lp, fnic->config.node_wwn);
+ +	fc_set_wwpn(lp, fnic->config.port_wwn);
+  
+ -	iport->flags |= FNIC_FIRST_LINK_UP;
+ +	fcoe_libfc_config(lp, &fnic->ctlr, &fnic_transport_template, 0);
+  
+ -	timer_setup(&(iport->fabric.retry_timer), fdls_fabric_timer_callback,
+ -				0);
+ +	if (!fc_exch_mgr_alloc(lp, FC_CLASS_3, FCPIO_HOST_EXCH_RANGE_START,
+ +			       FCPIO_HOST_EXCH_RANGE_END, NULL)) {
+ +		err = -ENOMEM;
+ +		goto err_out_remove_scsi_host;
+ +	}
+  
+ +	fc_lport_init_stats(lp);
+  	fnic->stats_reset_time = jiffies;
+  
+ -	INIT_WORK(&fnic->link_work, fnic_handle_link);
+ -	INIT_WORK(&fnic->frame_work, fnic_handle_frame);
+ -	INIT_WORK(&fnic->tport_work, fnic_tport_event_handler);
+ -	INIT_WORK(&fnic->flush_work, fnic_flush_tx);
+ -
+ -	INIT_LIST_HEAD(&fnic->frame_queue);
+ -	INIT_LIST_HEAD(&fnic->tx_queue);
+ -	INIT_LIST_HEAD(&fnic->tport_event_list);
+ +	fc_lport_config(lp);
+  
+ -	INIT_DELAYED_WORK(&iport->oxid_pool.schedule_oxid_free_retry,
+ -	fdls_schedule_oxid_free_retry_work);
+ -
+ -	/* Initialize the oxid reclaim list and work struct */
+ -	INIT_LIST_HEAD(&iport->oxid_pool.oxid_reclaim_list);
+ -	INIT_DELAYED_WORK(&iport->oxid_pool.oxid_reclaim_work, fdls_reclaim_oxid_handler);
+ -
+ -	/* Enable all queues */
+ -	for (i = 0; i < fnic->raw_wq_count; i++)
+ -		vnic_wq_enable(&fnic->wq[i]);
+ -	for (i = 0; i < fnic->rq_count; i++) {
+ -		if (!ioread32(&fnic->rq[i].ctrl->enable))
+ -			vnic_rq_enable(&fnic->rq[i]);
+ +	if (fc_set_mfs(lp, fnic->config.maxdatafieldsize +
+ +		       sizeof(struct fc_frame_header))) {
+ +		err = -EINVAL;
+ +		goto err_out_free_exch_mgr;
+  	}
+ -	for (i = 0; i < fnic->wq_copy_count; i++)
+ -		vnic_wq_copy_enable(&fnic->hw_copy_wq[i]);
+ +	fc_host_maxframe_size(lp->host) = lp->mfs;
+ +	fc_host_dev_loss_tmo(lp->host) = fnic->config.port_down_timeout / 1000;
+  
+++<<<<<<< HEAD
+ +	sprintf(fc_host_symbolic_name(lp->host),
+ +		DRV_NAME " v" DRV_VERSION " over %s", fnic->name);
+++=======
++ 	vnic_dev_enable(fnic->vdev);
++ 
++ 	err = fnic_request_intr(fnic);
++ 	if (err) {
++ 		dev_err(&fnic->pdev->dev, "Unable to request irq.\n");
++ 		goto err_out_fnic_request_intr;
++ 	}
++ 
++ 	fnic_notify_timer_start(fnic);
++ 
++ 	fnic_fdls_init(fnic, (fnic->config.flags & VFCF_FIP_CAPABLE));
++ 
++ 	err = fnic_scsi_drv_init(fnic);
++ 	if (err)
++ 		goto err_out_scsi_drv_init;
++ 
++ 	err = fnic_stats_debugfs_init(fnic);
++ 	if (err) {
++ 		dev_err(&fnic->pdev->dev, "Failed to initialize debugfs for stats\n");
++ 		goto err_out_free_stats_debugfs;
++ 	}
++ 
++ 	for (i = 0; i < fnic->intr_count; i++)
++ 		vnic_intr_unmask(&fnic->intr[i]);
+++>>>>>>> 3986001ca11e (scsi: fnic: Return appropriate error code from failure of scsi drv init)
+  
+  	spin_lock_irqsave(&fnic_list_lock, flags);
+  	list_add_tail(&fnic->list, &fnic_list);
+* Unmerged path drivers/scsi/fnic/fnic_main.c
