@@ -1711,7 +1711,6 @@ static int enic_open(struct net_device *netdev)
 	for (i = 0; i < enic->rq_count; i++) {
 		/* create a page pool for each RQ */
 		pp_params.napi = &enic->napi[i];
-		pp_params.queue_idx = i;
 		enic->rq[i].pool = page_pool_create(&pp_params);
 		if (IS_ERR(enic->rq[i].pool)) {
 			err = PTR_ERR(enic->rq[i].pool);
