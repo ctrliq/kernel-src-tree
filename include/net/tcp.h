@@ -40,7 +40,7 @@
 #include <net/inet_ecn.h>
 #include <net/dst.h>
 #include <net/mptcp.h>
-#include <net/xfrm.h>
+#include RH_KABI_HIDE_INCLUDE(<net/xfrm.h>)
 
 #include <linux/seq_file.h>
 #include <linux/memcontrol.h>
