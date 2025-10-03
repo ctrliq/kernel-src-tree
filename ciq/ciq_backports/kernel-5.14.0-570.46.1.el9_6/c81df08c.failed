@@ -1,0 +1,1486 @@
+scsi: fnic: Add support for multiqueue (MQ) in fnic driver
+
+jira LE-4311
+Rebuild_History Non-Buildable kernel-5.14.0-570.46.1.el9_6
+commit-author Karan Tilak Kumar <kartilak@cisco.com>
+commit c81df08cd2944f89921033e5f1744ae2960f4e69
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-570.46.1.el9_6/c81df08c.failed
+
+Implement support for MQ in fnic driver:
+
+The block multiqueue layer issues IO to the fnic driver with an MQ tag. Use
+the mqtag and derive a tag from it.  Derive the hardware queue from the
+mqtag and use it in all paths. Modify queuecommand to handle mqtag.
+
+Replace wq and cq indices to support MQ. Replace the zeroth queue with a
+hardware queue.  Implement spin locks on a per hardware queue basis.
+Replace io_lock with per hardware queue spinlock.  Implement out of range
+tag checks.
+
+Allocate an io_req_table to track status of the io_req.
+
+Test the driver by building it, loading it, and configuring 64 queues in
+UCSM. Issue IOs using Medusa on multiple fnics. Enable/disable links to
+exercise the abort and clean up path.
+
+	Reported-by: kernel test robot <lkp@intel.com>
+Closes: https://lore.kernel.org/oe-kbuild-all/202310300032.2awCqkfn-lkp@intel.com/
+	Reviewed-by: Sesidhar Baddela <sebaddel@cisco.com>
+	Reviewed-by: Arulprabhu Ponnusamy <arulponn@cisco.com>
+	Tested-by: Karan Tilak Kumar <kartilak@cisco.com>
+	Signed-off-by: Karan Tilak Kumar <kartilak@cisco.com>
+Link: https://lore.kernel.org/r/20231211173617.932990-12-kartilak@cisco.com
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit c81df08cd2944f89921033e5f1744ae2960f4e69)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/fnic/fnic_main.c
+#	drivers/scsi/fnic/fnic_scsi.c
+diff --cc drivers/scsi/fnic/fnic_main.c
+index 85e3a51a16fc,5ed1d897311a..000000000000
+--- a/drivers/scsi/fnic/fnic_main.c
++++ b/drivers/scsi/fnic/fnic_main.c
+@@@ -774,9 -794,6 +774,12 @@@ static int fnic_probe(struct pci_dev *p
+  		fnic->fw_ack_index[i] = -1;
+  	}
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < FNIC_IO_LOCKS; i++)
+ +		spin_lock_init(&fnic->io_req_lock[i]);
+ +
+++=======
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  	err = -ENOMEM;
+  	fnic->io_req_pool = mempool_create_slab_pool(2, fnic_io_req_cache);
+  	if (!fnic->io_req_pool)
+diff --cc drivers/scsi/fnic/fnic_scsi.c
+index a9f65dc3f089,42807e89859c..000000000000
+--- a/drivers/scsi/fnic/fnic_scsi.c
++++ b/drivers/scsi/fnic/fnic_scsi.c
+@@@ -414,15 -383,11 +398,22 @@@ static inline int fnic_queue_wq_copy_de
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * fnic_queuecommand
+ + * Routine to send a scsi cdb
+ + * Called with host_lock held and interrupts disabled.
+ + */
+ +static int fnic_queuecommand_lck(struct scsi_cmnd *sc, void (*done)(struct scsi_cmnd *))
+ +{
+ +	const int tag = scsi_cmd_to_rq(sc)->tag;
+++=======
++ int fnic_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *sc)
++ {
++ 	struct request *const rq = scsi_cmd_to_rq(sc);
++ 	uint32_t mqtag = 0;
++ 	void (*done)(struct scsi_cmnd *) = scsi_done;
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  	struct fc_lport *lp = shost_priv(sc->device->host);
+  	struct fc_rport *rport;
+  	struct fnic_io_req *io_req = NULL;
+@@@ -434,15 -399,28 +425,26 @@@
+  	int sg_count = 0;
+  	unsigned long flags = 0;
+  	unsigned long ptr;
+- 	spinlock_t *io_lock = NULL;
+  	int io_lock_acquired = 0;
+  	struct fc_rport_libfc_priv *rp;
++ 	uint16_t hwq = 0;
+  
+++<<<<<<< HEAD
+ +	if (unlikely(fnic_chk_state_flags_locked(fnic, FNIC_FLAGS_IO_BLOCKED)))
+++=======
++ 	mqtag = blk_mq_unique_tag(rq);
++ 	spin_lock_irqsave(&fnic->fnic_lock, flags);
++ 
++ 	if (unlikely(fnic_chk_state_flags_locked(fnic, FNIC_FLAGS_IO_BLOCKED))) {
++ 		spin_unlock_irqrestore(&fnic->fnic_lock, flags);
++ 		FNIC_SCSI_DBG(KERN_ERR, fnic->lport->host,
++ 			"fnic<%d>: %s: %d: fnic IO blocked flags: 0x%lx. Returning SCSI_MLQUEUE_HOST_BUSY\n",
++ 			fnic->fnic_num, __func__, __LINE__, fnic->state_flags);
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  		return SCSI_MLQUEUE_HOST_BUSY;
+ -	}
+  
+ -	if (unlikely(fnic_chk_state_flags_locked(fnic, FNIC_FLAGS_FWRESET))) {
+ -		spin_unlock_irqrestore(&fnic->fnic_lock, flags);
+ -		FNIC_SCSI_DBG(KERN_ERR, fnic->lport->host,
+ -			"fnic<%d>: %s: %d: fnic flags: 0x%lx. Returning SCSI_MLQUEUE_HOST_BUSY\n",
+ -			fnic->fnic_num, __func__, __LINE__, fnic->state_flags);
+ +	if (unlikely(fnic_chk_state_flags_locked(fnic, FNIC_FLAGS_FWRESET)))
+  		return SCSI_MLQUEUE_HOST_BUSY;
+ -	}
+  
+  	rport = starget_to_rport(scsi_target(sc->device));
+  	if (!rport) {
+@@@ -512,7 -494,7 +514,11 @@@
+  	sg_count = scsi_dma_map(sc);
+  	if (sg_count < 0) {
+  		FNIC_TRACE(fnic_queuecommand, sc->device->host->host_no,
+++<<<<<<< HEAD
+ +			  tag, sc, 0, sc->cmnd[0], sg_count, CMD_STATE(sc));
+++=======
++ 			  mqtag, sc, 0, sc->cmnd[0], sg_count, fnic_priv(sc)->state);
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  		mempool_free(io_req, fnic->io_req_pool);
+  		goto out;
+  	}
+@@@ -557,26 -538,37 +562,53 @@@
+  	io_lock_acquired = 1;
+  	io_req->port_id = rport->port_id;
+  	io_req->start_time = jiffies;
+++<<<<<<< HEAD
+ +	CMD_STATE(sc) = FNIC_IOREQ_CMD_PENDING;
+ +	CMD_SP(sc) = (char *)io_req;
+ +	CMD_FLAGS(sc) |= FNIC_IO_INITIALIZED;
+ +	sc->scsi_done = done;
+++=======
++ 	fnic_priv(sc)->state = FNIC_IOREQ_CMD_PENDING;
++ 	fnic_priv(sc)->io_req = io_req;
++ 	fnic_priv(sc)->flags |= FNIC_IO_INITIALIZED;
++ 	io_req->sc = sc;
++ 
++ 	if (fnic->sw_copy_wq[hwq].io_req_table[blk_mq_unique_tag_to_tag(mqtag)] != NULL) {
++ 		WARN(1, "fnic<%d>: %s: hwq: %d tag 0x%x already exists\n",
++ 				fnic->fnic_num, __func__, hwq, blk_mq_unique_tag_to_tag(mqtag));
++ 		return SCSI_MLQUEUE_HOST_BUSY;
++ 	}
++ 
++ 	fnic->sw_copy_wq[hwq].io_req_table[blk_mq_unique_tag_to_tag(mqtag)] = io_req;
++ 	io_req->tag = mqtag;
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  
+  	/* create copy wq desc and enqueue it */
+- 	wq = &fnic->hw_copy_wq[0];
+- 	ret = fnic_queue_wq_copy_desc(fnic, wq, io_req, sc, sg_count);
++ 	wq = &fnic->hw_copy_wq[hwq];
++ 	atomic64_inc(&fnic_stats->io_stats.ios[hwq]);
++ 	ret = fnic_queue_wq_copy_desc(fnic, wq, io_req, sc, sg_count, mqtag, hwq);
+  	if (ret) {
+  		/*
+  		 * In case another thread cancelled the request,
+  		 * refetch the pointer under the lock.
+  		 */
+  		FNIC_TRACE(fnic_queuecommand, sc->device->host->host_no,
+++<<<<<<< HEAD
+ +			  tag, sc, 0, 0, 0,
+ +			  (((u64)CMD_FLAGS(sc) << 32) | CMD_STATE(sc)));
+ +		io_req = (struct fnic_io_req *)CMD_SP(sc);
+ +		CMD_SP(sc) = NULL;
+ +		CMD_STATE(sc) = FNIC_IOREQ_CMD_COMPLETE;
+ +		spin_unlock_irqrestore(io_lock, flags);
+++=======
++ 			  mqtag, sc, 0, 0, 0, fnic_flags_and_state(sc));
++ 		io_req = fnic_priv(sc)->io_req;
++ 		fnic_priv(sc)->io_req = NULL;
++ 		if (io_req)
++ 			fnic->sw_copy_wq[hwq].io_req_table[blk_mq_unique_tag_to_tag(mqtag)] = NULL;
++ 		fnic_priv(sc)->state = FNIC_IOREQ_CMD_COMPLETE;
++ 		spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  		if (io_req) {
+  			fnic_release_ioreq_buf(fnic, io_req, sc);
+  			mempool_free(io_req, fnic->io_req_pool);
+@@@ -603,16 -593,14 +635,21 @@@ out
+  			sc->cmnd[5]);
+  
+  	FNIC_TRACE(fnic_queuecommand, sc->device->host->host_no,
+++<<<<<<< HEAD
+ +		  tag, sc, io_req, sg_count, cmd_trace,
+ +		  (((u64)CMD_FLAGS(sc) << 32) | CMD_STATE(sc)));
+++=======
++ 		   mqtag, sc, io_req, sg_count, cmd_trace,
++ 		   fnic_flags_and_state(sc));
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  
+  	/* if only we issued IO, will we have the io lock */
+  	if (io_lock_acquired)
+- 		spin_unlock_irqrestore(io_lock, flags);
++ 		spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+  
+  	atomic_dec(&fnic->in_flight);
+ +	/* acquire host lock before returning to SCSI */
+ +	spin_lock(lp->host->host_lock);
+  	return ret;
+  }
+  
+@@@ -865,14 -875,19 +924,30 @@@ static void fnic_fcpio_icmnd_cmpl_handl
+  		return;
+  	}
+  
+++<<<<<<< HEAD
+ +	io_lock = fnic_io_lock_hash(fnic, sc);
+ +	spin_lock_irqsave(io_lock, flags);
+ +	io_req = (struct fnic_io_req *)CMD_SP(sc);
+ +	WARN_ON_ONCE(!io_req);
+ +	if (!io_req) {
+ +		atomic64_inc(&fnic_stats->io_stats.ioreq_null);
+ +		CMD_FLAGS(sc) |= FNIC_IO_REQ_NULL;
+ +		spin_unlock_irqrestore(io_lock, flags);
+++=======
++ 	io_req = fnic_priv(sc)->io_req;
++ 	if (fnic->sw_copy_wq[hwq].io_req_table[tag] != io_req) {
++ 		WARN(1, "%s: %d: hwq: %d mqtag: 0x%x tag: 0x%x io_req tag mismatch\n",
++ 			__func__, __LINE__, hwq, mqtag, tag);
++ 		spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
++ 		return;
++ 	}
++ 
++ 	WARN_ON_ONCE(!io_req);
++ 	if (!io_req) {
++ 		atomic64_inc(&fnic_stats->io_stats.ioreq_null);
++ 		fnic_priv(sc)->flags |= FNIC_IO_REQ_NULL;
++ 		spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  		shost_printk(KERN_ERR, fnic->lport->host,
+  			  "icmnd_cmpl io_req is null - "
+  			  "hdr status = %s tag = 0x%x sc 0x%p\n",
+@@@ -894,11 -909,11 +969,17 @@@
+  		 * set the FNIC_IO_DONE so that this doesn't get
+  		 * flagged as 'out of order' if it was not aborted
+  		 */
+++<<<<<<< HEAD
+ +		CMD_FLAGS(sc) |= FNIC_IO_DONE;
+ +		CMD_FLAGS(sc) |= FNIC_IO_ABTS_PENDING;
+ +		spin_unlock_irqrestore(io_lock, flags);
+++=======
++ 		fnic_priv(sc)->flags |= FNIC_IO_DONE;
++ 		fnic_priv(sc)->flags |= FNIC_IO_ABTS_PENDING;
++ 		spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  		if(FCPIO_ABORTED == hdr_status)
+ -			fnic_priv(sc)->flags |= FNIC_IO_ABORTED;
+ +			CMD_FLAGS(sc) |= FNIC_IO_ABORTED;
+  
+  		FNIC_SCSI_DBG(KERN_INFO, fnic->lport->host,
+  			"icmnd_cmpl abts pending "
+@@@ -983,8 -998,12 +1064,17 @@@
+  	}
+  
+  	/* Break link with the SCSI command */
+++<<<<<<< HEAD
+ +	CMD_SP(sc) = NULL;
+ +	CMD_FLAGS(sc) |= FNIC_IO_DONE;
+++=======
++ 	fnic_priv(sc)->io_req = NULL;
++ 	io_req->sc = NULL;
++ 	fnic_priv(sc)->flags |= FNIC_IO_DONE;
++ 	fnic->sw_copy_wq[hwq].io_req_table[tag] = NULL;
++ 
++ 	spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  
+  	if (hdr_status != FCPIO_SUCCESS) {
+  		atomic64_inc(&fnic_stats->io_stats.io_failures);
+@@@ -1018,9 -1036,7 +1108,13 @@@
+  		fnic->lport->host_stats.fcp_control_requests++;
+  
+  	/* Call SCSI completion function to complete the IO */
+++<<<<<<< HEAD
+ +	if (sc->scsi_done)
+ +		sc->scsi_done(sc);
+ +	spin_unlock_irqrestore(io_lock, flags);
+++=======
++ 	scsi_done(sc);
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  
+  	mempool_free(io_req, fnic->io_req_pool);
+  
+@@@ -1071,36 -1087,77 +1165,102 @@@ static void fnic_fcpio_itmf_cmpl_handle
+  	struct terminate_stats *term_stats = &fnic->fnic_stats.term_stats;
+  	struct misc_stats *misc_stats = &fnic->fnic_stats.misc_stats;
+  	unsigned long flags;
+- 	spinlock_t *io_lock;
+  	unsigned long start_time;
+++<<<<<<< HEAD
+++=======
++ 	unsigned int hwq = cq_index;
++ 	unsigned int mqtag;
++ 	unsigned int tag;
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  
+ -	fcpio_header_dec(&desc->hdr, &type, &hdr_status, &ftag);
+ -	fcpio_tag_id_dec(&ftag, &id);
+ +	fcpio_header_dec(&desc->hdr, &type, &hdr_status, &tag);
+ +	fcpio_tag_id_dec(&tag, &id);
+ +
+++<<<<<<< HEAD
+ +	if ((id & FNIC_TAG_MASK) >= fnic->fnic_max_tag_id) {
+ +		shost_printk(KERN_ERR, fnic->lport->host,
+ +		"Tag out of range tag %x hdr status = %s\n",
+ +		id, fnic_fcpio_status_to_str(hdr_status));
+ +		return;
+ +	}
+  
+ +	sc = scsi_host_find_tag(fnic->lport->host, id & FNIC_TAG_MASK);
+++=======
++ 	mqtag = id & FNIC_TAG_MASK;
++ 	tag = blk_mq_unique_tag_to_tag(id & FNIC_TAG_MASK);
++ 	hwq = blk_mq_unique_tag_to_hwq(id & FNIC_TAG_MASK);
++ 
++ 	if (hwq != cq_index) {
++ 		FNIC_SCSI_DBG(KERN_ERR, fnic->lport->host,
++ 			"%s: %d: hwq: %d mqtag: 0x%x tag: 0x%x cq index: %d ",
++ 			__func__, __LINE__, hwq, mqtag, tag, cq_index);
++ 		FNIC_SCSI_DBG(KERN_ERR, fnic->lport->host,
++ 			"%s: %d: hdr status: %s ITMF completion on the wrong queue\n",
++ 			__func__, __LINE__,
++ 			fnic_fcpio_status_to_str(hdr_status));
++ 	}
++ 
++ 	if (tag > fnic->fnic_max_tag_id) {
++ 		FNIC_SCSI_DBG(KERN_ERR, fnic->lport->host,
++ 			"%s: %d: hwq: %d mqtag: 0x%x tag: 0x%x cq index: %d ",
++ 			__func__, __LINE__, hwq, mqtag, tag, cq_index);
++ 		FNIC_SCSI_DBG(KERN_ERR, fnic->lport->host,
++ 			"%s: %d: hdr status: %s Tag out of range\n",
++ 			__func__, __LINE__,
++ 			fnic_fcpio_status_to_str(hdr_status));
++ 		return;
++ 	}  else if ((tag == fnic->fnic_max_tag_id) && !(id & FNIC_TAG_DEV_RST)) {
++ 		FNIC_SCSI_DBG(KERN_ERR, fnic->lport->host,
++ 			"%s: %d: hwq: %d mqtag: 0x%x tag: 0x%x cq index: %d ",
++ 			__func__, __LINE__, hwq, mqtag, tag, cq_index);
++ 		FNIC_SCSI_DBG(KERN_ERR, fnic->lport->host,
++ 			"%s: %d: hdr status: %s Tag out of range\n",
++ 			__func__, __LINE__,
++ 			fnic_fcpio_status_to_str(hdr_status));
++ 		return;
++ 	}
++ 
++ 	spin_lock_irqsave(&fnic->wq_copy_lock[hwq], flags);
++ 
++ 	/* If it is sg3utils allocated SC then tag_id
++ 	 * is max_tag_id and SC is retrieved from io_req
++ 	 */
++ 	if ((mqtag == fnic->fnic_max_tag_id) && (id & FNIC_TAG_DEV_RST)) {
++ 		io_req = fnic->sw_copy_wq[hwq].io_req_table[tag];
++ 		if (io_req)
++ 			sc = io_req->sc;
++ 	} else {
++ 		sc = scsi_host_find_tag(fnic->lport->host, id & FNIC_TAG_MASK);
++ 	}
++ 
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  	WARN_ON_ONCE(!sc);
+  	if (!sc) {
+  		atomic64_inc(&fnic_stats->io_stats.sc_null);
++ 		spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+  		shost_printk(KERN_ERR, fnic->lport->host,
+  			  "itmf_cmpl sc is null - hdr status = %s tag = 0x%x\n",
+ -			  fnic_fcpio_status_to_str(hdr_status), tag);
+ +			  fnic_fcpio_status_to_str(hdr_status), id);
+  		return;
+  	}
+++<<<<<<< HEAD
+ +	io_lock = fnic_io_lock_hash(fnic, sc);
+ +	spin_lock_irqsave(io_lock, flags);
+ +	io_req = (struct fnic_io_req *)CMD_SP(sc);
+ +	WARN_ON_ONCE(!io_req);
+ +	if (!io_req) {
+ +		atomic64_inc(&fnic_stats->io_stats.ioreq_null);
+ +		spin_unlock_irqrestore(io_lock, flags);
+ +		CMD_FLAGS(sc) |= FNIC_IO_ABT_TERM_REQ_NULL;
+++=======
++ 
++ 	io_req = fnic_priv(sc)->io_req;
++ 	WARN_ON_ONCE(!io_req);
++ 	if (!io_req) {
++ 		atomic64_inc(&fnic_stats->io_stats.ioreq_null);
++ 		spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
++ 		fnic_priv(sc)->flags |= FNIC_IO_ABT_TERM_REQ_NULL;
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  		shost_printk(KERN_ERR, fnic->lport->host,
+  			  "itmf_cmpl io_req is null - "
+  			  "hdr status = %s tag = 0x%x sc 0x%p\n",
+@@@ -1115,12 -1172,12 +1275,12 @@@
+  		FNIC_SCSI_DBG(KERN_DEBUG, fnic->lport->host,
+  			      "dev reset abts cmpl recd. id %x status %s\n",
+  			      id, fnic_fcpio_status_to_str(hdr_status));
+ -		fnic_priv(sc)->state = FNIC_IOREQ_ABTS_COMPLETE;
+ -		fnic_priv(sc)->abts_status = hdr_status;
+ -		fnic_priv(sc)->flags |= FNIC_DEV_RST_DONE;
+ +		CMD_STATE(sc) = FNIC_IOREQ_ABTS_COMPLETE;
+ +		CMD_ABTS_STATUS(sc) = hdr_status;
+ +		CMD_FLAGS(sc) |= FNIC_DEV_RST_DONE;
+  		if (io_req->abts_done)
+  			complete(io_req->abts_done);
+- 		spin_unlock_irqrestore(io_lock, flags);
++ 		spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+  	} else if (id & FNIC_TAG_ABORT) {
+  		/* Completion of abort cmd */
+  		switch (hdr_status) {
+@@@ -1153,9 -1210,9 +1313,9 @@@
+  					&term_stats->terminate_failures);
+  			break;
+  		}
+ -		if (fnic_priv(sc)->state != FNIC_IOREQ_ABTS_PENDING) {
+ +		if (CMD_STATE(sc) != FNIC_IOREQ_ABTS_PENDING) {
+  			/* This is a late completion. Ignore it */
+- 			spin_unlock_irqrestore(io_lock, flags);
++ 			spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+  			return;
+  		}
+  
+@@@ -1185,41 -1242,37 +1345,48 @@@
+  		} else {
+  			FNIC_SCSI_DBG(KERN_DEBUG, fnic->lport->host,
+  				      "abts cmpl, completing IO\n");
+ -			fnic_priv(sc)->io_req = NULL;
+ +			CMD_SP(sc) = NULL;
+  			sc->result = (DID_ERROR << 16);
+- 
+- 			spin_unlock_irqrestore(io_lock, flags);
++ 			fnic->sw_copy_wq[hwq].io_req_table[tag] = NULL;
++ 			spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+  
+  			fnic_release_ioreq_buf(fnic, io_req, sc);
+  			mempool_free(io_req, fnic->io_req_pool);
+ -			FNIC_TRACE(fnic_fcpio_itmf_cmpl_handler,
+ -				   sc->device->host->host_no, id,
+ -				   sc,
+ -				   jiffies_to_msecs(jiffies - start_time),
+ -				   desc,
+ -				   (((u64)hdr_status << 40) |
+ -				    (u64)sc->cmnd[0] << 32 |
+ -				    (u64)sc->cmnd[2] << 24 |
+ -				    (u64)sc->cmnd[3] << 16 |
+ -				    (u64)sc->cmnd[4] << 8 | sc->cmnd[5]),
+ -				   fnic_flags_and_state(sc));
+ -			scsi_done(sc);
+ -			atomic64_dec(&fnic_stats->io_stats.active_ios);
+ -			if (atomic64_read(&fnic->io_cmpl_skip))
+ -				atomic64_dec(&fnic->io_cmpl_skip);
+ -			else
+ -				atomic64_inc(&fnic_stats->io_stats.io_completions);
+ +			if (sc->scsi_done) {
+ +				FNIC_TRACE(fnic_fcpio_itmf_cmpl_handler,
+ +					sc->device->host->host_no, id,
+ +					sc,
+ +					jiffies_to_msecs(jiffies - start_time),
+ +					desc,
+ +					(((u64)hdr_status << 40) |
+ +					(u64)sc->cmnd[0] << 32 |
+ +					(u64)sc->cmnd[2] << 24 |
+ +					(u64)sc->cmnd[3] << 16 |
+ +					(u64)sc->cmnd[4] << 8 | sc->cmnd[5]),
+ +					(((u64)CMD_FLAGS(sc) << 32) |
+ +					CMD_STATE(sc)));
+ +				sc->scsi_done(sc);
+ +				atomic64_dec(&fnic_stats->io_stats.active_ios);
+ +				if (atomic64_read(&fnic->io_cmpl_skip))
+ +					atomic64_dec(&fnic->io_cmpl_skip);
+ +				else
+ +					atomic64_inc(&fnic_stats->io_stats.io_completions);
+ +			}
+  		}
+ +
+  	} else if (id & FNIC_TAG_DEV_RST) {
+  		/* Completion of device reset */
+++<<<<<<< HEAD
+ +		CMD_LR_STATUS(sc) = hdr_status;
+ +		if (CMD_STATE(sc) == FNIC_IOREQ_ABTS_PENDING) {
+ +			spin_unlock_irqrestore(io_lock, flags);
+ +			CMD_FLAGS(sc) |= FNIC_DEV_RST_ABTS_PENDING;
+++=======
++ 		fnic_priv(sc)->lr_status = hdr_status;
++ 		if (fnic_priv(sc)->state == FNIC_IOREQ_ABTS_PENDING) {
++ 			spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
++ 			fnic_priv(sc)->flags |= FNIC_DEV_RST_ABTS_PENDING;
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  			FNIC_TRACE(fnic_fcpio_itmf_cmpl_handler,
+  				  sc->device->host->host_no, id, sc,
+  				  jiffies_to_msecs(jiffies - start_time),
+@@@ -1232,9 -1284,9 +1399,9 @@@
+  				fnic_fcpio_status_to_str(hdr_status));
+  			return;
+  		}
+ -		if (fnic_priv(sc)->flags & FNIC_DEV_RST_TIMED_OUT) {
+ +		if (CMD_FLAGS(sc) & FNIC_DEV_RST_TIMED_OUT) {
+  			/* Need to wait for terminate completion */
+- 			spin_unlock_irqrestore(io_lock, flags);
++ 			spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+  			FNIC_TRACE(fnic_fcpio_itmf_cmpl_handler,
+  				  sc->device->host->host_no, id, sc,
+  				  jiffies_to_msecs(jiffies - start_time),
+@@@ -1260,8 -1311,8 +1427,13 @@@
+  	} else {
+  		shost_printk(KERN_ERR, fnic->lport->host,
+  			     "Unexpected itmf io state %s tag %x\n",
+++<<<<<<< HEAD
+ +			     fnic_ioreq_state_to_str(CMD_STATE(sc)), id);
+ +		spin_unlock_irqrestore(io_lock, flags);
+++=======
++ 			     fnic_ioreq_state_to_str(fnic_priv(sc)->state), id);
++ 		spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  	}
+  
+  }
+@@@ -1355,16 -1408,31 +1529,37 @@@ static bool fnic_cleanup_io_iter(struc
+  	struct fnic *fnic = data;
+  	struct fnic_io_req *io_req;
+  	unsigned long flags = 0;
+- 	spinlock_t *io_lock;
+  	unsigned long start_time = 0;
+  	struct fnic_stats *fnic_stats = &fnic->fnic_stats;
++ 	uint16_t hwq = 0;
++ 	int tag;
++ 	int mqtag;
+  
+- 	io_lock = fnic_io_lock_tag(fnic, tag);
+- 	spin_lock_irqsave(io_lock, flags);
++ 	mqtag = blk_mq_unique_tag(rq);
++ 	hwq = blk_mq_unique_tag_to_hwq(mqtag);
++ 	tag = blk_mq_unique_tag_to_tag(mqtag);
+  
++ 	spin_lock_irqsave(&fnic->wq_copy_lock[hwq], flags);
++ 
++ 	fnic->sw_copy_wq[hwq].io_req_table[tag] = NULL;
++ 
+++<<<<<<< HEAD
+ +	io_req = (struct fnic_io_req *)CMD_SP(sc);
+ +	if ((CMD_FLAGS(sc) & FNIC_DEVICE_RESET) &&
+ +	    !(CMD_FLAGS(sc) & FNIC_DEV_RST_DONE)) {
+++=======
++ 	io_req = fnic_priv(sc)->io_req;
++ 	if (!io_req) {
++ 		spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
++ 		FNIC_SCSI_DBG(KERN_ERR, fnic->lport->host,
++ 			"fnic<%d>: %s: %d: hwq: %d mqtag: 0x%x tag: 0x%x flags: 0x%x No ioreq. Returning\n",
++ 			fnic->fnic_num, __func__, __LINE__, hwq, mqtag, tag, fnic_priv(sc)->flags);
++ 		return true;
++ 	}
++ 
++ 	if ((fnic_priv(sc)->flags & FNIC_DEVICE_RESET) &&
++ 	    !(fnic_priv(sc)->flags & FNIC_DEV_RST_DONE)) {
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  		/*
+  		 * We will be here only when FW completes reset
+  		 * without sending completions for outstanding ios.
+@@@ -1374,20 -1442,16 +1569,27 @@@
+  			complete(io_req->dr_done);
+  		else if (io_req && io_req->abts_done)
+  			complete(io_req->abts_done);
+- 		spin_unlock_irqrestore(io_lock, flags);
++ 		spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+  		return true;
+++<<<<<<< HEAD
+ +	} else if (CMD_FLAGS(sc) & FNIC_DEVICE_RESET) {
+ +		spin_unlock_irqrestore(io_lock, flags);
+++=======
++ 	} else if (fnic_priv(sc)->flags & FNIC_DEVICE_RESET) {
++ 		spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  		return true;
+  	}
+- 	if (!io_req) {
+- 		spin_unlock_irqrestore(io_lock, flags);
+- 		goto cleanup_scsi_cmd;
+- 	}
+  
+++<<<<<<< HEAD
+ +	CMD_SP(sc) = NULL;
+ +
+ +	spin_unlock_irqrestore(io_lock, flags);
+++=======
++ 	fnic_priv(sc)->io_req = NULL;
++ 	io_req->sc = NULL;
++ 	spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  
+  	/*
+  	 * If there is a scsi_cmnd associated with this io_req, then
+@@@ -1408,24 -1471,17 +1609,37 @@@
+  	else
+  		atomic64_inc(&fnic_stats->io_stats.io_completions);
+  
+++<<<<<<< HEAD
+ +	/* Complete the command to SCSI */
+ +	if (sc->scsi_done) {
+ +		if (!(CMD_FLAGS(sc) & FNIC_IO_ISSUED))
+ +			shost_printk(KERN_ERR, fnic->lport->host,
+ +				     "Calling done for IO not issued to fw: tag:0x%x sc:0x%p\n",
+ +				     tag, sc);
+ +
+ +		FNIC_TRACE(fnic_cleanup_io,
+ +			   sc->device->host->host_no, tag, sc,
+ +			   jiffies_to_msecs(jiffies - start_time),
+ +			   0, ((u64)sc->cmnd[0] << 32 |
+ +			       (u64)sc->cmnd[2] << 24 |
+ +			       (u64)sc->cmnd[3] << 16 |
+ +			       (u64)sc->cmnd[4] << 8 | sc->cmnd[5]),
+ +			   (((u64)CMD_FLAGS(sc) << 32) | CMD_STATE(sc)));
+++=======
++ 	FNIC_TRACE(fnic_cleanup_io,
++ 		   sc->device->host->host_no, tag, sc,
++ 		   jiffies_to_msecs(jiffies - start_time),
++ 		   0, ((u64)sc->cmnd[0] << 32 |
++ 		       (u64)sc->cmnd[2] << 24 |
++ 		       (u64)sc->cmnd[3] << 16 |
++ 		       (u64)sc->cmnd[4] << 8 | sc->cmnd[5]),
++ 		   fnic_flags_and_state(sc));
++ 
++ 	scsi_done(sc);
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  
+ +		sc->scsi_done(sc);
+ +	}
+  	return true;
+  }
+  
+@@@ -1457,11 -1513,11 +1671,11 @@@ void fnic_wq_copy_cleanup_handler(struc
+  	if (!sc)
+  		return;
+  
+- 	io_lock = fnic_io_lock_hash(fnic, sc);
+- 	spin_lock_irqsave(io_lock, flags);
++ 	hwq = blk_mq_unique_tag_to_hwq(id);
++ 	spin_lock_irqsave(&fnic->wq_copy_lock[hwq], flags);
+  
+  	/* Get the IO context which this desc refers to */
+ -	io_req = fnic_priv(sc)->io_req;
+ +	io_req = (struct fnic_io_req *)CMD_SP(sc);
+  
+  	/* fnic interrupts are turned off by now */
+  
+@@@ -1470,9 -1526,11 +1684,15 @@@
+  		goto wq_copy_cleanup_scsi_cmd;
+  	}
+  
+++<<<<<<< HEAD
+ +	CMD_SP(sc) = NULL;
+++=======
++ 	fnic_priv(sc)->io_req = NULL;
++ 	io_req->sc = NULL;
++ 	fnic->sw_copy_wq[hwq].io_req_table[blk_mq_unique_tag_to_tag(id)] = NULL;
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  
+- 	spin_unlock_irqrestore(io_lock, flags);
++ 	spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+  
+  	start_time = io_req->start_time;
+  	fnic_release_ioreq_buf(fnic, io_req, sc);
+@@@ -1498,10 -1554,10 +1718,15 @@@ wq_copy_cleanup_scsi_cmd
+  
+  static inline int fnic_queue_abort_io_req(struct fnic *fnic, int tag,
+  					  u32 task_req, u8 *fc_lun,
+- 					  struct fnic_io_req *io_req)
++ 					  struct fnic_io_req *io_req,
++ 					  unsigned int hwq)
+  {
+++<<<<<<< HEAD
+ +	struct vnic_wq_copy *wq = &fnic->hw_copy_wq[0];
+ +	struct Scsi_Host *host = fnic->lport->host;
+++=======
++ 	struct vnic_wq_copy *wq = &fnic->hw_copy_wq[hwq];
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  	struct misc_stats *misc_stats = &fnic->fnic_stats.misc_stats;
+  	unsigned long flags;
+  
+@@@ -1512,15 -1568,15 +1737,15 @@@
+  		return 1;
+  	} else
+  		atomic_inc(&fnic->in_flight);
+ -	spin_unlock_irqrestore(&fnic->fnic_lock, flags);
+ +	spin_unlock_irqrestore(host->host_lock, flags);
+  
+- 	spin_lock_irqsave(&fnic->wq_copy_lock[0], flags);
++ 	spin_lock_irqsave(&fnic->wq_copy_lock[hwq], flags);
+  
+- 	if (vnic_wq_copy_desc_avail(wq) <= fnic->wq_copy_desc_low[0])
+- 		free_wq_copy_descs(fnic, wq);
++ 	if (vnic_wq_copy_desc_avail(wq) <= fnic->wq_copy_desc_low[hwq])
++ 		free_wq_copy_descs(fnic, wq, hwq);
+  
+  	if (!vnic_wq_copy_desc_avail(wq)) {
+- 		spin_unlock_irqrestore(&fnic->wq_copy_lock[0], flags);
++ 		spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+  		atomic_dec(&fnic->in_flight);
+  		FNIC_SCSI_DBG(KERN_DEBUG, fnic->lport->host,
+  			"fnic_queue_abort_io_req: failure: no descriptors\n");
+@@@ -1561,14 -1617,17 +1786,17 @@@ static bool fnic_rport_abort_io_iter(st
+  	struct terminate_stats *term_stats = &fnic->fnic_stats.term_stats;
+  	struct scsi_lun fc_lun;
+  	enum fnic_ioreq_state old_ioreq_state;
++ 	uint16_t hwq = 0;
+  
+- 	io_lock = fnic_io_lock_tag(fnic, abt_tag);
+- 	spin_lock_irqsave(io_lock, flags);
++ 	abt_tag = blk_mq_unique_tag(rq);
++ 	hwq = blk_mq_unique_tag_to_hwq(abt_tag);
++ 
++ 	spin_lock_irqsave(&fnic->wq_copy_lock[hwq], flags);
+  
+ -	io_req = fnic_priv(sc)->io_req;
+ +	io_req = (struct fnic_io_req *)CMD_SP(sc);
+  
+  	if (!io_req || io_req->port_id != iter_data->port_id) {
+- 		spin_unlock_irqrestore(io_lock, flags);
++ 		spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+  		return true;
+  	}
+  
+@@@ -1585,8 -1644,8 +1813,13 @@@
+  	 * Found IO that is still pending with firmware and
+  	 * belongs to rport that went away
+  	 */
+++<<<<<<< HEAD
+ +	if (CMD_STATE(sc) == FNIC_IOREQ_ABTS_PENDING) {
+ +		spin_unlock_irqrestore(io_lock, flags);
+++=======
++ 	if (fnic_priv(sc)->state == FNIC_IOREQ_ABTS_PENDING) {
++ 		spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  		return true;
+  	}
+  	if (io_req->abts_done) {
+@@@ -1631,17 -1690,17 +1864,31 @@@
+  		 * aborted later by scsi_eh, or cleaned up during
+  		 * lun reset
+  		 */
+++<<<<<<< HEAD
+ +		spin_lock_irqsave(io_lock, flags);
+ +		if (CMD_STATE(sc) == FNIC_IOREQ_ABTS_PENDING)
+ +			CMD_STATE(sc) = old_ioreq_state;
+ +		spin_unlock_irqrestore(io_lock, flags);
+ +	} else {
+ +		spin_lock_irqsave(io_lock, flags);
+ +		if (CMD_FLAGS(sc) & FNIC_DEVICE_RESET)
+ +			CMD_FLAGS(sc) |= FNIC_DEV_RST_TERM_ISSUED;
+ +		else
+ +			CMD_FLAGS(sc) |= FNIC_IO_INTERNAL_TERM_ISSUED;
+ +		spin_unlock_irqrestore(io_lock, flags);
+++=======
++ 		spin_lock_irqsave(&fnic->wq_copy_lock[hwq], flags);
++ 		if (fnic_priv(sc)->state == FNIC_IOREQ_ABTS_PENDING)
++ 			fnic_priv(sc)->state = old_ioreq_state;
++ 		spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
++ 	} else {
++ 		spin_lock_irqsave(&fnic->wq_copy_lock[hwq], flags);
++ 		if (fnic_priv(sc)->flags & FNIC_DEVICE_RESET)
++ 			fnic_priv(sc)->flags |= FNIC_DEV_RST_TERM_ISSUED;
++ 		else
++ 			fnic_priv(sc)->flags |= FNIC_IO_INTERNAL_TERM_ISSUED;
++ 		spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  		atomic64_inc(&term_stats->terminates);
+  		iter_data->term_cnt++;
+  	}
+@@@ -1745,12 -1807,10 +1995,17 @@@ int fnic_abort_cmd(struct scsi_cmnd *sc
+  	term_stats = &fnic->fnic_stats.term_stats;
+  
+  	rport = starget_to_rport(scsi_target(sc->device));
+++<<<<<<< HEAD
+ +	FNIC_SCSI_DBG(KERN_DEBUG,
+ +		fnic->lport->host,
+ +		"Abort Cmd called FCID 0x%x, LUN 0x%llx TAG %x flags %x\n",
+ +		rport->port_id, sc->device->lun, tag, CMD_FLAGS(sc));
+++=======
++ 	mqtag = blk_mq_unique_tag(rq);
++ 	hwq = blk_mq_unique_tag_to_hwq(mqtag);
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  
+ -	fnic_priv(sc)->flags = FNIC_NO_FLAGS;
+ +	CMD_FLAGS(sc) = FNIC_NO_FLAGS;
+  
+  	if (lp->state != LPORT_ST_READY || !(lp->link_up)) {
+  		ret = FAILED;
+@@@ -1767,20 -1829,19 +2024,30 @@@
+  	 * happened, the completion wont actually complete the command
+  	 * and it will be considered as an aborted command
+  	 *
+ -	 * .io_req will not be cleared except while holding io_req_lock.
+ +	 * The CMD_SP will not be cleared except while holding io_req_lock.
+  	 */
+++<<<<<<< HEAD
+ +	io_lock = fnic_io_lock_hash(fnic, sc);
+ +	spin_lock_irqsave(io_lock, flags);
+ +	io_req = (struct fnic_io_req *)CMD_SP(sc);
+++=======
++ 	spin_lock_irqsave(&fnic->wq_copy_lock[hwq], flags);
++ 	io_req = fnic_priv(sc)->io_req;
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  	if (!io_req) {
+- 		spin_unlock_irqrestore(io_lock, flags);
++ 		spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+  		goto fnic_abort_cmd_end;
+  	}
+  
+  	io_req->abts_done = &tm_done;
+  
+++<<<<<<< HEAD
+ +	if (CMD_STATE(sc) == FNIC_IOREQ_ABTS_PENDING) {
+ +		spin_unlock_irqrestore(io_lock, flags);
+++=======
++ 	if (fnic_priv(sc)->state == FNIC_IOREQ_ABTS_PENDING) {
++ 		spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  		goto wait_pending;
+  	}
+  
+@@@ -1808,11 -1869,11 +2075,11 @@@
+  	 * the completion wont be done till mid-layer, since abort
+  	 * has already started.
+  	 */
+ -	old_ioreq_state = fnic_priv(sc)->state;
+ -	fnic_priv(sc)->state = FNIC_IOREQ_ABTS_PENDING;
+ -	fnic_priv(sc)->abts_status = FCPIO_INVALID_CODE;
+ +	old_ioreq_state = CMD_STATE(sc);
+ +	CMD_STATE(sc) = FNIC_IOREQ_ABTS_PENDING;
+ +	CMD_ABTS_STATUS(sc) = FCPIO_INVALID_CODE;
+  
+- 	spin_unlock_irqrestore(io_lock, flags);
++ 	spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+  
+  	/*
+  	 * Check readiness of the remote port. If the path to remote
+@@@ -1829,15 -1890,15 +2096,24 @@@
+  	/* Now queue the abort command to firmware */
+  	int_to_scsilun(sc->device->lun, &fc_lun);
+  
+++<<<<<<< HEAD
+ +	if (fnic_queue_abort_io_req(fnic, tag, task_req, fc_lun.scsi_lun,
+ +				    io_req)) {
+ +		spin_lock_irqsave(io_lock, flags);
+ +		if (CMD_STATE(sc) == FNIC_IOREQ_ABTS_PENDING)
+ +			CMD_STATE(sc) = old_ioreq_state;
+ +		io_req = (struct fnic_io_req *)CMD_SP(sc);
+++=======
++ 	if (fnic_queue_abort_io_req(fnic, mqtag, task_req, fc_lun.scsi_lun,
++ 				    io_req, hwq)) {
++ 		spin_lock_irqsave(&fnic->wq_copy_lock[hwq], flags);
++ 		if (fnic_priv(sc)->state == FNIC_IOREQ_ABTS_PENDING)
++ 			fnic_priv(sc)->state = old_ioreq_state;
++ 		io_req = fnic_priv(sc)->io_req;
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  		if (io_req)
+  			io_req->abts_done = NULL;
+- 		spin_unlock_irqrestore(io_lock, flags);
++ 		spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+  		ret = FAILED;
+  		goto fnic_abort_cmd_end;
+  	}
+@@@ -1861,21 -1922,21 +2137,31 @@@
+  				     fnic->config.ed_tov));
+  
+  	/* Check the abort status */
+- 	spin_lock_irqsave(io_lock, flags);
++ 	spin_lock_irqsave(&fnic->wq_copy_lock[hwq], flags);
+  
+ -	io_req = fnic_priv(sc)->io_req;
+ +	io_req = (struct fnic_io_req *)CMD_SP(sc);
+  	if (!io_req) {
+  		atomic64_inc(&fnic_stats->io_stats.ioreq_null);
+++<<<<<<< HEAD
+ +		spin_unlock_irqrestore(io_lock, flags);
+ +		CMD_FLAGS(sc) |= FNIC_IO_ABT_TERM_REQ_NULL;
+++=======
++ 		spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
++ 		fnic_priv(sc)->flags |= FNIC_IO_ABT_TERM_REQ_NULL;
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  		ret = FAILED;
+  		goto fnic_abort_cmd_end;
+  	}
+  	io_req->abts_done = NULL;
+  
+  	/* fw did not complete abort, timed out */
+++<<<<<<< HEAD
+ +	if (CMD_ABTS_STATUS(sc) == FCPIO_INVALID_CODE) {
+ +		spin_unlock_irqrestore(io_lock, flags);
+++=======
++ 	if (fnic_priv(sc)->abts_status == FCPIO_INVALID_CODE) {
++ 		spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  		if (task_req == FCPIO_ITMF_ABT_TASK) {
+  			atomic64_inc(&abts_stats->abort_drv_timeouts);
+  		} else {
+@@@ -1888,8 -1949,8 +2174,13 @@@
+  
+  	/* IO out of order */
+  
+++<<<<<<< HEAD
+ +	if (!(CMD_FLAGS(sc) & (FNIC_IO_ABORTED | FNIC_IO_DONE))) {
+ +		spin_unlock_irqrestore(io_lock, flags);
+++=======
++ 	if (!(fnic_priv(sc)->flags & (FNIC_IO_ABORTED | FNIC_IO_DONE))) {
++ 		spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  		FNIC_SCSI_DBG(KERN_DEBUG, fnic->lport->host,
+  			"Issuing Host reset due to out of order IO\n");
+  
+@@@ -1905,11 -1966,13 +2196,19 @@@
+  	 * free the io_req if successful. If abort fails,
+  	 * Device reset will clean the I/O.
+  	 */
+++<<<<<<< HEAD
+ +	if (CMD_ABTS_STATUS(sc) == FCPIO_SUCCESS)
+ +		CMD_SP(sc) = NULL;
+ +	else {
+++=======
++ 	if (fnic_priv(sc)->abts_status == FCPIO_SUCCESS ||
++ 		(fnic_priv(sc)->abts_status == FCPIO_ABORTED)) {
++ 		fnic_priv(sc)->io_req = NULL;
++ 		io_req->sc = NULL;
++ 	} else {
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  		ret = FAILED;
+- 		spin_unlock_irqrestore(io_lock, flags);
++ 		spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+  		goto fnic_abort_cmd_end;
+  	}
+  
+@@@ -1918,19 -1982,17 +2218,19 @@@
+  	fnic_release_ioreq_buf(fnic, io_req, sc);
+  	mempool_free(io_req, fnic->io_req_pool);
+  
+ +	if (sc->scsi_done) {
+  	/* Call SCSI completion function to complete the IO */
+ -	sc->result = DID_ABORT << 16;
+ -	scsi_done(sc);
+ -	atomic64_dec(&fnic_stats->io_stats.active_ios);
+ -	if (atomic64_read(&fnic->io_cmpl_skip))
+ -		atomic64_dec(&fnic->io_cmpl_skip);
+ -	else
+ -		atomic64_inc(&fnic_stats->io_stats.io_completions);
+ +		sc->result = (DID_ABORT << 16);
+ +		sc->scsi_done(sc);
+ +		atomic64_dec(&fnic_stats->io_stats.active_ios);
+ +		if (atomic64_read(&fnic->io_cmpl_skip))
+ +			atomic64_dec(&fnic->io_cmpl_skip);
+ +		else
+ +			atomic64_inc(&fnic_stats->io_stats.io_completions);
+ +	}
+  
+  fnic_abort_cmd_end:
+- 	FNIC_TRACE(fnic_abort_cmd, sc->device->host->host_no, tag, sc,
++ 	FNIC_TRACE(fnic_abort_cmd, sc->device->host->host_no, mqtag, sc,
+  		  jiffies_to_msecs(jiffies - start_time),
+  		  0, ((u64)sc->cmnd[0] << 32 |
+  		  (u64)sc->cmnd[2] << 24 | (u64)sc->cmnd[3] << 16 |
+@@@ -1948,26 -2010,31 +2248,49 @@@ static inline int fnic_queue_dr_io_req(
+  				       struct scsi_cmnd *sc,
+  				       struct fnic_io_req *io_req)
+  {
+++<<<<<<< HEAD
+ +	struct vnic_wq_copy *wq = &fnic->hw_copy_wq[0];
+ +	struct Scsi_Host *host = fnic->lport->host;
+ +	struct misc_stats *misc_stats = &fnic->fnic_stats.misc_stats;
+ +	struct scsi_lun fc_lun;
+ +	int ret = 0;
+ +	unsigned long intr_flags;
+ +
+ +	spin_lock_irqsave(host->host_lock, intr_flags);
+ +	if (unlikely(fnic_chk_state_flags_locked(fnic,
+ +						FNIC_FLAGS_IO_BLOCKED))) {
+ +		spin_unlock_irqrestore(host->host_lock, intr_flags);
+ +		return FAILED;
+ +	} else
+ +		atomic_inc(&fnic->in_flight);
+ +	spin_unlock_irqrestore(host->host_lock, intr_flags);
+++=======
++ 	struct vnic_wq_copy *wq;
++ 	struct misc_stats *misc_stats = &fnic->fnic_stats.misc_stats;
++ 	struct scsi_lun fc_lun;
++ 	int ret = 0;
++ 	unsigned long flags;
++ 	uint16_t hwq = 0;
++ 	uint32_t tag = 0;
+  
+- 	spin_lock_irqsave(&fnic->wq_copy_lock[0], intr_flags);
++ 	tag = io_req->tag;
++ 	hwq = blk_mq_unique_tag_to_hwq(tag);
++ 	wq = &fnic->hw_copy_wq[hwq];
+  
+- 	if (vnic_wq_copy_desc_avail(wq) <= fnic->wq_copy_desc_low[0])
+- 		free_wq_copy_descs(fnic, wq);
++ 	spin_lock_irqsave(&fnic->fnic_lock, flags);
++ 	if (unlikely(fnic_chk_state_flags_locked(fnic,
++ 						FNIC_FLAGS_IO_BLOCKED))) {
++ 		spin_unlock_irqrestore(&fnic->fnic_lock, flags);
++ 		return FAILED;
++ 	} else
++ 		atomic_inc(&fnic->in_flight);
++ 	spin_unlock_irqrestore(&fnic->fnic_lock, flags);
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
++ 
++ 	spin_lock_irqsave(&fnic->wq_copy_lock[hwq], flags);
++ 
++ 	if (vnic_wq_copy_desc_avail(wq) <= fnic->wq_copy_desc_low[hwq])
++ 		free_wq_copy_descs(fnic, wq, hwq);
+  
+  	if (!vnic_wq_copy_desc_avail(wq)) {
+  		FNIC_SCSI_DBG(KERN_DEBUG, fnic->lport->host,
+@@@ -2021,11 -2090,13 +2345,19 @@@ static bool fnic_pending_aborts_iter(st
+  	if (sc == iter_data->lr_sc || sc->device != lun_dev)
+  		return true;
+  
+++<<<<<<< HEAD
+ +	io_lock = fnic_io_lock_tag(fnic, abt_tag);
+ +	spin_lock_irqsave(io_lock, flags);
+ +	io_req = (struct fnic_io_req *)CMD_SP(sc);
+++=======
++ 	abt_tag = blk_mq_unique_tag(rq);
++ 	hwq = blk_mq_unique_tag_to_hwq(abt_tag);
++ 
++ 	spin_lock_irqsave(&fnic->wq_copy_lock[hwq], flags);
++ 	io_req = fnic_priv(sc)->io_req;
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  	if (!io_req) {
+- 		spin_unlock_irqrestore(io_lock, flags);
++ 		spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+  		return true;
+  	}
+  
+@@@ -2035,14 -2106,14 +2367,19 @@@
+  	 */
+  	FNIC_SCSI_DBG(KERN_DEBUG, fnic->lport->host,
+  		      "Found IO in %s on lun\n",
+ -		      fnic_ioreq_state_to_str(fnic_priv(sc)->state));
+ +		      fnic_ioreq_state_to_str(CMD_STATE(sc)));
+  
+++<<<<<<< HEAD
+ +	if (CMD_STATE(sc) == FNIC_IOREQ_ABTS_PENDING) {
+ +		spin_unlock_irqrestore(io_lock, flags);
+++=======
++ 	if (fnic_priv(sc)->state == FNIC_IOREQ_ABTS_PENDING) {
++ 		spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  		return true;
+  	}
+ -	if ((fnic_priv(sc)->flags & FNIC_DEVICE_RESET) &&
+ -	    (!(fnic_priv(sc)->flags & FNIC_DEV_RST_ISSUED))) {
+ +	if ((CMD_FLAGS(sc) & FNIC_DEVICE_RESET) &&
+ +	    (!(CMD_FLAGS(sc) & FNIC_DEV_RST_ISSUED))) {
+  		FNIC_SCSI_DBG(KERN_INFO, fnic->lport->host,
+  			      "%s dev rst not pending sc 0x%p\n", __func__,
+  			      sc);
+@@@ -2066,66 -2137,67 +2403,110 @@@
+  
+  	BUG_ON(io_req->abts_done);
+  
+++<<<<<<< HEAD
+ +	if (CMD_FLAGS(sc) & FNIC_DEVICE_RESET) {
+ +		abt_tag |= FNIC_TAG_DEV_RST;
+++=======
++ 	if (fnic_priv(sc)->flags & FNIC_DEVICE_RESET) {
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  		FNIC_SCSI_DBG(KERN_INFO, fnic->lport->host,
+  			      "%s: dev rst sc 0x%p\n", __func__, sc);
+  	}
+  
+ -	fnic_priv(sc)->abts_status = FCPIO_INVALID_CODE;
+ +	CMD_ABTS_STATUS(sc) = FCPIO_INVALID_CODE;
+  	io_req->abts_done = &tm_done;
+- 	spin_unlock_irqrestore(io_lock, flags);
++ 	spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+  
+  	/* Now queue the abort command to firmware */
+  	int_to_scsilun(sc->device->lun, &fc_lun);
+  
+  	if (fnic_queue_abort_io_req(fnic, abt_tag,
+  				    FCPIO_ITMF_ABT_TASK_TERM,
+++<<<<<<< HEAD
+ +				    fc_lun.scsi_lun, io_req)) {
+ +		spin_lock_irqsave(io_lock, flags);
+ +		io_req = (struct fnic_io_req *)CMD_SP(sc);
+ +		if (io_req)
+ +			io_req->abts_done = NULL;
+ +		if (CMD_STATE(sc) == FNIC_IOREQ_ABTS_PENDING)
+ +			CMD_STATE(sc) = old_ioreq_state;
+ +		spin_unlock_irqrestore(io_lock, flags);
+ +		iter_data->ret = FAILED;
+ +		return false;
+ +	} else {
+ +		spin_lock_irqsave(io_lock, flags);
+ +		if (CMD_FLAGS(sc) & FNIC_DEVICE_RESET)
+ +			CMD_FLAGS(sc) |= FNIC_DEV_RST_TERM_ISSUED;
+ +		spin_unlock_irqrestore(io_lock, flags);
+++=======
++ 				    fc_lun.scsi_lun, io_req, hwq)) {
++ 		spin_lock_irqsave(&fnic->wq_copy_lock[hwq], flags);
++ 		io_req = fnic_priv(sc)->io_req;
++ 		if (io_req)
++ 			io_req->abts_done = NULL;
++ 		if (fnic_priv(sc)->state == FNIC_IOREQ_ABTS_PENDING)
++ 			fnic_priv(sc)->state = old_ioreq_state;
++ 		spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
++ 		iter_data->ret = FAILED;
++ 		return false;
++ 	} else {
++ 		spin_lock_irqsave(&fnic->wq_copy_lock[hwq], flags);
++ 		if (fnic_priv(sc)->flags & FNIC_DEVICE_RESET)
++ 			fnic_priv(sc)->flags |= FNIC_DEV_RST_TERM_ISSUED;
++ 		spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  	}
+ -	fnic_priv(sc)->flags |= FNIC_IO_INTERNAL_TERM_ISSUED;
+ +	CMD_FLAGS(sc) |= FNIC_IO_INTERNAL_TERM_ISSUED;
+  
+  	wait_for_completion_timeout(&tm_done, msecs_to_jiffies
+  				    (fnic->config.ed_tov));
+  
+  	/* Recheck cmd state to check if it is now aborted */
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(io_lock, flags);
+ +	io_req = (struct fnic_io_req *)CMD_SP(sc);
+ +	if (!io_req) {
+ +		spin_unlock_irqrestore(io_lock, flags);
+ +		CMD_FLAGS(sc) |= FNIC_IO_ABT_TERM_REQ_NULL;
+++=======
++ 	spin_lock_irqsave(&fnic->wq_copy_lock[hwq], flags);
++ 	io_req = fnic_priv(sc)->io_req;
++ 	if (!io_req) {
++ 		spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
++ 		fnic_priv(sc)->flags |= FNIC_IO_ABT_TERM_REQ_NULL;
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  		return true;
+  	}
+  
+  	io_req->abts_done = NULL;
+  
+  	/* if abort is still pending with fw, fail */
+++<<<<<<< HEAD
+ +	if (CMD_ABTS_STATUS(sc) == FCPIO_INVALID_CODE) {
+ +		spin_unlock_irqrestore(io_lock, flags);
+ +		CMD_FLAGS(sc) |= FNIC_IO_ABT_TERM_DONE;
+++=======
++ 	if (fnic_priv(sc)->abts_status == FCPIO_INVALID_CODE) {
++ 		spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
++ 		fnic_priv(sc)->flags |= FNIC_IO_ABT_TERM_DONE;
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  		iter_data->ret = FAILED;
+  		return false;
+  	}
+ -	fnic_priv(sc)->state = FNIC_IOREQ_ABTS_COMPLETE;
+ +	CMD_STATE(sc) = FNIC_IOREQ_ABTS_COMPLETE;
+  
+  	/* original sc used for lr is handled by dev reset code */
+++<<<<<<< HEAD
+ +	if (sc != iter_data->lr_sc)
+ +		CMD_SP(sc) = NULL;
+ +	spin_unlock_irqrestore(io_lock, flags);
+++=======
++ 	if (sc != iter_data->lr_sc) {
++ 		fnic_priv(sc)->io_req = NULL;
++ 		fnic->sw_copy_wq[hwq].io_req_table[blk_mq_unique_tag_to_tag(abt_tag)] = NULL;
++ 	}
++ 	spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  
+  	/* original sc used for lr is handled by dev reset code */
+  	if (sc != iter_data->lr_sc) {
+@@@ -2204,10 -2273,10 +2584,11 @@@ int fnic_device_reset(struct scsi_cmnd 
+  	struct scsi_lun fc_lun;
+  	struct fnic_stats *fnic_stats;
+  	struct reset_stats *reset_stats;
+- 	int tag = rq->tag;
++ 	int mqtag = rq->tag;
+  	DECLARE_COMPLETION_ONSTACK(tm_done);
+ +	int tag_gen_flag = 0;   /*to track tags allocated by fnic driver*/
+  	bool new_sc = 0;
++ 	uint16_t hwq = 0;
+  
+  	/* Wait for rport to unblock */
+  	fc_block_scsi_eh(sc);
+@@@ -2235,23 -2304,26 +2616,36 @@@
+  		goto fnic_device_reset_end;
+  	}
+  
+ -	fnic_priv(sc)->flags = FNIC_DEVICE_RESET;
+ +	CMD_FLAGS(sc) = FNIC_DEVICE_RESET;
+ +	/* Allocate tag if not present */
+  
+- 	if (unlikely(tag < 0)) {
++ 	if (unlikely(mqtag < 0)) {
+  		/*
+ -		 * For device reset issued through sg3utils, we let
+ -		 * only one LUN_RESET to go through and use a special
+ -		 * tag equal to max_tag_id so that we don't have to allocate
+ -		 * or free it. It won't interact with tags
+ -		 * allocated by mid layer.
+ +		 * Really should fix the midlayer to pass in a proper
+ +		 * request for ioctls...
+  		 */
+++<<<<<<< HEAD
+ +		tag = fnic_scsi_host_start_tag(fnic, sc);
+ +		if (unlikely(tag == SCSI_NO_TAG))
+ +			goto fnic_device_reset_end;
+ +		tag_gen_flag = 1;
+ +		new_sc = 1;
+ +	}
+ +	io_lock = fnic_io_lock_hash(fnic, sc);
+ +	spin_lock_irqsave(io_lock, flags);
+ +	io_req = (struct fnic_io_req *)CMD_SP(sc);
+++=======
++ 		mutex_lock(&fnic->sgreset_mutex);
++ 		mqtag = fnic->fnic_max_tag_id;
++ 		new_sc = 1;
++ 	}  else {
++ 		mqtag = blk_mq_unique_tag(rq);
++ 		hwq = blk_mq_unique_tag_to_hwq(mqtag);
++ 	}
++ 
++ 	spin_lock_irqsave(&fnic->wq_copy_lock[hwq], flags);
++ 	io_req = fnic_priv(sc)->io_req;
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  
+  	/*
+  	 * If there is a io_req attached to this command, then use it,
+@@@ -2265,29 -2337,38 +2659,58 @@@
+  		}
+  		memset(io_req, 0, sizeof(*io_req));
+  		io_req->port_id = rport->port_id;
+++<<<<<<< HEAD
+ +		CMD_SP(sc) = (char *)io_req;
+ +	}
+ +	io_req->dr_done = &tm_done;
+ +	CMD_STATE(sc) = FNIC_IOREQ_CMD_PENDING;
+ +	CMD_LR_STATUS(sc) = FCPIO_INVALID_CODE;
+ +	spin_unlock_irqrestore(io_lock, flags);
+++=======
++ 		io_req->tag = mqtag;
++ 		fnic_priv(sc)->io_req = io_req;
++ 		io_req->sc = sc;
++ 
++ 		if (fnic->sw_copy_wq[hwq].io_req_table[blk_mq_unique_tag_to_tag(mqtag)] != NULL)
++ 			WARN(1, "fnic<%d>: %s: tag 0x%x already exists\n",
++ 					fnic->fnic_num, __func__, blk_mq_unique_tag_to_tag(mqtag));
++ 
++ 		fnic->sw_copy_wq[hwq].io_req_table[blk_mq_unique_tag_to_tag(mqtag)] =
++ 				io_req;
++ 	}
++ 	io_req->dr_done = &tm_done;
++ 	fnic_priv(sc)->state = FNIC_IOREQ_CMD_PENDING;
++ 	fnic_priv(sc)->lr_status = FCPIO_INVALID_CODE;
++ 	spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  
+- 	FNIC_SCSI_DBG(KERN_DEBUG, fnic->lport->host, "TAG %x\n", tag);
++ 	FNIC_SCSI_DBG(KERN_DEBUG, fnic->lport->host, "TAG %x\n", mqtag);
+  
+  	/*
+  	 * issue the device reset, if enqueue failed, clean up the ioreq
+  	 * and break assoc with scsi cmd
+  	 */
+  	if (fnic_queue_dr_io_req(fnic, sc, io_req)) {
+++<<<<<<< HEAD
+ +		spin_lock_irqsave(io_lock, flags);
+ +		io_req = (struct fnic_io_req *)CMD_SP(sc);
+++=======
++ 		spin_lock_irqsave(&fnic->wq_copy_lock[hwq], flags);
++ 		io_req = fnic_priv(sc)->io_req;
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  		if (io_req)
+  			io_req->dr_done = NULL;
+  		goto fnic_device_reset_clean;
+  	}
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(io_lock, flags);
+ +	CMD_FLAGS(sc) |= FNIC_DEV_RST_ISSUED;
+ +	spin_unlock_irqrestore(io_lock, flags);
+++=======
++ 	spin_lock_irqsave(&fnic->wq_copy_lock[hwq], flags);
++ 	fnic_priv(sc)->flags |= FNIC_DEV_RST_ISSUED;
++ 	spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  
+  	/*
+  	 * Wait on the local completion for LUN reset.  The io_req may be
+@@@ -2296,12 -2377,12 +2719,17 @@@
+  	wait_for_completion_timeout(&tm_done,
+  				    msecs_to_jiffies(FNIC_LUN_RESET_TIMEOUT));
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(io_lock, flags);
+ +	io_req = (struct fnic_io_req *)CMD_SP(sc);
+++=======
++ 	spin_lock_irqsave(&fnic->wq_copy_lock[hwq], flags);
++ 	io_req = fnic_priv(sc)->io_req;
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  	if (!io_req) {
+- 		spin_unlock_irqrestore(io_lock, flags);
++ 		spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+  		FNIC_SCSI_DBG(KERN_DEBUG, fnic->lport->host,
+- 				"io_req is null tag 0x%x sc 0x%p\n", tag, sc);
++ 				"io_req is null mqtag 0x%x sc 0x%p\n", mqtag, sc);
+  		goto fnic_device_reset_end;
+  	}
+  	io_req->dr_done = NULL;
+@@@ -2316,42 -2397,42 +2744,65 @@@
+  		atomic64_inc(&reset_stats->device_reset_timeouts);
+  		FNIC_SCSI_DBG(KERN_DEBUG, fnic->lport->host,
+  			      "Device reset timed out\n");
+++<<<<<<< HEAD
+ +		CMD_FLAGS(sc) |= FNIC_DEV_RST_TIMED_OUT;
+ +		spin_unlock_irqrestore(io_lock, flags);
+++=======
++ 		fnic_priv(sc)->flags |= FNIC_DEV_RST_TIMED_OUT;
++ 		spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  		int_to_scsilun(sc->device->lun, &fc_lun);
+  		/*
+  		 * Issue abort and terminate on device reset request.
+  		 * If q'ing of terminate fails, retry it after a delay.
+  		 */
+  		while (1) {
+++<<<<<<< HEAD
+ +			spin_lock_irqsave(io_lock, flags);
+ +			if (CMD_FLAGS(sc) & FNIC_DEV_RST_TERM_ISSUED) {
+ +				spin_unlock_irqrestore(io_lock, flags);
+++=======
++ 			spin_lock_irqsave(&fnic->wq_copy_lock[hwq], flags);
++ 			if (fnic_priv(sc)->flags & FNIC_DEV_RST_TERM_ISSUED) {
++ 				spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  				break;
+  			}
+- 			spin_unlock_irqrestore(io_lock, flags);
++ 			spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+  			if (fnic_queue_abort_io_req(fnic,
+- 				tag | FNIC_TAG_DEV_RST,
++ 				mqtag | FNIC_TAG_DEV_RST,
+  				FCPIO_ITMF_ABT_TASK_TERM,
+- 				fc_lun.scsi_lun, io_req)) {
++ 				fc_lun.scsi_lun, io_req, hwq)) {
+  				wait_for_completion_timeout(&tm_done,
+  				msecs_to_jiffies(FNIC_ABT_TERM_DELAY_TIMEOUT));
+  			} else {
+++<<<<<<< HEAD
+ +				spin_lock_irqsave(io_lock, flags);
+ +				CMD_FLAGS(sc) |= FNIC_DEV_RST_TERM_ISSUED;
+ +				CMD_STATE(sc) = FNIC_IOREQ_ABTS_PENDING;
+++=======
++ 				spin_lock_irqsave(&fnic->wq_copy_lock[hwq], flags);
++ 				fnic_priv(sc)->flags |= FNIC_DEV_RST_TERM_ISSUED;
++ 				fnic_priv(sc)->state = FNIC_IOREQ_ABTS_PENDING;
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  				io_req->abts_done = &tm_done;
+- 				spin_unlock_irqrestore(io_lock, flags);
++ 				spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+  				FNIC_SCSI_DBG(KERN_DEBUG, fnic->lport->host,
+- 				"Abort and terminate issued on Device reset "
+- 				"tag 0x%x sc 0x%p\n", tag, sc);
++ 				"Abort and terminate issued on Device reset mqtag 0x%x sc 0x%p\n",
++ 				mqtag, sc);
+  				break;
+  			}
+  		}
+  		while (1) {
+++<<<<<<< HEAD
+ +			spin_lock_irqsave(io_lock, flags);
+ +			if (!(CMD_FLAGS(sc) & FNIC_DEV_RST_DONE)) {
+ +				spin_unlock_irqrestore(io_lock, flags);
+++=======
++ 			spin_lock_irqsave(&fnic->wq_copy_lock[hwq], flags);
++ 			if (!(fnic_priv(sc)->flags & FNIC_DEV_RST_DONE)) {
++ 				spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  				wait_for_completion_timeout(&tm_done,
+  				msecs_to_jiffies(FNIC_LUN_RESET_TIMEOUT));
+  				break;
+@@@ -2383,8 -2464,8 +2834,13 @@@
+  	 * succeeds
+  	 */
+  	if (fnic_clean_pending_aborts(fnic, sc, new_sc)) {
+++<<<<<<< HEAD
+ +		spin_lock_irqsave(io_lock, flags);
+ +		io_req = (struct fnic_io_req *)CMD_SP(sc);
+++=======
++ 		spin_lock_irqsave(&fnic->wq_copy_lock[hwq], flags);
++ 		io_req = fnic_priv(sc)->io_req;
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  		FNIC_SCSI_DBG(KERN_DEBUG, fnic->lport->host,
+  			      "Device reset failed"
+  			      " since could not abort all IOs\n");
+@@@ -2392,17 -2473,20 +2848,30 @@@
+  	}
+  
+  	/* Clean lun reset command */
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(io_lock, flags);
+ +	io_req = (struct fnic_io_req *)CMD_SP(sc);
+++=======
++ 	spin_lock_irqsave(&fnic->wq_copy_lock[hwq], flags);
++ 	io_req = fnic_priv(sc)->io_req;
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  	if (io_req)
+  		/* Completed, and successful */
+  		ret = SUCCESS;
+  
+  fnic_device_reset_clean:
+++<<<<<<< HEAD
+ +	if (io_req)
+ +		CMD_SP(sc) = NULL;
+++=======
++ 	if (io_req) {
++ 		fnic_priv(sc)->io_req = NULL;
++ 		io_req->sc = NULL;
++ 		fnic->sw_copy_wq[hwq].io_req_table[blk_mq_unique_tag_to_tag(io_req->tag)] = NULL;
++ 	}
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  
+- 	spin_unlock_irqrestore(io_lock, flags);
++ 	spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+  
+  	if (io_req) {
+  		start_time = io_req->start_time;
+@@@ -2657,12 -2747,11 +3131,11 @@@ static bool fnic_abts_pending_iter(stru
+  	if (iter_data->lun_dev && sc->device != iter_data->lun_dev)
+  		return true;
+  
+- 	io_lock = fnic_io_lock_hash(fnic, sc);
+- 	spin_lock_irqsave(io_lock, flags);
++ 	spin_lock_irqsave(&fnic->wq_copy_lock[hwq], flags);
+  
+ -	io_req = fnic_priv(sc)->io_req;
+ +	io_req = (struct fnic_io_req *)CMD_SP(sc);
+  	if (!io_req) {
+- 		spin_unlock_irqrestore(io_lock, flags);
++ 		spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+  		return true;
+  	}
+  
+@@@ -2672,9 -2761,9 +3145,15 @@@
+  	 */
+  	FNIC_SCSI_DBG(KERN_INFO, fnic->lport->host,
+  		      "Found IO in %s on lun\n",
+++<<<<<<< HEAD
+ +		      fnic_ioreq_state_to_str(CMD_STATE(sc)));
+ +	cmd_state = CMD_STATE(sc);
+ +	spin_unlock_irqrestore(io_lock, flags);
+++=======
++ 		      fnic_ioreq_state_to_str(fnic_priv(sc)->state));
++ 	cmd_state = fnic_priv(sc)->state;
++ 	spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+++>>>>>>> c81df08cd294 (scsi: fnic: Add support for multiqueue (MQ) in fnic driver)
+  	if (cmd_state == FNIC_IOREQ_ABTS_PENDING)
+  		iter_data->ret = 1;
+  
+diff --git a/drivers/scsi/fnic/fnic.h b/drivers/scsi/fnic/fnic.h
+index 9ebca3720f82..87ac314ffce1 100644
+--- a/drivers/scsi/fnic/fnic.h
++++ b/drivers/scsi/fnic/fnic.h
+@@ -48,7 +48,6 @@
+ #define FNIC_MIN_IO_REQ			256 /* Min IO throttle count */
+ #define FNIC_MAX_IO_REQ		1024 /* scsi_cmnd tag map entries */
+ #define FNIC_DFLT_IO_REQ        256 /* Default scsi_cmnd tag map entries */
+-#define	FNIC_IO_LOCKS		64 /* IO locks: power of 2 */
+ #define FNIC_DFLT_QUEUE_DEPTH	256
+ #define	FNIC_STATS_RATE_LIMIT	4 /* limit rate at which stats are pulled up */
+ 
+@@ -292,7 +291,6 @@ struct fnic {
+ 	struct fnic_host_tag *tags;
+ 	mempool_t *io_req_pool;
+ 	mempool_t *io_sgl_pool[FNIC_SGL_NUM_CACHES];
+-	spinlock_t io_req_lock[FNIC_IO_LOCKS];	/* locks for scsi cmnds */
+ 
+ 	unsigned int copy_wq_base;
+ 	struct work_struct link_work;
+* Unmerged path drivers/scsi/fnic/fnic_main.c
+* Unmerged path drivers/scsi/fnic/fnic_scsi.c
