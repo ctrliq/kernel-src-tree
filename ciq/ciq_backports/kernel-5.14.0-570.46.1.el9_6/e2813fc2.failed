@@ -1,0 +1,293 @@
+scsi: fnic: Replace shost_printk() with dev_info()/dev_err()
+
+jira LE-4311
+Rebuild_History Non-Buildable kernel-5.14.0-570.46.1.el9_6
+commit-author Karan Tilak Kumar <kartilak@cisco.com>
+commit e2813fc27d274747fa6e204e135e3c89cc6426a3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-570.46.1.el9_6/e2813fc2.failed
+
+Sending host information to shost_printk() prior to host initialization in
+fnic is unnecessary. Replace shost_printk() and a printk() prior to this
+initialization with dev_info() and dev_err() accordingly.
+
+	Reviewed-by: Sesidhar Baddela <sebaddel@cisco.com>
+	Reviewed-by: Arulprabhu Ponnusamy <arulponn@cisco.com>
+	Reviewed-by: Gian Carlo Boffa <gcboffa@cisco.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Signed-off-by: Karan Tilak Kumar <kartilak@cisco.com>
+Link: https://lore.kernel.org/r/20241212020312.4786-2-kartilak@cisco.com
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit e2813fc27d274747fa6e204e135e3c89cc6426a3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/fnic/fnic_main.c
+diff --cc drivers/scsi/fnic/fnic_main.c
+index 06fd7b543b33,471a156b074e..000000000000
+--- a/drivers/scsi/fnic/fnic_main.c
++++ b/drivers/scsi/fnic/fnic_main.c
+@@@ -401,11 -387,10 +395,10 @@@ static int fnic_notify_set(struct fnic 
+  		err = vnic_dev_notify_set(fnic->vdev, -1);
+  		break;
+  	case VNIC_DEV_INTR_MODE_MSIX:
+ -		err = vnic_dev_notify_set(fnic->vdev, fnic->wq_copy_count + fnic->copy_wq_base);
+ +		err = vnic_dev_notify_set(fnic->vdev, FNIC_MSIX_ERR_NOTIFY);
+  		break;
+  	default:
+- 		shost_printk(KERN_ERR, fnic->lport->host,
+- 			     "Interrupt mode should be set up"
++ 		dev_err(&fnic->pdev->dev, "Interrupt mode should be set up"
+  			     " before devcmd notify set %d\n",
+  			     vnic_dev_get_intr_mode(fnic->vdev));
+  		err = -1;
+@@@ -574,18 -559,11 +567,16 @@@ static int fnic_scsi_drv_init(struct fn
+  	host->max_cmd_len = FCOE_MAX_CMD_LEN;
+  
+  	host->nr_hw_queues = fnic->wq_copy_count;
+ +	if (host->nr_hw_queues > 1)
+ +		shost_printk(KERN_ERR, host,
+ +				"fnic: blk-mq is not supported");
+ +
+ +	host->nr_hw_queues = fnic->wq_copy_count = 1;
+  
+- 	shost_printk(KERN_INFO, host,
+- 			"fnic: can_queue: %d max_lun: %llu",
++ 	dev_info(&fnic->pdev->dev, "fnic: can_queue: %d max_lun: %llu",
+  			host->can_queue, host->max_lun);
+  
+- 	shost_printk(KERN_INFO, host,
+- 			"fnic: max_id: %d max_cmd_len: %d nr_hw_queues: %d",
++ 	dev_info(&fnic->pdev->dev, "fnic: max_id: %d max_cmd_len: %d nr_hw_queues: %d",
+  			host->max_id, host->max_cmd_len, host->nr_hw_queues);
+  
+  	return 0;
+@@@ -634,15 -639,9 +625,14 @@@ static int fnic_probe(struct pci_dev *p
+  	fnic->fnic_num = fnic_id;
+  	fnic_stats_debugfs_init(fnic);
+  
+ +	/* Setup PCI resources */
+ +	pci_set_drvdata(pdev, fnic);
+ +
+ +	fnic->pdev = pdev;
+ +
+  	err = pci_enable_device(pdev);
+  	if (err) {
+- 		shost_printk(KERN_ERR, fnic->lport->host,
+- 			     "Cannot enable PCI device, aborting.\n");
++ 		dev_err(&fnic->pdev->dev, "Cannot enable PCI device, aborting.\n");
+  		goto err_out_free_hba;
+  	}
+  
+@@@ -760,6 -748,16 +738,19 @@@
+  		goto err_out_clear_intr;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	fnic_scsi_drv_init(fnic);
++ 
++ 	for (hwq = 0; hwq < fnic->wq_copy_count; hwq++) {
++ 		fnic->sw_copy_wq[hwq].ioreq_table_size = fnic->fnic_max_tag_id;
++ 		fnic->sw_copy_wq[hwq].io_req_table =
++ 					kzalloc((fnic->sw_copy_wq[hwq].ioreq_table_size + 1) *
++ 					sizeof(struct fnic_io_req *), GFP_KERNEL);
++ 	}
++ 	dev_info(&fnic->pdev->dev, "fnic copy wqs: %d, Q0 ioreq table size: %d\n",
++ 			fnic->wq_copy_count, fnic->sw_copy_wq[0].ioreq_table_size);
+++>>>>>>> e2813fc27d27 (scsi: fnic: Replace shost_printk() with dev_info()/dev_err())
+  
+  	/* initialize all fnic locks */
+  	spin_lock_init(&fnic->fnic_lock);
+@@@ -844,27 -836,41 +832,50 @@@
+  
+  	/* allocate RQ buffers and post them to RQ*/
+  	for (i = 0; i < fnic->rq_count; i++) {
+ +		vnic_rq_enable(&fnic->rq[i]);
+  		err = vnic_rq_fill(&fnic->rq[i], fnic_alloc_rq_frame);
+  		if (err) {
+- 			shost_printk(KERN_ERR, fnic->lport->host,
+- 				     "fnic_alloc_rq_frame can't alloc "
++ 			dev_err(&fnic->pdev->dev, "fnic_alloc_rq_frame can't alloc "
+  				     "frame\n");
+ -			goto err_out_rq_buf;
+ +			goto err_out_free_rq_buf;
+  		}
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Enable all queues */
++ 	for (i = 0; i < fnic->raw_wq_count; i++)
++ 		vnic_wq_enable(&fnic->wq[i]);
++ 	for (i = 0; i < fnic->rq_count; i++) {
++ 		if (!ioread32(&fnic->rq[i].ctrl->enable))
++ 			vnic_rq_enable(&fnic->rq[i]);
++ 	}
++ 	for (i = 0; i < fnic->wq_copy_count; i++)
++ 		vnic_wq_copy_enable(&fnic->hw_copy_wq[i]);
++ 
++ 	err = fnic_request_intr(fnic);
++ 	if (err) {
++ 		dev_err(&fnic->pdev->dev, "Unable to request irq.\n");
++ 		goto err_out_request_intr;
++ 	}
++ 
+++>>>>>>> e2813fc27d27 (scsi: fnic: Replace shost_printk() with dev_info()/dev_err())
+  	/*
+  	 * Initialization done with PCI system, hardware, firmware.
+  	 * Add host to SCSI
+  	 */
+  	err = scsi_add_host(lp->host, &pdev->dev);
+  	if (err) {
+++<<<<<<< HEAD
+ +		shost_printk(KERN_ERR, fnic->lport->host,
+ +			     "fnic: scsi_add_host failed...exiting\n");
+ +		goto err_out_free_rq_buf;
+++=======
++ 		dev_err(&fnic->pdev->dev, "fnic: scsi_add_host failed...exiting\n");
++ 		goto err_out_scsi_add_host;
+++>>>>>>> e2813fc27d27 (scsi: fnic: Replace shost_printk() with dev_info()/dev_err())
+  	}
+  
+ -
+  	/* Start local port initiatialization */
+  
+  	lp->link_up = 0;
+* Unmerged path drivers/scsi/fnic/fnic_main.c
+diff --git a/drivers/scsi/fnic/fnic_res.c b/drivers/scsi/fnic/fnic_res.c
+index f7c2ee009426..308323b89d49 100644
+--- a/drivers/scsi/fnic/fnic_res.c
++++ b/drivers/scsi/fnic/fnic_res.c
+@@ -42,9 +42,7 @@ int fnic_get_vnic_config(struct fnic *fnic)
+ 				    offsetof(struct vnic_fc_config, m), \
+ 				    sizeof(c->m), &c->m); \
+ 		if (err) { \
+-			shost_printk(KERN_ERR, fnic->lport->host, \
+-				     "Error getting %s, %d\n", #m, \
+-				     err); \
++			dev_err(&fnic->pdev->dev, "Error getting %s, %d\n", #m, err); \
+ 			return err; \
+ 		} \
+ 	} while (0);
+@@ -151,40 +149,29 @@ int fnic_get_vnic_config(struct fnic *fnic)
+ 
+ 	c->wq_copy_count = min_t(u16, FNIC_WQ_COPY_MAX, c->wq_copy_count);
+ 
+-	shost_printk(KERN_INFO, fnic->lport->host,
+-		     "vNIC MAC addr %pM "
++	dev_info(&fnic->pdev->dev, "vNIC MAC addr %pM "
+ 		     "wq/wq_copy/rq %d/%d/%d\n",
+ 		     fnic->ctlr.ctl_src_addr,
+ 		     c->wq_enet_desc_count, c->wq_copy_desc_count,
+ 		     c->rq_desc_count);
+-	shost_printk(KERN_INFO, fnic->lport->host,
+-		     "vNIC node wwn %llx port wwn %llx\n",
++	dev_info(&fnic->pdev->dev, "vNIC node wwn %llx port wwn %llx\n",
+ 		     c->node_wwn, c->port_wwn);
+-	shost_printk(KERN_INFO, fnic->lport->host,
+-		     "vNIC ed_tov %d ra_tov %d\n",
++	dev_info(&fnic->pdev->dev, "vNIC ed_tov %d ra_tov %d\n",
+ 		     c->ed_tov, c->ra_tov);
+-	shost_printk(KERN_INFO, fnic->lport->host,
+-		     "vNIC mtu %d intr timer %d\n",
++	dev_info(&fnic->pdev->dev, "vNIC mtu %d intr timer %d\n",
+ 		     c->maxdatafieldsize, c->intr_timer);
+-	shost_printk(KERN_INFO, fnic->lport->host,
+-		     "vNIC flags 0x%x luns per tgt %d\n",
++	dev_info(&fnic->pdev->dev, "vNIC flags 0x%x luns per tgt %d\n",
+ 		     c->flags, c->luns_per_tgt);
+-	shost_printk(KERN_INFO, fnic->lport->host,
+-		     "vNIC flogi_retries %d flogi timeout %d\n",
++	dev_info(&fnic->pdev->dev, "vNIC flogi_retries %d flogi timeout %d\n",
+ 		     c->flogi_retries, c->flogi_timeout);
+-	shost_printk(KERN_INFO, fnic->lport->host,
+-		     "vNIC plogi retries %d plogi timeout %d\n",
++	dev_info(&fnic->pdev->dev, "vNIC plogi retries %d plogi timeout %d\n",
+ 		     c->plogi_retries, c->plogi_timeout);
+-	shost_printk(KERN_INFO, fnic->lport->host,
+-		     "vNIC io throttle count %d link dn timeout %d\n",
++	dev_info(&fnic->pdev->dev, "vNIC io throttle count %d link dn timeout %d\n",
+ 		     c->io_throttle_count, c->link_down_timeout);
+-	shost_printk(KERN_INFO, fnic->lport->host,
+-		     "vNIC port dn io retries %d port dn timeout %d\n",
++	dev_info(&fnic->pdev->dev, "vNIC port dn io retries %d port dn timeout %d\n",
+ 		     c->port_down_io_retries, c->port_down_timeout);
+-	shost_printk(KERN_INFO, fnic->lport->host,
+-			"vNIC wq_copy_count: %d\n", c->wq_copy_count);
+-	shost_printk(KERN_INFO, fnic->lport->host,
+-			"vNIC intr mode: %d\n", c->intr_mode);
++	dev_info(&fnic->pdev->dev, "vNIC wq_copy_count: %d\n", c->wq_copy_count);
++	dev_info(&fnic->pdev->dev, "vNIC intr mode: %d\n", c->intr_mode);
+ 
+ 	return 0;
+ }
+@@ -218,18 +205,12 @@ void fnic_get_res_counts(struct fnic *fnic)
+ 	fnic->intr_count = vnic_dev_get_res_count(fnic->vdev,
+ 		RES_TYPE_INTR_CTRL);
+ 
+-	shost_printk(KERN_INFO, fnic->lport->host,
+-		"vNIC fw resources wq_count: %d\n", fnic->wq_count);
+-	shost_printk(KERN_INFO, fnic->lport->host,
+-		"vNIC fw resources raw_wq_count: %d\n", fnic->raw_wq_count);
+-	shost_printk(KERN_INFO, fnic->lport->host,
+-		"vNIC fw resources wq_copy_count: %d\n", fnic->wq_copy_count);
+-	shost_printk(KERN_INFO, fnic->lport->host,
+-		"vNIC fw resources rq_count: %d\n", fnic->rq_count);
+-	shost_printk(KERN_INFO, fnic->lport->host,
+-		"vNIC fw resources cq_count: %d\n", fnic->cq_count);
+-	shost_printk(KERN_INFO, fnic->lport->host,
+-		"vNIC fw resources intr_count: %d\n", fnic->intr_count);
++	dev_info(&fnic->pdev->dev, "vNIC fw resources wq_count: %d\n", fnic->wq_count);
++	dev_info(&fnic->pdev->dev, "vNIC fw resources raw_wq_count: %d\n", fnic->raw_wq_count);
++	dev_info(&fnic->pdev->dev, "vNIC fw resources wq_copy_count: %d\n", fnic->wq_copy_count);
++	dev_info(&fnic->pdev->dev, "vNIC fw resources rq_count: %d\n", fnic->rq_count);
++	dev_info(&fnic->pdev->dev, "vNIC fw resources cq_count: %d\n", fnic->cq_count);
++	dev_info(&fnic->pdev->dev, "vNIC fw resources intr_count: %d\n", fnic->intr_count);
+ }
+ 
+ void fnic_free_vnic_resources(struct fnic *fnic)
+@@ -265,19 +246,17 @@ int fnic_alloc_vnic_resources(struct fnic *fnic)
+ 
+ 	intr_mode = vnic_dev_get_intr_mode(fnic->vdev);
+ 
+-	shost_printk(KERN_INFO, fnic->lport->host, "vNIC interrupt mode: %s\n",
++	dev_info(&fnic->pdev->dev, "vNIC interrupt mode: %s\n",
+ 		     intr_mode == VNIC_DEV_INTR_MODE_INTX ? "legacy PCI INTx" :
+ 		     intr_mode == VNIC_DEV_INTR_MODE_MSI ? "MSI" :
+ 		     intr_mode == VNIC_DEV_INTR_MODE_MSIX ?
+ 		     "MSI-X" : "unknown");
+ 
+-	shost_printk(KERN_INFO, fnic->lport->host,
+-			"vNIC resources avail: wq %d cp_wq %d raw_wq %d rq %d",
++	dev_info(&fnic->pdev->dev, "res avail: wq %d cp_wq %d raw_wq %d rq %d",
+ 			fnic->wq_count, fnic->wq_copy_count,
+ 			fnic->raw_wq_count, fnic->rq_count);
+ 
+-	shost_printk(KERN_INFO, fnic->lport->host,
+-			"vNIC resources avail: cq %d intr %d cpy-wq desc count %d\n",
++	dev_info(&fnic->pdev->dev, "res avail: cq %d intr %d cpy-wq desc count %d\n",
+ 			fnic->cq_count, fnic->intr_count,
+ 			fnic->config.wq_copy_desc_count);
+ 
+@@ -352,8 +331,7 @@ int fnic_alloc_vnic_resources(struct fnic *fnic)
+ 				RES_TYPE_INTR_PBA_LEGACY, 0);
+ 
+ 	if (!fnic->legacy_pba && intr_mode == VNIC_DEV_INTR_MODE_INTX) {
+-		shost_printk(KERN_ERR, fnic->lport->host,
+-			     "Failed to hook legacy pba resource\n");
++		dev_err(&fnic->pdev->dev, "Failed to hook legacy pba resource\n");
+ 		err = -ENODEV;
+ 		goto err_out_cleanup;
+ 	}
+@@ -456,8 +434,7 @@ int fnic_alloc_vnic_resources(struct fnic *fnic)
+ 	/* init the stats memory by making the first call here */
+ 	err = vnic_dev_stats_dump(fnic->vdev, &fnic->stats);
+ 	if (err) {
+-		shost_printk(KERN_ERR, fnic->lport->host,
+-			     "vnic_dev_stats_dump failed - x%x\n", err);
++		dev_err(&fnic->pdev->dev, "vnic_dev_stats_dump failed - x%x\n", err);
+ 		goto err_out_cleanup;
+ 	}
+ 
