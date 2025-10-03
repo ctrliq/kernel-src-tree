@@ -1,0 +1,226 @@
+scsi: fnic: Remove extern definition from .c files
+
+jira LE-4311
+Rebuild_History Non-Buildable kernel-5.14.0-570.46.1.el9_6
+commit-author Karan Tilak Kumar <kartilak@cisco.com>
+commit 6cfba11510d6f4d0e863fc0fa939c7a983cf13bd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-570.46.1.el9_6/6cfba115.failed
+
+Implement review comments from Martin:
+    Remove extern definition of fnic_fip_queue from .c files
+
+	Reviewed-by: Sesidhar Baddela <sebaddel@cisco.com>
+	Reviewed-by: Arulprabhu Ponnusamy <arulponn@cisco.com>
+	Reviewed-by: Gian Carlo Boffa <gcboffa@cisco.com>
+	Reviewed-by: Arun Easi <aeasi@cisco.com>
+	Signed-off-by: Karan Tilak Kumar <kartilak@cisco.com>
+Link: https://lore.kernel.org/r/20250106224451.3597-2-kartilak@cisco.com
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 6cfba11510d6f4d0e863fc0fa939c7a983cf13bd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/fnic/fip.c
+#	drivers/scsi/fnic/fip.h
+#	drivers/scsi/fnic/fnic_fcs.c
+diff --cc drivers/scsi/fnic/fnic_fcs.c
+index 8c3b350695e3,1e8cd64f9a5c..000000000000
+--- a/drivers/scsi/fnic/fnic_fcs.c
++++ b/drivers/scsi/fnic/fnic_fcs.c
+@@@ -26,166 -14,37 +26,171 @@@
+  #include <linux/workqueue.h>
+  #include <scsi/fc/fc_fip.h>
+  #include <scsi/fc/fc_els.h>
+ +#include <scsi/fc/fc_fcoe.h>
+  #include <scsi/fc_frame.h>
+ -#include <linux/etherdevice.h>
+ -#include <scsi/scsi_transport_fc.h>
+ +#include <scsi/libfc.h>
+  #include "fnic_io.h"
+  #include "fnic.h"
+ -#include "fnic_fdls.h"
+ -#include "fdls_fc.h"
+ +#include "fnic_fip.h"
+  #include "cq_enet_desc.h"
+  #include "cq_exch_desc.h"
+ -#include "fip.h"
+  
+++<<<<<<< HEAD
+ +static u8 fcoe_all_fcfs[ETH_ALEN] = FIP_ALL_FCF_MACS;
+ +struct workqueue_struct *fnic_fip_queue;
+++=======
++ #define MAX_RESET_WAIT_COUNT    64
++ 
+++>>>>>>> 6cfba11510d6 (scsi: fnic: Remove extern definition from .c files)
+  struct workqueue_struct *fnic_event_queue;
+  
+ -static uint8_t FCOE_ALL_FCF_MAC[6] = FC_FCOE_FLOGI_MAC;
+ +static void fnic_set_eth_mode(struct fnic *);
+ +static void fnic_fcoe_send_vlan_req(struct fnic *fnic);
+ +static void fnic_fcoe_start_fcf_disc(struct fnic *fnic);
+ +static void fnic_fcoe_process_vlan_resp(struct fnic *fnic, struct sk_buff *);
+ +static int fnic_fcoe_vlan_check(struct fnic *fnic, u16 flag);
+ +static int fnic_fcoe_handle_fip_frame(struct fnic *fnic, struct sk_buff *skb);
+  
+ -/*
+ - * Internal Functions
+ - * This function will initialize the src_mac address to be
+ - * used in outgoing frames
+ - */
+ -static inline void fnic_fdls_set_fcoe_srcmac(struct fnic *fnic,
+ -							 uint8_t *src_mac)
+ +void fnic_handle_link(struct work_struct *work)
+  {
+ -	FNIC_FCS_DBG(KERN_INFO, fnic->host, fnic->fnic_num,
+ -				 "Setting src mac: %02x:%02x:%02x:%02x:%02x:%02x",
+ -				 src_mac[0], src_mac[1], src_mac[2], src_mac[3],
+ -				 src_mac[4], src_mac[5]);
+ +	struct fnic *fnic = container_of(work, struct fnic, link_work);
+ +	unsigned long flags;
+ +	int old_link_status;
+ +	u32 old_link_down_cnt;
+ +	u64 old_port_speed, new_port_speed;
+ +
+ +	spin_lock_irqsave(&fnic->fnic_lock, flags);
+ +
+ +	fnic->link_events = 1;      /* less work to just set everytime*/
+ +
+ +	if (fnic->stop_rx_link_events) {
+ +		spin_unlock_irqrestore(&fnic->fnic_lock, flags);
+ +		return;
+ +	}
+ +
+ +	old_link_down_cnt = fnic->link_down_cnt;
+ +	old_link_status = fnic->link_status;
+ +	old_port_speed = atomic64_read(
+ +			&fnic->fnic_stats.misc_stats.current_port_speed);
+ +
+ +	fnic->link_status = vnic_dev_link_status(fnic->vdev);
+ +	fnic->link_down_cnt = vnic_dev_link_down_cnt(fnic->vdev);
+ +
+ +	new_port_speed = vnic_dev_port_speed(fnic->vdev);
+ +	atomic64_set(&fnic->fnic_stats.misc_stats.current_port_speed,
+ +			new_port_speed);
+ +	if (old_port_speed != new_port_speed)
+ +		FNIC_MAIN_DBG(KERN_INFO, fnic->lport->host,
+ +				"Current vnic speed set to :  %llu\n",
+ +				new_port_speed);
+ +
+ +	switch (vnic_dev_port_speed(fnic->vdev)) {
+ +	case DCEM_PORTSPEED_10G:
+ +		fc_host_speed(fnic->lport->host)   = FC_PORTSPEED_10GBIT;
+ +		fnic->lport->link_supported_speeds = FC_PORTSPEED_10GBIT;
+ +		break;
+ +	case DCEM_PORTSPEED_20G:
+ +		fc_host_speed(fnic->lport->host)   = FC_PORTSPEED_20GBIT;
+ +		fnic->lport->link_supported_speeds = FC_PORTSPEED_20GBIT;
+ +		break;
+ +	case DCEM_PORTSPEED_25G:
+ +		fc_host_speed(fnic->lport->host)   = FC_PORTSPEED_25GBIT;
+ +		fnic->lport->link_supported_speeds = FC_PORTSPEED_25GBIT;
+ +		break;
+ +	case DCEM_PORTSPEED_40G:
+ +	case DCEM_PORTSPEED_4x10G:
+ +		fc_host_speed(fnic->lport->host)   = FC_PORTSPEED_40GBIT;
+ +		fnic->lport->link_supported_speeds = FC_PORTSPEED_40GBIT;
+ +		break;
+ +	case DCEM_PORTSPEED_100G:
+ +		fc_host_speed(fnic->lport->host)   = FC_PORTSPEED_100GBIT;
+ +		fnic->lport->link_supported_speeds = FC_PORTSPEED_100GBIT;
+ +		break;
+ +	default:
+ +		fc_host_speed(fnic->lport->host)   = FC_PORTSPEED_UNKNOWN;
+ +		fnic->lport->link_supported_speeds = FC_PORTSPEED_UNKNOWN;
+ +		break;
+ +	}
+ +
+ +	if (old_link_status == fnic->link_status) {
+ +		if (!fnic->link_status) {
+ +			/* DOWN -> DOWN */
+ +			spin_unlock_irqrestore(&fnic->fnic_lock, flags);
+ +			fnic_fc_trace_set_data(fnic->lport->host->host_no,
+ +				FNIC_FC_LE, "Link Status: DOWN->DOWN",
+ +				strlen("Link Status: DOWN->DOWN"));
+ +		} else {
+ +			if (old_link_down_cnt != fnic->link_down_cnt) {
+ +				/* UP -> DOWN -> UP */
+ +				fnic->lport->host_stats.link_failure_count++;
+ +				spin_unlock_irqrestore(&fnic->fnic_lock, flags);
+ +				fnic_fc_trace_set_data(
+ +					fnic->lport->host->host_no,
+ +					FNIC_FC_LE,
+ +					"Link Status:UP_DOWN_UP",
+ +					strlen("Link_Status:UP_DOWN_UP")
+ +					);
+ +				FNIC_FCS_DBG(KERN_DEBUG, fnic->lport->host,
+ +					     "link down\n");
+ +				fcoe_ctlr_link_down(&fnic->ctlr);
+ +				if (fnic->config.flags & VFCF_FIP_CAPABLE) {
+ +					/* start FCoE VLAN discovery */
+ +					fnic_fc_trace_set_data(
+ +						fnic->lport->host->host_no,
+ +						FNIC_FC_LE,
+ +						"Link Status: UP_DOWN_UP_VLAN",
+ +						strlen(
+ +						"Link Status: UP_DOWN_UP_VLAN")
+ +						);
+ +					fnic_fcoe_send_vlan_req(fnic);
+ +					return;
+ +				}
+ +				FNIC_FCS_DBG(KERN_DEBUG, fnic->lport->host,
+ +					     "link up\n");
+ +				fcoe_ctlr_link_up(&fnic->ctlr);
+ +			} else {
+ +				/* UP -> UP */
+ +				spin_unlock_irqrestore(&fnic->fnic_lock, flags);
+ +				fnic_fc_trace_set_data(
+ +					fnic->lport->host->host_no, FNIC_FC_LE,
+ +					"Link Status: UP_UP",
+ +					strlen("Link Status: UP_UP"));
+ +			}
+ +		}
+ +	} else if (fnic->link_status) {
+ +		/* DOWN -> UP */
+ +		spin_unlock_irqrestore(&fnic->fnic_lock, flags);
+ +		if (fnic->config.flags & VFCF_FIP_CAPABLE) {
+ +			/* start FCoE VLAN discovery */
+ +			fnic_fc_trace_set_data(fnic->lport->host->host_no,
+ +					       FNIC_FC_LE, "Link Status: DOWN_UP_VLAN",
+ +					       strlen("Link Status: DOWN_UP_VLAN"));
+ +			fnic_fcoe_send_vlan_req(fnic);
+ +
+ +			return;
+ +		}
+ +
+ +		FNIC_FCS_DBG(KERN_DEBUG, fnic->lport->host, "link up\n");
+ +		fnic_fc_trace_set_data(fnic->lport->host->host_no, FNIC_FC_LE,
+ +				       "Link Status: DOWN_UP", strlen("Link Status: DOWN_UP"));
+ +		fcoe_ctlr_link_up(&fnic->ctlr);
+ +	} else {
+ +		/* UP -> DOWN */
+ +		fnic->lport->host_stats.link_failure_count++;
+ +		spin_unlock_irqrestore(&fnic->fnic_lock, flags);
+ +		FNIC_FCS_DBG(KERN_DEBUG, fnic->lport->host, "link down\n");
+ +		fnic_fc_trace_set_data(
+ +			fnic->lport->host->host_no, FNIC_FC_LE,
+ +			"Link Status: UP_DOWN",
+ +			strlen("Link Status: UP_DOWN"));
+ +		if (fnic->config.flags & VFCF_FIP_CAPABLE) {
+ +			FNIC_FCS_DBG(KERN_DEBUG, fnic->lport->host,
+ +				"deleting fip-timer during link-down\n");
+ +			del_timer_sync(&fnic->fip_timer);
+ +		}
+ +		fcoe_ctlr_link_down(&fnic->ctlr);
+ +	}
+  
+ -	memcpy(fnic->iport.fpma, src_mac, 6);
+  }
+  
+  /*
+* Unmerged path drivers/scsi/fnic/fip.c
+* Unmerged path drivers/scsi/fnic/fip.h
+* Unmerged path drivers/scsi/fnic/fip.c
+* Unmerged path drivers/scsi/fnic/fip.h
+* Unmerged path drivers/scsi/fnic/fnic_fcs.c
