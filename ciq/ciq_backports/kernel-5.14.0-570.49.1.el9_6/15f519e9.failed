@@ -1,0 +1,696 @@
+ceph: fix race condition validating r_parent before applying state
+
+jira LE-4311
+Rebuild_History Non-Buildable kernel-5.14.0-570.49.1.el9_6
+Rebuild_CHGLOG: - ceph: fix client race condition validating r_parent before applying state (Alex Markuze) [RHEL-114962]
+Rebuild_FUZZ: 94.96%
+commit-author Alex Markuze <amarkuze@redhat.com>
+commit 15f519e9f883b316d86e2bb6b767a023aafd9d83
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-570.49.1.el9_6/15f519e9.failed
+
+Add validation to ensure the cached parent directory inode matches the
+directory info in MDS replies. This prevents client-side race conditions
+where concurrent operations (e.g. rename) cause r_parent to become stale
+between request initiation and reply processing, which could lead to
+applying state changes to incorrect directory inodes.
+
+[ idryomov: folded a kerneldoc fixup and a follow-up fix from Alex to
+  move CEPH_CAP_PIN reference when r_parent is updated:
+
+  When the parent directory lock is not held, req->r_parent can become
+  stale and is updated to point to the correct inode.  However, the
+  associated CEPH_CAP_PIN reference was not being adjusted.  The
+  CEPH_CAP_PIN is a reference on an inode that is tracked for
+  accounting purposes.  Moving this pin is important to keep the
+  accounting balanced. When the pin was not moved from the old parent
+  to the new one, it created two problems: The reference on the old,
+  stale parent was never released, causing a reference leak.
+  A reference for the new parent was never acquired, creating the risk
+  of a reference underflow later in ceph_mdsc_release_request().  This
+  patch corrects the logic by releasing the pin from the old parent and
+  acquiring it for the new parent when r_parent is switched.  This
+  ensures reference accounting stays balanced. ]
+
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Alex Markuze <amarkuze@redhat.com>
+	Reviewed-by: Viacheslav Dubeyko <Slava.Dubeyko@ibm.com>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit 15f519e9f883b316d86e2bb6b767a023aafd9d83)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/debugfs.c
+#	fs/ceph/dir.c
+#	fs/ceph/file.c
+#	fs/ceph/inode.c
+#	fs/ceph/mds_client.c
+#	fs/ceph/mds_client.h
+diff --cc fs/ceph/debugfs.c
+index 3904333fa6c3,f3fe786b4143..000000000000
+--- a/fs/ceph/debugfs.c
++++ b/fs/ceph/debugfs.c
+@@@ -81,8 -79,8 +79,13 @@@ static int mdsc_show(struct seq_file *s
+  		if (req->r_inode) {
+  			seq_printf(s, " #%llx", ceph_ino(req->r_inode));
+  		} else if (req->r_dentry) {
+++<<<<<<< HEAD
+ +			path = ceph_mdsc_build_path(req->r_dentry, &pathlen,
+ +						    &pathbase, 0);
+++=======
++ 			struct ceph_path_info path_info;
++ 			path = ceph_mdsc_build_path(mdsc, req->r_dentry, &path_info, 0);
+++>>>>>>> 15f519e9f883 (ceph: fix race condition validating r_parent before applying state)
+  			if (IS_ERR(path))
+  				path = NULL;
+  			spin_lock(&req->r_dentry->d_lock);
+@@@ -100,8 -98,8 +103,13 @@@
+  		}
+  
+  		if (req->r_old_dentry) {
+++<<<<<<< HEAD
+ +			path = ceph_mdsc_build_path(req->r_old_dentry, &pathlen,
+ +						    &pathbase, 0);
+++=======
++ 			struct ceph_path_info path_info;
++ 			path = ceph_mdsc_build_path(mdsc, req->r_old_dentry, &path_info, 0);
+++>>>>>>> 15f519e9f883 (ceph: fix race condition validating r_parent before applying state)
+  			if (IS_ERR(path))
+  				path = NULL;
+  			spin_lock(&req->r_old_dentry->d_lock);
+diff --cc fs/ceph/dir.c
+index e7b61aacd742,32973c62c1a2..000000000000
+--- a/fs/ceph/dir.c
++++ b/fs/ceph/dir.c
+@@@ -1224,10 -1271,8 +1224,15 @@@ static void ceph_async_unlink_cb(struc
+  
+  	/* If op failed, mark everyone involved for errors */
+  	if (result) {
+++<<<<<<< HEAD
+ +		int pathlen = 0;
+ +		u64 base = 0;
+ +		char *path = ceph_mdsc_build_path(dentry, &pathlen,
+ +						  &base, 0);
+++=======
++ 		struct ceph_path_info path_info = {0};
++ 		char *path = ceph_mdsc_build_path(mdsc, dentry, &path_info, 0);
+++>>>>>>> 15f519e9f883 (ceph: fix race condition validating r_parent before applying state)
+  
+  		/* mark error on parent + clear complete */
+  		mapping_set_error(req->r_parent->i_mapping, result);
+@@@ -1240,9 -1285,9 +1245,15 @@@
+  		/* mark inode itself for an error (since metadata is bogus) */
+  		mapping_set_error(req->r_old_inode->i_mapping, result);
+  
+++<<<<<<< HEAD
+ +		pr_warn("async unlink failure path=(%llx)%s result=%d!\n",
+ +			base, IS_ERR(path) ? "<<bad>>" : path, result);
+ +		ceph_mdsc_free_path(path, pathlen);
+++=======
++ 		pr_warn_client(cl, "failure path=(%llx)%s result=%d!\n",
++ 			       path_info.vino.ino, IS_ERR(path) ? "<<bad>>" : path, result);
++ 		ceph_mdsc_free_path_info(&path_info);
+++>>>>>>> 15f519e9f883 (ceph: fix race condition validating r_parent before applying state)
+  	}
+  out:
+  	iput(req->r_old_inode);
+@@@ -1295,8 -1341,10 +1306,12 @@@ static int ceph_unlink(struct inode *di
+  	struct inode *inode = d_inode(dentry);
+  	struct ceph_mds_request *req;
+  	bool try_async = ceph_test_mount_opt(fsc, ASYNC_DIROPS);
+ -	struct dentry *dn;
+  	int err = -EROFS;
+  	int op;
+++<<<<<<< HEAD
+++=======
++ 	char *path;
+++>>>>>>> 15f519e9f883 (ceph: fix race condition validating r_parent before applying state)
+  
+  	if (ceph_snap(dir) == CEPH_SNAPDIR) {
+  		/* rmdir .snap/foo is RMSNAP */
+@@@ -1309,6 -1358,31 +1324,34 @@@
+  			CEPH_MDS_OP_RMDIR : CEPH_MDS_OP_UNLINK;
+  	} else
+  		goto out;
+++<<<<<<< HEAD
+++=======
++ 
++ 	dn = d_find_alias(dir);
++ 	if (!dn) {
++ 		try_async = false;
++ 	} else {
++ 		struct ceph_path_info path_info;
++ 		path = ceph_mdsc_build_path(mdsc, dn, &path_info, 0);
++ 		if (IS_ERR(path)) {
++ 			try_async = false;
++ 			err = 0;
++ 		} else {
++ 			err = ceph_mds_check_access(mdsc, path, MAY_WRITE);
++ 		}
++ 		ceph_mdsc_free_path_info(&path_info);
++ 		dput(dn);
++ 
++ 		/* For none EACCES cases will let the MDS do the mds auth check */
++ 		if (err == -EACCES) {
++ 			return err;
++ 		} else if (err < 0) {
++ 			try_async = false;
++ 			err = 0;
++ 		}
++ 	}
++ 
+++>>>>>>> 15f519e9f883 (ceph: fix race condition validating r_parent before applying state)
+  retry:
+  	req = ceph_mdsc_create_request(mdsc, op, USE_AUTH_MDS);
+  	if (IS_ERR(req)) {
+diff --cc fs/ceph/file.c
+index 8bec680bed46,978acd3d4b32..000000000000
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@@ -362,9 -366,13 +362,16 @@@ int ceph_open(struct inode *inode, stru
+  	struct ceph_file_info *fi = file->private_data;
+  	int err;
+  	int flags, fmode, wanted;
+++<<<<<<< HEAD
+++=======
++ 	struct dentry *dentry;
++ 	char *path;
++ 	bool do_sync = false;
++ 	int mask = MAY_READ;
+++>>>>>>> 15f519e9f883 (ceph: fix race condition validating r_parent before applying state)
+  
+  	if (fi) {
+ -		doutc(cl, "file %p is already opened\n", file);
+ +		dout("open file %p is already opened\n", file);
+  		return 0;
+  	}
+  
+@@@ -383,6 -391,32 +390,35 @@@
+  	fmode = ceph_flags_to_mode(flags);
+  	wanted = ceph_caps_for_mode(fmode);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (fmode & CEPH_FILE_MODE_WR)
++ 		mask |= MAY_WRITE;
++ 	dentry = d_find_alias(inode);
++ 	if (!dentry) {
++ 		do_sync = true;
++ 	} else {
++ 		struct ceph_path_info path_info;
++ 		path = ceph_mdsc_build_path(mdsc, dentry, &path_info, 0);
++ 		if (IS_ERR(path)) {
++ 			do_sync = true;
++ 			err = 0;
++ 		} else {
++ 			err = ceph_mds_check_access(mdsc, path, mask);
++ 		}
++ 		ceph_mdsc_free_path_info(&path_info);
++ 		dput(dentry);
++ 
++ 		/* For none EACCES cases will let the MDS do the mds auth check */
++ 		if (err == -EACCES) {
++ 			return err;
++ 		} else if (err < 0) {
++ 			do_sync = true;
++ 			err = 0;
++ 		}
++ 	}
++ 
+++>>>>>>> 15f519e9f883 (ceph: fix race condition validating r_parent before applying state)
+  	/* snapped files are read-only */
+  	if (ceph_snap(inode) != CEPH_NOSNAP && (file->f_mode & FMODE_WRITE))
+  		return -EROFS;
+@@@ -576,14 -613,13 +612,24 @@@ static void ceph_async_create_cb(struc
+  	mapping_set_error(req->r_parent->i_mapping, result);
+  
+  	if (result) {
+++<<<<<<< HEAD
+ +		int pathlen = 0;
+ +		u64 base = 0;
+ +		char *path = ceph_mdsc_build_path(req->r_dentry, &pathlen,
+ +						  &base, 0);
+ +
+ +		pr_warn("async create failure path=(%llx)%s result=%d!\n",
+ +			base, IS_ERR(path) ? "<<bad>>" : path, result);
+ +		ceph_mdsc_free_path(path, pathlen);
+++=======
++ 		struct ceph_path_info path_info = {0};
++ 		char *path = ceph_mdsc_build_path(mdsc, req->r_dentry, &path_info, 0);
++ 
++ 		pr_warn_client(cl,
++ 			"async create failure path=(%llx)%s result=%d!\n",
++ 			path_info.vino.ino, IS_ERR(path) ? "<<bad>>" : path, result);
++ 		ceph_mdsc_free_path_info(&path_info);
+++>>>>>>> 15f519e9f883 (ceph: fix race condition validating r_parent before applying state)
+  
+  		ceph_dir_clear_complete(req->r_parent);
+  		if (!d_unhashed(dentry))
+@@@ -743,10 -787,11 +789,14 @@@ int ceph_atomic_open(struct inode *dir
+  	bool try_async = ceph_test_mount_opt(fsc, ASYNC_DIROPS);
+  	int mask;
+  	int err;
+++<<<<<<< HEAD
+++=======
++ 	char *path;
+++>>>>>>> 15f519e9f883 (ceph: fix race condition validating r_parent before applying state)
+  
+ -	doutc(cl, "%p %llx.%llx dentry %p '%pd' %s flags %d mode 0%o\n",
+ -	      dir, ceph_vinop(dir), dentry, dentry,
+ -	      d_unhashed(dentry) ? "unhashed" : "hashed", flags, mode);
+ +	dout("atomic_open %p dentry %p '%pd' %s flags %d mode 0%o\n",
+ +	     dir, dentry, dentry,
+ +	     d_unhashed(dentry) ? "unhashed" : "hashed", flags, mode);
+  
+  	if (dentry->d_name.len > NAME_MAX)
+  		return -ENAMETOOLONG;
+@@@ -760,6 -805,35 +810,38 @@@
+  	 */
+  	flags &= ~O_TRUNC;
+  
+++<<<<<<< HEAD
+++=======
++ 	dn = d_find_alias(dir);
++ 	if (!dn) {
++ 		try_async = false;
++ 	} else {
++ 		struct ceph_path_info path_info;
++ 		path = ceph_mdsc_build_path(mdsc, dn, &path_info, 0);
++ 		if (IS_ERR(path)) {
++ 			try_async = false;
++ 			err = 0;
++ 		} else {
++ 			int fmode = ceph_flags_to_mode(flags);
++ 
++ 			mask = MAY_READ;
++ 			if (fmode & CEPH_FILE_MODE_WR)
++ 				mask |= MAY_WRITE;
++ 			err = ceph_mds_check_access(mdsc, path, mask);
++ 		}
++ 		ceph_mdsc_free_path_info(&path_info);
++ 		dput(dn);
++ 
++ 		/* For none EACCES cases will let the MDS do the mds auth check */
++ 		if (err == -EACCES) {
++ 			return err;
++ 		} else if (err < 0) {
++ 			try_async = false;
++ 			err = 0;
++ 		}
++ 	}
++ 
+++>>>>>>> 15f519e9f883 (ceph: fix race condition validating r_parent before applying state)
+  retry:
+  	if (flags & O_CREAT) {
+  		if (ceph_quota_is_max_files_exceeded(dir))
+diff --cc fs/ceph/inode.c
+index 34cfeb0fba9e,8ac89ce6435c..000000000000
+--- a/fs/ceph/inode.c
++++ b/fs/ceph/inode.c
+@@@ -2437,6 -2485,33 +2437,36 @@@ int __ceph_setattr(struct mnt_idmap *id
+  	bool lock_snap_rwsem = false;
+  	bool fill_fscrypt;
+  	int truncate_retry = 20; /* The RMW will take around 50ms */
+++<<<<<<< HEAD
+++=======
++ 	struct dentry *dentry;
++ 	char *path;
++ 	bool do_sync = false;
++ 
++ 	dentry = d_find_alias(inode);
++ 	if (!dentry) {
++ 		do_sync = true;
++ 	} else {
++ 		struct ceph_path_info path_info;
++ 		path = ceph_mdsc_build_path(mdsc, dentry, &path_info, 0);
++ 		if (IS_ERR(path)) {
++ 			do_sync = true;
++ 			err = 0;
++ 		} else {
++ 			err = ceph_mds_check_access(mdsc, path, MAY_WRITE);
++ 		}
++ 		ceph_mdsc_free_path_info(&path_info);
++ 		dput(dentry);
++ 
++ 		/* For none EACCES cases will let the MDS do the mds auth check */
++ 		if (err == -EACCES) {
++ 			return err;
++ 		} else if (err < 0) {
++ 			do_sync = true;
++ 			err = 0;
++ 		}
++ 	}
+++>>>>>>> 15f519e9f883 (ceph: fix race condition validating r_parent before applying state)
+  
+  retry:
+  	prealloc_cf = ceph_alloc_cap_flush();
+diff --cc fs/ceph/mds_client.c
+index 92bcf1cd8c16,3bc72b47fe4d..000000000000
+--- a/fs/ceph/mds_client.c
++++ b/fs/ceph/mds_client.c
+@@@ -2630,9 -2679,9 +2630,8 @@@ static u8 *get_fscrypt_altname(const st
+  
+  /**
+   * ceph_mdsc_build_path - build a path string to a given dentry
+ - * @mdsc: mds client
+   * @dentry: dentry to which path should be built
+-  * @plen: returned length of string
+-  * @pbase: returned base inode number
++  * @path_info: output path, length, base ino+snap, and freepath ownership flag
+   * @for_wire: is this path going to be sent to the MDS?
+   *
+   * Build a string that represents the path to the dentry. This is mostly called
+@@@ -2649,9 -2698,10 +2648,14 @@@
+   * Encode hidden .snap dirs as a double /, i.e.
+   *   foo/.snap/bar -> foo//bar
+   */
+++<<<<<<< HEAD
+ +char *ceph_mdsc_build_path(struct dentry *dentry, int *plen, u64 *pbase,
+ +			   int for_wire)
+++=======
++ char *ceph_mdsc_build_path(struct ceph_mds_client *mdsc, struct dentry *dentry,
++ 			   struct ceph_path_info *path_info, int for_wire)
+++>>>>>>> 15f519e9f883 (ceph: fix race condition validating r_parent before applying state)
+  {
+ -	struct ceph_client *cl = mdsc->fsc->client;
+  	struct dentry *cur;
+  	struct inode *inode;
+  	char *path;
+@@@ -2753,24 -2802,35 +2757,49 @@@ retry
+  
+  	if (pos < 0) {
+  		/*
+ -		 * The path is longer than PATH_MAX and this function
+ -		 * cannot ever succeed.  Creating paths that long is
+ -		 * possible with Ceph, but Linux cannot use them.
+ +		 * A rename didn't occur, but somehow we didn't end up where
+ +		 * we thought we would. Throw a warning and try again.
+  		 */
+ -		return ERR_PTR(-ENAMETOOLONG);
+ +		pr_warn("build_path did not end path lookup where expected (pos = %d)\n",
+ +			pos);
+ +		goto retry;
+  	}
+  
+++<<<<<<< HEAD
+ +	*pbase = base;
+ +	*plen = PATH_MAX - 1 - pos;
+ +	dout("build_path on %p %d built %llx '%.*s'\n",
+ +	     dentry, d_count(dentry), base, *plen, path + pos);
+ +	return path + pos;
+ +}
+ +
+ +static int build_dentry_path(struct dentry *dentry, struct inode *dir,
+ +			     const char **ppath, int *ppathlen, u64 *pino,
+ +			     bool *pfreepath, bool parent_locked)
+++=======
++ 	/* Initialize the output structure */
++ 	memset(path_info, 0, sizeof(*path_info));
++ 
++ 	path_info->vino.ino = base;
++ 	path_info->pathlen = PATH_MAX - 1 - pos;
++ 	path_info->path = path + pos;
++ 	path_info->freepath = true;
++ 
++ 	/* Set snap from dentry if available */
++ 	if (d_inode(dentry))
++ 		path_info->vino.snap = ceph_snap(d_inode(dentry));
++ 	else
++ 		path_info->vino.snap = CEPH_NOSNAP;
++ 
++ 	doutc(cl, "on %p %d built %llx '%.*s'\n", dentry, d_count(dentry),
++ 	      base, PATH_MAX - 1 - pos, path + pos);
++ 	return path + pos;
++ }
++ 
++ static int build_dentry_path(struct ceph_mds_client *mdsc, struct dentry *dentry,
++ 			     struct inode *dir, struct ceph_path_info *path_info,
++ 			     bool parent_locked)
+++>>>>>>> 15f519e9f883 (ceph: fix race condition validating r_parent before applying state)
+  {
+  	char *path;
+  
+@@@ -2786,18 -2848,18 +2817,21 @@@
+  		return 0;
+  	}
+  	rcu_read_unlock();
+++<<<<<<< HEAD
+ +	path = ceph_mdsc_build_path(dentry, ppathlen, pino, 1);
+++=======
++ 	path = ceph_mdsc_build_path(mdsc, dentry, path_info, 1);
+++>>>>>>> 15f519e9f883 (ceph: fix race condition validating r_parent before applying state)
+  	if (IS_ERR(path))
+  		return PTR_ERR(path);
+- 	*ppath = path;
+- 	*pfreepath = true;
++ 	/*
++ 	 * ceph_mdsc_build_path already fills path_info, including snap handling.
++ 	 */
+  	return 0;
+  }
+  
+- static int build_inode_path(struct inode *inode,
+- 			    const char **ppath, int *ppathlen, u64 *pino,
+- 			    bool *pfreepath)
++ static int build_inode_path(struct inode *inode, struct ceph_path_info *path_info)
+  {
+ -	struct ceph_mds_client *mdsc = ceph_sb_to_mdsc(inode->i_sb);
+  	struct dentry *dentry;
+  	char *path;
+  
+@@@ -2807,7 -2871,7 +2843,11 @@@
+  		return 0;
+  	}
+  	dentry = d_find_alias(inode);
+++<<<<<<< HEAD
+ +	path = ceph_mdsc_build_path(dentry, ppathlen, pino, 1);
+++=======
++ 	path = ceph_mdsc_build_path(mdsc, dentry, path_info, 1);
+++>>>>>>> 15f519e9f883 (ceph: fix race condition validating r_parent before applying state)
+  	dput(dentry);
+  	if (IS_ERR(path))
+  		return PTR_ERR(path);
+@@@ -2820,27 -2887,34 +2863,56 @@@
+   * request arguments may be specified via an inode *, a dentry *, or
+   * an explicit ino+path.
+   */
+++<<<<<<< HEAD
+ +static int set_request_path_attr(struct inode *rinode, struct dentry *rdentry,
+ +				  struct inode *rdiri, const char *rpath,
+ +				  u64 rino, const char **ppath, int *pathlen,
+ +				  u64 *ino, bool *freepath, bool parent_locked)
+++=======
++ static int set_request_path_attr(struct ceph_mds_client *mdsc, struct inode *rinode,
++ 				 struct dentry *rdentry, struct inode *rdiri,
++ 				 const char *rpath, u64 rino,
++ 				 struct ceph_path_info *path_info,
++ 				 bool parent_locked)
+++>>>>>>> 15f519e9f883 (ceph: fix race condition validating r_parent before applying state)
+  {
+ -	struct ceph_client *cl = mdsc->fsc->client;
+  	int r = 0;
+  
++ 	/* Initialize the output structure */
++ 	memset(path_info, 0, sizeof(*path_info));
++ 
+  	if (rinode) {
+++<<<<<<< HEAD
+ +		r = build_inode_path(rinode, ppath, pathlen, ino, freepath);
+ +		dout(" inode %p %llx.%llx\n", rinode, ceph_ino(rinode),
+ +		     ceph_snap(rinode));
+ +	} else if (rdentry) {
+ +		r = build_dentry_path(rdentry, rdiri, ppath, pathlen, ino,
+ +					freepath, parent_locked);
+ +		dout(" dentry %p %llx/%.*s\n", rdentry, *ino, *pathlen,
+ +		     *ppath);
+ +	} else if (rpath || rino) {
+ +		*ino = rino;
+ +		*ppath = rpath;
+ +		*pathlen = rpath ? strlen(rpath) : 0;
+ +		dout(" path %.*s\n", *pathlen, rpath);
+++=======
++ 		r = build_inode_path(rinode, path_info);
++ 		doutc(cl, " inode %p %llx.%llx\n", rinode, ceph_ino(rinode),
++ 		      ceph_snap(rinode));
++ 	} else if (rdentry) {
++ 		r = build_dentry_path(mdsc, rdentry, rdiri, path_info, parent_locked);
++ 		doutc(cl, " dentry %p %llx/%.*s\n", rdentry, path_info->vino.ino,
++ 		      path_info->pathlen, path_info->path);
++ 	} else if (rpath || rino) {
++ 		path_info->vino.ino = rino;
++ 		path_info->vino.snap = CEPH_NOSNAP;
++ 		path_info->path = rpath;
++ 		path_info->pathlen = rpath ? strlen(rpath) : 0;
++ 		path_info->freepath = false;
++ 
++ 		doutc(cl, " path %.*s\n", path_info->pathlen, rpath);
+++>>>>>>> 15f519e9f883 (ceph: fix race condition validating r_parent before applying state)
+  	}
+  
+  	return r;
+@@@ -2891,25 -2988,25 +2963,42 @@@ static struct ceph_msg *create_request_
+  {
+  	int mds = session->s_mds;
+  	struct ceph_mds_client *mdsc = session->s_mdsc;
+ -	struct ceph_client *cl = mdsc->fsc->client;
+  	struct ceph_msg *msg;
+++<<<<<<< HEAD
+ +	struct ceph_mds_request_head_old *head;
+ +	const char *path1 = NULL;
+ +	const char *path2 = NULL;
+ +	u64 ino1 = 0, ino2 = 0;
+ +	int pathlen1 = 0, pathlen2 = 0;
+ +	bool freepath1 = false, freepath2 = false;
+++=======
++ 	struct ceph_mds_request_head_legacy *lhead;
++ 	struct ceph_path_info path_info1 = {0};
++ 	struct ceph_path_info path_info2 = {0};
+++>>>>>>> 15f519e9f883 (ceph: fix race condition validating r_parent before applying state)
+  	struct dentry *old_dentry = NULL;
+  	int len;
+  	u16 releases;
+  	void *p, *end;
+  	int ret;
+  	bool legacy = !(session->s_con.peer_features & CEPH_FEATURE_FS_BTIME);
+++<<<<<<< HEAD
+ +
+ +	ret = set_request_path_attr(req->r_inode, req->r_dentry,
+ +			      req->r_parent, req->r_path1, req->r_ino1.ino,
+ +			      &path1, &pathlen1, &ino1, &freepath1,
+ +			      test_bit(CEPH_MDS_R_PARENT_LOCKED,
+ +					&req->r_req_flags));
+++=======
++ 	u16 request_head_version = mds_supported_head_version(session);
++ 	kuid_t caller_fsuid = req->r_cred->fsuid;
++ 	kgid_t caller_fsgid = req->r_cred->fsgid;
++ 	bool parent_locked = test_bit(CEPH_MDS_R_PARENT_LOCKED, &req->r_req_flags);
++ 
++ 	ret = set_request_path_attr(mdsc, req->r_inode, req->r_dentry,
++ 				    req->r_parent, req->r_path1, req->r_ino1.ino,
++ 				    &path_info1, parent_locked);
+++>>>>>>> 15f519e9f883 (ceph: fix race condition validating r_parent before applying state)
+  	if (ret < 0) {
+  		msg = ERR_PTR(ret);
+  		goto out;
+@@@ -2919,10 -3041,10 +3033,17 @@@
+  	if (req->r_old_dentry &&
+  	    !(req->r_old_dentry->d_flags & DCACHE_DISCONNECTED))
+  		old_dentry = req->r_old_dentry;
+++<<<<<<< HEAD
+ +	ret = set_request_path_attr(NULL, old_dentry,
+ +			      req->r_old_dentry_dir,
+ +			      req->r_path2, req->r_ino2.ino,
+ +			      &path2, &pathlen2, &ino2, &freepath2, true);
+++=======
++ 	ret = set_request_path_attr(mdsc, NULL, old_dentry,
++ 				    req->r_old_dentry_dir,
++ 				    req->r_path2, req->r_ino2.ino,
++ 				    &path_info2, true);
+++>>>>>>> 15f519e9f883 (ceph: fix race condition validating r_parent before applying state)
+  	if (ret < 0) {
+  		msg = ERR_PTR(ret);
+  		goto out_free1;
+@@@ -2999,17 -3189,17 +3120,17 @@@
+  
+  	end = msg->front.iov_base + msg->front.iov_len;
+  
+ -	lhead->mdsmap_epoch = cpu_to_le32(mdsc->mdsmap->m_epoch);
+ -	lhead->op = cpu_to_le32(req->r_op);
+ -	lhead->caller_uid = cpu_to_le32(from_kuid(&init_user_ns,
+ -						  caller_fsuid));
+ -	lhead->caller_gid = cpu_to_le32(from_kgid(&init_user_ns,
+ -						  caller_fsgid));
+ -	lhead->ino = cpu_to_le64(req->r_deleg_ino);
+ -	lhead->args = req->r_args;
+ +	head->mdsmap_epoch = cpu_to_le32(mdsc->mdsmap->m_epoch);
+ +	head->op = cpu_to_le32(req->r_op);
+ +	head->caller_uid = cpu_to_le32(from_kuid(&init_user_ns,
+ +						 req->r_cred->fsuid));
+ +	head->caller_gid = cpu_to_le32(from_kgid(&init_user_ns,
+ +						 req->r_cred->fsgid));
+ +	head->ino = cpu_to_le64(req->r_deleg_ino);
+ +	head->args = req->r_args;
+  
+- 	ceph_encode_filepath(&p, end, ino1, path1);
+- 	ceph_encode_filepath(&p, end, ino2, path2);
++ 	ceph_encode_filepath(&p, end, path_info1.vino.ino, path_info1.path);
++ 	ceph_encode_filepath(&p, end, path_info2.vino.ino, path_info2.path);
+  
+  	/* make note of release offset, in case we need to replay */
+  	req->r_request_release_offset = p - msg->front.iov_base;
+@@@ -4331,7 -4628,7 +4449,11 @@@ static int reconnect_caps_cb(struct ino
+  	dentry = d_find_primary(inode);
+  	if (dentry) {
+  		/* set pathbase to parent dir when msg_version >= 2 */
+++<<<<<<< HEAD
+ +		path = ceph_mdsc_build_path(dentry, &pathlen, &pathbase,
+++=======
++ 		char *path = ceph_mdsc_build_path(mdsc, dentry, &path_info,
+++>>>>>>> 15f519e9f883 (ceph: fix race condition validating r_parent before applying state)
+  					    recon_state->msg_version >= 2);
+  		dput(dentry);
+  		if (IS_ERR(path)) {
+@@@ -4381,10 -4677,12 +4500,10 @@@
+  		rec.v1.wanted = cpu_to_le32(__ceph_caps_wanted(ci));
+  		rec.v1.issued = cpu_to_le32(cap->issued);
+  		rec.v1.size = cpu_to_le64(i_size_read(inode));
+ -		ts = inode_get_mtime(inode);
+ -		ceph_encode_timespec64(&rec.v1.mtime, &ts);
+ -		ts = inode_get_atime(inode);
+ -		ceph_encode_timespec64(&rec.v1.atime, &ts);
+ +		ceph_encode_timespec64(&rec.v1.mtime, &inode->i_mtime);
+ +		ceph_encode_timespec64(&rec.v1.atime, &inode->i_atime);
+  		rec.v1.snaprealm = cpu_to_le64(ci->i_snap_realm->ino);
+- 		rec.v1.pathbase = cpu_to_le64(pathbase);
++ 		rec.v1.pathbase = cpu_to_le64(path_info.vino.ino);
+  	}
+  
+  	if (list_empty(&ci->i_cap_snaps)) {
+diff --cc fs/ceph/mds_client.h
+index b45ce3fa8790,0428a5eaf28c..000000000000
+--- a/fs/ceph/mds_client.h
++++ b/fs/ceph/mds_client.h
+@@@ -575,15 -612,29 +575,30 @@@ extern void ceph_queue_cap_unlink_work(
+  extern int ceph_iterate_session_caps(struct ceph_mds_session *session,
+  				     int (*cb)(struct inode *, int mds, void *),
+  				     void *arg);
+ -extern int ceph_mds_check_access(struct ceph_mds_client *mdsc, char *tpath,
+ -				 int mask);
+ -
+  extern void ceph_mdsc_pre_umount(struct ceph_mds_client *mdsc);
+  
+- static inline void ceph_mdsc_free_path(char *path, int len)
++ /*
++  * Structure to group path-related output parameters for build_*_path functions
++  */
++ struct ceph_path_info {
++ 	const char *path;
++ 	int pathlen;
++ 	struct ceph_vino vino;
++ 	bool freepath;
++ };
++ 
++ static inline void ceph_mdsc_free_path_info(const struct ceph_path_info *path_info)
+  {
+- 	if (!IS_ERR_OR_NULL(path))
+- 		__putname(path - (PATH_MAX - 1 - len));
++ 	if (path_info && path_info->freepath && !IS_ERR_OR_NULL(path_info->path))
++ 		__putname((char *)path_info->path - (PATH_MAX - 1 - path_info->pathlen));
+  }
+  
+++<<<<<<< HEAD
+ +extern char *ceph_mdsc_build_path(struct dentry *dentry, int *plen, u64 *base,
+++=======
++ extern char *ceph_mdsc_build_path(struct ceph_mds_client *mdsc,
++ 				  struct dentry *dentry, struct ceph_path_info *path_info,
+++>>>>>>> 15f519e9f883 (ceph: fix race condition validating r_parent before applying state)
+  				  int for_wire);
+  
+  extern void __ceph_mdsc_drop_dentry_lease(struct dentry *dentry);
+* Unmerged path fs/ceph/debugfs.c
+* Unmerged path fs/ceph/dir.c
+* Unmerged path fs/ceph/file.c
+* Unmerged path fs/ceph/inode.c
+* Unmerged path fs/ceph/mds_client.c
+* Unmerged path fs/ceph/mds_client.h
