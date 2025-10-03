@@ -1,0 +1,277 @@
+xfs: fix error returns from xfs_bmapi_write
+
+jira LE-4321
+Rebuild_History Non-Buildable kernel-4.18.0-553.76.1.el8_10
+commit-author Christoph Hellwig <hch@lst.de>
+commit 6773da870ab89123d1b513da63ed59e32a29cb77
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.76.1.el8_10/6773da87.failed
+
+xfs_bmapi_write can return 0 without actually returning a mapping in
+mval in two different cases:
+
+ 1) when there is absolutely no space available to do an allocation
+ 2) when converting delalloc space, and the allocation is so small
+    that it only covers parts of the delalloc extent before the
+    range requested by the caller
+
+Callers at best can handle one of these cases, but in many cases can't
+cope with either one.  Switch xfs_bmapi_write to always return a
+mapping or return an error code instead.  For case 1) above ENOSPC is
+the obvious choice which is very much what the callers expect anyway.
+For case 2) there is no really good error code, so pick a funky one
+from the SysV streams portfolio.
+
+This fixes the reproducer here:
+
+    https://lore.kernel.org/linux-xfs/CAEJPjCvT3Uag-pMTYuigEjWZHn1sGMZ0GCjVVCv29tNHK76Cgg@mail.gmail.com0/
+
+which uses reserved blocks to create file systems that are gravely
+out of space and thus cause at least xfs_file_alloc_space to hang
+and trigger the lack of ENOSPC handling in xfs_dquot_disk_alloc.
+
+Note that this patch does not actually make any caller but
+xfs_alloc_file_space deal intelligently with case 2) above.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reported-by: 刘通 <lyutoon@gmail.com>
+	Reviewed-by: "Darrick J. Wong" <djwong@kernel.org>
+	Signed-off-by: Chandan Babu R <chandanbabu@kernel.org>
+(cherry picked from commit 6773da870ab89123d1b513da63ed59e32a29cb77)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_bmap.c
+#	fs/xfs/scrub/quota_repair.c
+#	fs/xfs/scrub/rtbitmap_repair.c
+#	fs/xfs/xfs_iomap.c
+diff --cc fs/xfs/libxfs/xfs_bmap.c
+index e4c9d0ba25a2,14c9781ec0ce..000000000000
+--- a/fs/xfs/libxfs/xfs_bmap.c
++++ b/fs/xfs/libxfs/xfs_bmap.c
+@@@ -4579,12 -4716,11 +4610,18 @@@ xfs_bmapi_convert_delalloc
+  	if (error)
+  		goto out_finish;
+  
+++<<<<<<< HEAD
+ +	error = -ENOSPC;
+ +	if (WARN_ON_ONCE(bma.blkno == NULLFSBLOCK))
+ +		goto out_finish;
+ +	error = -EFSCORRUPTED;
+ +	if (WARN_ON_ONCE(!xfs_valid_startblock(ip, bma.got.br_startblock)))
+++=======
++ 	if (WARN_ON_ONCE(!xfs_valid_startblock(ip, bma.got.br_startblock))) {
++ 		xfs_bmap_mark_sick(ip, whichfork);
++ 		error = -EFSCORRUPTED;
+++>>>>>>> 6773da870ab8 (xfs: fix error returns from xfs_bmapi_write)
+  		goto out_finish;
+ -	}
+  
+  	XFS_STATS_ADD(mp, xs_xstrat_bytes, XFS_FSB_TO_B(mp, bma.length));
+  	XFS_STATS_INC(mp, xs_xstrat_quick);
+diff --cc fs/xfs/xfs_iomap.c
+index 30306bbdd059,f5d0ed45721b..000000000000
+--- a/fs/xfs/xfs_iomap.c
++++ b/fs/xfs/xfs_iomap.c
+@@@ -300,16 -322,10 +300,21 @@@ xfs_iomap_write_direct
+  	if (error)
+  		goto out_unlock;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Copy any maps to caller's array and return any error.
+ +	 */
+ +	if (nimaps == 0) {
+ +		error = -ENOSPC;
+ +		goto out_unlock;
+ +	}
+ +
+ +	if (unlikely(!xfs_valid_startblock(ip, imap->br_startblock)))
+++=======
++ 	if (unlikely(!xfs_valid_startblock(ip, imap->br_startblock))) {
++ 		xfs_bmap_mark_sick(ip, XFS_DATA_FORK);
+++>>>>>>> 6773da870ab8 (xfs: fix error returns from xfs_bmapi_write)
+  		error = xfs_alert_fsblock_zero(ip, imap);
+ -	}
+  
+  out_unlock:
+  	*seq = xfs_iomap_inode_sequence(ip, 0);
+* Unmerged path fs/xfs/scrub/quota_repair.c
+* Unmerged path fs/xfs/scrub/rtbitmap_repair.c
+diff --git a/fs/xfs/libxfs/xfs_attr_remote.c b/fs/xfs/libxfs/xfs_attr_remote.c
+index 0c8bee3abc3b..d21ed06642f9 100644
+--- a/fs/xfs/libxfs/xfs_attr_remote.c
++++ b/fs/xfs/libxfs/xfs_attr_remote.c
+@@ -613,7 +613,6 @@ xfs_attr_rmtval_set_blk(
+ 	if (error)
+ 		return error;
+ 
+-	ASSERT(nmap == 1);
+ 	ASSERT((map->br_startblock != DELAYSTARTBLOCK) &&
+ 	       (map->br_startblock != HOLESTARTBLOCK));
+ 
+* Unmerged path fs/xfs/libxfs/xfs_bmap.c
+diff --git a/fs/xfs/libxfs/xfs_da_btree.c b/fs/xfs/libxfs/xfs_da_btree.c
+index 747ec77912c3..906a60e9355e 100644
+--- a/fs/xfs/libxfs/xfs_da_btree.c
++++ b/fs/xfs/libxfs/xfs_da_btree.c
+@@ -2146,8 +2146,8 @@ xfs_da_grow_inode_int(
+ 	struct xfs_inode	*dp = args->dp;
+ 	int			w = args->whichfork;
+ 	xfs_rfsblock_t		nblks = dp->i_nblocks;
+-	struct xfs_bmbt_irec	map, *mapp;
+-	int			nmap, error, got, i, mapi;
++	struct xfs_bmbt_irec	map, *mapp = &map;
++	int			nmap, error, got, i, mapi = 1;
+ 
+ 	/*
+ 	 * Find a spot in the file space to put the new block.
+@@ -2163,14 +2163,7 @@ xfs_da_grow_inode_int(
+ 	error = xfs_bmapi_write(tp, dp, *bno, count,
+ 			xfs_bmapi_aflag(w)|XFS_BMAPI_METADATA|XFS_BMAPI_CONTIG,
+ 			args->total, &map, &nmap);
+-	if (error)
+-		return error;
+-
+-	ASSERT(nmap <= 1);
+-	if (nmap == 1) {
+-		mapp = &map;
+-		mapi = 1;
+-	} else if (nmap == 0 && count > 1) {
++	if (error == -ENOSPC && count > 1) {
+ 		xfs_fileoff_t		b;
+ 		int			c;
+ 
+@@ -2187,16 +2180,13 @@ xfs_da_grow_inode_int(
+ 					args->total, &mapp[mapi], &nmap);
+ 			if (error)
+ 				goto out_free_map;
+-			if (nmap < 1)
+-				break;
+ 			mapi += nmap;
+ 			b = mapp[mapi - 1].br_startoff +
+ 			    mapp[mapi - 1].br_blockcount;
+ 		}
+-	} else {
+-		mapi = 0;
+-		mapp = NULL;
+ 	}
++	if (error)
++		goto out_free_map;
+ 
+ 	/*
+ 	 * Count the blocks we got, make sure it matches the total.
+* Unmerged path fs/xfs/scrub/quota_repair.c
+* Unmerged path fs/xfs/scrub/rtbitmap_repair.c
+diff --git a/fs/xfs/xfs_bmap_util.c b/fs/xfs/xfs_bmap_util.c
+index a6e40c35e9f1..afcbcf308c46 100644
+--- a/fs/xfs/xfs_bmap_util.c
++++ b/fs/xfs/xfs_bmap_util.c
+@@ -861,33 +861,32 @@ xfs_alloc_file_space(
+ 		if (error)
+ 			goto error;
+ 
+-		error = xfs_bmapi_write(tp, ip, startoffset_fsb,
+-				allocatesize_fsb, XFS_BMAPI_PREALLOC, 0, imapp,
+-				&nimaps);
+-		if (error)
+-			goto error;
+-
+-		ip->i_diflags |= XFS_DIFLAG_PREALLOC;
+-		xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
+-
+-		error = xfs_trans_commit(tp);
+-		xfs_iunlock(ip, XFS_ILOCK_EXCL);
+-		if (error)
+-			break;
+-
+ 		/*
+ 		 * If the allocator cannot find a single free extent large
+ 		 * enough to cover the start block of the requested range,
+-		 * xfs_bmapi_write will return 0 but leave *nimaps set to 0.
++		 * xfs_bmapi_write will return -ENOSR.
+ 		 *
+ 		 * In that case we simply need to keep looping with the same
+ 		 * startoffset_fsb so that one of the following allocations
+ 		 * will eventually reach the requested range.
+ 		 */
+-		if (nimaps) {
++		error = xfs_bmapi_write(tp, ip, startoffset_fsb,
++				allocatesize_fsb, XFS_BMAPI_PREALLOC, 0, imapp,
++				&nimaps);
++		if (error) {
++			if (error != -ENOSR)
++				goto error;
++			error = 0;
++		} else {
+ 			startoffset_fsb += imapp->br_blockcount;
+ 			allocatesize_fsb -= imapp->br_blockcount;
+ 		}
++
++		ip->i_diflags |= XFS_DIFLAG_PREALLOC;
++		xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
++
++		error = xfs_trans_commit(tp);
++		xfs_iunlock(ip, XFS_ILOCK_EXCL);
+ 	}
+ 
+ 	return error;
+diff --git a/fs/xfs/xfs_dquot.c b/fs/xfs/xfs_dquot.c
+index dd541eaca818..2ec2e903dc0b 100644
+--- a/fs/xfs/xfs_dquot.c
++++ b/fs/xfs/xfs_dquot.c
+@@ -328,7 +328,6 @@ xfs_dquot_disk_alloc(
+ 	if (error)
+ 		return error;
+ 	ASSERT(map.br_blockcount == XFS_DQUOT_CLUSTER_SIZE_FSB);
+-	ASSERT(nmaps == 1);
+ 	ASSERT((map.br_startblock != DELAYSTARTBLOCK) &&
+ 	       (map.br_startblock != HOLESTARTBLOCK));
+ 
+* Unmerged path fs/xfs/xfs_iomap.c
+diff --git a/fs/xfs/xfs_reflink.c b/fs/xfs/xfs_reflink.c
+index ae0964ec5909..c782b20af3f1 100644
+--- a/fs/xfs/xfs_reflink.c
++++ b/fs/xfs/xfs_reflink.c
+@@ -428,13 +428,6 @@ xfs_reflink_fill_cow_hole(
+ 	if (error)
+ 		return error;
+ 
+-	/*
+-	 * Allocation succeeded but the requested range was not even partially
+-	 * satisfied?  Bail out!
+-	 */
+-	if (nimaps == 0)
+-		return -ENOSPC;
+-
+ convert:
+ 	return xfs_reflink_convert_unwritten(ip, imap, cmap, convert_now);
+ 
+@@ -497,13 +490,6 @@ xfs_reflink_fill_delalloc(
+ 		error = xfs_trans_commit(tp);
+ 		if (error)
+ 			return error;
+-
+-		/*
+-		 * Allocation succeeded but the requested range was not even
+-		 * partially satisfied?  Bail out!
+-		 */
+-		if (nimaps == 0)
+-			return -ENOSPC;
+ 	} while (cmap->br_startoff + cmap->br_blockcount <= imap->br_startoff);
+ 
+ 	return xfs_reflink_convert_unwritten(ip, imap, cmap, convert_now);
+diff --git a/fs/xfs/xfs_rtalloc.c b/fs/xfs/xfs_rtalloc.c
+index 699066fb9052..32ee98725f54 100644
+--- a/fs/xfs/xfs_rtalloc.c
++++ b/fs/xfs/xfs_rtalloc.c
+@@ -815,8 +815,6 @@ xfs_growfs_rt_alloc(
+ 		nmap = 1;
+ 		error = xfs_bmapi_write(tp, ip, oblocks, nblocks - oblocks,
+ 					XFS_BMAPI_METADATA, 0, &map, &nmap);
+-		if (!error && nmap < 1)
+-			error = -ENOSPC;
+ 		if (error)
+ 			goto out_trans_cancel;
+ 		/*
