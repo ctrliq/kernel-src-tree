@@ -1,0 +1,286 @@
+net: introduce per netns packet chains
+
+jira LE-4311
+Rebuild_History Non-Buildable kernel-5.14.0-570.46.1.el9_6
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit c353e8983e0dea5dbba7789033326e1ad34135b7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-570.46.1.el9_6/c353e898.failed
+
+Currently network taps unbound to any interface are linked in the
+global ptype_all list, affecting the performance in all the network
+namespaces.
+
+Add per netns ptypes chains, so that in the mentioned case only
+the netns owning the packet socket(s) is affected.
+
+While at that drop the global ptype_all list: no in kernel user
+registers a tap on "any" type without specifying either the target
+device or the target namespace (and IMHO doing that would not make
+any sense).
+
+Note that this adds a conditional in the fast path (to check for
+per netns ptype_specific list) and increases the dataset size by
+a cacheline (owing the per netns lists).
+
+	Reviewed-by: Sabrina Dubroca <sd@queasysnail.net>
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Reviewed-by: Eric Dumazet <edumaze@google.com>
+Link: https://patch.msgid.link/ae405f98875ee87f8150c460ad162de7e466f8a7.1742494826.git.pabeni@redhat.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit c353e8983e0dea5dbba7789033326e1ad34135b7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/hotdata.h
+#	net/core/dev.c
+#	net/core/hotdata.c
+#	net/core/net-procfs.c
+#	net/core/net_namespace.c
+diff --cc net/core/dev.c
+index d16786a809da,bcf81c3ff6a3..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -569,10 -572,18 +569,25 @@@ static inline void netdev_set_addr_lock
+  
+  static inline struct list_head *ptype_head(const struct packet_type *pt)
+  {
+++<<<<<<< HEAD
+ +	if (pt->type == htons(ETH_P_ALL))
+ +		return pt->dev ? &pt->dev->ptype_all : &ptype_all;
+ +	else
+ +		return pt->dev ? &pt->dev->ptype_specific :
+++=======
++ 	if (pt->type == htons(ETH_P_ALL)) {
++ 		if (!pt->af_packet_net && !pt->dev)
++ 			return NULL;
++ 
++ 		return pt->dev ? &pt->dev->ptype_all :
++ 				 &pt->af_packet_net->ptype_all;
++ 	}
++ 
++ 	if (pt->dev)
++ 		return &pt->dev->ptype_specific;
++ 
++ 	return pt->af_packet_net ? &pt->af_packet_net->ptype_specific :
+++>>>>>>> c353e8983e0d (net: introduce per netns packet chains)
+  				 &ptype_base[ntohs(pt->type) & PTYPE_HASH_MASK];
+  }
+  
+@@@ -2305,11 -2461,15 +2328,19 @@@ static inline bool skb_loop_sk(struct p
+   *
+   * @dev: network device to check for the presence of taps
+   */
+- bool dev_nit_active(struct net_device *dev)
++ bool dev_nit_active_rcu(const struct net_device *dev)
+  {
+++<<<<<<< HEAD
+ +	return !list_empty(&ptype_all) || !list_empty(&dev->ptype_all);
+++=======
++ 	/* Callers may hold either RCU or RCU BH lock */
++ 	WARN_ON_ONCE(!rcu_read_lock_held() && !rcu_read_lock_bh_held());
++ 
++ 	return !list_empty(&dev_net(dev)->ptype_all) ||
++ 	       !list_empty(&dev->ptype_all);
+++>>>>>>> c353e8983e0d (net: introduce per netns packet chains)
+  }
+- EXPORT_SYMBOL_GPL(dev_nit_active);
++ EXPORT_SYMBOL_GPL(dev_nit_active_rcu);
+  
+  /*
+   *	Support routine. Sends outgoing frames to any network
+@@@ -2318,12 -2478,12 +2349,18 @@@
+  
+  void dev_queue_xmit_nit(struct sk_buff *skb, struct net_device *dev)
+  {
+++<<<<<<< HEAD
+ +	struct packet_type *ptype;
+++=======
++ 	struct packet_type *ptype, *pt_prev = NULL;
++ 	struct list_head *ptype_list;
+++>>>>>>> c353e8983e0d (net: introduce per netns packet chains)
+  	struct sk_buff *skb2 = NULL;
+ +	struct packet_type *pt_prev = NULL;
+ +	struct list_head *ptype_list = &ptype_all;
+  
+  	rcu_read_lock();
++ 	ptype_list = &dev_net_rcu(dev)->ptype_all;
+  again:
+  	list_for_each_entry_rcu(ptype, ptype_list, list) {
+  		if (READ_ONCE(ptype->ignore_outgoing))
+@@@ -2367,7 -2527,7 +2404,11 @@@
+  		pt_prev = ptype;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (ptype_list == &ptype_all) {
+++=======
++ 	if (ptype_list != &dev->ptype_all) {
+++>>>>>>> c353e8983e0d (net: introduce per netns packet chains)
+  		ptype_list = &dev->ptype_all;
+  		goto again;
+  	}
+@@@ -5445,7 -5716,8 +5486,12 @@@ another_round
+  	if (pfmemalloc)
+  		goto skip_taps;
+  
+++<<<<<<< HEAD
+ +	list_for_each_entry_rcu(ptype, &ptype_all, list) {
+++=======
++ 	list_for_each_entry_rcu(ptype, &dev_net_rcu(skb->dev)->ptype_all,
++ 				list) {
+++>>>>>>> c353e8983e0d (net: introduce per netns packet chains)
+  		if (pt_prev)
+  			ret = deliver_skb(skb, pt_prev, orig_dev);
+  		pt_prev = ptype;
+diff --cc net/core/net-procfs.c
+index f6aa2f227416,3e92bf0f9060..000000000000
+--- a/net/core/net-procfs.c
++++ b/net/core/net-procfs.c
+@@@ -175,7 -185,13 +175,17 @@@ static void *ptype_get_idx(struct seq_f
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	list_for_each_entry_rcu(pt, &ptype_all, list) {
+++=======
++ 	list_for_each_entry_rcu(pt, &seq_file_net(seq)->ptype_all, list) {
++ 		if (i == pos)
++ 			return pt;
++ 		++i;
++ 	}
++ 
++ 	list_for_each_entry_rcu(pt, &seq_file_net(seq)->ptype_specific, list) {
+++>>>>>>> c353e8983e0d (net: introduce per netns packet chains)
+  		if (i == pos)
+  			return pt;
+  		++i;
+@@@ -222,15 -239,22 +233,33 @@@ static void *ptype_seq_next(struct seq_
+  				goto found;
+  			}
+  		}
+++<<<<<<< HEAD
+ +
+ +		nxt = ptype_all.next;
+ +		goto ptype_all;
+ +	}
+ +
+ +	if (pt->type == htons(ETH_P_ALL)) {
+ +ptype_all:
+ +		if (nxt != &ptype_all)
+++=======
++ 		nxt = net->ptype_all.next;
++ 		goto net_ptype_all;
++ 	}
++ 
++ 	if (pt->af_packet_net) {
++ net_ptype_all:
++ 		if (nxt != &net->ptype_all && nxt != &net->ptype_specific)
+++>>>>>>> c353e8983e0d (net: introduce per netns packet chains)
+  			goto found;
++ 
++ 		if (nxt == &net->ptype_all) {
++ 			/* continue with ->ptype_specific if it's not empty */
++ 			nxt = net->ptype_specific.next;
++ 			if (nxt != &net->ptype_specific)
++ 				goto found;
++ 		}
++ 
+  		hash = 0;
+  		nxt = ptype_base[0].next;
+  	} else
+diff --cc net/core/net_namespace.c
+index 9fe7ae5e1863,b0dfdf791ece..000000000000
+--- a/net/core/net_namespace.c
++++ b/net/core/net_namespace.c
+@@@ -307,10 -308,41 +307,30 @@@ struct net *get_net_ns_by_id(const stru
+  }
+  EXPORT_SYMBOL_GPL(get_net_ns_by_id);
+  
+ -static __net_init void preinit_net_sysctl(struct net *net)
+ -{
+ -	net->core.sysctl_somaxconn = SOMAXCONN;
+ -	/* Limits per socket sk_omem_alloc usage.
+ -	 * TCP zerocopy regular usage needs 128 KB.
+ -	 */
+ -	net->core.sysctl_optmem_max = 128 * 1024;
+ -	net->core.sysctl_txrehash = SOCK_TXREHASH_ENABLED;
+ -	net->core.sysctl_tstamp_allow_data = 1;
+ -}
+ -
+  /* init code that must occur even if setup_net() is not called. */
+ -static __net_init void preinit_net(struct net *net, struct user_namespace *user_ns)
+ +static __net_init void preinit_net(struct net *net)
+  {
+ -	refcount_set(&net->passive, 1);
+ -	refcount_set(&net->ns.count, 1);
+ -	ref_tracker_dir_init(&net->refcnt_tracker, 128, "net refcnt");
+  	ref_tracker_dir_init(&net->notrefcnt_tracker, 128, "net notrefcnt");
+++<<<<<<< HEAD
+++=======
++ 
++ 	get_random_bytes(&net->hash_mix, sizeof(u32));
++ 	net->dev_base_seq = 1;
++ 	net->user_ns = user_ns;
++ 
++ 	idr_init(&net->netns_ids);
++ 	spin_lock_init(&net->nsid_lock);
++ 	mutex_init(&net->ipv4.ra_mutex);
++ 
++ #ifdef CONFIG_DEBUG_NET_SMALL_RTNL
++ 	mutex_init(&net->rtnl_mutex);
++ 	lock_set_cmp_fn(&net->rtnl_mutex, rtnl_net_lock_cmp_fn, NULL);
++ #endif
++ 
++ 	INIT_LIST_HEAD(&net->ptype_all);
++ 	INIT_LIST_HEAD(&net->ptype_specific);
++ 	preinit_net_sysctl(net);
+++>>>>>>> c353e8983e0d (net: introduce per netns packet chains)
+  }
+  
+  /*
+* Unmerged path include/net/hotdata.h
+* Unmerged path net/core/hotdata.c
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 7ec2fece55e2..2bdc4e008c41 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -4157,7 +4157,17 @@ static __always_inline int ____dev_forward_skb(struct net_device *dev,
+ 	return 0;
+ }
+ 
+-bool dev_nit_active(struct net_device *dev);
++bool dev_nit_active_rcu(const struct net_device *dev);
++static inline bool dev_nit_active(const struct net_device *dev)
++{
++	bool ret;
++
++	rcu_read_lock();
++	ret = dev_nit_active_rcu(dev);
++	rcu_read_unlock();
++	return ret;
++}
++
+ void dev_queue_xmit_nit(struct sk_buff *skb, struct net_device *dev);
+ 
+ static inline void __dev_put(struct net_device *dev)
+* Unmerged path include/net/hotdata.h
+diff --git a/include/net/net_namespace.h b/include/net/net_namespace.h
+index 555688672e67..c8333556d2c0 100644
+--- a/include/net/net_namespace.h
++++ b/include/net/net_namespace.h
+@@ -83,6 +83,9 @@ struct net {
+ 	struct llist_node	defer_free_list;
+ 	struct llist_node	cleanup_list;	/* namespaces on death row */
+ 
++	struct list_head ptype_all;
++	struct list_head ptype_specific;
++
+ #ifdef CONFIG_KEYS
+ 	struct key_tag		*key_domain;	/* Key domain of operation tag */
+ #endif
+* Unmerged path net/core/dev.c
+* Unmerged path net/core/hotdata.c
+* Unmerged path net/core/net-procfs.c
+* Unmerged path net/core/net_namespace.c
