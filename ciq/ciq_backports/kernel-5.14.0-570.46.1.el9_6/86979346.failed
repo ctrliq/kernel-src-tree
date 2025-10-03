@@ -1,0 +1,115 @@
+scsi: fnic: Propagate SCSI error code from fnic_scsi_drv_init()
+
+jira LE-4311
+Rebuild_History Non-Buildable kernel-5.14.0-570.46.1.el9_6
+commit-author Arun Easi <aeasi@cisco.com>
+commit 8697934682f1873b7b1cb9cc61b81edf042c9272
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-570.46.1.el9_6/86979346.failed
+
+Propagate scsi_add_host() error instead of returning -1.
+
+	Suggested-by: Dan Carpenter <dan.carpenter@linaro.org>
+	Reviewed-by: Sesidhar Baddela <sebaddel@cisco.com>
+	Reviewed-by: Arulprabhu Ponnusamy <arulponn@cisco.com>
+	Reviewed-by: Gian Carlo Boffa <gcboffa@cisco.com>
+	Signed-off-by: Arun Easi <aeasi@cisco.com>
+	Signed-off-by: Karan Tilak Kumar <kartilak@cisco.com>
+Link: https://lore.kernel.org/r/20250110091956.17749-1-kartilak@cisco.com
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 8697934682f1873b7b1cb9cc61b81edf042c9272)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/fnic/fnic_main.c
+diff --cc drivers/scsi/fnic/fnic_main.c
+index 06fd7b543b33,2f626b860f7a..000000000000
+--- a/drivers/scsi/fnic/fnic_main.c
++++ b/drivers/scsi/fnic/fnic_main.c
+@@@ -571,23 -607,71 +571,81 @@@ static int fnic_scsi_drv_init(struct fn
+  	fnic->fnic_max_tag_id = host->can_queue;
+  	host->max_lun = fnic->config.luns_per_tgt;
+  	host->max_id = FNIC_MAX_FCP_TARGET;
+ -	host->max_cmd_len = FNIC_FCOE_MAX_CMD_LEN;
+ +	host->max_cmd_len = FCOE_MAX_CMD_LEN;
+  
+  	host->nr_hw_queues = fnic->wq_copy_count;
+ +	if (host->nr_hw_queues > 1)
+ +		shost_printk(KERN_ERR, host,
+ +				"fnic: blk-mq is not supported");
+ +
+ +	host->nr_hw_queues = fnic->wq_copy_count = 1;
+  
+ -	dev_info(&fnic->pdev->dev, "fnic: can_queue: %d max_lun: %llu",
+ +	shost_printk(KERN_INFO, host,
+ +			"fnic: can_queue: %d max_lun: %llu",
+  			host->can_queue, host->max_lun);
+  
+ -	dev_info(&fnic->pdev->dev, "fnic: max_id: %d max_cmd_len: %d nr_hw_queues: %d",
+ +	shost_printk(KERN_INFO, host,
+ +			"fnic: max_id: %d max_cmd_len: %d nr_hw_queues: %d",
+  			host->max_id, host->max_cmd_len, host->nr_hw_queues);
+  
+++<<<<<<< HEAD
+++=======
++ 	for (hwq = 0; hwq < fnic->wq_copy_count; hwq++) {
++ 		fnic->sw_copy_wq[hwq].ioreq_table_size = fnic->fnic_max_tag_id;
++ 		fnic->sw_copy_wq[hwq].io_req_table =
++ 			kzalloc((fnic->sw_copy_wq[hwq].ioreq_table_size + 1) *
++ 					sizeof(struct fnic_io_req *), GFP_KERNEL);
++ 
++ 		if (!fnic->sw_copy_wq[hwq].io_req_table) {
++ 			fnic_free_ioreq_tables_mq(fnic);
++ 			return -ENOMEM;
++ 		}
++ 	}
++ 
++ 	dev_info(&fnic->pdev->dev, "fnic copy wqs: %d, Q0 ioreq table size: %d\n",
++ 			fnic->wq_copy_count, fnic->sw_copy_wq[0].ioreq_table_size);
++ 
++ 	fnic_scsi_init(fnic);
++ 
++ 	err = scsi_add_host(fnic->host, &pdev->dev);
++ 	if (err) {
++ 		dev_err(&fnic->pdev->dev, "fnic: scsi add host failed: aborting\n");
++ 		return err;
++ 	}
++ 	fc_host_maxframe_size(fnic->host) = iport->max_payload_size;
++ 	fc_host_dev_loss_tmo(fnic->host) =
++ 		fnic->config.port_down_timeout / 1000;
++ 	sprintf(fc_host_symbolic_name(fnic->host),
++ 			DRV_NAME " v" DRV_VERSION " over %s", fnic->name);
++ 	fc_host_port_type(fnic->host) = FC_PORTTYPE_NPORT;
++ 	fc_host_node_name(fnic->host) = iport->wwnn;
++ 	fc_host_port_name(fnic->host) = iport->wwpn;
++ 	fc_host_supported_classes(fnic->host) = FC_COS_CLASS3;
++ 	memset(fc_host_supported_fc4s(fnic->host), 0,
++ 		   sizeof(fc_host_supported_fc4s(fnic->host)));
++ 	fc_host_supported_fc4s(fnic->host)[2] = 1;
++ 	fc_host_supported_fc4s(fnic->host)[7] = 1;
++ 	fc_host_supported_speeds(fnic->host) = 0;
++ 	fc_host_supported_speeds(fnic->host) |= FC_PORTSPEED_8GBIT;
++ 
++ 	dev_info(&fnic->pdev->dev, "shost_data: 0x%p\n", fnic->host->shost_data);
++ 	if (fnic->host->shost_data != NULL) {
++ 		if (fnic_tgt_id_binding == 0) {
++ 			dev_info(&fnic->pdev->dev, "Setting target binding to NONE\n");
++ 			fc_host_tgtid_bind_type(fnic->host) = FC_TGTID_BIND_NONE;
++ 		} else {
++ 			dev_info(&fnic->pdev->dev, "Setting target binding to WWPN\n");
++ 			fc_host_tgtid_bind_type(fnic->host) = FC_TGTID_BIND_BY_WWPN;
++ 		}
++ 	}
++ 
++ 	fnic->io_req_pool = mempool_create_slab_pool(2, fnic_io_req_cache);
++ 	if (!fnic->io_req_pool) {
++ 		scsi_remove_host(fnic->host);
++ 		return -ENOMEM;
++ 	}
++ 
+++>>>>>>> 8697934682f1 (scsi: fnic: Propagate SCSI error code from fnic_scsi_drv_init())
+  	return 0;
+  }
+  
+* Unmerged path drivers/scsi/fnic/fnic_main.c
