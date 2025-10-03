@@ -1,0 +1,279 @@
+tracing: Disable interrupt or preemption before acquiring arch_spinlock_t
+
+jira LE-4321
+Rebuild_History Non-Buildable kernel-4.18.0-553.76.1.el8_10
+Rebuild_CHGLOG: - tracing: Disable interrupt or preemption before acquiring arch_spinlock_t (partial) (Luis Claudio R. Goncalves) [RHEL-95713]
+Rebuild_FUZZ: 93.59%
+commit-author Waiman Long <longman@redhat.com>
+commit c0a581d7126c0bbc96163276f585fd7b4e4d8d0e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.76.1.el8_10/c0a581d7.failed
+
+It was found that some tracing functions in kernel/trace/trace.c acquire
+an arch_spinlock_t with preemption and irqs enabled. An example is the
+tracing_saved_cmdlines_size_read() function which intermittently causes
+a "BUG: using smp_processor_id() in preemptible" warning when the LTP
+read_all_proc test is run.
+
+That can be problematic in case preemption happens after acquiring the
+lock. Add the necessary preemption or interrupt disabling code in the
+appropriate places before acquiring an arch_spinlock_t.
+
+The convention here is to disable preemption for trace_cmdline_lock and
+interupt for max_lock.
+
+Link: https://lkml.kernel.org/r/20220922145622.1744826-1-longman@redhat.com
+
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Will Deacon <will@kernel.org>
+	Cc: Boqun Feng <boqun.feng@gmail.com>
+	Cc: stable@vger.kernel.org
+Fixes: a35873a0993b ("tracing: Add conditional snapshot")
+Fixes: 939c7a4f04fc ("tracing: Introduce saved_cmdlines_size file")
+	Suggested-by: Steven Rostedt <rostedt@goodmis.org>
+	Signed-off-by: Waiman Long <longman@redhat.com>
+	Signed-off-by: Steven Rostedt (Google) <rostedt@goodmis.org>
+(cherry picked from commit c0a581d7126c0bbc96163276f585fd7b4e4d8d0e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/trace/trace.c
+diff --cc kernel/trace/trace.c
+index 6bd22b13d8d9,aed7ea6e6045..000000000000
+--- a/kernel/trace/trace.c
++++ b/kernel/trace/trace.c
+@@@ -1086,6 -1156,56 +1086,59 @@@ void tracing_snapshot(void
+  }
+  EXPORT_SYMBOL_GPL(tracing_snapshot);
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * tracing_snapshot_cond - conditionally take a snapshot of the current buffer.
++  * @tr:		The tracing instance to snapshot
++  * @cond_data:	The data to be tested conditionally, and possibly saved
++  *
++  * This is the same as tracing_snapshot() except that the snapshot is
++  * conditional - the snapshot will only happen if the
++  * cond_snapshot.update() implementation receiving the cond_data
++  * returns true, which means that the trace array's cond_snapshot
++  * update() operation used the cond_data to determine whether the
++  * snapshot should be taken, and if it was, presumably saved it along
++  * with the snapshot.
++  */
++ void tracing_snapshot_cond(struct trace_array *tr, void *cond_data)
++ {
++ 	tracing_snapshot_instance_cond(tr, cond_data);
++ }
++ EXPORT_SYMBOL_GPL(tracing_snapshot_cond);
++ 
++ /**
++  * tracing_cond_snapshot_data - get the user data associated with a snapshot
++  * @tr:		The tracing instance
++  *
++  * When the user enables a conditional snapshot using
++  * tracing_snapshot_cond_enable(), the user-defined cond_data is saved
++  * with the snapshot.  This accessor is used to retrieve it.
++  *
++  * Should not be called from cond_snapshot.update(), since it takes
++  * the tr->max_lock lock, which the code calling
++  * cond_snapshot.update() has already done.
++  *
++  * Returns the cond_data associated with the trace array's snapshot.
++  */
++ void *tracing_cond_snapshot_data(struct trace_array *tr)
++ {
++ 	void *cond_data = NULL;
++ 
++ 	local_irq_disable();
++ 	arch_spin_lock(&tr->max_lock);
++ 
++ 	if (tr->cond_snapshot)
++ 		cond_data = tr->cond_snapshot->cond_data;
++ 
++ 	arch_spin_unlock(&tr->max_lock);
++ 	local_irq_enable();
++ 
++ 	return cond_data;
++ }
++ EXPORT_SYMBOL_GPL(tracing_cond_snapshot_data);
++ 
+++>>>>>>> c0a581d7126c (tracing: Disable interrupt or preemption before acquiring arch_spinlock_t)
+  static int resize_buffer_duplicate_size(struct array_buffer *trace_buf,
+  					struct array_buffer *size_buf, int cpu_id);
+  static void set_buffer_entries(struct array_buffer *buf, unsigned long val);
+@@@ -1165,6 -1285,104 +1218,107 @@@ void tracing_snapshot_alloc(void
+  	tracing_snapshot();
+  }
+  EXPORT_SYMBOL_GPL(tracing_snapshot_alloc);
+++<<<<<<< HEAD
+++=======
++ 
++ /**
++  * tracing_snapshot_cond_enable - enable conditional snapshot for an instance
++  * @tr:		The tracing instance
++  * @cond_data:	User data to associate with the snapshot
++  * @update:	Implementation of the cond_snapshot update function
++  *
++  * Check whether the conditional snapshot for the given instance has
++  * already been enabled, or if the current tracer is already using a
++  * snapshot; if so, return -EBUSY, else create a cond_snapshot and
++  * save the cond_data and update function inside.
++  *
++  * Returns 0 if successful, error otherwise.
++  */
++ int tracing_snapshot_cond_enable(struct trace_array *tr, void *cond_data,
++ 				 cond_update_fn_t update)
++ {
++ 	struct cond_snapshot *cond_snapshot;
++ 	int ret = 0;
++ 
++ 	cond_snapshot = kzalloc(sizeof(*cond_snapshot), GFP_KERNEL);
++ 	if (!cond_snapshot)
++ 		return -ENOMEM;
++ 
++ 	cond_snapshot->cond_data = cond_data;
++ 	cond_snapshot->update = update;
++ 
++ 	mutex_lock(&trace_types_lock);
++ 
++ 	ret = tracing_alloc_snapshot_instance(tr);
++ 	if (ret)
++ 		goto fail_unlock;
++ 
++ 	if (tr->current_trace->use_max_tr) {
++ 		ret = -EBUSY;
++ 		goto fail_unlock;
++ 	}
++ 
++ 	/*
++ 	 * The cond_snapshot can only change to NULL without the
++ 	 * trace_types_lock. We don't care if we race with it going
++ 	 * to NULL, but we want to make sure that it's not set to
++ 	 * something other than NULL when we get here, which we can
++ 	 * do safely with only holding the trace_types_lock and not
++ 	 * having to take the max_lock.
++ 	 */
++ 	if (tr->cond_snapshot) {
++ 		ret = -EBUSY;
++ 		goto fail_unlock;
++ 	}
++ 
++ 	local_irq_disable();
++ 	arch_spin_lock(&tr->max_lock);
++ 	tr->cond_snapshot = cond_snapshot;
++ 	arch_spin_unlock(&tr->max_lock);
++ 	local_irq_enable();
++ 
++ 	mutex_unlock(&trace_types_lock);
++ 
++ 	return ret;
++ 
++  fail_unlock:
++ 	mutex_unlock(&trace_types_lock);
++ 	kfree(cond_snapshot);
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(tracing_snapshot_cond_enable);
++ 
++ /**
++  * tracing_snapshot_cond_disable - disable conditional snapshot for an instance
++  * @tr:		The tracing instance
++  *
++  * Check whether the conditional snapshot for the given instance is
++  * enabled; if so, free the cond_snapshot associated with it,
++  * otherwise return -EINVAL.
++  *
++  * Returns 0 if successful, error otherwise.
++  */
++ int tracing_snapshot_cond_disable(struct trace_array *tr)
++ {
++ 	int ret = 0;
++ 
++ 	local_irq_disable();
++ 	arch_spin_lock(&tr->max_lock);
++ 
++ 	if (!tr->cond_snapshot)
++ 		ret = -EINVAL;
++ 	else {
++ 		kfree(tr->cond_snapshot);
++ 		tr->cond_snapshot = NULL;
++ 	}
++ 
++ 	arch_spin_unlock(&tr->max_lock);
++ 	local_irq_enable();
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(tracing_snapshot_cond_disable);
+++>>>>>>> c0a581d7126c (tracing: Disable interrupt or preemption before acquiring arch_spinlock_t)
+  #else
+  void tracing_snapshot(void)
+  {
+@@@ -1864,10 -2195,22 +2018,15 @@@ void tracing_reset_all_online_cpus(void
+  	}
+  }
+  
+ -/*
+ - * The tgid_map array maps from pid to tgid; i.e. the value stored at index i
+ - * is the tgid last observed corresponding to pid=i.
+ - */
+  static int *tgid_map;
+  
+ -/* The maximum valid index into tgid_map. */
+ -static size_t tgid_map_max;
+ -
+  #define SAVED_CMDLINES_DEFAULT 128
+  #define NO_CMDLINE_MAP UINT_MAX
++ /*
++  * Preemption must be disabled before acquiring trace_cmdline_lock.
++  * The various trace_arrays' max_lock must be acquired in a context
++  * where interrupt is disabled.
++  */
+  static arch_spinlock_t trace_cmdline_lock = __ARCH_SPIN_LOCK_UNLOCKED;
+  struct saved_cmdlines_buffer {
+  	unsigned map_pid_to_cmdline[PID_MAX_DEFAULT+1];
+@@@ -5401,6 -6390,18 +5568,21 @@@ static int tracing_set_tracer(struct tr
+  	if (t == tr->current_trace)
+  		goto out;
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_TRACER_SNAPSHOT
++ 	if (t->use_max_tr) {
++ 		local_irq_disable();
++ 		arch_spin_lock(&tr->max_lock);
++ 		if (tr->cond_snapshot)
++ 			ret = -EBUSY;
++ 		arch_spin_unlock(&tr->max_lock);
++ 		local_irq_enable();
++ 		if (ret)
++ 			goto out;
++ 	}
++ #endif
+++>>>>>>> c0a581d7126c (tracing: Disable interrupt or preemption before acquiring arch_spinlock_t)
+  	/* Some tracers won't work on kernel command line */
+  	if (system_state < SYSTEM_RUNNING && t->noboot) {
+  		pr_warn("Tracer '%s' is not allowed on command line, ignored\n",
+@@@ -6484,6 -7457,15 +6666,18 @@@ tracing_snapshot_write(struct file *fil
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	local_irq_disable();
++ 	arch_spin_lock(&tr->max_lock);
++ 	if (tr->cond_snapshot)
++ 		ret = -EBUSY;
++ 	arch_spin_unlock(&tr->max_lock);
++ 	local_irq_enable();
++ 	if (ret)
++ 		goto out;
++ 
+++>>>>>>> c0a581d7126c (tracing: Disable interrupt or preemption before acquiring arch_spinlock_t)
+  	switch (val) {
+  	case 0:
+  		if (iter->cpu_file != RING_BUFFER_ALL_CPUS) {
+* Unmerged path kernel/trace/trace.c
