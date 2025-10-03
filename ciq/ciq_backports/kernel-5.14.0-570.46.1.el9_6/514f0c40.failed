@@ -1,0 +1,179 @@
+scsi: fnic: Fix sg_reset success path
+
+jira LE-4311
+Rebuild_History Non-Buildable kernel-5.14.0-570.46.1.el9_6
+commit-author Karan Tilak Kumar <kartilak@cisco.com>
+commit 514f0c400bde6b62405467daaf2a0a86bcf7794b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-570.46.1.el9_6/514f0c40.failed
+
+sg_reset performs a target or LUN reset. Since the command is issued by the
+user, it does not come into the driver with a tag or a queue id. Fix the
+fnic driver to create an io_req and use a SCSI command tag.  Fix the ITMF
+path to special case the sg_reset response.
+
+	Reviewed-by: Sesidhar Baddela <sebaddel@cisco.com>
+	Reviewed-by: Arulprabhu Ponnusamy <arulponn@cisco.com>
+	Tested-by: Karan Tilak Kumar <kartilak@cisco.com>
+	Signed-off-by: Karan Tilak Kumar <kartilak@cisco.com>
+Link: https://lore.kernel.org/r/20230919182436.6895-1-kartilak@cisco.com
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 514f0c400bde6b62405467daaf2a0a86bcf7794b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/fnic/fnic.h
+#	drivers/scsi/fnic/fnic_scsi.c
+diff --cc drivers/scsi/fnic/fnic.h
+index 38c8614e6aed,22cef283b2b9..000000000000
+--- a/drivers/scsi/fnic/fnic.h
++++ b/drivers/scsi/fnic/fnic.h
+@@@ -39,7 -27,7 +39,11 @@@
+  
+  #define DRV_NAME		"fnic"
+  #define DRV_DESCRIPTION		"Cisco FCoE HBA Driver"
+++<<<<<<< HEAD
+ +#define DRV_VERSION		"1.6.0.55"
+++=======
++ #define DRV_VERSION		"1.6.0.57"
+++>>>>>>> 514f0c400bde (scsi: fnic: Fix sg_reset success path)
+  #define PFX			DRV_NAME ": "
+  #define DFX                     DRV_NAME "%d: "
+  
+@@@ -235,6 -236,9 +239,12 @@@ struct fnic 
+  	unsigned int wq_count;
+  	unsigned int cq_count;
+  
+++<<<<<<< HEAD
+++=======
++ 	struct mutex sgreset_mutex;
++ 	spinlock_t sgreset_lock; /* lock for sgreset */
++ 	struct scsi_cmnd *sgreset_sc;
+++>>>>>>> 514f0c400bde (scsi: fnic: Fix sg_reset success path)
+  	struct dentry *fnic_stats_debugfs_host;
+  	struct dentry *fnic_stats_debugfs_file;
+  	struct dentry *fnic_reset_debugfs_file;
+diff --cc drivers/scsi/fnic/fnic_scsi.c
+index 19e3244e4ce8,416d81954819..000000000000
+--- a/drivers/scsi/fnic/fnic_scsi.c
++++ b/drivers/scsi/fnic/fnic_scsi.c
+@@@ -1090,12 -1091,12 +1106,12 @@@ static void fnic_fcpio_itmf_cmpl_handle
+  		atomic64_inc(&fnic_stats->io_stats.sc_null);
+  		shost_printk(KERN_ERR, fnic->lport->host,
+  			  "itmf_cmpl sc is null - hdr status = %s tag = 0x%x\n",
+- 			  fnic_fcpio_status_to_str(hdr_status), id);
++ 			  fnic_fcpio_status_to_str(hdr_status), tag);
+  		return;
+  	}
+- 	io_lock = fnic_io_lock_hash(fnic, sc);
++ 
+  	spin_lock_irqsave(io_lock, flags);
+ -	io_req = fnic_priv(sc)->io_req;
+ +	io_req = (struct fnic_io_req *)CMD_SP(sc);
+  	WARN_ON_ONCE(!io_req);
+  	if (!io_req) {
+  		atomic64_inc(&fnic_stats->io_stats.ioreq_null);
+@@@ -2250,18 -2241,25 +2270,24 @@@ int fnic_device_reset(struct scsi_cmnd 
+  
+  	if (unlikely(tag < 0)) {
+  		/*
+ -		 * For device reset issued through sg3utils, we let
+ -		 * only one LUN_RESET to go through and use a special
+ -		 * tag equal to max_tag_id so that we don't have to allocate
+ -		 * or free it. It won't interact with tags
+ -		 * allocated by mid layer.
+ +		 * Really should fix the midlayer to pass in a proper
+ +		 * request for ioctls...
+  		 */
+ -		mutex_lock(&fnic->sgreset_mutex);
+ -		tag = fnic->fnic_max_tag_id;
+ +		tag = fnic_scsi_host_start_tag(fnic, sc);
+ +		if (unlikely(tag == SCSI_NO_TAG))
+ +			goto fnic_device_reset_end;
+ +		tag_gen_flag = 1;
+  		new_sc = 1;
+- 	}
+- 	io_lock = fnic_io_lock_hash(fnic, sc);
++ 		fnic->sgreset_sc = sc;
++ 		io_lock = &fnic->sgreset_lock;
++ 		FNIC_SCSI_DBG(KERN_INFO, fnic->lport->host,
++ 			"fcid: 0x%x lun: 0x%llx flags: 0x%x tag: 0x%x Issuing sgreset\n",
++ 			rport->port_id, sc->device->lun, fnic_priv(sc)->flags, tag);
++ 	} else
++ 		io_lock = fnic_io_lock_hash(fnic, sc);
++ 
+  	spin_lock_irqsave(io_lock, flags);
+ -	io_req = fnic_priv(sc)->io_req;
+ +	io_req = (struct fnic_io_req *)CMD_SP(sc);
+  
+  	/*
+  	 * If there is a io_req attached to this command, then use it,
+@@@ -2275,11 -2273,13 +2301,17 @@@
+  		}
+  		memset(io_req, 0, sizeof(*io_req));
+  		io_req->port_id = rport->port_id;
+++<<<<<<< HEAD
+ +		CMD_SP(sc) = (char *)io_req;
+++=======
++ 		io_req->tag = tag;
++ 		io_req->sc = sc;
++ 		fnic_priv(sc)->io_req = io_req;
+++>>>>>>> 514f0c400bde (scsi: fnic: Fix sg_reset success path)
+  	}
+  	io_req->dr_done = &tm_done;
+ -	fnic_priv(sc)->state = FNIC_IOREQ_CMD_PENDING;
+ -	fnic_priv(sc)->lr_status = FCPIO_INVALID_CODE;
+ +	CMD_STATE(sc) = FNIC_IOREQ_CMD_PENDING;
+ +	CMD_LR_STATUS(sc) = FCPIO_INVALID_CODE;
+  	spin_unlock_irqrestore(io_lock, flags);
+  
+  	FNIC_SCSI_DBG(KERN_DEBUG, fnic->lport->host, "TAG %x\n", tag);
+@@@ -2426,11 -2426,12 +2458,18 @@@ fnic_device_reset_end
+  		  0, ((u64)sc->cmnd[0] << 32 |
+  		  (u64)sc->cmnd[2] << 24 | (u64)sc->cmnd[3] << 16 |
+  		  (u64)sc->cmnd[4] << 8 | sc->cmnd[5]),
+ -		  fnic_flags_and_state(sc));
+ +		  (((u64)CMD_FLAGS(sc) << 32) | CMD_STATE(sc)));
+  
+++<<<<<<< HEAD
+ +	/* free tag if it is allocated */
+ +	if (unlikely(tag_gen_flag))
+ +		fnic_scsi_host_end_tag(fnic, sc);
+++=======
++ 	if (new_sc) {
++ 		fnic->sgreset_sc = NULL;
++ 		mutex_unlock(&fnic->sgreset_mutex);
++ 	}
+++>>>>>>> 514f0c400bde (scsi: fnic: Fix sg_reset success path)
+  
+  	FNIC_SCSI_DBG(KERN_DEBUG, fnic->lport->host,
+  		      "Returning from device reset %s\n",
+* Unmerged path drivers/scsi/fnic/fnic.h
+diff --git a/drivers/scsi/fnic/fnic_io.h b/drivers/scsi/fnic/fnic_io.h
+index 1cb6a68c8e4e..5c415d8c9502 100644
+--- a/drivers/scsi/fnic/fnic_io.h
++++ b/drivers/scsi/fnic/fnic_io.h
+@@ -64,6 +64,8 @@ struct fnic_io_req {
+ 	unsigned long start_time; /* in jiffies */
+ 	struct completion *abts_done; /* completion for abts */
+ 	struct completion *dr_done; /* completion for device reset */
++	unsigned int tag;
++	struct scsi_cmnd *sc; /* midlayer's cmd pointer */
+ };
+ 
+ enum fnic_port_speeds {
+diff --git a/drivers/scsi/fnic/fnic_main.c b/drivers/scsi/fnic/fnic_main.c
+index bd44974d269f..d50fea80a978 100644
+--- a/drivers/scsi/fnic/fnic_main.c
++++ b/drivers/scsi/fnic/fnic_main.c
+@@ -765,6 +765,8 @@ static int fnic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 	for (i = 0; i < FNIC_IO_LOCKS; i++)
+ 		spin_lock_init(&fnic->io_req_lock[i]);
+ 
++	spin_lock_init(&fnic->sgreset_lock);
++
+ 	err = -ENOMEM;
+ 	fnic->io_req_pool = mempool_create_slab_pool(2, fnic_io_req_cache);
+ 	if (!fnic->io_req_pool)
+* Unmerged path drivers/scsi/fnic/fnic_scsi.c
