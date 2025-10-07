@@ -1195,8 +1195,6 @@ static int v4l_s_priority(const struct v4l2_ioctl_ops *ops,
 	u32 *p = arg;
 
 	vfd = video_devdata(file);
-	if (!test_bit(V4L2_FL_USES_V4L2_FH, &vfd->flags))
-		return -ENOTTY;
 	vfh = file_to_v4l2_fh(file);
 	return v4l2_prio_change(vfd->prio, &vfh->prio, *p);
 }
@@ -2295,8 +2293,7 @@ static int v4l_queryctrl(const struct v4l2_ioctl_ops *ops,
 	struct video_device *vfd = video_devdata(file);
 	struct v4l2_query_ext_ctrl qec = {};
 	struct v4l2_queryctrl *p = arg;
-	struct v4l2_fh *vfh =
-		test_bit(V4L2_FL_USES_V4L2_FH, &vfd->flags) ? fh : NULL;
+	struct v4l2_fh *vfh = fh;
 	int ret;
 
 	if (vfh && vfh->ctrl_handler)
@@ -2320,8 +2317,7 @@ static int v4l_query_ext_ctrl(const struct v4l2_ioctl_ops *ops,
 {
 	struct video_device *vfd = video_devdata(file);
 	struct v4l2_query_ext_ctrl *p = arg;
-	struct v4l2_fh *vfh =
-		test_bit(V4L2_FL_USES_V4L2_FH, &vfd->flags) ? fh : NULL;
+	struct v4l2_fh *vfh = fh;
 
 	if (vfh && vfh->ctrl_handler)
 		return v4l2_query_ext_ctrl(vfh->ctrl_handler, p);
@@ -2337,8 +2333,7 @@ static int v4l_querymenu(const struct v4l2_ioctl_ops *ops,
 {
 	struct video_device *vfd = video_devdata(file);
 	struct v4l2_querymenu *p = arg;
-	struct v4l2_fh *vfh =
-		test_bit(V4L2_FL_USES_V4L2_FH, &vfd->flags) ? fh : NULL;
+	struct v4l2_fh *vfh = fh;
 
 	if (vfh && vfh->ctrl_handler)
 		return v4l2_querymenu(vfh->ctrl_handler, p);
@@ -2354,8 +2349,7 @@ static int v4l_g_ctrl(const struct v4l2_ioctl_ops *ops,
 {
 	struct video_device *vfd = video_devdata(file);
 	struct v4l2_control *p = arg;
-	struct v4l2_fh *vfh =
-		test_bit(V4L2_FL_USES_V4L2_FH, &vfd->flags) ? fh : NULL;
+	struct v4l2_fh *vfh = fh;
 	struct v4l2_ext_controls ctrls;
 	struct v4l2_ext_control ctrl;
 
@@ -2386,8 +2380,7 @@ static int v4l_s_ctrl(const struct v4l2_ioctl_ops *ops,
 {
 	struct video_device *vfd = video_devdata(file);
 	struct v4l2_control *p = arg;
-	struct v4l2_fh *vfh =
-		test_bit(V4L2_FL_USES_V4L2_FH, &vfd->flags) ? fh : NULL;
+	struct v4l2_fh *vfh = fh;
 	struct v4l2_ext_controls ctrls;
 	struct v4l2_ext_control ctrl;
 	int ret;
@@ -2416,8 +2409,7 @@ static int v4l_g_ext_ctrls(const struct v4l2_ioctl_ops *ops,
 {
 	struct video_device *vfd = video_devdata(file);
 	struct v4l2_ext_controls *p = arg;
-	struct v4l2_fh *vfh =
-		test_bit(V4L2_FL_USES_V4L2_FH, &vfd->flags) ? fh : NULL;
+	struct v4l2_fh *vfh = fh;
 
 	p->error_idx = p->count;
 	if (vfh && vfh->ctrl_handler)
@@ -2437,8 +2429,7 @@ static int v4l_s_ext_ctrls(const struct v4l2_ioctl_ops *ops,
 {
 	struct video_device *vfd = video_devdata(file);
 	struct v4l2_ext_controls *p = arg;
-	struct v4l2_fh *vfh =
-		test_bit(V4L2_FL_USES_V4L2_FH, &vfd->flags) ? fh : NULL;
+	struct v4l2_fh *vfh = fh;
 
 	p->error_idx = p->count;
 	if (vfh && vfh->ctrl_handler)
@@ -2458,8 +2449,7 @@ static int v4l_try_ext_ctrls(const struct v4l2_ioctl_ops *ops,
 {
 	struct video_device *vfd = video_devdata(file);
 	struct v4l2_ext_controls *p = arg;
-	struct v4l2_fh *vfh =
-		test_bit(V4L2_FL_USES_V4L2_FH, &vfd->flags) ? fh : NULL;
+	struct v4l2_fh *vfh = fh;
 
 	p->error_idx = p->count;
 	if (vfh && vfh->ctrl_handler)
@@ -3071,7 +3061,7 @@ static long __video_do_ioctl(struct file *file,
 	struct v4l2_ioctl_info default_info;
 	const struct v4l2_ioctl_info *info;
 	void *fh = file->private_data;
-	struct v4l2_fh *vfh = NULL;
+	struct v4l2_fh *vfh = file_to_v4l2_fh(file);
 	int dev_debug = vfd->dev_debug;
 	long ret = -ENOTTY;
 
@@ -3080,9 +3070,6 @@ static long __video_do_ioctl(struct file *file,
 				video_device_node_name(vfd));
 		return ret;
 	}
-
-	if (test_bit(V4L2_FL_USES_V4L2_FH, &vfd->flags))
-		vfh = file_to_v4l2_fh(file);
 
 	/*
 	 * We need to serialize streamon/off with queueing new requests.
@@ -3115,10 +3102,10 @@ static long __video_do_ioctl(struct file *file,
 		info = &v4l2_ioctls[_IOC_NR(cmd)];
 
 		if (!is_valid_ioctl(vfd, cmd) &&
-		    !((info->flags & INFO_FL_CTRL) && vfh && vfh->ctrl_handler))
+		    !((info->flags & INFO_FL_CTRL) && vfh->ctrl_handler))
 			goto done;
 
-		if (vfh && (info->flags & INFO_FL_PRIO)) {
+		if (info->flags & INFO_FL_PRIO) {
 			ret = v4l2_prio_check(vfd->prio, vfh->prio);
 			if (ret)
 				goto done;
@@ -3137,7 +3124,7 @@ static long __video_do_ioctl(struct file *file,
 		ret = -ENOTTY;
 	} else {
 		ret = ops->vidioc_default(file, fh,
-			vfh ? v4l2_prio_check(vfd->prio, vfh->prio) >= 0 : 0,
+			v4l2_prio_check(vfd->prio, vfh->prio) >= 0,
 			cmd, arg);
 	}
 
