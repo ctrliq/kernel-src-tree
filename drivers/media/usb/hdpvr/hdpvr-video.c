@@ -585,7 +585,7 @@ static int vidioc_querycap(struct file *file, void  *priv,
 	return 0;
 }
 
-static int vidioc_s_std(struct file *file, void *_fh,
+static int vidioc_s_std(struct file *file, void *priv,
 			v4l2_std_id std)
 {
 	struct hdpvr_device *dev = video_drvdata(file);
@@ -605,7 +605,7 @@ static int vidioc_s_std(struct file *file, void *_fh,
 	return hdpvr_config_call(dev, CTRL_VIDEO_STD_TYPE, std_type);
 }
 
-static int vidioc_g_std(struct file *file, void *_fh,
+static int vidioc_g_std(struct file *file, void *priv,
 			v4l2_std_id *std)
 {
 	struct hdpvr_device *dev = video_drvdata(file);
@@ -617,7 +617,7 @@ static int vidioc_g_std(struct file *file, void *_fh,
 	return 0;
 }
 
-static int vidioc_querystd(struct file *file, void *_fh, v4l2_std_id *a)
+static int vidioc_querystd(struct file *file, void *priv, v4l2_std_id *a)
 {
 	struct hdpvr_device *dev = video_drvdata(file);
 	struct hdpvr_video_info vid_info;
@@ -636,7 +636,7 @@ static int vidioc_querystd(struct file *file, void *_fh, v4l2_std_id *a)
 	return ret;
 }
 
-static int vidioc_s_dv_timings(struct file *file, void *_fh,
+static int vidioc_s_dv_timings(struct file *file, void *priv,
 				    struct v4l2_dv_timings *timings)
 {
 	struct hdpvr_device *dev = video_drvdata(file);
@@ -659,7 +659,7 @@ static int vidioc_s_dv_timings(struct file *file, void *_fh,
 	return 0;
 }
 
-static int vidioc_g_dv_timings(struct file *file, void *_fh,
+static int vidioc_g_dv_timings(struct file *file, void *priv,
 				    struct v4l2_dv_timings *timings)
 {
 	struct hdpvr_device *dev = video_drvdata(file);
@@ -672,7 +672,7 @@ static int vidioc_g_dv_timings(struct file *file, void *_fh,
 	return 0;
 }
 
-static int vidioc_query_dv_timings(struct file *file, void *_fh,
+static int vidioc_query_dv_timings(struct file *file, void *priv,
 				    struct v4l2_dv_timings *timings)
 {
 	struct hdpvr_device *dev = video_drvdata(file);
@@ -714,7 +714,7 @@ static int vidioc_query_dv_timings(struct file *file, void *_fh,
 	return ret;
 }
 
-static int vidioc_enum_dv_timings(struct file *file, void *_fh,
+static int vidioc_enum_dv_timings(struct file *file, void *priv,
 				    struct v4l2_enum_dv_timings *timings)
 {
 	struct hdpvr_device *dev = video_drvdata(file);
@@ -730,7 +730,7 @@ static int vidioc_enum_dv_timings(struct file *file, void *_fh,
 	return 0;
 }
 
-static int vidioc_dv_timings_cap(struct file *file, void *_fh,
+static int vidioc_dv_timings_cap(struct file *file, void *priv,
 				    struct v4l2_dv_timings_cap *cap)
 {
 	struct hdpvr_device *dev = video_drvdata(file);
@@ -757,7 +757,7 @@ static const char *iname[] = {
 	[HDPVR_COMPOSITE] = "Composite",
 };
 
-static int vidioc_enum_input(struct file *file, void *_fh, struct v4l2_input *i)
+static int vidioc_enum_input(struct file *file, void *priv, struct v4l2_input *i)
 {
 	unsigned int n;
 
@@ -777,7 +777,7 @@ static int vidioc_enum_input(struct file *file, void *_fh, struct v4l2_input *i)
 	return 0;
 }
 
-static int vidioc_s_input(struct file *file, void *_fh,
+static int vidioc_s_input(struct file *file, void *priv,
 			  unsigned int index)
 {
 	struct hdpvr_device *dev = video_drvdata(file);
@@ -811,7 +811,7 @@ static int vidioc_s_input(struct file *file, void *_fh,
 	return retval;
 }
 
-static int vidioc_g_input(struct file *file, void *private_data,
+static int vidioc_g_input(struct file *file, void *priv,
 			  unsigned int *index)
 {
 	struct hdpvr_device *dev = video_drvdata(file);
@@ -843,7 +843,7 @@ static int vidioc_enumaudio(struct file *file, void *priv,
 	return 0;
 }
 
-static int vidioc_s_audio(struct file *file, void *private_data,
+static int vidioc_s_audio(struct file *file, void *priv,
 			  const struct v4l2_audio *audio)
 {
 	struct hdpvr_device *dev = video_drvdata(file);
@@ -862,7 +862,7 @@ static int vidioc_s_audio(struct file *file, void *private_data,
 	return retval;
 }
 
-static int vidioc_g_audio(struct file *file, void *private_data,
+static int vidioc_g_audio(struct file *file, void *priv,
 			  struct v4l2_audio *audio)
 {
 	struct hdpvr_device *dev = video_drvdata(file);
@@ -979,7 +979,7 @@ static int hdpvr_s_ctrl(struct v4l2_ctrl *ctrl)
 	return ret;
 }
 
-static int vidioc_enum_fmt_vid_cap(struct file *file, void *private_data,
+static int vidioc_enum_fmt_vid_cap(struct file *file, void *priv,
 				    struct v4l2_fmtdesc *f)
 {
 	if (f->index != 0)
@@ -990,7 +990,7 @@ static int vidioc_enum_fmt_vid_cap(struct file *file, void *private_data,
 	return 0;
 }
 
-static int vidioc_g_fmt_vid_cap(struct file *file, void *_fh,
+static int vidioc_g_fmt_vid_cap(struct file *file, void *priv,
 				struct v4l2_format *f)
 {
 	struct hdpvr_device *dev = video_drvdata(file);
