@@ -1080,7 +1080,6 @@ static int cs42l43_shutter_get(struct cs42l43_codec *priv, unsigned int shift)
 		ret ? "open" : "closed");
 
 error:
-	pm_runtime_mark_last_busy(priv->dev);
 	pm_runtime_put_autosuspend(priv->dev);
 
 	return ret;
@@ -2356,7 +2355,6 @@ static int cs42l43_codec_probe(struct platform_device *pdev)
 		goto err_clk;
 	}
 
-	pm_runtime_mark_last_busy(priv->dev);
 	pm_runtime_put_autosuspend(priv->dev);
 
 	return 0;
