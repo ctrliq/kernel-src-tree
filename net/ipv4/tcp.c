@@ -417,6 +417,7 @@ void tcp_init_sock(struct sock *sk)
 {
 	struct inet_connection_sock *icsk = inet_csk(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
+	int rto_max_ms;
 
 	tp->out_of_order_queue = RB_ROOT;
 	sk->tcp_rtx_queue = RB_ROOT;
@@ -425,7 +426,12 @@ void tcp_init_sock(struct sock *sk)
 	INIT_LIST_HEAD(&tp->tsorted_sent_queue);
 
 	icsk->icsk_rto = TCP_TIMEOUT_INIT;
+
+	rto_max_ms = READ_ONCE(sock_net(sk)->ipv4.sysctl_tcp_rto_max_ms);
+	icsk->icsk_rto_max = msecs_to_jiffies(rto_max_ms);
+
 	icsk->icsk_rto_min = TCP_RTO_MIN;
+
 	icsk->icsk_delack_max = TCP_DELACK_MAX;
 	tp->mdev_us = jiffies_to_usecs(TCP_TIMEOUT_INIT);
 	minmax_reset(&tp->rtt_min, tcp_jiffies32, ~0U);
@@ -3669,6 +3675,11 @@ int do_tcp_setsockopt(struct sock *sk, int level, int optname,
 			   secs_to_retrans(val, TCP_TIMEOUT_INIT / HZ,
 					   TCP_RTO_MAX / HZ));
 		return 0;
+	case TCP_RTO_MAX_MS:
+		if (val < MSEC_PER_SEC || val > TCP_RTO_MAX_SEC * MSEC_PER_SEC)
+			return -EINVAL;
+		WRITE_ONCE(inet_csk(sk)->icsk_rto_max, msecs_to_jiffies(val));
+		return 0;
 	}
 
 	sockopt_lock_sock(sk);
@@ -4429,6 +4440,9 @@ zerocopy_rcv_out:
 		return err;
 	}
 #endif
+	case TCP_RTO_MAX_MS:
+		val = jiffies_to_msecs(tcp_rto_max(sk));
+		break;
 	default:
 		return -ENOPROTOOPT;
 	}

@@ -2787,7 +2787,7 @@ bool tcp_schedule_loss_probe(struct sock *sk, bool advancing_rto)
 	if (rto_delta_us > 0)
 		timeout = min_t(u32, timeout, usecs_to_jiffies(rto_delta_us));
 
-	tcp_reset_xmit_timer(sk, ICSK_TIME_LOSS_PROBE, timeout, TCP_RTO_MAX);
+	tcp_reset_xmit_timer(sk, ICSK_TIME_LOSS_PROBE, timeout, true);
 	return true;
 }
 
@@ -3424,8 +3424,7 @@ void tcp_xmit_retransmit_queue(struct sock *sk)
 	}
 	if (rearm_timer)
 		tcp_reset_xmit_timer(sk, ICSK_TIME_RETRANS,
-				     inet_csk(sk)->icsk_rto,
-				     TCP_RTO_MAX);
+				     inet_csk(sk)->icsk_rto, true);
 }
 
 /* We allow to exceed memory limits for FIN packets to expedite
@@ -3946,8 +3945,8 @@ int tcp_connect(struct sock *sk)
 	TCP_INC_STATS(sock_net(sk), TCP_MIB_ACTIVEOPENS);
 
 	/* Timer for repeating the SYN until an answer. */
-	inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS,
-				  inet_csk(sk)->icsk_rto, TCP_RTO_MAX);
+	tcp_reset_xmit_timer(sk, ICSK_TIME_RETRANS,
+			     inet_csk(sk)->icsk_rto, false);
 	return 0;
 }
 EXPORT_SYMBOL(tcp_connect);
@@ -4028,11 +4027,11 @@ void __tcp_send_ack(struct sock *sk, u32 rcv_nxt)
 		unsigned long delay;
 
 		delay = TCP_DELACK_MAX << icsk->icsk_ack.retry;
-		if (delay < TCP_RTO_MAX)
+		if (delay < tcp_rto_max(sk))
 			icsk->icsk_ack.retry++;
 		inet_csk_schedule_ack(sk);
 		icsk->icsk_ack.ato = TCP_ATO_MIN;
-		inet_csk_reset_xmit_timer(sk, ICSK_TIME_DACK, delay, TCP_RTO_MAX);
+		tcp_reset_xmit_timer(sk, ICSK_TIME_DACK, delay, false);
 		return;
 	}
 
@@ -4168,7 +4167,7 @@ void tcp_send_probe0(struct sock *sk)
 	if (err <= 0) {
 		if (icsk->icsk_backoff < READ_ONCE(net->ipv4.sysctl_tcp_retries2))
 			icsk->icsk_backoff++;
-		timeout = tcp_probe0_when(sk, TCP_RTO_MAX);
+		timeout = tcp_probe0_when(sk, tcp_rto_max(sk));
 	} else {
 		/* If packet was not sent due to local congestion,
 		 * Let senders fight for local resources conservatively.
@@ -4177,7 +4176,7 @@ void tcp_send_probe0(struct sock *sk)
 	}
 
 	timeout = tcp_clamp_probe0_to_user_timeout(sk, timeout);
-	tcp_reset_xmit_timer(sk, ICSK_TIME_PROBE0, timeout, TCP_RTO_MAX);
+	tcp_reset_xmit_timer(sk, ICSK_TIME_PROBE0, timeout, true);
 }
 
 int tcp_rtx_synack(const struct sock *sk, struct request_sock *req)
