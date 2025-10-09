@@ -360,12 +360,8 @@ static int msi_capability_init(struct pci_dev *dev, int nvec,
 	if (nvec > 1 && !pci_msi_domain_supports(dev, MSI_FLAG_MULTI_PCI_MSI, ALLOW_LEGACY))
 		return 1;
 
-	/*
-	 * Disable MSI during setup in the hardware, but mark it enabled
-	 * so that setup code can evaluate it.
-	 */
+	/* Disable MSI during setup in the hardware to erase stale state */
 	pci_msi_set_enable(dev, 0);
-	dev->msi_enabled = 1;
 
 	if (affd)
 		masks = irq_create_affinity_masks(nvec, affd);
@@ -373,7 +369,7 @@ static int msi_capability_init(struct pci_dev *dev, int nvec,
 	msi_lock_descs(&dev->dev);
 	ret = msi_setup_msi_desc(dev, nvec, masks);
 	if (ret)
-		goto fail;
+		goto unlock;
 
 	/* All MSIs are unmasked by default; mask them all */
 	entry = msi_first_desc(&dev->dev, MSI_DESC_ALL);
@@ -395,6 +391,7 @@ static int msi_capability_init(struct pci_dev *dev, int nvec,
 		goto err;
 
 	/* Set MSI enabled bits	*/
+	dev->msi_enabled = 1;
 	pci_intx_for_msi(dev, 0);
 	pci_msi_set_enable(dev, 1);
 
@@ -405,8 +402,6 @@ static int msi_capability_init(struct pci_dev *dev, int nvec,
 err:
 	pci_msi_unmask(&desc, msi_multi_mask(&desc));
 	pci_free_msi_irqs(dev);
-fail:
-	dev->msi_enabled = 0;
 unlock:
 	msi_unlock_descs(&dev->dev);
 	kfree(masks);
