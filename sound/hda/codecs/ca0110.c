@@ -13,7 +13,7 @@
 #include "hda_local.h"
 #include "hda_auto_parser.h"
 #include "hda_jack.h"
-#include "hda_generic.h"
+#include "generic.h"
 
 static int ca0110_parse_auto_config(struct hda_codec *codec)
 {
