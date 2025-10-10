@@ -108,6 +108,11 @@ static int usbio_gpio_set(struct gpio_chip *gc, unsigned int offset, int value)
 				 &gbuf, sizeof(gbuf), NULL, 0);
 }
 
+static void usbio_gpio_set_void(struct gpio_chip *gc, unsigned int offset, int value)
+{
+	usbio_gpio_set(gc, offset, value);
+}
+
 static int usbio_gpio_update_config(struct gpio_chip *gc, unsigned int offset,
 				    u8 mask, u8 value)
 {
@@ -211,7 +216,7 @@ static int usbio_gpio_probe(struct auxiliary_device *adev,
 	gpio->gc.direction_input = usbio_gpio_direction_input;
 	gpio->gc.direction_output = usbio_gpio_direction_output;
 	gpio->gc.get = usbio_gpio_get;
-	gpio->gc.set = usbio_gpio_set;
+	gpio->gc.set = usbio_gpio_set_void;
 	gpio->gc.set_config = usbio_gpio_set_config;
 	gpio->gc.base = -1;
 	gpio->gc.ngpio = bank * USBIO_GPIOSPERBANK;
