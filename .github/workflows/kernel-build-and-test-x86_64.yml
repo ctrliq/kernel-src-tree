@@ -4,17 +4,27 @@ on: [push]
 permissions:
   contents: read
   actions: read
+  packages: read
 
 jobs:
   build:
-    name: Build x86_64
+    name: Build kernel
     runs-on: kernel-build
 
     steps:
-    - name: Checkout code
+    - name: Checkout kernel source
       uses: actions/checkout@v4
       with:
         fetch-depth: 1
+        path: kernel-src-tree
+
+    - name: Checkout kernel-container-build (test branch)
+      uses: actions/checkout@v4
+      with:
+        repository: ctrliq/kernel-container-build
+        ref: test-stage-separation
+        path: kernel-container-build
+        token: ${{ secrets.PRIVATE_REPO_ACCESS_TOKEN }}
 
     # Host deps + KVM / FUSE validation
     - name: Install host dependencies & verify KVM/FUSE
@@ -30,22 +40,24 @@ jobs:
           sudo chmod 0666 /dev/kvm
         fi
 
-    # Kernel build inside CIQ builder
+    # Kernel build inside CIQ builder (build only, no test)
     - name: Build kernel inside CIQ builder container
       run: |
         set -euxo pipefail
         mkdir -p output
         df -h
         cat /proc/cpuinfo
+        chmod +x kernel-container-build/build-container/*.sh
         podman run --rm --pull=always \
           --privileged \
           --device=/dev/fuse \
           $([ -e /dev/kvm ] && echo "--device=/dev/kvm") \
-          -v "$PWD":/src \
+          -v "$PWD/kernel-src-tree":/src \
           -v "$PWD/output":/output \
+          -v "$PWD/kernel-container-build/build-container":/usr/local/build-scripts:ro \
           --security-opt label=disable \
           pulp.prod.ciq.dev/ciq/cicd/lts-images/builder \
-          build_kernel.sh -c lts-9.2-kernel-builder 2>&1 | tee output/kernel-build.log
+          /usr/local/build-scripts/build_kernel.sh -c lts-9.2-kernel-builder 2>&1 | tee output/kernel-build.log
         sudo dmesg
 
     # Upload kernel compilation logs
@@ -57,6 +69,116 @@ jobs:
         path: output/kernel-build.log
         retention-days: 7
 
+    # Upload qcow2 image for next stages
+    - name: Upload qcow2 image
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: kernel-qcow2-image-x86_64
+        path: |
+          output/*.qcow2
+          output/last_build_image.txt
+        retention-days: 7
+
+  boot:
+    name: Boot verification
+    runs-on: kernel-build
+    needs: build
+
+    steps:
+    - name: Checkout kernel-container-build (test branch)
+      uses: actions/checkout@v4
+      with:
+        repository: ctrliq/kernel-container-build
+        ref: test-stage-separation
+        path: kernel-container-build
+        token: ${{ secrets.PRIVATE_REPO_ACCESS_TOKEN }}
+
+    - name: Install host dependencies
+      run: |
+        set -euxo pipefail
+        sudo apt-get update
+        sudo apt-get install -y fuse3 cpu-checker podman
+        sudo modprobe fuse
+        if [ -e /dev/kvm ]; then
+          sudo chmod 0666 /dev/kvm
+        fi
+
+    - name: Download qcow2 image
+      uses: actions/download-artifact@v4
+      with:
+        name: kernel-qcow2-image-x86_64
+        path: output
+
+    # Boot verification test
+    - name: Boot kernel and verify
+      run: |
+        set -euxo pipefail
+        chmod +x kernel-container-build/build-container/*.sh
+        podman run --rm --pull=always \
+          --privileged \
+          --device=/dev/fuse \
+          $([ -e /dev/kvm ] && echo "--device=/dev/kvm") \
+          -v "$PWD/output":/output \
+          -v "$PWD/kernel-container-build/build-container":/usr/local/build-scripts:ro \
+          --security-opt label=disable \
+          pulp.prod.ciq.dev/ciq/cicd/lts-images/builder \
+          /usr/local/build-scripts/boot_kernel.sh
+
+    # Upload boot logs
+    - name: Upload boot logs
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: boot-logs-x86_64
+        path: output/boot-*.log
+        retention-days: 7
+
+  test-kselftest:
+    name: Run kselftests
+    runs-on: kernel-build
+    needs: boot
+
+    steps:
+    - name: Checkout kernel-container-build (test branch)
+      uses: actions/checkout@v4
+      with:
+        repository: ctrliq/kernel-container-build
+        ref: test-stage-separation
+        path: kernel-container-build
+        token: ${{ secrets.PRIVATE_REPO_ACCESS_TOKEN }}
+
+    - name: Install host dependencies
+      run: |
+        set -euxo pipefail
+        sudo apt-get update
+        sudo apt-get install -y fuse3 cpu-checker podman
+        sudo modprobe fuse
+        if [ -e /dev/kvm ]; then
+          sudo chmod 0666 /dev/kvm
+        fi
+
+    - name: Download qcow2 image
+      uses: actions/download-artifact@v4
+      with:
+        name: kernel-qcow2-image-x86_64
+        path: output
+
+    # Run kselftests
+    - name: Execute kselftests
+      run: |
+        set -euxo pipefail
+        chmod +x kernel-container-build/build-container/*.sh
+        podman run --rm --pull=always \
+          --privileged \
+          --device=/dev/fuse \
+          $([ -e /dev/kvm ] && echo "--device=/dev/kvm") \
+          -v "$PWD/output":/output \
+          -v "$PWD/kernel-container-build/build-container":/usr/local/build-scripts:ro \
+          --security-opt label=disable \
+          pulp.prod.ciq.dev/ciq/cicd/lts-images/builder \
+          /usr/local/build-scripts/test_kselftests.sh
+
     # Upload kselftest logs
     - name: Upload kselftest logs
       uses: actions/upload-artifact@v4
@@ -66,15 +188,4 @@ jobs:
         path: |
           output/kselftests-*.log
           output/dmesg-*.log
-        retention-days: 7
-
-    # Upload qcow2 image
-    - name: Upload qcow2 image
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: kernel-qcow2-image-x86_64
-        path: |
-          output/*.qcow2
-          output/last_build_image.txt
         retention-days: 7
