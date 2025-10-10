@@ -870,6 +870,7 @@ static struct irq_domain *__msi_create_irq_domain(struct fwnode_handle *fwnode,
 
 	if (domain) {
 		irq_domain_update_bus_token(domain, info->bus_token);
+		domain->dev = info->dev;
 		if (info->flags & MSI_FLAG_PARENT_PM_DEV)
 			domain->pm_dev = parent->pm_dev;
 	}
@@ -1032,6 +1033,7 @@ bool msi_create_device_irq_domain(struct device *dev, unsigned int domid,
 	bundle->info.data = domain_data;
 	bundle->info.chip_data = chip_data;
 	bundle->info.alloc_data = &bundle->alloc_info;
+	bundle->info.dev = dev;
 
 	pops = parent->msi_parent_ops;
 	snprintf(bundle->name, sizeof(bundle->name), "%s%s-%s",
@@ -1070,7 +1072,6 @@ bool msi_create_device_irq_domain(struct device *dev, unsigned int domid,
 	if (!domain)
 		return false;
 
-	domain->dev = dev;
 	dev->msi.data->__domains[domid].domain = domain;
 
 	if (msi_domain_prepare_irqs(domain, dev, hwsize, &bundle->alloc_info)) {
