@@ -691,13 +691,6 @@ void irq_mark_irq(unsigned int irq)
 	mutex_unlock(&sparse_irq_lock);
 }
 
-#ifdef CONFIG_GENERIC_IRQ_LEGACY
-void irq_init_desc(unsigned int irq)
-{
-	free_desc(irq);
-}
-#endif
-
 #endif /* !CONFIG_SPARSE_IRQ */
 
 int handle_irq_desc(struct irq_desc *desc)
