@@ -744,6 +744,7 @@ struct cfs_rq {
 	struct list_head	throttled_csd_list;
 #endif /* CONFIG_CFS_BANDWIDTH */
 #endif /* CONFIG_FAIR_GROUP_SCHED */
+	RH_KABI_RESERVE(1)
 };
 
 #ifdef CONFIG_SCHED_CLASS_EXT
@@ -784,6 +785,7 @@ struct scx_rq {
 	struct balance_callback	deferred_bal_cb;
 	struct irq_work		deferred_irq_work;
 	struct irq_work		kick_cpus_irq_work;
+	RH_KABI_RESERVE(1)
 };
 #endif /* CONFIG_SCHED_CLASS_EXT */
 
@@ -1011,6 +1013,8 @@ struct root_domain {
 	 */
 	cpumask_var_t		rto_mask;
 	struct cpupri		cpupri;
+
+	RH_KABI_RESERVE(1)
 
 	/*
 	 * NULL-terminated list of performance domains intersecting with the
@@ -1288,6 +1292,8 @@ struct rq {
 	call_single_data_t	cfsb_csd;
 	struct list_head	cfsb_csd_list;
 #endif
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
 };
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
