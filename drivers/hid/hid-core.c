@@ -2266,6 +2266,9 @@ int hid_connect(struct hid_device *hdev, unsigned int connect_mask)
 	case BUS_I2C:
 		bus = "I2C";
 		break;
+	case BUS_SDW:
+		bus = "SOUNDWIRE";
+		break;
 	case BUS_VIRTUAL:
 		bus = "VIRTUAL";
 		break;
