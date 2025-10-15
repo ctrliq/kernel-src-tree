@@ -483,7 +483,8 @@ static int qcom_spi_block_erase(struct qcom_nand_controller *snandc)
 	snandc->regs->cmd = snandc->qspi->cmd;
 	snandc->regs->addr0 = snandc->qspi->addr1;
 	snandc->regs->addr1 = snandc->qspi->addr2;
-	snandc->regs->cfg0 = cpu_to_le32(ecc_cfg->cfg0_raw & ~(7 << CW_PER_PAGE));
+	snandc->regs->cfg0 = cpu_to_le32((ecc_cfg->cfg0_raw & ~CW_PER_PAGE_MASK) |
+					 FIELD_PREP(CW_PER_PAGE_MASK, 0));
 	snandc->regs->cfg1 = cpu_to_le32(ecc_cfg->cfg1_raw);
 	snandc->regs->exec = cpu_to_le32(1);
 
@@ -560,8 +561,8 @@ static int qcom_spi_read_last_cw(struct qcom_nand_controller *snandc,
 	snandc->regs->addr0 = (snandc->qspi->addr1 | cpu_to_le32(col));
 	snandc->regs->addr1 = snandc->qspi->addr2;
 
-	cfg0 = (ecc_cfg->cfg0_raw & ~(7U << CW_PER_PAGE)) |
-		0 << CW_PER_PAGE;
+	cfg0 = (ecc_cfg->cfg0_raw & ~CW_PER_PAGE_MASK) |
+	       FIELD_PREP(CW_PER_PAGE_MASK, 0);
 	cfg1 = ecc_cfg->cfg1_raw;
 	ecc_bch_cfg = ECC_CFG_ECC_DISABLE;
 
@@ -685,8 +686,8 @@ static int qcom_spi_read_cw_raw(struct qcom_nand_controller *snandc, u8 *data_bu
 	qcom_clear_bam_transaction(snandc);
 	raw_cw = num_cw - 1;
 
-	cfg0 = (ecc_cfg->cfg0_raw & ~(7U << CW_PER_PAGE)) |
-				0 << CW_PER_PAGE;
+	cfg0 = (ecc_cfg->cfg0_raw & ~CW_PER_PAGE_MASK) |
+	       FIELD_PREP(CW_PER_PAGE_MASK, 0);
 	cfg1 = ecc_cfg->cfg1_raw;
 	ecc_bch_cfg = ECC_CFG_ECC_DISABLE;
 
@@ -806,8 +807,8 @@ static int qcom_spi_read_page_ecc(struct qcom_nand_controller *snandc,
 	snandc->buf_start = 0;
 	qcom_clear_read_regs(snandc);
 
-	cfg0 = (ecc_cfg->cfg0 & ~(7U << CW_PER_PAGE)) |
-				(num_cw - 1) << CW_PER_PAGE;
+	cfg0 = (ecc_cfg->cfg0 & ~CW_PER_PAGE_MASK) |
+	       FIELD_PREP(CW_PER_PAGE_MASK, num_cw - 1);
 	cfg1 = ecc_cfg->cfg1;
 	ecc_bch_cfg = ecc_cfg->ecc_bch_cfg;
 
@@ -902,8 +903,8 @@ static int qcom_spi_read_page_oob(struct qcom_nand_controller *snandc,
 	qcom_clear_read_regs(snandc);
 	qcom_clear_bam_transaction(snandc);
 
-	cfg0 = (ecc_cfg->cfg0 & ~(7U << CW_PER_PAGE)) |
-				(num_cw - 1) << CW_PER_PAGE;
+	cfg0 = (ecc_cfg->cfg0 & ~CW_PER_PAGE_MASK) |
+	       FIELD_PREP(CW_PER_PAGE_MASK, num_cw - 1);
 	cfg1 = ecc_cfg->cfg1;
 	ecc_bch_cfg = ecc_cfg->ecc_bch_cfg;
 
@@ -1013,8 +1014,8 @@ static int qcom_spi_program_raw(struct qcom_nand_controller *snandc,
 	int num_cw = snandc->qspi->num_cw;
 	u32 cfg0, cfg1, ecc_bch_cfg;
 
-	cfg0 = (ecc_cfg->cfg0_raw & ~(7U << CW_PER_PAGE)) |
-			(num_cw - 1) << CW_PER_PAGE;
+	cfg0 = (ecc_cfg->cfg0_raw & ~CW_PER_PAGE_MASK) |
+	       FIELD_PREP(CW_PER_PAGE_MASK, num_cw - 1);
 	cfg1 = ecc_cfg->cfg1_raw;
 	ecc_bch_cfg = ECC_CFG_ECC_DISABLE;
 
@@ -1096,8 +1097,8 @@ static int qcom_spi_program_ecc(struct qcom_nand_controller *snandc,
 	int num_cw = snandc->qspi->num_cw;
 	u32 cfg0, cfg1, ecc_bch_cfg, ecc_buf_cfg;
 
-	cfg0 = (ecc_cfg->cfg0 & ~(7U << CW_PER_PAGE)) |
-				(num_cw - 1) << CW_PER_PAGE;
+	cfg0 = (ecc_cfg->cfg0 & ~CW_PER_PAGE_MASK) |
+	       FIELD_PREP(CW_PER_PAGE_MASK, num_cw - 1);
 	cfg1 = ecc_cfg->cfg1;
 	ecc_bch_cfg = ecc_cfg->ecc_bch_cfg;
 	ecc_buf_cfg = ecc_cfg->ecc_buf_cfg;
@@ -1173,8 +1174,8 @@ static int qcom_spi_program_oob(struct qcom_nand_controller *snandc,
 	int num_cw = snandc->qspi->num_cw;
 	u32 cfg0, cfg1, ecc_bch_cfg, ecc_buf_cfg;
 
-	cfg0 = (ecc_cfg->cfg0 & ~(7U << CW_PER_PAGE)) |
-				(num_cw - 1) << CW_PER_PAGE;
+	cfg0 = (ecc_cfg->cfg0 & ~CW_PER_PAGE_MASK) |
+	       FIELD_PREP(CW_PER_PAGE_MASK, num_cw - 1);
 	cfg1 = ecc_cfg->cfg1;
 	ecc_bch_cfg = ecc_cfg->ecc_bch_cfg;
 	ecc_buf_cfg = ecc_cfg->ecc_buf_cfg;
