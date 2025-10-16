@@ -348,3 +348,190 @@ jobs:
           echo "comparison_status=skipped" >> $GITHUB_OUTPUT
           echo "comparison_message=No baseline results available from ${{ steps.base_branch.outputs.base_branch }}" >> $GITHUB_OUTPUT
         fi
+  create-pr:
+    name: Create Pull Request
+    runs-on: kernel-build
+    needs: [build, boot, test-kselftest, compare-results]
+    if: success() || failure()
+
+    steps:
+    - name: Check if all stages passed
+      run: |
+        if [ "${{ needs.build.result }}" != "success" ] || \
+           [ "${{ needs.boot.result }}" != "success" ] || \
+           [ "${{ needs.test-kselftest.result }}" != "success" ]; then
+          echo "One or more test stages failed, skipping PR creation"
+          exit 1
+        fi
+        echo "All test stages passed, proceeding with PR creation"
+
+    - name: Checkout kernel source
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Download kernel compilation logs
+      uses: actions/download-artifact@v4
+      with:
+        name: kernel-compilation-logs-x86_64
+        path: artifacts/build
+
+    - name: Download boot logs
+      uses: actions/download-artifact@v4
+      with:
+        name: boot-logs-x86_64
+        path: artifacts/boot
+
+    - name: Download kselftest logs
+      uses: actions/download-artifact@v4
+      with:
+        name: kselftest-logs-x86_64
+        path: artifacts/test
+
+    - name: Extract test statistics
+      id: stats
+      run: |
+        PASSED=$(grep -a '^ok' artifacts/test/kselftests-*.log | wc -l || echo "0")
+        FAILED=$(grep -a '^not ok' artifacts/test/kselftests-*.log | wc -l || echo "0")
+        echo "passed=$PASSED" >> $GITHUB_OUTPUT
+        echo "failed=$FAILED" >> $GITHUB_OUTPUT
+
+    - name: Extract build timers
+      id: build_info
+      run: |
+        BUILD_TIME=$(grep -oP '\[TIMER\]\{BUILD\}:\s*\K[0-9]+' artifacts/build/kernel-build.log | head -1 || echo "N/A")
+        TOTAL_TIME=$(grep -oP '\[TIMER\]\{TOTAL\}\s*\K[0-9]+' artifacts/build/kernel-build.log | head -1 || echo "N/A")
+        echo "build_time=${BUILD_TIME}s" >> $GITHUB_OUTPUT
+        echo "total_time=${TOTAL_TIME}s" >> $GITHUB_OUTPUT
+
+    - name: Get commit information
+      id: commit_msg
+      run: |
+        # Count commits since origin/main (or appropriate base branch)
+        BASE_BRANCH="main"
+        if ! git rev-parse origin/$BASE_BRANCH >/dev/null 2>&1; then
+          # Try other common base branch names
+          for branch in master lts-9.2 lts-9; do
+            if git rev-parse origin/$branch >/dev/null 2>&1; then
+              BASE_BRANCH=$branch
+              break
+            fi
+          done
+        fi
+
+        COMMIT_COUNT=$(git rev-list --count origin/$BASE_BRANCH..HEAD 2>/dev/null || echo "1")
+
+        if [ "$COMMIT_COUNT" -eq "1" ]; then
+          # Single commit: use commit subject
+          git log -1 --pretty=%s > /tmp/commit_subject.txt
+          COMMIT_SUBJECT=$(cat /tmp/commit_subject.txt)
+          echo "commit_subject=$COMMIT_SUBJECT" >> $GITHUB_OUTPUT
+
+          # Save full commit message to file
+          git log -1 --pretty=%B > /tmp/commit_message.txt
+        else
+          # Multiple commits: create summary
+          echo "commit_subject=Multiple patches tested ($COMMIT_COUNT commits)" >> $GITHUB_OUTPUT
+
+          # Get all commit messages and save to file
+          git log origin/$BASE_BRANCH..HEAD --pretty=format:"### %s%n%n%b%n---" > /tmp/commit_message.txt
+        fi
+
+    - name: Create Pull Request
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        BASE_BRANCH=""
+
+        # For PRs, use the base branch directly
+        if [ -n "${{ github.base_ref }}" ]; then
+          BASE_BRANCH="${{ github.base_ref }}"
+          echo "Using PR base branch: $BASE_BRANCH"
+        else
+          # For direct pushes, find the common ancestor branch
+          echo "Not a PR, finding base branch via merge-base"
+
+          # Get all remote branches and find the one with closest common ancestor
+          CURRENT_COMMIT=$(git rev-parse HEAD)
+          BEST_BRANCH=""
+          CLOSEST_DISTANCE=999999
+
+          for remote_branch in $(git for-each-ref --format='%(refname:short)' refs/remotes/origin/ | grep -v 'HEAD\|PR-CHECKER'); do
+            branch_name=$(echo "$remote_branch" | sed 's|^origin/||')
+
+            # Skip if it's the current branch
+            if [ "$branch_name" = "${{ github.ref_name }}" ]; then
+              continue
+            fi
+
+            MERGE_BASE=$(git merge-base HEAD "$remote_branch" 2>/dev/null || echo "")
+
+            # Check if this branch shares history and isn't the current commit
+            if [ -n "$MERGE_BASE" ] && [ "$MERGE_BASE" != "$CURRENT_COMMIT" ]; then
+              # Calculate distance (number of commits) from merge-base to current HEAD
+              DISTANCE=$(git rev-list --count ${MERGE_BASE}..HEAD 2>/dev/null || echo "999999")
+
+              # Find the branch with the shortest distance (most recent common ancestor)
+              if [ "$DISTANCE" -lt "$CLOSEST_DISTANCE" ]; then
+                CLOSEST_DISTANCE=$DISTANCE
+                BEST_BRANCH=$branch_name
+              fi
+            fi
+          done
+
+          if [ -n "$BEST_BRANCH" ]; then
+            BASE_BRANCH=$BEST_BRANCH
+            echo "Found common ancestor with $BASE_BRANCH (distance: $CLOSEST_DISTANCE commits)"
+          fi
+        fi
+
+        if [ -z "$BASE_BRANCH" ]; then
+          echo "ERROR: Could not determine base branch for PR"
+          exit 1
+        fi
+
+        echo "Creating PR from ${{ github.ref_name }} to $BASE_BRANCH"
+
+        # Determine comparison status message
+        COMPARISON_RESULT="${{ needs.compare-results.result }}"
+        if [ "$COMPARISON_RESULT" = "success" ]; then
+          COMPARISON_SECTION="### ✅ Test Comparison
+        - Status: Passed - Within acceptable threshold (±3 tests)
+        - Compared against: $BASE_BRANCH"
+        else
+          COMPARISON_SECTION="### ⚠️ Test Comparison
+        - Status: Skipped
+        - Reason: No baseline test results available from $BASE_BRANCH
+        - **Note:** Manual review recommended to ensure no regressions"
+        fi
+
+        # Create PR body using script
+        chmod +x .github/scripts/create-pr-body.sh
+        .github/scripts/create-pr-body.sh \
+          "${{ steps.build_info.outputs.build_time }}" \
+          "${{ steps.build_info.outputs.total_time }}" \
+          "${{ steps.stats.outputs.passed }}" \
+          "${{ steps.stats.outputs.failed }}" \
+          "${{ github.run_id }}" \
+          "$COMPARISON_SECTION" \
+          "${{ github.repository }}" \
+          > pr_body.md
+
+        # Check if PR already exists
+        EXISTING_PR=$(gh pr list --head "${{ github.ref_name }}" --base "$BASE_BRANCH" --json number --jq '.[0].number' || echo "")
+
+        if [ -n "$EXISTING_PR" ]; then
+          echo "PR #$EXISTING_PR already exists, updating it"
+          gh pr edit "$EXISTING_PR" \
+            --title "[${{ github.ref_name }}] ${{ steps.commit_msg.outputs.commit_subject }}" \
+            --body-file pr_body.md
+        else
+          echo "Creating new PR from ${{ github.ref_name }} to $BASE_BRANCH"
+          gh pr create \
+            --base "$BASE_BRANCH" \
+            --head "${{ github.ref_name }}" \
+            --title "[${{ github.ref_name }}] ${{ steps.commit_msg.outputs.commit_subject }}" \
+            --body-file pr_body.md \
+            --label "automated,tested,ready-for-review"
+        fi
