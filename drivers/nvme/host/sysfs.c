@@ -260,6 +260,7 @@ static struct attribute *nvme_ns_attrs[] = {
 	&dev_attr_ana_state.attr,
 	&dev_attr_queue_depth.attr,
 	&dev_attr_numa_nodes.attr,
+	&dev_attr_delayed_removal_secs.attr,
 #endif
 	&dev_attr_io_passthru_err_log_enabled.attr,
 	NULL,
@@ -294,6 +295,12 @@ static umode_t nvme_ns_attrs_are_visible(struct kobject *kobj,
 	}
 	if (a == &dev_attr_queue_depth.attr || a == &dev_attr_numa_nodes.attr) {
 		if (nvme_disk_is_ns_head(dev_to_disk(dev)))
+			return 0;
+	}
+	if (a == &dev_attr_delayed_removal_secs.attr) {
+		struct gendisk *disk = dev_to_disk(dev);
+
+		if (!nvme_disk_is_ns_head(disk))
 			return 0;
 	}
 #endif
@@ -828,10 +835,10 @@ static umode_t nvme_tls_attrs_are_visible(struct kobject *kobj,
 		return 0;
 
 	if (a == &dev_attr_tls_key.attr &&
-	    !ctrl->opts->tls)
+	    !ctrl->opts->tls && !ctrl->opts->concat)
 		return 0;
 	if (a == &dev_attr_tls_configured_key.attr &&
-	    !ctrl->opts->tls_key)
+	    (!ctrl->opts->tls_key || ctrl->opts->concat))
 		return 0;
 	if (a == &dev_attr_tls_keyring.attr &&
 	    !ctrl->opts->keyring)

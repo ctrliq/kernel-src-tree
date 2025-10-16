@@ -9,7 +9,6 @@
 #include <linux/slab.h>
 #include <linux/crc32c.h>
 #include <linux/err.h>
-#include <linux/key.h>
 #include <linux/nvme-tcp.h>
 #include <linux/nvme-keyring.h>
 #include <net/sock.h>
@@ -1040,12 +1039,12 @@ static int nvmet_tcp_done_recv_pdu(struct nvmet_tcp_queue *queue)
 	req = &queue->cmd->req;
 	memcpy(req->cmd, nvme_cmd, sizeof(*nvme_cmd));
 
-	if (unlikely(!nvmet_req_init(req, &queue->nvme_cq,
-			&queue->nvme_sq, &nvmet_tcp_ops))) {
-		pr_err("failed cmd %p id %d opcode %d, data_len: %d\n",
+	if (unlikely(!nvmet_req_init(req, &queue->nvme_sq, &nvmet_tcp_ops))) {
+		pr_err("failed cmd %p id %d opcode %d, data_len: %d, status: %04x\n",
 			req->cmd, req->cmd->common.command_id,
 			req->cmd->common.opcode,
-			le32_to_cpu(req->cmd->common.dptr.sgl.length));
+			le32_to_cpu(req->cmd->common.dptr.sgl.length),
+			le16_to_cpu(req->cqe->status));
 
 		nvmet_tcp_handle_req_failure(queue, queue->cmd, req);
 		return 0;
@@ -1574,8 +1573,10 @@ static void nvmet_tcp_release_queue_work(struct work_struct *w)
 	/* stop accepting incoming data */
 	queue->rcv_state = NVMET_TCP_RECV_ERR;
 
+	nvmet_sq_put_tls_key(&queue->nvme_sq);
 	nvmet_tcp_uninit_data_in_cmds(queue);
 	nvmet_sq_destroy(&queue->nvme_sq);
+	nvmet_cq_put(&queue->nvme_cq);
 	cancel_work_sync(&queue->io_work);
 	nvmet_tcp_free_cmd_data_in_buffers(queue);
 	/* ->sock will be released by fput() */
@@ -1757,6 +1758,27 @@ static int nvmet_tcp_try_peek_pdu(struct nvmet_tcp_queue *queue)
 	return 0;
 }
 
+static int nvmet_tcp_tls_key_lookup(struct nvmet_tcp_queue *queue,
+				    key_serial_t peerid)
+{
+	struct key *tls_key = nvme_tls_key_lookup(peerid);
+	int status = 0;
+
+	if (IS_ERR(tls_key)) {
+		pr_warn("%s: queue %d failed to lookup key %x\n",
+			__func__, queue->idx, peerid);
+		spin_lock_bh(&queue->state_lock);
+		queue->state = NVMET_TCP_Q_FAILED;
+		spin_unlock_bh(&queue->state_lock);
+		status = PTR_ERR(tls_key);
+	} else {
+		pr_debug("%s: queue %d using TLS PSK %x\n",
+			 __func__, queue->idx, peerid);
+		queue->nvme_sq.tls_key = tls_key;
+	}
+	return status;
+}
+
 static void nvmet_tcp_tls_handshake_done(void *data, int status,
 					 key_serial_t peerid)
 {
@@ -1777,6 +1799,10 @@ static void nvmet_tcp_tls_handshake_done(void *data, int status,
 	spin_unlock_bh(&queue->state_lock);
 
 	cancel_delayed_work_sync(&queue->tls_handshake_tmo_work);
+
+	if (!status)
+		status = nvmet_tcp_tls_key_lookup(queue, peerid);
+
 	if (status)
 		nvmet_tcp_schedule_release_queue(queue);
 	else
@@ -1884,7 +1910,8 @@ static void nvmet_tcp_alloc_queue(struct nvmet_tcp_port *port,
 	if (ret)
 		goto out_ida_remove;
 
-	ret = nvmet_sq_init(&queue->nvme_sq);
+	nvmet_cq_init(&queue->nvme_cq);
+	ret = nvmet_sq_init(&queue->nvme_sq, &queue->nvme_cq);
 	if (ret)
 		goto out_free_connect;
 
@@ -1901,10 +1928,10 @@ static void nvmet_tcp_alloc_queue(struct nvmet_tcp_port *port,
 		struct sock *sk = queue->sock->sk;
 
 		/* Restore the default callbacks before starting upcall */
-		read_lock_bh(&sk->sk_callback_lock);
+		write_lock_bh(&sk->sk_callback_lock);
 		sk->sk_user_data = NULL;
 		sk->sk_data_ready = port->data_ready;
-		read_unlock_bh(&sk->sk_callback_lock);
+		write_unlock_bh(&sk->sk_callback_lock);
 		if (!nvmet_tcp_try_peek_pdu(queue)) {
 			if (!nvmet_tcp_tls_handshake(queue))
 				return;
@@ -1927,6 +1954,7 @@ out_destroy_sq:
 	mutex_unlock(&nvmet_tcp_queue_mutex);
 	nvmet_sq_destroy(&queue->nvme_sq);
 out_free_connect:
+	nvmet_cq_put(&queue->nvme_cq);
 	nvmet_tcp_free_cmd(&queue->connect);
 out_ida_remove:
 	ida_free(&nvmet_tcp_queue_ida, queue->idx);
