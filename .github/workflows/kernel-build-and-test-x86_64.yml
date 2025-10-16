@@ -199,39 +199,117 @@ jobs:
     if: success() || failure()
 
     steps:
+    - name: Checkout kernel source
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
     - name: Download current kselftest logs
       uses: actions/download-artifact@v4
       with:
         name: kselftest-logs-x86_64
         path: output-current
 
-    - name: Download previous kselftest logs
+    - name: Determine base branch for comparison
+      id: base_branch
+      run: |
+        BASE_BRANCH=""
+
+        # For PRs, use the base branch directly
+        if [ -n "${{ github.base_ref }}" ]; then
+          BASE_BRANCH="${{ github.base_ref }}"
+          echo "Using PR base branch: $BASE_BRANCH"
+        else
+          # For direct pushes, find the common ancestor branch
+          echo "Not a PR, finding base branch via merge-base"
+
+          # Get all remote branches and find the one with closest common ancestor
+          CURRENT_COMMIT=$(git rev-parse HEAD)
+          BEST_BRANCH=""
+          CLOSEST_DISTANCE=999999
+
+          for remote_branch in $(git for-each-ref --format='%(refname:short)' refs/remotes/origin/ | grep -v 'HEAD\|PR-CHECKER'); do
+            branch_name=$(echo "$remote_branch" | sed 's|^origin/||')
+
+            # Skip if it's the current branch
+            if [ "$branch_name" = "${{ github.ref_name }}" ]; then
+              continue
+            fi
+
+            MERGE_BASE=$(git merge-base HEAD "$remote_branch" 2>/dev/null || echo "")
+
+            # Check if this branch shares history and isn't the current commit
+            if [ -n "$MERGE_BASE" ] && [ "$MERGE_BASE" != "$CURRENT_COMMIT" ]; then
+              # Calculate distance (number of commits) from merge-base to current HEAD
+              DISTANCE=$(git rev-list --count ${MERGE_BASE}..HEAD 2>/dev/null || echo "999999")
+
+              # Find the branch with the shortest distance (most recent common ancestor)
+              if [ "$DISTANCE" -lt "$CLOSEST_DISTANCE" ]; then
+                CLOSEST_DISTANCE=$DISTANCE
+                BEST_BRANCH=$branch_name
+              fi
+            fi
+          done
+
+          if [ -n "$BEST_BRANCH" ]; then
+            BASE_BRANCH=$BEST_BRANCH
+            echo "Found common ancestor with $BASE_BRANCH (distance: $CLOSEST_DISTANCE commits)"
+          fi
+        fi
+
+        if [ -z "$BASE_BRANCH" ]; then
+          echo "::warning::Could not determine base branch for comparison - no common ancestor found"
+          echo "::warning::Kselftest comparison will be skipped"
+          echo "base_branch=" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        echo "base_branch=$BASE_BRANCH" >> $GITHUB_OUTPUT
+        echo "Base branch for comparison: $BASE_BRANCH"
+
+    - name: Download baseline kselftest logs from base branch
+      if: steps.base_branch.outputs.base_branch != ''
       uses: dawidd6/action-download-artifact@v3
       with:
         workflow: kernel-build-and-test-x86_64.yml
         name: kselftest-logs-x86_64
         path: output-previous
-        branch: ${{ github.ref_name }}
+        branch: ${{ steps.base_branch.outputs.base_branch }}
         workflow_conclusion: success
         search_artifacts: true
         skip_unpack: false
         if_no_artifact_found: warn
+        # Only search the last 5 successful runs for better performance
+        run_number: ${{ github.run_number }}
+        search_depth: 5
       continue-on-error: true
+      timeout-minutes: 3
 
     - name: Compare test results
+      id: comparison
       run: |
-        if [ -f output-previous/kselftests-*.log ]; then
+        # Check if we have a base branch to compare against
+        if [ -z "${{ steps.base_branch.outputs.base_branch }}" ]; then
+          echo "::warning::No base branch found for comparison"
+          echo "::warning::Kselftest comparison will be skipped"
+          echo "comparison_status=skipped" >> $GITHUB_OUTPUT
+          echo "comparison_message=No base branch found - unable to determine merge target" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        # Check if baseline logs exist
+        if ls output-previous/kselftests-*.log 1> /dev/null 2>&1; then
           # Compare passing tests (ok)
-          BEFORE_PASS=$(grep -a '^ok' output-previous/kselftests-*.log | wc -l)
-          AFTER_PASS=$(grep -a '^ok' output-current/kselftests-*.log | wc -l)
+          BEFORE_PASS=$(grep -a '^ok' output-previous/kselftests-*.log | wc -l || echo "0")
+          AFTER_PASS=$(grep -a '^ok' output-current/kselftests-*.log | wc -l || echo "0")
 
           # Compare failing tests (not ok)
-          BEFORE_FAIL=$(grep -a '^not ok' output-previous/kselftests-*.log | wc -l)
-          AFTER_FAIL=$(grep -a '^not ok' output-current/kselftests-*.log | wc -l)
+          BEFORE_FAIL=$(grep -a '^not ok' output-previous/kselftests-*.log | wc -l || echo "0")
+          AFTER_FAIL=$(grep -a '^not ok' output-current/kselftests-*.log | wc -l || echo "0")
 
-          echo "### Kselftest Comparison (Branch: ${{ github.ref_name }})"
-          echo "Passing tests: $BEFORE_PASS -> $AFTER_PASS"
-          echo "Failing tests: $BEFORE_FAIL -> $AFTER_FAIL"
+          echo "### Kselftest Comparison"
+          echo "Baseline (from ${{ steps.base_branch.outputs.base_branch }}): $BEFORE_PASS passing, $BEFORE_FAIL failing"
+          echo "Current (${{ github.ref_name }}): $AFTER_PASS passing, $AFTER_FAIL failing"
 
           # Calculate differences
           PASS_DIFF=$((AFTER_PASS - BEFORE_PASS))
@@ -255,10 +333,18 @@ jobs:
 
           if [ $REGRESSION -eq 1 ]; then
             echo "::error::Test regression exceeds acceptable threshold of 3 tests"
+            echo "comparison_status=failed" >> $GITHUB_OUTPUT
+            echo "comparison_message=Regression detected: Pass diff: $PASS_DIFF, Fail diff: $FAIL_DIFF (threshold: ±3)" >> $GITHUB_OUTPUT
             exit 1
           else
             echo "::notice::Test results within acceptable range (threshold: ±3 tests)"
+            echo "comparison_status=passed" >> $GITHUB_OUTPUT
+            echo "comparison_message=Baseline: $BEFORE_PASS passing, $BEFORE_FAIL failing | Current: $AFTER_PASS passing, $AFTER_FAIL failing" >> $GITHUB_OUTPUT
           fi
         else
-          echo "::warning::No previous successful test results found for branch ${{ github.ref_name }}, skipping comparison"
+          echo "::warning::No baseline test results found for branch ${{ steps.base_branch.outputs.base_branch }}"
+          echo "::notice::Cannot compare against base branch - artifacts may not exist or have expired (7-day retention)"
+          echo "::notice::Skipping comparison - PR will still be created with warning"
+          echo "comparison_status=skipped" >> $GITHUB_OUTPUT
+          echo "comparison_message=No baseline results available from ${{ steps.base_branch.outputs.base_branch }}" >> $GITHUB_OUTPUT
         fi
