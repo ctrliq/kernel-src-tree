@@ -197,6 +197,8 @@ jobs:
     runs-on: kernel-build
     needs: test-kselftest
     if: success() || failure()
+    outputs:
+      base_branch: ${{ steps.base_branch.outputs.base_branch }}
 
     steps:
     - name: Checkout kernel source
@@ -223,12 +225,14 @@ jobs:
           # For direct pushes, find the common ancestor branch
           echo "Not a PR, finding base branch via merge-base"
 
-          # Get all remote branches and find the one with closest common ancestor
+          # Get all remote branches sorted by commit date (most recent first)
+          # This ensures we check actively developed branches first
           CURRENT_COMMIT=$(git rev-parse HEAD)
           BEST_BRANCH=""
           CLOSEST_DISTANCE=999999
 
-          for remote_branch in $(git for-each-ref --format='%(refname:short)' refs/remotes/origin/ | grep -v 'HEAD\|PR-CHECKER'); do
+          # Only check the 30 most recently updated branches for performance
+          for remote_branch in $(git for-each-ref --sort=-committerdate --format='%(refname:short)' refs/remotes/origin/ | grep -v 'HEAD\|PR-CHECKER' | head -30); do
             branch_name=$(echo "$remote_branch" | sed 's|^origin/||')
 
             # Skip if it's the current branch
@@ -368,7 +372,7 @@ jobs:
     - name: Checkout kernel source
       uses: actions/checkout@v4
       with:
-        fetch-depth: 0
+        fetch-depth: 50  # Shallow clone: enough for commit messages and logs
         token: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Download kernel compilation logs
@@ -442,52 +446,11 @@ jobs:
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        BASE_BRANCH=""
-
-        # For PRs, use the base branch directly
-        if [ -n "${{ github.base_ref }}" ]; then
-          BASE_BRANCH="${{ github.base_ref }}"
-          echo "Using PR base branch: $BASE_BRANCH"
-        else
-          # For direct pushes, find the common ancestor branch
-          echo "Not a PR, finding base branch via merge-base"
-
-          # Get all remote branches and find the one with closest common ancestor
-          CURRENT_COMMIT=$(git rev-parse HEAD)
-          BEST_BRANCH=""
-          CLOSEST_DISTANCE=999999
-
-          for remote_branch in $(git for-each-ref --format='%(refname:short)' refs/remotes/origin/ | grep -v 'HEAD\|PR-CHECKER'); do
-            branch_name=$(echo "$remote_branch" | sed 's|^origin/||')
-
-            # Skip if it's the current branch
-            if [ "$branch_name" = "${{ github.ref_name }}" ]; then
-              continue
-            fi
-
-            MERGE_BASE=$(git merge-base HEAD "$remote_branch" 2>/dev/null || echo "")
-
-            # Check if this branch shares history and isn't the current commit
-            if [ -n "$MERGE_BASE" ] && [ "$MERGE_BASE" != "$CURRENT_COMMIT" ]; then
-              # Calculate distance (number of commits) from merge-base to current HEAD
-              DISTANCE=$(git rev-list --count ${MERGE_BASE}..HEAD 2>/dev/null || echo "999999")
-
-              # Find the branch with the shortest distance (most recent common ancestor)
-              if [ "$DISTANCE" -lt "$CLOSEST_DISTANCE" ]; then
-                CLOSEST_DISTANCE=$DISTANCE
-                BEST_BRANCH=$branch_name
-              fi
-            fi
-          done
-
-          if [ -n "$BEST_BRANCH" ]; then
-            BASE_BRANCH=$BEST_BRANCH
-            echo "Found common ancestor with $BASE_BRANCH (distance: $CLOSEST_DISTANCE commits)"
-          fi
-        fi
+        # Reuse base branch from compare-results stage (already computed)
+        BASE_BRANCH="${{ needs.compare-results.outputs.base_branch }}"
 
         if [ -z "$BASE_BRANCH" ]; then
-          echo "ERROR: Could not determine base branch for PR"
+          echo "ERROR: Could not determine base branch for PR (compare-results did not find one)"
           exit 1
         fi
 
