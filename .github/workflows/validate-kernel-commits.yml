@@ -1,0 +1,80 @@
+name: Validate Kernel Commits
+
+on:
+  workflow_call:
+    # No inputs needed - uses github context from caller
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  validate-kernel-commits:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.head_ref }}
+
+      - name: Checkout base branch
+        run: |
+          git fetch origin ${{ github.base_ref }}:${{ github.base_ref }}
+
+      - name: Download check_kernel_commits.py
+        run: |
+          curl -sL \
+            https://raw.githubusercontent.com/ctrliq/kernel-src-tree-tools/mainline/check_kernel_commits.py \
+            -o check_kernel_commits.py
+          chmod +x check_kernel_commits.py
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Run upstream fixes check
+        id: check-kernel-commits
+        run: |
+          set +e  # Don't exit on error, we want to capture the output
+          python3 check_kernel_commits.py --repo . --pr_branch "${{ github.head_ref }}" --base_branch "${{ github.base_ref }}" --markdown | tee result.txt
+          EXIT_CODE=$?
+
+          # Check if the script failed
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "❌ Kernel commits check failed with exit code $EXIT_CODE"
+            exit $EXIT_CODE
+          fi
+
+          # Check for findings:
+          # 1. Verify the success message exists
+          # 2. If it exists, check if there are any OTHER lines (which would indicate issues)
+          # 3. If success message doesn't exist, that's also a finding
+          if grep -q "All referenced commits exist upstream and have no Fixes: tags." result.txt; then
+            # Success message found, check if there are any other lines
+            LINE_COUNT=$(wc -l < ../ckc_result.txt)
+            if [ "$LINE_COUNT" -gt 1 ]; then
+              echo "has_findings=true" >> $GITHUB_OUTPUT
+            else
+              echo "has_findings=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            # Success message not found, there must be findings
+            echo "has_findings=true" >> $GITHUB_OUTPUT
+          fi
+
+          set -e  # Re-enable exit on error
+
+      - name: Comment on PR if issues found
+        if: steps.check-kernel-commits.outputs.has_findings == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh pr comment ${{ github.event.pull_request.number }} \
+            --body-file result.txt \
+            --repo ${{ github.repository }}; then
+            echo "❌ Failed to post check-kernel-commits comment to PR"
+            exit 1
+          fi
