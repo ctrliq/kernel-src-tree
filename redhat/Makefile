@@ -644,6 +644,7 @@ sources-rh: $(TARBALL) generate-testpatch-tmp setup-source dist-configs-check
 		README.rst \
 		kernel-local \
 		dracut-virt.conf \
+		keys/redhatsecureboot504.cer \
 		$(SOURCES)/
 	@cat $$(ls -1 $(PACKAGE_NAME).changelog-* | sort -t '.' -k 3 -n -r) \
 		> $(SOURCES)/kernel.changelog
