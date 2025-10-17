@@ -1152,6 +1152,7 @@ void kvm_set_cpu_caps(void)
 
 	kvm_cpu_cap_init(CPUID_8000_0021_EAX,
 		F(NO_NESTED_DATA_BP),
+		F(WRMSR_XX_BASE_NS),
 		/*
 		 * Synthesize "LFENCE is serializing" into the AMD-defined entry
 		 * in KVM's supported CPUID, i.e. if the feature is reported as
@@ -1167,10 +1168,12 @@ void kvm_set_cpu_caps(void)
 		/* 4: Resv */
 		SYNTHESIZED_F(VERW_CLEAR),
 		F(NULL_SEL_CLR_BASE),
+		/* UpperAddressIgnore */
 		F(AUTOIBRS),
 		EMULATED_F(NO_SMM_CTL_MSR),
 		/* PrefetchCtlMsr */
-		F(WRMSR_XX_BASE_NS),
+		/* GpOnUserCpuid */
+		/* EPSF */
 		SYNTHESIZED_F(SBPB),
 		SYNTHESIZED_F(IBPB_BRTYPE),
 		SYNTHESIZED_F(SRSO_NO),
