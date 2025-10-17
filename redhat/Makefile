@@ -761,6 +761,7 @@ sources-rh: $(TARBALL) $(KABI_TARBALL) $(KABIDW_TARBALL) generate-testpatch-tmp 
 		README.rst \
 		kernel-local \
 		dracut-virt.conf \
+		keys/redhatsecureboot504.cer \
 		uki.sbat.template \
 		uki-addons.sbat.template \
 		$(SOURCES)/
