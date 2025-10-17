@@ -125,9 +125,11 @@ static void gfs2_qd_dispose(struct gfs2_quota_data *qd)
 	hlist_bl_del_rcu(&qd->qd_hlist);
 	spin_unlock_bucket(qd->qd_hash);
 
-	gfs2_assert_warn(sdp, !qd->qd_change);
-	gfs2_assert_warn(sdp, !qd->qd_slot_count);
-	gfs2_assert_warn(sdp, !qd->qd_bh_count);
+	if (!gfs2_withdrawing_or_withdrawn(sdp)) {
+		gfs2_assert_warn(sdp, !qd->qd_change);
+		gfs2_assert_warn(sdp, !qd->qd_slot_count);
+		gfs2_assert_warn(sdp, !qd->qd_bh_count);
+	}
 
 	gfs2_glock_put(qd->qd_gl);
 	call_rcu(&qd->qd_rcu, gfs2_qd_dealloc);
@@ -1537,7 +1539,7 @@ static void quotad_error(struct gfs2_sbd *sdp, const char *msg, int error)
 {
 	if (error == 0 || error == -EROFS)
 		return;
-	if (!gfs2_withdrawn(sdp)) {
+	if (!gfs2_withdrawing_or_withdrawn(sdp)) {
 		if (!cmpxchg(&sdp->sd_log_error, 0, error))
 			fs_err(sdp, "gfs2_quotad: %s error %d\n", msg, error);
 		wake_up(&sdp->sd_logd_waitq);
@@ -1579,12 +1581,11 @@ int gfs2_quotad(void *data)
 	unsigned long statfs_timeo = 0;
 	unsigned long quotad_timeo = 0;
 	unsigned long t = 0;
-	DEFINE_WAIT(wait);
 
 	while (!kthread_should_stop()) {
+		if (gfs2_withdrawing_or_withdrawn(sdp))
+			break;
 
-		if (gfs2_withdrawn(sdp))
-			goto bypass;
 		/* Update the master statfs file */
 		if (sdp->sd_statfs_force_sync) {
 			int error = gfs2_statfs_sync(sdp->sd_vfs, 0);
@@ -1602,15 +1603,16 @@ int gfs2_quotad(void *data)
 
 		try_to_freeze();
 
-bypass:
 		t = min(quotad_timeo, statfs_timeo);
 
-		prepare_to_wait(&sdp->sd_quota_wait, &wait, TASK_INTERRUPTIBLE);
-		if (!sdp->sd_statfs_force_sync)
-			t -= schedule_timeout(t);
-		else
+		t = wait_event_interruptible_timeout(sdp->sd_quota_wait,
+				sdp->sd_statfs_force_sync ||
+				gfs2_withdrawing_or_withdrawn(sdp) ||
+				kthread_should_stop(),
+				t);
+
+		if (sdp->sd_statfs_force_sync)
 			t = 0;
-		finish_wait(&sdp->sd_quota_wait, &wait);
 	}
 
 	return 0;
