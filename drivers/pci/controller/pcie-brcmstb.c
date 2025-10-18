@@ -1357,11 +1357,7 @@ static int brcm_pcie_start_link(struct brcm_pcie *pcie)
 	if (ret)
 		return ret;
 
-	/*
-	 * Wait for 100ms after PERST# deassertion; see PCIe CEM specification
-	 * sections 2.2, PCIe r5.0, 6.6.1.
-	 */
-	msleep(100);
+	msleep(PCIE_RESET_CONFIG_WAIT_MS);
 
 	/*
 	 * Give the RC/EP even more time to wake up, before trying to
