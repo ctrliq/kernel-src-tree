@@ -1522,7 +1522,7 @@ ptp_ocp_utc_distribute(struct ptp_ocp *bp, u32 val)
 static void
 ptp_ocp_watchdog(struct timer_list *t)
 {
-	struct ptp_ocp *bp = from_timer(bp, t, watchdog);
+	struct ptp_ocp *bp = timer_container_of(bp, t, watchdog);
 	unsigned long flags;
 	u32 status, utc_offset;
 
@@ -4498,7 +4498,7 @@ ptp_ocp_detach(struct ptp_ocp *bp)
 	ptp_ocp_detach_sysfs(bp);
 	ptp_ocp_attr_group_del(bp);
 	if (timer_pending(&bp->watchdog))
-		del_timer_sync(&bp->watchdog);
+		timer_delete_sync(&bp->watchdog);
 	if (bp->ts0)
 		ptp_ocp_unregister_ext(bp->ts0);
 	if (bp->ts1)

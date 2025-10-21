@@ -836,7 +836,7 @@ int mwifiex_process_cmdresp(struct mwifiex_adapter *adapter)
 		return -1;
 	}
 	/* Now we got response from FW, cancel the command timer */
-	del_timer_sync(&adapter->cmd_timer);
+	timer_delete_sync(&adapter->cmd_timer);
 	clear_bit(MWIFIEX_IS_CMD_TIMEDOUT, &adapter->work_flags);
 
 	if (adapter->curr_cmd->cmd_flag & CMD_F_HOSTCMD) {
@@ -954,7 +954,8 @@ void mwifiex_process_assoc_resp(struct mwifiex_adapter *adapter)
 void
 mwifiex_cmd_timeout_func(struct timer_list *t)
 {
-	struct mwifiex_adapter *adapter = from_timer(adapter, t, cmd_timer);
+	struct mwifiex_adapter *adapter = timer_container_of(adapter, t,
+						             cmd_timer);
 	struct cmd_ctrl_node *cmd_node;
 
 	set_bit(MWIFIEX_IS_CMD_TIMEDOUT, &adapter->work_flags);

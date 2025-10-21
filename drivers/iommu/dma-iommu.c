@@ -177,7 +177,8 @@ static void fq_flush_iotlb(struct iommu_dma_cookie *cookie)
 
 static void fq_flush_timeout(struct timer_list *t)
 {
-	struct iommu_dma_cookie *cookie = from_timer(cookie, t, fq_timer);
+	struct iommu_dma_cookie *cookie = timer_container_of(cookie, t,
+							     fq_timer);
 	int cpu;
 
 	atomic_set(&cookie->fq_timer_on, 0);
@@ -272,7 +273,7 @@ static void iommu_dma_free_fq(struct iommu_dma_cookie *cookie)
 	if (!cookie->fq_domain)
 		return;
 
-	del_timer_sync(&cookie->fq_timer);
+	timer_delete_sync(&cookie->fq_timer);
 	if (cookie->options.qt == IOMMU_DMA_OPTS_SINGLE_QUEUE)
 		iommu_dma_free_fq_single(cookie->single_fq);
 	else

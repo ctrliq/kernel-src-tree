@@ -700,7 +700,7 @@ void ata_scsi_port_error_handler(struct Scsi_Host *host, struct ata_port *ap)
 	ata_eh_acquire(ap);
  repeat:
 	/* kill fast drain timer */
-	del_timer_sync(&ap->fastdrain_timer);
+	timer_delete_sync(&ap->fastdrain_timer);
 
 	/* process port resume request */
 	ata_eh_handle_port_resume(ap);
@@ -860,7 +860,7 @@ static unsigned int ata_eh_nr_in_flight(struct ata_port *ap)
 
 void ata_eh_fastdrain_timerfn(struct timer_list *t)
 {
-	struct ata_port *ap = from_timer(ap, t, fastdrain_timer);
+	struct ata_port *ap = timer_container_of(ap, t, fastdrain_timer);
 	unsigned long flags;
 	unsigned int cnt;
 

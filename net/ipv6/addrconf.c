@@ -312,7 +312,7 @@ static inline bool addrconf_link_ready(const struct net_device *dev)
 
 static void addrconf_del_rs_timer(struct inet6_dev *idev)
 {
-	if (del_timer(&idev->rs_timer))
+	if (timer_delete(&idev->rs_timer))
 		__in6_dev_put(idev);
 }
 
@@ -4040,7 +4040,7 @@ restart:
 
 static void addrconf_rs_timer(struct timer_list *t)
 {
-	struct inet6_dev *idev = from_timer(idev, t, rs_timer);
+	struct inet6_dev *idev = timer_container_of(idev, t, rs_timer);
 	struct net_device *dev = idev->dev;
 	struct in6_addr lladdr;
 	int rtr_solicits;

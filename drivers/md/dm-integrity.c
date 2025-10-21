@@ -1540,7 +1540,8 @@ static void sleep_on_endio_wait(struct dm_integrity_c *ic)
 
 static void autocommit_fn(struct timer_list *t)
 {
-	struct dm_integrity_c *ic = from_timer(ic, t, autocommit_timer);
+	struct dm_integrity_c *ic = timer_container_of(ic, t,
+						       autocommit_timer);
 
 	if (likely(!dm_integrity_failed(ic)))
 		queue_work(ic->commit_wq, &ic->commit_work);
@@ -2701,7 +2702,7 @@ static void integrity_commit(struct work_struct *w)
 	unsigned int i, j, n;
 	struct bio *flushes;
 
-	del_timer(&ic->autocommit_timer);
+	timer_delete(&ic->autocommit_timer);
 
 	if (ic->mode == 'I')
 		return;
@@ -3602,7 +3603,7 @@ static void dm_integrity_postsuspend(struct dm_target *ti)
 
 	WARN_ON(unregister_reboot_notifier(&ic->reboot_notifier));
 
-	del_timer_sync(&ic->autocommit_timer);
+	timer_delete_sync(&ic->autocommit_timer);
 
 	if (ic->recalc_wq)
 		drain_workqueue(ic->recalc_wq);

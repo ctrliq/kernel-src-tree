@@ -1553,7 +1553,7 @@ static bool kvm_xen_schedop_poll(struct kvm_vcpu *vcpu, bool longmode,
 		kvm_vcpu_halt(vcpu);
 
 		if (sched_poll.timeout)
-			del_timer(&vcpu->arch.xen.poll_timer);
+			timer_delete(&vcpu->arch.xen.poll_timer);
 
 		kvm_set_mp_state(vcpu, KVM_MP_STATE_RUNNABLE);
 	}
@@ -1571,7 +1571,8 @@ out:
 
 static void cancel_evtchn_poll(struct timer_list *t)
 {
-	struct kvm_vcpu *vcpu = from_timer(vcpu, t, arch.xen.poll_timer);
+	struct kvm_vcpu *vcpu = timer_container_of(vcpu, t,
+						   arch.xen.poll_timer);
 
 	kvm_make_request(KVM_REQ_UNBLOCK, vcpu);
 	kvm_vcpu_kick(vcpu);
@@ -2289,8 +2290,8 @@ void kvm_xen_init_vcpu(struct kvm_vcpu *vcpu)
 	vcpu->arch.xen.poll_evtchn = 0;
 
 	timer_setup(&vcpu->arch.xen.poll_timer, cancel_evtchn_poll, 0);
-	hrtimer_init(&vcpu->arch.xen.timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS_HARD);
-	vcpu->arch.xen.timer.function = xen_timer_callback;
+	hrtimer_setup(&vcpu->arch.xen.timer, xen_timer_callback, CLOCK_MONOTONIC,
+		      HRTIMER_MODE_ABS_HARD);
 
 	kvm_gpc_init(&vcpu->arch.xen.runstate_cache, vcpu->kvm);
 	kvm_gpc_init(&vcpu->arch.xen.runstate2_cache, vcpu->kvm);
@@ -2308,7 +2309,7 @@ void kvm_xen_destroy_vcpu(struct kvm_vcpu *vcpu)
 	kvm_gpc_deactivate(&vcpu->arch.xen.vcpu_info_cache);
 	kvm_gpc_deactivate(&vcpu->arch.xen.vcpu_time_info_cache);
 
-	del_timer_sync(&vcpu->arch.xen.poll_timer);
+	timer_delete_sync(&vcpu->arch.xen.poll_timer);
 }
 
 void kvm_xen_init_vm(struct kvm *kvm)

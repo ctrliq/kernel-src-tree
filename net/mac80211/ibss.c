@@ -1681,7 +1681,7 @@ void ieee80211_ibss_work(struct ieee80211_sub_if_data *sdata)
 static void ieee80211_ibss_timer(struct timer_list *t)
 {
 	struct ieee80211_sub_if_data *sdata =
-		from_timer(sdata, t, u.ibss.timer);
+		timer_container_of(sdata, t, u.ibss.timer);
 
 	wiphy_work_queue(sdata->local->hw.wiphy, &sdata->work);
 }
@@ -1844,7 +1844,7 @@ int ieee80211_ibss_leave(struct ieee80211_sub_if_data *sdata)
 
 	skb_queue_purge(&sdata->skb_queue);
 
-	del_timer_sync(&sdata->u.ibss.timer);
+	timer_delete_sync(&sdata->u.ibss.timer);
 
 	return 0;
 }

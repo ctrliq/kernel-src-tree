@@ -3927,7 +3927,7 @@ void lpfc_poll_eratt(struct timer_list *t)
 	uint32_t eratt = 0;
 	uint64_t sli_intr, cnt;
 
-	phba = from_timer(phba, t, eratt_poll);
+	phba = timer_container_of(phba, t, eratt_poll);
 	if (!test_bit(HBA_SETUP, &phba->hba_flag))
 		return;
 
@@ -5044,7 +5044,7 @@ lpfc_sli_brdkill(struct lpfc_hba *phba)
 			return 1;
 	}
 
-	del_timer_sync(&psli->mbox_tmo);
+	timer_delete_sync(&psli->mbox_tmo);
 	if (ha_copy & HA_ERATT) {
 		writel(HA_ERATT, phba->HAregaddr);
 		phba->pport->stopped = 1;
@@ -9118,7 +9118,7 @@ out_free_mbox:
 void
 lpfc_mbox_timeout(struct timer_list *t)
 {
-	struct lpfc_hba  *phba = from_timer(phba, t, sli.mbox_tmo);
+	struct lpfc_hba  *phba = timer_container_of(phba, t, sli.mbox_tmo);
 	unsigned long iflag;
 	uint32_t tmo_posted;
 
@@ -12083,7 +12083,7 @@ lpfc_sli_hba_down(struct lpfc_hba *phba)
 	local_bh_enable();
 
 	/* Return any active mbox cmds */
-	del_timer_sync(&psli->mbox_tmo);
+	timer_delete_sync(&psli->mbox_tmo);
 
 	spin_lock_irqsave(&phba->pport->work_port_lock, flags);
 	phba->pport->work_port_events &= ~WORKER_MBOX_TMO;
@@ -13811,7 +13811,7 @@ lpfc_sli_sp_intr_handler(int irq, void *dev_id)
 				phba->sli.mbox_active = NULL;
 				spin_unlock_irqrestore(&phba->hbalock, iflag);
 				phba->last_completion_time = jiffies;
-				del_timer(&phba->sli.mbox_tmo);
+				timer_delete(&phba->sli.mbox_tmo);
 				if (pmb->mbox_cmpl) {
 					lpfc_sli_pcimem_bcopy(mbox, pmbox,
 							MAILBOX_CMD_SIZE);
@@ -14311,7 +14311,7 @@ lpfc_sli4_sp_handle_mbox_event(struct lpfc_hba *phba, struct lpfc_mcqe *mcqe)
 
 	/* Reset heartbeat timer */
 	phba->last_completion_time = jiffies;
-	del_timer(&phba->sli.mbox_tmo);
+	timer_delete(&phba->sli.mbox_tmo);
 
 	/* Move mbox data to caller's mailbox region, do endian swapping */
 	if (pmb->mbox_cmpl && mbox)
@@ -15660,7 +15660,7 @@ lpfc_sli4_intr_handler(int irq, void *dev_id)
 
 void lpfc_sli4_poll_hbtimer(struct timer_list *t)
 {
-	struct lpfc_hba *phba = from_timer(phba, t, cpuhp_poll_timer);
+	struct lpfc_hba *phba = timer_container_of(phba, t, cpuhp_poll_timer);
 	struct lpfc_queue *eq;
 
 	rcu_read_lock();
@@ -15698,7 +15698,7 @@ static inline void lpfc_sli4_remove_from_poll_list(struct lpfc_queue *eq)
 	synchronize_rcu();
 
 	if (list_empty(&phba->poll_list))
-		del_timer_sync(&phba->cpuhp_poll_timer);
+		timer_delete_sync(&phba->cpuhp_poll_timer);
 }
 
 void lpfc_sli4_cleanup_poll_list(struct lpfc_hba *phba)

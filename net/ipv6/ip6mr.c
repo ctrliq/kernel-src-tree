@@ -839,7 +839,7 @@ static void ipmr_do_expire_process(struct mr_table *mrt)
 
 static void ipmr_expire_process(struct timer_list *t)
 {
-	struct mr_table *mrt = from_timer(mrt, t, ipmr_expire_timer);
+	struct mr_table *mrt = timer_container_of(mrt, t, ipmr_expire_timer);
 
 	if (!spin_trylock(&mfc_unres_lock)) {
 		mod_timer(&mrt->ipmr_expire_timer, jiffies + 1);
@@ -1513,7 +1513,7 @@ static int ip6mr_mfc_add(struct net *net, struct mr_table *mrt,
 		}
 	}
 	if (list_empty(&mrt->mfc_unres_queue))
-		del_timer(&mrt->ipmr_expire_timer);
+		timer_delete(&mrt->ipmr_expire_timer);
 	spin_unlock_bh(&mfc_unres_lock);
 
 	if (found) {

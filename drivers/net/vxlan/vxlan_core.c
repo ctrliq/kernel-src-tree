@@ -2840,7 +2840,7 @@ static netdev_tx_t vxlan_xmit(struct sk_buff *skb, struct net_device *dev)
 /* Walk the forwarding table and purge stale entries */
 static void vxlan_cleanup(struct timer_list *t)
 {
-	struct vxlan_dev *vxlan = from_timer(vxlan, t, age_timer);
+	struct vxlan_dev *vxlan = timer_container_of(vxlan, t, age_timer);
 	unsigned long next_timer = jiffies + FDB_AGE_INTERVAL;
 	unsigned int h;
 
@@ -3198,7 +3198,7 @@ static int vxlan_stop(struct net_device *dev)
 
 	vxlan_multicast_leave(vxlan);
 
-	del_timer_sync(&vxlan->age_timer);
+	timer_delete_sync(&vxlan->age_timer);
 
 	vxlan_flush(vxlan, &desc);
 	vxlan_sock_release(vxlan);

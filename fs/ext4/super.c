@@ -3638,7 +3638,7 @@ int ext4_feature_set_ok(struct super_block *sb, int readonly)
  */
 static void print_daily_error_info(struct timer_list *t)
 {
-	struct ext4_sb_info *sbi = from_timer(sbi, t, s_err_report);
+	struct ext4_sb_info *sbi = timer_container_of(sbi, t, s_err_report);
 	struct super_block *sb = sbi->s_sb;
 	struct ext4_super_block *es = sbi->s_es;
 
@@ -5692,7 +5692,7 @@ failed_mount3:
 	/* flush s_sb_upd_work before sbi destroy */
 	flush_work(&sbi->s_sb_upd_work);
 	ext4_stop_mmpd(sbi);
-	del_timer_sync(&sbi->s_err_report);
+	timer_delete_sync(&sbi->s_err_report);
 	ext4_group_desc_free(sbi);
 failed_mount:
 	if (sbi->s_chksum_driver)

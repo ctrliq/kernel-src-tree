@@ -9354,8 +9354,8 @@ static int sdebug_init_cmd_priv(struct Scsi_Host *shost, struct scsi_cmnd *cmd)
 	struct sdebug_defer *sd_dp = &sdsc->sd_dp;
 
 	spin_lock_init(&sdsc->lock);
-	hrtimer_init(&sd_dp->hrt, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED);
-	sd_dp->hrt.function = sdebug_q_cmd_hrt_complete;
+	hrtimer_setup(&sd_dp->hrt, sdebug_q_cmd_hrt_complete, CLOCK_MONOTONIC,
+		      HRTIMER_MODE_REL_PINNED);
 	INIT_WORK(&sd_dp->ew.work, sdebug_q_cmd_wq_complete);
 
 	return 0;
