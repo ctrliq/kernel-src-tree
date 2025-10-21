@@ -1,0 +1,561 @@
+name: Automated kernel build and test (x86_64)
+on:
+  push:
+    branches:
+      - '*_ciqlts9_2'
+
+permissions:
+  contents: read
+  actions: read
+  packages: read
+  pull-requests: write
+
+jobs:
+  build:
+    name: Build kernel
+    runs-on: kernel-build
+    if: "!contains(github.event.head_commit.message, '[skip ci]') && !contains(github.event.head_commit.message, '[ci skip]')"
+
+    steps:
+    - name: Checkout kernel source
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+        path: kernel-src-tree
+
+    - name: Checkout kernel-container-build (test branch)
+      uses: actions/checkout@v4
+      with:
+        repository: ctrliq/kernel-container-build
+        ref: automated-testing-v1
+        path: kernel-container-build
+        token: ${{ secrets.PRIVATE_REPO_ACCESS_TOKEN }}
+
+    # Host deps + KVM / FUSE validation
+    - name: Install host dependencies & verify KVM/FUSE
+      run: |
+        set -euxo pipefail
+        sudo apt-get update
+        sudo apt-get install -y fuse3 cpu-checker podman
+        sudo modprobe fuse # guarantee /dev/fuse
+        if ! sudo kvm-ok ; then
+          echo "::warning::KVM acceleration not available on this runner."
+        fi
+        if [ -e /dev/kvm ]; then
+          sudo chmod 0666 /dev/kvm
+        fi
+
+    # Kernel build inside CIQ builder (build only, no test)
+    - name: Build kernel inside CIQ builder container
+      run: |
+        set -euxo pipefail
+        mkdir -p output
+        df -h
+        cat /proc/cpuinfo
+        chmod +x kernel-container-build/build-container/*.sh
+        podman run --rm --pull=always \
+          --privileged \
+          --device=/dev/fuse \
+          $([ -e /dev/kvm ] && echo "--device=/dev/kvm") \
+          -v "$PWD/kernel-src-tree":/src \
+          -v "$PWD/output":/output \
+          -v "$PWD/kernel-container-build/build-container":/usr/local/build-scripts:ro \
+          -v "$PWD/kernel-container-build/container/kernel_build.sh":/usr/libexec/kernel_build.sh:ro \
+          -v "$PWD/kernel-container-build/container/check_kabi.sh":/usr/libexec/check_kabi.sh:ro \
+          --security-opt label=disable \
+          pulp.prod.ciq.dev/ciq/cicd/lts-images/builder \
+          /usr/local/build-scripts/build_kernel.sh 2>&1 | tee output/kernel-build.log
+        sudo dmesg
+
+    # Upload kernel compilation logs
+    - name: Upload kernel compilation logs
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: kernel-compilation-logs-x86_64
+        path: output/kernel-build.log
+        retention-days: 7
+
+    # Upload qcow2 image for next stages
+    - name: Upload qcow2 image
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: kernel-qcow2-image-x86_64
+        path: |
+          output/*.qcow2
+          output/last_build_image.txt
+        retention-days: 7
+
+  boot:
+    name: Boot verification
+    runs-on: kernel-build
+    needs: build
+
+    steps:
+    - name: Checkout kernel-container-build (test branch)
+      uses: actions/checkout@v4
+      with:
+        repository: ctrliq/kernel-container-build
+        ref: automated-testing-v1
+        path: kernel-container-build
+        token: ${{ secrets.PRIVATE_REPO_ACCESS_TOKEN }}
+
+    - name: Install host dependencies
+      run: |
+        set -euxo pipefail
+        sudo apt-get update
+        sudo apt-get install -y fuse3 cpu-checker podman
+        sudo modprobe fuse
+        if [ -e /dev/kvm ]; then
+          sudo chmod 0666 /dev/kvm
+        fi
+
+    - name: Download qcow2 image
+      uses: actions/download-artifact@v4
+      with:
+        name: kernel-qcow2-image-x86_64
+        path: output
+
+    # Boot verification test
+    - name: Boot kernel and verify
+      run: |
+        set -euxo pipefail
+        chmod +x kernel-container-build/build-container/*.sh
+        podman run --rm --pull=always \
+          --privileged \
+          --device=/dev/fuse \
+          $([ -e /dev/kvm ] && echo "--device=/dev/kvm") \
+          -v "$PWD/output":/output \
+          -v "$PWD/kernel-container-build/build-container":/usr/local/build-scripts:ro \
+          --security-opt label=disable \
+          pulp.prod.ciq.dev/ciq/cicd/lts-images/builder \
+          /usr/local/build-scripts/boot_kernel.sh
+
+    # Upload boot logs
+    - name: Upload boot logs
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: boot-logs-x86_64
+        path: output/boot-*.log
+        retention-days: 7
+
+  test-kselftest:
+    name: Run kselftests
+    runs-on: kernel-build
+    needs: boot
+
+    steps:
+    - name: Checkout kernel-container-build (test branch)
+      uses: actions/checkout@v4
+      with:
+        repository: ctrliq/kernel-container-build
+        ref: automated-testing-v1
+        path: kernel-container-build
+        token: ${{ secrets.PRIVATE_REPO_ACCESS_TOKEN }}
+
+    - name: Install host dependencies
+      run: |
+        set -euxo pipefail
+        sudo apt-get update
+        sudo apt-get install -y fuse3 cpu-checker podman
+        sudo modprobe fuse
+        if [ -e /dev/kvm ]; then
+          sudo chmod 0666 /dev/kvm
+        fi
+
+    - name: Download qcow2 image
+      uses: actions/download-artifact@v4
+      with:
+        name: kernel-qcow2-image-x86_64
+        path: output
+
+    # Run kselftests
+    - name: Execute kselftests
+      run: |
+        set -euxo pipefail
+        chmod +x kernel-container-build/build-container/*.sh
+        podman run --rm --pull=always \
+          --privileged \
+          --device=/dev/fuse \
+          $([ -e /dev/kvm ] && echo "--device=/dev/kvm") \
+          -v "$PWD/output":/output \
+          -v "$PWD/kernel-container-build/build-container":/usr/local/build-scripts:ro \
+          --security-opt label=disable \
+          pulp.prod.ciq.dev/ciq/cicd/lts-images/builder \
+          /usr/local/build-scripts/test_kselftests.sh
+
+    # Upload kselftest logs
+    - name: Upload kselftest logs
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: kselftest-logs-x86_64
+        path: |
+          output/kselftests-*.log
+          output/dmesg-*.log
+        retention-days: 7
+
+  compare-results:
+    name: Compare with previous run
+    runs-on: kernel-build
+    needs: test-kselftest
+    if: success() || failure()
+    outputs:
+      base_branch: ${{ steps.base_branch.outputs.base_branch }}
+      comparison_status: ${{ steps.comparison.outputs.comparison_status }}
+
+    steps:
+    - name: Checkout kernel source
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Full history needed for reliable merge-base detection
+
+    - name: Download current kselftest logs
+      uses: actions/download-artifact@v4
+      with:
+        name: kselftest-logs-x86_64
+        path: output-current
+
+    - name: Install GitHub CLI
+      run: |
+        set -euxo pipefail
+        # Install gh CLI if not already available
+        if ! command -v gh &> /dev/null; then
+          sudo apt-get update
+          sudo apt-get install -y gh
+        fi
+
+    - name: Determine base branch for comparison
+      id: base_branch
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        BASE_BRANCH=""
+
+        # First, check if an open PR already exists from this head branch
+        echo "Checking for existing open PR from branch: ${{ github.ref_name }}"
+        EXISTING_PR=$(gh pr list --head "${{ github.ref_name }}" --state open --json number,baseRefName --jq '.[0]' || echo "")
+
+        if [ -n "$EXISTING_PR" ] && [ "$EXISTING_PR" != "null" ]; then
+          # PR exists - use its existing base branch (no merge-base detection on force push)
+          BASE_BRANCH=$(echo "$EXISTING_PR" | jq -r '.baseRefName')
+          PR_NUMBER=$(echo "$EXISTING_PR" | jq -r '.number')
+          echo "Found existing PR #$PR_NUMBER, using existing base: $BASE_BRANCH"
+          echo "Skipping merge-base detection to avoid duplicate PRs on force push"
+        elif [ -n "${{ github.base_ref }}" ]; then
+          # For PRs, use the base branch directly
+          BASE_BRANCH="${{ github.base_ref }}"
+          echo "Using PR base branch: $BASE_BRANCH"
+        else
+          # No existing PR - for direct pushes, find the common ancestor branch
+          echo "No existing PR found, finding base branch via merge-base"
+
+          # Get all remote branches sorted by commit date (most recent first)
+          # This ensures we check actively developed branches first
+          CURRENT_COMMIT=$(git rev-parse HEAD)
+          BEST_BRANCH=""
+          CLOSEST_DISTANCE=999999
+
+          # Only check the 30 most recently updated branches for performance
+          for remote_branch in $(git for-each-ref --sort=-committerdate --format='%(refname:short)' refs/remotes/origin/ | grep -v 'HEAD\|PR-CHECKER' | head -30); do
+            branch_name=$(echo "$remote_branch" | sed 's|^origin/||')
+
+            # Skip if it's the current branch
+            if [ "$branch_name" = "${{ github.ref_name }}" ]; then
+              continue
+            fi
+
+            MERGE_BASE=$(git merge-base HEAD "$remote_branch" 2>/dev/null || echo "")
+
+            # Check if this branch shares history and isn't the current commit
+            if [ -n "$MERGE_BASE" ] && [ "$MERGE_BASE" != "$CURRENT_COMMIT" ]; then
+              # Calculate distance (number of commits) from merge-base to current HEAD
+              DISTANCE=$(git rev-list --count ${MERGE_BASE}..HEAD 2>/dev/null || echo "999999")
+
+              # Find the branch with the shortest distance (most recent common ancestor)
+              if [ "$DISTANCE" -lt "$CLOSEST_DISTANCE" ]; then
+                CLOSEST_DISTANCE=$DISTANCE
+                BEST_BRANCH=$branch_name
+              fi
+            fi
+          done
+
+          if [ -n "$BEST_BRANCH" ]; then
+            BASE_BRANCH=$BEST_BRANCH
+            echo "Found common ancestor with $BASE_BRANCH (distance: $CLOSEST_DISTANCE commits)"
+          fi
+        fi
+
+        if [ -z "$BASE_BRANCH" ]; then
+          echo "::warning::Could not determine base branch for comparison - no common ancestor found"
+          echo "::warning::Kselftest comparison will be skipped"
+          echo "base_branch=" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        echo "base_branch=$BASE_BRANCH" >> $GITHUB_OUTPUT
+        echo "Base branch for comparison: $BASE_BRANCH"
+
+    - name: Download baseline kselftest logs from base branch
+      if: steps.base_branch.outputs.base_branch != ''
+      uses: dawidd6/action-download-artifact@v3
+      with:
+        workflow: kernel-build-and-test-x86_64.yml
+        name: kselftest-logs-x86_64
+        path: output-previous
+        branch: ${{ steps.base_branch.outputs.base_branch }}
+        workflow_conclusion: success
+        search_artifacts: true
+        skip_unpack: false
+        if_no_artifact_found: warn
+        # Only search the last 5 successful runs for better performance
+        run_number: ${{ github.run_number }}
+        search_depth: 5
+      continue-on-error: true
+      timeout-minutes: 3
+
+    - name: Compare test results
+      id: comparison
+      run: |
+        # Check if we have a base branch to compare against
+        if [ -z "${{ steps.base_branch.outputs.base_branch }}" ]; then
+          echo "::warning::No base branch found for comparison"
+          echo "::warning::Kselftest comparison will be skipped"
+          echo "comparison_status=skipped" >> $GITHUB_OUTPUT
+          echo "comparison_message=No base branch found - unable to determine merge target" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        # Check if baseline logs exist
+        if ls output-previous/kselftests-*.log 1> /dev/null 2>&1; then
+          # Compare passing tests (ok)
+          BEFORE_PASS=$(grep -a '^ok' output-previous/kselftests-*.log | wc -l || echo "0")
+          AFTER_PASS=$(grep -a '^ok' output-current/kselftests-*.log | wc -l || echo "0")
+
+          # Compare failing tests (not ok)
+          BEFORE_FAIL=$(grep -a '^not ok' output-previous/kselftests-*.log | wc -l || echo "0")
+          AFTER_FAIL=$(grep -a '^not ok' output-current/kselftests-*.log | wc -l || echo "0")
+
+          echo "### Kselftest Comparison"
+          echo "Baseline (from ${{ steps.base_branch.outputs.base_branch }}): $BEFORE_PASS passing, $BEFORE_FAIL failing"
+          echo "Current (${{ github.ref_name }}): $AFTER_PASS passing, $AFTER_FAIL failing"
+
+          # Calculate differences
+          PASS_DIFF=$((AFTER_PASS - BEFORE_PASS))
+          FAIL_DIFF=$((AFTER_FAIL - BEFORE_FAIL))
+
+          echo "Pass difference: $PASS_DIFF"
+          echo "Fail difference: $FAIL_DIFF"
+
+          # Check for regression (more than 3 tests difference)
+          REGRESSION=0
+
+          if [ $PASS_DIFF -lt -3 ]; then
+            echo "::error::Regression detected: $PASS_DIFF passing tests (threshold: -3)"
+            REGRESSION=1
+          fi
+
+          if [ $FAIL_DIFF -gt 3 ]; then
+            echo "::error::Regression detected: +$FAIL_DIFF failing tests (threshold: +3)"
+            REGRESSION=1
+          fi
+
+          if [ $REGRESSION -eq 1 ]; then
+            echo "::error::Test regression exceeds acceptable threshold of 3 tests"
+            echo "comparison_status=failed" >> $GITHUB_OUTPUT
+            echo "comparison_message=Regression detected: Pass diff: $PASS_DIFF, Fail diff: $FAIL_DIFF (threshold: ±3)" >> $GITHUB_OUTPUT
+            exit 1
+          else
+            echo "::notice::Test results within acceptable range (threshold: ±3 tests)"
+            echo "comparison_status=passed" >> $GITHUB_OUTPUT
+            echo "comparison_message=Baseline: $BEFORE_PASS passing, $BEFORE_FAIL failing | Current: $AFTER_PASS passing, $AFTER_FAIL failing" >> $GITHUB_OUTPUT
+          fi
+        else
+          echo "::warning::No baseline test results found for branch ${{ steps.base_branch.outputs.base_branch }}"
+          echo "::notice::Cannot compare against base branch - artifacts may not exist or have expired (7-day retention)"
+          echo "::notice::Skipping comparison - PR will still be created with warning"
+          echo "comparison_status=skipped" >> $GITHUB_OUTPUT
+          echo "comparison_message=No baseline results available from ${{ steps.base_branch.outputs.base_branch }}" >> $GITHUB_OUTPUT
+        fi
+  create-pr:
+    name: Create Pull Request
+    runs-on: kernel-build
+    needs: [build, boot, test-kselftest, compare-results]
+    if: success() || failure()
+
+    steps:
+    - name: Check if branch name contains curly brackets
+      run: |
+        BRANCH_NAME="${{ github.ref_name }}"
+        if [[ ! "$BRANCH_NAME" =~ \{ ]] || [[ ! "$BRANCH_NAME" =~ \} ]]; then
+          echo "Branch name '$BRANCH_NAME' does not contain curly brackets, skipping PR creation"
+          exit 1
+        fi
+        echo "Branch name contains curly brackets, proceeding with PR creation checks"
+
+    - name: Check if tests passed and no regressions
+      run: |
+        # Skip PR if any test stage failed
+        if [ "${{ needs.build.result }}" != "success" ] || \
+           [ "${{ needs.boot.result }}" != "success" ] || \
+           [ "${{ needs.test-kselftest.result }}" != "success" ]; then
+          echo "One or more test stages failed, skipping PR creation"
+          exit 1
+        fi
+
+        # Skip PR if regression was detected (but allow if comparison was skipped/unavailable)
+        if [ "${{ needs.compare-results.outputs.comparison_status }}" = "failed" ]; then
+          echo "Test regression detected, skipping PR creation"
+          exit 1
+        fi
+
+        echo "All test stages passed and no regressions detected, proceeding with PR creation"
+
+    - name: Checkout kernel source
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 50  # Shallow clone: enough for commit messages and logs
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Download kernel compilation logs
+      uses: actions/download-artifact@v4
+      with:
+        name: kernel-compilation-logs-x86_64
+        path: artifacts/build
+
+    - name: Download boot logs
+      uses: actions/download-artifact@v4
+      with:
+        name: boot-logs-x86_64
+        path: artifacts/boot
+
+    - name: Download kselftest logs
+      uses: actions/download-artifact@v4
+      with:
+        name: kselftest-logs-x86_64
+        path: artifacts/test
+
+    - name: Extract test statistics
+      id: stats
+      run: |
+        PASSED=$(grep -a '^ok' artifacts/test/kselftests-*.log | wc -l || echo "0")
+        FAILED=$(grep -a '^not ok' artifacts/test/kselftests-*.log | wc -l || echo "0")
+        echo "passed=$PASSED" >> $GITHUB_OUTPUT
+        echo "failed=$FAILED" >> $GITHUB_OUTPUT
+
+    - name: Extract build timers
+      id: build_info
+      run: |
+        BUILD_TIME=$(grep -oP '\[TIMER\]\{BUILD\}:\s*\K[0-9]+' artifacts/build/kernel-build.log | head -1 || echo "N/A")
+        TOTAL_TIME=$(grep -oP '\[TIMER\]\{TOTAL\}\s*\K[0-9]+' artifacts/build/kernel-build.log | head -1 || echo "N/A")
+        echo "build_time=${BUILD_TIME}s" >> $GITHUB_OUTPUT
+        echo "total_time=${TOTAL_TIME}s" >> $GITHUB_OUTPUT
+
+    - name: Get commit information
+      id: commit_msg
+      run: |
+        # Count commits since origin/main (or appropriate base branch)
+        BASE_BRANCH="main"
+        if ! git rev-parse origin/$BASE_BRANCH >/dev/null 2>&1; then
+          # Try other common base branch names
+          for branch in master lts-9.2 lts-9; do
+            if git rev-parse origin/$branch >/dev/null 2>&1; then
+              BASE_BRANCH=$branch
+              break
+            fi
+          done
+        fi
+
+        COMMIT_COUNT=$(git rev-list --count origin/$BASE_BRANCH..HEAD 2>/dev/null || echo "1")
+
+        if [ "$COMMIT_COUNT" -eq "1" ]; then
+          # Single commit: use commit subject
+          git log -1 --pretty=%s > /tmp/commit_subject.txt
+          COMMIT_SUBJECT=$(cat /tmp/commit_subject.txt)
+          echo "commit_subject=$COMMIT_SUBJECT" >> $GITHUB_OUTPUT
+
+          # Save full commit message to file
+          git log -1 --pretty=%B > /tmp/commit_message.txt
+        else
+          # Multiple commits: create summary
+          echo "commit_subject=Multiple patches tested ($COMMIT_COUNT commits)" >> $GITHUB_OUTPUT
+
+          # Get all commit messages and save to file
+          git log origin/$BASE_BRANCH..HEAD --pretty=format:"### %s%n%n%b%n---" > /tmp/commit_message.txt
+        fi
+
+    - name: Create Pull Request
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        # Reuse base branch from compare-results stage (already computed)
+        BASE_BRANCH="${{ needs.compare-results.outputs.base_branch }}"
+
+        if [ -z "$BASE_BRANCH" ]; then
+          echo "ERROR: Could not determine base branch for PR (compare-results did not find one)"
+          exit 1
+        fi
+
+        echo "Creating/updating PR from ${{ github.ref_name }} to $BASE_BRANCH"
+
+        # Determine comparison status message
+        COMPARISON_STATUS="${{ needs.compare-results.outputs.comparison_status }}"
+        if [ "$COMPARISON_STATUS" = "passed" ]; then
+          COMPARISON_SECTION="### ✅ Test Comparison
+        - Status: Passed - Within acceptable threshold (±3 tests)
+        - Compared against: $BASE_BRANCH"
+        elif [ "$COMPARISON_STATUS" = "skipped" ]; then
+          COMPARISON_SECTION="### ⚠️ Test Comparison
+        - Status: Skipped
+        - Reason: No baseline test results available from $BASE_BRANCH
+        - **Note:** Manual review recommended to ensure no regressions"
+        else
+          COMPARISON_SECTION="### ❌ Test Comparison
+        - Status: Failed - Regression detected
+        - Compared against: $BASE_BRANCH
+        - **Action Required:** Review test differences before merging"
+        fi
+
+        # Create PR body using script
+        chmod +x .github/scripts/create-pr-body.sh
+        .github/scripts/create-pr-body.sh \
+          "${{ steps.build_info.outputs.build_time }}" \
+          "${{ steps.build_info.outputs.total_time }}" \
+          "${{ steps.stats.outputs.passed }}" \
+          "${{ steps.stats.outputs.failed }}" \
+          "${{ github.run_id }}" \
+          "$COMPARISON_SECTION" \
+          "${{ github.repository }}" \
+          > pr_body.md
+
+        # Check if any open PR already exists from this head branch (regardless of base)
+        EXISTING_PR=$(gh pr list --head "${{ github.ref_name }}" --state open --json number,baseRefName --jq '.[0]' || echo "")
+
+        if [ -n "$EXISTING_PR" ] && [ "$EXISTING_PR" != "null" ]; then
+          PR_NUMBER=$(echo "$EXISTING_PR" | jq -r '.number')
+          CURRENT_BASE=$(echo "$EXISTING_PR" | jq -r '.baseRefName')
+
+          echo "Found existing PR #$PR_NUMBER (current base: $CURRENT_BASE)"
+
+          # Update PR title and body
+          gh pr edit "$PR_NUMBER" \
+            --title "[$BASE_BRANCH] ${{ steps.commit_msg.outputs.commit_subject }}" \
+            --body-file pr_body.md
+
+          echo "Updated PR #$PR_NUMBER"
+
+          # Note: We don't change the base branch even if it differs from $BASE_BRANCH
+          # because compare-results already used the existing PR's base for comparison
+          if [ "$CURRENT_BASE" != "$BASE_BRANCH" ]; then
+            echo "::notice::PR base remains $CURRENT_BASE (comparison was done against this base)"
+          fi
+        else
+          echo "Creating new PR from ${{ github.ref_name }} to $BASE_BRANCH"
+          gh pr create \
+            --base "$BASE_BRANCH" \
+            --head "${{ github.ref_name }}" \
+            --title "[$BASE_BRANCH] ${{ steps.commit_msg.outputs.commit_subject }}" \
+            --body-file pr_body.md
+        fi
