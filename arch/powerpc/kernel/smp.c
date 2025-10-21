@@ -1017,6 +1017,13 @@ static int powerpc_smt_flags(void)
 #endif
 
 /*
+ * On shared processor LPARs scheduled on a big core (which has two or more
+ * independent thread groups per core), prefer lower numbered CPUs, so
+ * that workload consolidates to lesser number of cores.
+ */
+static __ro_after_init DEFINE_STATIC_KEY_FALSE(splpar_asym_pack);
+
+/*
  * P9 has a slightly odd architecture where pairs of cores share an L2 cache.
  * This topology makes it *much* cheaper to migrate tasks between adjacent cores
  * since the migrated task remains cache hot. We want to take advantage of this
@@ -1024,7 +1031,18 @@ static int powerpc_smt_flags(void)
  */
 static int powerpc_shared_cache_flags(void)
 {
+	if (static_branch_unlikely(&splpar_asym_pack))
+		return SD_SHARE_LLC | SD_ASYM_PACKING;
+
 	return SD_SHARE_LLC;
+}
+
+static int powerpc_shared_proc_flags(void)
+{
+	if (static_branch_unlikely(&splpar_asym_pack))
+		return SD_ASYM_PACKING;
+
+	return 0;
 }
 
 /*
@@ -1063,8 +1081,8 @@ static struct sched_domain_topology_level powerpc_topology[] = {
 	{ cpu_smt_mask, powerpc_smt_flags, SD_INIT_NAME(SMT) },
 #endif
 	{ shared_cache_mask, powerpc_shared_cache_flags, SD_INIT_NAME(CACHE) },
-	{ cpu_mc_mask, SD_INIT_NAME(MC) },
-	{ cpu_cpu_mask, SD_INIT_NAME(PKG) },
+	{ cpu_mc_mask, powerpc_shared_proc_flags, SD_INIT_NAME(MC) },
+	{ cpu_cpu_mask, powerpc_shared_proc_flags, SD_INIT_NAME(PKG) },
 	{ NULL, },
 };
 
@@ -1701,6 +1719,9 @@ int setup_profiling_timer(unsigned int multiplier)
 static void __init fixup_topology(void)
 {
 	int i;
+
+	if (is_shared_processor() && has_big_cores)
+		static_branch_enable(&splpar_asym_pack);
 
 #ifdef CONFIG_SCHED_SMT
 	if (has_big_cores) {
