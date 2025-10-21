@@ -554,7 +554,9 @@ static int fuse_uring_copy_from_ring(struct fuse_ring *ring,
 	cs.is_uring = 1;
 	cs.req = req;
 
-	return fuse_copy_out_args(&cs, args, ring_in_out.payload_sz);
+	err = fuse_copy_out_args(&cs, args, ring_in_out.payload_sz);
+	fuse_copy_finish(&cs);
+	return err;
 }
 
  /*
@@ -605,6 +607,7 @@ static int fuse_uring_args_to_ring(struct fuse_ring *ring, struct fuse_req *req,
 	/* copy the payload */
 	err = fuse_copy_args(&cs, num_args, args->in_pages,
 			     (struct fuse_arg *)in_args, 0);
+	fuse_copy_finish(&cs);
 	if (err) {
 		pr_info_ratelimited("%s fuse_copy_args failed\n", __func__);
 		return err;
