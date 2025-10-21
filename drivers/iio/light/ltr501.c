@@ -1591,6 +1591,8 @@ static int ltr501_probe(struct i2c_client *client,
 	if (ret)
 		goto error_unreg_buffer;
 
+	printk(KERN_INFO "This is a test 2\n");
+
 	return 0;
 
 error_unreg_buffer:
