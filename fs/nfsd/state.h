@@ -547,7 +547,7 @@ struct nfs4_replay {
 	unsigned int		rp_buflen;
 	char			*rp_buf;
 	struct knfsd_fh		rp_openfh;
-	atomic_t		rp_locked;
+	int			rp_locked;
 	char			rp_ibuf[NFSD4_REPLAY_ISIZE];
 };
 
@@ -665,6 +665,7 @@ struct nfs4_file {
 	atomic_t		fi_access[2];
 	u32			fi_share_deny;
 	struct nfsd_file	*fi_deleg_file;
+	struct nfsd_file	*fi_rdeleg_file;
 	int			fi_delegees;
 	struct knfsd_fh		fi_fhandle;
 	bool			fi_had_conflict;
