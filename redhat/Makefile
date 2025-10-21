@@ -760,6 +760,7 @@ sources-rh: $(TARBALL) $(KABI_TARBALL) $(KABIDW_TARBALL) generate-testpatch-tmp 
 		../Makefile.rhelver \
 		README.rst \
 		kernel-local \
+		kernel.sbat.template \
 		dracut-virt.conf \
 		keys/redhatsecureboot504.cer \
 		uki.sbat.template \
