@@ -9,7 +9,6 @@
 /*
  * sched-domains (multiprocessor balancing) declarations:
  */
-#ifdef CONFIG_SMP
 
 /* Generate SD flag indexes */
 #define SD_FLAG(name, mflags) __##name,
@@ -25,15 +24,11 @@ enum {
 };
 #undef SD_FLAG
 
-#ifdef CONFIG_SCHED_DEBUG
-
 struct sd_flag_debug {
 	unsigned int meta_flags;
 	char *name;
 };
 extern const struct sd_flag_debug sd_flag_debug[];
-
-#endif
 
 #ifdef CONFIG_SCHED_SMT
 static inline int cpu_smt_flags(void)
@@ -201,39 +196,8 @@ struct sched_domain_topology_level {
 extern void __init set_sched_topology(struct sched_domain_topology_level *tl);
 extern void sched_update_asym_prefer_cpu(int cpu, int old_prio, int new_prio);
 
-
-# define SD_INIT_NAME(type)		.name = #type
-
-#else /* CONFIG_SMP */
-
-struct sched_domain_attr;
-
-static inline void
-partition_sched_domains(int ndoms_new, cpumask_var_t doms_new[],
-			struct sched_domain_attr *dattr_new)
-{
-}
-
-static inline bool cpus_equal_capacity(int this_cpu, int that_cpu)
-{
-	return true;
-}
-
-static inline bool cpus_share_cache(int this_cpu, int that_cpu)
-{
-	return true;
-}
-
-static inline bool cpus_share_resources(int this_cpu, int that_cpu)
-{
-	return true;
-}
-
-static inline void sched_update_asym_prefer_cpu(int cpu, int old_prio, int new_prio)
-{
-}
-
-#endif	/* !CONFIG_SMP */
+#define SDTL_INIT(maskfn, flagsfn, dname) ((struct sched_domain_topology_level) \
+	    { .mask = maskfn, .sd_flags = flagsfn, .name = #dname })
 
 #if defined(CONFIG_ENERGY_MODEL) && defined(CONFIG_CPU_FREQ_GOV_SCHEDUTIL)
 extern void rebuild_sched_domains_energy(void);
