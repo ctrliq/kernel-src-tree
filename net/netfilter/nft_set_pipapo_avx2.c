@@ -1192,7 +1192,6 @@ nft_pipapo_avx2_lookup(const struct net *net, const struct nft_set *set,
 
 	nft_pipapo_avx2_prepare();
 
-next_match:
 	nft_pipapo_for_each_field(f, i, m) {
 		bool last = i == m->field_count - 1, first = !i;
 		int ret = 0;
@@ -1239,14 +1238,18 @@ next_match:
 
 #undef NFT_SET_PIPAPO_AVX2_LOOKUP
 
+next_match:
 		if (ret < 0)
 			goto out;
 
 		if (last) {
 			const struct nft_set_ext *e = &f->mt[ret].e->ext;
 
-			if (unlikely(nft_set_elem_expired(e)))
+			if (unlikely(nft_set_elem_expired(e))) {
+				ret = pipapo_refill(res, f->bsize, f->rules,
+						    fill, f->mt, last);
 				goto next_match;
+			}
 
 			ext = e;
 			goto out;
