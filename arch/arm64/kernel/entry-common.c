@@ -1105,7 +1105,6 @@ UNHANDLED(el0t, 32, fiq)
 UNHANDLED(el0t, 32, error)
 #endif /* CONFIG_COMPAT */
 
-#ifdef CONFIG_VMAP_STACK
 asmlinkage void noinstr __noreturn handle_bad_stack(struct pt_regs *regs)
 {
 	unsigned long esr = read_sysreg(esr_el1);
@@ -1114,7 +1113,6 @@ asmlinkage void noinstr __noreturn handle_bad_stack(struct pt_regs *regs)
 	arm64_enter_nmi(regs);
 	panic_bad_stack(regs, esr, far);
 }
-#endif /* CONFIG_VMAP_STACK */
 
 #ifdef CONFIG_ARM_SDE_INTERFACE
 asmlinkage noinstr unsigned long
