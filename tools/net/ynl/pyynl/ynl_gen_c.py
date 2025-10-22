@@ -1242,6 +1242,7 @@ class RenderInfo:
 
         # 'do' and 'dump' response parsing is identical
         self.type_consistent = True
+        self.type_oneside = False
         if op_mode != 'do' and 'dump' in op:
             if 'do' in op:
                 if ('reply' in op['do']) != ('reply' in op["dump"]):
@@ -1249,7 +1250,8 @@ class RenderInfo:
                 elif 'reply' in op['do'] and op["do"]["reply"] != op["dump"]["reply"]:
                     self.type_consistent = False
             else:
-                self.type_consistent = False
+                self.type_consistent = True
+                self.type_oneside = True
 
         self.attr_set = attr_set
         if not self.attr_set:
@@ -1546,7 +1548,9 @@ def op_prefix(ri, direction, deref=False):
         suffix += f"{direction_to_suffix[direction]}"
     else:
         if direction == 'request':
-            suffix += '_req_dump'
+            suffix += '_req'
+            if not ri.type_oneside:
+                suffix += '_dump'
         else:
             if ri.type_consistent:
                 if deref:
@@ -2042,7 +2046,7 @@ def _print_type(ri, direction, struct):
     if not direction and ri.type_name_conflict:
         suffix += '_'
 
-    if ri.op_mode == 'dump':
+    if ri.op_mode == 'dump' and not ri.type_oneside:
         suffix += '_dump'
 
     ri.cw.block_start(line=f"struct {ri.family.c_name}{suffix}")
@@ -3070,7 +3074,7 @@ def main():
                     ri = RenderInfo(cw, parsed, args.mode, op, 'dump')
                     print_req_type(ri)
                     print_req_type_helpers(ri)
-                    if not ri.type_consistent:
+                    if not ri.type_consistent or ri.type_oneside:
                         print_rsp_type(ri)
                     print_wrapped_type(ri)
                     print_dump_prototype(ri)
@@ -3148,7 +3152,7 @@ def main():
                 if 'dump' in op:
                     cw.p(f"/* {op.enum_name} - dump */")
                     ri = RenderInfo(cw, parsed, args.mode, op, "dump")
-                    if not ri.type_consistent:
+                    if not ri.type_consistent or ri.type_oneside:
                         parse_rsp_msg(ri, deref=True)
                     print_req_free(ri)
                     print_dump_type_free(ri)
