@@ -476,10 +476,16 @@ xfs_vm_writepages(
 	struct address_space	*mapping,
 	struct writeback_control *wbc)
 {
-	struct xfs_writepage_ctx wpc = { };
+	struct xfs_writepage_ctx	wpc = {
+		.ctx = {
+			.inode	= mapping->host,
+			.wbc	= wbc,
+			.ops	= &xfs_writeback_ops
+		},
+	};
 
 	xfs_iflags_clear(XFS_I(mapping->host), XFS_ITRUNCATED);
-	return iomap_writepages(mapping, wbc, &wpc.ctx, &xfs_writeback_ops);
+	return iomap_writepages(&wpc.ctx);
 }
 
 STATIC int
