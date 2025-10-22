@@ -78,3 +78,68 @@ jobs:
             echo "❌ Failed to post check-kernel-commits comment to PR"
             exit 1
           fi
+
+      - name: Install build dependencies for patchutils
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential autoconf automake libtool gnulib
+
+      - name: Clone and build custom patchutils
+        run: |
+          git clone https://github.com/kerneltoast/patchutils.git --depth=1 --revision=32e5f1df96920f1d24beb910346f01acab8b0bd8
+          cd patchutils
+          ./bootstrap
+          ./configure
+          make -j$(nproc)
+
+      - name: Download run_interdiff.py
+        run: |
+          curl -sL \
+            https://raw.githubusercontent.com/ctrliq/kernel-src-tree-tools/mainline/run_interdiff.py \
+            -o run_interdiff.py
+          chmod +x run_interdiff.py
+
+      - name: Run interdiff check
+        id: interdiff
+        run: |
+          set +e  # Don't exit on error, we want to capture the output
+          python3 run_interdiff.py --repo . --pr_branch "${{ github.head_ref }}" --base_branch "${{ github.base_ref }}" --markdown --interdiff ../patchutils/src/interdiff | tee interdiff_result.txt
+          EXIT_CODE=$?
+
+          # Check if the script failed
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "❌ Interdiff check failed with exit code $EXIT_CODE"
+            exit $EXIT_CODE
+          fi
+
+          # Check for differences:
+          # 1. Verify the success message exists
+          # 2. If it exists, check if there are any OTHER lines (which would indicate differences)
+          # 3. If success message doesn't exist, that's also a difference
+          if grep -q "All backported commits match their upstream counterparts." interdiff_result.txt; then
+            # Success message found, check if there are any other lines
+            LINE_COUNT=$(wc -l < ../interdiff_result.txt)
+            if [ "$LINE_COUNT" -gt 1 ]; then
+              echo "has_differences=true" >> $GITHUB_OUTPUT
+            else
+              echo "has_differences=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            # Success message not found, there must be differences
+            echo "has_differences=true" >> $GITHUB_OUTPUT
+          fi
+
+          set -e  # Re-enable exit on error
+
+      - name: Comment on PR if interdiff differences found
+        if: steps.interdiff.outputs.has_differences == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh pr comment ${{ github.event.pull_request.number }} \
+            --body-file interdiff_result.txt \
+            --repo ${{ github.repository }}; then
+            echo "❌ Failed to post interdiff comment to PR"
+            exit 1
+          fi
+
