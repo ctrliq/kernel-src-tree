@@ -316,8 +316,7 @@ retry:
 	rq = scsi_req(req);
 
 	if (bufflen) {
-		ret = blk_rq_map_kern(sdev->request_queue, req,
-				      buffer, bufflen, GFP_NOIO);
+		ret = blk_rq_map_kern(req, buffer, bufflen, GFP_NOIO);
 		if (ret)
 			goto out;
 	}
@@ -1161,7 +1160,7 @@ blk_status_t scsi_alloc_sgtables(struct scsi_cmnd *cmd)
 	 * Next, walk the list, and fill in the addresses and sizes of
 	 * each segment.
 	 */
-	count = __blk_rq_map_sg(rq->q, rq, cmd->sdb.table.sgl, &last_sg);
+	count = __blk_rq_map_sg(rq, cmd->sdb.table.sgl, &last_sg);
 
 	if (blk_rq_bytes(rq) & rq->q->limits.dma_pad_mask) {
 		unsigned int pad_len =
