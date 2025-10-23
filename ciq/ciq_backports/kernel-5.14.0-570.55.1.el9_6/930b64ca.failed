@@ -1,0 +1,169 @@
+nfsd: don't ignore the return code of svc_proc_register()
+
+jira LE-4539
+cve CVE-2025-22026
+Rebuild_History Non-Buildable kernel-5.14.0-570.55.1.el9_6
+commit-author Jeff Layton <jlayton@kernel.org>
+commit 930b64ca0c511521f0abdd1d57ce52b2a6e3476b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-570.55.1.el9_6/930b64ca.failed
+
+Currently, nfsd_proc_stat_init() ignores the return value of
+svc_proc_register(). If the procfile creation fails, then the kernel
+will WARN when it tries to remove the entry later.
+
+Fix nfsd_proc_stat_init() to return the same type of pointer as
+svc_proc_register(), and fix up nfsd_net_init() to check that and fail
+the nfsd_net construction if it occurs.
+
+svc_proc_register() can fail if the dentry can't be allocated, or if an
+identical dentry already exists. The second case is pretty unlikely in
+the nfsd_net construction codepath, so if this happens, return -ENOMEM.
+
+	Reported-by: syzbot+e34ad04f27991521104c@syzkaller.appspotmail.com
+Closes: https://lore.kernel.org/linux-nfs/67a47501.050a0220.19061f.05f9.GAE@google.com/
+	Cc: stable@vger.kernel.org # v6.9
+	Signed-off-by: Jeff Layton <jlayton@kernel.org>
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+(cherry picked from commit 930b64ca0c511521f0abdd1d57ce52b2a6e3476b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfsd/nfsctl.c
+#	fs/nfsd/stats.c
+#	fs/nfsd/stats.h
+diff --cc fs/nfsd/nfsctl.c
+index 93a72068776a,ac265d6fde35..000000000000
+--- a/fs/nfsd/nfsctl.c
++++ b/fs/nfsd/nfsctl.c
+@@@ -2233,22 -2198,35 +2233,45 @@@ static __net_init int nfsd_net_init(str
+  	retval = nfsd_idmap_init(net);
+  	if (retval)
+  		goto out_idmap_error;
+ -	retval = percpu_counter_init_many(nn->counter, 0, GFP_KERNEL,
+ -					  NFSD_STATS_COUNTERS_NUM);
+ +	retval = nfsd_stat_counters_init(nn);
+  	if (retval)
+  		goto out_repcache_error;
++ 
+  	memset(&nn->nfsd_svcstats, 0, sizeof(nn->nfsd_svcstats));
+++<<<<<<< HEAD
+ +	nn->nfsd_svcstats.program = &nfsd_program;
+ +	nn->nfsd_versions = NULL;
+ +	nn->nfsd4_minorversions = NULL;
+++=======
++ 	nn->nfsd_svcstats.program = &nfsd_programs[0];
++ 	if (!nfsd_proc_stat_init(net)) {
++ 		retval = -ENOMEM;
++ 		goto out_proc_error;
++ 	}
++ 
++ 	for (i = 0; i < sizeof(nn->nfsd_versions); i++)
++ 		nn->nfsd_versions[i] = nfsd_support_version(i);
++ 	for (i = 0; i < sizeof(nn->nfsd4_minorversions); i++)
++ 		nn->nfsd4_minorversions[i] = nfsd_support_version(4);
+++>>>>>>> 930b64ca0c51 (nfsd: don't ignore the return code of svc_proc_register())
+  	nn->nfsd_info.mutex = &nfsd_mutex;
+  	nn->nfsd_serv = NULL;
+  	nfsd4_init_leases_net(nn);
+  	get_random_bytes(&nn->siphash_key, sizeof(nn->siphash_key));
+  	seqlock_init(&nn->writeverf_lock);
+++<<<<<<< HEAD
+ +	nfsd_proc_stat_init(net);
+ +
+++=======
++ #if IS_ENABLED(CONFIG_NFS_LOCALIO)
++ 	spin_lock_init(&nn->local_clients_lock);
++ 	INIT_LIST_HEAD(&nn->local_clients);
++ #endif
+++>>>>>>> 930b64ca0c51 (nfsd: don't ignore the return code of svc_proc_register())
+  	return 0;
+  
++ out_proc_error:
++ 	percpu_counter_destroy_many(nn->counter, NFSD_STATS_COUNTERS_NUM);
+  out_repcache_error:
+  	nfsd_idmap_shutdown(net);
+  out_idmap_error:
+diff --cc fs/nfsd/stats.c
+index be52fb1e928e,f7eaf95e20fc..000000000000
+--- a/fs/nfsd/stats.c
++++ b/fs/nfsd/stats.c
+@@@ -73,49 -73,7 +73,53 @@@ static int nfsd_show(struct seq_file *s
+  
+  DEFINE_PROC_SHOW_ATTRIBUTE(nfsd);
+  
+++<<<<<<< HEAD
+ +int nfsd_percpu_counters_init(struct percpu_counter *counters, int num)
+ +{
+ +	int i, err = 0;
+ +
+ +	for (i = 0; !err && i < num; i++)
+ +		err = percpu_counter_init(&counters[i], 0, GFP_KERNEL);
+ +
+ +	if (!err)
+ +		return 0;
+ +
+ +	for (; i > 0; i--)
+ +		percpu_counter_destroy(&counters[i-1]);
+ +
+ +	return err;
+ +}
+ +
+ +void nfsd_percpu_counters_reset(struct percpu_counter counters[], int num)
+ +{
+ +	int i;
+ +
+ +	for (i = 0; i < num; i++)
+ +		percpu_counter_set(&counters[i], 0);
+ +}
+ +
+ +void nfsd_percpu_counters_destroy(struct percpu_counter counters[], int num)
+ +{
+ +	int i;
+ +
+ +	for (i = 0; i < num; i++)
+ +		percpu_counter_destroy(&counters[i]);
+ +}
+ +
+ +int nfsd_stat_counters_init(struct nfsd_net *nn)
+ +{
+ +	return nfsd_percpu_counters_init(nn->counter, NFSD_STATS_COUNTERS_NUM);
+ +}
+ +
+ +void nfsd_stat_counters_destroy(struct nfsd_net *nn)
+ +{
+ +	nfsd_percpu_counters_destroy(nn->counter, NFSD_STATS_COUNTERS_NUM);
+ +}
+ +
+ +void nfsd_proc_stat_init(struct net *net)
+++=======
++ struct proc_dir_entry *nfsd_proc_stat_init(struct net *net)
+++>>>>>>> 930b64ca0c51 (nfsd: don't ignore the return code of svc_proc_register())
+  {
+  	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
+  
+diff --cc fs/nfsd/stats.h
+index d2753e975dfd,e4efb0e4e56d..000000000000
+--- a/fs/nfsd/stats.h
++++ b/fs/nfsd/stats.h
+@@@ -10,12 -10,7 +10,16 @@@
+  #include <uapi/linux/nfsd/stats.h>
+  #include <linux/percpu_counter.h>
+  
+++<<<<<<< HEAD
+ +int nfsd_percpu_counters_init(struct percpu_counter *counters, int num);
+ +void nfsd_percpu_counters_reset(struct percpu_counter *counters, int num);
+ +void nfsd_percpu_counters_destroy(struct percpu_counter *counters, int num);
+ +int nfsd_stat_counters_init(struct nfsd_net *nn);
+ +void nfsd_stat_counters_destroy(struct nfsd_net *nn);
+ +void nfsd_proc_stat_init(struct net *net);
+++=======
++ struct proc_dir_entry *nfsd_proc_stat_init(struct net *net);
+++>>>>>>> 930b64ca0c51 (nfsd: don't ignore the return code of svc_proc_register())
+  void nfsd_proc_stat_shutdown(struct net *net);
+  
+  static inline void nfsd_stats_rc_hits_inc(struct nfsd_net *nn)
+* Unmerged path fs/nfsd/nfsctl.c
+* Unmerged path fs/nfsd/stats.c
+* Unmerged path fs/nfsd/stats.h
