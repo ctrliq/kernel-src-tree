@@ -1,0 +1,129 @@
+scsi: fnic: Fix crash in fnic_wq_cmpl_handler when FDMI times out
+
+jira LE-4569
+Rebuild_History Non-Buildable kernel-6.12.0-55.40.1.el10_0
+commit-author Karan Tilak Kumar <kartilak@cisco.com>
+commit a35b29bdedb4d2ae3160d4d6684a6f1ecd9ca7c2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-55.40.1.el10_0/a35b29bd.failed
+
+When both the RHBA and RPA FDMI requests time out, fnic reuses a frame to
+send ABTS for each of them. On send completion, this causes an attempt to
+free the same frame twice that leads to a crash.
+
+Fix crash by allocating separate frames for RHBA and RPA, and modify ABTS
+logic accordingly.
+
+Tested by checking MDS for FDMI information.
+
+Tested by using instrumented driver to:
+
+ - Drop PLOGI response
+ - Drop RHBA response
+ - Drop RPA response
+ - Drop RHBA and RPA response
+ - Drop PLOGI response + ABTS response
+ - Drop RHBA response + ABTS response
+ - Drop RPA response + ABTS response
+ - Drop RHBA and RPA response + ABTS response for both of them
+
+Fixes: 09c1e6ab4ab2 ("scsi: fnic: Add and integrate support for FDMI")
+	Reviewed-by: Sesidhar Baddela <sebaddel@cisco.com>
+	Reviewed-by: Arulprabhu Ponnusamy <arulponn@cisco.com>
+	Reviewed-by: Gian Carlo Boffa <gcboffa@cisco.com>
+	Tested-by: Arun Easi <aeasi@cisco.com>
+Co-developed-by: Arun Easi <aeasi@cisco.com>
+	Signed-off-by: Arun Easi <aeasi@cisco.com>
+	Tested-by: Karan Tilak Kumar <kartilak@cisco.com>
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Karan Tilak Kumar <kartilak@cisco.com>
+Link: https://lore.kernel.org/r/20250618003431.6314-1-kartilak@cisco.com
+	Reviewed-by: John Meneghini <jmeneghi@redhat.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit a35b29bdedb4d2ae3160d4d6684a6f1ecd9ca7c2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/fnic/fdls_disc.c
+diff --cc drivers/scsi/fnic/fdls_disc.c
+index a9ffa7b63730,36b498ad55b4..000000000000
+--- a/drivers/scsi/fnic/fdls_disc.c
++++ b/drivers/scsi/fnic/fdls_disc.c
+@@@ -2247,9 -2267,25 +2269,24 @@@ void fdls_fabric_timer_callback(struct 
+  	spin_unlock_irqrestore(&fnic->fnic_lock, flags);
+  }
+  
++ void fdls_fdmi_retry_plogi(struct fnic_iport_s *iport)
++ {
++ 	struct fnic *fnic = iport->fnic;
++ 
++ 	iport->fabric.fdmi_pending = 0;
++ 	/* If max retries not exhausted, start over from fdmi plogi */
++ 	if (iport->fabric.fdmi_retry < FDLS_FDMI_MAX_RETRY) {
++ 		iport->fabric.fdmi_retry++;
++ 		FNIC_FCS_DBG(KERN_INFO, fnic->host, fnic->fnic_num,
++ 					 "Retry FDMI PLOGI. FDMI retry: %d",
++ 					 iport->fabric.fdmi_retry);
++ 		fdls_send_fdmi_plogi(iport);
++ 	}
++ }
++ 
+  void fdls_fdmi_timer_callback(struct timer_list *t)
+  {
+ -	struct fnic_fdls_fabric_s *fabric = timer_container_of(fabric, t,
+ -							       fdmi_timer);
+ +	struct fnic_fdls_fabric_s *fabric = from_timer(fabric, t, fdmi_timer);
+  	struct fnic_iport_s *iport =
+  		container_of(fabric, struct fnic_iport_s, fabric);
+  	struct fnic *fnic = iport->fnic;
+@@@ -3731,10 -3781,16 +3782,23 @@@ static void fdls_process_fdmi_abts_rsp(
+  		break;
+  	}
+  
+++<<<<<<< HEAD
+ +	del_timer_sync(&iport->fabric.fdmi_timer);
+ +	iport->fabric.fdmi_pending &= ~FDLS_FDMI_ABORT_PENDING;
+ +
+ +	fdls_send_fdmi_plogi(iport);
+++=======
++ 	/*
++ 	 * Only if ABORT PENDING is off, delete the timer, and if no other
++ 	 * operations are pending, retry FDMI.
++ 	 * Otherwise, let the timer pop and take the appropriate action.
++ 	 */
++ 	if (!(iport->fabric.fdmi_pending & FDLS_FDMI_ABORT_PENDING)) {
++ 		timer_delete_sync(&iport->fabric.fdmi_timer);
++ 		if (!iport->fabric.fdmi_pending)
++ 			fdls_fdmi_retry_plogi(iport);
++ 	}
+++>>>>>>> a35b29bdedb4 (scsi: fnic: Fix crash in fnic_wq_cmpl_handler when FDMI times out)
+  }
+  
+  static void
+* Unmerged path drivers/scsi/fnic/fdls_disc.c
+diff --git a/drivers/scsi/fnic/fnic.h b/drivers/scsi/fnic/fnic.h
+index 6c5f6046b1f5..86e293ce530d 100644
+--- a/drivers/scsi/fnic/fnic.h
++++ b/drivers/scsi/fnic/fnic.h
+@@ -30,7 +30,7 @@
+ 
+ #define DRV_NAME		"fnic"
+ #define DRV_DESCRIPTION		"Cisco FCoE HBA Driver"
+-#define DRV_VERSION		"1.8.0.0"
++#define DRV_VERSION		"1.8.0.1"
+ #define PFX			DRV_NAME ": "
+ #define DFX                     DRV_NAME "%d: "
+ 
+diff --git a/drivers/scsi/fnic/fnic_fdls.h b/drivers/scsi/fnic/fnic_fdls.h
+index 8e610b65ad57..531d0b37e450 100644
+--- a/drivers/scsi/fnic/fnic_fdls.h
++++ b/drivers/scsi/fnic/fnic_fdls.h
+@@ -394,6 +394,7 @@ void fdls_send_tport_abts(struct fnic_iport_s *iport,
+ bool fdls_delete_tport(struct fnic_iport_s *iport,
+ 		       struct fnic_tport_s *tport);
+ void fdls_fdmi_timer_callback(struct timer_list *t);
++void fdls_fdmi_retry_plogi(struct fnic_iport_s *iport);
+ 
+ /* fnic_fcs.c */
+ void fnic_fdls_init(struct fnic *fnic, int usefip);
