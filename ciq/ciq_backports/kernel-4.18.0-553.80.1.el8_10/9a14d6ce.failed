@@ -1,0 +1,197 @@
+block: remove debugfs blk_mq_ctx dispatched/merged/completed attributes
+
+jira LE-4559
+Rebuild_History Non-Buildable kernel-4.18.0-553.80.1.el8_10
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 9a14d6ce4135fa72705a926c894218a0d6988924
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.80.1.el8_10/9a14d6ce.failed
+
+These were added as part of early days debugging for blk-mq, and they
+are not really useful anymore. Rather than spend cycles updating them,
+just get rid of them.
+
+As a bonus, this shrinks the per-cpu software queue size from 256b
+to 192b. That's a whole cacheline less.
+
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 9a14d6ce4135fa72705a926c894218a0d6988924)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq-sched.c
+#	block/blk-mq.c
+diff --cc block/blk-mq-sched.c
+index 8b2bc859cc7f,e85b7556b096..000000000000
+--- a/block/blk-mq-sched.c
++++ b/block/blk-mq-sched.c
+@@@ -448,14 -376,21 +448,32 @@@ bool __blk_mq_sched_bio_merge(struct re
+  	ctx = blk_mq_get_ctx(q);
+  	hctx = blk_mq_map_queue(q, bio->bi_opf, ctx);
+  	type = hctx->type;
+++<<<<<<< HEAD
+ +	if ((hctx->flags & BLK_MQ_F_SHOULD_MERGE) &&
+ +			!list_empty_careful(&ctx->rq_lists[type])) {
+ +		/* default per sw-queue merge */
+ +		spin_lock(&ctx->lock);
+ +		ret = blk_mq_attempt_merge(q, hctx, ctx, bio);
+ +		spin_unlock(&ctx->lock);
+ +	}
+ +
+++=======
++ 	if (!(hctx->flags & BLK_MQ_F_SHOULD_MERGE) ||
++ 	    list_empty_careful(&ctx->rq_lists[type]))
++ 		return false;
++ 
++ 	/* default per sw-queue merge */
++ 	spin_lock(&ctx->lock);
++ 	/*
++ 	 * Reverse check our software queue for entries that we could
++ 	 * potentially merge with. Currently includes a hand-wavy stop
++ 	 * count of 8, to not spend too much time checking for merges.
++ 	 */
++ 	if (blk_bio_list_merge(q, &ctx->rq_lists[type], bio, nr_segs))
++ 		ret = true;
++ 
++ 	spin_unlock(&ctx->lock);
+++>>>>>>> 9a14d6ce4135 (block: remove debugfs blk_mq_ctx dispatched/merged/completed attributes)
+  	return ret;
+  }
+  
+diff --cc block/blk-mq.c
+index 97348b138e4c,990d214a7658..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -353,10 -359,13 +353,17 @@@ static struct request *blk_mq_rq_ctx_in
+  	rq->end_io = NULL;
+  	rq->end_io_data = NULL;
+  
+++<<<<<<< HEAD
+ +	data->ctx->rq_dispatched[op_is_sync(data->cmd_flags)]++;
+++=======
++ 	blk_crypto_rq_set_defaults(rq);
++ 	INIT_LIST_HEAD(&rq->queuelist);
++ 	/* tag was already set */
++ 	WRITE_ONCE(rq->deadline, 0);
+++>>>>>>> 9a14d6ce4135 (block: remove debugfs blk_mq_ctx dispatched/merged/completed attributes)
+  	refcount_set(&rq->ref, 1);
+  
+ -	if (rq->rq_flags & RQF_ELV) {
+ +	if (!op_is_flush(data->cmd_flags)) {
+  		struct elevator_queue *e = data->q->elevator;
+  
+  		rq->elv.icq = NULL;
+@@@ -536,12 -594,12 +543,15 @@@ static void __blk_mq_free_request(struc
+  void blk_mq_free_request(struct request *rq)
+  {
+  	struct request_queue *q = rq->q;
+++<<<<<<< HEAD
+ +	struct elevator_queue *e = q->elevator;
+ +	struct blk_mq_ctx *ctx = rq->mq_ctx;
+++=======
+++>>>>>>> 9a14d6ce4135 (block: remove debugfs blk_mq_ctx dispatched/merged/completed attributes)
+  	struct blk_mq_hw_ctx *hctx = rq->mq_hctx;
+  
+ -	if (rq->rq_flags & (RQF_ELVPRIV | RQF_ELV)) {
+ -		struct elevator_queue *e = q->elevator;
+ -
+ -		if (e->type->ops.finish_request)
+ +	if (rq->rq_flags & RQF_ELVPRIV) {
+ +		if (e && e->type->ops.finish_request)
+  			e->type->ops.finish_request(rq);
+  		if (rq->elv.icq) {
+  			put_io_context(rq->elv.icq->ioc);
+diff --git a/block/blk-mq-debugfs.c b/block/blk-mq-debugfs.c
+index 249cccf5675b..6bd401adec48 100644
+--- a/block/blk-mq-debugfs.c
++++ b/block/blk-mq-debugfs.c
+@@ -674,57 +674,6 @@ CTX_RQ_SEQ_OPS(default, HCTX_TYPE_DEFAULT);
+ CTX_RQ_SEQ_OPS(read, HCTX_TYPE_READ);
+ CTX_RQ_SEQ_OPS(poll, HCTX_TYPE_POLL);
+ 
+-static int ctx_dispatched_show(void *data, struct seq_file *m)
+-{
+-	struct blk_mq_ctx *ctx = data;
+-
+-	seq_printf(m, "%lu %lu\n", ctx->rq_dispatched[1], ctx->rq_dispatched[0]);
+-	return 0;
+-}
+-
+-static ssize_t ctx_dispatched_write(void *data, const char __user *buf,
+-				    size_t count, loff_t *ppos)
+-{
+-	struct blk_mq_ctx *ctx = data;
+-
+-	ctx->rq_dispatched[0] = ctx->rq_dispatched[1] = 0;
+-	return count;
+-}
+-
+-static int ctx_merged_show(void *data, struct seq_file *m)
+-{
+-	struct blk_mq_ctx *ctx = data;
+-
+-	seq_printf(m, "%lu\n", ctx->rq_merged);
+-	return 0;
+-}
+-
+-static ssize_t ctx_merged_write(void *data, const char __user *buf,
+-				size_t count, loff_t *ppos)
+-{
+-	struct blk_mq_ctx *ctx = data;
+-
+-	ctx->rq_merged = 0;
+-	return count;
+-}
+-
+-static int ctx_completed_show(void *data, struct seq_file *m)
+-{
+-	struct blk_mq_ctx *ctx = data;
+-
+-	seq_printf(m, "%lu %lu\n", ctx->rq_completed[1], ctx->rq_completed[0]);
+-	return 0;
+-}
+-
+-static ssize_t ctx_completed_write(void *data, const char __user *buf,
+-				   size_t count, loff_t *ppos)
+-{
+-	struct blk_mq_ctx *ctx = data;
+-
+-	ctx->rq_completed[0] = ctx->rq_completed[1] = 0;
+-	return count;
+-}
+-
+ static int blk_mq_debugfs_show(struct seq_file *m, void *v)
+ {
+ 	const struct blk_mq_debugfs_attr *attr = m->private;
+@@ -814,9 +763,6 @@ static const struct blk_mq_debugfs_attr blk_mq_debugfs_ctx_attrs[] = {
+ 	{"default_rq_list", 0400, .seq_ops = &ctx_default_rq_list_seq_ops},
+ 	{"read_rq_list", 0400, .seq_ops = &ctx_read_rq_list_seq_ops},
+ 	{"poll_rq_list", 0400, .seq_ops = &ctx_poll_rq_list_seq_ops},
+-	{"dispatched", 0600, ctx_dispatched_show, ctx_dispatched_write},
+-	{"merged", 0600, ctx_merged_show, ctx_merged_write},
+-	{"completed", 0600, ctx_completed_show, ctx_completed_write},
+ 	{},
+ };
+ 
+* Unmerged path block/blk-mq-sched.c
+* Unmerged path block/blk-mq.c
+diff --git a/block/blk-mq.h b/block/blk-mq.h
+index 6998bcc538b8..b5409c6b97c9 100644
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@ -27,13 +27,6 @@ struct blk_mq_ctx {
+ 	unsigned short		index_hw[HCTX_MAX_TYPES];
+ 	RH_KABI_BROKEN_INSERT(struct blk_mq_hw_ctx	*hctxs[HCTX_MAX_TYPES])
+ 
+-	/* incremented at dispatch time */
+-	unsigned long		rq_dispatched[2];
+-	unsigned long		rq_merged;
+-
+-	/* incremented at completion time */
+-	unsigned long		____cacheline_aligned_in_smp rq_completed[2];
+-
+ 	struct request_queue	*queue;
+ 	struct blk_mq_ctxs      *ctxs;
+ 	struct kobject		kobj;
