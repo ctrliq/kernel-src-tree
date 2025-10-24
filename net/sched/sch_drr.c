@@ -336,6 +336,7 @@ static struct drr_class *drr_classify(struct sk_buff *skb, struct Qdisc *sch,
 static int drr_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 		       struct sk_buff **to_free)
 {
+	unsigned int len = qdisc_pkt_len(skb);
 	struct drr_sched *q = qdisc_priv(sch);
 	struct drr_class *cl;
 	int err = 0;
@@ -362,7 +363,7 @@ static int drr_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 		cl->deficit = cl->quantum;
 	}
 
-	qdisc_qstats_backlog_inc(sch, skb);
+	sch->qstats.backlog += len;
 	sch->q.qlen++;
 	return err;
 }
