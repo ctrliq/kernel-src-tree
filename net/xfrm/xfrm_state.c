@@ -535,9 +535,9 @@ static void ___xfrm_state_destroy(struct xfrm_state *x)
 {
 	hrtimer_cancel(&x->mtimer);
 	del_timer_sync(&x->rtimer);
-	kfree(x->aead);
-	kfree(x->aalg);
-	kfree(x->ealg);
+	kfree_sensitive(x->aead);
+	kfree_sensitive(x->aalg);
+	kfree_sensitive(x->ealg);
 	kfree(x->calg);
 	kfree(x->encap);
 	kfree(x->coaddr);
@@ -763,9 +763,6 @@ int __xfrm_state_delete(struct xfrm_state *x)
 			hlist_del_rcu(&x->byspi);
 		net->xfrm.state_num--;
 		spin_unlock(&net->xfrm.xfrm_state_lock);
-
-		if (x->encap_sk)
-			sock_put(rcu_dereference_raw(x->encap_sk));
 
 		xfrm_dev_state_delete(x);
 
