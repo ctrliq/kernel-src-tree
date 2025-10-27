@@ -1623,10 +1623,14 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
 	 * without the ability to perform CMOs.
 	 */
 	if (is_vma_cacheable && s2_force_noncacheable)
-		return -EINVAL;
+		ret = -EINVAL;
+	else if (exec_fault && s2_force_noncacheable)
+		ret = -ENOEXEC;
 
-	if (exec_fault && s2_force_noncacheable)
-		return -ENOEXEC;
+	if (ret) {
+		kvm_release_pfn_clean(pfn);
+		return ret;
+	}
 
 	/*
 	 * Potentially reduce shadow S2 permissions to match the guest's own
