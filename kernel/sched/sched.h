@@ -472,10 +472,7 @@ struct task_group {
 	struct rt_bandwidth	rt_bandwidth;
 #endif
 
-#ifdef CONFIG_EXT_GROUP_SCHED
-	u32			scx_flags;	/* SCX_TG_* */
-	u32			scx_weight;
-#endif
+	struct scx_task_group	scx;
 
 	struct rcu_head		rcu;
 	struct list_head	list;
@@ -1714,10 +1711,10 @@ extern struct balance_callback balance_push_callback;
 #ifdef CONFIG_SCHED_CLASS_EXT
 extern const struct sched_class ext_sched_class;
 
-DECLARE_STATIC_KEY_FALSE(__scx_ops_enabled);	/* SCX BPF scheduler loaded */
+DECLARE_STATIC_KEY_FALSE(__scx_enabled);	/* SCX BPF scheduler loaded */
 DECLARE_STATIC_KEY_FALSE(__scx_switched_all);	/* all fair class tasks on SCX */
 
-#define scx_enabled()		static_branch_unlikely(&__scx_ops_enabled)
+#define scx_enabled()		static_branch_unlikely(&__scx_enabled)
 #define scx_switched_all()	static_branch_unlikely(&__scx_switched_all)
 
 static inline void scx_rq_clock_update(struct rq *rq, u64 clock)

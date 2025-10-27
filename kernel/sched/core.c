@@ -3890,13 +3890,8 @@ bool cpus_share_resources(int this_cpu, int that_cpu)
 
 static inline bool ttwu_queue_cond(struct task_struct *p, int cpu)
 {
-	/*
-	 * The BPF scheduler may depend on select_task_rq() being invoked during
-	 * wakeups. In addition, @p may end up executing on a different CPU
-	 * regardless of what happens in the wakeup path making the ttwu_queue
-	 * optimization less meaningful. Skip if on SCX.
-	 */
-	if (task_on_scx(p))
+	/* See SCX_OPS_ALLOW_QUEUED_WAKEUP. */
+	if (!scx_allow_ttwu_queue(p))
 		return false;
 
 #ifdef CONFIG_SMP
@@ -8442,7 +8437,7 @@ void __init sched_init(void)
 		init_cfs_bandwidth(&root_task_group.cfs_bandwidth, NULL);
 #endif /* CONFIG_FAIR_GROUP_SCHED */
 #ifdef CONFIG_EXT_GROUP_SCHED
-		root_task_group.scx_weight = CGROUP_WEIGHT_DFL;
+		scx_tg_init(&root_task_group);
 #endif /* CONFIG_EXT_GROUP_SCHED */
 #ifdef CONFIG_RT_GROUP_SCHED
 		root_task_group.rt_se = (struct sched_rt_entity **)ptr;
@@ -8877,7 +8872,7 @@ struct task_group *sched_create_group(struct task_group *parent)
 	if (!alloc_rt_sched_group(tg, parent))
 		goto err;
 
-	scx_group_set_weight(tg, CGROUP_WEIGHT_DFL);
+	scx_tg_init(tg);
 	alloc_uclamp_sched_group(tg, parent);
 
 	return tg;
@@ -9286,7 +9281,7 @@ static unsigned long tg_weight(struct task_group *tg)
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	return scale_load_down(tg->shares);
 #else
-	return sched_weight_from_cgroup(tg->scx_weight);
+	return sched_weight_from_cgroup(tg->scx.weight);
 #endif
 }
 
