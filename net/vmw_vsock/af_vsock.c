@@ -479,20 +479,9 @@ int vsock_assign_transport(struct vsock_sock *vsk, struct vsock_sock *psk)
 		goto err;
 	}
 
-	if (vsk->transport) {
-		if (vsk->transport == new_transport) {
-			ret = 0;
-			goto err;
-		}
-
-		/* transport->release() must be called with sock lock acquired.
-		 * This path can only be taken during vsock_connect(), where we
-		 * have already held the sock lock. In the other cases, this
-		 * function is called on a new socket which is not assigned to
-		 * any transport.
-		 */
-		vsk->transport->release(vsk);
-		vsock_deassign_transport(vsk);
+	if (vsk->transport && vsk->transport == new_transport) {
+		ret = 0;
+		goto err;
 	}
 
 	/* We increase the module refcnt to prevent the transport unloading
@@ -508,6 +497,17 @@ int vsock_assign_transport(struct vsock_sock *vsk, struct vsock_sock *psk)
 	 * the last module_put() below or in vsock_deassign_transport().
 	 */
 	mutex_unlock(&vsock_register_mutex);
+
+	if (vsk->transport) {
+		/* transport->release() must be called with sock lock acquired.
+		 * This path can only be taken during vsock_connect(), where we
+		 * have already held the sock lock. In the other cases, this
+		 * function is called on a new socket which is not assigned to
+		 * any transport.
+		 */
+		vsk->transport->release(vsk);
+		vsock_deassign_transport(vsk);
+	}
 
 	if (sk->sk_type == SOCK_SEQPACKET) {
 		if (!new_transport->seqpacket_allow ||
