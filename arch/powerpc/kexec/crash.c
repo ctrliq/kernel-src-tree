@@ -468,8 +468,7 @@ static void update_crash_elfcorehdr(struct kimage *image, struct memory_notify *
 	}
 out:
 	kvfree(cmem);
-	if (elfbuf)
-		kvfree(elfbuf);
+	kvfree(elfbuf);
 }
 
 /**
