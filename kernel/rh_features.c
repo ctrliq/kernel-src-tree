@@ -21,7 +21,7 @@ bool __rh_mark_used_feature(const char *feature_name)
 	struct rh_feature *feat, *iter;
 
 	BUG_ON(in_interrupt());
-	feat = kzalloc(sizeof(*feat), GFP_KERNEL);
+	feat = kzalloc(sizeof(*feat), GFP_ATOMIC);
 	if (WARN(!feat, "Using feature %s.\n", feature_name))
 		return false;
 	strscpy(feat->name, feature_name, RH_FEATURE_NAME_LEN);
