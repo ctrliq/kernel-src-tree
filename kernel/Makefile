@@ -12,7 +12,7 @@ obj-y     = fork.o exec_domain.o panic.o \
 	    notifier.o ksysfs.o cred.o reboot.o \
 	    async.o range.o smpboot.o ucount.o regset.o ksyms_common.o
 
-obj-$(CONFIG_RHEL_DIFFERENCES) += rh_messages.o rh_features.o rh_shadowman.o
+obj-$(CONFIG_RHEL_DIFFERENCES) += rh_messages.o rh_flags.o rh_shadowman.o
 obj-$(CONFIG_USERMODE_DRIVER) += usermode_driver.o
 obj-$(CONFIG_MULTIUSER) += groups.o
 
