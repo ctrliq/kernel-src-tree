@@ -1,5 +1,7 @@
 #include <linux/kernel.h>
 #include <linux/list.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/rh_features.h>
@@ -62,3 +64,32 @@ void rh_print_used_features(void)
 	pr_cont("\n");
 }
 EXPORT_SYMBOL(rh_print_used_features);
+
+static int rh_features_show(struct seq_file *seq, void *unused)
+{
+	struct rh_feature *feat;
+	bool space = false;
+
+	if (list_empty(&rh_feature_list))
+		return 0;
+	rcu_read_lock();
+	list_for_each_entry_rcu(feat, &rh_feature_list, list) {
+		if (space)
+			seq_puts(seq, " ");
+		seq_puts(seq, feat->name);
+		space = true;
+	}
+	rcu_read_unlock();
+	seq_puts(seq, "\n");
+	return 0;
+}
+
+static __init int rh_features_init(void)
+{
+	struct proc_dir_entry *ent;
+
+	ent = proc_create_single("driver/rh_features", 0, NULL, rh_features_show);
+	WARN_ON(!ent);
+	return 0;
+}
+subsys_initcall(rh_features_init);
