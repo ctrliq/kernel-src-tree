@@ -7,6 +7,8 @@
 #include <linux/rh_features.h>
 
 #define RH_FEATURE_NAME_LEN	32
+#define MAX_RH_FEATURES		128
+#define MAX_RH_FEATURE_NAME_LEN	(MAX_RH_FEATURES * RH_FEATURE_NAME_LEN)
 
 struct rh_feature {
 	struct list_head list;
@@ -58,38 +60,56 @@ void rh_print_used_features(void)
 	if (list_empty(&rh_feature_list))
 		return;
 	printk(KERN_DEFAULT "Features:");
-	list_for_each_entry_rcu(feat, &rh_feature_list, list) {
+	list_for_each_entry_lockless(feat, &rh_feature_list, list) {
 		pr_cont(" %s", feat->name);
 	}
 	pr_cont("\n");
 }
 EXPORT_SYMBOL(rh_print_used_features);
 
-static int rh_features_show(struct seq_file *seq, void *unused)
+#ifdef CONFIG_SYSCTL
+static int rh_features_show(struct ctl_table *ctl, int write,
+			    void __user *buffer, size_t *lenp,
+			    loff_t *ppos)
 {
+	struct ctl_table tbl = { .maxlen = MAX_RH_FEATURE_NAME_LEN, };
 	struct rh_feature *feat;
-	bool space = false;
+	size_t offs = 0;
+	int ret;
 
-	if (list_empty(&rh_feature_list))
-		return 0;
+	tbl.data = kmalloc(tbl.maxlen, GFP_KERNEL);
+	if (!tbl.data)
+		return -ENOMEM;
+
 	rcu_read_lock();
 	list_for_each_entry_rcu(feat, &rh_feature_list, list) {
-		if (space)
-			seq_puts(seq, " ");
-		seq_puts(seq, feat->name);
-		space = true;
+		offs += scnprintf(tbl.data + offs, tbl.maxlen - offs, "%s%s",
+				  offs == 0 ? "" : " ", feat->name);
 	}
 	rcu_read_unlock();
-	seq_puts(seq, "\n");
-	return 0;
+
+	ret = proc_dostring(&tbl, write, buffer, lenp, ppos);
+	kfree(tbl.data);
+	return ret;
 }
+
+static struct ctl_table rh_features_table[] = {
+	{
+		.procname = "rh_features",
+		.data = &rh_feature_list,
+		.maxlen = MAX_RH_FEATURE_NAME_LEN,
+		.mode = 0444,
+		.proc_handler = rh_features_show,
+	},
+	{ }
+};
+#endif
 
 static __init int rh_features_init(void)
 {
-	struct proc_dir_entry *ent;
-
-	ent = proc_create_single("driver/rh_features", 0, NULL, rh_features_show);
-	WARN_ON(!ent);
+#ifdef CONFIG_SYSCTL
+	register_sysctl_init("kernel", rh_features_table);
+#endif
 	return 0;
 }
 subsys_initcall(rh_features_init);
