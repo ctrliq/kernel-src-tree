@@ -78,6 +78,7 @@ EXPORT_SYMBOL(rtas_flash_term_hook);
 
 DEFINE_MUTEX(rtas_ibm_get_vpd_lock);
 DEFINE_MUTEX(rtas_ibm_get_indices_lock);
+DEFINE_MUTEX(rtas_ibm_set_dynamic_indicator_lock);
 
 /* RTAS use home made raw locking instead of spin_lock_irqsave
  * because those can be called from within really nasty contexts
@@ -1121,6 +1122,9 @@ static struct mutex *find_rtas_mutex(int token)
 
 	if (token == rtas_token("ibm,get-indices"))
 		return &rtas_ibm_get_indices_lock;
+
+	if (token == rtas_token("ibm,set-dynamic-indicator"))
+		return &rtas_ibm_set_dynamic_indicator_lock;
 
 	return NULL;
 }
