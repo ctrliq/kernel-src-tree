@@ -1108,6 +1108,19 @@ static void __init rtas_syscall_filter_init(void)
 
 #endif /* CONFIG_PPC_RTAS_FILTER */
 
+/*
+ * For specific RTAS calls, mutex will be held before
+ * RTAS enter. Return the mutex struct for those
+ * specific RTAS tokens.
+ */
+static struct mutex *find_rtas_mutex(int token)
+{
+	if (token == rtas_token("ibm,get-vpd"))
+		return &rtas_ibm_get_vpd_lock;
+
+	return NULL;
+}
+
 /* We assume to be passed big endian arguments */
 SYSCALL_DEFINE1(rtas, struct rtas_args __user *, uargs)
 {
@@ -1115,7 +1128,7 @@ SYSCALL_DEFINE1(rtas, struct rtas_args __user *, uargs)
 	unsigned long flags;
 	char *buff_copy, *errbuf = NULL;
 	int nargs, nret, token;
-	bool is_get_vpd;
+	struct mutex *rtas_token_mutex = NULL;
 
 	if (!capable(CAP_SYS_ADMIN))
 		return -EPERM;
@@ -1171,9 +1184,12 @@ SYSCALL_DEFINE1(rtas, struct rtas_args __user *, uargs)
 
 	buff_copy = get_errorlog_buffer();
 
-	is_get_vpd = (token == rtas_token("ibm,get-vpd"));
-	if (is_get_vpd)
-		mutex_lock(&rtas_ibm_get_vpd_lock);
+	/*
+	 * Hold mutex only for specific RTAS calls.
+	 */
+	rtas_token_mutex = find_rtas_mutex(token);
+	if (rtas_token_mutex)
+		mutex_lock(rtas_token_mutex);
 
 	flags = lock_rtas();
 
@@ -1188,8 +1204,8 @@ SYSCALL_DEFINE1(rtas, struct rtas_args __user *, uargs)
 
 	unlock_rtas(flags);
 
-	if (is_get_vpd)
-		mutex_unlock(&rtas_ibm_get_vpd_lock);
+	if (rtas_token_mutex)
+		mutex_unlock(rtas_token_mutex);
 
 	if (buff_copy) {
 		if (errbuf)
