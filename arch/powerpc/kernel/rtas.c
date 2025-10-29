@@ -76,6 +76,7 @@ unsigned long rtas_rmo_buf;
 void (*rtas_flash_term_hook)(int);
 EXPORT_SYMBOL(rtas_flash_term_hook);
 
+DEFINE_MUTEX(rtas_ibm_physical_attestation_lock);
 DEFINE_MUTEX(rtas_ibm_get_vpd_lock);
 DEFINE_MUTEX(rtas_ibm_get_indices_lock);
 DEFINE_MUTEX(rtas_ibm_set_dynamic_indicator_lock);
@@ -1129,6 +1130,9 @@ static struct mutex *find_rtas_mutex(int token)
 
 	if (token == rtas_token("ibm,get-dynamic-sensor-state"))
 		return &rtas_ibm_get_dynamic_sensor_state_lock;
+
+	if (token == rtas_token("ibm,physical-attestation"))
+		return &rtas_ibm_physical_attestation_lock;
 
 	return NULL;
 }
