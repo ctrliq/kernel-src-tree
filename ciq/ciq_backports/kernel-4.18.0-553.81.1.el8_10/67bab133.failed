@@ -1,0 +1,387 @@
+mm/hugetlb: wait for hugetlb folios to be freed
+
+jira LE-4623
+Rebuild_History Non-Buildable kernel-4.18.0-553.81.1.el8_10
+commit-author Ge Yang <yangge1116@126.com>
+commit 67bab13307c83fb742c2556b06cdc39dbad27f07
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.81.1.el8_10/67bab133.failed
+
+Since the introduction of commit c77c0a8ac4c52 ("mm/hugetlb: defer freeing
+of huge pages if in non-task context"), which supports deferring the
+freeing of hugetlb pages, the allocation of contiguous memory through
+cma_alloc() may fail probabilistically.
+
+In the CMA allocation process, if it is found that the CMA area is
+occupied by in-use hugetlb folios, these in-use hugetlb folios need to be
+migrated to another location.  When there are no available hugetlb folios
+in the free hugetlb pool during the migration of in-use hugetlb folios,
+new folios are allocated from the buddy system.  A temporary state is set
+on the newly allocated folio.  Upon completion of the hugetlb folio
+migration, the temporary state is transferred from the new folios to the
+old folios.  Normally, when the old folios with the temporary state are
+freed, it is directly released back to the buddy system.  However, due to
+the deferred freeing of hugetlb pages, the PageBuddy() check fails,
+ultimately leading to the failure of cma_alloc().
+
+Here is a simplified call trace illustrating the process:
+cma_alloc()
+    ->__alloc_contig_migrate_range() // Migrate in-use hugetlb folios
+        ->unmap_and_move_huge_page()
+            ->folio_putback_hugetlb() // Free old folios
+    ->test_pages_isolated()
+        ->__test_page_isolated_in_pageblock()
+             ->PageBuddy(page) // Check if the page is in buddy
+
+To resolve this issue, we have implemented a function named
+wait_for_freed_hugetlb_folios().  This function ensures that the hugetlb
+folios are properly released back to the buddy system after their
+migration is completed.  By invoking wait_for_freed_hugetlb_folios()
+before calling PageBuddy(), we ensure that PageBuddy() will succeed.
+
+Link: https://lkml.kernel.org/r/1739936804-18199-1-git-send-email-yangge1116@126.com
+Fixes: c77c0a8ac4c5 ("mm/hugetlb: defer freeing of huge pages if in non-task context")
+	Signed-off-by: Ge Yang <yangge1116@126.com>
+	Reviewed-by: Muchun Song <muchun.song@linux.dev>
+	Acked-by: David Hildenbrand <david@redhat.com>
+	Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+	Cc: Barry Song <21cnbao@gmail.com>
+	Cc: Oscar Salvador <osalvador@suse.de>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit 67bab13307c83fb742c2556b06cdc39dbad27f07)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/hugetlb.h
+#	mm/hugetlb.c
+#	mm/page_isolation.c
+diff --cc include/linux/hugetlb.h
+index 6605a0d41b9d,dbe76d4f1bfc..000000000000
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@@ -584,18 -680,26 +584,33 @@@ struct huge_bootmem_page 
+  	struct hstate *hstate;
+  };
+  
+++<<<<<<< HEAD
+ +struct page *alloc_huge_page(struct vm_area_struct *vma,
+ +				unsigned long addr, int avoid_reserve);
+ +struct page *alloc_huge_page_nodemask(struct hstate *h, int preferred_nid,
+ +				nodemask_t *nmask, gfp_t gfp_mask);
+ +struct page *alloc_huge_page_vma(struct hstate *h, struct vm_area_struct *vma,
+ +				unsigned long address);
+ +int huge_add_to_page_cache(struct page *page, struct address_space *mapping,
+++=======
++ int isolate_or_dissolve_huge_page(struct page *page, struct list_head *list);
++ int replace_free_hugepage_folios(unsigned long start_pfn, unsigned long end_pfn);
++ void wait_for_freed_hugetlb_folios(void);
++ struct folio *alloc_hugetlb_folio(struct vm_area_struct *vma,
++ 				unsigned long addr, bool cow_from_owner);
++ struct folio *alloc_hugetlb_folio_nodemask(struct hstate *h, int preferred_nid,
++ 				nodemask_t *nmask, gfp_t gfp_mask,
++ 				bool allow_alloc_fallback);
++ struct folio *alloc_hugetlb_folio_reserve(struct hstate *h, int preferred_nid,
++ 					  nodemask_t *nmask, gfp_t gfp_mask);
++ 
++ int hugetlb_add_to_page_cache(struct folio *folio, struct address_space *mapping,
+++>>>>>>> 67bab13307c8 (mm/hugetlb: wait for hugetlb folios to be freed)
+  			pgoff_t idx);
+ -void restore_reserve_on_error(struct hstate *h, struct vm_area_struct *vma,
+ -				unsigned long address, struct folio *folio);
+  
+  /* arch callback */
+ -int __init __alloc_bootmem_huge_page(struct hstate *h, int nid);
+ -int __init alloc_bootmem_huge_page(struct hstate *h, int nid);
+ -bool __init hugetlb_node_alloc_supported(void);
+ +int __init __alloc_bootmem_huge_page(struct hstate *h);
+ +int __init alloc_bootmem_huge_page(struct hstate *h);
+  
+  void __init hugetlb_add_hstate(unsigned order);
+  bool __init arch_hugetlb_valid_size(unsigned long size);
+@@@ -851,9 -1049,31 +866,35 @@@ static inline struct hugepage_subpool *
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+ +static inline struct page *alloc_huge_page(struct vm_area_struct *vma,
+++=======
++ static inline struct folio *filemap_lock_hugetlb_folio(struct hstate *h,
++ 				struct address_space *mapping, pgoff_t idx)
++ {
++ 	return NULL;
++ }
++ 
++ static inline int isolate_or_dissolve_huge_page(struct page *page,
++ 						struct list_head *list)
++ {
++ 	return -ENOMEM;
++ }
++ 
++ static inline int replace_free_hugepage_folios(unsigned long start_pfn,
++ 		unsigned long end_pfn)
++ {
++ 	return 0;
++ }
++ 
++ static inline void wait_for_freed_hugetlb_folios(void)
++ {
++ }
++ 
++ static inline struct folio *alloc_hugetlb_folio(struct vm_area_struct *vma,
+++>>>>>>> 67bab13307c8 (mm/hugetlb: wait for hugetlb folios to be freed)
+  					   unsigned long addr,
+ -					   bool cow_from_owner)
+ +					   int avoid_reserve)
+  {
+  	return NULL;
+  }
+diff --cc mm/hugetlb.c
+index f1385ebb3bf8,811b29f77abf..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -2350,8 -2781,204 +2350,209 @@@ static void restore_reserve_on_error(st
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +struct page *alloc_huge_page(struct vm_area_struct *vma,
+ +				    unsigned long addr, int avoid_reserve)
+++=======
++ /*
++  * alloc_and_dissolve_hugetlb_folio - Allocate a new folio and dissolve
++  * the old one
++  * @h: struct hstate old page belongs to
++  * @old_folio: Old folio to dissolve
++  * @list: List to isolate the page in case we need to
++  * Returns 0 on success, otherwise negated error.
++  */
++ static int alloc_and_dissolve_hugetlb_folio(struct hstate *h,
++ 			struct folio *old_folio, struct list_head *list)
++ {
++ 	gfp_t gfp_mask = htlb_alloc_mask(h) | __GFP_THISNODE;
++ 	int nid = folio_nid(old_folio);
++ 	struct folio *new_folio = NULL;
++ 	int ret = 0;
++ 
++ retry:
++ 	spin_lock_irq(&hugetlb_lock);
++ 	if (!folio_test_hugetlb(old_folio)) {
++ 		/*
++ 		 * Freed from under us. Drop new_folio too.
++ 		 */
++ 		goto free_new;
++ 	} else if (folio_ref_count(old_folio)) {
++ 		bool isolated;
++ 
++ 		/*
++ 		 * Someone has grabbed the folio, try to isolate it here.
++ 		 * Fail with -EBUSY if not possible.
++ 		 */
++ 		spin_unlock_irq(&hugetlb_lock);
++ 		isolated = folio_isolate_hugetlb(old_folio, list);
++ 		ret = isolated ? 0 : -EBUSY;
++ 		spin_lock_irq(&hugetlb_lock);
++ 		goto free_new;
++ 	} else if (!folio_test_hugetlb_freed(old_folio)) {
++ 		/*
++ 		 * Folio's refcount is 0 but it has not been enqueued in the
++ 		 * freelist yet. Race window is small, so we can succeed here if
++ 		 * we retry.
++ 		 */
++ 		spin_unlock_irq(&hugetlb_lock);
++ 		cond_resched();
++ 		goto retry;
++ 	} else {
++ 		if (!new_folio) {
++ 			spin_unlock_irq(&hugetlb_lock);
++ 			new_folio = alloc_buddy_hugetlb_folio(h, gfp_mask, nid,
++ 							      NULL, NULL);
++ 			if (!new_folio)
++ 				return -ENOMEM;
++ 			__prep_new_hugetlb_folio(h, new_folio);
++ 			goto retry;
++ 		}
++ 
++ 		/*
++ 		 * Ok, old_folio is still a genuine free hugepage. Remove it from
++ 		 * the freelist and decrease the counters. These will be
++ 		 * incremented again when calling __prep_account_new_huge_page()
++ 		 * and enqueue_hugetlb_folio() for new_folio. The counters will
++ 		 * remain stable since this happens under the lock.
++ 		 */
++ 		remove_hugetlb_folio(h, old_folio, false);
++ 
++ 		/*
++ 		 * Ref count on new_folio is already zero as it was dropped
++ 		 * earlier.  It can be directly added to the pool free list.
++ 		 */
++ 		__prep_account_new_huge_page(h, nid);
++ 		enqueue_hugetlb_folio(h, new_folio);
++ 
++ 		/*
++ 		 * Folio has been replaced, we can safely free the old one.
++ 		 */
++ 		spin_unlock_irq(&hugetlb_lock);
++ 		update_and_free_hugetlb_folio(h, old_folio, false);
++ 	}
++ 
++ 	return ret;
++ 
++ free_new:
++ 	spin_unlock_irq(&hugetlb_lock);
++ 	if (new_folio)
++ 		update_and_free_hugetlb_folio(h, new_folio, false);
++ 
++ 	return ret;
++ }
++ 
++ int isolate_or_dissolve_huge_page(struct page *page, struct list_head *list)
++ {
++ 	struct hstate *h;
++ 	struct folio *folio = page_folio(page);
++ 	int ret = -EBUSY;
++ 
++ 	/*
++ 	 * The page might have been dissolved from under our feet, so make sure
++ 	 * to carefully check the state under the lock.
++ 	 * Return success when racing as if we dissolved the page ourselves.
++ 	 */
++ 	spin_lock_irq(&hugetlb_lock);
++ 	if (folio_test_hugetlb(folio)) {
++ 		h = folio_hstate(folio);
++ 	} else {
++ 		spin_unlock_irq(&hugetlb_lock);
++ 		return 0;
++ 	}
++ 	spin_unlock_irq(&hugetlb_lock);
++ 
++ 	/*
++ 	 * Fence off gigantic pages as there is a cyclic dependency between
++ 	 * alloc_contig_range and them. Return -ENOMEM as this has the effect
++ 	 * of bailing out right away without further retrying.
++ 	 */
++ 	if (hstate_is_gigantic(h))
++ 		return -ENOMEM;
++ 
++ 	if (folio_ref_count(folio) && folio_isolate_hugetlb(folio, list))
++ 		ret = 0;
++ 	else if (!folio_ref_count(folio))
++ 		ret = alloc_and_dissolve_hugetlb_folio(h, folio, list);
++ 
++ 	return ret;
++ }
++ 
++ /*
++  *  replace_free_hugepage_folios - Replace free hugepage folios in a given pfn
++  *  range with new folios.
++  *  @start_pfn: start pfn of the given pfn range
++  *  @end_pfn: end pfn of the given pfn range
++  *  Returns 0 on success, otherwise negated error.
++  */
++ int replace_free_hugepage_folios(unsigned long start_pfn, unsigned long end_pfn)
++ {
++ 	struct hstate *h;
++ 	struct folio *folio;
++ 	int ret = 0;
++ 
++ 	LIST_HEAD(isolate_list);
++ 
++ 	while (start_pfn < end_pfn) {
++ 		folio = pfn_folio(start_pfn);
++ 		if (folio_test_hugetlb(folio)) {
++ 			h = folio_hstate(folio);
++ 		} else {
++ 			start_pfn++;
++ 			continue;
++ 		}
++ 
++ 		if (!folio_ref_count(folio)) {
++ 			ret = alloc_and_dissolve_hugetlb_folio(h, folio,
++ 							       &isolate_list);
++ 			if (ret)
++ 				break;
++ 
++ 			putback_movable_pages(&isolate_list);
++ 		}
++ 		start_pfn++;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ void wait_for_freed_hugetlb_folios(void)
++ {
++ 	if (llist_empty(&hpage_freelist))
++ 		return;
++ 
++ 	flush_work(&free_hpage_work);
++ }
++ 
++ typedef enum {
++ 	/*
++ 	 * For either 0/1: we checked the per-vma resv map, and one resv
++ 	 * count either can be reused (0), or an extra needed (1).
++ 	 */
++ 	MAP_CHG_REUSE = 0,
++ 	MAP_CHG_NEEDED = 1,
++ 	/*
++ 	 * Cannot use per-vma resv count can be used, hence a new resv
++ 	 * count is enforced.
++ 	 *
++ 	 * NOTE: This is mostly identical to MAP_CHG_NEEDED, except
++ 	 * that currently vma_needs_reservation() has an unwanted side
++ 	 * effect to either use end() or commit() to complete the
++ 	 * transaction.	 Hence it needs to differenciate from NEEDED.
++ 	 */
++ 	MAP_CHG_ENFORCED = 2,
++ } map_chg_state;
++ 
++ /*
++  * NOTE! "cow_from_owner" represents a very hacky usage only used in CoW
++  * faults of hugetlb private mappings on top of a non-page-cache folio (in
++  * which case even if there's a private vma resv map it won't cover such
++  * allocation).  New call sites should (probably) never set it to true!!
++  * When it's set, the allocation will bypass all vma level reservations.
++  */
++ struct folio *alloc_hugetlb_folio(struct vm_area_struct *vma,
++ 				    unsigned long addr, bool cow_from_owner)
+++>>>>>>> 67bab13307c8 (mm/hugetlb: wait for hugetlb folios to be freed)
+  {
+  	struct hugepage_subpool *spool = subpool_vma(vma);
+  	struct hstate *h = hstate_vma(vma);
+diff --cc mm/page_isolation.c
+index 037eb6efb2f7,a051a29e95ad..000000000000
+--- a/mm/page_isolation.c
++++ b/mm/page_isolation.c
+@@@ -281,10 -605,21 +281,25 @@@ int test_pages_isolated(unsigned long s
+  	unsigned long pfn, flags;
+  	struct page *page;
+  	struct zone *zone;
+ -	int ret;
+  
+  	/*
+++<<<<<<< HEAD
+ +	 * Note: pageblock_nr_pages != MAX_ORDER. Then, chunks of free pages
+ +	 * are not aligned to pageblock_nr_pages.
+++=======
++ 	 * Due to the deferred freeing of hugetlb folios, the hugepage folios may
++ 	 * not immediately release to the buddy system. This can cause PageBuddy()
++ 	 * to fail in __test_page_isolated_in_pageblock(). To ensure that the
++ 	 * hugetlb folios are properly released back to the buddy system, we
++ 	 * invoke the wait_for_freed_hugetlb_folios() function to wait for the
++ 	 * release to complete.
++ 	 */
++ 	wait_for_freed_hugetlb_folios();
++ 
++ 	/*
++ 	 * Note: pageblock_nr_pages != MAX_PAGE_ORDER. Then, chunks of free
++ 	 * pages are not aligned to pageblock_nr_pages.
+++>>>>>>> 67bab13307c8 (mm/hugetlb: wait for hugetlb folios to be freed)
+  	 * Then we just check migratetype first.
+  	 */
+  	for (pfn = start_pfn; pfn < end_pfn; pfn += pageblock_nr_pages) {
+* Unmerged path include/linux/hugetlb.h
+* Unmerged path mm/hugetlb.c
+* Unmerged path mm/page_isolation.c
