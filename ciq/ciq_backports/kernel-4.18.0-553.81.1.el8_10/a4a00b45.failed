@@ -1,0 +1,232 @@
+mm: hugetlb: eliminate memory-less nodes handling
+
+jira LE-4623
+Rebuild_History Non-Buildable kernel-4.18.0-553.81.1.el8_10
+commit-author Muchun Song <songmuchun@bytedance.com>
+commit a4a00b451ef5e1deb959088e25e248f4ee399792
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.81.1.el8_10/a4a00b45.failed
+
+The memory-notify-based approach aims to handle meory-less nodes, however,
+it just adds the complexity of code as pointed by David in thread [1]. 
+The handling of memory-less nodes is introduced by commit 4faf8d950ec4
+("hugetlb: handle memory hot-plug events").  >From its commit message, we
+cannot find any necessity of handling this case.  So, we can simply
+register/unregister sysfs entries in register_node/unregister_node to
+simlify the code.
+
+BTW, hotplug callback added because in hugetlb_register_all_nodes() we
+register sysfs nodes only for N_MEMORY nodes, seeing commit 9b5e5d0fdc91,
+which said it was a preparation for handling memory-less nodes via memory
+hotplug.  Since we want to remove memory hotplug, so make sure we only
+register per-node sysfs for online (N_ONLINE) nodes in
+hugetlb_register_all_nodes().
+
+https://lore.kernel.org/linux-mm/60933ffc-b850-976c-78a0-0ee6e0ea9ef0@redhat.com/ [1]
+Link: https://lkml.kernel.org/r/20220914072603.60293-3-songmuchun@bytedance.com
+	Suggested-by: David Hildenbrand <david@redhat.com>
+	Signed-off-by: Muchun Song <songmuchun@bytedance.com>
+	Acked-by: David Hildenbrand <david@redhat.com>
+	Cc: Andi Kleen <andi@firstfloor.org>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: Mike Kravetz <mike.kravetz@oracle.com>
+	Cc: Oscar Salvador <osalvador@suse.de>
+	Cc: Rafael J. Wysocki <rafael@kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit a4a00b451ef5e1deb959088e25e248f4ee399792)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/base/node.c
+#	mm/hugetlb.c
+diff --cc drivers/base/node.c
+index fb1d56f977ea,80b1e91b9608..000000000000
+--- a/drivers/base/node.c
++++ b/drivers/base/node.c
+@@@ -660,13 -609,13 +661,20 @@@ static int register_node(struct node *n
+  	node->dev.groups = node_dev_groups;
+  	error = device_register(&node->dev);
+  
+- 	if (error)
++ 	if (error) {
+  		put_device(&node->dev);
+++<<<<<<< HEAD
+ +	else {
+ +		hugetlb_register_node(node);
+++=======
++ 	} else {
++ 		hugetlb_register_node(node);
++ 		compaction_register_node(node);
++ 	}
+++>>>>>>> a4a00b451ef5 (mm: hugetlb: eliminate memory-less nodes handling)
+  
+ +		compaction_register_node(node);
+ +	}
+  	return error;
+  }
+  
+@@@ -679,8 -628,8 +687,9 @@@
+   */
+  void unregister_node(struct node *node)
+  {
++ 	hugetlb_unregister_node(node);
+  	compaction_unregister_node(node);
+ +	hugetlb_unregister_node(node);		/* no-op, if memoryless node */
+  	node_remove_accesses(node);
+  	node_remove_caches(node);
+  	device_unregister(&node->dev);
+diff --cc mm/hugetlb.c
+index f1385ebb3bf8,0b1ab5af939e..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -3056,29 -3853,26 +3056,13 @@@ static int hugetlb_sysfs_add_hstate(str
+  	if (retval) {
+  		kobject_put(hstate_kobjs[hi]);
+  		hstate_kobjs[hi] = NULL;
+ -		return retval;
+ -	}
+ -
+ -	if (h->demote_order) {
+ -		retval = sysfs_create_group(hstate_kobjs[hi],
+ -					    &hstate_demote_attr_group);
+ -		if (retval) {
+ -			pr_warn("HugeTLB unable to create demote interfaces for %s\n", h->name);
+ -			sysfs_remove_group(hstate_kobjs[hi], hstate_attr_group);
+ -			kobject_put(hstate_kobjs[hi]);
+ -			hstate_kobjs[hi] = NULL;
+ -			return retval;
+ -		}
+  	}
+  
+ -	return 0;
+ +	return retval;
+  }
+  
+- static void __init hugetlb_sysfs_init(void)
+- {
+- 	struct hstate *h;
+- 	int err;
+- 
+- 	hugepages_kobj = kobject_create_and_add("hugepages", mm_kobj);
+- 	if (!hugepages_kobj)
+- 		return;
+- 
+- 	for_each_hstate(h) {
+- 		err = hugetlb_sysfs_add_hstate(h, hugepages_kobj,
+- 					 hstate_kobjs, &hstate_attr_group);
+- 		if (err)
+- 			pr_err("HugeTLB: Unable to add hstate %s", h->name);
+- 	}
+- }
+- 
+  #ifdef CONFIG_NUMA
++ static bool hugetlb_sysfs_initialized __ro_after_init;
+  
+  /*
+   * node_hstate/s - associate per node hstate attributes, via their kobjects,
+@@@ -3195,18 -3997,8 +3182,23 @@@ static void __init hugetlb_register_all
+  {
+  	int nid;
+  
+++<<<<<<< HEAD
+ +	for_each_node_state(nid, N_MEMORY) {
+ +		struct node *node = node_devices[nid];
+ +		if (node->dev.id == nid)
+ +			hugetlb_register_node(node);
+ +	}
+ +
+ +	/*
+ +	 * Let the node device driver know we're here so it can
+ +	 * [un]register hstate attributes on node hotplug.
+ +	 */
+ +	register_hugetlbfs_with_node(hugetlb_register_node,
+ +				     hugetlb_unregister_node);
+++=======
++ 	for_each_online_node(nid)
++ 		hugetlb_register_node(node_devices[nid]);
+++>>>>>>> a4a00b451ef5 (mm: hugetlb: eliminate memory-less nodes handling)
+  }
+  #else	/* !CONFIG_NUMA */
+  
+@@@ -3222,6 -4014,36 +3214,39 @@@ static void hugetlb_register_all_nodes(
+  
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_CMA
++ static void __init hugetlb_cma_check(void);
++ #else
++ static inline __init void hugetlb_cma_check(void)
++ {
++ }
++ #endif
++ 
++ static void __init hugetlb_sysfs_init(void)
++ {
++ 	struct hstate *h;
++ 	int err;
++ 
++ 	hugepages_kobj = kobject_create_and_add("hugepages", mm_kobj);
++ 	if (!hugepages_kobj)
++ 		return;
++ 
++ 	for_each_hstate(h) {
++ 		err = hugetlb_sysfs_add_hstate(h, hugepages_kobj,
++ 					 hstate_kobjs, &hstate_attr_group);
++ 		if (err)
++ 			pr_err("HugeTLB: Unable to add hstate %s", h->name);
++ 	}
++ 
++ #ifdef CONFIG_NUMA
++ 	hugetlb_sysfs_initialized = true;
++ #endif
++ 	hugetlb_register_all_nodes();
++ }
++ 
+++>>>>>>> a4a00b451ef5 (mm: hugetlb: eliminate memory-less nodes handling)
+  static int __init hugetlb_init(void)
+  {
+  	int i;
+* Unmerged path drivers/base/node.c
+diff --git a/include/linux/hugetlb.h b/include/linux/hugetlb.h
+index 6605a0d41b9d..d1c3ccfda4a4 100644
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@ -15,6 +15,7 @@
+ struct ctl_table;
+ struct user_struct;
+ struct mmu_gather;
++struct node;
+ 
+ #ifndef is_hugepd
+ typedef struct { unsigned long pd; } hugepd_t;
+@@ -843,6 +844,11 @@ static inline void huge_ptep_modify_prot_commit(struct vm_area_struct *vma,
+ }
+ #endif
+ 
++#ifdef CONFIG_NUMA
++void hugetlb_register_node(struct node *node);
++void hugetlb_unregister_node(struct node *node);
++#endif
++
+ #else	/* CONFIG_HUGETLB_PAGE */
+ struct hstate {};
+ 
+@@ -1000,6 +1006,14 @@ static inline void set_huge_swap_pte_at(struct mm_struct *mm, unsigned long addr
+ 					pte_t *ptep, pte_t pte, unsigned long sz)
+ {
+ }
++
++static inline void hugetlb_register_node(struct node *node)
++{
++}
++
++static inline void hugetlb_unregister_node(struct node *node)
++{
++}
+ #endif	/* CONFIG_HUGETLB_PAGE */
+ 
+ static inline spinlock_t *huge_pte_lock(struct hstate *h,
+* Unmerged path mm/hugetlb.c
