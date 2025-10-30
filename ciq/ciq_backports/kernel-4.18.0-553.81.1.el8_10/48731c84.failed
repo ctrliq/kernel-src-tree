@@ -1,0 +1,342 @@
+mm, compaction: rename compact_control->rescan to finish_pageblock
+
+jira LE-4623
+Rebuild_History Non-Buildable kernel-4.18.0-553.81.1.el8_10
+commit-author Mel Gorman <mgorman@techsingularity.net>
+commit 48731c8436c68ce5597dfe72f3836bd6808bedde
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.81.1.el8_10/48731c84.failed
+
+Patch series "Fix excessive CPU usage during compaction".
+
+Commit 7efc3b726103 ("mm/compaction: fix set skip in fast_find_migrateblock")
+fixed a problem where pageblocks found by fast_find_migrateblock() were
+ignored. Unfortunately there were numerous bug reports complaining about high
+CPU usage and massive stalls once 6.1 was released. Due to the severity,
+the patch was reverted by Vlastimil as a short-term fix[1] to -stable.		
+
+The underlying problem for each of the bugs is suspected to be the
+repeated scanning of the same pageblocks.  This series should guarantee
+forward progress even with commit 7efc3b726103.  More information is in
+the changelog for patch 4.
+
+[1] http://lore.kernel.org/r/20230113173345.9692-1-vbabka@suse.cz
+
+
+This patch (of 4):
+
+The rescan field was not well named albeit accurate at the time.  Rename
+the field to finish_pageblock to indicate that the remainder of the
+pageblock should be scanned regardless of COMPACT_CLUSTER_MAX.  The intent
+is that pageblocks with transient failures get marked for skipping to
+avoid revisiting the same pageblock.
+
+Link: https://lkml.kernel.org/r/20230125134434.18017-2-mgorman@techsingularity.net
+	Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+	Cc: Chuyi Zhou <zhouchuyi@bytedance.com>
+	Cc: Jiri Slaby <jirislaby@kernel.org>
+	Cc: Maxim Levitsky <mlevitsk@redhat.com>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: Pedro Falcato <pedro.falcato@gmail.com>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit 48731c8436c68ce5597dfe72f3836bd6808bedde)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/internal.h
+diff --cc mm/internal.h
+index 7d89d8d7cead,2d1b9fa8083e..000000000000
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@@ -327,6 -263,222 +327,225 @@@ static inline unsigned int buddy_order(
+  #define buddy_order_unsafe(page)	READ_ONCE(page_private(page))
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * This function checks whether a page is free && is the buddy
++  * we can coalesce a page and its buddy if
++  * (a) the buddy is not in a hole (check before calling!) &&
++  * (b) the buddy is in the buddy system &&
++  * (c) a page and its buddy have the same order &&
++  * (d) a page and its buddy are in the same zone.
++  *
++  * For recording whether a page is in the buddy system, we set PageBuddy.
++  * Setting, clearing, and testing PageBuddy is serialized by zone->lock.
++  *
++  * For recording page's order, we use page_private(page).
++  */
++ static inline bool page_is_buddy(struct page *page, struct page *buddy,
++ 				 unsigned int order)
++ {
++ 	if (!page_is_guard(buddy) && !PageBuddy(buddy))
++ 		return false;
++ 
++ 	if (buddy_order(buddy) != order)
++ 		return false;
++ 
++ 	/*
++ 	 * zone check is done late to avoid uselessly calculating
++ 	 * zone/node ids for pages that could never merge.
++ 	 */
++ 	if (page_zone_id(page) != page_zone_id(buddy))
++ 		return false;
++ 
++ 	VM_BUG_ON_PAGE(page_count(buddy) != 0, buddy);
++ 
++ 	return true;
++ }
++ 
++ /*
++  * Locate the struct page for both the matching buddy in our
++  * pair (buddy1) and the combined O(n+1) page they form (page).
++  *
++  * 1) Any buddy B1 will have an order O twin B2 which satisfies
++  * the following equation:
++  *     B2 = B1 ^ (1 << O)
++  * For example, if the starting buddy (buddy2) is #8 its order
++  * 1 buddy is #10:
++  *     B2 = 8 ^ (1 << 1) = 8 ^ 2 = 10
++  *
++  * 2) Any buddy B will have an order O+1 parent P which
++  * satisfies the following equation:
++  *     P = B & ~(1 << O)
++  *
++  * Assumption: *_mem_map is contiguous at least up to MAX_ORDER
++  */
++ static inline unsigned long
++ __find_buddy_pfn(unsigned long page_pfn, unsigned int order)
++ {
++ 	return page_pfn ^ (1 << order);
++ }
++ 
++ /*
++  * Find the buddy of @page and validate it.
++  * @page: The input page
++  * @pfn: The pfn of the page, it saves a call to page_to_pfn() when the
++  *       function is used in the performance-critical __free_one_page().
++  * @order: The order of the page
++  * @buddy_pfn: The output pointer to the buddy pfn, it also saves a call to
++  *             page_to_pfn().
++  *
++  * The found buddy can be a non PageBuddy, out of @page's zone, or its order is
++  * not the same as @page. The validation is necessary before use it.
++  *
++  * Return: the found buddy page or NULL if not found.
++  */
++ static inline struct page *find_buddy_page_pfn(struct page *page,
++ 			unsigned long pfn, unsigned int order, unsigned long *buddy_pfn)
++ {
++ 	unsigned long __buddy_pfn = __find_buddy_pfn(pfn, order);
++ 	struct page *buddy;
++ 
++ 	buddy = page + (__buddy_pfn - pfn);
++ 	if (buddy_pfn)
++ 		*buddy_pfn = __buddy_pfn;
++ 
++ 	if (page_is_buddy(page, buddy, order))
++ 		return buddy;
++ 	return NULL;
++ }
++ 
++ extern struct page *__pageblock_pfn_to_page(unsigned long start_pfn,
++ 				unsigned long end_pfn, struct zone *zone);
++ 
++ static inline struct page *pageblock_pfn_to_page(unsigned long start_pfn,
++ 				unsigned long end_pfn, struct zone *zone)
++ {
++ 	if (zone->contiguous)
++ 		return pfn_to_page(start_pfn);
++ 
++ 	return __pageblock_pfn_to_page(start_pfn, end_pfn, zone);
++ }
++ 
++ extern int __isolate_free_page(struct page *page, unsigned int order);
++ extern void __putback_isolated_page(struct page *page, unsigned int order,
++ 				    int mt);
++ extern void memblock_free_pages(struct page *page, unsigned long pfn,
++ 					unsigned int order);
++ extern void __free_pages_core(struct page *page, unsigned int order);
++ extern void prep_compound_page(struct page *page, unsigned int order);
++ extern void post_alloc_hook(struct page *page, unsigned int order,
++ 					gfp_t gfp_flags);
++ extern int user_min_free_kbytes;
++ 
++ extern void free_unref_page(struct page *page, unsigned int order);
++ extern void free_unref_page_list(struct list_head *list);
++ 
++ extern void zone_pcp_reset(struct zone *zone);
++ extern void zone_pcp_disable(struct zone *zone);
++ extern void zone_pcp_enable(struct zone *zone);
++ 
++ extern void *memmap_alloc(phys_addr_t size, phys_addr_t align,
++ 			  phys_addr_t min_addr,
++ 			  int nid, bool exact_nid);
++ 
++ int split_free_page(struct page *free_page,
++ 			unsigned int order, unsigned long split_pfn_offset);
++ 
++ /*
++  * This will have no effect, other than possibly generating a warning, if the
++  * caller passes in a non-large folio.
++  */
++ static inline void folio_set_order(struct folio *folio, unsigned int order)
++ {
++ 	if (WARN_ON_ONCE(!folio_test_large(folio)))
++ 		return;
++ 
++ 	folio->_folio_order = order;
++ #ifdef CONFIG_64BIT
++ 	/*
++ 	 * When hugetlb dissolves a folio, we need to clear the tail
++ 	 * page, rather than setting nr_pages to 1.
++ 	 */
++ 	folio->_folio_nr_pages = order ? 1U << order : 0;
++ #endif
++ }
++ 
++ #if defined CONFIG_COMPACTION || defined CONFIG_CMA
++ 
++ /*
++  * in mm/compaction.c
++  */
++ /*
++  * compact_control is used to track pages being migrated and the free pages
++  * they are being migrated to during memory compaction. The free_pfn starts
++  * at the end of a zone and migrate_pfn begins at the start. Movable pages
++  * are moved to the end of a zone during a compaction run and the run
++  * completes when free_pfn <= migrate_pfn
++  */
++ struct compact_control {
++ 	struct list_head freepages;	/* List of free pages to migrate to */
++ 	struct list_head migratepages;	/* List of pages being migrated */
++ 	unsigned int nr_freepages;	/* Number of isolated free pages */
++ 	unsigned int nr_migratepages;	/* Number of pages to migrate */
++ 	unsigned long free_pfn;		/* isolate_freepages search base */
++ 	/*
++ 	 * Acts as an in/out parameter to page isolation for migration.
++ 	 * isolate_migratepages uses it as a search base.
++ 	 * isolate_migratepages_block will update the value to the next pfn
++ 	 * after the last isolated one.
++ 	 */
++ 	unsigned long migrate_pfn;
++ 	unsigned long fast_start_pfn;	/* a pfn to start linear scan from */
++ 	struct zone *zone;
++ 	unsigned long total_migrate_scanned;
++ 	unsigned long total_free_scanned;
++ 	unsigned short fast_search_fail;/* failures to use free list searches */
++ 	short search_order;		/* order to start a fast search at */
++ 	const gfp_t gfp_mask;		/* gfp mask of a direct compactor */
++ 	int order;			/* order a direct compactor needs */
++ 	int migratetype;		/* migratetype of direct compactor */
++ 	const unsigned int alloc_flags;	/* alloc flags of a direct compactor */
++ 	const int highest_zoneidx;	/* zone index of a direct compactor */
++ 	enum migrate_mode mode;		/* Async or sync migration mode */
++ 	bool ignore_skip_hint;		/* Scan blocks even if marked skip */
++ 	bool no_set_skip_hint;		/* Don't mark blocks for skipping */
++ 	bool ignore_block_suitable;	/* Scan blocks considered unsuitable */
++ 	bool direct_compaction;		/* False from kcompactd or /proc/... */
++ 	bool proactive_compaction;	/* kcompactd proactive compaction */
++ 	bool whole_zone;		/* Whole zone should/has been scanned */
++ 	bool contended;			/* Signal lock contention */
++ 	bool finish_pageblock;		/* Scan the remainder of a pageblock. Used
++ 					 * when there are potentially transient
++ 					 * isolation or migration failures to
++ 					 * ensure forward progress.
++ 					 */
++ 	bool alloc_contig;		/* alloc_contig_range allocation */
++ };
++ 
++ /*
++  * Used in direct compaction when a page should be taken from the freelists
++  * immediately when one is created during the free path.
++  */
++ struct capture_control {
++ 	struct compact_control *cc;
++ 	struct page *page;
++ };
++ 
++ unsigned long
++ isolate_freepages_range(struct compact_control *cc,
++ 			unsigned long start_pfn, unsigned long end_pfn);
++ int
++ isolate_migratepages_range(struct compact_control *cc,
++ 			   unsigned long low_pfn, unsigned long end_pfn);
++ 
++ int __alloc_contig_migrate_range(struct compact_control *cc,
++ 					unsigned long start, unsigned long end);
++ #endif
++ int find_suitable_fallback(struct free_area *area, unsigned int order,
++ 			int migratetype, bool only_stealable, bool *can_steal);
++ 
++ /*
+++>>>>>>> 48731c8436c6 (mm, compaction: rename compact_control->rescan to finish_pageblock)
+   * These three helpers classifies VMAs for virtual memory accounting.
+   */
+  
+diff --git a/mm/compaction.c b/mm/compaction.c
+index c8f609371748..d2b0a737ac38 100644
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@ -1050,12 +1050,12 @@ isolate_migratepages_block(struct compact_control *cc, unsigned long low_pfn,
+ 
+ 		/*
+ 		 * Avoid isolating too much unless this block is being
+-		 * rescanned (e.g. dirty/writeback pages, parallel allocation)
++		 * fully scanned (e.g. dirty/writeback pages, parallel allocation)
+ 		 * or a lock is contended. For contention, isolate quickly to
+ 		 * potentially remove one source of contention.
+ 		 */
+ 		if (cc->nr_migratepages >= COMPACT_CLUSTER_MAX &&
+-		    !cc->rescan && !cc->contended) {
++		    !cc->finish_pageblock && !cc->contended) {
+ 			++low_pfn;
+ 			break;
+ 		}
+@@ -1117,14 +1117,14 @@ isolate_migratepages_block(struct compact_control *cc, unsigned long low_pfn,
+ 	}
+ 
+ 	/*
+-	 * Updated the cached scanner pfn once the pageblock has been scanned
++	 * Update the cached scanner pfn once the pageblock has been scanned.
+ 	 * Pages will either be migrated in which case there is no point
+ 	 * scanning in the near future or migration failed in which case the
+ 	 * failure reason may persist. The block is marked for skipping if
+ 	 * there were no pages isolated in the block or if the block is
+ 	 * rescanned twice in a row.
+ 	 */
+-	if (low_pfn == end_pfn && (!nr_isolated || cc->rescan)) {
++	if (low_pfn == end_pfn && (!nr_isolated || cc->finish_pageblock)) {
+ 		if (valid_page && !skip_updated)
+ 			set_pageblock_skip(valid_page);
+ 		update_cached_migrate(cc, low_pfn);
+@@ -2320,17 +2320,17 @@ compact_zone(struct compact_control *cc, struct capture_control *capc)
+ 		unsigned long iteration_start_pfn = cc->migrate_pfn;
+ 
+ 		/*
+-		 * Avoid multiple rescans which can happen if a page cannot be
+-		 * isolated (dirty/writeback in async mode) or if the migrated
+-		 * pages are being allocated before the pageblock is cleared.
+-		 * The first rescan will capture the entire pageblock for
+-		 * migration. If it fails, it'll be marked skip and scanning
+-		 * will proceed as normal.
++		 * Avoid multiple rescans of the same pageblock which can
++		 * happen if a page cannot be isolated (dirty/writeback in
++		 * async mode) or if the migrated pages are being allocated
++		 * before the pageblock is cleared.  The first rescan will
++		 * capture the entire pageblock for migration. If it fails,
++		 * it'll be marked skip and scanning will proceed as normal.
+ 		 */
+-		cc->rescan = false;
++		cc->finish_pageblock = false;
+ 		if (pageblock_start_pfn(last_migrated_pfn) ==
+ 		    pageblock_start_pfn(iteration_start_pfn)) {
+-			cc->rescan = true;
++			cc->finish_pageblock = true;
+ 		}
+ 
+ 		switch (isolate_migratepages(cc)) {
+* Unmerged path mm/internal.h
