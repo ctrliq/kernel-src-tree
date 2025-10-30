@@ -611,6 +611,9 @@ struct sched_entity {
 	 * collide with read-mostly values above.
 	 */
 	struct sched_avg		avg;
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
 };
 
 struct sched_rt_entity {
@@ -1636,6 +1639,11 @@ struct task_struct {
 #ifdef CONFIG_USER_EVENTS
 	struct user_event_mm		*user_event_mm;
 #endif
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
 
 	/*
 	 * New fields for task_struct should be added above here, so that
