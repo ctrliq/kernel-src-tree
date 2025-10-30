@@ -2042,7 +2042,7 @@ unsigned find_get_pages_range(struct address_space *mapping, pgoff_t *start,
 
 		pages[ret] = find_subpage(page, xas.xa_index);
 		if (++ret == nr_pages) {
-			*start = page->index + 1;
+			*start = xas.xa_index + 1;
 			goto out;
 		}
 		continue;
@@ -2168,7 +2168,7 @@ unsigned find_get_pages_range_tag(struct address_space *mapping, pgoff_t *index,
 
 		pages[ret] = find_subpage(page, xas.xa_index);
 		if (++ret == nr_pages) {
-			*index = page->index + 1;
+			*index = xas.xa_index + 1;
 			goto out;
 		}
 		continue;
