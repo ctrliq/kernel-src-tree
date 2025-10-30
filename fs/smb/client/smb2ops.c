@@ -5314,6 +5314,7 @@ struct smb_version_operations smb20_operations = {
 	.llseek = smb3_llseek,
 	.is_status_io_timeout = smb2_is_status_io_timeout,
 	.is_network_name_deleted = smb2_is_network_name_deleted,
+	.rename_pending_delete = smb2_rename_pending_delete,
 };
 #endif /* CIFS_ALLOW_INSECURE_LEGACY */
 
@@ -5419,6 +5420,7 @@ struct smb_version_operations smb21_operations = {
 	.llseek = smb3_llseek,
 	.is_status_io_timeout = smb2_is_status_io_timeout,
 	.is_network_name_deleted = smb2_is_network_name_deleted,
+	.rename_pending_delete = smb2_rename_pending_delete,
 };
 
 struct smb_version_operations smb30_operations = {
@@ -5535,6 +5537,7 @@ struct smb_version_operations smb30_operations = {
 	.llseek = smb3_llseek,
 	.is_status_io_timeout = smb2_is_status_io_timeout,
 	.is_network_name_deleted = smb2_is_network_name_deleted,
+	.rename_pending_delete = smb2_rename_pending_delete,
 };
 
 struct smb_version_operations smb311_operations = {
@@ -5651,6 +5654,7 @@ struct smb_version_operations smb311_operations = {
 	.llseek = smb3_llseek,
 	.is_status_io_timeout = smb2_is_status_io_timeout,
 	.is_network_name_deleted = smb2_is_network_name_deleted,
+	.rename_pending_delete = smb2_rename_pending_delete,
 };
 
 #ifdef CONFIG_CIFS_ALLOW_INSECURE_LEGACY
