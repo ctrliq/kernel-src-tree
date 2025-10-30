@@ -375,7 +375,7 @@ static inline struct page *find_subpage(struct page *head, pgoff_t index)
 	if (PageHuge(head))
 		return head;
 
-	return head + (index & (hpage_nr_pages(head) - 1));
+	return head + (index & (thp_nr_pages(head) - 1));
 }
 
 unsigned find_get_entries(struct address_space *mapping, pgoff_t start,
