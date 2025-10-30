@@ -1,0 +1,104 @@
+mm: zswap: shrink until can accept
+
+jira LE-4623
+Rebuild_History Non-Buildable kernel-4.18.0-553.81.1.el8_10
+commit-author Domenico Cerasuolo <cerasuolodomenico@gmail.com>
+commit e0228d590beb0d0af345c58a282f01afac5c57f3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.81.1.el8_10/e0228d59.failed
+
+This update addresses an issue with the zswap reclaim mechanism, which
+hinders the efficient offloading of cold pages to disk, thereby
+compromising the preservation of the LRU order and consequently
+diminishing, if not inverting, its performance benefits.
+
+The functioning of the zswap shrink worker was found to be inadequate, as
+shown by basic benchmark test.  For the test, a kernel build was utilized
+as a reference, with its memory confined to 1G via a cgroup and a 5G swap
+file provided.  The results are presented below, these are averages of
+three runs without the use of zswap:
+
+real 46m26s
+user 35m4s
+sys 7m37s
+
+With zswap (zbud) enabled and max_pool_percent set to 1 (in a 32G
+system), the results changed to:
+
+real 56m4s
+user 35m13s
+sys 8m43s
+
+written_back_pages: 18
+reject_reclaim_fail: 0
+pool_limit_hit:1478
+
+Besides the evident regression, one thing to notice from this data is the
+extremely low number of written_back_pages and pool_limit_hit.
+
+The pool_limit_hit counter, which is increased in zswap_frontswap_store
+when zswap is completely full, doesn't account for a particular scenario:
+once zswap hits his limit, zswap_pool_reached_full is set to true; with
+this flag on, zswap_frontswap_store rejects pages if zswap is still above
+the acceptance threshold.  Once we include the rejections due to
+zswap_pool_reached_full && !zswap_can_accept(), the number goes from 1478
+to a significant 21578266.
+
+Zswap is stuck in an undesirable state where it rejects pages because it's
+above the acceptance threshold, yet fails to attempt memory reclaimation. 
+This happens because the shrink work is only queued when
+zswap_frontswap_store detects that it's full and the work itself only
+reclaims one page per run.
+
+This state results in hot pages getting written directly to disk, while
+cold ones remain memory, waiting only to be invalidated.  The LRU order is
+completely broken and zswap ends up being just an overhead without
+providing any benefits.
+
+This commit applies 2 changes: a) the shrink worker is set to reclaim
+pages until the acceptance threshold is met and b) the task is also
+enqueued when zswap is not full but still above the threshold.
+
+Testing this suggested update showed much better numbers:
+
+real 36m37s
+user 35m8s
+sys 9m32s
+
+written_back_pages: 10459423
+reject_reclaim_fail: 12896
+pool_limit_hit: 75653
+
+Link: https://lkml.kernel.org/r/20230526183227.793977-1-cerasuolodomenico@gmail.com
+Fixes: 45190f01dd40 ("mm/zswap.c: add allocation hysteresis if pool limit is hit")
+	Signed-off-by: Domenico Cerasuolo <cerasuolodomenico@gmail.com>
+	Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+	Reviewed-by: Yosry Ahmed <yosryahmed@google.com>
+	Reviewed-by: Vitaly Wool <vitaly.wool@konsulko.com>
+	Cc: Dan Streetman <ddstreet@ieee.org>
+	Cc: Seth Jennings <sjenning@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit e0228d590beb0d0af345c58a282f01afac5c57f3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/zswap.c
+diff --cc mm/zswap.c
+index a85668159422,bcb82e09eb64..000000000000
+--- a/mm/zswap.c
++++ b/mm/zswap.c
+@@@ -43,6 -36,9 +43,12 @@@
+  #include <linux/pagemap.h>
+  #include <linux/workqueue.h>
+  
+++<<<<<<< HEAD
+++=======
++ #include "swap.h"
++ #include "internal.h"
++ 
+++>>>>>>> e0228d590beb (mm: zswap: shrink until can accept)
+  /*********************************
+  * statistics
+  **********************************/
+* Unmerged path mm/zswap.c
