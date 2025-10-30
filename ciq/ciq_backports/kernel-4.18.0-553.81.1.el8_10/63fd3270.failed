@@ -1,0 +1,104 @@
+mm: memcontrol: don't throttle dying tasks on memory.high
+
+jira LE-4623
+Rebuild_History Non-Buildable kernel-4.18.0-553.81.1.el8_10
+commit-author Johannes Weiner <hannes@cmpxchg.org>
+commit 63fd327016fdfca6f2fa27eba3496bd079eb8ed3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.81.1.el8_10/63fd3270.failed
+
+While investigating hosts with high cgroup memory pressures, Tejun
+found culprit zombie tasks that had were holding on to a lot of
+memory, had SIGKILL pending, but were stuck in memory.high reclaim.
+
+In the past, we used to always force-charge allocations from tasks
+that were exiting in order to accelerate them dying and freeing up
+their rss. This changed for memory.max in a4ebf1b6ca1e ("memcg:
+prohibit unconditional exceeding the limit of dying tasks"); it noted
+that this can cause (userspace inducable) containment failures, so it
+added a mandatory reclaim and OOM kill cycle before forcing charges.
+At the time, memory.high enforcement was handled in the userspace
+return path, which isn't reached by dying tasks, and so memory.high
+was still never enforced by dying tasks.
+
+When c9afe31ec443 ("memcg: synchronously enforce memory.high for large
+overcharges") added synchronous reclaim for memory.high, it added
+unconditional memory.high enforcement for dying tasks as well. The
+callstack shows that this path is where the zombie is stuck in.
+
+We need to accelerate dying tasks getting past memory.high, but we
+cannot do it quite the same way as we do for memory.max: memory.max is
+enforced strictly, and tasks aren't allowed to move past it without
+FIRST reclaiming and OOM killing if necessary. This ensures very small
+levels of excess. With memory.high, though, enforcement happens lazily
+after the charge, and OOM killing is never triggered. A lot of
+concurrent threads could have pushed, or could actively be pushing,
+the cgroup into excess. The dying task will enter reclaim on every
+allocation attempt, with little hope of restoring balance.
+
+To fix this, skip synchronous memory.high enforcement on dying tasks
+altogether again. Update memory.high path documentation while at it.
+
+[hannes@cmpxchg.org: also handle tasks are being killed during the reclaim]
+  Link: https://lkml.kernel.org/r/20240111192807.GA424308@cmpxchg.org
+Link: https://lkml.kernel.org/r/20240111132902.389862-1-hannes@cmpxchg.org
+Fixes: c9afe31ec443 ("memcg: synchronously enforce memory.high for large overcharges")
+	Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+	Reported-by: Tejun Heo <tj@kernel.org>
+	Reviewed-by: Yosry Ahmed <yosryahmed@google.com>
+	Acked-by: Shakeel Butt <shakeelb@google.com>
+	Acked-by: Roman Gushchin <roman.gushchin@linux.dev>
+	Cc: Dan Schatzberg <schatzberg.dan@gmail.com>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Muchun Song <muchun.song@linux.dev>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit 63fd327016fdfca6f2fa27eba3496bd079eb8ed3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memcontrol.c
+diff --cc mm/memcontrol.c
+index e60a67b83e0e,46d8d02114cf..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -2609,10 -2623,11 +2609,11 @@@ static unsigned long calculate_high_del
+  }
+  
+  /*
+-  * Scheduled by try_charge() to be executed from the userland return path
+-  * and reclaims memory over the high limit.
++  * Reclaims memory over the high limit. Called directly from
++  * try_charge() (context permitting), as well as from the userland
++  * return path where reclaim is always able to block.
+   */
+ -void mem_cgroup_handle_over_high(gfp_t gfp_mask)
+ +void mem_cgroup_handle_over_high(void)
+  {
+  	unsigned long penalty_jiffies;
+  	unsigned long pflags;
+@@@ -2864,11 -2902,17 +2879,23 @@@ done_restock
+  		}
+  	} while ((memcg = parent_mem_cgroup(memcg)));
+  
++ 	/*
++ 	 * Reclaim is set up above to be called from the userland
++ 	 * return path. But also attempt synchronous reclaim to avoid
++ 	 * excessive overrun while the task is still inside the
++ 	 * kernel. If this is successful, the return path will see it
++ 	 * when it rechecks the overage and simply bail out.
++ 	 */
+  	if (current->memcg_nr_pages_over_high > MEMCG_CHARGE_BATCH &&
+  	    !(current->flags & PF_MEMALLOC) &&
+++<<<<<<< HEAD
+ +	    gfpflags_allow_blocking(gfp_mask)) {
+ +		mem_cgroup_handle_over_high();
+ +	}
+++=======
++ 	    gfpflags_allow_blocking(gfp_mask))
++ 		mem_cgroup_handle_over_high(gfp_mask);
+++>>>>>>> 63fd327016fd (mm: memcontrol: don't throttle dying tasks on memory.high)
+  	return 0;
+  }
+  
+* Unmerged path mm/memcontrol.c
