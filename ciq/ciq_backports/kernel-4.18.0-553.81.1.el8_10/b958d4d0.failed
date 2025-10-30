@@ -1,0 +1,343 @@
+mm: hugetlb: simplify per-node sysfs creation and removal
+
+jira LE-4623
+Rebuild_History Non-Buildable kernel-4.18.0-553.81.1.el8_10
+commit-author Muchun Song <songmuchun@bytedance.com>
+commit b958d4d08fbfe938af24ea06ebbf839b48fa18a9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.81.1.el8_10/b958d4d0.failed
+
+Patch series "simplify handling of per-node sysfs creation and removal",
+v4.
+
+
+This patch (of 2):
+
+The following commit offload per-node sysfs creation and removal to a
+kworker and did not say why it is needed.  And it also said "I don't know
+that this is absolutely required".  It seems like the author was not sure
+as well.  Since it only complicates the code, this patch will revert the
+changes to simplify the code.
+
+  39da08cb074c ("hugetlb: offload per node attribute registrations")
+
+We could use memory hotplug notifier to do per-node sysfs creation and
+removal instead of inserting those operations to node registration and
+unregistration.  Then, it can reduce the code coupling between node.c and
+hugetlb.c.  Also, it can simplify the code.
+
+Link: https://lkml.kernel.org/r/20220914072603.60293-1-songmuchun@bytedance.com
+Link: https://lkml.kernel.org/r/20220914072603.60293-2-songmuchun@bytedance.com
+	Signed-off-by: Muchun Song <songmuchun@bytedance.com>
+	Acked-by: Mike Kravetz <mike.kravetz@oracle.com>
+	Acked-by: David Hildenbrand <david@redhat.com>
+	Cc: Andi Kleen <andi@firstfloor.org>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: Muchun Song <songmuchun@bytedance.com>
+	Cc: Oscar Salvador <osalvador@suse.de>
+	Cc: Rafael J. Wysocki <rafael@kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit b958d4d08fbfe938af24ea06ebbf839b48fa18a9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hugetlb.c
+diff --cc mm/hugetlb.c
+index f1385ebb3bf8,397f2988c37f..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -28,9 -29,14 +28,17 @@@
+  #include <linux/jhash.h>
+  #include <linux/numa.h>
+  #include <linux/llist.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/cma.h>
++ #include <linux/migrate.h>
++ #include <linux/nospec.h>
++ #include <linux/delayacct.h>
++ #include <linux/memory.h>
+++>>>>>>> b958d4d08fbf (mm: hugetlb: simplify per-node sysfs creation and removal)
+  
+  #include <asm/page.h>
+ -#include <asm/pgalloc.h>
+ +#include <asm/pgtable.h>
+  #include <asm/tlb.h>
+  
+  #include <linux/io.h>
+diff --git a/drivers/base/node.c b/drivers/base/node.c
+index fb1d56f977ea..936814cefd25 100644
+--- a/drivers/base/node.c
++++ b/drivers/base/node.c
+@@ -584,64 +584,9 @@ static const struct attribute_group *node_dev_groups[] = {
+ 	NULL
+ };
+ 
+-#ifdef CONFIG_HUGETLBFS
+-/*
+- * hugetlbfs per node attributes registration interface:
+- * When/if hugetlb[fs] subsystem initializes [sometime after this module],
+- * it will register its per node attributes for all online nodes with
+- * memory.  It will also call register_hugetlbfs_with_node(), below, to
+- * register its attribute registration functions with this node driver.
+- * Once these hooks have been initialized, the node driver will call into
+- * the hugetlb module to [un]register attributes for hot-plugged nodes.
+- */
+-static node_registration_func_t __hugetlb_register_node;
+-static node_registration_func_t __hugetlb_unregister_node;
+-
+-static inline bool hugetlb_register_node(struct node *node)
+-{
+-	if (__hugetlb_register_node &&
+-			node_state(node->dev.id, N_MEMORY)) {
+-		__hugetlb_register_node(node);
+-		return true;
+-	}
+-	return false;
+-}
+-
+-static inline void hugetlb_unregister_node(struct node *node)
+-{
+-	if (__hugetlb_unregister_node)
+-		__hugetlb_unregister_node(node);
+-}
+-
+-void register_hugetlbfs_with_node(node_registration_func_t doregister,
+-				  node_registration_func_t unregister)
+-{
+-	__hugetlb_register_node   = doregister;
+-	__hugetlb_unregister_node = unregister;
+-}
+-#else
+-static inline void hugetlb_register_node(struct node *node) {}
+-
+-static inline void hugetlb_unregister_node(struct node *node) {}
+-#endif
+-
+ static void node_device_release(struct device *dev)
+ {
+-	struct node *node = to_node(dev);
+-
+-#if defined(CONFIG_MEMORY_HOTPLUG) && defined(CONFIG_HUGETLBFS)
+-	/*
+-	 * We schedule the work only when a memory section is
+-	 * onlined/offlined on this node. When we come here,
+-	 * all the memory on this node has been offlined,
+-	 * so we won't enqueue new work to this work.
+-	 *
+-	 * The work is using node->node_work, so we should
+-	 * flush work before freeing the memory.
+-	 */
+-	flush_work(&node->node_work);
+-#endif
+-	kfree(node);
++	kfree(to_node(dev));
+ }
+ 
+ /*
+@@ -662,11 +607,9 @@ static int register_node(struct node *node, int num)
+ 
+ 	if (error)
+ 		put_device(&node->dev);
+-	else {
+-		hugetlb_register_node(node);
+-
++	else
+ 		compaction_register_node(node);
+-	}
++
+ 	return error;
+ }
+ 
+@@ -680,7 +623,6 @@ static int register_node(struct node *node, int num)
+ void unregister_node(struct node *node)
+ {
+ 	compaction_unregister_node(node);
+-	hugetlb_unregister_node(node);		/* no-op, if memoryless node */
+ 	node_remove_accesses(node);
+ 	node_remove_caches(node);
+ 	device_unregister(&node->dev);
+@@ -904,74 +846,8 @@ void register_memory_blocks_under_node(int nid, unsigned long start_pfn,
+ 			   (void *)&nid, func);
+ 	return;
+ }
+-
+-#ifdef CONFIG_HUGETLBFS
+-/*
+- * Handle per node hstate attribute [un]registration on transistions
+- * to/from memoryless state.
+- */
+-static void node_hugetlb_work(struct work_struct *work)
+-{
+-	struct node *node = container_of(work, struct node, node_work);
+-
+-	/*
+-	 * We only get here when a node transitions to/from memoryless state.
+-	 * We can detect which transition occurred by examining whether the
+-	 * node has memory now.  hugetlb_register_node() already check this
+-	 * so we try to register the attributes.  If that fails, then the
+-	 * node has transitioned to memoryless, try to unregister the
+-	 * attributes.
+-	 */
+-	if (!hugetlb_register_node(node))
+-		hugetlb_unregister_node(node);
+-}
+-
+-static void init_node_hugetlb_work(int nid)
+-{
+-	INIT_WORK(&node_devices[nid]->node_work, node_hugetlb_work);
+-}
+-
+-static int node_memory_callback(struct notifier_block *self,
+-				unsigned long action, void *arg)
+-{
+-	struct memory_notify *mnb = arg;
+-	int nid = mnb->status_change_nid;
+-
+-	switch (action) {
+-	case MEM_ONLINE:
+-	case MEM_OFFLINE:
+-		/*
+-		 * offload per node hstate [un]registration to a work thread
+-		 * when transitioning to/from memoryless state.
+-		 */
+-		if (nid != NUMA_NO_NODE)
+-			schedule_work(&node_devices[nid]->node_work);
+-		break;
+-
+-	case MEM_GOING_ONLINE:
+-	case MEM_GOING_OFFLINE:
+-	case MEM_CANCEL_ONLINE:
+-	case MEM_CANCEL_OFFLINE:
+-	default:
+-		break;
+-	}
+-
+-	return NOTIFY_OK;
+-}
+-#endif	/* CONFIG_HUGETLBFS */
+ #endif /* CONFIG_MEMORY_HOTPLUG */
+ 
+-#if !defined(CONFIG_MEMORY_HOTPLUG) || !defined(CONFIG_HUGETLBFS)
+-static inline int node_memory_callback(struct notifier_block *self,
+-				unsigned long action, void *arg)
+-{
+-	return NOTIFY_OK;
+-}
+-
+-static void init_node_hugetlb_work(int nid) { }
+-
+-#endif
+-
+ int __register_one_node(int nid)
+ {
+ 	int error;
+@@ -990,8 +866,6 @@ int __register_one_node(int nid)
+ 	}
+ 
+ 	INIT_LIST_HEAD(&node_devices[nid]->access_list);
+-	/* initialize work queue for memory hot plug */
+-	init_node_hugetlb_work(nid);
+ 	node_init_caches(nid);
+ 
+ 	return error;
+@@ -1062,13 +936,8 @@ static const struct attribute_group *cpu_root_attr_groups[] = {
+ 	NULL,
+ };
+ 
+-#define NODE_CALLBACK_PRI	2	/* lower than SLAB */
+ void __init node_dev_init(void)
+ {
+-	static struct notifier_block node_memory_callback_nb = {
+-		.notifier_call = node_memory_callback,
+-		.priority = NODE_CALLBACK_PRI,
+-	};
+ 	int ret, i;
+ 
+  	BUILD_BUG_ON(ARRAY_SIZE(node_state_attr) != NR_NODE_STATES);
+@@ -1078,8 +947,6 @@ void __init node_dev_init(void)
+ 	if (ret)
+ 		panic("%s() failed to register subsystem: %d\n", __func__, ret);
+ 
+-	register_hotmemory_notifier(&node_memory_callback_nb);
+-
+ 	/*
+ 	 * Create all node devices, which will properly link the node
+ 	 * to applicable memory block devices and already created cpu devices.
+diff --git a/include/linux/node.h b/include/linux/node.h
+index 9ec680dd607f..427a5975cf40 100644
+--- a/include/linux/node.h
++++ b/include/linux/node.h
+@@ -2,15 +2,15 @@
+ /*
+  * include/linux/node.h - generic node definition
+  *
+- * This is mainly for topological representation. We define the 
+- * basic 'struct node' here, which can be embedded in per-arch 
++ * This is mainly for topological representation. We define the
++ * basic 'struct node' here, which can be embedded in per-arch
+  * definitions of processors.
+  *
+  * Basic handling of the devices is done in drivers/base/node.c
+- * and system devices are handled in drivers/base/sys.c. 
++ * and system devices are handled in drivers/base/sys.c.
+  *
+  * Nodes are exported via driverfs in the class/node/devices/
+- * directory. 
++ * directory.
+  */
+ #ifndef _LINUX_NODE_H_
+ #define _LINUX_NODE_H_
+@@ -18,7 +18,6 @@
+ #include <linux/device.h>
+ #include <linux/cpumask.h>
+ #include <linux/list.h>
+-#include <linux/workqueue.h>
+ 
+ /**
+  * struct node_hmem_attrs - heterogeneous memory performance attributes
+@@ -84,10 +83,6 @@ static inline void node_set_perf_attrs(unsigned int nid,
+ struct node {
+ 	struct device	dev;
+ 	struct list_head access_list;
+-
+-#if defined(CONFIG_MEMORY_HOTPLUG) && defined(CONFIG_HUGETLBFS)
+-	struct work_struct	node_work;
+-#endif
+ #ifdef CONFIG_HMEM_REPORTING
+ 	struct list_head cache_attrs;
+ 	struct device *cache_dev;
+@@ -96,7 +91,6 @@ struct node {
+ 
+ struct memory_block;
+ extern struct node *node_devices[];
+-typedef  void (*node_registration_func_t)(struct node *);
+ 
+ #if defined(CONFIG_MEMORY_HOTPLUG) && defined(CONFIG_NUMA)
+ void register_memory_blocks_under_node(int nid, unsigned long start_pfn,
+@@ -144,11 +138,6 @@ extern void unregister_memory_block_under_nodes(struct memory_block *mem_blk);
+ extern int register_memory_node_under_compute_node(unsigned int mem_nid,
+ 						   unsigned int cpu_nid,
+ 						   unsigned access);
+-
+-#ifdef CONFIG_HUGETLBFS
+-extern void register_hugetlbfs_with_node(node_registration_func_t doregister,
+-					 node_registration_func_t unregister);
+-#endif
+ #else
+ static inline void node_dev_init(void)
+ {
+@@ -176,11 +165,6 @@ static inline int unregister_cpu_under_node(unsigned int cpu, unsigned int nid)
+ static inline void unregister_memory_block_under_nodes(struct memory_block *mem_blk)
+ {
+ }
+-
+-static inline void register_hugetlbfs_with_node(node_registration_func_t reg,
+-						node_registration_func_t unreg)
+-{
+-}
+ #endif
+ 
+ #define to_node(device) container_of(device, struct node, dev)
+* Unmerged path mm/hugetlb.c
