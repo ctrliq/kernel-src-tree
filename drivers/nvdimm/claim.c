@@ -56,17 +56,6 @@ bool __nd_attach_ndns(struct device *dev, struct nd_namespace_common *attach,
 	return true;
 }
 
-bool nd_attach_ndns(struct device *dev, struct nd_namespace_common *attach,
-		struct nd_namespace_common **_ndns)
-{
-	bool claimed;
-
-	nvdimm_bus_lock(&attach->dev);
-	claimed = __nd_attach_ndns(dev, attach, _ndns);
-	nvdimm_bus_unlock(&attach->dev);
-	return claimed;
-}
-
 static int namespace_match(struct device *dev, void *data)
 {
 	char *name = data;
