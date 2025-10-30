@@ -5548,7 +5548,7 @@ static int mem_cgroup_css_online(struct cgroup_subsys_state *css)
 		return -ENOMEM;
 	}
 
-	if (unlikely(mem_cgroup_is_root(memcg)))
+	if (unlikely(mem_cgroup_is_root(memcg)) && !mem_cgroup_disabled())
 		queue_delayed_work(system_unbound_wq, &stats_flush_dwork,
 				   2UL*HZ);
 
