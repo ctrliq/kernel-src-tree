@@ -22,7 +22,8 @@
 #include <linux/auxiliary_bus.h>
 #include <net/netdev_lock.h>
 
-#include "bnxt_hsi.h"
+#include <linux/bnxt/hsi.h>
+
 #include "bnxt.h"
 #include "bnxt_hwrm.h"
 #include "bnxt_ulp.h"
