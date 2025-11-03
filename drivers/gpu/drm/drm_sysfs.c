@@ -31,7 +31,7 @@
 #include <drm/drm_property.h>
 #include <drm/drm_sysfs.h>
 
-#include <asm/video.h>
+#include <asm-generic/fb.h>
 
 #include "drm_internal.h"
 #include "drm_crtc_internal.h"
