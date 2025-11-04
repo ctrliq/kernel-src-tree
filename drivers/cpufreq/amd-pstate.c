@@ -826,6 +826,13 @@ static void amd_pstate_init_prefcore(struct amd_cpudata *cpudata)
 	if (!amd_pstate_prefcore)
 		return;
 
+	/* should use amd-hfi instead */
+	if (cpu_feature_enabled(X86_FEATURE_AMD_WORKLOAD_CLASS) &&
+	    IS_ENABLED(CONFIG_AMD_HFI)) {
+		amd_pstate_prefcore = false;
+		return;
+	}
+
 	cpudata->hw_prefcore = true;
 
 	/* Priorities must be initialized before ITMT support can be toggled on. */
@@ -1335,6 +1342,12 @@ static ssize_t amd_pstate_show_status(char *buf)
 	return sysfs_emit(buf, "%s\n", amd_pstate_mode_string[cppc_state]);
 }
 
+int amd_pstate_get_status(void)
+{
+	return cppc_state;
+}
+EXPORT_SYMBOL_GPL(amd_pstate_get_status);
+
 int amd_pstate_update_status(const char *buf, size_t size)
 {
 	int mode_idx;
@@ -1544,13 +1557,15 @@ static void amd_pstate_epp_cpu_exit(struct cpufreq_policy *policy)
 	pr_debug("CPU %d exiting\n", policy->cpu);
 }
 
-static int amd_pstate_epp_update_limit(struct cpufreq_policy *policy)
+static int amd_pstate_epp_update_limit(struct cpufreq_policy *policy, bool policy_change)
 {
 	struct amd_cpudata *cpudata = policy->driver_data;
 	union perf_cached perf;
 	u8 epp;
 
-	if (policy->min != cpudata->min_limit_freq || policy->max != cpudata->max_limit_freq)
+	if (policy_change ||
+	    policy->min != cpudata->min_limit_freq ||
+	    policy->max != cpudata->max_limit_freq)
 		amd_pstate_update_min_max_limit(policy);
 
 	if (cpudata->policy == CPUFREQ_POLICY_PERFORMANCE)
@@ -1574,7 +1589,7 @@ static int amd_pstate_epp_set_policy(struct cpufreq_policy *policy)
 
 	cpudata->policy = policy->policy;
 
-	ret = amd_pstate_epp_update_limit(policy);
+	ret = amd_pstate_epp_update_limit(policy, true);
 	if (ret)
 		return ret;
 
@@ -1649,7 +1664,7 @@ static int amd_pstate_epp_resume(struct cpufreq_policy *policy)
 		int ret;
 
 		/* enable amd pstate from suspend state*/
-		ret = amd_pstate_epp_update_limit(policy);
+		ret = amd_pstate_epp_update_limit(policy, false);
 		if (ret)
 			return ret;
 
