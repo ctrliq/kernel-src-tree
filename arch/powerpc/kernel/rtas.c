@@ -81,6 +81,8 @@ DEFINE_MUTEX(rtas_ibm_get_vpd_lock);
 DEFINE_MUTEX(rtas_ibm_get_indices_lock);
 DEFINE_MUTEX(rtas_ibm_set_dynamic_indicator_lock);
 DEFINE_MUTEX(rtas_ibm_get_dynamic_sensor_state_lock);
+DEFINE_MUTEX(rtas_ibm_receive_hvpipe_msg_lock);
+DEFINE_MUTEX(rtas_ibm_send_hvpipe_msg_lock);
 
 /* RTAS use home made raw locking instead of spin_lock_irqsave
  * because those can be called from within really nasty contexts
@@ -1012,6 +1014,8 @@ static struct rtas_filter rtas_filters[] __ro_after_init = {
 	{ "ibm,update-properties", -1, 0, -1, -1, -1, 4096 },
 #endif
 	{ "ibm,physical-attestation", -1, 0, 1, -1, -1 },
+	{ "ibm,receive-hvpipe-msg", -1, 0, 1, -1, -1 },
+	{ "ibm,send-hvpipe-msg", -1, 1, -1, -1, -1 },
 };
 
 static bool in_rmo_buf(u32 base, u32 end)
@@ -1133,6 +1137,12 @@ static struct mutex *find_rtas_mutex(int token)
 
 	if (token == rtas_token("ibm,physical-attestation"))
 		return &rtas_ibm_physical_attestation_lock;
+
+	if (token == rtas_token("ibm,receive-hvpipe-msg"))
+		return &rtas_ibm_receive_hvpipe_msg_lock;
+
+	if (token == rtas_token("ibm,send-hvpipe-msg"))
+		return &rtas_ibm_send_hvpipe_msg_lock;
 
 	return NULL;
 }
