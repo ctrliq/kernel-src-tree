@@ -1338,7 +1338,6 @@ int drm_gpusvm_range_get_pages(struct drm_gpusvm *gpusvm,
 	unsigned long num_dma_mapped;
 	unsigned int order = 0;
 	unsigned long *pfns;
-	struct page **pages;
 	int err = 0;
 	struct dev_pagemap *pagemap;
 	struct drm_pagemap *dpagemap;
@@ -1378,7 +1377,6 @@ retry:
 	if (err)
 		goto err_free;
 
-	pages = (struct page **)pfns;
 map_pages:
 	/*
 	 * Perform all dma mappings under the notifier lock to not
@@ -1426,13 +1424,13 @@ map_pages:
 				goto err_unmap;
 			}
 			zdd = page->zone_device_data;
-			if (pagemap != page_pgmap(page)) {
+			if (pagemap != page->pgmap) {
 				if (i > 0) {
 					err = -EOPNOTSUPP;
 					goto err_unmap;
 				}
 
-				pagemap = page_pgmap(page);
+				pagemap = page->pgmap;
 				dpagemap = zdd->devmem_allocation->dpagemap;
 				if (drm_WARN_ON(gpusvm->drm, !dpagemap)) {
 					/*
@@ -1454,8 +1452,6 @@ map_pages:
 				err = -EFAULT;
 				goto err_unmap;
 			}
-
-			pages[i] = page;
 		} else {
 			dma_addr_t addr;
 
