@@ -37,6 +37,7 @@ struct opts {
 	const char *output;
 	bool sec_address;
 	bool stats;
+	bool verbose;
 	bool werror;
 };
 
