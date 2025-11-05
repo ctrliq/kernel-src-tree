@@ -193,52 +193,11 @@ static bool __dead_end_function(struct objtool_file *file, struct symbol *func,
 	struct instruction *insn;
 	bool empty = true;
 
-	/*
-	 * Unfortunately these have to be hard coded because the noreturn
-	 * attribute isn't provided in ELF data. Keep 'em sorted.
-	 */
+#define NORETURN(func) __stringify(func),
 	static const char * const global_noreturns[] = {
-		"__invalid_creds",
-		"__kunit_abort",
-		"__module_put_and_kthread_exit",
-		"__reiserfs_panic",
-		"__stack_chk_fail",
-		"__tdx_hypercall_failed",
-		"__ubsan_handle_builtin_unreachable",
-		"acpi_processor_ffh_play_dead",
-		"arch_call_rest_init",
-		"arch_cpu_idle_dead",
-		"cpu_bringup_and_idle",
-		"cpu_startup_entry",
-		"do_exit",
-		"do_group_exit",
-		"do_task_dead",
-		"ex_handler_msr_mce",
-		"fortify_panic",
-		"hlt_play_dead",
-		"hv_ghcb_terminate",
-		"kthread_complete_and_exit",
-		"kthread_exit",
-		"kunit_try_catch_throw",
-		"machine_real_restart",
-		"make_task_dead",
-		"mpt_halt_firmware",
-		"mwait_play_dead",
-		"nmi_panic_self_stop",
-		"panic",
-		"panic_smp_self_stop",
-		"rest_init",
-		"rewind_stack_and_make_dead",
-		"sev_es_terminate",
-		"snp_abort",
-		"start_kernel",
-		"stop_this_cpu",
-		"usercopy_abort",
-		"x86_64_start_kernel",
-		"x86_64_start_reservations",
-		"xen_cpu_bringup_again",
-		"xen_start_kernel",
+#include "noreturns.h"
 	};
+#undef NORETURN
 
 	if (!func)
 		return false;
