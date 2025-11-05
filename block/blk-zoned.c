@@ -1831,6 +1831,14 @@ static void disk_destroy_zone_wplugs_hash_table(struct gendisk *disk)
 	kfree(disk->zone_wplugs_hash);
 	disk->zone_wplugs_hash = NULL;
 	disk->zone_wplugs_hash_bits = 0;
+
+	/*
+	 * Wait for the zone write plugs to be RCU-freed before destroying the
+	 * mempool.
+	 */
+	rcu_barrier();
+	mempool_destroy(disk->zone_wplugs_pool);
+	disk->zone_wplugs_pool = NULL;
 }
 
 static void disk_set_zones_cond_array(struct gendisk *disk, u8 *zones_cond)
@@ -1847,24 +1855,12 @@ static void disk_set_zones_cond_array(struct gendisk *disk, u8 *zones_cond)
 
 void disk_free_zone_resources(struct gendisk *disk)
 {
-	if (!disk->zone_wplugs_pool)
-		return;
-
 	if (disk->zone_wplugs_wq) {
 		destroy_workqueue(disk->zone_wplugs_wq);
 		disk->zone_wplugs_wq = NULL;
 	}
 
 	disk_destroy_zone_wplugs_hash_table(disk);
-
-	/*
-	 * Wait for the zone write plugs to be RCU-freed before
-	 * destorying the mempool.
-	 */
-	rcu_barrier();
-
-	mempool_destroy(disk->zone_wplugs_pool);
-	disk->zone_wplugs_pool = NULL;
 
 	disk_set_zones_cond_array(disk, NULL);
 	disk->zone_capacity = 0;
