@@ -284,8 +284,8 @@ int objtool_run(int argc, const char **argv)
 		goto err;
 
 	if (!opts.link && has_multiple_files(file->elf)) {
-		ERROR("Linked object detected, forcing --link");
-		opts.link = true;
+		ERROR("Linked object requires --link");
+		goto err;
 	}
 
 	ret = check(file);
