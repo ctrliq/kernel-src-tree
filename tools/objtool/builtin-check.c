@@ -237,7 +237,7 @@ static void save_argv(int argc, const char **argv)
 	for (int i = 0; i < argc; i++) {
 		orig_argv[i] = strdup(argv[i]);
 		if (!orig_argv[i]) {
-			WARN_GLIBC("strdup(%s)", orig_argv[i]);
+			WARN_GLIBC("strdup(%s)", argv[i]);
 			exit(1);
 		}
 	};
