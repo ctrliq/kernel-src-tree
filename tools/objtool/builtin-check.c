@@ -150,7 +150,7 @@ static bool opts_valid(void)
 	    opts.static_call		||
 	    opts.uaccess) {
 		if (opts.dump_orc) {
-			ERROR("--dump can't be combined with other options");
+			ERROR("--dump can't be combined with other actions");
 			return false;
 		}
 
@@ -160,7 +160,7 @@ static bool opts_valid(void)
 	if (opts.dump_orc)
 		return true;
 
-	ERROR("At least one command required");
+	ERROR("At least one action required");
 	return false;
 }
 
