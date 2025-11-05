@@ -138,6 +138,26 @@ int cmd_parse_options(int argc, const char **argv, const char * const usage[])
 
 static bool opts_valid(void)
 {
+	if (opts.mnop && !opts.mcount) {
+		ERROR("--mnop requires --mcount");
+		return false;
+	}
+
+	if (opts.noinstr && !opts.link) {
+		ERROR("--noinstr requires --link");
+		return false;
+	}
+
+	if (opts.ibt && !opts.link) {
+		ERROR("--ibt requires --link");
+		return false;
+	}
+
+	if (opts.unret && !opts.link) {
+		ERROR("--unret requires --link");
+		return false;
+	}
+
 	if (opts.hack_jump_label	||
 	    opts.hack_noinstr		||
 	    opts.ibt			||
@@ -162,45 +182,6 @@ static bool opts_valid(void)
 
 	ERROR("At least one action required");
 	return false;
-}
-
-static bool mnop_opts_valid(void)
-{
-	if (opts.mnop && !opts.mcount) {
-		ERROR("--mnop requires --mcount");
-		return false;
-	}
-
-	return true;
-}
-
-static bool link_opts_valid(struct objtool_file *file)
-{
-	if (opts.link)
-		return true;
-
-	if (has_multiple_files(file->elf)) {
-		ERROR("Linked object detected, forcing --link");
-		opts.link = true;
-		return true;
-	}
-
-	if (opts.noinstr) {
-		ERROR("--noinstr requires --link");
-		return false;
-	}
-
-	if (opts.ibt) {
-		ERROR("--ibt requires --link");
-		return false;
-	}
-
-	if (opts.unret) {
-		ERROR("--unret requires --link");
-		return false;
-	}
-
-	return true;
 }
 
 static int copy_file(const char *src, const char *dst)
@@ -302,11 +283,10 @@ int objtool_run(int argc, const char **argv)
 	if (!file)
 		goto err;
 
-	if (!mnop_opts_valid())
-		goto err;
-
-	if (!link_opts_valid(file))
-		goto err;
+	if (!opts.link && has_multiple_files(file->elf)) {
+		ERROR("Linked object detected, forcing --link");
+		opts.link = true;
+	}
 
 	ret = check(file);
 	if (ret)
