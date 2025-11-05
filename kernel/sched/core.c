@@ -1063,6 +1063,7 @@ void resched_curr(struct rq *rq)
 
 	cpu = cpu_of(rq);
 
+	trace_sched_set_need_resched_tp(curr, cpu, TIF_NEED_RESCHED);
 	if (cpu == smp_processor_id()) {
 		set_tsk_need_resched(curr);
 		set_preempt_need_resched();
@@ -1073,6 +1074,11 @@ void resched_curr(struct rq *rq)
 		smp_send_reschedule(cpu);
 	else
 		trace_sched_wake_idle_without_ipi(cpu);
+}
+
+void __trace_set_need_resched(struct task_struct *curr, int tif)
+{
+	trace_sched_set_need_resched_tp(curr, smp_processor_id(), tif);
 }
 
 #ifdef CONFIG_PREEMPT_LAZY
@@ -1107,6 +1113,8 @@ void resched_curr_lazy(struct rq *rq)
 	cpu = cpu_of(rq);
 	if (cpu == smp_processor_id())
 		return;
+
+	trace_sched_set_need_resched_tp(curr, cpu, TIF_NEED_RESCHED_LAZY);
 
 	/* NEED_RESCHED_LAZY must be visible before we test polling */
 	smp_mb();
@@ -5168,7 +5176,7 @@ asmlinkage __visible void schedule_tail(struct task_struct *prev)
 	 * switched the context for the first time. It is returning from
 	 * schedule for the first time in this path.
 	 */
-	trace_sched_exit_tp(true, CALLER_ADDR0);
+	trace_sched_exit_tp(true);
 	preempt_enable();
 
 	if (current->set_child_tid)
@@ -6454,7 +6462,7 @@ static void __sched notrace __schedule(unsigned int sched_mode)
 	struct rq *rq;
 	int cpu;
 
-	trace_sched_entry_tp(!!sched_mode, CALLER_ADDR0);
+	trace_sched_entry_tp(!!sched_mode);
 
 	cpu = smp_processor_id();
 	rq = cpu_rq(cpu);
@@ -6576,7 +6584,7 @@ static void __sched notrace __schedule(unsigned int sched_mode)
 		__balance_callbacks(rq);
 		raw_spin_rq_unlock_irq(rq);
 	}
-	trace_sched_exit_tp(is_switch, CALLER_ADDR0);
+	trace_sched_exit_tp(is_switch);
 }
 
 void __noreturn do_task_dead(void)
