@@ -2570,7 +2570,7 @@ static int classify_symbols(struct objtool_file *file)
 			if (arch_is_embedded_insn(func))
 				func->embedded_insn = true;
 
-			if (!strcmp(func->name, "__fentry__"))
+			if (arch_ftrace_match(func->name))
 				func->fentry = true;
 
 			if (is_profiling_func(func->name))
