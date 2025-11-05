@@ -55,8 +55,9 @@ struct instruction {
 	   retpoline_safe	: 1,
 	   noendbr		: 1,
 	   unret		: 1;
-	   visited		: 4;
-		/* 3 bit hole */
+	   visited		: 4,
+	   no_reloc		: 1;
+		/* 2 bit hole */
 
 	s8 instr;
 
