@@ -56,7 +56,7 @@
 #include <linux/align.h>
 #include <net/netdev_queues.h>
 
-#include "bnxt_hsi.h"
+#include <linux/bnxt/hsi.h>
 #include "bnxt.h"
 #include "bnxt_hwrm.h"
 #include "bnxt_ulp.h"

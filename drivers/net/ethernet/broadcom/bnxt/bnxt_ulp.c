@@ -21,7 +21,7 @@
 #include <linux/bitmap.h>
 #include <linux/auxiliary_bus.h>
 
-#include "bnxt_hsi.h"
+#include <linux/bnxt/hsi.h>
 #include "bnxt.h"
 #include "bnxt_hwrm.h"
 #include "bnxt_ulp.h"
