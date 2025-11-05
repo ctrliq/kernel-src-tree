@@ -3853,7 +3853,7 @@ static int validate_unwind_hints(struct objtool_file *file, struct section *sec)
 static int validate_unret(struct objtool_file *file, struct instruction *insn)
 {
 	struct instruction *next, *dest;
-	int ret, warnings = 0;
+	int ret;
 
 	for (;;) {
 		next = next_insn_to_validate(file, insn);
@@ -3951,7 +3951,7 @@ static int validate_unret(struct objtool_file *file, struct instruction *insn)
 		insn = next;
 	}
 
-	return warnings;
+	return 0;
 }
 
 /*
@@ -4186,7 +4186,6 @@ static int add_prefix_symbols(struct objtool_file *file)
 {
 	struct section *sec;
 	struct symbol *func;
-	int warnings = 0;
 
 	for_each_sec(file, sec) {
 		if (!(sec->sh.sh_flags & SHF_EXECINSTR))
@@ -4200,7 +4199,7 @@ static int add_prefix_symbols(struct objtool_file *file)
 		}
 	}
 
-	return warnings;
+	return 0;
 }
 
 static int validate_symbol(struct objtool_file *file, struct section *sec,
