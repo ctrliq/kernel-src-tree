@@ -116,7 +116,7 @@ ifndef RHJOBS
 endif
 
 # for official builds use RELEASE_LOCALVERSION persisted in Makefile.variables
-ifneq ($(filter $(MAKECMDGOALS),dist-release dist-release-tag dist-release-git dist-rtg),)
+ifneq ($(filter $(MAKECMDGOALS),dist-release dist-release-tag dist-release-git dist-rtg dist-get-tag),)
   DISTLOCALVERSION:=$(RELEASE_LOCALVERSION)
   ifeq (,$(findstring s,$(firstword -$(MAKEFLAGS))))
     $(info DISTLOCALVERSION is "$(DISTLOCALVERSION)".)
