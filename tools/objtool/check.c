@@ -1015,6 +1015,8 @@ static int add_ignores(struct objtool_file *file)
 		}
 
 		func->ignore = true;
+		if (func->cfunc)
+			func->cfunc->ignore = true;
 	}
 
 	return 0;
