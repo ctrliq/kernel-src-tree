@@ -1083,6 +1083,7 @@ static void __resched_curr(struct rq *rq, int tif)
 
 	cpu = cpu_of(rq);
 
+	trace_sched_set_need_resched_tp(curr, cpu, tif);
 	if (cpu == smp_processor_id()) {
 		set_ti_thread_flag(cti, tif);
 		if (tif == TIF_NEED_RESCHED)
@@ -1096,6 +1097,11 @@ static void __resched_curr(struct rq *rq, int tif)
 	} else {
 		trace_sched_wake_idle_without_ipi(cpu);
 	}
+}
+
+void __trace_set_need_resched(struct task_struct *curr, int tif)
+{
+	trace_sched_set_need_resched_tp(curr, smp_processor_id(), tif);
 }
 
 void resched_curr(struct rq *rq)
@@ -5242,7 +5248,7 @@ asmlinkage __visible void schedule_tail(struct task_struct *prev)
 	 * switched the context for the first time. It is returning from
 	 * schedule for the first time in this path.
 	 */
-	trace_sched_exit_tp(true, CALLER_ADDR0);
+	trace_sched_exit_tp(true);
 	preempt_enable();
 
 	if (current->set_child_tid)
@@ -6585,7 +6591,8 @@ static void __sched notrace __schedule(int sched_mode)
 	struct rq *rq;
 	int cpu;
 
-	trace_sched_entry_tp(preempt, CALLER_ADDR0);
+	/* Trace preemptions consistently with task switches */
+	trace_sched_entry_tp(sched_mode == SM_PREEMPT);
 
 	cpu = smp_processor_id();
 	rq = cpu_rq(cpu);
@@ -6700,7 +6707,7 @@ picked:
 		__balance_callbacks(rq);
 		raw_spin_rq_unlock_irq(rq);
 	}
-	trace_sched_exit_tp(is_switch, CALLER_ADDR0);
+	trace_sched_exit_tp(is_switch);
 }
 
 void __noreturn do_task_dead(void)
