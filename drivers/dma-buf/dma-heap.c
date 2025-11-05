@@ -203,7 +203,7 @@ void *dma_heap_get_drvdata(struct dma_heap *heap)
 {
 	return heap->priv;
 }
-EXPORT_SYMBOL_NS_GPL(dma_heap_get_drvdata, "DMA_BUF_HEAP");
+EXPORT_SYMBOL_NS_GPL(dma_heap_get_drvdata, DMA_BUF_HEAP);
 
 /**
  * dma_heap_get_name - get heap name
@@ -216,7 +216,7 @@ const char *dma_heap_get_name(struct dma_heap *heap)
 {
 	return heap->name;
 }
-EXPORT_SYMBOL_NS_GPL(dma_heap_get_name, "DMA_BUF_HEAP");
+EXPORT_SYMBOL_NS_GPL(dma_heap_get_name, DMA_BUF_HEAP);
 
 /**
  * dma_heap_add - adds a heap to dmabuf heaps
@@ -306,7 +306,7 @@ err0:
 	kfree(heap);
 	return err_ret;
 }
-EXPORT_SYMBOL_NS_GPL(dma_heap_add, "DMA_BUF_HEAP");
+EXPORT_SYMBOL_NS_GPL(dma_heap_add, DMA_BUF_HEAP);
 
 static char *dma_heap_devnode(const struct device *dev, umode_t *mode)
 {
