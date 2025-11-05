@@ -373,6 +373,8 @@ void arch_cpu_idle_dead(void)
 	"	b	secondary_start_kernel"
 		:
 		: "r" (task_stack_page(current) + THREAD_SIZE - 8));
+
+	unreachable();
 }
 #endif /* CONFIG_HOTPLUG_CPU */
 
