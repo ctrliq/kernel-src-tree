@@ -40,6 +40,12 @@ struct dpll_device_ops {
 					void *dpll_priv,
 					enum dpll_feature_state *state,
 					struct netlink_ext_ack *extack);
+	int (*phase_offset_avg_factor_set)(const struct dpll_device *dpll,
+					   void *dpll_priv, u32 factor,
+					   struct netlink_ext_ack *extack);
+	int (*phase_offset_avg_factor_get)(const struct dpll_device *dpll,
+					   void *dpll_priv, u32 *factor,
+					   struct netlink_ext_ack *extack);
 
 	RH_KABI_RESERVE(1)
 	RH_KABI_RESERVE(2)
