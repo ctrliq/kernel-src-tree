@@ -1,0 +1,206 @@
+cifs: avoid parallel session setups on same channel
+
+jira LE-4669
+Rebuild_History Non-Buildable kernel-4.18.0-553.82.1.el8_10
+commit-author Shyam Prasad N <sprasad@microsoft.com>
+commit 5752bf645f9dd7db600651f726eb04a97c9f597f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.82.1.el8_10/5752bf64.failed
+
+After allowing channels to reconnect in parallel, it now
+becomes important to take care that multiple processes do not
+call negotiate/session setup in parallel on the same channel.
+
+This change avoids that by marking a channel as "in_reconnect".
+During session setup if the channel in question has this flag
+set, we return immediately.
+
+	Signed-off-by: Shyam Prasad N <sprasad@microsoft.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 5752bf645f9dd7db600651f726eb04a97c9f597f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/connect.c
+diff --cc fs/cifs/connect.c
+index b65c3401b8e7,199b076f7a64..000000000000
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@@ -3938,10 -3995,31 +3938,38 @@@ cifs_setup_session(const unsigned int x
+  	int rc = -ENOSYS;
+  	bool is_binding = false;
+  
+++<<<<<<< HEAD
+ +	spin_lock(&ses->chan_lock);
+ +	is_binding = !CIFS_ALL_CHANS_NEED_RECONNECT(ses);
+ +	spin_unlock(&ses->chan_lock);
+ +
+++=======
++ 
++ 	spin_lock(&cifs_tcp_ses_lock);
++ 	if (ses->ses_status != SES_GOOD &&
++ 	    ses->ses_status != SES_NEW &&
++ 	    ses->ses_status != SES_NEED_RECON) {
++ 		spin_unlock(&cifs_tcp_ses_lock);
++ 		return 0;
++ 	}
++ 
++ 	/* only send once per connect */
++ 	spin_lock(&ses->chan_lock);
++ 	if (CIFS_ALL_CHANS_GOOD(ses) ||
++ 	    cifs_chan_in_reconnect(ses, server)) {
++ 		spin_unlock(&ses->chan_lock);
++ 		spin_unlock(&cifs_tcp_ses_lock);
++ 		return 0;
++ 	}
++ 	is_binding = !CIFS_ALL_CHANS_NEED_RECONNECT(ses);
++ 	cifs_chan_set_in_reconnect(ses, server);
++ 	spin_unlock(&ses->chan_lock);
++ 
++ 	if (!is_binding)
++ 		ses->ses_status = SES_IN_SETUP;
++ 	spin_unlock(&cifs_tcp_ses_lock);
++ 
+++>>>>>>> 5752bf645f9d (cifs: avoid parallel session setups on same channel)
+  	if (!is_binding) {
+  		ses->capabilities = server->capabilities;
+  		if (!linuxExtEnabled)
+@@@ -3962,8 -4040,25 +3990,28 @@@
+  	if (server->ops->sess_setup)
+  		rc = server->ops->sess_setup(xid, ses, server, nls_info);
+  
+ -	if (rc) {
+ +	if (rc)
+  		cifs_server_dbg(VFS, "Send error in SessSetup = %d\n", rc);
+++<<<<<<< HEAD
+++=======
++ 		spin_lock(&cifs_tcp_ses_lock);
++ 		if (ses->ses_status == SES_IN_SETUP)
++ 			ses->ses_status = SES_NEED_RECON;
++ 		spin_lock(&ses->chan_lock);
++ 		cifs_chan_clear_in_reconnect(ses, server);
++ 		spin_unlock(&ses->chan_lock);
++ 		spin_unlock(&cifs_tcp_ses_lock);
++ 	} else {
++ 		spin_lock(&cifs_tcp_ses_lock);
++ 		if (ses->ses_status == SES_IN_SETUP)
++ 			ses->ses_status = SES_GOOD;
++ 		spin_lock(&ses->chan_lock);
++ 		cifs_chan_clear_in_reconnect(ses, server);
++ 		cifs_chan_clear_need_reconnect(ses, server);
++ 		spin_unlock(&ses->chan_lock);
++ 		spin_unlock(&cifs_tcp_ses_lock);
++ 	}
+++>>>>>>> 5752bf645f9d (cifs: avoid parallel session setups on same channel)
+  
+  	return rc;
+  }
+diff --git a/fs/cifs/cifs_debug.c b/fs/cifs/cifs_debug.c
+index f8f3b7014863..9f9ae9c710d1 100644
+--- a/fs/cifs/cifs_debug.c
++++ b/fs/cifs/cifs_debug.c
+@@ -428,6 +428,8 @@ static int cifs_debug_data_proc_show(struct seq_file *m, void *v)
+ 			spin_lock(&ses->chan_lock);
+ 			if (CIFS_CHAN_NEEDS_RECONNECT(ses, 0))
+ 				seq_puts(m, "\tPrimary channel: DISCONNECTED ");
++			if (CIFS_CHAN_IN_RECONNECT(ses, 0))
++				seq_puts(m, "\t[RECONNECTING] ");
+ 
+ 			if (ses->chan_count > 1) {
+ 				seq_printf(m, "\n\n\tExtra Channels: %zu ",
+@@ -436,6 +438,8 @@ static int cifs_debug_data_proc_show(struct seq_file *m, void *v)
+ 					cifs_dump_channel(m, j, &ses->chans[j]);
+ 					if (CIFS_CHAN_NEEDS_RECONNECT(ses, j))
+ 						seq_puts(m, "\tDISCONNECTED ");
++					if (CIFS_CHAN_IN_RECONNECT(ses, j))
++						seq_puts(m, "\t[RECONNECTING] ");
+ 				}
+ 			}
+ 			spin_unlock(&ses->chan_lock);
+diff --git a/fs/cifs/cifsglob.h b/fs/cifs/cifsglob.h
+index bfe603df9494..00162876a6f3 100644
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@ -915,6 +915,7 @@ struct cifs_server_iface {
+ };
+ 
+ struct cifs_chan {
++	unsigned int in_reconnect : 1; /* if session setup in progress for this channel */
+ 	struct TCP_Server_Info *server;
+ 	__u8 signkey[SMB3_SIGN_KEY_SIZE];
+ };
+@@ -976,10 +977,14 @@ struct cifs_ses {
+ #define CIFS_MAX_CHANNELS 16
+ #define CIFS_ALL_CHANNELS_SET(ses)	\
+ 	((1UL << (ses)->chan_count) - 1)
++#define CIFS_ALL_CHANS_GOOD(ses)		\
++	(!(ses)->chans_need_reconnect)
+ #define CIFS_ALL_CHANS_NEED_RECONNECT(ses)	\
+ 	((ses)->chans_need_reconnect == CIFS_ALL_CHANNELS_SET(ses))
+ #define CIFS_CHAN_NEEDS_RECONNECT(ses, index)	\
+ 	test_bit((index), &(ses)->chans_need_reconnect)
++#define CIFS_CHAN_IN_RECONNECT(ses, index)	\
++	((ses)->chans[(index)].in_reconnect)
+ 
+ 	struct cifs_chan chans[CIFS_MAX_CHANNELS];
+ 	size_t chan_count;
+diff --git a/fs/cifs/cifsproto.h b/fs/cifs/cifsproto.h
+index 081ad010ce30..6768a264c0bc 100644
+--- a/fs/cifs/cifsproto.h
++++ b/fs/cifs/cifsproto.h
+@@ -606,6 +606,15 @@ unsigned int
+ cifs_ses_get_chan_index(struct cifs_ses *ses,
+ 			struct TCP_Server_Info *server);
+ void
++cifs_chan_set_in_reconnect(struct cifs_ses *ses,
++			     struct TCP_Server_Info *server);
++void
++cifs_chan_clear_in_reconnect(struct cifs_ses *ses,
++			       struct TCP_Server_Info *server);
++bool
++cifs_chan_in_reconnect(struct cifs_ses *ses,
++			  struct TCP_Server_Info *server);
++void
+ cifs_chan_set_need_reconnect(struct cifs_ses *ses,
+ 			     struct TCP_Server_Info *server);
+ void
+* Unmerged path fs/cifs/connect.c
+diff --git a/fs/cifs/sess.c b/fs/cifs/sess.c
+index 1b56022e96fb..47b1469caa58 100644
+--- a/fs/cifs/sess.c
++++ b/fs/cifs/sess.c
+@@ -81,6 +81,33 @@ cifs_ses_get_chan_index(struct cifs_ses *ses,
+ 	return 0;
+ }
+ 
++void
++cifs_chan_set_in_reconnect(struct cifs_ses *ses,
++			     struct TCP_Server_Info *server)
++{
++	unsigned int chan_index = cifs_ses_get_chan_index(ses, server);
++
++	ses->chans[chan_index].in_reconnect = true;
++}
++
++void
++cifs_chan_clear_in_reconnect(struct cifs_ses *ses,
++			     struct TCP_Server_Info *server)
++{
++	unsigned int chan_index = cifs_ses_get_chan_index(ses, server);
++
++	ses->chans[chan_index].in_reconnect = false;
++}
++
++bool
++cifs_chan_in_reconnect(struct cifs_ses *ses,
++			  struct TCP_Server_Info *server)
++{
++	unsigned int chan_index = cifs_ses_get_chan_index(ses, server);
++
++	return CIFS_CHAN_IN_RECONNECT(ses, chan_index);
++}
++
+ void
+ cifs_chan_set_need_reconnect(struct cifs_ses *ses,
+ 			     struct TCP_Server_Info *server)
