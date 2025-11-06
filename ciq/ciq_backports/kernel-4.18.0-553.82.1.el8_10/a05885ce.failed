@@ -1,0 +1,226 @@
+cifs: fix the connection state transitions with multichannel
+
+jira LE-4669
+Rebuild_History Non-Buildable kernel-4.18.0-553.82.1.el8_10
+commit-author Shyam Prasad N <sprasad@microsoft.com>
+commit a05885ce13bd5ec9602551e32dfb1a4f26bfa542
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.82.1.el8_10/a05885ce.failed
+
+Recent changes to multichannel required some adjustments in
+the way connection states transitioned during/after reconnect.
+
+Also some minor fixes:
+1. A pending switch of GlobalMid_Lock to cifs_tcp_ses_lock
+2. Relocations of the code that logs reconnect
+3. Changed some code in allocate_mid to suit the new scheme
+
+	Signed-off-by: Shyam Prasad N <sprasad@microsoft.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit a05885ce13bd5ec9602551e32dfb1a4f26bfa542)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/connect.c
+#	fs/cifs/sess.c
+#	fs/cifs/smb2pdu.c
+#	fs/cifs/transport.c
+diff --cc fs/cifs/connect.c
+index aa59bbf815c2,9fba2ec56328..000000000000
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@@ -217,14 -217,6 +216,17 @@@ next_session
+  	}
+  	spin_unlock(&cifs_tcp_ses_lock);
+  
+++<<<<<<< HEAD
+ +	if (num_sessions == 0)
+ +		return;
+ +	/*
+ +	 * before reconnecting the tcp session, mark the smb session (uid)
+ +	 * and the tid bad so they are not used until reconnected
+ +	 */
+ +	cifs_dbg(FYI, "%s: marking sessions and tcons for reconnect\n",
+ +		 __func__);
+++=======
+++>>>>>>> a05885ce13bd (cifs: fix the connection state transitions with multichannel)
+  	/* do not want to be sending data on a socket we are freeing */
+  	cifs_dbg(FYI, "%s: tearing down socket\n", __func__);
+  	mutex_lock(&server->srv_mutex);
+@@@ -282,8 -274,13 +284,17 @@@ static bool cifs_tcp_ses_needs_reconnec
+  		wake_up(&server->response_q);
+  		return false;
+  	}
++ 
++ 	cifs_dbg(FYI, "Mark tcp session as need reconnect\n");
++ 	trace_smb3_reconnect(server->CurrentMid, server->conn_id,
++ 			     server->hostname);
+  	server->tcpStatus = CifsNeedReconnect;
+++<<<<<<< HEAD
+ +	spin_unlock(&GlobalMid_Lock);
+++=======
++ 
++ 	spin_unlock(&cifs_tcp_ses_lock);
+++>>>>>>> a05885ce13bd (cifs: fix the connection state transitions with multichannel)
+  	return true;
+  }
+  
+@@@ -610,13 -625,17 +621,17 @@@ cifs_readv_from_socket(struct TCP_Serve
+  		else
+  			length = sock_recvmsg(server->ssocket, smb_msg, 0);
+  
+ -		spin_lock(&cifs_tcp_ses_lock);
+ -		if (server->tcpStatus == CifsExiting) {
+ -			spin_unlock(&cifs_tcp_ses_lock);
+ +		if (server->tcpStatus == CifsExiting)
+  			return -ESHUTDOWN;
+ -		}
+  
+  		if (server->tcpStatus == CifsNeedReconnect) {
+++<<<<<<< HEAD
+ +			cifs_reconnect(server);
+++=======
++ 			spin_unlock(&cifs_tcp_ses_lock);
+++>>>>>>> a05885ce13bd (cifs: fix the connection state transitions with multichannel)
+  			return -ECONNABORTED;
+  		}
+ -		spin_unlock(&cifs_tcp_ses_lock);
+  
+  		if (length == -ERESTARTSYS ||
+  		    length == -EAGAIN ||
+@@@ -3913,12 -3874,20 +3928,21 @@@ cifs_negotiate_protocol(const unsigned 
+  
+  	rc = server->ops->negotiate(xid, ses, server);
+  	if (rc == 0) {
+ -		spin_lock(&cifs_tcp_ses_lock);
+ -		if (server->tcpStatus == CifsInNegotiate)
+ -			server->tcpStatus = CifsNeedSessSetup;
+ +		spin_lock(&GlobalMid_Lock);
+ +		if (server->tcpStatus == CifsNeedNegotiate)
+ +			server->tcpStatus = CifsGood;
+  		else
+  			rc = -EHOSTDOWN;
+++<<<<<<< HEAD
+ +		spin_unlock(&GlobalMid_Lock);
+++=======
++ 		spin_unlock(&cifs_tcp_ses_lock);
++ 	} else {
++ 		spin_lock(&cifs_tcp_ses_lock);
++ 		if (server->tcpStatus == CifsInNegotiate)
++ 			server->tcpStatus = CifsNeedNegotiate;
++ 		spin_unlock(&cifs_tcp_ses_lock);
+++>>>>>>> a05885ce13bd (cifs: fix the connection state transitions with multichannel)
+  	}
+  
+  	return rc;
+@@@ -4260,6 -4290,16 +4294,19 @@@ static int tree_connect_dfs_target(cons
+  	struct dfs_cache_tgt_iterator *tit;
+  	bool target_match;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* only send once per connect */
++ 	spin_lock(&cifs_tcp_ses_lock);
++ 	if (tcon->tidStatus != CifsNew &&
++ 	    tcon->tidStatus != CifsNeedTcon) {
++ 		spin_unlock(&cifs_tcp_ses_lock);
++ 		return 0;
++ 	}
++ 	tcon->tidStatus = CifsInTcon;
++ 	spin_unlock(&cifs_tcp_ses_lock);
++ 
+++>>>>>>> a05885ce13bd (cifs: fix the connection state transitions with multichannel)
+  	extract_unc_hostname(server->hostname, &tcp_host, &tcp_host_len);
+  
+  	tit = dfs_cache_get_tgt_iterator(tl);
+diff --cc fs/cifs/sess.c
+index 1b56022e96fb,e7fddd4a5990..000000000000
+--- a/fs/cifs/sess.c
++++ b/fs/cifs/sess.c
+@@@ -1056,9 -1053,9 +1056,13 @@@ sess_establish_session(struct sess_dat
+  	spin_unlock(&ses->chan_lock);
+  
+  	/* Even if one channel is active, session is in good state */
+++<<<<<<< HEAD
+ +	spin_lock(&GlobalMid_Lock);
+++=======
++ 	spin_lock(&cifs_tcp_ses_lock);
+++>>>>>>> a05885ce13bd (cifs: fix the connection state transitions with multichannel)
+  	ses->status = CifsGood;
+ -	spin_unlock(&cifs_tcp_ses_lock);
+ +	spin_unlock(&GlobalMid_Lock);
+  
+  	return 0;
+  }
+diff --cc fs/cifs/smb2pdu.c
+index fdd9bd57531e,6d8cfe15fbaf..000000000000
+--- a/fs/cifs/smb2pdu.c
++++ b/fs/cifs/smb2pdu.c
+@@@ -1389,9 -1392,9 +1389,13 @@@ SMB2_sess_establish_session(struct SMB2
+  	spin_unlock(&ses->chan_lock);
+  
+  	/* Even if one channel is active, session is in good state */
+++<<<<<<< HEAD
+ +	spin_lock(&GlobalMid_Lock);
+++=======
++ 	spin_lock(&cifs_tcp_ses_lock);
+++>>>>>>> a05885ce13bd (cifs: fix the connection state transitions with multichannel)
+  	ses->status = CifsGood;
+ -	spin_unlock(&cifs_tcp_ses_lock);
+ +	spin_unlock(&GlobalMid_Lock);
+  
+  	return rc;
+  }
+diff --cc fs/cifs/transport.c
+index 680bba1f6d90,548cb376942e..000000000000
+--- a/fs/cifs/transport.c
++++ b/fs/cifs/transport.c
+@@@ -417,9 -430,10 +417,16 @@@ unmask
+  		 * be taken as the remainder of this one. We need to kill the
+  		 * socket so the server throws away the partial SMB
+  		 */
+++<<<<<<< HEAD
+ +		spin_lock(&GlobalMid_Lock);
+ +		server->tcpStatus = CifsNeedReconnect;
+ +		spin_unlock(&GlobalMid_Lock);
+++=======
++ 		spin_lock(&cifs_tcp_ses_lock);
++ 		if (server->tcpStatus != CifsExiting)
++ 			server->tcpStatus = CifsNeedReconnect;
++ 		spin_unlock(&cifs_tcp_ses_lock);
+++>>>>>>> a05885ce13bd (cifs: fix the connection state transitions with multichannel)
+  		trace_smb3_partial_send_reconnect(server->CurrentMid,
+  						  server->conn_id, server->hostname);
+  	}
+@@@ -720,19 -729,13 +727,23 @@@ cifs_wait_mtu_credits(struct TCP_Server
+  static int allocate_mid(struct cifs_ses *ses, struct smb_hdr *in_buf,
+  			struct mid_q_entry **ppmidQ)
+  {
+++<<<<<<< HEAD
+ +	if (ses->server->tcpStatus == CifsExiting) {
+ +		return -ENOENT;
+ +	}
+ +
+ +	if (ses->server->tcpStatus == CifsNeedReconnect) {
+ +		cifs_dbg(FYI, "tcp session dead - return to caller to retry\n");
+ +		return -EAGAIN;
+ +	}
+ +
+++=======
++ 	spin_lock(&cifs_tcp_ses_lock);
+++>>>>>>> a05885ce13bd (cifs: fix the connection state transitions with multichannel)
+  	if (ses->status == CifsNew) {
+  		if ((in_buf->Command != SMB_COM_SESSION_SETUP_ANDX) &&
+ -			(in_buf->Command != SMB_COM_NEGOTIATE)) {
+ -			spin_unlock(&cifs_tcp_ses_lock);
+ +			(in_buf->Command != SMB_COM_NEGOTIATE))
+  			return -EAGAIN;
+ -		}
+  		/* else ok - we are setting up session */
+  	}
+  
+* Unmerged path fs/cifs/connect.c
+* Unmerged path fs/cifs/sess.c
+* Unmerged path fs/cifs/smb2pdu.c
+* Unmerged path fs/cifs/transport.c
