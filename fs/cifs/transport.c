@@ -1058,9 +1058,11 @@ pick_another:
 		if (CIFS_CHAN_NEEDS_RECONNECT(ses, index))
 			goto pick_another;
 	}
+
+	server = ses->chans[index].server;
 	spin_unlock(&ses->chan_lock);
 
-	return ses->chans[index].server;
+	return server;
 }
 
 int
