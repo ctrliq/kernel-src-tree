@@ -1,0 +1,169 @@
+ext4: check the extent status again before inserting delalloc block
+
+jira LE-4669
+Rebuild_History Non-Buildable kernel-4.18.0-553.82.1.el8_10
+commit-author Zhang Yi <yi.zhang@huawei.com>
+commit 0ea6560abb3bac1ffcfa4bf6b2c4d344fdc27b3c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.82.1.el8_10/0ea6560a.failed
+
+ext4_da_map_blocks looks up for any extent entry in the extent status
+tree (w/o i_data_sem) and then the looks up for any ondisk extent
+mapping (with i_data_sem in read mode).
+
+If it finds a hole in the extent status tree or if it couldn't find any
+entry at all, it then takes the i_data_sem in write mode to add a da
+entry into the extent status tree. This can actually race with page
+mkwrite & fallocate path.
+
+Note that this is ok between
+1. ext4 buffered-write path v/s ext4_page_mkwrite(), because of the
+   folio lock
+2. ext4 buffered write path v/s ext4 fallocate because of the inode
+   lock.
+
+But this can race between ext4_page_mkwrite() & ext4 fallocate path
+
+ext4_page_mkwrite()             ext4_fallocate()
+ block_page_mkwrite()
+  ext4_da_map_blocks()
+   //find hole in extent status tree
+                                 ext4_alloc_file_blocks()
+                                  ext4_map_blocks()
+                                   //allocate block and unwritten extent
+   ext4_insert_delayed_block()
+    ext4_da_reserve_space()
+     //reserve one more block
+    ext4_es_insert_delayed_block()
+     //drop unwritten extent and add delayed extent by mistake
+
+Then, the delalloc extent is wrong until writeback and the extra
+reserved block can't be released any more and it triggers below warning:
+
+ EXT4-fs (pmem2): Inode 13 (00000000bbbd4d23): i_reserved_data_blocks(1) not cleared!
+
+Fix the problem by looking up extent status tree again while the
+i_data_sem is held in write mode. If it still can't find any entry, then
+we insert a new da entry into the extent status tree.
+
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Zhang Yi <yi.zhang@huawei.com>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+Link: https://patch.msgid.link/20240517124005.347221-3-yi.zhang@huaweicloud.com
+	Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+(cherry picked from commit 0ea6560abb3bac1ffcfa4bf6b2c4d344fdc27b3c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/inode.c
+diff --cc fs/ext4/inode.c
+index 49ebe49ee7e4,4b0d64a76e88..000000000000
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@@ -1878,13 -1733,11 +1878,14 @@@ static int ext4_da_map_blocks(struct in
+  		  (unsigned long) map->m_lblk);
+  
+  	/* Lookup extent status tree firstly */
+ -	if (ext4_es_lookup_extent(inode, iblock, NULL, &es)) {
+ -		if (ext4_es_is_hole(&es))
+ +	if (ext4_es_lookup_extent(inode, iblock, &es)) {
+ +		if (ext4_es_is_hole(&es)) {
+ +			retval = 0;
+ +			down_read(&EXT4_I(inode)->i_data_sem);
+  			goto add_delayed;
+ +		}
+  
++ found:
+  		/*
+  		 * Delayed extent could be allocated by fallocate.
+  		 * So we need to check it.
+@@@ -1921,52 -1774,42 +1922,80 @@@
+  	down_read(&EXT4_I(inode)->i_data_sem);
+  	if (ext4_has_inline_data(inode))
+  		retval = 0;
+ +	else if (ext4_test_inode_flag(inode, EXT4_INODE_EXTENTS))
+ +		retval = ext4_ext_map_blocks(NULL, inode, map, 0);
+  	else
+ -		retval = ext4_map_query_blocks(NULL, inode, map);
+ -	up_read(&EXT4_I(inode)->i_data_sem);
+ -	if (retval)
+ -		return retval;
+ +		retval = ext4_ind_map_blocks(NULL, inode, map, 0);
+  
+  add_delayed:
+++<<<<<<< HEAD
+ +	if (retval == 0) {
+ +		int ret;
+ +
+ +		/*
+ +		 * XXX: __block_prepare_write() unmaps passed block,
+ +		 * is it OK?
+ +		 */
+ +
+ +		ret = ext4_insert_delayed_block(inode, map->m_lblk);
+ +		if (ret != 0) {
+ +			retval = ret;
+ +			goto out_unlock;
+ +		}
+ +
+ +		map_bh(bh, inode->i_sb, invalid_block);
+ +		set_buffer_new(bh);
+ +		set_buffer_delay(bh);
+ +	} else if (retval > 0) {
+ +		int ret;
+ +		unsigned int status;
+ +
+ +		if (unlikely(retval != map->m_len)) {
+ +			ext4_warning(inode->i_sb,
+ +				     "ES len assertion failed for inode "
+ +				     "%lu: retval %d != map->m_len %d",
+ +				     inode->i_ino, retval, map->m_len);
+ +			WARN_ON(1);
+ +		}
+ +
+ +		status = map->m_flags & EXT4_MAP_UNWRITTEN ?
+ +				EXTENT_STATUS_UNWRITTEN : EXTENT_STATUS_WRITTEN;
+ +		ret = ext4_es_insert_extent(inode, map->m_lblk, map->m_len,
+ +					    map->m_pblk, status);
+ +		if (ret != 0)
+ +			retval = ret;
+ +	}
+ +
+ +out_unlock:
+ +	up_read((&EXT4_I(inode)->i_data_sem));
+++=======
++ 	down_write(&EXT4_I(inode)->i_data_sem);
++ 	/*
++ 	 * Page fault path (ext4_page_mkwrite does not take i_rwsem)
++ 	 * and fallocate path (no folio lock) can race. Make sure we
++ 	 * lookup the extent status tree here again while i_data_sem
++ 	 * is held in write mode, before inserting a new da entry in
++ 	 * the extent status tree.
++ 	 */
++ 	if (ext4_es_lookup_extent(inode, iblock, NULL, &es)) {
++ 		if (!ext4_es_is_hole(&es)) {
++ 			up_write(&EXT4_I(inode)->i_data_sem);
++ 			goto found;
++ 		}
++ 	} else if (!ext4_has_inline_data(inode)) {
++ 		retval = ext4_map_query_blocks(NULL, inode, map);
++ 		if (retval) {
++ 			up_write(&EXT4_I(inode)->i_data_sem);
++ 			return retval;
++ 		}
++ 	}
++ 
++ 	retval = ext4_insert_delayed_block(inode, map->m_lblk);
++ 	up_write(&EXT4_I(inode)->i_data_sem);
++ 	if (retval)
++ 		return retval;
+++>>>>>>> 0ea6560abb3b (ext4: check the extent status again before inserting delalloc block)
+  
+ -	map_bh(bh, inode->i_sb, invalid_block);
+ -	set_buffer_new(bh);
+ -	set_buffer_delay(bh);
+  	return retval;
+  }
+  
+* Unmerged path fs/ext4/inode.c
