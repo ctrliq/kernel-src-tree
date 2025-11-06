@@ -1,0 +1,311 @@
+cifs: handle cases where a channel is closed
+
+jira LE-4669
+Rebuild_History Non-Buildable kernel-4.18.0-553.82.1.el8_10
+commit-author Shyam Prasad N <sprasad@microsoft.com>
+commit 0c51cc6f2cb0108e7d49805f6e089cd85caab279
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.82.1.el8_10/0c51cc6f.failed
+
+So far, SMB multichannel could only scale up, but not
+scale down the number of channels. In this series of
+patch, we now allow the client to deal with the case
+of multichannel disabled on the server when the share
+is mounted. With that change, we now need the ability
+to scale down the channels.
+
+This change allows the client to deal with cases of
+missing channels more gracefully.
+
+	Signed-off-by: Shyam Prasad N <sprasad@microsoft.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 0c51cc6f2cb0108e7d49805f6e089cd85caab279)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/connect.c
+#	fs/cifs/sess.c
+diff --cc fs/cifs/connect.c
+index ca2926c7b59e,3ff82f0aa00e..000000000000
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@@ -164,45 -140,70 +164,63 @@@ static void smb2_query_server_interface
+  			   (SMB_INTERFACE_POLL_INTERVAL * HZ));
+  }
+  
+ -/*
+ - * Update the tcpStatus for the server.
+ - * This is used to signal the cifsd thread to call cifs_reconnect
+ - * ONLY cifsd thread should call cifs_reconnect. For any other
+ - * thread, use this function
+ - *
+ - * @server: the tcp ses for which reconnect is needed
+ - * @all_channels: if this needs to be done for all channels
+ - */
+ -void
+ -cifs_signal_cifsd_for_reconnect(struct TCP_Server_Info *server,
+ -				bool all_channels)
+ +static void cifs_resolve_server(struct work_struct *work)
+  {
+ -	struct TCP_Server_Info *pserver;
+ -	struct cifs_ses *ses;
+ -	int i;
+ +	int rc;
+ +	struct TCP_Server_Info *server = container_of(work,
+ +					struct TCP_Server_Info, resolve.work);
+  
+ -	/* If server is a channel, select the primary channel */
+ -	pserver = SERVER_IS_CHAN(server) ? server->primary_server : server;
+ +	mutex_lock(&server->srv_mutex);
+  
+ -	/* if we need to signal just this channel */
+ -	if (!all_channels) {
+ -		spin_lock(&server->srv_lock);
+ -		if (server->tcpStatus != CifsExiting)
+ -			server->tcpStatus = CifsNeedReconnect;
+ -		spin_unlock(&server->srv_lock);
+ -		return;
+ +	/*
+ +	 * Resolve the hostname again to make sure that IP address is up-to-date.
+ +	 */
+ +	rc = reconn_set_ipaddr_from_hostname(server);
+ +	if (rc) {
+ +		cifs_dbg(FYI, "%s: failed to resolve hostname: %d\n",
+ +				__func__, rc);
+  	}
+  
+++<<<<<<< HEAD:fs/cifs/connect.c
+ +	mutex_unlock(&server->srv_mutex);
+++=======
++ 	spin_lock(&cifs_tcp_ses_lock);
++ 	list_for_each_entry(ses, &pserver->smb_ses_list, smb_ses_list) {
++ 		spin_lock(&ses->chan_lock);
++ 		for (i = 0; i < ses->chan_count; i++) {
++ 			if (!ses->chans[i].server)
++ 				continue;
++ 
++ 			spin_lock(&ses->chans[i].server->srv_lock);
++ 			if (ses->chans[i].server->tcpStatus != CifsExiting)
++ 				ses->chans[i].server->tcpStatus = CifsNeedReconnect;
++ 			spin_unlock(&ses->chans[i].server->srv_lock);
++ 		}
++ 		spin_unlock(&ses->chan_lock);
++ 	}
++ 	spin_unlock(&cifs_tcp_ses_lock);
+++>>>>>>> 0c51cc6f2cb0 (cifs: handle cases where a channel is closed):fs/smb/client/connect.c
+  }
+  
+ -/*
+ +/**
+   * Mark all sessions and tcons for reconnect.
+ - * IMPORTANT: make sure that this gets called only from
+ - * cifsd thread. For any other thread, use
+ - * cifs_signal_cifsd_for_reconnect
+   *
+ - * @server: the tcp ses for which reconnect is needed
+   * @server needs to be previously set to CifsNeedReconnect.
+ - * @mark_smb_session: whether even sessions need to be marked
+   */
+ -void
+ -cifs_mark_tcp_ses_conns_for_reconnect(struct TCP_Server_Info *server,
+ -				      bool mark_smb_session)
+ +static void cifs_mark_tcp_ses_conns_for_reconnect(struct TCP_Server_Info *server)
+  {
+ -	struct TCP_Server_Info *pserver;
+ -	struct cifs_ses *ses, *nses;
+ +	unsigned int num_sessions = 0;
+ +	struct cifs_ses *ses;
+  	struct cifs_tcon *tcon;
+ +	struct mid_q_entry *mid, *nmid;
+ +	struct list_head retry_list;
+ +	struct TCP_Server_Info *pserver;
+  
+ +	server->maxBuf = 0;
+ +	server->max_read = 0;
+ +
+ +	cifs_dbg(FYI, "Mark tcp session as need reconnect\n");
+ +	trace_smb3_reconnect(server->CurrentMid, server->conn_id, server->hostname);
+  	/*
+  	 * before reconnecting the tcp session, mark the smb session (uid) and the tid bad so they
+  	 * are not used until reconnected.
+diff --cc fs/cifs/sess.c
+index b9c9236e1312,d13a24613710..000000000000
+--- a/fs/cifs/sess.c
++++ b/fs/cifs/sess.c
+@@@ -65,7 -67,9 +65,13 @@@ bool is_ses_using_iface(struct cifs_se
+  	return false;
+  }
+  
+++<<<<<<< HEAD:fs/cifs/sess.c
+ +unsigned int
+++=======
++ /* channel helper functions. assumed that chan_lock is held by caller. */
++ 
++ int
+++>>>>>>> 0c51cc6f2cb0 (cifs: handle cases where a channel is closed):fs/smb/client/sess.c
+  cifs_ses_get_chan_index(struct cifs_ses *ses,
+  			struct TCP_Server_Info *server)
+  {
+@@@ -81,10 -85,44 +87,47 @@@
+  		cifs_dbg(VFS, "unable to get chan index for server: 0x%llx",
+  			 server->conn_id);
+  	WARN_ON(1);
+- 	return 0;
++ 	return CIFS_INVAL_CHAN_INDEX;
++ }
++ 
++ void
+++<<<<<<< HEAD:fs/cifs/sess.c
+++=======
++ cifs_chan_set_in_reconnect(struct cifs_ses *ses,
++ 			     struct TCP_Server_Info *server)
++ {
++ 	int chan_index = cifs_ses_get_chan_index(ses, server);
++ 
++ 	if (chan_index == CIFS_INVAL_CHAN_INDEX)
++ 		return;
++ 
++ 	ses->chans[chan_index].in_reconnect = true;
++ }
++ 
++ void
++ cifs_chan_clear_in_reconnect(struct cifs_ses *ses,
++ 			     struct TCP_Server_Info *server)
++ {
++ 	unsigned int chan_index = cifs_ses_get_chan_index(ses, server);
++ 	if (chan_index == CIFS_INVAL_CHAN_INDEX)
++ 		return;
++ 
++ 	ses->chans[chan_index].in_reconnect = false;
++ }
++ 
++ bool
++ cifs_chan_in_reconnect(struct cifs_ses *ses,
++ 			  struct TCP_Server_Info *server)
++ {
++ 	unsigned int chan_index = cifs_ses_get_chan_index(ses, server);
++ 	if (chan_index == CIFS_INVAL_CHAN_INDEX)
++ 		return true;	/* err on the safer side */
++ 
++ 	return CIFS_CHAN_IN_RECONNECT(ses, chan_index);
+  }
+  
+  void
+++>>>>>>> 0c51cc6f2cb0 (cifs: handle cases where a channel is closed):fs/smb/client/sess.c
+  cifs_chan_set_need_reconnect(struct cifs_ses *ses,
+  			     struct TCP_Server_Info *server)
+  {
+@@@ -236,9 -282,12 +287,16 @@@ cifs_chan_update_iface(struct cifs_ses 
+  	struct cifs_server_iface *old_iface = NULL;
+  	int rc = 0;
+  
+++<<<<<<< HEAD:fs/cifs/sess.c
+ +	/* primary channel. This can never go away */
+ +	if (!chan_index)
+++=======
++ 	spin_lock(&ses->chan_lock);
++ 	chan_index = cifs_ses_get_chan_index(ses, server);
++ 	if (chan_index == CIFS_INVAL_CHAN_INDEX) {
++ 		spin_unlock(&ses->chan_lock);
+++>>>>>>> 0c51cc6f2cb0 (cifs: handle cases where a channel is closed):fs/smb/client/sess.c
+  		return 0;
+ -	}
+  
+  	if (ses->chans[chan_index].iface) {
+  		old_iface = ses->chans[chan_index].iface;
+@@@ -281,14 -330,25 +339,26 @@@
+  		WARN_ON(!iface);
+  		cifs_dbg(FYI, "adding new iface: %pIS\n", &iface->sockaddr);
+  	}
+ +
+  	spin_unlock(&ses->iface_lock);
+  
+++<<<<<<< HEAD:fs/cifs/sess.c
+++=======
++ 	spin_lock(&ses->chan_lock);
++ 	chan_index = cifs_ses_get_chan_index(ses, server);
++ 	if (chan_index == CIFS_INVAL_CHAN_INDEX) {
++ 		spin_unlock(&ses->chan_lock);
++ 		return 0;
++ 	}
++ 
++ 	ses->chans[chan_index].iface = iface;
++ 
+++>>>>>>> 0c51cc6f2cb0 (cifs: handle cases where a channel is closed):fs/smb/client/sess.c
+  	/* No iface is found. if secondary chan, drop connection */
+ -	if (!iface && SERVER_IS_CHAN(server))
+ -		ses->chans[chan_index].server = NULL;
+ -
+ -	spin_unlock(&ses->chan_lock);
+ -
+ -	if (!iface && SERVER_IS_CHAN(server))
+ +	if (!iface && CIFS_SERVER_IS_CHAN(server)) {
+  		cifs_put_tcp_session(server, false);
+ +		ses->chans[chan_index].server = NULL;
+ +	}
+  
+  	return rc;
+  }
+diff --git a/fs/cifs/cifs_debug.c b/fs/cifs/cifs_debug.c
+index eb8541c3298e..02c728536d29 100644
+--- a/fs/cifs/cifs_debug.c
++++ b/fs/cifs/cifs_debug.c
+@@ -142,6 +142,11 @@ cifs_dump_channel(struct seq_file *m, int i, struct cifs_chan *chan)
+ {
+ 	struct TCP_Server_Info *server = chan->server;
+ 
++	if (!server) {
++		seq_printf(m, "\n\n\t\tChannel: %d DISABLED", i+1);
++		return;
++	}
++
+ 	seq_printf(m, "\n\n\t\tChannel: %d ConnectionId: 0x%llx"
+ 		   "\n\t\tNumber of credits: %d Dialect 0x%x"
+ 		   "\n\t\tTCP status: %d Instance: %d"
+diff --git a/fs/cifs/cifsglob.h b/fs/cifs/cifsglob.h
+index 9e7f8c48e52c..dd0fa3e31591 100644
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@ -1029,6 +1029,7 @@ struct cifs_ses {
+ 	spinlock_t chan_lock;
+ 	/* ========= begin: protected by chan_lock ======== */
+ #define CIFS_MAX_CHANNELS 16
++#define CIFS_INVAL_CHAN_INDEX (-1)
+ #define CIFS_ALL_CHANNELS_SET(ses)	\
+ 	((1UL << (ses)->chan_count) - 1)
+ #define CIFS_ALL_CHANS_NEED_RECONNECT(ses)	\
+diff --git a/fs/cifs/cifsproto.h b/fs/cifs/cifsproto.h
+index 76582fa73223..379a00836656 100644
+--- a/fs/cifs/cifsproto.h
++++ b/fs/cifs/cifsproto.h
+@@ -599,7 +599,7 @@ bool is_server_using_iface(struct TCP_Server_Info *server,
+ bool is_ses_using_iface(struct cifs_ses *ses, struct cifs_server_iface *iface);
+ void cifs_ses_mark_for_reconnect(struct cifs_ses *ses);
+ 
+-unsigned int
++int
+ cifs_ses_get_chan_index(struct cifs_ses *ses,
+ 			struct TCP_Server_Info *server);
+ void
+* Unmerged path fs/cifs/connect.c
+* Unmerged path fs/cifs/sess.c
+diff --git a/fs/cifs/smb2transport.c b/fs/cifs/smb2transport.c
+index c6bf79f874d4..7e9a760af8b1 100644
+--- a/fs/cifs/smb2transport.c
++++ b/fs/cifs/smb2transport.c
+@@ -412,7 +412,13 @@ generate_smb3signingkey(struct cifs_ses *ses,
+ 	spin_lock(&ses->chan_lock);
+ 	is_binding = !CIFS_ALL_CHANS_NEED_RECONNECT(ses);
+ 	chan_index = cifs_ses_get_chan_index(ses, server);
+-	/* TODO: introduce ref counting for channels when the can be freed */
++	if (chan_index == CIFS_INVAL_CHAN_INDEX) {
++		spin_unlock(&ses->chan_lock);
++		spin_unlock(&ses->ses_lock);
++
++		return -EINVAL;
++	}
++
+ 	spin_unlock(&ses->chan_lock);
+ 
+ 	/*
