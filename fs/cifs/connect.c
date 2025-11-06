@@ -1850,7 +1850,6 @@ void cifs_put_smb_ses(struct cifs_ses *ses)
 	list_del_init(&ses->smb_ses_list);
 	spin_unlock(&cifs_tcp_ses_lock);
 
-	spin_lock(&ses->chan_lock);
 	chan_count = ses->chan_count;
 	spin_unlock(&ses->chan_lock);
 
