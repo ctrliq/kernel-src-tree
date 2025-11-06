@@ -1,0 +1,135 @@
+cifs: distribute channels across interfaces based on speed
+
+jira LE-4669
+Rebuild_History Non-Buildable kernel-4.18.0-553.82.1.el8_10
+commit-author Shyam Prasad N <sprasad@microsoft.com>
+commit a6d8fb54a515f0546ffdb7870102b1238917e567
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.82.1.el8_10/a6d8fb54.failed
+
+Today, if the server interfaces RSS capable, we simply
+choose the fastest interface to setup a channel. This is not
+a scalable approach, and does not make a lot of attempt to
+distribute the connections.
+
+This change does a weighted distribution of channels across
+all the available server interfaces, where the weight is
+a function of the advertised interface speed.
+
+Also make sure that we don't mix rdma and non-rdma for channels.
+
+	Signed-off-by: Shyam Prasad N <sprasad@microsoft.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit a6d8fb54a515f0546ffdb7870102b1238917e567)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/sess.c
+diff --cc fs/cifs/sess.c
+index b9c9236e1312,336b64d93e41..000000000000
+--- a/fs/cifs/sess.c
++++ b/fs/cifs/sess.c
+@@@ -231,22 -298,39 +252,40 @@@ int cifs_try_adding_channels(struct cif
+  int
+  cifs_chan_update_iface(struct cifs_ses *ses, struct TCP_Server_Info *server)
+  {
+++<<<<<<< HEAD:fs/cifs/sess.c
+ +	unsigned int chan_index = cifs_ses_get_chan_index(ses, server);
+++=======
++ 	unsigned int chan_index;
++ 	size_t iface_weight = 0, iface_min_speed = 0;
+++>>>>>>> a6d8fb54a515 (cifs: distribute channels across interfaces based on speed):fs/smb/client/sess.c
+  	struct cifs_server_iface *iface = NULL;
+  	struct cifs_server_iface *old_iface = NULL;
++ 	struct cifs_server_iface *last_iface = NULL;
+  	int rc = 0;
+  
+ -	spin_lock(&ses->chan_lock);
+ -	chan_index = cifs_ses_get_chan_index(ses, server);
+ -	if (chan_index == CIFS_INVAL_CHAN_INDEX) {
+ -		spin_unlock(&ses->chan_lock);
+ +	/* primary channel. This can never go away */
+ +	if (!chan_index)
+  		return 0;
+ -	}
+  
+  	if (ses->chans[chan_index].iface) {
+  		old_iface = ses->chans[chan_index].iface;
+ -		if (old_iface->is_active) {
+ -			spin_unlock(&ses->chan_lock);
+ +		if (old_iface->is_active)
+  			return 1;
+ -		}
+  	}
+ -	spin_unlock(&ses->chan_lock);
+  
+  	spin_lock(&ses->iface_lock);
+++<<<<<<< HEAD:fs/cifs/sess.c
+++=======
++ 	if (!ses->iface_count) {
++ 		spin_unlock(&ses->iface_lock);
++ 		cifs_dbg(VFS, "server %s does not advertise interfaces\n", ses->server->hostname);
++ 		return 0;
++ 	}
++ 
++ 	last_iface = list_last_entry(&ses->iface_list, struct cifs_server_iface,
++ 				     iface_head);
++ 	iface_min_speed = last_iface->speed;
+++>>>>>>> a6d8fb54a515 (cifs: distribute channels across interfaces based on speed):fs/smb/client/sess.c
+  
+  	/* then look for a new one */
+  	list_for_each_entry(iface, &ses->iface_list, iface_head) {
+diff --git a/fs/cifs/cifs_debug.c b/fs/cifs/cifs_debug.c
+index eb8541c3298e..903f64652422 100644
+--- a/fs/cifs/cifs_debug.c
++++ b/fs/cifs/cifs_debug.c
+@@ -232,6 +232,8 @@ static int cifs_debug_data_proc_show(struct seq_file *m, void *v)
+ 	struct cifs_ses *ses;
+ 	struct cifs_tcon *tcon;
+ 	struct cifs_server_iface *iface;
++	size_t iface_weight = 0, iface_min_speed = 0;
++	struct cifs_server_iface *last_iface = NULL;
+ 	int c, i, j;
+ 
+ 	seq_puts(m,
+@@ -472,11 +474,25 @@ static int cifs_debug_data_proc_show(struct seq_file *m, void *v)
+ 					   "\tLast updated: %lu seconds ago",
+ 					   ses->iface_count,
+ 					   (jiffies - ses->iface_last_update) / HZ);
++
++			last_iface = list_last_entry(&ses->iface_list,
++						     struct cifs_server_iface,
++						     iface_head);
++			iface_min_speed = last_iface->speed;
++
+ 			j = 0;
+ 			list_for_each_entry(iface, &ses->iface_list,
+ 						 iface_head) {
+ 				seq_printf(m, "\n\t%d)", ++j);
+ 				cifs_dump_iface(m, iface);
++
++				iface_weight = iface->speed / iface_min_speed;
++				seq_printf(m, "\t\tWeight (cur,total): (%zu,%zu)"
++					   "\n\t\tAllocated channels: %u\n",
++					   iface->weight_fulfilled,
++					   iface_weight,
++					   iface->num_channels);
++
+ 				if (is_ses_using_iface(ses, iface))
+ 					seq_puts(m, "\t\t[CONNECTED]\n");
+ 			}
+diff --git a/fs/cifs/cifsglob.h b/fs/cifs/cifsglob.h
+index 9e7f8c48e52c..a68c17d158ba 100644
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@ -914,6 +914,8 @@ struct cifs_server_iface {
+ 	struct list_head iface_head;
+ 	struct kref refcount;
+ 	size_t speed;
++	size_t weight_fulfilled;
++	unsigned int num_channels;
+ 	unsigned int rdma_capable : 1;
+ 	unsigned int rss_capable : 1;
+ 	unsigned int is_active : 1; /* unset if non existent */
+* Unmerged path fs/cifs/sess.c
