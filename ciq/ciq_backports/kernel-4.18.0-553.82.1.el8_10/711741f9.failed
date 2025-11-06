@@ -1,0 +1,260 @@
+smb: client: fix potential deadlock when reconnecting channels
+
+jira LE-4669
+cve CVE-2025-38244
+Rebuild_History Non-Buildable kernel-4.18.0-553.82.1.el8_10
+commit-author Paulo Alcantara <pc@manguebit.org>
+commit 711741f94ac3cf9f4e3aa73aa171e76d188c0819
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.82.1.el8_10/711741f9.failed
+
+Fix cifs_signal_cifsd_for_reconnect() to take the correct lock order
+and prevent the following deadlock from happening
+
+======================================================
+WARNING: possible circular locking dependency detected
+6.16.0-rc3-build2+ #1301 Tainted: G S      W
+------------------------------------------------------
+cifsd/6055 is trying to acquire lock:
+ffff88810ad56038 (&tcp_ses->srv_lock){+.+.}-{3:3}, at: cifs_signal_cifsd_for_reconnect+0x134/0x200
+
+but task is already holding lock:
+ffff888119c64330 (&ret_buf->chan_lock){+.+.}-{3:3}, at: cifs_signal_cifsd_for_reconnect+0xcf/0x200
+
+which lock already depends on the new lock.
+
+the existing dependency chain (in reverse order) is:
+
+-> #2 (&ret_buf->chan_lock){+.+.}-{3:3}:
+       validate_chain+0x1cf/0x270
+       __lock_acquire+0x60e/0x780
+       lock_acquire.part.0+0xb4/0x1f0
+       _raw_spin_lock+0x2f/0x40
+       cifs_setup_session+0x81/0x4b0
+       cifs_get_smb_ses+0x771/0x900
+       cifs_mount_get_session+0x7e/0x170
+       cifs_mount+0x92/0x2d0
+       cifs_smb3_do_mount+0x161/0x460
+       smb3_get_tree+0x55/0x90
+       vfs_get_tree+0x46/0x180
+       do_new_mount+0x1b0/0x2e0
+       path_mount+0x6ee/0x740
+       do_mount+0x98/0xe0
+       __do_sys_mount+0x148/0x180
+       do_syscall_64+0xa4/0x260
+       entry_SYSCALL_64_after_hwframe+0x76/0x7e
+
+-> #1 (&ret_buf->ses_lock){+.+.}-{3:3}:
+       validate_chain+0x1cf/0x270
+       __lock_acquire+0x60e/0x780
+       lock_acquire.part.0+0xb4/0x1f0
+       _raw_spin_lock+0x2f/0x40
+       cifs_match_super+0x101/0x320
+       sget+0xab/0x270
+       cifs_smb3_do_mount+0x1e0/0x460
+       smb3_get_tree+0x55/0x90
+       vfs_get_tree+0x46/0x180
+       do_new_mount+0x1b0/0x2e0
+       path_mount+0x6ee/0x740
+       do_mount+0x98/0xe0
+       __do_sys_mount+0x148/0x180
+       do_syscall_64+0xa4/0x260
+       entry_SYSCALL_64_after_hwframe+0x76/0x7e
+
+-> #0 (&tcp_ses->srv_lock){+.+.}-{3:3}:
+       check_noncircular+0x95/0xc0
+       check_prev_add+0x115/0x2f0
+       validate_chain+0x1cf/0x270
+       __lock_acquire+0x60e/0x780
+       lock_acquire.part.0+0xb4/0x1f0
+       _raw_spin_lock+0x2f/0x40
+       cifs_signal_cifsd_for_reconnect+0x134/0x200
+       __cifs_reconnect+0x8f/0x500
+       cifs_handle_standard+0x112/0x280
+       cifs_demultiplex_thread+0x64d/0xbc0
+       kthread+0x2f7/0x310
+       ret_from_fork+0x2a/0x230
+       ret_from_fork_asm+0x1a/0x30
+
+other info that might help us debug this:
+
+Chain exists of:
+  &tcp_ses->srv_lock --> &ret_buf->ses_lock --> &ret_buf->chan_lock
+
+ Possible unsafe locking scenario:
+
+       CPU0                    CPU1
+       ----                    ----
+  lock(&ret_buf->chan_lock);
+                               lock(&ret_buf->ses_lock);
+                               lock(&ret_buf->chan_lock);
+  lock(&tcp_ses->srv_lock);
+
+ *** DEADLOCK ***
+
+3 locks held by cifsd/6055:
+ #0: ffffffff857de398 (&cifs_tcp_ses_lock){+.+.}-{3:3}, at: cifs_signal_cifsd_for_reconnect+0x7b/0x200
+ #1: ffff888119c64060 (&ret_buf->ses_lock){+.+.}-{3:3}, at: cifs_signal_cifsd_for_reconnect+0x9c/0x200
+ #2: ffff888119c64330 (&ret_buf->chan_lock){+.+.}-{3:3}, at: cifs_signal_cifsd_for_reconnect+0xcf/0x200
+
+	Cc: linux-cifs@vger.kernel.org
+	Reported-by: David Howells <dhowells@redhat.com>
+Fixes: d7d7a66aacd6 ("cifs: avoid use of global locks for high contention data")
+	Reviewed-by: David Howells <dhowells@redhat.com>
+	Tested-by: David Howells <dhowells@redhat.com>
+	Signed-off-by: Paulo Alcantara (Red Hat) <pc@manguebit.org>
+	Signed-off-by: David Howells <dhowells@redhat.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 711741f94ac3cf9f4e3aa73aa171e76d188c0819)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/cifsglob.h
+#	fs/cifs/connect.c
+diff --cc fs/cifs/cifsglob.h
+index 3c5d8dfc52dd,318a8405d475..000000000000
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@@ -587,8 -709,12 +587,13 @@@ inc_rfc1001_len(void *buf, int count
+  struct TCP_Server_Info {
+  	struct list_head tcp_ses_list;
+  	struct list_head smb_ses_list;
+++<<<<<<< HEAD:fs/cifs/cifsglob.h
+++=======
++ 	struct list_head rlist; /* reconnect list */
++ 	spinlock_t srv_lock;  /* protect anything here that is not protected */
+++>>>>>>> 711741f94ac3 (smb: client: fix potential deadlock when reconnecting channels):fs/smb/client/cifsglob.h
+  	__u64 conn_id; /* connection identifier (useful for debugging) */
+  	int srv_count; /* reference counter */
+ -	int rfc1001_sessinit; /* whether to estasblish netbios session */
+ -	bool with_rfc1001; /* if netbios session is used */
+  	/* 15 character server name + 0x20 16th byte indicating type = srv */
+  	char server_RFC1001_name[RFC1001_NAME_LEN_WITH_NULL];
+  	struct smb_version_operations	*ops;
+diff --cc fs/cifs/connect.c
+index ca2926c7b59e,685c65dcb8c4..000000000000
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@@ -164,45 -124,86 +164,108 @@@ static void smb2_query_server_interface
+  			   (SMB_INTERFACE_POLL_INTERVAL * HZ));
+  }
+  
+++<<<<<<< HEAD:fs/cifs/connect.c
+ +static void cifs_resolve_server(struct work_struct *work)
+ +{
+ +	int rc;
+ +	struct TCP_Server_Info *server = container_of(work,
+ +					struct TCP_Server_Info, resolve.work);
+ +
+ +	mutex_lock(&server->srv_mutex);
+ +
+ +	/*
+ +	 * Resolve the hostname again to make sure that IP address is up-to-date.
+ +	 */
+ +	rc = reconn_set_ipaddr_from_hostname(server);
+ +	if (rc) {
+ +		cifs_dbg(FYI, "%s: failed to resolve hostname: %d\n",
+ +				__func__, rc);
+ +	}
+ +
+ +	mutex_unlock(&server->srv_mutex);
+++=======
++ #define set_need_reco(server) \
++ do { \
++ 	spin_lock(&server->srv_lock); \
++ 	if (server->tcpStatus != CifsExiting) \
++ 		server->tcpStatus = CifsNeedReconnect; \
++ 	spin_unlock(&server->srv_lock); \
++ } while (0)
++ 
++ /*
++  * Update the tcpStatus for the server.
++  * This is used to signal the cifsd thread to call cifs_reconnect
++  * ONLY cifsd thread should call cifs_reconnect. For any other
++  * thread, use this function
++  *
++  * @server: the tcp ses for which reconnect is needed
++  * @all_channels: if this needs to be done for all channels
++  */
++ void
++ cifs_signal_cifsd_for_reconnect(struct TCP_Server_Info *server,
++ 				bool all_channels)
++ {
++ 	struct TCP_Server_Info *nserver;
++ 	struct cifs_ses *ses;
++ 	LIST_HEAD(reco);
++ 	int i;
++ 
++ 	/* if we need to signal just this channel */
++ 	if (!all_channels) {
++ 		set_need_reco(server);
++ 		return;
++ 	}
++ 
++ 	if (SERVER_IS_CHAN(server))
++ 		server = server->primary_server;
++ 	scoped_guard(spinlock, &cifs_tcp_ses_lock) {
++ 		set_need_reco(server);
++ 		list_for_each_entry(ses, &server->smb_ses_list, smb_ses_list) {
++ 			spin_lock(&ses->ses_lock);
++ 			if (ses->ses_status == SES_EXITING) {
++ 				spin_unlock(&ses->ses_lock);
++ 				continue;
++ 			}
++ 			spin_lock(&ses->chan_lock);
++ 			for (i = 1; i < ses->chan_count; i++) {
++ 				nserver = ses->chans[i].server;
++ 				if (!nserver)
++ 					continue;
++ 				nserver->srv_count++;
++ 				list_add(&nserver->rlist, &reco);
++ 			}
++ 			spin_unlock(&ses->chan_lock);
++ 			spin_unlock(&ses->ses_lock);
++ 		}
++ 	}
++ 
++ 	list_for_each_entry_safe(server, nserver, &reco, rlist) {
++ 		list_del_init(&server->rlist);
++ 		set_need_reco(server);
++ 		cifs_put_tcp_session(server, 0);
++ 	}
+++>>>>>>> 711741f94ac3 (smb: client: fix potential deadlock when reconnecting channels):fs/smb/client/connect.c
+  }
+  
+ -/*
+ +/**
+   * Mark all sessions and tcons for reconnect.
+ - * IMPORTANT: make sure that this gets called only from
+ - * cifsd thread. For any other thread, use
+ - * cifs_signal_cifsd_for_reconnect
+   *
+ - * @server: the tcp ses for which reconnect is needed
+   * @server needs to be previously set to CifsNeedReconnect.
+ - * @mark_smb_session: whether even sessions need to be marked
+   */
+ -void
+ -cifs_mark_tcp_ses_conns_for_reconnect(struct TCP_Server_Info *server,
+ -				      bool mark_smb_session)
+ +static void cifs_mark_tcp_ses_conns_for_reconnect(struct TCP_Server_Info *server)
+  {
+ -	struct TCP_Server_Info *pserver;
+ -	struct cifs_ses *ses, *nses;
+ +	unsigned int num_sessions = 0;
+ +	struct cifs_ses *ses;
+  	struct cifs_tcon *tcon;
+ +	struct mid_q_entry *mid, *nmid;
+ +	struct list_head retry_list;
+ +	struct TCP_Server_Info *pserver;
+  
+ +	server->maxBuf = 0;
+ +	server->max_read = 0;
+ +
+ +	cifs_dbg(FYI, "Mark tcp session as need reconnect\n");
+ +	trace_smb3_reconnect(server->CurrentMid, server->conn_id, server->hostname);
+  	/*
+  	 * before reconnecting the tcp session, mark the smb session (uid) and the tid bad so they
+  	 * are not used until reconnected.
+* Unmerged path fs/cifs/cifsglob.h
+* Unmerged path fs/cifs/connect.c
