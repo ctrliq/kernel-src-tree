@@ -89,6 +89,15 @@ cifs_mark_open_files_invalid(struct cifs_tcon *tcon)
 	struct list_head *tmp;
 	struct list_head *tmp1;
 
+	/* only send once per connect */
+	spin_lock(&tcon->ses->ses_lock);
+	if ((tcon->ses->ses_status != SES_GOOD) || (tcon->status != TID_NEED_RECON)) {
+		spin_unlock(&tcon->ses->ses_lock);
+		return;
+	}
+	tcon->status = TID_IN_FILES_INVALIDATE;
+	spin_unlock(&tcon->ses->ses_lock);
+
 	/* list all files open on tree connection and mark them invalid */
 	spin_lock(&tcon->open_file_lock);
 	list_for_each_safe(tmp, tmp1, &tcon->openFileList) {
@@ -105,6 +114,11 @@ cifs_mark_open_files_invalid(struct cifs_tcon *tcon)
 	memset(tcon->crfid.fid, 0, sizeof(struct cifs_fid));
 	mutex_unlock(&tcon->crfid.fid_mutex);
 
+	spin_lock(&tcon->tc_lock);
+	if (tcon->status == TID_IN_FILES_INVALIDATE)
+		tcon->status = TID_NEED_TCON;
+	spin_unlock(&tcon->tc_lock);
+
 	/*
 	 * BB Add call to invalidate_inodes(sb) for all superblocks mounted
 	 * to this tcon.
@@ -118,8 +132,7 @@ cifs_reconnect_tcon(struct cifs_tcon *tcon, int smb_command)
 	int rc;
 	struct cifs_ses *ses;
 	struct TCP_Server_Info *server;
-	struct nls_table *nls_codepage;
-	int retries;
+	struct nls_table *nls_codepage = NULL;
 
 	/*
 	 * SMBs NegProt, SessSetup, uLogoff do not have tcon yet so check for
@@ -136,51 +149,23 @@ cifs_reconnect_tcon(struct cifs_tcon *tcon, int smb_command)
 	 * only tree disconnect, open, and write, (and ulogoff which does not
 	 * have tcon) are allowed as we start force umount
 	 */
-	if (tcon->tidStatus == CifsExiting) {
+	spin_lock(&tcon->tc_lock);
+	if (tcon->status == TID_EXITING) {
 		if (smb_command != SMB_COM_WRITE_ANDX &&
 		    smb_command != SMB_COM_OPEN_ANDX &&
 		    smb_command != SMB_COM_TREE_DISCONNECT) {
+			spin_unlock(&tcon->tc_lock);
 			cifs_dbg(FYI, "can not send cmd %d while umounting\n",
 				 smb_command);
 			return -ENODEV;
 		}
 	}
+	spin_unlock(&tcon->tc_lock);
 
-	retries = server->nr_targets;
-
-	/*
-	 * Give demultiplex thread up to 10 seconds to each target available for
-	 * reconnect -- should be greater than cifs socket timeout which is 7
-	 * seconds.
-	 */
-	while (server->tcpStatus == CifsNeedReconnect) {
-		rc = wait_event_interruptible_timeout(server->response_q,
-						      (server->tcpStatus != CifsNeedReconnect),
-						      10 * HZ);
-		if (rc < 0) {
-			cifs_dbg(FYI, "%s: aborting reconnect due to a received signal by the process\n",
-				 __func__);
-			return -ERESTARTSYS;
-		}
-
-		/* are we still trying to reconnect? */
-		if (server->tcpStatus != CifsNeedReconnect)
-			break;
-
-		if (retries && --retries)
-			continue;
-
-		/*
-		 * on "soft" mounts we wait once. Hard mounts keep
-		 * retrying until process is killed or server comes
-		 * back on-line
-		 */
-		if (!tcon->retry) {
-			cifs_dbg(FYI, "gave up waiting on reconnect in smb_init\n");
-			return -EHOSTDOWN;
-		}
-		retries = server->nr_targets;
-	}
+again:
+	rc = cifs_wait_for_server_reconnect(server, tcon->retry);
+	if (rc)
+		return rc;
 
 	spin_lock(&ses->chan_lock);
 	if (!cifs_chan_needs_reconnect(ses, server) && !tcon->need_reconnect) {
@@ -189,42 +174,46 @@ cifs_reconnect_tcon(struct cifs_tcon *tcon, int smb_command)
 	}
 	spin_unlock(&ses->chan_lock);
 
+	mutex_lock(&ses->session_mutex);
+	/*
+	 * Recheck after acquire mutex. If another thread is negotiating
+	 * and the server never sends an answer the socket will be closed
+	 * and tcpStatus set to reconnect.
+	 */
+	spin_lock(&server->srv_lock);
+	if (server->tcpStatus == CifsNeedReconnect) {
+		spin_unlock(&server->srv_lock);
+		mutex_unlock(&ses->session_mutex);
+
+		if (tcon->retry)
+			goto again;
+		rc = -EHOSTDOWN;
+		goto out;
+	}
+	spin_unlock(&server->srv_lock);
+
 	nls_codepage = load_nls_default();
 
 	/*
 	 * need to prevent multiple threads trying to simultaneously
 	 * reconnect the same SMB session
 	 */
-	mutex_lock(&ses->session_mutex);
-
-	/*
-	 * Recheck after acquire mutex. If another thread is negotiating
-	 * and the server never sends an answer the socket will be closed
-	 * and tcpStatus set to reconnect.
-	 */
-	if (server->tcpStatus == CifsNeedReconnect) {
-		rc = -EHOSTDOWN;
-		mutex_unlock(&ses->session_mutex);
-		goto out;
-	}
-
-	/*
-	 * need to prevent multiple threads trying to simultaneously
-	 * reconnect the same SMB session
-	 */
+	spin_lock(&ses->ses_lock);
 	spin_lock(&ses->chan_lock);
-	if (!cifs_chan_needs_reconnect(ses, server)) {
+	if (!cifs_chan_needs_reconnect(ses, server) &&
+	    ses->ses_status == SES_GOOD) {
 		spin_unlock(&ses->chan_lock);
+		spin_unlock(&ses->ses_lock);
 
 		/* this means that we only need to tree connect */
 		if (tcon->need_reconnect)
 			goto skip_sess_setup;
 
-		rc = -EHOSTDOWN;
 		mutex_unlock(&ses->session_mutex);
 		goto out;
 	}
 	spin_unlock(&ses->chan_lock);
+	spin_unlock(&ses->ses_lock);
 
 	rc = cifs_negotiate_protocol(0, ses, server);
 	if (!rc)
@@ -1539,7 +1528,7 @@ cifs_readv_receive(struct TCP_Server_Info *server, struct mid_q_entry *mid)
 
 	if (server->ops->is_session_expired &&
 	    server->ops->is_session_expired(buf)) {
-		cifs_reconnect(server);
+		cifs_reconnect(server, true);
 		return -1;
 	}
 

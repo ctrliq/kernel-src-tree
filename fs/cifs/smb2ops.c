@@ -133,9 +133,13 @@ smb2_add_credits(struct TCP_Server_Info *server,
 			 optype, scredits, add);
 	}
 
+	spin_lock(&server->srv_lock);
 	if (server->tcpStatus == CifsNeedReconnect
-	    || server->tcpStatus == CifsExiting)
+	    || server->tcpStatus == CifsExiting) {
+		spin_unlock(&server->srv_lock);
 		return;
+	}
+	spin_unlock(&server->srv_lock);
 
 	switch (rc) {
 	case -1:
@@ -210,6 +214,16 @@ smb2_wait_mtu_credits(struct TCP_Server_Info *server, unsigned int size,
 
 	spin_lock(&server->req_lock);
 	while (1) {
+		spin_unlock(&server->req_lock);
+
+		spin_lock(&server->srv_lock);
+		if (server->tcpStatus == CifsExiting) {
+			spin_unlock(&server->srv_lock);
+			return -ENOENT;
+		}
+		spin_unlock(&server->srv_lock);
+
+		spin_lock(&server->req_lock);
 		if (server->credits <= 0) {
 			spin_unlock(&server->req_lock);
 			cifs_num_waiters_inc(server);
@@ -220,11 +234,6 @@ smb2_wait_mtu_credits(struct TCP_Server_Info *server, unsigned int size,
 				return rc;
 			spin_lock(&server->req_lock);
 		} else {
-			if (server->tcpStatus == CifsExiting) {
-				spin_unlock(&server->req_lock);
-				return -ENOENT;
-			}
-
 			scredits = server->credits;
 			/* can deadlock with reopen */
 			if (scredits <= 8) {
@@ -318,19 +327,19 @@ smb2_get_next_mid(struct TCP_Server_Info *server)
 {
 	__u64 mid;
 	/* for SMB2 we need the current value */
-	spin_lock(&GlobalMid_Lock);
+	spin_lock(&server->mid_lock);
 	mid = server->CurrentMid++;
-	spin_unlock(&GlobalMid_Lock);
+	spin_unlock(&server->mid_lock);
 	return mid;
 }
 
 static void
 smb2_revert_current_mid(struct TCP_Server_Info *server, const unsigned int val)
 {
-	spin_lock(&GlobalMid_Lock);
+	spin_lock(&server->mid_lock);
 	if (server->CurrentMid >= val)
 		server->CurrentMid -= val;
-	spin_unlock(&GlobalMid_Lock);
+	spin_unlock(&server->mid_lock);
 }
 
 static struct mid_q_entry *
@@ -345,7 +354,7 @@ __smb2_find_mid(struct TCP_Server_Info *server, char *buf, bool dequeue)
 		return NULL;
 	}
 
-	spin_lock(&GlobalMid_Lock);
+	spin_lock(&server->mid_lock);
 	list_for_each_entry(mid, &server->pending_mid_q, qhead) {
 		if ((mid->mid == wire_mid) &&
 		    (mid->mid_state == MID_REQUEST_SUBMITTED) &&
@@ -355,11 +364,11 @@ __smb2_find_mid(struct TCP_Server_Info *server, char *buf, bool dequeue)
 				list_del_init(&mid->qhead);
 				mid->mid_flags |= MID_DELETED;
 			}
-			spin_unlock(&GlobalMid_Lock);
+			spin_unlock(&server->mid_lock);
 			return mid;
 		}
 	}
-	spin_unlock(&GlobalMid_Lock);
+	spin_unlock(&server->mid_lock);
 	return NULL;
 }
 
@@ -386,7 +395,7 @@ smb2_dump_detail(void *buf, struct TCP_Server_Info *server)
 		 shdr->Id.SyncId.ProcessId);
 	if (!server->ops->check_message(buf, server->total_read, server)) {
 		cifs_server_dbg(VFS, "smb buf %p len %u\n", buf,
-				server->ops->calc_smb_size(buf, server));
+				server->ops->calc_smb_size(buf));
 	}
 #endif
 }
@@ -404,9 +413,9 @@ smb2_negotiate(const unsigned int xid,
 {
 	int rc;
 
-	spin_lock(&GlobalMid_Lock);
+	spin_lock(&server->mid_lock);
 	server->CurrentMid = 0;
-	spin_unlock(&GlobalMid_Lock);
+	spin_unlock(&server->mid_lock);
 	rc = SMB2_negotiate(xid, ses, server);
 	/* BB we probably don't need to retry with modern servers */
 	if (rc == -EAGAIN)
@@ -559,6 +568,7 @@ parse_server_interfaces(struct network_interface_info_ioctl_rsp *buf,
 				 "Empty network interface list returned by server %s\n",
 				 ses->server->hostname);
 		rc = -EINVAL;
+		ses->iface_last_update = jiffies;
 		goto out;
 	}
 
@@ -658,7 +668,6 @@ parse_server_interfaces(struct network_interface_info_ioctl_rsp *buf,
 
 		ses->iface_count++;
 		spin_unlock(&ses->iface_lock);
-		ses->iface_last_update = jiffies;
 next_iface:
 		nb_iface++;
 		next = le32_to_cpu(p->Next);
@@ -686,6 +695,8 @@ next_iface:
 		goto out;
 	}
 
+	ses->iface_last_update = jiffies;
+
 out:
 	/*
 	 * Go through the list again and put the inactive entries
@@ -711,6 +722,7 @@ SMB3_request_interfaces(const unsigned int xid, struct cifs_tcon *tcon, bool in_
 	unsigned int ret_data_len = 0;
 	struct network_interface_info_ioctl_rsp *out_buf = NULL;
 	struct cifs_ses *ses = tcon->ses;
+	struct TCP_Server_Info *pserver;
 
 	/* do not query too frequently */
 	if (ses->iface_last_update &&
@@ -734,6 +746,16 @@ SMB3_request_interfaces(const unsigned int xid, struct cifs_tcon *tcon, bool in_
 	rc = parse_server_interfaces(out_buf, ret_data_len, ses, in_mount);
 	if (rc)
 		goto out;
+
+	/* check if iface is still active */
+	spin_lock(&ses->chan_lock);
+	pserver = ses->chans[0].server;
+	if (pserver && !cifs_chan_is_iface_active(ses, pserver)) {
+		spin_unlock(&ses->chan_lock);
+		cifs_chan_update_iface(ses, pserver);
+		spin_lock(&ses->chan_lock);
+	}
+	spin_unlock(&ses->chan_lock);
 
 out:
 	kfree(out_buf);
@@ -2558,7 +2580,9 @@ smb2_is_network_name_deleted(char *buf, struct TCP_Server_Info *server)
 	list_for_each_entry(ses, &pserver->smb_ses_list, smb_ses_list) {
 		list_for_each_entry(tcon, &ses->tcon_list, tcon_list) {
 			if (tcon->tid == le32_to_cpu(shdr->Id.SyncId.TreeId)) {
+				spin_lock(&tcon->tc_lock);
 				tcon->need_reconnect = true;
+				spin_unlock(&tcon->tc_lock);
 				spin_unlock(&cifs_tcp_ses_lock);
 				pr_warn_once("Server share %s deleted.\n",
 					     tcon->treeName);
@@ -4435,19 +4459,23 @@ static void *smb2_get_aead_req(struct crypto_aead *tfm, const struct smb_rqst *r
 static int
 smb2_get_enc_key(struct TCP_Server_Info *server, __u64 ses_id, int enc, u8 *key)
 {
+	struct TCP_Server_Info *pserver;
 	struct cifs_ses *ses;
 	u8 *ses_enc_key;
 
+	/* If server is a channel, select the primary channel */
+	pserver = CIFS_SERVER_IS_CHAN(server) ? server->primary_server : server;
+
 	spin_lock(&cifs_tcp_ses_lock);
-	list_for_each_entry(server, &cifs_tcp_ses_list, tcp_ses_list) {
-		list_for_each_entry(ses, &server->smb_ses_list, smb_ses_list) {
-			if (ses->Suid == ses_id) {
-				ses_enc_key = enc ? ses->smb3encryptionkey :
-					ses->smb3decryptionkey;
-				memcpy(key, ses_enc_key, SMB3_ENC_DEC_KEY_SIZE);
-				spin_unlock(&cifs_tcp_ses_lock);
-				return 0;
-			}
+	list_for_each_entry(ses, &pserver->smb_ses_list, smb_ses_list) {
+		if (ses->Suid == ses_id) {
+			spin_lock(&ses->ses_lock);
+			ses_enc_key = enc ? ses->smb3encryptionkey :
+				ses->smb3decryptionkey;
+			memcpy(key, ses_enc_key, SMB3_ENC_DEC_KEY_SIZE);
+			spin_unlock(&ses->ses_lock);
+			spin_unlock(&cifs_tcp_ses_lock);
+			return 0;
 		}
 	}
 	spin_unlock(&cifs_tcp_ses_lock);
@@ -4766,7 +4794,7 @@ handle_read_data(struct TCP_Server_Info *server, struct mid_q_entry *mid,
 	if (server->ops->is_session_expired &&
 	    server->ops->is_session_expired(buf)) {
 		if (!is_offloaded)
-			cifs_reconnect(server);
+			cifs_reconnect(server, true);
 		return -1;
 	}
 
@@ -4939,17 +4967,21 @@ static void smb2_decrypt_offload(struct work_struct *work)
 
 			mid->callback(mid);
 		} else {
-			spin_lock(&GlobalMid_Lock);
+			spin_lock(&dw->server->srv_lock);
 			if (dw->server->tcpStatus == CifsNeedReconnect) {
+				spin_lock(&dw->server->mid_lock);
 				mid->mid_state = MID_RETRY_NEEDED;
-				spin_unlock(&GlobalMid_Lock);
+				spin_unlock(&dw->server->mid_lock);
+				spin_unlock(&dw->server->srv_lock);
 				mid->callback(mid);
 			} else {
+				spin_lock(&dw->server->mid_lock);
 				mid->mid_state = MID_REQUEST_SUBMITTED;
 				mid->mid_flags &= ~(MID_DELETED);
 				list_add_tail(&mid->qhead,
 					&dw->server->pending_mid_q);
-				spin_unlock(&GlobalMid_Lock);
+				spin_unlock(&dw->server->mid_lock);
+				spin_unlock(&dw->server->srv_lock);
 			}
 		}
 		release_mid(mid);
@@ -5181,13 +5213,13 @@ smb3_receive_transform(struct TCP_Server_Info *server,
 						sizeof(struct smb2_hdr)) {
 		cifs_server_dbg(VFS, "Transform message is too small (%u)\n",
 			 pdu_length);
-		cifs_reconnect(server);
+		cifs_reconnect(server, true);
 		return -ECONNABORTED;
 	}
 
 	if (pdu_length < orig_len + sizeof(struct smb2_transform_hdr)) {
 		cifs_server_dbg(VFS, "Transform message is broken\n");
-		cifs_reconnect(server);
+		cifs_reconnect(server, true);
 		return -ECONNABORTED;
 	}
 

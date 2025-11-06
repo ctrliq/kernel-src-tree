@@ -69,7 +69,8 @@ sesInfoAlloc(void)
 	ret_buf = kzalloc(sizeof(struct cifs_ses), GFP_KERNEL);
 	if (ret_buf) {
 		atomic_inc(&sesInfoAllocCount);
-		ret_buf->status = CifsNew;
+		spin_lock_init(&ret_buf->ses_lock);
+		ret_buf->ses_status = SES_NEW;
 		++ret_buf->ses_count;
 		INIT_LIST_HEAD(&ret_buf->smb_ses_list);
 		INIT_LIST_HEAD(&ret_buf->tcon_list);
@@ -122,8 +123,9 @@ tconInfoAlloc(void)
 	}
 
 	atomic_inc(&tconInfoAllocCount);
-	ret_buf->tidStatus = CifsNew;
+	ret_buf->status = TID_NEW;
 	++ret_buf->tc_count;
+	spin_lock_init(&ret_buf->tc_lock);
 	INIT_LIST_HEAD(&ret_buf->openFileList);
 	INIT_LIST_HEAD(&ret_buf->tcon_list);
 	spin_lock_init(&ret_buf->open_file_lock);
@@ -356,7 +358,7 @@ checkSMB(char *buf, unsigned int total_read, struct TCP_Server_Info *server)
 	/* otherwise, there is enough to get to the BCC */
 	if (check_smb_hdr(smb))
 		return -EIO;
-	clc_len = smbCalcSize(smb, server);
+	clc_len = smbCalcSize(smb);
 
 	if (4 + rfclen != total_read) {
 		cifs_dbg(VFS, "Length read does not match RFC1001 length %d\n",
@@ -1130,8 +1132,10 @@ int match_target_ip(struct TCP_Server_Info *server,
 		goto out;
 	}
 
+	spin_lock(&server->srv_lock);
 	*result = cifs_match_ipaddr((struct sockaddr *)&server->dstaddr,
 				    &tipaddr);
+	spin_unlock(&server->srv_lock);
 	cifs_dbg(FYI, "%s: ip addresses match: %u\n", __func__, *result);
 	rc = 0;
 
@@ -1159,3 +1163,47 @@ int cifs_update_super_prepath(struct cifs_sb_info *cifs_sb, char *prefix)
 	return 0;
 }
 #endif
+
+int cifs_wait_for_server_reconnect(struct TCP_Server_Info *server, bool retry)
+{
+	int timeout = 10;
+	int rc;
+
+	spin_lock(&server->srv_lock);
+	if (server->tcpStatus != CifsNeedReconnect) {
+		spin_unlock(&server->srv_lock);
+		return 0;
+	}
+	timeout *= server->nr_targets;
+	spin_unlock(&server->srv_lock);
+
+	/*
+	 * Give demultiplex thread up to 10 seconds to each target available for
+	 * reconnect -- should be greater than cifs socket timeout which is 7
+	 * seconds.
+	 *
+	 * On "soft" mounts we wait once. Hard mounts keep retrying until
+	 * process is killed or server comes back on-line.
+	 */
+	do {
+		rc = wait_event_interruptible_timeout(server->response_q,
+						      (server->tcpStatus != CifsNeedReconnect),
+						      timeout * HZ);
+		if (rc < 0) {
+			cifs_dbg(FYI, "%s: aborting reconnect due to received signal\n",
+				 __func__);
+			return -ERESTARTSYS;
+		}
+
+		/* are we still trying to reconnect? */
+		spin_lock(&server->srv_lock);
+		if (server->tcpStatus != CifsNeedReconnect) {
+			spin_unlock(&server->srv_lock);
+			return 0;
+		}
+		spin_unlock(&server->srv_lock);
+	} while (retry);
+
+	cifs_dbg(FYI, "%s: gave up waiting on reconnect\n", __func__);
+	return -EHOSTDOWN;
+}
