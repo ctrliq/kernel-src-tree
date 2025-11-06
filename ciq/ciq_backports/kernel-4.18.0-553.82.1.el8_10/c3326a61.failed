@@ -1,0 +1,127 @@
+cifs: reconnect helper should set reconnect for the right channel
+
+jira LE-4669
+Rebuild_History Non-Buildable kernel-4.18.0-553.82.1.el8_10
+commit-author Shyam Prasad N <sprasad@microsoft.com>
+commit c3326a61cdbf3ce1273d9198b6cbf90965d7e029
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.82.1.el8_10/c3326a61.failed
+
+We introduced a helper function to be used by non-cifsd threads to
+mark the connection for reconnect. For multichannel, when only
+a particular channel needs to be reconnected, this had a bug.
+
+This change fixes that by marking that particular channel
+for reconnect.
+
+Fixes: dca65818c80c ("cifs: use a different reconnect helper for non-cifsd threads")
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Shyam Prasad N <sprasad@microsoft.com>
+	Reviewed-by: Paulo Alcantara (SUSE) <pc@manguebit.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit c3326a61cdbf3ce1273d9198b6cbf90965d7e029)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/connect.c
+diff --cc fs/cifs/connect.c
+index ca2926c7b59e,a7147fa55c0c..000000000000
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@@ -164,45 -140,66 +164,55 @@@ static void smb2_query_server_interface
+  			   (SMB_INTERFACE_POLL_INTERVAL * HZ));
+  }
+  
+ -/*
+ - * Update the tcpStatus for the server.
+ - * This is used to signal the cifsd thread to call cifs_reconnect
+ - * ONLY cifsd thread should call cifs_reconnect. For any other
+ - * thread, use this function
+ - *
+ - * @server: the tcp ses for which reconnect is needed
+ - * @all_channels: if this needs to be done for all channels
+ - */
+ -void
+ -cifs_signal_cifsd_for_reconnect(struct TCP_Server_Info *server,
+ -				bool all_channels)
+ +static void cifs_resolve_server(struct work_struct *work)
+  {
+ -	struct TCP_Server_Info *pserver;
+ -	struct cifs_ses *ses;
+ -	int i;
+ +	int rc;
+ +	struct TCP_Server_Info *server = container_of(work,
+ +					struct TCP_Server_Info, resolve.work);
+  
+ -	/* If server is a channel, select the primary channel */
+ -	pserver = SERVER_IS_CHAN(server) ? server->primary_server : server;
+ +	mutex_lock(&server->srv_mutex);
+  
+++<<<<<<< HEAD:fs/cifs/connect.c
+ +	/*
+ +	 * Resolve the hostname again to make sure that IP address is up-to-date.
+ +	 */
+ +	rc = reconn_set_ipaddr_from_hostname(server);
+ +	if (rc) {
+ +		cifs_dbg(FYI, "%s: failed to resolve hostname: %d\n",
+ +				__func__, rc);
+++=======
++ 	/* if we need to signal just this channel */
++ 	if (!all_channels) {
++ 		spin_lock(&server->srv_lock);
++ 		if (server->tcpStatus != CifsExiting)
++ 			server->tcpStatus = CifsNeedReconnect;
++ 		spin_unlock(&server->srv_lock);
++ 		return;
+++>>>>>>> c3326a61cdbf (cifs: reconnect helper should set reconnect for the right channel):fs/smb/client/connect.c
+  	}
+  
+ -	spin_lock(&cifs_tcp_ses_lock);
+ -	list_for_each_entry(ses, &pserver->smb_ses_list, smb_ses_list) {
+ -		spin_lock(&ses->chan_lock);
+ -		for (i = 0; i < ses->chan_count; i++) {
+ -			spin_lock(&ses->chans[i].server->srv_lock);
+ -			ses->chans[i].server->tcpStatus = CifsNeedReconnect;
+ -			spin_unlock(&ses->chans[i].server->srv_lock);
+ -		}
+ -		spin_unlock(&ses->chan_lock);
+ -	}
+ -	spin_unlock(&cifs_tcp_ses_lock);
+ +	mutex_unlock(&server->srv_mutex);
+  }
+  
+ -/*
+ +/**
+   * Mark all sessions and tcons for reconnect.
+ - * IMPORTANT: make sure that this gets called only from
+ - * cifsd thread. For any other thread, use
+ - * cifs_signal_cifsd_for_reconnect
+   *
+ - * @server: the tcp ses for which reconnect is needed
+   * @server needs to be previously set to CifsNeedReconnect.
+ - * @mark_smb_session: whether even sessions need to be marked
+   */
+ -void
+ -cifs_mark_tcp_ses_conns_for_reconnect(struct TCP_Server_Info *server,
+ -				      bool mark_smb_session)
+ +static void cifs_mark_tcp_ses_conns_for_reconnect(struct TCP_Server_Info *server)
+  {
+ -	struct TCP_Server_Info *pserver;
+ -	struct cifs_ses *ses, *nses;
+ +	unsigned int num_sessions = 0;
+ +	struct cifs_ses *ses;
+  	struct cifs_tcon *tcon;
+ +	struct mid_q_entry *mid, *nmid;
+ +	struct list_head retry_list;
+ +	struct TCP_Server_Info *pserver;
+ +
+ +	server->maxBuf = 0;
+ +	server->max_read = 0;
+  
+ +	cifs_dbg(FYI, "Mark tcp session as need reconnect\n");
+ +	trace_smb3_reconnect(server->CurrentMid, server->conn_id, server->hostname);
+  	/*
+  	 * before reconnecting the tcp session, mark the smb session (uid) and the tid bad so they
+  	 * are not used until reconnected.
+* Unmerged path fs/cifs/connect.c
