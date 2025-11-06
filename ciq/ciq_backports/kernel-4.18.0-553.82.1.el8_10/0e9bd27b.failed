@@ -1,0 +1,269 @@
+cifs: get rid of dns resolve worker
+
+jira LE-4669
+Rebuild_History Non-Buildable kernel-4.18.0-553.82.1.el8_10
+commit-author Paulo Alcantara <pc@manguebit.com>
+commit 0e9bd27b2a635d54665fcc1d6398a5f6aeb6b0cb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.82.1.el8_10/0e9bd27b.failed
+
+We already upcall to resolve hostnames during reconnect by calling
+reconn_set_ipaddr_from_hostname(), so there is no point in having a
+worker to periodically call it.
+
+	Signed-off-by: Paulo Alcantara (SUSE) <pc@manguebit.com>
+	Reviewed-by <lsahlber@redhat.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 0e9bd27b2a635d54665fcc1d6398a5f6aeb6b0cb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/connect.c
+#	fs/cifs/sess.c
+diff --cc fs/cifs/connect.c
+index 6d6e98007d5e,150666e143ce..000000000000
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@@ -89,9 -77,8 +89,14 @@@ static int reconn_set_ipaddr_from_hostn
+  {
+  	int rc;
+  	int len;
+++<<<<<<< HEAD
+ +	char *unc, *ipaddr = NULL;
+ +	time64_t expiry, now;
+ +	unsigned long ttl = SMB_DNS_RESOLVE_INTERVAL_DEFAULT;
+++=======
++ 	char *unc;
++ 	struct sockaddr_storage ss;
+++>>>>>>> 0e9bd27b2a63 (cifs: get rid of dns resolve worker)
+  
+  	if (!server->hostname)
+  		return -EINVAL;
+@@@ -109,38 -96,23 +114,53 @@@
+  	}
+  	scnprintf(unc, len, "\\\\%s", server->hostname);
+  
+++<<<<<<< HEAD
+ +	rc = dns_resolve_server_name_to_ip(unc, &ipaddr, &expiry);
+++=======
++ 	spin_lock(&server->srv_lock);
++ 	ss = server->dstaddr;
++ 	spin_unlock(&server->srv_lock);
++ 
++ 	rc = dns_resolve_server_name_to_ip(unc, (struct sockaddr *)&ss, NULL);
+++>>>>>>> 0e9bd27b2a63 (cifs: get rid of dns resolve worker)
+  	kfree(unc);
+  
+  	if (rc < 0) {
+  		cifs_dbg(FYI, "%s: failed to resolve server part of %s to IP: %d\n",
+  			 __func__, server->hostname, rc);
+- 		goto requeue_resolve;
++ 	} else {
++ 		spin_lock(&server->srv_lock);
++ 		memcpy(&server->dstaddr, &ss, sizeof(server->dstaddr));
++ 		spin_unlock(&server->srv_lock);
++ 		rc = 0;
+  	}
+  
+++<<<<<<< HEAD
+ +	spin_lock(&cifs_tcp_ses_lock);
+ +	rc = cifs_convert_address((struct sockaddr *)&server->dstaddr, ipaddr,
+ +				  strlen(ipaddr));
+ +	spin_unlock(&cifs_tcp_ses_lock);
+ +	kfree(ipaddr);
+ +
+ +	/* rc == 1 means success here */
+ +	if (rc) {
+ +		now = ktime_get_real_seconds();
+ +		if (expiry && expiry > now)
+ +			/*
+ +			 * To make sure we don't use the cached entry, retry 1s
+ +			 * after expiry.
+ +			 */
+ +			ttl = max_t(unsigned long, expiry - now, SMB_DNS_RESOLVE_INTERVAL_MIN) + 1;
+ +	}
+ +	rc = !rc ? -1 : 0;
+ +
+ +requeue_resolve:
+ +	cifs_dbg(FYI, "%s: next dns resolution scheduled for %lu seconds in the future\n",
+ +		 __func__, ttl);
+ +	mod_delayed_work(cifsiod_wq, &server->resolve, (ttl * HZ));
+ +
+++=======
+++>>>>>>> 0e9bd27b2a63 (cifs: get rid of dns resolve worker)
+  	return rc;
+  }
+  
+@@@ -164,45 -136,65 +184,90 @@@ static void smb2_query_server_interface
+  			   (SMB_INTERFACE_POLL_INTERVAL * HZ));
+  }
+  
+++<<<<<<< HEAD
+ +static void cifs_resolve_server(struct work_struct *work)
+ +{
+ +	int rc;
+ +	struct TCP_Server_Info *server = container_of(work,
+ +					struct TCP_Server_Info, resolve.work);
+ +
+ +	mutex_lock(&server->srv_mutex);
+ +
+ +	/*
+ +	 * Resolve the hostname again to make sure that IP address is up-to-date.
+ +	 */
+ +	rc = reconn_set_ipaddr_from_hostname(server);
+ +	if (rc) {
+ +		cifs_dbg(FYI, "%s: failed to resolve hostname: %d\n",
+ +				__func__, rc);
+ +	}
+ +
+ +	mutex_unlock(&server->srv_mutex);
+ +}
+ +
+ +/**
+++=======
++ /*
++  * Update the tcpStatus for the server.
++  * This is used to signal the cifsd thread to call cifs_reconnect
++  * ONLY cifsd thread should call cifs_reconnect. For any other
++  * thread, use this function
++  *
++  * @server: the tcp ses for which reconnect is needed
++  * @all_channels: if this needs to be done for all channels
++  */
++ void
++ cifs_signal_cifsd_for_reconnect(struct TCP_Server_Info *server,
++ 				bool all_channels)
++ {
++ 	struct TCP_Server_Info *pserver;
++ 	struct cifs_ses *ses;
++ 	int i;
++ 
++ 	/* If server is a channel, select the primary channel */
++ 	pserver = CIFS_SERVER_IS_CHAN(server) ? server->primary_server : server;
++ 
++ 	spin_lock(&pserver->srv_lock);
++ 	if (!all_channels) {
++ 		pserver->tcpStatus = CifsNeedReconnect;
++ 		spin_unlock(&pserver->srv_lock);
++ 		return;
++ 	}
++ 	spin_unlock(&pserver->srv_lock);
++ 
++ 	spin_lock(&cifs_tcp_ses_lock);
++ 	list_for_each_entry(ses, &pserver->smb_ses_list, smb_ses_list) {
++ 		spin_lock(&ses->chan_lock);
++ 		for (i = 0; i < ses->chan_count; i++) {
++ 			spin_lock(&ses->chans[i].server->srv_lock);
++ 			ses->chans[i].server->tcpStatus = CifsNeedReconnect;
++ 			spin_unlock(&ses->chans[i].server->srv_lock);
++ 		}
++ 		spin_unlock(&ses->chan_lock);
++ 	}
++ 	spin_unlock(&cifs_tcp_ses_lock);
++ }
++ 
++ /*
+++>>>>>>> 0e9bd27b2a63 (cifs: get rid of dns resolve worker)
+   * Mark all sessions and tcons for reconnect.
+ - * IMPORTANT: make sure that this gets called only from
+ - * cifsd thread. For any other thread, use
+ - * cifs_signal_cifsd_for_reconnect
+   *
+ - * @server: the tcp ses for which reconnect is needed
+   * @server needs to be previously set to CifsNeedReconnect.
+ - * @mark_smb_session: whether even sessions need to be marked
+   */
+ -void
+ -cifs_mark_tcp_ses_conns_for_reconnect(struct TCP_Server_Info *server,
+ -				      bool mark_smb_session)
+ +static void cifs_mark_tcp_ses_conns_for_reconnect(struct TCP_Server_Info *server)
+  {
+ -	struct TCP_Server_Info *pserver;
+ -	struct cifs_ses *ses, *nses;
+ +	unsigned int num_sessions = 0;
+ +	struct cifs_ses *ses;
+  	struct cifs_tcon *tcon;
+ +	struct mid_q_entry *mid, *nmid;
+ +	struct list_head retry_list;
+ +	struct TCP_Server_Info *pserver;
+ +
+ +	server->maxBuf = 0;
+ +	server->max_read = 0;
+  
+ +	cifs_dbg(FYI, "Mark tcp session as need reconnect\n");
+ +	trace_smb3_reconnect(server->CurrentMid, server->conn_id, server->hostname);
+  	/*
+  	 * before reconnecting the tcp session, mark the smb session (uid) and the tid bad so they
+  	 * are not used until reconnected.
+@@@ -818,16 -888,15 +883,15 @@@ static void clean_demultiplex_info(stru
+  	int length;
+  
+  	/* take it off the list, if it's not already */
+ -	spin_lock(&server->srv_lock);
+ +	spin_lock(&cifs_tcp_ses_lock);
+  	list_del_init(&server->tcp_ses_list);
+ -	spin_unlock(&server->srv_lock);
+ +	spin_unlock(&cifs_tcp_ses_lock);
+  
+  	cancel_delayed_work_sync(&server->echo);
+- 	cancel_delayed_work_sync(&server->resolve);
+  
+ -	spin_lock(&server->srv_lock);
+ +	spin_lock(&GlobalMid_Lock);
+  	server->tcpStatus = CifsExiting;
+ -	spin_unlock(&server->srv_lock);
+ +	spin_unlock(&GlobalMid_Lock);
+  	wake_up_all(&server->response_q);
+  
+  	/* check if we have blocked requests that need to free */
+diff --cc fs/cifs/sess.c
+index 6c40b80edd52,d2cbae4b5d21..000000000000
+--- a/fs/cifs/sess.c
++++ b/fs/cifs/sess.c
+@@@ -429,8 -471,17 +429,18 @@@ cifs_ses_add_channel(struct cifs_sb_inf
+  	if (!rc)
+  		rc = cifs_setup_session(xid, ses, chan->server, cifs_sb->local_nls);
+  
+ -	mutex_unlock(&ses->session_mutex);
+ -
+  out:
+  	if (rc && chan->server) {
+++<<<<<<< HEAD
+++=======
++ 		/*
++ 		 * we should avoid race with these delayed works before we
++ 		 * remove this channel
++ 		 */
++ 		cancel_delayed_work_sync(&chan->server->echo);
++ 		cancel_delayed_work_sync(&chan->server->reconnect);
++ 
+++>>>>>>> 0e9bd27b2a63 (cifs: get rid of dns resolve worker)
+  		spin_lock(&ses->chan_lock);
+  		/* we rely on all bits beyond chan_count to be clear */
+  		cifs_chan_clear_need_reconnect(ses, chan->server);
+diff --git a/fs/cifs/cifsglob.h b/fs/cifs/cifsglob.h
+index 9e7f8c48e52c..ac8557ce3ab7 100644
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@ -78,10 +78,6 @@
+ #define SMB_ECHO_INTERVAL_MAX 600
+ #define SMB_ECHO_INTERVAL_DEFAULT 60
+ 
+-/* dns resolution intervals in seconds */
+-#define SMB_DNS_RESOLVE_INTERVAL_MIN     120
+-#define SMB_DNS_RESOLVE_INTERVAL_DEFAULT 600
+-
+ /* smb multichannel query server interfaces interval in seconds */
+ #define SMB_INTERFACE_POLL_INTERVAL	600
+ 
+@@ -663,7 +659,6 @@ struct TCP_Server_Info {
+ 	/* point to the SMBD connection if RDMA is used instead of socket */
+ 	struct smbd_connection *smbd_conn;
+ 	struct delayed_work	echo; /* echo ping workqueue job */
+-	struct delayed_work	resolve; /* dns resolution workqueue job */
+ 	char	*smallbuf;	/* pointer to current "small" buffer */
+ 	char	*bigbuf;	/* pointer to current "big" buffer */
+ 	/* Total size of this PDU. Only valid from cifs_demultiplex_thread */
+* Unmerged path fs/cifs/connect.c
+* Unmerged path fs/cifs/sess.c
