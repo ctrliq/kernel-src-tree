@@ -1,0 +1,675 @@
+cifs: take cifs_tcp_ses_lock for status checks
+
+jira LE-4669
+Rebuild_History Non-Buildable kernel-4.18.0-553.82.1.el8_10
+commit-author Shyam Prasad N <sprasad@microsoft.com>
+commit 080dc5e5656c1cc1cdefb501b9b645a07519f763
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.82.1.el8_10/080dc5e5.failed
+
+While checking/updating status for tcp ses, smb ses or tcon,
+we take GlobalMid_Lock. This doesn't make any sense.
+Replaced it with cifs_tcp_ses_lock.
+
+Ideally, we should take a spin lock per struct.
+But since tcp ses, smb ses and tcon objects won't add up to a lot,
+I think there should not be too much contention.
+
+Also, in few other places, these are checked without locking.
+Added locking for these.
+
+	Signed-off-by: Shyam Prasad N <sprasad@microsoft.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 080dc5e5656c1cc1cdefb501b9b645a07519f763)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/connect.c
+diff --cc fs/cifs/connect.c
+index aa59bbf815c2,815f629933de..000000000000
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@@ -564,11 -579,13 +568,13 @@@ server_unresponsive(struct TCP_Server_I
+  	    server->tcpStatus == CifsNeedNegotiate) &&
+  	    (!server->ops->can_echo || server->ops->can_echo(server)) &&
+  	    time_after(jiffies, server->lstrp + 3 * server->echo_interval)) {
++ 		spin_unlock(&cifs_tcp_ses_lock);
+  		cifs_server_dbg(VFS, "has not responded in %lu seconds. Reconnecting...\n",
+  			 (3 * server->echo_interval) / HZ);
+ -		cifs_reconnect(server, false);
+ +		cifs_reconnect(server);
+  		return true;
+  	}
++ 	spin_unlock(&cifs_tcp_ses_lock);
+  
+  	return false;
+  }
+@@@ -610,13 -630,18 +616,22 @@@ cifs_readv_from_socket(struct TCP_Serve
+  		else
+  			length = sock_recvmsg(server->ssocket, smb_msg, 0);
+  
+- 		if (server->tcpStatus == CifsExiting)
++ 		spin_lock(&cifs_tcp_ses_lock);
++ 		if (server->tcpStatus == CifsExiting) {
++ 			spin_unlock(&cifs_tcp_ses_lock);
+  			return -ESHUTDOWN;
++ 		}
+  
+  		if (server->tcpStatus == CifsNeedReconnect) {
+++<<<<<<< HEAD
+ +			cifs_reconnect(server);
+++=======
++ 			spin_unlock(&cifs_tcp_ses_lock);
++ 			cifs_reconnect(server, false);
+++>>>>>>> 080dc5e5656c (cifs: take cifs_tcp_ses_lock for status checks)
+  			return -ECONNABORTED;
+  		}
++ 		spin_unlock(&cifs_tcp_ses_lock);
+  
+  		if (length == -ERESTARTSYS ||
+  		    length == -EAGAIN ||
+diff --git a/fs/cifs/cifs_swn.c b/fs/cifs/cifs_swn.c
+index bcbaf4e25f94..41bedb3fabab 100644
+--- a/fs/cifs/cifs_swn.c
++++ b/fs/cifs/cifs_swn.c
+@@ -500,10 +500,10 @@ static int cifs_swn_reconnect(struct cifs_tcon *tcon, struct sockaddr_storage *a
+ 		goto unlock;
+ 	}
+ 
+-	spin_lock(&GlobalMid_Lock);
++	spin_lock(&cifs_tcp_ses_lock);
+ 	if (tcon->ses->server->tcpStatus != CifsExiting)
+ 		tcon->ses->server->tcpStatus = CifsNeedReconnect;
+-	spin_unlock(&GlobalMid_Lock);
++	spin_unlock(&cifs_tcp_ses_lock);
+ 
+ unlock:
+ 	mutex_unlock(&tcon->ses->server->srv_mutex);
+diff --git a/fs/cifs/cifsencrypt.c b/fs/cifs/cifsencrypt.c
+index 349d07c5d1e8..3259b0a83464 100644
+--- a/fs/cifs/cifsencrypt.c
++++ b/fs/cifs/cifsencrypt.c
+@@ -141,9 +141,13 @@ int cifs_sign_rqst(struct smb_rqst *rqst, struct TCP_Server_Info *server,
+ 	if ((cifs_pdu == NULL) || (server == NULL))
+ 		return -EINVAL;
+ 
++	spin_lock(&cifs_tcp_ses_lock);
+ 	if (!(cifs_pdu->Flags2 & SMBFLG2_SECURITY_SIGNATURE) ||
+-	    server->tcpStatus == CifsNeedNegotiate)
++	    server->tcpStatus == CifsNeedNegotiate) {
++		spin_unlock(&cifs_tcp_ses_lock);
+ 		return rc;
++	}
++	spin_unlock(&cifs_tcp_ses_lock);
+ 
+ 	if (!server->session_estab) {
+ 		memcpy(cifs_pdu->Signature.SecuritySignature, "BSRSPYL", 8);
+diff --git a/fs/cifs/cifsglob.h b/fs/cifs/cifsglob.h
+index bfe603df9494..1559c2ca6ea9 100644
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@ -590,7 +590,7 @@ struct TCP_Server_Info {
+ 	char server_RFC1001_name[RFC1001_NAME_LEN_WITH_NULL];
+ 	struct smb_version_operations	*ops;
+ 	struct smb_version_values	*vals;
+-	/* updates to tcpStatus protected by GlobalMid_Lock */
++	/* updates to tcpStatus protected by cifs_tcp_ses_lock */
+ 	enum statusEnum tcpStatus; /* what we think the status is */
+ 	char *hostname; /* hostname portion of UNC string */
+ 	struct socket *ssocket;
+@@ -929,7 +929,7 @@ struct cifs_ses {
+ 	struct mutex session_mutex;
+ 	struct TCP_Server_Info *server;	/* pointer to server info */
+ 	int ses_count;		/* reference counter */
+-	enum statusEnum status;  /* updates protected by GlobalMid_Lock */
++	enum statusEnum status;  /* updates protected by cifs_tcp_ses_lock */
+ 	unsigned overrideSecFlg;  /* if non-zero override global sec flags */
+ 	char *serverOS;		/* name of operating system underlying server */
+ 	char *serverNOS;	/* name of network operating system of server */
+diff --git a/fs/cifs/cifssmb.c b/fs/cifs/cifssmb.c
+index 141047242013..0407d6f3c7ff 100644
+--- a/fs/cifs/cifssmb.c
++++ b/fs/cifs/cifssmb.c
+@@ -136,15 +136,18 @@ cifs_reconnect_tcon(struct cifs_tcon *tcon, int smb_command)
+ 	 * only tree disconnect, open, and write, (and ulogoff which does not
+ 	 * have tcon) are allowed as we start force umount
+ 	 */
++	spin_lock(&cifs_tcp_ses_lock);
+ 	if (tcon->tidStatus == CifsExiting) {
+ 		if (smb_command != SMB_COM_WRITE_ANDX &&
+ 		    smb_command != SMB_COM_OPEN_ANDX &&
+ 		    smb_command != SMB_COM_TREE_DISCONNECT) {
++			spin_unlock(&cifs_tcp_ses_lock);
+ 			cifs_dbg(FYI, "can not send cmd %d while umounting\n",
+ 				 smb_command);
+ 			return -ENODEV;
+ 		}
+ 	}
++	spin_unlock(&cifs_tcp_ses_lock);
+ 
+ 	retries = server->nr_targets;
+ 
+@@ -164,8 +167,12 @@ cifs_reconnect_tcon(struct cifs_tcon *tcon, int smb_command)
+ 		}
+ 
+ 		/* are we still trying to reconnect? */
+-		if (server->tcpStatus != CifsNeedReconnect)
++		spin_lock(&cifs_tcp_ses_lock);
++		if (server->tcpStatus != CifsNeedReconnect) {
++			spin_unlock(&cifs_tcp_ses_lock);
+ 			break;
++		}
++		spin_unlock(&cifs_tcp_ses_lock);
+ 
+ 		if (retries && --retries)
+ 			continue;
+@@ -202,11 +209,14 @@ cifs_reconnect_tcon(struct cifs_tcon *tcon, int smb_command)
+ 	 * and the server never sends an answer the socket will be closed
+ 	 * and tcpStatus set to reconnect.
+ 	 */
++	spin_lock(&cifs_tcp_ses_lock);
+ 	if (server->tcpStatus == CifsNeedReconnect) {
++		spin_unlock(&cifs_tcp_ses_lock);
+ 		rc = -EHOSTDOWN;
+ 		mutex_unlock(&ses->session_mutex);
+ 		goto out;
+ 	}
++	spin_unlock(&cifs_tcp_ses_lock);
+ 
+ 	/*
+ 	 * need to prevent multiple threads trying to simultaneously
+* Unmerged path fs/cifs/connect.c
+diff --git a/fs/cifs/netmisc.c b/fs/cifs/netmisc.c
+index 33052a01b20e..7501d547ddd0 100644
+--- a/fs/cifs/netmisc.c
++++ b/fs/cifs/netmisc.c
+@@ -909,10 +909,10 @@ map_and_check_smb_error(struct mid_q_entry *mid, bool logErr)
+ 		if (class == ERRSRV && code == ERRbaduid) {
+ 			cifs_dbg(FYI, "Server returned 0x%x, reconnecting session...\n",
+ 				code);
+-			spin_lock(&GlobalMid_Lock);
++			spin_lock(&cifs_tcp_ses_lock);
+ 			if (mid->server->tcpStatus != CifsExiting)
+ 				mid->server->tcpStatus = CifsNeedReconnect;
+-			spin_unlock(&GlobalMid_Lock);
++			spin_unlock(&cifs_tcp_ses_lock);
+ 		}
+ 	}
+ 
+diff --git a/fs/cifs/sess.c b/fs/cifs/sess.c
+index 1b56022e96fb..50b76811c071 100644
+--- a/fs/cifs/sess.c
++++ b/fs/cifs/sess.c
+@@ -373,10 +373,10 @@ void cifs_ses_mark_for_reconnect(struct cifs_ses *ses)
+ 	int i;
+ 
+ 	for (i = 0; i < ses->chan_count; i++) {
+-		spin_lock(&GlobalMid_Lock);
++		spin_lock(&cifs_tcp_ses_lock);
+ 		if (ses->chans[i].server->tcpStatus != CifsExiting)
+ 			ses->chans[i].server->tcpStatus = CifsNeedReconnect;
+-		spin_unlock(&GlobalMid_Lock);
++		spin_unlock(&cifs_tcp_ses_lock);
+ 	}
+ }
+ 
+@@ -1056,9 +1056,9 @@ sess_establish_session(struct sess_data *sess_data)
+ 	spin_unlock(&ses->chan_lock);
+ 
+ 	/* Even if one channel is active, session is in good state */
+-	spin_lock(&GlobalMid_Lock);
++	spin_lock(&cifs_tcp_ses_lock);
+ 	ses->status = CifsGood;
+-	spin_unlock(&GlobalMid_Lock);
++	spin_unlock(&cifs_tcp_ses_lock);
+ 
+ 	return 0;
+ }
+diff --git a/fs/cifs/smb1ops.c b/fs/cifs/smb1ops.c
+index 421cc9a7fbb1..dd843b869251 100644
+--- a/fs/cifs/smb1ops.c
++++ b/fs/cifs/smb1ops.c
+@@ -175,7 +175,7 @@ cifs_get_next_mid(struct TCP_Server_Info *server)
+ {
+ 	__u64 mid = 0;
+ 	__u16 last_mid, cur_mid;
+-	bool collision;
++	bool collision, reconnect;
+ 
+ 	spin_lock(&GlobalMid_Lock);
+ 
+@@ -227,7 +227,7 @@ cifs_get_next_mid(struct TCP_Server_Info *server)
+ 		 * an eventual reconnect to clean out the pending_mid_q.
+ 		 */
+ 		if (num_mids > 32768)
+-			server->tcpStatus = CifsNeedReconnect;
++			reconnect = true;
+ 
+ 		if (!collision) {
+ 			mid = (__u64)cur_mid;
+@@ -237,6 +237,13 @@ cifs_get_next_mid(struct TCP_Server_Info *server)
+ 		cur_mid++;
+ 	}
+ 	spin_unlock(&GlobalMid_Lock);
++
++	if (reconnect) {
++		spin_lock(&cifs_tcp_ses_lock);
++		server->tcpStatus = CifsNeedReconnect;
++		spin_unlock(&cifs_tcp_ses_lock);
++	}
++
+ 	return mid;
+ }
+ 
+diff --git a/fs/cifs/smb2ops.c b/fs/cifs/smb2ops.c
+index 591bb60c97a0..35a8610bda4f 100644
+--- a/fs/cifs/smb2ops.c
++++ b/fs/cifs/smb2ops.c
+@@ -133,9 +133,13 @@ smb2_add_credits(struct TCP_Server_Info *server,
+ 			 optype, scredits, add);
+ 	}
+ 
++	spin_lock(&cifs_tcp_ses_lock);
+ 	if (server->tcpStatus == CifsNeedReconnect
+-	    || server->tcpStatus == CifsExiting)
++	    || server->tcpStatus == CifsExiting) {
++		spin_unlock(&cifs_tcp_ses_lock);
+ 		return;
++	}
++	spin_unlock(&cifs_tcp_ses_lock);
+ 
+ 	switch (rc) {
+ 	case -1:
+@@ -220,11 +224,15 @@ smb2_wait_mtu_credits(struct TCP_Server_Info *server, unsigned int size,
+ 				return rc;
+ 			spin_lock(&server->req_lock);
+ 		} else {
++			spin_unlock(&server->req_lock);
++			spin_lock(&cifs_tcp_ses_lock);
+ 			if (server->tcpStatus == CifsExiting) {
+-				spin_unlock(&server->req_lock);
++				spin_unlock(&cifs_tcp_ses_lock);
+ 				return -ENOENT;
+ 			}
++			spin_unlock(&cifs_tcp_ses_lock);
+ 
++			spin_lock(&server->req_lock);
+ 			scredits = server->credits;
+ 			/* can deadlock with reopen */
+ 			if (scredits <= 8) {
+@@ -4899,10 +4907,12 @@ static void smb2_decrypt_offload(struct work_struct *work)
+ 
+ 			mid->callback(mid);
+ 		} else {
++			spin_lock(&cifs_tcp_ses_lock);
+ 			spin_lock(&GlobalMid_Lock);
+ 			if (dw->server->tcpStatus == CifsNeedReconnect) {
+ 				mid->mid_state = MID_RETRY_NEEDED;
+ 				spin_unlock(&GlobalMid_Lock);
++				spin_unlock(&cifs_tcp_ses_lock);
+ 				mid->callback(mid);
+ 			} else {
+ 				mid->mid_state = MID_REQUEST_SUBMITTED;
+@@ -4910,6 +4920,7 @@ static void smb2_decrypt_offload(struct work_struct *work)
+ 				list_add_tail(&mid->qhead,
+ 					&dw->server->pending_mid_q);
+ 				spin_unlock(&GlobalMid_Lock);
++				spin_unlock(&cifs_tcp_ses_lock);
+ 			}
+ 		}
+ 		release_mid(mid);
+diff --git a/fs/cifs/smb2pdu.c b/fs/cifs/smb2pdu.c
+index fdd9bd57531e..55c1bd4ff149 100644
+--- a/fs/cifs/smb2pdu.c
++++ b/fs/cifs/smb2pdu.c
+@@ -162,6 +162,7 @@ smb2_reconnect(__le16 smb2_command, struct cifs_tcon *tcon,
+ 	if (smb2_command == SMB2_TREE_CONNECT || smb2_command == SMB2_IOCTL)
+ 		return 0;
+ 
++	spin_lock(&cifs_tcp_ses_lock);
+ 	if (tcon->tidStatus == CifsExiting) {
+ 		/*
+ 		 * only tree disconnect, open, and write,
+@@ -171,11 +172,13 @@ smb2_reconnect(__le16 smb2_command, struct cifs_tcon *tcon,
+ 		if ((smb2_command != SMB2_WRITE) &&
+ 		   (smb2_command != SMB2_CREATE) &&
+ 		   (smb2_command != SMB2_TREE_DISCONNECT)) {
++			spin_unlock(&cifs_tcp_ses_lock);
+ 			cifs_dbg(FYI, "can not send cmd %d while umounting\n",
+ 				 smb2_command);
+ 			return -ENODEV;
+ 		}
+ 	}
++	spin_unlock(&cifs_tcp_ses_lock);
+ 	if ((!tcon->ses) || (tcon->ses->status == CifsExiting) ||
+ 	    (!tcon->ses->server) || !server)
+ 		return -EIO;
+@@ -214,8 +217,12 @@ smb2_reconnect(__le16 smb2_command, struct cifs_tcon *tcon,
+ 		}
+ 
+ 		/* are we still trying to reconnect? */
+-		if (server->tcpStatus != CifsNeedReconnect)
++		spin_lock(&cifs_tcp_ses_lock);
++		if (server->tcpStatus != CifsNeedReconnect) {
++			spin_unlock(&cifs_tcp_ses_lock);
+ 			break;
++		}
++		spin_unlock(&cifs_tcp_ses_lock);
+ 
+ 		if (retries && --retries)
+ 			continue;
+@@ -255,11 +262,14 @@ smb2_reconnect(__le16 smb2_command, struct cifs_tcon *tcon,
+ 	 * and the server never sends an answer the socket will be closed
+ 	 * and tcpStatus set to reconnect.
+ 	 */
++	spin_lock(&cifs_tcp_ses_lock);
+ 	if (server->tcpStatus == CifsNeedReconnect) {
++		spin_unlock(&cifs_tcp_ses_lock);
+ 		rc = -EHOSTDOWN;
+ 		mutex_unlock(&ses->session_mutex);
+ 		goto out;
+ 	}
++	spin_unlock(&cifs_tcp_ses_lock);
+ 
+ 	/*
+ 	 * need to prevent multiple threads trying to simultaneously
+@@ -1389,9 +1399,9 @@ SMB2_sess_establish_session(struct SMB2_sess_data *sess_data)
+ 	spin_unlock(&ses->chan_lock);
+ 
+ 	/* Even if one channel is active, session is in good state */
+-	spin_lock(&GlobalMid_Lock);
++	spin_lock(&cifs_tcp_ses_lock);
+ 	ses->status = CifsGood;
+-	spin_unlock(&GlobalMid_Lock);
++	spin_unlock(&cifs_tcp_ses_lock);
+ 
+ 	return rc;
+ }
+@@ -1919,7 +1929,9 @@ SMB2_tcon(const unsigned int xid, struct cifs_ses *ses, const char *tree,
+ 	tcon->share_flags = le32_to_cpu(rsp->ShareFlags);
+ 	tcon->capabilities = rsp->Capabilities; /* we keep caps little endian */
+ 	tcon->maximal_access = le32_to_cpu(rsp->MaximalAccess);
++	spin_lock(&cifs_tcp_ses_lock);
+ 	tcon->tidStatus = CifsGood;
++	spin_unlock(&cifs_tcp_ses_lock);
+ 	tcon->need_reconnect = false;
+ 	tcon->tid = le32_to_cpu(rsp->hdr.Id.SyncId.TreeId);
+ 	strlcpy(tcon->treeName, tree, sizeof(tcon->treeName));
+@@ -3871,11 +3883,14 @@ SMB2_echo(struct TCP_Server_Info *server)
+ 
+ 	cifs_dbg(FYI, "In echo request\n");
+ 
++	spin_lock(&cifs_tcp_ses_lock);
+ 	if (server->tcpStatus == CifsNeedNegotiate) {
++		spin_unlock(&cifs_tcp_ses_lock);
+ 		/* No need to send echo on newly established connections */
+ 		mod_delayed_work(cifsiod_wq, &server->reconnect, 0);
+ 		return rc;
+ 	}
++	spin_unlock(&cifs_tcp_ses_lock);
+ 
+ 	rc = smb2_plain_req_init(SMB2_ECHO, NULL, server,
+ 				 (void **)&req, &total_len);
+diff --git a/fs/cifs/smb2transport.c b/fs/cifs/smb2transport.c
+index 24dcef8d497b..31f50abfd523 100644
+--- a/fs/cifs/smb2transport.c
++++ b/fs/cifs/smb2transport.c
+@@ -638,8 +638,12 @@ smb2_sign_rqst(struct smb_rqst *rqst, struct TCP_Server_Info *server)
+ 
+ 	if (!is_signed)
+ 		return 0;
+-	if (server->tcpStatus == CifsNeedNegotiate)
++	spin_lock(&cifs_tcp_ses_lock);
++	if (server->tcpStatus == CifsNeedNegotiate) {
++		spin_unlock(&cifs_tcp_ses_lock);
+ 		return 0;
++	}
++	spin_unlock(&cifs_tcp_ses_lock);
+ 	if (!is_binding && !server->session_estab) {
+ 		strncpy(shdr->Signature, "BSRSPYL", 8);
+ 		return 0;
+@@ -755,30 +759,41 @@ static int
+ smb2_get_mid_entry(struct cifs_ses *ses, struct TCP_Server_Info *server,
+ 		   struct smb2_hdr *shdr, struct mid_q_entry **mid)
+ {
+-	if (server->tcpStatus == CifsExiting)
++	spin_lock(&cifs_tcp_ses_lock);
++	if (server->tcpStatus == CifsExiting) {
++		spin_unlock(&cifs_tcp_ses_lock);
+ 		return -ENOENT;
++	}
+ 
+ 	if (server->tcpStatus == CifsNeedReconnect) {
++		spin_unlock(&cifs_tcp_ses_lock);
+ 		cifs_dbg(FYI, "tcp session dead - return to caller to retry\n");
+ 		return -EAGAIN;
+ 	}
+ 
+ 	if (server->tcpStatus == CifsNeedNegotiate &&
+-	   shdr->Command != SMB2_NEGOTIATE)
++	   shdr->Command != SMB2_NEGOTIATE) {
++		spin_unlock(&cifs_tcp_ses_lock);
+ 		return -EAGAIN;
++	}
+ 
+ 	if (ses->status == CifsNew) {
+ 		if ((shdr->Command != SMB2_SESSION_SETUP) &&
+-		    (shdr->Command != SMB2_NEGOTIATE))
++		    (shdr->Command != SMB2_NEGOTIATE)) {
++			spin_unlock(&cifs_tcp_ses_lock);
+ 			return -EAGAIN;
++		}
+ 		/* else ok - we are setting up session */
+ 	}
+ 
+ 	if (ses->status == CifsExiting) {
+-		if (shdr->Command != SMB2_LOGOFF)
++		if (shdr->Command != SMB2_LOGOFF) {
++			spin_unlock(&cifs_tcp_ses_lock);
+ 			return -EAGAIN;
++		}
+ 		/* else ok - we are shutting down the session */
+ 	}
++	spin_unlock(&cifs_tcp_ses_lock);
+ 
+ 	*mid = smb2_mid_entry_alloc(shdr, server);
+ 	if (*mid == NULL)
+@@ -851,9 +866,13 @@ smb2_setup_async_request(struct TCP_Server_Info *server, struct smb_rqst *rqst)
+ 			(struct smb2_hdr *)rqst->rq_iov[0].iov_base;
+ 	struct mid_q_entry *mid;
+ 
++	spin_lock(&cifs_tcp_ses_lock);
+ 	if (server->tcpStatus == CifsNeedNegotiate &&
+-	   shdr->Command != SMB2_NEGOTIATE)
++	   shdr->Command != SMB2_NEGOTIATE) {
++		spin_unlock(&cifs_tcp_ses_lock);
+ 		return ERR_PTR(-EAGAIN);
++	}
++	spin_unlock(&cifs_tcp_ses_lock);
+ 
+ 	smb2_seq_num_into_buf(server, shdr);
+ 
+diff --git a/fs/cifs/transport.c b/fs/cifs/transport.c
+index 680bba1f6d90..cef2568d5dab 100644
+--- a/fs/cifs/transport.c
++++ b/fs/cifs/transport.c
+@@ -417,9 +417,9 @@ __smb_send_rqst(struct TCP_Server_Info *server, int num_rqst,
+ 		 * be taken as the remainder of this one. We need to kill the
+ 		 * socket so the server throws away the partial SMB
+ 		 */
+-		spin_lock(&GlobalMid_Lock);
++		spin_lock(&cifs_tcp_ses_lock);
+ 		server->tcpStatus = CifsNeedReconnect;
+-		spin_unlock(&GlobalMid_Lock);
++		spin_unlock(&cifs_tcp_ses_lock);
+ 		trace_smb3_partial_send_reconnect(server->CurrentMid,
+ 						  server->conn_id, server->hostname);
+ 	}
+@@ -575,10 +575,14 @@ wait_for_free_credits(struct TCP_Server_Info *server, const int num_credits,
+ 				return -ERESTARTSYS;
+ 			spin_lock(&server->req_lock);
+ 		} else {
++			spin_unlock(&server->req_lock);
++
++			spin_lock(&cifs_tcp_ses_lock);
+ 			if (server->tcpStatus == CifsExiting) {
+-				spin_unlock(&server->req_lock);
++				spin_unlock(&cifs_tcp_ses_lock);
+ 				return -ENOENT;
+ 			}
++			spin_unlock(&cifs_tcp_ses_lock);
+ 
+ 			/*
+ 			 * For normal commands, reserve the last MAX_COMPOUND
+@@ -593,6 +597,7 @@ wait_for_free_credits(struct TCP_Server_Info *server, const int num_credits,
+ 			 * for servers that are slow to hand out credits on
+ 			 * new sessions.
+ 			 */
++			spin_lock(&server->req_lock);
+ 			if (!optype && num_credits == 1 &&
+ 			    server->in_flight > 2 * MAX_COMPOUND &&
+ 			    *credits <= MAX_COMPOUND) {
+@@ -720,28 +725,36 @@ cifs_wait_mtu_credits(struct TCP_Server_Info *server, unsigned int size,
+ static int allocate_mid(struct cifs_ses *ses, struct smb_hdr *in_buf,
+ 			struct mid_q_entry **ppmidQ)
+ {
++	spin_lock(&cifs_tcp_ses_lock);
+ 	if (ses->server->tcpStatus == CifsExiting) {
++		spin_unlock(&cifs_tcp_ses_lock);
+ 		return -ENOENT;
+ 	}
+ 
+ 	if (ses->server->tcpStatus == CifsNeedReconnect) {
++		spin_unlock(&cifs_tcp_ses_lock);
+ 		cifs_dbg(FYI, "tcp session dead - return to caller to retry\n");
+ 		return -EAGAIN;
+ 	}
+ 
+ 	if (ses->status == CifsNew) {
+ 		if ((in_buf->Command != SMB_COM_SESSION_SETUP_ANDX) &&
+-			(in_buf->Command != SMB_COM_NEGOTIATE))
++			(in_buf->Command != SMB_COM_NEGOTIATE)) {
++			spin_unlock(&cifs_tcp_ses_lock);
+ 			return -EAGAIN;
++		}
+ 		/* else ok - we are setting up session */
+ 	}
+ 
+ 	if (ses->status == CifsExiting) {
+ 		/* check if SMB session is bad because we are setting it up */
+-		if (in_buf->Command != SMB_COM_LOGOFF_ANDX)
++		if (in_buf->Command != SMB_COM_LOGOFF_ANDX) {
++			spin_unlock(&cifs_tcp_ses_lock);
+ 			return -EAGAIN;
++		}
+ 		/* else ok - we are shutting down session */
+ 	}
++	spin_unlock(&cifs_tcp_ses_lock);
+ 
+ 	*ppmidQ = alloc_mid(in_buf, ses->server);
+ 	if (*ppmidQ == NULL)
+@@ -1086,8 +1099,12 @@ compound_send_recv(const unsigned int xid, struct cifs_ses *ses,
+ 		return -EIO;
+ 	}
+ 
+-	if (server->tcpStatus == CifsExiting)
++	spin_lock(&cifs_tcp_ses_lock);
++	if (server->tcpStatus == CifsExiting) {
++		spin_unlock(&cifs_tcp_ses_lock);
+ 		return -ENOENT;
++	}
++	spin_unlock(&cifs_tcp_ses_lock);
+ 
+ 	/*
+ 	 * Wait for all the requests to become available.
+@@ -1190,11 +1207,17 @@ compound_send_recv(const unsigned int xid, struct cifs_ses *ses,
+ 	/*
+ 	 * Compounding is never used during session establish.
+ 	 */
++	spin_lock(&cifs_tcp_ses_lock);
+ 	if ((ses->status == CifsNew) || (optype & CIFS_NEG_OP) || (optype & CIFS_SESS_OP)) {
++		spin_unlock(&cifs_tcp_ses_lock);
++
+ 		mutex_lock(&server->srv_mutex);
+ 		smb311_update_preauth_hash(ses, server, rqst[0].rq_iov, rqst[0].rq_nvec);
+ 		mutex_unlock(&server->srv_mutex);
++
++		spin_lock(&cifs_tcp_ses_lock);
+ 	}
++	spin_unlock(&cifs_tcp_ses_lock);
+ 
+ 	for (i = 0; i < num_rqst; i++) {
+ 		rc = wait_for_response(server, midQ[i]);
+@@ -1258,15 +1281,19 @@ compound_send_recv(const unsigned int xid, struct cifs_ses *ses,
+ 	/*
+ 	 * Compounding is never used during session establish.
+ 	 */
++	spin_lock(&cifs_tcp_ses_lock);
+ 	if ((ses->status == CifsNew) || (optype & CIFS_NEG_OP) || (optype & CIFS_SESS_OP)) {
+ 		struct kvec iov = {
+ 			.iov_base = resp_iov[0].iov_base,
+ 			.iov_len = resp_iov[0].iov_len
+ 		};
++		spin_unlock(&cifs_tcp_ses_lock);
+ 		mutex_lock(&server->srv_mutex);
+ 		smb311_update_preauth_hash(ses, server, &iov, 1);
+ 		mutex_unlock(&server->srv_mutex);
++		spin_lock(&cifs_tcp_ses_lock);
+ 	}
++	spin_unlock(&cifs_tcp_ses_lock);
+ 
+ out:
+ 	/*
+@@ -1355,8 +1382,12 @@ SendReceive(const unsigned int xid, struct cifs_ses *ses,
+ 		return -EIO;
+ 	}
+ 
+-	if (server->tcpStatus == CifsExiting)
++	spin_lock(&cifs_tcp_ses_lock);
++	if (server->tcpStatus == CifsExiting) {
++		spin_unlock(&cifs_tcp_ses_lock);
+ 		return -ENOENT;
++	}
++	spin_unlock(&cifs_tcp_ses_lock);
+ 
+ 	/* Ensure that we do not send more than 50 overlapping requests
+ 	   to the same server. We may make this configurable later or
+@@ -1497,8 +1528,12 @@ SendReceiveBlockingLock(const unsigned int xid, struct cifs_tcon *tcon,
+ 		return -EIO;
+ 	}
+ 
+-	if (server->tcpStatus == CifsExiting)
++	spin_lock(&cifs_tcp_ses_lock);
++	if (server->tcpStatus == CifsExiting) {
++		spin_unlock(&cifs_tcp_ses_lock);
+ 		return -ENOENT;
++	}
++	spin_unlock(&cifs_tcp_ses_lock);
+ 
+ 	/* Ensure that we do not send more than 50 overlapping requests
+ 	   to the same server. We may make this configurable later or
+@@ -1557,11 +1592,13 @@ SendReceiveBlockingLock(const unsigned int xid, struct cifs_tcon *tcon,
+ 		 (server->tcpStatus != CifsNew)));
+ 
+ 	/* Were we interrupted by a signal ? */
++	spin_lock(&cifs_tcp_ses_lock);
+ 	if ((rc == -ERESTARTSYS) &&
+ 		(midQ->mid_state == MID_REQUEST_SUBMITTED ||
+ 		 midQ->mid_state == MID_RESPONSE_RECEIVED) &&
+ 		((server->tcpStatus == CifsGood) ||
+ 		 (server->tcpStatus == CifsNew))) {
++		spin_unlock(&cifs_tcp_ses_lock);
+ 
+ 		if (in_buf->Command == SMB_COM_TRANSACTION2) {
+ 			/* POSIX lock. We send a NT_CANCEL SMB to cause the
+@@ -1601,7 +1638,9 @@ SendReceiveBlockingLock(const unsigned int xid, struct cifs_tcon *tcon,
+ 
+ 		/* We got the response - restart system call. */
+ 		rstart = 1;
++		spin_lock(&cifs_tcp_ses_lock);
+ 	}
++	spin_unlock(&cifs_tcp_ses_lock);
+ 
+ 	rc = cifs_sync_mid_result(midQ, server);
+ 	if (rc != 0)
