@@ -1,0 +1,189 @@
+cifs: protect all accesses to chan_* with chan_lock
+
+jira LE-4669
+Rebuild_History Non-Buildable kernel-4.18.0-553.82.1.el8_10
+commit-author Shyam Prasad N <sprasad@microsoft.com>
+commit 88b024f556fcd5bf1288c6333016f576cfa5f539
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.82.1.el8_10/88b024f5.failed
+
+A spin lock called chan_lock was introduced recently.
+But not all accesses were protected. Doing that with
+this change.
+
+To make sure that a channel is not freed when in use,
+we need to introduce a ref count. But today, we don't
+ever free channels.
+
+	Signed-off-by: Shyam Prasad N <sprasad@microsoft.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 88b024f556fcd5bf1288c6333016f576cfa5f539)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/sess.c
+#	fs/cifs/smb2pdu.c
+#	fs/cifs/transport.c
+diff --cc fs/cifs/sess.c
+index 1b56022e96fb,f7de57f6f047..000000000000
+--- a/fs/cifs/sess.c
++++ b/fs/cifs/sess.c
+@@@ -372,12 -371,14 +374,21 @@@ void cifs_ses_mark_for_reconnect(struc
+  {
+  	int i;
+  
++ 	spin_lock(&cifs_tcp_ses_lock);
++ 	spin_lock(&ses->chan_lock);
+  	for (i = 0; i < ses->chan_count; i++) {
+++<<<<<<< HEAD
+ +		spin_lock(&GlobalMid_Lock);
+  		if (ses->chans[i].server->tcpStatus != CifsExiting)
+  			ses->chans[i].server->tcpStatus = CifsNeedReconnect;
+ +		spin_unlock(&GlobalMid_Lock);
+++=======
+++		if (ses->chans[i].server->tcpStatus != CifsExiting)
+++			ses->chans[i].server->tcpStatus = CifsNeedReconnect;
+++>>>>>>> 88b024f556fc (cifs: protect all accesses to chan_* with chan_lock)
+  	}
++ 	spin_unlock(&ses->chan_lock);
++ 	spin_unlock(&cifs_tcp_ses_lock);
+  }
+  
+  static __u32 cifs_ssetup_hdr(struct cifs_ses *ses,
+diff --cc fs/cifs/smb2pdu.c
+index fdd9bd57531e,ca8a16896f17..000000000000
+--- a/fs/cifs/smb2pdu.c
++++ b/fs/cifs/smb2pdu.c
+@@@ -3823,9 -3827,21 +3823,25 @@@ void smb2_reconnect_server(struct work_
+  		 */
+  		if (ses->tcon_ipc && ses->tcon_ipc->need_reconnect) {
+  			list_add_tail(&ses->tcon_ipc->rlist, &tmp_list);
+++<<<<<<< HEAD
+ +			tcon_exist = true;
+++=======
++ 			tcon_selected = tcon_exist = true;
+  			ses->ses_count++;
+  		}
++ 		/*
++ 		 * handle the case where channel needs to reconnect
++ 		 * binding session, but tcon is healthy (some other channel
++ 		 * is active)
++ 		 */
++ 		spin_lock(&ses->chan_lock);
++ 		if (!tcon_selected && cifs_chan_needs_reconnect(ses, server)) {
++ 			list_add_tail(&ses->rlist, &tmp_ses_list);
++ 			ses_selected = ses_exist = true;
+++>>>>>>> 88b024f556fc (cifs: protect all accesses to chan_* with chan_lock)
++ 			ses->ses_count++;
++ 		}
++ 		spin_unlock(&ses->chan_lock);
+  	}
+  	/*
+  	 * Get the reference to server struct to be sure that the last call of
+diff --cc fs/cifs/transport.c
+index 680bba1f6d90,8540f7c13eae..000000000000
+--- a/fs/cifs/transport.c
++++ b/fs/cifs/transport.c
+@@@ -1045,17 -1047,11 +1045,24 @@@ struct TCP_Server_Info *cifs_pick_chann
+  	if (!ses)
+  		return NULL;
+  
+ +	spin_lock(&ses->chan_lock);
+  	/* round robin */
+++<<<<<<< HEAD
+ +pick_another:
+ +	if (ses->chan_count > 1 &&
+ +	    !CIFS_ALL_CHANS_NEED_RECONNECT(ses)) {
+ +		index = (uint)atomic_inc_return(&ses->chan_seq);
+ +		index %= ses->chan_count;
+ +
+ +		if (CIFS_CHAN_NEEDS_RECONNECT(ses, index))
+ +			goto pick_another;
+ +	}
+++=======
++ 	index = (uint)atomic_inc_return(&ses->chan_seq);
++ 
++ 	spin_lock(&ses->chan_lock);
++ 	index %= ses->chan_count;
+++>>>>>>> 88b024f556fc (cifs: protect all accesses to chan_* with chan_lock)
+  	spin_unlock(&ses->chan_lock);
+  
+  	return ses->chans[index].server;
+diff --git a/fs/cifs/connect.c b/fs/cifs/connect.c
+index aa59bbf815c2..e018fd9d330b 100644
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@ -1820,7 +1820,6 @@ void cifs_put_smb_ses(struct cifs_ses *ses)
+ 
+ 	spin_lock(&ses->chan_lock);
+ 	chan_count = ses->chan_count;
+-	spin_unlock(&ses->chan_lock);
+ 
+ 	/* close any extra channels */
+ 	if (chan_count > 1) {
+@@ -1837,6 +1836,7 @@ void cifs_put_smb_ses(struct cifs_ses *ses)
+ 			ses->chans[i].server = NULL;
+ 		}
+ 	}
++	spin_unlock(&ses->chan_lock);
+ 
+ 	sesInfoFree(ses);
+ 	cifs_put_tcp_session(server, 0);
+@@ -2109,8 +2109,10 @@ cifs_get_smb_ses(struct TCP_Server_Info *server, struct smb3_fs_context *ctx)
+ 		rc = cifs_setup_session(xid, ses, server, ctx->local_nls);
+ 
+ 	/* each channel uses a different signing key */
++	spin_lock(&ses->chan_lock);
+ 	memcpy(ses->chans[0].signkey, ses->smb3signingkey,
+ 	       sizeof(ses->smb3signingkey));
++	spin_unlock(&ses->chan_lock);
+ 
+ 	mutex_unlock(&ses->session_mutex);
+ 	if (rc)
+* Unmerged path fs/cifs/sess.c
+* Unmerged path fs/cifs/smb2pdu.c
+diff --git a/fs/cifs/smb2transport.c b/fs/cifs/smb2transport.c
+index 24dcef8d497b..935eabd8545f 100644
+--- a/fs/cifs/smb2transport.c
++++ b/fs/cifs/smb2transport.c
+@@ -100,6 +100,7 @@ int smb2_get_sign_key(__u64 ses_id, struct TCP_Server_Info *server, u8 *key)
+ 	goto out;
+ 
+ found:
++	spin_lock(&ses->chan_lock);
+ 	if (cifs_chan_needs_reconnect(ses, server) &&
+ 	    !CIFS_ALL_CHANS_NEED_RECONNECT(ses)) {
+ 		/*
+@@ -108,6 +109,7 @@ int smb2_get_sign_key(__u64 ses_id, struct TCP_Server_Info *server, u8 *key)
+ 		 * session key
+ 		 */
+ 		memcpy(key, ses->smb3signingkey, SMB3_SIGN_KEY_SIZE);
++		spin_unlock(&ses->chan_lock);
+ 		goto out;
+ 	}
+ 
+@@ -119,9 +121,11 @@ int smb2_get_sign_key(__u64 ses_id, struct TCP_Server_Info *server, u8 *key)
+ 		chan = ses->chans + i;
+ 		if (chan->server == server) {
+ 			memcpy(key, chan->signkey, SMB3_SIGN_KEY_SIZE);
++			spin_unlock(&ses->chan_lock);
+ 			goto out;
+ 		}
+ 	}
++	spin_unlock(&ses->chan_lock);
+ 
+ 	cifs_dbg(VFS,
+ 		 "%s: Could not find channel signing key for session 0x%llx\n",
+@@ -434,8 +438,10 @@ generate_smb3signingkey(struct cifs_ses *ses,
+ 			return rc;
+ 
+ 		/* safe to access primary channel, since it will never go away */
++		spin_lock(&ses->chan_lock);
+ 		memcpy(ses->chans[0].signkey, ses->smb3signingkey,
+ 		       SMB3_SIGN_KEY_SIZE);
++		spin_unlock(&ses->chan_lock);
+ 
+ 		rc = generate_key(ses, ptriplet->encryption.label,
+ 				  ptriplet->encryption.context,
+* Unmerged path fs/cifs/transport.c
