@@ -1,0 +1,91 @@
+cifs: fix incorrect use of list iterator after the loop
+
+jira LE-4669
+Rebuild_History Non-Buildable kernel-4.18.0-553.82.1.el8_10
+commit-author Xiaomeng Tong <xiam0nd.tong@gmail.com>
+commit a96c94481f5993eac2271f9fb4d009b7dc076c24
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.82.1.el8_10/a96c9448.failed
+
+The bug is here:
+if (!tcon) {
+	resched = true;
+	list_del_init(&ses->rlist);
+	cifs_put_smb_ses(ses);
+
+Because the list_for_each_entry() never exits early (without any
+break/goto/return inside the loop), the iterator 'ses' after the
+loop will always be an pointer to a invalid struct containing the
+HEAD (&pserver->smb_ses_list). As a result, the uses of 'ses' above
+will lead to a invalid memory access.
+
+The original intention should have been to walk each entry 'ses' in
+'&tmp_ses_list', delete '&ses->rlist' and put 'ses'. So fix it with
+a list_for_each_entry_safe().
+
+	Cc: stable@vger.kernel.org # 5.17
+Fixes: 3663c9045f51a ("cifs: check reconnects for channels of active tcons too")
+	Signed-off-by: Xiaomeng Tong <xiam0nd.tong@gmail.com>
+	Reviewed-by: Shyam Prasad N <sprasad@microsoft.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit a96c94481f5993eac2271f9fb4d009b7dc076c24)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/smb2pdu.c
+diff --cc fs/cifs/smb2pdu.c
+index fdd9bd57531e,54b554c7aee8..000000000000
+--- a/fs/cifs/smb2pdu.c
++++ b/fs/cifs/smb2pdu.c
+@@@ -3849,13 -3846,43 +3849,47 @@@ void smb2_reconnect_server(struct work_
+  			cifs_put_tcon(tcon);
+  	}
+  
+++<<<<<<< HEAD
+ +	cifs_dbg(FYI, "Reconnecting tcons finished\n");
+++=======
++ 	if (!ses_exist)
++ 		goto done;
++ 
++ 	/* allocate a dummy tcon struct used for reconnect */
++ 	tcon = kzalloc(sizeof(struct cifs_tcon), GFP_KERNEL);
++ 	if (!tcon) {
++ 		resched = true;
++ 		list_for_each_entry_safe(ses, ses2, &tmp_ses_list, rlist) {
++ 			list_del_init(&ses->rlist);
++ 			cifs_put_smb_ses(ses);
++ 		}
++ 		goto done;
++ 	}
++ 
++ 	tcon->tidStatus = CifsGood;
++ 	tcon->retry = false;
++ 	tcon->need_reconnect = false;
++ 
++ 	/* now reconnect sessions for necessary channels */
++ 	list_for_each_entry_safe(ses, ses2, &tmp_ses_list, rlist) {
++ 		tcon->ses = ses;
++ 		rc = smb2_reconnect(SMB2_INTERNAL_CMD, tcon, server);
++ 		if (rc)
++ 			resched = true;
++ 		list_del_init(&ses->rlist);
++ 		cifs_put_smb_ses(ses);
++ 	}
++ 	kfree(tcon);
++ 
++ done:
++ 	cifs_dbg(FYI, "Reconnecting tcons and channels finished\n");
+++>>>>>>> a96c94481f59 (cifs: fix incorrect use of list iterator after the loop)
+  	if (resched)
+  		queue_delayed_work(cifsiod_wq, &server->reconnect, 2 * HZ);
+ -	mutex_unlock(&pserver->reconnect_mutex);
+ +	mutex_unlock(&server->reconnect_mutex);
+  
+  	/* now we can safely release srv struct */
+ -	if (tcon_exist || ses_exist)
+ +	if (tcon_exist)
+  		cifs_put_tcp_session(server, 1);
+  }
+  
+* Unmerged path fs/cifs/smb2pdu.c
