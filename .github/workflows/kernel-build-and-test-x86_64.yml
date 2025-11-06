@@ -218,18 +218,39 @@ jobs:
         name: kselftest-logs-x86_64
         path: output-current
 
+    - name: Install GitHub CLI
+      run: |
+        set -euxo pipefail
+        # Install gh CLI if not already available
+        if ! command -v gh &> /dev/null; then
+          sudo apt-get update
+          sudo apt-get install -y gh
+        fi
+
     - name: Determine base branch for comparison
       id: base_branch
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         BASE_BRANCH=""
 
-        # For PRs, use the base branch directly
-        if [ -n "${{ github.base_ref }}" ]; then
+        # First, check if an open PR already exists from this head branch
+        echo "Checking for existing open PR from branch: ${{ github.ref_name }}"
+        EXISTING_PR=$(gh pr list --head "${{ github.ref_name }}" --state open --json number,baseRefName --jq '.[0]' || echo "")
+
+        if [ -n "$EXISTING_PR" ] && [ "$EXISTING_PR" != "null" ]; then
+          # PR exists - use its existing base branch (no merge-base detection on force push)
+          BASE_BRANCH=$(echo "$EXISTING_PR" | jq -r '.baseRefName')
+          PR_NUMBER=$(echo "$EXISTING_PR" | jq -r '.number')
+          echo "Found existing PR #$PR_NUMBER, using existing base: $BASE_BRANCH"
+          echo "Skipping merge-base detection to avoid duplicate PRs on force push"
+        elif [ -n "${{ github.base_ref }}" ]; then
+          # For PRs, use the base branch directly
           BASE_BRANCH="${{ github.base_ref }}"
           echo "Using PR base branch: $BASE_BRANCH"
         else
-          # For direct pushes, find the common ancestor branch
-          echo "Not a PR, finding base branch via merge-base"
+          # No existing PR - for direct pushes, find the common ancestor branch
+          echo "No existing PR found, finding base branch via merge-base"
 
           # Get all remote branches sorted by commit date (most recent first)
           # This ensures we check actively developed branches first
@@ -477,7 +498,7 @@ jobs:
           exit 1
         fi
 
-        echo "Creating PR from ${{ github.ref_name }} to $BASE_BRANCH"
+        echo "Creating/updating PR from ${{ github.ref_name }} to $BASE_BRANCH"
 
         # Determine comparison status message
         COMPARISON_STATUS="${{ needs.compare-results.outputs.comparison_status }}"
@@ -509,14 +530,27 @@ jobs:
           "${{ github.repository }}" \
           > pr_body.md
 
-        # Check if PR already exists
-        EXISTING_PR=$(gh pr list --head "${{ github.ref_name }}" --base "$BASE_BRANCH" --json number --jq '.[0].number' || echo "")
+        # Check if any open PR already exists from this head branch (regardless of base)
+        EXISTING_PR=$(gh pr list --head "${{ github.ref_name }}" --state open --json number,baseRefName --jq '.[0]' || echo "")
 
-        if [ -n "$EXISTING_PR" ]; then
-          echo "PR #$EXISTING_PR already exists, updating it"
-          gh pr edit "$EXISTING_PR" \
+        if [ -n "$EXISTING_PR" ] && [ "$EXISTING_PR" != "null" ]; then
+          PR_NUMBER=$(echo "$EXISTING_PR" | jq -r '.number')
+          CURRENT_BASE=$(echo "$EXISTING_PR" | jq -r '.baseRefName')
+
+          echo "Found existing PR #$PR_NUMBER (current base: $CURRENT_BASE)"
+
+          # Update PR title and body
+          gh pr edit "$PR_NUMBER" \
             --title "[$BASE_BRANCH] ${{ steps.commit_msg.outputs.commit_subject }}" \
             --body-file pr_body.md
+
+          echo "Updated PR #$PR_NUMBER"
+
+          # Note: We don't change the base branch even if it differs from $BASE_BRANCH
+          # because compare-results already used the existing PR's base for comparison
+          if [ "$CURRENT_BASE" != "$BASE_BRANCH" ]; then
+            echo "::notice::PR base remains $CURRENT_BASE (comparison was done against this base)"
+          fi
         else
           echo "Creating new PR from ${{ github.ref_name }} to $BASE_BRANCH"
           gh pr create \
