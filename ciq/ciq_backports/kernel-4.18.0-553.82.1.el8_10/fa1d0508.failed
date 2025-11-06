@@ -1,0 +1,161 @@
+cifs: account for primary channel in the interface list
+
+jira LE-4669
+Rebuild_History Non-Buildable kernel-4.18.0-553.82.1.el8_10
+commit-author Shyam Prasad N <sprasad@microsoft.com>
+commit fa1d0508bdd4a68c5e40f85f635712af8c12f180
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.82.1.el8_10/fa1d0508.failed
+
+The refcounting of server interfaces should account
+for the primary channel too. Although this is not
+strictly necessary, doing so will account for the primary
+channel in DebugData.
+
+	Cc: stable@vger.kernel.org
+	Reviewed-by: Paulo Alcantara (SUSE) <pc@manguebit.com>
+	Signed-off-by: Shyam Prasad N <sprasad@microsoft.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit fa1d0508bdd4a68c5e40f85f635712af8c12f180)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/sess.c
+diff --cc fs/cifs/sess.c
+index b9c9236e1312,e716d046fb5f..000000000000
+--- a/fs/cifs/sess.c
++++ b/fs/cifs/sess.c
+@@@ -231,25 -298,61 +231,51 @@@ int cifs_try_adding_channels(struct cif
+  int
+  cifs_chan_update_iface(struct cifs_ses *ses, struct TCP_Server_Info *server)
+  {
+ -	unsigned int chan_index;
+ -	size_t iface_weight = 0, iface_min_speed = 0;
+ +	unsigned int chan_index = cifs_ses_get_chan_index(ses, server);
+  	struct cifs_server_iface *iface = NULL;
+  	struct cifs_server_iface *old_iface = NULL;
+++<<<<<<< HEAD:fs/cifs/sess.c
+++=======
++ 	struct cifs_server_iface *last_iface = NULL;
++ 	struct sockaddr_storage ss;
+++>>>>>>> fa1d0508bdd4 (cifs: account for primary channel in the interface list):fs/smb/client/sess.c
+  	int rc = 0;
+  
+ -	spin_lock(&ses->chan_lock);
+ -	chan_index = cifs_ses_get_chan_index(ses, server);
+ -	if (chan_index == CIFS_INVAL_CHAN_INDEX) {
+ -		spin_unlock(&ses->chan_lock);
+ +	/* primary channel. This can never go away */
+ +	if (!chan_index)
+  		return 0;
+ -	}
+  
+  	if (ses->chans[chan_index].iface) {
+  		old_iface = ses->chans[chan_index].iface;
+ -		if (old_iface->is_active) {
+ -			spin_unlock(&ses->chan_lock);
+ +		if (old_iface->is_active)
+  			return 1;
+ -		}
+  	}
+ -	spin_unlock(&ses->chan_lock);
+  
++ 	spin_lock(&server->srv_lock);
++ 	ss = server->dstaddr;
++ 	spin_unlock(&server->srv_lock);
++ 
+  	spin_lock(&ses->iface_lock);
+ -	if (!ses->iface_count) {
+ -		spin_unlock(&ses->iface_lock);
+ -		cifs_dbg(VFS, "server %s does not advertise interfaces\n", ses->server->hostname);
+ -		return 0;
+ -	}
+ -
+ -	last_iface = list_last_entry(&ses->iface_list, struct cifs_server_iface,
+ -				     iface_head);
+ -	iface_min_speed = last_iface->speed;
+  
+  	/* then look for a new one */
+  	list_for_each_entry(iface, &ses->iface_list, iface_head) {
+++<<<<<<< HEAD:fs/cifs/sess.c
+++=======
++ 		if (!chan_index) {
++ 			/* if we're trying to get the updated iface for primary channel */
++ 			if (!cifs_match_ipaddr((struct sockaddr *) &ss,
++ 					       (struct sockaddr *) &iface->sockaddr))
++ 				continue;
++ 
++ 			kref_get(&iface->refcount);
++ 			break;
++ 		}
++ 
++ 		/* do not mix rdma and non-rdma interfaces */
++ 		if (iface->rdma_capable != server->rdma)
++ 			continue;
++ 
+++>>>>>>> fa1d0508bdd4 (cifs: account for primary channel in the interface list):fs/smb/client/sess.c
+  		if (!iface->is_active ||
+  		    (is_ses_using_iface(ses, iface) &&
+  		     !iface->rss_capable)) {
+@@@ -265,7 -375,12 +291,16 @@@
+  		cifs_dbg(FYI, "unable to find a suitable iface\n");
+  	}
+  
+++<<<<<<< HEAD:fs/cifs/sess.c
+ +	ses->chans[chan_index].iface = iface;
+++=======
++ 	if (!chan_index && !iface) {
++ 		cifs_dbg(FYI, "unable to get the interface matching: %pIS\n",
++ 			 &ss);
++ 		spin_unlock(&ses->iface_lock);
++ 		return 0;
++ 	}
+++>>>>>>> fa1d0508bdd4 (cifs: account for primary channel in the interface list):fs/smb/client/sess.c
+  
+  	/* now drop the ref to the current iface */
+  	if (old_iface && iface) {
+@@@ -276,7 -398,18 +311,13 @@@
+  	} else if (old_iface) {
+  		cifs_dbg(FYI, "releasing ref to iface: %pIS\n",
+  			 &old_iface->sockaddr);
+ -
+ -		old_iface->num_channels--;
+ -		if (old_iface->weight_fulfilled)
+ -			old_iface->weight_fulfilled--;
+ -
+  		kref_put(&old_iface->refcount, release_iface);
++ 	} else if (!chan_index) {
++ 		/* special case: update interface for primary channel */
++ 		cifs_dbg(FYI, "referencing primary channel iface: %pIS\n",
++ 			 &iface->sockaddr);
++ 		iface->num_channels++;
++ 		iface->weight_fulfilled++;
+  	} else {
+  		WARN_ON(!iface);
+  		cifs_dbg(FYI, "adding new iface: %pIS\n", &iface->sockaddr);
+* Unmerged path fs/cifs/sess.c
+diff --git a/fs/cifs/smb2ops.c b/fs/cifs/smb2ops.c
+index 06fe88efbf89..ca9630b8bae7 100644
+--- a/fs/cifs/smb2ops.c
++++ b/fs/cifs/smb2ops.c
+@@ -703,6 +703,7 @@ SMB3_request_interfaces(const unsigned int xid, struct cifs_tcon *tcon, bool in_
+ 	unsigned int ret_data_len = 0;
+ 	struct network_interface_info_ioctl_rsp *out_buf = NULL;
+ 	struct cifs_ses *ses = tcon->ses;
++	struct TCP_Server_Info *pserver;
+ 
+ 	/* do not query too frequently */
+ 	if (ses->iface_last_update &&
+@@ -727,6 +728,11 @@ SMB3_request_interfaces(const unsigned int xid, struct cifs_tcon *tcon, bool in_
+ 	if (rc)
+ 		goto out;
+ 
++	/* check if iface is still active */
++	pserver = ses->chans[0].server;
++	if (pserver && !cifs_chan_is_iface_active(ses, pserver))
++		cifs_chan_update_iface(ses, pserver);
++
+ out:
+ 	kfree(out_buf);
+ 	return rc;
