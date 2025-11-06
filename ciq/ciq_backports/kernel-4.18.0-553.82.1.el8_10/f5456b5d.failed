@@ -1,0 +1,166 @@
+gfs2: Clean up revokes on normal withdraws
+
+jira LE-4669
+Rebuild_History Non-Buildable kernel-4.18.0-553.82.1.el8_10
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit f5456b5d67cf812fd31fe3e130ca216b2e0908e5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.82.1.el8_10/f5456b5d.failed
+
+Before this patch, the system ail lists were cleaned up if the logd
+process withdrew, but on other withdraws, they were not cleaned up.
+This included the cleaning up of the revokes as well.
+
+This patch reorganizes things a bit so that all withdraws (not just logd)
+clean up the ail lists, including any pending revokes.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit f5456b5d67cf812fd31fe3e130ca216b2e0908e5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/log.h
+diff --cc fs/gfs2/log.h
+index 082bb4b1d9f1,fc905c2af53c..000000000000
+--- a/fs/gfs2/log.h
++++ b/fs/gfs2/log.h
+@@@ -62,28 -70,29 +62,36 @@@ static inline void gfs2_ordered_add_ino
+  	}
+  }
+  
+ -extern void gfs2_ordered_del_inode(struct gfs2_inode *ip);
+ -extern unsigned int gfs2_struct2blk(struct gfs2_sbd *sdp, unsigned int nstruct);
+ -extern void gfs2_remove_from_ail(struct gfs2_bufdata *bd);
+ -extern bool gfs2_log_is_empty(struct gfs2_sbd *sdp);
+ -extern void gfs2_log_release_revokes(struct gfs2_sbd *sdp, unsigned int revokes);
+ -extern void gfs2_log_release(struct gfs2_sbd *sdp, unsigned int blks);
+ -extern bool gfs2_log_try_reserve(struct gfs2_sbd *sdp, struct gfs2_trans *tr,
+ -				 unsigned int *extra_revokes);
+ -extern void gfs2_log_reserve(struct gfs2_sbd *sdp, struct gfs2_trans *tr,
+ -			     unsigned int *extra_revokes);
+ -extern void gfs2_write_log_header(struct gfs2_sbd *sdp, struct gfs2_jdesc *jd,
+ -				  u64 seq, u32 tail, u32 lblock, u32 flags,
+ -				  int op_flags);
+ -extern void gfs2_log_flush(struct gfs2_sbd *sdp, struct gfs2_glock *gl,
+ -			   u32 type);
+ -extern void gfs2_log_commit(struct gfs2_sbd *sdp, struct gfs2_trans *trans);
+ -extern void gfs2_ail1_flush(struct gfs2_sbd *sdp, struct writeback_control *wbc);
+ -extern void log_flush_wait(struct gfs2_sbd *sdp);
+ +void gfs2_ordered_del_inode(struct gfs2_inode *ip);
+ +unsigned int gfs2_struct2blk(struct gfs2_sbd *sdp, unsigned int nstruct);
+ +void gfs2_remove_from_ail(struct gfs2_bufdata *bd);
+ +bool gfs2_log_is_empty(struct gfs2_sbd *sdp);
+ +void gfs2_log_release_revokes(struct gfs2_sbd *sdp, unsigned int revokes);
+ +void gfs2_log_release(struct gfs2_sbd *sdp, unsigned int blks);
+ +bool gfs2_log_try_reserve(struct gfs2_sbd *sdp, struct gfs2_trans *tr,
+ +			  unsigned int *extra_revokes);
+ +void gfs2_log_reserve(struct gfs2_sbd *sdp, struct gfs2_trans *tr,
+ +		      unsigned int *extra_revokes);
+ +void gfs2_write_log_header(struct gfs2_sbd *sdp, struct gfs2_jdesc *jd,
+ +			   u64 seq, u32 tail, u32 lblock, u32 flags,
+ +			   int op_flags);
+ +void gfs2_log_flush(struct gfs2_sbd *sdp, struct gfs2_glock *gl,
+ +		    u32 type);
+ +void gfs2_log_commit(struct gfs2_sbd *sdp, struct gfs2_trans *trans);
+ +void gfs2_ail1_flush(struct gfs2_sbd *sdp, struct writeback_control *wbc);
+ +void log_flush_wait(struct gfs2_sbd *sdp);
+  
+++<<<<<<< HEAD
+ +int gfs2_logd(void *data);
+ +void gfs2_add_revoke(struct gfs2_sbd *sdp, struct gfs2_bufdata *bd);
+ +void gfs2_glock_remove_revoke(struct gfs2_glock *gl);
+ +void gfs2_flush_revokes(struct gfs2_sbd *sdp);
+++=======
++ extern int gfs2_logd(void *data);
++ extern void gfs2_add_revoke(struct gfs2_sbd *sdp, struct gfs2_bufdata *bd);
++ extern void gfs2_glock_remove_revoke(struct gfs2_glock *gl);
++ extern void gfs2_flush_revokes(struct gfs2_sbd *sdp);
++ extern void gfs2_ail_drain(struct gfs2_sbd *sdp);
+++>>>>>>> f5456b5d67cf (gfs2: Clean up revokes on normal withdraws)
+  
+  #endif /* __LOG_DOT_H__ */
+diff --git a/fs/gfs2/log.c b/fs/gfs2/log.c
+index f8fa525525c0..03724f4ef5f4 100644
+--- a/fs/gfs2/log.c
++++ b/fs/gfs2/log.c
+@@ -895,10 +895,10 @@ static void log_write_header(struct gfs2_sbd *sdp, u32 flags)
+ }
+ 
+ /**
+- * ail_drain - drain the ail lists after a withdraw
++ * gfs2_ail_drain - drain the ail lists after a withdraw
+  * @sdp: Pointer to GFS2 superblock
+  */
+-static void ail_drain(struct gfs2_sbd *sdp)
++void gfs2_ail_drain(struct gfs2_sbd *sdp)
+ {
+ 	struct gfs2_trans *tr;
+ 
+@@ -925,6 +925,7 @@ static void ail_drain(struct gfs2_sbd *sdp)
+ 		list_del(&tr->tr_list);
+ 		gfs2_trans_free(sdp, tr);
+ 	}
++	gfs2_drain_revokes(sdp);
+ 	spin_unlock(&sdp->sd_ail_lock);
+ }
+ 
+@@ -1113,7 +1114,6 @@ void gfs2_log_flush(struct gfs2_sbd *sdp, struct gfs2_glock *gl, u32 flags)
+ 	if (tr && list_empty(&tr->tr_list))
+ 		list_add(&tr->tr_list, &sdp->sd_ail1_list);
+ 	spin_unlock(&sdp->sd_ail_lock);
+-	ail_drain(sdp); /* frees all transactions */
+ 	tr = NULL;
+ 	goto out_end;
+ }
+* Unmerged path fs/gfs2/log.h
+diff --git a/fs/gfs2/lops.c b/fs/gfs2/lops.c
+index bdabbe6a2e5d..e999dcad658e 100644
+--- a/fs/gfs2/lops.c
++++ b/fs/gfs2/lops.c
+@@ -884,7 +884,7 @@ static void revoke_lo_before_commit(struct gfs2_sbd *sdp, struct gfs2_trans *tr)
+ 	gfs2_log_write_page(sdp, page);
+ }
+ 
+-static void revoke_lo_after_commit(struct gfs2_sbd *sdp, struct gfs2_trans *tr)
++void gfs2_drain_revokes(struct gfs2_sbd *sdp)
+ {
+ 	struct list_head *head = &sdp->sd_log_revokes;
+ 	struct gfs2_bufdata *bd;
+@@ -899,6 +899,11 @@ static void revoke_lo_after_commit(struct gfs2_sbd *sdp, struct gfs2_trans *tr)
+ 	}
+ }
+ 
++static void revoke_lo_after_commit(struct gfs2_sbd *sdp, struct gfs2_trans *tr)
++{
++	gfs2_drain_revokes(sdp);
++}
++
+ static void revoke_lo_before_scan(struct gfs2_jdesc *jd,
+ 				  struct gfs2_log_header_host *head, int pass)
+ {
+diff --git a/fs/gfs2/lops.h b/fs/gfs2/lops.h
+index cc8b2d4aebbe..547e60085957 100644
+--- a/fs/gfs2/lops.h
++++ b/fs/gfs2/lops.h
+@@ -23,6 +23,7 @@ void gfs2_log_submit_bio(struct bio **biop, int opf);
+ void gfs2_pin(struct gfs2_sbd *sdp, struct buffer_head *bh);
+ int gfs2_find_jhead(struct gfs2_jdesc *jd,
+ 			   struct gfs2_log_header_host *head, bool keep_cache);
++extern void gfs2_drain_revokes(struct gfs2_sbd *sdp);
+ static inline unsigned int buf_limit(struct gfs2_sbd *sdp)
+ {
+ 	return sdp->sd_ldptrs;
+diff --git a/fs/gfs2/util.c b/fs/gfs2/util.c
+index f4c4bce3391a..725afa58de7a 100644
+--- a/fs/gfs2/util.c
++++ b/fs/gfs2/util.c
+@@ -129,6 +129,7 @@ static void signal_our_withdraw(struct gfs2_sbd *sdp)
+ 	if (test_bit(SDF_NORECOVERY, &sdp->sd_flags) || !sdp->sd_jdesc)
+ 		return;
+ 
++	gfs2_ail_drain(sdp); /* frees all transactions */
+ 	inode = sdp->sd_jdesc->jd_inode;
+ 	ip = GFS2_I(inode);
+ 	i_gl = ip->i_gl;
