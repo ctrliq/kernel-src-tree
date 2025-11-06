@@ -1,0 +1,192 @@
+cifs: make status checks in version independent callers
+
+jira LE-4669
+Rebuild_History Non-Buildable kernel-4.18.0-553.82.1.el8_10
+commit-author Shyam Prasad N <sprasad@microsoft.com>
+commit c1604da708d345a1ca1cf6a5537d503b14aa4787
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.82.1.el8_10/c1604da7.failed
+
+The status of tcp session, smb session and tcon have the
+same flow, irrespective of the SMB version used. Hence
+these status checks and updates should happen in the
+version independent callers of these commands.
+
+	Signed-off-by: Shyam Prasad N <sprasad@microsoft.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit c1604da708d345a1ca1cf6a5537d503b14aa4787)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/connect.c
+#	fs/cifs/sess.c
+#	fs/cifs/smb2pdu.c
+diff --cc fs/cifs/connect.c
+index 9047b33cdff7,0a35503b7b46..000000000000
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@@ -3812,8 -3770,6 +3812,11 @@@ CIFSTCon(const unsigned int xid, struc
+  	if (rc == 0) {
+  		bool is_unicode;
+  
+++<<<<<<< HEAD
+ +		tcon->tidStatus = CifsGood;
+ +		tcon->need_reconnect = false;
+++=======
+++>>>>>>> c1604da708d3 (cifs: make status checks in version independent callers)
+  		tcon->tid = smb_buffer_response->Tid;
+  		bcc_ptr = pByteArea(smb_buffer_response);
+  		bytes_left = get_bcc(smb_buffer_response);
+@@@ -3959,8 -3935,25 +3962,28 @@@ cifs_setup_session(const unsigned int x
+  	if (server->ops->sess_setup)
+  		rc = server->ops->sess_setup(xid, ses, server, nls_info);
+  
+ -	if (rc) {
+ +	if (rc)
+  		cifs_server_dbg(VFS, "Send error in SessSetup = %d\n", rc);
+++<<<<<<< HEAD
+++=======
++ 		spin_lock(&cifs_tcp_ses_lock);
++ 		if (server->tcpStatus == CifsInSessSetup)
++ 			server->tcpStatus = CifsNeedSessSetup;
++ 		spin_unlock(&cifs_tcp_ses_lock);
++ 	} else {
++ 		spin_lock(&cifs_tcp_ses_lock);
++ 		if (server->tcpStatus == CifsInSessSetup)
++ 			server->tcpStatus = CifsGood;
++ 		/* Even if one channel is active, session is in good state */
++ 		if (ses->status == CifsInSessSetup)
++ 			ses->status = CifsGood;
++ 		spin_unlock(&cifs_tcp_ses_lock);
++ 
++ 		spin_lock(&ses->chan_lock);
++ 		cifs_chan_clear_need_reconnect(ses, server);
++ 		spin_unlock(&ses->chan_lock);
++ 	}
+++>>>>>>> c1604da708d3 (cifs: make status checks in version independent callers)
+  
+  	return rc;
+  }
+@@@ -4354,13 -4462,52 +4377,58 @@@ out
+  	kfree(tree);
+  	cifs_put_tcp_super(sb);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (rc) {
++ 		spin_lock(&cifs_tcp_ses_lock);
++ 		if (tcon->tidStatus == CifsInTcon)
++ 			tcon->tidStatus = CifsNeedTcon;
++ 		spin_unlock(&cifs_tcp_ses_lock);
++ 	} else {
++ 		spin_lock(&cifs_tcp_ses_lock);
++ 		if (tcon->tidStatus == CifsInTcon)
++ 			tcon->tidStatus = CifsGood;
++ 		spin_unlock(&cifs_tcp_ses_lock);
++ 		tcon->need_reconnect = false;
++ 	}
++ 
+++>>>>>>> c1604da708d3 (cifs: make status checks in version independent callers)
+  	return rc;
+  }
+  #else
+  int cifs_tree_connect(const unsigned int xid, struct cifs_tcon *tcon, const struct nls_table *nlsc)
+  {
+ -	int rc;
+  	const struct smb_version_operations *ops = tcon->ses->server->ops;
+  
+++<<<<<<< HEAD
+ +	return ops->tree_connect(xid, tcon->ses, tcon->treeName, tcon, nlsc);
+++=======
++ 	/* only send once per connect */
++ 	spin_lock(&cifs_tcp_ses_lock);
++ 	if (tcon->ses->status != CifsGood ||
++ 	    (tcon->tidStatus != CifsNew &&
++ 	    tcon->tidStatus != CifsNeedTcon)) {
++ 		spin_unlock(&cifs_tcp_ses_lock);
++ 		return 0;
++ 	}
++ 	tcon->tidStatus = CifsInTcon;
++ 	spin_unlock(&cifs_tcp_ses_lock);
++ 
++ 	rc = ops->tree_connect(xid, tcon->ses, tcon->treeName, tcon, nlsc);
++ 	if (rc) {
++ 		spin_lock(&cifs_tcp_ses_lock);
++ 		if (tcon->tidStatus == CifsInTcon)
++ 			tcon->tidStatus = CifsNeedTcon;
++ 		spin_unlock(&cifs_tcp_ses_lock);
++ 	} else {
++ 		spin_lock(&cifs_tcp_ses_lock);
++ 		if (tcon->tidStatus == CifsInTcon)
++ 			tcon->tidStatus = CifsGood;
++ 		spin_unlock(&cifs_tcp_ses_lock);
++ 		tcon->need_reconnect = false;
++ 	}
++ 
++ 	return rc;
+++>>>>>>> c1604da708d3 (cifs: make status checks in version independent callers)
+  }
+  #endif
+diff --cc fs/cifs/sess.c
+index 1b56022e96fb,97fba1f28e4b..000000000000
+--- a/fs/cifs/sess.c
++++ b/fs/cifs/sess.c
+@@@ -1051,15 -1052,6 +1051,18 @@@ sess_establish_session(struct sess_dat
+  	mutex_unlock(&server->srv_mutex);
+  
+  	cifs_dbg(FYI, "CIFS session established successfully\n");
+++<<<<<<< HEAD
+ +	spin_lock(&ses->chan_lock);
+ +	cifs_chan_clear_need_reconnect(ses, server);
+ +	spin_unlock(&ses->chan_lock);
+ +
+ +	/* Even if one channel is active, session is in good state */
+ +	spin_lock(&GlobalMid_Lock);
+ +	ses->status = CifsGood;
+ +	spin_unlock(&GlobalMid_Lock);
+ +
+++=======
+++>>>>>>> c1604da708d3 (cifs: make status checks in version independent callers)
+  	return 0;
+  }
+  
+diff --cc fs/cifs/smb2pdu.c
+index fdd9bd57531e,1e670e56b07a..000000000000
+--- a/fs/cifs/smb2pdu.c
++++ b/fs/cifs/smb2pdu.c
+@@@ -1383,16 -1386,6 +1383,19 @@@ SMB2_sess_establish_session(struct SMB2
+  	mutex_unlock(&server->srv_mutex);
+  
+  	cifs_dbg(FYI, "SMB2/3 session established successfully\n");
+++<<<<<<< HEAD
+ +
+ +	spin_lock(&ses->chan_lock);
+ +	cifs_chan_clear_need_reconnect(ses, server);
+ +	spin_unlock(&ses->chan_lock);
+ +
+ +	/* Even if one channel is active, session is in good state */
+ +	spin_lock(&GlobalMid_Lock);
+ +	ses->status = CifsGood;
+ +	spin_unlock(&GlobalMid_Lock);
+ +
+++=======
+++>>>>>>> c1604da708d3 (cifs: make status checks in version independent callers)
+  	return rc;
+  }
+  
+@@@ -1919,8 -1913,6 +1922,11 @@@ SMB2_tcon(const unsigned int xid, struc
+  	tcon->share_flags = le32_to_cpu(rsp->ShareFlags);
+  	tcon->capabilities = rsp->Capabilities; /* we keep caps little endian */
+  	tcon->maximal_access = le32_to_cpu(rsp->MaximalAccess);
+++<<<<<<< HEAD
+ +	tcon->tidStatus = CifsGood;
+ +	tcon->need_reconnect = false;
+++=======
+++>>>>>>> c1604da708d3 (cifs: make status checks in version independent callers)
+  	tcon->tid = le32_to_cpu(rsp->hdr.Id.SyncId.TreeId);
+  	strlcpy(tcon->treeName, tree, sizeof(tcon->treeName));
+  
+* Unmerged path fs/cifs/connect.c
+* Unmerged path fs/cifs/sess.c
+* Unmerged path fs/cifs/smb2pdu.c
