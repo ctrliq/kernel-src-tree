@@ -1,0 +1,122 @@
+cifs: reconnect only the connection and not smb session where possible
+
+jira LE-4669
+Rebuild_History Non-Buildable kernel-4.18.0-553.82.1.el8_10
+commit-author Shyam Prasad N <sprasad@microsoft.com>
+commit 183eea2ee5ba968ca7c31f04a0f01fd3e5c1d014
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.82.1.el8_10/183eea2e.failed
+
+With the new per-channel bitmask for reconnect, we have an option to
+reconnect the tcp session associated with the channel without reconnecting
+the smb session. i.e. if there are still channels to operate on, we can
+continue to use the smb session and tcon.
+
+However, there are cases where it makes sense to reconnect the smb session
+even when there are active channels underneath. For example for
+SMB session expiry.
+
+With this patch, we'll have an option to do either, and use the correct
+option for specific cases.
+
+	Signed-off-by: Shyam Prasad N <sprasad@microsoft.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 183eea2ee5ba968ca7c31f04a0f01fd3e5c1d014)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/connect.c
+diff --cc fs/cifs/connect.c
+index aa59bbf815c2,7b478f5db9d6..000000000000
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@@ -1093,12 -1105,10 +1107,17 @@@ next_pdu
+  		if (server->ops->is_status_io_timeout &&
+  		    server->ops->is_status_io_timeout(buf)) {
+  			num_io_timeout++;
+++<<<<<<< HEAD
+ +			if (num_io_timeout > MAX_STATUS_IO_TIMEOUT) {
+ +				cifs_server_dbg(VFS,
+ +						"Number of request timeouts exceeded %d. Reconnecting",
+ +						MAX_STATUS_IO_TIMEOUT);
+ +				pending_reconnect = true;
+++=======
++ 			if (num_io_timeout > NUM_STATUS_IO_TIMEOUT) {
++ 				cifs_reconnect(server, false);
+++>>>>>>> 183eea2ee5ba (cifs: reconnect only the connection and not smb session where possible)
+  				num_io_timeout = 0;
+ -				continue;
+  			}
+  		}
+  
+diff --git a/fs/cifs/cifsglob.h b/fs/cifs/cifsglob.h
+index bfe603df9494..b5228374a17d 100644
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@ -978,6 +978,8 @@ struct cifs_ses {
+ 	((1UL << (ses)->chan_count) - 1)
+ #define CIFS_ALL_CHANS_NEED_RECONNECT(ses)	\
+ 	((ses)->chans_need_reconnect == CIFS_ALL_CHANNELS_SET(ses))
++#define CIFS_SET_ALL_CHANS_NEED_RECONNECT(ses)	\
++	((ses)->chans_need_reconnect = CIFS_ALL_CHANNELS_SET(ses))
+ #define CIFS_CHAN_NEEDS_RECONNECT(ses, index)	\
+ 	test_bit((index), &(ses)->chans_need_reconnect)
+ 
+diff --git a/fs/cifs/cifsproto.h b/fs/cifs/cifsproto.h
+index 081ad010ce30..ba46fcd2f818 100644
+--- a/fs/cifs/cifsproto.h
++++ b/fs/cifs/cifsproto.h
+@@ -130,7 +130,8 @@ extern int SendReceiveBlockingLock(const unsigned int xid,
+ 			struct smb_hdr *in_buf ,
+ 			struct smb_hdr *out_buf,
+ 			int *bytes_returned);
+-extern int cifs_reconnect(struct TCP_Server_Info *server);
++extern int cifs_reconnect(struct TCP_Server_Info *server,
++			  bool mark_smb_session);
+ extern int checkSMB(char *buf, unsigned int len, struct TCP_Server_Info *srvr);
+ extern bool is_valid_oplock_break(char *, struct TCP_Server_Info *);
+ extern bool backup_cred(struct cifs_sb_info *);
+diff --git a/fs/cifs/cifssmb.c b/fs/cifs/cifssmb.c
+index 141047242013..07c06c719072 100644
+--- a/fs/cifs/cifssmb.c
++++ b/fs/cifs/cifssmb.c
+@@ -1539,7 +1539,7 @@ cifs_readv_receive(struct TCP_Server_Info *server, struct mid_q_entry *mid)
+ 
+ 	if (server->ops->is_session_expired &&
+ 	    server->ops->is_session_expired(buf)) {
+-		cifs_reconnect(server);
++		cifs_reconnect(server, true);
+ 		return -1;
+ 	}
+ 
+* Unmerged path fs/cifs/connect.c
+diff --git a/fs/cifs/smb2ops.c b/fs/cifs/smb2ops.c
+index 591bb60c97a0..f5f7fcca67ec 100644
+--- a/fs/cifs/smb2ops.c
++++ b/fs/cifs/smb2ops.c
+@@ -4726,7 +4726,7 @@ handle_read_data(struct TCP_Server_Info *server, struct mid_q_entry *mid,
+ 	if (server->ops->is_session_expired &&
+ 	    server->ops->is_session_expired(buf)) {
+ 		if (!is_offloaded)
+-			cifs_reconnect(server);
++			cifs_reconnect(server, true);
+ 		return -1;
+ 	}
+ 
+@@ -5141,13 +5141,13 @@ smb3_receive_transform(struct TCP_Server_Info *server,
+ 						sizeof(struct smb2_hdr)) {
+ 		cifs_server_dbg(VFS, "Transform message is too small (%u)\n",
+ 			 pdu_length);
+-		cifs_reconnect(server);
++		cifs_reconnect(server, true);
+ 		return -ECONNABORTED;
+ 	}
+ 
+ 	if (pdu_length < orig_len + sizeof(struct smb2_transform_hdr)) {
+ 		cifs_server_dbg(VFS, "Transform message is broken\n");
+-		cifs_reconnect(server);
++		cifs_reconnect(server, true);
+ 		return -ECONNABORTED;
+ 	}
+ 
