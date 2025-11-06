@@ -1,0 +1,83 @@
+cifs: fix session state transition to avoid use-after-free issue
+
+jira LE-4669
+Rebuild_History Non-Buildable kernel-4.18.0-553.82.1.el8_10
+commit-author Winston Wen <wentao@uniontech.com>
+commit ff7d80a9f2711bf3d9fe1cfb70b3fd15c50584b7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.82.1.el8_10/ff7d80a9.failed
+
+We switch session state to SES_EXITING without cifs_tcp_ses_lock now,
+it may lead to potential use-after-free issue.
+
+Consider the following execution processes:
+
+Thread 1:
+__cifs_put_smb_ses()
+    spin_lock(&cifs_tcp_ses_lock)
+    if (--ses->ses_count > 0)
+        spin_unlock(&cifs_tcp_ses_lock)
+        return
+    spin_unlock(&cifs_tcp_ses_lock)
+        ---> **GAP**
+    spin_lock(&ses->ses_lock)
+    if (ses->ses_status == SES_GOOD)
+        ses->ses_status = SES_EXITING
+    spin_unlock(&ses->ses_lock)
+
+Thread 2:
+cifs_find_smb_ses()
+    spin_lock(&cifs_tcp_ses_lock)
+    list_for_each_entry(ses, ...)
+        spin_lock(&ses->ses_lock)
+        if (ses->ses_status == SES_EXITING)
+            spin_unlock(&ses->ses_lock)
+            continue
+        ...
+        spin_unlock(&ses->ses_lock)
+    if (ret)
+        cifs_smb_ses_inc_refcount(ret)
+    spin_unlock(&cifs_tcp_ses_lock)
+
+If thread 1 is preempted in the gap and thread 2 start executing, thread 2
+will get the session, and soon thread 1 will switch the session state to
+SES_EXITING and start releasing it, even though thread 1 had increased the
+session's refcount and still uses it.
+
+So switch session state under cifs_tcp_ses_lock to eliminate this gap.
+
+	Signed-off-by: Winston Wen <wentao@uniontech.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit ff7d80a9f2711bf3d9fe1cfb70b3fd15c50584b7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/connect.c
+diff --cc fs/cifs/connect.c
+index ca2926c7b59e,85dd1b373974..000000000000
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@@ -1814,14 -1976,10 +1818,21 @@@ void cifs_put_smb_ses(struct cifs_ses *
+  	/* ses_count can never go negative */
+  	WARN_ON(ses->ses_count < 0);
+  
+++<<<<<<< HEAD:fs/cifs/connect.c
+ +	spin_lock(&GlobalMid_Lock);
+ +	if (ses->status == CifsGood)
+ +		ses->status = CifsExiting;
+ +	spin_unlock(&GlobalMid_Lock);
+ +
+ +	cifs_free_ipc(ses);
+ +
+ +	if (ses->status == CifsExiting && server->ops->logoff) {
+++=======
++ 	spin_lock(&ses->ses_lock);
++ 	if (ses->ses_status == SES_EXITING && server->ops->logoff) {
++ 		spin_unlock(&ses->ses_lock);
++ 		cifs_free_ipc(ses);
+++>>>>>>> ff7d80a9f271 (cifs: fix session state transition to avoid use-after-free issue):fs/smb/client/connect.c
+  		xid = get_xid();
+  		rc = server->ops->logoff(xid, ses);
+  		if (rc)
+* Unmerged path fs/cifs/connect.c
