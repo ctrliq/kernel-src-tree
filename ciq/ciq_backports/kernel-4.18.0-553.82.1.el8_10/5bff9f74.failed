@@ -1,0 +1,109 @@
+cifs: protect session status check in smb2_reconnect()
+
+jira LE-4669
+Rebuild_History Non-Buildable kernel-4.18.0-553.82.1.el8_10
+commit-author Paulo Alcantara <pc@manguebit.com>
+commit 5bff9f741af60b143a5ae73417a8ec47fd5ff2f4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.82.1.el8_10/5bff9f74.failed
+
+Use @ses->ses_lock to protect access of @ses->ses_status.
+
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Paulo Alcantara (SUSE) <pc@manguebit.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 5bff9f741af60b143a5ae73417a8ec47fd5ff2f4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/smb2pdu.c
+diff --cc fs/cifs/smb2pdu.c
+index 4261a90e8093,3ce63f0cd9f5..000000000000
+--- a/fs/cifs/smb2pdu.c
++++ b/fs/cifs/smb2pdu.c
+@@@ -176,19 -174,22 +176,34 @@@ smb2_reconnect(__le16 smb2_command, str
+  			return -ENODEV;
+  		}
+  	}
+++<<<<<<< HEAD
+ +	if ((!tcon->ses) || (tcon->ses->status == CifsExiting) ||
+ +	    (!tcon->ses->server) || !server)
+++=======
++ 	spin_unlock(&tcon->tc_lock);
++ 
++ 	ses = tcon->ses;
++ 	if (!ses)
++ 		return -EIO;
++ 	spin_lock(&ses->ses_lock);
++ 	if (ses->ses_status == SES_EXITING) {
++ 		spin_unlock(&ses->ses_lock);
++ 		return -EIO;
++ 	}
++ 	spin_unlock(&ses->ses_lock);
++ 	if (!ses->server || !server)
+++>>>>>>> 5bff9f741af6 (cifs: protect session status check in smb2_reconnect())
+  		return -EIO;
+  
+ -	spin_lock(&server->srv_lock);
+ -	if (server->tcpStatus == CifsNeedReconnect) {
+ +	ses = tcon->ses;
+ +	retries = server->nr_targets;
+ +
+ +	/*
+ +	 * Give demultiplex thread up to 10 seconds to each target available for
+ +	 * reconnect -- should be greater than cifs socket timeout which is 7
+ +	 * seconds.
+ +	 */
+ +	while (server->tcpStatus == CifsNeedReconnect) {
+  		/*
+  		 * Return to caller for TREE_DISCONNECT and LOGOFF and CLOSE
+  		 * here since they are implicitly done when session drops.
+@@@ -201,36 -202,16 +216,45 @@@
+  		case SMB2_CANCEL:
+  		case SMB2_CLOSE:
+  		case SMB2_OPLOCK_BREAK:
+ -			spin_unlock(&server->srv_lock);
+  			return -EAGAIN;
+  		}
+ +
+ +		rc = wait_event_interruptible_timeout(server->response_q,
+ +						      (server->tcpStatus != CifsNeedReconnect),
+ +						      10 * HZ);
+ +		if (rc < 0) {
+ +			cifs_dbg(FYI, "%s: aborting reconnect due to a received signal by the process\n",
+ +				 __func__);
+ +			return -ERESTARTSYS;
+ +		}
+ +
+ +		/* are we still trying to reconnect? */
+ +		if (server->tcpStatus != CifsNeedReconnect)
+ +			break;
+ +
+ +		if (retries && --retries)
+ +			continue;
+ +
+ +		/*
+ +		 * on "soft" mounts we wait once. Hard mounts keep
+ +		 * retrying until process is killed or server comes
+ +		 * back on-line
+ +		 */
+ +		if (!tcon->retry) {
+ +			cifs_dbg(FYI, "gave up waiting on reconnect in smb_init\n");
+ +			return -EHOSTDOWN;
+ +		}
+ +		retries = server->nr_targets;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	spin_unlock(&server->srv_lock);
++ 
++ again:
++ 	rc = cifs_wait_for_server_reconnect(server, tcon->retry);
++ 	if (rc)
++ 		return rc;
+++>>>>>>> 5bff9f741af6 (cifs: protect session status check in smb2_reconnect())
+  
+  	spin_lock(&ses->chan_lock);
+  	if (!cifs_chan_needs_reconnect(ses, server) && !tcon->need_reconnect) {
+* Unmerged path fs/cifs/smb2pdu.c
