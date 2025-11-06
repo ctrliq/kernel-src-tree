@@ -1,0 +1,1798 @@
+cifs: avoid use of global locks for high contention data
+
+jira LE-4669
+Rebuild_History Non-Buildable kernel-4.18.0-553.82.1.el8_10
+commit-author Shyam Prasad N <sprasad@microsoft.com>
+commit d7d7a66aacd6fd8ca57baf08a7bac5421282f6f8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.82.1.el8_10/d7d7a66a.failed
+
+During analysis of multichannel perf, it was seen that
+the global locks cifs_tcp_ses_lock and GlobalMid_Lock, which
+were shared between various data structures were causing a
+lot of contention points.
+
+With this change, we're breaking down the use of these locks
+by introducing new locks at more granular levels. i.e.
+server->srv_lock, ses->ses_lock and tcon->tc_lock to protect
+the unprotected fields of server, session and tcon structs;
+and server->mid_lock to protect mid related lists and entries
+at server level.
+
+	Signed-off-by: Shyam Prasad N <sprasad@microsoft.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit d7d7a66aacd6fd8ca57baf08a7bac5421282f6f8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/cifsencrypt.c
+#	fs/cifs/cifsfs.c
+#	fs/cifs/cifsglob.h
+#	fs/cifs/cifssmb.c
+#	fs/cifs/connect.c
+#	fs/cifs/misc.c
+#	fs/cifs/smb1ops.c
+#	fs/cifs/smb2ops.c
+#	fs/cifs/smb2pdu.c
+#	fs/cifs/smb2transport.c
+#	fs/cifs/transport.c
+diff --cc fs/cifs/cifsencrypt.c
+index 349d07c5d1e8,8f7835ccbca1..000000000000
+--- a/fs/cifs/cifsencrypt.c
++++ b/fs/cifs/cifsencrypt.c
+@@@ -141,9 -141,13 +141,19 @@@ int cifs_sign_rqst(struct smb_rqst *rqs
+  	if ((cifs_pdu == NULL) || (server == NULL))
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	if (!(cifs_pdu->Flags2 & SMBFLG2_SECURITY_SIGNATURE) ||
+ +	    server->tcpStatus == CifsNeedNegotiate)
+ +		return rc;
+++=======
++ 	spin_lock(&server->srv_lock);
++ 	if (!(cifs_pdu->Flags2 & SMBFLG2_SECURITY_SIGNATURE) ||
++ 	    server->tcpStatus == CifsNeedNegotiate) {
++ 		spin_unlock(&server->srv_lock);
++ 		return rc;
++ 	}
++ 	spin_unlock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  
+  	if (!server->session_estab) {
+  		memcpy(cifs_pdu->Signature.SecuritySignature, "BSRSPYL", 8);
+diff --cc fs/cifs/cifsfs.c
+index ded3830746ce,af4c5632490e..000000000000
+--- a/fs/cifs/cifsfs.c
++++ b/fs/cifs/cifsfs.c
+@@@ -710,7 -731,8 +710,12 @@@ static void cifs_umount_begin(struct su
+  	tcon = cifs_sb_master_tcon(cifs_sb);
+  
+  	spin_lock(&cifs_tcp_ses_lock);
+++<<<<<<< HEAD
+ +	if ((tcon->tc_count > 1) || (tcon->tidStatus == CifsExiting)) {
+++=======
++ 	spin_lock(&tcon->tc_lock);
++ 	if ((tcon->tc_count > 1) || (tcon->status == TID_EXITING)) {
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  		/* we have other mounts to same share or we have
+  		   already tried to force umount this and woken up
+  		   all waiting network requests, nothing to do */
+@@@ -717,7 -740,8 +723,12 @@@
+  		spin_unlock(&cifs_tcp_ses_lock);
+  		return;
+  	} else if (tcon->tc_count == 1)
+++<<<<<<< HEAD
+ +		tcon->tidStatus = CifsExiting;
+++=======
++ 		tcon->status = TID_EXITING;
++ 	spin_unlock(&tcon->tc_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  	spin_unlock(&cifs_tcp_ses_lock);
+  
+  	/* cancel_brl_requests(tcon); */ /* BB mark all brl mids as exiting */
+diff --cc fs/cifs/cifsglob.h
+index 9e7f8c48e52c,3070407cafa7..000000000000
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@@ -979,8 -1007,10 +981,9 @@@ struct cifs_chan 
+   */
+  struct cifs_ses {
+  	struct list_head smb_ses_list;
+ -	struct list_head rlist; /* reconnect list */
+  	struct list_head tcon_list;
+  	struct cifs_tcon *tcon_ipc;
++ 	spinlock_t ses_lock;  /* protect anything here that is not protected */
+  	struct mutex session_mutex;
+  	struct TCP_Server_Info *server;	/* pointer to server info */
+  	int ses_count;		/* reference counter */
+@@@ -1849,34 -1903,78 +1853,86 @@@ require use of the stronger protocol *
+   */
+  
+  /****************************************************************************
+-  *  Locking notes.  All updates to global variables and lists should be
+-  *                  protected by spinlocks or semaphores.
++  * Here are all the locks (spinlock, mutex, semaphore) in cifs.ko, arranged according
++  * to the locking order. i.e. if two locks are to be held together, the lock that
++  * appears higher in this list needs to be taken before the other.
+   *
+-  *  Spinlocks
+-  *  ---------
+-  *  GlobalMid_Lock protects:
+-  *	list operations on pending_mid_q and oplockQ
+-  *      updates to XID counters, multiplex id  and SMB sequence numbers
+-  *      list operations on global DnotifyReqList
+-  *      updates to ses->status and TCP_Server_Info->tcpStatus
+-  *      updates to server->CurrentMid
+-  *  tcp_ses_lock protects:
+-  *	list operations on tcp and SMB session lists
+-  *  tcon->open_file_lock protects the list of open files hanging off the tcon
+-  *  inode->open_file_lock protects the openFileList hanging off the inode
+-  *  cfile->file_info_lock protects counters and fields in cifs file struct
+-  *  f_owner.lock protects certain per file struct operations
+-  *  mapping->page_lock protects certain per page operations
++  * If you hold a lock that is lower in this list, and you need to take a higher lock
++  * (or if you think that one of the functions that you're calling may need to), first
++  * drop the lock you hold, pick up the higher lock, then the lower one. This will
++  * ensure that locks are picked up only in one direction in the below table
++  * (top to bottom).
+   *
+-  *  Note that the cifs_tcon.open_file_lock should be taken before
+-  *  not after the cifsInodeInfo.open_file_lock
++  * Also, if you expect a function to be called with a lock held, explicitly document
++  * this in the comments on top of your function definition.
+   *
+++<<<<<<< HEAD
+ + *  Semaphores
+ + *  ----------
+ + *  sesSem     operations on smb session
+ + *  tconSem    operations on tree connection
+ + *  fh_sem      file handle reconnection operations
+++=======
++  * And also, try to keep the critical sections (lock hold time) to be as minimal as
++  * possible. Blocking / calling other functions with a lock held always increase
++  * the risk of a possible deadlock.
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+   *
++  * Following this rule will avoid unnecessary deadlocks, which can get really hard to
++  * debug. Also, any new lock that you introduce, please add to this list in the correct
++  * order.
++  *
++  * Please populate this list whenever you introduce new locks in your changes. Or in
++  * case I've missed some existing locks. Please ensure that it's added in the list
++  * based on the locking order expected.
++  *
++  * =====================================================================================
++  * Lock				Protects			Initialization fn
++  * =====================================================================================
++  * vol_list_lock
++  * vol_info->ctx_lock		vol_info->ctx
++  * cifs_sb_info->tlink_tree_lock	cifs_sb_info->tlink_tree	cifs_setup_cifs_sb
++  * TCP_Server_Info->		TCP_Server_Info			cifs_get_tcp_session
++  * reconnect_mutex
++  * TCP_Server_Info->srv_mutex	TCP_Server_Info			cifs_get_tcp_session
++  * cifs_ses->session_mutex		cifs_ses		sesInfoAlloc
++  *				cifs_tcon
++  * cifs_tcon->open_file_lock	cifs_tcon->openFileList		tconInfoAlloc
++  *				cifs_tcon->pending_opens
++  * cifs_tcon->stat_lock		cifs_tcon->bytes_read		tconInfoAlloc
++  *				cifs_tcon->bytes_written
++  * cifs_tcp_ses_lock		cifs_tcp_ses_list		sesInfoAlloc
++  * GlobalMid_Lock		GlobalMaxActiveXid		init_cifs
++  *				GlobalCurrentXid
++  *				GlobalTotalActiveXid
++  * TCP_Server_Info->srv_lock	(anything in struct not protected by another lock and can change)
++  * TCP_Server_Info->mid_lock	TCP_Server_Info->pending_mid_q	cifs_get_tcp_session
++  *				->CurrentMid
++  *				(any changes in mid_q_entry fields)
++  * TCP_Server_Info->req_lock	TCP_Server_Info->in_flight	cifs_get_tcp_session
++  *				->credits
++  *				->echo_credits
++  *				->oplock_credits
++  *				->reconnect_instance
++  * cifs_ses->ses_lock		(anything that is not protected by another lock and can change)
++  * cifs_ses->iface_lock		cifs_ses->iface_list		sesInfoAlloc
++  *				->iface_count
++  *				->iface_last_update
++  * cifs_ses->chan_lock		cifs_ses->chans
++  *				->chans_need_reconnect
++  *				->chans_in_reconnect
++  * cifs_tcon->tc_lock		(anything that is not protected by another lock and can change)
++  * cifsInodeInfo->open_file_lock	cifsInodeInfo->openFileList	cifs_alloc_inode
++  * cifsInodeInfo->writers_lock	cifsInodeInfo->writers		cifsInodeInfo_alloc
++  * cifsInodeInfo->lock_sem	cifsInodeInfo->llist		cifs_init_once
++  *				->can_cache_brlcks
++  * cifsInodeInfo->deferred_lock	cifsInodeInfo->deferred_closes	cifsInodeInfo_alloc
++  * cached_fid->fid_mutex		cifs_tcon->crfid		tconInfoAlloc
++  * cifsFileInfo->fh_mutex		cifsFileInfo			cifs_new_fileinfo
++  * cifsFileInfo->file_info_lock	cifsFileInfo->count		cifs_new_fileinfo
++  *				->invalidHandle			initiate_cifs_search
++  *				->oplock_break_cancelled
++  * cifs_aio_ctx->aio_mutex		cifs_aio_ctx			cifs_aio_ctx_alloc
+   ****************************************************************************/
+  
+  #ifdef DECLARE_GLOBALS_HERE
+diff --cc fs/cifs/cifssmb.c
+index 9d8d1d5da728,04a4c304d004..000000000000
+--- a/fs/cifs/cifssmb.c
++++ b/fs/cifs/cifssmb.c
+@@@ -89,6 -73,15 +89,18 @@@ cifs_mark_open_files_invalid(struct cif
+  	struct list_head *tmp;
+  	struct list_head *tmp1;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* only send once per connect */
++ 	spin_lock(&tcon->ses->ses_lock);
++ 	if ((tcon->ses->ses_status != SES_GOOD) || (tcon->status != TID_NEED_RECON)) {
++ 		spin_unlock(&tcon->ses->ses_lock);
++ 		return;
++ 	}
++ 	tcon->status = TID_IN_FILES_INVALIDATE;
++ 	spin_unlock(&tcon->ses->ses_lock);
++ 
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  	/* list all files open on tree connection and mark them invalid */
+  	spin_lock(&tcon->open_file_lock);
+  	list_for_each_safe(tmp, tmp1, &tcon->openFileList) {
+@@@ -105,6 -98,11 +117,14 @@@
+  	memset(tcon->crfid.fid, 0, sizeof(struct cifs_fid));
+  	mutex_unlock(&tcon->crfid.fid_mutex);
+  
+++<<<<<<< HEAD
+++=======
++ 	spin_lock(&tcon->tc_lock);
++ 	if (tcon->status == TID_IN_FILES_INVALIDATE)
++ 		tcon->status = TID_NEED_TCON;
++ 	spin_unlock(&tcon->tc_lock);
++ 
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  	/*
+  	 * BB Add call to invalidate_inodes(sb) for all superblocks mounted
+  	 * to this tcon.
+@@@ -136,15 -134,18 +156,28 @@@ cifs_reconnect_tcon(struct cifs_tcon *t
+  	 * only tree disconnect, open, and write, (and ulogoff which does not
+  	 * have tcon) are allowed as we start force umount
+  	 */
+++<<<<<<< HEAD
+ +	if (tcon->tidStatus == CifsExiting) {
+ +		if (smb_command != SMB_COM_WRITE_ANDX &&
+ +		    smb_command != SMB_COM_OPEN_ANDX &&
+ +		    smb_command != SMB_COM_TREE_DISCONNECT) {
+++=======
++ 	spin_lock(&tcon->tc_lock);
++ 	if (tcon->status == TID_EXITING) {
++ 		if (smb_command != SMB_COM_WRITE_ANDX &&
++ 		    smb_command != SMB_COM_OPEN_ANDX &&
++ 		    smb_command != SMB_COM_TREE_DISCONNECT) {
++ 			spin_unlock(&tcon->tc_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  			cifs_dbg(FYI, "can not send cmd %d while umounting\n",
+  				 smb_command);
+  			return -ENODEV;
+  		}
+  	}
+++<<<<<<< HEAD
+++=======
++ 	spin_unlock(&tcon->tc_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  
+  	retries = server->nr_targets;
+  
+@@@ -164,8 -165,12 +197,17 @@@
+  		}
+  
+  		/* are we still trying to reconnect? */
+++<<<<<<< HEAD
+ +		if (server->tcpStatus != CifsNeedReconnect)
+ +			break;
+++=======
++ 		spin_lock(&server->srv_lock);
++ 		if (server->tcpStatus != CifsNeedReconnect) {
++ 			spin_unlock(&server->srv_lock);
++ 			break;
++ 		}
++ 		spin_unlock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  
+  		if (retries && --retries)
+  			continue;
+@@@ -202,11 -201,13 +244,21 @@@
+  	 * and the server never sends an answer the socket will be closed
+  	 * and tcpStatus set to reconnect.
+  	 */
+++<<<<<<< HEAD
+++	if (server->tcpStatus == CifsNeedReconnect) {
+++=======
++ 	spin_lock(&server->srv_lock);
+  	if (server->tcpStatus == CifsNeedReconnect) {
++ 		spin_unlock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  		rc = -EHOSTDOWN;
+ +		mutex_unlock(&ses->session_mutex);
+  		goto out;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	spin_unlock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  
+  	/*
+  	 * need to prevent multiple threads trying to simultaneously
+diff --cc fs/cifs/connect.c
+index 48c43d43e1df,931d4b6fafc8..000000000000
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@@ -181,28 -182,68 +181,73 @@@ static void cifs_resolve_server(struct 
+  				__func__, rc);
+  	}
+  
+ -	cifs_server_unlock(server);
+ +	mutex_unlock(&server->srv_mutex);
+  }
+  
+++<<<<<<< HEAD
+ +/**
+++=======
++ /*
++  * Update the tcpStatus for the server.
++  * This is used to signal the cifsd thread to call cifs_reconnect
++  * ONLY cifsd thread should call cifs_reconnect. For any other
++  * thread, use this function
++  *
++  * @server: the tcp ses for which reconnect is needed
++  * @all_channels: if this needs to be done for all channels
++  */
++ void
++ cifs_signal_cifsd_for_reconnect(struct TCP_Server_Info *server,
++ 				bool all_channels)
++ {
++ 	struct TCP_Server_Info *pserver;
++ 	struct cifs_ses *ses;
++ 	int i;
++ 
++ 	/* If server is a channel, select the primary channel */
++ 	pserver = CIFS_SERVER_IS_CHAN(server) ? server->primary_server : server;
++ 
++ 	spin_lock(&pserver->srv_lock);
++ 	if (!all_channels) {
++ 		pserver->tcpStatus = CifsNeedReconnect;
++ 		spin_unlock(&pserver->srv_lock);
++ 		return;
++ 	}
++ 	spin_unlock(&pserver->srv_lock);
++ 
++ 	spin_lock(&cifs_tcp_ses_lock);
++ 	list_for_each_entry(ses, &pserver->smb_ses_list, smb_ses_list) {
++ 		spin_lock(&ses->chan_lock);
++ 		for (i = 0; i < ses->chan_count; i++) {
++ 			spin_lock(&ses->chans[i].server->srv_lock);
++ 			ses->chans[i].server->tcpStatus = CifsNeedReconnect;
++ 			spin_unlock(&ses->chans[i].server->srv_lock);
++ 		}
++ 		spin_unlock(&ses->chan_lock);
++ 	}
++ 	spin_unlock(&cifs_tcp_ses_lock);
++ }
++ 
++ /*
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+   * Mark all sessions and tcons for reconnect.
+ - * IMPORTANT: make sure that this gets called only from
+ - * cifsd thread. For any other thread, use
+ - * cifs_signal_cifsd_for_reconnect
+   *
+ - * @server: the tcp ses for which reconnect is needed
+   * @server needs to be previously set to CifsNeedReconnect.
+ - * @mark_smb_session: whether even sessions need to be marked
+   */
+ -void
+ -cifs_mark_tcp_ses_conns_for_reconnect(struct TCP_Server_Info *server,
+ -				      bool mark_smb_session)
+ +static void cifs_mark_tcp_ses_conns_for_reconnect(struct TCP_Server_Info *server)
+  {
+ -	struct TCP_Server_Info *pserver;
+ -	struct cifs_ses *ses, *nses;
+ +	unsigned int num_sessions = 0;
+ +	struct cifs_ses *ses;
+  	struct cifs_tcon *tcon;
+ +	struct mid_q_entry *mid, *nmid;
+ +	struct list_head retry_list;
+ +	struct TCP_Server_Info *pserver;
+  
+ +	server->maxBuf = 0;
+ +	server->max_read = 0;
+ +
+ +	cifs_dbg(FYI, "Mark tcp session as need reconnect\n");
+ +	trace_smb3_reconnect(server->CurrentMid, server->conn_id, server->hostname);
+  	/*
+  	 * before reconnecting the tcp session, mark the smb session (uid) and the tid bad so they
+  	 * are not used until reconnected.
+@@@ -278,8 -327,8 +323,13 @@@ next_session
+  		list_move(&mid->qhead, &retry_list);
+  		mid->mid_flags |= MID_DELETED;
+  	}
+++<<<<<<< HEAD
+ +	spin_unlock(&GlobalMid_Lock);
+ +	mutex_unlock(&server->srv_mutex);
+++=======
++ 	spin_unlock(&server->mid_lock);
++ 	cifs_server_unlock(server);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  
+  	cifs_dbg(FYI, "%s: issuing mid callbacks\n", __func__);
+  	list_for_each_entry_safe(mid, nmid, &retry_list, qhead) {
+@@@ -297,16 -346,21 +347,29 @@@
+  
+  static bool cifs_tcp_ses_needs_reconnect(struct TCP_Server_Info *server, int num_targets)
+  {
+++<<<<<<< HEAD
+ +	spin_lock(&GlobalMid_Lock);
+ +	server->nr_targets = num_targets;
+ +	if (server->tcpStatus == CifsExiting) {
+ +		/* the demux thread will exit normally next time through the loop */
+ +		spin_unlock(&GlobalMid_Lock);
+++=======
++ 	spin_lock(&server->srv_lock);
++ 	server->nr_targets = num_targets;
++ 	if (server->tcpStatus == CifsExiting) {
++ 		/* the demux thread will exit normally next time through the loop */
++ 		spin_unlock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  		wake_up(&server->response_q);
+  		return false;
+  	}
+ -
+ -	cifs_dbg(FYI, "Mark tcp session as need reconnect\n");
+ -	trace_smb3_reconnect(server->CurrentMid, server->conn_id,
+ -			     server->hostname);
+  	server->tcpStatus = CifsNeedReconnect;
+++<<<<<<< HEAD
+ +	spin_unlock(&GlobalMid_Lock);
+++=======
++ 
++ 	spin_unlock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  	return true;
+  }
+  
+@@@ -348,12 -410,13 +411,19 @@@ static int __cifs_reconnect(struct TCP_
+  		} else {
+  			atomic_inc(&tcpSesReconnectCount);
+  			set_credits(server, 1);
+++<<<<<<< HEAD
+ +			spin_lock(&GlobalMid_Lock);
+ +			if (server->tcpStatus != CifsExiting)
+ +				server->tcpStatus = CifsNeedNegotiate;
+ +			spin_unlock(&GlobalMid_Lock);
+++=======
++ 			spin_lock(&server->srv_lock);
++ 			if (server->tcpStatus != CifsExiting)
++ 				server->tcpStatus = CifsNeedNegotiate;
++ 			spin_unlock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  			cifs_swn_reset_server_dstaddr(server);
+ -			cifs_server_unlock(server);
+ -			mod_delayed_work(cifsiod_wq, &server->reconnect, 0);
+ +			mutex_unlock(&server->srv_mutex);
+  		}
+  	} while (server->tcpStatus == CifsNeedReconnect);
+  
+@@@ -467,12 -537,12 +537,19 @@@ static int reconnect_dfs_server(struct 
+  		 */
+  		atomic_inc(&tcpSesReconnectCount);
+  		set_credits(server, 1);
+++<<<<<<< HEAD
+ +		spin_lock(&GlobalMid_Lock);
+ +		if (server->tcpStatus != CifsExiting)
+ +			server->tcpStatus = CifsNeedNegotiate;
+ +		spin_unlock(&GlobalMid_Lock);
+++=======
++ 		spin_lock(&server->srv_lock);
++ 		if (server->tcpStatus != CifsExiting)
++ 			server->tcpStatus = CifsNeedNegotiate;
++ 		spin_unlock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  		cifs_swn_reset_server_dstaddr(server);
+ -		cifs_server_unlock(server);
+ +		mutex_unlock(&server->srv_mutex);
+  		mod_delayed_work(cifsiod_wq, &server->reconnect, 0);
+  	} while (server->tcpStatus == CifsNeedReconnect);
+  
+@@@ -482,22 -552,24 +559,34 @@@
+  	dfs_cache_free_tgts(&tl);
+  
+  	/* Need to set up echo worker again once connection has been established */
+++<<<<<<< HEAD
+++	if (server->tcpStatus == CifsNeedNegotiate)
+++		mod_delayed_work(cifsiod_wq, &server->echo, 0);
+++=======
++ 	spin_lock(&server->srv_lock);
+  	if (server->tcpStatus == CifsNeedNegotiate)
+  		mod_delayed_work(cifsiod_wq, &server->echo, 0);
++ 	spin_unlock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  
+  	wake_up(&server->response_q);
+  	return rc;
+  }
+  
+ -int cifs_reconnect(struct TCP_Server_Info *server, bool mark_smb_session)
+ +int cifs_reconnect(struct TCP_Server_Info *server)
+  {
+  	/* If tcp session is not an dfs connection, then reconnect to last target server */
+- 	spin_lock(&cifs_tcp_ses_lock);
++ 	spin_lock(&server->srv_lock);
+  	if (!server->is_dfs_conn) {
+++<<<<<<< HEAD
+ +		spin_unlock(&cifs_tcp_ses_lock);
+ +		return __cifs_reconnect(server);
+++=======
++ 		spin_unlock(&server->srv_lock);
++ 		return __cifs_reconnect(server, mark_smb_session);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  	}
+- 	spin_unlock(&cifs_tcp_ses_lock);
++ 	spin_unlock(&server->srv_lock);
+  
+  	mutex_lock(&server->refpath_lock);
+  	if (!server->origin_fullpath || !server->leaf_fullpath) {
+@@@ -593,15 -665,18 +682,27 @@@ server_unresponsive(struct TCP_Server_I
+  	 * 65s kernel_recvmsg times out, and we see that we haven't gotten
+  	 *     a response in >60s.
+  	 */
+++<<<<<<< HEAD
+++=======
++ 	spin_lock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  	if ((server->tcpStatus == CifsGood ||
+  	    server->tcpStatus == CifsNeedNegotiate) &&
+  	    (!server->ops->can_echo || server->ops->can_echo(server)) &&
+  	    time_after(jiffies, server->lstrp + 3 * server->echo_interval)) {
+++<<<<<<< HEAD
+++=======
++ 		spin_unlock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  		cifs_server_dbg(VFS, "has not responded in %lu seconds. Reconnecting...\n",
+  			 (3 * server->echo_interval) / HZ);
+ -		cifs_reconnect(server, false);
+ +		cifs_reconnect(server);
+  		return true;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	spin_unlock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  
+  	return false;
+  }
+@@@ -643,13 -721,18 +744,27 @@@ cifs_readv_from_socket(struct TCP_Serve
+  		else
+  			length = sock_recvmsg(server->ssocket, smb_msg, 0);
+  
+++<<<<<<< HEAD
+ +		if (server->tcpStatus == CifsExiting)
+++=======
++ 		spin_lock(&server->srv_lock);
++ 		if (server->tcpStatus == CifsExiting) {
++ 			spin_unlock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  			return -ESHUTDOWN;
+ -		}
+  
+  		if (server->tcpStatus == CifsNeedReconnect) {
+++<<<<<<< HEAD
+ +			cifs_reconnect(server);
+ +			return -ECONNABORTED;
+ +		}
+++=======
++ 			spin_unlock(&server->srv_lock);
++ 			cifs_reconnect(server, false);
++ 			return -ECONNABORTED;
++ 		}
++ 		spin_unlock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  
+  		if (length == -ERESTARTSYS ||
+  		    length == -EAGAIN ||
+@@@ -825,9 -910,9 +940,15 @@@ static void clean_demultiplex_info(stru
+  	cancel_delayed_work_sync(&server->echo);
+  	cancel_delayed_work_sync(&server->resolve);
+  
+++<<<<<<< HEAD
+ +	spin_lock(&GlobalMid_Lock);
+ +	server->tcpStatus = CifsExiting;
+ +	spin_unlock(&GlobalMid_Lock);
+++=======
++ 	spin_lock(&server->srv_lock);
++ 	server->tcpStatus = CifsExiting;
++ 	spin_unlock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  	wake_up_all(&server->response_q);
+  
+  	/* check if we have blocked requests that need to free */
+@@@ -1453,9 -1535,9 +1581,15 @@@ cifs_put_tcp_session(struct TCP_Server_
+  	else
+  		cancel_delayed_work_sync(&server->reconnect);
+  
+++<<<<<<< HEAD
+ +	spin_lock(&GlobalMid_Lock);
+ +	server->tcpStatus = CifsExiting;
+ +	spin_unlock(&GlobalMid_Lock);
+++=======
++ 	spin_lock(&server->srv_lock);
++ 	server->tcpStatus = CifsExiting;
++ 	spin_unlock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  
+  	cifs_crypto_secmech_release(server);
+  
+@@@ -1609,7 -1688,9 +1745,13 @@@ smbd_connected
+  	 * to the struct since the kernel thread not created yet
+  	 * no need to spinlock this update of tcpStatus
+  	 */
+++<<<<<<< HEAD
+++	tcp_ses->tcpStatus = CifsNeedNegotiate;
+++=======
++ 	spin_lock(&tcp_ses->srv_lock);
+  	tcp_ses->tcpStatus = CifsNeedNegotiate;
++ 	spin_unlock(&tcp_ses->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  
+  	if ((ctx->max_credits < 20) || (ctx->max_credits > 60000))
+  		tcp_ses->max_credits = SMB2_MAX_CREDITS_AVAILABLE;
+@@@ -1790,14 -1868,17 +1933,28 @@@ cifs_find_smb_ses(struct TCP_Server_Inf
+  
+  	spin_lock(&cifs_tcp_ses_lock);
+  	list_for_each_entry(ses, &server->smb_ses_list, smb_ses_list) {
+++<<<<<<< HEAD
+ +		if (ses->status == CifsExiting)
+ +			continue;
+ +		spin_lock(&ses->chan_lock);
+ +		if (!match_session(ses, ctx)) {
+ +			spin_unlock(&ses->chan_lock);
+ +			continue;
+ +		}
+ +		spin_unlock(&ses->chan_lock);
+++=======
++ 		spin_lock(&ses->ses_lock);
++ 		if (ses->ses_status == SES_EXITING) {
++ 			spin_unlock(&ses->ses_lock);
++ 			continue;
++ 		}
++ 		if (!match_session(ses, ctx)) {
++ 			spin_unlock(&ses->ses_lock);
++ 			continue;
++ 		}
++ 		spin_unlock(&ses->ses_lock);
++ 
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  		++ses->ses_count;
+  		spin_unlock(&cifs_tcp_ses_lock);
+  		return ses;
+@@@ -1812,11 -1893,12 +1969,18 @@@ void cifs_put_smb_ses(struct cifs_ses *
+  	unsigned int chan_count;
+  	struct TCP_Server_Info *server = ses->server;
+  
+++<<<<<<< HEAD
+ +	spin_lock(&cifs_tcp_ses_lock);
+ +	if (ses->status == CifsExiting) {
+ +		spin_unlock(&cifs_tcp_ses_lock);
+++=======
++ 	spin_lock(&ses->ses_lock);
++ 	if (ses->ses_status == SES_EXITING) {
++ 		spin_unlock(&ses->ses_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  		return;
+  	}
++ 	spin_unlock(&ses->ses_lock);
+  
+  	cifs_dbg(FYI, "%s: ses_count=%d\n", __func__, ses->ses_count);
+  	cifs_dbg(FYI, "%s: ses ipc: %s\n", __func__, ses->tcon_ipc ? ses->tcon_ipc->treeName : "NONE");
+@@@ -1830,10 -1913,8 +1995,15 @@@
+  	/* ses_count can never go negative */
+  	WARN_ON(ses->ses_count < 0);
+  
+++<<<<<<< HEAD
+ +	spin_lock(&GlobalMid_Lock);
+ +	if (ses->status == CifsGood)
+ +		ses->status = CifsExiting;
+ +	spin_unlock(&GlobalMid_Lock);
+++=======
++ 	if (ses->ses_status == SES_GOOD)
++ 		ses->ses_status = SES_EXITING;
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  
+  	cifs_free_ipc(ses);
+  
+@@@ -2166,9 -2249,10 +2336,10 @@@ get_ses_fail
+  	return ERR_PTR(rc);
+  }
+  
++ /* this function must be called with tc_lock held */
+  static int match_tcon(struct cifs_tcon *tcon, struct smb3_fs_context *ctx)
+  {
+ -	if (tcon->status == TID_EXITING)
+ +	if (tcon->tidStatus == CifsExiting)
+  		return 0;
+  	if (strncmp(tcon->treeName, ctx->UNC, MAX_TREE_SIZE))
+  		return 0;
+@@@ -2588,7 -2682,9 +2763,13 @@@ cifs_match_super(struct super_block *sb
+  
+  	ctx = mnt_data->ctx;
+  
+++<<<<<<< HEAD
+ +	spin_lock(&ses->chan_lock);
+++=======
++ 	spin_lock(&tcp_srv->srv_lock);
++ 	spin_lock(&ses->ses_lock);
++ 	spin_lock(&tcon->tc_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  	if (!match_server(tcp_srv, ctx) ||
+  	    !match_session(ses, ctx) ||
+  	    !match_tcon(tcon, ctx) ||
+@@@ -2599,7 -2695,10 +2780,14 @@@
+  
+  	rc = compare_mount_options(sb, mnt_data);
+  out:
+++<<<<<<< HEAD
+ +	spin_unlock(&ses->chan_lock);
+++=======
++ 	spin_unlock(&tcon->tc_lock);
++ 	spin_unlock(&ses->ses_lock);
++ 	spin_unlock(&tcp_srv->srv_lock);
++ 
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  	spin_unlock(&cifs_tcp_ses_lock);
+  	cifs_put_tlink(tlink);
+  	return rc;
+@@@ -3114,6 -3204,7 +3302,15 @@@ static int mount_get_conns(struct mount
+  		 * for just this mount.
+  		 */
+  		reset_cifs_unix_caps(xid, tcon, cifs_sb, ctx);
+++<<<<<<< HEAD
+++		if ((tcon->ses->server->tcpStatus == CifsNeedReconnect) &&
+++		    (le64_to_cpu(tcon->fsUnixInfo.Capability) &
+++		     CIFS_UNIX_TRANSPORT_ENCRYPTION_MANDATORY_CAP)) {
+++			rc = -EACCES;
+++			goto out;
+++		}
+++=======
++ 		spin_lock(&tcon->ses->server->srv_lock);
+  		if ((tcon->ses->server->tcpStatus == CifsNeedReconnect) &&
+  		    (le64_to_cpu(tcon->fsUnixInfo.Capability) &
+  		     CIFS_UNIX_TRANSPORT_ENCRYPTION_MANDATORY_CAP)) {
+@@@ -3120,6 -3212,7 +3318,8 @@@
+  			rc = -EACCES;
+  			goto out;
+  		}
++ 		spin_unlock(&tcon->ses->server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  	} else
+  		tcon->unix_ext = 0; /* server does not support them */
+  
+@@@ -3946,17 -4012,28 +4146,42 @@@ cifs_negotiate_protocol(const unsigned 
+  		return -ENOSYS;
+  
+  	/* only send once per connect */
+++<<<<<<< HEAD
+ +	if (!server->ops->need_neg(server))
+ +		return 0;
+ +
+ +	rc = server->ops->negotiate(xid, ses, server);
+ +	if (rc == 0) {
+ +		spin_lock(&GlobalMid_Lock);
+ +		if (server->tcpStatus == CifsNeedNegotiate)
+ +			server->tcpStatus = CifsGood;
+ +		else
+ +			rc = -EHOSTDOWN;
+ +		spin_unlock(&GlobalMid_Lock);
+++=======
++ 	spin_lock(&server->srv_lock);
++ 	if (!server->ops->need_neg(server) ||
++ 	    server->tcpStatus != CifsNeedNegotiate) {
++ 		spin_unlock(&server->srv_lock);
++ 		return 0;
++ 	}
++ 	server->tcpStatus = CifsInNegotiate;
++ 	spin_unlock(&server->srv_lock);
++ 
++ 	rc = server->ops->negotiate(xid, ses, server);
++ 	if (rc == 0) {
++ 		spin_lock(&server->srv_lock);
++ 		if (server->tcpStatus == CifsInNegotiate)
++ 			server->tcpStatus = CifsGood;
++ 		else
++ 			rc = -EHOSTDOWN;
++ 		spin_unlock(&server->srv_lock);
++ 	} else {
++ 		spin_lock(&server->srv_lock);
++ 		if (server->tcpStatus == CifsInNegotiate)
++ 			server->tcpStatus = CifsNeedNegotiate;
++ 		spin_unlock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  	}
+  
+  	return rc;
+@@@ -3968,12 -4045,39 +4193,43 @@@ cifs_setup_session(const unsigned int x
+  		   struct nls_table *nls_info)
+  {
+  	int rc = -ENOSYS;
+ -	struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *)&server->dstaddr;
+ -	struct sockaddr_in *addr = (struct sockaddr_in *)&server->dstaddr;
+  	bool is_binding = false;
+  
+++<<<<<<< HEAD
+ +	spin_lock(&ses->chan_lock);
+++=======
++ 	spin_lock(&ses->ses_lock);
++ 	if (server->dstaddr.ss_family == AF_INET6)
++ 		scnprintf(ses->ip_addr, sizeof(ses->ip_addr), "%pI6", &addr6->sin6_addr);
++ 	else
++ 		scnprintf(ses->ip_addr, sizeof(ses->ip_addr), "%pI4", &addr->sin_addr);
++ 
++ 	if (ses->ses_status != SES_GOOD &&
++ 	    ses->ses_status != SES_NEW &&
++ 	    ses->ses_status != SES_NEED_RECON) {
++ 		spin_unlock(&ses->ses_lock);
++ 		return 0;
++ 	}
++ 
++ 	/* only send once per connect */
++ 	spin_lock(&ses->chan_lock);
++ 	if (CIFS_ALL_CHANS_GOOD(ses) ||
++ 	    cifs_chan_in_reconnect(ses, server)) {
++ 		spin_unlock(&ses->chan_lock);
++ 		spin_unlock(&ses->ses_lock);
++ 		return 0;
++ 	}
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  	is_binding = !CIFS_ALL_CHANS_NEED_RECONNECT(ses);
+ -	cifs_chan_set_in_reconnect(ses, server);
+  	spin_unlock(&ses->chan_lock);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!is_binding)
++ 		ses->ses_status = SES_IN_SETUP;
++ 	spin_unlock(&ses->ses_lock);
++ 
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  	if (!is_binding) {
+  		ses->capabilities = server->capabilities;
+  		if (!linuxExtEnabled)
+@@@ -3994,8 -4098,25 +4250,28 @@@
+  	if (server->ops->sess_setup)
+  		rc = server->ops->sess_setup(xid, ses, server, nls_info);
+  
+ -	if (rc) {
+ +	if (rc)
+  		cifs_server_dbg(VFS, "Send error in SessSetup = %d\n", rc);
+++<<<<<<< HEAD
+++=======
++ 		spin_lock(&ses->ses_lock);
++ 		if (ses->ses_status == SES_IN_SETUP)
++ 			ses->ses_status = SES_NEED_RECON;
++ 		spin_lock(&ses->chan_lock);
++ 		cifs_chan_clear_in_reconnect(ses, server);
++ 		spin_unlock(&ses->chan_lock);
++ 		spin_unlock(&ses->ses_lock);
++ 	} else {
++ 		spin_lock(&ses->ses_lock);
++ 		if (ses->ses_status == SES_IN_SETUP)
++ 			ses->ses_status = SES_GOOD;
++ 		spin_lock(&ses->chan_lock);
++ 		cifs_chan_clear_in_reconnect(ses, server);
++ 		cifs_chan_clear_need_reconnect(ses, server);
++ 		spin_unlock(&ses->chan_lock);
++ 		spin_unlock(&ses->ses_lock);
++ 	}
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  
+  	return rc;
+  }
+@@@ -4359,9 -4578,22 +4635,23 @@@ int cifs_tree_connect(const unsigned in
+  	char *tree;
+  	struct dfs_info3_param ref = {0};
+  
+++<<<<<<< HEAD
+++=======
++ 	/* only send once per connect */
++ 	spin_lock(&tcon->tc_lock);
++ 	if (tcon->ses->ses_status != SES_GOOD ||
++ 	    (tcon->status != TID_NEW &&
++ 	    tcon->status != TID_NEED_TCON)) {
++ 		spin_unlock(&tcon->ses->ses_lock);
++ 		return 0;
++ 	}
++ 	tcon->status = TID_IN_TCON;
++ 	spin_unlock(&tcon->tc_lock);
++ 
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  	tree = kzalloc(MAX_TREE_SIZE, GFP_KERNEL);
+ -	if (!tree) {
+ -		rc = -ENOMEM;
+ -		goto out;
+ -	}
+ +	if (!tree)
+ +		return -ENOMEM;
+  
+  	if (tcon->ipc) {
+  		scnprintf(tree, MAX_TREE_SIZE, "\\\\%s\\IPC$", server->hostname);
+@@@ -4389,13 -4625,52 +4679,58 @@@ out
+  	kfree(tree);
+  	cifs_put_tcp_super(sb);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (rc) {
++ 		spin_lock(&tcon->tc_lock);
++ 		if (tcon->status == TID_IN_TCON)
++ 			tcon->status = TID_NEED_TCON;
++ 		spin_unlock(&tcon->tc_lock);
++ 	} else {
++ 		spin_lock(&tcon->tc_lock);
++ 		if (tcon->status == TID_IN_TCON)
++ 			tcon->status = TID_GOOD;
++ 		spin_unlock(&tcon->tc_lock);
++ 		tcon->need_reconnect = false;
++ 	}
++ 
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  	return rc;
+  }
+  #else
+  int cifs_tree_connect(const unsigned int xid, struct cifs_tcon *tcon, const struct nls_table *nlsc)
+  {
+ -	int rc;
+  	const struct smb_version_operations *ops = tcon->ses->server->ops;
+  
+++<<<<<<< HEAD
+ +	return ops->tree_connect(xid, tcon->ses, tcon->treeName, tcon, nlsc);
+++=======
++ 	/* only send once per connect */
++ 	spin_lock(&tcon->tc_lock);
++ 	if (tcon->ses->ses_status != SES_GOOD ||
++ 	    (tcon->status != TID_NEW &&
++ 	    tcon->status != TID_NEED_TCON)) {
++ 		spin_unlock(&tcon->tc_lock);
++ 		return 0;
++ 	}
++ 	tcon->status = TID_IN_TCON;
++ 	spin_unlock(&tcon->tc_lock);
++ 
++ 	rc = ops->tree_connect(xid, tcon->ses, tcon->treeName, tcon, nlsc);
++ 	if (rc) {
++ 		spin_lock(&tcon->tc_lock);
++ 		if (tcon->status == TID_IN_TCON)
++ 			tcon->status = TID_NEED_TCON;
++ 		spin_unlock(&tcon->tc_lock);
++ 	} else {
++ 		spin_lock(&tcon->tc_lock);
++ 		if (tcon->status == TID_IN_TCON)
++ 			tcon->status = TID_GOOD;
++ 		tcon->need_reconnect = false;
++ 		spin_unlock(&tcon->tc_lock);
++ 	}
++ 
++ 	return rc;
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  }
+  #endif
+diff --cc fs/cifs/misc.c
+index 8fdd91a0addb,7a906067db04..000000000000
+--- a/fs/cifs/misc.c
++++ b/fs/cifs/misc.c
+@@@ -69,7 -69,8 +69,12 @@@ sesInfoAlloc(void
+  	ret_buf = kzalloc(sizeof(struct cifs_ses), GFP_KERNEL);
+  	if (ret_buf) {
+  		atomic_inc(&sesInfoAllocCount);
+++<<<<<<< HEAD
+ +		ret_buf->status = CifsNew;
+++=======
++ 		spin_lock_init(&ret_buf->ses_lock);
++ 		ret_buf->ses_status = SES_NEW;
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  		++ret_buf->ses_count;
+  		INIT_LIST_HEAD(&ret_buf->smb_ses_list);
+  		INIT_LIST_HEAD(&ret_buf->tcon_list);
+@@@ -120,10 -121,13 +125,11 @@@ tconInfoAlloc(void
+  		kfree(ret_buf);
+  		return NULL;
+  	}
+ -	INIT_LIST_HEAD(&ret_buf->crfid.dirents.entries);
+ -	mutex_init(&ret_buf->crfid.dirents.de_mutex);
+  
+  	atomic_inc(&tconInfoAllocCount);
+ -	ret_buf->status = TID_NEW;
+ +	ret_buf->tidStatus = CifsNew;
+  	++ret_buf->tc_count;
++ 	spin_lock_init(&ret_buf->tc_lock);
+  	INIT_LIST_HEAD(&ret_buf->openFileList);
+  	INIT_LIST_HEAD(&ret_buf->tcon_list);
+  	spin_lock_init(&ret_buf->open_file_lock);
+diff --cc fs/cifs/smb1ops.c
+index 421cc9a7fbb1,f36b2d2d40ca..000000000000
+--- a/fs/cifs/smb1ops.c
++++ b/fs/cifs/smb1ops.c
+@@@ -175,9 -164,9 +175,9 @@@ cifs_get_next_mid(struct TCP_Server_Inf
+  {
+  	__u64 mid = 0;
+  	__u16 last_mid, cur_mid;
+ -	bool collision, reconnect = false;
+ +	bool collision;
+  
+- 	spin_lock(&GlobalMid_Lock);
++ 	spin_lock(&server->mid_lock);
+  
+  	/* mid is 16 bit only for CIFS/SMB */
+  	cur_mid = (__u16)((server->CurrentMid) & 0xffff);
+@@@ -236,7 -225,12 +236,16 @@@
+  		}
+  		cur_mid++;
+  	}
+++<<<<<<< HEAD
+ +	spin_unlock(&GlobalMid_Lock);
+++=======
++ 	spin_unlock(&server->mid_lock);
++ 
++ 	if (reconnect) {
++ 		cifs_signal_cifsd_for_reconnect(server, false);
++ 	}
++ 
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  	return mid;
+  }
+  
+diff --cc fs/cifs/smb2ops.c
+index 86dfcfed451f,82dd2e973753..000000000000
+--- a/fs/cifs/smb2ops.c
++++ b/fs/cifs/smb2ops.c
+@@@ -133,9 -126,13 +133,19 @@@ smb2_add_credits(struct TCP_Server_Inf
+  			 optype, scredits, add);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (server->tcpStatus == CifsNeedReconnect
+ +	    || server->tcpStatus == CifsExiting)
+ +		return;
+++=======
++ 	spin_lock(&server->srv_lock);
++ 	if (server->tcpStatus == CifsNeedReconnect
++ 	    || server->tcpStatus == CifsExiting) {
++ 		spin_unlock(&server->srv_lock);
++ 		return;
++ 	}
++ 	spin_unlock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  
+  	switch (rc) {
+  	case -1:
+@@@ -220,11 -217,15 +230,21 @@@ smb2_wait_mtu_credits(struct TCP_Server
+  				return rc;
+  			spin_lock(&server->req_lock);
+  		} else {
+++<<<<<<< HEAD
+ +			if (server->tcpStatus == CifsExiting) {
+ +				spin_unlock(&server->req_lock);
+ +				return -ENOENT;
+ +			}
+++=======
++ 			spin_unlock(&server->req_lock);
++ 			spin_lock(&server->srv_lock);
++ 			if (server->tcpStatus == CifsExiting) {
++ 				spin_unlock(&server->srv_lock);
++ 				return -ENOENT;
++ 			}
++ 			spin_unlock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  
+ -			spin_lock(&server->req_lock);
+  			scredits = server->credits;
+  			/* can deadlock with reopen */
+  			if (scredits <= 8) {
+@@@ -2516,14 -2581,13 +2536,16 @@@ smb2_is_network_name_deleted(char *buf
+  	if (shdr->Status != STATUS_NETWORK_NAME_DELETED)
+  		return;
+  
+ +	/* If server is a channel, select the primary channel */
+ +	pserver = CIFS_SERVER_IS_CHAN(server) ? server->primary_server : server;
+ +
+  	spin_lock(&cifs_tcp_ses_lock);
+ -	list_for_each_entry(ses, &server->smb_ses_list, smb_ses_list) {
+ +	list_for_each_entry(ses, &pserver->smb_ses_list, smb_ses_list) {
+  		list_for_each_entry(tcon, &ses->tcon_list, tcon_list) {
+  			if (tcon->tid == le32_to_cpu(shdr->Id.SyncId.TreeId)) {
++ 				spin_lock(&tcon->tc_lock);
+  				tcon->need_reconnect = true;
++ 				spin_unlock(&tcon->tc_lock);
+  				spin_unlock(&cifs_tcp_ses_lock);
+  				pr_warn_once("Server share %s deleted.\n",
+  					     tcon->treeName);
+@@@ -4907,20 -5082,24 +4931,36 @@@ static void smb2_decrypt_offload(struc
+  
+  			mid->callback(mid);
+  		} else {
+++<<<<<<< HEAD
+ +			spin_lock(&GlobalMid_Lock);
+++=======
++ 			spin_lock(&dw->server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  			if (dw->server->tcpStatus == CifsNeedReconnect) {
++ 				spin_lock(&dw->server->mid_lock);
+  				mid->mid_state = MID_RETRY_NEEDED;
+++<<<<<<< HEAD
+ +				spin_unlock(&GlobalMid_Lock);
+++=======
++ 				spin_unlock(&dw->server->mid_lock);
++ 				spin_unlock(&dw->server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  				mid->callback(mid);
+  			} else {
++ 				spin_lock(&dw->server->mid_lock);
+  				mid->mid_state = MID_REQUEST_SUBMITTED;
+  				mid->mid_flags &= ~(MID_DELETED);
+  				list_add_tail(&mid->qhead,
+  					&dw->server->pending_mid_q);
+++<<<<<<< HEAD
+ +				spin_unlock(&GlobalMid_Lock);
+++=======
++ 				spin_unlock(&dw->server->mid_lock);
++ 				spin_unlock(&dw->server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  			}
+  		}
+ -		cifs_mid_q_entry_release(mid);
+ +		release_mid(mid);
+  	}
+  
+  free_pages:
+diff --cc fs/cifs/smb2pdu.c
+index 655ad787fed6,131bec79d6fd..000000000000
+--- a/fs/cifs/smb2pdu.c
++++ b/fs/cifs/smb2pdu.c
+@@@ -162,7 -162,8 +162,12 @@@ smb2_reconnect(__le16 smb2_command, str
+  	if (smb2_command == SMB2_TREE_CONNECT || smb2_command == SMB2_IOCTL)
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	if (tcon->tidStatus == CifsExiting) {
+++=======
++ 	spin_lock(&tcon->tc_lock);
++ 	if (tcon->status == TID_EXITING) {
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  		/*
+  		 * only tree disconnect, open, and write,
+  		 * (and ulogoff which does not have tcon)
+@@@ -171,12 -172,14 +176,21 @@@
+  		if ((smb2_command != SMB2_WRITE) &&
+  		   (smb2_command != SMB2_CREATE) &&
+  		   (smb2_command != SMB2_TREE_DISCONNECT)) {
+++<<<<<<< HEAD
+++=======
++ 			spin_unlock(&tcon->tc_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  			cifs_dbg(FYI, "can not send cmd %d while umounting\n",
+  				 smb2_command);
+  			return -ENODEV;
+  		}
+  	}
+++<<<<<<< HEAD
+ +	if ((!tcon->ses) || (tcon->ses->status == CifsExiting) ||
+++=======
++ 	spin_unlock(&tcon->tc_lock);
++ 	if ((!tcon->ses) || (tcon->ses->ses_status == SES_EXITING) ||
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  	    (!tcon->ses->server) || !server)
+  		return -EIO;
+  
+@@@ -214,8 -217,12 +228,17 @@@
+  		}
+  
+  		/* are we still trying to reconnect? */
+++<<<<<<< HEAD
+ +		if (server->tcpStatus != CifsNeedReconnect)
+ +			break;
+++=======
++ 		spin_lock(&server->srv_lock);
++ 		if (server->tcpStatus != CifsNeedReconnect) {
++ 			spin_unlock(&server->srv_lock);
++ 			break;
++ 		}
++ 		spin_unlock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  
+  		if (retries && --retries)
+  			continue;
+@@@ -255,11 -256,13 +278,21 @@@
+  	 * and the server never sends an answer the socket will be closed
+  	 * and tcpStatus set to reconnect.
+  	 */
+++<<<<<<< HEAD
+++	if (server->tcpStatus == CifsNeedReconnect) {
+++=======
++ 	spin_lock(&server->srv_lock);
+  	if (server->tcpStatus == CifsNeedReconnect) {
++ 		spin_unlock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  		rc = -EHOSTDOWN;
+ +		mutex_unlock(&ses->session_mutex);
+  		goto out;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	spin_unlock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  
+  	/*
+  	 * need to prevent multiple threads trying to simultaneously
+@@@ -3872,13 -3909,17 +3905,24 @@@ SMB2_echo(struct TCP_Server_Info *serve
+  				 .rq_nvec = 1 };
+  	unsigned int total_len;
+  
+ -	cifs_dbg(FYI, "In echo request for conn_id %lld\n", server->conn_id);
+ +	cifs_dbg(FYI, "In echo request\n");
+  
+++<<<<<<< HEAD
+ +	if (server->tcpStatus == CifsNeedNegotiate) {
+++=======
++ 	spin_lock(&server->srv_lock);
++ 	if (server->ops->need_neg &&
++ 	    server->ops->need_neg(server)) {
++ 		spin_unlock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  		/* No need to send echo on newly established connections */
+  		mod_delayed_work(cifsiod_wq, &server->reconnect, 0);
+  		return rc;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	spin_unlock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  
+  	rc = smb2_plain_req_init(SMB2_ECHO, NULL, server,
+  				 (void **)&req, &total_len);
+diff --cc fs/cifs/smb2transport.c
+index 200597208c3f,f64922f340b3..000000000000
+--- a/fs/cifs/smb2transport.c
++++ b/fs/cifs/smb2transport.c
+@@@ -638,8 -640,13 +638,18 @@@ smb2_sign_rqst(struct smb_rqst *rqst, s
+  
+  	if (!is_signed)
+  		return 0;
+++<<<<<<< HEAD
+ +	if (server->tcpStatus == CifsNeedNegotiate)
+ +		return 0;
+++=======
++ 	spin_lock(&server->srv_lock);
++ 	if (server->ops->need_neg &&
++ 	    server->ops->need_neg(server)) {
++ 		spin_unlock(&server->srv_lock);
++ 		return 0;
++ 	}
++ 	spin_unlock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  	if (!is_binding && !server->session_estab) {
+  		strncpy(shdr->Signature, "BSRSPYL", 8);
+  		return 0;
+@@@ -755,30 -762,43 +765,64 @@@ static in
+  smb2_get_mid_entry(struct cifs_ses *ses, struct TCP_Server_Info *server,
+  		   struct smb2_hdr *shdr, struct mid_q_entry **mid)
+  {
+++<<<<<<< HEAD
+ +	if (server->tcpStatus == CifsExiting)
+++=======
++ 	spin_lock(&server->srv_lock);
++ 	if (server->tcpStatus == CifsExiting) {
++ 		spin_unlock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  		return -ENOENT;
+ -	}
+  
+  	if (server->tcpStatus == CifsNeedReconnect) {
+++<<<<<<< HEAD
+++=======
++ 		spin_unlock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  		cifs_dbg(FYI, "tcp session dead - return to caller to retry\n");
+  		return -EAGAIN;
+  	}
+  
+  	if (server->tcpStatus == CifsNeedNegotiate &&
+++<<<<<<< HEAD
+ +	   shdr->Command != SMB2_NEGOTIATE)
+ +		return -EAGAIN;
+ +
+ +	if (ses->status == CifsNew) {
+ +		if ((shdr->Command != SMB2_SESSION_SETUP) &&
+ +		    (shdr->Command != SMB2_NEGOTIATE))
+++=======
++ 	   shdr->Command != SMB2_NEGOTIATE) {
++ 		spin_unlock(&server->srv_lock);
++ 		return -EAGAIN;
++ 	}
++ 	spin_unlock(&server->srv_lock);
++ 
++ 	spin_lock(&ses->ses_lock);
++ 	if (ses->ses_status == SES_NEW) {
++ 		if ((shdr->Command != SMB2_SESSION_SETUP) &&
++ 		    (shdr->Command != SMB2_NEGOTIATE)) {
++ 			spin_unlock(&ses->ses_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  			return -EAGAIN;
+ -		}
+  		/* else ok - we are setting up session */
+  	}
+  
+++<<<<<<< HEAD
+ +	if (ses->status == CifsExiting) {
+ +		if (shdr->Command != SMB2_LOGOFF)
+++=======
++ 	if (ses->ses_status == SES_EXITING) {
++ 		if (shdr->Command != SMB2_LOGOFF) {
++ 			spin_unlock(&ses->ses_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  			return -EAGAIN;
+ -		}
+  		/* else ok - we are shutting down the session */
+  	}
+++<<<<<<< HEAD
+++=======
++ 	spin_unlock(&ses->ses_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  
+  	*mid = smb2_mid_entry_alloc(shdr, server);
+  	if (*mid == NULL)
+@@@ -851,9 -871,13 +895,19 @@@ smb2_setup_async_request(struct TCP_Ser
+  			(struct smb2_hdr *)rqst->rq_iov[0].iov_base;
+  	struct mid_q_entry *mid;
+  
+++<<<<<<< HEAD
+ +	if (server->tcpStatus == CifsNeedNegotiate &&
+ +	   shdr->Command != SMB2_NEGOTIATE)
+ +		return ERR_PTR(-EAGAIN);
+++=======
++ 	spin_lock(&server->srv_lock);
++ 	if (server->tcpStatus == CifsNeedNegotiate &&
++ 	   shdr->Command != SMB2_NEGOTIATE) {
++ 		spin_unlock(&server->srv_lock);
++ 		return ERR_PTR(-EAGAIN);
++ 	}
++ 	spin_unlock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  
+  	smb2_seq_num_into_buf(server, shdr);
+  
+diff --cc fs/cifs/transport.c
+index 3ad215919acb,160463e22c95..000000000000
+--- a/fs/cifs/transport.c
++++ b/fs/cifs/transport.c
+@@@ -155,17 -152,31 +155,34 @@@ void __release_mid(struct kref *refcoun
+  	mempool_free(midEntry, cifs_mid_poolp);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void cifs_mid_q_entry_release(struct mid_q_entry *midEntry)
++ {
++ 	struct TCP_Server_Info *server = midEntry->server;
++ 
++ 	spin_lock(&server->mid_lock);
++ 	kref_put(&midEntry->refcount, _cifs_mid_q_entry_release);
++ 	spin_unlock(&server->mid_lock);
++ }
++ 
++ void DeleteMidQEntry(struct mid_q_entry *midEntry)
++ {
++ 	cifs_mid_q_entry_release(midEntry);
++ }
++ 
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  void
+ -cifs_delete_mid(struct mid_q_entry *mid)
+ +delete_mid(struct mid_q_entry *mid)
+  {
+- 	spin_lock(&GlobalMid_Lock);
++ 	spin_lock(&mid->server->mid_lock);
+  	if (!(mid->mid_flags & MID_DELETED)) {
+  		list_del_init(&mid->qhead);
+  		mid->mid_flags |= MID_DELETED;
+  	}
+- 	spin_unlock(&GlobalMid_Lock);
++ 	spin_unlock(&mid->server->mid_lock);
+  
+ -	DeleteMidQEntry(mid);
+ +	release_mid(mid);
+  }
+  
+  /*
+@@@ -574,10 -577,14 +591,21 @@@ wait_for_free_credits(struct TCP_Server
+  				return -ERESTARTSYS;
+  			spin_lock(&server->req_lock);
+  		} else {
+++<<<<<<< HEAD
+ +			if (server->tcpStatus == CifsExiting) {
+ +				spin_unlock(&server->req_lock);
+ +				return -ENOENT;
+ +			}
+++=======
++ 			spin_unlock(&server->req_lock);
++ 
++ 			spin_lock(&server->srv_lock);
++ 			if (server->tcpStatus == CifsExiting) {
++ 				spin_unlock(&server->srv_lock);
++ 				return -ENOENT;
++ 			}
++ 			spin_unlock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  
+  			/*
+  			 * For normal commands, reserve the last MAX_COMPOUND
+@@@ -719,35 -727,32 +747,52 @@@ cifs_wait_mtu_credits(struct TCP_Server
+  static int allocate_mid(struct cifs_ses *ses, struct smb_hdr *in_buf,
+  			struct mid_q_entry **ppmidQ)
+  {
+++<<<<<<< HEAD
+ +	if (ses->server->tcpStatus == CifsExiting) {
+ +		return -ENOENT;
+ +	}
+ +
+ +	if (ses->server->tcpStatus == CifsNeedReconnect) {
+ +		cifs_dbg(FYI, "tcp session dead - return to caller to retry\n");
+ +		return -EAGAIN;
+ +	}
+ +
+ +	if (ses->status == CifsNew) {
+ +		if ((in_buf->Command != SMB_COM_SESSION_SETUP_ANDX) &&
+ +			(in_buf->Command != SMB_COM_NEGOTIATE))
+++=======
++ 	spin_lock(&ses->ses_lock);
++ 	if (ses->ses_status == SES_NEW) {
++ 		if ((in_buf->Command != SMB_COM_SESSION_SETUP_ANDX) &&
++ 			(in_buf->Command != SMB_COM_NEGOTIATE)) {
++ 			spin_unlock(&ses->ses_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  			return -EAGAIN;
+ -		}
+  		/* else ok - we are setting up session */
+  	}
+  
+ -	if (ses->ses_status == SES_EXITING) {
+ +	if (ses->status == CifsExiting) {
+  		/* check if SMB session is bad because we are setting it up */
+++<<<<<<< HEAD
+ +		if (in_buf->Command != SMB_COM_LOGOFF_ANDX)
+++=======
++ 		if (in_buf->Command != SMB_COM_LOGOFF_ANDX) {
++ 			spin_unlock(&ses->ses_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  			return -EAGAIN;
+ -		}
+  		/* else ok - we are shutting down session */
+  	}
+++<<<<<<< HEAD
+++=======
++ 	spin_unlock(&ses->ses_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  
+ -	*ppmidQ = AllocMidQEntry(in_buf, ses->server);
+ +	*ppmidQ = alloc_mid(in_buf, ses->server);
+  	if (*ppmidQ == NULL)
+  		return -ENOMEM;
+- 	spin_lock(&GlobalMid_Lock);
++ 	spin_lock(&ses->server->mid_lock);
+  	list_add_tail(&(*ppmidQ)->qhead, &ses->server->pending_mid_q);
+- 	spin_unlock(&GlobalMid_Lock);
++ 	spin_unlock(&ses->server->mid_lock);
+  	return 0;
+  }
+  
+@@@ -910,10 -914,10 +955,15 @@@ cifs_sync_mid_result(struct mid_q_entr
+  	cifs_dbg(FYI, "%s: cmd=%d mid=%llu state=%d\n",
+  		 __func__, le16_to_cpu(mid->command), mid->mid, mid->mid_state);
+  
+- 	spin_lock(&GlobalMid_Lock);
++ 	spin_lock(&server->mid_lock);
+  	switch (mid->mid_state) {
+++<<<<<<< HEAD
+ +	case MID_RESPONSE_READY:
+ +		spin_unlock(&GlobalMid_Lock);
+++=======
++ 	case MID_RESPONSE_RECEIVED:
++ 		spin_unlock(&server->mid_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  		return rc;
+  	case MID_RETRY_NEEDED:
+  		rc = -EAGAIN;
+@@@ -933,9 -937,9 +983,9 @@@
+  			 __func__, mid->mid, mid->mid_state);
+  		rc = -EIO;
+  	}
+- 	spin_unlock(&GlobalMid_Lock);
++ 	spin_unlock(&server->mid_lock);
+  
+ -	DeleteMidQEntry(mid);
+ +	release_mid(mid);
+  	return rc;
+  }
+  
+@@@ -1085,8 -1080,12 +1135,17 @@@ compound_send_recv(const unsigned int x
+  		return -EIO;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (server->tcpStatus == CifsExiting)
+ +		return -ENOENT;
+++=======
++ 	spin_lock(&server->srv_lock);
++ 	if (server->tcpStatus == CifsExiting) {
++ 		spin_unlock(&server->srv_lock);
++ 		return -ENOENT;
++ 	}
++ 	spin_unlock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  
+  	/*
+  	 * Wait for all the requests to become available.
+@@@ -1189,11 -1188,17 +1248,25 @@@
+  	/*
+  	 * Compounding is never used during session establish.
+  	 */
+++<<<<<<< HEAD
+ +	if ((ses->status == CifsNew) || (optype & CIFS_NEG_OP) || (optype & CIFS_SESS_OP)) {
+ +		mutex_lock(&server->srv_mutex);
+ +		smb311_update_preauth_hash(ses, server, rqst[0].rq_iov, rqst[0].rq_nvec);
+ +		mutex_unlock(&server->srv_mutex);
+ +	}
+++=======
++ 	spin_lock(&ses->ses_lock);
++ 	if ((ses->ses_status == SES_NEW) || (optype & CIFS_NEG_OP) || (optype & CIFS_SESS_OP)) {
++ 		spin_unlock(&ses->ses_lock);
++ 
++ 		cifs_server_lock(server);
++ 		smb311_update_preauth_hash(ses, server, rqst[0].rq_iov, rqst[0].rq_nvec);
++ 		cifs_server_unlock(server);
++ 
++ 		spin_lock(&ses->ses_lock);
++ 	}
++ 	spin_unlock(&ses->ses_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  
+  	for (i = 0; i < num_rqst; i++) {
+  		rc = wait_for_response(server, midQ[i]);
+@@@ -1205,10 -1210,9 +1278,10 @@@
+  			cifs_server_dbg(FYI, "Cancelling wait for mid %llu cmd: %d\n",
+  				 midQ[i]->mid, le16_to_cpu(midQ[i]->command));
+  			send_cancel(server, &rqst[i], midQ[i]);
+- 			spin_lock(&GlobalMid_Lock);
++ 			spin_lock(&server->mid_lock);
+  			midQ[i]->mid_flags |= MID_WAIT_CANCELLED;
+ -			if (midQ[i]->mid_state == MID_REQUEST_SUBMITTED) {
+ +			if (midQ[i]->mid_state == MID_REQUEST_SUBMITTED ||
+ +			    midQ[i]->mid_state == MID_RESPONSE_RECEIVED) {
+  				midQ[i]->callback = cifs_cancelled_callback;
+  				cancelled_mid[i] = true;
+  				credits[i].value = 0;
+@@@ -1257,15 -1261,19 +1330,30 @@@
+  	/*
+  	 * Compounding is never used during session establish.
+  	 */
+++<<<<<<< HEAD
+ +	if ((ses->status == CifsNew) || (optype & CIFS_NEG_OP) || (optype & CIFS_SESS_OP)) {
+++=======
++ 	spin_lock(&ses->ses_lock);
++ 	if ((ses->ses_status == SES_NEW) || (optype & CIFS_NEG_OP) || (optype & CIFS_SESS_OP)) {
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  		struct kvec iov = {
+  			.iov_base = resp_iov[0].iov_base,
+  			.iov_len = resp_iov[0].iov_len
+  		};
+++<<<<<<< HEAD
+ +		mutex_lock(&server->srv_mutex);
+ +		smb311_update_preauth_hash(ses, server, &iov, 1);
+ +		mutex_unlock(&server->srv_mutex);
+ +	}
+++=======
++ 		spin_unlock(&ses->ses_lock);
++ 		cifs_server_lock(server);
++ 		smb311_update_preauth_hash(ses, server, &iov, 1);
++ 		cifs_server_unlock(server);
++ 		spin_lock(&ses->ses_lock);
++ 	}
++ 	spin_unlock(&ses->ses_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  
+  out:
+  	/*
+@@@ -1354,8 -1362,12 +1442,17 @@@ SendReceive(const unsigned int xid, str
+  		return -EIO;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (server->tcpStatus == CifsExiting)
+ +		return -ENOENT;
+++=======
++ 	spin_lock(&server->srv_lock);
++ 	if (server->tcpStatus == CifsExiting) {
++ 		spin_unlock(&server->srv_lock);
++ 		return -ENOENT;
++ 	}
++ 	spin_unlock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  
+  	/* Ensure that we do not send more than 50 overlapping requests
+  	   to the same server. We may make this configurable later or
+@@@ -1409,12 -1421,11 +1506,20 @@@
+  	rc = wait_for_response(server, midQ);
+  	if (rc != 0) {
+  		send_cancel(server, &rqst, midQ);
+++<<<<<<< HEAD
+ +		spin_lock(&GlobalMid_Lock);
+ +		if (midQ->mid_state == MID_REQUEST_SUBMITTED ||
+ +		    midQ->mid_state == MID_RESPONSE_RECEIVED) {
+ +			/* no longer considered to be "in-flight" */
+ +			midQ->callback = release_mid;
+ +			spin_unlock(&GlobalMid_Lock);
+++=======
++ 		spin_lock(&server->mid_lock);
++ 		if (midQ->mid_state == MID_REQUEST_SUBMITTED) {
++ 			/* no longer considered to be "in-flight" */
++ 			midQ->callback = DeleteMidQEntry;
++ 			spin_unlock(&server->mid_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  			add_credits(server, &credits, 0);
+  			return rc;
+  		}
+@@@ -1496,8 -1507,12 +1601,17 @@@ SendReceiveBlockingLock(const unsigned 
+  		return -EIO;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (server->tcpStatus == CifsExiting)
+ +		return -ENOENT;
+++=======
++ 	spin_lock(&server->srv_lock);
++ 	if (server->tcpStatus == CifsExiting) {
++ 		spin_unlock(&server->srv_lock);
++ 		return -ENOENT;
++ 	}
++ 	spin_unlock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  
+  	/* Ensure that we do not send more than 50 overlapping requests
+  	   to the same server. We may make this configurable later or
+@@@ -1556,11 -1570,12 +1670,19 @@@
+  		 (server->tcpStatus != CifsNew)));
+  
+  	/* Were we interrupted by a signal ? */
+++<<<<<<< HEAD
+++=======
++ 	spin_lock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  	if ((rc == -ERESTARTSYS) &&
+ -		(midQ->mid_state == MID_REQUEST_SUBMITTED) &&
+ +		(midQ->mid_state == MID_REQUEST_SUBMITTED ||
+ +		 midQ->mid_state == MID_RESPONSE_RECEIVED) &&
+  		((server->tcpStatus == CifsGood) ||
+  		 (server->tcpStatus == CifsNew))) {
+++<<<<<<< HEAD
+++=======
++ 		spin_unlock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  
+  		if (in_buf->Command == SMB_COM_TRANSACTION2) {
+  			/* POSIX lock. We send a NT_CANCEL SMB to cause the
+@@@ -1587,20 -1602,21 +1709,34 @@@
+  		rc = wait_for_response(server, midQ);
+  		if (rc) {
+  			send_cancel(server, &rqst, midQ);
+++<<<<<<< HEAD
+ +			spin_lock(&GlobalMid_Lock);
+ +			if (midQ->mid_state == MID_REQUEST_SUBMITTED ||
+ +			    midQ->mid_state == MID_RESPONSE_RECEIVED) {
+ +				/* no longer considered to be "in-flight" */
+ +				midQ->callback = release_mid;
+ +				spin_unlock(&GlobalMid_Lock);
+++=======
++ 			spin_lock(&server->mid_lock);
++ 			if (midQ->mid_state == MID_REQUEST_SUBMITTED) {
++ 				/* no longer considered to be "in-flight" */
++ 				midQ->callback = DeleteMidQEntry;
++ 				spin_unlock(&server->mid_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  				return rc;
+  			}
+- 			spin_unlock(&GlobalMid_Lock);
++ 			spin_unlock(&server->mid_lock);
+  		}
+  
+  		/* We got the response - restart system call. */
+  		rstart = 1;
+++<<<<<<< HEAD
+++	}
+++=======
++ 		spin_lock(&server->srv_lock);
+  	}
++ 	spin_unlock(&server->srv_lock);
+++>>>>>>> d7d7a66aacd6 (cifs: avoid use of global locks for high contention data)
+  
+  	rc = cifs_sync_mid_result(midQ, server);
+  	if (rc != 0)
+diff --git a/fs/cifs/cifs_debug.c b/fs/cifs/cifs_debug.c
+index 3f6f269506f0..e4869c79d266 100644
+--- a/fs/cifs/cifs_debug.c
++++ b/fs/cifs/cifs_debug.c
+@@ -70,7 +70,7 @@ void cifs_dump_mids(struct TCP_Server_Info *server)
+ 		return;
+ 
+ 	cifs_dbg(VFS, "Dump pending requests:\n");
+-	spin_lock(&GlobalMid_Lock);
++	spin_lock(&server->mid_lock);
+ 	list_for_each_entry(mid_entry, &server->pending_mid_q, qhead) {
+ 		cifs_dbg(VFS, "State: %d Cmd: %d Pid: %d Cbdata: %p Mid %llu\n",
+ 			 mid_entry->mid_state,
+@@ -93,7 +93,7 @@ void cifs_dump_mids(struct TCP_Server_Info *server)
+ 				mid_entry->resp_buf, 62);
+ 		}
+ 	}
+-	spin_unlock(&GlobalMid_Lock);
++	spin_unlock(&server->mid_lock);
+ #endif /* CONFIG_CIFS_DEBUG2 */
+ }
+ 
+@@ -476,7 +476,7 @@ static int cifs_debug_data_proc_show(struct seq_file *m, void *v)
+ 			seq_printf(m, "\n\t\t[NONE]");
+ 
+ 		seq_puts(m, "\n\n\tMIDs: ");
+-		spin_lock(&GlobalMid_Lock);
++		spin_lock(&server->mid_lock);
+ 		list_for_each_entry(mid_entry, &server->pending_mid_q, qhead) {
+ 			seq_printf(m, "\n\tState: %d com: %d pid:"
+ 					" %d cbdata: %p mid %llu\n",
+@@ -486,7 +486,7 @@ static int cifs_debug_data_proc_show(struct seq_file *m, void *v)
+ 					mid_entry->callback_data,
+ 					mid_entry->mid);
+ 		}
+-		spin_unlock(&GlobalMid_Lock);
++		spin_unlock(&server->mid_lock);
+ 		seq_printf(m, "\n--\n");
+ 	}
+ 	if (c == 0)
+* Unmerged path fs/cifs/cifsencrypt.c
+* Unmerged path fs/cifs/cifsfs.c
+* Unmerged path fs/cifs/cifsglob.h
+* Unmerged path fs/cifs/cifssmb.c
+* Unmerged path fs/cifs/connect.c
+diff --git a/fs/cifs/dfs_cache.c b/fs/cifs/dfs_cache.c
+index 17718cdb89bc..ff15cf09b50f 100644
+--- a/fs/cifs/dfs_cache.c
++++ b/fs/cifs/dfs_cache.c
+@@ -1540,15 +1540,21 @@ static void refresh_mounts(struct cifs_ses **sessions)
+ 
+ 	spin_lock(&cifs_tcp_ses_lock);
+ 	list_for_each_entry(server, &cifs_tcp_ses_list, tcp_ses_list) {
+-		if (!server->is_dfs_conn)
++		spin_lock(&server->srv_lock);
++		if (!server->is_dfs_conn) {
++			spin_unlock(&server->srv_lock);
+ 			continue;
++		}
++		spin_unlock(&server->srv_lock);
+ 
+ 		list_for_each_entry(ses, &server->smb_ses_list, smb_ses_list) {
+ 			list_for_each_entry(tcon, &ses->tcon_list, tcon_list) {
++				spin_lock(&tcon->tc_lock);
+ 				if (!tcon->ipc && !tcon->need_reconnect) {
+ 					tcon->tc_count++;
+ 					list_add_tail(&tcon->ulist, &tcons);
+ 				}
++				spin_unlock(&tcon->tc_lock);
+ 			}
+ 		}
+ 	}
+* Unmerged path fs/cifs/misc.c
+* Unmerged path fs/cifs/smb1ops.c
+* Unmerged path fs/cifs/smb2ops.c
+* Unmerged path fs/cifs/smb2pdu.c
+* Unmerged path fs/cifs/smb2transport.c
+* Unmerged path fs/cifs/transport.c
