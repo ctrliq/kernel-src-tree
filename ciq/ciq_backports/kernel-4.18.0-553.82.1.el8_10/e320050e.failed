@@ -1,0 +1,121 @@
+gfs2: No more gfs2_find_jhead caching
+
+jira LE-4669
+Rebuild_History Non-Buildable kernel-4.18.0-553.82.1.el8_10
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit e320050eb75e914aa5e12de2a9ab830c9a2ce311
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.82.1.el8_10/e320050e.failed
+
+We are no longer calling gfs2_find_jhead() on the same log twice, so
+there is no more reason for keeping the log contents cached across those
+calls.  In addition, log head lookup and log header writing didn't go
+through the same address space and so the caching wasn't even fully
+working, anyway.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit e320050eb75e914aa5e12de2a9ab830c9a2ce311)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/lops.h
+diff --cc fs/gfs2/lops.h
+index cc8b2d4aebbe,be740bf33666..000000000000
+--- a/fs/gfs2/lops.h
++++ b/fs/gfs2/lops.h
+@@@ -19,10 -17,12 +19,16 @@@ u64 gfs2_log_bmap(struct gfs2_jdesc *jd
+  void gfs2_log_write(struct gfs2_sbd *sdp, struct gfs2_jdesc *jd,
+  		    struct page *page, unsigned size, unsigned offset,
+  		    u64 blkno);
+ -void gfs2_log_submit_bio(struct bio **biop, blk_opf_t opf);
+ +void gfs2_log_submit_bio(struct bio **biop, int opf);
+  void gfs2_pin(struct gfs2_sbd *sdp, struct buffer_head *bh);
+  int gfs2_find_jhead(struct gfs2_jdesc *jd,
+++<<<<<<< HEAD
+ +			   struct gfs2_log_header_host *head, bool keep_cache);
+++=======
++ 		    struct gfs2_log_header_host *head);
++ void gfs2_drain_revokes(struct gfs2_sbd *sdp);
++ 
+++>>>>>>> e320050eb75e (gfs2: No more gfs2_find_jhead caching)
+  static inline unsigned int buf_limit(struct gfs2_sbd *sdp)
+  {
+  	return sdp->sd_ldptrs;
+diff --git a/fs/gfs2/glops.c b/fs/gfs2/glops.c
+index 72c033c1a97f..67df5cbd111f 100644
+--- a/fs/gfs2/glops.c
++++ b/fs/gfs2/glops.c
+@@ -596,7 +596,7 @@ static int freeze_go_xmote_bh(struct gfs2_glock *gl)
+ 	if (test_bit(SDF_JOURNAL_LIVE, &sdp->sd_flags)) {
+ 		j_gl->gl_ops->go_inval(j_gl, DIO_METADATA);
+ 
+-		error = gfs2_find_jhead(sdp->sd_jdesc, &head, false);
++		error = gfs2_find_jhead(sdp->sd_jdesc, &head);
+ 		if (gfs2_assert_withdraw_delayed(sdp, !error))
+ 			return error;
+ 		if (gfs2_assert_withdraw_delayed(sdp, head.lh_flags &
+diff --git a/fs/gfs2/lops.c b/fs/gfs2/lops.c
+index bdabbe6a2e5d..5879b2e21096 100644
+--- a/fs/gfs2/lops.c
++++ b/fs/gfs2/lops.c
+@@ -510,8 +510,7 @@ static struct bio *gfs2_chain_bio(struct bio *prev, unsigned int nr_iovecs)
+  *
+  * Returns: 0 on success, errno otherwise
+  */
+-int gfs2_find_jhead(struct gfs2_jdesc *jd, struct gfs2_log_header_host *head,
+-		    bool keep_cache)
++int gfs2_find_jhead(struct gfs2_jdesc *jd, struct gfs2_log_header_host *head)
+ {
+ 	struct gfs2_sbd *sdp = GFS2_SB(jd->jd_inode);
+ 	struct address_space *mapping = jd->jd_inode->i_mapping;
+@@ -601,8 +600,7 @@ int gfs2_find_jhead(struct gfs2_jdesc *jd, struct gfs2_log_header_host *head,
+ 	if (!ret)
+ 		ret = filemap_check_wb_err(mapping, since);
+ 
+-	if (!keep_cache)
+-		truncate_inode_pages(mapping, 0);
++	truncate_inode_pages(mapping, 0);
+ 
+ 	return ret;
+ }
+* Unmerged path fs/gfs2/lops.h
+diff --git a/fs/gfs2/recovery.c b/fs/gfs2/recovery.c
+index ec7a2436cf8c..e3dd9bd99566 100644
+--- a/fs/gfs2/recovery.c
++++ b/fs/gfs2/recovery.c
+@@ -455,7 +455,7 @@ void gfs2_recover_func(struct work_struct *work)
+ 	if (error)
+ 		goto fail_gunlock_ji;
+ 
+-	error = gfs2_find_jhead(jd, &head, true);
++	error = gfs2_find_jhead(jd, &head);
+ 	if (error)
+ 		goto fail_gunlock_ji;
+ 	t_jhd = ktime_get();
+diff --git a/fs/gfs2/super.c b/fs/gfs2/super.c
+index 191bc6cbf487..756fafdea4ae 100644
+--- a/fs/gfs2/super.c
++++ b/fs/gfs2/super.c
+@@ -385,7 +385,7 @@ static int gfs2_lock_fs_check_clean(struct gfs2_sbd *sdp)
+ 		error = gfs2_jdesc_check(jd);
+ 		if (error)
+ 			break;
+-		error = gfs2_find_jhead(jd, &lh, false);
++		error = gfs2_find_jhead(jd, &lh);
+ 		if (error)
+ 			break;
+ 		if (!(lh.lh_flags & GFS2_LOG_HEAD_UNMOUNT)) {
+diff --git a/fs/gfs2/util.c b/fs/gfs2/util.c
+index f4c4bce3391a..ad6c67da5036 100644
+--- a/fs/gfs2/util.c
++++ b/fs/gfs2/util.c
+@@ -74,7 +74,7 @@ int check_journal_clean(struct gfs2_sbd *sdp, struct gfs2_jdesc *jd,
+ 			       "mount.\n");
+ 		goto out_unlock;
+ 	}
+-	error = gfs2_find_jhead(jd, &head, false);
++	error = gfs2_find_jhead(jd, &head);
+ 	if (error) {
+ 		if (verbose)
+ 			fs_err(sdp, "Error parsing journal for spectator "
