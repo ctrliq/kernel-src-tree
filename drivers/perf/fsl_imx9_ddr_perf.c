@@ -85,6 +85,11 @@ static const struct imx_ddr_devtype_data imx93_devtype_data = {
 	.identifier = "imx93",
 };
 
+static const struct imx_ddr_devtype_data imx94_devtype_data = {
+	.identifier = "imx94",
+	.filter_ver = DDR_PERF_AXI_FILTER_V2
+};
+
 static const struct imx_ddr_devtype_data imx95_devtype_data = {
 	.identifier = "imx95",
 };
@@ -101,6 +106,7 @@ static inline bool is_imx95(struct ddr_pmu *pmu)
 
 static const struct of_device_id imx_ddr_pmu_dt_ids[] = {
 	{ .compatible = "fsl,imx93-ddr-pmu", .data = &imx93_devtype_data },
+	{ .compatible = "fsl,imx94-ddr-pmu", .data = &imx94_devtype_data },
 	{ .compatible = "fsl,imx95-ddr-pmu", .data = &imx95_devtype_data },
 	{ /* sentinel */ }
 };
