@@ -1,0 +1,237 @@
+cifs: use a different reconnect helper for non-cifsd threads
+
+jira LE-4669
+Rebuild_History Non-Buildable kernel-4.18.0-553.82.1.el8_10
+commit-author Shyam Prasad N <sprasad@microsoft.com>
+commit dca65818c80cf06e0f08ba2cf94060a5236e73c2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.82.1.el8_10/dca65818.failed
+
+The cifs_demultiplexer_thread should only call cifs_reconnect.
+If any other thread wants to trigger a reconnect, they can do
+so by updating the server tcpStatus to CifsNeedReconnect.
+
+The last patch attempted to use the same helper function for
+both types of threads, but that causes other issues
+with lock dependencies.
+
+This patch creates a new helper for non-cifsd threads, that
+will indicate to cifsd that the server needs reconnect.
+
+Fixes: 2a05137a0575 ("cifs: mark sessions for reconnection in helper function")
+	Signed-off-by: Shyam Prasad N <sprasad@microsoft.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit dca65818c80cf06e0f08ba2cf94060a5236e73c2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/cifs_swn.c
+#	fs/cifs/cifsproto.h
+#	fs/cifs/connect.c
+#	fs/cifs/dfs_cache.c
+#	fs/cifs/smb1ops.c
+#	fs/cifs/transport.c
+diff --cc fs/cifs/cifs_swn.c
+index bcbaf4e25f94,180c234c2f46..000000000000
+--- a/fs/cifs/cifs_swn.c
++++ b/fs/cifs/cifs_swn.c
+@@@ -398,11 -396,11 +398,19 @@@ static int cifs_swn_resource_state_chan
+  	switch (state) {
+  	case CIFS_SWN_RESOURCE_STATE_UNAVAILABLE:
+  		cifs_dbg(FYI, "%s: resource name '%s' become unavailable\n", __func__, name);
+++<<<<<<< HEAD
+ +		cifs_ses_mark_for_reconnect(swnreg->tcon->ses);
+ +		break;
+ +	case CIFS_SWN_RESOURCE_STATE_AVAILABLE:
+ +		cifs_dbg(FYI, "%s: resource name '%s' become available\n", __func__, name);
+ +		cifs_ses_mark_for_reconnect(swnreg->tcon->ses);
+++=======
++ 		cifs_signal_cifsd_for_reconnect(swnreg->tcon->ses->server, true);
++ 		break;
++ 	case CIFS_SWN_RESOURCE_STATE_AVAILABLE:
++ 		cifs_dbg(FYI, "%s: resource name '%s' become available\n", __func__, name);
++ 		cifs_signal_cifsd_for_reconnect(swnreg->tcon->ses->server, true);
+++>>>>>>> dca65818c80c (cifs: use a different reconnect helper for non-cifsd threads)
+  		break;
+  	case CIFS_SWN_RESOURCE_STATE_UNKNOWN:
+  		cifs_dbg(FYI, "%s: resource name '%s' changed to unknown state\n", __func__, name);
+@@@ -500,10 -498,7 +508,14 @@@ static int cifs_swn_reconnect(struct ci
+  		goto unlock;
+  	}
+  
+++<<<<<<< HEAD
+ +	spin_lock(&GlobalMid_Lock);
+ +	if (tcon->ses->server->tcpStatus != CifsExiting)
+ +		tcon->ses->server->tcpStatus = CifsNeedReconnect;
+ +	spin_unlock(&GlobalMid_Lock);
+++=======
++ 	cifs_signal_cifsd_for_reconnect(tcon->ses->server, false);
+++>>>>>>> dca65818c80c (cifs: use a different reconnect helper for non-cifsd threads)
+  
+  unlock:
+  	mutex_unlock(&tcon->ses->server->srv_mutex);
+diff --cc fs/cifs/cifsproto.h
+index 081ad010ce30,0df3b24a0bf4..000000000000
+--- a/fs/cifs/cifsproto.h
++++ b/fs/cifs/cifsproto.h
+@@@ -130,7 -131,14 +130,18 @@@ extern int SendReceiveBlockingLock(cons
+  			struct smb_hdr *in_buf ,
+  			struct smb_hdr *out_buf,
+  			int *bytes_returned);
+++<<<<<<< HEAD
+ +extern int cifs_reconnect(struct TCP_Server_Info *server);
+++=======
++ void
++ cifs_signal_cifsd_for_reconnect(struct TCP_Server_Info *server,
++ 				      bool all_channels);
++ void
++ cifs_mark_tcp_ses_conns_for_reconnect(struct TCP_Server_Info *server,
++ 				      bool mark_smb_session);
++ extern int cifs_reconnect(struct TCP_Server_Info *server,
++ 			  bool mark_smb_session);
+++>>>>>>> dca65818c80c (cifs: use a different reconnect helper for non-cifsd threads)
+  extern int checkSMB(char *buf, unsigned int len, struct TCP_Server_Info *srvr);
+  extern bool is_valid_oplock_break(char *, struct TCP_Server_Info *);
+  extern bool backup_cred(struct cifs_sb_info *);
+diff --cc fs/cifs/connect.c
+index 7aabd597027d,9964c3634322..000000000000
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@@ -165,25 -162,60 +165,73 @@@ static void cifs_resolve_server(struct 
+  	mutex_unlock(&server->srv_mutex);
+  }
+  
+++<<<<<<< HEAD
+ +/**
+++=======
++ /*
++  * Update the tcpStatus for the server.
++  * This is used to signal the cifsd thread to call cifs_reconnect
++  * ONLY cifsd thread should call cifs_reconnect. For any other
++  * thread, use this function
++  *
++  * @server: the tcp ses for which reconnect is needed
++  * @all_channels: if this needs to be done for all channels
++  */
++ void
++ cifs_signal_cifsd_for_reconnect(struct TCP_Server_Info *server,
++ 				bool all_channels)
++ {
++ 	struct TCP_Server_Info *pserver;
++ 	struct cifs_ses *ses;
++ 	int i;
++ 
++ 	/* If server is a channel, select the primary channel */
++ 	pserver = CIFS_SERVER_IS_CHAN(server) ? server->primary_server : server;
++ 
++ 	spin_lock(&cifs_tcp_ses_lock);
++ 	if (!all_channels) {
++ 		pserver->tcpStatus = CifsNeedReconnect;
++ 		spin_unlock(&cifs_tcp_ses_lock);
++ 		return;
++ 	}
++ 
++ 	list_for_each_entry(ses, &pserver->smb_ses_list, smb_ses_list) {
++ 		spin_lock(&ses->chan_lock);
++ 		for (i = 0; i < ses->chan_count; i++)
++ 			ses->chans[i].server->tcpStatus = CifsNeedReconnect;
++ 		spin_unlock(&ses->chan_lock);
++ 	}
++ 	spin_unlock(&cifs_tcp_ses_lock);
++ }
++ 
++ /*
+++>>>>>>> dca65818c80c (cifs: use a different reconnect helper for non-cifsd threads)
+   * Mark all sessions and tcons for reconnect.
++  * IMPORTANT: make sure that this gets called only from
++  * cifsd thread. For any other thread, use
++  * cifs_signal_cifsd_for_reconnect
+   *
++  * @server: the tcp ses for which reconnect is needed
+   * @server needs to be previously set to CifsNeedReconnect.
+++<<<<<<< HEAD
+++=======
++  * @mark_smb_session: whether even sessions need to be marked
+++>>>>>>> dca65818c80c (cifs: use a different reconnect helper for non-cifsd threads)
+   */
+ -void
+ -cifs_mark_tcp_ses_conns_for_reconnect(struct TCP_Server_Info *server,
+ -				      bool mark_smb_session)
+ +static void cifs_mark_tcp_ses_conns_for_reconnect(struct TCP_Server_Info *server)
+  {
+ -	struct TCP_Server_Info *pserver;
+ +	unsigned int num_sessions = 0;
+  	struct cifs_ses *ses;
+  	struct cifs_tcon *tcon;
+ +	struct mid_q_entry *mid, *nmid;
+ +	struct list_head retry_list;
+ +	struct TCP_Server_Info *pserver;
+  
+ +	server->maxBuf = 0;
+ +	server->max_read = 0;
+ +
+ +	cifs_dbg(FYI, "Mark tcp session as need reconnect\n");
+ +	trace_smb3_reconnect(server->CurrentMid, server->conn_id, server->hostname);
+  	/*
+  	 * before reconnecting the tcp session, mark the smb session (uid) and the tid bad so they
+  	 * are not used until reconnected.
+diff --cc fs/cifs/dfs_cache.c
+index 17718cdb89bc,30e040da4f09..000000000000
+--- a/fs/cifs/dfs_cache.c
++++ b/fs/cifs/dfs_cache.c
+@@@ -1383,7 -1355,7 +1383,11 @@@ static void mark_for_reconnect_if_neede
+  	}
+  
+  	cifs_dbg(FYI, "%s: no cached or matched targets. mark dfs share for reconnect.\n", __func__);
+++<<<<<<< HEAD
+ +	cifs_ses_mark_for_reconnect(tcon->ses);
+++=======
++ 	cifs_signal_cifsd_for_reconnect(tcon->ses->server, true);
+++>>>>>>> dca65818c80c (cifs: use a different reconnect helper for non-cifsd threads)
+  }
+  
+  /* Refresh dfs referral of tcon and mark it for reconnect if needed */
+diff --cc fs/cifs/smb1ops.c
+index 421cc9a7fbb1,c71c9a44bef4..000000000000
+--- a/fs/cifs/smb1ops.c
++++ b/fs/cifs/smb1ops.c
+@@@ -237,6 -226,11 +237,14 @@@ cifs_get_next_mid(struct TCP_Server_Inf
+  		cur_mid++;
+  	}
+  	spin_unlock(&GlobalMid_Lock);
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (reconnect) {
++ 		cifs_signal_cifsd_for_reconnect(server, false);
++ 	}
++ 
+++>>>>>>> dca65818c80c (cifs: use a different reconnect helper for non-cifsd threads)
+  	return mid;
+  }
+  
+diff --cc fs/cifs/transport.c
+index 680bba1f6d90,eeb1a699bd6f..000000000000
+--- a/fs/cifs/transport.c
++++ b/fs/cifs/transport.c
+@@@ -417,9 -430,7 +417,13 @@@ unmask
+  		 * be taken as the remainder of this one. We need to kill the
+  		 * socket so the server throws away the partial SMB
+  		 */
+++<<<<<<< HEAD
+ +		spin_lock(&GlobalMid_Lock);
+ +		server->tcpStatus = CifsNeedReconnect;
+ +		spin_unlock(&GlobalMid_Lock);
+++=======
++ 		cifs_signal_cifsd_for_reconnect(server, false);
+++>>>>>>> dca65818c80c (cifs: use a different reconnect helper for non-cifsd threads)
+  		trace_smb3_partial_send_reconnect(server->CurrentMid,
+  						  server->conn_id, server->hostname);
+  	}
+* Unmerged path fs/cifs/cifs_swn.c
+* Unmerged path fs/cifs/cifsproto.h
+* Unmerged path fs/cifs/connect.c
+* Unmerged path fs/cifs/dfs_cache.c
+* Unmerged path fs/cifs/smb1ops.c
+* Unmerged path fs/cifs/transport.c
