@@ -1,0 +1,177 @@
+cifs: reset iface weights when we cannot find a candidate
+
+jira LE-4669
+Rebuild_History Non-Buildable kernel-4.18.0-553.82.1.el8_10
+commit-author Shyam Prasad N <sprasad@microsoft.com>
+commit 9d5eff7821f6d70f7d1b4d8a60680fba4de868a7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.82.1.el8_10/9d5eff78.failed
+
+We now do a weighted selection of server interfaces when allocating
+new channels. The weights are decided based on the speed advertised.
+The fulfilled weight for an interface is a counter that is used to
+track the interface selection. It should be reset back to zero once
+all interfaces fulfilling their weight.
+
+In cifs_chan_update_iface, this reset logic was missing. As a result
+when the server interface list changes, the client may not be able
+to find a new candidate for other channels after all interfaces have
+been fulfilled.
+
+Fixes: a6d8fb54a515 ("cifs: distribute channels across interfaces based on speed")
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Shyam Prasad N <sprasad@microsoft.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 9d5eff7821f6d70f7d1b4d8a60680fba4de868a7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/sess.c
+diff --cc fs/cifs/sess.c
+index f27026148ee7,0a8c2fcc9ded..000000000000
+--- a/fs/cifs/sess.c
++++ b/fs/cifs/sess.c
+@@@ -226,29 -265,106 +226,48 @@@ int cifs_try_adding_channels(struct cif
+  }
+  
+  /*
+ - * called when multichannel is disabled by the server.
+ - * this always gets called from smb2_reconnect
+ - * and cannot get called in parallel threads.
+ + * update the iface for the channel if necessary.
+ + * will return 0 when iface is updated. 1 otherwise
+ + * Must be called with chan_lock held.
+   */
+ -void
+ -cifs_disable_secondary_channels(struct cifs_ses *ses)
+ -{
+ -	int i, chan_count;
+ -	struct TCP_Server_Info *server;
+ -	struct cifs_server_iface *iface;
+ -
+ -	spin_lock(&ses->chan_lock);
+ -	chan_count = ses->chan_count;
+ -	if (chan_count == 1)
+ -		goto done;
+ -
+ -	ses->chan_count = 1;
+ -
+ -	/* for all secondary channels reset the need reconnect bit */
+ -	ses->chans_need_reconnect &= 1;
+ -
+ -	for (i = 1; i < chan_count; i++) {
+ -		iface = ses->chans[i].iface;
+ -		server = ses->chans[i].server;
+ -
+ -		/*
+ -		 * remove these references first, since we need to unlock
+ -		 * the chan_lock here, since iface_lock is a higher lock
+ -		 */
+ -		ses->chans[i].iface = NULL;
+ -		ses->chans[i].server = NULL;
+ -		spin_unlock(&ses->chan_lock);
+ -
+ -		if (iface) {
+ -			spin_lock(&ses->iface_lock);
+ -			iface->num_channels--;
+ -			if (iface->weight_fulfilled)
+ -				iface->weight_fulfilled--;
+ -			kref_put(&iface->refcount, release_iface);
+ -			spin_unlock(&ses->iface_lock);
+ -		}
+ -
+ -		if (server) {
+ -			if (!server->terminate) {
+ -				server->terminate = true;
+ -				cifs_signal_cifsd_for_reconnect(server, false);
+ -			}
+ -			cifs_put_tcp_session(server, false);
+ -		}
+ -
+ -		spin_lock(&ses->chan_lock);
+ -	}
+ -
+ -done:
+ -	spin_unlock(&ses->chan_lock);
+ -}
+ -
+ -/* update the iface for the channel if necessary. */
+ -void
+ +int
+  cifs_chan_update_iface(struct cifs_ses *ses, struct TCP_Server_Info *server)
+  {
+ -	unsigned int chan_index;
+ -	size_t iface_weight = 0, iface_min_speed = 0;
+ +	unsigned int chan_index = cifs_ses_get_chan_index(ses, server);
+  	struct cifs_server_iface *iface = NULL;
+  	struct cifs_server_iface *old_iface = NULL;
+++<<<<<<< HEAD:fs/cifs/sess.c
+ +	int rc = 0;
+++=======
++ 	struct cifs_server_iface *last_iface = NULL;
++ 	struct sockaddr_storage ss;
++ 	int retry = 0;
+++>>>>>>> 9d5eff7821f6 (cifs: reset iface weights when we cannot find a candidate):fs/smb/client/sess.c
+  
+ -	spin_lock(&ses->chan_lock);
+ -	chan_index = cifs_ses_get_chan_index(ses, server);
+ -	if (chan_index == CIFS_INVAL_CHAN_INDEX) {
+ -		spin_unlock(&ses->chan_lock);
+ -		return;
+ -	}
+ +	/* primary channel. This can never go away */
+ +	if (!chan_index)
+ +		return 0;
+  
+  	if (ses->chans[chan_index].iface) {
+  		old_iface = ses->chans[chan_index].iface;
+ -		if (old_iface->is_active) {
+ -			spin_unlock(&ses->chan_lock);
+ -			return;
+ -		}
+ +		if (old_iface->is_active)
+ +			return 1;
+  	}
+ -	spin_unlock(&ses->chan_lock);
+ -
+ -	spin_lock(&server->srv_lock);
+ -	ss = server->dstaddr;
+ -	spin_unlock(&server->srv_lock);
+  
+  	spin_lock(&ses->iface_lock);
+++<<<<<<< HEAD:fs/cifs/sess.c
+++=======
++ 	if (!ses->iface_count) {
++ 		spin_unlock(&ses->iface_lock);
++ 		cifs_dbg(ONCE, "server %s does not advertise interfaces\n", ses->server->hostname);
++ 		return;
++ 	}
++ 
++ try_again:
++ 	last_iface = list_last_entry(&ses->iface_list, struct cifs_server_iface,
++ 				     iface_head);
++ 	iface_min_speed = last_iface->speed;
+++>>>>>>> 9d5eff7821f6 (cifs: reset iface weights when we cannot find a candidate):fs/smb/client/sess.c
+  
+  	/* then look for a new one */
+  	list_for_each_entry(iface, &ses->iface_list, iface_head) {
+@@@ -262,7 -399,13 +281,17 @@@
+  	}
+  
+  	if (list_entry_is_head(iface, &ses->iface_list, iface_head)) {
+++<<<<<<< HEAD:fs/cifs/sess.c
+ +		rc = 1;
+++=======
++ 		list_for_each_entry(iface, &ses->iface_list, iface_head)
++ 			iface->weight_fulfilled = 0;
++ 
++ 		/* see if it can be satisfied in second attempt */
++ 		if (!retry++)
++ 			goto try_again;
++ 
+++>>>>>>> 9d5eff7821f6 (cifs: reset iface weights when we cannot find a candidate):fs/smb/client/sess.c
+  		iface = NULL;
+  		cifs_dbg(FYI, "unable to find a suitable iface\n");
+  	}
+* Unmerged path fs/cifs/sess.c
