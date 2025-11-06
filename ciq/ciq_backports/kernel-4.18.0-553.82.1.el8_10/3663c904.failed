@@ -1,0 +1,137 @@
+cifs: check reconnects for channels of active tcons too
+
+jira LE-4669
+Rebuild_History Non-Buildable kernel-4.18.0-553.82.1.el8_10
+commit-author Shyam Prasad N <sprasad@microsoft.com>
+commit 3663c9045f51a7ad635a0785adef07c21b79b560
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.82.1.el8_10/3663c904.failed
+
+With the new multichannel logic, when a channel needs reconnection,
+the tree connect and other channels can still be active.
+This fix will handle cases of checking for channel reconnect,
+when the tcon does not need reconnect.
+
+	Signed-off-by: Shyam Prasad N <sprasad@microsoft.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 3663c9045f51a7ad635a0785adef07c21b79b560)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/cifsglob.h
+#	fs/cifs/connect.c
+#	fs/cifs/smb2pdu.c
+diff --cc fs/cifs/cifsglob.h
+index bfe603df9494,cace0818d510..000000000000
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@@ -115,7 -111,14 +115,18 @@@ enum statusEnum 
+  	CifsGood,
+  	CifsExiting,
+  	CifsNeedReconnect,
+++<<<<<<< HEAD
+ +	CifsNeedNegotiate
+++=======
++ 	CifsNeedNegotiate,
++ 	CifsInNegotiate,
++ 	CifsNeedSessSetup,
++ 	CifsInSessSetup,
++ 	CifsNeedTcon,
++ 	CifsInTcon,
++ 	CifsNeedFilesInvalidate,
++ 	CifsInFilesInvalidate
+++>>>>>>> 3663c9045f51 (cifs: check reconnects for channels of active tcons too)
+  };
+  
+  enum securityEnum {
+diff --cc fs/cifs/connect.c
+index aa59bbf815c2,804ffcde0391..000000000000
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@@ -325,12 -329,13 +325,13 @@@ static int __cifs_reconnect(struct TCP_
+  		} else {
+  			atomic_inc(&tcpSesReconnectCount);
+  			set_credits(server, 1);
+ -			spin_lock(&cifs_tcp_ses_lock);
+ +			spin_lock(&GlobalMid_Lock);
+  			if (server->tcpStatus != CifsExiting)
+  				server->tcpStatus = CifsNeedNegotiate;
+ -			spin_unlock(&cifs_tcp_ses_lock);
+ +			spin_unlock(&GlobalMid_Lock);
+  			cifs_swn_reset_server_dstaddr(server);
+  			mutex_unlock(&server->srv_mutex);
++ 			mod_delayed_work(cifsiod_wq, &server->reconnect, 0);
+  		}
+  	} while (server->tcpStatus == CifsNeedReconnect);
+  
+@@@ -4356,8 -4463,27 +4376,31 @@@ out
+  #else
+  int cifs_tree_connect(const unsigned int xid, struct cifs_tcon *tcon, const struct nls_table *nlsc)
+  {
++ 	int rc;
+  	const struct smb_version_operations *ops = tcon->ses->server->ops;
+  
+++<<<<<<< HEAD
+ +	return ops->tree_connect(xid, tcon->ses, tcon->treeName, tcon, nlsc);
+++=======
++ 	/* only send once per connect */
++ 	spin_lock(&cifs_tcp_ses_lock);
++ 	if (tcon->ses->status != CifsGood ||
++ 	    (tcon->tidStatus != CifsNew &&
++ 	    tcon->tidStatus != CifsNeedTcon)) {
++ 		spin_unlock(&cifs_tcp_ses_lock);
++ 		return 0;
++ 	}
++ 	tcon->tidStatus = CifsInTcon;
++ 	spin_unlock(&cifs_tcp_ses_lock);
++ 
++ 	rc = ops->tree_connect(xid, tcon->ses, tcon->treeName, tcon, nlsc);
++ 	if (rc) {
++ 		spin_lock(&cifs_tcp_ses_lock);
++ 		tcon->tidStatus = CifsNeedTcon;
++ 		spin_unlock(&cifs_tcp_ses_lock);
++ 	}
++ 
++ 	return rc;
+++>>>>>>> 3663c9045f51 (cifs: check reconnects for channels of active tcons too)
+  }
+  #endif
+diff --cc fs/cifs/smb2pdu.c
+index fdd9bd57531e,41b6dffc84c7..000000000000
+--- a/fs/cifs/smb2pdu.c
++++ b/fs/cifs/smb2pdu.c
+@@@ -283,18 -285,22 +283,29 @@@ smb2_reconnect(__le16 smb2_command, str
+  	if (!rc) {
+  		rc = cifs_setup_session(0, ses, server, nls_codepage);
+  		if ((rc == -EACCES) && !tcon->retry) {
+ -			mutex_unlock(&ses->session_mutex);
+  			rc = -EHOSTDOWN;
+ +			mutex_unlock(&ses->session_mutex);
+  			goto failed;
+  		}
+++<<<<<<< HEAD
+ +	}
+ +
+ +	if (rc || !tcon->need_reconnect) {
+ +		mutex_unlock(&tcon->ses->session_mutex);
+++=======
++ 	} else {
++ 		mutex_unlock(&ses->session_mutex);
+++>>>>>>> 3663c9045f51 (cifs: check reconnects for channels of active tcons too)
+  		goto out;
+  	}
++ 	mutex_unlock(&ses->session_mutex);
+  
+  skip_sess_setup:
++ 	mutex_lock(&ses->session_mutex);
++ 	if (!tcon->need_reconnect) {
++ 		mutex_unlock(&ses->session_mutex);
++ 		goto out;
++ 	}
+  	cifs_mark_open_files_invalid(tcon);
+  	if (tcon->use_persistent)
+  		tcon->need_reopen_files = true;
+* Unmerged path fs/cifs/cifsglob.h
+* Unmerged path fs/cifs/connect.c
+* Unmerged path fs/cifs/smb2pdu.c
