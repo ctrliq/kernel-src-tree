@@ -34,12 +34,14 @@
 #include <linux/of.h>
 #include <linux/of_irq.h>
 #include <linux/pinctrl/consumer.h>
+#include <linux/pinctrl/devinfo.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/pm_wakeirq.h>
 #include <linux/property.h>
 #include <linux/rwsem.h>
 #include <linux/slab.h>
+#include <linux/string_choices.h>
 
 #include "i2c-core.h"
 
@@ -301,7 +303,9 @@ static void i2c_gpio_init_pinctrl_recovery(struct i2c_adapter *adap)
 {
 	struct i2c_bus_recovery_info *bri = adap->bus_recovery_info;
 	struct device *dev = &adap->dev;
-	struct pinctrl *p = bri->pinctrl;
+	struct pinctrl *p = bri->pinctrl ?: dev_pinctrl(dev->parent);
+
+	bri->pinctrl = p;
 
 	/*
 	 * we can't change states without pinctrl, so remove the states if
@@ -2024,7 +2028,7 @@ static int i2c_quirk_error(struct i2c_adapter *adap, struct i2c_msg *msg, char *
 {
 	dev_err_ratelimited(&adap->dev, "adapter quirk: %s (addr 0x%04x, size %u, %s)\n",
 			    err_msg, msg->addr, msg->len,
-			    msg->flags & I2C_M_RD ? "read" : "write");
+			    str_read_write(msg->flags & I2C_M_RD));
 	return -EOPNOTSUPP;
 }
 
