@@ -3396,8 +3396,10 @@ static int __smc_create(struct net *net, struct socket *sock, int protocol,
 	smc->sk.sk_sndbuf = max(smc->clcsock->sk->sk_sndbuf, SMC_BUF_MIN_SIZE);
 	smc->sk.sk_rcvbuf = max(smc->clcsock->sk->sk_rcvbuf, SMC_BUF_MIN_SIZE);
 
-	if (rc)
+	if (rc) {
 		sk_common_release(sk);
+		sock->sk = NULL;
+	}
 out:
 	return rc;
 }
