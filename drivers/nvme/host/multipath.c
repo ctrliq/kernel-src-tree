@@ -905,7 +905,7 @@ static int nvme_read_ana_log(struct nvme_ctrl *ctrl)
 	if (nr_change_groups)
 		mod_timer(&ctrl->anatt_timer, ctrl->anatt * HZ * 2 + jiffies);
 	else
-		del_timer_sync(&ctrl->anatt_timer);
+		timer_delete_sync(&ctrl->anatt_timer);
 out_unlock:
 	mutex_unlock(&ctrl->ana_lock);
 	return error;
@@ -935,7 +935,7 @@ void nvme_mpath_update(struct nvme_ctrl *ctrl)
 
 static void nvme_anatt_timeout(struct timer_list *t)
 {
-	struct nvme_ctrl *ctrl = from_timer(ctrl, t, anatt_timer);
+	struct nvme_ctrl *ctrl = timer_container_of(ctrl, t, anatt_timer);
 
 	dev_info(ctrl->device, "ANATT timeout, resetting controller.\n");
 	nvme_reset_ctrl(ctrl);
@@ -945,7 +945,7 @@ void nvme_mpath_stop(struct nvme_ctrl *ctrl)
 {
 	if (!nvme_ctrl_use_ana(ctrl))
 		return;
-	del_timer_sync(&ctrl->anatt_timer);
+	timer_delete_sync(&ctrl->anatt_timer);
 	cancel_work_sync(&ctrl->ana_work);
 }
 

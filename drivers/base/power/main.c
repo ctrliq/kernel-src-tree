@@ -512,7 +512,7 @@ struct dpm_watchdog {
  */
 static void dpm_watchdog_handler(struct timer_list *t)
 {
-	struct dpm_watchdog *wd = from_timer(wd, t, timer);
+	struct dpm_watchdog *wd = timer_container_of(wd, t, timer);
 	struct timer_list *timer = &wd->timer;
 	unsigned int time_left;
 
@@ -559,8 +559,8 @@ static void dpm_watchdog_clear(struct dpm_watchdog *wd)
 {
 	struct timer_list *timer = &wd->timer;
 
-	del_timer_sync(timer);
-	destroy_timer_on_stack(timer);
+	timer_delete_sync(timer);
+	timer_destroy_on_stack(timer);
 }
 #else
 #define DECLARE_DPM_WATCHDOG_ON_STACK(wd)

@@ -143,7 +143,7 @@ void s5p_mfc_cleanup_queue(struct list_head *lh, struct vb2_queue *vq)
 
 static void s5p_mfc_watchdog(struct timer_list *t)
 {
-	struct s5p_mfc_dev *dev = from_timer(dev, t, watchdog_timer);
+	struct s5p_mfc_dev *dev = timer_container_of(dev, t, watchdog_timer);
 
 	if (test_bit(0, &dev->hw_lock))
 		atomic_inc(&dev->watchdog_cnt);
@@ -933,7 +933,7 @@ err_pwr_enable:
 	if (dev->num_inst == 1) {
 		if (s5p_mfc_power_off(dev) < 0)
 			mfc_err("power off failed\n");
-		del_timer_sync(&dev->watchdog_timer);
+		timer_delete_sync(&dev->watchdog_timer);
 	}
 err_ctrls_setup:
 	s5p_mfc_dec_ctrls_delete(ctx);
@@ -982,7 +982,7 @@ static int s5p_mfc_release(struct file *file)
 		if (dev->num_inst == 0) {
 			mfc_debug(2, "Last instance\n");
 			s5p_mfc_deinit_hw(dev);
-			del_timer_sync(&dev->watchdog_timer);
+			timer_delete_sync(&dev->watchdog_timer);
 			s5p_mfc_clock_off(dev);
 			if (s5p_mfc_power_off(dev) < 0)
 				mfc_err("Power off failed\n");
@@ -1458,7 +1458,7 @@ static void s5p_mfc_remove(struct platform_device *pdev)
 	}
 	mutex_unlock(&dev->mfc_mutex);
 
-	del_timer_sync(&dev->watchdog_timer);
+	timer_delete_sync(&dev->watchdog_timer);
 	flush_work(&dev->watchdog_work);
 
 	video_unregister_device(dev->vfd_enc);
