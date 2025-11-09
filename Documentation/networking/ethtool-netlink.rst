@@ -1920,14 +1920,15 @@ used to ignore context 0s and only dump additional contexts).
 
 Kernel response contents:
 
-=====================================  ======  ==========================
+=====================================  ======  ===============================
   ``ETHTOOL_A_RSS_HEADER``             nested  reply header
   ``ETHTOOL_A_RSS_CONTEXT``            u32     context number
   ``ETHTOOL_A_RSS_HFUNC``              u32     RSS hash func
   ``ETHTOOL_A_RSS_INDIR``              binary  Indir table bytes
   ``ETHTOOL_A_RSS_HKEY``               binary  Hash key bytes
   ``ETHTOOL_A_RSS_INPUT_XFRM``         u32     RSS input data transformation
-=====================================  ======  ==========================
+  ``ETHTOOL_A_RSS_FLOW_HASH``          nested  Header fields included in hash
+=====================================  ======  ===============================
 
 ETHTOOL_A_RSS_HFUNC attribute is bitmap indicating the hash function
 being used. Current supported options are toeplitz, xor or crc32.
@@ -1936,6 +1937,8 @@ indicates queue number.
 ETHTOOL_A_RSS_INPUT_XFRM attribute is a bitmap indicating the type of
 transformation applied to the input protocol fields before given to the RSS
 hfunc. Current supported options are symmetric-xor and symmetric-or-xor.
+ETHTOOL_A_RSS_FLOW_HASH carries per-flow type bitmask of which header
+fields are included in the hash calculation.
 
 PLCA_GET_CFG
 ============
@@ -2387,7 +2390,7 @@ are netlink only.
   ``ETHTOOL_SFLAGS``                  ``ETHTOOL_MSG_FEATURES_SET``
   ``ETHTOOL_GPFLAGS``                 ``ETHTOOL_MSG_PRIVFLAGS_GET``
   ``ETHTOOL_SPFLAGS``                 ``ETHTOOL_MSG_PRIVFLAGS_SET``
-  ``ETHTOOL_GRXFH``                   n/a
+  ``ETHTOOL_GRXFH``                   ``ETHTOOL_MSG_RSS_GET``
   ``ETHTOOL_SRXFH``                   n/a
   ``ETHTOOL_GGRO``                    ``ETHTOOL_MSG_FEATURES_GET``
   ``ETHTOOL_SGRO``                    ``ETHTOOL_MSG_FEATURES_SET``
