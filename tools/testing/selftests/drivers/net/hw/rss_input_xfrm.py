@@ -33,7 +33,7 @@ def test_rss_input_xfrm(cfg, ipver):
         raise KsftSkipEx("Need at least two CPUs to test symmetric RSS hash")
 
     input_xfrm = cfg.ethnl.rss_get(
-        {'header': {'dev-name': cfg.ifname}}).get('input_xfrm')
+        {'header': {'dev-name': cfg.ifname}}).get('input-xfrm')
 
     # Check for symmetric xor/or-xor
     if not input_xfrm or (input_xfrm != 1 and input_xfrm != 2):
