@@ -11,6 +11,7 @@ TEST_PROGS = \
 	hw_stats_l3_gre.sh \
 	loopback.sh \
 	pp_alloc_fail.py \
+	rss_api.py \
 	rss_ctx.py \
 	rss_input_xfrm.py \
 	#
