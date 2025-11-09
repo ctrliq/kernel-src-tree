@@ -1953,6 +1953,7 @@ Request contents:
   ``ETHTOOL_A_RSS_HFUNC``              u32     RSS hash func
   ``ETHTOOL_A_RSS_INDIR``              binary  Indir table bytes
   ``ETHTOOL_A_RSS_HKEY``               binary  Hash key bytes
+  ``ETHTOOL_A_RSS_INPUT_XFRM``         u32     RSS input data transformation
 =====================================  ======  ==============================
 
 ``ETHTOOL_A_RSS_INDIR`` is the minimal RSS table the user expects. Kernel and
@@ -1962,9 +1963,6 @@ device needs at least 8 entries - the real table in use will end up being
 ``[0, 1, 0, 1, 0, 1, 0, 1]``. Most devices require the table size to be power
 of 2, so tables which size is not a power of 2 will likely be rejected.
 Using table of size 0 will reset the indirection table to the default.
-
-Note that, at present, only a subset of RSS configuration can be accomplished
-over Netlink.
 
 PLCA_GET_CFG
 ============
