@@ -1505,6 +1505,7 @@ static noinline_for_stack int ethtool_set_rxfh(struct net_device *dev,
 	struct ethtool_rxfh rxfh;
 	bool locked = false; /* dev->ethtool->rss_lock taken */
 	bool create = false;
+	bool mod = false;
 	u8 *rss_config;
 	int ret;
 
@@ -1691,6 +1692,7 @@ static noinline_for_stack int ethtool_set_rxfh(struct net_device *dev,
 		}
 		goto out;
 	}
+	mod = !create && !rxfh_dev.rss_delete;
 
 	if (copy_to_user(useraddr + offsetof(struct ethtool_rxfh, rss_context),
 			 &rxfh_dev.rss_context, sizeof(rxfh_dev.rss_context)))
@@ -1760,6 +1762,8 @@ out:
 	if (locked)
 		mutex_unlock(&dev->ethtool->rss_lock);
 	kfree(rss_config);
+	if (mod)
+		ethtool_rss_notify(dev, rxfh.rss_context);
 	return ret;
 }
 
