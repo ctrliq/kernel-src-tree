@@ -232,20 +232,19 @@ static inline char *bmname(struct bitmap *bitmap)
 	return bitmap->mddev ? mdname(bitmap->mddev) : "mdX";
 }
 
-static bool __bitmap_enabled(struct bitmap *bitmap)
+static bool bitmap_enabled(void *data, bool flush)
 {
-	return bitmap->storage.filemap &&
-	       !test_bit(BITMAP_STALE, &bitmap->flags);
-}
+	struct bitmap *bitmap = data;
 
-static bool bitmap_enabled(struct mddev *mddev)
-{
-	struct bitmap *bitmap = mddev->bitmap;
+	if (!flush)
+		return true;
 
-	if (!bitmap)
-		return false;
-
-	return __bitmap_enabled(bitmap);
+	/*
+	 * If caller want to flush bitmap pages to underlying disks, check if
+	 * there are cached pages in filemap.
+	 */
+	return !test_bit(BITMAP_STALE, &bitmap->flags) &&
+	       bitmap->storage.filemap != NULL;
 }
 
 /*
@@ -484,7 +483,8 @@ static int __write_sb_page(struct md_rdev *rdev, struct bitmap *bitmap,
 			return -EINVAL;
 	}
 
-	md_super_write(mddev, rdev, sboff + ps, (int)min(size, bitmap_limit), page);
+	md_write_metadata(mddev, rdev, sboff + ps, (int)min(size, bitmap_limit),
+			  page, 0);
 	return 0;
 }
 
@@ -1244,7 +1244,7 @@ static void __bitmap_unplug(struct bitmap *bitmap)
 	int dirty, need_write;
 	int writing = 0;
 
-	if (!__bitmap_enabled(bitmap))
+	if (!bitmap_enabled(bitmap, true))
 		return;
 
 	/* look at each page to see if there are any set bits that need to be
@@ -1788,15 +1788,9 @@ static bool __bitmap_start_sync(struct bitmap *bitmap, sector_t offset,
 				sector_t *blocks, bool degraded)
 {
 	bitmap_counter_t *bmc;
-	bool rv;
+	bool rv = false;
 
-	if (bitmap == NULL) {/* FIXME or bitmap set as 'failed' */
-		*blocks = 1024;
-		return true; /* always resync if no bitmap */
-	}
 	spin_lock_irq(&bitmap->counts.lock);
-
-	rv = false;
 	bmc = md_bitmap_get_counter(&bitmap->counts, offset, blocks, 0);
 	if (bmc) {
 		/* locked */
@@ -1845,10 +1839,6 @@ static void __bitmap_end_sync(struct bitmap *bitmap, sector_t offset,
 	bitmap_counter_t *bmc;
 	unsigned long flags;
 
-	if (bitmap == NULL) {
-		*blocks = 1024;
-		return;
-	}
 	spin_lock_irqsave(&bitmap->counts.lock, flags);
 	bmc = md_bitmap_get_counter(&bitmap->counts, offset, blocks, 0);
 	if (bmc == NULL)
@@ -1987,12 +1977,12 @@ static void bitmap_dirty_bits(struct mddev *mddev, unsigned long s,
 
 		md_bitmap_set_memory_bits(bitmap, sec, 1);
 		md_bitmap_file_set_bit(bitmap, sec);
-		if (sec < bitmap->mddev->recovery_cp)
+		if (sec < bitmap->mddev->resync_offset)
 			/* We are asserting that the array is dirty,
-			 * so move the recovery_cp address back so
+			 * so move the resync_offset address back so
 			 * that it is obvious that it is dirty
 			 */
-			bitmap->mddev->recovery_cp = sec;
+			bitmap->mddev->resync_offset = sec;
 	}
 }
 
@@ -2060,9 +2050,6 @@ static void bitmap_start_behind_write(struct mddev *mddev)
 	struct bitmap *bitmap = mddev->bitmap;
 	int bw;
 
-	if (!bitmap)
-		return;
-
 	atomic_inc(&bitmap->behind_writes);
 	bw = atomic_read(&bitmap->behind_writes);
 	if (bw > bitmap->behind_writes_used)
@@ -2075,9 +2062,6 @@ static void bitmap_start_behind_write(struct mddev *mddev)
 static void bitmap_end_behind_write(struct mddev *mddev)
 {
 	struct bitmap *bitmap = mddev->bitmap;
-
-	if (!bitmap)
-		return;
 
 	if (atomic_dec_and_test(&bitmap->behind_writes))
 		wake_up(&bitmap->behind_wait);
@@ -2258,7 +2242,7 @@ static int bitmap_load(struct mddev *mddev)
 	    || bitmap->events_cleared == mddev->events)
 		/* no need to keep dirty bits to optimise a
 		 * re-add of a missing device */
-		start = mddev->recovery_cp;
+		start = mddev->resync_offset;
 
 	mutex_lock(&mddev->bitmap_info.mutex);
 	err = md_bitmap_init_from_disk(bitmap, start);
@@ -2593,15 +2577,14 @@ err:
 	return ret;
 }
 
-static int bitmap_resize(struct mddev *mddev, sector_t blocks, int chunksize,
-			 bool init)
+static int bitmap_resize(struct mddev *mddev, sector_t blocks, int chunksize)
 {
 	struct bitmap *bitmap = mddev->bitmap;
 
 	if (!bitmap)
 		return 0;
 
-	return __bitmap_resize(bitmap, blocks, chunksize, init);
+	return __bitmap_resize(bitmap, blocks, chunksize, false);
 }
 
 static ssize_t
@@ -2990,7 +2973,8 @@ static struct attribute *md_bitmap_attrs[] = {
 	&max_backlog_used.attr,
 	NULL
 };
-const struct attribute_group md_bitmap_group = {
+
+static struct attribute_group md_bitmap_group = {
 	.name = "bitmap",
 	.attrs = md_bitmap_attrs,
 };
@@ -3026,6 +3010,8 @@ static struct bitmap_operations bitmap_ops = {
 	.copy_from_slot		= bitmap_copy_from_slot,
 	.set_pages		= bitmap_set_pages,
 	.free			= md_bitmap_free,
+
+	.group			= &md_bitmap_group,
 };
 
 void mddev_set_bitmap_ops(struct mddev *mddev)
