@@ -782,6 +782,8 @@ enum devlink_health_reporter_state {
  * @test: callback to trigger a test event
  * @default_graceful_period: default min time (in msec)
  *	between recovery attempts
+ * @default_burst_period: default time (in msec) for
+ *	error recoveries before starting the grace period
  */
 
 struct devlink_health_reporter_ops {
@@ -797,6 +799,7 @@ struct devlink_health_reporter_ops {
 	int (*test)(struct devlink_health_reporter *reporter,
 		    struct netlink_ext_ack *extack);
 	u64 default_graceful_period;
+	u64 default_burst_period;
 
         RH_KABI_RESERVE(1)
         RH_KABI_RESERVE(2)
