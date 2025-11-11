@@ -618,8 +618,7 @@ xfs_scrub_metadata(
 	if (error)
 		goto out;
 
-	xfs_warn_mount(mp, XFS_OPSTATE_WARNED_SCRUB,
- "EXPERIMENTAL online scrub feature in use. Use at your own risk!");
+	xfs_warn_experimental(mp, XFS_EXPERIMENTAL_SCRUB);
 	if (!printed) {
 		mark_tech_preview("Online scrub feature", THIS_MODULE);
 		printed = true;

@@ -163,8 +163,7 @@ xfs_growfs_data_private(
 		error = xfs_resizefs_init_new_ags(tp, &id, oagcount, nagcount,
 				delta, last_pag, &lastag_extended);
 	} else {
-		xfs_warn_mount(mp, XFS_OPSTATE_WARNED_SHRINK,
-	"EXPERIMENTAL online shrink feature in use. Use at your own risk!");
+		xfs_warn_experimental(mp, XFS_EXPERIMENTAL_SHRINK);
 
 		if (!printed) {
 			mark_tech_preview("Online shrink feature",

@@ -1661,9 +1661,7 @@ xfs_fs_fill_super(
 			goto out_free_sb;
 		}
 
-		xfs_warn(mp,
-"EXPERIMENTAL: V5 Filesystem with Large Block Size (%d bytes) enabled.",
-			mp->m_sb.sb_blocksize);
+		xfs_warn_experimental(mp, XFS_EXPERIMENTAL_LBS);
 		if (!printed) {
 			mark_tech_preview("V5 Filesystem with Large Block Size",
 					  THIS_MODULE);
@@ -1764,8 +1762,7 @@ xfs_fs_fill_super(
 	}
 
 	if (xfs_has_exchange_range(mp)) {
-		xfs_warn(mp,
-	"EXPERIMENTAL exchange-range feature enabled. Use at your own risk!");
+		xfs_warn_experimental(mp, XFS_EXPERIMENTAL_EXCHRANGE);
 		if (!printed) {
 			mark_tech_preview("Exchange-range feature",
 					  THIS_MODULE);
@@ -1774,8 +1771,7 @@ xfs_fs_fill_super(
 	}
 
 	if (xfs_has_parent(mp)) {
-		xfs_warn(mp,
-	"EXPERIMENTAL parent pointer feature enabled. Use at your own risk!");
+		xfs_warn_experimental(mp, XFS_EXPERIMENTAL_PPTR);
 		if (!printed) {
 			mark_tech_preview("Parent pointer feature",
 					  THIS_MODULE);
