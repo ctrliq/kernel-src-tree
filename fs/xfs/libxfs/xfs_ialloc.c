@@ -768,8 +768,7 @@ xfs_ialloc_ag_alloc(
 		/* Allow space for the inode btree to split. */
 		args.minleft = igeo->inobt_maxlevels;
 		error = xfs_alloc_vextent_exact_bno(&args,
-				XFS_AGB_TO_FSB(args.mp, pag->pag_agno,
-						args.agbno));
+				xfs_agbno_to_fsb(pag, args.agbno));
 		if (error)
 			return error;
 
@@ -811,8 +810,8 @@ xfs_ialloc_ag_alloc(
 		 */
 		args.minleft = igeo->inobt_maxlevels;
 		error = xfs_alloc_vextent_near_bno(&args,
-				XFS_AGB_TO_FSB(args.mp, pag->pag_agno,
-						be32_to_cpu(agi->agi_root)));
+				xfs_agbno_to_fsb(pag,
+					be32_to_cpu(agi->agi_root)));
 		if (error)
 			return error;
 	}
@@ -824,8 +823,8 @@ xfs_ialloc_ag_alloc(
 	if (isaligned && args.fsbno == NULLFSBLOCK) {
 		args.alignment = igeo->cluster_align;
 		error = xfs_alloc_vextent_near_bno(&args,
-				XFS_AGB_TO_FSB(args.mp, pag->pag_agno,
-						be32_to_cpu(agi->agi_root)));
+				xfs_agbno_to_fsb(pag,
+					be32_to_cpu(agi->agi_root)));
 		if (error)
 			return error;
 	}
@@ -861,8 +860,8 @@ sparse_alloc:
 				 igeo->ialloc_blks;
 
 		error = xfs_alloc_vextent_near_bno(&args,
-				XFS_AGB_TO_FSB(args.mp, pag->pag_agno,
-						be32_to_cpu(agi->agi_root)));
+				xfs_agbno_to_fsb(pag,
+					be32_to_cpu(agi->agi_root)));
 		if (error)
 			return error;
 
@@ -1979,7 +1978,6 @@ xfs_difree_inode_chunk(
 	struct xfs_inobt_rec_incore	*rec)
 {
 	struct xfs_mount		*mp = tp->t_mountp;
-	xfs_agnumber_t			agno = pag->pag_agno;
 	xfs_agblock_t			sagbno = XFS_AGINO_TO_AGBNO(mp,
 							rec->ir_startino);
 	int				startidx, endidx;
@@ -1990,8 +1988,7 @@ xfs_difree_inode_chunk(
 
 	if (!xfs_inobt_issparse(rec->ir_holemask)) {
 		/* not sparse, calculate extent info directly */
-		return xfs_free_extent_later(tp,
-				XFS_AGB_TO_FSB(mp, agno, sagbno),
+		return xfs_free_extent_later(tp, xfs_agbno_to_fsb(pag, sagbno),
 				M_IGEO(mp)->ialloc_blks, &XFS_RMAP_OINFO_INODES,
 				XFS_AG_RESV_NONE, 0);
 	}
@@ -2037,9 +2034,9 @@ xfs_difree_inode_chunk(
 
 		ASSERT(agbno % mp->m_sb.sb_spino_align == 0);
 		ASSERT(contigblk % mp->m_sb.sb_spino_align == 0);
-		error = xfs_free_extent_later(tp,
-				XFS_AGB_TO_FSB(mp, agno, agbno), contigblk,
-				&XFS_RMAP_OINFO_INODES, XFS_AG_RESV_NONE, 0);
+		error = xfs_free_extent_later(tp, xfs_agbno_to_fsb(pag, agbno),
+				contigblk, &XFS_RMAP_OINFO_INODES,
+				XFS_AG_RESV_NONE, 0);
 		if (error)
 			return error;
 
@@ -2510,7 +2507,7 @@ xfs_imap(
 		offset = XFS_INO_TO_OFFSET(mp, ino);
 		ASSERT(offset < mp->m_sb.sb_inopblock);
 
-		imap->im_blkno = XFS_AGB_TO_DADDR(mp, pag->pag_agno, agbno);
+		imap->im_blkno = xfs_agbno_to_daddr(pag, agbno);
 		imap->im_len = XFS_FSB_TO_BB(mp, 1);
 		imap->im_boffset = (unsigned short)(offset <<
 							mp->m_sb.sb_inodelog);
@@ -2540,7 +2537,7 @@ out_map:
 	offset = ((agbno - cluster_agbno) * mp->m_sb.sb_inopblock) +
 		XFS_INO_TO_OFFSET(mp, ino);
 
-	imap->im_blkno = XFS_AGB_TO_DADDR(mp, pag->pag_agno, cluster_agbno);
+	imap->im_blkno = xfs_agbno_to_daddr(pag, cluster_agbno);
 	imap->im_len = XFS_FSB_TO_BB(mp, M_IGEO(mp)->blocks_per_cluster);
 	imap->im_boffset = (unsigned short)(offset << mp->m_sb.sb_inodelog);
 
