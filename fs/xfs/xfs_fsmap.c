@@ -723,7 +723,10 @@ xfs_getfsmap_rtdev_rtbitmap_helper(
 	};
 	struct xfs_mount		*mp = rtg_mount(rtg);
 	struct xfs_getfsmap_info	*info = priv;
-	xfs_rtblock_t			rtbno;
+	xfs_rtblock_t			start_rtb =
+				xfs_rtx_to_rtb(rtg, rec->ar_startext);
+	uint64_t			rtbcount =
+				xfs_rtbxlen_to_blen(mp, rec->ar_extcount);
 
 	/*
 	 * For an info->last query, we're looking for a gap between the last
@@ -737,12 +740,10 @@ xfs_getfsmap_rtdev_rtbitmap_helper(
 	if (info->last) {
 		frec.start_daddr = info->end_daddr + 1;
 	} else {
-		rtbno = xfs_rtx_to_rtb(mp, rec->ar_startext);
-		frec.start_daddr = xfs_rtb_to_daddr(mp, rtbno);
+		frec.start_daddr = xfs_rtb_to_daddr(mp, start_rtb);
 	}
 
-	rtbno = xfs_rtx_to_rtb(mp, rec->ar_extcount);
-	frec.len_daddr = XFS_FSB_TO_BB(mp, rtbno);
+	frec.len_daddr = XFS_FSB_TO_BB(mp, rtbcount);
 	return xfs_getfsmap_helper(tp, info, &frec);
 }
 
