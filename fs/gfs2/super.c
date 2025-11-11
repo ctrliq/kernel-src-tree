@@ -1268,11 +1268,9 @@ static enum evict_behavior evict_should_delete(struct inode *inode,
 	if (ret)
 		return EVICT_SHOULD_SKIP_DELETE;
 
-	if (test_bit(GLF_INSTANTIATE_NEEDED, &ip->i_gl->gl_flags)) {
-		ret = gfs2_instantiate(gh);
-		if (ret)
-			return EVICT_SHOULD_SKIP_DELETE;
-	}
+	ret = gfs2_instantiate(gh);
+	if (ret)
+		return EVICT_SHOULD_SKIP_DELETE;
 
 	/*
 	 * The inode may have been recreated in the meantime.
