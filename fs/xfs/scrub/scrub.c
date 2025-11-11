@@ -459,7 +459,7 @@ static const struct xchk_meta_ops meta_scrub_ops[] = {
 		.setup	= xchk_setup_metapath,
 		.scrub	= xchk_metapath,
 		.has	= xfs_has_metadir,
-		.repair	= xrep_notsupported,
+		.repair	= xrep_metapath,
 	},
 };
 
