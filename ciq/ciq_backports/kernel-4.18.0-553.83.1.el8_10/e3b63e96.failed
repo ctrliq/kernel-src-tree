@@ -1,0 +1,192 @@
+mm: zswap: fix missing folio cleanup in writeback race path
+
+jira LE-4704
+cve CVE-2023-53178
+Rebuild_History Non-Buildable kernel-4.18.0-553.83.1.el8_10
+commit-author Yosry Ahmed <yosryahmed@google.com>
+commit e3b63e966cac0bf78aaa1efede1827a252815a1d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.83.1.el8_10/e3b63e96.failed
+
+In zswap_writeback_entry(), after we get a folio from
+__read_swap_cache_async(), we grab the tree lock again to check that the
+swap entry was not invalidated and recycled.  If it was, we delete the
+folio we just added to the swap cache and exit.
+
+However, __read_swap_cache_async() returns the folio locked when it is
+newly allocated, which is always true for this path, and the folio is
+ref'd.  Make sure to unlock and put the folio before returning.
+
+This was discovered by code inspection, probably because this path handles
+a race condition that should not happen often, and the bug would not crash
+the system, it will only strand the folio indefinitely.
+
+Link: https://lkml.kernel.org/r/20240125085127.1327013-1-yosryahmed@google.com
+Fixes: 04fc7816089c ("mm: fix zswap writeback race condition")
+	Signed-off-by: Yosry Ahmed <yosryahmed@google.com>
+	Reviewed-by: Chengming Zhou <zhouchengming@bytedance.com>
+	Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+	Reviewed-by: Nhat Pham <nphamcs@gmail.com>
+	Cc: Domenico Cerasuolo <cerasuolodomenico@gmail.com>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit e3b63e966cac0bf78aaa1efede1827a252815a1d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/zswap.c
+diff --cc mm/zswap.c
+index 8d38573d911e,d2423247acfd..000000000000
+--- a/mm/zswap.c
++++ b/mm/zswap.c
+@@@ -905,110 -1412,53 +905,117 @@@ static int zswap_writeback_entry(struc
+  		.sync_mode = WB_SYNC_NONE,
+  	};
+  
+ -	/* try to allocate swap cache folio */
+ -	mpol = get_task_policy(current);
+ -	folio = __read_swap_cache_async(swpentry, GFP_KERNEL, mpol,
+ -				NO_INTERLEAVE_INDEX, &folio_was_allocated, true);
+ -	if (!folio)
+ -		return -ENOMEM;
+ +	/* extract swpentry from data */
+ +	zhdr = zpool_map_handle(pool, handle, ZPOOL_MM_RO);
+ +	swpentry = zhdr->swpentry; /* here */
+ +	zpool_unmap_handle(pool, handle);
+ +	tree = zswap_trees[swp_type(swpentry)];
+ +	offset = swp_offset(swpentry);
+  
+ -	/*
+ -	 * Found an existing folio, we raced with load/swapin. We generally
+ -	 * writeback cold folios from zswap, and swapin means the folio just
+ -	 * became hot. Skip this folio and let the caller find another one.
+ -	 */
+ -	if (!folio_was_allocated) {
+ -		folio_put(folio);
+ -		return -EEXIST;
+ -	}
+ -
+ -	/*
+ -	 * folio is locked, and the swapcache is now secured against
+ -	 * concurrent swapping to and from the slot. Verify that the
+ -	 * swap entry hasn't been invalidated and recycled behind our
+ -	 * backs (our zswap_entry reference doesn't prevent that), to
+ -	 * avoid overwriting a new swap folio with old compressed data.
+ -	 */
+ +	/* find and ref zswap entry */
+  	spin_lock(&tree->lock);
+ -	if (zswap_rb_search(&tree->rbroot, swp_offset(entry->swpentry)) != entry) {
+ +	entry = zswap_entry_find_get(&tree->rbroot, offset);
+ +	if (!entry) {
+ +		/* entry was invalidated */
+  		spin_unlock(&tree->lock);
+++<<<<<<< HEAD
+ +		return 0;
+++=======
++ 		delete_from_swap_cache(folio);
++ 		folio_unlock(folio);
++ 		folio_put(folio);
++ 		return -ENOMEM;
+++>>>>>>> e3b63e966cac (mm: zswap: fix missing folio cleanup in writeback race path)
+  	}
+  	spin_unlock(&tree->lock);
+ +	BUG_ON(offset != entry->offset);
+  
+ -	__zswap_load(entry, &folio->page);
+ +	/* try to allocate swap cache page */
+ +	switch (zswap_get_swap_cache_page(swpentry, &page)) {
+ +	case ZSWAP_SWAPCACHE_FAIL: /* no memory or invalidate happened */
+ +		ret = -ENOMEM;
+ +		goto fail;
+ +
+ +	case ZSWAP_SWAPCACHE_EXIST:
+ +		/* page is already in the swap cache, ignore for now */
+ +		put_page(page);
+ +		ret = -EEXIST;
+ +		goto fail;
+ +
+ +	case ZSWAP_SWAPCACHE_NEW: /* page is locked */
+ +		/*
+ +		 * Having a local reference to the zswap entry doesn't exclude
+ +		 * swapping from invalidating and recycling the swap slot. Once
+ +		 * the swapcache is secured against concurrent swapping to and
+ +		 * from the slot, recheck that the entry is still current before
+ +		 * writing.
+ +		 */
+ +		spin_lock(&tree->lock);
+ +		if (zswap_rb_search(&tree->rbroot, entry->offset) != entry) {
+ +			spin_unlock(&tree->lock);
+ +			delete_from_swap_cache(page_folio(page));
+ +			ret = -ENOMEM;
+ +			goto fail;
+ +		}
+ +		spin_unlock(&tree->lock);
+  
+ -	/* folio is up to date */
+ -	folio_mark_uptodate(folio);
+ +		/* decompress */
+ +		dlen = PAGE_SIZE;
+ +		src = (u8 *)zpool_map_handle(entry->pool->zpool, entry->handle,
+ +				ZPOOL_MM_RO) + sizeof(struct zswap_header);
+ +		dst = kmap_atomic(page);
+ +		tfm = *get_cpu_ptr(entry->pool->tfm);
+ +		ret = crypto_comp_decompress(tfm, src, entry->length,
+ +					     dst, &dlen);
+ +		put_cpu_ptr(entry->pool->tfm);
+ +		kunmap_atomic(dst);
+ +		zpool_unmap_handle(entry->pool->zpool, entry->handle);
+ +		BUG_ON(ret);
+ +		BUG_ON(dlen != PAGE_SIZE);
+ +
+ +		/* page is up to date */
+ +		SetPageUptodate(page);
+ +	}
+  
+  	/* move it to the tail of the inactive list after end_writeback */
+ -	folio_set_reclaim(folio);
+ +	SetPageReclaim(page);
+  
+  	/* start writeback */
+ -	__swap_writepage(folio, &wbc);
+ -	folio_put(folio);
+ +	__swap_writepage(page, &wbc, end_swap_bio_write);
+ +	put_page(page);
+ +	zswap_written_back_pages++;
+  
+ -	return 0;
+ +	spin_lock(&tree->lock);
+ +	/* drop local reference */
+ +	zswap_entry_put(tree, entry);
+ +
+ +	/*
+ +	* There are two possible situations for entry here:
+ +	* (1) refcount is 1(normal case),  entry is valid and on the tree
+ +	* (2) refcount is 0, entry is freed and not on the tree
+ +	*     because invalidate happened during writeback
+ +	*  search the tree and free the entry if find entry
+ +	*/
+ +	if (entry == zswap_rb_search(&tree->rbroot, offset))
+ +		zswap_entry_put(tree, entry);
+ +	spin_unlock(&tree->lock);
+ +
+ +	goto end;
+ +
+ +	/*
+ +	* if we get here due to ZSWAP_SWAPCACHE_EXIST
+ +	* a load may be happening concurrently.
+ +	* it is safe and okay to not free the entry.
+ +	* if we free the entry in the following put
+ +	* it is also okay to return !0
+ +	*/
+ +fail:
+ +	spin_lock(&tree->lock);
+ +	zswap_entry_put(tree, entry);
+ +	spin_unlock(&tree->lock);
+ +
+ +end:
+ +	return ret;
+  }
+  
+  static int zswap_is_page_same_filled(void *ptr, unsigned long *value)
+* Unmerged path mm/zswap.c
