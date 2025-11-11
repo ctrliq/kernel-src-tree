@@ -158,7 +158,7 @@ struct xfs_getfsmap_info {
 	struct xfs_fsmap_head	*head;
 	struct fsmap		*fsmap_recs;	/* mapping records */
 	struct xfs_buf		*agf_bp;	/* AGF, for refcount queries */
-	struct xfs_perag	*pag;		/* AG info, if applicable */
+	struct xfs_group	*group;		/* group info, if applicable */
 	xfs_daddr_t		next_daddr;	/* next daddr we expect */
 	/* daddr of low fsmap key when we're using the rtbitmap */
 	xfs_daddr_t		low_daddr;
@@ -217,12 +217,13 @@ xfs_getfsmap_is_shared(
 	if (!xfs_has_reflink(mp))
 		return 0;
 	/* rt files will have no perag structure */
-	if (!info->pag)
+	if (!info->group)
 		return 0;
 
 	/* Are there any shared blocks here? */
 	flen = 0;
-	cur = xfs_refcountbt_init_cursor(mp, tp, info->agf_bp, info->pag);
+	cur = xfs_refcountbt_init_cursor(mp, tp, info->agf_bp,
+			to_perag(info->group));
 
 	error = xfs_refcount_find_shared(cur, rec->rm_startblock,
 			rec->rm_blockcount, &fbno, &flen, false);
@@ -354,7 +355,8 @@ xfs_getfsmap_helper(
 		return -ECANCELED;
 
 	trace_xfs_fsmap_mapping(mp, info->dev,
-			info->pag ? pag_agno(info->pag) : NULLAGNUMBER, rec);
+			info->group ? info->group->xg_gno : NULLAGNUMBER,
+			rec);
 
 	fmr.fmr_device = info->dev;
 	fmr.fmr_physical = rec_daddr;
@@ -520,7 +522,7 @@ __xfs_getfsmap_datadev(
 		 * Set the AG high key from the fsmap high key if this
 		 * is the last AG that we're querying.
 		 */
-		info->pag = pag;
+		info->group = pag_group(pag);
 		if (pag_agno(pag) == end_ag) {
 			info->high.rm_startblock = XFS_FSB_TO_AGBNO(mp,
 					end_fsb);
@@ -570,7 +572,7 @@ __xfs_getfsmap_datadev(
 			if (error)
 				break;
 		}
-		info->pag = NULL;
+		info->group = NULL;
 	}
 
 	if (bt_cur)
@@ -580,9 +582,9 @@ __xfs_getfsmap_datadev(
 		xfs_trans_brelse(tp, info->agf_bp);
 		info->agf_bp = NULL;
 	}
-	if (info->pag) {
-		xfs_perag_rele(info->pag);
-		info->pag = NULL;
+	if (info->group) {
+		xfs_perag_rele(pag);
+		info->group = NULL;
 	} else if (pag) {
 		/* loop termination case */
 		xfs_perag_rele(pag);
@@ -605,7 +607,7 @@ xfs_getfsmap_datadev_rmapbt_query(
 
 	/* Allocate cursor for this AG and query_range it. */
 	*curpp = xfs_rmapbt_init_cursor(tp->t_mountp, tp, info->agf_bp,
-			info->pag);
+			to_perag(info->group));
 	return xfs_rmap_query_range(*curpp, &info->low, &info->high,
 			xfs_getfsmap_datadev_helper, info);
 }
@@ -638,7 +640,7 @@ xfs_getfsmap_datadev_bnobt_query(
 
 	/* Allocate cursor for this AG and query_range it. */
 	*curpp = xfs_bnobt_init_cursor(tp->t_mountp, tp, info->agf_bp,
-			info->pag);
+			to_perag(info->group));
 	key->ar_startblock = info->low.rm_startblock;
 	key[1].ar_startblock = info->high.rm_startblock;
 	return xfs_alloc_query_range(*curpp, key, &key[1],
@@ -1004,7 +1006,7 @@ xfs_getfsmap(
 
 		info.dev = handlers[i].dev;
 		info.last = false;
-		info.pag = NULL;
+		info.group = NULL;
 		info.low_daddr = XFS_BUF_DADDR_NULL;
 		info.low.rm_blockcount = 0;
 		error = handlers[i].fn(tp, dkeys, &info);
