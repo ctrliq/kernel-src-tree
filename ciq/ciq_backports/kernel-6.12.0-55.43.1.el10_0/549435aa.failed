@@ -1,0 +1,123 @@
+x86/bugs: Move the X86_FEATURE_USE_IBPB check into callers
+
+jira LE-4694
+Rebuild_History Non-Buildable kernel-6.12.0-55.43.1.el10_0
+commit-author Yosry Ahmed <yosry.ahmed@linux.dev>
+commit 549435aab49ae83d60a08795de6cf0e866f3b2ec
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-55.43.1.el10_0/549435aa.failed
+
+indirect_branch_prediction_barrier() only performs the MSR write if
+X86_FEATURE_USE_IBPB is set, using alternative_msr_write(). In
+preparation for removing X86_FEATURE_USE_IBPB, move the feature check
+into the callers so that they can be addressed one-by-one, and use
+X86_FEATURE_IBPB instead to guard the MSR write.
+
+	Signed-off-by: Yosry Ahmed <yosry.ahmed@linux.dev>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+	Acked-by: Josh Poimboeuf <jpoimboe@kernel.org>
+	Acked-by: Sean Christopherson <seanjc@google.com>
+Link: https://lore.kernel.org/r/20250227012712.3193063-2-yosry.ahmed@linux.dev
+(cherry picked from commit 549435aab49ae83d60a08795de6cf0e866f3b2ec)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/nested.c
+diff --cc arch/x86/kvm/vmx/nested.c
+index 5df2c6bffab8,1df427a822dd..000000000000
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@@ -5015,7 -5026,8 +5015,12 @@@ void nested_vmx_vmexit(struct kvm_vcpu 
+  	 * doesn't isolate different VMCSs, i.e. in this case, doesn't provide
+  	 * separate modes for L2 vs L1.
+  	 */
+++<<<<<<< HEAD
+ +	if (guest_cpuid_has(vcpu, X86_FEATURE_SPEC_CTRL))
+++=======
++ 	if (guest_cpu_cap_has(vcpu, X86_FEATURE_SPEC_CTRL) &&
++ 	    cpu_feature_enabled(X86_FEATURE_USE_IBPB))
+++>>>>>>> 549435aab49a (x86/bugs: Move the X86_FEATURE_USE_IBPB check into callers)
+  		indirect_branch_prediction_barrier();
+  
+  	/* Update any VMCS fields that might have changed while L2 ran */
+diff --git a/arch/x86/include/asm/nospec-branch.h b/arch/x86/include/asm/nospec-branch.h
+index 96b410b1d4e8..8f88b21370c3 100644
+--- a/arch/x86/include/asm/nospec-branch.h
++++ b/arch/x86/include/asm/nospec-branch.h
+@@ -533,7 +533,7 @@ extern u64 x86_pred_cmd;
+ 
+ static inline void indirect_branch_prediction_barrier(void)
+ {
+-	alternative_msr_write(MSR_IA32_PRED_CMD, x86_pred_cmd, X86_FEATURE_USE_IBPB);
++	alternative_msr_write(MSR_IA32_PRED_CMD, x86_pred_cmd, X86_FEATURE_IBPB);
+ }
+ 
+ /* The Intel SPEC CTRL MSR base value cache */
+diff --git a/arch/x86/kernel/cpu/bugs.c b/arch/x86/kernel/cpu/bugs.c
+index 1d7afc40f227..754150fc0578 100644
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@ -2272,7 +2272,7 @@ static int ib_prctl_set(struct task_struct *task, unsigned long ctrl)
+ 		if (ctrl == PR_SPEC_FORCE_DISABLE)
+ 			task_set_spec_ib_force_disable(task);
+ 		task_update_spec_tif(task);
+-		if (task == current)
++		if (task == current && cpu_feature_enabled(X86_FEATURE_USE_IBPB))
+ 			indirect_branch_prediction_barrier();
+ 		break;
+ 	default:
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index cd896d1a1b4d..0ddfb7e78a53 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -1564,7 +1564,8 @@ static void svm_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+ 	if (sd->current_vmcb != svm->vmcb) {
+ 		sd->current_vmcb = svm->vmcb;
+ 
+-		if (!cpu_feature_enabled(X86_FEATURE_IBPB_ON_VMEXIT))
++		if (!cpu_feature_enabled(X86_FEATURE_IBPB_ON_VMEXIT) &&
++		    cpu_feature_enabled(X86_FEATURE_USE_IBPB))
+ 			indirect_branch_prediction_barrier();
+ 	}
+ 	if (kvm_vcpu_apicv_active(vcpu))
+* Unmerged path arch/x86/kvm/vmx/nested.c
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index 0bc4a4bb002c..ff9803dc265f 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -1478,7 +1478,8 @@ void vmx_vcpu_load_vmcs(struct kvm_vcpu *vcpu, int cpu,
+ 		 * performs IBPB on nested VM-Exit (a single nested transition
+ 		 * may switch the active VMCS multiple times).
+ 		 */
+-		if (!buddy || WARN_ON_ONCE(buddy->vmcs != prev))
++		if (cpu_feature_enabled(X86_FEATURE_USE_IBPB) &&
++		    (!buddy || WARN_ON_ONCE(buddy->vmcs != prev)))
+ 			indirect_branch_prediction_barrier();
+ 	}
+ 
+diff --git a/arch/x86/mm/tlb.c b/arch/x86/mm/tlb.c
+index 86593d1b787d..6d6cff8f20b5 100644
+--- a/arch/x86/mm/tlb.c
++++ b/arch/x86/mm/tlb.c
+@@ -436,7 +436,8 @@ static void cond_mitigation(struct task_struct *next)
+ 		 * both have the IBPB bit set.
+ 		 */
+ 		if (next_mm != prev_mm &&
+-		    (next_mm | prev_mm) & LAST_USER_MM_IBPB)
++		    (next_mm | prev_mm) & LAST_USER_MM_IBPB &&
++		    cpu_feature_enabled(X86_FEATURE_USE_IBPB))
+ 			indirect_branch_prediction_barrier();
+ 	}
+ 
+@@ -446,8 +447,8 @@ static void cond_mitigation(struct task_struct *next)
+ 		 * different context than the user space task which ran
+ 		 * last on this CPU.
+ 		 */
+-		if ((prev_mm & ~LAST_USER_MM_SPEC_MASK) !=
+-					(unsigned long)next->mm)
++		if ((prev_mm & ~LAST_USER_MM_SPEC_MASK) != (unsigned long)next->mm &&
++		    cpu_feature_enabled(X86_FEATURE_USE_IBPB))
+ 			indirect_branch_prediction_barrier();
+ 	}
+ 
