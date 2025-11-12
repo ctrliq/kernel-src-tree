@@ -2114,7 +2114,7 @@ int ice_start_phy_timer_eth56g(struct ice_hw *hw, u8 port)
 static int ice_ptp_init_phc_e825(struct ice_hw *hw)
 {
 	/* Initialize the Clock Generation Unit */
-	return ice_init_cgu_e82x(hw);
+	return ice_tspll_init(hw);
 }
 
 /**
@@ -2787,7 +2787,7 @@ static int ice_ptp_init_phc_e82x(struct ice_hw *hw)
 	wr32(hw, PF_SB_REM_DEV_CTL, val);
 
 	/* Initialize the Clock Generation Unit */
-	err = ice_init_cgu_e82x(hw);
+	err = ice_tspll_init(hw);
 	if (err)
 		return err;
 
