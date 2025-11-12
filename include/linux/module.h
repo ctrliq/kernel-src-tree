@@ -367,8 +367,8 @@ enum mod_mem_type {
 
 struct module_memory {
 	void *base;
-	bool is_rox;
 	unsigned int size;
+	RH_KABI_FILL_HOLE(bool is_rox)
 
 #ifdef CONFIG_MODULES_TREE_LOOKUP
 	struct mod_tree_node mtn;
