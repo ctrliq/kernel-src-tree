@@ -5453,7 +5453,7 @@ int ext4_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 				error = ext4_begin_ordered_truncate(inode,
 							    attr->ia_size);
 				if (error)
-					goto err_out;
+					goto out_mmap_sem;
 			}
 			/*
 			 * Blocks are going to be removed from the inode. Wait
