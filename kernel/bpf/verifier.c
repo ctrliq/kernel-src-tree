@@ -4051,8 +4051,10 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 			 * before it would be equally necessary to
 			 * propagate it to dreg.
 			 */
-			bt_set_reg(bt, dreg);
-			bt_set_reg(bt, sreg);
+			if (!hist || !(hist->flags & INSN_F_SRC_REG_STACK))
+				bt_set_reg(bt, sreg);
+			if (!hist || !(hist->flags & INSN_F_DST_REG_STACK))
+				bt_set_reg(bt, dreg);
 		} else if (BPF_SRC(insn->code) == BPF_K) {
 			 /* dreg <cond> K
 			  * Only dreg still needs precision before
@@ -11306,6 +11308,7 @@ enum special_kfunc_type {
 	KF_bpf_preempt_enable,
 	KF_bpf_iter_css_task_new,
 	KF_bpf_session_cookie,
+	KF___bpf_trap,
 };
 
 BTF_SET_START(special_kfunc_set)
@@ -11371,6 +11374,7 @@ BTF_ID(func, bpf_session_cookie)
 #else
 BTF_ID_UNUSED
 #endif
+BTF_ID(func, __bpf_trap)
 
 static bool is_kfunc_ret_null(struct bpf_kfunc_call_arg_meta *meta)
 {
@@ -12514,6 +12518,11 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	insn_aux = &env->insn_aux_data[insn_idx];
 
 	insn_aux->is_iter_next = is_iter_next_kfunc(&meta);
+
+	if (!insn->off && insn->imm == special_kfunc_list[KF___bpf_trap]) {
+		verbose(env, "unexpected __bpf_trap() due to uninitialized variable?\n");
+		return -EFAULT;
+	}
 
 	if (is_kfunc_destructive(&meta) && !capable(CAP_SYS_BOOT)) {
 		verbose(env, "destructive kfunc calls require CAP_SYS_BOOT capability\n");
@@ -15488,6 +15497,7 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 	struct bpf_reg_state *eq_branch_regs;
 	struct linked_regs linked_regs = {};
 	u8 opcode = BPF_OP(insn->code);
+	int insn_flags = 0;
 	bool is_jmp32;
 	int pred = -1;
 	int err;
@@ -15547,6 +15557,11 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 				insn->src_reg);
 			return -EACCES;
 		}
+
+		if (src_reg->type == PTR_TO_STACK)
+			insn_flags |= INSN_F_SRC_REG_STACK;
+		if (dst_reg->type == PTR_TO_STACK)
+			insn_flags |= INSN_F_DST_REG_STACK;
 	} else {
 		if (insn->src_reg != BPF_REG_0) {
 			verbose(env, "BPF_JMP/JMP32 uses reserved fields\n");
@@ -15556,6 +15571,15 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 		memset(src_reg, 0, sizeof(*src_reg));
 		src_reg->type = SCALAR_VALUE;
 		__mark_reg_known(src_reg, insn->imm);
+
+		if (dst_reg->type == PTR_TO_STACK)
+			insn_flags |= INSN_F_DST_REG_STACK;
+	}
+
+	if (insn_flags) {
+		err = push_jmp_history(env, this_branch, insn_flags, 0);
+		if (err)
+			return err;
 	}
 
 	is_jmp32 = BPF_CLASS(insn->code) == BPF_JMP32;
