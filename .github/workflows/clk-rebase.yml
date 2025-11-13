@@ -1,0 +1,324 @@
+name: CLK Rebase
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types:
+      - stable-branch-updated
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  clk-rebase:
+    runs-on: kernel-build
+    container:
+      image: rockylinux:9
+      options: --cpus 8 --privileged
+    env:
+      # For repository_dispatch events, use the branch from the payload
+      # For workflow_dispatch, default to stable_6.18.y
+      STABLE_TRACKING_BRANCH: ${{ github.event.client_payload.branch || 'stable_6.18.y' }}
+    steps:
+      - name: Validate branch name
+        run: |
+          # Ensure branch name only contains allowed characters
+          if ! echo "$STABLE_TRACKING_BRANCH" | grep -qE '^stable_[0-9]+\.[0-9]+\.y$'; then
+            echo "ERROR: Invalid STABLE_TRACKING_BRANCH format: $STABLE_TRACKING_BRANCH"
+            echo "Expected format: stable_X.Y.y (e.g., stable_6.18.y)"
+            exit 1
+          fi
+          echo "Branch name validated: $STABLE_TRACKING_BRANCH"
+
+      - name: Generate GitHub App token
+        id: generate-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          repositories: |
+            kernel-src-tree
+            kernel-src-tree-tools
+
+      - name: Set version variables
+        run: |
+          set -e  # Exit on any error
+          # Extract version from STABLE_TRACKING_BRANCH (e.g., stable_6.12.y -> 6.12.y)
+          STABLE_BASE_VERSION=$(echo "$STABLE_TRACKING_BRANCH" | sed 's/^stable_//')
+          echo "STABLE_BASE_VERSION=$STABLE_BASE_VERSION" >> $GITHUB_ENV
+
+          # Construct branch names from the base version
+          echo "CLK_BRANCH=ciq-$STABLE_BASE_VERSION" >> $GITHUB_ENV
+          echo "CLK_NEXT_BRANCH=ciq-${STABLE_BASE_VERSION}-next" >> $GITHUB_ENV
+          echo "TMP_CLK_NEXT_BRANCH={automation_tmp}_ciq-${STABLE_BASE_VERSION}-next" >> $GITHUB_ENV
+
+      - name: Install system dependencies
+        run: |
+          dnf install epel-release -y
+          dnf groupinstall 'Development Tools' -y
+          dnf install --enablerepo=crb bc dwarves elfutils-libelf-devel grubby grub2-tools iproute jq kernel-devel openssl-devel qemu-kvm sudo virtme-ng -y
+
+          # kernel_kselftest.sh calls sudo even when running as root
+          # Allow sudo to work without warnings in these cases
+          echo "root ALL=(ALL:ALL) NOPASSWD: ALL" >> /etc/sudoers
+
+          # Install GitHub CLI
+          dnf install 'dnf-command(config-manager)' -y
+          dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
+          dnf install gh -y
+
+          # the vm has curl-minimal installed.  kernel_kselftest will balk when
+          # it tries to install full curl later.  Install the full version now
+          # with --allowerasing
+          dnf install curl --allowerasing -y
+
+          # work around install issue with iputils under vng
+          dnf install -y --setopt=tsflags=nocaps iputils
+
+      - name: Checkout kernel-src-tree
+        uses: actions/checkout@v4
+        with:
+          repository: ctrliq/kernel-src-tree
+          token: ${{ steps.generate-token.outputs.token }}
+          path: kernel-src-tree
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Checkout kernel-src-tree-tools
+        uses: actions/checkout@v4
+        with:
+          repository: ctrliq/kernel-src-tree-tools
+          token: ${{ steps.generate-token.outputs.token }}
+          path: kernel-src-tree-tools
+          persist-credentials: true
+
+      - name: Configure git
+        run: |
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+
+      - name: Perform rebase
+        run: |
+          set -e  # Exit on any error
+          cd kernel-src-tree
+
+          git checkout $STABLE_TRACKING_BRANCH
+          git checkout $CLK_BRANCH
+
+          # Run rebase script and verify it succeeded
+          if ! ../kernel-src-tree-tools/lt_rebase.sh $STABLE_TRACKING_BRANCH; then
+            echo "ERROR: Rebase failed"
+            exit 1
+          fi
+
+          echo "Rebase completed successfully"
+
+      - name: Build kernel
+        run: |
+          set -e  # Exit on any error
+          cd kernel-src-tree
+
+          # need some config tweaks for vng
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_VSOCKETS
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_VIRTIO_VSOCKETS
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_VIRTIO_VSOCKETS_COMMON
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_NET_9P
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_NET_9P_FD
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_NET_9P_VIRTIO
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_FAILOVER
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_BLK_DEV_SD
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_SCSI_VIRTIO
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_VIRTIO_NET
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_NET_FAILOVER
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_VIRTIO_CONSOLE
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_I6300ESB_WDT
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_VIRTIO_BALLOON
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_VIRTIO_MMIO
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_FUSE_FS
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_VIRTIO_FS
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_OVERLAY_FS
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_NETFS_SUPPORT
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_9P_FS
+
+          ../kernel-src-tree-tools/kernel_build.sh --skip-kabi --no-reboot | tee ../build.log
+
+      - name: Run selftests
+        run: |
+          set -e  # Exit on any error
+          cd kernel-src-tree
+
+          vng --qemu /usr/libexec/qemu-kvm --force-initramfs --disable-microvm --rw --network user --verbose --memory 16G -- ../kernel-src-tree-tools/kernel_kselftest.sh
+
+      - name: Generate fresh token for push and PR
+        id: generate-push-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          repositories: |
+            kernel-src-tree
+
+      - name: Extract results and push branches
+        env:
+          PUSH_TOKEN: ${{ steps.generate-push-token.outputs.token }}
+        run: |
+          set -e  # Exit on any error
+          cd kernel-src-tree
+
+          echo "Selftests passed:"
+          OK_TESTS=$(grep -a ^ok ../kselftest-logs/selftest* 2>/dev/null | wc -l || echo "0")
+          echo $OK_TESTS
+
+          # Extract the stable version we rebased onto
+          STABLE_VERSION=$(git log -1 --format=%s $STABLE_TRACKING_BRANCH | grep -oP 'Linux \K[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
+          echo "Rebased to stable version: $STABLE_VERSION"
+
+          # Clear any cached credentials
+          git config --unset-all http.https://github.com/.extraheader || true
+
+          # Configure git to use the token via URL insteadOf (GitHub Actions recommended method)
+          git config --global url."https://x-access-token:${PUSH_TOKEN}@github.com/".insteadOf "https://github.com/"
+
+          # Push the branches
+          git push origin $CLK_NEXT_BRANCH
+          git push origin $TMP_CLK_NEXT_BRANCH
+
+          # Check for config changes
+          # Look for a commit at HEAD with message like "[CIQ] v6.12.29 - rebased configs"
+          # that matches the stable version we're rebasing onto
+          HEAD_COMMIT_MSG=$(git log -1 --format=%s HEAD)
+          if echo "$HEAD_COMMIT_MSG" | grep -qF "[CIQ] v${STABLE_VERSION} - rebased configs"; then
+            echo "Config change commit detected for v${STABLE_VERSION}"
+            # Extract the config changes from the commit
+            git show HEAD --stat > ../config_changes.txt
+          else
+            echo "No config change commit detected for v${STABLE_VERSION}"
+            echo "None" > ../config_changes.txt
+          fi
+
+          # Save data for PR creation
+          echo "$STABLE_VERSION" > ../stable_version.txt
+          echo "$OK_TESTS" > ../ok_tests.txt
+
+      - name: Upload selftest logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kselftest-logs
+          path: kselftest-logs/selftest*
+          if-no-files-found: warn
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: warn
+
+      - name: Fetch previous PR kselftest results
+        if: success()
+        env:
+          GH_TOKEN: ${{ steps.generate-push-token.outputs.token }}
+        run: |
+          set -e  # Exit on any error
+          cd kernel-src-tree
+
+          # Extract the major.minor version for matching (e.g., "6.12" from "6.12.y")
+          CLK_VERSION=$(echo "$STABLE_BASE_VERSION" | grep -oP '^\d+\.\d+')
+          echo "Looking for previous [CIQ ${CLK_VERSION}] PR..."
+
+          # Find the most recent merged PR to the same base branch with matching CIQ version
+          if PREVIOUS_PR=$(gh pr list \
+            --repo ${{ github.repository }} \
+            --base ${CLK_NEXT_BRANCH} \
+            --state merged \
+            --limit 10 \
+            --json number,title,body,mergedAt \
+            --jq "map(select(.title | contains(\"[CIQ ${CLK_VERSION}]\"))) | sort_by(.mergedAt) | reverse | .[0]" 2>&1); then
+
+            if [ -n "$PREVIOUS_PR" ] && [ "$PREVIOUS_PR" != "null" ]; then
+              # Extract the test count from the previous PR body
+              PREVIOUS_PR_BODY=$(echo "$PREVIOUS_PR" | jq -r '.body')
+              PREVIOUS_OK_TESTS=$(echo "$PREVIOUS_PR_BODY" | grep -oP 'Selftests passed:\s+\*\*\K[0-9]+' || echo "unknown")
+              PREVIOUS_PR_NUMBER=$(echo "$PREVIOUS_PR" | jq -r '.number')
+
+              echo "Found previous PR #${PREVIOUS_PR_NUMBER} with ${PREVIOUS_OK_TESTS} passing tests"
+              echo "$PREVIOUS_OK_TESTS" > ../previous_ok_tests.txt
+              echo "$PREVIOUS_PR_NUMBER" > ../previous_pr_number.txt
+            else
+              echo "No previous [CIQ ${CLK_VERSION}] PR found"
+              echo "unknown" > ../previous_ok_tests.txt
+              echo "N/A" > ../previous_pr_number.txt
+            fi
+          else
+            echo "WARNING: Failed to fetch previous PR information: $PREVIOUS_PR"
+            echo "unknown" > ../previous_ok_tests.txt
+            echo "N/A" > ../previous_pr_number.txt
+          fi
+
+      - name: Create Pull Request
+        if: success()
+        env:
+          GH_TOKEN: ${{ steps.generate-push-token.outputs.token }}
+        run: |
+          set -e  # Exit on any error
+          cd kernel-src-tree
+
+          STABLE_VERSION=$(cat ../stable_version.txt)
+          OK_TESTS=$(cat ../ok_tests.txt)
+          CONFIG_CHANGES=$(cat ../config_changes.txt)
+          PREVIOUS_OK_TESTS=$(cat ../previous_ok_tests.txt)
+          PREVIOUS_PR_NUMBER=$(cat ../previous_pr_number.txt)
+
+          # Extract the major.minor version for the PR title (e.g., "6.12" from "6.12.y")
+          CLK_VERSION=$(echo "$STABLE_BASE_VERSION" | grep -oP '^\d+\.\d+')
+
+          # Extract abbreviated build log (first 20 and last 20 lines)
+          BUILD_LOG_SUMMARY=$(egrep -B 5 -A 5 "\[TIMER\]|^Starting Build" ../build.log)
+
+          # Get artifact URLs (will be available after workflow completes)
+          RUN_ID="${{ github.run_id }}"
+          REPO="${{ github.repository }}"
+          SELFTEST_ARTIFACT_URL="https://github.com/${REPO}/actions/runs/${RUN_ID}"
+          BUILD_LOG_ARTIFACT_URL="https://github.com/${REPO}/actions/runs/${RUN_ID}"
+
+          # Build previous test results line if available
+          if [ "$PREVIOUS_OK_TESTS" != "unknown" ] && [ "$PREVIOUS_PR_NUMBER" != "N/A" ]; then
+            PREVIOUS_TEST_LINE="Previous: ${PREVIOUS_OK_TESTS} tests ([PR #${PREVIOUS_PR_NUMBER}](https://github.com/${{ github.repository }}/pull/${PREVIOUS_PR_NUMBER}))"
+          else
+            PREVIOUS_TEST_LINE=""
+          fi
+
+          # Create PR body
+          cat > /tmp/pr_body.md <<EOF
+          ## Automated Rebase to v${STABLE_VERSION}
+
+          ### Config Changes
+          \`\`\`
+          ${CONFIG_CHANGES}
+          \`\`\`
+
+          ### Build Log
+          \`\`\`
+          ${BUILD_LOG_SUMMARY}
+          \`\`\`
+
+          ### Testing
+          Selftests passed: **${OK_TESTS}** tests
+          ${PREVIOUS_TEST_LINE}
+
+          ### Artifacts
+          - [Build Log](${BUILD_LOG_ARTIFACT_URL})
+          - [Selftest Logs](${SELFTEST_ARTIFACT_URL})
+
+          EOF
+
+          # Create the PR
+          gh pr create \
+            --title "[CIQ ${CLK_VERSION}] Rebase to v${STABLE_VERSION}" \
+            --body-file /tmp/pr_body.md \
+            --base ${CLK_NEXT_BRANCH} \
+            --head ${TMP_CLK_NEXT_BRANCH} \
+            --reviewer bmastbergen
+
