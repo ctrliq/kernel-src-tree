@@ -3085,7 +3085,8 @@ bool ext4_empty_dir(struct inode *inode)
 	de = (struct ext4_dir_entry_2 *) bh->b_data;
 	if (ext4_check_dir_entry(inode, NULL, de, bh, bh->b_data, bh->b_size,
 				 0) ||
-	    le32_to_cpu(de->inode) != inode->i_ino || strcmp(".", de->name)) {
+	    le32_to_cpu(de->inode) != inode->i_ino || de->name_len != 1 ||
+	    de->name[0] != '.') {
 		ext4_warning_inode(inode, "directory missing '.'");
 		brelse(bh);
 		return false;
@@ -3094,7 +3095,8 @@ bool ext4_empty_dir(struct inode *inode)
 	de = ext4_next_entry(de, sb->s_blocksize);
 	if (ext4_check_dir_entry(inode, NULL, de, bh, bh->b_data, bh->b_size,
 				 offset) ||
-	    le32_to_cpu(de->inode) == 0 || strcmp("..", de->name)) {
+	    le32_to_cpu(de->inode) == 0 || de->name_len != 2 ||
+	    de->name[0] != '.' || de->name[1] != '.') {
 		ext4_warning_inode(inode, "directory missing '..'");
 		brelse(bh);
 		return false;
@@ -3535,7 +3537,7 @@ static struct buffer_head *ext4_get_first_dir_block(handle_t *handle,
 		if (ext4_check_dir_entry(inode, NULL, de, bh, bh->b_data,
 					 bh->b_size, 0) ||
 		    le32_to_cpu(de->inode) != inode->i_ino ||
-		    strcmp(".", de->name)) {
+		    de->name_len != 1 || de->name[0] != '.') {
 			EXT4_ERROR_INODE(inode, "directory missing '.'");
 			brelse(bh);
 			*retval = -EFSCORRUPTED;
@@ -3546,7 +3548,8 @@ static struct buffer_head *ext4_get_first_dir_block(handle_t *handle,
 		de = ext4_next_entry(de, inode->i_sb->s_blocksize);
 		if (ext4_check_dir_entry(inode, NULL, de, bh, bh->b_data,
 					 bh->b_size, offset) ||
-		    le32_to_cpu(de->inode) == 0 || strcmp("..", de->name)) {
+		    le32_to_cpu(de->inode) == 0 || de->name_len != 2 ||
+		    de->name[0] != '.' || de->name[1] != '.') {
 			EXT4_ERROR_INODE(inode, "directory missing '..'");
 			brelse(bh);
 			*retval = -EFSCORRUPTED;
