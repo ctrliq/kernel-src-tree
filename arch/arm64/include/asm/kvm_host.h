@@ -1613,4 +1613,6 @@ static inline bool kvm_arch_has_irq_bypass(void)
 	return true;
 }
 
+void compute_fgu(struct kvm *kvm, enum fgt_group_id fgt);
+
 #endif /* __ARM64_KVM_HOST_H__ */
