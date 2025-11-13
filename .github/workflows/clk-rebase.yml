@@ -1,0 +1,212 @@
+name: CLK Rebase
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - stable_6.*.y
+      - clk-rebase-ga
+
+jobs:
+  clk-rebase:
+    runs-on: kernel-build
+    container:
+      image: rockylinux:9
+      options: --cpus 8 --privileged
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # For push events, use the branch that triggered the workflow
+      # For manual dispatch, default to stable_6.12.y
+      #STABLE_TRACKING_BRANCH: ${{ github.ref_name || 'stable_6.12.y' }}
+      STABLE_TRACKING_BRANCH: ${{ 'stable_6.12.y' }}
+    steps:
+      - name: Set version variables
+        run: |
+          # Extract version from STABLE_TRACKING_BRANCH (e.g., stable_6.12.y -> 6.12.y)
+          STABLE_BASE_VERSION=$(echo "$STABLE_TRACKING_BRANCH" | sed 's/^stable_//')
+          echo "STABLE_BASE_VERSION=$STABLE_BASE_VERSION" >> $GITHUB_ENV
+
+          # Construct branch names from the base version
+          echo "CLK_BRANCH=ciq-$STABLE_BASE_VERSION" >> $GITHUB_ENV
+          echo "CLK_NEXT_BRANCH=ciq-${STABLE_BASE_VERSION}-next" >> $GITHUB_ENV
+          echo "TMP_CLK_NEXT_BRANCH={automation_tmp}_ciq-${STABLE_BASE_VERSION}-next" >> $GITHUB_ENV
+
+      - name: Install system dependencies
+        run: |
+          dnf install epel-release -y
+          dnf groupinstall 'Development Tools' -y
+          dnf install --enablerepo=crb bc dwarves elfutils-libelf-devel grubby grub2-tools iproute kernel-devel openssl-devel qemu-kvm sudo virtme-ng -y
+
+          # so root can call sudo without complaint
+          echo "root ALL=(ALL:ALL) NOPASSWD: ALL" >> /etc/sudoers
+
+          # Install GitHub CLI
+          dnf install 'dnf-command(config-manager)' -y
+          dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
+          dnf install gh -y
+
+          # the vm has curl-minimal installed.  kernel_kselftest will balk when
+          # it tries to install full curl later.  Install the full version now
+          # with --allowerasing
+          dnf install curl --allowerasing -y
+
+      - name: Clone repositories
+        run: |
+          git config --global user.email "bmastbergen@ciq.com"
+          git config --global user.name "Brett Mastbergen"
+
+          git clone https://oauth2:$GITHUB_TOKEN@github.com/ctrliq/kernel-src-tree-tools
+          git clone https://oauth2:$GITHUB_TOKEN@github.com/ctrliq/kernel-src-tree
+
+      - name: Perform rebase
+        run: |
+          cd kernel-src-tree
+
+          git checkout $STABLE_TRACKING_BRANCH
+          git checkout $CLK_BRANCH
+
+          ../kernel-src-tree-tools/lt_rebase.sh
+
+      - name: Build kernel
+        run: |
+          cd kernel-src-tree
+
+          # need some config tweaks for vng
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_VSOCKETS
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_VIRTIO_VSOCKETS
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_VIRTIO_VSOCKETS_COMMON
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_VSOCKETS
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_NET_9P
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_NET_9P_FD
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_NET_9P_VIRTIO
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_FAILOVER
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_BLK_SD_DEV
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_SCSI_VIRTIO
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_VIRTIO_NET
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_NET_FAILOVER
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_VIRTIO_CONSOLE
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_I6300ESB_WDT
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_VIRTIO_BALLOON
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_VIRTIO_MMIO
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_FUSE_FS
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_VIRTIO_FS
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_OVERLAY_FS
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_NETFS_SUPPORT
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_9P_FS
+
+          ../kernel-src-tree-tools/kernel_build.sh --skip-kabi --no-reboot | tee ../build.log
+
+      - name: Install test dependencies
+        run: |
+          # work around install issue with iputils
+          dnf install -y --setopt=tsflags=nocaps iputils
+
+          # should be installed in kernel_kselftest.sh
+          dnf install -y python3-pyyaml python3-jsonschema
+
+      - name: Run selftests
+        run: |
+          cd kernel-src-tree
+
+          vng --qemu /usr/libexec/qemu-kvm --force-initramfs --disable-microvm --rw --network user --verbose --memory 16G -- ../kernel-src-tree-tools/kernel_kselftest.sh
+
+          # HACK HACK HACK
+          #vng --qemu /usr/libexec/qemu-kvm --force-initramfs --disable-microvm --rw --network user --verbose --memory 16G -- sh -c 'mkdir ../kselftest-logs ; echo ok foo:bar > ../kselftest-logs/selftest-$(uname -r).log'
+
+      - name: Extract results and push branches
+        run: |
+          cd kernel-src-tree
+
+          echo "Selftests passed:"
+          OK_TESTS=$(grep -a ^ok ../kselftest-logs/selftest* | wc -l)
+          echo $OK_TESTS
+
+          # Extract the stable version we rebased onto
+          STABLE_VERSION=$(git log -1 --format=%s $STABLE_TRACKING_BRANCH | grep -oP 'Linux \K[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
+          echo "Rebased to stable version: $STABLE_VERSION"
+
+          # Push the branches
+          git push origin $CLK_NEXT_BRANCH
+          git push origin $TMP_CLK_NEXT_BRANCH
+
+          # Check for config changes
+          # Look for a commit at HEAD with message like "[CIQ] v6.12.29 - rebased configs"
+          # that matches the stable version we're rebasing onto
+          HEAD_COMMIT_MSG=$(git log -1 --format=%s HEAD)
+          if echo "$HEAD_COMMIT_MSG" | grep -qF "[CIQ] v${STABLE_VERSION} - rebased configs"; then
+            echo "Config change commit detected for v${STABLE_VERSION}"
+            # Extract the config changes from the commit
+            git show HEAD --stat > ../config_changes.txt
+          else
+            echo "No config change commit detected for v${STABLE_VERSION}"
+            echo "None" > ../config_changes.txt
+          fi
+
+          # Save data for PR creation
+          echo "$STABLE_VERSION" > ../stable_version.txt
+          echo "$OK_TESTS" > ../ok_tests.txt
+
+      - name: Upload selftest logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kselftest-logs
+          path: kselftest-logs/selftest*
+          if-no-files-found: warn
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: warn
+
+      - name: Create Pull Request
+        if: success()
+        run: |
+          cd kernel-src-tree
+
+          STABLE_VERSION=$(cat ../stable_version.txt)
+          OK_TESTS=$(cat ../ok_tests.txt)
+          CONFIG_CHANGES=$(cat ../config_changes.txt)
+
+          # Extract abbreviated build log (first 20 and last 20 lines)
+          #BUILD_LOG_SUMMARY=$(head -20 ../build.log && echo "" && echo "[snip]" && echo "" && tail -20 ../build.log)
+          BUILD_LOG_SUMMARY=$(egrep -B 5 -A 5 "\[TIMER\]|^Starting Build" ../build.log)
+
+          # Get artifact URLs (will be available after workflow completes)
+          RUN_ID="${{ github.run_id }}"
+          REPO="${{ github.repository }}"
+          SELFTEST_ARTIFACT_URL="https://github.com/${REPO}/actions/runs/${RUN_ID}"
+          BUILD_LOG_ARTIFACT_URL="https://github.com/${REPO}/actions/runs/${RUN_ID}"
+
+          # Create PR body
+          cat > /tmp/pr_body.md <<EOF
+          ## Automated Rebase to v${STABLE_VERSION}
+
+          ### Config Changes
+          \`\`\`
+          ${CONFIG_CHANGES}
+          \`\`\`
+
+          ### Build Log
+          \`\`\`
+          ${BUILD_LOG_SUMMARY}
+          \`\`\`
+
+          ### Testing
+          Selftests passed: **${OK_TESTS}** tests
+
+          ### Artifacts
+          - [Build Log](${BUILD_LOG_ARTIFACT_URL})
+          - [Selftest Logs](${SELFTEST_ARTIFACT_URL})
+
+          EOF
+
+          # Create the PR
+          gh pr create \
+            --title "TESTING TESTING TESTING [CIQ 6.12] Rebase to v${STABLE_VERSION}" \
+            --body-file /tmp/pr_body.md \
+            --base ${CLK_NEXT_BRANCH} \
+            --head ${TMP_CLK_NEXT_BRANCH}
+
