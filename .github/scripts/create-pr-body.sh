@@ -1,7 +1,16 @@
 #!/bin/bash
 
 # Script to create PR body
-# Arguments: build_time total_time passed failed run_id comparison_section
+# Arguments: build_time total_time passed failed run_id comparison_section repo commit_message_file
+
+set -euo pipefail
+
+# Check number of arguments
+if [ $# -lt 7 ] || [ $# -gt 8 ]; then
+  echo "Error: Expected 7 or 8 arguments, got $#" >&2
+  echo "Usage: $0 <build_time> <total_time> <passed> <failed> <run_id> <comparison_section> <repo> [commit_message_file]" >&2
+  exit 1
+fi
 
 BUILD_TIME="$1"
 TOTAL_TIME="$2"
@@ -10,6 +19,20 @@ FAILED="$4"
 RUN_ID="$5"
 COMPARISON_SECTION="$6"
 REPO="$7"
+COMMIT_MESSAGE_FILE="${8:-/tmp/commit_message.txt}"
+
+# Validate required arguments are not empty
+if [ -z "$BUILD_TIME" ] || [ -z "$TOTAL_TIME" ] || [ -z "$PASSED" ] || [ -z "$FAILED" ] || [ -z "$RUN_ID" ] || [ -z "$COMPARISON_SECTION" ] || [ -z "$REPO" ]; then
+  echo "Error: One or more required arguments are empty" >&2
+  echo "Usage: $0 <build_time> <total_time> <passed> <failed> <run_id> <comparison_section> <repo> [commit_message_file]" >&2
+  exit 1
+fi
+
+# Check if commit message file exists
+if [ ! -f "$COMMIT_MESSAGE_FILE" ]; then
+  echo "Error: Commit message file not found: $COMMIT_MESSAGE_FILE" >&2
+  exit 1
+fi
 
 # Convert seconds to minutes for better readability
 convert_time() {
@@ -30,7 +53,7 @@ This PR has been automatically created after successful completion of all CI sta
 \`\`\`
 EOF
 
-cat /tmp/commit_message.txt
+cat "$COMMIT_MESSAGE_FILE"
 
 cat << EOF
 \`\`\`
