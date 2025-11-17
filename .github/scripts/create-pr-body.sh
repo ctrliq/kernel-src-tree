@@ -54,6 +54,7 @@ This PR has been automatically created after successful completion of all CI sta
 EOF
 
 cat "$COMMIT_MESSAGE_FILE"
+echo ""
 
 cat << EOF
 \`\`\`
