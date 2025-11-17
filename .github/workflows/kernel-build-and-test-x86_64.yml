@@ -233,66 +233,52 @@ jobs:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         BASE_BRANCH=""
+        BRANCH_NAME="${{ github.ref_name }}"
+
+        # Define whitelist of valid base branches
+        VALID_BASES="ciqlts9_2 ciqlts9_4 ciqlts8_6"
+
+        echo "Current branch: $BRANCH_NAME"
 
         # First, check if an open PR already exists from this head branch
-        echo "Checking for existing open PR from branch: ${{ github.ref_name }}"
-        EXISTING_PR=$(gh pr list --head "${{ github.ref_name }}" --state open --json number,baseRefName --jq '.[0]' || echo "")
+        echo "Checking for existing open PR from branch: $BRANCH_NAME"
+        EXISTING_PR=$(gh pr list --head "$BRANCH_NAME" --state open --json number,baseRefName --jq '.[0]' || echo "")
 
         if [ -n "$EXISTING_PR" ] && [ "$EXISTING_PR" != "null" ]; then
-          # PR exists - use its existing base branch (no merge-base detection on force push)
+          # PR exists - use its existing base branch
           BASE_BRANCH=$(echo "$EXISTING_PR" | jq -r '.baseRefName')
           PR_NUMBER=$(echo "$EXISTING_PR" | jq -r '.number')
           echo "Found existing PR #$PR_NUMBER, using existing base: $BASE_BRANCH"
-          echo "Skipping merge-base detection to avoid duplicate PRs on force push"
         elif [ -n "${{ github.base_ref }}" ]; then
           # For PRs, use the base branch directly
           BASE_BRANCH="${{ github.base_ref }}"
           echo "Using PR base branch: $BASE_BRANCH"
         else
-          # No existing PR - for direct pushes, find the common ancestor branch
-          echo "No existing PR found, finding base branch via merge-base"
+          # Extract base branch from branch name pattern: {name}_base or {name}-base
+          # Match patterns like {shreeya}_ciqlts9_2 or {shreeya}-ciqlts9_2
+          if [[ "$BRANCH_NAME" =~ \{[^}]+\}[_-](.+) ]]; then
+            EXTRACTED_BASE="${BASH_REMATCH[1]}"
+            echo "Extracted base branch from branch name: $EXTRACTED_BASE"
 
-          # Get all remote branches sorted by commit date (most recent first)
-          # This ensures we check actively developed branches first
-          CURRENT_COMMIT=$(git rev-parse HEAD)
-          BEST_BRANCH=""
-          CLOSEST_DISTANCE=999999
-
-          # Only check the 30 most recently updated branches for performance
-          for remote_branch in $(git for-each-ref --sort=-committerdate --format='%(refname:short)' refs/remotes/origin/ | grep -v 'HEAD\|PR-CHECKER' | head -30); do
-            branch_name=$(echo "$remote_branch" | sed 's|^origin/||')
-
-            # Skip if it's the current branch
-            if [ "$branch_name" = "${{ github.ref_name }}" ]; then
-              continue
+            # Validate against whitelist
+            if echo "$VALID_BASES" | grep -wq "$EXTRACTED_BASE"; then
+              BASE_BRANCH="$EXTRACTED_BASE"
+              echo "Base branch validated: $BASE_BRANCH"
+            else
+              echo "::error::Extracted base '$EXTRACTED_BASE' is not in whitelist: $VALID_BASES"
+              echo "::error::Valid base branches are: $VALID_BASES"
+              exit 1
             fi
-
-            MERGE_BASE=$(git merge-base HEAD "$remote_branch" 2>/dev/null || echo "")
-
-            # Check if this branch shares history and isn't the current commit
-            if [ -n "$MERGE_BASE" ] && [ "$MERGE_BASE" != "$CURRENT_COMMIT" ]; then
-              # Calculate distance (number of commits) from merge-base to current HEAD
-              DISTANCE=$(git rev-list --count ${MERGE_BASE}..HEAD 2>/dev/null || echo "999999")
-
-              # Find the branch with the shortest distance (most recent common ancestor)
-              if [ "$DISTANCE" -lt "$CLOSEST_DISTANCE" ]; then
-                CLOSEST_DISTANCE=$DISTANCE
-                BEST_BRANCH=$branch_name
-              fi
-            fi
-          done
-
-          if [ -n "$BEST_BRANCH" ]; then
-            BASE_BRANCH=$BEST_BRANCH
-            echo "Found common ancestor with $BASE_BRANCH (distance: $CLOSEST_DISTANCE commits)"
+          else
+            echo "::error::Branch name does not match expected pattern {name}_base or {name}-base"
+            echo "::error::Branch name must be in format {name}_base or {name}-base where base is one of: $VALID_BASES"
+            exit 1
           fi
         fi
 
         if [ -z "$BASE_BRANCH" ]; then
-          echo "::warning::Could not determine base branch for comparison - no common ancestor found"
-          echo "::warning::Kselftest comparison will be skipped"
-          echo "base_branch=" >> $GITHUB_OUTPUT
-          exit 0
+          echo "::error::Could not determine base branch"
+          exit 1
         fi
 
         echo "base_branch=$BASE_BRANCH" >> $GITHUB_OUTPUT
@@ -456,16 +442,17 @@ jobs:
     - name: Get commit information
       id: commit_msg
       run: |
-        # Count commits since origin/main (or appropriate base branch)
-        BASE_BRANCH="main"
+        # Use the base branch determined by compare-results stage
+        BASE_BRANCH="${{ needs.compare-results.outputs.base_branch }}"
+
+        if [ -z "$BASE_BRANCH" ]; then
+          echo "::error::Base branch not determined by compare-results stage"
+          exit 1
+        fi
+
         if ! git rev-parse origin/$BASE_BRANCH >/dev/null 2>&1; then
-          # Try other common base branch names
-          for branch in master lts-9.2 lts-9; do
-            if git rev-parse origin/$branch >/dev/null 2>&1; then
-              BASE_BRANCH=$branch
-              break
-            fi
-          done
+          echo "::error::Base branch origin/$BASE_BRANCH does not exist"
+          exit 1
         fi
 
         COMMIT_COUNT=$(git rev-list --count origin/$BASE_BRANCH..HEAD 2>/dev/null || echo "1")
