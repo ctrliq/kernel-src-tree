@@ -399,11 +399,7 @@ ifeq ("$(ZSTREAM)", "yes")
   BUILDOPTS += +kabidupchk
 else
   ZSTREAM_FLAG = no
-  ifeq ("$(EARLY_YSTREAM)", "yes")
-    YSTREAM_FLAG = early
-  else
-    YSTREAM_FLAG = yes
-  endif
+  YSTREAM_FLAG = yes
 endif
 
 include Makefile.cross
