@@ -10,4 +10,5 @@
 %define patchlevel 12
 %define specrelease 6%{?buildid}%{?dist}
 %define kabiversion 5.12.0
+%define _with_kabidupchk 1
 Mon Mar 28 2022 Fedora Kernel Team <kernel-team@fedoraproject.org> [5.12.0-6.test]
