@@ -2415,11 +2415,11 @@ static void ice_service_task(struct work_struct *work)
 	}
 
 	if (test_and_clear_bit(ICE_AUX_ERR_PENDING, pf->state)) {
-		struct iidc_event *event;
+		struct iidc_rdma_event *event;
 
 		event = kzalloc(sizeof(*event), GFP_KERNEL);
 		if (event) {
-			set_bit(IIDC_EVENT_CRIT_ERR, event->type);
+			set_bit(IIDC_RDMA_EVENT_CRIT_ERR, event->type);
 			/* report the entire OICR value to AUX driver */
 			swap(event->reg, pf->oicr_err_reg);
 			ice_send_event_to_aux(pf, event);
@@ -2438,11 +2438,11 @@ static void ice_service_task(struct work_struct *work)
 		ice_plug_aux_dev(pf);
 
 	if (test_and_clear_bit(ICE_FLAG_MTU_CHANGED, pf->flags)) {
-		struct iidc_event *event;
+		struct iidc_rdma_event *event;
 
 		event = kzalloc(sizeof(*event), GFP_KERNEL);
 		if (event) {
-			set_bit(IIDC_EVENT_AFTER_MTU_CHANGE, event->type);
+			set_bit(IIDC_RDMA_EVENT_AFTER_MTU_CHANGE, event->type);
 			ice_send_event_to_aux(pf, event);
 			kfree(event);
 		}
