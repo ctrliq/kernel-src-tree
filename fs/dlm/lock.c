@@ -1888,7 +1888,7 @@ void dlm_scan_timeout(struct dlm_ls *ls)
 		}
 		mutex_unlock(&ls->ls_timeout_mutex);
 
-		if (!lkb)
+		if (!do_cancel && !do_warn)
 			break;
 
 		r = lkb->lkb_resource;
