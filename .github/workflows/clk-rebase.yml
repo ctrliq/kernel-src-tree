@@ -3,7 +3,8 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - stable_6.12.y
+      - stable_6.*.y
+      - clk-rebase-ga
 
 jobs:
   clk-rebase:
@@ -13,14 +14,24 @@ jobs:
       options: --cpus 8 --privileged
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # For push events, use the branch that triggered the workflow
+      # For manual dispatch, default to stable_6.12.y
+      #STABLE_TRACKING_BRANCH: ${{ github.ref_name || 'stable_6.12.y' }}
+      STABLE_TRACKING_BRANCH: ${{ 'stable_6.12.y' }}
     steps:
-      - name: Perform CLK Rebase
+      - name: Set version variables
         run: |
-          CLK_BRANCH=ciq-6.12.y
-          CLK_NEXT_BRANCH=ciq-6.12.y-next
-          TMP_CLK_NEXT_BRANCH={automation_tmp}_ciq-6.12.y-next
-          STABLE_TRACKING_BRANCH=stable_6.12.y
+          # Extract version from STABLE_TRACKING_BRANCH (e.g., stable_6.12.y -> 6.12.y)
+          STABLE_BASE_VERSION=$(echo "$STABLE_TRACKING_BRANCH" | sed 's/^stable_//')
+          echo "STABLE_BASE_VERSION=$STABLE_BASE_VERSION" >> $GITHUB_ENV
 
+          # Construct branch names from the base version
+          echo "CLK_BRANCH=ciq-$STABLE_BASE_VERSION" >> $GITHUB_ENV
+          echo "CLK_NEXT_BRANCH=ciq-${STABLE_BASE_VERSION}-next" >> $GITHUB_ENV
+          echo "TMP_CLK_NEXT_BRANCH={automation_tmp}_ciq-${STABLE_BASE_VERSION}-next" >> $GITHUB_ENV
+
+      - name: Install system dependencies
+        run: |
           dnf install epel-release -y
           dnf install grubby grub2-tools qemu-kvm sudo virtme-ng -y
 
@@ -34,11 +45,8 @@ jobs:
           dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
           dnf install gh -y
 
-          WORKDIR=clk-rebase-$(date '+%Y_%m_%d__%H_%M_%S')
-          mkdir $WORKDIR
-          pushd $WORKDIR
-
-
+      - name: Clone repositories
+        run: |
           git config --global user.email "bmastbergen@ciq.com"
           git config --global user.name "Brett Mastbergen"
 
@@ -48,12 +56,18 @@ jobs:
 
           git clone https://oauth2:$GITHUB_TOKEN@github.com/ctrliq/kernel-src-tree
 
-          pushd kernel-src-tree
+      - name: Perform rebase
+        run: |
+          cd kernel-src-tree
 
           git checkout $STABLE_TRACKING_BRANCH
           git checkout $CLK_BRANCH
 
           ../kernel-src-tree-tools/lt_rebase.sh
+
+      - name: Configure kernel for testing
+        run: |
+          cd kernel-src-tree
 
           # need some config tweaks for vng
           ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_VSOCKETS
@@ -78,17 +92,29 @@ jobs:
           ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_NETFS_SUPPORT
           ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_9P_FS
 
+      - name: Build kernel
+        run: |
+          cd kernel-src-tree
           ../kernel-src-tree-tools/kernel_build.sh --skip-kabi --no-reboot | tee ../build.log
 
+      - name: Install test dependencies
+        run: |
           dnf install curl --allowerasing -y
-
           # should be installed in kernel_kselftest.sh
           dnf install conntrack-tools e2fsprogs ethtool iptables iputils ipvsadm kernel-tools nftables teamd traceroute -y
+
+      - name: Run selftests
+        run: |
+          cd kernel-src-tree
 
           #vng --qemu /usr/libexec/qemu-kvm --force-initramfs --disable-microvm --rw --network user --verbose --memory 16G -- ../kernel-src-tree-tools/kernel_kselftest.sh
 
           # HACK HACK HACK
           vng --qemu /usr/libexec/qemu-kvm --force-initramfs --disable-microvm --rw --network user --verbose --memory 16G -- sh -c 'mkdir ../kselftest-logs ; echo ok foo:bar > ../kselftest-logs/selftest-$(uname -r).log'
+
+      - name: Extract results and push branches
+        run: |
+          cd kernel-src-tree
 
           echo "Selftests passed:"
           OK_TESTS=$(grep -a ^ok ../kselftest-logs/selftest* | wc -l)
@@ -119,15 +145,12 @@ jobs:
           echo "$STABLE_VERSION" > ../stable_version.txt
           echo "$OK_TESTS" > ../ok_tests.txt
 
-          popd
-          popd
-
       - name: Upload selftest logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: kselftest-logs
-          path: clk-rebase-*/kselftest-logs/selftest*
+          path: kselftest-logs/selftest*
           if-no-files-found: warn
 
       - name: Upload build log
@@ -135,14 +158,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-log
-          path: clk-rebase-*/build.log
+          path: build.log
           if-no-files-found: warn
 
       - name: Create Pull Request
         if: success()
         run: |
-          WORKDIR=$(ls -d clk-rebase-* | head -1)
-          cd $WORKDIR/kernel-src-tree
+          cd kernel-src-tree
 
           STABLE_VERSION=$(cat ../stable_version.txt)
           OK_TESTS=$(cat ../ok_tests.txt)
@@ -185,6 +207,6 @@ jobs:
           gh pr create \
             --title "TESTING TESTING TESTING [CIQ 6.12] Rebase to v${STABLE_VERSION}" \
             --body-file /tmp/pr_body.md \
-            --base ciq-6.12.y-next \
-            --head {automation_tmp}_ciq-6.12.y-next
+            --base ${CLK_NEXT_BRANCH} \
+            --head ${TMP_CLK_NEXT_BRANCH}
 
