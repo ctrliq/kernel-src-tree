@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#! /usr/bin/python3 -s
 # SPDX-License-Identifier: GPL-2.0
 
 from lib.py import ksft_run, ksft_exit, ksft_eq, KsftSkipEx

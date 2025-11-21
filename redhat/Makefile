@@ -761,6 +761,8 @@ sources-rh: $(TARBALL) $(KABI_TARBALL) $(KABIDW_TARBALL) generate-testpatch-tmp 
 		README.rst \
 		kernel-local \
 		dracut-virt.conf \
+		uki.sbat.template \
+		uki-addons.sbat.template \
 		$(SOURCES)/
 	@changelog_glob="$(SPECPACKAGE_NAME).changelog-*"; \
 	[[ -n "$(AUTOMOTIVE_BUILD)" ]] && changelog_glob="kernel.changelog-*"; \

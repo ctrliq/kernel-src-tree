@@ -22,6 +22,7 @@
 #include "linux/magic.h"
 
 #include "vm_util.h"
+#include "../kselftest.h"
 #include "thp_settings.h"
 
 #define BASE_ADDR ((void *)(1UL << 30))
