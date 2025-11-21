@@ -50,14 +50,13 @@ cat << EOF
 This PR has been automatically created after successful completion of all CI stages.
 
 ## Commit Message(s)
-\`\`\`
+
 EOF
 
 cat "$COMMIT_MESSAGE_FILE"
 echo ""
 
 cat << EOF
-\`\`\`
 
 ## Test Results
 
