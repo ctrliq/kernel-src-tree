@@ -1,0 +1,144 @@
+x86: move ZMM exclusion list into CPU feature flag
+
+jira KERNEL-156
+Rebuild_History Non-Buildable kernel-6.12.0-124.2.1.el10_1
+commit-author Eric Biggers <ebiggers@google.com>
+commit 968e9bc4cef87054741db81a0d94d5c1f67d518a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-124.2.1.el10_1/968e9bc4.failed
+
+Lift zmm_exclusion_list in aesni-intel_glue.c into the x86 CPU setup
+code, and add a new x86 CPU feature flag X86_FEATURE_PREFER_YMM that is
+set when the CPU is on this list.
+
+This allows other code in arch/x86/, such as the CRC library code, to
+apply the same exclusion list when deciding whether to execute 256-bit
+or 512-bit optimized functions.
+
+Note that full AVX512 support including ZMM registers is still exposed
+to userspace and is still supported for in-kernel use.  This flag just
+indicates whether in-kernel code should prefer to use YMM registers.
+
+	Acked-by: Ard Biesheuvel <ardb@kernel.org>
+	Acked-by: Ingo Molnar <mingo@kernel.org>
+	Acked-by: Keith Busch <kbusch@kernel.org>
+	Reviewed-by: "Martin K. Petersen" <martin.petersen@oracle.com>
+Link: https://lore.kernel.org/r/20250210174540.161705-2-ebiggers@kernel.org
+	Signed-off-by: Eric Biggers <ebiggers@google.com>
+(cherry picked from commit 968e9bc4cef87054741db81a0d94d5c1f67d518a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/cpufeatures.h
+#	arch/x86/kernel/cpu/intel.c
+diff --cc arch/x86/include/asm/cpufeatures.h
+index 5d6708839f04,99334026a26c..000000000000
+--- a/arch/x86/include/asm/cpufeatures.h
++++ b/arch/x86/include/asm/cpufeatures.h
+@@@ -484,7 -482,8 +484,12 @@@
+  #define X86_FEATURE_CLEAR_BHB_LOOP_ON_VMEXIT (21*32+ 4) /* Clear branch history at vmexit using SW loop */
+  #define X86_FEATURE_AMD_FAST_CPPC	(21*32 + 5) /* Fast CPPC */
+  #define X86_FEATURE_AMD_HETEROGENEOUS_CORES (21*32 + 6) /* Heterogeneous Core Topology */
+++<<<<<<< HEAD
+ +#define X86_FEATURE_INDIRECT_THUNK_ITS	(21*32 + 9) /* Use thunk for indirect branches in lower half of cacheline */
+++=======
++ #define X86_FEATURE_AMD_WORKLOAD_CLASS	(21*32 + 7) /* Workload Classification */
++ #define X86_FEATURE_PREFER_YMM		(21*32 + 8) /* Avoid ZMM registers due to downclocking */
+++>>>>>>> 968e9bc4cef8 (x86: move ZMM exclusion list into CPU feature flag)
+  
+  /*
+   * BUG word(s)
+diff --cc arch/x86/kernel/cpu/intel.c
+index a620d7047444,c3005c4ec46a..000000000000
+--- a/arch/x86/kernel/cpu/intel.c
++++ b/arch/x86/kernel/cpu/intel.c
+@@@ -547,8 -521,24 +547,29 @@@ static void init_intel_misc_features(st
+  	wrmsrl(MSR_MISC_FEATURES_ENABLES, msr);
+  }
+  
+++<<<<<<< HEAD
+ +static void split_lock_init(void);
+ +static void bus_lock_init(void);
+++=======
++ /*
++  * This is a list of Intel CPUs that are known to suffer from downclocking when
++  * ZMM registers (512-bit vectors) are used.  On these CPUs, when the kernel
++  * executes SIMD-optimized code such as cryptography functions or CRCs, it
++  * should prefer 256-bit (YMM) code to 512-bit (ZMM) code.
++  */
++ static const struct x86_cpu_id zmm_exclusion_list[] = {
++ 	X86_MATCH_VFM(INTEL_SKYLAKE_X,		0),
++ 	X86_MATCH_VFM(INTEL_ICELAKE_X,		0),
++ 	X86_MATCH_VFM(INTEL_ICELAKE_D,		0),
++ 	X86_MATCH_VFM(INTEL_ICELAKE,		0),
++ 	X86_MATCH_VFM(INTEL_ICELAKE_L,		0),
++ 	X86_MATCH_VFM(INTEL_ICELAKE_NNPI,	0),
++ 	X86_MATCH_VFM(INTEL_TIGERLAKE_L,	0),
++ 	X86_MATCH_VFM(INTEL_TIGERLAKE,		0),
++ 	/* Allow Rocket Lake and later, and Sapphire Rapids and later. */
++ 	{},
++ };
+++>>>>>>> 968e9bc4cef8 (x86: move ZMM exclusion list into CPU feature flag)
+  
+  static void init_intel(struct cpuinfo_x86 *c)
+  {
+@@@ -628,13 -618,11 +649,16 @@@
+  		if (p)
+  			strcpy(c->x86_model_id, p);
+  	}
+ +
+ +	if (c->x86 == 15)
+ +		set_cpu_cap(c, X86_FEATURE_P4);
+ +	if (c->x86 == 6)
+ +		set_cpu_cap(c, X86_FEATURE_P3);
+  #endif
+  
++ 	if (x86_match_cpu(zmm_exclusion_list))
++ 		set_cpu_cap(c, X86_FEATURE_PREFER_YMM);
++ 
+  	/* Work around errata */
+  	srat_detect_node(c);
+  
+diff --git a/arch/x86/crypto/aesni-intel_glue.c b/arch/x86/crypto/aesni-intel_glue.c
+index b0dd83555499..dee214f02be2 100644
+--- a/arch/x86/crypto/aesni-intel_glue.c
++++ b/arch/x86/crypto/aesni-intel_glue.c
+@@ -1536,26 +1536,6 @@ DEFINE_GCM_ALGS(vaes_avx10_512, FLAG_AVX10_512,
+ 		AES_GCM_KEY_AVX10_SIZE, 800);
+ #endif /* CONFIG_AS_VAES && CONFIG_AS_VPCLMULQDQ */
+ 
+-/*
+- * This is a list of CPU models that are known to suffer from downclocking when
+- * zmm registers (512-bit vectors) are used.  On these CPUs, the AES mode
+- * implementations with zmm registers won't be used by default.  Implementations
+- * with ymm registers (256-bit vectors) will be used by default instead.
+- */
+-static const struct x86_cpu_id zmm_exclusion_list[] = {
+-	X86_MATCH_VFM(INTEL_SKYLAKE_X,		0),
+-	X86_MATCH_VFM(INTEL_ICELAKE_X,		0),
+-	X86_MATCH_VFM(INTEL_ICELAKE_D,		0),
+-	X86_MATCH_VFM(INTEL_ICELAKE,		0),
+-	X86_MATCH_VFM(INTEL_ICELAKE_L,		0),
+-	X86_MATCH_VFM(INTEL_ICELAKE_NNPI,	0),
+-	X86_MATCH_VFM(INTEL_TIGERLAKE_L,	0),
+-	X86_MATCH_VFM(INTEL_TIGERLAKE,		0),
+-	/* Allow Rocket Lake and later, and Sapphire Rapids and later. */
+-	/* Also allow AMD CPUs (starting with Zen 4, the first with AVX-512). */
+-	{},
+-};
+-
+ static int __init register_avx_algs(void)
+ {
+ 	int err;
+@@ -1600,7 +1580,7 @@ static int __init register_avx_algs(void)
+ 	if (err)
+ 		return err;
+ 
+-	if (x86_match_cpu(zmm_exclusion_list)) {
++	if (boot_cpu_has(X86_FEATURE_PREFER_YMM)) {
+ 		int i;
+ 
+ 		aes_xts_alg_vaes_avx10_512.base.cra_priority = 1;
+* Unmerged path arch/x86/include/asm/cpufeatures.h
+* Unmerged path arch/x86/kernel/cpu/intel.c
