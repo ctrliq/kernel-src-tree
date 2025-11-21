@@ -1,0 +1,263 @@
+x86/bugs: Restructure retbleed mitigation
+
+jira KERNEL-156
+Rebuild_History Non-Buildable kernel-6.12.0-124.2.1.el10_1
+commit-author David Kaplan <david.kaplan@amd.com>
+commit e3b78a7ad5ea718ea1dbaeb02ba9a6aa2aee9324
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-124.2.1.el10_1/e3b78a7a.failed
+
+Restructure retbleed mitigation to use select/update/apply functions to create
+consistent vulnerability handling.  The retbleed_update_mitigation()
+simplifies the dependency between spectre_v2 and retbleed.
+
+The command line options now directly select a preferred mitigation
+which simplifies the logic.
+
+	Signed-off-by: David Kaplan <david.kaplan@amd.com>
+	Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+	Reviewed-by: Josh Poimboeuf <jpoimboe@kernel.org>
+Link: https://lore.kernel.org/20250418161721.1855190-11-david.kaplan@amd.com
+(cherry picked from commit e3b78a7ad5ea718ea1dbaeb02ba9a6aa2aee9324)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/bugs.c
+diff --cc arch/x86/kernel/cpu/bugs.c
+index eaabc5443ada,207a472d1a6e..000000000000
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@@ -34,9 -34,31 +34,11 @@@
+  
+  #include "cpu.h"
+  
+ -/*
+ - * Speculation Vulnerability Handling
+ - *
+ - * Each vulnerability is handled with the following functions:
+ - *   <vuln>_select_mitigation() -- Selects a mitigation to use.  This should
+ - *				   take into account all relevant command line
+ - *				   options.
+ - *   <vuln>_update_mitigation() -- This is called after all vulnerabilities have
+ - *				   selected a mitigation, in case the selection
+ - *				   may want to change based on other choices
+ - *				   made.  This function is optional.
+ - *   <vuln>_apply_mitigation() -- Enable the selected mitigation.
+ - *
+ - * The compile-time mitigation in all cases should be AUTO.  An explicit
+ - * command-line option can override AUTO.  If no such option is
+ - * provided, <vuln>_select_mitigation() will override AUTO to the best
+ - * mitigation option.
+ - */
+ -
+  static void __init spectre_v1_select_mitigation(void);
+ -static void __init spectre_v1_apply_mitigation(void);
+  static void __init spectre_v2_select_mitigation(void);
+  static void __init retbleed_select_mitigation(void);
++ static void __init retbleed_update_mitigation(void);
++ static void __init retbleed_apply_mitigation(void);
+  static void __init spectre_v2_user_select_mitigation(void);
+  static void __init ssb_select_mitigation(void);
+  static void __init l1tf_select_mitigation(void);
+@@@ -191,7 -211,25 +188,29 @@@ void __init cpu_select_mitigations(void
+  	 */
+  	srso_select_mitigation();
+  	gds_select_mitigation();
+++<<<<<<< HEAD
+ +	its_select_mitigation();
+++=======
++ 
++ 	/*
++ 	 * After mitigations are selected, some may need to update their
++ 	 * choices.
++ 	 */
++ 	retbleed_update_mitigation();
++ 	mds_update_mitigation();
++ 	taa_update_mitigation();
++ 	mmio_update_mitigation();
++ 	rfds_update_mitigation();
++ 
++ 	spectre_v1_apply_mitigation();
++ 	retbleed_apply_mitigation();
++ 	mds_apply_mitigation();
++ 	taa_apply_mitigation();
++ 	mmio_apply_mitigation();
++ 	rfds_apply_mitigation();
++ 	srbds_apply_mitigation();
++ 	gds_apply_mitigation();
+++>>>>>>> e3b78a7ad5ea (x86/bugs: Restructure retbleed mitigation)
+  }
+  
+  /*
+@@@ -1181,169 -1300,8 +1224,147 @@@ static void __init retbleed_apply_mitig
+  	if (mitigate_smt && !boot_cpu_has(X86_FEATURE_STIBP) &&
+  	    (retbleed_nosmt || cpu_mitigations_auto_nosmt()))
+  		cpu_smt_disable(false);
+- 
+- 	/*
+- 	 * Let IBRS trump all on Intel without affecting the effects of the
+- 	 * retbleed= cmdline option except for call depth based stuffing
+- 	 */
+- 	if (boot_cpu_data.x86_vendor == X86_VENDOR_INTEL) {
+- 		switch (spectre_v2_enabled) {
+- 		case SPECTRE_V2_IBRS:
+- 			retbleed_mitigation = RETBLEED_MITIGATION_IBRS;
+- 			break;
+- 		case SPECTRE_V2_EIBRS:
+- 		case SPECTRE_V2_EIBRS_RETPOLINE:
+- 		case SPECTRE_V2_EIBRS_LFENCE:
+- 			retbleed_mitigation = RETBLEED_MITIGATION_EIBRS;
+- 			break;
+- 		default:
+- 			if (retbleed_mitigation != RETBLEED_MITIGATION_STUFF)
+- 				pr_err(RETBLEED_INTEL_MSG);
+- 		}
+- 	}
+- 
+- 	pr_info("%s\n", retbleed_strings[retbleed_mitigation]);
+  }
+  
+ +#undef pr_fmt
+ +#define pr_fmt(fmt)     "ITS: " fmt
+ +
+ +enum its_mitigation_cmd {
+ +	ITS_CMD_OFF,
+ +	ITS_CMD_ON,
+ +	ITS_CMD_VMEXIT,
+ +	ITS_CMD_RSB_STUFF,
+ +};
+ +
+ +enum its_mitigation {
+ +	ITS_MITIGATION_OFF,
+ +	ITS_MITIGATION_VMEXIT_ONLY,
+ +	ITS_MITIGATION_ALIGNED_THUNKS,
+ +	ITS_MITIGATION_RETPOLINE_STUFF,
+ +};
+ +
+ +static const char * const its_strings[] = {
+ +	[ITS_MITIGATION_OFF]			= "Vulnerable",
+ +	[ITS_MITIGATION_VMEXIT_ONLY]		= "Mitigation: Vulnerable, KVM: Not affected",
+ +	[ITS_MITIGATION_ALIGNED_THUNKS]		= "Mitigation: Aligned branch/return thunks",
+ +	[ITS_MITIGATION_RETPOLINE_STUFF]	= "Mitigation: Retpolines, Stuffing RSB",
+ +};
+ +
+ +static enum its_mitigation its_mitigation __ro_after_init = ITS_MITIGATION_ALIGNED_THUNKS;
+ +
+ +static enum its_mitigation_cmd its_cmd __ro_after_init =
+ +	IS_ENABLED(CONFIG_MITIGATION_ITS) ? ITS_CMD_ON : ITS_CMD_OFF;
+ +
+ +static int __init its_parse_cmdline(char *str)
+ +{
+ +	if (!str)
+ +		return -EINVAL;
+ +
+ +	if (!IS_ENABLED(CONFIG_MITIGATION_ITS)) {
+ +		pr_err("Mitigation disabled at compile time, ignoring option (%s)", str);
+ +		return 0;
+ +	}
+ +
+ +	if (!strcmp(str, "off")) {
+ +		its_cmd = ITS_CMD_OFF;
+ +	} else if (!strcmp(str, "on")) {
+ +		its_cmd = ITS_CMD_ON;
+ +	} else if (!strcmp(str, "force")) {
+ +		its_cmd = ITS_CMD_ON;
+ +		setup_force_cpu_bug(X86_BUG_ITS);
+ +	} else if (!strcmp(str, "vmexit")) {
+ +		its_cmd = ITS_CMD_VMEXIT;
+ +	} else if (!strcmp(str, "stuff")) {
+ +		its_cmd = ITS_CMD_RSB_STUFF;
+ +	} else {
+ +		pr_err("Ignoring unknown indirect_target_selection option (%s).", str);
+ +	}
+ +
+ +	return 0;
+ +}
+ +early_param("indirect_target_selection", its_parse_cmdline);
+ +
+ +static void __init its_select_mitigation(void)
+ +{
+ +	enum its_mitigation_cmd cmd = its_cmd;
+ +
+ +	if (!boot_cpu_has_bug(X86_BUG_ITS) || cpu_mitigations_off()) {
+ +		its_mitigation = ITS_MITIGATION_OFF;
+ +		return;
+ +	}
+ +
+ +	/* Retpoline+CDT mitigates ITS, bail out */
+ +	if (boot_cpu_has(X86_FEATURE_RETPOLINE) &&
+ +	    boot_cpu_has(X86_FEATURE_CALL_DEPTH)) {
+ +		its_mitigation = ITS_MITIGATION_RETPOLINE_STUFF;
+ +		goto out;
+ +	}
+ +
+ +	/* Exit early to avoid irrelevant warnings */
+ +	if (cmd == ITS_CMD_OFF) {
+ +		its_mitigation = ITS_MITIGATION_OFF;
+ +		goto out;
+ +	}
+ +	if (spectre_v2_enabled == SPECTRE_V2_NONE) {
+ +		pr_err("WARNING: Spectre-v2 mitigation is off, disabling ITS\n");
+ +		its_mitigation = ITS_MITIGATION_OFF;
+ +		goto out;
+ +	}
+ +	if (!IS_ENABLED(CONFIG_MITIGATION_RETPOLINE) ||
+ +	    !IS_ENABLED(CONFIG_MITIGATION_RETHUNK)) {
+ +		pr_err("WARNING: ITS mitigation depends on retpoline and rethunk support\n");
+ +		its_mitigation = ITS_MITIGATION_OFF;
+ +		goto out;
+ +	}
+ +	if (IS_ENABLED(CONFIG_DEBUG_FORCE_FUNCTION_ALIGN_64B)) {
+ +		pr_err("WARNING: ITS mitigation is not compatible with CONFIG_DEBUG_FORCE_FUNCTION_ALIGN_64B\n");
+ +		its_mitigation = ITS_MITIGATION_OFF;
+ +		goto out;
+ +	}
+ +	if (boot_cpu_has(X86_FEATURE_RETPOLINE_LFENCE)) {
+ +		pr_err("WARNING: ITS mitigation is not compatible with lfence mitigation\n");
+ +		its_mitigation = ITS_MITIGATION_OFF;
+ +		goto out;
+ +	}
+ +
+ +	if (cmd == ITS_CMD_RSB_STUFF &&
+ +	    (!boot_cpu_has(X86_FEATURE_RETPOLINE) || !IS_ENABLED(CONFIG_MITIGATION_CALL_DEPTH_TRACKING))) {
+ +		pr_err("RSB stuff mitigation not supported, using default\n");
+ +		cmd = ITS_CMD_ON;
+ +	}
+ +
+ +	switch (cmd) {
+ +	case ITS_CMD_OFF:
+ +		its_mitigation = ITS_MITIGATION_OFF;
+ +		break;
+ +	case ITS_CMD_VMEXIT:
+ +		if (boot_cpu_has_bug(X86_BUG_ITS_NATIVE_ONLY)) {
+ +			its_mitigation = ITS_MITIGATION_VMEXIT_ONLY;
+ +			goto out;
+ +		}
+ +		fallthrough;
+ +	case ITS_CMD_ON:
+ +		its_mitigation = ITS_MITIGATION_ALIGNED_THUNKS;
+ +		if (!boot_cpu_has(X86_FEATURE_RETPOLINE))
+ +			setup_force_cpu_cap(X86_FEATURE_INDIRECT_THUNK_ITS);
+ +		setup_force_cpu_cap(X86_FEATURE_RETHUNK);
+ +		set_return_thunk(its_return_thunk);
+ +		break;
+ +	case ITS_CMD_RSB_STUFF:
+ +		its_mitigation = ITS_MITIGATION_RETPOLINE_STUFF;
+ +		setup_force_cpu_cap(X86_FEATURE_RETHUNK);
+ +		setup_force_cpu_cap(X86_FEATURE_CALL_DEPTH);
+ +		set_return_thunk(call_depth_return_thunk);
+ +		if (retbleed_mitigation == RETBLEED_MITIGATION_NONE) {
+ +			retbleed_mitigation = RETBLEED_MITIGATION_STUFF;
+ +			pr_info("Retbleed mitigation updated to stuffing\n");
+ +		}
+ +		break;
+ +	}
+ +out:
+ +	pr_info("%s\n", its_strings[its_mitigation]);
+ +}
+ +
+  #undef pr_fmt
+  #define pr_fmt(fmt)     "Spectre V2 : " fmt
+  
+* Unmerged path arch/x86/kernel/cpu/bugs.c
