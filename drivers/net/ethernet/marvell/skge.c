@@ -484,7 +484,8 @@ static void skge_get_strings(struct net_device *dev, u32 stringset, u8 *data)
 	switch (stringset) {
 	case ETH_SS_STATS:
 		for (i = 0; i < ARRAY_SIZE(skge_stats); i++)
-			ethtool_puts(&data, skge_stats[i].name);
+			memcpy(data + i * ETH_GSTRING_LEN,
+			       skge_stats[i].name, ETH_GSTRING_LEN);
 		break;
 	}
 }
