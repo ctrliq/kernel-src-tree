@@ -2022,6 +2022,22 @@ static int set_id_aa64mmfr2_el1(struct kvm_vcpu *vcpu,
 	return set_id_reg(vcpu, rd, user_val);
 }
 
+static int set_id_aa64mmfr2_el1(struct kvm_vcpu *vcpu,
+				const struct sys_reg_desc *rd, u64 user_val)
+{
+	u64 hw_val = read_sanitised_ftr_reg(SYS_ID_AA64MMFR2_EL1);
+	u64 nv_mask = ID_AA64MMFR2_EL1_NV_MASK;
+
+	/*
+	 * We made the mistake to expose the now deprecated NV field,
+	 * so allow userspace to write it, but silently ignore it.
+	 */
+	if ((hw_val & nv_mask) == (user_val & nv_mask))
+		user_val &= ~nv_mask;
+
+	return set_id_reg(vcpu, rd, user_val);
+}
+
 static int set_ctr_el0(struct kvm_vcpu *vcpu,
 		       const struct sys_reg_desc *rd, u64 user_val)
 {
