@@ -28,9 +28,11 @@
 static __always_inline void __monitor(const void *eax, unsigned long ecx,
 			     unsigned long edx)
 {
-	/* "monitor %eax, %ecx, %edx;" */
-	asm volatile(".byte 0x0f, 0x01, 0xc8;"
-		     :: "a" (eax), "c" (ecx), "d"(edx));
+	/*
+	 * Use the instruction mnemonic with implicit operands, as the LLVM
+	 * assembler fails to assemble the mnemonic with explicit operands:
+	 */
+	asm volatile("monitor" :: "a" (eax), "c" (ecx), "d" (edx));
 }
 
 static __always_inline void __monitorx(const void *eax, unsigned long ecx,
@@ -45,9 +47,11 @@ static __always_inline void __mwait(unsigned long eax, unsigned long ecx)
 {
 	mds_idle_clear_cpu_buffers();
 
-	/* "mwait %eax, %ecx;" */
-	asm volatile(".byte 0x0f, 0x01, 0xc9;"
-		     :: "a" (eax), "c" (ecx));
+	/*
+	 * Use the instruction mnemonic with implicit operands, as the LLVM
+	 * assembler fails to assemble the mnemonic with explicit operands:
+	 */
+	asm volatile("mwait" :: "a" (eax), "c" (ecx));
 }
 
 /*
@@ -98,9 +102,8 @@ static __always_inline void __mwaitx(unsigned long eax, unsigned long ebx,
 static __always_inline void __sti_mwait(unsigned long eax, unsigned long ecx)
 {
 	mds_idle_clear_cpu_buffers();
-	/* "mwait %eax, %ecx;" */
-	asm volatile("sti; .byte 0x0f, 0x01, 0xc9;"
-		     :: "a" (eax), "c" (ecx));
+
+	asm volatile("sti; mwait" :: "a" (eax), "c" (ecx));
 }
 
 /*
