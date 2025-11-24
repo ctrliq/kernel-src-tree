@@ -3004,13 +3004,12 @@ static int ipv6_mc_config(struct sock *sk, bool join,
 /*
  *	Manual configuration of address on an interface
  */
-static int inet6_addr_add(struct net *net, int ifindex,
+static int inet6_addr_add(struct net *net, struct net_device *dev,
 			  struct ifa6_config *cfg,
 			  struct netlink_ext_ack *extack)
 {
 	struct inet6_ifaddr *ifp;
 	struct inet6_dev *idev;
-	struct net_device *dev;
 	unsigned long timeout;
 	clock_t expires;
 	u32 flags;
@@ -3033,10 +3032,6 @@ static int inet6_addr_add(struct net *net, int ifindex,
 		return -EINVAL;
 	}
 
-	dev = __dev_get_by_index(net, ifindex);
-	if (!dev)
-		return -ENODEV;
-
 	idev = addrconf_add_dev(dev);
 	if (IS_ERR(idev)) {
 		NL_SET_ERR_MSG_MOD(extack, "IPv6 is disabled on this device");
@@ -3045,7 +3040,7 @@ static int inet6_addr_add(struct net *net, int ifindex,
 
 	if (cfg->ifa_flags & IFA_F_MCAUTOJOIN) {
 		int ret = ipv6_mc_config(net->ipv6.mc_autojoin_sk,
-					 true, cfg->pfx, ifindex);
+					 true, cfg->pfx, dev->ifindex);
 
 		if (ret < 0) {
 			NL_SET_ERR_MSG_MOD(extack, "Multicast auto join failed");
@@ -3100,7 +3095,7 @@ static int inet6_addr_add(struct net *net, int ifindex,
 		return 0;
 	} else if (cfg->ifa_flags & IFA_F_MCAUTOJOIN) {
 		ipv6_mc_config(net->ipv6.mc_autojoin_sk, false,
-			       cfg->pfx, ifindex);
+			       cfg->pfx, dev->ifindex);
 	}
 
 	return PTR_ERR(ifp);
@@ -3166,6 +3161,7 @@ int addrconf_add_ifaddr(struct net *net, void __user *arg)
 		.preferred_lft = INFINITY_LIFE_TIME,
 		.valid_lft = INFINITY_LIFE_TIME,
 	};
+	struct net_device *dev;
 	struct in6_ifreq ireq;
 	int err;
 
@@ -3179,7 +3175,11 @@ int addrconf_add_ifaddr(struct net *net, void __user *arg)
 	cfg.plen = ireq.ifr6_prefixlen;
 
 	rtnl_lock();
-	err = inet6_addr_add(net, ireq.ifr6_ifindex, &cfg, NULL);
+	dev = __dev_get_by_index(net, ireq.ifr6_ifindex);
+	if (dev)
+		err = inet6_addr_add(net, dev, &cfg, NULL);
+	else
+		err = -ENODEV;
 	rtnl_unlock();
 	return err;
 }
@@ -5064,7 +5064,7 @@ inet6_rtm_newaddr(struct sk_buff *skb, struct nlmsghdr *nlh,
 		 * It would be best to check for !NLM_F_CREATE here but
 		 * userspace already relies on not having to provide this.
 		 */
-		return inet6_addr_add(net, ifm->ifa_index, &cfg, extack);
+		return inet6_addr_add(net, dev, &cfg, extack);
 	}
 
 	if (nlh->nlmsg_flags & NLM_F_EXCL ||
