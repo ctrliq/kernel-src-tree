@@ -58,6 +58,8 @@ struct mem_cgroup_reclaim_cookie {
 	unsigned int generation;
 };
 
+#define MEM_CGROUP_RECLAIM_RETRIES	5
+
 #ifdef CONFIG_MEMCG
 
 #define MEM_CGROUP_ID_SHIFT	16
@@ -1137,6 +1139,15 @@ unsigned long mem_cgroup_soft_limit_reclaim(pg_data_t *pgdat, int order,
 						gfp_t gfp_mask,
 						unsigned long *total_scanned);
 
+static inline unsigned long offlined_memcg_nr_pages(void)
+{
+	extern atomic_t nr_offlined_memcgs;
+
+	return atomic_read(&nr_offlined_memcgs) * MEMCG_CHARGE_BATCH;
+}
+
+unsigned long scrape_offlined_memcgs(unsigned long nr_to_reclaim);
+
 #else /* CONFIG_MEMCG */
 
 #define MEM_CGROUP_ID_SHIFT	0
@@ -1545,6 +1556,17 @@ unsigned long mem_cgroup_soft_limit_reclaim(pg_data_t *pgdat, int order,
 {
 	return 0;
 }
+
+static inline unsigned long offlined_memcg_nr_pages(void)
+{
+	return 0;
+}
+
+static inline unsigned long scrape_offlined_memcgs(unsigned long nr_to_reclaim)
+{
+	return 0;
+}
+
 #endif /* CONFIG_MEMCG */
 
 static inline void __inc_lruvec_kmem_state(void *p, enum node_stat_item idx)

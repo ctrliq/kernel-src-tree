@@ -5350,6 +5350,8 @@ remove_id:
 	return -ENOMEM;
 }
 
+atomic_t nr_offlined_memcgs = ATOMIC_INIT(0);
+
 static void mem_cgroup_css_offline(struct cgroup_subsys_state *css)
 {
 	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
@@ -5377,6 +5379,8 @@ static void mem_cgroup_css_offline(struct cgroup_subsys_state *css)
 	drain_all_stock(memcg);
 
 	mem_cgroup_id_put(memcg);
+
+	atomic_inc(&nr_offlined_memcgs);
 }
 
 static void mem_cgroup_css_released(struct cgroup_subsys_state *css)
@@ -5384,6 +5388,8 @@ static void mem_cgroup_css_released(struct cgroup_subsys_state *css)
 	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
 
 	invalidate_reclaim_iterators(memcg);
+
+	atomic_dec(&nr_offlined_memcgs);
 }
 
 static void mem_cgroup_css_free(struct cgroup_subsys_state *css)
