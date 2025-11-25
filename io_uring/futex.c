@@ -148,6 +148,8 @@ int io_futex_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	    !futex_validate_input(iof->futex_flags, iof->futex_mask))
 		return -EINVAL;
 
+	/* Mark as inflight, so file exit cancelation will find it */
+	io_req_track_inflight(req);
 	return 0;
 }
 
@@ -193,6 +195,8 @@ int io_futexv_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 		return ret;
 	}
 
+	/* Mark as inflight, so file exit cancelation will find it */
+	io_req_track_inflight(req);
 	iof->futexv_owned = 0;
 	iof->futexv_unqueued = 0;
 	req->flags |= REQ_F_ASYNC_DATA;
@@ -273,7 +277,6 @@ int io_futex_wait(struct io_kiocb *req, unsigned int issue_flags)
 	struct io_futex *iof = io_kiocb_to_cmd(req, struct io_futex);
 	struct io_ring_ctx *ctx = req->ctx;
 	struct io_futex_data *ifd = NULL;
-	struct futex_hash_bucket *hb;
 	int ret;
 
 	if (!iof->futex_mask) {
@@ -296,12 +299,11 @@ int io_futex_wait(struct io_kiocb *req, unsigned int issue_flags)
 	ifd->req = req;
 
 	ret = futex_wait_setup(iof->uaddr, iof->futex_val, iof->futex_flags,
-			       &ifd->q, &hb);
+			       &ifd->q, NULL, NULL);
 	if (!ret) {
 		hlist_add_head(&req->hash_node, &ctx->futex_list);
 		io_ring_submit_unlock(ctx, issue_flags);
 
-		futex_queue(&ifd->q, hb);
 		return IOU_ISSUE_SKIP_COMPLETE;
 	}
 
