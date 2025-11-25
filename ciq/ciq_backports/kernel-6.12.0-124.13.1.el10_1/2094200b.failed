@@ -1,0 +1,378 @@
+ibmveth: Add multi buffers rx replenishment hcall support
+
+jira KERNEL-206
+Rebuild_History Non-Buildable kernel-6.12.0-124.13.1.el10_1
+commit-author Mingming Cao <mmc@linux.ibm.com>
+commit 2094200b5f77e6710f9594571889f64f31966de1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-124.13.1.el10_1/2094200b.failed
+
+This patch enables batched RX buffer replenishment in ibmveth by
+using the new firmware-supported h_add_logical_lan_buffers() hcall
+ to submit up to 8 RX buffers in a single call, instead of repeatedly
+calling the single-buffer h_add_logical_lan_buffer() hcall.
+
+During the probe, with the patch, the driver queries ILLAN attributes
+to detect IBMVETH_ILLAN_RX_MULTI_BUFF_SUPPORT bit. If the attribute is
+present, rx_buffers_per_hcall is set to 8, enabling batched replenishment.
+Otherwise, it defaults to 1, preserving the original upstream behavior
+ with no change in code flow for unsupported systems.
+
+The core rx replenish logic remains the same. But when batching
+is enabled, the driver aggregates up to 8 fully prepared descriptors
+into a single h_add_logical_lan_buffers() hypercall. If any allocation
+or DMA mapping fails while preparing a batch, only the successfully
+prepared buffers are submitted, and the remaining are deferred for
+the next replenish cycle.
+
+If at runtime the firmware stops accepting the batched hcall—e,g,
+after a Live Partition Migration (LPM) to a host that does not
+support h_add_logical_lan_buffers(), the hypercall returns H_FUNCTION.
+In that case, the driver transparently disables batching, resets
+rx_buffers_per_hcall to 1, and falls back to the single-buffer hcall
+in next future replenishments to take care of these and future buffers.
+
+Test were done on systems with firmware that both supports and
+does not support the new h_add_logical_lan_buffers hcall.
+
+On supported firmware, this reduces hypercall overhead significantly
+over multiple buffers. SAR measurements showed about a 15% improvement
+in packet processing rate under moderate RX load, with heavier traffic
+seeing gains more than 30%
+
+	Signed-off-by: Mingming Cao <mmc@linux.ibm.com>
+	Reviewed-by: Brian King <bjking1@linux.ibm.com>
+	Reviewed-by: Haren Myneni <haren@linux.ibm.com>
+	Reviewed-by: Dave Marquardt <davemarq@linux.ibm.com>
+	Reviewed-by: Simon Horman <horms@kernel.org>
+Link: https://patch.msgid.link/20250719091356.57252-1-mmc@linux.ibm.com
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+
+(cherry picked from commit 2094200b5f77e6710f9594571889f64f31966de1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/ibm/ibmveth.c
+#	drivers/net/ethernet/ibm/ibmveth.h
+diff --cc drivers/net/ethernet/ibm/ibmveth.c
+index 04192190beba,6f0821f1e798..000000000000
+--- a/drivers/net/ethernet/ibm/ibmveth.c
++++ b/drivers/net/ethernet/ibm/ibmveth.c
+@@@ -224,86 -227,156 +229,177 @@@ static void ibmveth_replenish_buffer_po
+  
+  	mb();
+  
+- 	for (i = 0; i < count; ++i) {
+- 		union ibmveth_buf_desc desc;
++ 	batch = adapter->rx_buffers_per_hcall;
+  
+- 		free_index = pool->consumer_index;
+- 		index = pool->free_map[free_index];
+- 		skb = NULL;
++ 	while (remaining > 0) {
++ 		unsigned int free_index = pool->consumer_index;
+  
+++<<<<<<< HEAD
+ +		BUG_ON(index == IBM_VETH_INVALID_MAP);
+++=======
++ 		/* Fill a batch of descriptors */
++ 		for (filled = 0; filled < min(remaining, batch); filled++) {
++ 			index = pool->free_map[free_index];
++ 			if (WARN_ON(index == IBM_VETH_INVALID_MAP)) {
++ 				adapter->replenish_add_buff_failure++;
++ 				netdev_info(adapter->netdev,
++ 					    "Invalid map index %u, reset\n",
++ 					    index);
++ 				schedule_work(&adapter->work);
++ 				break;
++ 			}
+  
+- 		/* are we allocating a new buffer or recycling an old one */
+- 		if (pool->skbuff[index])
+- 			goto reuse;
++ 			if (!pool->skbuff[index]) {
++ 				struct sk_buff *skb = NULL;
++ 
++ 				skb = netdev_alloc_skb(adapter->netdev,
++ 						       pool->buff_size);
++ 				if (!skb) {
++ 					adapter->replenish_no_mem++;
++ 					adapter->replenish_add_buff_failure++;
++ 					break;
++ 				}
++ 
++ 				dma_addr = dma_map_single(dev, skb->data,
++ 							  pool->buff_size,
++ 							  DMA_FROM_DEVICE);
++ 				if (dma_mapping_error(dev, dma_addr)) {
++ 					dev_kfree_skb_any(skb);
++ 					adapter->replenish_add_buff_failure++;
++ 					break;
++ 				}
++ 
++ 				pool->dma_addr[index] = dma_addr;
++ 				pool->skbuff[index] = skb;
++ 			} else {
++ 				/* re-use case */
++ 				dma_addr = pool->dma_addr[index];
++ 			}
+  
+- 		skb = netdev_alloc_skb(adapter->netdev, pool->buff_size);
++ 			if (rx_flush) {
++ 				unsigned int len;
+  
+- 		if (!skb) {
+- 			netdev_dbg(adapter->netdev,
+- 				   "replenish: unable to allocate skb\n");
+- 			adapter->replenish_no_mem++;
+- 			break;
++ 				len = adapter->netdev->mtu + IBMVETH_BUFF_OH;
++ 				len = min(pool->buff_size, len);
++ 				ibmveth_flush_buffer(pool->skbuff[index]->data,
++ 						     len);
++ 			}
++ 
++ 			descs[filled].fields.flags_len = IBMVETH_BUF_VALID |
++ 							  pool->buff_size;
++ 			descs[filled].fields.address = dma_addr;
++ 
++ 			correlators[filled] = ((u64)pool->index << 32) | index;
++ 			*(u64 *)pool->skbuff[index]->data = correlators[filled];
++ 
++ 			free_index++;
++ 			if (free_index >= pool->size)
++ 				free_index = 0;
+  		}
+++>>>>>>> 2094200b5f77 (ibmveth: Add multi buffers rx replenishment hcall support)
+  
+- 		dma_addr = dma_map_single(&adapter->vdev->dev, skb->data,
+- 				pool->buff_size, DMA_FROM_DEVICE);
++ 		if (!filled)
++ 			break;
+  
+- 		if (dma_mapping_error(&adapter->vdev->dev, dma_addr))
+- 			goto failure;
++ 		/* single buffer case*/
++ 		if (filled == 1)
++ 			lpar_rc = h_add_logical_lan_buffer(vdev->unit_address,
++ 							   descs[0].desc);
++ 		else
++ 			/* Multi-buffer hcall */
++ 			lpar_rc = h_add_logical_lan_buffers(vdev->unit_address,
++ 							    descs[0].desc,
++ 							    descs[1].desc,
++ 							    descs[2].desc,
++ 							    descs[3].desc,
++ 							    descs[4].desc,
++ 							    descs[5].desc,
++ 							    descs[6].desc,
++ 							    descs[7].desc);
++ 		if (lpar_rc != H_SUCCESS) {
++ 			dev_warn_ratelimited(dev,
++ 					     "RX h_add_logical_lan failed: filled=%u, rc=%lu, batch=%u\n",
++ 					     filled, lpar_rc, batch);
++ 			goto hcall_failure;
++ 		}
+  
+- 		pool->dma_addr[index] = dma_addr;
+- 		pool->skbuff[index] = skb;
++ 		/* Only update pool state after hcall succeeds */
++ 		for (i = 0; i < filled; i++) {
++ 			free_index = pool->consumer_index;
++ 			pool->free_map[free_index] = IBM_VETH_INVALID_MAP;
+  
+- 		if (rx_flush) {
+- 			unsigned int len = min(pool->buff_size,
+- 					       adapter->netdev->mtu +
+- 					       IBMVETH_BUFF_OH);
+- 			ibmveth_flush_buffer(skb->data, len);
++ 			pool->consumer_index++;
++ 			if (pool->consumer_index >= pool->size)
++ 				pool->consumer_index = 0;
+  		}
+- reuse:
+- 		dma_addr = pool->dma_addr[index];
+- 		desc.fields.flags_len = IBMVETH_BUF_VALID | pool->buff_size;
+- 		desc.fields.address = dma_addr;
+  
+- 		correlator = ((u64)pool->index << 32) | index;
+- 		*(u64 *)pool->skbuff[index]->data = correlator;
++ 		buffers_added += filled;
++ 		adapter->replenish_add_buff_success += filled;
++ 		remaining -= filled;
+  
+- 		lpar_rc = h_add_logical_lan_buffer(adapter->vdev->unit_address,
+- 						   desc.desc);
++ 		memset(&descs, 0, sizeof(descs));
++ 		memset(&correlators, 0, sizeof(correlators));
++ 		continue;
+  
+- 		if (lpar_rc != H_SUCCESS) {
+- 			netdev_warn(adapter->netdev,
+- 				    "%sadd_logical_lan failed %lu\n",
+- 				    skb ? "" : "When recycling: ", lpar_rc);
+- 			goto failure;
+- 		}
++ hcall_failure:
++ 		for (i = 0; i < filled; i++) {
++ 			index = correlators[i] & 0xffffffffUL;
++ 			dma_addr =  pool->dma_addr[index];
+  
+- 		pool->free_map[free_index] = IBM_VETH_INVALID_MAP;
+- 		pool->consumer_index++;
+- 		if (pool->consumer_index >= pool->size)
+- 			pool->consumer_index = 0;
++ 			if (pool->skbuff[index]) {
++ 				if (dma_addr &&
++ 				    !dma_mapping_error(dev, dma_addr))
++ 					dma_unmap_single(dev, dma_addr,
++ 							 pool->buff_size,
++ 							 DMA_FROM_DEVICE);
+  
+- 		buffers_added++;
+- 		adapter->replenish_add_buff_success++;
++ 				dev_kfree_skb_any(pool->skbuff[index]);
++ 				pool->skbuff[index] = NULL;
++ 			}
++ 		}
++ 		adapter->replenish_add_buff_failure += filled;
++ 
++ 		/*
++ 		 * If multi rx buffers hcall is no longer supported by FW
++ 		 * e.g. in the case of Live Parttion Migration
++ 		 */
++ 		if (batch > 1 && lpar_rc == H_FUNCTION) {
++ 			/*
++ 			 * Instead of retry submit single buffer individually
++ 			 * here just set the max rx buffer per hcall to 1
++ 			 * buffers will be respleshed next time
++ 			 * when ibmveth_replenish_buffer_pool() is called again
++ 			 * with single-buffer case
++ 			 */
++ 			netdev_info(adapter->netdev,
++ 				    "RX Multi buffers not supported by FW, rc=%lu\n",
++ 				    lpar_rc);
++ 			adapter->rx_buffers_per_hcall = 1;
++ 			netdev_info(adapter->netdev,
++ 				    "Next rx replesh will fall back to single-buffer hcall\n");
++ 		}
++ 		break;
+  	}
+  
+  	mb();
+  	atomic_add(buffers_added, &(pool->available));
+++<<<<<<< HEAD
+ +	return;
+ +
+ +failure:
+ +
+ +	if (dma_addr && !dma_mapping_error(&adapter->vdev->dev, dma_addr))
+ +		dma_unmap_single(&adapter->vdev->dev,
+ +		                 pool->dma_addr[index], pool->buff_size,
+ +		                 DMA_FROM_DEVICE);
+ +	dev_kfree_skb_any(pool->skbuff[index]);
+ +	pool->skbuff[index] = NULL;
+ +	adapter->replenish_add_buff_failure++;
+ +
+ +	mb();
+ +	atomic_add(buffers_added, &(pool->available));
+++=======
+++>>>>>>> 2094200b5f77 (ibmveth: Add multi buffers rx replenishment hcall support)
+  }
+  
+  /*
+diff --cc drivers/net/ethernet/ibm/ibmveth.h
+index 8468e2c59d7a,068f99df133e..000000000000
+--- a/drivers/net/ethernet/ibm/ibmveth.h
++++ b/drivers/net/ethernet/ibm/ibmveth.h
+@@@ -134,38 -154,40 +154,59 @@@ struct ibmveth_rx_q 
+  };
+  
+  struct ibmveth_adapter {
+++<<<<<<< HEAD
+ +    struct vio_dev *vdev;
+ +    struct net_device *netdev;
+ +    struct napi_struct napi;
+ +    unsigned int mcastFilterSize;
+ +    void * buffer_list_addr;
+ +    void * filter_list_addr;
+ +    void *tx_ltb_ptr[IBMVETH_MAX_QUEUES];
+ +    unsigned int tx_ltb_size;
+ +    dma_addr_t tx_ltb_dma[IBMVETH_MAX_QUEUES];
+ +    dma_addr_t buffer_list_dma;
+ +    dma_addr_t filter_list_dma;
+ +    struct ibmveth_buff_pool rx_buff_pool[IBMVETH_NUM_BUFF_POOLS];
+ +    struct ibmveth_rx_q rx_queue;
+ +    int rx_csum;
+ +    int large_send;
+ +    bool is_active_trunk;
+++=======
++ 	struct vio_dev *vdev;
++ 	struct net_device *netdev;
++ 	struct napi_struct napi;
++ 	struct work_struct work;
++ 	unsigned int mcastFilterSize;
++ 	void *buffer_list_addr;
++ 	void *filter_list_addr;
++ 	void *tx_ltb_ptr[IBMVETH_MAX_QUEUES];
++ 	unsigned int tx_ltb_size;
++ 	dma_addr_t tx_ltb_dma[IBMVETH_MAX_QUEUES];
++ 	dma_addr_t buffer_list_dma;
++ 	dma_addr_t filter_list_dma;
++ 	struct ibmveth_buff_pool rx_buff_pool[IBMVETH_NUM_BUFF_POOLS];
++ 	struct ibmveth_rx_q rx_queue;
++ 	int rx_csum;
++ 	int large_send;
++ 	bool is_active_trunk;
++ 	unsigned int rx_buffers_per_hcall;
+ -
+ -	u64 fw_ipv6_csum_support;
+ -	u64 fw_ipv4_csum_support;
+ -	u64 fw_large_send_support;
+ -	/* adapter specific stats */
+ -	u64 replenish_task_cycles;
+ -	u64 replenish_no_mem;
+ -	u64 replenish_add_buff_failure;
+ -	u64 replenish_add_buff_success;
+ -	u64 rx_invalid_buffer;
+ -	u64 rx_no_buffer;
+ -	u64 tx_map_failed;
+ -	u64 tx_send_failed;
+ -	u64 tx_large_packets;
+ -	u64 rx_large_packets;
+ -	/* Ethtool settings */
+++>>>>>>> 2094200b5f77 (ibmveth: Add multi buffers rx replenishment hcall support)
+ +
+ +    u64 fw_ipv6_csum_support;
+ +    u64 fw_ipv4_csum_support;
+ +    u64 fw_large_send_support;
+ +    /* adapter specific stats */
+ +    u64 replenish_task_cycles;
+ +    u64 replenish_no_mem;
+ +    u64 replenish_add_buff_failure;
+ +    u64 replenish_add_buff_success;
+ +    u64 rx_invalid_buffer;
+ +    u64 rx_no_buffer;
+ +    u64 tx_map_failed;
+ +    u64 tx_send_failed;
+ +    u64 tx_large_packets;
+ +    u64 rx_large_packets;
+ +    /* Ethtool settings */
+  	u8 duplex;
+  	u32 speed;
+  };
+diff --git a/arch/powerpc/include/asm/hvcall.h b/arch/powerpc/include/asm/hvcall.h
+index 7a8495660c2f..296a534b2f0d 100644
+--- a/arch/powerpc/include/asm/hvcall.h
++++ b/arch/powerpc/include/asm/hvcall.h
+@@ -270,6 +270,7 @@
+ #define H_QUERY_INT_STATE       0x1E4
+ #define H_POLL_PENDING		0x1D8
+ #define H_ILLAN_ATTRIBUTES	0x244
++#define H_ADD_LOGICAL_LAN_BUFFERS 0x248
+ #define H_MODIFY_HEA_QP		0x250
+ #define H_QUERY_HEA_QP		0x254
+ #define H_QUERY_HEA		0x258
+* Unmerged path drivers/net/ethernet/ibm/ibmveth.c
+* Unmerged path drivers/net/ethernet/ibm/ibmveth.h
