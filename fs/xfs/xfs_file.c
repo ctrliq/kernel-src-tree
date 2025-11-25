@@ -790,7 +790,8 @@ write_retry:
 
 	trace_xfs_file_buffered_write(iocb, from);
 	ret = iomap_file_buffered_write(iocb, from,
-			&xfs_buffered_write_iomap_ops, NULL);
+			&xfs_buffered_write_iomap_ops, &xfs_iomap_write_ops,
+			NULL);
 
 	/*
 	 * If we hit a space limit, try to free up some lingering preallocated
@@ -1460,7 +1461,8 @@ xfs_write_fault(
 	if (IS_DAX(inode))
 		ret = xfs_dax_fault_locked(vmf, order, true);
 	else
-		ret = iomap_page_mkwrite(vmf, &xfs_page_mkwrite_iomap_ops);
+		ret = iomap_page_mkwrite(vmf, &xfs_page_mkwrite_iomap_ops,
+				NULL);
 	xfs_iunlock(ip, lock_mode);
 
 	sb_end_pagefault(inode->i_sb);
