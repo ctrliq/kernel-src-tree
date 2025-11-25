@@ -6,7 +6,8 @@
 	(defined(RSEQ_TEMPLATE_CPU_ID) || defined(RSEQ_TEMPLATE_MM_CID))
 
 static inline __always_inline
-int RSEQ_TEMPLATE_IDENTIFIER(rseq_cmpeqv_storev)(intptr_t *v, intptr_t expect, intptr_t newv, int cpu)
+int RSEQ_TEMPLATE_IDENTIFIER(rseq_cmpeqv_storev)(intptr_t *v, intptr_t expect, intptr_t newv,
+				int cpu)
 {
 	RSEQ_INJECT_C(9)
 
@@ -25,7 +26,7 @@ int RSEQ_TEMPLATE_IDENTIFIER(rseq_cmpeqv_storev)(intptr_t *v, intptr_t expect, i
 				  RSEQ_ASM_CMP_CPU_ID(cpu_id, current_cpu_id, "%l[error1]")
 				  RSEQ_ASM_OP_CMPEQ(v, expect, "%l[error2]")
 #endif
-				  RSEQ_ASM_OP_FINAL_STORE(newv, v, 3)
+				  RSEQ_ASM_OP_FINAL_STORE(v, newv, 3)
 				  RSEQ_INJECT_ASM(5)
 				  RSEQ_ASM_DEFINE_ABORT(4, abort)
 				  : /* gcc asm goto does not allow outputs */
@@ -92,7 +93,7 @@ int RSEQ_TEMPLATE_IDENTIFIER(rseq_cmpnev_storeoffp_load)(intptr_t *v, intptr_t e
 				    [v]			"m" (*v),
 				    [expectnot]		"r" (expectnot),
 				    [load]		"m" (*load),
-				    [voffp]		"r" (voffp)
+				    [voffp]		"Ir" (voffp)
 				    RSEQ_INJECT_INPUT
 				  : "memory", RSEQ_ASM_TMP_REG_1
 				    RSEQ_INJECT_CLOBBER
@@ -185,7 +186,7 @@ int RSEQ_TEMPLATE_IDENTIFIER(rseq_cmpeqv_cmpeqv_storev)(intptr_t *v, intptr_t ex
 				  RSEQ_ASM_OP_CMPEQ(v, expect, "%l[error2]")
 				  RSEQ_ASM_OP_CMPEQ(v2, expect2, "%l[error3]")
 #endif
-				  RSEQ_ASM_OP_FINAL_STORE(newv, v, 3)
+				  RSEQ_ASM_OP_FINAL_STORE(v, newv, 3)
 				  RSEQ_INJECT_ASM(6)
 				  RSEQ_ASM_DEFINE_ABORT(4, abort)
 				  : /* gcc asm goto does not allow outputs */
@@ -194,7 +195,7 @@ int RSEQ_TEMPLATE_IDENTIFIER(rseq_cmpeqv_cmpeqv_storev)(intptr_t *v, intptr_t ex
 				    [rseq_cs]		"m" (rseq_get_abi()->rseq_cs.arch.ptr),
 				    [v]			"m" (*v),
 				    [expect]		"r" (expect),
-				    [v2]			"m" (*v2),
+				    [v2]		"m" (*v2),
 				    [expect2]		"r" (expect2),
 				    [newv]		"r" (newv)
 				    RSEQ_INJECT_INPUT
@@ -229,7 +230,8 @@ error3:
  *  *pval += inc;
  */
 static inline __always_inline
-int RSEQ_TEMPLATE_IDENTIFIER(rseq_offset_deref_addv)(intptr_t *ptr, off_t off, intptr_t inc, int cpu)
+int RSEQ_TEMPLATE_IDENTIFIER(rseq_offset_deref_addv)(intptr_t *ptr, off_t off, intptr_t inc,
+				int cpu)
 {
 	RSEQ_INJECT_C(9)
 
@@ -247,12 +249,12 @@ int RSEQ_TEMPLATE_IDENTIFIER(rseq_offset_deref_addv)(intptr_t *ptr, off_t off, i
 				  RSEQ_INJECT_ASM(4)
 				  RSEQ_ASM_DEFINE_ABORT(4, abort)
 				  : /* gcc asm goto does not allow outputs */
-				  : [cpu_id]			"r" (cpu),
-				    [current_cpu_id]		"m" (rseq_get_abi()->RSEQ_TEMPLATE_CPU_ID_FIELD),
-				    [rseq_cs]			"m" (rseq_get_abi()->rseq_cs.arch.ptr),
-				    [ptr]			"r" (ptr),
-				    [off]			"r" (off),
-				    [inc]			"r" (inc)
+				  : [cpu_id]		"r" (cpu),
+				    [current_cpu_id]	"m" (rseq_get_abi()->RSEQ_TEMPLATE_CPU_ID_FIELD),
+				    [rseq_cs]		"m" (rseq_get_abi()->rseq_cs.arch.ptr),
+				    [ptr]		"r" (ptr),
+				    [off]		"r" (off),
+				    [inc]		"r" (inc)
 				    RSEQ_INJECT_INPUT
 				  : "memory", RSEQ_ASM_TMP_REG_1
 				    RSEQ_INJECT_CLOBBER
@@ -299,24 +301,24 @@ int RSEQ_TEMPLATE_IDENTIFIER(rseq_cmpeqv_trystorev_storev)(intptr_t *v, intptr_t
 				  RSEQ_ASM_CMP_CPU_ID(cpu_id, current_cpu_id, "%l[error1]")
 				  RSEQ_ASM_OP_CMPEQ(v, expect, "%l[error2]")
 #endif
-				  RSEQ_ASM_OP_STORE(newv2, v2)
+				  RSEQ_ASM_OP_STORE(v2, newv2)
 				  RSEQ_INJECT_ASM(5)
 #ifdef RSEQ_TEMPLATE_MO_RELEASE
-				  RSEQ_ASM_OP_FINAL_STORE_RELEASE(newv, v, 3)
+				  RSEQ_ASM_OP_FINAL_STORE_RELEASE(v, newv, 3)
 #else
-				  RSEQ_ASM_OP_FINAL_STORE(newv, v, 3)
+				  RSEQ_ASM_OP_FINAL_STORE(v, newv, 3)
 #endif
 				  RSEQ_INJECT_ASM(6)
 				  RSEQ_ASM_DEFINE_ABORT(4, abort)
 				  : /* gcc asm goto does not allow outputs */
-				  : [cpu_id]			"r" (cpu),
-				    [current_cpu_id]		"m" (rseq_get_abi()->RSEQ_TEMPLATE_CPU_ID_FIELD),
-				    [rseq_cs]			"m" (rseq_get_abi()->rseq_cs.arch.ptr),
-				    [expect]			"r" (expect),
-				    [v]				"m" (*v),
-				    [newv]			"r" (newv),
-				    [v2]			"m" (*v2),
-				    [newv2]			"r" (newv2)
+				  : [cpu_id]		"r" (cpu),
+				    [current_cpu_id]	"m" (rseq_get_abi()->RSEQ_TEMPLATE_CPU_ID_FIELD),
+				    [rseq_cs]		"m" (rseq_get_abi()->rseq_cs.arch.ptr),
+				    [expect]		"r" (expect),
+				    [v]			"m" (*v),
+				    [newv]		"r" (newv),
+				    [v2]		"m" (*v2),
+				    [newv2]		"r" (newv2)
 				    RSEQ_INJECT_INPUT
 				  : "memory", RSEQ_ASM_TMP_REG_1
 				    RSEQ_INJECT_CLOBBER
@@ -364,22 +366,22 @@ int RSEQ_TEMPLATE_IDENTIFIER(rseq_cmpeqv_trymemcpy_storev)(intptr_t *v, intptr_t
 				  RSEQ_ASM_OP_R_BAD_MEMCPY(dst, src, len)
 				  RSEQ_INJECT_ASM(5)
 #ifdef RSEQ_TEMPLATE_MO_RELEASE
-				  RSEQ_ASM_OP_FINAL_STORE_RELEASE(newv, v, 3)
+				  RSEQ_ASM_OP_FINAL_STORE_RELEASE(v, newv, 3)
 #else
-				  RSEQ_ASM_OP_FINAL_STORE(newv, v, 3)
+				  RSEQ_ASM_OP_FINAL_STORE(v, newv, 3)
 #endif
 				  RSEQ_INJECT_ASM(6)
 				  RSEQ_ASM_DEFINE_ABORT(4, abort)
 				  : /* gcc asm goto does not allow outputs */
-				  : [cpu_id]			"r" (cpu),
-				    [current_cpu_id]		"m" (rseq_get_abi()->RSEQ_TEMPLATE_CPU_ID_FIELD),
-				    [rseq_cs]			"m" (rseq_get_abi()->rseq_cs.arch.ptr),
-				    [expect]			"r" (expect),
-				    [v]				"m" (*v),
-				    [newv]			"r" (newv),
-				    [dst]			"r" (dst),
-				    [src]			"r" (src),
-				    [len]			"r" (len)
+				  : [cpu_id]		"r" (cpu),
+				    [current_cpu_id]	"m" (rseq_get_abi()->RSEQ_TEMPLATE_CPU_ID_FIELD),
+				    [rseq_cs]		"m" (rseq_get_abi()->rseq_cs.arch.ptr),
+				    [expect]		"r" (expect),
+				    [v]			"m" (*v),
+				    [newv]		"r" (newv),
+				    [dst]		"r" (dst),
+				    [src]		"r" (src),
+				    [len]		"r" (len)
 				    RSEQ_INJECT_INPUT
 				  : "memory", RSEQ_ASM_TMP_REG_1, RSEQ_ASM_TMP_REG_2,
 				    RSEQ_ASM_TMP_REG_3, RSEQ_ASM_TMP_REG_4
