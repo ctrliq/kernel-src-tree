@@ -2829,7 +2829,7 @@ static int do_setlink(const struct sk_buff *skb,
 
 	err = validate_linkmsg(dev, tb, extack);
 	if (err < 0)
-		goto errout;
+		return err;
 
 	if (tb[IFLA_IFNAME])
 		nla_strscpy(ifname, tb[IFLA_IFNAME], IFNAMSIZ);
@@ -2845,7 +2845,7 @@ static int do_setlink(const struct sk_buff *skb,
 						tb, CAP_NET_ADMIN);
 		if (IS_ERR(net)) {
 			err = PTR_ERR(net);
-			goto errout;
+			return err;
 		}
 
 		if (tb[IFLA_NEW_IFINDEX])
@@ -2856,7 +2856,7 @@ static int do_setlink(const struct sk_buff *skb,
 		err = __dev_change_net_namespace(dev, net, pat, new_ifindex);
 		put_net(net);
 		if (err)
-			goto errout;
+			return err;
 		status |= DO_SETLINK_MODIFIED;
 	}
 
