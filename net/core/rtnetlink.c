@@ -2827,8 +2827,6 @@ static int do_setlink(const struct sk_buff *skb,
 	char ifname[IFNAMSIZ];
 	int err;
 
-	netdev_lock_ops(dev);
-
 	err = validate_linkmsg(dev, tb, extack);
 	if (err < 0)
 		goto errout;
@@ -2855,12 +2853,14 @@ static int do_setlink(const struct sk_buff *skb,
 		else
 			new_ifindex = 0;
 
-		err = netif_change_net_namespace(dev, net, pat, new_ifindex);
+		err = __dev_change_net_namespace(dev, net, pat, new_ifindex);
 		put_net(net);
 		if (err)
 			goto errout;
 		status |= DO_SETLINK_MODIFIED;
 	}
+
+	netdev_lock_ops(dev);
 
 	if (tb[IFLA_MAP]) {
 		struct rtnl_link_ifmap *u_map;
