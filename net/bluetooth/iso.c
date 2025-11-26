@@ -1671,6 +1671,17 @@ static int iso_sock_setsockopt(struct socket *sock, int level, int optname,
 			clear_bit(BT_SK_PKT_STATUS, &bt_sk(sk)->flags);
 		break;
 
+	case BT_PKT_SEQNUM:
+		err = copy_safe_from_sockptr(&opt, sizeof(opt), optval, optlen);
+		if (err)
+			break;
+
+		if (opt)
+			set_bit(BT_SK_PKT_SEQNUM, &bt_sk(sk)->flags);
+		else
+			clear_bit(BT_SK_PKT_SEQNUM, &bt_sk(sk)->flags);
+		break;
+
 	case BT_ISO_QOS:
 		if (sk->sk_state != BT_OPEN && sk->sk_state != BT_BOUND &&
 		    sk->sk_state != BT_CONNECT2 &&
@@ -1875,7 +1886,7 @@ static void iso_sock_ready(struct sock *sk)
 
 static bool iso_match_big(struct sock *sk, void *data)
 {
-	struct hci_evt_le_big_sync_estabilished *ev = data;
+	struct hci_evt_le_big_sync_established *ev = data;
 
 	return ev->handle == iso_pi(sk)->qos.bcast.big;
 }
@@ -1896,7 +1907,7 @@ static void iso_conn_ready(struct iso_conn *conn)
 {
 	struct sock *parent = NULL;
 	struct sock *sk = conn->sk;
-	struct hci_ev_le_big_sync_estabilished *ev = NULL;
+	struct hci_ev_le_big_sync_established *ev = NULL;
 	struct hci_ev_le_pa_sync_established *ev2 = NULL;
 	struct hci_ev_le_per_adv_report *ev3 = NULL;
 	struct hci_conn *hcon;
@@ -2007,7 +2018,7 @@ static void iso_conn_ready(struct iso_conn *conn)
 		hci_conn_hold(hcon);
 		iso_chan_add(conn, sk, parent);
 
-		if ((ev && ((struct hci_evt_le_big_sync_estabilished *)ev)->status) ||
+		if ((ev && ((struct hci_evt_le_big_sync_established *)ev)->status) ||
 		    (ev2 && ev2->status)) {
 			/* Trigger error signal on child socket */
 			sk->sk_err = ECONNREFUSED;
@@ -2066,7 +2077,7 @@ int iso_connect_ind(struct hci_dev *hdev, bdaddr_t *bdaddr, __u8 *flags)
 	 * proceed to establishing a BIG sync:
 	 *
 	 * 1. HCI_EV_LE_PA_SYNC_ESTABLISHED: The socket may specify a specific
-	 * SID to listen to and once sync is estabilished its handle needs to
+	 * SID to listen to and once sync is established its handle needs to
 	 * be stored in iso_pi(sk)->sync_handle so it can be matched once
 	 * receiving the BIG Info.
 	 * 2. HCI_EVT_LE_BIG_INFO_ADV_REPORT: When connect_ind is triggered by a
@@ -2264,7 +2275,7 @@ static void iso_disconn_cfm(struct hci_conn *hcon, __u8 reason)
 void iso_recv(struct hci_conn *hcon, struct sk_buff *skb, u16 flags)
 {
 	struct iso_conn *conn = hcon->iso_data;
-	__u16 pb, ts, len;
+	__u16 pb, ts, len, sn;
 
 	if (!conn)
 		goto drop;
@@ -2294,6 +2305,7 @@ void iso_recv(struct hci_conn *hcon, struct sk_buff *skb, u16 flags)
 				goto drop;
 			}
 
+			sn = __le16_to_cpu(hdr->sn);
 			len = __le16_to_cpu(hdr->slen);
 		} else {
 			struct hci_iso_data_hdr *hdr;
@@ -2304,18 +2316,20 @@ void iso_recv(struct hci_conn *hcon, struct sk_buff *skb, u16 flags)
 				goto drop;
 			}
 
+			sn = __le16_to_cpu(hdr->sn);
 			len = __le16_to_cpu(hdr->slen);
 		}
 
 		flags  = hci_iso_data_flags(len);
 		len    = hci_iso_data_len(len);
 
-		BT_DBG("Start: total len %d, frag len %d flags 0x%4.4x", len,
-		       skb->len, flags);
+		BT_DBG("Start: total len %d, frag len %d flags 0x%4.4x sn %d",
+		       len, skb->len, flags, sn);
 
 		if (len == skb->len) {
 			/* Complete frame received */
 			hci_skb_pkt_status(skb) = flags & 0x03;
+			hci_skb_pkt_seqnum(skb) = sn;
 			iso_recv_frame(conn, skb);
 			return;
 		}
@@ -2338,6 +2352,7 @@ void iso_recv(struct hci_conn *hcon, struct sk_buff *skb, u16 flags)
 			goto drop;
 
 		hci_skb_pkt_status(conn->rx_skb) = flags & 0x03;
+		hci_skb_pkt_seqnum(conn->rx_skb) = sn;
 		skb_copy_from_linear_data(skb, skb_put(conn->rx_skb, skb->len),
 					  skb->len);
 		conn->rx_len = len - skb->len;
@@ -2441,11 +2456,11 @@ static const struct net_proto_family iso_sock_family_ops = {
 	.create	= iso_sock_create,
 };
 
-static bool iso_inited;
+static bool inited;
 
-bool iso_enabled(void)
+bool iso_inited(void)
 {
-	return iso_inited;
+	return inited;
 }
 
 int iso_init(void)
@@ -2454,7 +2469,7 @@ int iso_init(void)
 
 	BUILD_BUG_ON(sizeof(struct sockaddr_iso) > sizeof(struct sockaddr));
 
-	if (iso_inited)
+	if (inited)
 		return -EALREADY;
 
 	err = proto_register(&iso_proto, 0);
@@ -2482,7 +2497,7 @@ int iso_init(void)
 		iso_debugfs = debugfs_create_file("iso", 0444, bt_debugfs,
 						  NULL, &iso_debugfs_fops);
 
-	iso_inited = true;
+	inited = true;
 
 	return 0;
 
@@ -2493,7 +2508,7 @@ error:
 
 int iso_exit(void)
 {
-	if (!iso_inited)
+	if (!inited)
 		return -EALREADY;
 
 	bt_procfs_cleanup(&init_net, "iso");
@@ -2507,7 +2522,7 @@ int iso_exit(void)
 
 	proto_unregister(&iso_proto);
 
-	iso_inited = false;
+	inited = false;
 
 	return 0;
 }
