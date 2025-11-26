@@ -10,6 +10,8 @@
 #include <linux/writeback.h>
 #include <linux/sysctl.h>
 #include <linux/gfp.h>
+#include <linux/memcontrol.h>
+#include <linux/backing-dev.h>
 #include "internal.h"
 
 /* A global variable is a bit ugly, but it keeps the code simple */
@@ -65,6 +67,24 @@ int drop_caches_sysctl_handler(struct ctl_table *table, int write,
 		if (sysctl_drop_caches & 2) {
 			drop_slab();
 			count_vm_event(DROP_SLAB);
+		}
+		if (sysctl_drop_caches & 8) {
+			int nr_retries = MEM_CGROUP_RECLAIM_RETRIES;
+			unsigned long target = offlined_memcg_nr_pages();
+
+			while (nr_retries) {
+				unsigned long progress = scrape_offlined_memcgs(target);
+
+				if (progress >= target)
+					break;
+
+				if (!progress) {
+					congestion_wait(BLK_RW_ASYNC, HZ / 10);
+					nr_retries--;
+				}
+
+				target -= progress;
+			}
 		}
 		if (!stfu) {
 			pr_info("%s (%d): drop_caches: %d\n",
