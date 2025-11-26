@@ -16600,6 +16600,7 @@ static void bnxt_shutdown(struct pci_dev *pdev)
 	if (!dev)
 		return;
 
+	rtnl_lock();
 	netdev_lock(dev);
 	bp = netdev_priv(dev);
 	if (!bp)
@@ -16619,6 +16620,7 @@ static void bnxt_shutdown(struct pci_dev *pdev)
 
 shutdown_exit:
 	netdev_unlock(dev);
+	rtnl_unlock();
 }
 
 #ifdef CONFIG_PM_SLEEP
