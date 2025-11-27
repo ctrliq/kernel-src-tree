@@ -9451,6 +9451,8 @@ int netif_set_mtu_ext(struct net_device *dev, int new_mtu,
 {
 	int err, orig_mtu;
 
+	netdev_ops_assert_locked(dev);
+
 	if (new_mtu == dev->mtu)
 		return 0;
 
