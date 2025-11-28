@@ -2,6 +2,7 @@
 
 #include <linux/netdevice.h>
 #include <net/netdev_queues.h>
+#include <net/netdev_lock.h>
 #include <net/netdev_rx_queue.h>
 
 #include "page_pool_priv.h"
@@ -18,7 +19,7 @@ int netdev_rx_queue_restart(struct net_device *dev, unsigned int rxq_idx)
 	    !dev->queue_mgmt_ops->ndo_queue_start)
 		return -EOPNOTSUPP;
 
-	ASSERT_RTNL();
+	netdev_assert_locked(dev);
 
 	new_mem = kvzalloc(dev->queue_mgmt_ops->ndo_queue_mem_size, GFP_KERNEL);
 	if (!new_mem)
@@ -29,8 +30,6 @@ int netdev_rx_queue_restart(struct net_device *dev, unsigned int rxq_idx)
 		err = -ENOMEM;
 		goto err_free_new_mem;
 	}
-
-	netdev_lock(dev);
 
 	err = dev->queue_mgmt_ops->ndo_queue_mem_alloc(dev, new_mem, rxq_idx);
 	if (err)
@@ -49,8 +48,6 @@ int netdev_rx_queue_restart(struct net_device *dev, unsigned int rxq_idx)
 		goto err_start_queue;
 
 	dev->queue_mgmt_ops->ndo_queue_mem_free(dev, old_mem);
-
-	netdev_unlock(dev);
 
 	kvfree(old_mem);
 	kvfree(new_mem);
@@ -76,7 +73,6 @@ err_free_new_queue_mem:
 	dev->queue_mgmt_ops->ndo_queue_mem_free(dev, new_mem);
 
 err_free_old_mem:
-	netdev_unlock(dev);
 	kvfree(old_mem);
 
 err_free_new_mem:

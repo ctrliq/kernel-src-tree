@@ -24,7 +24,6 @@
 
 /* Device memory support */
 
-/* Protected by rtnl_lock() */
 static DEFINE_XARRAY_FLAGS(net_devmem_dmabuf_bindings, XA_FLAGS_ALLOC1);
 
 static void net_devmem_dmabuf_free_chunk_owner(struct gen_pool *genpool,
@@ -118,9 +117,10 @@ void net_devmem_unbind_dmabuf(struct net_devmem_dmabuf_binding *binding)
 
 		rxq->mp_params.mp_priv = NULL;
 
+		netdev_lock(binding->dev);
 		rxq_idx = get_netdev_rx_queue_index(rxq);
-
 		WARN_ON(netdev_rx_queue_restart(binding->dev, rxq_idx));
+		netdev_unlock(binding->dev);
 	}
 
 	xa_erase(&net_devmem_dmabuf_bindings, binding->id);
