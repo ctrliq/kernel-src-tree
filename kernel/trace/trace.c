@@ -881,7 +881,6 @@ int tracing_is_enabled(void)
 	 * return the mirror variable of the state of the ring buffer.
 	 * It's a little racy, but we don't really care.
 	 */
-	smp_rmb();
 	return !global_trace.buffer_disabled;
 }
 
@@ -1052,8 +1051,6 @@ void tracer_tracing_on(struct trace_array *tr)
 	 * important to be fast than accurate.
 	 */
 	tr->buffer_disabled = 0;
-	/* Make the flag seen by readers */
-	smp_wmb();
 }
 
 /**
@@ -1585,8 +1582,6 @@ void tracer_tracing_off(struct trace_array *tr)
 	 * important to be fast than accurate.
 	 */
 	tr->buffer_disabled = 1;
-	/* Make the flag seen by readers */
-	smp_wmb();
 }
 
 /**
@@ -2621,8 +2616,6 @@ void trace_buffered_event_enable(void)
 
 static void enable_trace_buffered_event(void *data)
 {
-	/* Probably not needed, but do it anyway */
-	smp_rmb();
 	this_cpu_dec(trace_buffered_event_cnt);
 }
 
