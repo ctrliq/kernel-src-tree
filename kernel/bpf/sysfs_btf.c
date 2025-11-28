@@ -15,15 +15,6 @@
 extern char __start_BTF[];
 extern char __stop_BTF[];
 
-static ssize_t
-btf_vmlinux_read(struct file *file, struct kobject *kobj,
-		 struct bin_attribute *bin_attr,
-		 char *buf, loff_t off, size_t len)
-{
-	memcpy(buf, __start_BTF + off, len);
-	return len;
-}
-
 static int btf_sysfs_vmlinux_mmap(struct file *filp, struct kobject *kobj,
 				  const struct bin_attribute *attr,
 				  struct vm_area_struct *vma)
@@ -52,10 +43,9 @@ static int btf_sysfs_vmlinux_mmap(struct file *filp, struct kobject *kobj,
 	return remap_pfn_range(vma, vma->vm_start, pfn, vm_size, vma->vm_page_prot);
 }
 
-
 static struct bin_attribute bin_attr_btf_vmlinux __ro_after_init = {
 	.attr = { .name = "vmlinux", .mode = 0444, },
-	.read = btf_vmlinux_read,
+	.read_new = sysfs_bin_attr_simple_read,
 	.mmap = btf_sysfs_vmlinux_mmap,
 };
 
