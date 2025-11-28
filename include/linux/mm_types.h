@@ -32,6 +32,7 @@
 #define INIT_PASID	0
 
 struct address_space;
+struct futex_private_hash;
 struct mem_cgroup;
 
 /*
@@ -617,6 +618,9 @@ struct vma_numab_state {
  * per VM-area/task. A VM area is any part of the process virtual memory
  * space that has a special rule for the page-fault handlers (ie a shared
  * library, the executable area etc).
+ *
+ * Only explicitly marked struct members may be accessed by RCU readers before
+ * getting a stable reference.
  */
 struct vm_area_struct {
 	/* The first cache line has the info for VMA tree walking. */
@@ -632,7 +636,11 @@ struct vm_area_struct {
 #endif
 	};
 
-	struct mm_struct *vm_mm;	/* The address space we belong to. */
+	/*
+	 * The address space we belong to.
+	 * Unstable RCU readers are allowed to read this.
+	 */
+	struct mm_struct *vm_mm;
 	pgprot_t vm_page_prot;          /* Access permissions of this VMA. */
 
 	/*
@@ -645,6 +653,12 @@ struct vm_area_struct {
 	};
 
 #ifdef CONFIG_PER_VMA_LOCK
+	/*
+	 * Flag to indicate areas detached from the mm->mm_mt tree.
+	 * Unstable RCU readers are allowed to read this.
+	 */
+	bool detached;
+
 	/*
 	 * Can only be written (using WRITE_ONCE()) while holding both:
 	 *  - mmap_lock (in write mode)
@@ -659,11 +673,9 @@ struct vm_area_struct {
 	 * counter reuse can only lead to occasional unnecessary use of the
 	 * slowpath.
 	 */
-	int vm_lock_seq;
+	unsigned int vm_lock_seq;
+	/* Unstable RCU readers are allowed to read this. */
 	struct vma_lock *vm_lock;
-
-	/* Flag to indicate areas detached from the mm->mm_mt tree */
-	bool detached;
 #endif
 
 	/*
@@ -808,6 +820,9 @@ struct mm_struct {
 		 * Roughly speaking, incrementing the sequence number is
 		 * equivalent to releasing locks on VMAs; reading the sequence
 		 * number can be part of taking a read lock on a VMA.
+		 * Incremented every time mmap_lock is write-locked/unlocked.
+		 * Initialized to 0, therefore odd values indicate mmap_lock
+		 * is write-locked and even values that it's released.
 		 *
 		 * Can be modified under write mmap_lock using RELEASE
 		 * semantics.
@@ -816,9 +831,18 @@ struct mm_struct {
 		 * Can be read with ACQUIRE semantics if not holding write
 		 * mmap_lock.
 		 */
-		int mm_lock_seq;
+		seqcount_t mm_lock_seq;
 #endif
-
+#ifdef CONFIG_FUTEX_PRIVATE_HASH
+		struct mutex			futex_hash_lock;
+		struct futex_private_hash	__rcu *futex_phash;
+		struct futex_private_hash	*futex_phash_new;
+		/* futex-ref */
+		unsigned long			futex_batches;
+		struct rcu_head			futex_rcu;
+		atomic_long_t			futex_atomic;
+		unsigned int			__percpu *futex_ref;
+#endif
 
 		unsigned long hiwater_rss; /* High-watermark of RSS usage */
 		unsigned long hiwater_vm;  /* High-water virtual memory usage */
