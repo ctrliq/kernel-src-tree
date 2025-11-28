@@ -136,6 +136,13 @@ void kvm_arm_vcpu_init_debug(struct kvm_vcpu *vcpu)
 	preempt_enable();
 }
 
+void kvm_debug_init_vhe(void)
+{
+	/* Clear PMSCR_EL1.E{0,1}SPE which reset to UNKNOWN values. */
+	if (SYS_FIELD_GET(ID_AA64DFR0_EL1, PMSVer, read_sysreg(id_aa64dfr0_el1)))
+		write_sysreg_el1(0, SYS_PMSCR);
+}
+
 /**
  * kvm_arm_reset_debug_ptr - reset the debug ptr to point to the vcpu state
  * @vcpu:	the vcpu pointer
