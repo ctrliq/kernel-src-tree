@@ -43,6 +43,36 @@ def check_fec(cfg) -> None:
                                      "flags": {'stats'}}})
     ksft_true(data['stats'], "driver does not report stats")
 
+def check_fec_hist(cfg) -> None:
+    """
+    Check that drivers which support FEC histogram statistics report
+    reasonable values.
+    """
+
+    try:
+        data = ethnl.fec_get({"header": {"dev-index": cfg.ifindex,
+                                         "flags": {'stats'}}})
+    except NlError as e:
+        if e.error == errno.EOPNOTSUPP:
+            raise KsftSkipEx("FEC not supported by the device") from e
+        raise
+    if 'stats' not in data:
+        raise KsftSkipEx("FEC stats not supported by the device")
+    if 'hist' not in data['stats']:
+        raise KsftSkipEx("FEC histogram not supported by the device")
+
+    hist = data['stats']['hist']
+    for fec_bin in hist:
+        for key in ['bin-low', 'bin-high', 'bin-val']:
+            ksft_in(key, fec_bin,
+	            "Drivers should always report FEC bin range and value")
+        ksft_ge(fec_bin['bin-high'], fec_bin['bin-low'],
+                "FEC bin range should be valid")
+        if 'bin-val-per-lane' in fec_bin:
+            ksft_eq(sum(fec_bin['bin-val-per-lane']), fec_bin['bin-val'],
+                    "FEC bin value should be equal to sum of per-plane values")
+
+
 
 def pkt_byte_sum(cfg) -> None:
     global netfam, rtnl
@@ -176,8 +206,8 @@ def check_down(cfg) -> None:
 
 def main() -> None:
     with NetDrvEnv(__file__, queue_count=100) as cfg:
-        ksft_run([check_pause, check_fec, pkt_byte_sum, qstat_by_ifindex,
-                  check_down],
+        ksft_run([check_pause, check_fec, check_fec_hist, pkt_byte_sum,
+                 qstat_by_ifindex, check_down],
                  args=(cfg, ))
     ksft_exit()
 
