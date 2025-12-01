@@ -1,0 +1,312 @@
+x86/sme: Use percpu boolean to control WBINVD during kexec
+
+jira KERNEL-216
+Rebuild_History Non-Buildable kernel-5.14.0-611.9.1.el9_7
+commit-author Kai Huang <kai.huang@intel.com>
+commit 83214a775f33bc9d61c2c284f2ace3f854a4cddb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-611.9.1.el9_7/83214a77.failed
+
+TL;DR:
+
+Prepare to unify how TDX and SME do cache flushing during kexec by
+making a percpu boolean control whether to do the WBINVD.
+
+-- Background --
+
+On SME platforms, dirty cacheline aliases with and without encryption
+bit can coexist, and the CPU can flush them back to memory in random
+order.  During kexec, the caches must be flushed before jumping to the
+new kernel otherwise the dirty cachelines could silently corrupt the
+memory used by the new kernel due to different encryption property.
+
+TDX also needs a cache flush during kexec for the same reason.  It would
+be good to have a generic way to flush the cache instead of scattering
+checks for each feature all around.
+
+When SME is enabled, the kernel basically encrypts all memory including
+the kernel itself and a simple memory write from the kernel could dirty
+cachelines.  Currently, the kernel uses WBINVD to flush the cache for
+SME during kexec in two places:
+
+1) the one in stop_this_cpu() for all remote CPUs when the kexec-ing CPU
+   stops them;
+2) the one in the relocate_kernel() where the kexec-ing CPU jumps to the
+   new kernel.
+
+-- Solution --
+
+Unlike SME, TDX can only dirty cachelines when it is used (i.e., when
+SEAMCALLs are performed).  Since there are no more SEAMCALLs after the
+aforementioned WBINVDs, leverage this for TDX.
+
+To unify the approach for SME and TDX, use a percpu boolean to indicate
+the cache may be in an incoherent state and needs flushing during kexec,
+and set the boolean for SME.  TDX can then leverage it.
+
+While SME could use a global flag (since it's enabled at early boot and
+enabled on all CPUs), the percpu flag fits TDX better:
+
+The percpu flag can be set when a CPU makes a SEAMCALL, and cleared when
+another WBINVD on the CPU obviates the need for a kexec-time WBINVD.
+Saving kexec-time WBINVD is valuable, because there is an existing
+race[*] where kexec could proceed while another CPU is active.  WBINVD
+could make this race worse, so it's worth skipping it when possible.
+
+-- Side effect to SME --
+
+Today the first WBINVD in the stop_this_cpu() is performed when SME is
+*supported* by the platform, and the second WBINVD is done in
+relocate_kernel() when SME is *activated* by the kernel.  Make things
+simple by changing to do the second WBINVD when the platform supports
+SME.  This allows the kernel to simply turn on this percpu boolean when
+bringing up a CPU by checking whether the platform supports SME.
+
+No other functional change intended.
+
+[*] The aforementioned race:
+
+During kexec native_stop_other_cpus() is called to stop all remote CPUs
+before jumping to the new kernel.  native_stop_other_cpus() firstly
+sends normal REBOOT vector IPIs to stop remote CPUs and waits them to
+stop.  If that times out, it sends NMI to stop the CPUs that are still
+alive.  The race happens when native_stop_other_cpus() has to send NMIs
+and could potentially result in the system hang (for more information
+please see [1]).
+
+	Signed-off-by: Kai Huang <kai.huang@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Reviewed-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Reviewed-by: Borislav Petkov (AMD) <bp@alien8.de>
+	Tested-by: Tom Lendacky <thomas.lendacky@amd.com>
+Link: https://lore.kernel.org/kvm/b963fcd60abe26c7ec5dc20b42f1a2ebbcc72397.1750934177.git.kai.huang@intel.com/ [1]
+Link: https://lore.kernel.org/all/20250901160930.1785244-3-pbonzini%40redhat.com
+(cherry picked from commit 83214a775f33bc9d61c2c284f2ace3f854a4cddb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kexec.h
+#	arch/x86/kernel/machine_kexec_64.c
+#	arch/x86/kernel/process.c
+#	arch/x86/kernel/relocate_kernel_64.S
+diff --cc arch/x86/include/asm/kexec.h
+index 8be622e82ba8,5cfb27f26583..000000000000
+--- a/arch/x86/include/asm/kexec.h
++++ b/arch/x86/include/asm/kexec.h
+@@@ -9,16 -9,23 +9,29 @@@
+  # define PA_SWAP_PAGE		3
+  # define PAGES_NR		4
+  #else
+ -/* Size of each exception handler referenced by the IDT */
+ -# define KEXEC_DEBUG_EXC_HANDLER_SIZE	6 /* PUSHI, PUSHI, 2-byte JMP */
+ +# define PA_CONTROL_PAGE	0
+ +# define VA_CONTROL_PAGE	1
+ +# define PA_TABLE_PAGE		2
+ +# define PA_SWAP_PAGE		3
+ +# define PAGES_NR		4
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_X86_64
++ 
++ #include <linux/bits.h>
++ 
++ #define RELOC_KERNEL_PRESERVE_CONTEXT	BIT(0)
++ #define RELOC_KERNEL_CACHE_INCOHERENT	BIT(1)
++ 
++ #endif
++ 
++ # define KEXEC_CONTROL_PAGE_SIZE	4096
+++>>>>>>> 83214a775f33 (x86/sme: Use percpu boolean to control WBINVD during kexec)
+  # define KEXEC_CONTROL_CODE_MAX_SIZE	2048
+  
+ -#ifndef __ASSEMBLER__
+ +#ifndef __ASSEMBLY__
+  
+  #include <linux/string.h>
+  #include <linux/kernel.h>
+diff --cc arch/x86/kernel/machine_kexec_64.c
+index 31af9f60cc1a,dfb91091f451..000000000000
+--- a/arch/x86/kernel/machine_kexec_64.c
++++ b/arch/x86/kernel/machine_kexec_64.c
+@@@ -350,17 -414,24 +351,30 @@@ void machine_kexec(struct kimage *image
+  #endif
+  	}
+  
+ -	control_page = page_address(image->control_code_page);
+ +	control_page = page_address(image->control_code_page) + PAGE_SIZE;
+ +	__memcpy(control_page, relocate_kernel, KEXEC_CONTROL_CODE_MAX_SIZE);
+  
+ -	/*
+ -	 * Allow for the possibility that relocate_kernel might not be at
+ -	 * the very start of the page.
+ -	 */
+ -	relocate_kernel_ptr = control_page + (unsigned long)relocate_kernel - reloc_start;
+ +	page_list[PA_CONTROL_PAGE] = virt_to_phys(control_page);
+ +	page_list[VA_CONTROL_PAGE] = (unsigned long)control_page;
+ +	page_list[PA_TABLE_PAGE] =
+ +	  (unsigned long)__pa(page_address(image->control_code_page));
+  
+++<<<<<<< HEAD
+ +	if (image->type == KEXEC_TYPE_DEFAULT)
+ +		page_list[PA_SWAP_PAGE] = (page_to_pfn(image->swap_page)
+ +						<< PAGE_SHIFT);
+++=======
++ 	relocate_kernel_flags = 0;
++ 	if (image->preserve_context)
++ 		relocate_kernel_flags |= RELOC_KERNEL_PRESERVE_CONTEXT;
++ 
++ 	/*
++ 	 * This must be done before load_segments() since it resets
++ 	 * GS to 0 and percpu data needs the correct GS to work.
++ 	 */
++ 	if (this_cpu_read(cache_state_incoherent))
++ 		relocate_kernel_flags |= RELOC_KERNEL_CACHE_INCOHERENT;
+++>>>>>>> 83214a775f33 (x86/sme: Use percpu boolean to control WBINVD during kexec)
+  
+  	/*
+  	 * The segment registers are funny things, they have both a
+@@@ -369,23 -440,21 +383,33 @@@
+  	 * with from a table in memory.  At no other time is the
+  	 * descriptor table in memory accessed.
+  	 *
+++<<<<<<< HEAD
+ +	 * I take advantage of this here by force loading the
+ +	 * segments, before I zap the gdt with an invalid value.
+++=======
++ 	 * Take advantage of this here by force loading the segments,
++ 	 * before the GDT is zapped with an invalid value.
++ 	 *
++ 	 * load_segments() resets GS to 0.  Don't make any function call
++ 	 * after here since call depth tracking uses percpu variables to
++ 	 * operate (relocate_kernel() is explicitly ignored by call depth
++ 	 * tracking).
+++>>>>>>> 83214a775f33 (x86/sme: Use percpu boolean to control WBINVD during kexec)
+  	 */
+  	load_segments();
+ +	/*
+ +	 * The gdt & idt are now invalid.
+ +	 * If you want to load them you must set up your own idt & gdt.
+ +	 */
+ +	native_idt_invalidate();
+ +	native_gdt_invalidate();
+  
+  	/* now call it */
+ -	image->start = relocate_kernel_ptr((unsigned long)image->head,
+ -					   virt_to_phys(control_page),
+ -					   image->start,
+ -					   relocate_kernel_flags);
+ +	image->start = relocate_kernel((unsigned long)image->head,
+ +				       (unsigned long)page_list,
+ +				       image->start,
+ +				       image->preserve_context,
+ +				       cc_platform_has(CC_ATTR_HOST_MEM_ENCRYPT));
+  
+  #ifdef CONFIG_KEXEC_JUMP
+  	if (image->preserve_context)
+diff --cc arch/x86/kernel/process.c
+index 6a3214df4e35,f2bbbeef5477..000000000000
+--- a/arch/x86/kernel/process.c
++++ b/arch/x86/kernel/process.c
+@@@ -785,20 -837,8 +795,25 @@@ void __noreturn stop_this_cpu(void *dum
+  	disable_local_APIC();
+  	mcheck_cpu_clear(c);
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Use wbinvd on processors that support SME. This provides support
+ +	 * for performing a successful kexec when going from SME inactive
+ +	 * to SME active (or vice-versa). The cache must be cleared so that
+ +	 * if there are entries with the same physical address, both with and
+ +	 * without the encryption bit, they don't race each other when flushed
+ +	 * and potentially end up with the wrong entry being committed to
+ +	 * memory.
+ +	 *
+ +	 * Test the CPUID bit directly because the machine might've cleared
+ +	 * X86_FEATURE_SME due to cmdline options.
+ +	 */
+ +	if (c->extended_cpuid_level >= 0x8000001f && (cpuid_eax(0x8000001f) & BIT(0)))
+ +		native_wbinvd();
+++=======
++ 	if (this_cpu_read(cache_state_incoherent))
++ 		wbinvd();
+++>>>>>>> 83214a775f33 (x86/sme: Use percpu boolean to control WBINVD during kexec)
+  
+  	/*
+  	 * This brings a cache line back and dirties it, but
+diff --cc arch/x86/kernel/relocate_kernel_64.S
+index 042c9a0334e9,11e20bb13aca..000000000000
+--- a/arch/x86/kernel/relocate_kernel_64.S
++++ b/arch/x86/kernel/relocate_kernel_64.S
+@@@ -164,13 -204,16 +167,22 @@@ SYM_CODE_START_LOCAL_NOALIGN(identity_m
+  	 * If SME is active, there could be old encrypted cache line
+  	 * entries that will conflict with the now unencrypted memory
+  	 * used by kexec. Flush the caches before copying the kernel.
++ 	 *
++ 	 * Note SME sets this flag to true when the platform supports
++ 	 * SME, so the WBINVD is performed even SME is not activated
++ 	 * by the kernel.  But this has no harm.
+  	 */
+++<<<<<<< HEAD
+ +	testq	%r12, %r12
+ +	jz .Lsme_off
+++=======
++ 	testb	$RELOC_KERNEL_CACHE_INCOHERENT, %r11b
++ 	jz .Lnowbinvd
+++>>>>>>> 83214a775f33 (x86/sme: Use percpu boolean to control WBINVD during kexec)
+  	wbinvd
+- .Lsme_off:
++ .Lnowbinvd:
+  
+ +	movq	%rcx, %r11
+  	call	swap_pages
+  
+  	/*
+* Unmerged path arch/x86/include/asm/kexec.h
+diff --git a/arch/x86/include/asm/processor.h b/arch/x86/include/asm/processor.h
+index 8d5036457f9b..033847d7102a 100644
+--- a/arch/x86/include/asm/processor.h
++++ b/arch/x86/include/asm/processor.h
+@@ -773,6 +773,8 @@ void __noreturn stop_this_cpu(void *dummy);
+ void microcode_check(struct cpuinfo_x86 *prev_info);
+ void store_cpu_caps(struct cpuinfo_x86 *info);
+ 
++DECLARE_PER_CPU(bool, cache_state_incoherent);
++
+ enum l1tf_mitigations {
+ 	L1TF_MITIGATION_OFF,
+ 	L1TF_MITIGATION_FLUSH_NOWARN,
+diff --git a/arch/x86/kernel/cpu/amd.c b/arch/x86/kernel/cpu/amd.c
+index 381249de1c53..fcae36a2f710 100644
+--- a/arch/x86/kernel/cpu/amd.c
++++ b/arch/x86/kernel/cpu/amd.c
+@@ -530,6 +530,23 @@ static void early_detect_mem_encrypt(struct cpuinfo_x86 *c)
+ {
+ 	u64 msr;
+ 
++	/*
++	 * Mark using WBINVD is needed during kexec on processors that
++	 * support SME. This provides support for performing a successful
++	 * kexec when going from SME inactive to SME active (or vice-versa).
++	 *
++	 * The cache must be cleared so that if there are entries with the
++	 * same physical address, both with and without the encryption bit,
++	 * they don't race each other when flushed and potentially end up
++	 * with the wrong entry being committed to memory.
++	 *
++	 * Test the CPUID bit directly because with mem_encrypt=off the
++	 * BSP will clear the X86_FEATURE_SME bit and the APs will not
++	 * see it set after that.
++	 */
++	if (c->extended_cpuid_level >= 0x8000001f && (cpuid_eax(0x8000001f) & BIT(0)))
++		__this_cpu_write(cache_state_incoherent, true);
++
+ 	/*
+ 	 * BIOS support is required for SME and SEV.
+ 	 *   For SME: If BIOS has enabled SME then adjust x86_phys_bits by
+* Unmerged path arch/x86/kernel/machine_kexec_64.c
+* Unmerged path arch/x86/kernel/process.c
+* Unmerged path arch/x86/kernel/relocate_kernel_64.S
