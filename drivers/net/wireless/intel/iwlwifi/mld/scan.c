@@ -1809,8 +1809,8 @@ void iwl_mld_int_mlo_scan(struct iwl_mld *mld, struct ieee80211_vif *vif)
 
 	lockdep_assert_wiphy(mld->wiphy);
 
-	if (!vif->cfg.assoc || !ieee80211_vif_is_mld(vif) ||
-	    hweight16(vif->valid_links) == 1)
+	if (!IWL_MLD_AUTO_EML_ENABLE || !vif->cfg.assoc ||
+	    !ieee80211_vif_is_mld(vif) || hweight16(vif->valid_links) == 1)
 		return;
 
 	if (mld->scan.status & IWL_MLD_SCAN_INT_MLO) {
@@ -1920,6 +1920,9 @@ void iwl_mld_handle_scan_complete_notif(struct iwl_mld *mld,
 			IWL_DEBUG_SCAN(mld, "Scan link is no longer valid\n");
 
 		ieee80211_scan_completed(mld->hw, &info);
+
+		/* Scan is over, we can check again the tpt counters */
+		iwl_mld_stop_ignoring_tpt_updates(mld);
 	} else if (mld->scan.uid_status[uid] == IWL_MLD_SCAN_SCHED) {
 		ieee80211_sched_scan_stopped(mld->hw);
 		mld->scan.pass_all_sched_res = SCHED_SCAN_PASS_ALL_STATE_DISABLED;
