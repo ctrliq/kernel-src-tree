@@ -53,6 +53,8 @@ struct rh_waived_item {
 
 /* Always use the marco RH_INSERT_WAIVED to insert items to this array. */
 struct rh_waived_item rh_waived_list[RH_WAIVED_ITEMS] = {
+	RH_INSERT_WAIVED_ITEM(CVE_2025_38085, "CVE-2025-38085",
+			      "no-cve-2025-38085", RH_WAIVED_CVE),
 };
 
 /*
