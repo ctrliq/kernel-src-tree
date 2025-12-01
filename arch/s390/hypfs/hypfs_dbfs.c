@@ -78,6 +78,7 @@ static const struct file_operations dbfs_ops_ioctl = {
 
 static const struct file_operations dbfs_ops = {
 	.read		= dbfs_read,
+	.llseek		= no_llseek,
 };
 
 void hypfs_dbfs_create_file(struct hypfs_dbfs_file *df)
