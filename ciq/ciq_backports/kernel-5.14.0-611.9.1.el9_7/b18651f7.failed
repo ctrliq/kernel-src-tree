@@ -1,0 +1,134 @@
+x86/kexec: Disable kexec/kdump on platforms with TDX partial write erratum
+
+jira KERNEL-216
+Rebuild_History Non-Buildable kernel-5.14.0-611.9.1.el9_7
+commit-author Kai Huang <kai.huang@intel.com>
+commit b18651f70ce0e45d52b9e66d9065b831b3f30784
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-611.9.1.el9_7/b18651f7.failed
+
+Some early TDX-capable platforms have an erratum: A kernel partial
+write (a write transaction of less than cacheline lands at memory
+controller) to TDX private memory poisons that memory, and a subsequent
+read triggers a machine check.
+
+On those platforms, the old kernel must reset TDX private memory before
+jumping to the new kernel, otherwise the new kernel may see unexpected
+machine check.  Currently the kernel doesn't track which page is a TDX
+private page.  For simplicity just fail kexec/kdump for those platforms.
+
+Leverage the existing machine_kexec_prepare() to fail kexec/kdump by
+adding the check of the presence of the TDX erratum (which is only
+checked for if the kernel is built with TDX host support).  This rejects
+kexec/kdump when the kernel is loading the kexec/kdump kernel image.
+
+The alternative is to reject kexec/kdump when the kernel is jumping to
+the new kernel.  But for kexec this requires adding a new check (e.g.,
+arch_kexec_allowed()) in the common code to fail kernel_kexec() at early
+stage.  Kdump (crash_kexec()) needs similar check, but it's hard to
+justify because crash_kexec() is not supposed to abort.
+
+It's feasible to further relax this limitation, i.e., only fail kexec
+when TDX is actually enabled by the kernel.  But this is still a half
+measure compared to resetting TDX private memory so just do the simplest
+thing for now.
+
+The impact to userspace is the users will get an error when loading the
+kexec/kdump kernel image:
+
+  kexec_load failed: Operation not supported
+
+This might be confusing to the users, thus also print the reason in the
+dmesg:
+
+  [..] kexec: Not allowed on platform with tdx_pw_mce bug.
+
+	Signed-off-by: Kai Huang <kai.huang@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Reviewed-by: Rick Edgecombe <rick.p.edgecombe@intel.com>
+	Reviewed-by: Binbin Wu <binbin.wu@linux.intel.com>
+	Tested-by: Farrah Chen <farrah.chen@intel.com>
+Link: https://lore.kernel.org/all/20250901160930.1785244-5-pbonzini%40redhat.com
+(cherry picked from commit b18651f70ce0e45d52b9e66d9065b831b3f30784)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/machine_kexec_64.c
+diff --cc arch/x86/kernel/machine_kexec_64.c
+index 31af9f60cc1a,15088d14904f..000000000000
+--- a/arch/x86/kernel/machine_kexec_64.c
++++ b/arch/x86/kernel/machine_kexec_64.c
+@@@ -294,18 -322,63 +294,36 @@@ static void load_segments(void
+  		);
+  }
+  
+ -static void prepare_debug_idt(unsigned long control_page, unsigned long vec_ofs)
+ -{
+ -	gate_desc idtentry = { 0 };
+ -	int i;
+ -
+ -	idtentry.bits.p		= 1;
+ -	idtentry.bits.type	= GATE_TRAP;
+ -	idtentry.segment	= __KERNEL_CS;
+ -	idtentry.offset_low	= (control_page & 0xFFFF) + vec_ofs;
+ -	idtentry.offset_middle	= (control_page >> 16) & 0xFFFF;
+ -	idtentry.offset_high	= control_page >> 32;
+ -
+ -	for (i = 0; i < 16; i++) {
+ -		kexec_debug_idt[i] = idtentry;
+ -		idtentry.offset_low += KEXEC_DEBUG_EXC_HANDLER_SIZE;
+ -	}
+ -}
+ -
+  int machine_kexec_prepare(struct kimage *image)
+  {
+ -	void *control_page = page_address(image->control_code_page);
+ -	unsigned long reloc_start = (unsigned long)__relocate_kernel_start;
+ -	unsigned long reloc_end = (unsigned long)__relocate_kernel_end;
+ +	unsigned long start_pgtable;
+  	int result;
+  
+++<<<<<<< HEAD
+ +	/* Calculate the offsets */
+ +	start_pgtable = page_to_pfn(image->control_code_page) << PAGE_SHIFT;
+++=======
++ 	/*
++ 	 * Some early TDX-capable platforms have an erratum.  A kernel
++ 	 * partial write (a write transaction of less than cacheline
++ 	 * lands at memory controller) to TDX private memory poisons that
++ 	 * memory, and a subsequent read triggers a machine check.
++ 	 *
++ 	 * On those platforms the old kernel must reset TDX private
++ 	 * memory before jumping to the new kernel otherwise the new
++ 	 * kernel may see unexpected machine check.  For simplicity
++ 	 * just fail kexec/kdump on those platforms.
++ 	 */
++ 	if (boot_cpu_has_bug(X86_BUG_TDX_PW_MCE)) {
++ 		pr_info_once("Not allowed on platform with tdx_pw_mce bug\n");
++ 		return -EOPNOTSUPP;
++ 	}
+++>>>>>>> b18651f70ce0 (x86/kexec: Disable kexec/kdump on platforms with TDX partial write erratum)
+  
+  	/* Setup the identity mapped 64bit page table */
+ -	result = init_pgtable(image, __pa(control_page));
+ +	result = init_pgtable(image, start_pgtable);
+  	if (result)
+  		return result;
+ -	kexec_va_control_page = (unsigned long)control_page;
+ -	kexec_pa_table_page = (unsigned long)__pa(image->arch.pgd);
+ -
+ -	if (image->type == KEXEC_TYPE_DEFAULT)
+ -		kexec_pa_swap_page = page_to_pfn(image->swap_page) << PAGE_SHIFT;
+ -
+ -	prepare_debug_idt((unsigned long)__pa(control_page),
+ -			  (unsigned long)kexec_debug_exc_vectors - reloc_start);
+ -
+ -	__memcpy(control_page, __relocate_kernel_start, reloc_end - reloc_start);
+ -
+ -	set_memory_rox((unsigned long)control_page, 1);
+  
+  	return 0;
+  }
+* Unmerged path arch/x86/kernel/machine_kexec_64.c
