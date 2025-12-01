@@ -10,6 +10,7 @@
 #define _RH_WAIVED_H
 
 enum rh_waived_items {
+	CVE_2025_38085,
 	/* RH_WAIVED_ITEMS must always be the last item in the enum */
 	RH_WAIVED_ITEMS,
 };
