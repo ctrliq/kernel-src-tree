@@ -1,0 +1,145 @@
+smb: client: fix filename matching of deferred files
+
+jira KERNEL-216
+Rebuild_History Non-Buildable kernel-5.14.0-611.9.1.el9_7
+commit-author Paulo Alcantara <pc@manguebit.org>
+commit 93ed9a2951308db374cba4562533dde97bac70d3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-611.9.1.el9_7/93ed9a29.failed
+
+Fix the following case where the client would end up closing both
+deferred files (foo.tmp & foo) after unlink(foo) due to strstr() call
+in cifs_close_deferred_file_under_dentry():
+
+  fd1 = openat(AT_FDCWD, "foo", O_WRONLY|O_CREAT|O_TRUNC, 0666);
+  fd2 = openat(AT_FDCWD, "foo.tmp", O_WRONLY|O_CREAT|O_TRUNC, 0666);
+  close(fd1);
+  close(fd2);
+  unlink("foo");
+
+Fixes: e3fc065682eb ("cifs: Deferred close performance improvements")
+	Signed-off-by: Paulo Alcantara (Red Hat) <pc@manguebit.org>
+	Reviewed-by: Enzo Matsumiya <ematsumiya@suse.de>
+	Cc: Frank Sorenson <sorenson@redhat.com>
+	Cc: David Howells <dhowells@redhat.com>
+	Cc: linux-cifs@vger.kernel.org
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 93ed9a2951308db374cba4562533dde97bac70d3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/smb/client/inode.c
+diff --cc fs/smb/client/inode.c
+index 61df2b76ea92,1703f1285d36..000000000000
+--- a/fs/smb/client/inode.c
++++ b/fs/smb/client/inode.c
+@@@ -1964,7 -1983,8 +1964,12 @@@ static int __cifs_unlink(struct inode *
+  		goto unlink_out;
+  	}
+  
+++<<<<<<< HEAD
+ +	cifs_close_deferred_file_under_dentry(tcon, full_path);
+++=======
++ 	netfs_wait_for_outstanding_io(inode);
++ 	cifs_close_deferred_file_under_dentry(tcon, dentry);
+++>>>>>>> 93ed9a295130 (smb: client: fix filename matching of deferred files)
+  #ifdef CONFIG_CIFS_ALLOW_INSECURE_LEGACY
+  	if (cap_unix(tcon->ses) && (CIFS_UNIX_POSIX_PATH_OPS_CAP &
+  				le64_to_cpu(tcon->fsUnixInfo.Capability))) {
+@@@ -2518,9 -2538,11 +2523,17 @@@ cifs_rename2(struct mnt_idmap *idmap, s
+  		goto cifs_rename_exit;
+  	}
+  
+++<<<<<<< HEAD
+ +	cifs_close_deferred_file_under_dentry(tcon, from_name);
+ +	if (d_inode(target_dentry) != NULL)
+ +		cifs_close_deferred_file_under_dentry(tcon, to_name);
+++=======
++ 	cifs_close_deferred_file_under_dentry(tcon, source_dentry);
++ 	if (d_inode(target_dentry) != NULL) {
++ 		netfs_wait_for_outstanding_io(d_inode(target_dentry));
++ 		cifs_close_deferred_file_under_dentry(tcon, target_dentry);
++ 	}
+++>>>>>>> 93ed9a295130 (smb: client: fix filename matching of deferred files)
+  
+  	rc = cifs_do_rename(xid, source_dentry, from_name, target_dentry,
+  			    to_name);
+diff --git a/fs/smb/client/cifsproto.h b/fs/smb/client/cifsproto.h
+index 776a1fcd5ad1..ce111e78935a 100644
+--- a/fs/smb/client/cifsproto.h
++++ b/fs/smb/client/cifsproto.h
+@@ -297,8 +297,8 @@ extern void cifs_close_deferred_file(struct cifsInodeInfo *cifs_inode);
+ 
+ extern void cifs_close_all_deferred_files(struct cifs_tcon *cifs_tcon);
+ 
+-extern void cifs_close_deferred_file_under_dentry(struct cifs_tcon *cifs_tcon,
+-				const char *path);
++void cifs_close_deferred_file_under_dentry(struct cifs_tcon *cifs_tcon,
++					   struct dentry *dentry);
+ 
+ extern void cifs_mark_open_handles_for_deleted_file(struct inode *inode,
+ 				const char *path);
+* Unmerged path fs/smb/client/inode.c
+diff --git a/fs/smb/client/misc.c b/fs/smb/client/misc.c
+index 0d4b82c448ba..2b121f6c0bd2 100644
+--- a/fs/smb/client/misc.c
++++ b/fs/smb/client/misc.c
+@@ -832,33 +832,28 @@ cifs_close_all_deferred_files(struct cifs_tcon *tcon)
+ 		kfree(tmp_list);
+ 	}
+ }
+-void
+-cifs_close_deferred_file_under_dentry(struct cifs_tcon *tcon, const char *path)
++
++void cifs_close_deferred_file_under_dentry(struct cifs_tcon *tcon,
++					   struct dentry *dentry)
+ {
+-	struct cifsFileInfo *cfile;
+ 	struct file_list *tmp_list, *tmp_next_list;
+-	void *page;
+-	const char *full_path;
++	struct cifsFileInfo *cfile;
+ 	LIST_HEAD(file_head);
+ 
+-	page = alloc_dentry_path();
+ 	spin_lock(&tcon->open_file_lock);
+ 	list_for_each_entry(cfile, &tcon->openFileList, tlist) {
+-		full_path = build_path_from_dentry(cfile->dentry, page);
+-		if (strstr(full_path, path)) {
+-			if (delayed_work_pending(&cfile->deferred)) {
+-				if (cancel_delayed_work(&cfile->deferred)) {
+-					spin_lock(&CIFS_I(d_inode(cfile->dentry))->deferred_lock);
+-					cifs_del_deferred_close(cfile);
+-					spin_unlock(&CIFS_I(d_inode(cfile->dentry))->deferred_lock);
+-
+-					tmp_list = kmalloc(sizeof(struct file_list), GFP_ATOMIC);
+-					if (tmp_list == NULL)
+-						break;
+-					tmp_list->cfile = cfile;
+-					list_add_tail(&tmp_list->list, &file_head);
+-				}
+-			}
++		if ((cfile->dentry == dentry) &&
++		    delayed_work_pending(&cfile->deferred) &&
++		    cancel_delayed_work(&cfile->deferred)) {
++			spin_lock(&CIFS_I(d_inode(cfile->dentry))->deferred_lock);
++			cifs_del_deferred_close(cfile);
++			spin_unlock(&CIFS_I(d_inode(cfile->dentry))->deferred_lock);
++
++			tmp_list = kmalloc(sizeof(struct file_list), GFP_ATOMIC);
++			if (tmp_list == NULL)
++				break;
++			tmp_list->cfile = cfile;
++			list_add_tail(&tmp_list->list, &file_head);
+ 		}
+ 	}
+ 	spin_unlock(&tcon->open_file_lock);
+@@ -868,7 +863,6 @@ cifs_close_deferred_file_under_dentry(struct cifs_tcon *tcon, const char *path)
+ 		list_del(&tmp_list->list);
+ 		kfree(tmp_list);
+ 	}
+-	free_dentry_path(page);
+ }
+ 
+ /*
