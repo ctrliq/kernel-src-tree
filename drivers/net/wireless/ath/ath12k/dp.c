@@ -1027,7 +1027,7 @@ void ath12k_dp_hal_rx_desc_init(struct ath12k_base *ab)
 
 static void ath12k_dp_service_mon_ring(struct timer_list *t)
 {
-	struct ath12k_base *ab = from_timer(ab, t, mon_reap_timer);
+	struct ath12k_base *ab = timer_container_of(ab, t, mon_reap_timer);
 	int i;
 
 	for (i = 0; i < ab->hw_params->num_rxdma_per_pdev; i++)

@@ -1115,7 +1115,7 @@ alloc_failed:
 static void
 ixgb_watchdog(struct timer_list *t)
 {
-	struct ixgb_adapter *adapter = from_timer(adapter, t, watchdog_timer);
+	struct ixgb_adapter *adapter = timer_container_of(adapter, t, watchdog_timer);
 	struct net_device *netdev = adapter->netdev;
 	struct ixgb_desc_ring *txdr = &adapter->tx_ring;
 

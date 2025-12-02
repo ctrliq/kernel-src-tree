@@ -2591,7 +2591,7 @@ static void ipr_process_error(struct ipr_cmnd *ipr_cmd)
  **/
 static void ipr_timeout(struct timer_list *t)
 {
-	struct ipr_cmnd *ipr_cmd = from_timer(ipr_cmd, t, timer);
+	struct ipr_cmnd *ipr_cmd = timer_container_of(ipr_cmd, t, timer);
 	unsigned long lock_flags = 0;
 	struct ipr_ioa_cfg *ioa_cfg = ipr_cmd->ioa_cfg;
 
@@ -2624,7 +2624,7 @@ static void ipr_timeout(struct timer_list *t)
  **/
 static void ipr_oper_timeout(struct timer_list *t)
 {
-	struct ipr_cmnd *ipr_cmd = from_timer(ipr_cmd, t, timer);
+	struct ipr_cmnd *ipr_cmd = timer_container_of(ipr_cmd, t, timer);
 	unsigned long lock_flags = 0;
 	struct ipr_ioa_cfg *ioa_cfg = ipr_cmd->ioa_cfg;
 
@@ -5154,7 +5154,7 @@ static void ipr_bus_reset_done(struct ipr_cmnd *ipr_cmd)
  **/
 static void ipr_abort_timeout(struct timer_list *t)
 {
-	struct ipr_cmnd *ipr_cmd = from_timer(ipr_cmd, t, timer);
+	struct ipr_cmnd *ipr_cmd = timer_container_of(ipr_cmd, t, timer);
 	struct ipr_cmnd *reset_cmd;
 	struct ipr_ioa_cfg *ioa_cfg = ipr_cmd->ioa_cfg;
 	struct ipr_cmd_pkt *cmd_pkt;
@@ -7531,7 +7531,7 @@ static int ipr_ioafp_identify_hrrq(struct ipr_cmnd *ipr_cmd)
  **/
 static void ipr_reset_timer_done(struct timer_list *t)
 {
-	struct ipr_cmnd *ipr_cmd = from_timer(ipr_cmd, t, timer);
+	struct ipr_cmnd *ipr_cmd = timer_container_of(ipr_cmd, t, timer);
 	struct ipr_ioa_cfg *ioa_cfg = ipr_cmd->ioa_cfg;
 	unsigned long lock_flags = 0;
 

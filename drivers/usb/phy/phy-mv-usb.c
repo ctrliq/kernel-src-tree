@@ -87,7 +87,7 @@ static void mv_otg_run_state_machine(struct mv_otg *mvotg,
 
 static void mv_otg_timer_await_bcon(struct timer_list *t)
 {
-	struct mv_otg *mvotg = from_timer(mvotg, t,
+	struct mv_otg *mvotg = timer_container_of(mvotg, t,
 					  otg_ctrl.timer[A_WAIT_BCON_TIMER]);
 
 	mvotg->otg_ctrl.a_wait_bcon_timeout = 1;
