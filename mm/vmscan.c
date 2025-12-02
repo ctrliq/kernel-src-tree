@@ -123,6 +123,9 @@ struct scan_control {
 	/* The file pages on the current node are dangerously low */
 	unsigned int file_is_tiny:1;
 
+	/* Scrape LRU pages from offlined memcgs */
+	unsigned int scrape_offlined_memcgs:1;
+
 	/* Always discard instead of demoting to lower tier memory */
 	unsigned int no_demotion:1;
 
@@ -3092,6 +3095,9 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
 			memcg_memory_event(memcg, MEMCG_LOW);
 		}
 
+		if (sc->scrape_offlined_memcgs && mem_cgroup_online(memcg))
+			continue;
+
 		reclaimed = sc->nr_reclaimed;
 		scanned = sc->nr_scanned;
 
@@ -4816,3 +4822,31 @@ void check_move_unevictable_pages(struct pagevec *pvec)
 	}
 }
 EXPORT_SYMBOL_GPL(check_move_unevictable_pages);
+
+#ifdef CONFIG_MEMCG
+unsigned long scrape_offlined_memcgs(unsigned long nr_to_reclaim)
+{
+	unsigned int flags;
+	unsigned long nr_reclaimed;
+	struct scan_control sc = {
+		.nr_to_reclaim = max(nr_to_reclaim, SWAP_CLUSTER_MAX),
+		.gfp_mask = GFP_KERNEL,
+		.target_mem_cgroup = root_mem_cgroup,
+		.reclaim_idx = MAX_NR_ZONES - 1,
+		.may_writepage = true,
+		.may_unmap = true,
+		.scrape_offlined_memcgs = true,
+	};
+	struct zonelist *zonelist = node_zonelist(numa_node_id(), sc.gfp_mask);
+
+	set_task_reclaim_state(current, &sc.reclaim_state);
+	flags = memalloc_noreclaim_save();
+
+	nr_reclaimed = do_try_to_free_pages(zonelist, &sc);
+
+	memalloc_noreclaim_restore(flags);
+	set_task_reclaim_state(current, NULL);
+
+	return nr_reclaimed;
+}
+#endif

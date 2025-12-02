@@ -243,6 +243,10 @@ To free slab objects and pagecache::
 
 	echo 3 > /proc/sys/vm/drop_caches
 
+To scrape LRU pages from offlined memcgs:
+
+	echo 8 > /proc/sys/vm/drop_caches
+
 This is a non-destructive operation and will not free any dirty objects.
 To increase the number of objects freed by this operation, the user may run
 `sync` prior to writing to /proc/sys/vm/drop_caches.  This will minimize the
@@ -265,6 +269,14 @@ used::
 
 These are informational only.  They do not mean that anything is wrong
 with your system.  To disable them, echo 4 (bit 2) into drop_caches.
+
+Note that for offlined memcgs, kmem (slab) is reparented so that it
+does not hold refcnts which would in turn prevent those memcgs from
+being released. However, reparenting does not apply to LRU pages
+(pagecache), and therefore they need to be scraped as well for
+offlined memcgs. "echo 8" was introduced for this reason. And unlike
+"echo 1", it does not have performance impact on online memcgs in
+terms of zapping pagecache.
 
 
 extfrag_threshold
