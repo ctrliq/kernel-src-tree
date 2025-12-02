@@ -305,6 +305,7 @@ void iommu_device_unregister_bus(struct iommu_device *iommu,
 				 struct notifier_block *nb)
 {
 	bus_unregister_notifier(bus, nb);
+	fwnode_remove_software_node(iommu->fwnode);
 	iommu_device_unregister(iommu);
 }
 EXPORT_SYMBOL_GPL(iommu_device_unregister_bus);
@@ -327,6 +328,12 @@ int iommu_device_register_bus(struct iommu_device *iommu,
 	if (err)
 		return err;
 
+	iommu->fwnode = fwnode_create_software_node(NULL, NULL);
+	if (IS_ERR(iommu->fwnode)) {
+		bus_unregister_notifier(bus, nb);
+		return PTR_ERR(iommu->fwnode);
+	}
+
 	spin_lock(&iommu_device_lock);
 	list_add_tail(&iommu->list, &iommu_device_list);
 	spin_unlock(&iommu_device_lock);
@@ -336,9 +343,28 @@ int iommu_device_register_bus(struct iommu_device *iommu,
 		iommu_device_unregister_bus(iommu, bus, nb);
 		return err;
 	}
+	WRITE_ONCE(iommu->ready, true);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(iommu_device_register_bus);
+
+int iommu_mock_device_add(struct device *dev, struct iommu_device *iommu)
+{
+	int rc;
+
+	mutex_lock(&iommu_probe_device_lock);
+	rc = iommu_fwspec_init(dev, iommu->fwnode);
+	mutex_unlock(&iommu_probe_device_lock);
+
+	if (rc)
+		return rc;
+
+	rc = device_add(dev);
+	if (rc)
+		iommu_fwspec_free(dev);
+	return rc;
+}
+EXPORT_SYMBOL_GPL(iommu_mock_device_add);
 #endif
 
 static struct dev_iommu *dev_iommu_get(struct device *dev)
@@ -425,13 +451,15 @@ static int iommu_init_device(struct device *dev)
 	 * is buried in the bus dma_configure path. Properly unpicking that is
 	 * still a big job, so for now just invoke the whole thing. The device
 	 * already having a driver bound means dma_configure has already run and
-	 * either found no IOMMU to wait for, or we're in its replay call right
-	 * now, so either way there's no point calling it again.
+	 * found no IOMMU to wait for, so there's no point calling it again.
 	 */
-	if (!dev->driver && dev->bus->dma_configure) {
+	if (!dev->iommu->fwspec && !dev->driver && dev->bus->dma_configure) {
 		mutex_unlock(&iommu_probe_device_lock);
 		dev->bus->dma_configure(dev);
 		mutex_lock(&iommu_probe_device_lock);
+		/* If another instance finished the job for us, skip it */
+		if (!dev->iommu || dev->iommu_group)
+			return -ENODEV;
 	}
 	/*
 	 * At this point, relevant devices either now have a fwspec which will
@@ -1632,15 +1660,13 @@ static struct iommu_domain *__iommu_alloc_identity_domain(struct device *dev)
 	if (ops->identity_domain)
 		return ops->identity_domain;
 
-	/* Older drivers create the identity domain via ops->domain_alloc() */
-	if (!ops->domain_alloc)
+	if (ops->domain_alloc_identity) {
+		domain = ops->domain_alloc_identity(dev);
+		if (IS_ERR(domain))
+			return domain;
+	} else {
 		return ERR_PTR(-EOPNOTSUPP);
-
-	domain = ops->domain_alloc(IOMMU_DOMAIN_IDENTITY);
-	if (IS_ERR(domain))
-		return domain;
-	if (!domain)
-		return ERR_PTR(-ENOMEM);
+	}
 
 	iommu_domain_init(domain, IOMMU_DOMAIN_IDENTITY, ops);
 	return domain;
@@ -2003,13 +2029,6 @@ static void iommu_domain_init(struct iommu_domain *domain, unsigned int type,
 	domain->owner = ops;
 	if (!domain->ops)
 		domain->ops = ops->default_domain_ops;
-
-	/*
-	 * If not already set, assume all sizes by default; the driver
-	 * may override this later
-	 */
-	if (!domain->pgsize_bitmap)
-		domain->pgsize_bitmap = ops->pgsize_bitmap;
 }
 
 static struct iommu_domain *
@@ -2028,8 +2047,10 @@ __iommu_paging_domain_alloc_flags(struct device *dev, unsigned int type,
 		domain = ops->domain_alloc_paging(dev);
 	else if (ops->domain_alloc_paging_flags)
 		domain = ops->domain_alloc_paging_flags(dev, flags, NULL);
+#if IS_ENABLED(CONFIG_FSL_PAMU)
 	else if (ops->domain_alloc && !flags)
 		domain = ops->domain_alloc(IOMMU_DOMAIN_UNMANAGED);
+#endif
 	else
 		return ERR_PTR(-EOPNOTSUPP);
 
@@ -2946,38 +2967,6 @@ int iommu_fwspec_add_ids(struct device *dev, const u32 *ids, int num_ids)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(iommu_fwspec_add_ids);
-
-/*
- * Per device IOMMU features.
- */
-int iommu_dev_enable_feature(struct device *dev, enum iommu_dev_features feat)
-{
-	if (dev_has_iommu(dev)) {
-		const struct iommu_ops *ops = dev_iommu_ops(dev);
-
-		if (ops->dev_enable_feat)
-			return ops->dev_enable_feat(dev, feat);
-	}
-
-	return -ENODEV;
-}
-EXPORT_SYMBOL_GPL(iommu_dev_enable_feature);
-
-/*
- * The device drivers should do the necessary cleanups before calling this.
- */
-int iommu_dev_disable_feature(struct device *dev, enum iommu_dev_features feat)
-{
-	if (dev_has_iommu(dev)) {
-		const struct iommu_ops *ops = dev_iommu_ops(dev);
-
-		if (ops->dev_disable_feat)
-			return ops->dev_disable_feat(dev, feat);
-	}
-
-	return -EBUSY;
-}
-EXPORT_SYMBOL_GPL(iommu_dev_disable_feature);
 
 #ifdef CONFIG_ARM64
 static int __init iommu_quirks(void)

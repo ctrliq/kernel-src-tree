@@ -29,8 +29,6 @@
  * some size calculation constants
  */
 #define DEV_TABLE_ENTRY_SIZE		32
-#define ALIAS_TABLE_ENTRY_SIZE		2
-#define RLOOKUP_TABLE_ENTRY_SIZE	(sizeof(void *))
 
 /* Capability offsets used by the driver */
 #define MMIO_CAP_HDR_OFFSET	0x00
@@ -112,6 +110,7 @@
 #define FEATURE_SNPAVICSUP	GENMASK_ULL(7, 5)
 #define FEATURE_SNPAVICSUP_GAM(x) \
 	(FIELD_GET(FEATURE_SNPAVICSUP, x) == 0x1)
+#define FEATURE_HT_RANGE_IGNORE		BIT_ULL(11)
 
 #define FEATURE_NUM_INT_REMAP_SUP	GENMASK_ULL(9, 8)
 #define FEATURE_NUM_INT_REMAP_SUP_2K(x) \
@@ -317,6 +316,7 @@
 #define DTE_IRQ_REMAP_INTCTL    (2ULL << 60)
 #define DTE_IRQ_REMAP_ENABLE    1ULL
 
+#define DTE_INTTAB_ALIGNMENT    128
 #define DTE_INTTABLEN_MASK      (0xfULL << 1)
 #define DTE_INTTABLEN_VALUE_512 9ULL
 #define DTE_INTTABLEN_512       (DTE_INTTABLEN_VALUE_512 << 1)
@@ -555,6 +555,7 @@ struct gcr3_tbl_info {
 };
 
 struct amd_io_pgtable {
+	seqcount_t		seqcount;	/* Protects root/mode update */
 	struct io_pgtable	pgtbl;
 	int			mode;
 	u64			*root;
@@ -620,12 +621,6 @@ struct amd_iommu_pci_seg {
 
 	/* Size of the device table */
 	u32 dev_table_size;
-
-	/* Size of the alias table */
-	u32 alias_table_size;
-
-	/* Size of the rlookup table */
-	u32 rlookup_table_size;
 
 	/*
 	 * device table virtual address
@@ -801,6 +796,8 @@ struct amd_iommu {
 #ifdef CONFIG_AMD_IOMMU_DEBUGFS
 	/* DebugFS Info */
 	struct dentry *debugfs;
+	int dbg_mmio_offset;
+	int dbg_cap_offset;
 #endif
 
 	/* IOPF support */
@@ -899,6 +896,13 @@ struct dev_table_entry {
 		u64 data[4];
 		u128 data128[2];
 	};
+};
+
+/*
+ * Structure defining one entry in the command buffer
+ */
+struct iommu_cmd {
+	u32 data[4];
 };
 
 /*

@@ -28,9 +28,9 @@ void *__init iommu_alloc_4k_pages(struct amd_iommu *iommu,
 				  gfp_t gfp, size_t size);
 
 #ifdef CONFIG_AMD_IOMMU_DEBUGFS
-void amd_iommu_debugfs_setup(struct amd_iommu *iommu);
+void amd_iommu_debugfs_setup(void);
 #else
-static inline void amd_iommu_debugfs_setup(struct amd_iommu *iommu) {}
+static inline void amd_iommu_debugfs_setup(void) {}
 #endif
 
 /* Needed for interrupt remapping */
@@ -148,6 +148,8 @@ static inline int get_pci_sbdf_id(struct pci_dev *pdev)
 
 	return PCI_SEG_DEVID_TO_SBDF(seg, devid);
 }
+
+bool amd_iommu_ht_range_ignore(void);
 
 /*
  * This must be called after device probe completes. During probe

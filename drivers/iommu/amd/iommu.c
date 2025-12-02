@@ -25,6 +25,7 @@
 #include <linux/notifier.h>
 #include <linux/export.h>
 #include <linux/irq.h>
+#include <linux/irqchip/irq-msi-lib.h>
 #include <linux/msi.h>
 #include <linux/irqdomain.h>
 #include <linux/percpu.h>
@@ -61,13 +62,6 @@ const struct iommu_ops amd_iommu_ops;
 static const struct iommu_dirty_ops amd_dirty_ops;
 
 int amd_iommu_max_glx_val = -1;
-
-/*
- * general struct to manage commands send to an IOMMU
- */
-struct iommu_cmd {
-	u32 data[4];
-};
 
 /*
  * AMD IOMMU allows up to 2^16 different protection domains. This is a bitmap
@@ -634,8 +628,8 @@ static inline void pdev_disable_cap_pasid(struct pci_dev *pdev)
 
 static void pdev_enable_caps(struct pci_dev *pdev)
 {
-	pdev_enable_cap_ats(pdev);
 	pdev_enable_cap_pasid(pdev);
+	pdev_enable_cap_ats(pdev);
 	pdev_enable_cap_pri(pdev);
 }
 
@@ -1004,6 +998,14 @@ static int (*iommu_ga_log_notifier)(u32);
 int amd_iommu_register_ga_log_notifier(int (*notifier)(u32))
 {
 	iommu_ga_log_notifier = notifier;
+
+	/*
+	 * Ensure all in-flight IRQ handlers run to completion before returning
+	 * to the caller, e.g. to ensure module code isn't unloaded while it's
+	 * being executed in the IRQ handler.
+	 */
+	if (!notifier)
+		synchronize_rcu();
 
 	return 0;
 }
@@ -1835,7 +1837,7 @@ static void free_gcr3_tbl_level1(u64 *tbl)
 
 		ptr = iommu_phys_to_virt(tbl[i] & PAGE_MASK);
 
-		iommu_free_page(ptr);
+		iommu_free_pages(ptr);
 	}
 }
 
@@ -1868,7 +1870,7 @@ static void free_gcr3_table(struct gcr3_tbl_info *gcr3_info)
 	/* Free per device domain ID */
 	pdom_id_free(gcr3_info->domid);
 
-	iommu_free_page(gcr3_info->gcr3_tbl);
+	iommu_free_pages(gcr3_info->gcr3_tbl);
 	gcr3_info->gcr3_tbl = NULL;
 }
 
@@ -1907,7 +1909,7 @@ static int setup_gcr3_table(struct gcr3_tbl_info *gcr3_info,
 		return -ENOSPC;
 	gcr3_info->domid = domid;
 
-	gcr3_info->gcr3_tbl = iommu_alloc_page_node(nid, GFP_ATOMIC);
+	gcr3_info->gcr3_tbl = iommu_alloc_pages_node_sz(nid, GFP_ATOMIC, SZ_4K);
 	if (gcr3_info->gcr3_tbl == NULL) {
 		pdom_id_free(domid);
 		return -ENOMEM;
@@ -2528,8 +2530,21 @@ static inline u64 dma_max_address(enum protection_domain_mode pgtable)
 	if (pgtable == PD_MODE_V1)
 		return PM_LEVEL_SIZE(amd_iommu_hpt_level);
 
-	/* V2 with 4/5 level page table */
-	return ((1ULL << PM_LEVEL_SHIFT(amd_iommu_gpt_level)) - 1);
+	/*
+	 * V2 with 4/5 level page table. Note that "2.2.6.5 AMD64 4-Kbyte Page
+	 * Translation" shows that the V2 table sign extends the top of the
+	 * address space creating a reserved region in the middle of the
+	 * translation, just like the CPU does. Further Vasant says the docs are
+	 * incomplete and this only applies to non-zero PASIDs. If the AMDv2
+	 * page table is assigned to the 0 PASID then there is no sign extension
+	 * check.
+	 *
+	 * Since the IOMMU must have a fixed geometry, and the core code does
+	 * not understand sign extended addressing, we have to chop off the high
+	 * bit to get consistent behavior with attachments of the domain to any
+	 * PASID.
+	 */
+	return ((1ULL << (PM_LEVEL_SHIFT(amd_iommu_gpt_level) - 1)) - 1);
 }
 
 static bool amd_iommu_hd_support(struct amd_iommu *iommu)
@@ -2944,6 +2959,9 @@ static void amd_iommu_get_resv_regions(struct device *dev,
 		return;
 	list_add_tail(&region->list, head);
 
+	if (amd_iommu_ht_range_ignore())
+		return;
+
 	region = iommu_alloc_resv_region(HT_RANGE_START,
 					 HT_RANGE_END - HT_RANGE_START + 1,
 					 0, IOMMU_RESV_RESERVED, GFP_KERNEL);
@@ -3020,38 +3038,6 @@ static const struct iommu_dirty_ops amd_dirty_ops = {
 	.read_and_clear_dirty = amd_iommu_read_and_clear_dirty,
 };
 
-static int amd_iommu_dev_enable_feature(struct device *dev,
-					enum iommu_dev_features feat)
-{
-	int ret = 0;
-
-	switch (feat) {
-	case IOMMU_DEV_FEAT_IOPF:
-	case IOMMU_DEV_FEAT_SVA:
-		break;
-	default:
-		ret = -EINVAL;
-		break;
-	}
-	return ret;
-}
-
-static int amd_iommu_dev_disable_feature(struct device *dev,
-					 enum iommu_dev_features feat)
-{
-	int ret = 0;
-
-	switch (feat) {
-	case IOMMU_DEV_FEAT_IOPF:
-	case IOMMU_DEV_FEAT_SVA:
-		break;
-	default:
-		ret = -EINVAL;
-		break;
-	}
-	return ret;
-}
-
 const struct iommu_ops amd_iommu_ops = {
 	.capable = amd_iommu_capable,
 	.blocked_domain = &blocked_domain,
@@ -3065,8 +3051,6 @@ const struct iommu_ops amd_iommu_ops = {
 	.get_resv_regions = amd_iommu_get_resv_regions,
 	.is_attach_deferred = amd_iommu_is_attach_deferred,
 	.def_domain_type = amd_iommu_def_domain_type,
-	.dev_enable_feat = amd_iommu_dev_enable_feature,
-	.dev_disable_feat = amd_iommu_dev_disable_feature,
 	.page_response = amd_iommu_page_response,
 	.default_domain_ops = &(const struct iommu_domain_ops) {
 		.attach_dev	= amd_iommu_attach_device,
@@ -3165,7 +3149,7 @@ static struct irq_remap_table *get_irq_table(struct amd_iommu *iommu, u16 devid)
 	return table;
 }
 
-static struct irq_remap_table *__alloc_irq_table(int nid, int order)
+static struct irq_remap_table *__alloc_irq_table(int nid, size_t size)
 {
 	struct irq_remap_table *table;
 
@@ -3173,7 +3157,8 @@ static struct irq_remap_table *__alloc_irq_table(int nid, int order)
 	if (!table)
 		return NULL;
 
-	table->table = iommu_alloc_pages_node(nid, GFP_KERNEL, order);
+	table->table = iommu_alloc_pages_node_sz(
+		nid, GFP_KERNEL, max(DTE_INTTAB_ALIGNMENT, size));
 	if (!table->table) {
 		kfree(table);
 		return NULL;
@@ -3227,7 +3212,6 @@ static struct irq_remap_table *alloc_irq_table(struct amd_iommu *iommu,
 	struct irq_remap_table *new_table = NULL;
 	struct amd_iommu_pci_seg *pci_seg;
 	unsigned long flags;
-	int order = get_order(get_irq_table_size(max_irqs));
 	int nid = iommu && iommu->dev ? dev_to_node(&iommu->dev->dev) : NUMA_NO_NODE;
 	u16 alias;
 
@@ -3247,7 +3231,7 @@ static struct irq_remap_table *alloc_irq_table(struct amd_iommu *iommu,
 	spin_unlock_irqrestore(&iommu_table_lock, flags);
 
 	/* Nothing there yet, allocate new irq remapping table */
-	new_table = __alloc_irq_table(nid, order);
+	new_table = __alloc_irq_table(nid, get_irq_table_size(max_irqs));
 	if (!new_table)
 		return NULL;
 
@@ -3282,7 +3266,7 @@ out_unlock:
 	spin_unlock_irqrestore(&iommu_table_lock, flags);
 
 	if (new_table) {
-		iommu_free_pages(new_table->table, order);
+		iommu_free_pages(new_table->table);
 		kfree(new_table);
 	}
 	return table;
@@ -4007,29 +3991,30 @@ static struct irq_chip amd_ir_chip = {
 
 static const struct msi_parent_ops amdvi_msi_parent_ops = {
 	.supported_flags	= X86_VECTOR_MSI_FLAGS_SUPPORTED | MSI_FLAG_MULTI_PCI_MSI,
+	.bus_select_token	= DOMAIN_BUS_AMDVI,
+	.bus_select_mask	= MATCH_PCI_MSI,
 	.prefix			= "IR-",
 	.init_dev_msi_info	= msi_parent_init_dev_msi_info,
 };
 
 int amd_iommu_create_irq_domain(struct amd_iommu *iommu)
 {
-	struct fwnode_handle *fn;
+	struct irq_domain_info info = {
+		.fwnode		= irq_domain_alloc_named_id_fwnode("AMD-IR", iommu->index),
+		.ops		= &amd_ir_domain_ops,
+		.domain_flags	= IRQ_DOMAIN_FLAG_ISOLATED_MSI,
+		.host_data	= iommu,
+		.parent		= arch_get_ir_parent_domain(),
+	};
 
-	fn = irq_domain_alloc_named_id_fwnode("AMD-IR", iommu->index);
-	if (!fn)
+	if (!info.fwnode)
 		return -ENOMEM;
-	iommu->ir_domain = irq_domain_create_hierarchy(arch_get_ir_parent_domain(), 0, 0,
-						       fn, &amd_ir_domain_ops, iommu);
+
+	iommu->ir_domain = msi_create_parent_irq_domain(&info, &amdvi_msi_parent_ops);
 	if (!iommu->ir_domain) {
-		irq_domain_free_fwnode(fn);
+		irq_domain_free_fwnode(info.fwnode);
 		return -ENOMEM;
 	}
-
-	irq_domain_update_bus_token(iommu->ir_domain,  DOMAIN_BUS_AMDVI);
-	iommu->ir_domain->flags |= IRQ_DOMAIN_FLAG_MSI_PARENT |
-				   IRQ_DOMAIN_FLAG_ISOLATED_MSI;
-	iommu->ir_domain->msi_parent_ops = &amdvi_msi_parent_ops;
-
 	return 0;
 }
 
