@@ -2767,6 +2767,7 @@ static void rtw8822c_set_tx_power_index(struct rtw_dev *rtwdev)
 }
 
 static int rtw8822c_set_antenna(struct rtw_dev *rtwdev,
+				int radio_idx,
 				u32 antenna_tx,
 				u32 antenna_rx)
 {
@@ -4963,6 +4964,7 @@ static const struct rtw_chip_ops rtw8822c_ops = {
 	.query_phy_status	= query_phy_status,
 	.set_channel		= rtw8822c_set_channel,
 	.mac_init		= rtw8822c_mac_init,
+	.mac_postinit		= NULL,
 	.dump_fw_crash		= rtw8822c_dump_fw_crash,
 	.read_rf		= rtw_phy_read_rf,
 	.write_rf		= rtw_phy_write_rf_reg_mix,
