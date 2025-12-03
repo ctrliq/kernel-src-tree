@@ -1881,6 +1881,9 @@ mshv_ioctl_create_partition(void __user *user_arg, struct device *module_dev)
 	    args.pt_isolation >= MSHV_PT_ISOLATION_COUNT)
 		return -EINVAL;
 
+	pr_err("using unsupported MSHV_CREATE_PARTITION ioctl\n");
+	add_taint(TAINT_SUPPORT_REMOVED, LOCKDEP_STILL_OK);
+
 	/* Only support EXO partitions */
 	creation_flags = HV_PARTITION_CREATION_FLAG_EXO_PARTITION |
 			 HV_PARTITION_CREATION_FLAG_INTERCEPT_MESSAGE_PAGE_ENABLED;
