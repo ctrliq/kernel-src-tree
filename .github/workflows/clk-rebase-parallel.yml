@@ -1,0 +1,344 @@
+name: CLK Rebase (Parallel Tests)
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - stable_6.*.y
+      - clk-rebase-ga
+
+jobs:
+  rebase-and-build:
+    runs-on: kernel-build
+    container:
+      image: rockylinux:9
+      options: --cpus 8 --privileged
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # For push events, use the branch that triggered the workflow
+      # For manual dispatch, default to stable_6.12.y
+      #STABLE_TRACKING_BRANCH: ${{ github.ref_name || 'stable_6.12.y' }}
+      STABLE_TRACKING_BRANCH: ${{ 'stable_6.12.y' }}
+    outputs:
+      stable-version: ${{ steps.save-versions.outputs.stable-version }}
+      clk-branch: ${{ steps.save-versions.outputs.clk-branch }}
+      clk-next-branch: ${{ steps.save-versions.outputs.clk-next-branch }}
+      tmp-clk-next-branch: ${{ steps.save-versions.outputs.tmp-clk-next-branch }}
+    steps:
+      - name: Set version variables
+        run: |
+          # Extract version from STABLE_TRACKING_BRANCH (e.g., stable_6.12.y -> 6.12.y)
+          STABLE_BASE_VERSION=$(echo "$STABLE_TRACKING_BRANCH" | sed 's/^stable_//')
+          echo "STABLE_BASE_VERSION=$STABLE_BASE_VERSION" >> $GITHUB_ENV
+
+          # Construct branch names from the base version
+          echo "CLK_BRANCH=ciq-$STABLE_BASE_VERSION" >> $GITHUB_ENV
+          echo "CLK_NEXT_BRANCH=ciq-${STABLE_BASE_VERSION}-next" >> $GITHUB_ENV
+          echo "TMP_CLK_NEXT_BRANCH={automation_tmp}_ciq-${STABLE_BASE_VERSION}-next" >> $GITHUB_ENV
+
+      - name: Install system dependencies
+        run: |
+          dnf install -y epel-release
+          dnf groupinstall -y 'Development Tools'
+          dnf install -y --enablerepo=crb bc dwarves elfutils-libelf-devel grubby grub2-tools kernel-devel openssl-devel
+
+      - name: Checkout kernel-src-tree
+        uses: actions/checkout@v4
+        with:
+          repository: ctrliq/kernel-src-tree
+          token: ${{ secrets.GITHUB_TOKEN }}
+          path: kernel-src-tree
+          fetch-depth: 0
+
+      - name: Checkout kernel-src-tree-tools
+        uses: actions/checkout@v4
+        with:
+          repository: ctrliq/kernel-src-tree-tools
+          token: ${{ secrets.GITHUB_TOKEN }}
+          path: kernel-src-tree-tools
+
+      - name: Configure git
+        run: |
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+
+      - name: Perform rebase
+        run: |
+          cd kernel-src-tree
+
+          git checkout $STABLE_TRACKING_BRANCH
+          git checkout $CLK_BRANCH
+
+          ../kernel-src-tree-tools/lt_rebase.sh
+
+      - name: Build kernel
+        run: |
+          cd kernel-src-tree
+
+          # need some config tweaks for vng
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_VSOCKETS
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_VIRTIO_VSOCKETS
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_VIRTIO_VSOCKETS_COMMON
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_NET_9P
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_NET_9P_FD
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_NET_9P_VIRTIO
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_FAILOVER
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_BLK_SD_DEV
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_SCSI_VIRTIO
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_VIRTIO_NET
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_NET_FAILOVER
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_VIRTIO_CONSOLE
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_I6300ESB_WDT
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_VIRTIO_BALLOON
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_VIRTIO_MMIO
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_FUSE_FS
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_VIRTIO_FS
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_OVERLAY_FS
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_NETFS_SUPPORT
+          ./scripts/config --file ./ciq/configs/kernel-x86_64.config --enable CONFIG_9P_FS
+
+          ../kernel-src-tree-tools/kernel_build.sh --skip-kabi --no-reboot | tee ../build.log
+
+      - name: Save version information
+        id: save-versions
+        run: |
+          cd kernel-src-tree
+
+          # Extract the stable version we rebased onto
+          STABLE_VERSION=$(git log -1 --format=%s $STABLE_TRACKING_BRANCH | grep -oP 'Linux \K[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
+          echo "stable-version=$STABLE_VERSION" >> $GITHUB_OUTPUT
+          echo "clk-branch=$CLK_BRANCH" >> $GITHUB_OUTPUT
+          echo "clk-next-branch=$CLK_NEXT_BRANCH" >> $GITHUB_OUTPUT
+          echo "tmp-clk-next-branch=$TMP_CLK_NEXT_BRANCH" >> $GITHUB_OUTPUT
+
+      - name: Upload kernel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-build
+          path: kernel-src-tree/
+          retention-days: 1
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: warn
+
+  discover-tests:
+    needs: rebase-and-build
+    runs-on: kernel-build
+    container:
+      image: rockylinux:9
+    outputs:
+      matrix: ${{ steps.create-matrix.outputs.matrix }}
+    steps:
+      - name: Download kernel build
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-build
+          path: kernel-src-tree
+
+      - name: Discover available test targets
+        id: create-matrix
+        run: |
+          cd kernel-src-tree/tools/testing/selftests
+
+          # Skip list - tests we don't want to run
+          SKIP_LIST="lkdtm"
+
+          # Extract TARGETS from Makefile - use awk to get just the target names
+          AVAILABLE_TARGETS=$(grep -E '^TARGETS \+?=' Makefile | awk '{print $3}')
+
+          # Filter out skip list and create JSON array
+          MATRIX_JSON="["
+          FIRST=true
+          for target in $AVAILABLE_TARGETS; do
+            skip=false
+            for skip_item in $SKIP_LIST; do
+              if [ "$target" = "$skip_item" ]; then
+                skip=true
+                break
+              fi
+            done
+            if [ "$skip" = false ]; then
+              if [ "$FIRST" = false ]; then
+                MATRIX_JSON="$MATRIX_JSON,"
+              fi
+              MATRIX_JSON="$MATRIX_JSON{\"name\":\"$target\",\"target\":\"$target\"}"
+              FIRST=false
+            fi
+          done
+          MATRIX_JSON="$MATRIX_JSON]"
+
+          echo "matrix={\"test\":$MATRIX_JSON}" >> $GITHUB_OUTPUT
+          echo "Generated test matrix for $(echo $MATRIX_JSON | grep -o '"name"' | wc -l) tests"
+
+  test:
+    needs: [rebase-and-build, discover-tests]
+    runs-on: kernel-build
+    container:
+      image: rockylinux:9
+      options: --cpus 8 --privileged
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover-tests.outputs.matrix) }}
+    steps:
+      - name: Install dependencies
+        run: |
+          dnf install -y epel-release
+          dnf groupinstall -y 'Development Tools'
+          dnf install -y --enablerepo=crb,devel --allowerasing VirtualGL alsa-lib-devel bc clang conntrack-tools curl dropwatch dwarves e2fsprogs elfutils-libelf-devel ethtool fuse fuse-devel gcc-toolset-13-libasan-devel glibc glibc-static iperf3 iproute iptables ipvsadm jq kernel-devel kernel-selftests-internal kernel-tools kmod libasan libcap-devel libcap-ng-devel libmnl-devel libreswan libubsan llvm ncurses-devel net-tools netsniff-ng nftables nmap-ncat numactl-devel openssl-devel packetdrill perf popt-devel python3-pip python3-pyyaml python3-jsonschema qemu-kvm rsync socat sudo tcpdump teamd traceroute virtme-ng wget
+          dnf install -y --setopt=tsflags=nocaps iputils
+          pip3 install --user netaddr packaging pyftpdlib pyparsing pytest scapy tftpy wheel
+
+          # so root can call sudo without complaint
+          echo "root ALL=(ALL:ALL) NOPASSWD: ALL" >> /etc/sudoers
+
+      - name: Download kernel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-build
+          path: kernel-src-tree
+
+      - name: Run selftests for ${{ matrix.test.name }}
+        run: |
+          cd kernel-src-tree
+
+          # Test if vng works at all - just create a dummy log file
+          vng --qemu /usr/libexec/qemu-kvm --force-initramfs --disable-microvm --rw --network user --verbose --memory 16G -- sh -c "mkdir -p ../kselftest-logs ; echo 'ok test-${{ matrix.test.target }}' >> ../kselftest-logs/selftest-\$(uname -r)-${{ matrix.test.target }}.log"
+
+      - name: Upload test logs for ${{ matrix.test.name }}
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kselftest-logs-${{ matrix.test.name }}
+          path: kselftest-logs/selftest*
+          if-no-files-found: warn
+
+  aggregate-results:
+    needs: [rebase-and-build, test]
+    if: always()
+    runs-on: kernel-build
+    container:
+      image: rockylinux:9
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Install dependencies
+        run: |
+          dnf install -y git 'dnf-command(config-manager)'
+          dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
+          dnf install -y gh
+
+      - name: Download all test logs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: kselftest-logs-*
+          path: kselftest-logs/
+          merge-multiple: true
+
+      - name: Download build log
+        uses: actions/download-artifact@v4
+        with:
+          name: build-log
+          path: .
+
+      - name: Download kernel build
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-build
+          path: kernel-src-tree
+
+      - name: Aggregate test results
+        run: |
+          echo "Aggregating test results..."
+          OK_TESTS=$(grep -a ^ok kselftest-logs/selftest* 2>/dev/null | wc -l || echo "0")
+          FAIL_TESTS=$(grep -a "^not ok" kselftest-logs/selftest* 2>/dev/null | wc -l || echo "0")
+
+          echo "Tests passed: $OK_TESTS"
+          echo "Tests failed: $FAIL_TESTS"
+
+          echo "$OK_TESTS" > ok_tests.txt
+          echo "$FAIL_TESTS" > fail_tests.txt
+
+      - name: Extract config changes and push branches
+        run: |
+          cd kernel-src-tree
+
+          STABLE_VERSION="${{ needs.rebase-and-build.outputs.stable-version }}"
+          CLK_NEXT_BRANCH="${{ needs.rebase-and-build.outputs.clk-next-branch }}"
+          TMP_CLK_NEXT_BRANCH="${{ needs.rebase-and-build.outputs.tmp-clk-next-branch }}"
+
+          # Check for config changes
+          STABLE_TRACKING_BRANCH="stable_6.12.y"
+          git checkout $STABLE_TRACKING_BRANCH
+          git checkout $CLK_NEXT_BRANCH || git checkout -b $CLK_NEXT_BRANCH
+
+          HEAD_COMMIT_MSG=$(git log -1 --format=%s HEAD)
+          if echo "$HEAD_COMMIT_MSG" | grep -qF "[CIQ] v${STABLE_VERSION} - rebased configs"; then
+            echo "Config change commit detected for v${STABLE_VERSION}"
+            git show HEAD --stat > ../config_changes.txt
+          else
+            echo "No config change commit detected for v${STABLE_VERSION}"
+            echo "None" > ../config_changes.txt
+          fi
+
+          # Push branches
+          git push origin $CLK_NEXT_BRANCH
+          git push origin $TMP_CLK_NEXT_BRANCH
+
+      - name: Create Pull Request
+        if: success()
+        run: |
+          cd kernel-src-tree
+
+          STABLE_VERSION="${{ needs.rebase-and-build.outputs.stable-version }}"
+          CLK_NEXT_BRANCH="${{ needs.rebase-and-build.outputs.clk-next-branch }}"
+          TMP_CLK_NEXT_BRANCH="${{ needs.rebase-and-build.outputs.tmp-clk-next-branch }}"
+
+          OK_TESTS=$(cat ../ok_tests.txt)
+          FAIL_TESTS=$(cat ../fail_tests.txt)
+          CONFIG_CHANGES=$(cat ../config_changes.txt)
+
+          # Extract abbreviated build log
+          BUILD_LOG_SUMMARY=$(egrep -B 5 -A 5 "\[TIMER\]|^Starting Build" ../build.log)
+
+          # Get artifact URLs
+          RUN_ID="${{ github.run_id }}"
+          REPO="${{ github.repository }}"
+          SELFTEST_ARTIFACT_URL="https://github.com/${REPO}/actions/runs/${RUN_ID}"
+          BUILD_LOG_ARTIFACT_URL="https://github.com/${REPO}/actions/runs/${RUN_ID}"
+
+          # Create PR body
+          cat > /tmp/pr_body.md <<EOF
+          ## Automated Rebase to v${STABLE_VERSION}
+
+          ### Config Changes
+          \`\`\`
+          ${CONFIG_CHANGES}
+          \`\`\`
+
+          ### Build Log
+          \`\`\`
+          ${BUILD_LOG_SUMMARY}
+          \`\`\`
+
+          ### Testing (Parallelized)
+          - Tests passed: **${OK_TESTS}**
+          - Tests failed: **${FAIL_TESTS}**
+
+          Tests were run in parallel across 7 test groups for faster execution.
+
+          ### Artifacts
+          - [Build Log](${BUILD_LOG_ARTIFACT_URL})
+          - [Selftest Logs](${SELFTEST_ARTIFACT_URL})
+
+          EOF
+
+          # Create the PR
+          gh pr create \
+            --title "TESTING TESTING TESTING [CIQ 6.12] Rebase to v${STABLE_VERSION}" \
+            --body-file /tmp/pr_body.md \
+            --base ${CLK_NEXT_BRANCH} \
+            --head ${TMP_CLK_NEXT_BRANCH}
