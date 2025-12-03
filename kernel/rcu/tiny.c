@@ -233,15 +233,15 @@ bool poll_state_synchronize_rcu(unsigned long oldstate)
 EXPORT_SYMBOL_GPL(poll_state_synchronize_rcu);
 
 #if IS_ENABLED(CONFIG_RCU_TORTURE_TEST)
-unsigned long rcutorture_gather_gp_seqs(void)
+unsigned long long rcutorture_gather_gp_seqs(void)
 {
-	return READ_ONCE(rcu_ctrlblk.gp_seq) & 0xff;
+	return READ_ONCE(rcu_ctrlblk.gp_seq) & 0xffffULL;
 }
 EXPORT_SYMBOL_GPL(rcutorture_gather_gp_seqs);
 
-void rcutorture_format_gp_seqs(unsigned long seqs, char *cp)
+void rcutorture_format_gp_seqs(unsigned long long seqs, char *cp)
 {
-	snprintf(cp, 8, "g%02lx", seqs & 0xff);
+	snprintf(cp, 8, "g%04llx", seqs & 0xffffULL);
 }
 EXPORT_SYMBOL_GPL(rcutorture_format_gp_seqs);
 #endif
