@@ -1241,12 +1241,12 @@ int ipmi_create_user(unsigned int          if_num,
 	}
 	/* Not found, return an error */
 	rv = -EINVAL;
-	goto out_kfree;
+	goto out_unlock;
 
  found:
 	if (intf->in_shutdown) {
 		rv = -ENODEV;
-		goto out_kfree;
+		goto out_unlock;
 	}
 
 	if (atomic_add_return(1, &intf->nr_users) > max_users) {
@@ -1294,6 +1294,7 @@ out_kfree:
 	} else {
 		*user = new_user;
 	}
+out_unlock:
 	mutex_unlock(&ipmi_interfaces_mutex);
 	return rv;
 }
