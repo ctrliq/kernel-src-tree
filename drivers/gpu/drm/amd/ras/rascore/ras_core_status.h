@@ -1,5 +1,6 @@
+/* SPDX-License-Identifier: MIT */
 /*
- * Copyright 2014 Advanced Micro Devices, Inc.
+ * Copyright 2025 Advanced Micro Devices, Inc.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -21,12 +22,16 @@
  *
  */
 
-#ifndef __DCE_V11_0_H__
-#define __DCE_V11_0_H__
+#ifndef __RAS_CORE_STATUS_H__
+#define __RAS_CORE_STATUS_H__
 
-extern const struct amdgpu_ip_block_version dce_v11_0_ip_block;
-extern const struct amdgpu_ip_block_version dce_v11_2_ip_block;
-
-void dce_v11_0_disable_dce(struct amdgpu_device *adev);
-
+#define RAS_CORE_OK                       0
+#define RAS_CORE_NOT_SUPPORTED            248
+#define RAS_CORE_FAIL_ERROR_QUERY         249
+#define RAS_CORE_FAIL_ERROR_INJECTION     250
+#define RAS_CORE_FAIL_FATAL_RECOVERY      251
+#define RAS_CORE_FAIL_POISON_CONSUMPTION  252
+#define RAS_CORE_FAIL_POISON_CREATION     253
+#define RAS_CORE_FAIL_NO_VALID_BANKS      254
+#define RAS_CORE_GPU_IN_MODE1_RESET       255
 #endif
