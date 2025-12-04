@@ -1,0 +1,77 @@
+smb: client: fix race with concurrent opens in unlink(2)
+
+jira KERNEL-249
+Rebuild_History Non-Buildable kernel-4.18.0-553.87.1.el8_10
+commit-author Paulo Alcantara <pc@manguebit.org>
+commit 0af1561b2d60bab2a2b00720a5c7b292ecc549ec
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.87.1.el8_10/0af1561b.failed
+
+According to some logs reported by customers, CIFS client might end up
+reporting unlinked files as existing in stat(2) due to concurrent
+opens racing with unlink(2).
+
+Besides sending the removal request to the server, the unlink process
+could involve closing any deferred close as well as marking all
+existing open handles as deleted to prevent them from deferring
+closes, which increases the race window for potential concurrent
+opens.
+
+Fix this by unhashing the dentry in cifs_unlink() to prevent any
+subsequent opens.  Any open attempts, while we're still unlinking,
+will block on parent's i_rwsem.
+
+	Reported-by: Jay Shin <jaeshin@redhat.com>
+	Signed-off-by: Paulo Alcantara (Red Hat) <pc@manguebit.org>
+	Reviewed-by: David Howells <dhowells@redhat.com>
+	Cc: Al Viro <viro@zeniv.linux.org.uk>
+	Cc: linux-cifs@vger.kernel.org
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 0af1561b2d60bab2a2b00720a5c7b292ecc549ec)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/inode.c
+diff --cc fs/cifs/inode.c
+index 6d62c3c28cc8,cf9060f0fc08..000000000000
+--- a/fs/cifs/inode.c
++++ b/fs/cifs/inode.c
+@@@ -1597,6 -1950,17 +1598,20 @@@ int cifs_unlink(struct inode *dir, stru
+  
+  	cifs_dbg(FYI, "cifs_unlink, dir=0x%p, dentry=0x%p\n", dir, dentry);
+  
+++<<<<<<< HEAD:fs/cifs/inode.c
+++=======
++ 	if (unlikely(cifs_forced_shutdown(cifs_sb)))
++ 		return -EIO;
++ 
++ 	/* Unhash dentry in advance to prevent any concurrent opens */
++ 	spin_lock(&dentry->d_lock);
++ 	if (!d_unhashed(dentry)) {
++ 		__d_drop(dentry);
++ 		rehash = true;
++ 	}
++ 	spin_unlock(&dentry->d_lock);
++ 
+++>>>>>>> 0af1561b2d60 (smb: client: fix race with concurrent opens in unlink(2)):fs/smb/client/inode.c
+  	tlink = cifs_sb_tlink(cifs_sb);
+  	if (IS_ERR(tlink))
+  		return PTR_ERR(tlink);
+@@@ -1639,10 -2007,13 +1654,11 @@@ retry_std_delete
+  
+  psx_del_no_retry:
+  	if (!rc) {
+ -		if (inode) {
+ -			cifs_mark_open_handles_for_deleted_file(inode, full_path);
+ +		if (inode)
+  			cifs_drop_nlink(inode);
+ -		}
+  	} else if (rc == -ENOENT) {
+- 		d_drop(dentry);
++ 		if (simple_positive(dentry))
++ 			d_delete(dentry);
+  	} else if (rc == -EBUSY) {
+  		if (server->ops->rename_pending_delete) {
+  			rc = server->ops->rename_pending_delete(full_path,
+* Unmerged path fs/cifs/inode.c
