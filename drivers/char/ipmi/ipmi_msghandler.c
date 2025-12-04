@@ -47,6 +47,7 @@ static void handle_new_recv_msgs(struct ipmi_smi *intf);
 static void need_waiter(struct ipmi_smi *intf);
 static int handle_one_recv_msg(struct ipmi_smi *intf,
 			       struct ipmi_smi_msg *msg);
+static void intf_free(struct kref *ref);
 
 static bool initialized;
 static bool drvregistered;
@@ -196,25 +197,6 @@ struct ipmi_user {
 
 	atomic_t nr_msgs;
 };
-
-static void free_ipmi_user(struct kref *ref)
-{
-	struct ipmi_user *user = container_of(ref, struct ipmi_user, refcount);
-
-	vfree(user);
-}
-
-static void release_ipmi_user(struct ipmi_user *user)
-{
-	kref_put(&user->refcount, free_ipmi_user);
-}
-
-static struct ipmi_user *acquire_ipmi_user(struct ipmi_user *user)
-{
-	if (!kref_get_unless_zero(&user->refcount))
-		return NULL;
-	return user;
-}
 
 struct cmd_rcvr {
 	struct list_head link;
@@ -612,6 +594,28 @@ static int __ipmi_bmc_register(struct ipmi_smi *intf,
 			       bool guid_set, guid_t *guid, int intf_num);
 static int __scan_channels(struct ipmi_smi *intf, struct ipmi_device_id *id);
 
+static void free_ipmi_user(struct kref *ref)
+{
+	struct ipmi_user *user = container_of(ref, struct ipmi_user, refcount);
+	struct module *owner;
+
+	owner = user->intf->owner;
+	kref_put(&user->intf->refcount, intf_free);
+	module_put(owner);
+	vfree(user);
+}
+
+static void release_ipmi_user(struct ipmi_user *user)
+{
+	kref_put(&user->refcount, free_ipmi_user);
+}
+
+static struct ipmi_user *acquire_ipmi_user(struct ipmi_user *user)
+{
+	if (!kref_get_unless_zero(&user->refcount))
+		return NULL;
+	return user;
+}
 
 /*
  * The driver model view of the IPMI messaging driver.
@@ -1331,7 +1335,6 @@ static void _ipmi_destroy_user(struct ipmi_user *user)
 	unsigned long    flags;
 	struct cmd_rcvr  *rcvr;
 	struct cmd_rcvr  *rcvrs = NULL;
-	struct module    *owner;
 
 	if (!refcount_dec_if_one(&user->destroyed))
 		return;
@@ -1383,10 +1386,6 @@ static void _ipmi_destroy_user(struct ipmi_user *user)
 	}
 
 	release_ipmi_user(user);
-
-	owner = intf->owner;
-	kref_put(&intf->refcount, intf_free);
-	module_put(owner);
 }
 
 void ipmi_destroy_user(struct ipmi_user *user)
@@ -2316,7 +2315,7 @@ static int i_ipmi_request(struct ipmi_user     *user,
 		}
 	}
 
-	mutex_lock(&ipmi_interfaces_mutex);
+	mutex_lock(&intf->users_mutex);
 	if (intf->in_shutdown) {
 		rv = -ENODEV;
 		goto out_err;
@@ -2362,7 +2361,7 @@ out_err:
 
 		smi_send(intf, intf->handlers, smi_msg, priority);
 	}
-	mutex_unlock(&ipmi_interfaces_mutex);
+	mutex_unlock(&intf->users_mutex);
 
 out:
 	if (rv && user)
