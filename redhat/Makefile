@@ -57,10 +57,10 @@ ifneq ($(SPECGEMINI),0)
   SPECKEXTRAVERSION:=
 endif
 
-# When building kernel-automotive, set AUTOMOTIVE_BUILD=1.
+# When building the automotive kernel package, set AUTOMOTIVE_BUILD=1.
 ifeq ($(AUTOMOTIVE_BUILD), 1)
-  SPECPACKAGE_NAME:=kernel-automotive
-  DIST:=.el$(RHEL_MAJOR)iv
+  SPECPACKAGE_NAME:=$(AUTOMOTIVE_PKG_NAME)
+  DIST:=$(AUTOMOTIVE_PKG_DIST)
 endif
 
 GITID:= $(shell $(GIT) log --max-count=1 --pretty=format:%H $(HEAD))
@@ -349,7 +349,7 @@ else
   RHPKG_BIN:=rhpkg
 endif
 
-# When building kernel-automotive, set AUTOMOTIVE_BUILD=1.
+# When building the automotive kernel package, set AUTOMOTIVE_BUILD=1.
 ifeq ($(AUTOMOTIVE_BUILD), 1)
   ifeq ("$(DISTRO)", "rhel")
     RHDISTGIT_BRANCH:=rhivos-$(AUTOMOTIVE_MAJOR).$(AUTOMOTIVE_MINOR).0
