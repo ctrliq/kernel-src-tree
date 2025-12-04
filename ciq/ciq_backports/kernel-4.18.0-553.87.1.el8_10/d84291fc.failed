@@ -1,0 +1,113 @@
+smb: client: fix race with concurrent opens in rename(2)
+
+jira KERNEL-249
+cve CVE-2025-39825
+Rebuild_History Non-Buildable kernel-4.18.0-553.87.1.el8_10
+commit-author Paulo Alcantara <pc@manguebit.org>
+commit d84291fc7453df7881a970716f8256273aca5747
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.87.1.el8_10/d84291fc.failed
+
+Besides sending the rename request to the server, the rename process
+also involves closing any deferred close, waiting for outstanding I/O
+to complete as well as marking all existing open handles as deleted to
+prevent them from deferring closes, which increases the race window
+for potential concurrent opens on the target file.
+
+Fix this by unhashing the dentry in advance to prevent any concurrent
+opens on the target.
+
+	Signed-off-by: Paulo Alcantara (Red Hat) <pc@manguebit.org>
+	Reviewed-by: David Howells <dhowells@redhat.com>
+	Cc: Al Viro <viro@zeniv.linux.org.uk>
+	Cc: linux-cifs@vger.kernel.org
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit d84291fc7453df7881a970716f8256273aca5747)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/inode.c
+diff --cc fs/cifs/inode.c
+index 6d62c3c28cc8,fe453a4b3dc8..000000000000
+--- a/fs/cifs/inode.c
++++ b/fs/cifs/inode.c
+@@@ -2066,15 -2474,33 +2066,36 @@@ cifs_rename2(struct inode *source_dir, 
+  	struct cifs_sb_info *cifs_sb;
+  	struct tcon_link *tlink;
+  	struct cifs_tcon *tcon;
+++<<<<<<< HEAD:fs/cifs/inode.c
+ +	FILE_UNIX_BASIC_INFO *info_buf_source = NULL;
+ +	FILE_UNIX_BASIC_INFO *info_buf_target;
+++=======
++ 	bool rehash = false;
+++>>>>>>> d84291fc7453 (smb: client: fix race with concurrent opens in rename(2)):fs/smb/client/inode.c
+  	unsigned int xid;
+  	int rc, tmprc;
+ -	int retry_count = 0;
+ -	FILE_UNIX_BASIC_INFO *info_buf_source = NULL;
+ -#ifdef CONFIG_CIFS_ALLOW_INSECURE_LEGACY
+ -	FILE_UNIX_BASIC_INFO *info_buf_target;
+ -#endif /* CONFIG_CIFS_ALLOW_INSECURE_LEGACY */
+  
+  	if (flags & ~RENAME_NOREPLACE)
+  		return -EINVAL;
+  
+  	cifs_sb = CIFS_SB(source_dir->i_sb);
+++<<<<<<< HEAD:fs/cifs/inode.c
+++=======
++ 	if (unlikely(cifs_forced_shutdown(cifs_sb)))
++ 		return -EIO;
++ 
++ 	/*
++ 	 * Prevent any concurrent opens on the target by unhashing the dentry.
++ 	 * VFS already unhashes the target when renaming directories.
++ 	 */
++ 	if (d_is_positive(target_dentry) && !d_is_dir(target_dentry)) {
++ 		if (!d_unhashed(target_dentry)) {
++ 			d_drop(target_dentry);
++ 			rehash = true;
++ 		}
++ 	}
++ 
+++>>>>>>> d84291fc7453 (smb: client: fix race with concurrent opens in rename(2)):fs/smb/client/inode.c
+  	tlink = cifs_sb_tlink(cifs_sb);
+  	if (IS_ERR(tlink))
+  		return PTR_ERR(tlink);
+@@@ -2099,6 -2525,25 +2120,22 @@@
+  	rc = cifs_do_rename(xid, source_dentry, from_name, target_dentry,
+  			    to_name);
+  
+++<<<<<<< HEAD:fs/cifs/inode.c
+++=======
++ 	if (rc == -EACCES) {
++ 		while (retry_count < 3) {
++ 			cifs_close_all_deferred_files(tcon);
++ 			rc = cifs_do_rename(xid, source_dentry, from_name, target_dentry,
++ 					    to_name);
++ 			if (rc != -EACCES)
++ 				break;
++ 			retry_count++;
++ 		}
++ 	}
++ 
++ 	if (!rc)
++ 		rehash = false;
+++>>>>>>> d84291fc7453 (smb: client: fix race with concurrent opens in rename(2)):fs/smb/client/inode.c
+  	/*
+  	 * No-replace is the natural behavior for CIFS, so skip unlink hacks.
+  	 */
+@@@ -2159,10 -2609,9 +2198,12 @@@ unlink_target
+  	/* force revalidate to go get info when needed */
+  	CIFS_I(source_dir)->time = CIFS_I(target_dir)->time = 0;
+  
+ +	source_dir->i_ctime = source_dir->i_mtime = target_dir->i_ctime =
+ +		target_dir->i_mtime = current_time(source_dir);
+ +
+  cifs_rename_exit:
++ 	if (rehash)
++ 		d_rehash(target_dentry);
+  	kfree(info_buf_source);
+  	free_dentry_path(page2);
+  	free_dentry_path(page1);
+* Unmerged path fs/cifs/inode.c
