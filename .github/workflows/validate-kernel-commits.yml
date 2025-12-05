@@ -14,15 +14,16 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      - name: Checkout base branch
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          ref: ${{ github.base_ref }}
+      - name: Clone base branch
+        run: |
+          # Optimization: don't checkout at the start because it's superfluous
+          git clone --depth=1 --no-checkout "${{ github.event.pull_request.base.repo.clone_url }}" -b "${{ github.base_ref }}" .
 
       - name: Fetch PR branch
         run: |
-          git fetch "${{ github.event.pull_request.head.repo.clone_url }}" "${{ github.head_ref }}"
+          # Fetch all of the commits in the PR plus one more commit before,
+          # which should be the head of the base branch
+          git fetch --depth=$((${{ github.event.pull_request.commits }} + 1)) "${{ github.event.pull_request.head.repo.clone_url }}" "${{ github.head_ref }}"
           echo "HEAD_SHA=$(git rev-parse FETCH_HEAD)" >> "$GITHUB_ENV"
 
       - name: Verify PR branch isn't on stale base
@@ -31,6 +32,21 @@ jobs:
             echo "❌ PR branch must be rebased onto latest base branch commit"
             exit 1
           fi
+
+      - name: Fetch upstream mainline branch
+        run: |
+          # Determine the kernel version tag, since it is the most recent common
+          # ancestor between the base branch and the upstream mainline branch
+          MAKEFILE=$(git show "${{ github.base_ref }}":Makefile)
+          VERSION=$(grep -m1 -Po '(?<=^VERSION = )\d+' <<< "$MAKEFILE")
+          PATCHLEVEL=$(grep -m1 -Po '(?<=^PATCHLEVEL = )\d+' <<< "$MAKEFILE")
+
+          # Fetch upstream mainline branch without tags, fetching only history
+          # that is newer than this kernel version tag. This reduces the amount
+          # of commits cloned knowing that there's no need to check any commits
+          # for Fixes commits older than what the base branch already contains
+          git fetch --no-tags --shallow-exclude="v$VERSION.$PATCHLEVEL" origin kernel-mainline
+          echo "MAINLINE_SHA=$(git rev-parse FETCH_HEAD)" >> "$GITHUB_ENV"
 
       - name: Checkout kernel-src-tree-tools
         uses: actions/checkout@v4
@@ -55,6 +71,7 @@ jobs:
             --pr_branch "$HEAD_SHA" \
             --base_branch "${{ github.base_ref }}" \
             --markdown \
+            --upstream-ref "$MAINLINE_SHA" \
             --check-cves | tee ../ckc_result.txt
           EXIT_CODE=$?
 
