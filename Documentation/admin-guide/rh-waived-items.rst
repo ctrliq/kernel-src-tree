@@ -27,3 +27,9 @@ The waived items listed in the next session follow the pattern below:
 List of Red Hat Waived Items
 ============================
 
+- CVE-2025-38085
+        Waiving this mitigation can help with addressing perceived performace
+        degradation on some workloads utilizing huge-pages [1] at the expense
+        of re-introducing conditions to allow for the data race that leads to
+        the enumerated common vulnerability.
+        [1] https://access.redhat.com/solutions/7132440
