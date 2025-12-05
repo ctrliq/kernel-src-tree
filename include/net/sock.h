@@ -2776,8 +2776,6 @@ static inline void _sock_tx_timestamp(struct sock *sk, __u16 tsflags,
 		    tsflags & SOF_TIMESTAMPING_TX_RECORD_MASK)
 			*tskey = atomic_inc_return(&sk->sk_tskey) - 1;
 	}
-	if (unlikely(sock_flag(sk, SOCK_WIFI_STATUS)))
-		*tx_flags |= SKBTX_WIFI_STATUS;
 }
 
 static inline void sock_tx_timestamp(struct sock *sk, __u16 tsflags,
@@ -2877,6 +2875,12 @@ skb_steal_sock(struct sk_buff *skb, bool *refcounted)
 	}
 	*refcounted = false;
 	return NULL;
+}
+
+static inline bool
+sk_requests_wifi_status(struct sock *sk)
+{
+	return sk && sk_fullsock(sk) && sock_flag(sk, SOCK_WIFI_STATUS);
 }
 
 /* Checks if this SKB belongs to an HW offloaded socket
