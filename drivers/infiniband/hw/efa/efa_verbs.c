@@ -249,6 +249,7 @@ int efa_query_device(struct ib_device *ibdev,
 		resp.max_rdma_size = dev_attr->max_rdma_size;
 
 		resp.device_caps |= EFA_QUERY_DEVICE_CAPS_CQ_WITH_SGID;
+		resp.device_caps |= EFA_QUERY_DEVICE_CAPS_CQ_WITH_EXT_MEM;
 		if (EFA_DEV_CAP(dev, RDMA_READ))
 			resp.device_caps |= EFA_QUERY_DEVICE_CAPS_RDMA_READ;
 
@@ -1082,8 +1083,11 @@ int efa_destroy_cq(struct ib_cq *ibcq, struct ib_udata *udata)
 		xa_erase(&dev->cqs_xa, cq->cq_idx);
 		synchronize_irq(cq->eq->irq.irqn);
 	}
-	efa_free_mapped(dev, cq->cpu_addr, cq->dma_addr, cq->size,
-			DMA_FROM_DEVICE);
+
+	if (cq->umem)
+		ib_umem_release(cq->umem);
+	else
+		efa_free_mapped(dev, cq->cpu_addr, cq->dma_addr, cq->size, DMA_FROM_DEVICE);
 	return 0;
 }
 
@@ -1122,8 +1126,8 @@ static int cq_mmap_entries_setup(struct efa_dev *dev, struct efa_cq *cq,
 	return 0;
 }
 
-int efa_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
-		  struct uverbs_attr_bundle *attrs)
+int efa_create_cq_umem(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
+		       struct ib_umem *umem, struct uverbs_attr_bundle *attrs)
 {
 	struct ib_udata *udata = &attrs->driver_udata;
 	struct efa_ucontext *ucontext = rdma_udata_to_drv_context(
@@ -1202,11 +1206,30 @@ int efa_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
 
 	cq->ucontext = ucontext;
 	cq->size = PAGE_ALIGN(cmd.cq_entry_size * entries * cmd.num_sub_cqs);
-	cq->cpu_addr = efa_zalloc_mapped(dev, &cq->dma_addr, cq->size,
-					 DMA_FROM_DEVICE);
-	if (!cq->cpu_addr) {
-		err = -ENOMEM;
-		goto err_out;
+
+	if (umem) {
+		if (umem->length < cq->size) {
+			ibdev_dbg(&dev->ibdev, "External memory too small\n");
+			err = -EINVAL;
+			goto err_out;
+		}
+
+		if (!ib_umem_is_contiguous(umem)) {
+			ibdev_dbg(&dev->ibdev, "Non contiguous CQ unsupported\n");
+			err = -EINVAL;
+			goto err_out;
+		}
+
+		cq->cpu_addr = NULL;
+		cq->dma_addr = ib_umem_start_dma_addr(umem);
+		cq->umem = umem;
+	} else {
+		cq->cpu_addr = efa_zalloc_mapped(dev, &cq->dma_addr, cq->size,
+						 DMA_FROM_DEVICE);
+		if (!cq->cpu_addr) {
+			err = -ENOMEM;
+			goto err_out;
+		}
 	}
 
 	params.uarn = cq->ucontext->uarn;
@@ -1231,7 +1254,9 @@ int efa_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
 	cq->ibcq.cqe = result.actual_depth;
 	WARN_ON_ONCE(entries != result.actual_depth);
 
-	err = cq_mmap_entries_setup(dev, cq, &resp, result.db_valid);
+	if (!umem)
+		err = cq_mmap_entries_setup(dev, cq, &resp, result.db_valid);
+
 	if (err) {
 		ibdev_dbg(ibdev, "Could not setup cq[%u] mmap entries\n",
 			  cq->cq_idx);
@@ -1270,12 +1295,18 @@ err_remove_mmap:
 err_destroy_cq:
 	efa_destroy_cq_idx(dev, cq->cq_idx);
 err_free_mapped:
-	efa_free_mapped(dev, cq->cpu_addr, cq->dma_addr, cq->size,
-			DMA_FROM_DEVICE);
-
+	if (!umem)
+		efa_free_mapped(dev, cq->cpu_addr, cq->dma_addr, cq->size,
+				DMA_FROM_DEVICE);
 err_out:
 	atomic64_inc(&dev->stats.create_cq_err);
 	return err;
+}
+
+int efa_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
+		  struct uverbs_attr_bundle *attrs)
+{
+	return efa_create_cq_umem(ibcq, attr, NULL, attrs);
 }
 
 static int umem_to_page_list(struct efa_dev *dev,
@@ -1727,12 +1758,18 @@ static int efa_register_mr(struct ib_pd *ibpd, struct efa_mr *mr, u64 start,
 struct ib_mr *efa_reg_user_mr_dmabuf(struct ib_pd *ibpd, u64 start,
 				     u64 length, u64 virt_addr,
 				     int fd, int access_flags,
+				     struct ib_dmah *dmah,
 				     struct uverbs_attr_bundle *attrs)
 {
 	struct efa_dev *dev = to_edev(ibpd->device);
 	struct ib_umem_dmabuf *umem_dmabuf;
 	struct efa_mr *mr;
 	int err;
+
+	if (dmah) {
+		err = -EOPNOTSUPP;
+		goto err_out;
+	}
 
 	mr = efa_alloc_mr(ibpd, access_flags, &attrs->driver_udata);
 	if (IS_ERR(mr)) {
@@ -1766,11 +1803,17 @@ err_out:
 
 struct ib_mr *efa_reg_mr(struct ib_pd *ibpd, u64 start, u64 length,
 			 u64 virt_addr, int access_flags,
+			 struct ib_dmah *dmah,
 			 struct ib_udata *udata)
 {
 	struct efa_dev *dev = to_edev(ibpd->device);
 	struct efa_mr *mr;
 	int err;
+
+	if (dmah) {
+		err = -EOPNOTSUPP;
+		goto err_out;
+	}
 
 	mr = efa_alloc_mr(ibpd, access_flags, udata);
 	if (IS_ERR(mr)) {
