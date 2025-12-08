@@ -180,18 +180,6 @@
 #ifdef __ASSEMBLY__
 
 /*
- * This should be used immediately before an indirect jump/call. It tells
- * objtool the subsequent indirect jump/call is vouched safe for retpoline
- * builds.
- */
-.macro ANNOTATE_RETPOLINE_SAFE
-.Lhere_\@:
-	.pushsection .discard.retpoline_safe
-	.long .Lhere_\@
-	.popsection
-.endm
-
-/*
  * (ab)use RETPOLINE_SAFE on RET to annotate away 'bare' RET instructions
  * vs RETBleed validation.
  */
@@ -355,12 +343,6 @@
 #endif
 
 #else /* __ASSEMBLY__ */
-
-#define ANNOTATE_RETPOLINE_SAFE					\
-	"999:\n\t"						\
-	".pushsection .discard.retpoline_safe\n\t"		\
-	".long 999b\n\t"					\
-	".popsection\n\t"
 
 #define ITS_THUNK_SIZE	64
 

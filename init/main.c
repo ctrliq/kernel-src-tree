@@ -686,7 +686,7 @@ static void __init setup_command_line(char *command_line)
 
 static __initdata DECLARE_COMPLETION(kthreadd_done);
 
-noinline void __ref __noreturn rest_init(void)
+static noinline void __ref __noreturn rest_init(void)
 {
 	struct task_struct *tsk;
 	int pid;
@@ -826,11 +826,6 @@ static int __init early_randomize_kstack_offset(char *buf)
 }
 early_param("randomize_kstack_offset", early_randomize_kstack_offset);
 #endif
-
-void __init __weak __noreturn arch_call_rest_init(void)
-{
-	rest_init();
-}
 
 static void __init print_unknown_bootoptions(void)
 {
@@ -1082,7 +1077,7 @@ asmlinkage __visible void __init __no_sanitize_address __noreturn start_kernel(v
 	kcsan_init();
 
 	/* Do the rest non-__init'ed, we're now alive */
-	arch_call_rest_init();
+	rest_init();
 
 	prevent_tail_call_optimization();
 }
