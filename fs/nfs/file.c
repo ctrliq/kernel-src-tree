@@ -385,6 +385,8 @@ static int nfs_write_begin(struct file *file, struct address_space *mapping,
 	int once_thru = 0;
 	int ret;
 
+	trace_nfs_write_begin(file_inode(file), pos, len);
+
 	dfprintk(PAGECACHE, "NFS: write_begin(%pD2(%lu), %u@%lld)\n",
 		file, mapping->host->i_ino, len, (long long) pos);
 	nfs_truncate_last_folio(mapping, i_size_read(mapping->host), pos);
@@ -393,8 +395,10 @@ static int nfs_write_begin(struct file *file, struct address_space *mapping,
 start:
 	folio = __filemap_get_folio(mapping, pos >> PAGE_SHIFT, fgp,
 				    mapping_gfp_mask(mapping));
-	if (IS_ERR(folio))
-		return PTR_ERR(folio);
+	if (IS_ERR(folio)) {
+		ret = PTR_ERR(folio);
+		goto out;
+	}
 	*foliop = folio;
 
 	ret = nfs_flush_incompatible(file, folio);
@@ -409,6 +413,8 @@ start:
 		if (!ret)
 			goto start;
 	}
+out:
+	trace_nfs_write_begin_done(file_inode(file), pos, len, ret);
 	return ret;
 }
 
@@ -420,6 +426,7 @@ static int nfs_write_end(struct file *file, struct address_space *mapping,
 	unsigned offset = offset_in_folio(folio, pos);
 	int status;
 
+	trace_nfs_write_end(file_inode(file), pos, len);
 	dfprintk(PAGECACHE, "NFS: write_end(%pD2(%lu), %u@%lld)\n",
 		file, mapping->host->i_ino, len, (long long) pos);
 
@@ -448,13 +455,16 @@ static int nfs_write_end(struct file *file, struct address_space *mapping,
 	folio_unlock(folio);
 	folio_put(folio);
 
-	if (status < 0)
+	if (status < 0) {
+		trace_nfs_write_end_done(file_inode(file), pos, len, status);
 		return status;
+	}
 	NFS_I(mapping->host)->write_io += copied;
 
 	if (nfs_ctx_key_to_expire(ctx, mapping->host))
 		nfs_wb_all(mapping->host);
 
+	trace_nfs_write_end_done(file_inode(file), pos, len, copied);
 	return copied;
 }
 
