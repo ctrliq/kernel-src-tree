@@ -2208,8 +2208,6 @@ no_open:
 		else
 			dput(dentry);
 	}
-	if (IS_ERR(res))
-		return PTR_ERR(res);
 	return finish_no_open(file, res);
 }
 EXPORT_SYMBOL_GPL(nfs_atomic_open);
