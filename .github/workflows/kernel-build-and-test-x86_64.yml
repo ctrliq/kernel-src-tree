@@ -326,20 +326,65 @@ jobs:
         echo "base_branch=$BASE_BRANCH" >> $GITHUB_OUTPUT
         echo "Base branch for comparison: $BASE_BRANCH"
 
-    - name: Download baseline kselftest logs from base branch
+    - name: Download baseline kselftest logs from last successful run targeting same base
       if: steps.base_branch.outputs.base_branch != ''
-      uses: dawidd6/action-download-artifact@v11
-      with:
-        workflow: kernel-build-and-test-x86_64.yml
-        name: kselftest-logs-x86_64
-        path: output-previous
-        branch: ${{ steps.base_branch.outputs.base_branch }}
-        workflow_conclusion: success
-        search_artifacts: true
-        skip_unpack: false
-        if_no_artifact_found: warn
-        # Search the last 5 successful runs for better performance
-        search_depth: 5
+      env:
+        GH_TOKEN: ${{ steps.generate_token_compare.outputs.token }}
+      run: |
+        set +e  # Don't exit on error, we handle it with continue-on-error
+        BASE_BRANCH="${{ steps.base_branch.outputs.base_branch }}"
+        CURRENT_RUN_ID="${{ github.run_id }}"
+
+        echo "Searching for baseline from last successful run targeting base branch: $BASE_BRANCH"
+        echo "Current run ID: $CURRENT_RUN_ID (will be excluded from search)"
+
+        # Get last 50 successful workflow runs (cast a wider net to find PRs targeting this base)
+        # We need to check each run to see if it targets the same base branch
+        SUCCESSFUL_RUNS=$(gh run list \
+          --workflow kernel-build-and-test-x86_64.yml \
+          --status success \
+          --limit 50 \
+          --json databaseId,headBranch,createdAt)
+
+        if [ -z "$SUCCESSFUL_RUNS" ] || [ "$SUCCESSFUL_RUNS" = "[]" ]; then
+          echo "::warning::No successful workflow runs found"
+          exit 0
+        fi
+
+        # Parse runs and check each one's base branch by examining branch name pattern
+        echo "$SUCCESSFUL_RUNS" | jq -c '.[]' | while read -r run; do
+          RUN_ID=$(echo "$run" | jq -r '.databaseId')
+          HEAD_BRANCH=$(echo "$run" | jq -r '.headBranch')
+
+          # Skip current run
+          if [ "$RUN_ID" = "$CURRENT_RUN_ID" ]; then
+            continue
+          fi
+
+          # Extract base from branch name pattern {name}_base or {name}-base
+          EXTRACTED_BASE=""
+          if [[ "$HEAD_BRANCH" =~ \{[^}]+\}[_-](.+) ]]; then
+            EXTRACTED_BASE="${BASH_REMATCH[1]}"
+          fi
+
+          # Check if this run targets the same base branch
+          if [ "$EXTRACTED_BASE" = "$BASE_BRANCH" ]; then
+            echo "Found candidate run $RUN_ID from branch $HEAD_BRANCH (targets: $BASE_BRANCH)"
+
+            # Try to download artifact from this run
+            if gh run download "$RUN_ID" --name kselftest-logs-x86_64 --dir output-previous 2>/dev/null; then
+              echo "Successfully downloaded baseline from run $RUN_ID (branch: $HEAD_BRANCH)"
+              echo "BASELINE_RUN_ID=$RUN_ID" >> $GITHUB_ENV
+              echo "BASELINE_BRANCH=$HEAD_BRANCH" >> $GITHUB_ENV
+              exit 0
+            else
+              echo "Run $RUN_ID has no kselftest artifacts or they expired"
+            fi
+          fi
+        done
+
+        echo "::warning::No baseline test results found in recent successful runs targeting $BASE_BRANCH"
+        echo "::notice::This may be the first run targeting this base branch, or artifacts have expired (7-day retention)"
       continue-on-error: true
       timeout-minutes: 3
 
@@ -357,6 +402,9 @@ jobs:
 
         # Check if baseline logs exist
         if ls output-previous/kselftests-*.log 1> /dev/null 2>&1; then
+          # Get baseline source info
+          BASELINE_SOURCE="${BASELINE_BRANCH:-last successful run}"
+
           # Compare passing tests (ok)
           BEFORE_PASS=$(grep -a '^ok' output-previous/kselftests-*.log | wc -l || echo "0")
           AFTER_PASS=$(grep -a '^ok' output-current/kselftests-*.log | wc -l || echo "0")
@@ -366,7 +414,7 @@ jobs:
           AFTER_FAIL=$(grep -a '^not ok' output-current/kselftests-*.log | wc -l || echo "0")
 
           echo "### Kselftest Comparison"
-          echo "Baseline (from ${{ steps.base_branch.outputs.base_branch }}): $BEFORE_PASS passing, $BEFORE_FAIL failing"
+          echo "Baseline (from $BASELINE_SOURCE targeting ${{ steps.base_branch.outputs.base_branch }}): $BEFORE_PASS passing, $BEFORE_FAIL failing"
           echo "Current (${{ github.ref_name }}): $AFTER_PASS passing, $AFTER_FAIL failing"
 
           # Calculate differences
