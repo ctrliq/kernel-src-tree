@@ -1,0 +1,167 @@
+mm/memcg: revert ("mm/memcg: optimize user context object stock access")
+
+jira KERNEL-325
+cve CVE-2023-53401
+Rebuild_History Non-Buildable kernel-4.18.0-553.89.1.el8_10
+commit-author Michal Hocko <mhocko@suse.com>
+commit fead2b869764f89d524b79dc8862e61d5191be55
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.89.1.el8_10/fead2b86.failed
+
+Patch series "mm/memcg: Address PREEMPT_RT problems instead of disabling it", v5.
+
+This series aims to address the memcg related problem on PREEMPT_RT.
+
+I tested them on CONFIG_PREEMPT and CONFIG_PREEMPT_RT with the
+tools/testing/selftests/cgroup/* tests and I haven't observed any
+regressions (other than the lockdep report that is already there).
+
+This patch (of 6):
+
+The optimisation is based on a micro benchmark where local_irq_save() is
+more expensive than a preempt_disable().  There is no evidence that it
+is visible in a real-world workload and there are CPUs where the
+opposite is true (local_irq_save() is cheaper than preempt_disable()).
+
+Based on micro benchmarks, the optimisation makes sense on PREEMPT_NONE
+where preempt_disable() is optimized away.  There is no improvement with
+PREEMPT_DYNAMIC since the preemption counter is always available.
+
+The optimization makes also the PREEMPT_RT integration more complicated
+since most of the assumption are not true on PREEMPT_RT.
+
+Revert the optimisation since it complicates the PREEMPT_RT integration
+and the improvement is hardly visible.
+
+[bigeasy@linutronix.de: patch body around Michal's diff]
+
+Link: https://lkml.kernel.org/r/20220226204144.1008339-1-bigeasy@linutronix.de
+Link: https://lore.kernel.org/all/YgOGkXXCrD%2F1k+p4@dhcp22.suse.cz
+Link: https://lkml.kernel.org/r/YdX+INO9gQje6d0S@linutronix.de
+Link: https://lkml.kernel.org/r/20220226204144.1008339-2-bigeasy@linutronix.de
+	Signed-off-by: Michal Hocko <mhocko@suse.com>
+	Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+	Acked-by: Roman Gushchin <guro@fb.com>
+	Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+	Reviewed-by: Shakeel Butt <shakeelb@google.com>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Vladimir Davydov <vdavydov.dev@gmail.com>
+	Cc: Waiman Long <longman@redhat.com>
+	Cc: kernel test robot <oliver.sang@intel.com>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Michal Koutný <mkoutny@suse.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit fead2b869764f89d524b79dc8862e61d5191be55)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memcontrol.c
+diff --cc mm/memcontrol.c
+index 6e2a077af4c1,7bf204b2b053..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -2232,18 -2061,27 +2232,21 @@@ static void __unlock_page_memcg(struct 
+  }
+  
+  /**
+ - * folio_memcg_unlock - Release the binding between a folio and its memcg.
+ - * @folio: The folio.
+ - *
+ - * This releases the binding created by folio_memcg_lock().  This does
+ - * not change the accounting of this folio to its memcg, but it does
+ - * permit others to change it.
+ + * unlock_page_memcg - unlock a page and memcg binding
+ + * @page: the page
+   */
+ -void folio_memcg_unlock(struct folio *folio)
+ -{
+ -	__folio_memcg_unlock(folio_memcg(folio));
+ -}
+ -
+  void unlock_page_memcg(struct page *page)
+  {
+ -	folio_memcg_unlock(page_folio(page));
+ +	struct page *head = compound_head(page);
+ +
+ +	__unlock_page_memcg(page_memcg(head));
+  }
+ +EXPORT_SYMBOL(unlock_page_memcg);
+  
+- struct obj_stock {
++ struct memcg_stock_pcp {
++ 	struct mem_cgroup *cached; /* this never be root cgroup */
++ 	unsigned int nr_pages;
++ 
+  #ifdef CONFIG_MEMCG_KMEM
+  	struct obj_cgroup *cached_objcg;
+  	struct pglist_data *cached_pgdat;
+@@@ -2269,12 -2098,13 +2263,12 @@@ static DEFINE_PER_CPU(struct memcg_stoc
+  static DEFINE_MUTEX(percpu_charge_mutex);
+  
+  #ifdef CONFIG_MEMCG_KMEM
+- static void drain_obj_stock(struct obj_stock *stock);
++ static void drain_obj_stock(struct memcg_stock_pcp *stock);
+  static bool obj_stock_flush_required(struct memcg_stock_pcp *stock,
+  				     struct mem_cgroup *root_memcg);
+ -static void memcg_account_kmem(struct mem_cgroup *memcg, int nr_pages);
+  
+  #else
+- static inline void drain_obj_stock(struct obj_stock *stock)
++ static inline void drain_obj_stock(struct memcg_stock_pcp *stock)
+  {
+  }
+  static bool obj_stock_flush_required(struct memcg_stock_pcp *stock,
+@@@ -7219,22 -6782,21 +7180,30 @@@ static void uncharge_batch(const struc
+  	css_put(&ug->memcg->css);
+  }
+  
+ -static void uncharge_folio(struct folio *folio, struct uncharge_gather *ug)
+ +static void uncharge_page(struct page *page, struct uncharge_gather *ug)
+  {
+ -	long nr_pages;
+ +	unsigned long nr_pages;
+  	struct mem_cgroup *memcg;
+  	struct obj_cgroup *objcg;
+++<<<<<<< HEAD
+ +	bool use_objcg = PageMemcgKmem(page);
+++=======
+++>>>>>>> fead2b869764 (mm/memcg: revert ("mm/memcg: optimize user context object stock access"))
+  
+ -	VM_BUG_ON_FOLIO(folio_test_lru(folio), folio);
+ +	VM_BUG_ON_PAGE(PageLRU(page), page);
+  
+  	/*
+  	 * Nobody should be changing or seriously looking at
+ -	 * folio memcg or objcg at this point, we have fully
+ -	 * exclusive access to the folio.
+ +	 * page memcg or objcg at this point, we have fully
+ +	 * exclusive access to the page.
+  	 */
+++<<<<<<< HEAD
+ +	if (use_objcg) {
+ +		objcg = __page_objcg(page);
+++=======
++ 	if (folio_memcg_kmem(folio)) {
++ 		objcg = __folio_objcg(folio);
+++>>>>>>> fead2b869764 (mm/memcg: revert ("mm/memcg: optimize user context object stock access"))
+  		/*
+  		 * This get matches the put at the end of the function and
+  		 * kmem pages do not hold memcg references anymore.
+@@@ -7259,9 -6821,9 +7228,9 @@@
+  		css_get(&memcg->css);
+  	}
+  
+ -	nr_pages = folio_nr_pages(folio);
+ +	nr_pages = compound_nr(page);
+  
+- 	if (use_objcg) {
++ 	if (folio_memcg_kmem(folio)) {
+  		ug->nr_memory += nr_pages;
+  		ug->nr_kmem += nr_pages;
+  
+* Unmerged path mm/memcontrol.c
