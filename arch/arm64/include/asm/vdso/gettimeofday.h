@@ -68,7 +68,7 @@ int clock_getres_fallback(clockid_t _clkid, struct __kernel_timespec *_ts)
 }
 
 static __always_inline u64 __arch_get_hw_counter(s32 clock_mode,
-						 const struct vdso_data *vd)
+						 const struct vdso_time_data *vd)
 {
 	/*
 	 * Core checks for mode already, so this raced against a concurrent
@@ -80,20 +80,6 @@ static __always_inline u64 __arch_get_hw_counter(s32 clock_mode,
 
 	return __arch_counter_get_cntvct();
 }
-
-static __always_inline
-const struct vdso_data *__arch_get_vdso_data(void)
-{
-	return _vdso_data;
-}
-
-#ifdef CONFIG_TIME_NS
-static __always_inline
-const struct vdso_data *__arch_get_timens_vdso_data(const struct vdso_data *vd)
-{
-	return _timens_data;
-}
-#endif
 
 #endif /* !__ASSEMBLY__ */
 
