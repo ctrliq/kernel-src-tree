@@ -81,7 +81,7 @@ void __init time_early_init(void)
 
 	/* Initialize TOD steering parameters */
 	for (cs = 0; cs < CS_BASES; cs++)
-		vdso_data[cs].arch_data.tod_delta = tod_clock_base.tod;
+		vdso_k_time_data[cs].arch_data.tod_delta = tod_clock_base.tod;
 
 	if (!test_facility(28))
 		return;
@@ -359,7 +359,7 @@ static void clock_sync_global(long delta)
 	/* Fixup the monotonic sched clock. */
 	tod_clock_base.eitod += delta;
 	for (cs = 0; cs < CS_BASES; cs++)
-		vdso_data[cs].arch_data.tod_delta = tod_clock_base.tod;
+		vdso_k_time_data[cs].arch_data.tod_delta = tod_clock_base.tod;
 
 	/* Update LPAR offset. */
 	if (ptff_query(PTFF_QTO) && ptff(&qto, sizeof(qto), PTFF_QTO) == 0)
