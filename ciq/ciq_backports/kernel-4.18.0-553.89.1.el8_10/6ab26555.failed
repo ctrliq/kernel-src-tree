@@ -1,0 +1,155 @@
+gfs2: Add proper lockspace locking
+
+jira KERNEL-325
+Rebuild_History Non-Buildable kernel-4.18.0-553.89.1.el8_10
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 6ab26555c9ffef96c56ca16356e55ac5ab61ec93
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.89.1.el8_10/6ab26555.failed
+
+GFS2 has been calling functions like dlm_lock() even after the lockspace
+that these functions operate on has been released with
+dlm_release_lockspace().  It has always assumed that those functions
+would return -EINVAL in that case, but that was never guaranteed, and it
+certainly is no longer the case since commit 4db41bf4f04f ("dlm: remove
+ls_local_handle from struct dlm_ls").
+
+To fix that, add proper lockspace locking.
+
+Fixes: 3e11e5304150 ("GFS2: ignore unlock failures after withdraw")
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+	Reviewed-by: Andrew Price <anprice@redhat.com>
+(cherry picked from commit 6ab26555c9ffef96c56ca16356e55ac5ab61ec93)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/file.c
+#	fs/gfs2/lock_dlm.c
+diff --cc fs/gfs2/file.c
+index dd07e0f60888,bc67fa058c84..000000000000
+--- a/fs/gfs2/file.c
++++ b/fs/gfs2/file.c
+@@@ -1414,28 -1442,44 +1414,46 @@@ static int gfs2_lock(struct file *file
+  	struct gfs2_inode *ip = GFS2_I(file->f_mapping->host);
+  	struct gfs2_sbd *sdp = GFS2_SB(file->f_mapping->host);
+  	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
++ 	int ret;
+  
+ -	if (!(fl->c.flc_flags & FL_POSIX))
+ +	if (!(fl->fl_flags & FL_POSIX))
+ +		return -ENOLCK;
+ +	if (__mandatory_lock(&ip->i_inode) && fl->fl_type != F_UNLCK)
+  		return -ENOLCK;
+ -	if (gfs2_withdrawing_or_withdrawn(sdp)) {
+ -		if (lock_is_unlock(fl))
+ +
+ +	if (cmd == F_CANCELLK) {
+ +		/* Hack: */
+ +		cmd = F_SETLK;
+ +		fl->fl_type = F_UNLCK;
+ +	}
+ +	if (unlikely(gfs2_withdrawn(sdp))) {
+ +		if (fl->fl_type == F_UNLCK)
+  			locks_lock_file_wait(file, fl);
+  		return -EIO;
+  	}
+++<<<<<<< HEAD
+ +	if (IS_GETLK(cmd))
+ +		return dlm_posix_get(ls->ls_dlm, ip->i_no_addr, file, fl);
+ +	else if (fl->fl_type == F_UNLCK)
+ +		return dlm_posix_unlock(ls->ls_dlm, ip->i_no_addr, file, fl);
+ +	else
+ +		return dlm_posix_lock(ls->ls_dlm, ip->i_no_addr, file, cmd, fl);
+++=======
++ 	down_read(&ls->ls_sem);
++ 	ret = -ENODEV;
++ 	if (likely(ls->ls_dlm != NULL)) {
++ 		if (cmd == F_CANCELLK)
++ 			ret = dlm_posix_cancel(ls->ls_dlm, ip->i_no_addr, file, fl);
++ 		else if (IS_GETLK(cmd))
++ 			ret = dlm_posix_get(ls->ls_dlm, ip->i_no_addr, file, fl);
++ 		else if (lock_is_unlock(fl))
++ 			ret = dlm_posix_unlock(ls->ls_dlm, ip->i_no_addr, file, fl);
++ 		else
++ 			ret = dlm_posix_lock(ls->ls_dlm, ip->i_no_addr, file, cmd, fl);
++ 	}
++ 	up_read(&ls->ls_sem);
++ 	return ret;
+ -}
+ -
+ -static void __flock_holder_uninit(struct file *file, struct gfs2_holder *fl_gh)
+ -{
+ -	struct gfs2_glock *gl = gfs2_glock_hold(fl_gh->gh_gl);
+ -
+ -	/*
+ -	 * Make sure gfs2_glock_put() won't sleep under the file->f_lock
+ -	 * spinlock.
+ -	 */
+ -
+ -	spin_lock(&file->f_lock);
+ -	gfs2_holder_uninit(fl_gh);
+ -	spin_unlock(&file->f_lock);
+ -	gfs2_glock_put(gl);
+++>>>>>>> 6ab26555c9ff (gfs2: Add proper lockspace locking)
+  }
+  
+  static int do_flock(struct file *file, int cmd, struct file_lock *fl)
+diff --cc fs/gfs2/lock_dlm.c
+index 0579fdbc9c63,3c7db20ce564..000000000000
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@@ -334,9 -363,17 +339,19 @@@ static void gdlm_put_lock(struct gfs2_g
+  		return;
+  	}
+  
+ -	if (gl->gl_lksb.sb_lvbptr)
+ -		flags |= DLM_LKF_VALBLK;
+ -
+  again:
+++<<<<<<< HEAD
+ +	error = dlm_unlock(ls->ls_dlm, gl->gl_lksb.sb_lkid, DLM_LKF_VALBLK,
+ +			   NULL, gl);
+++=======
++ 	down_read(&ls->ls_sem);
++ 	error = -ENODEV;
++ 	if (likely(ls->ls_dlm != NULL)) {
++ 		error = dlm_unlock(ls->ls_dlm, gl->gl_lksb.sb_lkid, flags,
++ 				   NULL, gl);
++ 	}
++ 	up_read(&ls->ls_sem);
+++>>>>>>> 6ab26555c9ff (gfs2: Add proper lockspace locking)
+  	if (error == -EBUSY) {
+  		msleep(20);
+  		goto again;
+* Unmerged path fs/gfs2/file.c
+diff --git a/fs/gfs2/glock.c b/fs/gfs2/glock.c
+index de182757764b..8581006a1023 100644
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@ -827,9 +827,8 @@ __acquires(&gl->gl_lockref.lock)
+ 		}
+ 		clear_bit(GLF_PENDING_REPLY, &gl->gl_flags);
+ 
+-		if (ret == -EINVAL && gl->gl_target == LM_ST_UNLOCKED &&
+-		    target == LM_ST_UNLOCKED &&
+-		    test_bit(DFL_UNMOUNT, &ls->ls_recover_flags)) {
++		if (ret == -ENODEV && gl->gl_target == LM_ST_UNLOCKED &&
++		    target == LM_ST_UNLOCKED) {
+ 			/*
+ 			 * The lockspace has been released and the lock has
+ 			 * been unlocked implicitly.
+diff --git a/fs/gfs2/incore.h b/fs/gfs2/incore.h
+index 6eca783f0691..36018c48b8f2 100644
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@ -665,6 +665,8 @@ struct lm_lockstruct {
+ 	struct completion ls_sync_wait; /* {control,mounted}_{lock,unlock} */
+ 	char *ls_lvb_bits;
+ 
++	struct rw_semaphore ls_sem;
++
+ 	spinlock_t ls_recover_spin; /* protects following fields */
+ 	unsigned long ls_recover_flags; /* DFL_ */
+ 	uint32_t ls_recover_mount; /* gen in first recover_done cb */
+* Unmerged path fs/gfs2/lock_dlm.c
