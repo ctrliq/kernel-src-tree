@@ -625,7 +625,7 @@ extern void raise_hrtimer_softirq(void);
 
 static inline unsigned int local_pending_timers(void)
 {
-	return __this_cpu_read(pending_timer_softirq);
+        return __this_cpu_read(pending_timer_softirq);
 }
 
 #else
@@ -641,7 +641,7 @@ static inline void raise_hrtimer_softirq(void)
 
 static inline unsigned int local_pending_timers(void)
 {
-	return local_softirq_pending();
+        return local_softirq_pending();
 }
 #endif
 

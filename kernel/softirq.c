@@ -637,10 +637,10 @@ DEFINE_PER_CPU(unsigned long, pending_timer_softirq);
 
 static void wake_timersd(void)
 {
-	struct task_struct *tsk = __this_cpu_read(timersd);
+        struct task_struct *tsk = __this_cpu_read(timersd);
 
-	if (tsk)
-		wake_up_process(tsk);
+        if (tsk)
+                wake_up_process(tsk);
 }
 
 #else
@@ -997,12 +997,12 @@ static struct smp_hotplug_thread softirq_threads = {
 #ifdef CONFIG_PREEMPT_RT
 static void timersd_setup(unsigned int cpu)
 {
-	sched_set_fifo_low(current);
+        sched_set_fifo_low(current);
 }
 
 static int timersd_should_run(unsigned int cpu)
 {
-	return local_pending_timers();
+        return local_pending_timers();
 }
 
 static void run_timersd(unsigned int cpu)
@@ -1042,11 +1042,11 @@ void raise_timer_softirq(void)
 }
 
 static struct smp_hotplug_thread timer_threads = {
-	.store			= &timersd,
-	.setup			= timersd_setup,
-	.thread_should_run	= timersd_should_run,
-	.thread_fn		= run_timersd,
-	.thread_comm		= "ktimers/%u",
+        .store                  = &timersd,
+        .setup                  = timersd_setup,
+        .thread_should_run      = timersd_should_run,
+        .thread_fn              = run_timersd,
+        .thread_comm            = "ktimers/%u",
 };
 #endif
 
