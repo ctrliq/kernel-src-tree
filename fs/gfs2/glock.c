@@ -1611,6 +1611,7 @@ static void __gfs2_glock_dq(struct gfs2_holder *gh)
 	list_del_init(&gh->gh_list);
 	clear_bit(HIF_HOLDER, &gh->gh_iflags);
 	trace_gfs2_glock_queue(gh, 0);
+	clear_bit(HIF_WAIT, &gh->gh_iflags);
 
 	/*
 	 * If there hasn't been a demote request we are done.
