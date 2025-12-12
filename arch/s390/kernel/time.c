@@ -77,11 +77,8 @@ void __init time_early_init(void)
 {
 	struct ptff_qto qto;
 	struct ptff_qui qui;
-	int cs;
 
-	/* Initialize TOD steering parameters */
-	for (cs = 0; cs < CS_BASES; cs++)
-		vdso_k_time_data[cs].arch_data.tod_delta = tod_clock_base.tod;
+	vdso_k_time_data->arch_data.tod_delta = tod_clock_base.tod;
 
 	if (!test_facility(28))
 		return;
@@ -354,12 +351,10 @@ static inline int check_sync_clock(void)
 static void clock_sync_global(long delta)
 {
 	struct ptff_qto qto;
-	int cs;
 
 	/* Fixup the monotonic sched clock. */
 	tod_clock_base.eitod += delta;
-	for (cs = 0; cs < CS_BASES; cs++)
-		vdso_k_time_data[cs].arch_data.tod_delta = tod_clock_base.tod;
+	vdso_k_time_data->arch_data.tod_delta = tod_clock_base.tod;
 
 	/* Update LPAR offset. */
 	if (ptff_query(PTFF_QTO) && ptff(&qto, sizeof(qto), PTFF_QTO) == 0)
