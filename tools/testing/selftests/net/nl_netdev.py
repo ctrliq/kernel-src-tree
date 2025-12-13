@@ -36,14 +36,14 @@ def napi_set_threaded(nf) -> None:
         napi1_id = napis[1]['id']
 
         # set napi threaded and verify
-        nf.napi_set({'id': napi0_id, 'threaded': 1})
+        nf.napi_set({'id': napi0_id, 'threaded': "enabled"})
         napi0 = nf.napi_get({'id': napi0_id})
-        ksft_eq(napi0['threaded'], 1)
+        ksft_eq(napi0['threaded'], "enabled")
         ksft_ne(napi0.get('pid'), None)
 
         # check it is not set for napi1
         napi1 = nf.napi_get({'id': napi1_id})
-        ksft_eq(napi1['threaded'], 0)
+        ksft_eq(napi1['threaded'], "disabled")
         ksft_eq(napi1.get('pid'), None)
 
         ip(f"link set dev {nsim.ifname} down")
@@ -51,18 +51,18 @@ def napi_set_threaded(nf) -> None:
 
         # verify if napi threaded is still set
         napi0 = nf.napi_get({'id': napi0_id})
-        ksft_eq(napi0['threaded'], 1)
+        ksft_eq(napi0['threaded'], "enabled")
         ksft_ne(napi0.get('pid'), None)
 
         # check it is still not set for napi1
         napi1 = nf.napi_get({'id': napi1_id})
-        ksft_eq(napi1['threaded'], 0)
+        ksft_eq(napi1['threaded'], "disabled")
         ksft_eq(napi1.get('pid'), None)
 
         # unset napi threaded and verify
-        nf.napi_set({'id': napi0_id, 'threaded': 0})
+        nf.napi_set({'id': napi0_id, 'threaded': "disabled"})
         napi0 = nf.napi_get({'id': napi0_id})
-        ksft_eq(napi0['threaded'], 0)
+        ksft_eq(napi0['threaded'], "disabled")
         ksft_eq(napi0.get('pid'), None)
 
         # set threaded at device level
@@ -70,10 +70,10 @@ def napi_set_threaded(nf) -> None:
 
         # check napi threaded is set for both napis
         napi0 = nf.napi_get({'id': napi0_id})
-        ksft_eq(napi0['threaded'], 1)
+        ksft_eq(napi0['threaded'], "enabled")
         ksft_ne(napi0.get('pid'), None)
         napi1 = nf.napi_get({'id': napi1_id})
-        ksft_eq(napi1['threaded'], 1)
+        ksft_eq(napi1['threaded'], "enabled")
         ksft_ne(napi1.get('pid'), None)
 
         # unset threaded at device level
@@ -81,16 +81,16 @@ def napi_set_threaded(nf) -> None:
 
         # check napi threaded is unset for both napis
         napi0 = nf.napi_get({'id': napi0_id})
-        ksft_eq(napi0['threaded'], 0)
+        ksft_eq(napi0['threaded'], "disabled")
         ksft_eq(napi0.get('pid'), None)
         napi1 = nf.napi_get({'id': napi1_id})
-        ksft_eq(napi1['threaded'], 0)
+        ksft_eq(napi1['threaded'], "disabled")
         ksft_eq(napi1.get('pid'), None)
 
         # set napi threaded for napi0
         nf.napi_set({'id': napi0_id, 'threaded': 1})
         napi0 = nf.napi_get({'id': napi0_id})
-        ksft_eq(napi0['threaded'], 1)
+        ksft_eq(napi0['threaded'], "enabled")
         ksft_ne(napi0.get('pid'), None)
 
         # unset threaded at device level
@@ -98,10 +98,10 @@ def napi_set_threaded(nf) -> None:
 
         # check napi threaded is unset for both napis
         napi0 = nf.napi_get({'id': napi0_id})
-        ksft_eq(napi0['threaded'], 0)
+        ksft_eq(napi0['threaded'], "disabled")
         ksft_eq(napi0.get('pid'), None)
         napi1 = nf.napi_get({'id': napi1_id})
-        ksft_eq(napi1['threaded'], 0)
+        ksft_eq(napi1['threaded'], "disabled")
         ksft_eq(napi1.get('pid'), None)
 
 def dev_set_threaded(nf) -> None:
@@ -125,10 +125,10 @@ def dev_set_threaded(nf) -> None:
 
         # check napi threaded is set for both napis
         napi0 = nf.napi_get({'id': napi0_id})
-        ksft_eq(napi0['threaded'], 1)
+        ksft_eq(napi0['threaded'], "enabled")
         ksft_ne(napi0.get('pid'), None)
         napi1 = nf.napi_get({'id': napi1_id})
-        ksft_eq(napi1['threaded'], 1)
+        ksft_eq(napi1['threaded'], "enabled")
         ksft_ne(napi1.get('pid'), None)
 
         # unset threaded
@@ -136,10 +136,10 @@ def dev_set_threaded(nf) -> None:
 
         # check napi threaded is unset for both napis
         napi0 = nf.napi_get({'id': napi0_id})
-        ksft_eq(napi0['threaded'], 0)
+        ksft_eq(napi0['threaded'], "disabled")
         ksft_eq(napi0.get('pid'), None)
         napi1 = nf.napi_get({'id': napi1_id})
-        ksft_eq(napi1['threaded'], 0)
+        ksft_eq(napi1['threaded'], "disabled")
         ksft_eq(napi1.get('pid'), None)
 
 def page_pool_check(nf) -> None:
