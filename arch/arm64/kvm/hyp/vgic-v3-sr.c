@@ -295,13 +295,16 @@ void __vgic_v3_activate_traps(struct vgic_v3_cpu_if *cpu_if)
 		}
 	}
 
-	/*
-	 * Prevent the guest from touching the ICC_SRE_EL1 system
-	 * register. Note that this may not have any effect, as
-	 * ICC_SRE_EL2.Enable being RAO/WI is a valid implementation.
-	 */
-	write_gicreg(read_gicreg(ICC_SRE_EL2) & ~ICC_SRE_EL2_ENABLE,
-		     ICC_SRE_EL2);
+	/* Only disable SRE if the host implements the GICv2 interface */
+	if (static_branch_unlikely(&vgic_v3_has_v2_compat)) {
+		/*
+		 * Prevent the guest from touching the ICC_SRE_EL1 system
+		 * register. Note that this may not have any effect, as
+		 * ICC_SRE_EL2.Enable being RAO/WI is a valid implementation.
+		 */
+		write_gicreg(read_gicreg(ICC_SRE_EL2) & ~ICC_SRE_EL2_ENABLE,
+			     ICC_SRE_EL2);
+	}
 
 	/*
 	 * If we need to trap system registers, we must write
@@ -322,13 +325,16 @@ void __vgic_v3_deactivate_traps(struct vgic_v3_cpu_if *cpu_if)
 		cpu_if->vgic_vmcr = read_gicreg(ICH_VMCR_EL2);
 	}
 
-	val = read_gicreg(ICC_SRE_EL2);
-	write_gicreg(val | ICC_SRE_EL2_ENABLE, ICC_SRE_EL2);
+	/* Only restore SRE if the host implements the GICv2 interface */
+	if (static_branch_unlikely(&vgic_v3_has_v2_compat)) {
+		val = read_gicreg(ICC_SRE_EL2);
+		write_gicreg(val | ICC_SRE_EL2_ENABLE, ICC_SRE_EL2);
 
-	if (!cpu_if->vgic_sre) {
-		/* Make sure ENABLE is set at EL2 before setting SRE at EL1 */
-		isb();
-		write_gicreg(1, ICC_SRE_EL1);
+		if (!cpu_if->vgic_sre) {
+			/* Make sure ENABLE is set at EL2 before setting SRE at EL1 */
+			isb();
+			write_gicreg(1, ICC_SRE_EL1);
+		}
 	}
 
 	/*
