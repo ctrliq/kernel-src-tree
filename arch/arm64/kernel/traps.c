@@ -1094,7 +1094,7 @@ int kasan_brk_handler(struct pt_regs *regs, unsigned long esr)
 #ifdef CONFIG_UBSAN_TRAP
 int ubsan_brk_handler(struct pt_regs *regs, unsigned long esr)
 {
-	die(report_ubsan_failure(regs, esr & UBSAN_BRK_MASK), regs, esr);
+	die(report_ubsan_failure(esr & UBSAN_BRK_MASK), regs, esr);
 	return DBG_HOOK_HANDLED;
 }
 #endif
