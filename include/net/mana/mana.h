@@ -4,6 +4,9 @@
 #ifndef _MANA_H
 #define _MANA_H
 
+#include <linux/rh_kabi.h>
+#include RH_KABI_HIDE_INCLUDE(<net/net_shaper.h>)
+
 #include "gdma.h"
 #include "hw_channel.h"
 
@@ -552,6 +555,14 @@ struct mana_port_context {
 
 	/* Debugfs */
 	struct dentry *mana_port_debugfs;
+
+	/* Fields added via RH_KABI_EXTEND to preserve kABI for MANA symbols
+	 * added to the kABI whitelist in RHEL 9.8.
+	 * Upstream commits: 75cabb46935b ("net: mana: Add support for net_shaper_ops")
+	 * and a6d5edf11e0c ("net: mana: Add speed support in mana_get_link_ksettings")
+	 */
+	RH_KABI_EXTEND(struct net_shaper_handle handle)
+	RH_KABI_EXTEND(u32 speed)
 };
 
 netdev_tx_t mana_start_xmit(struct sk_buff *skb, struct net_device *ndev);
@@ -577,6 +588,9 @@ struct bpf_prog *mana_xdp_get(struct mana_port_context *apc);
 void mana_chn_setxdp(struct mana_port_context *apc, struct bpf_prog *prog);
 int mana_bpf(struct net_device *ndev, struct netdev_bpf *bpf);
 int mana_query_gf_stats(struct mana_context *ac);
+int mana_query_link_cfg(struct mana_port_context *apc);
+int mana_set_bw_clamp(struct mana_port_context *apc, u32 speed,
+		      int enable_clamping);
 void mana_query_phy_stats(struct mana_port_context *apc);
 int mana_pre_alloc_rxbufs(struct mana_port_context *apc, int mtu, int num_queues);
 void mana_pre_dealloc_rxbufs(struct mana_port_context *apc);
@@ -605,6 +619,8 @@ enum mana_command_code {
 	MANA_FENCE_RQ		= 0x20006,
 	MANA_CONFIG_VPORT_RX	= 0x20007,
 	MANA_QUERY_VPORT_CONFIG	= 0x20008,
+	RH_KABI_EXTEND_ENUM(MANA_QUERY_LINK_CONFIG = 0x2000A)
+	RH_KABI_EXTEND_ENUM(MANA_SET_BW_CLAMP = 0x2000B)
 	MANA_QUERY_PHY_STAT     = 0x2000c,
 
 	/* Privileged commands for the PF mode */
@@ -613,6 +629,35 @@ enum mana_command_code {
 	MANA_REGISTER_HW_PORT	= 0x28003,
 	MANA_DEREGISTER_HW_PORT	= 0x28004,
 };
+
+/* Query Link Configuration*/
+struct mana_query_link_config_req {
+	struct gdma_req_hdr hdr;
+	mana_handle_t vport;
+}; /* HW DATA */
+
+struct mana_query_link_config_resp {
+	struct gdma_resp_hdr hdr;
+	u32 qos_speed_mbps;
+	u8 qos_unconfigured;
+	u8 reserved1[3];
+	u32 link_speed_mbps;
+	u8 reserved2[4];
+}; /* HW DATA */
+
+/* Set Bandwidth Clamp*/
+struct mana_set_bw_clamp_req {
+	struct gdma_req_hdr hdr;
+	mana_handle_t vport;
+	enum TRI_STATE enable_clamping;
+	u32 link_speed_mbps;
+}; /* HW DATA */
+
+struct mana_set_bw_clamp_resp {
+	struct gdma_resp_hdr hdr;
+	u8 qos_unconfigured;
+	u8 reserved[7];
+}; /* HW DATA */
 
 /* Query Device Configuration */
 struct mana_query_device_cfg_req {
