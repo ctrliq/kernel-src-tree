@@ -318,7 +318,6 @@ err_ipc:
 	if (!adev->logged_resources) {
 		avs_dsp_enable_d0ix(adev);
 err_d0ix:
-		pm_runtime_mark_last_busy(adev->dev);
 		pm_runtime_put_autosuspend(adev->dev);
 	}
 
@@ -345,7 +344,6 @@ static int disable_logs(struct avs_dev *adev, u32 resource_mask)
 	/* If that's the last resource, allow for D3. */
 	if (!adev->logged_resources) {
 		avs_dsp_enable_d0ix(adev);
-		pm_runtime_mark_last_busy(adev->dev);
 		pm_runtime_put_autosuspend(adev->dev);
 	}
 
