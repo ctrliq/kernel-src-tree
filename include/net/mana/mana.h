@@ -563,6 +563,7 @@ struct mana_port_context {
 	 */
 	RH_KABI_EXTEND(struct net_shaper_handle handle)
 	RH_KABI_EXTEND(u32 speed)
+	RH_KABI_EXTEND(u32 max_speed)
 };
 
 netdev_tx_t mana_start_xmit(struct sk_buff *skb, struct net_device *ndev);
