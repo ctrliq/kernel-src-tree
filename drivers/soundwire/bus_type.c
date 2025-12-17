@@ -19,7 +19,7 @@
  * struct sdw_device_id.
  */
 static const struct sdw_device_id *
-sdw_get_device_id(struct sdw_slave *slave, struct sdw_driver *drv)
+sdw_get_device_id(struct sdw_slave *slave, const struct sdw_driver *drv)
 {
 	const struct sdw_device_id *id;
 
@@ -35,10 +35,10 @@ sdw_get_device_id(struct sdw_slave *slave, struct sdw_driver *drv)
 	return NULL;
 }
 
-static int sdw_bus_match(struct device *dev, struct device_driver *ddrv)
+static int sdw_bus_match(struct device *dev, const struct device_driver *ddrv)
 {
 	struct sdw_slave *slave;
-	struct sdw_driver *drv;
+	const struct sdw_driver *drv;
 	int ret = 0;
 
 	if (is_sdw_slave(dev)) {
@@ -217,6 +217,7 @@ int __sdw_register_driver(struct sdw_driver *drv, struct module *owner)
 	drv->driver.probe = sdw_drv_probe;
 	drv->driver.remove = sdw_drv_remove;
 	drv->driver.shutdown = sdw_drv_shutdown;
+	drv->driver.dev_groups = sdw_attr_groups;
 
 	return driver_register(&drv->driver);
 }

@@ -56,9 +56,9 @@ bool __nd_attach_ndns(struct device *dev, struct nd_namespace_common *attach,
 	return true;
 }
 
-static int namespace_match(struct device *dev, void *data)
+static int namespace_match(struct device *dev, const void *data)
 {
-	char *name = data;
+	const char *name = data;
 
 	return strcmp(name, dev_name(dev)) == 0;
 }

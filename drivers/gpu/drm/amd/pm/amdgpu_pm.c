@@ -4467,7 +4467,7 @@ int amdgpu_pm_sysfs_init(struct amdgpu_device *adev)
 		ret = devm_device_add_group(adev->dev,
 					    &amdgpu_pm_policy_attr_group);
 		if (ret)
-			goto err_out0;
+			goto err_out1;
 	}
 
 	adev->pm.sysfs_initialized = true;
