@@ -276,6 +276,10 @@ static int acpi_processor_get_power_info_fadt(struct acpi_processor *pr)
 			 ACPI_CX_DESC_LEN, "ACPI P_LVL3 IOPORT 0x%x",
 			 pr->power.states[ACPI_STATE_C3].address);
 
+	if (!pr->power.states[ACPI_STATE_C2].address &&
+	    !pr->power.states[ACPI_STATE_C3].address)
+		return -ENODEV;
+
 	return 0;
 }
 
@@ -465,9 +469,7 @@ static int acpi_processor_power_verify(struct acpi_processor *pr)
 
 static int acpi_processor_get_cstate_info(struct acpi_processor *pr)
 {
-	unsigned int i;
 	int result;
-
 
 	/* NOTE: the idle thread may not be running while calling
 	 * this function */
@@ -485,17 +487,7 @@ static int acpi_processor_get_cstate_info(struct acpi_processor *pr)
 	acpi_processor_get_power_info_default(pr);
 
 	pr->power.count = acpi_processor_power_verify(pr);
-
-	/*
-	 * if one state of type C2 or C3 is available, mark this
-	 * CPU as being "idle manageable"
-	 */
-	for (i = 1; i < ACPI_PROCESSOR_MAX_POWER; i++) {
-		if (pr->power.states[i].valid) {
-			pr->power.count = i;
-			pr->flags.power = 1;
-		}
-	}
+	pr->flags.power = 1;
 
 	return 0;
 }
@@ -810,12 +802,12 @@ static int acpi_processor_setup_cstates(struct acpi_processor *pr)
 		state->enter = acpi_idle_enter;
 
 		state->flags = 0;
-		if (cx->type == ACPI_STATE_C1 || cx->type == ACPI_STATE_C2 ||
-		    cx->type == ACPI_STATE_C3) {
-			state->enter_dead = acpi_idle_play_dead;
-			if (cx->type != ACPI_STATE_C3)
-				drv->safe_state_index = count;
-		}
+
+		state->enter_dead = acpi_idle_play_dead;
+
+		if (cx->type == ACPI_STATE_C1 || cx->type == ACPI_STATE_C2)
+			drv->safe_state_index = count;
+
 		/*
 		 * Halt-induced C1 is not good for ->enter_s2idle, because it
 		 * re-enables interrupts on exit.  Moreover, C1 is generally not
