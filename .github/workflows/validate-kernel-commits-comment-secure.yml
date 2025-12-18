@@ -1,0 +1,435 @@
+name: Validate Kernel Commits - Post Comments (Secure)
+
+on:
+  workflow_run:
+    workflows: ["Validate Kernel Commits"]
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Workflow run ID to fetch artifacts from"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write  # Need write to post comments
+
+jobs:
+  post-comments:
+    runs-on: ubuntu-latest
+    # Only run if the check workflow succeeded or failed (not skipped/cancelled)
+    # For workflow_dispatch, always run (manual testing)
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' || github.event.workflow_run.conclusion == 'failure')
+
+    steps:
+      - name: Download check results
+        uses: actions/download-artifact@v4
+        with:
+          name: check-results
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.event_name == 'workflow_dispatch' && inputs.run_id || github.event.workflow_run.id }}
+
+      - name: Verify artifact integrity
+        run: |
+          if [ ! -f pr_metadata/checksums.txt ]; then
+            echo "⚠️ Warning: No checksums file found, skipping integrity check"
+          else
+            cd pr_metadata
+            if sha256sum -c checksums.txt --quiet; then
+              echo "✅ Artifact integrity verified"
+            else
+              echo "❌ Artifact integrity check failed!"
+              exit 1
+            fi
+            cd ..
+          fi
+
+      - name: Read and validate PR metadata
+        id: pr_metadata
+        run: |
+          if [ ! -f pr_metadata/pr_number.txt ]; then
+            echo "❌ PR metadata not found - check workflow may have failed before saving metadata"
+            exit 1
+          fi
+
+          # Read values into variables (not step outputs yet - validate first!)
+          PR_NUMBER=$(cat pr_metadata/pr_number.txt)
+          REPOSITORY=$(cat pr_metadata/repository.txt)
+          BASE_REF=$(cat pr_metadata/base_ref.txt)
+          HEAD_SHA=$(cat pr_metadata/head_sha.txt)
+          HEAD_REPO=$(cat pr_metadata/head_repo.txt)
+
+          # === CRITICAL VALIDATION: Prevent command injection ===
+
+          # Validate PR number is actually a number
+          if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "❌ Security: Invalid PR number format: $PR_NUMBER"
+            exit 1
+          fi
+
+          # Validate PR number is reasonable (1 to 7 digits)
+          if [ "$PR_NUMBER" -lt 1 ] || [ "$PR_NUMBER" -gt 9999999 ]; then
+            echo "❌ Security: PR number out of range: $PR_NUMBER"
+            exit 1
+          fi
+
+          # Validate repository format (owner/repo)
+          if ! [[ "$REPOSITORY" =~ ^[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+$ ]]; then
+            echo "❌ Security: Invalid repository format: $REPOSITORY"
+            exit 1
+          fi
+
+          # Validate repository name length
+          if [ ${#REPOSITORY} -gt 100 ]; then
+            echo "❌ Security: Repository name too long"
+            exit 1
+          fi
+
+          # Validate SHA is exactly 40 hex characters
+          if ! [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "❌ Security: Invalid SHA format: $HEAD_SHA"
+            exit 1
+          fi
+
+          # Validate branch name (alphanumeric, dots, slashes, dashes, underscores, curly braces)
+          if ! [[ "$BASE_REF" =~ ^[a-zA-Z0-9/_.{}-]+$ ]]; then
+            echo "❌ Security: Invalid base branch name: $BASE_REF"
+            exit 1
+          fi
+
+          # Validate branch name length
+          if [ ${#BASE_REF} -gt 255 ]; then
+            echo "❌ Security: Branch name too long"
+            exit 1
+          fi
+
+          # Validate head repo format (can be empty for deleted forks)
+          if [ -n "$HEAD_REPO" ] && ! [[ "$HEAD_REPO" =~ ^[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+$ ]]; then
+            echo "❌ Security: Invalid head repo format: $HEAD_REPO"
+            exit 1
+          fi
+
+          # === All validation passed - safe to use ===
+          echo "✅ All metadata validation passed"
+
+          # Now safe to output (these will be used in subsequent steps)
+          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+          echo "repository=$REPOSITORY" >> $GITHUB_OUTPUT
+          echo "base_ref=$BASE_REF" >> $GITHUB_OUTPUT
+          echo "head_sha=$HEAD_SHA" >> $GITHUB_OUTPUT
+          echo "head_repo=$HEAD_REPO" >> $GITHUB_OUTPUT
+
+      - name: Check if PR is from fork
+        id: is_fork
+        run: |
+          if [ "${{ steps.pr_metadata.outputs.head_repo }}" = "${{ steps.pr_metadata.outputs.repository }}" ]; then
+            echo "result=false" >> $GITHUB_OUTPUT
+            echo "✅ Internal PR detected"
+          else
+            echo "result=false" >> $GITHUB_OUTPUT
+            echo "✅ Fork PR detected - JIRA checks will be skipped"
+          fi
+
+      - name: Post workflow run link to PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr_metadata.outputs.pr_number }}
+          REPOSITORY: ${{ steps.pr_metadata.outputs.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          BODY="🤖 **Validation Checks In Progress** \
+          \
+          Workflow run: $RUN_URL \
+          \
+          This comment will be updated with check results when complete."
+
+          gh pr comment "$PR_NUMBER" \
+            --body "$BODY" \
+            --repo "$REPOSITORY"
+
+      - name: Validate comment files
+        run: |
+          # Validate result files exist and are reasonable size
+          if [ -f ckc_result.txt ]; then
+            FILE_SIZE=$(stat -f%z ckc_result.txt 2>/dev/null || stat -c%s ckc_result.txt 2>/dev/null)
+            if [ "$FILE_SIZE" -gt 1048576 ]; then  # 1MB limit
+              echo "❌ Security: ckc_result.txt file too large: $FILE_SIZE bytes"
+              exit 1
+            fi
+            echo "✅ ckc_result.txt validated (size: $FILE_SIZE bytes)"
+          fi
+
+          if [ -f interdiff_result.txt ]; then
+            FILE_SIZE=$(stat -f%z interdiff_result.txt 2>/dev/null || stat -c%s interdiff_result.txt 2>/dev/null)
+            if [ "$FILE_SIZE" -gt 1048576 ]; then  # 1MB limit
+              echo "❌ Security: interdiff_result.txt file too large: $FILE_SIZE bytes"
+              exit 1
+            fi
+            echo "✅ interdiff_result.txt validated (size: $FILE_SIZE bytes)"
+          fi
+
+      - name: Comment on PR if check-kernel-commits issues found
+        if: hashFiles('ckc_result.txt') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr_metadata.outputs.pr_number }}
+          REPOSITORY: ${{ steps.pr_metadata.outputs.repository }}
+        run: |
+          # Check if there are findings
+          if grep -q "All referenced commits exist upstream and have no Fixes: tags." ckc_result.txt; then
+            LINE_COUNT=$(wc -l < ckc_result.txt)
+            if [ "$LINE_COUNT" -le 1 ]; then
+              echo "✅ No check-kernel-commits findings, skipping comment"
+              exit 0
+            fi
+          fi
+
+          # Post comment using environment variables (prevents injection)
+          if ! gh pr comment "$PR_NUMBER" \
+            --body-file ckc_result.txt \
+            --repo "$REPOSITORY"; then
+            echo "❌ Failed to post check-kernel-commits comment to PR"
+            exit 1
+          fi
+
+          echo "✅ Posted check-kernel-commits comment to PR #$PR_NUMBER"
+
+      - name: Comment on PR if interdiff differences found
+        if: hashFiles('interdiff_result.txt') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr_metadata.outputs.pr_number }}
+          REPOSITORY: ${{ steps.pr_metadata.outputs.repository }}
+        run: |
+          # Check if there are differences
+          if grep -q "All backported commits match their upstream counterparts." interdiff_result.txt; then
+            LINE_COUNT=$(wc -l < interdiff_result.txt)
+            if [ "$LINE_COUNT" -le 1 ]; then
+              echo "✅ No interdiff differences, skipping comment"
+              exit 0
+            fi
+          fi
+
+          # Post comment using environment variables (prevents injection)
+          if ! gh pr comment "$PR_NUMBER" \
+            --body-file interdiff_result.txt \
+            --repo "$REPOSITORY"; then
+            echo "❌ Failed to post interdiff comment to PR"
+            exit 1
+          fi
+
+          echo "✅ Posted interdiff comment to PR #$PR_NUMBER"
+
+      - name: Checkout PR head for JIRA check
+        if: steps.is_fork.outputs.result == 'false'
+        env:
+          CLONE_URL: ${{ github.event_name == 'workflow_dispatch' && format('{0}/{1}.git', github.server_url, github.repository) || github.event.workflow_run.repository.clone_url }}
+          BASE_REF: ${{ steps.pr_metadata.outputs.base_ref }}
+          HEAD_SHA: ${{ steps.pr_metadata.outputs.head_sha }}
+        run: |
+          # Use environment variables to prevent command injection
+          # Clone into subdirectory since workspace contains artifacts
+          git clone --depth=1 --no-checkout "$CLONE_URL" -b "$BASE_REF" kernel-src-tree
+          cd kernel-src-tree
+          git fetch --depth=100 origin "$HEAD_SHA"
+          git checkout "$HEAD_SHA"
+
+          # Create a temporary branch to avoid detached HEAD issues
+          git checkout -b temp-pr-check
+
+          # Verify we're on the expected commit
+          ACTUAL_SHA=$(git rev-parse HEAD)
+          if [ "$ACTUAL_SHA" != "$HEAD_SHA" ]; then
+            echo "❌ Security: SHA mismatch after checkout!"
+            echo "Expected: $HEAD_SHA"
+            echo "Actual: $ACTUAL_SHA"
+            exit 1
+          fi
+
+          echo "✅ Checked out commit $HEAD_SHA to kernel-src-tree/ (on branch temp-pr-check)"
+
+      - name: Checkout kernel-src-tree-tools for JIRA check
+        if: steps.is_fork.outputs.result == 'false'
+        uses: actions/checkout@v4
+        with:
+          repository: ctrliq/kernel-src-tree-tools
+          ref: 'mainline'
+          path: kernel-src-tree-tools
+
+      - name: Set up Python for JIRA check
+        if: steps.is_fork.outputs.result == 'false'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install JIRA PR Check dependencies
+        if: steps.is_fork.outputs.result == 'false'
+        run: |
+          python -m pip install --upgrade pip
+          pip install jira
+
+      - name: Mask JIRA credentials
+        if: steps.is_fork.outputs.result == 'false'
+        run: |
+          echo "::add-mask::${{ secrets.JIRA_API_TOKEN }}"
+          echo "::add-mask::${{ secrets.JIRA_API_USER }}"
+          echo "::add-mask::${{ secrets.JIRA_URL }}"
+
+      - name: Run JIRA PR Check
+        if: steps.is_fork.outputs.result == 'false'
+        id: jira_check
+        continue-on-error: true  # Allow PR comments to be posted before failing workflow
+        env:
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_API_USER: ${{ secrets.JIRA_API_USER }}
+          JIRA_URL: ${{ secrets.JIRA_URL }}
+          BASE_REF: ${{ steps.pr_metadata.outputs.base_ref }}
+          HEAD_SHA: ${{ steps.pr_metadata.outputs.head_sha }}
+        working-directory: kernel-src-tree-tools
+        run: |
+          # Run script and capture output, ensuring credentials are never echoed
+          set +x  # Disable command echo to prevent credential exposure
+          set +e  # Don't exit on error, we want to capture the output
+
+          # Use environment variables for all arguments (prevents injection)
+          OUTPUT=$(python3 jira_pr_check.py \
+            --kernel-src-tree ../kernel-src-tree \
+            --merge-target "$BASE_REF" \
+            --pr-branch "$HEAD_SHA" 2>&1)
+          EXIT_CODE=$?
+
+          # Filter out any potential credential leaks from output
+          # Use fixed string matching to avoid regex issues with special chars in tokens
+          FILTERED_OUTPUT=$(echo "$OUTPUT" | grep -v -F -e "jira-user" -e "jira-key" -e "basic_auth" -e "Authorization" -e "Bearer")
+
+          # Additional safety: remove any lines that might contain the actual token
+          # Do this without putting the token in the command line
+          FILTERED_OUTPUT=$(echo "$FILTERED_OUTPUT" | grep -v "$JIRA_API_USER" || true)
+
+          echo "$FILTERED_OUTPUT"
+
+          # Save output using heredoc (safer than multiline strings)
+          {
+            echo "output<<JIRA_OUTPUT_EOF"
+            echo "$FILTERED_OUTPUT"
+            echo "JIRA_OUTPUT_EOF"
+          } >> $GITHUB_OUTPUT
+
+          # Check if there are any issues based on output patterns
+          if echo "$FILTERED_OUTPUT" | grep -q "❌ Errors:"; then
+            echo "has_issues=true" >> $GITHUB_OUTPUT
+
+            # Check specifically for LTS mismatch errors
+            if echo "$FILTERED_OUTPUT" | grep -q "expects branch"; then
+              echo "has_lts_mismatch=true" >> $GITHUB_OUTPUT
+            else
+              echo "has_lts_mismatch=false" >> $GITHUB_OUTPUT
+            fi
+          elif echo "$FILTERED_OUTPUT" | grep -q "⚠️ Warnings:"; then
+            echo "has_issues=true" >> $GITHUB_OUTPUT
+            echo "has_lts_mismatch=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_issues=false" >> $GITHUB_OUTPUT
+            echo "has_lts_mismatch=false" >> $GITHUB_OUTPUT
+          fi
+
+          # Exit with the script's exit code
+          exit $EXIT_CODE
+
+      - name: Comment PR with JIRA issues
+        if: steps.is_fork.outputs.result == 'false' && steps.jira_check.outputs.has_issues == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr_metadata.outputs.pr_number }}
+          REPOSITORY: ${{ steps.pr_metadata.outputs.repository }}
+          JIRA_OUTPUT: ${{ steps.jira_check.outputs.output }}
+        run: |
+          # Validate output size before posting
+          OUTPUT_SIZE=${#JIRA_OUTPUT}
+          if [ "$OUTPUT_SIZE" -gt 65536 ]; then  # 64KB limit
+            echo "⚠️ JIRA output too large ($OUTPUT_SIZE bytes), truncating"
+            JIRA_OUTPUT="${JIRA_OUTPUT:0:65000}... (output truncated due to size)"
+          fi
+
+          # Post comment using environment variable (prevents injection)
+          if ! gh pr comment "$PR_NUMBER" \
+            --body "$JIRA_OUTPUT" \
+            --repo "$REPOSITORY"; then
+            echo "❌ Failed to post JIRA check comment to PR"
+            exit 1
+          fi
+
+          echo "✅ Posted JIRA comment to PR #$PR_NUMBER"
+
+      - name: Dismiss previous bot reviews if checks pass
+        if: steps.is_fork.outputs.result == 'false' && steps.jira_check.outcome == 'success' && steps.jira_check.outputs.has_issues == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr_metadata.outputs.pr_number }}
+          REPOSITORY: ${{ steps.pr_metadata.outputs.repository }}
+        run: |
+          # Find and dismiss any previous "changes requested" reviews from github-actions bot
+          REVIEW_IDS=$(gh api "/repos/$REPOSITORY/pulls/$PR_NUMBER/reviews" \
+            --jq '.[] | select(.state == "CHANGES_REQUESTED" and .user.login == "github-actions[bot]") | .id')
+
+          if [ -n "$REVIEW_IDS" ]; then
+            echo "$REVIEW_IDS" | while read -r REVIEW_ID; do
+              echo "Dismissing review ID: $REVIEW_ID"
+              gh api "/repos/$REPOSITORY/pulls/$PR_NUMBER/reviews/$REVIEW_ID/dismissals" \
+                -X PUT \
+                -f message="All validation checks now pass. Issues have been resolved." \
+                -f event="DISMISS" || echo "⚠️ Failed to dismiss review $REVIEW_ID"
+            done
+            echo "✅ Dismissed previous change requests"
+          else
+            echo "ℹ️ No previous change requests to dismiss"
+          fi
+
+      - name: Request changes if LTS mismatch
+        if: steps.is_fork.outputs.result == 'false' && steps.jira_check.outputs.has_lts_mismatch == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr_metadata.outputs.pr_number }}
+          REPOSITORY: ${{ steps.pr_metadata.outputs.repository }}
+        run: |
+          gh pr review "$PR_NUMBER" \
+            --request-changes \
+            --body "⚠️ This PR contains VULN tickets that do not match the target LTS product. Please review the JIRA ticket assignments and ensure they match the merge target branch." \
+            --repo "$REPOSITORY"
+
+          echo "✅ Requested changes on PR #$PR_NUMBER"
+
+      - name: Fail workflow if JIRA errors found
+        if: steps.is_fork.outputs.result == 'false' && steps.jira_check.outcome == 'failure'
+        run: |
+          echo "❌ JIRA PR check failed - errors were found in one or more commits"
+          exit 1
+
+      - name: Post final summary to PR
+        if: always()  # Run even if previous steps failed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr_metadata.outputs.pr_number }}
+          REPOSITORY: ${{ steps.pr_metadata.outputs.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CONCLUSION: ${{ job.status }}
+        run: |
+          if [ "$CONCLUSION" = "success" ]; then
+            EMOJI="✅"
+            STATUS="completed successfully"
+          else
+            EMOJI="❌"
+            STATUS="completed with issues"
+          fi
+
+          BODY="$EMOJI **Validation checks $STATUS**\
+          \
+          View full results: $RUN_URL"
+
+          gh pr comment "$PR_NUMBER" \
+            --body "$BODY" \
+            --repo "$REPOSITORY" || echo "⚠️ Failed to post summary comment"
