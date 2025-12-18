@@ -738,14 +738,14 @@ static int lkb_idr_free(int id, void *p, void *data)
    This is because there may be LKBs queued as ASTs that have been unlinked
    from their RSBs and are pending deletion once the AST has been delivered */
 
-static int lockspace_busy(struct dlm_ls *ls, int force)
+static int lockspace_busy(struct dlm_ls *ls, int release_option)
 {
 	int rv;
 
 	spin_lock(&ls->ls_lkbidr_spin);
-	if (force == 0) {
+	if (release_option == DLM_RELEASE_NO_LOCKS) {
 		rv = idr_for_each(&ls->ls_lkbidr, lkb_idr_is_any, ls);
-	} else if (force == 1) {
+	} else if (release_option == DLM_RELEASE_UNUSED) {
 		rv = idr_for_each(&ls->ls_lkbidr, lkb_idr_is_local, ls);
 	} else {
 		rv = 0;
@@ -754,13 +754,13 @@ static int lockspace_busy(struct dlm_ls *ls, int force)
 	return rv;
 }
 
-static int release_lockspace(struct dlm_ls *ls, int force)
+static int release_lockspace(struct dlm_ls *ls, int release_option)
 {
 	struct dlm_rsb *rsb;
 	struct rb_node *n;
 	int i, busy, rv;
 
-	busy = lockspace_busy(ls, force);
+	busy = lockspace_busy(ls, release_option);
 
 	spin_lock(&lslist_lock);
 	if (ls->ls_create_count == 1) {
@@ -785,7 +785,8 @@ static int release_lockspace(struct dlm_ls *ls, int force)
 
 	dlm_device_deregister(ls);
 
-	if (force != 3 && dlm_user_daemon_available())
+	if (release_option != DLM_RELEASE_NO_EVENT &&
+	    dlm_user_daemon_available())
 		do_uevent(ls, 0);
 
 	dlm_recoverd_stop(ls);
@@ -866,11 +867,7 @@ static int release_lockspace(struct dlm_ls *ls, int force)
  * lockspace must continue to function as usual, participating in recoveries,
  * until this returns.
  *
- * Force has 4 possible values:
- * 0 - don't destroy locksapce if it has any LKBs
- * 1 - destroy lockspace if it has remote LKBs but not if it has local LKBs
- * 2 - destroy lockspace regardless of LKBs
- * 3 - destroy lockspace as part of a forced shutdown
+ * See DLM_RELEASE defines for release_option values and their meaning.
  */
 
 int dlm_release_lockspace(void *lockspace, int force)
