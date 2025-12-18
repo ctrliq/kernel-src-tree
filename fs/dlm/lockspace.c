@@ -743,7 +743,7 @@ static int lkb_idr_free(int id, void *p, void *data)
    This is because there may be LKBs queued as ASTs that have been unlinked
    from their RSBs and are pending deletion once the AST has been delivered */
 
-static int lockspace_busy(struct dlm_ls *ls, int release_option)
+static int lockspace_busy(struct dlm_ls *ls, unsigned int release_option)
 {
 	int rv;
 
@@ -759,7 +759,7 @@ static int lockspace_busy(struct dlm_ls *ls, int release_option)
 	return rv;
 }
 
-static int release_lockspace(struct dlm_ls *ls, int release_option)
+static int release_lockspace(struct dlm_ls *ls, unsigned int release_option)
 {
 	struct dlm_rsb *rsb;
 	struct rb_node *n;
@@ -875,7 +875,7 @@ static int release_lockspace(struct dlm_ls *ls, int release_option)
  * See DLM_RELEASE defines for release_option values and their meaning.
  */
 
-int dlm_release_lockspace(void *lockspace, int force)
+int dlm_release_lockspace(void *lockspace, unsigned int release_option)
 {
 	struct dlm_ls *ls;
 	int error;
@@ -886,7 +886,7 @@ int dlm_release_lockspace(void *lockspace, int force)
 	dlm_put_lockspace(ls);
 
 	mutex_lock(&ls_lock);
-	error = release_lockspace(ls, force);
+	error = release_lockspace(ls, release_option);
 	if (!error)
 		ls_count--;
 	if (!ls_count)
