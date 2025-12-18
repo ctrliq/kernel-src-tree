@@ -1,0 +1,281 @@
+name: Validate Kernel Commits - Check (Secure)
+
+on:
+  workflow_call:
+    # No inputs needed - uses github context from caller
+
+permissions:
+  contents: read
+  # No pull-requests: write needed - we don't comment here
+
+jobs:
+  validate-kernel-commits-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Validate and sanitize inputs
+        id: validate_inputs
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_COMMITS: ${{ github.event.pull_request.commits }}
+        run: |
+          # Validate base branch name (alphanumeric, dots, slashes, dashes, underscores, curly braces)
+          # Note: hyphen must be at end of character class or escaped to be literal
+          if ! [[ "$BASE_REF" =~ ^[a-zA-Z0-9/_.{}-]+$ ]]; then
+            echo "❌ Invalid base branch name: $BASE_REF"
+            exit 1
+          fi
+
+          # Validate head branch name
+          if ! [[ "$HEAD_REF" =~ ^[a-zA-Z0-9/_.{}-]+$ ]]; then
+            echo "❌ Invalid head branch name: $HEAD_REF"
+            exit 1
+          fi
+
+          # Validate length (prevent resource exhaustion)
+          if [ ${#BASE_REF} -gt 255 ]; then
+            echo "❌ Base branch name too long"
+            exit 1
+          fi
+
+          if [ ${#HEAD_REF} -gt 255 ]; then
+            echo "❌ Head branch name too long"
+            exit 1
+          fi
+
+          # Validate PR number is numeric
+          if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "❌ Invalid PR number: $PR_NUMBER"
+            exit 1
+          fi
+
+          # Validate commits count is numeric
+          if ! [[ "$PR_COMMITS" =~ ^[0-9]+$ ]]; then
+            echo "❌ Invalid commits count: $PR_COMMITS"
+            exit 1
+          fi
+
+          # Pass validated values to environment
+          echo "BASE_REF=$BASE_REF" >> "$GITHUB_ENV"
+          echo "HEAD_REF=$HEAD_REF" >> "$GITHUB_ENV"
+          echo "PR_NUMBER=$PR_NUMBER" >> "$GITHUB_ENV"
+          echo "PR_COMMITS=$PR_COMMITS" >> "$GITHUB_ENV"
+
+      - name: Clone base branch
+        env:
+          BASE_CLONE_URL: ${{ github.event.pull_request.base.repo.clone_url }}
+        run: |
+          # Use environment variables to prevent injection
+          git clone --depth=1 --no-checkout "$BASE_CLONE_URL" -b "$BASE_REF" .
+
+      - name: Fetch PR branch
+        env:
+          HEAD_CLONE_URL: ${{ github.event.pull_request.head.repo.clone_url }}
+        run: |
+          # Use environment variables to prevent command injection
+          git fetch --depth=$((PR_COMMITS + 1)) "$HEAD_CLONE_URL" "$HEAD_REF"
+          HEAD_SHA=$(git rev-parse FETCH_HEAD)
+
+          # Validate SHA format (40 hex characters)
+          if ! [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "❌ Invalid SHA format: $HEAD_SHA"
+            exit 1
+          fi
+
+          echo "HEAD_SHA=$HEAD_SHA" >> "$GITHUB_ENV"
+
+      - name: Verify PR branch isn't on stale base
+        run: |
+          if ! git merge-base --is-ancestor "$BASE_REF" "$HEAD_SHA"; then
+            echo "❌ PR branch must be rebased onto latest base branch commit"
+            exit 1
+          fi
+
+      - name: Fetch upstream mainline branch
+        run: |
+          # Determine the kernel version tag, since it is the most recent common
+          # ancestor between the base branch and the upstream mainline branch
+          MAKEFILE=$(git show "$BASE_REF":Makefile)
+          VERSION=$(grep -m1 -Po '(?<=^VERSION = )\d+' <<< "$MAKEFILE")
+          PATCHLEVEL=$(grep -m1 -Po '(?<=^PATCHLEVEL = )\d+' <<< "$MAKEFILE")
+
+          # Validate VERSION and PATCHLEVEL are numeric
+          if ! [[ "$VERSION" =~ ^[0-9]+$ ]] || ! [[ "$PATCHLEVEL" =~ ^[0-9]+$ ]]; then
+            echo "❌ Invalid kernel version: $VERSION.$PATCHLEVEL"
+            exit 1
+          fi
+
+          # Fetch upstream mainline branch without tags, fetching only history
+          # that is newer than this kernel version tag. This reduces the amount
+          # of commits cloned knowing that there's no need to check any commits
+          # for Fixes commits older than what the base branch already contains
+          git fetch --no-tags --shallow-exclude="v$VERSION.$PATCHLEVEL" origin kernel-mainline
+          MAINLINE_SHA=$(git rev-parse FETCH_HEAD)
+
+          # Validate SHA format
+          if ! [[ "$MAINLINE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "❌ Invalid mainline SHA format: $MAINLINE_SHA"
+            exit 1
+          fi
+
+          echo "MAINLINE_SHA=$MAINLINE_SHA" >> "$GITHUB_ENV"
+
+      - name: Checkout kernel-src-tree-tools
+        uses: actions/checkout@v4
+        with:
+          repository: ctrliq/kernel-src-tree-tools
+          ref: 'mainline'
+          path: kernel-src-tree-tools
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Run upstream fixes check
+        id: check-kernel-commits
+        working-directory: kernel-src-tree-tools
+        run: |
+          set +e  # Don't exit on error, we want to capture the output
+          set -o pipefail  # Capture exit code from python script, not tee
+          python3 check_kernel_commits.py \
+            --repo .. \
+            --pr_branch "$HEAD_SHA" \
+            --base_branch "$BASE_REF" \
+            --markdown \
+            --upstream-ref "$MAINLINE_SHA" \
+            --check-cves | tee ../ckc_result.txt
+          EXIT_CODE=$?
+
+          # Check if the script failed
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "❌ Kernel commits check failed with exit code $EXIT_CODE"
+            exit $EXIT_CODE
+          fi
+
+          # Check for findings:
+          # 1. Verify the success message exists
+          # 2. If it exists, check if there are any OTHER lines (which would indicate issues)
+          # 3. If success message doesn't exist, that's also a finding
+          if grep -q "All referenced commits exist upstream and have no Fixes: tags." ../ckc_result.txt; then
+            # Success message found, check if there are any other lines
+            LINE_COUNT=$(wc -l < ../ckc_result.txt)
+            if [ "$LINE_COUNT" -gt 1 ]; then
+              echo "has_findings=true" >> $GITHUB_OUTPUT
+            else
+              echo "has_findings=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            # Success message not found, there must be findings
+            echo "has_findings=true" >> $GITHUB_OUTPUT
+          fi
+
+          set -e  # Re-enable exit on error
+
+      - name: Install build dependencies for patchutils
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential autoconf automake libtool gnulib
+
+      - name: Clone and build custom patchutils
+        run: |
+          # Security: Pin to specific commit to prevent supply chain attacks
+          EXPECTED_COMMIT="60a60b3909d0e29c0ff286f6a73de4168977b097"
+
+          # Clone repository
+          git clone https://github.com/kerneltoast/patchutils.git
+          cd patchutils
+
+          # Fetch the specific commit we want
+          git fetch origin "$EXPECTED_COMMIT"
+          git checkout "$EXPECTED_COMMIT"
+
+          # Verify we're on the expected commit
+          ACTUAL_COMMIT=$(git rev-parse HEAD)
+          if [ "$ACTUAL_COMMIT" != "$EXPECTED_COMMIT" ]; then
+            echo "❌ Security: Commit mismatch!"
+            echo "Expected: $EXPECTED_COMMIT"
+            echo "Actual: $ACTUAL_COMMIT"
+            exit 1
+          fi
+
+          # Build patchutils
+          ./bootstrap
+          ./configure
+          make -j$(nproc)
+
+          # Verify the binary was created
+          if [ ! -x src/interdiff ]; then
+            echo "❌ Failed to build interdiff binary"
+            exit 1
+          fi
+
+      - name: Run interdiff check
+        id: interdiff
+        working-directory: kernel-src-tree-tools
+        run: |
+          set +e  # Don't exit on error, we want to capture the output
+          set -o pipefail  # Capture exit code from python script, not tee
+          python3 run_interdiff.py \
+            --repo .. \
+            --pr_branch "$HEAD_SHA" \
+            --base_branch "$BASE_REF" \
+            --markdown \
+            --interdiff ../patchutils/src/interdiff | tee ../interdiff_result.txt
+          EXIT_CODE=$?
+
+          # Check if the script failed
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "❌ Interdiff check failed with exit code $EXIT_CODE"
+            exit $EXIT_CODE
+          fi
+
+          # Check for differences:
+          # 1. Verify the success message exists
+          # 2. If it exists, check if there are any OTHER lines (which would indicate differences)
+          # 3. If success message doesn't exist, that's also a difference
+          if grep -q "All backported commits match their upstream counterparts." ../interdiff_result.txt; then
+            # Success message found, check if there are any other lines
+            LINE_COUNT=$(wc -l < ../interdiff_result.txt)
+            if [ "$LINE_COUNT" -gt 1 ]; then
+              echo "has_differences=true" >> $GITHUB_OUTPUT
+            else
+              echo "has_differences=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            # Success message not found, there must be differences
+            echo "has_differences=true" >> $GITHUB_OUTPUT
+          fi
+
+          set -e  # Re-enable exit on error
+
+      - name: Save PR metadata for comment workflow
+        env:
+          HEAD_REPO_FULL_NAME: ${{ github.event.pull_request.head.repo.full_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          mkdir -p pr_metadata
+
+          # Save validated metadata
+          echo "$PR_NUMBER" > pr_metadata/pr_number.txt
+          echo "$REPOSITORY" > pr_metadata/repository.txt
+          echo "$BASE_REF" > pr_metadata/base_ref.txt
+          echo "$HEAD_SHA" > pr_metadata/head_sha.txt
+          echo "$HEAD_REPO_FULL_NAME" > pr_metadata/head_repo.txt
+
+          # Create a checksum of metadata for integrity verification
+          (cd pr_metadata && sha256sum *.txt > checksums.txt)
+
+      - name: Upload check results
+        uses: actions/upload-artifact@v4
+        if: always()  # Upload even if checks fail
+        with:
+          name: check-results
+          path: |
+            ckc_result.txt
+            interdiff_result.txt
+            pr_metadata/
+          retention-days: 3  # Increased from 1 to prevent premature deletion
