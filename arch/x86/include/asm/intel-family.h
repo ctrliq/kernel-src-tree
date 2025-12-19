@@ -161,6 +161,8 @@
 #define INTEL_FAM6_GRANITERAPIDS_D	0xAE
 #define INTEL_GRANITERAPIDS_D		IFM(6, 0xAE)
 
+#define INTEL_DIAMONDRAPIDS_X		IFM(19, 0x01) /* Panther Cove */
+
 #define INTEL_BARTLETTLAKE		IFM(6, 0xD7) /* Raptor Cove */
 
 /* "Hybrid" Processors (P-Core/E-Core) */
@@ -268,9 +270,6 @@
 
 /* Family 5 */
 #define INTEL_QUARK_X1000		IFM(5, 0x09) /* Quark X1000 SoC */
-
-/* Family 19 */
-#define INTEL_PANTHERCOVE_X		IFM(19, 0x01) /* Diamond Rapids */
 
 /* CPU core types */
 enum intel_cpu_type {
