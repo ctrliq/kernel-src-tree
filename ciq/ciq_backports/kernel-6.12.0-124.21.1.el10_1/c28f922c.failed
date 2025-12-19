@@ -1,0 +1,89 @@
+clone_private_mnt(): make sure that caller has CAP_SYS_ADMIN in the right userns
+
+jira KERNEL-386
+cve CVE-2025-38499
+Rebuild_History Non-Buildable kernel-6.12.0-124.21.1.el10_1
+Rebuild_CHGLOG: - CVE-2025-38499 kernel: clone_private_mnt(): make sure that caller has CAP_SYS_ADMIN in the right userns (Abhi Das) [RHEL-129282] {CVE-2025-38499}
+Rebuild_FUZZ: 87.43%
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit c28f922c9dcee0e4876a2c095939d77fe7e15116
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-124.21.1.el10_1/c28f922c.failed
+
+What we want is to verify there is that clone won't expose something
+hidden by a mount we wouldn't be able to undo.  "Wouldn't be able to undo"
+may be a result of MNT_LOCKED on a child, but it may also come from
+lacking admin rights in the userns of the namespace mount belongs to.
+
+clone_private_mnt() checks the former, but not the latter.
+
+There's a number of rather confusing CAP_SYS_ADMIN checks in various
+userns during the mount, especially with the new mount API; they serve
+different purposes and in case of clone_private_mnt() they usually,
+but not always end up covering the missing check mentioned above.
+
+	Reviewed-by: Christian Brauner <brauner@kernel.org>
+	Reported-by: "Orlando, Noah" <Noah.Orlando@deshaw.com>
+Fixes: 427215d85e8d ("ovl: prevent private clone if bind mount is not allowed")
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit c28f922c9dcee0e4876a2c095939d77fe7e15116)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/namespace.c
+diff --cc fs/namespace.c
+index da767032a0a1,1c54c16c7bab..000000000000
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@@ -2254,21 -2488,37 +2254,33 @@@ struct vfsmount *clone_private_mount(co
+  	struct mount *old_mnt = real_mount(path->mnt);
+  	struct mount *new_mnt;
+  
+ -	guard(rwsem_read)(&namespace_sem);
+ -
+ +	down_read(&namespace_sem);
+  	if (IS_MNT_UNBINDABLE(old_mnt))
+ -		return ERR_PTR(-EINVAL);
+ +		goto invalid;
+  
+ -	/*
+ -	 * Make sure the source mount is acceptable.
+ -	 * Anything mounted in our mount namespace is allowed.
+ -	 * Otherwise, it must be the root of an anonymous mount
+ -	 * namespace, and we need to make sure no namespace
+ -	 * loops get created.
+ -	 */
+ -	if (!check_mnt(old_mnt)) {
+ -		if (!is_mounted(&old_mnt->mnt) ||
+ -			!is_anon_ns(old_mnt->mnt_ns) ||
+ -			mnt_has_parent(old_mnt))
+ -			return ERR_PTR(-EINVAL);
+ +	if (!check_mnt(old_mnt))
+ +		goto invalid;
+  
+++<<<<<<< HEAD
+ +	if (has_locked_children(old_mnt, path->dentry))
+ +		goto invalid;
+++=======
++ 		if (!check_for_nsfs_mounts(old_mnt))
++ 			return ERR_PTR(-EINVAL);
++ 	}
++ 
++         if (!ns_capable(old_mnt->mnt_ns->user_ns, CAP_SYS_ADMIN))
++ 		return ERR_PTR(-EPERM);
++ 
++ 	if (__has_locked_children(old_mnt, path->dentry))
++ 		return ERR_PTR(-EINVAL);
+++>>>>>>> c28f922c9dce (clone_private_mnt(): make sure that caller has CAP_SYS_ADMIN in the right userns)
+  
+  	new_mnt = clone_mnt(old_mnt, path->dentry, CL_PRIVATE);
+ +	up_read(&namespace_sem);
+ +
+  	if (IS_ERR(new_mnt))
+ -		return ERR_PTR(-EINVAL);
+ +		return ERR_CAST(new_mnt);
+  
+  	/* Longterm mount to be removed by kern_unmount*() */
+  	new_mnt->mnt_ns = MNT_NS_INTERNAL;
+* Unmerged path fs/namespace.c
