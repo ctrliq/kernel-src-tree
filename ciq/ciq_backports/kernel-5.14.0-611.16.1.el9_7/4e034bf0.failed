@@ -1,0 +1,146 @@
+iommufd: Fix race during abort for file descriptors
+
+jira KERNEL-393
+cve CVE-2025-39966
+Rebuild_History Non-Buildable kernel-5.14.0-611.16.1.el9_7
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit 4e034bf045b12852a24d5d33f2451850818ba0c1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-611.16.1.el9_7/4e034bf0.failed
+
+fput() doesn't actually call file_operations release() synchronously, it
+puts the file on a work queue and it will be released eventually.
+
+This is normally fine, except for iommufd the file and the iommufd_object
+are tied to gether. The file has the object as it's private_data and holds
+a users refcount, while the object is expected to remain alive as long as
+the file is.
+
+When the allocation of a new object aborts before installing the file it
+will fput() the file and then go on to immediately kfree() the obj. This
+causes a UAF once the workqueue completes the fput() and tries to
+decrement the users refcount.
+
+Fix this by putting the core code in charge of the file lifetime, and call
+__fput_sync() during abort to ensure that release() is called before
+kfree. __fput_sync() is a bit too tricky to open code in all the object
+implementations. Instead the objects tell the core code where the file
+pointer is and the core will take care of the life cycle.
+
+If the object is successfully allocated then the file will hold a users
+refcount and the iommufd_object cannot be destroyed.
+
+It is worth noting that close(); ioctl(IOMMU_DESTROY); doesn't have an
+issue because close() is already using a synchronous version of fput().
+
+The UAF looks like this:
+
+    BUG: KASAN: slab-use-after-free in iommufd_eventq_fops_release+0x45/0xc0 drivers/iommu/iommufd/eventq.c:376
+    Write of size 4 at addr ffff888059c97804 by task syz.0.46/6164
+
+    CPU: 0 UID: 0 PID: 6164 Comm: syz.0.46 Not tainted syzkaller #0 PREEMPT(full)
+    Hardware name: Google Google Compute Engine/Google Compute Engine, BIOS Google 08/18/2025
+    Call Trace:
+     <TASK>
+     __dump_stack lib/dump_stack.c:94 [inline]
+     dump_stack_lvl+0x116/0x1f0 lib/dump_stack.c:120
+     print_address_description mm/kasan/report.c:378 [inline]
+     print_report+0xcd/0x630 mm/kasan/report.c:482
+     kasan_report+0xe0/0x110 mm/kasan/report.c:595
+     check_region_inline mm/kasan/generic.c:183 [inline]
+     kasan_check_range+0x100/0x1b0 mm/kasan/generic.c:189
+     instrument_atomic_read_write include/linux/instrumented.h:96 [inline]
+     atomic_fetch_sub_release include/linux/atomic/atomic-instrumented.h:400 [inline]
+     __refcount_dec include/linux/refcount.h:455 [inline]
+     refcount_dec include/linux/refcount.h:476 [inline]
+     iommufd_eventq_fops_release+0x45/0xc0 drivers/iommu/iommufd/eventq.c:376
+     __fput+0x402/0xb70 fs/file_table.c:468
+     task_work_run+0x14d/0x240 kernel/task_work.c:227
+     resume_user_mode_work include/linux/resume_user_mode.h:50 [inline]
+     exit_to_user_mode_loop+0xeb/0x110 kernel/entry/common.c:43
+     exit_to_user_mode_prepare include/linux/irq-entry-common.h:225 [inline]
+     syscall_exit_to_user_mode_work include/linux/entry-common.h:175 [inline]
+     syscall_exit_to_user_mode include/linux/entry-common.h:210 [inline]
+     do_syscall_64+0x41c/0x4c0 arch/x86/entry/syscall_64.c:100
+     entry_SYSCALL_64_after_hwframe+0x77/0x7f
+
+Link: https://patch.msgid.link/r/1-v1-02cd136829df+31-iommufd_syz_fput_jgg@nvidia.com
+	Cc: stable@vger.kernel.org
+Fixes: 07838f7fd529 ("iommufd: Add iommufd fault object")
+	Reviewed-by: Nicolin Chen <nicolinc@nvidia.com>
+	Reviewed-by: Nirmoy Das <nirmoyd@nvidia.com>
+	Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+	Tested-by: Nicolin Chen <nicolinc@nvidia.com>
+	Reported-by: syzbot+80620e2d0d0a33b09f93@syzkaller.appspotmail.com
+Closes: https://lore.kernel.org/r/68c8583d.050a0220.2ff435.03a2.GAE@google.com
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+(cherry picked from commit 4e034bf045b12852a24d5d33f2451850818ba0c1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/iommufd/eventq.c
+#	drivers/iommu/iommufd/main.c
+diff --cc drivers/iommu/iommufd/main.c
+index ee750fc5ae80,88be2e157245..000000000000
+--- a/drivers/iommu/iommufd/main.c
++++ b/drivers/iommu/iommufd/main.c
+@@@ -23,6 -23,8 +23,11 @@@
+  #include "iommufd_test.h"
+  
+  struct iommufd_object_ops {
+++<<<<<<< HEAD
+++=======
++ 	size_t file_offset;
++ 	void (*pre_destroy)(struct iommufd_object *obj);
+++>>>>>>> 4e034bf045b1 (iommufd: Fix race during abort for file descriptors)
+  	void (*destroy)(struct iommufd_object *obj);
+  	void (*abort)(struct iommufd_object *obj);
+  };
+@@@ -479,8 -678,14 +504,14 @@@ void iommufd_ctx_put(struct iommufd_ct
+  {
+  	fput(ictx->file);
+  }
+ -EXPORT_SYMBOL_NS_GPL(iommufd_ctx_put, "IOMMUFD");
+ +EXPORT_SYMBOL_NS_GPL(iommufd_ctx_put, IOMMUFD);
+  
++ #define IOMMUFD_FILE_OFFSET(_struct, _filep, _obj)                           \
++ 	.file_offset = (offsetof(_struct, _filep) +                          \
++ 			BUILD_BUG_ON_ZERO(!__same_type(                      \
++ 				struct file *, ((_struct *)NULL)->_filep)) + \
++ 			BUILD_BUG_ON_ZERO(offsetof(_struct, _obj)))
++ 
+  static const struct iommufd_object_ops iommufd_object_ops[] = {
+  	[IOMMUFD_OBJ_ACCESS] = {
+  		.destroy = iommufd_access_destroy_object,
+@@@ -490,7 -696,11 +521,8 @@@
+  	},
+  	[IOMMUFD_OBJ_FAULT] = {
+  		.destroy = iommufd_fault_destroy,
++ 		IOMMUFD_FILE_OFFSET(struct iommufd_fault, common.filep, common.obj),
+  	},
+ -	[IOMMUFD_OBJ_HW_QUEUE] = {
+ -		.destroy = iommufd_hw_queue_destroy,
+ -	},
+  	[IOMMUFD_OBJ_HWPT_PAGING] = {
+  		.destroy = iommufd_hwpt_paging_destroy,
+  		.abort = iommufd_hwpt_paging_abort,
+@@@ -504,6 -714,12 +536,15 @@@
+  	},
+  	[IOMMUFD_OBJ_VDEVICE] = {
+  		.destroy = iommufd_vdevice_destroy,
+++<<<<<<< HEAD
+++=======
++ 		.abort = iommufd_vdevice_abort,
++ 	},
++ 	[IOMMUFD_OBJ_VEVENTQ] = {
++ 		.destroy = iommufd_veventq_destroy,
++ 		.abort = iommufd_veventq_abort,
++ 		IOMMUFD_FILE_OFFSET(struct iommufd_veventq, common.filep, common.obj),
+++>>>>>>> 4e034bf045b1 (iommufd: Fix race during abort for file descriptors)
+  	},
+  	[IOMMUFD_OBJ_VIOMMU] = {
+  		.destroy = iommufd_viommu_destroy,
+* Unmerged path drivers/iommu/iommufd/eventq.c
+* Unmerged path drivers/iommu/iommufd/eventq.c
+* Unmerged path drivers/iommu/iommufd/main.c
