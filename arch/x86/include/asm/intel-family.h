@@ -51,6 +51,9 @@
 #define INTEL_PENTIUM_MMX		IFM(5, 0x04) /* P55C */
 #define INTEL_QUARK_X1000		IFM(5, 0x09) /* Quark X1000 SoC */
 
+/* Family 19 */
+#define INTEL_PANTHERCOVE_X		IFM(19, 0x01) /* Diamond Rapids */
+
 /* Family 6, 18, 19 */
 #define INTEL_PENTIUM_PRO		IFM(6, 0x01)
 #define INTEL_PENTIUM_II_KLAMATH	IFM(6, 0x03)
@@ -156,6 +159,8 @@
 
 #define INTEL_NOVALAKE			IFM(18, 0x01) /* Coyote Cove / Arctic Wolf */
 #define INTEL_NOVALAKE_L		IFM(18, 0x03) /* Coyote Cove / Arctic Wolf */
+
+#define INTEL_PANTHERLAKE_L		IFM(6, 0xCC)
 
 /* "Small Core" Processors (Atom/E-Core) */
 
