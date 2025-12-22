@@ -119,7 +119,7 @@
 
 #define SO_DETACH_REUSEPORT_BPF 68
 
-#define SCM_TS_OPT_ID		78
+#define SCM_TS_OPT_ID           81
 
 #if !defined(__KERNEL__)
 
