@@ -592,7 +592,7 @@ void hsr_prune_nodes(struct timer_list *t)
 
 void hsr_prune_proxy_nodes(struct timer_list *t)
 {
-	struct hsr_priv *hsr = from_timer(hsr, t, prune_proxy_timer);
+	struct hsr_priv *hsr = timer_container_of(hsr, t, prune_proxy_timer);
 	unsigned long timestamp;
 	struct hsr_node *node;
 	struct hsr_node *tmp;

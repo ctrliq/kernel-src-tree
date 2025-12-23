@@ -417,7 +417,8 @@ static void hsr_announce(struct timer_list *t)
  */
 static void hsr_proxy_announce(struct timer_list *t)
 {
-	struct hsr_priv *hsr = from_timer(hsr, t, announce_proxy_timer);
+	struct hsr_priv *hsr = timer_container_of(hsr, t,
+						  announce_proxy_timer);
 	struct hsr_port *interlink;
 	unsigned long interval = 0;
 	struct hsr_node *node;
