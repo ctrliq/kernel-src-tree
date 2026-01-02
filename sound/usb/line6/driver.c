@@ -286,36 +286,36 @@ static void line6_data_received(struct urb *urb)
 {
 	struct usb_line6 *line6 = (struct usb_line6 *)urb->context;
 	struct midi_buffer *mb = &line6->line6midi->midibuf_in;
-	int done;
+	int written;
 
 	if (urb->status == -ESHUTDOWN)
 		return;
 
 	if (line6->properties->capabilities & LINE6_CAP_CONTROL_MIDI) {
 		scoped_guard(spinlock_irqsave, &line6->line6midi->lock) {
-			done =
+			written =
 				line6_midibuf_write(mb, urb->transfer_buffer, urb->actual_length);
 
-			if (done < urb->actual_length) {
-				line6_midibuf_ignore(mb, done);
+			if (written < urb->actual_length) {
+				line6_midibuf_ignore(mb, written);
 				dev_dbg(line6->ifcdev, "%d %d buffer overflow - message skipped\n",
-					done, urb->actual_length);
+					written, urb->actual_length);
 			}
 		}
 
 		for (;;) {
 			scoped_guard(spinlock_irqsave, &line6->line6midi->lock) {
-				done =
+				written =
 					line6_midibuf_read(mb, line6->buffer_message,
 							   LINE6_MIDI_MESSAGE_MAXLEN,
 							   LINE6_MIDIBUF_READ_RX);
 			}
 
-			if (done <= 0)
+			if (written <= 0)
 				break;
 
-			line6->message_length = done;
-			line6_midi_receive(line6, line6->buffer_message, done);
+			line6->message_length = written;
+			line6_midi_receive(line6, line6->buffer_message, written);
 
 			if (line6->process_message)
 				line6->process_message(line6);
