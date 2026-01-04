@@ -55,6 +55,11 @@ int uffd_register_with_ioctls(int uffd, void *addr, uint64_t len,
 unsigned long get_free_hugepages(void);
 bool check_vmflag_io(void *addr);
 
+static inline int sz2ord(size_t size)
+{
+	return __builtin_ctzll(size / getpagesize());
+}
+
 /*
  * On ppc64 this will only work with radix 2M hugepage size
  */
