@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 
+#include <linux/netdevice.h>
+#include <net/netdev_lock.h>
 #include <net/xsk_buff_pool.h>
 #include <net/xdp_sock.h>
 #include <net/xdp_sock_drv.h>
@@ -220,6 +222,7 @@ int xp_assign_dev(struct xsk_buff_pool *pool,
 	bpf.xsk.pool = pool;
 	bpf.xsk.queue_id = queue_id;
 
+	netdev_ops_assert_locked(netdev);
 	err = netdev->netdev_ops->ndo_bpf(netdev, &bpf);
 	if (err)
 		goto err_unreg_pool;
@@ -263,13 +266,17 @@ int xp_assign_dev_shared(struct xsk_buff_pool *pool, struct xdp_sock *umem_xs,
 
 void xp_clear_dev(struct xsk_buff_pool *pool)
 {
+	struct net_device *netdev = pool->netdev;
+
 	if (!pool->netdev)
 		return;
 
+	netdev_lock_ops(netdev);
 	xp_disable_drv_zc(pool);
 	xsk_clear_pool_at_qid(pool->netdev, pool->queue_id);
-	dev_put(pool->netdev);
 	pool->netdev = NULL;
+	netdev_unlock_ops(netdev);
+	dev_put(netdev);
 }
 
 static void xp_release_deferred(struct work_struct *work)

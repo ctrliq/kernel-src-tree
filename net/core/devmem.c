@@ -24,7 +24,6 @@
 
 /* Device memory support */
 
-/* Protected by rtnl_lock() */
 static DEFINE_XARRAY_FLAGS(net_devmem_dmabuf_bindings, XA_FLAGS_ALLOC1);
 
 static void net_devmem_dmabuf_free_chunk_owner(struct gen_pool *genpool,
@@ -119,7 +118,6 @@ void net_devmem_unbind_dmabuf(struct net_devmem_dmabuf_binding *binding)
 		rxq->mp_params.mp_priv = NULL;
 
 		rxq_idx = get_netdev_rx_queue_index(rxq);
-
 		WARN_ON(netdev_rx_queue_restart(binding->dev, rxq_idx));
 	}
 
@@ -218,6 +216,8 @@ net_devmem_bind_dmabuf(struct net_device *dev, unsigned int dmabuf_fd,
 	xa_init_flags(&binding->bound_rxqs, XA_FLAGS_ALLOC);
 
 	refcount_set(&binding->ref, 1);
+
+	mutex_init(&binding->lock);
 
 	binding->dmabuf = dmabuf;
 
@@ -328,6 +328,11 @@ void dev_dmabuf_uninstall(struct net_device *dev)
 		xa_for_each(&binding->bound_rxqs, xa_idx, rxq)
 			if (rxq == &dev->_rx[i]) {
 				xa_erase(&binding->bound_rxqs, xa_idx);
+				if (xa_empty(&binding->bound_rxqs)) {
+					mutex_lock(&binding->lock);
+					binding->dev = NULL;
+					mutex_unlock(&binding->lock);
+				}
 				break;
 			}
 	}

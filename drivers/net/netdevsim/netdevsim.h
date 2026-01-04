@@ -128,7 +128,6 @@ struct netdevsim {
 	struct nsim_macsec macsec;
 	struct {
 		u32 inject_error;
-		u32 sleep;
 		u32 __ports[2][NSIM_UDP_TUNNEL_N_PORTS];
 		u32 (*ports)[NSIM_UDP_TUNNEL_N_PORTS];
 		struct dentry *ddir;
@@ -140,6 +139,9 @@ struct netdevsim {
 
 	struct nsim_ethtool ethtool;
 	struct netdevsim __rcu *peer;
+
+	struct notifier_block nb;
+	struct netdev_net_notifier nn;
 };
 
 struct netdevsim *
@@ -335,7 +337,6 @@ struct nsim_dev {
 		bool ipv4_only;
 		bool shared;
 		bool static_iana_vxlan;
-		u32 sleep;
 	} udp_ports;
 	struct nsim_dev_psample *psample;
 	u16 esw_mode;

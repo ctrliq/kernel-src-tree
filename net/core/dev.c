@@ -156,6 +156,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/prandom.h>
 #include <linux/once_lite.h>
+#include <net/netdev_lock.h>
 #include <net/netdev_rx_queue.h>
 #include <net/page_pool/types.h>
 #include <net/page_pool/helpers.h>
@@ -828,7 +829,7 @@ netdev_napi_by_id_lock(struct net *net, unsigned int napi_id)
 	dev_hold(dev);
 	rcu_read_unlock();
 
-	dev = __netdev_put_lock(dev);
+	dev = __netdev_put_lock(dev, net);
 	if (!dev)
 		return NULL;
 
@@ -1039,11 +1040,26 @@ struct net_device *dev_get_by_napi_id(unsigned int napi_id)
  * This helper is intended for locking net_device after it has been looked up
  * using a lockless lookup helper. Lock prevents the instance from going away.
  */
-struct net_device *__netdev_put_lock(struct net_device *dev)
+struct net_device *__netdev_put_lock(struct net_device *dev, struct net *net)
 {
 	netdev_lock(dev);
-	if (dev->reg_state > NETREG_REGISTERED) {
+	if (dev->reg_state > NETREG_REGISTERED ||
+	    dev->moving_ns || !net_eq(dev_net(dev), net)) {
 		netdev_unlock(dev);
+		dev_put(dev);
+		return NULL;
+	}
+	dev_put(dev);
+	return dev;
+}
+
+static struct net_device *
+__netdev_put_lock_ops_compat(struct net_device *dev, struct net *net)
+{
+	netdev_lock_ops_compat(dev);
+	if (dev->reg_state > NETREG_REGISTERED ||
+	    dev->moving_ns || !net_eq(dev_net(dev), net)) {
+		netdev_unlock_ops_compat(dev);
 		dev_put(dev);
 		return NULL;
 	}
@@ -1070,7 +1086,19 @@ struct net_device *netdev_get_by_index_lock(struct net *net, int ifindex)
 	if (!dev)
 		return NULL;
 
-	return __netdev_put_lock(dev);
+	return __netdev_put_lock(dev, net);
+}
+
+struct net_device *
+netdev_get_by_index_lock_ops_compat(struct net *net, int ifindex)
+{
+	struct net_device *dev;
+
+	dev = dev_get_by_index(net, ifindex);
+	if (!dev)
+		return NULL;
+
+	return __netdev_put_lock_ops_compat(dev, net);
 }
 
 struct net_device *
@@ -1090,7 +1118,32 @@ netdev_xa_find_lock(struct net *net, struct net_device *dev,
 		dev_hold(dev);
 		rcu_read_unlock();
 
-		dev = __netdev_put_lock(dev);
+		dev = __netdev_put_lock(dev, net);
+		if (dev)
+			return dev;
+
+		(*index)++;
+	} while (true);
+}
+
+struct net_device *
+netdev_xa_find_lock_ops_compat(struct net *net, struct net_device *dev,
+			       unsigned long *index)
+{
+	if (dev)
+		netdev_unlock_ops_compat(dev);
+
+	do {
+		rcu_read_lock();
+		dev = xa_find(&net->dev_by_index, index, ULONG_MAX, XA_PRESENT);
+		if (!dev) {
+			rcu_read_unlock();
+			return NULL;
+		}
+		dev_hold(dev);
+		rcu_read_unlock();
+
+		dev = __netdev_put_lock_ops_compat(dev, net);
 		if (dev)
 			return dev;
 
@@ -1385,15 +1438,7 @@ static int dev_get_valid_name(struct net *net, struct net_device *dev,
 	return ret < 0 ? ret : 0;
 }
 
-/**
- *	dev_change_name - change name of a device
- *	@dev: device
- *	@newname: name (or format string) must be at least IFNAMSIZ
- *
- *	Change name of a device, can pass format strings "eth%d".
- *	for wildcarding.
- */
-int dev_change_name(struct net_device *dev, const char *newname)
+int netif_change_name(struct net_device *dev, const char *newname)
 {
 	unsigned char old_assign_type;
 	char oldname[IFNAMSIZ];
@@ -1476,15 +1521,7 @@ rollback:
 	return err;
 }
 
-/**
- *	dev_set_alias - change ifalias of a device
- *	@dev: device
- *	@alias: name up to IFALIASZ
- *	@len: limit of bytes to copy from info
- *
- *	Set ifalias for a device,
- */
-int dev_set_alias(struct net_device *dev, const char *alias, size_t len)
+int netif_set_alias(struct net_device *dev, const char *alias, size_t len)
 {
 	struct dev_ifalias *new_alias = NULL;
 
@@ -1510,7 +1547,6 @@ int dev_set_alias(struct net_device *dev, const char *alias, size_t len)
 
 	return len;
 }
-EXPORT_SYMBOL(dev_set_alias);
 
 /**
  *	dev_get_alias - get ifalias of a device
@@ -1547,16 +1583,10 @@ void netdev_features_change(struct net_device *dev)
 }
 EXPORT_SYMBOL(netdev_features_change);
 
-/**
- *	netdev_state_change - device changes state
- *	@dev: device to cause notification
- *
- *	Called to indicate a device has changed state. This function calls
- *	the notifier chains for netdev_chain and sends a NEWLINK message
- *	to the routing socket.
- */
-void netdev_state_change(struct net_device *dev)
+void netif_state_change(struct net_device *dev)
 {
+	netdev_ops_assert_locked_or_invisible(dev);
+
 	if (dev->flags & IFF_UP) {
 		struct netdev_notifier_change_info change_info = {
 			.info.dev = dev,
@@ -1567,7 +1597,6 @@ void netdev_state_change(struct net_device *dev)
 		rtmsg_ifinfo(RTM_NEWLINK, dev, 0, GFP_KERNEL, 0, NULL);
 	}
 }
-EXPORT_SYMBOL(netdev_state_change);
 
 /**
  * __netdev_notify_peers - notify network peers about existence of @dev,
@@ -1656,6 +1685,8 @@ static int __dev_open(struct net_device *dev, struct netlink_ext_ack *extack)
 
 	set_bit(__LINK_STATE_START, &dev->state);
 
+	netdev_ops_assert_locked(dev);
+
 	if (ops->ndo_validate_addr)
 		ret = ops->ndo_validate_addr(dev);
 
@@ -1676,20 +1707,7 @@ static int __dev_open(struct net_device *dev, struct netlink_ext_ack *extack)
 	return ret;
 }
 
-/**
- *	dev_open	- prepare an interface for use.
- *	@dev: device to open
- *	@extack: netlink extended ack
- *
- *	Takes a device from down to up state. The device's private open
- *	function is invoked and then the multicast lists are loaded. Finally
- *	the device is moved into the up state and a %NETDEV_UP message is
- *	sent to the netdev notifier chain.
- *
- *	Calling this function on an active interface is a nop. On a failure
- *	a negative errno code is returned.
- */
-int dev_open(struct net_device *dev, struct netlink_ext_ack *extack)
+int netif_open(struct net_device *dev, struct netlink_ext_ack *extack)
 {
 	int ret;
 
@@ -1705,7 +1723,6 @@ int dev_open(struct net_device *dev, struct netlink_ext_ack *extack)
 
 	return ret;
 }
-EXPORT_SYMBOL(dev_open);
 
 static void __dev_close_many(struct list_head *head)
 {
@@ -1743,6 +1760,9 @@ static void __dev_close_many(struct list_head *head)
 		 *	We allow it to be called even after a DETACH hot-plug
 		 *	event.
 		 */
+
+		netdev_ops_assert_locked(dev);
+
 		if (ops->ndo_stop)
 			ops->ndo_stop(dev);
 
@@ -1780,16 +1800,7 @@ void dev_close_many(struct list_head *head, bool unlink)
 }
 EXPORT_SYMBOL(dev_close_many);
 
-/**
- *	dev_close - shutdown an interface.
- *	@dev: device to shutdown
- *
- *	This function moves an active device into down state. A
- *	%NETDEV_GOING_DOWN is sent to the netdev notifier chain. The device
- *	is then deactivated and finally a %NETDEV_DOWN is sent to the notifier
- *	chain.
- */
-void dev_close(struct net_device *dev)
+void netif_close(struct net_device *dev)
 {
 	if (dev->flags & IFF_UP) {
 		LIST_HEAD(single);
@@ -1799,18 +1810,9 @@ void dev_close(struct net_device *dev)
 		list_del(&single);
 	}
 }
-EXPORT_SYMBOL(dev_close);
+EXPORT_SYMBOL(netif_close);
 
-
-/**
- *	dev_disable_lro - disable Large Receive Offload on a device
- *	@dev: device
- *
- *	Disable Large Receive Offload (LRO) on a net device.  Must be
- *	called under RTNL.  This is needed if received packets may be
- *	forwarded to another interface.
- */
-void dev_disable_lro(struct net_device *dev)
+void netif_disable_lro(struct net_device *dev)
 {
 	struct net_device *lower_dev;
 	struct list_head *iter;
@@ -1821,10 +1823,13 @@ void dev_disable_lro(struct net_device *dev)
 	if (unlikely(dev->features & NETIF_F_LRO))
 		netdev_WARN(dev, "failed to disable LRO!\n");
 
-	netdev_for_each_lower_dev(dev, lower_dev, iter)
-		dev_disable_lro(lower_dev);
+	netdev_for_each_lower_dev(dev, lower_dev, iter) {
+		netdev_lock_ops(lower_dev);
+		netif_disable_lro(lower_dev);
+		netdev_unlock_ops(lower_dev);
+	}
 }
-EXPORT_SYMBOL(dev_disable_lro);
+EXPORT_IPV6_MOD(netif_disable_lro);
 
 /**
  *	dev_disable_gro_hw - disable HW Generic Receive Offload on a device
@@ -1912,7 +1917,9 @@ static int call_netdevice_register_net_notifiers(struct notifier_block *nb,
 	int err;
 
 	for_each_netdev(net, dev) {
+		netdev_lock_ops(dev);
 		err = call_netdevice_register_notifiers(nb, dev);
+		netdev_unlock_ops(dev);
 		if (err)
 			goto rollback;
 	}
@@ -3132,7 +3139,7 @@ int netif_set_real_num_tx_queues(struct net_device *dev, unsigned int txq)
 
 	if (dev->reg_state == NETREG_REGISTERED ||
 	    dev->reg_state == NETREG_UNREGISTERING) {
-		ASSERT_RTNL();
+		netdev_ops_assert_locked(dev);
 
 		rc = netdev_queue_update_kobjects(dev, dev->real_num_tx_queues,
 						  txq);
@@ -3163,7 +3170,6 @@ int netif_set_real_num_tx_queues(struct net_device *dev, unsigned int txq)
 }
 EXPORT_SYMBOL(netif_set_real_num_tx_queues);
 
-#ifdef CONFIG_SYSFS
 /**
  *	netif_set_real_num_rx_queues - set actual number of RX queues used
  *	@dev: Network device
@@ -3182,7 +3188,7 @@ int netif_set_real_num_rx_queues(struct net_device *dev, unsigned int rxq)
 		return -EINVAL;
 
 	if (dev->reg_state == NETREG_REGISTERED) {
-		ASSERT_RTNL();
+		netdev_ops_assert_locked(dev);
 
 		rc = net_rx_queue_update_kobjects(dev, dev->real_num_rx_queues,
 						  rxq);
@@ -3194,7 +3200,6 @@ int netif_set_real_num_rx_queues(struct net_device *dev, unsigned int rxq)
 	return 0;
 }
 EXPORT_SYMBOL(netif_set_real_num_rx_queues);
-#endif
 
 /**
  *	netif_set_real_num_queues - set actual number of RX and TX queues used
@@ -6044,7 +6049,7 @@ static int generic_xdp_install(struct net_device *dev, struct netdev_bpf *xdp)
 			static_branch_dec(&generic_xdp_needed_key);
 		} else if (new && !old) {
 			static_branch_inc(&generic_xdp_needed_key);
-			dev_disable_lro(dev);
+			netif_disable_lro(dev);
 			dev_disable_gro_hw(dev);
 		}
 		break;
@@ -6887,8 +6892,7 @@ void netif_queue_set_napi(struct net_device *dev, unsigned int queue_index,
 
 	if (WARN_ON_ONCE(napi && !napi->dev))
 		return;
-	if (dev->reg_state >= NETREG_REGISTERED)
-		ASSERT_RTNL();
+	netdev_ops_assert_locked_or_invisible(dev);
 
 	switch (type) {
 	case NETDEV_QUEUE_TYPE_RX:
@@ -9175,18 +9179,7 @@ static int __dev_set_promiscuity(struct net_device *dev, int inc, bool notify)
 	return 0;
 }
 
-/**
- *	dev_set_promiscuity	- update promiscuity count on a device
- *	@dev: device
- *	@inc: modifier
- *
- *	Add or remove promiscuity from a device. While the count in the device
- *	remains above zero the interface remains promiscuous. Once it hits zero
- *	the device reverts back to normal filtering operation. A negative inc
- *	value is used to drop promiscuity on the device.
- *	Return 0 if successful or a negative errno code on error.
- */
-int dev_set_promiscuity(struct net_device *dev, int inc)
+int netif_set_promiscuity(struct net_device *dev, int inc)
 {
 	unsigned int old_flags = dev->flags;
 	int err;
@@ -9198,9 +9191,8 @@ int dev_set_promiscuity(struct net_device *dev, int inc)
 		dev_set_rx_mode(dev);
 	return err;
 }
-EXPORT_SYMBOL(dev_set_promiscuity);
 
-static int __dev_set_allmulti(struct net_device *dev, int inc, bool notify)
+int netif_set_allmulti(struct net_device *dev, int inc, bool notify)
 {
 	unsigned int old_flags = dev->flags, old_gflags = dev->gflags;
 	unsigned int allmulti, flags;
@@ -9234,25 +9226,6 @@ static int __dev_set_allmulti(struct net_device *dev, int inc, bool notify)
 	}
 	return 0;
 }
-
-/**
- *	dev_set_allmulti	- update allmulti count on a device
- *	@dev: device
- *	@inc: modifier
- *
- *	Add or remove reception of all multicast frames to a device. While the
- *	count in the device remains above zero the interface remains listening
- *	to all interfaces. Once it hits zero the device reverts back to normal
- *	filtering operation. A negative @inc value is used to drop the counter
- *	when releasing a resource needing all multicasts.
- *	Return 0 if successful or a negative errno code on error.
- */
-
-int dev_set_allmulti(struct net_device *dev, int inc)
-{
-	return __dev_set_allmulti(dev, inc, true);
-}
-EXPORT_SYMBOL(dev_set_allmulti);
 
 /*
  *	Upload unicast and multicast address lists to device and
@@ -9386,7 +9359,7 @@ int __dev_change_flags(struct net_device *dev, unsigned int flags,
 		int inc = (flags & IFF_ALLMULTI) ? 1 : -1;
 
 		dev->gflags ^= IFF_ALLMULTI;
-		__dev_set_allmulti(dev, inc, false);
+		netif_set_allmulti(dev, inc, false);
 	}
 
 	return ret;
@@ -9421,17 +9394,8 @@ void __dev_notify_flags(struct net_device *dev, unsigned int old_flags,
 	}
 }
 
-/**
- *	dev_change_flags - change device settings
- *	@dev: device
- *	@flags: device state flags
- *	@extack: netlink extended ack
- *
- *	Change settings on device based state flags. The flags are
- *	in the userspace exported format.
- */
-int dev_change_flags(struct net_device *dev, unsigned int flags,
-		     struct netlink_ext_ack *extack)
+int netif_change_flags(struct net_device *dev, unsigned int flags,
+		       struct netlink_ext_ack *extack)
 {
 	int ret;
 	unsigned int changes, old_flags = dev->flags, old_gflags = dev->gflags;
@@ -9444,7 +9408,6 @@ int dev_change_flags(struct net_device *dev, unsigned int flags,
 	__dev_notify_flags(dev, old_flags, changes, 0, NULL);
 	return ret;
 }
-EXPORT_SYMBOL(dev_change_flags);
 
 int __dev_set_mtu(struct net_device *dev, int new_mtu)
 {
@@ -9476,17 +9439,19 @@ int dev_validate_mtu(struct net_device *dev, int new_mtu,
 }
 
 /**
- *	dev_set_mtu_ext - Change maximum transfer unit
+ *	netif_set_mtu_ext - Change maximum transfer unit
  *	@dev: device
  *	@new_mtu: new transfer unit
  *	@extack: netlink extended ack
  *
  *	Change the maximum transfer size of the network device.
  */
-int dev_set_mtu_ext(struct net_device *dev, int new_mtu,
-		    struct netlink_ext_ack *extack)
+int netif_set_mtu_ext(struct net_device *dev, int new_mtu,
+		      struct netlink_ext_ack *extack)
 {
 	int err, orig_mtu;
+
+	netdev_ops_assert_locked(dev);
 
 	if (new_mtu == dev->mtu)
 		return 0;
@@ -9522,25 +9487,20 @@ int dev_set_mtu_ext(struct net_device *dev, int new_mtu,
 	return err;
 }
 
-int dev_set_mtu(struct net_device *dev, int new_mtu)
+int netif_set_mtu(struct net_device *dev, int new_mtu)
 {
 	struct netlink_ext_ack extack;
 	int err;
 
 	memset(&extack, 0, sizeof(extack));
-	err = dev_set_mtu_ext(dev, new_mtu, &extack);
+	err = netif_set_mtu_ext(dev, new_mtu, &extack);
 	if (err && extack._msg)
 		net_err_ratelimited("%s: %s\n", dev->name, extack._msg);
 	return err;
 }
-EXPORT_SYMBOL(dev_set_mtu);
+EXPORT_SYMBOL(netif_set_mtu);
 
-/**
- *	dev_change_tx_queue_len - Change TX queue length of a netdevice
- *	@dev: device
- *	@new_len: new tx queue length
- */
-int dev_change_tx_queue_len(struct net_device *dev, unsigned long new_len)
+int netif_change_tx_queue_len(struct net_device *dev, unsigned long new_len)
 {
 	unsigned int orig_len = dev->tx_queue_len;
 	int res;
@@ -9567,12 +9527,7 @@ err_rollback:
 	return res;
 }
 
-/**
- *	dev_set_group - Change group this device belongs to
- *	@dev: device
- *	@new_group: group this device should belong to
- */
-void dev_set_group(struct net_device *dev, int new_group)
+void netif_set_group(struct net_device *dev, int new_group)
 {
 	dev->group = new_group;
 }
@@ -9598,16 +9553,8 @@ int dev_pre_changeaddr_notify(struct net_device *dev, const char *addr,
 }
 EXPORT_SYMBOL(dev_pre_changeaddr_notify);
 
-/**
- *	dev_set_mac_address - Change Media Access Control Address
- *	@dev: device
- *	@sa: new address
- *	@extack: netlink extended ack
- *
- *	Change the hardware (MAC) address of the device
- */
-int dev_set_mac_address(struct net_device *dev, struct sockaddr *sa,
-			struct netlink_ext_ack *extack)
+int netif_set_mac_address(struct net_device *dev, struct sockaddr *sa,
+			  struct netlink_ext_ack *extack)
 {
 	const struct net_device_ops *ops = dev->netdev_ops;
 	int err;
@@ -9631,21 +9578,8 @@ int dev_set_mac_address(struct net_device *dev, struct sockaddr *sa,
 	add_device_randomness(dev->dev_addr, dev->addr_len);
 	return 0;
 }
-EXPORT_SYMBOL(dev_set_mac_address);
 
 DECLARE_RWSEM(dev_addr_sem);
-
-int dev_set_mac_address_user(struct net_device *dev, struct sockaddr *sa,
-			     struct netlink_ext_ack *extack)
-{
-	int ret;
-
-	down_write(&dev_addr_sem);
-	ret = dev_set_mac_address(dev, sa, extack);
-	up_write(&dev_addr_sem);
-	return ret;
-}
-EXPORT_SYMBOL(dev_set_mac_address_user);
 
 int dev_get_mac_address(struct sockaddr *sa, struct net *net, char *dev_name)
 {
@@ -9675,14 +9609,7 @@ unlock:
 }
 EXPORT_SYMBOL(dev_get_mac_address);
 
-/**
- *	dev_change_carrier - Change device carrier
- *	@dev: device
- *	@new_carrier: new value
- *
- *	Change device carrier
- */
-int dev_change_carrier(struct net_device *dev, bool new_carrier)
+int netif_change_carrier(struct net_device *dev, bool new_carrier)
 {
 	const struct net_device_ops *ops = dev->netdev_ops;
 
@@ -9793,13 +9720,7 @@ bool netdev_port_same_parent_id(struct net_device *a, struct net_device *b)
 }
 EXPORT_SYMBOL(netdev_port_same_parent_id);
 
-/**
- *	dev_change_proto_down - set carrier according to proto_down.
- *
- *	@dev: device
- *	@proto_down: new value
- */
-int dev_change_proto_down(struct net_device *dev, bool proto_down)
+int netif_change_proto_down(struct net_device *dev, bool proto_down)
 {
 	if (!dev->change_proto_down)
 		return -EOPNOTSUPP;
@@ -9814,14 +9735,14 @@ int dev_change_proto_down(struct net_device *dev, bool proto_down)
 }
 
 /**
- *	dev_change_proto_down_reason - proto down reason
+ *	netdev_change_proto_down_reason_locked - proto down reason
  *
  *	@dev: device
  *	@mask: proto down mask
  *	@value: proto down value
  */
-void dev_change_proto_down_reason(struct net_device *dev, unsigned long mask,
-				  u32 value)
+void netdev_change_proto_down_reason_locked(struct net_device *dev,
+					    unsigned long mask, u32 value)
 {
 	u32 proto_down_reason;
 	int b;
@@ -9910,7 +9831,7 @@ u8 dev_xdp_sb_prog_count(struct net_device *dev)
 	return count;
 }
 
-int dev_xdp_propagate(struct net_device *dev, struct netdev_bpf *bpf)
+int netif_xdp_propagate(struct net_device *dev, struct netdev_bpf *bpf)
 {
 	if (!dev->netdev_ops->ndo_bpf)
 		return -EOPNOTSUPP;
@@ -9930,7 +9851,7 @@ int dev_xdp_propagate(struct net_device *dev, struct netdev_bpf *bpf)
 
 	return dev->netdev_ops->ndo_bpf(dev, bpf);
 }
-EXPORT_SYMBOL_GPL(dev_xdp_propagate);
+EXPORT_SYMBOL_GPL(netif_xdp_propagate);
 
 u32 dev_xdp_prog_id(struct net_device *dev, enum bpf_xdp_mode mode)
 {
@@ -9959,6 +9880,8 @@ static int dev_xdp_install(struct net_device *dev, enum bpf_xdp_mode mode,
 {
 	struct netdev_bpf xdp;
 	int err;
+
+	netdev_ops_assert_locked(dev);
 
 	if (dev->cfg->hds_config == ETHTOOL_TCP_DATA_SPLIT_ENABLED &&
 	    prog && !prog->aux->xdp_has_frags) {
@@ -10188,7 +10111,9 @@ static void bpf_xdp_link_release(struct bpf_link *link)
 	 * already NULL, in which case link was already auto-detached
 	 */
 	if (xdp_link->dev) {
+		netdev_lock_ops(xdp_link->dev);
 		WARN_ON(dev_xdp_detach_link(xdp_link->dev, NULL, xdp_link));
+		netdev_unlock_ops(xdp_link->dev);
 		xdp_link->dev = NULL;
 	}
 
@@ -10270,10 +10195,12 @@ static int bpf_xdp_link_update(struct bpf_link *link, struct bpf_prog *new_prog,
 		goto out_unlock;
 	}
 
+	netdev_lock_ops(xdp_link->dev);
 	mode = dev_xdp_mode(xdp_link->dev, xdp_link->flags);
 	bpf_op = dev_xdp_bpf_op(xdp_link->dev, mode);
 	err = dev_xdp_install(xdp_link->dev, mode, bpf_op, NULL,
 			      xdp_link->flags, new_prog);
+	netdev_unlock_ops(xdp_link->dev);
 	if (err)
 		goto out_unlock;
 
@@ -10327,7 +10254,9 @@ int bpf_xdp_link_attach(const union bpf_attr *attr, struct bpf_prog *prog)
 		goto unlock;
 	}
 
+	netdev_lock_ops(dev);
 	err = dev_xdp_attach_link(dev, &extack, link);
+	netdev_unlock_ops(dev);
 	rtnl_unlock();
 
 	if (err) {
@@ -10400,7 +10329,7 @@ u32 dev_get_min_mp_channel_count(const struct net_device *dev)
 {
 	int i;
 
-	ASSERT_RTNL();
+	netdev_ops_assert_locked(dev);
 
 	for (i = dev->real_num_rx_queues - 1; i >= 0; i--)
 		if (dev->_rx[i].mp_params.mp_priv)
@@ -10489,6 +10418,7 @@ static void netdev_sync_lower_features(struct net_device *upper,
 		if (!(features & feature) && (lower->features & feature)) {
 			netdev_dbg(upper, "Disabling feature %pNF on lower dev %s.\n",
 				   &feature, lower->name);
+			netdev_lock_ops(lower);
 			lower->wanted_features &= ~feature;
 			__netdev_update_features(lower);
 
@@ -10497,6 +10427,7 @@ static void netdev_sync_lower_features(struct net_device *upper,
 					    &feature, lower->name);
 			else
 				netdev_features_change(lower);
+			netdev_unlock_ops(lower);
 		}
 	}
 }
@@ -10617,6 +10548,7 @@ int __netdev_update_features(struct net_device *dev)
 	int err = -1;
 
 	ASSERT_RTNL();
+	netdev_ops_assert_locked(dev);
 
 	features = netdev_get_wanted_features(dev);
 
@@ -10669,12 +10601,14 @@ sync_lower:
 			 * *before* calling udp_tunnel_get_rx_info,
 			 * but *after* calling udp_tunnel_drop_rx_info.
 			 */
+			udp_tunnel_nic_lock(dev);
 			if (features & NETIF_F_RX_UDP_TUNNEL_PORT) {
 				dev->features = features;
 				udp_tunnel_get_rx_info(dev);
 			} else {
 				udp_tunnel_drop_rx_info(dev);
 			}
+			udp_tunnel_nic_unlock(dev);
 		}
 
 		if (diff & NETIF_F_HW_VLAN_CTAG_FILTER) {
@@ -11050,7 +10984,9 @@ int register_netdevice(struct net_device *dev)
 	if (ret)
 		goto err_uninit_notify;
 
+	netdev_lock_ops(dev);
 	__netdev_update_features(dev);
+	netdev_unlock_ops(dev);
 
 	/*
 	 *	Default initial state at registry is that the
@@ -11076,7 +11012,9 @@ int register_netdevice(struct net_device *dev)
 		memcpy(dev->perm_addr, dev->dev_addr, dev->addr_len);
 
 	/* Notify protocols, that a new device appeared. */
+	netdev_lock_ops(dev);
 	ret = call_netdevice_notifiers(NETDEV_REGISTER, dev);
+	netdev_unlock_ops(dev);
 	ret = notifier_to_errno(ret);
 	if (ret) {
 		/* Expect explicit free_netdev() on failure */
@@ -11905,6 +11843,35 @@ void unregister_netdevice_queue(struct net_device *dev, struct list_head *head)
 }
 EXPORT_SYMBOL(unregister_netdevice_queue);
 
+/* devices must be UP and netdev_lock()'d */
+static void netif_close_many_and_unlock(struct list_head *close_head)
+{
+	struct net_device *dev, *tmp;
+
+	dev_close_many(close_head, false);
+
+	/* ... now unlock them */
+	list_for_each_entry_safe(dev, tmp, close_head, close_list) {
+		netdev_unlock(dev);
+		list_del_init(&dev->close_list);
+	}
+}
+
+static void netif_close_many_and_unlock_cond(struct list_head *close_head)
+{
+#ifdef CONFIG_LOCKDEP
+	/* We can only track up to MAX_LOCK_DEPTH locks per task.
+	 *
+	 * Reserve half the available slots for additional locks possibly
+	 * taken by notifiers and (soft)irqs.
+	 */
+	unsigned int limit = MAX_LOCK_DEPTH / 2;
+
+	if (lockdep_depth(current) > limit)
+		netif_close_many_and_unlock(close_head);
+#endif
+}
+
 void unregister_netdevice_many_notify(struct list_head *head,
 				      u32 portid, const struct nlmsghdr *nlh)
 {
@@ -11935,9 +11902,22 @@ void unregister_netdevice_many_notify(struct list_head *head,
 		BUG_ON(dev->reg_state != NETREG_REGISTERED);
 	}
 
-	/* If device is running, close it first. */
-	list_for_each_entry(dev, head, unreg_list)
-		list_add_tail(&dev->close_list, &close_head);
+	/* If device is running, close it first. Start with ops locked... */
+	list_for_each_entry(dev, head, unreg_list) {
+		if (!(dev->flags & IFF_UP))
+			continue;
+		if (netdev_need_ops_lock(dev)) {
+			list_add_tail(&dev->close_list, &close_head);
+			netdev_lock(dev);
+		}
+		netif_close_many_and_unlock_cond(&close_head);
+	}
+	netif_close_many_and_unlock(&close_head);
+	/* ... now go over the rest. */
+	list_for_each_entry(dev, head, unreg_list) {
+		if (!netdev_need_ops_lock(dev))
+			list_add_tail(&dev->close_list, &close_head);
+	}
 	dev_close_many(&close_head, true);
 
 	list_for_each_entry(dev, head, unreg_list) {
@@ -11955,11 +11935,13 @@ void unregister_netdevice_many_notify(struct list_head *head,
 		struct sk_buff *skb = NULL;
 
 		/* Shutdown queueing discipline. */
+		netdev_lock_ops(dev);
 		dev_shutdown(dev);
 		dev_tcx_uninstall(dev);
 		dev_xdp_uninstall(dev);
-		bpf_dev_bound_netdev_unregister(dev);
 		dev_dmabuf_uninstall(dev);
+		netdev_unlock_ops(dev);
+		bpf_dev_bound_netdev_unregister(dev);
 
 		netdev_offload_xstats_disable_all(dev);
 
@@ -12053,22 +12035,6 @@ void unregister_netdev(struct net_device *dev)
 }
 EXPORT_SYMBOL(unregister_netdev);
 
-/**
- *	__dev_change_net_namespace - move device to different nethost namespace
- *	@dev: device
- *	@net: network namespace
- *	@pat: If not NULL name pattern to try if the current device name
- *	      is already taken in the destination network namespace.
- *	@new_ifindex: If not zero, specifies device index in the target
- *	              namespace.
- *
- *	This function shuts down a device interface and moves it
- *	to a new network namespace. On success 0 is returned, on
- *	a failure a netagive errno code is returned.
- *
- *	Callers must hold the rtnl semaphore.
- */
-
 int __dev_change_net_namespace(struct net_device *dev, struct net *net,
 			       const char *pat, int new_ifindex)
 {
@@ -12130,16 +12096,23 @@ int __dev_change_net_namespace(struct net_device *dev, struct net *net,
 	 * And now a mini version of register_netdevice unregister_netdevice.
 	 */
 
+	netdev_lock_ops(dev);
 	/* If device is running close it first. */
-	dev_close(dev);
-
+	netif_close(dev);
 	/* And unlink it from device chain */
 	unlist_netdevice(dev);
+
+	if (!netdev_need_ops_lock(dev))
+		netdev_lock(dev);
+	dev->moving_ns = true;
+	netdev_unlock(dev);
 
 	synchronize_net();
 
 	/* Shutdown queueing discipline. */
+	netdev_lock_ops(dev);
 	dev_shutdown(dev);
+	netdev_unlock_ops(dev);
 
 	/* Notify protocols, that we are about to destroy
 	 * this device. They should clean all the things.
@@ -12170,7 +12143,9 @@ int __dev_change_net_namespace(struct net_device *dev, struct net *net,
 	move_netdevice_notifiers_dev_net(dev, net);
 
 	/* Actually switch the network namespace */
+	netdev_lock(dev);
 	dev_net_set(dev, net);
+	netdev_unlock(dev);
 	dev->ifindex = new_ifindex;
 
 	if (new_name[0]) {
@@ -12196,11 +12171,16 @@ int __dev_change_net_namespace(struct net_device *dev, struct net *net,
 	err = netdev_change_owner(dev, net_old, net);
 	WARN_ON(err);
 
+	netdev_lock(dev);
+	dev->moving_ns = false;
+	if (!netdev_need_ops_lock(dev))
+		netdev_unlock(dev);
+
 	/* Add the device back in the hashes */
 	list_netdevice(dev);
-
 	/* Notify protocols, that a new device appeared. */
 	call_netdevice_notifiers(NETDEV_REGISTER, dev);
+	netdev_unlock_ops(dev);
 
 	/*
 	 *	Prevent userspace races by waiting until the network
@@ -12213,7 +12193,6 @@ int __dev_change_net_namespace(struct net_device *dev, struct net *net,
 out:
 	return err;
 }
-EXPORT_SYMBOL_GPL(__dev_change_net_namespace);
 
 static int dev_cpu_dead(unsigned int oldcpu)
 {

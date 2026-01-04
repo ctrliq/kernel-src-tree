@@ -80,6 +80,7 @@
 #include <net/netlink.h>
 #include <net/pkt_sched.h>
 #include <net/l3mdev.h>
+#include <net/netdev_lock.h>
 #include <linux/if_tunnel.h>
 #include <linux/rtnetlink.h>
 #include <linux/netconf.h>
@@ -377,6 +378,7 @@ static struct inet6_dev *ipv6_add_dev(struct net_device *dev)
 	int err = -ENOMEM;
 
 	ASSERT_RTNL();
+	netdev_ops_assert_locked(dev);
 
 	if (dev->mtu < IPV6_MIN_MTU && dev != blackhole_netdev)
 		return ERR_PTR(-EINVAL);
@@ -402,7 +404,7 @@ static struct inet6_dev *ipv6_add_dev(struct net_device *dev)
 		return ERR_PTR(err);
 	}
 	if (ndev->cnf.forwarding)
-		dev_disable_lro(dev);
+		netif_disable_lro(dev);
 	/* We refer to the device */
 	netdev_hold(dev, &ndev->dev_tracker, GFP_KERNEL);
 
@@ -3004,13 +3006,12 @@ static int ipv6_mc_config(struct sock *sk, bool join,
 /*
  *	Manual configuration of address on an interface
  */
-static int inet6_addr_add(struct net *net, int ifindex,
+static int inet6_addr_add(struct net *net, struct net_device *dev,
 			  struct ifa6_config *cfg,
 			  struct netlink_ext_ack *extack)
 {
 	struct inet6_ifaddr *ifp;
 	struct inet6_dev *idev;
-	struct net_device *dev;
 	unsigned long timeout;
 	clock_t expires;
 	u32 flags;
@@ -3033,10 +3034,6 @@ static int inet6_addr_add(struct net *net, int ifindex,
 		return -EINVAL;
 	}
 
-	dev = __dev_get_by_index(net, ifindex);
-	if (!dev)
-		return -ENODEV;
-
 	idev = addrconf_add_dev(dev);
 	if (IS_ERR(idev)) {
 		NL_SET_ERR_MSG_MOD(extack, "IPv6 is disabled on this device");
@@ -3045,7 +3042,7 @@ static int inet6_addr_add(struct net *net, int ifindex,
 
 	if (cfg->ifa_flags & IFA_F_MCAUTOJOIN) {
 		int ret = ipv6_mc_config(net->ipv6.mc_autojoin_sk,
-					 true, cfg->pfx, ifindex);
+					 true, cfg->pfx, dev->ifindex);
 
 		if (ret < 0) {
 			NL_SET_ERR_MSG_MOD(extack, "Multicast auto join failed");
@@ -3100,7 +3097,7 @@ static int inet6_addr_add(struct net *net, int ifindex,
 		return 0;
 	} else if (cfg->ifa_flags & IFA_F_MCAUTOJOIN) {
 		ipv6_mc_config(net->ipv6.mc_autojoin_sk, false,
-			       cfg->pfx, ifindex);
+			       cfg->pfx, dev->ifindex);
 	}
 
 	return PTR_ERR(ifp);
@@ -3166,6 +3163,7 @@ int addrconf_add_ifaddr(struct net *net, void __user *arg)
 		.preferred_lft = INFINITY_LIFE_TIME,
 		.valid_lft = INFINITY_LIFE_TIME,
 	};
+	struct net_device *dev;
 	struct in6_ifreq ireq;
 	int err;
 
@@ -3179,7 +3177,14 @@ int addrconf_add_ifaddr(struct net *net, void __user *arg)
 	cfg.plen = ireq.ifr6_prefixlen;
 
 	rtnl_lock();
-	err = inet6_addr_add(net, ireq.ifr6_ifindex, &cfg, NULL);
+	dev = __dev_get_by_index(net, ireq.ifr6_ifindex);
+	if (dev) {
+		netdev_lock_ops(dev);
+		err = inet6_addr_add(net, dev, &cfg, NULL);
+		netdev_unlock_ops(dev);
+	} else {
+		err = -ENODEV;
+	}
 	rtnl_unlock();
 	return err;
 }
@@ -5045,9 +5050,12 @@ inet6_rtm_newaddr(struct sk_buff *skb, struct nlmsghdr *nlh,
 			 IFA_F_MANAGETEMPADDR | IFA_F_NOPREFIXROUTE |
 			 IFA_F_MCAUTOJOIN | IFA_F_OPTIMISTIC;
 
+	netdev_lock_ops(dev);
 	idev = ipv6_find_idev(dev);
-	if (IS_ERR(idev))
-		return PTR_ERR(idev);
+	if (IS_ERR(idev)) {
+		err = PTR_ERR(idev);
+		goto unlock;
+	}
 
 	if (!ipv6_allow_optimistic_dad(net, idev))
 		cfg.ifa_flags &= ~IFA_F_OPTIMISTIC;
@@ -5055,7 +5063,8 @@ inet6_rtm_newaddr(struct sk_buff *skb, struct nlmsghdr *nlh,
 	if (cfg.ifa_flags & IFA_F_NODAD &&
 	    cfg.ifa_flags & IFA_F_OPTIMISTIC) {
 		NL_SET_ERR_MSG(extack, "IFA_F_NODAD and IFA_F_OPTIMISTIC are mutually exclusive");
-		return -EINVAL;
+		err = -EINVAL;
+		goto unlock;
 	}
 
 	ifa = ipv6_get_ifaddr(net, cfg.pfx, dev, 1);
@@ -5064,7 +5073,8 @@ inet6_rtm_newaddr(struct sk_buff *skb, struct nlmsghdr *nlh,
 		 * It would be best to check for !NLM_F_CREATE here but
 		 * userspace already relies on not having to provide this.
 		 */
-		return inet6_addr_add(net, ifm->ifa_index, &cfg, extack);
+		err = inet6_addr_add(net, dev, &cfg, extack);
+		goto unlock;
 	}
 
 	if (nlh->nlmsg_flags & NLM_F_EXCL ||
@@ -5076,6 +5086,9 @@ inet6_rtm_newaddr(struct sk_buff *skb, struct nlmsghdr *nlh,
 	}
 
 	in6_ifa_put(ifa);
+
+unlock:
+	netdev_unlock_ops(dev);
 
 	return err;
 }
@@ -6525,7 +6538,9 @@ static int addrconf_sysctl_addr_gen_mode(const struct ctl_table *ctl, int write,
 
 			if (idev->cnf.addr_gen_mode != new_val) {
 				WRITE_ONCE(idev->cnf.addr_gen_mode, new_val);
+				netdev_lock_ops(idev->dev);
 				addrconf_init_auto_addrs(idev->dev);
+				netdev_unlock_ops(idev->dev);
 			}
 		} else if (&net->ipv6.devconf_all->addr_gen_mode == ctl->data) {
 			struct net_device *dev;
@@ -6537,7 +6552,9 @@ static int addrconf_sysctl_addr_gen_mode(const struct ctl_table *ctl, int write,
 				    idev->cnf.addr_gen_mode != new_val) {
 					WRITE_ONCE(idev->cnf.addr_gen_mode,
 						  new_val);
+					netdev_lock_ops(idev->dev);
 					addrconf_init_auto_addrs(idev->dev);
+					netdev_unlock_ops(idev->dev);
 				}
 			}
 		}

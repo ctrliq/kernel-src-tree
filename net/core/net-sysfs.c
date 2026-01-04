@@ -23,6 +23,7 @@
 #include <linux/of.h>
 #include <linux/of_net.h>
 #include <linux/cpu.h>
+#include <net/netdev_lock.h>
 #include <net/netdev_rx_queue.h>
 #include <net/rps.h>
 
@@ -1371,8 +1372,10 @@ static ssize_t tx_maxrate_store(struct netdev_queue *queue,
 		return restart_syscall();
 
 	err = -EOPNOTSUPP;
+	netdev_lock_ops(dev);
 	if (dev->netdev_ops->ndo_set_tx_maxrate)
 		err = dev->netdev_ops->ndo_set_tx_maxrate(dev, index, rate);
+	netdev_unlock_ops(dev);
 
 	rtnl_unlock();
 	if (!err) {
@@ -1984,8 +1987,10 @@ static void remove_queue_kobjects(struct net_device *dev)
 	net_rx_queue_update_kobjects(dev, real_rx, 0);
 	netdev_queue_update_kobjects(dev, real_tx, 0);
 
+	netdev_lock_ops(dev);
 	dev->real_num_rx_queues = 0;
 	dev->real_num_tx_queues = 0;
+	netdev_unlock_ops(dev);
 #ifdef CONFIG_SYSFS
 	kset_unregister(dev->queues_kset);
 #endif

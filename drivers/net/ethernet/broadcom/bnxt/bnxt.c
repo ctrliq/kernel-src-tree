@@ -54,6 +54,7 @@
 #include <net/pkt_cls.h>
 #include <net/page_pool/helpers.h>
 #include <linux/align.h>
+#include <net/netdev_lock.h>
 #include <net/netdev_queues.h>
 
 #include "bnxt_hsi.h"
@@ -5267,8 +5268,10 @@ static void bnxt_free_ntp_fltrs(struct bnxt *bp, bool all)
 {
 	int i;
 
-	/* Under rtnl_lock and all our NAPIs have been disabled.  It's
-	 * safe to delete the hash table.
+	netdev_assert_locked_or_invisible(bp->dev);
+
+	/* Under netdev instance lock and all our NAPIs have been disabled.
+	 * It's safe to delete the hash table.
 	 */
 	for (i = 0; i < BNXT_NTP_FLTR_HASH_SIZE; i++) {
 		struct hlist_head *head;
@@ -11444,7 +11447,7 @@ static int bnxt_request_irq(struct bnxt *bp)
 		if (rc)
 			break;
 
-		netif_napi_set_irq(&bp->bnapi[i]->napi, irq->vector);
+		netif_napi_set_irq_locked(&bp->bnapi[i]->napi, irq->vector);
 		irq->requested = 1;
 
 		if (zalloc_cpumask_var(&irq->cpu_mask, GFP_KERNEL)) {
@@ -11480,9 +11483,9 @@ static void bnxt_del_napi(struct bnxt *bp)
 	for (i = 0; i < bp->cp_nr_rings; i++) {
 		struct bnxt_napi *bnapi = bp->bnapi[i];
 
-		__netif_napi_del(&bnapi->napi);
+		__netif_napi_del_locked(&bnapi->napi);
 	}
-	/* We called __netif_napi_del(), we need
+	/* We called __netif_napi_del_locked(), we need
 	 * to respect an RCU grace period before freeing napi structures.
 	 */
 	synchronize_net();
@@ -11504,12 +11507,12 @@ static void bnxt_init_napi(struct bnxt *bp)
 
 	for (i = 0; i < cp_nr_rings; i++) {
 		bnapi = bp->bnapi[i];
-		netif_napi_add_config(bp->dev, &bnapi->napi, poll_fn,
+		netif_napi_add_config_locked(bp->dev, &bnapi->napi, poll_fn,
 				      bnapi->index);
 	}
 	if (BNXT_CHIP_TYPE_NITRO_A0(bp)) {
 		bnapi = bp->bnapi[cp_nr_rings];
-		netif_napi_add(bp->dev, &bnapi->napi, bnxt_poll_nitroa0);
+		netif_napi_add_locked(bp->dev, &bnapi->napi, bnxt_poll_nitroa0);
 	}
 }
 
@@ -11530,7 +11533,7 @@ static void bnxt_disable_napi(struct bnxt *bp)
 			cpr->sw_stats->tx.tx_resets++;
 		if (bnapi->in_reset)
 			cpr->sw_stats->rx.rx_resets++;
-		napi_disable(&bnapi->napi);
+		napi_disable_locked(&bnapi->napi);
 	}
 }
 
@@ -11552,7 +11555,7 @@ static void bnxt_enable_napi(struct bnxt *bp)
 			INIT_WORK(&cpr->dim.work, bnxt_dim_work);
 			cpr->dim.mode = DIM_CQ_PERIOD_MODE_START_FROM_EQE;
 		}
-		napi_enable(&bnapi->napi);
+		napi_enable_locked(&bnapi->napi);
 	}
 }
 
@@ -12715,7 +12718,6 @@ open_err_free_mem:
 	return rc;
 }
 
-/* rtnl_lock held */
 int bnxt_open_nic(struct bnxt *bp, bool irq_re_init, bool link_re_init)
 {
 	int rc = 0;
@@ -12726,14 +12728,14 @@ int bnxt_open_nic(struct bnxt *bp, bool irq_re_init, bool link_re_init)
 		rc = __bnxt_open_nic(bp, irq_re_init, link_re_init);
 	if (rc) {
 		netdev_err(bp->dev, "nic open fail (rc: %x)\n", rc);
-		dev_close(bp->dev);
+		netif_close(bp->dev);
 	}
 	return rc;
 }
 
-/* rtnl_lock held, open the NIC half way by allocating all resources, but
- * NAPI, IRQ, and TX are not enabled.  This is mainly used for offline
- * self tests.
+/* netdev instance lock held, open the NIC half way by allocating all
+ * resources, but NAPI, IRQ, and TX are not enabled.  This is mainly used
+ * for offline self tests.
  */
 int bnxt_half_open_nic(struct bnxt *bp)
 {
@@ -12764,12 +12766,12 @@ int bnxt_half_open_nic(struct bnxt *bp)
 half_open_err:
 	bnxt_free_skbs(bp);
 	bnxt_free_mem(bp, true);
-	dev_close(bp->dev);
+	netif_close(bp->dev);
 	return rc;
 }
 
-/* rtnl_lock held, this call can only be made after a previous successful
- * call to bnxt_half_open_nic().
+/* netdev instance lock held, this call can only be made after a previous
+ * successful call to bnxt_half_open_nic().
  */
 void bnxt_half_close_nic(struct bnxt *bp)
 {
@@ -12878,10 +12880,11 @@ void bnxt_close_nic(struct bnxt *bp, bool irq_re_init, bool link_re_init)
 	if (test_bit(BNXT_STATE_IN_FW_RESET, &bp->state)) {
 		/* If we get here, it means firmware reset is in progress
 		 * while we are trying to close.  We can safely proceed with
-		 * the close because we are holding rtnl_lock().  Some firmware
-		 * messages may fail as we proceed to close.  We set the
-		 * ABORT_ERR flag here so that the FW reset thread will later
-		 * abort when it gets the rtnl_lock() and sees the flag.
+		 * the close because we are holding netdev instance lock.
+		 * Some firmware messages may fail as we proceed to close.
+		 * We set the ABORT_ERR flag here so that the FW reset thread
+		 * will later abort when it gets the netdev instance lock
+		 * and sees the flag.
 		 */
 		netdev_warn(bp->dev, "FW reset in progress during close, FW reset will be aborted\n");
 		set_bit(BNXT_STATE_ABORT_ERR, &bp->state);
@@ -12972,7 +12975,7 @@ static int bnxt_hwrm_port_phy_write(struct bnxt *bp, u16 phy_addr, u16 reg,
 	return hwrm_req_send(bp, req);
 }
 
-/* rtnl_lock held */
+/* netdev instance lock held */
 static int bnxt_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 {
 	struct mii_ioctl_data *mdio = if_mii(ifr);
@@ -13891,30 +13894,31 @@ bnxt_restart_timer:
 	mod_timer(&bp->timer, jiffies + bp->current_interval);
 }
 
-static void bnxt_rtnl_lock_sp(struct bnxt *bp)
+static void bnxt_lock_sp(struct bnxt *bp)
 {
 	/* We are called from bnxt_sp_task which has BNXT_STATE_IN_SP_TASK
 	 * set.  If the device is being closed, bnxt_close() may be holding
-	 * rtnl() and waiting for BNXT_STATE_IN_SP_TASK to clear.  So we
-	 * must clear BNXT_STATE_IN_SP_TASK before holding rtnl().
+	 * netdev instance lock and waiting for BNXT_STATE_IN_SP_TASK to clear.
+	 * So we must clear BNXT_STATE_IN_SP_TASK before holding netdev
+	 * instance lock.
 	 */
 	clear_bit(BNXT_STATE_IN_SP_TASK, &bp->state);
-	rtnl_lock();
+	netdev_lock(bp->dev);
 }
 
-static void bnxt_rtnl_unlock_sp(struct bnxt *bp)
+static void bnxt_unlock_sp(struct bnxt *bp)
 {
 	set_bit(BNXT_STATE_IN_SP_TASK, &bp->state);
-	rtnl_unlock();
+	netdev_unlock(bp->dev);
 }
 
 /* Only called from bnxt_sp_task() */
 static void bnxt_reset(struct bnxt *bp, bool silent)
 {
-	bnxt_rtnl_lock_sp(bp);
+	bnxt_lock_sp(bp);
 	if (test_bit(BNXT_STATE_OPEN, &bp->state))
 		bnxt_reset_task(bp, silent);
-	bnxt_rtnl_unlock_sp(bp);
+	bnxt_unlock_sp(bp);
 }
 
 /* Only called from bnxt_sp_task() */
@@ -13922,9 +13926,9 @@ static void bnxt_rx_ring_reset(struct bnxt *bp)
 {
 	int i;
 
-	bnxt_rtnl_lock_sp(bp);
+	bnxt_lock_sp(bp);
 	if (!test_bit(BNXT_STATE_OPEN, &bp->state)) {
-		bnxt_rtnl_unlock_sp(bp);
+		bnxt_unlock_sp(bp);
 		return;
 	}
 	/* Disable and flush TPA before resetting the RX ring */
@@ -13963,7 +13967,7 @@ static void bnxt_rx_ring_reset(struct bnxt *bp)
 	}
 	if (bp->flags & BNXT_FLAG_TPA)
 		bnxt_set_tpa(bp, true);
-	bnxt_rtnl_unlock_sp(bp);
+	bnxt_unlock_sp(bp);
 }
 
 static void bnxt_fw_fatal_close(struct bnxt *bp)
@@ -14019,7 +14023,7 @@ static bool is_bnxt_fw_ok(struct bnxt *bp)
 	return false;
 }
 
-/* rtnl_lock is acquired before calling this function */
+/* netdev instance lock is acquired before calling this function */
 static void bnxt_force_fw_reset(struct bnxt *bp)
 {
 	struct bnxt_fw_health *fw_health = bp->fw_health;
@@ -14062,9 +14066,9 @@ void bnxt_fw_exception(struct bnxt *bp)
 	netdev_warn(bp->dev, "Detected firmware fatal condition, initiating reset\n");
 	set_bit(BNXT_STATE_FW_FATAL_COND, &bp->state);
 	bnxt_ulp_stop(bp);
-	bnxt_rtnl_lock_sp(bp);
+	bnxt_lock_sp(bp);
 	bnxt_force_fw_reset(bp);
-	bnxt_rtnl_unlock_sp(bp);
+	bnxt_unlock_sp(bp);
 }
 
 /* Returns the number of registered VFs, or 1 if VF configuration is pending, or
@@ -14094,7 +14098,7 @@ static int bnxt_get_registered_vfs(struct bnxt *bp)
 void bnxt_fw_reset(struct bnxt *bp)
 {
 	bnxt_ulp_stop(bp);
-	bnxt_rtnl_lock_sp(bp);
+	bnxt_lock_sp(bp);
 	if (test_bit(BNXT_STATE_OPEN, &bp->state) &&
 	    !test_bit(BNXT_STATE_IN_FW_RESET, &bp->state)) {
 		struct bnxt_ptp_cfg *ptp = bp->ptp_cfg;
@@ -14117,7 +14121,7 @@ void bnxt_fw_reset(struct bnxt *bp)
 			netdev_err(bp->dev, "Firmware reset aborted, rc = %d\n",
 				   n);
 			clear_bit(BNXT_STATE_IN_FW_RESET, &bp->state);
-			dev_close(bp->dev);
+			netif_close(bp->dev);
 			goto fw_reset_exit;
 		} else if (n > 0) {
 			u16 vf_tmo_dsecs = n * 10;
@@ -14140,7 +14144,7 @@ void bnxt_fw_reset(struct bnxt *bp)
 		bnxt_queue_fw_reset_work(bp, tmo);
 	}
 fw_reset_exit:
-	bnxt_rtnl_unlock_sp(bp);
+	bnxt_unlock_sp(bp);
 }
 
 static void bnxt_chk_missed_irq(struct bnxt *bp)
@@ -14339,7 +14343,7 @@ static void bnxt_sp_task(struct work_struct *work)
 static void _bnxt_get_max_rings(struct bnxt *bp, int *max_rx, int *max_tx,
 				int *max_cp);
 
-/* Under rtnl_lock */
+/* Under netdev instance lock */
 int bnxt_check_rings(struct bnxt *bp, int tx, int rx, bool sh, int tcs,
 		     int tx_xdp)
 {
@@ -14732,7 +14736,7 @@ static void bnxt_fw_reset_abort(struct bnxt *bp, int rc)
 	if (bp->fw_reset_state != BNXT_FW_RESET_STATE_POLL_VF)
 		bnxt_dl_health_fw_status_update(bp, false);
 	bp->fw_reset_state = BNXT_FW_RESET_STATE_ABORT;
-	dev_close(bp->dev);
+	netif_close(bp->dev);
 }
 
 static void bnxt_fw_reset_task(struct work_struct *work)
@@ -14767,10 +14771,10 @@ static void bnxt_fw_reset_task(struct work_struct *work)
 			return;
 		}
 		bp->fw_reset_timestamp = jiffies;
-		rtnl_lock();
+		netdev_lock(bp->dev);
 		if (test_bit(BNXT_STATE_ABORT_ERR, &bp->state)) {
 			bnxt_fw_reset_abort(bp, rc);
-			rtnl_unlock();
+			netdev_unlock(bp->dev);
 			goto ulp_start;
 		}
 		bnxt_fw_reset_close(bp);
@@ -14781,7 +14785,7 @@ static void bnxt_fw_reset_task(struct work_struct *work)
 			bp->fw_reset_state = BNXT_FW_RESET_STATE_ENABLE_DEV;
 			tmo = bp->fw_reset_min_dsecs * HZ / 10;
 		}
-		rtnl_unlock();
+		netdev_unlock(bp->dev);
 		bnxt_queue_fw_reset_work(bp, tmo);
 		return;
 	}
@@ -14855,7 +14859,7 @@ static void bnxt_fw_reset_task(struct work_struct *work)
 		bp->fw_reset_state = BNXT_FW_RESET_STATE_OPENING;
 		fallthrough;
 	case BNXT_FW_RESET_STATE_OPENING:
-		while (!rtnl_trylock()) {
+		while (!netdev_trylock(bp->dev)) {
 			bnxt_queue_fw_reset_work(bp, HZ / 10);
 			return;
 		}
@@ -14863,7 +14867,7 @@ static void bnxt_fw_reset_task(struct work_struct *work)
 		if (rc) {
 			netdev_err(bp->dev, "bnxt_open() failed during FW reset\n");
 			bnxt_fw_reset_abort(bp, rc);
-			rtnl_unlock();
+			netdev_unlock(bp->dev);
 			goto ulp_start;
 		}
 
@@ -14882,13 +14886,13 @@ static void bnxt_fw_reset_task(struct work_struct *work)
 			bnxt_dl_health_fw_recovery_done(bp);
 			bnxt_dl_health_fw_status_update(bp, true);
 		}
-		rtnl_unlock();
+		netdev_unlock(bp->dev);
 		bnxt_ulp_start(bp, 0);
 		bnxt_reenable_sriov(bp);
-		rtnl_lock();
+		netdev_lock(bp->dev);
 		bnxt_vf_reps_alloc(bp);
 		bnxt_vf_reps_open(bp);
-		rtnl_unlock();
+		netdev_unlock(bp->dev);
 		break;
 	}
 	return;
@@ -14901,9 +14905,9 @@ fw_reset_abort_status:
 		netdev_err(bp->dev, "fw_health_status 0x%x\n", sts);
 	}
 fw_reset_abort:
-	rtnl_lock();
+	netdev_lock(bp->dev);
 	bnxt_fw_reset_abort(bp, rc);
-	rtnl_unlock();
+	netdev_unlock(bp->dev);
 ulp_start:
 	bnxt_ulp_start(bp, rc);
 }
@@ -14995,12 +14999,13 @@ init_err:
 	return rc;
 }
 
-/* rtnl_lock held */
 static int bnxt_change_mac_addr(struct net_device *dev, void *p)
 {
 	struct sockaddr *addr = p;
 	struct bnxt *bp = netdev_priv(dev);
 	int rc = 0;
+
+	netdev_assert_locked(dev);
 
 	if (!is_valid_ether_addr(addr->sa_data))
 		return -EADDRNOTAVAIL;
@@ -15022,10 +15027,11 @@ static int bnxt_change_mac_addr(struct net_device *dev, void *p)
 	return rc;
 }
 
-/* rtnl_lock held */
 static int bnxt_change_mtu(struct net_device *dev, int new_mtu)
 {
 	struct bnxt *bp = netdev_priv(dev);
+
+	netdev_assert_locked(dev);
 
 	if (netif_running(dev))
 		bnxt_close_nic(bp, true, false);
@@ -15406,8 +15412,7 @@ static int bnxt_udp_tunnel_unset_port(struct net_device *netdev, unsigned int ta
 static const struct udp_tunnel_nic_info bnxt_udp_tunnels = {
 	.set_port	= bnxt_udp_tunnel_set_port,
 	.unset_port	= bnxt_udp_tunnel_unset_port,
-	.flags		= UDP_TUNNEL_NIC_INFO_MAY_SLEEP |
-			  UDP_TUNNEL_NIC_INFO_OPEN_ONLY,
+	.flags		= UDP_TUNNEL_NIC_INFO_OPEN_ONLY,
 	.tables		= {
 		{ .n_entries = 1, .tunnel_types = UDP_TUNNEL_TYPE_VXLAN,  },
 		{ .n_entries = 1, .tunnel_types = UDP_TUNNEL_TYPE_GENEVE, },
@@ -15415,8 +15420,7 @@ static const struct udp_tunnel_nic_info bnxt_udp_tunnels = {
 }, bnxt_udp_tunnels_p7 = {
 	.set_port	= bnxt_udp_tunnel_set_port,
 	.unset_port	= bnxt_udp_tunnel_unset_port,
-	.flags		= UDP_TUNNEL_NIC_INFO_MAY_SLEEP |
-			  UDP_TUNNEL_NIC_INFO_OPEN_ONLY,
+	.flags		= UDP_TUNNEL_NIC_INFO_OPEN_ONLY,
 	.tables		= {
 		{ .n_entries = 1, .tunnel_types = UDP_TUNNEL_TYPE_VXLAN,  },
 		{ .n_entries = 1, .tunnel_types = UDP_TUNNEL_TYPE_GENEVE, },
@@ -15805,7 +15809,7 @@ static int bnxt_queue_start(struct net_device *dev, void *qmem, int idx)
 			goto err_reset;
 	}
 
-	napi_enable(&bnapi->napi);
+	napi_enable_locked(&bnapi->napi);
 	bnxt_db_nq_arm(bp, &cpr->cp_db, cpr->cp_raw_cons);
 
 	for (i = 0; i < bp->nr_vnics; i++) {
@@ -15827,7 +15831,7 @@ static int bnxt_queue_start(struct net_device *dev, void *qmem, int idx)
 err_reset:
 	netdev_err(bp->dev, "Unexpected HWRM error during queue start rc: %d\n",
 		   rc);
-	napi_enable(&bnapi->napi);
+	napi_enable_locked(&bnapi->napi);
 	bnxt_db_nq_arm(bp, &cpr->cp_db, cpr->cp_raw_cons);
 	bnxt_reset_task(bp, true);
 	return rc;
@@ -15867,7 +15871,7 @@ static int bnxt_queue_stop(struct net_device *dev, void *qmem, int idx)
 	 * completion is handled in NAPI to guarantee no more DMA on that ring
 	 * after seeing the completion.
 	 */
-	napi_disable(&bnapi->napi);
+	napi_disable_locked(&bnapi->napi);
 
 	if (bp->tph_mode) {
 		bnxt_hwrm_cp_ring_free(bp, rxr->rx_cpr);
@@ -16193,7 +16197,7 @@ int bnxt_restore_pf_fw_resources(struct bnxt *bp)
 {
 	int rc;
 
-	ASSERT_RTNL();
+	netdev_ops_assert_locked(bp->dev);
 	bnxt_hwrm_func_qcaps(bp);
 
 	if (netif_running(bp->dev))
@@ -16206,7 +16210,7 @@ int bnxt_restore_pf_fw_resources(struct bnxt *bp)
 
 	if (netif_running(bp->dev)) {
 		if (rc)
-			dev_close(bp->dev);
+			netif_close(bp->dev);
 		else
 			rc = bnxt_open_nic(bp, true, false);
 	}
@@ -16543,6 +16547,7 @@ static int bnxt_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 		bp->rss_cap |= BNXT_RSS_CAP_MULTI_RSS_CTX;
 	if (BNXT_SUPPORTS_QUEUE_API(bp))
 		dev->queue_mgmt_ops = &bnxt_queue_mgmt_ops;
+	dev->request_ops_lock = true;
 
 	rc = register_netdev(dev);
 	if (rc)
@@ -16594,12 +16599,13 @@ static void bnxt_shutdown(struct pci_dev *pdev)
 		return;
 
 	rtnl_lock();
+	netdev_lock(dev);
 	bp = netdev_priv(dev);
 	if (!bp)
 		goto shutdown_exit;
 
 	if (netif_running(dev))
-		dev_close(dev);
+		netif_close(dev);
 
 	bnxt_ptp_clear(bp);
 	bnxt_clear_int_mode(bp);
@@ -16611,6 +16617,7 @@ static void bnxt_shutdown(struct pci_dev *pdev)
 	}
 
 shutdown_exit:
+	netdev_unlock(dev);
 	rtnl_unlock();
 }
 
@@ -16623,7 +16630,7 @@ static int bnxt_suspend(struct device *device)
 
 	bnxt_ulp_stop(bp);
 
-	rtnl_lock();
+	netdev_lock(dev);
 	if (netif_running(dev)) {
 		netif_device_detach(dev);
 		rc = bnxt_close(dev);
@@ -16632,7 +16639,7 @@ static int bnxt_suspend(struct device *device)
 	bnxt_ptp_clear(bp);
 	pci_disable_device(bp->pdev);
 	bnxt_free_ctx_mem(bp, false);
-	rtnl_unlock();
+	netdev_unlock(dev);
 	return rc;
 }
 
@@ -16642,7 +16649,7 @@ static int bnxt_resume(struct device *device)
 	struct bnxt *bp = netdev_priv(dev);
 	int rc = 0;
 
-	rtnl_lock();
+	netdev_lock(dev);
 	rc = pci_enable_device(bp->pdev);
 	if (rc) {
 		netdev_err(dev, "Cannot re-enable PCI device during resume, err = %d\n",
@@ -16685,7 +16692,7 @@ static int bnxt_resume(struct device *device)
 	}
 
 resume_exit:
-	rtnl_unlock();
+	netdev_unlock(bp->dev);
 	bnxt_ulp_start(bp, rc);
 	if (!rc)
 		bnxt_reenable_sriov(bp);
@@ -16720,7 +16727,7 @@ static pci_ers_result_t bnxt_io_error_detected(struct pci_dev *pdev,
 
 	bnxt_ulp_stop(bp);
 
-	rtnl_lock();
+	netdev_lock(netdev);
 	netif_device_detach(netdev);
 
 	if (test_and_set_bit(BNXT_STATE_IN_FW_RESET, &bp->state)) {
@@ -16729,7 +16736,7 @@ static pci_ers_result_t bnxt_io_error_detected(struct pci_dev *pdev,
 	}
 
 	if (abort || state == pci_channel_io_perm_failure) {
-		rtnl_unlock();
+		netdev_unlock(netdev);
 		return PCI_ERS_RESULT_DISCONNECT;
 	}
 
@@ -16748,7 +16755,7 @@ static pci_ers_result_t bnxt_io_error_detected(struct pci_dev *pdev,
 	if (pci_is_enabled(pdev))
 		pci_disable_device(pdev);
 	bnxt_free_ctx_mem(bp, false);
-	rtnl_unlock();
+	netdev_unlock(netdev);
 
 	/* Request a slot slot reset. */
 	return PCI_ERS_RESULT_NEED_RESET;
@@ -16778,7 +16785,7 @@ static pci_ers_result_t bnxt_io_slot_reset(struct pci_dev *pdev)
 	    test_bit(BNXT_STATE_PCI_CHANNEL_IO_FROZEN, &bp->state))
 		msleep(900);
 
-	rtnl_lock();
+	netdev_lock(netdev);
 
 	if (pci_enable_device(pdev)) {
 		dev_err(&pdev->dev,
@@ -16832,7 +16839,7 @@ static pci_ers_result_t bnxt_io_slot_reset(struct pci_dev *pdev)
 reset_exit:
 	clear_bit(BNXT_STATE_IN_FW_RESET, &bp->state);
 	bnxt_clear_reservations(bp, true);
-	rtnl_unlock();
+	netdev_unlock(netdev);
 
 	return result;
 }
@@ -16851,7 +16858,7 @@ static void bnxt_io_resume(struct pci_dev *pdev)
 	int err;
 
 	netdev_info(bp->dev, "PCI Slot Resume\n");
-	rtnl_lock();
+	netdev_lock(netdev);
 
 	err = bnxt_hwrm_func_qcaps(bp);
 	if (!err) {
@@ -16867,7 +16874,7 @@ static void bnxt_io_resume(struct pci_dev *pdev)
 	if (!err)
 		netif_device_attach(netdev);
 
-	rtnl_unlock();
+	netdev_unlock(netdev);
 	bnxt_ulp_start(bp, err);
 	if (!err)
 		bnxt_reenable_sriov(bp);
