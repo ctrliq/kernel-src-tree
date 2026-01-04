@@ -95,14 +95,14 @@ int uvc_query_ctrl(struct uvc_device *dev, u8 query, u8 unit,
 	 */
 	if (ret > 0 && query != UVC_GET_INFO) {
 		memset(data + ret, 0, size - ret);
-		dev_warn_once(&dev->udev->dev,
+		dev_warn_once(&dev->intf->dev,
 			      "UVC non compliance: %s control %u on unit %u returned %d bytes when we expected %u.\n",
 			      uvc_query_name(query), cs, unit, ret, size);
 		return 0;
 	}
 
 	if (ret != -EPIPE) {
-		dev_err(&dev->udev->dev,
+		dev_err(&dev->intf->dev,
 			"Failed to query (%s) UVC control %u on unit %u: %d (exp. %u).\n",
 			uvc_query_name(query), cs, unit, ret, size);
 		return ret < 0 ? ret : -EPIPE;
@@ -119,7 +119,7 @@ int uvc_query_ctrl(struct uvc_device *dev, u8 query, u8 unit,
 	*(u8 *)data = tmp;
 
 	if (ret != 1) {
-		dev_err_ratelimited(&dev->udev->dev,
+		dev_err_ratelimited(&dev->intf->dev,
 				    "Failed to query (%s) UVC error code control %u on unit %u: %d (exp. 1).\n",
 				    uvc_query_name(query), cs, unit, ret);
 		return ret < 0 ? ret : -EPIPE;
@@ -261,6 +261,15 @@ static void uvc_fixup_video_ctrl(struct uvc_streaming *stream,
 		bandwidth = max_t(u32, bandwidth, 1024);
 
 		ctrl->dwMaxPayloadTransferSize = bandwidth;
+	}
+
+	if (stream->intf->num_altsetting > 1 &&
+	    ctrl->dwMaxPayloadTransferSize > stream->maxpsize) {
+		dev_warn_ratelimited(&stream->intf->dev,
+				     "UVC non compliance: Reducing max payload transfer size (%u) to fit endpoint limit (%u).\n",
+				     ctrl->dwMaxPayloadTransferSize,
+				     stream->maxpsize);
+		ctrl->dwMaxPayloadTransferSize = stream->maxpsize;
 	}
 }
 
@@ -1433,12 +1442,6 @@ static void uvc_video_decode_meta(struct uvc_streaming *stream,
 	if (!meta_buf || length == 2)
 		return;
 
-	if (meta_buf->length - meta_buf->bytesused <
-	    length + sizeof(meta->ns) + sizeof(meta->sof)) {
-		meta_buf->error = 1;
-		return;
-	}
-
 	has_pts = mem[1] & UVC_STREAM_PTS;
 	has_scr = mem[1] & UVC_STREAM_SCR;
 
@@ -1458,6 +1461,12 @@ static void uvc_video_decode_meta(struct uvc_streaming *stream,
 	if (length == len_std && (!has_scr ||
 				  !memcmp(scr, stream->clock.last_scr, 6)))
 		return;
+
+	if (meta_buf->length - meta_buf->bytesused <
+	    length + sizeof(meta->ns) + sizeof(meta->sof)) {
+		meta_buf->error = 1;
+		return;
+	}
 
 	meta = (struct uvc_meta_buf *)((u8 *)meta_buf->mem + meta_buf->bytesused);
 	local_irq_save(flags);
@@ -1696,7 +1705,7 @@ static void uvc_video_complete(struct urb *urb)
 	struct uvc_streaming *stream = uvc_urb->stream;
 	struct uvc_video_queue *queue = &stream->queue;
 	struct uvc_video_queue *qmeta = &stream->meta.queue;
-	struct vb2_queue *vb2_qmeta = stream->meta.vdev.queue;
+	struct vb2_queue *vb2_qmeta = stream->meta.queue.vdev.queue;
 	struct uvc_buffer *buf = NULL;
 	struct uvc_buffer *buf_meta = NULL;
 	unsigned long flags;

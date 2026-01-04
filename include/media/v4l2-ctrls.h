@@ -579,8 +579,10 @@ int v4l2_ctrl_handler_init_class(struct v4l2_ctrl_handler *hdl,
  * @hdl:	The control handler.
  *
  * Does nothing if @hdl == NULL.
+ *
+ * Return: @hdl's error field or 0 if @hdl is NULL.
  */
-void v4l2_ctrl_handler_free(struct v4l2_ctrl_handler *hdl);
+int v4l2_ctrl_handler_free(struct v4l2_ctrl_handler *hdl);
 
 /**
  * v4l2_ctrl_lock() - Helper function to lock the handler
@@ -1311,13 +1313,13 @@ void v4l2_ctrl_merge(const struct v4l2_event *old, struct v4l2_event *new);
  * v4l2_ctrl_log_status - helper function to implement %VIDIOC_LOG_STATUS ioctl
  *
  * @file: pointer to struct file
- * @fh: unused. Kept just to be compatible to the arguments expected by
+ * @priv: unused. Kept just to be compatible to the arguments expected by
  *	&struct v4l2_ioctl_ops.vidioc_log_status.
  *
  * Can be used as a vidioc_log_status function that just dumps all controls
  * associated with the filehandle.
  */
-int v4l2_ctrl_log_status(struct file *file, void *fh);
+int v4l2_ctrl_log_status(struct file *file, void *priv);
 
 /**
  * v4l2_ctrl_subscribe_event - Subscribes to an event
@@ -1431,6 +1433,18 @@ v4l2_ctrl_request_hdl_ctrl_find(struct v4l2_ctrl_handler *hdl, u32 id);
  * If hdl == NULL then they will all return -EINVAL.
  */
 int v4l2_queryctrl(struct v4l2_ctrl_handler *hdl, struct v4l2_queryctrl *qc);
+
+/**
+ * v4l2_query_ext_ctrl_to_v4l2_queryctrl - Convert a qec to qe.
+ *
+ * @to: The v4l2_queryctrl to write to.
+ * @from: The v4l2_query_ext_ctrl to read from.
+ *
+ * This function is a helper to convert a v4l2_query_ext_ctrl into a
+ * v4l2_queryctrl.
+ */
+void v4l2_query_ext_ctrl_to_v4l2_queryctrl(struct v4l2_queryctrl *to,
+					   const struct v4l2_query_ext_ctrl *from);
 
 /**
  * v4l2_query_ext_ctrl - Helper function to implement
