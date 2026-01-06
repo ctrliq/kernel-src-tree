@@ -2132,6 +2132,7 @@ int __phy_hwtstamp_set(struct phy_device *phydev,
 		       struct netlink_ext_ack *extack);
 
 extern const struct bus_type mdio_bus_type;
+extern const struct class mdio_bus_class;
 
 struct mdio_board_info {
 	const char	*bus_id;
