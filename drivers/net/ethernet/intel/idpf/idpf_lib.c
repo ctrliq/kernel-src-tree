@@ -840,6 +840,7 @@ static int idpf_cfg_netdev(struct idpf_vport *vport)
 	idpf_xdp_set_features(vport);
 
 	idpf_set_ethtool_ops(netdev);
+	netif_set_affinity_auto(netdev);
 	SET_NETDEV_DEV(netdev, &adapter->pdev->dev);
 
 	/* carrier off on init to avoid Tx hangs */
