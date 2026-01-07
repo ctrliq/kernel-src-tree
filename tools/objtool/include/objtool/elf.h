@@ -81,6 +81,7 @@ struct symbol {
 	u8 ignore	     : 1;
 	u8 cold		     : 1;
 	u8 prefix	     : 1;
+	u8 debug_checksum    : 1;
 	struct list_head pv_target;
 	struct reloc *relocs;
 	struct section *group_sec;
