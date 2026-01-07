@@ -72,6 +72,7 @@ struct symbol {
 	u8 frame_pointer     : 1;
 	u8 ignore	     : 1;
 	u8 cold		     : 1;
+	u8 prefix	     : 1;
 	struct list_head pv_target;
 	struct reloc *relocs;
 	struct section *group_sec;
@@ -227,6 +228,11 @@ static inline bool is_weak_sym(struct symbol *sym)
 static inline bool is_local_sym(struct symbol *sym)
 {
 	return sym->bind == STB_LOCAL;
+}
+
+static inline bool is_prefix_func(struct symbol *sym)
+{
+	return sym->prefix;
 }
 
 static inline bool is_reloc_sec(struct section *sec)
