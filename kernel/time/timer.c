@@ -386,32 +386,6 @@ static unsigned long round_jiffies_common(unsigned long j, int cpu,
 }
 
 /**
- * __round_jiffies - function to round jiffies to a full second
- * @j: the time in (absolute) jiffies that should be rounded
- * @cpu: the processor number on which the timeout will happen
- *
- * __round_jiffies() rounds an absolute time in the future (in jiffies)
- * up or down to (approximately) full seconds. This is useful for timers
- * for which the exact time they fire does not matter too much, as long as
- * they fire approximately every X seconds.
- *
- * By rounding these timers to whole seconds, all such timers will fire
- * at the same time, rather than at various times spread out. The goal
- * of this is to have the CPU wake up less, which saves power.
- *
- * The exact rounding is skewed for each processor to avoid all
- * processors firing at the exact same time, which could lead
- * to lock contention or spurious cache line bouncing.
- *
- * The return value is the rounded version of the @j parameter.
- */
-unsigned long __round_jiffies(unsigned long j, int cpu)
-{
-	return round_jiffies_common(j, cpu, false);
-}
-EXPORT_SYMBOL_GPL(__round_jiffies);
-
-/**
  * __round_jiffies_relative - function to round jiffies to a full second
  * @j: the time in (relative) jiffies that should be rounded
  * @cpu: the processor number on which the timeout will happen
@@ -481,22 +455,6 @@ unsigned long round_jiffies_relative(unsigned long j)
 	return __round_jiffies_relative(j, raw_smp_processor_id());
 }
 EXPORT_SYMBOL_GPL(round_jiffies_relative);
-
-/**
- * __round_jiffies_up - function to round jiffies up to a full second
- * @j: the time in (absolute) jiffies that should be rounded
- * @cpu: the processor number on which the timeout will happen
- *
- * This is the same as __round_jiffies() except that it will never
- * round down.  This is useful for timeouts for which the exact time
- * of firing does not matter too much, as long as they don't fire too
- * early.
- */
-unsigned long __round_jiffies_up(unsigned long j, int cpu)
-{
-	return round_jiffies_common(j, cpu, true);
-}
-EXPORT_SYMBOL_GPL(__round_jiffies_up);
 
 /**
  * __round_jiffies_up_relative - function to round jiffies up to a full second
@@ -956,33 +914,29 @@ static int detach_if_pending(struct timer_list *timer, struct timer_base *base,
 static inline struct timer_base *get_timer_cpu_base(u32 tflags, u32 cpu)
 {
 	int index = tflags & TIMER_PINNED ? BASE_LOCAL : BASE_GLOBAL;
-	struct timer_base *base;
-
-	base = per_cpu_ptr(&timer_bases[index], cpu);
 
 	/*
 	 * If the timer is deferrable and NO_HZ_COMMON is set then we need
 	 * to use the deferrable base.
 	 */
 	if (IS_ENABLED(CONFIG_NO_HZ_COMMON) && (tflags & TIMER_DEFERRABLE))
-		base = per_cpu_ptr(&timer_bases[BASE_DEF], cpu);
-	return base;
+		index = BASE_DEF;
+
+	return per_cpu_ptr(&timer_bases[index], cpu);
 }
 
 static inline struct timer_base *get_timer_this_cpu_base(u32 tflags)
 {
 	int index = tflags & TIMER_PINNED ? BASE_LOCAL : BASE_GLOBAL;
-	struct timer_base *base;
-
-	base = this_cpu_ptr(&timer_bases[index]);
 
 	/*
 	 * If the timer is deferrable and NO_HZ_COMMON is set then we need
 	 * to use the deferrable base.
 	 */
 	if (IS_ENABLED(CONFIG_NO_HZ_COMMON) && (tflags & TIMER_DEFERRABLE))
-		base = this_cpu_ptr(&timer_bases[BASE_DEF]);
-	return base;
+		index = BASE_DEF;
+
+	return this_cpu_ptr(&timer_bases[index]);
 }
 
 static inline struct timer_base *get_timer_base(u32 tflags)
@@ -2421,7 +2375,8 @@ static inline void __run_timers(struct timer_base *base)
 
 static void __run_timer_base(struct timer_base *base)
 {
-	if (time_before(jiffies, base->next_expiry))
+	/* Can race against a remote CPU updating next_expiry under the lock */
+	if (time_before(jiffies, READ_ONCE(base->next_expiry)))
 		return;
 
 	timer_base_lock_expiry(base);
@@ -2498,7 +2453,7 @@ static void run_local_timers(void)
 		 */
 		if (time_after_eq(jiffies, READ_ONCE(base->next_expiry)) ||
 		    (i == BASE_DEF && tmigr_requires_handle_remote())) {
-			raise_timer_softirq();
+			raise_timer_softirq(TIMER_SOFTIRQ);
 			return;
 		}
 	}

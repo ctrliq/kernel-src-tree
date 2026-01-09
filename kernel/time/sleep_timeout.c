@@ -110,8 +110,17 @@ signed long __sched schedule_timeout(signed long timeout)
 EXPORT_SYMBOL(schedule_timeout);
 
 /*
- * We can use __set_current_state() here because schedule_timeout() calls
- * schedule() unconditionally.
+ * __set_current_state() can be used in schedule_timeout_*() functions, because
+ * schedule_timeout() calls schedule() unconditionally.
+ */
+
+/**
+ * schedule_timeout_interruptible - sleep until timeout (interruptible)
+ * @timeout: timeout value in jiffies
+ *
+ * See schedule_timeout() for details.
+ *
+ * Task state is set to TASK_INTERRUPTIBLE before starting the timeout.
  */
 signed long __sched schedule_timeout_interruptible(signed long timeout)
 {
@@ -120,6 +129,14 @@ signed long __sched schedule_timeout_interruptible(signed long timeout)
 }
 EXPORT_SYMBOL(schedule_timeout_interruptible);
 
+/**
+ * schedule_timeout_killable - sleep until timeout (killable)
+ * @timeout: timeout value in jiffies
+ *
+ * See schedule_timeout() for details.
+ *
+ * Task state is set to TASK_KILLABLE before starting the timeout.
+ */
 signed long __sched schedule_timeout_killable(signed long timeout)
 {
 	__set_current_state(TASK_KILLABLE);
@@ -127,6 +144,14 @@ signed long __sched schedule_timeout_killable(signed long timeout)
 }
 EXPORT_SYMBOL(schedule_timeout_killable);
 
+/**
+ * schedule_timeout_uninterruptible - sleep until timeout (uninterruptible)
+ * @timeout: timeout value in jiffies
+ *
+ * See schedule_timeout() for details.
+ *
+ * Task state is set to TASK_UNINTERRUPTIBLE before starting the timeout.
+ */
 signed long __sched schedule_timeout_uninterruptible(signed long timeout)
 {
 	__set_current_state(TASK_UNINTERRUPTIBLE);
@@ -134,9 +159,15 @@ signed long __sched schedule_timeout_uninterruptible(signed long timeout)
 }
 EXPORT_SYMBOL(schedule_timeout_uninterruptible);
 
-/*
- * Like schedule_timeout_uninterruptible(), except this task will not contribute
- * to load average.
+/**
+ * schedule_timeout_idle - sleep until timeout (idle)
+ * @timeout: timeout value in jiffies
+ *
+ * See schedule_timeout() for details.
+ *
+ * Task state is set to TASK_IDLE before starting the timeout. It is similar to
+ * schedule_timeout_uninterruptible(), except this task will not contribute to
+ * load average.
  */
 signed long __sched schedule_timeout_idle(signed long timeout)
 {
@@ -151,6 +182,9 @@ EXPORT_SYMBOL(schedule_timeout_idle);
  * @delta:	slack in expires timeout (ktime_t)
  * @mode:	timer mode
  * @clock_id:	timer clock to be used
+ *
+ * Details are explained in schedule_hrtimeout_range() function description as
+ * this function is commonly used.
  */
 int __sched schedule_hrtimeout_range_clock(ktime_t *expires, u64 delta,
 					   const enum hrtimer_mode mode, clockid_t clock_id)
@@ -236,26 +270,8 @@ EXPORT_SYMBOL_GPL(schedule_hrtimeout_range);
  * @expires:	timeout value (ktime_t)
  * @mode:	timer mode
  *
- * Make the current task sleep until the given expiry time has
- * elapsed. The routine will return immediately unless
- * the current task state has been set (see set_current_state()).
- *
- * You can set the task state as follows -
- *
- * %TASK_UNINTERRUPTIBLE - at least @timeout time is guaranteed to
- * pass before the routine returns unless the current task is explicitly
- * woken up, (e.g. by wake_up_process()).
- *
- * %TASK_INTERRUPTIBLE - the routine may return early if a signal is
- * delivered to the current task or the current task is explicitly woken
- * up.
- *
- * The current task state is guaranteed to be TASK_RUNNING when this
- * routine returns.
- *
- * Returns: 0 when the timer has expired. If the task was woken before the
- * timer expired by a signal (only possible in state TASK_INTERRUPTIBLE) or
- * by an explicit wakeup, it returns -EINTR.
+ * See schedule_hrtimeout_range() for details. @delta argument of
+ * schedule_hrtimeout_range() is set to 0 and has therefore no impact.
  */
 int __sched schedule_hrtimeout(ktime_t *expires, const enum hrtimer_mode mode)
 {
@@ -265,7 +281,34 @@ EXPORT_SYMBOL_GPL(schedule_hrtimeout);
 
 /**
  * msleep - sleep safely even with waitqueue interruptions
- * @msecs: Time in milliseconds to sleep for
+ * @msecs:	Requested sleep duration in milliseconds
+ *
+ * msleep() uses jiffy based timeouts for the sleep duration. Because of the
+ * design of the timer wheel, the maximum additional percentage delay (slack) is
+ * 12.5%. This is only valid for timers which will end up in level 1 or a higher
+ * level of the timer wheel. For explanation of those 12.5% please check the
+ * detailed description about the basics of the timer wheel.
+ *
+ * The slack of timers which will end up in level 0 depends on sleep duration
+ * (msecs) and HZ configuration and can be calculated in the following way (with
+ * the timer wheel design restriction that the slack is not less than 12.5%):
+ *
+ *   ``slack = MSECS_PER_TICK / msecs``
+ *
+ * When the allowed slack of the callsite is known, the calculation could be
+ * turned around to find the minimal allowed sleep duration to meet the
+ * constraints. For example:
+ *
+ * * ``HZ=1000`` with ``slack=25%``: ``MSECS_PER_TICK / slack = 1 / (1/4) = 4``:
+ *   all sleep durations greater or equal 4ms will meet the constraints.
+ * * ``HZ=1000`` with ``slack=12.5%``: ``MSECS_PER_TICK / slack = 1 / (1/8) = 8``:
+ *   all sleep durations greater or equal 8ms will meet the constraints.
+ * * ``HZ=250`` with ``slack=25%``: ``MSECS_PER_TICK / slack = 4 / (1/4) = 16``:
+ *   all sleep durations greater or equal 16ms will meet the constraints.
+ * * ``HZ=250`` with ``slack=12.5%``: ``MSECS_PER_TICK / slack = 4 / (1/8) = 32``:
+ *   all sleep durations greater or equal 32ms will meet the constraints.
+ *
+ * See also the signal aware variant msleep_interruptible().
  */
 void msleep(unsigned int msecs)
 {
@@ -278,7 +321,15 @@ EXPORT_SYMBOL(msleep);
 
 /**
  * msleep_interruptible - sleep waiting for signals
- * @msecs: Time in milliseconds to sleep for
+ * @msecs:	Requested sleep duration in milliseconds
+ *
+ * See msleep() for some basic information.
+ *
+ * The difference between msleep() and msleep_interruptible() is that the sleep
+ * could be interrupted by a signal delivery and then returns early.
+ *
+ * Returns: The remaining time of the sleep duration transformed to msecs (see
+ * schedule_timeout() for details).
  */
 unsigned long msleep_interruptible(unsigned int msecs)
 {
@@ -296,16 +347,25 @@ EXPORT_SYMBOL(msleep_interruptible);
  * @max:	Maximum time in usecs to sleep
  * @state:	State of the current task that will be while sleeping
  *
+ * usleep_range_state() sleeps at least for the minimum specified time but not
+ * longer than the maximum specified amount of time. The range might reduce
+ * power usage by allowing hrtimers to coalesce an already scheduled interrupt
+ * with this hrtimer. In the worst case, an interrupt is scheduled for the upper
+ * bound.
+ *
+ * The sleeping task is set to the specified state before starting the sleep.
+ *
  * In non-atomic context where the exact wakeup time is flexible, use
- * usleep_range_state() instead of udelay().  The sleep improves responsiveness
- * by avoiding the CPU-hogging busy-wait of udelay(), and the range reduces
- * power usage by allowing hrtimers to take advantage of an already-
- * scheduled interrupt instead of scheduling a new one just for this sleep.
+ * usleep_range() or its variants instead of udelay(). The sleep improves
+ * responsiveness by avoiding the CPU-hogging busy-wait of udelay().
  */
 void __sched usleep_range_state(unsigned long min, unsigned long max, unsigned int state)
 {
 	ktime_t exp = ktime_add_us(ktime_get(), min);
 	u64 delta = (u64)(max - min) * NSEC_PER_USEC;
+
+	if (WARN_ON_ONCE(max < min))
+		delta = 0;
 
 	for (;;) {
 		__set_current_state(state);
