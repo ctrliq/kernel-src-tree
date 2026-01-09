@@ -647,6 +647,7 @@ sources-rh: $(TARBALL) generate-testpatch-tmp setup-source dist-configs-check
 		../Makefile.rhelver \
 		README.rst \
 		kernel-local \
+		kernel.sbat.template \
 		dracut-virt.conf \
 		keys/redhatsecureboot504.cer \
 		$(SOURCES)/
