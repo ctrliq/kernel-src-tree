@@ -470,7 +470,7 @@ struct request_queue {
 	 */
 	unsigned long		queue_flags;
 
-	unsigned int		rq_timeout;
+	unsigned int __data_racy rq_timeout;
 
 	unsigned int		queue_depth;
 
