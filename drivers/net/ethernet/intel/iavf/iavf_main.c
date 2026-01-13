@@ -5747,9 +5747,11 @@ static void iavf_remove(struct pci_dev *pdev)
 
 	iavf_misc_irq_disable(adapter);
 	/* Shut down all the garbage mashers on the detention level */
+	netdev_unlock(netdev);
 	cancel_work_sync(&adapter->reset_task);
 	cancel_delayed_work_sync(&adapter->watchdog_task);
 	cancel_work_sync(&adapter->adminq_task);
+	netdev_lock(netdev);
 
 	adapter->aq_required = 0;
 	adapter->flags &= ~IAVF_FLAG_REINIT_ITR_NEEDED;
