@@ -45,6 +45,15 @@
 #define DOMAIN_NUMBER_MASK		GENMASK(7, 4)
 #define BUS_NUMBER_MASK			GENMASK(3, 0)
 
+static ulong rh_ath12k_host_msi_vector_addr = 0;
+module_param_named(rh_host_msi_vector_addr, rh_ath12k_host_msi_vector_addr, ulong, 0644);
+MODULE_PARM_DESC(rh_host_msi_vector_addr,
+		 "Red Hat workaround to configure the MSI vector address that is used from host in order to be used in VM");
+static uint rh_ath12k_host_msi_vector_data = 0;
+module_param_named(rh_host_msi_vector_data, rh_ath12k_host_msi_vector_data, uint, 0644);
+MODULE_PARM_DESC(rh_host_msi_vector_data,
+		 "Red Hat workaround to configure the MSI vector data that is used from host in order to be used in VM");
+
 static const struct pci_device_id ath12k_pci_id_table[] = {
 	{ PCI_VDEVICE(QCOM, QCN9274_DEVICE_ID) },
 	{ PCI_VDEVICE(QCOM, WCN7850_DEVICE_ID) },
@@ -800,6 +809,16 @@ static int ath12k_pci_msi_alloc(struct ath12k_pci *ab_pci)
 
 	ath12k_pci_msi_disable(ab_pci);
 
+	if (rh_ath12k_host_msi_vector_addr) {
+		ab_pci->msi_ep_base_data = rh_ath12k_host_msi_vector_data;
+
+		ath12k_dbg(ab, ATH12K_DBG_PCI, "msi addr hi 0x%x lo 0x%x base data is %d\n",
+			   (u32)(rh_ath12k_host_msi_vector_addr >> 32),
+			   (u32)(rh_ath12k_host_msi_vector_addr & 0xffffffff),
+			   ab_pci->msi_ep_base_data);
+		return 0;
+	}
+
 	msi_desc = irq_get_msi_desc(ab_pci->pdev->irq);
 	if (!msi_desc) {
 		ath12k_err(ab, "msi_desc is NULL!\n");
@@ -830,6 +849,9 @@ static void ath12k_pci_msi_free(struct ath12k_pci *ab_pci)
 static int ath12k_pci_config_msi_data(struct ath12k_pci *ab_pci)
 {
 	struct msi_desc *msi_desc;
+
+	if (rh_ath12k_host_msi_vector_addr)
+		return 0;
 
 	msi_desc = irq_get_msi_desc(ab_pci->pdev->irq);
 	if (!msi_desc) {
@@ -1068,6 +1090,12 @@ void ath12k_pci_get_msi_address(struct ath12k_base *ab, u32 *msi_addr_lo,
 {
 	struct ath12k_pci *ab_pci = ath12k_pci_priv(ab);
 	struct pci_dev *pci_dev = to_pci_dev(ab->dev);
+
+	if (rh_ath12k_host_msi_vector_addr) {
+		*msi_addr_hi = (u32)(rh_ath12k_host_msi_vector_addr >> 32);
+		*msi_addr_lo = (u32)(rh_ath12k_host_msi_vector_addr & 0xffffffff);
+		return;
+	}
 
 	pci_read_config_dword(pci_dev, pci_dev->msi_cap + PCI_MSI_ADDRESS_LO,
 			      msi_addr_lo);
