@@ -4,8 +4,7 @@
  * This code generates raw asm output which is post-processed to extract
  * and format the required data.
  */
-
-#define ASM_OFFSETS_C
+#define COMPILE_OFFSETS
 
 #include <linux/kbuild.h>
 #include <linux/sched.h>
