@@ -1,0 +1,307 @@
+ceph: fix race condition where r_parent becomes stale before sending message
+
+jira KERNEL-428
+Rebuild_History Non-Buildable kernel-4.18.0-553.92.1.el8_10
+Rebuild_CHGLOG: - ceph: fix client race condition where r_parent becomes stale before sending message (Alex Markuze) [RHEL-120226]
+Rebuild_FUZZ: 95.60%
+commit-author Alex Markuze <amarkuze@redhat.com>
+commit bec324f33d1ed346394b2eee25bf6dbf3511f727
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.92.1.el8_10/bec324f3.failed
+
+When the parent directory's i_rwsem is not locked, req->r_parent may become
+stale due to concurrent operations (e.g. rename) between dentry lookup and
+message creation. Validate that r_parent matches the encoded parent inode
+and update to the correct inode if a mismatch is detected.
+
+[ idryomov: folded a follow-up fix from Alex to drop extra reference
+  from ceph_get_reply_dir() in ceph_fill_trace():
+
+  ceph_get_reply_dir() may return a different, referenced inode when
+  r_parent is stale and the parent directory lock is not held.
+  ceph_fill_trace() used that inode but failed to drop the reference
+  when it differed from req->r_parent, leaking an inode reference.
+
+  Keep the directory inode in a local variable and iput() it at
+  function end if it does not match req->r_parent. ]
+
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Alex Markuze <amarkuze@redhat.com>
+	Reviewed-by: Viacheslav Dubeyko <Slava.Dubeyko@ibm.com>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit bec324f33d1ed346394b2eee25bf6dbf3511f727)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/inode.c
+diff --cc fs/ceph/inode.c
+index 696abab74f09,f67025465de0..000000000000
+--- a/fs/ceph/inode.c
++++ b/fs/ceph/inode.c
+@@@ -52,8 -55,130 +52,72 @@@ static int ceph_set_ino_cb(struct inod
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +struct inode *ceph_get_inode(struct super_block *sb, struct ceph_vino vino)
+++=======
++ /*
++  * Check if the parent inode matches the vino from directory reply info
++  */
++ static inline bool ceph_vino_matches_parent(struct inode *parent,
++ 					    struct ceph_vino vino)
++ {
++ 	return ceph_ino(parent) == vino.ino && ceph_snap(parent) == vino.snap;
++ }
++ 
++ /*
++  * Validate that the directory inode referenced by @req->r_parent matches the
++  * inode number and snapshot id contained in the reply's directory record.  If
++  * they do not match – which can theoretically happen if the parent dentry was
++  * moved between the time the request was issued and the reply arrived – fall
++  * back to looking up the correct inode in the inode cache.
++  *
++  * A reference is *always* returned.  Callers that receive a different inode
++  * than the original @parent are responsible for dropping the extra reference
++  * once the reply has been processed.
++  */
++ static struct inode *ceph_get_reply_dir(struct super_block *sb,
++ 					struct inode *parent,
++ 					struct ceph_mds_reply_info_parsed *rinfo)
++ {
++ 	struct ceph_vino vino;
++ 
++ 	if (unlikely(!rinfo->diri.in))
++ 		return parent; /* nothing to compare against */
++ 
++ 	/* If we didn't have a cached parent inode to begin with, just bail out. */
++ 	if (!parent)
++ 		return NULL;
++ 
++ 	vino.ino  = le64_to_cpu(rinfo->diri.in->ino);
++ 	vino.snap = le64_to_cpu(rinfo->diri.in->snapid);
++ 
++ 	if (likely(ceph_vino_matches_parent(parent, vino)))
++ 		return parent; /* matches – use the original reference */
++ 
++ 	/* Mismatch – this should be rare.  Emit a WARN and obtain the correct inode. */
++ 	WARN_ONCE(1, "ceph: reply dir mismatch (parent valid %llx.%llx reply %llx.%llx)\n",
++ 		  ceph_ino(parent), ceph_snap(parent), vino.ino, vino.snap);
++ 
++ 	return ceph_get_inode(sb, vino, NULL);
++ }
++ 
++ /**
++  * ceph_new_inode - allocate a new inode in advance of an expected create
++  * @dir: parent directory for new inode
++  * @dentry: dentry that may eventually point to new inode
++  * @mode: mode of new inode
++  * @as_ctx: pointer to inherited security context
++  *
++  * Allocate a new inode in advance of an operation to create a new inode.
++  * This allocates the inode and sets up the acl_sec_ctx with appropriate
++  * info for the new inode.
++  *
++  * Returns a pointer to the new inode or an ERR_PTR.
++  */
++ struct inode *ceph_new_inode(struct inode *dir, struct dentry *dentry,
++ 			     umode_t *mode, struct ceph_acl_sec_ctx *as_ctx)
+++>>>>>>> bec324f33d1e (ceph: fix race condition where r_parent becomes stale before sending message)
+  {
+ -	int err;
+ -	struct inode *inode;
+ -
+ -	inode = new_inode(dir->i_sb);
+ -	if (!inode)
+ -		return ERR_PTR(-ENOMEM);
+ -
+ -	inode->i_blkbits = CEPH_FSCRYPT_BLOCK_SHIFT;
+ -
+ -	if (!S_ISLNK(*mode)) {
+ -		err = ceph_pre_init_acls(dir, mode, as_ctx);
+ -		if (err < 0)
+ -			goto out_err;
+ -	}
+ -
+ -	inode->i_state = 0;
+ -	inode->i_mode = *mode;
+ -
+ -	err = ceph_security_init_secctx(dentry, *mode, as_ctx);
+ -	if (err < 0)
+ -		goto out_err;
+ -
+ -	/*
+ -	 * We'll skip setting fscrypt context for snapshots, leaving that for
+ -	 * the handle_reply().
+ -	 */
+ -	if (ceph_snap(dir) != CEPH_SNAPDIR) {
+ -		err = ceph_fscrypt_prepare_context(dir, inode, as_ctx);
+ -		if (err)
+ -			goto out_err;
+ -	}
+ -
+ -	return inode;
+ -out_err:
+ -	iput(inode);
+ -	return ERR_PTR(err);
+ -}
+ -
+ -void ceph_as_ctx_to_req(struct ceph_mds_request *req,
+ -			struct ceph_acl_sec_ctx *as_ctx)
+ -{
+ -	if (as_ctx->pagelist) {
+ -		req->r_pagelist = as_ctx->pagelist;
+ -		as_ctx->pagelist = NULL;
+ -	}
+ -	ceph_fscrypt_as_ctx_to_req(req, as_ctx);
+ -}
+ -
+ -/**
+ - * ceph_get_inode - find or create/hash a new inode
+ - * @sb: superblock to search and allocate in
+ - * @vino: vino to search for
+ - * @newino: optional new inode to insert if one isn't found (may be NULL)
+ - *
+ - * Search for or insert a new inode into the hash for the given vino, and
+ - * return a reference to it. If new is non-NULL, its reference is consumed.
+ - */
+ -struct inode *ceph_get_inode(struct super_block *sb, struct ceph_vino vino,
+ -			     struct inode *newino)
+ -{
+ -	struct ceph_mds_client *mdsc = ceph_sb_to_mdsc(sb);
+ -	struct ceph_client *cl = mdsc->fsc->client;
+  	struct inode *inode;
+  
+  	if (ceph_vino_is_reserved(vino))
+@@@ -1270,14 -1567,16 +1334,20 @@@ int ceph_fill_trace(struct super_block 
+  	struct ceph_mds_reply_info_parsed *rinfo = &req->r_reply_info;
+  	struct inode *in = NULL;
+  	struct ceph_vino tvino, dvino;
+++<<<<<<< HEAD
+ +	struct ceph_fs_client *fsc = ceph_sb_to_client(sb);
+++=======
++ 	struct ceph_fs_client *fsc = ceph_sb_to_fs_client(sb);
++ 	struct ceph_client *cl = fsc->client;
++ 	struct inode *parent_dir = NULL;
+++>>>>>>> bec324f33d1e (ceph: fix race condition where r_parent becomes stale before sending message)
+  	int err = 0;
+  
+ -	doutc(cl, "%p is_dentry %d is_target %d\n", req,
+ -	      rinfo->head->is_dentry, rinfo->head->is_target);
+ +	dout("fill_trace %p is_dentry %d is_target %d\n", req,
+ +	     rinfo->head->is_dentry, rinfo->head->is_target);
+  
+  	if (!rinfo->head->is_target && !rinfo->head->is_dentry) {
+ -		doutc(cl, "reply is empty!\n");
+ +		dout("fill_trace reply is empty!\n");
+  		if (rinfo->head->result == 0 && req->r_parent)
+  			ceph_invalidate_dir_request(req);
+  		return 0;
+@@@ -1296,20 -1602,39 +1373,46 @@@
+  			WARN_ON_ONCE(1);
+  		}
+  
+- 		if (dir && req->r_op == CEPH_MDS_OP_LOOKUPNAME &&
++ 		if (parent_dir && req->r_op == CEPH_MDS_OP_LOOKUPNAME &&
+  		    test_bit(CEPH_MDS_R_PARENT_LOCKED, &req->r_req_flags) &&
+  		    !test_bit(CEPH_MDS_R_ABORTED, &req->r_req_flags)) {
+ -			bool is_nokey = false;
+  			struct qstr dname;
+  			struct dentry *dn, *parent;
+++<<<<<<< HEAD
+++=======
++ 			struct fscrypt_str oname = FSTR_INIT(NULL, 0);
++ 			struct ceph_fname fname = { .dir	= parent_dir,
++ 						    .name	= rinfo->dname,
++ 						    .ctext	= rinfo->altname,
++ 						    .name_len	= rinfo->dname_len,
++ 						    .ctext_len	= rinfo->altname_len };
+++>>>>>>> bec324f33d1e (ceph: fix race condition where r_parent becomes stale before sending message)
+  
+  			BUG_ON(!rinfo->head->is_target);
+  			BUG_ON(req->r_dentry);
+  
+- 			parent = d_find_any_alias(dir);
++ 			parent = d_find_any_alias(parent_dir);
+  			BUG_ON(!parent);
+  
+++<<<<<<< HEAD
+ +			dname.name = rinfo->dname;
+ +			dname.len = rinfo->dname_len;
+++=======
++ 			err = ceph_fname_alloc_buffer(parent_dir, &oname);
++ 			if (err < 0) {
++ 				dput(parent);
++ 				goto done;
++ 			}
++ 
++ 			err = ceph_fname_to_usr(&fname, NULL, &oname, &is_nokey);
++ 			if (err < 0) {
++ 				dput(parent);
++ 				ceph_fname_free_buffer(parent_dir, &oname);
++ 				goto done;
++ 			}
++ 			dname.name = oname.name;
++ 			dname.len = oname.len;
+++>>>>>>> bec324f33d1e (ceph: fix race condition where r_parent becomes stale before sending message)
+  			dname.hash = full_name_hash(parent, dname.name, dname.len);
+  			tvino.ino = le64_to_cpu(rinfo->targeti.in->ino);
+  			tvino.snap = le64_to_cpu(rinfo->targeti.in->snapid);
+@@@ -1320,10 -1645,11 +1423,14 @@@ retry_lookup
+  
+  			if (!dn) {
+  				dn = d_alloc(parent, &dname);
+ -				doutc(cl, "d_alloc %p '%.*s' = %p\n", parent,
+ -				      dname.len, dname.name, dn);
+ +				dout("d_alloc %p '%.*s' = %p\n", parent,
+ +				     dname.len, dname.name, dn);
+  				if (!dn) {
+  					dput(parent);
+++<<<<<<< HEAD
+++=======
++ 					ceph_fname_free_buffer(parent_dir, &oname);
+++>>>>>>> bec324f33d1e (ceph: fix race condition where r_parent becomes stale before sending message)
+  					err = -ENOMEM;
+  					goto done;
+  				}
+@@@ -1331,13 -1662,14 +1438,23 @@@
+  			} else if (d_really_is_positive(dn) &&
+  				   (ceph_ino(d_inode(dn)) != tvino.ino ||
+  				    ceph_snap(d_inode(dn)) != tvino.snap)) {
+++<<<<<<< HEAD
+ +				dout(" dn %p points to wrong inode %p\n",
+ +				     dn, d_inode(dn));
+ +				ceph_dir_clear_ordered(dir);
+++=======
++ 				doutc(cl, " dn %p points to wrong inode %p\n",
++ 				      dn, d_inode(dn));
++ 				ceph_dir_clear_ordered(parent_dir);
+++>>>>>>> bec324f33d1e (ceph: fix race condition where r_parent becomes stale before sending message)
+  				d_delete(dn);
+  				dput(dn);
+  				goto retry_lookup;
+  			}
+++<<<<<<< HEAD
+++=======
++ 			ceph_fname_free_buffer(parent_dir, &oname);
+++>>>>>>> bec324f33d1e (ceph: fix race condition where r_parent becomes stale before sending message)
+  
+  			req->r_dentry = dn;
+  			dput(parent);
+@@@ -1517,7 -1848,10 +1634,14 @@@
+  					    &dvino, ptvino);
+  	}
+  done:
+++<<<<<<< HEAD
+ +	dout("fill_trace done err=%d\n", err);
+++=======
++ 	/* Drop extra ref from ceph_get_reply_dir() if it returned a new inode */
++ 	if (unlikely(!IS_ERR_OR_NULL(parent_dir) && parent_dir != req->r_parent))
++ 		iput(parent_dir);
++ 	doutc(cl, "done err=%d\n", err);
+++>>>>>>> bec324f33d1e (ceph: fix race condition where r_parent becomes stale before sending message)
+  	return err;
+  }
+  
+* Unmerged path fs/ceph/inode.c
