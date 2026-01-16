@@ -98,11 +98,7 @@ struct intel_fbc {
 	struct intel_display *display;
 	const struct intel_fbc_funcs *funcs;
 
-	/*
-	 * This is always the inner lock when overlapping with
-	 * struct_mutex and it's the outer lock when overlapping
-	 * with stolen_lock.
-	 */
+	/* This is always the outer lock when overlapping with stolen_lock */
 	struct mutex lock;
 	unsigned int busy_bits;
 
@@ -1460,7 +1456,7 @@ static int intel_fbc_check_plane(struct intel_atomic_state *state,
 		return 0;
 	}
 
-	if (intel_display_needs_wa_16023588340(display)) {
+	if (intel_display_wa(display, 16023588340)) {
 		plane_state->no_fbc_reason = "Wa_16023588340";
 		return 0;
 	}
@@ -1550,14 +1546,14 @@ static int intel_fbc_check_plane(struct intel_atomic_state *state,
 	 * having a Y offset that isn't divisible by 4 causes FIFO underrun
 	 * and screen flicker.
 	 */
-	if (DISPLAY_VER(display) >= 9 &&
+	if (IS_DISPLAY_VER(display, 9, 12) &&
 	    plane_state->view.color_plane[0].y & 3) {
 		plane_state->no_fbc_reason = "plane start Y offset misaligned";
 		return 0;
 	}
 
 	/* Wa_22010751166: icl, ehl, tgl, dg1, rkl */
-	if (DISPLAY_VER(display) >= 11 &&
+	if (IS_DISPLAY_VER(display, 9, 12) &&
 	    (plane_state->view.color_plane[0].y +
 	     (drm_rect_height(&plane_state->uapi.src) >> 16)) & 3) {
 		plane_state->no_fbc_reason = "plane end Y offset misaligned";
@@ -2240,10 +2236,9 @@ void intel_fbc_crtc_debugfs_add(struct intel_crtc *crtc)
 /* FIXME: remove this once igt is on board with per-crtc stuff */
 void intel_fbc_debugfs_register(struct intel_display *display)
 {
-	struct drm_minor *minor = display->drm->primary;
 	struct intel_fbc *fbc;
 
 	fbc = display->fbc[INTEL_FBC_A];
 	if (fbc)
-		intel_fbc_debugfs_add(fbc, minor->debugfs_root);
+		intel_fbc_debugfs_add(fbc, display->drm->debugfs_root);
 }
