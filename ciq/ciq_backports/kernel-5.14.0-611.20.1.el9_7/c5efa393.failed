@@ -1,0 +1,318 @@
+selftests/landlock: Add a new test for setuid()
+
+jira KERNEL-445
+Rebuild_History Non-Buildable kernel-5.14.0-611.20.1.el9_7
+commit-author Mickaël Salaün <mic@digikod.net>
+commit c5efa393d82cf68812e0ae4d93e339873eabe9fe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-611.20.1.el9_7/c5efa393.failed
+
+The new signal_scoping_thread_setuid tests check that the libc's
+setuid() function works as expected even when a thread is sandboxed with
+scoped signal restrictions.
+
+Before the signal scoping fix, this test would have failed with the
+setuid() call:
+
+  [pid    65] getpid()                    = 65
+  [pid    65] tgkill(65, 66, SIGRT_1)     = -1 EPERM (Operation not permitted)
+  [pid    65] futex(0x40a66cdc, FUTEX_WAKE_PRIVATE, 1) = 0
+  [pid    65] setuid(1001)                = 0
+
+After the fix, tgkill(2) is successfully leveraged to synchronize
+credentials update across threads:
+
+  [pid    65] getpid()                    = 65
+  [pid    65] tgkill(65, 66, SIGRT_1)     = 0
+  [pid    66] <... read resumed>0x40a65eb7, 1) = ? ERESTARTSYS (To be restarted if SA_RESTART is set)
+  [pid    66] --- SIGRT_1 {si_signo=SIGRT_1, si_code=SI_TKILL, si_pid=65, si_uid=1000} ---
+  [pid    66] getpid()                    = 65
+  [pid    66] setuid(1001)                = 0
+  [pid    66] futex(0x40a66cdc, FUTEX_WAKE_PRIVATE, 1) = 0
+  [pid    66] rt_sigreturn({mask=[]})     = 0
+  [pid    66] read(3,  <unfinished ...>
+  [pid    65] setuid(1001)                = 0
+
+Test coverage for security/landlock is 92.9% of 1137 lines according to
+gcc/gcov-14.
+
+Fixes: c8994965013e ("selftests/landlock: Test signal scoping for threads")
+	Cc: Günther Noack <gnoack@google.com>
+	Cc: Tahera Fahimi <fahimitahera@gmail.com>
+	Cc: stable@vger.kernel.org
+Link: https://lore.kernel.org/r/20250318161443.279194-8-mic@digikod.net
+[mic: Update test coverage]
+	Signed-off-by: Mickaël Salaün <mic@digikod.net>
+(cherry picked from commit c5efa393d82cf68812e0ae4d93e339873eabe9fe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/landlock/scoped_signal_test.c
+diff --cc tools/testing/selftests/landlock/scoped_signal_test.c
+index cd70d1fb7278,d8bf33417619..000000000000
+--- a/tools/testing/selftests/landlock/scoped_signal_test.c
++++ b/tools/testing/selftests/landlock/scoped_signal_test.c
+@@@ -316,4 -317,246 +317,249 @@@ TEST(signal_scoping_thread_after
+  	EXPECT_EQ(0, close(thread_pipe[1]));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct thread_setuid_args {
++ 	int pipe_read, new_uid;
++ };
++ 
++ void *thread_setuid(void *ptr)
++ {
++ 	const struct thread_setuid_args *arg = ptr;
++ 	char buf;
++ 
++ 	if (read(arg->pipe_read, &buf, 1) != 1)
++ 		return (void *)THREAD_ERROR;
++ 
++ 	/* libc's setuid() should update all thread's credentials. */
++ 	if (getuid() != arg->new_uid)
++ 		return (void *)THREAD_TEST_FAILED;
++ 
++ 	return (void *)THREAD_SUCCESS;
++ }
++ 
++ TEST(signal_scoping_thread_setuid)
++ {
++ 	struct thread_setuid_args arg;
++ 	pthread_t no_sandbox_thread;
++ 	enum thread_return ret = THREAD_INVALID;
++ 	int pipe_parent[2];
++ 	int prev_uid;
++ 
++ 	disable_caps(_metadata);
++ 
++ 	/* This test does not need to be run as root. */
++ 	prev_uid = getuid();
++ 	arg.new_uid = prev_uid + 1;
++ 	EXPECT_LT(0, arg.new_uid);
++ 
++ 	ASSERT_EQ(0, pipe2(pipe_parent, O_CLOEXEC));
++ 	arg.pipe_read = pipe_parent[0];
++ 
++ 	/* Capabilities must be set before creating a new thread. */
++ 	set_cap(_metadata, CAP_SETUID);
++ 	ASSERT_EQ(0, pthread_create(&no_sandbox_thread, NULL, thread_setuid,
++ 				    &arg));
++ 
++ 	/* Enforces restriction after creating the thread. */
++ 	create_scoped_domain(_metadata, LANDLOCK_SCOPE_SIGNAL);
++ 
++ 	EXPECT_NE(arg.new_uid, getuid());
++ 	EXPECT_EQ(0, setuid(arg.new_uid));
++ 	EXPECT_EQ(arg.new_uid, getuid());
++ 	EXPECT_EQ(1, write(pipe_parent[1], ".", 1));
++ 
++ 	EXPECT_EQ(0, pthread_join(no_sandbox_thread, (void **)&ret));
++ 	EXPECT_EQ(THREAD_SUCCESS, ret);
++ 
++ 	clear_cap(_metadata, CAP_SETUID);
++ 	EXPECT_EQ(0, close(pipe_parent[0]));
++ 	EXPECT_EQ(0, close(pipe_parent[1]));
++ }
++ 
++ const short backlog = 10;
++ 
++ static volatile sig_atomic_t signal_received;
++ 
++ static void handle_sigurg(int sig)
++ {
++ 	if (sig == SIGURG)
++ 		signal_received = 1;
++ 	else
++ 		signal_received = -1;
++ }
++ 
++ static int setup_signal_handler(int signal)
++ {
++ 	struct sigaction sa = {
++ 		.sa_handler = handle_sigurg,
++ 	};
++ 
++ 	if (sigemptyset(&sa.sa_mask))
++ 		return -1;
++ 
++ 	sa.sa_flags = SA_SIGINFO | SA_RESTART;
++ 	return sigaction(SIGURG, &sa, NULL);
++ }
++ 
++ /* clang-format off */
++ FIXTURE(fown) {};
++ /* clang-format on */
++ 
++ enum fown_sandbox {
++ 	SANDBOX_NONE,
++ 	SANDBOX_BEFORE_FORK,
++ 	SANDBOX_BEFORE_SETOWN,
++ 	SANDBOX_AFTER_SETOWN,
++ };
++ 
++ FIXTURE_VARIANT(fown)
++ {
++ 	const enum fown_sandbox sandbox_setown;
++ };
++ 
++ /* clang-format off */
++ FIXTURE_VARIANT_ADD(fown, no_sandbox) {
++ 	/* clang-format on */
++ 	.sandbox_setown = SANDBOX_NONE,
++ };
++ 
++ /* clang-format off */
++ FIXTURE_VARIANT_ADD(fown, sandbox_before_fork) {
++ 	/* clang-format on */
++ 	.sandbox_setown = SANDBOX_BEFORE_FORK,
++ };
++ 
++ /* clang-format off */
++ FIXTURE_VARIANT_ADD(fown, sandbox_before_setown) {
++ 	/* clang-format on */
++ 	.sandbox_setown = SANDBOX_BEFORE_SETOWN,
++ };
++ 
++ /* clang-format off */
++ FIXTURE_VARIANT_ADD(fown, sandbox_after_setown) {
++ 	/* clang-format on */
++ 	.sandbox_setown = SANDBOX_AFTER_SETOWN,
++ };
++ 
++ FIXTURE_SETUP(fown)
++ {
++ 	drop_caps(_metadata);
++ }
++ 
++ FIXTURE_TEARDOWN(fown)
++ {
++ }
++ 
++ /*
++  * Sending an out of bound message will trigger the SIGURG signal
++  * through file_send_sigiotask.
++  */
++ TEST_F(fown, sigurg_socket)
++ {
++ 	int server_socket, recv_socket;
++ 	struct service_fixture server_address;
++ 	char buffer_parent;
++ 	int status;
++ 	int pipe_parent[2], pipe_child[2];
++ 	pid_t child;
++ 
++ 	memset(&server_address, 0, sizeof(server_address));
++ 	set_unix_address(&server_address, 0);
++ 
++ 	ASSERT_EQ(0, pipe2(pipe_parent, O_CLOEXEC));
++ 	ASSERT_EQ(0, pipe2(pipe_child, O_CLOEXEC));
++ 
++ 	if (variant->sandbox_setown == SANDBOX_BEFORE_FORK)
++ 		create_scoped_domain(_metadata, LANDLOCK_SCOPE_SIGNAL);
++ 
++ 	child = fork();
++ 	ASSERT_LE(0, child);
++ 	if (child == 0) {
++ 		int client_socket;
++ 		char buffer_child;
++ 
++ 		EXPECT_EQ(0, close(pipe_parent[1]));
++ 		EXPECT_EQ(0, close(pipe_child[0]));
++ 
++ 		ASSERT_EQ(0, setup_signal_handler(SIGURG));
++ 		client_socket = socket(AF_UNIX, SOCK_STREAM, 0);
++ 		ASSERT_LE(0, client_socket);
++ 
++ 		/* Waits for the parent to listen. */
++ 		ASSERT_EQ(1, read(pipe_parent[0], &buffer_child, 1));
++ 		ASSERT_EQ(0, connect(client_socket, &server_address.unix_addr,
++ 				     server_address.unix_addr_len));
++ 
++ 		/*
++ 		 * Waits for the parent to accept the connection, sandbox
++ 		 * itself, and call fcntl(2).
++ 		 */
++ 		ASSERT_EQ(1, read(pipe_parent[0], &buffer_child, 1));
++ 		/* May signal itself. */
++ 		ASSERT_EQ(1, send(client_socket, ".", 1, MSG_OOB));
++ 		EXPECT_EQ(0, close(client_socket));
++ 		ASSERT_EQ(1, write(pipe_child[1], ".", 1));
++ 		EXPECT_EQ(0, close(pipe_child[1]));
++ 
++ 		/* Waits for the message to be received. */
++ 		ASSERT_EQ(1, read(pipe_parent[0], &buffer_child, 1));
++ 		EXPECT_EQ(0, close(pipe_parent[0]));
++ 
++ 		if (variant->sandbox_setown == SANDBOX_BEFORE_SETOWN) {
++ 			ASSERT_EQ(0, signal_received);
++ 		} else {
++ 			/*
++ 			 * A signal is only received if fcntl(F_SETOWN) was
++ 			 * called before any sandboxing or if the signal
++ 			 * receiver is in the same domain.
++ 			 */
++ 			ASSERT_EQ(1, signal_received);
++ 		}
++ 		_exit(_metadata->exit_code);
++ 		return;
++ 	}
++ 	EXPECT_EQ(0, close(pipe_parent[0]));
++ 	EXPECT_EQ(0, close(pipe_child[1]));
++ 
++ 	server_socket = socket(AF_UNIX, SOCK_STREAM, 0);
++ 	ASSERT_LE(0, server_socket);
++ 	ASSERT_EQ(0, bind(server_socket, &server_address.unix_addr,
++ 			  server_address.unix_addr_len));
++ 	ASSERT_EQ(0, listen(server_socket, backlog));
++ 	ASSERT_EQ(1, write(pipe_parent[1], ".", 1));
++ 
++ 	recv_socket = accept(server_socket, NULL, NULL);
++ 	ASSERT_LE(0, recv_socket);
++ 
++ 	if (variant->sandbox_setown == SANDBOX_BEFORE_SETOWN)
++ 		create_scoped_domain(_metadata, LANDLOCK_SCOPE_SIGNAL);
++ 
++ 	/*
++ 	 * Sets the child to receive SIGURG for MSG_OOB.  This uncommon use is
++ 	 * a valid attack scenario which also simplifies this test.
++ 	 */
++ 	ASSERT_EQ(0, fcntl(recv_socket, F_SETOWN, child));
++ 
++ 	if (variant->sandbox_setown == SANDBOX_AFTER_SETOWN)
++ 		create_scoped_domain(_metadata, LANDLOCK_SCOPE_SIGNAL);
++ 
++ 	ASSERT_EQ(1, write(pipe_parent[1], ".", 1));
++ 
++ 	/* Waits for the child to send MSG_OOB. */
++ 	ASSERT_EQ(1, read(pipe_child[0], &buffer_parent, 1));
++ 	EXPECT_EQ(0, close(pipe_child[0]));
++ 	ASSERT_EQ(1, recv(recv_socket, &buffer_parent, 1, MSG_OOB));
++ 	EXPECT_EQ(0, close(recv_socket));
++ 	EXPECT_EQ(0, close(server_socket));
++ 	ASSERT_EQ(1, write(pipe_parent[1], ".", 1));
++ 	EXPECT_EQ(0, close(pipe_parent[1]));
++ 
++ 	ASSERT_EQ(child, waitpid(child, &status, 0));
++ 	if (WIFSIGNALED(status) || !WIFEXITED(status) ||
++ 	    WEXITSTATUS(status) != EXIT_SUCCESS)
++ 		_metadata->exit_code = KSFT_FAIL;
++ }
++ 
+++>>>>>>> c5efa393d82c (selftests/landlock: Add a new test for setuid())
+  TEST_HARNESS_MAIN
+diff --git a/tools/testing/selftests/landlock/common.h b/tools/testing/selftests/landlock/common.h
+index 61056fa074bb..19f4149eee16 100644
+--- a/tools/testing/selftests/landlock/common.h
++++ b/tools/testing/selftests/landlock/common.h
+@@ -68,6 +68,7 @@ static void _init_caps(struct __test_metadata *const _metadata, bool drop_all)
+ 		CAP_MKNOD,
+ 		CAP_NET_ADMIN,
+ 		CAP_NET_BIND_SERVICE,
++		CAP_SETUID,
+ 		CAP_SYS_ADMIN,
+ 		CAP_SYS_CHROOT,
+ 		/* clang-format on */
+* Unmerged path tools/testing/selftests/landlock/scoped_signal_test.c
