@@ -1,0 +1,331 @@
+landlock: Add the errata interface
+
+jira KERNEL-445
+Rebuild_History Non-Buildable kernel-5.14.0-611.20.1.el9_7
+commit-author Mickaël Salaün <mic@digikod.net>
+commit 15383a0d63dbcd63dc7e8d9ec1bf3a0f7ebf64ac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-611.20.1.el9_7/15383a0d.failed
+
+Some fixes may require user space to check if they are applied on the
+running kernel before using a specific feature.  For instance, this
+applies when a restriction was previously too restrictive and is now
+getting relaxed (e.g. for compatibility reasons).  However, non-visible
+changes for legitimate use (e.g. security fixes) do not require an
+erratum.
+
+Because fixes are backported down to a specific Landlock ABI, we need a
+way to avoid cherry-pick conflicts.  The solution is to only update a
+file related to the lower ABI impacted by this issue.  All the ABI files
+are then used to create a bitmask of fixes.
+
+The new errata interface is similar to the one used to get the supported
+Landlock ABI version, but it returns a bitmask instead because the order
+of fixes may not match the order of versions, and not all fixes may
+apply to all versions.
+
+The actual errata will come with dedicated commits.  The description is
+not actually used in the code but serves as documentation.
+
+Create the landlock_abi_version symbol and use its value to check errata
+consistency.
+
+Update test_base's create_ruleset_checks_ordering tests and add errata
+tests.
+
+This commit is backportable down to the first version of Landlock.
+
+Fixes: 3532b0b4352c ("landlock: Enable user space to infer supported features")
+	Cc: Günther Noack <gnoack@google.com>
+	Cc: stable@vger.kernel.org
+Link: https://lore.kernel.org/r/20250318161443.279194-3-mic@digikod.net
+	Signed-off-by: Mickaël Salaün <mic@digikod.net>
+(cherry picked from commit 15383a0d63dbcd63dc7e8d9ec1bf3a0f7ebf64ac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	security/landlock/setup.c
+diff --cc security/landlock/setup.c
+index 28519a45b11f,0c85ea27e409..000000000000
+--- a/security/landlock/setup.c
++++ b/security/landlock/setup.c
+@@@ -26,10 -33,32 +28,39 @@@ struct lsm_blob_sizes landlock_blob_siz
+  	.lbs_superblock = sizeof(struct landlock_superblock_security),
+  };
+  
+++<<<<<<< HEAD
+ +const struct lsm_id landlock_lsmid = {
+ +	.name = LANDLOCK_NAME,
+ +	.id = LSM_ID_LANDLOCK,
+ +};
+++=======
++ int landlock_errata __ro_after_init;
++ 
++ static void __init compute_errata(void)
++ {
++ 	size_t i;
++ 
++ #ifndef __has_include
++ 	/*
++ 	 * This is a safeguard to make sure the compiler implements
++ 	 * __has_include (see errata.h).
++ 	 */
++ 	WARN_ON_ONCE(1);
++ 	return;
++ #endif
++ 
++ 	for (i = 0; landlock_errata_init[i].number; i++) {
++ 		const int prev_errata = landlock_errata;
++ 
++ 		if (WARN_ON_ONCE(landlock_errata_init[i].abi >
++ 				 landlock_abi_version))
++ 			continue;
++ 
++ 		landlock_errata |= BIT(landlock_errata_init[i].number - 1);
++ 		WARN_ON_ONCE(prev_errata == landlock_errata);
++ 	}
++ }
+++>>>>>>> 15383a0d63db (landlock: Add the errata interface)
+  
+  static int __init landlock_init(void)
+  {
+diff --git a/include/uapi/linux/landlock.h b/include/uapi/linux/landlock.h
+index 33745642f787..c223572f8229 100644
+--- a/include/uapi/linux/landlock.h
++++ b/include/uapi/linux/landlock.h
+@@ -57,9 +57,11 @@ struct landlock_ruleset_attr {
+  *
+  * - %LANDLOCK_CREATE_RULESET_VERSION: Get the highest supported Landlock ABI
+  *   version.
++ * - %LANDLOCK_CREATE_RULESET_ERRATA: Get a bitmask of fixed issues.
+  */
+ /* clang-format off */
+ #define LANDLOCK_CREATE_RULESET_VERSION			(1U << 0)
++#define LANDLOCK_CREATE_RULESET_ERRATA			(1U << 1)
+ /* clang-format on */
+ 
+ /**
+diff --git a/security/landlock/errata.h b/security/landlock/errata.h
+new file mode 100644
+index 000000000000..f26b28b9873d
+--- /dev/null
++++ b/security/landlock/errata.h
+@@ -0,0 +1,87 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Landlock - Errata information
++ *
++ * Copyright © 2025 Microsoft Corporation
++ */
++
++#ifndef _SECURITY_LANDLOCK_ERRATA_H
++#define _SECURITY_LANDLOCK_ERRATA_H
++
++#include <linux/init.h>
++
++struct landlock_erratum {
++	const int abi;
++	const u8 number;
++};
++
++/* clang-format off */
++#define LANDLOCK_ERRATUM(NUMBER) \
++	{ \
++		.abi = LANDLOCK_ERRATA_ABI, \
++		.number = NUMBER, \
++	},
++/* clang-format on */
++
++/*
++ * Some fixes may require user space to check if they are applied on the running
++ * kernel before using a specific feature.  For instance, this applies when a
++ * restriction was previously too restrictive and is now getting relaxed (for
++ * compatibility or semantic reasons).  However, non-visible changes for
++ * legitimate use (e.g. security fixes) do not require an erratum.
++ */
++static const struct landlock_erratum landlock_errata_init[] __initconst = {
++
++/*
++ * Only Sparse may not implement __has_include.  If a compiler does not
++ * implement __has_include, a warning will be printed at boot time (see
++ * setup.c).
++ */
++#ifdef __has_include
++
++#define LANDLOCK_ERRATA_ABI 1
++#if __has_include("errata/abi-1.h")
++#include "errata/abi-1.h"
++#endif
++#undef LANDLOCK_ERRATA_ABI
++
++#define LANDLOCK_ERRATA_ABI 2
++#if __has_include("errata/abi-2.h")
++#include "errata/abi-2.h"
++#endif
++#undef LANDLOCK_ERRATA_ABI
++
++#define LANDLOCK_ERRATA_ABI 3
++#if __has_include("errata/abi-3.h")
++#include "errata/abi-3.h"
++#endif
++#undef LANDLOCK_ERRATA_ABI
++
++#define LANDLOCK_ERRATA_ABI 4
++#if __has_include("errata/abi-4.h")
++#include "errata/abi-4.h"
++#endif
++#undef LANDLOCK_ERRATA_ABI
++
++/*
++ * For each new erratum, we need to include all the ABI files up to the impacted
++ * ABI to make all potential future intermediate errata easy to backport.
++ *
++ * If such change involves more than one ABI addition, then it must be in a
++ * dedicated commit with the same Fixes tag as used for the actual fix.
++ *
++ * Each commit creating a new security/landlock/errata/abi-*.h file must have a
++ * Depends-on tag to reference the commit that previously added the line to
++ * include this new file, except if the original Fixes tag is enough.
++ *
++ * Each erratum must be documented in its related ABI file, and a dedicated
++ * commit must update Documentation/userspace-api/landlock.rst to include this
++ * erratum.  This commit will not be backported.
++ */
++
++#endif
++
++	{}
++};
++
++#endif /* _SECURITY_LANDLOCK_ERRATA_H */
+* Unmerged path security/landlock/setup.c
+diff --git a/security/landlock/setup.h b/security/landlock/setup.h
+index c4252d46d49d..fca307c35fee 100644
+--- a/security/landlock/setup.h
++++ b/security/landlock/setup.h
+@@ -11,7 +11,10 @@
+ 
+ #include <linux/lsm_hooks.h>
+ 
++extern const int landlock_abi_version;
++
+ extern bool landlock_initialized;
++extern int landlock_errata;
+ 
+ extern struct lsm_blob_sizes landlock_blob_sizes;
+ extern const struct lsm_id landlock_lsmid;
+diff --git a/security/landlock/syscalls.c b/security/landlock/syscalls.c
+index c67836841e46..584bfd0c9f5a 100644
+--- a/security/landlock/syscalls.c
++++ b/security/landlock/syscalls.c
+@@ -159,7 +159,9 @@ static const struct file_operations ruleset_fops = {
+  *        the new ruleset.
+  * @size: Size of the pointed &struct landlock_ruleset_attr (needed for
+  *        backward and forward compatibility).
+- * @flags: Supported value: %LANDLOCK_CREATE_RULESET_VERSION.
++ * @flags: Supported value:
++ *         - %LANDLOCK_CREATE_RULESET_VERSION
++ *         - %LANDLOCK_CREATE_RULESET_ERRATA
+  *
+  * This system call enables to create a new Landlock ruleset, and returns the
+  * related file descriptor on success.
+@@ -168,6 +170,10 @@ static const struct file_operations ruleset_fops = {
+  * 0, then the returned value is the highest supported Landlock ABI version
+  * (starting at 1).
+  *
++ * If @flags is %LANDLOCK_CREATE_RULESET_ERRATA and @attr is NULL and @size is
++ * 0, then the returned value is a bitmask of fixed issues for the current
++ * Landlock ABI version.
++ *
+  * Possible returned errors are:
+  *
+  * - %EOPNOTSUPP: Landlock is supported by the kernel but disabled at boot time;
+@@ -191,9 +197,15 @@ SYSCALL_DEFINE3(landlock_create_ruleset,
+ 		return -EOPNOTSUPP;
+ 
+ 	if (flags) {
+-		if ((flags == LANDLOCK_CREATE_RULESET_VERSION) && !attr &&
+-		    !size)
+-			return LANDLOCK_ABI_VERSION;
++		if (attr || size)
++			return -EINVAL;
++
++		if (flags == LANDLOCK_CREATE_RULESET_VERSION)
++			return landlock_abi_version;
++
++		if (flags == LANDLOCK_CREATE_RULESET_ERRATA)
++			return landlock_errata;
++
+ 		return -EINVAL;
+ 	}
+ 
+@@ -234,6 +246,8 @@ SYSCALL_DEFINE3(landlock_create_ruleset,
+ 	return ruleset_fd;
+ }
+ 
++const int landlock_abi_version = LANDLOCK_ABI_VERSION;
++
+ /*
+  * Returns an owned ruleset from a FD. It is thus needed to call
+  * landlock_put_ruleset() on the return value.
+diff --git a/tools/testing/selftests/landlock/base_test.c b/tools/testing/selftests/landlock/base_test.c
+index 1bc16fde2e8a..4766f8fec9f6 100644
+--- a/tools/testing/selftests/landlock/base_test.c
++++ b/tools/testing/selftests/landlock/base_test.c
+@@ -98,10 +98,54 @@ TEST(abi_version)
+ 	ASSERT_EQ(EINVAL, errno);
+ }
+ 
++/*
++ * Old source trees might not have the set of Kselftest fixes related to kernel
++ * UAPI headers.
++ */
++#ifndef LANDLOCK_CREATE_RULESET_ERRATA
++#define LANDLOCK_CREATE_RULESET_ERRATA (1U << 1)
++#endif
++
++TEST(errata)
++{
++	const struct landlock_ruleset_attr ruleset_attr = {
++		.handled_access_fs = LANDLOCK_ACCESS_FS_READ_FILE,
++	};
++	int errata;
++
++	errata = landlock_create_ruleset(NULL, 0,
++					 LANDLOCK_CREATE_RULESET_ERRATA);
++	/* The errata bitmask will not be backported to tests. */
++	ASSERT_LE(0, errata);
++	TH_LOG("errata: 0x%x", errata);
++
++	ASSERT_EQ(-1, landlock_create_ruleset(&ruleset_attr, 0,
++					      LANDLOCK_CREATE_RULESET_ERRATA));
++	ASSERT_EQ(EINVAL, errno);
++
++	ASSERT_EQ(-1, landlock_create_ruleset(NULL, sizeof(ruleset_attr),
++					      LANDLOCK_CREATE_RULESET_ERRATA));
++	ASSERT_EQ(EINVAL, errno);
++
++	ASSERT_EQ(-1,
++		  landlock_create_ruleset(&ruleset_attr, sizeof(ruleset_attr),
++					  LANDLOCK_CREATE_RULESET_ERRATA));
++	ASSERT_EQ(EINVAL, errno);
++
++	ASSERT_EQ(-1, landlock_create_ruleset(
++			      NULL, 0,
++			      LANDLOCK_CREATE_RULESET_VERSION |
++				      LANDLOCK_CREATE_RULESET_ERRATA));
++	ASSERT_EQ(-1, landlock_create_ruleset(NULL, 0,
++					      LANDLOCK_CREATE_RULESET_ERRATA |
++						      1 << 31));
++	ASSERT_EQ(EINVAL, errno);
++}
++
+ /* Tests ordering of syscall argument checks. */
+ TEST(create_ruleset_checks_ordering)
+ {
+-	const int last_flag = LANDLOCK_CREATE_RULESET_VERSION;
++	const int last_flag = LANDLOCK_CREATE_RULESET_ERRATA;
+ 	const int invalid_flag = last_flag << 1;
+ 	int ruleset_fd;
+ 	const struct landlock_ruleset_attr ruleset_attr = {
