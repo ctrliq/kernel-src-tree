@@ -1,0 +1,101 @@
+perf/x86/intel/ds: Fix the conversion from TSC to perf time
+
+jira KERNEL-428
+Rebuild_History Non-Buildable kernel-4.18.0-553.92.1.el8_10
+commit-author Kan Liang <kan.liang@linux.intel.com>
+commit 89e97eb8cec0f1af5ebf2380308913256ca7915a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.92.1.el8_10/89e97eb8.failed
+
+The time order is incorrect when the TSC in a PEBS record is used.
+
+ $perf record -e cycles:upp dd if=/dev/zero of=/dev/null
+  count=10000
+ $ perf script --show-task-events
+       perf-exec     0     0.000000: PERF_RECORD_COMM: perf-exec:915/915
+              dd   915   106.479872: PERF_RECORD_COMM exec: dd:915/915
+              dd   915   106.483270: PERF_RECORD_EXIT(915:915):(914:914)
+              dd   915   106.512429:          1 cycles:upp:
+ ffffffff96c011b7 [unknown] ([unknown])
+ ... ...
+
+The perf time is from sched_clock_cpu(). The current PEBS code
+unconditionally convert the TSC to native_sched_clock(). There is a
+shift between the two clocks. If the TSC is stable, the shift is
+consistent, __sched_clock_offset. If the TSC is unstable, the shift has
+to be calculated at runtime.
+
+This patch doesn't support the conversion when the TSC is unstable. The
+TSC unstable case is a corner case and very unlikely to happen. If it
+happens, the TSC in a PEBS record will be dropped and fall back to
+perf_event_clock().
+
+Fixes: 47a3aeb39e8d ("perf/x86/intel/pebs: Fix PEBS timestamps overwritten")
+	Reported-by: Namhyung Kim <namhyung@kernel.org>
+	Signed-off-by: Kan Liang <kan.liang@linux.intel.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lore.kernel.org/all/CAM9d7cgWDVAq8-11RbJ2uGfwkKD6fA-OMwOKDrNUrU_=8MgEjg@mail.gmail.com/
+(cherry picked from commit 89e97eb8cec0f1af5ebf2380308913256ca7915a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/events/intel/ds.c
+diff --cc arch/x86/events/intel/ds.c
+index db550c11f4a1,b0354dc869d2..000000000000
+--- a/arch/x86/events/intel/ds.c
++++ b/arch/x86/events/intel/ds.c
+@@@ -1541,6 -1570,31 +1543,34 @@@ static u64 get_data_src(struct perf_eve
+  	return val;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void setup_pebs_time(struct perf_event *event,
++ 			    struct perf_sample_data *data,
++ 			    u64 tsc)
++ {
++ 	/* Converting to a user-defined clock is not supported yet. */
++ 	if (event->attr.use_clockid != 0)
++ 		return;
++ 
++ 	/*
++ 	 * Doesn't support the conversion when the TSC is unstable.
++ 	 * The TSC unstable case is a corner case and very unlikely to
++ 	 * happen. If it happens, the TSC in a PEBS record will be
++ 	 * dropped and fall back to perf_event_clock().
++ 	 */
++ 	if (!using_native_sched_clock() || !sched_clock_stable())
++ 		return;
++ 
++ 	data->time = native_sched_clock_from_tsc(tsc) + __sched_clock_offset;
++ 	data->sample_flags |= PERF_SAMPLE_TIME;
++ }
++ 
++ #define PERF_SAMPLE_ADDR_TYPE	(PERF_SAMPLE_ADDR |		\
++ 				 PERF_SAMPLE_PHYS_ADDR |	\
++ 				 PERF_SAMPLE_DATA_PAGE_SIZE)
++ 
+++>>>>>>> 89e97eb8cec0 (perf/x86/intel/ds: Fix the conversion from TSC to perf time)
+  static void setup_pebs_fixed_sample_data(struct perf_event *event,
+  				   struct pt_regs *iregs, void *__pebs,
+  				   struct perf_sample_data *data,
+@@@ -1675,14 -1738,11 +1705,11 @@@
+  	 *
+  	 * We can only do this for the default trace clock.
+  	 */
+- 	if (x86_pmu.intel_cap.pebs_format >= 3 &&
+- 		event->attr.use_clockid == 0) {
+- 		data->time = native_sched_clock_from_tsc(pebs->tsc);
+- 		data->sample_flags |= PERF_SAMPLE_TIME;
+- 	}
++ 	if (x86_pmu.intel_cap.pebs_format >= 3)
++ 		setup_pebs_time(event, data, pebs->tsc);
+  
+  	if (has_branch_stack(event))
+ -		perf_sample_save_brstack(data, event, &cpuc->lbr_stack);
+ +		data->br_stack = &cpuc->lbr_stack;
+  }
+  
+  static void adaptive_pebs_save_regs(struct pt_regs *regs,
+* Unmerged path arch/x86/events/intel/ds.c
