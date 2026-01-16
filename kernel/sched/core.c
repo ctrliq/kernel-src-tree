@@ -1083,6 +1083,7 @@ void __trace_set_need_resched(struct task_struct *curr, int tif)
 {
 	trace_sched_set_need_resched_tp(curr, smp_processor_id(), tif);
 }
+EXPORT_SYMBOL_GPL(__trace_set_need_resched);
 
 #ifdef CONFIG_PREEMPT_LAZY
 
