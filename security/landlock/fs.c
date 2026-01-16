@@ -1669,7 +1669,7 @@ static void hook_file_set_fowner(struct file *file)
 	struct landlock_ruleset *prev_dom;
 	struct landlock_ruleset *new_dom = NULL;
 
-	if (control_current_fowner(file_f_owner(file))) {
+	if (control_current_fowner(&file->f_owner)) {
 		new_dom = landlock_get_current_domain();
 		landlock_get_ruleset(new_dom);
 	}

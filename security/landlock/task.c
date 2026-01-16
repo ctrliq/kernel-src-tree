@@ -291,7 +291,7 @@ static int hook_file_send_sigiotask(struct task_struct *tsk,
 
 	/* Lock already held by send_sigio() and send_sigurg(). */
 	lockdep_assert_held(&fown->lock);
-	dom = landlock_file(fown->file)->fown_domain;
+	dom = landlock_file(container_of(fown, struct file, f_owner))->fown_domain;
 
 	/* Quick return for unowned socket. */
 	if (!dom)
