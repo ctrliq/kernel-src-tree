@@ -3906,6 +3906,7 @@ out_free_rdev:
 static int analyze_sbs(struct mddev *mddev)
 {
 	struct md_rdev *rdev, *freshest, *tmp;
+	int i;
 
 	freshest = NULL;
 	rdev_for_each_safe(rdev, tmp, mddev)
