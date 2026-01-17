@@ -4766,8 +4766,6 @@ static int mvneta_ethtool_get_rxnfc(struct net_device *dev,
 	case ETHTOOL_GRXRINGS:
 		info->data =  rxq_number;
 		return 0;
-	case ETHTOOL_GRXFH:
-		return -EOPNOTSUPP;
 	default:
 		return -EOPNOTSUPP;
 	}
