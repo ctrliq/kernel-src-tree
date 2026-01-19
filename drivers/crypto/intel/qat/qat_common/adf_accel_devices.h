@@ -11,6 +11,7 @@
 #include <linux/types.h>
 #include <linux/qat/qat_mig_dev.h>
 #include "adf_cfg_common.h"
+#include "adf_dc.h"
 #include "adf_rl.h"
 #include "adf_telemetry.h"
 #include "adf_pfvf_msg.h"
@@ -266,7 +267,8 @@ struct adf_pfvf_ops {
 };
 
 struct adf_dc_ops {
-	void (*build_deflate_ctx)(void *ctx);
+	int (*build_comp_block)(void *ctx, enum adf_dc_algo algo);
+	int (*build_decomp_block)(void *ctx, enum adf_dc_algo algo);
 };
 
 struct qat_migdev_ops {
