@@ -42,12 +42,12 @@ static int max_iotlb_entries = 2048;
 module_param(max_iotlb_entries, int, 0444);
 MODULE_PARM_DESC(max_iotlb_entries,
 	"Maximum number of iotlb entries. (default: 2048)");
-static bool fork_from_owner_default = VHOST_FORK_OWNER_TASK;
+static bool fork_from_owner_default = VHOST_FORK_OWNER_KTHREAD;
 
 #ifdef CONFIG_VHOST_ENABLE_FORK_OWNER_CONTROL
 module_param(fork_from_owner_default, bool, 0444);
 MODULE_PARM_DESC(fork_from_owner_default,
-		 "Set task mode as the default(default: Y)");
+		 "Default mode: Y=task, N=kthread (default: N)");
 #endif
 
 enum {
