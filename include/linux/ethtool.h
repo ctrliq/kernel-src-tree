@@ -19,6 +19,7 @@
 #include <linux/netlink.h>
 #include <linux/timer_types.h>
 #include <uapi/linux/ethtool.h>
+#include <uapi/linux/ethtool_netlink_generated.h>
 #include <uapi/linux/net_tstamp.h>
 
 #define ETHTOOL_MM_MAX_VERIFY_TIME_MS		128
@@ -491,7 +492,29 @@ struct ethtool_pause_stats {
 };
 
 #define ETHTOOL_MAX_LANES	8
+/**
+ * IEEE 802.3ck/df defines 16 bins for FEC histogram plus one more for
+ * the end-of-list marker, total 17 items
+ */
+#define ETHTOOL_FEC_HIST_MAX	17
+/**
+ * struct ethtool_fec_hist_range - error bits range for FEC histogram
+ * statistics
+ * @low: low bound of the bin (inclusive)
+ * @high: high bound of the bin (inclusive)
+ */
+struct ethtool_fec_hist_range {
+	u16 low;
+	u16 high;
+};
 
+struct ethtool_fec_hist {
+	struct ethtool_fec_hist_value {
+		u64 sum;
+		u64 per_lane[ETHTOOL_MAX_LANES];
+	} values[ETHTOOL_FEC_HIST_MAX];
+	const struct ethtool_fec_hist_range *ranges;
+};
 /**
  * struct ethtool_fec_stats - statistics for IEEE 802.3 FEC
  * @corrected_blocks: number of received blocks corrected by FEC
@@ -535,7 +558,7 @@ struct ethtool_rmon_hist_range {
 	u16 high;
 };
 
-#define ETHTOOL_RMON_HIST_MAX	10
+#define ETHTOOL_RMON_HIST_MAX	11
 
 /**
  * struct ethtool_rmon_stats - selected RMON (RFC 2819) statistics
@@ -843,6 +866,8 @@ struct ethtool_rxfh_fields {
  * @so_timestamping: bit mask of the sum of the supported SO_TIMESTAMPING flags
  * @phc_index: device index of the associated PHC, or -1 if there is none
  * @phc_qualifier: qualifier of the associated PHC
+ * @phc_source: source device of the associated PHC
+ * @phc_phyindex: index of PHY device source of the associated PHC
  * @tx_types: bit mask of the supported hwtstamp_tx_types enumeration values
  * @rx_filters: bit mask of the supported hwtstamp_rx_filters enumeration values
  */
@@ -851,8 +876,10 @@ struct kernel_ethtool_ts_info {
 	u32 so_timestamping;
 	int phc_index;
 	enum hwtstamp_provider_qualifier phc_qualifier;
-	enum hwtstamp_tx_types tx_types;
-	enum hwtstamp_rx_filters rx_filters;
+	enum hwtstamp_source phc_source;
+	int phc_phyindex;
+	u32 tx_types;
+	u32 rx_filters;
 };
 
 /**
@@ -860,9 +887,6 @@ struct kernel_ethtool_ts_info {
  * @supported_input_xfrm: supported types of input xfrm from %RXH_XFRM_*.
  * @cap_link_lanes_supported: indicates if the driver supports lanes
  *	parameter.
- * @cap_rss_ctx_supported: indicates if the driver supports RSS
- *	contexts via legacy API, drivers implementing @create_rxfh_context
- *	do not have to set this bit.
  * @rxfh_per_ctx_fields: device supports selecting different header fields
  *	for Rx hash calculation and RSS for each additional context.
  * @rxfh_per_ctx_key: device supports setting different RSS key for each
@@ -966,6 +990,7 @@ struct kernel_ethtool_ts_info {
  * @reset: Reset (part of) the device, as specified by a bitmask of
  *	flags from &enum ethtool_reset_flags.  Returns a negative
  *	error code or zero.
+ * @get_rx_ring_count: Return the number of RX rings
  * @get_rxfh_key_size: Get the size of the RX flow hash key.
  *	Returns zero if not supported for this specific device.
  * @get_rxfh_indir_size: Get the size of the RX flow hash indirection table.
@@ -1016,10 +1041,11 @@ struct kernel_ethtool_ts_info {
  * @get_ts_info: Get the time stamping and PTP hardware clock capabilities.
  *	It may be called with RCU, or rtnl or reference on the device.
  *	Drivers supporting transmit time stamps in software should set this to
- *	ethtool_op_get_ts_info(). Drivers must not zero statistics which they
- *	don't report. The stats	structure is initialized to ETHTOOL_STAT_NOT_SET
- *	indicating driver does not report statistics.
- * @get_ts_stats: Query the device hardware timestamping statistics.
+ *	ethtool_op_get_ts_info().
+ * @get_ts_stats: Query the device hardware timestamping statistics. Drivers
+ *	must not zero statistics which they don't report. The stats structure
+ *	is initialized to ETHTOOL_STAT_NOT_SET indicating driver does not
+ *	report statistics.
  * @get_module_info: Get the size and type of the eeprom contained within
  *	a plug-in module.
  * @get_module_eeprom: Get the eeprom information from the plug-in module
@@ -1094,7 +1120,6 @@ struct kernel_ethtool_ts_info {
 struct ethtool_ops {
 	u32     supported_input_xfrm:8;
 	u32     cap_link_lanes_supported:1;
-	u32     cap_rss_ctx_supported:1;
 	u32	rxfh_per_ctx_fields:1;
 	u32	rxfh_per_ctx_key:1;
 	u32	cap_rss_rxnfc_adds:1;
@@ -1160,6 +1185,7 @@ struct ethtool_ops {
 	int	(*set_rxnfc)(struct net_device *, struct ethtool_rxnfc *);
 	int	(*flash_device)(struct net_device *, struct ethtool_flash *);
 	int	(*reset)(struct net_device *, u32 *);
+	u32	(*get_rx_ring_count)(struct net_device *dev);
 	u32	(*get_rxfh_key_size)(struct net_device *);
 	u32	(*get_rxfh_indir_size)(struct net_device *);
 	int	(*get_rxfh)(struct net_device *, struct ethtool_rxfh_param *);
@@ -1210,7 +1236,8 @@ struct ethtool_ops {
 	int	(*set_link_ksettings)(struct net_device *,
 				      const struct ethtool_link_ksettings *);
 	void	(*get_fec_stats)(struct net_device *dev,
-				 struct ethtool_fec_stats *fec_stats);
+				 struct ethtool_fec_stats *fec_stats,
+				 struct ethtool_fec_hist *hist);
 	int	(*get_fecparam)(struct net_device *,
 				      struct ethtool_fecparam *);
 	int	(*set_fecparam)(struct net_device *,
@@ -1424,6 +1451,17 @@ extern __printf(2, 3) void ethtool_sprintf(u8 **data, const char *fmt, ...);
  * two arguments or if @fmt is just "%s".
  */
 extern void ethtool_puts(u8 **data, const char *str);
+
+/**
+ * ethtool_cpy - Write possibly-not-NUL-terminated string to ethtool string data
+ * @data: Pointer to a pointer to the start of string to write into
+ * @str: NUL-byte padded char array of size ETH_GSTRING_LEN to copy from
+ */
+#define ethtool_cpy(data, str)	do {				\
+	BUILD_BUG_ON(sizeof(str) != ETH_GSTRING_LEN);		\
+	memcpy(*(data), str, ETH_GSTRING_LEN);			\
+	*(data) += ETH_GSTRING_LEN;				\
+} while (0)
 
 /* Link mode to forced speed capabilities maps */
 struct ethtool_forced_speed_map {
