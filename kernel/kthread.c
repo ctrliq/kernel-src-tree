@@ -67,6 +67,7 @@ struct kthread {
 #endif
 	struct task_struct *task;
 	struct list_head hotplug_node;
+	struct cpumask *preferred_affinity;
 };
 
 enum KTHREAD_BITS {
@@ -309,6 +310,11 @@ void __noreturn kthread_exit(long result)
 		mutex_lock(&kthreads_hotplug_lock);
 		list_del(&kthread->hotplug_node);
 		mutex_unlock(&kthreads_hotplug_lock);
+
+		if (kthread->preferred_affinity) {
+			kfree(kthread->preferred_affinity);
+			kthread->preferred_affinity = NULL;
+		}
 	}
 	do_exit(0);
 }
@@ -337,9 +343,17 @@ EXPORT_SYMBOL(kthread_complete_and_exit);
 
 static void kthread_fetch_affinity(struct kthread *kthread, struct cpumask *cpumask)
 {
-	cpumask_and(cpumask, cpumask_of_node(kthread->node),
-		    housekeeping_cpumask(HK_TYPE_KTHREAD));
+	const struct cpumask *pref;
 
+	if (kthread->preferred_affinity) {
+		pref = kthread->preferred_affinity;
+	} else {
+		if (WARN_ON_ONCE(kthread->node == NUMA_NO_NODE))
+			return;
+		pref = cpumask_of_node(kthread->node);
+	}
+
+	cpumask_and(cpumask, pref, housekeeping_cpumask(HK_TYPE_KTHREAD));
 	if (cpumask_empty(cpumask))
 		cpumask_copy(cpumask, housekeeping_cpumask(HK_TYPE_KTHREAD));
 }
@@ -420,7 +434,7 @@ static int kthread(void *_create)
 
 	self->started = 1;
 
-	if (!(current->flags & PF_NO_SETAFFINITY))
+	if (!(current->flags & PF_NO_SETAFFINITY) && !self->preferred_affinity)
 		kthread_affine_node();
 
 	ret = -EINTR;
@@ -820,12 +834,53 @@ int kthreadd(void *unused)
 	return 0;
 }
 
+int kthread_affine_preferred(struct task_struct *p, const struct cpumask *mask)
+{
+	struct kthread *kthread = to_kthread(p);
+	cpumask_var_t affinity;
+	unsigned long flags;
+	int ret;
+
+	if (!wait_task_inactive(p, TASK_UNINTERRUPTIBLE) || kthread->started) {
+		WARN_ON(1);
+		return -EINVAL;
+	}
+
+	WARN_ON_ONCE(kthread->preferred_affinity);
+
+	if (!zalloc_cpumask_var(&affinity, GFP_KERNEL))
+		return -ENOMEM;
+
+	kthread->preferred_affinity = kzalloc(sizeof(struct cpumask), GFP_KERNEL);
+	if (!kthread->preferred_affinity) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	mutex_lock(&kthreads_hotplug_lock);
+	cpumask_copy(kthread->preferred_affinity, mask);
+	WARN_ON_ONCE(!list_empty(&kthread->hotplug_node));
+	list_add_tail(&kthread->hotplug_node, &kthreads_hotplug);
+	kthread_fetch_affinity(kthread, affinity);
+
+	/* It's safe because the task is inactive. */
+	raw_spin_lock_irqsave(&p->pi_lock, flags);
+	do_set_cpus_allowed(p, affinity);
+	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
+
+	mutex_unlock(&kthreads_hotplug_lock);
+out:
+	free_cpumask_var(affinity);
+
+	return 0;
+}
+
 /*
  * Re-affine kthreads according to their preferences
  * and the newly online CPU. The CPU down part is handled
  * by select_fallback_rq() which default re-affines to
- * housekeepers in case the preferred affinity doesn't
- * apply anymore.
+ * housekeepers from other nodes in case the preferred
+ * affinity doesn't apply anymore.
  */
 static int kthreads_online_cpu(unsigned int cpu)
 {
@@ -845,8 +900,7 @@ static int kthreads_online_cpu(unsigned int cpu)
 
 	list_for_each_entry(k, &kthreads_hotplug, hotplug_node) {
 		if (WARN_ON_ONCE((k->task->flags & PF_NO_SETAFFINITY) ||
-				 kthread_is_per_cpu(k->task) ||
-				 k->node == NUMA_NO_NODE)) {
+				 kthread_is_per_cpu(k->task))) {
 			ret = -EINVAL;
 			continue;
 		}
