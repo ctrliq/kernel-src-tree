@@ -1519,14 +1519,14 @@ static int idpf_vport_open(struct idpf_vport *vport, bool rtnl)
 	if (err) {
 		dev_err(&adapter->pdev->dev, "Failed to initialize RX buffers for vport %u: %d\n",
 			vport->vport_id, err);
-		goto queues_rel;
+		goto intr_deinit;
 	}
 
 	err = idpf_queue_reg_init(vport);
 	if (err) {
 		dev_err(&adapter->pdev->dev, "Failed to initialize queue registers for vport %u: %d\n",
 			vport->vport_id, err);
-		goto queues_rel;
+		goto intr_deinit;
 	}
 
 	idpf_rx_init_buf_tail(vport);
