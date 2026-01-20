@@ -133,15 +133,18 @@ static inline bool io_kbuf_commit(struct io_kiocb *req,
 
 	if (bl->flags & IOBL_INC) {
 		struct io_uring_buf *buf;
+		u32 buf_len;
 
 		buf = io_ring_head_to_buf(bl->buf_ring, bl->head, bl->mask);
-		if (WARN_ON_ONCE(len > buf->len))
-			len = buf->len;
-		buf->len -= len;
-		if (buf->len) {
+		buf_len = READ_ONCE(buf->len);
+		len = min_t(int, len, buf_len);
+		buf_len -= len;
+		if (buf_len) {
+			buf->len = buf_len;
 			buf->addr += len;
 			return false;
 		}
+		buf->len = 0;
 	}
 
 	bl->head += nr;
