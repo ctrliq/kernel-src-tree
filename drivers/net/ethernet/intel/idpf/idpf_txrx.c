@@ -111,7 +111,7 @@ static void idpf_tx_desc_rel(struct idpf_tx_queue *txq)
  */
 static void idpf_compl_desc_rel(struct idpf_compl_queue *complq)
 {
-	if (!complq->comp)
+	if (!complq->desc_ring)
 		return;
 
 	dma_free_coherent(complq->netdev->dev.parent, complq->size,
