@@ -2638,9 +2638,8 @@ struct smbdirect_mr_io *smbd_register_mr(
 {
 	struct smbdirect_socket *sc = &info->socket;
 	struct smbdirect_socket_parameters *sp = &sc->parameters;
-	struct smbdirect_mr_io *smbdirect_mr;
+	struct smbdirect_mr_io *mr;
 	int rc, i;
-	enum dma_data_direction dir;
 	struct ib_reg_wr *reg_wr;
 
 	if (num_pages > sp->max_frmr_depth) {
@@ -2649,46 +2648,42 @@ struct smbdirect_mr_io *smbd_register_mr(
 		return NULL;
 	}
 
-	smbdirect_mr = get_mr(sc);
-	if (!smbdirect_mr) {
+	mr = get_mr(sc);
+	if (!mr) {
 		log_rdma_mr(ERR, "get_mr returning NULL\n");
 		return NULL;
 	}
-	smbdirect_mr->need_invalidate = need_invalidate;
-	smbdirect_mr->sgl_count = num_pages;
-	sg_init_table(smbdirect_mr->sgl, num_pages);
+	mr->need_invalidate = need_invalidate;
+	mr->sgl_count = num_pages;
+	sg_init_table(mr->sgl, num_pages);
 
 	log_rdma_mr(INFO, "num_pages=0x%x offset=0x%x tailsz=0x%x\n",
 			num_pages, offset, tailsz);
 
 	if (num_pages == 1) {
-		sg_set_page(&smbdirect_mr->sgl[0], pages[0], tailsz, offset);
+		sg_set_page(&mr->sgl[0], pages[0], tailsz, offset);
 		goto skip_multiple_pages;
 	}
 
 	/* We have at least two pages to register */
-	sg_set_page(
-		&smbdirect_mr->sgl[0], pages[0], PAGE_SIZE - offset, offset);
+	sg_set_page(&mr->sgl[0], pages[0], PAGE_SIZE - offset, offset);
 	i = 1;
 	while (i < num_pages - 1) {
-		sg_set_page(&smbdirect_mr->sgl[i], pages[i], PAGE_SIZE, 0);
+		sg_set_page(&mr->sgl[i], pages[i], PAGE_SIZE, 0);
 		i++;
 	}
-	sg_set_page(&smbdirect_mr->sgl[i], pages[i],
-		tailsz ? tailsz : PAGE_SIZE, 0);
+	sg_set_page(&mr->sgl[i], pages[i], tailsz ? tailsz : PAGE_SIZE, 0);
 
 skip_multiple_pages:
-	dir = writing ? DMA_FROM_DEVICE : DMA_TO_DEVICE;
-	smbdirect_mr->dir = dir;
-	rc = ib_dma_map_sg(sc->ib.dev, smbdirect_mr->sgl, num_pages, dir);
+	mr->dir = writing ? DMA_FROM_DEVICE : DMA_TO_DEVICE;
+	rc = ib_dma_map_sg(sc->ib.dev, mr->sgl, num_pages, mr->dir);
 	if (!rc) {
 		log_rdma_mr(ERR, "ib_dma_map_sg num_pages=%x dir=%x rc=%x\n",
-			num_pages, dir, rc);
+			num_pages, mr->dir, rc);
 		goto dma_map_error;
 	}
 
-	rc = ib_map_mr_sg(smbdirect_mr->mr, smbdirect_mr->sgl, num_pages,
-		NULL, PAGE_SIZE);
+	rc = ib_map_mr_sg(mr->mr, mr->sgl, num_pages, NULL, PAGE_SIZE);
 	if (rc != num_pages) {
 		log_rdma_mr(ERR,
 			"ib_map_mr_sg failed rc = %d num_pages = %x\n",
@@ -2696,16 +2691,15 @@ skip_multiple_pages:
 		goto map_mr_error;
 	}
 
-	ib_update_fast_reg_key(smbdirect_mr->mr,
-		ib_inc_rkey(smbdirect_mr->mr->rkey));
-	reg_wr = &smbdirect_mr->wr;
+	ib_update_fast_reg_key(mr->mr, ib_inc_rkey(mr->mr->rkey));
+	reg_wr = &mr->wr;
 	reg_wr->wr.opcode = IB_WR_REG_MR;
-	smbdirect_mr->cqe.done = register_mr_done;
-	reg_wr->wr.wr_cqe = &smbdirect_mr->cqe;
+	mr->cqe.done = register_mr_done;
+	reg_wr->wr.wr_cqe = &mr->cqe;
 	reg_wr->wr.num_sge = 0;
 	reg_wr->wr.send_flags = IB_SEND_SIGNALED;
-	reg_wr->mr = smbdirect_mr->mr;
-	reg_wr->key = smbdirect_mr->mr->rkey;
+	reg_wr->mr = mr->mr;
+	reg_wr->key = mr->mr->rkey;
 	reg_wr->access = writing ?
 			IB_ACCESS_REMOTE_WRITE | IB_ACCESS_LOCAL_WRITE :
 			IB_ACCESS_REMOTE_READ;
@@ -2717,18 +2711,17 @@ skip_multiple_pages:
 	 */
 	rc = ib_post_send(sc->ib.qp, &reg_wr->wr, NULL);
 	if (!rc)
-		return smbdirect_mr;
+		return mr;
 
 	log_rdma_mr(ERR, "ib_post_send failed rc=%x reg_wr->key=%x\n",
 		rc, reg_wr->key);
 
 	/* If all failed, attempt to recover this MR by setting it SMBDIRECT_MR_ERROR*/
 map_mr_error:
-	ib_dma_unmap_sg(sc->ib.dev, smbdirect_mr->sgl,
-		smbdirect_mr->sgl_count, smbdirect_mr->dir);
+	ib_dma_unmap_sg(sc->ib.dev, mr->sgl, mr->sgl_count, mr->dir);
 
 dma_map_error:
-	smbdirect_mr->state = SMBDIRECT_MR_ERROR;
+	mr->state = SMBDIRECT_MR_ERROR;
 	if (atomic_dec_and_test(&sc->mr_io.used.count))
 		wake_up(&sc->mr_io.cleanup.wait_queue);
 
