@@ -2502,9 +2502,8 @@ static void destroy_mr_list(struct smbdirect_socket *sc)
 	spin_unlock_irqrestore(&sc->mr_io.all.lock, flags);
 
 	list_for_each_entry_safe(mr, tmp, &all_list, list) {
-		if (mr->state == SMBDIRECT_MR_INVALIDATED)
-			ib_dma_unmap_sg(sc->ib.dev, mr->sgl,
-				mr->sgl_count, mr->dir);
+		if (mr->sgl_count)
+			ib_dma_unmap_sg(sc->ib.dev, mr->sgl, mr->sgl_count, mr->dir);
 		ib_dereg_mr(mr->mr);
 		kfree(mr->sgl);
 		list_del(&mr->list);
@@ -2721,6 +2720,7 @@ map_mr_error:
 	ib_dma_unmap_sg(sc->ib.dev, mr->sgl, mr->sgl_count, mr->dir);
 
 dma_map_error:
+	mr->sgl_count = 0;
 	mr->state = SMBDIRECT_MR_ERROR;
 	if (atomic_dec_and_test(&sc->mr_io.used.count))
 		wake_up(&sc->mr_io.cleanup.wait_queue);
@@ -2783,8 +2783,12 @@ void smbd_deregister_mr(struct smbdirect_mr_io *mr)
 		 */
 		mr->state = SMBDIRECT_MR_INVALIDATED;
 
-	if (mr->state == SMBDIRECT_MR_INVALIDATED) {
+	if (mr->sgl_count) {
 		ib_dma_unmap_sg(sc->ib.dev, mr->sgl, mr->sgl_count, mr->dir);
+		mr->sgl_count = 0;
+	}
+
+	if (mr->state == SMBDIRECT_MR_INVALIDATED) {
 		mr->state = SMBDIRECT_MR_READY;
 		if (atomic_inc_return(&sc->mr_io.ready.count) == 1)
 			wake_up(&sc->mr_io.ready.wait_queue);
