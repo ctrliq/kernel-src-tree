@@ -249,7 +249,7 @@ smbd_qp_async_error_upcall(struct ib_event *event, void *context)
 	}
 }
 
-static inline void *smbd_request_payload(struct smbd_request *request)
+static inline void *smbdirect_send_io_payload(struct smbdirect_send_io *request)
 {
 	return (void *)request->packet;
 }
@@ -263,12 +263,13 @@ static inline void *smbdirect_recv_io_payload(struct smbdirect_recv_io *response
 static void send_done(struct ib_cq *cq, struct ib_wc *wc)
 {
 	int i;
-	struct smbd_request *request =
-		container_of(wc->wr_cqe, struct smbd_request, cqe);
-	struct smbd_connection *info = request->info;
-	struct smbdirect_socket *sc = &info->socket;
+	struct smbdirect_send_io *request =
+		container_of(wc->wr_cqe, struct smbdirect_send_io, cqe);
+	struct smbdirect_socket *sc = request->socket;
+	struct smbd_connection *info =
+		container_of(sc, struct smbd_connection, socket);
 
-	log_rdma_send(INFO, "smbd_request 0x%p completed wc->status=%d\n",
+	log_rdma_send(INFO, "smbdirect_send_io 0x%p completed wc->status=%d\n",
 		request, wc->status);
 
 	for (i = 0; i < request->num_sge; i++)
@@ -285,12 +286,12 @@ static void send_done(struct ib_cq *cq, struct ib_wc *wc)
 		return;
 	}
 
-	if (atomic_dec_and_test(&request->info->send_pending))
-		wake_up(&request->info->wait_send_pending);
+	if (atomic_dec_and_test(&info->send_pending))
+		wake_up(&info->wait_send_pending);
 
-	wake_up(&request->info->wait_post_send);
+	wake_up(&info->wait_post_send);
 
-	mempool_free(request, request->info->request_mempool);
+	mempool_free(request, info->request_mempool);
 }
 
 static void dump_smbdirect_negotiate_resp(struct smbdirect_negotiate_resp *resp)
@@ -700,16 +701,16 @@ static int smbd_post_send_negotiate_req(struct smbd_connection *info)
 	struct smbdirect_socket_parameters *sp = &sc->parameters;
 	struct ib_send_wr send_wr;
 	int rc = -ENOMEM;
-	struct smbd_request *request;
+	struct smbdirect_send_io *request;
 	struct smbdirect_negotiate_req *packet;
 
 	request = mempool_alloc(info->request_mempool, GFP_KERNEL);
 	if (!request)
 		return rc;
 
-	request->info = info;
+	request->socket = sc;
 
-	packet = smbd_request_payload(request);
+	packet = smbdirect_send_io_payload(request);
 	packet->min_version = cpu_to_le16(SMBDIRECT_V1);
 	packet->max_version = cpu_to_le16(SMBDIRECT_V1);
 	packet->reserved = 0;
@@ -806,7 +807,7 @@ static int manage_keep_alive_before_sending(struct smbd_connection *info)
 
 /* Post the send request */
 static int smbd_post_send(struct smbd_connection *info,
-		struct smbd_request *request)
+		struct smbdirect_send_io *request)
 {
 	struct smbdirect_socket *sc = &info->socket;
 	struct smbdirect_socket_parameters *sp = &sc->parameters;
@@ -854,7 +855,7 @@ static int smbd_post_send_sgl(struct smbd_connection *info,
 	int num_sgs;
 	int i, rc;
 	int header_length;
-	struct smbd_request *request;
+	struct smbdirect_send_io *request;
 	struct smbdirect_data_transfer *packet;
 	int new_credits;
 	struct scatterlist *sg;
@@ -900,10 +901,10 @@ wait_send_queue:
 		goto err_alloc;
 	}
 
-	request->info = info;
+	request->socket = sc;
 
 	/* Fill in the packet header */
-	packet = smbd_request_payload(request);
+	packet = smbdirect_send_io_payload(request);
 	packet->credits_requested = cpu_to_le16(sp->send_credit_target);
 
 	new_credits = manage_credits_prior_sending(info);
@@ -1042,9 +1043,9 @@ static int smbd_post_send_data(
 {
 	int i;
 	u32 data_length = 0;
-	struct scatterlist sgl[SMBDIRECT_MAX_SEND_SGE - 1];
+	struct scatterlist sgl[SMBDIRECT_SEND_IO_MAX_SGE - 1];
 
-	if (n_vec > SMBDIRECT_MAX_SEND_SGE - 1) {
+	if (n_vec > SMBDIRECT_SEND_IO_MAX_SGE - 1) {
 		cifs_dbg(VFS, "Can't fit data to SGL, n_vec=%d\n", n_vec);
 		return -EINVAL;
 	}
@@ -1472,11 +1473,11 @@ static int allocate_caches_and_workqueue(struct smbd_connection *info)
 	char name[MAX_NAME_LEN];
 	int rc;
 
-	scnprintf(name, MAX_NAME_LEN, "smbd_request_%p", info);
+	scnprintf(name, MAX_NAME_LEN, "smbdirect_send_io_%p", info);
 	info->request_cache =
 		kmem_cache_create(
 			name,
-			sizeof(struct smbd_request) +
+			sizeof(struct smbdirect_send_io) +
 				sizeof(struct smbdirect_data_transfer),
 			0, SLAB_HWCACHE_ALIGN, NULL);
 	if (!info->request_cache)
@@ -1582,7 +1583,7 @@ static struct smbd_connection *_smbd_get_connection(
 	sp->max_recv_size = smbd_max_receive_size;
 	sp->keepalive_interval_msec = smbd_keep_alive_interval * 1000;
 
-	if (sc->ib.dev->attrs.max_send_sge < SMBDIRECT_MAX_SEND_SGE ||
+	if (sc->ib.dev->attrs.max_send_sge < SMBDIRECT_SEND_IO_MAX_SGE ||
 	    sc->ib.dev->attrs.max_recv_sge < SMBDIRECT_RECV_IO_MAX_SGE) {
 		log_rdma_event(ERR,
 			"device %.*s max_send_sge/max_recv_sge = %d/%d too small\n",
@@ -1614,7 +1615,7 @@ static struct smbd_connection *_smbd_get_connection(
 	qp_attr.qp_context = info;
 	qp_attr.cap.max_send_wr = sp->send_credit_target;
 	qp_attr.cap.max_recv_wr = sp->recv_credit_max;
-	qp_attr.cap.max_send_sge = SMBDIRECT_MAX_SEND_SGE;
+	qp_attr.cap.max_send_sge = SMBDIRECT_SEND_IO_MAX_SGE;
 	qp_attr.cap.max_recv_sge = SMBDIRECT_RECV_IO_MAX_SGE;
 	qp_attr.cap.max_inline_data = 0;
 	qp_attr.sq_sig_type = IB_SIGNAL_REQ_WR;
@@ -2006,7 +2007,7 @@ int smbd_send(struct TCP_Server_Info *server,
 	struct smbd_connection *info = server->smbd_conn;
 	struct smbdirect_socket *sc = &info->socket;
 	struct smbdirect_socket_parameters *sp = &sc->parameters;
-	struct kvec vecs[SMBDIRECT_MAX_SEND_SGE - 1];
+	struct kvec vecs[SMBDIRECT_SEND_IO_MAX_SGE - 1];
 	int nvecs;
 	int size;
 	unsigned int buflen, remaining_data_length;
@@ -2066,7 +2067,7 @@ int smbd_send(struct TCP_Server_Info *server,
 			i = start;
 			j = 0;
 			while (i < rqst->rq_nvec &&
-				j < SMBDIRECT_MAX_SEND_SGE - 1 &&
+				j < SMBDIRECT_SEND_IO_MAX_SGE - 1 &&
 				buflen < max_iov_size) {
 
 				vecs[j].iov_base = iov[i].iov_base + offset;
