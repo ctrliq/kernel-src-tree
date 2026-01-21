@@ -39,9 +39,9 @@ static int smbd_post_recv(
 
 static int smbd_post_send_empty(struct smbdirect_socket *sc);
 static int smbd_post_send_data(
-		struct smbd_connection *info,
+		struct smbdirect_socket *sc,
 		struct kvec *iov, int n_vec, int remaining_data_length);
-static int smbd_post_send_page(struct smbd_connection *info,
+static int smbd_post_send_page(struct smbdirect_socket *sc,
 		struct page *page, unsigned long offset,
 		size_t size, int remaining_data_length);
 
@@ -1187,10 +1187,9 @@ err_wait_credit:
  * size: length in the page to send
  * remaining_data_length: remaining data to send in this payload
  */
-static int smbd_post_send_page(struct smbd_connection *info, struct page *page,
+static int smbd_post_send_page(struct smbdirect_socket *sc, struct page *page,
 		unsigned long offset, size_t size, int remaining_data_length)
 {
-	struct smbdirect_socket *sc = &info->socket;
 	struct scatterlist sgl;
 
 	sg_init_table(&sgl, 1);
@@ -1218,10 +1217,9 @@ static int smbd_post_send_empty(struct smbdirect_socket *sc)
  * in segmented SMBD packet
  */
 static int smbd_post_send_data(
-	struct smbd_connection *info, struct kvec *iov, int n_vec,
+	struct smbdirect_socket *sc, struct kvec *iov, int n_vec,
 	int remaining_data_length)
 {
-	struct smbdirect_socket *sc = &info->socket;
 	int i;
 	u32 data_length = 0;
 	struct scatterlist sgl[SMBDIRECT_SEND_IO_MAX_SGE - 1];
@@ -2291,7 +2289,7 @@ int smbd_send(struct TCP_Server_Info *server,
 					remaining_data_length);
 
 			start = i;
-			rc = smbd_post_send_data(info, vecs, j, remaining_data_length);
+			rc = smbd_post_send_data(sc, vecs, j, remaining_data_length);
 			if (rc)
 				goto done;
 		} while (remaining_vec_data_length > 0);
@@ -2309,7 +2307,7 @@ int smbd_send(struct TCP_Server_Info *server,
 					  i, j * max_iov_size + offset, size,
 					  remaining_data_length);
 				rc = smbd_post_send_page(
-					info, rqst->rq_pages[i],
+					sc, rqst->rq_pages[i],
 					j*max_iov_size + offset,
 					size, remaining_data_length);
 				if (rc)
