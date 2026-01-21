@@ -281,7 +281,7 @@ static void send_done(struct ib_cq *cq, struct ib_wc *wc)
 	if (wc->status != IB_WC_SUCCESS || wc->opcode != IB_WC_SEND) {
 		log_rdma_send(ERR, "wc->status=%d wc->opcode=%d\n",
 			wc->status, wc->opcode);
-		mempool_free(request, info->request_mempool);
+		mempool_free(request, sc->send_io.mem.pool);
 		smbd_disconnect_rdma_connection(info);
 		return;
 	}
@@ -291,7 +291,7 @@ static void send_done(struct ib_cq *cq, struct ib_wc *wc)
 
 	wake_up(&info->wait_post_send);
 
-	mempool_free(request, info->request_mempool);
+	mempool_free(request, sc->send_io.mem.pool);
 }
 
 static void dump_smbdirect_negotiate_resp(struct smbdirect_negotiate_resp *resp)
@@ -704,7 +704,7 @@ static int smbd_post_send_negotiate_req(struct smbd_connection *info)
 	struct smbdirect_send_io *request;
 	struct smbdirect_negotiate_req *packet;
 
-	request = mempool_alloc(info->request_mempool, GFP_KERNEL);
+	request = mempool_alloc(sc->send_io.mem.pool, GFP_KERNEL);
 	if (!request)
 		return rc;
 
@@ -763,7 +763,7 @@ static int smbd_post_send_negotiate_req(struct smbd_connection *info)
 	smbd_disconnect_rdma_connection(info);
 
 dma_mapping_failed:
-	mempool_free(request, info->request_mempool);
+	mempool_free(request, sc->send_io.mem.pool);
 	return rc;
 }
 
@@ -895,7 +895,7 @@ wait_send_queue:
 		goto wait_send_queue;
 	}
 
-	request = mempool_alloc(info->request_mempool, GFP_KERNEL);
+	request = mempool_alloc(sc->send_io.mem.pool, GFP_KERNEL);
 	if (!request) {
 		rc = -ENOMEM;
 		goto err_alloc;
@@ -981,7 +981,7 @@ err_dma:
 					    request->sge[i].addr,
 					    request->sge[i].length,
 					    DMA_TO_DEVICE);
-	mempool_free(request, info->request_mempool);
+	mempool_free(request, sc->send_io.mem.pool);
 
 	/* roll back receive credits and credits to be offered */
 	spin_lock(&info->lock_new_credits_offered);
@@ -1263,7 +1263,7 @@ static int allocate_receive_buffers(struct smbd_connection *info, int num_buf)
 	init_waitqueue_head(&info->wait_receive_queues);
 
 	for (i = 0; i < num_buf; i++) {
-		response = mempool_alloc(info->response_mempool, GFP_KERNEL);
+		response = mempool_alloc(sc->recv_io.mem.pool, GFP_KERNEL);
 		if (!response)
 			goto allocate_failed;
 
@@ -1283,17 +1283,18 @@ allocate_failed:
 		list_del(&response->list);
 		info->count_receive_queue--;
 
-		mempool_free(response, info->response_mempool);
+		mempool_free(response, sc->recv_io.mem.pool);
 	}
 	return -ENOMEM;
 }
 
 static void destroy_receive_buffers(struct smbd_connection *info)
 {
+	struct smbdirect_socket *sc = &info->socket;
 	struct smbdirect_recv_io *response;
 
 	while ((response = get_receive_buffer(info)))
-		mempool_free(response, info->response_mempool);
+		mempool_free(response, sc->recv_io.mem.pool);
 }
 
 /* Implement idle connection timer [MS-SMBD] 3.1.6.2 */
@@ -1405,11 +1406,11 @@ void smbd_destroy(struct TCP_Server_Info *server)
 	rdma_destroy_id(sc->rdma.cm_id);
 
 	/* free mempools */
-	mempool_destroy(info->request_mempool);
-	kmem_cache_destroy(info->request_cache);
+	mempool_destroy(sc->send_io.mem.pool);
+	kmem_cache_destroy(sc->send_io.mem.cache);
 
-	mempool_destroy(info->response_mempool);
-	kmem_cache_destroy(info->response_cache);
+	mempool_destroy(sc->recv_io.mem.pool);
+	kmem_cache_destroy(sc->recv_io.mem.cache);
 
 	sc->status = SMBDIRECT_SOCKET_DESTROYED;
 
@@ -1457,12 +1458,14 @@ create_conn:
 
 static void destroy_caches_and_workqueue(struct smbd_connection *info)
 {
+	struct smbdirect_socket *sc = &info->socket;
+
 	destroy_receive_buffers(info);
 	destroy_workqueue(info->workqueue);
-	mempool_destroy(info->response_mempool);
-	kmem_cache_destroy(info->response_cache);
-	mempool_destroy(info->request_mempool);
-	kmem_cache_destroy(info->request_cache);
+	mempool_destroy(sc->recv_io.mem.pool);
+	kmem_cache_destroy(sc->recv_io.mem.cache);
+	mempool_destroy(sc->send_io.mem.pool);
+	kmem_cache_destroy(sc->send_io.mem.cache);
 }
 
 #define MAX_NAME_LEN	80
@@ -1474,35 +1477,35 @@ static int allocate_caches_and_workqueue(struct smbd_connection *info)
 	int rc;
 
 	scnprintf(name, MAX_NAME_LEN, "smbdirect_send_io_%p", info);
-	info->request_cache =
+	sc->send_io.mem.cache =
 		kmem_cache_create(
 			name,
 			sizeof(struct smbdirect_send_io) +
 				sizeof(struct smbdirect_data_transfer),
 			0, SLAB_HWCACHE_ALIGN, NULL);
-	if (!info->request_cache)
+	if (!sc->send_io.mem.cache)
 		return -ENOMEM;
 
-	info->request_mempool =
+	sc->send_io.mem.pool =
 		mempool_create(sp->send_credit_target, mempool_alloc_slab,
-			mempool_free_slab, info->request_cache);
-	if (!info->request_mempool)
+			mempool_free_slab, sc->send_io.mem.cache);
+	if (!sc->send_io.mem.pool)
 		goto out1;
 
 	scnprintf(name, MAX_NAME_LEN, "smbdirect_recv_io_%p", info);
-	info->response_cache =
+	sc->recv_io.mem.cache =
 		kmem_cache_create(
 			name,
 			sizeof(struct smbdirect_recv_io) +
 				sp->max_recv_size,
 			0, SLAB_HWCACHE_ALIGN, NULL);
-	if (!info->response_cache)
+	if (!sc->recv_io.mem.cache)
 		goto out2;
 
-	info->response_mempool =
+	sc->recv_io.mem.pool =
 		mempool_create(sp->recv_credit_max, mempool_alloc_slab,
-		       mempool_free_slab, info->response_cache);
-	if (!info->response_mempool)
+		       mempool_free_slab, sc->recv_io.mem.cache);
+	if (!sc->recv_io.mem.pool)
 		goto out3;
 
 	scnprintf(name, MAX_NAME_LEN, "smbd_%p", info);
@@ -1521,13 +1524,13 @@ static int allocate_caches_and_workqueue(struct smbd_connection *info)
 out5:
 	destroy_workqueue(info->workqueue);
 out4:
-	mempool_destroy(info->response_mempool);
+	mempool_destroy(sc->recv_io.mem.pool);
 out3:
-	kmem_cache_destroy(info->response_cache);
+	kmem_cache_destroy(sc->recv_io.mem.cache);
 out2:
-	mempool_destroy(info->request_mempool);
+	mempool_destroy(sc->send_io.mem.pool);
 out1:
-	kmem_cache_destroy(info->request_cache);
+	kmem_cache_destroy(sc->send_io.mem.cache);
 	return -ENOMEM;
 }
 
