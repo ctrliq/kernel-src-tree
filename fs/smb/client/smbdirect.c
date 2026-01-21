@@ -37,7 +37,7 @@ static int smbd_post_recv(
 		struct smbdirect_socket *sc,
 		struct smbdirect_recv_io *response);
 
-static int smbd_post_send_empty(struct smbd_connection *info);
+static int smbd_post_send_empty(struct smbdirect_socket *sc);
 static int smbd_post_send_data(
 		struct smbd_connection *info,
 		struct kvec *iov, int n_vec, int remaining_data_length);
@@ -1204,9 +1204,8 @@ static int smbd_post_send_page(struct smbd_connection *info, struct page *page,
  * Empty message is used to extend credits to peer to for keep live
  * while there is no upper layer payload to send at the time
  */
-static int smbd_post_send_empty(struct smbd_connection *info)
+static int smbd_post_send_empty(struct smbdirect_socket *sc)
 {
-	struct smbdirect_socket *sc = &info->socket;
 	sc->statistics.send_empty++;
 	return smbd_post_send_sgl(sc, NULL, 0, 0);
 }
@@ -1465,14 +1464,12 @@ static void send_immediate_empty_message(struct work_struct *work)
 {
 	struct smbdirect_socket *sc =
 		container_of(work, struct smbdirect_socket, idle.immediate_work);
-	struct smbd_connection *info =
-		container_of(sc, struct smbd_connection, socket);
 
 	if (sc->status != SMBDIRECT_SOCKET_CONNECTED)
 		return;
 
 	log_keep_alive(INFO, "send an empty message\n");
-	smbd_post_send_empty(info);
+	smbd_post_send_empty(sc);
 }
 
 /* Implement idle connection timer [MS-SMBD] 3.1.6.2 */
