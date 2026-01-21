@@ -1032,10 +1032,9 @@ static int smbd_post_send(struct smbdirect_socket *sc,
 	return rc;
 }
 
-static int smbd_post_send_sgl(struct smbd_connection *info,
+static int smbd_post_send_sgl(struct smbdirect_socket *sc,
 	struct scatterlist *sgl, int data_length, int remaining_data_length)
 {
-	struct smbdirect_socket *sc = &info->socket;
 	struct smbdirect_socket_parameters *sp = &sc->parameters;
 	int num_sgs;
 	int i, rc;
@@ -1191,12 +1190,13 @@ err_wait_credit:
 static int smbd_post_send_page(struct smbd_connection *info, struct page *page,
 		unsigned long offset, size_t size, int remaining_data_length)
 {
+	struct smbdirect_socket *sc = &info->socket;
 	struct scatterlist sgl;
 
 	sg_init_table(&sgl, 1);
 	sg_set_page(&sgl, page, size, offset);
 
-	return smbd_post_send_sgl(info, &sgl, size, remaining_data_length);
+	return smbd_post_send_sgl(sc, &sgl, size, remaining_data_length);
 }
 
 /*
@@ -1208,7 +1208,7 @@ static int smbd_post_send_empty(struct smbd_connection *info)
 {
 	struct smbdirect_socket *sc = &info->socket;
 	sc->statistics.send_empty++;
-	return smbd_post_send_sgl(info, NULL, 0, 0);
+	return smbd_post_send_sgl(sc, NULL, 0, 0);
 }
 
 /*
@@ -1222,6 +1222,7 @@ static int smbd_post_send_data(
 	struct smbd_connection *info, struct kvec *iov, int n_vec,
 	int remaining_data_length)
 {
+	struct smbdirect_socket *sc = &info->socket;
 	int i;
 	u32 data_length = 0;
 	struct scatterlist sgl[SMBDIRECT_SEND_IO_MAX_SGE - 1];
@@ -1237,7 +1238,7 @@ static int smbd_post_send_data(
 		sg_set_buf(&sgl[i], iov[i].iov_base, iov[i].iov_len);
 	}
 
-	return smbd_post_send_sgl(info, sgl, data_length, remaining_data_length);
+	return smbd_post_send_sgl(sc, sgl, data_length, remaining_data_length);
 }
 
 /*
