@@ -6,6 +6,7 @@
  */
 #include <linux/module.h>
 #include <linux/highmem.h>
+#include "../common/smbdirect/smbdirect_pdu.h"
 #include "smbdirect.h"
 #include "cifs_debug.h"
 #include "cifsproto.h"
@@ -43,9 +44,6 @@ static int smbd_post_send_page(struct smbd_connection *info,
 
 static void destroy_mr_list(struct smbd_connection *info);
 static int allocate_mr_list(struct smbd_connection *info);
-
-/* SMBD version number */
-#define SMBD_V1	0x0100
 
 /* Port numbers for SMBD transport */
 #define SMB_PORT	445
@@ -293,7 +291,7 @@ static void send_done(struct ib_cq *cq, struct ib_wc *wc)
 	mempool_free(request, request->info->request_mempool);
 }
 
-static void dump_smbd_negotiate_resp(struct smbd_negotiate_resp *resp)
+static void dump_smbdirect_negotiate_resp(struct smbdirect_negotiate_resp *resp)
 {
 	log_rdma_event(INFO, "resp message min_version %u max_version %u negotiated_version %u credits_requested %u credits_granted %u status %u max_readwrite_size %u preferred_send_size %u max_receive_size %u max_fragmented_size %u\n",
 		       resp->min_version, resp->max_version,
@@ -312,15 +310,15 @@ static bool process_negotiation_response(
 		struct smbd_response *response, int packet_length)
 {
 	struct smbd_connection *info = response->info;
-	struct smbd_negotiate_resp *packet = smbd_response_payload(response);
+	struct smbdirect_negotiate_resp *packet = smbd_response_payload(response);
 
-	if (packet_length < sizeof(struct smbd_negotiate_resp)) {
+	if (packet_length < sizeof(struct smbdirect_negotiate_resp)) {
 		log_rdma_event(ERR,
 			"error: packet_length=%d\n", packet_length);
 		return false;
 	}
 
-	if (le16_to_cpu(packet->negotiated_version) != SMBD_V1) {
+	if (le16_to_cpu(packet->negotiated_version) != SMBDIRECT_V1) {
 		log_rdma_event(ERR, "error: negotiated_version=%x\n",
 			le16_to_cpu(packet->negotiated_version));
 		return false;
@@ -442,7 +440,7 @@ static void smbd_post_send_credits(struct work_struct *work)
 /* Called from softirq, when recv is done */
 static void recv_done(struct ib_cq *cq, struct ib_wc *wc)
 {
-	struct smbd_data_transfer *data_transfer;
+	struct smbdirect_data_transfer *data_transfer;
 	struct smbd_response *response =
 		container_of(wc->wr_cqe, struct smbd_response, cqe);
 	struct smbd_connection *info = response->info;
@@ -470,7 +468,7 @@ static void recv_done(struct ib_cq *cq, struct ib_wc *wc)
 	switch (response->type) {
 	/* SMBD negotiation response */
 	case SMBD_NEGOTIATE_RESP:
-		dump_smbd_negotiate_resp(smbd_response_payload(response));
+		dump_smbdirect_negotiate_resp(smbd_response_payload(response));
 		info->full_packet_received = true;
 		info->negotiate_done =
 			process_negotiation_response(response, wc->byte_len);
@@ -482,7 +480,7 @@ static void recv_done(struct ib_cq *cq, struct ib_wc *wc)
 		data_transfer = smbd_response_payload(response);
 
 		if (wc->byte_len <
-		    offsetof(struct smbd_data_transfer, padding))
+		    offsetof(struct smbdirect_data_transfer, padding))
 			goto error;
 
 		remaining_data_length = le32_to_cpu(data_transfer->remaining_data_length);
@@ -542,7 +540,7 @@ static void recv_done(struct ib_cq *cq, struct ib_wc *wc)
 		/* Send a KEEP_ALIVE response right away if requested */
 		info->keep_alive_requested = KEEP_ALIVE_NONE;
 		if (le16_to_cpu(data_transfer->flags) &
-				SMB_DIRECT_RESPONSE_REQUESTED) {
+				SMBDIRECT_FLAG_RESPONSE_REQUESTED) {
 			info->keep_alive_requested = KEEP_ALIVE_PENDING;
 		}
 
@@ -697,7 +695,7 @@ static int smbd_post_send_negotiate_req(struct smbd_connection *info)
 	struct ib_send_wr send_wr;
 	int rc = -ENOMEM;
 	struct smbd_request *request;
-	struct smbd_negotiate_req *packet;
+	struct smbdirect_negotiate_req *packet;
 
 	request = mempool_alloc(info->request_mempool, GFP_KERNEL);
 	if (!request)
@@ -706,8 +704,8 @@ static int smbd_post_send_negotiate_req(struct smbd_connection *info)
 	request->info = info;
 
 	packet = smbd_request_payload(request);
-	packet->min_version = cpu_to_le16(SMBD_V1);
-	packet->max_version = cpu_to_le16(SMBD_V1);
+	packet->min_version = cpu_to_le16(SMBDIRECT_V1);
+	packet->max_version = cpu_to_le16(SMBDIRECT_V1);
 	packet->reserved = 0;
 	packet->credits_requested = cpu_to_le16(info->send_credit_target);
 	packet->preferred_send_size = cpu_to_le32(info->max_send_size);
@@ -785,10 +783,10 @@ static int manage_credits_prior_sending(struct smbd_connection *info)
 /*
  * Check if we need to send a KEEP_ALIVE message
  * The idle connection timer triggers a KEEP_ALIVE message when expires
- * SMB_DIRECT_RESPONSE_REQUESTED is set in the message flag to have peer send
+ * SMBDIRECT_FLAG_RESPONSE_REQUESTED is set in the message flag to have peer send
  * back a response.
  * return value:
- * 1 if SMB_DIRECT_RESPONSE_REQUESTED needs to be set
+ * 1 if SMBDIRECT_FLAG_RESPONSE_REQUESTED needs to be set
  * 0: otherwise
  */
 static int manage_keep_alive_before_sending(struct smbd_connection *info)
@@ -847,7 +845,7 @@ static int smbd_post_send_sgl(struct smbd_connection *info,
 	int i, rc;
 	int header_length;
 	struct smbd_request *request;
-	struct smbd_data_transfer *packet;
+	struct smbdirect_data_transfer *packet;
 	int new_credits;
 	struct scatterlist *sg;
 
@@ -906,7 +904,7 @@ wait_send_queue:
 
 	packet->flags = 0;
 	if (manage_keep_alive_before_sending(info))
-		packet->flags |= cpu_to_le16(SMB_DIRECT_RESPONSE_REQUESTED);
+		packet->flags |= cpu_to_le16(SMBDIRECT_FLAG_RESPONSE_REQUESTED);
 
 	packet->reserved = 0;
 	if (!data_length)
@@ -925,10 +923,10 @@ wait_send_queue:
 		     le32_to_cpu(packet->remaining_data_length));
 
 	/* Map the packet to DMA */
-	header_length = sizeof(struct smbd_data_transfer);
+	header_length = sizeof(struct smbdirect_data_transfer);
 	/* If this is a packet without payload, don't send padding */
 	if (!data_length)
-		header_length = offsetof(struct smbd_data_transfer, padding);
+		header_length = offsetof(struct smbdirect_data_transfer, padding);
 
 	request->num_sge = 1;
 	request->sge[0].addr = ib_dma_map_single(info->id->device,
@@ -1482,7 +1480,7 @@ static int allocate_caches_and_workqueue(struct smbd_connection *info)
 		kmem_cache_create(
 			name,
 			sizeof(struct smbd_request) +
-				sizeof(struct smbd_data_transfer),
+				sizeof(struct smbdirect_data_transfer),
 			0, SLAB_HWCACHE_ALIGN, NULL);
 	if (!info->request_cache)
 		return -ENOMEM;
@@ -1785,7 +1783,7 @@ static int smbd_recv_buf(struct smbd_connection *info, char *buf,
 		unsigned int size)
 {
 	struct smbd_response *response;
-	struct smbd_data_transfer *data_transfer;
+	struct smbdirect_data_transfer *data_transfer;
 	int to_copy, to_read, data_read, offset;
 	u32 data_length, remaining_data_length, data_offset;
 	int rc;
@@ -2011,7 +2009,7 @@ int smbd_send(struct TCP_Server_Info *server,
 	unsigned int offset, remaining_vec_data_length;
 	int start, i, j;
 	int max_iov_size =
-		info->max_send_size - sizeof(struct smbd_data_transfer);
+		info->max_send_size - sizeof(struct smbdirect_data_transfer);
 	struct kvec *iov;
 	int rc;
 	struct smb_rqst *rqst;
