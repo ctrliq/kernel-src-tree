@@ -1572,7 +1572,7 @@ struct cifs_readdata {
 	struct kvec			iov[2];
 	struct TCP_Server_Info		*server;
 #ifdef CONFIG_CIFS_SMB_DIRECT
-	struct smbd_mr			*mr;
+	struct smbdirect_mr_io		*mr;
 #endif
 	unsigned int			pagesz;
 	unsigned int			page_offset;
@@ -1597,7 +1597,7 @@ struct cifs_writedata {
 	int				result;
 	struct TCP_Server_Info		*server;
 #ifdef CONFIG_CIFS_SMB_DIRECT
-	struct smbd_mr			*mr;
+	struct smbdirect_mr_io		*mr;
 #endif
 	unsigned int			pagesz;
 	unsigned int			page_offset;

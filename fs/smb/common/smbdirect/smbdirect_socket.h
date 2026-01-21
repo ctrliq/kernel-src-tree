@@ -448,7 +448,8 @@ struct smbdirect_mr_io {
 
 	enum smbdirect_mr_state state;
 	struct ib_mr *mr;
-	struct sg_table sgt;
+	struct scatterlist *sgl;
+	int sgl_count;
 	enum dma_data_direction dir;
 	union {
 		struct ib_reg_wr wr;
