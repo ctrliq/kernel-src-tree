@@ -211,27 +211,27 @@ static int smbd_conn_upcall(
 	case RDMA_CM_EVENT_ADDR_RESOLVED:
 		WARN_ON_ONCE(sc->status != SMBDIRECT_SOCKET_RESOLVE_ADDR_RUNNING);
 		sc->status = SMBDIRECT_SOCKET_RESOLVE_ROUTE_NEEDED;
-		wake_up_interruptible(&sc->status_wait);
+		wake_up(&sc->status_wait);
 		break;
 
 	case RDMA_CM_EVENT_ROUTE_RESOLVED:
 		WARN_ON_ONCE(sc->status != SMBDIRECT_SOCKET_RESOLVE_ROUTE_RUNNING);
 		sc->status = SMBDIRECT_SOCKET_RDMA_CONNECT_NEEDED;
-		wake_up_interruptible(&sc->status_wait);
+		wake_up(&sc->status_wait);
 		break;
 
 	case RDMA_CM_EVENT_ADDR_ERROR:
 		log_rdma_event(ERR, "connecting failed event=%s\n", event_name);
 		WARN_ON_ONCE(sc->status != SMBDIRECT_SOCKET_RESOLVE_ADDR_RUNNING);
 		sc->status = SMBDIRECT_SOCKET_RESOLVE_ADDR_FAILED;
-		wake_up_interruptible(&sc->status_wait);
+		wake_up_all(&sc->status_wait);
 		break;
 
 	case RDMA_CM_EVENT_ROUTE_ERROR:
 		log_rdma_event(ERR, "connecting failed event=%s\n", event_name);
 		WARN_ON_ONCE(sc->status != SMBDIRECT_SOCKET_RESOLVE_ROUTE_RUNNING);
 		sc->status = SMBDIRECT_SOCKET_RESOLVE_ROUTE_FAILED;
-		wake_up_interruptible(&sc->status_wait);
+		wake_up_all(&sc->status_wait);
 		break;
 
 	case RDMA_CM_EVENT_ESTABLISHED:
@@ -317,7 +317,7 @@ static int smbd_conn_upcall(
 
 		WARN_ON_ONCE(sc->status != SMBDIRECT_SOCKET_RDMA_CONNECT_RUNNING);
 		sc->status = SMBDIRECT_SOCKET_NEGOTIATE_NEEDED;
-		wake_up_interruptible(&sc->status_wait);
+		wake_up(&sc->status_wait);
 		break;
 
 	case RDMA_CM_EVENT_CONNECT_ERROR:
@@ -326,7 +326,7 @@ static int smbd_conn_upcall(
 		log_rdma_event(ERR, "connecting failed event=%s\n", event_name);
 		WARN_ON_ONCE(sc->status != SMBDIRECT_SOCKET_RDMA_CONNECT_RUNNING);
 		sc->status = SMBDIRECT_SOCKET_RDMA_CONNECT_FAILED;
-		wake_up_interruptible(&sc->status_wait);
+		wake_up_all(&sc->status_wait);
 		break;
 
 	case RDMA_CM_EVENT_DEVICE_REMOVAL:
@@ -335,14 +335,14 @@ static int smbd_conn_upcall(
 		if (sc->status == SMBDIRECT_SOCKET_NEGOTIATE_FAILED) {
 			log_rdma_event(ERR, "event=%s during negotiation\n", event_name);
 			sc->status = SMBDIRECT_SOCKET_DISCONNECTED;
-			wake_up(&sc->status_wait);
+			wake_up_all(&sc->status_wait);
 			break;
 		}
 
 		sc->status = SMBDIRECT_SOCKET_DISCONNECTED;
-		wake_up_interruptible(&sc->status_wait);
-		wake_up_interruptible(&sc->recv_io.reassembly.wait_queue);
-		wake_up_interruptible_all(&info->wait_send_queue);
+		wake_up_all(&sc->status_wait);
+		wake_up_all(&sc->recv_io.reassembly.wait_queue);
+		wake_up_all(&info->wait_send_queue);
 		break;
 
 	default:
@@ -519,7 +519,7 @@ static void smbd_post_send_credits(struct work_struct *work)
 	struct smbdirect_socket *sc = &info->socket;
 
 	if (sc->status != SMBDIRECT_SOCKET_CONNECTED) {
-		wake_up(&info->wait_receive_queues);
+		wake_up_all(&info->wait_receive_queues);
 		return;
 	}
 
@@ -599,12 +599,14 @@ static void recv_done(struct ib_cq *cq, struct ib_wc *wc)
 			process_negotiation_response(response, wc->byte_len);
 		put_receive_buffer(info, response);
 		WARN_ON_ONCE(sc->status != SMBDIRECT_SOCKET_NEGOTIATE_RUNNING);
-		if (!negotiate_done)
+		if (!negotiate_done) {
 			sc->status = SMBDIRECT_SOCKET_NEGOTIATE_FAILED;
-		else
+			wake_up_all(&sc->status_wait);
+		} else {
 			sc->status = SMBDIRECT_SOCKET_CONNECTED;
+			wake_up(&sc->status_wait);
+		}
 
-		wake_up_interruptible(&sc->status_wait);
 		return;
 
 	/* SMBD data transfer packet */
@@ -647,7 +649,7 @@ static void recv_done(struct ib_cq *cq, struct ib_wc *wc)
 			 * We have new send credits granted from remote peer
 			 * If any sender is waiting for credits, unblock it
 			 */
-			wake_up_interruptible(&info->wait_send_queue);
+			wake_up(&info->wait_send_queue);
 		}
 
 		log_incoming(INFO, "data flags %d data_offset %d data_length %d remaining_data_length %d\n",
@@ -669,7 +671,7 @@ static void recv_done(struct ib_cq *cq, struct ib_wc *wc)
 		 */
 		if (data_length) {
 			enqueue_reassembly(info, response, data_length);
-			wake_up_interruptible(&sc->recv_io.reassembly.wait_queue);
+			wake_up(&sc->recv_io.reassembly.wait_queue);
 		} else
 			put_receive_buffer(info, response);
 
@@ -1546,7 +1548,7 @@ void smbd_destroy(struct TCP_Server_Info *server)
 	 * path when sending data, and then release memory registrations.
 	 */
 	log_rdma_event(INFO, "freeing mr list\n");
-	wake_up_interruptible_all(&info->wait_mr);
+	wake_up_all(&info->wait_mr);
 	while (atomic_read(&info->mr_used_count)) {
 		cifs_server_unlock(server);
 		msleep(1000);
@@ -2371,7 +2373,7 @@ static void smbd_mr_recovery_work(struct work_struct *work)
 		 * get_mr() from the I/O issuing CPUs
 		 */
 		if (atomic_inc_return(&info->mr_ready_count) == 1)
-			wake_up_interruptible(&info->wait_mr);
+			wake_up(&info->wait_mr);
 	}
 }
 
@@ -2678,7 +2680,7 @@ int smbd_deregister_mr(struct smbd_mr *smbdirect_mr)
 			smbdirect_mr->dir);
 		smbdirect_mr->state = MR_READY;
 		if (atomic_inc_return(&info->mr_ready_count) == 1)
-			wake_up_interruptible(&info->wait_mr);
+			wake_up(&info->wait_mr);
 	} else
 		/*
 		 * Schedule the work to do MR recovery for future I/Os MR
