@@ -54,6 +54,8 @@ int uffd_register_with_ioctls(int uffd, void *addr, uint64_t len,
 			      bool miss, bool wp, bool minor, uint64_t *ioctls);
 unsigned long get_free_hugepages(void);
 bool check_vmflag_io(void *addr);
+int write_sysfs(const char *file_path, unsigned long val);
+int read_sysfs(const char *file_path, unsigned long *val);
 
 static inline int sz2ord(size_t size)
 {
