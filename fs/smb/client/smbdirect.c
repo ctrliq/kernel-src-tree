@@ -1363,7 +1363,6 @@ static void enqueue_reassembly(
 	virt_wmb();
 	sc->recv_io.reassembly.data_length += data_length;
 	spin_unlock(&sc->recv_io.reassembly.lock);
-	info->count_reassembly_queue++;
 	info->count_enqueue_reassembly_queue++;
 }
 
@@ -2075,7 +2074,6 @@ again:
 						&sc->recv_io.reassembly.lock);
 				}
 				queue_removed++;
-				info->count_reassembly_queue--;
 				info->count_dequeue_reassembly_queue++;
 				put_receive_buffer(info, response);
 				offset = 0;
