@@ -2500,6 +2500,7 @@ static void destroy_mr_list(struct smbdirect_socket *sc)
 				mr->sgl_count, mr->dir);
 		ib_dereg_mr(mr->mr);
 		kfree(mr->sgl);
+		list_del(&mr->list);
 		kfree(mr);
 	}
 }
