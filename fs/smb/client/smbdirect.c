@@ -1151,8 +1151,28 @@ wait_send_queue:
 
 	request->socket = sc;
 
-	/* Fill in the packet header */
+	/* Map the packet to DMA */
+	header_length = sizeof(struct smbdirect_data_transfer);
+	/* If this is a packet without payload, don't send padding */
+	if (!data_length)
+		header_length = offsetof(struct smbdirect_data_transfer, padding);
+
 	packet = smbdirect_send_io_payload(request);
+	request->sge[0].addr = ib_dma_map_single(sc->ib.dev,
+						 (void *)packet,
+						 header_length,
+						 DMA_TO_DEVICE);
+	if (ib_dma_mapping_error(sc->ib.dev, request->sge[0].addr)) {
+		rc = -EIO;
+		request->sge[0].addr = 0;
+		goto err_dma;
+	}
+
+	request->sge[0].length = header_length;
+	request->sge[0].lkey = sc->ib.pd->local_dma_lkey;
+	request->num_sge = 1;
+
+	/* Fill in the packet header */
 	packet->credits_requested = cpu_to_le16(sp->send_credit_target);
 
 	new_credits = manage_credits_prior_sending(sc);
@@ -1178,26 +1198,6 @@ wait_send_queue:
 		     le32_to_cpu(packet->data_offset),
 		     le32_to_cpu(packet->data_length),
 		     le32_to_cpu(packet->remaining_data_length));
-
-	/* Map the packet to DMA */
-	header_length = sizeof(struct smbdirect_data_transfer);
-	/* If this is a packet without payload, don't send padding */
-	if (!data_length)
-		header_length = offsetof(struct smbdirect_data_transfer, padding);
-
-	request->num_sge = 1;
-	request->sge[0].addr = ib_dma_map_single(sc->ib.dev,
-						 (void *)packet,
-						 header_length,
-						 DMA_TO_DEVICE);
-	if (ib_dma_mapping_error(sc->ib.dev, request->sge[0].addr)) {
-		rc = -EIO;
-		request->sge[0].addr = 0;
-		goto err_dma;
-	}
-
-	request->sge[0].length = header_length;
-	request->sge[0].lkey = sc->ib.pd->local_dma_lkey;
 
 	/* Fill in the packet data payload */
 	num_sgs = sgl ? sg_nents(sgl) : 0;
