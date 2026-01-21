@@ -604,6 +604,14 @@ static void recv_done(struct ib_cq *cq, struct ib_wc *wc)
 		response->sge.length,
 		DMA_FROM_DEVICE);
 
+	/*
+	 * Reset timer to the keepalive interval in
+	 * order to trigger our next keepalive message.
+	 */
+	info->keep_alive_requested = KEEP_ALIVE_NONE;
+	mod_delayed_work(info->workqueue, &info->idle_timer_work,
+			 msecs_to_jiffies(sp->keepalive_interval_msec));
+
 	switch (sc->recv_io.expected) {
 	/* SMBD negotiation response */
 	case SMBDIRECT_EXPECT_NEGOTIATE_REP:
@@ -678,11 +686,11 @@ static void recv_done(struct ib_cq *cq, struct ib_wc *wc)
 			     le32_to_cpu(data_transfer->data_length),
 			     le32_to_cpu(data_transfer->remaining_data_length));
 
-		/* Send a KEEP_ALIVE response right away if requested */
-		info->keep_alive_requested = KEEP_ALIVE_NONE;
+		/* Send an immediate response right away if requested */
 		if (le16_to_cpu(data_transfer->flags) &
 				SMBDIRECT_FLAG_RESPONSE_REQUESTED) {
-			info->keep_alive_requested = KEEP_ALIVE_PENDING;
+			log_keep_alive(INFO, "schedule send of immediate response\n");
+			queue_work(info->workqueue, &info->send_immediate_work);
 		}
 
 		/*
@@ -981,8 +989,17 @@ static int manage_credits_prior_sending(struct smbd_connection *info)
  */
 static int manage_keep_alive_before_sending(struct smbd_connection *info)
 {
+	struct smbdirect_socket *sc = &info->socket;
+	struct smbdirect_socket_parameters *sp = &sc->parameters;
+
 	if (info->keep_alive_requested == KEEP_ALIVE_PENDING) {
 		info->keep_alive_requested = KEEP_ALIVE_SENT;
+		/*
+		 * Now use the keepalive timeout (instead of keepalive interval)
+		 * in order to wait for a response
+		 */
+		mod_delayed_work(info->workqueue, &info->idle_timer_work,
+				 msecs_to_jiffies(sp->keepalive_timeout_msec));
 		return 1;
 	}
 	return 0;
@@ -993,7 +1010,6 @@ static int smbd_post_send(struct smbd_connection *info,
 		struct smbdirect_send_io *request)
 {
 	struct smbdirect_socket *sc = &info->socket;
-	struct smbdirect_socket_parameters *sp = &sc->parameters;
 	struct ib_send_wr send_wr;
 	int rc, i;
 
@@ -1022,10 +1038,7 @@ static int smbd_post_send(struct smbd_connection *info,
 		log_rdma_send(ERR, "ib_post_send failed rc=%d\n", rc);
 		smbd_disconnect_rdma_connection(info);
 		rc = -EAGAIN;
-	} else
-		/* Reset timer for idle connection after packet is sent */
-		mod_delayed_work(info->workqueue, &info->idle_timer_work,
-			msecs_to_jiffies(sp->keepalive_interval_msec));
+	}
 
 	return rc;
 }
@@ -1496,12 +1509,18 @@ static void idle_connection_timer(struct work_struct *work)
 		return;
 	}
 
+	if (sc->status != SMBDIRECT_SOCKET_CONNECTED)
+		return;
+
+	/*
+	 * Now use the keepalive timeout (instead of keepalive interval)
+	 * in order to wait for a response
+	 */
+	info->keep_alive_requested = KEEP_ALIVE_PENDING;
+	mod_delayed_work(info->workqueue, &info->idle_timer_work,
+			 msecs_to_jiffies(sp->keepalive_timeout_msec));
 	log_keep_alive(INFO, "schedule send of empty idle message\n");
 	queue_work(info->workqueue, &info->send_immediate_work);
-
-	/* Setup the next idle timeout work */
-	queue_delayed_work(info->workqueue, &info->idle_timer_work,
-			msecs_to_jiffies(sp->keepalive_interval_msec));
 }
 
 /*
@@ -1883,8 +1902,13 @@ static struct smbd_connection *_smbd_get_connection(
 
 	INIT_WORK(&info->send_immediate_work, send_immediate_empty_message);
 	INIT_DELAYED_WORK(&info->idle_timer_work, idle_connection_timer);
-	queue_delayed_work(info->workqueue, &info->idle_timer_work,
-		msecs_to_jiffies(sp->keepalive_interval_msec));
+	/*
+	 * start with the negotiate timeout and KEEP_ALIVE_PENDING
+	 * so that the timer will cause a disconnect.
+	 */
+	info->keep_alive_requested = KEEP_ALIVE_PENDING;
+	mod_delayed_work(info->workqueue, &info->idle_timer_work,
+			 msecs_to_jiffies(sp->negotiate_timeout_msec));
 
 	INIT_WORK(&sc->recv_io.posted.refill_work, smbd_post_send_credits);
 
