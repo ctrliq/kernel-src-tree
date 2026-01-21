@@ -1653,10 +1653,8 @@ create_conn:
 	return -ENOENT;
 }
 
-static void destroy_caches_and_workqueue(struct smbd_connection *info)
+static void destroy_caches_and_workqueue(struct smbdirect_socket *sc)
 {
-	struct smbdirect_socket *sc = &info->socket;
-
 	destroy_receive_buffers(sc);
 	destroy_workqueue(sc->workqueue);
 	mempool_destroy(sc->recv_io.mem.pool);
@@ -1666,14 +1664,13 @@ static void destroy_caches_and_workqueue(struct smbd_connection *info)
 }
 
 #define MAX_NAME_LEN	80
-static int allocate_caches_and_workqueue(struct smbd_connection *info)
+static int allocate_caches_and_workqueue(struct smbdirect_socket *sc)
 {
-	struct smbdirect_socket *sc = &info->socket;
 	struct smbdirect_socket_parameters *sp = &sc->parameters;
 	char name[MAX_NAME_LEN];
 	int rc;
 
-	scnprintf(name, MAX_NAME_LEN, "smbdirect_send_io_%p", info);
+	scnprintf(name, MAX_NAME_LEN, "smbdirect_send_io_%p", sc);
 	sc->send_io.mem.cache =
 		kmem_cache_create(
 			name,
@@ -1689,7 +1686,7 @@ static int allocate_caches_and_workqueue(struct smbd_connection *info)
 	if (!sc->send_io.mem.pool)
 		goto out1;
 
-	scnprintf(name, MAX_NAME_LEN, "smbdirect_recv_io_%p", info);
+	scnprintf(name, MAX_NAME_LEN, "smbdirect_recv_io_%p", sc);
 	sc->recv_io.mem.cache =
 		kmem_cache_create(
 			name,
@@ -1705,7 +1702,7 @@ static int allocate_caches_and_workqueue(struct smbd_connection *info)
 	if (!sc->recv_io.mem.pool)
 		goto out3;
 
-	scnprintf(name, MAX_NAME_LEN, "smbd_%p", info);
+	scnprintf(name, MAX_NAME_LEN, "smbd_%p", sc);
 	sc->workqueue = create_workqueue(name);
 	if (!sc->workqueue)
 		goto out4;
@@ -1891,7 +1888,7 @@ static struct smbd_connection *_smbd_get_connection(
 
 	log_rdma_event(INFO, "rdma_connect connected\n");
 
-	rc = allocate_caches_and_workqueue(info);
+	rc = allocate_caches_and_workqueue(sc);
 	if (rc) {
 		log_rdma_event(ERR, "cache allocation failed\n");
 		goto allocate_cache_failed;
@@ -1931,7 +1928,7 @@ allocate_mr_failed:
 
 negotiation_failed:
 	disable_delayed_work_sync(&sc->idle.timer_work);
-	destroy_caches_and_workqueue(info);
+	destroy_caches_and_workqueue(sc);
 	sc->status = SMBDIRECT_SOCKET_NEGOTIATE_FAILED;
 	rdma_disconnect(sc->rdma.cm_id);
 	wait_event(sc->status_wait,
