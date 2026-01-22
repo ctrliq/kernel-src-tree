@@ -232,9 +232,6 @@ fi;
 # final build of init/
 ${MAKE} -f "${srctree}/scripts/Makefile.build" obj=init need-builtin=1
 
-#link vmlinux.o
-${MAKE} -f "${srctree}/scripts/Makefile.vmlinux_o"
-
 # Generate the list of objects in vmlinux
 for f in ${KBUILD_VMLINUX_OBJS} ${KBUILD_VMLINUX_LIBS}; do
 	case ${f} in
