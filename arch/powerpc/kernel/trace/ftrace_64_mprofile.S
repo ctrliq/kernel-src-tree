@@ -158,6 +158,10 @@ _GLOBAL(ftrace_caller)
 	cmpdi	r3, 0
 	beq	ftrace_no_trace
 
+	/* Save previous stack pointer (r1) */
+	addi	r8, r1, SWITCH_FRAME_SIZE
+	PPC_STL	r8, GPR1(r1)
+
 	/* Get the _mcount() call site out of LR */
 	mflr	r7
 	std     r7, _NIP(r1)
