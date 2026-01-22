@@ -326,7 +326,7 @@ int module_frob_arch_sections(Elf64_Ehdr *hdr,
 	return 0;
 }
 
-#ifdef CONFIG_MPROFILE_KERNEL
+#if defined(CONFIG_MPROFILE_KERNEL) || defined(CONFIG_ARCH_USING_PATCHABLE_FUNCTION_ENTRY)
 
 static u32 stub_insns[] = {
 	PPC_RAW_LD(_R12, _R13, offsetof(struct paca_struct, kernel_toc)),
