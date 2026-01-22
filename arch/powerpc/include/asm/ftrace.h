@@ -50,14 +50,6 @@
 #else /* !__ASSEMBLY__ */
 extern void _mcount(void);
 
-static inline unsigned long ftrace_call_adjust(unsigned long addr)
-{
-	if (IS_ENABLED(CONFIG_ARCH_USING_PATCHABLE_FUNCTION_ENTRY))
-		addr += MCOUNT_INSN_SIZE;
-
-       return addr;
-}
-
 struct module;
 struct dyn_ftrace;
 struct dyn_arch_ftrace {
@@ -173,12 +165,14 @@ static inline u8 this_cpu_get_ftrace_enabled(void)
 }
 
 void ftrace_free_init_tramp(void);
+unsigned long ftrace_call_adjust(unsigned long addr);
 #else /* CONFIG_PPC64 */
 static inline void this_cpu_disable_ftrace(void) { }
 static inline void this_cpu_enable_ftrace(void) { }
 static inline void this_cpu_set_ftrace_enabled(u8 ftrace_enabled) { }
 static inline u8 this_cpu_get_ftrace_enabled(void) { return 1; }
 static inline void ftrace_free_init_tramp(void) { }
+static inline unsigned long ftrace_call_adjust(unsigned long addr) { return addr; }
 #endif /* CONFIG_PPC64 */
 #endif /* !__ASSEMBLY__ */
 
