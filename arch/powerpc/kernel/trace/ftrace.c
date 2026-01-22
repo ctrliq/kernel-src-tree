@@ -32,13 +32,7 @@
 
 #ifdef CONFIG_DYNAMIC_FTRACE
 
-/*
- * We generally only have a single long_branch tramp and at most 2 or 3 plt
- * tramps generated. But, we don't use the plt tramps currently. We also allot
- * 2 tramps after .text and .init.text. So, we only end up with around 3 usable
- * tramps in total. Set aside 8 just to be sure.
- */
-#define	NUM_FTRACE_TRAMPS	8
+#define	NUM_FTRACE_TRAMPS	2
 static unsigned long ftrace_tramps[NUM_FTRACE_TRAMPS];
 
 static ppc_inst_t
@@ -104,11 +98,6 @@ static int test_24bit_addr(unsigned long ip, unsigned long addr)
 static int is_bl_op(ppc_inst_t op)
 {
 	return (ppc_inst_val(op) & 0xfc000003) == 0x48000001;
-}
-
-static int is_b_op(ppc_inst_t op)
-{
-	return (ppc_inst_val(op) & 0xfc000003) == 0x48000000;
 }
 
 static unsigned long find_bl_target(unsigned long ip, ppc_inst_t op)
@@ -297,100 +286,12 @@ static unsigned long find_ftrace_tramp(unsigned long ip)
 	int i;
 	ppc_inst_t instr;
 
-	/*
-	 * We have the compiler generated long_branch tramps at the end
-	 * and we prefer those
-	 */
-	for (i = NUM_FTRACE_TRAMPS - 1; i >= 0; i--)
+	for (i = 0; i < NUM_FTRACE_TRAMPS; i++)
 		if (!ftrace_tramps[i])
 			continue;
 		else if (create_branch(&instr, (void *)ip,
 				       ftrace_tramps[i], 0) == 0)
 			return ftrace_tramps[i];
-
-	return 0;
-}
-
-static int add_ftrace_tramp(unsigned long tramp)
-{
-	int i;
-
-	for (i = 0; i < NUM_FTRACE_TRAMPS; i++)
-		if (!ftrace_tramps[i]) {
-			ftrace_tramps[i] = tramp;
-			return 0;
-		}
-
-	return -1;
-}
-
-/*
- * If this is a compiler generated long_branch trampoline (essentially, a
- * trampoline that has a branch to _mcount()), we re-write the branch to
- * instead go to ftrace_[regs_]caller() and note down the location of this
- * trampoline.
- */
-static int setup_mcount_compiler_tramp(unsigned long tramp)
-{
-	int i;
-	ppc_inst_t op;
-	unsigned long ptr;
-	ppc_inst_t instr;
-	static unsigned long ftrace_plt_tramps[NUM_FTRACE_TRAMPS];
-
-	/* Is this a known long jump tramp? */
-	for (i = 0; i < NUM_FTRACE_TRAMPS; i++)
-		if (ftrace_tramps[i] == tramp)
-			return 0;
-
-	/* Is this a known plt tramp? */
-	for (i = 0; i < NUM_FTRACE_TRAMPS; i++)
-		if (!ftrace_plt_tramps[i])
-			break;
-		else if (ftrace_plt_tramps[i] == tramp)
-			return -1;
-
-	/* New trampoline -- read where this goes */
-	if (copy_inst_from_kernel_nofault(&op, (void *)tramp)) {
-		pr_debug("Fetching opcode failed.\n");
-		return -1;
-	}
-
-	/* Is this a 24 bit branch? */
-	if (!is_b_op(op)) {
-		pr_debug("Trampoline is not a long branch tramp.\n");
-		return -1;
-	}
-
-	/* lets find where the pointer goes */
-	ptr = find_bl_target(tramp, op);
-
-	if (ptr != ppc_global_function_entry((void *)_mcount)) {
-		pr_debug("Trampoline target %p is not _mcount\n", (void *)ptr);
-		return -1;
-	}
-
-	/* Let's re-write the tramp to go to ftrace_[regs_]caller */
-#ifdef CONFIG_DYNAMIC_FTRACE_WITH_REGS
-	ptr = ppc_global_function_entry((void *)ftrace_regs_caller);
-#else
-	ptr = ppc_global_function_entry((void *)ftrace_caller);
-#endif
-	if (create_branch(&instr, (void *)tramp, ptr, 0)) {
-		pr_debug("%ps is not reachable from existing mcount tramp\n",
-				(void *)ptr);
-		return -1;
-	}
-
-	if (patch_branch((u32 *)tramp, ptr, 0)) {
-		pr_debug("REL24 out of range!\n");
-		return -1;
-	}
-
-	if (add_ftrace_tramp(tramp)) {
-		pr_debug("No tramp locations left\n");
-		return -1;
-	}
 
 	return 0;
 }
@@ -417,13 +318,10 @@ static int __ftrace_make_nop_kernel(struct dyn_ftrace *rec, unsigned long addr)
 
 	pr_devel("ip:%lx jumps to %lx", ip, tramp);
 
-	if (setup_mcount_compiler_tramp(tramp)) {
-		/* Are other trampolines reachable? */
-		if (!find_ftrace_tramp(ip)) {
-			pr_err("No ftrace trampolines reachable from %ps\n",
-					(void *)ip);
-			return -EINVAL;
-		}
+	/* Are ftrace trampolines reachable? */
+	if (!find_ftrace_tramp(ip)) {
+		pr_err("No ftrace trampolines reachable from %ps\n", (void *)ip);
+		return -EINVAL;
 	}
 
 	if (patch_instruction((u32 *)ip, ppc_inst(PPC_RAW_NOP()))) {
@@ -890,6 +788,17 @@ void ftrace_free_init_tramp(void)
 	for (i = 0; i < NUM_FTRACE_TRAMPS && ftrace_tramps[i]; i++)
 		if (ftrace_tramps[i] == (unsigned long)ftrace_tramp_init) {
 			ftrace_tramps[i] = 0;
+			return;
+		}
+}
+
+static void __init add_ftrace_tramp(unsigned long tramp)
+{
+	int i;
+
+	for (i = 0; i < NUM_FTRACE_TRAMPS; i++)
+		if (!ftrace_tramps[i]) {
+			ftrace_tramps[i] = tramp;
 			return;
 		}
 }
