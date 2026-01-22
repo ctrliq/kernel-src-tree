@@ -4524,7 +4524,7 @@ smb2_readv_callback(struct mid_q_entry *mid)
 	struct smb2_hdr *shdr =
 				(struct smb2_hdr *)rdata->iov[0].iov_base;
 	struct cifs_credits credits = { .value = 0, .instance = 0 };
-	struct smb_rqst rqst = { .rq_iov = &rdata->iov[1],
+	struct smb_rqst rqst = { .rq_iov = &rdata->iov[0],
 				 .rq_nvec = 1, };
 
 	if (rdata->got_bytes) {
