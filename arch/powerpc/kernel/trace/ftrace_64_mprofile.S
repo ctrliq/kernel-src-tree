@@ -65,10 +65,6 @@ _GLOBAL(ftrace_regs_caller)
 
 	/* Get the _mcount() call site out of LR */
 	mflr	r7
-	/* Save it as pt_regs->nip */
-	std     r7, _NIP(r1)
-	/* Also save it in B's stackframe header for proper unwind */
-	std	r7, LRSAVE+SWITCH_FRAME_SIZE(r1)
 	/* Save the read LR in pt_regs->link */
 	std     r0, _LINK(r1)
 
@@ -80,20 +76,46 @@ _GLOBAL(ftrace_regs_caller)
 	addi	r3,r3,function_trace_op@toc@l
 	ld	r5,0(r3)
 
-#ifdef CONFIG_LIVEPATCH
-	mr	r14,r7		/* remember old NIP */
-#endif
-	/* Calculate ip from nip-4 into r3 for call below */
-	subi    r3, r7, MCOUNT_INSN_SIZE
-
-	/* Put the original return address in r4 as parent_ip */
-	mr	r4, r0
-
 	/* Save special regs */
 	std     r8, _MSR(r1)
 	std     r9, _CTR(r1)
 	std     r10, _XER(r1)
 	std     r11, _CCR(r1)
+
+#ifdef CONFIG_PPC_FTRACE_OUT_OF_LINE
+	mr	r15, r7
+	/*
+	 * We want the ftrace location in the function, but our lr (in r7)
+	 * points at the 'mtlr r0' instruction in the out of line stub.  To
+	 * recover the ftrace location, we read the branch instruction in the
+	 * stub, and adjust our lr by the branch offset.
+	 *
+	 * See ftrace_init_ool_stub() for the profile sequence.
+	 */
+	lwz	r8, MCOUNT_INSN_SIZE(r7)
+	slwi	r8, r8, 6
+	srawi	r8, r8, 6
+	add	r3, r7, r8
+	/*
+	 * Override our nip to point past the branch in the original function.
+	 * This allows reliable stack trace and the ftrace stack tracer to work as-is.
+	 */
+	addi	r7, r3, MCOUNT_INSN_SIZE
+#else
+	/* Calculate ip from nip-4 into r3 for call below */
+	subi    r3, r7, MCOUNT_INSN_SIZE
+#endif
+
+	/* Save NIP as pt_regs->nip */
+	PPC_STL	r7, _NIP(r1)
+	/* Also save it in B's stackframe header for proper unwind */
+	PPC_STL	r7, LRSAVE+SWITCH_FRAME_SIZE(r1)
+#if defined(CONFIG_LIVEPATCH) || defined(CONFIG_PPC_FTRACE_OUT_OF_LINE)
+	mr	r14, r7		/* remember old NIP */
+#endif
+
+	/* Put the original return address in r4 as parent_ip */
+	mr	r4, r0
 
 	/* Load &pt_regs in r6 for call below */
 	addi    r6, r1 ,STACK_FRAME_OVERHEAD
@@ -104,11 +126,21 @@ ftrace_regs_call:
 	bl	ftrace_stub
 	nop
 
+#ifndef CONFIG_PPC_FTRACE_OUT_OF_LINE
 	/* Load ctr with the possibly modified NIP */
 	ld	r3, _NIP(r1)
 	mtctr	r3
 #ifdef CONFIG_LIVEPATCH
 	cmpd	r14, r3		/* has NIP been altered? */
+#endif
+#else /* !CONFIG_PPC_FTRACE_OUT_OF_LINE */
+	/* Load LR with the possibly modified NIP */
+	PPC_LL	r3, _NIP(r1)
+	cmpd	r14, r3		/* has NIP been altered? */
+	bne-	1f
+
+	mr	r3, r15
+1:	mtlr	r3
 #endif
 
 	/* Restore gprs */
@@ -116,7 +148,9 @@ ftrace_regs_call:
 
 	/* Restore possibly modified LR */
 	ld	r0, _LINK(r1)
+#ifndef CONFIG_PPC_FTRACE_OUT_OF_LINE
 	mtlr	r0
+#endif
 
 	/* Restore callee's TOC */
 	ld	r2, 24(r1)
@@ -128,18 +162,33 @@ ftrace_regs_call:
         /* Based on the cmpd above, if the NIP was altered handle livepatch */
 	bne-	livepatch_handler
 #endif
-	bctr			/* jump after _mcount site */
+	/* jump after _mcount site */
+#ifdef CONFIG_PPC_FTRACE_OUT_OF_LINE
+	/*
+	 * Return with blr to keep the link stack balanced. The function profiling sequence
+	 * uses 'mtlr r0' to restore LR.
+	 */
+	blr
+#else
+	bctr
+#endif
 
 _GLOBAL(ftrace_stub)
 	blr
 
 ftrace_no_trace:
+#ifdef CONFIG_PPC_FTRACE_OUT_OF_LINE
+	REST_GPR(3, r1)
+	addi	r1, r1, SWITCH_FRAME_SIZE+STACK_FRAME_MIN_SIZE
+	blr
+#else
 	mflr	r3
 	mtctr	r3
 	REST_GPR(3, r1)
 	addi	r1, r1, SWITCH_FRAME_SIZE+STACK_FRAME_MIN_SIZE
 	mtlr	r0
 	bctr
+#endif
 
 _GLOBAL(ftrace_caller)
 	/* Save the original return address in A's stack frame */
@@ -164,9 +213,6 @@ _GLOBAL(ftrace_caller)
 
 	/* Get the _mcount() call site out of LR */
 	mflr	r7
-	std     r7, _NIP(r1)
-	/* Also save it in B's stackframe header for proper unwind */
-	std	r7, LRSAVE+SWITCH_FRAME_SIZE(r1)
 
 	/* Save callee's TOC in the ABI compliant location */
 	std	r2, 24(r1)
@@ -176,20 +222,52 @@ _GLOBAL(ftrace_caller)
 	addi	r3, r3, function_trace_op@toc@l
 	ld	r5, 0(r3)
 
-#ifdef CONFIG_LIVEPATCH
+#if defined(CONFIG_LIVEPATCH) || defined(CONFIG_PPC_FTRACE_OUT_OF_LINE)
 	SAVE_GPR(14, r1)
-	mr	r14,r7		/* remember old NIP */
 #endif
-	/* Calculate ip from nip-4 into r3 for call below */
-	subi    r3, r7, MCOUNT_INSN_SIZE
 
-	/* Put the original return address in r4 as parent_ip */
 	std	r0, _LINK(r1)
-	mr	r4, r0
 
 	/* Clear MSR to flag as ftrace_caller versus frace_regs_caller */
 	li	r8, 0
 	PPC_STL	r8, _MSR(r1)
+
+#ifdef CONFIG_PPC_FTRACE_OUT_OF_LINE
+	/* Save our real return address in nvr for return */
+	SAVE_GPR(15, r1)
+	mr	r15, r7
+	/*
+	 * We want the ftrace location in the function, but our lr (in r7)
+	 * points at the 'mtlr r0' instruction in the out of line stub.  To
+	 * recover the ftrace location, we read the branch instruction in the
+	 * stub, and adjust our lr by the branch offset.
+	 *
+	 * See ftrace_init_ool_stub() for the profile sequence.
+	 */
+	lwz	r8, MCOUNT_INSN_SIZE(r7)
+	slwi	r8, r8, 6
+	srawi	r8, r8, 6
+	add	r3, r7, r8
+	/*
+	 * Override our nip to point past the branch in the original function.
+	 * This allows reliable stack trace and the ftrace stack tracer to work as-is.
+	 */
+	addi	r7, r3, MCOUNT_INSN_SIZE
+#else
+	/* Calculate ip from nip-4 into r3 for call below */
+	subi    r3, r7, MCOUNT_INSN_SIZE
+#endif
+
+	/* Save NIP as pt_regs->nip */
+	PPC_STL	r7, _NIP(r1)
+	/* Also save it in B's stackframe header for proper unwind */
+	PPC_STL	r7, LRSAVE+SWITCH_FRAME_SIZE(r1)
+#if defined(CONFIG_LIVEPATCH) || defined(CONFIG_PPC_FTRACE_OUT_OF_LINE)
+	mr	r14, r7		/* remember old NIP */
+#endif
+
+	/* Put the original return address in r4 as parent_ip */
+	mr	r4, r0
 
 	/* Load &pt_regs in r6 for call below */
 	addi    r6, r1 ,STACK_FRAME_OVERHEAD
@@ -200,10 +278,24 @@ ftrace_call:
 	bl	ftrace_stub
 	nop
 
+#ifndef CONFIG_PPC_FTRACE_OUT_OF_LINE
 	ld	r3, _NIP(r1)
 	mtctr	r3
 #ifdef CONFIG_LIVEPATCH
 	cmpd	r14, r3		/* has NIP been altered? */
+#endif
+#else /* !CONFIG_PPC_FTRACE_OUT_OF_LINE */
+	/* Load LR with the possibly modified NIP */
+	PPC_LL	r3, _NIP(r1)
+	cmpd	r14, r3		/* has NIP been altered? */
+	bne-	1f
+
+	mr	r3, r15
+	REST_GPR(15, r1)
+1:	mtlr	r3
+#endif
+
+#if defined(CONFIG_LIVEPATCH) || defined(CONFIG_PPC_FTRACE_OUT_OF_LINE)
 	REST_GPR(14, r1)
 #endif
 
@@ -215,7 +307,9 @@ ftrace_call:
 
 	/* Restore possibly modified LR */
 	ld	r0, _LINK(r1)
+#ifndef CONFIG_PPC_FTRACE_OUT_OF_LINE
 	mtlr	r0
+#endif
 
 	/* Pop our stack frame */
 	addi	r1, r1, SWITCH_FRAME_SIZE+STACK_FRAME_MIN_SIZE
@@ -224,7 +318,16 @@ ftrace_call:
         /* Based on the cmpd above, if the NIP was altered handle livepatch */
 	bne-	livepatch_handler
 #endif
-	bctr			/* jump after _mcount site */
+	/* jump after _mcount site */
+#ifdef CONFIG_PPC_FTRACE_OUT_OF_LINE
+	/*
+	 * Return with blr to keep the link stack balanced. The function profiling sequence
+	 * uses 'mtlr r0' to restore LR.
+	 */
+	blr
+#else
+	bctr
+#endif
 
 #ifdef CONFIG_LIVEPATCH
 	/*
@@ -235,11 +338,17 @@ ftrace_call:
 	 * We get here when a function A, calls another function B, but B has
 	 * been live patched with a new function C.
 	 *
-	 * On entry:
-	 *  - we have no stack frame and can not allocate one
+	 * On entry, we have no stack frame and can not allocate one.
+	 *
+	 * With PPC_FTRACE_OUT_OF_LINE=n, on entry:
 	 *  - LR points back to the original caller (in A)
 	 *  - CTR holds the new NIP in C
 	 *  - r0, r11 & r12 are free
+	 *
+	 * With PPC_FTRACE_OUT_OF_LINE=y, on entry:
+	 *  - r0 points back to the original caller (in A)
+	 *  - LR holds the new NIP in C
+	 *  - r11 & r12 are free
 	 */
 livepatch_handler:
 	ld	r12, PACA_THREAD_INFO(r13)
@@ -249,18 +358,23 @@ livepatch_handler:
 	addi	r11, r11, 24
 	std	r11, TI_livepatch_sp(r12)
 
-	/* Save toc & real LR on livepatch stack */
-	std	r2,  -24(r11)
-	mflr	r12
-	std	r12, -16(r11)
-
 	/* Store stack end marker */
 	lis     r12, STACK_END_MAGIC@h
 	ori     r12, r12, STACK_END_MAGIC@l
 	std	r12, -8(r11)
 
-	/* Put ctr in r12 for global entry and branch there */
+	/* Save toc & real LR on livepatch stack */
+	std	r2,  -24(r11)
+#ifndef CONFIG_PPC_FTRACE_OUT_OF_LINE
+	mflr	r12
+	std	r12, -16(r11)
 	mfctr	r12
+#else
+	std	r0, -16(r11)
+	mflr	r12
+	/* Put ctr in r12 for global entry and branch there */
+	mtctr	r12
+#endif
 	bctrl
 
 	/*

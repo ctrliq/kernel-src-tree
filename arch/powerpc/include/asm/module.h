@@ -43,6 +43,11 @@ struct mod_arch_specific {
 	unsigned long tramp;
 #ifdef CONFIG_DYNAMIC_FTRACE_WITH_REGS
 	unsigned long tramp_regs;
+#ifdef CONFIG_PPC_FTRACE_OUT_OF_LINE
+	struct ftrace_ool_stub *ool_stubs;
+	unsigned int ool_stub_count;
+	unsigned int ool_stub_index;
+#endif
 #endif
 #endif
 
