@@ -45,19 +45,6 @@ static ppc_inst_t ftrace_create_branch_inst(unsigned long ip, unsigned long addr
 	return op;
 }
 
-static ppc_inst_t
-ftrace_call_replace(unsigned long ip, unsigned long addr, int link)
-{
-	ppc_inst_t op;
-
-	addr = ppc_function_entry((void *)addr);
-
-	/* if (link) set op to 'bl' else 'b' */
-	create_branch(&op, (u32 *)ip, addr, link ? 1 : 0);
-
-	return op;
-}
-
 static inline int ftrace_read_inst(unsigned long ip, ppc_inst_t *op)
 {
 	if (copy_inst_from_kernel_nofault(op, (void *)ip)) {
@@ -281,18 +268,16 @@ int ftrace_update_ftrace_func(ftrace_func_t func)
 	int ret;
 
 	old = ppc_inst_read((u32 *)&ftrace_call);
-	new = ftrace_call_replace(ip, (unsigned long)func, 1);
+	new = ftrace_create_branch_inst(ip, ppc_function_entry(func), 1);
 	ret = ftrace_modify_code(ip, old, new);
 
-#ifdef CONFIG_DYNAMIC_FTRACE_WITH_REGS
 	/* Also update the regs callback function */
-	if (!ret) {
+	if (IS_ENABLED(CONFIG_DYNAMIC_FTRACE_WITH_REGS) && !ret) {
 		ip = (unsigned long)(&ftrace_regs_call);
 		old = ppc_inst_read((u32 *)&ftrace_regs_call);
-		new = ftrace_call_replace(ip, (unsigned long)func, 1);
+		new = ftrace_create_branch_inst(ip, ppc_function_entry(func), 1);
 		ret = ftrace_modify_code(ip, old, new);
 	}
-#endif
 
 	return ret;
 }
