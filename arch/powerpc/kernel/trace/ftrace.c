@@ -122,175 +122,6 @@ static unsigned long find_bl_target(unsigned long ip, ppc_inst_t op)
 	return ip + (long)offset;
 }
 
-#ifdef CONFIG_MODULES
-#ifdef CONFIG_PPC64
-static int
-__ftrace_make_nop(struct module *mod,
-		  struct dyn_ftrace *rec, unsigned long addr)
-{
-	unsigned long entry, ptr, tramp;
-	unsigned long ip = rec->ip;
-	ppc_inst_t op, pop;
-
-	/* read where this goes */
-	if (copy_inst_from_kernel_nofault(&op, (void *)ip)) {
-		pr_err("Fetching opcode failed.\n");
-		return -EFAULT;
-	}
-
-	/* Make sure that this is still a 24bit jump */
-	if (!is_bl_op(op)) {
-		pr_err("Not expected bl: opcode is %s\n", ppc_inst_as_str(op));
-		return -EINVAL;
-	}
-
-	/* lets find where the pointer goes */
-	tramp = find_bl_target(ip, op);
-
-	pr_devel("ip:%lx jumps to %lx", ip, tramp);
-
-	if (module_trampoline_target(mod, tramp, &ptr)) {
-		pr_err("Failed to get trampoline target\n");
-		return -EFAULT;
-	}
-
-	pr_devel("trampoline target %lx", ptr);
-
-	entry = ppc_global_function_entry((void *)addr);
-	/* This should match what was called */
-	if (ptr != entry) {
-		pr_err("addr %lx does not match expected %lx\n", ptr, entry);
-		return -EINVAL;
-	}
-
-#ifdef CONFIG_MPROFILE_KERNEL
-	/* When using -mkernel_profile there is no load to jump over */
-	pop = ppc_inst(PPC_RAW_NOP());
-
-	if (copy_inst_from_kernel_nofault(&op, (void *)(ip - 4))) {
-		pr_err("Fetching instruction at %lx failed.\n", ip - 4);
-		return -EFAULT;
-	}
-
-	/* We expect either a mflr r0, or a std r0, LRSAVE(r1) */
-	if (!ppc_inst_equal(op, ppc_inst(PPC_RAW_MFLR(_R0))) &&
-	    !ppc_inst_equal(op, ppc_inst(PPC_INST_STD_LR))) {
-		pr_err("Unexpected instruction %s around bl _mcount\n",
-		       ppc_inst_as_str(op));
-		return -EINVAL;
-	}
-#else
-	/*
-	 * Our original call site looks like:
-	 *
-	 * bl <tramp>
-	 * ld r2,XX(r1)
-	 *
-	 * Milton Miller pointed out that we can not simply nop the branch.
-	 * If a task was preempted when calling a trace function, the nops
-	 * will remove the way to restore the TOC in r2 and the r2 TOC will
-	 * get corrupted.
-	 *
-	 * Use a b +8 to jump over the load.
-	 */
-
-	pop = ppc_inst(PPC_INST_BRANCH | 8);	/* b +8 */
-
-	/*
-	 * Check what is in the next instruction. We can see ld r2,40(r1), but
-	 * on first pass after boot we will see mflr r0.
-	 */
-	if (copy_inst_from_kernel_nofault(&op, (void *)(ip + 4))) {
-		pr_err("Fetching op failed.\n");
-		return -EFAULT;
-	}
-
-	if (!ppc_inst_equal(op,  ppc_inst(PPC_INST_LD_TOC))) {
-		pr_err("Expected %08lx found %s\n", PPC_INST_LD_TOC, ppc_inst_as_str(op));
-		return -EINVAL;
-	}
-#endif /* CONFIG_MPROFILE_KERNEL */
-
-	if (patch_instruction((u32 *)ip, pop)) {
-		pr_err("Patching NOP failed.\n");
-		return -EPERM;
-	}
-
-	return 0;
-}
-
-#else /* !PPC64 */
-static int
-__ftrace_make_nop(struct module *mod,
-		  struct dyn_ftrace *rec, unsigned long addr)
-{
-	ppc_inst_t op;
-	unsigned int jmp[4];
-	unsigned long ip = rec->ip;
-	unsigned long tramp;
-
-	if (copy_from_kernel_nofault(&op, (void *)ip, MCOUNT_INSN_SIZE))
-		return -EFAULT;
-
-	/* Make sure that that this is still a 24bit jump */
-	if (!is_bl_op(op)) {
-		pr_err("Not expected bl: opcode is %s\n", ppc_inst_as_str(op));
-		return -EINVAL;
-	}
-
-	/* lets find where the pointer goes */
-	tramp = find_bl_target(ip, op);
-
-	/*
-	 * On PPC32 the trampoline looks like:
-	 *  0x3d, 0x80, 0x00, 0x00  lis r12,sym@ha
-	 *  0x39, 0x8c, 0x00, 0x00  addi r12,r12,sym@l
-	 *  0x7d, 0x89, 0x03, 0xa6  mtctr r12
-	 *  0x4e, 0x80, 0x04, 0x20  bctr
-	 */
-
-	pr_devel("ip:%lx jumps to %lx", ip, tramp);
-
-	/* Find where the trampoline jumps to */
-	if (copy_from_kernel_nofault(jmp, (void *)tramp, sizeof(jmp))) {
-		pr_err("Failed to read %lx\n", tramp);
-		return -EFAULT;
-	}
-
-	pr_devel(" %08x %08x ", jmp[0], jmp[1]);
-
-	/* verify that this is what we expect it to be */
-	if (((jmp[0] & 0xffff0000) != 0x3d800000) ||
-	    ((jmp[1] & 0xffff0000) != 0x398c0000) ||
-	    (jmp[2] != 0x7d8903a6) ||
-	    (jmp[3] != 0x4e800420)) {
-		pr_err("Not a trampoline\n");
-		return -EINVAL;
-	}
-
-	tramp = (jmp[1] & 0xffff) |
-		((jmp[0] & 0xffff) << 16);
-	if (tramp & 0x8000)
-		tramp -= 0x10000;
-
-	pr_devel(" %lx ", tramp);
-
-	if (tramp != addr) {
-		pr_err("Trampoline location %08lx does not match addr\n",
-		       tramp);
-		return -EINVAL;
-	}
-
-	op = ppc_inst(PPC_RAW_NOP());
-
-	if (patch_instruction((u32 *)ip, op))
-		return -EPERM;
-
-	return 0;
-}
-#endif /* PPC64 */
-#endif /* CONFIG_MODULES */
-
 static unsigned long find_ftrace_tramp(unsigned long ip)
 {
 	int i;
@@ -304,90 +135,6 @@ static unsigned long find_ftrace_tramp(unsigned long ip)
 			return ftrace_tramps[i];
 
 	return 0;
-}
-
-static int __ftrace_make_nop_kernel(struct dyn_ftrace *rec, unsigned long addr)
-{
-	unsigned long tramp, ip = rec->ip;
-	ppc_inst_t op;
-
-	/* Read where this goes */
-	if (copy_inst_from_kernel_nofault(&op, (void *)ip)) {
-		pr_err("Fetching opcode failed.\n");
-		return -EFAULT;
-	}
-
-	/* Make sure that this is still a 24bit jump */
-	if (!is_bl_op(op)) {
-		pr_err("Not expected bl: opcode is %s\n", ppc_inst_as_str(op));
-		return -EINVAL;
-	}
-
-	/* Let's find where the pointer goes */
-	tramp = find_bl_target(ip, op);
-
-	pr_devel("ip:%lx jumps to %lx", ip, tramp);
-
-	/* Are ftrace trampolines reachable? */
-	if (!find_ftrace_tramp(ip)) {
-		pr_err("No ftrace trampolines reachable from %ps\n", (void *)ip);
-		return -EINVAL;
-	}
-
-	if (patch_instruction((u32 *)ip, ppc_inst(PPC_RAW_NOP()))) {
-		pr_err("Patching NOP failed.\n");
-		return -EPERM;
-	}
-
-	return 0;
-}
-
-int ftrace_make_nop(struct module *mod,
-		    struct dyn_ftrace *rec, unsigned long addr)
-{
-	unsigned long ip = rec->ip;
-	ppc_inst_t old, new;
-
-	/*
-	 * If the calling address is more that 24 bits away,
-	 * then we had to use a trampoline to make the call.
-	 * Otherwise just update the call site.
-	 */
-	if (test_24bit_addr(ip, addr)) {
-		/* within range */
-		old = ftrace_call_replace(ip, addr, 1);
-		new = ppc_inst(PPC_RAW_NOP());
-		return ftrace_modify_code(ip, old, new);
-	} else if (core_kernel_text(ip))
-		return __ftrace_make_nop_kernel(rec, addr);
-
-#ifdef CONFIG_MODULES
-	/*
-	 * Out of range jumps are called from modules.
-	 * We should either already have a pointer to the module
-	 * or it has been passed in.
-	 */
-	if (!rec->arch.mod) {
-		if (!mod) {
-			pr_err("No module loaded addr=%lx\n", addr);
-			return -EFAULT;
-		}
-		rec->arch.mod = mod;
-	} else if (mod) {
-		if (mod != rec->arch.mod) {
-			pr_err("Record mod %p not equal to passed in mod %p\n",
-			       rec->arch.mod, mod);
-			return -EINVAL;
-		}
-		/* nothing to do if mod == rec->arch.mod */
-	} else
-		mod = rec->arch.mod;
-
-	return __ftrace_make_nop(mod, rec, addr);
-#else
-	/* We should not get here without modules */
-	return -EINVAL;
-#endif /* CONFIG_MODULES */
 }
 
 #ifdef CONFIG_MODULES
@@ -753,6 +500,38 @@ int ftrace_modify_call(struct dyn_ftrace *rec, unsigned long old_addr,
 #endif /* CONFIG_MODULES */
 }
 #endif
+
+int ftrace_make_nop(struct module *mod, struct dyn_ftrace *rec, unsigned long addr)
+{
+	unsigned long tramp, ip = rec->ip;
+	ppc_inst_t old, new;
+
+	/* Nop-out the ftrace location */
+	new = ppc_inst(PPC_RAW_NOP());
+	if (is_offset_in_branch_range(addr - ip)) {
+		/* Within range */
+		old = ftrace_create_branch_inst(ip, addr, 1);
+		return ftrace_modify_code(ip, old, new);
+	} else if (core_kernel_text(ip)) {
+		/* We would be branching to one of our ftrace tramps */
+		tramp = find_ftrace_tramp(ip);
+		if (!tramp) {
+			pr_err("0x%lx: No ftrace trampolines reachable\n", ip);
+			return -EINVAL;
+		}
+		old = ftrace_create_branch_inst(ip, tramp, 1);
+		return ftrace_modify_code(ip, old, new);
+	} else if (IS_ENABLED(CONFIG_MODULES)) {
+		/* Module code would be going to one of the module stubs */
+		if (!mod)
+			mod = rec->arch.mod;
+		tramp = (addr == (unsigned long)ftrace_caller ? mod->arch.tramp : mod->arch.tramp_regs);
+		old = ftrace_create_branch_inst(ip, tramp, 1);
+		return ftrace_modify_code(ip, old, new);
+	}
+
+	return -EINVAL;
+}
 
 int ftrace_init_nop(struct module *mod, struct dyn_ftrace *rec)
 {
