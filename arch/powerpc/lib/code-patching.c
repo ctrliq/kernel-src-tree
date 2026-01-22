@@ -39,7 +39,7 @@ static int __patch_instruction(u32 *exec_addr, ppc_inst_t instr, u32 *patch_addr
 
 failed:
 	mb();  /* sync */
-	return -EFAULT;
+	return -EPERM;
 }
 
 int raw_patch_instruction(u32 *addr, ppc_inst_t instr)
