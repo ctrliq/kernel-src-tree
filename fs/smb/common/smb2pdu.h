@@ -1227,7 +1227,7 @@ struct create_posix {
 } __packed;
 
 /* See MS-SMB2 2.2.13.2.3 and MS-SMB2 2.2.13.2.4 */
-struct create_durable {
+typedef struct {
 	struct create_context_hdr ccontext;
 	__u8   Name[8];
 	union {
@@ -1237,7 +1237,7 @@ struct create_durable {
 			__u64 VolatileFileId;
 		} Fid;
 	} Data;
-} __packed;
+} __packed create_durable_req_t, create_durable_reconn_t;
 
 /* See MS-SMB2 2.2.13.2.5 */
 struct create_mxac_req {
