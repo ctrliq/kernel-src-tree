@@ -383,8 +383,8 @@ ftrace_call:
 	bne-	1f
 
 	mr	r3, r15
-	REST_GPR(15, r1)
 1:	mtlr	r3
+	REST_GPR(15, r1)
 #endif
 
 #if defined(CONFIG_LIVEPATCH) || defined(CONFIG_PPC_FTRACE_OUT_OF_LINE)
