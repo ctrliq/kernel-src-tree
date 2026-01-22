@@ -112,7 +112,6 @@ ftrace_regs_call:
 #endif
 
 	/* Restore gprs */
-	REST_GPR(0, r1)
 	REST_GPRS(2, 31, r1)
 
 	/* Restore possibly modified LR */
@@ -182,14 +181,19 @@ _GLOBAL(ftrace_caller)
 	addi	r3, r3, function_trace_op@toc@l
 	ld	r5, 0(r3)
 
+#ifdef CONFIG_LIVEPATCH
+	SAVE_GPR(14, r1)
+	mr	r14,r7		/* remember old NIP */
+#endif
 	/* Calculate ip from nip-4 into r3 for call below */
 	subi    r3, r7, MCOUNT_INSN_SIZE
 
 	/* Put the original return address in r4 as parent_ip */
+	std	r0, _LINK(r1)
 	mr	r4, r0
 
-	/* Set pt_regs to NULL */
-	li	r6, 0
+	/* Load &pt_regs in r6 for call below */
+	addi    r6, r1 ,STACK_FRAME_OVERHEAD
 
 	/* ftrace_call(r3, r4, r5, r6) */
 .globl ftrace_call
@@ -199,6 +203,10 @@ ftrace_call:
 
 	ld	r3, _NIP(r1)
 	mtctr	r3
+#ifdef CONFIG_LIVEPATCH
+	cmpd	r14, r3		/* has NIP been altered? */
+	REST_GPR(14, r1)
+#endif
 
 	/* Restore gprs */
 	REST_GPRS(3, 10, r1)
@@ -206,13 +214,17 @@ ftrace_call:
 	/* Restore callee's TOC */
 	ld	r2, 24(r1)
 
+	/* Restore possibly modified LR */
+	ld	r0, _LINK(r1)
+	mtlr	r0
+
 	/* Pop our stack frame */
 	addi	r1, r1, SWITCH_FRAME_SIZE+STACK_FRAME_MIN_SIZE
 
-	/* Reload original LR */
-	ld	r0, LRSAVE(r1)
-	mtlr	r0
-
+#ifdef CONFIG_LIVEPATCH
+        /* Based on the cmpd above, if the NIP was altered handle livepatch */
+	bne-	livepatch_handler
+#endif
 	/* Handle function_graph or go back */
 	b	ftrace_caller_common
 
