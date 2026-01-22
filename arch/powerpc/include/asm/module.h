@@ -27,6 +27,7 @@ struct ppc_plt_entry {
 struct mod_arch_specific {
 #ifdef __powerpc64__
 	unsigned int stubs_section;	/* Index of stubs section in module */
+	unsigned int stub_count;	/* Number of stubs used */
 	unsigned int toc_section;	/* What section is the TOC? */
 	bool toc_fixed;			/* Have we fixed up .TOC.? */
 
