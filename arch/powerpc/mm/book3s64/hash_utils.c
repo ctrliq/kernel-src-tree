@@ -2184,10 +2184,10 @@ void hash__kernel_map_pages(struct page *page, int numpages, int enable)
 	local_irq_restore(flags);
 }
 #else /* CONFIG_DEBUG_PAGEALLOC */
-int hash__kernel_map_pages(struct page *page, int numpages,
+void hash__kernel_map_pages(struct page *page, int numpages,
 					 int enable)
 {
-	return 0;
+
 }
 #endif /* CONFIG_DEBUG_PAGEALLOC */
 
