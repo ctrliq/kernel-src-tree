@@ -13,7 +13,7 @@
 #ifdef CONFIG_PPC_FTRACE_OUT_OF_LINE
 SYM_DATA(ftrace_ool_stub_text_count, .long CONFIG_PPC_FTRACE_OUT_OF_LINE_NUM_RESERVE)
 
-SYM_CODE_START(ftrace_ool_stub_text)
+SYM_START(ftrace_ool_stub_text, SYM_L_GLOBAL, .balign SZL)
 	.space CONFIG_PPC_FTRACE_OUT_OF_LINE_NUM_RESERVE * FTRACE_OOL_STUB_SIZE
 SYM_CODE_END(ftrace_ool_stub_text)
 #endif

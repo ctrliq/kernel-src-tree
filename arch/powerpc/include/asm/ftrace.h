@@ -169,8 +169,11 @@ static inline u8 this_cpu_get_ftrace_enabled(void)
 
 #ifdef CONFIG_PPC_FTRACE_OUT_OF_LINE
 struct ftrace_ool_stub {
+#ifdef CONFIG_DYNAMIC_FTRACE_WITH_CALL_OPS
+	struct ftrace_ops *ftrace_op;
+#endif
 	u32	insn[4];
-};
+} __aligned(sizeof(unsigned long));
 extern struct ftrace_ool_stub ftrace_ool_stub_text_end[], ftrace_ool_stub_text[],
 			      ftrace_ool_stub_inittext[];
 extern unsigned int ftrace_ool_stub_text_end_count, ftrace_ool_stub_text_count,

@@ -72,9 +72,16 @@ _GLOBAL(ftrace_regs_caller)
 	std	r2, 24(r1)
 	ld	r2,PACATOC(r13)	/* get kernel TOC in r2 */
 
+#ifdef CONFIG_DYNAMIC_FTRACE_WITH_CALL_OPS
+	/* r7 points to the instruction following the call to ftrace */
+	PPC_LL	r5, -(MCOUNT_INSN_SIZE*2 + SZL)(r7)
+	PPC_LL	r12, FTRACE_OPS_FUNC(r5)
+	mtctr	r12
+#else /* !CONFIG_DYNAMIC_FTRACE_WITH_CALL_OPS */
 	addis	r3,r2,function_trace_op@toc@ha
 	addi	r3,r3,function_trace_op@toc@l
 	ld	r5,0(r3)
+#endif
 
 	/* Save special regs */
 	std     r8, _MSR(r1)
@@ -120,11 +127,15 @@ _GLOBAL(ftrace_regs_caller)
 	/* Load &pt_regs in r6 for call below */
 	addi    r6, r1 ,STACK_FRAME_OVERHEAD
 
+#ifdef CONFIG_DYNAMIC_FTRACE_WITH_CALL_OPS
+	bctrl
+#else
 	/* ftrace_call(r3, r4, r5, r6) */
 .globl ftrace_regs_call
 ftrace_regs_call:
 	bl	ftrace_stub
 	nop
+#endif
 
 #ifndef CONFIG_PPC_FTRACE_OUT_OF_LINE
 	/* Load ctr with the possibly modified NIP */
@@ -218,9 +229,16 @@ _GLOBAL(ftrace_caller)
 	std	r2, 24(r1)
 	ld	r2, PACATOC(r13)	/* get kernel TOC in r2 */
 
+#ifdef CONFIG_DYNAMIC_FTRACE_WITH_CALL_OPS
+	/* r7 points to the instruction following the call to ftrace */
+	PPC_LL	r5, -(MCOUNT_INSN_SIZE*2 + SZL)(r7)
+	PPC_LL	r12, FTRACE_OPS_FUNC(r5)
+	mtctr	r12
+#else /* !CONFIG_DYNAMIC_FTRACE_WITH_CALL_OPS */
 	addis	r3, r2, function_trace_op@toc@ha
 	addi	r3, r3, function_trace_op@toc@l
 	ld	r5, 0(r3)
+#endif
 
 #if defined(CONFIG_LIVEPATCH) || defined(CONFIG_PPC_FTRACE_OUT_OF_LINE)
 	SAVE_GPR(14, r1)
@@ -272,11 +290,15 @@ _GLOBAL(ftrace_caller)
 	/* Load &pt_regs in r6 for call below */
 	addi    r6, r1 ,STACK_FRAME_OVERHEAD
 
+#ifdef CONFIG_DYNAMIC_FTRACE_WITH_CALL_OPS
+	bctrl
+#else
 	/* ftrace_call(r3, r4, r5, r6) */
 .globl ftrace_call
 ftrace_call:
 	bl	ftrace_stub
 	nop
+#endif
 
 #ifndef CONFIG_PPC_FTRACE_OUT_OF_LINE
 	ld	r3, _NIP(r1)
