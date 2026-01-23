@@ -2354,8 +2354,7 @@ asmlinkage int vprintk_emit(int facility, int level,
 			    const struct dev_printk_info *dev_info,
 			    const char *fmt, va_list args)
 {
-	bool do_trylock_unlock = printing_via_unlock &&
-				 !IS_ENABLED(CONFIG_PREEMPT_RT);
+	bool do_trylock_unlock = printing_via_unlock && !is_printk_legacy_deferred();
 	int printed_len;
 
 	/* Suppress unimportant messages after panic happens */
@@ -2758,7 +2757,7 @@ void resume_console(void)
 static int console_cpu_notify(unsigned int cpu)
 {
 	if (!cpuhp_tasks_frozen && printing_via_unlock &&
-	    !IS_ENABLED(CONFIG_PREEMPT_RT)) {
+	    !force_legacy_kthread()) {
 		/* If trylock fails, someone else is doing the printing */
 		if (console_trylock())
 			console_unlock();
@@ -2987,7 +2986,7 @@ static bool console_emit_next_record(struct console *con, bool *handover, int co
 
 	/* Write everything out to the hardware. */
 
-	if (IS_ENABLED(CONFIG_PREEMPT_RT)) {
+	if (force_legacy_kthread()) {
 		/*
 		 * On PREEMPT_RT this function is either in a thread or
 		 * panic context. So there is no need for concern about
@@ -3199,7 +3198,7 @@ void console_unlock(void)
 	 * PREEMPT_RT relies on kthread and atomic consoles for printing.
 	 * It never attempts to print from console_unlock().
 	 */
-	if (IS_ENABLED(CONFIG_PREEMPT_RT)) {
+	if (force_legacy_kthread()) {
 		__console_unlock();
 		return;
 	}
@@ -3493,7 +3492,7 @@ void nbcon_legacy_kthread_create(void)
 
 	lockdep_assert_held(&console_mutex);
 
-	if (!IS_ENABLED(CONFIG_PREEMPT_RT))
+	if (!force_legacy_kthread())
 		return;
 
 	if (!printk_threads_enabled || nbcon_legacy_kthread)
@@ -4106,7 +4105,7 @@ static bool __pr_flush(struct console *con, int timeout_ms, bool reset_on_progre
 	 * Otherwise this function will just wait for the threaded printers
 	 * to print up to @seq.
 	 */
-	if (printing_via_unlock && !IS_ENABLED(CONFIG_PREEMPT_RT)) {
+	if (printing_via_unlock && !force_legacy_kthread()) {
 		console_lock();
 		console_unlock();
 	}
@@ -4214,7 +4213,7 @@ static void wake_up_klogd_work_func(struct irq_work *irq_work)
 	int pending = this_cpu_xchg(printk_pending, 0);
 
 	if (pending & PRINTK_PENDING_OUTPUT) {
-		if (IS_ENABLED(CONFIG_PREEMPT_RT)) {
+		if (force_legacy_kthread()) {
 			wake_up_interruptible(&legacy_wait);
 		} else {
 			/*
