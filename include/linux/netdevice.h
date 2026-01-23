@@ -339,10 +339,26 @@ struct gro_list {
 };
 
 /*
- * size of gro hash buckets, must less than bit number of
- * napi_struct::gro_bitmask
+ * size of gro hash buckets, must be <= the number of bits in
+ * gro_node::bitmask
  */
 #define GRO_HASH_BUCKETS	8
+
+/**
+ * struct gro_node - structure to support Generic Receive Offload
+ * @bitmask: bitmask to indicate used buckets in @hash
+ * @hash: hashtable of pending aggregated skbs, separated by flows
+ * @rx_list: list of pending ``GRO_NORMAL`` skbs
+ * @rx_count: cached current length of @rx_list
+ * @cached_napi_id: napi_struct::napi_id cached for hotpath, 0 for standalone
+ */
+struct gro_node {
+	unsigned long		bitmask;
+	struct gro_list		hash[GRO_HASH_BUCKETS];
+	struct list_head	rx_list;
+	u32			rx_count;
+	u32			cached_napi_id;
+};
 
 /*
  * Structure for per-NAPI config
@@ -352,6 +368,7 @@ struct napi_config {
 	u64 irq_suspend_timeout;
 	u32 defer_hard_irqs;
 	cpumask_t affinity_mask;
+	u8 threaded;
 	unsigned int napi_id;
 };
 
@@ -370,7 +387,6 @@ struct napi_struct {
 	unsigned long		state;
 	int			weight;
 	u32			defer_hard_irqs_count;
-	unsigned long		gro_bitmask;
 	int			(*poll)(struct napi_struct *, int);
 #ifdef CONFIG_NETPOLL
 	/* CPU actively polling if netpoll is configured */
@@ -379,11 +395,8 @@ struct napi_struct {
 	/* CPU on which NAPI has been scheduled for processing */
 	int			list_owner;
 	struct net_device	*dev;
-	struct gro_list		gro_hash[GRO_HASH_BUCKETS];
 	struct sk_buff		*skb;
-	struct list_head	rx_list; /* Pending GRO_NORMAL skbs */
-	int			rx_count; /* length of rx_list */
-	unsigned int		napi_id; /* protected by netdev_lock */
+	struct gro_node		gro;
 	struct hrtimer		timer;
 	/* all fields past this point are write-protected by netdev_lock */
 	struct task_struct	*thread;
@@ -391,6 +404,7 @@ struct napi_struct {
 	unsigned long		irq_suspend_timeout;
 	u32			defer_hard_irqs;
 	/* control-path-only fields follow */
+	u32			napi_id;
 	struct list_head	dev_list;
 	struct hlist_node	napi_hash_node;
 	int			irq;
@@ -407,11 +421,12 @@ enum {
 	NAPI_STATE_NPSVC,		/* Netpoll - don't dequeue from poll_list */
 	NAPI_STATE_LISTED,		/* NAPI added to system lists */
 	NAPI_STATE_NO_BUSY_POLL,	/* Do not add in napi_hash, no busy polling */
-	NAPI_STATE_IN_BUSY_POLL,	/* sk_busy_loop() owns this NAPI */
+	NAPI_STATE_IN_BUSY_POLL,	/* Do not rearm NAPI interrupt */
 	NAPI_STATE_PREFER_BUSY_POLL,	/* prefer busy-polling over softirq processing*/
 	NAPI_STATE_THREADED,		/* The poll is performed inside its own thread*/
 	NAPI_STATE_SCHED_THREADED,	/* Napi is currently scheduled in threaded mode */
 	NAPI_STATE_HAS_NOTIFIER,	/* Napi has an IRQ notifier */
+	NAPI_STATE_THREADED_BUSY_POLL,	/* The threaded NAPI poller will busy poll */
 };
 
 enum {
@@ -426,6 +441,7 @@ enum {
 	NAPIF_STATE_THREADED		= BIT(NAPI_STATE_THREADED),
 	NAPIF_STATE_SCHED_THREADED	= BIT(NAPI_STATE_SCHED_THREADED),
 	NAPIF_STATE_HAS_NOTIFIER	= BIT(NAPI_STATE_HAS_NOTIFIER),
+	NAPIF_STATE_THREADED_BUSY_POLL	= BIT(NAPI_STATE_THREADED_BUSY_POLL),
 };
 
 enum gro_result {
@@ -574,7 +590,9 @@ static inline bool napi_complete(struct napi_struct *n)
 	return napi_complete_done(n, 0);
 }
 
-int dev_set_threaded(struct net_device *dev, bool threaded);
+void netif_threaded_enable(struct net_device *dev);
+int dev_set_threaded(struct net_device *dev,
+		     enum netdev_napi_threaded threaded);
 
 void napi_disable(struct napi_struct *n);
 void napi_disable_locked(struct napi_struct *n);
@@ -1855,6 +1873,7 @@ enum netdev_reg_state {
  * 	@addr_len:		Hardware address length
  *	@upper_level:		Maximum depth level of upper devices.
  *	@lower_level:		Maximum depth level of lower devices.
+ *	@threaded:		napi threaded state.
  *	@neigh_priv_len:	Used in neigh_alloc()
  * 	@dev_id:		Used to differentiate devices that share
  * 				the same link layer address
@@ -1997,8 +2016,6 @@ enum netdev_reg_state {
  *			switch driver and used to set the phys state of the
  *			switch port.
  *
- *	@threaded:	napi threaded mode is enabled
- *
  *	@irq_affinity_auto: driver wants the core to store and re-assign the IRQ
  *			    affinity. Set by netif_enable_irq_affinity(), then
  *			    the driver must create a persistent napi by
@@ -2057,6 +2074,8 @@ enum netdev_reg_state {
  *	@max_pacing_offload_horizon: max EDT offload horizon in nsec.
  *	@napi_config: An array of napi_config structures containing per-NAPI
  *		      settings.
+ *	@num_napi_configs:	number of allocated NAPI config structs,
+ *		always >= max(num_rx_queues, num_tx_queues).
  *	@gro_flush_timeout:	timeout for GRO layer in NAPI
  *	@napi_defer_hard_irqs:	If not zero, provides a counter that would
  *				allow to avoid NIC hard IRQ, on busy queues.
@@ -2230,6 +2249,7 @@ struct net_device {
 	unsigned char		addr_len;
 	unsigned char		upper_level;
 	unsigned char		lower_level;
+	u8			threaded;
 
 	unsigned short		neigh_priv_len;
 	unsigned short          dev_id;
@@ -2411,7 +2431,6 @@ struct net_device {
 	struct sfp_bus		*sfp_bus;
 	struct lock_class_key	*qdisc_tx_busylock;
 	bool			proto_down;
-	bool			threaded;
 	bool			irq_affinity_auto;
 	bool			rx_cpu_rmap_auto;
 
@@ -2464,8 +2483,9 @@ struct net_device {
 
 	u64			max_pacing_offload_horizon;
 	struct napi_config	*napi_config;
-	unsigned long		gro_flush_timeout;
+	u32			num_napi_configs;
 	u32			napi_defer_hard_irqs;
+	unsigned long		gro_flush_timeout;
 
 	/**
 	 * @up: copy of @state's IFF_UP, but safe to read with just @lock.
@@ -4086,8 +4106,14 @@ int netif_receive_skb(struct sk_buff *skb);
 int netif_receive_skb_core(struct sk_buff *skb);
 void netif_receive_skb_list_internal(struct list_head *head);
 void netif_receive_skb_list(struct list_head *head);
-gro_result_t napi_gro_receive(struct napi_struct *napi, struct sk_buff *skb);
-void napi_gro_flush(struct napi_struct *napi, bool flush_old);
+gro_result_t gro_receive_skb(struct gro_node *gro, struct sk_buff *skb);
+
+static inline gro_result_t napi_gro_receive(struct napi_struct *napi,
+					    struct sk_buff *skb)
+{
+	return gro_receive_skb(&napi->gro, skb);
+}
+
 struct sk_buff *napi_get_frags(struct napi_struct *napi);
 gro_result_t napi_gro_frags(struct napi_struct *napi);
 
