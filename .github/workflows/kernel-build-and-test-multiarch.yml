@@ -1,0 +1,877 @@
+name: Automated kernel build and test (multi-arch)
+
+on:
+  workflow_call:
+    inputs:
+      architectures:
+        description: 'Comma-separated architectures to build (x86_64, aarch64)'
+        required: false
+        type: string
+        default: 'x86_64,aarch64'
+    secrets:
+      APP_ID:
+        required: true
+      APP_PRIVATE_KEY:
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+  packages: read
+  pull-requests: write
+
+jobs:
+  build:
+    name: Build kernel (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    if: "!contains(github.event.head_commit.message, '[skip ci]') && !contains(github.event.head_commit.message, '[ci skip]')"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: kernel-build
+            enabled: ${{ contains(inputs.architectures, 'x86_64') }}
+          - arch: aarch64
+            runner: kernel-build-arm64
+            enabled: ${{ contains(inputs.architectures, 'aarch64') }}
+        exclude:
+          - enabled: false
+
+    steps:
+    - name: Generate GitHub App token
+      id: generate_token
+      uses: actions/create-github-app-token@v1
+      with:
+        app-id: ${{ secrets.APP_ID }}
+        private-key: ${{ secrets.APP_PRIVATE_KEY }}
+        repositories: |
+          kernel-container-build
+
+    - name: Checkout kernel source
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+        path: kernel-src-tree
+
+    - name: Checkout kernel-container-build (test branch)
+      uses: actions/checkout@v4
+      with:
+        repository: ctrliq/kernel-container-build
+        ref: automated-testing-v1
+        path: kernel-container-build
+        token: ${{ steps.generate_token.outputs.token }}
+
+    # Host deps + KVM / FUSE validation
+    - name: Install host dependencies & verify KVM/FUSE
+      run: |
+        set -euxo pipefail
+        sudo apt-get update
+        sudo apt-get install -y fuse3 cpu-checker podman
+        sudo modprobe fuse # guarantee /dev/fuse
+        if ! sudo kvm-ok ; then
+          echo "::warning::KVM acceleration not available on this runner."
+        fi
+        if [ -e /dev/kvm ]; then
+          sudo chmod 0666 /dev/kvm
+        fi
+
+    # Kernel build inside CIQ builder (build only, no test)
+    - name: Build kernel inside CIQ builder container
+      run: |
+        set -euxo pipefail
+        mkdir -p output
+        df -h
+        cat /proc/cpuinfo
+        chmod +x kernel-container-build/build-container/*.sh
+        podman run --rm --pull=always \
+          --privileged \
+          --device=/dev/fuse \
+          $([ -e /dev/kvm ] && echo "--device=/dev/kvm") \
+          -v "$PWD/kernel-src-tree":/src \
+          -v "$PWD/output":/output \
+          -v "$PWD/kernel-container-build/build-container":/usr/local/build-scripts:ro \
+          -v "$PWD/kernel-container-build/container/kernel_build.sh":/usr/libexec/kernel_build.sh:ro \
+          -v "$PWD/kernel-container-build/container/check_kabi.sh":/usr/libexec/check_kabi.sh:ro \
+          --security-opt label=disable \
+          pulp.prod.ciq.dev/ciq/cicd/lts-images/builder \
+          /usr/local/build-scripts/build_kernel.sh 2>&1 | tee output/kernel-build.log
+        sudo dmesg
+
+    # Upload kernel compilation logs
+    - name: Upload kernel compilation logs
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: kernel-compilation-logs-${{ matrix.arch }}
+        path: output/kernel-build.log
+        retention-days: 7
+
+    # Upload qcow2 image for next stages
+    - name: Upload qcow2 image
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: kernel-qcow2-image-${{ matrix.arch }}
+        path: |
+          output/*.qcow2
+          output/last_build_image.txt
+        retention-days: 7
+
+  boot:
+    name: Boot verification (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: kernel-build
+            enabled: ${{ contains(inputs.architectures, 'x86_64') }}
+          - arch: aarch64
+            runner: kernel-build-arm64
+            enabled: ${{ contains(inputs.architectures, 'aarch64') }}
+        exclude:
+          - enabled: false
+
+    steps:
+    - name: Generate GitHub App token
+      id: generate_token
+      uses: actions/create-github-app-token@v1
+      with:
+        app-id: ${{ secrets.APP_ID }}
+        private-key: ${{ secrets.APP_PRIVATE_KEY }}
+        repositories: |
+          kernel-container-build
+
+    - name: Checkout kernel-container-build (test branch)
+      uses: actions/checkout@v4
+      with:
+        repository: ctrliq/kernel-container-build
+        ref: automated-testing-v1
+        path: kernel-container-build
+        token: ${{ steps.generate_token.outputs.token }}
+
+    - name: Install host dependencies
+      run: |
+        set -euxo pipefail
+        sudo apt-get update
+        sudo apt-get install -y fuse3 cpu-checker podman
+        sudo modprobe fuse
+        if [ -e /dev/kvm ]; then
+          sudo chmod 0666 /dev/kvm
+        fi
+
+    - name: Download qcow2 image
+      uses: actions/download-artifact@v4
+      with:
+        name: kernel-qcow2-image-${{ matrix.arch }}
+        path: output
+
+    # Boot verification test
+    - name: Boot kernel and verify
+      run: |
+        set -euxo pipefail
+        chmod +x kernel-container-build/build-container/*.sh
+        podman run --rm --pull=always \
+          --privileged \
+          --device=/dev/fuse \
+          $([ -e /dev/kvm ] && echo "--device=/dev/kvm") \
+          -v "$PWD/output":/output \
+          -v "$PWD/kernel-container-build/build-container":/usr/local/build-scripts:ro \
+          --security-opt label=disable \
+          pulp.prod.ciq.dev/ciq/cicd/lts-images/builder \
+          /usr/local/build-scripts/boot_kernel.sh
+
+    # Upload boot logs
+    - name: Upload boot logs
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: boot-logs-${{ matrix.arch }}
+        path: output/boot-*.log
+        retention-days: 7
+
+  test-kselftest:
+    name: Run kselftests (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    needs: boot
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: kernel-build
+            enabled: ${{ contains(inputs.architectures, 'x86_64') }}
+          - arch: aarch64
+            runner: kernel-build-arm64
+            enabled: ${{ contains(inputs.architectures, 'aarch64') }}
+        exclude:
+          - enabled: false
+
+    steps:
+    - name: Generate GitHub App token
+      id: generate_token
+      uses: actions/create-github-app-token@v1
+      with:
+        app-id: ${{ secrets.APP_ID }}
+        private-key: ${{ secrets.APP_PRIVATE_KEY }}
+        repositories: |
+          kernel-container-build
+
+    - name: Checkout kernel-container-build (test branch)
+      uses: actions/checkout@v4
+      with:
+        repository: ctrliq/kernel-container-build
+        ref: automated-testing-v1
+        path: kernel-container-build
+        token: ${{ steps.generate_token.outputs.token }}
+
+    - name: Install host dependencies
+      run: |
+        set -euxo pipefail
+        sudo apt-get update
+        sudo apt-get install -y fuse3 cpu-checker podman
+        sudo modprobe fuse
+        if [ -e /dev/kvm ]; then
+          sudo chmod 0666 /dev/kvm
+        fi
+
+    - name: Download qcow2 image
+      uses: actions/download-artifact@v4
+      with:
+        name: kernel-qcow2-image-${{ matrix.arch }}
+        path: output
+
+    # Run kselftests
+    - name: Execute kselftests
+      run: |
+        set -euxo pipefail
+        chmod +x kernel-container-build/build-container/*.sh
+        podman run --rm --pull=always \
+          --privileged \
+          --device=/dev/fuse \
+          $([ -e /dev/kvm ] && echo "--device=/dev/kvm") \
+          -v "$PWD/output":/output \
+          -v "$PWD/kernel-container-build/build-container":/usr/local/build-scripts:ro \
+          --security-opt label=disable \
+          pulp.prod.ciq.dev/ciq/cicd/lts-images/builder \
+          /usr/local/build-scripts/test_kselftests.sh
+
+    # Upload kselftest logs
+    - name: Upload kselftest logs
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: kselftest-logs-${{ matrix.arch }}
+        path: |
+          output/kselftests-*.log
+          output/dmesg-*.log
+        retention-days: 7
+
+  compare-results:
+    name: Compare with previous run (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    needs: test-kselftest
+    if: success() || failure()
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: kernel-build
+            enabled: ${{ contains(inputs.architectures, 'x86_64') }}
+          - arch: aarch64
+            runner: kernel-build-arm64
+            enabled: ${{ contains(inputs.architectures, 'aarch64') }}
+        exclude:
+          - enabled: false
+    outputs:
+      base_branch: ${{ steps.base_branch.outputs.base_branch }}
+      comparison_status_x86_64: ${{ steps.comparison.outputs.comparison_status }}
+      comparison_status_aarch64: ${{ steps.comparison.outputs.comparison_status }}
+
+    steps:
+    - name: Checkout kernel source
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Full history needed for reliable merge-base detection
+
+    - name: Download current kselftest logs
+      uses: actions/download-artifact@v4
+      with:
+        name: kselftest-logs-${{ matrix.arch }}
+        path: output-current
+
+    - name: Install GitHub CLI
+      run: |
+        set -euxo pipefail
+        # Install gh CLI if not already available
+        if ! command -v gh &> /dev/null; then
+          sudo apt-get update
+          sudo apt-get install -y gh
+        fi
+
+    - name: Generate GitHub App token for comparison
+      id: generate_token_compare
+      uses: actions/create-github-app-token@v1
+      with:
+        app-id: ${{ secrets.APP_ID }}
+        private-key: ${{ secrets.APP_PRIVATE_KEY }}
+        repositories: |
+          kernel-src-tree
+          kernel-container-build
+
+    - name: Determine base branch for comparison
+      id: base_branch
+      env:
+        GH_TOKEN: ${{ steps.generate_token_compare.outputs.token }}
+      run: |
+        BASE_BRANCH=""
+        BRANCH_NAME="${{ github.ref_name }}"
+
+        # Define whitelist of valid base branches
+        # TODO: Use a centralized place to get the base branches
+        VALID_BASES="ciqlts9_2 ciqlts9_4 ciqlts8_6"
+
+        echo "Current branch: $BRANCH_NAME"
+
+        # First, check if an open PR already exists from this head branch
+        echo "Checking for existing open PR from branch: $BRANCH_NAME"
+        EXISTING_PR=$(gh pr list --head "$BRANCH_NAME" --state open --json number,baseRefName --jq '.[0]' || echo "")
+
+        if [ -n "$EXISTING_PR" ] && [ "$EXISTING_PR" != "null" ]; then
+          # PR exists - use its existing base branch
+          BASE_BRANCH=$(echo "$EXISTING_PR" | jq -r '.baseRefName')
+          PR_NUMBER=$(echo "$EXISTING_PR" | jq -r '.number')
+          echo "Found existing PR #$PR_NUMBER, using existing base: $BASE_BRANCH"
+        elif [ -n "${{ github.base_ref }}" ]; then
+          # For PRs, use the base branch directly
+          BASE_BRANCH="${{ github.base_ref }}"
+          echo "Using PR base branch: $BASE_BRANCH"
+        else
+          # Extract base branch from branch name pattern: {name}_base or {name}-base
+          # Match patterns like {shreeya}_ciqlts9_2 or {shreeya}-ciqlts9_2
+          if [[ "$BRANCH_NAME" =~ \{[^}]+\}[_-](.+) ]]; then
+            EXTRACTED_BASE="${BASH_REMATCH[1]}"
+            echo "Extracted base branch from branch name: $EXTRACTED_BASE"
+
+            # Validate against whitelist
+            if echo "$VALID_BASES" | grep -wq "$EXTRACTED_BASE"; then
+              BASE_BRANCH="$EXTRACTED_BASE"
+              echo "Base branch validated: $BASE_BRANCH"
+            else
+              echo "::error::Extracted base '$EXTRACTED_BASE' is not in whitelist: $VALID_BASES"
+              echo "::error::Valid base branches are: $VALID_BASES"
+              exit 1
+            fi
+          else
+            echo "::error::Branch name does not match expected pattern {name}_base or {name}-base"
+            echo "::error::Branch name must be in format {name}_base or {name}-base where base is one of: $VALID_BASES"
+            exit 1
+          fi
+        fi
+
+        if [ -z "$BASE_BRANCH" ]; then
+          echo "::error::Could not determine base branch"
+          exit 1
+        fi
+
+        echo "base_branch=$BASE_BRANCH" >> $GITHUB_OUTPUT
+        echo "Base branch for comparison: $BASE_BRANCH"
+
+    - name: Download baseline kselftest logs from last successful run targeting same base
+      if: steps.base_branch.outputs.base_branch != ''
+      env:
+        GH_TOKEN: ${{ steps.generate_token_compare.outputs.token }}
+      run: |
+        set +e  # Don't exit on error, we handle it with continue-on-error
+        BASE_BRANCH="${{ steps.base_branch.outputs.base_branch }}"
+        CURRENT_RUN_ID="${{ github.run_id }}"
+
+        echo "Searching for baseline from last successful run targeting base branch: $BASE_BRANCH"
+        echo "Current run ID: $CURRENT_RUN_ID (will be excluded from search)"
+
+        # Get last 50 successful workflow runs (cast a wider net to find PRs targeting this base)
+        # We need to check each run to see if it targets the same base branch
+        SUCCESSFUL_RUNS=$(gh run list \
+          --workflow kernel-build-and-test-multiarch.yml \
+          --status success \
+          --limit 50 \
+          --json databaseId,headBranch,createdAt)
+
+        if [ -z "$SUCCESSFUL_RUNS" ] || [ "$SUCCESSFUL_RUNS" = "[]" ]; then
+          echo "::warning::No successful workflow runs found"
+          exit 0
+        fi
+
+        # Parse runs and check each one's base branch by examining branch name pattern
+        while read -r run; do
+          RUN_ID=$(echo "$run" | jq -r '.databaseId')
+          HEAD_BRANCH=$(echo "$run" | jq -r '.headBranch')
+          CREATED_AT=$(echo "$run" | jq -r '.createdAt')
+
+          # Skip current run
+          if [ "$RUN_ID" = "$CURRENT_RUN_ID" ]; then
+            continue
+          fi
+
+          # Extract base from branch name pattern {name}_base or {name}-base
+          EXTRACTED_BASE=""
+          if [[ "$HEAD_BRANCH" =~ \{[^}]+\}[_-](.+) ]]; then
+            EXTRACTED_BASE="${BASH_REMATCH[1]}"
+          fi
+
+          # Check if this run targets the same base branch
+          if [ "$EXTRACTED_BASE" = "$BASE_BRANCH" ]; then
+            echo "Found candidate run $RUN_ID from branch $HEAD_BRANCH (targets: $BASE_BRANCH)"
+
+            # Try to download artifact from this run
+            if gh run download "$RUN_ID" --name kselftest-logs-${{ matrix.arch }} --dir output-previous 2>/dev/null; then
+              echo "Successfully downloaded baseline from run $RUN_ID (branch: $HEAD_BRANCH, created: $CREATED_AT)"
+              echo "BASELINE_RUN_ID=$RUN_ID" >> $GITHUB_ENV
+              echo "BASELINE_BRANCH=$HEAD_BRANCH" >> $GITHUB_ENV
+              exit 0
+            else
+              echo "Run $RUN_ID has no kselftest artifacts or they expired"
+            fi
+          fi
+        done < <(echo "$SUCCESSFUL_RUNS" | jq -c '.[]')
+
+        echo "::warning::No baseline test results found in recent successful runs targeting $BASE_BRANCH"
+        echo "::notice::This may be the first run targeting this base branch, or artifacts have expired (7-day retention)"
+      continue-on-error: true
+      timeout-minutes: 3
+
+    - name: Compare test results
+      id: comparison
+      run: |
+        # Check if we have a base branch to compare against
+        if [ -z "${{ steps.base_branch.outputs.base_branch }}" ]; then
+          echo "::warning::No base branch found for comparison"
+          echo "::warning::Kselftest comparison will be skipped"
+          echo "comparison_status=skipped" >> $GITHUB_OUTPUT
+          echo "comparison_message=No base branch found - unable to determine merge target" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        # Check if baseline logs exist
+        if ls output-previous/kselftests-*.log 1> /dev/null 2>&1; then
+          # Get baseline source info
+          BASELINE_SOURCE="${BASELINE_BRANCH:-last successful run}"
+
+          # Compare passing tests (ok)
+          BEFORE_PASS=$(grep -a '^ok' output-previous/kselftests-*.log | wc -l || echo "0")
+          AFTER_PASS=$(grep -a '^ok' output-current/kselftests-*.log | wc -l || echo "0")
+
+          # Compare failing tests (not ok)
+          BEFORE_FAIL=$(grep -a '^not ok' output-previous/kselftests-*.log | wc -l || echo "0")
+          AFTER_FAIL=$(grep -a '^not ok' output-current/kselftests-*.log | wc -l || echo "0")
+
+          echo "### Kselftest Comparison (${{ matrix.arch }})"
+          echo "Baseline (from $BASELINE_SOURCE targeting ${{ steps.base_branch.outputs.base_branch }}): $BEFORE_PASS passing, $BEFORE_FAIL failing"
+          echo "Current (${{ github.ref_name }}): $AFTER_PASS passing, $AFTER_FAIL failing"
+
+          # Calculate differences
+          PASS_DIFF=$((AFTER_PASS - BEFORE_PASS))
+          FAIL_DIFF=$((AFTER_FAIL - BEFORE_FAIL))
+
+          echo "Pass difference: $PASS_DIFF"
+          echo "Fail difference: $FAIL_DIFF"
+
+          # Check for regression (more than 3 tests difference)
+          REGRESSION=0
+
+          if [ $PASS_DIFF -lt -3 ]; then
+            echo "::error::Regression detected: $PASS_DIFF passing tests (threshold: -3)"
+            REGRESSION=1
+          fi
+
+          if [ $FAIL_DIFF -gt 3 ]; then
+            echo "::error::Regression detected: +$FAIL_DIFF failing tests (threshold: +3)"
+            REGRESSION=1
+          fi
+
+          if [ $REGRESSION -eq 1 ]; then
+            echo "::error::Test regression exceeds acceptable threshold of 3 tests"
+            echo "comparison_status=failed" >> $GITHUB_OUTPUT
+            echo "comparison_message=Regression detected: Pass diff: $PASS_DIFF, Fail diff: $FAIL_DIFF (threshold: ±3)" >> $GITHUB_OUTPUT
+            exit 1
+          else
+            echo "::notice::Test results within acceptable range (threshold: ±3 tests)"
+            echo "comparison_status=passed" >> $GITHUB_OUTPUT
+            echo "comparison_message=Baseline: $BEFORE_PASS passing, $BEFORE_FAIL failing | Current: $AFTER_PASS passing, $AFTER_FAIL failing" >> $GITHUB_OUTPUT
+          fi
+        else
+          echo "::warning::No baseline test results found for branch ${{ steps.base_branch.outputs.base_branch }}"
+          echo "::notice::Cannot compare against base branch - artifacts may not exist or have expired (7-day retention)"
+          echo "::notice::Skipping comparison - PR will still be created with warning"
+          echo "comparison_status=skipped" >> $GITHUB_OUTPUT
+          echo "comparison_message=No baseline results available from ${{ steps.base_branch.outputs.base_branch }}" >> $GITHUB_OUTPUT
+        fi
+
+  create-pr:
+    name: Create Pull Request
+    runs-on: kernel-build
+    needs: [build, boot, test-kselftest, compare-results]
+    if: success() || failure()
+
+    steps:
+    - name: Check if branch name contains curly brackets
+      run: |
+        BRANCH_NAME="${{ github.ref_name }}"
+        if [[ ! "$BRANCH_NAME" =~ \{ ]] || [[ ! "$BRANCH_NAME" =~ \} ]]; then
+          echo "Branch name '$BRANCH_NAME' does not contain curly brackets, skipping PR creation"
+          exit 1
+        fi
+        echo "Branch name contains curly brackets, proceeding with PR creation checks"
+
+    - name: Check if tests passed and no regressions
+      run: |
+        # Skip PR if any test stage failed
+        if [ "${{ needs.build.result }}" != "success" ] || \
+           [ "${{ needs.boot.result }}" != "success" ] || \
+           [ "${{ needs.test-kselftest.result }}" != "success" ]; then
+          echo "One or more test stages failed, skipping PR creation"
+          exit 1
+        fi
+
+        # Determine which architectures are enabled
+        ARCHS="${{ inputs.architectures }}"
+        REGRESSION_DETECTED=false
+
+        # Check x86_64 regression if enabled
+        if echo "$ARCHS" | grep -q "x86_64"; then
+          if [ "${{ needs.compare-results.outputs.comparison_status_x86_64 }}" = "failed" ]; then
+            echo "x86_64: Test regression detected"
+            REGRESSION_DETECTED=true
+          fi
+        fi
+
+        # Check aarch64 regression if enabled
+        if echo "$ARCHS" | grep -q "aarch64"; then
+          if [ "${{ needs.compare-results.outputs.comparison_status_aarch64 }}" = "failed" ]; then
+            echo "aarch64: Test regression detected"
+            REGRESSION_DETECTED=true
+          fi
+        fi
+
+        # Skip PR if any regression was detected (but allow if comparison was skipped/unavailable)
+        if [ "$REGRESSION_DETECTED" = "true" ]; then
+          echo "Test regression detected, skipping PR creation"
+          exit 1
+        fi
+
+        echo "All test stages passed and no regressions detected, proceeding with PR creation"
+
+    - name: Checkout kernel source
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 100  # Fetch more history for commit counting
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Fetch base branch for commit comparison
+      run: |
+        BASE_BRANCH="${{ needs.compare-results.outputs.base_branch }}"
+        if [ -n "$BASE_BRANCH" ]; then
+          # Fetch base branch with enough history to find common ancestor
+          git fetch --depth=200 origin "$BASE_BRANCH:refs/remotes/origin/$BASE_BRANCH" || true
+          echo "Fetched base branch: $BASE_BRANCH"
+        fi
+
+    - name: Detect available architectures
+      id: detect_arch
+      run: |
+        ARCHS="${{ inputs.architectures }}"
+        HAS_X86_64=false
+        HAS_AARCH64=false
+
+        if echo "$ARCHS" | grep -q "x86_64"; then
+          HAS_X86_64=true
+        fi
+
+        if echo "$ARCHS" | grep -q "aarch64"; then
+          HAS_AARCH64=true
+        fi
+
+        echo "has_x86_64=$HAS_X86_64" >> $GITHUB_OUTPUT
+        echo "has_aarch64=$HAS_AARCH64" >> $GITHUB_OUTPUT
+        echo "Architectures enabled: x86_64=$HAS_X86_64, aarch64=$HAS_AARCH64"
+
+    - name: Download kernel compilation logs (x86_64)
+      if: steps.detect_arch.outputs.has_x86_64 == 'true'
+      uses: actions/download-artifact@v4
+      with:
+        name: kernel-compilation-logs-x86_64
+        path: artifacts/build/x86_64
+
+    - name: Download kernel compilation logs (aarch64)
+      if: steps.detect_arch.outputs.has_aarch64 == 'true'
+      uses: actions/download-artifact@v4
+      with:
+        name: kernel-compilation-logs-aarch64
+        path: artifacts/build/aarch64
+
+    - name: Download boot logs (x86_64)
+      if: steps.detect_arch.outputs.has_x86_64 == 'true'
+      uses: actions/download-artifact@v4
+      with:
+        name: boot-logs-x86_64
+        path: artifacts/boot/x86_64
+
+    - name: Download boot logs (aarch64)
+      if: steps.detect_arch.outputs.has_aarch64 == 'true'
+      uses: actions/download-artifact@v4
+      with:
+        name: boot-logs-aarch64
+        path: artifacts/boot/aarch64
+
+    - name: Download kselftest logs (x86_64)
+      if: steps.detect_arch.outputs.has_x86_64 == 'true'
+      uses: actions/download-artifact@v4
+      with:
+        name: kselftest-logs-x86_64
+        path: artifacts/test/x86_64
+
+    - name: Download kselftest logs (aarch64)
+      if: steps.detect_arch.outputs.has_aarch64 == 'true'
+      uses: actions/download-artifact@v4
+      with:
+        name: kselftest-logs-aarch64
+        path: artifacts/test/aarch64
+
+    - name: Extract test statistics
+      id: stats
+      run: |
+        HAS_X86="${{ steps.detect_arch.outputs.has_x86_64 }}"
+        HAS_ARM="${{ steps.detect_arch.outputs.has_aarch64 }}"
+
+        # x86_64 stats
+        if [ "$HAS_X86" = "true" ]; then
+          PASSED_X86=$(grep -a '^ok' artifacts/test/x86_64/kselftests-*.log | wc -l || echo "0")
+          FAILED_X86=$(grep -a '^not ok' artifacts/test/x86_64/kselftests-*.log | wc -l || echo "0")
+        else
+          PASSED_X86="0"
+          FAILED_X86="0"
+        fi
+        echo "passed_x86_64=$PASSED_X86" >> $GITHUB_OUTPUT
+        echo "failed_x86_64=$FAILED_X86" >> $GITHUB_OUTPUT
+
+        # aarch64 stats
+        if [ "$HAS_ARM" = "true" ]; then
+          PASSED_ARM=$(grep -a '^ok' artifacts/test/aarch64/kselftests-*.log | wc -l || echo "0")
+          FAILED_ARM=$(grep -a '^not ok' artifacts/test/aarch64/kselftests-*.log | wc -l || echo "0")
+        else
+          PASSED_ARM="0"
+          FAILED_ARM="0"
+        fi
+        echo "passed_aarch64=$PASSED_ARM" >> $GITHUB_OUTPUT
+        echo "failed_aarch64=$FAILED_ARM" >> $GITHUB_OUTPUT
+
+    - name: Extract build timers
+      id: build_info
+      run: |
+        HAS_X86="${{ steps.detect_arch.outputs.has_x86_64 }}"
+        HAS_ARM="${{ steps.detect_arch.outputs.has_aarch64 }}"
+
+        # x86_64 build times
+        if [ "$HAS_X86" = "true" ]; then
+          BUILD_TIME_X86=$(grep -oP '\[TIMER\]\{BUILD\}:\s*\K[0-9]+' artifacts/build/x86_64/kernel-build.log | head -1 || echo "N/A")
+          TOTAL_TIME_X86=$(grep -oP '\[TIMER\]\{TOTAL\}\s*\K[0-9]+' artifacts/build/x86_64/kernel-build.log | head -1 || echo "N/A")
+        else
+          BUILD_TIME_X86="N/A"
+          TOTAL_TIME_X86="N/A"
+        fi
+        echo "build_time_x86_64=${BUILD_TIME_X86}s" >> $GITHUB_OUTPUT
+        echo "total_time_x86_64=${TOTAL_TIME_X86}s" >> $GITHUB_OUTPUT
+
+        # aarch64 build times
+        if [ "$HAS_ARM" = "true" ]; then
+          BUILD_TIME_ARM=$(grep -oP '\[TIMER\]\{BUILD\}:\s*\K[0-9]+' artifacts/build/aarch64/kernel-build.log | head -1 || echo "N/A")
+          TOTAL_TIME_ARM=$(grep -oP '\[TIMER\]\{TOTAL\}\s*\K[0-9]+' artifacts/build/aarch64/kernel-build.log | head -1 || echo "N/A")
+        else
+          BUILD_TIME_ARM="N/A"
+          TOTAL_TIME_ARM="N/A"
+        fi
+        echo "build_time_aarch64=${BUILD_TIME_ARM}s" >> $GITHUB_OUTPUT
+        echo "total_time_aarch64=${TOTAL_TIME_ARM}s" >> $GITHUB_OUTPUT
+
+    - name: Get commit information
+      id: commit_msg
+      run: |
+        # Use the base branch determined by compare-results stage
+        BASE_BRANCH="${{ needs.compare-results.outputs.base_branch }}"
+
+        if [ -z "$BASE_BRANCH" ]; then
+          echo "::error::Base branch not determined by compare-results stage"
+          exit 1
+        fi
+
+        if ! git rev-parse origin/$BASE_BRANCH >/dev/null 2>&1; then
+          echo "::error::Base branch origin/$BASE_BRANCH does not exist"
+          exit 1
+        fi
+
+        COMMIT_COUNT=$(git rev-list --count origin/$BASE_BRANCH..HEAD 2>/dev/null || echo "1")
+
+        if [ "$COMMIT_COUNT" -eq "1" ]; then
+          # Single commit: use commit subject
+          git log -1 --pretty=%s > /tmp/commit_subject.txt
+          COMMIT_SUBJECT=$(cat /tmp/commit_subject.txt)
+          echo "commit_subject=$COMMIT_SUBJECT" >> $GITHUB_OUTPUT
+        else
+          # Multiple commits: create summary
+          echo "commit_subject=Multiple patches tested ($COMMIT_COUNT commits)" >> $GITHUB_OUTPUT
+        fi
+
+        # Get all commit messages and save to file (in reverse order)
+        for commit in $(git log origin/$BASE_BRANCH..HEAD --format=%h | tac); do
+          git log -1 $commit --format=%B | awk 'BEGIN{print "```"} /^$/{empty++} empty==2{exit} {print} END{print "```"}' >> /tmp/commit_message.txt
+        done
+
+    - name: Fetch PR body script from shreeya_kernelci_main
+      run: |
+        git fetch origin shreeya_kernelci_main:shreeya_kernelci_main
+        git checkout origin/shreeya_kernelci_main -- .github/scripts/create-pr-body.sh
+        chmod +x .github/scripts/create-pr-body.sh
+
+    - name: Generate GitHub App token
+      id: generate_token
+      uses: actions/create-github-app-token@v1
+      with:
+        app-id: ${{ secrets.APP_ID }}
+        private-key: ${{ secrets.APP_PRIVATE_KEY }}
+        repositories: |
+          kernel-src-tree
+          kernel-container-build
+
+    - name: Create Pull Request
+      env:
+        GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+      run: |
+        # Reuse base branch from compare-results stage (already computed)
+        BASE_BRANCH="${{ needs.compare-results.outputs.base_branch }}"
+
+        if [ -z "$BASE_BRANCH" ]; then
+          echo "ERROR: Could not determine base branch for PR (compare-results did not find one)"
+          exit 1
+        fi
+
+        echo "Creating/updating PR from ${{ github.ref_name }} to $BASE_BRANCH"
+
+        # Determine which architectures are enabled
+        HAS_X86="${{ steps.detect_arch.outputs.has_x86_64 }}"
+        HAS_ARM="${{ steps.detect_arch.outputs.has_aarch64 }}"
+
+        # Determine comparison status message
+        COMPARISON_STATUS_X86="${{ needs.compare-results.outputs.comparison_status_x86_64 }}"
+        COMPARISON_STATUS_ARM="${{ needs.compare-results.outputs.comparison_status_aarch64 }}"
+
+        # Create comparison section - always use same format, include only enabled architectures
+        COMPARISON_SECTION="### Test Comparison"
+
+        # Add x86_64 section if enabled
+        if [ "$HAS_X86" = "true" ]; then
+          COMPARISON_SECTION="$COMPARISON_SECTION
+
+        **x86_64:**"
+          if [ "$COMPARISON_STATUS_X86" = "passed" ]; then
+            COMPARISON_SECTION="$COMPARISON_SECTION
+        - ✅ Status: Passed - Within acceptable threshold (±3 tests)
+        - Compared against: $BASE_BRANCH"
+          elif [ "$COMPARISON_STATUS_X86" = "skipped" ]; then
+            COMPARISON_SECTION="$COMPARISON_SECTION
+        - ⚠️ Status: Skipped - No baseline available"
+          else
+            COMPARISON_SECTION="$COMPARISON_SECTION
+        - ❌ Status: Failed - Regression detected"
+          fi
+        fi
+
+        # Add aarch64 section if enabled
+        if [ "$HAS_ARM" = "true" ]; then
+          COMPARISON_SECTION="$COMPARISON_SECTION
+
+        **aarch64:**"
+          if [ "$COMPARISON_STATUS_ARM" = "passed" ]; then
+            COMPARISON_SECTION="$COMPARISON_SECTION
+        - ✅ Status: Passed - Within acceptable threshold (±3 tests)
+        - Compared against: $BASE_BRANCH"
+          elif [ "$COMPARISON_STATUS_ARM" = "skipped" ]; then
+            COMPARISON_SECTION="$COMPARISON_SECTION
+        - ⚠️ Status: Skipped - No baseline available"
+          else
+            COMPARISON_SECTION="$COMPARISON_SECTION
+        - ❌ Status: Failed - Regression detected"
+          fi
+        fi
+
+        # Determine architecture parameter and which stats to use
+        if [ "$HAS_X86" = "true" ] && [ "$HAS_ARM" = "true" ]; then
+          ARCH_PARAM="x86_64,aarch64"
+          BUILD_TIME_PARAM="${{ steps.build_info.outputs.build_time_x86_64 }}"
+          TOTAL_TIME_PARAM="${{ steps.build_info.outputs.total_time_x86_64 }}"
+          PASSED_PARAM="${{ steps.stats.outputs.passed_x86_64 }}"
+          FAILED_PARAM="${{ steps.stats.outputs.failed_x86_64 }}"
+          # Add aarch64 parameters for multi-arch
+          EXTRA_PARAMS="${{ steps.build_info.outputs.build_time_aarch64 }} ${{ steps.build_info.outputs.total_time_aarch64 }} ${{ steps.stats.outputs.passed_aarch64 }} ${{ steps.stats.outputs.failed_aarch64 }}"
+        elif [ "$HAS_X86" = "true" ]; then
+          ARCH_PARAM="x86_64"
+          BUILD_TIME_PARAM="${{ steps.build_info.outputs.build_time_x86_64 }}"
+          TOTAL_TIME_PARAM="${{ steps.build_info.outputs.total_time_x86_64 }}"
+          PASSED_PARAM="${{ steps.stats.outputs.passed_x86_64 }}"
+          FAILED_PARAM="${{ steps.stats.outputs.failed_x86_64 }}"
+          EXTRA_PARAMS=""
+        else
+          ARCH_PARAM="aarch64"
+          BUILD_TIME_PARAM="${{ steps.build_info.outputs.build_time_aarch64 }}"
+          TOTAL_TIME_PARAM="${{ steps.build_info.outputs.total_time_aarch64 }}"
+          PASSED_PARAM="${{ steps.stats.outputs.passed_aarch64 }}"
+          FAILED_PARAM="${{ steps.stats.outputs.failed_aarch64 }}"
+          EXTRA_PARAMS=""
+        fi
+
+        # Call script with appropriate parameters
+        .github/scripts/create-pr-body.sh \
+          "$ARCH_PARAM" \
+          "$BUILD_TIME_PARAM" \
+          "$TOTAL_TIME_PARAM" \
+          "$PASSED_PARAM" \
+          "$FAILED_PARAM" \
+          "${{ github.run_id }}" \
+          "$COMPARISON_SECTION" \
+          "${{ github.repository }}" \
+          "/tmp/commit_message.txt" \
+          $EXTRA_PARAMS \
+          > pr_body.md
+
+        # Check if any open PR already exists from this head branch (regardless of base)
+        EXISTING_PR=$(gh pr list --head "${{ github.ref_name }}" --state open --json number,baseRefName --jq '.[0]' || echo "")
+
+        if [ -n "$EXISTING_PR" ] && [ "$EXISTING_PR" != "null" ]; then
+          PR_NUMBER=$(echo "$EXISTING_PR" | jq -r '.number')
+          CURRENT_BASE=$(echo "$EXISTING_PR" | jq -r '.baseRefName')
+
+          echo "Found existing PR #$PR_NUMBER (current base: $CURRENT_BASE)"
+
+          # Update PR title and body
+          gh pr edit "$PR_NUMBER" \
+            --title "[$BASE_BRANCH] ${{ steps.commit_msg.outputs.commit_subject }}" \
+            --body-file pr_body.md
+
+          echo "Updated PR #$PR_NUMBER"
+
+          # Note: We don't change the base branch even if it differs from $BASE_BRANCH
+          # because compare-results already used the existing PR's base for comparison
+          if [ "$CURRENT_BASE" != "$BASE_BRANCH" ]; then
+            echo "::notice::PR base remains $CURRENT_BASE (comparison was done against this base)"
+          fi
+        else
+          echo "Creating new PR from ${{ github.ref_name }} to $BASE_BRANCH"
+          gh pr create \
+            --base "$BASE_BRANCH" \
+            --head "${{ github.ref_name }}" \
+            --title "[$BASE_BRANCH] ${{ steps.commit_msg.outputs.commit_subject }}" \
+            --body-file pr_body.md
+        fi
