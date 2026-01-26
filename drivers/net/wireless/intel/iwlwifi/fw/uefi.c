@@ -727,6 +727,8 @@ int iwl_uefi_get_dsm(struct iwl_fw_runtime *fwrt, enum iwl_dsm_funcs func,
 	struct uefi_cnv_var_general_cfg *data;
 	int ret = -EINVAL;
 
+	BUILD_BUG_ON(ARRAY_SIZE(data->functions) < DSM_FUNC_NUM_FUNCS);
+
 	/* Not supported function index */
 	if (func >= DSM_FUNC_NUM_FUNCS || func == 5)
 		return -EOPNOTSUPP;
