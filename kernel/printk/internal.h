@@ -58,16 +58,6 @@ enum printk_info_flags {
 
 extern struct printk_ringbuffer *prb;
 extern bool printk_threads_enabled;
-extern bool have_legacy_console;
-extern bool have_boot_console;
-
-/*
- * Specifies if the console lock/unlock dance is needed for console
- * printing. If @have_boot_console is true, the nbcon consoles will
- * be printed serially along with the legacy consoles because nbcon
- * consoles cannot print simultaneously with boot consoles.
- */
-#define printing_via_unlock (have_legacy_console || have_boot_console)
 
 __printf(4, 0)
 int vprintk_store(int facility, int level,
@@ -177,7 +167,6 @@ static inline void nbcon_kthread_wake(struct console *con)
 static inline void nbcon_kthread_wake(struct console *con) { }
 static inline void nbcon_kthread_create(struct console *con) { }
 #define printk_threads_enabled (false)
-#define printing_via_unlock (false)
 
 /*
  * In !PRINTK builds we still export console_sem
@@ -203,6 +192,110 @@ static inline bool console_is_usable(struct console *con, short flags,
 				     bool use_atomic) { return false; }
 
 #endif /* CONFIG_PRINTK */
+
+extern bool have_boot_console;
+extern bool have_nbcon_console;
+extern bool have_legacy_console;
+extern bool legacy_allow_panic_sync;
+
+/**
+ * struct console_flush_type - Define available console flush methods
+ * @nbcon_atomic:	Flush directly using nbcon_atomic() callback
+ * @nbcon_offload:	Offload flush to printer thread
+ * @legacy_direct:	Call the legacy loop in this context
+ * @legacy_offload:	Offload the legacy loop into IRQ
+ *
+ * Note that the legacy loop also flushes the nbcon consoles.
+ */
+struct console_flush_type {
+	bool	nbcon_atomic;
+	bool	nbcon_offload;
+	bool	legacy_direct;
+	bool	legacy_offload;
+};
+
+/*
+ * Identify which console flushing methods should be used in the context of
+ * the caller.
+ */
+static inline void printk_get_console_flush_type(struct console_flush_type *ft)
+{
+	memset(ft, 0, sizeof(*ft));
+
+	switch (nbcon_get_default_prio()) {
+	case NBCON_PRIO_NORMAL:
+		if (have_nbcon_console && !have_boot_console) {
+			if (printk_threads_enabled)
+				ft->nbcon_offload = true;
+			else
+				ft->nbcon_atomic = true;
+
+			/*
+			 * nbcon atomic printing should happen during shutdown,
+			 * since the printing threads may not get a chance to
+			 * print the final messages, see printk_kthread_shutdown()
+			 */
+			if (ft->nbcon_offload && system_state > SYSTEM_RUNNING) {
+				ft->nbcon_atomic = true;
+				ft->nbcon_offload = false;
+			}
+		}
+
+		/* Legacy consoles are flushed directly when possible. */
+		if (have_legacy_console || have_boot_console) {
+			if (!is_printk_legacy_deferred())
+				ft->legacy_direct = true;
+			else
+				ft->legacy_offload = true;
+		}
+		break;
+	case NBCON_PRIO_EMERGENCY:
+		if (have_nbcon_console && !have_boot_console)
+			ft->nbcon_atomic = true;
+
+		/* Legacy consoles are flushed directly when possible. */
+		if (have_legacy_console || have_boot_console) {
+			if (!is_printk_legacy_deferred())
+				ft->legacy_direct = true;
+			else
+				ft->legacy_offload = true;
+		}
+		break;
+
+	case NBCON_PRIO_PANIC:
+		/*
+		 * In panic, the nbcon consoles will directly print. But
+		 * only allowed if there are no boot consoles.
+		 */
+		if (have_nbcon_console && !have_boot_console)
+			ft->nbcon_atomic = true;
+
+		if (have_legacy_console || have_boot_console) {
+			/*
+			 * This is the same decision as NBCON_PRIO_NORMAL
+			 * except that offloading never occurs in panic.
+			 *
+			 * Note that console_flush_on_panic() will flush
+			 * legacy consoles anyway, even if unsafe.
+			 */
+			if (!is_printk_legacy_deferred())
+				ft->legacy_direct = true;
+
+			/*
+			 * In panic, if nbcon atomic printing occurs,
+			 * the legacy consoles must remain silent until
+			 * explicitly allowed.
+			 */
+			if (ft->nbcon_atomic && !legacy_allow_panic_sync)
+				ft->legacy_direct = false;
+		}
+		break;
+
+	default:
+		WARN_ON_ONCE(1);
+		break;
+	}
+}
 
 extern struct printk_buffers printk_shared_pbufs;
 
