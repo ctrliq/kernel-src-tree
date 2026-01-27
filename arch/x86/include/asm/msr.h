@@ -268,7 +268,7 @@ static inline void wrmsr(u32 msr, u32 low, u32 high)
 	native_write_msr(msr, low, high);
 }
 
-#define rdmsrl(msr, val)			\
+#define rdmsrq(msr, val)			\
 	((val) = native_read_msr((msr)))
 
 static inline void wrmsrl(u32 msr, u64 val)
@@ -329,6 +329,9 @@ void msrs_free(struct msr *msrs);
 int msr_set_bit(u32 msr, u8 bit);
 int msr_clear_bit(u32 msr, u8 bit);
 
+/* temporary #defines for RHEL */
+#define rdmsrl(msr, val) rdmsrq(msr, val)
+
 #ifdef CONFIG_SMP
 int rdmsr_on_cpu(unsigned int cpu, u32 msr_no, u32 *l, u32 *h);
 int wrmsr_on_cpu(unsigned int cpu, u32 msr_no, u32 l, u32 h);
@@ -355,7 +358,7 @@ static inline int wrmsr_on_cpu(unsigned int cpu, u32 msr_no, u32 l, u32 h)
 }
 static inline int rdmsrl_on_cpu(unsigned int cpu, u32 msr_no, u64 *q)
 {
-	rdmsrl(msr_no, *q);
+	rdmsrq(msr_no, *q);
 	return 0;
 }
 static inline int wrmsrl_on_cpu(unsigned int cpu, u32 msr_no, u64 q)
