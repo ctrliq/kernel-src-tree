@@ -32,6 +32,12 @@ struct sfp_bus {
 	bool started;
 };
 
+const struct sfp_module_caps *sfp_get_module_caps(struct sfp_bus *bus)
+{
+	return &bus->caps;
+}
+EXPORT_SYMBOL_GPL(sfp_get_module_caps);
+
 /**
  * sfp_parse_port() - Parse the EEPROM base ID, setting the port type
  * @bus: a pointer to the &struct sfp_bus structure for the sfp module
