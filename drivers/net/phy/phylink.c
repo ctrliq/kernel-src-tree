@@ -714,6 +714,9 @@ static int phylink_parse_fixedlink(struct phylink *pl,
 			return -EINVAL;
 		}
 
+		phylink_warn(pl, "%pfw uses deprecated array-style fixed-link binding!\n",
+			     fwnode);
+
 		ret = fwnode_property_read_u32_array(fwnode, "fixed-link",
 						     prop, ARRAY_SIZE(prop));
 		if (!ret) {
