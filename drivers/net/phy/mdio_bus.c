@@ -372,7 +372,7 @@ EXPORT_SYMBOL_GPL(mdio_bus_class);
  * mdio_find_bus - Given the name of a mdiobus, find the mii_bus.
  * @mdio_name: The name of a mdiobus.
  *
- * Returns a reference to the mii_bus, or NULL if none found.  The
+ * Return: a reference to the mii_bus, or NULL if none found. The
  * embedded struct device will have its reference count incremented,
  * and this must be put_deviced'ed once the bus is finished with.
  */
@@ -390,7 +390,7 @@ EXPORT_SYMBOL(mdio_find_bus);
  * of_mdio_find_bus - Given an mii_bus node, find the mii_bus.
  * @mdio_bus_np: Pointer to the mii_bus.
  *
- * Returns a reference to the mii_bus, or NULL if none found.  The
+ * Return: a reference to the mii_bus, or NULL if none found. The
  * embedded struct device will have its reference count incremented,
  * and this must be put once the bus is finished with.
  *
@@ -438,6 +438,8 @@ out:
  * @addr: the phy address
  * @regnum: register number to read
  *
+ * Return: The register value if successful, negative error code on failure
+ *
  * Read a MDIO bus register. Caller must hold the mdio bus lock.
  *
  * NOTE: MUST NOT be called from interrupt context.
@@ -469,6 +471,8 @@ EXPORT_SYMBOL(__mdiobus_read);
  * @addr: the phy address
  * @regnum: register number to write
  * @val: value to write to @regnum
+ *
+ * Return: Zero if successful, negative error code on failure
  *
  * Write a MDIO bus register. Caller must hold the mdio bus lock.
  *
@@ -503,8 +507,11 @@ EXPORT_SYMBOL(__mdiobus_write);
  * @mask: bit mask of bits to clear
  * @set: bit mask of bits to set
  *
+ * Return: 1 if the register was modified, 0 if no change was needed,
+ *	   negative on any error condition
+ *
  * Read, modify, and if any change, write the register value back to the
- * device. Any error returns a negative number.
+ * device.
  *
  * NOTE: MUST NOT be called from interrupt context.
  */
@@ -533,6 +540,8 @@ EXPORT_SYMBOL_GPL(__mdiobus_modify_changed);
  * @addr: the phy address
  * @devad: device address to read
  * @regnum: register number to read
+ *
+ * Return: The register value if successful, negative error code on failure
  *
  * Read a MDIO bus register. Caller must hold the mdio bus lock.
  *
@@ -566,6 +575,8 @@ EXPORT_SYMBOL(__mdiobus_c45_read);
  * @devad: device address to read
  * @regnum: register number to write
  * @val: value to write to @regnum
+ *
+ * Return: Zero if successful, negative error code on failure
  *
  * Write a MDIO bus register. Caller must hold the mdio bus lock.
  *
@@ -602,6 +613,9 @@ EXPORT_SYMBOL(__mdiobus_c45_write);
  * @mask: bit mask of bits to clear
  * @set: bit mask of bits to set
  *
+ * Return: 1 if the register was modified, 0 if no change was needed,
+ *	   negative on any error condition
+ *
  * Read, modify, and if any change, write the register value back to the
  * device. Any error returns a negative number.
  *
@@ -632,6 +646,8 @@ static int __mdiobus_c45_modify_changed(struct mii_bus *bus, int addr,
  * @addr: the phy address
  * @regnum: register number to read
  *
+ * Return: The register value if successful, negative error code on failure
+ *
  * In case of nested MDIO bus access avoid lockdep false positives by
  * using mutex_lock_nested().
  *
@@ -657,6 +673,8 @@ EXPORT_SYMBOL(mdiobus_read_nested);
  * @addr: the phy address
  * @regnum: register number to read
  *
+ * Return: The register value if successful, negative error code on failure
+ *
  * NOTE: MUST NOT be called from interrupt context,
  * because the bus read/write functions may wait for an interrupt
  * to conclude the operation.
@@ -680,6 +698,8 @@ EXPORT_SYMBOL(mdiobus_read);
  * @devad: device address to read
  * @regnum: register number to read
  *
+ * Return: The register value if successful, negative error code on failure
+ *
  * NOTE: MUST NOT be called from interrupt context,
  * because the bus read/write functions may wait for an interrupt
  * to conclude the operation.
@@ -702,6 +722,8 @@ EXPORT_SYMBOL(mdiobus_c45_read);
  * @addr: the phy address
  * @devad: device address to read
  * @regnum: register number to read
+ *
+ * Return: The register value if successful, negative error code on failure
  *
  * In case of nested MDIO bus access avoid lockdep false positives by
  * using mutex_lock_nested().
@@ -730,6 +752,8 @@ EXPORT_SYMBOL(mdiobus_c45_read_nested);
  * @regnum: register number to write
  * @val: value to write to @regnum
  *
+ * Return: Zero if successful, negative error code on failure
+ *
  * In case of nested MDIO bus access avoid lockdep false positives by
  * using mutex_lock_nested().
  *
@@ -756,6 +780,8 @@ EXPORT_SYMBOL(mdiobus_write_nested);
  * @regnum: register number to write
  * @val: value to write to @regnum
  *
+ * Return: Zero if successful, negative error code on failure
+ *
  * NOTE: MUST NOT be called from interrupt context,
  * because the bus read/write functions may wait for an interrupt
  * to conclude the operation.
@@ -779,6 +805,8 @@ EXPORT_SYMBOL(mdiobus_write);
  * @devad: device address to read
  * @regnum: register number to write
  * @val: value to write to @regnum
+ *
+ * Return: Zero if successful, negative error code on failure
  *
  * NOTE: MUST NOT be called from interrupt context,
  * because the bus read/write functions may wait for an interrupt
@@ -804,6 +832,8 @@ EXPORT_SYMBOL(mdiobus_c45_write);
  * @devad: device address to read
  * @regnum: register number to write
  * @val: value to write to @regnum
+ *
+ * Return: Zero if successful, negative error code on failure
  *
  * In case of nested MDIO bus access avoid lockdep false positives by
  * using mutex_lock_nested().
@@ -833,6 +863,8 @@ EXPORT_SYMBOL(mdiobus_c45_write_nested);
  * @regnum: register number to write
  * @mask: bit mask of bits to clear
  * @set: bit mask of bits to set
+ *
+ * Return: 0 on success, negative on any error condition
  */
 int __mdiobus_modify(struct mii_bus *bus, int addr, u32 regnum, u16 mask,
 		     u16 set)
@@ -853,6 +885,8 @@ EXPORT_SYMBOL_GPL(__mdiobus_modify);
  * @regnum: register number to write
  * @mask: bit mask of bits to clear
  * @set: bit mask of bits to set
+ *
+ * Return: 0 on success, negative on any error condition
  */
 int mdiobus_modify(struct mii_bus *bus, int addr, u32 regnum, u16 mask, u16 set)
 {
@@ -875,6 +909,8 @@ EXPORT_SYMBOL_GPL(mdiobus_modify);
  * @regnum: register number to write
  * @mask: bit mask of bits to clear
  * @set: bit mask of bits to set
+ *
+ * Return: 0 on success, negative on any error condition
  */
 int mdiobus_c45_modify(struct mii_bus *bus, int addr, int devad, u32 regnum,
 		       u16 mask, u16 set)
@@ -898,6 +934,9 @@ EXPORT_SYMBOL_GPL(mdiobus_c45_modify);
  * @regnum: register number to write
  * @mask: bit mask of bits to clear
  * @set: bit mask of bits to set
+ *
+ * Return: 1 if the register was modified, 0 if no change was needed,
+ *	   negative on any error condition
  */
 int mdiobus_modify_changed(struct mii_bus *bus, int addr, u32 regnum,
 			   u16 mask, u16 set)
@@ -921,6 +960,9 @@ EXPORT_SYMBOL_GPL(mdiobus_modify_changed);
  * @regnum: register number to write
  * @mask: bit mask of bits to clear
  * @set: bit mask of bits to set
+ *
+ * Return: 1 if the register was modified, 0 if no change was needed,
+ *	   negative on any error condition
  */
 int mdiobus_c45_modify_changed(struct mii_bus *bus, int addr, int devad,
 			       u32 regnum, u16 mask, u16 set)
@@ -941,10 +983,10 @@ EXPORT_SYMBOL_GPL(mdiobus_c45_modify_changed);
  * @dev: target MDIO device
  * @drv: given MDIO driver
  *
- * Description: Given a MDIO device, and a MDIO driver, return 1 if
- *   the driver supports the device.  Otherwise, return 0. This may
- *   require calling the devices own match function, since different classes
- *   of MDIO devices have different match criteria.
+ * Return: 1 if the driver supports the device, 0 otherwise
+ *
+ * Description: This may require calling the devices own match function,
+ *   since different classes of MDIO devices have different match criteria.
  */
 static int mdio_bus_match(struct device *dev, const struct device_driver *drv)
 {
