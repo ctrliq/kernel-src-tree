@@ -4278,10 +4278,30 @@ void defer_console_output(void)
 	__wake_up_klogd(val);
 }
 
+/**
+ * printk_trigger_flush - Attempt to flush printk buffer to consoles.
+ *
+ * If possible, flush the printk buffer to all consoles in the caller's
+ * context. If offloading is available, trigger deferred printing.
+ *
+ * This is best effort. Depending on the system state, console states,
+ * and caller context, no actual flushing may result from this call.
+ */
 void printk_trigger_flush(void)
 {
-	nbcon_wake_threads();
-	defer_console_output();
+	struct console_flush_type ft;
+
+	printk_get_console_flush_type(&ft);
+	if (ft.nbcon_atomic)
+		nbcon_atomic_flush_all();
+	if (ft.nbcon_offload)
+		nbcon_wake_threads();
+	if (ft.legacy_direct) {
+		if (console_trylock())
+			console_unlock();
+	}
+	if (ft.legacy_offload)
+		defer_console_output();
 }
 
 int vprintk_deferred(const char *fmt, va_list args)
