@@ -3621,6 +3621,11 @@ static int phy_driver_register(struct phy_driver *new_driver,
 	return 0;
 }
 
+static void phy_driver_unregister(struct phy_driver *drv)
+{
+	driver_unregister(&drv->mdiodrv.driver);
+}
+
 int phy_drivers_register(struct phy_driver *new_driver, int n,
 			 struct module *owner)
 {
@@ -3637,12 +3642,6 @@ int phy_drivers_register(struct phy_driver *new_driver, int n,
 	return ret;
 }
 EXPORT_SYMBOL(phy_drivers_register);
-
-void phy_driver_unregister(struct phy_driver *drv)
-{
-	driver_unregister(&drv->mdiodrv.driver);
-}
-EXPORT_SYMBOL(phy_driver_unregister);
 
 void phy_drivers_unregister(struct phy_driver *drv, int n)
 {
