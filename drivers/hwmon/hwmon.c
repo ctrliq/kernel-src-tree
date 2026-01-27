@@ -128,6 +128,17 @@ static struct class hwmon_class = {
 
 static DEFINE_IDA(hwmon_ida);
 
+static umode_t hwmon_is_visible(const struct hwmon_ops *ops,
+				const void *drvdata,
+				enum hwmon_sensor_types type,
+				u32 attr, int channel)
+{
+	if (ops->visible)
+		return ops->visible;
+
+	return ops->is_visible(drvdata, type, attr, channel);
+}
+
 /* Thermal zone handling */
 
 /*
@@ -250,8 +261,8 @@ static int hwmon_thermal_register_sensors(struct device *dev)
 			int err;
 
 			if (!(info[i]->config[j] & HWMON_T_INPUT) ||
-			    !chip->ops->is_visible(drvdata, hwmon_temp,
-						   hwmon_temp_input, j))
+			    !hwmon_is_visible(chip->ops, drvdata, hwmon_temp,
+					      hwmon_temp_input, j))
 				continue;
 
 			err = hwmon_thermal_add_sensor(dev, j);
@@ -385,7 +396,7 @@ static struct attribute *hwmon_genattr(const void *drvdata,
 	if (!template)
 		return ERR_PTR(-ENOENT);
 
-	mode = ops->is_visible(drvdata, type, attr, index);
+	mode = hwmon_is_visible(ops, drvdata, type, attr, index);
 	if (!mode)
 		return ERR_PTR(-ENOENT);
 
@@ -872,7 +883,7 @@ hwmon_device_register_with_info(struct device *dev, const char *name,
 	if (!dev || !name || !chip)
 		return ERR_PTR(-EINVAL);
 
-	if (!chip->ops || !chip->ops->is_visible || !chip->info)
+	if (!chip->ops || !(chip->ops->visible || chip->ops->is_visible) || !chip->info)
 		return ERR_PTR(-EINVAL);
 
 	return __hwmon_device_register(dev, name, drvdata, chip, extra_groups);
