@@ -437,7 +437,11 @@ static int pci_endpoint_test_msi_irq(struct pci_endpoint_test *test,
 {
 	struct pci_dev *pdev = test->pdev;
 	u32 val;
-	int ret;
+	int irq;
+
+	irq = pci_irq_vector(pdev, msi_num - 1);
+	if (irq < 0)
+		return irq;
 
 	pci_endpoint_test_writel(test, PCI_ENDPOINT_TEST_IRQ_TYPE,
 				 msix ? PCITEST_IRQ_TYPE_MSIX :
@@ -451,11 +455,7 @@ static int pci_endpoint_test_msi_irq(struct pci_endpoint_test *test,
 	if (!val)
 		return -ETIMEDOUT;
 
-	ret = pci_irq_vector(pdev, msi_num - 1);
-	if (ret < 0)
-		return ret;
-
-	if (ret != test->last_irq)
+	if (irq != test->last_irq)
 		return -EIO;
 
 	return 0;
