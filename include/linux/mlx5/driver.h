@@ -433,7 +433,6 @@ struct mlx5_sq_bfreg {
 	struct mlx5_uars_page  *up;
 	bool			wc;
 	u32			index;
-	unsigned int		offset;
 };
 
 struct mlx5_core_health {
