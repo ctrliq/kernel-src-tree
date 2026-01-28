@@ -1318,7 +1318,7 @@ static int smbd_post_send_data(
 	sg_init_table(sgl, n_vec);
 	for (i = 0; i < n_vec; i++) {
 		data_length += iov[i].iov_len;
-		sg_set_buf(&sgl[i], iov[i].iov_base, iov[i].iov_len);
+		cifs_sg_set_buf(&sgl[i], iov[i].iov_base, iov[i].iov_len);
 	}
 
 	return smbd_post_send_sgl(sc, sgl, data_length, remaining_data_length);
