@@ -292,7 +292,7 @@ static inline int wrmsr_safe(u32 msr, u32 low, u32 high)
 	__err;							\
 })
 
-static inline int rdmsrl_safe(u32 msr, u64 *p)
+static inline int rdmsrq_safe(u32 msr, u64 *p)
 {
 	int err;
 
@@ -332,6 +332,7 @@ int msr_clear_bit(u32 msr, u8 bit);
 /* temporary #defines for RHEL */
 #define rdmsrl(msr, val) rdmsrq(msr, val)
 #define wrmsrl(msr, val) wrmsrq(msr, val)
+#define rdmsrl_safe(msr, p) rdmsrq_safe(msr, p)
 
 #ifdef CONFIG_SMP
 int rdmsr_on_cpu(unsigned int cpu, u32 msr_no, u32 *l, u32 *h);
@@ -388,7 +389,7 @@ static inline int wrmsr_safe_on_cpu(unsigned int cpu, u32 msr_no, u32 l, u32 h)
 }
 static inline int rdmsrl_safe_on_cpu(unsigned int cpu, u32 msr_no, u64 *q)
 {
-	return rdmsrl_safe(msr_no, q);
+	return rdmsrq_safe(msr_no, q);
 }
 static inline int wrmsrl_safe_on_cpu(unsigned int cpu, u32 msr_no, u64 q)
 {
