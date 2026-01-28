@@ -1835,8 +1835,14 @@ static int mlx5_notifiers_init(struct mlx5_core_dev *dev)
 	if (err)
 		goto err_sf_notifiers;
 
+	err = mlx5_sf_dev_notifier_init(dev);
+	if (err)
+		goto err_sf_dev_notifier;
+
 	return 0;
 
+err_sf_dev_notifier:
+	mlx5_sf_notifiers_cleanup(dev);
 err_sf_notifiers:
 	mlx5_sf_hw_notifier_cleanup(dev);
 err_sf_hw_notifier:
@@ -1846,6 +1852,7 @@ err_sf_hw_notifier:
 
 static void mlx5_notifiers_cleanup(struct mlx5_core_dev *dev)
 {
+	mlx5_sf_dev_notifier_cleanup(dev);
 	mlx5_sf_notifiers_cleanup(dev);
 	mlx5_sf_hw_notifier_cleanup(dev);
 	mlx5_events_cleanup(dev);
