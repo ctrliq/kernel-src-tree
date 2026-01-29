@@ -6,6 +6,10 @@
 #include <linux/phy.h>
 #include <linux/of.h>
 
+#include "phylib.h"
+#include "phylib-internal.h"
+#include "phy-caps.h"
+
 /**
  * phy_speed_to_str - Return a string representing the PHY link speed
  *
@@ -337,37 +341,9 @@ phy_lookup_setting(int speed, int duplex, const unsigned long *mask, bool exact)
 }
 EXPORT_SYMBOL_GPL(phy_lookup_setting);
 
-size_t phy_speeds(unsigned int *speeds, size_t size,
-		  unsigned long *mask)
-{
-	size_t count;
-	int i;
-
-	for (i = 0, count = 0; i < ARRAY_SIZE(settings) && count < size; i++)
-		if (settings[i].bit < __ETHTOOL_LINK_MODE_MASK_NBITS &&
-		    test_bit(settings[i].bit, mask) &&
-		    (count == 0 || speeds[count - 1] != settings[i].speed))
-			speeds[count++] = settings[i].speed;
-
-	return count;
-}
-
-static void __set_linkmode_max_speed(u32 max_speed, unsigned long *addr)
-{
-	const struct phy_setting *p;
-	int i;
-
-	for (i = 0, p = settings; i < ARRAY_SIZE(settings); i++, p++) {
-		if (p->speed > max_speed)
-			linkmode_clear_bit(p->bit, addr);
-		else
-			break;
-	}
-}
-
 static void __set_phy_supported(struct phy_device *phydev, u32 max_speed)
 {
-	__set_linkmode_max_speed(max_speed, phydev->supported);
+	phy_caps_linkmode_max_speed(max_speed, phydev->supported);
 }
 
 /**
@@ -406,7 +382,38 @@ void of_set_phy_supported(struct phy_device *phydev)
 void of_set_phy_eee_broken(struct phy_device *phydev)
 {
 	struct device_node *node = phydev->mdio.dev.of_node;
-	u32 broken = 0;
+	unsigned long *modes = phydev->eee_disabled_modes;
+
+	if (!IS_ENABLED(CONFIG_OF_MDIO) || !node)
+		return;
+
+	linkmode_zero(modes);
+
+	if (of_property_read_bool(node, "eee-broken-100tx"))
+		linkmode_set_bit(ETHTOOL_LINK_MODE_100baseT_Full_BIT, modes);
+	if (of_property_read_bool(node, "eee-broken-1000t"))
+		linkmode_set_bit(ETHTOOL_LINK_MODE_1000baseT_Full_BIT, modes);
+	if (of_property_read_bool(node, "eee-broken-10gt"))
+		linkmode_set_bit(ETHTOOL_LINK_MODE_10000baseT_Full_BIT, modes);
+	if (of_property_read_bool(node, "eee-broken-1000kx"))
+		linkmode_set_bit(ETHTOOL_LINK_MODE_1000baseKX_Full_BIT, modes);
+	if (of_property_read_bool(node, "eee-broken-10gkx4"))
+		linkmode_set_bit(ETHTOOL_LINK_MODE_10000baseKX4_Full_BIT, modes);
+	if (of_property_read_bool(node, "eee-broken-10gkr"))
+		linkmode_set_bit(ETHTOOL_LINK_MODE_10000baseKR_Full_BIT, modes);
+}
+
+/**
+ * of_set_phy_timing_role - Set the master/slave mode of the PHY
+ *
+ * @phydev: The phy_device struct
+ *
+ * Set master/slave configuration of the PHY based on the device tree.
+ */
+void of_set_phy_timing_role(struct phy_device *phydev)
+{
+	struct device_node *node = phydev->mdio.dev.of_node;
+	const char *master;
 
 	if (!IS_ENABLED(CONFIG_OF_MDIO))
 		return;
@@ -414,20 +421,19 @@ void of_set_phy_eee_broken(struct phy_device *phydev)
 	if (!node)
 		return;
 
-	if (of_property_read_bool(node, "eee-broken-100tx"))
-		broken |= MDIO_EEE_100TX;
-	if (of_property_read_bool(node, "eee-broken-1000t"))
-		broken |= MDIO_EEE_1000T;
-	if (of_property_read_bool(node, "eee-broken-10gt"))
-		broken |= MDIO_EEE_10GT;
-	if (of_property_read_bool(node, "eee-broken-1000kx"))
-		broken |= MDIO_EEE_1000KX;
-	if (of_property_read_bool(node, "eee-broken-10gkx4"))
-		broken |= MDIO_EEE_10GKX4;
-	if (of_property_read_bool(node, "eee-broken-10gkr"))
-		broken |= MDIO_EEE_10GKR;
+	if (of_property_read_string(node, "timing-role", &master))
+		return;
 
-	phydev->eee_broken_modes = broken;
+	if (strcmp(master, "forced-master") == 0)
+		phydev->master_slave_set = MASTER_SLAVE_CFG_MASTER_FORCE;
+	else if (strcmp(master, "forced-slave") == 0)
+		phydev->master_slave_set = MASTER_SLAVE_CFG_SLAVE_FORCE;
+	else if (strcmp(master, "preferred-master") == 0)
+		phydev->master_slave_set = MASTER_SLAVE_CFG_MASTER_PREFERRED;
+	else if (strcmp(master, "preferred-slave") == 0)
+		phydev->master_slave_set = MASTER_SLAVE_CFG_SLAVE_PREFERRED;
+	else
+		phydev_warn(phydev, "Unknown master-slave mode %s\n", master);
 }
 
 /**
@@ -463,16 +469,15 @@ EXPORT_SYMBOL_GPL(phy_resolve_aneg_pause);
 void phy_resolve_aneg_linkmode(struct phy_device *phydev)
 {
 	__ETHTOOL_DECLARE_LINK_MODE_MASK(common);
-	int i;
+	const struct link_capabilities *c;
 
 	linkmode_and(common, phydev->lp_advertising, phydev->advertising);
 
-	for (i = 0; i < ARRAY_SIZE(settings); i++)
-		if (test_bit(settings[i].bit, common)) {
-			phydev->speed = settings[i].speed;
-			phydev->duplex = settings[i].duplex;
-			break;
-		}
+	c = phy_caps_lookup_by_linkmode(common);
+	if (c) {
+		phydev->speed = c->speed;
+		phydev->duplex = c->duplex;
+	}
 
 	phy_resolve_aneg_pause(phydev);
 }
@@ -490,7 +495,8 @@ EXPORT_SYMBOL_GPL(phy_resolve_aneg_linkmode);
 void phy_check_downshift(struct phy_device *phydev)
 {
 	__ETHTOOL_DECLARE_LINK_MODE_MASK(common);
-	int i, speed = SPEED_UNKNOWN;
+	const struct link_capabilities *c;
+	int speed = SPEED_UNKNOWN;
 
 	phydev->downshifted_rate = 0;
 
@@ -500,11 +506,9 @@ void phy_check_downshift(struct phy_device *phydev)
 
 	linkmode_and(common, phydev->lp_advertising, phydev->advertising);
 
-	for (i = 0; i < ARRAY_SIZE(settings); i++)
-		if (test_bit(settings[i].bit, common)) {
-			speed = settings[i].speed;
-			break;
-		}
+	c = phy_caps_lookup_by_linkmode(common);
+	if (c)
+		speed = c->speed;
 
 	if (speed == SPEED_UNKNOWN || phydev->speed >= speed)
 		return;
@@ -514,22 +518,17 @@ void phy_check_downshift(struct phy_device *phydev)
 
 	phydev->downshifted_rate = 1;
 }
-EXPORT_SYMBOL_GPL(phy_check_downshift);
 
 static int phy_resolve_min_speed(struct phy_device *phydev, bool fdx_only)
 {
 	__ETHTOOL_DECLARE_LINK_MODE_MASK(common);
-	int i = ARRAY_SIZE(settings);
+	const struct link_capabilities *c;
 
 	linkmode_and(common, phydev->lp_advertising, phydev->advertising);
 
-	while (--i >= 0) {
-		if (test_bit(settings[i].bit, common)) {
-			if (fdx_only && settings[i].duplex != DUPLEX_FULL)
-				continue;
-			return settings[i].speed;
-		}
-	}
+	c = phy_caps_lookup_by_linkmode_rev(common, fdx_only);
+	if (c)
+		return c->speed;
 
 	return SPEED_UNKNOWN;
 }
@@ -541,7 +540,7 @@ int phy_speed_down_core(struct phy_device *phydev)
 	if (min_common_speed == SPEED_UNKNOWN)
 		return -EINVAL;
 
-	__set_linkmode_max_speed(min_common_speed, phydev->advertising);
+	phy_caps_linkmode_max_speed(min_common_speed, phydev->advertising);
 
 	return 0;
 }
@@ -703,43 +702,6 @@ int __phy_package_read_mmd(struct phy_device *phydev,
 EXPORT_SYMBOL(__phy_package_read_mmd);
 
 /**
- * phy_package_read_mmd - read MMD reg relative to PHY package base addr
- * @phydev: The phy_device struct
- * @addr_offset: The offset to be added to PHY package base_addr
- * @devad: The MMD to read from
- * @regnum: The register on the MMD to read
- *
- * Convenience helper for reading a register of an MMD on a given PHY
- * using the PHY package base address. The base address is added to
- * the addr_offset value.
- *
- * Same calling rules as for phy_read();
- *
- * NOTE: It's assumed that the entire PHY package is either C22 or C45.
- */
-int phy_package_read_mmd(struct phy_device *phydev,
-			 unsigned int addr_offset, int devad,
-			 u32 regnum)
-{
-	int addr = phy_package_address(phydev, addr_offset);
-	int val;
-
-	if (addr < 0)
-		return addr;
-
-	if (regnum > (u16)~0 || devad > 32)
-		return -EINVAL;
-
-	phy_lock_mdio_bus(phydev);
-	val = mmd_phy_read(phydev->mdio.bus, addr, phydev->is_c45, devad,
-			   regnum);
-	phy_unlock_mdio_bus(phydev);
-
-	return val;
-}
-EXPORT_SYMBOL(phy_package_read_mmd);
-
-/**
  * __phy_package_write_mmd - write MMD reg relative to PHY package base addr
  * @phydev: The phy_device struct
  * @addr_offset: The offset to be added to PHY package base_addr
@@ -771,44 +733,6 @@ int __phy_package_write_mmd(struct phy_device *phydev,
 			     regnum, val);
 }
 EXPORT_SYMBOL(__phy_package_write_mmd);
-
-/**
- * phy_package_write_mmd - write MMD reg relative to PHY package base addr
- * @phydev: The phy_device struct
- * @addr_offset: The offset to be added to PHY package base_addr
- * @devad: The MMD to write to
- * @regnum: The register on the MMD to write
- * @val: value to write to @regnum
- *
- * Convenience helper for writing a register of an MMD on a given PHY
- * using the PHY package base address. The base address is added to
- * the addr_offset value.
- *
- * Same calling rules as for phy_write();
- *
- * NOTE: It's assumed that the entire PHY package is either C22 or C45.
- */
-int phy_package_write_mmd(struct phy_device *phydev,
-			  unsigned int addr_offset, int devad,
-			  u32 regnum, u16 val)
-{
-	int addr = phy_package_address(phydev, addr_offset);
-	int ret;
-
-	if (addr < 0)
-		return addr;
-
-	if (regnum > (u16)~0 || devad > 32)
-		return -EINVAL;
-
-	phy_lock_mdio_bus(phydev);
-	ret = mmd_phy_write(phydev->mdio.bus, addr, phydev->is_c45, devad,
-			    regnum, val);
-	phy_unlock_mdio_bus(phydev);
-
-	return ret;
-}
-EXPORT_SYMBOL(phy_package_write_mmd);
 
 /**
  * phy_modify_changed - Function for modifying a PHY register

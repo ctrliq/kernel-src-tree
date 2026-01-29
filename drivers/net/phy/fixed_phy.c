@@ -160,10 +160,9 @@ static int fixed_phy_add_gpiod(unsigned int irq, int phy_addr,
 	return 0;
 }
 
-int fixed_phy_add(unsigned int irq, int phy_addr,
-		  struct fixed_phy_status *status)
+int fixed_phy_add(int phy_addr, struct fixed_phy_status *status)
 {
-	return fixed_phy_add_gpiod(irq, phy_addr, status, NULL);
+	return fixed_phy_add_gpiod(PHY_POLL, phy_addr, status, NULL);
 }
 EXPORT_SYMBOL_GPL(fixed_phy_add);
 
@@ -223,12 +222,12 @@ static struct gpio_desc *fixed_phy_get_gpiod(struct device_node *np)
 }
 #endif
 
-static struct phy_device *__fixed_phy_register(unsigned int irq,
-					       struct fixed_phy_status *status,
-					       struct device_node *np,
-					       struct gpio_desc *gpiod)
+struct phy_device *fixed_phy_register(unsigned int irq,
+				      struct fixed_phy_status *status,
+				      struct device_node *np)
 {
 	struct fixed_mdio_bus *fmb = &platform_fmb;
+	struct gpio_desc *gpiod;
 	struct phy_device *phy;
 	int phy_addr;
 	int ret;
@@ -237,11 +236,9 @@ static struct phy_device *__fixed_phy_register(unsigned int irq,
 		return ERR_PTR(-EPROBE_DEFER);
 
 	/* Check if we have a GPIO associated with this fixed phy */
-	if (!gpiod) {
-		gpiod = fixed_phy_get_gpiod(np);
-		if (IS_ERR(gpiod))
-			return ERR_CAST(gpiod);
-	}
+	gpiod = fixed_phy_get_gpiod(np);
+	if (IS_ERR(gpiod))
+		return ERR_CAST(gpiod);
 
 	/* Get the next available PHY address, up to PHY_MAX_ADDR */
 	phy_addr = ida_alloc_max(&phy_fixed_ida, PHY_MAX_ADDR - 1, GFP_KERNEL);
@@ -306,23 +303,7 @@ static struct phy_device *__fixed_phy_register(unsigned int irq,
 
 	return phy;
 }
-
-struct phy_device *fixed_phy_register(unsigned int irq,
-				      struct fixed_phy_status *status,
-				      struct device_node *np)
-{
-	return __fixed_phy_register(irq, status, np, NULL);
-}
 EXPORT_SYMBOL_GPL(fixed_phy_register);
-
-struct phy_device *
-fixed_phy_register_with_gpiod(unsigned int irq,
-			      struct fixed_phy_status *status,
-			      struct gpio_desc *gpiod)
-{
-	return __fixed_phy_register(irq, status, NULL, gpiod);
-}
-EXPORT_SYMBOL_GPL(fixed_phy_register_with_gpiod);
 
 void fixed_phy_unregister(struct phy_device *phy)
 {
