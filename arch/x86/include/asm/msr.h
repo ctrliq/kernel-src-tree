@@ -319,7 +319,7 @@ static __always_inline void wrmsrns(u32 msr, u64 val)
 /*
  * 64-bit version of wrmsr_safe():
  */
-static inline int wrmsrl_safe(u32 msr, u64 val)
+static inline int wrmsrq_safe(u32 msr, u64 val)
 {
 	return wrmsr_safe(msr, (u32)val,  (u32)(val >> 32));
 }
@@ -333,6 +333,7 @@ int msr_clear_bit(u32 msr, u8 bit);
 #define rdmsrl(msr, val) rdmsrq(msr, val)
 #define wrmsrl(msr, val) wrmsrq(msr, val)
 #define rdmsrl_safe(msr, p) rdmsrq_safe(msr, p)
+#define wrmsrl_safe(msr, val) wrmsrq_safe(msr, val)
 
 #ifdef CONFIG_SMP
 int rdmsr_on_cpu(unsigned int cpu, u32 msr_no, u32 *l, u32 *h);
@@ -393,7 +394,7 @@ static inline int rdmsrl_safe_on_cpu(unsigned int cpu, u32 msr_no, u64 *q)
 }
 static inline int wrmsrl_safe_on_cpu(unsigned int cpu, u32 msr_no, u64 q)
 {
-	return wrmsrl_safe(msr_no, q);
+	return wrmsrq_safe(msr_no, q);
 }
 static inline int rdmsr_safe_regs_on_cpu(unsigned int cpu, u32 regs[8])
 {
