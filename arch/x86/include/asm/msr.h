@@ -122,7 +122,7 @@ do {							\
 #define native_wrmsr(msr, low, high)			\
 	__wrmsr(msr, low, high)
 
-#define native_wrmsrl(msr, val)				\
+#define native_wrmsrq(msr, val)				\
 	__wrmsr((msr), (u32)((u64)(val)),		\
 		       (u32)((u64)(val) >> 32))
 
@@ -335,6 +335,7 @@ int msr_clear_bit(u32 msr, u8 bit);
 #define rdmsrl_safe(msr, p) rdmsrq_safe(msr, p)
 #define wrmsrl_safe(msr, val) wrmsrq_safe(msr, val)
 #define rdmsrl_on_cpu(cpu, msr_no, q) rdmsrq_on_cpu(cpu, msr_no, q)
+#define native_wrmsrl(msr, val) native_wrmsrq(msr, val)
 
 #ifdef CONFIG_SMP
 int rdmsr_on_cpu(unsigned int cpu, u32 msr_no, u32 *l, u32 *h);
