@@ -265,7 +265,6 @@ static noinstr void mce_panic(const char *msg, struct mce_hw_err *final, char *e
 	struct mce_evt_llist *l;
 	int apei_err = 0;
 	const char *memmsg;
-	struct page *p;
 
 	/*
 	 * Allow instrumentation around external facilities usage. Not that it
@@ -335,6 +334,7 @@ static noinstr void mce_panic(const char *msg, struct mce_hw_err *final, char *e
 		 */
 		if (kexec_crash_loaded()) {
 			if (final && (final->m.status & MCI_STATUS_ADDRV)) {
+				struct page *p;
 				p = pfn_to_online_page(final->m.addr >> PAGE_SHIFT);
 				if (p)
 					SetPageHWPoison(p);
