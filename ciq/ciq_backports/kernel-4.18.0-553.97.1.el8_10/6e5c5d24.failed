@@ -1,0 +1,162 @@
+scsi: lpfc: Move scsi_host_template outside dynamically allocated/freed phba
+
+jira KERNEL-548
+Rebuild_History Non-Buildable kernel-4.18.0-553.97.1.el8_10
+commit-author James Smart <jsmart2021@gmail.com>
+commit 6e5c5d246e6c16127327eeecf61ef2cf21a94ce5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.97.1.el8_10/6e5c5d24.failed
+
+On a PCI hotplug capable system, it is possible for scsi_device_put() to
+happen after lpfc_pci_remove_one() is called.  As a result, the
+sdev->host->hostt->module dereference is for a previously freed memory
+location because the phba structure containing the hostt template was
+already freed when lpfc_pci_remove_one() returned.
+
+Since the lpfc module is still loaded during power slot disable, all
+scsi_host_templates should be declared as part of the global data segment
+instead of inside the heap allocated phba structure.  This way the
+sdev->host->hostt memory area is always valid as long as the module is
+loaded regardless if PCI hotplug dynamically allocates or frees phba
+structures.
+
+Move all scsi_host_templates in the phba structure to global variables.
+Create a small helper routine to determine appropriate sg_tablesize during
+shost allocation.
+
+Link: https://lore.kernel.org/r/20220911221505.117655-7-jsmart2021@gmail.com
+Co-developed-by: Dwip N. Banerjee <dnbanerg@us.ibm.com>
+	Signed-off-by: Dwip N. Banerjee <dnbanerg@us.ibm.com>
+Co-developed-by: Daniel Wagner <dwagner@suse.de>
+	Signed-off-by: Daniel Wagner <dwagner@suse.de>
+Co-developed-by: Justin Tee <justin.tee@broadcom.com>
+	Signed-off-by: Justin Tee <justin.tee@broadcom.com>
+	Signed-off-by: James Smart <jsmart2021@gmail.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 6e5c5d246e6c16127327eeecf61ef2cf21a94ce5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/lpfc/lpfc.h
+#	drivers/scsi/lpfc/lpfc_init.c
+#	drivers/scsi/lpfc/lpfc_scsi.c
+diff --cc drivers/scsi/lpfc/lpfc.h
+index 62069f5bb747,68b3bd70dd52..000000000000
+--- a/drivers/scsi/lpfc/lpfc.h
++++ b/drivers/scsi/lpfc/lpfc.h
+@@@ -1593,15 -1596,6 +1593,18 @@@ struct lpfc_hba 
+  
+  	char os_host_name[MAXHOSTNAMELEN];
+  
+++<<<<<<< HEAD
+ +	/* LD Signaling */
+ +	u32 degrade_activate_threshold;
+ +	u32 degrade_deactivate_threshold;
+ +	u32 fec_degrade_interval;
+ +
+ +	/* SCSI host template information - for physical port */
+ +	struct scsi_host_template port_template;
+ +	/* SCSI host template information - for all vports */
+ +	struct scsi_host_template vport_template;
+++=======
+++>>>>>>> 6e5c5d246e6c (scsi: lpfc: Move scsi_host_template outside dynamically allocated/freed phba)
+  	atomic_t dbg_log_idx;
+  	atomic_t dbg_log_cnt;
+  	atomic_t dbg_log_dmping;
+diff --cc drivers/scsi/lpfc/lpfc_init.c
+index 82d25ea51ff7,0a4a82f5df5c..000000000000
+--- a/drivers/scsi/lpfc/lpfc_init.c
++++ b/drivers/scsi/lpfc/lpfc_init.c
+@@@ -4515,22 -4725,31 +4526,47 @@@ lpfc_create_port(struct lpfc_hba *phba
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	if (phba->cfg_enable_fc4_type & LPFC_ENABLE_FCP) {
+ +		if (dev != &phba->pcidev->dev) {
+ +			shost = scsi_host_alloc(&lpfc_vport_template,
+ +						sizeof(struct lpfc_vport));
+ +		} else {
+ +			if (!use_no_reset_hba)
+ +				shost = scsi_host_alloc(&lpfc_template,
+ +						sizeof(struct lpfc_vport));
+ +			else
+ +				shost = scsi_host_alloc(&lpfc_template_no_hr,
+ +						sizeof(struct lpfc_vport));
+ +		}
+ +	} else if (phba->cfg_enable_fc4_type & LPFC_ENABLE_NVME) {
+ +		shost = scsi_host_alloc(&lpfc_template_nvme,
+ +					sizeof(struct lpfc_vport));
+++=======
++ 	/* Seed template for SCSI host registration */
++ 	if (dev == &phba->pcidev->dev) {
++ 		if (phba->cfg_enable_fc4_type & LPFC_ENABLE_FCP) {
++ 			/* Seed physical port template */
++ 			template = &lpfc_template;
++ 
++ 			if (use_no_reset_hba)
++ 				/* template is for a no reset SCSI Host */
++ 				template->eh_host_reset_handler = NULL;
++ 
++ 			/* Seed updated value of sg_tablesize */
++ 			template->sg_tablesize = lpfc_get_sg_tablesize(phba);
++ 		} else {
++ 			/* NVMET is for physical port only */
++ 			template = &lpfc_template_nvme;
++ 		}
++ 	} else {
++ 		/* Seed vport template */
++ 		template = &lpfc_vport_template;
++ 
++ 		/* Seed updated value of sg_tablesize */
++ 		template->sg_tablesize = lpfc_get_sg_tablesize(phba);
+++>>>>>>> 6e5c5d246e6c (scsi: lpfc: Move scsi_host_template outside dynamically allocated/freed phba)
+  	}
+ -
+ -	shost = scsi_host_alloc(template, sizeof(struct lpfc_vport));
+  	if (!shost)
+  		goto out;
+  
+diff --cc drivers/scsi/lpfc/lpfc_scsi.c
+index 5694a0a98c35,63fd5bd38ca1..000000000000
+--- a/drivers/scsi/lpfc/lpfc_scsi.c
++++ b/drivers/scsi/lpfc/lpfc_scsi.c
+@@@ -7316,9 -6802,12 +7316,18 @@@ struct scsi_host_template lpfc_vport_te
+  	.info			= lpfc_info,
+  	.queuecommand		= lpfc_queuecommand,
+  	.eh_timed_out		= fc_eh_timed_out,
+++<<<<<<< HEAD
+ +	.eh_abort_handler	= lpfc_abort_handler,
+ +	.eh_device_reset_handler = lpfc_device_reset_handler,
+ +	.eh_target_reset_handler = lpfc_target_reset_handler,
+++=======
++ 	.eh_should_retry_cmd    = fc_eh_should_retry_cmd,
++ 	.eh_abort_handler	= lpfc_abort_handler,
++ 	.eh_device_reset_handler = lpfc_device_reset_handler,
++ 	.eh_target_reset_handler = lpfc_target_reset_handler,
++ 	.eh_bus_reset_handler	= NULL,
++ 	.eh_host_reset_handler	= NULL,
+++>>>>>>> 6e5c5d246e6c (scsi: lpfc: Move scsi_host_template outside dynamically allocated/freed phba)
+  	.slave_alloc		= lpfc_slave_alloc,
+  	.slave_configure	= lpfc_slave_configure,
+  	.slave_destroy		= lpfc_slave_destroy,
+@@@ -7326,9 -6815,9 +7335,15 @@@
+  	.this_id		= -1,
+  	.sg_tablesize		= LPFC_DEFAULT_SG_SEG_CNT,
+  	.cmd_per_lun		= LPFC_CMD_PER_LUN,
+++<<<<<<< HEAD
+ +	.use_clustering		= ENABLE_CLUSTERING,
+ +	.shost_attrs		= lpfc_vport_attrs,
+ +	.max_sectors		= 0xFFFF,
+++=======
++ 	.shost_groups		= lpfc_vport_groups,
++ 	.max_sectors		= 0xFFFFFFFF,
++ 	.vendor_id		= 0,
+++>>>>>>> 6e5c5d246e6c (scsi: lpfc: Move scsi_host_template outside dynamically allocated/freed phba)
+  	.change_queue_depth	= scsi_change_queue_depth,
+  	.track_queue_depth	= 1,
+  };
+* Unmerged path drivers/scsi/lpfc/lpfc.h
+* Unmerged path drivers/scsi/lpfc/lpfc_init.c
+* Unmerged path drivers/scsi/lpfc/lpfc_scsi.c
