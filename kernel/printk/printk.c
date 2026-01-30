@@ -488,6 +488,9 @@ bool have_boot_console;
 /* See printk_legacy_allow_panic_sync() for details. */
 bool legacy_allow_panic_sync;
 
+/* Avoid using irq_work when suspending. */
+bool console_irqwork_blocked;
+
 #ifdef CONFIG_PRINTK
 DECLARE_WAIT_QUEUE_HEAD(log_wait);
 
@@ -2421,7 +2424,7 @@ asmlinkage int vprintk_emit(int facility, int level,
 
 	if (ft.legacy_offload)
 		defer_console_output();
-	else
+	else if (!console_irqwork_blocked)
 		wake_up_klogd();
 
 	return printed_len;
@@ -2656,10 +2659,20 @@ void suspend_console(void)
 {
 	struct console *con;
 
+	if (console_suspend_enabled)
+		pr_info("Suspending console(s) (use no_console_suspend to debug)\n");
+
+	/*
+	 * Flush any console backlog and then avoid queueing irq_work until
+	 * console_resume_all(). Until then deferred printing is no longer
+	 * triggered, NBCON consoles transition to atomic flushing, and
+	 * any klogd waiters are not triggered.
+	 */
+	pr_flush(1000, true);
+	console_irqwork_blocked = true;
+
 	if (!console_suspend_enabled)
 		return;
-	pr_info("Suspending console(s) (use no_console_suspend to debug)\n");
-	pr_flush(1000, true);
 
 	console_list_lock();
 	for_each_console(con)
@@ -2677,38 +2690,37 @@ void suspend_console(void)
 
 void resume_console(void)
 {
+	struct console_flush_type ft;
 	struct console *con;
-	short flags;
-	int cookie;
-
-	if (!console_suspend_enabled)
-		return;
-
-	console_list_lock();
-	for_each_console(con)
-		console_srcu_write_flags(con, con->flags & ~CON_SUSPENDED);
-	console_list_unlock();
 
 	/*
-	 * Ensure that all SRCU list walks have completed. All printing
-	 * contexts must be able to see they are no longer suspended so
-	 * that they are guaranteed to wake up and resume printing.
+	 * Allow queueing irq_work. After restoring console state, deferred
+	 * printing and any klogd waiters need to be triggered in case there
+	 * is now a console backlog.
 	 */
-	synchronize_srcu(&console_srcu);
+	console_irqwork_blocked = false;
 
-	/*
-	 * Since this runs in task context, wake the threaded printers
-	 * directly rather than scheduling irq_work to do it.
-	 */
-	cookie = console_srcu_read_lock();
-	for_each_console_srcu(con) {
-		flags = console_srcu_read_flags(con);
-		if (flags & CON_NBCON)
-			nbcon_kthread_wake(con);
+	if (console_suspend_enabled) {
+		console_list_lock();
+		for_each_console(con)
+			console_srcu_write_flags(con, con->flags & ~CON_SUSPENDED);
+		console_list_unlock();
+
+		/*
+		 * Ensure that all SRCU list walks have completed. All printing
+		 * contexts must be able to see they are no longer suspended so
+		 * that they are guaranteed to wake up and resume printing.
+		 */
+		synchronize_srcu(&console_srcu);
 	}
-	console_srcu_read_unlock(cookie);
 
-	wake_up_legacy_kthread();
+	printk_get_console_flush_type(&ft);
+	if (ft.nbcon_offload)
+		nbcon_wake_threads();
+	if (ft.legacy_offload)
+		defer_console_output();
+	else
+		wake_up_klogd();
 
 	pr_flush(1000, true);
 }
@@ -4216,6 +4228,13 @@ static DEFINE_PER_CPU(struct irq_work, wake_up_klogd_work) =
 static void __wake_up_klogd(int val)
 {
 	if (!printk_percpu_data_ready())
+		return;
+
+	/*
+	 * It is not allowed to call this function when console irq_work
+	 * is blocked.
+	 */
+	if (WARN_ON_ONCE(console_irqwork_blocked))
 		return;
 
 	preempt_disable();

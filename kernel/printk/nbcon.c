@@ -1158,6 +1158,16 @@ void nbcon_wake_threads(void)
 	struct console *con;
 	int cookie;
 
+	if (!printk_threads_enabled)
+		return;
+
+	/*
+	 * It is not allowed to call this function when console irq_work
+	 * is blocked.
+	 */
+	if (WARN_ON_ONCE(console_irqwork_blocked))
+		return;
+
 	cookie = console_srcu_read_lock();
 	for_each_console_srcu(con) {
 		/*
