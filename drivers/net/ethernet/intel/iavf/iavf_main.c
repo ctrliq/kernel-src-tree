@@ -49,6 +49,7 @@ MODULE_ALIAS("i40evf");
 MODULE_DESCRIPTION("Intel(R) Ethernet Adaptive Virtual Function Network Driver");
 MODULE_IMPORT_NS(LIBETH);
 MODULE_IMPORT_NS(LIBIE);
+MODULE_IMPORT_NS(LIBIE_ADMINQ);
 MODULE_LICENSE("GPL v2");
 
 static const struct net_device_ops iavf_netdev_ops;
@@ -1733,7 +1734,7 @@ static int iavf_config_rss_aq(struct iavf_adapter *adapter)
 	if (status) {
 		dev_err(&adapter->pdev->dev, "Cannot set RSS key, err %s aq_err %s\n",
 			iavf_stat_str(hw, status),
-			iavf_aq_str(hw, hw->aq.asq_last_status));
+			libie_aq_str(hw->aq.asq_last_status));
 		return iavf_status_to_errno(status);
 
 	}
@@ -1743,7 +1744,7 @@ static int iavf_config_rss_aq(struct iavf_adapter *adapter)
 	if (status) {
 		dev_err(&adapter->pdev->dev, "Cannot set RSS lut, err %s aq_err %s\n",
 			iavf_stat_str(hw, status),
-			iavf_aq_str(hw, hw->aq.asq_last_status));
+			libie_aq_str(hw->aq.asq_last_status));
 		return iavf_status_to_errno(status);
 	}
 
@@ -1764,11 +1765,11 @@ static int iavf_config_rss_reg(struct iavf_adapter *adapter)
 	u16 i;
 
 	dw = (u32 *)adapter->rss_key;
-	for (i = 0; i <= adapter->rss_key_size / 4; i++)
+	for (i = 0; i < adapter->rss_key_size / 4; i++)
 		wr32(hw, IAVF_VFQF_HKEY(i), dw[i]);
 
 	dw = (u32 *)adapter->rss_lut;
-	for (i = 0; i <= adapter->rss_lut_size / 4; i++)
+	for (i = 0; i < adapter->rss_lut_size / 4; i++)
 		wr32(hw, IAVF_VFQF_HLUT(i), dw[i]);
 
 	iavf_flush(hw);
@@ -1822,12 +1823,13 @@ static int iavf_init_rss(struct iavf_adapter *adapter)
 		/* Enable PCTYPES for RSS, TCP/UDP with IPv4/IPv6 */
 		if (adapter->vf_res->vf_cap_flags &
 		    VIRTCHNL_VF_OFFLOAD_RSS_PCTYPE_V2)
-			adapter->hena = IAVF_DEFAULT_RSS_HENA_EXPANDED;
+			adapter->rss_hashcfg =
+				IAVF_DEFAULT_RSS_HASHCFG_EXPANDED;
 		else
-			adapter->hena = IAVF_DEFAULT_RSS_HENA;
+			adapter->rss_hashcfg = IAVF_DEFAULT_RSS_HASHCFG;
 
-		wr32(hw, IAVF_VFQF_HENA(0), (u32)adapter->hena);
-		wr32(hw, IAVF_VFQF_HENA(1), (u32)(adapter->hena >> 32));
+		wr32(hw, IAVF_VFQF_HENA(0), (u32)adapter->rss_hashcfg);
+		wr32(hw, IAVF_VFQF_HENA(1), (u32)(adapter->rss_hashcfg >> 32));
 	}
 
 	iavf_fill_rss_lut(adapter);
@@ -2198,12 +2200,12 @@ static int iavf_process_aq_command(struct iavf_adapter *adapter)
 		adapter->aq_required &= ~IAVF_FLAG_AQ_CONFIGURE_RSS;
 		return 0;
 	}
-	if (adapter->aq_required & IAVF_FLAG_AQ_GET_HENA) {
-		iavf_get_hena(adapter);
+	if (adapter->aq_required & IAVF_FLAG_AQ_GET_RSS_HASHCFG) {
+		iavf_get_rss_hashcfg(adapter);
 		return 0;
 	}
-	if (adapter->aq_required & IAVF_FLAG_AQ_SET_HENA) {
-		iavf_set_hena(adapter);
+	if (adapter->aq_required & IAVF_FLAG_AQ_SET_RSS_HASHCFG) {
+		iavf_set_rss_hashcfg(adapter);
 		return 0;
 	}
 	if (adapter->aq_required & IAVF_FLAG_AQ_SET_RSS_KEY) {
@@ -2910,28 +2912,16 @@ err:
 	iavf_change_state(adapter, __IAVF_INIT_FAILED);
 }
 
-/**
- * iavf_watchdog_task - Periodic call-back task
- * @work: pointer to work_struct
- **/
-static void iavf_watchdog_task(struct work_struct *work)
+static const int IAVF_NO_RESCHED = -1;
+
+/* return: msec delay for requeueing itself */
+static int iavf_watchdog_step(struct iavf_adapter *adapter)
 {
-	struct iavf_adapter *adapter = container_of(work,
-						    struct iavf_adapter,
-						    watchdog_task.work);
-	struct net_device *netdev = adapter->netdev;
 	struct iavf_hw *hw = &adapter->hw;
 	u32 reg_val;
 
-	netdev_lock(netdev);
-	if (!mutex_trylock(&adapter->crit_lock)) {
-		if (adapter->state == __IAVF_REMOVE) {
-			netdev_unlock(netdev);
-			return;
-		}
-
-		goto restart_watchdog;
-	}
+	netdev_assert_locked(adapter->netdev);
+	lockdep_assert_held(&adapter->crit_lock);
 
 	if (adapter->flags & IAVF_FLAG_PF_COMMS_FAILED)
 		iavf_change_state(adapter, __IAVF_COMM_FAILED);
@@ -2939,39 +2929,19 @@ static void iavf_watchdog_task(struct work_struct *work)
 	switch (adapter->state) {
 	case __IAVF_STARTUP:
 		iavf_startup(adapter);
-		mutex_unlock(&adapter->crit_lock);
-		netdev_unlock(netdev);
-		queue_delayed_work(adapter->wq, &adapter->watchdog_task,
-				   msecs_to_jiffies(30));
-		return;
+		return 30;
 	case __IAVF_INIT_VERSION_CHECK:
 		iavf_init_version_check(adapter);
-		mutex_unlock(&adapter->crit_lock);
-		netdev_unlock(netdev);
-		queue_delayed_work(adapter->wq, &adapter->watchdog_task,
-				   msecs_to_jiffies(30));
-		return;
+		return 30;
 	case __IAVF_INIT_GET_RESOURCES:
 		iavf_init_get_resources(adapter);
-		mutex_unlock(&adapter->crit_lock);
-		netdev_unlock(netdev);
-		queue_delayed_work(adapter->wq, &adapter->watchdog_task,
-				   msecs_to_jiffies(1));
-		return;
+		return 1;
 	case __IAVF_INIT_EXTENDED_CAPS:
 		iavf_init_process_extended_caps(adapter);
-		mutex_unlock(&adapter->crit_lock);
-		netdev_unlock(netdev);
-		queue_delayed_work(adapter->wq, &adapter->watchdog_task,
-				   msecs_to_jiffies(1));
-		return;
+		return 1;
 	case __IAVF_INIT_CONFIG_ADAPTER:
 		iavf_init_config_adapter(adapter);
-		mutex_unlock(&adapter->crit_lock);
-		netdev_unlock(netdev);
-		queue_delayed_work(adapter->wq, &adapter->watchdog_task,
-				   msecs_to_jiffies(1));
-		return;
+		return 1;
 	case __IAVF_INIT_FAILED:
 		if (test_bit(__IAVF_IN_REMOVE_TASK,
 			     &adapter->crit_section)) {
@@ -2979,27 +2949,18 @@ static void iavf_watchdog_task(struct work_struct *work)
 			 * watchdog task, iavf_remove should handle this state
 			 * as it can loop forever
 			 */
-			mutex_unlock(&adapter->crit_lock);
-			netdev_unlock(netdev);
-			return;
+			return IAVF_NO_RESCHED;
 		}
 		if (++adapter->aq_wait_count > IAVF_AQ_MAX_ERR) {
 			dev_err(&adapter->pdev->dev,
 				"Failed to communicate with PF; waiting before retry\n");
 			adapter->flags |= IAVF_FLAG_PF_COMMS_FAILED;
 			iavf_shutdown_adminq(hw);
-			mutex_unlock(&adapter->crit_lock);
-			netdev_unlock(netdev);
-			queue_delayed_work(adapter->wq,
-					   &adapter->watchdog_task, (5 * HZ));
-			return;
+			return 5000;
 		}
 		/* Try again from failed step*/
 		iavf_change_state(adapter, adapter->last_state);
-		mutex_unlock(&adapter->crit_lock);
-		netdev_unlock(netdev);
-		queue_delayed_work(adapter->wq, &adapter->watchdog_task, HZ);
-		return;
+		return 1000;
 	case __IAVF_COMM_FAILED:
 		if (test_bit(__IAVF_IN_REMOVE_TASK,
 			     &adapter->crit_section)) {
@@ -3009,9 +2970,7 @@ static void iavf_watchdog_task(struct work_struct *work)
 			 */
 			iavf_change_state(adapter, __IAVF_INIT_FAILED);
 			adapter->flags &= ~IAVF_FLAG_PF_COMMS_FAILED;
-			mutex_unlock(&adapter->crit_lock);
-			netdev_unlock(netdev);
-			return;
+			return IAVF_NO_RESCHED;
 		}
 		reg_val = rd32(hw, IAVF_VFGEN_RSTAT) &
 			  IAVF_VFGEN_RSTAT_VFR_STATE_MASK;
@@ -3029,18 +2988,9 @@ static void iavf_watchdog_task(struct work_struct *work)
 		}
 		adapter->aq_required = 0;
 		adapter->current_op = VIRTCHNL_OP_UNKNOWN;
-		mutex_unlock(&adapter->crit_lock);
-		netdev_unlock(netdev);
-		queue_delayed_work(adapter->wq,
-				   &adapter->watchdog_task,
-				   msecs_to_jiffies(10));
-		return;
+		return 10;
 	case __IAVF_RESETTING:
-		mutex_unlock(&adapter->crit_lock);
-		netdev_unlock(netdev);
-		queue_delayed_work(adapter->wq, &adapter->watchdog_task,
-				   HZ * 2);
-		return;
+		return 2000;
 	case __IAVF_DOWN:
 	case __IAVF_DOWN_PENDING:
 	case __IAVF_TESTING:
@@ -3067,9 +3017,7 @@ static void iavf_watchdog_task(struct work_struct *work)
 		break;
 	case __IAVF_REMOVE:
 	default:
-		mutex_unlock(&adapter->crit_lock);
-		netdev_unlock(netdev);
-		return;
+		return IAVF_NO_RESCHED;
 	}
 
 	/* check for hw reset */
@@ -3079,24 +3027,43 @@ static void iavf_watchdog_task(struct work_struct *work)
 		adapter->current_op = VIRTCHNL_OP_UNKNOWN;
 		dev_err(&adapter->pdev->dev, "Hardware reset detected\n");
 		iavf_schedule_reset(adapter, IAVF_FLAG_RESET_PENDING);
-		mutex_unlock(&adapter->crit_lock);
-		netdev_unlock(netdev);
-		queue_delayed_work(adapter->wq,
-				   &adapter->watchdog_task, HZ * 2);
-		return;
 	}
+
+	return adapter->aq_required ? 20 : 2000;
+}
+
+static void iavf_watchdog_task(struct work_struct *work)
+{
+	struct iavf_adapter *adapter = container_of(work,
+						    struct iavf_adapter,
+						    watchdog_task.work);
+	struct net_device *netdev = adapter->netdev;
+	int msec_delay;
+
+	netdev_lock(netdev);
+	if (!mutex_trylock(&adapter->crit_lock)) {
+		if (adapter->state == __IAVF_REMOVE) {
+			netdev_unlock(netdev);
+			return;
+		}
+
+		msec_delay = 20;
+		goto restart_watchdog;
+	}
+
+	msec_delay = iavf_watchdog_step(adapter);
 
 	mutex_unlock(&adapter->crit_lock);
 restart_watchdog:
 	netdev_unlock(netdev);
+
+	/* note that we schedule a different task */
 	if (adapter->state >= __IAVF_DOWN)
 		queue_work(adapter->wq, &adapter->adminq_task);
-	if (adapter->aq_required)
+
+	if (msec_delay != IAVF_NO_RESCHED)
 		queue_delayed_work(adapter->wq, &adapter->watchdog_task,
-				   msecs_to_jiffies(20));
-	else
-		queue_delayed_work(adapter->wq, &adapter->watchdog_task,
-				   HZ * 2);
+				   msecs_to_jiffies(msec_delay));
 }
 
 /**
@@ -5646,7 +5613,7 @@ static int iavf_resume(struct device *dev_d)
 {
 	struct pci_dev *pdev = to_pci_dev(dev_d);
 	struct iavf_adapter *adapter;
-	u32 err;
+	int err;
 
 	adapter = iavf_pdev_to_adapter(pdev);
 
