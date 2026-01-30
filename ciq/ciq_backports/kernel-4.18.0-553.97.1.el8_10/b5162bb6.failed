@@ -1,0 +1,117 @@
+scsi: lpfc: Avoid potential ndlp use-after-free in dev_loss_tmo_callbk
+
+jira KERNEL-548
+Rebuild_History Non-Buildable kernel-4.18.0-553.97.1.el8_10
+commit-author Justin Tee <justin.tee@broadcom.com>
+commit b5162bb6aa1ec04dff4509b025883524b6d7e7ca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.97.1.el8_10/b5162bb6.failed
+
+Smatch detected a potential use-after-free of an ndlp oject in
+dev_loss_tmo_callbk during driver unload or fatal error handling.
+
+Fix by reordering code to avoid potential use-after-free if initial
+nodelist reference has been previously removed.
+
+Fixes: 4281f44ea8bf ("scsi: lpfc: Prevent NDLP reference count underflow in dev_loss_tmo callback")
+	Reported-by: Dan Carpenter <dan.carpenter@linaro.org>
+Closes: https://lore.kernel.org/linux-scsi/41c1d855-9eb5-416f-ac12-8b61929201a3@stanley.mountain/
+	Signed-off-by: Justin Tee <justin.tee@broadcom.com>
+Link: https://lore.kernel.org/r/20250425194806.3585-6-justintee8345@gmail.com
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit b5162bb6aa1ec04dff4509b025883524b6d7e7ca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/lpfc/lpfc_hbadisc.c
+diff --cc drivers/scsi/lpfc/lpfc_hbadisc.c
+index 2be2e893f962,3d15a964f5c9..000000000000
+--- a/drivers/scsi/lpfc/lpfc_hbadisc.c
++++ b/drivers/scsi/lpfc/lpfc_hbadisc.c
+@@@ -161,6 -161,7 +161,10 @@@ lpfc_dev_loss_tmo_callbk(struct fc_rpor
+  	struct lpfc_hba   *phba;
+  	struct lpfc_work_evt *evtp;
+  	unsigned long iflags;
+++<<<<<<< HEAD
+++=======
++ 	bool drop_initial_node_ref = false;
+++>>>>>>> b5162bb6aa1e (scsi: lpfc: Avoid potential ndlp use-after-free in dev_loss_tmo_callbk)
+  
+  	ndlp = ((struct lpfc_rport_data *)rport->dd_data)->pnode;
+  	if (!ndlp)
+@@@ -186,35 -188,42 +190,71 @@@
+  		spin_lock_irqsave(&ndlp->lock, iflags);
+  		ndlp->rport = NULL;
+  
+++<<<<<<< HEAD
+++=======
++ 		/* Only 1 thread can drop the initial node reference.
++ 		 * If not registered for NVME and NLP_DROPPED flag is
++ 		 * clear, remove the initial reference.
++ 		 */
++ 		if (!(ndlp->fc4_xpt_flags & NVME_XPT_REGD))
++ 			if (!test_and_set_bit(NLP_DROPPED, &ndlp->nlp_flag))
++ 				drop_initial_node_ref = true;
++ 
+++>>>>>>> b5162bb6aa1e (scsi: lpfc: Avoid potential ndlp use-after-free in dev_loss_tmo_callbk)
+  		/* The scsi_transport is done with the rport so lpfc cannot
+ -		 * call to unregister.
+ +		 * call to unregister. Remove the scsi transport reference
+ +		 * and clean up the SCSI transport node details.
+  		 */
+ -		if (ndlp->fc4_xpt_flags & SCSI_XPT_REGD) {
+ +		if (ndlp->fc4_xpt_flags & (NLP_XPT_REGD | SCSI_XPT_REGD)) {
+  			ndlp->fc4_xpt_flags &= ~SCSI_XPT_REGD;
+  
+++<<<<<<< HEAD
+ +			/* NVME transport-registered rports need the
+ +			 * NLP_XPT_REGD flag to complete an unregister.
+ +			 */
+ +			if (!(ndlp->fc4_xpt_flags & NVME_XPT_REGD))
+ +				ndlp->fc4_xpt_flags &= ~NLP_XPT_REGD;
+++=======
++ 			/* If NLP_XPT_REGD was cleared in lpfc_nlp_unreg_node,
++ 			 * unregister calls were made to the scsi and nvme
++ 			 * transports and refcnt was already decremented. Clear
++ 			 * the NLP_XPT_REGD flag only if the NVME nrport is
++ 			 * confirmed unregistered.
++ 			 */
++ 			if (ndlp->fc4_xpt_flags & NLP_XPT_REGD) {
++ 				if (!(ndlp->fc4_xpt_flags & NVME_XPT_REGD))
++ 					ndlp->fc4_xpt_flags &= ~NLP_XPT_REGD;
++ 				spin_unlock_irqrestore(&ndlp->lock, iflags);
++ 
++ 				/* Release scsi transport reference */
++ 				lpfc_nlp_put(ndlp);
++ 			} else {
++ 				spin_unlock_irqrestore(&ndlp->lock, iflags);
++ 			}
++ 		} else {
+++>>>>>>> b5162bb6aa1e (scsi: lpfc: Avoid potential ndlp use-after-free in dev_loss_tmo_callbk)
+  			spin_unlock_irqrestore(&ndlp->lock, iflags);
+ +			lpfc_nlp_put(ndlp);
+ +			spin_lock_irqsave(&ndlp->lock, iflags);
+ +		}
+ +
+++<<<<<<< HEAD
+ +		/* Only 1 thread can drop the initial node reference.  If
+ +		 * another thread has set NLP_DROPPED, this thread is done.
+ +		 */
+ +		if (!(ndlp->fc4_xpt_flags & NVME_XPT_REGD) &&
+ +		    !(ndlp->nlp_flag & NLP_DROPPED)) {
+ +			ndlp->nlp_flag |= NLP_DROPPED;
+ +			spin_unlock_irqrestore(&ndlp->lock, iflags);
+ +			lpfc_nlp_put(ndlp);
+ +			return;
+  		}
+  
+ +		spin_unlock_irqrestore(&ndlp->lock, iflags);
+++=======
++ 		if (drop_initial_node_ref)
++ 			lpfc_nlp_put(ndlp);
+++>>>>>>> b5162bb6aa1e (scsi: lpfc: Avoid potential ndlp use-after-free in dev_loss_tmo_callbk)
+  		return;
+  	}
+  
+* Unmerged path drivers/scsi/lpfc/lpfc_hbadisc.c
