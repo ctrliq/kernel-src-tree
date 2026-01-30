@@ -839,7 +839,7 @@ cifs_d_revalidate(struct dentry *direntry, unsigned int flags)
 			return 1;
 		}
 	} else {
-		struct cifs_sb_info *cifs_sb = CIFS_SB(dir->i_sb);
+		struct cifs_sb_info *cifs_sb = CIFS_SB(d_inode(direntry->d_parent)->i_sb);
 		struct cifs_tcon *tcon = cifs_sb_master_tcon(cifs_sb);
 
 		if (!open_cached_dir_by_dentry(tcon, direntry->d_parent, &cfid)) {
