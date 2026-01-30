@@ -210,7 +210,6 @@ struct lpfc_node_rrq {
 					   NPR list */
 #define NLP_RM_DFLT_RPI    0x04000000	/* need to remove leftover dflt RPI */
 #define NLP_NODEV_REMOVE   0x08000000	/* Defer removal till discovery ends */
-#define NLP_TARGET_REMOVE  0x10000000   /* Target remove in process */
 #define NLP_SC_REQ         0x20000000	/* Target requires authentication */
 #define NLP_FIRSTBURST     0x40000000	/* Target supports FirstBurst */
 #define NLP_RPI_REGISTERED 0x80000000	/* nlp_rpi is valid */
