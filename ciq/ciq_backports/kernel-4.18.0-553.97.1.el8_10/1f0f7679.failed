@@ -1,0 +1,113 @@
+scsi: lpfc: Update PRLO handling in direct attached topology
+
+jira KERNEL-548
+Rebuild_History Non-Buildable kernel-4.18.0-553.97.1.el8_10
+commit-author Justin Tee <justin.tee@broadcom.com>
+commit 1f0f7679ad8942f810b0f19ee9cf098c3502d66a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.97.1.el8_10/1f0f7679.failed
+
+A kref imbalance occurs when handling an unsolicited PRLO in direct
+attached topology.
+
+Rework PRLO rcv handling when in MAPPED state.  Save the state that we were
+handling a PRLO by setting nlp_last_elscmd to ELS_CMD_PRLO.  Then in the
+lpfc_cmpl_els_logo_acc() completion routine, manually restart discovery.
+By issuing the PLOGI, which nlp_gets, before nlp_put at the end of the
+lpfc_cmpl_els_logo_acc() routine, we are saving us from a final nlp_put.
+And, we are still allowing the unreg_rpi to happen.
+
+	Signed-off-by: Justin Tee <justin.tee@broadcom.com>
+Link: https://lore.kernel.org/r/20240726231512.92867-7-justintee8345@gmail.com
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 1f0f7679ad8942f810b0f19ee9cf098c3502d66a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/lpfc/lpfc_els.c
+diff --cc drivers/scsi/lpfc/lpfc_els.c
+index 5c9369b9b870,de0ec945d2f1..000000000000
+--- a/drivers/scsi/lpfc/lpfc_els.c
++++ b/drivers/scsi/lpfc/lpfc_els.c
+@@@ -5228,29 -5261,22 +5229,46 @@@ lpfc_cmpl_els_logo_acc(struct lpfc_hba 
+  		goto out;
+  
+  	if (ndlp->nlp_state == NLP_STE_NPR_NODE) {
+++<<<<<<< HEAD
+ +
+ +		/* If PLOGI is being retried, PLOGI completion will cleanup the
+ +		 * node. The NLP_NPR_2B_DISC flag needs to be retained to make
+ +		 * progress on nodes discovered from last RSCN.
+ +		 */
+ +		if ((ndlp->nlp_flag & NLP_DELAY_TMO) &&
+ +		    (ndlp->nlp_last_elscmd == ELS_CMD_PLOGI))
+ +			goto out;
+ +
+ +		/* NPort Recovery mode or node is just allocated */
+ +		if (!lpfc_nlp_not_used(ndlp)) {
+ +			/* A LOGO is completing and the node is in NPR state.
+ +			 * Just unregister the RPI because the node is still
+ +			 * required.
+ +			 */
+ +			lpfc_unreg_rpi(vport, ndlp);
+ +		} else {
+ +			/* Indicate the node has already released, should
+ +			 * not reference to it from within lpfc_els_free_iocb.
+ +			 */
+ +			cmdiocb->context1 = NULL;
+++=======
++ 		if (ndlp->nlp_flag & NLP_RPI_REGISTERED)
++ 			lpfc_unreg_rpi(vport, ndlp);
++ 
++ 		/* If came from PRLO, then PRLO_ACC is done.
++ 		 * Start rediscovery now.
++ 		 */
++ 		if (ndlp->nlp_last_elscmd == ELS_CMD_PRLO) {
++ 			spin_lock_irq(&ndlp->lock);
++ 			ndlp->nlp_flag |= NLP_NPR_2B_DISC;
++ 			spin_unlock_irq(&ndlp->lock);
++ 			ndlp->nlp_prev_state = ndlp->nlp_state;
++ 			lpfc_nlp_set_state(vport, ndlp, NLP_STE_PLOGI_ISSUE);
++ 			lpfc_issue_els_plogi(vport, ndlp->nlp_DID, 0);
+++>>>>>>> 1f0f7679ad89 (scsi: lpfc: Update PRLO handling in direct attached topology)
+  		}
+  	}
++ 
+   out:
+  	/*
+  	 * The driver received a LOGO from the rport and has ACK'd it.
+* Unmerged path drivers/scsi/lpfc/lpfc_els.c
+diff --git a/drivers/scsi/lpfc/lpfc_nportdisc.c b/drivers/scsi/lpfc/lpfc_nportdisc.c
+index 297b4db5a986..c51a0f371cd0 100644
+--- a/drivers/scsi/lpfc/lpfc_nportdisc.c
++++ b/drivers/scsi/lpfc/lpfc_nportdisc.c
+@@ -2620,8 +2620,26 @@ lpfc_rcv_prlo_mapped_node(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
+ 	/* flush the target */
+ 	lpfc_sli_abort_iocb(vport, ndlp->nlp_sid, 0, LPFC_CTX_TGT);
+ 
+-	/* Treat like rcv logo */
+-	lpfc_rcv_logo(vport, ndlp, cmdiocb, ELS_CMD_PRLO);
++	/* Send PRLO_ACC */
++	spin_lock_irq(&ndlp->lock);
++	ndlp->nlp_flag |= NLP_LOGO_ACC;
++	spin_unlock_irq(&ndlp->lock);
++	lpfc_els_rsp_acc(vport, ELS_CMD_PRLO, cmdiocb, ndlp, NULL);
++
++	/* Save ELS_CMD_PRLO as the last elscmd and then set to NPR.
++	 * lpfc_cmpl_els_logo_acc is expected to restart discovery.
++	 */
++	ndlp->nlp_last_elscmd = ELS_CMD_PRLO;
++	ndlp->nlp_prev_state = ndlp->nlp_state;
++
++	lpfc_printf_vlog(vport, KERN_INFO, LOG_NODE | LOG_ELS | LOG_DISCOVERY,
++			 "3422 DID x%06x nflag x%x lastels x%x ref cnt %u\n",
++			 ndlp->nlp_DID, ndlp->nlp_flag,
++			 ndlp->nlp_last_elscmd,
++			 kref_read(&ndlp->kref));
++
++	lpfc_nlp_set_state(vport, ndlp, NLP_STE_NPR_NODE);
++
+ 	return ndlp->nlp_state;
+ }
+ 
