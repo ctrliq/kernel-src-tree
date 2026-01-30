@@ -1,0 +1,141 @@
+scsi: lpfc: Fill in missing ndlp kref puts in error paths
+
+jira KERNEL-548
+Rebuild_History Non-Buildable kernel-4.18.0-553.97.1.el8_10
+commit-author James Smart <jsmart2021@gmail.com>
+commit ba3d58a1df460ba28bb5989ad7269ff48682375a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.97.1.el8_10/ba3d58a1.failed
+
+Code review, following every lpfc_nlp_get() call vs calls during error
+handling, discovered cases of missing put calls.
+
+Correct by adding ndlp kref puts in the respective error paths.
+
+Also added comments to several of the error paths to record relationships
+to reference counts.
+
+Link: https://lore.kernel.org/r/20220506035519.50908-3-jsmart2021@gmail.com
+Co-developed-by: Justin Tee <justin.tee@broadcom.com>
+	Signed-off-by: Justin Tee <justin.tee@broadcom.com>
+	Signed-off-by: James Smart <jsmart2021@gmail.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit ba3d58a1df460ba28bb5989ad7269ff48682375a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/lpfc/lpfc_els.c
+diff --cc drivers/scsi/lpfc/lpfc_els.c
+index 1fcc5ef24ddf,ace812ce857d..000000000000
+--- a/drivers/scsi/lpfc/lpfc_els.c
++++ b/drivers/scsi/lpfc/lpfc_els.c
+@@@ -8709,14 -8722,17 +8709,22 @@@ lpfc_issue_els_rrq(struct lpfc_vport *v
+  		"Issue RRQ:     did:x%x",
+  		did, rrq->xritag, rrq->rxid);
+  	elsiocb->context_un.rrq = rrq;
+ -	elsiocb->cmd_cmpl = lpfc_cmpl_els_rrq;
+ +	elsiocb->iocb_cmpl = lpfc_cmpl_els_rrq;
+  
+++<<<<<<< HEAD
+ +	lpfc_nlp_get(ndlp);
+ +	elsiocb->context1 = ndlp;
+++=======
++ 	elsiocb->ndlp = lpfc_nlp_get(ndlp);
++ 	if (!elsiocb->ndlp)
++ 		goto io_err;
+++>>>>>>> ba3d58a1df46 (scsi: lpfc: Fill in missing ndlp kref puts in error paths)
+  
+  	ret = lpfc_sli_issue_iocb(phba, LPFC_ELS_RING, elsiocb, 0);
+- 	if (ret == IOCB_ERROR)
++ 	if (ret == IOCB_ERROR) {
++ 		lpfc_nlp_put(ndlp);
+  		goto io_err;
++ 	}
+  	return 0;
+  
+   io_err:
+* Unmerged path drivers/scsi/lpfc/lpfc_els.c
+diff --git a/drivers/scsi/lpfc/lpfc_nportdisc.c b/drivers/scsi/lpfc/lpfc_nportdisc.c
+index 297b4db5a986..677c2416ecac 100644
+--- a/drivers/scsi/lpfc/lpfc_nportdisc.c
++++ b/drivers/scsi/lpfc/lpfc_nportdisc.c
+@@ -498,6 +498,10 @@ lpfc_rcv_plogi(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
+ 			lpfc_config_link(phba, link_mbox);
+ 			link_mbox->mbox_cmpl = lpfc_sli_def_mbox_cmpl;
+ 			link_mbox->vport = vport;
++
++			/* The default completion handling for CONFIG_LINK
++			 * does not require the ndlp so no reference is needed.
++			 */
+ 			link_mbox->ctx_ndlp = ndlp;
+ 
+ 			rc = lpfc_sli_issue_mbox(phba, link_mbox, MBX_NOWAIT);
+@@ -623,6 +627,9 @@ lpfc_rcv_plogi(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
+ 	 */
+ 	login_mbox->mbox_cmpl = lpfc_defer_plogi_acc;
+ 	login_mbox->ctx_ndlp = lpfc_nlp_get(ndlp);
++	if (!login_mbox->ctx_ndlp)
++		goto out;
++
+ 	login_mbox->context3 = save_iocb; /* For PLOGI ACC */
+ 
+ 	spin_lock_irq(&ndlp->lock);
+@@ -631,8 +638,10 @@ lpfc_rcv_plogi(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
+ 
+ 	/* Start the ball rolling by issuing REG_LOGIN here */
+ 	rc = lpfc_sli_issue_mbox(phba, login_mbox, MBX_NOWAIT);
+-	if (rc == MBX_NOT_FINISHED)
++	if (rc == MBX_NOT_FINISHED) {
++		lpfc_nlp_put(ndlp);
+ 		goto out;
++	}
+ 	lpfc_nlp_set_state(vport, ndlp, NLP_STE_REG_LOGIN_ISSUE);
+ 
+ 	return 1;
+@@ -1104,8 +1113,10 @@ lpfc_release_rpi(struct lpfc_hba *phba, struct lpfc_vport *vport,
+ 				 ndlp->nlp_rpi, ndlp->nlp_DID, ndlp->nlp_flag);
+ 
+ 		rc = lpfc_sli_issue_mbox(phba, pmb, MBX_NOWAIT);
+-		if (rc == MBX_NOT_FINISHED)
++		if (rc == MBX_NOT_FINISHED) {
++			lpfc_nlp_put(ndlp);
+ 			mempool_free(pmb, phba->mbox_mem_pool);
++		}
+ 	}
+ }
+ 
+diff --git a/drivers/scsi/lpfc/lpfc_nvme.c b/drivers/scsi/lpfc/lpfc_nvme.c
+index c484b65666c2..eb7846b25fff 100644
+--- a/drivers/scsi/lpfc/lpfc_nvme.c
++++ b/drivers/scsi/lpfc/lpfc_nvme.c
+@@ -2362,6 +2362,11 @@ lpfc_nvme_register_port(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp)
+ 		rpinfo.dev_loss_tmo = vport->cfg_devloss_tmo;
+ 
+ 	spin_lock_irq(&ndlp->lock);
++
++	/* If an oldrport exists, so does the ndlp reference.  If not
++	 * a new reference is needed because either the node has never
++	 * been registered or it's been unregistered and getting deleted.
++	 */
+ 	oldrport = lpfc_ndlp_get_nrport(ndlp);
+ 	if (oldrport) {
+ 		prev_ndlp = oldrport->ndlp;
+diff --git a/drivers/scsi/lpfc/lpfc_sli.c b/drivers/scsi/lpfc/lpfc_sli.c
+index cde4f0a52f61..3a1b44fc43c6 100644
+--- a/drivers/scsi/lpfc/lpfc_sli.c
++++ b/drivers/scsi/lpfc/lpfc_sli.c
+@@ -21345,8 +21345,12 @@ lpfc_cleanup_pending_mbox(struct lpfc_vport *vport)
+ 			mb->mbox_cmpl = lpfc_sli_def_mbox_cmpl;
+ 		if (mb->u.mb.mbxCommand == MBX_REG_LOGIN64) {
+ 			act_mbx_ndlp = (struct lpfc_nodelist *)mb->ctx_ndlp;
+-			/* Put reference count for delayed processing */
++
++			/* This reference is local to this routine.  The
++			 * reference is removed at routine exit.
++			 */
+ 			act_mbx_ndlp = lpfc_nlp_get(act_mbx_ndlp);
++
+ 			/* Unregister the RPI when mailbox complete */
+ 			mb->mbox_flag |= LPFC_MBX_IMED_UNREG;
+ 		}
