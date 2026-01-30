@@ -3786,6 +3786,9 @@ static int ublk_ctrl_uring_cmd(struct io_uring_cmd *cmd,
 	    issue_flags & IO_URING_F_NONBLOCK)
 		return -EAGAIN;
 
+	if (!(issue_flags & IO_URING_F_SQE128))
+		return -EINVAL;
+
 	header.dev_id = READ_ONCE(ub_src->dev_id);
 	header.queue_id = READ_ONCE(ub_src->queue_id);
 	header.len = READ_ONCE(ub_src->len);
@@ -3793,9 +3796,6 @@ static int ublk_ctrl_uring_cmd(struct io_uring_cmd *cmd,
 	header.data[0] = READ_ONCE(ub_src->data[0]);
 	header.dev_path_len = READ_ONCE(ub_src->dev_path_len);
 	ublk_ctrl_cmd_dump(cmd_op, &header);
-
-	if (!(issue_flags & IO_URING_F_SQE128))
-		goto out;
 
 	ret = ublk_check_cmd_op(cmd_op);
 	if (ret)
