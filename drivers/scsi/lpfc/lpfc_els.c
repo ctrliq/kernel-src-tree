@@ -1081,7 +1081,7 @@ stop_rr_fcf_flogi:
 		    !(ndlp->fc4_xpt_flags & SCSI_XPT_REGD))
 			lpfc_nlp_put(ndlp);
 
-		lpfc_printf_vlog(vport, KERN_WARNING, LOG_TRACE_EVENT,
+		lpfc_printf_vlog(vport, KERN_WARNING, LOG_ELS,
 				 "0150 FLOGI failure Status:x%x/x%x "
 				 "xri x%x TMO:x%x refcnt %d\n",
 				 irsp->ulpStatus, irsp->un.ulpWord[4],
@@ -1126,7 +1126,6 @@ stop_rr_fcf_flogi:
 			if (!lpfc_error_lost_link(irsp))
 				lpfc_issue_reg_vfi(vport);
 
-			lpfc_nlp_put(ndlp);
 			goto out;
 		}
 		goto flogifail;
