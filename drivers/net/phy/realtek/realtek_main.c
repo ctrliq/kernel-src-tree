@@ -17,6 +17,8 @@
 #include <linux/clk.h>
 #include <linux/string_choices.h>
 
+#include "realtek.h"
+
 #define RTL8201F_IER				0x13
 
 #define RTL8201F_ISR				0x1e
@@ -1119,6 +1121,15 @@ static int rtl822x_write_mmd(struct phy_device *phydev, int devnum, u16 regnum,
 	return ret;
 }
 
+static int rtl822x_probe(struct phy_device *phydev)
+{
+	if (IS_ENABLED(CONFIG_REALTEK_PHY_HWMON) &&
+	    phydev->phy_id != RTL_GENERIC_PHYID)
+		return rtl822x_hwmon_init(phydev);
+
+	return 0;
+}
+
 static int rtl822xb_config_init(struct phy_device *phydev)
 {
 	bool has_2500, has_sgmii;
@@ -2065,6 +2076,7 @@ static struct phy_driver realtek_drvs[] = {
 		.match_phy_device = rtl_internal_nbaset_match_phy_device,
 		.name           = "Realtek Internal NBASE-T PHY",
 		.flags		= PHY_IS_INTERNAL,
+		.probe		= rtl822x_probe,
 		.get_features   = rtl822x_get_features,
 		.config_aneg    = rtl822x_config_aneg,
 		.read_status    = rtl822x_read_status,
