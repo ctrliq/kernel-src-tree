@@ -5666,6 +5666,7 @@ static inline int nf_ingress(struct sk_buff *skb, struct packet_type **pt_prev,
 static int __netif_receive_skb_core(struct sk_buff **pskb, bool pfmemalloc,
 				    struct packet_type **ppt_prev)
 {
+	enum skb_drop_reason drop_reason = SKB_DROP_REASON_UNHANDLED_PROTO;
 	struct packet_type *ptype, *pt_prev;
 	rx_handler_func_t *rx_handler;
 	struct sk_buff *skb = *pskb;
@@ -5751,8 +5752,10 @@ skip_taps:
 #endif
 	skb_reset_redirect(skb);
 skip_classify:
-	if (pfmemalloc && !skb_pfmemalloc_protocol(skb))
+	if (pfmemalloc && !skb_pfmemalloc_protocol(skb)) {
+		drop_reason = SKB_DROP_REASON_PFMEMALLOC;
 		goto drop;
+	}
 
 	if (skb_vlan_tag_present(skb)) {
 		if (pt_prev) {
@@ -5859,7 +5862,8 @@ drop:
 			dev_core_stats_rx_dropped_inc(skb->dev);
 		else
 			dev_core_stats_rx_nohandler_inc(skb->dev);
-		kfree_skb_reason(skb, SKB_DROP_REASON_UNHANDLED_PROTO);
+
+		kfree_skb_reason(skb, drop_reason);
 		/* Jamal, now you will not able to escape explaining
 		 * me how you were going to use this. :-)
 		 */
@@ -6181,16 +6185,18 @@ static DEFINE_PER_CPU(struct work_struct, flush_works);
 static void flush_backlog(struct work_struct *work)
 {
 	struct sk_buff *skb, *tmp;
+	struct sk_buff_head list;
 	struct softnet_data *sd;
 
+	__skb_queue_head_init(&list);
 	local_bh_disable();
 	sd = this_cpu_ptr(&softnet_data);
 
 	backlog_lock_irq_disable(sd);
 	skb_queue_walk_safe(&sd->input_pkt_queue, skb, tmp) {
-		if (skb->dev->reg_state == NETREG_UNREGISTERING) {
+		if (READ_ONCE(skb->dev->reg_state) == NETREG_UNREGISTERING) {
 			__skb_unlink(skb, &sd->input_pkt_queue);
-			dev_kfree_skb_irq(skb);
+			__skb_queue_tail(&list, skb);
 			rps_input_queue_head_incr(sd);
 		}
 	}
@@ -6198,14 +6204,16 @@ static void flush_backlog(struct work_struct *work)
 
 	local_lock_nested_bh(&softnet_data.process_queue_bh_lock);
 	skb_queue_walk_safe(&sd->process_queue, skb, tmp) {
-		if (skb->dev->reg_state == NETREG_UNREGISTERING) {
+		if (READ_ONCE(skb->dev->reg_state) == NETREG_UNREGISTERING) {
 			__skb_unlink(skb, &sd->process_queue);
-			kfree_skb(skb);
+			__skb_queue_tail(&list, skb);
 			rps_input_queue_head_incr(sd);
 		}
 	}
 	local_unlock_nested_bh(&softnet_data.process_queue_bh_lock);
 	local_bh_enable();
+
+	__skb_queue_purge_reason(&list, SKB_DROP_REASON_DEV_READY);
 }
 
 static bool flush_required(int cpu)
