@@ -161,6 +161,8 @@ nfs_file_read(struct kiocb *iocb, struct iov_iter *to)
 	struct inode *inode = file_inode(iocb->ki_filp);
 	ssize_t result;
 
+	trace_nfs_file_read(iocb, to);
+
 	if (iocb->ki_flags & IOCB_DIRECT)
 		return nfs_file_direct_read(iocb, to, false);
 
@@ -383,6 +385,8 @@ static int nfs_write_begin(struct file *file, struct address_space *mapping,
 	int once_thru = 0;
 	int ret;
 
+	trace_nfs_write_begin(file_inode(file), pos, len);
+
 	dfprintk(PAGECACHE, "NFS: write_begin(%pD2(%lu), %u@%lld)\n",
 		file, mapping->host->i_ino, len, (long long) pos);
 	nfs_truncate_last_folio(mapping, i_size_read(mapping->host), pos);
@@ -391,8 +395,10 @@ static int nfs_write_begin(struct file *file, struct address_space *mapping,
 start:
 	folio = __filemap_get_folio(mapping, pos >> PAGE_SHIFT, fgp,
 				    mapping_gfp_mask(mapping));
-	if (IS_ERR(folio))
-		return PTR_ERR(folio);
+	if (IS_ERR(folio)) {
+		ret = PTR_ERR(folio);
+		goto out;
+	}
 	*foliop = folio;
 
 	ret = nfs_flush_incompatible(file, folio);
@@ -407,6 +413,8 @@ start:
 		if (!ret)
 			goto start;
 	}
+out:
+	trace_nfs_write_begin_done(file_inode(file), pos, len, ret);
 	return ret;
 }
 
@@ -418,6 +426,7 @@ static int nfs_write_end(struct file *file, struct address_space *mapping,
 	unsigned offset = offset_in_folio(folio, pos);
 	int status;
 
+	trace_nfs_write_end(file_inode(file), pos, len);
 	dfprintk(PAGECACHE, "NFS: write_end(%pD2(%lu), %u@%lld)\n",
 		file, mapping->host->i_ino, len, (long long) pos);
 
@@ -446,13 +455,16 @@ static int nfs_write_end(struct file *file, struct address_space *mapping,
 	folio_unlock(folio);
 	folio_put(folio);
 
-	if (status < 0)
+	if (status < 0) {
+		trace_nfs_write_end_done(file_inode(file), pos, len, status);
 		return status;
+	}
 	NFS_I(mapping->host)->write_io += copied;
 
 	if (nfs_ctx_key_to_expire(ctx, mapping->host))
 		nfs_wb_all(mapping->host);
 
+	trace_nfs_write_end_done(file_inode(file), pos, len, copied);
 	return copied;
 }
 
@@ -494,7 +506,8 @@ static bool nfs_release_folio(struct folio *folio, gfp_t gfp)
 		if ((current_gfp_context(gfp) & GFP_KERNEL) != GFP_KERNEL ||
 		    current_is_kswapd() || current_is_kcompactd())
 			return false;
-		if (nfs_wb_folio(folio->mapping->host, folio) < 0)
+		if (nfs_wb_folio_reclaim(folio->mapping->host, folio) < 0 ||
+		    folio_test_private(folio))
 			return false;
 	}
 	return nfs_fscache_release_folio(folio, gfp);
@@ -684,6 +697,8 @@ ssize_t nfs_file_write(struct kiocb *iocb, struct iov_iter *from)
 	ssize_t result, written;
 	errseq_t since;
 	int error;
+
+	trace_nfs_file_write(iocb, from);
 
 	result = nfs_key_timeout_notify(file, inode);
 	if (result)
