@@ -80,6 +80,14 @@
 
 . xsk_prereqs.sh
 
+function generate_random_digits
+{
+	s=$(dd if=/dev/urandom count=1 2> /dev/null | cksum | cut -d' ' -f1)
+	s=${s:0:4}
+
+	echo $s
+}
+
 while getopts "cvD" flag
 do
 	case "${flag}" in
@@ -94,9 +102,9 @@ TEST_NAME="PREREQUISITES"
 URANDOM=/dev/urandom
 [ ! -e "${URANDOM}" ] && { echo "${URANDOM} not found. Skipping tests."; test_exit 1 1; }
 
-VETH0_POSTFIX=$(cat ${URANDOM} | tr -dc '0-9' | fold -w 256 | head -n 1 | head --bytes 4)
+VETH0_POSTFIX=$(generate_random_digits)
 VETH0=ve${VETH0_POSTFIX}
-VETH1_POSTFIX=$(cat ${URANDOM} | tr -dc '0-9' | fold -w 256 | head -n 1 | head --bytes 4)
+VETH1_POSTFIX=$(generate_random_digits)
 VETH1=ve${VETH1_POSTFIX}
 NS0=root
 NS1=af_xdp${VETH1_POSTFIX}
