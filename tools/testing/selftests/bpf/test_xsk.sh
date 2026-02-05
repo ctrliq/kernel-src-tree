@@ -74,6 +74,7 @@
 # Run test suite for physical device in loopback mode
 #   sudo ./test_xsk.sh -i IFACE
 
+set -x
 . xsk_prereqs.sh
 
 ETH=""
