@@ -619,7 +619,7 @@ static int kiocb_done(struct io_kiocb *req, ssize_t ret,
 		io_req_io_end(req);
 		io_req_set_res(req, final_ret, io_put_kbuf(req, ret, issue_flags));
 		io_req_rw_cleanup(req, issue_flags);
-		return IOU_OK;
+		return IOU_COMPLETE;
 	} else {
 		io_rw_done(req, ret);
 	}
@@ -1006,9 +1006,7 @@ int io_read_mshot(struct io_kiocb *req, unsigned int issue_flags)
 		 */
 		if (io_kbuf_recycle(req, issue_flags))
 			rw->len = 0;
-		if (issue_flags & IO_URING_F_MULTISHOT)
-			return IOU_ISSUE_SKIP_COMPLETE;
-		return -EAGAIN;
+		return IOU_RETRY;
 	} else if (ret <= 0) {
 		io_kbuf_recycle(req, issue_flags);
 		if (ret < 0)
@@ -1026,16 +1024,15 @@ int io_read_mshot(struct io_kiocb *req, unsigned int issue_flags)
 		rw->len = 0; /* similarly to above, reset len to 0 */
 
 		if (io_req_post_cqe(req, ret, cflags | IORING_CQE_F_MORE)) {
-			if (issue_flags & IO_URING_F_MULTISHOT) {
+			if (issue_flags & IO_URING_F_MULTISHOT)
 				/*
 				 * Force retry, as we might have more data to
 				 * be read and otherwise it won't get retried
 				 * until (if ever) another poll is triggered.
 				 */
 				io_poll_multishot_retry(req);
-				return IOU_ISSUE_SKIP_COMPLETE;
-			}
-			return -EAGAIN;
+
+			return IOU_RETRY;
 		}
 	}
 
@@ -1045,9 +1042,7 @@ int io_read_mshot(struct io_kiocb *req, unsigned int issue_flags)
 	 */
 	io_req_set_res(req, ret, cflags);
 	io_req_rw_cleanup(req, issue_flags);
-	if (issue_flags & IO_URING_F_MULTISHOT)
-		return IOU_STOP_MULTISHOT;
-	return IOU_OK;
+	return IOU_COMPLETE;
 }
 
 static bool io_kiocb_start_write(struct io_kiocb *req, struct kiocb *kiocb)
