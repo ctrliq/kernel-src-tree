@@ -285,7 +285,7 @@ static int __io_prep_rw(struct io_kiocb *req, const struct io_uring_sqe *sqe,
 
 	rw->addr = READ_ONCE(sqe->addr);
 	rw->len = READ_ONCE(sqe->len);
-	rw->flags = READ_ONCE(sqe->rw_flags);
+	rw->flags = (__force rwf_t) READ_ONCE(sqe->rw_flags);
 
 	attr_type_mask = READ_ONCE(sqe->attr_type_mask);
 	if (attr_type_mask) {
@@ -458,7 +458,10 @@ int io_read_mshot_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 
 void io_readv_writev_cleanup(struct io_kiocb *req)
 {
+	struct io_async_rw *rw = req->async_data;
+
 	lockdep_assert_held(&req->ctx->uring_lock);
+	io_vec_free(&rw->vec);
 	io_rw_recycle(req, 0);
 }
 
@@ -537,7 +540,7 @@ static void __io_complete_rw_common(struct io_kiocb *req, long res)
 {
 	if (res == req->cqe.res)
 		return;
-	if (res == -EAGAIN && io_rw_should_reissue(req)) {
+	if ((res == -EOPNOTSUPP || res == -EAGAIN) && io_rw_should_reissue(req)) {
 		req->flags |= REQ_F_REISSUE | REQ_F_BL_NO_RECYCLE;
 	} else {
 		req_set_fail(req);
@@ -882,6 +885,9 @@ static int io_rw_init_file(struct io_kiocb *req, fmode_t mode, int rw_type)
 
 	if (req->flags & REQ_F_HAS_METADATA) {
 		struct io_async_rw *io = req->async_data;
+
+		if (!(file->f_mode & FMODE_HAS_METADATA))
+			return -EINVAL;
 
 		/*
 		 * We have a union of meta fields with wpq used for buffered-io
