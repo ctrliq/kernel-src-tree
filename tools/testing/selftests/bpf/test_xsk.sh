@@ -74,6 +74,7 @@
 # Run and dump packet contents:
 #   sudo ./test_xsk.sh -D
 
+set -x
 . xsk_prereqs.sh
 
 while getopts "vD" flag
