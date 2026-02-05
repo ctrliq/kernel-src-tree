@@ -24,8 +24,8 @@
 #include <linux/pagemap.h>
 #include <linux/xattr.h>
 #include "cifsglob.h"
-#include "cifsacl.h"
 #include "cifsproto.h"
+#include "cifsacl.h"
 #include "smb2proto.h"
 #include "cifs_unicode.h"
 #include "cifs_debug.h"
@@ -34,6 +34,7 @@
 #include "smb2glob.h"
 #include "cifspdu.h"
 #include "cifs_spnego.h"
+#include "../common/smbdirect/smbdirect.h"
 #include "smbdirect.h"
 #include "trace.h"
 #ifdef CONFIG_CIFS_DFS_UPCALL
@@ -165,7 +166,7 @@ out:
 static int
 cifs_chan_skip_or_disable(struct cifs_ses *ses,
 			  struct TCP_Server_Info *server,
-			  bool from_reconnect)
+			  bool from_reconnect, bool disable_mchan)
 {
 	struct TCP_Server_Info *pserver;
 	unsigned int chan_index;
@@ -203,12 +204,44 @@ skip_terminate:
 		return -EHOSTDOWN;
 	}
 
-	cifs_server_dbg(VFS,
-		"server does not support multichannel anymore. Disable all other channels\n");
-	cifs_disable_secondary_channels(ses);
-
+	cifs_decrease_secondary_channels(ses, disable_mchan);
 
 	return 0;
+}
+
+/*
+ * smb3_update_ses_channels - Synchronize session channels with new configuration
+ * @ses: pointer to the CIFS session structure
+ * @server: pointer to the TCP server info structure
+ * @from_reconnect: indicates if called from reconnect context
+ * @disable_mchan: indicates if called from reconnect to disable multichannel
+ *
+ * Returns 0 on success or error code on failure.
+ *
+ * Outside of reconfigure, this function is called from cifs_mount() during mount
+ * and from reconnect scenarios to adjust channel count when the
+ * server's multichannel support changes.
+ */
+int smb3_update_ses_channels(struct cifs_ses *ses, struct TCP_Server_Info *server,
+			bool from_reconnect, bool disable_mchan)
+{
+	int rc = 0;
+	/*
+	 * Manage session channels based on current count vs max:
+	 * - If disable requested, skip or disable the channel
+	 * - If below max channels, attempt to add more
+	 * - If above max channels, skip or disable excess channels
+	 */
+	if (disable_mchan)
+		rc = cifs_chan_skip_or_disable(ses, server, from_reconnect, disable_mchan);
+	else {
+		if (ses->chan_count < ses->chan_max)
+			rc = cifs_try_adding_channels(ses);
+		else if (ses->chan_count > ses->chan_max)
+			rc = cifs_chan_skip_or_disable(ses, server, from_reconnect, disable_mchan);
+	}
+
+	return rc;
 }
 
 static int
@@ -237,8 +270,8 @@ smb2_reconnect(__le16 smb2_command, struct cifs_tcon *tcon,
 		 */
 		if (smb2_command != SMB2_TREE_DISCONNECT) {
 			spin_unlock(&tcon->tc_lock);
-			cifs_dbg(FYI, "can not send cmd %d while umounting\n",
-				 smb2_command);
+			cifs_tcon_dbg(FYI, "can not send cmd %d while umounting\n",
+				      smb2_command);
 			return -ENODEV;
 		}
 	}
@@ -293,9 +326,9 @@ again:
 		return 0;
 	}
 	spin_unlock(&ses->chan_lock);
-	cifs_dbg(FYI, "sess reconnect mask: 0x%lx, tcon reconnect: %d",
-		 tcon->ses->chans_need_reconnect,
-		 tcon->need_reconnect);
+	cifs_tcon_dbg(FYI, "sess reconnect mask: 0x%lx, tcon reconnect: %d\n",
+		      tcon->ses->chans_need_reconnect,
+		      tcon->need_reconnect);
 
 	mutex_lock(&ses->session_mutex);
 	/*
@@ -352,8 +385,8 @@ again:
 	 */
 	if (ses->chan_count > 1 &&
 	    !(server->capabilities & SMB2_GLOBAL_CAP_MULTI_CHANNEL)) {
-		rc = cifs_chan_skip_or_disable(ses, server,
-					       from_reconnect);
+		rc = smb3_update_ses_channels(ses, server,
+					       from_reconnect, true /* disable_mchan */);
 		if (rc) {
 			mutex_unlock(&ses->session_mutex);
 			goto out;
@@ -389,11 +422,11 @@ skip_sess_setup:
 
 	rc = cifs_tree_connect(0, tcon);
 
-	cifs_dbg(FYI, "reconnect tcon rc = %d\n", rc);
+	cifs_tcon_dbg(FYI, "reconnect tcon rc = %d\n", rc);
 	if (rc) {
 		/* If sess reconnected but tcon didn't, something strange ... */
 		mutex_unlock(&ses->session_mutex);
-		cifs_dbg(VFS, "reconnect tcon failed rc = %d\n", rc);
+		cifs_tcon_dbg(VFS, "reconnect tcon failed rc = %d\n", rc);
 		goto out;
 	}
 
@@ -435,12 +468,13 @@ skip_sess_setup:
 			 * treat this as server not supporting multichannel
 			 */
 
-			rc = cifs_chan_skip_or_disable(ses, server,
-						       from_reconnect);
+			rc = smb3_update_ses_channels(ses, server,
+						       from_reconnect,
+						       true /* disable_mchan */);
 			goto skip_add_channels;
 		} else if (rc)
-			cifs_dbg(FYI, "%s: failed to query server interfaces: %d\n",
-				 __func__, rc);
+			cifs_tcon_dbg(FYI, "%s: failed to query server interfaces: %d\n",
+				      __func__, rc);
 
 		if (ses->chan_max > ses->chan_count &&
 		    ses->iface_count &&
@@ -448,7 +482,8 @@ skip_sess_setup:
 			if (ses->chan_count == 1)
 				cifs_server_dbg(VFS, "supports multichannel now\n");
 
-			cifs_try_adding_channels(ses);
+			smb3_update_ses_channels(ses, server, from_reconnect,
+						  false /* disable_mchan */);
 		}
 	} else {
 		mutex_unlock(&ses->session_mutex);
@@ -460,7 +495,7 @@ skip_add_channels:
 	spin_unlock(&ses->ses_lock);
 
 	if (smb2_command != SMB2_INTERNAL_CMD)
-		mod_delayed_work(cifsiod_wq, &server->reconnect, 0);
+		cifs_queue_server_reconn(server);
 
 	atomic_inc(&tconInfoReconnectCount);
 out:
@@ -1102,8 +1137,7 @@ SMB2_negotiate(const unsigned int xid,
 		req->SecurityMode = 0;
 
 	req->Capabilities = cpu_to_le32(server->vals->req_capabilities);
-	if (ses->chan_max > 1)
-		req->Capabilities |= cpu_to_le32(SMB2_GLOBAL_CAP_MULTI_CHANNEL);
+	req->Capabilities |= cpu_to_le32(SMB2_GLOBAL_CAP_MULTI_CHANNEL);
 
 	/* ClientGUID must be zero for SMB2.02 dialect */
 	if (server->vals->protocol_id == SMB20_PROT_ID)
@@ -1309,8 +1343,7 @@ int smb3_validate_negotiate(const unsigned int xid, struct cifs_tcon *tcon)
 
 	pneg_inbuf->Capabilities =
 			cpu_to_le32(server->vals->req_capabilities);
-	if (tcon->ses->chan_max > 1)
-		pneg_inbuf->Capabilities |= cpu_to_le32(SMB2_GLOBAL_CAP_MULTI_CHANNEL);
+	pneg_inbuf->Capabilities |= cpu_to_le32(SMB2_GLOBAL_CAP_MULTI_CHANNEL);
 
 	memcpy(pneg_inbuf->Guid, server->client_guid,
 					SMB2_CLIENT_GUID_SIZE);
@@ -1625,8 +1658,6 @@ SMB2_auth_kerberos(struct SMB2_sess_data *sess_data)
 	spnego_key = cifs_get_spnego_key(ses, server);
 	if (IS_ERR(spnego_key)) {
 		rc = PTR_ERR(spnego_key);
-		if (rc == -ENOKEY)
-			cifs_dbg(VFS, "Verify user has a krb5 ticket and keyutils is installed\n");
 		spnego_key = NULL;
 		goto out;
 	}
@@ -2226,21 +2257,20 @@ SMB2_tdis(const unsigned int xid, struct cifs_tcon *tcon)
 	return rc;
 }
 
-
-static struct create_durable *
+static create_durable_req_t *
 create_durable_buf(void)
 {
-	struct create_durable *buf;
+	create_durable_req_t *buf;
 
-	buf = kzalloc(sizeof(struct create_durable), GFP_KERNEL);
+	buf = kzalloc(sizeof(create_durable_req_t), GFP_KERNEL);
 	if (!buf)
 		return NULL;
 
 	buf->ccontext.DataOffset = cpu_to_le16(offsetof
-					(struct create_durable, Data));
+					(create_durable_req_t, Data));
 	buf->ccontext.DataLength = cpu_to_le32(16);
 	buf->ccontext.NameOffset = cpu_to_le16(offsetof
-				(struct create_durable, Name));
+				(create_durable_req_t, Name));
 	buf->ccontext.NameLength = cpu_to_le16(4);
 	/* SMB2_CREATE_DURABLE_HANDLE_REQUEST is "DHnQ" */
 	buf->Name[0] = 'D';
@@ -2250,20 +2280,20 @@ create_durable_buf(void)
 	return buf;
 }
 
-static struct create_durable *
+static create_durable_req_t *
 create_reconnect_durable_buf(struct cifs_fid *fid)
 {
-	struct create_durable *buf;
+	create_durable_req_t *buf;
 
-	buf = kzalloc(sizeof(struct create_durable), GFP_KERNEL);
+	buf = kzalloc(sizeof(create_durable_req_t), GFP_KERNEL);
 	if (!buf)
 		return NULL;
 
 	buf->ccontext.DataOffset = cpu_to_le16(offsetof
-					(struct create_durable, Data));
+					(create_durable_req_t, Data));
 	buf->ccontext.DataLength = cpu_to_le32(16);
 	buf->ccontext.NameOffset = cpu_to_le16(offsetof
-				(struct create_durable, Name));
+				(create_durable_req_t, Name));
 	buf->ccontext.NameLength = cpu_to_le16(4);
 	buf->Data.Fid.PersistentFileId = fid->persistent_fid;
 	buf->Data.Fid.VolatileFileId = fid->volatile_fid;
@@ -2421,21 +2451,21 @@ add_lease_context(struct TCP_Server_Info *server,
 	return 0;
 }
 
-static struct create_durable_v2 *
+static struct create_durable_req_v2 *
 create_durable_v2_buf(struct cifs_open_parms *oparms)
 {
 	struct cifs_fid *pfid = oparms->fid;
-	struct create_durable_v2 *buf;
+	struct create_durable_req_v2 *buf;
 
-	buf = kzalloc(sizeof(struct create_durable_v2), GFP_KERNEL);
+	buf = kzalloc(sizeof(struct create_durable_req_v2), GFP_KERNEL);
 	if (!buf)
 		return NULL;
 
 	buf->ccontext.DataOffset = cpu_to_le16(offsetof
-					(struct create_durable_v2, dcontext));
-	buf->ccontext.DataLength = cpu_to_le32(sizeof(struct durable_context_v2));
+					(struct create_durable_req_v2, dcontext));
+	buf->ccontext.DataLength = cpu_to_le32(sizeof(struct durable_context_v2_req));
 	buf->ccontext.NameOffset = cpu_to_le16(offsetof
-				(struct create_durable_v2, Name));
+				(struct create_durable_req_v2, Name));
 	buf->ccontext.NameLength = cpu_to_le16(4);
 
 	/*
@@ -2505,7 +2535,7 @@ add_durable_v2_context(struct kvec *iov, unsigned int *num_iovec,
 	iov[num].iov_base = create_durable_v2_buf(oparms);
 	if (iov[num].iov_base == NULL)
 		return -ENOMEM;
-	iov[num].iov_len = sizeof(struct create_durable_v2);
+	iov[num].iov_len = sizeof(struct create_durable_req_v2);
 	*num_iovec = num + 1;
 	return 0;
 }
@@ -2549,7 +2579,7 @@ add_durable_context(struct kvec *iov, unsigned int *num_iovec,
 		iov[num].iov_base = create_durable_buf();
 	if (iov[num].iov_base == NULL)
 		return -ENOMEM;
-	iov[num].iov_len = sizeof(struct create_durable);
+	iov[num].iov_len = sizeof(create_durable_req_t);
 	*num_iovec = num + 1;
 	return 0;
 }
@@ -3274,7 +3304,7 @@ replay_again:
 		buf->EndOfFile = rsp->EndofFile;
 		buf->Attributes = rsp->FileAttributes;
 		buf->NumberOfLinks = cpu_to_le32(1);
-		buf->DeletePending = 0;
+		buf->DeletePending = 0; /* successful open = not delete pending */
 	}
 
 
@@ -3911,7 +3941,8 @@ int SMB2_query_info(const unsigned int xid, struct cifs_tcon *tcon,
 /* currently unused, as now we are doing compounding instead (see smb311_posix_query_path_info) */
 int
 SMB311_posix_query_info(const unsigned int xid, struct cifs_tcon *tcon,
-		u64 persistent_fid, u64 volatile_fid, struct smb311_posix_qinfo *data, u32 *plen)
+			u64 persistent_fid, u64 volatile_fid,
+			struct smb311_posix_qinfo *data, u32 *plen)
 {
 	size_t output_len = sizeof(struct smb311_posix_qinfo *) +
 			(sizeof(struct smb_sid) * 2) + (PATH_MAX * 2);
@@ -4051,9 +4082,12 @@ replay_again:
 
 		smb_rsp = (struct smb2_change_notify_rsp *)rsp_iov.iov_base;
 
-		smb2_validate_iov(le16_to_cpu(smb_rsp->OutputBufferOffset),
-				le32_to_cpu(smb_rsp->OutputBufferLength), &rsp_iov,
+		rc = smb2_validate_iov(le16_to_cpu(smb_rsp->OutputBufferOffset),
+				le32_to_cpu(smb_rsp->OutputBufferLength),
+				&rsp_iov,
 				sizeof(struct file_notify_information));
+		if (rc)
+			goto cnotify_exit;
 
 		*out_data = kmemdup((char *)smb_rsp + le16_to_cpu(smb_rsp->OutputBufferOffset),
 				le32_to_cpu(smb_rsp->OutputBufferLength), GFP_KERNEL);
@@ -4086,9 +4120,8 @@ replay_again:
  * FIXME: maybe we should consider checking that the reply matches request?
  */
 static void
-smb2_echo_callback(struct mid_q_entry *mid)
+smb2_echo_callback(struct TCP_Server_Info *server, struct mid_q_entry *mid)
 {
-	struct TCP_Server_Info *server = mid->callback_data;
 	struct smb2_echo_rsp *rsp = (struct smb2_echo_rsp *)mid->resp_buf;
 	struct cifs_credits credits = { .value = 0, .instance = 0 };
 
@@ -4098,7 +4131,7 @@ smb2_echo_callback(struct mid_q_entry *mid)
 		credits.instance = server->reconnect_instance;
 	}
 
-	release_mid(mid);
+	release_mid(server, mid);
 	add_credits(server, &credits, CIFS_ECHO_OP);
 }
 
@@ -4243,7 +4276,7 @@ void smb2_reconnect_server(struct work_struct *work)
 done:
 	cifs_dbg(FYI, "Reconnecting tcons and channels finished\n");
 	if (resched)
-		queue_delayed_work(cifsiod_wq, &server->reconnect, 2 * HZ);
+		cifs_requeue_server_reconn(server);
 	mutex_unlock(&pserver->reconnect_mutex);
 
 	/* now we can safely release srv struct */
@@ -4267,7 +4300,7 @@ SMB2_echo(struct TCP_Server_Info *server)
 	    server->ops->need_neg(server)) {
 		spin_unlock(&server->srv_lock);
 		/* No need to send echo on newly established connections */
-		mod_delayed_work(cifsiod_wq, &server->reconnect, 0);
+		cifs_queue_server_reconn(server);
 		return rc;
 	}
 	spin_unlock(&server->srv_lock);
@@ -4408,7 +4441,7 @@ static inline bool smb3_use_rdma_offload(struct cifs_io_parms *io_parms)
 		return false;
 
 	/* offload also has its overhead, so only do it if desired */
-	if (io_parms->length < server->smbd_conn->rdma_readwrite_threshold)
+	if (io_parms->length < server->rdma_readwrite_threshold)
 		return false;
 
 	return true;
@@ -4456,10 +4489,10 @@ smb2_new_read_req(void **buf, unsigned int *total_len,
 #ifdef CONFIG_CIFS_SMB_DIRECT
 	/*
 	 * If we want to do a RDMA write, fill in and append
-	 * smbd_buffer_descriptor_v1 to the end of read request
+	 * smbdirect_buffer_descriptor_v1 to the end of read request
 	 */
 	if (rdata && smb3_use_rdma_offload(io_parms)) {
-		struct smbd_buffer_descriptor_v1 *v1;
+		struct smbdirect_buffer_descriptor_v1 *v1;
 		bool need_invalidate = server->dialect == SMB30_PROT_ID;
 
 		rdata->mr = smbd_register_mr(
@@ -4475,8 +4508,8 @@ smb2_new_read_req(void **buf, unsigned int *total_len,
 		req->ReadChannelInfoOffset =
 			cpu_to_le16(offsetof(struct smb2_read_req, Buffer));
 		req->ReadChannelInfoLength =
-			cpu_to_le16(sizeof(struct smbd_buffer_descriptor_v1));
-		v1 = (struct smbd_buffer_descriptor_v1 *) &req->Buffer[0];
+			cpu_to_le16(sizeof(struct smbdirect_buffer_descriptor_v1));
+		v1 = (struct smbdirect_buffer_descriptor_v1 *) &req->Buffer[0];
 		v1->offset = cpu_to_le64(rdata->mr->mr->iova);
 		v1->token = cpu_to_le32(rdata->mr->mr->rkey);
 		v1->length = cpu_to_le32(rdata->mr->mr->length);
@@ -4513,15 +4546,13 @@ smb2_new_read_req(void **buf, unsigned int *total_len,
 }
 
 static void
-smb2_readv_callback(struct mid_q_entry *mid)
+smb2_readv_callback(struct TCP_Server_Info *server, struct mid_q_entry *mid)
 {
 	struct cifs_readdata *rdata = mid->callback_data;
 	struct cifs_tcon *tcon = tlink_tcon(rdata->cfile->tlink);
-	struct TCP_Server_Info *server = rdata->server;
-	struct smb2_hdr *shdr =
-				(struct smb2_hdr *)rdata->iov[0].iov_base;
+	struct smb2_hdr *shdr = (struct smb2_hdr *)rdata->iov[0].iov_base;
 	struct cifs_credits credits = { .value = 0, .instance = 0 };
-	struct smb_rqst rqst = { .rq_iov = &rdata->iov[1],
+	struct smb_rqst rqst = { .rq_iov = &rdata->iov[0],
 				 .rq_nvec = 1, };
 
 	if (rdata->got_bytes) {
@@ -4532,9 +4563,9 @@ smb2_readv_callback(struct mid_q_entry *mid)
 		rqst.rq_tailsz = rdata->tailsz;
 	}
 
-	WARN_ONCE(rdata->server != mid->server,
+	WARN_ONCE(rdata->server != server,
 		  "rdata server %p != mid server %p",
-		  rdata->server, mid->server);
+		  rdata->server, server);
 
 	cifs_dbg(FYI, "%s: mid=%llu state=%d result=%d bytes=%u\n",
 		 __func__, mid->mid, mid->mid_state, rdata->result,
@@ -4598,7 +4629,7 @@ smb2_readv_callback(struct mid_q_entry *mid)
 				     rdata->offset, rdata->got_bytes);
 
 	queue_work(cifsiod_wq, &rdata->work);
-	release_mid(mid);
+	release_mid(server, mid);
 	add_credits(server, &credits, 0);
 }
 
@@ -4767,18 +4798,17 @@ SMB2_read(const unsigned int xid, struct cifs_io_parms *io_parms,
  * workqueue completion task.
  */
 static void
-smb2_writev_callback(struct mid_q_entry *mid)
+smb2_writev_callback(struct TCP_Server_Info *server, struct mid_q_entry *mid)
 {
 	struct cifs_writedata *wdata = mid->callback_data;
 	struct cifs_tcon *tcon = tlink_tcon(wdata->cfile->tlink);
-	struct TCP_Server_Info *server = wdata->server;
 	unsigned int written;
 	struct smb2_write_rsp *rsp = (struct smb2_write_rsp *)mid->resp_buf;
 	struct cifs_credits credits = { .value = 0, .instance = 0 };
 
-	WARN_ONCE(wdata->server != mid->server,
+	WARN_ONCE(wdata->server != server,
 		  "wdata server %p != mid server %p",
-		  wdata->server, mid->server);
+		  wdata->server, server);
 
 	switch (mid->mid_state) {
 	case MID_RESPONSE_RECEIVED:
@@ -4844,7 +4874,7 @@ smb2_writev_callback(struct mid_q_entry *mid)
 				      wdata->offset, wdata->bytes);
 
 	queue_work(cifsiod_wq, &wdata->work);
-	release_mid(mid);
+	release_mid(server, mid);
 	add_credits(server, &credits, 0);
 }
 
@@ -4914,10 +4944,10 @@ smb2_async_writev(struct cifs_writedata *wdata,
 #ifdef CONFIG_CIFS_SMB_DIRECT
 	/*
 	 * If we want to do a server RDMA read, fill in and append
-	 * smbd_buffer_descriptor_v1 to the end of write request
+	 * smbdirect_buffer_descriptor_v1 to the end of write request
 	 */
 	if (smb3_use_rdma_offload(io_parms)) {
-		struct smbd_buffer_descriptor_v1 *v1;
+		struct smbdirect_buffer_descriptor_v1 *v1;
 		bool need_invalidate = server->dialect == SMB30_PROT_ID;
 
 		wdata->mr = smbd_register_mr(
@@ -4944,8 +4974,8 @@ smb2_async_writev(struct cifs_writedata *wdata,
 		req->WriteChannelInfoOffset =
 			cpu_to_le16(offsetof(struct smb2_write_req, Buffer));
 		req->WriteChannelInfoLength =
-			cpu_to_le16(sizeof(struct smbd_buffer_descriptor_v1));
-		v1 = (struct smbd_buffer_descriptor_v1 *) &req->Buffer[0];
+			cpu_to_le16(sizeof(struct smbdirect_buffer_descriptor_v1));
+		v1 = (struct smbdirect_buffer_descriptor_v1 *) &req->Buffer[0];
 		v1->offset = cpu_to_le64(wdata->mr->mr->iova);
 		v1->token = cpu_to_le32(wdata->mr->mr->rkey);
 		v1->length = cpu_to_le32(wdata->mr->mr->length);
@@ -4965,7 +4995,7 @@ smb2_async_writev(struct cifs_writedata *wdata,
 		smb2_set_replay(server, &rqst);
 #ifdef CONFIG_CIFS_SMB_DIRECT
 	if (wdata->mr) {
-		iov[0].iov_len += sizeof(struct smbd_buffer_descriptor_v1);
+		iov[0].iov_len += sizeof(struct smbdirect_buffer_descriptor_v1);
 		rqst.rq_npages = 0;
 	}
 #endif
@@ -5370,7 +5400,7 @@ smb2_parse_query_directory(struct cifs_tcon *tcon,
 		info_buf_size = sizeof(FILE_DIRECTORY_INFO);
 		break;
 	case SMB_FIND_FILE_ID_FULL_DIR_INFO:
-		info_buf_size = sizeof(SEARCH_ID_FULL_DIR_INFO);
+		info_buf_size = sizeof(FILE_ID_FULL_DIR_INFO);
 		break;
 	case SMB_FIND_FILE_POSIX_INFO:
 		/* note that posix payload are variable size */
@@ -5898,8 +5928,8 @@ replay_again:
 		max_len = sizeof(FILE_SYSTEM_DEVICE_INFO);
 		min_len = sizeof(FILE_SYSTEM_DEVICE_INFO);
 	} else if (level == FS_ATTRIBUTE_INFORMATION) {
-		max_len = sizeof(FILE_SYSTEM_ATTRIBUTE_INFO);
-		min_len = MIN_FS_ATTR_INFO_SIZE;
+		max_len = sizeof(FILE_SYSTEM_ATTRIBUTE_INFO) + MAX_FS_NAME_LEN;
+		min_len = sizeof(FILE_SYSTEM_ATTRIBUTE_INFO);
 	} else if (level == FS_SECTOR_SIZE_INFORMATION) {
 		max_len = sizeof(struct smb3_fs_ss_info);
 		min_len = sizeof(struct smb3_fs_ss_info);
@@ -5945,7 +5975,7 @@ replay_again:
 	if (level == FS_ATTRIBUTE_INFORMATION)
 		memcpy(&tcon->fsAttrInfo, offset
 			+ (char *)rsp, min_t(unsigned int,
-			rsp_len, max_len));
+			rsp_len, min_len));
 	else if (level == FS_DEVICE_INFORMATION)
 		memcpy(&tcon->fsDevInfo, offset
 			+ (char *)rsp, sizeof(FILE_SYSTEM_DEVICE_INFO));
