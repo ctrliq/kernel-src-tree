@@ -563,6 +563,11 @@ struct sock {
 	RH_KABI_RESERVE(16)
 };
 
+struct sock_bh_locked {
+	struct sock *sock;
+	local_lock_t bh_lock;
+};
+
 enum sk_pacing {
 	SK_PACING_NONE		= 0,
 	SK_PACING_NEEDED	= 1,
