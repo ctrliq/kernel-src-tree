@@ -418,6 +418,7 @@ else
 endif
 
 include Makefile.cross
+include Makefile.exports
 
 #
 # Targets
@@ -955,8 +956,7 @@ dist-os-version:
 	@echo "OSVERSION: $(RHEL_MAJOR).$(RHEL_MINOR)"
 
 dist-dump-variables:
-	$(eval VARS:=$(sort $(shell cat Makefile.variables Makefile.automotive | sed '/^#/d; /^$$/d; s/[ ]*[?:]=.*//')))
-	@$(foreach V,$(sort $(.VARIABLES)), $(if $(filter-out environment default automatic, $(origin $V)),$(info $V=$($V)),$(if $(filter $(VARS),$(V)),$(info $V=$($V)))))
+	@$(foreach V,$(sort $(.VARIABLES)), $(if $(filter-out environment default automatic override, $(origin $V)),$(info $V=$($V)),$(if $(filter $(EXPORTED_VARS),$(V)),$(info $V=$($V)))))
 
 dist-self-test:
 	@if test -x /usr/bin/bats; then \
@@ -1103,4 +1103,4 @@ dist-full-help:
 	@echo  '                        specfile template.'
 	@echo  ''
 
-export
+$(foreach var,$(EXPORTED_VARS),$(eval export $(var)))
