@@ -3101,7 +3101,7 @@ const struct bmp280_chip_info bmp085_chip_info = {
 	.trigger_probe = bmp085_trigger_probe,
 	.trigger_handler = bmp180_trigger_handler,
 };
-EXPORT_SYMBOL_NS(bmp085_chip_info, IIO_BMP280);
+EXPORT_SYMBOL_NS(bmp085_chip_info, "IIO_BMP280");
 
 static int bmp280_buffer_preenable(struct iio_dev *indio_dev)
 {
