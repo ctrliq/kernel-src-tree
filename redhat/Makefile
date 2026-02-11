@@ -710,6 +710,9 @@ dist-get-buildreqs: setup-source
 # recipes may be ordered before/in parallel with dist-clean-sources
 # (prerequisite of setup-source), which would then delete their results.
 setup-source: dist-clean-sources dist-git-version-check
+	@if [ "$(SPECPACKAGE_REBUILD)" = "1" ]; then \
+		$(REDHAT)/scripts/generate-rebuild-changelog.sh; \
+	fi
 	@if [ ! -e $(REDHAT)/$(SPECFILE).template ]; then \
 		echo "Creating $(REDHAT)/$(SPECFILE).template as a copy of $(REDHAT)/kernel.spec.template"; \
 		cp $(REDHAT)/kernel.spec.template $(REDHAT)/$(SPECFILE).template; \
