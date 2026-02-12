@@ -1,0 +1,161 @@
+dpll: add reference-sync netlink attribute
+
+jira KERNEL-619
+Rebuild_History Non-Buildable kernel-5.14.0-611.30.1.el9_7
+commit-author Arkadiusz Kubalewski <arkadiusz.kubalewski@intel.com>
+commit 7f15ee35972dd3dee37704bfd0f136290f6d63d9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-611.30.1.el9_7/7f15ee35.failed
+
+Add new netlink attribute to allow user space configuration of reference
+sync pin pairs, where both pins are used to provide one clock signal
+consisting of both: base frequency and sync signal.
+
+	Reviewed-by: Przemek Kitszel <przemyslaw.kitszel@intel.com>
+	Reviewed-by: Milena Olech <milena.olech@intel.com>
+	Reviewed-by: Jiri Pirko <jiri@nvidia.com>
+	Signed-off-by: Arkadiusz Kubalewski <arkadiusz.kubalewski@intel.com>
+Link: https://patch.msgid.link/20250626135219.1769350-2-arkadiusz.kubalewski@intel.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 7f15ee35972dd3dee37704bfd0f136290f6d63d9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/netlink/specs/dpll.yaml
+#	include/uapi/linux/dpll.h
+diff --cc Documentation/netlink/specs/dpll.yaml
+index 83e62cb86bf1,5decee61a2c4..000000000000
+--- a/Documentation/netlink/specs/dpll.yaml
++++ b/Documentation/netlink/specs/dpll.yaml
+@@@ -429,11 -429,13 +429,21 @@@ attribute-sets
+            A ratio of high to low state of a SYNC signal pulse embedded
+            into base clock frequency. Value is in percents.
+        -
+++<<<<<<< HEAD
+ +        name: phase-adjust-gran
+ +        type: u32
+ +        doc: |
+ +          Granularity of phase adjustment, in picoseconds. The value of
+ +          phase adjustment must be a multiple of this granularity.
+++=======
++         name: reference-sync
++         type: nest
++         multi-attr: true
++         nested-attributes: reference-sync
++         doc: |
++           Capable pin provides list of pins that can be bound to create a
++           reference-sync pin pair.
+++>>>>>>> 7f15ee35972d (dpll: add reference-sync netlink attribute)
+  
+    -
+      name: pin-parent-device
+diff --cc include/uapi/linux/dpll.h
+index bdcadf8cbcf4,37b438ce8efc..000000000000
+--- a/include/uapi/linux/dpll.h
++++ b/include/uapi/linux/dpll.h
+@@@ -249,8 -249,7 +249,12 @@@ enum dpll_a_pin 
+  	DPLL_A_PIN_ESYNC_FREQUENCY,
+  	DPLL_A_PIN_ESYNC_FREQUENCY_SUPPORTED,
+  	DPLL_A_PIN_ESYNC_PULSE,
+++<<<<<<< HEAD
+ +	__RH_RESERVED_DPLL_A_PIN_REFERENCE_SYNC,
+ +	DPLL_A_PIN_PHASE_ADJUST_GRAN,
+++=======
++ 	DPLL_A_PIN_REFERENCE_SYNC,
+++>>>>>>> 7f15ee35972d (dpll: add reference-sync netlink attribute)
+  
+  	__DPLL_A_PIN_MAX,
+  	DPLL_A_PIN_MAX = (__DPLL_A_PIN_MAX - 1)
+diff --git a/Documentation/driver-api/dpll.rst b/Documentation/driver-api/dpll.rst
+index faf643fe8ac8..c459d33565d9 100644
+--- a/Documentation/driver-api/dpll.rst
++++ b/Documentation/driver-api/dpll.rst
+@@ -255,6 +255,31 @@ the pin.
+   ``DPLL_A_PIN_ESYNC_PULSE``                pulse type of Embedded SYNC
+   ========================================= =================================
+ 
++Reference SYNC
++==============
++
++The device may support the Reference SYNC feature, which allows the combination
++of two inputs into a input pair. In this configuration, clock signals
++from both inputs are used to synchronize the DPLL device. The higher frequency
++signal is utilized for the loop bandwidth of the DPLL, while the lower frequency
++signal is used to syntonize the output signal of the DPLL device. This feature
++enables the provision of a high-quality loop bandwidth signal from an external
++source.
++
++A capable input provides a list of inputs that can be bound with to create
++Reference SYNC. To control this feature, the user must request a desired
++state for a target pin: use ``DPLL_PIN_STATE_CONNECTED`` to enable or
++``DPLL_PIN_STATE_DISCONNECTED`` to disable the feature. An input pin can be
++bound to only one other pin at any given time.
++
++  ============================== ==========================================
++  ``DPLL_A_PIN_REFERENCE_SYNC``  nested attribute for providing info or
++                                 requesting configuration of the Reference
++                                 SYNC feature
++    ``DPLL_A_PIN_ID``            target pin id for Reference SYNC feature
++    ``DPLL_A_PIN_STATE``         state of Reference SYNC connection
++  ============================== ==========================================
++
+ Configuration commands group
+ ============================
+ 
+* Unmerged path Documentation/netlink/specs/dpll.yaml
+diff --git a/drivers/dpll/dpll_nl.c b/drivers/dpll/dpll_nl.c
+index 8de90310c3be..9f2efaf25268 100644
+--- a/drivers/dpll/dpll_nl.c
++++ b/drivers/dpll/dpll_nl.c
+@@ -24,6 +24,11 @@ const struct nla_policy dpll_pin_parent_pin_nl_policy[DPLL_A_PIN_STATE + 1] = {
+ 	[DPLL_A_PIN_STATE] = NLA_POLICY_RANGE(NLA_U32, 1, 3),
+ };
+ 
++const struct nla_policy dpll_reference_sync_nl_policy[DPLL_A_PIN_STATE + 1] = {
++	[DPLL_A_PIN_ID] = { .type = NLA_U32, },
++	[DPLL_A_PIN_STATE] = NLA_POLICY_RANGE(NLA_U32, 1, 3),
++};
++
+ /* DPLL_CMD_DEVICE_ID_GET - do */
+ static const struct nla_policy dpll_device_id_get_nl_policy[DPLL_A_TYPE + 1] = {
+ 	[DPLL_A_MODULE_NAME] = { .type = NLA_NUL_STRING, },
+@@ -63,7 +68,7 @@ static const struct nla_policy dpll_pin_get_dump_nl_policy[DPLL_A_PIN_ID + 1] =
+ };
+ 
+ /* DPLL_CMD_PIN_SET - do */
+-static const struct nla_policy dpll_pin_set_nl_policy[DPLL_A_PIN_ESYNC_FREQUENCY + 1] = {
++static const struct nla_policy dpll_pin_set_nl_policy[DPLL_A_PIN_REFERENCE_SYNC + 1] = {
+ 	[DPLL_A_PIN_ID] = { .type = NLA_U32, },
+ 	[DPLL_A_PIN_FREQUENCY] = { .type = NLA_U64, },
+ 	[DPLL_A_PIN_DIRECTION] = NLA_POLICY_RANGE(NLA_U32, 1, 2),
+@@ -73,6 +78,7 @@ static const struct nla_policy dpll_pin_set_nl_policy[DPLL_A_PIN_ESYNC_FREQUENCY
+ 	[DPLL_A_PIN_PARENT_PIN] = NLA_POLICY_NESTED(dpll_pin_parent_pin_nl_policy),
+ 	[DPLL_A_PIN_PHASE_ADJUST] = { .type = NLA_S32, },
+ 	[DPLL_A_PIN_ESYNC_FREQUENCY] = { .type = NLA_U64, },
++	[DPLL_A_PIN_REFERENCE_SYNC] = NLA_POLICY_NESTED(dpll_reference_sync_nl_policy),
+ };
+ 
+ /* Ops table for dpll */
+@@ -140,7 +146,7 @@ static const struct genl_split_ops dpll_nl_ops[] = {
+ 		.doit		= dpll_nl_pin_set_doit,
+ 		.post_doit	= dpll_pin_post_doit,
+ 		.policy		= dpll_pin_set_nl_policy,
+-		.maxattr	= DPLL_A_PIN_ESYNC_FREQUENCY,
++		.maxattr	= DPLL_A_PIN_REFERENCE_SYNC,
+ 		.flags		= GENL_ADMIN_PERM | GENL_CMD_CAP_DO,
+ 	},
+ };
+diff --git a/drivers/dpll/dpll_nl.h b/drivers/dpll/dpll_nl.h
+index f491262bee4f..3da10cfe9a6e 100644
+--- a/drivers/dpll/dpll_nl.h
++++ b/drivers/dpll/dpll_nl.h
+@@ -14,6 +14,7 @@
+ /* Common nested types */
+ extern const struct nla_policy dpll_pin_parent_device_nl_policy[DPLL_A_PIN_PHASE_OFFSET + 1];
+ extern const struct nla_policy dpll_pin_parent_pin_nl_policy[DPLL_A_PIN_STATE + 1];
++extern const struct nla_policy dpll_reference_sync_nl_policy[DPLL_A_PIN_STATE + 1];
+ 
+ int dpll_lock_doit(const struct genl_split_ops *ops, struct sk_buff *skb,
+ 		   struct genl_info *info);
+* Unmerged path include/uapi/linux/dpll.h
