@@ -141,10 +141,15 @@ static inline void put_task_struct(struct task_struct *t)
 	 * when it fails to fork a process. Therefore, there is no
 	 * way it can conflict with __put_task_struct().
 	 */
-	if (IS_ENABLED(CONFIG_PREEMPT_RT))
-		call_rcu(&t->rcu, __put_task_struct_rcu_cb);
-	else
+	if (!IS_ENABLED(CONFIG_PREEMPT_RT)) {
+		static DEFINE_WAIT_OVERRIDE_MAP(put_task_map, LD_WAIT_SLEEP);
+
+		lock_map_acquire_try(&put_task_map);
 		__put_task_struct(t);
+		lock_map_release(&put_task_map);
+		return;
+	}
+	call_rcu(&t->rcu, __put_task_struct_rcu_cb);
 }
 
 DEFINE_FREE(put_task, struct task_struct *, if (_T) put_task_struct(_T))
