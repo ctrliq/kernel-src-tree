@@ -973,7 +973,7 @@ static int sun8i_dwmac_set_syscon(struct device *dev,
 		}
 	}
 
-	switch (plat->mac_interface) {
+	switch (plat->phy_interface) {
 	case PHY_INTERFACE_MODE_MII:
 		/* default */
 		break;
@@ -988,7 +988,7 @@ static int sun8i_dwmac_set_syscon(struct device *dev,
 		break;
 	default:
 		dev_err(dev, "Unsupported interface mode: %s",
-			phy_modes(plat->mac_interface));
+			phy_modes(plat->phy_interface));
 		return -EINVAL;
 	}
 
