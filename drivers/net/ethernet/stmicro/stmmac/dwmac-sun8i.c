@@ -30,10 +30,6 @@
  */
 
 /* struct emac_variant - Describe dwmac-sun8i hardware variant
- * @default_syscon_value:	The default value of the EMAC register in syscon
- *				This value is used for disabling properly EMAC
- *				and used as a good starting value in case of the
- *				boot process(uboot) leave some stuff.
  * @syscon_field		reg_field for the syscon's gmac register
  * @soc_has_internal_phy:	Does the MAC embed an internal PHY
  * @support_mii:		Does the MAC handle MII
@@ -47,7 +43,6 @@
  *				value of zero indicates this is not supported.
  */
 struct emac_variant {
-	u32 default_syscon_value;
 	const struct reg_field *syscon_field;
 	bool soc_has_internal_phy;
 	bool support_mii;
@@ -93,7 +88,6 @@ static const struct reg_field sun8i_ccu_reg_field = {
 };
 
 static const struct emac_variant emac_variant_h3 = {
-	.default_syscon_value = 0x58000,
 	.syscon_field = &sun8i_syscon_reg_field,
 	.soc_has_internal_phy = true,
 	.support_mii = true,
@@ -104,14 +98,12 @@ static const struct emac_variant emac_variant_h3 = {
 };
 
 static const struct emac_variant emac_variant_v3s = {
-	.default_syscon_value = 0x38000,
 	.syscon_field = &sun8i_syscon_reg_field,
 	.soc_has_internal_phy = true,
 	.support_mii = true
 };
 
 static const struct emac_variant emac_variant_a83t = {
-	.default_syscon_value = 0,
 	.syscon_field = &sun8i_syscon_reg_field,
 	.soc_has_internal_phy = false,
 	.support_mii = true,
@@ -121,7 +113,6 @@ static const struct emac_variant emac_variant_a83t = {
 };
 
 static const struct emac_variant emac_variant_r40 = {
-	.default_syscon_value = 0,
 	.syscon_field = &sun8i_ccu_reg_field,
 	.support_mii = true,
 	.support_rgmii = true,
@@ -129,7 +120,6 @@ static const struct emac_variant emac_variant_r40 = {
 };
 
 static const struct emac_variant emac_variant_a64 = {
-	.default_syscon_value = 0,
 	.syscon_field = &sun8i_syscon_reg_field,
 	.soc_has_internal_phy = false,
 	.support_mii = true,
@@ -140,7 +130,6 @@ static const struct emac_variant emac_variant_a64 = {
 };
 
 static const struct emac_variant emac_variant_h6 = {
-	.default_syscon_value = 0x50000,
 	.syscon_field = &sun8i_syscon_reg_field,
 	/* The "Internal PHY" of H6 is not on the die. It's on the
 	 * co-packaged AC200 chip instead.
@@ -932,25 +921,11 @@ static int sun8i_dwmac_set_syscon(struct device *dev,
 	struct sunxi_priv_data *gmac = plat->bsp_priv;
 	struct device_node *node = dev->of_node;
 	int ret;
-	u32 reg, val;
-
-	ret = regmap_field_read(gmac->regmap_field, &val);
-	if (ret) {
-		dev_err(dev, "Fail to read from regmap field.\n");
-		return ret;
-	}
-
-	reg = gmac->variant->default_syscon_value;
-	if (reg != val)
-		dev_warn(dev,
-			 "Current syscon value is not the default %x (expect %x)\n",
-			 val, reg);
+	u32 reg = 0, val;
 
 	if (gmac->variant->soc_has_internal_phy) {
 		if (of_property_read_bool(node, "allwinner,leds-active-low"))
 			reg |= H3_EPHY_LED_POL;
-		else
-			reg &= ~H3_EPHY_LED_POL;
 
 		/* Force EPHY xtal frequency to 24MHz. */
 		reg |= H3_EPHY_CLK_SEL;
@@ -964,11 +939,6 @@ static int sun8i_dwmac_set_syscon(struct device *dev,
 		 * address. No need to mask it again.
 		 */
 		reg |= ret << H3_EPHY_ADDR_SHIFT;
-	} else {
-		/* For SoCs without internal PHY the PHY selection bit should be
-		 * set to 0 (external PHY).
-		 */
-		reg &= ~H3_EPHY_SELECT;
 	}
 
 	if (!of_property_read_u32(node, "allwinner,tx-delay-ps", &val)) {
@@ -979,8 +949,6 @@ static int sun8i_dwmac_set_syscon(struct device *dev,
 		val /= 100;
 		dev_dbg(dev, "set tx-delay to %x\n", val);
 		if (val <= gmac->variant->tx_delay_max) {
-			reg &= ~(gmac->variant->tx_delay_max <<
-				 SYSCON_ETXDC_SHIFT);
 			reg |= (val << SYSCON_ETXDC_SHIFT);
 		} else {
 			dev_err(dev, "Invalid TX clock delay: %d\n",
@@ -997,8 +965,6 @@ static int sun8i_dwmac_set_syscon(struct device *dev,
 		val /= 100;
 		dev_dbg(dev, "set rx-delay to %x\n", val);
 		if (val <= gmac->variant->rx_delay_max) {
-			reg &= ~(gmac->variant->rx_delay_max <<
-				 SYSCON_ERXDC_SHIFT);
 			reg |= (val << SYSCON_ERXDC_SHIFT);
 		} else {
 			dev_err(dev, "Invalid RX clock delay: %d\n",
@@ -1006,11 +972,6 @@ static int sun8i_dwmac_set_syscon(struct device *dev,
 			return -EINVAL;
 		}
 	}
-
-	/* Clear interface mode bits */
-	reg &= ~(SYSCON_ETCS_MASK | SYSCON_EPIT);
-	if (gmac->variant->support_rmii)
-		reg &= ~SYSCON_RMII_EN;
 
 	switch (plat->mac_interface) {
 	case PHY_INTERFACE_MODE_MII:
@@ -1038,9 +999,9 @@ static int sun8i_dwmac_set_syscon(struct device *dev,
 
 static void sun8i_dwmac_unset_syscon(struct sunxi_priv_data *gmac)
 {
-	u32 reg = gmac->variant->default_syscon_value;
-
-	regmap_field_write(gmac->regmap_field, reg);
+	if (gmac->variant->soc_has_internal_phy)
+		regmap_field_write(gmac->regmap_field,
+				   (H3_EPHY_SHUTDOWN | H3_EPHY_SELECT));
 }
 
 static void sun8i_dwmac_exit(struct platform_device *pdev, void *priv)
