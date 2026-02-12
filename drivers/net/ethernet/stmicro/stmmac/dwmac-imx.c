@@ -73,7 +73,7 @@ static int imx8mp_set_intf_mode(struct plat_stmmacenet_data *plat_dat)
 	struct imx_priv_data *dwmac = plat_dat->bsp_priv;
 	int val;
 
-	switch (plat_dat->mac_interface) {
+	switch (plat_dat->phy_interface) {
 	case PHY_INTERFACE_MODE_MII:
 		val = GPR_ENET_QOS_INTF_SEL_MII;
 		break;
@@ -89,8 +89,8 @@ static int imx8mp_set_intf_mode(struct plat_stmmacenet_data *plat_dat)
 		      GPR_ENET_QOS_RGMII_EN;
 		break;
 	default:
-		pr_debug("imx dwmac doesn't support %d interface\n",
-			 plat_dat->mac_interface);
+		pr_debug("imx dwmac doesn't support %s interface\n",
+			 phy_modes(plat_dat->phy_interface));
 		return -EINVAL;
 	}
 
@@ -113,7 +113,7 @@ static int imx93_set_intf_mode(struct plat_stmmacenet_data *plat_dat)
 	struct imx_priv_data *dwmac = plat_dat->bsp_priv;
 	int val, ret;
 
-	switch (plat_dat->mac_interface) {
+	switch (plat_dat->phy_interface) {
 	case PHY_INTERFACE_MODE_MII:
 		val = MX93_GPR_ENET_QOS_INTF_SEL_MII;
 		break;
@@ -135,8 +135,8 @@ static int imx93_set_intf_mode(struct plat_stmmacenet_data *plat_dat)
 		val = MX93_GPR_ENET_QOS_INTF_SEL_RGMII;
 		break;
 	default:
-		dev_dbg(dwmac->dev, "imx dwmac doesn't support %d interface\n",
-			 plat_dat->mac_interface);
+		dev_dbg(dwmac->dev, "imx dwmac doesn't support %s interface\n",
+			phy_modes(plat_dat->phy_interface));
 		return -EINVAL;
 	}
 
@@ -198,7 +198,7 @@ static int imx_dwmac_set_clk_tx_rate(void *bsp_priv, struct clk *clk_tx_i,
 {
 	struct imx_priv_data *dwmac = bsp_priv;
 
-	interface = dwmac->plat_dat->mac_interface;
+	interface = dwmac->plat_dat->phy_interface;
 	if (interface == PHY_INTERFACE_MODE_RMII ||
 	    interface == PHY_INTERFACE_MODE_MII)
 		return 0;
@@ -216,8 +216,8 @@ static void imx_dwmac_fix_speed(void *priv, int speed, unsigned int mode)
 	plat_dat = dwmac->plat_dat;
 
 	if (dwmac->ops->mac_rgmii_txclk_auto_adj ||
-	    (plat_dat->mac_interface == PHY_INTERFACE_MODE_RMII) ||
-	    (plat_dat->mac_interface == PHY_INTERFACE_MODE_MII))
+	    (plat_dat->phy_interface == PHY_INTERFACE_MODE_RMII) ||
+	    (plat_dat->phy_interface == PHY_INTERFACE_MODE_MII))
 		return;
 
 	rate = rgmii_clock(speed);
@@ -275,7 +275,7 @@ static int imx_dwmac_mx93_reset(struct stmmac_priv *priv, void __iomem *ioaddr)
 	value |= DMA_BUS_MODE_SFT_RESET;
 	writel(value, ioaddr + DMA_BUS_MODE);
 
-	if (plat_dat->mac_interface == PHY_INTERFACE_MODE_RMII) {
+	if (plat_dat->phy_interface == PHY_INTERFACE_MODE_RMII) {
 		usleep_range(100, 200);
 		writel(RMII_RESET_SPEED, ioaddr + MAC_CTRL_REG);
 	}
