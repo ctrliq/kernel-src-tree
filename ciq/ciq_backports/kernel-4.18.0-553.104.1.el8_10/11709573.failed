@@ -1,0 +1,166 @@
+ipv6: use RCU in ip6_output()
+
+jira KERNEL-609
+cve CVE-2025-40158
+Rebuild_History Non-Buildable kernel-4.18.0-553.104.1.el8_10
+commit-author Eric Dumazet <edumazet@google.com>
+commit 11709573cc4e48dc34c80fc7ab9ce5b159e29695
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.104.1.el8_10/11709573.failed
+
+Use RCU in ip6_output() in order to use dst_dev_rcu() to prevent
+possible UAF.
+
+We can remove rcu_read_lock()/rcu_read_unlock() pairs
+from ip6_finish_output2().
+
+Fixes: 4a6ce2b6f2ec ("net: introduce a new function dst_dev_put()")
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Reviewed-by: David Ahern <dsahern@kernel.org>
+Link: https://patch.msgid.link/20250828195823.3958522-5-edumazet@google.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 11709573cc4e48dc34c80fc7ab9ce5b159e29695)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/ip6_output.c
+diff --cc net/ipv6/ip6_output.c
+index f4f534042ec2,9d64c13bab5e..000000000000
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@@ -63,14 -60,27 +63,34 @@@
+  static int ip6_finish_output2(struct net *net, struct sock *sk, struct sk_buff *skb)
+  {
+  	struct dst_entry *dst = skb_dst(skb);
+++<<<<<<< HEAD
+ +	struct net_device *dev = dst->dev;
+ +	const struct in6_addr *nexthop;
+ +	struct neighbour *neigh;
+ +	int ret;
+ +
+ +	if (ipv6_addr_is_multicast(&ipv6_hdr(skb)->daddr)) {
+ +		struct inet6_dev *idev = ip6_dst_idev(skb_dst(skb));
+++=======
++ 	struct net_device *dev = dst_dev_rcu(dst);
++ 	struct inet6_dev *idev = ip6_dst_idev(dst);
++ 	unsigned int hh_len = LL_RESERVED_SPACE(dev);
++ 	const struct in6_addr *daddr, *nexthop;
++ 	struct ipv6hdr *hdr;
++ 	struct neighbour *neigh;
++ 	int ret;
++ 
++ 	/* Be paranoid, rather than too clever. */
++ 	if (unlikely(hh_len > skb_headroom(skb)) && dev->header_ops) {
++ 		/* idev stays alive because we hold rcu_read_lock(). */
++ 		skb = skb_expand_head(skb, hh_len);
++ 		if (!skb) {
++ 			IP6_INC_STATS(net, idev, IPSTATS_MIB_OUTDISCARDS);
++ 			return -ENOMEM;
++ 		}
++ 	}
+++>>>>>>> 11709573cc4e (ipv6: use RCU in ip6_output())
+  
+ -	hdr = ipv6_hdr(skb);
+ -	daddr = &hdr->daddr;
+ -	if (ipv6_addr_is_multicast(daddr)) {
+  		if (!(dev->flags & IFF_LOOPBACK) && sk_mc_loop(sk) &&
+  		    ((mroute6_is_socket(net, skb) &&
+  		     !(IP6CB(skb)->flags & IP6SKB_FORWARDED)) ||
+@@@ -111,22 -118,23 +131,42 @@@
+  			return res;
+  	}
+  
+++<<<<<<< HEAD
+ +	rcu_read_lock_bh();
+ +	nexthop = rt6_nexthop((struct rt6_info *)dst, &ipv6_hdr(skb)->daddr);
+ +	neigh = __ipv6_neigh_lookup_noref(dst->dev, nexthop);
+ +	if (unlikely(!neigh))
+ +		neigh = __neigh_create(&nd_tbl, nexthop, dst->dev, false);
+ +	if (!IS_ERR(neigh)) {
+ +		sock_confirm_neigh(skb, neigh);
+ +		ret = neigh_output(neigh, skb);
+ +		rcu_read_unlock_bh();
+ +		return ret;
+ +	}
+ +	rcu_read_unlock_bh();
+ +
+ +	IP6_INC_STATS(net, ip6_dst_idev(dst), IPSTATS_MIB_OUTNOROUTES);
+ +	kfree_skb_reason(skb, SKB_DROP_REASON_NEIGH_CREATEFAIL);
+ +	return -EINVAL;
+++=======
++ 	IP6_UPD_PO_STATS(net, idev, IPSTATS_MIB_OUT, skb->len);
++ 
++ 	nexthop = rt6_nexthop(dst_rt6_info(dst), daddr);
++ 	neigh = __ipv6_neigh_lookup_noref(dev, nexthop);
++ 
++ 	if (IS_ERR_OR_NULL(neigh)) {
++ 		if (unlikely(!neigh))
++ 			neigh = __neigh_create(&nd_tbl, nexthop, dev, false);
++ 		if (IS_ERR(neigh)) {
++ 			IP6_INC_STATS(net, idev, IPSTATS_MIB_OUTNOROUTES);
++ 			kfree_skb_reason(skb, SKB_DROP_REASON_NEIGH_CREATEFAIL);
++ 			return -EINVAL;
++ 		}
++ 	}
++ 	sock_confirm_neigh(skb, neigh);
++ 	ret = neigh_output(neigh, skb, false);
++ 	return ret;
+++>>>>>>> 11709573cc4e (ipv6: use RCU in ip6_output())
+  }
+  
+  static int
+@@@ -210,30 -226,38 +250,43 @@@ static int ip6_finish_output(struct ne
+  
+  int ip6_output(struct net *net, struct sock *sk, struct sk_buff *skb)
+  {
+++<<<<<<< HEAD
+ +	struct net_device *dev = skb_dst(skb)->dev, *indev = skb->dev;
+ +	struct inet6_dev *idev = ip6_dst_idev(skb_dst(skb));
+++=======
++ 	struct dst_entry *dst = skb_dst(skb);
++ 	struct net_device *dev, *indev = skb->dev;
++ 	struct inet6_dev *idev;
++ 	int ret;
+++>>>>>>> 11709573cc4e (ipv6: use RCU in ip6_output())
+  
+  	skb->protocol = htons(ETH_P_IPV6);
++ 	rcu_read_lock();
++ 	dev = dst_dev_rcu(dst);
++ 	idev = ip6_dst_idev(dst);
+  	skb->dev = dev;
+  
+ -	if (unlikely(!idev || READ_ONCE(idev->cnf.disable_ipv6))) {
+ +	if (unlikely(!idev || idev->cnf.disable_ipv6)) {
+  		IP6_INC_STATS(net, idev, IPSTATS_MIB_OUTDISCARDS);
++ 		rcu_read_unlock();
+  		kfree_skb_reason(skb, SKB_DROP_REASON_IPV6DISABLED);
+  		return 0;
+  	}
+  
+- 	return NF_HOOK_COND(NFPROTO_IPV6, NF_INET_POST_ROUTING,
+- 			    net, sk, skb, indev, dev,
+- 			    ip6_finish_output,
+- 			    !(IP6CB(skb)->flags & IP6SKB_REROUTED));
++ 	ret = NF_HOOK_COND(NFPROTO_IPV6, NF_INET_POST_ROUTING,
++ 			   net, sk, skb, indev, dev,
++ 			   ip6_finish_output,
++ 			   !(IP6CB(skb)->flags & IP6SKB_REROUTED));
++ 	rcu_read_unlock();
++ 	return ret;
+  }
+ -EXPORT_SYMBOL(ip6_output);
+  
+ -bool ip6_autoflowlabel(struct net *net, const struct sock *sk)
+ +bool ip6_autoflowlabel(struct net *net, const struct ipv6_pinfo *np)
+  {
+ -	if (!inet6_test_bit(AUTOFLOWLABEL_SET, sk))
+ +	if (!np->autoflowlabel_set)
+  		return ip6_default_np_autolabel(net);
+ -	return inet6_test_bit(AUTOFLOWLABEL, sk);
+ +	else
+ +		return np->autoflowlabel;
+  }
+  
+  /*
+* Unmerged path net/ipv6/ip6_output.c
