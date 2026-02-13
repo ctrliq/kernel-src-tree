@@ -134,7 +134,7 @@ static void idpf_compl_desc_rel(struct idpf_compl_queue *complq)
 {
 	idpf_xsk_clear_queue(complq, VIRTCHNL2_QUEUE_TYPE_TX_COMPLETION);
 
-	if (!complq->comp)
+	if (!complq->desc_ring)
 		return;
 
 	dma_free_coherent(complq->netdev->dev.parent, complq->size,
@@ -695,9 +695,10 @@ err:
 static int idpf_rx_bufs_init_singleq(struct idpf_rx_queue *rxq)
 {
 	struct libeth_fq fq = {
-		.count	= rxq->desc_count,
-		.type	= LIBETH_FQE_MTU,
-		.nid	= idpf_q_vector_to_mem(rxq->q_vector),
+		.count		= rxq->desc_count,
+		.type		= LIBETH_FQE_MTU,
+		.buf_len	= IDPF_RX_MAX_BUF_SZ,
+		.nid		= idpf_q_vector_to_mem(rxq->q_vector),
 	};
 	int ret;
 
@@ -754,6 +755,7 @@ static int idpf_rx_bufs_init(struct idpf_buf_queue *bufq,
 		.truesize	= bufq->truesize,
 		.count		= bufq->desc_count,
 		.type		= type,
+		.buf_len	= IDPF_RX_MAX_BUF_SZ,
 		.hsplit		= idpf_queue_has(HSPLIT_EN, bufq),
 		.xdp		= idpf_xdp_enabled(bufq->q_vector->vport),
 		.nid		= idpf_q_vector_to_mem(bufq->q_vector),
@@ -922,8 +924,8 @@ static int idpf_rx_desc_alloc_all(struct idpf_vport *vport)
 			err = idpf_rx_desc_alloc(vport, q);
 			if (err) {
 				pci_err(vport->adapter->pdev,
-					"Memory allocation for Rx Queue %u failed\n",
-					i);
+					"Memory allocation for Rx queue %u from queue group %u failed\n",
+					j, i);
 				goto err_out;
 			}
 		}
@@ -939,8 +941,8 @@ static int idpf_rx_desc_alloc_all(struct idpf_vport *vport)
 			err = idpf_bufq_desc_alloc(vport, q);
 			if (err) {
 				pci_err(vport->adapter->pdev,
-					"Memory allocation for Rx Buffer Queue %u failed\n",
-					i);
+					"Memory allocation for Rx Buffer Queue %u from queue group %u failed\n",
+					j, i);
 				goto err_out;
 			}
 		}
@@ -2275,7 +2277,7 @@ fetch_next_desc:
 		/* Update BQL */
 		nq = netdev_get_tx_queue(tx_q->netdev, tx_q->idx);
 
-		dont_wake = !complq_ok || np->state != __IDPF_VPORT_UP ||
+		dont_wake = !complq_ok || !test_bit(IDPF_VPORT_UP, np->state) ||
 			    !netif_carrier_ok(tx_q->netdev);
 		/* Check if the TXQ needs to and can be restarted */
 		__netif_txq_completed_wake(nq, tx_q->cleaned_pkts, tx_q->cleaned_bytes,
@@ -3807,8 +3809,6 @@ void idpf_vport_intr_rel(struct idpf_vport *vport)
 		q_vector->tx = NULL;
 		kfree(q_vector->rx);
 		q_vector->rx = NULL;
-
-		free_cpumask_var(q_vector->affinity_mask);
 	}
 
 	kfree(vport->q_vectors);
@@ -3849,8 +3849,6 @@ static void idpf_vport_intr_rel_irq(struct idpf_vport *vport)
 		vidx = vport->q_vector_idxs[vector];
 		irq_num = adapter->msix_entries[vidx].vector;
 
-		/* clear the affinity_mask in the IRQ descriptor */
-		irq_set_affinity_hint(irq_num, NULL);
 		idpf_q_vector_set_napi(q_vector, false);
 		kfree(free_irq(irq_num, q_vector));
 	}
@@ -3941,7 +3939,7 @@ static void idpf_update_dim_sample(struct idpf_q_vector *q_vector,
 static void idpf_net_dim(struct idpf_q_vector *q_vector)
 {
 	struct dim_sample dim_sample = { };
-	u64 packets, bytes;
+	u64 packets, bytes, pkts, bts;
 	u32 i;
 
 	if (!IDPF_ITR_IS_DYNAMIC(q_vector->tx_intr_mode))
@@ -3953,9 +3951,12 @@ static void idpf_net_dim(struct idpf_q_vector *q_vector)
 
 		do {
 			start = u64_stats_fetch_begin(&txq->stats_sync);
-			packets += u64_stats_read(&txq->q_stats.packets);
-			bytes += u64_stats_read(&txq->q_stats.bytes);
+			pkts = u64_stats_read(&txq->q_stats.packets);
+			bts = u64_stats_read(&txq->q_stats.bytes);
 		} while (u64_stats_fetch_retry(&txq->stats_sync, start));
+
+		packets += pkts;
+		bytes += bts;
 	}
 
 	idpf_update_dim_sample(q_vector, &dim_sample, &q_vector->tx_dim,
@@ -3972,9 +3973,12 @@ check_rx_itr:
 
 		do {
 			start = u64_stats_fetch_begin(&rxq->stats_sync);
-			packets += u64_stats_read(&rxq->q_stats.packets);
-			bytes += u64_stats_read(&rxq->q_stats.bytes);
+			pkts = u64_stats_read(&rxq->q_stats.packets);
+			bts = u64_stats_read(&rxq->q_stats.bytes);
 		} while (u64_stats_fetch_retry(&rxq->stats_sync, start));
+
+		packets += pkts;
+		bytes += bts;
 	}
 
 	idpf_update_dim_sample(q_vector, &dim_sample, &q_vector->rx_dim,
@@ -4041,8 +4045,7 @@ static int idpf_vport_intr_req_irq(struct idpf_vport *vport)
 				   "Request_irq failed, error: %d\n", err);
 			goto free_q_irqs;
 		}
-		/* assign the mask for this irq */
-		irq_set_affinity_hint(irq_num, q_vector->affinity_mask);
+
 		idpf_q_vector_set_napi(q_vector, true);
 	}
 
@@ -4477,7 +4480,8 @@ static int idpf_vport_intr_init_vec_idx(struct idpf_vport *vport)
 static void idpf_vport_intr_napi_add_all(struct idpf_vport *vport)
 {
 	int (*napi_poll)(struct napi_struct *napi, int budget);
-	u16 v_idx;
+	u16 v_idx, qv_idx;
+	int irq_num;
 
 	if (idpf_is_queue_model_split(vport->txq_model))
 		napi_poll = idpf_vport_splitq_napi_poll;
@@ -4486,12 +4490,12 @@ static void idpf_vport_intr_napi_add_all(struct idpf_vport *vport)
 
 	for (v_idx = 0; v_idx < vport->num_q_vectors; v_idx++) {
 		struct idpf_q_vector *q_vector = &vport->q_vectors[v_idx];
+		qv_idx = vport->q_vector_idxs[v_idx];
+		irq_num = vport->adapter->msix_entries[qv_idx].vector;
 
-		netif_napi_add(vport->netdev, &q_vector->napi, napi_poll);
-
-		/* only set affinity_mask if the CPU is online */
-		if (cpu_online(v_idx))
-			cpumask_set_cpu(v_idx, q_vector->affinity_mask);
+		netif_napi_add_config(vport->netdev, &q_vector->napi,
+				      napi_poll, v_idx);
+		netif_napi_set_irq(&q_vector->napi, irq_num);
 	}
 }
 
@@ -4539,9 +4543,6 @@ int idpf_vport_intr_alloc(struct idpf_vport *vport)
 		q_vector->rx_itr_value = q_coal->rx_coalesce_usecs;
 		q_vector->rx_intr_mode = q_coal->rx_intr_mode;
 		q_vector->rx_itr_idx = VIRTCHNL2_ITR_IDX_0;
-
-		if (!zalloc_cpumask_var(&q_vector->affinity_mask, GFP_KERNEL))
-			goto error;
 
 		q_vector->tx = kcalloc(txqs_per_vector, sizeof(*q_vector->tx),
 				       GFP_KERNEL);
@@ -4646,7 +4647,7 @@ int idpf_config_rss(struct idpf_vport *vport)
  * idpf_fill_dflt_rss_lut - Fill the indirection table with the default values
  * @vport: virtual port structure
  */
-static void idpf_fill_dflt_rss_lut(struct idpf_vport *vport)
+void idpf_fill_dflt_rss_lut(struct idpf_vport *vport)
 {
 	struct idpf_adapter *adapter = vport->adapter;
 	u16 num_active_rxq = vport->num_rxq;
@@ -4655,57 +4656,47 @@ static void idpf_fill_dflt_rss_lut(struct idpf_vport *vport)
 
 	rss_data = &adapter->vport_config[vport->idx]->user_config.rss_data;
 
-	for (i = 0; i < rss_data->rss_lut_size; i++) {
+	for (i = 0; i < rss_data->rss_lut_size; i++)
 		rss_data->rss_lut[i] = i % num_active_rxq;
-		rss_data->cached_lut[i] = rss_data->rss_lut[i];
-	}
 }
 
 /**
- * idpf_init_rss - Allocate and initialize RSS resources
+ * idpf_init_rss_lut - Allocate and initialize RSS LUT
  * @vport: virtual port
  *
- * Return 0 on success, negative on failure
+ * Return: 0 on success, negative on failure
  */
-int idpf_init_rss(struct idpf_vport *vport)
+int idpf_init_rss_lut(struct idpf_vport *vport)
 {
 	struct idpf_adapter *adapter = vport->adapter;
 	struct idpf_rss_data *rss_data;
-	u32 lut_size;
 
 	rss_data = &adapter->vport_config[vport->idx]->user_config.rss_data;
+	if (!rss_data->rss_lut) {
+		u32 lut_size;
 
-	lut_size = rss_data->rss_lut_size * sizeof(u32);
-	rss_data->rss_lut = kzalloc(lut_size, GFP_KERNEL);
-	if (!rss_data->rss_lut)
-		return -ENOMEM;
-
-	rss_data->cached_lut = kzalloc(lut_size, GFP_KERNEL);
-	if (!rss_data->cached_lut) {
-		kfree(rss_data->rss_lut);
-		rss_data->rss_lut = NULL;
-
-		return -ENOMEM;
+		lut_size = rss_data->rss_lut_size * sizeof(u32);
+		rss_data->rss_lut = kzalloc(lut_size, GFP_KERNEL);
+		if (!rss_data->rss_lut)
+			return -ENOMEM;
 	}
 
 	/* Fill the default RSS lut values */
 	idpf_fill_dflt_rss_lut(vport);
 
-	return idpf_config_rss(vport);
+	return 0;
 }
 
 /**
- * idpf_deinit_rss - Release RSS resources
+ * idpf_deinit_rss_lut - Release RSS LUT
  * @vport: virtual port
  */
-void idpf_deinit_rss(struct idpf_vport *vport)
+void idpf_deinit_rss_lut(struct idpf_vport *vport)
 {
 	struct idpf_adapter *adapter = vport->adapter;
 	struct idpf_rss_data *rss_data;
 
 	rss_data = &adapter->vport_config[vport->idx]->user_config.rss_data;
-	kfree(rss_data->cached_lut);
-	rss_data->cached_lut = NULL;
 	kfree(rss_data->rss_lut);
 	rss_data->rss_lut = NULL;
 }
