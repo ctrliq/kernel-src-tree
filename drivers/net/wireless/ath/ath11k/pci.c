@@ -33,6 +33,15 @@
 
 #define TCSR_SOC_HW_SUB_VER	0x1910010
 
+static ulong rh_ath11k_host_msi_vector_addr = 0;
+module_param_named(rh_host_msi_vector_addr, rh_ath11k_host_msi_vector_addr, ulong, 0644);
+MODULE_PARM_DESC(rh_host_msi_vector_addr,
+		 "Red Hat workaround to configure the MSI vector address that is used from host in order to be used in VM");
+static uint rh_ath11k_host_msi_vector_data = 0;
+module_param_named(rh_host_msi_vector_data, rh_ath11k_host_msi_vector_data, uint, 0644);
+MODULE_PARM_DESC(rh_host_msi_vector_data,
+		 "Red Hat workaround to configure the MSI vector data that is used from host in order to be used in VM");
+
 static const struct pci_device_id ath11k_pci_id_table[] = {
 	{ PCI_VDEVICE(QCOM, QCA6390_DEVICE_ID) },
 	{ PCI_VDEVICE(QCOM, WCN6855_DEVICE_ID) },
@@ -445,6 +454,18 @@ static int ath11k_pci_alloc_msi(struct ath11k_pci *ab_pci)
 
 	ath11k_pci_msi_disable(ab_pci);
 
+	if (rh_ath11k_host_msi_vector_addr) {
+		ab->pci.msi.ep_base_data = rh_ath11k_host_msi_vector_data;
+		ab->pci.msi.addr_hi = (u32)(rh_ath11k_host_msi_vector_addr >> 32);
+		ab->pci.msi.addr_lo = (u32)(rh_ath11k_host_msi_vector_addr & 0xffffffff);
+
+		ath11k_dbg(ab, ATH11K_DBG_PCI, "msi addr hi 0x%x lo 0x%x base data is %d\n",
+			   ab->pci.msi.addr_hi,
+			   ab->pci.msi.addr_lo,
+			   ab->pci.msi.ep_base_data);
+		return 0;
+	}
+
 	msi_desc = irq_get_msi_desc(ab_pci->pdev->irq);
 	if (!msi_desc) {
 		ath11k_err(ab, "msi_desc is NULL!\n");
@@ -483,6 +504,9 @@ static void ath11k_pci_free_msi(struct ath11k_pci *ab_pci)
 static int ath11k_pci_config_msi_data(struct ath11k_pci *ab_pci)
 {
 	struct msi_desc *msi_desc;
+
+	if (rh_ath11k_host_msi_vector_addr)
+		return 0;
 
 	msi_desc = irq_get_msi_desc(ab_pci->pdev->irq);
 	if (!msi_desc) {
