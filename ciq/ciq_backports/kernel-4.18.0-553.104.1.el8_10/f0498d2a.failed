@@ -1,0 +1,3544 @@
+sched: Fix stop_one_cpu_nowait() vs hotplug
+
+jira KERNEL-609
+Rebuild_History Non-Buildable kernel-4.18.0-553.104.1.el8_10
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit f0498d2a54e7966ce23cd7c7ff42c64fa0059b07
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.104.1.el8_10/f0498d2a.failed
+
+Kuyo reported sporadic failures on a sched_setaffinity() vs CPU
+hotplug stress-test -- notably affine_move_task() remains stuck in
+wait_for_completion(), leading to a hung-task detector warning.
+
+Specifically, it was reported that stop_one_cpu_nowait(.fn =
+migration_cpu_stop) returns false -- this stopper is responsible for
+the matching complete().
+
+The race scenario is:
+
+	CPU0					CPU1
+
+					// doing _cpu_down()
+
+  __set_cpus_allowed_ptr()
+    task_rq_lock();
+					takedown_cpu()
+					  stop_machine_cpuslocked(take_cpu_down..)
+
+					<PREEMPT: cpu_stopper_thread()
+					  MULTI_STOP_PREPARE
+					  ...
+    __set_cpus_allowed_ptr_locked()
+      affine_move_task()
+        task_rq_unlock();
+
+  <PREEMPT: cpu_stopper_thread()\>
+    ack_state()
+					  MULTI_STOP_RUN
+					    take_cpu_down()
+					      __cpu_disable();
+					      stop_machine_park();
+						stopper->enabled = false;
+					 />
+   />
+	stop_one_cpu_nowait(.fn = migration_cpu_stop);
+          if (stopper->enabled) // false!!!
+
+That is, by doing stop_one_cpu_nowait() after dropping rq-lock, the
+stopper thread gets a chance to preempt and allows the cpu-down for
+the target CPU to complete.
+
+OTOH, since stop_one_cpu_nowait() / cpu_stop_queue_work() needs to
+issue a wakeup, it must not be ran under the scheduler locks.
+
+Solve this apparent contradiction by keeping preemption disabled over
+the unlock + queue_stopper combination:
+
+	preempt_disable();
+	task_rq_unlock(...);
+	if (!stop_pending)
+	  stop_one_cpu_nowait(...)
+	preempt_enable();
+
+This respects the lock ordering contraints while still avoiding the
+above race. That is, if we find the CPU is online under rq-lock, the
+targeted stop_one_cpu_nowait() must succeed.
+
+Apply this pattern to all similar stop_one_cpu_nowait() invocations.
+
+Fixes: 6d337eab041d ("sched: Fix migrate_disable() vs set_cpus_allowed_ptr()")
+	Reported-by: "Kuyo Chang (張建文)" <Kuyo.Chang@mediatek.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Tested-by: "Kuyo Chang (張建文)" <Kuyo.Chang@mediatek.com>
+Link: https://lkml.kernel.org/r/20231010200442.GA16515@noisy.programming.kicks-ass.net
+(cherry picked from commit f0498d2a54e7966ce23cd7c7ff42c64fa0059b07)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/core.c
+#	kernel/sched/deadline.c
+#	kernel/sched/fair.c
+#	kernel/sched/rt.c
+diff --cc kernel/sched/core.c
+index 8fcf168d05ef,264c2eb380d7..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -1020,752 -1588,2759 +1020,756 @@@ inline int task_curr(const struct task_
+  }
+  
+  /*
+ - * When a task is dequeued from a rq, the clamp bucket refcounted by the task
+ - * is released. If this is the last task reference counting the rq's max
+ - * active clamp value, then the rq's clamp value is updated.
+ + * switched_from, switched_to and prio_changed must _NOT_ drop rq->lock,
+ + * use the balance_callback list if you want balancing.
+   *
+ - * Both refcounted tasks and rq's cached clamp values are expected to be
+ - * always valid. If it's detected they are not, as defensive programming,
+ - * enforce the expected state and warn.
+ + * this means any call to check_class_changed() must be followed by a call to
+ + * balance_callback().
+   */
+ -static inline void uclamp_rq_dec_id(struct rq *rq, struct task_struct *p,
+ -				    enum uclamp_id clamp_id)
+ +static inline void check_class_changed(struct rq *rq, struct task_struct *p,
+ +				       const struct sched_class *prev_class,
+ +				       int oldprio)
+  {
+ -	struct uclamp_rq *uc_rq = &rq->uclamp[clamp_id];
+ -	struct uclamp_se *uc_se = &p->uclamp[clamp_id];
+ -	struct uclamp_bucket *bucket;
+ -	unsigned int bkt_clamp;
+ -	unsigned int rq_clamp;
+ +	if (prev_class != p->sched_class) {
+ +		if (prev_class->switched_from)
+ +			prev_class->switched_from(rq, p);
+  
+ -	lockdep_assert_rq_held(rq);
+ +		p->sched_class->switched_to(rq, p);
+ +	} else if (oldprio != p->prio || dl_task(p))
+ +		p->sched_class->prio_changed(rq, p, oldprio);
+ +}
+ +
+ +void check_preempt_curr(struct rq *rq, struct task_struct *p, int flags)
+ +{
+ +	const struct sched_class *class;
+ +
+ +	if (p->sched_class == rq->curr->sched_class) {
+ +		rq->curr->sched_class->check_preempt_curr(rq, p, flags);
+ +	} else {
+ +		for_each_class(class) {
+ +			if (class == rq->curr->sched_class)
+ +				break;
+ +			if (class == p->sched_class) {
+ +				resched_curr(rq);
+ +				break;
+ +			}
+ +		}
+ +	}
+  
+  	/*
+ -	 * If sched_uclamp_used was enabled after task @p was enqueued,
+ -	 * we could end up with unbalanced call to uclamp_rq_dec_id().
+ -	 *
+ -	 * In this case the uc_se->active flag should be false since no uclamp
+ -	 * accounting was performed at enqueue time and we can just return
+ -	 * here.
+ -	 *
+ -	 * Need to be careful of the following enqueue/dequeue ordering
+ -	 * problem too
+ -	 *
+ -	 *	enqueue(taskA)
+ -	 *	// sched_uclamp_used gets enabled
+ -	 *	enqueue(taskB)
+ -	 *	dequeue(taskA)
+ -	 *	// Must not decrement bucket->tasks here
+ -	 *	dequeue(taskB)
+ -	 *
+ -	 * where we could end up with stale data in uc_se and
+ -	 * bucket[uc_se->bucket_id].
+ -	 *
+ -	 * The following check here eliminates the possibility of such race.
+ +	 * A queue event has occurred, and we're going to schedule.  In
+ +	 * this case, we can save a useless back to back clock update.
+  	 */
+ -	if (unlikely(!uc_se->active))
+ -		return;
+ +	if (task_on_rq_queued(rq->curr) && test_tsk_need_resched(rq->curr))
+ +		rq_clock_skip_update(rq);
+ +}
+ +
+ +#ifdef CONFIG_SMP
+  
+ -	bucket = &uc_rq->bucket[uc_se->bucket_id];
+ +static void
+ +__do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask, u32 flags);
+  
+ -	SCHED_WARN_ON(!bucket->tasks);
+ -	if (likely(bucket->tasks))
+ -		bucket->tasks--;
+ +static int __set_cpus_allowed_ptr(struct task_struct *p,
+ +				  const struct cpumask *new_mask,
+ +				  u32 flags);
+  
+ -	uc_se->active = false;
+ +static void migrate_disable_switch(struct rq *rq, struct task_struct *p)
+ +{
+ +	if (likely(!p->migration_disabled))
+ +		return;
+  
+ -	/*
+ -	 * Keep "local max aggregation" simple and accept to (possibly)
+ -	 * overboost some RUNNABLE tasks in the same bucket.
+ -	 * The rq clamp bucket value is reset to its base value whenever
+ -	 * there are no more RUNNABLE tasks refcounting it.
+ -	 */
+ -	if (likely(bucket->tasks))
+ +	if (p->cpus_ptr != &p->cpus_mask)
+  		return;
+  
+ -	rq_clamp = uclamp_rq_get(rq, clamp_id);
+  	/*
+ -	 * Defensive programming: this should never happen. If it happens,
+ -	 * e.g. due to future modification, warn and fixup the expected value.
+ +	 * Violates locking rules! see comment in __do_set_cpus_allowed().
+  	 */
+ -	SCHED_WARN_ON(bucket->value > rq_clamp);
+ -	if (bucket->value >= rq_clamp) {
+ -		bkt_clamp = uclamp_rq_max_value(rq, clamp_id, uc_se->value);
+ -		uclamp_rq_set(rq, clamp_id, bkt_clamp);
+ -	}
+ +	__do_set_cpus_allowed(p, cpumask_of(rq->cpu), SCA_MIGRATE_DISABLE);
+  }
+  
+ -static inline void uclamp_rq_inc(struct rq *rq, struct task_struct *p)
+ +void migrate_disable(void)
+  {
+ -	enum uclamp_id clamp_id;
+ -
+ -	/*
+ -	 * Avoid any overhead until uclamp is actually used by the userspace.
+ -	 *
+ -	 * The condition is constructed such that a NOP is generated when
+ -	 * sched_uclamp_used is disabled.
+ -	 */
+ -	if (!static_branch_unlikely(&sched_uclamp_used))
+ -		return;
+ +	struct task_struct *p = current;
+  
+ -	if (unlikely(!p->sched_class->uclamp_enabled))
+ +	if (p->migration_disabled) {
+ +		p->migration_disabled++;
+  		return;
+ +	}
+  
+ -	for_each_clamp_id(clamp_id)
+ -		uclamp_rq_inc_id(rq, p, clamp_id);
+ -
+ -	/* Reset clamp idle holding when there is one RUNNABLE task */
+ -	if (rq->uclamp_flags & UCLAMP_FLAG_IDLE)
+ -		rq->uclamp_flags &= ~UCLAMP_FLAG_IDLE;
+ +	preempt_disable();
+ +	this_rq()->nr_pinned++;
+ +	p->migration_disabled = 1;
+ +	preempt_enable();
+  }
+ +EXPORT_SYMBOL_GPL(migrate_disable);
+  
+ -static inline void uclamp_rq_dec(struct rq *rq, struct task_struct *p)
+ +void migrate_enable(void)
+  {
+ -	enum uclamp_id clamp_id;
+ -
+ -	/*
+ -	 * Avoid any overhead until uclamp is actually used by the userspace.
+ -	 *
+ -	 * The condition is constructed such that a NOP is generated when
+ -	 * sched_uclamp_used is disabled.
+ -	 */
+ -	if (!static_branch_unlikely(&sched_uclamp_used))
+ -		return;
+ +	struct task_struct *p = current;
+  
+ -	if (unlikely(!p->sched_class->uclamp_enabled))
+ +	if (p->migration_disabled > 1) {
+ +		p->migration_disabled--;
+  		return;
+ +	}
+  
+ -	for_each_clamp_id(clamp_id)
+ -		uclamp_rq_dec_id(rq, p, clamp_id);
+ -}
+ -
+ -static inline void uclamp_rq_reinc_id(struct rq *rq, struct task_struct *p,
+ -				      enum uclamp_id clamp_id)
+ -{
+ -	if (!p->uclamp[clamp_id].active)
+ +	if (WARN_ON_ONCE(!p->migration_disabled))
+  		return;
+  
+ -	uclamp_rq_dec_id(rq, p, clamp_id);
+ -	uclamp_rq_inc_id(rq, p, clamp_id);
+ -
+ -	/*
+ -	 * Make sure to clear the idle flag if we've transiently reached 0
+ -	 * active tasks on rq.
+ -	 */
+ -	if (clamp_id == UCLAMP_MAX && (rq->uclamp_flags & UCLAMP_FLAG_IDLE))
+ -		rq->uclamp_flags &= ~UCLAMP_FLAG_IDLE;
+ -}
+ -
+ -static inline void
+ -uclamp_update_active(struct task_struct *p)
+ -{
+ -	enum uclamp_id clamp_id;
+ -	struct rq_flags rf;
+ -	struct rq *rq;
+ -
+  	/*
+ -	 * Lock the task and the rq where the task is (or was) queued.
+ -	 *
+ -	 * We might lock the (previous) rq of a !RUNNABLE task, but that's the
+ -	 * price to pay to safely serialize util_{min,max} updates with
+ -	 * enqueues, dequeues and migration operations.
+ -	 * This is the same locking schema used by __set_cpus_allowed_ptr().
+ +	 * Ensure stop_task runs either before or after this, and that
+ +	 * __set_cpus_allowed_ptr(SCA_MIGRATE_ENABLE) doesn't schedule().
+  	 */
+ -	rq = task_rq_lock(p, &rf);
+ -
+ +	preempt_disable();
+ +	if (p->cpus_ptr != &p->cpus_mask)
+ +		__set_cpus_allowed_ptr(p, &p->cpus_mask, SCA_MIGRATE_ENABLE);
+  	/*
+ -	 * Setting the clamp bucket is serialized by task_rq_lock().
+ -	 * If the task is not yet RUNNABLE and its task_struct is not
+ -	 * affecting a valid clamp bucket, the next time it's enqueued,
+ -	 * it will already see the updated clamp bucket value.
+ +	 * Mustn't clear migration_disabled() until cpus_ptr points back at the
+ +	 * regular cpus_mask, otherwise things that race (eg.
+ +	 * select_fallback_rq) get confused.
+  	 */
+ -	for_each_clamp_id(clamp_id)
+ -		uclamp_rq_reinc_id(rq, p, clamp_id);
+ -
+ -	task_rq_unlock(rq, p, &rf);
+ +	barrier();
+ +	p->migration_disabled = 0;
+ +	this_rq()->nr_pinned--;
+ +	preempt_enable();
+  }
+ +EXPORT_SYMBOL_GPL(migrate_enable);
+  
+ -#ifdef CONFIG_UCLAMP_TASK_GROUP
+ -static inline void
+ -uclamp_update_active_tasks(struct cgroup_subsys_state *css)
+ +static inline bool rq_has_pinned_tasks(struct rq *rq)
+  {
+ -	struct css_task_iter it;
+ -	struct task_struct *p;
+ -
+ -	css_task_iter_start(css, 0, &it);
+ -	while ((p = css_task_iter_next(&it)))
+ -		uclamp_update_active(p);
+ -	css_task_iter_end(&it);
+ +	return rq->nr_pinned;
+  }
+  
+ -static void cpu_util_update_eff(struct cgroup_subsys_state *css);
+ -#endif
+ -
+ -#ifdef CONFIG_SYSCTL
+ -#ifdef CONFIG_UCLAMP_TASK
+ -#ifdef CONFIG_UCLAMP_TASK_GROUP
+ -static void uclamp_update_root_tg(void)
+ +/*
+ + * Per-CPU kthreads are allowed to run on !active && online CPUs, see
+ + * __set_cpus_allowed_ptr() and select_fallback_rq().
+ + */
+ +static inline bool is_cpu_allowed(struct task_struct *p, int cpu)
+  {
+ -	struct task_group *tg = &root_task_group;
+ +	/* When not in the task's cpumask, no point in looking further. */
+ +	if (!cpumask_test_cpu(cpu, p->cpus_ptr))
+ +		return false;
+  
+ -	uclamp_se_set(&tg->uclamp_req[UCLAMP_MIN],
+ -		      sysctl_sched_uclamp_util_min, false);
+ -	uclamp_se_set(&tg->uclamp_req[UCLAMP_MAX],
+ -		      sysctl_sched_uclamp_util_max, false);
+ +	/* migrate_disabled() must be allowed to finish. */
+ +	if (is_migration_disabled(p))
+ +		return cpu_online(cpu);
+  
+ -	guard(rcu)();
+ -	cpu_util_update_eff(&root_task_group.css);
+ -}
+ -#else
+ -static void uclamp_update_root_tg(void) { }
+ -#endif
+ +	/* Non kernel threads are not allowed during either online or offline. */
+ +	if (!(p->flags & PF_KTHREAD))
+ +		return cpu_active(cpu);
+  
+ -static void uclamp_sync_util_min_rt_default(void)
+ -{
+ -	struct task_struct *g, *p;
+ +	/* KTHREAD_IS_PER_CPU is always allowed. */
+ +	if (kthread_is_per_cpu(p))
+ +		return cpu_online(cpu);
+  
+ -	/*
+ -	 * copy_process()			sysctl_uclamp
+ -	 *					  uclamp_min_rt = X;
+ -	 *   write_lock(&tasklist_lock)		  read_lock(&tasklist_lock)
+ -	 *   // link thread			  smp_mb__after_spinlock()
+ -	 *   write_unlock(&tasklist_lock)	  read_unlock(&tasklist_lock);
+ -	 *   sched_post_fork()			  for_each_process_thread()
+ -	 *     __uclamp_sync_rt()		    __uclamp_sync_rt()
+ -	 *
+ -	 * Ensures that either sched_post_fork() will observe the new
+ -	 * uclamp_min_rt or for_each_process_thread() will observe the new
+ -	 * task.
+ -	 */
+ -	read_lock(&tasklist_lock);
+ -	smp_mb__after_spinlock();
+ -	read_unlock(&tasklist_lock);
+ +	/* Regular kernel threads don't get to stay during offline. */
+ +	if (cpu_dying(cpu))
+ +		return false;
+  
+ -	guard(rcu)();
+ -	for_each_process_thread(g, p)
+ -		uclamp_update_util_min_rt_default(p);
+ +	/* But are allowed during online. */
+ +	return cpu_online(cpu);
+  }
+  
+ -static int sysctl_sched_uclamp_handler(struct ctl_table *table, int write,
+ -				void *buffer, size_t *lenp, loff_t *ppos)
+ -{
+ -	bool update_root_tg = false;
+ -	int old_min, old_max, old_min_rt;
+ -	int result;
+ -
+ -	guard(mutex)(&uclamp_mutex);
+ -
+ -	old_min = sysctl_sched_uclamp_util_min;
+ -	old_max = sysctl_sched_uclamp_util_max;
+ -	old_min_rt = sysctl_sched_uclamp_util_min_rt_default;
+ +/*
+ + * This is how migration works:
+ + *
+ + * 1) we invoke migration_cpu_stop() on the target CPU using
+ + *    stop_one_cpu().
+ + * 2) stopper starts to run (implicitly forcing the migrated thread
+ + *    off the CPU)
+ + * 3) it checks whether the migrated task is still in the wrong runqueue.
+ + * 4) if it's in the wrong runqueue then the migration thread removes
+ + *    it and puts it into the right queue.
+ + * 5) stopper completes and stop_one_cpu() returns and the migration
+ + *    is done.
+ + */
+  
+ -	result = proc_dointvec(table, write, buffer, lenp, ppos);
+ -	if (result)
+ -		goto undo;
+ -	if (!write)
+ -		return 0;
+ -
+ -	if (sysctl_sched_uclamp_util_min > sysctl_sched_uclamp_util_max ||
+ -	    sysctl_sched_uclamp_util_max > SCHED_CAPACITY_SCALE	||
+ -	    sysctl_sched_uclamp_util_min_rt_default > SCHED_CAPACITY_SCALE) {
+ -
+ -		result = -EINVAL;
+ -		goto undo;
+ -	}
+ -
+ -	if (old_min != sysctl_sched_uclamp_util_min) {
+ -		uclamp_se_set(&uclamp_default[UCLAMP_MIN],
+ -			      sysctl_sched_uclamp_util_min, false);
+ -		update_root_tg = true;
+ -	}
+ -	if (old_max != sysctl_sched_uclamp_util_max) {
+ -		uclamp_se_set(&uclamp_default[UCLAMP_MAX],
+ -			      sysctl_sched_uclamp_util_max, false);
+ -		update_root_tg = true;
+ -	}
+ +/*
+ + * move_queued_task - move a queued task to new rq.
+ + *
+ + * Returns (locked) new rq. Old rq's lock is released.
+ + */
+ +static struct rq *move_queued_task(struct rq *rq, struct rq_flags *rf,
+ +				   struct task_struct *p, int new_cpu)
+ +{
+ +	lockdep_assert_held(&rq->lock);
+  
+ -	if (update_root_tg) {
+ -		static_branch_enable(&sched_uclamp_used);
+ -		uclamp_update_root_tg();
+ -	}
+ +	deactivate_task(rq, p, DEQUEUE_NOCLOCK);
+ +	set_task_cpu(p, new_cpu);
+ +	rq_unlock(rq, rf);
+  
+ -	if (old_min_rt != sysctl_sched_uclamp_util_min_rt_default) {
+ -		static_branch_enable(&sched_uclamp_used);
+ -		uclamp_sync_util_min_rt_default();
+ -	}
+ +	rq = cpu_rq(new_cpu);
+  
+ -	/*
+ -	 * We update all RUNNABLE tasks only when task groups are in use.
+ -	 * Otherwise, keep it simple and do just a lazy update at each next
+ -	 * task enqueue time.
+ -	 */
+ -	return 0;
+ +	rq_lock(rq, rf);
+ +	BUG_ON(task_cpu(p) != new_cpu);
+ +	activate_task(rq, p, 0);
+ +	check_preempt_curr(rq, p, 0);
+  
+ -undo:
+ -	sysctl_sched_uclamp_util_min = old_min;
+ -	sysctl_sched_uclamp_util_max = old_max;
+ -	sysctl_sched_uclamp_util_min_rt_default = old_min_rt;
+ -	return result;
+ +	return rq;
+  }
+ -#endif
+ -#endif
+  
+ -static int uclamp_validate(struct task_struct *p,
+ -			   const struct sched_attr *attr)
+ -{
+ -	int util_min = p->uclamp_req[UCLAMP_MIN].value;
+ -	int util_max = p->uclamp_req[UCLAMP_MAX].value;
+ +struct migration_arg {
+ +	struct task_struct		*task;
+ +	int				dest_cpu;
+ +	struct set_affinity_pending	*pending;
+ +};
+  
+ -	if (attr->sched_flags & SCHED_FLAG_UTIL_CLAMP_MIN) {
+ -		util_min = attr->sched_util_min;
+ +/*
+ + * @refs: number of wait_for_completion()
+ + * @stop_pending: is @stop_work in use
+ + */
+ +struct set_affinity_pending {
+ +	refcount_t		refs;
+ +	unsigned int		stop_pending;
+ +	struct completion	done;
+ +	struct cpu_stop_work	stop_work;
+ +	struct migration_arg	arg;
+ +};
+  
+ -		if (util_min + 1 > SCHED_CAPACITY_SCALE + 1)
+ -			return -EINVAL;
+ -	}
+ +/*
+ + * Move (not current) task off this CPU, onto the destination CPU. We're doing
+ + * this because either it can't run here any more (set_cpus_allowed()
+ + * away from this CPU, or CPU going down), or because we're
+ + * attempting to rebalance this task on exec (sched_exec).
+ + *
+ + * So we race with normal scheduler movements, but that's OK, as long
+ + * as the task is no longer on this CPU.
+ + */
+ +static struct rq *__migrate_task(struct rq *rq, struct rq_flags *rf,
+ +				 struct task_struct *p, int dest_cpu)
+ +{
+ +	/* Affinity changed (again). */
+ +	if (!is_cpu_allowed(p, dest_cpu))
+ +		return rq;
+  
+ -	if (attr->sched_flags & SCHED_FLAG_UTIL_CLAMP_MAX) {
+ -		util_max = attr->sched_util_max;
+ +	rq = move_queued_task(rq, rf, p, dest_cpu);
+  
+ -		if (util_max + 1 > SCHED_CAPACITY_SCALE + 1)
+ -			return -EINVAL;
+ -	}
+ +	return rq;
+ +}
+  
+ -	if (util_min != -1 && util_max != -1 && util_min > util_max)
+ -		return -EINVAL;
+ +/*
+ + * migration_cpu_stop - this will be executed by a highprio stopper thread
+ + * and performs thread migration by bumping thread off CPU then
+ + * 'pushing' onto another runqueue.
+ + */
+ +static int migration_cpu_stop(void *data)
+ +{
+ +	struct migration_arg *arg = data;
+ +	struct set_affinity_pending *pending = arg->pending;
+ +	struct task_struct *p = arg->task;
+ +	struct rq *rq = this_rq();
+ +	bool complete = false;
+ +	struct rq_flags rf;
+  
+  	/*
+ -	 * We have valid uclamp attributes; make sure uclamp is enabled.
+ -	 *
+ -	 * We need to do that here, because enabling static branches is a
+ -	 * blocking operation which obviously cannot be done while holding
+ -	 * scheduler locks.
+ +	 * The original target CPU might have gone down and we might
+ +	 * be on another CPU but it doesn't matter.
+  	 */
+ -	static_branch_enable(&sched_uclamp_used);
+ -
+ -	return 0;
+ -}
+ +	local_irq_save(rf.flags);
+ +	/*
+ +	 * We need to explicitly wake pending tasks before running
+ +	 * __migrate_task() such that we will not miss enforcing cpus_ptr
+ +	 * during wakeups, see set_cpus_allowed_ptr()'s TASK_WAKING test.
+ +	 */
+ +	flush_smp_call_function_queue();
+  
+ -static bool uclamp_reset(const struct sched_attr *attr,
+ -			 enum uclamp_id clamp_id,
+ -			 struct uclamp_se *uc_se)
+ -{
+ -	/* Reset on sched class change for a non user-defined clamp value. */
+ -	if (likely(!(attr->sched_flags & SCHED_FLAG_UTIL_CLAMP)) &&
+ -	    !uc_se->user_defined)
+ -		return true;
+ +	raw_spin_lock(&p->pi_lock);
+ +	rq_lock(rq, &rf);
+  
+ -	/* Reset on sched_util_{min,max} == -1. */
+ -	if (clamp_id == UCLAMP_MIN &&
+ -	    attr->sched_flags & SCHED_FLAG_UTIL_CLAMP_MIN &&
+ -	    attr->sched_util_min == -1) {
+ -		return true;
+ -	}
+ +	/*
+ +	 * If we were passed a pending, then ->stop_pending was set, thus
+ +	 * p->migration_pending must have remained stable.
+ +	 */
+ +	WARN_ON_ONCE(pending && pending != p->migration_pending);
+  
+ -	if (clamp_id == UCLAMP_MAX &&
+ -	    attr->sched_flags & SCHED_FLAG_UTIL_CLAMP_MAX &&
+ -	    attr->sched_util_max == -1) {
+ -		return true;
+ -	}
+ +	/*
+ +	 * If task_rq(p) != rq, it cannot be migrated here, because we're
+ +	 * holding rq->lock, if p->on_rq == 0 it cannot get enqueued because
+ +	 * we're holding p->pi_lock.
+ +	 */
+ +	if (task_rq(p) == rq) {
+ +		if (is_migration_disabled(p))
+ +			goto out;
+  
+ -	return false;
+ -}
+ +		if (pending) {
+ +			p->migration_pending = NULL;
+ +			complete = true;
+  
+ -static void __setscheduler_uclamp(struct task_struct *p,
+ -				  const struct sched_attr *attr)
+ -{
+ -	enum uclamp_id clamp_id;
+ +			if (cpumask_test_cpu(task_cpu(p), &p->cpus_mask))
+ +				goto out;
+ +		}
+  
+ -	for_each_clamp_id(clamp_id) {
+ -		struct uclamp_se *uc_se = &p->uclamp_req[clamp_id];
+ -		unsigned int value;
+ +		if (task_on_rq_queued(p)) {
+ +			update_rq_clock(rq);
+ +			rq = __migrate_task(rq, &rf, p, arg->dest_cpu);
+ +		} else {
+ +			p->wake_cpu = arg->dest_cpu;
+ +		}
+  
+ -		if (!uclamp_reset(attr, clamp_id, uc_se))
+ -			continue;
+ +		/*
+ +		 * XXX __migrate_task() can fail, at which point we might end
+ +		 * up running on a dodgy CPU, AFAICT this can only happen
+ +		 * during CPU hotplug, at which point we'll get pushed out
+ +		 * anyway, so it's probably not a big deal.
+ +		 */
+  
+ +	} else if (pending) {
+  		/*
+ -		 * RT by default have a 100% boost value that could be modified
+ -		 * at runtime.
+ +		 * This happens when we get migrated between migrate_enable()'s
+ +		 * preempt_enable() and scheduling the stopper task. At that
+ +		 * point we're a regular task again and not current anymore.
+ +		 *
+ +		 * A !PREEMPT kernel has a giant hole here, which makes it far
+ +		 * more likely.
+  		 */
+ -		if (unlikely(rt_task(p) && clamp_id == UCLAMP_MIN))
+ -			value = sysctl_sched_uclamp_util_min_rt_default;
+ -		else
+ -			value = uclamp_none(clamp_id);
+  
+ -		uclamp_se_set(uc_se, value, false);
+ +		/*
+ +		 * The task moved before the stopper got to run. We're holding
+ +		 * ->pi_lock, so the allowed mask is stable - if it got
+ +		 * somewhere allowed, we're done.
+ +		 */
+ +		if (cpumask_test_cpu(task_cpu(p), p->cpus_ptr)) {
+ +			p->migration_pending = NULL;
+ +			complete = true;
+ +			goto out;
+ +		}
+  
+ +		/*
+ +		 * When migrate_enable() hits a rq mis-match we can't reliably
+ +		 * determine is_migration_disabled() and so have to chase after
+ +		 * it.
+ +		 */
+ +		WARN_ON_ONCE(!pending->stop_pending);
+++		preempt_disable();
+ +		task_rq_unlock(rq, p, &rf);
+ +		stop_one_cpu_nowait(task_cpu(p), migration_cpu_stop,
+ +				    &pending->arg, &pending->stop_work);
+++		preempt_enable();
+ +		return 0;
+  	}
+ +out:
+ +	if (pending)
+ +		pending->stop_pending = false;
+ +	task_rq_unlock(rq, p, &rf);
+  
+ -	if (likely(!(attr->sched_flags & SCHED_FLAG_UTIL_CLAMP)))
+ -		return;
+ -
+ -	if (attr->sched_flags & SCHED_FLAG_UTIL_CLAMP_MIN &&
+ -	    attr->sched_util_min != -1) {
+ -		uclamp_se_set(&p->uclamp_req[UCLAMP_MIN],
+ -			      attr->sched_util_min, true);
+ -	}
+ +	if (complete)
+ +		complete_all(&pending->done);
+  
+ -	if (attr->sched_flags & SCHED_FLAG_UTIL_CLAMP_MAX &&
+ -	    attr->sched_util_max != -1) {
+ -		uclamp_se_set(&p->uclamp_req[UCLAMP_MAX],
+ -			      attr->sched_util_max, true);
+ -	}
+ +	return 0;
+  }
+  
+ -static void uclamp_fork(struct task_struct *p)
+ +int push_cpu_stop(void *arg)
+  {
+ -	enum uclamp_id clamp_id;
+ -
+ -	/*
+ -	 * We don't need to hold task_rq_lock() when updating p->uclamp_* here
+ -	 * as the task is still at its early fork stages.
+ -	 */
+ -	for_each_clamp_id(clamp_id)
+ -		p->uclamp[clamp_id].active = false;
+ -
+ -	if (likely(!p->sched_reset_on_fork))
+ -		return;
+ -
+ -	for_each_clamp_id(clamp_id) {
+ -		uclamp_se_set(&p->uclamp_req[clamp_id],
+ -			      uclamp_none(clamp_id), false);
+ -	}
+ -}
+ +	struct rq *lowest_rq = NULL, *rq = this_rq();
+ +	struct task_struct *p = arg;
+  
+ -static void uclamp_post_fork(struct task_struct *p)
+ -{
+ -	uclamp_update_util_min_rt_default(p);
+ -}
+ +	raw_spin_lock_irq(&p->pi_lock);
+ +	raw_spin_lock(&rq->lock);
+  
+ -static void __init init_uclamp_rq(struct rq *rq)
+ -{
+ -	enum uclamp_id clamp_id;
+ -	struct uclamp_rq *uc_rq = rq->uclamp;
+ +	if (task_rq(p) != rq)
+ +		goto out_unlock;
+  
+ -	for_each_clamp_id(clamp_id) {
+ -		uc_rq[clamp_id] = (struct uclamp_rq) {
+ -			.value = uclamp_none(clamp_id)
+ -		};
+ +	if (is_migration_disabled(p)) {
+ +		p->migration_flags |= MDF_PUSH;
+ +		goto out_unlock;
+  	}
+  
+ -	rq->uclamp_flags = UCLAMP_FLAG_IDLE;
+ -}
+ -
+ -static void __init init_uclamp(void)
+ -{
+ -	struct uclamp_se uc_max = {};
+ -	enum uclamp_id clamp_id;
+ -	int cpu;
+ +	p->migration_flags &= ~MDF_PUSH;
+  
+ -	for_each_possible_cpu(cpu)
+ -		init_uclamp_rq(cpu_rq(cpu));
+ +	if (p->sched_class->find_lock_rq)
+ +		lowest_rq = p->sched_class->find_lock_rq(p, rq);
+  
+ -	for_each_clamp_id(clamp_id) {
+ -		uclamp_se_set(&init_task.uclamp_req[clamp_id],
+ -			      uclamp_none(clamp_id), false);
+ -	}
+ +	if (!lowest_rq)
+ +		goto out_unlock;
+  
+ -	/* System defaults allow max clamp values for both indexes */
+ -	uclamp_se_set(&uc_max, uclamp_none(UCLAMP_MAX), false);
+ -	for_each_clamp_id(clamp_id) {
+ -		uclamp_default[clamp_id] = uc_max;
+ -#ifdef CONFIG_UCLAMP_TASK_GROUP
+ -		root_task_group.uclamp_req[clamp_id] = uc_max;
+ -		root_task_group.uclamp[clamp_id] = uc_max;
+ -#endif
+ +	// XXX validate p is still the highest prio task
+ +	if (task_rq(p) == rq) {
+ +		deactivate_task(rq, p, 0);
+ +		set_task_cpu(p, lowest_rq->cpu);
+ +		activate_task(lowest_rq, p, 0);
+ +		resched_curr(lowest_rq);
+  	}
+ -}
+ -
+ -#else /* CONFIG_UCLAMP_TASK */
+ -static inline void uclamp_rq_inc(struct rq *rq, struct task_struct *p) { }
+ -static inline void uclamp_rq_dec(struct rq *rq, struct task_struct *p) { }
+ -static inline int uclamp_validate(struct task_struct *p,
+ -				  const struct sched_attr *attr)
+ -{
+ -	return -EOPNOTSUPP;
+ -}
+ -static void __setscheduler_uclamp(struct task_struct *p,
+ -				  const struct sched_attr *attr) { }
+ -static inline void uclamp_fork(struct task_struct *p) { }
+ -static inline void uclamp_post_fork(struct task_struct *p) { }
+ -static inline void init_uclamp(void) { }
+ -#endif /* CONFIG_UCLAMP_TASK */
+ -
+ -bool sched_task_on_rq(struct task_struct *p)
+ -{
+ -	return task_on_rq_queued(p);
+ -}
+ -
+ -unsigned long get_wchan(struct task_struct *p)
+ -{
+ -	unsigned long ip = 0;
+ -	unsigned int state;
+  
+ -	if (!p || p == current)
+ -		return 0;
+ +	double_unlock_balance(rq, lowest_rq);
+  
+ -	/* Only get wchan if task is blocked and we can keep it that way. */
+ -	raw_spin_lock_irq(&p->pi_lock);
+ -	state = READ_ONCE(p->__state);
+ -	smp_rmb(); /* see try_to_wake_up() */
+ -	if (state != TASK_RUNNING && state != TASK_WAKING && !p->on_rq)
+ -		ip = __get_wchan(p);
+ +out_unlock:
+ +	rq->push_busy = false;
+ +	raw_spin_unlock(&rq->lock);
+  	raw_spin_unlock_irq(&p->pi_lock);
+  
+ -	return ip;
+ +	put_task_struct(p);
+ +	return 0;
+  }
+  
+ -static inline void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
+ +/*
+ + * sched_class::set_cpus_allowed must do the below, but is not required to
+ + * actually call this function.
+ + */
+ +void set_cpus_allowed_common(struct task_struct *p, const struct cpumask *new_mask, u32 flags)
+  {
+ -	if (!(flags & ENQUEUE_NOCLOCK))
+ -		update_rq_clock(rq);
+ -
+ -	if (!(flags & ENQUEUE_RESTORE)) {
+ -		sched_info_enqueue(rq, p);
+ -		psi_enqueue(p, (flags & ENQUEUE_WAKEUP) && !(flags & ENQUEUE_MIGRATED));
+ +	if (flags & (SCA_MIGRATE_ENABLE | SCA_MIGRATE_DISABLE)) {
+ +		p->cpus_ptr = new_mask;
+ +		return;
+  	}
+  
+ -	uclamp_rq_inc(rq, p);
+ -	p->sched_class->enqueue_task(rq, p, flags);
+ -
+ -	if (sched_core_enabled(rq))
+ -		sched_core_enqueue(rq, p);
+ +	cpumask_copy(&p->cpus_mask, new_mask);
+ +	p->nr_cpus_allowed = cpumask_weight(new_mask);
+  }
+  
+ -static inline void dequeue_task(struct rq *rq, struct task_struct *p, int flags)
+ +static void
+ +__do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask, u32 flags)
+  {
+ -	if (sched_core_enabled(rq))
+ -		sched_core_dequeue(rq, p, flags);
+ -
+ -	if (!(flags & DEQUEUE_NOCLOCK))
+ -		update_rq_clock(rq);
+ -
+ -	if (!(flags & DEQUEUE_SAVE)) {
+ -		sched_info_dequeue(rq, p);
+ -		psi_dequeue(p, flags & DEQUEUE_SLEEP);
+ -	}
+ -
+ -	uclamp_rq_dec(rq, p);
+ -	p->sched_class->dequeue_task(rq, p, flags);
+ -}
+ -
+ -void activate_task(struct rq *rq, struct task_struct *p, int flags)
+ -{
+ -	if (task_on_rq_migrating(p))
+ -		flags |= ENQUEUE_MIGRATED;
+ -	if (flags & ENQUEUE_MIGRATED)
+ -		sched_mm_cid_migrate_to(rq, p);
+ -
+ -	enqueue_task(rq, p, flags);
+ -
+ -	p->on_rq = TASK_ON_RQ_QUEUED;
+ -}
+ -
+ -void deactivate_task(struct rq *rq, struct task_struct *p, int flags)
+ -{
+ -	p->on_rq = (flags & DEQUEUE_SLEEP) ? 0 : TASK_ON_RQ_MIGRATING;
+ -
+ -	dequeue_task(rq, p, flags);
+ -}
+ -
+ -static inline int __normal_prio(int policy, int rt_prio, int nice)
+ -{
+ -	int prio;
+ -
+ -	if (dl_policy(policy))
+ -		prio = MAX_DL_PRIO - 1;
+ -	else if (rt_policy(policy))
+ -		prio = MAX_RT_PRIO - 1 - rt_prio;
+ -	else
+ -		prio = NICE_TO_PRIO(nice);
+ -
+ -	return prio;
+ -}
+ -
+ -/*
+ - * Calculate the expected normal priority: i.e. priority
+ - * without taking RT-inheritance into account. Might be
+ - * boosted by interactivity modifiers. Changes upon fork,
+ - * setprio syscalls, and whenever the interactivity
+ - * estimator recalculates.
+ - */
+ -static inline int normal_prio(struct task_struct *p)
+ -{
+ -	return __normal_prio(p->policy, p->rt_priority, PRIO_TO_NICE(p->static_prio));
+ -}
+ -
+ -/*
+ - * Calculate the current priority, i.e. the priority
+ - * taken into account by the scheduler. This value might
+ - * be boosted by RT tasks, or might be boosted by
+ - * interactivity modifiers. Will be RT if the task got
+ - * RT-boosted. If not then it returns p->normal_prio.
+ - */
+ -static int effective_prio(struct task_struct *p)
+ -{
+ -	p->normal_prio = normal_prio(p);
+ -	/*
+ -	 * If we are RT tasks or we were boosted to RT priority,
+ -	 * keep the priority unchanged. Otherwise, update priority
+ -	 * to the normal priority:
+ -	 */
+ -	if (!rt_prio(p->prio))
+ -		return p->normal_prio;
+ -	return p->prio;
+ -}
+ -
+ -/**
+ - * task_curr - is this task currently executing on a CPU?
+ - * @p: the task in question.
+ - *
+ - * Return: 1 if the task is currently executing. 0 otherwise.
+ - */
+ -inline int task_curr(const struct task_struct *p)
+ -{
+ -	return cpu_curr(task_cpu(p)) == p;
+ -}
+ -
+ -/*
+ - * switched_from, switched_to and prio_changed must _NOT_ drop rq->lock,
+ - * use the balance_callback list if you want balancing.
+ - *
+ - * this means any call to check_class_changed() must be followed by a call to
+ - * balance_callback().
+ - */
+ -static inline void check_class_changed(struct rq *rq, struct task_struct *p,
+ -				       const struct sched_class *prev_class,
+ -				       int oldprio)
+ -{
+ -	if (prev_class != p->sched_class) {
+ -		if (prev_class->switched_from)
+ -			prev_class->switched_from(rq, p);
+ -
+ -		p->sched_class->switched_to(rq, p);
+ -	} else if (oldprio != p->prio || dl_task(p))
+ -		p->sched_class->prio_changed(rq, p, oldprio);
+ -}
+ -
+ -void wakeup_preempt(struct rq *rq, struct task_struct *p, int flags)
+ -{
+ -	if (p->sched_class == rq->curr->sched_class)
+ -		rq->curr->sched_class->wakeup_preempt(rq, p, flags);
+ -	else if (sched_class_above(p->sched_class, rq->curr->sched_class))
+ -		resched_curr(rq);
+ -
+ -	/*
+ -	 * A queue event has occurred, and we're going to schedule.  In
+ -	 * this case, we can save a useless back to back clock update.
+ -	 */
+ -	if (task_on_rq_queued(rq->curr) && test_tsk_need_resched(rq->curr))
+ -		rq_clock_skip_update(rq);
+ -}
+ -
+ -static __always_inline
+ -int __task_state_match(struct task_struct *p, unsigned int state)
+ -{
+ -	if (READ_ONCE(p->__state) & state)
+ -		return 1;
+ -
+ -	if (READ_ONCE(p->saved_state) & state)
+ -		return -1;
+ -
+ -	return 0;
+ -}
+ -
+ -static __always_inline
+ -int task_state_match(struct task_struct *p, unsigned int state)
+ -{
+ -	/*
+ -	 * Serialize against current_save_and_set_rtlock_wait_state(),
+ -	 * current_restore_rtlock_saved_state(), and __refrigerator().
+ -	 */
+ -	guard(raw_spinlock_irq)(&p->pi_lock);
+ -	return __task_state_match(p, state);
+ -}
+ -
+ -/*
+ - * wait_task_inactive - wait for a thread to unschedule.
+ - *
+ - * Wait for the thread to block in any of the states set in @match_state.
+ - * If it changes, i.e. @p might have woken up, then return zero.  When we
+ - * succeed in waiting for @p to be off its CPU, we return a positive number
+ - * (its total switch count).  If a second call a short while later returns the
+ - * same number, the caller can be sure that @p has remained unscheduled the
+ - * whole time.
+ - *
+ - * The caller must ensure that the task *will* unschedule sometime soon,
+ - * else this function might spin for a *long* time. This function can't
+ - * be called with interrupts off, or it may introduce deadlock with
+ - * smp_call_function() if an IPI is sent by the same process we are
+ - * waiting to become inactive.
+ - */
+ -unsigned long wait_task_inactive(struct task_struct *p, unsigned int match_state)
+ -{
+ -	int running, queued, match;
+ -	struct rq_flags rf;
+ -	unsigned long ncsw;
+ -	struct rq *rq;
+ -
+ -	for (;;) {
+ -		/*
+ -		 * We do the initial early heuristics without holding
+ -		 * any task-queue locks at all. We'll only try to get
+ -		 * the runqueue lock when things look like they will
+ -		 * work out!
+ -		 */
+ -		rq = task_rq(p);
+ -
+ -		/*
+ -		 * If the task is actively running on another CPU
+ -		 * still, just relax and busy-wait without holding
+ -		 * any locks.
+ -		 *
+ -		 * NOTE! Since we don't hold any locks, it's not
+ -		 * even sure that "rq" stays as the right runqueue!
+ -		 * But we don't care, since "task_on_cpu()" will
+ -		 * return false if the runqueue has changed and p
+ -		 * is actually now running somewhere else!
+ -		 */
+ -		while (task_on_cpu(rq, p)) {
+ -			if (!task_state_match(p, match_state))
+ -				return 0;
+ -			cpu_relax();
+ -		}
+ -
+ -		/*
+ -		 * Ok, time to look more closely! We need the rq
+ -		 * lock now, to be *sure*. If we're wrong, we'll
+ -		 * just go back and repeat.
+ -		 */
+ -		rq = task_rq_lock(p, &rf);
+ -		trace_sched_wait_task(p);
+ -		running = task_on_cpu(rq, p);
+ -		queued = task_on_rq_queued(p);
+ -		ncsw = 0;
+ -		if ((match = __task_state_match(p, match_state))) {
+ -			/*
+ -			 * When matching on p->saved_state, consider this task
+ -			 * still queued so it will wait.
+ -			 */
+ -			if (match < 0)
+ -				queued = 1;
+ -			ncsw = p->nvcsw | LONG_MIN; /* sets MSB */
+ -		}
+ -		task_rq_unlock(rq, p, &rf);
+ -
+ -		/*
+ -		 * If it changed from the expected state, bail out now.
+ -		 */
+ -		if (unlikely(!ncsw))
+ -			break;
+ -
+ -		/*
+ -		 * Was it really running after all now that we
+ -		 * checked with the proper locks actually held?
+ -		 *
+ -		 * Oops. Go back and try again..
+ -		 */
+ -		if (unlikely(running)) {
+ -			cpu_relax();
+ -			continue;
+ -		}
+ -
+ -		/*
+ -		 * It's not enough that it's not actively running,
+ -		 * it must be off the runqueue _entirely_, and not
+ -		 * preempted!
+ -		 *
+ -		 * So if it was still runnable (but just not actively
+ -		 * running right now), it's preempted, and we should
+ -		 * yield - it could be a while.
+ -		 */
+ -		if (unlikely(queued)) {
+ -			ktime_t to = NSEC_PER_SEC / HZ;
+ -
+ -			set_current_state(TASK_UNINTERRUPTIBLE);
+ -			schedule_hrtimeout(&to, HRTIMER_MODE_REL_HARD);
+ -			continue;
+ -		}
+ -
+ -		/*
+ -		 * Ahh, all good. It wasn't running, and it wasn't
+ -		 * runnable, which means that it will never become
+ -		 * running in the future either. We're all done!
+ -		 */
+ -		break;
+ -	}
+ -
+ -	return ncsw;
+ -}
+ -
+ -#ifdef CONFIG_SMP
+ -
+ -static void
+ -__do_set_cpus_allowed(struct task_struct *p, struct affinity_context *ctx);
+ -
+ -static int __set_cpus_allowed_ptr(struct task_struct *p,
+ -				  struct affinity_context *ctx);
+ -
+ -static void migrate_disable_switch(struct rq *rq, struct task_struct *p)
+ -{
+ -	struct affinity_context ac = {
+ -		.new_mask  = cpumask_of(rq->cpu),
+ -		.flags     = SCA_MIGRATE_DISABLE,
+ -	};
+ -
+ -	if (likely(!p->migration_disabled))
+ -		return;
+ -
+ -	if (p->cpus_ptr != &p->cpus_mask)
+ -		return;
+ -
+ -	/*
+ -	 * Violates locking rules! see comment in __do_set_cpus_allowed().
+ -	 */
+ -	__do_set_cpus_allowed(p, &ac);
+ -}
+ -
+ -void migrate_disable(void)
+ -{
+ -	struct task_struct *p = current;
+ -
+ -	if (p->migration_disabled) {
+ -		p->migration_disabled++;
+ -		return;
+ -	}
+ -
+ -	guard(preempt)();
+ -	this_rq()->nr_pinned++;
+ -	p->migration_disabled = 1;
+ -}
+ -EXPORT_SYMBOL_GPL(migrate_disable);
+ -
+ -void migrate_enable(void)
+ -{
+ -	struct task_struct *p = current;
+ -	struct affinity_context ac = {
+ -		.new_mask  = &p->cpus_mask,
+ -		.flags     = SCA_MIGRATE_ENABLE,
+ -	};
+ -
+ -	if (p->migration_disabled > 1) {
+ -		p->migration_disabled--;
+ -		return;
+ -	}
+ -
+ -	if (WARN_ON_ONCE(!p->migration_disabled))
+ -		return;
+ -
+ -	/*
+ -	 * Ensure stop_task runs either before or after this, and that
+ -	 * __set_cpus_allowed_ptr(SCA_MIGRATE_ENABLE) doesn't schedule().
+ -	 */
+ -	guard(preempt)();
+ -	if (p->cpus_ptr != &p->cpus_mask)
+ -		__set_cpus_allowed_ptr(p, &ac);
+ -	/*
+ -	 * Mustn't clear migration_disabled() until cpus_ptr points back at the
+ -	 * regular cpus_mask, otherwise things that race (eg.
+ -	 * select_fallback_rq) get confused.
+ -	 */
+ -	barrier();
+ -	p->migration_disabled = 0;
+ -	this_rq()->nr_pinned--;
+ -}
+ -EXPORT_SYMBOL_GPL(migrate_enable);
+ -
+ -static inline bool rq_has_pinned_tasks(struct rq *rq)
+ -{
+ -	return rq->nr_pinned;
+ -}
+ -
+ -/*
+ - * Per-CPU kthreads are allowed to run on !active && online CPUs, see
+ - * __set_cpus_allowed_ptr() and select_fallback_rq().
+ - */
+ -static inline bool is_cpu_allowed(struct task_struct *p, int cpu)
+ -{
+ -	/* When not in the task's cpumask, no point in looking further. */
+ -	if (!cpumask_test_cpu(cpu, p->cpus_ptr))
+ -		return false;
+ -
+ -	/* migrate_disabled() must be allowed to finish. */
+ -	if (is_migration_disabled(p))
+ -		return cpu_online(cpu);
+ -
+ -	/* Non kernel threads are not allowed during either online or offline. */
+ -	if (!(p->flags & PF_KTHREAD))
+ -		return cpu_active(cpu) && task_cpu_possible(cpu, p);
+ -
+ -	/* KTHREAD_IS_PER_CPU is always allowed. */
+ -	if (kthread_is_per_cpu(p))
+ -		return cpu_online(cpu);
+ -
+ -	/* Regular kernel threads don't get to stay during offline. */
+ -	if (cpu_dying(cpu))
+ -		return false;
+ -
+ -	/* But are allowed during online. */
+ -	return cpu_online(cpu);
+ -}
+ -
+ -/*
+ - * This is how migration works:
+ - *
+ - * 1) we invoke migration_cpu_stop() on the target CPU using
+ - *    stop_one_cpu().
+ - * 2) stopper starts to run (implicitly forcing the migrated thread
+ - *    off the CPU)
+ - * 3) it checks whether the migrated task is still in the wrong runqueue.
+ - * 4) if it's in the wrong runqueue then the migration thread removes
+ - *    it and puts it into the right queue.
+ - * 5) stopper completes and stop_one_cpu() returns and the migration
+ - *    is done.
+ - */
+ -
+ -/*
+ - * move_queued_task - move a queued task to new rq.
+ - *
+ - * Returns (locked) new rq. Old rq's lock is released.
+ - */
+ -static struct rq *move_queued_task(struct rq *rq, struct rq_flags *rf,
+ -				   struct task_struct *p, int new_cpu)
+ -{
+ -	lockdep_assert_rq_held(rq);
+ -
+ -	deactivate_task(rq, p, DEQUEUE_NOCLOCK);
+ -	set_task_cpu(p, new_cpu);
+ -	rq_unlock(rq, rf);
+ -
+ -	rq = cpu_rq(new_cpu);
+ -
+ -	rq_lock(rq, rf);
+ -	WARN_ON_ONCE(task_cpu(p) != new_cpu);
+ -	activate_task(rq, p, 0);
+ -	wakeup_preempt(rq, p, 0);
+ -
+ -	return rq;
+ -}
+ -
+ -struct migration_arg {
+ -	struct task_struct		*task;
+ -	int				dest_cpu;
+ -	struct set_affinity_pending	*pending;
+ -};
+ -
+ -/*
+ - * @refs: number of wait_for_completion()
+ - * @stop_pending: is @stop_work in use
+ - */
+ -struct set_affinity_pending {
+ -	refcount_t		refs;
+ -	unsigned int		stop_pending;
+ -	struct completion	done;
+ -	struct cpu_stop_work	stop_work;
+ -	struct migration_arg	arg;
+ -};
+ -
+ -/*
+ - * Move (not current) task off this CPU, onto the destination CPU. We're doing
+ - * this because either it can't run here any more (set_cpus_allowed()
+ - * away from this CPU, or CPU going down), or because we're
+ - * attempting to rebalance this task on exec (sched_exec).
+ - *
+ - * So we race with normal scheduler movements, but that's OK, as long
+ - * as the task is no longer on this CPU.
+ - */
+ -static struct rq *__migrate_task(struct rq *rq, struct rq_flags *rf,
+ -				 struct task_struct *p, int dest_cpu)
+ -{
+ -	/* Affinity changed (again). */
+ -	if (!is_cpu_allowed(p, dest_cpu))
+ -		return rq;
+ -
+ -	rq = move_queued_task(rq, rf, p, dest_cpu);
+ -
+ -	return rq;
+ -}
+ -
+ -/*
+ - * migration_cpu_stop - this will be executed by a highprio stopper thread
+ - * and performs thread migration by bumping thread off CPU then
+ - * 'pushing' onto another runqueue.
+ - */
+ -static int migration_cpu_stop(void *data)
+ -{
+ -	struct migration_arg *arg = data;
+ -	struct set_affinity_pending *pending = arg->pending;
+ -	struct task_struct *p = arg->task;
+ -	struct rq *rq = this_rq();
+ -	bool complete = false;
+ -	struct rq_flags rf;
+ -
+ -	/*
+ -	 * The original target CPU might have gone down and we might
+ -	 * be on another CPU but it doesn't matter.
+ -	 */
+ -	local_irq_save(rf.flags);
+ -	/*
+ -	 * We need to explicitly wake pending tasks before running
+ -	 * __migrate_task() such that we will not miss enforcing cpus_ptr
+ -	 * during wakeups, see set_cpus_allowed_ptr()'s TASK_WAKING test.
+ -	 */
+ -	flush_smp_call_function_queue();
+ -
+ -	raw_spin_lock(&p->pi_lock);
+ -	rq_lock(rq, &rf);
+ -
+ -	/*
+ -	 * If we were passed a pending, then ->stop_pending was set, thus
+ -	 * p->migration_pending must have remained stable.
+ -	 */
+ -	WARN_ON_ONCE(pending && pending != p->migration_pending);
+ -
+ -	/*
+ -	 * If task_rq(p) != rq, it cannot be migrated here, because we're
+ -	 * holding rq->lock, if p->on_rq == 0 it cannot get enqueued because
+ -	 * we're holding p->pi_lock.
+ -	 */
+ -	if (task_rq(p) == rq) {
+ -		if (is_migration_disabled(p))
+ -			goto out;
+ -
+ -		if (pending) {
+ -			p->migration_pending = NULL;
+ -			complete = true;
+ -
+ -			if (cpumask_test_cpu(task_cpu(p), &p->cpus_mask))
+ -				goto out;
+ -		}
+ -
+ -		if (task_on_rq_queued(p)) {
+ -			update_rq_clock(rq);
+ -			rq = __migrate_task(rq, &rf, p, arg->dest_cpu);
+ -		} else {
+ -			p->wake_cpu = arg->dest_cpu;
+ -		}
+ -
+ -		/*
+ -		 * XXX __migrate_task() can fail, at which point we might end
+ -		 * up running on a dodgy CPU, AFAICT this can only happen
+ -		 * during CPU hotplug, at which point we'll get pushed out
+ -		 * anyway, so it's probably not a big deal.
+ -		 */
+ -
+ -	} else if (pending) {
+ -		/*
+ -		 * This happens when we get migrated between migrate_enable()'s
+ -		 * preempt_enable() and scheduling the stopper task. At that
+ -		 * point we're a regular task again and not current anymore.
+ -		 *
+ -		 * A !PREEMPT kernel has a giant hole here, which makes it far
+ -		 * more likely.
+ -		 */
+ -
+ -		/*
+ -		 * The task moved before the stopper got to run. We're holding
+ -		 * ->pi_lock, so the allowed mask is stable - if it got
+ -		 * somewhere allowed, we're done.
+ -		 */
+ -		if (cpumask_test_cpu(task_cpu(p), p->cpus_ptr)) {
+ -			p->migration_pending = NULL;
+ -			complete = true;
+ -			goto out;
+ -		}
+ -
+ -		/*
+ -		 * When migrate_enable() hits a rq mis-match we can't reliably
+ -		 * determine is_migration_disabled() and so have to chase after
+ -		 * it.
+ -		 */
+ -		WARN_ON_ONCE(!pending->stop_pending);
+ -		preempt_disable();
+ -		task_rq_unlock(rq, p, &rf);
+ -		stop_one_cpu_nowait(task_cpu(p), migration_cpu_stop,
+ -				    &pending->arg, &pending->stop_work);
+ -		preempt_enable();
+ -		return 0;
+ -	}
+ -out:
+ -	if (pending)
+ -		pending->stop_pending = false;
+ -	task_rq_unlock(rq, p, &rf);
+ -
+ -	if (complete)
+ -		complete_all(&pending->done);
+ -
+ -	return 0;
+ -}
+ -
+ -int push_cpu_stop(void *arg)
+ -{
+ -	struct rq *lowest_rq = NULL, *rq = this_rq();
+ -	struct task_struct *p = arg;
+ -
+ -	raw_spin_lock_irq(&p->pi_lock);
+ -	raw_spin_rq_lock(rq);
+ -
+ -	if (task_rq(p) != rq)
+ -		goto out_unlock;
+ -
+ -	if (is_migration_disabled(p)) {
+ -		p->migration_flags |= MDF_PUSH;
+ -		goto out_unlock;
+ -	}
+ -
+ -	p->migration_flags &= ~MDF_PUSH;
+ -
+ -	if (p->sched_class->find_lock_rq)
+ -		lowest_rq = p->sched_class->find_lock_rq(p, rq);
+ -
+ -	if (!lowest_rq)
+ -		goto out_unlock;
+ -
+ -	// XXX validate p is still the highest prio task
+ -	if (task_rq(p) == rq) {
+ -		deactivate_task(rq, p, 0);
+ -		set_task_cpu(p, lowest_rq->cpu);
+ -		activate_task(lowest_rq, p, 0);
+ -		resched_curr(lowest_rq);
+ -	}
+ -
+ -	double_unlock_balance(rq, lowest_rq);
+ -
+ -out_unlock:
+ -	rq->push_busy = false;
+ -	raw_spin_rq_unlock(rq);
+ -	raw_spin_unlock_irq(&p->pi_lock);
+ -
+ -	put_task_struct(p);
+ -	return 0;
+ -}
+ -
+ -/*
+ - * sched_class::set_cpus_allowed must do the below, but is not required to
+ - * actually call this function.
+ - */
+ -void set_cpus_allowed_common(struct task_struct *p, struct affinity_context *ctx)
+ -{
+ -	if (ctx->flags & (SCA_MIGRATE_ENABLE | SCA_MIGRATE_DISABLE)) {
+ -		p->cpus_ptr = ctx->new_mask;
+ -		return;
+ -	}
+ -
+ -	cpumask_copy(&p->cpus_mask, ctx->new_mask);
+ -	p->nr_cpus_allowed = cpumask_weight(ctx->new_mask);
+ -
+ -	/*
+ -	 * Swap in a new user_cpus_ptr if SCA_USER flag set
+ -	 */
+ -	if (ctx->flags & SCA_USER)
+ -		swap(p->user_cpus_ptr, ctx->user_mask);
+ -}
+ -
+ -static void
+ -__do_set_cpus_allowed(struct task_struct *p, struct affinity_context *ctx)
+ -{
+ -	struct rq *rq = task_rq(p);
+ -	bool queued, running;
+ -
+ -	/*
+ -	 * This here violates the locking rules for affinity, since we're only
+ -	 * supposed to change these variables while holding both rq->lock and
+ -	 * p->pi_lock.
+ -	 *
+ -	 * HOWEVER, it magically works, because ttwu() is the only code that
+ -	 * accesses these variables under p->pi_lock and only does so after
+ -	 * smp_cond_load_acquire(&p->on_cpu, !VAL), and we're in __schedule()
+ -	 * before finish_task().
+ -	 *
+ -	 * XXX do further audits, this smells like something putrid.
+ -	 */
+ -	if (ctx->flags & SCA_MIGRATE_DISABLE)
+ -		SCHED_WARN_ON(!p->on_cpu);
+ -	else
+ -		lockdep_assert_held(&p->pi_lock);
+ -
+ -	queued = task_on_rq_queued(p);
+ -	running = task_current(rq, p);
+ -
+ -	if (queued) {
+ -		/*
+ -		 * Because __kthread_bind() calls this on blocked tasks without
+ -		 * holding rq->lock.
+ -		 */
+ -		lockdep_assert_rq_held(rq);
+ -		dequeue_task(rq, p, DEQUEUE_SAVE | DEQUEUE_NOCLOCK);
+ -	}
+ -	if (running)
+ -		put_prev_task(rq, p);
+ -
+ -	p->sched_class->set_cpus_allowed(p, ctx);
+ -
+ -	if (queued)
+ -		enqueue_task(rq, p, ENQUEUE_RESTORE | ENQUEUE_NOCLOCK);
+ -	if (running)
+ -		set_next_task(rq, p);
+ -}
+ -
+ -/*
+ - * Used for kthread_bind() and select_fallback_rq(), in both cases the user
+ - * affinity (if any) should be destroyed too.
+ - */
+ -void do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask)
+ -{
+ -	struct affinity_context ac = {
+ -		.new_mask  = new_mask,
+ -		.user_mask = NULL,
+ -		.flags     = SCA_USER,	/* clear the user requested mask */
+ -	};
+ -	union cpumask_rcuhead {
+ -		cpumask_t cpumask;
+ -		struct rcu_head rcu;
+ -	};
+ -
+ -	__do_set_cpus_allowed(p, &ac);
+ -
+ -	/*
+ -	 * Because this is called with p->pi_lock held, it is not possible
+ -	 * to use kfree() here (when PREEMPT_RT=y), therefore punt to using
+ -	 * kfree_rcu().
+ -	 */
+ -	kfree_rcu((union cpumask_rcuhead *)ac.user_mask, rcu);
+ -}
+ -
+ -static cpumask_t *alloc_user_cpus_ptr(int node)
+ -{
+ -	/*
+ -	 * See do_set_cpus_allowed() above for the rcu_head usage.
+ -	 */
+ -	int size = max_t(int, cpumask_size(), sizeof(struct rcu_head));
+ -
+ -	return kmalloc_node(size, GFP_KERNEL, node);
+ -}
+ -
+ -int dup_user_cpus_ptr(struct task_struct *dst, struct task_struct *src,
+ -		      int node)
+ -{
+ -	cpumask_t *user_mask;
+ -	unsigned long flags;
+ -
+ -	/*
+ -	 * Always clear dst->user_cpus_ptr first as their user_cpus_ptr's
+ -	 * may differ by now due to racing.
+ -	 */
+ -	dst->user_cpus_ptr = NULL;
+ -
+ -	/*
+ -	 * This check is racy and losing the race is a valid situation.
+ -	 * It is not worth the extra overhead of taking the pi_lock on
+ -	 * every fork/clone.
+ -	 */
+ -	if (data_race(!src->user_cpus_ptr))
+ -		return 0;
+ -
+ -	user_mask = alloc_user_cpus_ptr(node);
+ -	if (!user_mask)
+ -		return -ENOMEM;
+ -
+ -	/*
+ -	 * Use pi_lock to protect content of user_cpus_ptr
+ -	 *
+ -	 * Though unlikely, user_cpus_ptr can be reset to NULL by a concurrent
+ -	 * do_set_cpus_allowed().
+ -	 */
+ -	raw_spin_lock_irqsave(&src->pi_lock, flags);
+ -	if (src->user_cpus_ptr) {
+ -		swap(dst->user_cpus_ptr, user_mask);
+ -		cpumask_copy(dst->user_cpus_ptr, src->user_cpus_ptr);
+ -	}
+ -	raw_spin_unlock_irqrestore(&src->pi_lock, flags);
+ -
+ -	if (unlikely(user_mask))
+ -		kfree(user_mask);
+ -
+ -	return 0;
+ -}
+ -
+ -static inline struct cpumask *clear_user_cpus_ptr(struct task_struct *p)
+ -{
+ -	struct cpumask *user_mask = NULL;
+ -
+ -	swap(p->user_cpus_ptr, user_mask);
+ -
+ -	return user_mask;
+ -}
+ -
+ -void release_user_cpus_ptr(struct task_struct *p)
+ -{
+ -	kfree(clear_user_cpus_ptr(p));
+ -}
+ -
+ -/*
+ - * This function is wildly self concurrent; here be dragons.
+ - *
+ - *
+ - * When given a valid mask, __set_cpus_allowed_ptr() must block until the
+ - * designated task is enqueued on an allowed CPU. If that task is currently
+ - * running, we have to kick it out using the CPU stopper.
+ - *
+ - * Migrate-Disable comes along and tramples all over our nice sandcastle.
+ - * Consider:
+ - *
+ - *     Initial conditions: P0->cpus_mask = [0, 1]
+ - *
+ - *     P0@CPU0                  P1
+ - *
+ - *     migrate_disable();
+ - *     <preempted>
+ - *                              set_cpus_allowed_ptr(P0, [1]);
+ - *
+ - * P1 *cannot* return from this set_cpus_allowed_ptr() call until P0 executes
+ - * its outermost migrate_enable() (i.e. it exits its Migrate-Disable region).
+ - * This means we need the following scheme:
+ - *
+ - *     P0@CPU0                  P1
+ - *
+ - *     migrate_disable();
+ - *     <preempted>
+ - *                              set_cpus_allowed_ptr(P0, [1]);
+ - *                                <blocks>
+ - *     <resumes>
+ - *     migrate_enable();
+ - *       __set_cpus_allowed_ptr();
+ - *       <wakes local stopper>
+ - *                         `--> <woken on migration completion>
+ - *
+ - * Now the fun stuff: there may be several P1-like tasks, i.e. multiple
+ - * concurrent set_cpus_allowed_ptr(P0, [*]) calls. CPU affinity changes of any
+ - * task p are serialized by p->pi_lock, which we can leverage: the one that
+ - * should come into effect at the end of the Migrate-Disable region is the last
+ - * one. This means we only need to track a single cpumask (i.e. p->cpus_mask),
+ - * but we still need to properly signal those waiting tasks at the appropriate
+ - * moment.
+ - *
+ - * This is implemented using struct set_affinity_pending. The first
+ - * __set_cpus_allowed_ptr() caller within a given Migrate-Disable region will
+ - * setup an instance of that struct and install it on the targeted task_struct.
+ - * Any and all further callers will reuse that instance. Those then wait for
+ - * a completion signaled at the tail of the CPU stopper callback (1), triggered
+ - * on the end of the Migrate-Disable region (i.e. outermost migrate_enable()).
+ - *
+ - *
+ - * (1) In the cases covered above. There is one more where the completion is
+ - * signaled within affine_move_task() itself: when a subsequent affinity request
+ - * occurs after the stopper bailed out due to the targeted task still being
+ - * Migrate-Disable. Consider:
+ - *
+ - *     Initial conditions: P0->cpus_mask = [0, 1]
+ - *
+ - *     CPU0		  P1				P2
+ - *     <P0>
+ - *       migrate_disable();
+ - *       <preempted>
+ - *                        set_cpus_allowed_ptr(P0, [1]);
+ - *                          <blocks>
+ - *     <migration/0>
+ - *       migration_cpu_stop()
+ - *         is_migration_disabled()
+ - *           <bails>
+ - *                                                       set_cpus_allowed_ptr(P0, [0, 1]);
+ - *                                                         <signal completion>
+ - *                          <awakes>
+ - *
+ - * Note that the above is safe vs a concurrent migrate_enable(), as any
+ - * pending affinity completion is preceded by an uninstallation of
+ - * p->migration_pending done with p->pi_lock held.
+ - */
+ -static int affine_move_task(struct rq *rq, struct task_struct *p, struct rq_flags *rf,
+ -			    int dest_cpu, unsigned int flags)
+ -	__releases(rq->lock)
+ -	__releases(p->pi_lock)
+ -{
+ -	struct set_affinity_pending my_pending = { }, *pending = NULL;
+ -	bool stop_pending, complete = false;
+ -
+ -	/* Can the task run on the task's current CPU? If so, we're done */
+ -	if (cpumask_test_cpu(task_cpu(p), &p->cpus_mask)) {
+ -		struct task_struct *push_task = NULL;
+ -
+ -		if ((flags & SCA_MIGRATE_ENABLE) &&
+ -		    (p->migration_flags & MDF_PUSH) && !rq->push_busy) {
+ -			rq->push_busy = true;
+ -			push_task = get_task_struct(p);
+ -		}
+ -
+ -		/*
+ -		 * If there are pending waiters, but no pending stop_work,
+ -		 * then complete now.
+ -		 */
+ -		pending = p->migration_pending;
+ -		if (pending && !pending->stop_pending) {
+ -			p->migration_pending = NULL;
+ -			complete = true;
+ -		}
+ -
+ -		preempt_disable();
+ -		task_rq_unlock(rq, p, rf);
+ -		if (push_task) {
+ -			stop_one_cpu_nowait(rq->cpu, push_cpu_stop,
+ -					    p, &rq->push_work);
+ -		}
+ -		preempt_enable();
+ -
+ -		if (complete)
+ -			complete_all(&pending->done);
+ -
+ -		return 0;
+ -	}
+ -
+ -	if (!(flags & SCA_MIGRATE_ENABLE)) {
+ -		/* serialized by p->pi_lock */
+ -		if (!p->migration_pending) {
+ -			/* Install the request */
+ -			refcount_set(&my_pending.refs, 1);
+ -			init_completion(&my_pending.done);
+ -			my_pending.arg = (struct migration_arg) {
+ -				.task = p,
+ -				.dest_cpu = dest_cpu,
+ -				.pending = &my_pending,
+ -			};
+ -
+ -			p->migration_pending = &my_pending;
+ -		} else {
+ -			pending = p->migration_pending;
+ -			refcount_inc(&pending->refs);
+ -			/*
+ -			 * Affinity has changed, but we've already installed a
+ -			 * pending. migration_cpu_stop() *must* see this, else
+ -			 * we risk a completion of the pending despite having a
+ -			 * task on a disallowed CPU.
+ -			 *
+ -			 * Serialized by p->pi_lock, so this is safe.
+ -			 */
+ -			pending->arg.dest_cpu = dest_cpu;
+ -		}
+ -	}
+ -	pending = p->migration_pending;
+ -	/*
+ -	 * - !MIGRATE_ENABLE:
+ -	 *   we'll have installed a pending if there wasn't one already.
+ -	 *
+ -	 * - MIGRATE_ENABLE:
+ -	 *   we're here because the current CPU isn't matching anymore,
+ -	 *   the only way that can happen is because of a concurrent
+ -	 *   set_cpus_allowed_ptr() call, which should then still be
+ -	 *   pending completion.
+ -	 *
+ -	 * Either way, we really should have a @pending here.
+ -	 */
+ -	if (WARN_ON_ONCE(!pending)) {
+ -		task_rq_unlock(rq, p, rf);
+ -		return -EINVAL;
+ -	}
+ -
+ -	if (task_on_cpu(rq, p) || READ_ONCE(p->__state) == TASK_WAKING) {
+ -		/*
+ -		 * MIGRATE_ENABLE gets here because 'p == current', but for
+ -		 * anything else we cannot do is_migration_disabled(), punt
+ -		 * and have the stopper function handle it all race-free.
+ -		 */
+ -		stop_pending = pending->stop_pending;
+ -		if (!stop_pending)
+ -			pending->stop_pending = true;
+ -
+ -		if (flags & SCA_MIGRATE_ENABLE)
+ -			p->migration_flags &= ~MDF_PUSH;
+ -
+ -		preempt_disable();
+ -		task_rq_unlock(rq, p, rf);
+ -		if (!stop_pending) {
+ -			stop_one_cpu_nowait(cpu_of(rq), migration_cpu_stop,
+ -					    &pending->arg, &pending->stop_work);
+ -		}
+ -		preempt_enable();
+ -
+ -		if (flags & SCA_MIGRATE_ENABLE)
+ -			return 0;
+ -	} else {
+ -
+ -		if (!is_migration_disabled(p)) {
+ -			if (task_on_rq_queued(p))
+ -				rq = move_queued_task(rq, rf, p, dest_cpu);
+ -
+ -			if (!pending->stop_pending) {
+ -				p->migration_pending = NULL;
+ -				complete = true;
+ -			}
+ -		}
+ -		task_rq_unlock(rq, p, rf);
+ -
+ -		if (complete)
+ -			complete_all(&pending->done);
+ -	}
+ -
+ -	wait_for_completion(&pending->done);
+ -
+ -	if (refcount_dec_and_test(&pending->refs))
+ -		wake_up_var(&pending->refs); /* No UaF, just an address */
+ -
+ -	/*
+ -	 * Block the original owner of &pending until all subsequent callers
+ -	 * have seen the completion and decremented the refcount
+ -	 */
+ -	wait_var_event(&my_pending.refs, !refcount_read(&my_pending.refs));
+ -
+ -	/* ARGH */
+ -	WARN_ON_ONCE(my_pending.stop_pending);
+ -
+ -	return 0;
+ -}
+ -
+ -/*
+ - * Called with both p->pi_lock and rq->lock held; drops both before returning.
+ - */
+ -static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
+ -					 struct affinity_context *ctx,
+ -					 struct rq *rq,
+ -					 struct rq_flags *rf)
+ -	__releases(rq->lock)
+ -	__releases(p->pi_lock)
+ -{
+ -	const struct cpumask *cpu_allowed_mask = task_cpu_possible_mask(p);
+ -	const struct cpumask *cpu_valid_mask = cpu_active_mask;
+ -	bool kthread = p->flags & PF_KTHREAD;
+ -	unsigned int dest_cpu;
+ -	int ret = 0;
+ -
+ -	update_rq_clock(rq);
+ -
+ -	if (kthread || is_migration_disabled(p)) {
+ -		/*
+ -		 * Kernel threads are allowed on online && !active CPUs,
+ -		 * however, during cpu-hot-unplug, even these might get pushed
+ -		 * away if not KTHREAD_IS_PER_CPU.
+ -		 *
+ -		 * Specifically, migration_disabled() tasks must not fail the
+ -		 * cpumask_any_and_distribute() pick below, esp. so on
+ -		 * SCA_MIGRATE_ENABLE, otherwise we'll not call
+ -		 * set_cpus_allowed_common() and actually reset p->cpus_ptr.
+ -		 */
+ -		cpu_valid_mask = cpu_online_mask;
+ -	}
+ -
+ -	if (!kthread && !cpumask_subset(ctx->new_mask, cpu_allowed_mask)) {
+ -		ret = -EINVAL;
+ -		goto out;
+ -	}
+ -
+ -	/*
+ -	 * Must re-check here, to close a race against __kthread_bind(),
+ -	 * sched_setaffinity() is not guaranteed to observe the flag.
+ -	 */
+ -	if ((ctx->flags & SCA_CHECK) && (p->flags & PF_NO_SETAFFINITY)) {
+ -		ret = -EINVAL;
+ -		goto out;
+ -	}
+ -
+ -	if (!(ctx->flags & SCA_MIGRATE_ENABLE)) {
+ -		if (cpumask_equal(&p->cpus_mask, ctx->new_mask)) {
+ -			if (ctx->flags & SCA_USER)
+ -				swap(p->user_cpus_ptr, ctx->user_mask);
+ -			goto out;
+ -		}
+ -
+ -		if (WARN_ON_ONCE(p == current &&
+ -				 is_migration_disabled(p) &&
+ -				 !cpumask_test_cpu(task_cpu(p), ctx->new_mask))) {
+ -			ret = -EBUSY;
+ -			goto out;
+ -		}
+ -	}
+ -
+ -	/*
+ -	 * Picking a ~random cpu helps in cases where we are changing affinity
+ -	 * for groups of tasks (ie. cpuset), so that load balancing is not
+ -	 * immediately required to distribute the tasks within their new mask.
+ -	 */
+ -	dest_cpu = cpumask_any_and_distribute(cpu_valid_mask, ctx->new_mask);
+ -	if (dest_cpu >= nr_cpu_ids) {
+ -		ret = -EINVAL;
+ -		goto out;
+ -	}
+ -
+ -	__do_set_cpus_allowed(p, ctx);
+ -
+ -	return affine_move_task(rq, p, rf, dest_cpu, ctx->flags);
+ -
+ -out:
+ -	task_rq_unlock(rq, p, rf);
+ -
+ -	return ret;
+ -}
+ -
+ -/*
+ - * Change a given task's CPU affinity. Migrate the thread to a
+ - * proper CPU and schedule it away if the CPU it's executing on
+ - * is removed from the allowed bitmask.
+ - *
+ - * NOTE: the caller must have a valid reference to the task, the
+ - * task must not exit() & deallocate itself prematurely. The
+ - * call is not atomic; no spinlocks may be held.
+ - */
+ -static int __set_cpus_allowed_ptr(struct task_struct *p,
+ -				  struct affinity_context *ctx)
+ -{
+ -	struct rq_flags rf;
+ -	struct rq *rq;
+ -
+ -	rq = task_rq_lock(p, &rf);
+ -	/*
+ -	 * Masking should be skipped if SCA_USER or any of the SCA_MIGRATE_*
+ -	 * flags are set.
+ -	 */
+ -	if (p->user_cpus_ptr &&
+ -	    !(ctx->flags & (SCA_USER | SCA_MIGRATE_ENABLE | SCA_MIGRATE_DISABLE)) &&
+ -	    cpumask_and(rq->scratch_mask, ctx->new_mask, p->user_cpus_ptr))
+ -		ctx->new_mask = rq->scratch_mask;
+ -
+ -	return __set_cpus_allowed_ptr_locked(p, ctx, rq, &rf);
+ -}
+ -
+ -int set_cpus_allowed_ptr(struct task_struct *p, const struct cpumask *new_mask)
+ -{
+ -	struct affinity_context ac = {
+ -		.new_mask  = new_mask,
+ -		.flags     = 0,
+ -	};
+ -
+ -	return __set_cpus_allowed_ptr(p, &ac);
+ -}
+ -EXPORT_SYMBOL_GPL(set_cpus_allowed_ptr);
+ -
+ -/*
+ - * Change a given task's CPU affinity to the intersection of its current
+ - * affinity mask and @subset_mask, writing the resulting mask to @new_mask.
+ - * If user_cpus_ptr is defined, use it as the basis for restricting CPU
+ - * affinity or use cpu_online_mask instead.
+ - *
+ - * If the resulting mask is empty, leave the affinity unchanged and return
+ - * -EINVAL.
+ - */
+ -static int restrict_cpus_allowed_ptr(struct task_struct *p,
+ -				     struct cpumask *new_mask,
+ -				     const struct cpumask *subset_mask)
+ -{
+ -	struct affinity_context ac = {
+ -		.new_mask  = new_mask,
+ -		.flags     = 0,
+ -	};
+ -	struct rq_flags rf;
+ -	struct rq *rq;
+ -	int err;
+ -
+ -	rq = task_rq_lock(p, &rf);
+ -
+ -	/*
+ -	 * Forcefully restricting the affinity of a deadline task is
+ -	 * likely to cause problems, so fail and noisily override the
+ -	 * mask entirely.
+ -	 */
+ -	if (task_has_dl_policy(p) && dl_bandwidth_enabled()) {
+ -		err = -EPERM;
+ -		goto err_unlock;
+ -	}
+ -
+ -	if (!cpumask_and(new_mask, task_user_cpus(p), subset_mask)) {
+ -		err = -EINVAL;
+ -		goto err_unlock;
+ -	}
+ -
+ -	return __set_cpus_allowed_ptr_locked(p, &ac, rq, &rf);
+ -
+ -err_unlock:
+ -	task_rq_unlock(rq, p, &rf);
+ -	return err;
+ -}
+ -
+ -/*
+ - * Restrict the CPU affinity of task @p so that it is a subset of
+ - * task_cpu_possible_mask() and point @p->user_cpus_ptr to a copy of the
+ - * old affinity mask. If the resulting mask is empty, we warn and walk
+ - * up the cpuset hierarchy until we find a suitable mask.
+ - */
+ -void force_compatible_cpus_allowed_ptr(struct task_struct *p)
+ -{
+ -	cpumask_var_t new_mask;
+ -	const struct cpumask *override_mask = task_cpu_possible_mask(p);
+ -
+ -	alloc_cpumask_var(&new_mask, GFP_KERNEL);
+ -
+ -	/*
+ -	 * __migrate_task() can fail silently in the face of concurrent
+ -	 * offlining of the chosen destination CPU, so take the hotplug
+ -	 * lock to ensure that the migration succeeds.
+ -	 */
+ -	cpus_read_lock();
+ -	if (!cpumask_available(new_mask))
+ -		goto out_set_mask;
+ -
+ -	if (!restrict_cpus_allowed_ptr(p, new_mask, override_mask))
+ -		goto out_free_mask;
+ -
+ -	/*
+ -	 * We failed to find a valid subset of the affinity mask for the
+ -	 * task, so override it based on its cpuset hierarchy.
+ -	 */
+ -	cpuset_cpus_allowed(p, new_mask);
+ -	override_mask = new_mask;
+ -
+ -out_set_mask:
+ -	if (printk_ratelimit()) {
+ -		printk_deferred("Overriding affinity for process %d (%s) to CPUs %*pbl\n",
+ -				task_pid_nr(p), p->comm,
+ -				cpumask_pr_args(override_mask));
+ -	}
+ -
+ -	WARN_ON(set_cpus_allowed_ptr(p, override_mask));
+ -out_free_mask:
+ -	cpus_read_unlock();
+ -	free_cpumask_var(new_mask);
+ -}
+ -
+ -static int
+ -__sched_setaffinity(struct task_struct *p, struct affinity_context *ctx);
+ -
+ -/*
+ - * Restore the affinity of a task @p which was previously restricted by a
+ - * call to force_compatible_cpus_allowed_ptr().
+ - *
+ - * It is the caller's responsibility to serialise this with any calls to
+ - * force_compatible_cpus_allowed_ptr(@p).
+ - */
+ -void relax_compatible_cpus_allowed_ptr(struct task_struct *p)
+ -{
+ -	struct affinity_context ac = {
+ -		.new_mask  = task_user_cpus(p),
+ -		.flags     = 0,
+ -	};
+ -	int ret;
+ -
+ -	/*
+ -	 * Try to restore the old affinity mask with __sched_setaffinity().
+ -	 * Cpuset masking will be done there too.
+ -	 */
+ -	ret = __sched_setaffinity(p, &ac);
+ -	WARN_ON_ONCE(ret);
+ -}
+ -
+ -void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
+ -{
+ -#ifdef CONFIG_SCHED_DEBUG
+ -	unsigned int state = READ_ONCE(p->__state);
+ -
+ -	/*
+ -	 * We should never call set_task_cpu() on a blocked task,
+ -	 * ttwu() will sort out the placement.
+ -	 */
+ -	WARN_ON_ONCE(state != TASK_RUNNING && state != TASK_WAKING && !p->on_rq);
+ -
+ -	/*
+ -	 * Migrating fair class task must have p->on_rq = TASK_ON_RQ_MIGRATING,
+ -	 * because schedstat_wait_{start,end} rebase migrating task's wait_start
+ -	 * time relying on p->on_rq.
+ -	 */
+ -	WARN_ON_ONCE(state == TASK_RUNNING &&
+ -		     p->sched_class == &fair_sched_class &&
+ -		     (p->on_rq && !task_on_rq_migrating(p)));
+ -
+ -#ifdef CONFIG_LOCKDEP
+ -	/*
+ -	 * The caller should hold either p->pi_lock or rq->lock, when changing
+ -	 * a task's CPU. ->pi_lock for waking tasks, rq->lock for runnable tasks.
+ -	 *
+ -	 * sched_move_task() holds both and thus holding either pins the cgroup,
+ -	 * see task_group().
+ -	 *
+ -	 * Furthermore, all task_rq users should acquire both locks, see
+ -	 * task_rq_lock().
+ -	 */
+ -	WARN_ON_ONCE(debug_locks && !(lockdep_is_held(&p->pi_lock) ||
+ -				      lockdep_is_held(__rq_lockp(task_rq(p)))));
+ -#endif
+ -	/*
+ -	 * Clearly, migrating tasks to offline CPUs is a fairly daft thing.
+ -	 */
+ -	WARN_ON_ONCE(!cpu_online(new_cpu));
+ -
+ -	WARN_ON_ONCE(is_migration_disabled(p));
+ -#endif
+ -
+ -	trace_sched_migrate_task(p, new_cpu);
+ -
+ -	if (task_cpu(p) != new_cpu) {
+ -		if (p->sched_class->migrate_task_rq)
+ -			p->sched_class->migrate_task_rq(p, new_cpu);
+ -		p->se.nr_migrations++;
+ -		rseq_migrate(p);
+ -		sched_mm_cid_migrate_from(p);
+ -		perf_event_task_migrate(p);
+ -	}
+ -
+ -	__set_task_cpu(p, new_cpu);
+ -}
+ -
+ -#ifdef CONFIG_NUMA_BALANCING
+ -static void __migrate_swap_task(struct task_struct *p, int cpu)
+ -{
+ -	if (task_on_rq_queued(p)) {
+ -		struct rq *src_rq, *dst_rq;
+ -		struct rq_flags srf, drf;
+ -
+ -		src_rq = task_rq(p);
+ -		dst_rq = cpu_rq(cpu);
+ -
+ -		rq_pin_lock(src_rq, &srf);
+ -		rq_pin_lock(dst_rq, &drf);
+ -
+ -		deactivate_task(src_rq, p, 0);
+ -		set_task_cpu(p, cpu);
+ -		activate_task(dst_rq, p, 0);
+ -		wakeup_preempt(dst_rq, p, 0);
+ -
+ -		rq_unpin_lock(dst_rq, &drf);
+ -		rq_unpin_lock(src_rq, &srf);
+ -
+ -	} else {
+ -		/*
+ -		 * Task isn't running anymore; make it appear like we migrated
+ -		 * it before it went to sleep. This means on wakeup we make the
+ -		 * previous CPU our target instead of where it really is.
+ -		 */
+ -		p->wake_cpu = cpu;
+ -	}
+ -}
+ -
+ -struct migration_swap_arg {
+ -	struct task_struct *src_task, *dst_task;
+ -	int src_cpu, dst_cpu;
+ -};
+ -
+ -static int migrate_swap_stop(void *data)
+ -{
+ -	struct migration_swap_arg *arg = data;
+ -	struct rq *src_rq, *dst_rq;
+ -
+ -	if (!cpu_active(arg->src_cpu) || !cpu_active(arg->dst_cpu))
+ -		return -EAGAIN;
+ -
+ -	src_rq = cpu_rq(arg->src_cpu);
+ -	dst_rq = cpu_rq(arg->dst_cpu);
+ -
+ -	guard(double_raw_spinlock)(&arg->src_task->pi_lock, &arg->dst_task->pi_lock);
+ -	guard(double_rq_lock)(src_rq, dst_rq);
+ -
+ -	if (task_cpu(arg->dst_task) != arg->dst_cpu)
+ -		return -EAGAIN;
+ -
+ -	if (task_cpu(arg->src_task) != arg->src_cpu)
+ -		return -EAGAIN;
+ -
+ -	if (!cpumask_test_cpu(arg->dst_cpu, arg->src_task->cpus_ptr))
+ -		return -EAGAIN;
+ -
+ -	if (!cpumask_test_cpu(arg->src_cpu, arg->dst_task->cpus_ptr))
+ -		return -EAGAIN;
+ -
+ -	__migrate_swap_task(arg->src_task, arg->dst_cpu);
+ -	__migrate_swap_task(arg->dst_task, arg->src_cpu);
+ -
+ -	return 0;
+ -}
+ -
+ -/*
+ - * Cross migrate two tasks
+ - */
+ -int migrate_swap(struct task_struct *cur, struct task_struct *p,
+ -		int target_cpu, int curr_cpu)
+ -{
+ -	struct migration_swap_arg arg;
+ -	int ret = -EINVAL;
+ -
+ -	arg = (struct migration_swap_arg){
+ -		.src_task = cur,
+ -		.src_cpu = curr_cpu,
+ -		.dst_task = p,
+ -		.dst_cpu = target_cpu,
+ -	};
+ -
+ -	if (arg.src_cpu == arg.dst_cpu)
+ -		goto out;
+ -
+ -	/*
+ -	 * These three tests are all lockless; this is OK since all of them
+ -	 * will be re-checked with proper locks held further down the line.
+ -	 */
+ -	if (!cpu_active(arg.src_cpu) || !cpu_active(arg.dst_cpu))
+ -		goto out;
+ -
+ -	if (!cpumask_test_cpu(arg.dst_cpu, arg.src_task->cpus_ptr))
+ -		goto out;
+ -
+ -	if (!cpumask_test_cpu(arg.src_cpu, arg.dst_task->cpus_ptr))
+ -		goto out;
+ -
+ -	trace_sched_swap_numa(cur, arg.src_cpu, p, arg.dst_cpu);
+ -	ret = stop_two_cpus(arg.dst_cpu, arg.src_cpu, migrate_swap_stop, &arg);
+ -
+ -out:
+ -	return ret;
+ -}
+ -#endif /* CONFIG_NUMA_BALANCING */
+ -
+ -/***
+ - * kick_process - kick a running thread to enter/exit the kernel
+ - * @p: the to-be-kicked thread
+ - *
+ - * Cause a process which is running on another CPU to enter
+ - * kernel-mode, without any delay. (to get signals handled.)
+ - *
+ - * NOTE: this function doesn't have to take the runqueue lock,
+ - * because all it wants to ensure is that the remote task enters
+ - * the kernel. If the IPI races and the task has been migrated
+ - * to another CPU then no harm is done and the purpose has been
+ - * achieved as well.
+ - */
+ -void kick_process(struct task_struct *p)
+ -{
+ -	guard(preempt)();
+ -	int cpu = task_cpu(p);
+ -
+ -	if ((cpu != smp_processor_id()) && task_curr(p))
+ -		smp_send_reschedule(cpu);
+ -}
+ -EXPORT_SYMBOL_GPL(kick_process);
+ -
+ -/*
+ - * ->cpus_ptr is protected by both rq->lock and p->pi_lock
+ - *
+ - * A few notes on cpu_active vs cpu_online:
+ - *
+ - *  - cpu_active must be a subset of cpu_online
+ - *
+ - *  - on CPU-up we allow per-CPU kthreads on the online && !active CPU,
+ - *    see __set_cpus_allowed_ptr(). At this point the newly online
+ - *    CPU isn't yet part of the sched domains, and balancing will not
+ - *    see it.
+ - *
+ - *  - on CPU-down we clear cpu_active() to mask the sched domains and
+ - *    avoid the load balancer to place new tasks on the to be removed
+ - *    CPU. Existing tasks will remain running there and will be taken
+ - *    off.
+ - *
+ - * This means that fallback selection must not select !active CPUs.
+ - * And can assume that any active CPU must be online. Conversely
+ - * select_task_rq() below may allow selection of !active CPUs in order
+ - * to satisfy the above rules.
+ - */
+ -static int select_fallback_rq(int cpu, struct task_struct *p)
+ -{
+ -	int nid = cpu_to_node(cpu);
+ -	const struct cpumask *nodemask = NULL;
+ -	enum { cpuset, possible, fail } state = cpuset;
+ -	int dest_cpu;
+ -
+ -	/*
+ -	 * If the node that the CPU is on has been offlined, cpu_to_node()
+ -	 * will return -1. There is no CPU on the node, and we should
+ -	 * select the CPU on the other node.
+ -	 */
+ -	if (nid != -1) {
+ -		nodemask = cpumask_of_node(nid);
+ -
+ -		/* Look for allowed, online CPU in same node. */
+ -		for_each_cpu(dest_cpu, nodemask) {
+ -			if (is_cpu_allowed(p, dest_cpu))
+ -				return dest_cpu;
+ -		}
+ -	}
+ -
+ -	for (;;) {
+ -		/* Any allowed, online CPU? */
+ -		for_each_cpu(dest_cpu, p->cpus_ptr) {
+ -			if (!is_cpu_allowed(p, dest_cpu))
+ -				continue;
+ -
+ -			goto out;
+ -		}
+ -
+ -		/* No more Mr. Nice Guy. */
+ -		switch (state) {
+ -		case cpuset:
+ -			if (cpuset_cpus_allowed_fallback(p)) {
+ -				state = possible;
+ -				break;
+ -			}
+ -			fallthrough;
+ -		case possible:
+ -			/*
+ -			 * XXX When called from select_task_rq() we only
+ -			 * hold p->pi_lock and again violate locking order.
+ -			 *
+ -			 * More yuck to audit.
+ -			 */
+ -			do_set_cpus_allowed(p, task_cpu_possible_mask(p));
+ -			state = fail;
+ -			break;
+ -		case fail:
+ -			BUG();
+ -			break;
+ -		}
+ -	}
+ -
+ -out:
+ -	if (state != cpuset) {
+ -		/*
+ -		 * Don't tell them about moving exiting tasks or
+ -		 * kernel threads (both mm NULL), since they never
+ -		 * leave kernel.
+ -		 */
+ -		if (p->mm && printk_ratelimit()) {
+ -			printk_deferred("process %d (%s) no longer affine to cpu%d\n",
+ -					task_pid_nr(p), p->comm, cpu);
+ -		}
+ -	}
+ -
+ -	return dest_cpu;
+ -}
+ -
+ -/*
+ - * The caller (fork, wakeup) owns p->pi_lock, ->cpus_ptr is stable.
+ - */
+ -static inline
+ -int select_task_rq(struct task_struct *p, int cpu, int wake_flags)
+ -{
+ -	lockdep_assert_held(&p->pi_lock);
+ -
+ -	if (p->nr_cpus_allowed > 1 && !is_migration_disabled(p))
+ -		cpu = p->sched_class->select_task_rq(p, cpu, wake_flags);
+ -	else
+ -		cpu = cpumask_any(p->cpus_ptr);
+ -
+ -	/*
+ -	 * In order not to call set_task_cpu() on a blocking task we need
+ -	 * to rely on ttwu() to place the task on a valid ->cpus_ptr
+ -	 * CPU.
+ -	 *
+ -	 * Since this is common to all placement strategies, this lives here.
+ -	 *
+ -	 * [ this allows ->select_task() to simply return task_cpu(p) and
+ -	 *   not worry about this generic constraint ]
+ -	 */
+ -	if (unlikely(!is_cpu_allowed(p, cpu)))
+ -		cpu = select_fallback_rq(task_cpu(p), p);
+ -
+ -	return cpu;
+ -}
+ -
+ -void sched_set_stop_task(int cpu, struct task_struct *stop)
+ -{
+ -	static struct lock_class_key stop_pi_lock;
+ -	struct sched_param param = { .sched_priority = MAX_RT_PRIO - 1 };
+ -	struct task_struct *old_stop = cpu_rq(cpu)->stop;
+ -
+ -	if (stop) {
+ -		/*
+ -		 * Make it appear like a SCHED_FIFO task, its something
+ -		 * userspace knows about and won't get confused about.
+ -		 *
+ -		 * Also, it will make PI more or less work without too
+ -		 * much confusion -- but then, stop work should not
+ -		 * rely on PI working anyway.
+ -		 */
+ -		sched_setscheduler_nocheck(stop, SCHED_FIFO, &param);
+ -
+ -		stop->sched_class = &stop_sched_class;
+ -
+ -		/*
+ -		 * The PI code calls rt_mutex_setprio() with ->pi_lock held to
+ -		 * adjust the effective priority of a task. As a result,
+ -		 * rt_mutex_setprio() can trigger (RT) balancing operations,
+ -		 * which can then trigger wakeups of the stop thread to push
+ -		 * around the current task.
+ -		 *
+ -		 * The stop task itself will never be part of the PI-chain, it
+ -		 * never blocks, therefore that ->pi_lock recursion is safe.
+ -		 * Tell lockdep about this by placing the stop->pi_lock in its
+ -		 * own class.
+ -		 */
+ -		lockdep_set_class(&stop->pi_lock, &stop_pi_lock);
+ -	}
+ -
+ -	cpu_rq(cpu)->stop = stop;
+ -
+ -	if (old_stop) {
+ -		/*
+ -		 * Reset it back to a normal scheduling class so that
+ -		 * it can die in pieces.
+ -		 */
+ -		old_stop->sched_class = &rt_sched_class;
+ -	}
+ -}
+ -
+ -#else /* CONFIG_SMP */
+ -
+ -static inline int __set_cpus_allowed_ptr(struct task_struct *p,
+ -					 struct affinity_context *ctx)
+ -{
+ -	return set_cpus_allowed_ptr(p, ctx->new_mask);
+ -}
+ -
+ -static inline void migrate_disable_switch(struct rq *rq, struct task_struct *p) { }
+ -
+ -static inline bool rq_has_pinned_tasks(struct rq *rq)
+ -{
+ -	return false;
+ -}
+ -
+ -static inline cpumask_t *alloc_user_cpus_ptr(int node)
+ -{
+ -	return NULL;
+ -}
+ -
+ -#endif /* !CONFIG_SMP */
+ -
+ -static void
+ -ttwu_stat(struct task_struct *p, int cpu, int wake_flags)
+ -{
+ -	struct rq *rq;
+ -
+ -	if (!schedstat_enabled())
+ -		return;
+ -
+ -	rq = this_rq();
+ -
+ -#ifdef CONFIG_SMP
+ -	if (cpu == rq->cpu) {
+ -		__schedstat_inc(rq->ttwu_local);
+ -		__schedstat_inc(p->stats.nr_wakeups_local);
+ -	} else {
+ -		struct sched_domain *sd;
+ -
+ -		__schedstat_inc(p->stats.nr_wakeups_remote);
+ -
+ -		guard(rcu)();
+ -		for_each_domain(rq->cpu, sd) {
+ -			if (cpumask_test_cpu(cpu, sched_domain_span(sd))) {
+ -				__schedstat_inc(sd->ttwu_wake_remote);
+ -				break;
+ -			}
+ -		}
+ -	}
+ -
+ -	if (wake_flags & WF_MIGRATED)
+ -		__schedstat_inc(p->stats.nr_wakeups_migrate);
+ -#endif /* CONFIG_SMP */
+ -
+ -	__schedstat_inc(rq->ttwu_count);
+ -	__schedstat_inc(p->stats.nr_wakeups);
+ -
+ -	if (wake_flags & WF_SYNC)
+ -		__schedstat_inc(p->stats.nr_wakeups_sync);
+ -}
+ -
+ -/*
+ - * Mark the task runnable.
+ - */
+ -static inline void ttwu_do_wakeup(struct task_struct *p)
+ -{
+ -	WRITE_ONCE(p->__state, TASK_RUNNING);
+ -	trace_sched_wakeup(p);
+ -}
+ -
+ -static void
+ -ttwu_do_activate(struct rq *rq, struct task_struct *p, int wake_flags,
+ -		 struct rq_flags *rf)
+ -{
+ -	int en_flags = ENQUEUE_WAKEUP | ENQUEUE_NOCLOCK;
+ -
+ -	lockdep_assert_rq_held(rq);
+ -
+ -	if (p->sched_contributes_to_load)
+ -		rq->nr_uninterruptible--;
+ -
+ -#ifdef CONFIG_SMP
+ -	if (wake_flags & WF_MIGRATED)
+ -		en_flags |= ENQUEUE_MIGRATED;
+ -	else
+ -#endif
+ -	if (p->in_iowait) {
+ -		delayacct_blkio_end(p);
+ -		atomic_dec(&task_rq(p)->nr_iowait);
+ -	}
+ -
+ -	activate_task(rq, p, en_flags);
+ -	wakeup_preempt(rq, p, wake_flags);
+ -
+ -	ttwu_do_wakeup(p);
+ -
+ -#ifdef CONFIG_SMP
+ -	if (p->sched_class->task_woken) {
+ -		/*
+ -		 * Our task @p is fully woken up and running; so it's safe to
+ -		 * drop the rq->lock, hereafter rq is only used for statistics.
+ -		 */
+ -		rq_unpin_lock(rq, rf);
+ -		p->sched_class->task_woken(rq, p);
+ -		rq_repin_lock(rq, rf);
+ -	}
+ -
+ -	if (rq->idle_stamp) {
+ -		u64 delta = rq_clock(rq) - rq->idle_stamp;
+ -		u64 max = 2*rq->max_idle_balance_cost;
+ -
+ -		update_avg(&rq->avg_idle, delta);
+ -
+ -		if (rq->avg_idle > max)
+ -			rq->avg_idle = max;
+ -
+ -		rq->wake_stamp = jiffies;
+ -		rq->wake_avg_idle = rq->avg_idle / 2;
+ -
+ -		rq->idle_stamp = 0;
+ -	}
+ -#endif
+ -}
+ -
+ -/*
+ - * Consider @p being inside a wait loop:
+ - *
+ - *   for (;;) {
+ - *      set_current_state(TASK_UNINTERRUPTIBLE);
+ - *
+ - *      if (CONDITION)
+ - *         break;
+ - *
+ - *      schedule();
+ - *   }
+ - *   __set_current_state(TASK_RUNNING);
+ - *
+ - * between set_current_state() and schedule(). In this case @p is still
+ - * runnable, so all that needs doing is change p->state back to TASK_RUNNING in
+ - * an atomic manner.
+ - *
+ - * By taking task_rq(p)->lock we serialize against schedule(), if @p->on_rq
+ - * then schedule() must still happen and p->state can be changed to
+ - * TASK_RUNNING. Otherwise we lost the race, schedule() has happened, and we
+ - * need to do a full wakeup with enqueue.
+ - *
+ - * Returns: %true when the wakeup is done,
+ - *          %false otherwise.
+ - */
+ -static int ttwu_runnable(struct task_struct *p, int wake_flags)
+ -{
+ -	struct rq_flags rf;
+ -	struct rq *rq;
+ -	int ret = 0;
+ -
+ -	rq = __task_rq_lock(p, &rf);
+ -	if (task_on_rq_queued(p)) {
+ -		if (!task_on_cpu(rq, p)) {
+ -			/*
+ -			 * When on_rq && !on_cpu the task is preempted, see if
+ -			 * it should preempt the task that is current now.
+ -			 */
+ -			update_rq_clock(rq);
+ -			wakeup_preempt(rq, p, wake_flags);
+ -		}
+ -		ttwu_do_wakeup(p);
+ -		ret = 1;
+ -	}
+ -	__task_rq_unlock(rq, &rf);
+ -
+ -	return ret;
+ -}
+ -
+ -#ifdef CONFIG_SMP
+ -void sched_ttwu_pending(void *arg)
+ -{
+ -	struct llist_node *llist = arg;
+ -	struct rq *rq = this_rq();
+ -	struct task_struct *p, *t;
+ -	struct rq_flags rf;
+ -
+ -	if (!llist)
+ -		return;
+ -
+ -	rq_lock_irqsave(rq, &rf);
+ -	update_rq_clock(rq);
+ -
+ -	llist_for_each_entry_safe(p, t, llist, wake_entry.llist) {
+ -		if (WARN_ON_ONCE(p->on_cpu))
+ -			smp_cond_load_acquire(&p->on_cpu, !VAL);
+ -
+ -		if (WARN_ON_ONCE(task_cpu(p) != cpu_of(rq)))
+ -			set_task_cpu(p, cpu_of(rq));
+ -
+ -		ttwu_do_activate(rq, p, p->sched_remote_wakeup ? WF_MIGRATED : 0, &rf);
+ -	}
+ -
+ -	/*
+ -	 * Must be after enqueueing at least once task such that
+ -	 * idle_cpu() does not observe a false-negative -- if it does,
+ -	 * it is possible for select_idle_siblings() to stack a number
+ -	 * of tasks on this CPU during that window.
+ -	 *
+ -	 * It is ok to clear ttwu_pending when another task pending.
+ -	 * We will receive IPI after local irq enabled and then enqueue it.
+ -	 * Since now nr_running > 0, idle_cpu() will always get correct result.
+ -	 */
+ -	WRITE_ONCE(rq->ttwu_pending, 0);
+ -	rq_unlock_irqrestore(rq, &rf);
+ -}
+ -
+ -/*
+ - * Prepare the scene for sending an IPI for a remote smp_call
+ - *
+ - * Returns true if the caller can proceed with sending the IPI.
+ - * Returns false otherwise.
+ - */
+ -bool call_function_single_prep_ipi(int cpu)
+ -{
+ -	if (set_nr_if_polling(cpu_rq(cpu)->idle)) {
+ -		trace_sched_wake_idle_without_ipi(cpu);
+ -		return false;
+ -	}
+ -
+ -	return true;
+ -}
+ -
+ -/*
+ - * Queue a task on the target CPUs wake_list and wake the CPU via IPI if
+ - * necessary. The wakee CPU on receipt of the IPI will queue the task
+ - * via sched_ttwu_wakeup() for activation so the wakee incurs the cost
+ - * of the wakeup instead of the waker.
+ - */
+ -static void __ttwu_queue_wakelist(struct task_struct *p, int cpu, int wake_flags)
+ -{
+ -	struct rq *rq = cpu_rq(cpu);
+ -
+ -	p->sched_remote_wakeup = !!(wake_flags & WF_MIGRATED);
+ -
+ -	WRITE_ONCE(rq->ttwu_pending, 1);
+ -	__smp_call_single_queue(cpu, &p->wake_entry.llist);
+ -}
+ -
+ -void wake_up_if_idle(int cpu)
+ -{
+ -	struct rq *rq = cpu_rq(cpu);
+ -
+ -	guard(rcu)();
+ -	if (is_idle_task(rcu_dereference(rq->curr))) {
+ -		guard(rq_lock_irqsave)(rq);
+ -		if (is_idle_task(rq->curr))
+ -			resched_curr(rq);
+ -	}
+ -}
+ -
+ -bool cpus_share_cache(int this_cpu, int that_cpu)
+ -{
+ -	if (this_cpu == that_cpu)
+ -		return true;
+ -
+ -	return per_cpu(sd_llc_id, this_cpu) == per_cpu(sd_llc_id, that_cpu);
+ -}
+ -
+ -static inline bool ttwu_queue_cond(struct task_struct *p, int cpu)
+ -{
+ -	/*
+ -	 * Do not complicate things with the async wake_list while the CPU is
+ -	 * in hotplug state.
+ -	 */
+ -	if (!cpu_active(cpu))
+ -		return false;
+ -
+ -	/* Ensure the task will still be allowed to run on the CPU. */
+ -	if (!cpumask_test_cpu(cpu, p->cpus_ptr))
+ -		return false;
+ -
+ -	/*
+ -	 * If the CPU does not share cache, then queue the task on the
+ -	 * remote rqs wakelist to avoid accessing remote data.
+ -	 */
+ -	if (!cpus_share_cache(smp_processor_id(), cpu))
+ -		return true;
+ -
+ -	if (cpu == smp_processor_id())
+ -		return false;
+ +	struct rq *rq = task_rq(p);
+ +	bool queued, running;
+  
+  	/*
+ -	 * If the wakee cpu is idle, or the task is descheduling and the
+ -	 * only running task on the CPU, then use the wakelist to offload
+ -	 * the task activation to the idle (or soon-to-be-idle) CPU as
+ -	 * the current CPU is likely busy. nr_running is checked to
+ -	 * avoid unnecessary task stacking.
+ +	 * This here violates the locking rules for affinity, since we're only
+ +	 * supposed to change these variables while holding both rq->lock and
+ +	 * p->pi_lock.
+  	 *
+ -	 * Note that we can only get here with (wakee) p->on_rq=0,
+ -	 * p->on_cpu can be whatever, we've done the dequeue, so
+ -	 * the wakee has been accounted out of ->nr_running.
+ +	 * HOWEVER, it magically works, because ttwu() is the only code that
+ +	 * accesses these variables under p->pi_lock and only does so after
+ +	 * smp_cond_load_acquire(&p->on_cpu, !VAL), and we're in __schedule()
+ +	 * before finish_task().
+ +	 *
+ +	 * XXX do further audits, this smells like something putrid.
+  	 */
+ -	if (!cpu_rq(cpu)->nr_running)
+ -		return true;
+ +	if (flags & SCA_MIGRATE_DISABLE)
+ +		SCHED_WARN_ON(!p->on_cpu);
+ +	else
+ +		lockdep_assert_held(&p->pi_lock);
+  
+ -	return false;
+ -}
+ +	queued = task_on_rq_queued(p);
+ +	running = task_current(rq, p);
+  
+ -static bool ttwu_queue_wakelist(struct task_struct *p, int cpu, int wake_flags)
+ -{
+ -	if (sched_feat(TTWU_QUEUE) && ttwu_queue_cond(p, cpu)) {
+ -		sched_clock_cpu(cpu); /* Sync clocks across CPUs */
+ -		__ttwu_queue_wakelist(p, cpu, wake_flags);
+ -		return true;
+ +	if (queued) {
+ +		/*
+ +		 * Because __kthread_bind() calls this on blocked tasks without
+ +		 * holding rq->lock.
+ +		 */
+ +		lockdep_assert_held(&rq->lock);
+ +		dequeue_task(rq, p, DEQUEUE_SAVE | DEQUEUE_NOCLOCK);
+  	}
+ +	if (running)
+ +		put_prev_task(rq, p);
+  
+ -	return false;
+ -}
+ -
+ -#else /* !CONFIG_SMP */
+ -
+ -static inline bool ttwu_queue_wakelist(struct task_struct *p, int cpu, int wake_flags)
+ -{
+ -	return false;
+ -}
+ -
+ -#endif /* CONFIG_SMP */
+ -
+ -static void ttwu_queue(struct task_struct *p, int cpu, int wake_flags)
+ -{
+ -	struct rq *rq = cpu_rq(cpu);
+ -	struct rq_flags rf;
+ -
+ -	if (ttwu_queue_wakelist(p, cpu, wake_flags))
+ -		return;
+ +	p->sched_class->set_cpus_allowed(p, new_mask, flags);
+  
+ -	rq_lock(rq, &rf);
+ -	update_rq_clock(rq);
+ -	ttwu_do_activate(rq, p, wake_flags, &rf);
+ -	rq_unlock(rq, &rf);
+ +	if (queued)
+ +		enqueue_task(rq, p, ENQUEUE_RESTORE | ENQUEUE_NOCLOCK);
+ +	if (running)
+ +		set_next_task(rq, p);
+  }
+  
+ -/*
+ - * Invoked from try_to_wake_up() to check whether the task can be woken up.
+ - *
+ - * The caller holds p::pi_lock if p != current or has preemption
+ - * disabled when p == current.
+ - *
+ - * The rules of saved_state:
+ - *
+ - *   The related locking code always holds p::pi_lock when updating
+ - *   p::saved_state, which means the code is fully serialized in both cases.
+ - *
+ - *   For PREEMPT_RT, the lock wait and lock wakeups happen via TASK_RTLOCK_WAIT.
+ - *   No other bits set. This allows to distinguish all wakeup scenarios.
+ - *
+ - *   For FREEZER, the wakeup happens via TASK_FROZEN. No other bits set. This
+ - *   allows us to prevent early wakeup of tasks before they can be run on
+ - *   asymmetric ISA architectures (eg ARMv9).
+ - */
+ -static __always_inline
+ -bool ttwu_state_match(struct task_struct *p, unsigned int state, int *success)
+ +void do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask)
+  {
+ -	int match;
+ -
+ -	if (IS_ENABLED(CONFIG_DEBUG_PREEMPT)) {
+ -		WARN_ON_ONCE((state & TASK_RTLOCK_WAIT) &&
+ -			     state != TASK_RTLOCK_WAIT);
+ -	}
+ -
+ -	*success = !!(match = __task_state_match(p, state));
+ -
+ -	/*
+ -	 * Saved state preserves the task state across blocking on
+ -	 * an RT lock or TASK_FREEZABLE tasks.  If the state matches,
+ -	 * set p::saved_state to TASK_RUNNING, but do not wake the task
+ -	 * because it waits for a lock wakeup or __thaw_task(). Also
+ -	 * indicate success because from the regular waker's point of
+ -	 * view this has succeeded.
+ -	 *
+ -	 * After acquiring the lock the task will restore p::__state
+ -	 * from p::saved_state which ensures that the regular
+ -	 * wakeup is not lost. The restore will also set
+ -	 * p::saved_state to TASK_RUNNING so any further tests will
+ -	 * not result in false positives vs. @success
+ -	 */
+ -	if (match < 0)
+ -		p->saved_state = TASK_RUNNING;
+ -
+ -	return match > 0;
+ +	__do_set_cpus_allowed(p, new_mask, 0);
+  }
+  
+  /*
+ - * Notes on Program-Order guarantees on SMP systems.
+ - *
+ - *  MIGRATION
+ - *
+ - * The basic program-order guarantee on SMP systems is that when a task [t]
+ - * migrates, all its activity on its old CPU [c0] happens-before any subsequent
+ - * execution on its new CPU [c1].
+ - *
+ - * For migration (of runnable tasks) this is provided by the following means:
+ - *
+ - *  A) UNLOCK of the rq(c0)->lock scheduling out task t
+ - *  B) migration for t is required to synchronize *both* rq(c0)->lock and
+ - *     rq(c1)->lock (if not at the same time, then in that order).
+ - *  C) LOCK of the rq(c1)->lock scheduling in task
+ - *
+ - * Release/acquire chaining guarantees that B happens after A and C after B.
+ - * Note: the CPU doing B need not be c0 or c1
+ - *
+ - * Example:
+ - *
+ - *   CPU0            CPU1            CPU2
+ - *
+ - *   LOCK rq(0)->lock
+ - *   sched-out X
+ - *   sched-in Y
+ - *   UNLOCK rq(0)->lock
+ - *
+ - *                                   LOCK rq(0)->lock // orders against CPU0
+ - *                                   dequeue X
+ - *                                   UNLOCK rq(0)->lock
+ - *
+ - *                                   LOCK rq(1)->lock
+ - *                                   enqueue X
+ - *                                   UNLOCK rq(1)->lock
+ - *
+ - *                   LOCK rq(1)->lock // orders against CPU2
+ - *                   sched-out Z
+ - *                   sched-in X
+ - *                   UNLOCK rq(1)->lock
+ - *
+ - *
+ - *  BLOCKING -- aka. SLEEP + WAKEUP
+ - *
+ - * For blocking we (obviously) need to provide the same guarantee as for
+ - * migration. However the means are completely different as there is no lock
+ - * chain to provide order. Instead we do:
+ - *
+ - *   1) smp_store_release(X->on_cpu, 0)   -- finish_task()
+ - *   2) smp_cond_load_acquire(!X->on_cpu) -- try_to_wake_up()
+ - *
+ - * Example:
+ - *
+ - *   CPU0 (schedule)  CPU1 (try_to_wake_up) CPU2 (schedule)
+ - *
+ - *   LOCK rq(0)->lock LOCK X->pi_lock
+ - *   dequeue X
+ - *   sched-out X
+ - *   smp_store_release(X->on_cpu, 0);
+ + * This function is wildly self concurrent; here be dragons.
+   *
+ - *                    smp_cond_load_acquire(&X->on_cpu, !VAL);
+ - *                    X->state = WAKING
+ - *                    set_task_cpu(X,2)
+   *
+ - *                    LOCK rq(2)->lock
+ - *                    enqueue X
+ - *                    X->state = RUNNING
+ - *                    UNLOCK rq(2)->lock
+ + * When given a valid mask, __set_cpus_allowed_ptr() must block until the
+ + * designated task is enqueued on an allowed CPU. If that task is currently
+ + * running, we have to kick it out using the CPU stopper.
+   *
+ - *                                          LOCK rq(2)->lock // orders against CPU1
+ - *                                          sched-out Z
+ - *                                          sched-in X
+ - *                                          UNLOCK rq(2)->lock
+ + * Migrate-Disable comes along and tramples all over our nice sandcastle.
+ + * Consider:
+   *
+ - *                    UNLOCK X->pi_lock
+ - *   UNLOCK rq(0)->lock
+ + *     Initial conditions: P0->cpus_mask = [0, 1]
+   *
+ + *     P0@CPU0                  P1
+   *
+ - * However, for wakeups there is a second guarantee we must provide, namely we
+ - * must ensure that CONDITION=1 done by the caller can not be reordered with
+ - * accesses to the task state; see try_to_wake_up() and set_current_state().
+ - */
+ -
+ -/**
+ - * try_to_wake_up - wake up a thread
+ - * @p: the thread to be awakened
+ - * @state: the mask of task states that can be woken
+ - * @wake_flags: wake modifier flags (WF_*)
+ + *     migrate_disable();
+ + *     <preempted>
+ + *                              set_cpus_allowed_ptr(P0, [1]);
+   *
+ - * Conceptually does:
+ + * P1 *cannot* return from this set_cpus_allowed_ptr() call until P0 executes
+ + * its outermost migrate_enable() (i.e. it exits its Migrate-Disable region).
+ + * This means we need the following scheme:
+   *
+ - *   If (@state & @p->state) @p->state = TASK_RUNNING.
+ + *     P0@CPU0                  P1
+   *
+ - * If the task was not queued/runnable, also place it back on a runqueue.
+ + *     migrate_disable();
+ + *     <preempted>
+ + *                              set_cpus_allowed_ptr(P0, [1]);
+ + *                                <blocks>
+ + *     <resumes>
+ + *     migrate_enable();
+ + *       __set_cpus_allowed_ptr();
+ + *       <wakes local stopper>
+ + *                         `--> <woken on migration completion>
+   *
+ - * This function is atomic against schedule() which would dequeue the task.
+ + * Now the fun stuff: there may be several P1-like tasks, i.e. multiple
+ + * concurrent set_cpus_allowed_ptr(P0, [*]) calls. CPU affinity changes of any
+ + * task p are serialized by p->pi_lock, which we can leverage: the one that
+ + * should come into effect at the end of the Migrate-Disable region is the last
+ + * one. This means we only need to track a single cpumask (i.e. p->cpus_mask),
+ + * but we still need to properly signal those waiting tasks at the appropriate
+ + * moment.
+   *
+ - * It issues a full memory barrier before accessing @p->state, see the comment
+ - * with set_current_state().
+ + * This is implemented using struct set_affinity_pending. The first
+ + * __set_cpus_allowed_ptr() caller within a given Migrate-Disable region will
+ + * setup an instance of that struct and install it on the targeted task_struct.
+ + * Any and all further callers will reuse that instance. Those then wait for
+ + * a completion signaled at the tail of the CPU stopper callback (1), triggered
+ + * on the end of the Migrate-Disable region (i.e. outermost migrate_enable()).
+   *
+ - * Uses p->pi_lock to serialize against concurrent wake-ups.
+   *
+ - * Relies on p->pi_lock stabilizing:
+ - *  - p->sched_class
+ - *  - p->cpus_ptr
+ - *  - p->sched_task_group
+ - * in order to do migration, see its use of select_task_rq()/set_task_cpu().
+ + * (1) In the cases covered above. There is one more where the completion is
+ + * signaled within affine_move_task() itself: when a subsequent affinity request
+ + * occurs after the stopper bailed out due to the targeted task still being
+ + * Migrate-Disable. Consider:
+   *
+ - * Tries really hard to only take one task_rq(p)->lock for performance.
+ - * Takes rq->lock in:
+ - *  - ttwu_runnable()    -- old rq, unavoidable, see comment there;
+ - *  - ttwu_queue()       -- new rq, for enqueue of the task;
+ - *  - psi_ttwu_dequeue() -- much sadness :-( accounting will kill us.
+ + *     Initial conditions: P0->cpus_mask = [0, 1]
+   *
+ - * As a consequence we race really badly with just about everything. See the
+ - * many memory barriers and their comments for details.
+ + *     CPU0		  P1				P2
+ + *     <P0>
+ + *       migrate_disable();
+ + *       <preempted>
+ + *                        set_cpus_allowed_ptr(P0, [1]);
+ + *                          <blocks>
+ + *     <migration/0>
+ + *       migration_cpu_stop()
+ + *         is_migration_disabled()
+ + *           <bails>
+ + *                                                       set_cpus_allowed_ptr(P0, [0, 1]);
+ + *                                                         <signal completion>
+ + *                          <awakes>
+   *
+ - * Return: %true if @p->state changes (an actual wakeup was done),
+ - *	   %false otherwise.
+ + * Note that the above is safe vs a concurrent migrate_enable(), as any
+ + * pending affinity completion is preceded by an uninstallation of
+ + * p->migration_pending done with p->pi_lock held.
+   */
+ -int try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
+ +static int affine_move_task(struct rq *rq, struct task_struct *p, struct rq_flags *rf,
+ +			    int dest_cpu, unsigned int flags)
+  {
+ -	guard(preempt)();
+ -	int cpu, success = 0;
+ +	struct set_affinity_pending my_pending = { }, *pending = NULL;
+ +	bool stop_pending, complete = false;
+ +
+ +	/* Can the task run on the task's current CPU? If so, we're done */
+ +	if (cpumask_test_cpu(task_cpu(p), &p->cpus_mask)) {
+ +		struct task_struct *push_task = NULL;
+ +
+ +		if ((flags & SCA_MIGRATE_ENABLE) &&
+ +		    (p->migration_flags & MDF_PUSH) && !rq->push_busy) {
+ +			rq->push_busy = true;
+ +			push_task = get_task_struct(p);
+ +		}
+  
+ -	if (p == current) {
+  		/*
+ -		 * We're waking current, this means 'p->on_rq' and 'task_cpu(p)
+ -		 * == smp_processor_id()'. Together this means we can special
+ -		 * case the whole 'p->on_rq && ttwu_runnable()' case below
+ -		 * without taking any locks.
+ -		 *
+ -		 * In particular:
+ -		 *  - we rely on Program-Order guarantees for all the ordering,
+ -		 *  - we're serialized against set_special_state() by virtue of
+ -		 *    it disabling IRQs (this allows not taking ->pi_lock).
+ +		 * If there are pending waiters, but no pending stop_work,
+ +		 * then complete now.
+  		 */
+ -		if (!ttwu_state_match(p, state, &success))
+ -			goto out;
+ +		pending = p->migration_pending;
+ +		if (pending && !pending->stop_pending) {
+ +			p->migration_pending = NULL;
+ +			complete = true;
+ +		}
+  
+ -		trace_sched_waking(p);
+ -		ttwu_do_wakeup(p);
+ -		goto out;
+++		preempt_disable();
+ +		task_rq_unlock(rq, p, rf);
+- 
+ +		if (push_task) {
+ +			stop_one_cpu_nowait(rq->cpu, push_cpu_stop,
+ +					    p, &rq->push_work);
+ +		}
+++		preempt_enable();
+ +
+ +		if (complete)
+ +			complete_all(&pending->done);
+ +
+ +		return 0;
+  	}
+  
+ +	if (!(flags & SCA_MIGRATE_ENABLE)) {
+ +		/* serialized by p->pi_lock */
+ +		if (!p->migration_pending) {
+ +			/* Install the request */
+ +			refcount_set(&my_pending.refs, 1);
+ +			init_completion(&my_pending.done);
+ +			my_pending.arg = (struct migration_arg) {
+ +				.task = p,
+ +				.dest_cpu = dest_cpu,
+ +				.pending = &my_pending,
+ +			};
+ +
+ +			p->migration_pending = &my_pending;
+ +		} else {
+ +			pending = p->migration_pending;
+ +			refcount_inc(&pending->refs);
+ +			/*
+ +			 * Affinity has changed, but we've already installed a
+ +			 * pending. migration_cpu_stop() *must* see this, else
+ +			 * we risk a completion of the pending despite having a
+ +			 * task on a disallowed CPU.
+ +			 *
+ +			 * Serialized by p->pi_lock, so this is safe.
+ +			 */
+ +			pending->arg.dest_cpu = dest_cpu;
+ +		}
+ +	}
+ +	pending = p->migration_pending;
+  	/*
+ -	 * If we are going to wake up a thread waiting for CONDITION we
+ -	 * need to ensure that CONDITION=1 done by the caller can not be
+ -	 * reordered with p->state check below. This pairs with smp_store_mb()
+ -	 * in set_current_state() that the waiting thread does.
+ +	 * - !MIGRATE_ENABLE:
+ +	 *   we'll have installed a pending if there wasn't one already.
+ +	 *
+ +	 * - MIGRATE_ENABLE:
+ +	 *   we're here because the current CPU isn't matching anymore,
+ +	 *   the only way that can happen is because of a concurrent
+ +	 *   set_cpus_allowed_ptr() call, which should then still be
+ +	 *   pending completion.
+ +	 *
+ +	 * Either way, we really should have a @pending here.
+  	 */
+ -	scoped_guard (raw_spinlock_irqsave, &p->pi_lock) {
+ -		smp_mb__after_spinlock();
+ -		if (!ttwu_state_match(p, state, &success))
+ -			break;
+ -
+ -		trace_sched_waking(p);
+ +	if (WARN_ON_ONCE(!pending)) {
+ +		task_rq_unlock(rq, p, rf);
+ +		return -EINVAL;
+ +	}
+  
+ +	if (task_on_cpu(rq, p) || READ_ONCE(p->__state) == TASK_WAKING) {
+  		/*
+ -		 * Ensure we load p->on_rq _after_ p->state, otherwise it would
+ -		 * be possible to, falsely, observe p->on_rq == 0 and get stuck
+ -		 * in smp_cond_load_acquire() below.
+ -		 *
+ -		 * sched_ttwu_pending()			try_to_wake_up()
+ -		 *   STORE p->on_rq = 1			  LOAD p->state
+ -		 *   UNLOCK rq->lock
+ -		 *
+ -		 * __schedule() (switch to task 'p')
+ -		 *   LOCK rq->lock			  smp_rmb();
+ -		 *   smp_mb__after_spinlock();
+ -		 *   UNLOCK rq->lock
+ -		 *
+ -		 * [task p]
+ -		 *   STORE p->state = UNINTERRUPTIBLE	  LOAD p->on_rq
+ -		 *
+ -		 * Pairs with the LOCK+smp_mb__after_spinlock() on rq->lock in
+ -		 * __schedule().  See the comment for smp_mb__after_spinlock().
+ -		 *
+ -		 * A similar smp_rmb() lives in __task_needs_rq_lock().
+ +		 * MIGRATE_ENABLE gets here because 'p == current', but for
+ +		 * anything else we cannot do is_migration_disabled(), punt
+ +		 * and have the stopper function handle it all race-free.
+  		 */
+ -		smp_rmb();
+ -		if (READ_ONCE(p->on_rq) && ttwu_runnable(p, wake_flags))
+ -			break;
+ +		stop_pending = pending->stop_pending;
+ +		if (!stop_pending)
+ +			pending->stop_pending = true;
+  
+ -#ifdef CONFIG_SMP
+ -		/*
+ -		 * Ensure we load p->on_cpu _after_ p->on_rq, otherwise it would be
+ -		 * possible to, falsely, observe p->on_cpu == 0.
+ -		 *
+ -		 * One must be running (->on_cpu == 1) in order to remove oneself
+ -		 * from the runqueue.
+ -		 *
+ -		 * __schedule() (switch to task 'p')	try_to_wake_up()
+ -		 *   STORE p->on_cpu = 1		  LOAD p->on_rq
+ -		 *   UNLOCK rq->lock
+ -		 *
+ -		 * __schedule() (put 'p' to sleep)
+ -		 *   LOCK rq->lock			  smp_rmb();
+ -		 *   smp_mb__after_spinlock();
+ -		 *   STORE p->on_rq = 0			  LOAD p->on_cpu
+ -		 *
+ -		 * Pairs with the LOCK+smp_mb__after_spinlock() on rq->lock in
+ -		 * __schedule().  See the comment for smp_mb__after_spinlock().
+ -		 *
+ -		 * Form a control-dep-acquire with p->on_rq == 0 above, to ensure
+ -		 * schedule()'s deactivate_task() has 'happened' and p will no longer
+ -		 * care about it's own p->state. See the comment in __schedule().
+ -		 */
+ -		smp_acquire__after_ctrl_dep();
+ +		if (flags & SCA_MIGRATE_ENABLE)
+ +			p->migration_flags &= ~MDF_PUSH;
+  
+ -		/*
+ -		 * We're doing the wakeup (@success == 1), they did a dequeue (p->on_rq
+ -		 * == 0), which means we need to do an enqueue, change p->state to
+ -		 * TASK_WAKING such that we can unlock p->pi_lock before doing the
+ -		 * enqueue, such as ttwu_queue_wakelist().
+ -		 */
+ -		WRITE_ONCE(p->__state, TASK_WAKING);
+++		preempt_disable();
+ +		task_rq_unlock(rq, p, rf);
+- 
+ +		if (!stop_pending) {
+ +			stop_one_cpu_nowait(cpu_of(rq), migration_cpu_stop,
+ +					    &pending->arg, &pending->stop_work);
+ +		}
+++		preempt_enable();
+  
+ -		/*
+ -		 * If the owning (remote) CPU is still in the middle of schedule() with
+ -		 * this task as prev, considering queueing p on the remote CPUs wake_list
+ -		 * which potentially sends an IPI instead of spinning on p->on_cpu to
+ -		 * let the waker make forward progress. This is safe because IRQs are
+ -		 * disabled and the IPI will deliver after on_cpu is cleared.
+ -		 *
+ -		 * Ensure we load task_cpu(p) after p->on_cpu:
+ -		 *
+ -		 * set_task_cpu(p, cpu);
+ -		 *   STORE p->cpu = @cpu
+ -		 * __schedule() (switch to task 'p')
+ -		 *   LOCK rq->lock
+ -		 *   smp_mb__after_spin_lock()		smp_cond_load_acquire(&p->on_cpu)
+ -		 *   STORE p->on_cpu = 1		LOAD p->cpu
+ -		 *
+ -		 * to ensure we observe the correct CPU on which the task is currently
+ -		 * scheduling.
+ -		 */
+ -		if (smp_load_acquire(&p->on_cpu) &&
+ -		    ttwu_queue_wakelist(p, task_cpu(p), wake_flags))
+ -			break;
+ +		if (flags & SCA_MIGRATE_ENABLE)
+ +			return 0;
+ +	} else {
+ +
+ +		if (!is_migration_disabled(p)) {
+ +			if (task_on_rq_queued(p))
+ +				rq = move_queued_task(rq, rf, p, dest_cpu);
+ +
+ +			if (!pending->stop_pending) {
+ +				p->migration_pending = NULL;
+ +				complete = true;
+ +			}
+ +		}
+ +		task_rq_unlock(rq, p, rf);
+ +
+ +		if (complete)
+ +			complete_all(&pending->done);
+ +	}
+ +
+ +	wait_for_completion(&pending->done);
+ +
+ +	if (refcount_dec_and_test(&pending->refs))
+ +		wake_up_var(&pending->refs); /* No UaF, just an address */
+ +
+ +	/*
+ +	 * Block the original owner of &pending until all subsequent callers
+ +	 * have seen the completion and decremented the refcount
+ +	 */
+ +	wait_var_event(&my_pending.refs, !refcount_read(&my_pending.refs));
+ +
+ +	/* ARGH */
+ +	WARN_ON_ONCE(my_pending.stop_pending);
+ +
+ +	return 0;
+ +}
+ +
+ +/*
+ + * Change a given task's CPU affinity. Migrate the thread to a
+ + * proper CPU and schedule it away if the CPU it's executing on
+ + * is removed from the allowed bitmask.
+ + *
+ + * NOTE: the caller must have a valid reference to the task, the
+ + * task must not exit() & deallocate itself prematurely. The
+ + * call is not atomic; no spinlocks may be held.
+ + */
+ +static int __set_cpus_allowed_ptr(struct task_struct *p,
+ +				  const struct cpumask *new_mask,
+ +				  u32 flags)
+ +{
+ +	const struct cpumask *cpu_valid_mask = cpu_active_mask;
+ +	unsigned int dest_cpu;
+ +	struct rq_flags rf;
+ +	struct rq *rq;
+ +	int ret = 0;
+ +
+ +	rq = task_rq_lock(p, &rf);
+ +	update_rq_clock(rq);
+  
+ +	if (p->flags & PF_KTHREAD || is_migration_disabled(p)) {
+  		/*
+ -		 * If the owning (remote) CPU is still in the middle of schedule() with
+ -		 * this task as prev, wait until it's done referencing the task.
+ -		 *
+ -		 * Pairs with the smp_store_release() in finish_task().
+ +		 * Kernel threads are allowed on online && !active CPUs,
+ +		 * however, during cpu-hot-unplug, even these might get pushed
+ +		 * away if not KTHREAD_IS_PER_CPU.
+  		 *
+ -		 * This ensures that tasks getting woken will be fully ordered against
+ -		 * their previous state and preserve Program Order.
+ +		 * Specifically, migration_disabled() tasks must not fail the
+ +		 * cpumask_any_and_distribute() pick below, esp. so on
+ +		 * SCA_MIGRATE_ENABLE, otherwise we'll not call
+ +		 * set_cpus_allowed_common() and actually reset p->cpus_ptr.
+  		 */
+ -		smp_cond_load_acquire(&p->on_cpu, !VAL);
+ +		cpu_valid_mask = cpu_online_mask;
+ +	}
+  
+ -		cpu = select_task_rq(p, p->wake_cpu, wake_flags | WF_TTWU);
+ -		if (task_cpu(p) != cpu) {
+ -			if (p->in_iowait) {
+ -				delayacct_blkio_end(p);
+ -				atomic_dec(&task_rq(p)->nr_iowait);
+ -			}
+ +	/*
+ +	 * Must re-check here, to close a race against __kthread_bind(),
+ +	 * sched_setaffinity() is not guaranteed to observe the flag.
+ +	 */
+ +	if ((flags & SCA_CHECK) && (p->flags & PF_NO_SETAFFINITY)) {
+ +		ret = -EINVAL;
+ +		goto out;
+ +	}
+ +
+ +	if (!(flags & SCA_MIGRATE_ENABLE)) {
+ +		if (cpumask_equal(&p->cpus_mask, new_mask))
+ +			goto out;
+  
+ -			wake_flags |= WF_MIGRATED;
+ -			psi_ttwu_dequeue(p);
+ -			set_task_cpu(p, cpu);
+ +		if (WARN_ON_ONCE(p == current &&
+ +				 is_migration_disabled(p) &&
+ +				 !cpumask_test_cpu(task_cpu(p), new_mask))) {
+ +			ret = -EBUSY;
+ +			goto out;
+  		}
+ -#else
+ -		cpu = task_cpu(p);
+ -#endif /* CONFIG_SMP */
+ +	}
+  
+ -		ttwu_queue(p, cpu, wake_flags);
+ +	/*
+ +	 * Picking a ~random cpu helps in cases where we are changing affinity
+ +	 * for groups of tasks (ie. cpuset), so that load balancing is not
+ +	 * immediately required to distribute the tasks within their new mask.
+ +	 */
+ +	dest_cpu = cpumask_any_and_distribute(cpu_valid_mask, new_mask);
+ +	if (dest_cpu >= nr_cpu_ids) {
+ +		ret = -EINVAL;
+ +		goto out;
+  	}
+ +
+ +	__do_set_cpus_allowed(p, new_mask, flags);
+ +
+ +	return affine_move_task(rq, p, &rf, dest_cpu, flags);
+ +
+  out:
+ -	if (success)
+ -		ttwu_stat(p, task_cpu(p), wake_flags);
+ +	task_rq_unlock(rq, p, &rf);
+  
+ -	return success;
+ +	return ret;
+ +}
+ +
+ +int set_cpus_allowed_ptr(struct task_struct *p, const struct cpumask *new_mask)
+ +{
+ +	return __set_cpus_allowed_ptr(p, new_mask, 0);
+  }
+ +EXPORT_SYMBOL_GPL(set_cpus_allowed_ptr);
+  
+ -static bool __task_needs_rq_lock(struct task_struct *p)
+ +void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
+  {
+ +#ifdef CONFIG_SCHED_DEBUG
+  	unsigned int state = READ_ONCE(p->__state);
+  
+  	/*
+@@@ -6899,9 -9425,11 +6903,15 @@@ static void balance_push(struct rq *rq
+  	 * Temporarily drop rq->lock such that we can wake-up the stop task.
+  	 * Both preemption and IRQs are still disabled.
+  	 */
+++<<<<<<< HEAD
+ +	raw_spin_unlock(&rq->lock);
+++=======
++ 	preempt_disable();
++ 	raw_spin_rq_unlock(rq);
+++>>>>>>> f0498d2a54e7 (sched: Fix stop_one_cpu_nowait() vs hotplug)
+  	stop_one_cpu_nowait(rq->cpu, __balance_push_cpu_stop, push_task,
+  			    this_cpu_ptr(&push_work));
++ 	preempt_enable();
+  	/*
+  	 * At this point need_resched() is true and we'll take the loop in
+  	 * schedule(). The next pick is obviously going to be the stop task
+diff --cc kernel/sched/deadline.c
+index 6409a1b5bb75,b28114478b82..000000000000
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@@ -2290,10 -2420,12 +2290,19 @@@ skip
+  		double_unlock_balance(this_rq, src_rq);
+  
+  		if (push_task) {
+++<<<<<<< HEAD
+ +			raw_spin_unlock(&this_rq->lock);
+ +			stop_one_cpu_nowait(src_rq->cpu, push_cpu_stop,
+ +					    push_task, &src_rq->push_work);
+ +			raw_spin_lock(&this_rq->lock);
+++=======
++ 			preempt_disable();
++ 			raw_spin_rq_unlock(this_rq);
++ 			stop_one_cpu_nowait(src_rq->cpu, push_cpu_stop,
++ 					    push_task, &src_rq->push_work);
++ 			preempt_enable();
++ 			raw_spin_rq_lock(this_rq);
+++>>>>>>> f0498d2a54e7 (sched: Fix stop_one_cpu_nowait() vs hotplug)
+  		}
+  	}
+  
+diff --cc kernel/sched/fair.c
+index f169082914de,38d757c35004..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -10138,8 -11254,9 +10138,13 @@@ more_balance
+  				busiest->push_cpu = this_cpu;
+  				active_balance = 1;
+  			}
+++<<<<<<< HEAD
+ +			raw_spin_unlock_irqrestore(&busiest->lock, flags);
+++=======
+++>>>>>>> f0498d2a54e7 (sched: Fix stop_one_cpu_nowait() vs hotplug)
+  
++ 			preempt_disable();
++ 			raw_spin_rq_unlock_irqrestore(busiest, flags);
+  			if (active_balance) {
+  				stop_one_cpu_nowait(cpu_of(busiest),
+  					active_load_balance_cpu_stop, busiest,
+diff --cc kernel/sched/rt.c
+index b794be2afbfc,6aaf0a3d6081..000000000000
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@@ -1862,10 -2063,12 +1862,19 @@@ retry
+  		 */
+  		push_task = get_push_task(rq);
+  		if (push_task) {
+++<<<<<<< HEAD
+ +			raw_spin_unlock(&rq->lock);
+ +			stop_one_cpu_nowait(rq->cpu, push_cpu_stop,
+ +					    push_task, &rq->push_work);
+ +			raw_spin_lock(&rq->lock);
+++=======
++ 			preempt_disable();
++ 			raw_spin_rq_unlock(rq);
++ 			stop_one_cpu_nowait(rq->cpu, push_cpu_stop,
++ 					    push_task, &rq->push_work);
++ 			preempt_enable();
++ 			raw_spin_rq_lock(rq);
+++>>>>>>> f0498d2a54e7 (sched: Fix stop_one_cpu_nowait() vs hotplug)
+  		}
+  
+  		return 0;
+@@@ -2201,10 -2404,12 +2210,19 @@@ skip
+  		double_unlock_balance(this_rq, src_rq);
+  
+  		if (push_task) {
+++<<<<<<< HEAD
+ +			raw_spin_unlock(&this_rq->lock);
+ +			stop_one_cpu_nowait(src_rq->cpu, push_cpu_stop,
+ +					    push_task, &src_rq->push_work);
+ +			raw_spin_lock(&this_rq->lock);
+++=======
++ 			preempt_disable();
++ 			raw_spin_rq_unlock(this_rq);
++ 			stop_one_cpu_nowait(src_rq->cpu, push_cpu_stop,
++ 					    push_task, &src_rq->push_work);
++ 			preempt_enable();
++ 			raw_spin_rq_lock(this_rq);
+++>>>>>>> f0498d2a54e7 (sched: Fix stop_one_cpu_nowait() vs hotplug)
+  		}
+  	}
+  
+* Unmerged path kernel/sched/core.c
+* Unmerged path kernel/sched/deadline.c
+* Unmerged path kernel/sched/fair.c
+* Unmerged path kernel/sched/rt.c
