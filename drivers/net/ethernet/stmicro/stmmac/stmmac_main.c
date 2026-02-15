@@ -1148,11 +1148,8 @@ static const struct phylink_mac_ops stmmac_phylink_mac_ops = {
  */
 static void stmmac_check_pcs_mode(struct stmmac_priv *priv)
 {
-	int interface = priv->plat->mac_interface;
 	int speed = priv->plat->mac_port_sel_speed;
-
-	if (interface == PHY_INTERFACE_MODE_NA)
-		interface = priv->plat->phy_interface;
+	int interface = priv->plat->phy_interface;
 
 	if (priv->dma_cap.pcs && interface == PHY_INTERFACE_MODE_SGMII) {
 		netdev_dbg(priv->dev, "PCS SGMII support enabled\n");

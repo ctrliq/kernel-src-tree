@@ -54,7 +54,6 @@ static int lpc18xx_dwmac_probe(struct platform_device *pdev)
 	if (IS_ERR(plat_dat))
 		return PTR_ERR(plat_dat);
 
-	plat_dat->mac_interface = PHY_INTERFACE_MODE_NA;
 	plat_dat->core_type = DWMAC_CORE_GMAC;
 
 	regmap = syscon_regmap_lookup_by_compatible("nxp,lpc1850-creg");
