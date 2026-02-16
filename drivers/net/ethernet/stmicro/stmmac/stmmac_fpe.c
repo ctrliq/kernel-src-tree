@@ -174,7 +174,7 @@ void stmmac_fpe_irq_status(struct stmmac_priv *priv)
  */
 static void stmmac_fpe_verify_timer(struct timer_list *t)
 {
-	struct stmmac_fpe_cfg *fpe_cfg = from_timer(fpe_cfg, t, verify_timer);
+	struct stmmac_fpe_cfg *fpe_cfg = timer_container_of(fpe_cfg, t, verify_timer);
 	struct stmmac_priv *priv = container_of(fpe_cfg, struct stmmac_priv,
 						fpe_cfg);
 	unsigned long flags;
