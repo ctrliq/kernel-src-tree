@@ -131,7 +131,7 @@ static int avs_es8336_codec_init(struct snd_soc_pcm_runtime *runtime)
 	snd_jack_set_key(data->jack.jack, SND_JACK_BTN_0, KEY_PLAYPAUSE);
 	snd_soc_component_set_jack(component, &data->jack, NULL);
 
-	card->dapm.idle_bias_off = true;
+	card->dapm.idle_bias = false;
 
 	return 0;
 }
@@ -194,8 +194,9 @@ static int avs_es8336_be_fixup(struct snd_soc_pcm_runtime *runtime,
 
 	return 0;
 }
-static int avs_create_dai_link(struct device *dev, const char *platform_name, int ssp_port,
-			       int tdm_slot, struct snd_soc_dai_link **dai_link)
+
+static int avs_create_dai_link(struct device *dev, int ssp_port, int tdm_slot,
+			       struct snd_soc_dai_link **dai_link)
 {
 	struct snd_soc_dai_link_component *platform;
 	struct snd_soc_dai_link *dl;
@@ -204,8 +205,6 @@ static int avs_create_dai_link(struct device *dev, const char *platform_name, in
 	platform = devm_kzalloc(dev, sizeof(*platform), GFP_KERNEL);
 	if (!dl || !platform)
 		return -ENOMEM;
-
-	platform->name = platform_name;
 
 	dl->name = devm_kasprintf(dev, GFP_KERNEL,
 				  AVS_STRING_FMT("SSP", "-Codec", ssp_port, tdm_slot));
@@ -221,6 +220,7 @@ static int avs_create_dai_link(struct device *dev, const char *platform_name, in
 	if (!dl->cpus->dai_name || !dl->codecs->name || !dl->codecs->dai_name)
 		return -ENOMEM;
 
+	platform->name = dev_name(dev);
 	dl->num_cpus = 1;
 	dl->num_codecs = 1;
 	dl->platforms = platform;
@@ -262,18 +262,16 @@ static int avs_es8336_probe(struct platform_device *pdev)
 	struct avs_card_drvdata *data;
 	struct snd_soc_card *card;
 	struct device *dev = &pdev->dev;
-	const char *pname;
 	int ssp_port, tdm_slot, ret;
 
 	mach = dev_get_platdata(dev);
-	pname = mach->mach_params.platform;
 	pdata = mach->pdata;
 
 	ret = avs_mach_get_ssp_tdm(dev, mach, &ssp_port, &tdm_slot);
 	if (ret)
 		return ret;
 
-	ret = avs_create_dai_link(dev, pname, ssp_port, tdm_slot, &dai_link);
+	ret = avs_create_dai_link(dev, ssp_port, tdm_slot, &dai_link);
 	if (ret) {
 		dev_err(dev, "Failed to create dai link: %d", ret);
 		return ret;
@@ -304,10 +302,6 @@ static int avs_es8336_probe(struct platform_device *pdev)
 	card->num_dapm_routes = ARRAY_SIZE(card_routes);
 	card->fully_routed = true;
 	snd_soc_card_set_drvdata(card, data);
-
-	ret = snd_soc_fixup_dai_links_platform_name(card, pname);
-	if (ret)
-		return ret;
 
 	return devm_snd_soc_register_deferrable_card(dev, card);
 }

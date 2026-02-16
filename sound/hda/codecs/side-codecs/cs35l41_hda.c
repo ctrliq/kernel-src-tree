@@ -623,11 +623,10 @@ static void cs35l41_remove_dsp(struct cs35l41_hda *cs35l41)
 
 	cancel_work_sync(&cs35l41->fw_load_work);
 
-	mutex_lock(&cs35l41->fw_mutex);
+	guard(mutex)(&cs35l41->fw_mutex);
 	cs35l41_shutdown_dsp(cs35l41);
 	cs_dsp_remove(dsp);
 	cs35l41->halo_initialized = false;
-	mutex_unlock(&cs35l41->fw_mutex);
 }
 
 /* Protection release cycle to get the speaker out of Safe-Mode */
@@ -789,9 +788,9 @@ static void cs35l41_hda_pre_playback_hook(struct device *dev, int action)
 
 	switch (action) {
 	case HDA_GEN_PCM_ACT_CLEANUP:
-		mutex_lock(&cs35l41->fw_mutex);
-		cs35l41_hda_pause_start(dev);
-		mutex_unlock(&cs35l41->fw_mutex);
+		scoped_guard(mutex, &cs35l41->fw_mutex) {
+			cs35l41_hda_pause_start(dev);
+		}
 		break;
 	default:
 		break;
@@ -812,24 +811,24 @@ static void cs35l41_hda_playback_hook(struct device *dev, int action)
 		pm_runtime_get_sync(dev);
 		break;
 	case HDA_GEN_PCM_ACT_PREPARE:
-		mutex_lock(&cs35l41->fw_mutex);
-		cs35l41_hda_play_start(dev);
-		mutex_unlock(&cs35l41->fw_mutex);
+		scoped_guard(mutex, &cs35l41->fw_mutex) {
+			cs35l41_hda_play_start(dev);
+		}
 		break;
 	case HDA_GEN_PCM_ACT_CLEANUP:
-		mutex_lock(&cs35l41->fw_mutex);
-		cs35l41_hda_pause_done(dev);
-		mutex_unlock(&cs35l41->fw_mutex);
+		scoped_guard(mutex, &cs35l41->fw_mutex) {
+			cs35l41_hda_pause_done(dev);
+		}
 		break;
 	case HDA_GEN_PCM_ACT_CLOSE:
-		mutex_lock(&cs35l41->fw_mutex);
-		if (!cs35l41->cs_dsp.running && cs35l41->request_fw_load &&
-		    !cs35l41->fw_request_ongoing) {
-			dev_info(dev, "Requesting Firmware Load after HDA_GEN_PCM_ACT_CLOSE\n");
-			cs35l41->fw_request_ongoing = true;
-			schedule_work(&cs35l41->fw_load_work);
+		scoped_guard(mutex, &cs35l41->fw_mutex) {
+			if (!cs35l41->cs_dsp.running && cs35l41->request_fw_load &&
+			    !cs35l41->fw_request_ongoing) {
+				dev_info(dev, "Requesting Firmware Load after HDA_GEN_PCM_ACT_CLOSE\n");
+				cs35l41->fw_request_ongoing = true;
+				schedule_work(&cs35l41->fw_load_work);
+			}
 		}
-		mutex_unlock(&cs35l41->fw_mutex);
 
 		/*
 		 * Playback must be finished for all amps before we start runtime suspend.
@@ -848,9 +847,9 @@ static void cs35l41_hda_post_playback_hook(struct device *dev, int action)
 
 	switch (action) {
 	case HDA_GEN_PCM_ACT_PREPARE:
-		mutex_lock(&cs35l41->fw_mutex);
-		cs35l41_hda_play_done(dev);
-		mutex_unlock(&cs35l41->fw_mutex);
+		scoped_guard(mutex, &cs35l41->fw_mutex) {
+			cs35l41_hda_play_done(dev);
+		}
 		break;
 	default:
 		break;
@@ -916,13 +915,12 @@ static int cs35l41_verify_id(struct cs35l41_hda *cs35l41, unsigned int *regid, u
 
 static int cs35l41_ready_for_reset(struct cs35l41_hda *cs35l41)
 {
-	mutex_lock(&cs35l41->fw_mutex);
+	guard(mutex)(&cs35l41->fw_mutex);
 	if (cs35l41->cs_dsp.running) {
 		cs35l41->cs_dsp.running = false;
 		cs35l41->cs_dsp.booted = false;
 	}
 	regcache_mark_dirty(cs35l41->regmap);
-	mutex_unlock(&cs35l41->fw_mutex);
 
 	return 0;
 }
@@ -938,10 +936,9 @@ static int cs35l41_system_suspend_prep(struct device *dev)
 		return 0; /* don't block the whole system suspend */
 	}
 
-	mutex_lock(&cs35l41->fw_mutex);
+	guard(mutex)(&cs35l41->fw_mutex);
 	if (cs35l41->playback_started)
 		cs35l41_hda_pause_start(dev);
-	mutex_unlock(&cs35l41->fw_mutex);
 
 	return 0;
 }
@@ -958,10 +955,10 @@ static int cs35l41_system_suspend(struct device *dev)
 		return 0; /* don't block the whole system suspend */
 	}
 
-	mutex_lock(&cs35l41->fw_mutex);
-	if (cs35l41->playback_started)
-		cs35l41_hda_pause_done(dev);
-	mutex_unlock(&cs35l41->fw_mutex);
+	scoped_guard(mutex, &cs35l41->fw_mutex) {
+		if (cs35l41->playback_started)
+			cs35l41_hda_pause_done(dev);
+	}
 
 	ret = pm_runtime_force_suspend(dev);
 	if (ret) {
@@ -1046,13 +1043,12 @@ static int cs35l41_system_resume(struct device *dev)
 		return ret;
 	}
 
-	mutex_lock(&cs35l41->fw_mutex);
+	guard(mutex)(&cs35l41->fw_mutex);
 
 	if (cs35l41->request_fw_load && !cs35l41->fw_request_ongoing) {
 		cs35l41->fw_request_ongoing = true;
 		schedule_work(&cs35l41->fw_load_work);
 	}
-	mutex_unlock(&cs35l41->fw_mutex);
 
 	return ret;
 }
@@ -1069,7 +1065,7 @@ static int cs35l41_runtime_idle(struct device *dev)
 static int cs35l41_runtime_suspend(struct device *dev)
 {
 	struct cs35l41_hda *cs35l41 = dev_get_drvdata(dev);
-	int ret = 0;
+	int ret;
 
 	dev_dbg(cs35l41->dev, "Runtime Suspend\n");
 
@@ -1078,13 +1074,13 @@ static int cs35l41_runtime_suspend(struct device *dev)
 		return 0;
 	}
 
-	mutex_lock(&cs35l41->fw_mutex);
+	guard(mutex)(&cs35l41->fw_mutex);
 
 	if (cs35l41->cs_dsp.running) {
 		ret = cs35l41_enter_hibernate(cs35l41->dev, cs35l41->regmap,
 					      cs35l41->hw_cfg.bst_type);
 		if (ret)
-			goto err;
+			return ret;
 	} else {
 		cs35l41_safe_reset(cs35l41->regmap, cs35l41->hw_cfg.bst_type);
 	}
@@ -1092,17 +1088,14 @@ static int cs35l41_runtime_suspend(struct device *dev)
 	regcache_cache_only(cs35l41->regmap, true);
 	regcache_mark_dirty(cs35l41->regmap);
 
-err:
-	mutex_unlock(&cs35l41->fw_mutex);
-
-	return ret;
+	return 0;
 }
 
 static int cs35l41_runtime_resume(struct device *dev)
 {
 	struct cs35l41_hda *cs35l41 = dev_get_drvdata(dev);
 	unsigned int regid, reg_revid;
-	int ret = 0;
+	int ret;
 
 	dev_dbg(cs35l41->dev, "Runtime Resume\n");
 
@@ -1111,7 +1104,7 @@ static int cs35l41_runtime_resume(struct device *dev)
 		return 0;
 	}
 
-	mutex_lock(&cs35l41->fw_mutex);
+	guard(mutex)(&cs35l41->fw_mutex);
 
 	regcache_cache_only(cs35l41->regmap, false);
 
@@ -1119,13 +1112,13 @@ static int cs35l41_runtime_resume(struct device *dev)
 		ret = cs35l41_exit_hibernate(cs35l41->dev, cs35l41->regmap);
 		if (ret) {
 			dev_warn(cs35l41->dev, "Unable to exit Hibernate.");
-			goto err;
+			return ret;
 		}
 	}
 
 	ret = cs35l41_verify_id(cs35l41, &regid, &reg_revid);
 	if (ret)
-		goto err;
+		return ret;
 
 	/* Test key needs to be unlocked to allow the OTP settings to re-apply */
 	cs35l41_test_key_unlock(cs35l41->dev, cs35l41->regmap);
@@ -1133,7 +1126,7 @@ static int cs35l41_runtime_resume(struct device *dev)
 	cs35l41_test_key_lock(cs35l41->dev, cs35l41->regmap);
 	if (ret) {
 		dev_err(cs35l41->dev, "Failed to restore register cache: %d\n", ret);
-		goto err;
+		return ret;
 	}
 
 	if (cs35l41->hw_cfg.bst_type == CS35L41_EXT_BOOST)
@@ -1141,22 +1134,14 @@ static int cs35l41_runtime_resume(struct device *dev)
 
 	dev_dbg(cs35l41->dev, "CS35L41 Resumed (%x), Revision: %02X\n", regid, reg_revid);
 
-err:
-	mutex_unlock(&cs35l41->fw_mutex);
-
-	return ret;
+	return 0;
 }
 
 static int cs35l41_hda_read_ctl(struct cs_dsp *dsp, const char *name, int type,
 				unsigned int alg, void *buf, size_t len)
 {
-	int ret;
-
-	mutex_lock(&dsp->pwr_lock);
-	ret = cs_dsp_coeff_read_ctrl(cs_dsp_get_ctl(dsp, name, type, alg), 0, buf, len);
-	mutex_unlock(&dsp->pwr_lock);
-
-	return ret;
+	guard(mutex)(&dsp->pwr_lock);
+	return cs_dsp_coeff_read_ctrl(cs_dsp_get_ctl(dsp, name, type, alg), 0, buf, len);
 }
 
 static int cs35l41_smart_amp(struct cs35l41_hda *cs35l41)
@@ -1271,16 +1256,15 @@ static void cs35l41_fw_load_work(struct work_struct *work)
 
 	pm_runtime_get_sync(cs35l41->dev);
 
-	mutex_lock(&cs35l41->fw_mutex);
+	scoped_guard(mutex, &cs35l41->fw_mutex) {
+		/* Recheck if playback is ongoing, mutex will block playback during firmware loading */
+		if (cs35l41->playback_started)
+			dev_err(cs35l41->dev, "Cannot Load/Unload firmware during Playback. Retrying...\n");
+		else
+			cs35l41_load_firmware(cs35l41, cs35l41->request_fw_load);
 
-	/* Recheck if playback is ongoing, mutex will block playback during firmware loading */
-	if (cs35l41->playback_started)
-		dev_err(cs35l41->dev, "Cannot Load/Unload firmware during Playback. Retrying...\n");
-	else
-		cs35l41_load_firmware(cs35l41, cs35l41->request_fw_load);
-
-	cs35l41->fw_request_ongoing = false;
-	mutex_unlock(&cs35l41->fw_mutex);
+		cs35l41->fw_request_ongoing = false;
+	}
 
 	pm_runtime_put_autosuspend(cs35l41->dev);
 }
@@ -1425,6 +1409,8 @@ static int cs35l41_get_acpi_mute_state(struct cs35l41_hda *cs35l41, acpi_handle 
 
 	if (cs35l41_dsm_supported(handle, CS35L41_DSM_GET_MUTE)) {
 		ret = acpi_evaluate_dsm(handle, &guid, 0, CS35L41_DSM_GET_MUTE, NULL);
+		if (!ret)
+			return -EINVAL;
 		mute = *ret->buffer.pointer;
 		dev_dbg(cs35l41->dev, "CS35L41_DSM_GET_MUTE: %d\n", mute);
 	}
@@ -1914,6 +1900,8 @@ static int cs35l41_hda_read_acpi(struct cs35l41_hda *cs35l41, const char *hid, i
 
 	cs35l41->dacpi = adev;
 	physdev = get_device(acpi_get_first_physical_node(adev));
+	if (!physdev)
+		return -ENODEV;
 
 	sub = acpi_get_subsystem_id(ACPI_HANDLE(physdev));
 	if (IS_ERR(sub))

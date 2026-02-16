@@ -1110,6 +1110,11 @@ static inline int snd_soc_card_is_instantiated(struct snd_soc_card *card)
 	return card && card->instantiated;
 }
 
+static inline struct snd_soc_dapm_context *snd_soc_card_to_dapm(struct snd_soc_card *card)
+{
+	return &card->dapm;
+}
+
 /* SoC machine DAI configuration, glues a codec and cpu DAI together */
 struct snd_soc_pcm_runtime {
 	struct device *dev;
@@ -1210,6 +1215,7 @@ struct soc_mixer_control {
 	unsigned int sign_bit;
 	unsigned int invert:1;
 	unsigned int autodisable:1;
+	unsigned int sdca_q78:1;
 #ifdef CONFIG_SND_SOC_TOPOLOGY
 	struct snd_soc_dobj dobj;
 #endif
