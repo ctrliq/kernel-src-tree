@@ -11,6 +11,7 @@
 #include <linux/debugfs.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/pci.h>
 #include <linux/platform_device.h>
 #include <linux/power_supply.h>
@@ -468,6 +469,10 @@ static int amd_pmf_probe(struct platform_device *pdev)
 	mutex_init(&dev->lock);
 	mutex_init(&dev->update_mutex);
 	mutex_init(&dev->cb_mutex);
+
+	err = devm_mutex_init(dev->dev, &dev->cbi_mutex);
+	if (err)
+		return err;
 
 	apmf_acpi_init(dev);
 	platform_set_drvdata(pdev, dev);
