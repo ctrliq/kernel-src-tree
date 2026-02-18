@@ -5086,11 +5086,8 @@ static struct timer_list ipmi_timer;
 
 static atomic_t stop_operation;
 
-static void ipmi_timeout_work(struct work_struct *work)
+static void ipmi_timeout(struct timer_list *unused)
 {
-	if (atomic_read(&stop_operation))
-		return;
-
 	struct ipmi_smi *intf;
 	bool need_timer = false;
 	int index;
@@ -5115,16 +5112,6 @@ static void ipmi_timeout_work(struct work_struct *work)
 
 	if (need_timer)
 		mod_timer(&ipmi_timer, jiffies + IPMI_TIMEOUT_JIFFIES);
-}
-
-static DECLARE_WORK(ipmi_timer_work, ipmi_timeout_work);
-
-static void ipmi_timeout(struct timer_list *unused)
-{
-	if (atomic_read(&stop_operation))
-		return;
-
-	queue_work(system_bh_wq, &ipmi_timer_work);
 }
 
 static void need_waiter(struct ipmi_smi *intf)
@@ -5567,7 +5554,6 @@ static void __exit cleanup_ipmi(void)
 		 */
 		atomic_set(&stop_operation, 1);
 		timer_delete_sync(&ipmi_timer);
-		cancel_work_sync(&ipmi_timer_work);
 
 		initialized = false;
 
