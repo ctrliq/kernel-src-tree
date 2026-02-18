@@ -1,0 +1,215 @@
+name: LT Rebase Merge
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to test merge on'
+        required: true
+        type: number
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  lt-rebase-merge:
+    # Only run on PRs when comment contains /lt_rebase_merge, or when manually dispatched
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.issue.pull_request && contains(github.event.comment.body, '/lt_rebase_merge'))
+    runs-on: ubuntu-latest
+    container:
+      image: rockylinux:9
+    steps:
+      - name: Generate GitHub App token
+        id: generate-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          repositories: |
+            kernel-src-tree
+            kernel-src-tree-tools
+
+      - name: Install system dependencies
+        run: |
+          dnf install -y git jq
+
+          # Install GitHub CLI
+          dnf install 'dnf-command(config-manager)' -y
+          dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
+          dnf install gh -y
+
+      - name: Validate commenter has write access
+        if: github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+          COMMENTER: ${{ github.event.comment.user.login }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -e
+
+          # Check if commenter has write or admin permission on the repository
+          PERMISSION=$(gh api "/repos/$REPOSITORY/collaborators/$COMMENTER/permission" --jq '.permission' 2>/dev/null || echo "none")
+
+          echo "User $COMMENTER has permission level: $PERMISSION"
+
+          if [[ "$PERMISSION" == "admin" || "$PERMISSION" == "write" ]]; then
+            echo "✅ User $COMMENTER has sufficient permissions"
+          else
+            echo "❌ User $COMMENTER does not have write or admin access to $REPOSITORY"
+            echo "Only users with write or admin access can trigger lt_rebase_merge"
+            exit 1
+          fi
+
+      - name: Get PR details and verify approvals
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+          PR_NUMBER: ${{ github.event_name == 'workflow_dispatch' && inputs.pr_number || github.event.issue.number }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -e
+
+          # Get PR details
+          PR_DATA=$(gh pr view "$PR_NUMBER" --repo "$REPOSITORY" --json number,headRefName,baseRefName,title,reviews)
+
+          # Extract branch names
+          HEAD_BRANCH=$(echo "$PR_DATA" | jq -r '.headRefName')
+          BASE_BRANCH=$(echo "$PR_DATA" | jq -r '.baseRefName')
+          PR_TITLE=$(echo "$PR_DATA" | jq -r '.title')
+
+          echo "HEAD_BRANCH=$HEAD_BRANCH" >> $GITHUB_ENV
+          echo "BASE_BRANCH=$BASE_BRANCH" >> $GITHUB_ENV
+          echo "PR_TITLE=$PR_TITLE" >> $GITHUB_ENV
+
+          # Count approvals
+          APPROVALS=$(echo "$PR_DATA" | jq '[.reviews[] | select(.state == "APPROVED")] | length')
+
+          echo "PR #$PR_NUMBER has $APPROVALS approvals"
+
+          if [ "$APPROVALS" -lt 2 ]; then
+            echo "❌ PR requires at least 2 approvals to merge. Current approvals: $APPROVALS"
+            exit 1
+          fi
+
+          echo "✅ PR has sufficient approvals ($APPROVALS)"
+
+      - name: Extract LT version from PR
+        run: |
+          set -e
+
+          # Extract version from head branch name
+          # Expected patterns: {automation_tmp}_ciq-6.XX.y-next or similar
+          if echo "$HEAD_BRANCH" | grep -qE 'ciq-[0-9]+\.([0-9]+)\.y'; then
+            LT_MINOR=$(echo "$HEAD_BRANCH" | grep -oP 'ciq-[0-9]+\.\K([0-9]+)(?=\.y)')
+            LT_MAJOR=$(echo "$HEAD_BRANCH" | grep -oP 'ciq-\K([0-9]+)(?=\.[0-9]+\.y)')
+            echo "Extracted version from branch: $LT_MAJOR.$LT_MINOR"
+          else
+            echo "❌ Could not extract LT version from branch name '$HEAD_BRANCH'"
+            echo "Branch name must match pattern: ciq-X.Y.y"
+            exit 1
+          fi
+
+          # Validate extracted values
+          if ! [[ "$LT_MAJOR" =~ ^[0-9]+$ ]] || ! [[ "$LT_MINOR" =~ ^[0-9]+$ ]]; then
+            echo "❌ Invalid LT version extracted: $LT_MAJOR.$LT_MINOR"
+            exit 1
+          fi
+
+          echo "LT_MAJOR=$LT_MAJOR" >> $GITHUB_ENV
+          echo "LT_MINOR=$LT_MINOR" >> $GITHUB_ENV
+          echo "LT_VERSION=$LT_MAJOR.$LT_MINOR" >> $GITHUB_ENV
+
+          # Construct branch names
+          echo "AUTOMATION_TMP_BRANCH={automation_tmp}_ciq-${LT_MAJOR}.${LT_MINOR}.y-next" >> $GITHUB_ENV
+          echo "NEXT_BRANCH=ciq-${LT_MAJOR}.${LT_MINOR}.y-next" >> $GITHUB_ENV
+          echo "TARGET_BRANCH=ciq-${LT_MAJOR}.${LT_MINOR}.y" >> $GITHUB_ENV
+
+          echo "✅ LT Version: $LT_MAJOR.$LT_MINOR"
+
+      - name: Checkout kernel-src-tree
+        uses: actions/checkout@v4
+        with:
+          repository: ctrliq/kernel-src-tree
+          token: ${{ steps.generate-token.outputs.token }}
+          path: kernel-src-tree
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Checkout kernel-src-tree-tools
+        uses: actions/checkout@v4
+        with:
+          repository: ctrliq/kernel-src-tree-tools
+          token: ${{ steps.generate-token.outputs.token }}
+          path: kernel-src-tree-tools
+          persist-credentials: true
+
+      - name: Configure git
+        run: |
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+
+      - name: Setup branch references and execute lt_rebase_merge.sh
+        run: |
+          set -e
+          cd kernel-src-tree
+
+          # Get local references to the required branches
+          echo "Fetching required branches..."
+          git fetch origin "$AUTOMATION_TMP_BRANCH:$AUTOMATION_TMP_BRANCH" || git checkout "$AUTOMATION_TMP_BRANCH"
+          git fetch origin "$NEXT_BRANCH:$NEXT_BRANCH" || git checkout "$NEXT_BRANCH"
+          git fetch origin "$TARGET_BRANCH:$TARGET_BRANCH" || git checkout "$TARGET_BRANCH"
+
+          echo "✅ Branch references set up"
+          echo "Branches:"
+          echo "  - Automation Tmp: $AUTOMATION_TMP_BRANCH"
+          echo "  - Next: $NEXT_BRANCH"
+          echo "  - Target: $TARGET_BRANCH"
+
+          # Execute the lt_rebase_merge.sh script
+          echo "Executing lt_rebase_merge.sh..."
+          if ! ../kernel-src-tree-tools/lt_rebase_merge.sh "$AUTOMATION_TMP_BRANCH" "$TARGET_BRANCH"; then
+            echo "❌ lt_rebase_merge.sh failed"
+            exit 1
+          fi
+
+          echo "✅ lt_rebase_merge.sh completed successfully"
+
+      - name: Comment on PR with result
+        if: always()
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+          PR_NUMBER: ${{ github.event_name == 'workflow_dispatch' && inputs.pr_number || github.event.issue.number }}
+          REPOSITORY: ${{ github.repository }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          if [ "$JOB_STATUS" == "success" ]; then
+            EMOJI="✅"
+            TITLE="LT Rebase Merge completed successfully"
+            MESSAGE="Merged \`$AUTOMATION_TMP_BRANCH\` to \`$TARGET_BRANCH\` for LT $LT_VERSION"
+          else
+            EMOJI="❌"
+            TITLE="LT Rebase Merge failed"
+            MESSAGE="Failed to merge \`$AUTOMATION_TMP_BRANCH\` to \`$TARGET_BRANCH\` for LT $LT_VERSION
+
+          Please check the workflow run for details: $RUN_URL"
+          fi
+
+          gh pr comment "$PR_NUMBER" \
+            --body "$EMOJI **$TITLE**
+
+          $MESSAGE
+
+          Workflow run: $RUN_URL" \
+            --repo "$REPOSITORY"
+
+          if [ $? -eq 0 ]; then
+            echo "✅ Successfully commented on PR #$PR_NUMBER"
+          else
+            echo "⚠️ Failed to comment on PR #$PR_NUMBER (commenting failure is non-fatal)"
+          fi
