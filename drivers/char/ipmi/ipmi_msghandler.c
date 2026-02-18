@@ -3739,13 +3739,7 @@ void ipmi_unregister_smi(struct ipmi_smi *intf)
 	list_del(&intf->link);
 	mutex_unlock(&ipmi_interfaces_mutex);
 
-	/*
-	 * At this point no users can be added to the interface and no
-	 * new messages can be sent.
-	 */
-
-	if (intf->handlers->shutdown)
-		intf->handlers->shutdown(intf->send_info);
+	/* At this point no users can be added to the interface. */
 
 	device_remove_file(intf->si_dev, &intf->nr_msgs_devattr);
 	device_remove_file(intf->si_dev, &intf->nr_users_devattr);
@@ -3767,6 +3761,9 @@ void ipmi_unregister_smi(struct ipmi_smi *intf)
 		_ipmi_destroy_user(user);
 	}
 	mutex_unlock(&intf->users_mutex);
+
+	if (intf->handlers->shutdown)
+		intf->handlers->shutdown(intf->send_info);
 
 	cleanup_smi_msgs(intf);
 
