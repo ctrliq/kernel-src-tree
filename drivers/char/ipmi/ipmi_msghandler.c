@@ -959,14 +959,20 @@ static int deliver_response(struct ipmi_smi *intf, struct ipmi_recv_msg *msg)
 		ipmi_free_recv_msg(msg);
 		atomic_dec(&msg->user->nr_msgs);
 	} else {
-		/*
-		 * Deliver it in smi_work.  The message will hold a
-		 * refcount to the user.
-		 */
-		mutex_lock(&intf->user_msgs_mutex);
-		list_add_tail(&msg->link, &intf->user_msgs);
-		mutex_unlock(&intf->user_msgs_mutex);
-		queue_work(system_wq, &intf->smi_work);
+		struct ipmi_user *user = acquire_ipmi_user(msg->user);
+
+		if (user) {
+			/* Deliver it in smi_work. */
+			mutex_lock(&intf->user_msgs_mutex);
+			list_add_tail(&msg->link, &intf->user_msgs);
+			mutex_unlock(&intf->user_msgs_mutex);
+			queue_work(system_wq, &intf->smi_work);
+			/* User release will happen in the work queue. */
+		} else {
+			/* User went away, give up. */
+			ipmi_free_recv_msg(msg);
+			rv = -EINVAL;
+		}
 	}
 
 	return rv;
@@ -4822,13 +4828,6 @@ static void smi_work(struct work_struct *t)
 		mutex_unlock(&intf->users_mutex);
 	}
 
-	/*
-	 * Freeing the message can cause a user to be released, which
-	 * can then cause the interface to be freed.  Make sure that
-	 * doesn't happen until we are ready.
-	 */
-	kref_get(&intf->refcount);
-
 	mutex_lock(&intf->user_msgs_mutex);
 	list_for_each_entry_safe(msg, msg2, &intf->user_msgs, link) {
 		struct ipmi_user *user = msg->user;
@@ -4836,10 +4835,9 @@ static void smi_work(struct work_struct *t)
 		list_del(&msg->link);
 		atomic_dec(&user->nr_msgs);
 		user->handler->ipmi_recv_hndl(msg, user->handler_data);
+		release_ipmi_user(user);
 	}
 	mutex_unlock(&intf->user_msgs_mutex);
-
-	kref_put(&intf->refcount, intf_free);
 }
 
 /* Handle a new message from the lower layer. */
