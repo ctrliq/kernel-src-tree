@@ -3894,12 +3894,17 @@ static int handle_ipmb_get_msg_cmd(struct ipmi_smi *intf,
 		dev_dbg(intf->si_dev, "Invalid command: %*ph\n",
 			msg->data_size, msg->data);
 
-		smi_send(intf, intf->handlers, msg, 0);
-		/*
-		 * We used the message, so return the value that
-		 * causes it to not be freed or queued.
-		 */
-		rv = -1;
+		mutex_lock(&ipmi_interfaces_mutex);
+		if (!intf->in_shutdown) {
+			smi_send(intf, intf->handlers, msg, 0);
+			/*
+			 * We used the message, so return the value
+			 * that causes it to not be freed or
+			 * queued.
+			 */
+			rv = -1;
+		}
+		mutex_unlock(&ipmi_interfaces_mutex);
 	} else {
 		recv_msg = ipmi_alloc_recv_msg();
 		if (!recv_msg) {
@@ -3980,12 +3985,17 @@ static int handle_ipmb_direct_rcv_cmd(struct ipmi_smi *intf,
 		msg->data[4] = IPMI_INVALID_CMD_COMPLETION_CODE;
 		msg->data_size = 5;
 
-		smi_send(intf, intf->handlers, msg, 0);
-		/*
-		 * We used the message, so return the value that
-		 * causes it to not be freed or queued.
-		 */
-		rv = -1;
+		mutex_lock(&ipmi_interfaces_mutex);
+		if (!intf->in_shutdown) {
+			smi_send(intf, intf->handlers, msg, 0);
+			/*
+			 * We used the message, so return the value
+			 * that causes it to not be freed or
+			 * queued.
+			 */
+			rv = -1;
+		}
+		mutex_unlock(&ipmi_interfaces_mutex);
 	} else {
 		recv_msg = ipmi_alloc_recv_msg();
 		if (!recv_msg) {
