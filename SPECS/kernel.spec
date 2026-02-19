@@ -933,12 +933,6 @@ Source43: %{name}-aarch64-64k-debug-rhel.config
 %endif
 
 %if 0%{?include_rocky}
-Source1000: kernel-aarch64-64k.config
-Source1001: kernel-aarch64-64k-debug.config
-Source1002: kernel-aarch64.config
-Source1003: kernel-aarch64-debug.config
-Source1004: kernel-x86_64.config
-Source1005: kernel-x86_64-debug.config
 Source1006: partial-snip.config
 Source1007: def_variants.yaml.rocky
 %endif
@@ -1910,14 +1904,15 @@ cd configs
 
 %{log_msg "Copy additional source files into buildroot"}
 # Drop some necessary files from the source dir into the buildroot
-cp $RPM_SOURCE_DIR/%{name}-*.config .
+# Copy kernel config files from ciq/configs in the source tarball
+cp ../ciq/configs/kernel-*.config .
 cp %{SOURCE80} .
 # merge.py
 cp %{SOURCE3000} .
 # kernel-local - rename and copy for partial snippet config process
 cp %{SOURCE3001} partial-kernel-local-snip.config
 cp %{SOURCE3001} partial-kernel-local-debug-snip.config
-for config in $RPM_SOURCE_DIR/kernel-*.config; do
+for config in ../ciq/configs/kernel-*.config; do
     arch=$(echo $config | sed -n 's/.*kernel-\(.*\)\.config/\1/p')
     cp $config kernel-%{specversion}-$arch.config
 done
