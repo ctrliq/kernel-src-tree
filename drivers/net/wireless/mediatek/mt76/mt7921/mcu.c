@@ -142,24 +142,6 @@ static u8 mt7921_mcu_chan_bw(struct cfg80211_chan_def *chandef)
 	return width_to_bw[chandef->width];
 }
 
-static int
-mt7921_mcu_parse_eeprom(struct mt76_dev *dev, struct sk_buff *skb)
-{
-	struct mt7921_mcu_eeprom_info *res;
-	u8 *buf;
-
-	if (!skb)
-		return -EINVAL;
-
-	skb_pull(skb, sizeof(struct mt7921_mcu_rxd));
-
-	res = (struct mt7921_mcu_eeprom_info *)skb->data;
-	buf = dev->eeprom.data + le32_to_cpu(res->addr);
-	memcpy(buf, res->data, 16);
-
-	return 0;
-}
-
 int mt7921_mcu_parse_response(struct mt76_dev *mdev, int cmd,
 			      struct sk_buff *skb, int seq)
 {
@@ -187,9 +169,6 @@ int mt7921_mcu_parse_response(struct mt76_dev *mdev, int cmd,
 	case MCU_EXT_CMD_GET_TEMP:
 		skb_pull(skb, sizeof(*rxd) + 4);
 		ret = le32_to_cpu(*(__le32 *)skb->data);
-		break;
-	case MCU_EXT_CMD_EFUSE_ACCESS:
-		ret = mt7921_mcu_parse_eeprom(mdev, skb);
 		break;
 	case MCU_UNI_CMD_DEV_INFO_UPDATE:
 	case MCU_UNI_CMD_BSS_INFO_UPDATE:
