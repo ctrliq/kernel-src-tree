@@ -1,0 +1,222 @@
+Bluetooth: hci_conn: Consolidate code for aborting connections
+
+jira KERNEL-647
+cve CVE-2023-53762
+Rebuild_History Non-Buildable kernel-4.18.0-553.105.1.el8_10
+commit-author Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+commit a13f316e90fdb1fb6df6582e845aa9b3270f3581
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.105.1.el8_10/a13f316e.failed
+
+This consolidates code for aborting connections using
+hci_cmd_sync_queue so it is synchronized with other threads, but
+because of the fact that some commands may block the cmd_sync_queue
+while waiting specific events this attempt to cancel those requests by
+using hci_cmd_sync_cancel.
+
+	Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+(cherry picked from commit a13f316e90fdb1fb6df6582e845aa9b3270f3581)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bluetooth/hci_conn.c
+#	net/bluetooth/hci_sync.c
+diff --cc net/bluetooth/hci_conn.c
+index e964f0d46df4,fa9236dfba3e..000000000000
+--- a/net/bluetooth/hci_conn.c
++++ b/net/bluetooth/hci_conn.c
+@@@ -154,64 -169,15 +154,13 @@@ static void hci_conn_cleanup(struct hci
+  			hdev->notify(hdev, HCI_NOTIFY_CONN_DEL);
+  	}
+  
+ -	hci_conn_del_sysfs(conn);
+ -
+  	debugfs_remove_recursive(conn->debugfs);
+  
+ -	hci_dev_put(hdev);
+ +	hci_conn_del_sysfs(conn);
+  
+ -	hci_conn_put(conn);
+ +	hci_dev_put(hdev);
+  }
+  
+- static void le_scan_cleanup(struct work_struct *work)
+- {
+- 	struct hci_conn *conn = container_of(work, struct hci_conn,
+- 					     le_scan_cleanup);
+- 	struct hci_dev *hdev = conn->hdev;
+- 	struct hci_conn *c = NULL;
+- 
+- 	BT_DBG("%s hcon %p", hdev->name, conn);
+- 
+- 	hci_dev_lock(hdev);
+- 
+- 	/* Check that the hci_conn is still around */
+- 	rcu_read_lock();
+- 	list_for_each_entry_rcu(c, &hdev->conn_hash.list, list) {
+- 		if (c == conn)
+- 			break;
+- 	}
+- 	rcu_read_unlock();
+- 
+- 	if (c == conn) {
+- 		hci_connect_le_scan_cleanup(conn, 0x00);
+- 		hci_conn_cleanup(conn);
+- 	}
+- 
+- 	hci_dev_unlock(hdev);
+- 	hci_dev_put(hdev);
+- 	hci_conn_put(conn);
+- }
+- 
+- static void hci_connect_le_scan_remove(struct hci_conn *conn)
+- {
+- 	BT_DBG("%s hcon %p", conn->hdev->name, conn);
+- 
+- 	/* We can't call hci_conn_del/hci_conn_cleanup here since that
+- 	 * could deadlock with another hci_conn_del() call that's holding
+- 	 * hci_dev_lock and doing cancel_delayed_work_sync(&conn->disc_work).
+- 	 * Instead, grab temporary extra references to the hci_dev and
+- 	 * hci_conn and perform the necessary cleanup in a separate work
+- 	 * callback.
+- 	 */
+- 
+- 	hci_dev_hold(conn->hdev);
+- 	hci_conn_get(conn);
+- 
+- 	/* Even though we hold a reference to the hdev, many other
+- 	 * things might get cleaned up meanwhile, including the hdev's
+- 	 * own workqueue, so we can't use that for scheduling.
+- 	 */
+- 	schedule_work(&conn->le_scan_cleanup);
+- }
+- 
+  static void hci_acl_create_connection(struct hci_conn *conn)
+  {
+  	struct hci_dev *hdev = conn->hdev;
+@@@ -1799,3 -2828,47 +1740,50 @@@ u32 hci_conn_get_phy(struct hci_conn *c
+  
+  	return phys;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static int abort_conn_sync(struct hci_dev *hdev, void *data)
++ {
++ 	struct hci_conn *conn;
++ 	u16 handle = PTR_ERR(data);
++ 
++ 	conn = hci_conn_hash_lookup_handle(hdev, handle);
++ 	if (!conn)
++ 		return 0;
++ 
++ 	return hci_abort_conn_sync(hdev, conn, conn->abort_reason);
++ }
++ 
++ int hci_abort_conn(struct hci_conn *conn, u8 reason)
++ {
++ 	struct hci_dev *hdev = conn->hdev;
++ 
++ 	/* If abort_reason has already been set it means the connection is
++ 	 * already being aborted so don't attempt to overwrite it.
++ 	 */
++ 	if (conn->abort_reason)
++ 		return 0;
++ 
++ 	bt_dev_dbg(hdev, "handle 0x%2.2x reason 0x%2.2x", conn->handle, reason);
++ 
++ 	conn->abort_reason = reason;
++ 
++ 	/* If the connection is pending check the command opcode since that
++ 	 * might be blocking on hci_cmd_sync_work while waiting its respective
++ 	 * event so we need to hci_cmd_sync_cancel to cancel it.
++ 	 */
++ 	if (conn->state == BT_CONNECT && hdev->req_status == HCI_REQ_PEND) {
++ 		switch (hci_skb_event(hdev->sent_cmd)) {
++ 		case HCI_EV_LE_CONN_COMPLETE:
++ 		case HCI_EV_LE_ENHANCED_CONN_COMPLETE:
++ 		case HCI_EVT_LE_CIS_ESTABLISHED:
++ 			hci_cmd_sync_cancel(hdev, -ECANCELED);
++ 			break;
++ 		}
++ 	}
++ 
++ 	return hci_cmd_sync_queue(hdev, abort_conn_sync, ERR_PTR(conn->handle),
++ 				  NULL);
++ }
+++>>>>>>> a13f316e90fd (Bluetooth: hci_conn: Consolidate code for aborting connections)
+diff --cc net/bluetooth/hci_sync.c
+index c253d8b90d40,5f7a901709b5..000000000000
+--- a/net/bluetooth/hci_sync.c
++++ b/net/bluetooth/hci_sync.c
+@@@ -4368,19 -5274,27 +4368,30 @@@ static int hci_disconnect_sync(struct h
+  }
+  
+  static int hci_le_connect_cancel_sync(struct hci_dev *hdev,
+- 				      struct hci_conn *conn)
++ 				      struct hci_conn *conn, u8 reason)
+  {
++ 	/* Return reason if scanning since the connection shall probably be
++ 	 * cleanup directly.
++ 	 */
+  	if (test_bit(HCI_CONN_SCANNING, &conn->flags))
++ 		return reason;
++ 
+++<<<<<<< HEAD
+++=======
++ 	if (conn->role == HCI_ROLE_SLAVE ||
++ 	    test_and_set_bit(HCI_CONN_CANCEL, &conn->flags))
+  		return 0;
+  
+++>>>>>>> a13f316e90fd (Bluetooth: hci_conn: Consolidate code for aborting connections)
+  	return __hci_cmd_sync_status(hdev, HCI_OP_LE_CREATE_CONN_CANCEL,
+ -				     0, NULL, HCI_CMD_TIMEOUT);
+ +				     6, &conn->dst, HCI_CMD_TIMEOUT);
+  }
+  
+- static int hci_connect_cancel_sync(struct hci_dev *hdev, struct hci_conn *conn)
++ static int hci_connect_cancel_sync(struct hci_dev *hdev, struct hci_conn *conn,
++ 				   u8 reason)
+  {
+  	if (conn->type == LE_LINK)
+- 		return hci_le_connect_cancel_sync(hdev, conn);
++ 		return hci_le_connect_cancel_sync(hdev, conn, reason);
+  
+  	if (hdev->hci_ver < BLUETOOTH_VER_1_2)
+  		return 0;
+@@@ -5326,6 -6264,9 +5339,12 @@@ int hci_le_create_conn_sync(struct hci_
+  				       conn->conn_timeout, NULL);
+  
+  done:
+++<<<<<<< HEAD
+++=======
++ 	if (err == -ETIMEDOUT)
++ 		hci_le_connect_cancel_sync(hdev, conn, 0x00);
++ 
+++>>>>>>> a13f316e90fd (Bluetooth: hci_conn: Consolidate code for aborting connections)
+  	/* Re-enable advertising after the connection attempt is finished. */
+  	hci_resume_advertising_sync(hdev);
+  	return err;
+diff --git a/include/net/bluetooth/hci_core.h b/include/net/bluetooth/hci_core.h
+index e5c6e75dec07..10500f7a3747 100644
+--- a/include/net/bluetooth/hci_core.h
++++ b/include/net/bluetooth/hci_core.h
+@@ -696,6 +696,7 @@ struct hci_conn {
+ 	unsigned long	flags;
+ 
+ 	enum conn_reasons conn_reason;
++	__u8		abort_reason;
+ 
+ 	__u32		clock;
+ 	__u16		clock_accuracy;
+@@ -715,7 +716,6 @@ struct hci_conn {
+ 	struct delayed_work auto_accept_work;
+ 	struct delayed_work idle_work;
+ 	struct delayed_work le_conn_timeout;
+-	struct work_struct  le_scan_cleanup;
+ 
+ 	struct device	dev;
+ 	struct dentry	*debugfs;
+* Unmerged path net/bluetooth/hci_conn.c
+* Unmerged path net/bluetooth/hci_sync.c

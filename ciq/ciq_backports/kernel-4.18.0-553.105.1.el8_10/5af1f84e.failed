@@ -1,0 +1,110 @@
+Bluetooth: hci_sync: Fix UAF on hci_abort_conn_sync
+
+jira KERNEL-647
+cve CVE-2023-53762
+Rebuild_History Non-Buildable kernel-4.18.0-553.105.1.el8_10
+commit-author Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+commit 5af1f84ed13a416297ab9ced7537f4d5ae7f329a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.105.1.el8_10/5af1f84e.failed
+
+Connections may be cleanup while waiting for the commands to complete so
+this attempts to check if the connection handle remains valid in case of
+errors that would lead to call hci_conn_failed:
+
+BUG: KASAN: slab-use-after-free in hci_conn_failed+0x1f/0x160
+Read of size 8 at addr ffff888001376958 by task kworker/u3:0/52
+
+CPU: 0 PID: 52 Comm: kworker/u3:0 Not tainted
+6.5.0-rc1-00527-g2dfe76d58d3a #5615
+Hardware name: QEMU Standard PC (Q35 + ICH9, 2009), BIOS
+1.16.2-1.fc38 04/01/2014
+Workqueue: hci0 hci_cmd_sync_work
+Call Trace:
+ <TASK>
+ dump_stack_lvl+0x1d/0x70
+ print_report+0xce/0x620
+ ? __virt_addr_valid+0xd4/0x150
+ ? hci_conn_failed+0x1f/0x160
+ kasan_report+0xd1/0x100
+ ? hci_conn_failed+0x1f/0x160
+ hci_conn_failed+0x1f/0x160
+ hci_abort_conn_sync+0x237/0x360
+
+	Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+(cherry picked from commit 5af1f84ed13a416297ab9ced7537f4d5ae7f329a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bluetooth/hci_sync.c
+diff --cc net/bluetooth/hci_sync.c
+index c253d8b90d40,ec8929e79502..000000000000
+--- a/net/bluetooth/hci_sync.c
++++ b/net/bluetooth/hci_sync.c
+@@@ -4431,26 -5395,46 +4432,61 @@@ int hci_abort_conn_sync(struct hci_dev 
+  	switch (conn->state) {
+  	case BT_CONNECTED:
+  	case BT_CONFIG:
+- 		return hci_disconnect_sync(hdev, conn, reason);
++ 		err = hci_disconnect_sync(hdev, conn, reason);
++ 		break;
+  	case BT_CONNECT:
+++<<<<<<< HEAD
+ +		err = hci_connect_cancel_sync(hdev, conn);
+ +		/* Cleanup hci_conn object if it cannot be cancelled as it
+ +		 * likelly means the controller and host stack are out of sync.
+ +		 */
+ +		if (err) {
+ +			hci_dev_lock(hdev);
+ +			hci_conn_failed(conn, err);
+ +			hci_dev_unlock(hdev);
+ +		}
+ +		return err;
+ +	case BT_CONNECT2:
+ +		return hci_reject_conn_sync(hdev, conn, reason);
+++=======
++ 		err = hci_connect_cancel_sync(hdev, conn, reason);
++ 		break;
++ 	case BT_CONNECT2:
++ 		err = hci_reject_conn_sync(hdev, conn, reason);
++ 		break;
++ 	case BT_OPEN:
++ 	case BT_BOUND:
++ 		hci_dev_lock(hdev);
++ 		hci_conn_failed(conn, reason);
++ 		hci_dev_unlock(hdev);
++ 		return 0;
+++>>>>>>> 5af1f84ed13a (Bluetooth: hci_sync: Fix UAF on hci_abort_conn_sync)
+  	default:
+  		conn->state = BT_CLOSED;
+- 		break;
++ 		return 0;
+  	}
+  
+- 	return 0;
++ 	/* Cleanup hci_conn object if it cannot be cancelled as it
++ 	 * likelly means the controller and host stack are out of sync
++ 	 * or in case of LE it was still scanning so it can be cleanup
++ 	 * safely.
++ 	 */
++ 	if (err) {
++ 		struct hci_conn *c;
++ 
++ 		/* Check if the connection hasn't been cleanup while waiting
++ 		 * commands to complete.
++ 		 */
++ 		c = hci_conn_hash_lookup_handle(hdev, handle);
++ 		if (!c || c != conn)
++ 			return 0;
++ 
++ 		hci_dev_lock(hdev);
++ 		hci_conn_failed(conn, err);
++ 		hci_dev_unlock(hdev);
++ 	}
++ 
++ 	return err;
+  }
+  
+  static int hci_disconnect_all_sync(struct hci_dev *hdev, u8 reason)
+* Unmerged path net/bluetooth/hci_sync.c
