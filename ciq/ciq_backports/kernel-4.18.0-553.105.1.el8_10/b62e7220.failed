@@ -1,0 +1,186 @@
+Bluetooth: Fix printing errors if LE Connection times out
+
+jira KERNEL-647
+cve CVE-2023-53762
+Rebuild_History Non-Buildable kernel-4.18.0-553.105.1.el8_10
+commit-author Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+commit b62e72200eaad523f08d8319bba50fc652e032a8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.105.1.el8_10/b62e7220.failed
+
+This fixes errors like bellow when LE Connection times out since that
+is actually not a controller error:
+
+ Bluetooth: hci0: Opcode 0x200d failed: -110
+ Bluetooth: hci0: request failed to create LE connection: err -110
+
+Instead the code shall properly detect if -ETIMEDOUT is returned and
+send HCI_OP_LE_CREATE_CONN_CANCEL to give up on the connection.
+
+Link: https://github.com/bluez/bluez/issues/340
+Fixes: 8e8b92ee60de ("Bluetooth: hci_sync: Add hci_le_create_conn_sync")
+	Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+(cherry picked from commit b62e72200eaad523f08d8319bba50fc652e032a8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bluetooth/hci_conn.c
+#	net/bluetooth/hci_sync.c
+diff --cc net/bluetooth/hci_conn.c
+index e964f0d46df4,e4aee5950c36..000000000000
+--- a/net/bluetooth/hci_conn.c
++++ b/net/bluetooth/hci_conn.c
+@@@ -1799,3 -2766,82 +1799,85 @@@ u32 hci_conn_get_phy(struct hci_conn *c
+  
+  	return phys;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ int hci_abort_conn(struct hci_conn *conn, u8 reason)
++ {
++ 	int r = 0;
++ 
++ 	if (test_and_set_bit(HCI_CONN_CANCEL, &conn->flags))
++ 		return 0;
++ 
++ 	switch (conn->state) {
++ 	case BT_CONNECTED:
++ 	case BT_CONFIG:
++ 		if (conn->type == AMP_LINK) {
++ 			struct hci_cp_disconn_phy_link cp;
++ 
++ 			cp.phy_handle = HCI_PHY_HANDLE(conn->handle);
++ 			cp.reason = reason;
++ 			r = hci_send_cmd(conn->hdev, HCI_OP_DISCONN_PHY_LINK,
++ 					 sizeof(cp), &cp);
++ 		} else {
++ 			struct hci_cp_disconnect dc;
++ 
++ 			dc.handle = cpu_to_le16(conn->handle);
++ 			dc.reason = reason;
++ 			r = hci_send_cmd(conn->hdev, HCI_OP_DISCONNECT,
++ 					 sizeof(dc), &dc);
++ 		}
++ 
++ 		conn->state = BT_DISCONN;
++ 
++ 		break;
++ 	case BT_CONNECT:
++ 		if (conn->type == LE_LINK) {
++ 			if (test_bit(HCI_CONN_SCANNING, &conn->flags))
++ 				break;
++ 			r = hci_send_cmd(conn->hdev,
++ 					 HCI_OP_LE_CREATE_CONN_CANCEL, 0, NULL);
++ 		} else if (conn->type == ACL_LINK) {
++ 			if (conn->hdev->hci_ver < BLUETOOTH_VER_1_2)
++ 				break;
++ 			r = hci_send_cmd(conn->hdev,
++ 					 HCI_OP_CREATE_CONN_CANCEL,
++ 					 6, &conn->dst);
++ 		}
++ 		break;
++ 	case BT_CONNECT2:
++ 		if (conn->type == ACL_LINK) {
++ 			struct hci_cp_reject_conn_req rej;
++ 
++ 			bacpy(&rej.bdaddr, &conn->dst);
++ 			rej.reason = reason;
++ 
++ 			r = hci_send_cmd(conn->hdev,
++ 					 HCI_OP_REJECT_CONN_REQ,
++ 					 sizeof(rej), &rej);
++ 		} else if (conn->type == SCO_LINK || conn->type == ESCO_LINK) {
++ 			struct hci_cp_reject_sync_conn_req rej;
++ 
++ 			bacpy(&rej.bdaddr, &conn->dst);
++ 
++ 			/* SCO rejection has its own limited set of
++ 			 * allowed error values (0x0D-0x0F) which isn't
++ 			 * compatible with most values passed to this
++ 			 * function. To be safe hard-code one of the
++ 			 * values that's suitable for SCO.
++ 			 */
++ 			rej.reason = HCI_ERROR_REJ_LIMITED_RESOURCES;
++ 
++ 			r = hci_send_cmd(conn->hdev,
++ 					 HCI_OP_REJECT_SYNC_CONN_REQ,
++ 					 sizeof(rej), &rej);
++ 		}
++ 		break;
++ 	default:
++ 		conn->state = BT_CLOSED;
++ 		break;
++ 	}
++ 
++ 	return r;
++ }
+++>>>>>>> b62e72200eaa (Bluetooth: Fix printing errors if LE Connection times out)
+diff --cc net/bluetooth/hci_sync.c
+index c253d8b90d40,632be1267288..000000000000
+--- a/net/bluetooth/hci_sync.c
++++ b/net/bluetooth/hci_sync.c
+@@@ -245,8 -246,9 +245,14 @@@ int __hci_cmd_sync_status_sk(struct hci
+  
+  	skb = __hci_cmd_sync_sk(hdev, opcode, plen, param, event, timeout, sk);
+  	if (IS_ERR(skb)) {
+++<<<<<<< HEAD
+ +		bt_dev_err(hdev, "Opcode 0x%4x failed: %ld", opcode,
+ +			   PTR_ERR(skb));
+++=======
++ 		if (!event)
++ 			bt_dev_err(hdev, "Opcode 0x%4x failed: %ld", opcode,
++ 				   PTR_ERR(skb));
+++>>>>>>> b62e72200eaa (Bluetooth: Fix printing errors if LE Connection times out)
+  		return PTR_ERR(skb);
+  	}
+  
+diff --git a/include/net/bluetooth/hci_core.h b/include/net/bluetooth/hci_core.h
+index e5c6e75dec07..c36b1bdf73e6 100644
+--- a/include/net/bluetooth/hci_core.h
++++ b/include/net/bluetooth/hci_core.h
+@@ -898,6 +898,7 @@ enum {
+ 	HCI_CONN_STK_ENCRYPT,
+ 	HCI_CONN_AUTH_INITIATOR,
+ 	HCI_CONN_DROP,
++	HCI_CONN_CANCEL,
+ 	HCI_CONN_PARAM_REMOVAL_PEND,
+ 	HCI_CONN_NEW_LINK_KEY,
+ 	HCI_CONN_SCANNING,
+* Unmerged path net/bluetooth/hci_conn.c
+diff --git a/net/bluetooth/hci_event.c b/net/bluetooth/hci_event.c
+index 1b9fbbe71689..9c090c5bedd8 100644
+--- a/net/bluetooth/hci_event.c
++++ b/net/bluetooth/hci_event.c
+@@ -2873,16 +2873,6 @@ static void cs_le_create_conn(struct hci_dev *hdev, bdaddr_t *peer_addr,
+ 
+ 	conn->resp_addr_type = peer_addr_type;
+ 	bacpy(&conn->resp_addr, peer_addr);
+-
+-	/* We don't want the connection attempt to stick around
+-	 * indefinitely since LE doesn't have a page timeout concept
+-	 * like BR/EDR. Set a timer for any connection that doesn't use
+-	 * the accept list for connecting.
+-	 */
+-	if (filter_policy == HCI_LE_USE_PEER_ADDR)
+-		queue_delayed_work(conn->hdev->workqueue,
+-				   &conn->le_conn_timeout,
+-				   conn->conn_timeout);
+ }
+ 
+ static void hci_cs_le_create_conn(struct hci_dev *hdev, u8 status)
+@@ -5650,6 +5640,12 @@ static void le_conn_complete_evt(struct hci_dev *hdev, u8 status,
+ 	if (status)
+ 		goto unlock;
+ 
++	/* Drop the connection if it has been aborted */
++	if (test_bit(HCI_CONN_CANCEL, &conn->flags)) {
++		hci_conn_drop(conn);
++		goto unlock;
++	}
++
+ 	if (conn->dst_type == ADDR_LE_DEV_PUBLIC)
+ 		addr_type = BDADDR_LE_PUBLIC;
+ 	else
+* Unmerged path net/bluetooth/hci_sync.c
