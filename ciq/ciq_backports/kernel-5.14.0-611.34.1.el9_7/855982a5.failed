@@ -1,0 +1,123 @@
+smb: client: relax session and tcon reconnect attempts
+
+jira KERNEL-660
+Rebuild_History Non-Buildable kernel-5.14.0-611.34.1.el9_7
+commit-author Paulo Alcantara <pc@manguebit.org>
+commit 855982a52ff7d188188f0ecf86c2ce95957202c6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-611.34.1.el9_7/855982a5.failed
+
+When the client re-establishes connection to the server, it will queue
+a worker thread that will attempt to reconnect sessions and tcons on
+every two seconds, which is kinda overkill as it is a very common
+scenario when having expired passwords or KRB5 TGT tickets, or deleted
+shares.
+
+Use an exponential backoff strategy to handle session/tcon reconnect
+attempts in the worker thread to prevent the client from overloading
+the system when it is very unlikely to re-establish any session/tcon
+soon while client is idle.
+
+	Signed-off-by: Paulo Alcantara (Red Hat) <pc@manguebit.org>
+	Reviewed-by: David Howells <dhowells@redhat.com>
+	Cc: Pierguido Lambri <plambri@redhat.com>
+	Cc: linux-cifs@vger.kernel.org
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 855982a52ff7d188188f0ecf86c2ce95957202c6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/smb/client/cifsglob.h
+diff --cc fs/smb/client/cifsglob.h
+index ed69205386c4,3eca5bfb7030..000000000000
+--- a/fs/smb/client/cifsglob.h
++++ b/fs/smb/client/cifsglob.h
+@@@ -2420,4 -2287,30 +2421,33 @@@ static inline bool cifs_netbios_name(co
+  	 (le32_to_cpu((tcon)->fsAttrInfo.Attributes) & \
+  	  FILE_SUPPORTS_REPARSE_POINTS))
+  
+++<<<<<<< HEAD
+++=======
++ struct cifs_calc_sig_ctx {
++ 	struct md5_ctx *md5;
++ 	struct hmac_sha256_ctx *hmac;
++ 	struct shash_desc *shash;
++ };
++ 
++ #define CIFS_RECONN_DELAY_SECS	30
++ #define CIFS_MAX_RECONN_DELAY	(4 * CIFS_RECONN_DELAY_SECS)
++ 
++ static inline void cifs_queue_server_reconn(struct TCP_Server_Info *server)
++ {
++ 	if (!delayed_work_pending(&server->reconnect)) {
++ 		WRITE_ONCE(server->reconn_delay, 0);
++ 		mod_delayed_work(cifsiod_wq, &server->reconnect, 0);
++ 	}
++ }
++ 
++ static inline void cifs_requeue_server_reconn(struct TCP_Server_Info *server)
++ {
++ 	unsigned long delay = READ_ONCE(server->reconn_delay);
++ 
++ 	delay = umin(delay + CIFS_RECONN_DELAY_SECS, CIFS_MAX_RECONN_DELAY);
++ 	WRITE_ONCE(server->reconn_delay, delay);
++ 	queue_delayed_work(cifsiod_wq, &server->reconnect, delay * HZ);
++ }
++ 
+++>>>>>>> 855982a52ff7 (smb: client: relax session and tcon reconnect attempts)
+  #endif	/* _CIFS_GLOB_H */
+* Unmerged path fs/smb/client/cifsglob.h
+diff --git a/fs/smb/client/connect.c b/fs/smb/client/connect.c
+index 56933591fda9..6df5aea630f5 100644
+--- a/fs/smb/client/connect.c
++++ b/fs/smb/client/connect.c
+@@ -429,7 +429,7 @@ static int __cifs_reconnect(struct TCP_Server_Info *server,
+ 			spin_unlock(&server->srv_lock);
+ 			cifs_swn_reset_server_dstaddr(server);
+ 			cifs_server_unlock(server);
+-			mod_delayed_work(cifsiod_wq, &server->reconnect, 0);
++			cifs_queue_server_reconn(server);
+ 		}
+ 	} while (server->tcpStatus == CifsNeedReconnect);
+ 
+@@ -568,7 +568,7 @@ static int reconnect_dfs_server(struct TCP_Server_Info *server)
+ 		spin_unlock(&server->srv_lock);
+ 		cifs_swn_reset_server_dstaddr(server);
+ 		cifs_server_unlock(server);
+-		mod_delayed_work(cifsiod_wq, &server->reconnect, 0);
++		cifs_queue_server_reconn(server);
+ 	} while (server->tcpStatus == CifsNeedReconnect);
+ 
+ 	dfs_cache_noreq_update_tgthint(ref_path, target_hint);
+diff --git a/fs/smb/client/smb2pdu.c b/fs/smb/client/smb2pdu.c
+index 7310dc74adfc..daefc1d78256 100644
+--- a/fs/smb/client/smb2pdu.c
++++ b/fs/smb/client/smb2pdu.c
+@@ -460,7 +460,7 @@ smb2_reconnect(__le16 smb2_command, struct cifs_tcon *tcon,
+ 	spin_unlock(&ses->ses_lock);
+ 
+ 	if (smb2_command != SMB2_INTERNAL_CMD)
+-		mod_delayed_work(cifsiod_wq, &server->reconnect, 0);
++		cifs_queue_server_reconn(server);
+ 
+ 	atomic_inc(&tconInfoReconnectCount);
+ out:
+@@ -4243,7 +4243,7 @@ void smb2_reconnect_server(struct work_struct *work)
+ done:
+ 	cifs_dbg(FYI, "Reconnecting tcons and channels finished\n");
+ 	if (resched)
+-		queue_delayed_work(cifsiod_wq, &server->reconnect, 2 * HZ);
++		cifs_requeue_server_reconn(server);
+ 	mutex_unlock(&pserver->reconnect_mutex);
+ 
+ 	/* now we can safely release srv struct */
+@@ -4267,7 +4267,7 @@ SMB2_echo(struct TCP_Server_Info *server)
+ 	    server->ops->need_neg(server)) {
+ 		spin_unlock(&server->srv_lock);
+ 		/* No need to send echo on newly established connections */
+-		mod_delayed_work(cifsiod_wq, &server->reconnect, 0);
++		cifs_queue_server_reconn(server);
+ 		return rc;
+ 	}
+ 	spin_unlock(&server->srv_lock);
