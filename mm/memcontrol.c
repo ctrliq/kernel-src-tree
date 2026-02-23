@@ -700,12 +700,12 @@ static int memcg_state_val_in_pages(int idx, int val)
 static __always_inline struct mem_cgroup *
 percpu_stats_memcg(struct mem_cgroup *memcg, struct mem_cgroup_per_node **pn)
 {
-	if (likely(!memcg->percpu_stats_disabled))
+	if (likely(!READ_ONCE(memcg->percpu_stats_disabled)))
 		return memcg;
 
 	do {
 		memcg = parent_mem_cgroup(memcg);
-	} while (memcg->percpu_stats_disabled);
+	} while (READ_ONCE(memcg->percpu_stats_disabled));
 
 	if (pn) {
 		unsigned int nid = (*pn)->nid;
@@ -3627,6 +3627,7 @@ fail:
  */
 static void percpu_stats_free_rwork_fn(struct work_struct *work)
 {
+	extern void css_rstat_barrier(struct cgroup_subsys_state *css);
 	struct mem_cgroup *memcg = container_of(to_rcu_work(work),
 						struct mem_cgroup,
 						percpu_stats_rwork);
@@ -3643,9 +3644,14 @@ static void percpu_stats_free_rwork_fn(struct work_struct *work)
 		return;
 	}
 
-	cgroup_rstat_flush_hold(memcg->css.cgroup);
+	css_rstat_flush(&memcg->css);
 	WRITE_ONCE(memcg->percpu_stats_disabled, PERCPU_STATS_FLUSHED);
-	cgroup_rstat_flush_release(memcg->css.cgroup);
+	/*
+	 * Insert a barrier to ensure that all future css_rstat_flush()
+	 * operations will see the updated PERCPU_STATS_FLUSHED before freeing
+	 * the percpu stats. This is needed to prevent UAF (Use-After-Free).
+	 */
+	css_rstat_barrier(&memcg->css);
 
 	for_each_node(node) {
 		struct mem_cgroup_per_node *pn = memcg->nodeinfo[node];
@@ -3667,14 +3673,14 @@ static void memcg_percpu_stats_disable(struct mem_cgroup *memcg)
 	 */
 	css_get(&memcg->css);
 	mem_cgroup_id_put(memcg);
-	memcg->percpu_stats_disabled = PERCPU_STATS_DISABLED;
+	WRITE_ONCE(memcg->percpu_stats_disabled, PERCPU_STATS_DISABLED);
 	INIT_RCU_WORK(&memcg->percpu_stats_rwork, percpu_stats_free_rwork_fn);
 	queue_rcu_work(system_wq, &memcg->percpu_stats_rwork);
 }
 
 static inline bool memcg_percpu_stats_flushed(struct mem_cgroup *memcg)
 {
-	return memcg->percpu_stats_disabled >= PERCPU_STATS_FLUSHED;
+	return READ_ONCE(memcg->percpu_stats_disabled) >= PERCPU_STATS_FLUSHED;
 }
 
 static struct cgroup_subsys_state * __ref

@@ -648,3 +648,10 @@ static int __init bpf_rstat_kfunc_init(void)
 					 &bpf_rstat_kfunc_set);
 }
 late_initcall(bpf_rstat_kfunc_init);
+
+extern void css_rstat_barrier(struct cgroup_subsys_state *css);
+void css_rstat_barrier(struct cgroup_subsys_state *css)
+{
+	__css_rstat_lock(css, -1);
+	__css_rstat_unlock(css, -1);
+}
