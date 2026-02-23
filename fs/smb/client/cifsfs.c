@@ -1117,7 +1117,7 @@ static ssize_t cifs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 			cifs_dbg(FYI,
 				 "Set no oplock for inode=%p after a write operation\n",
 				 inode);
-			cinode->oplock = 0;
+			cifs_reset_oplock(cinode);
 		}
 		return written;
 	}

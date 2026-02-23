@@ -1148,6 +1148,7 @@ smb2_set_ea(const unsigned int xid, struct cifs_tcon *tcon,
 
 replay_again:
 	/* reinitialize for possible replay */
+	used_len = 0;
 	flags = CIFS_CP_CREATE_CLOSE_OP;
 	oplock = SMB2_OPLOCK_LEVEL_NONE;
 	server = cifs_pick_channel(ses);
@@ -1420,6 +1421,8 @@ smb2_set_fid(struct cifsFileInfo *cfile, struct cifs_fid *fid, __u32 oplock)
 	struct cifsInodeInfo *cinode = CIFS_I(d_inode(cfile->dentry));
 	struct TCP_Server_Info *server = tlink_tcon(cfile->tlink)->ses->server;
 
+	lockdep_assert_held(&cinode->open_file_lock);
+
 	cfile->fid.persistent_fid = fid->persistent_fid;
 	cfile->fid.volatile_fid = fid->volatile_fid;
 	cfile->fid.access = fid->access;
@@ -1544,6 +1547,7 @@ smb2_ioctl_query_info(const unsigned int xid,
 
 replay_again:
 	/* reinitialize for possible replay */
+	buffer = NULL;
 	flags = CIFS_CP_CREATE_CLOSE_OP;
 	oplock = SMB2_OPLOCK_LEVEL_NONE;
 	server = cifs_pick_channel(ses);
@@ -2629,16 +2633,19 @@ smb2_is_network_name_deleted(char *buf, struct TCP_Server_Info *server)
 	return false;
 }
 
-static int
-smb2_oplock_response(struct cifs_tcon *tcon, __u64 persistent_fid,
-		__u64 volatile_fid, __u16 net_fid, struct cifsInodeInfo *cinode)
+static int smb2_oplock_response(struct cifs_tcon *tcon, __u64 persistent_fid,
+				__u64 volatile_fid, __u16 net_fid,
+				struct cifsInodeInfo *cinode, unsigned int oplock)
 {
+	unsigned int sbflags = CIFS_SB(cinode->netfs.inode.i_sb)->mnt_cifs_flags;
+	__u8 op;
+
 	if (tcon->ses->server->capabilities & SMB2_GLOBAL_CAP_LEASING)
 		return SMB2_lease_break(0, tcon, cinode->lease_key,
-					smb2_get_lease_state(cinode));
+					smb2_get_lease_state(cinode, oplock));
 
-	return SMB2_oplock_break(0, tcon, persistent_fid, volatile_fid,
-				 CIFS_CACHE_READ(cinode) ? 1 : 0);
+	op = !!((oplock & CIFS_CACHE_READ_FLG) || (sbflags & CIFS_MOUNT_RO_CACHE));
+	return SMB2_oplock_break(0, tcon, persistent_fid, volatile_fid, op);
 }
 
 void
@@ -3114,8 +3121,6 @@ smb2_get_dfs_refer(const unsigned int xid, struct cifs_ses *ses,
 	if (tcon && !tcon->ipc) {
 		/* ipc tcons are not refcounted */
 		cifs_put_tcon(tcon, netfs_trace_tcon_ref_put_dfs_refer);
-		trace_smb3_tcon_ref(tcon->debug_id, tcon->tc_count,
-				    netfs_trace_tcon_ref_dec_dfs_refer);
 	}
 	kfree(utf16_path);
 	kfree(dfs_req);
@@ -3981,6 +3986,7 @@ smb2_downgrade_oplock(struct TCP_Server_Info *server,
 		      struct cifsInodeInfo *cinode, __u32 oplock,
 		      __u16 epoch, bool *purge_cache)
 {
+	lockdep_assert_held(&cinode->open_file_lock);
 	server->ops->set_oplock_level(cinode, oplock, 0, NULL);
 }
 
@@ -4021,19 +4027,19 @@ smb2_set_oplock_level(struct cifsInodeInfo *cinode, __u32 oplock,
 	if (oplock == SMB2_OPLOCK_LEVEL_NOCHANGE)
 		return;
 	if (oplock == SMB2_OPLOCK_LEVEL_BATCH) {
-		cinode->oplock = CIFS_CACHE_RHW_FLG;
+		WRITE_ONCE(cinode->oplock, CIFS_CACHE_RHW_FLG);
 		cifs_dbg(FYI, "Batch Oplock granted on inode %p\n",
 			 &cinode->netfs.inode);
 	} else if (oplock == SMB2_OPLOCK_LEVEL_EXCLUSIVE) {
-		cinode->oplock = CIFS_CACHE_RW_FLG;
+		WRITE_ONCE(cinode->oplock, CIFS_CACHE_RW_FLG);
 		cifs_dbg(FYI, "Exclusive Oplock granted on inode %p\n",
 			 &cinode->netfs.inode);
 	} else if (oplock == SMB2_OPLOCK_LEVEL_II) {
-		cinode->oplock = CIFS_CACHE_READ_FLG;
+		WRITE_ONCE(cinode->oplock, CIFS_CACHE_READ_FLG);
 		cifs_dbg(FYI, "Level II Oplock granted on inode %p\n",
 			 &cinode->netfs.inode);
 	} else
-		cinode->oplock = 0;
+		WRITE_ONCE(cinode->oplock, 0);
 }
 
 static void
@@ -4068,7 +4074,7 @@ smb21_set_oplock_level(struct cifsInodeInfo *cinode, __u32 oplock,
 	if (!new_oplock)
 		strncpy(message, "None", sizeof(message));
 
-	cinode->oplock = new_oplock;
+	WRITE_ONCE(cinode->oplock, new_oplock);
 	cifs_dbg(FYI, "%s Lease granted on inode %p\n", message,
 		 &cinode->netfs.inode);
 }
@@ -4077,30 +4083,32 @@ static void
 smb3_set_oplock_level(struct cifsInodeInfo *cinode, __u32 oplock,
 		      __u16 epoch, bool *purge_cache)
 {
-	unsigned int old_oplock = cinode->oplock;
+	unsigned int old_oplock = READ_ONCE(cinode->oplock);
+	unsigned int new_oplock;
 
 	smb21_set_oplock_level(cinode, oplock, epoch, purge_cache);
+	new_oplock = READ_ONCE(cinode->oplock);
 
 	if (purge_cache) {
 		*purge_cache = false;
 		if (old_oplock == CIFS_CACHE_READ_FLG) {
-			if (cinode->oplock == CIFS_CACHE_READ_FLG &&
+			if (new_oplock == CIFS_CACHE_READ_FLG &&
 			    (epoch - cinode->epoch > 0))
 				*purge_cache = true;
-			else if (cinode->oplock == CIFS_CACHE_RH_FLG &&
+			else if (new_oplock == CIFS_CACHE_RH_FLG &&
 				 (epoch - cinode->epoch > 1))
 				*purge_cache = true;
-			else if (cinode->oplock == CIFS_CACHE_RHW_FLG &&
+			else if (new_oplock == CIFS_CACHE_RHW_FLG &&
 				 (epoch - cinode->epoch > 1))
 				*purge_cache = true;
-			else if (cinode->oplock == 0 &&
+			else if (new_oplock == 0 &&
 				 (epoch - cinode->epoch > 0))
 				*purge_cache = true;
 		} else if (old_oplock == CIFS_CACHE_RH_FLG) {
-			if (cinode->oplock == CIFS_CACHE_RH_FLG &&
+			if (new_oplock == CIFS_CACHE_RH_FLG &&
 			    (epoch - cinode->epoch > 0))
 				*purge_cache = true;
-			else if (cinode->oplock == CIFS_CACHE_RHW_FLG &&
+			else if (new_oplock == CIFS_CACHE_RHW_FLG &&
 				 (epoch - cinode->epoch > 1))
 				*purge_cache = true;
 		}
