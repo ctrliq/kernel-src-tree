@@ -6370,13 +6370,13 @@ static int __init cgroup_wq_init(void)
 	 * We would prefer to do this in cgroup_init() above, but that
 	 * is called before init_workqueues(): so leave this until after.
 	 */
-	cgroup_offline_wq = alloc_workqueue("cgroup_offline", 0, 1);
+	cgroup_offline_wq = alloc_workqueue("cgroup_offline", WQ_PERCPU, 1);
 	BUG_ON(!cgroup_offline_wq);
 
-	cgroup_release_wq = alloc_workqueue("cgroup_release", 0, 1);
+	cgroup_release_wq = alloc_workqueue("cgroup_release", WQ_PERCPU, 1);
 	BUG_ON(!cgroup_release_wq);
 
-	cgroup_free_wq = alloc_workqueue("cgroup_free", 0, 1);
+	cgroup_free_wq = alloc_workqueue("cgroup_free", WQ_PERCPU, 1);
 	BUG_ON(!cgroup_free_wq);
 	return 0;
 }
