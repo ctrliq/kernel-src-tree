@@ -1394,7 +1394,8 @@ static void set_power_ctl_ee_state(bool input)
 {
 	u64 power_ctl;
 
-	mutex_lock(&intel_pstate_driver_lock);
+	guard(mutex)(&intel_pstate_driver_lock);
+
 	rdmsrl(MSR_IA32_POWER_CTL, power_ctl);
 	if (input) {
 		power_ctl &= ~BIT(MSR_IA32_POWER_CTL_BIT_EE);
@@ -1404,7 +1405,6 @@ static void set_power_ctl_ee_state(bool input)
 		power_ctl_ee_state = POWER_CTL_EE_DISABLE;
 	}
 	wrmsrl(MSR_IA32_POWER_CTL, power_ctl);
-	mutex_unlock(&intel_pstate_driver_lock);
 }
 
 static void intel_pstate_hwp_enable(struct cpudata *cpudata);
@@ -1526,13 +1526,9 @@ static int intel_pstate_update_status(const char *buf, size_t size);
 static ssize_t show_status(struct kobject *kobj,
 			   struct kobj_attribute *attr, char *buf)
 {
-	ssize_t ret;
+	guard(mutex)(&intel_pstate_driver_lock);
 
-	mutex_lock(&intel_pstate_driver_lock);
-	ret = intel_pstate_show_status(buf);
-	mutex_unlock(&intel_pstate_driver_lock);
-
-	return ret;
+	return intel_pstate_show_status(buf);
 }
 
 static ssize_t store_status(struct kobject *a, struct kobj_attribute *b,
@@ -1541,11 +1537,13 @@ static ssize_t store_status(struct kobject *a, struct kobj_attribute *b,
 	char *p = memchr(buf, '\n', count);
 	int ret;
 
-	mutex_lock(&intel_pstate_driver_lock);
-	ret = intel_pstate_update_status(buf, p ? p - buf : count);
-	mutex_unlock(&intel_pstate_driver_lock);
+	guard(mutex)(&intel_pstate_driver_lock);
 
-	return ret < 0 ? ret : count;
+	ret = intel_pstate_update_status(buf, p ? p - buf : count);
+	if (ret < 0)
+		return ret;
+
+	return count;
 }
 
 static ssize_t show_turbo_pct(struct kobject *kobj,
@@ -1555,12 +1553,10 @@ static ssize_t show_turbo_pct(struct kobject *kobj,
 	int total, no_turbo, turbo_pct;
 	uint32_t turbo_fp;
 
-	mutex_lock(&intel_pstate_driver_lock);
+	guard(mutex)(&intel_pstate_driver_lock);
 
-	if (!intel_pstate_driver) {
-		mutex_unlock(&intel_pstate_driver_lock);
+	if (!intel_pstate_driver)
 		return -EAGAIN;
-	}
 
 	cpu = all_cpu_data[0];
 
@@ -1568,8 +1564,6 @@ static ssize_t show_turbo_pct(struct kobject *kobj,
 	no_turbo = cpu->pstate.max_pstate - cpu->pstate.min_pstate + 1;
 	turbo_fp = div_fp(no_turbo, total);
 	turbo_pct = 100 - fp_toint(mul_fp(turbo_fp, int_tofp(100)));
-
-	mutex_unlock(&intel_pstate_driver_lock);
 
 	return sprintf(buf, "%u\n", turbo_pct);
 }
@@ -1580,17 +1574,13 @@ static ssize_t show_num_pstates(struct kobject *kobj,
 	struct cpudata *cpu;
 	int total;
 
-	mutex_lock(&intel_pstate_driver_lock);
+	guard(mutex)(&intel_pstate_driver_lock);
 
-	if (!intel_pstate_driver) {
-		mutex_unlock(&intel_pstate_driver_lock);
+	if (!intel_pstate_driver)
 		return -EAGAIN;
-	}
 
 	cpu = all_cpu_data[0];
 	total = cpu->pstate.turbo_pstate - cpu->pstate.min_pstate + 1;
-
-	mutex_unlock(&intel_pstate_driver_lock);
 
 	return sprintf(buf, "%u\n", total);
 }
@@ -1598,20 +1588,12 @@ static ssize_t show_num_pstates(struct kobject *kobj,
 static ssize_t show_no_turbo(struct kobject *kobj,
 			     struct kobj_attribute *attr, char *buf)
 {
-	ssize_t ret;
+	guard(mutex)(&intel_pstate_driver_lock);
 
-	mutex_lock(&intel_pstate_driver_lock);
-
-	if (!intel_pstate_driver) {
-		mutex_unlock(&intel_pstate_driver_lock);
+	if (!intel_pstate_driver)
 		return -EAGAIN;
-	}
 
-	ret = sprintf(buf, "%u\n", global.no_turbo);
-
-	mutex_unlock(&intel_pstate_driver_lock);
-
-	return ret;
+	return sprintf(buf, "%u\n", global.no_turbo);
 }
 
 static ssize_t store_no_turbo(struct kobject *a, struct kobj_attribute *b,
@@ -1623,28 +1605,24 @@ static ssize_t store_no_turbo(struct kobject *a, struct kobj_attribute *b,
 	if (sscanf(buf, "%u", &input) != 1)
 		return -EINVAL;
 
-	mutex_lock(&intel_pstate_driver_lock);
+	guard(mutex)(&intel_pstate_driver_lock);
 
-	if (!intel_pstate_driver) {
-		count = -EAGAIN;
-		goto unlock_driver;
-	}
+	if (!intel_pstate_driver)
+		return -EAGAIN;
 
 	no_turbo = !!clamp_t(int, input, 0, 1);
 
 	WRITE_ONCE(global.turbo_disabled, turbo_is_disabled());
 	if (global.turbo_disabled && !no_turbo) {
 		pr_notice("Turbo disabled by BIOS or unavailable on processor\n");
-		count = -EPERM;
 		if (global.no_turbo)
-			goto unlock_driver;
-		else
-			no_turbo = 1;
+			return -EPERM;
+
+		no_turbo = 1;
 	}
 
-	if (no_turbo == global.no_turbo) {
-		goto unlock_driver;
-	}
+	if (no_turbo == global.no_turbo)
+		return count;
 
 	WRITE_ONCE(global.no_turbo, no_turbo);
 
@@ -1663,9 +1641,6 @@ static ssize_t store_no_turbo(struct kobject *a, struct kobj_attribute *b,
 
 	intel_pstate_update_limits_for_all();
 	arch_set_max_freq_ratio(no_turbo);
-
-unlock_driver:
-	mutex_unlock(&intel_pstate_driver_lock);
 
 	return count;
 }
@@ -1716,12 +1691,10 @@ static ssize_t store_max_perf_pct(struct kobject *a, struct kobj_attribute *b,
 	if (ret != 1)
 		return -EINVAL;
 
-	mutex_lock(&intel_pstate_driver_lock);
+	guard(mutex)(&intel_pstate_driver_lock);
 
-	if (!intel_pstate_driver) {
-		mutex_unlock(&intel_pstate_driver_lock);
+	if (!intel_pstate_driver)
 		return -EAGAIN;
-	}
 
 	mutex_lock(&intel_pstate_limits_lock);
 
@@ -1733,8 +1706,6 @@ static ssize_t store_max_perf_pct(struct kobject *a, struct kobj_attribute *b,
 		intel_pstate_update_policies();
 	else
 		update_qos_requests(FREQ_QOS_MAX);
-
-	mutex_unlock(&intel_pstate_driver_lock);
 
 	return count;
 }
@@ -1749,12 +1720,10 @@ static ssize_t store_min_perf_pct(struct kobject *a, struct kobj_attribute *b,
 	if (ret != 1)
 		return -EINVAL;
 
-	mutex_lock(&intel_pstate_driver_lock);
+	guard(mutex)(&intel_pstate_driver_lock);
 
-	if (!intel_pstate_driver) {
-		mutex_unlock(&intel_pstate_driver_lock);
+	if (!intel_pstate_driver)
 		return -EAGAIN;
-	}
 
 	mutex_lock(&intel_pstate_limits_lock);
 
@@ -1767,8 +1736,6 @@ static ssize_t store_min_perf_pct(struct kobject *a, struct kobj_attribute *b,
 		intel_pstate_update_policies();
 	else
 		update_qos_requests(FREQ_QOS_MIN);
-
-	mutex_unlock(&intel_pstate_driver_lock);
 
 	return count;
 }
@@ -1790,10 +1757,10 @@ static ssize_t store_hwp_dynamic_boost(struct kobject *a,
 	if (ret)
 		return ret;
 
-	mutex_lock(&intel_pstate_driver_lock);
+	guard(mutex)(&intel_pstate_driver_lock);
+
 	hwp_boost = !!input;
 	intel_pstate_update_policies();
-	mutex_unlock(&intel_pstate_driver_lock);
 
 	return count;
 }
@@ -3915,9 +3882,9 @@ hwp_cpu_matched:
 
 	}
 
-	mutex_lock(&intel_pstate_driver_lock);
-	rc = intel_pstate_register_driver(default_driver);
-	mutex_unlock(&intel_pstate_driver_lock);
+	scoped_guard(mutex, &intel_pstate_driver_lock) {
+		rc = intel_pstate_register_driver(default_driver);
+	}
 	if (rc) {
 		intel_pstate_sysfs_remove();
 		return rc;
