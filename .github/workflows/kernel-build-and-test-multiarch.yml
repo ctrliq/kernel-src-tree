@@ -373,7 +373,7 @@ jobs:
         echo "base_branch=$BASE_BRANCH" >> $GITHUB_OUTPUT
         echo "Base branch for comparison: $BASE_BRANCH"
 
-    - name: Download baseline kselftest logs from last successful run targeting same base
+    - name: Download baseline kselftest logs from last merged PR targeting same base
       if: steps.base_branch.outputs.base_branch != ''
       env:
         GH_TOKEN: ${{ steps.generate_token_compare.outputs.token }}
@@ -382,11 +382,11 @@ jobs:
         BASE_BRANCH="${{ steps.base_branch.outputs.base_branch }}"
         CURRENT_RUN_ID="${{ github.run_id }}"
 
-        echo "Searching for baseline from last successful run targeting base branch: $BASE_BRANCH"
+        echo "Searching for baseline from last merged PR targeting base branch: $BASE_BRANCH"
         echo "Current run ID: $CURRENT_RUN_ID (will be excluded from search)"
 
         # Get last 50 successful workflow runs (cast a wider net to find PRs targeting this base)
-        # We need to check each run to see if it targets the same base branch
+        # We need to check each run to see if it targets the same base branch AND was merged
         SUCCESSFUL_RUNS=$(gh run list \
           --workflow kernel-build-and-test-multiarch.yml \
           --status success \
@@ -417,36 +417,51 @@ jobs:
 
           # Check if this run targets the same base branch
           if [ "$EXTRACTED_BASE" = "$BASE_BRANCH" ]; then
-            echo "Found candidate run $RUN_ID from branch $HEAD_BRANCH (targets: $BASE_BRANCH)"
+            # Check if the PR from this branch was merged and actually targets the expected base branch
+            PR_INFO=$(gh pr list --head "$HEAD_BRANCH" --base "$BASE_BRANCH" --state merged --json number,mergedAt,baseRefName --jq '.[0]' 2>/dev/null || echo "")
 
-            # Get the most recent artifact with this name (in case of reruns/duplicates)
-            # gh run download always picks the first artifact, which may be from an incomplete run
-            ARTIFACT_ID=$(gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/artifacts" \
-              --jq ".artifacts[] | select(.name == \"kselftest-logs-${{ matrix.arch }}\" and .expired == false) | .id" \
-              | tail -1)
+            if [ -n "$PR_INFO" ] && [ "$PR_INFO" != "null" ]; then
+              BASE_REF=$(echo "$PR_INFO" | jq -r '.baseRefName')
+              if [ -z "$BASE_REF" ] || [ "$BASE_REF" = "null" ] || [ "$BASE_REF" != "$BASE_BRANCH" ]; then
+                echo "Merged PR for branch $HEAD_BRANCH does not target expected base $BASE_BRANCH (actual base: ${BASE_REF:-unknown}), skipping run $RUN_ID"
+                continue
+              fi
 
-            if [ -n "$ARTIFACT_ID" ]; then
-              echo "Downloading artifact ID $ARTIFACT_ID (most recent with name kselftest-logs-${{ matrix.arch }})"
-              mkdir -p output-previous
-              if gh api "repos/${{ github.repository }}/actions/artifacts/$ARTIFACT_ID/zip" > /tmp/baseline-artifact.zip 2>/dev/null && \
-                 unzip -q /tmp/baseline-artifact.zip -d output-previous 2>/dev/null; then
-                echo "Successfully downloaded baseline from run $RUN_ID (branch: $HEAD_BRANCH, created: $CREATED_AT)"
-                rm -f /tmp/baseline-artifact.zip
-                echo "BASELINE_RUN_ID=$RUN_ID" >> $GITHUB_ENV
-                echo "BASELINE_BRANCH=$HEAD_BRANCH" >> $GITHUB_ENV
-                exit 0
+              PR_NUMBER=$(echo "$PR_INFO" | jq -r '.number')
+              MERGED_AT=$(echo "$PR_INFO" | jq -r '.mergedAt')
+              echo "Found merged PR #$PR_NUMBER from branch $HEAD_BRANCH (merged: $MERGED_AT, targets: $BASE_REF)"
+
+              # Get the most recent artifact with this name (in case of reruns/duplicates)
+              ARTIFACT_ID=$(gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/artifacts" \
+                --jq ".artifacts[] | select(.name == \"kselftest-logs-${{ matrix.arch }}\" and .expired == false) | .id" \
+                | tail -1)
+
+              if [ -n "$ARTIFACT_ID" ]; then
+                echo "Downloading artifact ID $ARTIFACT_ID (most recent with name kselftest-logs-${{ matrix.arch }})"
+                mkdir -p output-previous
+                if gh api "repos/${{ github.repository }}/actions/artifacts/$ARTIFACT_ID/zip" > /tmp/baseline-artifact.zip 2>/dev/null && \
+                   unzip -q /tmp/baseline-artifact.zip -d output-previous 2>/dev/null; then
+                  echo "Successfully downloaded baseline from merged PR #$PR_NUMBER (run $RUN_ID, branch: $HEAD_BRANCH)"
+                  rm -f /tmp/baseline-artifact.zip
+                  echo "BASELINE_RUN_ID=$RUN_ID" >> $GITHUB_ENV
+                  echo "BASELINE_BRANCH=$HEAD_BRANCH" >> $GITHUB_ENV
+                  echo "BASELINE_PR=$PR_NUMBER" >> $GITHUB_ENV
+                  exit 0
+                else
+                  echo "Failed to download or extract artifact $ARTIFACT_ID"
+                  rm -f /tmp/baseline-artifact.zip
+                fi
               else
-                echo "Failed to download or extract artifact $ARTIFACT_ID"
-                rm -f /tmp/baseline-artifact.zip
+                echo "Run $RUN_ID has no kselftest artifacts for ${{ matrix.arch }} or they expired"
               fi
             else
-              echo "Run $RUN_ID has no kselftest artifacts for ${{ matrix.arch }} or they expired"
+              echo "Branch $HEAD_BRANCH was not merged, skipping run $RUN_ID"
             fi
           fi
         done < <(echo "$SUCCESSFUL_RUNS" | jq -c '.[]')
 
-        echo "::warning::No baseline test results found in recent successful runs targeting $BASE_BRANCH"
-        echo "::notice::This may be the first run targeting this base branch, or artifacts have expired (7-day retention)"
+        echo "::warning::No baseline test results found from merged PRs targeting $BASE_BRANCH"
+        echo "::notice::This may be the first merged PR targeting this base branch, or artifacts have expired (7-day retention)"
       continue-on-error: true
       timeout-minutes: 3
 
