@@ -278,6 +278,16 @@ static int fips_run_selftests(void)
 	/* DH */
 	SELFTEST("fips-dh-generic", "dh", 0, 0);
 
+	/* FFDHE (Finite-Field DH groups per RFC 7919).
+	 * The ffdhe* templates are registered by fips_dh_init() as part of
+	 * dh.c when CONFIG_CRYPTO_DH_RFC7919_GROUPS=y.  All five groups are
+	 * marked fips_allowed=1 in testmgr.h. */
+	SELFTEST("ffdhe2048(dh)", "ffdhe2048(dh)", 0, 0);
+	SELFTEST("ffdhe3072(dh)", "ffdhe3072(dh)", 0, 0);
+	SELFTEST("ffdhe4096(dh)", "ffdhe4096(dh)", 0, 0);
+	SELFTEST("ffdhe6144(dh)", "ffdhe6144(dh)", 0, 0);
+	SELFTEST("ffdhe8192(dh)", "ffdhe8192(dh)", 0, 0);
+
 	/* ---------------------------------------------------------------
 	 * JitterEntropy RNG
 	 * --------------------------------------------------------------- */
