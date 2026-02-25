@@ -41,6 +41,7 @@ fips_module-y :=					\
 							\
 	crypto/authenc.o				\
 	crypto/ccm.o					\
+	crypto/essiv.o					\
 	crypto/hmac.o					\
 	crypto/cmac.o					\
 							\
