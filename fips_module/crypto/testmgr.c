@@ -5868,3 +5868,21 @@ non_fips_alg:
 
 #endif /* CONFIG_CRYPTO_SELFTESTS */
 
+/**
+ * fips_alg_test - Invoke this module's own copy of alg_test().
+ *
+ * This thin wrapper is the entry point used by fips_run_selftests() in
+ * fips_init.c.  Because the call to alg_test() is made from within the
+ * same translation unit as the definition of alg_test(), the compiler and
+ * linker are guaranteed to resolve it to the module-private copy rather
+ * than the kernel's built-in version that is triggered asynchronously by
+ * the cryptomgr on algorithm registration.
+ *
+ * This ensures that the FIPS cryptographic boundary's own test vectors and
+ * test logic are used to validate every algorithm at module load time.
+ */
+int fips_alg_test(const char *driver, const char *alg, u32 type, u32 mask)
+{
+	return alg_test(driver, alg, type, mask);
+}
+
