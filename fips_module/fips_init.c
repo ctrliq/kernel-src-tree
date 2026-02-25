@@ -182,6 +182,12 @@ static int fips_run_selftests(void)
 	SELFTEST("fips-hmac-sha384-lib",  "hmac(sha384)", 0, 0);
 	SELFTEST("fips-hmac-sha512-lib",  "hmac(sha512)", 0, 0);
 
+	/* HMAC-SHA3 (template-composed: hmac wraps our fips SHA3 shash) */
+	SELFTEST("hmac(sha3-224)", "hmac(sha3-224)", 0, 0);
+	SELFTEST("hmac(sha3-256)", "hmac(sha3-256)", 0, 0);
+	SELFTEST("hmac(sha3-384)", "hmac(sha3-384)", 0, 0);
+	SELFTEST("hmac(sha3-512)", "hmac(sha3-512)", 0, 0);
+
 	/* ---------------------------------------------------------------
 	 * AES cipher modes (template-based)
 	 * Passing the algorithm name as 'driver' causes crypto_alloc_*()
