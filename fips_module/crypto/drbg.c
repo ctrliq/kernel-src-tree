@@ -1508,7 +1508,7 @@ static int drbg_prepare_hrng(struct drbg_state *drbg)
 	if (list_empty(&drbg->test_data.list))
 		return 0;
 
-	drbg->jent = crypto_alloc_rng("jitterentropy_rng", 0, 0);
+	drbg->jent = crypto_alloc_rng("fips-jitterentropy_rng", 0, 0);
 	if (IS_ERR(drbg->jent)) {
 		const int err = PTR_ERR(drbg->jent);
 
