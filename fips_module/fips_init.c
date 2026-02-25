@@ -205,6 +205,35 @@ static int fips_run_selftests(void)
 	SELFTEST("cmac(aes)", "cmac(aes)", 0, 0);
 
 	/* ---------------------------------------------------------------
+	 * authenc: AEAD combining HMAC authentication with AES encryption.
+	 * The authenc template composes registered hmac and skcipher
+	 * implementations at instantiation time; no fixed driver names.
+	 * rfc3686(ctr(aes)) is implemented within ctr.c.
+	 * --------------------------------------------------------------- */
+	SELFTEST("authenc(hmac(sha1),cbc(aes))",
+		 "authenc(hmac(sha1),cbc(aes))", 0, 0);
+	SELFTEST("authenc(hmac(sha1),ctr(aes))",
+		 "authenc(hmac(sha1),ctr(aes))", 0, 0);
+	SELFTEST("authenc(hmac(sha1),rfc3686(ctr(aes)))",
+		 "authenc(hmac(sha1),rfc3686(ctr(aes)))", 0, 0);
+	SELFTEST("authenc(hmac(sha256),cbc(aes))",
+		 "authenc(hmac(sha256),cbc(aes))", 0, 0);
+	SELFTEST("authenc(hmac(sha256),ctr(aes))",
+		 "authenc(hmac(sha256),ctr(aes))", 0, 0);
+	SELFTEST("authenc(hmac(sha256),rfc3686(ctr(aes)))",
+		 "authenc(hmac(sha256),rfc3686(ctr(aes)))", 0, 0);
+	SELFTEST("authenc(hmac(sha384),ctr(aes))",
+		 "authenc(hmac(sha384),ctr(aes))", 0, 0);
+	SELFTEST("authenc(hmac(sha384),rfc3686(ctr(aes)))",
+		 "authenc(hmac(sha384),rfc3686(ctr(aes)))", 0, 0);
+	SELFTEST("authenc(hmac(sha512),cbc(aes))",
+		 "authenc(hmac(sha512),cbc(aes))", 0, 0);
+	SELFTEST("authenc(hmac(sha512),ctr(aes))",
+		 "authenc(hmac(sha512),ctr(aes))", 0, 0);
+	SELFTEST("authenc(hmac(sha512),rfc3686(ctr(aes)))",
+		 "authenc(hmac(sha512),rfc3686(ctr(aes)))", 0, 0);
+
+	/* ---------------------------------------------------------------
 	 * Asymmetric / key-agreement algorithms
 	 * --------------------------------------------------------------- */
 	/* RSA */
@@ -311,7 +340,7 @@ static int __init fips_module_init(void)
 	 * 2. Hash primitives (GHASH, SHA)
 	 * 3. Hardware accelerated variants
 	 * 4. Cipher modes (ECB, CBC, CTR, XTS, GCM)
-	 * 5. MAC algorithms (HMAC, CMAC)
+	 * 5. MAC algorithms (HMAC, CMAC) and AEAD templates (authenc)
 	 * 6. KDF
 	 * 7. Asymmetric (RSA, ECC, ECDSA, ECDH, DH)
 	 * 8. DRBG and entropy (JitterEntropy, DRBG)
@@ -433,6 +462,12 @@ static int __init fips_module_init(void)
 		goto err_cmac;
 	}
 
+	ret = fips_authenc_init();
+	if (ret) {
+		pr_err("fips_module: authenc init failed: %d\n", ret);
+		goto err_authenc;
+	}
+
 	ret = fips_kdf_sp800108_init();
 	if (ret) {
 		pr_err("fips_module: kdf_sp800108 init failed: %d\n", ret);
@@ -507,6 +542,8 @@ err_ecdsa:
 err_rsa:
 	fips_kdf_sp800108_exit();
 err_kdf:
+	fips_authenc_exit();
+err_authenc:
 	fips_cmac_exit();
 err_cmac:
 	fips_hmac_exit();
@@ -560,6 +597,7 @@ static void __exit fips_module_exit(void)
 	fips_ecdsa_exit();
 	fips_rsa_exit();
 	fips_kdf_sp800108_exit();
+	fips_authenc_exit();
 	fips_cmac_exit();
 	fips_hmac_exit();
 	fips_gcm_exit();
