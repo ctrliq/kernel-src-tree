@@ -498,8 +498,8 @@ SYM_CODE_START(mcck_int_handler)
 	stctg	%c1,%c1,__PT_CR1(%r11)
 	lctlg	%c1,%c1,__LC_KERNEL_ASCE
 	xc	__SF_BACKCHAIN(8,%r15),__SF_BACKCHAIN(%r15)
-	lghi	%r14,__LC_GPREGS_SAVE_AREA+64
-	stmg	%r0,%r7,__PT_R0(%r11)
+	lghi	%r14,__LC_GPREGS_SAVE_AREA
+	mvc	__PT_R0(128,%r11),0(%r14)
 	# clear user controlled registers to prevent speculative use
 	xgr	%r0,%r0
 	xgr	%r1,%r1
@@ -510,7 +510,6 @@ SYM_CODE_START(mcck_int_handler)
 	xgr	%r7,%r7
 	xgr	%r10,%r10
 	xgr	%r12,%r12
-	mvc	__PT_R8(64,%r11),0(%r14)
 	stmg	%r8,%r9,__PT_PSW(%r11)
 	xc	__PT_FLAGS(8,%r11),__PT_FLAGS(%r11)
 	xc	__SF_BACKCHAIN(8,%r15),__SF_BACKCHAIN(%r15)
