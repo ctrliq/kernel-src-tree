@@ -234,6 +234,15 @@ static int fips_run_selftests(void)
 		 "authenc(hmac(sha512),rfc3686(ctr(aes)))", 0, 0);
 
 	/* ---------------------------------------------------------------
+	 * CCM: Counter with CBC-MAC (AEAD).
+	 * ccm.c also registers cbcmac (the internal MAC primitive),
+	 * ccm_base, ccm, and rfc4309 templates.
+	 * --------------------------------------------------------------- */
+	SELFTEST("cbcmac(aes)", "cbcmac(aes)", 0, 0);
+	SELFTEST("ccm(aes)",         "ccm(aes)",         0, 0);
+	SELFTEST("rfc4309(ccm(aes))", "rfc4309(ccm(aes))", 0, 0);
+
+	/* ---------------------------------------------------------------
 	 * Asymmetric / key-agreement algorithms
 	 * --------------------------------------------------------------- */
 	/* RSA */
@@ -468,6 +477,12 @@ static int __init fips_module_init(void)
 		goto err_authenc;
 	}
 
+	ret = fips_ccm_init();
+	if (ret) {
+		pr_err("fips_module: ccm init failed: %d\n", ret);
+		goto err_ccm;
+	}
+
 	ret = fips_kdf_sp800108_init();
 	if (ret) {
 		pr_err("fips_module: kdf_sp800108 init failed: %d\n", ret);
@@ -542,6 +557,8 @@ err_ecdsa:
 err_rsa:
 	fips_kdf_sp800108_exit();
 err_kdf:
+	fips_ccm_exit();
+err_ccm:
 	fips_authenc_exit();
 err_authenc:
 	fips_cmac_exit();
@@ -597,6 +614,7 @@ static void __exit fips_module_exit(void)
 	fips_ecdsa_exit();
 	fips_rsa_exit();
 	fips_kdf_sp800108_exit();
+	fips_ccm_exit();
 	fips_authenc_exit();
 	fips_cmac_exit();
 	fips_hmac_exit();
