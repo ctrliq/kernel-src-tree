@@ -74,6 +74,18 @@ void fips_ecdh_exit(void);
 int  fips_dh_init(void);
 void fips_dh_exit(void);
 
+/*
+ * fips_alg_test - module-private self-test entry point.
+ *
+ * Calls this module's own copy of alg_test() (from the bundled testmgr.c)
+ * rather than the kernel's built-in version.  Used by fips_run_selftests()
+ * in fips_init.c to validate every registered algorithm at load time.
+ */
+/* u32 = unsigned int on all Linux architectures; use the primitive type
+ * here so this header can be force-included before linux/types.h.      */
+int fips_alg_test(const char *driver, const char *alg,
+		  unsigned int type, unsigned int mask);
+
 /* x86_64 hardware-accelerated */
 int  fips_aesni_init(void);
 void fips_aesni_exit(void);

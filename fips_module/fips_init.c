@@ -103,6 +103,187 @@ int  fips_sha3_ce_init(void);
 void fips_sha3_ce_exit(void);
 #endif
 
+/*
+ * fips_run_selftests - explicitly run the module-private self-tests.
+ *
+ * The kernel's cryptomgr calls the kernel's own alg_test() asynchronously
+ * for each algorithm when it is registered.  That code lives in vmlinux and
+ * is outside the FIPS cryptographic boundary defined by this module.
+ *
+ * This function calls fips_alg_test() instead, which resolves at link time
+ * to the module-local alg_test() defined in our bundled testmgr.c copy.
+ * Every algorithm registered by the module is tested explicitly before
+ * fips_module_init() returns, so:
+ *   - the test code is inside the FIPS boundary, and
+ *   - a test failure aborts module loading.
+ *
+ * Template-based algorithms (ecb, cbc, ctr, xts, gcm, hmac, cmac) are
+ * tested by passing the algorithm name as both 'driver' and 'alg'; the
+ * crypto API instantiates the template using the highest-priority
+ * implementation, which is always this module's copy (priority 100000).
+ *
+ * DRBG variants are also tested here for completeness; the DRBG init code
+ * already runs a subset of these tests internally via the module-local
+ * alg_test() as a side-effect of module linking.
+ */
+static int fips_run_selftests(void)
+{
+	int ret;
+
+/*
+ * Helper macro: call fips_alg_test() and abort with an error message on
+ * any non-zero return.  alg_test() returns 0 for both "test passed" and
+ * "no test registered for this algorithm", so only genuine failures (< 0)
+ * are reported.
+ */
+#define SELFTEST(driver, alg, type, mask)				\
+	do {								\
+		ret = fips_alg_test((driver), (alg), (type), (mask));	\
+		if (ret) {						\
+			pr_err("fips_module: self-test FAILED for"	\
+			       " '%s' (%s): %d\n",			\
+			       (driver), (alg), ret);			\
+			return ret;					\
+		}							\
+	} while (0)
+
+	/* ---------------------------------------------------------------
+	 * AES block cipher (raw)
+	 * alg_test() wraps raw ciphers in ECB automatically when type bits
+	 * indicate CRYPTO_ALG_TYPE_CIPHER.
+	 * --------------------------------------------------------------- */
+	SELFTEST("fips-aes-generic", "aes",
+		 CRYPTO_ALG_TYPE_CIPHER, CRYPTO_ALG_TYPE_MASK);
+
+	/* ---------------------------------------------------------------
+	 * GHASH
+	 * --------------------------------------------------------------- */
+	SELFTEST("fips-ghash-generic", "ghash", 0, 0);
+
+	/* ---------------------------------------------------------------
+	 * SHA hash functions
+	 * --------------------------------------------------------------- */
+	SELFTEST("fips-sha1-lib",          "sha1",     0, 0);
+	SELFTEST("fips-sha224-lib",        "sha224",   0, 0);
+	SELFTEST("fips-sha256-lib",        "sha256",   0, 0);
+	SELFTEST("fips-sha384-lib",        "sha384",   0, 0);
+	SELFTEST("fips-sha512-lib",        "sha512",   0, 0);
+	SELFTEST("fips-sha3-224-generic",  "sha3-224", 0, 0);
+	SELFTEST("fips-sha3-256-generic",  "sha3-256", 0, 0);
+	SELFTEST("fips-sha3-384-generic",  "sha3-384", 0, 0);
+	SELFTEST("fips-sha3-512-generic",  "sha3-512", 0, 0);
+
+	/* ---------------------------------------------------------------
+	 * HMAC (registered directly by the sha*-lib implementations)
+	 * --------------------------------------------------------------- */
+	SELFTEST("fips-hmac-sha1-lib",    "hmac(sha1)",   0, 0);
+	SELFTEST("fips-hmac-sha224-lib",  "hmac(sha224)", 0, 0);
+	SELFTEST("fips-hmac-sha256-lib",  "hmac(sha256)", 0, 0);
+	SELFTEST("fips-hmac-sha384-lib",  "hmac(sha384)", 0, 0);
+	SELFTEST("fips-hmac-sha512-lib",  "hmac(sha512)", 0, 0);
+
+	/* ---------------------------------------------------------------
+	 * AES cipher modes (template-based)
+	 * Passing the algorithm name as 'driver' causes crypto_alloc_*()
+	 * to select the highest-priority implementation (this module,
+	 * priority 100000).
+	 * --------------------------------------------------------------- */
+	SELFTEST("ecb(aes)",         "ecb(aes)",         0, 0);
+	SELFTEST("cbc(aes)",         "cbc(aes)",         0, 0);
+	SELFTEST("ctr(aes)",         "ctr(aes)",         0, 0);
+	SELFTEST("xts(aes)",         "xts(aes)",         0, 0);
+	SELFTEST("gcm(aes)",         "gcm(aes)",         0, 0);
+	SELFTEST("rfc4106(gcm(aes))", "rfc4106(gcm(aes))", 0, 0);
+
+	/* CMAC */
+	SELFTEST("cmac(aes)", "cmac(aes)", 0, 0);
+
+	/* ---------------------------------------------------------------
+	 * Asymmetric / key-agreement algorithms
+	 * --------------------------------------------------------------- */
+	/* RSA */
+	SELFTEST("fips-rsa-generic",    "rsa",             0, 0);
+	SELFTEST("pkcs1pad(rsa)",       "pkcs1pad(rsa)",   0, 0);
+	SELFTEST("pkcs1(rsa,none)",     "pkcs1(rsa,none)", 0, 0);
+	SELFTEST("pkcs1(rsa,sha256)",   "pkcs1(rsa,sha256)", 0, 0);
+	SELFTEST("pkcs1(rsa,sha384)",   "pkcs1(rsa,sha384)", 0, 0);
+	SELFTEST("pkcs1(rsa,sha512)",   "pkcs1(rsa,sha512)", 0, 0);
+
+	/* ECDSA */
+	SELFTEST("fips-ecdsa-nist-p192-generic", "ecdsa-nist-p192", 0, 0);
+	SELFTEST("fips-ecdsa-nist-p256-generic", "ecdsa-nist-p256", 0, 0);
+	SELFTEST("fips-ecdsa-nist-p384-generic", "ecdsa-nist-p384", 0, 0);
+	SELFTEST("fips-ecdsa-nist-p521-generic", "ecdsa-nist-p521", 0, 0);
+
+	/* ECDH */
+	SELFTEST("fips-ecdh-nist-p192-generic", "ecdh-nist-p192", 0, 0);
+	SELFTEST("fips-ecdh-nist-p256-generic", "ecdh-nist-p256", 0, 0);
+	SELFTEST("fips-ecdh-nist-p384-generic", "ecdh-nist-p384", 0, 0);
+
+	/* DH */
+	SELFTEST("fips-dh-generic", "dh", 0, 0);
+
+	/* ---------------------------------------------------------------
+	 * JitterEntropy RNG
+	 * --------------------------------------------------------------- */
+	SELFTEST("fips-jitterentropy_rng", "jitterentropy_rng", 0, 0);
+
+	/* ---------------------------------------------------------------
+	 * DRBG: all prediction-resistant and non-prediction-resistant
+	 * variants for CTR(AES), Hash(SHA), and HMAC(SHA).
+	 * --------------------------------------------------------------- */
+	SELFTEST("drbg_pr_ctr_aes128",    "drbg_pr_ctr_aes128",   0, 0);
+	SELFTEST("drbg_pr_ctr_aes192",    "drbg_pr_ctr_aes192",   0, 0);
+	SELFTEST("drbg_pr_ctr_aes256",    "drbg_pr_ctr_aes256",   0, 0);
+	SELFTEST("drbg_pr_sha256",        "drbg_pr_sha256",        0, 0);
+	SELFTEST("drbg_pr_sha384",        "drbg_pr_sha384",        0, 0);
+	SELFTEST("drbg_pr_sha512",        "drbg_pr_sha512",        0, 0);
+	SELFTEST("drbg_pr_hmac_sha256",   "drbg_pr_hmac_sha256",   0, 0);
+	SELFTEST("drbg_pr_hmac_sha384",   "drbg_pr_hmac_sha384",   0, 0);
+	SELFTEST("drbg_pr_hmac_sha512",   "drbg_pr_hmac_sha512",   0, 0);
+	SELFTEST("drbg_nopr_ctr_aes128",  "drbg_nopr_ctr_aes128",  0, 0);
+	SELFTEST("drbg_nopr_ctr_aes192",  "drbg_nopr_ctr_aes192",  0, 0);
+	SELFTEST("drbg_nopr_ctr_aes256",  "drbg_nopr_ctr_aes256",  0, 0);
+	SELFTEST("drbg_nopr_sha256",      "drbg_nopr_sha256",       0, 0);
+	SELFTEST("drbg_nopr_sha384",      "drbg_nopr_sha384",       0, 0);
+	SELFTEST("drbg_nopr_sha512",      "drbg_nopr_sha512",       0, 0);
+	SELFTEST("drbg_nopr_hmac_sha256", "drbg_nopr_hmac_sha256",  0, 0);
+	SELFTEST("drbg_nopr_hmac_sha384", "drbg_nopr_hmac_sha384",  0, 0);
+	SELFTEST("drbg_nopr_hmac_sha512", "drbg_nopr_hmac_sha512",  0, 0);
+
+#if defined(CONFIG_X86_64) || defined(CONFIG_X86)
+	/* ---------------------------------------------------------------
+	 * x86_64 AES-NI / AVX hardware-accelerated implementations
+	 * --------------------------------------------------------------- */
+	SELFTEST("fips-aes-aesni", "aes",
+		 CRYPTO_ALG_TYPE_CIPHER, CRYPTO_ALG_TYPE_MASK);
+	SELFTEST("fips-ecb-aes-aesni", "ecb(aes)", 0, 0);
+	SELFTEST("fips-cbc-aes-aesni", "cbc(aes)", 0, 0);
+	SELFTEST("fips-ctr-aes-aesni", "ctr(aes)", 0, 0);
+	SELFTEST("fips-xts-aes-aesni", "xts(aes)", 0, 0);
+	/* GHASH via CLMUL (pclmulqdq) */
+	SELFTEST("fips-ghash-pclmulqdqni", "ghash", 0, 0);
+#endif /* CONFIG_X86_64 || CONFIG_X86 */
+
+#ifdef CONFIG_ARM64
+	/* ---------------------------------------------------------------
+	 * ARM64 Crypto Extension hardware-accelerated implementations
+	 * --------------------------------------------------------------- */
+	SELFTEST("fips-aes-ce", "aes",
+		 CRYPTO_ALG_TYPE_CIPHER, CRYPTO_ALG_TYPE_MASK);
+	SELFTEST("fips-ghash-neon",  "ghash",    0, 0);
+	SELFTEST("fips-gcm-aes-ce",  "gcm(aes)", 0, 0);
+	SELFTEST("fips-sha3-224-ce", "sha3-224", 0, 0);
+	SELFTEST("fips-sha3-256-ce", "sha3-256", 0, 0);
+	SELFTEST("fips-sha3-384-ce", "sha3-384", 0, 0);
+	SELFTEST("fips-sha3-512-ce", "sha3-512", 0, 0);
+#endif /* CONFIG_ARM64 */
+
+#undef SELFTEST
+
+	return 0;
+}
+
 static int __init fips_module_init(void)
 {
 	int ret;
@@ -118,10 +299,9 @@ static int __init fips_module_init(void)
 	 * 7. Asymmetric (RSA, ECC, ECDSA, ECDH, DH)
 	 * 8. DRBG and entropy (JitterEntropy, DRBG)
 	 *
-	 * The kernel's crypto test framework (testmgr.c / alg_test()) runs
-	 * self-tests automatically for each algorithm as it is registered.
-	 * When fips_enabled is set, test failures prevent the algorithm
-	 * from being used.
+	 * After all algorithms are registered, fips_run_selftests() is called
+	 * to explicitly exercise the module-private copy of alg_test() and its
+	 * test vectors.  A self-test failure aborts module loading.
 	 */
 
 	ret = fips_aes_generic_init();
@@ -278,10 +458,25 @@ static int __init fips_module_init(void)
 		goto err_drbg;
 	}
 
-	pr_info("fips_module: all FIPS algorithms registered\n");
+	/*
+	 * Run the module-private self-tests for every registered algorithm.
+	 * fips_run_selftests() calls fips_alg_test() which resolves to the
+	 * local copy of alg_test() in this module's bundled testmgr.c, not
+	 * the kernel's built-in version triggered by the cryptomgr.
+	 */
+	ret = fips_run_selftests();
+	if (ret) {
+		pr_err("fips_module: self-tests FAILED: %d\n", ret);
+		goto err_selftests;
+	}
+
+	pr_info("fips_module: all FIPS algorithms registered and "
+		"self-tests passed\n");
 	return 0;
 
 	/* Unwind in reverse order on error */
+err_selftests:
+	fips_drbg_exit();
 err_drbg:
 	fips_jent_exit();
 err_jent:

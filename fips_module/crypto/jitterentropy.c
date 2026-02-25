@@ -58,7 +58,9 @@ typedef	unsigned long long	__u64;
 typedef	long long		__s64;
 typedef	unsigned int		__u32;
 typedef unsigned char		u8;
+#ifndef NULL
 #define NULL    ((void *) 0)
+#endif
 
 /* The entropy pool */
 struct rand_data {

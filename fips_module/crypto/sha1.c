@@ -180,7 +180,7 @@ static int crypto_hmac_sha1_import_core(struct shash_desc *desc, const void *in)
 static struct shash_alg algs[] = {
 	{
 		.base.cra_name		= "sha1",
-		.base.cra_driver_name		= "fips-fips-sha1-lib",
+		.base.cra_driver_name		= "fips-sha1-lib",
 		.base.cra_priority		= 100000,
 		.base.cra_blocksize	= SHA1_BLOCK_SIZE,
 		.base.cra_module	= THIS_MODULE,
@@ -198,7 +198,7 @@ static struct shash_alg algs[] = {
 	},
 	{
 		.base.cra_name		= "hmac(sha1)",
-		.base.cra_driver_name		= "fips-fips-hmac-sha1-lib",
+		.base.cra_driver_name		= "fips-hmac-sha1-lib",
 		.base.cra_priority		= 100000,
 		.base.cra_blocksize	= SHA1_BLOCK_SIZE,
 		.base.cra_ctxsize	= sizeof(struct hmac_sha1_key),
