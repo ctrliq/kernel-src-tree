@@ -42,9 +42,11 @@ void fips_sha512_exit(void);
 int  fips_sha3_init(void);
 void fips_sha3_exit(void);
 
-/* Authenticated encryption (AEAD template) */
+/* Authenticated encryption (AEAD templates) */
 int  fips_authenc_init(void);
 void fips_authenc_exit(void);
+int  fips_ccm_init(void);
+void fips_ccm_exit(void);
 
 /* Message authentication codes */
 int  fips_hmac_init(void);
