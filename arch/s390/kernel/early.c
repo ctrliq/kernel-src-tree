@@ -49,6 +49,7 @@ decompressor_handled_param(noexec);
 decompressor_handled_param(facilities);
 decompressor_handled_param(nokaslr);
 decompressor_handled_param(cmma);
+decompressor_handled_param(relocate_lowcore);
 #if IS_ENABLED(CONFIG_KVM)
 decompressor_handled_param(prot_virt);
 #endif
