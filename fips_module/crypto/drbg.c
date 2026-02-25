@@ -1863,25 +1863,29 @@ out:
 static inline void drbg_convert_tfm_core(const char *cra_driver_name,
 					 int *coreref, bool *pr)
 {
+	const char *name = cra_driver_name;
 	int i = 0;
 	size_t start = 0;
 	int len = 0;
 
 	*pr = true;
+	/* skip "fips-" prefix present in our registered driver names */
+	if (!memcmp(name, "fips-", 5))
+		name += 5;
 	/* disassemble the names */
-	if (!memcmp(cra_driver_name, "drbg_nopr_", 10)) {
+	if (!memcmp(name, "drbg_nopr_", 10)) {
 		start = 10;
 		*pr = false;
-	} else if (!memcmp(cra_driver_name, "drbg_pr_", 8)) {
+	} else if (!memcmp(name, "drbg_pr_", 8)) {
 		start = 8;
 	} else {
 		return;
 	}
 
 	/* remove the first part */
-	len = strlen(cra_driver_name) - start;
+	len = strlen(name) - start;
 	for (i = 0; ARRAY_SIZE(drbg_cores) > i; i++) {
-		if (!memcmp(cra_driver_name + start, drbg_cores[i].cra_name,
+		if (!memcmp(name + start, drbg_cores[i].cra_name,
 			    len)) {
 			*coreref = i;
 			return;
@@ -2047,11 +2051,11 @@ static inline void drbg_fill_array(struct rng_alg *alg,
 
 	memcpy(alg->base.cra_name, "stdrng", 6);
 	if (pr) {
-		memcpy(alg->base.cra_driver_name, "drbg_pr_", 8);
-		pos = 8;
+		memcpy(alg->base.cra_driver_name, "fips-drbg_pr_", 13);
+		pos = 13;
 	} else {
-		memcpy(alg->base.cra_driver_name, "drbg_nopr_", 10);
-		pos = 10;
+		memcpy(alg->base.cra_driver_name, "fips-drbg_nopr_", 15);
+		pos = 15;
 	}
 	memcpy(alg->base.cra_driver_name + pos, core->cra_name,
 	       strlen(core->cra_name));

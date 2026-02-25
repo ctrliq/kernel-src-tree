@@ -232,24 +232,24 @@ static int fips_run_selftests(void)
 	 * DRBG: all prediction-resistant and non-prediction-resistant
 	 * variants for CTR(AES), Hash(SHA), and HMAC(SHA).
 	 * --------------------------------------------------------------- */
-	SELFTEST("drbg_pr_ctr_aes128",    "drbg_pr_ctr_aes128",   0, 0);
-	SELFTEST("drbg_pr_ctr_aes192",    "drbg_pr_ctr_aes192",   0, 0);
-	SELFTEST("drbg_pr_ctr_aes256",    "drbg_pr_ctr_aes256",   0, 0);
-	SELFTEST("drbg_pr_sha256",        "drbg_pr_sha256",        0, 0);
-	SELFTEST("drbg_pr_sha384",        "drbg_pr_sha384",        0, 0);
-	SELFTEST("drbg_pr_sha512",        "drbg_pr_sha512",        0, 0);
-	SELFTEST("drbg_pr_hmac_sha256",   "drbg_pr_hmac_sha256",   0, 0);
-	SELFTEST("drbg_pr_hmac_sha384",   "drbg_pr_hmac_sha384",   0, 0);
-	SELFTEST("drbg_pr_hmac_sha512",   "drbg_pr_hmac_sha512",   0, 0);
-	SELFTEST("drbg_nopr_ctr_aes128",  "drbg_nopr_ctr_aes128",  0, 0);
-	SELFTEST("drbg_nopr_ctr_aes192",  "drbg_nopr_ctr_aes192",  0, 0);
-	SELFTEST("drbg_nopr_ctr_aes256",  "drbg_nopr_ctr_aes256",  0, 0);
-	SELFTEST("drbg_nopr_sha256",      "drbg_nopr_sha256",       0, 0);
-	SELFTEST("drbg_nopr_sha384",      "drbg_nopr_sha384",       0, 0);
-	SELFTEST("drbg_nopr_sha512",      "drbg_nopr_sha512",       0, 0);
-	SELFTEST("drbg_nopr_hmac_sha256", "drbg_nopr_hmac_sha256",  0, 0);
-	SELFTEST("drbg_nopr_hmac_sha384", "drbg_nopr_hmac_sha384",  0, 0);
-	SELFTEST("drbg_nopr_hmac_sha512", "drbg_nopr_hmac_sha512",  0, 0);
+	SELFTEST("fips-drbg_pr_ctr_aes128",    "drbg_pr_ctr_aes128",   0, 0);
+	SELFTEST("fips-drbg_pr_ctr_aes192",    "drbg_pr_ctr_aes192",   0, 0);
+	SELFTEST("fips-drbg_pr_ctr_aes256",    "drbg_pr_ctr_aes256",   0, 0);
+	SELFTEST("fips-drbg_pr_sha256",        "drbg_pr_sha256",        0, 0);
+	SELFTEST("fips-drbg_pr_sha384",        "drbg_pr_sha384",        0, 0);
+	SELFTEST("fips-drbg_pr_sha512",        "drbg_pr_sha512",        0, 0);
+	SELFTEST("fips-drbg_pr_hmac_sha256",   "drbg_pr_hmac_sha256",   0, 0);
+	SELFTEST("fips-drbg_pr_hmac_sha384",   "drbg_pr_hmac_sha384",   0, 0);
+	SELFTEST("fips-drbg_pr_hmac_sha512",   "drbg_pr_hmac_sha512",   0, 0);
+	SELFTEST("fips-drbg_nopr_ctr_aes128",  "drbg_nopr_ctr_aes128",  0, 0);
+	SELFTEST("fips-drbg_nopr_ctr_aes192",  "drbg_nopr_ctr_aes192",  0, 0);
+	SELFTEST("fips-drbg_nopr_ctr_aes256",  "drbg_nopr_ctr_aes256",  0, 0);
+	SELFTEST("fips-drbg_nopr_sha256",      "drbg_nopr_sha256",       0, 0);
+	SELFTEST("fips-drbg_nopr_sha384",      "drbg_nopr_sha384",       0, 0);
+	SELFTEST("fips-drbg_nopr_sha512",      "drbg_nopr_sha512",       0, 0);
+	SELFTEST("fips-drbg_nopr_hmac_sha256", "drbg_nopr_hmac_sha256",  0, 0);
+	SELFTEST("fips-drbg_nopr_hmac_sha384", "drbg_nopr_hmac_sha384",  0, 0);
+	SELFTEST("fips-drbg_nopr_hmac_sha512", "drbg_nopr_hmac_sha512",  0, 0);
 
 #if defined(CONFIG_X86_64) || defined(CONFIG_X86)
 	/* ---------------------------------------------------------------
