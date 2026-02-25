@@ -211,6 +211,7 @@ static int fips_run_selftests(void)
 	SELFTEST("fips-rsa-generic",    "rsa",             0, 0);
 	SELFTEST("pkcs1pad(rsa)",       "pkcs1pad(rsa)",   0, 0);
 	SELFTEST("pkcs1(rsa,none)",     "pkcs1(rsa,none)", 0, 0);
+	SELFTEST("pkcs1(rsa,sha224)",   "pkcs1(rsa,sha224)", 0, 0);
 	SELFTEST("pkcs1(rsa,sha256)",   "pkcs1(rsa,sha256)", 0, 0);
 	SELFTEST("pkcs1(rsa,sha384)",   "pkcs1(rsa,sha384)", 0, 0);
 	SELFTEST("pkcs1(rsa,sha512)",   "pkcs1(rsa,sha512)", 0, 0);
@@ -220,6 +221,16 @@ static int fips_run_selftests(void)
 	SELFTEST("fips-ecdsa-nist-p256-generic", "ecdsa-nist-p256", 0, 0);
 	SELFTEST("fips-ecdsa-nist-p384-generic", "ecdsa-nist-p384", 0, 0);
 	SELFTEST("fips-ecdsa-nist-p521-generic", "ecdsa-nist-p521", 0, 0);
+
+	/* ECDSA P1363 encoding wrappers (IEEE P1363 raw r||s format) */
+	SELFTEST("p1363(ecdsa-nist-p256)", "p1363(ecdsa-nist-p256)", 0, 0);
+	SELFTEST("p1363(ecdsa-nist-p384)", "p1363(ecdsa-nist-p384)", 0, 0);
+	SELFTEST("p1363(ecdsa-nist-p521)", "p1363(ecdsa-nist-p521)", 0, 0);
+
+	/* ECDSA X9.62 encoding wrappers (DER/ASN.1 format) */
+	SELFTEST("x962(ecdsa-nist-p256)", "x962(ecdsa-nist-p256)", 0, 0);
+	SELFTEST("x962(ecdsa-nist-p384)", "x962(ecdsa-nist-p384)", 0, 0);
+	SELFTEST("x962(ecdsa-nist-p521)", "x962(ecdsa-nist-p521)", 0, 0);
 
 	/* ECDH */
 	SELFTEST("fips-ecdh-nist-p192-generic", "ecdh-nist-p192", 0, 0);
