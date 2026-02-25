@@ -39,6 +39,7 @@ fips_module-y :=					\
 	crypto/sha512.o					\
 	crypto/sha3_generic.o				\
 							\
+	crypto/authenc.o				\
 	crypto/hmac.o					\
 	crypto/cmac.o					\
 							\
