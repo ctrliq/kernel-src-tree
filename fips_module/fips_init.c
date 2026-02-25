@@ -243,6 +243,18 @@ static int fips_run_selftests(void)
 	SELFTEST("rfc4309(ccm(aes))", "rfc4309(ccm(aes))", 0, 0);
 
 	/* ---------------------------------------------------------------
+	 * ESSIV: Encrypted Salt-Sector IV Generation.
+	 * Used by dm-crypt and fscrypt for sector-based IV generation.
+	 * Both the skcipher variant (essiv(cbc(aes),sha256)) and the AEAD
+	 * variant (essiv(authenc(hmac(sha256),cbc(aes)),sha256)) are
+	 * fips_allowed=1.  authenc must be registered before essiv.
+	 * --------------------------------------------------------------- */
+	SELFTEST("essiv(cbc(aes),sha256)",
+		 "essiv(cbc(aes),sha256)", 0, 0);
+	SELFTEST("essiv(authenc(hmac(sha256),cbc(aes)),sha256)",
+		 "essiv(authenc(hmac(sha256),cbc(aes)),sha256)", 0, 0);
+
+	/* ---------------------------------------------------------------
 	 * Asymmetric / key-agreement algorithms
 	 * --------------------------------------------------------------- */
 	/* RSA */
@@ -493,6 +505,12 @@ static int __init fips_module_init(void)
 		goto err_ccm;
 	}
 
+	ret = fips_essiv_init();
+	if (ret) {
+		pr_err("fips_module: essiv init failed: %d\n", ret);
+		goto err_essiv;
+	}
+
 	ret = fips_kdf_sp800108_init();
 	if (ret) {
 		pr_err("fips_module: kdf_sp800108 init failed: %d\n", ret);
@@ -567,6 +585,8 @@ err_ecdsa:
 err_rsa:
 	fips_kdf_sp800108_exit();
 err_kdf:
+	fips_essiv_exit();
+err_essiv:
 	fips_ccm_exit();
 err_ccm:
 	fips_authenc_exit();
@@ -624,6 +644,7 @@ static void __exit fips_module_exit(void)
 	fips_ecdsa_exit();
 	fips_rsa_exit();
 	fips_kdf_sp800108_exit();
+	fips_essiv_exit();
 	fips_ccm_exit();
 	fips_authenc_exit();
 	fips_cmac_exit();
