@@ -1,0 +1,270 @@
+page_pool: Fix use-after-free in page_pool_recycle_in_ring
+
+jira KERNEL-691
+cve CVE-2025-38129
+Rebuild_History Non-Buildable kernel-4.18.0-553.107.1.el8_10
+commit-author Dong Chenchen <dongchenchen2@huawei.com>
+commit 271683bb2cf32e5126c592b5d5e6a756fa374fd9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.107.1.el8_10/271683bb.failed
+
+syzbot reported a uaf in page_pool_recycle_in_ring:
+
+BUG: KASAN: slab-use-after-free in lock_release+0x151/0xa30 kernel/locking/lockdep.c:5862
+Read of size 8 at addr ffff8880286045a0 by task syz.0.284/6943
+
+CPU: 0 UID: 0 PID: 6943 Comm: syz.0.284 Not tainted 6.13.0-rc3-syzkaller-gdfa94ce54f41 #0
+Hardware name: Google Google Compute Engine/Google Compute Engine, BIOS Google 09/13/2024
+Call Trace:
+ <TASK>
+ __dump_stack lib/dump_stack.c:94 [inline]
+ dump_stack_lvl+0x241/0x360 lib/dump_stack.c:120
+ print_address_description mm/kasan/report.c:378 [inline]
+ print_report+0x169/0x550 mm/kasan/report.c:489
+ kasan_report+0x143/0x180 mm/kasan/report.c:602
+ lock_release+0x151/0xa30 kernel/locking/lockdep.c:5862
+ __raw_spin_unlock_bh include/linux/spinlock_api_smp.h:165 [inline]
+ _raw_spin_unlock_bh+0x1b/0x40 kernel/locking/spinlock.c:210
+ spin_unlock_bh include/linux/spinlock.h:396 [inline]
+ ptr_ring_produce_bh include/linux/ptr_ring.h:164 [inline]
+ page_pool_recycle_in_ring net/core/page_pool.c:707 [inline]
+ page_pool_put_unrefed_netmem+0x748/0xb00 net/core/page_pool.c:826
+ page_pool_put_netmem include/net/page_pool/helpers.h:323 [inline]
+ page_pool_put_full_netmem include/net/page_pool/helpers.h:353 [inline]
+ napi_pp_put_page+0x149/0x2b0 net/core/skbuff.c:1036
+ skb_pp_recycle net/core/skbuff.c:1047 [inline]
+ skb_free_head net/core/skbuff.c:1094 [inline]
+ skb_release_data+0x6c4/0x8a0 net/core/skbuff.c:1125
+ skb_release_all net/core/skbuff.c:1190 [inline]
+ __kfree_skb net/core/skbuff.c:1204 [inline]
+ sk_skb_reason_drop+0x1c9/0x380 net/core/skbuff.c:1242
+ kfree_skb_reason include/linux/skbuff.h:1263 [inline]
+ __skb_queue_purge_reason include/linux/skbuff.h:3343 [inline]
+
+root cause is:
+
+page_pool_recycle_in_ring
+  ptr_ring_produce
+    spin_lock(&r->producer_lock);
+    WRITE_ONCE(r->queue[r->producer++], ptr)
+      //recycle last page to pool
+				page_pool_release
+				  page_pool_scrub
+				    page_pool_empty_ring
+				      ptr_ring_consume
+				      page_pool_return_page  //release all page
+				  __page_pool_destroy
+				     free_percpu(pool->recycle_stats);
+				     free(pool) //free
+
+     spin_unlock(&r->producer_lock); //pool->ring uaf read
+  recycle_stat_inc(pool, ring);
+
+page_pool can be free while page pool recycle the last page in ring.
+Add producer-lock barrier to page_pool_release to prevent the page
+pool from being free before all pages have been recycled.
+
+recycle_stat_inc() is empty when CONFIG_PAGE_POOL_STATS is not
+enabled, which will trigger Wempty-body build warning. Add definition
+for pool stat macro to fix warning.
+
+	Suggested-by: Jakub Kicinski <kuba@kernel.org>
+Link: https://lore.kernel.org/netdev/20250513083123.3514193-1-dongchenchen2@huawei.com
+Fixes: ff7d6b27f894 ("page_pool: refurbish version of page_pool code")
+	Reported-by: syzbot+204a4382fcb3311f3858@syzkaller.appspotmail.com
+Closes: https://syzkaller.appspot.com/bug?extid=204a4382fcb3311f3858
+	Signed-off-by: Dong Chenchen <dongchenchen2@huawei.com>
+	Reviewed-by: Toke Høiland-Jørgensen <toke@redhat.com>
+	Reviewed-by: Mina Almasry <almasrymina@google.com>
+Link: https://patch.msgid.link/20250527114152.3119109-1-dongchenchen2@huawei.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 271683bb2cf32e5126c592b5d5e6a756fa374fd9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/page_pool.c
+diff --cc net/core/page_pool.c
+index 68ffa0e55489,ba7cf3e3c32f..000000000000
+--- a/net/core/page_pool.c
++++ b/net/core/page_pool.c
+@@@ -23,6 -30,134 +23,130 @@@
+  #define DEFER_TIME (msecs_to_jiffies(1000))
+  #define DEFER_WARN_INTERVAL (60 * HZ)
+  
+++<<<<<<< HEAD
+++=======
++ #define BIAS_MAX	(LONG_MAX >> 1)
++ 
++ #ifdef CONFIG_PAGE_POOL_STATS
++ static DEFINE_PER_CPU(struct page_pool_recycle_stats, pp_system_recycle_stats);
++ 
++ /* alloc_stat_inc is intended to be used in softirq context */
++ #define alloc_stat_inc(pool, __stat)	(pool->alloc_stats.__stat++)
++ /* recycle_stat_inc is safe to use when preemption is possible. */
++ #define recycle_stat_inc(pool, __stat)							\
++ 	do {										\
++ 		struct page_pool_recycle_stats __percpu *s = pool->recycle_stats;	\
++ 		this_cpu_inc(s->__stat);						\
++ 	} while (0)
++ 
++ #define recycle_stat_add(pool, __stat, val)						\
++ 	do {										\
++ 		struct page_pool_recycle_stats __percpu *s = pool->recycle_stats;	\
++ 		this_cpu_add(s->__stat, val);						\
++ 	} while (0)
++ 
++ static const char pp_stats[][ETH_GSTRING_LEN] = {
++ 	"rx_pp_alloc_fast",
++ 	"rx_pp_alloc_slow",
++ 	"rx_pp_alloc_slow_ho",
++ 	"rx_pp_alloc_empty",
++ 	"rx_pp_alloc_refill",
++ 	"rx_pp_alloc_waive",
++ 	"rx_pp_recycle_cached",
++ 	"rx_pp_recycle_cache_full",
++ 	"rx_pp_recycle_ring",
++ 	"rx_pp_recycle_ring_full",
++ 	"rx_pp_recycle_released_ref",
++ };
++ 
++ /**
++  * page_pool_get_stats() - fetch page pool stats
++  * @pool:	pool from which page was allocated
++  * @stats:	struct page_pool_stats to fill in
++  *
++  * Retrieve statistics about the page_pool. This API is only available
++  * if the kernel has been configured with ``CONFIG_PAGE_POOL_STATS=y``.
++  * A pointer to a caller allocated struct page_pool_stats structure
++  * is passed to this API which is filled in. The caller can then report
++  * those stats to the user (perhaps via ethtool, debugfs, etc.).
++  */
++ bool page_pool_get_stats(const struct page_pool *pool,
++ 			 struct page_pool_stats *stats)
++ {
++ 	int cpu = 0;
++ 
++ 	if (!stats)
++ 		return false;
++ 
++ 	/* The caller is responsible to initialize stats. */
++ 	stats->alloc_stats.fast += pool->alloc_stats.fast;
++ 	stats->alloc_stats.slow += pool->alloc_stats.slow;
++ 	stats->alloc_stats.slow_high_order += pool->alloc_stats.slow_high_order;
++ 	stats->alloc_stats.empty += pool->alloc_stats.empty;
++ 	stats->alloc_stats.refill += pool->alloc_stats.refill;
++ 	stats->alloc_stats.waive += pool->alloc_stats.waive;
++ 
++ 	for_each_possible_cpu(cpu) {
++ 		const struct page_pool_recycle_stats *pcpu =
++ 			per_cpu_ptr(pool->recycle_stats, cpu);
++ 
++ 		stats->recycle_stats.cached += pcpu->cached;
++ 		stats->recycle_stats.cache_full += pcpu->cache_full;
++ 		stats->recycle_stats.ring += pcpu->ring;
++ 		stats->recycle_stats.ring_full += pcpu->ring_full;
++ 		stats->recycle_stats.released_refcnt += pcpu->released_refcnt;
++ 	}
++ 
++ 	return true;
++ }
++ EXPORT_SYMBOL(page_pool_get_stats);
++ 
++ u8 *page_pool_ethtool_stats_get_strings(u8 *data)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(pp_stats); i++) {
++ 		memcpy(data, pp_stats[i], ETH_GSTRING_LEN);
++ 		data += ETH_GSTRING_LEN;
++ 	}
++ 
++ 	return data;
++ }
++ EXPORT_SYMBOL(page_pool_ethtool_stats_get_strings);
++ 
++ int page_pool_ethtool_stats_get_count(void)
++ {
++ 	return ARRAY_SIZE(pp_stats);
++ }
++ EXPORT_SYMBOL(page_pool_ethtool_stats_get_count);
++ 
++ u64 *page_pool_ethtool_stats_get(u64 *data, const void *stats)
++ {
++ 	const struct page_pool_stats *pool_stats = stats;
++ 
++ 	*data++ = pool_stats->alloc_stats.fast;
++ 	*data++ = pool_stats->alloc_stats.slow;
++ 	*data++ = pool_stats->alloc_stats.slow_high_order;
++ 	*data++ = pool_stats->alloc_stats.empty;
++ 	*data++ = pool_stats->alloc_stats.refill;
++ 	*data++ = pool_stats->alloc_stats.waive;
++ 	*data++ = pool_stats->recycle_stats.cached;
++ 	*data++ = pool_stats->recycle_stats.cache_full;
++ 	*data++ = pool_stats->recycle_stats.ring;
++ 	*data++ = pool_stats->recycle_stats.ring_full;
++ 	*data++ = pool_stats->recycle_stats.released_refcnt;
++ 
++ 	return data;
++ }
++ EXPORT_SYMBOL(page_pool_ethtool_stats_get);
++ 
++ #else
++ #define alloc_stat_inc(...)	do { } while (0)
++ #define recycle_stat_inc(...)	do { } while (0)
++ #define recycle_stat_add(...)	do { } while (0)
++ #endif
++ 
+++>>>>>>> 271683bb2cf3 (page_pool: Fix use-after-free in page_pool_recycle_in_ring)
+  static bool page_pool_producer_lock(struct page_pool *pool)
+  	__acquires(&pool->ring.producer_lock)
+  {
+@@@ -345,16 -739,18 +469,27 @@@ static void page_pool_return_page(struc
+  	 */
+  }
+  
+ -static bool page_pool_recycle_in_ring(struct page_pool *pool, netmem_ref netmem)
+ +static bool page_pool_recycle_in_ring(struct page_pool *pool, struct page *page)
+  {
+- 	int ret;
++ 	bool in_softirq, ret;
++ 
+  	/* BH protection not needed if current is softirq */
+++<<<<<<< HEAD
+ +	if (in_softirq())
+ +		ret = ptr_ring_produce(&pool->ring, page);
+ +	else
+ +		ret = ptr_ring_produce_bh(&pool->ring, page);
+ +
+ +	return (ret == 0) ? true : false;
+++=======
++ 	in_softirq = page_pool_producer_lock(pool);
++ 	ret = !__ptr_ring_produce(&pool->ring, (__force void *)netmem);
++ 	if (ret)
++ 		recycle_stat_inc(pool, ring);
++ 	page_pool_producer_unlock(pool, in_softirq);
++ 
++ 	return ret;
+++>>>>>>> 271683bb2cf3 (page_pool: Fix use-after-free in page_pool_recycle_in_ring)
+  }
+  
+  /* Only allow direct recycling in special circumstances, into the
+@@@ -537,9 -1151,12 +673,16 @@@ static int page_pool_release(struct pag
+  	int inflight;
+  
+  	page_pool_scrub(pool);
+++<<<<<<< HEAD
+ +	inflight = page_pool_inflight(pool);
+++=======
++ 	inflight = page_pool_inflight(pool, true);
++ 	/* Acquire producer lock to make sure producers have exited. */
++ 	in_softirq = page_pool_producer_lock(pool);
++ 	page_pool_producer_unlock(pool, in_softirq);
+++>>>>>>> 271683bb2cf3 (page_pool: Fix use-after-free in page_pool_recycle_in_ring)
+  	if (!inflight)
+ -		__page_pool_destroy(pool);
+ +		page_pool_free(pool);
+  
+  	return inflight;
+  }
+* Unmerged path net/core/page_pool.c
