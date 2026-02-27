@@ -1656,7 +1656,19 @@ int crypto_ecdh_shared_secret(unsigned int curve_id, unsigned int ndigits,
 
 	nbytes = ndigits << ECC_DIGITS_TO_BYTES_SHIFT;
 
-	get_random_bytes(rand_z, nbytes);
+	/* fips_module: use in-boundary jent for the point-mult blinding scalar */
+	{
+		struct crypto_rng *jent = crypto_alloc_rng("fips-jitterentropy_rng",
+							   0, 0);
+		if (IS_ERR(jent)) {
+			ret = PTR_ERR(jent);
+			goto out;
+		}
+		ret = crypto_rng_get_bytes(jent, (u8 *)rand_z, nbytes);
+		crypto_free_rng(jent);
+		if (ret)
+			goto out;
+	}
 
 	pk = ecc_alloc_point(ndigits);
 	if (!pk) {
