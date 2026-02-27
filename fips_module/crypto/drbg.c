@@ -1046,8 +1046,14 @@ static inline int drbg_get_random_bytes(struct drbg_state *drbg,
 {
 	int ret;
 
+	/* fips_module: jent is mandatory; never call get_random_bytes() */
+	if (!drbg->jent)
+		return -ENODEV;
+
 	do {
-		get_random_bytes(entropy, entropylen);
+		ret = crypto_rng_get_bytes(drbg->jent, entropy, entropylen);
+		if (ret)
+			return ret;
 		ret = drbg_fips_continuous_test(drbg, entropy);
 		if (ret && ret != -EAGAIN)
 			return ret;
