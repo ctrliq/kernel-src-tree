@@ -143,7 +143,7 @@ static void destroy_pid_namespace(struct pid_namespace *ns)
 	call_rcu(&ns->rcu, delayed_free_pidns);
 }
 
-struct pid_namespace *copy_pid_ns(unsigned long flags,
+struct pid_namespace *copy_pid_ns(u64 flags,
 	struct user_namespace *user_ns, struct pid_namespace *old_ns)
 {
 	if (!(flags & CLONE_NEWPID))
