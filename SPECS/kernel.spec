@@ -171,8 +171,6 @@ Summary: The Linux kernel
 %define patchlevel 12
 # This allows pkg_release to have configurable %%{?dist} tag
 %define specrelease 1%{?buildid}%{?dist}
-# This defines the kabi tarball version
-%define kabiversion 6.12.63-1.1.0.0.el9_clk
 
 # If this variable is set to 1, a bpf selftests build failure will cause a
 # fatal kernel package build error
@@ -234,8 +232,6 @@ Summary: The Linux kernel
 %define with_tools     %{?_without_tools:     0} %{?!_without_tools:     1}
 # kernel-debuginfo
 %define with_debuginfo %{?_without_debuginfo: 0} %{?!_without_debuginfo: 1}
-# kernel-abi-stablelists
-%define with_kernel_abi_stablelists %{?_without_kernel_abi_stablelists: 0} %{?!_without_kernel_abi_stablelists: 1}
 # internal samples and selftests
 %define with_selftests %{?_without_selftests: 0} %{?!_without_selftests: 1}
 #
@@ -249,17 +245,6 @@ Summary: The Linux kernel
 %define with_rtonly    %{?_with_rtonly:       1} %{?!_with_rtonly:       0}
 # Only build the automotive kernel (--with automotiveonly):%
 %define with_automotiveonly %{?_with_automotiveonly:       1} %{?!_with_automotiveonly:       0}
-# Control whether we perform a compat. check against published ABI.
-%define with_kabichk   %{?_without_kabichk:   0} %{?!_without_kabichk:   1}
-# Temporarily disable kabi checks until RC.
-%define with_kabichk 0
-# Control whether we perform a compat. check against DUP ABI.
-%define with_kabidupchk %{?_with_kabidupchk:  1} %{?!_with_kabidupchk:   0}
-#
-# Control whether to run an extensive DWARF based kABI check.
-# Note that this option needs to have baseline setup in SOURCE300.
-%define with_kabidwchk %{?_without_kabidwchk: 0} %{?!_without_kabidwchk: 1}
-%define with_kabidw_base %{?_with_kabidw_base: 1} %{?!_with_kabidw_base: 0}
 #
 # Control whether to install the vdso directories.
 %define with_vdso_install %{?_without_vdso_install: 0} %{?!_without_vdso_install: 1}
@@ -303,8 +288,6 @@ Summary: The Linux kernel
 %define with_cross_headers 0
 # no ipa_clone for now
 %define with_ipaclones 0
-# no stablelist
-%define with_kernel_abi_stablelists 0
 %define with_arm64_64k 0
 %define with_realtime 0
 %define with_automotive 0
@@ -332,19 +315,9 @@ Summary: The Linux kernel
 %global with_ipaclones 0
 %endif
 
-# turn off debug kernel and kabichk for gcov builds
+# turn off debug kernel for gcov builds
 %if %{with_gcov}
 %define with_debug 0
-%define with_kabichk 0
-%define with_kabidupchk 0
-%define with_kabidwchk 0
-%define with_kabidw_base 0
-%define with_kernel_abi_stablelists 0
-%endif
-
-# turn off kABI DWARF-based check if we're generating the base dataset
-%if %{with_kabidw_base}
-%define with_kabidwchk 0
 %endif
 
 # kpatch_kcflags are extra compiler flags applied to base kernel
@@ -393,7 +366,6 @@ Summary: The Linux kernel
 %define with_perf 0
 %define with_libperf 0
 %define with_tools 0
-%define with_kernel_abi_stablelists 0
 %define with_selftests 0
 %define with_ipaclones 0
 %endif
@@ -405,7 +377,6 @@ Summary: The Linux kernel
 %define with_perf 0
 %define with_libperf 0
 %define with_tools 0
-%define with_kernel_abi_stablelists 0
 %define with_selftests 0
 %define with_ipaclones 0
 %endif
@@ -421,7 +392,6 @@ Summary: The Linux kernel
 %define with_perf 0
 %define with_libperf 0
 %define with_tools 0
-%define with_kernel_abi_stablelists 0
 %define with_selftests 0
 %define with_ipaclones 0
 %define with_headers 0
@@ -465,9 +435,6 @@ Summary: The Linux kernel
 %define with_perf 0
 %define with_libperf 0
 %define with_tools 0
-%define with_kabichk 0
-%define with_kernel_abi_stablelists 0
-%define with_kabidw_base 0
 %define with_ipaclones 0
 %endif
 
@@ -477,18 +444,8 @@ Summary: The Linux kernel
 # for parallel xz processes, replace with 1 to go back to single process
 %endif
 
-# turn off kABI DUP check and DWARF-based check if kABI check is disabled
-%if !%{with_kabichk}
-%define with_kabidupchk 0
-%define with_kabidwchk 0
-%endif
-
 %if %{with_vdso_install}
 %define use_vdso 1
-%endif
-
-%ifnarch noarch
-%define with_kernel_abi_stablelists 0
 %endif
 
 # Overrides for generic default options
@@ -794,9 +751,6 @@ BuildConflicts: dwarves < 1.13
 %global _missing_build_ids_terminate_build 1
 %global _no_recompute_build_ids 1
 %endif
-%if %{with_kabidwchk} || %{with_kabidw_base}
-BuildRequires: kabi-dw
-%endif
 
 %if %{signkernel}%{signmodules}
 BuildRequires: openssl
@@ -1042,23 +996,6 @@ Source106: fedoraimaca.x509
 %endif
 
 %define ima_cert_name ima.cer
-
-Source200: check-kabi
-
-Source201: Module.kabi_aarch64
-Source202: Module.kabi_ppc64le
-Source203: Module.kabi_s390x
-Source204: Module.kabi_x86_64
-Source205: Module.kabi_riscv64
-
-Source210: Module.kabi_dup_aarch64
-Source211: Module.kabi_dup_ppc64le
-Source212: Module.kabi_dup_s390x
-Source213: Module.kabi_dup_x86_64
-Source214: Module.kabi_dup_riscv64
-
-Source300: kernel-abi-stablelists-%{kabiversion}.tar.xz
-Source301: kernel-kabi-dw-%{kabiversion}.tar.xz
 
 %if 0%{include_rt}
 %if 0%{include_rhel}
@@ -1381,24 +1318,6 @@ Summary: gcov graph and source files for coverage data collection.\
 %description %{?1:%{1}-}gcov\
 %{?1:%{1}-}gcov includes the gcov graph and source files for gcov coverage collection.\
 %{nil}
-
-%package -n %{package_name}-abi-stablelists
-Summary: The Red Hat Enterprise Linux kernel ABI symbol stablelists
-AutoReqProv: no
-%description -n %{package_name}-abi-stablelists
-The kABI package contains information pertaining to the Red Hat Enterprise
-Linux kernel ABI, including lists of kernel symbols that are needed by
-external Linux kernel modules, and a yum plugin to aid enforcement.
-
-%if %{with_kabidw_base}
-%package kernel-kabidw-base-internal
-Summary: The baseline dataset for kABI verification using DWARF data
-Group: System Environment/Kernel
-AutoReqProv: no
-%description kernel-kabidw-base-internal
-The package contains data describing the current ABI of the Red Hat Enterprise
-Linux kernel, suitable for the kabi-dw tool.
-%endif
 
 #
 # This macro creates a kernel-<subpackage>-debuginfo package.
@@ -2466,7 +2385,7 @@ BuildKernel() {
       cp Module.markers $RPM_BUILD_ROOT/lib/modules/$KernelVer/build
     fi
 
-    # create the kABI metadata for use in packaging
+    # create the kernel ABI metadata for use in packaging
     # NOTENOTE: the name symvers is used by the rpm backend
     # NOTENOTE: to discover and run the /usr/lib/rpm/fileattrs/kabi.attr
     # NOTENOTE: script which dynamically adds exported kernel symbol
@@ -2475,79 +2394,6 @@ BuildKernel() {
     %{log_msg "GENERATING kernel ABI metadata"}
     %compression --stdout %compression_flags < Module.symvers > $RPM_BUILD_ROOT/boot/symvers-$KernelVer.%compext
     cp $RPM_BUILD_ROOT/boot/symvers-$KernelVer.%compext $RPM_BUILD_ROOT/lib/modules/$KernelVer/symvers.%compext
-
-%if %{with_kabichk}
-    %{log_msg "kABI checking is enabled in kernel SPEC file."}
-    chmod 0755 $RPM_SOURCE_DIR/check-kabi
-    if [ -e $RPM_SOURCE_DIR/Module.kabi_%{_target_cpu}$Variant ]; then
-        cp $RPM_SOURCE_DIR/Module.kabi_%{_target_cpu}$Variant $RPM_BUILD_ROOT/Module.kabi
-        $RPM_SOURCE_DIR/check-kabi -k $RPM_BUILD_ROOT/Module.kabi -s Module.symvers || exit 1
-        # for now, don't keep it around.
-        rm $RPM_BUILD_ROOT/Module.kabi
-    else
-	%{log_msg "NOTE: Cannot find reference Module.kabi file."}
-    fi
-%endif
-
-%if %{with_kabidupchk}
-    %{log_msg "kABI DUP checking is enabled in kernel SPEC file."}
-    if [ -e $RPM_SOURCE_DIR/Module.kabi_dup_%{_target_cpu}$Variant ]; then
-        cp $RPM_SOURCE_DIR/Module.kabi_dup_%{_target_cpu}$Variant $RPM_BUILD_ROOT/Module.kabi
-        $RPM_SOURCE_DIR/check-kabi -k $RPM_BUILD_ROOT/Module.kabi -s Module.symvers || exit 1
-        # for now, don't keep it around.
-        rm $RPM_BUILD_ROOT/Module.kabi
-    else
-	%{log_msg "NOTE: Cannot find DUP reference Module.kabi file."}
-    fi
-%endif
-
-%if %{with_kabidw_base}
-    # Don't build kabi base for debug kernels
-    if [ "$Variant" != "zfcpdump" -a "$Variant" != "debug" ]; then
-        mkdir -p $RPM_BUILD_ROOT/kabi-dwarf
-        tar -xvf %{SOURCE301} -C $RPM_BUILD_ROOT/kabi-dwarf
-
-        mkdir -p $RPM_BUILD_ROOT/kabi-dwarf/stablelists
-        tar -xvf %{SOURCE300} -C $RPM_BUILD_ROOT/kabi-dwarf/stablelists
-
-	%{log_msg "GENERATING DWARF-based kABI baseline dataset"}
-        chmod 0755 $RPM_BUILD_ROOT/kabi-dwarf/run_kabi-dw.sh
-        $RPM_BUILD_ROOT/kabi-dwarf/run_kabi-dw.sh generate \
-            "$RPM_BUILD_ROOT/kabi-dwarf/stablelists/kabi-current/kabi_stablelist_%{_target_cpu}" \
-            "$(pwd)" \
-            "$RPM_BUILD_ROOT/kabidw-base/%{_target_cpu}${Variant:+.${Variant}}" || :
-
-        rm -rf $RPM_BUILD_ROOT/kabi-dwarf
-    fi
-%endif
-
-%if %{with_kabidwchk}
-    if [ "$Variant" != "zfcpdump" ]; then
-        mkdir -p $RPM_BUILD_ROOT/kabi-dwarf
-        tar -xvf %{SOURCE301} -C $RPM_BUILD_ROOT/kabi-dwarf
-        if [ -d "$RPM_BUILD_ROOT/kabi-dwarf/base/%{_target_cpu}${Variant:+.${Variant}}" ]; then
-            mkdir -p $RPM_BUILD_ROOT/kabi-dwarf/stablelists
-            tar -xvf %{SOURCE300} -C $RPM_BUILD_ROOT/kabi-dwarf/stablelists
-
-	    %{log_msg "GENERATING DWARF-based kABI dataset"}
-            chmod 0755 $RPM_BUILD_ROOT/kabi-dwarf/run_kabi-dw.sh
-            $RPM_BUILD_ROOT/kabi-dwarf/run_kabi-dw.sh generate \
-                "$RPM_BUILD_ROOT/kabi-dwarf/stablelists/kabi-current/kabi_stablelist_%{_target_cpu}" \
-                "$(pwd)" \
-                "$RPM_BUILD_ROOT/kabi-dwarf/base/%{_target_cpu}${Variant:+.${Variant}}.tmp" || :
-
-	    %{log_msg "kABI DWARF-based comparison report"}
-            $RPM_BUILD_ROOT/kabi-dwarf/run_kabi-dw.sh compare \
-                "$RPM_BUILD_ROOT/kabi-dwarf/base/%{_target_cpu}${Variant:+.${Variant}}" \
-                "$RPM_BUILD_ROOT/kabi-dwarf/base/%{_target_cpu}${Variant:+.${Variant}}.tmp" || :
-	    %{log_msg "End of kABI DWARF-based comparison report"}
-        else
-	    %{log_msg "Baseline dataset for kABI DWARF-BASED comparison report not found"}
-        fi
-
-        rm -rf $RPM_BUILD_ROOT/kabi-dwarf
-    fi
-%endif
 
    %{log_msg "Cleanup Makefiles/Kconfig files"}
     # then drop all but the needed Makefiles/Kconfig files
@@ -3433,16 +3279,6 @@ done
 rm -rf $RPM_BUILD_ROOT/usr/tmp-headers
 %endif
 
-%if %{with_kernel_abi_stablelists}
-# kabi directory
-INSTALL_KABI_PATH=$RPM_BUILD_ROOT/lib/modules/
-mkdir -p $INSTALL_KABI_PATH
-
-# install kabi releases directories
-tar -xvf %{SOURCE300} -C $INSTALL_KABI_PATH
-# with_kernel_abi_stablelists
-%endif
-
 %if %{with_perf}
 # perf tool binary and supporting scripts/binaries
 %{perf_make} DESTDIR=$RPM_BUILD_ROOT lib=%{_lib} install-bin
@@ -3940,19 +3776,6 @@ fi\
 %if %{with_cross_headers}
 %files cross-headers
 /usr/*-linux-gnu/include/*
-%endif
-
-%if %{with_kernel_abi_stablelists}
-%files -n %{package_name}-abi-stablelists
-/lib/modules/kabi-*
-%endif
-
-%if %{with_kabidw_base}
-%ifarch x86_64 s390x ppc64 ppc64le aarch64 riscv64
-%files kernel-kabidw-base-internal
-%defattr(-,root,root)
-/kabidw-base/%{_target_cpu}/*
-%endif
 %endif
 
 # only some architecture builds need kernel-doc
