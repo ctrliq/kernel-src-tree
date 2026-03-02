@@ -95,6 +95,7 @@ struct udp_sock {
 
 	/* Cache friendly copy of sk->sk_peek_off >= 0 */
 	bool		peeking_with_offset;
+	struct numa_drop_counters drop_counters;
 };
 
 #define udp_test_bit(nr, sk)			\

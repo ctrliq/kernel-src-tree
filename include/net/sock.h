@@ -282,6 +282,7 @@ struct sk_filter;
   *	@sk_err_soft: errors that don't cause failure but are the cause of a
   *		      persistent failure not just 'timed out'
   *	@sk_drops: raw/udp drops counter
+  *	@sk_drop_counters: optional pointer to numa_drop_counters
   *	@sk_ack_backlog: current listen backlog
   *	@sk_max_ack_backlog: listen backlog set in listen()
   *	@sk_uid: user id of owner
@@ -442,6 +443,7 @@ struct sock {
 #ifdef CONFIG_XFRM
 	struct xfrm_policy __rcu *sk_policy[2];
 #endif
+	struct numa_drop_counters *sk_drop_counters;
 	__cacheline_group_end(sock_read_rxtx);
 
 	__cacheline_group_begin(sock_write_rxtx);
@@ -2629,18 +2631,53 @@ struct sock_skb_cb {
 #define sock_skb_cb_check_size(size) \
 	BUILD_BUG_ON((size) > SOCK_SKB_CB_OFFSET)
 
+static inline void sk_drops_add(struct sock *sk, int segs)
+{
+	struct numa_drop_counters *ndc = sk->sk_drop_counters;
+
+	if (ndc)
+		numa_drop_add(ndc, segs);
+	else
+		atomic_add(segs, &sk->sk_drops);
+}
+
+static inline void sk_drops_inc(struct sock *sk)
+{
+	sk_drops_add(sk, 1);
+}
+
+static inline int sk_drops_read(const struct sock *sk)
+{
+	const struct numa_drop_counters *ndc = sk->sk_drop_counters;
+
+	if (ndc) {
+		DEBUG_NET_WARN_ON_ONCE(atomic_read(&sk->sk_drops));
+		return numa_drop_read(ndc);
+	}
+	return atomic_read(&sk->sk_drops);
+}
+
+static inline void sk_drops_reset(struct sock *sk)
+{
+	struct numa_drop_counters *ndc = sk->sk_drop_counters;
+
+	if (ndc)
+		numa_drop_reset(ndc);
+	atomic_set(&sk->sk_drops, 0);
+}
+
 static inline void
 sock_skb_set_dropcount(const struct sock *sk, struct sk_buff *skb)
 {
 	SOCK_SKB_CB(skb)->dropcount = sock_flag(sk, SOCK_RXQ_OVFL) ?
-						atomic_read(&sk->sk_drops) : 0;
+						sk_drops_read(sk) : 0;
 }
 
-static inline void sk_drops_add(struct sock *sk, const struct sk_buff *skb)
+static inline void sk_drops_skbadd(struct sock *sk, const struct sk_buff *skb)
 {
 	int segs = max_t(u16, 1, skb_shinfo(skb)->gso_segs);
 
-	atomic_add(segs, &sk->sk_drops);
+	sk_drops_add(sk, segs);
 }
 
 static inline ktime_t sock_read_timestamp(struct sock *sk)
