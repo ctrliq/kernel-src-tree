@@ -14,6 +14,8 @@
 #include <linux/jiffies.h>
 #include <linux/gfp.h>
 #include <linux/dma-mapping.h>
+#include <linux/t10-pi.h>
+#include <linux/crc64.h>
 
 #include "blk.h"
 #include "blk-rq-qos.h"
@@ -50,6 +52,8 @@ void blk_set_stacking_limits(struct queue_limits *lim)
 	lim->max_sectors = UINT_MAX;
 	lim->max_dev_sectors = UINT_MAX;
 	lim->max_write_zeroes_sectors = UINT_MAX;
+	lim->max_hw_wzeroes_unmap_sectors = UINT_MAX;
+	lim->max_user_wzeroes_unmap_sectors = UINT_MAX;
 	lim->max_hw_zone_append_sectors = UINT_MAX;
 	lim->max_user_discard_sectors = UINT_MAX;
 	lim->atomic_write_hw_max = UINT_MAX;
@@ -59,16 +63,24 @@ EXPORT_SYMBOL(blk_set_stacking_limits);
 void blk_apply_bdi_limits(struct backing_dev_info *bdi,
 		struct queue_limits *lim)
 {
+	u64 io_opt = lim->io_opt;
+
 	/*
 	 * For read-ahead of large files to be effective, we need to read ahead
-	 * at least twice the optimal I/O size.
+	 * at least twice the optimal I/O size. For rotational devices that do
+	 * not report an optimal I/O size (e.g. ATA HDDs), use the maximum I/O
+	 * size to avoid falling back to the (rather inefficient) small default
+	 * read-ahead size.
 	 *
 	 * There is no hardware limitation for the read-ahead size and the user
 	 * might have increased the read-ahead size through sysfs, so don't ever
 	 * decrease it.
 	 */
+	if (!io_opt && (lim->features & BLK_FEAT_ROTATIONAL))
+		io_opt = (u64)lim->max_sectors << SECTOR_SHIFT;
+
 	bdi->ra_pages = max3(bdi->ra_pages,
-				lim->io_opt * 2 / PAGE_SIZE,
+				io_opt * 2 >> PAGE_SHIFT,
 				VM_READAHEAD_PAGES);
 	bdi->io_pages = lim->max_sectors >> PAGE_SECTORS_SHIFT;
 }
@@ -111,11 +123,24 @@ static int blk_validate_zoned_limits(struct queue_limits *lim)
 	return 0;
 }
 
+/*
+ * Maximum size of I/O that needs a block layer integrity buffer.  Limited
+ * by the number of intervals for which we can fit the integrity buffer into
+ * the buffer size.  Because the buffer is a single segment it is also limited
+ * by the maximum segment size.
+ */
+static inline unsigned int max_integrity_io_size(struct queue_limits *lim)
+{
+	return min_t(unsigned int, lim->max_segment_size,
+		(BLK_INTEGRITY_MAX_SIZE / lim->integrity.metadata_size) <<
+			lim->integrity.interval_exp);
+}
+
 static int blk_validate_integrity_limits(struct queue_limits *lim)
 {
 	struct blk_integrity *bi = &lim->integrity;
 
-	if (!bi->tuple_size) {
+	if (!bi->metadata_size) {
 		if (bi->csum_type != BLK_INTEGRITY_CSUM_NONE ||
 		    bi->tag_size || ((bi->flags & BLK_INTEGRITY_REF_TAG))) {
 			pr_warn("invalid PI settings.\n");
@@ -136,8 +161,63 @@ static int blk_validate_integrity_limits(struct queue_limits *lim)
 		return -EINVAL;
 	}
 
-	if (!bi->interval_exp)
+	if (bi->pi_offset + bi->pi_tuple_size > bi->metadata_size) {
+		pr_warn("pi_offset (%u) + pi_tuple_size (%u) exceeds metadata_size (%u)\n",
+			bi->pi_offset, bi->pi_tuple_size, bi->metadata_size);
+		return -EINVAL;
+	}
+
+	switch (bi->csum_type) {
+	case BLK_INTEGRITY_CSUM_NONE:
+		if (bi->pi_tuple_size) {
+			pr_warn("pi_tuple_size must be 0 when checksum type is none\n");
+			return -EINVAL;
+		}
+		break;
+	case BLK_INTEGRITY_CSUM_CRC:
+	case BLK_INTEGRITY_CSUM_IP:
+		if (bi->pi_tuple_size != sizeof(struct t10_pi_tuple)) {
+			pr_warn("pi_tuple_size mismatch for T10 PI: expected %zu, got %u\n",
+				 sizeof(struct t10_pi_tuple),
+				 bi->pi_tuple_size);
+			return -EINVAL;
+		}
+		break;
+	case BLK_INTEGRITY_CSUM_CRC64:
+		if (bi->pi_tuple_size != sizeof(struct crc64_pi_tuple)) {
+			pr_warn("pi_tuple_size mismatch for CRC64 PI: expected %zu, got %u\n",
+				 sizeof(struct crc64_pi_tuple),
+				 bi->pi_tuple_size);
+			return -EINVAL;
+		}
+		break;
+	}
+
+	if (!bi->interval_exp) {
 		bi->interval_exp = ilog2(lim->logical_block_size);
+	} else if (bi->interval_exp < SECTOR_SHIFT ||
+		   bi->interval_exp > ilog2(lim->logical_block_size)) {
+		pr_warn("invalid interval_exp %u\n", bi->interval_exp);
+		return -EINVAL;
+	}
+
+	/*
+	 * The PI generation / validation helpers do not expect intervals to
+	 * straddle multiple bio_vecs.  Enforce alignment so that those are
+	 * never generated, and that each buffer is aligned as expected.
+	 */
+	if (bi->csum_type) {
+		lim->dma_alignment = max(lim->dma_alignment,
+					(1U << bi->interval_exp) - 1);
+	}
+
+	/*
+	 * The block layer automatically adds integrity data for bios that don't
+	 * already have it.  Limit the I/O size so that a single maximum size
+	 * metadata segment can cover the integrity data for the entire I/O.
+	 */
+	lim->max_sectors = min(lim->max_sectors,
+		max_integrity_io_size(lim) >> SECTOR_SHIFT);
 
 	return 0;
 }
@@ -287,8 +367,12 @@ int blk_validate_limits(struct queue_limits *lim)
 		pr_warn("Invalid logical block size (%d)\n", lim->logical_block_size);
 		return -EINVAL;
 	}
-	if (lim->physical_block_size < lim->logical_block_size)
+	if (lim->physical_block_size < lim->logical_block_size) {
 		lim->physical_block_size = lim->logical_block_size;
+	} else if (!is_power_of_2(lim->physical_block_size)) {
+		pr_warn("Invalid physical block size (%d)\n", lim->physical_block_size);
+		return -EINVAL;
+	}
 
 	/*
 	 * The minimum I/O size defaults to the physical block size unless
@@ -354,14 +438,27 @@ int blk_validate_limits(struct queue_limits *lim)
 	if (!lim->max_segments)
 		lim->max_segments = BLK_MAX_SEGMENTS;
 
+	if (lim->max_hw_wzeroes_unmap_sectors &&
+	    lim->max_hw_wzeroes_unmap_sectors != lim->max_write_zeroes_sectors)
+		return -EINVAL;
+	lim->max_wzeroes_unmap_sectors = min(lim->max_hw_wzeroes_unmap_sectors,
+			lim->max_user_wzeroes_unmap_sectors);
+
 	lim->max_discard_sectors =
 		min(lim->max_hw_discard_sectors, lim->max_user_discard_sectors);
 
+	/*
+	 * When discard is not supported, discard_granularity should be reported
+	 * as 0 to userspace.
+	 */
+	if (lim->max_discard_sectors)
+		lim->discard_granularity =
+			max(lim->discard_granularity, lim->physical_block_size);
+	else
+		lim->discard_granularity = 0;
+
 	if (!lim->max_discard_segments)
 		lim->max_discard_segments = 1;
-
-	if (lim->discard_granularity < lim->physical_block_size)
-		lim->discard_granularity = lim->physical_block_size;
 
 	/*
 	 * By default there is no limit on the segment boundary alignment,
@@ -395,12 +492,12 @@ int blk_validate_limits(struct queue_limits *lim)
 			return -EINVAL;
 	}
 
-	/* setup min segment size for building new segment in fast path */
+	/* setup max segment size for building new segment in fast path */
 	if (lim->seg_boundary_mask > lim->max_segment_size - 1)
 		seg_size = lim->max_segment_size;
 	else
 		seg_size = lim->seg_boundary_mask + 1;
-	lim->min_segment_size = min_t(unsigned int, seg_size, PAGE_SIZE);
+	lim->max_fast_segment_size = min_t(unsigned int, seg_size, PAGE_SIZE);
 
 	/*
 	 * We require drivers to at least do logical block aligned I/O, but
@@ -439,10 +536,11 @@ int blk_set_default_limits(struct queue_limits *lim)
 {
 	/*
 	 * Most defaults are set by capping the bounds in blk_validate_limits,
-	 * but max_user_discard_sectors is special and needs an explicit
-	 * initialization to the max value here.
+	 * but these limits are special and need an explicit initialization to
+	 * the max value here.
 	 */
 	lim->max_user_discard_sectors = UINT_MAX;
+	lim->max_user_wzeroes_unmap_sectors = UINT_MAX;
 	return blk_validate_limits(lim);
 }
 
@@ -461,6 +559,8 @@ int queue_limits_commit_update(struct request_queue *q,
 		struct queue_limits *lim)
 {
 	int error;
+
+	lockdep_assert_held(&q->limits_lock);
 
 	error = blk_validate_limits(lim);
 	if (error)
@@ -696,7 +796,8 @@ unsupported:
 int blk_stack_limits(struct queue_limits *t, struct queue_limits *b,
 		     sector_t start)
 {
-	unsigned int top, bottom, alignment, ret = 0;
+	unsigned int top, bottom, alignment;
+	int ret = 0;
 
 	t->features |= (b->features & BLK_FEAT_INHERIT_MASK);
 
@@ -720,6 +821,13 @@ int blk_stack_limits(struct queue_limits *t, struct queue_limits *b,
 	t->max_dev_sectors = min_not_zero(t->max_dev_sectors, b->max_dev_sectors);
 	t->max_write_zeroes_sectors = min(t->max_write_zeroes_sectors,
 					b->max_write_zeroes_sectors);
+	t->max_user_wzeroes_unmap_sectors =
+			min(t->max_user_wzeroes_unmap_sectors,
+			    b->max_user_wzeroes_unmap_sectors);
+	t->max_hw_wzeroes_unmap_sectors =
+			min(t->max_hw_wzeroes_unmap_sectors,
+			    b->max_hw_wzeroes_unmap_sectors);
+
 	t->max_hw_zone_append_sectors = min(t->max_hw_zone_append_sectors,
 					b->max_hw_zone_append_sectors);
 
@@ -791,7 +899,7 @@ int blk_stack_limits(struct queue_limits *t, struct queue_limits *b,
 	}
 
 	/* chunk_sectors a multiple of the physical block size? */
-	if ((t->chunk_sectors << 9) & (t->physical_block_size - 1)) {
+	if (t->chunk_sectors % (t->physical_block_size >> SECTOR_SHIFT)) {
 		t->chunk_sectors = 0;
 		t->flags |= BLK_FLAG_MISALIGNED;
 		ret = -1;
@@ -887,13 +995,15 @@ bool queue_limits_stack_integrity(struct queue_limits *t,
 		return true;
 
 	if (ti->flags & BLK_INTEGRITY_STACKED) {
-		if (ti->tuple_size != bi->tuple_size)
+		if (ti->metadata_size != bi->metadata_size)
 			goto incompatible;
 		if (ti->interval_exp != bi->interval_exp)
 			goto incompatible;
 		if (ti->tag_size != bi->tag_size)
 			goto incompatible;
 		if (ti->csum_type != bi->csum_type)
+			goto incompatible;
+		if (ti->pi_tuple_size != bi->pi_tuple_size)
 			goto incompatible;
 		if ((ti->flags & BLK_INTEGRITY_REF_TAG) !=
 		    (bi->flags & BLK_INTEGRITY_REF_TAG))
@@ -903,7 +1013,8 @@ bool queue_limits_stack_integrity(struct queue_limits *t,
 		ti->flags |= (bi->flags & BLK_INTEGRITY_DEVICE_CAPABLE) |
 			     (bi->flags & BLK_INTEGRITY_REF_TAG);
 		ti->csum_type = bi->csum_type;
-		ti->tuple_size = bi->tuple_size;
+		ti->pi_tuple_size = bi->pi_tuple_size;
+		ti->metadata_size = bi->metadata_size;
 		ti->pi_offset = bi->pi_offset;
 		ti->interval_exp = bi->interval_exp;
 		ti->tag_size = bi->tag_size;

@@ -9,6 +9,7 @@
 #include <linux/cpu.h>
 #include <linux/crypto.h>
 #include <linux/vmalloc.h>
+#include <linux/sysfs.h>
 
 #include "zcomp.h"
 
@@ -88,23 +89,21 @@ bool zcomp_available_algorithm(const char *comp)
 }
 
 /* show available compressors */
-ssize_t zcomp_available_show(const char *comp, char *buf)
+ssize_t zcomp_available_show(const char *comp, char *buf, ssize_t at)
 {
-	ssize_t sz = 0;
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(backends) - 1; i++) {
 		if (!strcmp(comp, backends[i]->name)) {
-			sz += scnprintf(buf + sz, PAGE_SIZE - sz - 2,
-					"[%s] ", backends[i]->name);
+			at += sysfs_emit_at(buf, at, "[%s] ",
+					    backends[i]->name);
 		} else {
-			sz += scnprintf(buf + sz, PAGE_SIZE - sz - 2,
-					"%s ", backends[i]->name);
+			at += sysfs_emit_at(buf, at, "%s ", backends[i]->name);
 		}
 	}
 
-	sz += scnprintf(buf + sz, PAGE_SIZE - sz, "\n");
-	return sz;
+	at += sysfs_emit_at(buf, at, "\n");
+	return at;
 }
 
 struct zcomp_strm *zcomp_stream_get(struct zcomp *comp)

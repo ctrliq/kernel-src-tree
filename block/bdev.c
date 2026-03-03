@@ -148,6 +148,8 @@ static void set_init_blocksize(struct block_device *bdev)
 		bsize <<= 1;
 	}
 	BD_INODE(bdev)->i_blkbits = blksize_bits(bsize);
+	mapping_set_folio_min_order(BD_INODE(bdev)->i_mapping,
+				    get_order(bsize));
 }
 
 int set_blocksize(struct file *file, int size)
@@ -169,6 +171,7 @@ int set_blocksize(struct file *file, int size)
 	if (inode->i_blkbits != blksize_bits(size)) {
 		sync_blockdev(bdev);
 		inode->i_blkbits = blksize_bits(size);
+		mapping_set_folio_min_order(inode->i_mapping, get_order(size));
 		kill_bdev(bdev);
 	}
 	return 0;
@@ -180,8 +183,7 @@ int sb_set_blocksize(struct super_block *sb, int size)
 {
 	if (set_blocksize(sb->s_bdev_file, size))
 		return 0;
-	/* If we get here, we know size is power of two
-	 * and it's value is between 512 and PAGE_SIZE */
+	/* If we get here, we know size is validated */
 	sb->s_blocksize = size;
 	sb->s_blocksize_bits = blksize_bits(size);
 	return sb->s_blocksize;
@@ -773,13 +775,13 @@ static void blkdev_put_part(struct block_device *part)
 	blkdev_put_whole(whole);
 }
 
-struct block_device *blkdev_get_no_open(dev_t dev)
+struct block_device *blkdev_get_no_open(dev_t dev, bool autoload)
 {
 	struct block_device *bdev;
 	struct inode *inode;
 
 	inode = ilookup(blockdev_superblock, dev);
-	if (!inode && IS_ENABLED(CONFIG_BLOCK_LEGACY_AUTOLOAD)) {
+	if (!inode && autoload && IS_ENABLED(CONFIG_BLOCK_LEGACY_AUTOLOAD)) {
 		blk_request_module(dev);
 		inode = ilookup(blockdev_superblock, dev);
 		if (inode)
@@ -1001,7 +1003,7 @@ struct file *bdev_file_open_by_dev(dev_t dev, blk_mode_t mode, void *holder,
 	if (ret)
 		return ERR_PTR(ret);
 
-	bdev = blkdev_get_no_open(dev);
+	bdev = blkdev_get_no_open(dev, true);
 	if (!bdev)
 		return ERR_PTR(-ENXIO);
 
@@ -1281,7 +1283,7 @@ void bdev_statx(const struct path *path, struct kstat *stat, u32 request_mask)
 	 * to use I_BDEV() here; the block device has to be looked up by i_rdev
 	 * instead.
 	 */
-	bdev = blkdev_get_no_open(backing_inode->i_rdev);
+	bdev = blkdev_get_no_open(backing_inode->i_rdev, false);
 	if (!bdev)
 		return;
 

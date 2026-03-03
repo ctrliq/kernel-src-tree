@@ -297,15 +297,15 @@ static bool bt_iter(struct sbitmap *bitmap, unsigned int bitnr, void *data)
 /**
  * bt_for_each - iterate over the requests associated with a hardware queue
  * @hctx:	Hardware queue to examine.
- * @q:		Request queue to examine.
+ * @q:		Request queue @hctx is associated with (@hctx->queue).
  * @bt:		sbitmap to examine. This is either the breserved_tags member
  *		or the bitmap_tags member of struct blk_mq_tags.
  * @fn:		Pointer to the function that will be called for each request
  *		associated with @hctx that has been assigned a driver tag.
- *		@fn will be called as follows: @fn(@hctx, rq, @data, @reserved)
- *		where rq is a pointer to a request. Return true to continue
- *		iterating tags, false to stop.
- * @data:	Will be passed as third argument to @fn.
+ *		@fn will be called as follows: @fn(rq, @data) where rq is a
+ *		pointer to a request. Return %true to continue iterating tags;
+ *		%false to stop.
+ * @data:	Will be passed as second argument to @fn.
  * @reserved:	Indicates whether @bt is the breserved_tags member or the
  *		bitmap_tags member of struct blk_mq_tags.
  */
@@ -371,9 +371,9 @@ static bool bt_tags_iter(struct sbitmap *bitmap, unsigned int bitnr, void *data)
  * @bt:		sbitmap to examine. This is either the breserved_tags member
  *		or the bitmap_tags member of struct blk_mq_tags.
  * @fn:		Pointer to the function that will be called for each started
- *		request. @fn will be called as follows: @fn(rq, @data,
- *		@reserved) where rq is a pointer to a request. Return true
- *		to continue iterating tags, false to stop.
+ *		request. @fn will be called as follows: @fn(rq, @data) where rq
+ *		is a pointer to a request. Return %true to continue iterating
+ *		tags; %false to stop.
  * @data:	Will be passed as second argument to @fn.
  * @flags:	BT_TAG_ITER_*
  */
@@ -406,10 +406,9 @@ static void __blk_mq_all_tag_iter(struct blk_mq_tags *tags,
  * blk_mq_all_tag_iter - iterate over all requests in a tag map
  * @tags:	Tag map to iterate over.
  * @fn:		Pointer to the function that will be called for each
- *		request. @fn will be called as follows: @fn(rq, @priv,
- *		reserved) where rq is a pointer to a request. 'reserved'
- *		indicates whether or not @rq is a reserved request. Return
- *		true to continue iterating tags, false to stop.
+ *		request. @fn will be called as follows: @fn(rq, @priv) where rq
+ *		is a pointer to a request. Return %true to continue iterating
+ *		tags; %false to stop.
  * @priv:	Will be passed as second argument to @fn.
  *
  * Caller has to pass the tag map from which requests are allocated.
@@ -424,10 +423,9 @@ void blk_mq_all_tag_iter(struct blk_mq_tags *tags, busy_tag_iter_fn *fn,
  * blk_mq_tagset_busy_iter - iterate over all started requests in a tag set
  * @tagset:	Tag set to iterate over.
  * @fn:		Pointer to the function that will be called for each started
- *		request. @fn will be called as follows: @fn(rq, @priv,
- *		reserved) where rq is a pointer to a request. 'reserved'
- *		indicates whether or not @rq is a reserved request. Return
- *		true to continue iterating tags, false to stop.
+ *		request. @fn will be called as follows: @fn(rq, @priv) where
+ *		rq is a pointer to a request. Return true to continue iterating
+ *		tags, false to stop.
  * @priv:	Will be passed as second argument to @fn.
  *
  * We grab one request reference before calling @fn and release it after
@@ -486,11 +484,10 @@ EXPORT_SYMBOL(blk_mq_tagset_wait_completed_request);
  * blk_mq_queue_tag_busy_iter - iterate over all requests with a driver tag
  * @q:		Request queue to examine.
  * @fn:		Pointer to the function that will be called for each request
- *		on @q. @fn will be called as follows: @fn(hctx, rq, @priv,
- *		reserved) where rq is a pointer to a request and hctx points
- *		to the hardware queue associated with the request. 'reserved'
- *		indicates whether or not @rq is a reserved request.
- * @priv:	Will be passed as third argument to @fn.
+ *		on @q. @fn will be called as follows: @fn(rq, @priv) where rq
+ *		is a pointer to a request and hctx points to the hardware queue
+ *		associated with the request.
+ * @priv:	Will be passed as second argument to @fn.
  *
  * Note: if @q->tag_set is shared with other request queues then @fn will be
  * called for all requests on all queues that share that tag set and not only
@@ -502,7 +499,7 @@ void blk_mq_queue_tag_busy_iter(struct request_queue *q, busy_tag_iter_fn *fn,
 	int srcu_idx;
 
 	/*
-	 * __blk_mq_update_nr_hw_queues() updates nr_hw_queues and hctx_table
+	 * __blk_mq_update_nr_hw_queues() updates nr_hw_queues and queue_hw_ctx
 	 * while the queue is frozen. So we can use q_usage_counter to avoid
 	 * racing with it.
 	 */
@@ -618,59 +615,6 @@ void blk_mq_free_tags(struct blk_mq_tag_set *set, struct blk_mq_tags *tags)
 	call_srcu(&set->tags_srcu, &tags->rcu_head, blk_mq_free_tags_callback);
 }
 
-int blk_mq_tag_update_depth(struct blk_mq_hw_ctx *hctx,
-			    struct blk_mq_tags **tagsptr, unsigned int tdepth,
-			    bool can_grow)
-{
-	struct blk_mq_tags *tags = *tagsptr;
-
-	if (tdepth <= tags->nr_reserved_tags)
-		return -EINVAL;
-
-	/*
-	 * If we are allowed to grow beyond the original size, allocate
-	 * a new set of tags before freeing the old one.
-	 */
-	if (tdepth > tags->nr_tags) {
-		struct blk_mq_tag_set *set = hctx->queue->tag_set;
-		struct blk_mq_tags *new;
-
-		if (!can_grow)
-			return -EINVAL;
-
-		/*
-		 * We need some sort of upper limit, set it high enough that
-		 * no valid use cases should require more.
-		 */
-		if (tdepth > MAX_SCHED_RQ)
-			return -EINVAL;
-
-		/*
-		 * Only the sbitmap needs resizing since we allocated the max
-		 * initially.
-		 */
-		if (blk_mq_is_shared_tags(set->flags))
-			return 0;
-
-		new = blk_mq_alloc_map_and_rqs(set, hctx->queue_num, tdepth);
-		if (!new)
-			return -ENOMEM;
-
-		blk_mq_free_map_and_rqs(set, *tagsptr, hctx->queue_num);
-		hctx->queue->elevator->et->tags[hctx->queue_num] = new;
-		*tagsptr = new;
-	} else {
-		/*
-		 * Don't need (or can't) update reserved tags here, they
-		 * remain static and should never need resizing.
-		 */
-		sbitmap_queue_resize(&tags->bitmap_tags,
-				tdepth - tags->nr_reserved_tags);
-	}
-
-	return 0;
-}
-
 void blk_mq_tag_resize_shared_tags(struct blk_mq_tag_set *set, unsigned int size)
 {
 	struct blk_mq_tags *tags = set->shared_tags;
@@ -678,10 +622,11 @@ void blk_mq_tag_resize_shared_tags(struct blk_mq_tag_set *set, unsigned int size
 	sbitmap_queue_resize(&tags->bitmap_tags, size - set->reserved_tags);
 }
 
-void blk_mq_tag_update_sched_shared_tags(struct request_queue *q)
+void blk_mq_tag_update_sched_shared_tags(struct request_queue *q,
+					 unsigned int nr)
 {
 	sbitmap_queue_resize(&q->sched_shared_tags->bitmap_tags,
-			     q->nr_requests - q->tag_set->reserved_tags);
+			     nr - q->tag_set->reserved_tags);
 }
 
 /**

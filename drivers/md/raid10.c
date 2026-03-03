@@ -163,14 +163,14 @@ static void * r10buf_pool_alloc(gfp_t gfp_flags, void *data)
 		bio = bio_kmalloc(RESYNC_PAGES, gfp_flags);
 		if (!bio)
 			goto out_free_bio;
-		bio_init(bio, NULL, bio->bi_inline_vecs, RESYNC_PAGES, 0);
+		bio_init_inline(bio, NULL, RESYNC_PAGES, 0);
 		r10_bio->devs[j].bio = bio;
 		if (!conf->have_replacement)
 			continue;
 		bio = bio_kmalloc(RESYNC_PAGES, gfp_flags);
 		if (!bio)
 			goto out_free_bio;
-		bio_init(bio, NULL, bio->bi_inline_vecs, RESYNC_PAGES, 0);
+		bio_init_inline(bio, NULL, RESYNC_PAGES, 0);
 		r10_bio->devs[j].repl_bio = bio;
 	}
 	/*
@@ -4013,6 +4013,7 @@ static int raid10_set_queue_limits(struct mddev *mddev)
 
 	md_init_stacking_limits(&lim);
 	lim.max_write_zeroes_sectors = 0;
+	lim.max_hw_wzeroes_unmap_sectors = 0;
 	lim.io_min = mddev->chunk_sectors << 9;
 	lim.chunk_sectors = mddev->chunk_sectors;
 	lim.io_opt = lim.io_min * raid10_nr_stripes(conf);
