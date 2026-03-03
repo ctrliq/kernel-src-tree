@@ -7,6 +7,7 @@
 #define KMSG_COMPONENT "setup"
 #define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
 
+#include <linux/cpufeature.h>
 #include <linux/compiler.h>
 #include <linux/init.h>
 #include <linux/errno.h>
@@ -166,9 +167,8 @@ static __init void setup_topology(void)
 {
 	int max_mnest;
 
-	if (!test_facility(11))
+	if (!cpu_has_topology())
 		return;
-	get_lowcore()->machine_flags |= MACHINE_FLAG_TOPOLOGY;
 	for (max_mnest = 6; max_mnest > 1; max_mnest--) {
 		if (stsi(&sysinfo_page, 15, 1, max_mnest) == 0)
 			break;
