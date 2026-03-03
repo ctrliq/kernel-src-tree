@@ -11,7 +11,6 @@
 #include <asm/physmem_info.h>
 
 struct machine_info {
-	unsigned char has_edat1 : 1;
 	unsigned char has_edat2 : 1;
 };
 

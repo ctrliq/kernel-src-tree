@@ -9,12 +9,13 @@
 #define KMSG_COMPONENT "hugetlb"
 #define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
 
-#include <asm/pgalloc.h>
+#include <linux/cpufeature.h>
 #include <linux/mm.h>
 #include <linux/hugetlb.h>
 #include <linux/mman.h>
 #include <linux/sched/mm.h>
 #include <linux/security.h>
+#include <asm/pgalloc.h>
 
 /*
  * If the bit selected by single-bit bitmask "a" is set within "x", move
@@ -258,7 +259,7 @@ int pud_huge(pud_t pud)
 
 bool __init arch_hugetlb_valid_size(unsigned long size)
 {
-	if (MACHINE_HAS_EDAT1 && size == PMD_SIZE)
+	if (cpu_has_edat1() && size == PMD_SIZE)
 		return true;
 	else if (MACHINE_HAS_EDAT2 && size == PUD_SIZE)
 		return true;

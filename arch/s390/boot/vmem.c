@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
+#include <linux/cpufeature.h>
 #include <linux/sched/task.h>
 #include <linux/pgtable.h>
 #include <linux/kasan.h>
@@ -298,7 +299,7 @@ static unsigned long try_get_large_pmd_pa(pmd_t *pm_dir, unsigned long addr, uns
 {
 	unsigned long pa, size = end - addr;
 
-	if (!machine.has_edat1 || !large_page_mapping_allowed(mode) ||
+	if (!cpu_has_edat1() || !large_page_mapping_allowed(mode) ||
 	    !IS_ALIGNED(addr, PMD_SIZE) || (size < PMD_SIZE))
 		return INVALID_PHYS_ADDR;
 
