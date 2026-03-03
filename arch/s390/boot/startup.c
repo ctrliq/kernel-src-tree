@@ -38,8 +38,6 @@ int __bootdata_preserved(relocate_lowcore);
 u64 __bootdata_preserved(stfle_fac_list[16]);
 struct oldmem_data __bootdata_preserved(oldmem_data);
 
-struct machine_info machine;
-
 void error(char *x)
 {
 	sclp_early_printk("\n\n");
@@ -53,8 +51,6 @@ static void detect_facilities(void)
 {
 	if (cpu_has_edat1())
 		local_ctl_set_bit(0, CR0_EDAT_BIT);
-	if (test_facility(78))
-		machine.has_edat2 = 1;
 	page_noexec_mask = -1UL;
 	segment_noexec_mask = -1UL;
 	region_noexec_mask = -1UL;
