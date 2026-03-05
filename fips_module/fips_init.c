@@ -565,6 +565,18 @@ static int __init fips_module_init(void)
 		goto err_selftests;
 	}
 
+	/*
+	 * All algorithms are registered and self-tested.  Now redirect
+	 * getrandom(2) and /dev/random to the in-boundary FIPS DRBG.
+	 * fips_extrng_init() is self-cleaning on failure, so its error
+	 * path falls through to the existing err_selftests unwind.
+	 */
+	ret = fips_extrng_init();
+	if (ret) {
+		pr_err("fips_module: extrng init failed: %d\n", ret);
+		goto err_selftests;
+	}
+
 	pr_info("fips_module: all FIPS algorithms registered and "
 		"self-tests passed\n");
 	return 0;
@@ -637,6 +649,7 @@ err_aes_generic:
 static void __exit fips_module_exit(void)
 {
 	/* Unregister in reverse initialization order */
+	fips_extrng_exit();
 	fips_drbg_exit();
 	fips_jent_exit();
 	fips_dh_exit();

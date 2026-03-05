@@ -82,6 +82,10 @@ void fips_ecdh_exit(void);
 int  fips_dh_init(void);
 void fips_dh_exit(void);
 
+/* extrng hook: redirect /dev/random and getrandom(2) to FIPS DRBG */
+int  fips_extrng_init(void);
+void fips_extrng_exit(void);
+
 /*
  * fips_alg_test - module-private self-test entry point.
  *
