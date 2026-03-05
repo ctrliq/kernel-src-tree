@@ -2511,6 +2511,9 @@ const struct file_operations fuse_dev_operations = {
 	.fasync		= fuse_dev_fasync,
 	.unlocked_ioctl = fuse_dev_ioctl,
 	.compat_ioctl   = compat_ptr_ioctl,
+#ifdef CONFIG_FUSE_IO_URING
+	.uring_cmd	= fuse_uring_cmd,
+#endif
 #ifdef CONFIG_PROC_FS
 	.show_fdinfo	= fuse_dev_show_fdinfo,
 #endif
