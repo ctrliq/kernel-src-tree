@@ -102,6 +102,7 @@ TEST_PROGS += vlan_bridge_binding.sh
 TEST_PROGS += bpf_offload.py
 TEST_PROGS += ipv6_route_update_soft_lockup.sh
 TEST_PROGS += busy_poll_test.sh
+TEST_PROGS += double_udp_encap.sh
 
 # YNL files, must be before "include ..lib.mk"
 YNL_GEN_FILES := ncdevmem busy_poller netlink-dumps
