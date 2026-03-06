@@ -26,6 +26,7 @@ MODULE_NAME := fips_module
 fips_module-y :=					\
 	fips_init.o					\
 	fips_extrng.o					\
+	fips_algtest.o					\
 							\
 	crypto/aes_generic.o				\
 	crypto/cbc.o					\

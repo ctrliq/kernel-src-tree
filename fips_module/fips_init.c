@@ -589,9 +589,23 @@ static int __init fips_module_init(void)
 		goto err_selftests;
 	}
 
+	/*
+	 * Register the CRYPTO_MSG_ALG_REGISTER notifier that enforces
+	 * fips_module's own fips_allowed list for all future algorithm
+	 * registrations, independent of the vmlinux testmgr.
+	 */
+	ret = fips_algtest_init();
+	if (ret) {
+		pr_err("fips_module: algtest notifier init failed: %d\n", ret);
+		goto err_algtest;
+	}
+
 	pr_info("fips_module: all FIPS algorithms registered and "
 		"self-tests passed\n");
 	return 0;
+
+err_algtest:
+	fips_extrng_exit();
 
 	/* Unwind in reverse order on error */
 err_selftests:
@@ -661,6 +675,7 @@ err_aes_generic:
 static void __exit fips_module_exit(void)
 {
 	/* Unregister in reverse initialization order */
+	fips_algtest_exit();
 	fips_extrng_exit();
 	fips_drbg_exit();
 	fips_jent_exit();

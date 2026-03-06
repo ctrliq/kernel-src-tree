@@ -5866,6 +5866,34 @@ non_fips_alg:
 	return alg_fips_disabled(driver, alg);
 }
 
+/**
+ * fips_alg_is_allowed - check whether an algorithm is FIPS-approved per
+ *                       fips_module's own alg_test_descs[] table.
+ *
+ * Looks up @alg (algorithm name) and @driver (driver name) in
+ * alg_test_descs[].  Returns 1 only if at least one matching entry has
+ * fips_allowed=1, meaning fips_module explicitly approves the algorithm.
+ *
+ * Returns 0 (blocked) for any algorithm not present in fips_module's table
+ * and for any algorithm explicitly marked fips_allowed=0.  This is the
+ * fail-safe policy: unknown algorithms are denied, not permitted.
+ *
+ * This is intentionally a table lookup only — no crypto operations are
+ * performed — so it is safe to call from a notifier callback context.
+ */
+int fips_alg_is_allowed(const char *alg, const char *driver)
+{
+	int i = alg_find_test(alg);
+	int j = alg_find_test(driver);
+
+	/* driver-name match takes precedence (mirrors alg_test() logic) */
+	if (j >= 0 && alg_test_descs[j].fips_allowed)
+		return 1;
+	if (i >= 0 && alg_test_descs[i].fips_allowed)
+		return 1;
+	return 0;
+}
+
 #endif /* CONFIG_CRYPTO_SELFTESTS */
 
 /**
@@ -5885,4 +5913,15 @@ int fips_alg_test(const char *driver, const char *alg, u32 type, u32 mask)
 {
 	return alg_test(driver, alg, type, mask);
 }
+
+#ifndef CONFIG_CRYPTO_SELFTESTS
+/*
+ * Stub when selftests are compiled out: no table to consult, so block
+ * everything — fail safe.
+ */
+int fips_alg_is_allowed(const char *alg, const char *driver)
+{
+	return 0;
+}
+#endif
 

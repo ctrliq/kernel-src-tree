@@ -86,6 +86,20 @@ void fips_dh_exit(void);
 int  fips_extrng_init(void);
 void fips_extrng_exit(void);
 
+/* algtest notifier: enforce fips_module's fips_allowed list on all registrations */
+int  fips_algtest_init(void);
+void fips_algtest_exit(void);
+
+/*
+ * fips_alg_is_allowed - table-only check: returns 1 only if the algorithm
+ * is explicitly listed as fips_allowed=1 in fips_module's alg_test_descs[].
+ * All unknown and explicitly non-FIPS algorithms return 0 (fail safe).
+ * Safe to call from notifier context (no crypto operations, no sleeping).
+ *
+ * When CONFIG_CRYPTO_SELFTESTS is not set, always returns 0 (block all).
+ */
+int  fips_alg_is_allowed(const char *alg, const char *driver);
+
 /*
  * fips_alg_test - module-private self-test entry point.
  *
