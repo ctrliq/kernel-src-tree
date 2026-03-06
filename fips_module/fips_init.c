@@ -17,6 +17,7 @@
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/crypto.h>
+#include <linux/fips.h>
 
 /*
  * Forward declarations for all algorithm init/exit functions.
@@ -364,6 +365,17 @@ static int fips_run_selftests(void)
 static int __init fips_module_init(void)
 {
 	int ret;
+
+	/*
+	 * Refuse to load when the kernel is not in FIPS mode.  This module
+	 * exists solely to provide a FIPS-validated cryptographic boundary;
+	 * loading it on a non-FIPS system would add overhead with no benefit
+	 * and could give a false impression of FIPS compliance.
+	 */
+	if (!fips_enabled) {
+		pr_err("fips_module: refusing to load: kernel FIPS mode is not enabled\n");
+		return -EPERM;
+	}
 
 	/*
 	 * Initialize algorithms in dependency order:
