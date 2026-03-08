@@ -1603,7 +1603,7 @@ int proc_do_static_key(const struct ctl_table *table, int write,
 	return ret;
 }
 
-static struct ctl_table kern_table[] = {
+static const struct ctl_table kern_table[] = {
 	{
 		.procname	= "panic",
 		.data		= &panic_timeout,
@@ -1947,7 +1947,7 @@ static struct ctl_table kern_table[] = {
 	},
 };
 
-static struct ctl_table vm_table[] = {
+static const struct ctl_table vm_table[] = {
 	{
 		.procname	= "overcommit_memory",
 		.data		= &sysctl_overcommit_memory,
