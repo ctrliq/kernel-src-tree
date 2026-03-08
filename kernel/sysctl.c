@@ -1763,16 +1763,6 @@ static const struct ctl_table kern_table[] = {
 		.mode		= 0444,
 		.proc_handler	= proc_dointvec,
 	},
-#if (defined(CONFIG_X86_32) || defined(CONFIG_PARISC)) && \
-	defined(CONFIG_DEBUG_STACKOVERFLOW)
-	{
-		.procname	= "panic_on_stackoverflow",
-		.data		= &sysctl_panic_on_stackoverflow,
-		.maxlen		= sizeof(int),
-		.mode		= 0644,
-		.proc_handler	= proc_dointvec,
-	},
-#endif
 #if defined(CONFIG_MMU)
 	{
 		.procname	= "randomize_va_space",
