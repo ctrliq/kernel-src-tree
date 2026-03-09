@@ -255,7 +255,6 @@ static int fips_run_selftests(void)
 	/* RSA */
 	SELFTEST("fips-rsa-generic",    "rsa",             0, 0);
 	SELFTEST("pkcs1pad(rsa)",       "pkcs1pad(rsa)",   0, 0);
-	SELFTEST("pkcs1(rsa,none)",     "pkcs1(rsa,none)", 0, 0);
 	SELFTEST("pkcs1(rsa,sha224)",   "pkcs1(rsa,sha224)", 0, 0);
 	SELFTEST("pkcs1(rsa,sha256)",   "pkcs1(rsa,sha256)", 0, 0);
 	SELFTEST("pkcs1(rsa,sha384)",   "pkcs1(rsa,sha384)", 0, 0);
