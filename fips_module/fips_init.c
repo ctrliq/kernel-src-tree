@@ -231,10 +231,9 @@ static int fips_run_selftests(void)
 
 	/* ---------------------------------------------------------------
 	 * CCM: Counter with CBC-MAC (AEAD).
-	 * ccm.c also registers cbcmac (the internal MAC primitive),
-	 * ccm_base, ccm, and rfc4309 templates.
+	 * cbcmac is an internal primitive (fips_allowed=0); it is tested
+	 * implicitly by the ccm(aes) and rfc4309(ccm(aes)) tests below.
 	 * --------------------------------------------------------------- */
-	SELFTEST("cbcmac(aes)", "cbcmac(aes)", 0, 0);
 	SELFTEST("ccm(aes)",         "ccm(aes)",         0, 0);
 	SELFTEST("rfc4309(ccm(aes))", "rfc4309(ccm(aes))", 0, 0);
 
