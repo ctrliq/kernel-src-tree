@@ -554,6 +554,22 @@ static int __init fips_module_init(void)
 		goto err_ecdsa;
 	}
 
+	/*
+	 * JitterEntropy must be registered before ECDH and DH.  The ECDH
+	 * shared-secret implementation (ecc.c) calls
+	 * crypto_alloc_rng("fips-jitterentropy_rng", 0, 0) for its
+	 * point-multiplication blinding scalar.  If jent is not yet in the
+	 * crypto_alg_list when the ECDH test kthread runs, that lookup
+	 * returns -ENOENT and the P-384 self-test panics.  Registering jent
+	 * first ensures it is at least present as a larval entry — the crypto
+	 * API will wait for the larval to be resolved rather than failing.
+	 */
+	ret = fips_jent_init();
+	if (ret) {
+		pr_err("fips_module: jitterentropy init failed: %d\n", ret);
+		goto err_jent;
+	}
+
 	ret = fips_ecdh_init();
 	if (ret) {
 		pr_err("fips_module: ecdh init failed: %d\n", ret);
@@ -564,12 +580,6 @@ static int __init fips_module_init(void)
 	if (ret) {
 		pr_err("fips_module: dh init failed: %d\n", ret);
 		goto err_dh;
-	}
-
-	ret = fips_jent_init();
-	if (ret) {
-		pr_err("fips_module: jitterentropy init failed: %d\n", ret);
-		goto err_jent;
 	}
 
 	ret = fips_drbg_init();
@@ -610,12 +620,12 @@ static int __init fips_module_init(void)
 err_selftests:
 	fips_drbg_exit();
 err_drbg:
-	fips_jent_exit();
-err_jent:
 	fips_dh_exit();
 err_dh:
 	fips_ecdh_exit();
 err_ecdh:
+	fips_jent_exit();
+err_jent:
 	fips_ecdsa_exit();
 err_ecdsa:
 	fips_rsa_exit();
