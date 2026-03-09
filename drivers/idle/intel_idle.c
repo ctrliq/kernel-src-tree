@@ -61,8 +61,6 @@
 #include <asm/tsc.h>
 #include <asm/fpu/api.h>
 
-#define INTEL_IDLE_VERSION "0.5.1"
-
 static struct cpuidle_driver intel_idle_driver = {
 	.name = "intel_idle",
 	.owner = THIS_MODULE,
@@ -2443,9 +2441,6 @@ static int __init intel_idle_init(void)
 	} else if (!intel_idle_acpi_cst_extract()) {
 		return -ENODEV;
 	}
-
-	pr_debug("v" INTEL_IDLE_VERSION " model 0x%X\n",
-		 boot_cpu_data.x86_model);
 
 	intel_idle_cpuidle_devices = alloc_percpu(struct cpuidle_device);
 	if (!intel_idle_cpuidle_devices)
