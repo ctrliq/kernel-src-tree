@@ -89,6 +89,7 @@ void fips_extrng_exit(void);
 /* algtest notifier: enforce fips_module's fips_allowed list on all registrations */
 int  fips_algtest_init(void);
 void fips_algtest_exit(void);
+void fips_sweep_preregistered_algs(void);
 
 /*
  * fips_alg_is_allowed - table-only check: returns 1 only if the algorithm

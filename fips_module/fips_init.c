@@ -394,6 +394,14 @@ static int __init fips_module_init(void)
 		return ret;
 	}
 
+	/*
+	 * Retroactively block non-approved algorithms that were already
+	 * registered before fips_module loaded (vmlinux built-ins such as
+	 * des3_ede, md5, rc4).  The notifier above covers future registrations;
+	 * this sweep closes the gap for pre-existing ones.
+	 */
+	fips_sweep_preregistered_algs();
+
 	ret = fips_aes_generic_init();
 	if (ret) {
 		pr_err("fips_module: aes_generic init failed: %d\n", ret);

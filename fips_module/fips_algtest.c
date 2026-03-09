@@ -42,8 +42,12 @@
 #include <linux/kthread.h>
 #include <linux/module.h>
 #include <linux/notifier.h>
+#include <linux/rwsem.h>
 #include <linux/slab.h>
 #include <crypto/algapi.h>
+
+extern struct list_head crypto_alg_list;
+extern struct rw_semaphore crypto_alg_sem;
 
 /*
  * crypto_alg_tested() is EXPORT_SYMBOL_GPL but is not declared in any
@@ -151,6 +155,60 @@ static struct notifier_block fips_algtest_notifier = {
 	.notifier_call	= fips_algtest_notify,
 	.priority	= 100,	/* higher than algboss (0) */
 };
+
+/*
+ * fips_sweep_preregistered_algs - retroactively block non-approved algorithms
+ *
+ * The CRYPTO_MSG_ALG_REGISTER notifier only fires for algorithms registered
+ * after fips_module loads.  Any algorithm already registered before module
+ * load (vmlinux built-ins such as des3_ede, md5, rc4) was handled by the
+ * vmlinux algboss notifier at boot time.  With fips=1 that is sufficient
+ * because algboss already marks non-approved algorithms FIPS_INTERNAL.
+ * However, to make fips_module's enforcement self-contained and independent
+ * of the boot-time fips=1 path, we walk crypto_alg_list at load time and
+ * stamp any algorithm not in our approved list with CRYPTO_ALG_FIPS_INTERNAL.
+ *
+ * Must be called after the notifier is registered (so future registrations
+ * are also covered) and before fips_run_selftests().
+ *
+ * Locking: takes crypto_alg_sem for write because we modify cra_flags.
+ * We set the flag directly rather than calling crypto_alg_tested() because
+ * these algorithms have already completed the testing state machine; there
+ * are no larval waiters to wake.
+ */
+void fips_sweep_preregistered_algs(void)
+{
+	struct crypto_alg *alg;
+
+	down_write(&crypto_alg_sem);
+	list_for_each_entry(alg, &crypto_alg_list, cra_list) {
+		const char *check_name = alg->cra_name;
+		char ecb_name[CRYPTO_MAX_ALG_NAME];
+
+		/* Already blocked — nothing to do. */
+		if (alg->cra_flags & CRYPTO_ALG_FIPS_INTERNAL)
+			continue;
+
+		/*
+		 * Mirror the CRYPTO_ALG_TYPE_CIPHER special case: raw block
+		 * ciphers are approved/tested through their ecb() wrapper.
+		 */
+		if ((alg->cra_flags & CRYPTO_ALG_TYPE_MASK) ==
+		    CRYPTO_ALG_TYPE_CIPHER) {
+			if (snprintf(ecb_name, sizeof(ecb_name), "ecb(%s)",
+				     alg->cra_name) < sizeof(ecb_name))
+				check_name = ecb_name;
+		}
+
+		if (!fips_alg_is_allowed(check_name, alg->cra_driver_name)) {
+			pr_info("fips_module: blocking pre-registered "
+				"non-approved algorithm %s (%s)\n",
+				alg->cra_name, alg->cra_driver_name);
+			alg->cra_flags |= CRYPTO_ALG_FIPS_INTERNAL;
+		}
+	}
+	up_write(&crypto_alg_sem);
+}
 
 int fips_algtest_init(void)
 {
