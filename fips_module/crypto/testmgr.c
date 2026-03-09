@@ -5759,19 +5759,19 @@ static int alg_find_test(const char *alg)
 
 static int alg_fips_disabled(const char *driver, const char *alg)
 {
-	pr_info("alg: %s (%s) is disabled due to FIPS\n", alg, driver);
+	pr_info("fips_module: alg: %s (%s) is disabled due to FIPS\n", alg, driver);
 
 	return -ECANCELED;
 }
 
-int alg_test(const char *driver, const char *alg, u32 type, u32 mask)
+static int fips_module_alg_test(const char *driver, const char *alg, u32 type, u32 mask)
 {
 	int i;
 	int j;
 	int rc;
 
 	if (!fips_enabled && notests) {
-		printk_once(KERN_INFO "alg: self-tests disabled\n");
+		printk_once(KERN_INFO "fips_module: alg: self-tests disabled\n");
 		return 0;
 	}
 
@@ -5820,17 +5820,17 @@ test_done:
 	if (rc) {
 		if (fips_enabled) {
 			fips_fail_notify();
-			panic("alg: self-tests for %s (%s) failed in fips mode!\n",
+			panic("fips_module: alg: self-tests for %s (%s) failed in fips mode!\n",
 			      driver, alg);
 		}
-		pr_warn("alg: self-tests for %s using %s failed (rc=%d)",
+		pr_warn("fips_module: alg: self-tests for %s using %s failed (rc=%d)",
 			alg, driver, rc);
 		WARN(rc != -ENOENT,
-		     "alg: self-tests for %s using %s failed (rc=%d)",
+		     "fips_module: alg: self-tests for %s using %s failed (rc=%d)",
 		     alg, driver, rc);
 	} else {
 		if (fips_enabled)
-			pr_info("alg: self-tests for %s (%s) passed\n",
+			pr_info("fips_module: alg: self-tests for %s (%s) passed\n",
 				driver, alg);
 	}
 
@@ -5856,7 +5856,7 @@ notest:
 	}
 
 notest2:
-	printk(KERN_INFO "alg: No test for %s (%s)\n", alg, driver);
+	printk(KERN_INFO "fips_module: alg: No test for %s (%s)\n", alg, driver);
 
 	if (type & CRYPTO_ALG_FIPS_INTERNAL)
 		return alg_fips_disabled(driver, alg);
@@ -5904,8 +5904,6 @@ int fips_alg_is_allowed(const char *alg, const char *driver)
 	return 0;
 }
 
-#endif /* CONFIG_CRYPTO_SELFTESTS */
-
 /**
  * fips_alg_test - Invoke this module's own copy of alg_test().
  *
@@ -5921,14 +5919,21 @@ int fips_alg_is_allowed(const char *alg, const char *driver)
  */
 int fips_alg_test(const char *driver, const char *alg, u32 type, u32 mask)
 {
-	return alg_test(driver, alg, type, mask);
+	return fips_module_alg_test(driver, alg, type, mask);
 }
+
+#endif /* CONFIG_CRYPTO_SELFTESTS */
 
 #ifndef CONFIG_CRYPTO_SELFTESTS
 /*
- * Stub when selftests are compiled out: no table to consult, so block
+ * Stubs when selftests are compiled out: no table to consult, so block
  * everything — fail safe.
  */
+int fips_alg_test(const char *driver, const char *alg, u32 type, u32 mask)
+{
+	return -ECANCELED;
+}
+
 int fips_alg_is_allowed(const char *alg, const char *driver)
 {
 	return 0;

@@ -132,14 +132,14 @@ int fips_kdf_sp800108_init(void)
 		       crypto_kdf108_setkey, crypto_kdf108_ctr_generate);
 	if (ret) {
 		if (fips_enabled)
-			panic("alg: self-tests for CTR-KDF (hmac(sha256)) failed (rc=%d)\n",
+			panic("fips_module: alg: self-tests for CTR-KDF (hmac(sha256)) failed (rc=%d)\n",
 			      ret);
 
 		WARN(1,
-		     "alg: self-tests for CTR-KDF (hmac(sha256)) failed (rc=%d)\n",
+		     "fips_module: alg: self-tests for CTR-KDF (hmac(sha256)) failed (rc=%d)\n",
 		     ret);
 	} else if (fips_enabled) {
-		pr_info("alg: self-tests for CTR-KDF (hmac(sha256)) passed\n");
+		pr_info("fips_module: alg: self-tests for CTR-KDF (hmac(sha256)) passed\n");
 	}
 
 	return ret;
