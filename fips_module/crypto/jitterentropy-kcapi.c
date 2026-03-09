@@ -37,6 +37,7 @@
  * DAMAGE.
  */
 
+#include <crypto/algapi.h>
 #include <crypto/hash.h>
 #include <crypto/sha3.h>
 #include <linux/fips.h>
@@ -45,6 +46,12 @@
 #include <linux/slab.h>
 #include <linux/time.h>
 #include <crypto/internal/rng.h>
+
+/*
+ * crypto_alg_mod_lookup() is EXPORT_SYMBOL_GPL but not in any public header
+ * (it is declared in crypto/internal.h which is not exported).
+ */
+struct crypto_alg *crypto_alg_mod_lookup(const char *name, u32 type, u32 mask);
 
 #include "jitterentropy.h"
 
@@ -323,7 +330,7 @@ static struct rng_alg jent_alg = {
 	.seedsize		= 0,
 	.base			= {
 		.cra_name               = "jitterentropy_rng",
-		.cra_driver_name		= "fips-jitterentropy_rng",
+		.cra_driver_name	= "jitterentropy_rng-fips",
 		.cra_priority		= 100000,
 		.cra_ctxsize            = sizeof(struct jitterentropy),
 		.cra_module             = THIS_MODULE,
@@ -360,6 +367,38 @@ int fips_jent_init(void)
 		pr_info("jitterentropy: Initialization failed with host not compliant with requirements: %d\n", ret);
 		return -EFAULT;
 	}
+
+	/*
+	 * Replace the kernel's built-in jitterentropy_rng with our certified
+	 * FIPS-boundary copy.  Unregistering the vmlinux implementation first
+	 * prevents the -EEXIST collision in __crypto_register_alg() that
+	 * rejects any new registration whose cra_name matches an existing
+	 * entry's cra_driver_name.  After this point, any new
+	 * crypto_alloc_rng("jitterentropy_rng") call — including from the
+	 * kernel's HMAC-SHA DRBG — will resolve to our implementation.
+	 *
+	 * crypto_alg_mod_lookup() increments the algorithm's refcount;
+	 * crypto_mod_put() releases that extra reference so the refcount
+	 * check in crypto_unregister_alg() sees the correct value.
+	 *
+	 * Existing DRBG instances that already hold a reference to the
+	 * vmlinux jent continue to function until they are freed; only new
+	 * allocations are redirected.
+	 */
+	{
+		struct crypto_alg *kern_jent;
+
+		kern_jent = crypto_alg_mod_lookup("jitterentropy_rng",
+						  CRYPTO_ALG_TYPE_RNG,
+						  CRYPTO_ALG_TYPE_MASK);
+		if (!IS_ERR(kern_jent)) {
+			crypto_mod_put(kern_jent);
+			crypto_unregister_alg(kern_jent);
+			pr_info("fips_module: unregistered vmlinux jitterentropy_rng; "
+				"replacing with FIPS-boundary driver\n");
+		}
+	}
+
 	return crypto_register_rng(&jent_alg);
 }
 

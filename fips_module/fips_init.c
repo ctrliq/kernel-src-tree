@@ -304,7 +304,7 @@ static int fips_run_selftests(void)
 	/* ---------------------------------------------------------------
 	 * JitterEntropy RNG
 	 * --------------------------------------------------------------- */
-	SELFTEST("fips-jitterentropy_rng", "jitterentropy_rng", 0, 0);
+	SELFTEST("jitterentropy_rng-fips", "jitterentropy_rng", 0, 0);
 
 	/* ---------------------------------------------------------------
 	 * DRBG: all prediction-resistant and non-prediction-resistant
@@ -557,7 +557,7 @@ static int __init fips_module_init(void)
 	/*
 	 * JitterEntropy must be registered before ECDH and DH.  The ECDH
 	 * shared-secret implementation (ecc.c) calls
-	 * crypto_alloc_rng("fips-jitterentropy_rng", 0, 0) for its
+	 * crypto_alloc_rng("jitterentropy_rng", 0, 0) for its
 	 * point-multiplication blinding scalar.  If jent is not yet in the
 	 * crypto_alg_list when the ECDH test kthread runs, that lookup
 	 * returns -ENOENT and the P-384 self-test panics.  Registering jent

@@ -19,7 +19,7 @@
  *           → drbg_generate_long() → drbg_generate() → drbg_seed()
  *             → drbg_get_random_bytes()
  *               → crypto_rng_get_bytes(drbg->jent)
- *                 → fips-jitterentropy_rng
+ *                 → jitterentropy_rng-fips
  *                   [fips_module/crypto/jitterentropy*.c]
  *
  * get_random_bytes() (vmlinux ChaCha20 CRNG) is never called.

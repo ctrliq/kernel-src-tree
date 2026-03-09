@@ -1658,7 +1658,7 @@ int crypto_ecdh_shared_secret(unsigned int curve_id, unsigned int ndigits,
 
 	/* fips_module: use in-boundary jent for the point-mult blinding scalar */
 	{
-		struct crypto_rng *jent = crypto_alloc_rng("fips-jitterentropy_rng",
+		struct crypto_rng *jent = crypto_alloc_rng("jitterentropy_rng",
 							   0, 0);
 		if (IS_ERR(jent)) {
 			ret = PTR_ERR(jent);
