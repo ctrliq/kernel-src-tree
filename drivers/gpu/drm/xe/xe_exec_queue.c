@@ -394,8 +394,6 @@ void xe_exec_queue_destroy(struct kref *ref)
 	struct xe_exec_queue *eq, *next;
 	int i;
 
-	xe_assert(gt_to_xe(q->gt), atomic_read(&q->job_cnt) == 0);
-
 	if (q->ufence_syncobj)
 		drm_syncobj_put(q->ufence_syncobj);
 
