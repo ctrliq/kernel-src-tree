@@ -5886,6 +5886,16 @@ int fips_alg_is_allowed(const char *alg, const char *driver)
 	int i = alg_find_test(alg);
 	int j = alg_find_test(driver);
 
+	/*
+	 * Our driver names are prefixed with "fips-" (e.g.
+	 * "fips-drbg_pr_ctr_aes128") but alg_test_descs[] uses the original
+	 * unprefixed names (e.g. "drbg_pr_ctr_aes128").  Strip the prefix and
+	 * retry so that DRBG and other "fips-"-prefixed drivers are correctly
+	 * identified as FIPS-allowed.
+	 */
+	if (j < 0 && strncmp(driver, "fips-", 5) == 0)
+		j = alg_find_test(driver + 5);
+
 	/* driver-name match takes precedence (mirrors alg_test() logic) */
 	if (j >= 0 && alg_test_descs[j].fips_allowed)
 		return 1;
