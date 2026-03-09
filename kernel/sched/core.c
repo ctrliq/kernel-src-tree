@@ -2557,7 +2557,8 @@ static int migration_cpu_stop(void *data)
 		 */
 		WARN_ON_ONCE(!pending->stop_pending);
 		preempt_disable();
-		task_rq_unlock(rq, p, &rf);
+		rq_unlock(rq, &rf);
+		raw_spin_unlock_irqrestore(&p->pi_lock, rf.flags);
 		stop_one_cpu_nowait(task_cpu(p), migration_cpu_stop,
 				    &pending->arg, &pending->stop_work);
 		preempt_enable();
@@ -2566,7 +2567,8 @@ static int migration_cpu_stop(void *data)
 out:
 	if (pending)
 		pending->stop_pending = false;
-	task_rq_unlock(rq, p, &rf);
+	rq_unlock(rq, &rf);
+	raw_spin_unlock_irqrestore(&p->pi_lock, rf.flags);
 
 	if (complete)
 		complete_all(&pending->done);
@@ -3672,7 +3674,7 @@ static int ttwu_runnable(struct task_struct *p, int wake_flags)
 		ttwu_do_wakeup(p);
 		ret = 1;
 	}
-	__task_rq_unlock(rq, &rf);
+	__task_rq_unlock(rq, p, &rf);
 
 	return ret;
 }
@@ -4265,7 +4267,7 @@ int task_call_func(struct task_struct *p, task_call_f func, void *arg)
 	ret = func(p, arg);
 
 	if (rq)
-		rq_unlock(rq, &rf);
+		__task_rq_unlock(rq, p, &rf);
 
 	raw_spin_unlock_irqrestore(&p->pi_lock, rf.flags);
 	return ret;
@@ -7102,7 +7104,8 @@ out_unlock:
 
 	rq_unpin_lock(rq, &rf);
 	__balance_callbacks(rq);
-	raw_spin_rq_unlock(rq);
+	rq_repin_lock(rq, &rf);
+	__task_rq_unlock(rq, p, &rf);
 
 	preempt_enable();
 }
