@@ -672,47 +672,7 @@ err_aes_generic:
 	return ret;
 }
 
-static void __exit fips_module_exit(void)
-{
-	/* Unregister in reverse initialization order */
-	fips_algtest_exit();
-	fips_extrng_exit();
-	fips_drbg_exit();
-	fips_jent_exit();
-	fips_dh_exit();
-	fips_ecdh_exit();
-	fips_ecdsa_exit();
-	fips_rsa_exit();
-	fips_kdf_sp800108_exit();
-	fips_essiv_exit();
-	fips_ccm_exit();
-	fips_authenc_exit();
-	fips_cmac_exit();
-	fips_hmac_exit();
-	fips_gcm_exit();
-	fips_xts_exit();
-	fips_ctr_exit();
-	fips_cbc_exit();
-	fips_ecb_exit();
-#ifdef CONFIG_ARM64
-	fips_sha3_ce_exit();
-	fips_ghash_ce_exit();
-	fips_aes_ce_exit();
-#endif
-#if defined(CONFIG_X86_64) || defined(CONFIG_X86)
-	fips_ghash_clmul_exit();
-	fips_aesni_exit();
-#endif
-	fips_sha3_exit();
-	fips_sha512_exit();
-	fips_sha256_exit();
-	fips_sha1_exit();
-	fips_ghash_exit();
-	fips_aes_generic_exit();
-}
-
 module_init(fips_module_init);
-module_exit(fips_module_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("FIPS Cryptographic Module");
