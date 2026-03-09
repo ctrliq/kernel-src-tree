@@ -81,11 +81,26 @@ static int fips_algtest_notify(struct notifier_block *this,
 	struct crypto_alg *alg = data;
 	struct fips_test_param *param;
 	struct task_struct *thread;
+	const char *check_name = alg->cra_name;
+	char ecb_name[CRYPTO_MAX_ALG_NAME];
 
 	if (msg != CRYPTO_MSG_ALG_REGISTER)
 		return NOTIFY_DONE;
 
-	if (!fips_alg_is_allowed(alg->cra_name, alg->cra_driver_name)) {
+	/*
+	 * Mirror alg_test()'s raw-cipher special case: when the algorithm
+	 * type is CRYPTO_ALG_TYPE_CIPHER (a raw block cipher like "aes"),
+	 * alg_test() looks up "ecb(<name>)" in alg_test_descs[], not the
+	 * cipher name itself.  There is no standalone "aes" table entry;
+	 * raw ciphers are approved and tested through their ECB wrapper.
+	 */
+	if ((alg->cra_flags & CRYPTO_ALG_TYPE_MASK) == CRYPTO_ALG_TYPE_CIPHER) {
+		if (snprintf(ecb_name, sizeof(ecb_name), "ecb(%s)",
+			     alg->cra_name) < sizeof(ecb_name))
+			check_name = ecb_name;
+	}
+
+	if (!fips_alg_is_allowed(check_name, alg->cra_driver_name)) {
 		/*
 		 * Not in fips_module's approved list.  Reject immediately
 		 * without running any test vectors — safe to do synchronously
