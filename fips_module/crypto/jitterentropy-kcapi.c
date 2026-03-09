@@ -339,6 +339,8 @@ static struct rng_alg jent_alg = {
 	}
 };
 
+static void fips_jent_noop_destroy(struct crypto_alg *alg) { }
+
 int fips_jent_init(void)
 {
 	SHASH_DESC_ON_STACK(desc, tfm);
@@ -384,6 +386,13 @@ int fips_jent_init(void)
 	 * Existing DRBG instances that already hold a reference to the
 	 * vmlinux jent continue to function until they are freed; only new
 	 * allocations are redirected.
+	 *
+	 * crypto_unregister_alg() fires WARN_ON(!alg->cra_destroy && refcnt != 1)
+	 * because the vmlinux jent has existing users (kernel DRBGs) holding
+	 * references, and its static struct has cra_destroy=NULL.  Setting
+	 * cra_destroy to a no-op satisfies the check.  This is safe because
+	 * fips_module is permanent (not removable), so this function pointer
+	 * remains valid for the lifetime of the system.
 	 */
 	{
 		struct crypto_alg *kern_jent;
@@ -393,6 +402,7 @@ int fips_jent_init(void)
 						  CRYPTO_ALG_TYPE_MASK);
 		if (!IS_ERR(kern_jent)) {
 			crypto_mod_put(kern_jent);
+			kern_jent->cra_destroy = fips_jent_noop_destroy;
 			crypto_unregister_alg(kern_jent);
 			pr_info("fips_module: unregistered vmlinux jitterentropy_rng; "
 				"replacing with FIPS-boundary driver\n");
