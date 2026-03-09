@@ -3651,7 +3651,7 @@ static int alg_test_drbg(const struct alg_test_desc *desc, const char *driver,
 	const struct drbg_testvec *template = desc->suite.drbg.vecs;
 	unsigned int tcount = desc->suite.drbg.count;
 
-	if (0 == memcmp(driver, "drbg_pr_", 8))
+	if (strstr(driver, "drbg_pr_"))
 		pr = 1;
 
 	for (i = 0; i < tcount; i++) {
