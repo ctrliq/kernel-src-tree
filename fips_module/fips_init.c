@@ -157,11 +157,6 @@ static int fips_run_selftests(void)
 		 CRYPTO_ALG_TYPE_CIPHER, CRYPTO_ALG_TYPE_MASK);
 
 	/* ---------------------------------------------------------------
-	 * GHASH
-	 * --------------------------------------------------------------- */
-	SELFTEST("fips-ghash-generic", "ghash", 0, 0);
-
-	/* ---------------------------------------------------------------
 	 * SHA hash functions
 	 * --------------------------------------------------------------- */
 	SELFTEST("fips-sha1-lib",          "sha1",     0, 0);
@@ -267,8 +262,7 @@ static int fips_run_selftests(void)
 	SELFTEST("pkcs1(rsa,sha384)",   "pkcs1(rsa,sha384)", 0, 0);
 	SELFTEST("pkcs1(rsa,sha512)",   "pkcs1(rsa,sha512)", 0, 0);
 
-	/* ECDSA */
-	SELFTEST("fips-ecdsa-nist-p192-generic", "ecdsa-nist-p192", 0, 0);
+	/* ECDSA (P-192 is not FIPS-approved; omit its self-test) */
 	SELFTEST("fips-ecdsa-nist-p256-generic", "ecdsa-nist-p256", 0, 0);
 	SELFTEST("fips-ecdsa-nist-p384-generic", "ecdsa-nist-p384", 0, 0);
 	SELFTEST("fips-ecdsa-nist-p521-generic", "ecdsa-nist-p521", 0, 0);
@@ -283,14 +277,11 @@ static int fips_run_selftests(void)
 	SELFTEST("x962(ecdsa-nist-p384)", "x962(ecdsa-nist-p384)", 0, 0);
 	SELFTEST("x962(ecdsa-nist-p521)", "x962(ecdsa-nist-p521)", 0, 0);
 
-	/* ECDH */
-	SELFTEST("fips-ecdh-nist-p192-generic", "ecdh-nist-p192", 0, 0);
+	/* ECDH (P-192 is not FIPS-approved; omit its self-test) */
 	SELFTEST("fips-ecdh-nist-p256-generic", "ecdh-nist-p256", 0, 0);
 	SELFTEST("fips-ecdh-nist-p384-generic", "ecdh-nist-p384", 0, 0);
 
-	/* DH */
-	SELFTEST("fips-dh-generic", "dh", 0, 0);
-
+	/* DH: classical raw dh is not FIPS-approved; FFDHE groups are. */
 	/* FFDHE (Finite-Field DH groups per RFC 7919).
 	 * The ffdhe* templates are registered by fips_dh_init() as part of
 	 * dh.c when CONFIG_CRYPTO_DH_RFC7919_GROUPS=y.  All five groups are
@@ -339,8 +330,7 @@ static int fips_run_selftests(void)
 	SELFTEST("fips-cbc-aes-aesni", "cbc(aes)", 0, 0);
 	SELFTEST("fips-ctr-aes-aesni", "ctr(aes)", 0, 0);
 	SELFTEST("fips-xts-aes-aesni", "xts(aes)", 0, 0);
-	/* GHASH via CLMUL (pclmulqdq) */
-	SELFTEST("fips-ghash-pclmulqdqni", "ghash", 0, 0);
+	/* ghash standalone is not FIPS-approved; tested implicitly via gcm(aes) */
 #endif /* CONFIG_X86_64 || CONFIG_X86 */
 
 #ifdef CONFIG_ARM64
@@ -349,7 +339,7 @@ static int fips_run_selftests(void)
 	 * --------------------------------------------------------------- */
 	SELFTEST("fips-aes-ce", "aes",
 		 CRYPTO_ALG_TYPE_CIPHER, CRYPTO_ALG_TYPE_MASK);
-	SELFTEST("fips-ghash-neon",  "ghash",    0, 0);
+	/* ghash standalone is not FIPS-approved; tested implicitly via gcm(aes) */
 	SELFTEST("fips-gcm-aes-ce",  "gcm(aes)", 0, 0);
 	SELFTEST("fips-sha3-224-ce", "sha3-224", 0, 0);
 	SELFTEST("fips-sha3-256-ce", "sha3-256", 0, 0);
