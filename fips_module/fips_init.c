@@ -378,7 +378,15 @@ static int __init fips_module_init(void)
 	}
 
 	/*
-	 * Initialize algorithms in dependency order:
+	 * Register the CRYPTO_MSG_ALG_REGISTER notifier FIRST, before any
+	 * algorithm is registered, so that every registration event is
+	 * intercepted by fips_module's notifier (priority 100) rather than
+	 * algboss (priority 0).  This ensures that only fips_alg_test() is
+	 * ever called for our algorithms — the vmlinux alg_test() is never
+	 * used.
+	 *
+	 * After the notifier is in place, initialize algorithms in dependency
+	 * order:
 	 * 1. Base cipher (AES)
 	 * 2. Hash primitives (GHASH, SHA)
 	 * 3. Hardware accelerated variants
@@ -392,6 +400,11 @@ static int __init fips_module_init(void)
 	 * to explicitly exercise the module-private copy of alg_test() and its
 	 * test vectors.  A self-test failure aborts module loading.
 	 */
+	ret = fips_algtest_init();
+	if (ret) {
+		pr_err("fips_module: algtest notifier init failed: %d\n", ret);
+		return ret;
+	}
 
 	ret = fips_aes_generic_init();
 	if (ret) {
@@ -589,23 +602,9 @@ static int __init fips_module_init(void)
 		goto err_selftests;
 	}
 
-	/*
-	 * Register the CRYPTO_MSG_ALG_REGISTER notifier that enforces
-	 * fips_module's own fips_allowed list for all future algorithm
-	 * registrations, independent of the vmlinux testmgr.
-	 */
-	ret = fips_algtest_init();
-	if (ret) {
-		pr_err("fips_module: algtest notifier init failed: %d\n", ret);
-		goto err_algtest;
-	}
-
 	pr_info("fips_module: all FIPS algorithms registered and "
 		"self-tests passed\n");
 	return 0;
-
-err_algtest:
-	fips_extrng_exit();
 
 	/* Unwind in reverse order on error */
 err_selftests:
@@ -669,6 +668,7 @@ err_sha1:
 err_ghash:
 	fips_aes_generic_exit();
 err_aes_generic:
+	fips_algtest_exit();
 	return ret;
 }
 
