@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
+
+#include <linux/cpufeature.h>
 #include <linux/set_memory.h>
 #include <linux/ptdump.h>
 #include <linux/seq_file.h>
@@ -224,7 +226,7 @@ void ptdump_check_wx(void)
 		},
 	};
 
-	if (!MACHINE_HAS_NX)
+	if (!cpu_has_nx())
 		return;
 	ptdump_walk_pgd(&st.ptdump, &init_mm, NULL);
 	if (st.wx_pages)
