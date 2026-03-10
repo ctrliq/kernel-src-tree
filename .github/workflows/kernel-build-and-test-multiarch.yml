@@ -13,6 +13,11 @@ on:
         required: false
         type: boolean
         default: false
+      skip_kselftests:
+        description: 'Skip the kselftests stage (e.g. for CBR where kselftest coverage is minimal)'
+        required: false
+        type: boolean
+        default: false
     secrets:
       APP_ID:
         required: true
@@ -120,6 +125,7 @@ jobs:
           -v "$PWD/kernel-src-tree":/src \
           -v "$PWD/output":/output \
           -v "$PWD/kernel-container-build/build-container":/usr/local/build-scripts:ro \
+          -v "$PWD/kernel-container-build/build-container/image_from_container.sh":/usr/local/bin/image_from_container.sh:ro \
           -v "$PWD/kernel-container-build/container/kernel_build.sh":/usr/libexec/kernel_build.sh:ro \
           -v "$PWD/kernel-container-build/container/check_kabi.sh":/usr/libexec/check_kabi.sh:ro \
           --security-opt label=disable \
@@ -217,6 +223,7 @@ jobs:
     name: Run kselftests (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     needs: [setup, boot]
+    if: ${{ !inputs.skip_kselftests }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
@@ -284,8 +291,8 @@ jobs:
   compare-results:
     name: Compare with previous run (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    needs: [setup, test-kselftest]
-    if: success() || failure()
+    needs: [setup, build, boot, test-kselftest]
+    if: ${{ always() && needs.build.result == 'success' && needs.boot.result == 'success' }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
@@ -301,6 +308,7 @@ jobs:
         fetch-depth: 1  # Shallow clone - only current commit needed for comparison logic
 
     - name: Download current kselftest logs
+      if: ${{ !inputs.skip_kselftests }}
       uses: actions/download-artifact@v4
       with:
         name: kselftest-logs-${{ matrix.arch }}
@@ -335,7 +343,7 @@ jobs:
 
         # Define whitelist of valid base branches
         # TODO: Use a centralized place to get the base branches
-        VALID_BASES="ciqlts9_2 ciqlts9_4 ciqlts8_6 ciqlts9_6 ciq-6.12.y ciq-6.18.y"
+        VALID_BASES="ciqlts9_2 ciqlts9_4 ciqlts8_6 ciqlts9_6 ciq-6.12.y ciq-6.18.y ciqcbr7_9"
 
         echo "Current branch: $BRANCH_NAME"
 
@@ -399,7 +407,7 @@ jobs:
         echo "Base branch for comparison: $BASE_BRANCH"
 
     - name: Download baseline kselftest logs from last merged PR targeting same base
-      if: steps.base_branch.outputs.base_branch != ''
+      if: ${{ !inputs.skip_kselftests && steps.base_branch.outputs.base_branch != '' }}
       env:
         GH_TOKEN: ${{ steps.generate_token_compare.outputs.token }}
       run: |
@@ -494,6 +502,7 @@ jobs:
 
     - name: Compare test results
       id: comparison
+      if: ${{ !inputs.skip_kselftests }}
       run: |
         # Check if we have a base branch to compare against
         if [ -z "${{ steps.base_branch.outputs.base_branch }}" ]; then
@@ -563,7 +572,10 @@ jobs:
     name: Create Pull Request
     runs-on: kernel-build
     needs: [setup, build, boot, test-kselftest, compare-results]
-    if: success() || failure()
+    if: |
+      always() &&
+      needs.build.result == 'success' &&
+      needs.boot.result == 'success'
 
     steps:
     - name: Check if branch name matches a supported pattern
@@ -579,10 +591,12 @@ jobs:
 
     - name: Check if tests passed and no regressions
       run: |
-        # Skip PR if any test stage failed
+        # Skip PR if any required stage failed
+        # test-kselftest is optional when skip_kselftests is true (result will be 'skipped')
+        KSELFTEST_RESULT="${{ needs.test-kselftest.result }}"
         if [ "${{ needs.build.result }}" != "success" ] || \
            [ "${{ needs.boot.result }}" != "success" ] || \
-           [ "${{ needs.test-kselftest.result }}" != "success" ]; then
+           ( [ "$KSELFTEST_RESULT" != "success" ] && [ "$KSELFTEST_RESULT" != "skipped" ] ); then
           echo "One or more test stages failed, skipping PR creation"
           exit 1
         fi
@@ -678,14 +692,14 @@ jobs:
         path: artifacts/boot/aarch64
 
     - name: Download kselftest logs (x86_64)
-      if: steps.detect_arch.outputs.has_x86_64 == 'true'
+      if: steps.detect_arch.outputs.has_x86_64 == 'true' && !inputs.skip_kselftests
       uses: actions/download-artifact@v4
       with:
         name: kselftest-logs-x86_64
         path: artifacts/test/x86_64
 
     - name: Download kselftest logs (aarch64)
-      if: steps.detect_arch.outputs.has_aarch64 == 'true'
+      if: steps.detect_arch.outputs.has_aarch64 == 'true' && !inputs.skip_kselftests
       uses: actions/download-artifact@v4
       with:
         name: kselftest-logs-aarch64
@@ -698,23 +712,23 @@ jobs:
         HAS_ARM="${{ steps.detect_arch.outputs.has_aarch64 }}"
 
         # x86_64 stats
-        if [ "$HAS_X86" = "true" ]; then
+        if [ "$HAS_X86" = "true" ] && ls artifacts/test/x86_64/kselftests-*.log 1>/dev/null 2>&1; then
           PASSED_X86=$(grep -a '^ok' artifacts/test/x86_64/kselftests-*.log | wc -l || echo "0")
           FAILED_X86=$(grep -a '^not ok' artifacts/test/x86_64/kselftests-*.log | wc -l || echo "0")
         else
-          PASSED_X86="0"
-          FAILED_X86="0"
+          PASSED_X86="N/A"
+          FAILED_X86="N/A"
         fi
         echo "passed_x86_64=$PASSED_X86" >> $GITHUB_OUTPUT
         echo "failed_x86_64=$FAILED_X86" >> $GITHUB_OUTPUT
 
         # aarch64 stats
-        if [ "$HAS_ARM" = "true" ]; then
+        if [ "$HAS_ARM" = "true" ] && ls artifacts/test/aarch64/kselftests-*.log 1>/dev/null 2>&1; then
           PASSED_ARM=$(grep -a '^ok' artifacts/test/aarch64/kselftests-*.log | wc -l || echo "0")
           FAILED_ARM=$(grep -a '^not ok' artifacts/test/aarch64/kselftests-*.log | wc -l || echo "0")
         else
-          PASSED_ARM="0"
-          FAILED_ARM="0"
+          PASSED_ARM="N/A"
+          FAILED_ARM="N/A"
         fi
         echo "passed_aarch64=$PASSED_ARM" >> $GITHUB_OUTPUT
         echo "failed_aarch64=$FAILED_ARM" >> $GITHUB_OUTPUT
@@ -811,6 +825,12 @@ jobs:
         # Determine comparison status message
         COMPARISON_STATUS_X86="${{ needs.compare-results.outputs.comparison_status_x86_64 }}"
         COMPARISON_STATUS_ARM="${{ needs.compare-results.outputs.comparison_status_aarch64 }}"
+
+        # When kselftests are skipped, comparison step doesn't run so status is empty — treat as skipped
+        if [ "${{ inputs.skip_kselftests }}" = "true" ]; then
+          [ -z "$COMPARISON_STATUS_X86" ] && COMPARISON_STATUS_X86="skipped"
+          [ -z "$COMPARISON_STATUS_ARM" ] && COMPARISON_STATUS_ARM="skipped"
+        fi
 
         # Create comparison section - use printf to avoid code block formatting
         COMPARISON_SECTION="### Test Comparison"
