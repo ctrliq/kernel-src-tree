@@ -26,7 +26,7 @@
 enum md_submodule_type {
 	MD_PERSONALITY = 0,
 	MD_CLUSTER,
-	MD_BITMAP, /* TODO */
+	MD_BITMAP,
 };
 
 enum md_submodule_id {
@@ -41,7 +41,7 @@ enum md_submodule_id {
 	ID_RAID10	= 10,
 	ID_CLUSTER,
 	ID_BITMAP,
-	ID_LLBITMAP,	/* TODO */
+	ID_LLBITMAP,
 	ID_BITMAP_NONE,
 };
 
