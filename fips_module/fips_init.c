@@ -193,6 +193,7 @@ static int fips_run_selftests(void)
 	SELFTEST("ecb(aes)",         "ecb(aes)",         0, 0);
 	SELFTEST("cbc(aes)",         "cbc(aes)",         0, 0);
 	SELFTEST("ctr(aes)",         "ctr(aes)",         0, 0);
+	SELFTEST("rfc3686(ctr(aes))", "rfc3686(ctr(aes))", 0, 0);
 	SELFTEST("xts(aes)",         "xts(aes)",         0, 0);
 	SELFTEST("gcm(aes)",         "gcm(aes)",         0, 0);
 	SELFTEST("rfc4106(gcm(aes))", "rfc4106(gcm(aes))", 0, 0);
@@ -259,6 +260,9 @@ static int fips_run_selftests(void)
 	SELFTEST("pkcs1(rsa,sha256)",   "pkcs1(rsa,sha256)", 0, 0);
 	SELFTEST("pkcs1(rsa,sha384)",   "pkcs1(rsa,sha384)", 0, 0);
 	SELFTEST("pkcs1(rsa,sha512)",   "pkcs1(rsa,sha512)", 0, 0);
+	SELFTEST("pkcs1(rsa,sha3-256)", "pkcs1(rsa,sha3-256)", 0, 0);
+	SELFTEST("pkcs1(rsa,sha3-384)", "pkcs1(rsa,sha3-384)", 0, 0);
+	SELFTEST("pkcs1(rsa,sha3-512)", "pkcs1(rsa,sha3-512)", 0, 0);
 
 	/* ECDSA (P-192 is not FIPS-approved; omit its self-test) */
 	SELFTEST("fips-ecdsa-nist-p256-generic", "ecdsa-nist-p256", 0, 0);
