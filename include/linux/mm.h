@@ -79,6 +79,11 @@ extern int page_cluster;
 extern const int page_cluster_max;
 
 #ifdef CONFIG_SYSCTL
+
+#ifdef CONFIG_MEMCG
+extern int sysctl_mem_cgroup_reclaim_retries;
+#endif
+
 extern int sysctl_legacy_va_layout;
 #else
 #define sysctl_legacy_va_layout 0

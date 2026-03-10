@@ -2193,6 +2193,17 @@ static struct ctl_table vm_table[] = {
 		.extra1		= SYSCTL_ZERO,
 		.extra2		= SYSCTL_TWO_HUNDRED,
 	},
+#ifdef CONFIG_MEMCG
+	{
+		.procname	= "mem_cgroup_reclaim_retries",
+		.data		= &sysctl_mem_cgroup_reclaim_retries,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ONE,
+		.extra2		= SYSCTL_MAX_RECLAIM_TRIES,
+	},
+#endif
 #ifdef CONFIG_NUMA
 	{
 		.procname	= "numa_stat",

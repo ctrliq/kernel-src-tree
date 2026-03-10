@@ -217,6 +217,8 @@ enum percpu_stats_state {
 	     iter != NULL;				\
 	     iter = mem_cgroup_iter(NULL, iter, NULL))
 
+int sysctl_mem_cgroup_reclaim_retries = MAX_RECLAIM_RETRIES;
+
 static inline bool task_is_dying(void)
 {
 	return tsk_is_oom_victim(current) || fatal_signal_pending(current) ||
@@ -2437,7 +2439,7 @@ void mem_cgroup_handle_over_high(gfp_t gfp_mask)
 	unsigned long pflags;
 	unsigned long nr_reclaimed;
 	unsigned int nr_pages = current->memcg_nr_pages_over_high;
-	int nr_retries = MAX_RECLAIM_RETRIES;
+	int nr_retries = sysctl_mem_cgroup_reclaim_retries;
 	struct mem_cgroup *memcg;
 	bool in_retry = false;
 
@@ -2528,7 +2530,7 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
 			unsigned int nr_pages)
 {
 	unsigned int batch = max(MEMCG_CHARGE_BATCH, nr_pages);
-	int nr_retries = MAX_RECLAIM_RETRIES;
+	int nr_retries = sysctl_mem_cgroup_reclaim_retries;
 	struct mem_cgroup *mem_over_limit;
 	struct page_counter *counter;
 	unsigned long nr_reclaimed;
@@ -2629,7 +2631,7 @@ retry:
 	if (mem_cgroup_oom(mem_over_limit, gfp_mask,
 			   get_order(nr_pages * PAGE_SIZE))) {
 		passed_oom = true;
-		nr_retries = MAX_RECLAIM_RETRIES;
+		nr_retries = sysctl_mem_cgroup_reclaim_retries;
 		goto retry;
 	}
 nomem:
@@ -3521,7 +3523,7 @@ static int mem_cgroup_resize_max(struct mem_cgroup *memcg,
  */
 static int mem_cgroup_force_empty(struct mem_cgroup *memcg)
 {
-	int nr_retries = MAX_RECLAIM_RETRIES;
+	int nr_retries = sysctl_mem_cgroup_reclaim_retries;
 
 	/* we call try-to-free pages for make this cgroup empty */
 	lru_add_drain_all();
@@ -6538,7 +6540,7 @@ static ssize_t memory_high_write(struct kernfs_open_file *of,
 				 char *buf, size_t nbytes, loff_t off)
 {
 	struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
-	unsigned int nr_retries = MAX_RECLAIM_RETRIES;
+	unsigned int nr_retries = sysctl_mem_cgroup_reclaim_retries;
 	bool drained = false;
 	unsigned long high;
 	int err;
@@ -6587,7 +6589,7 @@ static ssize_t memory_max_write(struct kernfs_open_file *of,
 				char *buf, size_t nbytes, loff_t off)
 {
 	struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
-	unsigned int nr_reclaims = MAX_RECLAIM_RETRIES;
+	unsigned int nr_reclaims = sysctl_mem_cgroup_reclaim_retries;
 	bool drained = false;
 	unsigned long max;
 	int err;
@@ -6747,7 +6749,7 @@ static ssize_t memory_reclaim(struct kernfs_open_file *of, char *buf,
 			      size_t nbytes, loff_t off)
 {
 	struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
-	unsigned int nr_retries = MAX_RECLAIM_RETRIES;
+	unsigned int nr_retries = sysctl_mem_cgroup_reclaim_retries;
 	unsigned long nr_to_reclaim, nr_reclaimed = 0;
 	unsigned int reclaim_options;
 	int err;
