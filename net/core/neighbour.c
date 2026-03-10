@@ -817,7 +817,8 @@ int pneigh_create(struct neigh_table *tbl, struct net *net,
 	rcu_assign_pointer(tbl->phash_buckets[hash_val], n);
 update:
 	WRITE_ONCE(n->flags, flags);
-	WRITE_ONCE(n->protocol, protocol);
+	if (protocol)
+		WRITE_ONCE(n->protocol, protocol);
 out:
 	mutex_unlock(&tbl->phash_lock);
 	return err;
