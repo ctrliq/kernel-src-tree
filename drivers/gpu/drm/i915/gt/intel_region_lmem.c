@@ -51,12 +51,16 @@ static void i915_resize_lmem_bar(struct drm_i915_private *i915, resource_size_t 
 	current_size = roundup_pow_of_two(pci_resource_len(pdev, GEN12_LMEM_BAR));
 
 	if (i915->params.lmem_bar_size) {
-		rebar_size = i915->params.lmem_bar_size * (resource_size_t)SZ_1M;
+		u32 bar_sizes;
+
+		rebar_size = i915->params.lmem_bar_size *
+			(resource_size_t)SZ_1M;
+		bar_sizes = pci_rebar_get_possible_sizes(pdev, GEN12_LMEM_BAR);
+
 		if (rebar_size == current_size)
 			return;
 
-		if (!pci_rebar_size_supported(pdev, GEN12_LMEM_BAR,
-					      pci_rebar_bytes_to_size(rebar_size)) ||
+		if (!(bar_sizes & BIT(pci_rebar_bytes_to_size(rebar_size))) ||
 		    rebar_size >= roundup_pow_of_two(lmem_size)) {
 			rebar_size = lmem_size;
 
