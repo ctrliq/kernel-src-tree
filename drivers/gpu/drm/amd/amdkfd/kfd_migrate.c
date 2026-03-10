@@ -567,9 +567,8 @@ out:
 	return r < 0 ? r : 0;
 }
 
-static void svm_migrate_folio_free(struct folio *folio)
+static void svm_migrate_page_free(struct page *page)
 {
-	struct page *page = &folio->page;
 	struct svm_range_bo *svm_bo = page->zone_device_data;
 
 	if (svm_bo) {
@@ -1007,7 +1006,7 @@ out_mmput:
 }
 
 static const struct dev_pagemap_ops svm_migrate_pgmap_ops = {
-	.folio_free		= svm_migrate_folio_free,
+	.page_free		= svm_migrate_page_free,
 	.migrate_to_ram		= svm_migrate_to_ram,
 };
 

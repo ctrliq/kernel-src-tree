@@ -757,15 +757,15 @@ err_out:
 }
 
 /**
- * drm_pagemap_folio_free() - Put GPU SVM zone device data associated with a folio
- * @folio: Pointer to the folio
+ * drm_pagemap_page_free() - Put GPU SVM zone device data associated with a page
+ * @page: Pointer to the page
  *
  * This function is a callback used to put the GPU SVM zone device data
  * associated with a page when it is being released.
  */
-static void drm_pagemap_folio_free(struct folio *folio)
+static void drm_pagemap_page_free(struct page *page)
 {
-	drm_pagemap_zdd_put(folio->page.zone_device_data);
+	drm_pagemap_zdd_put(page->zone_device_data);
 }
 
 /**
@@ -793,7 +793,7 @@ static vm_fault_t drm_pagemap_migrate_to_ram(struct vm_fault *vmf)
 }
 
 static const struct dev_pagemap_ops drm_pagemap_pagemap_ops = {
-	.folio_free = drm_pagemap_folio_free,
+	.page_free = drm_pagemap_page_free,
 	.migrate_to_ram = drm_pagemap_migrate_to_ram,
 };
 
