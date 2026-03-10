@@ -11,8 +11,7 @@ HIDE_UNSUPPORTED_ARCH=1;
 # override LC_TIME to avoid date conflicts when building the srpm
 LC_TIME=
 
-GIT_FORMAT="--format=- %s (%an)%n%N%n^^^NOTES-END^^^%n%b"
-GIT_NOTES="--notes=refs/notes/${RHEL_MAJOR}.${RHEL_MINOR}*"
+GIT_FORMAT="--format=- %s (%an)%n%b"
 
 lasttag=$(git rev-list --first-parent --grep="^\[redhat\] ${SPECPACKAGE_NAME}-${SPECKVERSION}.${SPECKPATCHLEVEL}" --max-count=1 HEAD)
 # if we didn't find the proper tag, assume this is the first release
@@ -33,7 +32,7 @@ cdate="$(LC_ALL=C date +"%a %b %d %Y")"
 cversion="[$DISTBASEVERSION]";
 echo "* $cdate $cname $cversion" > "$clogf"
 
-git log --topo-order --no-merges -z "$GIT_NOTES" "$GIT_FORMAT" \
+git log --topo-order --no-merges -z "$GIT_FORMAT" \
 	^"${UPSTREAM}" "$lasttag".. -- ':!/redhat/rhdocs' | "${0%/*}"/genlog.py >> "$clogf"
 
 if [ "$HIDE_REDHAT" = "1" ]; then

@@ -3,7 +3,7 @@
 # Copyright (C) 2023 Red Hat, Inc.
 
 """Parses git log from stdin, expecting format of:
-$ git log [<options>] -z --format="- %s (%an)%n%N%n^^^NOTES-END^^^%n%b" [<range>] [[--] <path>...] | ...
+$ git log [<options>] -z --format="- %s (%an)%n%b" [<range>] [[--] <path>...] | ...
 and prints changelog output to stdout."""
 
 import re
@@ -25,9 +25,7 @@ class CommitTags:
         'Patchwork-instance': [r'(.*)'],
     }
     tag_patterns['Y-Bugzilla'] = tag_patterns['Bugzilla']
-    tag_patterns['Z-Bugzilla'] = tag_patterns['Bugzilla']
     tag_patterns['Y-JIRA'] = tag_patterns['JIRA']
-    tag_patterns['Z-JIRA'] = tag_patterns['JIRA']
     tag_patterns['O-JIRA'] = tag_patterns['JIRA']
 
     compiled_patterns = {}
@@ -47,14 +45,6 @@ class CommitTags:
             raise Exception('Unsupported tag name: ' + tag_name)
         return self.tag_dict[tag_name]
 
-    def override_by(self, other_commit_tags):
-        for tag_name, tag_set in other_commit_tags.tag_dict.items():
-            if tag_set:
-                if tag_set == set(['N/A']):
-                    self.tag_dict[tag_name] = set()
-                else:
-                    self.tag_dict[tag_name] = set(tag_set)
-
     def parse_tags(self, input_str):
         tag_values = {}
         for tag_name, tag_pattern_list in CommitTags.compiled_patterns.items():
@@ -64,23 +54,9 @@ class CommitTags:
                     tag_values[tag_name].add(value)
         self.tag_dict = tag_values
 
-    def convert_to_y_tags(self):
-        if self.tag_dict['Z-Bugzilla'] or self.tag_dict['Z-JIRA']:
-            tmp = self.tag_dict['Bugzilla']
-            self.tag_dict['Bugzilla'] = self.tag_dict['Z-Bugzilla']
-            self.tag_dict['Y-Bugzilla'] = tmp
-            self.tag_dict['Z-Bugzilla'] = set()
-
-            tmp = self.tag_dict['JIRA']
-            self.tag_dict['JIRA'] = self.tag_dict['Z-JIRA']
-            self.tag_dict['Y-JIRA'] = tmp
-            self.tag_dict['Z-JIRA'] = set()
-
     def get_changelog_str(self):
         chnglog = []
         tickets = sorted(self.tag_dict['Bugzilla']) + sorted(self.tag_dict['JIRA'])
-        #if self.tag_dict['Y-Bugzilla'] or self.tag_dict['Y-JIRA']:
-        #    tickets = tickets + sorted(self.tag_dict['Y-Bugzilla']) + sorted(self.tag_dict['Y-JIRA'])
         if tickets:
             chnglog.append('[' + ' '.join(tickets) + ']')
         if self.tag_dict['CVE']:
@@ -97,19 +73,7 @@ class CommitTags:
 
 
 def parse_commit(commit):
-    if '^^^NOTES-END^^^' in commit:
-        input_notes, input_commit = commit.split('^^^NOTES-END^^^')
-    else:
-        input_notes = ''
-        input_commit = commit
-
-    tags = CommitTags(input_commit)
-    if input_notes:
-        notes_tags = CommitTags(input_notes)
-        notes_tags.convert_to_y_tags()
-        tags.override_by(notes_tags)
-
-    return tags
+    return CommitTags(commit)
 
 
 if __name__ == "__main__":
