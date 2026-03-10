@@ -64,8 +64,7 @@ struct md_bitmap_stats {
 struct bitmap_operations {
 	bool (*enabled)(void *data, bool flush);
 	int (*create)(struct mddev *mddev);
-	int (*resize)(struct mddev *mddev, sector_t blocks, int chunksize,
-		      bool init);
+	int (*resize)(struct mddev *mddev, sector_t blocks, int chunksize);
 
 	int (*load)(struct mddev *mddev);
 	void (*destroy)(struct mddev *mddev);
