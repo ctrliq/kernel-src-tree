@@ -1674,6 +1674,8 @@ static void pci_claim_bridge_resources(struct pci_dev *dev)
 
 		if (!r->flags || r->parent)
 			continue;
+		if (r->flags & IORESOURCE_DISABLED)
+			continue;
 
 		pci_claim_bridge_resource(dev, i);
 	}
