@@ -36,6 +36,8 @@ fips_module-y :=					\
 	crypto/ghash-generic.o				\
 	crypto/xts.o					\
 							\
+	lib/sha256.o					\
+							\
 	crypto/sha1.o					\
 	crypto/sha256.o					\
 	crypto/sha512.o					\
