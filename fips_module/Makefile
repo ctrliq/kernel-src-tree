@@ -25,6 +25,7 @@ MODULE_NAME := fips_module
 # -----------------------------------------------------------------------
 fips_module-y :=					\
 	fips_init.o					\
+	fips_integrity.o				\
 	fips_extrng.o					\
 	fips_algtest.o					\
 							\
@@ -169,9 +170,31 @@ $(obj)/crypto/ecdsa-x962.o:  $(obj)/crypto/ecdsasignature.asn1.h
 # -----------------------------------------------------------------------
 # Build targets
 # -----------------------------------------------------------------------
+#
+# After the kbuild step links fips_module.ko, the post-build script
+# scripts/fips_hmac_patch.py must be run to embed the expected HMAC-SHA-256
+# of the module image into its .fips_hmac ELF section.  The 'all' target
+# does this automatically when building from within fips_module/.
+#
+# When building from the kernel root with 'make M=fips_module', kbuild
+# does not invoke this Makefile's 'all' target.  Run the patch step
+# manually afterwards:
+#   python3 fips_module/scripts/fips_hmac_patch.py fips_module/fips_module.ko
+# or use the 'hmac_patch' target:
+#   make -C fips_module hmac_patch
+#
+# NOTE: If the module is stripped before installation, stripping must
+# happen BEFORE the HMAC patch step, since stripping modifies the file.
+
+PYTHON3 ?= python3
+FIPS_HMAC_PATCH := $(PWD)/scripts/fips_hmac_patch.py
 
 all:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
+	$(PYTHON3) $(FIPS_HMAC_PATCH) $(PWD)/fips_module.ko
+
+hmac_patch:
+	$(PYTHON3) $(FIPS_HMAC_PATCH) $(PWD)/fips_module.ko
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean

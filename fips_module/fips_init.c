@@ -379,6 +379,15 @@ static int __init fips_module_init(void)
 		panic("fips_module: SHA-256 bootstrap self-test FAILED\n");
 
 	/*
+	 * Module self-integrity check: read the .ko file and verify its
+	 * HMAC-SHA-256 against the value embedded by scripts/fips_hmac_patch.py
+	 * at build time.  This relies on the SHA-256 implementation verified
+	 * above and must complete before any algorithms are registered.
+	 */
+	if (fips_self_integrity_check())
+		panic("fips_module: self-integrity check FAILED\n");
+
+	/*
 	 * Register the CRYPTO_MSG_ALG_REGISTER notifier FIRST, before any
 	 * algorithm is registered, so that every registration event is
 	 * intercepted by fips_module's notifier (priority 100) rather than

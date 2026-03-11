@@ -21,6 +21,18 @@
  */
 int  fips_sha256_bootstrap_selftest(void);
 
+/*
+ * Module self-integrity check.
+ *
+ * Reads the .ko file named by the "path=" module parameter, locates the
+ * .fips_hmac ELF section, and verifies the HMAC-SHA-256 of the file image
+ * against the value patched in at build time by scripts/fips_hmac_patch.py.
+ *
+ * Must be called after fips_sha256_bootstrap_selftest() and before any
+ * fips_*_init() call.
+ */
+int  fips_self_integrity_check(void);
+
 /* AES block cipher */
 int  fips_aes_generic_init(void);
 void fips_aes_generic_exit(void);
