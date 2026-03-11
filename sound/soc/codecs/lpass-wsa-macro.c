@@ -2498,10 +2498,8 @@ static const struct snd_soc_dapm_route wsa_audio_map[] = {
 	{"WSA RX_MIX0", NULL, "WSA RX_MIX0 MUX"},
 	{"WSA RX_MIX1", NULL, "WSA RX_MIX1 MUX"},
 
-	{"WSA RX0", NULL, "WSA_RX0_CLK"},
-	{"WSA RX1", NULL, "WSA_RX1_CLK"},
-	{"WSA RX_MIX0", NULL, "WSA_RX_MIX0_CLK"},
-	{"WSA RX_MIX1", NULL, "WSA_RX_MIX1_CLK"},
+	{"WSA_RX INT0 MIX", NULL, "WSA_RX0_CLK"},
+	{"WSA_RX INT1 MIX", NULL, "WSA_RX1_CLK"},
 
 	{"WSA_RX0 INP0", "RX0", "WSA RX0"},
 	{"WSA_RX0 INP0", "RX1", "WSA RX1"},
@@ -2531,6 +2529,8 @@ static const struct snd_soc_dapm_route wsa_audio_map[] = {
 	{"WSA_RX0 MIX INP", "RX1", "WSA RX1"},
 	{"WSA_RX0 MIX INP", "RX_MIX0", "WSA RX_MIX0"},
 	{"WSA_RX0 MIX INP", "RX_MIX1", "WSA RX_MIX1"},
+	{"WSA_RX0 MIX INP", NULL, "WSA_RX0_CLK"},
+	{"WSA_RX0 MIX INP", NULL, "WSA_RX_MIX0_CLK"},
 	{"WSA_RX INT0 SEC MIX", NULL, "WSA_RX0 MIX INP"},
 
 	{"WSA_RX INT0 SEC MIX", NULL, "WSA_RX INT0 MIX"},
@@ -2570,6 +2570,8 @@ static const struct snd_soc_dapm_route wsa_audio_map[] = {
 	{"WSA_RX1 MIX INP", "RX1", "WSA RX1"},
 	{"WSA_RX1 MIX INP", "RX_MIX0", "WSA RX_MIX0"},
 	{"WSA_RX1 MIX INP", "RX_MIX1", "WSA RX_MIX1"},
+	{"WSA_RX1 MIX INP", NULL, "WSA_RX1_CLK"},
+	{"WSA_RX1 MIX INP", NULL, "WSA_RX_MIX1_CLK"},
 	{"WSA_RX INT1 SEC MIX", NULL, "WSA_RX1 MIX INP"},
 
 	{"WSA_RX INT1 SEC MIX", NULL, "WSA_RX INT1 MIX"},
