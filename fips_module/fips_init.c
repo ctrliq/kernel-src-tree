@@ -356,8 +356,6 @@ static int fips_run_selftests(void)
 
 static int __init fips_module_init(void)
 {
-	int ret;
-
 	/*
 	 * Refuse to load when the kernel is not in FIPS mode.  This module
 	 * exists solely to provide a FIPS-validated cryptographic boundary;
@@ -377,11 +375,8 @@ static int __init fips_module_init(void)
 	 * establishes that the SHA-256 implementation is trustworthy before
 	 * it is relied upon by every subsequent operation.
 	 */
-	ret = fips_sha256_bootstrap_selftest();
-	if (ret) {
-		panic("fips_module: SHA-256 bootstrap self-test FAILED: %d\n", ret);
-		return ret;
-	}
+	if (fips_sha256_bootstrap_selftest())
+		panic("fips_module: SHA-256 bootstrap self-test FAILED\n");
 
 	/*
 	 * Register the CRYPTO_MSG_ALG_REGISTER notifier FIRST, before any
@@ -404,13 +399,11 @@ static int __init fips_module_init(void)
 	 *
 	 * After all algorithms are registered, fips_run_selftests() is called
 	 * to explicitly exercise the module-private copy of alg_test() and its
-	 * test vectors.  A self-test failure aborts module loading.
+	 * test vectors.  A self-test failure panics the kernel — a FIPS module
+	 * must never operate with unverified algorithm implementations.
 	 */
-	ret = fips_algtest_init();
-	if (ret) {
-		pr_err("fips_module: algtest notifier init failed: %d\n", ret);
-		return ret;
-	}
+	if (fips_algtest_init())
+		panic("fips_module: algtest notifier init failed\n");
 
 	/*
 	 * Retroactively block non-approved algorithms that were already
@@ -420,153 +413,61 @@ static int __init fips_module_init(void)
 	 */
 	fips_sweep_preregistered_algs();
 
-	ret = fips_aes_generic_init();
-	if (ret) {
-		pr_err("fips_module: aes_generic init failed: %d\n", ret);
-		goto err_aes_generic;
-	}
-
-	ret = fips_ghash_init();
-	if (ret) {
-		pr_err("fips_module: ghash init failed: %d\n", ret);
-		goto err_ghash;
-	}
-
-	ret = fips_sha1_init();
-	if (ret) {
-		pr_err("fips_module: sha1 init failed: %d\n", ret);
-		goto err_sha1;
-	}
-
-	ret = fips_sha256_init();
-	if (ret) {
-		pr_err("fips_module: sha256 init failed: %d\n", ret);
-		goto err_sha256;
-	}
-
-	ret = fips_sha512_init();
-	if (ret) {
-		pr_err("fips_module: sha512 init failed: %d\n", ret);
-		goto err_sha512;
-	}
-
-	ret = fips_sha3_init();
-	if (ret) {
-		pr_err("fips_module: sha3 init failed: %d\n", ret);
-		goto err_sha3;
-	}
+	if (fips_aes_generic_init())
+		panic("fips_module: aes_generic init failed\n");
+	if (fips_ghash_init())
+		panic("fips_module: ghash init failed\n");
+	if (fips_sha1_init())
+		panic("fips_module: sha1 init failed\n");
+	if (fips_sha256_init())
+		panic("fips_module: sha256 init failed\n");
+	if (fips_sha512_init())
+		panic("fips_module: sha512 init failed\n");
+	if (fips_sha3_init())
+		panic("fips_module: sha3 init failed\n");
 
 #if defined(CONFIG_X86_64) || defined(CONFIG_X86)
-	ret = fips_aesni_init();
-	if (ret) {
-		pr_err("fips_module: aesni init failed: %d\n", ret);
-		goto err_aesni;
-	}
-
-	ret = fips_ghash_clmul_init();
-	if (ret) {
-		pr_err("fips_module: ghash_clmul init failed: %d\n", ret);
-		goto err_ghash_clmul;
-	}
+	if (fips_aesni_init())
+		panic("fips_module: aesni init failed\n");
+	if (fips_ghash_clmul_init())
+		panic("fips_module: ghash_clmul init failed\n");
 #endif
 
 #ifdef CONFIG_ARM64
-	ret = fips_aes_ce_init();
-	if (ret) {
-		pr_err("fips_module: aes_ce init failed: %d\n", ret);
-		goto err_aes_ce;
-	}
-
-	ret = fips_ghash_ce_init();
-	if (ret) {
-		pr_err("fips_module: ghash_ce init failed: %d\n", ret);
-		goto err_ghash_ce;
-	}
-
-	ret = fips_sha3_ce_init();
-	if (ret) {
-		pr_err("fips_module: sha3_ce init failed: %d\n", ret);
-		goto err_sha3_ce;
-	}
+	if (fips_aes_ce_init())
+		panic("fips_module: aes_ce init failed\n");
+	if (fips_ghash_ce_init())
+		panic("fips_module: ghash_ce init failed\n");
+	if (fips_sha3_ce_init())
+		panic("fips_module: sha3_ce init failed\n");
 #endif
 
-	ret = fips_ecb_init();
-	if (ret) {
-		pr_err("fips_module: ecb init failed: %d\n", ret);
-		goto err_ecb;
-	}
-
-	ret = fips_cbc_init();
-	if (ret) {
-		pr_err("fips_module: cbc init failed: %d\n", ret);
-		goto err_cbc;
-	}
-
-	ret = fips_ctr_init();
-	if (ret) {
-		pr_err("fips_module: ctr init failed: %d\n", ret);
-		goto err_ctr;
-	}
-
-	ret = fips_xts_init();
-	if (ret) {
-		pr_err("fips_module: xts init failed: %d\n", ret);
-		goto err_xts;
-	}
-
-	ret = fips_gcm_init();
-	if (ret) {
-		pr_err("fips_module: gcm init failed: %d\n", ret);
-		goto err_gcm;
-	}
-
-	ret = fips_hmac_init();
-	if (ret) {
-		pr_err("fips_module: hmac init failed: %d\n", ret);
-		goto err_hmac;
-	}
-
-	ret = fips_cmac_init();
-	if (ret) {
-		pr_err("fips_module: cmac init failed: %d\n", ret);
-		goto err_cmac;
-	}
-
-	ret = fips_authenc_init();
-	if (ret) {
-		pr_err("fips_module: authenc init failed: %d\n", ret);
-		goto err_authenc;
-	}
-
-	ret = fips_ccm_init();
-	if (ret) {
-		pr_err("fips_module: ccm init failed: %d\n", ret);
-		goto err_ccm;
-	}
-
-	ret = fips_essiv_init();
-	if (ret) {
-		pr_err("fips_module: essiv init failed: %d\n", ret);
-		goto err_essiv;
-	}
-
-	ret = fips_kdf_sp800108_init();
-	if (ret) {
-		pr_err("fips_module: kdf_sp800108 init failed: %d\n", ret);
-		goto err_kdf;
-	}
-
-	ret = fips_rsa_init();
-	if (ret) {
-		pr_err("fips_module: rsa init failed: %d\n", ret);
-		goto err_rsa;
-	}
-
-	ret = fips_ecdsa_init();
-	if (ret) {
-		pr_err("fips_module: ecdsa init failed: %d\n", ret);
-		goto err_ecdsa;
-	}
+	if (fips_ecb_init())
+		panic("fips_module: ecb init failed\n");
+	if (fips_cbc_init())
+		panic("fips_module: cbc init failed\n");
+	if (fips_ctr_init())
+		panic("fips_module: ctr init failed\n");
+	if (fips_xts_init())
+		panic("fips_module: xts init failed\n");
+	if (fips_gcm_init())
+		panic("fips_module: gcm init failed\n");
+	if (fips_hmac_init())
+		panic("fips_module: hmac init failed\n");
+	if (fips_cmac_init())
+		panic("fips_module: cmac init failed\n");
+	if (fips_authenc_init())
+		panic("fips_module: authenc init failed\n");
+	if (fips_ccm_init())
+		panic("fips_module: ccm init failed\n");
+	if (fips_essiv_init())
+		panic("fips_module: essiv init failed\n");
+	if (fips_kdf_sp800108_init())
+		panic("fips_module: kdf_sp800108 init failed\n");
+	if (fips_rsa_init())
+		panic("fips_module: rsa init failed\n");
+	if (fips_ecdsa_init())
+		panic("fips_module: ecdsa init failed\n");
 
 	/*
 	 * JitterEntropy must be registered before ECDH and DH.  The ECDH
@@ -578,29 +479,14 @@ static int __init fips_module_init(void)
 	 * first ensures it is at least present as a larval entry — the crypto
 	 * API will wait for the larval to be resolved rather than failing.
 	 */
-	ret = fips_jent_init();
-	if (ret) {
-		pr_err("fips_module: jitterentropy init failed: %d\n", ret);
-		goto err_jent;
-	}
-
-	ret = fips_ecdh_init();
-	if (ret) {
-		pr_err("fips_module: ecdh init failed: %d\n", ret);
-		goto err_ecdh;
-	}
-
-	ret = fips_dh_init();
-	if (ret) {
-		pr_err("fips_module: dh init failed: %d\n", ret);
-		goto err_dh;
-	}
-
-	ret = fips_drbg_init();
-	if (ret) {
-		pr_err("fips_module: drbg init failed: %d\n", ret);
-		goto err_drbg;
-	}
+	if (fips_jent_init())
+		panic("fips_module: jitterentropy init failed\n");
+	if (fips_ecdh_init())
+		panic("fips_module: ecdh init failed\n");
+	if (fips_dh_init())
+		panic("fips_module: dh init failed\n");
+	if (fips_drbg_init())
+		panic("fips_module: drbg init failed\n");
 
 	/*
 	 * Run the module-private self-tests for every registered algorithm.
@@ -608,92 +494,19 @@ static int __init fips_module_init(void)
 	 * local copy of alg_test() in this module's bundled testmgr.c, not
 	 * the kernel's built-in version triggered by the cryptomgr.
 	 */
-	ret = fips_run_selftests();
-	if (ret) {
-		pr_err("fips_module: self-tests FAILED: %d\n", ret);
-		goto err_selftests;
-	}
+	if (fips_run_selftests())
+		panic("fips_module: self-tests FAILED\n");
 
 	/*
 	 * All algorithms are registered and self-tested.  Now redirect
 	 * getrandom(2) and /dev/random to the in-boundary FIPS DRBG.
-	 * fips_extrng_init() is self-cleaning on failure, so its error
-	 * path falls through to the existing err_selftests unwind.
 	 */
-	ret = fips_extrng_init();
-	if (ret) {
-		pr_err("fips_module: extrng init failed: %d\n", ret);
-		goto err_selftests;
-	}
+	if (fips_extrng_init())
+		panic("fips_module: extrng init failed\n");
 
 	pr_info("fips_module: all FIPS algorithms registered and "
 		"self-tests passed\n");
 	return 0;
-
-	/* Unwind in reverse order on error */
-err_selftests:
-	fips_drbg_exit();
-err_drbg:
-	fips_dh_exit();
-err_dh:
-	fips_ecdh_exit();
-err_ecdh:
-	fips_jent_exit();
-err_jent:
-	fips_ecdsa_exit();
-err_ecdsa:
-	fips_rsa_exit();
-err_rsa:
-	fips_kdf_sp800108_exit();
-err_kdf:
-	fips_essiv_exit();
-err_essiv:
-	fips_ccm_exit();
-err_ccm:
-	fips_authenc_exit();
-err_authenc:
-	fips_cmac_exit();
-err_cmac:
-	fips_hmac_exit();
-err_hmac:
-	fips_gcm_exit();
-err_gcm:
-	fips_xts_exit();
-err_xts:
-	fips_ctr_exit();
-err_ctr:
-	fips_cbc_exit();
-err_cbc:
-	fips_ecb_exit();
-err_ecb:
-#ifdef CONFIG_ARM64
-	fips_sha3_ce_exit();
-err_sha3_ce:
-	fips_ghash_ce_exit();
-err_ghash_ce:
-	fips_aes_ce_exit();
-err_aes_ce:
-#endif
-#if defined(CONFIG_X86_64) || defined(CONFIG_X86)
-	fips_ghash_clmul_exit();
-err_ghash_clmul:
-	fips_aesni_exit();
-err_aesni:
-#endif
-	fips_sha3_exit();
-err_sha3:
-	fips_sha512_exit();
-err_sha512:
-	fips_sha256_exit();
-err_sha256:
-	fips_sha1_exit();
-err_sha1:
-	fips_ghash_exit();
-err_ghash:
-	fips_aes_generic_exit();
-err_aes_generic:
-	fips_algtest_exit();
-	return ret;
 }
 
 module_init(fips_module_init);
