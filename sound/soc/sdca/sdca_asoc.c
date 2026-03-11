@@ -844,6 +844,9 @@ static int populate_control(struct device *dev,
 	cn = (1ul << 31) - 1; // type_max(mc->max)
 	mc->max = clamp((0x1ull << control->nbits) - 1, 0, cn);
 
+	if (SDCA_CTL_TYPE(entity->type, control->sel) == SDCA_CTL_TYPE_S(FU, MUTE))
+		mc->invert = true;
+
 	(*kctl)->name = control_name;
 	(*kctl)->private_value = (unsigned long)mc;
 	(*kctl)->iface = SNDRV_CTL_ELEM_IFACE_MIXER;
