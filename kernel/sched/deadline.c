@@ -3302,6 +3302,12 @@ static void switched_to_dl(struct rq *rq, struct task_struct *p)
 
 static u64 get_prio_dl(struct rq *rq, struct task_struct *p)
 {
+	/*
+	 * Make sure to update current so we don't return a stale value.
+	 */
+	if (task_current_donor(rq, p))
+		update_curr_dl(rq);
+
 	return p->dl.deadline;
 }
 
