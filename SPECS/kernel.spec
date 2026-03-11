@@ -835,6 +835,7 @@ Source8006: ciq_sb_kernel_driver_aarch64.der
 Source8007: ciq_sb_kernel_kpatch_aarch64.der
 Source8008: ciq_sb_uki.crt
 Source8009: ciq_sb_uki_aarch64.crt
+Source8010: x509.genkey.rocky
 
 %if %{signkernel}
 # Name of the packaged file containing signing key
@@ -2145,9 +2146,9 @@ InitBuildVars() {
     %{make} %{?_smp_mflags} mrproper
     cp configs/$Config .config
 
-    # %if %{signkernel}%{signmodules}
-    # cp configs/x509.genkey certs/.
-    # %endif
+    %if %{signkernel}%{signmodules}
+    cp configs/x509.genkey certs/.
+    %endif
 
 %if %{with_debuginfo} == 0
     sed -i 's/^\(CONFIG_DEBUG_INFO.*\)=y/# \1 is not set/' .config
