@@ -424,3 +424,56 @@ void fips_lib_hmac_sha256_usingrawkey(const u8 *raw_key, size_t raw_key_len,
 	fips_lib__sha256_update(&ctx.ctx.sha_ctx, data, data_len);
 	fips_lib_hmac_sha256_final(&ctx, out);
 }
+
+/*
+ * fips_sha256_bootstrap_selftest - pre-operational HMAC-SHA-256 known-answer test
+ *
+ * Called at the very start of fips_module_init(), before the crypto API is
+ * touched and before any algorithm is registered.  Uses fips_lib_* functions
+ * directly so there is no dependency on crypto_alloc_shash() or any other
+ * part of the kernel crypto API.
+ *
+ * By running this KAT first, two goals are achieved simultaneously:
+ *   1. The HMAC-SHA-256 implementation is verified to produce correct output
+ *      (satisfies the FIPS 140-3 power-on algorithm self-test requirement).
+ *   2. The same implementation can then be trusted for use in a module
+ *      integrity check (HMAC over the .ko image) without a bootstrapping
+ *      dependency on an untested algorithm.
+ *
+ * Test vector: RFC 4231, Test Case 1
+ *   Key    = 0x0b (repeated 20 times)
+ *   Data   = "Hi There"
+ *   Result = b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7
+ */
+int fips_sha256_bootstrap_selftest(void)
+{
+	static const u8 key[20] = {
+		0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
+		0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
+		0x0b, 0x0b, 0x0b, 0x0b
+	};
+	static const u8 data[] = "Hi There";
+	static const u8 expected[SHA256_DIGEST_SIZE] = {
+		0xb0, 0x34, 0x4c, 0x61, 0xd8, 0xdb, 0x38, 0x53,
+		0x5c, 0xa8, 0xaf, 0xce, 0xaf, 0x0b, 0xf1, 0x2b,
+		0x88, 0x1d, 0xc2, 0x00, 0xc9, 0x83, 0x3d, 0xa7,
+		0x26, 0xe9, 0x37, 0x6c, 0x2e, 0x32, 0xcf, 0xf7
+	};
+	u8 result[SHA256_DIGEST_SIZE];
+	int ret;
+
+	fips_lib_hmac_sha256_usingrawkey(key, sizeof(key),
+					 data, sizeof(data) - 1,
+					 result);
+
+	if (memcmp(result, expected, SHA256_DIGEST_SIZE) != 0) {
+		pr_err("fips_module: HMAC-SHA-256 bootstrap self-test FAILED\n");
+		ret = -ENOKEY;
+	} else {
+		pr_info("fips_module: HMAC-SHA-256 bootstrap self-test passed\n");
+		ret = 0;
+	}
+
+	memzero_explicit(result, sizeof(result));
+	return ret;
+}

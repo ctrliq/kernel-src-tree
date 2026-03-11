@@ -12,6 +12,15 @@
 #define _FIPS_ALG_H
 
 
+/*
+ * Bootstrap HMAC-SHA-256 known-answer test.
+ *
+ * Must be called before the crypto API is initialised (i.e. before any
+ * fips_*_init() call).  Uses the fips_lib_ library functions directly so
+ * there is no dependency on crypto_alloc_shash() or registered algorithms.
+ */
+int  fips_sha256_bootstrap_selftest(void);
+
 /* AES block cipher */
 int  fips_aes_generic_init(void);
 void fips_aes_generic_exit(void);

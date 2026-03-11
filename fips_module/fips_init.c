@@ -370,6 +370,20 @@ static int __init fips_module_init(void)
 	}
 
 	/*
+	 * Bootstrap self-test: verify HMAC-SHA-256 correctness using the
+	 * in-boundary fips_lib_ functions, before the crypto API is touched.
+	 * This satisfies the FIPS 140-3 power-on self-test requirement for the
+	 * algorithm that would be used for any module integrity check, and
+	 * establishes that the SHA-256 implementation is trustworthy before
+	 * it is relied upon by every subsequent operation.
+	 */
+	ret = fips_sha256_bootstrap_selftest();
+	if (ret) {
+		panic("fips_module: SHA-256 bootstrap self-test FAILED: %d\n", ret);
+		return ret;
+	}
+
+	/*
 	 * Register the CRYPTO_MSG_ALG_REGISTER notifier FIRST, before any
 	 * algorithm is registered, so that every registration event is
 	 * intercepted by fips_module's notifier (priority 100) rather than
