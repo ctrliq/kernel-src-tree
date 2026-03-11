@@ -624,7 +624,7 @@ cpu_master_loop:
 			 * early kernel debug can be biten by this. Hopefully
 			 * they are sophisticated enough to take care of
 			 * themselves, especially with help from the lockdown
-			 * message printed on the console!
+			 * message printed on the console! EXTRA TEXT
 			 */
 			if (get_securelevel() > 0) {
 				if (IS_ENABLED(CONFIG_KGDB_KDB)) {
