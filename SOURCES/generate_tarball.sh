@@ -46,21 +46,21 @@ if [ "$GIT_VERSION" != "$SPEC_VERSION" ]; then
     exit 1
 fi
 
-TARBALL="$SOURCE_DIR/linux-$TARFILE_RELEASE.tar.xz"
-XZ_THREADS="--threads 4"
+TARBALL="$SOURCE_DIR/linux-$TARFILE_RELEASE.tar.zst"
+ZSTD_THREADS="--threads=4"
 ARCH=$(arch)
-XZ_OPTIONS=""
+ZSTD_OPTIONS="-19"
 
 if [ "$ARCH" != "x86_64" ]
 then
-        XZ_OPTIONS="-M 3G"
+        ZSTD_OPTIONS="-19 --long"
 fi
 
 # convert from shortened git sha to standard 40 digit git sha
 _GITID="$(git rev-parse HEAD)"
 
 if [ -f "$TARBALL" ]; then
-	TARID=$(xzcat -qq "$TARBALL" | git get-tar-commit-id 2>/dev/null)
+	TARID=$(zstdcat -qq "$TARBALL" | git get-tar-commit-id 2>/dev/null)
 	if [ "$_GITID" = "$TARID" ]; then
 		echo "$(basename "$TARBALL") unchanged..."
 		exit 0
@@ -70,6 +70,6 @@ fi
 
 echo "Creating $(basename "$TARBALL")..."
 trap 'rm -vf "$TARBALL"' INT
-git archive --prefix="linux-$TARFILE_RELEASE"/ --format=tar "$_GITID" | xz $XZ_OPTIONS $XZ_THREADS > "$TARBALL";
+git archive --prefix="linux-$TARFILE_RELEASE"/ --format=tar "$_GITID" | zstd $ZSTD_OPTIONS $ZSTD_THREADS > "$TARBALL";
 
 echo "Tarball created: $TARBALL"
