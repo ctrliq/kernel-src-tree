@@ -3,6 +3,10 @@
  * Copyright © 2023-2024 Intel Corporation
  */
 
+#include <linux/bitops.h>
+#include <linux/pci.h>
+
+#include "regs/xe_bars.h"
 #include "xe_assert.h"
 #include "xe_device.h"
 #include "xe_gt_sriov_pf_config.h"
@@ -137,6 +141,12 @@ static int pf_enable_vfs(struct xe_device *xe, int num_vfs)
 	err = xe_sriov_pf_provision_vfs(xe, num_vfs);
 	if (err < 0)
 		goto failed;
+
+	if (IS_DGFX(xe)) {
+		err = resize_vf_vram_bar(xe, num_vfs);
+		if (err)
+			xe_sriov_info(xe, "Failed to set VF LMEM BAR size: %d\n", err);
+	}
 
 	err = pci_enable_sriov(pdev, num_vfs);
 	if (err < 0)
