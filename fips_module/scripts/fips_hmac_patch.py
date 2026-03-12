@@ -12,24 +12,34 @@ installed.  The runtime check in fips_integrity.c reproduces this computation
 to verify the module has not been corrupted or tampered with.
 
 Algorithm:
-  1. Parse the ELF64 section header table to find the .fips_hmac section.
-  2. Zero the 32 bytes at the section's file offset (they hold the previous
+  1. Read the .ko file.  If it is gzip- or xz-compressed (as produced by
+     kbuild when CONFIG_MODULE_COMPRESS_GZIP or CONFIG_MODULE_COMPRESS_XZ is
+     set), decompress it first.  The runtime check in the kernel reads raw ELF
+     bytes, so the file must be an uncompressed ELF before patching.
+  2. Parse the ELF64 section header table to find the .fips_hmac section.
+  3. Zero the 32 bytes at the section's file offset (they hold the previous
      HMAC or zeros on a fresh build).
-  3. Compute HMAC-SHA-256 of the entire .ko image (with those bytes zeroed),
+  4. Compute HMAC-SHA-256 of the entire .ko image (with those bytes zeroed),
      using the fixed key below.
-  4. Patch the computed HMAC back into the .fips_hmac section.
-  5. Write the modified binary back to the same file.
+  5. Patch the computed HMAC back into the .fips_hmac section.
+  6. Write the (always uncompressed) ELF binary back to the same file.
 
 The key must match fips_integrity_key[] in fips_integrity.c exactly.
 
 NOTE: If the module is stripped before installation, stripping must happen
 before running this script.  Stripping after patching invalidates the HMAC.
+
+NOTE: This script always writes back an uncompressed ELF even when the input
+was compressed.  The Linux kernel module loader accepts uncompressed .ko files
+regardless of whether CONFIG_MODULE_COMPRESS_* is set.
 """
 
 import sys
 import struct
 import hmac
 import hashlib
+import gzip
+import lzma
 
 # Must match fips_integrity_key[] in fips_integrity.c
 FIPS_KEY = b'fips_module integrity v1'
@@ -39,6 +49,32 @@ HMAC_SIZE = 32          # SHA256_DIGEST_SIZE
 ELFMAG = b'\x7fELF'
 ELFCLASS64 = 2
 EI_CLASS = 4
+
+# Compression magic bytes
+GZIP_MAGIC = b'\x1f\x8b'
+XZ_MAGIC   = b'\xfd7zXZ\x00'
+
+
+def maybe_decompress(raw: bytes) -> tuple:
+    """
+    Detect and decompress gzip or xz compression.
+
+    Returns (data: bytes, fmt: str) where fmt is 'elf', 'gzip', or 'xz'.
+    Raises ValueError if the data looks compressed but decompression fails.
+    """
+    if raw[:len(XZ_MAGIC)] == XZ_MAGIC:
+        try:
+            return lzma.decompress(raw), 'xz'
+        except lzma.LZMAError as e:
+            raise ValueError(f"xz decompression failed: {e}")
+
+    if raw[:len(GZIP_MAGIC)] == GZIP_MAGIC:
+        try:
+            return gzip.decompress(raw), 'gzip'
+        except OSError as e:
+            raise ValueError(f"gzip decompression failed: {e}")
+
+    return raw, 'elf'
 
 
 def find_hmac_section(data: bytearray) -> tuple:
@@ -116,7 +152,14 @@ def find_hmac_section(data: bytearray) -> tuple:
 
 def compute_and_patch(ko_path: str) -> None:
     with open(ko_path, 'rb') as f:
-        data = bytearray(f.read())
+        raw = f.read()
+
+    data_bytes, fmt = maybe_decompress(raw)
+    if fmt != 'elf':
+        print(f"fips_hmac_patch: decompressed {fmt}-compressed module "
+              f"({len(raw)} -> {len(data_bytes)} bytes)")
+
+    data = bytearray(data_bytes)
 
     offset, _ = find_hmac_section(data)
 
@@ -134,6 +177,8 @@ def compute_and_patch(ko_path: str) -> None:
     # Patch the HMAC back in
     data[offset: offset + HMAC_SIZE] = computed
 
+    # Always write back uncompressed ELF — the kernel module loader accepts
+    # uncompressed .ko files regardless of CONFIG_MODULE_COMPRESS_* setting.
     with open(ko_path, 'wb') as f:
         f.write(data)
 
@@ -141,6 +186,8 @@ def compute_and_patch(ko_path: str) -> None:
     if old_hmac != b'\x00' * HMAC_SIZE:
         print(f"  previous: {old_hmac.hex()}")
     print(f"  embedded: {computed.hex()}")
+    if fmt != 'elf':
+        print(f"  note: file rewritten as uncompressed ELF (was {fmt})")
 
 
 def main():
