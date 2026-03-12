@@ -125,6 +125,15 @@ static int fips_algtest_notify(struct notifier_block *this,
 	if (!try_module_get(THIS_MODULE))
 		return NOTIFY_OK;
 
+	if (alg->cra_module != THIS_MODULE) {
+		pr_info("fips_module: blocking fips algorithm (not from this module) "
+			"%s (%s)\n",
+			alg->cra_name, alg->cra_driver_name);
+		crypto_alg_tested(alg->cra_driver_name, -ECANCELED);
+		module_put(THIS_MODULE);
+		return NOTIFY_STOP;
+	}
+
 	param = kzalloc(sizeof(*param), GFP_KERNEL);
 	if (!param)
 		goto err_put_module;
