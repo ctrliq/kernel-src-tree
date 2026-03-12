@@ -87,24 +87,68 @@ static int fips_find_hmac_section(const void *buf, size_t size,
 	u64 shstr_end;
 	unsigned int i;
 
-	if (size < sizeof(*ehdr))
+	if (size < sizeof(*ehdr)) {
+		pr_err("fips_module: ELF too small: %zu bytes\n", size);
 		return -EINVAL;
-	if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0)
+	}
+	if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0) {
+		/*
+		 * Detect common compression formats so the user gets an
+		 * actionable message instead of a cryptic "bad magic" error.
+		 * kbuild compresses .ko files in-place when
+		 * CONFIG_MODULE_COMPRESS_GZIP or CONFIG_MODULE_COMPRESS_XZ is
+		 * set; scripts/fips_hmac_patch.py must be run to decompress
+		 * the file and embed the HMAC before loading.
+		 */
+		if (size >= 6 &&
+		    ((u8 *)buf)[0] == 0xfd && ((u8 *)buf)[1] == '7' &&
+		    ((u8 *)buf)[2] == 'z'  && ((u8 *)buf)[3] == 'X' &&
+		    ((u8 *)buf)[4] == 'Z'  && ((u8 *)buf)[5] == 0x00)
+			pr_err("fips_module: '%s' is xz-compressed; run "
+			       "scripts/fips_hmac_patch.py to decompress "
+			       "and patch before loading\n",
+			       fips_module_path);
+		else if (size >= 2 &&
+			 ((u8 *)buf)[0] == 0x1f && ((u8 *)buf)[1] == 0x8b)
+			pr_err("fips_module: '%s' is gzip-compressed; run "
+			       "scripts/fips_hmac_patch.py to decompress "
+			       "and patch before loading\n",
+			       fips_module_path);
+		else
+			pr_err("fips_module: '%s' is not an ELF file "
+			       "(bad magic %02x %02x %02x %02x)\n",
+			       fips_module_path,
+			       ((u8 *)buf)[0], ((u8 *)buf)[1],
+			       size > 2 ? ((u8 *)buf)[2] : 0,
+			       size > 3 ? ((u8 *)buf)[3] : 0);
 		return -EINVAL;
-	if (ehdr->e_ident[EI_CLASS] != ELFCLASS64)
+	}
+	if (ehdr->e_ident[EI_CLASS] != ELFCLASS64) {
+		pr_err("fips_module: not ELF64 (class=%u)\n",
+		       ehdr->e_ident[EI_CLASS]);
 		return -EINVAL;
-	if (ehdr->e_shoff == 0 || ehdr->e_shnum == 0)
+	}
+	if (ehdr->e_shoff == 0 || ehdr->e_shnum == 0) {
+		pr_err("fips_module: no section headers (shoff=%llu shnum=%u)\n",
+		       (unsigned long long)ehdr->e_shoff, ehdr->e_shnum);
 		return -EINVAL;
+	}
 	/* e_shstrndx == SHN_UNDEF (0) means no string table */
-	if (ehdr->e_shstrndx == SHN_UNDEF || ehdr->e_shstrndx >= ehdr->e_shnum)
+	if (ehdr->e_shstrndx == SHN_UNDEF || ehdr->e_shstrndx >= ehdr->e_shnum) {
+		pr_err("fips_module: bad e_shstrndx=%u (e_shnum=%u)\n",
+		       ehdr->e_shstrndx, ehdr->e_shnum);
 		return -EINVAL;
+	}
 	/*
 	 * e_shentsize must match the struct we use for indexing.  If an
 	 * adversarially crafted ELF claimed a different entry size, shdrs[i]
 	 * pointer arithmetic would land at wrong offsets.
 	 */
-	if (ehdr->e_shentsize != sizeof(Elf64_Shdr))
+	if (ehdr->e_shentsize != sizeof(Elf64_Shdr)) {
+		pr_err("fips_module: e_shentsize=%u != sizeof(Elf64_Shdr)=%zu\n",
+		       ehdr->e_shentsize, sizeof(Elf64_Shdr));
 		return -EINVAL;
+	}
 
 	/*
 	 * Bounds-check the section header table.
@@ -117,8 +161,13 @@ static int fips_find_hmac_section(const void *buf, size_t size,
 	if (check_add_overflow(ehdr->e_shoff,
 			       (u64)ehdr->e_shnum * sizeof(Elf64_Shdr),
 			       &shdr_table_end) ||
-	    shdr_table_end > size)
+	    shdr_table_end > size) {
+		pr_err("fips_module: section header table out of bounds "
+		       "(shoff=%llu shnum=%u shentsize=%u filesize=%zu)\n",
+		       (unsigned long long)ehdr->e_shoff,
+		       ehdr->e_shnum, ehdr->e_shentsize, size);
 		return -EINVAL;
+	}
 
 	shdrs      = buf + ehdr->e_shoff;
 	shstr_shdr = &shdrs[ehdr->e_shstrndx];
@@ -130,8 +179,13 @@ static int fips_find_hmac_section(const void *buf, size_t size,
 	if (shstr_shdr->sh_size == 0 ||
 	    check_add_overflow(shstr_shdr->sh_offset, shstr_shdr->sh_size,
 			       &shstr_end) ||
-	    shstr_end > size)
+	    shstr_end > size) {
+		pr_err("fips_module: shstrtab out of bounds "
+		       "(shstr_off=%llu shstr_size=%llu filesize=%zu)\n",
+		       (unsigned long long)shstr_shdr->sh_offset,
+		       (unsigned long long)shstr_shdr->sh_size, size);
 		return -EINVAL;
+	}
 
 	shstrtab = buf + shstr_shdr->sh_offset;
 
