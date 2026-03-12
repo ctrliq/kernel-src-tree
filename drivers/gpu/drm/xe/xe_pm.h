@@ -44,8 +44,6 @@ DEFINE_GUARD(xe_pm_runtime, struct xe_device *,
 	     xe_pm_runtime_get(_T), xe_pm_runtime_put(_T))
 DEFINE_GUARD(xe_pm_runtime_noresume, struct xe_device *,
 	     xe_pm_runtime_get_noresume(_T), xe_pm_runtime_put(_T))
-DEFINE_GUARD_COND(xe_pm_runtime, _ioctl, xe_pm_runtime_get_ioctl(_T), _RET >= 0)
-
 /*
  * Used when a function needs to release runtime PM in all possible cases
  * and error paths, but the wakeref was already acquired by a different
