@@ -206,6 +206,13 @@ void fips_sweep_preregistered_algs(void)
 				alg->cra_name, alg->cra_driver_name);
 			alg->cra_flags |= CRYPTO_ALG_FIPS_INTERNAL;
 		}
+		if (alg->cra_module != THIS_MODULE) {
+			pr_info("fips_module: blocking pre-registered "
+				"fips algorithm (not from this module) "
+				"%s (%s)\n",
+				alg->cra_name, alg->cra_driver_name);
+			alg->cra_flags |= CRYPTO_ALG_FIPS_INTERNAL;
+		}
 	}
 	up_write(&crypto_alg_sem);
 }

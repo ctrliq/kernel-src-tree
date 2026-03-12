@@ -414,14 +414,6 @@ static int __init fips_module_init(void)
 	if (fips_algtest_init())
 		panic("fips_module: algtest notifier init failed\n");
 
-	/*
-	 * Retroactively block non-approved algorithms that were already
-	 * registered before fips_module loaded (vmlinux built-ins such as
-	 * des3_ede, md5, rc4).  The notifier above covers future registrations;
-	 * this sweep closes the gap for pre-existing ones.
-	 */
-	fips_sweep_preregistered_algs();
-
 	if (fips_aes_generic_init())
 		panic("fips_module: aes_generic init failed\n");
 	if (fips_ghash_init())
@@ -512,6 +504,14 @@ static int __init fips_module_init(void)
 	 */
 	if (fips_extrng_init())
 		panic("fips_module: extrng init failed\n");
+
+	/*
+	 * Retroactively block non-approved algorithms that were already
+	 * registered before fips_module loaded (vmlinux built-ins such as
+	 * des3_ede, md5, rc4).  The notifier above covers future registrations;
+	 * this sweep closes the gap for pre-existing ones.
+	 */
+	fips_sweep_preregistered_algs();
 
 	pr_info("fips_module: all FIPS algorithms registered and "
 		"self-tests passed\n");
