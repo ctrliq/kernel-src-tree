@@ -25,7 +25,8 @@
  */
 
 #include <linux/elf.h>
-#include <linux/kernel_read_file.h>
+#include <linux/file.h>
+#include <linux/fs.h>
 #include <linux/module.h>
 #include <linux/overflow.h>
 #include <linux/printk.h>
@@ -225,6 +226,69 @@ static int fips_find_hmac_section(const void *buf, size_t size,
 }
 
 /*
+ * fips_read_ko - read the entire .ko file into a vmalloc buffer.
+ *
+ * Uses filp_open() + kernel_read() directly rather than
+ * kernel_read_file_from_path(), which has additional LSM hooks and has
+ * been observed to return a zero-filled buffer on some configurations
+ * (e.g. RHEL9 NFS mounts) even when the file is readable.
+ *
+ * On success, *buf_out points to a vmalloc'd buffer of *size_out bytes
+ * containing the file contents; the caller must vfree() it.
+ *
+ * Returns 0 on success, negative errno on any failure.
+ */
+static int fips_read_ko(const char *path, void **buf_out, size_t *size_out)
+{
+	struct file *filp;
+	loff_t i_size;
+	void *buf;
+	loff_t pos = 0;
+	ssize_t nread;
+
+	filp = filp_open(path, O_RDONLY, 0);
+	if (IS_ERR(filp)) {
+		pr_err("fips_module: failed to open '%s': %ld\n",
+		       path, PTR_ERR(filp));
+		return (int)PTR_ERR(filp);
+	}
+
+	i_size = i_size_read(file_inode(filp));
+	if (i_size <= 0 || i_size > (256L * 1024 * 1024)) {
+		pr_err("fips_module: unexpected file size %lld for '%s'\n",
+		       (long long)i_size, path);
+		fput(filp);
+		return -EINVAL;
+	}
+
+	buf = vmalloc((size_t)i_size);
+	if (!buf) {
+		fput(filp);
+		return -ENOMEM;
+	}
+
+	nread = kernel_read(filp, buf, (size_t)i_size, &pos);
+	fput(filp);
+
+	if (nread < 0) {
+		pr_err("fips_module: failed to read '%s': %zd\n",
+		       path, nread);
+		vfree(buf);
+		return (int)nread;
+	}
+	if ((size_t)nread != (size_t)i_size) {
+		pr_err("fips_module: short read of '%s': got %zd, expected %lld\n",
+		       path, nread, (long long)i_size);
+		vfree(buf);
+		return -EIO;
+	}
+
+	*buf_out  = buf;
+	*size_out = (size_t)i_size;
+	return 0;
+}
+
+/*
  * fips_self_integrity_check - verify the module's HMAC-SHA-256 integrity.
  *
  * Reads the .ko file named by the "path=" module parameter, locates the
@@ -245,7 +309,6 @@ int fips_self_integrity_check(void)
 	loff_t hmac_offset;
 	u8 stored_hmac[SHA256_DIGEST_SIZE];
 	u8 computed_hmac[SHA256_DIGEST_SIZE];
-	ssize_t nread;
 	int ret;
 
 	if (!fips_module_path[0]) {
@@ -254,18 +317,9 @@ int fips_self_integrity_check(void)
 		return -EINVAL;
 	}
 
-	/*
-	 * Read the entire .ko image into a vmalloc buffer.
-	 * Passing buf=NULL causes the function to allocate the buffer;
-	 * buf_size is ignored in that case.  Free with vfree() on success.
-	 */
-	nread = kernel_read_file_from_path(fips_module_path, 0, &buf, 0,
-					   &file_size, READING_UNKNOWN);
-	if (nread < 0) {
-		pr_err("fips_module: failed to read '%s': %ld\n",
-		       fips_module_path, nread);
-		return (int)nread;
-	}
+	ret = fips_read_ko(fips_module_path, &buf, &file_size);
+	if (ret)
+		return ret;
 
 	/* Locate the .fips_hmac section within the file image */
 	ret = fips_find_hmac_section(buf, file_size, &hmac_offset);
