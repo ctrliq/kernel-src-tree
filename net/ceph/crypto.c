@@ -7,6 +7,7 @@
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <crypto/aes.h>
+#include <crypto/hash.h>
 #include <crypto/krb5.h>
 #include <crypto/skcipher.h>
 #include <linux/key-type.h>
@@ -75,6 +76,28 @@ out_flag:
 	return ret;
 }
 
+static int set_hmac_and_krb5_tfms(struct ceph_crypto_key *key,
+				  const u32 *key_usages, int key_usage_cnt)
+{
+	unsigned int noio_flag;
+	int ret;
+
+	noio_flag = memalloc_noio_save();
+	key->hmac_tfm = crypto_alloc_shash("hmac(sha256)", 0, 0);
+	memalloc_noio_restore(noio_flag);
+	if (IS_ERR(key->hmac_tfm)) {
+		ret = PTR_ERR(key->hmac_tfm);
+		key->hmac_tfm = NULL;
+		return ret;
+	}
+
+	ret = crypto_shash_setkey(key->hmac_tfm, key->key, key->len);
+	if (ret)
+		return ret;
+
+	return set_krb5_tfms(key, key_usages, key_usage_cnt);
+}
+
 int ceph_crypto_key_prepare(struct ceph_crypto_key *key,
 			    const u32 *key_usages, int key_usage_cnt)
 {
@@ -84,7 +107,7 @@ int ceph_crypto_key_prepare(struct ceph_crypto_key *key,
 	case CEPH_CRYPTO_AES:
 		return set_aes_tfm(key);
 	case CEPH_CRYPTO_AES256KRB5:
-		return set_krb5_tfms(key, key_usages, key_usage_cnt);
+		return set_hmac_and_krb5_tfms(key, key_usages, key_usage_cnt);
 	default:
 		return -ENOTSUPP;
 	}
@@ -178,6 +201,10 @@ void ceph_crypto_key_destroy(struct ceph_crypto_key *key)
 			key->aes_tfm = NULL;
 		}
 	} else if (key->type == CEPH_CRYPTO_AES256KRB5) {
+		if (key->hmac_tfm) {
+			crypto_free_shash(key->hmac_tfm);
+			key->hmac_tfm = NULL;
+		}
 		for (i = 0; i < ARRAY_SIZE(key->krb5_tfms); i++) {
 			if (key->krb5_tfms[i]) {
 				crypto_free_aead(key->krb5_tfms[i]);
@@ -431,6 +458,22 @@ int ceph_crypt_buflen(const struct ceph_crypto_key *key, int data_len)
 	case CEPH_CRYPTO_AES256KRB5:
 		/* confounder at the beginning and 192-bit HMAC at the end */
 		return AES_BLOCK_SIZE + data_len + 24;
+	default:
+		BUG();
+	}
+}
+
+int ceph_hmac_sha256(const struct ceph_crypto_key *key, const void *buf,
+		     int buf_len, u8 hmac[SHA256_DIGEST_SIZE])
+{
+	switch (key->type) {
+	case CEPH_CRYPTO_NONE:
+	case CEPH_CRYPTO_AES:
+		memset(hmac, 0, SHA256_DIGEST_SIZE);
+		return 0;
+	case CEPH_CRYPTO_AES256KRB5:
+		return crypto_shash_tfm_digest(key->hmac_tfm, buf, buf_len,
+					       hmac);
 	default:
 		BUG();
 	}
