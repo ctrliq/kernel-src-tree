@@ -817,8 +817,8 @@ BuildRequires: redhat-sb-certs >= 9.4-0.1
 # tarball is generated from a src-git tree. If you want to see the
 # exact git commit you can run
 #
-# xzcat -qq ${TARBALL} | git get-tar-commit-id
-Source0: linux-%{tarfile_release}.tar.xz
+# zstdcat -qq ${TARBALL} | git get-tar-commit-id
+Source0: linux-%{tarfile_release}.tar.zst
 
 Source1: Makefile.rhelver
 Source2: kernel.changelog
