@@ -55,7 +55,7 @@ struct crypto_alg *crypto_alg_mod_lookup(const char *name, u32 type, u32 mask);
 
 #include "jitterentropy.h"
 
-#define JENT_CONDITIONING_HASH	"sha3-256-generic"
+#define JENT_CONDITIONING_HASH	"fips-sha3-256-generic"
 
 /***************************************************************************
  * Helper function
