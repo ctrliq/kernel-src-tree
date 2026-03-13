@@ -48,6 +48,8 @@ fi
 
 set -e
 
+ZSTD_CMD=$(which zstd 2>/dev/null) || { echo "Error: zstd not found. Install it with: dnf install zstd"; exit 1; }
+
 TARBALL="$SOURCE_DIR/linux-$TARFILE_RELEASE.tar.zst"
 ZSTD_THREADS="--threads=4"
 ARCH=$(arch)
@@ -62,7 +64,7 @@ fi
 _GITID="$(git rev-parse HEAD)"
 
 if [ -f "$TARBALL" ]; then
-	TARID=$(zstdcat -qq "$TARBALL" | git get-tar-commit-id 2>/dev/null)
+	TARID=$("$ZSTD_CMD" -d -c -qq "$TARBALL" | git get-tar-commit-id 2>/dev/null)
 	if [ "$_GITID" = "$TARID" ]; then
 		echo "$(basename "$TARBALL") unchanged..."
 		exit 0
@@ -72,6 +74,6 @@ fi
 
 echo "Creating $(basename "$TARBALL")..."
 trap '[ $? -ne 0 ] && rm -vf "$TARBALL"' EXIT
-git archive --prefix="linux-$TARFILE_RELEASE"/ --format=tar "$_GITID" | zstd $ZSTD_OPTIONS $ZSTD_THREADS > "$TARBALL";
+git archive --prefix="linux-$TARFILE_RELEASE"/ --format=tar "$_GITID" | "$ZSTD_CMD" $ZSTD_OPTIONS $ZSTD_THREADS > "$TARBALL";
 
 echo "Tarball created: $TARBALL"
