@@ -122,8 +122,13 @@ static int fips_algtest_notify(struct notifier_block *this,
 	 * so algboss never schedules its own test thread — the vmlinux
 	 * alg_test() is therefore never called for this algorithm.
 	 */
-	if (!try_module_get(THIS_MODULE))
-		return NOTIFY_OK;
+	if (!try_module_get(THIS_MODULE)) {
+		panic("fips_module: failed to get module reference for approved algorithm "
+		      "%s (%s)\n",
+		      alg->cra_name, alg->cra_driver_name);
+		/* NOTREACHED */
+		return NOTIFY_STOP;
+	}
 
 	if (alg->cra_module != THIS_MODULE) {
 		pr_info("fips_module: blocking fips algorithm (not from this module) "
@@ -153,11 +158,13 @@ err_free_param:
 err_put_module:
 	module_put(THIS_MODULE);
 	/*
-	 * kthread_run or kzalloc failed — fall back to NOTIFY_OK so algboss
-	 * can still schedule a test, rather than leaving the larval permanently
-	 * unresolved.
+	 * kthread_run or kzalloc failed — panic.
 	 */
-	return NOTIFY_OK;
+	panic("fips_module: failed to spawn test thread for approved algorithm "
+	      "%s (%s): %ld\n",
+	      alg->cra_name, alg->cra_driver_name, PTR_ERR(thread));
+	/* NOTREACHED */
+	return NOTIFY_STOP;
 }
 
 static struct notifier_block fips_algtest_notifier = {
