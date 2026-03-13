@@ -954,7 +954,6 @@ Source701: %{name}-riscv64-debug-fedora.config
 Source62: def_variants.yaml.fedora
 %endif
 
-Source80: generate_all_configs.sh
 Source81: process_configs.sh
 
 Source86: dracut-virt.conf
@@ -1903,7 +1902,6 @@ cd configs
 # Drop some necessary files from the source dir into the buildroot
 # Copy kernel config files from ciq/configs in the source tarball
 cp ../ciq/configs/kernel-*.config .
-cp %{SOURCE80} .
 # merge.py
 cp %{SOURCE3000} .
 # kernel-local - rename and copy for partial snippet config process
