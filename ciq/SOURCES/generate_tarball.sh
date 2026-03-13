@@ -4,7 +4,7 @@
 # It reads the tarfile name from the spec file and creates the tarball
 
 # Determine dist-git directory paths
-# Assuming this script is in dist-git/SOURCES/
+# Assuming this script is in ciq/SOURCES/
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DISTGIT_ROOT="$(dirname "$SCRIPT_DIR")"
 SOURCE_DIR="$DISTGIT_ROOT/SOURCES"
