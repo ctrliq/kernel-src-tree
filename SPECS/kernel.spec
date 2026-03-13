@@ -820,8 +820,6 @@ BuildRequires: redhat-sb-certs >= 9.4-0.1
 # zstdcat -qq ${TARBALL} | git get-tar-commit-id
 Source0: linux-%{tarfile_release}.tar.zst
 
-Source2: kernel.changelog
-
 Source10: redhatsecurebootca5.cer
 Source13: redhatsecureboot501.cer
 
@@ -3231,8 +3229,6 @@ docdir=$RPM_BUILD_ROOT%{_datadir}/doc/kernel-doc-%{specversion}-%{pkgrelease}
 # copy the source over
 mkdir -p $docdir
 tar -h -f - --exclude=man --exclude='.*' -c Documentation | tar xf - -C $docdir
-cat %{SOURCE2} | xz > $docdir/kernel.changelog.xz
-chmod 0644 $docdir/kernel.changelog.xz
 
 # with_doc
 %endif
@@ -3779,7 +3775,6 @@ fi\
 %{_datadir}/doc/kernel-doc-%{specversion}-%{pkgrelease}/Documentation/*
 %dir %{_datadir}/doc/kernel-doc-%{specversion}-%{pkgrelease}/Documentation
 %dir %{_datadir}/doc/kernel-doc-%{specversion}-%{pkgrelease}
-%{_datadir}/doc/kernel-doc-%{specversion}-%{pkgrelease}/kernel.changelog.xz
 %endif
 
 %if %{with_perf}
