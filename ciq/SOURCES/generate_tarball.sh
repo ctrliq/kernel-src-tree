@@ -46,6 +46,8 @@ if [ "$GIT_VERSION" != "$SPEC_VERSION" ]; then
     exit 1
 fi
 
+set -e
+
 TARBALL="$SOURCE_DIR/linux-$TARFILE_RELEASE.tar.zst"
 ZSTD_THREADS="--threads=4"
 ARCH=$(arch)
@@ -69,7 +71,7 @@ if [ -f "$TARBALL" ]; then
 fi
 
 echo "Creating $(basename "$TARBALL")..."
-trap 'rm -vf "$TARBALL"' INT
+trap '[ $? -ne 0 ] && rm -vf "$TARBALL"' EXIT
 git archive --prefix="linux-$TARFILE_RELEASE"/ --format=tar "$_GITID" | zstd $ZSTD_OPTIONS $ZSTD_THREADS > "$TARBALL";
 
 echo "Tarball created: $TARBALL"
