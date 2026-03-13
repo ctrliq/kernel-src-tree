@@ -820,7 +820,6 @@ BuildRequires: redhat-sb-certs >= 9.4-0.1
 # zstdcat -qq ${TARBALL} | git get-tar-commit-id
 Source0: linux-%{tarfile_release}.tar.zst
 
-Source1: Makefile.rhelver
 Source2: kernel.changelog
 
 Source10: redhatsecurebootca5.cer
@@ -1854,7 +1853,6 @@ ApplyOptionalPatch()
 mv linux-%{tarfile_release} linux-%{KVERREL}
 
 cd linux-%{KVERREL}
-cp -a %{SOURCE1} .
 
 %{log_msg "Start of patch applications"}
 %if !%{nopatches}
