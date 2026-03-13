@@ -200,17 +200,17 @@ void gfs2_trans_add_data(struct gfs2_glock *gl, struct buffer_head *bh)
 		set_bit(TR_TOUCHED, &tr->tr_flags);
 		goto out;
 	}
-	gfs2_log_lock(sdp);
+	spin_lock(&sdp->sd_log_lock);
 	bd = bh->b_private;
 	if (bd == NULL) {
-		gfs2_log_unlock(sdp);
+		spin_unlock(&sdp->sd_log_lock);
 		unlock_buffer(bh);
 		if (bh->b_private == NULL)
 			bd = gfs2_alloc_bufdata(gl, bh);
 		else
 			bd = bh->b_private;
 		lock_buffer(bh);
-		gfs2_log_lock(sdp);
+		spin_lock(&sdp->sd_log_lock);
 	}
 	gfs2_assert(sdp, bd->bd_gl == gl);
 	set_bit(TR_TOUCHED, &tr->tr_flags);
@@ -221,7 +221,7 @@ void gfs2_trans_add_data(struct gfs2_glock *gl, struct buffer_head *bh)
 		tr->tr_num_databuf_new++;
 		list_add_tail(&bd->bd_list, &tr->tr_databuf);
 	}
-	gfs2_log_unlock(sdp);
+	spin_unlock(&sdp->sd_log_lock);
 out:
 	unlock_buffer(bh);
 }
@@ -241,10 +241,10 @@ void gfs2_trans_add_meta(struct gfs2_glock *gl, struct buffer_head *bh)
 		set_bit(TR_TOUCHED, &tr->tr_flags);
 		goto out;
 	}
-	gfs2_log_lock(sdp);
+	spin_lock(&sdp->sd_log_lock);
 	bd = bh->b_private;
 	if (bd == NULL) {
-		gfs2_log_unlock(sdp);
+		spin_unlock(&sdp->sd_log_lock);
 		unlock_buffer(bh);
 		lock_page(bh->b_page);
 		if (bh->b_private == NULL)
@@ -253,7 +253,7 @@ void gfs2_trans_add_meta(struct gfs2_glock *gl, struct buffer_head *bh)
 			bd = bh->b_private;
 		unlock_page(bh->b_page);
 		lock_buffer(bh);
-		gfs2_log_lock(sdp);
+		spin_lock(&sdp->sd_log_lock);
 	}
 	gfs2_assert(sdp, bd->bd_gl == gl);
 	set_bit(TR_TOUCHED, &tr->tr_flags);
@@ -284,7 +284,7 @@ void gfs2_trans_add_meta(struct gfs2_glock *gl, struct buffer_head *bh)
 	list_add(&bd->bd_list, &tr->tr_buf);
 	tr->tr_num_buf_new++;
 out_unlock:
-	gfs2_log_unlock(sdp);
+	spin_unlock(&sdp->sd_log_lock);
 	if (withdraw)
 		gfs2_assert_withdraw(sdp, 0);
 out:
@@ -306,7 +306,7 @@ void gfs2_trans_remove_revoke(struct gfs2_sbd *sdp, u64 blkno, unsigned int len)
 	struct gfs2_bufdata *bd, *tmp;
 	unsigned int n = len;
 
-	gfs2_log_lock(sdp);
+	spin_lock(&sdp->sd_log_lock);
 	list_for_each_entry_safe(bd, tmp, &sdp->sd_log_revokes, bd_list) {
 		if ((bd->bd_blkno >= blkno) && (bd->bd_blkno < (blkno + len))) {
 			list_del_init(&bd->bd_list);
@@ -320,7 +320,7 @@ void gfs2_trans_remove_revoke(struct gfs2_sbd *sdp, u64 blkno, unsigned int len)
 				break;
 		}
 	}
-	gfs2_log_unlock(sdp);
+	spin_unlock(&sdp->sd_log_lock);
 }
 
 void gfs2_trans_free(struct gfs2_sbd *sdp, struct gfs2_trans *tr)
