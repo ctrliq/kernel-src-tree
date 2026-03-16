@@ -100,7 +100,8 @@ FEATURE_TESTS_BASIC :=                  \
         libzstd				\
         disassembler-four-args		\
         disassembler-init-styled	\
-        file-handle
+        file-handle			\
+        libopenssl
 
 # FEATURE_TESTS_BASIC + FEATURE_TESTS_EXTRA is the complete list
 # of all feature tests
@@ -148,7 +149,8 @@ FEATURE_DISPLAY ?=              \
          lzma                   \
          bpf			\
          libaio			\
-         libzstd
+         libzstd		\
+         libopenssl
 
 #
 # Declare group members of a feature to display the logical OR of the detection

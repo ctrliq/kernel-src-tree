@@ -146,6 +146,10 @@
 # include "test-libtraceevent.c"
 #undef main
 
+#define main main_test_libopenssl
+# include "test-libopenssl.c"
+#undef main
+
 int main(int argc, char *argv[])
 {
 	main_test_libpython();
@@ -178,6 +182,7 @@ int main(int argc, char *argv[])
 	main_test_reallocarray();
 	main_test_libzstd();
 	main_test_libtraceevent();
+	main_test_libopenssl();
 
 	return 0;
 }
