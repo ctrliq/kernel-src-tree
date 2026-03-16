@@ -518,6 +518,7 @@ static void timerlat_top_usage(char *usage)
 		"	     --deepest-idle-state n: only go down to idle state n on cpus used by timerlat to reduce exit from idle latency",
 		"	     --on-threshold <action>: define action to be executed at latency threshold, multiple are allowed",
 		"	     --on-end: define action to be executed at measurement end, multiple are allowed",
+		"	     --bpf-action <program>: load and execute BPF program when latency threshold is exceeded",
 		NULL,
 	};
 
@@ -600,6 +601,7 @@ static struct timerlat_params
 			{"deepest-idle-state",	required_argument,	0, '8'},
 			{"on-threshold",	required_argument,	0, '9'},
 			{"on-end",		required_argument,	0, '\1'},
+			{"bpf-action",		required_argument,	0, '\2'},
 			{0, 0, 0, 0}
 		};
 
@@ -792,6 +794,9 @@ static struct timerlat_params
 				err_msg("Invalid action %s\n", optarg);
 				exit(EXIT_FAILURE);
 			}
+			break;
+		case '\2':
+			params->bpf_action_program = optarg;
 			break;
 		default:
 			timerlat_top_usage("Invalid option");
