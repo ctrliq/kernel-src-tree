@@ -2547,20 +2547,20 @@ int v4l2_subdev_s_stream_helper(struct v4l2_subdev *sd, int enable)
 }
 EXPORT_SYMBOL_GPL(v4l2_subdev_s_stream_helper);
 
-int v4l2_subdev_get_frame_desc_passthrough(struct v4l2_subdev *sd,
-					   unsigned int pad,
-					   struct v4l2_mbus_frame_desc *fd)
+int __v4l2_subdev_get_frame_desc_passthrough(struct v4l2_subdev *sd,
+					     struct v4l2_subdev_state *state,
+					     unsigned int pad,
+					     struct v4l2_mbus_frame_desc *fd)
 {
 	struct media_pad *local_sink_pad;
 	struct v4l2_subdev_route *route;
-	struct v4l2_subdev_state *state;
 	struct device *dev = sd->dev;
 	int ret = 0;
 
+	lockdep_assert_held(state->lock);
+
 	if (WARN_ON(!(sd->entity.pads[pad].flags & MEDIA_PAD_FL_SOURCE)))
 		return -EINVAL;
-
-	state = v4l2_subdev_lock_and_get_active_state(sd);
 
 	/* Iterate over sink pads */
 	media_entity_for_each_pad(&sd->entity, local_sink_pad) {
@@ -2588,15 +2588,12 @@ int v4l2_subdev_get_frame_desc_passthrough(struct v4l2_subdev *sd,
 				if (IS_ERR(remote_source_pad)) {
 					dev_dbg(dev, "Failed to find remote pad for sink pad %u\n",
 						local_sink_pad->index);
-					ret = PTR_ERR(remote_source_pad);
-					goto out_unlock;
+					return PTR_ERR(remote_source_pad);
 				}
 
 				remote_sd = media_entity_to_v4l2_subdev(remote_source_pad->entity);
-				if (!remote_sd) {
-					ret = -EINVAL;
-					goto out_unlock;
-				}
+				if (!remote_sd)
+					return -EINVAL;
 
 				ret = v4l2_subdev_call(remote_sd, pad,
 						       get_frame_desc,
@@ -2606,7 +2603,7 @@ int v4l2_subdev_get_frame_desc_passthrough(struct v4l2_subdev *sd,
 					dev_err(dev,
 						"Failed to get frame desc from remote subdev %s\n",
 						remote_sd->name);
-					goto out_unlock;
+					return ret;
 				}
 
 				have_source_fd = true;
@@ -2617,8 +2614,7 @@ int v4l2_subdev_get_frame_desc_passthrough(struct v4l2_subdev *sd,
 					dev_err(dev,
 						"Frame desc type mismatch: %u != %u\n",
 						fd->type, source_fd.type);
-					ret = -EPIPE;
-					goto out_unlock;
+					return -EPIPE;
 				}
 			}
 
@@ -2633,14 +2629,12 @@ int v4l2_subdev_get_frame_desc_passthrough(struct v4l2_subdev *sd,
 				dev_dbg(dev,
 					"Failed to find stream %u from source frame desc\n",
 					route->sink_stream);
-				ret = -EPIPE;
-				goto out_unlock;
+				return -EPIPE;
 			}
 
 			if (fd->num_entries >= V4L2_FRAME_DESC_ENTRY_MAX) {
 				dev_dbg(dev, "Frame desc entry limit reached\n");
-				ret = -ENOSPC;
-				goto out_unlock;
+				return -ENOSPC;
 			}
 
 			fd->entry[fd->num_entries] = *source_entry;
@@ -2651,7 +2645,21 @@ int v4l2_subdev_get_frame_desc_passthrough(struct v4l2_subdev *sd,
 		}
 	}
 
-out_unlock:
+	return 0;
+}
+EXPORT_SYMBOL_GPL(__v4l2_subdev_get_frame_desc_passthrough);
+
+int v4l2_subdev_get_frame_desc_passthrough(struct v4l2_subdev *sd,
+					   unsigned int pad,
+					   struct v4l2_mbus_frame_desc *fd)
+{
+	struct v4l2_subdev_state *state;
+	int ret;
+
+	state = v4l2_subdev_lock_and_get_active_state(sd);
+
+	ret = __v4l2_subdev_get_frame_desc_passthrough(sd, state, pad, fd);
+
 	v4l2_subdev_unlock_state(state);
 
 	return ret;
