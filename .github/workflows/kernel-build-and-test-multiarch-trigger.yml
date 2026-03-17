@@ -1,0 +1,210 @@
+name: Trigger Automated kernel build and test (multi-arch)
+
+on:
+  workflow_call:
+    inputs:
+      architectures:
+        description: 'Comma-separated architectures to build (x86_64, aarch64)'
+        required: false
+        type: string
+        default: 'x86_64,aarch64'
+      skip_kabi:
+        description: 'Skip kABI compatibility check'
+        required: false
+        type: boolean
+        default: false
+      skip_kselftests:
+        description: 'Skip the kselftests stage (e.g. for CBR where kselftest coverage is minimal)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+  packages: read
+  pull-requests: read
+
+jobs:
+  trigger-kernelCI:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Validate and sanitize inputs
+        id: validate_inputs
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_REF: ${{ github.ref_name }}
+          PUSH_SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARCHITECTURES: ${{ inputs.architectures }}
+          SKIP_KABI: ${{ inputs.skip_kabi }}
+          SKIP_KSELFTESTS: ${{ inputs.skip_kselftests }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          IS_PR=false
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            IS_PR=true
+          fi
+
+          # Check for [skip ci] / [ci skip] in commit message or PR title
+          if echo "$COMMIT_MSG" | grep -qiE '\[(skip ci|ci skip)\]' || \
+             echo "$PR_TITLE"   | grep -qiE '\[(skip ci|ci skip)\]'; then
+            echo "⏭️ [skip ci] detected — skipping CI"
+            echo "SKIP_CI=true" >> "$GITHUB_ENV"
+            # Do not exit here — fall through so the artifact is still uploaded
+            # with the skip sentinel, allowing the actual workflow to exit cleanly
+          else
+            echo "SKIP_CI=false" >> "$GITHUB_ENV"
+          fi
+
+          # On push events there is no PR context; BASE_REF is empty string
+          # It will be deduced automatically in a later worklow
+          if [[ "$IS_PR" == "false" ]]; then
+            BASE_REF=""
+            HEAD_REF="$PUSH_REF"
+            PR_NUMBER="0"
+
+            # Validate and export SHA early for push events
+            if ! [[ "$PUSH_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "❌ Invalid SHA format: $PUSH_SHA"
+              exit 1
+            fi
+            echo "HEAD_SHA=$PUSH_SHA" >> "$GITHUB_ENV"
+
+            # Check if this push is updating an existing open PR
+            EXISTING_PR=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$HEAD_REF" --state open --json number,baseRefName --jq '.[0]' 2>/dev/null || echo "")
+            if [ -n "$EXISTING_PR" ] && [ "$EXISTING_PR" != "null" ]; then
+              PR_NUMBER=$(echo "$EXISTING_PR" | jq -r '.number')
+              BASE_REF=$(echo "$EXISTING_PR" | jq -r '.baseRefName')
+              IS_PR=true
+              echo "Found existing open PR #$PR_NUMBER for branch $HEAD_REF, base: $BASE_REF"
+            fi
+          fi
+
+          # Validate base branch name (alphanumeric, dots, slashes, dashes, underscores, curly braces)
+          # Only if pull request is present
+          if [[ "$IS_PR" == "true" ]]; then
+            if ! [[ "$BASE_REF" =~ ^[a-zA-Z0-9/_.{}-]+$ ]]; then
+              echo "❌ Invalid base branch name: $BASE_REF"
+              exit 1
+            fi
+
+            # Validate base branch name length
+            if [ ${#BASE_REF} -gt 255 ]; then
+              echo "❌ Base branch name too long"
+              exit 1
+            fi
+          fi
+
+          # Validate head branch name
+          if ! [[ "$HEAD_REF" =~ ^[a-zA-Z0-9/_.{}-]+$ ]]; then
+            echo "❌ Invalid head branch name: $HEAD_REF"
+            exit 1
+          fi
+
+          # Validate head branch name length
+          if [ ${#HEAD_REF} -gt 255 ]; then
+            echo "❌ Head branch name too long"
+            exit 1
+          fi
+
+          # Validate PR number is numeric
+          if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "❌ Invalid PR number: $PR_NUMBER"
+            exit 1
+          fi
+
+          # Validate architectures - only allow the four valid combinations
+          if ! [[ "$ARCHITECTURES" =~ ^(x86_64,aarch64|aarch64,x86_64|x86_64|aarch64)$ ]]; then
+            echo "❌ Invalid architectures value: $ARCHITECTURES"
+            exit 1
+          fi
+
+          # Validate skip_kabi - must be exactly 'true' or 'false'
+          if ! [[ "$SKIP_KABI" =~ ^(true|false)$ ]]; then
+            echo "❌ Invalid skip_kabi value: $SKIP_KABI"
+            exit 1
+          fi
+
+          # Validate skip_kselftests - must be exactly 'true' or 'false'
+          if ! [[ "$SKIP_KSELFTESTS" =~ ^(true|false)$ ]]; then
+            echo "❌ Invalid skip_kselftests value: $SKIP_KSELFTESTS"
+            exit 1
+          fi
+
+          # Pass validated values to environment
+          echo "IS_PR=$IS_PR" >> "$GITHUB_ENV"
+          echo "BASE_REF=$BASE_REF" >> "$GITHUB_ENV"
+          echo "HEAD_REF=$HEAD_REF" >> "$GITHUB_ENV"
+          echo "PR_NUMBER=$PR_NUMBER" >> "$GITHUB_ENV"
+          echo "ARCHITECTURES=$ARCHITECTURES" >> "$GITHUB_ENV"
+          echo "SKIP_KABI=$SKIP_KABI" >> "$GITHUB_ENV"
+          echo "SKIP_KSELFTESTS=$SKIP_KSELFTESTS" >> "$GITHUB_ENV"
+
+      - name: Clone base branch
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_CLONE_URL: ${{ github.event.pull_request.base.repo.clone_url }}
+        run: |
+          # Use environment variables to prevent injection
+          git clone --depth=1 --no-checkout "$BASE_CLONE_URL" -b "$BASE_REF" .
+
+      - name: Fetch PR branch
+        if: github.event_name == 'pull_request'
+        env:
+          HEAD_CLONE_URL: ${{ github.event.pull_request.head.repo.clone_url }}
+        run: |
+          # Use environment variables to prevent command injection
+          git fetch --depth=1 "$HEAD_CLONE_URL" "$HEAD_REF"
+          HEAD_SHA=$(git rev-parse FETCH_HEAD)
+
+          # Validate SHA format (40 hex characters)
+          if ! [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "❌ Invalid SHA format: $HEAD_SHA"
+            exit 1
+          fi
+
+          echo "HEAD_SHA=$HEAD_SHA" >> "$GITHUB_ENV"
+
+      - name: Save PR metadata for workflow
+        env:
+          REPOSITORY: ${{ github.repository }}
+
+        run: |
+          mkdir -p pr_metadata
+
+          # Write skip sentinel — actual workflow will exit cleanly when true
+          echo "$SKIP_CI" > pr_metadata/skip_ci.txt
+
+          if [[ "$SKIP_CI" == "true" ]]; then
+            echo "⏭️ Writing skip sentinel only — no full metadata saved"
+          else
+            # Save validated metadata
+            echo "$PR_NUMBER" > pr_metadata/pr_number.txt
+            echo "$REPOSITORY" > pr_metadata/repository.txt
+            echo "$BASE_REF" > pr_metadata/base_ref.txt
+            echo "$HEAD_REF" > pr_metadata/head_ref.txt
+            echo "$HEAD_SHA" > pr_metadata/head_sha.txt
+            echo "$ARCHITECTURES" > pr_metadata/architectures.txt
+            echo "$SKIP_KABI" > pr_metadata/skip_kabi.txt
+            echo "$SKIP_KSELFTESTS" > pr_metadata/skip_kselftests.txt
+            echo "$IS_PR" > pr_metadata/is_pr.txt
+
+            # Create a checksum of metadata for integrity verification
+            (cd pr_metadata && sha256sum *.txt > checksums.txt)
+          fi
+
+      - name: Upload check results
+        uses: actions/upload-artifact@v4
+        if: always()  # Upload even if checks fail
+        with:
+          name: check-results
+          path: |
+            pr_metadata/
+          retention-days: 3  # Increased from 1 (then 3) to prevent premature deletion and support manual follow-ups
