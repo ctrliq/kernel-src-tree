@@ -1,28 +1,16 @@
 name: Automated kernel build and test (multi-arch)
 
 on:
-  workflow_call:
+  workflow_run:
+    workflows: ["Trigger Automated kernel build and test (multi-arch)"]
+    types:
+      - completed
+  workflow_dispatch:
     inputs:
-      architectures:
-        description: 'Comma-separated architectures to build (x86_64, aarch64)'
-        required: false
+      run_id:
+        description: "Workflow run ID to fetch artifacts from"
+        required: true
         type: string
-        default: 'x86_64,aarch64'
-      skip_kabi:
-        description: 'Skip kABI compatibility check'
-        required: false
-        type: boolean
-        default: false
-      skip_kselftests:
-        description: 'Skip the kselftests stage (e.g. for CBR where kselftest coverage is minimal)'
-        required: false
-        type: boolean
-        default: false
-    secrets:
-      APP_ID:
-        required: true
-      APP_PRIVATE_KEY:
-        required: true
 
 permissions:
   contents: read
@@ -31,17 +19,201 @@ permissions:
   pull-requests: write
 
 jobs:
+  pre-setup:
+    runs-on: ubuntu-latest
+    # Only run if the check workflow succeeded or failed (not skipped/cancelled)
+    # For workflow_dispatch, always run (manual testing)
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' || github.event.workflow_run.conclusion == 'failure')
+    outputs:
+      skip_ci: ${{ steps.pr_metadata.outputs.skip_ci }}
+      pr_number: ${{ steps.pr_metadata.outputs.pr_number }}
+      repository: ${{ steps.pr_metadata.outputs.repository }}
+      base_ref: ${{ steps.pr_metadata.outputs.base_ref }}
+      head_ref: ${{ steps.pr_metadata.outputs.head_ref }}
+      head_sha: ${{ steps.pr_metadata.outputs.head_sha }}
+      architectures: ${{ steps.pr_metadata.outputs.architectures }}
+      skip_kabi: ${{ steps.pr_metadata.outputs.skip_kabi }}
+      skip_kselftests: ${{ steps.pr_metadata.outputs.skip_kselftests }}
+      is_pr: ${{ steps.pr_metadata.outputs.is_pr }}
+
+    steps:
+      - name: Download check results
+        uses: actions/download-artifact@v4
+        with:
+          name: check-results
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.event_name == 'workflow_dispatch' && inputs.run_id || github.event.workflow_run.id }}
+          path: pr_metadata/
+
+      - name: Verify artifact integrity
+        run: |
+          if [ ! -f pr_metadata/checksums.txt ]; then
+            echo "⚠️ Warning: No checksums file found, skipping integrity check"
+          else
+            cd pr_metadata
+            if sha256sum -c checksums.txt --quiet; then
+              echo "✅ Artifact integrity verified"
+            else
+              echo "❌ Artifact integrity check failed!"
+              exit 1
+            fi
+            cd ..
+          fi
+
+      - name: Read and validate PR metadata
+        id: pr_metadata
+        run: |
+          # Check for skip sentinel before anything else
+          if [ -f pr_metadata/skip_ci.txt ]; then
+            SKIP_CI=$(cat pr_metadata/skip_ci.txt)
+            if ! [[ "$SKIP_CI" =~ ^(true|false)$ ]]; then
+              echo "❌ Security: Invalid skip_ci value: $SKIP_CI"
+              exit 1
+            fi
+            if [ "$SKIP_CI" = "true" ]; then
+              echo "⏭️ [skip ci] detected in trigger workflow — skipping"
+              echo "skip_ci=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          fi
+
+          if [ ! -f pr_metadata/pr_number.txt ]; then
+            echo "❌ PR metadata not found - check workflow may have failed before saving metadata"
+            exit 1
+          fi
+
+          # Read values into variables (not step outputs yet - validate first!)
+          PR_NUMBER=$(cat pr_metadata/pr_number.txt)
+          REPOSITORY=$(cat pr_metadata/repository.txt)
+          BASE_REF=$(cat pr_metadata/base_ref.txt)
+          HEAD_REF=$(cat pr_metadata/head_ref.txt)
+          HEAD_SHA=$(cat pr_metadata/head_sha.txt)
+          ARCHITECTURES=$(cat pr_metadata/architectures.txt)
+          SKIP_KABI=$(cat pr_metadata/skip_kabi.txt)
+          SKIP_KSELFTESTS=$(cat pr_metadata/skip_kselftests.txt)
+          IS_PR=$(cat pr_metadata/is_pr.txt)
+
+          # === CRITICAL VALIDATION: Prevent command injection ===
+
+          if ! [[ "$IS_PR" =~ ^(true|false)$ ]]; then
+            echo "❌ Security: Invalid is_pr value: $IS_PR"
+            exit 1
+          fi
+
+          if [[ "$IS_PR" == "true" ]]; then
+            # Validate PR number is actually a number
+            if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+              echo "❌ Security: Invalid PR number format: $PR_NUMBER"
+              exit 1
+            fi
+
+            # Validate PR number is reasonable (1 to 7 digits)
+            if [ "$PR_NUMBER" -lt 1 ] || [ "$PR_NUMBER" -gt 9999999 ]; then
+              echo "❌ Security: PR number out of range: $PR_NUMBER"
+              exit 1
+            fi
+
+            # Validate base branch name (alphanumeric, dots, slashes, dashes, underscores, curly braces)
+            if ! [[ "$BASE_REF" =~ ^[a-zA-Z0-9/_.{}-]+$ ]]; then
+              echo "❌ Security: Invalid base branch name: $BASE_REF"
+              exit 1
+            fi
+
+            # Validate base branch name length
+            if [ ${#BASE_REF} -gt 255 ]; then
+              echo "❌ Security: Base branch name too long"
+              exit 1
+            fi
+          fi
+
+          # Validate PR number is numeric in all cases
+          # PR_NUMBER can be non-zero on push events too (existing PR found)
+          if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "❌ Security: Invalid PR number format: $PR_NUMBER"
+            exit 1
+          fi
+
+          # Validate repository format (owner/repo)
+          if ! [[ "$REPOSITORY" =~ ^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$ ]]; then
+            echo "❌ Security: Invalid repository format: $REPOSITORY"
+            exit 1
+          fi
+
+          # Validate repository name length
+          if [ ${#REPOSITORY} -gt 100 ]; then
+            echo "❌ Security: Repository name too long"
+            exit 1
+          fi
+
+          # Validate SHA is exactly 40 hex characters
+          if ! [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "❌ Security: Invalid SHA format: $HEAD_SHA"
+            exit 1
+          fi
+
+          # Validate head branch name (alphanumeric, dots, slashes, dashes, underscores, curly braces)
+          if ! [[ "$HEAD_REF" =~ ^[a-zA-Z0-9/_.{}-]+$ ]]; then
+            echo "❌ Security: Invalid head branch name: $HEAD_REF"
+            exit 1
+          fi
+
+          # Validate head branch name length
+          if [ ${#HEAD_REF} -gt 255 ]; then
+            echo "❌ Security: Head branch name too long"
+            exit 1
+          fi
+
+          # Validate architectures - only allow the four valid combinations
+          if ! [[ "$ARCHITECTURES" =~ ^(x86_64,aarch64|aarch64,x86_64|x86_64|aarch64)$ ]]; then
+            echo "❌ Security: Invalid architectures value: $ARCHITECTURES"
+            exit 1
+          fi
+
+          # Validate skip_kabi - must be exactly 'true' or 'false'
+          if ! [[ "$SKIP_KABI" =~ ^(true|false)$ ]]; then
+            echo "❌ Security: Invalid skip_kabi value: $SKIP_KABI"
+            exit 1
+          fi
+
+          # Validate skip_kselftests - must be exactly 'true' or 'false'
+          if ! [[ "$SKIP_KSELFTESTS" =~ ^(true|false)$ ]]; then
+            echo "❌ Security: Invalid skip_kselftests value: $SKIP_KSELFTESTS"
+            exit 1
+          fi
+
+          # === All validation passed - safe to use ===
+          echo "✅ All metadata validation passed"
+
+          # Now safe to output (these will be used in subsequent steps)
+          echo "skip_ci=false" >> $GITHUB_OUTPUT
+          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+          echo "repository=$REPOSITORY" >> $GITHUB_OUTPUT
+          echo "base_ref=$BASE_REF" >> $GITHUB_OUTPUT
+          echo "head_ref=$HEAD_REF" >> $GITHUB_OUTPUT
+          echo "head_sha=$HEAD_SHA" >> $GITHUB_OUTPUT
+          echo "architectures=$ARCHITECTURES" >> $GITHUB_OUTPUT
+          echo "skip_kabi=$SKIP_KABI" >> $GITHUB_OUTPUT
+          echo "skip_kselftests=$SKIP_KSELFTESTS" >> $GITHUB_OUTPUT
+          echo "is_pr=$IS_PR" >> $GITHUB_OUTPUT
+
   setup:
     name: Setup matrix
     runs-on: ubuntu-latest
+    needs: [pre-setup]
+    if: needs.pre-setup.outputs.skip_ci != 'true'
+
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
     - name: Generate dynamic matrix
       id: set-matrix
+      env:
+        ARCHITECTURES: ${{ needs.pre-setup.outputs.architectures }}
       run: |
         # Parse architectures input and build matrix
-        ARCHS="${{ inputs.architectures }}"
+        ARCHS="$ARCHITECTURES"
 
         MATRIX_ITEMS='[]'
 
@@ -61,8 +233,8 @@ jobs:
   build:
     name: Build kernel (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    needs: setup
-    if: "!contains(github.event.head_commit.message, '[skip ci]') && !contains(github.event.head_commit.message, '[ci skip]')"
+    needs: [pre-setup, setup]
+
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
@@ -82,6 +254,14 @@ jobs:
       with:
         fetch-depth: 1
         path: kernel-src-tree
+        ref: ${{ needs.pre-setup.outputs.pr_number != '0' && format('refs/pull/{0}/head', needs.pre-setup.outputs.pr_number) || needs.pre-setup.outputs.head_sha }}
+
+    - name: Create local branch for build
+      working-directory: kernel-src-tree
+      env:
+        HEAD_REF: ${{ needs.pre-setup.outputs.head_ref }}
+      run: |
+        git checkout -b "$HEAD_REF"
 
     - name: Checkout kernel-container-build (test branch)
       uses: actions/checkout@v4
@@ -107,6 +287,8 @@ jobs:
 
     # Kernel build inside CIQ builder (build only, no test)
     - name: Build kernel inside CIQ builder container
+      env:
+        SKIP_KABI: ${{ needs.pre-setup.outputs.skip_kabi }}
       run: |
         set -euxo pipefail
         mkdir -p output
@@ -114,7 +296,7 @@ jobs:
         cat /proc/cpuinfo
         chmod +x kernel-container-build/build-container/*.sh
         BUILD_ARGS=()
-        if [ "${{ inputs.skip_kabi }}" = "true" ]; then
+        if [ "$SKIP_KABI" = "true" ]; then
           # -u overrides the build container's default command (kernel_build.sh)
           BUILD_ARGS=(-u "/usr/local/bin/kernel_build.sh skipkabi")
         fi
@@ -156,7 +338,7 @@ jobs:
   boot:
     name: Boot verification (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    needs: [setup, build]
+    needs: [pre-setup, setup, build]
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
@@ -222,8 +404,8 @@ jobs:
   test-kselftest:
     name: Run kselftests (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    needs: [setup, boot]
-    if: ${{ !inputs.skip_kselftests }}
+    needs: [pre-setup, setup, boot]
+    if: ${{ needs.pre-setup.outputs.skip_kselftests == 'false' }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
@@ -291,7 +473,7 @@ jobs:
   compare-results:
     name: Compare with previous run (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    needs: [setup, build, boot, test-kselftest]
+    needs: [pre-setup, setup, build, boot, test-kselftest]
     if: ${{ always() && needs.build.result == 'success' && needs.boot.result == 'success' }}
     strategy:
       fail-fast: false
@@ -306,9 +488,10 @@ jobs:
       uses: actions/checkout@v4
       with:
         fetch-depth: 1  # Shallow clone - only current commit needed for comparison logic
+        ref: ${{ needs.pre-setup.outputs.pr_number != '0' && format('refs/pull/{0}/head', needs.pre-setup.outputs.pr_number) || needs.pre-setup.outputs.head_sha }}
 
     - name: Download current kselftest logs
-      if: ${{ !inputs.skip_kselftests }}
+      if: ${{ needs.pre-setup.outputs.skip_kselftests == 'false' }}
       uses: actions/download-artifact@v4
       with:
         name: kselftest-logs-${{ matrix.arch }}
@@ -337,9 +520,12 @@ jobs:
       id: base_branch
       env:
         GH_TOKEN: ${{ steps.generate_token_compare.outputs.token }}
+        HEAD_REF: ${{ needs.pre-setup.outputs.head_ref }}
+        BASE_REF: ${{ needs.pre-setup.outputs.base_ref }}
+        PR_NUMBER: ${{ needs.pre-setup.outputs.pr_number }}
       run: |
         BASE_BRANCH=""
-        BRANCH_NAME="${{ github.ref_name }}"
+        BRANCH_NAME="$HEAD_REF"
 
         # Define whitelist of valid base branches
         # TODO: Use a centralized place to get the base branches
@@ -356,9 +542,9 @@ jobs:
           BASE_BRANCH=$(echo "$EXISTING_PR" | jq -r '.baseRefName')
           PR_NUMBER=$(echo "$EXISTING_PR" | jq -r '.number')
           echo "Found existing PR #$PR_NUMBER, using existing base: $BASE_BRANCH"
-        elif [ -n "${{ github.base_ref }}" ]; then
-          # For PRs, use the base branch directly
-          BASE_BRANCH="${{ github.base_ref }}"
+        elif [ -n "$BASE_REF" ]; then
+          # Use the base branch from pr_metadata
+          BASE_BRANCH="$BASE_REF"
           echo "Using PR base branch: $BASE_BRANCH"
         else
           # Extract base branch from branch name.
@@ -407,7 +593,7 @@ jobs:
         echo "Base branch for comparison: $BASE_BRANCH"
 
     - name: Download baseline kselftest logs from last merged PR targeting same base
-      if: ${{ !inputs.skip_kselftests && steps.base_branch.outputs.base_branch != '' }}
+      if: ${{ needs.pre-setup.outputs.skip_kselftests == 'false' && steps.base_branch.outputs.base_branch != '' }}
       env:
         GH_TOKEN: ${{ steps.generate_token_compare.outputs.token }}
       run: |
@@ -502,7 +688,7 @@ jobs:
 
     - name: Compare test results
       id: comparison
-      if: ${{ !inputs.skip_kselftests }}
+      if: ${{ needs.pre-setup.outputs.skip_kselftests == 'false' }}
       run: |
         # Check if we have a base branch to compare against
         if [ -z "${{ steps.base_branch.outputs.base_branch }}" ]; then
@@ -528,7 +714,7 @@ jobs:
 
           echo "### Kselftest Comparison (${{ matrix.arch }})"
           echo "Baseline (from $BASELINE_SOURCE targeting ${{ steps.base_branch.outputs.base_branch }}): $BEFORE_PASS passing, $BEFORE_FAIL failing"
-          echo "Current (${{ github.ref_name }}): $AFTER_PASS passing, $AFTER_FAIL failing"
+          echo "Current (${{ needs.pre-setup.outputs.head_ref }}): $AFTER_PASS passing, $AFTER_FAIL failing"
 
           # Calculate differences
           PASS_DIFF=$((AFTER_PASS - BEFORE_PASS))
@@ -571,7 +757,7 @@ jobs:
   create-pr:
     name: Create Pull Request
     runs-on: kernel-build
-    needs: [setup, build, boot, test-kselftest, compare-results]
+    needs: [pre-setup, setup, build, boot, test-kselftest, compare-results]
     if: |
       always() &&
       needs.build.result == 'success' &&
@@ -579,8 +765,10 @@ jobs:
 
     steps:
     - name: Check if branch name matches a supported pattern
+      env:
+        HEAD_REF: ${{ needs.pre-setup.outputs.head_ref }}
       run: |
-        BRANCH_NAME="${{ github.ref_name }}"
+        BRANCH_NAME="$HEAD_REF"
         # Accept any branch whose name contains curly braces (covers both
         # legacy {user}_BASE and RLC {user}_rlc-N/VERSION patterns)
         if [[ ! "$BRANCH_NAME" =~ \{ ]] || [[ ! "$BRANCH_NAME" =~ \} ]]; then
@@ -590,6 +778,8 @@ jobs:
         echo "Branch name contains curly brackets, proceeding with PR creation checks"
 
     - name: Check if tests passed and no regressions
+      env:
+        ARCHITECTURES: ${{ needs.pre-setup.outputs.architectures }}
       run: |
         # Skip PR if any required stage failed
         # test-kselftest is optional when skip_kselftests is true (result will be 'skipped')
@@ -602,7 +792,7 @@ jobs:
         fi
 
         # Determine which architectures are enabled
-        ARCHS="${{ inputs.architectures }}"
+        ARCHS="$ARCHITECTURES"
         REGRESSION_DETECTED=false
 
         # Check x86_64 regression if enabled
@@ -634,6 +824,7 @@ jobs:
       with:
         fetch-depth: 100  # Fetch more history for commit counting
         token: ${{ secrets.GITHUB_TOKEN }}
+        ref: ${{ needs.pre-setup.outputs.pr_number != '0' && format('refs/pull/{0}/head', needs.pre-setup.outputs.pr_number) || needs.pre-setup.outputs.head_sha }}
 
     - name: Fetch base branch for commit comparison
       run: |
@@ -646,8 +837,10 @@ jobs:
 
     - name: Detect available architectures
       id: detect_arch
+      env:
+        ARCHITECTURES: ${{ needs.pre-setup.outputs.architectures }}
       run: |
-        ARCHS="${{ inputs.architectures }}"
+        ARCHS="$ARCHITECTURES"
         HAS_X86_64=false
         HAS_AARCH64=false
 
@@ -692,14 +885,14 @@ jobs:
         path: artifacts/boot/aarch64
 
     - name: Download kselftest logs (x86_64)
-      if: steps.detect_arch.outputs.has_x86_64 == 'true' && !inputs.skip_kselftests
+      if: steps.detect_arch.outputs.has_x86_64 == 'true' && needs.pre-setup.outputs.skip_kselftests == 'false'
       uses: actions/download-artifact@v4
       with:
         name: kselftest-logs-x86_64
         path: artifacts/test/x86_64
 
     - name: Download kselftest logs (aarch64)
-      if: steps.detect_arch.outputs.has_aarch64 == 'true' && !inputs.skip_kselftests
+      if: steps.detect_arch.outputs.has_aarch64 == 'true' && needs.pre-setup.outputs.skip_kselftests == 'false'
       uses: actions/download-artifact@v4
       with:
         name: kselftest-logs-aarch64
@@ -807,6 +1000,9 @@ jobs:
     - name: Create Pull Request
       env:
         GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+        HEAD_REF: ${{ needs.pre-setup.outputs.head_ref }}
+        PR_NUMBER: ${{ needs.pre-setup.outputs.pr_number }}
+        IS_PR: ${{ needs.pre-setup.outputs.is_pr }}
       run: |
         # Reuse base branch from compare-results stage (already computed)
         BASE_BRANCH="${{ needs.compare-results.outputs.base_branch }}"
@@ -816,7 +1012,7 @@ jobs:
           exit 1
         fi
 
-        echo "Creating/updating PR from ${{ github.ref_name }} to $BASE_BRANCH"
+        echo "Creating/updating PR from $HEAD_REF to $BASE_BRANCH"
 
         # Determine which architectures are enabled
         HAS_X86="${{ steps.detect_arch.outputs.has_x86_64 }}"
@@ -827,7 +1023,7 @@ jobs:
         COMPARISON_STATUS_ARM="${{ needs.compare-results.outputs.comparison_status_aarch64 }}"
 
         # When kselftests are skipped, comparison step doesn't run so status is empty — treat as skipped
-        if [ "${{ inputs.skip_kselftests }}" = "true" ]; then
+        if [ "${{ needs.pre-setup.outputs.skip_kselftests }}" = "true" ]; then
           [ -z "$COMPARISON_STATUS_X86" ] && COMPARISON_STATUS_X86="skipped"
           [ -z "$COMPARISON_STATUS_ARM" ] && COMPARISON_STATUS_ARM="skipped"
         fi
@@ -910,32 +1106,37 @@ jobs:
         # Call script with named arguments
         .github/scripts/create-pr-body-multiarch.sh "${SCRIPT_ARGS[@]}" > pr_body.md
 
-        # Check if any open PR already exists from this head branch (regardless of base)
-        EXISTING_PR=$(gh pr list --head "${{ github.ref_name }}" --state open --json number,baseRefName --jq '.[0]' || echo "")
+        if [ "$IS_PR" = "true" ] && [ "$PR_NUMBER" != "0" ]; then
+          # We already know a PR exists — check if it was created by this workflow
+          PR_JSON=$(gh pr view "$PR_NUMBER" --json labels,baseRefName)
+          IS_WORKFLOW_PR=$(echo "$PR_JSON" | jq -r '[.labels[].name] | contains(["created-by-kernelci"])')
+          CURRENT_BASE=$(echo "$PR_JSON" | jq -r '.baseRefName')
 
-        if [ -n "$EXISTING_PR" ] && [ "$EXISTING_PR" != "null" ]; then
-          PR_NUMBER=$(echo "$EXISTING_PR" | jq -r '.number')
-          CURRENT_BASE=$(echo "$EXISTING_PR" | jq -r '.baseRefName')
+          if [ "$IS_WORKFLOW_PR" = "true" ]; then
+            # Update PR title and body
+            gh pr edit "$PR_NUMBER" \
+              --title "[$BASE_BRANCH] ${{ steps.commit_msg.outputs.commit_subject }}" \
+              --body-file pr_body.md
 
-          echo "Found existing PR #$PR_NUMBER (current base: $CURRENT_BASE)"
+            echo "Updated PR #$PR_NUMBER"
 
-          # Update PR title and body
-          gh pr edit "$PR_NUMBER" \
-            --title "[$BASE_BRANCH] ${{ steps.commit_msg.outputs.commit_subject }}" \
-            --body-file pr_body.md
-
-          echo "Updated PR #$PR_NUMBER"
-
-          # Note: We don't change the base branch even if it differs from $BASE_BRANCH
-          # because compare-results already used the existing PR's base for comparison
-          if [ "$CURRENT_BASE" != "$BASE_BRANCH" ]; then
-            echo "::notice::PR base remains $CURRENT_BASE (comparison was done against this base)"
+            # Note: We don't change the base branch even if it differs from $BASE_BRANCH
+            # because compare-results already used the existing PR's base for comparison
+            if [ "$CURRENT_BASE" != "$BASE_BRANCH" ]; then
+              echo "::notice::PR base remains $CURRENT_BASE (comparison was done against this base)"
+            fi
+          else
+            echo "Manually created PR #$PR_NUMBER, adding comment instead"
+            gh pr comment "$PR_NUMBER" \
+              --repo "${{ github.repository }}" \
+              --body-file pr_body.md
           fi
         else
-          echo "Creating new PR from ${{ github.ref_name }} to $BASE_BRANCH"
+          echo "Creating new PR from $HEAD_REF to $BASE_BRANCH"
           gh pr create \
             --base "$BASE_BRANCH" \
-            --head "${{ github.ref_name }}" \
+            --head "$HEAD_REF" \
             --title "[$BASE_BRANCH] ${{ steps.commit_msg.outputs.commit_subject }}" \
-            --body-file pr_body.md
+            --body-file pr_body.md \
+            --label "created-by-kernelci"
         fi
