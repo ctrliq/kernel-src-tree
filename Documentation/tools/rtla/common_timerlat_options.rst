@@ -119,3 +119,21 @@
         $ rtla timerlat -d 5s --on-end trace
 
         This runs rtla timerlat with default options and save trace output at the end.
+
+**--bpf-action** *bpf-program*
+
+        Loads a BPF program from an ELF file and executes it when a latency threshold is exceeded.
+
+        The BPF program must be a valid ELF file loadable with libbpf. The program must contain
+        a function named ``action_handler``, stored in an ELF section with the ``tp_`` prefix.
+        The prefix is used by libbpf to set BPF program type to BPF_PROG_TYPE_TRACEPOINT.
+
+        The program receives a ``struct trace_event_raw_timerlat_sample`` parameter
+        containing timerlat sample data.
+
+        An example is provided in ``tools/tracing/rtla/example/timerlat_bpf_action.c``.
+        This example demonstrates how to create a BPF program that prints latency information using
+        bpf_trace_printk() when a threshold is exceeded.
+
+        **Note**: BPF actions require BPF support to be available. If BPF is not available
+        or disabled, the tool falls back to tracefs mode and BPF actions are not supported.
