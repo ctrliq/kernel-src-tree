@@ -12,7 +12,7 @@ receiver in an SoC.
 Bus types
 ---------
 
-The following busses are the most common. This section discusses these two only.
+The following buses are the most common. This section discusses these two only.
 
 MIPI CSI-2
 ^^^^^^^^^^
@@ -35,7 +35,7 @@ Transmitter drivers
 
 Transmitter drivers generally need to provide the receiver drivers with the
 configuration of the transmitter. What is required depends on the type of the
-bus. These are common for both busses.
+bus. These are common for both buses.
 
 Media bus pixel code
 ^^^^^^^^^^^^^^^^^^^^
