@@ -4194,13 +4194,6 @@ static const char *scx_exit_reason(enum scx_exit_kind kind)
 	}
 }
 
-static void free_kick_syncs_rcu(struct rcu_head *rcu)
-{
-	struct scx_kick_syncs *ksyncs = container_of(rcu, struct scx_kick_syncs, rcu);
-
-	kvfree(ksyncs);
-}
-
 static void free_kick_syncs(void)
 {
 	int cpu;
@@ -4211,7 +4204,7 @@ static void free_kick_syncs(void)
 
 		to_free = rcu_replace_pointer(*ksyncs, NULL, true);
 		if (to_free)
-			call_rcu(&to_free->rcu, free_kick_syncs_rcu);
+			kvfree_rcu(to_free, rcu);
 	}
 }
 
