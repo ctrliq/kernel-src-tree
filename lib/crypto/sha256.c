@@ -14,6 +14,7 @@
 #include <linux/export.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/static_call.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
 #include <linux/wordpart.h>
@@ -169,19 +170,33 @@ static void __sha256_init(struct __sha256_ctx *ctx,
 	ctx->bytecount = initial_bytecount;
 }
 
-void sha224_init(struct sha224_ctx *ctx)
+static void _sha224_init(struct sha224_ctx *ctx)
 {
 	__sha256_init(&ctx->ctx, &sha224_iv, 0);
 }
+DEFINE_STATIC_CALL(sha224_init, _sha224_init);
+EXPORT_STATIC_CALL_GPL(sha224_init);
+
+void sha224_init(struct sha224_ctx *ctx)
+{
+	static_call(sha224_init)(ctx);
+}
 EXPORT_SYMBOL_GPL(sha224_init);
 
-void sha256_init(struct sha256_ctx *ctx)
+static void _sha256_init(struct sha256_ctx *ctx)
 {
 	__sha256_init(&ctx->ctx, &sha256_iv, 0);
 }
+DEFINE_STATIC_CALL(sha256_init, _sha256_init);
+EXPORT_STATIC_CALL_GPL(sha256_init);
+
+void sha256_init(struct sha256_ctx *ctx)
+{
+	static_call(sha256_init)(ctx);
+}
 EXPORT_SYMBOL_GPL(sha256_init);
 
-void __sha256_update(struct __sha256_ctx *ctx, const u8 *data, size_t len)
+static void ___sha256_update(struct __sha256_ctx *ctx, const u8 *data, size_t len)
 {
 	size_t partial = ctx->bytecount % SHA256_BLOCK_SIZE;
 
@@ -212,6 +227,13 @@ void __sha256_update(struct __sha256_ctx *ctx, const u8 *data, size_t len)
 	if (len)
 		memcpy(&ctx->buf[partial], data, len);
 }
+DEFINE_STATIC_CALL(__sha256_update, ___sha256_update);
+EXPORT_STATIC_CALL(__sha256_update);
+
+void __sha256_update(struct __sha256_ctx *ctx, const u8 *data, size_t len)
+{
+	static_call(__sha256_update)(ctx, data, len);
+}
 EXPORT_SYMBOL(__sha256_update);
 
 static void __sha256_final(struct __sha256_ctx *ctx,
@@ -234,21 +256,35 @@ static void __sha256_final(struct __sha256_ctx *ctx,
 		put_unaligned_be32(ctx->state.h[i / 4], out + i);
 }
 
-void sha224_final(struct sha224_ctx *ctx, u8 out[SHA224_DIGEST_SIZE])
+static void _sha224_final(struct sha224_ctx *ctx, u8 out[SHA224_DIGEST_SIZE])
 {
 	__sha256_final(&ctx->ctx, out, SHA224_DIGEST_SIZE);
 	memzero_explicit(ctx, sizeof(*ctx));
 }
+DEFINE_STATIC_CALL(sha224_final, _sha224_final);
+EXPORT_STATIC_CALL(sha224_final);
+
+void sha224_final(struct sha224_ctx *ctx, u8 out[SHA224_DIGEST_SIZE])
+{
+	static_call(sha224_final)(ctx, out);
+}
 EXPORT_SYMBOL(sha224_final);
 
-void sha256_final(struct sha256_ctx *ctx, u8 out[SHA256_DIGEST_SIZE])
+static void _sha256_final(struct sha256_ctx *ctx, u8 out[SHA256_DIGEST_SIZE])
 {
 	__sha256_final(&ctx->ctx, out, SHA256_DIGEST_SIZE);
 	memzero_explicit(ctx, sizeof(*ctx));
 }
+DEFINE_STATIC_CALL(sha256_final, _sha256_final);
+EXPORT_STATIC_CALL(sha256_final);
+
+void sha256_final(struct sha256_ctx *ctx, u8 out[SHA256_DIGEST_SIZE])
+{
+	static_call(sha256_final)(ctx, out);
+}
 EXPORT_SYMBOL(sha256_final);
 
-void sha224(const u8 *data, size_t len, u8 out[SHA224_DIGEST_SIZE])
+static void _sha224(const u8 *data, size_t len, u8 out[SHA224_DIGEST_SIZE])
 {
 	struct sha224_ctx ctx;
 
@@ -256,15 +292,29 @@ void sha224(const u8 *data, size_t len, u8 out[SHA224_DIGEST_SIZE])
 	sha224_update(&ctx, data, len);
 	sha224_final(&ctx, out);
 }
+DEFINE_STATIC_CALL(sha224, _sha224);
+EXPORT_STATIC_CALL(sha224);
+
+void sha224(const u8 *data, size_t len, u8 out[SHA224_DIGEST_SIZE])
+{
+	static_call(sha224)(data, len, out);
+}
 EXPORT_SYMBOL(sha224);
 
-void sha256(const u8 *data, size_t len, u8 out[SHA256_DIGEST_SIZE])
+static void _sha256(const u8 *data, size_t len, u8 out[SHA256_DIGEST_SIZE])
 {
 	struct sha256_ctx ctx;
 
 	sha256_init(&ctx);
 	sha256_update(&ctx, data, len);
 	sha256_final(&ctx, out);
+}
+DEFINE_STATIC_CALL(sha256, _sha256);
+EXPORT_STATIC_CALL(sha256);
+
+void sha256(const u8 *data, size_t len, u8 out[SHA256_DIGEST_SIZE])
+{
+	static_call(sha256)(data, len, out);
 }
 EXPORT_SYMBOL(sha256);
 
@@ -304,9 +354,10 @@ static noinline_for_stack void sha256_finup_2x_sequential(
 	__sha256_final(&mut_ctx, out2, SHA256_DIGEST_SIZE);
 }
 
-void sha256_finup_2x(const struct sha256_ctx *ctx, const u8 *data1,
-		     const u8 *data2, size_t len, u8 out1[SHA256_DIGEST_SIZE],
-		     u8 out2[SHA256_DIGEST_SIZE])
+static void _sha256_finup_2x(const struct sha256_ctx *ctx, const u8 *data1,
+			     const u8 *data2, size_t len,
+			     u8 out1[SHA256_DIGEST_SIZE],
+			     u8 out2[SHA256_DIGEST_SIZE])
 {
 	if (ctx == NULL)
 		ctx = &initial_sha256_ctx;
@@ -316,11 +367,27 @@ void sha256_finup_2x(const struct sha256_ctx *ctx, const u8 *data1,
 		return;
 	sha256_finup_2x_sequential(&ctx->ctx, data1, data2, len, out1, out2);
 }
+DEFINE_STATIC_CALL(sha256_finup_2x, _sha256_finup_2x);
+EXPORT_STATIC_CALL_GPL(sha256_finup_2x);
+
+void sha256_finup_2x(const struct sha256_ctx *ctx, const u8 *data1,
+		     const u8 *data2, size_t len, u8 out1[SHA256_DIGEST_SIZE],
+		     u8 out2[SHA256_DIGEST_SIZE])
+{
+	static_call(sha256_finup_2x)(ctx, data1, data2, len, out1, out2);
+}
 EXPORT_SYMBOL_GPL(sha256_finup_2x);
+
+static bool _sha256_finup_2x_is_optimized(void)
+{
+	return sha256_finup_2x_is_optimized_arch();
+}
+DEFINE_STATIC_CALL(sha256_finup_2x_is_optimized, _sha256_finup_2x_is_optimized);
+EXPORT_STATIC_CALL_GPL(sha256_finup_2x_is_optimized);
 
 bool sha256_finup_2x_is_optimized(void)
 {
-	return sha256_finup_2x_is_optimized_arch();
+	return static_call(sha256_finup_2x_is_optimized)();
 }
 EXPORT_SYMBOL_GPL(sha256_finup_2x_is_optimized);
 
@@ -357,45 +424,85 @@ static void __hmac_sha256_preparekey(struct sha256_block_state *istate,
 	memzero_explicit(&derived_key, sizeof(derived_key));
 }
 
-void hmac_sha224_preparekey(struct hmac_sha224_key *key,
-			    const u8 *raw_key, size_t raw_key_len)
+static void _hmac_sha224_preparekey(struct hmac_sha224_key *key,
+				    const u8 *raw_key, size_t raw_key_len)
 {
 	__hmac_sha256_preparekey(&key->key.istate, &key->key.ostate,
 				 raw_key, raw_key_len, &sha224_iv);
 }
+DEFINE_STATIC_CALL(hmac_sha224_preparekey, _hmac_sha224_preparekey);
+EXPORT_STATIC_CALL_GPL(hmac_sha224_preparekey);
+
+void hmac_sha224_preparekey(struct hmac_sha224_key *key,
+			    const u8 *raw_key, size_t raw_key_len)
+{
+	static_call(hmac_sha224_preparekey)(key, raw_key, raw_key_len);
+}
 EXPORT_SYMBOL_GPL(hmac_sha224_preparekey);
+
+static void _hmac_sha256_preparekey(struct hmac_sha256_key *key,
+				    const u8 *raw_key, size_t raw_key_len)
+{
+	__hmac_sha256_preparekey(&key->key.istate, &key->key.ostate,
+				 raw_key, raw_key_len, &sha256_iv);
+}
+DEFINE_STATIC_CALL(hmac_sha256_preparekey, _hmac_sha256_preparekey);
+EXPORT_STATIC_CALL_GPL(hmac_sha256_preparekey);
 
 void hmac_sha256_preparekey(struct hmac_sha256_key *key,
 			    const u8 *raw_key, size_t raw_key_len)
 {
-	__hmac_sha256_preparekey(&key->key.istate, &key->key.ostate,
-				 raw_key, raw_key_len, &sha256_iv);
+	static_call(hmac_sha256_preparekey)(key, raw_key, raw_key_len);
 }
 EXPORT_SYMBOL_GPL(hmac_sha256_preparekey);
 
-void __hmac_sha256_init(struct __hmac_sha256_ctx *ctx,
-			const struct __hmac_sha256_key *key)
+static void ___hmac_sha256_init(struct __hmac_sha256_ctx *ctx,
+				const struct __hmac_sha256_key *key)
 {
 	__sha256_init(&ctx->sha_ctx, &key->istate, SHA256_BLOCK_SIZE);
 	ctx->ostate = key->ostate;
 }
+DEFINE_STATIC_CALL(__hmac_sha256_init, ___hmac_sha256_init);
+EXPORT_STATIC_CALL_GPL(__hmac_sha256_init);
+
+void __hmac_sha256_init(struct __hmac_sha256_ctx *ctx,
+			const struct __hmac_sha256_key *key)
+{
+	static_call(__hmac_sha256_init)(ctx, key);
+}
 EXPORT_SYMBOL_GPL(__hmac_sha256_init);
 
-void hmac_sha224_init_usingrawkey(struct hmac_sha224_ctx *ctx,
-				  const u8 *raw_key, size_t raw_key_len)
+static void _hmac_sha224_init_usingrawkey(struct hmac_sha224_ctx *ctx,
+					  const u8 *raw_key, size_t raw_key_len)
 {
 	__hmac_sha256_preparekey(&ctx->ctx.sha_ctx.state, &ctx->ctx.ostate,
 				 raw_key, raw_key_len, &sha224_iv);
 	ctx->ctx.sha_ctx.bytecount = SHA256_BLOCK_SIZE;
 }
+DEFINE_STATIC_CALL(hmac_sha224_init_usingrawkey, _hmac_sha224_init_usingrawkey);
+EXPORT_STATIC_CALL_GPL(hmac_sha224_init_usingrawkey);
+
+void hmac_sha224_init_usingrawkey(struct hmac_sha224_ctx *ctx,
+				  const u8 *raw_key, size_t raw_key_len)
+{
+	static_call(hmac_sha224_init_usingrawkey)(ctx, raw_key, raw_key_len);
+}
 EXPORT_SYMBOL_GPL(hmac_sha224_init_usingrawkey);
 
-void hmac_sha256_init_usingrawkey(struct hmac_sha256_ctx *ctx,
-				  const u8 *raw_key, size_t raw_key_len)
+static void _hmac_sha256_init_usingrawkey(struct hmac_sha256_ctx *ctx,
+					  const u8 *raw_key, size_t raw_key_len)
 {
 	__hmac_sha256_preparekey(&ctx->ctx.sha_ctx.state, &ctx->ctx.ostate,
 				 raw_key, raw_key_len, &sha256_iv);
 	ctx->ctx.sha_ctx.bytecount = SHA256_BLOCK_SIZE;
+}
+DEFINE_STATIC_CALL(hmac_sha256_init_usingrawkey, _hmac_sha256_init_usingrawkey);
+EXPORT_STATIC_CALL_GPL(hmac_sha256_init_usingrawkey);
+
+void hmac_sha256_init_usingrawkey(struct hmac_sha256_ctx *ctx,
+				  const u8 *raw_key, size_t raw_key_len)
+{
+	static_call(hmac_sha256_init_usingrawkey)(ctx, raw_key, raw_key_len);
 }
 EXPORT_SYMBOL_GPL(hmac_sha256_init_usingrawkey);
 
@@ -418,22 +525,39 @@ static void __hmac_sha256_final(struct __hmac_sha256_ctx *ctx,
 	memzero_explicit(ctx, sizeof(*ctx));
 }
 
-void hmac_sha224_final(struct hmac_sha224_ctx *ctx,
-		       u8 out[SHA224_DIGEST_SIZE])
+static void _hmac_sha224_final(struct hmac_sha224_ctx *ctx,
+			       u8 out[SHA224_DIGEST_SIZE])
 {
 	__hmac_sha256_final(&ctx->ctx, out, SHA224_DIGEST_SIZE);
 }
+DEFINE_STATIC_CALL(hmac_sha224_final, _hmac_sha224_final);
+EXPORT_STATIC_CALL_GPL(hmac_sha224_final);
+
+void hmac_sha224_final(struct hmac_sha224_ctx *ctx,
+		       u8 out[SHA224_DIGEST_SIZE])
+{
+	static_call(hmac_sha224_final)(ctx, out);
+}
 EXPORT_SYMBOL_GPL(hmac_sha224_final);
+
+static void _hmac_sha256_final(struct hmac_sha256_ctx *ctx,
+			       u8 out[SHA256_DIGEST_SIZE])
+{
+	__hmac_sha256_final(&ctx->ctx, out, SHA256_DIGEST_SIZE);
+}
+DEFINE_STATIC_CALL(hmac_sha256_final, _hmac_sha256_final);
+EXPORT_STATIC_CALL_GPL(hmac_sha256_final);
 
 void hmac_sha256_final(struct hmac_sha256_ctx *ctx,
 		       u8 out[SHA256_DIGEST_SIZE])
 {
-	__hmac_sha256_final(&ctx->ctx, out, SHA256_DIGEST_SIZE);
+	static_call(hmac_sha256_final)(ctx, out);
 }
 EXPORT_SYMBOL_GPL(hmac_sha256_final);
 
-void hmac_sha224(const struct hmac_sha224_key *key,
-		 const u8 *data, size_t data_len, u8 out[SHA224_DIGEST_SIZE])
+static void _hmac_sha224(const struct hmac_sha224_key *key,
+			 const u8 *data, size_t data_len,
+			 u8 out[SHA224_DIGEST_SIZE])
 {
 	struct hmac_sha224_ctx ctx;
 
@@ -441,10 +565,19 @@ void hmac_sha224(const struct hmac_sha224_key *key,
 	hmac_sha224_update(&ctx, data, data_len);
 	hmac_sha224_final(&ctx, out);
 }
+DEFINE_STATIC_CALL(hmac_sha224, _hmac_sha224);
+EXPORT_STATIC_CALL_GPL(hmac_sha224);
+
+void hmac_sha224(const struct hmac_sha224_key *key,
+		 const u8 *data, size_t data_len, u8 out[SHA224_DIGEST_SIZE])
+{
+	static_call(hmac_sha224)(key, data, data_len, out);
+}
 EXPORT_SYMBOL_GPL(hmac_sha224);
 
-void hmac_sha256(const struct hmac_sha256_key *key,
-		 const u8 *data, size_t data_len, u8 out[SHA256_DIGEST_SIZE])
+static void _hmac_sha256(const struct hmac_sha256_key *key,
+			 const u8 *data, size_t data_len,
+			 u8 out[SHA256_DIGEST_SIZE])
 {
 	struct hmac_sha256_ctx ctx;
 
@@ -452,11 +585,19 @@ void hmac_sha256(const struct hmac_sha256_key *key,
 	hmac_sha256_update(&ctx, data, data_len);
 	hmac_sha256_final(&ctx, out);
 }
+DEFINE_STATIC_CALL(hmac_sha256, _hmac_sha256);
+EXPORT_STATIC_CALL_GPL(hmac_sha256);
+
+void hmac_sha256(const struct hmac_sha256_key *key,
+		 const u8 *data, size_t data_len, u8 out[SHA256_DIGEST_SIZE])
+{
+	static_call(hmac_sha256)(key, data, data_len, out);
+}
 EXPORT_SYMBOL_GPL(hmac_sha256);
 
-void hmac_sha224_usingrawkey(const u8 *raw_key, size_t raw_key_len,
-			     const u8 *data, size_t data_len,
-			     u8 out[SHA224_DIGEST_SIZE])
+static void _hmac_sha224_usingrawkey(const u8 *raw_key, size_t raw_key_len,
+				     const u8 *data, size_t data_len,
+				     u8 out[SHA224_DIGEST_SIZE])
 {
 	struct hmac_sha224_ctx ctx;
 
@@ -464,17 +605,37 @@ void hmac_sha224_usingrawkey(const u8 *raw_key, size_t raw_key_len,
 	hmac_sha224_update(&ctx, data, data_len);
 	hmac_sha224_final(&ctx, out);
 }
+DEFINE_STATIC_CALL(hmac_sha224_usingrawkey, _hmac_sha224_usingrawkey);
+EXPORT_STATIC_CALL_GPL(hmac_sha224_usingrawkey);
+
+void hmac_sha224_usingrawkey(const u8 *raw_key, size_t raw_key_len,
+			     const u8 *data, size_t data_len,
+			     u8 out[SHA224_DIGEST_SIZE])
+{
+	static_call(hmac_sha224_usingrawkey)(raw_key, raw_key_len, data,
+					     data_len, out);
+}
 EXPORT_SYMBOL_GPL(hmac_sha224_usingrawkey);
 
-void hmac_sha256_usingrawkey(const u8 *raw_key, size_t raw_key_len,
-			     const u8 *data, size_t data_len,
-			     u8 out[SHA256_DIGEST_SIZE])
+static void _hmac_sha256_usingrawkey(const u8 *raw_key, size_t raw_key_len,
+				     const u8 *data, size_t data_len,
+				     u8 out[SHA256_DIGEST_SIZE])
 {
 	struct hmac_sha256_ctx ctx;
 
 	hmac_sha256_init_usingrawkey(&ctx, raw_key, raw_key_len);
 	hmac_sha256_update(&ctx, data, data_len);
 	hmac_sha256_final(&ctx, out);
+}
+DEFINE_STATIC_CALL(hmac_sha256_usingrawkey, _hmac_sha256_usingrawkey);
+EXPORT_STATIC_CALL_GPL(hmac_sha256_usingrawkey);
+
+void hmac_sha256_usingrawkey(const u8 *raw_key, size_t raw_key_len,
+			     const u8 *data, size_t data_len,
+			     u8 out[SHA256_DIGEST_SIZE])
+{
+	static_call(hmac_sha256_usingrawkey)(raw_key, raw_key_len, data,
+					     data_len, out);
 }
 EXPORT_SYMBOL_GPL(hmac_sha256_usingrawkey);
 #endif /* !__DISABLE_EXPORTS */

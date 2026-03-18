@@ -6,6 +6,7 @@
 #ifndef _CRYPTO_SHA2_H
 #define _CRYPTO_SHA2_H
 
+#include <linux/static_call_types.h>
 #include <linux/types.h>
 
 #define SHA224_DIGEST_SIZE	28
@@ -130,6 +131,7 @@ struct __sha256_ctx {
 	u8 buf[SHA256_BLOCK_SIZE] __aligned(__alignof__(__be64));
 };
 void __sha256_update(struct __sha256_ctx *ctx, const u8 *data, size_t len);
+DECLARE_STATIC_CALL(__sha256_update, __sha256_update);
 
 /*
  * HMAC key and message context structs, shared by HMAC-SHA224 and HMAC-SHA256.
@@ -146,6 +148,7 @@ struct __hmac_sha256_ctx {
 };
 void __hmac_sha256_init(struct __hmac_sha256_ctx *ctx,
 			const struct __hmac_sha256_key *key);
+DECLARE_STATIC_CALL(__hmac_sha256_init, __hmac_sha256_init);
 
 /**
  * struct sha224_ctx - Context for hashing a message with SHA-224
@@ -164,6 +167,7 @@ struct sha224_ctx {
  * Context: Any context.
  */
 void sha224_init(struct sha224_ctx *ctx);
+DECLARE_STATIC_CALL(sha224_init, sha224_init);
 
 /**
  * sha224_update() - Update a SHA-224 context with message data
@@ -191,6 +195,7 @@ static inline void sha224_update(struct sha224_ctx *ctx,
  * Context: Any context.
  */
 void sha224_final(struct sha224_ctx *ctx, u8 out[SHA224_DIGEST_SIZE]);
+DECLARE_STATIC_CALL(sha224_final, sha224_final);
 
 /**
  * sha224() - Compute SHA-224 message digest in one shot
@@ -201,6 +206,7 @@ void sha224_final(struct sha224_ctx *ctx, u8 out[SHA224_DIGEST_SIZE]);
  * Context: Any context.
  */
 void sha224(const u8 *data, size_t len, u8 out[SHA224_DIGEST_SIZE]);
+DECLARE_STATIC_CALL(sha224, sha224);
 
 /**
  * struct hmac_sha224_key - Prepared key for HMAC-SHA224
@@ -231,6 +237,7 @@ struct hmac_sha224_ctx {
  */
 void hmac_sha224_preparekey(struct hmac_sha224_key *key,
 			    const u8 *raw_key, size_t raw_key_len);
+DECLARE_STATIC_CALL(hmac_sha224_preparekey, hmac_sha224_preparekey);
 
 /**
  * hmac_sha224_init() - Initialize an HMAC-SHA224 context for a new message
@@ -261,6 +268,7 @@ static inline void hmac_sha224_init(struct hmac_sha224_ctx *ctx,
  */
 void hmac_sha224_init_usingrawkey(struct hmac_sha224_ctx *ctx,
 				  const u8 *raw_key, size_t raw_key_len);
+DECLARE_STATIC_CALL(hmac_sha224_init_usingrawkey, hmac_sha224_init_usingrawkey);
 
 /**
  * hmac_sha224_update() - Update an HMAC-SHA224 context with message data
@@ -288,6 +296,7 @@ static inline void hmac_sha224_update(struct hmac_sha224_ctx *ctx,
  * Context: Any context.
  */
 void hmac_sha224_final(struct hmac_sha224_ctx *ctx, u8 out[SHA224_DIGEST_SIZE]);
+DECLARE_STATIC_CALL(hmac_sha224_final, hmac_sha224_final);
 
 /**
  * hmac_sha224() - Compute HMAC-SHA224 in one shot, using a prepared key
@@ -302,6 +311,7 @@ void hmac_sha224_final(struct hmac_sha224_ctx *ctx, u8 out[SHA224_DIGEST_SIZE]);
  */
 void hmac_sha224(const struct hmac_sha224_key *key,
 		 const u8 *data, size_t data_len, u8 out[SHA224_DIGEST_SIZE]);
+DECLARE_STATIC_CALL(hmac_sha224, hmac_sha224);
 
 /**
  * hmac_sha224_usingrawkey() - Compute HMAC-SHA224 in one shot, using a raw key
@@ -319,6 +329,7 @@ void hmac_sha224(const struct hmac_sha224_key *key,
 void hmac_sha224_usingrawkey(const u8 *raw_key, size_t raw_key_len,
 			     const u8 *data, size_t data_len,
 			     u8 out[SHA224_DIGEST_SIZE]);
+DECLARE_STATIC_CALL(hmac_sha224_usingrawkey, hmac_sha224_usingrawkey);
 
 /**
  * struct sha256_ctx - Context for hashing a message with SHA-256
@@ -337,6 +348,7 @@ struct sha256_ctx {
  * Context: Any context.
  */
 void sha256_init(struct sha256_ctx *ctx);
+DECLARE_STATIC_CALL(sha256_init, sha256_init);
 
 /**
  * sha256_update() - Update a SHA-256 context with message data
@@ -364,6 +376,7 @@ static inline void sha256_update(struct sha256_ctx *ctx,
  * Context: Any context.
  */
 void sha256_final(struct sha256_ctx *ctx, u8 out[SHA256_DIGEST_SIZE]);
+DECLARE_STATIC_CALL(sha256_final, sha256_final);
 
 /**
  * sha256() - Compute SHA-256 message digest in one shot
@@ -374,6 +387,7 @@ void sha256_final(struct sha256_ctx *ctx, u8 out[SHA256_DIGEST_SIZE]);
  * Context: Any context.
  */
 void sha256(const u8 *data, size_t len, u8 out[SHA256_DIGEST_SIZE]);
+DECLARE_STATIC_CALL(sha256, sha256);
 
 /**
  * sha256_finup_2x() - Compute two SHA-256 digests from a common initial
@@ -392,6 +406,7 @@ void sha256(const u8 *data, size_t len, u8 out[SHA256_DIGEST_SIZE]);
 void sha256_finup_2x(const struct sha256_ctx *ctx, const u8 *data1,
 		     const u8 *data2, size_t len, u8 out1[SHA256_DIGEST_SIZE],
 		     u8 out2[SHA256_DIGEST_SIZE]);
+DECLARE_STATIC_CALL(sha256_finup_2x, sha256_finup_2x);
 
 /**
  * sha256_finup_2x_is_optimized() - Check if sha256_finup_2x() is using a real
@@ -402,6 +417,7 @@ void sha256_finup_2x(const struct sha256_ctx *ctx, const u8 *data1,
  * Context: Any context.
  */
 bool sha256_finup_2x_is_optimized(void);
+DECLARE_STATIC_CALL(sha256_finup_2x_is_optimized, sha256_finup_2x_is_optimized);
 
 /**
  * struct hmac_sha256_key - Prepared key for HMAC-SHA256
@@ -432,6 +448,7 @@ struct hmac_sha256_ctx {
  */
 void hmac_sha256_preparekey(struct hmac_sha256_key *key,
 			    const u8 *raw_key, size_t raw_key_len);
+DECLARE_STATIC_CALL(hmac_sha256_preparekey, hmac_sha256_preparekey);
 
 /**
  * hmac_sha256_init() - Initialize an HMAC-SHA256 context for a new message
@@ -462,6 +479,7 @@ static inline void hmac_sha256_init(struct hmac_sha256_ctx *ctx,
  */
 void hmac_sha256_init_usingrawkey(struct hmac_sha256_ctx *ctx,
 				  const u8 *raw_key, size_t raw_key_len);
+DECLARE_STATIC_CALL(hmac_sha256_init_usingrawkey, hmac_sha256_init_usingrawkey);
 
 /**
  * hmac_sha256_update() - Update an HMAC-SHA256 context with message data
@@ -489,6 +507,7 @@ static inline void hmac_sha256_update(struct hmac_sha256_ctx *ctx,
  * Context: Any context.
  */
 void hmac_sha256_final(struct hmac_sha256_ctx *ctx, u8 out[SHA256_DIGEST_SIZE]);
+DECLARE_STATIC_CALL(hmac_sha256_final, hmac_sha256_final);
 
 /**
  * hmac_sha256() - Compute HMAC-SHA256 in one shot, using a prepared key
@@ -503,6 +522,7 @@ void hmac_sha256_final(struct hmac_sha256_ctx *ctx, u8 out[SHA256_DIGEST_SIZE]);
  */
 void hmac_sha256(const struct hmac_sha256_key *key,
 		 const u8 *data, size_t data_len, u8 out[SHA256_DIGEST_SIZE]);
+DECLARE_STATIC_CALL(hmac_sha256, hmac_sha256);
 
 /**
  * hmac_sha256_usingrawkey() - Compute HMAC-SHA256 in one shot, using a raw key
@@ -520,6 +540,7 @@ void hmac_sha256(const struct hmac_sha256_key *key,
 void hmac_sha256_usingrawkey(const u8 *raw_key, size_t raw_key_len,
 			     const u8 *data, size_t data_len,
 			     u8 out[SHA256_DIGEST_SIZE]);
+DECLARE_STATIC_CALL(hmac_sha256_usingrawkey, hmac_sha256_usingrawkey);
 
 /* State for the SHA-512 (and SHA-384) compression function */
 struct sha512_block_state {
