@@ -2,6 +2,7 @@
 #define _CRYPTO_GCM_H
 
 #include <linux/errno.h>
+#include <linux/static_call_types.h>
 
 #include <crypto/aes.h>
 #include <crypto/gf128mul.h>
@@ -72,14 +73,17 @@ struct aesgcm_ctx {
 
 int aesgcm_expandkey(struct aesgcm_ctx *ctx, const u8 *key,
 		     unsigned int keysize, unsigned int authsize);
+DECLARE_STATIC_CALL(aesgcm_expandkey, aesgcm_expandkey);
 
 void aesgcm_encrypt(const struct aesgcm_ctx *ctx, u8 *dst, const u8 *src,
 		    int crypt_len, const u8 *assoc, int assoc_len,
 		    const u8 iv[GCM_AES_IV_SIZE], u8 *authtag);
+DECLARE_STATIC_CALL(aesgcm_encrypt, aesgcm_encrypt);
 
 bool __must_check aesgcm_decrypt(const struct aesgcm_ctx *ctx, u8 *dst,
 				 const u8 *src, int crypt_len, const u8 *assoc,
 				 int assoc_len, const u8 iv[GCM_AES_IV_SIZE],
 				 const u8 *authtag);
+DECLARE_STATIC_CALL(aesgcm_decrypt, aesgcm_decrypt);
 
 #endif

@@ -10,6 +10,7 @@
 #include <crypto/ghash.h>
 #include <linux/export.h>
 #include <linux/module.h>
+#include <linux/static_call.h>
 #include <asm/irqflags.h>
 
 static void aesgcm_encrypt_block(const struct crypto_aes_ctx *ctx, void *dst,
@@ -42,8 +43,8 @@ static void aesgcm_encrypt_block(const struct crypto_aes_ctx *ctx, void *dst,
  * Returns: 0 on success, or -EINVAL if @keysize or @authsize contain values
  * that are not permitted by the GCM specification.
  */
-int aesgcm_expandkey(struct aesgcm_ctx *ctx, const u8 *key,
-		     unsigned int keysize, unsigned int authsize)
+static int _aesgcm_expandkey(struct aesgcm_ctx *ctx, const u8 *key,
+			     unsigned int keysize, unsigned int authsize)
 {
 	u8 kin[AES_BLOCK_SIZE] = {};
 	int ret;
@@ -57,6 +58,14 @@ int aesgcm_expandkey(struct aesgcm_ctx *ctx, const u8 *key,
 	aesgcm_encrypt_block(&ctx->aes_ctx, &ctx->ghash_key, kin);
 
 	return 0;
+}
+DEFINE_STATIC_CALL(aesgcm_expandkey, _aesgcm_expandkey);
+EXPORT_STATIC_CALL(aesgcm_expandkey);
+
+int aesgcm_expandkey(struct aesgcm_ctx *ctx, const u8 *key,
+		     unsigned int keysize, unsigned int authsize)
+{
+	return static_call(aesgcm_expandkey)(ctx, key, keysize, authsize);
 }
 EXPORT_SYMBOL(aesgcm_expandkey);
 
@@ -144,9 +153,9 @@ static void aesgcm_crypt(const struct aesgcm_ctx *ctx, u8 *dst, const u8 *src,
  *		tag should be stored. The buffer is assumed to have space for
  *		@ctx->authsize bytes.
  */
-void aesgcm_encrypt(const struct aesgcm_ctx *ctx, u8 *dst, const u8 *src,
-		    int crypt_len, const u8 *assoc, int assoc_len,
-		    const u8 iv[GCM_AES_IV_SIZE], u8 *authtag)
+static void _aesgcm_encrypt(const struct aesgcm_ctx *ctx, u8 *dst, const u8 *src,
+			    int crypt_len, const u8 *assoc, int assoc_len,
+			    const u8 iv[GCM_AES_IV_SIZE], u8 *authtag)
 {
 	__be32 ctr[4];
 
@@ -154,6 +163,16 @@ void aesgcm_encrypt(const struct aesgcm_ctx *ctx, u8 *dst, const u8 *src,
 
 	aesgcm_crypt(ctx, dst, src, crypt_len, ctr);
 	aesgcm_mac(ctx, dst, crypt_len, assoc, assoc_len, ctr, authtag);
+}
+DEFINE_STATIC_CALL(aesgcm_encrypt, _aesgcm_encrypt);
+EXPORT_STATIC_CALL(aesgcm_encrypt);
+
+void aesgcm_encrypt(const struct aesgcm_ctx *ctx, u8 *dst, const u8 *src,
+		    int crypt_len, const u8 *assoc, int assoc_len,
+		    const u8 iv[GCM_AES_IV_SIZE], u8 *authtag)
+{
+	static_call(aesgcm_encrypt)(ctx, dst, src, crypt_len, assoc, assoc_len,
+				    iv, authtag);
 }
 EXPORT_SYMBOL(aesgcm_encrypt);
 
@@ -174,10 +193,10 @@ EXPORT_SYMBOL(aesgcm_encrypt);
  * Returns: true on success, or false if the ciphertext failed authentication.
  * On failure, no plaintext will be returned.
  */
-bool __must_check aesgcm_decrypt(const struct aesgcm_ctx *ctx, u8 *dst,
-				 const u8 *src, int crypt_len, const u8 *assoc,
-				 int assoc_len, const u8 iv[GCM_AES_IV_SIZE],
-				 const u8 *authtag)
+static bool _aesgcm_decrypt(const struct aesgcm_ctx *ctx, u8 *dst,
+			    const u8 *src, int crypt_len, const u8 *assoc,
+			    int assoc_len, const u8 iv[GCM_AES_IV_SIZE],
+			    const u8 *authtag)
 {
 	u8 tagbuf[AES_BLOCK_SIZE];
 	__be32 ctr[4];
@@ -191,6 +210,17 @@ bool __must_check aesgcm_decrypt(const struct aesgcm_ctx *ctx, u8 *dst,
 	}
 	aesgcm_crypt(ctx, dst, src, crypt_len, ctr);
 	return true;
+}
+DEFINE_STATIC_CALL(aesgcm_decrypt, _aesgcm_decrypt);
+EXPORT_STATIC_CALL(aesgcm_decrypt);
+
+bool __must_check aesgcm_decrypt(const struct aesgcm_ctx *ctx, u8 *dst,
+				 const u8 *src, int crypt_len, const u8 *assoc,
+				 int assoc_len, const u8 iv[GCM_AES_IV_SIZE],
+				 const u8 *authtag)
+{
+	return static_call(aesgcm_decrypt)(ctx, dst, src, crypt_len, assoc,
+					   assoc_len, iv, authtag);
 }
 EXPORT_SYMBOL(aesgcm_decrypt);
 
