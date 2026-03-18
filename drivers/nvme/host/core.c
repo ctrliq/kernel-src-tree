@@ -902,6 +902,15 @@ static void nvme_set_ref_tag(struct nvme_ns *ns, struct nvme_command *cmnd,
 	u32 upper, lower;
 	u64 ref48;
 
+	/* only type1 and type 2 PI formats have a reftag */
+	switch (ns->head->pi_type) {
+	case NVME_NS_DPS_PI_TYPE1:
+	case NVME_NS_DPS_PI_TYPE2:
+		break;
+	default:
+		return;
+	}
+
 	/* both rw and write zeroes share the same reftag format */
 	switch (ns->head->guard_type) {
 	case NVME_NVM_NS_16B_GUARD:
@@ -941,13 +950,7 @@ static inline blk_status_t nvme_setup_write_zeroes(struct nvme_ns *ns,
 
 	if (nvme_ns_has_pi(ns->head)) {
 		cmnd->write_zeroes.control |= cpu_to_le16(NVME_RW_PRINFO_PRACT);
-
-		switch (ns->head->pi_type) {
-		case NVME_NS_DPS_PI_TYPE1:
-		case NVME_NS_DPS_PI_TYPE2:
-			nvme_set_ref_tag(ns, cmnd, req);
-			break;
-		}
+		nvme_set_ref_tag(ns, cmnd, req);
 	}
 
 	return BLK_STS_OK;
@@ -1038,6 +1041,7 @@ static inline blk_status_t nvme_setup_rw(struct nvme_ns *ns,
 			if (WARN_ON_ONCE(!nvme_ns_has_pi(ns->head)))
 				return BLK_STS_NOTSUPP;
 			control |= NVME_RW_PRINFO_PRACT;
+			nvme_set_ref_tag(ns, cmnd, req);
 		}
 
 		if (bio_integrity_flagged(req->bio, BIP_CHECK_GUARD))
@@ -1802,12 +1806,12 @@ static void nvme_release(struct gendisk *disk)
 	nvme_ns_release(disk->private_data);
 }
 
-int nvme_getgeo(struct block_device *bdev, struct hd_geometry *geo)
+int nvme_getgeo(struct gendisk *disk, struct hd_geometry *geo)
 {
 	/* some standard values */
 	geo->heads = 1 << 6;
 	geo->sectors = 1 << 5;
-	geo->cylinders = get_capacity(bdev->bd_disk) >> 11;
+	geo->cylinders = get_capacity(disk) >> 11;
 	return 0;
 }
 
@@ -1869,8 +1873,11 @@ static bool nvme_init_integrity(struct nvme_ns_head *head,
 		break;
 	}
 
-	bi->tuple_size = head->ms;
-	bi->pi_offset = info->pi_offset;
+	bi->metadata_size = head->ms;
+	if (bi->csum_type) {
+		bi->pi_tuple_size = head->pi_size;
+		bi->pi_offset = info->pi_offset;
+	}
 	return true;
 }
 
@@ -2061,13 +2068,13 @@ static u32 nvme_max_drv_segments(struct nvme_ctrl *ctrl)
 }
 
 static void nvme_set_ctrl_limits(struct nvme_ctrl *ctrl,
-		struct queue_limits *lim)
+		struct queue_limits *lim, bool is_admin)
 {
 	lim->max_hw_sectors = ctrl->max_hw_sectors;
 	lim->max_segments = min_t(u32, USHRT_MAX,
 		min_not_zero(nvme_max_drv_segments(ctrl), ctrl->max_segments));
 	lim->max_integrity_segments = ctrl->max_integrity_segments;
-	lim->virt_boundary_mask = NVME_CTRL_PAGE_SIZE - 1;
+	lim->virt_boundary_mask = ctrl->ops->get_virt_boundary(ctrl, is_admin);
 	lim->max_segment_size = UINT_MAX;
 	lim->dma_alignment = 3;
 }
@@ -2169,7 +2176,7 @@ static int nvme_update_ns_info_generic(struct nvme_ns *ns,
 	int ret;
 
 	lim = queue_limits_start_update(ns->disk->queue);
-	nvme_set_ctrl_limits(ns->ctrl, &lim);
+	nvme_set_ctrl_limits(ns->ctrl, &lim, false);
 
 	memflags = blk_mq_freeze_queue(ns->disk->queue);
 	ret = queue_limits_commit_update(ns->disk->queue, &lim);
@@ -2373,7 +2380,7 @@ static int nvme_update_ns_info_block(struct nvme_ns *ns,
 	ns->head->lba_shift = id->lbaf[lbaf].ds;
 	ns->head->nuse = le64_to_cpu(id->nuse);
 	capacity = nvme_lba_to_sect(ns->head, le64_to_cpu(id->nsze));
-	nvme_set_ctrl_limits(ns->ctrl, &lim);
+	nvme_set_ctrl_limits(ns->ctrl, &lim, false);
 	nvme_configure_metadata(ns->ctrl, ns->head, id, nvm, info);
 	nvme_set_chunk_sectors(ns, id, &lim);
 	if (!nvme_update_disk_info(ns, id, &lim))
@@ -2407,6 +2414,17 @@ static int nvme_update_ns_info_block(struct nvme_ns *ns,
 	else
 		lim.write_stream_granularity = 0;
 
+	/*
+	 * Only set the DEAC bit if the device guarantees that reads from
+	 * deallocated data return zeroes.  While the DEAC bit does not
+	 * require that, it must be a no-op if reads from deallocated data
+	 * do not return zeroes.
+	 */
+	if ((id->dlfeat & 0x7) == 0x1 && (id->dlfeat & (1 << 3))) {
+		ns->head->features |= NVME_NS_DEAC;
+		lim.max_hw_wzeroes_unmap_sectors = lim.max_write_zeroes_sectors;
+	}
+
 	ret = queue_limits_commit_update(ns->disk->queue, &lim);
 	if (ret) {
 		blk_mq_unfreeze_queue(ns->disk->queue, memflags);
@@ -2414,15 +2432,6 @@ static int nvme_update_ns_info_block(struct nvme_ns *ns,
 	}
 
 	set_capacity_and_notify(ns->disk, capacity);
-
-	/*
-	 * Only set the DEAC bit if the device guarantees that reads from
-	 * deallocated data return zeroes.  While the DEAC bit does not
-	 * require that, it must be a no-op if reads from deallocated data
-	 * do not return zeroes.
-	 */
-	if ((id->dlfeat & 0x7) == 0x1 && (id->dlfeat & (1 << 3)))
-		ns->head->features |= NVME_NS_DEAC;
 	set_disk_ro(ns->disk, nvme_ns_is_readonly(ns, info));
 	set_bit(NVME_NS_READY, &ns->flags);
 	blk_mq_unfreeze_queue(ns->disk->queue, memflags);
@@ -2589,10 +2598,9 @@ static void nvme_configure_opal(struct nvme_ctrl *ctrl, bool was_suspended)
 
 #ifdef CONFIG_BLK_DEV_ZONED
 static int nvme_report_zones(struct gendisk *disk, sector_t sector,
-		unsigned int nr_zones, report_zones_cb cb, void *data)
+		unsigned int nr_zones, struct blk_report_zones_args *args)
 {
-	return nvme_ns_report_zones(disk->private_data, sector, nr_zones, cb,
-			data);
+	return nvme_ns_report_zones(disk->private_data, sector, nr_zones, args);
 }
 #else
 #define nvme_report_zones	NULL
@@ -3152,6 +3160,16 @@ static inline bool nvme_discovery_ctrl(struct nvme_ctrl *ctrl)
 	return ctrl->opts && ctrl->opts->discovery_nqn;
 }
 
+static inline bool nvme_admin_ctrl(struct nvme_ctrl *ctrl)
+{
+	return ctrl->cntrltype == NVME_CTRL_ADMIN;
+}
+
+static inline bool nvme_is_io_ctrl(struct nvme_ctrl *ctrl)
+{
+	return !nvme_discovery_ctrl(ctrl) && !nvme_admin_ctrl(ctrl);
+}
+
 static bool nvme_validate_cntlid(struct nvme_subsystem *subsys,
 		struct nvme_ctrl *ctrl, struct nvme_id_ctrl *id)
 {
@@ -3354,7 +3372,7 @@ static int nvme_init_non_mdts_limits(struct nvme_ctrl *ctrl)
 	else
 		ctrl->max_zeroes_sectors = 0;
 
-	if (ctrl->subsys->subtype != NVME_NQN_NVME ||
+	if (!nvme_is_io_ctrl(ctrl) ||
 	    !nvme_id_cns_ok(ctrl, NVME_ID_CNS_CS_CTRL) ||
 	    test_bit(NVME_CTRL_SKIP_ID_CNS_CS, &ctrl->flags))
 		return 0;
@@ -3476,14 +3494,14 @@ static int nvme_check_ctrl_fabric_info(struct nvme_ctrl *ctrl, struct nvme_id_ct
 		return -EINVAL;
 	}
 
-	if (!nvme_discovery_ctrl(ctrl) && ctrl->ioccsz < 4) {
+	if (nvme_is_io_ctrl(ctrl) && ctrl->ioccsz < 4) {
 		dev_err(ctrl->device,
 			"I/O queue command capsule supported size %d < 4\n",
 			ctrl->ioccsz);
 		return -EINVAL;
 	}
 
-	if (!nvme_discovery_ctrl(ctrl) && ctrl->iorcsz < 1) {
+	if (nvme_is_io_ctrl(ctrl) && ctrl->iorcsz < 1) {
 		dev_err(ctrl->device,
 			"I/O queue response capsule supported size %d < 1\n",
 			ctrl->iorcsz);
@@ -3569,7 +3587,7 @@ static int nvme_init_identify(struct nvme_ctrl *ctrl)
 		min_not_zero(ctrl->max_hw_sectors, max_hw_sectors);
 
 	lim = queue_limits_start_update(ctrl->admin_q);
-	nvme_set_ctrl_limits(ctrl, &lim);
+	nvme_set_ctrl_limits(ctrl, &lim, true);
 	ret = queue_limits_commit_update(ctrl->admin_q, &lim);
 	if (ret)
 		goto out_free;
@@ -3663,6 +3681,17 @@ int nvme_init_ctrl_finish(struct nvme_ctrl *ctrl, bool was_suspended)
 	ret = nvme_init_identify(ctrl);
 	if (ret)
 		return ret;
+
+	if (nvme_admin_ctrl(ctrl)) {
+		/*
+		 * An admin controller has one admin queue, but no I/O queues.
+		 * Override queue_count so it only creates an admin queue.
+		 */
+		dev_dbg(ctrl->device,
+			"Subsystem %s is an administrative controller",
+			ctrl->subsys->subnqn);
+		ctrl->queue_count = 1;
+	}
 
 	ret = nvme_configure_apst(ctrl);
 	if (ret < 0)
@@ -4288,7 +4317,7 @@ static void nvme_scan_ns(struct nvme_ctrl *ctrl, unsigned nsid)
 	}
 
 	/*
-	 * If available try to use the Command Set Idependent Identify Namespace
+	 * If available try to use the Command Set Independent Identify Namespace
 	 * data structure to find all the generic information that is needed to
 	 * set up a namespace.  If not fall back to the legacy version.
 	 */
@@ -4920,8 +4949,14 @@ void nvme_start_ctrl(struct nvme_ctrl *ctrl)
 	 * checking that they started once before, hence are reconnecting back.
 	 */
 	if (test_bit(NVME_CTRL_STARTED_ONCE, &ctrl->flags) &&
-	    nvme_discovery_ctrl(ctrl))
+	    nvme_discovery_ctrl(ctrl)) {
+		if (!ctrl->kato) {
+			nvme_stop_keep_alive(ctrl);
+			ctrl->kato = NVME_DEFAULT_KATO;
+			nvme_start_keep_alive(ctrl);
+		}
 		nvme_change_uevent(ctrl, "NVME_EVENT=rediscover");
+	}
 
 	if (ctrl->queue_count > 1) {
 		nvme_queue_scan(ctrl);

@@ -1052,7 +1052,7 @@ static void pkt_gather_data(struct pktcdvd_device *pd, struct packet_data *pkt)
 			continue;
 
 		bio = pkt->r_bios[f];
-		bio_init(bio, file_bdev(pd->bdev_file), bio->bi_inline_vecs, 1,
+		bio_init(bio, file_bdev(pd->bdev_file), bio_inline_vecs(bio), 1,
 			 REQ_OP_READ);
 		bio->bi_iter.bi_sector = pkt->sector + f * (CD_FRAMESIZE >> 9);
 		bio->bi_end_io = pkt_end_io_read;
@@ -1268,7 +1268,7 @@ static void pkt_start_write(struct pktcdvd_device *pd, struct packet_data *pkt)
 	struct device *ddev = disk_to_dev(pd->disk);
 	int f;
 
-	bio_init(pkt->w_bio, file_bdev(pd->bdev_file), pkt->w_bio->bi_inline_vecs,
+	bio_init(pkt->w_bio, file_bdev(pd->bdev_file), bio_inline_vecs(pkt->w_bio),
 		 pkt->frames, REQ_OP_WRITE);
 	pkt->w_bio->bi_iter.bi_sector = pkt->sector;
 	pkt->w_bio->bi_end_io = pkt_end_io_packet_write;

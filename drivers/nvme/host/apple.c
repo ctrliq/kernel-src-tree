@@ -301,8 +301,8 @@ static void apple_nvme_submit_cmd(struct apple_nvme_queue *q,
 	memcpy(&q->sqes[tag], cmd, sizeof(*cmd));
 
 	/*
-	 * This lock here doesn't make much sense at a first glace but
-	 * removing it will result in occasional missed completetion
+	 * This lock here doesn't make much sense at a first glance but
+	 * removing it will result in occasional missed completion
 	 * interrupts even though the commands still appear on the CQ.
 	 * It's unclear why this happens but our best guess is that
 	 * there is a bug in the firmware triggered when a new command
@@ -1238,6 +1238,7 @@ static const struct nvme_ctrl_ops nvme_ctrl_ops = {
 	.reg_read64 = apple_nvme_reg_read64,
 	.free_ctrl = apple_nvme_free_ctrl,
 	.get_address = apple_nvme_get_address,
+	.get_virt_boundary = nvme_get_virt_boundary,
 };
 
 static void apple_nvme_async_probe(void *data, async_cookie_t cookie)

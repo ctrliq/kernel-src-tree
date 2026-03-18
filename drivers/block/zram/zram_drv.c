@@ -234,7 +234,7 @@ static ssize_t initstate_show(struct device *dev,
 	val = init_done(zram);
 	up_read(&zram->init_lock);
 
-	return scnprintf(buf, PAGE_SIZE, "%u\n", val);
+	return sysfs_emit(buf, "%u\n", val);
 }
 
 static ssize_t disksize_show(struct device *dev,
@@ -242,7 +242,7 @@ static ssize_t disksize_show(struct device *dev,
 {
 	struct zram *zram = dev_to_zram(dev);
 
-	return scnprintf(buf, PAGE_SIZE, "%llu\n", zram->disksize);
+	return sysfs_emit(buf, "%llu\n", zram->disksize);
 }
 
 static ssize_t mem_limit_store(struct device *dev,
@@ -384,7 +384,7 @@ static ssize_t writeback_limit_enable_show(struct device *dev,
 	spin_unlock(&zram->wb_limit_lock);
 	up_read(&zram->init_lock);
 
-	return scnprintf(buf, PAGE_SIZE, "%d\n", val);
+	return sysfs_emit(buf, "%d\n", val);
 }
 
 static ssize_t writeback_limit_store(struct device *dev,
@@ -419,7 +419,7 @@ static ssize_t writeback_limit_show(struct device *dev,
 	spin_unlock(&zram->wb_limit_lock);
 	up_read(&zram->init_lock);
 
-	return scnprintf(buf, PAGE_SIZE, "%llu\n", val);
+	return sysfs_emit(buf, "%llu\n", val);
 }
 
 static void reset_bdev(struct zram *zram)
@@ -792,7 +792,7 @@ static int read_from_bdev_sync(struct zram *zram, struct page *page,
 	work.entry = entry;
 
 	INIT_WORK_ONSTACK(&work.work, zram_sync_read);
-	queue_work(system_unbound_wq, &work.work);
+	queue_work(system_dfl_wq, &work.work);
 	flush_work(&work.work);
 	destroy_work_on_stack(&work.work);
 
@@ -953,12 +953,13 @@ static void comp_algorithm_set(struct zram *zram, u32 prio, const char *alg)
 	zram->comp_algs[prio] = alg;
 }
 
-static ssize_t __comp_algorithm_show(struct zram *zram, u32 prio, char *buf)
+static ssize_t __comp_algorithm_show(struct zram *zram, u32 prio,
+				     char *buf, ssize_t at)
 {
 	ssize_t sz;
 
 	down_read(&zram->init_lock);
-	sz = zcomp_available_show(zram->comp_algs[prio], buf);
+	sz = zcomp_available_show(zram->comp_algs[prio], buf, at);
 	up_read(&zram->init_lock);
 
 	return sz;
@@ -1102,7 +1103,7 @@ static ssize_t comp_algorithm_show(struct device *dev,
 {
 	struct zram *zram = dev_to_zram(dev);
 
-	return __comp_algorithm_show(zram, ZRAM_PRIMARY_COMP, buf);
+	return __comp_algorithm_show(zram, ZRAM_PRIMARY_COMP, buf, 0);
 }
 
 static ssize_t comp_algorithm_store(struct device *dev,
@@ -1130,8 +1131,8 @@ static ssize_t recomp_algorithm_show(struct device *dev,
 		if (!zram->comp_algs[prio])
 			continue;
 
-		sz += scnprintf(buf + sz, PAGE_SIZE - sz - 2, "#%d: ", prio);
-		sz += __comp_algorithm_show(zram, prio, buf + sz);
+		sz += sysfs_emit_at(buf, sz, "#%d: ", prio);
+		sz += __comp_algorithm_show(zram, prio, buf, sz);
 	}
 
 	return sz;
@@ -1203,7 +1204,7 @@ static ssize_t io_stat_show(struct device *dev,
 	ssize_t ret;
 
 	down_read(&zram->init_lock);
-	ret = scnprintf(buf, PAGE_SIZE,
+	ret = sysfs_emit(buf,
 			"%8llu %8llu 0 %8llu\n",
 			(u64)atomic64_read(&zram->stats.failed_reads),
 			(u64)atomic64_read(&zram->stats.failed_writes),
@@ -1233,7 +1234,7 @@ static ssize_t mm_stat_show(struct device *dev,
 	orig_size = atomic64_read(&zram->stats.pages_stored);
 	max_used = atomic_long_read(&zram->stats.max_used_pages);
 
-	ret = scnprintf(buf, PAGE_SIZE,
+	ret = sysfs_emit(buf,
 			"%8llu %8llu %8llu %8lu %8ld %8llu %8lu %8llu %8llu\n",
 			orig_size << PAGE_SHIFT,
 			(u64)atomic64_read(&zram->stats.compr_data_size),
@@ -1258,8 +1259,8 @@ static ssize_t bd_stat_show(struct device *dev,
 	ssize_t ret;
 
 	down_read(&zram->init_lock);
-	ret = scnprintf(buf, PAGE_SIZE,
-		"%8llu %8llu %8llu\n",
+	ret = sysfs_emit(buf,
+			"%8llu %8llu %8llu\n",
 			FOUR_K((u64)atomic64_read(&zram->stats.bd_count)),
 			FOUR_K((u64)atomic64_read(&zram->stats.bd_reads)),
 			FOUR_K((u64)atomic64_read(&zram->stats.bd_writes)));
@@ -1277,7 +1278,7 @@ static ssize_t debug_stat_show(struct device *dev,
 	ssize_t ret;
 
 	down_read(&zram->init_lock);
-	ret = scnprintf(buf, PAGE_SIZE,
+	ret = sysfs_emit(buf,
 			"version: %d\n%8llu %8llu\n",
 			version,
 			(u64)atomic64_read(&zram->stats.writestall),
@@ -2472,7 +2473,7 @@ static ssize_t hot_add_show(const struct class *class,
 
 	if (ret < 0)
 		return ret;
-	return scnprintf(buf, PAGE_SIZE, "%d\n", ret);
+	return sysfs_emit(buf, "%d\n", ret);
 }
 /* This attribute must be set to 0400, so CLASS_ATTR_RO() can not be used */
 static struct class_attribute class_attr_hot_add =

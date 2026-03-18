@@ -1149,6 +1149,11 @@ static void sd_config_write_same(struct scsi_disk *sdkp,
 out:
 	lim->max_write_zeroes_sectors =
 		sdkp->max_ws_blocks * (logical_block_size >> SECTOR_SHIFT);
+
+	if (sdkp->zeroing_mode == SD_ZERO_WS16_UNMAP ||
+	    sdkp->zeroing_mode == SD_ZERO_WS10_UNMAP)
+		lim->max_hw_wzeroes_unmap_sectors =
+				lim->max_write_zeroes_sectors;
 }
 
 static blk_status_t sd_setup_flush_cmnd(struct scsi_cmnd *cmd)
@@ -1602,9 +1607,9 @@ static void sd_release(struct gendisk *disk)
 	scsi_device_put(sdev);
 }
 
-static int sd_getgeo(struct block_device *bdev, struct hd_geometry *geo)
+static int sd_getgeo(struct gendisk *disk, struct hd_geometry *geo)
 {
-	struct scsi_disk *sdkp = scsi_disk(bdev->bd_disk);
+	struct scsi_disk *sdkp = scsi_disk(disk);
 	struct scsi_device *sdp = sdkp->device;
 	struct Scsi_Host *host = sdp->host;
 	sector_t capacity = logical_to_sectors(sdp, sdkp->capacity);
@@ -1617,9 +1622,9 @@ static int sd_getgeo(struct block_device *bdev, struct hd_geometry *geo)
 
 	/* override with calculated, extended default, or driver values */
 	if (host->hostt->bios_param)
-		host->hostt->bios_param(sdp, bdev, capacity, diskinfo);
+		host->hostt->bios_param(sdp, disk, capacity, diskinfo);
 	else
-		scsicam_bios_param(bdev, capacity, diskinfo);
+		scsicam_bios_param(disk, capacity, diskinfo);
 
 	geo->heads = diskinfo[0];
 	geo->sectors = diskinfo[1];
@@ -1977,8 +1982,18 @@ static int sd_pr_read_keys(struct block_device *bdev, struct pr_keys *keys_info)
 {
 	int result, i, data_offset, num_copy_keys;
 	u32 num_keys = keys_info->num_keys;
-	int data_len = num_keys * 8 + 8;
+	int data_len;
 	u8 *data;
+
+	/*
+	 * Each reservation key takes 8 bytes and there is an 8-byte header
+	 * before the reservation key list. The total size must fit into the
+	 * 16-bit ALLOCATION LENGTH field.
+	 */
+	if (check_mul_overflow(num_keys, 8, &data_len) ||
+	    check_add_overflow(data_len, 8, &data_len) ||
+	    data_len > USHRT_MAX)
+		return -EINVAL;
 
 	data = kzalloc(data_len, GFP_KERNEL);
 	if (!data)

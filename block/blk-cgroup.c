@@ -110,12 +110,6 @@ static struct cgroup_subsys_state *blkcg_css(void)
 	return task_css(current, io_cgrp_id);
 }
 
-static bool blkcg_policy_enabled(struct request_queue *q,
-				 const struct blkcg_policy *pol)
-{
-	return pol && test_bit(pol->plid, q->blkcg_pols);
-}
-
 static void blkg_free_workfn(struct work_struct *work)
 {
 	struct blkcg_gq *blkg = container_of(work, struct blkcg_gq,
@@ -394,7 +388,7 @@ static struct blkcg_gq *blkg_create(struct blkcg *blkcg, struct gendisk *disk,
 
 	/* allocate */
 	if (!new_blkg) {
-		new_blkg = blkg_alloc(blkcg, disk, GFP_NOWAIT | __GFP_NOWARN);
+		new_blkg = blkg_alloc(blkcg, disk, GFP_NOWAIT);
 		if (unlikely(!new_blkg)) {
 			ret = -ENOMEM;
 			goto err_put_css;
@@ -796,7 +790,7 @@ int blkg_conf_open_bdev(struct blkg_conf_ctx *ctx)
 		return -EINVAL;
 	input = skip_spaces(input);
 
-	bdev = blkdev_get_no_open(MKDEV(major, minor));
+	bdev = blkdev_get_no_open(MKDEV(major, minor), true);
 	if (!bdev)
 		return -ENODEV;
 	if (bdev_is_partition(bdev)) {
@@ -817,8 +811,7 @@ int blkg_conf_open_bdev(struct blkg_conf_ctx *ctx)
 }
 /*
  * Similar to blkg_conf_open_bdev, but additionally freezes the queue,
- * acquires q->elevator_lock, and ensures the correct locking order
- * between q->elevator_lock and q->rq_qos_mutex.
+ * ensures the correct locking order between freeze queue and q->rq_qos_mutex.
  *
  * This function returns negative error on failure. On success it returns
  * memflags which must be saved and later passed to blkg_conf_exit_frozen
@@ -839,13 +832,11 @@ unsigned long __must_check blkg_conf_open_bdev_frozen(struct blkg_conf_ctx *ctx)
 	 * At this point, we haven’t started protecting anything related to QoS,
 	 * so we release q->rq_qos_mutex here, which was first acquired in blkg_
 	 * conf_open_bdev. Later, we re-acquire q->rq_qos_mutex after freezing
-	 * the queue and acquiring q->elevator_lock to maintain the correct
-	 * locking order.
+	 * the queue to maintain the correct locking order.
 	 */
 	mutex_unlock(&ctx->bdev->bd_queue->rq_qos_mutex);
 
 	memflags = blk_mq_freeze_queue(ctx->bdev->bd_queue);
-	mutex_lock(&ctx->bdev->bd_queue->elevator_lock);
 	mutex_lock(&ctx->bdev->bd_queue->rq_qos_mutex);
 
 	return memflags;
@@ -1000,9 +991,8 @@ void blkg_conf_exit(struct blkg_conf_ctx *ctx)
 EXPORT_SYMBOL_GPL(blkg_conf_exit);
 
 /*
- * Similar to blkg_conf_exit, but also unfreezes the queue and releases
- * q->elevator_lock. Should be used when blkg_conf_open_bdev_frozen
- * is used to open the bdev.
+ * Similar to blkg_conf_exit, but also unfreezes the queue. Should be used
+ * when blkg_conf_open_bdev_frozen is used to open the bdev.
  */
 void blkg_conf_exit_frozen(struct blkg_conf_ctx *ctx, unsigned long memflags)
 {
@@ -1010,7 +1000,6 @@ void blkg_conf_exit_frozen(struct blkg_conf_ctx *ctx, unsigned long memflags)
 		struct request_queue *q = ctx->bdev->bd_queue;
 
 		blkg_conf_exit(ctx);
-		mutex_unlock(&q->elevator_lock);
 		blk_mq_unfreeze_queue(q, memflags);
 	}
 }
@@ -1459,7 +1448,7 @@ blkcg_css_alloc(struct cgroup_subsys_state *parent_css)
 
 	spin_lock_init(&blkcg->lock);
 	refcount_set(&blkcg->online_pin, 1);
-	INIT_RADIX_TREE(&blkcg->blkg_tree, GFP_NOWAIT | __GFP_NOWARN);
+	INIT_RADIX_TREE(&blkcg->blkg_tree, GFP_NOWAIT);
 	INIT_HLIST_HEAD(&blkcg->blkg_list);
 #ifdef CONFIG_CGROUP_WRITEBACK
 	INIT_LIST_HEAD(&blkcg->cgwb_list);
@@ -1622,7 +1611,7 @@ retry:
 			pd_prealloc = NULL;
 		} else {
 			pd = pol->pd_alloc_fn(disk, blkg->blkcg,
-					      GFP_NOWAIT | __GFP_NOWARN);
+					      GFP_NOWAIT);
 		}
 
 		if (!pd) {
