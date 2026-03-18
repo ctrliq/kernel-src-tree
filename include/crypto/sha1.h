@@ -6,6 +6,7 @@
 #ifndef _CRYPTO_SHA1_H
 #define _CRYPTO_SHA1_H
 
+#include <linux/static_call_types.h>
 #include <linux/types.h>
 
 #define SHA1_DIGEST_SIZE        20
@@ -34,7 +35,9 @@ struct sha1_state {
 #define SHA1_DIGEST_WORDS	(SHA1_DIGEST_SIZE / 4)
 #define SHA1_WORKSPACE_WORDS	16
 void sha1_init_raw(__u32 *buf);
+DECLARE_STATIC_CALL(sha1_init_raw, sha1_init_raw);
 void sha1_transform(__u32 *digest, const char *data, __u32 *W);
+DECLARE_STATIC_CALL(sha1_transform, sha1_transform);
 
 /* State for the SHA-1 compression function */
 struct sha1_block_state {
@@ -62,6 +65,7 @@ struct sha1_ctx {
  * Context: Any context.
  */
 void sha1_init(struct sha1_ctx *ctx);
+DECLARE_STATIC_CALL(sha1_init, sha1_init);
 
 /**
  * sha1_update() - Update a SHA-1 context with message data
@@ -74,6 +78,7 @@ void sha1_init(struct sha1_ctx *ctx);
  * Context: Any context.
  */
 void sha1_update(struct sha1_ctx *ctx, const u8 *data, size_t len);
+DECLARE_STATIC_CALL(sha1_update, sha1_update);
 
 /**
  * sha1_final() - Finish computing a SHA-1 message digest
@@ -85,6 +90,7 @@ void sha1_update(struct sha1_ctx *ctx, const u8 *data, size_t len);
  * Context: Any context.
  */
 void sha1_final(struct sha1_ctx *ctx, u8 out[SHA1_DIGEST_SIZE]);
+DECLARE_STATIC_CALL(sha1_final, sha1_final);
 
 /**
  * sha1() - Compute SHA-1 message digest in one shot
@@ -95,6 +101,7 @@ void sha1_final(struct sha1_ctx *ctx, u8 out[SHA1_DIGEST_SIZE]);
  * Context: Any context.
  */
 void sha1(const u8 *data, size_t len, u8 out[SHA1_DIGEST_SIZE]);
+DECLARE_STATIC_CALL(sha1, sha1);
 
 /**
  * struct hmac_sha1_key - Prepared key for HMAC-SHA1
@@ -129,6 +136,7 @@ struct hmac_sha1_ctx {
  */
 void hmac_sha1_preparekey(struct hmac_sha1_key *key,
 			  const u8 *raw_key, size_t raw_key_len);
+DECLARE_STATIC_CALL(hmac_sha1_preparekey, hmac_sha1_preparekey);
 
 /**
  * hmac_sha1_init() - Initialize an HMAC-SHA1 context for a new message
@@ -140,6 +148,7 @@ void hmac_sha1_preparekey(struct hmac_sha1_key *key,
  * Context: Any context.
  */
 void hmac_sha1_init(struct hmac_sha1_ctx *ctx, const struct hmac_sha1_key *key);
+DECLARE_STATIC_CALL(hmac_sha1_init, hmac_sha1_init);
 
 /**
  * hmac_sha1_init_usingrawkey() - Initialize an HMAC-SHA1 context for a new
@@ -155,6 +164,7 @@ void hmac_sha1_init(struct hmac_sha1_ctx *ctx, const struct hmac_sha1_key *key);
  */
 void hmac_sha1_init_usingrawkey(struct hmac_sha1_ctx *ctx,
 				const u8 *raw_key, size_t raw_key_len);
+DECLARE_STATIC_CALL(hmac_sha1_init_usingrawkey, hmac_sha1_init_usingrawkey);
 
 /**
  * hmac_sha1_update() - Update an HMAC-SHA1 context with message data
@@ -182,6 +192,7 @@ static inline void hmac_sha1_update(struct hmac_sha1_ctx *ctx,
  * Context: Any context.
  */
 void hmac_sha1_final(struct hmac_sha1_ctx *ctx, u8 out[SHA1_DIGEST_SIZE]);
+DECLARE_STATIC_CALL(hmac_sha1_final, hmac_sha1_final);
 
 /**
  * hmac_sha1() - Compute HMAC-SHA1 in one shot, using a prepared key
@@ -196,6 +207,7 @@ void hmac_sha1_final(struct hmac_sha1_ctx *ctx, u8 out[SHA1_DIGEST_SIZE]);
  */
 void hmac_sha1(const struct hmac_sha1_key *key,
 	       const u8 *data, size_t data_len, u8 out[SHA1_DIGEST_SIZE]);
+DECLARE_STATIC_CALL(hmac_sha1, hmac_sha1);
 
 /**
  * hmac_sha1_usingrawkey() - Compute HMAC-SHA1 in one shot, using a raw key
@@ -213,5 +225,6 @@ void hmac_sha1(const struct hmac_sha1_key *key,
 void hmac_sha1_usingrawkey(const u8 *raw_key, size_t raw_key_len,
 			   const u8 *data, size_t data_len,
 			   u8 out[SHA1_DIGEST_SIZE]);
+DECLARE_STATIC_CALL(hmac_sha1_usingrawkey, hmac_sha1_usingrawkey);
 
 #endif /* _CRYPTO_SHA1_H */

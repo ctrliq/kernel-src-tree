@@ -9,6 +9,7 @@
 #include <linux/export.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/static_call.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
 #include <linux/wordpart.h>
@@ -87,7 +88,7 @@ static const struct sha1_block_state sha1_iv = {
  * to clear the workspace. This is left to the caller to avoid
  * unnecessary clears between chained hashing operations.
  */
-void sha1_transform(__u32 *digest, const char *data, __u32 *array)
+static void _sha1_transform(__u32 *digest, const char *data, __u32 *array)
 {
 	__u32 A, B, C, D, E;
 	unsigned int i = 0;
@@ -124,19 +125,38 @@ void sha1_transform(__u32 *digest, const char *data, __u32 *array)
 	digest[3] += D;
 	digest[4] += E;
 }
+DEFINE_STATIC_CALL(sha1_transform, _sha1_transform);
+EXPORT_STATIC_CALL(sha1_transform);
+
+void sha1_transform(__u32 *digest, const char *data, __u32 *array)
+{
+	static_call(sha1_transform)(digest, data, array);
+}
 EXPORT_SYMBOL(sha1_transform);
 
 /**
  * sha1_init_raw - initialize the vectors for a SHA1 digest
  * @buf: vector to initialize
+ *
+ * Renamed to _sha1_init_raw to serve as the default target of the
+ * sha1_init_raw static_call.  The public sha1_init_raw() wrapper dispatches
+ * through that static_call, allowing a module to substitute a validated
+ * implementation at runtime via static_call_update(sha1_init_raw, ...).
  */
-void sha1_init_raw(__u32 *buf)
+static void _sha1_init_raw(__u32 *buf)
 {
 	buf[0] = 0x67452301;
 	buf[1] = 0xefcdab89;
 	buf[2] = 0x98badcfe;
 	buf[3] = 0x10325476;
 	buf[4] = 0xc3d2e1f0;
+}
+DEFINE_STATIC_CALL(sha1_init_raw, _sha1_init_raw);
+EXPORT_STATIC_CALL(sha1_init_raw);
+
+void sha1_init_raw(__u32 *buf)
+{
+	static_call(sha1_init_raw)(buf);
 }
 EXPORT_SYMBOL(sha1_init_raw);
 
@@ -159,14 +179,21 @@ static void __maybe_unused sha1_blocks_generic(struct sha1_block_state *state,
 #define sha1_blocks sha1_blocks_generic
 #endif
 
-void sha1_init(struct sha1_ctx *ctx)
+static void _sha1_init(struct sha1_ctx *ctx)
 {
 	ctx->state = sha1_iv;
 	ctx->bytecount = 0;
 }
+DEFINE_STATIC_CALL(sha1_init, _sha1_init);
+EXPORT_STATIC_CALL_GPL(sha1_init);
+
+void sha1_init(struct sha1_ctx *ctx)
+{
+	static_call(sha1_init)(ctx);
+}
 EXPORT_SYMBOL_GPL(sha1_init);
 
-void sha1_update(struct sha1_ctx *ctx, const u8 *data, size_t len)
+static void _sha1_update(struct sha1_ctx *ctx, const u8 *data, size_t len)
 {
 	size_t partial = ctx->bytecount % SHA1_BLOCK_SIZE;
 
@@ -197,6 +224,13 @@ void sha1_update(struct sha1_ctx *ctx, const u8 *data, size_t len)
 	if (len)
 		memcpy(&ctx->buf[partial], data, len);
 }
+DEFINE_STATIC_CALL(sha1_update, _sha1_update);
+EXPORT_STATIC_CALL_GPL(sha1_update);
+
+void sha1_update(struct sha1_ctx *ctx, const u8 *data, size_t len)
+{
+	static_call(sha1_update)(ctx, data, len);
+}
 EXPORT_SYMBOL_GPL(sha1_update);
 
 static void __sha1_final(struct sha1_ctx *ctx, u8 out[SHA1_DIGEST_SIZE])
@@ -218,20 +252,34 @@ static void __sha1_final(struct sha1_ctx *ctx, u8 out[SHA1_DIGEST_SIZE])
 		put_unaligned_be32(ctx->state.h[i / 4], out + i);
 }
 
-void sha1_final(struct sha1_ctx *ctx, u8 out[SHA1_DIGEST_SIZE])
+static void _sha1_final(struct sha1_ctx *ctx, u8 out[SHA1_DIGEST_SIZE])
 {
 	__sha1_final(ctx, out);
 	memzero_explicit(ctx, sizeof(*ctx));
 }
+DEFINE_STATIC_CALL(sha1_final, _sha1_final);
+EXPORT_STATIC_CALL_GPL(sha1_final);
+
+void sha1_final(struct sha1_ctx *ctx, u8 out[SHA1_DIGEST_SIZE])
+{
+	static_call(sha1_final)(ctx, out);
+}
 EXPORT_SYMBOL_GPL(sha1_final);
 
-void sha1(const u8 *data, size_t len, u8 out[SHA1_DIGEST_SIZE])
+static void _sha1(const u8 *data, size_t len, u8 out[SHA1_DIGEST_SIZE])
 {
 	struct sha1_ctx ctx;
 
 	sha1_init(&ctx);
 	sha1_update(&ctx, data, len);
 	sha1_final(&ctx, out);
+}
+DEFINE_STATIC_CALL(sha1, _sha1);
+EXPORT_STATIC_CALL_GPL(sha1);
+
+void sha1(const u8 *data, size_t len, u8 out[SHA1_DIGEST_SIZE])
+{
+	static_call(sha1)(data, len, out);
 }
 EXPORT_SYMBOL_GPL(sha1);
 
@@ -263,32 +311,56 @@ static void __hmac_sha1_preparekey(struct sha1_block_state *istate,
 	memzero_explicit(&derived_key, sizeof(derived_key));
 }
 
-void hmac_sha1_preparekey(struct hmac_sha1_key *key,
-			  const u8 *raw_key, size_t raw_key_len)
+static void _hmac_sha1_preparekey(struct hmac_sha1_key *key,
+				  const u8 *raw_key, size_t raw_key_len)
 {
 	__hmac_sha1_preparekey(&key->istate, &key->ostate,
 			       raw_key, raw_key_len);
 }
+DEFINE_STATIC_CALL(hmac_sha1_preparekey, _hmac_sha1_preparekey);
+EXPORT_STATIC_CALL_GPL(hmac_sha1_preparekey);
+
+void hmac_sha1_preparekey(struct hmac_sha1_key *key,
+			  const u8 *raw_key, size_t raw_key_len)
+{
+	static_call(hmac_sha1_preparekey)(key, raw_key, raw_key_len);
+}
 EXPORT_SYMBOL_GPL(hmac_sha1_preparekey);
 
-void hmac_sha1_init(struct hmac_sha1_ctx *ctx, const struct hmac_sha1_key *key)
+static void _hmac_sha1_init(struct hmac_sha1_ctx *ctx,
+			    const struct hmac_sha1_key *key)
 {
 	ctx->sha_ctx.state = key->istate;
 	ctx->sha_ctx.bytecount = SHA1_BLOCK_SIZE;
 	ctx->ostate = key->ostate;
 }
+DEFINE_STATIC_CALL(hmac_sha1_init, _hmac_sha1_init);
+EXPORT_STATIC_CALL_GPL(hmac_sha1_init);
+
+void hmac_sha1_init(struct hmac_sha1_ctx *ctx, const struct hmac_sha1_key *key)
+{
+	static_call(hmac_sha1_init)(ctx, key);
+}
 EXPORT_SYMBOL_GPL(hmac_sha1_init);
 
-void hmac_sha1_init_usingrawkey(struct hmac_sha1_ctx *ctx,
-				const u8 *raw_key, size_t raw_key_len)
+static void _hmac_sha1_init_usingrawkey(struct hmac_sha1_ctx *ctx,
+					const u8 *raw_key, size_t raw_key_len)
 {
 	__hmac_sha1_preparekey(&ctx->sha_ctx.state, &ctx->ostate,
 			       raw_key, raw_key_len);
 	ctx->sha_ctx.bytecount = SHA1_BLOCK_SIZE;
 }
+DEFINE_STATIC_CALL(hmac_sha1_init_usingrawkey, _hmac_sha1_init_usingrawkey);
+EXPORT_STATIC_CALL_GPL(hmac_sha1_init_usingrawkey);
+
+void hmac_sha1_init_usingrawkey(struct hmac_sha1_ctx *ctx,
+				const u8 *raw_key, size_t raw_key_len)
+{
+	static_call(hmac_sha1_init_usingrawkey)(ctx, raw_key, raw_key_len);
+}
 EXPORT_SYMBOL_GPL(hmac_sha1_init_usingrawkey);
 
-void hmac_sha1_final(struct hmac_sha1_ctx *ctx, u8 out[SHA1_DIGEST_SIZE])
+static void _hmac_sha1_final(struct hmac_sha1_ctx *ctx, u8 out[SHA1_DIGEST_SIZE])
 {
 	/* Generate the padded input for the outer hash in ctx->sha_ctx.buf. */
 	__sha1_final(&ctx->sha_ctx, ctx->sha_ctx.buf);
@@ -305,10 +377,17 @@ void hmac_sha1_final(struct hmac_sha1_ctx *ctx, u8 out[SHA1_DIGEST_SIZE])
 
 	memzero_explicit(ctx, sizeof(*ctx));
 }
+DEFINE_STATIC_CALL(hmac_sha1_final, _hmac_sha1_final);
+EXPORT_STATIC_CALL_GPL(hmac_sha1_final);
+
+void hmac_sha1_final(struct hmac_sha1_ctx *ctx, u8 out[SHA1_DIGEST_SIZE])
+{
+	static_call(hmac_sha1_final)(ctx, out);
+}
 EXPORT_SYMBOL_GPL(hmac_sha1_final);
 
-void hmac_sha1(const struct hmac_sha1_key *key,
-	       const u8 *data, size_t data_len, u8 out[SHA1_DIGEST_SIZE])
+static void _hmac_sha1(const struct hmac_sha1_key *key,
+		       const u8 *data, size_t data_len, u8 out[SHA1_DIGEST_SIZE])
 {
 	struct hmac_sha1_ctx ctx;
 
@@ -316,17 +395,35 @@ void hmac_sha1(const struct hmac_sha1_key *key,
 	hmac_sha1_update(&ctx, data, data_len);
 	hmac_sha1_final(&ctx, out);
 }
+DEFINE_STATIC_CALL(hmac_sha1, _hmac_sha1);
+EXPORT_STATIC_CALL_GPL(hmac_sha1);
+
+void hmac_sha1(const struct hmac_sha1_key *key,
+	       const u8 *data, size_t data_len, u8 out[SHA1_DIGEST_SIZE])
+{
+	static_call(hmac_sha1)(key, data, data_len, out);
+}
 EXPORT_SYMBOL_GPL(hmac_sha1);
 
-void hmac_sha1_usingrawkey(const u8 *raw_key, size_t raw_key_len,
-			   const u8 *data, size_t data_len,
-			   u8 out[SHA1_DIGEST_SIZE])
+static void _hmac_sha1_usingrawkey(const u8 *raw_key, size_t raw_key_len,
+				   const u8 *data, size_t data_len,
+				   u8 out[SHA1_DIGEST_SIZE])
 {
 	struct hmac_sha1_ctx ctx;
 
 	hmac_sha1_init_usingrawkey(&ctx, raw_key, raw_key_len);
 	hmac_sha1_update(&ctx, data, data_len);
 	hmac_sha1_final(&ctx, out);
+}
+DEFINE_STATIC_CALL(hmac_sha1_usingrawkey, _hmac_sha1_usingrawkey);
+EXPORT_STATIC_CALL_GPL(hmac_sha1_usingrawkey);
+
+void hmac_sha1_usingrawkey(const u8 *raw_key, size_t raw_key_len,
+			   const u8 *data, size_t data_len,
+			   u8 out[SHA1_DIGEST_SIZE])
+{
+	static_call(hmac_sha1_usingrawkey)(raw_key, raw_key_len, data,
+					   data_len, out);
 }
 EXPORT_SYMBOL_GPL(hmac_sha1_usingrawkey);
 
