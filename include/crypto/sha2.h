@@ -559,6 +559,7 @@ struct __sha512_ctx {
 	u8 buf[SHA512_BLOCK_SIZE] __aligned(__alignof__(__be64));
 };
 void __sha512_update(struct __sha512_ctx *ctx, const u8 *data, size_t len);
+DECLARE_STATIC_CALL(__sha512_update, __sha512_update);
 
 /*
  * HMAC key and message context structs, shared by HMAC-SHA384 and HMAC-SHA512.
@@ -575,6 +576,7 @@ struct __hmac_sha512_ctx {
 };
 void __hmac_sha512_init(struct __hmac_sha512_ctx *ctx,
 			const struct __hmac_sha512_key *key);
+DECLARE_STATIC_CALL(__hmac_sha512_init, __hmac_sha512_init);
 
 /**
  * struct sha384_ctx - Context for hashing a message with SHA-384
@@ -593,6 +595,7 @@ struct sha384_ctx {
  * Context: Any context.
  */
 void sha384_init(struct sha384_ctx *ctx);
+DECLARE_STATIC_CALL(sha384_init, sha384_init);
 
 /**
  * sha384_update() - Update a SHA-384 context with message data
@@ -620,6 +623,7 @@ static inline void sha384_update(struct sha384_ctx *ctx,
  * Context: Any context.
  */
 void sha384_final(struct sha384_ctx *ctx, u8 out[SHA384_DIGEST_SIZE]);
+DECLARE_STATIC_CALL(sha384_final, sha384_final);
 
 /**
  * sha384() - Compute SHA-384 message digest in one shot
@@ -630,6 +634,7 @@ void sha384_final(struct sha384_ctx *ctx, u8 out[SHA384_DIGEST_SIZE]);
  * Context: Any context.
  */
 void sha384(const u8 *data, size_t len, u8 out[SHA384_DIGEST_SIZE]);
+DECLARE_STATIC_CALL(sha384, sha384);
 
 /**
  * struct hmac_sha384_key - Prepared key for HMAC-SHA384
@@ -660,6 +665,7 @@ struct hmac_sha384_ctx {
  */
 void hmac_sha384_preparekey(struct hmac_sha384_key *key,
 			    const u8 *raw_key, size_t raw_key_len);
+DECLARE_STATIC_CALL(hmac_sha384_preparekey, hmac_sha384_preparekey);
 
 /**
  * hmac_sha384_init() - Initialize an HMAC-SHA384 context for a new message
@@ -690,6 +696,7 @@ static inline void hmac_sha384_init(struct hmac_sha384_ctx *ctx,
  */
 void hmac_sha384_init_usingrawkey(struct hmac_sha384_ctx *ctx,
 				  const u8 *raw_key, size_t raw_key_len);
+DECLARE_STATIC_CALL(hmac_sha384_init_usingrawkey, hmac_sha384_init_usingrawkey);
 
 /**
  * hmac_sha384_update() - Update an HMAC-SHA384 context with message data
@@ -717,6 +724,7 @@ static inline void hmac_sha384_update(struct hmac_sha384_ctx *ctx,
  * Context: Any context.
  */
 void hmac_sha384_final(struct hmac_sha384_ctx *ctx, u8 out[SHA384_DIGEST_SIZE]);
+DECLARE_STATIC_CALL(hmac_sha384_final, hmac_sha384_final);
 
 /**
  * hmac_sha384() - Compute HMAC-SHA384 in one shot, using a prepared key
@@ -731,6 +739,7 @@ void hmac_sha384_final(struct hmac_sha384_ctx *ctx, u8 out[SHA384_DIGEST_SIZE]);
  */
 void hmac_sha384(const struct hmac_sha384_key *key,
 		 const u8 *data, size_t data_len, u8 out[SHA384_DIGEST_SIZE]);
+DECLARE_STATIC_CALL(hmac_sha384, hmac_sha384);
 
 /**
  * hmac_sha384_usingrawkey() - Compute HMAC-SHA384 in one shot, using a raw key
@@ -748,6 +757,7 @@ void hmac_sha384(const struct hmac_sha384_key *key,
 void hmac_sha384_usingrawkey(const u8 *raw_key, size_t raw_key_len,
 			     const u8 *data, size_t data_len,
 			     u8 out[SHA384_DIGEST_SIZE]);
+DECLARE_STATIC_CALL(hmac_sha384_usingrawkey, hmac_sha384_usingrawkey);
 
 /**
  * struct sha512_ctx - Context for hashing a message with SHA-512
@@ -766,6 +776,7 @@ struct sha512_ctx {
  * Context: Any context.
  */
 void sha512_init(struct sha512_ctx *ctx);
+DECLARE_STATIC_CALL(sha512_init, sha512_init);
 
 /**
  * sha512_update() - Update a SHA-512 context with message data
@@ -793,6 +804,7 @@ static inline void sha512_update(struct sha512_ctx *ctx,
  * Context: Any context.
  */
 void sha512_final(struct sha512_ctx *ctx, u8 out[SHA512_DIGEST_SIZE]);
+DECLARE_STATIC_CALL(sha512_final, sha512_final);
 
 /**
  * sha512() - Compute SHA-512 message digest in one shot
@@ -803,6 +815,7 @@ void sha512_final(struct sha512_ctx *ctx, u8 out[SHA512_DIGEST_SIZE]);
  * Context: Any context.
  */
 void sha512(const u8 *data, size_t len, u8 out[SHA512_DIGEST_SIZE]);
+DECLARE_STATIC_CALL(sha512, sha512);
 
 /**
  * struct hmac_sha512_key - Prepared key for HMAC-SHA512
@@ -833,6 +846,7 @@ struct hmac_sha512_ctx {
  */
 void hmac_sha512_preparekey(struct hmac_sha512_key *key,
 			    const u8 *raw_key, size_t raw_key_len);
+DECLARE_STATIC_CALL(hmac_sha512_preparekey, hmac_sha512_preparekey);
 
 /**
  * hmac_sha512_init() - Initialize an HMAC-SHA512 context for a new message
@@ -863,6 +877,7 @@ static inline void hmac_sha512_init(struct hmac_sha512_ctx *ctx,
  */
 void hmac_sha512_init_usingrawkey(struct hmac_sha512_ctx *ctx,
 				  const u8 *raw_key, size_t raw_key_len);
+DECLARE_STATIC_CALL(hmac_sha512_init_usingrawkey, hmac_sha512_init_usingrawkey);
 
 /**
  * hmac_sha512_update() - Update an HMAC-SHA512 context with message data
@@ -890,6 +905,7 @@ static inline void hmac_sha512_update(struct hmac_sha512_ctx *ctx,
  * Context: Any context.
  */
 void hmac_sha512_final(struct hmac_sha512_ctx *ctx, u8 out[SHA512_DIGEST_SIZE]);
+DECLARE_STATIC_CALL(hmac_sha512_final, hmac_sha512_final);
 
 /**
  * hmac_sha512() - Compute HMAC-SHA512 in one shot, using a prepared key
@@ -904,6 +920,7 @@ void hmac_sha512_final(struct hmac_sha512_ctx *ctx, u8 out[SHA512_DIGEST_SIZE]);
  */
 void hmac_sha512(const struct hmac_sha512_key *key,
 		 const u8 *data, size_t data_len, u8 out[SHA512_DIGEST_SIZE]);
+DECLARE_STATIC_CALL(hmac_sha512, hmac_sha512);
 
 /**
  * hmac_sha512_usingrawkey() - Compute HMAC-SHA512 in one shot, using a raw key
@@ -921,5 +938,6 @@ void hmac_sha512(const struct hmac_sha512_key *key,
 void hmac_sha512_usingrawkey(const u8 *raw_key, size_t raw_key_len,
 			     const u8 *data, size_t data_len,
 			     u8 out[SHA512_DIGEST_SIZE]);
+DECLARE_STATIC_CALL(hmac_sha512_usingrawkey, hmac_sha512_usingrawkey);
 
 #endif /* _CRYPTO_SHA2_H */

@@ -14,6 +14,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/overflow.h>
+#include <linux/static_call.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
 #include <linux/wordpart.h>
@@ -147,19 +148,33 @@ static void __sha512_init(struct __sha512_ctx *ctx,
 	ctx->bytecount_hi = 0;
 }
 
-void sha384_init(struct sha384_ctx *ctx)
+static void _sha384_init(struct sha384_ctx *ctx)
 {
 	__sha512_init(&ctx->ctx, &sha384_iv, 0);
 }
+DEFINE_STATIC_CALL(sha384_init, _sha384_init);
+EXPORT_STATIC_CALL_GPL(sha384_init);
+
+void sha384_init(struct sha384_ctx *ctx)
+{
+	static_call(sha384_init)(ctx);
+}
 EXPORT_SYMBOL_GPL(sha384_init);
 
-void sha512_init(struct sha512_ctx *ctx)
+static void _sha512_init(struct sha512_ctx *ctx)
 {
 	__sha512_init(&ctx->ctx, &sha512_iv, 0);
 }
+DEFINE_STATIC_CALL(sha512_init, _sha512_init);
+EXPORT_STATIC_CALL_GPL(sha512_init);
+
+void sha512_init(struct sha512_ctx *ctx)
+{
+	static_call(sha512_init)(ctx);
+}
 EXPORT_SYMBOL_GPL(sha512_init);
 
-void __sha512_update(struct __sha512_ctx *ctx, const u8 *data, size_t len)
+static void ___sha512_update(struct __sha512_ctx *ctx, const u8 *data, size_t len)
 {
 	size_t partial = ctx->bytecount_lo % SHA512_BLOCK_SIZE;
 
@@ -191,6 +206,13 @@ void __sha512_update(struct __sha512_ctx *ctx, const u8 *data, size_t len)
 	if (len)
 		memcpy(&ctx->buf[partial], data, len);
 }
+DEFINE_STATIC_CALL(__sha512_update, ___sha512_update);
+EXPORT_STATIC_CALL_GPL(__sha512_update);
+
+void __sha512_update(struct __sha512_ctx *ctx, const u8 *data, size_t len)
+{
+	static_call(__sha512_update)(ctx, data, len);
+}
 EXPORT_SYMBOL_GPL(__sha512_update);
 
 static void __sha512_final(struct __sha512_ctx *ctx,
@@ -215,21 +237,35 @@ static void __sha512_final(struct __sha512_ctx *ctx,
 		put_unaligned_be64(ctx->state.h[i / 8], out + i);
 }
 
-void sha384_final(struct sha384_ctx *ctx, u8 out[SHA384_DIGEST_SIZE])
+static void _sha384_final(struct sha384_ctx *ctx, u8 out[SHA384_DIGEST_SIZE])
 {
 	__sha512_final(&ctx->ctx, out, SHA384_DIGEST_SIZE);
 	memzero_explicit(ctx, sizeof(*ctx));
 }
+DEFINE_STATIC_CALL(sha384_final, _sha384_final);
+EXPORT_STATIC_CALL_GPL(sha384_final);
+
+void sha384_final(struct sha384_ctx *ctx, u8 out[SHA384_DIGEST_SIZE])
+{
+	static_call(sha384_final)(ctx, out);
+}
 EXPORT_SYMBOL_GPL(sha384_final);
 
-void sha512_final(struct sha512_ctx *ctx, u8 out[SHA512_DIGEST_SIZE])
+static void _sha512_final(struct sha512_ctx *ctx, u8 out[SHA512_DIGEST_SIZE])
 {
 	__sha512_final(&ctx->ctx, out, SHA512_DIGEST_SIZE);
 	memzero_explicit(ctx, sizeof(*ctx));
 }
+DEFINE_STATIC_CALL(sha512_final, _sha512_final);
+EXPORT_STATIC_CALL_GPL(sha512_final);
+
+void sha512_final(struct sha512_ctx *ctx, u8 out[SHA512_DIGEST_SIZE])
+{
+	static_call(sha512_final)(ctx, out);
+}
 EXPORT_SYMBOL_GPL(sha512_final);
 
-void sha384(const u8 *data, size_t len, u8 out[SHA384_DIGEST_SIZE])
+static void _sha384(const u8 *data, size_t len, u8 out[SHA384_DIGEST_SIZE])
 {
 	struct sha384_ctx ctx;
 
@@ -237,15 +273,29 @@ void sha384(const u8 *data, size_t len, u8 out[SHA384_DIGEST_SIZE])
 	sha384_update(&ctx, data, len);
 	sha384_final(&ctx, out);
 }
+DEFINE_STATIC_CALL(sha384, _sha384);
+EXPORT_STATIC_CALL_GPL(sha384);
+
+void sha384(const u8 *data, size_t len, u8 out[SHA384_DIGEST_SIZE])
+{
+	static_call(sha384)(data, len, out);
+}
 EXPORT_SYMBOL_GPL(sha384);
 
-void sha512(const u8 *data, size_t len, u8 out[SHA512_DIGEST_SIZE])
+static void _sha512(const u8 *data, size_t len, u8 out[SHA512_DIGEST_SIZE])
 {
 	struct sha512_ctx ctx;
 
 	sha512_init(&ctx);
 	sha512_update(&ctx, data, len);
 	sha512_final(&ctx, out);
+}
+DEFINE_STATIC_CALL(sha512, _sha512);
+EXPORT_STATIC_CALL_GPL(sha512);
+
+void sha512(const u8 *data, size_t len, u8 out[SHA512_DIGEST_SIZE])
+{
+	static_call(sha512)(data, len, out);
 }
 EXPORT_SYMBOL_GPL(sha512);
 
@@ -282,47 +332,87 @@ static void __hmac_sha512_preparekey(struct sha512_block_state *istate,
 	memzero_explicit(&derived_key, sizeof(derived_key));
 }
 
-void hmac_sha384_preparekey(struct hmac_sha384_key *key,
-			    const u8 *raw_key, size_t raw_key_len)
+static void _hmac_sha384_preparekey(struct hmac_sha384_key *key,
+				    const u8 *raw_key, size_t raw_key_len)
 {
 	__hmac_sha512_preparekey(&key->key.istate, &key->key.ostate,
 				 raw_key, raw_key_len, &sha384_iv);
 }
+DEFINE_STATIC_CALL(hmac_sha384_preparekey, _hmac_sha384_preparekey);
+EXPORT_STATIC_CALL_GPL(hmac_sha384_preparekey);
+
+void hmac_sha384_preparekey(struct hmac_sha384_key *key,
+			    const u8 *raw_key, size_t raw_key_len)
+{
+	static_call(hmac_sha384_preparekey)(key, raw_key, raw_key_len);
+}
 EXPORT_SYMBOL_GPL(hmac_sha384_preparekey);
+
+static void _hmac_sha512_preparekey(struct hmac_sha512_key *key,
+				    const u8 *raw_key, size_t raw_key_len)
+{
+	__hmac_sha512_preparekey(&key->key.istate, &key->key.ostate,
+				 raw_key, raw_key_len, &sha512_iv);
+}
+DEFINE_STATIC_CALL(hmac_sha512_preparekey, _hmac_sha512_preparekey);
+EXPORT_STATIC_CALL_GPL(hmac_sha512_preparekey);
 
 void hmac_sha512_preparekey(struct hmac_sha512_key *key,
 			    const u8 *raw_key, size_t raw_key_len)
 {
-	__hmac_sha512_preparekey(&key->key.istate, &key->key.ostate,
-				 raw_key, raw_key_len, &sha512_iv);
+	static_call(hmac_sha512_preparekey)(key, raw_key, raw_key_len);
 }
 EXPORT_SYMBOL_GPL(hmac_sha512_preparekey);
 
-void __hmac_sha512_init(struct __hmac_sha512_ctx *ctx,
-			const struct __hmac_sha512_key *key)
+static void ___hmac_sha512_init(struct __hmac_sha512_ctx *ctx,
+				const struct __hmac_sha512_key *key)
 {
 	__sha512_init(&ctx->sha_ctx, &key->istate, SHA512_BLOCK_SIZE);
 	ctx->ostate = key->ostate;
 }
+DEFINE_STATIC_CALL(__hmac_sha512_init, ___hmac_sha512_init);
+EXPORT_STATIC_CALL_GPL(__hmac_sha512_init);
+
+void __hmac_sha512_init(struct __hmac_sha512_ctx *ctx,
+			const struct __hmac_sha512_key *key)
+{
+	static_call(__hmac_sha512_init)(ctx, key);
+}
 EXPORT_SYMBOL_GPL(__hmac_sha512_init);
 
-void hmac_sha384_init_usingrawkey(struct hmac_sha384_ctx *ctx,
-				  const u8 *raw_key, size_t raw_key_len)
+static void _hmac_sha384_init_usingrawkey(struct hmac_sha384_ctx *ctx,
+					  const u8 *raw_key, size_t raw_key_len)
 {
 	__hmac_sha512_preparekey(&ctx->ctx.sha_ctx.state, &ctx->ctx.ostate,
 				 raw_key, raw_key_len, &sha384_iv);
 	ctx->ctx.sha_ctx.bytecount_lo = SHA512_BLOCK_SIZE;
 	ctx->ctx.sha_ctx.bytecount_hi = 0;
 }
+DEFINE_STATIC_CALL(hmac_sha384_init_usingrawkey, _hmac_sha384_init_usingrawkey);
+EXPORT_STATIC_CALL_GPL(hmac_sha384_init_usingrawkey);
+
+void hmac_sha384_init_usingrawkey(struct hmac_sha384_ctx *ctx,
+				  const u8 *raw_key, size_t raw_key_len)
+{
+	static_call(hmac_sha384_init_usingrawkey)(ctx, raw_key, raw_key_len);
+}
 EXPORT_SYMBOL_GPL(hmac_sha384_init_usingrawkey);
 
-void hmac_sha512_init_usingrawkey(struct hmac_sha512_ctx *ctx,
-				  const u8 *raw_key, size_t raw_key_len)
+static void _hmac_sha512_init_usingrawkey(struct hmac_sha512_ctx *ctx,
+					  const u8 *raw_key, size_t raw_key_len)
 {
 	__hmac_sha512_preparekey(&ctx->ctx.sha_ctx.state, &ctx->ctx.ostate,
 				 raw_key, raw_key_len, &sha512_iv);
 	ctx->ctx.sha_ctx.bytecount_lo = SHA512_BLOCK_SIZE;
 	ctx->ctx.sha_ctx.bytecount_hi = 0;
+}
+DEFINE_STATIC_CALL(hmac_sha512_init_usingrawkey, _hmac_sha512_init_usingrawkey);
+EXPORT_STATIC_CALL_GPL(hmac_sha512_init_usingrawkey);
+
+void hmac_sha512_init_usingrawkey(struct hmac_sha512_ctx *ctx,
+				  const u8 *raw_key, size_t raw_key_len)
+{
+	static_call(hmac_sha512_init_usingrawkey)(ctx, raw_key, raw_key_len);
 }
 EXPORT_SYMBOL_GPL(hmac_sha512_init_usingrawkey);
 
@@ -345,22 +435,39 @@ static void __hmac_sha512_final(struct __hmac_sha512_ctx *ctx,
 	memzero_explicit(ctx, sizeof(*ctx));
 }
 
-void hmac_sha384_final(struct hmac_sha384_ctx *ctx,
-		       u8 out[SHA384_DIGEST_SIZE])
+static void _hmac_sha384_final(struct hmac_sha384_ctx *ctx,
+			       u8 out[SHA384_DIGEST_SIZE])
 {
 	__hmac_sha512_final(&ctx->ctx, out, SHA384_DIGEST_SIZE);
 }
+DEFINE_STATIC_CALL(hmac_sha384_final, _hmac_sha384_final);
+EXPORT_STATIC_CALL_GPL(hmac_sha384_final);
+
+void hmac_sha384_final(struct hmac_sha384_ctx *ctx,
+		       u8 out[SHA384_DIGEST_SIZE])
+{
+	static_call(hmac_sha384_final)(ctx, out);
+}
 EXPORT_SYMBOL_GPL(hmac_sha384_final);
+
+static void _hmac_sha512_final(struct hmac_sha512_ctx *ctx,
+			       u8 out[SHA512_DIGEST_SIZE])
+{
+	__hmac_sha512_final(&ctx->ctx, out, SHA512_DIGEST_SIZE);
+}
+DEFINE_STATIC_CALL(hmac_sha512_final, _hmac_sha512_final);
+EXPORT_STATIC_CALL_GPL(hmac_sha512_final);
 
 void hmac_sha512_final(struct hmac_sha512_ctx *ctx,
 		       u8 out[SHA512_DIGEST_SIZE])
 {
-	__hmac_sha512_final(&ctx->ctx, out, SHA512_DIGEST_SIZE);
+	static_call(hmac_sha512_final)(ctx, out);
 }
 EXPORT_SYMBOL_GPL(hmac_sha512_final);
 
-void hmac_sha384(const struct hmac_sha384_key *key,
-		 const u8 *data, size_t data_len, u8 out[SHA384_DIGEST_SIZE])
+static void _hmac_sha384(const struct hmac_sha384_key *key,
+			 const u8 *data, size_t data_len,
+			 u8 out[SHA384_DIGEST_SIZE])
 {
 	struct hmac_sha384_ctx ctx;
 
@@ -368,10 +475,19 @@ void hmac_sha384(const struct hmac_sha384_key *key,
 	hmac_sha384_update(&ctx, data, data_len);
 	hmac_sha384_final(&ctx, out);
 }
+DEFINE_STATIC_CALL(hmac_sha384, _hmac_sha384);
+EXPORT_STATIC_CALL_GPL(hmac_sha384);
+
+void hmac_sha384(const struct hmac_sha384_key *key,
+		 const u8 *data, size_t data_len, u8 out[SHA384_DIGEST_SIZE])
+{
+	static_call(hmac_sha384)(key, data, data_len, out);
+}
 EXPORT_SYMBOL_GPL(hmac_sha384);
 
-void hmac_sha512(const struct hmac_sha512_key *key,
-		 const u8 *data, size_t data_len, u8 out[SHA512_DIGEST_SIZE])
+static void _hmac_sha512(const struct hmac_sha512_key *key,
+			 const u8 *data, size_t data_len,
+			 u8 out[SHA512_DIGEST_SIZE])
 {
 	struct hmac_sha512_ctx ctx;
 
@@ -379,11 +495,19 @@ void hmac_sha512(const struct hmac_sha512_key *key,
 	hmac_sha512_update(&ctx, data, data_len);
 	hmac_sha512_final(&ctx, out);
 }
+DEFINE_STATIC_CALL(hmac_sha512, _hmac_sha512);
+EXPORT_STATIC_CALL_GPL(hmac_sha512);
+
+void hmac_sha512(const struct hmac_sha512_key *key,
+		 const u8 *data, size_t data_len, u8 out[SHA512_DIGEST_SIZE])
+{
+	static_call(hmac_sha512)(key, data, data_len, out);
+}
 EXPORT_SYMBOL_GPL(hmac_sha512);
 
-void hmac_sha384_usingrawkey(const u8 *raw_key, size_t raw_key_len,
-			     const u8 *data, size_t data_len,
-			     u8 out[SHA384_DIGEST_SIZE])
+static void _hmac_sha384_usingrawkey(const u8 *raw_key, size_t raw_key_len,
+				     const u8 *data, size_t data_len,
+				     u8 out[SHA384_DIGEST_SIZE])
 {
 	struct hmac_sha384_ctx ctx;
 
@@ -391,17 +515,35 @@ void hmac_sha384_usingrawkey(const u8 *raw_key, size_t raw_key_len,
 	hmac_sha384_update(&ctx, data, data_len);
 	hmac_sha384_final(&ctx, out);
 }
+DEFINE_STATIC_CALL(hmac_sha384_usingrawkey, _hmac_sha384_usingrawkey);
+EXPORT_STATIC_CALL_GPL(hmac_sha384_usingrawkey);
+
+void hmac_sha384_usingrawkey(const u8 *raw_key, size_t raw_key_len,
+			     const u8 *data, size_t data_len,
+			     u8 out[SHA384_DIGEST_SIZE])
+{
+	static_call(hmac_sha384_usingrawkey)(raw_key, raw_key_len, data, data_len, out);
+}
 EXPORT_SYMBOL_GPL(hmac_sha384_usingrawkey);
 
-void hmac_sha512_usingrawkey(const u8 *raw_key, size_t raw_key_len,
-			     const u8 *data, size_t data_len,
-			     u8 out[SHA512_DIGEST_SIZE])
+static void _hmac_sha512_usingrawkey(const u8 *raw_key, size_t raw_key_len,
+				     const u8 *data, size_t data_len,
+				     u8 out[SHA512_DIGEST_SIZE])
 {
 	struct hmac_sha512_ctx ctx;
 
 	hmac_sha512_init_usingrawkey(&ctx, raw_key, raw_key_len);
 	hmac_sha512_update(&ctx, data, data_len);
 	hmac_sha512_final(&ctx, out);
+}
+DEFINE_STATIC_CALL(hmac_sha512_usingrawkey, _hmac_sha512_usingrawkey);
+EXPORT_STATIC_CALL_GPL(hmac_sha512_usingrawkey);
+
+void hmac_sha512_usingrawkey(const u8 *raw_key, size_t raw_key_len,
+			     const u8 *data, size_t data_len,
+			     u8 out[SHA512_DIGEST_SIZE])
+{
+	static_call(hmac_sha512_usingrawkey)(raw_key, raw_key_len, data, data_len, out);
 }
 EXPORT_SYMBOL_GPL(hmac_sha512_usingrawkey);
 
