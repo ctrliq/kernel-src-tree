@@ -32,7 +32,7 @@
 #include <linux/printk.h>
 #include <linux/string.h>
 #include <linux/vmalloc.h>
-#include "lib/sha256_lib.h"
+#include "lib/crypto/sha256_lib.h"
 
 /* Module parameter: absolute path to this module's .ko file */
 static char fips_module_path[256];

@@ -26,7 +26,7 @@
 #include <linux/unaligned.h>
 #include <linux/wordpart.h>
 
-#include "lib/sha256_lib.h"
+#include "sha256_lib.h"
 
 static const struct sha256_block_state sha224_iv = {
 	.h = {

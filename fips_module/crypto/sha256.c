@@ -12,7 +12,7 @@
 #include <crypto/sha2.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
-#include "lib/sha256_lib.h"
+#include "lib/crypto/sha256_lib.h"
 
 /*
  * Export and import functions.  crypto_shash wants a particular format that
