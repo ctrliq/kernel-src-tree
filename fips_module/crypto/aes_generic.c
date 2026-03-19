@@ -55,6 +55,7 @@
 #include <linux/errno.h>
 #include <asm/byteorder.h>
 #include <linux/unaligned.h>
+#include "lib/crypto/aes_lib.h"
 
 static inline u8 byte(const u32 x, const unsigned n)
 {
@@ -1136,7 +1137,7 @@ int crypto_aes_set_key(struct crypto_tfm *tfm, const u8 *in_key,
 {
 	struct crypto_aes_ctx *ctx = crypto_tfm_ctx(tfm);
 
-	return aes_expandkey(ctx, in_key, key_len);
+	return fips_lib_aes_expandkey(ctx, in_key, key_len);
 }
 
 /* encrypt a block of text */
