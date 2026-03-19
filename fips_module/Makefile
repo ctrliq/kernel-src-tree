@@ -39,6 +39,8 @@ fips_module-y :=					\
 							\
 	lib/sha256.o					\
 							\
+	lib/crypto/aes.o				\
+							\
 	crypto/sha1.o					\
 	crypto/sha256.o					\
 	crypto/sha512.o					\
@@ -149,9 +151,10 @@ CFLAGS_crypto/jitterentropy.o		:= -O0
 KASAN_SANITIZE_crypto/jitterentropy.o	:= n
 UBSAN_SANITIZE_crypto/jitterentropy.o	:= n
 
-# AES generic benefits from disabling code-hoisting optimisation which
+# AES implementations benefit from disabling code-hoisting optimisation which
 # can create timing side-channels.
 CFLAGS_crypto/aes_generic.o := $(call cc-option,-fno-code-hoisting)
+CFLAGS_lib/crypto/aes.o     := $(call cc-option,-fno-code-hoisting)
 
 # -----------------------------------------------------------------------
 # ASN.1 generated sources
