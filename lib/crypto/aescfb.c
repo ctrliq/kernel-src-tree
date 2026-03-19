@@ -9,6 +9,7 @@
 #include <crypto/algapi.h>
 #include <linux/export.h>
 #include <linux/module.h>
+#include <linux/static_call.h>
 #include <asm/irqflags.h>
 
 static void aescfb_encrypt_block(const struct crypto_aes_ctx *ctx, void *dst,
@@ -38,8 +39,8 @@ static void aescfb_encrypt_block(const struct crypto_aes_ctx *ctx, void *dst,
  * @len:	The size in bytes of the plaintext and ciphertext.
  * @iv:		The initialization vector (IV) to use for this block of data
  */
-void aescfb_encrypt(const struct crypto_aes_ctx *ctx, u8 *dst, const u8 *src,
-		    int len, const u8 iv[AES_BLOCK_SIZE])
+static void _aescfb_encrypt(const struct crypto_aes_ctx *ctx, u8 *dst,
+			    const u8 *src, int len, const u8 iv[AES_BLOCK_SIZE])
 {
 	u8 ks[AES_BLOCK_SIZE];
 	const u8 *v = iv;
@@ -56,6 +57,14 @@ void aescfb_encrypt(const struct crypto_aes_ctx *ctx, u8 *dst, const u8 *src,
 
 	memzero_explicit(ks, sizeof(ks));
 }
+DEFINE_STATIC_CALL(aescfb_encrypt, _aescfb_encrypt);
+EXPORT_STATIC_CALL(aescfb_encrypt);
+
+void aescfb_encrypt(const struct crypto_aes_ctx *ctx, u8 *dst, const u8 *src,
+		    int len, const u8 iv[AES_BLOCK_SIZE])
+{
+	static_call(aescfb_encrypt)(ctx, dst, src, len, iv);
+}
 EXPORT_SYMBOL(aescfb_encrypt);
 
 /**
@@ -67,8 +76,8 @@ EXPORT_SYMBOL(aescfb_encrypt);
  * @len:	The size in bytes of the plaintext and ciphertext.
  * @iv:		The initialization vector (IV) to use for this block of data
  */
-void aescfb_decrypt(const struct crypto_aes_ctx *ctx, u8 *dst, const u8 *src,
-		    int len, const u8 iv[AES_BLOCK_SIZE])
+static void _aescfb_decrypt(const struct crypto_aes_ctx *ctx, u8 *dst,
+			    const u8 *src, int len, const u8 iv[AES_BLOCK_SIZE])
 {
 	u8 ks[2][AES_BLOCK_SIZE];
 
@@ -91,6 +100,14 @@ void aescfb_decrypt(const struct crypto_aes_ctx *ctx, u8 *dst, const u8 *src,
 	}
 
 	memzero_explicit(ks, sizeof(ks));
+}
+DEFINE_STATIC_CALL(aescfb_decrypt, _aescfb_decrypt);
+EXPORT_STATIC_CALL(aescfb_decrypt);
+
+void aescfb_decrypt(const struct crypto_aes_ctx *ctx, u8 *dst, const u8 *src,
+		    int len, const u8 iv[AES_BLOCK_SIZE])
+{
+	static_call(aescfb_decrypt)(ctx, dst, src, len, iv);
 }
 EXPORT_SYMBOL(aescfb_decrypt);
 

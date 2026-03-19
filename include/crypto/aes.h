@@ -93,7 +93,9 @@ extern const u8 crypto_aes_inv_sbox[];
 
 void aescfb_encrypt(const struct crypto_aes_ctx *ctx, u8 *dst, const u8 *src,
 		    int len, const u8 iv[AES_BLOCK_SIZE]);
+DECLARE_STATIC_CALL(aescfb_encrypt, aescfb_encrypt);
 void aescfb_decrypt(const struct crypto_aes_ctx *ctx, u8 *dst, const u8 *src,
 		    int len, const u8 iv[AES_BLOCK_SIZE]);
+DECLARE_STATIC_CALL(aescfb_decrypt, aescfb_decrypt);
 
 #endif
