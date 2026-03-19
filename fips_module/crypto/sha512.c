@@ -11,6 +11,7 @@
 #include <crypto/sha2.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include "lib/crypto/sha512_lib.h"
 
 /*
  * Export and import functions.  crypto_shash wants a particular format that
@@ -78,27 +79,27 @@ const u8 sha384_zero_message_hash[SHA384_DIGEST_SIZE] = {
 
 static int crypto_sha384_init(struct shash_desc *desc)
 {
-	sha384_init(SHA384_CTX(desc));
+	fips_lib_sha384_init(SHA384_CTX(desc));
 	return 0;
 }
 
 static int crypto_sha384_update(struct shash_desc *desc,
 				const u8 *data, unsigned int len)
 {
-	sha384_update(SHA384_CTX(desc), data, len);
+	fips_lib_sha384_update(SHA384_CTX(desc), data, len);
 	return 0;
 }
 
 static int crypto_sha384_final(struct shash_desc *desc, u8 *out)
 {
-	sha384_final(SHA384_CTX(desc), out);
+	fips_lib_sha384_final(SHA384_CTX(desc), out);
 	return 0;
 }
 
 static int crypto_sha384_digest(struct shash_desc *desc,
 				const u8 *data, unsigned int len, u8 *out)
 {
-	sha384(data, len, out);
+	fips_lib_sha384(data, len, out);
 	return 0;
 }
 
@@ -139,27 +140,27 @@ const u8 sha512_zero_message_hash[SHA512_DIGEST_SIZE] = {
 
 static int crypto_sha512_init(struct shash_desc *desc)
 {
-	sha512_init(SHA512_CTX(desc));
+	fips_lib_sha512_init(SHA512_CTX(desc));
 	return 0;
 }
 
 static int crypto_sha512_update(struct shash_desc *desc,
 				const u8 *data, unsigned int len)
 {
-	sha512_update(SHA512_CTX(desc), data, len);
+	fips_lib_sha512_update(SHA512_CTX(desc), data, len);
 	return 0;
 }
 
 static int crypto_sha512_final(struct shash_desc *desc, u8 *out)
 {
-	sha512_final(SHA512_CTX(desc), out);
+	fips_lib_sha512_final(SHA512_CTX(desc), out);
 	return 0;
 }
 
 static int crypto_sha512_digest(struct shash_desc *desc,
 				const u8 *data, unsigned int len, u8 *out)
 {
-	sha512(data, len, out);
+	fips_lib_sha512(data, len, out);
 	return 0;
 }
 
@@ -191,26 +192,26 @@ static int crypto_sha512_import_core(struct shash_desc *desc, const void *in)
 static int crypto_hmac_sha384_setkey(struct crypto_shash *tfm,
 				     const u8 *raw_key, unsigned int keylen)
 {
-	hmac_sha384_preparekey(HMAC_SHA384_KEY(tfm), raw_key, keylen);
+	fips_lib_hmac_sha384_preparekey(HMAC_SHA384_KEY(tfm), raw_key, keylen);
 	return 0;
 }
 
 static int crypto_hmac_sha384_init(struct shash_desc *desc)
 {
-	hmac_sha384_init(HMAC_SHA384_CTX(desc), HMAC_SHA384_KEY(desc->tfm));
+	fips_lib_hmac_sha384_init(HMAC_SHA384_CTX(desc), HMAC_SHA384_KEY(desc->tfm));
 	return 0;
 }
 
 static int crypto_hmac_sha384_update(struct shash_desc *desc,
 				     const u8 *data, unsigned int len)
 {
-	hmac_sha384_update(HMAC_SHA384_CTX(desc), data, len);
+	fips_lib_hmac_sha384_update(HMAC_SHA384_CTX(desc), data, len);
 	return 0;
 }
 
 static int crypto_hmac_sha384_final(struct shash_desc *desc, u8 *out)
 {
-	hmac_sha384_final(HMAC_SHA384_CTX(desc), out);
+	fips_lib_hmac_sha384_final(HMAC_SHA384_CTX(desc), out);
 	return 0;
 }
 
@@ -218,7 +219,7 @@ static int crypto_hmac_sha384_digest(struct shash_desc *desc,
 				     const u8 *data, unsigned int len,
 				     u8 *out)
 {
-	hmac_sha384(HMAC_SHA384_KEY(desc->tfm), data, len, out);
+	fips_lib_hmac_sha384(HMAC_SHA384_KEY(desc->tfm), data, len, out);
 	return 0;
 }
 
@@ -258,26 +259,26 @@ static int crypto_hmac_sha384_import_core(struct shash_desc *desc,
 static int crypto_hmac_sha512_setkey(struct crypto_shash *tfm,
 				     const u8 *raw_key, unsigned int keylen)
 {
-	hmac_sha512_preparekey(HMAC_SHA512_KEY(tfm), raw_key, keylen);
+	fips_lib_hmac_sha512_preparekey(HMAC_SHA512_KEY(tfm), raw_key, keylen);
 	return 0;
 }
 
 static int crypto_hmac_sha512_init(struct shash_desc *desc)
 {
-	hmac_sha512_init(HMAC_SHA512_CTX(desc), HMAC_SHA512_KEY(desc->tfm));
+	fips_lib_hmac_sha512_init(HMAC_SHA512_CTX(desc), HMAC_SHA512_KEY(desc->tfm));
 	return 0;
 }
 
 static int crypto_hmac_sha512_update(struct shash_desc *desc,
 				     const u8 *data, unsigned int len)
 {
-	hmac_sha512_update(HMAC_SHA512_CTX(desc), data, len);
+	fips_lib_hmac_sha512_update(HMAC_SHA512_CTX(desc), data, len);
 	return 0;
 }
 
 static int crypto_hmac_sha512_final(struct shash_desc *desc, u8 *out)
 {
-	hmac_sha512_final(HMAC_SHA512_CTX(desc), out);
+	fips_lib_hmac_sha512_final(HMAC_SHA512_CTX(desc), out);
 	return 0;
 }
 
@@ -285,7 +286,7 @@ static int crypto_hmac_sha512_digest(struct shash_desc *desc,
 				     const u8 *data, unsigned int len,
 				     u8 *out)
 {
-	hmac_sha512(HMAC_SHA512_KEY(desc->tfm), data, len, out);
+	fips_lib_hmac_sha512(HMAC_SHA512_KEY(desc->tfm), data, len, out);
 	return 0;
 }
 
