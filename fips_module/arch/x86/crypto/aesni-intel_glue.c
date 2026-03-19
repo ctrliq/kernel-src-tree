@@ -36,6 +36,7 @@
 #include <linux/workqueue.h>
 #include <linux/spinlock.h>
 #include <linux/static_call.h>
+#include "lib/crypto/aes_lib.h"
 
 
 #define AESNI_ALIGN	16
@@ -101,7 +102,7 @@ static int aes_set_key_common(struct crypto_aes_ctx *ctx,
 	int err;
 
 	if (!crypto_simd_usable())
-		return aes_expandkey(ctx, in_key, key_len);
+		return fips_lib_aes_expandkey(ctx, in_key, key_len);
 
 	err = aes_check_keylen(key_len);
 	if (err)
@@ -125,7 +126,7 @@ static void aesni_encrypt(struct crypto_tfm *tfm, u8 *dst, const u8 *src)
 	struct crypto_aes_ctx *ctx = aes_ctx(crypto_tfm_ctx(tfm));
 
 	if (!crypto_simd_usable()) {
-		aes_encrypt(ctx, dst, src);
+		fips_lib_aes_encrypt(ctx, dst, src);
 	} else {
 		kernel_fpu_begin();
 		aesni_enc(ctx, dst, src);
@@ -138,7 +139,7 @@ static void aesni_decrypt(struct crypto_tfm *tfm, u8 *dst, const u8 *src)
 	struct crypto_aes_ctx *ctx = aes_ctx(crypto_tfm_ctx(tfm));
 
 	if (!crypto_simd_usable()) {
-		aes_decrypt(ctx, dst, src);
+		fips_lib_aes_decrypt(ctx, dst, src);
 	} else {
 		kernel_fpu_begin();
 		aesni_dec(ctx, dst, src);
@@ -1219,12 +1220,12 @@ static int gcm_setkey(struct crypto_aead *tfm, const u8 *raw_key,
 		be128 h;
 		int i;
 
-		err = aes_expandkey(&key->aes_key, raw_key, keylen);
+		err = fips_lib_aes_expandkey(&key->aes_key, raw_key, keylen);
 		if (err)
 			return err;
 
 		/* Encrypt the all-zeroes block to get the hash key H^1 */
-		aes_encrypt(&key->aes_key, (u8 *)&h1, (u8 *)&h1);
+		fips_lib_aes_encrypt(&key->aes_key, (u8 *)&h1, (u8 *)&h1);
 
 		/* Compute H^1 * x^-1 */
 		h = h1;
