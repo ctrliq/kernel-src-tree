@@ -11,6 +11,7 @@
 #include <crypto/sha1.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include "lib/crypto/sha1_lib.h"
 
 /*
  * Export and import functions.  crypto_shash wants a particular format that
@@ -71,27 +72,27 @@ const u8 sha1_zero_message_hash[SHA1_DIGEST_SIZE] = {
 
 static int crypto_sha1_init(struct shash_desc *desc)
 {
-	sha1_init(SHA1_CTX(desc));
+	fips_lib_sha1_init(SHA1_CTX(desc));
 	return 0;
 }
 
 static int crypto_sha1_update(struct shash_desc *desc,
 			      const u8 *data, unsigned int len)
 {
-	sha1_update(SHA1_CTX(desc), data, len);
+	fips_lib_sha1_update(SHA1_CTX(desc), data, len);
 	return 0;
 }
 
 static int crypto_sha1_final(struct shash_desc *desc, u8 *out)
 {
-	sha1_final(SHA1_CTX(desc), out);
+	fips_lib_sha1_final(SHA1_CTX(desc), out);
 	return 0;
 }
 
 static int crypto_sha1_digest(struct shash_desc *desc,
 			      const u8 *data, unsigned int len, u8 *out)
 {
-	sha1(data, len, out);
+	fips_lib_sha1(data, len, out);
 	return 0;
 }
 
@@ -121,33 +122,33 @@ static int crypto_sha1_import_core(struct shash_desc *desc, const void *in)
 static int crypto_hmac_sha1_setkey(struct crypto_shash *tfm,
 				   const u8 *raw_key, unsigned int keylen)
 {
-	hmac_sha1_preparekey(HMAC_SHA1_KEY(tfm), raw_key, keylen);
+	fips_lib_hmac_sha1_preparekey(HMAC_SHA1_KEY(tfm), raw_key, keylen);
 	return 0;
 }
 
 static int crypto_hmac_sha1_init(struct shash_desc *desc)
 {
-	hmac_sha1_init(HMAC_SHA1_CTX(desc), HMAC_SHA1_KEY(desc->tfm));
+	fips_lib_hmac_sha1_init(HMAC_SHA1_CTX(desc), HMAC_SHA1_KEY(desc->tfm));
 	return 0;
 }
 
 static int crypto_hmac_sha1_update(struct shash_desc *desc,
 				   const u8 *data, unsigned int len)
 {
-	hmac_sha1_update(HMAC_SHA1_CTX(desc), data, len);
+	fips_lib_hmac_sha1_update(HMAC_SHA1_CTX(desc), data, len);
 	return 0;
 }
 
 static int crypto_hmac_sha1_final(struct shash_desc *desc, u8 *out)
 {
-	hmac_sha1_final(HMAC_SHA1_CTX(desc), out);
+	fips_lib_hmac_sha1_final(HMAC_SHA1_CTX(desc), out);
 	return 0;
 }
 
 static int crypto_hmac_sha1_digest(struct shash_desc *desc,
 				   const u8 *data, unsigned int len, u8 *out)
 {
-	hmac_sha1(HMAC_SHA1_KEY(desc->tfm), data, len, out);
+	fips_lib_hmac_sha1(HMAC_SHA1_KEY(desc->tfm), data, len, out);
 	return 0;
 }
 
