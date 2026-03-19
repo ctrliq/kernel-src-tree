@@ -40,6 +40,7 @@ fips_module-y :=					\
 	lib/sha256.o					\
 							\
 	lib/crypto/aes.o				\
+	lib/crypto/sha1.o				\
 							\
 	crypto/sha1.o					\
 	crypto/sha256.o					\
