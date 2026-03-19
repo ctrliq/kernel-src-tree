@@ -7,6 +7,7 @@
 #include <linux/crypto.h>
 #include <linux/export.h>
 #include <linux/module.h>
+#include <linux/static_call.h>
 #include <linux/unaligned.h>
 
 /*
@@ -183,8 +184,8 @@ static u32 subw(u32 in)
  * described in FIPS-197. The first slot (16 bytes) of each key (enc or dec) is
  * for the initial combination, the second slot for the first round and so on.
  */
-int aes_expandkey(struct crypto_aes_ctx *ctx, const u8 *in_key,
-		  unsigned int key_len)
+static int _aes_expandkey(struct crypto_aes_ctx *ctx, const u8 *in_key,
+			  unsigned int key_len)
 {
 	u32 kwords = key_len / sizeof(u32);
 	u32 rc, i, j;
@@ -248,6 +249,14 @@ int aes_expandkey(struct crypto_aes_ctx *ctx, const u8 *in_key,
 
 	return 0;
 }
+DEFINE_STATIC_CALL(aes_expandkey, _aes_expandkey);
+EXPORT_STATIC_CALL(aes_expandkey);
+
+int aes_expandkey(struct crypto_aes_ctx *ctx, const u8 *in_key,
+		  unsigned int key_len)
+{
+	return static_call(aes_expandkey)(ctx, in_key, key_len);
+}
 EXPORT_SYMBOL(aes_expandkey);
 
 /**
@@ -256,7 +265,7 @@ EXPORT_SYMBOL(aes_expandkey);
  * @out:	Buffer to store the ciphertext
  * @in:		Buffer containing the plaintext
  */
-void aes_encrypt(const struct crypto_aes_ctx *ctx, u8 *out, const u8 *in)
+static void _aes_encrypt(const struct crypto_aes_ctx *ctx, u8 *out, const u8 *in)
 {
 	const u32 *rkp = ctx->key_enc + 4;
 	int rounds = 6 + ctx->key_length / 4;
@@ -299,6 +308,13 @@ void aes_encrypt(const struct crypto_aes_ctx *ctx, u8 *out, const u8 *in)
 	put_unaligned_le32(subshift(st1, 2) ^ rkp[6], out + 8);
 	put_unaligned_le32(subshift(st1, 3) ^ rkp[7], out + 12);
 }
+DEFINE_STATIC_CALL(aes_encrypt, _aes_encrypt);
+EXPORT_STATIC_CALL(aes_encrypt);
+
+void aes_encrypt(const struct crypto_aes_ctx *ctx, u8 *out, const u8 *in)
+{
+	static_call(aes_encrypt)(ctx, out, in);
+}
 EXPORT_SYMBOL(aes_encrypt);
 
 /**
@@ -307,7 +323,7 @@ EXPORT_SYMBOL(aes_encrypt);
  * @out:	Buffer to store the plaintext
  * @in:		Buffer containing the ciphertext
  */
-void aes_decrypt(const struct crypto_aes_ctx *ctx, u8 *out, const u8 *in)
+static void _aes_decrypt(const struct crypto_aes_ctx *ctx, u8 *out, const u8 *in)
 {
 	const u32 *rkp = ctx->key_dec + 4;
 	int rounds = 6 + ctx->key_length / 4;
@@ -349,6 +365,13 @@ void aes_decrypt(const struct crypto_aes_ctx *ctx, u8 *out, const u8 *in)
 	put_unaligned_le32(inv_subshift(st1, 1) ^ rkp[5], out + 4);
 	put_unaligned_le32(inv_subshift(st1, 2) ^ rkp[6], out + 8);
 	put_unaligned_le32(inv_subshift(st1, 3) ^ rkp[7], out + 12);
+}
+DEFINE_STATIC_CALL(aes_decrypt, _aes_decrypt);
+EXPORT_STATIC_CALL(aes_decrypt);
+
+void aes_decrypt(const struct crypto_aes_ctx *ctx, u8 *out, const u8 *in)
+{
+	static_call(aes_decrypt)(ctx, out, in);
 }
 EXPORT_SYMBOL(aes_decrypt);
 

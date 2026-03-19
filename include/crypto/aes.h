@@ -6,6 +6,7 @@
 #ifndef _CRYPTO_AES_H
 #define _CRYPTO_AES_H
 
+#include <linux/static_call_types.h>
 #include <linux/types.h>
 #include <linux/crypto.h>
 
@@ -67,6 +68,7 @@ int crypto_aes_set_key(struct crypto_tfm *tfm, const u8 *in_key,
  */
 int aes_expandkey(struct crypto_aes_ctx *ctx, const u8 *in_key,
 		  unsigned int key_len);
+DECLARE_STATIC_CALL(aes_expandkey, aes_expandkey);
 
 /**
  * aes_encrypt - Encrypt a single AES block
@@ -75,6 +77,7 @@ int aes_expandkey(struct crypto_aes_ctx *ctx, const u8 *in_key,
  * @in:		Buffer containing the plaintext
  */
 void aes_encrypt(const struct crypto_aes_ctx *ctx, u8 *out, const u8 *in);
+DECLARE_STATIC_CALL(aes_encrypt, aes_encrypt);
 
 /**
  * aes_decrypt - Decrypt a single AES block
@@ -83,6 +86,7 @@ void aes_encrypt(const struct crypto_aes_ctx *ctx, u8 *out, const u8 *in);
  * @in:		Buffer containing the ciphertext
  */
 void aes_decrypt(const struct crypto_aes_ctx *ctx, u8 *out, const u8 *in);
+DECLARE_STATIC_CALL(aes_decrypt, aes_decrypt);
 
 extern const u8 crypto_aes_sbox[];
 extern const u8 crypto_aes_inv_sbox[];
