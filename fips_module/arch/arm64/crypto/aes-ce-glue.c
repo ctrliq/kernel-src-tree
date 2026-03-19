@@ -15,6 +15,7 @@
 #include <linux/module.h>
 
 #include "aes-ce-setkey.h"
+#include "lib/crypto/aes_lib.h"
 
 
 struct aes_block {
@@ -45,7 +46,7 @@ static void aes_cipher_encrypt(struct crypto_tfm *tfm, u8 dst[], u8 const src[])
 	struct crypto_aes_ctx *ctx = crypto_tfm_ctx(tfm);
 
 	if (!crypto_simd_usable()) {
-		aes_encrypt(ctx, dst, src);
+		fips_lib_aes_encrypt(ctx, dst, src);
 		return;
 	}
 
@@ -59,7 +60,7 @@ static void aes_cipher_decrypt(struct crypto_tfm *tfm, u8 dst[], u8 const src[])
 	struct crypto_aes_ctx *ctx = crypto_tfm_ctx(tfm);
 
 	if (!crypto_simd_usable()) {
-		aes_decrypt(ctx, dst, src);
+		fips_lib_aes_decrypt(ctx, dst, src);
 		return;
 	}
 
