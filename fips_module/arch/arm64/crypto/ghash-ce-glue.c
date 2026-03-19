@@ -21,6 +21,7 @@
 #include <linux/module.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
+#include "lib/crypto/aes_lib.h"
 
 
 #define RFC4106_NONCE_SIZE	4
@@ -202,11 +203,11 @@ static int gcm_aes_setkey(struct crypto_aead *tfm, const u8 *inkey,
 	be128 h;
 	int ret;
 
-	ret = aes_expandkey(&ctx->aes_key, inkey, keylen);
+	ret = fips_lib_aes_expandkey(&ctx->aes_key, inkey, keylen);
 	if (ret)
 		return -EINVAL;
 
-	aes_encrypt(&ctx->aes_key, key, (u8[AES_BLOCK_SIZE]){});
+	fips_lib_aes_encrypt(&ctx->aes_key, key, (u8[AES_BLOCK_SIZE]){});
 
 	/* needed for the fallback */
 	memcpy(&ctx->ghash_key.k, key, GHASH_BLOCK_SIZE);
