@@ -38,6 +38,7 @@ fips_module-y :=					\
 	crypto/xts.o					\
 							\
 	lib/crypto/aes.o				\
+	lib/crypto/aescfb.o				\
 	lib/crypto/aesgcm.o				\
 	lib/crypto/sha1.o				\
 	lib/crypto/sha256.o				\
