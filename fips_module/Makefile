@@ -17,8 +17,9 @@
 
 KDIR ?= $(realpath $(dir $(abspath $(lastword $(MAKEFILE_LIST))))/..)
 
-# Module name
-MODULE_NAME := fips_module
+# Module version and name
+FIPS_VERSION := 1.0.0-k6.18
+FIPS_KO      := fips_module-$(FIPS_VERSION).ko
 
 # -----------------------------------------------------------------------
 # Core object files (architecture-independent)
@@ -159,6 +160,10 @@ ccflags-y += -include $(src)/fips_alg.h
 # copied source files continue to resolve correctly.
 ccflags-y += -I$(src)
 
+# Inject the module version string as a C preprocessor define so that
+# fips_init.c and the Makefile share a single source of truth.
+ccflags-y += -DFIPS_MODULE_VERSION='"$(FIPS_VERSION)"'
+
 # -----------------------------------------------------------------------
 # Special compiler flags
 # -----------------------------------------------------------------------
@@ -192,16 +197,13 @@ $(obj)/crypto/ecdsa-x962.o:  $(obj)/crypto/ecdsasignature.asn1.h
 # Build targets
 # -----------------------------------------------------------------------
 #
-# After the kbuild step links fips_module.ko, the post-build script
-# scripts/fips_hmac_patch.py must be run to embed the expected HMAC-SHA-256
-# of the module image into its .fips_hmac ELF section.  The 'all' target
-# does this automatically when building from within fips_module/.
+# kbuild produces fips_module.ko; the 'all' target then:
+#   1. Embeds the HMAC-SHA-256 integrity value via fips_hmac_patch.py
+#   2. Renames the result to fips_module-$(FIPS_VERSION).ko
 #
 # When building from the kernel root with 'make M=fips_module', kbuild
-# does not invoke this Makefile's 'all' target.  Run the patch step
-# manually afterwards:
-#   python3 fips_module/scripts/fips_hmac_patch.py fips_module/fips_module.ko
-# or use the 'hmac_patch' target:
+# does not invoke this Makefile's 'all' target.  Run the post-build
+# steps manually afterwards, or use:
 #   make -C fips_module hmac_patch
 #
 # NOTE: If the module is stripped before installation, stripping must
@@ -213,9 +215,12 @@ FIPS_HMAC_PATCH := $(PWD)/scripts/fips_hmac_patch.py
 all:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 	$(PYTHON3) $(FIPS_HMAC_PATCH) $(PWD)/fips_module.ko
+	mv $(PWD)/fips_module.ko $(PWD)/$(FIPS_KO)
 
 hmac_patch:
 	$(PYTHON3) $(FIPS_HMAC_PATCH) $(PWD)/fips_module.ko
+	mv $(PWD)/fips_module.ko $(PWD)/$(FIPS_KO)
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
+	$(RM) $(PWD)/$(FIPS_KO)

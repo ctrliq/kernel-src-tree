@@ -530,6 +530,7 @@ static int __init fips_module_init(void)
 
 	pr_info("fips_module: all FIPS algorithms registered and "
 		"self-tests passed\n");
+	pr_info("fips_module: version " FIPS_MODULE_VERSION " loaded\n");
 	return 0;
 }
 
@@ -538,5 +539,5 @@ module_init(fips_module_init);
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("FIPS Cryptographic Module");
 MODULE_AUTHOR("CIQ");
-MODULE_VERSION("1.0");
+MODULE_VERSION(FIPS_MODULE_VERSION);
 MODULE_IMPORT_NS("CRYPTO_INTERNAL");
