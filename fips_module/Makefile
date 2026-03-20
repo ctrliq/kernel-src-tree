@@ -131,6 +131,8 @@ fips_module-$(CONFIG_X86_64) +=				\
 # -----------------------------------------------------------------------
 fips_module-$(CONFIG_ARM64) +=				\
 	lib/crypto/arm64/sha1-ce-core.o			\
+	lib/crypto/arm64/sha256-core.o			\
+	lib/crypto/arm64/sha256-ce.o			\
 	arch/arm64/crypto/aes-ce-core.o			\
 	arch/arm64/crypto/aes-ce-glue.o			\
 	arch/arm64/crypto/aes-modes.o			\

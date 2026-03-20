@@ -150,6 +150,8 @@ static void sha256_blocks_generic(struct sha256_block_state *state,
 
 #ifdef CONFIG_X86_64
 #include "x86/sha256.h"
+#elif defined(CONFIG_ARM64)
+#include "arm64/sha256.h"
 #else
 #define sha256_blocks sha256_blocks_generic
 #endif
@@ -284,7 +286,7 @@ void fips_lib_sha256_finup_2x(const struct sha256_ctx *ctx,
 	if (ctx == NULL)
 		ctx = &initial_sha256_ctx;
 
-#ifdef CONFIG_X86_64
+#ifdef sha256_finup_2x_arch
 	if (sha256_finup_2x_arch(&ctx->ctx, data1, data2, len, out1, out2))
 		return;
 #endif
@@ -293,7 +295,7 @@ void fips_lib_sha256_finup_2x(const struct sha256_ctx *ctx,
 
 bool fips_lib_sha256_finup_2x_is_optimized(void)
 {
-#ifdef CONFIG_X86_64
+#ifdef sha256_finup_2x_arch
 	return sha256_finup_2x_is_optimized_arch();
 #else
 	return false;
