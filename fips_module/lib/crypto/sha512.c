@@ -141,6 +141,8 @@ static void sha512_blocks_generic(struct sha512_block_state *state,
 
 #ifdef CONFIG_X86_64
 #include "x86/sha512.h"
+#elif defined(CONFIG_ARM64)
+#include "arm64/sha512.h"
 #else
 #define sha512_blocks sha512_blocks_generic
 #endif
