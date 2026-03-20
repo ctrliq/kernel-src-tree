@@ -1,0 +1,604 @@
+printk: nbcon: Allow reacquire during panic
+
+jira KERNEL-749
+Rebuild_History Non-Buildable kernel-5.14.0-611.41.1.el9_7
+commit-author John Ogness <john.ogness@linutronix.de>
+commit 571c1ea91a73db56bd94054fabecd0f070dc90db
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-611.41.1.el9_7/571c1ea9.failed
+
+If a console printer is interrupted during panic, it will never
+be able to reacquire ownership in order to perform and cleanup.
+That in itself is not a problem, since the non-panic CPU will
+simply quiesce in an endless loop within nbcon_reacquire_nobuf().
+
+However, in this state, platforms that do not support a true NMI
+to interrupt the quiesced CPU will not be able to shutdown that
+CPU from within panic(). This then causes problems for such as
+being unable to load and run a kdump kernel.
+
+Fix this by allowing non-panic CPUs to reacquire ownership using
+a direct acquire. Then the non-panic CPUs can successfullyl exit
+the nbcon_reacquire_nobuf() loop and the console driver can
+perform any necessary cleanup. But more importantly, the CPU is
+no longer quiesced and is free to process any interrupts
+necessary for panic() to shutdown the CPU.
+
+All other forms of acquire are still not allowed for non-panic
+CPUs since it is safer to have them avoid gaining console
+ownership that is not strictly necessary.
+
+	Reported-by: Michael Kelley <mhklinux@outlook.com>
+Closes: https://lore.kernel.org/r/SN6PR02MB4157A4C5E8CB219A75263A17D46DA@SN6PR02MB4157.namprd02.prod.outlook.com
+	Signed-off-by: John Ogness <john.ogness@linutronix.de>
+	Reviewed-by: Petr Mladek <pmladek@suse.com>
+	Tested-by: Michael Kelley <mhklinux@outlook.com>
+Link: https://patch.msgid.link/20250606185549.900611-1-john.ogness@linutronix.de
+	Signed-off-by: Petr Mladek <pmladek@suse.com>
+(cherry picked from commit 571c1ea91a73db56bd94054fabecd0f070dc90db)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/printk/nbcon.c
+diff --cc kernel/printk/nbcon.c
+index b4278854eeb9,e7a3af81b173..000000000000
+--- a/kernel/printk/nbcon.c
++++ b/kernel/printk/nbcon.c
+@@@ -205,12 -212,11 +205,13 @@@ static void nbcon_seq_try_update(struc
+  	}
+  }
+  
+ +bool printk_threads_enabled __ro_after_init;
+ +
+  /**
+   * nbcon_context_try_acquire_direct - Try to acquire directly
+-  * @ctxt:	The context of the caller
+-  * @cur:	The current console state
++  * @ctxt:		The context of the caller
++  * @cur:		The current console state
++  * @is_reacquire:	This acquire is a reacquire
+   *
+   * Acquire the console when it is released. Also acquire the console when
+   * the current owner has a lower priority and the console is in a safe state.
+@@@ -237,8 -243,21 +238,25 @@@ static int nbcon_context_try_acquire_di
+  	struct nbcon_state new;
+  
+  	do {
+++<<<<<<< HEAD
+ +		if (other_cpu_in_panic())
+++=======
++ 		/*
++ 		 * Panic does not imply that the console is owned. However,
++ 		 * since all non-panic CPUs are stopped during panic(), it
++ 		 * is safer to have them avoid gaining console ownership.
++ 		 *
++ 		 * If this acquire is a reacquire (and an unsafe takeover
++ 		 * has not previously occurred) then it is allowed to attempt
++ 		 * a direct acquire in panic. This gives console drivers an
++ 		 * opportunity to perform any necessary cleanup if they were
++ 		 * interrupted by the panic CPU while printing.
++ 		 */
++ 		if (other_cpu_in_panic() &&
++ 		    (!is_reacquire || cur->unsafe_takeover)) {
+++>>>>>>> 571c1ea91a73 (printk: nbcon: Allow reacquire during panic)
+  			return -EPERM;
++ 		}
+  
+  		if (ctxt->prio <= cur->prio || ctxt->prio <= cur->req_prio)
+  			return -EPERM;
+@@@ -275,11 -297,20 +293,21 @@@ static bool nbcon_waiter_matches(struc
+  	 *
+  	 * As a result, the following scenario is *not* possible:
+  	 *
+ -	 * 1. This context is currently a waiter.
+ -	 * 2. Another context with a higher priority than this context
+ -	 *    directly takes ownership.
+ -	 * 3. The higher priority context releases the ownership.
+ -	 * 4. Another lower priority context takes the ownership.
+ -	 * 5. Another context with the same priority as this context
+ +	 * 1. Another context with a higher priority directly takes ownership.
+ +	 * 2. The higher priority context releases the ownership.
+ +	 * 3. A lower priority context takes the ownership.
+ +	 * 4. Another context with the same priority as this context
+  	 *    creates a request and starts waiting.
+++<<<<<<< HEAD
+++=======
++ 	 *
++ 	 * Event #1 implies this context is EMERGENCY.
++ 	 * Event #2 implies the new context is PANIC.
++ 	 * Event #3 occurs when panic() has flushed the console.
++ 	 * Event #4 occurs when a non-panic CPU reacquires.
++ 	 * Event #5 is not possible due to the other_cpu_in_panic() check
++ 	 *          in nbcon_context_try_acquire_handover().
+++>>>>>>> 571c1ea91a73 (printk: nbcon: Allow reacquire during panic)
+  	 */
+  
+  	return (cur->req_prio == expected_prio);
+@@@ -535,9 -576,10 +573,10 @@@ static struct printk_buffers panic_nbco
+  
+  /**
+   * nbcon_context_try_acquire - Try to acquire nbcon console
+-  * @ctxt:	The context of the caller
++  * @ctxt:		The context of the caller
++  * @is_reacquire:	This acquire is a reacquire
+   *
+ - * Context:	Under @ctxt->con->device_lock() or local_irq_save().
+ + * Context:	Any context which could not be migrated to another CPU.
+   * Return:	True if the console was acquired. False otherwise.
+   *
+   * If the caller allowed an unsafe hostile takeover, on success the
+@@@ -831,36 -912,32 +870,36 @@@ bool nbcon_exit_unsafe(struct nbcon_wri
+  EXPORT_SYMBOL_GPL(nbcon_exit_unsafe);
+  
+  /**
+ - * nbcon_reacquire_nobuf - Reacquire a console after losing ownership
+ - *				while printing
+ - * @wctxt:	The write context that was handed to the write callback
+ + * nbcon_reacquire - Reacquire a console after losing ownership
+ + * @wctxt:	The write context that was handed to the write function
+   *
+   * Since ownership can be lost at any time due to handover or takeover, a
+ - * printing context _must_ be prepared to back out immediately and
+ - * carefully. However, there are scenarios where the printing context must
+ + * printing context _should_ be prepared to back out immediately and
+ + * carefully. However, there are many scenarios where the context _must_
+   * reacquire ownership in order to finalize or revert hardware changes.
+   *
+ - * This function allows a printing context to reacquire ownership using the
+ - * same priority as its previous ownership.
+ + * This function allows a context to reacquire ownership using the same
+ + * priority as its previous ownership.
+   *
+ - * Note that after a successful reacquire the printing context will have no
+ - * output buffer because that has been lost. This function cannot be used to
+ - * resume printing.
+ + * Note that for printing contexts, after a successful reacquire the
+ + * context will have no output buffer because that has been lost. This
+ + * function cannot be used to resume printing.
+   */
+ -void nbcon_reacquire_nobuf(struct nbcon_write_context *wctxt)
+ +void nbcon_reacquire(struct nbcon_write_context *wctxt)
+  {
+  	struct nbcon_context *ctxt = &ACCESS_PRIVATE(wctxt, ctxt);
+ +	struct console *con = ctxt->console;
+ +	struct nbcon_state cur;
+  
+- 	while (!nbcon_context_try_acquire(ctxt))
++ 	while (!nbcon_context_try_acquire(ctxt, true))
+  		cpu_relax();
+  
+ -	nbcon_write_context_set_buf(wctxt, NULL, 0);
+ +	wctxt->outbuf = NULL;
+ +	wctxt->len = 0;
+ +	nbcon_state_read(con, &cur);
+ +	wctxt->unsafe_takeover = cur.unsafe_takeover;
+  }
+ -EXPORT_SYMBOL_GPL(nbcon_reacquire_nobuf);
+ +EXPORT_SYMBOL_GPL(nbcon_reacquire);
+  
+  /**
+   * nbcon_emit_next_record - Emit a record in the acquired context
+@@@ -975,6 -1086,63 +1014,66 @@@ update_con
+  	return nbcon_context_exit_unsafe(ctxt);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * nbcon_emit_one - Print one record for an nbcon console using the
++  *			specified callback
++  * @wctxt:	An initialized write context struct to use for this context
++  * @use_atomic:	True if the write_atomic() callback is to be used
++  *
++  * Return:	True, when a record has been printed and there are still
++  *		pending records. The caller might want to continue flushing.
++  *
++  *		False, when there is no pending record, or when the console
++  *		context cannot be acquired, or the ownership has been lost.
++  *		The caller should give up. Either the job is done, cannot be
++  *		done, or will be handled by the owning context.
++  *
++  * This is an internal helper to handle the locking of the console before
++  * calling nbcon_emit_next_record().
++  */
++ static bool nbcon_emit_one(struct nbcon_write_context *wctxt, bool use_atomic)
++ {
++ 	struct nbcon_context *ctxt = &ACCESS_PRIVATE(wctxt, ctxt);
++ 	struct console *con = ctxt->console;
++ 	unsigned long flags;
++ 	bool ret = false;
++ 
++ 	if (!use_atomic) {
++ 		con->device_lock(con, &flags);
++ 
++ 		/*
++ 		 * Ensure this stays on the CPU to make handover and
++ 		 * takeover possible.
++ 		 */
++ 		cant_migrate();
++ 	}
++ 
++ 	if (!nbcon_context_try_acquire(ctxt, false))
++ 		goto out;
++ 
++ 	/*
++ 	 * nbcon_emit_next_record() returns false when the console was
++ 	 * handed over or taken over. In both cases the context is no
++ 	 * longer valid.
++ 	 *
++ 	 * The higher priority printing context takes over responsibility
++ 	 * to print the pending records.
++ 	 */
++ 	if (!nbcon_emit_next_record(wctxt, use_atomic))
++ 		goto out;
++ 
++ 	nbcon_context_release(ctxt);
++ 
++ 	ret = ctxt->backlog;
++ out:
++ 	if (!use_atomic)
++ 		con->device_unlock(con, flags);
++ 	return ret;
++ }
++ 
+++>>>>>>> 571c1ea91a73 (printk: nbcon: Allow reacquire during panic)
+  /**
+   * nbcon_kthread_should_wakeup - Check whether a printer thread should wakeup
+   * @con:	Console to operate on
+@@@ -1277,53 -1498,120 +1376,151 @@@ static void __nbcon_atomic_flush_all(u6
+  {
+  	struct nbcon_write_context wctxt = { };
+  	struct nbcon_context *ctxt = &ACCESS_PRIVATE(&wctxt, ctxt);
+++<<<<<<< HEAD
+++=======
++ 	int err = 0;
++ 
++ 	ctxt->console			= con;
++ 	ctxt->spinwait_max_us		= 2000;
++ 	ctxt->prio			= nbcon_get_default_prio();
++ 	ctxt->allow_unsafe_takeover	= allow_unsafe_takeover;
++ 
++ 	if (!nbcon_context_try_acquire(ctxt, false))
++ 		return -EPERM;
++ 
++ 	while (nbcon_seq_read(con) < stop_seq) {
++ 		/*
++ 		 * nbcon_emit_next_record() returns false when the console was
++ 		 * handed over or taken over. In both cases the context is no
++ 		 * longer valid.
++ 		 */
++ 		if (!nbcon_emit_next_record(&wctxt, true))
++ 			return -EAGAIN;
++ 
++ 		if (!ctxt->backlog) {
++ 			/* Are there reserved but not yet finalized records? */
++ 			if (nbcon_seq_read(con) < stop_seq)
++ 				err = -ENOENT;
++ 			break;
++ 		}
++ 	}
++ 
++ 	nbcon_context_release(ctxt);
++ 	return err;
++ }
++ 
++ /**
++  * nbcon_atomic_flush_pending_con - Flush specified nbcon console using its
++  *					write_atomic() callback
++  * @con:			The nbcon console to flush
++  * @stop_seq:			Flush up until this record
++  * @allow_unsafe_takeover:	True, to allow unsafe hostile takeovers
++  *
++  * This will stop flushing before @stop_seq if another context has ownership.
++  * That context is then responsible for the flushing. Likewise, if new records
++  * are added while this context was flushing and there is no other context
++  * to handle the printing, this context must also flush those records.
++  */
++ static void nbcon_atomic_flush_pending_con(struct console *con, u64 stop_seq,
++ 					   bool allow_unsafe_takeover)
++ {
++ 	struct console_flush_type ft;
++ 	unsigned long flags;
++ 	int err;
++ 
++ again:
++ 	/*
++ 	 * Atomic flushing does not use console driver synchronization (i.e.
++ 	 * it does not hold the port lock for uart consoles). Therefore IRQs
++ 	 * must be disabled to avoid being interrupted and then calling into
++ 	 * a driver that will deadlock trying to acquire console ownership.
++ 	 */
++ 	local_irq_save(flags);
++ 
++ 	err = __nbcon_atomic_flush_pending_con(con, stop_seq, allow_unsafe_takeover);
++ 
++ 	local_irq_restore(flags);
++ 
++ 	/*
++ 	 * If there was a new owner (-EPERM, -EAGAIN), that context is
++ 	 * responsible for completing.
++ 	 *
++ 	 * Do not wait for records not yet finalized (-ENOENT) to avoid a
++ 	 * possible deadlock. They will either get flushed by the writer or
++ 	 * eventually skipped on panic CPU.
++ 	 */
++ 	if (err)
++ 		return;
++ 
++ 	/*
++ 	 * If flushing was successful but more records are available, this
++ 	 * context must flush those remaining records if the printer thread
++ 	 * is not available do it.
++ 	 */
++ 	printk_get_console_flush_type(&ft);
++ 	if (!ft.nbcon_offload &&
++ 	    prb_read_valid(prb, nbcon_seq_read(con), NULL)) {
++ 		stop_seq = prb_next_reserve_seq(prb);
++ 		goto again;
++ 	}
++ }
++ 
++ /**
++  * __nbcon_atomic_flush_pending - Flush all nbcon consoles using their
++  *					write_atomic() callback
++  * @stop_seq:			Flush up until this record
++  * @allow_unsafe_takeover:	True, to allow unsafe hostile takeovers
++  */
++ static void __nbcon_atomic_flush_pending(u64 stop_seq, bool allow_unsafe_takeover)
++ {
+++>>>>>>> 571c1ea91a73 (printk: nbcon: Allow reacquire during panic)
+  	struct console *con;
+ +	bool any_progress;
+  	int cookie;
+  
+ -	cookie = console_srcu_read_lock();
+ -	for_each_console_srcu(con) {
+ -		short flags = console_srcu_read_flags(con);
+ +	do {
+ +		any_progress = false;
+  
+ -		if (!(flags & CON_NBCON))
+ -			continue;
+ +		cookie = console_srcu_read_lock();
+ +		for_each_console_srcu(con) {
+ +			short flags = console_srcu_read_flags(con);
+ +			unsigned long irq_flags;
+  
+ -		if (!console_is_usable(con, flags, true))
+ -			continue;
+ +			if (!(flags & CON_NBCON))
+ +				continue;
+  
+ -		if (nbcon_seq_read(con) >= stop_seq)
+ -			continue;
+ +			if (!console_is_usable(con, flags, true))
+ +				continue;
+  
+ -		nbcon_atomic_flush_pending_con(con, stop_seq, allow_unsafe_takeover);
+ -	}
+ -	console_srcu_read_unlock(cookie);
+ +			if (nbcon_seq_read(con) >= stop_seq)
+ +				continue;
+ +
+ +			memset(ctxt, 0, sizeof(*ctxt));
+ +			ctxt->console			= con;
+ +			ctxt->spinwait_max_us		= 2000;
+ +			ctxt->allow_unsafe_takeover	= allow_unsafe_takeover;
+ +
+ +			/*
+ +			 * Atomic flushing does not use console driver
+ +			 * synchronization (i.e. it does not hold the port
+ +			 * lock for uart consoles). Therefore IRQs must be
+ +			 * disabled to avoid being interrupted and then
+ +			 * calling into a driver that will deadlock trying
+ +			 * acquire console ownership.
+ +			 *
+ +			 * This also disables migration in order to get the
+ +			 * current CPU priority.
+ +			 */
+ +			local_irq_save(irq_flags);
+ +
+ +			ctxt->prio = nbcon_get_default_prio();
+ +
+ +			any_progress |= nbcon_atomic_emit_one(&wctxt);
+ +
+ +			local_irq_restore(irq_flags);
+ +		}
+ +		console_srcu_read_unlock(cookie);
+ +	} while (any_progress);
+  }
+  
+  /**
+@@@ -1546,114 -1752,84 +1743,143 @@@ void nbcon_free(struct console *con
+  	con->pbufs = NULL;
+  }
+  
+ -/**
+ - * nbcon_device_try_acquire - Try to acquire nbcon console and enter unsafe
+ - *				section
+ - * @con:	The nbcon console to acquire
+ - *
+ - * Context:	Under the locking mechanism implemented in
+ - *		@con->device_lock() including disabling migration.
+ - * Return:	True if the console was acquired. False otherwise.
+ - *
+ - * Console drivers will usually use their own internal synchronization
+ - * mechasism to synchronize between console printing and non-printing
+ - * activities (such as setting baud rates). However, nbcon console drivers
+ - * supporting atomic consoles may also want to mark unsafe sections when
+ - * performing non-printing activities in order to synchronize against their
+ - * atomic_write() callback.
+ - *
+ - * This function acquires the nbcon console using priority NBCON_PRIO_NORMAL
+ - * and marks it unsafe for handover/takeover.
+ - */
+ -bool nbcon_device_try_acquire(struct console *con)
+ +static inline bool uart_is_nbcon(struct uart_port *up)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct nbcon_context *ctxt = &ACCESS_PRIVATE(con, nbcon_device_ctxt);
++ 
++ 	cant_migrate();
++ 
++ 	memset(ctxt, 0, sizeof(*ctxt));
++ 	ctxt->console	= con;
++ 	ctxt->prio	= NBCON_PRIO_NORMAL;
++ 
++ 	if (!nbcon_context_try_acquire(ctxt, false))
++ 		return false;
++ 
++ 	if (!nbcon_context_enter_unsafe(ctxt))
++ 		return false;
++ 
++ 	return true;
++ }
++ EXPORT_SYMBOL_GPL(nbcon_device_try_acquire);
++ 
++ /**
++  * nbcon_device_release - Exit unsafe section and release the nbcon console
++  * @con:	The nbcon console acquired in nbcon_device_try_acquire()
++  */
++ void nbcon_device_release(struct console *con)
++ {
++ 	struct nbcon_context *ctxt = &ACCESS_PRIVATE(con, nbcon_device_ctxt);
++ 	struct console_flush_type ft;
+++>>>>>>> 571c1ea91a73 (printk: nbcon: Allow reacquire during panic)
+  	int cookie;
+ +	bool ret;
+  
+ -	if (!nbcon_context_exit_unsafe(ctxt))
+ +	if (!uart_console(up))
+ +		return false;
+ +
+ +	cookie = console_srcu_read_lock();
+ +	ret = (console_srcu_read_flags(up->cons) & CON_NBCON);
+ +	console_srcu_read_unlock(cookie);
+ +	return ret;
+ +}
+ +
+ +/**
+ + * nbcon_acquire - The second half of the port locking wrapper
+ + * @up:		The uart port whose @lock was locked
+ + *
+ + * The uart_port_lock() wrappers will first lock the spin_lock @up->lock.
+ + * Then this function is called to implement nbcon-specific processing.
+ + *
+ + * If @up is an nbcon console, this console will be acquired and marked as
+ + * unsafe. Otherwise this function does nothing.
+ + *
+ + * nbcon consoles acquired via the port lock wrapper always use priority
+ + * NBCON_PRIO_NORMAL.
+ + */
+ +void nbcon_acquire(struct uart_port *up)
+ +{
+ +	struct console *con = up->cons;
+ +	struct nbcon_context ctxt;
+ +
+ +	if (!uart_is_nbcon(up))
+  		return;
+  
+ -	nbcon_context_release(ctxt);
+ +	WARN_ON_ONCE(up->nbcon_locked_port);
+  
+ -	/*
+ -	 * This context must flush any new records added while the console
+ -	 * was locked if the printer thread is not available to do it. The
+ -	 * console_srcu_read_lock must be taken to ensure the console is
+ -	 * usable throughout flushing.
+ -	 */
+ -	cookie = console_srcu_read_lock();
+ -	printk_get_console_flush_type(&ft);
+ -	if (console_is_usable(con, console_srcu_read_flags(con), true) &&
+ -	    !ft.nbcon_offload &&
+ -	    prb_read_valid(prb, nbcon_seq_read(con), NULL)) {
+ -		/*
+ -		 * If nbcon_atomic flushing is not available, fallback to
+ -		 * using the legacy loop.
+ -		 */
+ -		if (ft.nbcon_atomic) {
+ -			__nbcon_atomic_flush_pending_con(con, prb_next_reserve_seq(prb), false);
+ -		} else if (ft.legacy_direct) {
+ -			if (console_trylock())
+ -				console_unlock();
+ -		} else if (ft.legacy_offload) {
+ -			printk_trigger_flush();
+ -		}
+ +	do {
+ +		do {
+ +			memset(&ctxt, 0, sizeof(ctxt));
+ +			ctxt.console	= con;
+ +			ctxt.prio	= NBCON_PRIO_NORMAL;
+ +		} while (!nbcon_context_try_acquire(&ctxt));
+ +
+ +	} while (!nbcon_context_enter_unsafe(&ctxt));
+ +
+ +	up->nbcon_locked_port = true;
+ +}
+ +EXPORT_SYMBOL_GPL(nbcon_acquire);
+ +
+ +/**
+ + * nbcon_release - The first half of the port unlocking wrapper
+ + * @up:		The uart port whose @lock is about to be unlocked
+ + *
+ + * The uart_port_unlock() wrappers will first call this function to implement
+ + * nbcon-specific processing. Then afterwards the uart_port_unlock() wrappers
+ + * will unlock the spin_lock @up->lock.
+ + *
+ + * If @up is an nbcon console, the console will be marked as safe and
+ + * released. Otherwise this function does nothing.
+ + *
+ + * nbcon consoles acquired via the port lock wrapper always use priority
+ + * NBCON_PRIO_NORMAL.
+ + */
+ +void nbcon_release(struct uart_port *up)
+ +{
+ +	struct console *con = up->cons;
+ +	struct nbcon_context ctxt = {
+ +		.console	= con,
+ +		.prio		= NBCON_PRIO_NORMAL,
+ +	};
+ +
+ +	if (!up->nbcon_locked_port)
+ +		return;
+ +
+ +	if (nbcon_context_exit_unsafe(&ctxt))
+ +		nbcon_context_release(&ctxt);
+ +
+ +	up->nbcon_locked_port = false;
+ +}
+ +EXPORT_SYMBOL_GPL(nbcon_release);
+ +
+ +/**
+ + * printk_kthread_shutdown - shutdown all threaded printers
+ + *
+ + * On system shutdown all threaded printers are stopped. This allows printk
+ + * to transition back to atomic printing, thus providing a robust mechanism
+ + * for the final shutdown/reboot messages to be output.
+ + */
+ +static void printk_kthread_shutdown(void)
+ +{
+ +	struct console *con;
+ +
+ +	console_list_lock();
+ +	for_each_console(con) {
+ +		if (con->flags & CON_NBCON)
+ +			nbcon_kthread_stop(con);
+  	}
+ -	console_srcu_read_unlock(cookie);
+ +	console_list_unlock();
+ +}
+ +
+ +static struct syscore_ops printk_syscore_ops = {
+ +	.shutdown = printk_kthread_shutdown,
+ +};
+ +
+ +static int __init printk_init_ops(void)
+ +{
+ +	register_syscore_ops(&printk_syscore_ops);
+ +	return 0;
+  }
+ -EXPORT_SYMBOL_GPL(nbcon_device_release);
+ +device_initcall(printk_init_ops);
+* Unmerged path kernel/printk/nbcon.c
