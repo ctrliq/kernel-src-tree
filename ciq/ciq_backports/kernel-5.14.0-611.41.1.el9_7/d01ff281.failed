@@ -1,0 +1,276 @@
+printk: Allow printk_trigger_flush() to flush all types
+
+jira KERNEL-749
+Rebuild_History Non-Buildable kernel-5.14.0-611.41.1.el9_7
+commit-author John Ogness <john.ogness@linutronix.de>
+commit d01ff281bd9b1bfeac9ab98ec8a9ee41da900d5e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-611.41.1.el9_7/d01ff281.failed
+
+Currently printk_trigger_flush() only triggers legacy offloaded
+flushing, even if that may not be the appropriate method to flush
+for currently registered consoles. (The function predates the
+NBCON consoles.)
+
+Since commit 6690d6b52726 ("printk: Add helper for flush type
+logic") there is printk_get_console_flush_type(), which also
+considers NBCON consoles and reports all the methods of flushing
+appropriate based on the system state and consoles available.
+
+Update printk_trigger_flush() to use
+printk_get_console_flush_type() to appropriately flush registered
+consoles.
+
+	Suggested-by: Petr Mladek <pmladek@suse.com>
+	Signed-off-by: John Ogness <john.ogness@linutronix.de>
+	Reviewed-by: Petr Mladek <pmladek@suse.com>
+Link: https://lore.kernel.org/stable/20251113160351.113031-2-john.ogness%40linutronix.de
+	Tested-by: Sherry Sun <sherry.sun@nxp.com>
+Link: https://patch.msgid.link/20251113160351.113031-2-john.ogness@linutronix.de
+	Signed-off-by: Petr Mladek <pmladek@suse.com>
+(cherry picked from commit d01ff281bd9b1bfeac9ab98ec8a9ee41da900d5e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/printk/nbcon.c
+#	kernel/printk/printk.c
+diff --cc kernel/printk/nbcon.c
+index b4278854eeb9,73f315fd97a3..000000000000
+--- a/kernel/printk/nbcon.c
++++ b/kernel/printk/nbcon.c
+@@@ -1546,114 -1774,84 +1546,142 @@@ void nbcon_free(struct console *con
+  	con->pbufs = NULL;
+  }
+  
+ -/**
+ - * nbcon_device_try_acquire - Try to acquire nbcon console and enter unsafe
+ - *				section
+ - * @con:	The nbcon console to acquire
+ - *
+ - * Context:	Under the locking mechanism implemented in
+ - *		@con->device_lock() including disabling migration.
+ - * Return:	True if the console was acquired. False otherwise.
+ - *
+ - * Console drivers will usually use their own internal synchronization
+ - * mechasism to synchronize between console printing and non-printing
+ - * activities (such as setting baud rates). However, nbcon console drivers
+ - * supporting atomic consoles may also want to mark unsafe sections when
+ - * performing non-printing activities in order to synchronize against their
+ - * atomic_write() callback.
+ - *
+ - * This function acquires the nbcon console using priority NBCON_PRIO_NORMAL
+ - * and marks it unsafe for handover/takeover.
+ - */
+ -bool nbcon_device_try_acquire(struct console *con)
+ +static inline bool uart_is_nbcon(struct uart_port *up)
+  {
+ -	struct nbcon_context *ctxt = &ACCESS_PRIVATE(con, nbcon_device_ctxt);
+ -
+ -	cant_migrate();
+ -
+ -	memset(ctxt, 0, sizeof(*ctxt));
+ -	ctxt->console	= con;
+ -	ctxt->prio	= NBCON_PRIO_NORMAL;
+ -
+ -	if (!nbcon_context_try_acquire(ctxt, false))
+ -		return false;
+ +	int cookie;
+ +	bool ret;
+  
+ -	if (!nbcon_context_enter_unsafe(ctxt))
+ +	if (!uart_console(up))
+  		return false;
+  
+ -	return true;
+ +	cookie = console_srcu_read_lock();
+ +	ret = (console_srcu_read_flags(up->cons) & CON_NBCON);
+ +	console_srcu_read_unlock(cookie);
+ +	return ret;
+  }
+ -EXPORT_SYMBOL_GPL(nbcon_device_try_acquire);
+  
+  /**
+ - * nbcon_device_release - Exit unsafe section and release the nbcon console
+ - * @con:	The nbcon console acquired in nbcon_device_try_acquire()
+ + * nbcon_acquire - The second half of the port locking wrapper
+ + * @up:		The uart port whose @lock was locked
+ + *
+ + * The uart_port_lock() wrappers will first lock the spin_lock @up->lock.
+ + * Then this function is called to implement nbcon-specific processing.
+ + *
+ + * If @up is an nbcon console, this console will be acquired and marked as
+ + * unsafe. Otherwise this function does nothing.
+ + *
+ + * nbcon consoles acquired via the port lock wrapper always use priority
+ + * NBCON_PRIO_NORMAL.
+   */
+ -void nbcon_device_release(struct console *con)
+ +void nbcon_acquire(struct uart_port *up)
+  {
+ -	struct nbcon_context *ctxt = &ACCESS_PRIVATE(con, nbcon_device_ctxt);
+ -	struct console_flush_type ft;
+ -	int cookie;
+ +	struct console *con = up->cons;
+ +	struct nbcon_context ctxt;
+  
+ -	if (!nbcon_context_exit_unsafe(ctxt))
+ +	if (!uart_is_nbcon(up))
+  		return;
+  
+ -	nbcon_context_release(ctxt);
+ +	WARN_ON_ONCE(up->nbcon_locked_port);
+ +
+++<<<<<<< HEAD
+ +	do {
+ +		do {
+ +			memset(&ctxt, 0, sizeof(ctxt));
+ +			ctxt.console	= con;
+ +			ctxt.prio	= NBCON_PRIO_NORMAL;
+ +		} while (!nbcon_context_try_acquire(&ctxt));
+  
+ +	} while (!nbcon_context_enter_unsafe(&ctxt));
+ +
+ +	up->nbcon_locked_port = true;
+++=======
++ 	/*
++ 	 * This context must flush any new records added while the console
++ 	 * was locked if the printer thread is not available to do it. The
++ 	 * console_srcu_read_lock must be taken to ensure the console is
++ 	 * usable throughout flushing.
++ 	 */
++ 	cookie = console_srcu_read_lock();
++ 	printk_get_console_flush_type(&ft);
++ 	if (console_is_usable(con, console_srcu_read_flags(con), true) &&
++ 	    !ft.nbcon_offload &&
++ 	    prb_read_valid(prb, nbcon_seq_read(con), NULL)) {
++ 		/*
++ 		 * If nbcon_atomic flushing is not available, fallback to
++ 		 * using the legacy loop.
++ 		 */
++ 		if (ft.nbcon_atomic) {
++ 			__nbcon_atomic_flush_pending_con(con, prb_next_reserve_seq(prb), false);
++ 		} else if (ft.legacy_direct) {
++ 			if (console_trylock())
++ 				console_unlock();
++ 		} else if (ft.legacy_offload) {
++ 			defer_console_output();
++ 		}
++ 	}
++ 	console_srcu_read_unlock(cookie);
+++>>>>>>> d01ff281bd9b (printk: Allow printk_trigger_flush() to flush all types)
+ +}
+ +EXPORT_SYMBOL_GPL(nbcon_acquire);
+ +
+ +/**
+ + * nbcon_release - The first half of the port unlocking wrapper
+ + * @up:		The uart port whose @lock is about to be unlocked
+ + *
+ + * The uart_port_unlock() wrappers will first call this function to implement
+ + * nbcon-specific processing. Then afterwards the uart_port_unlock() wrappers
+ + * will unlock the spin_lock @up->lock.
+ + *
+ + * If @up is an nbcon console, the console will be marked as safe and
+ + * released. Otherwise this function does nothing.
+ + *
+ + * nbcon consoles acquired via the port lock wrapper always use priority
+ + * NBCON_PRIO_NORMAL.
+ + */
+ +void nbcon_release(struct uart_port *up)
+ +{
+ +	struct console *con = up->cons;
+ +	struct nbcon_context ctxt = {
+ +		.console	= con,
+ +		.prio		= NBCON_PRIO_NORMAL,
+ +	};
+ +
+ +	if (!up->nbcon_locked_port)
+ +		return;
+ +
+ +	if (nbcon_context_exit_unsafe(&ctxt))
+ +		nbcon_context_release(&ctxt);
+ +
+ +	up->nbcon_locked_port = false;
+ +}
+ +EXPORT_SYMBOL_GPL(nbcon_release);
+ +
+ +/**
+ + * printk_kthread_shutdown - shutdown all threaded printers
+ + *
+ + * On system shutdown all threaded printers are stopped. This allows printk
+ + * to transition back to atomic printing, thus providing a robust mechanism
+ + * for the final shutdown/reboot messages to be output.
+ + */
+ +static void printk_kthread_shutdown(void)
+ +{
+ +	struct console *con;
+ +
+ +	console_list_lock();
+ +	for_each_console(con) {
+ +		if (con->flags & CON_NBCON)
+ +			nbcon_kthread_stop(con);
+ +	}
+ +	console_list_unlock();
+ +}
+ +
+ +static struct syscore_ops printk_syscore_ops = {
+ +	.shutdown = printk_kthread_shutdown,
+ +};
+ +
+ +static int __init printk_init_ops(void)
+ +{
+ +	register_syscore_ops(&printk_syscore_ops);
+ +	return 0;
+  }
+ -EXPORT_SYMBOL_GPL(nbcon_device_release);
+ +device_initcall(printk_init_ops);
+diff --cc kernel/printk/printk.c
+index 74127f8be9b6,dc89239cf1b5..000000000000
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@@ -4291,17 -4564,33 +4291,42 @@@ void defer_console_output(void
+  	 * New messages may have been added directly to the ringbuffer
+  	 * using vprintk_store(), so wake any waiters as well.
+  	 */
+ -	__wake_up_klogd(PRINTK_PENDING_WAKEUP | PRINTK_PENDING_OUTPUT);
+ +	int val = PRINTK_PENDING_WAKEUP;
+ +
+ +	if (printing_via_unlock)
+ +		val |= PRINTK_PENDING_OUTPUT;
+ +	__wake_up_klogd(val);
+  }
+  
++ /**
++  * printk_trigger_flush - Attempt to flush printk buffer to consoles.
++  *
++  * If possible, flush the printk buffer to all consoles in the caller's
++  * context. If offloading is available, trigger deferred printing.
++  *
++  * This is best effort. Depending on the system state, console states,
++  * and caller context, no actual flushing may result from this call.
++  */
+  void printk_trigger_flush(void)
+  {
+++<<<<<<< HEAD
+ +	nbcon_wake_threads();
+ +	defer_console_output();
+++=======
++ 	struct console_flush_type ft;
++ 
++ 	printk_get_console_flush_type(&ft);
++ 	if (ft.nbcon_atomic)
++ 		nbcon_atomic_flush_pending();
++ 	if (ft.nbcon_offload)
++ 		nbcon_kthreads_wake();
++ 	if (ft.legacy_direct) {
++ 		if (console_trylock())
++ 			console_unlock();
++ 	}
++ 	if (ft.legacy_offload)
++ 		defer_console_output();
+++>>>>>>> d01ff281bd9b (printk: Allow printk_trigger_flush() to flush all types)
+  }
+  
+  int vprintk_deferred(const char *fmt, va_list args)
+* Unmerged path kernel/printk/nbcon.c
+* Unmerged path kernel/printk/printk.c
