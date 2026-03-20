@@ -130,6 +130,7 @@ fips_module-$(CONFIG_X86_64) +=				\
 # ARM64 hardware-accelerated AES-CE, GHASH-CE, SHA3-CE
 # -----------------------------------------------------------------------
 fips_module-$(CONFIG_ARM64) +=				\
+	lib/crypto/arm64/sha1-ce-core.o			\
 	arch/arm64/crypto/aes-ce-core.o			\
 	arch/arm64/crypto/aes-ce-glue.o			\
 	arch/arm64/crypto/aes-modes.o			\

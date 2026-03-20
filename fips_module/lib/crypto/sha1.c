@@ -138,6 +138,8 @@ static void sha1_blocks_generic(struct sha1_block_state *state,
 
 #ifdef CONFIG_X86_64
 #include "x86/sha1.h"
+#elif defined(CONFIG_ARM64)
+#include "arm64/sha1.h"
 #else
 #define sha1_blocks sha1_blocks_generic
 #endif
