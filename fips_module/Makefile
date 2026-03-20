@@ -110,6 +110,10 @@ fips_module-$(CONFIG_X86_64) +=				\
 	lib/crypto/x86/sha1-ssse3-and-avx.o		\
 	lib/crypto/x86/sha1-avx2-asm.o			\
 	lib/crypto/x86/sha1-ni-asm.o			\
+	lib/crypto/x86/sha256-ssse3-asm.o		\
+	lib/crypto/x86/sha256-avx-asm.o			\
+	lib/crypto/x86/sha256-avx2-asm.o		\
+	lib/crypto/x86/sha256-ni-asm.o			\
 	arch/x86/crypto/aesni-intel_asm.o		\
 	arch/x86/crypto/aesni-intel_glue.o		\
 	arch/x86/crypto/aes-ctr-avx-x86_64.o		\

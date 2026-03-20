@@ -135,9 +135,8 @@ static void sha256_block_generic(struct sha256_block_state *state,
 	state->h[4] += e; state->h[5] += f; state->h[6] += g; state->h[7] += h;
 }
 
-/* Always use the generic C implementation — no arch dispatch. */
-static void sha256_blocks(struct sha256_block_state *state,
-			  const u8 *data, size_t nblocks)
+static void sha256_blocks_generic(struct sha256_block_state *state,
+				  const u8 *data, size_t nblocks)
 {
 	u32 W[64];
 
@@ -147,6 +146,19 @@ static void sha256_blocks(struct sha256_block_state *state,
 	} while (--nblocks);
 
 	memzero_explicit(W, sizeof(W));
+}
+
+#ifdef CONFIG_X86_64
+#include "x86/sha256.h"
+#else
+#define sha256_blocks sha256_blocks_generic
+#endif
+
+void fips_lib_sha256_arch_init(void)
+{
+#ifdef sha256_mod_init_arch
+	sha256_mod_init_arch();
+#endif
 }
 
 static void __sha256_init(struct __sha256_ctx *ctx,
@@ -272,12 +284,20 @@ void fips_lib_sha256_finup_2x(const struct sha256_ctx *ctx,
 	if (ctx == NULL)
 		ctx = &initial_sha256_ctx;
 
+#ifdef CONFIG_X86_64
+	if (sha256_finup_2x_arch(&ctx->ctx, data1, data2, len, out1, out2))
+		return;
+#endif
 	sha256_finup_2x_sequential(&ctx->ctx, data1, data2, len, out1, out2);
 }
 
 bool fips_lib_sha256_finup_2x_is_optimized(void)
 {
+#ifdef CONFIG_X86_64
+	return sha256_finup_2x_is_optimized_arch();
+#else
 	return false;
+#endif
 }
 
 static void __hmac_sha256_preparekey(struct sha256_block_state *istate,
