@@ -210,17 +210,22 @@ $(obj)/crypto/ecdsa-x962.o:  $(obj)/crypto/ecdsasignature.asn1.h
 # happen BEFORE the HMAC patch step, since stripping modifies the file.
 
 PYTHON3 ?= python3
-FIPS_HMAC_PATCH := $(PWD)/scripts/fips_hmac_patch.py
+FIPS_HMAC_PATCH := $(CURDIR)/scripts/fips_hmac_patch.py
 
 all:
-	$(MAKE) -C $(KDIR) M=$(PWD) modules
-	$(PYTHON3) $(FIPS_HMAC_PATCH) $(PWD)/fips_module.ko
-	mv $(PWD)/fips_module.ko $(PWD)/$(FIPS_KO)
+	$(MAKE) -C $(KDIR) M=$(CURDIR) modules
+	$(PYTHON3) $(FIPS_HMAC_PATCH) $(CURDIR)/fips_module.ko
+	mv $(CURDIR)/fips_module.ko $(CURDIR)/$(FIPS_KO)
 
 hmac_patch:
-	$(PYTHON3) $(FIPS_HMAC_PATCH) $(PWD)/fips_module.ko
-	mv $(PWD)/fips_module.ko $(PWD)/$(FIPS_KO)
+	$(PYTHON3) $(FIPS_HMAC_PATCH) $(CURDIR)/fips_module.ko
+	mv $(CURDIR)/fips_module.ko $(CURDIR)/$(FIPS_KO)
+
+# Rename fips_module.ko to the versioned filename without running the HMAC
+# patch step.  Useful after 'make M=fips_module modules' during development.
+rename:
+	mv $(CURDIR)/fips_module.ko $(CURDIR)/$(FIPS_KO)
 
 clean:
-	$(MAKE) -C $(KDIR) M=$(PWD) clean
-	$(RM) $(PWD)/$(FIPS_KO)
+	$(MAKE) -C $(KDIR) M=$(CURDIR) clean
+	$(RM) $(CURDIR)/$(FIPS_KO)
