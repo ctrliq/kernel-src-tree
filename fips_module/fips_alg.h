@@ -107,6 +107,14 @@ void fips_dh_exit(void);
 int  fips_extrng_init(void);
 void fips_extrng_exit(void);
 
+/*
+ * fips_lib_selftests - KATs for lib/crypto functions not covered by the
+ * crypto API self-tests (AES-GCM lib, AES-CFB lib, SHA-256 finup_2x).
+ * Must be called after fips_sha256_bootstrap_selftest() and after all
+ * fips_lib_*_arch_init() calls, but before fips_run_selftests().
+ */
+int  fips_lib_selftests(void);
+
 /* algtest notifier: enforce fips_module's fips_allowed list on all registrations */
 int  fips_algtest_init(void);
 void fips_algtest_exit(void);

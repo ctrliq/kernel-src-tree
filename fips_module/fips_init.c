@@ -496,6 +496,15 @@ static int __init fips_module_init(void)
 		panic("fips_module: drbg init failed\n");
 
 	/*
+	 * Run KATs for lib/crypto library functions that are not exercised
+	 * by the crypto API self-tests below.  Must run after the arch init
+	 * calls (so SIMD dispatch is set up) and after the bootstrap SHA-256
+	 * test (so fips_lib_sha256 is known-correct for the finup_2x check).
+	 */
+	if (fips_lib_selftests())
+		panic("fips_module: lib self-tests FAILED\n");
+
+	/*
 	 * Run the module-private self-tests for every registered algorithm.
 	 * fips_run_selftests() calls fips_alg_test() which resolves to the
 	 * local copy of alg_test() in this module's bundled testmgr.c, not

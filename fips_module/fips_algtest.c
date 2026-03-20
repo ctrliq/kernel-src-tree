@@ -36,6 +36,11 @@
  *   CRYPTO_MSG_ALG_REGISTER is fired from crypto_schedule_test() after
  *   crypto_alg_sem has been released, so calling crypto_alg_tested() from
  *   within this notifier (case 1) is safe — no lock ordering violation.
+ *
+ * fips_lib_selftests() is also defined here.  It runs known-answer tests
+ * for lib/crypto library functions (AES-GCM lib, AES-CFB lib, SHA-256
+ * finup_2x) that are not exercised by the crypto API self-tests in
+ * fips_run_selftests().
  */
 
 #include <linux/crypto.h>
@@ -44,7 +49,14 @@
 #include <linux/notifier.h>
 #include <linux/rwsem.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 #include <crypto/algapi.h>
+#include <crypto/aes.h>
+#include <crypto/gcm.h>
+#include "lib/crypto/aes_lib.h"
+#include "lib/crypto/aesgcm_lib.h"
+#include "lib/crypto/aescfb_lib.h"
+#include "lib/crypto/sha256_lib.h"
 
 extern struct list_head crypto_alg_list;
 extern struct rw_semaphore crypto_alg_sem;
@@ -231,6 +243,205 @@ void fips_sweep_preregistered_algs(void)
 		}
 	}
 	up_write(&crypto_alg_sem);
+}
+
+/*
+ * fips_lib_selftests - Known-answer tests for lib/crypto functions that are
+ * not exercised indirectly by the crypto API self-tests in fips_run_selftests().
+ *
+ * Three algorithms are covered:
+ *
+ * 1. AES-GCM library API (fips_lib_aesgcm_expandkey/encrypt/decrypt)
+ *    The crypto API gcm(aes) implementation composes ctr(aes) + GHASH and
+ *    is a completely separate code path from lib/crypto/aesgcm.c.
+ *    Vector: NIST SP 800-38D, AES-128-GCM, zeroed key/IV/PT, no AAD,
+ *            authsize = 16.
+ *
+ * 2. AES-CFB library API (fips_lib_aescfb_encrypt/decrypt)
+ *    No AES-CFB mode is registered as a crypto API algorithm in fips_module.
+ *    Vector: NIST SP 800-38A F.3.13, AES-128-CFB128, first 32 bytes.
+ *
+ * 3. SHA-256 finup_2x (fips_lib_sha256_finup_2x)
+ *    Parallelised path not exercised by the sha256 shash self-test.
+ *    Correctness check: result must match two independent fips_lib_sha256()
+ *    calls.  fips_lib_sha256 itself was already KAT-tested by
+ *    fips_sha256_bootstrap_selftest() before this function is called.
+ *    Two 64-byte messages are used (>= SHA256_BLOCK_SIZE) so that arch
+ *    SIMD acceleration paths (x86 SHA-NI, arm64 SHA-CE) are exercised.
+ *
+ * Returns 0 on success, -EINVAL on any failure.
+ */
+int fips_lib_selftests(void)
+{
+	int ret = -EINVAL;
+
+	/* -------------------------------------------------------------------
+	 * 1. AES-GCM library KAT
+	 *
+	 * NIST SP 800-38D, AES-128-GCM test case (from testmgr.h vector 2):
+	 *   Key  : 16 zero bytes
+	 *   IV   : 12 zero bytes
+	 *   PT   : 16 zero bytes
+	 *   AAD  : none
+	 *   CT   : 0388dace60b6a392 f328c2b971b2fe78
+	 *   Tag  : ab6e47d42cec13bd f53a67b21257bddf
+	 * ------------------------------------------------------------------- */
+	{
+		static const u8 gcm_key[16]; /* zeroed */
+		static const u8 gcm_iv[GCM_AES_IV_SIZE]; /* zeroed */
+		static const u8 gcm_pt[16]; /* zeroed */
+		static const u8 gcm_ct[16] = {
+			0x03, 0x88, 0xda, 0xce, 0x60, 0xb6, 0xa3, 0x92,
+			0xf3, 0x28, 0xc2, 0xb9, 0x71, 0xb2, 0xfe, 0x78,
+		};
+		static const u8 gcm_tag[16] = {
+			0xab, 0x6e, 0x47, 0xd4, 0x2c, 0xec, 0x13, 0xbd,
+			0xf5, 0x3a, 0x67, 0xb2, 0x12, 0x57, 0xbd, 0xdf,
+		};
+		struct aesgcm_ctx ctx;
+		u8 out[16];
+		u8 tag[16];
+
+		if (fips_lib_aesgcm_expandkey(&ctx, gcm_key, sizeof(gcm_key),
+					      sizeof(gcm_tag)) < 0) {
+			pr_err("fips_module: AES-GCM lib KAT: expandkey failed\n");
+			goto out;
+		}
+
+		fips_lib_aesgcm_encrypt(&ctx, out, gcm_pt, sizeof(gcm_pt),
+					NULL, 0, gcm_iv, tag);
+		if (memcmp(out, gcm_ct, sizeof(gcm_ct)) ||
+		    memcmp(tag, gcm_tag, sizeof(gcm_tag))) {
+			pr_err("fips_module: AES-GCM lib KAT: encrypt mismatch\n");
+			goto out;
+		}
+
+		memset(out, 0, sizeof(out));
+		if (!fips_lib_aesgcm_decrypt(&ctx, out, gcm_ct, sizeof(gcm_ct),
+					     NULL, 0, gcm_iv, gcm_tag)) {
+			pr_err("fips_module: AES-GCM lib KAT: decrypt auth failed\n");
+			goto out;
+		}
+		if (memcmp(out, gcm_pt, sizeof(gcm_pt))) {
+			pr_err("fips_module: AES-GCM lib KAT: decrypt mismatch\n");
+			goto out;
+		}
+
+		memzero_explicit(&ctx, sizeof(ctx));
+		pr_info("fips_module: alg: self-tests for %s (%s) passed\n",
+			"fips-aesgcm-lib", "aesgcm");
+	}
+
+	/* -------------------------------------------------------------------
+	 * 2. AES-CFB library KAT
+	 *
+	 * NIST SP 800-38A F.3.13, AES-128-CFB128, first 32 bytes:
+	 *   Key  : 2b7e151628aed2a6 abf7158809cf4f3c
+	 *   IV   : 00010203 04050607 08090a0b 0c0d0e0f
+	 *   PT   : 6bc1bee2 2e409f96 e93d7e11 73931720
+	 *          ae2d8a57 1e03ac9c 9eb76fac 45af8e51
+	 *   CT   : 3b3fd92e b72dad20 333449f8 e83cfb4a
+	 *          c8a64537 a0b3a93f cde3cdad 9f1ce58b
+	 * ------------------------------------------------------------------- */
+	{
+		static const u8 cfb_key[16] = {
+			0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6,
+			0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c,
+		};
+		static const u8 cfb_iv[AES_BLOCK_SIZE] = {
+			0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+			0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+		};
+		static const u8 cfb_pt[32] = {
+			0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96,
+			0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93, 0x17, 0x2a,
+			0xae, 0x2d, 0x8a, 0x57, 0x1e, 0x03, 0xac, 0x9c,
+			0x9e, 0xb7, 0x6f, 0xac, 0x45, 0xaf, 0x8e, 0x51,
+		};
+		static const u8 cfb_ct[32] = {
+			0x3b, 0x3f, 0xd9, 0x2e, 0xb7, 0x2d, 0xad, 0x20,
+			0x33, 0x34, 0x49, 0xf8, 0xe8, 0x3c, 0xfb, 0x4a,
+			0xc8, 0xa6, 0x45, 0x37, 0xa0, 0xb3, 0xa9, 0x3f,
+			0xcd, 0xe3, 0xcd, 0xad, 0x9f, 0x1c, 0xe5, 0x8b,
+		};
+		struct crypto_aes_ctx aes_ctx;
+		u8 out[32];
+
+		if (fips_lib_aes_expandkey(&aes_ctx, cfb_key,
+					   sizeof(cfb_key)) < 0) {
+			pr_err("fips_module: AES-CFB lib KAT: expandkey failed\n");
+			goto out;
+		}
+
+		fips_lib_aescfb_encrypt(&aes_ctx, out, cfb_pt,
+					sizeof(cfb_pt), cfb_iv);
+		if (memcmp(out, cfb_ct, sizeof(cfb_ct))) {
+			pr_err("fips_module: AES-CFB lib KAT: encrypt mismatch\n");
+			goto out;
+		}
+
+		fips_lib_aescfb_decrypt(&aes_ctx, out, cfb_ct,
+					sizeof(cfb_ct), cfb_iv);
+		if (memcmp(out, cfb_pt, sizeof(cfb_pt))) {
+			pr_err("fips_module: AES-CFB lib KAT: decrypt mismatch\n");
+			goto out;
+		}
+
+		memzero_explicit(&aes_ctx, sizeof(aes_ctx));
+		pr_info("fips_module: alg: self-tests for %s (%s) passed\n",
+			"fips-aescfb-lib", "aescfb");
+	}
+
+	/* -------------------------------------------------------------------
+	 * 3. SHA-256 finup_2x correctness check
+	 *
+	 * Verifies that fips_lib_sha256_finup_2x(NULL, data1, data2, len,
+	 * out1, out2) produces the same digests as two independent
+	 * fips_lib_sha256() calls.  fips_lib_sha256 was already KAT-tested
+	 * by fips_sha256_bootstrap_selftest() before this function is called.
+	 *
+	 * Two distinct 64-byte messages are used so that both output lanes
+	 * are independently verified and arch SIMD paths (x86 SHA-NI, arm64
+	 * SHA-CE) are exercised (those paths require len >= SHA256_BLOCK_SIZE).
+	 *
+	 * data1: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-"
+	 *   SHA-256 = b5fead567dffcba4 2c32293219bbfbfa
+	 *             d6ff94a372918566 63ba787758a3403a   (from NIST / testmgr.h)
+	 * data2: same string with last two bytes changed to "+="
+	 *   SHA-256 verified via consistency with fips_lib_sha256()
+	 * ------------------------------------------------------------------- */
+	{
+		static const u8 data1[64] =
+			"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-";
+		static const u8 data2[64] =
+			"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+=";
+		static const u8 expected1[SHA256_DIGEST_SIZE] = {
+			0xb5, 0xfe, 0xad, 0x56, 0x7d, 0xff, 0xcb, 0xa4,
+			0x2c, 0x32, 0x29, 0x32, 0x19, 0xbb, 0xfb, 0xfa,
+			0xd6, 0xff, 0x94, 0xa3, 0x72, 0x91, 0x85, 0x66,
+			0x3b, 0xa7, 0x87, 0x77, 0x58, 0xa3, 0x40, 0x3a,
+		};
+		u8 ref2[SHA256_DIGEST_SIZE];
+		u8 out1[SHA256_DIGEST_SIZE], out2[SHA256_DIGEST_SIZE];
+
+		/* Compute expected SHA-256 of data2 using the already-tested
+		 * scalar path, then compare both outputs from finup_2x. */
+		fips_lib_sha256(data2, sizeof(data2), ref2);
+		fips_lib_sha256_finup_2x(NULL, data1, data2, sizeof(data1),
+					 out1, out2);
+
+		if (memcmp(out1, expected1, SHA256_DIGEST_SIZE) ||
+		    memcmp(out2, ref2, SHA256_DIGEST_SIZE)) {
+			pr_err("fips_module: SHA-256 finup_2x KAT failed\n");
+			goto out;
+		}
+		pr_info("fips_module: alg: self-tests for %s (%s) passed\n",
+			"fips-sha256-finup2x", "sha256-finup-2x");
+	}
+
+	ret = 0;
+out:
+	return ret;
 }
 
 int fips_algtest_init(void)
