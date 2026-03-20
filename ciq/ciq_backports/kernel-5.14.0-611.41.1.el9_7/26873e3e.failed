@@ -1,0 +1,309 @@
+printk: Avoid scheduling irq_work on suspend
+
+jira KERNEL-749
+Rebuild_History Non-Buildable kernel-5.14.0-611.41.1.el9_7
+commit-author John Ogness <john.ogness@linutronix.de>
+commit 26873e3e7f0cb26c45e6ad63656f9fe36b2aa31b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-611.41.1.el9_7/26873e3e.failed
+
+Allowing irq_work to be scheduled while trying to suspend has shown
+to cause problems as some architectures interpret the pending
+interrupts as a reason to not suspend. This became a problem for
+printk() with the introduction of NBCON consoles. With every
+printk() call, NBCON console printing kthreads are woken by queueing
+irq_work. This means that irq_work continues to be queued due to
+printk() calls late in the suspend procedure.
+
+Avoid this problem by preventing printk() from queueing irq_work
+once console suspending has begun. This applies to triggering NBCON
+and legacy deferred printing as well as klogd waiters.
+
+Since triggering of NBCON threaded printing relies on irq_work, the
+pr_flush() within console_suspend_all() is used to perform the final
+flushing before suspending consoles and blocking irq_work queueing.
+NBCON consoles that are not suspended (due to the usage of the
+"no_console_suspend" boot argument) transition to atomic flushing.
+
+Introduce a new global variable @console_irqwork_blocked to flag
+when irq_work queueing is to be avoided. The flag is used by
+printk_get_console_flush_type() to avoid allowing deferred printing
+and switch NBCON consoles to atomic flushing. It is also used by
+vprintk_emit() to avoid klogd waking.
+
+Add WARN_ON_ONCE(console_irqwork_blocked) to the irq_work queuing
+functions to catch any code that attempts to queue printk irq_work
+during the suspending/resuming procedure.
+
+	Cc: stable@vger.kernel.org # 6.13.x because no drivers in 6.12.x
+Fixes: 6b93bb41f6ea ("printk: Add non-BKL (nbcon) console basic infrastructure")
+Closes: https://lore.kernel.org/lkml/DB9PR04MB8429E7DDF2D93C2695DE401D92C4A@DB9PR04MB8429.eurprd04.prod.outlook.com
+	Signed-off-by: John Ogness <john.ogness@linutronix.de>
+	Reviewed-by: Petr Mladek <pmladek@suse.com>
+	Tested-by: Sherry Sun <sherry.sun@nxp.com>
+Link: https://patch.msgid.link/20251113160351.113031-3-john.ogness@linutronix.de
+	Signed-off-by: Petr Mladek <pmladek@suse.com>
+(cherry picked from commit 26873e3e7f0cb26c45e6ad63656f9fe36b2aa31b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/printk/internal.h
+#	kernel/printk/nbcon.c
+#	kernel/printk/printk.c
+diff --cc kernel/printk/internal.h
+index c6edec471735,b20929b7d71f..000000000000
+--- a/kernel/printk/internal.h
++++ b/kernel/printk/internal.h
+@@@ -192,6 -209,103 +192,106 @@@ static inline bool console_is_usable(st
+  
+  #endif /* CONFIG_PRINTK */
+  
+++<<<<<<< HEAD
+++=======
++ extern bool have_boot_console;
++ extern bool have_nbcon_console;
++ extern bool have_legacy_console;
++ extern bool legacy_allow_panic_sync;
++ 
++ /**
++  * struct console_flush_type - Define available console flush methods
++  * @nbcon_atomic:	Flush directly using nbcon_atomic() callback
++  * @nbcon_offload:	Offload flush to printer thread
++  * @legacy_direct:	Call the legacy loop in this context
++  * @legacy_offload:	Offload the legacy loop into IRQ or legacy thread
++  *
++  * Note that the legacy loop also flushes the nbcon consoles.
++  */
++ struct console_flush_type {
++ 	bool	nbcon_atomic;
++ 	bool	nbcon_offload;
++ 	bool	legacy_direct;
++ 	bool	legacy_offload;
++ };
++ 
++ extern bool console_irqwork_blocked;
++ 
++ /*
++  * Identify which console flushing methods should be used in the context of
++  * the caller.
++  */
++ static inline void printk_get_console_flush_type(struct console_flush_type *ft)
++ {
++ 	memset(ft, 0, sizeof(*ft));
++ 
++ 	switch (nbcon_get_default_prio()) {
++ 	case NBCON_PRIO_NORMAL:
++ 		if (have_nbcon_console && !have_boot_console) {
++ 			if (printk_kthreads_running && !console_irqwork_blocked)
++ 				ft->nbcon_offload = true;
++ 			else
++ 				ft->nbcon_atomic = true;
++ 		}
++ 
++ 		/* Legacy consoles are flushed directly when possible. */
++ 		if (have_legacy_console || have_boot_console) {
++ 			if (!is_printk_legacy_deferred())
++ 				ft->legacy_direct = true;
++ 			else if (!console_irqwork_blocked)
++ 				ft->legacy_offload = true;
++ 		}
++ 		break;
++ 
++ 	case NBCON_PRIO_EMERGENCY:
++ 		if (have_nbcon_console && !have_boot_console)
++ 			ft->nbcon_atomic = true;
++ 
++ 		/* Legacy consoles are flushed directly when possible. */
++ 		if (have_legacy_console || have_boot_console) {
++ 			if (!is_printk_legacy_deferred())
++ 				ft->legacy_direct = true;
++ 			else if (!console_irqwork_blocked)
++ 				ft->legacy_offload = true;
++ 		}
++ 		break;
++ 
++ 	case NBCON_PRIO_PANIC:
++ 		/*
++ 		 * In panic, the nbcon consoles will directly print. But
++ 		 * only allowed if there are no boot consoles.
++ 		 */
++ 		if (have_nbcon_console && !have_boot_console)
++ 			ft->nbcon_atomic = true;
++ 
++ 		if (have_legacy_console || have_boot_console) {
++ 			/*
++ 			 * This is the same decision as NBCON_PRIO_NORMAL
++ 			 * except that offloading never occurs in panic.
++ 			 *
++ 			 * Note that console_flush_on_panic() will flush
++ 			 * legacy consoles anyway, even if unsafe.
++ 			 */
++ 			if (!is_printk_legacy_deferred())
++ 				ft->legacy_direct = true;
++ 
++ 			/*
++ 			 * In panic, if nbcon atomic printing occurs,
++ 			 * the legacy consoles must remain silent until
++ 			 * explicitly allowed.
++ 			 */
++ 			if (ft->nbcon_atomic && !legacy_allow_panic_sync)
++ 				ft->legacy_direct = false;
++ 		}
++ 		break;
++ 
++ 	default:
++ 		WARN_ON_ONCE(1);
++ 		break;
++ 	}
++ }
++ 
+++>>>>>>> 26873e3e7f0c (printk: Avoid scheduling irq_work on suspend)
+  extern struct printk_buffers printk_shared_pbufs;
+  
+  /**
+diff --cc kernel/printk/nbcon.c
+index b4278854eeb9,730d14f6cbc5..000000000000
+--- a/kernel/printk/nbcon.c
++++ b/kernel/printk/nbcon.c
+@@@ -1124,8 -1273,21 +1124,21 @@@ void nbcon_wake_threads(void
+  	struct console *con;
+  	int cookie;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!printk_kthreads_running)
++ 		return;
++ 
++ 	/*
++ 	 * It is not allowed to call this function when console irq_work
++ 	 * is blocked.
++ 	 */
++ 	if (WARN_ON_ONCE(console_irqwork_blocked))
++ 		return;
++ 
+++>>>>>>> 26873e3e7f0c (printk: Avoid scheduling irq_work on suspend)
+  	cookie = console_srcu_read_lock();
+  	for_each_console_srcu(con) {
+ -		if (!(console_srcu_read_flags(con) & CON_NBCON))
+ -			continue;
+ -
+  		/*
+  		 * Only schedule irq_work if the printing thread is
+  		 * actively waiting. If not waiting, the thread will
+diff --cc kernel/printk/printk.c
+index 74127f8be9b6,b1c0d35cf3ca..000000000000
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@@ -485,11 -459,15 +485,20 @@@ bool have_nbcon_console
+   */
+  bool have_boot_console;
+  
+++<<<<<<< HEAD
+++=======
++ /* See printk_legacy_allow_panic_sync() for details. */
++ bool legacy_allow_panic_sync;
++ 
++ /* Avoid using irq_work when suspending. */
++ bool console_irqwork_blocked;
++ 
+++>>>>>>> 26873e3e7f0c (printk: Avoid scheduling irq_work on suspend)
+  #ifdef CONFIG_PRINTK
+  DECLARE_WAIT_QUEUE_HEAD(log_wait);
+ +
+  static DECLARE_WAIT_QUEUE_HEAD(legacy_wait);
+ +
+  /* All 3 protected by @syslog_lock. */
+  /* the next printk record to read by syslog(READ) or /proc/kmsg */
+  static u64 syslog_seq;
+@@@ -2452,10 -2427,10 +2461,16 @@@ asmlinkage int vprintk_emit(int facilit
+  		preempt_enable();
+  	}
+  
+++<<<<<<< HEAD
+ +	if (do_trylock_unlock)
+++=======
++ 	if (ft.legacy_offload)
++ 		defer_console_output();
++ 	else if (!console_irqwork_blocked)
+++>>>>>>> 26873e3e7f0c (printk: Avoid scheduling irq_work on suspend)
+  		wake_up_klogd();
+ +	else
+ +		defer_console_output();
+  
+  	return printed_len;
+  }
+@@@ -2708,40 -2762,39 +2733,56 @@@ void suspend_console(void
+  	synchronize_srcu(&console_srcu);
+  }
+  
+ -void console_resume_all(void)
+ +void resume_console(void)
+  {
+ -	struct console_flush_type ft;
+  	struct console *con;
+ +	short flags;
+ +	int cookie;
+  
+- 	if (!console_suspend_enabled)
+- 		return;
+- 
+- 	console_list_lock();
+- 	for_each_console(con)
+- 		console_srcu_write_flags(con, con->flags & ~CON_SUSPENDED);
+- 	console_list_unlock();
+- 
+  	/*
+- 	 * Ensure that all SRCU list walks have completed. All printing
+- 	 * contexts must be able to see they are no longer suspended so
+- 	 * that they are guaranteed to wake up and resume printing.
++ 	 * Allow queueing irq_work. After restoring console state, deferred
++ 	 * printing and any klogd waiters need to be triggered in case there
++ 	 * is now a console backlog.
+  	 */
+- 	synchronize_srcu(&console_srcu);
++ 	console_irqwork_blocked = false;
++ 
++ 	if (console_suspend_enabled) {
++ 		console_list_lock();
++ 		for_each_console(con)
++ 			console_srcu_write_flags(con, con->flags & ~CON_SUSPENDED);
++ 		console_list_unlock();
++ 
++ 		/*
++ 		 * Ensure that all SRCU list walks have completed. All printing
++ 		 * contexts must be able to see they are no longer suspended so
++ 		 * that they are guaranteed to wake up and resume printing.
++ 		 */
++ 		synchronize_srcu(&console_srcu);
++ 	}
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Since this runs in task context, wake the threaded printers
+ +	 * directly rather than scheduling irq_work to do it.
+ +	 */
+ +	cookie = console_srcu_read_lock();
+ +	for_each_console_srcu(con) {
+ +		flags = console_srcu_read_flags(con);
+ +		if (flags & CON_NBCON)
+ +			nbcon_kthread_wake(con);
+ +	}
+ +	console_srcu_read_unlock(cookie);
+ +
+ +	wake_up_legacy_kthread();
+++=======
++ 	printk_get_console_flush_type(&ft);
++ 	if (ft.nbcon_offload)
++ 		nbcon_kthreads_wake();
++ 	if (ft.legacy_offload)
++ 		defer_console_output();
++ 	else
++ 		wake_up_klogd();
+++>>>>>>> 26873e3e7f0c (printk: Avoid scheduling irq_work on suspend)
+  
+  	pr_flush(1000, true);
+  }
+* Unmerged path kernel/printk/internal.h
+* Unmerged path kernel/printk/nbcon.c
+* Unmerged path kernel/printk/printk.c
