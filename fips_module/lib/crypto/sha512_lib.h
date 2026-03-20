@@ -98,4 +98,7 @@ static inline void fips_lib_hmac_sha512_update(struct hmac_sha512_ctx *ctx,
 	fips_lib__sha512_update(&ctx->ctx.sha_ctx, data, data_len);
 }
 
+/* Initialise arch-specific SHA-512 acceleration (call once at module init). */
+void fips_lib_sha512_arch_init(void);
+
 #endif /* _FIPS_LIB_CRYPTO_SHA512_LIB_H */

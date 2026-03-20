@@ -139,8 +139,18 @@ static void sha512_blocks_generic(struct sha512_block_state *state,
 	} while (--nblocks);
 }
 
-/* For Stage 1d (generic C only): always use the C implementation. */
+#ifdef CONFIG_X86_64
+#include "x86/sha512.h"
+#else
 #define sha512_blocks sha512_blocks_generic
+#endif
+
+void fips_lib_sha512_arch_init(void)
+{
+#ifdef sha512_mod_init_arch
+	sha512_mod_init_arch();
+#endif
+}
 
 static void __sha512_init(struct __sha512_ctx *ctx,
 			  const struct sha512_block_state *iv,
