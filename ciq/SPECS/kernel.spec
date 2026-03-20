@@ -2023,14 +2023,6 @@ done
 # signkernel signmodules
 %endif
 
-# Adjust FIPS module name for RHEL
-%if 0%{?rhel}
-%{log_msg "Adjust FIPS module name for RHEL"}
-for i in *.config; do
-  sed -i 's/CONFIG_CRYPTO_FIPS_NAME=.*/CONFIG_CRYPTO_FIPS_NAME="Red Hat Enterprise Linux %{rhel} - Kernel Cryptographic API"/' $i
-done
-%endif
-
 %{log_msg "Set process_configs.sh $OPTS"}
 cp %{SOURCE81} .
 OPTS=""
