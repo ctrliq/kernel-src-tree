@@ -136,8 +136,18 @@ static void sha1_blocks_generic(struct sha1_block_state *state,
 	memzero_explicit(workspace, sizeof(workspace));
 }
 
-/* For Stage 1b (generic C only): always use the C implementation. */
+#ifdef CONFIG_X86_64
+#include "x86/sha1.h"
+#else
 #define sha1_blocks sha1_blocks_generic
+#endif
+
+void fips_lib_sha1_arch_init(void)
+{
+#ifdef sha1_mod_init_arch
+	sha1_mod_init_arch();
+#endif
+}
 
 void fips_lib_sha1_init(struct sha1_ctx *ctx)
 {

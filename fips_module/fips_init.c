@@ -18,6 +18,7 @@
 #include <linux/kernel.h>
 #include <linux/crypto.h>
 #include <linux/fips.h>
+#include "lib/crypto/sha1_lib.h"
 
 /*
  * Forward declarations for all algorithm init/exit functions.
@@ -418,6 +419,7 @@ static int __init fips_module_init(void)
 		panic("fips_module: aes_generic init failed\n");
 	if (fips_ghash_init())
 		panic("fips_module: ghash init failed\n");
+	fips_lib_sha1_arch_init();
 	if (fips_sha1_init())
 		panic("fips_module: sha1 init failed\n");
 	if (fips_sha256_init())

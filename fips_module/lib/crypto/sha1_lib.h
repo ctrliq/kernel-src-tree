@@ -40,4 +40,7 @@ void fips_lib_hmac_sha1_usingrawkey(const u8 *raw_key, size_t raw_key_len,
 				    const u8 *data, size_t data_len,
 				    u8 out[SHA1_DIGEST_SIZE]);
 
+/* Initialise arch-specific SHA-1 acceleration (call once at module init). */
+void fips_lib_sha1_arch_init(void);
+
 #endif /* _FIPS_LIB_CRYPTO_SHA1_LIB_H */

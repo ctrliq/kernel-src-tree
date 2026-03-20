@@ -107,6 +107,9 @@ fips_module-y :=					\
 # x86_64 hardware-accelerated AES-NI and GHASH
 # -----------------------------------------------------------------------
 fips_module-$(CONFIG_X86_64) +=				\
+	lib/crypto/x86/sha1-ssse3-and-avx.o		\
+	lib/crypto/x86/sha1-avx2-asm.o			\
+	lib/crypto/x86/sha1-ni-asm.o			\
 	arch/x86/crypto/aesni-intel_asm.o		\
 	arch/x86/crypto/aesni-intel_glue.o		\
 	arch/x86/crypto/aes-ctr-avx-x86_64.o		\
