@@ -189,9 +189,11 @@ CFLAGS_lib/crypto/aes.o     := $(call cc-option,-fno-code-hoisting)
 # a generated .asn1.h, so that make generates the header before compiling
 # that file.
 
+ifdef KERNELRELEASE
 $(obj)/crypto/rsa_helper.o:  $(obj)/crypto/rsapubkey.asn1.h \
 			     $(obj)/crypto/rsaprivkey.asn1.h
 $(obj)/crypto/ecdsa-x962.o:  $(obj)/crypto/ecdsasignature.asn1.h
+endif
 
 # -----------------------------------------------------------------------
 # Build targets
