@@ -130,6 +130,7 @@ static void reconn_set_next_dfs_target(struct TCP_Server_Info *server,
 				       struct dfs_cache_tgt_iterator **tgt_it)
 {
 	const char *name;
+	char *hostname;
 	int rc;
 
 	if (!cifs_sb || !cifs_sb->origin_fullpath)
@@ -147,13 +148,18 @@ static void reconn_set_next_dfs_target(struct TCP_Server_Info *server,
 
 	name = dfs_cache_get_tgt_name(*tgt_it);
 
-	kfree(server->hostname);
-
-	server->hostname = extract_hostname(name);
-	if (IS_ERR(server->hostname)) {
+	hostname = extract_hostname(name);
+	if (!IS_ERR(hostname)) {
+		spin_lock(&server->srv_lock);
+		kfree(server->hostname);
+		server->hostname = hostname;
+		spin_unlock(&server->srv_lock);
+	} else {
 		cifs_dbg(FYI,
 			 "%s: failed to extract hostname from target: %ld\n",
-			 __func__, PTR_ERR(server->hostname));
+			 __func__, PTR_ERR(hostname));
+		cifs_dbg(FYI, "%s: default to last target server: %s\n", __func__,
+			 server->hostname);
 	}
 
 	rc = reconn_set_ipaddr_from_hostname(server);
@@ -418,9 +424,7 @@ cifs_echo_request(struct work_struct *work)
 		goto requeue_echo;
 
 	rc = server->ops->echo ? server->ops->echo(server) : -ENOSYS;
-	if (rc)
-		cifs_dbg(FYI, "Unable to send echo request to server: %s\n",
-			 server->hostname);
+	cifs_server_dbg(FYI, "send echo request: rc = %d\n", rc);
 
 #ifdef CONFIG_CIFS_SWN_UPCALL
 	/* Check witness registrations */
@@ -1194,8 +1198,12 @@ static int match_server(struct TCP_Server_Info *server, struct smb3_fs_context *
 	if (!net_eq(cifs_net_ns(server), current->nsproxy->net_ns))
 		return 0;
 
-	if (strcasecmp(server->hostname, ctx->server_hostname))
+	spin_lock(&server->srv_lock);
+	if (strcasecmp(server->hostname, ctx->server_hostname)) {
+		spin_unlock(&server->srv_lock);
 		return 0;
+	}
+	spin_unlock(&server->srv_lock);
 
 	if (!match_address(server, addr,
 			   (struct sockaddr *)&ctx->srcaddr))
@@ -1343,6 +1351,7 @@ cifs_get_tcp_session(struct smb3_fs_context *ctx)
 	tcp_ses->lstrp = jiffies;
 	tcp_ses->compress_algorithm = cpu_to_le16(ctx->compression);
 	spin_lock_init(&tcp_ses->req_lock);
+	spin_lock_init(&tcp_ses->srv_lock);
 	INIT_LIST_HEAD(&tcp_ses->tcp_ses_list);
 	INIT_LIST_HEAD(&tcp_ses->smb_ses_list);
 	INIT_DELAYED_WORK(&tcp_ses->echo, cifs_echo_request);
@@ -1512,7 +1521,9 @@ cifs_setup_ipc(struct cifs_ses *ses, struct smb3_fs_context *ctx)
 	if (tcon == NULL)
 		return -ENOMEM;
 
+	spin_lock(&server->srv_lock);
 	scnprintf(unc, sizeof(unc), "\\\\%s\\IPC$", server->hostname);
+	spin_unlock(&server->srv_lock);
 
 	xid = get_xid();
 	tcon->ses = ses;
