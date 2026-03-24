@@ -21,4 +21,7 @@ void fips_lib_aes_decrypt(const struct crypto_aes_ctx *ctx, u8 *out,
 
 int fips_aes_bootstrap_selftest(void);
 
+/* Redirect vmlinux lib/crypto AES call sites to fips_lib_ implementations. */
+void fips_lib_aes_redirect(void);
+
 #endif /* _FIPS_LIB_CRYPTO_AES_LIB_H */

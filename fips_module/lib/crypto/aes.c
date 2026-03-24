@@ -15,6 +15,7 @@
 #include <crypto/aes.h>
 #include <linux/kernel.h>
 #include <linux/printk.h>
+#include <linux/static_call.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
 #include "aes_lib.h"
@@ -329,6 +330,20 @@ void fips_lib_aes_decrypt(const struct crypto_aes_ctx *ctx, u8 *out,
 	put_unaligned_le32(inv_subshift(st1, 1) ^ rkp[5], out + 4);
 	put_unaligned_le32(inv_subshift(st1, 2) ^ rkp[6], out + 8);
 	put_unaligned_le32(inv_subshift(st1, 3) ^ rkp[7], out + 12);
+}
+
+/*
+ * fips_lib_aes_redirect - redirect vmlinux AES call sites to fips_lib_
+ *
+ * Patches every static_call site for aes_expandkey(), aes_encrypt(), and
+ * aes_decrypt() to dispatch to the in-boundary fips_lib_ implementations.
+ * Must be called after self-tests have passed.
+ */
+void fips_lib_aes_redirect(void)
+{
+	static_call_update(aes_expandkey, fips_lib_aes_expandkey);
+	static_call_update(aes_encrypt,   fips_lib_aes_encrypt);
+	static_call_update(aes_decrypt,   fips_lib_aes_decrypt);
 }
 
 /*
