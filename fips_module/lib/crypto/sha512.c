@@ -21,6 +21,7 @@
 #include <crypto/sha2.h>
 #include <linux/kernel.h>
 #include <linux/overflow.h>
+#include <linux/static_call.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
 #include <linux/wordpart.h>
@@ -406,4 +407,33 @@ void fips_lib_hmac_sha512_usingrawkey(const u8 *raw_key, size_t raw_key_len,
 	fips_lib_hmac_sha512_init_usingrawkey(&ctx, raw_key, raw_key_len);
 	fips_lib_hmac_sha512_update(&ctx, data, data_len);
 	fips_lib_hmac_sha512_final(&ctx, out);
+}
+
+/*
+ * fips_lib_sha512_redirect - redirect vmlinux SHA-384/512 call sites to fips_lib_
+ *
+ * Patches every static_call site for the SHA-384, SHA-512, and
+ * HMAC-SHA-384/512 lib/crypto public API to dispatch to the in-boundary
+ * fips_lib_ implementations.  Must be called after self-tests have passed.
+ */
+void fips_lib_sha512_redirect(void)
+{
+	static_call_update(sha384_init,                  fips_lib_sha384_init);
+	static_call_update(sha512_init,                  fips_lib_sha512_init);
+	static_call_update(__sha512_update,              fips_lib__sha512_update);
+	static_call_update(sha384_final,                 fips_lib_sha384_final);
+	static_call_update(sha512_final,                 fips_lib_sha512_final);
+	static_call_update(sha384,                       fips_lib_sha384);
+	static_call_update(sha512,                       fips_lib_sha512);
+	static_call_update(hmac_sha384_preparekey,       fips_lib_hmac_sha384_preparekey);
+	static_call_update(hmac_sha512_preparekey,       fips_lib_hmac_sha512_preparekey);
+	static_call_update(__hmac_sha512_init,           fips_lib__hmac_sha512_init);
+	static_call_update(hmac_sha384_init_usingrawkey, fips_lib_hmac_sha384_init_usingrawkey);
+	static_call_update(hmac_sha512_init_usingrawkey, fips_lib_hmac_sha512_init_usingrawkey);
+	static_call_update(hmac_sha384_final,            fips_lib_hmac_sha384_final);
+	static_call_update(hmac_sha512_final,            fips_lib_hmac_sha512_final);
+	static_call_update(hmac_sha384,                  fips_lib_hmac_sha384);
+	static_call_update(hmac_sha512,                  fips_lib_hmac_sha512);
+	static_call_update(hmac_sha384_usingrawkey,      fips_lib_hmac_sha384_usingrawkey);
+	static_call_update(hmac_sha512_usingrawkey,      fips_lib_hmac_sha512_usingrawkey);
 }

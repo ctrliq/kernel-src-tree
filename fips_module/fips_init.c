@@ -521,6 +521,7 @@ static int __init fips_module_init(void)
 	 */
 	fips_lib_sha1_redirect();
 	fips_lib_sha256_redirect();
+	fips_lib_sha512_redirect();
 
 	/*
 	 * All algorithms are registered and self-tested.  Now redirect

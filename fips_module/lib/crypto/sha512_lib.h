@@ -101,4 +101,7 @@ static inline void fips_lib_hmac_sha512_update(struct hmac_sha512_ctx *ctx,
 /* Initialise arch-specific SHA-512 acceleration (call once at module init). */
 void fips_lib_sha512_arch_init(void);
 
+/* Redirect vmlinux lib/crypto SHA-384/512 call sites to fips_lib_ implementations. */
+void fips_lib_sha512_redirect(void);
+
 #endif /* _FIPS_LIB_CRYPTO_SHA512_LIB_H */
