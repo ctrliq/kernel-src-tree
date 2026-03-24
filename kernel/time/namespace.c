@@ -130,7 +130,7 @@ fail:
  *
  * Return: timens_for_children namespace or ERR_PTR.
  */
-struct time_namespace *copy_time_ns(unsigned long flags,
+struct time_namespace *copy_time_ns(u64 flags,
 	struct user_namespace *user_ns, struct time_namespace *old_ns)
 {
 	if (!(flags & CLONE_NEWTIME))
@@ -241,6 +241,11 @@ static void timens_set_vvar_page(struct task_struct *task,
 
 	for (i = 0; i < CS_BASES; i++)
 		timens_setup_vdso_clock_data(&vc[i], ns);
+
+	if (IS_ENABLED(CONFIG_POSIX_AUX_CLOCKS)) {
+		for (i = 0; i < ARRAY_SIZE(vdata->aux_clock_data); i++)
+			timens_setup_vdso_clock_data(&vdata->aux_clock_data[i], ns);
+	}
 
 out:
 	mutex_unlock(&offset_lock);
