@@ -1639,6 +1639,7 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
 
 		force_pte = (max_map_size == PAGE_SIZE);
 		vma_pagesize = min(vma_pagesize, (long)max_map_size);
+		vma_shift = __ffs(vma_pagesize);
 	}
 
 	/*
