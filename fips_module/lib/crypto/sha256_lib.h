@@ -70,4 +70,7 @@ void fips_lib_hmac_sha256_usingrawkey(const u8 *raw_key, size_t raw_key_len,
 /* Initialise arch-specific SHA-256 acceleration (call once at module init). */
 void fips_lib_sha256_arch_init(void);
 
+/* Redirect vmlinux lib/crypto SHA-224/256 call sites to fips_lib_ implementations. */
+void fips_lib_sha256_redirect(void);
+
 #endif /* _FIPS_SHA256_LIB_H */

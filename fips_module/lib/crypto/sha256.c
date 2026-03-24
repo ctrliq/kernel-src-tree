@@ -22,6 +22,7 @@
 #include <crypto/hmac.h>
 #include <crypto/sha2.h>
 #include <linux/kernel.h>
+#include <linux/static_call.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
 #include <linux/wordpart.h>
@@ -445,6 +446,37 @@ void fips_lib_hmac_sha256_usingrawkey(const u8 *raw_key, size_t raw_key_len,
 	fips_lib_hmac_sha256_init_usingrawkey(&ctx, raw_key, raw_key_len);
 	fips_lib__sha256_update(&ctx.ctx.sha_ctx, data, data_len);
 	fips_lib_hmac_sha256_final(&ctx, out);
+}
+
+/*
+ * fips_lib_sha256_redirect - redirect vmlinux SHA-224/256 call sites to fips_lib_
+ *
+ * Patches every static_call site for the SHA-224, SHA-256, and
+ * HMAC-SHA-224/256 lib/crypto public API to dispatch to the in-boundary
+ * fips_lib_ implementations.  Must be called after self-tests have passed.
+ */
+void fips_lib_sha256_redirect(void)
+{
+	static_call_update(__sha256_update,              fips_lib__sha256_update);
+	static_call_update(sha224_init,                  fips_lib_sha224_init);
+	static_call_update(sha224_final,                 fips_lib_sha224_final);
+	static_call_update(sha224,                       fips_lib_sha224);
+	static_call_update(sha256_init,                  fips_lib_sha256_init);
+	static_call_update(sha256_final,                 fips_lib_sha256_final);
+	static_call_update(sha256,                       fips_lib_sha256);
+	static_call_update(sha256_finup_2x,              fips_lib_sha256_finup_2x);
+	static_call_update(sha256_finup_2x_is_optimized, fips_lib_sha256_finup_2x_is_optimized);
+	static_call_update(hmac_sha224_preparekey,       fips_lib_hmac_sha224_preparekey);
+	static_call_update(hmac_sha224_init_usingrawkey, fips_lib_hmac_sha224_init_usingrawkey);
+	static_call_update(hmac_sha224_final,            fips_lib_hmac_sha224_final);
+	static_call_update(hmac_sha224,                  fips_lib_hmac_sha224);
+	static_call_update(hmac_sha224_usingrawkey,      fips_lib_hmac_sha224_usingrawkey);
+	static_call_update(hmac_sha256_preparekey,       fips_lib_hmac_sha256_preparekey);
+	static_call_update(__hmac_sha256_init,           fips_lib__hmac_sha256_init);
+	static_call_update(hmac_sha256_init_usingrawkey, fips_lib_hmac_sha256_init_usingrawkey);
+	static_call_update(hmac_sha256_final,            fips_lib_hmac_sha256_final);
+	static_call_update(hmac_sha256,                  fips_lib_hmac_sha256);
+	static_call_update(hmac_sha256_usingrawkey,      fips_lib_hmac_sha256_usingrawkey);
 }
 
 /*
