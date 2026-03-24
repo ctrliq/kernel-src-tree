@@ -161,12 +161,12 @@ Summary: The Linux kernel
 #  the --with-release option overrides this setting.)
 %define debugbuildsenabled 1
 %define buildid .1.0.0
-%define specrpmversion 6.12.74
-%define specversion 6.12.74
+%define specrpmversion 6.12.77
+%define specversion 6.12.77
 %define patchversion 6.12
 %define pkgrelease 1.1.0.0
 %define kversion 6
-%define tarfile_release 6.12.74-1.1.0.0.el9_clk
+%define tarfile_release 6.12.77-1.1.0.0.el9_clk
 # This is needed to do merge window version magic
 %define patchlevel 12
 # This allows pkg_release to have configurable %%{?dist} tag
@@ -4087,6 +4087,43 @@ fi\
 #
 #
 %changelog
+* Tue Mar 24 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.12.77-1.1.0.0.el9_clk
+-- Rebased changes for Linux 6.12.77 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.12.77-1)
+-- uki_addons: Add debug.addon and systemd-volatile-overlay.addon (Brett Mastbergen)
+-- kernel.spec: Remove FIPS config tweak (Brett Mastbergen)
+-- Add linux-kernel-test.patch (Brett Mastbergen)
+-- Remove rpminspect.yaml (Brett Mastbergen)
+-- Update README.rst for CIQ layout (Brett Mastbergen)
+-- generate_tarball.sh: check for zstd and use ZSTD_CMD variable (Brett Mastbergen)
+-- generate_tarball.sh: improve error handling and cleanup (Brett Mastbergen)
+-- Remove ciq_sbsign.macros (Brett Mastbergen)
+-- Move SOURCES and SPECS into ciq/ (Brett Mastbergen)
+-- Remove generate_all_configs.sh (Brett Mastbergen)
+-- Remove kernel.changelog (Brett Mastbergen)
+-- Remove Makefile.rhelver (Brett Mastbergen)
+-- Switch to zstd for source tarball (Brett Mastbergen)
+-- Adding CIQ attributes to kernel mod signing cert (Michael L. Young)
+-- Add generate_tarball.sh (Brett Mastbergen)
+-- kernel.spec: Use configs from ciq/config (Brett Mastbergen)
+-- kernel.spec: Move netfilter modules to core (Brett Mastbergen)
+-- kernel.spec: Remove kabi code (Brett Mastbergen)
+-- Import dist-git from 6.12.74 SRPM (Brett Mastbergen)
+-- [CIQ] v6.12.76 - rebased configs (github-actions[bot])
+-- [CIQ] v6.12.63 - rebased configs (Brett Mastbergen)
+-- [CIQ] configs: Update PAHOLE_VERSION to 130 (Brett Mastbergen)
+-- [CIQ] v6.12.17 -> v6.12.47 config updates (Jonathan Maple)
+-- [CIQ] Refresh Configs after making modifications (Jonathan Maple)
+-- [CIQ] Arm Lockdown Config Enablement (Jonathan Maple)
+-- Add efi_status_to_str() and rework efi_status_to_err(). (Peter Jones)
+-- mtd: phram,slram: Disable when the kernel is locked down (Ben Hutchings)
+-- efi: Lock down the kernel if booted in secure boot mode (Ben Hutchings)
+-- efi: Add an EFI_SECURE_BOOT flag to indicate secure boot mode (David Howells)
+-- arm64: add kernel config option to lock down when in Secure Boot mode (Linn Crosetto)
+-- github actions: Make Builds on Merge Request Work (Jonathan Maple)
+-- Add CIQ configs (Jonathan Maple)
+
+-- Linux 6.12.77 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.12.77)
+
 
 ###
 # The following Emacs magic makes C-c C-e use UTC dates.
