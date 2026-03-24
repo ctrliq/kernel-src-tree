@@ -24,4 +24,7 @@ bool __must_check fips_lib_aesgcm_decrypt(const struct aesgcm_ctx *ctx,
 					  const u8 iv[GCM_AES_IV_SIZE],
 					  const u8 *authtag);
 
+/* Redirect vmlinux lib/crypto AES-GCM call sites to fips_lib_ implementations. */
+void fips_lib_aesgcm_redirect(void);
+
 #endif /* _FIPS_LIB_CRYPTO_AESGCM_LIB_H */

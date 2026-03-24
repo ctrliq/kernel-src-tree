@@ -22,6 +22,7 @@
 #include <crypto/algapi.h>
 #include <crypto/gcm.h>
 #include <crypto/ghash.h>
+#include <linux/static_call.h>
 #include "aes_lib.h"
 #include "aesgcm_lib.h"
 
@@ -191,4 +192,18 @@ bool __must_check fips_lib_aesgcm_decrypt(const struct aesgcm_ctx *ctx,
 	}
 	aesgcm_crypt(ctx, dst, src, crypt_len, ctr);
 	return true;
+}
+
+/*
+ * fips_lib_aesgcm_redirect - redirect vmlinux AES-GCM call sites to fips_lib_
+ *
+ * Patches every static_call site for aesgcm_expandkey(), aesgcm_encrypt(),
+ * and aesgcm_decrypt() to dispatch to the in-boundary fips_lib_
+ * implementations.  Must be called after self-tests have passed.
+ */
+void fips_lib_aesgcm_redirect(void)
+{
+	static_call_update(aesgcm_expandkey, fips_lib_aesgcm_expandkey);
+	static_call_update(aesgcm_encrypt,   fips_lib_aesgcm_encrypt);
+	static_call_update(aesgcm_decrypt,   fips_lib_aesgcm_decrypt);
 }
