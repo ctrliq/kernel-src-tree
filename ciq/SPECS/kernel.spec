@@ -1130,7 +1130,6 @@ Source3002: Patchlist.changelog
 %endif
 
 Source4000: README.rst
-Source4002: gating.yaml
 
 ## Patches needed for building this package
 
