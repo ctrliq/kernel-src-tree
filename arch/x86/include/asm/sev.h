@@ -587,6 +587,12 @@ static inline void sev_evict_cache(void *va, int npages)
 	}
 }
 
+struct psc_desc {
+	enum psc_op op;
+	struct svsm_ca *ca;
+	u64 caa_pa;
+};
+
 #else	/* !CONFIG_AMD_MEM_ENCRYPT */
 
 #define snp_vmpl 0
