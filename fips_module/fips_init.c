@@ -514,6 +514,14 @@ static int __init fips_module_init(void)
 		panic("fips_module: self-tests FAILED\n");
 
 	/*
+	 * All self-tests have passed.  Redirect vmlinux lib/crypto call sites
+	 * to the in-boundary fips_lib_ implementations via static_call
+	 * patching.  This must happen after self-tests so that callers never
+	 * reach an untested implementation.
+	 */
+	fips_lib_sha1_redirect();
+
+	/*
 	 * All algorithms are registered and self-tested.  Now redirect
 	 * getrandom(2) and /dev/random to the in-boundary FIPS DRBG.
 	 */

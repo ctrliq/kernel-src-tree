@@ -43,4 +43,7 @@ void fips_lib_hmac_sha1_usingrawkey(const u8 *raw_key, size_t raw_key_len,
 /* Initialise arch-specific SHA-1 acceleration (call once at module init). */
 void fips_lib_sha1_arch_init(void);
 
+/* Redirect vmlinux lib/crypto SHA-1 call sites to fips_lib_ implementations. */
+void fips_lib_sha1_redirect(void);
+
 #endif /* _FIPS_LIB_CRYPTO_SHA1_LIB_H */

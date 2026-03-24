@@ -15,6 +15,7 @@
 #include <crypto/sha1.h>
 #include <linux/bitops.h>
 #include <linux/kernel.h>
+#include <linux/static_call.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
 #include <linux/wordpart.h>
@@ -313,4 +314,27 @@ void fips_lib_hmac_sha1_usingrawkey(const u8 *raw_key, size_t raw_key_len,
 	fips_lib_hmac_sha1_init_usingrawkey(&ctx, raw_key, raw_key_len);
 	fips_lib_hmac_sha1_update(&ctx, data, data_len);
 	fips_lib_hmac_sha1_final(&ctx, out);
+}
+
+/*
+ * fips_lib_sha1_redirect - redirect vmlinux SHA-1 call sites to fips_lib_
+ *
+ * Patches every static_call site for the SHA-1 and HMAC-SHA1 lib/crypto
+ * public API to dispatch to the in-boundary fips_lib_ implementations.
+ * Must be called after self-tests have passed.
+ */
+void fips_lib_sha1_redirect(void)
+{
+	static_call_update(sha1_transform,             fips_lib_sha1_transform);
+	static_call_update(sha1_init_raw,              fips_lib_sha1_init_raw);
+	static_call_update(sha1_init,                  fips_lib_sha1_init);
+	static_call_update(sha1_update,                fips_lib_sha1_update);
+	static_call_update(sha1_final,                 fips_lib_sha1_final);
+	static_call_update(sha1,                       fips_lib_sha1);
+	static_call_update(hmac_sha1_preparekey,       fips_lib_hmac_sha1_preparekey);
+	static_call_update(hmac_sha1_init,             fips_lib_hmac_sha1_init);
+	static_call_update(hmac_sha1_init_usingrawkey, fips_lib_hmac_sha1_init_usingrawkey);
+	static_call_update(hmac_sha1_final,            fips_lib_hmac_sha1_final);
+	static_call_update(hmac_sha1,                  fips_lib_hmac_sha1);
+	static_call_update(hmac_sha1_usingrawkey,      fips_lib_hmac_sha1_usingrawkey);
 }
