@@ -19,6 +19,7 @@
 #include <asm/irqflags.h>
 #include <crypto/algapi.h>
 #include <crypto/aes.h>
+#include <linux/static_call.h>
 #include "aes_lib.h"
 #include "aescfb_lib.h"
 
@@ -104,3 +105,21 @@ void fips_lib_aescfb_decrypt(const struct crypto_aes_ctx *ctx, u8 *dst,
 
 	memzero_explicit(ks, sizeof(ks));
 }
+
+/*
+ * fips_lib_aescfb_redirect - redirect vmlinux AES-CFB call sites to fips_lib_
+ *
+ * Patches every static_call site for aescfb_encrypt() and aescfb_decrypt()
+ * to dispatch to the in-boundary fips_lib_ implementations.
+ * Must be called after self-tests have passed.
+ *
+ * Only compiled when CONFIG_CRYPTO_LIB_AESCFB=y; the static_call key and
+ * trampoline symbols are only exported by vmlinux when that option is set.
+ */
+#ifdef CONFIG_CRYPTO_LIB_AESCFB
+void fips_lib_aescfb_redirect(void)
+{
+	static_call_update(aescfb_encrypt, fips_lib_aescfb_encrypt);
+	static_call_update(aescfb_decrypt, fips_lib_aescfb_decrypt);
+}
+#endif /* CONFIG_CRYPTO_LIB_AESCFB */

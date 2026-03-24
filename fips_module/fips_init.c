@@ -19,6 +19,7 @@
 #include <linux/crypto.h>
 #include <linux/fips.h>
 #include "lib/crypto/aes_lib.h"
+#include "lib/crypto/aescfb_lib.h"
 #include "lib/crypto/sha1_lib.h"
 #include "lib/crypto/sha256_lib.h"
 #include "lib/crypto/sha512_lib.h"
@@ -524,6 +525,9 @@ static int __init fips_module_init(void)
 	fips_lib_sha256_redirect();
 	fips_lib_sha512_redirect();
 	fips_lib_aes_redirect();
+#ifdef CONFIG_CRYPTO_LIB_AESCFB
+	fips_lib_aescfb_redirect();
+#endif
 
 	/*
 	 * All algorithms are registered and self-tested.  Now redirect
