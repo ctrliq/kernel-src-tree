@@ -3830,7 +3830,6 @@ static inline bool io_uring_allowed(void)
 {
 	int disabled = READ_ONCE(sysctl_io_uring_disabled);
 	kgid_t io_uring_group;
-	static bool printed = false;
 
 	if (disabled == 2)
 		return false;
@@ -3846,11 +3845,6 @@ static inline bool io_uring_allowed(void)
 		return false;
 
 allowed:
-	if (!printed) {
-		mark_tech_preview("io_uring", NULL);
-		printed = true;
-	}
-
 	return true;
 }
 
