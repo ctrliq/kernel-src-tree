@@ -165,11 +165,11 @@ Summary: The Linux kernel
 #  to build the base kernel using the debug configuration. (Specifying
 #  the --with-release option overrides this setting.)
 %define debugbuildsenabled 1
-%define buildid .1.0.0
+%define buildid .1
 %define specrpmversion 6.18.19
 %define specversion 6.18.19
 %define patchversion 6.18
-%define pkgrelease 1.1.0.0
+%define pkgrelease 1.%{?buildid}
 %define kversion 6
 %define tarfile_release 6.18.19-1.1.0.0.el9_clk
 # This is needed to do merge window version magic
