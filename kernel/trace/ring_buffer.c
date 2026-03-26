@@ -1751,6 +1751,7 @@ static int rb_read_data_buffer(struct buffer_data_page *dpage, int tail, int cpu
 	struct ring_buffer_event *event;
 	u64 ts, delta;
 	int events = 0;
+	int len;
 	int e;
 
 	*delta_ptr = 0;
@@ -1758,9 +1759,12 @@ static int rb_read_data_buffer(struct buffer_data_page *dpage, int tail, int cpu
 
 	ts = dpage->time_stamp;
 
-	for (e = 0; e < tail; e += rb_event_length(event)) {
+	for (e = 0; e < tail; e += len) {
 
 		event = (struct ring_buffer_event *)(dpage->data + e);
+		len = rb_event_length(event);
+		if (len <= 0 || len > tail - e)
+			return -1;
 
 		switch (event->type_len) {
 
@@ -2974,6 +2978,8 @@ int ring_buffer_resize(struct trace_buffer *buffer, unsigned long size,
 					list) {
 			list_del_init(&bpage->list);
 			free_buffer_page(bpage);
+
+			cond_resched();
 		}
 	}
  out_err_unlock:
@@ -4632,10 +4638,7 @@ void ring_buffer_discard_commit(struct trace_buffer *buffer,
 	RB_WARN_ON(buffer, !local_read(&cpu_buffer->committing));
 
 	rb_decrement_entry(cpu_buffer, event);
-	if (rb_try_to_discard(cpu_buffer, event))
-		goto out;
-
- out:
+	rb_try_to_discard(cpu_buffer, event);
 	rb_end_commit(cpu_buffer);
 
 	trace_recursive_unlock(cpu_buffer);
@@ -7222,6 +7225,10 @@ consume:
 			rb_advance_reader(cpu_buffer);
 		goto out;
 	}
+
+	/* Did the reader catch up with the writer? */
+	if (cpu_buffer->reader_page == cpu_buffer->commit_page)
+		goto out;
 
 	reader = rb_get_reader_page(cpu_buffer);
 	if (WARN_ON(!reader))
