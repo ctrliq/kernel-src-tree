@@ -8,7 +8,7 @@
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DISTGIT_ROOT="$(dirname "$SCRIPT_DIR")"
 SOURCE_DIR="$DISTGIT_ROOT/SOURCES"
-SPEC_FILE="$DISTGIT_ROOT/SPECS/kernel.spec"
+SPEC_FILE="$DISTGIT_ROOT/SPECS/kernel-clk6.18.spec"
 
 # Extract version information from spec file
 TARFILE_RELEASE=$(grep '^%define tarfile_release' "$SPEC_FILE" | awk '{print $3}')
