@@ -139,8 +139,10 @@ Summary: The Linux kernel
 # genspec.sh variables
 #
 
+# suffix for CLK kernel packages
+%global pkg_suffix clk%{patchversion}
 # kernel package name
-%global package_name kernel-clk6.18
+%global package_name kernel-%{pkg_suffix}
 # Include Fedora files
 %global include_fedora 0
 # Include RHEL files
@@ -1233,72 +1235,86 @@ This package is required by %{name}-debuginfo subpackages.
 It provides the kernel source files common to all builds.
 
 %if %{with_perf}
-%package -n perf
+%package -n perf-%{pkg_suffix}
 Summary: Performance monitoring for the Linux kernel
+Provides: perf = %{specrpmversion}-%{release}
+Conflicts: perf
 Requires: bzip2
-%description -n perf
+%description -n perf-%{pkg_suffix}
 This package contains the perf tool, which enables performance monitoring
 of the Linux kernel.
 
-%package -n perf-debuginfo
+%package -n perf-%{pkg_suffix}-debuginfo
 Summary: Debug information for package perf
+Provides: perf-debuginfo = %{specrpmversion}-%{release}
+Conflicts: perf-debuginfo
 Requires: %{name}-debuginfo-common-%{_target_cpu} = %{specrpmversion}-%{release}
 AutoReqProv: no
-%description -n perf-debuginfo
+%description -n perf-%{pkg_suffix}-debuginfo
 This package provides debug information for the perf package.
 
 # Note that this pattern only works right to match the .build-id
 # symlinks because of the trailing nonmatching alternation and
 # the leading .*, because of find-debuginfo.sh's buggy handling
 # of matching the pattern against the symlinks file.
-%{expand:%%global _find_debuginfo_opts %{?_find_debuginfo_opts} -p '.*%%{_bindir}/perf(\.debug)?|.*%%{_libexecdir}/perf-core/.*|.*%%{_libdir}/libperf-jvmti.so(\.debug)?|XXX' -o perf-debuginfo.list}
+%{expand:%%global _find_debuginfo_opts %{?_find_debuginfo_opts} -p '.*%%{_bindir}/perf(\.debug)?|.*%%{_libexecdir}/perf-core/.*|.*%%{_libdir}/libperf-jvmti.so(\.debug)?|XXX' -o perf-%{pkg_suffix}-debuginfo.list}
 
-%package -n python3-perf
+%package -n python3-perf-%{pkg_suffix}
 Summary: Python bindings for apps which will manipulate perf events
-%description -n python3-perf
+Provides: python3-perf = %{specrpmversion}-%{release}
+Conflicts: python3-perf
+%description -n python3-perf-%{pkg_suffix}
 The python3-perf package contains a module that permits applications
 written in the Python programming language to use the interface
 to manipulate perf events.
 
-%package -n python3-perf-debuginfo
+%package -n python3-perf-%{pkg_suffix}-debuginfo
 Summary: Debug information for package perf python bindings
+Provides: python3-perf-debuginfo = %{specrpmversion}-%{release}
+Conflicts: python3-perf-debuginfo
 Requires: %{name}-debuginfo-common-%{_target_cpu} = %{specrpmversion}-%{release}
 AutoReqProv: no
-%description -n python3-perf-debuginfo
+%description -n python3-perf-%{pkg_suffix}-debuginfo
 This package provides debug information for the perf python bindings.
 
 # the python_sitearch macro should already be defined from above
-%{expand:%%global _find_debuginfo_opts %{?_find_debuginfo_opts} -p '.*%%{python3_sitearch}/perf.*so(\.debug)?|XXX' -o python3-perf-debuginfo.list}
+%{expand:%%global _find_debuginfo_opts %{?_find_debuginfo_opts} -p '.*%%{python3_sitearch}/perf.*so(\.debug)?|XXX' -o python3-perf-%{pkg_suffix}-debuginfo.list}
 
 # with_perf
 %endif
 
 %if %{with_libperf}
-%package -n libperf
+%package -n libperf-%{pkg_suffix}
 Summary: The perf library from kernel source
-%description -n libperf
+Provides: libperf = %{specrpmversion}-%{release}
+Conflicts: libperf
+%description -n libperf-%{pkg_suffix}
 This package contains the kernel source perf library.
 
-%package -n libperf-devel
+%package -n libperf-%{pkg_suffix}-devel
 Summary: Developement files for the perf library from kernel source
-Requires: libperf = %{version}-%{release}
-%description -n libperf-devel
+Provides: libperf-devel = %{specrpmversion}-%{release}
+Conflicts: libperf-devel
+Requires: libperf-%{pkg_suffix} = %{version}-%{release}
+%description -n libperf-%{pkg_suffix}-devel
 This package includes libraries and header files needed for development
 of applications which use perf library from kernel source.
 
-%package -n libperf-debuginfo
+%package -n libperf-%{pkg_suffix}-debuginfo
 Summary: Debug information for package libperf
+Provides: libperf-debuginfo = %{specrpmversion}-%{release}
+Conflicts: libperf-debuginfo
 Group: Development/Debug
 Requires: %{name}-debuginfo-common-%{_target_cpu} = %{version}-%{release}
 AutoReqProv: no
-%description -n libperf-debuginfo
+%description -n libperf-%{pkg_suffix}-debuginfo
 This package provides debug information for the libperf package.
 
 # Note that this pattern only works right to match the .build-id
 # symlinks because of the trailing nonmatching alternation and
 # the leading .*, because of find-debuginfo.sh's buggy handling
 # of matching the pattern against the symlinks file.
-%{expand:%%global _find_debuginfo_opts %{?_find_debuginfo_opts} -p '.*%%{_libdir}/libperf.so.*(\.debug)?|XXX' -o libperf-debuginfo.list}
+%{expand:%%global _find_debuginfo_opts %{?_find_debuginfo_opts} -p '.*%%{_libdir}/libperf.so.*(\.debug)?|XXX' -o libperf-%{pkg_suffix}-debuginfo.list}
 # with_libperf
 %endif
 
@@ -1358,23 +1374,27 @@ This package provides debug information for package %{package_name}-tools.
 # of matching the pattern against the symlinks file.
 %{expand:%%global _find_debuginfo_opts %{?_find_debuginfo_opts} -p '.*%%{_bindir}/bootconfig(\.debug)?|.*%%{_bindir}/centrino-decode(\.debug)?|.*%%{_bindir}/powernow-k8-decode(\.debug)?|.*%%{_bindir}/cpupower(\.debug)?|.*%%{_libdir}/libcpupower.*|.*%%{python3_sitearch}/_raw_pylibcpupower.*|.*%%{_bindir}/turbostat(\.debug)?|.*%%{_bindir}/x86_energy_perf_policy(\.debug)?|.*%%{_bindir}/tmon(\.debug)?|.*%%{_bindir}/lsgpio(\.debug)?|.*%%{_bindir}/gpio-hammer(\.debug)?|.*%%{_bindir}/gpio-event-mon(\.debug)?|.*%%{_bindir}/gpio-watch(\.debug)?|.*%%{_bindir}/iio_event_monitor(\.debug)?|.*%%{_bindir}/iio_generic_buffer(\.debug)?|.*%%{_bindir}/lsiio(\.debug)?|.*%%{_bindir}/intel-speed-select(\.debug)?|.*%%{_bindir}/page_owner_sort(\.debug)?|.*%%{_bindir}/slabinfo(\.debug)?|.*%%{_sbindir}/intel_sdsi(\.debug)?|XXX' -o %{package_name}-tools-debuginfo.list}
 
-%package -n rtla
+%package -n rtla-%{pkg_suffix}
 Summary: Real-Time Linux Analysis tools
+Provides: rtla = %{specrpmversion}-%{release}
+Conflicts: rtla
 Requires: libtraceevent
 Requires: libtracefs
 Requires: libbpf
 %ifarch %{cpupowerarchs}
 Requires: %{package_name}-tools-libs = %{version}-%{release}
 %endif
-%description -n rtla
+%description -n rtla-%{pkg_suffix}
 The rtla meta-tool includes a set of commands that aims to analyze
 the real-time properties of Linux. Instead of testing Linux as a black box,
 rtla leverages kernel tracing capabilities to provide precise information
 about the properties and root causes of unexpected results.
 
-%package -n rv
+%package -n rv-%{pkg_suffix}
 Summary: RV: Runtime Verification
-%description -n rv
+Provides: rv = %{specrpmversion}-%{release}
+Conflicts: rv
+%description -n rv-%{pkg_suffix}
 Runtime Verification (RV) is a lightweight (yet rigorous) method that
 complements classical exhaustive verification techniques (such as model
 checking and theorem proving) with a more practical approach for
@@ -4037,7 +4057,7 @@ fi\
 %endif
 
 %if %{with_perf}
-%files -n perf
+%files -n perf-%{pkg_suffix}
 %{_bindir}/perf
 %{_libdir}/libperf-jvmti.so
 %dir %{_libexecdir}/perf-core
@@ -4048,23 +4068,23 @@ fi\
 %{_docdir}/perf-tip/tips.txt
 %{_includedir}/perf/perf_dlfilter.h
 
-%files -n python3-perf
+%files -n python3-perf-%{pkg_suffix}
 %{python3_sitearch}/perf*
 
 %if %{with_debuginfo}
-%files -f perf-debuginfo.list -n perf-debuginfo
+%files -f perf-%{pkg_suffix}-debuginfo.list -n perf-%{pkg_suffix}-debuginfo
 
-%files -f python3-perf-debuginfo.list -n python3-perf-debuginfo
+%files -f python3-perf-%{pkg_suffix}-debuginfo.list -n python3-perf-%{pkg_suffix}-debuginfo
 %endif
 # with_perf
 %endif
 
 %if %{with_libperf}
-%files -n libperf
+%files -n libperf-%{pkg_suffix}
 %{_libdir}/libperf.so.0
 %{_libdir}/libperf.so.0.0.1
 
-%files -n libperf-devel
+%files -n libperf-%{pkg_suffix}-devel
 %{_libdir}/libperf.so
 %{_libdir}/pkgconfig/libperf.pc
 %{_includedir}/internal/*.h
@@ -4086,7 +4106,7 @@ fi\
 %{_docdir}/libperf/html/libperf-sampling.html
 
 %if %{with_debuginfo}
-%files -f libperf-debuginfo.list -n libperf-debuginfo
+%files -f libperf-%{pkg_suffix}-debuginfo.list -n libperf-%{pkg_suffix}-debuginfo
 %endif
 
 # with_libperf
@@ -4167,7 +4187,7 @@ fi\
 %{_includedir}/ynl
 %endif
 
-%files -n rtla
+%files -n rtla-%{pkg_suffix}
 %{_bindir}/rtla
 %{_bindir}/hwnoise
 %{_bindir}/osnoise
@@ -4181,7 +4201,7 @@ fi\
 %{_mandir}/man1/rtla-timerlat.1.gz
 %{_mandir}/man1/rtla.1.gz
 
-%files -n rv
+%files -n rv-%{pkg_suffix}
 %{_bindir}/rv
 %{_mandir}/man1/rv-list.1.gz
 %{_mandir}/man1/rv-mon-wip.1.gz
