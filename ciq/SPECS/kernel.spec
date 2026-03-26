@@ -161,12 +161,12 @@ Summary: The Linux kernel
 #  the --with-release option overrides this setting.)
 %define debugbuildsenabled 1
 %define buildid .1.0.0
-%define specrpmversion 6.12.77
-%define specversion 6.12.77
+%define specrpmversion 6.12.78
+%define specversion 6.12.78
 %define patchversion 6.12
 %define pkgrelease 1.1.0.0
 %define kversion 6
-%define tarfile_release 6.12.77-1.1.0.0.el9_clk
+%define tarfile_release 6.12.78-1.1.0.0.el9_clk
 # This is needed to do merge window version magic
 %define patchlevel 12
 # This allows pkg_release to have configurable %%{?dist} tag
@@ -4087,8 +4087,11 @@ fi\
 #
 #
 %changelog
-* Tue Mar 24 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.12.77-1.1.0.0.el9_clk
--- Rebased changes for Linux 6.12.77 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.12.77-1)
+* Thu Mar 26 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.12.78-1.1.0.0.el9_clk
+-- Rebased changes for Linux 6.12.78 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.12.78-1)
+-- [CIQ] v6.12.78 - rebased configs (github-actions[bot])
+-- github actions: Inherit the Kernel CI Automated workflow from main (Brett Mastbergen)
+-- [CIQ] v6.12.77 - updated spec (github-actions[bot])
 -- uki_addons: Add debug.addon and systemd-volatile-overlay.addon (Brett Mastbergen)
 -- kernel.spec: Remove FIPS config tweak (Brett Mastbergen)
 -- Add linux-kernel-test.patch (Brett Mastbergen)
@@ -4122,7 +4125,7 @@ fi\
 -- github actions: Make Builds on Merge Request Work (Jonathan Maple)
 -- Add CIQ configs (Jonathan Maple)
 
--- Linux 6.12.77 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.12.77)
+-- Linux 6.12.78 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.12.78)
 
 
 ###
