@@ -482,7 +482,7 @@ static int cifs_swn_store_swn_addr(const struct sockaddr_storage *new,
 static int cifs_swn_reconnect(struct cifs_tcon *tcon, struct sockaddr_storage *addr)
 {
 	/* Store the reconnect address */
-	mutex_lock(&tcon->ses->server->srv_mutex);
+	cifs_server_lock(tcon->ses->server);
 	if (!cifs_sockaddr_equal(&tcon->ses->server->dstaddr, addr)) {
 		int ret;
 
@@ -520,7 +520,7 @@ static int cifs_swn_reconnect(struct cifs_tcon *tcon, struct sockaddr_storage *a
 			tcon->ses->server->tcpStatus = CifsNeedReconnect;
 		spin_unlock(&GlobalMid_Lock);
 	}
-	mutex_unlock(&tcon->ses->server->srv_mutex);
+	cifs_server_unlock(tcon->ses->server);
 
 	return 0;
 }
