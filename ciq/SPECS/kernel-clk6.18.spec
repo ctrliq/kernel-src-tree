@@ -1185,6 +1185,8 @@ AutoProv: yes\
 %package doc
 Summary: Various documentation bits found in the kernel source
 Group: Documentation
+Provides: kernel-doc = %{specrpmversion}-%{release}
+Conflicts: kernel-doc
 %description doc
 This package contains documentation files from the kernel
 source. Various bits of information about the Linux kernel and the
@@ -1198,6 +1200,8 @@ options that can be passed to Linux kernel modules at load time.
 Summary: Header files for the Linux kernel for use by glibc
 Obsoletes: glibc-kernheaders < 3.0-46
 Provides: glibc-kernheaders = 3.0-46
+Provides: kernel-headers = %{specrpmversion}-%{release}
+Conflicts: kernel-headers
 %description headers
 Kernel-headers includes the C header files that specify the interface
 between the Linux kernel and userspace libraries and programs.  The
@@ -1209,6 +1213,8 @@ glibc package.
 %if %{with_cross_headers}
 %package cross-headers
 Summary: Header files for the Linux kernel for use by cross-glibc
+Provides: kernel-cross-headers = %{specrpmversion}-%{release}
+Conflicts: kernel-cross-headers
 %description cross-headers
 Kernel-cross-headers includes the C header files that specify the interface
 between the Linux kernel and userspace libraries and programs.  The
@@ -1220,6 +1226,8 @@ cross-glibc package.
 %package debuginfo-common-%{_target_cpu}
 Summary: Kernel source files used by %{name}-debuginfo packages
 Provides: installonlypkg(kernel)
+Provides: kernel-debuginfo-common-%{_target_cpu} = %{specrpmversion}-%{release}
+Conflicts: kernel-debuginfo-common-%{_target_cpu}
 %description debuginfo-common-%{_target_cpu}
 This package is required by %{name}-debuginfo subpackages.
 It provides the kernel source files common to all builds.
@@ -1297,6 +1305,8 @@ This package provides debug information for the libperf package.
 %if %{with_tools}
 %package -n %{package_name}-tools
 Summary: Assortment of tools for the Linux kernel
+Provides: kernel-tools = %{specrpmversion}-%{release}
+Conflicts: kernel-tools
 %ifarch %{cpupowerarchs}
 Provides:  cpupowerutils = 1:009-0.6.p1
 Obsoletes: cpupowerutils < 1:009-0.6.p1
@@ -1314,12 +1324,16 @@ and the supporting documentation.
 
 %package -n %{package_name}-tools-libs
 Summary: Libraries for the kernels-tools
+Provides: kernel-tools-libs = %{specrpmversion}-%{release}
+Conflicts: kernel-tools-libs
 %description -n %{package_name}-tools-libs
 This package contains the libraries built from the tools/ directory
 from the kernel source.
 
 %package -n %{package_name}-tools-libs-devel
 Summary: Assortment of tools for the Linux kernel
+Provides: kernel-tools-libs-devel = %{specrpmversion}-%{release}
+Conflicts: kernel-tools-libs-devel
 Requires: %{package_name}-tools = %{version}-%{release}
 %ifarch %{cpupowerarchs}
 Provides:  cpupowerutils-devel = 1:009-0.6.p1
@@ -1375,6 +1389,8 @@ analysing the logical and timing behavior of Linux.
 
 %package selftests-internal
 Summary: Kernel samples and selftests
+Provides: kernel-selftests-internal = %{specrpmversion}-%{release}
+Conflicts: kernel-selftests-internal
 Requires: binutils, bpftool, fuse-libs, iproute-tc, iputils, keyutils, nmap-ncat, python3
 %description selftests-internal
 Kernel sample programs and selftests.
