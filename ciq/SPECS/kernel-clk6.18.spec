@@ -140,7 +140,7 @@ Summary: The Linux kernel
 #
 
 # kernel package name
-%global package_name kernel
+%global package_name kernel-clk6.18
 %global gemini 0
 # Include Fedora files
 %global include_fedora 0
@@ -2026,7 +2026,7 @@ cp %{SOURCE3001} partial-kernel-local-snip.config
 cp %{SOURCE3001} partial-kernel-local-debug-snip.config
 for config in ../ciq/configs/kernel-*.config; do
     arch=$(echo $config | sed -n 's/.*kernel-\(.*\)\.config/\1/p')
-    cp $config kernel-%{specversion}-$arch.config
+    cp $config %{name}-%{specversion}-$arch.config
 done
 
 # Collect custom defined config options
