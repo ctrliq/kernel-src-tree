@@ -1737,9 +1737,7 @@ int amdgpu_device_resize_fb_bar(struct amdgpu_device *adev)
 	/* Tear down doorbell as resizing will release BARs */
 	amdgpu_doorbell_fini(adev);
 
-	r = pci_resize_resource(adev->pdev, 0, rbar_size,
-				(adev->asic_type >= CHIP_BONAIRE) ? 1 << 5
-								  : 1 << 2);
+	r = pci_resize_resource(adev->pdev, 0, rbar_size);
 	if (r == -ENOSPC)
 		dev_info(adev->dev,
 			 "Not enough PCI address space for a large BAR.");
