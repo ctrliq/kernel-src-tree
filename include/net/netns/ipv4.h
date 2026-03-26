@@ -109,6 +109,9 @@ struct netns_ipv4 {
 #endif
 	struct hlist_head	*fib_table_hash;
 	struct sock		*fibnl;
+	struct hlist_head	*fib_info_hash;
+	unsigned int		fib_info_hash_bits;
+	unsigned int		fib_info_cnt;
 
 	struct sock		*mc_autojoin_sk;
 
@@ -264,12 +267,14 @@ struct netns_ipv4 {
 #endif
 
 	struct fib_notifier_ops	*notifier_ops;
-	unsigned int	fib_seq;	/* protected by rtnl_mutex */
+	unsigned int	fib_seq;	/* writes protected by rtnl_mutex */
 
 	struct fib_notifier_ops	*ipmr_notifier_ops;
 	unsigned int	ipmr_seq;	/* protected by rtnl_mutex */
 
 	atomic_t	rt_genid;
 	siphash_key_t	ip_id_key;
+	struct hlist_head	*inet_addr_lst;
+	struct delayed_work	addr_chk_work;
 };
 #endif

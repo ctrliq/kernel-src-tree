@@ -193,6 +193,10 @@ struct net {
 #if IS_ENABLED(CONFIG_SMC)
 	struct netns_smc	smc;
 #endif
+#ifdef CONFIG_DEBUG_NET_SMALL_RTNL
+	/* Move to a better place when the config guard is removed. */
+	struct mutex		rtnl_mutex;
+#endif
 #if IS_ENABLED(CONFIG_VSOCKETS)
 	struct netns_vsock	vsock;
 #endif
@@ -213,6 +217,8 @@ void net_ns_barrier(void);
 
 struct ns_common *get_net_ns(struct ns_common *ns);
 struct net *get_net_ns_by_fd(int fd);
+extern struct task_struct *cleanup_net_task;
+
 #else /* CONFIG_NET_NS */
 #include <linux/sched.h>
 #include <linux/nsproxy.h>
@@ -298,6 +304,7 @@ static inline int check_net(const struct net *net)
 }
 
 void net_drop_ns(void *);
+void net_passive_dec(struct net *net);
 
 #else
 
@@ -327,7 +334,17 @@ static inline int check_net(const struct net *net)
 }
 
 #define net_drop_ns NULL
+
+static inline void net_passive_dec(struct net *net)
+{
+	refcount_dec(&net->passive);
+}
 #endif
+
+static inline void net_passive_inc(struct net *net)
+{
+	refcount_inc(&net->passive);
+}
 
 /* Returns true if the netns initialization is completed successfully */
 static inline bool net_initialized(const struct net *net)
@@ -462,8 +479,8 @@ struct pernet_operations {
 	void (*exit)(struct net *net);
 	void (*exit_batch)(struct list_head *net_exit_list);
 	/* Following method is called with RTNL held. */
-	void (*exit_batch_rtnl)(struct list_head *net_exit_list,
-				struct list_head *dev_kill_list);
+	void (*exit_rtnl)(struct net *net,
+			  struct list_head *dev_kill_list);
 	unsigned int * const id;
 	const size_t size;
 };

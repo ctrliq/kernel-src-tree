@@ -286,7 +286,7 @@ static int ip6mr_rules_dump(struct net *net, struct notifier_block *nb,
 	return fib_rules_dump(net, nb, RTNL_FAMILY_IP6MR, extack);
 }
 
-static unsigned int ip6mr_rules_seq_read(struct net *net)
+static unsigned int ip6mr_rules_seq_read(const struct net *net)
 {
 	return fib_rules_seq_read(net, RTNL_FAMILY_IP6MR);
 }
@@ -347,7 +347,7 @@ static int ip6mr_rules_dump(struct net *net, struct notifier_block *nb,
 	return 0;
 }
 
-static unsigned int ip6mr_rules_seq_read(struct net *net)
+static unsigned int ip6mr_rules_seq_read(const struct net *net)
 {
 	return 0;
 }
@@ -1278,11 +1278,9 @@ static int ip6mr_device_event(struct notifier_block *this,
 	return NOTIFY_DONE;
 }
 
-static unsigned int ip6mr_seq_read(struct net *net)
+static unsigned int ip6mr_seq_read(const struct net *net)
 {
-	ASSERT_RTNL();
-
-	return net->ipv6.ipmr_seq + ip6mr_rules_seq_read(net);
+	return READ_ONCE(net->ipv6.ipmr_seq) + ip6mr_rules_seq_read(net);
 }
 
 static int ip6mr_dump(struct net *net, struct notifier_block *nb,
@@ -1387,6 +1385,12 @@ static struct pernet_operations ip6mr_net_ops = {
 	.exit_batch = ip6mr_net_exit_batch,
 };
 
+static const struct rtnl_msg_handler ip6mr_rtnl_msg_handlers[] __initconst_or_module = {
+	{.owner = THIS_MODULE, .protocol = RTNL_FAMILY_IP6MR,
+	 .msgtype = RTM_GETROUTE,
+	 .doit = ip6mr_rtm_getroute, .dumpit = ip6mr_rtm_dumproute},
+};
+
 int __init ip6_mr_init(void)
 {
 	int err;
@@ -1409,9 +1413,8 @@ int __init ip6_mr_init(void)
 		goto add_proto_fail;
 	}
 #endif
-	err = rtnl_register_module(THIS_MODULE, RTNL_FAMILY_IP6MR, RTM_GETROUTE,
-				   ip6mr_rtm_getroute, ip6mr_rtm_dumproute, 0);
-	if (err == 0)
+	err = rtnl_register_many(ip6mr_rtnl_msg_handlers);
+	if (!err)
 		return 0;
 
 #ifdef CONFIG_IPV6_PIMSM_V2
@@ -1428,7 +1431,7 @@ reg_pernet_fail:
 
 void __init ip6_mr_cleanup(void)
 {
-	rtnl_unregister(RTNL_FAMILY_IP6MR, RTM_GETROUTE);
+	rtnl_unregister_many(ip6mr_rtnl_msg_handlers);
 #ifdef CONFIG_IPV6_PIMSM_V2
 	inet6_del_protocol(&pim6_protocol, IPPROTO_PIM);
 #endif

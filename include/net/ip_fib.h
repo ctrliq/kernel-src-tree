@@ -162,6 +162,8 @@ struct fib_info {
 	struct fib_nh		fib_nh[] __counted_by(fib_nhs);
 };
 
+int __net_init fib4_semantics_init(struct net *net);
+void __net_exit fib4_semantics_exit(struct net *net);
 
 #ifdef CONFIG_IP_MULTIPLE_TABLES
 struct fib_rule;
@@ -347,7 +349,7 @@ static inline int fib4_rules_dump(struct net *net, struct notifier_block *nb,
 	return 0;
 }
 
-static inline unsigned int fib4_rules_seq_read(struct net *net)
+static inline unsigned int fib4_rules_seq_read(const struct net *net)
 {
 	return 0;
 }
@@ -411,7 +413,7 @@ static inline bool fib4_has_custom_rules(const struct net *net)
 bool fib4_rule_default(const struct fib_rule *rule);
 int fib4_rules_dump(struct net *net, struct notifier_block *nb,
 		    struct netlink_ext_ack *extack);
-unsigned int fib4_rules_seq_read(struct net *net);
+unsigned int fib4_rules_seq_read(const struct net *net);
 
 static inline bool fib4_rules_early_flow_dissect(struct net *net,
 						 struct sk_buff *skb,

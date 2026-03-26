@@ -183,8 +183,6 @@ static DEFINE_SPINLOCK(napi_hash_lock);
 static unsigned int napi_gen_id = NR_CPUS;
 static DEFINE_READ_MOSTLY_HASHTABLE(napi_hash, 8);
 
-static DECLARE_RWSEM(devnet_rename_sem);
-
 static inline void dev_base_seq_inc(struct net *net)
 {
 	unsigned int val = net->dev_base_seq + 1;
@@ -1440,23 +1438,16 @@ static int dev_get_valid_name(struct net *net, struct net_device *dev,
 
 int netif_change_name(struct net_device *dev, const char *newname)
 {
+	struct net *net = dev_net(dev);
 	unsigned char old_assign_type;
 	char oldname[IFNAMSIZ];
 	int err = 0;
 	int ret;
-	struct net *net;
 
-	ASSERT_RTNL();
-	BUG_ON(!dev_net(dev));
+	ASSERT_RTNL_NET(net);
 
-	net = dev_net(dev);
-
-	down_write(&devnet_rename_sem);
-
-	if (strncmp(newname, dev->name, IFNAMSIZ) == 0) {
-		up_write(&devnet_rename_sem);
+	if (!strncmp(newname, dev->name, IFNAMSIZ))
 		return 0;
-	}
 
 	memcpy(oldname, dev->name, IFNAMSIZ);
 
@@ -1464,10 +1455,8 @@ int netif_change_name(struct net_device *dev, const char *newname)
 	err = dev_get_valid_name(net, dev, newname);
 	write_sequnlock_bh(&netdev_rename_lock);
 
-	if (err < 0) {
-		up_write(&devnet_rename_sem);
+	if (err < 0)
 		return err;
-	}
 
 	if (oldname[0] && !strchr(oldname, '%'))
 		netdev_info(dev, "renamed from %s%s\n", oldname,
@@ -1483,11 +1472,8 @@ rollback:
 		memcpy(dev->name, oldname, IFNAMSIZ);
 		write_sequnlock_bh(&netdev_rename_lock);
 		WRITE_ONCE(dev->name_assign_type, old_assign_type);
-		up_write(&devnet_rename_sem);
 		return ret;
 	}
-
-	up_write(&devnet_rename_sem);
 
 	netdev_adjacent_rename_links(dev, oldname);
 
@@ -1504,7 +1490,6 @@ rollback:
 		/* err >= 0 after dev_alloc_name() or stores the first errno */
 		if (err >= 0) {
 			err = ret;
-			down_write(&devnet_rename_sem);
 			write_seqlock_bh(&netdev_rename_lock);
 			memcpy(dev->name, oldname, IFNAMSIZ);
 			write_sequnlock_bh(&netdev_rename_lock);
@@ -1780,7 +1765,7 @@ static void __dev_close(struct net_device *dev)
 	list_del(&single);
 }
 
-void dev_close_many(struct list_head *head, bool unlink)
+void netif_close_many(struct list_head *head, bool unlink)
 {
 	struct net_device *dev, *tmp;
 
@@ -1798,7 +1783,7 @@ void dev_close_many(struct list_head *head, bool unlink)
 			list_del_init(&dev->close_list);
 	}
 }
-EXPORT_SYMBOL(dev_close_many);
+EXPORT_SYMBOL_NS_GPL(netif_close_many, "NETDEV_INTERNAL");
 
 void netif_close(struct net_device *dev)
 {
@@ -1806,7 +1791,7 @@ void netif_close(struct net_device *dev)
 		LIST_HEAD(single);
 
 		list_add(&dev->close_list, &single);
-		dev_close_many(&single, true);
+		netif_close_many(&single, true);
 		list_del(&single);
 	}
 }
@@ -1963,14 +1948,19 @@ int register_netdevice_notifier(struct notifier_block *nb)
 
 	/* Close race with setup_net() and cleanup_net() */
 	down_write(&pernet_ops_rwsem);
+
+	/* When RTNL is removed, we need protection for netdev_chain. */
 	rtnl_lock();
+
 	err = raw_notifier_chain_register(&netdev_chain, nb);
 	if (err)
 		goto unlock;
 	if (dev_boot_phase)
 		goto unlock;
 	for_each_net(net) {
+		__rtnl_net_lock(net);
 		err = call_netdevice_register_net_notifiers(nb, net);
+		__rtnl_net_unlock(net);
 		if (err)
 			goto rollback;
 	}
@@ -1981,8 +1971,11 @@ unlock:
 	return err;
 
 rollback:
-	for_each_net_continue_reverse(net)
+	for_each_net_continue_reverse(net) {
+		__rtnl_net_lock(net);
 		call_netdevice_unregister_net_notifiers(nb, net);
+		__rtnl_net_unlock(net);
+	}
 
 	raw_notifier_chain_unregister(&netdev_chain, nb);
 	goto unlock;
@@ -2015,8 +2008,11 @@ int unregister_netdevice_notifier(struct notifier_block *nb)
 	if (err)
 		goto unlock;
 
-	for_each_net(net)
+	for_each_net(net) {
+		__rtnl_net_lock(net);
 		call_netdevice_unregister_net_notifiers(nb, net);
+		__rtnl_net_unlock(net);
+	}
 
 unlock:
 	rtnl_unlock();
@@ -2080,9 +2076,10 @@ int register_netdevice_notifier_net(struct net *net, struct notifier_block *nb)
 {
 	int err;
 
-	rtnl_lock();
+	rtnl_net_lock(net);
 	err = __register_netdevice_notifier_net(net, nb, false);
-	rtnl_unlock();
+	rtnl_net_unlock(net);
+
 	return err;
 }
 EXPORT_SYMBOL(register_netdevice_notifier_net);
@@ -2108,9 +2105,10 @@ int unregister_netdevice_notifier_net(struct net *net,
 {
 	int err;
 
-	rtnl_lock();
+	rtnl_net_lock(net);
 	err = __unregister_netdevice_notifier_net(net, nb);
-	rtnl_unlock();
+	rtnl_net_unlock(net);
+
 	return err;
 }
 EXPORT_SYMBOL(unregister_netdevice_notifier_net);
@@ -2123,19 +2121,56 @@ static void __move_netdevice_notifier_net(struct net *src_net,
 	__register_netdevice_notifier_net(dst_net, nb, true);
 }
 
+static void rtnl_net_dev_lock(struct net_device *dev)
+{
+	bool again;
+
+	do {
+		struct net *net;
+
+		again = false;
+
+		/* netns might be being dismantled. */
+		rcu_read_lock();
+		net = dev_net_rcu(dev);
+		net_passive_inc(net);
+		rcu_read_unlock();
+
+		rtnl_net_lock(net);
+
+#ifdef CONFIG_NET_NS
+		/* dev might have been moved to another netns. */
+		if (!net_eq(net, rcu_access_pointer(dev->nd_net.net))) {
+			rtnl_net_unlock(net);
+			net_passive_dec(net);
+			again = true;
+		}
+#endif
+	} while (again);
+}
+
+static void rtnl_net_dev_unlock(struct net_device *dev)
+{
+	struct net *net = dev_net(dev);
+
+	rtnl_net_unlock(net);
+	net_passive_dec(net);
+}
+
 int register_netdevice_notifier_dev_net(struct net_device *dev,
 					struct notifier_block *nb,
 					struct netdev_net_notifier *nn)
 {
 	int err;
 
-	rtnl_lock();
+	rtnl_net_dev_lock(dev);
 	err = __register_netdevice_notifier_net(dev_net(dev), nb, false);
 	if (!err) {
 		nn->nb = nb;
 		list_add(&nn->list, &dev->net_notifier_list);
 	}
-	rtnl_unlock();
+	rtnl_net_dev_unlock(dev);
+
 	return err;
 }
 EXPORT_SYMBOL(register_netdevice_notifier_dev_net);
@@ -2146,10 +2181,11 @@ int unregister_netdevice_notifier_dev_net(struct net_device *dev,
 {
 	int err;
 
-	rtnl_lock();
+	rtnl_net_dev_lock(dev);
 	list_del(&nn->list);
 	err = __unregister_netdevice_notifier_net(dev_net(dev), nb);
-	rtnl_unlock();
+	rtnl_net_dev_unlock(dev);
+
 	return err;
 }
 EXPORT_SYMBOL(unregister_netdevice_notifier_dev_net);
@@ -6179,8 +6215,6 @@ void netif_receive_skb_list(struct list_head *head)
 }
 EXPORT_SYMBOL(netif_receive_skb_list);
 
-static DEFINE_PER_CPU(struct work_struct, flush_works);
-
 /* Network device is going away, flush any packets still pending */
 static void flush_backlog(struct work_struct *work)
 {
@@ -6241,36 +6275,54 @@ static bool flush_required(int cpu)
 	return true;
 }
 
+struct flush_backlogs {
+	cpumask_t		flush_cpus;
+	struct work_struct	w[];
+};
+
+static struct flush_backlogs *flush_backlogs_alloc(void)
+{
+	return kmalloc(struct_size_t(struct flush_backlogs, w, nr_cpu_ids),
+		       GFP_KERNEL);
+}
+
+static struct flush_backlogs *flush_backlogs_fallback;
+static DEFINE_MUTEX(flush_backlogs_mutex);
+
 static void flush_all_backlogs(void)
 {
-	static cpumask_t flush_cpus;
+	struct flush_backlogs *ptr = flush_backlogs_alloc();
 	unsigned int cpu;
 
-	/* since we are under rtnl lock protection we can use static data
-	 * for the cpumask and avoid allocating on stack the possibly
-	 * large mask
-	 */
-	ASSERT_RTNL();
+	if (!ptr) {
+		mutex_lock(&flush_backlogs_mutex);
+		ptr = flush_backlogs_fallback;
+	}
+	cpumask_clear(&ptr->flush_cpus);
 
 	cpus_read_lock();
 
-	cpumask_clear(&flush_cpus);
 	for_each_online_cpu(cpu) {
 		if (flush_required(cpu)) {
-			queue_work_on(cpu, system_highpri_wq,
-				      per_cpu_ptr(&flush_works, cpu));
-			cpumask_set_cpu(cpu, &flush_cpus);
+			INIT_WORK(&ptr->w[cpu], flush_backlog);
+			queue_work_on(cpu, system_highpri_wq, &ptr->w[cpu]);
+			__cpumask_set_cpu(cpu, &ptr->flush_cpus);
 		}
 	}
 
 	/* we can have in flight packet[s] on the cpus we are not flushing,
 	 * synchronize_net() in unregister_netdevice_many() will take care of
-	 * them
+	 * them.
 	 */
-	for_each_cpu(cpu, &flush_cpus)
-		flush_work(per_cpu_ptr(&flush_works, cpu));
+	for_each_cpu(cpu, &ptr->flush_cpus)
+		flush_work(&ptr->w[cpu]);
 
 	cpus_read_unlock();
+
+	if (ptr != flush_backlogs_fallback)
+		kfree(ptr);
+	else
+		mutex_unlock(&flush_backlogs_mutex);
 }
 
 static void net_rps_send_ipi(struct softnet_data *remsd)
@@ -9357,12 +9409,12 @@ void dev_set_rx_mode(struct net_device *dev)
 }
 
 /**
- *	dev_get_flags - get flags reported to userspace
- *	@dev: device
+ * netif_get_flags() - get flags reported to userspace
+ * @dev: device
  *
- *	Get the combination of flag bits exported through APIs to userspace.
+ * Get the combination of flag bits exported through APIs to userspace.
  */
-unsigned int dev_get_flags(const struct net_device *dev)
+unsigned int netif_get_flags(const struct net_device *dev)
 {
 	unsigned int flags;
 
@@ -9385,7 +9437,7 @@ unsigned int dev_get_flags(const struct net_device *dev)
 
 	return flags;
 }
-EXPORT_SYMBOL(dev_get_flags);
+EXPORT_SYMBOL(netif_get_flags);
 
 int __dev_change_flags(struct net_device *dev, unsigned int flags,
 		       struct netlink_ext_ack *extack)
@@ -9497,7 +9549,7 @@ int netif_change_flags(struct net_device *dev, unsigned int flags,
 	return ret;
 }
 
-int __dev_set_mtu(struct net_device *dev, int new_mtu)
+int __netif_set_mtu(struct net_device *dev, int new_mtu)
 {
 	const struct net_device_ops *ops = dev->netdev_ops;
 
@@ -9508,7 +9560,7 @@ int __dev_set_mtu(struct net_device *dev, int new_mtu)
 	WRITE_ONCE(dev->mtu, new_mtu);
 	return 0;
 }
-EXPORT_SYMBOL(__dev_set_mtu);
+EXPORT_SYMBOL_NS_GPL(__netif_set_mtu, "NETDEV_INTERNAL");
 
 int dev_validate_mtu(struct net_device *dev, int new_mtu,
 		     struct netlink_ext_ack *extack)
@@ -9527,12 +9579,14 @@ int dev_validate_mtu(struct net_device *dev, int new_mtu,
 }
 
 /**
- *	netif_set_mtu_ext - Change maximum transfer unit
- *	@dev: device
- *	@new_mtu: new transfer unit
- *	@extack: netlink extended ack
+ * netif_set_mtu_ext() - Change maximum transfer unit
+ * @dev: device
+ * @new_mtu: new transfer unit
+ * @extack: netlink extended ack
  *
- *	Change the maximum transfer size of the network device.
+ * Change the maximum transfer size of the network device.
+ *
+ * Return: 0 on success, -errno on failure.
  */
 int netif_set_mtu_ext(struct net_device *dev, int new_mtu,
 		      struct netlink_ext_ack *extack)
@@ -9557,7 +9611,7 @@ int netif_set_mtu_ext(struct net_device *dev, int new_mtu,
 		return err;
 
 	orig_mtu = dev->mtu;
-	err = __dev_set_mtu(dev, new_mtu);
+	err = __netif_set_mtu(dev, new_mtu);
 
 	if (!err) {
 		err = call_netdevice_notifiers_mtu(NETDEV_CHANGEMTU, dev,
@@ -9567,7 +9621,7 @@ int netif_set_mtu_ext(struct net_device *dev, int new_mtu,
 			/* setting mtu back and notifying everyone again,
 			 * so that they have a chance to revert changes.
 			 */
-			__dev_set_mtu(dev, orig_mtu);
+			__netif_set_mtu(dev, orig_mtu);
 			call_netdevice_notifiers_mtu(NETDEV_CHANGEMTU, dev,
 						     new_mtu);
 		}
@@ -9621,13 +9675,15 @@ void netif_set_group(struct net_device *dev, int new_group)
 }
 
 /**
- *	dev_pre_changeaddr_notify - Call NETDEV_PRE_CHANGEADDR.
- *	@dev: device
- *	@addr: new address
- *	@extack: netlink extended ack
+ * netif_pre_changeaddr_notify() - Call NETDEV_PRE_CHANGEADDR.
+ * @dev: device
+ * @addr: new address
+ * @extack: netlink extended ack
+ *
+ * Return: 0 on success, -errno on failure.
  */
-int dev_pre_changeaddr_notify(struct net_device *dev, const char *addr,
-			      struct netlink_ext_ack *extack)
+int netif_pre_changeaddr_notify(struct net_device *dev, const char *addr,
+				struct netlink_ext_ack *extack)
 {
 	struct netdev_notifier_pre_changeaddr_info info = {
 		.info.dev = dev,
@@ -9639,7 +9695,7 @@ int dev_pre_changeaddr_notify(struct net_device *dev, const char *addr,
 	rc = call_netdevice_notifiers_info(NETDEV_PRE_CHANGEADDR, &info.info);
 	return notifier_to_errno(rc);
 }
-EXPORT_SYMBOL(dev_pre_changeaddr_notify);
+EXPORT_SYMBOL_NS_GPL(netif_pre_changeaddr_notify, "NETDEV_INTERNAL");
 
 int netif_set_mac_address(struct net_device *dev, struct sockaddr *sa,
 			  struct netlink_ext_ack *extack)
@@ -9653,7 +9709,7 @@ int netif_set_mac_address(struct net_device *dev, struct sockaddr *sa,
 		return -EINVAL;
 	if (!netif_device_present(dev))
 		return -ENODEV;
-	err = dev_pre_changeaddr_notify(dev, sa->sa_data, extack);
+	err = netif_pre_changeaddr_notify(dev, sa->sa_data, extack);
 	if (err)
 		return err;
 	if (memcmp(dev->dev_addr, sa->sa_data, dev->addr_len)) {
@@ -9669,7 +9725,7 @@ int netif_set_mac_address(struct net_device *dev, struct sockaddr *sa,
 
 DECLARE_RWSEM(dev_addr_sem);
 
-int dev_get_mac_address(struct sockaddr *sa, struct net *net, char *dev_name)
+int netif_get_mac_address(struct sockaddr *sa, struct net *net, char *dev_name)
 {
 	size_t size = sizeof(sa->sa_data_min);
 	struct net_device *dev;
@@ -9695,7 +9751,7 @@ unlock:
 	up_read(&dev_addr_sem);
 	return ret;
 }
-EXPORT_SYMBOL(dev_get_mac_address);
+EXPORT_SYMBOL_NS_GPL(netif_get_mac_address, "NETDEV_INTERNAL");
 
 int netif_change_carrier(struct net_device *dev, bool new_carrier)
 {
@@ -9748,16 +9804,17 @@ int dev_get_phys_port_name(struct net_device *dev,
 }
 
 /**
- *	dev_get_port_parent_id - Get the device's port parent identifier
- *	@dev: network device
- *	@ppid: pointer to a storage for the port's parent identifier
- *	@recurse: allow/disallow recursion to lower devices
+ * netif_get_port_parent_id() - Get the device's port parent identifier
+ * @dev: network device
+ * @ppid: pointer to a storage for the port's parent identifier
+ * @recurse: allow/disallow recursion to lower devices
  *
- *	Get the devices's port parent identifier
+ * Get the devices's port parent identifier.
+ *
+ * Return: 0 on success, -errno on failure.
  */
-int dev_get_port_parent_id(struct net_device *dev,
-			   struct netdev_phys_item_id *ppid,
-			   bool recurse)
+int netif_get_port_parent_id(struct net_device *dev,
+			     struct netdev_phys_item_id *ppid, bool recurse)
 {
 	const struct net_device_ops *ops = dev->netdev_ops;
 	struct netdev_phys_item_id first = { };
@@ -9776,7 +9833,7 @@ int dev_get_port_parent_id(struct net_device *dev,
 		return err;
 
 	netdev_for_each_lower_dev(dev, lower_dev, iter) {
-		err = dev_get_port_parent_id(lower_dev, ppid, true);
+		err = netif_get_port_parent_id(lower_dev, ppid, true);
 		if (err)
 			break;
 		if (!first.id_len)
@@ -9787,7 +9844,7 @@ int dev_get_port_parent_id(struct net_device *dev,
 
 	return err;
 }
-EXPORT_SYMBOL(dev_get_port_parent_id);
+EXPORT_SYMBOL(netif_get_port_parent_id);
 
 /**
  *	netdev_port_same_parent_id - Indicate if two network devices have
@@ -9800,8 +9857,8 @@ bool netdev_port_same_parent_id(struct net_device *a, struct net_device *b)
 	struct netdev_phys_item_id a_id = { };
 	struct netdev_phys_item_id b_id = { };
 
-	if (dev_get_port_parent_id(a, &a_id, true) ||
-	    dev_get_port_parent_id(b, &b_id, true))
+	if (netif_get_port_parent_id(a, &a_id, true) ||
+	    netif_get_port_parent_id(b, &b_id, true))
 		return false;
 
 	return netdev_phys_item_id_same(&a_id, &b_id);
@@ -10462,6 +10519,15 @@ static void dev_index_release(struct net *net, int ifindex)
 {
 	/* Expect only unused indexes, unlist_netdevice() removes the used */
 	WARN_ON(xa_erase(&net->dev_by_index, ifindex));
+}
+
+static bool from_cleanup_net(void)
+{
+#ifdef CONFIG_NET_NS
+	return current == READ_ONCE(cleanup_net_task);
+#else
+	return false;
+#endif
 }
 
 /* Delayed registration/unregisteration */
@@ -11177,12 +11243,16 @@ static void init_dummy_netdev(struct net_device *dev)
  */
 int register_netdev(struct net_device *dev)
 {
+	struct net *net = dev_net(dev);
 	int err;
 
-	if (rtnl_lock_killable())
+	if (rtnl_net_lock_killable(net))
 		return -EINTR;
+
 	err = register_netdevice(dev);
-	rtnl_unlock();
+
+	rtnl_net_unlock(net);
+
 	return err;
 }
 EXPORT_SYMBOL(register_netdev);
@@ -11872,7 +11942,7 @@ EXPORT_SYMBOL_GPL(alloc_netdev_dummy);
 void synchronize_net(void)
 {
 	might_sleep();
-	if (rtnl_is_locked())
+	if (from_cleanup_net() || rtnl_is_locked())
 		synchronize_rcu_expedited();
 	else
 		synchronize_rcu();
@@ -11927,7 +11997,7 @@ static void netif_close_many_and_unlock(struct list_head *close_head)
 {
 	struct net_device *dev, *tmp;
 
-	dev_close_many(close_head, false);
+	netif_close_many(close_head, false);
 
 	/* ... now unlock them */
 	list_for_each_entry_safe(dev, tmp, close_head, close_list) {
@@ -11997,7 +12067,7 @@ void unregister_netdevice_many_notify(struct list_head *head,
 		if (!netdev_need_ops_lock(dev))
 			list_add_tail(&dev->close_list, &close_head);
 	}
-	dev_close_many(&close_head, true);
+	netif_close_many(&close_head, true);
 
 	list_for_each_entry(dev, head, unreg_list) {
 		/* And unlink it from device chain. */
@@ -12108,14 +12178,15 @@ EXPORT_SYMBOL(unregister_netdevice_many);
  */
 void unregister_netdev(struct net_device *dev)
 {
-	rtnl_lock();
+	rtnl_net_dev_lock(dev);
 	unregister_netdevice(dev);
-	rtnl_unlock();
+	rtnl_net_dev_unlock(dev);
 }
 EXPORT_SYMBOL(unregister_netdev);
 
 int __dev_change_net_namespace(struct net_device *dev, struct net *net,
-			       const char *pat, int new_ifindex)
+			       const char *pat, int new_ifindex,
+			       struct netlink_ext_ack *extack)
 {
 	struct netdev_name_node *name_node;
 	struct net *net_old = dev_net(dev);
@@ -12126,12 +12197,16 @@ int __dev_change_net_namespace(struct net_device *dev, struct net *net,
 
 	/* Don't allow namespace local devices to be moved. */
 	err = -EINVAL;
-	if (dev->netns_immutable)
+	if (dev->netns_immutable) {
+		NL_SET_ERR_MSG(extack, "The interface netns is immutable");
 		goto out;
+	}
 
 	/* Ensure the device has been registered */
-	if (dev->reg_state != NETREG_REGISTERED)
+	if (dev->reg_state != NETREG_REGISTERED) {
+		NL_SET_ERR_MSG(extack, "The interface isn't registered");
 		goto out;
+	}
 
 	/* Get out if there is nothing todo */
 	err = 0;
@@ -12144,30 +12219,49 @@ int __dev_change_net_namespace(struct net_device *dev, struct net *net,
 	err = -EEXIST;
 	if (netdev_name_in_use(net, dev->name)) {
 		/* We get here if we can't use the current device name */
-		if (!pat)
+		if (!pat) {
+			NL_SET_ERR_MSG(extack,
+				       "An interface with the same name exists in the target netns");
 			goto out;
+		}
 		err = dev_prep_valid_name(net, dev, pat, new_name, EEXIST);
-		if (err < 0)
+		if (err < 0) {
+			NL_SET_ERR_MSG_FMT(extack,
+					   "Unable to use '%s' for the new interface name in the target netns",
+					   pat);
 			goto out;
+		}
 	}
 	/* Check that none of the altnames conflicts. */
 	err = -EEXIST;
-	netdev_for_each_altname(dev, name_node)
-		if (netdev_name_in_use(net, name_node->name))
+	netdev_for_each_altname(dev, name_node) {
+		if (netdev_name_in_use(net, name_node->name)) {
+			NL_SET_ERR_MSG_FMT(extack,
+					   "An interface with the altname %s exists in the target netns",
+					   name_node->name);
 			goto out;
+		}
+	}
 
 	/* Check that new_ifindex isn't used yet. */
 	if (new_ifindex) {
 		err = dev_index_reserve(net, new_ifindex);
-		if (err < 0)
+		if (err < 0) {
+			NL_SET_ERR_MSG_FMT(extack,
+					   "The ifindex %d is not available in the target netns",
+					   new_ifindex);
 			goto out;
+		}
 	} else {
 		/* If there is an ifindex conflict assign a new one */
 		err = dev_index_reserve(net, dev->ifindex);
 		if (err == -EBUSY)
 			err = dev_index_reserve(net, 0);
-		if (err < 0)
+		if (err < 0) {
+			NL_SET_ERR_MSG(extack,
+				       "Unable to allocate a new ifindex in the target netns");
 			goto out;
+		}
 		new_ifindex = err;
 	}
 
@@ -12818,11 +12912,12 @@ static int __init net_dev_init(void)
 	 *	Initialise the packet receive queues.
 	 */
 
-	for_each_possible_cpu(i) {
-		struct work_struct *flush = per_cpu_ptr(&flush_works, i);
-		struct softnet_data *sd = &per_cpu(softnet_data, i);
+	flush_backlogs_fallback = flush_backlogs_alloc();
+	if (!flush_backlogs_fallback)
+		goto out;
 
-		INIT_WORK(flush, flush_backlog);
+	for_each_possible_cpu(i) {
+		struct softnet_data *sd = &per_cpu(softnet_data, i);
 
 		skb_queue_head_init(&sd->input_pkt_queue);
 		skb_queue_head_init(&sd->process_queue);

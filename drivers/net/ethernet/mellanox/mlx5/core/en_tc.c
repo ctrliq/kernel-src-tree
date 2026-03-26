@@ -5456,7 +5456,7 @@ int mlx5e_tc_esw_init(struct mlx5_rep_uplink_priv *uplink_priv)
 		goto err_action_counter;
 	}
 
-	err = dev_get_port_parent_id(priv->netdev, &ppid, false);
+	err = netif_get_port_parent_id(priv->netdev, &ppid, false);
 	if (!err) {
 		memcpy(&attr.key.buf, &ppid.id, ppid.id_len);
 		attr.flags = MLX5_DEVCOM_MATCH_FLAGS_NS;

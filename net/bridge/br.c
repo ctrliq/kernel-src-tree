@@ -79,9 +79,9 @@ static int br_device_event(struct notifier_block *unused, unsigned long event, v
 		if (br->dev->addr_assign_type == NET_ADDR_SET)
 			break;
 		prechaddr_info = ptr;
-		err = dev_pre_changeaddr_notify(br->dev,
-						prechaddr_info->dev_addr,
-						extack);
+		err = netif_pre_changeaddr_notify(br->dev,
+						  prechaddr_info->dev_addr,
+						  extack);
 		if (err)
 			return notifier_from_errno(err);
 		break;
@@ -402,21 +402,20 @@ void br_opt_toggle(struct net_bridge *br, enum net_bridge_opts opt, bool on)
 		clear_bit(opt, &br->options);
 }
 
-static void __net_exit br_net_exit_batch_rtnl(struct list_head *net_list,
-					      struct list_head *dev_to_kill)
+static void __net_exit br_net_exit_rtnl(struct net *net,
+					struct list_head *dev_to_kill)
 {
 	struct net_device *dev;
-	struct net *net;
 
-	ASSERT_RTNL();
-	list_for_each_entry(net, net_list, exit_list)
-		for_each_netdev(net, dev)
-			if (netif_is_bridge_master(dev))
-				br_dev_delete(dev, dev_to_kill);
+	ASSERT_RTNL_NET(net);
+
+	for_each_netdev(net, dev)
+		if (netif_is_bridge_master(dev))
+			br_dev_delete(dev, dev_to_kill);
 }
 
 static struct pernet_operations br_net_ops = {
-	.exit_batch_rtnl = br_net_exit_batch_rtnl,
+	.exit_rtnl = br_net_exit_rtnl,
 };
 
 static const struct stp_proto br_stp_proto = {
@@ -519,3 +518,4 @@ MODULE_LICENSE("GPL");
 MODULE_VERSION(BR_VERSION);
 MODULE_ALIAS_RTNL_LINK("bridge");
 MODULE_DESCRIPTION("Ethernet bridge driver");
+MODULE_IMPORT_NS("NETDEV_INTERNAL");

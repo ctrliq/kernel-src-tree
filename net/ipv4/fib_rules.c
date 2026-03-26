@@ -74,7 +74,7 @@ int fib4_rules_dump(struct net *net, struct notifier_block *nb,
 	return fib_rules_dump(net, nb, AF_INET, extack);
 }
 
-unsigned int fib4_rules_seq_read(struct net *net)
+unsigned int fib4_rules_seq_read(const struct net *net)
 {
 	return fib_rules_seq_read(net, AF_INET);
 }
@@ -245,9 +245,9 @@ static int fib4_rule_configure(struct fib_rule *rule, struct sk_buff *skb,
 			       struct nlattr **tb,
 			       struct netlink_ext_ack *extack)
 {
-	struct net *net = sock_net(skb->sk);
+	struct fib4_rule *rule4 = (struct fib4_rule *)rule;
+	struct net *net = rule->fr_net;
 	int err = -EINVAL;
-	struct fib4_rule *rule4 = (struct fib4_rule *) rule;
 
 	if (!inet_validate_dscp(frh->tos)) {
 		NL_SET_ERR_MSG(extack,
