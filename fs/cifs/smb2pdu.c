@@ -549,8 +549,10 @@ assemble_neg_contexts(struct smb2_negotiate_req *req,
 	} else
 		req->NegotiateContextCount = cpu_to_le16(4);
 
+	cifs_server_lock(server);
 	ctxt_len = build_netname_ctxt((struct smb2_netname_neg_context *)pneg_ctxt,
 					server->hostname);
+	cifs_server_unlock(server);
 	*total_len += ctxt_len;
 	pneg_ctxt += ctxt_len;
 
