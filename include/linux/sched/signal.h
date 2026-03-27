@@ -395,6 +395,15 @@ static inline int signal_pending(struct task_struct *p)
 	return task_sigpending(p);
 }
 
+/*
+ * signal_pending_current - test whether the current task has a pending signal
+ *
+ * Exported wrapper around signal_pending(current) for use by kernel modules
+ * that must not take a direct dependency on const_current_task or
+ * struct task_struct layout.
+ */
+bool signal_pending_current(void);
+
 static inline int __fatal_signal_pending(struct task_struct *p)
 {
 	return unlikely(sigismember(&p->pending.signal, SIGKILL));

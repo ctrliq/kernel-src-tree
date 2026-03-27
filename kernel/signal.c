@@ -183,6 +183,22 @@ void recalc_sigpending(void)
 }
 EXPORT_SYMBOL(recalc_sigpending);
 
+/**
+ * signal_pending_current - test whether the current task has a pending signal
+ *
+ * Returns true if the current task has a pending signal or a pending
+ * TIF_NOTIFY_SIGNAL, false otherwise.
+ *
+ * This is an exported wrapper around signal_pending(current) for use by
+ * kernel modules that must not take a direct dependency on const_current_task
+ * or struct task_struct layout.
+ */
+bool signal_pending_current(void)
+{
+	return signal_pending(current);
+}
+EXPORT_SYMBOL(signal_pending_current);
+
 void calculate_sigpending(void)
 {
 	/* Have any signals or users of TIF_SIGPENDING been delayed
