@@ -1,127 +1,103 @@
 #!/bin/bash
 
 # Script to create PR body using named arguments
-# Usage: create-pr-body.sh --arch ARCH --build-time TIME --total-time TIME --passed N --failed N [--arch ...] --run-id ID --comparison SECTION --repo REPO [--commit-file FILE]
+# Usage: create-pr-body.sh --arch ARCH --build-time TIME --total-time TIME
+#          [--kselftest-passed N --kselftest-failed N --kselftest-status TEXT]
+#          [--ltp-passed N --ltp-failed N --ltp-status TEXT]
+#          [--arch ...] --run-id ID --repo REPO --compared-against BRANCH
+#          [--ltp-details TEXT] [--commit-file FILE]
 
 set -euo pipefail
 
-# Arrays to track architectures and their data
 declare -a ARCHS=()
 declare -A ARCH_DATA
 
-# Global parameters
 RUN_ID=""
-COMPARISON_SECTION=""
 REPO=""
 COMMIT_MESSAGE_FILE=""
+COMPARED_AGAINST=""
+LTP_DETAILS=""
 
 CURRENT_ARCH=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --arch)
-      [[ $# -lt 2 ]] && { echo "Error: --arch requires a value" >&2; exit 1; }
       CURRENT_ARCH="$2"
-      # Only add to ARCHS array if not already present
       if [[ ! " ${ARCHS[@]:-} " =~ " ${CURRENT_ARCH} " ]]; then
         ARCHS+=("$CURRENT_ARCH")
       fi
       shift 2
       ;;
     --build-time)
-      [[ $# -lt 2 ]] && { echo "Error: --build-time requires a value" >&2; exit 1; }
-      [[ -z "$CURRENT_ARCH" ]] && { echo "Error: --arch must be specified before --build-time" >&2; exit 1; }
-      ARCH_DATA["${CURRENT_ARCH}_build_time"]="$2"
-      shift 2
-      ;;
+      ARCH_DATA["${CURRENT_ARCH}_build_time"]="$2"; shift 2 ;;
     --total-time)
-      [[ $# -lt 2 ]] && { echo "Error: --total-time requires a value" >&2; exit 1; }
-      [[ -z "$CURRENT_ARCH" ]] && { echo "Error: --arch must be specified before --total-time" >&2; exit 1; }
-      ARCH_DATA["${CURRENT_ARCH}_total_time"]="$2"
-      shift 2
-      ;;
-    --passed)
-      [[ $# -lt 2 ]] && { echo "Error: --passed requires a value" >&2; exit 1; }
-      [[ -z "$CURRENT_ARCH" ]] && { echo "Error: --arch must be specified before --passed" >&2; exit 1; }
-      ARCH_DATA["${CURRENT_ARCH}_passed"]="$2"
-      shift 2
-      ;;
-    --failed)
-      [[ $# -lt 2 ]] && { echo "Error: --failed requires a value" >&2; exit 1; }
-      [[ -z "$CURRENT_ARCH" ]] && { echo "Error: --arch must be specified before --failed" >&2; exit 1; }
-      ARCH_DATA["${CURRENT_ARCH}_failed"]="$2"
-      shift 2
-      ;;
+      ARCH_DATA["${CURRENT_ARCH}_total_time"]="$2"; shift 2 ;;
+    --kselftest-passed)
+      ARCH_DATA["${CURRENT_ARCH}_kselftest_passed"]="$2"; shift 2 ;;
+    --kselftest-failed)
+      ARCH_DATA["${CURRENT_ARCH}_kselftest_failed"]="$2"; shift 2 ;;
+    --kselftest-status)
+      ARCH_DATA["${CURRENT_ARCH}_kselftest_status"]="$2"; shift 2 ;;
+    --ltp-passed)
+      ARCH_DATA["${CURRENT_ARCH}_ltp_passed"]="$2"; shift 2 ;;
+    --ltp-failed)
+      ARCH_DATA["${CURRENT_ARCH}_ltp_failed"]="$2"; shift 2 ;;
+    --ltp-status)
+      ARCH_DATA["${CURRENT_ARCH}_ltp_status"]="$2"; shift 2 ;;
     --run-id)
-      [[ $# -lt 2 ]] && { echo "Error: --run-id requires a value" >&2; exit 1; }
-      RUN_ID="$2"
-      shift 2
-      ;;
-    --comparison)
-      [[ $# -lt 2 ]] && { echo "Error: --comparison requires a value" >&2; exit 1; }
-      COMPARISON_SECTION="$2"
-      shift 2
-      ;;
+      RUN_ID="$2"; shift 2 ;;
     --repo)
-      [[ $# -lt 2 ]] && { echo "Error: --repo requires a value" >&2; exit 1; }
-      REPO="$2"
-      shift 2
-      ;;
+      REPO="$2"; shift 2 ;;
+    --compared-against)
+      COMPARED_AGAINST="$2"; shift 2 ;;
+    --ltp-details)
+      LTP_DETAILS="$2"; shift 2 ;;
     --commit-file)
-      [[ $# -lt 2 ]] && { echo "Error: --commit-file requires a value" >&2; exit 1; }
-      COMMIT_MESSAGE_FILE="$2"
-      shift 2
-      ;;
+      COMMIT_MESSAGE_FILE="$2"; shift 2 ;;
     *)
-      echo "Error: Unknown option: $1" >&2
-      echo "Usage: $0 --arch ARCH --build-time TIME --total-time TIME --passed N --failed N [--arch ...] --run-id ID --comparison SECTION --repo REPO [--commit-file FILE]" >&2
-      exit 1
-      ;;
+      echo "Error: Unknown option: $1" >&2; exit 1 ;;
   esac
 done
 
-# Validate required parameters
 [[ ${#ARCHS[@]} -eq 0 ]] && { echo "Error: At least one --arch required" >&2; exit 1; }
 [[ -z "$RUN_ID" ]] && { echo "Error: --run-id required" >&2; exit 1; }
-[[ -z "$COMPARISON_SECTION" ]] && { echo "Error: --comparison required" >&2; exit 1; }
 [[ -z "$REPO" ]] && { echo "Error: --repo required" >&2; exit 1; }
 [[ -z "$COMMIT_MESSAGE_FILE" ]] && COMMIT_MESSAGE_FILE="/tmp/commit_message.txt"
 
-# Check if commit message file exists
 if [ ! -f "$COMMIT_MESSAGE_FILE" ]; then
   echo "Error: Commit message file not found: $COMMIT_MESSAGE_FILE" >&2
   exit 1
 fi
 
-# Validate each arch has all required data
 for arch in "${ARCHS[@]}"; do
   [[ -z "${ARCH_DATA[${arch}_build_time]:-}" ]] && { echo "Error: Missing --build-time for $arch" >&2; exit 1; }
   [[ -z "${ARCH_DATA[${arch}_total_time]:-}" ]] && { echo "Error: Missing --total-time for $arch" >&2; exit 1; }
-  [[ -z "${ARCH_DATA[${arch}_passed]:-}" ]] && { echo "Error: Missing --passed for $arch" >&2; exit 1; }
-  [[ -z "${ARCH_DATA[${arch}_failed]:-}" ]] && { echo "Error: Missing --failed for $arch" >&2; exit 1; }
 done
 
-# Convert seconds to minutes for better readability
 convert_time() {
-  local seconds="${1%s}"  # Remove 's' suffix if present
+  local seconds="${1%s}"
   local minutes=$((seconds / 60))
   local remaining_seconds=$((seconds % 60))
   echo "${minutes}m ${remaining_seconds}s"
 }
 
-# Determine if multi-arch
 MULTIARCH=false
-if [ ${#ARCHS[@]} -gt 1 ]; then
-  MULTIARCH=true
-fi
+[ ${#ARCHS[@]} -gt 1 ] && MULTIARCH=true
 
-# Convert times for all architectures
 for arch in "${ARCHS[@]}"; do
   ARCH_DATA["${arch}_build_time_readable"]=$(convert_time "${ARCH_DATA[${arch}_build_time]}")
   ARCH_DATA["${arch}_total_time_readable"]=$(convert_time "${ARCH_DATA[${arch}_total_time]}")
 done
 
-# Generate PR body
+# Check if any arch has kselftest or LTP data
+HAS_KSELFTEST=false
+HAS_LTP=false
+for arch in "${ARCHS[@]}"; do
+  [ -n "${ARCH_DATA[${arch}_kselftest_passed]:-}" ] && HAS_KSELFTEST=true
+  [ -n "${ARCH_DATA[${arch}_ltp_passed]:-}" ] && HAS_LTP=true
+done
+
 cat << EOF
 ## Summary
 This PR has been automatically created after successful completion of all CI stages.
@@ -140,70 +116,77 @@ cat << EOF
 ### ✅ Build Stage
 EOF
 
-# Build Stage - conditional formatting
 if [ "$MULTIARCH" = true ]; then
-  cat << EOF
-
-| Architecture | Build Time | Total Time |
-|--------------|------------|------------|
-EOF
+  echo ""
+  echo "| Architecture | Build Time | Total Time |"
+  echo "|--------------|------------|------------|"
   for arch in "${ARCHS[@]}"; do
     echo "| ${arch} | ${ARCH_DATA[${arch}_build_time_readable]} | ${ARCH_DATA[${arch}_total_time_readable]} |"
   done
 else
   ARCH1="${ARCHS[0]}"
-  cat << EOF
-- Status: Passed (${ARCH1})
-- Build Time: ${ARCH_DATA[${ARCH1}_build_time_readable]}
-- Total Time: ${ARCH_DATA[${ARCH1}_total_time_readable]}
-EOF
+  echo "- Status: Passed (${ARCH1})"
+  echo "- Build Time: ${ARCH_DATA[${ARCH1}_build_time_readable]}"
+  echo "- Total Time: ${ARCH_DATA[${ARCH1}_total_time_readable]}"
 fi
 
-cat << EOF
+echo ""
+echo "- [View build logs](https://github.com/${REPO}/actions/runs/${RUN_ID})"
 
-- [View build logs](https://github.com/${REPO}/actions/runs/${RUN_ID})
+cat << EOF
 
 ### ✅ Boot Verification
 EOF
 
-# Boot Verification - conditional formatting
 if [ "$MULTIARCH" = true ]; then
   echo "- Status: Passed (all architectures)"
 else
   echo "- Status: Passed (${ARCHS[0]})"
 fi
+echo "- [View boot logs](https://github.com/${REPO}/actions/runs/${RUN_ID})"
 
-cat << EOF
-- [View boot logs](https://github.com/${REPO}/actions/runs/${RUN_ID})
+if [ "$HAS_KSELFTEST" = true ]; then
+  cat << EOF
 
 ### ✅ Kernel Selftests
-EOF
 
-# Kernel Selftests - conditional formatting
-if [ "$MULTIARCH" = true ]; then
-  cat << EOF
-
-| Architecture | Passed | Failed |
-|--------------|---------|--------|
+| Architecture | Passed | Failed | Compared Against | Status |
+|--------------|--------|--------|-----------------|--------|
 EOF
   for arch in "${ARCHS[@]}"; do
-    echo "| ${arch} | ${ARCH_DATA[${arch}_passed]} | ${ARCH_DATA[${arch}_failed]} |"
+    passed="${ARCH_DATA[${arch}_kselftest_passed]:-N/A}"
+    failed="${ARCH_DATA[${arch}_kselftest_failed]:-N/A}"
+    status="${ARCH_DATA[${arch}_kselftest_status]:-⚠️ No baseline available}"
+    echo "| ${arch} | ${passed} | ${failed} | ${COMPARED_AGAINST:-N/A} | ${status} |"
   done
-else
-  ARCH1="${ARCHS[0]}"
+  echo ""
+  echo "- [View kselftest logs](https://github.com/${REPO}/actions/runs/${RUN_ID})"
+fi
+
+if [ "$HAS_LTP" = true ]; then
   cat << EOF
 
-- **Architecture:** ${ARCH1}
-- **Passed:** ${ARCH_DATA[${ARCH1}_passed]}
-- **Failed:** ${ARCH_DATA[${ARCH1}_failed]}
+### ✅ LTP Results
+
+| Architecture | Passed | Failed | Compared Against | Status |
+|--------------|--------|--------|-----------------|--------|
 EOF
+  for arch in "${ARCHS[@]}"; do
+    ltp_passed="${ARCH_DATA[${arch}_ltp_passed]:-N/A}"
+    ltp_failed="${ARCH_DATA[${arch}_ltp_failed]:-N/A}"
+    ltp_status="${ARCH_DATA[${arch}_ltp_status]:-⚠️ No baseline available}"
+    echo "| ${arch} | ${ltp_passed} | ${ltp_failed} | ${COMPARED_AGAINST:-N/A} | ${ltp_status} |"
+  done
+  echo ""
+  echo "- [View LTP logs](https://github.com/${REPO}/actions/runs/${RUN_ID})"
+
+  if [ -n "$LTP_DETAILS" ]; then
+    echo ""
+    echo "$LTP_DETAILS"
+  fi
 fi
 
 cat << EOF
-
-- [View kselftest logs](https://github.com/${REPO}/actions/runs/${RUN_ID})
-
-${COMPARISON_SECTION}
 
 ---
 🤖 This PR was automatically generated by GitHub Actions
