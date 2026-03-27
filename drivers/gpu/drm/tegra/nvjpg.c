@@ -322,7 +322,7 @@ struct platform_driver tegra_nvjpg_driver = {
 		.pm = &nvjpg_pm_ops
 	},
 	.probe = nvjpg_probe,
-	.remove = nvjpg_remove,
+	.remove_new = nvjpg_remove,
 };
 
 #if IS_ENABLED(CONFIG_ARCH_TEGRA_210_SOC)
