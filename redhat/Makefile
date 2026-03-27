@@ -359,7 +359,7 @@ endif
 # When building the automotive kernel package, set AUTOMOTIVE_BUILD=1.
 ifeq ($(AUTOMOTIVE_BUILD), 1)
   ifeq ("$(DISTRO)", "rhel")
-    RHDISTGIT_BRANCH:=rhivos-$(AUTOMOTIVE_MAJOR).$(AUTOMOTIVE_MINOR).0
+    RHDISTGIT_BRANCH:=rhivos-$(AUTOMOTIVE_MAJOR).$(AUTOMOTIVE_MINOR)
     RHPKG_BIN:=rhpkg
     RHPKG_NS:=
     RHPKG_OPTS:=
