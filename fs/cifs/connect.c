@@ -4081,7 +4081,9 @@ int cifs_tree_connect(const unsigned int xid, struct cifs_tcon *tcon, const stru
 
 	if (!tcon->dfs_path) {
 		if (tcon->ipc) {
+			cifs_server_lock(server);
 			scnprintf(tree, MAX_TREE_SIZE, "\\\\%s\\IPC$", server->hostname);
+			cifs_server_unlock(server);
 			rc = ops->tree_connect(xid, tcon->ses, tree, tcon, nlsc);
 		} else {
 			rc = ops->tree_connect(xid, tcon->ses, tcon->treeName, tcon, nlsc);
@@ -4094,8 +4096,6 @@ int cifs_tree_connect(const unsigned int xid, struct cifs_tcon *tcon, const stru
 		goto out;
 	isroot = ref.server_type == DFS_TYPE_ROOT;
 	free_dfs_info_param(&ref);
-
-	extract_unc_hostname(server->hostname, &tcp_host, &tcp_host_len);
 
 	for (it = dfs_cache_get_tgt_iterator(&tl); it; it = dfs_cache_get_next_tgt(&tl, it)) {
 		bool target_match;
@@ -4114,10 +4114,13 @@ int cifs_tree_connect(const unsigned int xid, struct cifs_tcon *tcon, const stru
 
 		extract_unc_hostname(share, &dfs_host, &dfs_host_len);
 
+		cifs_server_lock(server);
+		extract_unc_hostname(server->hostname, &tcp_host, &tcp_host_len);
 		if (dfs_host_len != tcp_host_len
 		    || strncasecmp(dfs_host, tcp_host, dfs_host_len) != 0) {
 			cifs_dbg(FYI, "%s: %.*s doesn't match %.*s\n", __func__, (int)dfs_host_len,
 				 dfs_host, (int)tcp_host_len, tcp_host);
+			cifs_server_unlock(server);
 
 			rc = match_target_ip(server, dfs_host, dfs_host_len, &target_match);
 			if (rc) {
@@ -4129,7 +4132,8 @@ int cifs_tree_connect(const unsigned int xid, struct cifs_tcon *tcon, const stru
 				cifs_dbg(FYI, "%s: skipping target\n", __func__);
 				continue;
 			}
-		}
+		} else
+			cifs_server_unlock(server);
 
 		if (tcon->ipc) {
 			scnprintf(tree, MAX_TREE_SIZE, "\\\\%s\\IPC$", share);
