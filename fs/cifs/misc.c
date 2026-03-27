@@ -1123,8 +1123,10 @@ int match_target_ip(struct TCP_Server_Info *server,
 		goto out;
 	}
 
+	spin_lock(&cifs_tcp_ses_lock);
 	*result = cifs_match_ipaddr((struct sockaddr *)&server->dstaddr,
 				    &tipaddr);
+	spin_unlock(&cifs_tcp_ses_lock);
 	cifs_dbg(FYI, "%s: ip addresses match: %u\n", __func__, *result);
 	rc = 0;
 
