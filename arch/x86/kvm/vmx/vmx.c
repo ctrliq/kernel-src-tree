@@ -7905,7 +7905,7 @@ static __init u64 vmx_get_perf_capabilities(void)
 
 static __init void vmx_set_cpu_caps(void)
 {
-	kvm_set_cpu_caps();
+	kvm_initialize_cpu_caps();
 
 	/* CPUID 0x1 */
 	if (nested)
@@ -7951,6 +7951,8 @@ static __init void vmx_set_cpu_caps(void)
 
 	if (cpu_has_vmx_waitpkg())
 		kvm_cpu_cap_check_and_set(X86_FEATURE_WAITPKG);
+
+	kvm_finalize_cpu_caps();
 }
 
 static bool vmx_is_io_intercepted(struct kvm_vcpu *vcpu,

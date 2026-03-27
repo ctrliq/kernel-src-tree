@@ -5336,7 +5336,7 @@ static __init void svm_adjust_mmio_mask(void)
 
 static __init void svm_set_cpu_caps(void)
 {
-	kvm_set_cpu_caps();
+	kvm_initialize_cpu_caps();
 
 	kvm_caps.supported_perf_cap = 0;
 	kvm_caps.supported_xss = 0;
@@ -5417,6 +5417,8 @@ static __init void svm_set_cpu_caps(void)
 	 */
 	kvm_cpu_cap_clear(X86_FEATURE_BUS_LOCK_DETECT);
 	kvm_cpu_cap_clear(X86_FEATURE_MSR_IMM);
+
+	kvm_finalize_cpu_caps();
 }
 
 static __init int svm_hardware_setup(void)
