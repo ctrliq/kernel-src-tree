@@ -342,7 +342,7 @@ static bool nested_vmcb_check_controls(struct kvm_vcpu *vcpu)
  */
 #define __nested_svm_sanitize_intercept(__vcpu, __control, fname, iname)	\
 do {										\
-	if (!guest_cpuid_has(__vcpu, X86_FEATURE_##fname))			\
+	if (!guest_cpu_cap_has(__vcpu, X86_FEATURE_##fname))			\
 		vmcb12_clr_intercept(__control, INTERCEPT_##iname);		\
 } while (0)
 
