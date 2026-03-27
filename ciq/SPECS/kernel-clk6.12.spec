@@ -133,9 +133,10 @@ Summary: The Linux kernel
 # genspec.sh variables
 #
 
+# suffix for CLK kernel packages
+%global pkg_suffix clk%{patchversion}
 # kernel package name
-%global package_name kernel
-%global gemini 0
+%global package_name kernel-%{pkg_suffix}
 # Include Fedora files
 %global include_fedora 0
 # Include RHEL files
@@ -656,9 +657,9 @@ ExclusiveArch: noarch i386 i686 x86_64 s390x aarch64 ppc64le
 %endif
 ExclusiveOS: Linux
 %ifnarch %{nobuildarches}
-Requires: kernel-core-uname-r = %{KVERREL}
-Requires: kernel-modules-uname-r = %{KVERREL}
-Requires: kernel-modules-core-uname-r = %{KVERREL}
+Requires: %{name}-core-uname-r = %{KVERREL}
+Requires: %{name}-modules-uname-r = %{KVERREL}
+Requires: %{name}-modules-core-uname-r = %{KVERREL}
 Provides: installonlypkg(kernel)
 %endif
 
@@ -1081,6 +1082,8 @@ AutoProv: yes\
 %package doc
 Summary: Various documentation bits found in the kernel source
 Group: Documentation
+Provides: kernel-doc = %{specrpmversion}-%{release}
+Conflicts: kernel-doc
 %description doc
 This package contains documentation files from the kernel
 source. Various bits of information about the Linux kernel and the
@@ -1094,10 +1097,8 @@ options that can be passed to Linux kernel modules at load time.
 Summary: Header files for the Linux kernel for use by glibc
 Obsoletes: glibc-kernheaders < 3.0-46
 Provides: glibc-kernheaders = 3.0-46
-%if 0%{?gemini}
-Provides: kernel-headers = %{specversion}-%{release}
-Obsoletes: kernel-headers < %{specversion}
-%endif
+Provides: kernel-headers = %{specrpmversion}-%{release}
+Conflicts: kernel-headers
 %description headers
 Kernel-headers includes the C header files that specify the interface
 between the Linux kernel and userspace libraries and programs.  The
@@ -1107,10 +1108,8 @@ glibc package.
 
 %package cross-headers
 Summary: Header files for the Linux kernel for use by cross-glibc
-%if 0%{?gemini}
-Provides: kernel-cross-headers = %{specversion}-%{release}
-Obsoletes: kernel-cross-headers < %{specversion}
-%endif
+Provides: kernel-cross-headers = %{specrpmversion}-%{release}
+Conflicts: kernel-cross-headers
 %description cross-headers
 Kernel-cross-headers includes the C header files that specify the interface
 between the Linux kernel and userspace libraries and programs.  The
@@ -1121,95 +1120,101 @@ cross-glibc package.
 %package debuginfo-common-%{_target_cpu}
 Summary: Kernel source files used by %{name}-debuginfo packages
 Provides: installonlypkg(kernel)
+Provides: kernel-debuginfo-common-%{_target_cpu} = %{specrpmversion}-%{release}
+Conflicts: kernel-debuginfo-common-%{_target_cpu}
 %description debuginfo-common-%{_target_cpu}
 This package is required by %{name}-debuginfo subpackages.
 It provides the kernel source files common to all builds.
 
 %if %{with_perf}
-%package -n perf
-%if 0%{gemini}
-Epoch: %{gemini}
-%endif
+%package -n perf-%{pkg_suffix}
 Summary: Performance monitoring for the Linux kernel
+Provides: perf = %{specrpmversion}-%{release}
+Conflicts: perf
 Requires: bzip2
-%description -n perf
+%description -n perf-%{pkg_suffix}
 This package contains the perf tool, which enables performance monitoring
 of the Linux kernel.
 
-%package -n perf-debuginfo
-%if 0%{gemini}
-Epoch: %{gemini}
-%endif
+%package -n perf-%{pkg_suffix}-debuginfo
 Summary: Debug information for package perf
+Provides: perf-debuginfo = %{specrpmversion}-%{release}
+Conflicts: perf-debuginfo
 Requires: %{name}-debuginfo-common-%{_target_cpu} = %{specrpmversion}-%{release}
 AutoReqProv: no
-%description -n perf-debuginfo
+%description -n perf-%{pkg_suffix}-debuginfo
 This package provides debug information for the perf package.
 
 # Note that this pattern only works right to match the .build-id
 # symlinks because of the trailing nonmatching alternation and
 # the leading .*, because of find-debuginfo.sh's buggy handling
 # of matching the pattern against the symlinks file.
-%{expand:%%global _find_debuginfo_opts %{?_find_debuginfo_opts} -p '.*%%{_bindir}/perf(\.debug)?|.*%%{_libexecdir}/perf-core/.*|.*%%{_libdir}/libperf-jvmti.so(\.debug)?|XXX' -o perf-debuginfo.list}
+%{expand:%%global _find_debuginfo_opts %{?_find_debuginfo_opts} -p '.*%%{_bindir}/perf(\.debug)?|.*%%{_libexecdir}/perf-core/.*|.*%%{_libdir}/libperf-jvmti.so(\.debug)?|XXX' -o perf-%{pkg_suffix}-debuginfo.list}
 
-%package -n python3-perf
-%if 0%{gemini}
-Epoch: %{gemini}
-%endif
+%package -n python3-perf-%{pkg_suffix}
 Summary: Python bindings for apps which will manipulate perf events
-%description -n python3-perf
+Provides: python3-perf = %{specrpmversion}-%{release}
+Conflicts: python3-perf
+%description -n python3-perf-%{pkg_suffix}
 The python3-perf package contains a module that permits applications
 written in the Python programming language to use the interface
 to manipulate perf events.
 
-%package -n python3-perf-debuginfo
-%if 0%{gemini}
-Epoch: %{gemini}
-%endif
+%package -n python3-perf-%{pkg_suffix}-debuginfo
 Summary: Debug information for package perf python bindings
+Provides: python3-perf-debuginfo = %{specrpmversion}-%{release}
+Conflicts: python3-perf-debuginfo
 Requires: %{name}-debuginfo-common-%{_target_cpu} = %{specrpmversion}-%{release}
 AutoReqProv: no
-%description -n python3-perf-debuginfo
+%description -n python3-perf-%{pkg_suffix}-debuginfo
 This package provides debug information for the perf python bindings.
 
 # the python_sitearch macro should already be defined from above
-%{expand:%%global _find_debuginfo_opts %{?_find_debuginfo_opts} -p '.*%%{python3_sitearch}/perf.*so(\.debug)?|XXX' -o python3-perf-debuginfo.list}
+%{expand:%%global _find_debuginfo_opts %{?_find_debuginfo_opts} -p '.*%%{python3_sitearch}/perf.*so(\.debug)?|XXX' -o python3-perf-%{pkg_suffix}-debuginfo.list}
 
 # with_perf
 %endif
 
 %if %{with_libperf}
-%package -n libperf
+%package -n libperf-%{pkg_suffix}
 Summary: The perf library from kernel source
-%description -n libperf
+Provides: libperf = %{specrpmversion}-%{release}
+Conflicts: libperf
+%description -n libperf-%{pkg_suffix}
 This package contains the kernel source perf library.
 
-%package -n libperf-devel
+%package -n libperf-%{pkg_suffix}-devel
 Summary: Developement files for the perf library from kernel source
-Requires: libperf = %{version}-%{release}
-%description -n libperf-devel
+Provides: libperf-devel = %{specrpmversion}-%{release}
+Conflicts: libperf-devel
+Requires: libperf-%{pkg_suffix} = %{version}-%{release}
+%description -n libperf-%{pkg_suffix}-devel
 This package includes libraries and header files needed for development
 of applications which use perf library from kernel source.
 
-%package -n libperf-debuginfo
+%package -n libperf-%{pkg_suffix}-debuginfo
 Summary: Debug information for package libperf
+Provides: libperf-debuginfo = %{specrpmversion}-%{release}
+Conflicts: libperf-debuginfo
 Group: Development/Debug
 Requires: %{name}-debuginfo-common-%{_target_cpu} = %{version}-%{release}
 AutoReqProv: no
-%description -n libperf-debuginfo
+%description -n libperf-%{pkg_suffix}-debuginfo
 This package provides debug information for the libperf package.
 
 # Note that this pattern only works right to match the .build-id
 # symlinks because of the trailing nonmatching alternation and
 # the leading .*, because of find-debuginfo.sh's buggy handling
 # of matching the pattern against the symlinks file.
-%{expand:%%global _find_debuginfo_opts %{?_find_debuginfo_opts} -p '.*%%{_libdir}/libperf.so.*(\.debug)?|XXX' -o libperf-debuginfo.list}
+%{expand:%%global _find_debuginfo_opts %{?_find_debuginfo_opts} -p '.*%%{_libdir}/libperf.so.*(\.debug)?|XXX' -o libperf-%{pkg_suffix}-debuginfo.list}
 # with_libperf
 %endif
 
 %if %{with_tools}
 %package -n %{package_name}-tools
 Summary: Assortment of tools for the Linux kernel
+Provides: kernel-tools = %{specrpmversion}-%{release}
+Conflicts: kernel-tools
 %ifarch %{cpupowerarchs}
 Provides:  cpupowerutils = 1:009-0.6.p1
 Obsoletes: cpupowerutils < 1:009-0.6.p1
@@ -1227,12 +1232,16 @@ and the supporting documentation.
 
 %package -n %{package_name}-tools-libs
 Summary: Libraries for the kernels-tools
+Provides: kernel-tools-libs = %{specrpmversion}-%{release}
+Conflicts: kernel-tools-libs
 %description -n %{package_name}-tools-libs
 This package contains the libraries built from the tools/ directory
 from the kernel source.
 
 %package -n %{package_name}-tools-libs-devel
 Summary: Assortment of tools for the Linux kernel
+Provides: kernel-tools-libs-devel = %{specrpmversion}-%{release}
+Conflicts: kernel-tools-libs-devel
 Requires: %{package_name}-tools = %{version}-%{release}
 %ifarch %{cpupowerarchs}
 Provides:  cpupowerutils-devel = 1:009-0.6.p1
@@ -1257,22 +1266,23 @@ This package provides debug information for package %{package_name}-tools.
 # of matching the pattern against the symlinks file.
 %{expand:%%global _find_debuginfo_opts %{?_find_debuginfo_opts} -p '.*%%{_bindir}/bootconfig(\.debug)?|.*%%{_bindir}/centrino-decode(\.debug)?|.*%%{_bindir}/powernow-k8-decode(\.debug)?|.*%%{_bindir}/cpupower(\.debug)?|.*%%{_libdir}/libcpupower.*|.*%%{_bindir}/turbostat(\.debug)?|.*%%{_bindir}/x86_energy_perf_policy(\.debug)?|.*%%{_bindir}/tmon(\.debug)?|.*%%{_bindir}/lsgpio(\.debug)?|.*%%{_bindir}/gpio-hammer(\.debug)?|.*%%{_bindir}/gpio-event-mon(\.debug)?|.*%%{_bindir}/gpio-watch(\.debug)?|.*%%{_bindir}/iio_event_monitor(\.debug)?|.*%%{_bindir}/iio_generic_buffer(\.debug)?|.*%%{_bindir}/lsiio(\.debug)?|.*%%{_bindir}/intel-speed-select(\.debug)?|.*%%{_bindir}/page_owner_sort(\.debug)?|.*%%{_bindir}/slabinfo(\.debug)?|.*%%{_sbindir}/intel_sdsi(\.debug)?|XXX' -o %{package_name}-tools-debuginfo.list}
 
-%package -n rtla
-%if 0%{gemini}
-Epoch: %{gemini}
-%endif
+%package -n rtla-%{pkg_suffix}
 Summary: Real-Time Linux Analysis tools
+Provides: rtla = %{specrpmversion}-%{release}
+Conflicts: rtla
 Requires: libtraceevent
 Requires: libtracefs
-%description -n rtla
+%description -n rtla-%{pkg_suffix}
 The rtla meta-tool includes a set of commands that aims to analyze
 the real-time properties of Linux. Instead of testing Linux as a black box,
 rtla leverages kernel tracing capabilities to provide precise information
 about the properties and root causes of unexpected results.
 
-%package -n rv
+%package -n rv-%{pkg_suffix}
 Summary: RV: Runtime Verification
-%description -n rv
+Provides: rv = %{specrpmversion}-%{release}
+Conflicts: rv
+%description -n rv-%{pkg_suffix}
 Runtime Verification (RV) is a lightweight (yet rigorous) method that
 complements classical exhaustive verification techniques (such as model
 checking and theorem proving) with a more practical approach for
@@ -1287,6 +1297,8 @@ analysing the logical and timing behavior of Linux.
 
 %package selftests-internal
 Summary: Kernel samples and selftests
+Provides: kernel-selftests-internal = %{specrpmversion}-%{release}
+Conflicts: kernel-selftests-internal
 Requires: binutils, bpftool, iproute-tc, nmap-ncat, python3, fuse-libs, keyutils
 %description selftests-internal
 Kernel sample programs and selftests.
@@ -1353,7 +1365,7 @@ Requires: flex\
 Requires: make\
 Requires: gcc\
 %if %{-m:1}%{!-m:0}\
-Requires: kernel-devel-uname-r = %{KVERREL}%{uname_variant %{?1:%{1}}}\
+Requires: %{name}-devel-uname-r = %{KVERREL}%{uname_variant %{?1:%{1}}}\
 %endif\
 %description %{?1:%{1}-}devel\
 This package provides kernel headers and makefiles sufficient to build modules\
@@ -1399,7 +1411,7 @@ Provides: kernel%{?1:-%{1}}-modules-internal-%{_target_cpu} = %{specrpmversion}-
 Provides: kernel%{?1:-%{1}}-modules-internal = %{specrpmversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
 Provides: installonlypkg(kernel-module)\
 Provides: kernel%{?1:-%{1}}-modules-internal-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
-Requires: kernel-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
+Requires: %{name}-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
 Requires: kernel%{?1:-%{1}}-modules-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
 Requires: kernel%{?1:-%{1}}-modules-core-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
 AutoReq: no\
@@ -1420,11 +1432,11 @@ Provides: kernel%{?1:-%{1}}-modules-extra-%{_target_cpu} = %{specrpmversion}-%{r
 Provides: kernel%{?1:-%{1}}-modules-extra = %{specrpmversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
 Provides: installonlypkg(kernel-module)\
 Provides: kernel%{?1:-%{1}}-modules-extra-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
-Requires: kernel-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
+Requires: %{name}-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
 Requires: kernel%{?1:-%{1}}-modules-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
 Requires: kernel%{?1:-%{1}}-modules-core-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
 %if %{-m:1}%{!-m:0}\
-Requires: kernel-modules-extra-uname-r = %{KVERREL}%{uname_variant %{?1:+%{1}}}\
+Requires: %{name}-modules-extra-uname-r = %{KVERREL}%{uname_variant %{?1:+%{1}}}\
 %endif\
 AutoReq: no\
 AutoProv: yes\
@@ -1444,10 +1456,10 @@ Provides: kernel-modules-%{_target_cpu} = %{specrpmversion}-%{release}%{uname_su
 Provides: kernel-modules = %{specrpmversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
 Provides: installonlypkg(kernel-module)\
 Provides: kernel%{?1:-%{1}}-modules-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
-Requires: kernel-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
+Requires: %{name}-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
 Requires: kernel%{?1:-%{1}}-modules-core-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
 %if %{-m:1}%{!-m:0}\
-Requires: kernel-modules-uname-r = %{KVERREL}%{uname_variant %{?1:+%{1}}}\
+Requires: %{name}-modules-uname-r = %{KVERREL}%{uname_variant %{?1:+%{1}}}\
 %endif\
 AutoReq: no\
 AutoProv: yes\
@@ -1467,9 +1479,9 @@ Provides: kernel-modules-core-%{_target_cpu} = %{specrpmversion}-%{release}%{una
 Provides: kernel-modules-core = %{specrpmversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
 Provides: installonlypkg(kernel-module)\
 Provides: kernel%{?1:-%{1}}-modules-core-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
-Requires: kernel-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
+Requires: %{name}-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
 %if %{-m:1}%{!-m:0}\
-Requires: kernel-modules-core-uname-r = %{KVERREL}%{uname_variant %{?1:+%{1}}}\
+Requires: %{name}-modules-core-uname-r = %{KVERREL}%{uname_variant %{?1:+%{1}}}\
 %endif\
 AutoReq: no\
 AutoProv: yes\
@@ -1484,9 +1496,9 @@ This package provides essential kernel modules for the %{?2:%{2}-}core kernel pa
 %define kernel_meta_package() \
 %package %{1}\
 summary: kernel meta-package for the %{1} kernel\
-Requires: kernel-%{1}-core-uname-r = %{KVERREL}%{uname_suffix %{1}}\
-Requires: kernel-%{1}-modules-uname-r = %{KVERREL}%{uname_suffix %{1}}\
-Requires: kernel-%{1}-modules-core-uname-r = %{KVERREL}%{uname_suffix %{1}}\
+Requires: %{name}-%{1}-core-uname-r = %{KVERREL}%{uname_suffix %{1}}\
+Requires: %{name}-%{1}-modules-uname-r = %{KVERREL}%{uname_suffix %{1}}\
+Requires: %{name}-%{1}-modules-core-uname-r = %{KVERREL}%{uname_suffix %{1}}\
 %if "%{1}" == "rt" || "%{1}" == "rt-debug"\
 Requires: realtime-setup\
 %endif\
@@ -1504,7 +1516,7 @@ The meta-package for the %{1} kernel\
 %package %{?1:%{1}-}kvm\
 Summary: KVM modules for package kernel%{?1:-%{1}}\
 Group: System Environment/Kernel\
-Requires: kernel-uname-r = %{KVERREL}%{uname_suffix %{?1:%{1}}}\
+Requires: %{name}-uname-r = %{KVERREL}%{uname_suffix %{?1:%{1}}}\
 Requires: kernel%{?1:-%{1}}-modules-core-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
 Provides: installonlypkg(kernel-module)\
 Provides: kernel%{?1:-%{1}}-kvm-%{_target_cpu} = %{version}-%{release}\
@@ -1525,8 +1537,8 @@ Summary: %{variant_summary}\
 Provides: kernel-%{?1:%{1}-}core-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
 Provides: installonlypkg(kernel)\
 %if %{-m:1}%{!-m:0}\
-Requires: kernel-core-uname-r = %{KVERREL}%{uname_variant %{?1:+%{1}}}\
-Requires: kernel-%{?1:%{1}-}-modules-core-uname-r = %{KVERREL}%{uname_variant %{?1:+%{1}}}\
+Requires: %{name}-core-uname-r = %{KVERREL}%{uname_variant %{?1:+%{1}}}\
+Requires: %{name}-%{?1:%{1}-}-modules-core-uname-r = %{KVERREL}%{uname_variant %{?1:+%{1}}}\
 %endif\
 %{expand:%%kernel_reqprovconf %{?1:%{1}} %{-o:%{-o}}}\
 %if %{?1:1} %{!?1:0} \
@@ -1588,7 +1600,7 @@ Provides: kernel%{?1:-%{1}}-modules-partner-%{_target_cpu} = %{specrpmversion}-%
 Provides: kernel%{?1:-%{1}}-modules-partner = %{specrpmversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
 Provides: installonlypkg(kernel-module)\
 Provides: kernel%{?1:-%{1}}-modules-partner-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
-Requires: kernel-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
+Requires: %{name}-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
 Requires: kernel%{?1:-%{1}}-modules-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
 Requires: kernel%{?1:-%{1}}-modules-core-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
 AutoReq: no\
@@ -1908,7 +1920,7 @@ cp %{SOURCE3001} partial-kernel-local-snip.config
 cp %{SOURCE3001} partial-kernel-local-debug-snip.config
 for config in ../ciq/configs/kernel-*.config; do
     arch=$(echo $config | sed -n 's/.*kernel-\(.*\)\.config/\1/p')
-    cp $config kernel-%{specversion}-$arch.config
+    cp $config %{name}-%{specversion}-$arch.config
 done
 
 
@@ -2112,7 +2124,7 @@ InitBuildVars() {
     Variant=$1
 
     # Pick the right kernel config file
-    Config=%{name}-%{_target_cpu}${Variant:+-${Variant}}.config
+    Config=kernel-%{_target_cpu}${Variant:+-${Variant}}.config
     DevelDir=/usr/src/kernels/%{KVERREL}${Variant:++${Variant}}
 
     KernelVer=%{specversion}-%{release}.%{_target_cpu}${Variant:++${Variant}}
@@ -3767,7 +3779,7 @@ fi\
 %endif
 
 %if %{with_perf}
-%files -n perf
+%files -n perf-%{pkg_suffix}
 %{_bindir}/perf
 %{_libdir}/libperf-jvmti.so
 %dir %{_libexecdir}/perf-core
@@ -3779,23 +3791,23 @@ fi\
 %{_docdir}/perf-tip/tips.txt
 %{_includedir}/perf/perf_dlfilter.h
 
-%files -n python3-perf
+%files -n python3-perf-%{pkg_suffix}
 %{python3_sitearch}/*
 
 %if %{with_debuginfo}
-%files -f perf-debuginfo.list -n perf-debuginfo
+%files -f perf-%{pkg_suffix}-debuginfo.list -n perf-%{pkg_suffix}-debuginfo
 
-%files -f python3-perf-debuginfo.list -n python3-perf-debuginfo
+%files -f python3-perf-%{pkg_suffix}-debuginfo.list -n python3-perf-%{pkg_suffix}-debuginfo
 %endif
 # with_perf
 %endif
 
 %if %{with_libperf}
-%files -n libperf
+%files -n libperf-%{pkg_suffix}
 %{_libdir}/libperf.so.0
 %{_libdir}/libperf.so.0.0.1
 
-%files -n libperf-devel
+%files -n libperf-%{pkg_suffix}-devel
 %{_libdir}/libperf.so
 %{_libdir}/pkgconfig/libperf.pc
 %{_includedir}/internal/*.h
@@ -3817,7 +3829,7 @@ fi\
 %{_docdir}/libperf/html/libperf-sampling.html
 
 %if %{with_debuginfo}
-%files -f libperf-debuginfo.list -n libperf-debuginfo
+%files -f libperf-%{pkg_suffix}-debuginfo.list -n libperf-%{pkg_suffix}-debuginfo
 %endif
 
 # with_libperf
@@ -3878,7 +3890,7 @@ fi\
 %{_includedir}/powercap.h
 %endif
 
-%files -n rtla
+%files -n rtla-%{pkg_suffix}
 %{_bindir}/rtla
 %{_bindir}/hwnoise
 %{_bindir}/osnoise
@@ -3892,7 +3904,7 @@ fi\
 %{_mandir}/man1/rtla-timerlat.1.gz
 %{_mandir}/man1/rtla.1.gz
 
-%files -n rv
+%files -n rv-%{pkg_suffix}
 %{_bindir}/rv
 %{_mandir}/man1/rv-list.1.gz
 %{_mandir}/man1/rv-mon-wip.1.gz
