@@ -36,6 +36,7 @@ jobs:
       architectures: ${{ steps.pr_metadata.outputs.architectures }}
       skip_kabi: ${{ steps.pr_metadata.outputs.skip_kabi }}
       skip_kselftests: ${{ steps.pr_metadata.outputs.skip_kselftests }}
+      skip_ltp: ${{ steps.pr_metadata.outputs.skip_ltp }}
       is_pr: ${{ steps.pr_metadata.outputs.is_pr }}
 
     steps:
@@ -93,6 +94,7 @@ jobs:
           ARCHITECTURES=$(cat pr_metadata/architectures.txt)
           SKIP_KABI=$(cat pr_metadata/skip_kabi.txt)
           SKIP_KSELFTESTS=$(cat pr_metadata/skip_kselftests.txt)
+          SKIP_LTP=$(cat pr_metadata/skip_ltp.txt 2>/dev/null || echo "false")
           IS_PR=$(cat pr_metadata/is_pr.txt)
 
           # === CRITICAL VALIDATION: Prevent command injection ===
@@ -183,6 +185,12 @@ jobs:
             exit 1
           fi
 
+          # Validate skip_ltp - must be exactly 'true' or 'false'
+          if ! [[ "$SKIP_LTP" =~ ^(true|false)$ ]]; then
+            echo "❌ Security: Invalid skip_ltp value: $SKIP_LTP"
+            exit 1
+          fi
+
           # === All validation passed - safe to use ===
           echo "✅ All metadata validation passed"
 
@@ -196,6 +204,7 @@ jobs:
           echo "architectures=$ARCHITECTURES" >> $GITHUB_OUTPUT
           echo "skip_kabi=$SKIP_KABI" >> $GITHUB_OUTPUT
           echo "skip_kselftests=$SKIP_KSELFTESTS" >> $GITHUB_OUTPUT
+          echo "skip_ltp=$SKIP_LTP" >> $GITHUB_OUTPUT
           echo "is_pr=$IS_PR" >> $GITHUB_OUTPUT
 
       - name: Upload head_ref for baseline search
@@ -297,6 +306,8 @@ jobs:
     - name: Build kernel inside CIQ builder container
       env:
         SKIP_KABI: ${{ needs.pre-setup.outputs.skip_kabi }}
+        SKIP_KSELFTESTS: ${{ needs.pre-setup.outputs.skip_kselftests }}
+        SKIP_LTP: ${{ needs.pre-setup.outputs.skip_ltp }}
       run: |
         set -euxo pipefail
         mkdir -p output
@@ -318,6 +329,8 @@ jobs:
           -v "$PWD/kernel-container-build/build-container/image_from_container.sh":/usr/local/bin/image_from_container.sh:ro \
           -v "$PWD/kernel-container-build/container/kernel_build.sh":/usr/libexec/kernel_build.sh:ro \
           -v "$PWD/kernel-container-build/container/check_kabi.sh":/usr/libexec/check_kabi.sh:ro \
+          $([ "$SKIP_KSELFTESTS" != "true" ] && echo "-v $PWD/kernel-container-build/container/build_kselftests.sh:/usr/libexec/build_kselftests.sh:ro") \
+          $([ "$SKIP_LTP" != "true" ] && echo "-v $PWD/kernel-container-build/container/build_ltp.sh:/usr/libexec/build_ltp.sh:ro") \
           --security-opt label=disable \
           pulp.prod.ciq.dev/ciq/cicd/lts-images/builder \
           /usr/local/build-scripts/build_kernel.sh "${BUILD_ARGS[@]}" 2>&1 | tee output/kernel-build.log
@@ -332,14 +345,37 @@ jobs:
         path: output/kernel-build.log
         retention-days: 7
 
-    # Upload qcow2 image for next stages
-    - name: Upload qcow2 image
+    # Upload kselftests qcow2 image
+    - name: Upload kselftests qcow2 image
       uses: actions/upload-artifact@v4
-      if: always()
+      if: ${{ always() && needs.pre-setup.outputs.skip_kselftests == 'false' }}
       with:
-        name: kernel-qcow2-image-${{ matrix.arch }}
+        name: kernel-qcow2-kselftests-${{ matrix.arch }}
         path: |
-          output/*.qcow2
+          output/*-kselftests.qcow2
+          output/last_build_image.txt
+        retention-days: 7
+
+    # Upload LTP qcow2 image
+    - name: Upload LTP qcow2 image
+      uses: actions/upload-artifact@v4
+      if: ${{ always() && needs.pre-setup.outputs.skip_ltp == 'false' }}
+      with:
+        name: kernel-qcow2-ltp-${{ matrix.arch }}
+        path: |
+          output/*-ltp.qcow2
+          output/last_ltp_image.txt
+          output/last_build_image.txt
+        retention-days: 7
+
+    # Upload plain boot qcow2 image (only when both kselftests and LTP are skipped)
+    - name: Upload plain boot qcow2 image
+      uses: actions/upload-artifact@v4
+      if: ${{ always() && needs.pre-setup.outputs.skip_kselftests == 'true' && needs.pre-setup.outputs.skip_ltp == 'true' }}
+      with:
+        name: kernel-qcow2-boot-${{ matrix.arch }}
+        path: |
+          output/*-boot.qcow2
           output/last_build_image.txt
         retention-days: 7
 
@@ -379,10 +415,25 @@ jobs:
           sudo chmod 0666 /dev/kvm
         fi
 
-    - name: Download qcow2 image
+    - name: Download qcow2 image (kselftests)
+      if: ${{ needs.pre-setup.outputs.skip_kselftests == 'false' }}
       uses: actions/download-artifact@v4
       with:
-        name: kernel-qcow2-image-${{ matrix.arch }}
+        name: kernel-qcow2-kselftests-${{ matrix.arch }}
+        path: output
+
+    - name: Download qcow2 image (LTP — kselftests skipped)
+      if: ${{ needs.pre-setup.outputs.skip_kselftests == 'true' && needs.pre-setup.outputs.skip_ltp == 'false' }}
+      uses: actions/download-artifact@v4
+      with:
+        name: kernel-qcow2-ltp-${{ matrix.arch }}
+        path: output
+
+    - name: Download qcow2 image (plain boot — both skipped)
+      if: ${{ needs.pre-setup.outputs.skip_kselftests == 'true' && needs.pre-setup.outputs.skip_ltp == 'true' }}
+      uses: actions/download-artifact@v4
+      with:
+        name: kernel-qcow2-boot-${{ matrix.arch }}
         path: output
 
     # Boot verification test
@@ -449,7 +500,7 @@ jobs:
     - name: Download qcow2 image
       uses: actions/download-artifact@v4
       with:
-        name: kernel-qcow2-image-${{ matrix.arch }}
+        name: kernel-qcow2-kselftests-${{ matrix.arch }}
         path: output
 
     # Run kselftests
@@ -478,11 +529,329 @@ jobs:
           output/dmesg-*.log
         retention-days: 7
 
-  compare-results:
+  test-ltp:
+    name: Run LTP (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    needs: [pre-setup, setup, boot]
+    if: ${{ needs.pre-setup.outputs.skip_ltp == 'false' }}
+    continue-on-error: true  # LTP results are informational only - do not fail the workflow
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+
+    steps:
+    - name: Generate GitHub App token
+      id: generate_token
+      uses: actions/create-github-app-token@v1
+      with:
+        app-id: ${{ secrets.APP_ID }}
+        private-key: ${{ secrets.APP_PRIVATE_KEY }}
+        repositories: |
+          kernel-container-build
+
+    - name: Checkout kernel-container-build (test branch)
+      uses: actions/checkout@v4
+      with:
+        repository: ctrliq/kernel-container-build
+        ref: automated-testing-v1
+        path: kernel-container-build
+        token: ${{ steps.generate_token.outputs.token }}
+
+    - name: Install host dependencies
+      run: |
+        set -euxo pipefail
+        sudo apt-get update
+        sudo apt-get install -y fuse3 cpu-checker podman
+        sudo modprobe fuse
+        if [ -e /dev/kvm ]; then
+          sudo chmod 0666 /dev/kvm
+        fi
+
+    - name: Download qcow2 image
+      uses: actions/download-artifact@v4
+      with:
+        name: kernel-qcow2-ltp-${{ matrix.arch }}
+        path: output
+
+    - name: Execute LTP
+      run: |
+        set -euxo pipefail
+        chmod +x kernel-container-build/build-container/*.sh
+        podman run --rm --pull=always \
+          --privileged \
+          --device=/dev/fuse \
+          $([ -e /dev/kvm ] && echo "--device=/dev/kvm") \
+          -v "$PWD/output":/output \
+          -v "$PWD/kernel-container-build/build-container":/usr/local/build-scripts:ro \
+          --security-opt label=disable \
+          pulp.prod.ciq.dev/ciq/cicd/lts-images/builder \
+          /usr/local/build-scripts/test_ltp.sh
+
+    - name: Parse LTP results
+      if: always()
+      run: |
+        set -euxo pipefail
+        chmod +x kernel-container-build/build-container/parse_ltp_results.sh
+        LOG=$(ls output/ltp-*.log 2>/dev/null | head -1)
+        if [ -n "$LOG" ]; then
+          kernel-container-build/build-container/parse_ltp_results.sh "$LOG" output/ltp-results.json
+        else
+          echo "::warning::No LTP log found to parse"
+        fi
+
+    - name: Upload LTP logs
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: ltp-logs-${{ matrix.arch }}
+        path: |
+          output/ltp-*.log
+          output/ltp-results.json
+          output/dmesg-ltp-*.log
+        retention-days: 7
+
+  compare-ltp:
+    name: Compare LTP results (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    needs: [pre-setup, setup, build, boot, test-ltp]
+    if: ${{ always() && needs.pre-setup.outputs.skip_ltp == 'false' && needs.build.result == 'success' && needs.boot.result == 'success' }}
+    continue-on-error: true  # LTP results are informational only - do not fail the workflow
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    outputs:
+      base_branch: ${{ steps.base_branch.outputs.base_branch }}
+      comparison_status_x86_64: ${{ matrix.arch == 'x86_64' && steps.ltp_comparison.outputs.comparison_status || '' }}
+      comparison_status_aarch64: ${{ matrix.arch == 'aarch64' && steps.ltp_comparison.outputs.comparison_status || '' }}
+      regressions_x86_64: ${{ matrix.arch == 'x86_64' && steps.ltp_comparison.outputs.regressions || '' }}
+      regressions_aarch64: ${{ matrix.arch == 'aarch64' && steps.ltp_comparison.outputs.regressions || '' }}
+      fixes_x86_64: ${{ matrix.arch == 'x86_64' && steps.ltp_comparison.outputs.fixes || '' }}
+      fixes_aarch64: ${{ matrix.arch == 'aarch64' && steps.ltp_comparison.outputs.fixes || '' }}
+      passed_x86_64: ${{ matrix.arch == 'x86_64' && steps.ltp_comparison.outputs.passed || '' }}
+      passed_aarch64: ${{ matrix.arch == 'aarch64' && steps.ltp_comparison.outputs.passed || '' }}
+      failed_x86_64: ${{ matrix.arch == 'x86_64' && steps.ltp_comparison.outputs.failed || '' }}
+      failed_aarch64: ${{ matrix.arch == 'aarch64' && steps.ltp_comparison.outputs.failed || '' }}
+
+    steps:
+    - name: Checkout kernel source
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+
+    - name: Generate GitHub App token
+      id: generate_token
+      uses: actions/create-github-app-token@v1
+      with:
+        app-id: ${{ secrets.APP_ID }}
+        private-key: ${{ secrets.APP_PRIVATE_KEY }}
+        repositories: |
+          kernel-container-build
+
+    - name: Checkout kernel-container-build
+      uses: actions/checkout@v4
+      with:
+        repository: ctrliq/kernel-container-build
+        ref: automated-testing-v1
+        path: kernel-container-build
+        token: ${{ steps.generate_token.outputs.token }}
+
+    - name: Install GitHub CLI
+      run: |
+        if ! command -v gh &> /dev/null; then
+          sudo apt-get update && sudo apt-get install -y gh
+        fi
+
+    - name: Generate GitHub App token for comparison
+      id: generate_token_compare
+      uses: actions/create-github-app-token@v1
+      with:
+        app-id: ${{ secrets.APP_ID }}
+        private-key: ${{ secrets.APP_PRIVATE_KEY }}
+        repositories: |
+          kernel-src-tree
+          kernel-container-build
+
+    - name: Download current LTP results
+      if: needs.test-ltp.result == 'success'
+      uses: actions/download-artifact@v4
+      with:
+        name: ltp-logs-${{ matrix.arch }}
+        path: output-current
+
+    - name: Determine base branch
+      id: base_branch
+      env:
+        GH_TOKEN: ${{ steps.generate_token_compare.outputs.token }}
+        HEAD_REF: ${{ needs.pre-setup.outputs.head_ref }}
+        BASE_REF: ${{ needs.pre-setup.outputs.base_ref }}
+        PR_NUMBER: ${{ needs.pre-setup.outputs.pr_number }}
+      run: |
+        # Reuse same base branch logic as compare-kselftest job
+        BASE_BRANCH=""
+        BRANCH_NAME="$HEAD_REF"
+        VALID_BASES="ciqlts9_2 ciqlts9_4 ciqlts8_6 ciqlts9_6 ciq-6.12.y ciq-6.12.y-next ciq-6.18.y ciq-6.18.y-next ciqcbr7_9"
+
+        EXISTING_PR=$(gh pr list --head "$BRANCH_NAME" --state open --json number,baseRefName --jq '.[0]' || echo "")
+        if [ -n "$EXISTING_PR" ] && [ "$EXISTING_PR" != "null" ]; then
+          BASE_BRANCH=$(echo "$EXISTING_PR" | jq -r '.baseRefName')
+        elif [ -n "$BASE_REF" ]; then
+          BASE_BRANCH="$BASE_REF"
+        elif [[ "$BRANCH_NAME" =~ ^\{[^}]+\}_(rlc-[0-9]+/.+)$ ]]; then
+          BASE_BRANCH="${BASH_REMATCH[1]}"
+        elif [[ "$BRANCH_NAME" =~ \{[^}]+\}[_-](.+) ]]; then
+          EXTRACTED_BASE="${BASH_REMATCH[1]}"
+          if echo "$VALID_BASES" | grep -wq "$EXTRACTED_BASE"; then
+            BASE_BRANCH="$EXTRACTED_BASE"
+          fi
+        fi
+
+        echo "base_branch=$BASE_BRANCH" >> $GITHUB_OUTPUT
+
+    - name: Download baseline LTP results from last merged PR
+      if: steps.base_branch.outputs.base_branch != ''
+      env:
+        GH_TOKEN: ${{ steps.generate_token_compare.outputs.token }}
+      run: |
+        set +e
+        BASE_BRANCH="${{ steps.base_branch.outputs.base_branch }}"
+        CURRENT_RUN_ID="${{ github.run_id }}"
+
+        SUCCESSFUL_RUNS=$(gh run list \
+          --workflow kernel-build-and-test-multiarch.yml \
+          --status success \
+          --limit 50 \
+          --json databaseId,createdAt)
+
+        if [ -z "$SUCCESSFUL_RUNS" ] || [ "$SUCCESSFUL_RUNS" = "[]" ]; then
+          echo "::warning::No successful workflow runs found"
+          exit 0
+        fi
+
+        while read -r run; do
+          RUN_ID=$(echo "$run" | jq -r '.databaseId')
+
+          [ "$RUN_ID" = "$CURRENT_RUN_ID" ] && continue
+
+          # Download the head-ref artifact to read the original head_ref.
+          # This artifact is uploaded by pre-setup and is directly attached to each
+          # actual workflow run — no need to cross-reference the trigger workflow.
+          HEAD_REF_ARTIFACT_ID=$(gh api \
+            "repos/${{ github.repository }}/actions/runs/$RUN_ID/artifacts" \
+            --jq ".artifacts[] | select(.name == \"head-ref\" and .expired == false) | .id" \
+            | tail -1)
+
+          if [ -z "$HEAD_REF_ARTIFACT_ID" ]; then
+            echo "Run $RUN_ID: no head-ref artifact, skipping"
+            continue
+          fi
+
+          rm -rf /tmp/run-head-ref && mkdir -p /tmp/run-head-ref
+          if ! gh api "repos/${{ github.repository }}/actions/artifacts/$HEAD_REF_ARTIFACT_ID/zip" \
+               > /tmp/run-head-ref.zip 2>/dev/null || \
+             ! unzip -q /tmp/run-head-ref.zip -d /tmp/run-head-ref 2>/dev/null; then
+            echo "Run $RUN_ID: failed to download/extract head-ref artifact, skipping"
+            rm -f /tmp/run-head-ref.zip
+            continue
+          fi
+          rm -f /tmp/run-head-ref.zip
+
+          HEAD_BRANCH=$(cat /tmp/run-head-ref/head_ref.txt 2>/dev/null || echo "")
+          if [ -z "$HEAD_BRANCH" ]; then
+            echo "Run $RUN_ID: no head_ref.txt in artifact, skipping"
+            continue
+          fi
+
+          EXTRACTED_BASE=""
+          if [[ "$HEAD_BRANCH" =~ ^\{[^}]+\}_(rlc-[0-9]+/.+)$ ]]; then
+            EXTRACTED_BASE="${BASH_REMATCH[1]}"
+          elif [[ "$HEAD_BRANCH" =~ \{[^}]+\}[_-](.+) ]]; then
+            EXTRACTED_BASE="${BASH_REMATCH[1]}"
+          fi
+
+          if [ "$EXTRACTED_BASE" = "$BASE_BRANCH" ]; then
+            PR_INFO=$(gh pr list --head "$HEAD_BRANCH" --base "$BASE_BRANCH" --state merged --json number,mergedAt,baseRefName --jq '.[0]' 2>/dev/null || echo "")
+            if [ -n "$PR_INFO" ] && [ "$PR_INFO" != "null" ]; then
+              ARTIFACT_ID=$(gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/artifacts" \
+                --jq ".artifacts[] | select(.name == \"ltp-logs-${{ matrix.arch }}\" and .expired == false) | .id" \
+                | tail -1)
+              if [ -n "$ARTIFACT_ID" ]; then
+                mkdir -p output-previous
+                if gh api "repos/${{ github.repository }}/actions/artifacts/$ARTIFACT_ID/zip" > /tmp/baseline-ltp.zip 2>/dev/null && \
+                   unzip -q /tmp/baseline-ltp.zip -d output-previous 2>/dev/null; then
+                  rm -f /tmp/baseline-ltp.zip
+                  exit 0
+                fi
+                rm -f /tmp/baseline-ltp.zip
+              fi
+            fi
+          fi
+        done < <(echo "$SUCCESSFUL_RUNS" | jq -c '.[]')
+
+        echo "::warning::No baseline LTP results found from merged PRs targeting $BASE_BRANCH"
+      continue-on-error: true
+      timeout-minutes: 3
+
+    - name: Compare LTP results
+      id: ltp_comparison
+      run: |
+        chmod +x kernel-container-build/build-container/compare_ltp_results.sh
+
+        CURR_JSON=$(ls output-current/ltp-results.json 2>/dev/null | head -1)
+        PREV_JSON=$(ls output-previous/ltp-results.json 2>/dev/null | head -1)
+        EXPECTED_FILE=".github/ltp/ltp-expected.txt"
+
+        if [ -z "$CURR_JSON" ]; then
+          echo "::warning::No current LTP results JSON found, skipping comparison"
+          echo "comparison_status=skipped" >> $GITHUB_OUTPUT
+          echo "regressions=" >> $GITHUB_OUTPUT
+          echo "fixes=" >> $GITHUB_OUTPUT
+          echo "passed=" >> $GITHUB_OUTPUT
+          echo "failed=" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        # Count passed/failed from current results
+        PASSED=$(jq '[to_entries[] | select(.value == "PASS")] | length' "$CURR_JSON")
+        FAILED=$(jq '[to_entries[] | select(.value == "FAIL")] | length' "$CURR_JSON")
+        echo "passed=$PASSED" >> $GITHUB_OUTPUT
+        echo "failed=$FAILED" >> $GITHUB_OUTPUT
+
+        if [ -z "$PREV_JSON" ]; then
+          echo "::notice::No baseline LTP results found - first run or artifacts expired"
+          echo "comparison_status=skipped" >> $GITHUB_OUTPUT
+          echo "regressions=" >> $GITHUB_OUTPUT
+          echo "fixes=" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        EXPECTED_ARG=""
+        [ -f "$EXPECTED_FILE" ] && EXPECTED_ARG="$EXPECTED_FILE"
+
+        set +e
+        COMPARE_OUTPUT=$(kernel-container-build/build-container/compare_ltp_results.sh "$PREV_JSON" "$CURR_JSON" $EXPECTED_ARG 2>&1)
+        COMPARE_EXIT=$?
+        set -e
+
+        echo "$COMPARE_OUTPUT"
+
+        REGRESSIONS=$(echo "$COMPARE_OUTPUT" | grep '^  - ' | sed 's/^  - //' | paste -sd '|' -)
+        FIXES=$(echo "$COMPARE_OUTPUT" | grep '^  + ' | sed 's/^  + //' | paste -sd '|' -)
+
+        echo "regressions=$REGRESSIONS" >> $GITHUB_OUTPUT
+        echo "fixes=$FIXES" >> $GITHUB_OUTPUT
+
+        if [ $COMPARE_EXIT -ne 0 ]; then
+          echo "::warning::LTP regressions detected (informational only)"
+          echo "comparison_status=failed" >> $GITHUB_OUTPUT
+        else
+          echo "comparison_status=passed" >> $GITHUB_OUTPUT
+        fi
+
+  compare-kselftest:
     name: Compare with previous run (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     needs: [pre-setup, setup, build, boot, test-kselftest]
-    if: ${{ always() && needs.build.result == 'success' && needs.boot.result == 'success' }}
+    if: ${{ always() && needs.pre-setup.outputs.skip_kselftests == 'false' && needs.build.result == 'success' && needs.boot.result == 'success' }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
@@ -793,7 +1162,7 @@ jobs:
   create-pr:
     name: Create Pull Request
     runs-on: kernel-build
-    needs: [pre-setup, setup, build, boot, test-kselftest, compare-results]
+    needs: [pre-setup, setup, build, boot, test-kselftest, compare-kselftest, test-ltp, compare-ltp]
     if: |
       always() &&
       needs.build.result == 'success' &&
@@ -818,7 +1187,8 @@ jobs:
         ARCHITECTURES: ${{ needs.pre-setup.outputs.architectures }}
       run: |
         # Skip PR if any required stage failed
-        # test-kselftest is optional when skip_kselftests is true (result will be 'skipped')
+        # test-kselftest is optional when skip_kselftests input is true
+        # LTP failures/regressions are informational only - do not block PR creation
         KSELFTEST_RESULT="${{ needs.test-kselftest.result }}"
         if [ "${{ needs.build.result }}" != "success" ] || \
            [ "${{ needs.boot.result }}" != "success" ] || \
@@ -831,25 +1201,26 @@ jobs:
         ARCHS="$ARCHITECTURES"
         REGRESSION_DETECTED=false
 
-        # Check x86_64 regression if enabled
+        # Check x86_64 regressions if enabled
         if echo "$ARCHS" | grep -q "x86_64"; then
-          if [ "${{ needs.compare-results.outputs.comparison_status_x86_64 }}" = "failed" ]; then
-            echo "x86_64: Test regression detected"
+          if [ "${{ needs.compare-kselftest.outputs.comparison_status_x86_64 }}" = "failed" ]; then
+            echo "x86_64: kselftest regression detected"
             REGRESSION_DETECTED=true
           fi
         fi
 
-        # Check aarch64 regression if enabled
+        # Check aarch64 regressions if enabled
         if echo "$ARCHS" | grep -q "aarch64"; then
-          if [ "${{ needs.compare-results.outputs.comparison_status_aarch64 }}" = "failed" ]; then
-            echo "aarch64: Test regression detected"
+          if [ "${{ needs.compare-kselftest.outputs.comparison_status_aarch64 }}" = "failed" ]; then
+            echo "aarch64: kselftest regression detected"
             REGRESSION_DETECTED=true
           fi
         fi
 
-        # Skip PR if any regression was detected (but allow if comparison was skipped/unavailable)
+        # Note: LTP regressions are shown in PR body but do not block PR creation
+
         if [ "$REGRESSION_DETECTED" = "true" ]; then
-          echo "Test regression detected, skipping PR creation"
+          echo "Regression detected, skipping PR creation"
           exit 1
         fi
 
@@ -862,9 +1233,19 @@ jobs:
         token: ${{ secrets.GITHUB_TOKEN }}
         ref: ${{ needs.pre-setup.outputs.pr_number != '0' && format('refs/pull/{0}/head', needs.pre-setup.outputs.pr_number) || needs.pre-setup.outputs.head_sha }}
 
+    - name: Generate GitHub App token
+      id: generate_token
+      uses: actions/create-github-app-token@v1
+      with:
+        app-id: ${{ secrets.APP_ID }}
+        private-key: ${{ secrets.APP_PRIVATE_KEY }}
+        repositories: |
+          kernel-src-tree
+          kernel-container-build
+
     - name: Fetch base branch for commit comparison
       run: |
-        BASE_BRANCH="${{ needs.compare-results.outputs.base_branch }}"
+        BASE_BRANCH="${{ needs.compare-kselftest.outputs.base_branch || needs.compare-ltp.outputs.base_branch }}"
         if [ -n "$BASE_BRANCH" ]; then
           # Fetch base branch with enough history to find common ancestor
           git fetch --depth=200 origin "$BASE_BRANCH:refs/remotes/origin/$BASE_BRANCH" || true
@@ -986,14 +1367,41 @@ jobs:
 
     - name: Get commit information
       id: commit_msg
+      env:
+        GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+        HEAD_REF: ${{ needs.pre-setup.outputs.head_ref }}
+        BASE_REF: ${{ needs.pre-setup.outputs.base_ref }}
       run: |
-        # Use the base branch determined by compare-results stage
-        BASE_BRANCH="${{ needs.compare-results.outputs.base_branch }}"
+        # Use base branch from comparison jobs if available, otherwise detect it here
+        BASE_BRANCH="${{ needs.compare-kselftest.outputs.base_branch || needs.compare-ltp.outputs.base_branch }}"
 
         if [ -z "$BASE_BRANCH" ]; then
-          echo "::error::Base branch not determined by compare-results stage"
+          # Both comparison jobs were skipped — detect base branch directly
+          BRANCH_NAME="$HEAD_REF"
+          VALID_BASES="ciqlts9_2 ciqlts9_4 ciqlts8_6 ciqlts9_6 ciq-6.12.y ciq-6.12.y-next ciq-6.18.y ciq-6.18.y-next ciqcbr7_9"
+          EXISTING_PR=$(gh pr list --head "$BRANCH_NAME" --state open --json number,baseRefName --jq '.[0]' || echo "")
+          if [ -n "$EXISTING_PR" ] && [ "$EXISTING_PR" != "null" ]; then
+            BASE_BRANCH=$(echo "$EXISTING_PR" | jq -r '.baseRefName')
+          elif [ -n "$BASE_REF" ]; then
+            BASE_BRANCH="$BASE_REF"
+          elif [[ "$BRANCH_NAME" =~ ^\{[^}]+\}_(rlc-[0-9]+/.+)$ ]]; then
+            BASE_BRANCH="${BASH_REMATCH[1]}"
+          elif [[ "$BRANCH_NAME" =~ \{[^}]+\}[_-](.+) ]]; then
+            EXTRACTED_BASE="${BASH_REMATCH[1]}"
+            if echo "$VALID_BASES" | grep -wq "$EXTRACTED_BASE"; then
+              BASE_BRANCH="$EXTRACTED_BASE"
+            fi
+          fi
+        fi
+
+        if [ -z "$BASE_BRANCH" ]; then
+          echo "::error::Could not determine base branch"
           exit 1
         fi
+
+        echo "base_branch=$BASE_BRANCH" >> $GITHUB_OUTPUT
+
+        git fetch --depth=200 origin "$BASE_BRANCH:refs/remotes/origin/$BASE_BRANCH" || true
 
         if ! git rev-parse origin/$BASE_BRANCH >/dev/null 2>&1; then
           echo "::error::Base branch origin/$BASE_BRANCH does not exist"
@@ -1023,16 +1431,6 @@ jobs:
         git checkout origin/main -- .github/scripts/create-pr-body-multiarch.sh
         chmod +x .github/scripts/create-pr-body-multiarch.sh
 
-    - name: Generate GitHub App token
-      id: generate_token
-      uses: actions/create-github-app-token@v1
-      with:
-        app-id: ${{ secrets.APP_ID }}
-        private-key: ${{ secrets.APP_PRIVATE_KEY }}
-        repositories: |
-          kernel-src-tree
-          kernel-container-build
-
     - name: Create Pull Request
       env:
         GH_TOKEN: ${{ steps.generate_token.outputs.token }}
@@ -1040,11 +1438,11 @@ jobs:
         PR_NUMBER: ${{ needs.pre-setup.outputs.pr_number }}
         IS_PR: ${{ needs.pre-setup.outputs.is_pr }}
       run: |
-        # Reuse base branch from compare-results stage (already computed)
-        BASE_BRANCH="${{ needs.compare-results.outputs.base_branch }}"
+        # Use base branch from whichever comparison job ran, already resolved in commit_msg step
+        BASE_BRANCH="${{ steps.commit_msg.outputs.base_branch }}"
 
         if [ -z "$BASE_BRANCH" ]; then
-          echo "ERROR: Could not determine base branch for PR (compare-results did not find one)"
+          echo "ERROR: Could not determine base branch for PR"
           exit 1
         fi
 
@@ -1054,9 +1452,30 @@ jobs:
         HAS_X86="${{ steps.detect_arch.outputs.has_x86_64 }}"
         HAS_ARM="${{ steps.detect_arch.outputs.has_aarch64 }}"
 
-        # Determine comparison status message
-        COMPARISON_STATUS_X86="${{ needs.compare-results.outputs.comparison_status_x86_64 }}"
-        COMPARISON_STATUS_ARM="${{ needs.compare-results.outputs.comparison_status_aarch64 }}"
+        # Helper functions
+        kselftest_status_text() {
+          case "$1" in
+            passed) echo "✅ No regressions" ;;
+            failed) echo "❌ Regression detected" ;;
+            *)      echo "⚠️ No baseline available" ;;
+          esac
+        }
+
+        ltp_format_list() {
+          echo "$1" | tr '|' '\n' | sed 's/^/- /'
+        }
+
+        ltp_status_text() {
+          case "$1" in
+            passed) echo "✅ No regressions" ;;
+            failed) echo "❌ $(echo "$2" | tr '|' '\n' | wc -l | tr -d ' ') regressions" ;;
+            *)      echo "⚠️ No baseline available" ;;
+          esac
+        }
+
+        # Kselftest comparison status
+        COMPARISON_STATUS_X86="${{ needs.compare-kselftest.outputs.comparison_status_x86_64 }}"
+        COMPARISON_STATUS_ARM="${{ needs.compare-kselftest.outputs.comparison_status_aarch64 }}"
 
         # When kselftests are skipped, comparison step doesn't run so status is empty — treat as skipped
         if [ "${{ needs.pre-setup.outputs.skip_kselftests }}" = "true" ]; then
@@ -1064,57 +1483,42 @@ jobs:
           [ -z "$COMPARISON_STATUS_ARM" ] && COMPARISON_STATUS_ARM="skipped"
         fi
 
-        # Create comparison section - use printf to avoid code block formatting
-        COMPARISON_SECTION="### Test Comparison"
+        # LTP comparison data
+        LTP_STATUS_X86="${{ needs.compare-ltp.outputs.comparison_status_x86_64 }}"
+        LTP_STATUS_ARM="${{ needs.compare-ltp.outputs.comparison_status_aarch64 }}"
+        LTP_REGRESSIONS_X86="${{ needs.compare-ltp.outputs.regressions_x86_64 }}"
+        LTP_FIXES_X86="${{ needs.compare-ltp.outputs.fixes_x86_64 }}"
+        LTP_REGRESSIONS_ARM="${{ needs.compare-ltp.outputs.regressions_aarch64 }}"
+        LTP_FIXES_ARM="${{ needs.compare-ltp.outputs.fixes_aarch64 }}"
+        LTP_PASSED_X86="${{ needs.compare-ltp.outputs.passed_x86_64 }}"
+        LTP_FAILED_X86="${{ needs.compare-ltp.outputs.failed_x86_64 }}"
+        LTP_PASSED_ARM="${{ needs.compare-ltp.outputs.passed_aarch64 }}"
+        LTP_FAILED_ARM="${{ needs.compare-ltp.outputs.failed_aarch64 }}"
 
-        # Add x86_64 section if enabled
-        if [ "$HAS_X86" = "true" ]; then
-          if [ "$COMPARISON_STATUS_X86" = "passed" ]; then
-            COMPARISON_SECTION="$COMPARISON_SECTION
-
-        **x86_64:**
-        - ✅ Status: Passed - Within acceptable threshold (±3 tests)
-        - Compared against: $BASE_BRANCH"
-          elif [ "$COMPARISON_STATUS_X86" = "skipped" ]; then
-            COMPARISON_SECTION="$COMPARISON_SECTION
-
-        **x86_64:**
-        - ⚠️ Status: Skipped - No baseline available"
-          else
-            COMPARISON_SECTION="$COMPARISON_SECTION
-
-        **x86_64:**
-        - ❌ Status: Failed - Regression detected"
+        # Build LTP details (regressions/fixes as bullet lists below the table)
+        LTP_DETAILS=""
+        if [ "${{ needs.pre-setup.outputs.skip_ltp }}" != "true" ]; then
+          if [ "$HAS_X86" = "true" ] && [ "$LTP_STATUS_X86" = "failed" ]; then
+            LTP_DETAILS="$LTP_DETAILS"$'\n'"**x86_64 regressions:**"$'\n'"$(ltp_format_list "$LTP_REGRESSIONS_X86")"
+          fi
+          if [ "$HAS_X86" = "true" ] && [ -n "$LTP_FIXES_X86" ]; then
+            LTP_DETAILS="$LTP_DETAILS"$'\n'"**x86_64 newly passing:**"$'\n'"$(ltp_format_list "$LTP_FIXES_X86")"
+          fi
+          if [ "$HAS_ARM" = "true" ] && [ "$LTP_STATUS_ARM" = "failed" ]; then
+            LTP_DETAILS="$LTP_DETAILS"$'\n'"**aarch64 regressions:**"$'\n'"$(ltp_format_list "$LTP_REGRESSIONS_ARM")"
+          fi
+          if [ "$HAS_ARM" = "true" ] && [ -n "$LTP_FIXES_ARM" ]; then
+            LTP_DETAILS="$LTP_DETAILS"$'\n'"**aarch64 newly passing:**"$'\n'"$(ltp_format_list "$LTP_FIXES_ARM")"
           fi
         fi
 
-        # Add aarch64 section if enabled
-        if [ "$HAS_ARM" = "true" ]; then
-          if [ "$COMPARISON_STATUS_ARM" = "passed" ]; then
-            COMPARISON_SECTION="$COMPARISON_SECTION
-
-        **aarch64:**
-        - ✅ Status: Passed - Within acceptable threshold (±3 tests)
-        - Compared against: $BASE_BRANCH"
-          elif [ "$COMPARISON_STATUS_ARM" = "skipped" ]; then
-            COMPARISON_SECTION="$COMPARISON_SECTION
-
-        **aarch64:**
-        - ⚠️ Status: Skipped - No baseline available"
-          else
-            COMPARISON_SECTION="$COMPARISON_SECTION
-
-        **aarch64:**
-        - ❌ Status: Failed - Regression detected"
-          fi
-        fi
-
-        # Build script arguments with named parameters
+        # Build script arguments
         SCRIPT_ARGS=(
           --run-id "${{ github.run_id }}"
-          --comparison "$COMPARISON_SECTION"
           --repo "${{ github.repository }}"
           --commit-file "/tmp/commit_message.txt"
+          --compared-against "$BASE_BRANCH"
+          --ltp-details "$LTP_DETAILS"
         )
 
         # Add x86_64 architecture if enabled
@@ -1123,9 +1527,22 @@ jobs:
             --arch x86_64
             --build-time "${{ steps.build_info.outputs.build_time_x86_64 }}"
             --total-time "${{ steps.build_info.outputs.total_time_x86_64 }}"
-            --passed "${{ steps.stats.outputs.passed_x86_64 }}"
-            --failed "${{ steps.stats.outputs.failed_x86_64 }}"
           )
+          # Only add kselftest data if not skipped
+          if [ "${{ needs.pre-setup.outputs.skip_kselftests }}" != "true" ]; then
+            SCRIPT_ARGS+=(
+              --kselftest-passed "${{ steps.stats.outputs.passed_x86_64 }}"
+              --kselftest-failed "${{ steps.stats.outputs.failed_x86_64 }}"
+              --kselftest-status "$(kselftest_status_text "$COMPARISON_STATUS_X86")"
+            )
+          fi
+          if [ "${{ needs.pre-setup.outputs.skip_ltp }}" != "true" ]; then
+            SCRIPT_ARGS+=(
+              --ltp-passed "${LTP_PASSED_X86:-N/A}"
+              --ltp-failed "${LTP_FAILED_X86:-N/A}"
+              --ltp-status "$(ltp_status_text "$LTP_STATUS_X86" "$LTP_REGRESSIONS_X86")"
+            )
+          fi
         fi
 
         # Add aarch64 architecture if enabled
@@ -1134,9 +1551,21 @@ jobs:
             --arch aarch64
             --build-time "${{ steps.build_info.outputs.build_time_aarch64 }}"
             --total-time "${{ steps.build_info.outputs.total_time_aarch64 }}"
-            --passed "${{ steps.stats.outputs.passed_aarch64 }}"
-            --failed "${{ steps.stats.outputs.failed_aarch64 }}"
           )
+          if [ "${{ needs.pre-setup.outputs.skip_kselftests }}" != "true" ]; then
+            SCRIPT_ARGS+=(
+              --kselftest-passed "${{ steps.stats.outputs.passed_aarch64 }}"
+              --kselftest-failed "${{ steps.stats.outputs.failed_aarch64 }}"
+              --kselftest-status "$(kselftest_status_text "$COMPARISON_STATUS_ARM")"
+            )
+          fi
+          if [ "${{ needs.pre-setup.outputs.skip_ltp }}" != "true" ]; then
+            SCRIPT_ARGS+=(
+              --ltp-passed "${LTP_PASSED_ARM:-N/A}"
+              --ltp-failed "${LTP_FAILED_ARM:-N/A}"
+              --ltp-status "$(ltp_status_text "$LTP_STATUS_ARM" "$LTP_REGRESSIONS_ARM")"
+            )
+          fi
         fi
 
         # Call script with named arguments
@@ -1157,7 +1586,7 @@ jobs:
             echo "Updated PR #$PR_NUMBER"
 
             # Note: We don't change the base branch even if it differs from $BASE_BRANCH
-            # because compare-results already used the existing PR's base for comparison
+            # because compare-kselftest already used the existing PR's base for comparison
             if [ "$CURRENT_BASE" != "$BASE_BRANCH" ]; then
               echo "::notice::PR base remains $CURRENT_BASE (comparison was done against this base)"
             fi
