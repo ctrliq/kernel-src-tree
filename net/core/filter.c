@@ -3297,13 +3297,6 @@ static const struct bpf_func_proto bpf_skb_vlan_pop_proto = {
 	.arg1_type      = ARG_PTR_TO_CTX,
 };
 
-static void bpf_skb_change_protocol(struct sk_buff *skb, u16 proto)
-{
-	skb->protocol = htons(proto);
-	if (skb_valid_dst(skb))
-		skb_dst_drop(skb);
-}
-
 static int bpf_skb_generic_push(struct sk_buff *skb, u32 off, u32 len)
 {
 	/* Caller already did skb_cow() with len as headroom,
@@ -3401,7 +3394,7 @@ static int bpf_skb_proto_4_to_6(struct sk_buff *skb)
 		shinfo->gso_type |=  SKB_GSO_DODGY;
 	}
 
-	bpf_skb_change_protocol(skb, ETH_P_IPV6);
+	skb->protocol = htons(ETH_P_IPV6);
 	skb_clear_hash(skb);
 
 	return 0;
@@ -3432,7 +3425,7 @@ static int bpf_skb_proto_6_to_4(struct sk_buff *skb)
 		shinfo->gso_type |=  SKB_GSO_DODGY;
 	}
 
-	bpf_skb_change_protocol(skb, ETH_P_IP);
+	skb->protocol = htons(ETH_P_IP);
 	skb_clear_hash(skb);
 
 	return 0;
@@ -3480,7 +3473,13 @@ BPF_CALL_3(bpf_skb_change_proto, struct sk_buff *, skb, __be16, proto,
 	 */
 	ret = bpf_skb_proto_xlat(skb, proto);
 	bpf_compute_data_pointers(skb);
-	return ret;
+	if (ret)
+		return ret;
+
+	if (skb_valid_dst(skb))
+		skb_dst_drop(skb);
+
+	return 0;
 }
 
 static const struct bpf_func_proto bpf_skb_change_proto_proto = {
@@ -3621,12 +3620,13 @@ static int bpf_skb_net_grow(struct sk_buff *skb, u32 off, u32 len_diff,
 		}
 
 		/* Match skb->protocol to new outer l3 protocol */
-		if (skb->protocol == htons(ETH_P_IP) &&
-		    flags & BPF_F_ADJ_ROOM_ENCAP_L3_IPV6)
-			bpf_skb_change_protocol(skb, ETH_P_IPV6);
-		else if (skb->protocol == htons(ETH_P_IPV6) &&
-			 flags & BPF_F_ADJ_ROOM_ENCAP_L3_IPV4)
-			bpf_skb_change_protocol(skb, ETH_P_IP);
+		if (flags & BPF_F_ADJ_ROOM_ENCAP_L3_IPV6)
+			skb->protocol = htons(ETH_P_IPV6);
+		else if (flags & BPF_F_ADJ_ROOM_ENCAP_L3_IPV4)
+			skb->protocol = htons(ETH_P_IP);
+
+		if (skb_valid_dst(skb))
+			skb_dst_drop(skb);
 	}
 
 	if (skb_is_gso(skb)) {
@@ -3654,6 +3654,7 @@ static int bpf_skb_net_grow(struct sk_buff *skb, u32 off, u32 len_diff,
 static int bpf_skb_net_shrink(struct sk_buff *skb, u32 off, u32 len_diff,
 			      u64 flags)
 {
+	bool decap = flags & BPF_F_ADJ_ROOM_DECAP_L3_MASK;
 	int ret;
 
 	if (unlikely(flags & ~(BPF_F_ADJ_ROOM_FIXED_GSO |
@@ -3676,13 +3677,16 @@ static int bpf_skb_net_shrink(struct sk_buff *skb, u32 off, u32 len_diff,
 	if (unlikely(ret < 0))
 		return ret;
 
-	/* Match skb->protocol to new outer l3 protocol */
-	if (skb->protocol == htons(ETH_P_IP) &&
-	    flags & BPF_F_ADJ_ROOM_DECAP_L3_IPV6)
-		bpf_skb_change_protocol(skb, ETH_P_IPV6);
-	else if (skb->protocol == htons(ETH_P_IPV6) &&
-		 flags & BPF_F_ADJ_ROOM_DECAP_L3_IPV4)
-		bpf_skb_change_protocol(skb, ETH_P_IP);
+	if (decap) {
+		/* Match skb->protocol to new outer l3 protocol */
+		if (flags & BPF_F_ADJ_ROOM_DECAP_L3_IPV6)
+			skb->protocol = htons(ETH_P_IPV6);
+		else if (flags & BPF_F_ADJ_ROOM_DECAP_L3_IPV4)
+			skb->protocol = htons(ETH_P_IP);
+
+		if (skb_valid_dst(skb))
+			skb_dst_drop(skb);
+	}
 
 	if (skb_is_gso(skb)) {
 		struct skb_shared_info *shinfo = skb_shinfo(skb);
