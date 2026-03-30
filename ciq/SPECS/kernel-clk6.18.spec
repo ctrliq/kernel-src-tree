@@ -2498,8 +2498,8 @@ BuildKernel() {
     # NOTENOTE: checksums to the rpm metadata provides list.
     # NOTENOTE: if you change the symvers name, update the backend too
     %{log_msg "GENERATING kernel ABI metadata"}
-    %compression --stdout %compression_flags < Module.symvers > $RPM_BUILD_ROOT/boot/symvers-$KernelVer.%compext
-    cp $RPM_BUILD_ROOT/boot/symvers-$KernelVer.%compext $RPM_BUILD_ROOT/lib/modules/$KernelVer/symvers.%compext
+    gzip -c9 < Module.symvers > $RPM_BUILD_ROOT/boot/symvers-$KernelVer.gz
+    cp $RPM_BUILD_ROOT/boot/symvers-$KernelVer.gz $RPM_BUILD_ROOT/lib/modules/$KernelVer/symvers.gz
 
    %{log_msg "Cleanup Makefiles/Kconfig files"}
     # then drop all but the needed Makefiles/Kconfig files
@@ -3877,10 +3877,10 @@ fi\
 %endif\
 rm -f %{_localstatedir}/lib/rpm-state/%{name}/installing_core_%{KVERREL}%{?-v:+%{-v*}}\
 /bin/kernel-install add %{KVERREL}%{?-v:+%{-v*}} /lib/modules/%{KVERREL}%{?-v:+%{-v*}}/vmlinuz%{?-u:-%{-u*}.efi} || exit $?\
-if [[ ! -e "/boot/symvers-%{KVERREL}%{?-v:+%{-v*}}.%compext" ]]; then\
-    cp "/lib/modules/%{KVERREL}%{?-v:+%{-v*}}/symvers.%compext" "/boot/symvers-%{KVERREL}%{?-v:+%{-v*}}.%compext"\
+if [[ ! -e "/boot/symvers-%{KVERREL}%{?-v:+%{-v*}}.gz" ]]; then\
+    cp "/lib/modules/%{KVERREL}%{?-v:+%{-v*}}/symvers.gz" "/boot/symvers-%{KVERREL}%{?-v:+%{-v*}}.gz"\
     if command -v restorecon &>/dev/null; then\
-        restorecon "/boot/symvers-%{KVERREL}%{?-v:+%{-v*}}.%compext"\
+        restorecon "/boot/symvers-%{KVERREL}%{?-v:+%{-v*}}.gz"\
     fi\
 fi\
 %{nil}
@@ -4252,10 +4252,10 @@ fi\
 %ghost /boot/System.map-%{KVERREL}%{?3:+%{3}}\
 %dir /lib/modules\
 %dir /lib/modules/%{KVERREL}%{?3:+%{3}}\
-/lib/modules/%{KVERREL}%{?3:+%{3}}/symvers.%compext\
+/lib/modules/%{KVERREL}%{?3:+%{3}}/symvers.gz\
 /lib/modules/%{KVERREL}%{?3:+%{3}}/config\
 /lib/modules/%{KVERREL}%{?3:+%{3}}/modules.builtin*\
-%ghost %attr(0644, root, root) /boot/symvers-%{KVERREL}%{?3:+%{3}}.%compext\
+%ghost %attr(0600, root, root) /boot/symvers-%{KVERREL}%{?3:+%{3}}.gz\
 %ghost %attr(0600, root, root) /boot/initramfs-%{KVERREL}%{?3:+%{3}}.img\
 %ghost %attr(0644, root, root) /boot/config-%{KVERREL}%{?3:+%{3}}\
 %{expand:%%files -f kernel-%{?3:%{3}-}modules-core.list %{?3:%{3}-}modules-core}\
@@ -4307,7 +4307,7 @@ fi\
 %dir /lib/modules\
 %dir /lib/modules/%{KVERREL}%{?3:+%{3}}\
 /lib/modules/%{KVERREL}%{?3:+%{3}}/System.map\
-/lib/modules/%{KVERREL}%{?3:+%{3}}/symvers.%compext\
+/lib/modules/%{KVERREL}%{?3:+%{3}}/symvers.gz\
 /lib/modules/%{KVERREL}%{?3:+%{3}}/config\
 /lib/modules/%{KVERREL}%{?3:+%{3}}/modules.builtin*\
 %attr(0644, root, root) /lib/modules/%{KVERREL}%{?3:+%{3}}/%{?-k:%{-k*}}%{!?-k:vmlinuz}-virt.efi\
