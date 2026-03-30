@@ -1402,6 +1402,14 @@ complex systems.
 The rv tool is the interface for a collection of monitors that aim
 analysing the logical and timing behavior of Linux.
 
+%package -n %{package_name}-default
+Summary: Make kernel-%{pkg_suffix} the default kernel
+Requires: %{package_name}-core
+%description -n %{package_name}-default
+This package configures kernel-%{pkg_suffix} as the default kernel for the system
+by modifying /etc/sysconfig/kernel. When installed, new kernels will be
+kernel-%{pkg_suffix} variants by default.
+
 # with_tools
 %endif
 
@@ -3757,6 +3765,16 @@ popd
 /sbin/ldconfig
 %endif
 
+%post -n %{package_name}-default
+if [ -f /etc/sysconfig/kernel ]; then
+    # Update existing DEFAULTKERNEL line or append if not present
+    if grep -q "^DEFAULTKERNEL=" /etc/sysconfig/kernel; then
+        /bin/sed -i 's/^DEFAULTKERNEL=.*/DEFAULTKERNEL=kernel-%{pkg_suffix}/' /etc/sysconfig/kernel
+    else
+        echo "DEFAULTKERNEL=kernel-%{pkg_suffix}" >> /etc/sysconfig/kernel
+    fi
+fi
+
 #
 # This macro defines a %%post script for a kernel*-devel package.
 #	%%kernel_devel_post [<subpackage>]
@@ -4209,6 +4227,9 @@ fi\
 %{_mandir}/man1/rv-mon.1.gz
 %{_mandir}/man1/rv-mon-sched.1.gz
 %{_mandir}/man1/rv.1.gz
+
+%files -n %{package_name}-default
+# This is a meta-package with no files
 
 # with_tools
 %endif
