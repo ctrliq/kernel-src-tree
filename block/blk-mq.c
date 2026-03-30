@@ -397,6 +397,15 @@ static inline void blk_mq_rq_time_init(struct request *rq, u64 alloc_time_ns)
 #endif
 }
 
+static inline void blk_mq_bio_issue_init(struct request_queue *q,
+					 struct bio *bio)
+{
+#ifdef CONFIG_BLK_CGROUP
+	if (test_bit(QUEUE_FLAG_BIO_ISSUE_TIME, &q->queue_flags))
+		bio->issue_time_ns = blk_time_get_ns();
+#endif
+}
+
 static struct request *blk_mq_rq_ctx_init(struct blk_mq_alloc_data *data,
 		struct blk_mq_tags *tags, unsigned int tag)
 {
@@ -3169,6 +3178,7 @@ void blk_mq_submit_bio(struct bio *bio)
 	if (!bio_integrity_prep(bio))
 		goto queue_exit;
 
+	blk_mq_bio_issue_init(q, bio);
 	if (blk_mq_attempt_bio_merge(q, bio, nr_segs))
 		goto queue_exit;
 
@@ -4961,20 +4971,21 @@ int blk_mq_update_nr_requests(struct request_queue *q, unsigned int nr)
 						      false);
 		}
 		if (ret)
-			break;
-		if (q->elevator && q->elevator->type->ops.depth_updated)
-			q->elevator->type->ops.depth_updated(hctx);
-	}
-	if (!ret) {
-		q->nr_requests = nr;
-		if (blk_mq_is_shared_tags(set->flags)) {
-			if (q->elevator)
-				blk_mq_tag_update_sched_shared_tags(q);
-			else
-				blk_mq_tag_resize_shared_tags(set, nr);
-		}
+			goto out;
 	}
 
+	q->nr_requests = nr;
+	if (q->elevator && q->elevator->type->ops.depth_updated)
+		q->elevator->type->ops.depth_updated(q);
+
+	if (blk_mq_is_shared_tags(set->flags)) {
+		if (q->elevator)
+			blk_mq_tag_update_sched_shared_tags(q);
+		else
+			blk_mq_tag_resize_shared_tags(set, nr);
+	}
+
+out:
 	blk_mq_unquiesce_queue(q);
 
 	return ret;
