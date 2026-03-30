@@ -1786,7 +1786,7 @@ static void audit_log_exit(void)
 						  axs->target_sessionid[i],
 						  axs->target_sid[i],
 						  axs->target_comm[i]))
-			call_panic = 1;
+				call_panic = 1;
 	}
 
 	if (context->target_pid &&
