@@ -334,7 +334,7 @@ Summary: The Linux kernel
 %define make_target bzImage
 %define image_install_path boot
 
-%define KVERREL %{specversion}-%{release}.%{_target_cpu}
+%define KVERREL %{specversion}-%{release}.%{_target_cpu}+%{pkg_suffix}
 %define KVERREL_RE %(echo %KVERREL | sed 's/+/[+]/g')
 %define hdrarch %_target_cpu
 %define asmarch %_target_cpu
@@ -2127,13 +2127,13 @@ InitBuildVars() {
     Config=kernel-%{_target_cpu}${Variant:+-${Variant}}.config
     DevelDir=/usr/src/kernels/%{KVERREL}${Variant:++${Variant}}
 
-    KernelVer=%{specversion}-%{release}.%{_target_cpu}${Variant:++${Variant}}
+    KernelVer=%{specversion}-%{release}.%{_target_cpu}+%{pkg_suffix}${Variant:++${Variant}}
 
     %{log_msg "InitBuildVars: Update Makefile"}
     # make sure EXTRAVERSION says what we want it to say
     # Trim the release if this is a CI build, since KERNELVERSION is limited to 64 characters
     ShortRel=$(perl -e "print \"%{release}\" =~ s/\.pr\.[0-9A-Fa-f]{32}//r")
-    perl -p -i -e "s/^EXTRAVERSION.*/EXTRAVERSION = -${ShortRel}.%{_target_cpu}${Variant:++${Variant}}/" Makefile
+    perl -p -i -e "s/^EXTRAVERSION.*/EXTRAVERSION = -${ShortRel}.%{_target_cpu}+%{pkg_suffix}${Variant:++${Variant}}/" Makefile
 
     # if pre-rc1 devel kernel, must fix up PATCHLEVEL for our versioning scheme
     # if we are post rc1 this should match anyway so this won't matter
