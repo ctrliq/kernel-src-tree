@@ -1321,7 +1321,7 @@ This package provides debug information for the libperf package.
 %endif
 
 %if %{with_tools}
-%package -n %{package_name}-tools
+%package tools
 Summary: Assortment of tools for the Linux kernel
 Provides: kernel-tools = %{specversion}-%{release}
 Conflicts: kernel-tools
@@ -1336,19 +1336,19 @@ Obsoletes: cpuspeed < 1:1.5-16
 Requires: %{package_name}-tools-libs = %{specversion}-%{release}
 %endif
 %define __requires_exclude ^%{_bindir}/python
-%description -n %{package_name}-tools
+%description tools
 This package contains the tools/ directory from the kernel source
 and the supporting documentation.
 
-%package -n %{package_name}-tools-libs
+%package tools-libs
 Summary: Libraries for the kernels-tools
 Provides: kernel-tools-libs = %{specversion}-%{release}
 Conflicts: kernel-tools-libs
-%description -n %{package_name}-tools-libs
+%description tools-libs
 This package contains the libraries built from the tools/ directory
 from the kernel source.
 
-%package -n %{package_name}-tools-libs-devel
+%package tools-libs-devel
 Summary: Assortment of tools for the Linux kernel
 Provides: kernel-tools-libs-devel = %{specversion}-%{release}
 Conflicts: kernel-tools-libs-devel
@@ -1359,15 +1359,15 @@ Obsoletes: cpupowerutils-devel < 1:009-0.6.p1
 %endif
 Requires: %{package_name}-tools-libs = %{version}-%{release}
 Provides: %{package_name}-tools-devel
-%description -n %{package_name}-tools-libs-devel
+%description tools-libs-devel
 This package contains the development files for the tools/ directory from
 the kernel source.
 
-%package -n %{package_name}-tools-debuginfo
+%package tools-debuginfo
 Summary: Debug information for package %{package_name}-tools
 Requires: %{name}-debuginfo-common-%{_target_cpu} = %{version}-%{release}
 AutoReqProv: no
-%description -n %{package_name}-tools-debuginfo
+%description tools-debuginfo
 This package provides debug information for package %{package_name}-tools.
 
 # Note that this pattern only works right to match the .build-id
@@ -1404,16 +1404,23 @@ complex systems.
 The rv tool is the interface for a collection of monitors that aim
 analysing the logical and timing behavior of Linux.
 
-%package -n %{package_name}-default
-Summary: Make kernel-%{pkg_suffix} the default kernel
-Requires: %{package_name}-core
-%description -n %{package_name}-default
-This package configures kernel-%{pkg_suffix} as the default kernel for the system
-by modifying /etc/sysconfig/kernel. When installed, new kernels will be
-kernel-%{pkg_suffix} variants by default.
-
 # with_tools
 %endif
+
+%package default
+Summary: Set kernel-%{pkg_suffix} as the default kernel
+Requires: %{package_name} = %{?epoch:%{epoch}:}%{specversion}-%{release}
+Requires(posttrans): %{package_name}-core = %{?epoch:%{epoch}:}%{specversion}-%{release}
+Provides: kernel-provider(default)
+Conflicts: kernel-provider(default)
+%description default
+This package sets kernel-%{pkg_suffix} as the default kernel for the system
+by modifying /etc/sysconfig/kernel. When installed, only new kernels of the
+kernel-%{pkg_suffix} variants will be set as the default kernel.
+
+WARNING: Installing this package takes ownership of /etc/sysconfig/kernel.
+Manual edits will be overwritten on reinstall. To manage this file yourself,
+remove this package first.
 
 %if %{with_selftests}
 
@@ -3760,21 +3767,67 @@ popd
 ###
 
 %if %{with_tools}
-%post -n %{package_name}-tools-libs
+%post tools-libs
 /sbin/ldconfig
 
-%postun -n %{package_name}-tools-libs
+%postun tools-libs
 /sbin/ldconfig
 %endif
 
-%post -n %{package_name}-default
-if [ -f /etc/sysconfig/kernel ]; then
-    # Update existing DEFAULTKERNEL line or append if not present
-    if grep -q "^DEFAULTKERNEL=" /etc/sysconfig/kernel; then
-        /bin/sed -i 's/^DEFAULTKERNEL=.*/DEFAULTKERNEL=kernel-%{pkg_suffix}/' /etc/sysconfig/kernel
+%postun default
+# Restore original /etc/sysconfig/kernel on uninstall, but only if the file
+# still references our kernel.  If another kernel-provider(default) package
+# has already taken over the file, the grep won't match and we leave it alone.
+if [ "$1" -eq 0 ] && \
+   grep -q "^DEFAULTKERNEL=kernel-%{pkg_suffix}-core$" /etc/sysconfig/kernel 2>/dev/null; then
+    if [ -f /etc/sysconfig/kernel.rpmsave ]; then
+        mv -f /etc/sysconfig/kernel.rpmsave /etc/sysconfig/kernel
     else
-        echo "DEFAULTKERNEL=kernel-%{pkg_suffix}" >> /etc/sysconfig/kernel
+        # Backup is gone; write a sane default
+        cat > /etc/sysconfig/kernel <<EOF
+# UPDATEDEFAULT specifies if kernel-install should make
+# new kernels the default
+UPDATEDEFAULT=yes
+
+# DEFAULTKERNEL specifies the default kernel package type
+DEFAULTKERNEL=kernel-core
+EOF
     fi
+fi
+
+%pre default
+# Already configured -- nothing to do. This also handles upgrades safely:
+# %postun of the old version sees $1 > 0 and skips the restore, so our
+# managed file from the prior install remains intact.
+if grep -q "^DEFAULTKERNEL=kernel-%{pkg_suffix}-core$" /etc/sysconfig/kernel 2>/dev/null; then
+    exit 0
+fi
+
+# Back up the original file only on first install; never clobber an existing
+# backup so the original config is always recoverable on uninstall.
+if [ ! -f /etc/sysconfig/kernel.rpmsave ] && [ -f /etc/sysconfig/kernel ]; then
+    cp -f /etc/sysconfig/kernel /etc/sysconfig/kernel.rpmsave || exit 1
+fi
+
+# Write our managed configuration
+cat > /etc/sysconfig/kernel <<EOF
+# This file is managed by %{package_name}-default
+# To revert to the original, uninstall %{package_name}-default
+# and restore /etc/sysconfig/kernel.rpmsave
+#
+# UPDATEDEFAULT specifies if kernel-install should make
+# new kernels the default
+UPDATEDEFAULT=yes
+
+# DEFAULTKERNEL specifies the default kernel package type
+DEFAULTKERNEL=kernel-%{pkg_suffix}-core
+EOF
+
+%posttrans default
+# Set this kernel version as the boot default after all transactions complete
+if [ -f /boot/vmlinuz-%{KVERREL} ]; then
+    grubby --set-default=/boot/vmlinuz-%{KVERREL} ||
+        echo "warning: failed to set kernel-%{pkg_suffix} as boot default" >&2
 fi
 
 #
@@ -4141,9 +4194,9 @@ fi\
 
 %if %{with_tools}
 %ifnarch %{cpupowerarchs}
-%files -n %{package_name}-tools
+%files tools
 %else
-%files -n %{package_name}-tools -f cpupower.lang
+%files tools -f cpupower.lang
 %{_bindir}/cpupower
 %{_libexecdir}/cpupower
 %{_unitdir}/cpupower.service
@@ -4187,16 +4240,16 @@ fi\
 %endif
 
 %if %{with_debuginfo}
-%files -f %{package_name}-tools-debuginfo.list -n %{package_name}-tools-debuginfo
+%files -f %{package_name}-tools-debuginfo.list tools-debuginfo
 %endif
 
-%files -n %{package_name}-tools-libs
+%files tools-libs
 %ifarch %{cpupowerarchs}
 %{_libdir}/libcpupower.so.1
 %{_libdir}/libcpupower.so.1.0.1
 %endif
 
-%files -n %{package_name}-tools-libs-devel
+%files tools-libs-devel
 %ifarch %{cpupowerarchs}
 %{_libdir}/libcpupower.so
 %{_includedir}/cpufreq.h
@@ -4236,11 +4289,11 @@ fi\
 %{_mandir}/man1/rv-mon-sched.1.gz
 %{_mandir}/man1/rv.1.gz
 
-%files -n %{package_name}-default
-# This is a meta-package with no files
-
 # with_tools
 %endif
+
+%files default
+# This is a meta-package with no files
 
 %if %{with_selftests}
 %files selftests-internal
