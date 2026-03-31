@@ -715,7 +715,7 @@ BuildRequires: bzip2, xz, findutils, m4, perl-interpreter, perl-Carp, perl-devel
 BuildRequires: zstd
 %endif
 BuildRequires: gcc, binutils, redhat-rpm-config, hmaccalc, bison, flex, gcc-c++
-BuildRequires: rust, rust-src, bindgen, rustfmt, clippy
+BuildRequires: rust, rust-src, rustfmt, clippy
 BuildRequires: net-tools, hostname, bc, elfutils-devel
 BuildRequires: dwarves
 BuildRequires: python3
@@ -1133,6 +1133,9 @@ Source3002: Patchlist.changelog
 %endif
 
 Source4000: README.rst
+
+# Bundled bindgen-cli source (not packaged in Rocky 9.6)
+Source5000: bindgen-cli.tar.gz
 
 ## Patches needed for building this package
 
@@ -2237,6 +2240,18 @@ cp_vmlinux()
 %define build_hostcflags  %{?build_cflags}
 %define build_hostldflags %{?build_ldflags}
 %endif
+
+# Build bundled bindgen and add to PATH
+%{log_msg "Build bindgen"}
+BINDGEN_DIR=$RPM_BUILD_ROOT/bindgen
+BINDGEN_BUNDLE_NAME=$(basename %{SOURCE5000} .tar.gz)
+mkdir -p $BINDGEN_DIR
+tar -xf %{SOURCE5000} -C $BINDGEN_DIR
+pushd $BINDGEN_DIR/$BINDGEN_BUNDLE_NAME
+cargo build --offline --frozen --release
+export PATH="$PWD/target/release:$PATH"
+popd
+bindgen --version
 
 %define make %{__make} %{?cross_opts} %{?make_opts} HOSTCFLAGS="%{?build_hostcflags}" HOSTLDFLAGS="%{?build_hostldflags}"
 
