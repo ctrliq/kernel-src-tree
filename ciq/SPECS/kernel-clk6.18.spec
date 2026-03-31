@@ -140,7 +140,7 @@ Summary: The Linux kernel
 #
 
 # suffix for CLK kernel packages
-%global pkg_suffix clk%{patchversion}
+%global pkg_suffix clk%{kernel_major_minor}
 # kernel package name
 %global package_name kernel-%{pkg_suffix}
 # Include Fedora files
@@ -166,17 +166,19 @@ Summary: The Linux kernel
 #  to build the base kernel using the debug configuration. (Specifying
 #  the --with-release option overrides this setting.)
 %define debugbuildsenabled 1
+%define el_version 9
+%define kernel_major_minor 6.18
+%define kernel_patch 19
 %define buildid .1
-%define specrpmversion 6.18.19
-%define specversion 6.18.19
-%define patchversion 6.18
-%define pkgrelease 1.%{?buildid}
-%define kversion 6
-%define tarfile_release 6.18.19-1.1.0.0.el9_clk
+%define specversion %{kernel_major_minor}.%{kernel_patch}
+%define pkgrelease 1%{?buildid}
+%define kversion %{lua:print((rpm.expand("%{kernel_major_minor}"):match("^(%d+)")))}
+
+%define tarfile_release %{specversion}-%{pkgrelease}.el%{el_version}
 # This is needed to do merge window version magic
-%define patchlevel 18
+%define patchlevel %{lua:print((rpm.expand("%{kernel_major_minor}"):match("%.(%d+)$")))}
 # This allows pkg_release to have configurable %%{?dist} tag
-%define specrelease 1%{?buildid}%{?dist}
+%define specrelease %{pkgrelease}%{?dist}
 
 # If this variable is set to 1, a bpf selftests build failure will cause a
 # fatal kernel package build error
@@ -498,7 +500,7 @@ Summary: The Linux kernel
 %endif
 %endif
 
-%define all_configs %{name}-%{specrpmversion}-*.config
+%define all_configs %{name}-%{specversion}-*.config
 
 # don't build noarch kernels or headers (duh)
 %ifarch noarch
@@ -684,7 +686,7 @@ Summary: The Linux kernel
 Name: %{package_name}
 License: ((GPL-2.0-only WITH Linux-syscall-note) OR BSD-2-Clause) AND ((GPL-2.0-only WITH Linux-syscall-note) OR BSD-3-Clause) AND ((GPL-2.0-only WITH Linux-syscall-note) OR CDDL-1.0) AND ((GPL-2.0-only WITH Linux-syscall-note) OR Linux-OpenIB) AND ((GPL-2.0-only WITH Linux-syscall-note) OR MIT) AND ((GPL-2.0-or-later WITH Linux-syscall-note) OR BSD-3-Clause) AND ((GPL-2.0-or-later WITH Linux-syscall-note) OR MIT) AND 0BSD AND BSD-2-Clause AND (BSD-2-Clause OR Apache-2.0) AND BSD-3-Clause AND BSD-3-Clause-Clear AND CC0-1.0 AND GFDL-1.1-no-invariants-or-later AND GPL-1.0-or-later AND (GPL-1.0-or-later OR BSD-3-Clause) AND (GPL-1.0-or-later WITH Linux-syscall-note) AND GPL-2.0-only AND (GPL-2.0-only OR Apache-2.0) AND (GPL-2.0-only OR BSD-2-Clause) AND (GPL-2.0-only OR BSD-3-Clause) AND (GPL-2.0-only OR CDDL-1.0) AND (GPL-2.0-only OR GFDL-1.1-no-invariants-or-later) AND (GPL-2.0-only OR GFDL-1.2-no-invariants-only) AND (GPL-2.0-only OR GFDL-1.2-no-invariants-or-later) AND (GPL-2.0-only WITH Linux-syscall-note) AND GPL-2.0-or-later AND (GPL-2.0-or-later OR BSD-2-Clause) AND (GPL-2.0-or-later OR BSD-3-Clause) AND (GPL-2.0-or-later OR CC-BY-4.0) AND (GPL-2.0-or-later WITH GCC-exception-2.0) AND (GPL-2.0-or-later WITH Linux-syscall-note) AND ISC AND LGPL-2.0-or-later AND (LGPL-2.0-or-later OR BSD-2-Clause) AND (LGPL-2.0-or-later WITH Linux-syscall-note) AND LGPL-2.1-only AND (LGPL-2.1-only OR BSD-2-Clause) AND (LGPL-2.1-only WITH Linux-syscall-note) AND LGPL-2.1-or-later AND (LGPL-2.1-or-later WITH Linux-syscall-note) AND (Linux-OpenIB OR GPL-2.0-only) AND (Linux-OpenIB OR GPL-2.0-only OR BSD-2-Clause) AND Linux-man-pages-copyleft AND MIT AND (MIT OR Apache-2.0) AND (MIT OR GPL-2.0-only) AND (MIT OR GPL-2.0-or-later) AND (MIT OR LGPL-2.1-only) AND (MPL-1.1 OR GPL-2.0-only) AND (X11 OR GPL-2.0-only) AND (X11 OR GPL-2.0-or-later) AND Zlib AND (copyleft-next-0.3.1 OR GPL-2.0-or-later)
 URL: https://www.kernel.org/
-Version: %{specrpmversion}
+Version: %{specversion}
 Release: %{pkg_release}
 # DO NOT CHANGE THE 'ExclusiveArch' LINE TO TEMPORARILY EXCLUDE AN ARCHITECTURE BUILD.
 # SET %%nobuildarches (ABOVE) INSTEAD
@@ -1136,7 +1138,7 @@ Source4000: README.rst
 
 %if !%{nopatches}
 
-Patch1: patch-%{patchversion}-redhat.patch
+Patch1: patch-%{kernel_major_minor}-redhat.patch
 %endif
 
 # empty final patch to facilitate testing of kernel patches
@@ -1160,7 +1162,7 @@ The %{package_name} meta package
 Provides: kernel = %{specversion}-%{pkg_release}\
 Provides: %{name} = %{specversion}-%{pkg_release}\
 %endif\
-Provides: %{name}-%{_target_cpu} = %{specrpmversion}-%{pkg_release}%{uname_suffix %{?1}}\
+Provides: %{name}-%{_target_cpu} = %{specversion}-%{pkg_release}%{uname_suffix %{?1}}\
 Provides: %{name}-uname-r = %{KVERREL}%{uname_suffix %{?1}}\
 Requires: %{name}%{?1:-%{1}}-modules-core-uname-r = %{KVERREL}%{uname_suffix %{?1}}\
 Requires(pre): %{kernel_prereq}\
@@ -1187,7 +1189,7 @@ AutoProv: yes\
 %package doc
 Summary: Various documentation bits found in the kernel source
 Group: Documentation
-Provides: kernel-doc = %{specrpmversion}-%{release}
+Provides: kernel-doc = %{specversion}-%{release}
 Conflicts: kernel-doc
 %description doc
 This package contains documentation files from the kernel
@@ -1202,7 +1204,7 @@ options that can be passed to Linux kernel modules at load time.
 Summary: Header files for the Linux kernel for use by glibc
 Obsoletes: glibc-kernheaders < 3.0-46
 Provides: glibc-kernheaders = 3.0-46
-Provides: kernel-headers = %{specrpmversion}-%{release}
+Provides: kernel-headers = %{specversion}-%{release}
 Conflicts: kernel-headers
 %description headers
 Kernel-headers includes the C header files that specify the interface
@@ -1215,7 +1217,7 @@ glibc package.
 %if %{with_cross_headers}
 %package cross-headers
 Summary: Header files for the Linux kernel for use by cross-glibc
-Provides: kernel-cross-headers = %{specrpmversion}-%{release}
+Provides: kernel-cross-headers = %{specversion}-%{release}
 Conflicts: kernel-cross-headers
 %description cross-headers
 Kernel-cross-headers includes the C header files that specify the interface
@@ -1228,7 +1230,7 @@ cross-glibc package.
 %package debuginfo-common-%{_target_cpu}
 Summary: Kernel source files used by %{name}-debuginfo packages
 Provides: installonlypkg(kernel)
-Provides: kernel-debuginfo-common-%{_target_cpu} = %{specrpmversion}-%{release}
+Provides: kernel-debuginfo-common-%{_target_cpu} = %{specversion}-%{release}
 Conflicts: kernel-debuginfo-common-%{_target_cpu}
 %description debuginfo-common-%{_target_cpu}
 This package is required by %{name}-debuginfo subpackages.
@@ -1237,7 +1239,7 @@ It provides the kernel source files common to all builds.
 %if %{with_perf}
 %package -n perf-%{pkg_suffix}
 Summary: Performance monitoring for the Linux kernel
-Provides: perf = %{specrpmversion}-%{release}
+Provides: perf = %{specversion}-%{release}
 Conflicts: perf
 Requires: bzip2
 %description -n perf-%{pkg_suffix}
@@ -1246,9 +1248,9 @@ of the Linux kernel.
 
 %package -n perf-%{pkg_suffix}-debuginfo
 Summary: Debug information for package perf
-Provides: perf-debuginfo = %{specrpmversion}-%{release}
+Provides: perf-debuginfo = %{specversion}-%{release}
 Conflicts: perf-debuginfo
-Requires: %{name}-debuginfo-common-%{_target_cpu} = %{specrpmversion}-%{release}
+Requires: %{name}-debuginfo-common-%{_target_cpu} = %{specversion}-%{release}
 AutoReqProv: no
 %description -n perf-%{pkg_suffix}-debuginfo
 This package provides debug information for the perf package.
@@ -1261,7 +1263,7 @@ This package provides debug information for the perf package.
 
 %package -n python3-perf-%{pkg_suffix}
 Summary: Python bindings for apps which will manipulate perf events
-Provides: python3-perf = %{specrpmversion}-%{release}
+Provides: python3-perf = %{specversion}-%{release}
 Conflicts: python3-perf
 %description -n python3-perf-%{pkg_suffix}
 The python3-perf package contains a module that permits applications
@@ -1270,9 +1272,9 @@ to manipulate perf events.
 
 %package -n python3-perf-%{pkg_suffix}-debuginfo
 Summary: Debug information for package perf python bindings
-Provides: python3-perf-debuginfo = %{specrpmversion}-%{release}
+Provides: python3-perf-debuginfo = %{specversion}-%{release}
 Conflicts: python3-perf-debuginfo
-Requires: %{name}-debuginfo-common-%{_target_cpu} = %{specrpmversion}-%{release}
+Requires: %{name}-debuginfo-common-%{_target_cpu} = %{specversion}-%{release}
 AutoReqProv: no
 %description -n python3-perf-%{pkg_suffix}-debuginfo
 This package provides debug information for the perf python bindings.
@@ -1286,14 +1288,14 @@ This package provides debug information for the perf python bindings.
 %if %{with_libperf}
 %package -n libperf-%{pkg_suffix}
 Summary: The perf library from kernel source
-Provides: libperf = %{specrpmversion}-%{release}
+Provides: libperf = %{specversion}-%{release}
 Conflicts: libperf
 %description -n libperf-%{pkg_suffix}
 This package contains the kernel source perf library.
 
 %package -n libperf-%{pkg_suffix}-devel
 Summary: Developement files for the perf library from kernel source
-Provides: libperf-devel = %{specrpmversion}-%{release}
+Provides: libperf-devel = %{specversion}-%{release}
 Conflicts: libperf-devel
 Requires: libperf-%{pkg_suffix} = %{version}-%{release}
 %description -n libperf-%{pkg_suffix}-devel
@@ -1302,7 +1304,7 @@ of applications which use perf library from kernel source.
 
 %package -n libperf-%{pkg_suffix}-debuginfo
 Summary: Debug information for package libperf
-Provides: libperf-debuginfo = %{specrpmversion}-%{release}
+Provides: libperf-debuginfo = %{specversion}-%{release}
 Conflicts: libperf-debuginfo
 Group: Development/Debug
 Requires: %{name}-debuginfo-common-%{_target_cpu} = %{version}-%{release}
@@ -1321,7 +1323,7 @@ This package provides debug information for the libperf package.
 %if %{with_tools}
 %package -n %{package_name}-tools
 Summary: Assortment of tools for the Linux kernel
-Provides: kernel-tools = %{specrpmversion}-%{release}
+Provides: kernel-tools = %{specversion}-%{release}
 Conflicts: kernel-tools
 %ifarch %{cpupowerarchs}
 Provides:  cpupowerutils = 1:009-0.6.p1
@@ -1331,7 +1333,7 @@ Provides:  cpufrequtils = 1:009-0.6.p1
 Obsoletes: cpufreq-utils < 1:009-0.6.p1
 Obsoletes: cpufrequtils < 1:009-0.6.p1
 Obsoletes: cpuspeed < 1:1.5-16
-Requires: %{package_name}-tools-libs = %{specrpmversion}-%{release}
+Requires: %{package_name}-tools-libs = %{specversion}-%{release}
 %endif
 %define __requires_exclude ^%{_bindir}/python
 %description -n %{package_name}-tools
@@ -1340,7 +1342,7 @@ and the supporting documentation.
 
 %package -n %{package_name}-tools-libs
 Summary: Libraries for the kernels-tools
-Provides: kernel-tools-libs = %{specrpmversion}-%{release}
+Provides: kernel-tools-libs = %{specversion}-%{release}
 Conflicts: kernel-tools-libs
 %description -n %{package_name}-tools-libs
 This package contains the libraries built from the tools/ directory
@@ -1348,7 +1350,7 @@ from the kernel source.
 
 %package -n %{package_name}-tools-libs-devel
 Summary: Assortment of tools for the Linux kernel
-Provides: kernel-tools-libs-devel = %{specrpmversion}-%{release}
+Provides: kernel-tools-libs-devel = %{specversion}-%{release}
 Conflicts: kernel-tools-libs-devel
 Requires: %{package_name}-tools = %{version}-%{release}
 %ifarch %{cpupowerarchs}
@@ -1376,7 +1378,7 @@ This package provides debug information for package %{package_name}-tools.
 
 %package -n rtla-%{pkg_suffix}
 Summary: Real-Time Linux Analysis tools
-Provides: rtla = %{specrpmversion}-%{release}
+Provides: rtla = %{specversion}-%{release}
 Conflicts: rtla
 Requires: libtraceevent
 Requires: libtracefs
@@ -1392,7 +1394,7 @@ about the properties and root causes of unexpected results.
 
 %package -n rv-%{pkg_suffix}
 Summary: RV: Runtime Verification
-Provides: rv = %{specrpmversion}-%{release}
+Provides: rv = %{specversion}-%{release}
 Conflicts: rv
 %description -n rv-%{pkg_suffix}
 Runtime Verification (RV) is a lightweight (yet rigorous) method that
@@ -1417,7 +1419,7 @@ kernel-%{pkg_suffix} variants by default.
 
 %package selftests-internal
 Summary: Kernel samples and selftests
-Provides: kernel-selftests-internal = %{specrpmversion}-%{release}
+Provides: kernel-selftests-internal = %{specversion}-%{release}
 Conflicts: kernel-selftests-internal
 Requires: binutils, bpftool, fuse-libs, iproute-tc, iputils, keyutils, nmap-ncat, python3
 %description selftests-internal
@@ -1453,8 +1455,8 @@ Summary: gcov graph and source files for coverage data collection.\
 %define kernel_debuginfo_package() \
 %package %{?1:%{1}-}debuginfo\
 Summary: Debug information for package %{name}%{?1:-%{1}}\
-Requires: %{name}-debuginfo-common-%{_target_cpu} = %{specrpmversion}-%{release}\
-Provides: %{name}%{?1:-%{1}}-debuginfo-%{_target_cpu} = %{specrpmversion}-%{release}\
+Requires: %{name}-debuginfo-common-%{_target_cpu} = %{specversion}-%{release}\
+Provides: %{name}%{?1:-%{1}}-debuginfo-%{_target_cpu} = %{specversion}-%{release}\
 Provides: installonlypkg(kernel)\
 AutoReqProv: no\
 %description %{?1:%{1}-}debuginfo\
@@ -1470,8 +1472,8 @@ This is required to use SystemTap with %{name}%{?1:-%{1}}-%{KVERREL}.\
 %define kernel_devel_package(m) \
 %package %{?1:%{1}-}devel\
 Summary: Development package for building kernel modules to match the %{?2:%{2} }kernel\
-Provides: %{name}%{?1:-%{1}}-devel-%{_target_cpu} = %{specrpmversion}-%{release}\
-Provides: %{name}-devel-%{_target_cpu} = %{specrpmversion}-%{release}%{uname_suffix %{?1}}\
+Provides: %{name}%{?1:-%{1}}-devel-%{_target_cpu} = %{specversion}-%{release}\
+Provides: %{name}-devel-%{_target_cpu} = %{specversion}-%{release}%{uname_suffix %{?1}}\
 Provides: kernel-devel-uname-r = %{KVERREL}%{uname_suffix %{?1}}\
 Provides: %{name}-devel-uname-r = %{KVERREL}%{uname_suffix %{?1}}\
 Provides: installonlypkg(kernel)\
@@ -1501,8 +1503,8 @@ against the %{?2:%{2} }kernel package.\
 %define kernel_devel_matched_package(m) \
 %package %{?1:%{1}-}devel-matched\
 Summary: Meta package to install matching core and devel packages for a given %{?2:%{2} }kernel\
-Requires: %{package_name}%{?1:-%{1}}-devel = %{specrpmversion}-%{release}\
-Requires: %{package_name}%{?1:-%{1}}-core = %{specrpmversion}-%{release}\
+Requires: %{package_name}%{?1:-%{1}}-devel = %{specversion}-%{release}\
+Requires: %{package_name}%{?1:-%{1}}-core = %{specversion}-%{release}\
 %description %{?1:%{1}-}devel-matched\
 This meta package is used to install matching core and devel packages for a given %{?2:%{2} }kernel.\
 %{nil}
@@ -1522,9 +1524,9 @@ This meta package provides a single reference that other packages can Require to
 %package %{?1:%{1}-}modules-internal\
 Summary: Extra kernel modules to match the %{?2:%{2} }kernel\
 Group: System Environment/Kernel\
-Provides: %{name}%{?1:-%{1}}-modules-internal-%{_target_cpu} = %{specrpmversion}-%{release}\
-Provides: %{name}%{?1:-%{1}}-modules-internal-%{_target_cpu} = %{specrpmversion}-%{release}%{uname_suffix %{?1}}\
-Provides: %{name}%{?1:-%{1}}-modules-internal = %{specrpmversion}-%{release}%{uname_suffix %{?1}}\
+Provides: %{name}%{?1:-%{1}}-modules-internal-%{_target_cpu} = %{specversion}-%{release}\
+Provides: %{name}%{?1:-%{1}}-modules-internal-%{_target_cpu} = %{specversion}-%{release}%{uname_suffix %{?1}}\
+Provides: %{name}%{?1:-%{1}}-modules-internal = %{specversion}-%{release}%{uname_suffix %{?1}}\
 Provides: installonlypkg(kernel-module)\
 Provides: %{name}%{?1:-%{1}}-modules-internal-uname-r = %{KVERREL}%{uname_suffix %{?1}}\
 Requires: %{name}-uname-r = %{KVERREL}%{uname_suffix %{?1}}\
@@ -1543,9 +1545,9 @@ This package provides kernel modules for the %{?2:%{2} }kernel package for Red H
 %define kernel_modules_extra_package(m) \
 %package %{?1:%{1}-}modules-extra\
 Summary: Extra kernel modules to match the %{?2:%{2} }kernel\
-Provides: %{name}%{?1:-%{1}}-modules-extra-%{_target_cpu} = %{specrpmversion}-%{release}\
-Provides: %{name}%{?1:-%{1}}-modules-extra-%{_target_cpu} = %{specrpmversion}-%{release}%{uname_suffix %{?1}}\
-Provides: %{name}%{?1:-%{1}}-modules-extra = %{specrpmversion}-%{release}%{uname_suffix %{?1}}\
+Provides: %{name}%{?1:-%{1}}-modules-extra-%{_target_cpu} = %{specversion}-%{release}\
+Provides: %{name}%{?1:-%{1}}-modules-extra-%{_target_cpu} = %{specversion}-%{release}%{uname_suffix %{?1}}\
+Provides: %{name}%{?1:-%{1}}-modules-extra = %{specversion}-%{release}%{uname_suffix %{?1}}\
 Provides: installonlypkg(kernel-module)\
 Provides: %{name}%{?1:-%{1}}-modules-extra-uname-r = %{KVERREL}%{uname_suffix %{?1}}\
 Requires: %{name}-uname-r = %{KVERREL}%{uname_suffix %{?1}}\
@@ -1567,9 +1569,9 @@ This package provides less commonly used kernel modules for the %{?2:%{2} }kerne
 %define kernel_modules_package(m) \
 %package %{?1:%{1}-}modules\
 Summary: kernel modules to match the %{?2:%{2}-}core kernel\
-Provides: %{name}%{?1:-%{1}}-modules-%{_target_cpu} = %{specrpmversion}-%{release}\
-Provides: %{name}-modules-%{_target_cpu} = %{specrpmversion}-%{release}%{uname_suffix %{?1}}\
-Provides: %{name}-modules = %{specrpmversion}-%{release}%{uname_suffix %{?1}}\
+Provides: %{name}%{?1:-%{1}}-modules-%{_target_cpu} = %{specversion}-%{release}\
+Provides: %{name}-modules-%{_target_cpu} = %{specversion}-%{release}%{uname_suffix %{?1}}\
+Provides: %{name}-modules = %{specversion}-%{release}%{uname_suffix %{?1}}\
 Provides: installonlypkg(kernel-module)\
 Provides: %{name}%{?1:-%{1}}-modules-uname-r = %{KVERREL}%{uname_suffix %{?1}}\
 Requires: %{name}-uname-r = %{KVERREL}%{uname_suffix %{?1}}\
@@ -1590,9 +1592,9 @@ This package provides commonly used kernel modules for the %{?2:%{2}-}core kerne
 %define kernel_modules_core_package(m) \
 %package %{?1:%{1}-}modules-core\
 Summary: Core kernel modules to match the %{?2:%{2}-}core kernel\
-Provides: %{name}%{?1:-%{1}}-modules-core-%{_target_cpu} = %{specrpmversion}-%{release}\
-Provides: %{name}-modules-core-%{_target_cpu} = %{specrpmversion}-%{release}%{uname_suffix %{?1}}\
-Provides: %{name}-modules-core = %{specrpmversion}-%{release}%{uname_suffix %{?1}}\
+Provides: %{name}%{?1:-%{1}}-modules-core-%{_target_cpu} = %{specversion}-%{release}\
+Provides: %{name}-modules-core-%{_target_cpu} = %{specversion}-%{release}%{uname_suffix %{?1}}\
+Provides: %{name}-modules-core = %{specversion}-%{release}%{uname_suffix %{?1}}\
 Provides: installonlypkg(kernel-module)\
 Provides: %{name}%{?1:-%{1}}-modules-core-uname-r = %{KVERREL}%{uname_suffix %{?1}}\
 Requires: %{name}-uname-r = %{KVERREL}%{uname_suffix %{?1}}\
@@ -1670,7 +1672,7 @@ Recommends: uki-direct\
 %package %{?1:%{1}-}uki-virt-addons\
 Summary: %{variant_summary} unified kernel image addons for virtual machines\
 Provides: installonlypkg(kernel)\
-Requires: %{name}%{?1:-%{1}}-uki-virt = %{specrpmversion}-%{release}\
+Requires: %{name}%{?1:-%{1}}-uki-virt = %{specversion}-%{release}\
 Requires(pre): systemd >= 254-1\
 %endif\
 %if %{with_gcov}\
@@ -1686,9 +1688,9 @@ Requires(pre): systemd >= 254-1\
 %package %{?1:%{1}-}modules-partner\
 Summary: Extra kernel modules to match the %{?2:%{2} }kernel\
 Group: System Environment/Kernel\
-Provides: %{name}%{?1:-%{1}}-modules-partner-%{_target_cpu} = %{specrpmversion}-%{release}\
-Provides: %{name}%{?1:-%{1}}-modules-partner-%{_target_cpu} = %{specrpmversion}-%{release}%{uname_suffix %{?1}}\
-Provides: %{name}%{?1:-%{1}}-modules-partner = %{specrpmversion}-%{release}%{uname_suffix %{?1}}\
+Provides: %{name}%{?1:-%{1}}-modules-partner-%{_target_cpu} = %{specversion}-%{release}\
+Provides: %{name}%{?1:-%{1}}-modules-partner-%{_target_cpu} = %{specversion}-%{release}%{uname_suffix %{?1}}\
+Provides: %{name}%{?1:-%{1}}-modules-partner = %{specversion}-%{release}%{uname_suffix %{?1}}\
 Provides: installonlypkg(kernel-module)\
 Provides: %{name}%{?1:-%{1}}-modules-partner-uname-r = %{KVERREL}%{uname_suffix %{?1}}\
 Requires: %{name}-uname-r = %{KVERREL}%{uname_suffix %{?1}}\
@@ -1986,7 +1988,7 @@ cd linux-%{KVERREL}
 %{log_msg "Start of patch applications"}
 %if !%{nopatches}
 
-ApplyOptionalPatch patch-%{patchversion}-redhat.patch
+ApplyOptionalPatch patch-%{kernel_major_minor}-redhat.patch
 %endif
 
 ApplyOptionalPatch linux-kernel-test.patch
@@ -1997,7 +1999,7 @@ ApplyOptionalPatch linux-kernel-test.patch
 # Any further pre-build tree manipulations happen here.
 %{log_msg "Pre-build tree manipulations"}
 chmod +x scripts/checkpatch.pl
-mv COPYING COPYING-%{specrpmversion}-%{release}
+mv COPYING COPYING-%{specversion}-%{release}
 
 # on linux-next prevent scripts/setlocalversion from mucking with our version numbers
 rm -f localversion-next localversion-rt
@@ -2163,7 +2165,7 @@ for opt in %{clang_make_opts}; do
 done
 %endif
 %{log_msg "Generate redhat configs"}
-RHJOBS=$RPM_BUILD_NCPUS SPECPACKAGE_NAME=%{name} ./process_configs.sh $OPTS %{specrpmversion}
+RHJOBS=$RPM_BUILD_NCPUS SPECPACKAGE_NAME=%{name} ./process_configs.sh $OPTS %{specversion}
 
 # We may want to override files from the primary target in case of building
 # against a flavour of it (eg. centos not rhel), thus override it here if
@@ -2241,7 +2243,7 @@ InitBuildVars() {
     Variant=$1
 
     # Pick the right kernel config file
-    Config=%{name}-%{specrpmversion}-%{_target_cpu}${Variant:+-${Variant}}.config
+    Config=%{name}-%{specversion}-%{_target_cpu}${Variant:+-${Variant}}.config
     DevelDir=/usr/src/kernels/%{KVERREL}${Variant:++${Variant}}
 
     KernelVer=%{specversion}-%{release}.%{_target_cpu}+%{pkg_suffix}${Variant:++${Variant}}
@@ -3894,6 +3896,12 @@ fi\
 %endif\
 %endif\
 rm -f %{_localstatedir}/lib/rpm-state/%{name}/installing_core_%{KVERREL}%{?-v:+%{-v*}}\
+# Tell 20-grub.install that this is a non-standard kernel so it only becomes\
+# the boot default when DEFAULTKERNEL in /etc/sysconfig/kernel is set to\
+# %{name}-core.  When DEFAULTKERNEL is kernel-core, grub2-get-kernel-settings\
+# does not output GRUB_NON_STANDARD_KERNEL, so this export survives into\
+# 20-grub.install and prevents the CLK kernel from taking over the default.\
+export GRUB_NON_STANDARD_KERNEL=true\
 /bin/kernel-install add %{KVERREL}%{?-v:+%{-v*}} /lib/modules/%{KVERREL}%{?-v:+%{-v*}}/vmlinuz%{?-u:-%{-u*}.efi} || exit $?\
 if [[ ! -e "/boot/symvers-%{KVERREL}%{?-v:+%{-v*}}.gz" ]]; then\
     cp "/lib/modules/%{KVERREL}%{?-v:+%{-v*}}/symvers.gz" "/boot/symvers-%{KVERREL}%{?-v:+%{-v*}}.gz"\
