@@ -1739,7 +1739,7 @@ static int nft_dump_basechain_hook(struct sk_buff *skb, int family,
 		if (!nest_devs)
 			goto nla_put_failure;
 
-		list_for_each_entry(hook, &basechain->hook_list, list) {
+		list_for_each_entry_rcu(hook, &basechain->hook_list, list) {
 			if (!first)
 				first = hook;
 
