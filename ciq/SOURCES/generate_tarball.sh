@@ -11,18 +11,22 @@ SOURCE_DIR="$DISTGIT_ROOT/SOURCES"
 SPEC_FILE="$DISTGIT_ROOT/SPECS/kernel-clk6.18.spec"
 
 # Extract version information from spec file
-TARFILE_RELEASE=$(grep '^%define tarfile_release' "$SPEC_FILE" | awk '{print $3}')
-SPEC_VERSION=$(grep '^%define specversion' "$SPEC_FILE" | awk '{print $3}')
+KERNEL_MAJOR_MINOR=$(grep '^%define kernel_major_minor' "$SPEC_FILE" | awk '{print $3}')
+KERNEL_PATCH=$(grep '^%define kernel_patch' "$SPEC_FILE" | awk '{print $3}')
+BUILDID=$(grep '^%define buildid' "$SPEC_FILE" | awk '{print $3}')
+PKGRELEASE=$(grep '^%define pkgrelease' "$SPEC_FILE" | awk '{print $3}')
+EL_VERSION=$(grep '^%define el_version' "$SPEC_FILE" | awk '{print $3}')
 
-if [ -z "$TARFILE_RELEASE" ]; then
-    echo "Error: Could not extract tarfile_release from $SPEC_FILE"
+if [ -z "$KERNEL_MAJOR_MINOR" ] || [ -z "$KERNEL_PATCH" ] || [ -z "$PKGRELEASE" ] || [ -z "$EL_VERSION" ]; then
+    echo "Error: Could not extract kernel version from $SPEC_FILE"
     exit 1
 fi
 
-if [ -z "$SPEC_VERSION" ]; then
-    echo "Error: Could not extract specversion from $SPEC_FILE"
-    exit 1
-fi
+# Resolve macros in pkgrelease
+PKGRELEASE=$(echo "$PKGRELEASE" | sed "s/%{?buildid}/${BUILDID}/")
+
+SPEC_VERSION="${KERNEL_MAJOR_MINOR}.${KERNEL_PATCH}"
+TARFILE_RELEASE="${SPEC_VERSION}-${PKGRELEASE}.el${EL_VERSION}"
 
 # Get current git tag and extract version
 CURRENT_TAG=$(git describe --tags --abbrev=0 2>/dev/null)
