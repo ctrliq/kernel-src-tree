@@ -1271,14 +1271,9 @@ fail:
 
 static void acpi_battery_remove(struct platform_device *pdev)
 {
-	struct acpi_device *device = ACPI_COMPANION(&pdev->dev);
 	struct acpi_battery *battery = platform_get_drvdata(pdev);
 
-	if (!device || !battery)
-		return 0;
-	device_init_wakeup(&device->dev, 0);
-
-	acpi_dev_remove_notify_handler(device, ACPI_ALL_NOTIFY,
+	acpi_dev_remove_notify_handler(battery->device, ACPI_ALL_NOTIFY,
 				       acpi_battery_notify);
 
 	device_init_wakeup(&pdev->dev, false);
