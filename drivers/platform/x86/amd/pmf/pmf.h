@@ -128,6 +128,8 @@ struct cookie_header {
 #define SET_CMD		false
 #define GET_CMD		true
 
+#define METRICS_TABLE_ID	7
+
 typedef void (*apmf_event_handler_t)(acpi_handle handle, u32 event, void *data);
 
 static const uuid_t amd_pmf_ta_uuid[] __used = { UUID_INIT(0xd9b39bf2, 0x66bd, 0x4154, 0xaf, 0xb8,
