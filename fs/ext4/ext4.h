@@ -33,7 +33,7 @@
 #include <linux/blockgroup_lock.h>
 #include <linux/percpu_counter.h>
 #include <linux/ratelimit.h>
-#include <linux/crc32c.h>
+#include <crypto/hash.h>
 #include <linux/falloc.h>
 #include <linux/percpu-rwsem.h>
 #include <linux/fiemap.h>
@@ -1675,6 +1675,9 @@ struct ext4_sb_info {
 	/* record the last minlen when FITRIM is called. */
 	unsigned long s_last_trim_minblks;
 
+	/* Reference to checksum algorithm driver via cryptoapi */
+	struct crypto_shash *s_chksum_driver;
+
 	/* Precomputed FS UUID checksum for seeding other checksums */
 	__u32 s_csum_seed;
 
@@ -2506,7 +2509,19 @@ static inline __le16 ext4_rec_len_to_disk(unsigned len, unsigned blocksize)
 static inline u32 ext4_chksum(struct ext4_sb_info *sbi, u32 crc,
 			      const void *address, unsigned int length)
 {
-	return crc32c(crc, address, length);
+	struct {
+		struct shash_desc shash;
+		char ctx[4];
+	} desc;
+
+	BUG_ON(crypto_shash_descsize(sbi->s_chksum_driver)!=sizeof(desc.ctx));
+
+	desc.shash.tfm = sbi->s_chksum_driver;
+	*(u32 *)desc.ctx = crc;
+
+	BUG_ON(crypto_shash_update(&desc.shash, address, length));
+
+	return *(u32 *)desc.ctx;
 }
 
 #ifdef __KERNEL__
@@ -3320,7 +3335,11 @@ extern int ext4_register_li_request(struct super_block *sb,
 
 static inline int ext4_has_metadata_csum(struct super_block *sb)
 {
-	return ext4_has_feature_metadata_csum(sb);
+	WARN_ON_ONCE(ext4_has_feature_metadata_csum(sb) &&
+		     !EXT4_SB(sb)->s_chksum_driver);
+
+	return ext4_has_feature_metadata_csum(sb) &&
+	       (EXT4_SB(sb)->s_chksum_driver != NULL);
 }
 
 static inline int ext4_has_group_desc_csum(struct super_block *sb)
