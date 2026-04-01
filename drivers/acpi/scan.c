@@ -2750,6 +2750,8 @@ int acpi_bus_register_early_device(int type)
 	if (result)
 		return result;
 
+	acpi_default_enumeration(device);
+
 	device->flags.match_driver = true;
 	return device_attach(&device->dev);
 }
