@@ -198,6 +198,14 @@ jobs:
           echo "skip_kselftests=$SKIP_KSELFTESTS" >> $GITHUB_OUTPUT
           echo "is_pr=$IS_PR" >> $GITHUB_OUTPUT
 
+      - name: Upload head_ref for baseline search
+        if: steps.pr_metadata.outputs.skip_ci != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: head-ref
+          path: pr_metadata/head_ref.txt
+          retention-days: 7
+
   setup:
     name: Setup matrix
     runs-on: ubuntu-latest
@@ -606,11 +614,12 @@ jobs:
 
         # Get last 50 successful workflow runs (cast a wider net to find PRs targeting this base)
         # We need to check each run to see if it targets the same base branch AND was merged
+        # The workflow always runs on mainline after the split
         SUCCESSFUL_RUNS=$(gh run list \
           --workflow kernel-build-and-test-multiarch.yml \
           --status success \
           --limit 50 \
-          --json databaseId,headBranch,createdAt)
+          --json databaseId,createdAt)
 
         if [ -z "$SUCCESSFUL_RUNS" ] || [ "$SUCCESSFUL_RUNS" = "[]" ]; then
           echo "::warning::No successful workflow runs found"
@@ -620,11 +629,38 @@ jobs:
         # Parse runs and check each one's base branch by examining branch name pattern
         while read -r run; do
           RUN_ID=$(echo "$run" | jq -r '.databaseId')
-          HEAD_BRANCH=$(echo "$run" | jq -r '.headBranch')
-          CREATED_AT=$(echo "$run" | jq -r '.createdAt')
 
           # Skip current run
           if [ "$RUN_ID" = "$CURRENT_RUN_ID" ]; then
+            continue
+          fi
+
+          # Download the head-ref artifact to read the original head_ref.
+          # This artifact is uploaded by pre-setup and is directly attached to each
+          # actual workflow run — no need to cross-reference the trigger workflow.
+          HEAD_REF_ARTIFACT_ID=$(gh api \
+            "repos/${{ github.repository }}/actions/runs/$RUN_ID/artifacts" \
+            --jq ".artifacts[] | select(.name == \"head-ref\" and .expired == false) | .id" \
+            | tail -1)
+
+          if [ -z "$HEAD_REF_ARTIFACT_ID" ]; then
+            echo "Run $RUN_ID: no head-ref artifact, skipping"
+            continue
+          fi
+
+          rm -rf /tmp/run-head-ref && mkdir -p /tmp/run-head-ref
+          if ! gh api "repos/${{ github.repository }}/actions/artifacts/$HEAD_REF_ARTIFACT_ID/zip" \
+               > /tmp/run-head-ref.zip 2>/dev/null || \
+             ! unzip -q /tmp/run-head-ref.zip -d /tmp/run-head-ref 2>/dev/null; then
+            echo "Run $RUN_ID: failed to download/extract head-ref artifact, skipping"
+            rm -f /tmp/run-head-ref.zip
+            continue
+          fi
+          rm -f /tmp/run-head-ref.zip
+
+          HEAD_BRANCH=$(cat /tmp/run-head-ref/head_ref.txt 2>/dev/null || echo "")
+          if [ -z "$HEAD_BRANCH" ]; then
+            echo "Run $RUN_ID: no head_ref.txt in artifact, skipping"
             continue
           fi
 
@@ -684,7 +720,7 @@ jobs:
         echo "::warning::No baseline test results found from merged PRs targeting $BASE_BRANCH"
         echo "::notice::This may be the first merged PR targeting this base branch, or artifacts have expired (7-day retention)"
       continue-on-error: true
-      timeout-minutes: 3
+      timeout-minutes: 5
 
     - name: Compare test results
       id: comparison
