@@ -168,7 +168,7 @@ Summary: The Linux kernel
 %define debugbuildsenabled 1
 %define el_version 9
 %define kernel_major_minor 6.18
-%define kernel_patch 19
+%define kernel_patch 20
 %define buildid .1
 %define specversion %{kernel_major_minor}.%{kernel_patch}
 %define pkgrelease 1%{?buildid}
@@ -4486,8 +4486,26 @@ fi\
 #
 #
 %changelog
-* Mon Mar 23 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.19-1.1.0.0.el9_clk
--- Rebased changes for Linux 6.18.19 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.19-1)
+* Wed Apr 01 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.18.20-1.1.el9
+-- Rebased changes for Linux 6.18.20 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.20-1)
+-- Bundle bindgen-cli from source for Rocky 9.6 builds (Jonathan Dieter)
+-- Rework -default package and clean up tool subpackage naming (Jonathan Dieter)
+-- Consolidate spec version defines and prevent CLK kernel from hijacking boot default (Jonathan Dieter)
+-- Add kernel-clk6.18-default package to set default kernel (Brett Mastbergen)
+-- Add +clk6.18 suffix to kernel version string (uname -r) (Jonathan Dieter)
+-- Use gzip for symvers compression to match upstream (Jonathan Dieter)
+-- Rename tool packages with pkg_suffix and add Provides/Conflicts (Brett Mastbergen)
+-- Add Provides/Conflicts for non-parallel installable kernel-* packages (Brett Mastbergen)
+-- Remove gemini switch (Brett Mastbergen)
+-- Rename package to kernel-clk6.18 (Brett Mastbergen)
+-- rocky: generalize rule for kunit and test kmod placement (Brett Mastbergen)
+-- Set buildid to .1 (Brett Mastbergen)
+-- Remove modules-rt-kvm references (Brett Mastbergen)
+-- Ensure all qdiscs are in modules-core (Brett Mastbergen)
+-- Update sbat templates (Brett Mastbergen)
+-- Remove gating.yaml (Brett Mastbergen)
+-- kernel.spec: Fix buildid and pkgrelease (Brett Mastbergen)
+-- Import initial dist-git for 6.18.19 (Brett Mastbergen)
 -- configs: Enable INTEL_TDX_HOST for x86_64 configs (Brett Mastbergen)
 -- [CIQ] v6.18.17 - rebased configs (github-actions[bot])
 -- [CIQ] v6.18.14 - rebased configs (github-actions[bot])
@@ -4502,8 +4520,7 @@ fi\
 -- github actions: Make Builds on Merge Request Work (Jonathan Maple)
 -- Add initial CIQ config tweaks (Brett Mastbergen)
 -- Add CIQ configs (Brett Mastbergen)
-
--- Linux 6.18.19 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.18.19)
+-- Linux 6.18.20 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.18.20)
 
 
 ###
