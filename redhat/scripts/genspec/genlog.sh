@@ -4,6 +4,14 @@ set -e
 
 LAST_MARKER=$(cat "${REDHAT}"/marker)
 clogf="$1"
+
+# For package rebuilds (e.g., kernel-automotive), the changelog is generated
+# by generate-rebuild-changelog.sh rather than from git log.
+if [[ "$SPECPACKAGE_REBUILD" == "1" ]]; then
+    echo -n > "$clogf"
+    exit 0
+fi
+
 # hide [redhat] entries from changelog
 HIDE_REDHAT=1;
 # hide entries for unsupported arches
