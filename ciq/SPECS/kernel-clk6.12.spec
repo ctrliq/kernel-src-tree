@@ -2154,7 +2154,7 @@ InitBuildVars() {
     Variant=$1
 
     # Pick the right kernel config file
-    Config=kernel-%{_target_cpu}${Variant:+-${Variant}}.config
+    Config=%{name}-%{specversion}-%{_target_cpu}${Variant:+-${Variant}}.config
     DevelDir=/usr/src/kernels/%{KVERREL}${Variant:++${Variant}}
 
     KernelVer=%{specversion}-%{release}.%{_target_cpu}+%{pkg_suffix}${Variant:++${Variant}}
