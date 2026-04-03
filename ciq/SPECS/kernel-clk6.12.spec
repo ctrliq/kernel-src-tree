@@ -1057,6 +1057,7 @@ The kernel meta package
 %define kernel_reqprovconf(o) \
 %if %{-o:0}%{!-o:1}\
 Provides: kernel = %{specversion}-%{pkg_release}\
+Provides: %{name} = %{specversion}-%{pkg_release}\
 %endif\
 Provides: %{name}-%{_target_cpu} = %{specversion}-%{pkg_release}%{uname_suffix %{?1:+%{1}}}\
 Provides: %{name}-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
@@ -1371,6 +1372,7 @@ Summary: Development package for building kernel modules to match the %{?2:%{2} 
 Provides: %{name}%{?1:-%{1}}-devel-%{_target_cpu} = %{specversion}-%{release}\
 Provides: %{name}-devel-%{_target_cpu} = %{specversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
 Provides: kernel-devel-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
+Provides: %{name}-devel-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
 Provides: installonlypkg(kernel)\
 AutoReqProv: no\
 Requires(pre): findutils\
