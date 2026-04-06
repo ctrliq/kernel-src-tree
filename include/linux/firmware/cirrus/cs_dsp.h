@@ -104,7 +104,7 @@ struct cs_dsp_coeff_ctl {
 	struct list_head list;
 	void *cache;
 	unsigned int offset;
-	size_t len;
+	unsigned int len;
 	unsigned int set:1;
 	unsigned int flags;
 	unsigned int type;
@@ -188,8 +188,8 @@ struct cs_dsp {
 
 #ifdef CONFIG_DEBUG_FS
 	struct dentry *debugfs_root;
-	char *wmfw_file_name;
-	char *bin_file_name;
+	const char *wmfw_file_name;
+	const char *bin_file_name;
 #endif
 };
 

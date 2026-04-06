@@ -1326,8 +1326,7 @@ static int skl_tplg_multi_config_set_get(struct snd_kcontrol *kcontrol,
 					 struct snd_ctl_elem_value *ucontrol,
 					 bool is_set)
 {
-	struct snd_soc_component *component =
-		snd_soc_kcontrol_component(kcontrol);
+	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
 	struct hdac_bus *bus = snd_soc_component_get_drvdata(component);
 	struct skl_dev *skl = bus_to_skl(bus);
 	struct skl_pipeline *ppl;
