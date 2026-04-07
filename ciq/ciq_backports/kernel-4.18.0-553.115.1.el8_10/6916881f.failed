@@ -1,0 +1,186 @@
+cifs: fix refresh of cached referrals
+
+jira KERNEL-814
+Rebuild_History Non-Buildable kernel-4.18.0-553.115.1.el8_10
+commit-author Paulo Alcantara <pc@cjr.nz>
+commit 6916881f443f67f6893b504fa2171468c8aed915
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.115.1.el8_10/6916881f.failed
+
+We can't rely on cifs_tcon::ses to refresh cached referral as the
+server target might not respond to referrals, e.g. share is not hosted
+in a DFS root server.  Consider the following
+
+  mount //dom/dfs/link -> /root1/dfs/link -> /fs0/share
+
+where fs0 can't get a referral for "/root1/dfs/link".
+
+To simplify and fix the access of dfs root sessions, store the dfs
+root session pointer directly to new sessions so making it easier to
+select the appropriate ipc connection and use it for failover or cache
+refresh.
+
+	Signed-off-by: Paulo Alcantara (SUSE) <pc@cjr.nz>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 6916881f443f67f6893b504fa2171468c8aed915)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/connect.c
+#	fs/cifs/dfs.c
+#	fs/cifs/dfs_cache.c
+diff --cc fs/cifs/connect.c
+index 4ce4c920af28,db3a2b3ac497..000000000000
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@@ -4521,9 -4199,35 +4522,41 @@@ static int tree_connect_dfs_target(cons
+  		}
+  
+  		scnprintf(tree, MAX_TREE_SIZE, "\\%s", share);
+++<<<<<<< HEAD
+ +		rc = ops->tree_connect(xid, tcon->ses, tree, tcon, cifs_sb->local_nls);
+ +		if (islink && !rc)
+ +			rc = cifs_update_super_prepath(cifs_sb, prefix);
+++=======
++ 		if (!islink) {
++ 			rc = ops->tree_connect(xid, tcon->ses, tree, tcon, cifs_sb->local_nls);
++ 			break;
++ 		}
++ 		/*
++ 		 * If no dfs referrals were returned from link target, then just do a TREE_CONNECT
++ 		 * to it.  Otherwise, cache the dfs referral and then mark current tcp ses for
++ 		 * reconnect so either the demultiplex thread or the echo worker will reconnect to
++ 		 * newly resolved target.
++ 		 */
++ 		if (dfs_cache_find(xid, root_ses, cifs_sb->local_nls, cifs_remap(cifs_sb), target,
++ 				   NULL, &ntl)) {
++ 			rc = ops->tree_connect(xid, tcon->ses, tree, tcon, cifs_sb->local_nls);
++ 			if (rc)
++ 				continue;
++ 			rc = dfs_cache_noreq_update_tgthint(server->current_fullpath + 1, tit);
++ 			if (!rc)
++ 				rc = cifs_update_super_prepath(cifs_sb, prefix);
++ 		} else {
++ 			/* Target is another dfs share */
++ 			rc = update_server_fullpath(server, cifs_sb, target);
++ 			dfs_cache_free_tgts(tl);
++ 
++ 			if (!rc) {
++ 				rc = -EREMOTE;
++ 				list_replace_init(&ntl.tl_list, &tl->tl_list);
++ 			} else
++ 				dfs_cache_free_tgts(&ntl);
++ 		}
+++>>>>>>> 6916881f443f (cifs: fix refresh of cached referrals)
+  		break;
+  	}
+  
+diff --cc fs/cifs/dfs_cache.c
+index f047927707aa,95cc3951420e..000000000000
+--- a/fs/cifs/dfs_cache.c
++++ b/fs/cifs/dfs_cache.c
+@@@ -82,27 -83,6 +82,30 @@@ static void refresh_cache_worker(struc
+  
+  static DECLARE_DELAYED_WORK(refresh_task, refresh_cache_worker);
+  
+++<<<<<<< HEAD
+ +static void get_ipc_unc(const char *ref_path, char *ipc, size_t ipclen)
+ +{
+ +	const char *host;
+ +	size_t len;
+ +
+ +	extract_unc_hostname(ref_path, &host, &len);
+ +	scnprintf(ipc, ipclen, "\\\\%.*s\\IPC$", (int)len, host);
+ +}
+ +
+ +static struct cifs_ses *find_ipc_from_server_path(struct cifs_ses **ses, const char *path)
+ +{
+ +	char unc[SERVER_NAME_LENGTH + sizeof("//x/IPC$")] = {0};
+ +
+ +	get_ipc_unc(path, unc, sizeof(unc));
+ +	for (; *ses; ses++) {
+ +		if (!strcasecmp(unc, (*ses)->tcon_ipc->treeName))
+ +			return *ses;
+ +	}
+ +	return ERR_PTR(-ENOENT);
+ +}
+ +
+++=======
+++>>>>>>> 6916881f443f (cifs: fix refresh of cached referrals)
+  static void __mount_group_release(struct mount_group *mg)
+  {
+  	int i;
+@@@ -1540,17 -1465,23 +1510,27 @@@ static void refresh_cache_worker(struc
+  
+  	spin_lock(&cifs_tcp_ses_lock);
+  	list_for_each_entry(server, &cifs_tcp_ses_list, tcp_ses_list) {
+ -		if (!server->leaf_fullpath)
+ +		spin_lock(&server->srv_lock);
+ +		if (!server->is_dfs_conn) {
+ +			spin_unlock(&server->srv_lock);
+  			continue;
+ +		}
+ +		spin_unlock(&server->srv_lock);
+  
+  		list_for_each_entry(ses, &server->smb_ses_list, smb_ses_list) {
++ 			struct cifs_ses *root_ses = CIFS_DFS_ROOT_SES(ses);
++ 
++ 			spin_lock(&root_ses->ses_lock);
++ 			if (root_ses->ses_status != SES_GOOD) {
++ 				spin_unlock(&root_ses->ses_lock);
++ 				continue;
++ 			}
++ 			spin_unlock(&root_ses->ses_lock);
++ 
+  			list_for_each_entry(tcon, &ses->tcon_list, tcon_list) {
+  				spin_lock(&tcon->tc_lock);
+- 				if (!tcon->ipc && !tcon->need_reconnect) {
++ 				if (!tcon->ipc && tcon->status != TID_NEW &&
++ 				    tcon->status != TID_NEED_TCON) {
+  					tcon->tc_count++;
+  					list_add_tail(&tcon->ulist, &tcons);
+  				}
+@@@ -1566,12 -1497,8 +1546,17 @@@
+  		list_del_init(&tcon->ulist);
+  
+  		mutex_lock(&server->refpath_lock);
+++<<<<<<< HEAD
+ +		if (server->origin_fullpath) {
+ +			if (server->leaf_fullpath && strcasecmp(server->leaf_fullpath,
+ +								server->origin_fullpath))
+ +				__refresh_tcon(server->leaf_fullpath + 1, sessions, tcon, false);
+ +			__refresh_tcon(server->origin_fullpath + 1, sessions, tcon, false);
+ +		}
+++=======
++ 		if (server->leaf_fullpath)
++ 			__refresh_tcon(server->leaf_fullpath + 1, tcon, false);
+++>>>>>>> 6916881f443f (cifs: fix refresh of cached referrals)
+  		mutex_unlock(&server->refpath_lock);
+  
+  		cifs_put_tcon(tcon);
+* Unmerged path fs/cifs/dfs.c
+diff --git a/fs/cifs/cifsglob.h b/fs/cifs/cifsglob.h
+index 65b96100c528..cd023e893a68 100644
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@ -105,6 +105,8 @@
+ 
+ #define CIFS_MAX_WORKSTATION_LEN  (__NEW_UTS_LEN + 1)  /* reasonable max for client */
+ 
++#define CIFS_DFS_ROOT_SES(ses) ((ses)->dfs_root_ses ?: (ses))
++
+ /*
+  * CIFS vfs client Status information (based on what we know.)
+  */
+@@ -1102,6 +1104,7 @@ struct cifs_ses {
+ 	 */
+ 	unsigned long chans_need_reconnect;
+ 	/* ========= end: protected by chan_lock ======== */
++	struct cifs_ses *dfs_root_ses;
+ };
+ 
+ static inline bool
+* Unmerged path fs/cifs/connect.c
+* Unmerged path fs/cifs/dfs.c
+* Unmerged path fs/cifs/dfs_cache.c
