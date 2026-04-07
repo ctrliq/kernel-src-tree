@@ -209,8 +209,8 @@ struct scsi_device {
 	RH_KABI_FILL_HOLE(unsigned silence_suspend:1)	/* Do not print runtime PM related messages */
 	RH_KABI_FILL_HOLE(unsigned no_vpd_size:1)	/* No VPD size reported in header */
 
-	unsigned int ua_new_media_ctr;	/* Counter for New Media UNIT ATTENTIONs */
-	unsigned int ua_por_ctr;	/* Counter for Power On / Reset UAs */
+	atomic_t ua_new_media_ctr;	/* Counter for New Media UNIT ATTENTIONs */
+	atomic_t ua_por_ctr;		/* Counter for Power On / Reset UAs */
 
 	atomic_t disk_events_disable_depth; /* disable depth for disk events */
 
@@ -627,10 +627,8 @@ static inline int scsi_device_busy(struct scsi_device *sdev)
 }
 
 /* Macros to access the UNIT ATTENTION counters */
-#define scsi_get_ua_new_media_ctr(sdev) \
-	((const unsigned int)(sdev->ua_new_media_ctr))
-#define scsi_get_ua_por_ctr(sdev) \
-	((const unsigned int)(sdev->ua_por_ctr))
+#define scsi_get_ua_new_media_ctr(sdev)	atomic_read(&sdev->ua_new_media_ctr)
+#define scsi_get_ua_por_ctr(sdev)	atomic_read(&sdev->ua_por_ctr)
 
 #define MODULE_ALIAS_SCSI_DEVICE(type) \
 	MODULE_ALIAS("scsi:t-" __stringify(type) "*")
