@@ -128,7 +128,7 @@ static void copy_hashes_authenticate_chunks(struct work_struct *work)
 	ifsd = ifs_get_data(dev);
 	msrs = ifs_get_test_msrs(dev);
 	/* run scan hash copy */
-	wrmsrl(msrs->copy_hashes, ifs_hash_ptr);
+	wrmsrq(msrs->copy_hashes, ifs_hash_ptr);
 	rdmsrq(msrs->copy_hashes_status, hashes_status.data);
 
 	/* enumerate the scan image information */
@@ -150,7 +150,7 @@ static void copy_hashes_authenticate_chunks(struct work_struct *work)
 		linear_addr = base + i * chunk_size;
 		linear_addr |= i;
 
-		wrmsrl(msrs->copy_chunks, linear_addr);
+		wrmsrq(msrs->copy_chunks, linear_addr);
 		rdmsrq(msrs->copy_chunks_status, chunk_status.data);
 
 		ifsd->valid_chunks = chunk_status.valid_chunks;
@@ -196,7 +196,7 @@ static int copy_hashes_authenticate_chunks_gen2(struct device *dev)
 	msrs = ifs_get_test_msrs(dev);
 
 	if (need_copy_scan_hashes(ifsd)) {
-		wrmsrl(msrs->copy_hashes, ifs_hash_ptr);
+		wrmsrq(msrs->copy_hashes, ifs_hash_ptr);
 		rdmsrq(msrs->copy_hashes_status, hashes_status.data);
 
 		/* enumerate the scan image information */
@@ -217,7 +217,7 @@ static int copy_hashes_authenticate_chunks_gen2(struct device *dev)
 	}
 
 	if (ifsd->generation >= IFS_GEN_STRIDE_AWARE) {
-		wrmsrl(msrs->test_ctrl, INVALIDATE_STRIDE);
+		wrmsrq(msrs->test_ctrl, INVALIDATE_STRIDE);
 		rdmsrq(msrs->copy_chunks_status, chunk_status.data);
 		if (chunk_status.valid_chunks != 0) {
 			dev_err(dev, "Couldn't invalidate installed stride - %d\n",
@@ -239,7 +239,7 @@ static int copy_hashes_authenticate_chunks_gen2(struct device *dev)
 		chunk_table[1] = linear_addr;
 		do {
 			local_irq_disable();
-			wrmsrl(msrs->copy_chunks, (u64)chunk_table);
+			wrmsrq(msrs->copy_chunks, (u64)chunk_table);
 			local_irq_enable();
 			rdmsrq(msrs->copy_chunks_status, chunk_status.data);
 			err_code = chunk_status.error_code;
