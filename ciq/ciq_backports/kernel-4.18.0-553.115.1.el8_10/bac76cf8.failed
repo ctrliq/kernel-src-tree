@@ -1,0 +1,146 @@
+tcp: fix forever orphan socket caused by tcp_abort
+
+jira KERNEL-814
+Rebuild_History Non-Buildable kernel-4.18.0-553.115.1.el8_10
+commit-author Xueming Feng <kuro@kuroa.me>
+commit bac76cf89816bff06c4ec2f3df97dc34e150a1c4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.115.1.el8_10/bac76cf8.failed
+
+We have some problem closing zero-window fin-wait-1 tcp sockets in our
+environment. This patch come from the investigation.
+
+Previously tcp_abort only sends out reset and calls tcp_done when the
+socket is not SOCK_DEAD, aka orphan. For orphan socket, it will only
+purging the write queue, but not close the socket and left it to the
+timer.
+
+While purging the write queue, tp->packets_out and sk->sk_write_queue
+is cleared along the way. However tcp_retransmit_timer have early
+return based on !tp->packets_out and tcp_probe_timer have early
+return based on !sk->sk_write_queue.
+
+This caused ICSK_TIME_RETRANS and ICSK_TIME_PROBE0 not being resched
+and socket not being killed by the timers, converting a zero-windowed
+orphan into a forever orphan.
+
+This patch removes the SOCK_DEAD check in tcp_abort, making it send
+reset to peer and close the socket accordingly. Preventing the
+timer-less orphan from happening.
+
+According to Lorenzo's email in the v1 thread, the check was there to
+prevent force-closing the same socket twice. That situation is handled
+by testing for TCP_CLOSE inside lock, and returning -ENOENT if it is
+already closed.
+
+The -ENOENT code comes from the associate patch Lorenzo made for
+iproute2-ss; link attached below, which also conform to RFC 9293.
+
+At the end of the patch, tcp_write_queue_purge(sk) is removed because it
+was already called in tcp_done_with_error().
+
+p.s. This is the same patch with v2. Resent due to mis-labeled "changes
+requested" on patchwork.kernel.org.
+
+Link: https://patchwork.ozlabs.org/project/netdev/patch/1450773094-7978-3-git-send-email-lorenzo@google.com/
+Fixes: c1e64e298b8c ("net: diag: Support destroying TCP sockets.")
+	Signed-off-by: Xueming Feng <kuro@kuroa.me>
+	Tested-by: Lorenzo Colitti <lorenzo@google.com>
+	Reviewed-by: Jason Xing <kerneljasonxing@gmail.com>
+	Reviewed-by: Eric Dumazet <edumazet@google.com>
+Link: https://patch.msgid.link/20240826102327.1461482-1-kuro@kuroa.me
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit bac76cf89816bff06c4ec2f3df97dc34e150a1c4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp.c
+diff --cc net/ipv4/tcp.c
+index dc110d95dffb,831a18dc7aa6..000000000000
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@@ -4061,21 -4612,38 +4061,28 @@@ EXPORT_SYMBOL_GPL(tcp_done)
+  
+  int tcp_abort(struct sock *sk, int err)
+  {
+ -	int state = inet_sk_state_load(sk);
+ -
+ -	if (state == TCP_NEW_SYN_RECV) {
+ -		struct request_sock *req = inet_reqsk(sk);
+ +	if (!sk_fullsock(sk)) {
+ +		if (sk->sk_state == TCP_NEW_SYN_RECV) {
+ +			struct request_sock *req = inet_reqsk(sk);
+  
+ -		local_bh_disable();
+ -		inet_csk_reqsk_queue_drop(req->rsk_listener, req);
+ -		local_bh_enable();
+ -		return 0;
+ -	}
+ -	if (state == TCP_TIME_WAIT) {
+ -		struct inet_timewait_sock *tw = inet_twsk(sk);
+ -
+ -		refcount_inc(&tw->tw_refcnt);
+ -		local_bh_disable();
+ -		inet_twsk_deschedule_put(tw);
+ -		local_bh_enable();
+ -		return 0;
+ +			local_bh_disable();
+ +			inet_csk_reqsk_queue_drop(req->rsk_listener, req);
+ +			local_bh_enable();
+ +			return 0;
+ +		}
+ +		return -EOPNOTSUPP;
+  	}
+  
+ -	/* BPF context ensures sock locking. */
+ -	if (!has_current_bpf_ctx())
+ -		/* Don't race with userspace socket closes such as tcp_close. */
+ -		lock_sock(sk);
+ +	/* Don't race with userspace socket closes such as tcp_close. */
+ +	lock_sock(sk);
+  
++ 	/* Avoid closing the same socket twice. */
++ 	if (sk->sk_state == TCP_CLOSE) {
++ 		if (!has_current_bpf_ctx())
++ 			release_sock(sk);
++ 		return -ENOENT;
++ 	}
++ 
+  	if (sk->sk_state == TCP_LISTEN) {
+  		tcp_set_state(sk, TCP_CLOSE);
+  		inet_csk_listen_stop(sk);
+@@@ -4085,20 -4653,15 +4092,32 @@@
+  	local_bh_disable();
+  	bh_lock_sock(sk);
+  
+++<<<<<<< HEAD
+ +	if (!sock_flag(sk, SOCK_DEAD)) {
+ +		sk->sk_err = err;
+ +		/* This barrier is coupled with smp_rmb() in tcp_poll() */
+ +		smp_wmb();
+ +		sk_error_report(sk);
+ +		if (tcp_need_reset(sk->sk_state))
+ +			tcp_send_active_reset(sk, GFP_ATOMIC);
+ +		tcp_done(sk);
+ +	}
+ +
+ +	bh_unlock_sock(sk);
+ +	local_bh_enable();
+ +	tcp_write_queue_purge(sk);
+ +	release_sock(sk);
+++=======
++ 	if (tcp_need_reset(sk->sk_state))
++ 		tcp_send_active_reset(sk, GFP_ATOMIC,
++ 				      SK_RST_REASON_NOT_SPECIFIED);
++ 	tcp_done_with_error(sk, err);
++ 
++ 	bh_unlock_sock(sk);
++ 	local_bh_enable();
++ 	if (!has_current_bpf_ctx())
++ 		release_sock(sk);
+++>>>>>>> bac76cf89816 (tcp: fix forever orphan socket caused by tcp_abort)
+  	return 0;
+  }
+  EXPORT_SYMBOL_GPL(tcp_abort);
+* Unmerged path net/ipv4/tcp.c
