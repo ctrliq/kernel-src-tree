@@ -1,0 +1,216 @@
+cifs: use origin fullpath for automounts
+
+jira KERNEL-814
+Rebuild_History Non-Buildable kernel-4.18.0-553.115.1.el8_10
+commit-author Paulo Alcantara <pc@cjr.nz>
+commit 7ad54b98fc1f141cfb70cfe2a3d6def5a85169ff
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.115.1.el8_10/7ad54b98.failed
+
+Use TCP_Server_Info::origin_fullpath instead of cifs_tcon::tree_name
+when building source paths for automounts as it will be useful for
+domain-based DFS referrals where the connections and referrals would
+get either re-used from the cache or re-created when chasing the dfs
+link.
+
+	Signed-off-by: Paulo Alcantara (SUSE) <pc@cjr.nz>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 7ad54b98fc1f141cfb70cfe2a3d6def5a85169ff)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/cifs_dfs_ref.c
+#	fs/cifs/dfs.h
+#	fs/cifs/dir.c
+diff --cc fs/cifs/cifs_dfs_ref.c
+index e0edfc02f320,2b1a8d55b4ec..000000000000
+--- a/fs/cifs/cifs_dfs_ref.c
++++ b/fs/cifs/cifs_dfs_ref.c
+@@@ -122,128 -118,15 +121,140 @@@ cifs_build_devname(char *nodename, cons
+  	return dev;
+  }
+  
+++<<<<<<< HEAD
+ +
+ +/**
+ + * cifs_compose_mount_options	-	creates mount options for referral
+ + * @sb_mountdata:	parent/root DFS mount options (template)
+ + * @fullpath:		full path in UNC format
+ + * @ref:		optional server's referral
+ + * @devname:		return the built cifs device name if passed pointer not NULL
+ + * creates mount options for submount based on template options sb_mountdata
+ + * and replacing unc,ip,prefixpath options with ones we've got form ref_unc.
+ + *
+ + * Returns: pointer to new mount options or ERR_PTR.
+ + * Caller is responsible for freeing returned value if it is not error.
+ + */
+ +char *cifs_compose_mount_options(const char *sb_mountdata,
+ +				 const char *fullpath,
+ +				 const struct dfs_info3_param *ref,
+ +				 char **devname)
+ +{
+ +	int rc;
+ +	char *name;
+ +	char *mountdata = NULL;
+ +	const char *prepath = NULL;
+ +	int md_len;
+ +	const char *start, *end;
+ +	char *srvIP = NULL;
+ +	char sep = ',';
+ +
+ +	if (sb_mountdata == NULL)
+ +		return ERR_PTR(-EINVAL);
+ +
+ +	if (ref) {
+ +		if (WARN_ON_ONCE(!ref->node_name || ref->path_consumed < 0))
+ +			return ERR_PTR(-EINVAL);
+ +
+ +		if (strlen(fullpath) - ref->path_consumed) {
+ +			prepath = fullpath + ref->path_consumed;
+ +			/* skip initial delimiter */
+ +			if (*prepath == '/' || *prepath == '\\')
+ +				prepath++;
+ +		}
+ +
+ +		name = cifs_build_devname(ref->node_name, prepath);
+ +		if (IS_ERR(name)) {
+ +			rc = PTR_ERR(name);
+ +			name = NULL;
+ +			goto compose_mount_options_err;
+ +		}
+ +	} else {
+ +		name = cifs_build_devname((char *)fullpath, NULL);
+ +		if (IS_ERR(name)) {
+ +			rc = PTR_ERR(name);
+ +			name = NULL;
+ +			goto compose_mount_options_err;
+ +		}
+ +	}
+ +
+ +	rc = dns_resolve_server_name_to_ip(name, &srvIP, NULL);
+ +	if (rc < 0) {
+ +		cifs_dbg(FYI, "%s: Failed to resolve server part of %s to IP: %d\n",
+ +			 __func__, name, rc);
+ +		goto compose_mount_options_err;
+ +	}
+ +
+ +	/*
+ +	 * In most cases, we'll be building a shorter string than the original,
+ +	 * but we do have to assume that the address in the ip= option may be
+ +	 * much longer than the original. Add the max length of an address
+ +	 * string to the length of the original string to allow for worst case.
+ +	 */
+ +	md_len = strlen(sb_mountdata) + INET6_ADDRSTRLEN;
+ +	mountdata = kzalloc(md_len + sizeof("ip=") + 1, GFP_KERNEL);
+ +	if (mountdata == NULL) {
+ +		rc = -ENOMEM;
+ +		goto compose_mount_options_err;
+ +	}
+ +
+ +	/* copy all options except of unc,ip,prefixpath,cruid */
+ +	start = end = sb_mountdata;
+ +	for (;;) {
+ +		end = strchrnul(end, sep);
+ +		while (*end && end[0] == sep && end[1] == sep)
+ +			end += 2;
+ +
+ +		if (strncasecmp(start, "prefixpath=", 11) == 0 ||
+ +		    strncasecmp(start, "cruid=", 6) == 0 ||
+ +		    strncasecmp(start, "unc=", 4) == 0 ||
+ +		    strncasecmp(start, "ip=", 3) == 0)
+ +			goto next_opt;
+ +
+ +		if (*mountdata)
+ +			strncat(mountdata, &sep, 1);
+ +		strncat(mountdata, start, end - start);
+ +next_opt:
+ +		if (!*end)
+ +			break;
+ +		start = ++end;
+ +	}
+ +	mountdata[md_len] = '\0';
+ +
+ +	/* copy new IP and ref share name */
+ +	if (*mountdata)
+ +		strncat(mountdata, &sep, 1);
+ +	strcat(mountdata, "ip=");
+ +	strcat(mountdata, srvIP);
+ +
+ +	if (devname)
+ +		*devname = name;
+ +	else
+ +		kfree(name);
+ +
+ +	cifs_dbg(FYI, "%s: parent mountdata: %s\n", __func__, sb_mountdata);
+ +	cifs_dbg(FYI, "%s: submount mountdata: %s\n", __func__, mountdata);
+ +
+ +compose_mount_options_out:
+ +	kfree(srvIP);
+ +	return mountdata;
+ +
+ +compose_mount_options_err:
+ +	kfree(mountdata);
+ +	mountdata = ERR_PTR(rc);
+ +	kfree(name);
+ +	goto compose_mount_options_out;
+++=======
++ static int set_dest_addr(struct smb3_fs_context *ctx, const char *full_path)
++ {
++ 	struct sockaddr *addr = (struct sockaddr *)&ctx->dstaddr;
++ 	int rc;
++ 
++ 	rc = dns_resolve_server_name_to_ip(full_path, addr, NULL);
++ 	if (!rc)
++ 		cifs_set_port(addr, ctx->port);
++ 	return rc;
+++>>>>>>> 7ad54b98fc1f (cifs: use origin fullpath for automounts)
+  }
+  
+  /*
+diff --cc fs/cifs/dir.c
+index 82b8a84d4180,ad4208bf1e32..000000000000
+--- a/fs/cifs/dir.c
++++ b/fs/cifs/dir.c
+@@@ -91,7 -92,7 +90,11 @@@ char *__build_path_from_dentry_optional
+  		return ERR_PTR(-ENOMEM);
+  
+  	if (prefix)
+++<<<<<<< HEAD
+ +		dfsplen = strnlen(tcon->treeName, MAX_TREE_SIZE + 1);
+++=======
++ 		dfsplen = strnlen(tree, tree_len + 1);
+++>>>>>>> 7ad54b98fc1f (cifs: use origin fullpath for automounts)
+  	else
+  		dfsplen = 0;
+  
+@@@ -121,7 -122,7 +124,11 @@@
+  	}
+  	if (dfsplen) {
+  		s -= dfsplen;
+++<<<<<<< HEAD
+ +		memcpy(s, tcon->treeName, dfsplen);
+++=======
++ 		memcpy(s, tree, dfsplen);
+++>>>>>>> 7ad54b98fc1f (cifs: use origin fullpath for automounts)
+  		if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_POSIX_PATHS) {
+  			int i;
+  			for (i = 0; i < dfsplen; i++) {
+* Unmerged path fs/cifs/dfs.h
+* Unmerged path fs/cifs/cifs_dfs_ref.c
+diff --git a/fs/cifs/cifsproto.h b/fs/cifs/cifsproto.h
+index 054815560eda..b4bbd4fc0626 100644
+--- a/fs/cifs/cifsproto.h
++++ b/fs/cifs/cifsproto.h
+@@ -57,6 +57,9 @@ extern void exit_cifs_idmap(void);
+ extern int init_cifs_spnego(void);
+ extern void exit_cifs_spnego(void);
+ extern const char *build_path_from_dentry(struct dentry *, void *);
++char *__build_path_from_dentry_optional_prefix(struct dentry *direntry, void *page,
++					       const char *tree, int tree_len,
++					       bool prefix);
+ extern char *build_path_from_dentry_optional_prefix(struct dentry *direntry,
+ 						    void *page, bool prefix);
+ static inline void *alloc_dentry_path(void)
+* Unmerged path fs/cifs/dfs.h
+* Unmerged path fs/cifs/dir.c
