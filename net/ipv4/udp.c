@@ -1533,17 +1533,11 @@ static void udp_skb_dtor_locked(struct sock *sk, struct sk_buff *skb)
  * to relieve pressure on the receive_queue spinlock shared by consumer.
  * Under flood, this means that only one producer can be in line
  * trying to acquire the receive_queue spinlock.
- * These busylock can be allocated on a per cpu manner, instead of a
- * per socket one (that would consume a cache line per socket)
  */
-static int udp_busylocks_log __read_mostly;
-static spinlock_t *udp_busylocks __read_mostly;
-
-static spinlock_t *busylock_acquire(void *ptr)
+static spinlock_t *busylock_acquire(struct sock *sk)
 {
-	spinlock_t *busy;
+	spinlock_t *busy = &udp_sk(sk)->busylock;
 
-	busy = udp_busylocks + hash_ptr(ptr, udp_busylocks_log);
 	spin_lock(busy);
 	return busy;
 }
@@ -1583,8 +1577,8 @@ int __udp_enqueue_schedule_skb(struct sock *sk, struct sk_buff *skb)
 		if (rcvbuf > INT_MAX >> 1)
 			goto drop;
 
-		/* Always allow at least one packet for small buffer. */
-		if (rmem > rcvbuf)
+		/* Accept the packet if queue is empty. */
+		if (rmem)
 			goto drop;
 	}
 
@@ -1597,12 +1591,15 @@ int __udp_enqueue_schedule_skb(struct sock *sk, struct sk_buff *skb)
 	if (rmem > (rcvbuf >> 1)) {
 		skb_condense(skb);
 		size = skb->truesize;
+		rmem = atomic_add_return(size, &sk->sk_rmem_alloc);
+		if (rmem > rcvbuf)
+			goto uncharge_drop;
 		busy = busylock_acquire(sk);
+	} else {
+		atomic_add(size, &sk->sk_rmem_alloc);
 	}
 
 	udp_set_dev_scratch(skb);
-
-	atomic_add(size, &sk->sk_rmem_alloc);
 
 	spin_lock(&list->lock);
 	err = udp_rmem_schedule(sk, size);
@@ -1631,7 +1628,7 @@ uncharge_drop:
 	atomic_sub(skb->truesize, &sk->sk_rmem_alloc);
 
 drop:
-	sk_drops_inc(sk);
+	udp_drops_inc(sk);
 	busylock_release(busy);
 	return err;
 }
@@ -1672,6 +1669,12 @@ void skb_consume_udp(struct sock *sk, struct sk_buff *skb, int len)
 	if (unlikely(READ_ONCE(udp_sk(sk)->peeking_with_offset)))
 		sk_peek_offset_bwd(sk, len);
 
+	if (!skb_shared(skb)) {
+		skb_orphan(skb);
+		skb_attempt_defer_free(skb);
+		return;
+	}
+
 	if (!skb_unref(skb))
 		return;
 
@@ -1696,7 +1699,7 @@ static struct sk_buff *__first_packet_length(struct sock *sk,
 					IS_UDPLITE(sk));
 			__UDP_INC_STATS(sock_net(sk), UDP_MIB_INERRORS,
 					IS_UDPLITE(sk));
-			sk_drops_inc(sk);
+			udp_drops_inc(sk);
 			__skb_unlink(skb, rcvq);
 			*total += skb->truesize;
 			kfree_skb_reason(skb, SKB_DROP_REASON_UDP_CSUM);
@@ -1852,7 +1855,7 @@ try_again:
 
 		__UDP_INC_STATS(net, UDP_MIB_CSUMERRORS, is_udplite);
 		__UDP_INC_STATS(net, UDP_MIB_INERRORS, is_udplite);
-		sk_drops_inc(sk);
+		udp_drops_inc(sk);
 		kfree_skb_reason(skb, SKB_DROP_REASON_UDP_CSUM);
 		goto try_again;
 	}
@@ -1922,7 +1925,7 @@ try_again:
 
 	if (unlikely(err)) {
 		if (!peeking) {
-			sk_drops_inc(sk);
+			udp_drops_inc(sk);
 			UDP_INC_STATS(sock_net(sk),
 				      UDP_MIB_INERRORS, is_udplite);
 		}
@@ -2251,7 +2254,7 @@ csum_error:
 	__UDP_INC_STATS(sock_net(sk), UDP_MIB_CSUMERRORS, is_udplite);
 drop:
 	__UDP_INC_STATS(sock_net(sk), UDP_MIB_INERRORS, is_udplite);
-	sk_drops_inc(sk);
+	udp_drops_inc(sk);
 	sk_skb_reason_drop(sk, skb, drop_reason);
 	return -1;
 }
@@ -2336,7 +2339,7 @@ start_lookup:
 		nskb = skb_clone(skb, GFP_ATOMIC);
 
 		if (unlikely(!nskb)) {
-			sk_drops_inc(sk);
+			udp_drops_inc(sk);
 			__UDP_INC_STATS(net, UDP_MIB_RCVBUFERRORS,
 					IS_UDPLITE(sk));
 			__UDP_INC_STATS(net, UDP_MIB_INERRORS,
@@ -3698,7 +3701,6 @@ static void __init bpf_iter_register(void)
 void __init udp_init(void)
 {
 	unsigned long limit;
-	unsigned int i;
 
 	udp_table_init(&udp_table, "UDP");
 	limit = nr_free_buffer_pages() / 8;
@@ -3706,15 +3708,6 @@ void __init udp_init(void)
 	sysctl_udp_mem[0] = limit / 4 * 3;
 	sysctl_udp_mem[1] = limit;
 	sysctl_udp_mem[2] = sysctl_udp_mem[0] * 2;
-
-	/* 16 spinlocks per cpu */
-	udp_busylocks_log = ilog2(nr_cpu_ids) + 4;
-	udp_busylocks = kmalloc(sizeof(spinlock_t) << udp_busylocks_log,
-				GFP_KERNEL);
-	if (!udp_busylocks)
-		panic("UDP: failed to alloc udp_busylocks\n");
-	for (i = 0; i < (1U << udp_busylocks_log); i++)
-		spin_lock_init(udp_busylocks + i);
 
 	if (register_pernet_subsys(&udp_sysctl_ops))
 		panic("UDP: failed to init sysctl parameters.\n");
