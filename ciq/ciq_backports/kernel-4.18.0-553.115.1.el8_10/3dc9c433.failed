@@ -1,0 +1,137 @@
+cifs: protect access of TCP_Server_Info::{origin,leaf}_fullpath
+
+jira KERNEL-814
+Rebuild_History Non-Buildable kernel-4.18.0-553.115.1.el8_10
+commit-author Paulo Alcantara <pc@manguebit.com>
+commit 3dc9c433c9dde15477d02b609ccb4328e2adb6dc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.115.1.el8_10/3dc9c433.failed
+
+Protect access of TCP_Server_Info::{origin,leaf}_fullpath when
+matching DFS connections, and get rid of
+TCP_Server_Info::current_fullpath while we're at it.
+
+	Cc: stable@vger.kernel.org # v6.2+
+	Signed-off-by: Paulo Alcantara (SUSE) <pc@manguebit.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 3dc9c433c9dde15477d02b609ccb4328e2adb6dc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/cifsglob.h
+#	fs/cifs/connect.c
+#	fs/cifs/dfs.c
+#	fs/cifs/dfs.h
+#	fs/cifs/dfs_cache.c
+diff --cc fs/cifs/cifsglob.h
+index 65b96100c528,a62447404851..000000000000
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@@ -737,24 -734,32 +737,34 @@@ struct TCP_Server_Info 
+  	bool use_swn_dstaddr;
+  	struct sockaddr_storage swn_dstaddr;
+  #endif
+ +#ifdef CONFIG_CIFS_DFS_UPCALL
+ +	bool is_dfs_conn; /* if a dfs connection */
+  	struct mutex refpath_lock; /* protects leaf_fullpath */
+  	/*
+- 	 * Canonical DFS full paths that were used to chase referrals in mount and reconnect.
++ 	 * origin_fullpath: Canonical copy of smb3_fs_context::source.
++ 	 *                  It is used for matching existing DFS tcons.
+  	 *
+- 	 * origin_fullpath: first or original referral path
+- 	 * leaf_fullpath: last referral path (might be changed due to nested links in reconnect)
++ 	 * leaf_fullpath: Canonical DFS referral path related to this
++ 	 *                connection.
++ 	 *                It is used in DFS cache refresher, reconnect and may
++ 	 *                change due to nested DFS links.
+  	 *
+- 	 * current_fullpath: pointer to either origin_fullpath or leaf_fullpath
+- 	 * NOTE: cannot be accessed outside cifs_reconnect() and smb2_reconnect()
++ 	 * Both protected by @refpath_lock and @srv_lock.  The @refpath_lock is
++ 	 * mosly used for not requiring a copy of @leaf_fullpath when getting
++ 	 * cached or new DFS referrals (which might also sleep during I/O).
++ 	 * While @srv_lock is held for making string and NULL comparions against
++ 	 * both fields as in mount(2) and cache refresh.
+  	 *
+- 	 * format: \\HOST\SHARE\[OPTIONAL PATH]
++ 	 * format: \\HOST\SHARE[\OPTIONAL PATH]
+  	 */
+++<<<<<<< HEAD
+ +	char *origin_fullpath, *leaf_fullpath, *current_fullpath;
+ +#endif
+++=======
++ 	char *origin_fullpath, *leaf_fullpath;
+++>>>>>>> 3dc9c433c9dd (cifs: protect access of TCP_Server_Info::{origin,leaf}_fullpath)
+  };
+  
+ -static inline bool is_smb1(struct TCP_Server_Info *server)
+ -{
+ -	return HEADER_PREAMBLE_SIZE(server) != 0;
+ -}
+ -
+  static inline void cifs_server_lock(struct TCP_Server_Info *server)
+  {
+  	unsigned int nofs_flag = memalloc_nofs_save();
+diff --cc fs/cifs/connect.c
+index a7a4a25fafa3,9451b1023af8..000000000000
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@@ -535,9 -513,9 +536,15 @@@ static int reconnect_dfs_server(struct 
+  		mod_delayed_work(cifsiod_wq, &server->reconnect, 0);
+  	} while (server->tcpStatus == CifsNeedReconnect);
+  
+++<<<<<<< HEAD
+ +	if (target_hint)
+ +		dfs_cache_noreq_update_tgthint(refpath, target_hint);
+ +
+++=======
++ 	mutex_lock(&server->refpath_lock);
++ 	dfs_cache_noreq_update_tgthint(server->leaf_fullpath + 1, target_hint);
++ 	mutex_unlock(&server->refpath_lock);
+++>>>>>>> 3dc9c433c9dd (cifs: protect access of TCP_Server_Info::{origin,leaf}_fullpath)
+  	dfs_cache_free_tgts(&tl);
+  
+  	/* Need to set up echo worker again once connection has been established */
+@@@ -1551,6 -1579,14 +1558,17 @@@ cifs_get_tcp_session(struct smb3_fs_con
+  		goto out_err;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (ctx->leaf_fullpath) {
++ 		tcp_ses->leaf_fullpath = kstrdup(ctx->leaf_fullpath, GFP_KERNEL);
++ 		if (!tcp_ses->leaf_fullpath) {
++ 			rc = -ENOMEM;
++ 			goto out_err;
++ 		}
++ 	}
++ 
+++>>>>>>> 3dc9c433c9dd (cifs: protect access of TCP_Server_Info::{origin,leaf}_fullpath)
+  	if (ctx->nosharesock)
+  		tcp_ses->nosharesock = true;
+  
+diff --cc fs/cifs/dfs_cache.c
+index cb493cdef4ba,6557d7b2798a..000000000000
+--- a/fs/cifs/dfs_cache.c
++++ b/fs/cifs/dfs_cache.c
+@@@ -1540,7 -1279,7 +1540,11 @@@ static void refresh_mounts(struct cifs_
+  	spin_lock(&cifs_tcp_ses_lock);
+  	list_for_each_entry(server, &cifs_tcp_ses_list, tcp_ses_list) {
+  		spin_lock(&server->srv_lock);
+++<<<<<<< HEAD
+ +		if (!server->is_dfs_conn) {
+++=======
++ 		if (!server->leaf_fullpath) {
+++>>>>>>> 3dc9c433c9dd (cifs: protect access of TCP_Server_Info::{origin,leaf}_fullpath)
+  			spin_unlock(&server->srv_lock);
+  			continue;
+  		}
+* Unmerged path fs/cifs/dfs.c
+* Unmerged path fs/cifs/dfs.h
+* Unmerged path fs/cifs/cifsglob.h
+* Unmerged path fs/cifs/connect.c
+* Unmerged path fs/cifs/dfs.c
+* Unmerged path fs/cifs/dfs.h
+* Unmerged path fs/cifs/dfs_cache.c
