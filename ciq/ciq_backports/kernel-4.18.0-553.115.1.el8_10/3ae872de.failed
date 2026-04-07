@@ -1,0 +1,495 @@
+smb: client: fix shared DFS root mounts with different prefixes
+
+jira KERNEL-814
+Rebuild_History Non-Buildable kernel-4.18.0-553.115.1.el8_10
+commit-author Paulo Alcantara <pc@manguebit.com>
+commit 3ae872de410751fe5e629e04da491a632d95201c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.115.1.el8_10/3ae872de.failed
+
+When having two DFS root mounts that are connected to same namespace,
+same mount options but different prefix paths, we can't really use the
+shared @server->origin_fullpath when chasing DFS links in them.
+
+Move the origin_fullpath field to cifs_tcon structure so when having
+shared DFS root mounts with different prefix paths, and we need to
+chase any DFS links, dfs_get_automount_devname() will pick up the
+correct full path out of the @tcon that will be used for the new
+mount.
+
+Before patch
+
+  mount.cifs //dom/dfs/dir /mnt/1 -o ...
+  mount.cifs //dom/dfs /mnt/2 -o ...
+  # shared server, ses, tcon
+  # server: origin_fullpath=//dom/dfs/dir
+
+  # @server->origin_fullpath + '/dir/link1'
+  $ ls /mnt/2/dir/link1
+  ls: cannot open directory '/mnt/2/dir/link1': No such file or directory
+
+After patch
+
+  mount.cifs //dom/dfs/dir /mnt/1 -o ...
+  mount.cifs //dom/dfs /mnt/2 -o ...
+  # shared server & ses
+  # tcon_1: origin_fullpath=//dom/dfs/dir
+  # tcon_2: origin_fullpath=//dom/dfs
+
+  # @tcon_2->origin_fullpath + '/dir/link1'
+  $ ls /mnt/2/dir/link1
+  dir0  dir1  dir10  dir3  dir5  dir6  dir7  dir9  target2_file.txt  tsub
+
+Fixes: 8e3554150d6c ("cifs: fix sharing of DFS connections")
+	Signed-off-by: Paulo Alcantara (SUSE) <pc@manguebit.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 3ae872de410751fe5e629e04da491a632d95201c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/cifs_debug.c
+#	fs/cifs/cifsglob.h
+#	fs/cifs/connect.c
+#	fs/cifs/dfs_cache.c
+#	fs/cifs/misc.c
+#	fs/smb/client/dfs.c
+#	fs/smb/client/dfs.h
+diff --cc fs/cifs/cifs_debug.c
+index b37ad18239f1,fb4162a52844..000000000000
+--- a/fs/cifs/cifs_debug.c
++++ b/fs/cifs/cifs_debug.c
+@@@ -131,9 -118,16 +131,15 @@@ static void cifs_debug_tcon(struct seq_
+  		tcon->ses->server->ops->dump_share_caps(m, tcon);
+  	if (tcon->use_witness)
+  		seq_puts(m, " Witness");
+ -	if (tcon->broken_sparse_sup)
+ -		seq_puts(m, " nosparse");
+ +
+  	if (tcon->need_reconnect)
+  		seq_puts(m, "\tDISCONNECTED ");
++ 	spin_lock(&tcon->tc_lock);
++ 	if (tcon->origin_fullpath) {
++ 		seq_printf(m, "\n\tDFS origin fullpath: %s",
++ 			   tcon->origin_fullpath);
++ 	}
++ 	spin_unlock(&tcon->tc_lock);
+  	seq_putc(m, '\n');
+  }
+  
+@@@ -398,6 -434,10 +404,13 @@@ skip_rdma
+  		seq_printf(m, "\nIn Send: %d In MaxReq Wait: %d",
+  				atomic_read(&server->in_send),
+  				atomic_read(&server->num_waiters));
+++<<<<<<< HEAD:fs/cifs/cifs_debug.c
+++=======
++ 		if (server->leaf_fullpath) {
++ 			seq_printf(m, "\nDFS leaf full path: %s",
++ 				   server->leaf_fullpath);
++ 		}
+++>>>>>>> 3ae872de4107 (smb: client: fix shared DFS root mounts with different prefixes):fs/smb/client/cifs_debug.c
+  
+  		seq_printf(m, "\n\n\tSessions: ");
+  		i = 0;
+diff --cc fs/cifs/cifsglob.h
+index ee8d82174e1b,ca2da713c5fe..000000000000
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@@ -737,24 -734,29 +737,41 @@@ struct TCP_Server_Info 
+  	bool use_swn_dstaddr;
+  	struct sockaddr_storage swn_dstaddr;
+  #endif
+ +#ifdef CONFIG_CIFS_DFS_UPCALL
+ +	bool is_dfs_conn; /* if a dfs connection */
+  	struct mutex refpath_lock; /* protects leaf_fullpath */
+  	/*
+++<<<<<<< HEAD:fs/cifs/cifsglob.h
+ +	 * Canonical DFS full paths that were used to chase referrals in mount and reconnect.
+ +	 *
+ +	 * origin_fullpath: first or original referral path
+ +	 * leaf_fullpath: last referral path (might be changed due to nested links in reconnect)
+ +	 *
+ +	 * current_fullpath: pointer to either origin_fullpath or leaf_fullpath
+ +	 * NOTE: cannot be accessed outside cifs_reconnect() and smb2_reconnect()
+++=======
++ 	 * leaf_fullpath: Canonical DFS referral path related to this
++ 	 *                connection.
++ 	 *                It is used in DFS cache refresher, reconnect and may
++ 	 *                change due to nested DFS links.
++ 	 *
++ 	 * Protected by @refpath_lock and @srv_lock.  The @refpath_lock is
++ 	 * mostly used for not requiring a copy of @leaf_fullpath when getting
++ 	 * cached or new DFS referrals (which might also sleep during I/O).
++ 	 * While @srv_lock is held for making string and NULL comparions against
++ 	 * both fields as in mount(2) and cache refresh.
+++>>>>>>> 3ae872de4107 (smb: client: fix shared DFS root mounts with different prefixes):fs/smb/client/cifsglob.h
+  	 *
+ -	 * format: \\HOST\SHARE[\OPTIONAL PATH]
+ +	 * format: \\HOST\SHARE\[OPTIONAL PATH]
+  	 */
+++<<<<<<< HEAD:fs/cifs/cifsglob.h
+ +	char *origin_fullpath, *leaf_fullpath, *current_fullpath;
+ +#endif
+++=======
++ 	char *leaf_fullpath;
+++>>>>>>> 3ae872de4107 (smb: client: fix shared DFS root mounts with different prefixes):fs/smb/client/cifsglob.h
+  };
+  
+ -static inline bool is_smb1(struct TCP_Server_Info *server)
+ -{
+ -	return HEADER_PREAMBLE_SIZE(server) != 0;
+ -}
+ -
+  static inline void cifs_server_lock(struct TCP_Server_Info *server)
+  {
+  	unsigned int nofs_flag = memalloc_nofs_save();
+@@@ -1175,15 -1192,17 +1192,16 @@@ struct cifs_tcon 
+  	__u32 max_bytes_copy;
+  #ifdef CONFIG_CIFS_FSCACHE
+  	u64 resource_id;		/* server resource id */
+ -	struct fscache_volume *fscache;	/* cookie for share */
+ +	struct fscache_cookie *fscache;	/* cookie for share */
+  #endif
+  	struct list_head pending_opens;	/* list of incomplete opens */
+ -	struct cached_fids *cfids;
+ +	struct cached_fid crfid; /* Cached root fid */
+  	/* BB add field for back pointer to sb struct(s)? */
+  #ifdef CONFIG_CIFS_DFS_UPCALL
+ -	struct list_head dfs_ses_list;
+ -	struct delayed_work dfs_cache_work;
+ +	struct list_head ulist; /* cache update list */
+  #endif
+  	struct delayed_work	query_interfaces; /* query interfaces workqueue job */
++ 	char *origin_fullpath; /* canonical copy of smb3_fs_context::source */
+  };
+  
+  /*
+diff --cc fs/cifs/connect.c
+index ac21200be929,dab7bc876507..000000000000
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@@ -964,12 -996,7 +964,15 @@@ static void clean_demultiplex_info(stru
+  		 */
+  	}
+  
+++<<<<<<< HEAD:fs/cifs/connect.c
+ +#ifdef CONFIG_CIFS_DFS_UPCALL
+ +	/* Release netns reference for this server. */
+ +	put_net(cifs_net_ns(server));
+ +	kfree(server->origin_fullpath);
+++=======
+++>>>>>>> 3ae872de4107 (smb: client: fix shared DFS root mounts with different prefixes):fs/smb/client/connect.c
+  	kfree(server->leaf_fullpath);
+ +#endif
+  	kfree(server);
+  
+  	length = atomic_dec_return(&tcpSesAllocCount);
+@@@ -1453,14 -1464,45 +1458,53 @@@ static int match_server(struct TCP_Serv
+  	if (!net_eq(cifs_net_ns(server), current->nsproxy->net_ns))
+  		return 0;
+  
+ -	if (!cifs_match_ipaddr((struct sockaddr *)&ctx->srcaddr,
+ -			       (struct sockaddr *)&server->srcaddr))
+ +	if (strcasecmp(server->hostname, ctx->server_hostname))
+ +		return 0;
+++<<<<<<< HEAD:fs/cifs/connect.c
+ +
+ +	if (!match_address(server, addr,
+ +			   (struct sockaddr *)&ctx->srcaddr))
+  		return 0;
+ +
+ +	if (!match_port(server, addr))
+++=======
++ 	/*
++ 	 * When matching cifs.ko superblocks (@match_super == true), we can't
++ 	 * really match either @server->leaf_fullpath or @server->dstaddr
++ 	 * directly since this @server might belong to a completely different
++ 	 * server -- in case of domain-based DFS referrals or DFS links -- as
++ 	 * provided earlier by mount(2) through 'source' and 'ip' options.
++ 	 *
++ 	 * Otherwise, match the DFS referral in @server->leaf_fullpath or the
++ 	 * destination address in @server->dstaddr.
++ 	 *
++ 	 * When using 'nodfs' mount option, we avoid sharing it with DFS
++ 	 * connections as they might failover.
++ 	 */
++ 	if (!match_super) {
++ 		if (!ctx->nodfs) {
++ 			if (server->leaf_fullpath) {
++ 				if (!ctx->leaf_fullpath ||
++ 				    strcasecmp(server->leaf_fullpath,
++ 					       ctx->leaf_fullpath))
++ 					return 0;
++ 			} else if (ctx->leaf_fullpath) {
++ 				return 0;
++ 			}
++ 		} else if (server->leaf_fullpath) {
++ 			return 0;
++ 		}
++ 	}
++ 
++ 	/*
++ 	 * Match for a regular connection (address/hostname/port) which has no
++ 	 * DFS referrals set.
++ 	 */
++ 	if (!server->leaf_fullpath &&
++ 	    (strcasecmp(server->hostname, ctx->server_hostname) ||
++ 	     !match_server_address(server, addr) ||
++ 	     !match_port(server, addr)))
+++>>>>>>> 3ae872de4107 (smb: client: fix shared DFS root mounts with different prefixes):fs/smb/client/connect.c
+  		return 0;
+  
+  	if (!match_security(server, ctx))
+@@@ -2274,10 -2320,20 +2319,22 @@@ get_ses_fail
+  /* this function must be called with tc_lock held */
+  static int match_tcon(struct cifs_tcon *tcon, struct smb3_fs_context *ctx)
+  {
+ -	struct TCP_Server_Info *server = tcon->ses->server;
+ -
+  	if (tcon->status == TID_EXITING)
+  		return 0;
+++<<<<<<< HEAD:fs/cifs/connect.c
+ +	if (strncmp(tcon->treeName, ctx->UNC, MAX_TREE_SIZE))
+++=======
++ 
++ 	if (tcon->origin_fullpath) {
++ 		if (!ctx->source ||
++ 		    !dfs_src_pathname_equal(ctx->source,
++ 					    tcon->origin_fullpath))
++ 			return 0;
++ 	} else if (!server->leaf_fullpath &&
++ 		   strncmp(tcon->tree_name, ctx->UNC, MAX_TREE_SIZE)) {
+++>>>>>>> 3ae872de4107 (smb: client: fix shared DFS root mounts with different prefixes):fs/smb/client/connect.c
+  		return 0;
++ 	}
+  	if (tcon->seal != ctx->seal)
+  		return 0;
+  	if (tcon->snapshot_time != ctx->snapshot_time)
+@@@ -2658,9 -2731,11 +2715,15 @@@ compare_mount_options(struct super_bloc
+  	return 1;
+  }
+  
+++<<<<<<< HEAD:fs/cifs/connect.c
+ +static int
+ +match_prepath(struct super_block *sb, struct cifs_mnt_data *mnt_data)
+++=======
++ static int match_prepath(struct super_block *sb,
++ 			 struct cifs_tcon *tcon,
++ 			 struct cifs_mnt_data *mnt_data)
+++>>>>>>> 3ae872de4107 (smb: client: fix shared DFS root mounts with different prefixes):fs/smb/client/connect.c
+  {
+ -	struct smb3_fs_context *ctx = mnt_data->ctx;
+  	struct cifs_sb_info *old = CIFS_SB(sb);
+  	struct cifs_sb_info *new = mnt_data->cifs_sb;
+  	bool old_set = (old->mnt_cifs_flags & CIFS_MOUNT_USE_PREFIX_PATH) &&
+@@@ -2668,6 -2743,10 +2731,13 @@@
+  	bool new_set = (new->mnt_cifs_flags & CIFS_MOUNT_USE_PREFIX_PATH) &&
+  		new->prepath;
+  
+++<<<<<<< HEAD:fs/cifs/connect.c
+++=======
++ 	if (tcon->origin_fullpath &&
++ 	    dfs_src_pathname_equal(tcon->origin_fullpath, ctx->source))
++ 		return 1;
++ 
+++>>>>>>> 3ae872de4107 (smb: client: fix shared DFS root mounts with different prefixes):fs/smb/client/connect.c
+  	if (old_set && new_set && !strcmp(new->prepath, old->prepath))
+  		return 1;
+  	else if (!old_set && !new_set)
+@@@ -2707,10 -2793,10 +2777,14 @@@ cifs_match_super(struct super_block *sb
+  	spin_lock(&ses->ses_lock);
+  	spin_lock(&ses->chan_lock);
+  	spin_lock(&tcon->tc_lock);
+- 	if (!match_server(tcp_srv, ctx) ||
++ 	if (!match_server(tcp_srv, ctx, true) ||
+  	    !match_session(ses, ctx) ||
+  	    !match_tcon(tcon, ctx) ||
+++<<<<<<< HEAD:fs/cifs/connect.c
+ +	    !match_prepath(sb, mnt_data)) {
+++=======
++ 	    !match_prepath(sb, tcon, mnt_data)) {
+++>>>>>>> 3ae872de4107 (smb: client: fix shared DFS root mounts with different prefixes):fs/smb/client/connect.c
+  		rc = 0;
+  		goto out;
+  	}
+diff --cc fs/cifs/dfs_cache.c
+index cb493cdef4ba,33adf43a01f1..000000000000
+--- a/fs/cifs/dfs_cache.c
++++ b/fs/cifs/dfs_cache.c
+@@@ -1473,10 -1248,6 +1473,13 @@@ static int refresh_tcon(struct cifs_se
+  int dfs_cache_remount_fs(struct cifs_sb_info *cifs_sb)
+  {
+  	struct cifs_tcon *tcon;
+++<<<<<<< HEAD:fs/cifs/dfs_cache.c
+ +	struct TCP_Server_Info *server;
+ +	struct mount_group *mg;
+ +	struct cifs_ses *sessions[CACHE_MAX_ENTRIES + 1] = {NULL};
+ +	int rc;
+++=======
+++>>>>>>> 3ae872de4107 (smb: client: fix shared DFS root mounts with different prefixes):fs/smb/client/dfs_cache.c
+  
+  	if (!cifs_sb || !cifs_sb->master_tlink)
+  		return -EINVAL;
+@@@ -1488,25 -1260,7 +1492,29 @@@
+  		cifs_dbg(FYI, "%s: not a dfs mount\n", __func__);
+  		return 0;
+  	}
+++<<<<<<< HEAD:fs/cifs/dfs_cache.c
+ +
+ +	if (uuid_is_null(&cifs_sb->dfs_mount_id)) {
+ +		cifs_dbg(FYI, "%s: no dfs mount group id\n", __func__);
+ +		return -EINVAL;
+ +	}
+ +
+ +	mutex_lock(&mount_group_list_lock);
+ +	mg = find_mount_group_locked(&cifs_sb->dfs_mount_id);
+ +	if (IS_ERR(mg)) {
+ +		mutex_unlock(&mount_group_list_lock);
+ +		cifs_dbg(FYI, "%s: no ipc session for refreshing referral\n", __func__);
+ +		return PTR_ERR(mg);
+ +	}
+ +	kref_get(&mg->refcount);
+ +	mutex_unlock(&mount_group_list_lock);
+ +
+ +	spin_lock(&mg->lock);
+ +	memcpy(&sessions, mg->sessions, mg->num_sessions * sizeof(mg->sessions[0]));
+ +	spin_unlock(&mg->lock);
+++=======
++ 	spin_unlock(&tcon->tc_lock);
+++>>>>>>> 3ae872de4107 (smb: client: fix shared DFS root mounts with different prefixes):fs/smb/client/dfs_cache.c
+  
+  	/*
+  	 * After reconnecting to a different server, unique ids won't match anymore, so we disable
+diff --cc fs/cifs/misc.c
+index c17d5d57f533,70dbfe6584f9..000000000000
+--- a/fs/cifs/misc.c
++++ b/fs/cifs/misc.c
+@@@ -144,11 -149,15 +144,21 @@@ tconInfoFree(struct cifs_tcon *buf_to_f
+  		cifs_dbg(FYI, "Null buffer passed to tconInfoFree\n");
+  		return;
+  	}
+ -	free_cached_dirs(tcon->cfids);
+  	atomic_dec(&tconInfoAllocCount);
+++<<<<<<< HEAD:fs/cifs/misc.c
+ +	kfree(buf_to_free->nativeFileSystem);
+ +	kfree_sensitive(buf_to_free->password);
+ +	kfree(buf_to_free->crfid.fid);
+ +	kfree(buf_to_free);
+++=======
++ 	kfree(tcon->nativeFileSystem);
++ 	kfree_sensitive(tcon->password);
++ #ifdef CONFIG_CIFS_DFS_UPCALL
++ 	dfs_put_root_smb_sessions(&tcon->dfs_ses_list);
++ #endif
++ 	kfree(tcon->origin_fullpath);
++ 	kfree(tcon);
+++>>>>>>> 3ae872de4107 (smb: client: fix shared DFS root mounts with different prefixes):fs/smb/client/misc.c
+  }
+  
+  struct smb_hdr *
+@@@ -1162,6 -1230,80 +1184,83 @@@ int cifs_update_super_prepath(struct ci
+  	cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_USE_PREFIX_PATH;
+  	return 0;
+  }
+++<<<<<<< HEAD:fs/cifs/misc.c
+++=======
++ 
++ /*
++  * Handle weird Windows SMB server behaviour. It responds with
++  * STATUS_OBJECT_NAME_INVALID code to SMB2 QUERY_INFO request for
++  * "\<server>\<dfsname>\<linkpath>" DFS reference, where <dfsname> contains
++  * non-ASCII unicode symbols.
++  */
++ int cifs_inval_name_dfs_link_error(const unsigned int xid,
++ 				   struct cifs_tcon *tcon,
++ 				   struct cifs_sb_info *cifs_sb,
++ 				   const char *full_path,
++ 				   bool *islink)
++ {
++ 	struct cifs_ses *ses = tcon->ses;
++ 	size_t len;
++ 	char *path;
++ 	char *ref_path;
++ 
++ 	*islink = false;
++ 
++ 	/*
++ 	 * Fast path - skip check when @full_path doesn't have a prefix path to
++ 	 * look up or tcon is not DFS.
++ 	 */
++ 	if (strlen(full_path) < 2 || !cifs_sb ||
++ 	    (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_NO_DFS) ||
++ 	    !is_tcon_dfs(tcon))
++ 		return 0;
++ 
++ 	spin_lock(&tcon->tc_lock);
++ 	if (!tcon->origin_fullpath) {
++ 		spin_unlock(&tcon->tc_lock);
++ 		return 0;
++ 	}
++ 	spin_unlock(&tcon->tc_lock);
++ 
++ 	/*
++ 	 * Slow path - tcon is DFS and @full_path has prefix path, so attempt
++ 	 * to get a referral to figure out whether it is an DFS link.
++ 	 */
++ 	len = strnlen(tcon->tree_name, MAX_TREE_SIZE + 1) + strlen(full_path) + 1;
++ 	path = kmalloc(len, GFP_KERNEL);
++ 	if (!path)
++ 		return -ENOMEM;
++ 
++ 	scnprintf(path, len, "%s%s", tcon->tree_name, full_path);
++ 	ref_path = dfs_cache_canonical_path(path + 1, cifs_sb->local_nls,
++ 					    cifs_remap(cifs_sb));
++ 	kfree(path);
++ 
++ 	if (IS_ERR(ref_path)) {
++ 		if (PTR_ERR(ref_path) != -EINVAL)
++ 			return PTR_ERR(ref_path);
++ 	} else {
++ 		struct dfs_info3_param *refs = NULL;
++ 		int num_refs = 0;
++ 
++ 		/*
++ 		 * XXX: we are not using dfs_cache_find() here because we might
++ 		 * end up filling all the DFS cache and thus potentially
++ 		 * removing cached DFS targets that the client would eventually
++ 		 * need during failover.
++ 		 */
++ 		ses = CIFS_DFS_ROOT_SES(ses);
++ 		if (ses->server->ops->get_dfs_refer &&
++ 		    !ses->server->ops->get_dfs_refer(xid, ses, ref_path, &refs,
++ 						     &num_refs, cifs_sb->local_nls,
++ 						     cifs_remap(cifs_sb)))
++ 			*islink = refs[0].server_type == DFS_TYPE_LINK;
++ 		free_dfs_info_array(refs, num_refs);
++ 		kfree(ref_path);
++ 	}
++ 	return 0;
++ }
+++>>>>>>> 3ae872de4107 (smb: client: fix shared DFS root mounts with different prefixes):fs/smb/client/misc.c
+  #endif
+  
+  int cifs_wait_for_server_reconnect(struct TCP_Server_Info *server, bool retry)
+* Unmerged path fs/smb/client/dfs.c
+* Unmerged path fs/smb/client/dfs.h
+* Unmerged path fs/cifs/cifs_debug.c
+* Unmerged path fs/cifs/cifsglob.h
+diff --git a/fs/cifs/cifsproto.h b/fs/cifs/cifsproto.h
+index c5eafe17793d..3d0806aeb74e 100644
+--- a/fs/cifs/cifsproto.h
++++ b/fs/cifs/cifsproto.h
+@@ -644,7 +644,7 @@ int smb2_parse_query_directory(struct cifs_tcon *tcon, struct kvec *rsp_iov,
+ 			       int resp_buftype,
+ 			       struct cifs_search_info *srch_inf);
+ 
+-struct super_block *cifs_get_tcp_super(struct TCP_Server_Info *server);
++struct super_block *cifs_get_dfs_tcon_super(struct cifs_tcon *tcon);
+ void cifs_put_tcp_super(struct super_block *sb);
+ int cifs_update_super_prepath(struct cifs_sb_info *cifs_sb, char *prefix);
+ char *extract_hostname(const char *unc);
+* Unmerged path fs/cifs/connect.c
+* Unmerged path fs/cifs/dfs_cache.c
+* Unmerged path fs/cifs/misc.c
+* Unmerged path fs/smb/client/dfs.c
+* Unmerged path fs/smb/client/dfs.h
