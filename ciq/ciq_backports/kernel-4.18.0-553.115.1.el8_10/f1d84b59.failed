@@ -1,0 +1,232 @@
+x86/mm: Carve out INVLPG inline asm for use by others
+
+jira KERNEL-814
+Rebuild_History Non-Buildable kernel-4.18.0-553.115.1.el8_10
+commit-author Borislav Petkov (AMD) <bp@alien8.de>
+commit f1d84b59cbb9547c243d93991acf187fdbe9fbe9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.115.1.el8_10/f1d84b59.failed
+
+No functional changes.
+
+	Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+Link: https://lore.kernel.org/r/ZyulbYuvrkshfsd2@antipodes
+(cherry picked from commit f1d84b59cbb9547c243d93991acf187fdbe9fbe9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/mm/tlb.c
+diff --cc arch/x86/mm/tlb.c
+index f2e37d86dabe,a2becb85bea7..000000000000
+--- a/arch/x86/mm/tlb.c
++++ b/arch/x86/mm/tlb.c
+@@@ -12,7 -17,10 +12,12 @@@
+  #include <asm/mmu_context.h>
+  #include <asm/nospec-branch.h>
+  #include <asm/cache.h>
+ -#include <asm/cacheflush.h>
+  #include <asm/apic.h>
+++<<<<<<< HEAD
+++=======
++ #include <asm/perf_event.h>
++ #include <asm/tlb.h>
+++>>>>>>> f1d84b59cbb9 (x86/mm: Carve out INVLPG inline asm for use by others)
+  
+  #include "mm_internal.h"
+  
+@@@ -725,13 -1078,172 +730,179 @@@ void flush_tlb_kernel_range(unsigned lo
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * This can be used from process context to figure out what the value of
++  * CR3 is without needing to do a (slow) __read_cr3().
++  *
++  * It's intended to be used for code like KVM that sneakily changes CR3
++  * and needs to restore it.  It needs to be used very carefully.
++  */
++ unsigned long __get_current_cr3_fast(void)
++ {
++ 	unsigned long cr3 =
++ 		build_cr3(this_cpu_read(cpu_tlbstate.loaded_mm)->pgd,
++ 			  this_cpu_read(cpu_tlbstate.loaded_mm_asid),
++ 			  tlbstate_lam_cr3_mask());
++ 
++ 	/* For now, be very restrictive about when this can be called. */
++ 	VM_WARN_ON(in_nmi() || preemptible());
++ 
++ 	VM_BUG_ON(cr3 != __read_cr3());
++ 	return cr3;
++ }
++ EXPORT_SYMBOL_GPL(__get_current_cr3_fast);
++ 
++ /*
++  * Flush one page in the kernel mapping
++  */
++ void flush_tlb_one_kernel(unsigned long addr)
++ {
++ 	count_vm_tlb_event(NR_TLB_LOCAL_FLUSH_ONE);
++ 
++ 	/*
++ 	 * If PTI is off, then __flush_tlb_one_user() is just INVLPG or its
++ 	 * paravirt equivalent.  Even with PCID, this is sufficient: we only
++ 	 * use PCID if we also use global PTEs for the kernel mapping, and
++ 	 * INVLPG flushes global translations across all address spaces.
++ 	 *
++ 	 * If PTI is on, then the kernel is mapped with non-global PTEs, and
++ 	 * __flush_tlb_one_user() will flush the given address for the current
++ 	 * kernel address space and for its usermode counterpart, but it does
++ 	 * not flush it for other address spaces.
++ 	 */
++ 	flush_tlb_one_user(addr);
++ 
++ 	if (!static_cpu_has(X86_FEATURE_PTI))
++ 		return;
++ 
++ 	/*
++ 	 * See above.  We need to propagate the flush to all other address
++ 	 * spaces.  In principle, we only need to propagate it to kernelmode
++ 	 * address spaces, but the extra bookkeeping we would need is not
++ 	 * worth it.
++ 	 */
++ 	this_cpu_write(cpu_tlbstate.invalidate_other, true);
++ }
++ 
++ /*
++  * Flush one page in the user mapping
++  */
++ STATIC_NOPV void native_flush_tlb_one_user(unsigned long addr)
++ {
++ 	u32 loaded_mm_asid;
++ 	bool cpu_pcide;
++ 
++ 	/* Flush 'addr' from the kernel PCID: */
++ 	invlpg(addr);
++ 
++ 	/* If PTI is off there is no user PCID and nothing to flush. */
++ 	if (!static_cpu_has(X86_FEATURE_PTI))
++ 		return;
++ 
++ 	loaded_mm_asid = this_cpu_read(cpu_tlbstate.loaded_mm_asid);
++ 	cpu_pcide      = this_cpu_read(cpu_tlbstate.cr4) & X86_CR4_PCIDE;
++ 
++ 	/*
++ 	 * invpcid_flush_one(pcid>0) will #GP if CR4.PCIDE==0.  Check
++ 	 * 'cpu_pcide' to ensure that *this* CPU will not trigger those
++ 	 * #GP's even if called before CR4.PCIDE has been initialized.
++ 	 */
++ 	if (boot_cpu_has(X86_FEATURE_INVPCID) && cpu_pcide)
++ 		invpcid_flush_one(user_pcid(loaded_mm_asid), addr);
++ 	else
++ 		invalidate_user_asid(loaded_mm_asid);
++ }
++ 
++ void flush_tlb_one_user(unsigned long addr)
++ {
++ 	__flush_tlb_one_user(addr);
++ }
++ 
++ /*
++  * Flush everything
++  */
++ STATIC_NOPV void native_flush_tlb_global(void)
++ {
++ 	unsigned long flags;
++ 
++ 	if (static_cpu_has(X86_FEATURE_INVPCID)) {
++ 		/*
++ 		 * Using INVPCID is considerably faster than a pair of writes
++ 		 * to CR4 sandwiched inside an IRQ flag save/restore.
++ 		 *
++ 		 * Note, this works with CR4.PCIDE=0 or 1.
++ 		 */
++ 		invpcid_flush_all();
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * Read-modify-write to CR4 - protect it from preemption and
++ 	 * from interrupts. (Use the raw variant because this code can
++ 	 * be called from deep inside debugging code.)
++ 	 */
++ 	raw_local_irq_save(flags);
++ 
++ 	__native_tlb_flush_global(this_cpu_read(cpu_tlbstate.cr4));
++ 
++ 	raw_local_irq_restore(flags);
++ }
++ 
++ /*
++  * Flush the entire current user mapping
++  */
++ STATIC_NOPV void native_flush_tlb_local(void)
++ {
++ 	/*
++ 	 * Preemption or interrupts must be disabled to protect the access
++ 	 * to the per CPU variable and to prevent being preempted between
++ 	 * read_cr3() and write_cr3().
++ 	 */
++ 	WARN_ON_ONCE(preemptible());
++ 
++ 	invalidate_user_asid(this_cpu_read(cpu_tlbstate.loaded_mm_asid));
++ 
++ 	/* If current->mm == NULL then the read_cr3() "borrows" an mm */
++ 	native_write_cr3(__native_read_cr3());
++ }
++ 
++ void flush_tlb_local(void)
++ {
++ 	__flush_tlb_local();
++ }
++ 
++ /*
++  * Flush everything
++  */
++ void __flush_tlb_all(void)
++ {
++ 	/*
++ 	 * This is to catch users with enabled preemption and the PGE feature
++ 	 * and don't trigger the warning in __native_flush_tlb().
++ 	 */
++ 	VM_WARN_ON_ONCE(preemptible());
++ 
++ 	if (cpu_feature_enabled(X86_FEATURE_PGE)) {
++ 		__flush_tlb_global();
++ 	} else {
++ 		/*
++ 		 * !PGE -> !PCID (setup_pcid()), thus every flush is total.
++ 		 */
++ 		flush_tlb_local();
++ 	}
++ }
++ EXPORT_SYMBOL_GPL(__flush_tlb_all);
++ 
+++>>>>>>> f1d84b59cbb9 (x86/mm: Carve out INVLPG inline asm for use by others)
+  void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch)
+  {
+ -	struct flush_tlb_info *info;
+ +	struct flush_tlb_info info = {
+ +		.mm = NULL,
+ +		.start = 0UL,
+ +		.end = TLB_FLUSH_ALL,
+ +	};
+  
+  	int cpu = get_cpu();
+  
+diff --git a/arch/x86/include/asm/tlb.h b/arch/x86/include/asm/tlb.h
+index 580636cdc257..4d3c9d00d6b6 100644
+--- a/arch/x86/include/asm/tlb.h
++++ b/arch/x86/include/asm/tlb.h
+@@ -34,4 +34,8 @@ static inline void __tlb_remove_table(void *table)
+ 	free_page_and_swap_cache(table);
+ }
+ 
++static inline void invlpg(unsigned long addr)
++{
++	asm volatile("invlpg (%0)" ::"r" (addr) : "memory");
++}
+ #endif /* _ASM_X86_TLB_H */
+* Unmerged path arch/x86/mm/tlb.c
