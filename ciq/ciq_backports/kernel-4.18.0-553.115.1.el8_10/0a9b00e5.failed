@@ -1,0 +1,254 @@
+smb: client: get rid of TCP_Server_Info::refpath_lock
+
+jira KERNEL-814
+Rebuild_History Non-Buildable kernel-4.18.0-553.115.1.el8_10
+commit-author Paulo Alcantara <pc@manguebit.com>
+commit 0a9b00e5e5c5fc3c77cbfd01e6ffbe77fc7fe74a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.115.1.el8_10/0a9b00e5.failed
+
+TCP_Server_Info::leaf_fullpath is allocated in cifs_get_tcp_session()
+and never changed afterwards, so there is no need to serialize its
+access.
+
+	Signed-off-by: Paulo Alcantara (Red Hat) <pc@manguebit.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 0a9b00e5e5c5fc3c77cbfd01e6ffbe77fc7fe74a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/cifsglob.h
+#	fs/cifs/connect.c
+#	fs/cifs/dfs_cache.c
+diff --cc fs/cifs/cifsglob.h
+index ee8d82174e1b,49ffc040f736..000000000000
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@@ -737,24 -811,22 +737,30 @@@ struct TCP_Server_Info 
+  	bool use_swn_dstaddr;
+  	struct sockaddr_storage swn_dstaddr;
+  #endif
+++<<<<<<< HEAD:fs/cifs/cifsglob.h
+ +#ifdef CONFIG_CIFS_DFS_UPCALL
+ +	bool is_dfs_conn; /* if a dfs connection */
+ +	struct mutex refpath_lock; /* protects leaf_fullpath */
+ +	/*
+ +	 * Canonical DFS full paths that were used to chase referrals in mount and reconnect.
+ +	 *
+ +	 * origin_fullpath: first or original referral path
+ +	 * leaf_fullpath: last referral path (might be changed due to nested links in reconnect)
+++=======
++ 	/*
++ 	 * Canonical DFS referral path used in cifs_reconnect() for failover as
++ 	 * well as in DFS cache refresher.
+++>>>>>>> 0a9b00e5e5c5 (smb: client: get rid of TCP_Server_Info::refpath_lock):fs/smb/client/cifsglob.h
+  	 *
+ -	 * format: \\HOST\SHARE[\OPTIONAL PATH]
+ +	 * current_fullpath: pointer to either origin_fullpath or leaf_fullpath
+ +	 * NOTE: cannot be accessed outside cifs_reconnect() and smb2_reconnect()
+ +	 *
+ +	 * format: \\HOST\SHARE\[OPTIONAL PATH]
+  	 */
+ -	char *leaf_fullpath;
+ -	bool dfs_conn:1;
+ -	char dns_dom[CIFS_MAX_DOMAINNAME_LEN + 1];
+ +	char *origin_fullpath, *leaf_fullpath, *current_fullpath;
+ +#endif
+  };
+  
+ -static inline bool is_smb1(struct TCP_Server_Info *server)
+ -{
+ -	return HEADER_PREAMBLE_SIZE(server) != 0;
+ -}
+ -
+  static inline void cifs_server_lock(struct TCP_Server_Info *server)
+  {
+  	unsigned int nofs_flag = memalloc_nofs_save();
+diff --cc fs/cifs/connect.c
+index 55dcd5c06444,1053ef8915fb..000000000000
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@@ -486,11 -491,11 +486,18 @@@ static int reconnect_target_locked(stru
+  
+  static int reconnect_dfs_server(struct TCP_Server_Info *server)
+  {
+++<<<<<<< HEAD:fs/cifs/connect.c
+++=======
++ 	struct dfs_cache_tgt_iterator *target_hint = NULL;
++ 	const char *ref_path = server->leaf_fullpath + 1;
++ 	DFS_CACHE_TGT_LIST(tl);
++ 	int num_targets = 0;
+++>>>>>>> 0a9b00e5e5c5 (smb: client: get rid of TCP_Server_Info::refpath_lock):fs/smb/client/connect.c
+  	int rc = 0;
+ +	const char *refpath = server->current_fullpath + 1;
+ +	struct dfs_cache_tgt_list tl = DFS_CACHE_TGT_LIST_INIT(tl);
+ +	struct dfs_cache_tgt_iterator *target_hint = NULL;
+ +	int num_targets = 0;
+  
+  	/*
+  	 * Determine the number of dfs targets the referral path in @cifs_sb resolves to.
+@@@ -500,7 -505,7 +507,11 @@@
+  	 * through /proc/fs/cifs/dfscache or the target list is empty due to server settings after
+  	 * refreshing the referral, so, in this case, default it to 1.
+  	 */
+++<<<<<<< HEAD:fs/cifs/connect.c
+ +	if (!dfs_cache_noreq_find(refpath, NULL, &tl))
+++=======
++ 	if (!dfs_cache_noreq_find(ref_path, NULL, &tl))
+++>>>>>>> 0a9b00e5e5c5 (smb: client: get rid of TCP_Server_Info::refpath_lock):fs/smb/client/connect.c
+  		num_targets = dfs_cache_get_nr_tgts(&tl);
+  	if (!num_targets)
+  		num_targets = 1;
+@@@ -545,9 -550,7 +556,13 @@@
+  		mod_delayed_work(cifsiod_wq, &server->reconnect, 0);
+  	} while (server->tcpStatus == CifsNeedReconnect);
+  
+++<<<<<<< HEAD:fs/cifs/connect.c
+ +	if (target_hint)
+ +		dfs_cache_noreq_update_tgthint(refpath, target_hint);
+ +
+++=======
++ 	dfs_cache_noreq_update_tgthint(ref_path, target_hint);
+++>>>>>>> 0a9b00e5e5c5 (smb: client: get rid of TCP_Server_Info::refpath_lock):fs/smb/client/connect.c
+  	dfs_cache_free_tgts(&tl);
+  
+  	/* Need to set up echo worker again once connection has been established */
+@@@ -562,21 -565,8 +577,22 @@@
+  
+  int cifs_reconnect(struct TCP_Server_Info *server, bool mark_smb_session)
+  {
+++<<<<<<< HEAD:fs/cifs/connect.c
+ +	/* If tcp session is not an dfs connection, then reconnect to last target server */
+ +	spin_lock(&server->srv_lock);
+ +	if (!server->is_dfs_conn) {
+ +		spin_unlock(&server->srv_lock);
+ +		return __cifs_reconnect(server, mark_smb_session);
+ +	}
+ +	spin_unlock(&server->srv_lock);
+ +
+ +	mutex_lock(&server->refpath_lock);
+ +	if (!server->origin_fullpath || !server->leaf_fullpath) {
+ +		mutex_unlock(&server->refpath_lock);
+++=======
++ 	if (!server->leaf_fullpath)
+++>>>>>>> 0a9b00e5e5c5 (smb: client: get rid of TCP_Server_Info::refpath_lock):fs/smb/client/connect.c
+  		return __cifs_reconnect(server, mark_smb_session);
+- 	}
+- 	mutex_unlock(&server->refpath_lock);
+- 
+  	return reconnect_dfs_server(server);
+  }
+  #else
+diff --cc fs/cifs/dfs_cache.c
+index d19f8e94c80f,5022bb1f122a..000000000000
+--- a/fs/cifs/dfs_cache.c
++++ b/fs/cifs/dfs_cache.c
+@@@ -1361,21 -1120,90 +1361,94 @@@ static bool target_share_equal(struct T
+  	return match;
+  }
+  
+ -static bool is_ses_good(struct cifs_ses *ses)
+ +/*
+ + * Mark dfs tcon for reconnecting when the currently connected tcon does not match any of the new
+ + * target shares in @refs.
+ + */
+ +static void mark_for_reconnect_if_needed(struct cifs_tcon *tcon, struct dfs_cache_tgt_list *tl,
+ +					 const struct dfs_info3_param *refs, int numrefs)
+  {
+++<<<<<<< HEAD:fs/cifs/dfs_cache.c
+ +	struct dfs_cache_tgt_iterator *it;
+++=======
++ 	struct TCP_Server_Info *server = ses->server;
++ 	struct cifs_tcon *tcon = ses->tcon_ipc;
++ 	bool ret;
++ 
++ 	spin_lock(&ses->ses_lock);
++ 	spin_lock(&ses->chan_lock);
++ 	ret = !cifs_chan_needs_reconnect(ses, server) &&
++ 		ses->ses_status == SES_GOOD &&
++ 		!tcon->need_reconnect;
++ 	spin_unlock(&ses->chan_lock);
++ 	spin_unlock(&ses->ses_lock);
++ 	return ret;
++ }
++ 
++ static char *get_ses_refpath(struct cifs_ses *ses)
++ {
++ 	struct TCP_Server_Info *server = ses->server;
++ 	char *path = ERR_PTR(-ENOENT);
++ 
++ 	if (server->leaf_fullpath) {
++ 		path = kstrdup(server->leaf_fullpath + 1, GFP_KERNEL);
++ 		if (!path)
++ 			path = ERR_PTR(-ENOMEM);
++ 	}
++ 	return path;
++ }
++ 
++ /* Refresh dfs referral of @ses */
++ static void refresh_ses_referral(struct cifs_ses *ses)
++ {
++ 	struct cache_entry *ce;
++ 	unsigned int xid;
++ 	char *path;
++ 	int rc = 0;
++ 
++ 	xid = get_xid();
++ 
++ 	path = get_ses_refpath(ses);
++ 	if (IS_ERR(path)) {
++ 		rc = PTR_ERR(path);
++ 		path = NULL;
++ 		goto out;
++ 	}
++ 
++ 	ses = CIFS_DFS_ROOT_SES(ses);
++ 	if (!is_ses_good(ses)) {
++ 		cifs_dbg(FYI, "%s: skip cache refresh due to disconnected ipc\n",
++ 			 __func__);
++ 		goto out;
++ 	}
++ 
++ 	ce = cache_refresh_path(xid, ses, path, false);
++ 	if (!IS_ERR(ce))
++ 		up_read(&htable_rw_lock);
++ 	else
++ 		rc = PTR_ERR(ce);
++ 
++ out:
++ 	free_xid(xid);
++ 	kfree(path);
++ }
++ 
++ static int __refresh_tcon_referral(struct cifs_tcon *tcon,
++ 				   const char *path,
++ 				   struct dfs_info3_param *refs,
++ 				   int numrefs, bool force_refresh)
++ {
++ 	struct cache_entry *ce;
++ 	bool reconnect = force_refresh;
++ 	int rc = 0;
+++>>>>>>> 0a9b00e5e5c5 (smb: client: get rid of TCP_Server_Info::refpath_lock):fs/smb/client/dfs_cache.c
+  	int i;
+  
+ -	if (unlikely(!numrefs))
+ -		return 0;
+ -
+ -	if (force_refresh) {
+ +	for (it = dfs_cache_get_tgt_iterator(tl); it; it = dfs_cache_get_next_tgt(tl, it)) {
+  		for (i = 0; i < numrefs; i++) {
+ -			/* TODO: include prefix paths in the matching */
+ -			if (target_share_equal(tcon, refs[i].node_name)) {
+ -				reconnect = false;
+ -				break;
+ -			}
+ +			if (target_share_equal(tcon->ses->server, dfs_cache_get_tgt_name(it),
+ +					       refs[i].node_name))
+ +				return;
+  		}
+  	}
+  
+* Unmerged path fs/cifs/cifsglob.h
+* Unmerged path fs/cifs/connect.c
+* Unmerged path fs/cifs/dfs_cache.c
