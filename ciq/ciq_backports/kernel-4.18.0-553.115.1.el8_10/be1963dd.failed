@@ -1,0 +1,209 @@
+smb: client: get rid of kstrdup() in get_ses_refpath()
+
+jira KERNEL-814
+Rebuild_History Non-Buildable kernel-4.18.0-553.115.1.el8_10
+commit-author Paulo Alcantara <pc@manguebit.com>
+commit be1963dd4ce4e467f062b023d1e696f40c926a04
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.115.1.el8_10/be1963dd.failed
+
+After commit 36008fe6e3dc ("smb: client: don't try following DFS links
+in cifs_tree_connect()"), TCP_Server_Info::leaf_fullpath will no
+longer be changed, so there is no need to kstrdup() it.
+
+	Signed-off-by: Paulo Alcantara (Red Hat) <pc@manguebit.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit be1963dd4ce4e467f062b023d1e696f40c926a04)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/dfs_cache.c
+#	fs/smb/client/dfs.h
+diff --cc fs/cifs/dfs_cache.c
+index d19f8e94c80f,4dada26d56b5..000000000000
+--- a/fs/cifs/dfs_cache.c
++++ b/fs/cifs/dfs_cache.c
+@@@ -1361,45 -1120,115 +1361,119 @@@ static bool target_share_equal(struct T
+  	return match;
+  }
+  
+ -static bool is_ses_good(struct cifs_ses *ses)
+ +/*
+ + * Mark dfs tcon for reconnecting when the currently connected tcon does not match any of the new
+ + * target shares in @refs.
+ + */
+ +static void mark_for_reconnect_if_needed(struct cifs_tcon *tcon, struct dfs_cache_tgt_list *tl,
+ +					 const struct dfs_info3_param *refs, int numrefs)
+  {
+++<<<<<<< HEAD:fs/cifs/dfs_cache.c
+ +	struct dfs_cache_tgt_iterator *it;
+++=======
++ 	struct TCP_Server_Info *server = ses->server;
++ 	struct cifs_tcon *tcon = ses->tcon_ipc;
++ 	bool ret;
++ 
++ 	spin_lock(&ses->ses_lock);
++ 	spin_lock(&ses->chan_lock);
++ 	ret = !cifs_chan_needs_reconnect(ses, server) &&
++ 		ses->ses_status == SES_GOOD &&
++ 		!tcon->need_reconnect;
++ 	spin_unlock(&ses->chan_lock);
++ 	spin_unlock(&ses->ses_lock);
++ 	return ret;
++ }
++ 
++ /* Refresh dfs referral of @ses */
++ static void refresh_ses_referral(struct cifs_ses *ses)
++ {
++ 	struct cache_entry *ce;
++ 	unsigned int xid;
++ 	const char *path;
++ 	int rc = 0;
++ 
++ 	xid = get_xid();
++ 
++ 	path = dfs_ses_refpath(ses);
++ 	if (IS_ERR(path)) {
++ 		rc = PTR_ERR(path);
++ 		goto out;
++ 	}
++ 
++ 	ses = CIFS_DFS_ROOT_SES(ses);
++ 	if (!is_ses_good(ses)) {
++ 		cifs_dbg(FYI, "%s: skip cache refresh due to disconnected ipc\n",
++ 			 __func__);
++ 		goto out;
++ 	}
++ 
++ 	ce = cache_refresh_path(xid, ses, path, false);
++ 	if (!IS_ERR(ce))
++ 		up_read(&htable_rw_lock);
++ 	else
++ 		rc = PTR_ERR(ce);
++ 
++ out:
++ 	free_xid(xid);
++ }
++ 
++ static int __refresh_tcon_referral(struct cifs_tcon *tcon,
++ 				   const char *path,
++ 				   struct dfs_info3_param *refs,
++ 				   int numrefs, bool force_refresh)
++ {
++ 	struct cache_entry *ce;
++ 	bool reconnect = force_refresh;
++ 	int rc = 0;
+++>>>>>>> be1963dd4ce4 (smb: client: get rid of kstrdup() in get_ses_refpath()):fs/smb/client/dfs_cache.c
+  	int i;
+  
+ -	if (unlikely(!numrefs))
+ -		return 0;
+ -
+ -	if (force_refresh) {
+ +	for (it = dfs_cache_get_tgt_iterator(tl); it; it = dfs_cache_get_next_tgt(tl, it)) {
+  		for (i = 0; i < numrefs; i++) {
+ -			/* TODO: include prefix paths in the matching */
+ -			if (target_share_equal(tcon, refs[i].node_name)) {
+ -				reconnect = false;
+ -				break;
+ -			}
+ +			if (target_share_equal(tcon->ses->server, dfs_cache_get_tgt_name(it),
+ +					       refs[i].node_name))
+ +				return;
+  		}
+  	}
+  
+ -	down_write(&htable_rw_lock);
+ -	ce = lookup_cache_entry(path);
+ -	if (!IS_ERR(ce)) {
+ -		if (force_refresh || cache_entry_expired(ce))
+ -			rc = update_cache_entry_locked(ce, refs, numrefs);
+ -	} else if (PTR_ERR(ce) == -ENOENT) {
+ -		ce = add_cache_entry_locked(refs, numrefs);
+ -	}
+ -	up_write(&htable_rw_lock);
+ -
+ -	if (IS_ERR(ce))
+ -		rc = PTR_ERR(ce);
+ -	if (reconnect) {
+ -		cifs_tcon_dbg(FYI, "%s: mark for reconnect\n", __func__);
+ -		cifs_signal_cifsd_for_reconnect(tcon->ses->server, true);
+ -	}
+ -	return rc;
+ +	cifs_dbg(FYI, "%s: no cached or matched targets. mark dfs share for reconnect.\n", __func__);
+ +	cifs_signal_cifsd_for_reconnect(tcon->ses->server, true);
+  }
+  
+ -static void refresh_tcon_referral(struct cifs_tcon *tcon, bool force_refresh)
+ +/* Refresh dfs referral of tcon and mark it for reconnect if needed */
+ +static int __refresh_tcon(const char *path, struct cifs_ses **sessions, struct cifs_tcon *tcon,
+ +			  bool force_refresh)
+  {
+ -	struct dfs_info3_param *refs = NULL;
+ -	struct cache_entry *ce;
+  	struct cifs_ses *ses;
+++<<<<<<< HEAD:fs/cifs/dfs_cache.c
+ +	struct cache_entry *ce;
+ +	struct dfs_info3_param *refs = NULL;
+++=======
++ 	bool needs_refresh;
++ 	const char *path;
++ 	unsigned int xid;
+++>>>>>>> be1963dd4ce4 (smb: client: get rid of kstrdup() in get_ses_refpath()):fs/smb/client/dfs_cache.c
+  	int numrefs = 0;
+ +	bool needs_refresh = false;
+ +	struct dfs_cache_tgt_list tl = DFS_CACHE_TGT_LIST_INIT(tl);
+  	int rc = 0;
+ +	unsigned int xid;
+  
+++<<<<<<< HEAD:fs/cifs/dfs_cache.c
+ +	ses = find_ipc_from_server_path(sessions, path);
+ +	if (IS_ERR(ses)) {
+ +		cifs_dbg(FYI, "%s: could not find ipc session\n", __func__);
+ +		return PTR_ERR(ses);
+++=======
++ 	xid = get_xid();
++ 	ses = tcon->ses;
++ 
++ 	path = dfs_ses_refpath(ses);
++ 	if (IS_ERR(path)) {
++ 		rc = PTR_ERR(path);
++ 		goto out;
+++>>>>>>> be1963dd4ce4 (smb: client: get rid of kstrdup() in get_ses_refpath()):fs/smb/client/dfs_cache.c
+  	}
+  
+  	down_read(&htable_rw_lock);
+@@@ -1437,25 -1254,8 +1511,29 @@@
+  	}
+  
+  out:
+++<<<<<<< HEAD:fs/cifs/dfs_cache.c
+ +	dfs_cache_free_tgts(&tl);
+++=======
++ 	free_xid(xid);
+++>>>>>>> be1963dd4ce4 (smb: client: get rid of kstrdup() in get_ses_refpath()):fs/smb/client/dfs_cache.c
+  	free_dfs_info_array(refs, numrefs);
+ +	return rc;
+ +}
+ +
+ +static int refresh_tcon(struct cifs_ses **sessions, struct cifs_tcon *tcon, bool force_refresh)
+ +{
+ +	struct TCP_Server_Info *server = tcon->ses->server;
+ +
+ +	mutex_lock(&server->refpath_lock);
+ +	if (server->origin_fullpath) {
+ +		if (server->leaf_fullpath && strcasecmp(server->leaf_fullpath,
+ +							server->origin_fullpath))
+ +			__refresh_tcon(server->leaf_fullpath + 1, sessions, tcon, force_refresh);
+ +		__refresh_tcon(server->origin_fullpath + 1, sessions, tcon, force_refresh);
+ +	}
+ +	mutex_unlock(&server->refpath_lock);
+ +
+ +	return 0;
+  }
+  
+  /**
+* Unmerged path fs/smb/client/dfs.h
+* Unmerged path fs/cifs/dfs_cache.c
+* Unmerged path fs/smb/client/dfs.h
