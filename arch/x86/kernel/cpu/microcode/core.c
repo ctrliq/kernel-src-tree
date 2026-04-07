@@ -31,7 +31,9 @@
 #include <linux/fs.h>
 #include <linux/mm.h>
 
+#include <asm/microcode_intel.h>
 #include <asm/cpu_device_id.h>
+#include <asm/microcode_amd.h>
 #include <asm/perf_event.h>
 #include <asm/microcode.h>
 #include <asm/processor.h>
@@ -296,7 +298,7 @@ struct cpio_data find_microcode_in_initrd(const char *path, bool use_pa)
 #endif
 }
 
-static void reload_early_microcode(unsigned int cpu)
+void reload_early_microcode(unsigned int cpu)
 {
 	int vendor, family;
 

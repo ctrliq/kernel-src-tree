@@ -29,6 +29,7 @@
 #include <linux/kernel.h>
 #include <linux/pci.h>
 
+#include <asm/microcode_amd.h>
 #include <asm/microcode.h>
 #include <asm/processor.h>
 #include <asm/setup.h>
@@ -515,7 +516,7 @@ void load_ucode_amd_early(unsigned int cpuid_1_eax)
 	return apply_ucode_from_containers(cpuid_1_eax);
 }
 
-static enum ucode_state _load_microcode_amd(u8 family, const u8 *data, size_t size);
+static enum ucode_state load_microcode_amd(u8 family, const u8 *data, size_t size);
 
 int __init save_microcode_in_initrd_amd(unsigned int cpuid_1_eax)
 {
@@ -533,7 +534,7 @@ int __init save_microcode_in_initrd_amd(unsigned int cpuid_1_eax)
 	if (!desc.mc)
 		return -EINVAL;
 
-	ret = _load_microcode_amd(x86_family(cpuid_1_eax), desc.data, desc.size);
+	ret = load_microcode_amd(x86_family(cpuid_1_eax), desc.data, desc.size);
 	if (ret > UCODE_UPDATED)
 		return -EINVAL;
 
@@ -818,20 +819,6 @@ static enum ucode_state __load_microcode_amd(u8 family, const u8 *data,
 	return UCODE_OK;
 }
 
-static enum ucode_state _load_microcode_amd(u8 family, const u8 *data, size_t size)
-{
-	enum ucode_state ret;
-
-	/* free old equiv table */
-	free_equiv_cpu_table();
-
-	ret = __load_microcode_amd(family, data, size);
-	if (ret != UCODE_OK)
-		cleanup();
-
-	return ret;
-}
-
 static enum ucode_state load_microcode_amd(u8 family, const u8 *data, size_t size)
 {
 	struct cpuinfo_x86 *c;
@@ -839,9 +826,14 @@ static enum ucode_state load_microcode_amd(u8 family, const u8 *data, size_t siz
 	struct ucode_patch *p;
 	enum ucode_state ret;
 
-	ret = _load_microcode_amd(family, data, size);
-	if (ret != UCODE_OK)
+	/* free old equiv table */
+	free_equiv_cpu_table();
+
+	ret = __load_microcode_amd(family, data, size);
+	if (ret != UCODE_OK) {
+		cleanup();
 		return ret;
+	}
 
 	for_each_node_with_cpus(nid) {
 		cpu = cpumask_first(cpumask_of_node(nid));

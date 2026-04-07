@@ -3528,8 +3528,69 @@ static int partition_tape(struct scsi_tape *STp, int size)
 out:
 	return result;
 }
-
 
+/*
+ * Handles any extra state needed for ioctls which are not st-specific.
+ * Called with the scsi_tape lock held, released before return
+ */
+static long st_common_ioctl(struct scsi_tape *STp, struct st_modedef *STm,
+			    struct file *file, unsigned int cmd_in,
+			    unsigned long arg)
+{
+	int i, retval = 0;
+	void __user *p = (void __user *)arg;
+
+	if (!STm->defined) {
+		retval = -ENXIO;
+		goto out;
+	}
+
+	switch (cmd_in) {
+	case SCSI_IOCTL_GET_IDLUN:
+	case SCSI_IOCTL_GET_BUS_NUMBER:
+	case SCSI_IOCTL_GET_PCI:
+		break;
+	case SG_IO:
+	case SCSI_IOCTL_SEND_COMMAND:
+	case CDROM_SEND_PACKET:
+		if (!capable(CAP_SYS_RAWIO)) {
+			retval = -EPERM;
+			goto out;
+		}
+		retval = scsi_cmd_ioctl(STp->disk->queue, STp->disk,
+				   file->f_mode, cmd_in, p);
+
+		if (retval != -ENOTTY)
+			goto out;
+
+		fallthrough;
+	default:
+		if ((i = flush_buffer(STp, 0)) < 0) {
+			retval = i;
+			goto out;
+		} else { /* flush_buffer succeeds */
+			if (STp->can_partitions) {
+				i = switch_partition(STp);
+				if (i < 0) {
+					retval = i;
+					goto out;
+				}
+			}
+		}
+	}
+	mutex_unlock(&STp->lock);
+
+	retval = scsi_ioctl(STp->device, cmd_in, p);
+	if (!retval && cmd_in == SCSI_IOCTL_STOP_UNIT) {
+		/* unload */
+		STp->rew_at_close = 0;
+		STp->ready = ST_NO_TAPE;
+	}
+	return retval;
+out:
+	mutex_unlock(&STp->lock);
+	return retval;
+}
 
 /* The ioctl command */
 static long st_ioctl(struct file *file, unsigned int cmd_in, unsigned long arg)
@@ -3566,6 +3627,15 @@ static long st_ioctl(struct file *file, unsigned int cmd_in, unsigned long arg)
 			file->f_flags & O_NDELAY);
 	if (retval)
 		goto out;
+
+	switch (cmd_in) {
+	case MTIOCPOS:
+	case MTIOCGET:
+	case MTIOCTOP:
+		break;
+	default:
+		return st_common_ioctl(STp, STm, file, cmd_in, arg);
+	}
 
 	cmd_type = _IOC_TYPE(cmd_in);
 	cmd_nr = _IOC_NR(cmd_in);
@@ -3883,33 +3953,7 @@ static long st_ioctl(struct file *file, unsigned int cmd_in, unsigned long arg)
 		i = copy_to_user(p, &mt_pos, sizeof(struct mtpos));
 		if (i)
 			retval = (-EFAULT);
-		goto out;
 	}
-	mutex_unlock(&STp->lock);
-	switch (cmd_in) {
-		case SCSI_IOCTL_GET_IDLUN:
-		case SCSI_IOCTL_GET_BUS_NUMBER:
-			break;
-		default:
-			if ((cmd_in == SG_IO ||
-			     cmd_in == SCSI_IOCTL_SEND_COMMAND ||
-			     cmd_in == CDROM_SEND_PACKET) &&
-			    !capable(CAP_SYS_RAWIO))
-				i = -EPERM;
-			else
-				i = scsi_cmd_ioctl(STp->disk->queue, STp->disk,
-						   file->f_mode, cmd_in, p);
-			if (i != -ENOTTY)
-				return i;
-			break;
-	}
-	retval = scsi_ioctl(STp->device, cmd_in, p);
-	if (!retval && cmd_in == SCSI_IOCTL_STOP_UNIT) { /* unload */
-		STp->rew_at_close = 0;
-		STp->ready = ST_NO_TAPE;
-	}
-	return retval;
-
  out:
 	mutex_unlock(&STp->lock);
 	return retval;

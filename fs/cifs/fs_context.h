@@ -259,6 +259,11 @@ struct smb3_fs_context {
 	__u16 compression; /* compression algorithm 0xFFFF default 0=disabled */
 	bool rootfs:1; /* if it's a SMB root file system */
 	bool witness:1; /* use witness protocol */
+	char *leaf_fullpath;
+	struct cifs_ses *dfs_root_ses;
+	bool dfs_automount:1; /* set for dfs automount only */
+	bool dfs_conn:1; /* set for dfs mounts */
+	char *dns_dom;
 };
 
 extern const struct fs_parameter_spec smb3_fs_parameters[];

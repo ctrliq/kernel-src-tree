@@ -3,7 +3,7 @@
 
 #include <linux/firmware.h>
 #include <asm/cpu.h>
-#include <asm/microcode.h>
+#include <asm/microcode_intel.h>
 
 #include "ifs.h"
 
