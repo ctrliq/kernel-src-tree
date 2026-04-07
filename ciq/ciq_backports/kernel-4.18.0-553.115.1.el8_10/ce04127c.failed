@@ -1,0 +1,135 @@
+smb: client: ensure to try all targets when finding nested links
+
+jira KERNEL-814
+Rebuild_History Non-Buildable kernel-4.18.0-553.115.1.el8_10
+commit-author Paulo Alcantara <pc@manguebit.com>
+commit ce04127c5849af610d395b5b9552ef31d83c0189
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.115.1.el8_10/ce04127c.failed
+
+With current implementation, when a nested DFS link is found during
+mount(2), the client follows the referral and then try to connect to
+all of its targets.  If all targets failed, the client bails out
+rather than retrying remaining targets from previous referral.
+
+Fix this by stacking all referrals and targets so the client can retry
+remaining targets from previous referrals in case all targets of
+current referral have failed.
+
+Thanks to samba, this can be easily tested like below
+
+* Run the following under dfs folder in samba server
+
+  $ ln -s "msdfs:srv\\bad-share" link1
+  $ ln -s "msdfs:srv\\dfs\\link1,srv\\good-share" link0
+
+* Before patch
+
+  $ mount.cifs //srv/dfs/link0 /mnt -o ...
+  mount error(2): No such file or directory
+  Refer to the mount.cifs(8) manual page (e.g. man mount.cifs)...
+
+* After patch
+
+  $ mount.cifs //srv/dfs/link0 /mnt -o ...
+  # ls /mnt
+  bar  fileshare1  sub
+
+	Signed-off-by: Paulo Alcantara (SUSE) <pc@manguebit.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit ce04127c5849af610d395b5b9552ef31d83c0189)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/smb/client/dfs.c
+#	fs/smb/client/dfs.h
+* Unmerged path fs/smb/client/dfs.c
+* Unmerged path fs/smb/client/dfs.h
+diff --git a/fs/cifs/cifsglob.h b/fs/cifs/cifsglob.h
+index ee8d82174e1b..f64a4d960eba 100644
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@ -1731,11 +1731,23 @@ struct cifs_mount_ctx {
+ #endif
+ };
+ 
++static inline void __free_dfs_info_param(struct dfs_info3_param *param)
++{
++	kfree(param->path_name);
++	kfree(param->node_name);
++}
++
+ static inline void free_dfs_info_param(struct dfs_info3_param *param)
++{
++	if (param)
++		__free_dfs_info_param(param);
++}
++
++static inline void zfree_dfs_info_param(struct dfs_info3_param *param)
+ {
+ 	if (param) {
+-		kfree(param->path_name);
+-		kfree(param->node_name);
++		__free_dfs_info_param(param);
++		memset(param, 0, sizeof(*param));
+ 	}
+ }
+ 
+diff --git a/fs/cifs/dfs_cache.c b/fs/cifs/dfs_cache.c
+index cb493cdef4ba..588c8feeec4f 100644
+--- a/fs/cifs/dfs_cache.c
++++ b/fs/cifs/dfs_cache.c
+@@ -26,8 +26,6 @@
+ #define CACHE_MAX_ENTRIES 64
+ #define CACHE_MIN_TTL 120 /* 2 minutes */
+ 
+-#define IS_DFS_INTERLINK(v) (((v) & DFSREF_REFERRAL_SERVER) && !((v) & DFSREF_STORAGE_SERVER))
+-
+ struct cache_dfs_tgt {
+ 	char *name;
+ 	int path_consumed;
+@@ -283,7 +281,7 @@ static int dfscache_proc_show(struct seq_file *m, void *v)
+ 				   "cache entry: path=%s,type=%s,ttl=%d,etime=%ld,hdr_flags=0x%x,ref_flags=0x%x,interlink=%s,path_consumed=%d,expired=%s\n",
+ 				   ce->path, ce->srvtype == DFS_TYPE_ROOT ? "root" : "link",
+ 				   ce->ttl, ce->etime.tv_nsec, ce->hdr_flags, ce->ref_flags,
+-				   IS_DFS_INTERLINK(ce->hdr_flags) ? "yes" : "no",
++				   DFS_INTERLINK(ce->hdr_flags) ? "yes" : "no",
+ 				   ce->path_consumed, cache_entry_expired(ce) ? "yes" : "no");
+ 
+ 			list_for_each_entry(t, &ce->tlist, list) {
+@@ -352,7 +350,7 @@ static inline void dump_ce(const struct cache_entry *ce)
+ 		 ce->srvtype == DFS_TYPE_ROOT ? "root" : "link", ce->ttl,
+ 		 ce->etime.tv_nsec,
+ 		 ce->hdr_flags, ce->ref_flags,
+-		 IS_DFS_INTERLINK(ce->hdr_flags) ? "yes" : "no",
++		 DFS_INTERLINK(ce->hdr_flags) ? "yes" : "no",
+ 		 ce->path_consumed,
+ 		 cache_entry_expired(ce) ? "yes" : "no");
+ 	dump_tgts(ce);
+diff --git a/fs/cifs/dfs_cache.h b/fs/cifs/dfs_cache.h
+index 2b8c2526de76..4d0b5a276b92 100644
+--- a/fs/cifs/dfs_cache.h
++++ b/fs/cifs/dfs_cache.h
+@@ -52,8 +52,8 @@ static inline struct dfs_cache_tgt_iterator *
+ dfs_cache_get_next_tgt(struct dfs_cache_tgt_list *tl,
+ 		       struct dfs_cache_tgt_iterator *it)
+ {
+-	if (!tl || list_empty(&tl->tl_list) || !it ||
+-	    list_is_last(&it->it_list, &tl->tl_list))
++	if (!tl || !tl->tl_numtgts || list_empty(&tl->tl_list) ||
++	    !it || list_is_last(&it->it_list, &tl->tl_list))
+ 		return NULL;
+ 	return list_next_entry(it, it_list);
+ }
+@@ -72,7 +72,7 @@ static inline void dfs_cache_free_tgts(struct dfs_cache_tgt_list *tl)
+ {
+ 	struct dfs_cache_tgt_iterator *it, *nit;
+ 
+-	if (!tl || list_empty(&tl->tl_list))
++	if (!tl || !tl->tl_numtgts || list_empty(&tl->tl_list))
+ 		return;
+ 	list_for_each_entry_safe(it, nit, &tl->tl_list, it_list) {
+ 		list_del(&it->it_list);
+* Unmerged path fs/smb/client/dfs.c
+* Unmerged path fs/smb/client/dfs.h
