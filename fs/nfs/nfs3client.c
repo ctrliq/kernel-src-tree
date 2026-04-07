@@ -81,6 +81,7 @@ struct nfs_client *nfs3_set_ds_client(struct nfs_server *mds_srv,
 		int ds_proto, unsigned int ds_timeo, unsigned int ds_retrans)
 {
 	struct rpc_timeout ds_timeout;
+	unsigned long connect_timeout = ds_timeo * (ds_retrans + 1) * HZ / 10;
 	struct nfs_client *mds_clp = mds_srv->nfs_client;
 	struct nfs_client_initdata cl_init = {
 		.addr = ds_addr,
@@ -92,6 +93,8 @@ struct nfs_client *nfs3_set_ds_client(struct nfs_server *mds_srv,
 		.net = mds_clp->cl_net,
 		.timeparms = &ds_timeout,
 		.cred = mds_srv->cred,
+		.connect_timeout = connect_timeout,
+		.reconnect_timeout = connect_timeout,
 	};
 	struct nfs_client *clp;
 	char buf[INET6_ADDRSTRLEN + 1];

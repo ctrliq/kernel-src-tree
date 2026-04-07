@@ -300,7 +300,8 @@ readpage_async_filler(void *data, struct page *page)
 
 	aligned_len = min_t(unsigned int, ALIGN(len, rsize), PAGE_SIZE);
 
-	new = nfs_create_request(desc->ctx, page, 0, aligned_len);
+	new = nfs_page_create_from_page(desc->ctx, page, 0,
+					page_index(page) << PAGE_SHIFT, aligned_len);
 	if (IS_ERR(new))
 		goto out_error;
 
