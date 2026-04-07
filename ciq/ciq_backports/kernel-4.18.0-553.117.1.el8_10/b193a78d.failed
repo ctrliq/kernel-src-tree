@@ -1,0 +1,179 @@
+NFS: Use the correct commit info in nfs_join_page_group()
+
+jira KERNEL-814
+Rebuild_History Non-Buildable kernel-4.18.0-553.117.1.el8_10
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit b193a78ddb5ee7dba074d3f28dc050069ba083c0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.117.1.el8_10/b193a78d.failed
+
+Ensure that nfs_clear_request_commit() updates the correct counters when
+it removes them from the commit list.
+
+Fixes: ed5d588fe47f ("NFS: Try to join page groups before an O_DIRECT retransmission")
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit b193a78ddb5ee7dba074d3f28dc050069ba083c0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/write.c
+#	include/linux/nfs_page.h
+diff --cc fs/nfs/write.c
+index 0060e32e5e03,8c1ee1a1a28f..000000000000
+--- a/fs/nfs/write.c
++++ b/fs/nfs/write.c
+@@@ -559,16 -560,17 +560,23 @@@ nfs_page_group_lock_subreq(struct nfs_p
+   *
+   * Returns a locked, referenced pointer to the head request - which after
+   * this call is guaranteed to be the only request associated with the page.
+ - * Returns NULL if no requests are found for @folio, or a ERR_PTR if an
+ + * Returns NULL if no requests are found for @page, or a ERR_PTR if an
+   * error was encountered.
+   */
+ -static struct nfs_page *nfs_lock_and_join_requests(struct folio *folio)
+ +static struct nfs_page *
+ +nfs_lock_and_join_requests(struct page *page)
+  {
+++<<<<<<< HEAD
+ +	struct inode *inode = page_file_mapping(page)->host;
+ +	struct nfs_page *head, *subreq;
+++=======
++ 	struct inode *inode = folio_file_mapping(folio)->host;
++ 	struct nfs_page *head;
++ 	struct nfs_commit_info cinfo;
+++>>>>>>> b193a78ddb5e (NFS: Use the correct commit info in nfs_join_page_group())
+  	int ret;
+  
++ 	nfs_init_cinfo_from_inode(&cinfo, inode);
+  	/*
+  	 * A reference is taken only on the head request which acts as a
+  	 * reference to the whole page group - the group will not be destroyed
+@@@ -579,44 -580,16 +587,48 @@@ retry
+  	if (IS_ERR_OR_NULL(head))
+  		return head;
+  
+ -	/* lock each request in the page group */
+ -	ret = nfs_page_group_lock_subrequests(head);
+ -	if (ret < 0) {
+ -		nfs_unlock_and_release_request(head);
+ -		return ERR_PTR(ret);
+ +	while (!nfs_lock_request(head)) {
+ +		ret = nfs_wait_on_request(head);
+ +		if (ret < 0) {
+ +			nfs_release_request(head);
+ +			return ERR_PTR(ret);
+ +		}
+  	}
+  
+++<<<<<<< HEAD
+ +	ret = nfs_page_group_lock(head);
+ +	if (ret < 0)
+ +		goto out_unlock;
+++=======
++ 	nfs_join_page_group(head, &cinfo, inode);
+++>>>>>>> b193a78ddb5e (NFS: Use the correct commit info in nfs_join_page_group())
+ +
+ +	/* Ensure that nobody removed the request before we locked it */
+ +	if (head != nfs_page_private_request(page) && !PageSwapCache(page)) {
+ +		nfs_page_group_unlock(head);
+ +		nfs_unlock_and_release_request(head);
+ +		goto retry;
+ +	}
+  
+ +	nfs_cancel_remove_inode(head, inode);
+ +
+ +	/* lock each request in the page group */
+ +	for (subreq = head->wb_this_page;
+ +	     subreq != head;
+ +	     subreq = subreq->wb_this_page) {
+ +		ret = nfs_page_group_lock_subreq(head, subreq);
+ +		if (ret < 0)
+ +			goto out_unlock;
+ +	}
+ +
+ +	nfs_page_group_unlock(head);
+ +
+ +	nfs_join_page_group(head, inode);
+  	return head;
+ +
+ +out_unlock:
+ +	nfs_unlock_and_release_request(head);
+ +	return ERR_PTR(ret);
+  }
+  
+  static void nfs_write_error(struct nfs_page *req, int error)
+@@@ -984,15 -964,13 +996,13 @@@ static void nfs_clear_request_commit(st
+  	if (test_bit(PG_CLEAN, &req->wb_flags)) {
+  		struct nfs_open_context *ctx = nfs_req_openctx(req);
+  		struct inode *inode = d_inode(ctx->dentry);
+- 		struct nfs_commit_info cinfo;
+  
+- 		nfs_init_cinfo_from_inode(&cinfo, inode);
+  		mutex_lock(&NFS_I(inode)->commit_mutex);
+- 		if (!pnfs_clear_request_commit(req, &cinfo)) {
+- 			nfs_request_remove_commit_list(req, &cinfo);
++ 		if (!pnfs_clear_request_commit(req, cinfo)) {
++ 			nfs_request_remove_commit_list(req, cinfo);
+  		}
+  		mutex_unlock(&NFS_I(inode)->commit_mutex);
+ -		nfs_folio_clear_commit(nfs_page_to_folio(req));
+ +		nfs_clear_page_commit(req->wb_page);
+  	}
+  }
+  
+diff --cc include/linux/nfs_page.h
+index d6e6a9376ee4,1c315f854ea8..000000000000
+--- a/include/linux/nfs_page.h
++++ b/include/linux/nfs_page.h
+@@@ -144,7 -156,10 +144,14 @@@ extern  int nfs_wait_on_request(struct 
+  extern	void nfs_unlock_request(struct nfs_page *req);
+  extern	void nfs_unlock_and_release_request(struct nfs_page *);
+  extern	struct nfs_page *nfs_page_group_lock_head(struct nfs_page *req);
+++<<<<<<< HEAD
+ +extern	void nfs_join_page_group(struct nfs_page *head, struct inode *inode);
+++=======
++ extern	int nfs_page_group_lock_subrequests(struct nfs_page *head);
++ extern void nfs_join_page_group(struct nfs_page *head,
++ 				struct nfs_commit_info *cinfo,
++ 				struct inode *inode);
+++>>>>>>> b193a78ddb5e (NFS: Use the correct commit info in nfs_join_page_group())
+  extern int nfs_page_group_lock(struct nfs_page *);
+  extern void nfs_page_group_unlock(struct nfs_page *);
+  extern bool nfs_page_group_sync_on_bit(struct nfs_page *, unsigned int);
+diff --git a/fs/nfs/direct.c b/fs/nfs/direct.c
+index cba4a098dc6d..9ba025b8a095 100644
+--- a/fs/nfs/direct.c
++++ b/fs/nfs/direct.c
+@@ -520,7 +520,9 @@ static void nfs_direct_add_page_head(struct list_head *list,
+ 	kref_get(&head->wb_kref);
+ }
+ 
+-static void nfs_direct_join_group(struct list_head *list, struct inode *inode)
++static void nfs_direct_join_group(struct list_head *list,
++				  struct nfs_commit_info *cinfo,
++				  struct inode *inode)
+ {
+ 	struct nfs_page *req, *subreq;
+ 
+@@ -542,7 +544,7 @@ static void nfs_direct_join_group(struct list_head *list, struct inode *inode)
+ 				nfs_release_request(subreq);
+ 			}
+ 		} while ((subreq = subreq->wb_this_page) != req);
+-		nfs_join_page_group(req, inode);
++		nfs_join_page_group(req, cinfo, inode);
+ 	}
+ }
+ 
+@@ -568,7 +570,7 @@ static void nfs_direct_write_reschedule(struct nfs_direct_req *dreq)
+ 	nfs_init_cinfo_from_dreq(&cinfo, dreq);
+ 	nfs_direct_write_scan_commit_list(dreq->inode, &reqs, &cinfo);
+ 
+-	nfs_direct_join_group(&reqs, dreq->inode);
++	nfs_direct_join_group(&reqs, &cinfo, dreq->inode);
+ 
+ 	dreq->count = 0;
+ 	dreq->max_count = 0;
+* Unmerged path fs/nfs/write.c
+* Unmerged path include/linux/nfs_page.h
