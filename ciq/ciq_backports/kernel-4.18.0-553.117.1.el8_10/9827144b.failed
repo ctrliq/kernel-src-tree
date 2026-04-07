@@ -1,0 +1,185 @@
+NFS: Treat ENETUNREACH errors as fatal in containers
+
+jira KERNEL-814
+Rebuild_History Non-Buildable kernel-4.18.0-553.117.1.el8_10
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit 9827144bfb2b1baf1e78600da73dcc9e92e28415
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.117.1.el8_10/9827144b.failed
+
+Propagate the NFS_MOUNT_NETUNREACH_FATAL flag to work with the generic
+NFS client. If the flag is set, the client will receive ENETDOWN and
+ENETUNREACH errors from the RPC layer, and is expected to treat them as
+being fatal.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+	Reviewed-by: Jeff Layton <jlayton@kernel.org>
+	Tested-by: Jeff Layton <jlayton@kernel.org>
+	Acked-by: Chuck Lever <chuck.lever@oracle.com>
+(cherry picked from commit 9827144bfb2b1baf1e78600da73dcc9e92e28415)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sunrpc/clnt.h
+#	net/sunrpc/clnt.c
+diff --cc include/linux/sunrpc/clnt.h
+index 8fcd08c62084,f8b406b0a1af..000000000000
+--- a/include/linux/sunrpc/clnt.h
++++ b/include/linux/sunrpc/clnt.h
+@@@ -57,7 -63,11 +57,15 @@@ struct rpc_clnt 
+  				cl_discrtry : 1,/* disconnect before retry */
+  				cl_noretranstimeo: 1,/* No retransmit timeouts */
+  				cl_autobind : 1,/* use getport() */
+++<<<<<<< HEAD
+ +				cl_chatty   : 1;/* be verbose */
+++=======
++ 				cl_chatty   : 1,/* be verbose */
++ 				cl_shutdown : 1,/* rpc immediate -EIO */
++ 				cl_netunreach_fatal : 1;
++ 						/* Treat ENETUNREACH errors as fatal */
++ 	struct xprtsec_parms	cl_xprtsec;	/* transport security policy */
+++>>>>>>> 9827144bfb2b (NFS: Treat ENETUNREACH errors as fatal in containers)
+  
+  	struct rpc_rtt *	cl_rtt;		/* RTO estimator data */
+  	const struct rpc_timeout *cl_timeout;	/* Timeout strategy */
+diff --cc net/sunrpc/clnt.c
+index 8dd0adcb19d8,1cfaf93ceec1..000000000000
+--- a/net/sunrpc/clnt.c
++++ b/net/sunrpc/clnt.c
+@@@ -1100,12 -1198,9 +1103,18 @@@ void rpc_task_set_client(struct rpc_tas
+  		task->tk_flags |= RPC_TASK_TIMEOUT;
+  	if (clnt->cl_noretranstimeo)
+  		task->tk_flags |= RPC_TASK_NO_RETRANS_TIMEOUT;
+++<<<<<<< HEAD
+ +	if (atomic_read(&clnt->cl_swapper))
+ +		task->tk_flags |= RPC_TASK_SWAPPER;
+ +	/* Add to the client's list of all tasks */
+ +	spin_lock(&clnt->cl_lock);
+ +	list_add_tail(&task->tk_task, &clnt->cl_tasks);
+ +	spin_unlock(&clnt->cl_lock);
+++=======
++ 	if (clnt->cl_netunreach_fatal)
++ 		task->tk_flags |= RPC_TASK_NETUNREACH_FATAL;
++ 	atomic_inc(&clnt->cl_task_count);
+++>>>>>>> 9827144bfb2b (NFS: Treat ENETUNREACH errors as fatal in containers)
+  }
+  
+  static void
+@@@ -2086,19 -2199,22 +2098,22 @@@ call_connect_status(struct rpc_task *ta
+  
+  	task->tk_status = 0;
+  	switch (status) {
++ 	case -ENETDOWN:
++ 	case -ENETUNREACH:
++ 		if (task->tk_flags & RPC_TASK_NETUNREACH_FATAL)
++ 			break;
++ 		fallthrough;
+  	case -ECONNREFUSED:
+ -	case -ECONNRESET:
+  		/* A positive refusal suggests a rebind is needed. */
+- 		if (RPC_IS_SOFTCONN(task))
+- 			break;
+  		if (clnt->cl_autobind) {
+  			rpc_force_rebind(clnt);
++ 			if (RPC_IS_SOFTCONN(task))
++ 				break;
+  			goto out_retry;
+  		}
+ -		fallthrough;
+ +		/* fall through */
+ +	case -ECONNRESET:
+  	case -ECONNABORTED:
+- 	case -ENETDOWN:
+- 	case -ENETUNREACH:
+  	case -EHOSTUNREACH:
+  	case -EPIPE:
+  	case -EPROTO:
+diff --git a/fs/nfs/client.c b/fs/nfs/client.c
+index 75ae576066e9..c178f838bc36 100644
+--- a/fs/nfs/client.c
++++ b/fs/nfs/client.c
+@@ -532,6 +532,8 @@ int nfs_create_rpc_client(struct nfs_client *clp,
+ 		args.flags |= RPC_CLNT_CREATE_NOPING;
+ 	if (test_bit(NFS_CS_REUSEPORT, &clp->cl_flags))
+ 		args.flags |= RPC_CLNT_CREATE_REUSEPORT;
++	if (test_bit(NFS_CS_NETUNREACH_FATAL, &clp->cl_flags))
++		args.flags |= RPC_CLNT_CREATE_NETUNREACH_FATAL;
+ 
+ 	if (!IS_ERR(clp->cl_rpcclient))
+ 		return 0;
+@@ -690,6 +692,9 @@ static int nfs_init_server(struct nfs_server *server,
+ 	if (ctx->flags & NFS_MOUNT_NORESVPORT)
+ 		set_bit(NFS_CS_NORESVPORT, &cl_init.init_flags);
+ 
++	if (ctx->flags & NFS_MOUNT_NETUNREACH_FATAL)
++		__set_bit(NFS_CS_NETUNREACH_FATAL, &cl_init.init_flags);
++
+ 	/* Allocate or find a client reference we can use */
+ 	clp = nfs_get_client(&cl_init);
+ 	if (IS_ERR(clp))
+diff --git a/fs/nfs/nfs4client.c b/fs/nfs/nfs4client.c
+index a0c5c7dac4a5..e6f479b72c71 100644
+--- a/fs/nfs/nfs4client.c
++++ b/fs/nfs/nfs4client.c
+@@ -231,6 +231,8 @@ struct nfs_client *nfs4_alloc_client(const struct nfs_client_initdata *cl_init)
+ 	__set_bit(NFS_CS_NO_RETRANS_TIMEOUT, &clp->cl_flags);
+ 	if (test_bit(NFS_CS_PNFS, &cl_init->init_flags))
+ 		__set_bit(NFS_CS_PNFS, &clp->cl_flags);
++	if (test_bit(NFS_CS_NETUNREACH_FATAL, &cl_init->init_flags))
++		__set_bit(NFS_CS_NETUNREACH_FATAL, &clp->cl_flags);
+ 	/*
+ 	 * Set up the connection to the server before we add add to the
+ 	 * global list.
+diff --git a/fs/nfs/nfs4proc.c b/fs/nfs/nfs4proc.c
+index 61f07be64dbc..bcaa28c20bf6 100644
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@ -188,6 +188,9 @@ static int nfs4_map_errors(int err)
+ 		return -EBUSY;
+ 	case -NFS4ERR_NOT_SAME:
+ 		return -ENOTSYNC;
++	case -ENETDOWN:
++	case -ENETUNREACH:
++		break;
+ 	default:
+ 		dprintk("%s could not handle NFSv4 error %d\n",
+ 				__func__, -err);
+diff --git a/include/linux/nfs_fs_sb.h b/include/linux/nfs_fs_sb.h
+index 4d0a89db4e88..aa3554a8976f 100644
+--- a/include/linux/nfs_fs_sb.h
++++ b/include/linux/nfs_fs_sb.h
+@@ -49,6 +49,7 @@ struct nfs_client {
+ #define NFS_CS_DS		7		/* - Server is a DS */
+ #define NFS_CS_REUSEPORT	8		/* - reuse src port on reconnect */
+ #define NFS_CS_PNFS		9		/* - Server used for pnfs */
++#define NFS_CS_NETUNREACH_FATAL	10		/* - ENETUNREACH errors are fatal */
+ 	struct sockaddr_storage	cl_addr;	/* server identifier */
+ 	size_t			cl_addrlen;
+ 	char *			cl_hostname;	/* hostname of server */
+* Unmerged path include/linux/sunrpc/clnt.h
+diff --git a/include/linux/sunrpc/sched.h b/include/linux/sunrpc/sched.h
+index 2a9d13fe2827..db51eeadd5f0 100644
+--- a/include/linux/sunrpc/sched.h
++++ b/include/linux/sunrpc/sched.h
+@@ -123,6 +123,7 @@ struct rpc_task_setup {
+ #define RPC_TASK_MOVEABLE	0x0004		/* nfs4.1+ rpc tasks */
+ #define RPC_TASK_NULLCREDS	0x0010		/* Use AUTH_NULL credential */
+ #define RPC_CALL_MAJORSEEN	0x0020		/* major timeout seen */
++#define RPC_TASK_NETUNREACH_FATAL 0x0040	/* ENETUNREACH is fatal */
+ #define RPC_TASK_DYNAMIC	0x0080		/* task was kmalloc'ed */
+ #define	RPC_TASK_NO_ROUND_ROBIN	0x0100		/* send requests on "main" xprt */
+ #define RPC_TASK_SOFT		0x0200		/* Use soft timeouts */
+diff --git a/include/trace/events/sunrpc.h b/include/trace/events/sunrpc.h
+index db914a956f81..5eb17d5d7e2d 100644
+--- a/include/trace/events/sunrpc.h
++++ b/include/trace/events/sunrpc.h
+@@ -310,6 +310,7 @@ TRACE_EVENT(rpc_request,
+ 		{ RPC_TASK_SWAPPER, "SWAPPER" },			\
+ 		{ RPC_TASK_NULLCREDS, "NULLCREDS" },			\
+ 		{ RPC_CALL_MAJORSEEN, "MAJORSEEN" },			\
++		{ RPC_TASK_NETUNREACH_FATAL, "NETUNREACH_FATAL"},	\
+ 		{ RPC_TASK_DYNAMIC, "DYNAMIC" },			\
+ 		{ RPC_TASK_NO_ROUND_ROBIN, "NO_ROUND_ROBIN" },		\
+ 		{ RPC_TASK_SOFT, "SOFT" },				\
+* Unmerged path net/sunrpc/clnt.c
