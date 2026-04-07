@@ -1,0 +1,239 @@
+cifs: change tcon status when need_reconnect is set on it
+
+jira KERNEL-814
+Rebuild_History Non-Buildable kernel-4.18.0-553.115.1.el8_10
+commit-author Shyam Prasad N <sprasad@microsoft.com>
+commit c6e02eefd6ace3da3369c764f15429f5647056af
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.115.1.el8_10/c6e02eef.failed
+
+When a tcon is marked for need_reconnect, the intention
+is to have it reconnected.
+
+This change adjusts tcon->status in cifs_tree_connect
+when need_reconnect is set. Also, this change has a minor
+correction in resetting need_reconnect on success. It makes
+sure that it is done with tc_lock held.
+
+	Signed-off-by: Shyam Prasad N <sprasad@microsoft.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit c6e02eefd6ace3da3369c764f15429f5647056af)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/connect.c
+#	fs/cifs/file.c
+#	fs/smb/client/dfs.c
+diff --cc fs/cifs/connect.c
+index ac21200be929,01c49b29c499..000000000000
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@@ -4667,9 -4228,12 +4667,18 @@@ int cifs_tree_connect(const unsigned in
+  
+  	/* only send once per connect */
+  	spin_lock(&tcon->tc_lock);
+++<<<<<<< HEAD:fs/cifs/connect.c
+ +	if (tcon->ses->ses_status != SES_GOOD ||
+ +	    (tcon->status != TID_NEW &&
+ +	    tcon->status != TID_NEED_TCON)) {
+++=======
++ 
++ 	/* if tcon is marked for needing reconnect, update state */
++ 	if (tcon->need_reconnect)
++ 		tcon->status = TID_NEED_TCON;
++ 
++ 	if (tcon->status == TID_GOOD) {
+++>>>>>>> c6e02eefd6ac (cifs: change tcon status when need_reconnect is set on it):fs/smb/client/connect.c
+  		spin_unlock(&tcon->tc_lock);
+  		return 0;
+  	}
+diff --cc fs/cifs/file.c
+index 0580416165b8,f391c9b803d8..000000000000
+--- a/fs/cifs/file.c
++++ b/fs/cifs/file.c
+@@@ -31,6 -34,177 +31,180 @@@
+  #include "fscache.h"
+  #include "smbdirect.h"
+  #include "fs_context.h"
+++<<<<<<< HEAD:fs/cifs/file.c
+++=======
++ #include "cifs_ioctl.h"
++ #include "cached_dir.h"
++ 
++ /*
++  * Remove the dirty flags from a span of pages.
++  */
++ static void cifs_undirty_folios(struct inode *inode, loff_t start, unsigned int len)
++ {
++ 	struct address_space *mapping = inode->i_mapping;
++ 	struct folio *folio;
++ 	pgoff_t end;
++ 
++ 	XA_STATE(xas, &mapping->i_pages, start / PAGE_SIZE);
++ 
++ 	rcu_read_lock();
++ 
++ 	end = (start + len - 1) / PAGE_SIZE;
++ 	xas_for_each_marked(&xas, folio, end, PAGECACHE_TAG_DIRTY) {
++ 		if (xas_retry(&xas, folio))
++ 			continue;
++ 		xas_pause(&xas);
++ 		rcu_read_unlock();
++ 		folio_lock(folio);
++ 		folio_clear_dirty_for_io(folio);
++ 		folio_unlock(folio);
++ 		rcu_read_lock();
++ 	}
++ 
++ 	rcu_read_unlock();
++ }
++ 
++ /*
++  * Completion of write to server.
++  */
++ void cifs_pages_written_back(struct inode *inode, loff_t start, unsigned int len)
++ {
++ 	struct address_space *mapping = inode->i_mapping;
++ 	struct folio *folio;
++ 	pgoff_t end;
++ 
++ 	XA_STATE(xas, &mapping->i_pages, start / PAGE_SIZE);
++ 
++ 	if (!len)
++ 		return;
++ 
++ 	rcu_read_lock();
++ 
++ 	end = (start + len - 1) / PAGE_SIZE;
++ 	xas_for_each(&xas, folio, end) {
++ 		if (xas_retry(&xas, folio))
++ 			continue;
++ 		if (!folio_test_writeback(folio)) {
++ 			WARN_ONCE(1, "bad %x @%llx page %lx %lx\n",
++ 				  len, start, folio->index, end);
++ 			continue;
++ 		}
++ 
++ 		folio_detach_private(folio);
++ 		folio_end_writeback(folio);
++ 	}
++ 
++ 	rcu_read_unlock();
++ }
++ 
++ /*
++  * Failure of write to server.
++  */
++ void cifs_pages_write_failed(struct inode *inode, loff_t start, unsigned int len)
++ {
++ 	struct address_space *mapping = inode->i_mapping;
++ 	struct folio *folio;
++ 	pgoff_t end;
++ 
++ 	XA_STATE(xas, &mapping->i_pages, start / PAGE_SIZE);
++ 
++ 	if (!len)
++ 		return;
++ 
++ 	rcu_read_lock();
++ 
++ 	end = (start + len - 1) / PAGE_SIZE;
++ 	xas_for_each(&xas, folio, end) {
++ 		if (xas_retry(&xas, folio))
++ 			continue;
++ 		if (!folio_test_writeback(folio)) {
++ 			WARN_ONCE(1, "bad %x @%llx page %lx %lx\n",
++ 				  len, start, folio->index, end);
++ 			continue;
++ 		}
++ 
++ 		folio_set_error(folio);
++ 		folio_end_writeback(folio);
++ 	}
++ 
++ 	rcu_read_unlock();
++ }
++ 
++ /*
++  * Redirty pages after a temporary failure.
++  */
++ void cifs_pages_write_redirty(struct inode *inode, loff_t start, unsigned int len)
++ {
++ 	struct address_space *mapping = inode->i_mapping;
++ 	struct folio *folio;
++ 	pgoff_t end;
++ 
++ 	XA_STATE(xas, &mapping->i_pages, start / PAGE_SIZE);
++ 
++ 	if (!len)
++ 		return;
++ 
++ 	rcu_read_lock();
++ 
++ 	end = (start + len - 1) / PAGE_SIZE;
++ 	xas_for_each(&xas, folio, end) {
++ 		if (!folio_test_writeback(folio)) {
++ 			WARN_ONCE(1, "bad %x @%llx page %lx %lx\n",
++ 				  len, start, folio->index, end);
++ 			continue;
++ 		}
++ 
++ 		filemap_dirty_folio(folio->mapping, folio);
++ 		folio_end_writeback(folio);
++ 	}
++ 
++ 	rcu_read_unlock();
++ }
++ 
++ /*
++  * Mark as invalid, all open files on tree connections since they
++  * were closed when session to server was lost.
++  */
++ void
++ cifs_mark_open_files_invalid(struct cifs_tcon *tcon)
++ {
++ 	struct cifsFileInfo *open_file = NULL;
++ 	struct list_head *tmp;
++ 	struct list_head *tmp1;
++ 
++ 	/* only send once per connect */
++ 	spin_lock(&tcon->tc_lock);
++ 	if (tcon->need_reconnect)
++ 		tcon->status = TID_NEED_RECON;
++ 
++ 	if (tcon->status != TID_NEED_RECON) {
++ 		spin_unlock(&tcon->tc_lock);
++ 		return;
++ 	}
++ 	tcon->status = TID_IN_FILES_INVALIDATE;
++ 	spin_unlock(&tcon->tc_lock);
++ 
++ 	/* list all files open on tree connection and mark them invalid */
++ 	spin_lock(&tcon->open_file_lock);
++ 	list_for_each_safe(tmp, tmp1, &tcon->openFileList) {
++ 		open_file = list_entry(tmp, struct cifsFileInfo, tlist);
++ 		open_file->invalidHandle = true;
++ 		open_file->oplock_break_cancelled = true;
++ 	}
++ 	spin_unlock(&tcon->open_file_lock);
++ 
++ 	invalidate_all_cached_dirs(tcon);
++ 	spin_lock(&tcon->tc_lock);
++ 	if (tcon->status == TID_IN_FILES_INVALIDATE)
++ 		tcon->status = TID_NEED_TCON;
++ 	spin_unlock(&tcon->tc_lock);
++ 
++ 	/*
++ 	 * BB Add call to invalidate_inodes(sb) for all superblocks mounted
++ 	 * to this tcon.
++ 	 */
++ }
+++>>>>>>> c6e02eefd6ac (cifs: change tcon status when need_reconnect is set on it):fs/smb/client/file.c
+  
+  static inline int cifs_convert_flags(unsigned int flags)
+  {
+* Unmerged path fs/smb/client/dfs.c
+* Unmerged path fs/cifs/connect.c
+* Unmerged path fs/cifs/file.c
+* Unmerged path fs/smb/client/dfs.c
