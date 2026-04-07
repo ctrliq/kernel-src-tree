@@ -4489,6 +4489,11 @@ fi\
 #
 #
 %changelog
+* Tue Apr 07 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.21-2.1.el9
+-- spec: Skip certificate setup for noarch builds (Brett Mastbergen)
+-- github actions: Inherit the Kernel CI Automated workflow from main (Brett Mastbergen)
+-- kallsyms: clean up modname and modbuildid initialization in kallsyms_lookup_buildid() (Brett Mastbergen)
+-- [CIQ] v6.18.21 - updated spec (github-actions[bot])
 * Fri Apr 03 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.18.21-1.1.el9
 -- Rebased changes for Linux 6.18.21 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.21-1)
 -- [CIQ] v6.18.20 - updated spec (github-actions[bot])
