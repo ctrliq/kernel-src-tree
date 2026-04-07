@@ -1,0 +1,242 @@
+x86/microcode/AMD: Fix Entrysign revision check for Zen5/Strix Halo
+
+jira KERNEL-814
+Rebuild_History Non-Buildable kernel-4.18.0-553.115.1.el8_10
+commit-author Rong Zhang <i@rong.moe>
+commit 150b1b97e27513535dcd3795d5ecd28e61b6cb8c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.115.1.el8_10/150b1b97.failed
+
+Zen5 also contains family 1Ah, models 70h-7Fh, which are mistakenly missing
+from cpu_has_entrysign(). Add the missing range.
+
+Fixes: 8a9fb5129e8e ("x86/microcode/AMD: Limit Entrysign signature checking to known generations")
+	Signed-off-by: Rong Zhang <i@rong.moe>
+	Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+	Cc: stable@kernel.org
+Link: https://patch.msgid.link/20251229182245.152747-1-i@rong.moe
+(cherry picked from commit 150b1b97e27513535dcd3795d5ecd28e61b6cb8c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/microcode/amd.c
+diff --cc arch/x86/kernel/cpu/microcode/amd.c
+index 7f9558923561,46673530bc6f..000000000000
+--- a/arch/x86/kernel/cpu/microcode/amd.c
++++ b/arch/x86/kernel/cpu/microcode/amd.c
+@@@ -62,6 -138,210 +62,213 @@@ static u32 ucode_new_rev
+  static const char
+  ucode_path[] __maybe_unused = "kernel/x86/microcode/AuthenticAMD.bin";
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * This is CPUID(1).EAX on the BSP. It is used in two ways:
++  *
++  * 1. To ignore the equivalence table on Zen1 and newer.
++  *
++  * 2. To match which patches to load because the patch revision ID
++  *    already contains the f/m/s for which the microcode is destined
++  *    for.
++  */
++ static u32 bsp_cpuid_1_eax __ro_after_init;
++ 
++ static bool sha_check = true;
++ 
++ struct patch_digest {
++ 	u32 patch_id;
++ 	u8 sha256[SHA256_DIGEST_SIZE];
++ };
++ 
++ #include "amd_shas.c"
++ 
++ static int cmp_id(const void *key, const void *elem)
++ {
++ 	struct patch_digest *pd = (struct patch_digest *)elem;
++ 	u32 patch_id = *(u32 *)key;
++ 
++ 	if (patch_id == pd->patch_id)
++ 		return 0;
++ 	else if (patch_id < pd->patch_id)
++ 		return -1;
++ 	else
++ 		return 1;
++ }
++ 
++ static u32 cpuid_to_ucode_rev(unsigned int val)
++ {
++ 	union zen_patch_rev p = {};
++ 	union cpuid_1_eax c;
++ 
++ 	c.full = val;
++ 
++ 	p.stepping  = c.stepping;
++ 	p.model     = c.model;
++ 	p.ext_model = c.ext_model;
++ 	p.ext_fam   = c.ext_fam;
++ 
++ 	return p.ucode_rev;
++ }
++ 
++ static u32 get_cutoff_revision(u32 rev)
++ {
++ 	switch (rev >> 8) {
++ 	case 0x80012: return 0x8001277; break;
++ 	case 0x80082: return 0x800820f; break;
++ 	case 0x83010: return 0x830107c; break;
++ 	case 0x86001: return 0x860010e; break;
++ 	case 0x86081: return 0x8608108; break;
++ 	case 0x87010: return 0x8701034; break;
++ 	case 0x8a000: return 0x8a0000a; break;
++ 	case 0xa0010: return 0xa00107a; break;
++ 	case 0xa0011: return 0xa0011da; break;
++ 	case 0xa0012: return 0xa001243; break;
++ 	case 0xa0082: return 0xa00820e; break;
++ 	case 0xa1011: return 0xa101153; break;
++ 	case 0xa1012: return 0xa10124e; break;
++ 	case 0xa1081: return 0xa108109; break;
++ 	case 0xa2010: return 0xa20102f; break;
++ 	case 0xa2012: return 0xa201212; break;
++ 	case 0xa4041: return 0xa404109; break;
++ 	case 0xa5000: return 0xa500013; break;
++ 	case 0xa6012: return 0xa60120a; break;
++ 	case 0xa7041: return 0xa704109; break;
++ 	case 0xa7052: return 0xa705208; break;
++ 	case 0xa7080: return 0xa708009; break;
++ 	case 0xa70c0: return 0xa70C009; break;
++ 	case 0xaa001: return 0xaa00116; break;
++ 	case 0xaa002: return 0xaa00218; break;
++ 	case 0xb0021: return 0xb002146; break;
++ 	case 0xb0081: return 0xb008111; break;
++ 	case 0xb1010: return 0xb101046; break;
++ 	case 0xb2040: return 0xb204031; break;
++ 	case 0xb4040: return 0xb404031; break;
++ 	case 0xb4041: return 0xb404101; break;
++ 	case 0xb6000: return 0xb600031; break;
++ 	case 0xb6080: return 0xb608031; break;
++ 	case 0xb7000: return 0xb700031; break;
++ 	default: break;
++ 
++ 	}
++ 	return 0;
++ }
++ 
++ static bool need_sha_check(u32 cur_rev)
++ {
++ 	u32 cutoff;
++ 
++ 	if (!cur_rev) {
++ 		cur_rev = cpuid_to_ucode_rev(bsp_cpuid_1_eax);
++ 		pr_info_once("No current revision, generating the lowest one: 0x%x\n", cur_rev);
++ 	}
++ 
++ 	cutoff = get_cutoff_revision(cur_rev);
++ 	if (cutoff)
++ 		return cur_rev <= cutoff;
++ 
++ 	pr_info("You should not be seeing this. Please send the following couple of lines to x86-<at>-kernel.org\n");
++ 	pr_info("CPUID(1).EAX: 0x%x, current revision: 0x%x\n", bsp_cpuid_1_eax, cur_rev);
++ 	return true;
++ }
++ 
++ static bool cpu_has_entrysign(void)
++ {
++ 	unsigned int fam   = x86_family(bsp_cpuid_1_eax);
++ 	unsigned int model = x86_model(bsp_cpuid_1_eax);
++ 
++ 	if (fam == 0x17 || fam == 0x19)
++ 		return true;
++ 
++ 	if (fam == 0x1a) {
++ 		if (model <= 0x2f ||
++ 		    (0x40 <= model && model <= 0x4f) ||
++ 		    (0x60 <= model && model <= 0x7f))
++ 			return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ static bool verify_sha256_digest(u32 patch_id, u32 cur_rev, const u8 *data, unsigned int len)
++ {
++ 	struct patch_digest *pd = NULL;
++ 	u8 digest[SHA256_DIGEST_SIZE];
++ 	int i;
++ 
++ 	if (!cpu_has_entrysign())
++ 		return true;
++ 
++ 	if (!need_sha_check(cur_rev))
++ 		return true;
++ 
++ 	if (!sha_check)
++ 		return true;
++ 
++ 	pd = bsearch(&patch_id, phashes, ARRAY_SIZE(phashes), sizeof(struct patch_digest), cmp_id);
++ 	if (!pd) {
++ 		pr_err("No sha256 digest for patch ID: 0x%x found\n", patch_id);
++ 		return false;
++ 	}
++ 
++ 	sha256(data, len, digest);
++ 
++ 	if (memcmp(digest, pd->sha256, sizeof(digest))) {
++ 		pr_err("Patch 0x%x SHA256 digest mismatch!\n", patch_id);
++ 
++ 		for (i = 0; i < SHA256_DIGEST_SIZE; i++)
++ 			pr_cont("0x%x ", digest[i]);
++ 		pr_info("\n");
++ 
++ 		return false;
++ 	}
++ 
++ 	return true;
++ }
++ 
++ static union cpuid_1_eax ucode_rev_to_cpuid(unsigned int val)
++ {
++ 	union zen_patch_rev p;
++ 	union cpuid_1_eax c;
++ 
++ 	p.ucode_rev = val;
++ 	c.full = 0;
++ 
++ 	c.stepping  = p.stepping;
++ 	c.model     = p.model;
++ 	c.ext_model = p.ext_model;
++ 	c.family    = 0xf;
++ 	c.ext_fam   = p.ext_fam;
++ 
++ 	return c;
++ }
++ 
++ static u32 get_patch_level(void)
++ {
++ 	u32 rev, dummy __always_unused;
++ 
++ 	if (IS_ENABLED(CONFIG_MICROCODE_DBG)) {
++ 		int cpu = smp_processor_id();
++ 
++ 		if (!microcode_rev[cpu]) {
++ 			if (!base_rev)
++ 				base_rev = cpuid_to_ucode_rev(bsp_cpuid_1_eax);
++ 
++ 			microcode_rev[cpu] = base_rev;
++ 
++ 			ucode_dbg("CPU%d, base_rev: 0x%x\n", cpu, base_rev);
++ 		}
++ 
++ 		return microcode_rev[cpu];
++ 	}
++ 
++ 	native_rdmsr(MSR_AMD64_PATCH_LEVEL, rev, dummy);
++ 
++ 	return rev;
++ }
++ 
+++>>>>>>> 150b1b97e275 (x86/microcode/AMD: Fix Entrysign revision check for Zen5/Strix Halo)
+  static u16 find_equiv_id(struct equiv_cpu_table *et, u32 sig)
+  {
+  	unsigned int i;
+* Unmerged path arch/x86/kernel/cpu/microcode/amd.c
