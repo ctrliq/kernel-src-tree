@@ -1,0 +1,407 @@
+smb: client: get rid of @nlsc param in cifs_tree_connect()
+
+jira KERNEL-814
+Rebuild_History Non-Buildable kernel-4.18.0-553.115.1.el8_10
+commit-author Paulo Alcantara <pc@manguebit.com>
+commit b2fe4a8fa0f6b9dbb7d4965f71ec72191cda34f1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.115.1.el8_10/b2fe4a8f.failed
+
+We can access local_nls directly from @tcon->ses, so there is no need
+to pass it as parameter in cifs_tree_connect().
+
+	Signed-off-by: Paulo Alcantara (Red Hat) <pc@manguebit.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit b2fe4a8fa0f6b9dbb7d4965f71ec72191cda34f1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/cifssmb.c
+#	fs/cifs/connect.c
+#	fs/cifs/smb2pdu.c
+#	fs/smb/client/dfs.c
+diff --cc fs/cifs/cifssmb.c
+index 5230834dc430,98abf1492c5c..000000000000
+--- a/fs/cifs/cifssmb.c
++++ b/fs/cifs/cifssmb.c
+@@@ -190,8 -130,6 +189,11 @@@ again
+  	}
+  	spin_unlock(&server->srv_lock);
+  
+++<<<<<<< HEAD:fs/cifs/cifssmb.c
+ +	nls_codepage = load_nls_default();
+ +
+++=======
+++>>>>>>> b2fe4a8fa0f6 (smb: client: get rid of @nlsc param in cifs_tree_connect()):fs/smb/client/cifssmb.c
+  	/*
+  	 * need to prevent multiple threads trying to simultaneously
+  	 * reconnect the same SMB session
+diff --cc fs/cifs/connect.c
+index 3502a761bcf9,0afb923cc1a5..000000000000
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@@ -4513,185 -4343,35 +4513,195 @@@ cifs_prune_tlinks(struct work_struct *w
+  				TLINK_IDLE_EXPIRE);
+  }
+  
+ -#ifndef CONFIG_CIFS_DFS_UPCALL
+ -int cifs_tree_connect(const unsigned int xid, struct cifs_tcon *tcon)
+++<<<<<<< HEAD:fs/cifs/connect.c
+ +#ifdef CONFIG_CIFS_DFS_UPCALL
+ +static int target_share_matches_server(struct TCP_Server_Info *server, const char *tcp_host,
+ +				       size_t tcp_host_len, char *share, bool *target_match)
+ +{
+ +	int rc = 0;
+ +	const char *dfs_host;
+ +	size_t dfs_host_len;
+ +
+ +	*target_match = true;
+ +	extract_unc_hostname(share, &dfs_host, &dfs_host_len);
+ +
+ +	/* Check if hostnames or addresses match */
+ +	cifs_server_lock(server);
+ +	if (dfs_host_len != tcp_host_len || strncasecmp(dfs_host, tcp_host, dfs_host_len) != 0) {
+ +		cifs_dbg(FYI, "%s: %.*s doesn't match %.*s\n", __func__, (int)dfs_host_len,
+ +			 dfs_host, (int)tcp_host_len, tcp_host);
+ +		rc = match_target_ip(server, dfs_host, dfs_host_len, target_match);
+ +		if (rc)
+ +			cifs_dbg(VFS, "%s: failed to match target ip: %d\n", __func__, rc);
+ +	}
+ +	cifs_server_unlock(server);
+ +	return rc;
+ +}
+ +
+ +static int tree_connect_dfs_target(const unsigned int xid, struct cifs_tcon *tcon,
+ +				   struct cifs_sb_info *cifs_sb, char *tree, bool islink,
+ +				   struct dfs_cache_tgt_list *tl)
+  {
+ -	const struct smb_version_operations *ops = tcon->ses->server->ops;
+  	int rc;
+ +	struct TCP_Server_Info *server = tcon->ses->server;
+ +	const struct smb_version_operations *ops = server->ops;
+ +	struct cifs_tcon *ipc = tcon->ses->tcon_ipc;
+ +	char *share = NULL, *prefix = NULL;
+ +	const char *tcp_host;
+ +	size_t tcp_host_len;
+ +	struct dfs_cache_tgt_iterator *tit;
+ +	bool target_match;
+  
+ -	/* only send once per connect */
+ -	spin_lock(&tcon->tc_lock);
+ +	cifs_server_lock(server);
+ +	extract_unc_hostname(server->hostname, &tcp_host, &tcp_host_len);
+ +	cifs_server_unlock(server);
+  
+ -	/* if tcon is marked for needing reconnect, update state */
+ -	if (tcon->need_reconnect)
+ -		tcon->status = TID_NEED_TCON;
+ +	tit = dfs_cache_get_tgt_iterator(tl);
+ +	if (!tit) {
+ +		rc = -ENOENT;
+ +		goto out;
+ +	}
+ +
+ +	/* Try to tree connect to all dfs targets */
+ +	for (; tit; tit = dfs_cache_get_next_tgt(tl, tit)) {
+ +		kfree(share);
+ +		kfree(prefix);
+ +		share = prefix = NULL;
+  
+ -	if (tcon->status == TID_GOOD) {
+ +		/* Check if share matches with tcp ses */
+ +		rc = dfs_cache_get_tgt_share(server->current_fullpath + 1, tit, &share, &prefix);
+ +		if (rc) {
+ +			cifs_dbg(VFS, "%s: failed to parse target share: %d\n", __func__, rc);
+ +			break;
+ +		}
+ +
+ +		rc = target_share_matches_server(server, tcp_host, tcp_host_len, share,
+ +						 &target_match);
+ +		if (rc)
+ +			break;
+ +		if (!target_match) {
+ +			rc = -EHOSTUNREACH;
+ +			continue;
+ +		}
+ +
+ +		dfs_cache_noreq_update_tgthint(server->current_fullpath + 1, tit);
+ +		if (ipc->need_reconnect) {
+ +			scnprintf(tree, MAX_TREE_SIZE, "\\\\%s\\IPC$", server->hostname);
+ +			ops->tree_connect(xid, ipc->ses, tree, ipc, cifs_sb->local_nls);
+ +		}
+ +
+ +		scnprintf(tree, MAX_TREE_SIZE, "\\%s", share);
+ +		rc = ops->tree_connect(xid, tcon->ses, tree, tcon, cifs_sb->local_nls);
+ +		if (islink && !rc)
+ +			rc = cifs_update_super_prepath(cifs_sb, prefix);
+ +		break;
+ +	}
+ +
+ +out:
+ +	kfree(share);
+ +	kfree(prefix);
+ +	dfs_cache_free_tgts(tl);
+ +	return rc;
+ +}
+ +
+ +int cifs_tree_connect(const unsigned int xid, struct cifs_tcon *tcon, const struct nls_table *nlsc)
+ +{
+ +	int rc;
+ +	struct TCP_Server_Info *server = tcon->ses->server;
+ +	const struct smb_version_operations *ops = server->ops;
+ +	struct super_block *sb = NULL;
+ +	struct cifs_sb_info *cifs_sb = NULL;
+ +	struct dfs_cache_tgt_list tl = DFS_CACHE_TGT_LIST_INIT(tl);
+ +	char *tree;
+ +	struct dfs_info3_param ref = {0};
+ +
+ +	/* only send once per connect */
+ +	spin_lock(&tcon->tc_lock);
+ +	if (tcon->ses->ses_status != SES_GOOD ||
+ +	    (tcon->status != TID_NEW &&
+ +	    tcon->status != TID_NEED_TCON)) {
+  		spin_unlock(&tcon->tc_lock);
+  		return 0;
+  	}
+ +	tcon->status = TID_IN_TCON;
+ +	spin_unlock(&tcon->tc_lock);
+ +
+ +	tree = kzalloc(MAX_TREE_SIZE, GFP_KERNEL);
+ +	if (!tree) {
+ +		rc = -ENOMEM;
+ +		goto out;
+ +	}
+ +
+ +	if (tcon->ipc) {
+ +		cifs_server_lock(server);
+ +		scnprintf(tree, MAX_TREE_SIZE, "\\\\%s\\IPC$", server->hostname);
+ +		cifs_server_unlock(server);
+ +		rc = ops->tree_connect(xid, tcon->ses, tree, tcon, nlsc);
+ +		goto out;
+ +	}
+  
+ -	if (tcon->status != TID_NEW &&
+ -	    tcon->status != TID_NEED_TCON) {
+ +	sb = cifs_get_tcp_super(server);
+ +	if (!IS_ERR(sb))
+ +		cifs_sb = CIFS_SB(sb);
+ +
+ +	/* If it is not dfs or there was no cached dfs referral, then reconnect to same share */
+ +	if (!cifs_sb || !server->current_fullpath ||
+ +	    dfs_cache_noreq_find(server->current_fullpath + 1, &ref, &tl)) {
+ +		rc = ops->tree_connect(xid, tcon->ses, tcon->treeName, tcon,
+ +				       cifs_sb ? cifs_sb->local_nls : nlsc);
+ +		goto out;
+ +	}
+ +
+ +	rc = tree_connect_dfs_target(xid, tcon, cifs_sb, tree, ref.server_type == DFS_TYPE_LINK,
+ +				     &tl);
+ +	free_dfs_info_param(&ref);
+ +
+ +out:
+ +	kfree(tree);
+ +	cifs_put_tcp_super(sb);
+ +
+ +	if (rc) {
+ +		spin_lock(&tcon->tc_lock);
+ +		if (tcon->status == TID_IN_TCON)
+ +			tcon->status = TID_NEED_TCON;
+  		spin_unlock(&tcon->tc_lock);
+ -		return -EHOSTDOWN;
+ +	} else {
+ +		spin_lock(&tcon->tc_lock);
+ +		if (tcon->status == TID_IN_TCON)
+ +			tcon->status = TID_GOOD;
+ +		spin_unlock(&tcon->tc_lock);
+ +		tcon->need_reconnect = false;
+  	}
+  
+ +	return rc;
+ +}
+ +#else
+ +int cifs_tree_connect(const unsigned int xid, struct cifs_tcon *tcon, const struct nls_table *nlsc)
+++=======
+++#ifndef CONFIG_CIFS_DFS_UPCALL
+++int cifs_tree_connect(const unsigned int xid, struct cifs_tcon *tcon)
+++>>>>>>> b2fe4a8fa0f6 (smb: client: get rid of @nlsc param in cifs_tree_connect()):fs/smb/client/connect.c
+ +{
+- 	int rc;
+ +	const struct smb_version_operations *ops = tcon->ses->server->ops;
+++	int rc;
+ +
+ +	/* only send once per connect */
+ +	spin_lock(&tcon->tc_lock);
+ +	if (tcon->ses->ses_status != SES_GOOD ||
+ +	    (tcon->status != TID_NEW &&
+ +	    tcon->status != TID_NEED_TCON)) {
+ +		spin_unlock(&tcon->tc_lock);
+ +		return 0;
+ +	}
+  	tcon->status = TID_IN_TCON;
+  	spin_unlock(&tcon->tc_lock);
+  
+++<<<<<<< HEAD:fs/cifs/connect.c
+ +	rc = ops->tree_connect(xid, tcon->ses, tcon->treeName, tcon, nlsc);
+++=======
++ 	rc = ops->tree_connect(xid, tcon->ses, tcon->tree_name,
++ 			       tcon, tcon->ses->local_nls);
+++>>>>>>> b2fe4a8fa0f6 (smb: client: get rid of @nlsc param in cifs_tree_connect()):fs/smb/client/connect.c
+  	if (rc) {
+  		spin_lock(&tcon->tc_lock);
+  		if (tcon->status == TID_IN_TCON)
+diff --cc fs/cifs/smb2pdu.c
+index 34892c614e1e,2f62178048ab..000000000000
+--- a/fs/cifs/smb2pdu.c
++++ b/fs/cifs/smb2pdu.c
+@@@ -138,13 -162,63 +138,16 @@@ out
+  	return;
+  }
+  
+ -/* helper function for code reuse */
+ -static int
+ -cifs_chan_skip_or_disable(struct cifs_ses *ses,
+ -			  struct TCP_Server_Info *server,
+ -			  bool from_reconnect)
+ -{
+ -	struct TCP_Server_Info *pserver;
+ -	unsigned int chan_index;
+ -
+ -	if (SERVER_IS_CHAN(server)) {
+ -		cifs_dbg(VFS,
+ -			"server %s does not support multichannel anymore. Skip secondary channel\n",
+ -			 ses->server->hostname);
+ -
+ -		spin_lock(&ses->chan_lock);
+ -		chan_index = cifs_ses_get_chan_index(ses, server);
+ -		if (chan_index == CIFS_INVAL_CHAN_INDEX) {
+ -			spin_unlock(&ses->chan_lock);
+ -			goto skip_terminate;
+ -		}
+ -
+ -		ses->chans[chan_index].server = NULL;
+ -		server->terminate = true;
+ -		spin_unlock(&ses->chan_lock);
+ -
+ -		/*
+ -		 * the above reference of server by channel
+ -		 * needs to be dropped without holding chan_lock
+ -		 * as cifs_put_tcp_session takes a higher lock
+ -		 * i.e. cifs_tcp_ses_lock
+ -		 */
+ -		cifs_put_tcp_session(server, from_reconnect);
+ -
+ -		cifs_signal_cifsd_for_reconnect(server, false);
+ -
+ -		/* mark primary server as needing reconnect */
+ -		pserver = server->primary_server;
+ -		cifs_signal_cifsd_for_reconnect(pserver, false);
+ -skip_terminate:
+ -		return -EHOSTDOWN;
+ -	}
+ -
+ -	cifs_server_dbg(VFS,
+ -		"server does not support multichannel anymore. Disable all other channels\n");
+ -	cifs_disable_secondary_channels(ses);
+ -
+ -
+ -	return 0;
+ -}
+ -
+  static int
+  smb2_reconnect(__le16 smb2_command, struct cifs_tcon *tcon,
+ -	       struct TCP_Server_Info *server, bool from_reconnect)
+ +	       struct TCP_Server_Info *server)
+  {
+- 	int rc = 0;
+- 	struct nls_table *nls_codepage = NULL;
+  	struct cifs_ses *ses;
+++<<<<<<< HEAD:fs/cifs/smb2pdu.c
+++=======
++ 	int xid;
++ 	int rc = 0;
+++>>>>>>> b2fe4a8fa0f6 (smb: client: get rid of @nlsc param in cifs_tree_connect()):fs/smb/client/smb2pdu.c
+  
+  	/*
+  	 * SMB2s NegProt, SessSetup, Logoff do not have tcon yet so
+@@@ -241,8 -333,6 +244,11 @@@ again
+  	}
+  	spin_unlock(&server->srv_lock);
+  
+++<<<<<<< HEAD:fs/cifs/smb2pdu.c
+ +	nls_codepage = load_nls_default();
+ +
+++=======
+++>>>>>>> b2fe4a8fa0f6 (smb: client: get rid of @nlsc param in cifs_tree_connect()):fs/smb/client/smb2pdu.c
+  	/*
+  	 * need to prevent multiple threads trying to simultaneously
+  	 * reconnect the same SMB session
+@@@ -265,7 -355,32 +271,36 @@@
+  
+  	rc = cifs_negotiate_protocol(0, ses, server);
+  	if (!rc) {
+++<<<<<<< HEAD:fs/cifs/smb2pdu.c
+ +		rc = cifs_setup_session(0, ses, server, nls_codepage);
+++=======
++ 		/*
++ 		 * if server stopped supporting multichannel
++ 		 * and the first channel reconnected, disable all the others.
++ 		 */
++ 		if (ses->chan_count > 1 &&
++ 		    !(server->capabilities & SMB2_GLOBAL_CAP_MULTI_CHANNEL)) {
++ 			rc = cifs_chan_skip_or_disable(ses, server,
++ 						       from_reconnect);
++ 			if (rc) {
++ 				mutex_unlock(&ses->session_mutex);
++ 				goto out;
++ 			}
++ 		}
++ 
++ 		rc = cifs_setup_session(0, ses, server, ses->local_nls);
++ 		if ((rc == -EACCES) || (rc == -EKEYEXPIRED) || (rc == -EKEYREVOKED)) {
++ 			/*
++ 			 * Try alternate password for next reconnect (key rotation
++ 			 * could be enabled on the server e.g.) if an alternate
++ 			 * password is available and the current password is expired,
++ 			 * but do not swap on non pwd related errors like host down
++ 			 */
++ 			if (ses->password2)
++ 				swap(ses->password2, ses->password);
++ 		}
++ 
+++>>>>>>> b2fe4a8fa0f6 (smb: client: get rid of @nlsc param in cifs_tree_connect()):fs/smb/client/smb2pdu.c
+  		if ((rc == -EACCES) && !tcon->retry) {
+  			mutex_unlock(&ses->session_mutex);
+  			rc = -EHOSTDOWN;
+@@@ -288,8 -403,7 +323,12 @@@ skip_sess_setup
+  	if (tcon->use_persistent)
+  		tcon->need_reopen_files = true;
+  
+++<<<<<<< HEAD:fs/cifs/smb2pdu.c
+ +	rc = cifs_tree_connect(0, tcon, nls_codepage);
+ +	mutex_unlock(&ses->session_mutex);
+++=======
++ 	rc = cifs_tree_connect(0, tcon);
+++>>>>>>> b2fe4a8fa0f6 (smb: client: get rid of @nlsc param in cifs_tree_connect()):fs/smb/client/smb2pdu.c
+  
+  	cifs_dbg(FYI, "reconnect tcon rc = %d\n", rc);
+  	if (rc) {
+* Unmerged path fs/smb/client/dfs.c
+diff --git a/fs/cifs/cifsproto.h b/fs/cifs/cifsproto.h
+index 52d8fd7fa0d1..b6e369605b6e 100644
+--- a/fs/cifs/cifsproto.h
++++ b/fs/cifs/cifsproto.h
+@@ -281,8 +281,7 @@ extern void cifs_move_llist(struct list_head *source, struct list_head *dest);
+ extern void cifs_free_llist(struct list_head *llist);
+ extern void cifs_del_lock_waiters(struct cifsLockInfo *lock);
+ 
+-extern int cifs_tree_connect(const unsigned int xid, struct cifs_tcon *tcon,
+-			     const struct nls_table *nlsc);
++int cifs_tree_connect(const unsigned int xid, struct cifs_tcon *tcon);
+ 
+ extern int cifs_negotiate_protocol(const unsigned int xid,
+ 				   struct cifs_ses *ses,
+* Unmerged path fs/cifs/cifssmb.c
+* Unmerged path fs/cifs/connect.c
+* Unmerged path fs/cifs/smb2pdu.c
+* Unmerged path fs/smb/client/dfs.c
