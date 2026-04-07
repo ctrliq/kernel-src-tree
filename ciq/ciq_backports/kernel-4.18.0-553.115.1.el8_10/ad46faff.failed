@@ -1,0 +1,481 @@
+smb: client: fix DFS mount against old servers with NTLMSSP
+
+jira KERNEL-814
+Rebuild_History Non-Buildable kernel-4.18.0-553.115.1.el8_10
+commit-author Paulo Alcantara <pc@manguebit.com>
+commit ad46faff1afcc8db72f9954a6ea2296d31259217
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.115.1.el8_10/ad46faff.failed
+
+Old Windows servers will return not fully qualified DFS targets by
+default as specified in
+
+  MS-DFSC 3.2.5.5 Receiving a Root Referral Request or Link Referral
+  Request
+
+    | Servers SHOULD<30> return fully qualified DNS host names of
+    | targets in responses to root referral requests and link referral
+    | requests.
+    | ...
+    | <30> Section 3.2.5.5: By default, Windows Server 2003, Windows
+    | Server 2008, Windows Server 2008 R2, Windows Server 2012, and
+    | Windows Server 2012 R2 return DNS host names that are not fully
+    | qualified for targets.
+
+Fix this by converting all NetBIOS host names from DFS targets to
+FQDNs and try resolving them first if DNS domain name was provided in
+NTLMSSP CHALLENGE_MESSAGE message from previous SMB2_SESSION_SETUP.
+This also prevents the client from translating the DFS target
+hostnames to another domain depending on the network domain search
+order.
+
+	Signed-off-by: Paulo Alcantara (Red Hat) <pc@manguebit.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit ad46faff1afcc8db72f9954a6ea2296d31259217)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/cifsglob.h
+#	fs/cifs/connect.c
+#	fs/cifs/dfs_cache.c
+#	fs/cifs/dns_resolve.c
+#	fs/cifs/dns_resolve.h
+#	fs/cifs/fs_context.c
+#	fs/cifs/fs_context.h
+#	fs/cifs/misc.c
+#	fs/smb/client/dfs.c
+diff --cc fs/cifs/cifsglob.h
+index ee8d82174e1b,c747b6f9baca..000000000000
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@@ -737,24 -811,31 +737,30 @@@ struct TCP_Server_Info 
+  	bool use_swn_dstaddr;
+  	struct sockaddr_storage swn_dstaddr;
+  #endif
+ +#ifdef CONFIG_CIFS_DFS_UPCALL
+ +	bool is_dfs_conn; /* if a dfs connection */
+  	struct mutex refpath_lock; /* protects leaf_fullpath */
+  	/*
+ -	 * leaf_fullpath: Canonical DFS referral path related to this
+ -	 *                connection.
+ -	 *                It is used in DFS cache refresher, reconnect and may
+ -	 *                change due to nested DFS links.
+ +	 * Canonical DFS full paths that were used to chase referrals in mount and reconnect.
+ +	 *
+ +	 * origin_fullpath: first or original referral path
+ +	 * leaf_fullpath: last referral path (might be changed due to nested links in reconnect)
+  	 *
+ -	 * Protected by @refpath_lock and @srv_lock.  The @refpath_lock is
+ -	 * mostly used for not requiring a copy of @leaf_fullpath when getting
+ -	 * cached or new DFS referrals (which might also sleep during I/O).
+ -	 * While @srv_lock is held for making string and NULL comparisons against
+ -	 * both fields as in mount(2) and cache refresh.
+ +	 * current_fullpath: pointer to either origin_fullpath or leaf_fullpath
+ +	 * NOTE: cannot be accessed outside cifs_reconnect() and smb2_reconnect()
+  	 *
+ -	 * format: \\HOST\SHARE[\OPTIONAL PATH]
+ +	 * format: \\HOST\SHARE\[OPTIONAL PATH]
+  	 */
+++<<<<<<< HEAD:fs/cifs/cifsglob.h
+ +	char *origin_fullpath, *leaf_fullpath, *current_fullpath;
+ +#endif
+++=======
++ 	char *leaf_fullpath;
++ 	bool dfs_conn:1;
++ 	char dns_dom[CIFS_MAX_DOMAINNAME_LEN + 1];
+++>>>>>>> ad46faff1afc (smb: client: fix DFS mount against old servers with NTLMSSP):fs/smb/client/cifsglob.h
+  };
+  
+ -static inline bool is_smb1(struct TCP_Server_Info *server)
+ -{
+ -	return HEADER_PREAMBLE_SIZE(server) != 0;
+ -}
+ -
+  static inline void cifs_server_lock(struct TCP_Server_Info *server)
+  {
+  	unsigned int nofs_flag = memalloc_nofs_save();
+@@@ -2180,9 -2273,64 +2186,29 @@@ static inline struct scatterlist *cifs_
+  			buflen -= len;
+  		} while (buflen);
+  	} else {
+ -		sg_set_page(&sgtable->sgl[sgtable->nents++],
+ -			    virt_to_page((void *)addr), buflen, off);
+ +		sg_set_page(sg++, virt_to_page(addr), buflen, off);
+  	}
+ -}
+ -
+ -#define CIFS_OPARMS(_cifs_sb, _tcon, _path, _da, _cd, _co, _mode) \
+ -	((struct cifs_open_parms) { \
+ -		.tcon = _tcon, \
+ -		.path = _path, \
+ -		.desired_access = (_da), \
+ -		.disposition = (_cd), \
+ -		.create_options = cifs_create_options(_cifs_sb, (_co)), \
+ -		.mode = (_mode), \
+ -		.cifs_sb = _cifs_sb, \
+ -	})
+ -
+ -struct smb2_compound_vars {
+ -	struct cifs_open_parms oparms;
+ -	struct kvec rsp_iov[MAX_COMPOUND];
+ -	struct smb_rqst rqst[MAX_COMPOUND];
+ -	struct kvec open_iov[SMB2_CREATE_IOV_SIZE];
+ -	struct kvec qi_iov;
+ -	struct kvec io_iov[SMB2_IOCTL_IOV_SIZE];
+ -	struct kvec si_iov[SMB2_SET_INFO_IOV_SIZE];
+ -	struct kvec close_iov;
+ -	struct smb2_file_rename_info rename_info;
+ -	struct smb2_file_link_info link_info;
+ -	struct kvec ea_iov;
+ -};
+ -
+ -static inline bool cifs_ses_exiting(struct cifs_ses *ses)
+ -{
+ -	bool ret;
+ -
+ -	spin_lock(&ses->ses_lock);
+ -	ret = ses->ses_status == SES_EXITING;
+ -	spin_unlock(&ses->ses_lock);
+ -	return ret;
+ +	return sg;
+  }
+  
++ static inline bool cifs_netbios_name(const char *name, size_t namelen)
++ {
++ 	bool ret = false;
++ 	size_t i;
++ 
++ 	if (namelen >= 1 && namelen <= RFC1001_NAME_LEN) {
++ 		for (i = 0; i < namelen; i++) {
++ 			const unsigned char c = name[i];
++ 
++ 			if (c == '\\' || c == '/' || c == ':' || c == '*' ||
++ 			    c == '?' || c == '"' || c == '<' || c == '>' ||
++ 			    c == '|' || c == '.')
++ 				return false;
++ 			if (!ret && isalpha(c))
++ 				ret = true;
++ 		}
++ 	}
++ 	return ret;
++ }
++ 
+  #endif	/* _CIFS_GLOB_H */
+diff --cc fs/cifs/connect.c
+index 3502a761bcf9,9e16edf5c883..000000000000
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@@ -93,7 -93,12 +93,16 @@@ static int reconn_set_ipaddr_from_hostn
+  	}
+  	scnprintf(unc, len, "\\\\%s", server->hostname);
+  
+++<<<<<<< HEAD:fs/cifs/connect.c
+ +	rc = dns_resolve_server_name_to_ip(unc, &ipaddr, NULL);
+++=======
++ 	spin_lock(&server->srv_lock);
++ 	ss = server->dstaddr;
++ 	spin_unlock(&server->srv_lock);
++ 
++ 	rc = dns_resolve_server_name_to_ip(server->dns_dom, unc,
++ 					   (struct sockaddr *)&ss, NULL);
+++>>>>>>> ad46faff1afc (smb: client: fix DFS mount against old servers with NTLMSSP):fs/smb/client/connect.c
+  	kfree(unc);
+  
+  	if (rc < 0) {
+@@@ -1601,8 -1704,19 +1610,21 @@@ cifs_get_tcp_session(struct smb3_fs_con
+  		goto out_err;
+  	}
+  
+++<<<<<<< HEAD:fs/cifs/connect.c
+++=======
++ 	if (ctx->leaf_fullpath) {
++ 		tcp_ses->leaf_fullpath = kstrdup(ctx->leaf_fullpath, GFP_KERNEL);
++ 		if (!tcp_ses->leaf_fullpath) {
++ 			rc = -ENOMEM;
++ 			goto out_err;
++ 		}
++ 	}
++ 	if (ctx->dns_dom)
++ 		strscpy(tcp_ses->dns_dom, ctx->dns_dom);
++ 
+++>>>>>>> ad46faff1afc (smb: client: fix DFS mount against old servers with NTLMSSP):fs/smb/client/connect.c
+  	if (ctx->nosharesock)
+  		tcp_ses->nosharesock = true;
+ -	tcp_ses->dfs_conn = ctx->dfs_conn;
+  
+  	tcp_ses->ops = ctx->ops;
+  	tcp_ses->vals = ctx->vals;
+diff --cc fs/cifs/dfs_cache.c
+index d19f8e94c80f,c0a167c869fb..000000000000
+--- a/fs/cifs/dfs_cache.c
++++ b/fs/cifs/dfs_cache.c
+@@@ -1341,7 -1114,8 +1341,12 @@@ static bool target_share_equal(struct T
+  	extract_unc_hostname(s1, &host, &hostlen);
+  	scnprintf(unc, sizeof(unc), "\\\\%.*s", (int)hostlen, host);
+  
+++<<<<<<< HEAD:fs/cifs/dfs_cache.c
+ +	rc = dns_resolve_server_name_to_ip(unc, &ip, NULL);
+++=======
++ 	rc = dns_resolve_server_name_to_ip(server->dns_dom, unc,
++ 					   (struct sockaddr *)&ss, NULL);
+++>>>>>>> ad46faff1afc (smb: client: fix DFS mount against old servers with NTLMSSP):fs/smb/client/dfs_cache.c
+  	if (rc < 0) {
+  		cifs_dbg(FYI, "%s: could not resolve %.*s. assuming server address matches.\n",
+  			 __func__, (int)hostlen, host);
+diff --cc fs/cifs/dns_resolve.c
+index d0d9ae881f73,83db27f9c8f1..000000000000
+--- a/fs/cifs/dns_resolve.c
++++ b/fs/cifs/dns_resolve.c
+@@@ -25,64 -56,51 +55,92 @@@ static int resolve_name(const char *nam
+   * @ip_addr: Where to return the IP address.
+   * @expiry: Where to return the expiry time for the dns record.
+   *
+ - * Returns zero success, -ve on error.
+ + * The IP address will be returned in string form, and the caller is
+ + * responsible for freeing it.
+ + *
+ + * Returns length of result on success, -ve on error.
+   */
+++<<<<<<< HEAD:fs/cifs/dns_resolve.c
+ +int
+ +dns_resolve_server_name_to_ip(const char *unc, char **ip_addr, time64_t *expiry)
+ +{
+ +	struct sockaddr_storage ss;
+ +	const char *hostname, *sep;
+ +	char *name;
+ +	int len, rc;
+++=======
++ int dns_resolve_server_name_to_ip(const char *dom, const char *unc,
++ 				  struct sockaddr *ip_addr, time64_t *expiry)
++ {
++ 	const char *name;
++ 	size_t namelen, len;
++ 	char *s;
++ 	int rc;
+++>>>>>>> ad46faff1afc (smb: client: fix DFS mount against old servers with NTLMSSP):fs/smb/client/dns_resolve.c
+  
+  	if (!ip_addr || !unc)
+  		return -EINVAL;
+  
+- 	len = strlen(unc);
+- 	if (len < 3) {
+- 		cifs_dbg(FYI, "%s: unc is too short: %s\n", __func__, unc);
++ 	cifs_dbg(FYI, "%s: dom=%s unc=%s\n", __func__, dom, unc);
++ 	if (strlen(unc) < 3)
+  		return -EINVAL;
+- 	}
+- 
+- 	/* Discount leading slashes for cifs */
+- 	len -= 2;
+- 	hostname = unc + 2;
+  
+- 	/* Search for server name delimiter */
+- 	sep = memchr(hostname, '/', len);
+- 	if (sep)
+- 		len = sep - hostname;
+- 	else
+- 		cifs_dbg(FYI, "%s: probably server name is whole unc: %s\n",
+- 			 __func__, unc);
++ 	extract_unc_hostname(unc, &name, &namelen);
++ 	if (!namelen)
++ 		return -EINVAL;
+  
++ 	cifs_dbg(FYI, "%s: hostname=%.*s\n", __func__, (int)namelen, name);
+  	/* Try to interpret hostname as an IPv4 or IPv6 address */
+++<<<<<<< HEAD:fs/cifs/dns_resolve.c
+ +	rc = cifs_convert_address((struct sockaddr *)&ss, hostname, len);
+ +	if (rc > 0)
+ +		goto name_is_IP_address;
+ +
+ +	/* Perform the upcall */
+ +	rc = dns_query(NULL, hostname, len, NULL, ip_addr, expiry);
+ +	if (rc < 0)
+ +		cifs_dbg(FYI, "%s: unable to resolve: %*.*s\n",
+ +			 __func__, len, len, hostname);
+ +	else
+ +		cifs_dbg(FYI, "%s: resolved: %*.*s to %s expiry %llu\n",
+ +			 __func__, len, len, hostname, *ip_addr,
+ +			 expiry ? (*expiry) : 0);
+ +	return rc;
+ +
+ +name_is_IP_address:
+ +	name = kmalloc(len + 1, GFP_KERNEL);
+ +	if (!name)
+ +		return -ENOMEM;
+ +	memcpy(name, hostname, len);
+ +	name[len] = 0;
+ +	cifs_dbg(FYI, "%s: unc is IP, skipping dns upcall: %s\n",
+ +		 __func__, name);
+ +	*ip_addr = name;
+ +	return 0;
+++=======
++ 	rc = cifs_convert_address(ip_addr, name, namelen);
++ 	if (rc > 0) {
++ 		cifs_dbg(FYI, "%s: unc is IP, skipping dns upcall: %*.*s\n",
++ 			 __func__, (int)namelen, (int)namelen, name);
++ 		return 0;
++ 	}
++ 
++ 	/*
++ 	 * If @name contains a NetBIOS name and @dom has been specified, then
++ 	 * convert @name to an FQDN and try resolving it first.
++ 	 */
++ 	if (dom && *dom && cifs_netbios_name(name, namelen)) {
++ 		len = strnlen(dom, CIFS_MAX_DOMAINNAME_LEN) + namelen + 2;
++ 		s = kmalloc(len, GFP_KERNEL);
++ 		if (!s)
++ 			return -ENOMEM;
++ 
++ 		scnprintf(s, len, "%.*s.%s", (int)namelen, name, dom);
++ 		rc = resolve_name(s, len - 1, ip_addr, expiry);
++ 		kfree(s);
++ 		if (!rc)
++ 			return 0;
++ 	}
++ 	return resolve_name(name, namelen, ip_addr, expiry);
+++>>>>>>> ad46faff1afc (smb: client: fix DFS mount against old servers with NTLMSSP):fs/smb/client/dns_resolve.c
+  }
+diff --cc fs/cifs/dns_resolve.h
+index afc0df381246,64c1dd2ad39b..000000000000
+--- a/fs/cifs/dns_resolve.h
++++ b/fs/cifs/dns_resolve.h
+@@@ -11,8 -11,11 +11,13 @@@
+  #ifndef _DNS_RESOLVE_H
+  #define _DNS_RESOLVE_H
+  
+ -#include <linux/net.h>
+ -
+  #ifdef __KERNEL__
+++<<<<<<< HEAD:fs/cifs/dns_resolve.h
+ +extern int dns_resolve_server_name_to_ip(const char *unc, char **ip_addr, time64_t *expiry);
+++=======
++ int dns_resolve_server_name_to_ip(const char *dom, const char *unc,
++ 				  struct sockaddr *ip_addr, time64_t *expiry);
+++>>>>>>> ad46faff1afc (smb: client: fix DFS mount against old servers with NTLMSSP):fs/smb/client/dns_resolve.h
+  #endif /* KERNEL */
+  
+  #endif /* _DNS_RESOLVE_H */
+diff --cc fs/cifs/fs_context.c
+index 55a041ac727c,5381f05420bc..000000000000
+--- a/fs/cifs/fs_context.c
++++ b/fs/cifs/fs_context.c
+@@@ -328,6 -384,8 +328,11 @@@ smb3_fs_context_dup(struct smb3_fs_cont
+  	new_ctx->UNC = NULL;
+  	new_ctx->source = NULL;
+  	new_ctx->iocharset = NULL;
+++<<<<<<< HEAD:fs/cifs/fs_context.c
+++=======
++ 	new_ctx->leaf_fullpath = NULL;
++ 	new_ctx->dns_dom = NULL;
+++>>>>>>> ad46faff1afc (smb: client: fix DFS mount against old servers with NTLMSSP):fs/smb/client/fs_context.c
+  	/*
+  	 * Make sure to stay in sync with smb3_cleanup_fs_context_contents()
+  	 */
+@@@ -340,6 -399,8 +345,11 @@@
+  	DUP_CTX_STR(domainname);
+  	DUP_CTX_STR(nodename);
+  	DUP_CTX_STR(iocharset);
+++<<<<<<< HEAD:fs/cifs/fs_context.c
+++=======
++ 	DUP_CTX_STR(leaf_fullpath);
++ 	DUP_CTX_STR(dns_dom);
+++>>>>>>> ad46faff1afc (smb: client: fix DFS mount against old servers with NTLMSSP):fs/smb/client/fs_context.c
+  
+  	return 0;
+  }
+@@@ -1557,6 -1863,10 +1567,13 @@@ smb3_cleanup_fs_context_contents(struc
+  	ctx->iocharset = NULL;
+  	kfree(ctx->prepath);
+  	ctx->prepath = NULL;
+++<<<<<<< HEAD:fs/cifs/fs_context.c
+++=======
++ 	kfree(ctx->leaf_fullpath);
++ 	ctx->leaf_fullpath = NULL;
++ 	kfree(ctx->dns_dom);
++ 	ctx->dns_dom = NULL;
+++>>>>>>> ad46faff1afc (smb: client: fix DFS mount against old servers with NTLMSSP):fs/smb/client/fs_context.c
+  }
+  
+  void
+diff --cc fs/cifs/fs_context.h
+index b12924ed0bfd,8813533345ee..000000000000
+--- a/fs/cifs/fs_context.h
++++ b/fs/cifs/fs_context.h
+@@@ -256,9 -286,16 +256,18 @@@ struct smb3_fs_context 
+  	__u32 handle_timeout; /* persistent and durable handle timeout in ms */
+  	unsigned int max_credits; /* smb3 max_credits 10 < credits < 60000 */
+  	unsigned int max_channels;
+ -	unsigned int max_cached_dirs;
+ -	bool compress; /* enable SMB2 messages (READ/WRITE) de/compression */
+ +	__u16 compression; /* compression algorithm 0xFFFF default 0=disabled */
+  	bool rootfs:1; /* if it's a SMB root file system */
+  	bool witness:1; /* use witness protocol */
+++<<<<<<< HEAD:fs/cifs/fs_context.h
+++=======
++ 	char *leaf_fullpath;
++ 	struct cifs_ses *dfs_root_ses;
++ 	bool dfs_automount:1; /* set for dfs automount only */
++ 	enum cifs_reparse_type reparse_type;
++ 	bool dfs_conn:1; /* set for dfs mounts */
++ 	char *dns_dom;
+++>>>>>>> ad46faff1afc (smb: client: fix DFS mount against old servers with NTLMSSP):fs/smb/client/fs_context.h
+  };
+  
+  extern const struct fs_parameter_spec smb3_fs_parameters[];
+diff --cc fs/cifs/misc.c
+index c17d5d57f533,0d483cd08354..000000000000
+--- a/fs/cifs/misc.c
++++ b/fs/cifs/misc.c
+@@@ -1119,31 -1189,18 +1119,38 @@@ int match_target_ip(struct TCP_Server_I
+  
+  	cifs_dbg(FYI, "%s: target name: %s\n", __func__, target + 2);
+  
+++<<<<<<< HEAD:fs/cifs/misc.c
+ +	rc = dns_resolve_server_name_to_ip(target, &tip, NULL);
+++=======
++ 	rc = dns_resolve_server_name_to_ip(server->dns_dom, target,
++ 					   (struct sockaddr *)&ss, NULL);
++ 	kfree(target);
++ 
+++>>>>>>> ad46faff1afc (smb: client: fix DFS mount against old servers with NTLMSSP):fs/smb/client/misc.c
+  	if (rc < 0)
+ -		return rc;
+ +		goto out;
+ +
+ +	cifs_dbg(FYI, "%s: target ip: %s\n", __func__, tip);
+ +
+ +	if (!cifs_convert_address(&tipaddr, tip, strlen(tip))) {
+ +		cifs_dbg(VFS, "%s: failed to convert target ip address\n",
+ +			 __func__);
+ +		rc = -EINVAL;
+ +		goto out;
+ +	}
+  
+  	spin_lock(&server->srv_lock);
+ -	*result = cifs_match_ipaddr((struct sockaddr *)&server->dstaddr, (struct sockaddr *)&ss);
+ +	*result = cifs_match_ipaddr((struct sockaddr *)&server->dstaddr,
+ +				    &tipaddr);
+  	spin_unlock(&server->srv_lock);
+  	cifs_dbg(FYI, "%s: ip addresses match: %u\n", __func__, *result);
+ -	return 0;
+ +	rc = 0;
+ +
+ +out:
+ +	kfree(target);
+ +	kfree(tip);
+ +
+ +	return rc;
+  }
+  
+  int cifs_update_super_prepath(struct cifs_sb_info *cifs_sb, char *prefix)
+* Unmerged path fs/smb/client/dfs.c
+* Unmerged path fs/cifs/cifsglob.h
+* Unmerged path fs/cifs/connect.c
+* Unmerged path fs/cifs/dfs_cache.c
+* Unmerged path fs/cifs/dns_resolve.c
+* Unmerged path fs/cifs/dns_resolve.h
+* Unmerged path fs/cifs/fs_context.c
+* Unmerged path fs/cifs/fs_context.h
+* Unmerged path fs/cifs/misc.c
+* Unmerged path fs/smb/client/dfs.c
