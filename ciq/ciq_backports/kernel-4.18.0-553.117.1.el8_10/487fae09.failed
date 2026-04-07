@@ -1,0 +1,153 @@
+NFS: Add a mount option to make ENETUNREACH errors fatal
+
+jira KERNEL-814
+Rebuild_History Non-Buildable kernel-4.18.0-553.117.1.el8_10
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit 487fae09d7e266a58a13784983cc1ef6a2076526
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.117.1.el8_10/487fae09.failed
+
+If the NFS client was initially created in a container, and that
+container is torn down, there is usually no possibity to go back and
+destroy any NFS clients that are hung because their virtual network
+devices have been unlinked.
+
+Add a flag that tells the NFS client that in these circumstances, it
+should treat ENETDOWN and ENETUNREACH errors as fatal to the NFS client.
+
+The option defaults to being on when the mount happens from inside a net
+namespace that is not "init_net".
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+	Reviewed-by: Jeff Layton <jlayton@kernel.org>
+	Tested-by: Jeff Layton <jlayton@kernel.org>
+	Acked-by: Chuck Lever <chuck.lever@oracle.com>
+(cherry picked from commit 487fae09d7e266a58a13784983cc1ef6a2076526)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/fs_context.c
+diff --cc fs/nfs/fs_context.c
+index f102e526824f,13f71ca8c974..000000000000
+--- a/fs/nfs/fs_context.c
++++ b/fs/nfs/fs_context.c
+@@@ -43,6 -49,8 +43,11 @@@ enum nfs_param 
+  	Opt_bsize,
+  	Opt_clientaddr,
+  	Opt_cto,
+++<<<<<<< HEAD
+++=======
++ 	Opt_alignwrite,
++ 	Opt_fatal_neterrors,
+++>>>>>>> 487fae09d7e2 (NFS: Add a mount option to make ENETUNREACH errors fatal)
+  	Opt_fg,
+  	Opt_fscache,
+  	Opt_fscache_flag,
+@@@ -86,8 -94,24 +91,22 @@@
+  	Opt_v,
+  	Opt_vers,
+  	Opt_wsize,
+ -	Opt_write,
+ -	Opt_xprtsec,
+  };
+  
++ enum {
++ 	Opt_fatal_neterrors_default,
++ 	Opt_fatal_neterrors_enetunreach,
++ 	Opt_fatal_neterrors_none,
++ };
++ 
++ static const struct constant_table nfs_param_enums_fatal_neterrors[] = {
++ 	{ "default",			Opt_fatal_neterrors_default },
++ 	{ "ENETDOWN:ENETUNREACH",	Opt_fatal_neterrors_enetunreach },
++ 	{ "ENETUNREACH:ENETDOWN",	Opt_fatal_neterrors_enetunreach },
++ 	{ "none",			Opt_fatal_neterrors_none },
++ 	{}
++ };
++ 
+  enum {
+  	Opt_local_lock_all,
+  	Opt_local_lock_flock,
+@@@ -130,6 -167,9 +149,12 @@@ static const struct fs_parameter_spec n
+  	fsparam_u32   ("bsize",		Opt_bsize),
+  	fsparam_string("clientaddr",	Opt_clientaddr),
+  	fsparam_flag_no("cto",		Opt_cto),
+++<<<<<<< HEAD
+++=======
++ 	fsparam_flag_no("alignwrite",	Opt_alignwrite),
++ 	fsparam_enum("fatal_neterrors", Opt_fatal_neterrors,
++ 		     nfs_param_enums_fatal_neterrors),
+++>>>>>>> 487fae09d7e2 (NFS: Add a mount option to make ENETUNREACH errors fatal)
+  	fsparam_flag  ("fg",		Opt_fg),
+  	fsparam_flag_no("fsc",		Opt_fscache_flag),
+  	fsparam_string("fsc",		Opt_fscache),
+@@@ -776,7 -913,27 +801,26 @@@ static int nfs_fs_context_parse_param(s
+  			goto out_of_bounds;
+  		ctx->nfs_server.max_connect = result.uint_32;
+  		break;
++ 	case Opt_fatal_neterrors:
++ 		trace_nfs_mount_assign(param->key, param->string);
++ 		switch (result.uint_32) {
++ 		case Opt_fatal_neterrors_default:
++ 			if (fc->net_ns != &init_net)
++ 				ctx->flags |= NFS_MOUNT_NETUNREACH_FATAL;
++ 			else
++ 				ctx->flags &= ~NFS_MOUNT_NETUNREACH_FATAL;
++ 			break;
++ 		case Opt_fatal_neterrors_enetunreach:
++ 			ctx->flags |= NFS_MOUNT_NETUNREACH_FATAL;
++ 			break;
++ 		case Opt_fatal_neterrors_none:
++ 			ctx->flags &= ~NFS_MOUNT_NETUNREACH_FATAL;
++ 			break;
++ 		default:
++ 			goto out_invalid_value;
++ 		}
++ 		break;
+  	case Opt_lookupcache:
+ -		trace_nfs_mount_assign(param->key, param->string);
+  		switch (result.uint_32) {
+  		case Opt_lookupcache_all:
+  			ctx->flags &= ~(NFS_MOUNT_LOOKUP_CACHE_NONEG|NFS_MOUNT_LOOKUP_CACHE_NONE);
+@@@ -1527,7 -1707,13 +1571,10 @@@ static int nfs_init_fs_context(struct f
+  		ctx->selected_flavor	= RPC_AUTH_MAXFLAVOR;
+  		ctx->minorversion	= 0;
+  		ctx->need_mount		= true;
+ -		ctx->xprtsec.policy	= RPC_XPRTSEC_NONE;
+ -		ctx->xprtsec.cert_serial	= TLS_NO_CERT;
+ -		ctx->xprtsec.privkey_serial	= TLS_NO_PRIVKEY;
+  
++ 		if (fc->net_ns != &init_net)
++ 			ctx->flags |= NFS_MOUNT_NETUNREACH_FATAL;
++ 
+  		fc->s_iflags		|= SB_I_STABLE_WRITES;
+  	}
+  	fc->fs_private = ctx;
+* Unmerged path fs/nfs/fs_context.c
+diff --git a/fs/nfs/super.c b/fs/nfs/super.c
+index 4ab49269a18e..91c406e168cb 100644
+--- a/fs/nfs/super.c
++++ b/fs/nfs/super.c
+@@ -419,6 +419,9 @@ static void nfs_show_mount_options(struct seq_file *m, struct nfs_server *nfss,
+ 		{ NFS_MOUNT_FORCE_RDIRPLUS, ",rdirplus=force", "" },
+ 		{ NFS_MOUNT_UNSHARED, ",nosharecache", "" },
+ 		{ NFS_MOUNT_NORESVPORT, ",noresvport", "" },
++		{ NFS_MOUNT_NETUNREACH_FATAL,
++		  ",fatal_neterrors=ENETDOWN:ENETUNREACH",
++		  ",fatal_neterrors=none" },
+ 		{ 0, NULL, NULL }
+ 	};
+ 	const struct proc_nfs_info *nfs_infop;
+diff --git a/include/linux/nfs_fs_sb.h b/include/linux/nfs_fs_sb.h
+index 4d0a89db4e88..78a67b7f400e 100644
+--- a/include/linux/nfs_fs_sb.h
++++ b/include/linux/nfs_fs_sb.h
+@@ -159,6 +159,7 @@ struct nfs_server {
+ #define NFS_MOUNT_WRITE_WAIT		0x02000000
+ #define NFS_MOUNT_TRUNK_DISCOVERY	0x04000000
+ #define NFS_MOUNT_FORCE_RDIRPLUS	0x20000000
++#define NFS_MOUNT_NETUNREACH_FATAL	0x40000000
+ 
+ 	unsigned int		caps;		/* server capabilities */
+ 	unsigned int		rsize;		/* read size */
