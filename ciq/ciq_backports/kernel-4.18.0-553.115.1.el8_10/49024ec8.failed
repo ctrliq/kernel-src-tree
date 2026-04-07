@@ -1,0 +1,393 @@
+smb: client: fix parsing of source mount option
+
+jira KERNEL-814
+Rebuild_History Non-Buildable kernel-4.18.0-553.115.1.el8_10
+commit-author Paulo Alcantara <pc@manguebit.com>
+commit 49024ec8795ed2bd7217c249ef50a70c4e25d662
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.115.1.el8_10/49024ec8.failed
+
+Handle trailing and leading separators when parsing UNC and prefix
+paths in smb3_parse_devname().  Then, store the sanitised paths in
+smb3_fs_context::source.
+
+This fixes the following cases
+
+$ mount //srv/share// /mnt/1 -o ...
+$ cat /mnt/1/d0/f0
+cat: /mnt/1/d0/f0: Invalid argument
+
+The -EINVAL was returned because the client sent SMB2_CREATE "\\d0\f0"
+rather than SMB2_CREATE "\d0\f0".
+
+$ mount //srv//share /mnt/1 -o ...
+mount: Invalid argument
+
+The -EINVAL was returned correctly although the client only realised
+it after sending a couple of bad requests rather than bailing out
+earlier when parsing mount options.
+
+	Signed-off-by: Paulo Alcantara (SUSE) <pc@manguebit.com>
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 49024ec8795ed2bd7217c249ef50a70c4e25d662)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/cifs_dfs_ref.c
+#	fs/smb/client/dfs.c
+diff --cc fs/cifs/cifs_dfs_ref.c
+index e0edfc02f320,b1c2499b1c3b..000000000000
+--- a/fs/cifs/cifs_dfs_ref.c
++++ b/fs/cifs/cifs_dfs_ref.c
+@@@ -122,128 -118,15 +122,140 @@@ cifs_build_devname(char *nodename, cons
+  	return dev;
+  }
+  
+++<<<<<<< HEAD:fs/cifs/cifs_dfs_ref.c
+ +
+ +/**
+ + * cifs_compose_mount_options	-	creates mount options for referral
+ + * @sb_mountdata:	parent/root DFS mount options (template)
+ + * @fullpath:		full path in UNC format
+ + * @ref:		optional server's referral
+ + * @devname:		return the built cifs device name if passed pointer not NULL
+ + * creates mount options for submount based on template options sb_mountdata
+ + * and replacing unc,ip,prefixpath options with ones we've got form ref_unc.
+ + *
+ + * Returns: pointer to new mount options or ERR_PTR.
+ + * Caller is responsible for freeing returned value if it is not error.
+ + */
+ +char *cifs_compose_mount_options(const char *sb_mountdata,
+ +				 const char *fullpath,
+ +				 const struct dfs_info3_param *ref,
+ +				 char **devname)
+ +{
+ +	int rc;
+ +	char *name;
+ +	char *mountdata = NULL;
+ +	const char *prepath = NULL;
+ +	int md_len;
+ +	const char *start, *end;
+ +	char *srvIP = NULL;
+ +	char sep = ',';
+ +
+ +	if (sb_mountdata == NULL)
+ +		return ERR_PTR(-EINVAL);
+ +
+ +	if (ref) {
+ +		if (WARN_ON_ONCE(!ref->node_name || ref->path_consumed < 0))
+ +			return ERR_PTR(-EINVAL);
+ +
+ +		if (strlen(fullpath) - ref->path_consumed) {
+ +			prepath = fullpath + ref->path_consumed;
+ +			/* skip initial delimiter */
+ +			if (*prepath == '/' || *prepath == '\\')
+ +				prepath++;
+ +		}
+ +
+ +		name = cifs_build_devname(ref->node_name, prepath);
+ +		if (IS_ERR(name)) {
+ +			rc = PTR_ERR(name);
+ +			name = NULL;
+ +			goto compose_mount_options_err;
+ +		}
+ +	} else {
+ +		name = cifs_build_devname((char *)fullpath, NULL);
+ +		if (IS_ERR(name)) {
+ +			rc = PTR_ERR(name);
+ +			name = NULL;
+ +			goto compose_mount_options_err;
+ +		}
+ +	}
+ +
+ +	rc = dns_resolve_server_name_to_ip(name, &srvIP, NULL);
+ +	if (rc < 0) {
+ +		cifs_dbg(FYI, "%s: Failed to resolve server part of %s to IP: %d\n",
+ +			 __func__, name, rc);
+ +		goto compose_mount_options_err;
+ +	}
+ +
+ +	/*
+ +	 * In most cases, we'll be building a shorter string than the original,
+ +	 * but we do have to assume that the address in the ip= option may be
+ +	 * much longer than the original. Add the max length of an address
+ +	 * string to the length of the original string to allow for worst case.
+ +	 */
+ +	md_len = strlen(sb_mountdata) + INET6_ADDRSTRLEN;
+ +	mountdata = kzalloc(md_len + sizeof("ip=") + 1, GFP_KERNEL);
+ +	if (mountdata == NULL) {
+ +		rc = -ENOMEM;
+ +		goto compose_mount_options_err;
+ +	}
+ +
+ +	/* copy all options except of unc,ip,prefixpath,cruid */
+ +	start = end = sb_mountdata;
+ +	for (;;) {
+ +		end = strchrnul(end, sep);
+ +		while (*end && end[0] == sep && end[1] == sep)
+ +			end += 2;
+ +
+ +		if (strncasecmp(start, "prefixpath=", 11) == 0 ||
+ +		    strncasecmp(start, "cruid=", 6) == 0 ||
+ +		    strncasecmp(start, "unc=", 4) == 0 ||
+ +		    strncasecmp(start, "ip=", 3) == 0)
+ +			goto next_opt;
+ +
+ +		if (*mountdata)
+ +			strncat(mountdata, &sep, 1);
+ +		strncat(mountdata, start, end - start);
+ +next_opt:
+ +		if (!*end)
+ +			break;
+ +		start = ++end;
+ +	}
+ +	mountdata[md_len] = '\0';
+ +
+ +	/* copy new IP and ref share name */
+ +	if (*mountdata)
+ +		strncat(mountdata, &sep, 1);
+ +	strcat(mountdata, "ip=");
+ +	strcat(mountdata, srvIP);
+ +
+ +	if (devname)
+ +		*devname = name;
+ +	else
+ +		kfree(name);
+ +
+ +	cifs_dbg(FYI, "%s: parent mountdata: %s\n", __func__, sb_mountdata);
+ +	cifs_dbg(FYI, "%s: submount mountdata: %s\n", __func__, mountdata);
+ +
+ +compose_mount_options_out:
+ +	kfree(srvIP);
+ +	return mountdata;
+ +
+ +compose_mount_options_err:
+ +	kfree(mountdata);
+ +	mountdata = ERR_PTR(rc);
+ +	kfree(name);
+ +	goto compose_mount_options_out;
+++=======
++ static int set_dest_addr(struct smb3_fs_context *ctx)
++ {
++ 	struct sockaddr *addr = (struct sockaddr *)&ctx->dstaddr;
++ 	int rc;
++ 
++ 	rc = dns_resolve_server_name_to_ip(ctx->source, addr, NULL);
++ 	if (!rc)
++ 		cifs_set_port(addr, ctx->port);
++ 	return rc;
+++>>>>>>> 49024ec8795e (smb: client: fix parsing of source mount option):fs/smb/client/cifs_dfs_ref.c
+  }
+  
+  /*
+@@@ -289,13 -171,12 +301,20 @@@ static struct vfsmount *cifs_dfs_do_aut
+  		mnt = ERR_CAST(full_path);
+  		goto out;
+  	}
+++<<<<<<< HEAD:fs/cifs/cifs_dfs_ref.c
+ +
+ +	convert_delimiter(full_path, '/');
+ +	cifs_dbg(FYI, "%s: full_path: %s\n", __func__, full_path);
+ +
+ +	tmp = *cur_ctx;
+ +	tmp.source = full_path;
+++=======
++ 
++ 	tmp = *cur_ctx;
++ 	tmp.source = NULL;
++ 	tmp.leaf_fullpath = NULL;
+++>>>>>>> 49024ec8795e (smb: client: fix parsing of source mount option):fs/smb/client/cifs_dfs_ref.c
+  	tmp.UNC = tmp.prepath = NULL;
+ -	tmp.dfs_root_ses = NULL;
+  
+  	rc = smb3_fs_context_dup(ctx, &tmp);
+  	if (rc) {
+@@@ -304,6 -185,21 +323,24 @@@
+  	}
+  
+  	rc = smb3_parse_devname(full_path, ctx);
+++<<<<<<< HEAD:fs/cifs/cifs_dfs_ref.c
+++=======
++ 	if (rc) {
++ 		mnt = ERR_PTR(rc);
++ 		goto out;
++ 	}
++ 
++ 	ctx->source = smb3_fs_context_fullpath(ctx, '/');
++ 	if (IS_ERR(ctx->source)) {
++ 		mnt = ERR_CAST(ctx->source);
++ 		ctx->source = NULL;
++ 		goto out;
++ 	}
++ 	cifs_dbg(FYI, "%s: ctx: source=%s UNC=%s prepath=%s dstaddr=%pISpc\n",
++ 		 __func__, ctx->source, ctx->UNC, ctx->prepath, &ctx->dstaddr);
++ 
++ 	rc = set_dest_addr(ctx);
+++>>>>>>> 49024ec8795e (smb: client: fix parsing of source mount option):fs/smb/client/cifs_dfs_ref.c
+  	if (!rc)
+  		mnt = fc_mount(fc);
+  	else
+* Unmerged path fs/smb/client/dfs.c
+* Unmerged path fs/cifs/cifs_dfs_ref.c
+diff --git a/fs/cifs/cifsproto.h b/fs/cifs/cifsproto.h
+index c5eafe17793d..2c061489d580 100644
+--- a/fs/cifs/cifsproto.h
++++ b/fs/cifs/cifsproto.h
+@@ -83,6 +83,8 @@ void __release_mid(struct kref *refcount);
+ extern void cifs_wake_up_task(struct mid_q_entry *mid);
+ extern int cifs_handle_standard(struct TCP_Server_Info *server,
+ 				struct mid_q_entry *mid);
++extern char *smb3_fs_context_fullpath(const struct smb3_fs_context *ctx,
++				      char dirsep);
+ extern int smb3_parse_devname(const char *devname, struct smb3_fs_context *ctx);
+ extern int smb3_parse_opt(const char *options, const char *key, char **val);
+ extern int cifs_ipaddr_cmp(struct sockaddr *srcaddr, struct sockaddr *rhs);
+diff --git a/fs/cifs/fs_context.c b/fs/cifs/fs_context.c
+index f398a4935704..a3de471c10e2 100644
+--- a/fs/cifs/fs_context.c
++++ b/fs/cifs/fs_context.c
+@@ -449,14 +449,17 @@ int smb3_parse_opt(const char *options, const char *key, char **val)
+  * but there are some bugs that prevent rename from working if there are
+  * multiple delimiters.
+  *
+- * Returns a sanitized duplicate of @path. @gfp indicates the GFP_* flags
+- * for kstrdup.
++ * Return a sanitized duplicate of @path or NULL for empty prefix paths.
++ * Otherwise, return ERR_PTR.
++ *
++ * @gfp indicates the GFP_* flags for kstrdup.
+  * The caller is responsible for freeing the original.
+  */
+ #define IS_DELIM(c) ((c) == '/' || (c) == '\\')
+ char *cifs_sanitize_prepath(char *prepath, gfp_t gfp)
+ {
+ 	char *cursor1 = prepath, *cursor2 = prepath;
++	char *s;
+ 
+ 	/* skip all prepended delimiters */
+ 	while (IS_DELIM(*cursor1))
+@@ -477,8 +480,39 @@ char *cifs_sanitize_prepath(char *prepath, gfp_t gfp)
+ 	if (IS_DELIM(*(cursor2 - 1)))
+ 		cursor2--;
+ 
+-	*(cursor2) = '\0';
+-	return kstrdup(prepath, gfp);
++	*cursor2 = '\0';
++	if (!*prepath)
++		return NULL;
++	s = kstrdup(prepath, gfp);
++	if (!s)
++		return ERR_PTR(-ENOMEM);
++	return s;
++}
++
++/*
++ * Return full path based on the values of @ctx->{UNC,prepath}.
++ *
++ * It is assumed that both values were already parsed by smb3_parse_devname().
++ */
++char *smb3_fs_context_fullpath(const struct smb3_fs_context *ctx, char dirsep)
++{
++	size_t ulen, plen;
++	char *s;
++
++	ulen = strlen(ctx->UNC);
++	plen = ctx->prepath ? strlen(ctx->prepath) + 1 : 0;
++
++	s = kmalloc(ulen + plen + 1, GFP_KERNEL);
++	if (!s)
++		return ERR_PTR(-ENOMEM);
++	memcpy(s, ctx->UNC, ulen);
++	if (plen) {
++		s[ulen] = dirsep;
++		memcpy(s + ulen + 1, ctx->prepath, plen);
++	}
++	s[ulen + plen] = '\0';
++	convert_delimiter(s, dirsep);
++	return s;
+ }
+ 
+ /*
+@@ -492,6 +526,7 @@ smb3_parse_devname(const char *devname, struct smb3_fs_context *ctx)
+ 	char *pos;
+ 	const char *delims = "/\\";
+ 	size_t len;
++	int rc;
+ 
+ 	if (unlikely(!devname || !*devname)) {
+ 		cifs_dbg(VFS, "Device name not specified\n");
+@@ -519,6 +554,8 @@ smb3_parse_devname(const char *devname, struct smb3_fs_context *ctx)
+ 
+ 	/* now go until next delimiter or end of string */
+ 	len = strcspn(pos, delims);
++	if (!len)
++		return -EINVAL;
+ 
+ 	/* move "pos" up to delimiter or NULL */
+ 	pos += len;
+@@ -541,8 +578,11 @@ smb3_parse_devname(const char *devname, struct smb3_fs_context *ctx)
+ 		return 0;
+ 
+ 	ctx->prepath = cifs_sanitize_prepath(pos, GFP_KERNEL);
+-	if (!ctx->prepath)
+-		return -ENOMEM;
++	if (IS_ERR(ctx->prepath)) {
++		rc = PTR_ERR(ctx->prepath);
++		ctx->prepath = NULL;
++		return rc;
++	}
+ 
+ 	return 0;
+ }
+@@ -1109,12 +1149,13 @@ static int smb3_fs_context_parse_param(struct fs_context *fc,
+ 			cifs_errorf(fc, "Unknown error parsing devname\n");
+ 			goto cifs_parse_mount_err;
+ 		}
+-		ctx->source = kstrdup(param->string, GFP_KERNEL);
+-		if (ctx->source == NULL) {
++		ctx->source = smb3_fs_context_fullpath(ctx, '/');
++		if (IS_ERR(ctx->source)) {
++			ctx->source = NULL;
+ 			cifs_errorf(fc, "OOM when copying UNC string\n");
+ 			goto cifs_parse_mount_err;
+ 		}
+-		fc->source = kstrdup(param->string, GFP_KERNEL);
++		fc->source = kstrdup(ctx->source, GFP_KERNEL);
+ 		if (fc->source == NULL) {
+ 			cifs_errorf(fc, "OOM when copying UNC string\n");
+ 			goto cifs_parse_mount_err;
+diff --git a/fs/cifs/misc.c b/fs/cifs/misc.c
+index c17d5d57f533..b8612d8b8f08 100644
+--- a/fs/cifs/misc.c
++++ b/fs/cifs/misc.c
+@@ -1148,16 +1148,21 @@ int match_target_ip(struct TCP_Server_Info *server,
+ 
+ int cifs_update_super_prepath(struct cifs_sb_info *cifs_sb, char *prefix)
+ {
++	int rc;
++
+ 	kfree(cifs_sb->prepath);
++	cifs_sb->prepath = NULL;
+ 
+ 	if (prefix && *prefix) {
+ 		cifs_sb->prepath = cifs_sanitize_prepath(prefix, GFP_ATOMIC);
+-		if (!cifs_sb->prepath)
+-			return -ENOMEM;
+-
+-		convert_delimiter(cifs_sb->prepath, CIFS_DIR_SEP(cifs_sb));
+-	} else
+-		cifs_sb->prepath = NULL;
++		if (IS_ERR(cifs_sb->prepath)) {
++			rc = PTR_ERR(cifs_sb->prepath);
++			cifs_sb->prepath = NULL;
++			return rc;
++		}
++		if (cifs_sb->prepath)
++			convert_delimiter(cifs_sb->prepath, CIFS_DIR_SEP(cifs_sb));
++	}
+ 
+ 	cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_USE_PREFIX_PATH;
+ 	return 0;
+* Unmerged path fs/smb/client/dfs.c
