@@ -1,0 +1,263 @@
+cifs: don't block in dfs_cache_noreq_update_tgthint()
+
+jira KERNEL-814
+Rebuild_History Non-Buildable kernel-4.18.0-553.115.1.el8_10
+commit-author Paulo Alcantara <pc@cjr.nz>
+commit 1d04a6fe75eef16dd1816b112edb4406fd1fbffd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.115.1.el8_10/1d04a6fe.failed
+
+Avoid blocking in dfs_cache_noreq_update_tgthint() while reconnecting
+servers or tcons as the cache refresh worker or new mounts might
+already be updating their targets.
+
+Move some more dfs related code out of connect.c while at it.
+
+	Signed-off-by: Paulo Alcantara (SUSE) <pc@cjr.nz>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 1d04a6fe75eef16dd1816b112edb4406fd1fbffd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/connect.c
+#	fs/cifs/dfs.c
+#	fs/cifs/dfs_cache.c
+diff --cc fs/cifs/connect.c
+index 4ce4c920af28,41009ef7878f..000000000000
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@@ -4444,168 -4077,7 +4442,172 @@@ cifs_prune_tlinks(struct work_struct *w
+  				TLINK_IDLE_EXPIRE);
+  }
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_CIFS_DFS_UPCALL
+ +static int target_share_matches_server(struct TCP_Server_Info *server, const char *tcp_host,
+ +				       size_t tcp_host_len, char *share, bool *target_match)
+ +{
+ +	int rc = 0;
+ +	const char *dfs_host;
+ +	size_t dfs_host_len;
+ +
+ +	*target_match = true;
+ +	extract_unc_hostname(share, &dfs_host, &dfs_host_len);
+ +
+ +	/* Check if hostnames or addresses match */
+ +	cifs_server_lock(server);
+ +	if (dfs_host_len != tcp_host_len || strncasecmp(dfs_host, tcp_host, dfs_host_len) != 0) {
+ +		cifs_dbg(FYI, "%s: %.*s doesn't match %.*s\n", __func__, (int)dfs_host_len,
+ +			 dfs_host, (int)tcp_host_len, tcp_host);
+ +		rc = match_target_ip(server, dfs_host, dfs_host_len, target_match);
+ +		if (rc)
+ +			cifs_dbg(VFS, "%s: failed to match target ip: %d\n", __func__, rc);
+ +	}
+ +	cifs_server_unlock(server);
+ +	return rc;
+ +}
+ +
+ +static int tree_connect_dfs_target(const unsigned int xid, struct cifs_tcon *tcon,
+ +				   struct cifs_sb_info *cifs_sb, char *tree, bool islink,
+ +				   struct dfs_cache_tgt_list *tl)
+ +{
+ +	int rc;
+ +	struct TCP_Server_Info *server = tcon->ses->server;
+ +	const struct smb_version_operations *ops = server->ops;
+ +	struct cifs_tcon *ipc = tcon->ses->tcon_ipc;
+ +	char *share = NULL, *prefix = NULL;
+ +	const char *tcp_host;
+ +	size_t tcp_host_len;
+ +	struct dfs_cache_tgt_iterator *tit;
+ +	bool target_match;
+ +
+ +	cifs_server_lock(server);
+ +	extract_unc_hostname(server->hostname, &tcp_host, &tcp_host_len);
+ +	cifs_server_unlock(server);
+ +
+ +	tit = dfs_cache_get_tgt_iterator(tl);
+ +	if (!tit) {
+ +		rc = -ENOENT;
+ +		goto out;
+ +	}
+ +
+ +	/* Try to tree connect to all dfs targets */
+ +	for (; tit; tit = dfs_cache_get_next_tgt(tl, tit)) {
+ +		kfree(share);
+ +		kfree(prefix);
+ +		share = prefix = NULL;
+ +
+ +		/* Check if share matches with tcp ses */
+ +		rc = dfs_cache_get_tgt_share(server->current_fullpath + 1, tit, &share, &prefix);
+ +		if (rc) {
+ +			cifs_dbg(VFS, "%s: failed to parse target share: %d\n", __func__, rc);
+ +			break;
+ +		}
+ +
+ +		rc = target_share_matches_server(server, tcp_host, tcp_host_len, share,
+ +						 &target_match);
+ +		if (rc)
+ +			break;
+ +		if (!target_match) {
+ +			rc = -EHOSTUNREACH;
+ +			continue;
+ +		}
+ +
+ +		dfs_cache_noreq_update_tgthint(server->current_fullpath + 1, tit);
+ +		if (ipc->need_reconnect) {
+ +			scnprintf(tree, MAX_TREE_SIZE, "\\\\%s\\IPC$", server->hostname);
+ +			ops->tree_connect(xid, ipc->ses, tree, ipc, cifs_sb->local_nls);
+ +		}
+ +
+ +		scnprintf(tree, MAX_TREE_SIZE, "\\%s", share);
+ +		rc = ops->tree_connect(xid, tcon->ses, tree, tcon, cifs_sb->local_nls);
+ +		if (islink && !rc)
+ +			rc = cifs_update_super_prepath(cifs_sb, prefix);
+ +		break;
+ +	}
+ +
+ +out:
+ +	kfree(share);
+ +	kfree(prefix);
+ +	dfs_cache_free_tgts(tl);
+ +	return rc;
+ +}
+ +
+ +int cifs_tree_connect(const unsigned int xid, struct cifs_tcon *tcon, const struct nls_table *nlsc)
+ +{
+ +	int rc;
+ +	struct TCP_Server_Info *server = tcon->ses->server;
+ +	const struct smb_version_operations *ops = server->ops;
+ +	struct super_block *sb = NULL;
+ +	struct cifs_sb_info *cifs_sb = NULL;
+ +	struct dfs_cache_tgt_list tl = DFS_CACHE_TGT_LIST_INIT(tl);
+ +	char *tree;
+ +	struct dfs_info3_param ref = {0};
+ +
+ +	/* only send once per connect */
+ +	spin_lock(&tcon->tc_lock);
+ +	if (tcon->ses->ses_status != SES_GOOD ||
+ +	    (tcon->status != TID_NEW &&
+ +	    tcon->status != TID_NEED_TCON)) {
+ +		spin_unlock(&tcon->tc_lock);
+ +		return 0;
+ +	}
+ +	tcon->status = TID_IN_TCON;
+ +	spin_unlock(&tcon->tc_lock);
+ +
+ +	tree = kzalloc(MAX_TREE_SIZE, GFP_KERNEL);
+ +	if (!tree) {
+ +		rc = -ENOMEM;
+ +		goto out;
+ +	}
+ +
+ +	if (tcon->ipc) {
+ +		cifs_server_lock(server);
+ +		scnprintf(tree, MAX_TREE_SIZE, "\\\\%s\\IPC$", server->hostname);
+ +		cifs_server_unlock(server);
+ +		rc = ops->tree_connect(xid, tcon->ses, tree, tcon, nlsc);
+ +		goto out;
+ +	}
+ +
+ +	sb = cifs_get_tcp_super(server);
+ +	if (!IS_ERR(sb))
+ +		cifs_sb = CIFS_SB(sb);
+ +
+ +	/* If it is not dfs or there was no cached dfs referral, then reconnect to same share */
+ +	if (!cifs_sb || !server->current_fullpath ||
+ +	    dfs_cache_noreq_find(server->current_fullpath + 1, &ref, &tl)) {
+ +		rc = ops->tree_connect(xid, tcon->ses, tcon->treeName, tcon,
+ +				       cifs_sb ? cifs_sb->local_nls : nlsc);
+ +		goto out;
+ +	}
+ +
+ +	rc = tree_connect_dfs_target(xid, tcon, cifs_sb, tree, ref.server_type == DFS_TYPE_LINK,
+ +				     &tl);
+ +	free_dfs_info_param(&ref);
+ +
+ +out:
+ +	kfree(tree);
+ +	cifs_put_tcp_super(sb);
+ +
+ +	if (rc) {
+ +		spin_lock(&tcon->tc_lock);
+ +		if (tcon->status == TID_IN_TCON)
+ +			tcon->status = TID_NEED_TCON;
+ +		spin_unlock(&tcon->tc_lock);
+ +	} else {
+ +		spin_lock(&tcon->tc_lock);
+ +		if (tcon->status == TID_IN_TCON)
+ +			tcon->status = TID_GOOD;
+ +		spin_unlock(&tcon->tc_lock);
+ +		tcon->need_reconnect = false;
+ +	}
+ +
+ +	return rc;
+ +}
+ +#else
+++=======
++ #ifndef CONFIG_CIFS_DFS_UPCALL
+++>>>>>>> 1d04a6fe75ee (cifs: don't block in dfs_cache_noreq_update_tgthint())
+  int cifs_tree_connect(const unsigned int xid, struct cifs_tcon *tcon, const struct nls_table *nlsc)
+  {
+  	int rc;
+diff --cc fs/cifs/dfs_cache.c
+index f047927707aa,43ad1176dcb9..000000000000
+--- a/fs/cifs/dfs_cache.c
++++ b/fs/cifs/dfs_cache.c
+@@@ -1129,16 -1092,14 +1128,23 @@@ void dfs_cache_noreq_update_tgthint(con
+  
+  	cifs_dbg(FYI, "%s: path: %s\n", __func__, path);
+  
+++<<<<<<< HEAD
+ +	down_read(&htable_rw_lock);
+++=======
++ 	if (!down_write_trylock(&htable_rw_lock))
++ 		return;
+++>>>>>>> 1d04a6fe75ee (cifs: don't block in dfs_cache_noreq_update_tgthint())
+  
+  	ce = lookup_cache_entry(path);
+- 	if (IS_ERR(ce)) {
+- 		rc = PTR_ERR(ce);
++ 	if (IS_ERR(ce))
+  		goto out_unlock;
+- 	}
+  
+++<<<<<<< HEAD
+ +	rc = 0;
+ +	t = READ_ONCE(ce->tgthint);
+++=======
++ 	t = ce->tgthint;
+++>>>>>>> 1d04a6fe75ee (cifs: don't block in dfs_cache_noreq_update_tgthint())
+  
+  	if (unlikely(!strcasecmp(it->it_name, t->name)))
+  		goto out_unlock;
+@@@ -1153,8 -1114,7 +1159,12 @@@
+  	}
+  
+  out_unlock:
+++<<<<<<< HEAD
+ +	up_read(&htable_rw_lock);
+ +	return rc;
+++=======
++ 	up_write(&htable_rw_lock);
+++>>>>>>> 1d04a6fe75ee (cifs: don't block in dfs_cache_noreq_update_tgthint())
+  }
+  
+  /**
+* Unmerged path fs/cifs/dfs.c
+* Unmerged path fs/cifs/connect.c
+* Unmerged path fs/cifs/dfs.c
+* Unmerged path fs/cifs/dfs_cache.c
+diff --git a/fs/cifs/dfs_cache.h b/fs/cifs/dfs_cache.h
+index 2b8c2526de76..9ecef3485c1d 100644
+--- a/fs/cifs/dfs_cache.h
++++ b/fs/cifs/dfs_cache.h
+@@ -38,7 +38,7 @@ int dfs_cache_noreq_find(const char *path, struct dfs_info3_param *ref,
+ int dfs_cache_update_tgthint(const unsigned int xid, struct cifs_ses *ses,
+ 			     const struct nls_table *cp, int remap, const char *path,
+ 			     const struct dfs_cache_tgt_iterator *it);
+-int dfs_cache_noreq_update_tgthint(const char *path, const struct dfs_cache_tgt_iterator *it);
++void dfs_cache_noreq_update_tgthint(const char *path, const struct dfs_cache_tgt_iterator *it);
+ int dfs_cache_get_tgt_referral(const char *path, const struct dfs_cache_tgt_iterator *it,
+ 			       struct dfs_info3_param *ref);
+ int dfs_cache_get_tgt_share(char *path, const struct dfs_cache_tgt_iterator *it, char **share,
