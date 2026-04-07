@@ -1141,6 +1141,8 @@ static inline bool efi_runtime_disabled(void) { return true; }
 extern void efi_call_virt_check_flags(unsigned long flags, const void *caller);
 extern unsigned long efi_call_virt_save_flags(void);
 
+void efi_runtime_assert_lock_held(void);
+
 static inline
 enum efi_secureboot_mode efi_get_secureboot_mode(efi_get_variable_t *get_var)
 {
