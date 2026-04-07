@@ -1,0 +1,176 @@
+NFS: Clean up O_DIRECT request allocation
+
+jira KERNEL-814
+Rebuild_History Non-Buildable kernel-4.18.0-553.117.1.el8_10
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit 70e9db69f927bb378db9aaa807cc83ae550779a9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.117.1.el8_10/70e9db69.failed
+
+Rather than adjusting the index+offset after the call to
+nfs_create_request(), add a function nfs_page_create_from_page() that
+takes an offset.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 70e9db69f927bb378db9aaa807cc83ae550779a9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/pagelist.c
+#	include/linux/nfs_page.h
+diff --cc fs/nfs/pagelist.c
+index 842fbc92cc19,0b4c07c93a52..000000000000
+--- a/fs/nfs/pagelist.c
++++ b/fs/nfs/pagelist.c
+@@@ -388,11 -496,29 +388,12 @@@ __nfs_create_request(struct nfs_lock_co
+  	return req;
+  }
+  
+ -static void nfs_page_assign_folio(struct nfs_page *req, struct folio *folio)
+ -{
+ -	if (folio != NULL) {
+ -		req->wb_folio = folio;
+ -		folio_get(folio);
+ -		set_bit(PG_FOLIO, &req->wb_flags);
+ -	}
+ -}
+ -
+ -static void nfs_page_assign_page(struct nfs_page *req, struct page *page)
+ -{
+ -	if (page != NULL) {
+ -		req->wb_page = page;
+ -		get_page(page);
+ -	}
+ -}
+ -
+  /**
+-  * nfs_create_request - Create an NFS read/write request.
++  * nfs_page_create_from_page - Create an NFS read/write request.
+   * @ctx: open context to use
+   * @page: page to write
+-  * @offset: starting offset within the page for the write
++  * @pgbase: starting offset within the page for the write
++  * @offset: file offset for the write
+   * @count: number of bytes to read/write
+   *
+   * The page must be locked by the caller. This makes sure we never
+@@@ -408,9 -535,42 +410,16 @@@ struct nfs_page *nfs_page_create_from_p
+  
+  	if (IS_ERR(l_ctx))
+  		return ERR_CAST(l_ctx);
+++<<<<<<< HEAD
+ +	ret = __nfs_create_request(l_ctx, page, offset, offset, count);
+ +	if (!IS_ERR(ret))
+++=======
++ 	ret = nfs_page_create(l_ctx, pgbase, offset >> PAGE_SHIFT,
++ 			      offset_in_page(offset), count);
++ 	if (!IS_ERR(ret)) {
++ 		nfs_page_assign_page(ret, page);
+++>>>>>>> 70e9db69f927 (NFS: Clean up O_DIRECT request allocation)
+  		nfs_page_group_init(ret, NULL);
+ -	}
+ -	nfs_put_lock_context(l_ctx);
+ -	return ret;
+ -}
+ -
+ -/**
+ - * nfs_page_create_from_folio - Create an NFS read/write request.
+ - * @ctx: open context to use
+ - * @folio: folio to write
+ - * @offset: starting offset within the folio for the write
+ - * @count: number of bytes to read/write
+ - *
+ - * The page must be locked by the caller. This makes sure we never
+ - * create two different requests for the same page.
+ - * User should ensure it is safe to sleep in this function.
+ - */
+ -struct nfs_page *nfs_page_create_from_folio(struct nfs_open_context *ctx,
+ -					    struct folio *folio,
+ -					    unsigned int offset,
+ -					    unsigned int count)
+ -{
+ -	struct nfs_lock_context *l_ctx = nfs_get_lock_context(ctx);
+ -	struct nfs_page *ret;
+ -
+ -	if (IS_ERR(l_ctx))
+ -		return ERR_CAST(l_ctx);
+ -	ret = nfs_page_create(l_ctx, offset, folio_index(folio), offset, count);
+ -	if (!IS_ERR(ret)) {
+ -		nfs_page_assign_folio(ret, folio);
+ -		nfs_page_group_init(ret, NULL);
+ -	}
+  	nfs_put_lock_context(l_ctx);
+  	return ret;
+  }
+diff --cc include/linux/nfs_page.h
+index d6e6a9376ee4,a2f1ca657623..000000000000
+--- a/include/linux/nfs_page.h
++++ b/include/linux/nfs_page.h
+@@@ -117,10 -121,15 +117,22 @@@ struct nfs_pageio_descriptor 
+  
+  #define NFS_WBACK_BUSY(req)	(test_bit(PG_BUSY,&(req)->wb_flags))
+  
+++<<<<<<< HEAD
+ +extern	struct nfs_page *nfs_create_request(struct nfs_open_context *ctx,
+ +					    struct page *page,
+ +					    unsigned int offset,
+ +					    unsigned int count);
+++=======
++ extern struct nfs_page *nfs_page_create_from_page(struct nfs_open_context *ctx,
++ 						  struct page *page,
++ 						  unsigned int pgbase,
++ 						  loff_t offset,
++ 						  unsigned int count);
++ extern struct nfs_page *nfs_page_create_from_folio(struct nfs_open_context *ctx,
++ 						   struct folio *folio,
++ 						   unsigned int offset,
++ 						   unsigned int count);
+++>>>>>>> 70e9db69f927 (NFS: Clean up O_DIRECT request allocation)
+  extern	void nfs_release_request(struct nfs_page *);
+  
+  
+diff --git a/fs/nfs/direct.c b/fs/nfs/direct.c
+index 34e9a46313e5..18dc17475c73 100644
+--- a/fs/nfs/direct.c
++++ b/fs/nfs/direct.c
+@@ -377,14 +377,12 @@ static ssize_t nfs_direct_read_schedule_iovec(struct nfs_direct_req *dreq,
+ 			struct nfs_page *req;
+ 			unsigned int req_len = min_t(size_t, bytes, PAGE_SIZE - pgbase);
+ 			/* XXX do we need to do the eof zeroing found in async_filler? */
+-			req = nfs_create_request(dreq->ctx, pagevec[i],
+-						 pgbase, req_len);
++			req = nfs_page_create_from_page(dreq->ctx, pagevec[i],
++							pgbase, pos, req_len);
+ 			if (IS_ERR(req)) {
+ 				result = PTR_ERR(req);
+ 				break;
+ 			}
+-			req->wb_index = pos >> PAGE_SHIFT;
+-			req->wb_offset = pos & ~PAGE_MASK;
+ 			if (!nfs_pageio_add_request(&desc, req)) {
+ 				result = desc.pg_error;
+ 				nfs_release_request(req);
+@@ -829,8 +827,8 @@ static ssize_t nfs_direct_write_schedule_iovec(struct nfs_direct_req *dreq,
+ 			struct nfs_page *req;
+ 			unsigned int req_len = min_t(size_t, bytes, PAGE_SIZE - pgbase);
+ 
+-			req = nfs_create_request(dreq->ctx, pagevec[i],
+-						 pgbase, req_len);
++			req = nfs_page_create_from_page(dreq->ctx, pagevec[i],
++							pgbase, pos, req_len);
+ 			if (IS_ERR(req)) {
+ 				result = PTR_ERR(req);
+ 				break;
+@@ -843,8 +841,6 @@ static ssize_t nfs_direct_write_schedule_iovec(struct nfs_direct_req *dreq,
+ 			}
+ 
+ 			nfs_lock_request(req);
+-			req->wb_index = pos >> PAGE_SHIFT;
+-			req->wb_offset = pos & ~PAGE_MASK;
+ 			if (!nfs_pageio_add_request(&desc, req)) {
+ 				result = desc.pg_error;
+ 				nfs_unlock_and_release_request(req);
+* Unmerged path fs/nfs/pagelist.c
+* Unmerged path include/linux/nfs_page.h
