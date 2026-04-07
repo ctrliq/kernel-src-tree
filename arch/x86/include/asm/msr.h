@@ -339,10 +339,11 @@ int msr_clear_bit(u32 msr, u8 bit);
 /* temporary #defines for RHEL */
 #define rdmsrl(msr, val) rdmsrq(msr, val)
 #define wrmsrl(msr, val) wrmsrq(msr, val)
+#define native_wrmsrl(msr, val) native_wrmsrq(msr, val)
 #define rdmsrl_safe(msr, p) rdmsrq_safe(msr, p)
 #define wrmsrl_safe(msr, val) wrmsrq_safe(msr, val)
 #define rdmsrl_on_cpu(cpu, msr_no, q) rdmsrq_on_cpu(cpu, msr_no, q)
-#define native_wrmsrl(msr, val) native_wrmsrq(msr, val)
+#define wrmsrl_on_cpu(cpu, msr_no, q) wrmsrq_on_cpu(cpu, msr_no, q)
 #define rdmsrl_safe_on_cpu(cpu, msr_no, q) rdmsrq_safe_on_cpu(cpu, msr_no, q)
 #define wrmsrl_safe_on_cpu(cpu, msr_no, q) wrmsrq_safe_on_cpu(cpu, msr_no, q)
 
@@ -350,7 +351,7 @@ int msr_clear_bit(u32 msr, u8 bit);
 int rdmsr_on_cpu(unsigned int cpu, u32 msr_no, u32 *l, u32 *h);
 int wrmsr_on_cpu(unsigned int cpu, u32 msr_no, u32 l, u32 h);
 int rdmsrq_on_cpu(unsigned int cpu, u32 msr_no, u64 *q);
-int wrmsrl_on_cpu(unsigned int cpu, u32 msr_no, u64 q);
+int wrmsrq_on_cpu(unsigned int cpu, u32 msr_no, u64 q);
 void rdmsr_on_cpus(const struct cpumask *mask, u32 msr_no, struct msr *msrs);
 void wrmsr_on_cpus(const struct cpumask *mask, u32 msr_no, struct msr *msrs);
 int rdmsr_safe_on_cpu(unsigned int cpu, u32 msr_no, u32 *l, u32 *h);
@@ -375,7 +376,7 @@ static inline int rdmsrq_on_cpu(unsigned int cpu, u32 msr_no, u64 *q)
 	rdmsrq(msr_no, *q);
 	return 0;
 }
-static inline int wrmsrl_on_cpu(unsigned int cpu, u32 msr_no, u64 q)
+static inline int wrmsrq_on_cpu(unsigned int cpu, u32 msr_no, u64 q)
 {
 	wrmsrq(msr_no, q);
 	return 0;
