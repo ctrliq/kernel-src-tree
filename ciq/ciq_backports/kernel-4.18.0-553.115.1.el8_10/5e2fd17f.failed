@@ -1,0 +1,261 @@
+smb: client: fix mount when dns_resolver key is not available
+
+jira KERNEL-814
+Rebuild_History Non-Buildable kernel-4.18.0-553.115.1.el8_10
+commit-author Paulo Alcantara <pc@manguebit.com>
+commit 5e2fd17f434d2fed78efb123e2fc6711e4f598f1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.115.1.el8_10/5e2fd17f.failed
+
+There was a wrong assumption that with CONFIG_CIFS_DFS_UPCALL=y there
+would always be a dns_resolver key set up so we could unconditionally
+upcall to resolve UNC hostname rather than using the value provided by
+mount(2).
+
+Only require it when performing automount of junctions within a DFS
+share so users that don't have dns_resolver key still can mount their
+regular shares with server hostname resolved by mount.cifs(8).
+
+Fixes: 348a04a8d113 ("smb: client: get rid of dfs code dep in namespace.c")
+	Cc: stable@vger.kernel.org
+	Tested-by: Eduard Bachmakov <e.bachmakov@gmail.com>
+	Reported-by: Eduard Bachmakov <e.bachmakov@gmail.com>
+Closes: https://lore.kernel.org/all/CADCRUiNvZuiUZ0VGZZO9HRyPyw6x92kiA7o7Q4tsX5FkZqUkKg@mail.gmail.com/
+	Signed-off-by: Paulo Alcantara (SUSE) <pc@manguebit.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 5e2fd17f434d2fed78efb123e2fc6711e4f598f1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/cifs_dfs_ref.c
+#	fs/cifs/fs_context.h
+#	fs/smb/client/dfs.c
+diff --cc fs/cifs/cifs_dfs_ref.c
+index 2dd1ebafaac9,a6968573b775..000000000000
+--- a/fs/cifs/cifs_dfs_ref.c
++++ b/fs/cifs/cifs_dfs_ref.c
+@@@ -122,128 -117,55 +122,145 @@@ cifs_build_devname(char *nodename, cons
+  	return dev;
+  }
+  
+++<<<<<<< HEAD:fs/cifs/cifs_dfs_ref.c
+ +
+ +/**
+ + * cifs_compose_mount_options	-	creates mount options for referral
+ + * @sb_mountdata:	parent/root DFS mount options (template)
+ + * @fullpath:		full path in UNC format
+ + * @ref:		optional server's referral
+ + * @devname:		return the built cifs device name if passed pointer not NULL
+ + * creates mount options for submount based on template options sb_mountdata
+ + * and replacing unc,ip,prefixpath options with ones we've got form ref_unc.
+ + *
+ + * Returns: pointer to new mount options or ERR_PTR.
+ + * Caller is responsible for freeing returned value if it is not error.
+ + */
+ +char *cifs_compose_mount_options(const char *sb_mountdata,
+ +				 const char *fullpath,
+ +				 const struct dfs_info3_param *ref,
+ +				 char **devname)
+++=======
++ static bool is_dfs_mount(struct dentry *dentry)
++ {
++ 	struct cifs_sb_info *cifs_sb = CIFS_SB(dentry->d_sb);
++ 	struct cifs_tcon *tcon = cifs_sb_master_tcon(cifs_sb);
++ 	bool ret;
++ 
++ 	spin_lock(&tcon->tc_lock);
++ 	ret = !!tcon->origin_fullpath;
++ 	spin_unlock(&tcon->tc_lock);
++ 	return ret;
++ }
++ 
++ /* Return full path out of a dentry set for automount */
++ static char *automount_fullpath(struct dentry *dentry, void *page)
+++>>>>>>> 5e2fd17f434d (smb: client: fix mount when dns_resolver key is not available):fs/smb/client/namespace.c
+  {
+ -	struct cifs_sb_info *cifs_sb = CIFS_SB(dentry->d_sb);
+ -	struct cifs_tcon *tcon = cifs_sb_master_tcon(cifs_sb);
+ -	size_t len;
+ -	char *s;
+ +	int rc;
+ +	char *name;
+ +	char *mountdata = NULL;
+ +	const char *prepath = NULL;
+ +	int md_len;
+ +	const char *start, *end;
+ +	char *srvIP = NULL;
+ +	char sep = ',';
+ +
+ +	if (sb_mountdata == NULL)
+ +		return ERR_PTR(-EINVAL);
+  
+ -	spin_lock(&tcon->tc_lock);
+ -	if (!tcon->origin_fullpath) {
+ -		spin_unlock(&tcon->tc_lock);
+ -		return build_path_from_dentry_optional_prefix(dentry,
+ -							      page,
+ -							      true);
+ +	if (ref) {
+ +		if (WARN_ON_ONCE(!ref->node_name || ref->path_consumed < 0))
+ +			return ERR_PTR(-EINVAL);
+ +
+ +		if (strlen(fullpath) - ref->path_consumed) {
+ +			prepath = fullpath + ref->path_consumed;
+ +			/* skip initial delimiter */
+ +			if (*prepath == '/' || *prepath == '\\')
+ +				prepath++;
+ +		}
+ +
+ +		name = cifs_build_devname(ref->node_name, prepath);
+ +		if (IS_ERR(name)) {
+ +			rc = PTR_ERR(name);
+ +			name = NULL;
+ +			goto compose_mount_options_err;
+ +		}
+ +	} else {
+ +		name = cifs_build_devname((char *)fullpath, NULL);
+ +		if (IS_ERR(name)) {
+ +			rc = PTR_ERR(name);
+ +			name = NULL;
+ +			goto compose_mount_options_err;
+ +		}
+  	}
+ -	spin_unlock(&tcon->tc_lock);
+ -
+ -	s = dentry_path_raw(dentry, page, PATH_MAX);
+ -	if (IS_ERR(s))
+ -		return s;
+ -	/* for root, we want "" */
+ -	if (!s[1])
+ -		s++;
+  
+ -	spin_lock(&tcon->tc_lock);
+ -	len = strlen(tcon->origin_fullpath);
+ -	if (s < (char *)page + len) {
+ -		spin_unlock(&tcon->tc_lock);
+ -		return ERR_PTR(-ENAMETOOLONG);
+ +	rc = dns_resolve_server_name_to_ip(name, &srvIP, NULL);
+ +	if (rc < 0) {
+ +		cifs_dbg(FYI, "%s: Failed to resolve server part of %s to IP: %d\n",
+ +			 __func__, name, rc);
+ +		goto compose_mount_options_err;
+  	}
+  
+ -	s -= len;
+ -	memcpy(s, tcon->origin_fullpath, len);
+ -	spin_unlock(&tcon->tc_lock);
+ -	convert_delimiter(s, '/');
+ +	/*
+ +	 * In most cases, we'll be building a shorter string than the original,
+ +	 * but we do have to assume that the address in the ip= option may be
+ +	 * much longer than the original. Add the max length of an address
+ +	 * string to the length of the original string to allow for worst case.
+ +	 */
+ +	md_len = strlen(sb_mountdata) + INET6_ADDRSTRLEN;
+ +	mountdata = kzalloc(md_len + sizeof("ip=") + 1, GFP_KERNEL);
+ +	if (mountdata == NULL) {
+ +		rc = -ENOMEM;
+ +		goto compose_mount_options_err;
+ +	}
+  
+ -	return s;
+ +	/* copy all options except of unc,ip,prefixpath,cruid */
+ +	start = end = sb_mountdata;
+ +	for (;;) {
+ +		end = strchrnul(end, sep);
+ +		while (*end && end[0] == sep && end[1] == sep)
+ +			end += 2;
+ +
+ +		if (strncasecmp(start, "prefixpath=", 11) == 0 ||
+ +		    strncasecmp(start, "cruid=", 6) == 0 ||
+ +		    strncasecmp(start, "unc=", 4) == 0 ||
+ +		    strncasecmp(start, "ip=", 3) == 0)
+ +			goto next_opt;
+ +
+ +		if (*mountdata)
+ +			strncat(mountdata, &sep, 1);
+ +		strncat(mountdata, start, end - start);
+ +next_opt:
+ +		if (!*end)
+ +			break;
+ +		start = ++end;
+ +	}
+ +	mountdata[md_len] = '\0';
+ +
+ +	/* copy new IP and ref share name */
+ +	if (*mountdata)
+ +		strncat(mountdata, &sep, 1);
+ +	strcat(mountdata, "ip=");
+ +	strcat(mountdata, srvIP);
+ +
+ +	if (devname)
+ +		*devname = name;
+ +	else
+ +		kfree(name);
+ +
+ +	cifs_dbg(FYI, "%s: parent mountdata: %s\n", __func__, sb_mountdata);
+ +	cifs_dbg(FYI, "%s: submount mountdata: %s\n", __func__, mountdata);
+ +
+ +compose_mount_options_out:
+ +	kfree(srvIP);
+ +	return mountdata;
+ +
+ +compose_mount_options_err:
+ +	kfree(mountdata);
+ +	mountdata = ERR_PTR(rc);
+ +	kfree(name);
+ +	goto compose_mount_options_out;
+  }
+  
+  /*
+@@@ -304,11 -213,22 +321,25 @@@ static struct vfsmount *cifs_do_automou
+  	}
+  
+  	rc = smb3_parse_devname(full_path, ctx);
+ -	if (rc) {
+ +	if (!rc)
+ +		mnt = fc_mount(fc);
+ +	else
+  		mnt = ERR_PTR(rc);
+ -		goto out;
+ -	}
+  
+++<<<<<<< HEAD:fs/cifs/cifs_dfs_ref.c
+++=======
++ 	ctx->source = smb3_fs_context_fullpath(ctx, '/');
++ 	if (IS_ERR(ctx->source)) {
++ 		mnt = ERR_CAST(ctx->source);
++ 		ctx->source = NULL;
++ 		goto out;
++ 	}
++ 	ctx->dfs_automount = is_dfs_mount(mntpt);
++ 	cifs_dbg(FYI, "%s: ctx: source=%s UNC=%s prepath=%s dfs_automount=%d\n",
++ 		 __func__, ctx->source, ctx->UNC, ctx->prepath, ctx->dfs_automount);
++ 
++ 	mnt = fc_mount(fc);
+++>>>>>>> 5e2fd17f434d (smb: client: fix mount when dns_resolver key is not available):fs/smb/client/namespace.c
+  out:
+  	put_fs_context(fc);
+  	free_dentry_path(page);
+diff --cc fs/cifs/fs_context.h
+index 26619c1ccca7,cf46916286d0..000000000000
+--- a/fs/cifs/fs_context.h
++++ b/fs/cifs/fs_context.h
+@@@ -259,6 -265,10 +259,12 @@@ struct smb3_fs_context 
+  	__u16 compression; /* compression algorithm 0xFFFF default 0=disabled */
+  	bool rootfs:1; /* if it's a SMB root file system */
+  	bool witness:1; /* use witness protocol */
+++<<<<<<< HEAD:fs/cifs/fs_context.h
+++=======
++ 	char *leaf_fullpath;
++ 	struct cifs_ses *dfs_root_ses;
++ 	bool dfs_automount:1; /* set for dfs automount only */
+++>>>>>>> 5e2fd17f434d (smb: client: fix mount when dns_resolver key is not available):fs/smb/client/fs_context.h
+  };
+  
+  extern const struct fs_parameter_spec smb3_fs_parameters[];
+* Unmerged path fs/smb/client/dfs.c
+* Unmerged path fs/cifs/cifs_dfs_ref.c
+* Unmerged path fs/cifs/fs_context.h
+* Unmerged path fs/smb/client/dfs.c
