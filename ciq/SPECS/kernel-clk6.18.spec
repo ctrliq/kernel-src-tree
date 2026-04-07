@@ -2114,6 +2114,7 @@ done
 
 %if %{signkernel}%{signmodules}
 
+%ifnarch noarch
 # Add DUP and kpatch certificates to system trusted keys for RHEL
 truncate -s0 ../certs/rhel.pem
 %if 0%{?rhel}
@@ -2161,6 +2162,8 @@ for i in *.config; do
 %endif
   sed -i 's@CONFIG_EFI_SBAT_FILE=""@CONFIG_EFI_SBAT_FILE="kernel.sbat"@' $i
 done
+# ifnarch noarch
+%endif
 %endif
 
 %{log_msg "Set process_configs.sh $OPTS"}
