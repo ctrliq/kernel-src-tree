@@ -1,0 +1,171 @@
+nfs: add new nfs_direct_req tracepoint events
+
+jira KERNEL-814
+Rebuild_History Non-Buildable kernel-4.18.0-553.117.1.el8_10
+commit-author Jeff Layton <jlayton@kernel.org>
+commit 8efc4bbe84a8bdd26e848ed93a8900fad1b44ca2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.117.1.el8_10/8efc4bbe.failed
+
+Add some new tracepoints to the DIO write code.
+
+	Signed-off-by: Jeff Layton <jlayton@kernel.org>
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+(cherry picked from commit 8efc4bbe84a8bdd26e848ed93a8900fad1b44ca2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/direct.c
+diff --cc fs/nfs/direct.c
+index 082935102c89,ad40e81857ee..000000000000
+--- a/fs/nfs/direct.c
++++ b/fs/nfs/direct.c
+@@@ -58,6 -59,8 +58,11 @@@
+  #include "internal.h"
+  #include "iostat.h"
+  #include "pnfs.h"
+++<<<<<<< HEAD
+++=======
++ #include "fscache.h"
++ #include "nfstrace.h"
+++>>>>>>> 8efc4bbe84a8 (nfs: add new nfs_direct_req tracepoint events)
+  
+  #define NFSDBG_FACILITY		NFSDBG_VFS
+  
+@@@ -803,7 -776,9 +784,13 @@@ static ssize_t nfs_direct_write_schedul
+  	size_t requested_bytes = 0;
+  	size_t wsize = max_t(size_t, NFS_SERVER(inode)->wsize, PAGE_SIZE);
+  
+++<<<<<<< HEAD
+ +	nfs_pageio_init_write(&desc, inode, FLUSH_COND_STABLE, false,
+++=======
++ 	trace_nfs_direct_write_schedule_iovec(dreq);
++ 
++ 	nfs_pageio_init_write(&desc, inode, ioflags, false,
+++>>>>>>> 8efc4bbe84a8 (nfs: add new nfs_direct_req tracepoint events)
+  			      &nfs_direct_write_completion_ops);
+  	desc.pg_dreq = dreq;
+  	get_dreq(dreq);
+* Unmerged path fs/nfs/direct.c
+diff --git a/fs/nfs/internal.h b/fs/nfs/internal.h
+index 8e6175d7e5fa..503aeba3d2cf 100644
+--- a/fs/nfs/internal.h
++++ b/fs/nfs/internal.h
+@@ -865,3 +865,36 @@ static inline void nfs_set_port(struct sockaddr *sap, int *port,
+ 
+ 	rpc_set_port(sap, *port);
+ }
++
++struct nfs_direct_req {
++	struct kref		kref;		/* release manager */
++
++	/* I/O parameters */
++	struct nfs_open_context	*ctx;		/* file open context info */
++	struct nfs_lock_context *l_ctx;		/* Lock context info */
++	struct kiocb *		iocb;		/* controlling i/o request */
++	struct inode *		inode;		/* target file of i/o */
++
++	/* completion state */
++	atomic_t		io_count;	/* i/os we're waiting for */
++	spinlock_t		lock;		/* protect completion state */
++
++	loff_t			io_start;	/* Start offset for I/O */
++	ssize_t			count,		/* bytes actually processed */
++				max_count,	/* max expected count */
++				bytes_left,	/* bytes left to be sent */
++				error;		/* any reported error */
++	struct completion	completion;	/* wait for i/o completion */
++
++	/* commit state */
++	struct nfs_mds_commit_info mds_cinfo;	/* Storage for cinfo */
++	struct pnfs_ds_commit_info ds_cinfo;	/* Storage for cinfo */
++	struct work_struct	work;
++	int			flags;
++	/* for write */
++#define NFS_ODIRECT_DO_COMMIT		(1)	/* an unstable reply was received */
++#define NFS_ODIRECT_RESCHED_WRITES	(2)	/* write verification failed */
++	/* for read */
++#define NFS_ODIRECT_SHOULD_DIRTY	(3)	/* dirty user-space page after read */
++#define NFS_ODIRECT_DONE		INT_MAX	/* write verification failed */
++};
+diff --git a/fs/nfs/nfstrace.h b/fs/nfs/nfstrace.h
+index 6f90264c4b78..56dcb1bffc4e 100644
+--- a/fs/nfs/nfstrace.h
++++ b/fs/nfs/nfstrace.h
+@@ -1483,6 +1483,75 @@ TRACE_EVENT(nfs_commit_done,
+ 		)
+ );
+ 
++#define nfs_show_direct_req_flags(v) \
++	__print_flags(v, "|", \
++			{ NFS_ODIRECT_DO_COMMIT, "DO_COMMIT" }, \
++			{ NFS_ODIRECT_RESCHED_WRITES, "RESCHED_WRITES" }, \
++			{ NFS_ODIRECT_SHOULD_DIRTY, "SHOULD DIRTY" }, \
++			{ NFS_ODIRECT_DONE, "DONE" } )
++
++DECLARE_EVENT_CLASS(nfs_direct_req_class,
++		TP_PROTO(
++			const struct nfs_direct_req *dreq
++		),
++
++		TP_ARGS(dreq),
++
++		TP_STRUCT__entry(
++			__field(const struct nfs_direct_req *, dreq)
++			__field(dev_t, dev)
++			__field(u64, fileid)
++			__field(u32, fhandle)
++			__field(int, ref)
++			__field(loff_t, io_start)
++			__field(ssize_t, count)
++			__field(ssize_t, bytes_left)
++			__field(ssize_t, error)
++			__field(int, flags)
++		),
++
++		TP_fast_assign(
++			const struct inode *inode = dreq->inode;
++			const struct nfs_inode *nfsi = NFS_I(inode);
++			const struct nfs_fh *fh = &nfsi->fh;
++
++			__entry->dreq = dreq;
++			__entry->dev = inode->i_sb->s_dev;
++			__entry->fileid = nfsi->fileid;
++			__entry->fhandle = nfs_fhandle_hash(fh);
++			__entry->ref = kref_read(&dreq->kref);
++			__entry->io_start = dreq->io_start;
++			__entry->count = dreq->count;
++			__entry->bytes_left = dreq->bytes_left;
++			__entry->error = dreq->error;
++			__entry->flags = dreq->flags;
++		),
++
++		TP_printk(
++			"dreq=%p fileid=%02x:%02x:%llu fhandle=0x%08x ref=%d "
++			"io_start=%lld count=%zd bytes_left=%zd error=%zd flags=%s",
++			__entry->dreq, MAJOR(__entry->dev), MINOR(__entry->dev),
++			(unsigned long long)__entry->fileid,
++			__entry->fhandle, __entry->ref,
++			__entry->io_start, __entry->count, __entry->bytes_left,
++			__entry->error, nfs_show_direct_req_flags(__entry->flags)
++		)
++);
++
++#define DEFINE_NFS_DIRECT_REQ_EVENT(name) \
++	DEFINE_EVENT(nfs_direct_req_class, name, \
++			TP_PROTO( \
++				const struct nfs_direct_req *dreq \
++			), \
++			TP_ARGS(dreq))
++
++DEFINE_NFS_DIRECT_REQ_EVENT(nfs_direct_commit_complete);
++DEFINE_NFS_DIRECT_REQ_EVENT(nfs_direct_resched_write);
++DEFINE_NFS_DIRECT_REQ_EVENT(nfs_direct_write_complete);
++DEFINE_NFS_DIRECT_REQ_EVENT(nfs_direct_write_completion);
++DEFINE_NFS_DIRECT_REQ_EVENT(nfs_direct_write_schedule_iovec);
++DEFINE_NFS_DIRECT_REQ_EVENT(nfs_direct_write_reschedule_io);
++
+ TRACE_EVENT(nfs_fh_to_dentry,
+ 		TP_PROTO(
+ 			const struct super_block *sb,
