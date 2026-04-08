@@ -35,13 +35,45 @@ fi
 echo "Gathering new log entries since $lasttag"
 # master is expected to track mainline.
 
+commits_to_exclude=()
+issues_to_exclude=""
+
+if [[ -n "$CHANGELOG_EXCLUDE_REFS_PATTERN" ]]; then
+    mapfile -t exclude_cl_commits < <(git log HEAD ^"${UPSTREAM}" ^"${lasttag}" --format=%H \
+        --topo-order --merges --grep="$CHANGELOG_EXCLUDE_REFS_PATTERN")
+    for commit in "${exclude_cl_commits[@]}"; do
+        echo "Ignoring commits reachable from: $(git log -1 --oneline "$commit")"
+        commits_to_exclude+=("^$commit")
+    done
+fi
+
+if [[ -n "$RESOLVES_EXCLUDE_REFS_PATTERN" ]]; then
+    mapfile -t exclude_res_commits < <(git log HEAD ^"${UPSTREAM}" ^"${lasttag}" --format=%H \
+        --topo-order --merges --grep="$RESOLVES_EXCLUDE_REFS_PATTERN")
+    if [[ "${#exclude_res_commits[@]}" -gt 0 ]]; then
+        for commit in "${exclude_res_commits[@]}"; do
+            echo "Ignoring issues in commits reachable from: $(git log -1 --oneline "$commit")"
+        done
+        issues_to_exclude=$(git log --topo-order --no-merges -z "$GIT_FORMAT" \
+            "${exclude_res_commits[@]}" ^"${lasttag}" -- ':!/redhat/rhdocs' |
+            "${0%/*}"/genlog.py | sed -n 's/^Resolves: //p' | sed 's/,//g')
+    fi
+fi
+
 cname="$(git var GIT_COMMITTER_IDENT |sed 's/>.*/>/')"
 cdate="$(LC_ALL=C date +"%a %b %d %Y")"
 cversion="[$DISTBASEVERSION]";
 echo "* $cdate $cname $cversion" > "$clogf"
 
 git log --topo-order --no-merges -z "$GIT_FORMAT" \
-	^"${UPSTREAM}" "$lasttag".. -- ':!/redhat/rhdocs' | "${0%/*}"/genlog.py >> "$clogf"
+    ^"${UPSTREAM}" "${commits_to_exclude[@]}" "$lasttag".. -- ':!/redhat/rhdocs' | "${0%/*}"/genlog.py >> "$clogf"
+
+if [[ -n "$issues_to_exclude" ]]; then
+    for issue in $issues_to_exclude; do
+        echo "Dropping from Resolves line: $issue"
+        sed -i "/^Resolves:/ { s/, ${issue}\b//g; s/${issue}, //g; s/${issue}\b//g; }" "$clogf"
+    done
+fi
 
 if [ "$HIDE_REDHAT" = "1" ]; then
 	grep -v -e "^- \[redhat\]" "$clogf" |
