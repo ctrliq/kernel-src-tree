@@ -408,7 +408,7 @@ bool ivpu_hw_uses_ecc_mca_signal(struct ivpu_device *vdev)
 	if (ivpu_hw_ip_gen(vdev) < IVPU_HW_IP_50XX)
 		return false;
 
-	ret = rdmsrq_safe(MSR_INTEGRITY_CAPS, &msr_integrity_caps);
+	ret = rdmsrl_safe(MSR_INTEGRITY_CAPS, &msr_integrity_caps);
 	if (ret) {
 		ivpu_warn(vdev, "Error reading MSR_INTEGRITY_CAPS: %d", ret);
 		return false;
