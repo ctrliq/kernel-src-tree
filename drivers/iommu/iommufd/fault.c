@@ -402,6 +402,7 @@ int iommufd_fault_alloc(struct iommufd_ucmd *ucmd)
 	spin_lock_init(&fault->lock);
 	init_waitqueue_head(&fault->wait_queue);
 
+	/* The filep is fput() by the core code during failure */
 	filep = anon_inode_getfile("[iommufd-pgfault]", &iommufd_fault_fops,
 				   fault, O_RDWR);
 	if (IS_ERR(filep)) {
@@ -416,7 +417,7 @@ int iommufd_fault_alloc(struct iommufd_ucmd *ucmd)
 	fdno = get_unused_fd_flags(O_CLOEXEC);
 	if (fdno < 0) {
 		rc = fdno;
-		goto out_fput;
+		goto out_abort;
 	}
 
 	cmd->out_fault_id = fault->obj.id;
@@ -432,8 +433,6 @@ int iommufd_fault_alloc(struct iommufd_ucmd *ucmd)
 	return 0;
 out_put_fdno:
 	put_unused_fd(fdno);
-out_fput:
-	fput(filep);
 out_abort:
 	iommufd_object_abort_and_destroy(ucmd->ictx, &fault->obj);
 
