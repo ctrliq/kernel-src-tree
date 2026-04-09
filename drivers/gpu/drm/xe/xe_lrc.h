@@ -6,6 +6,7 @@
 #define _XE_LRC_H_
 
 #include <linux/types.h>
+#include <linux/sizes.h>
 
 #include "xe_lrc_types.h"
 
