@@ -76,7 +76,7 @@ void of_phandle_args_to_fwspec(struct device_node *np, const u32 *args,
  * struct irq_fwspec_info - firmware provided IRQ information structure
  *
  * @flags:		Information validity flags
- * @cpumask:		Affinity mask for this interrupt
+ * @affinity:		Affinity mask for this interrupt
  *
  * This structure reports firmware-specific information about an
  * interrupt. The only significant information is the affinity of a
