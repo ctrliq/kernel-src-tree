@@ -237,6 +237,7 @@ struct mt76_queue {
 	u8 magic_cnt;
 
 	struct mtk_wed_device *wed;
+	struct mt76_dev *dev;
 	u32 wed_regs;
 
 	dma_addr_t desc_dma;
