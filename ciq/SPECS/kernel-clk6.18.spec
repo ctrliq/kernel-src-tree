@@ -168,7 +168,7 @@ Summary: The Linux kernel
 %define debugbuildsenabled 1
 %define el_version 9
 %define kernel_major_minor 6.18
-%define kernel_patch 21
+%define kernel_patch 22
 %define buildid .1
 %define specversion %{kernel_major_minor}.%{kernel_patch}
 %define pkgrelease 1%{?buildid}
@@ -4489,13 +4489,14 @@ fi\
 #
 #
 %changelog
-* Tue Apr 07 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.21-2.1.el9
+* Sun Apr 12 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.18.22-1.1.el9
+-- Rebased changes for Linux 6.18.22 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.22-1)
+-- github actions: Trigger kernelCI on ciq-6.18.y-next branches (Brett Mastbergen)
+-- github actions: Use trigger for kernelCI (Brett Mastbergen)
+-- Update spec for ciq_kernel-6.18.21-2 (Brett Mastbergen)
 -- spec: Skip certificate setup for noarch builds (Brett Mastbergen)
 -- github actions: Inherit the Kernel CI Automated workflow from main (Brett Mastbergen)
--- kallsyms: clean up modname and modbuildid initialization in kallsyms_lookup_buildid() (Brett Mastbergen)
 -- [CIQ] v6.18.21 - updated spec (github-actions[bot])
-* Fri Apr 03 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.18.21-1.1.el9
--- Rebased changes for Linux 6.18.21 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.21-1)
 -- [CIQ] v6.18.20 - updated spec (github-actions[bot])
 -- Bundle bindgen-cli from source for Rocky 9.6 builds (Jonathan Dieter)
 -- Rework -default package and clean up tool subpackage naming (Jonathan Dieter)
@@ -4529,7 +4530,7 @@ fi\
 -- github actions: Make Builds on Merge Request Work (Jonathan Maple)
 -- Add initial CIQ config tweaks (Brett Mastbergen)
 -- Add CIQ configs (Brett Mastbergen)
--- Linux 6.18.21 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.18.21)
+-- Linux 6.18.22 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.18.22)
 
 
 ###
