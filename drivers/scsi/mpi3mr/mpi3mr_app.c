@@ -3257,6 +3257,29 @@ adp_state_show(struct device *dev, struct device_attribute *attr,
 
 static DEVICE_ATTR_RO(adp_state);
 
+/**
+ * fwfault_count_show() - SysFS callback to show firmware fault count
+ * @dev: class device
+ * @attr: Device attribute
+ * @buf: Buffer to copy data into
+ *
+ * Displays the total number of firmware faults detected by the driver
+ * since the controller was initialized.
+ *
+ * Return: Number of bytes written to @buf
+ */
+
+static ssize_t
+fwfault_count_show(struct device *dev, struct device_attribute *attr,
+	char *buf)
+{
+	struct Scsi_Host *shost = class_to_shost(dev);
+	struct mpi3mr_ioc *mrioc = shost_priv(shost);
+
+	return snprintf(buf, PAGE_SIZE, "%llu\n", mrioc->fwfault_counter);
+}
+static DEVICE_ATTR_RO(fwfault_count);
+
 struct device_attribute *mpi3mr_host_attrs[] = {
 	&dev_attr_adp_state,
 	&dev_attr_version_fw,
@@ -3265,6 +3288,7 @@ struct device_attribute *mpi3mr_host_attrs[] = {
 	&dev_attr_reply_queue_count,
 	&dev_attr_reply_qfull_count,
 	&dev_attr_logging_level,
+	&dev_attr_fwfault_count,
 	NULL,
 };
 
