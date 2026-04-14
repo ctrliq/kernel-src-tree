@@ -95,11 +95,7 @@
 %endif
 
 Summary: The Linux kernel
-%if 0%{?fedora}
-%define secure_boot_arch x86_64
-%else
 %define secure_boot_arch x86_64 aarch64 s390x ppc64le
-%endif
 
 # Signing for secure boot authentication
 %ifarch %{secure_boot_arch}
@@ -129,11 +125,7 @@ Summary: The Linux kernel
 %global compression_flags --compress --check=crc32 --lzma2=dict=1MiB
 %global compext xz
 
-%if 0%{?fedora}
-%define primary_target fedora
-%else
 %define primary_target rocky
-%endif
 
 #
 # genspec.sh variables
@@ -143,8 +135,6 @@ Summary: The Linux kernel
 %global pkg_suffix clk%{kernel_major_minor}
 # kernel package name
 %global package_name kernel-%{pkg_suffix}
-# Include Fedora files
-%global include_fedora 0
 # Include RT files
 %global include_rt 0
 %global include_rocky 1
@@ -203,18 +193,10 @@ Summary: The Linux kernel
 %define with_arm64_16k %{?_with_arm64_16k:    1} %{?!_with_arm64_16k:    0}
 # kernel-64k (aarch64 kernel with 64K page_size)
 %define with_arm64_64k %{?_without_arm64_64k: 0} %{?!_without_arm64_64k: 1}
-# we default reatime builds to off for fedora and on for rhel/centos/eln
-%if 0%{?fedora}
-# kernel-rt (x86_64 and aarch64 only PREEMPT_RT enabled kernel)
-%define with_realtime  %{?_with_realtime:  1} %{?!_with_realtime:  0}
-# kernel-rt-64k (aarch64 RT kernel with 64K page_size)
-%define with_realtime_arm64_64k %{?_with_realtime_arm64_64k: 1} %{?!_with_realtime_arm64_64k: 0}
-%else
 # kernel-rt (x86_64 and aarch64 only PREEMPT_RT enabled kernel)
 %define with_realtime  %{?_without_realtime:  0} %{?!_without_realtime:  1}
 # kernel-rt-64k (aarch64 RT kernel with 64K page_size)
 %define with_realtime_arm64_64k %{?_without_realtime_arm64_64k: 0} %{?!_without_realtime_arm64_64k: 1}
-%endif
 
 # Supported variants
 #            with_base with_debug    with_gcov
@@ -288,14 +270,6 @@ Summary: The Linux kernel
 %define with_realtime_arm64_64k 0
 %define with_ynl 0
 
-%if 0%{?fedora}
-# Kernel headers are being split out into a separate package
-%define with_headers 0
-%define with_cross_headers 0
-# no ipa_clone for now
-%define with_ipaclones 0
-%define with_arm64_64k 0
-%endif
 
 %if %{with_verbose}
 %define make_opts V=1
@@ -432,12 +406,6 @@ Summary: The Linux kernel
 %define doc_build_fail true
 %endif
 
-%if 0%{?fedora}
-# don't do debug builds on anything but aarch64 and x86_64
-%ifnarch aarch64 x86_64
-%define with_debug 0
-%endif
-%endif
 
 %define all_configs %{name}-%{specversion}-*.config
 
@@ -471,10 +439,6 @@ Summary: The Linux kernel
 %define with_realtime_arm64_64k 0
 %endif
 
-%if 0%{?fedora}
-# This is not for Fedora
-%define with_zfcpdump 0
-%endif
 
 # Per-arch tweaks
 
@@ -532,11 +496,7 @@ Summary: The Linux kernel
 # Which is a BadThing(tm).
 
 # We only build kernel-headers on the following...
-%if 0%{?fedora}
-%define nobuildarches i386
-%else
 %define nobuildarches i386 i686
-%endif
 
 %ifarch %nobuildarches
 # disable BuildKernel commands
@@ -557,11 +517,7 @@ Summary: The Linux kernel
 %endif
 
 # Architectures we build tools/cpupower on
-%if 0%{?fedora}
-%define cpupowerarchs %{ix86} x86_64 ppc64le aarch64 riscv64
-%else
 %define cpupowerarchs i686 x86_64 ppc64le aarch64 riscv64
-%endif
 
 %if 0%{?use_vdso}
 %define _use_vdso 1
@@ -622,11 +578,7 @@ Version: %{specversion}
 Release: %{pkg_release}
 # DO NOT CHANGE THE 'ExclusiveArch' LINE TO TEMPORARILY EXCLUDE AN ARCHITECTURE BUILD.
 # SET %%nobuildarches (ABOVE) INSTEAD
-%if 0%{?fedora}
-ExclusiveArch: noarch x86_64 s390x aarch64 ppc64le riscv64
-%else
 ExclusiveArch: noarch i386 i686 x86_64 s390x aarch64 ppc64le riscv64
-%endif
 ExclusiveOS: Linux
 %ifnarch %{nobuildarches}
 Requires: %{name}-core-uname-r = %{KVERREL}
@@ -708,12 +660,7 @@ BuildRequires: libnl3-devel
 %endif
 
 %if %{with_tools} && %{with_ynl}
-%if 0%{?fedora}
-BuildRequires: python3-pyyaml python3-jsonschema python3-pip python3-setuptools >= 61
-BuildRequires: (python3-wheel if python3-setuptools < 70)
-%else
 BuildRequires: python3-pyyaml python3-jsonschema python3-pip python3-setuptools
-%endif
 %endif
 
 BuildRequires: openssl-devel
@@ -722,9 +669,6 @@ BuildRequires: openssl-devel
 BuildRequires: clang llvm-devel fuse-devel zlib-devel binutils-devel python3-docutils python3-jsonschema
 %ifarch x86_64 riscv64
 BuildRequires: lld
-%endif
-%if 0%{?fedora}
-BuildRequires: libasan-static
 %endif
 BuildRequires: libcap-devel libcap-ng-devel rsync libmnl-devel libxml2-devel
 BuildRequires: liburing-devel
@@ -772,15 +716,6 @@ BuildRequires: binutils-%{_build_arch}-linux-gnu, gcc-%{_build_arch}-linux-gnu
 %define cross_opts CROSS_COMPILE=%{_build_arch}-linux-gnu-
 %define __strip %{_build_arch}-linux-gnu-strip
 
-%if 0%{?fedora} && 0%{?fedora} <= 41
-# Work around find-debuginfo for cross builds.
-# find-debuginfo doesn't support any of CROSS options (RHEL-21797),
-# and since debugedit > 5.0-16.el10, or since commit
-#   dfe1f7ff30f4 ("find-debuginfo.sh: Exit with real exit status in parallel jobs")
-# it now aborts on failure and build fails.
-# debugedit-5.1-5 in F42 added support to override tools with target versions.
-%undefine _include_gdb_index
-%endif
 
 %if 0%{?rhel}%{?centos}
 %ifarch riscv64
@@ -868,11 +803,6 @@ Source8010: x509.genkey.rocky
 
 # pesign macro expects to see these cert file names, see:
 # https://github.com/rhboot/pesign/blob/main/src/pesign-rpmbuild-helper.in#L216
-%if 0%{?fedora}%{?eln}
-%define pesign_name_0 redhatsecureboot501
-%define secureboot_ca_0 %{SOURCE10}
-%define secureboot_key_0 %{SOURCE13}
-%endif
 
 # RHEL/centos certs come from system-sb-certs
 %if 0%{?rhel} && !0%{?eln}
@@ -932,24 +862,6 @@ Source22: filtermods.py
 
 
 
-%if 0%{?include_fedora}
-Source50: x509.genkey.fedora
-
-Source52: %{name}-aarch64-fedora.config
-Source53: %{name}-aarch64-debug-fedora.config
-Source54: %{name}-aarch64-16k-fedora.config
-Source55: %{name}-aarch64-16k-debug-fedora.config
-Source56: %{name}-ppc64le-fedora.config
-Source57: %{name}-ppc64le-debug-fedora.config
-Source58: %{name}-s390x-fedora.config
-Source59: %{name}-s390x-debug-fedora.config
-Source60: %{name}-x86_64-fedora.config
-Source61: %{name}-x86_64-debug-fedora.config
-Source700: %{name}-riscv64-fedora.config
-Source701: %{name}-riscv64-debug-fedora.config
-
-Source62: def_variants.yaml.fedora
-%endif
 
 %if 0%{?include_rocky}
 Source1006: partial-snip.config
@@ -975,11 +887,6 @@ Source102: nvidiagpuoot001.x509
 Source103: rhelimaca1.x509
 Source104: rhelima.x509
 Source105: rhelima_centos.x509
-Source106: fedoraimaca.x509
-
-%if 0%{?fedora}%{?eln}
-%define ima_ca_cert %{SOURCE106}
-%endif
 
 %if 0%{?rhel} && !0%{?eln}
 %define ima_ca_cert %{SOURCE103}
@@ -995,16 +902,6 @@ Source106: fedoraimaca.x509
 %define ima_cert_name ima.cer
 
 %if 0%{include_rt}
-%if 0%{include_fedora}
-Source480: %{name}-aarch64-rt-fedora.config
-Source481: %{name}-aarch64-rt-debug-fedora.config
-Source482: %{name}-aarch64-rt-64k-fedora.config
-Source483: %{name}-aarch64-rt-64k-debug-fedora.config
-Source484: %{name}-x86_64-rt-fedora.config
-Source485: %{name}-x86_64-rt-debug-fedora.config
-Source486: %{name}-riscv64-rt-fedora.config
-Source487: %{name}-riscv64-rt-debug-fedora.config
-%endif
 %endif
 
 
@@ -1549,9 +1446,7 @@ Requires: %{name}-%{?1:%{1}-}-modules-core-uname-r = %{KVERREL}%{uname_variant %
 %{expand:%%kernel_modules_extra_package %{?1:%{1}} %{!?{-n}:%{1}}%{?{-n}:%{-n*}} %{-m:%{-m}}}\
 %if %{-m:0}%{!-m:1}\
 %{expand:%%kernel_modules_internal_package %{?1:%{1}} %{!?{-n}:%{1}}%{?{-n}:%{-n*}}}\
-%if 0%{!?fedora:1}\
 %{expand:%%kernel_modules_partner_package %{?1:%{1}} %{!?{-n}:%{1}}%{?{-n}:%{-n*}}}\
-%endif\
 %{expand:%%kernel_debuginfo_package %{?1:%{1}}}\
 %endif\
 %if %{with_efiuki} && ("%{1}" != "rt" && "%{1}" != "rt-debug" && "%{1}" != "rt-64k" && "%{1}" != "rt-64k-debug")\
@@ -2635,9 +2530,6 @@ BuildKernel() {
 
 %if %{signkernel}
 	%{log_msg "Sign the EFI UKI kernel"}
-%if 0%{?fedora}%{?eln}
-        %pesign -s -i $KernelUnifiedImage -o $KernelUnifiedImage.signed -a %{secureboot_ca_0} -c %{secureboot_key_0} -n %{pesign_name_0}
-%else
 %if 0%{?centos}
         UKI_secureboot_name=centossecureboot204
 %else
@@ -2658,8 +2550,6 @@ BuildKernel() {
 # 0%{?pe_uki_signing_certkeyslot:1}
 %endif
 
-# 0%{?fedora}%{?eln}
-%endif
         if [ ! -s $KernelUnifiedImage.signed ]; then
             echo "pesigning failed"
             exit 1
@@ -2785,9 +2675,7 @@ BuildKernel() {
         create_module_file_list "kernel" ../modules.list ../kernel${Variant:+-${Variant}}-modules.list 0 0
         create_module_file_list "internal" ../modules-internal.list ../kernel${Variant:+-${Variant}}-modules-internal.list 0 1
         create_module_file_list "kernel" ../modules-extra.list ../kernel${Variant:+-${Variant}}-modules-extra.list 0 1
-%if 0%{!?fedora:1}
         create_module_file_list "partner" ../modules-partner.list ../kernel${Variant:+-${Variant}}-modules-partner.list 1 1
-%endif
     fi # $DoModules -eq 1
 
     remove_depmod_files()
@@ -3806,12 +3694,10 @@ fi\
 #
 %define kernel_variant_posttrans(v:u:) \
 %{expand:%%posttrans %{?-v:%{-v*}-}%{!?-u*:core}%{?-u*:uki-%{-u*}}}\
-%if 0%{!?fedora:1}\
 if [ -x %{_sbindir}/weak-modules ]\
 then\
     %{_sbindir}/weak-modules --add-kernel %{KVERREL}%{?-v:+%{-v*}} || exit $?\
 fi\
-%endif\
 rm -f %{_localstatedir}/lib/rpm-state/%{name}/installing_core_%{KVERREL}%{?-v:+%{-v*}}\
 # Tell 20-grub.install that this is a non-standard kernel so it only becomes\
 # the boot default when DEFAULTKERNEL in /etc/sysconfig/kernel is set to\
@@ -3839,9 +3725,7 @@ fi\
 %{expand:%%kernel_modules_core_post %{?-v*}}\
 %{expand:%%kernel_modules_extra_post %{?-v*}}\
 %{expand:%%kernel_modules_internal_post %{?-v*}}\
-%if 0%{!?fedora:1}\
 %{expand:%%kernel_modules_partner_post %{?-v*}}\
-%endif\
 %{expand:%%kernel_variant_posttrans %{?-v*:-v %{-v*}}}\
 %{expand:%%post %{?-v*:%{-v*}-}core}\
 %{-r:\
@@ -4230,9 +4114,7 @@ fi\
 %{expand:%%files %{?3:%{3}-}devel-matched}\
 %{expand:%%files -f kernel-%{?3:%{3}-}modules-extra.list %{?3:%{3}-}modules-extra}\
 %{expand:%%files -f kernel-%{?3:%{3}-}modules-internal.list %{?3:%{3}-}modules-internal}\
-%if 0%{!?fedora:1}\
 %{expand:%%files -f kernel-%{?3:%{3}-}modules-partner.list %{?3:%{3}-}modules-partner}\
-%endif\
 %if %{with_debuginfo}\
 %ifnarch noarch\
 %{expand:%%files -f debuginfo%{?3}.list %{?3:%{3}-}debuginfo}\
