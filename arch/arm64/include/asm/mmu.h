@@ -35,10 +35,10 @@ typedef struct {
 #ifdef CONFIG_COMPAT
 	void		*sigpage;
 #endif
-	refcount_t	pinned;
 	void		*vdso;
 	unsigned long	flags;
 	atomic_t	nr_active_mm;
+	RH_KABI_FILL_HOLE(refcount_t	pinned)
 } mm_context_t;
 
 /*
