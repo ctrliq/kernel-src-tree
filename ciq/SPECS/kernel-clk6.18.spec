@@ -153,7 +153,6 @@ Summary: The Linux kernel
 %global include_automotive 0
 %global include_rocky 1
 # Provide Patchlist.changelog file
-%global patchlist_changelog 0
 # Set debugbuildsenabled to 1 to build separate base and debug kernels
 #  (on supported architectures). The kernel-debug-* subpackages will
 #  contain the debug kernel.
@@ -1123,10 +1122,6 @@ Source2002: kvm_stat.logrotate
 # source tree, but in the mean time we carry this to support the legacy workflow
 Source3000: merge.py
 Source3001: kernel-local
-%if %{patchlist_changelog}
-Source3002: Patchlist.changelog
-%endif
-
 Source4000: README.rst
 
 # Bundled bindgen-cli source (not packaged in Rocky 9.6)
