@@ -149,8 +149,6 @@ Summary: The Linux kernel
 %global include_rhel 0
 # Include RT files
 %global include_rt 0
-# Include Automotive files
-%global include_automotive 0
 %global include_rocky 1
 # Provide Patchlist.changelog file
 # Set debugbuildsenabled to 1 to build separate base and debug kernels
@@ -219,8 +217,6 @@ Summary: The Linux kernel
 # kernel-rt-64k (aarch64 RT kernel with 64K page_size)
 %define with_realtime_arm64_64k %{?_without_realtime_arm64_64k: 0} %{?!_without_realtime_arm64_64k: 1}
 %endif
-# kernel-automotive (x86_64 and aarch64 with PREEMPT_RT enabled - currently off by default)
-%define with_automotive %{?_with_automotive:  1} %{?!_with_automotive:   0}
 
 # Supported variants
 #            with_base with_debug    with_gcov
@@ -229,7 +225,6 @@ Summary: The Linux kernel
 # arm64_16k  X         X             X
 # arm64_64k  X         X             X
 # realtime   X         X             X
-# automotive X         X             X
 
 # kernel-doc
 %define with_doc       %{?_without_doc:       0} %{?!_without_doc:       1}
@@ -257,10 +252,6 @@ Summary: The Linux kernel
 %define with_dbgonly   %{?_with_dbgonly:      1} %{?!_with_dbgonly:      0}
 # Only build the realtime kernel (--with rtonly):
 %define with_rtonly    %{?_with_rtonly:       1} %{?!_with_rtonly:       0}
-# Only build the automotive variant of the kernel (--with automotiveonly):
-%define with_automotiveonly %{?_with_automotiveonly:       1} %{?!_with_automotiveonly:       0}
-# Build the automotive kernel (--with automotive_build), this builds base variant with automotive config/options:
-%define with_automotive_build %{?_with_automotive_build:   1} %{?!_with_automotive_build:     0}
 # Only build the tools package
 %define with_toolsonly %{?_with_toolsonly:    1} %{?!_with_toolsonly:    0}
 #
@@ -306,7 +297,6 @@ Summary: The Linux kernel
 # no ipa_clone for now
 %define with_ipaclones 0
 %define with_arm64_64k 0
-%define with_automotive 0
 %endif
 
 %if %{with_verbose}
@@ -383,7 +373,6 @@ Summary: The Linux kernel
 %if %{with_rtonly}
 %define with_realtime 1
 %define with_realtime_arm64_64k 1
-%define with_automotive 0
 %define with_up 0
 %define with_debug 0
 %define with_debuginfo 0
@@ -399,22 +388,6 @@ Summary: The Linux kernel
 %define with_arm64_64k 0
 %endif
 
-# if requested, only build the automotive variant of the kernel
-%if %{with_automotiveonly}
-%define with_automotive 1
-%define with_realtime 0
-%define with_up 0
-%define with_debug 0
-%define with_debuginfo 0
-%define with_vdso_install 0
-%define with_selftests 1
-%endif
-
-# if requested, build kernel-automotive
-%if %{with_automotive_build}
-%define with_automotive 1
-%define with_selftests 1
-%endif
 
 # if requested, only build tools
 %if %{with_toolsonly}
@@ -426,7 +399,6 @@ Summary: The Linux kernel
 %define with_realtime_arm64_64k 0
 %define with_arm64_16k 0
 %define with_arm64_64k 0
-%define with_automotive 0
 %define with_cross_headers 0
 %define with_doc 0
 %define with_selftests 0
@@ -439,34 +411,9 @@ Summary: The Linux kernel
 %define with_configchecks 0
 %endif
 
-# RT and Automotive kernels are only built on x86_64 and aarch64
+# RT kernel is only built on x86_64 and aarch64
 %ifnarch x86_64 aarch64
 %define with_realtime 0
-%define with_automotive 0
-%endif
-
-%if %{with_automotive}
-# overrides compression algorithms for automotive
-%global compression zstd
-%global compression_flags --rm
-%global compext zst
-
-# automotive does not support the following variants
-%define with_realtime 0
-%define with_realtime_arm64_64k 0
-%define with_arm64_16k 0
-%define with_arm64_64k 0
-%define with_efiuki 0
-%define with_doc 0
-%define with_headers 0
-%define with_cross_headers 0
-%define with_perf 0
-%define with_libperf 0
-%define with_tools 0
-%define with_ipaclones 0
-%define signkernel 0
-%define signmodules 1
-%define rhelkeys 0
 %endif
 
 
@@ -500,7 +447,6 @@ Summary: The Linux kernel
 %ifarch noarch
 %define with_up 0
 %define with_realtime 0
-%define with_automotive 0
 %define with_headers 0
 %define with_cross_headers 0
 %define with_tools 0
@@ -603,7 +549,6 @@ Summary: The Linux kernel
 %define with_arm64_64k 0
 %define with_realtime 0
 %define with_realtime_arm64_64k 0
-%define with_automotive 0
 
 %define with_debuginfo 0
 %define with_perf 0
@@ -647,11 +592,6 @@ Summary: The Linux kernel
 %define with_realtime_base 1
 %else
 %define with_realtime_base 0
-%endif
-%if %{with_automotive} && %{with_base} && !%{with_automotive_build}
-%define with_automotive_base 1
-%else
-%define with_automotive_base 0
 %endif
 %if %{with_arm64_16k} && %{with_base}
 %define with_arm64_16k_base 1
@@ -1010,7 +950,7 @@ Source44: %{name}-riscv64-rhel.config
 Source45: %{name}-riscv64-debug-rhel.config
 %endif
 
-%if %{include_rhel} || %{include_automotive}
+%if %{include_rhel}
 Source23: x509.genkey.rhel
 Source34: def_variants.yaml.rhel
 Source41: x509.genkey.centos
@@ -1096,20 +1036,6 @@ Source484: %{name}-x86_64-rt-fedora.config
 Source485: %{name}-x86_64-rt-debug-fedora.config
 Source486: %{name}-riscv64-rt-fedora.config
 Source487: %{name}-riscv64-rt-debug-fedora.config
-%endif
-%endif
-
-%if %{include_automotive}
-%if %{with_automotive_build}
-Source488: %{name}-aarch64-rhel.config
-Source489: %{name}-aarch64-debug-rhel.config
-Source490: %{name}-x86_64-rhel.config
-Source491: %{name}-x86_64-debug-rhel.config
-%else
-Source488: %{name}-aarch64-automotive-rhel.config
-Source489: %{name}-aarch64-automotive-debug-rhel.config
-Source490: %{name}-x86_64-automotive-rhel.config
-Source491: %{name}-x86_64-automotive-debug-rhel.config
 %endif
 %endif
 
@@ -1803,27 +1729,6 @@ It should only be installed when trying to gather additional information
 on kernel bugs, as some of these options impact performance noticably.
 %endif
 
-%if %{with_debug} && %{with_automotive} && !%{with_automotive_build}
-%define variant_summary The Linux Automotive kernel compiled with extra debugging enabled
-%kernel_variant_package automotive-debug
-%description automotive-debug-core
-The kernel package contains the Linux kernel (vmlinuz), the core of any
-Linux operating system.  The kernel handles the basic functions
-of the operating system:  memory allocation, process allocation, device
-input and output, etc.
-
-This variant of the kernel has numerous debugging options enabled.
-It should only be installed when trying to gather additional information
-on kernel bugs, as some of these options impact performance noticably.
-%endif
-
-%if %{with_automotive_base}
-%define variant_summary The Linux kernel compiled with PREEMPT_RT enabled
-%kernel_variant_package automotive
-%description automotive-core
-This package includes a version of the Linux kernel compiled with the
-PREEMPT_RT real-time preemption support, targeted for Automotive platforms
-%endif
 
 %if %{with_up} && %{with_debug}
 %if !%{debugbuildsenabled}
@@ -1925,12 +1830,6 @@ exit 1
 %endif
 %endif
 
-%if %{with_automotive}
-%if 0%{?fedora}
-%{log_msg "Cannot build automotive with a fedora baseline, must be rhel/centos/eln"}
-exit 1
-%endif
-%endif
 
 # more sanity checking; do it quietly
 if [ "%{patches}" != "%%{patches}" ] ; then
@@ -2736,7 +2635,7 @@ BuildKernel() {
     # Copy the System.map file for depmod to use
     cp System.map $RPM_BUILD_ROOT/.
 
-    if [[ "$Variant" == "rt" || "$Variant" == "rt-debug" || "$Variant" == "rt-64k" || "$Variant" == "rt-64k-debug" || "$Variant" == "automotive" || "$Variant" == "automotive-debug" ]]; then
+    if [[ "$Variant" == "rt" || "$Variant" == "rt-debug" || "$Variant" == "rt-64k" || "$Variant" == "rt-64k-debug" ]]; then
 	%{log_msg "Skipping efiuki build"}
     else
 %if %{with_efiuki}
@@ -2822,7 +2721,7 @@ BuildKernel() {
 # with_efiuki
 %endif
 	:  # in case of empty block
-    fi # "$Variant" == "rt" || "$Variant" == "rt-debug" || "$Variant" == "automotive" || "$Variant" == "automotive-debug"
+    fi # "$Variant" == "rt" || "$Variant" == "rt-debug" || "$Variant" == "rt-64k" || "$Variant" == "rt-64k-debug"
 
 
     #
@@ -2898,9 +2797,6 @@ BuildKernel() {
         fi
         if [[ "$Variant" == "rt-64k" || "$Variant" == "rt-64k-debug" ]]; then
             variants_param="-r rt-64k"
-        fi
-        if [[ "$Variant" == "automotive" || "$Variant" == "automotive-debug" ]]; then
-            variants_param="-r automotive"
         fi
         # this creates ../modules-*.list output, where each kmod path is as it
         # appears in modules.dep (relative to lib/modules/$KernelVer)
@@ -3034,9 +2930,6 @@ BuildKernel %make_target %kernel_image %{_use_vdso} rt-debug
 BuildKernel %make_target %kernel_image %{_use_vdso} rt-64k-debug
 %endif
 
-%if %{with_automotive} && !%{with_automotive_build}
-BuildKernel %make_target %kernel_image %{_use_vdso} automotive-debug
-%endif
 
 %if %{with_arm64_16k}
 BuildKernel %make_target %kernel_image %{_use_vdso} 16k-debug
@@ -3071,16 +2964,13 @@ BuildKernel %make_target %kernel_image %{_use_vdso} rt
 BuildKernel %make_target %kernel_image %{_use_vdso} rt-64k
 %endif
 
-%if %{with_automotive_base}
-BuildKernel %make_target %kernel_image %{_use_vdso} automotive
-%endif
 
 %if %{with_up_base}
 BuildKernel %make_target %kernel_image %{_use_vdso}
 %endif
 
 %ifnarch noarch i686 %{nobuildarches}
-%if !%{with_debug} && !%{with_zfcpdump} && !%{with_up} && !%{with_arm64_16k} && !%{with_arm64_64k} && !%{with_realtime} && !%{with_realtime_arm64_64k} && !%{with_automotive}
+%if !%{with_debug} && !%{with_zfcpdump} && !%{with_up} && !%{with_arm64_16k} && !%{with_arm64_64k} && !%{with_realtime} && !%{with_realtime_arm64_64k}
 # If only building the user space tools, then initialize the build environment
 # and some variables so that the various userspace tools can be built.
 %{log_msg "Initialize userspace tools build environment"}
@@ -3949,12 +3839,10 @@ fi\
 %define kernel_variant_posttrans(v:u:) \
 %{expand:%%posttrans %{?-v:%{-v*}-}%{!?-u*:core}%{?-u*:uki-%{-u*}}}\
 %if 0%{!?fedora:1}\
-%if !%{with_automotive}\
 if [ -x %{_sbindir}/weak-modules ]\
 then\
     %{_sbindir}/weak-modules --add-kernel %{KVERREL}%{?-v:+%{-v*}} || exit $?\
 fi\
-%endif\
 %endif\
 rm -f %{_localstatedir}/lib/rpm-state/%{name}/installing_core_%{KVERREL}%{?-v:+%{-v*}}\
 # Tell 20-grub.install that this is a non-standard kernel so it only becomes\
@@ -4011,12 +3899,10 @@ entry_type=""\
     entry_type="--entry-type %{!?-u:type1}%{?-u:type2}" \
 }\
 /bin/kernel-install remove %{KVERREL}%{?-v:+%{-v*}} $entry_type || exit $?\
-%if !%{with_automotive}\
 if [ -x %{_sbindir}/weak-modules ]\
 then\
     %{_sbindir}/weak-modules --remove-kernel %{KVERREL}%{?-v:+%{-v*}} || exit $?\
 fi\
-%endif\
 %{nil}
 
 %if %{with_up_base} && %{with_efiuki}
@@ -4089,10 +3975,6 @@ fi\
 %kernel_variant_post -v rt -r kernel
 %endif
 
-%if %{with_automotive_base}
-%kernel_variant_preun -v automotive
-%kernel_variant_post -v automotive -r kernel
-%endif
 
 %if %{with_realtime} && %{with_debug}
 %kernel_variant_preun -v rt-debug
@@ -4111,10 +3993,6 @@ fi\
 %kernel_kvm_post rt-64k-debug
 %endif
 
-%if %{with_automotive} && %{with_debug} && !%{with_automotive_build}
-%kernel_variant_preun -v automotive-debug
-%kernel_variant_post -v automotive-debug
-%endif
 
 ###
 ### file lists
@@ -4431,10 +4309,6 @@ fi\
 %kernel_variant_files %{_use_vdso} %{with_realtime_base} rt
 %if %{with_realtime}
 %kernel_variant_files %{_use_vdso} %{with_debug} rt-debug
-%endif
-%kernel_variant_files %{_use_vdso} %{with_automotive_base} automotive
-%if %{with_automotive} && !%{with_automotive_build}
-%kernel_variant_files %{_use_vdso} %{with_debug} automotive-debug
 %endif
 
 %if %{with_debug_meta}
