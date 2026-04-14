@@ -145,8 +145,6 @@ Summary: The Linux kernel
 %global package_name kernel-%{pkg_suffix}
 # Include Fedora files
 %global include_fedora 0
-# Include RHEL files
-%global include_rhel 0
 # Include RT files
 %global include_rt 0
 %global include_rocky 1
@@ -932,29 +930,7 @@ Source22: filtermods.py
 
 %define modsign_cmd %{SOURCE21}
 
-%if 0%{?include_rhel}
-Source24: %{name}-aarch64-rhel.config
-Source25: %{name}-aarch64-debug-rhel.config
-Source27: %{name}-ppc64le-rhel.config
-Source28: %{name}-ppc64le-debug-rhel.config
-Source29: %{name}-s390x-rhel.config
-Source30: %{name}-s390x-debug-rhel.config
-Source31: %{name}-s390x-zfcpdump-rhel.config
-Source32: %{name}-x86_64-rhel.config
-Source33: %{name}-x86_64-debug-rhel.config
-# ARM64 64K page-size kernel config
-Source42: %{name}-aarch64-64k-rhel.config
-Source43: %{name}-aarch64-64k-debug-rhel.config
 
-Source44: %{name}-riscv64-rhel.config
-Source45: %{name}-riscv64-debug-rhel.config
-%endif
-
-%if %{include_rhel}
-Source23: x509.genkey.rhel
-Source34: def_variants.yaml.rhel
-Source41: x509.genkey.centos
-%endif
 
 %if 0%{?include_fedora}
 Source50: x509.genkey.fedora
@@ -1019,14 +995,6 @@ Source106: fedoraimaca.x509
 %define ima_cert_name ima.cer
 
 %if 0%{include_rt}
-%if 0%{include_rhel}
-Source474: %{name}-aarch64-rt-rhel.config
-Source475: %{name}-aarch64-rt-debug-rhel.config
-Source476: %{name}-aarch64-rt-64k-rhel.config
-Source477: %{name}-aarch64-rt-64k-debug-rhel.config
-Source478: %{name}-x86_64-rt-rhel.config
-Source479: %{name}-x86_64-rt-debug-rhel.config
-%endif
 %if 0%{include_fedora}
 Source480: %{name}-aarch64-rt-fedora.config
 Source481: %{name}-aarch64-rt-debug-fedora.config
