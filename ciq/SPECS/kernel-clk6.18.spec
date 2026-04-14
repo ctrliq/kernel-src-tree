@@ -698,7 +698,7 @@ BuildConflicts: dwarves < 1.13
 BuildRequires: openssl
 %if %{signkernel}
 # ELN uses Fedora signing process, so exclude
-%if 0%{?rhel}%{?centos} && !0%{?eln}
+%if 0%{?rhel} && !0%{?eln}
 BuildRequires: system-sb-certs
 %endif
 %ifarch x86_64 aarch64 riscv64
@@ -714,7 +714,7 @@ BuildRequires: binutils-%{_build_arch}-linux-gnu, gcc-%{_build_arch}-linux-gnu
 %define __strip %{_build_arch}-linux-gnu-strip
 
 
-%if 0%{?rhel}%{?centos}
+%if 0%{?rhel}
 %ifarch riscv64
 # Temporary workaround to avoid using find-debuginfo and gdb.minimal.
 # The current c10s version of gdb-minimal (14.2-4.el10) crashes when given some
@@ -758,12 +758,8 @@ BuildRequires: systemd-ukify
 # For TPM operations in UKI initramfs
 BuildRequires: tpm2-tools
 # For UKI sb cert
-%if 0%{?rhel}%{?centos} && !0%{?eln}
-%if 0%{?centos}
-BuildRequires: centos-sb-certs >= 9.0-23
-%else
+%if 0%{?rhel} && !0%{?eln}
 BuildRequires: redhat-sb-certs >= 9.4-0.1
-%endif
 %endif
 %endif
 
@@ -801,14 +797,11 @@ Source8010: x509.genkey.rocky
 # pesign macro expects to see these cert file names, see:
 # https://github.com/rhboot/pesign/blob/main/src/pesign-rpmbuild-helper.in#L216
 
-# RHEL/centos certs come from system-sb-certs
+# RHEL certs come from system-sb-certs
 %if 0%{?rhel} && !0%{?eln}
 %define secureboot_ca_0 %{_datadir}/pki/sb-certs/secureboot-ca-%{_arch}.cer
 %define secureboot_key_0 %{_datadir}/pki/sb-certs/secureboot-kernel-%{_arch}.cer
 
-%if 0%{?centos}
-%define pesign_name_0 centossecureboot201
-%else
 %ifarch x86_64 aarch64
 %define pesign_name_0 redhatsecureboot501
 %endif
@@ -817,7 +810,6 @@ Source8010: x509.genkey.rocky
 %endif
 %ifarch ppc64le
 %define pesign_name_0 redhatsecureboot701
-%endif
 %endif
 
 # CIQ Kernel
@@ -883,18 +875,13 @@ Source101: rhelkpatch1.x509
 Source102: nvidiagpuoot001.x509
 Source103: rhelimaca1.x509
 Source104: rhelima.x509
-Source105: rhelima_centos.x509
 
 %if 0%{?rhel} && !0%{?eln}
 %define ima_ca_cert %{SOURCE103}
 # rhel && !eln
 %endif
 
-%if 0%{?centos}
-%define ima_signing_cert %{SOURCE105}
-%else
 %define ima_signing_cert %{SOURCE104}
-%endif
 
 %define ima_cert_name ima.cer
 
@@ -1929,8 +1916,7 @@ done
 %{log_msg "Generate CIQ configs"}
 RHJOBS=$RPM_BUILD_NCPUS SPECPACKAGE_NAME=%{name} ./process_configs.sh $OPTS %{specversion}
 
-# We may want to override files from the primary target in case of building
-# against a flavour of it (eg. centos not rhel), thus override it here if
+# We may want to override files from the primary target, thus override it here if
 # necessary
 update_scripts() {
 	TARGET="$1"
@@ -1943,13 +1929,6 @@ update_scripts() {
 
 %{log_msg "Set scripts/SOURCES targets"}
 update_target=rocky
-if [ "%{primary_target}" == "rhel" ]; then
-: # no-op to avoid empty if-fi error
-%if 0%{?centos}
-  %{log_msg "Updating scripts/sources to centos version"}
-  update_target=centos
-%endif
-fi
 update_scripts $update_target
 
 %endif
@@ -2527,11 +2506,7 @@ BuildKernel() {
 
 %if %{signkernel}
 	%{log_msg "Sign the EFI UKI kernel"}
-%if 0%{?centos}
-        UKI_secureboot_name=centossecureboot204
-%else
         UKI_secureboot_name=redhatsecureboot504
-%endif
 
         UKI_secureboot_cert=%{_datadir}/pki/sb-certs/secureboot-uki-virt-%{_arch}.cer
 
