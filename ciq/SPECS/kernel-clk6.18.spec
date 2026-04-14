@@ -1545,7 +1545,7 @@ Requires: %{name}%{?1:-%{1}}-modules-core-uname-r = %{KVERREL}%{uname_suffix %{?
 AutoReq: no\
 AutoProv: yes\
 %description %{?1:%{1}-}modules-internal\
-This package provides kernel modules for the %{?2:%{2} }kernel package for Red Hat internal usage.\
+This package provides kernel modules for the %{?2:%{2} }kernel package for CIQ internal usage.\
 %{nil}
 
 #
@@ -1709,7 +1709,7 @@ Requires: %{name}%{?1:-%{1}}-modules-core-uname-r = %{KVERREL}%{uname_suffix %{?
 AutoReq: no\
 AutoProv: yes\
 %description %{?1:%{1}-}modules-partner\
-This package provides kernel modules for the %{?2:%{2} }kernel package for Red Hat partners usage.\
+This package provides kernel modules for the %{?2:%{2} }kernel package for CIQ partners usage.\
 %{nil}
 
 # Now, each variant package.
@@ -2177,7 +2177,7 @@ for opt in %{clang_make_opts}; do
   OPTS="$OPTS -m $opt"
 done
 %endif
-%{log_msg "Generate redhat configs"}
+%{log_msg "Generate CIQ configs"}
 RHJOBS=$RPM_BUILD_NCPUS SPECPACKAGE_NAME=%{name} ./process_configs.sh $OPTS %{specversion}
 
 # We may want to override files from the primary target in case of building
@@ -2987,7 +2987,7 @@ BuildKernel() {
     # prune junk from kernel-debuginfo
     find $RPM_BUILD_ROOT/usr/src/kernels -name "*.mod.c" -delete
 
-    # Red Hat UEFI Secure Boot CA cert, which can be used to authenticate the kernel
+    # UEFI Secure Boot CA cert, which can be used to authenticate the kernel
     %{log_msg "Install certs"}
     mkdir -p $RPM_BUILD_ROOT%{_datadir}/doc/kernel-keys/$KernelVer
 %if %{signkernel}
@@ -3000,7 +3000,7 @@ BuildKernel() {
 %endif
 
 %if 0%{?rhel}
-    # Red Hat IMA code-signing cert, which is used to authenticate package files
+    # IMA code-signing cert, which is used to authenticate package files
     install -m 0644 %{ima_signing_cert} $RPM_BUILD_ROOT%{_datadir}/doc/kernel-keys/$KernelVer/%{ima_cert_name}
 %endif
 
