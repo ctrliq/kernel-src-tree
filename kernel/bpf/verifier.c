@@ -17942,7 +17942,7 @@ static struct bpf_iarray *iarray_realloc(struct bpf_iarray *old, size_t n_elem)
  */
 static int visit_abnormal_return_insn(struct bpf_verifier_env *env, int t)
 {
-	static struct bpf_subprog_info *subprog;
+	struct bpf_subprog_info *subprog;
 	struct bpf_iarray *jt;
 
 	if (env->insn_aux_data[t].jt)
