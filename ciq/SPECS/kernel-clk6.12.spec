@@ -663,6 +663,7 @@ Requires: %{name}-core-uname-r = %{KVERREL}
 Requires: %{name}-modules-uname-r = %{KVERREL}
 Requires: %{name}-modules-core-uname-r = %{KVERREL}
 Provides: installonlypkg(kernel)
+Provides: kernel = %{specversion}-%{pkg_release}
 %endif
 
 
