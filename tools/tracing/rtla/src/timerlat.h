@@ -48,6 +48,7 @@ struct timerlat_params {
 	struct sched_attr	sched_param;
 	struct trace_events	*events;
 	enum timerlat_tracing_mode mode;
+	const char		*bpf_action_program;
 
 	struct actions threshold_actions;
 	struct actions end_actions;
@@ -74,7 +75,6 @@ struct timerlat_params {
 };
 
 int timerlat_apply_config(struct osnoise_tool *tool, struct timerlat_params *params);
-
 int timerlat_hist_main(int argc, char *argv[]);
 int timerlat_top_main(int argc, char *argv[]);
 int timerlat_main(int argc, char *argv[]);
