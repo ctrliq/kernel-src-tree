@@ -702,6 +702,7 @@ Requires: %{name}-modules-uname-r = %{KVERREL}
 Requires: %{name}-modules-core-uname-r = %{KVERREL}
 Requires: ((%{name}-modules-extra-uname-r = %{KVERREL}) if %{name}-modules-extra-matched)
 Provides: installonlypkg(kernel)
+Provides: kernel = %{specversion}-%{pkg_release}
 %endif
 
 
