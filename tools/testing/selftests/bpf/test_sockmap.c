@@ -1278,7 +1278,7 @@ run:
 	} else
 		fprintf(stderr, "unknown test\n");
 out:
-	/* Detatch and zero all the maps */
+	/* Detach and zero all the maps */
 	bpf_prog_detach2(prog_fd[3], cg_fd, BPF_CGROUP_SOCK_OPS);
 	bpf_prog_detach2(prog_fd[0], map_fd[0], BPF_SK_SKB_STREAM_PARSER);
 	bpf_prog_detach2(prog_fd[1], map_fd[0], BPF_SK_SKB_STREAM_VERDICT);
