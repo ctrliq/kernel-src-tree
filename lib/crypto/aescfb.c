@@ -10,6 +10,7 @@
 #include <linux/export.h>
 #include <linux/module.h>
 #include <asm/irqflags.h>
+#include <linux/fips.h>
 
 static void aescfb_encrypt_block(const struct crypto_aes_ctx *ctx, void *dst,
 				 const void *src)
@@ -219,6 +220,8 @@ static int __init libaescfb_init(void)
 
 		if (aes_expandkey(&ctx, aescfb_tv[i].key, aescfb_tv[i].klen)) {
 			pr_err("aes_expandkey() failed on vector %d\n", i);
+			if (fips_enabled)
+				panic("aes_expandkey() failed on vector %d\n", i);
 			return -ENODEV;
 		}
 
@@ -226,6 +229,8 @@ static int __init libaescfb_init(void)
 			       aescfb_tv[i].iv);
 		if (memcmp(buf, aescfb_tv[i].ctext, aescfb_tv[i].len)) {
 			pr_err("aescfb_encrypt() #1 failed on vector %d\n", i);
+			if (fips_enabled)
+				panic("aescfb_encrypt() #1 failed on vector %d\n", i);
 			return -ENODEV;
 		}
 
@@ -233,6 +238,8 @@ static int __init libaescfb_init(void)
 		aescfb_decrypt(&ctx, buf, buf, aescfb_tv[i].len, aescfb_tv[i].iv);
 		if (memcmp(buf, aescfb_tv[i].ptext, aescfb_tv[i].len)) {
 			pr_err("aescfb_decrypt() failed on vector %d\n", i);
+			if (fips_enabled)
+				panic("aescfb_decrypt() failed on vector %d\n", i);
 			return -ENODEV;
 		}
 
@@ -240,6 +247,8 @@ static int __init libaescfb_init(void)
 		aescfb_encrypt(&ctx, buf, buf, aescfb_tv[i].len, aescfb_tv[i].iv);
 		if (memcmp(buf, aescfb_tv[i].ctext, aescfb_tv[i].len)) {
 			pr_err("aescfb_encrypt() #2 failed on vector %d\n", i);
+			if (fips_enabled)
+				panic("aescfb_encrypt() #2 failed on vector %d\n", i);
 
 			return -ENODEV;
 		}
