@@ -25,6 +25,10 @@ int crypto_kdf108_ctr_generate(struct crypto_shash *kmd,
 	int err = 0;
 	u8 *dst_orig = dst;
 
+	/* SP800-131Arev2: minimum 112-bit output length */
+	if (fips_enabled && dlen < 112 / 8)
+		return -EINVAL;
+
 	desc->tfm = kmd;
 
 	while (dlen) {
