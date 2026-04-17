@@ -11,6 +11,7 @@
 #include <linux/export.h>
 #include <linux/module.h>
 #include <asm/irqflags.h>
+#include <linux/fips.h>
 
 static void aesgcm_encrypt_block(const struct crypto_aes_ctx *ctx, void *dst,
 				 const void *src)
@@ -701,6 +702,8 @@ static int __init libaesgcm_init(void)
 		if (aesgcm_expandkey(&ctx, aesgcm_tv[i].key, aesgcm_tv[i].klen,
 				     aesgcm_tv[i].clen - plen)) {
 			pr_err("aesgcm_expandkey() failed on vector %d\n", i);
+			if (fips_enabled)
+				panic("aesgcm_expandkey() failed on vector %d\n", i);
 			return -ENODEV;
 		}
 
@@ -709,6 +712,8 @@ static int __init libaesgcm_init(void)
 				    aesgcm_tv[i].iv, aesgcm_tv[i].ctext + plen)
 		    || memcmp(buf, aesgcm_tv[i].ptext, plen)) {
 			pr_err("aesgcm_decrypt() #1 failed on vector %d\n", i);
+			if (fips_enabled)
+				panic("aesgcm_decrypt() #1 failed on vector %d\n", i);
 			return -ENODEV;
 		}
 
@@ -717,6 +722,8 @@ static int __init libaesgcm_init(void)
 			       aesgcm_tv[i].alen, aesgcm_tv[i].iv, tagbuf);
 		if (memcmp(buf, aesgcm_tv[i].ctext, plen)) {
 			pr_err("aesgcm_encrypt() failed on vector %d\n", i);
+			if (fips_enabled)
+				panic("aesgcm_encrypt() failed on vector %d\n", i);
 			return -ENODEV;
 		}
 
@@ -725,6 +732,8 @@ static int __init libaesgcm_init(void)
 				    aesgcm_tv[i].alen, aesgcm_tv[i].iv, tagbuf)
 		    || memcmp(buf, aesgcm_tv[i].ptext, plen)) {
 			pr_err("aesgcm_decrypt() #2 failed on vector %d\n", i);
+			if (fips_enabled)
+				panic("aesgcm_decrypt() #2 failed on vector %d\n", i);
 			return -ENODEV;
 		}
 	}
