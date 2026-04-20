@@ -2343,6 +2343,7 @@ static const struct bin_test_param x_or_y_and_offset_param_cases[] = {
 };
 
 static const struct bin_test_param x_or_y_and_long_offset_param_cases[] = {
+	/* Offset < 0xffff in long-offset block type */
 	{ .mem_type = WMFW_ADSP2_XM, .offset_words = 0,  WMDR_PATCH_LONG },
 	{ .mem_type = WMFW_ADSP2_XM, .offset_words = 1,  WMDR_PATCH_LONG },
 	{ .mem_type = WMFW_ADSP2_XM, .offset_words = 2,  WMDR_PATCH_LONG },
@@ -2353,6 +2354,7 @@ static const struct bin_test_param x_or_y_and_long_offset_param_cases[] = {
 	{ .mem_type = WMFW_ADSP2_XM, .offset_words = 21, WMDR_PATCH_LONG },
 	{ .mem_type = WMFW_ADSP2_XM, .offset_words = 20, WMDR_PATCH_LONG },
 
+	/* Offset < 0xffff in long-offset block type */
 	{ .mem_type = WMFW_ADSP2_YM, .offset_words = 0,  WMDR_PATCH_LONG },
 	{ .mem_type = WMFW_ADSP2_YM, .offset_words = 1,  WMDR_PATCH_LONG },
 	{ .mem_type = WMFW_ADSP2_YM, .offset_words = 2,  WMDR_PATCH_LONG },
@@ -2362,6 +2364,28 @@ static const struct bin_test_param x_or_y_and_long_offset_param_cases[] = {
 	{ .mem_type = WMFW_ADSP2_YM, .offset_words = 22, WMDR_PATCH_LONG },
 	{ .mem_type = WMFW_ADSP2_YM, .offset_words = 21, WMDR_PATCH_LONG },
 	{ .mem_type = WMFW_ADSP2_YM, .offset_words = 20, WMDR_PATCH_LONG },
+
+	/* Offset > 0xffff in long-offset block type */
+	{ .mem_type = WMFW_ADSP2_XM, .offset_words = 0x10000, WMDR_PATCH_LONG },
+	{ .mem_type = WMFW_ADSP2_XM, .offset_words = 0x10001, WMDR_PATCH_LONG },
+	{ .mem_type = WMFW_ADSP2_XM, .offset_words = 0x10002, WMDR_PATCH_LONG },
+	{ .mem_type = WMFW_ADSP2_XM, .offset_words = 0x10003, WMDR_PATCH_LONG },
+	{ .mem_type = WMFW_ADSP2_XM, .offset_words = 0x10004, WMDR_PATCH_LONG },
+	{ .mem_type = WMFW_ADSP2_XM, .offset_words = 0x2f003, WMDR_PATCH_LONG },
+	{ .mem_type = WMFW_ADSP2_XM, .offset_words = 0x2f002, WMDR_PATCH_LONG },
+	{ .mem_type = WMFW_ADSP2_XM, .offset_words = 0x2f001, WMDR_PATCH_LONG },
+	{ .mem_type = WMFW_ADSP2_XM, .offset_words = 0x2f000, WMDR_PATCH_LONG },
+
+	/* Offset > 0xffff in long-offset block type */
+	{ .mem_type = WMFW_ADSP2_YM, .offset_words = 0x10000, WMDR_PATCH_LONG },
+	{ .mem_type = WMFW_ADSP2_YM, .offset_words = 0x10001, WMDR_PATCH_LONG },
+	{ .mem_type = WMFW_ADSP2_YM, .offset_words = 0x10002, WMDR_PATCH_LONG },
+	{ .mem_type = WMFW_ADSP2_YM, .offset_words = 0x10003, WMDR_PATCH_LONG },
+	{ .mem_type = WMFW_ADSP2_YM, .offset_words = 0x10004, WMDR_PATCH_LONG },
+	{ .mem_type = WMFW_ADSP2_YM, .offset_words = 0x2f003, WMDR_PATCH_LONG },
+	{ .mem_type = WMFW_ADSP2_YM, .offset_words = 0x2f002, WMDR_PATCH_LONG },
+	{ .mem_type = WMFW_ADSP2_YM, .offset_words = 0x2f001, WMDR_PATCH_LONG },
+	{ .mem_type = WMFW_ADSP2_YM, .offset_words = 0x2f000, WMDR_PATCH_LONG },
 };
 
 /* Parameterize on ZM with a range of word offsets */
@@ -2391,15 +2415,31 @@ static const struct bin_test_param packed_x_or_y_and_offset_param_cases[] = {
 };
 
 static const struct bin_test_param packed_x_or_y_and_long_offset_param_cases[] = {
+	/* Offset < 0xffff in long-offset block type */
 	{ .mem_type = WMFW_HALO_XM_PACKED, .offset_words = 0,  WMDR_PATCH_LONG },
 	{ .mem_type = WMFW_HALO_XM_PACKED, .offset_words = 4,  WMDR_PATCH_LONG },
 	{ .mem_type = WMFW_HALO_XM_PACKED, .offset_words = 8,  WMDR_PATCH_LONG },
 	{ .mem_type = WMFW_HALO_XM_PACKED, .offset_words = 12, WMDR_PATCH_LONG },
 
+	/* Offset < 0xffff in long-offset block type */
 	{ .mem_type = WMFW_HALO_YM_PACKED, .offset_words = 0,  WMDR_PATCH_LONG },
 	{ .mem_type = WMFW_HALO_YM_PACKED, .offset_words = 4,  WMDR_PATCH_LONG },
 	{ .mem_type = WMFW_HALO_YM_PACKED, .offset_words = 8,  WMDR_PATCH_LONG },
 	{ .mem_type = WMFW_HALO_YM_PACKED, .offset_words = 12, WMDR_PATCH_LONG },
+
+	/* Offset > 0xffff in long-offset block type */
+	{ .mem_type = WMFW_HALO_XM_PACKED, .offset_words = 0x10000, WMDR_PATCH_LONG },
+	{ .mem_type = WMFW_HALO_XM_PACKED, .offset_words = 0x10004, WMDR_PATCH_LONG },
+	{ .mem_type = WMFW_HALO_XM_PACKED, .offset_words = 0x10008, WMDR_PATCH_LONG },
+	{ .mem_type = WMFW_HALO_XM_PACKED, .offset_words = 0x2f000, WMDR_PATCH_LONG },
+	{ .mem_type = WMFW_HALO_XM_PACKED, .offset_words = 0x2f004, WMDR_PATCH_LONG },
+
+	/* Offset > 0xffff in long-offset block type */
+	{ .mem_type = WMFW_HALO_YM_PACKED, .offset_words = 0x10000, WMDR_PATCH_LONG },
+	{ .mem_type = WMFW_HALO_YM_PACKED, .offset_words = 0x10004, WMDR_PATCH_LONG },
+	{ .mem_type = WMFW_HALO_YM_PACKED, .offset_words = 0x10008, WMDR_PATCH_LONG },
+	{ .mem_type = WMFW_HALO_YM_PACKED, .offset_words = 0x2f000, WMDR_PATCH_LONG },
+	{ .mem_type = WMFW_HALO_YM_PACKED, .offset_words = 0x2f004, WMDR_PATCH_LONG },
 };
 
 static void x_or_y_or_z_and_offset_param_desc(const struct bin_test_param *param,
@@ -2466,6 +2506,7 @@ static const struct bin_test_param offset_param_cases[] = {
 };
 
 static const struct bin_test_param long_offset_param_cases[] = {
+	/* Offset < 0xffff in long-offset block type */
 	{ .offset_words = 0,  WMDR_PATCH_LONG },
 	{ .offset_words = 1,  WMDR_PATCH_LONG },
 	{ .offset_words = 2,  WMDR_PATCH_LONG },
@@ -2475,6 +2516,17 @@ static const struct bin_test_param long_offset_param_cases[] = {
 	{ .offset_words = 22, WMDR_PATCH_LONG },
 	{ .offset_words = 21, WMDR_PATCH_LONG },
 	{ .offset_words = 20, WMDR_PATCH_LONG },
+
+	/* Offset > 0xffff in long-offset block type */
+	{ .offset_words = 0x10000, WMDR_PATCH_LONG },
+	{ .offset_words = 0x10001, WMDR_PATCH_LONG },
+	{ .offset_words = 0x10002, WMDR_PATCH_LONG },
+	{ .offset_words = 0x10003, WMDR_PATCH_LONG },
+	{ .offset_words = 0x10004, WMDR_PATCH_LONG },
+	{ .offset_words = 0x2f000, WMDR_PATCH_LONG },
+	{ .offset_words = 0x2f001, WMDR_PATCH_LONG },
+	{ .offset_words = 0x2f002, WMDR_PATCH_LONG },
+	{ .offset_words = 0x2f003, WMDR_PATCH_LONG },
 };
 
 static void offset_param_desc(const struct bin_test_param *param, char *desc)
