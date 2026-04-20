@@ -171,7 +171,7 @@ Summary: The Linux kernel
 %define kernel_patch 21
 %define buildid .1
 %define specversion %{kernel_major_minor}.%{kernel_patch}
-%define pkgrelease 1%{?buildid}
+%define pkgrelease 3%{?buildid}
 %define kversion %{lua:print((rpm.expand("%{kernel_major_minor}"):match("^(%d+)")))}
 
 %define tarfile_release %{specversion}-%{pkgrelease}.el%{el_version}
@@ -4492,6 +4492,11 @@ fi\
 #
 #
 %changelog
+* Mon Apr 20 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.21-3.1.el9
+-- spec: Fix posttrans script to handle noarch package expansion (Brett Mastbergen)
+-- github actions: Trigger kernelCI on ciq-6.18.y-next branches (Brett Mastbergen)
+-- github actions: Use trigger for kernelCI (Brett Mastbergen)
+
 * Tue Apr 07 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.21-2.1.el9
 -- spec: Skip certificate setup for noarch builds (Brett Mastbergen)
 -- github actions: Inherit the Kernel CI Automated workflow from main (Brett Mastbergen)
