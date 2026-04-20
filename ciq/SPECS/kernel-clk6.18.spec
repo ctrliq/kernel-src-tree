@@ -171,7 +171,7 @@ Summary: The Linux kernel
 %define kernel_patch 22
 %define buildid .1
 %define specversion %{kernel_major_minor}.%{kernel_patch}
-%define pkgrelease 1%{?buildid}
+%define pkgrelease 2%{?buildid}
 %define kversion %{lua:print((rpm.expand("%{kernel_major_minor}"):match("^(%d+)")))}
 
 %define tarfile_release %{specversion}-%{pkgrelease}.el%{el_version}
@@ -4492,6 +4492,9 @@ fi\
 #
 #
 %changelog
+* Mon Apr 20 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.22-2.1.el9
+-- spec: Fix posttrans script to handle noarch package expansion (Brett Mastbergen)
+
 * Sun Apr 12 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.18.22-1.1.el9
 -- Rebased changes for Linux 6.18.22 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.22-1)
 -- github actions: Trigger kernelCI on ciq-6.18.y-next branches (Brett Mastbergen)
