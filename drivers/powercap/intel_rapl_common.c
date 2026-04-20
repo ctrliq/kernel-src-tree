@@ -252,7 +252,8 @@ struct rapl_primitive_info {
 static void rapl_init_domains(struct rapl_package *rp);
 static int rapl_read_data_raw(struct rapl_domain *rd,
 			      enum rapl_primitives prim,
-			      bool xlate, u64 *data);
+			      bool xlate, u64 *data,
+			      bool atomic);
 static int rapl_write_data_raw(struct rapl_domain *rd,
 			       enum rapl_primitives prim,
 			       unsigned long long value);
@@ -288,7 +289,7 @@ static int get_energy_counter(struct powercap_zone *power_zone,
 	cpus_read_lock();
 	rd = power_zone_to_rapl_domain(power_zone);
 
-	if (!rapl_read_data_raw(rd, ENERGY_COUNTER, true, &energy_now)) {
+	if (!rapl_read_data_raw(rd, ENERGY_COUNTER, true, &energy_now, false)) {
 		*energy_raw = energy_now;
 		cpus_read_unlock();
 
@@ -829,7 +830,8 @@ prim_fixups(struct rapl_domain *rd, enum rapl_primitives prim)
  * 63-------------------------- 31--------------------------- 0
  */
 static int rapl_read_data_raw(struct rapl_domain *rd,
-			      enum rapl_primitives prim, bool xlate, u64 *data)
+			      enum rapl_primitives prim, bool xlate, u64 *data,
+			      bool atomic)
 {
 	u64 value;
 	enum rapl_primitives prim_fixed = prim_fixups(rd, prim);
@@ -851,7 +853,7 @@ static int rapl_read_data_raw(struct rapl_domain *rd,
 
 	ra.mask = rpi->mask;
 
-	if (rd->rp->priv->read_raw(get_rid(rd->rp), &ra)) {
+	if (rd->rp->priv->read_raw(get_rid(rd->rp), &ra, atomic)) {
 		pr_debug("failed to read reg 0x%llx for %s:%s\n", ra.reg.val, rd->rp->name, rd->name);
 		return -EIO;
 	}
@@ -903,7 +905,7 @@ static int rapl_read_pl_data(struct rapl_domain *rd, int pl,
 	if (!is_pl_valid(rd, pl))
 		return -EINVAL;
 
-	return rapl_read_data_raw(rd, prim, xlate, data);
+	return rapl_read_data_raw(rd, prim, xlate, data, false);
 }
 
 static int rapl_write_pl_data(struct rapl_domain *rd, int pl,
@@ -940,7 +942,7 @@ static int rapl_check_unit_core(struct rapl_domain *rd)
 
 	ra.reg = rd->regs[RAPL_DOMAIN_REG_UNIT];
 	ra.mask = ~0;
-	if (rd->rp->priv->read_raw(get_rid(rd->rp), &ra)) {
+	if (rd->rp->priv->read_raw(get_rid(rd->rp), &ra, false)) {
 		pr_err("Failed to read power unit REG 0x%llx on %s:%s, exit.\n",
 			ra.reg.val, rd->rp->name, rd->name);
 		return -ENODEV;
@@ -968,7 +970,7 @@ static int rapl_check_unit_atom(struct rapl_domain *rd)
 
 	ra.reg = rd->regs[RAPL_DOMAIN_REG_UNIT];
 	ra.mask = ~0;
-	if (rd->rp->priv->read_raw(get_rid(rd->rp), &ra)) {
+	if (rd->rp->priv->read_raw(get_rid(rd->rp), &ra, false)) {
 		pr_err("Failed to read power unit REG 0x%llx on %s:%s, exit.\n",
 			ra.reg.val, rd->rp->name, rd->name);
 		return -ENODEV;
@@ -1155,7 +1157,7 @@ static int rapl_check_unit_tpmi(struct rapl_domain *rd)
 
 	ra.reg = rd->regs[RAPL_DOMAIN_REG_UNIT];
 	ra.mask = ~0;
-	if (rd->rp->priv->read_raw(get_rid(rd->rp), &ra)) {
+	if (rd->rp->priv->read_raw(get_rid(rd->rp), &ra, false)) {
 		pr_err("Failed to read power unit REG 0x%llx on %s:%s, exit.\n",
 			ra.reg.val, rd->rp->name, rd->name);
 		return -ENODEV;
@@ -1325,7 +1327,7 @@ static void rapl_update_domain_data(struct rapl_package *rp)
 			struct rapl_primitive_info *rpi = get_rpi(rp, prim);
 
 			if (!rapl_read_data_raw(&rp->domains[dmn], prim,
-						rpi->unit, &val))
+						rpi->unit, &val, false))
 				rp->domains[dmn].rdd.primitives[prim] = val;
 		}
 	}
@@ -1425,7 +1427,7 @@ static int rapl_check_domain(int domain, struct rapl_package *rp)
 	 */
 
 	ra.mask = ENERGY_STATUS_MASK;
-	if (rp->priv->read_raw(get_rid(rp), &ra) || !ra.value)
+	if (rp->priv->read_raw(get_rid(rp), &ra, false) || !ra.value)
 		return -ENODEV;
 
 	return 0;
@@ -1636,7 +1638,7 @@ static u64 event_read_counter(struct perf_event *event)
 	if (event->hw.idx < 0)
 		return 0;
 
-	ret = rapl_read_data_raw(&rp->domains[event->hw.idx], ENERGY_COUNTER, false, &val);
+	ret = rapl_read_data_raw(&rp->domains[event->hw.idx], ENERGY_COUNTER, false, &val, true);
 
 	/* Return 0 for failed read */
 	if (ret)
