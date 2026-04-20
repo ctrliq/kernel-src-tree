@@ -1248,7 +1248,7 @@ static int rt1320_r0_cali_put(struct snd_kcontrol *kcontrol,
 {
 	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
 	struct rt1320_sdw_priv *rt1320 = snd_soc_component_get_drvdata(component);
-	struct snd_soc_dapm_context *dapm = snd_soc_component_get_dapm(rt1320->component);
+	struct snd_soc_dapm_context *dapm = snd_soc_component_to_dapm(rt1320->component);
 	int ret;
 
 	if (!rt1320->hw_init)
@@ -1260,7 +1260,7 @@ static int rt1320_r0_cali_put(struct snd_kcontrol *kcontrol,
 
 	rt1320->cali_done = false;
 	snd_soc_dapm_mutex_lock(dapm);
-	if (snd_soc_component_get_bias_level(component) == SND_SOC_BIAS_OFF &&
+	if (snd_soc_dapm_get_bias_level(dapm) == SND_SOC_BIAS_OFF &&
 		ucontrol->value.integer.value[0]) {
 		rt1320_calibrate(rt1320);
 	}
@@ -1584,8 +1584,7 @@ struct rt1320_dspfwheader {
 	short crc;
 };
 
-	struct snd_soc_dapm_context *dapm =
-		snd_soc_component_get_dapm(rt1320->component);
+	struct snd_soc_dapm_context *dapm = snd_soc_component_to_dapm(rt1320->component);
 	struct device *dev = &rt1320->sdw_slave->dev;
 	unsigned int val, i, fw_offset, fw_ready;
 	unsigned int fw_status_addr;
@@ -2390,7 +2389,7 @@ static int rt1320_r0_load_mode_put(struct snd_kcontrol *kcontrol,
 {
 	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
 	struct rt1320_sdw_priv *rt1320 = snd_soc_component_get_drvdata(component);
-	struct snd_soc_dapm_context *dapm = snd_soc_component_get_dapm(rt1320->component);
+	struct snd_soc_dapm_context *dapm = snd_soc_component_to_dapm(rt1320->component);
 	int ret;
 
 	if (!rt1320->hw_init)
@@ -2405,7 +2404,7 @@ static int rt1320_r0_load_mode_put(struct snd_kcontrol *kcontrol,
 		return ret;
 
 	snd_soc_dapm_mutex_lock(dapm);
-	if (snd_soc_component_get_bias_level(component) == SND_SOC_BIAS_OFF) {
+	if (snd_soc_dapm_get_bias_level(dapm) == SND_SOC_BIAS_OFF) {
 		rt1320->r0_l_reg = ucontrol->value.integer.value[0];
 		rt1320->r0_r_reg = ucontrol->value.integer.value[1];
 		rt1320_calc_r0(rt1320);
@@ -2449,6 +2448,7 @@ static int rt1320_dspfw_load_put(struct snd_kcontrol *kcontrol,
 {
 	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
 	struct rt1320_sdw_priv *rt1320 = snd_soc_component_get_drvdata(component);
+	struct snd_soc_dapm_context *dapm = snd_soc_component_to_dapm(component);
 	int ret;
 
 	if (!rt1320->hw_init)
@@ -2458,7 +2458,7 @@ static int rt1320_dspfw_load_put(struct snd_kcontrol *kcontrol,
 	if (ret < 0 && ret != -EACCES)
 		return ret;
 
-	if (snd_soc_component_get_bias_level(component) == SND_SOC_BIAS_OFF &&
+	if (snd_soc_dapm_get_bias_level(dapm) == SND_SOC_BIAS_OFF &&
 		ucontrol->value.integer.value[0])
 		rt1320_dspfw_load_code(rt1320);
 
@@ -2483,6 +2483,7 @@ static int rt1320_rae_update_put(struct snd_kcontrol *kcontrol,
 {
 	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
 	struct rt1320_sdw_priv *rt1320 = snd_soc_component_get_drvdata(component);
+	struct snd_soc_dapm_context *dapm = snd_soc_component_to_dapm(component);
 	int ret;
 
 	if (!rt1320->hw_init)
@@ -2492,7 +2493,7 @@ static int rt1320_rae_update_put(struct snd_kcontrol *kcontrol,
 	if (ret < 0 && ret != -EACCES)
 		return ret;
 
-	if (snd_soc_component_get_bias_level(component) == SND_SOC_BIAS_OFF &&
+	if (snd_soc_dapm_get_bias_level(dapm) == SND_SOC_BIAS_OFF &&
 		ucontrol->value.integer.value[0] && rt1320->fw_load_done)
 		rt1320_rae_load(rt1320);
 
@@ -2518,7 +2519,7 @@ static int rt1320_r0_temperature_put(struct snd_kcontrol *kcontrol,
 {
 	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
 	struct rt1320_sdw_priv *rt1320 = snd_soc_component_get_drvdata(component);
-	struct snd_soc_dapm_context *dapm = snd_soc_component_get_dapm(rt1320->component);
+	struct snd_soc_dapm_context *dapm = snd_soc_component_to_dapm(rt1320->component);
 	int ret;
 
 	if (!rt1320->hw_init)
@@ -2529,7 +2530,7 @@ static int rt1320_r0_temperature_put(struct snd_kcontrol *kcontrol,
 		return ret;
 
 	snd_soc_dapm_mutex_lock(dapm);
-	if ((snd_soc_component_get_bias_level(component) == SND_SOC_BIAS_OFF) &&
+	if ((snd_soc_dapm_get_bias_level(dapm) == SND_SOC_BIAS_OFF) &&
 		ucontrol->value.integer.value[0] && ucontrol->value.integer.value[1])
 		rt1320_t0_load(rt1320, ucontrol->value.integer.value[0], ucontrol->value.integer.value[1]);
 	snd_soc_dapm_mutex_unlock(dapm);
