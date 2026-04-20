@@ -16,14 +16,16 @@ hostprogs := pnmtologo
 quiet_cmd_logo = LOGO    $@
       cmd_logo = $(obj)/pnmtologo -t $2 -n $(basename $(notdir $@)) -o $@ $<
 
+logo_linux_clut224_file := $(patsubst "%",%,$(CONFIG_LOGO_LINUX_CLUT224_FILE))
+
+$(obj)/logo_linux_clut224.c: $(logo_linux_clut224_file) $(obj)/pnmtologo FORCE
+	$(call if_changed,logo,clut224)
+
 $(obj)/logo_linux_mono.c: $(CONFIG_LOGO_LINUX_MONO_FILE) $(obj)/pnmtologo FORCE
 	$(call if_changed,logo,mono)
 
 $(obj)/logo_linux_vga16.c: $(CONFIG_LOGO_LINUX_VGA16_FILE) $(obj)/pnmtologo FORCE
 	$(call if_changed,logo,vga16)
-
-$(obj)/logo_linux_clut224.c: $(CONFIG_LOGO_LINUX_CLUT224_FILE) $(obj)/pnmtologo FORCE
-	$(call if_changed,logo,clut224)
 
 $(obj)/%_clut224.c: $(src)/%_clut224.ppm $(obj)/pnmtologo FORCE
 	$(call if_changed,logo,clut224)
