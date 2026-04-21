@@ -3567,11 +3567,14 @@ DEFAULTKERNEL=kernel-%{pkg_suffix}-core
 EOF
 
 %posttrans default
-# Set this kernel version as the boot default after all transactions complete
-if [ -f /boot/vmlinuz-%{KVERREL} ]; then
-    grubby --set-default=/boot/vmlinuz-%{KVERREL} ||
+# Use a glob -- this is a noarch package so %{_target_cpu} expands to "noarch"
+# at build time, not the actual installed arch.
+for vmlinuz in /boot/vmlinuz-%{specversion}-%{release}.*+%{pkg_suffix}; do
+    [ -f "$vmlinuz" ] || continue
+    grubby --set-default="$vmlinuz" ||
         echo "warning: failed to set kernel-%{pkg_suffix} as boot default" >&2
-fi
+    break
+done
 
 #
 # This macro defines a %%post script for a kernel*-devel package.
