@@ -1194,16 +1194,16 @@ VISIBLE_IF_KUNIT int cs35l56_set_fw_name(struct snd_soc_component *component)
 	int ret;
 
 	if ((cs35l56->speaker_id < 0) && cs35l56->base.num_onchip_spkid_gpios) {
-		PM_RUNTIME_ACQUIRE(cs35l56->base.dev, pm);
-		ret = PM_RUNTIME_ACQUIRE_ERR(&pm);
+		ret = pm_runtime_resume_and_get(cs35l56->base.dev);
 		if (ret)
 			return ret;
 
 		ret = cs35l56_configure_onchip_spkid_pads(&cs35l56->base);
-		if (ret)
-			return ret;
+		if (ret >= 0)
+			ret = cs35l56_read_onchip_spkid(&cs35l56->base);
 
-		ret = cs35l56_read_onchip_spkid(&cs35l56->base);
+		pm_runtime_put(cs35l56->base.dev);
+
 		if (ret < 0)
 			return ret;
 
