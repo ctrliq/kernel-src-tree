@@ -529,7 +529,7 @@ struct ipmi_smi {
 	 * Events that were queues because no one was there to receive
 	 * them.
 	 */
-	spinlock_t       events_lock; /* For dealing with event stuff. */
+	struct mutex     events_mutex; /* For dealing with event stuff. */
 	struct list_head waiting_events;
 	unsigned int     waiting_events_count; /* How many events in queue? */
 	char             event_msg_printed;
@@ -1595,7 +1595,6 @@ EXPORT_SYMBOL(ipmi_set_maintenance_mode);
 
 int ipmi_set_gets_events(struct ipmi_user *user, bool val)
 {
-	unsigned long        flags;
 	struct ipmi_smi      *intf = user->intf;
 	struct ipmi_recv_msg *msg, *msg2;
 	struct list_head     msgs;
@@ -1607,7 +1606,7 @@ int ipmi_set_gets_events(struct ipmi_user *user, bool val)
 
 	INIT_LIST_HEAD(&msgs);
 
-	spin_lock_irqsave(&intf->events_lock, flags);
+	mutex_lock(&intf->events_mutex);
 	if (user->gets_events == val)
 		goto out;
 
@@ -1638,7 +1637,7 @@ int ipmi_set_gets_events(struct ipmi_user *user, bool val)
 	}
 
  out:
-	spin_unlock_irqrestore(&intf->events_lock, flags);
+	mutex_unlock(&intf->events_mutex);
 	release_ipmi_user(user, index);
 
 	return 0;
@@ -3606,7 +3605,7 @@ int ipmi_add_smi(struct module         *owner,
 	spin_lock_init(&intf->xmit_msgs_lock);
 	INIT_LIST_HEAD(&intf->xmit_msgs);
 	INIT_LIST_HEAD(&intf->hp_xmit_msgs);
-	spin_lock_init(&intf->events_lock);
+	mutex_init(&intf->events_mutex);
 	spin_lock_init(&intf->watch_lock);
 	atomic_set(&intf->event_waiters, 0);
 	intf->ticks_to_req_ev = IPMI_REQUEST_EV_TIME;
@@ -4392,7 +4391,6 @@ static int handle_read_event_rsp(struct ipmi_smi *intf,
 	struct list_head     msgs;
 	struct ipmi_user     *user;
 	int rv = 0, deliver_count = 0, index;
-	unsigned long        flags;
 
 	if (msg->rsp_size < 19) {
 		/* Message is too small to be an IPMB event. */
@@ -4407,7 +4405,7 @@ static int handle_read_event_rsp(struct ipmi_smi *intf,
 
 	INIT_LIST_HEAD(&msgs);
 
-	spin_lock_irqsave(&intf->events_lock, flags);
+	mutex_lock(&intf->events_mutex);
 
 	ipmi_inc_stat(intf, events);
 
@@ -4482,7 +4480,7 @@ static int handle_read_event_rsp(struct ipmi_smi *intf,
 	}
 
  out:
-	spin_unlock_irqrestore(&intf->events_lock, flags);
+	mutex_unlock(&intf->events_mutex);
 
 	return rv;
 }
