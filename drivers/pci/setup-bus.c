@@ -1076,14 +1076,10 @@ static resource_size_t calculate_iosize(resource_size_t size,
 
 static resource_size_t calculate_memsize(resource_size_t size,
 					 resource_size_t min_size,
-					 resource_size_t add_size,
 					 resource_size_t children_add_size,
 					 resource_size_t align)
 {
-	if (size < min_size)
-		size = min_size;
-
-	size = max(size, add_size) + children_add_size;
+	size = max(size, min_size) + children_add_size;
 	return ALIGN(size, align);
 }
 
@@ -1122,8 +1118,7 @@ static resource_size_t window_alignment(struct pci_bus *bus, unsigned long type)
  * pbus_size_io() - Size the I/O window of a given bus
  *
  * @bus:		The bus
- * @min_size:		The minimum I/O window that must be allocated
- * @add_size:		Additional optional I/O window
+ * @add_size:		Additional I/O window
  * @realloc_head:	Track the additional I/O window on this list
  *
  * Sizing the I/O windows of the PCI-PCI bridge is trivial, since these
@@ -1131,8 +1126,7 @@ static resource_size_t window_alignment(struct pci_bus *bus, unsigned long type)
  * devices are limited to 256 bytes.  We must be careful with the ISA
  * aliasing though.
  */
-static void pbus_size_io(struct pci_bus *bus, resource_size_t min_size,
-			 resource_size_t add_size,
+static void pbus_size_io(struct pci_bus *bus, resource_size_t add_size,
 			 struct list_head *realloc_head)
 {
 	struct pci_dev *dev;
@@ -1177,7 +1171,7 @@ static void pbus_size_io(struct pci_bus *bus, resource_size_t min_size,
 		}
 	}
 
-	size0 = calculate_iosize(size, min_size, size1, 0, 0,
+	size0 = calculate_iosize(size, realloc_head ? 0 : add_size, size1, 0, 0,
 			resource_size(b_res), min_align);
 
 	if (size0)
@@ -1185,7 +1179,7 @@ static void pbus_size_io(struct pci_bus *bus, resource_size_t min_size,
 
 	size1 = size0;
 	if (realloc_head && (add_size > 0 || children_add_size > 0)) {
-		size1 = calculate_iosize(size, min_size, size1, add_size,
+		size1 = calculate_iosize(size, 0, size1, add_size,
 					 children_add_size, resource_size(b_res),
 					 min_align);
 	}
@@ -1276,8 +1270,7 @@ static resource_size_t calculate_head_align(resource_size_t *aligns,
  *
  * @bus:		The bus
  * @type:		The type of bridge resource
- * @min_size:		The minimum memory window that must be allocated
- * @add_size:		Additional optional memory window
+ * @add_size:		Additional memory window
  * @realloc_head:	Track the additional memory window on this list
  *
  * Calculate the size of the bus resource for @type and minimal alignment
@@ -1290,7 +1283,6 @@ static resource_size_t calculate_head_align(resource_size_t *aligns,
  * supplied.
  */
 static void pbus_size_mem(struct pci_bus *bus, unsigned long type,
-			 resource_size_t min_size,
 			 resource_size_t add_size,
 			 struct list_head *realloc_head)
 {
@@ -1370,7 +1362,8 @@ static void pbus_size_mem(struct pci_bus *bus, unsigned long type,
 	win_align = window_alignment(bus, b_res->flags);
 	min_align = calculate_head_align(aligns, max_order);
 	min_align = max(min_align, win_align);
-	size0 = calculate_memsize(size, min_size, 0, 0, win_align);
+	size0 = calculate_memsize(size, realloc_head ? 0 : add_size,
+				  0, win_align);
 
 	if (size0) {
 		resource_set_range(b_res, min_align, size0);
@@ -1379,7 +1372,7 @@ static void pbus_size_mem(struct pci_bus *bus, unsigned long type,
 
 	if (realloc_head && (add_size > 0 || children_add_size > 0)) {
 		add_align = max(min_align, add_align);
-		size1 = calculate_memsize(size, min_size, add_size, children_add_size,
+		size1 = calculate_memsize(size, add_size, children_add_size,
 					  win_align);
 	}
 
@@ -1557,20 +1550,17 @@ void __pci_bus_size_bridges(struct pci_bus *bus, struct list_head *realloc_head)
 		}
 		fallthrough;
 	default:
-		pbus_size_io(bus, realloc_head ? 0 : additional_io_size,
-			     additional_io_size, realloc_head);
+		pbus_size_io(bus, additional_io_size, realloc_head);
 
 		if (pref && (pref->flags & IORESOURCE_PREFETCH)) {
 			pbus_size_mem(bus,
 				      IORESOURCE_MEM | IORESOURCE_PREFETCH |
 				      (pref->flags & IORESOURCE_MEM_64),
-				      realloc_head ? 0 : additional_mmio_pref_size,
 				      additional_mmio_pref_size, realloc_head);
 		}
 
-		pbus_size_mem(bus, IORESOURCE_MEM,
-			      realloc_head ? 0 : additional_mmio_size,
-			      additional_mmio_size, realloc_head);
+		pbus_size_mem(bus, IORESOURCE_MEM, additional_mmio_size,
+			      realloc_head);
 		break;
 	}
 }
