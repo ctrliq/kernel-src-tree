@@ -543,8 +543,7 @@ static int __region_intersects(struct resource *parent, resource_size_t start,
 	bool is_type, covered;
 	struct resource res;
 
-	res.start = start;
-	res.end = start + size - 1;
+	res = DEFINE_RES(start, size, 0);
 
 	for (p = parent->child; p ; p = p->sibling) {
 		if (!resource_overlaps(p, &res))
