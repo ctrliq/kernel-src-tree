@@ -1,0 +1,156 @@
+dlm: add new flag DLM_RELEASE_RECOVER for dlm_lockspace_release
+
+jira KERNEL-878
+Rebuild_History Non-Buildable kernel-4.18.0-553.120.1.el8_10
+commit-author Alexander Aring <aahringo@redhat.com>
+commit 6f4f4ca5caf73de5e86329547d4527b3e0c08488
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.120.1.el8_10/6f4f4ca5.failed
+
+When dlm_lockspace_release() is passed DLM_RELEASE_RECOVER, it
+tells the dlm to handle the release/leave as if the node had failed,
+i.e. perform recovery steps for a failed node, like recover_slot().
+
+When DLM_RELEASE_RECOVER is set:
+- dlm_release_lockspace() includes RELEASE_RECOVER=1 in the OFFLINE
+  uevent sent to userspace.
+- userspace/dlm_controld sends a message to all lockspace members
+  indicating that the subsequent node removal should be handled as
+  if the node had failed.
+- when dlm_controld on all nodes receives the new message, it sets
+  the release_recover configfs entry to 1 for the node.
+- when the dlm/kernel next performs recovery and removes the node,
+  it will see that release_recover has been set, and will perform
+  recovery steps for the node as if it had failed, e.g. the
+  recover_slot() callback is called to notify the fs.
+
+	Signed-off-by: Alexander Aring <aahringo@redhat.com>
+	Signed-off-by: David Teigland <teigland@redhat.com>
+(cherry picked from commit 6f4f4ca5caf73de5e86329547d4527b3e0c08488)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dlm/lockspace.c
+#	include/linux/dlm.h
+diff --cc fs/dlm/lockspace.c
+index 8bc309c01dca,d986b7ef153d..000000000000
+--- a/fs/dlm/lockspace.c
++++ b/fs/dlm/lockspace.c
+@@@ -784,10 -731,14 +784,16 @@@ static int release_lockspace(struct dlm
+  		return rv;
+  	}
+  
+ -	if (ls_count == 1)
+ -		dlm_midcomms_version_wait();
+ -
+  	dlm_device_deregister(ls);
+  
+++<<<<<<< HEAD
+ +	if (force != 3 && dlm_user_daemon_available())
+ +		do_uevent(ls, 0);
+++=======
++ 	if (release_option != DLM_RELEASE_NO_EVENT &&
++ 	    dlm_user_daemon_available())
++ 		do_uevent(ls, 0, (release_option == DLM_RELEASE_RECOVER));
+++>>>>>>> 6f4f4ca5caf7 (dlm: add new flag DLM_RELEASE_RECOVER for dlm_lockspace_release)
+  
+  	dlm_recoverd_stop(ls);
+  
+diff --cc include/linux/dlm.h
+index d02da2c6fc1a,108eb953eb18..000000000000
+--- a/include/linux/dlm.h
++++ b/include/linux/dlm.h
+@@@ -88,6 -88,33 +88,36 @@@ int dlm_new_lockspace(const char *name
+  		      int *ops_result, dlm_lockspace_t **lockspace);
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * dlm_release_lockspace() release_option values:
++  *
++  * DLM_RELEASE_NO_LOCKS returns -EBUSY if any locks (lkb's)
++  *   exist in the local lockspace.
++  *
++  * DLM_RELEASE_UNUSED previous value that is no longer used.
++  *
++  * DLM_RELEASE_NORMAL releases the lockspace regardless of any
++  *   locks managed in the local lockspace.
++  *
++  * DLM_RELEASE_NO_EVENT release the lockspace regardless of any
++  *   locks managed in the local lockspace, and does not submit
++  *   a leave event to the cluster manager, so other nodes will
++  *   not be notified that the node should be removed from the
++  *   list of lockspace members.
++  *
++  * DLM_RELEASE_RECOVER like DLM_RELEASE_NORMAL, but the remaining
++  *   nodes will handle the removal of the node as if the node
++  *   had failed, e.g. the recover_slot() callback would be used.
++  */
++ #define DLM_RELEASE_NO_LOCKS		0
++ #define DLM_RELEASE_UNUSED		1
++ #define DLM_RELEASE_NORMAL		2
++ #define DLM_RELEASE_NO_EVENT		3
++ #define DLM_RELEASE_RECOVER		4
++ 
++ /*
+++>>>>>>> 6f4f4ca5caf7 (dlm: add new flag DLM_RELEASE_RECOVER for dlm_lockspace_release)
+   * dlm_release_lockspace
+   *
+   * Stop a lockspace.
+* Unmerged path fs/dlm/lockspace.c
+diff --git a/fs/dlm/member.c b/fs/dlm/member.c
+index 21ccbe89ef55..393befbd498f 100644
+--- a/fs/dlm/member.c
++++ b/fs/dlm/member.c
+@@ -454,7 +454,8 @@ static void dlm_lsop_recover_prep(struct dlm_ls *ls)
+ 	ls->ls_ops->recover_prep(ls->ls_ops_arg);
+ }
+ 
+-static void dlm_lsop_recover_slot(struct dlm_ls *ls, struct dlm_member *memb)
++static void dlm_lsop_recover_slot(struct dlm_ls *ls, struct dlm_member *memb,
++				  unsigned int release_recover)
+ {
+ 	struct dlm_slot slot;
+ 	uint32_t seq;
+@@ -471,7 +472,7 @@ static void dlm_lsop_recover_slot(struct dlm_ls *ls, struct dlm_member *memb)
+ 
+ 	error = dlm_comm_seq(memb->nodeid, &seq, false);
+ 
+-	if (!error && seq == memb->comm_seq)
++	if (!release_recover && !error && seq == memb->comm_seq)
+ 		return;
+ 
+ 	slot.nodeid = memb->nodeid;
+@@ -528,6 +529,7 @@ int dlm_recover_members(struct dlm_ls *ls, struct dlm_recover *rv, int *neg_out)
+ 	struct dlm_member *memb, *safe;
+ 	struct dlm_config_node *node;
+ 	int i, error, neg = 0, low = -1;
++	unsigned int release_recover;
+ 
+ 	/* previously removed members that we've not finished removing need to
+ 	   count as a negative change so the "neg" recovery steps will happen */
+@@ -544,8 +546,12 @@ int dlm_recover_members(struct dlm_ls *ls, struct dlm_recover *rv, int *neg_out)
+ 		if (node && !node->new && !node->gone)
+ 			continue;
+ 
++		release_recover = 0;
++
+ 		if (node->gone) {
+-			log_rinfo(ls, "remove member %d", memb->nodeid);
++			release_recover = node->release_recover;
++			log_rinfo(ls, "remove member %d%s", memb->nodeid,
++				  release_recover ? " (release_recover)" : "");
+ 		} else {
+ 			/* removed and re-added */
+ 			log_rinfo(ls, "remove member %d comm_seq %u %u",
+@@ -555,7 +561,7 @@ int dlm_recover_members(struct dlm_ls *ls, struct dlm_recover *rv, int *neg_out)
+ 		neg++;
+ 		list_move(&memb->list, &ls->ls_nodes_gone);
+ 		ls->ls_num_nodes--;
+-		dlm_lsop_recover_slot(ls, memb);
++		dlm_lsop_recover_slot(ls, memb, release_recover);
+ 	}
+ 
+ 	/* add new members to ls_nodes */
+* Unmerged path include/linux/dlm.h
