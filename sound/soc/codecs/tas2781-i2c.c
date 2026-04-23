@@ -2028,7 +2028,7 @@ static void tasdevice_parse_dt(struct tasdevice_priv *tas_priv)
 		sizeof(tas_priv->dev_name));
 }
 
-static int tasdevice_i2c_probe(struct i2c_client *i2c)
+static int tasdevice_i2c_probe(struct i2c_client *i2c, const struct i2c_device_id *)
 {
 	const struct acpi_device_id *acpi_id;
 	struct tasdevice_priv *tas_priv;
@@ -2077,11 +2077,13 @@ err:
 	return ret;
 }
 
-static void tasdevice_i2c_remove(struct i2c_client *client)
+static int tasdevice_i2c_remove(struct i2c_client *client)
 {
 	struct tasdevice_priv *tas_priv = i2c_get_clientdata(client);
 
 	tasdevice_remove(tas_priv);
+
+	return 0;
 }
 
 #ifdef CONFIG_ACPI
