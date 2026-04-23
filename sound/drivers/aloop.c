@@ -340,65 +340,72 @@ static int loopback_check_format(struct loopback_cable *cable, int stream)
 	struct loopback_setup *setup;
 	struct snd_card *card;
 	bool stop_capture = false;
-	int check;
+	unsigned long flags;
+	int ret = 0, check;
 
-	scoped_guard(spinlock_irqsave, &cable->lock) {
-		dpcm_play = cable->streams[SNDRV_PCM_STREAM_PLAYBACK];
-		dpcm_capt = cable->streams[SNDRV_PCM_STREAM_CAPTURE];
+	spin_lock_irqsave(&cable->lock, flags);
+	dpcm_play = cable->streams[SNDRV_PCM_STREAM_PLAYBACK];
+	dpcm_capt = cable->streams[SNDRV_PCM_STREAM_CAPTURE];
 
-		if (cable->valid != CABLE_VALID_BOTH) {
-			if (stream == SNDRV_PCM_STREAM_CAPTURE || !dpcm_play)
-				return 0;
-		} else {
-			if (!dpcm_play || !dpcm_capt)
-				return -EIO;
-			runtime = dpcm_play->substream->runtime;
-			cruntime = dpcm_capt->substream->runtime;
-			if (!runtime || !cruntime)
-				return -EIO;
-			check = runtime->format != cruntime->format ||
-			runtime->rate != cruntime->rate ||
-			runtime->channels != cruntime->channels ||
-			is_access_interleaved(runtime->access) !=
-			is_access_interleaved(cruntime->access);
-			if (!check)
-				return 0;
-			if (stream == SNDRV_PCM_STREAM_CAPTURE)
-				return -EIO;
-			else if (cruntime->state == SNDRV_PCM_STATE_RUNNING)
-				stop_capture = true;
-		}
-
-		setup = get_setup(dpcm_play);
-		card = dpcm_play->loopback->card;
+	if (cable->valid != CABLE_VALID_BOTH) {
+		if (stream == SNDRV_PCM_STREAM_CAPTURE || !dpcm_play)
+			goto unlock;
+	} else {
+		if (!dpcm_play || !dpcm_capt)
+			goto unlock_eio;
 		runtime = dpcm_play->substream->runtime;
-		if (setup->format != runtime->format) {
-			snd_ctl_notify(card, SNDRV_CTL_EVENT_MASK_VALUE,
-							&setup->format_id);
-			setup->format = runtime->format;
-		}
-		if (setup->rate != runtime->rate) {
-			snd_ctl_notify(card, SNDRV_CTL_EVENT_MASK_VALUE,
-							&setup->rate_id);
-			setup->rate = runtime->rate;
-		}
-		if (setup->channels != runtime->channels) {
-			snd_ctl_notify(card, SNDRV_CTL_EVENT_MASK_VALUE,
-							&setup->channels_id);
-			setup->channels = runtime->channels;
-		}
-		if (is_access_interleaved(setup->access) !=
-		    is_access_interleaved(runtime->access)) {
-			snd_ctl_notify(card, SNDRV_CTL_EVENT_MASK_VALUE,
-							&setup->access_id);
-			setup->access = runtime->access;
-		}
+		cruntime = dpcm_capt->substream->runtime;
+		if (!runtime || !cruntime)
+			goto unlock_eio;
+		check = runtime->format != cruntime->format ||
+		runtime->rate != cruntime->rate ||
+		runtime->channels != cruntime->channels ||
+		is_access_interleaved(runtime->access) !=
+		is_access_interleaved(cruntime->access);
+		if (!check)
+			goto unlock;
+		if (stream == SNDRV_PCM_STREAM_CAPTURE)
+			goto unlock_eio;
+		else if (cruntime->state == SNDRV_PCM_STATE_RUNNING)
+			stop_capture = true;
 	}
+
+	setup = get_setup(dpcm_play);
+	card = dpcm_play->loopback->card;
+	runtime = dpcm_play->substream->runtime;
+	if (setup->format != runtime->format) {
+		snd_ctl_notify(card, SNDRV_CTL_EVENT_MASK_VALUE,
+						&setup->format_id);
+		setup->format = runtime->format;
+	}
+	if (setup->rate != runtime->rate) {
+		snd_ctl_notify(card, SNDRV_CTL_EVENT_MASK_VALUE,
+						&setup->rate_id);
+		setup->rate = runtime->rate;
+	}
+	if (setup->channels != runtime->channels) {
+		snd_ctl_notify(card, SNDRV_CTL_EVENT_MASK_VALUE,
+						&setup->channels_id);
+		setup->channels = runtime->channels;
+	}
+	if (is_access_interleaved(setup->access) !=
+	    is_access_interleaved(runtime->access)) {
+		snd_ctl_notify(card, SNDRV_CTL_EVENT_MASK_VALUE,
+						&setup->access_id);
+		setup->access = runtime->access;
+	}
+	spin_unlock_irqrestore(&cable->lock, flags);
 
 	if (stop_capture)
 		snd_pcm_stop(dpcm_capt->substream, SNDRV_PCM_STATE_DRAINING);
 
 	return 0;
+
+unlock_eio:
+	ret = -EIO;
+unlock:
+	spin_unlock_irqrestore(&cable->lock, flags);
+	return ret;
 }
 
 static void loopback_active_notify(struct loopback_pcm *dpcm)
