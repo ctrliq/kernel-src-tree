@@ -1,0 +1,339 @@
+gfs2: Get rid of gfs2_log_[un]lock helpers
+
+jira KERNEL-878
+Rebuild_History Non-Buildable kernel-4.18.0-553.120.1.el8_10
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 5a15907f99e5d93b0133be608a9bbe24fd76f67a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.120.1.el8_10/5a15907f.failed
+
+These two helpers only hide the locking operation; they do not make
+the code more readable.
+
+Created with:
+
+sed -i -e 's:gfs2_log_unlock(sdp):spin_unlock(\&sdp->sd_log_lock):' \
+       -e 's:gfs2_log_lock(sdp):spin_lock(\&sdp->sd_log_lock):'
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 5a15907f99e5d93b0133be608a9bbe24fd76f67a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/aops.c
+#	fs/gfs2/glops.c
+#	fs/gfs2/trans.c
+diff --cc fs/gfs2/aops.c
+index 3283c12712d0,403b5e1fada4..000000000000
+--- a/fs/gfs2/aops.c
++++ b/fs/gfs2/aops.c
+@@@ -708,21 -652,23 +708,26 @@@ int gfs2_releasepage(struct page *page
+  	struct buffer_head *bh, *head;
+  	struct gfs2_bufdata *bd;
+  
+ -	head = folio_buffers(folio);
+ -	if (!head)
+ -		return false;
+ +	if (!page_has_buffers(page))
+ +		return 0;
+  
+  	/*
+ -	 * mm accommodates an old ext3 case where clean folios might
+ -	 * not have had the dirty bit cleared.	Thus, it can send actual
+ -	 * dirty folios to ->release_folio() via shrink_active_list().
+ +	 * From xfs_vm_releasepage: mm accommodates an old ext3 case where
+ +	 * clean pages might not have had the dirty bit cleared.  Thus, it can
+ +	 * send actual dirty pages to ->releasepage() via shrink_active_list().
+  	 *
+ -	 * As a workaround, we skip folios that contain dirty buffers
+ -	 * below.  Once ->release_folio isn't called on dirty folios
+ -	 * anymore, we can warn on dirty buffers like we used to here
+ -	 * again.
+ +	 * As a workaround, we skip pages that contain dirty buffers below.
+ +	 * Once ->releasepage isn't called on dirty pages anymore, we can warn
+ +	 * on dirty buffers like we used to here again.
+  	 */
+  
+++<<<<<<< HEAD
+ +	gfs2_log_lock(sdp);
+ +	head = bh = page_buffers(page);
+++=======
++ 	spin_lock(&sdp->sd_log_lock);
++ 	bh = head;
+++>>>>>>> 5a15907f99e5 (gfs2: Get rid of gfs2_log_[un]lock helpers)
+  	do {
+  		if (atomic_read(&bh->b_count))
+  			goto cannot_release;
+@@@ -753,13 -699,13 +758,18 @@@
+  
+  		bh = bh->b_this_page;
+  	} while (bh != head);
+- 	gfs2_log_unlock(sdp);
++ 	spin_unlock(&sdp->sd_log_lock);
+  
+ -	return try_to_free_buffers(folio);
+ +	return try_to_free_buffers(page);
+  
+  cannot_release:
+++<<<<<<< HEAD
+ +	gfs2_log_unlock(sdp);
+ +	return 0;
+++=======
++ 	spin_unlock(&sdp->sd_log_lock);
++ 	return false;
+++>>>>>>> 5a15907f99e5 (gfs2: Get rid of gfs2_log_[un]lock helpers)
+  }
+  
+  static const struct address_space_operations gfs2_aops = {
+diff --cc fs/gfs2/glops.c
+index 67df5cbd111f,aff7e890bf60..000000000000
+--- a/fs/gfs2/glops.c
++++ b/fs/gfs2/glops.c
+@@@ -83,10 -80,7 +83,14 @@@ static void __gfs2_ail_flush(struct gfs
+  	}
+  	GLOCK_BUG_ON(gl, !fsync && atomic_read(&gl->gl_ail_count));
+  	spin_unlock(&sdp->sd_ail_lock);
+++<<<<<<< HEAD
+ +	gfs2_log_unlock(sdp);
+ +
+ +	if (gfs2_withdrawing(sdp))
+ +		gfs2_withdraw(sdp);
+++=======
++ 	spin_unlock(&sdp->sd_log_lock);
+++>>>>>>> 5a15907f99e5 (gfs2: Get rid of gfs2_log_[un]lock helpers)
+  }
+  
+  
+diff --cc fs/gfs2/trans.c
+index 84b9f776183b,0ded2d63dbbb..000000000000
+--- a/fs/gfs2/trans.c
++++ b/fs/gfs2/trans.c
+@@@ -244,19 -266,19 +244,19 @@@ void gfs2_trans_add_meta(struct gfs2_gl
+  		set_bit(TR_TOUCHED, &tr->tr_flags);
+  		goto out;
+  	}
+- 	gfs2_log_lock(sdp);
++ 	spin_lock(&sdp->sd_log_lock);
+  	bd = bh->b_private;
+  	if (bd == NULL) {
+- 		gfs2_log_unlock(sdp);
++ 		spin_unlock(&sdp->sd_log_lock);
+  		unlock_buffer(bh);
+ -		folio_lock(bh->b_folio);
+ +		lock_page(bh->b_page);
+  		if (bh->b_private == NULL)
+  			bd = gfs2_alloc_bufdata(gl, bh);
+  		else
+  			bd = bh->b_private;
+ -		folio_unlock(bh->b_folio);
+ +		unlock_page(bh->b_page);
+  		lock_buffer(bh);
+- 		gfs2_log_lock(sdp);
++ 		spin_lock(&sdp->sd_log_lock);
+  	}
+  	gfs2_assert(sdp, bd->bd_gl == gl);
+  	set_bit(TR_TOUCHED, &tr->tr_flags);
+@@@ -287,9 -309,7 +287,13 @@@
+  	list_add(&bd->bd_list, &tr->tr_buf);
+  	tr->tr_num_buf_new++;
+  out_unlock:
+++<<<<<<< HEAD
+ +	gfs2_log_unlock(sdp);
+ +	if (withdraw)
+ +		gfs2_assert_withdraw(sdp, 0);
+++=======
++ 	spin_unlock(&sdp->sd_log_lock);
+++>>>>>>> 5a15907f99e5 (gfs2: Get rid of gfs2_log_[un]lock helpers)
+  out:
+  	unlock_buffer(bh);
+  }
+* Unmerged path fs/gfs2/aops.c
+* Unmerged path fs/gfs2/glops.c
+diff --git a/fs/gfs2/log.c b/fs/gfs2/log.c
+index 03724f4ef5f4..8a74ee365b34 100644
+--- a/fs/gfs2/log.c
++++ b/fs/gfs2/log.c
+@@ -773,9 +773,9 @@ void gfs2_flush_revokes(struct gfs2_sbd *sdp)
+ 	/* number of revokes we still have room for */
+ 	unsigned int max_revokes = atomic_read(&sdp->sd_log_revokes_available);
+ 
+-	gfs2_log_lock(sdp);
++	spin_lock(&sdp->sd_log_lock);
+ 	gfs2_ail1_empty(sdp, max_revokes);
+-	gfs2_log_unlock(sdp);
++	spin_unlock(&sdp->sd_log_lock);
+ }
+ 
+ /**
+@@ -1055,7 +1055,7 @@ void gfs2_log_flush(struct gfs2_sbd *sdp, struct gfs2_glock *gl, u32 flags)
+ 		goto out_withdraw;
+ 	lops_after_commit(sdp, tr);
+ 
+-	gfs2_log_lock(sdp);
++	spin_lock(&sdp->sd_log_lock);
+ 	sdp->sd_log_blks_reserved = 0;
+ 
+ 	spin_lock(&sdp->sd_ail_lock);
+@@ -1064,7 +1064,7 @@ void gfs2_log_flush(struct gfs2_sbd *sdp, struct gfs2_glock *gl, u32 flags)
+ 		tr = NULL;
+ 	}
+ 	spin_unlock(&sdp->sd_ail_lock);
+-	gfs2_log_unlock(sdp);
++	spin_unlock(&sdp->sd_log_lock);
+ 
+ 	if (!(flags & GFS2_LOG_HEAD_FLUSH_NORMAL)) {
+ 		if (!sdp->sd_log_idle) {
+@@ -1152,7 +1152,7 @@ static void log_refund(struct gfs2_sbd *sdp, struct gfs2_trans *tr)
+ 	unsigned int unused;
+ 	unsigned int maxres;
+ 
+-	gfs2_log_lock(sdp);
++	spin_lock(&sdp->sd_log_lock);
+ 
+ 	if (sdp->sd_log_tr) {
+ 		gfs2_merge_trans(sdp, tr);
+@@ -1170,7 +1170,7 @@ static void log_refund(struct gfs2_sbd *sdp, struct gfs2_trans *tr)
+ 		gfs2_log_release(sdp, unused);
+ 	sdp->sd_log_blks_reserved = reserved;
+ 
+-	gfs2_log_unlock(sdp);
++	spin_unlock(&sdp->sd_log_lock);
+ }
+ 
+ /**
+diff --git a/fs/gfs2/log.h b/fs/gfs2/log.h
+index c18c9358a3cc..bc9444504029 100644
+--- a/fs/gfs2/log.h
++++ b/fs/gfs2/log.h
+@@ -23,30 +23,6 @@
+  */
+ #define GFS2_LOG_FLUSH_MIN_BLOCKS 4
+ 
+-/**
+- * gfs2_log_lock - acquire the right to mess with the log manager
+- * @sdp: the filesystem
+- *
+- */
+-
+-static inline void gfs2_log_lock(struct gfs2_sbd *sdp)
+-__acquires(&sdp->sd_log_lock)
+-{
+-	spin_lock(&sdp->sd_log_lock);
+-}
+-
+-/**
+- * gfs2_log_unlock - release the right to mess with the log manager
+- * @sdp: the filesystem
+- *
+- */
+-
+-static inline void gfs2_log_unlock(struct gfs2_sbd *sdp)
+-__releases(&sdp->sd_log_lock)
+-{
+-	spin_unlock(&sdp->sd_log_lock);
+-}
+-
+ static inline void gfs2_ordered_add_inode(struct gfs2_inode *ip)
+ {
+ 	struct gfs2_sbd *sdp = GFS2_SB(&ip->i_inode);
+diff --git a/fs/gfs2/lops.c b/fs/gfs2/lops.c
+index cd59140dbe47..ae7da65109ee 100644
+--- a/fs/gfs2/lops.c
++++ b/fs/gfs2/lops.c
+@@ -659,19 +659,19 @@ static void gfs2_before_commit(struct gfs2_sbd *sdp, unsigned int limit,
+ 	unsigned n;
+ 	__be64 *ptr;
+ 
+-	gfs2_log_lock(sdp);
++	spin_lock(&sdp->sd_log_lock);
+ 	list_sort(NULL, blist, blocknr_cmp);
+ 	bd1 = bd2 = list_prepare_entry(bd1, blist, bd_list);
+ 	while(total) {
+ 		num = total;
+ 		if (total > limit)
+ 			num = limit;
+-		gfs2_log_unlock(sdp);
++		spin_unlock(&sdp->sd_log_lock);
+ 		page = gfs2_get_log_desc(sdp,
+ 					 is_databuf ? GFS2_LOG_DESC_JDATA :
+ 					 GFS2_LOG_DESC_METADATA, num + 1, num);
+ 		ld = page_address(page);
+-		gfs2_log_lock(sdp);
++		spin_lock(&sdp->sd_log_lock);
+ 		ptr = (__be64 *)(ld + 1);
+ 
+ 		n = 0;
+@@ -685,14 +685,14 @@ static void gfs2_before_commit(struct gfs2_sbd *sdp, unsigned int limit,
+ 				break;
+ 		}
+ 
+-		gfs2_log_unlock(sdp);
++		spin_unlock(&sdp->sd_log_lock);
+ 		gfs2_log_write_page(sdp, page);
+-		gfs2_log_lock(sdp);
++		spin_lock(&sdp->sd_log_lock);
+ 
+ 		n = 0;
+ 		list_for_each_entry_continue(bd2, blist, bd_list) {
+ 			get_bh(bd2->bd_bh);
+-			gfs2_log_unlock(sdp);
++			spin_unlock(&sdp->sd_log_lock);
+ 			lock_buffer(bd2->bd_bh);
+ 
+ 			if (buffer_escaped(bd2->bd_bh)) {
+@@ -711,7 +711,7 @@ static void gfs2_before_commit(struct gfs2_sbd *sdp, unsigned int limit,
+ 			} else {
+ 				gfs2_log_write_bh(sdp, bd2->bd_bh);
+ 			}
+-			gfs2_log_lock(sdp);
++			spin_lock(&sdp->sd_log_lock);
+ 			if (++n >= num)
+ 				break;
+ 		}
+@@ -719,7 +719,7 @@ static void gfs2_before_commit(struct gfs2_sbd *sdp, unsigned int limit,
+ 		BUG_ON(total < num);
+ 		total -= num;
+ 	}
+-	gfs2_log_unlock(sdp);
++	spin_unlock(&sdp->sd_log_lock);
+ }
+ 
+ static void buf_lo_before_commit(struct gfs2_sbd *sdp, struct gfs2_trans *tr)
+diff --git a/fs/gfs2/meta_io.c b/fs/gfs2/meta_io.c
+index 6ca7376b181d..83b6f0e454b3 100644
+--- a/fs/gfs2/meta_io.c
++++ b/fs/gfs2/meta_io.c
+@@ -386,7 +386,7 @@ static void gfs2_ail1_wipe(struct gfs2_sbd *sdp, u64 bstart, u32 blen)
+ 	struct buffer_head *bh;
+ 	u64 end = bstart + blen;
+ 
+-	gfs2_log_lock(sdp);
++	spin_lock(&sdp->sd_log_lock);
+ 	spin_lock(&sdp->sd_ail_lock);
+ 	list_for_each_entry_safe(tr, s, &sdp->sd_ail1_list, tr_list) {
+ 		list_for_each_entry_safe(bd, bs, &tr->tr_ail1_list,
+@@ -399,7 +399,7 @@ static void gfs2_ail1_wipe(struct gfs2_sbd *sdp, u64 bstart, u32 blen)
+ 		}
+ 	}
+ 	spin_unlock(&sdp->sd_ail_lock);
+-	gfs2_log_unlock(sdp);
++	spin_unlock(&sdp->sd_log_lock);
+ }
+ 
+ static struct buffer_head *gfs2_getjdatabuf(struct gfs2_inode *ip, u64 blkno)
+@@ -459,11 +459,11 @@ void gfs2_journal_wipe(struct gfs2_inode *ip, u64 bstart, u32 blen)
+ 		}
+ 		if (bh) {
+ 			lock_buffer(bh);
+-			gfs2_log_lock(sdp);
++			spin_lock(&sdp->sd_log_lock);
+ 			spin_lock(&sdp->sd_ail_lock);
+ 			gfs2_remove_from_journal(bh, ty);
+ 			spin_unlock(&sdp->sd_ail_lock);
+-			gfs2_log_unlock(sdp);
++			spin_unlock(&sdp->sd_log_lock);
+ 			unlock_buffer(bh);
+ 			brelse(bh);
+ 		}
+* Unmerged path fs/gfs2/trans.c
