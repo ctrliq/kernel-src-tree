@@ -33,8 +33,8 @@ DECLARE_EVENT_CLASS(snd_soc_dapm,
 	),
 
 	TP_fast_assign(
-		__assign_str(card_name, dapm->card->name);
-		__assign_str(comp_name, dapm->component ? dapm->component->name : "(none)");
+		__assign_str(card_name, snd_soc_dapm_to_card(dapm)->name);
+		__assign_str(comp_name, snd_soc_dapm_to_component(dapm) ? snd_soc_dapm_to_component(dapm)->name : "(none)");
 		__entry->val = val;
 	),
 
