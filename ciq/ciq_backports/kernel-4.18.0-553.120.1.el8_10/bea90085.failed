@@ -1,0 +1,247 @@
+dlm: use defines for force values in dlm_release_lockspace
+
+jira KERNEL-878
+Rebuild_History Non-Buildable kernel-4.18.0-553.120.1.el8_10
+commit-author Alexander Aring <aahringo@redhat.com>
+commit bea90085dcb0f9a75748e73d723bde557a5ebf1a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.120.1.el8_10/bea90085.failed
+
+Clarify the use of the force parameter by renaming it to
+"release_option" and adding defines (with descriptions) for
+each of the accepted values.
+
+	Signed-off-by: Alexander Aring <aahringo@redhat.com>
+	Signed-off-by: David Teigland <teigland@redhat.com>
+(cherry picked from commit bea90085dcb0f9a75748e73d723bde557a5ebf1a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dlm/lockspace.c
+diff --cc fs/dlm/lockspace.c
+index 8bc309c01dca,be8dbf482229..000000000000
+--- a/fs/dlm/lockspace.c
++++ b/fs/dlm/lockspace.c
+@@@ -739,15 -671,27 +739,33 @@@ static int lkb_idr_free(int id, void *p
+     This is because there may be LKBs queued as ASTs that have been unlinked
+     from their RSBs and are pending deletion once the AST has been delivered */
+  
+- static int lockspace_busy(struct dlm_ls *ls, int force)
++ static int lockspace_busy(struct dlm_ls *ls, int release_option)
+  {
+ -	struct dlm_lkb *lkb;
+ -	unsigned long id;
+ -	int rv = 0;
+ -
+ +	int rv;
+ +
+++<<<<<<< HEAD
+ +	spin_lock(&ls->ls_lkbidr_spin);
+ +	if (force == 0) {
+ +		rv = idr_for_each(&ls->ls_lkbidr, lkb_idr_is_any, ls);
+ +	} else if (force == 1) {
+ +		rv = idr_for_each(&ls->ls_lkbidr, lkb_idr_is_local, ls);
+++=======
++ 	read_lock_bh(&ls->ls_lkbxa_lock);
++ 	if (release_option == DLM_RELEASE_NO_LOCKS) {
++ 		xa_for_each(&ls->ls_lkbxa, id, lkb) {
++ 			rv = 1;
++ 			break;
++ 		}
++ 	} else if (release_option == DLM_RELEASE_UNUSED) {
++ 		/* TODO: handle this UNUSED option as NO_LOCKS in later patch */
++ 		xa_for_each(&ls->ls_lkbxa, id, lkb) {
++ 			if (lkb->lkb_nodeid == 0 &&
++ 			    lkb->lkb_grmode != DLM_LOCK_IV) {
++ 				rv = 1;
++ 				break;
++ 			}
++ 		}
+++>>>>>>> bea90085dcb0 (dlm: use defines for force values in dlm_release_lockspace)
+  	} else {
+  		rv = 0;
+  	}
+@@@ -755,15 -699,13 +773,15 @@@
+  	return rv;
+  }
+  
+- static int release_lockspace(struct dlm_ls *ls, int force)
++ static int release_lockspace(struct dlm_ls *ls, int release_option)
+  {
+ -	int busy, rv;
+ +	struct dlm_rsb *rsb;
+ +	struct rb_node *n;
+ +	int i, busy, rv;
+  
+- 	busy = lockspace_busy(ls, force);
++ 	busy = lockspace_busy(ls, release_option);
+  
+ -	spin_lock_bh(&lslist_lock);
+ +	spin_lock(&lslist_lock);
+  	if (ls->ls_create_count == 1) {
+  		if (busy) {
+  			rv = -EBUSY;
+@@@ -784,9 -726,13 +802,10 @@@
+  		return rv;
+  	}
+  
+ -	if (ls_count == 1)
+ -		dlm_midcomms_version_wait();
+ -
+  	dlm_device_deregister(ls);
+  
+- 	if (force != 3 && dlm_user_daemon_available())
++ 	if (release_option != DLM_RELEASE_NO_EVENT &&
++ 	    dlm_user_daemon_available())
+  		do_uevent(ls, 0);
+  
+  	dlm_recoverd_stop(ls);
+@@@ -860,11 -784,7 +879,15 @@@
+   * lockspace must continue to function as usual, participating in recoveries,
+   * until this returns.
+   *
+++<<<<<<< HEAD
+ + * Force has 4 possible values:
+ + * 0 - don't destroy locksapce if it has any LKBs
+ + * 1 - destroy lockspace if it has remote LKBs but not if it has local LKBs
+ + * 2 - destroy lockspace regardless of LKBs
+ + * 3 - destroy lockspace as part of a forced shutdown
+++=======
++  * See DLM_RELEASE defines for release_option values and their meaning.
+++>>>>>>> bea90085dcb0 (dlm: use defines for force values in dlm_release_lockspace)
+   */
+  
+  int dlm_release_lockspace(void *lockspace, int force)
+diff --git a/drivers/md/md-cluster.c b/drivers/md/md-cluster.c
+index 13b8cb3e01fb..46a437818d70 100644
+--- a/drivers/md/md-cluster.c
++++ b/drivers/md/md-cluster.c
+@@ -962,7 +962,7 @@ static int join(struct mddev *mddev, int nodes)
+ 	lockres_free(cinfo->resync_lockres);
+ 	lockres_free(cinfo->bitmap_lockres);
+ 	if (cinfo->lockspace)
+-		dlm_release_lockspace(cinfo->lockspace, 2);
++		dlm_release_lockspace(cinfo->lockspace, DLM_RELEASE_NORMAL);
+ 	mddev->cluster_info = NULL;
+ 	kfree(cinfo);
+ 	return ret;
+@@ -1025,7 +1025,7 @@ static int leave(struct mddev *mddev)
+ 	lockres_free(cinfo->resync_lockres);
+ 	lockres_free(cinfo->bitmap_lockres);
+ 	unlock_all_bitmaps(mddev);
+-	dlm_release_lockspace(cinfo->lockspace, 2);
++	dlm_release_lockspace(cinfo->lockspace, DLM_RELEASE_NORMAL);
+ 	kfree(cinfo);
+ 	return 0;
+ }
+* Unmerged path fs/dlm/lockspace.c
+diff --git a/fs/dlm/user.c b/fs/dlm/user.c
+index defc3beab056..0f4b132be60f 100644
+--- a/fs/dlm/user.c
++++ b/fs/dlm/user.c
+@@ -419,7 +419,7 @@ static int device_create_lockspace(struct dlm_lspace_params *params)
+ 	dlm_put_lockspace(ls);
+ 
+ 	if (error)
+-		dlm_release_lockspace(lockspace, 0);
++		dlm_release_lockspace(lockspace, DLM_RELEASE_NO_LOCKS);
+ 	else
+ 		error = ls->ls_device.minor;
+ 
+@@ -430,7 +430,7 @@ static int device_remove_lockspace(struct dlm_lspace_params *params)
+ {
+ 	dlm_lockspace_t *lockspace;
+ 	struct dlm_ls *ls;
+-	int error, force = 0;
++	int error, force = DLM_RELEASE_NO_LOCKS;
+ 
+ 	if (!capable(CAP_SYS_ADMIN))
+ 		return -EPERM;
+@@ -440,7 +440,7 @@ static int device_remove_lockspace(struct dlm_lspace_params *params)
+ 		return -ENOENT;
+ 
+ 	if (params->flags & DLM_USER_LSFLG_FORCEFREE)
+-		force = 2;
++		force = DLM_RELEASE_NORMAL;
+ 
+ 	lockspace = ls->ls_local_handle;
+ 	dlm_put_lockspace(ls);
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index fabc797f5ed5..80476629e280 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -1391,7 +1391,7 @@ static int gdlm_mount(struct gfs2_sbd *sdp, const char *table)
+ 	return 0;
+ 
+ fail_release:
+-	dlm_release_lockspace(ls->ls_dlm, 2);
++	dlm_release_lockspace(ls->ls_dlm, DLM_RELEASE_NORMAL);
+ fail_free:
+ 	free_recover_size(ls);
+ fail:
+@@ -1429,7 +1429,7 @@ static void gdlm_unmount(struct gfs2_sbd *sdp)
+ release:
+ 	down_write(&ls->ls_sem);
+ 	if (ls->ls_dlm) {
+-		dlm_release_lockspace(ls->ls_dlm, 2);
++		dlm_release_lockspace(ls->ls_dlm, DLM_RELEASE_NORMAL);
+ 		ls->ls_dlm = NULL;
+ 	}
+ 	up_write(&ls->ls_sem);
+diff --git a/fs/ocfs2/stack_user.c b/fs/ocfs2/stack_user.c
+index d2fb97b173da..5ece21419f83 100644
+--- a/fs/ocfs2/stack_user.c
++++ b/fs/ocfs2/stack_user.c
+@@ -981,7 +981,7 @@ static const struct dlm_lockspace_ops ocfs2_ls_ops = {
+ static int user_cluster_disconnect(struct ocfs2_cluster_connection *conn)
+ {
+ 	version_unlock(conn);
+-	dlm_release_lockspace(conn->cc_lockspace, 2);
++	dlm_release_lockspace(conn->cc_lockspace, DLM_RELEASE_NORMAL);
+ 	conn->cc_lockspace = NULL;
+ 	ocfs2_live_connection_drop(conn->cc_private);
+ 	conn->cc_private = NULL;
+diff --git a/include/linux/dlm.h b/include/linux/dlm.h
+index d02da2c6fc1a..3a782f898820 100644
+--- a/include/linux/dlm.h
++++ b/include/linux/dlm.h
+@@ -87,13 +87,37 @@ int dlm_new_lockspace(const char *name, const char *cluster,
+ 		      const struct dlm_lockspace_ops *ops, void *ops_arg,
+ 		      int *ops_result, dlm_lockspace_t **lockspace);
+ 
++/*
++ * dlm_release_lockspace() release_option values:
++ *
++ * DLM_RELEASE_NO_LOCKS returns -EBUSY if any locks (lkb's)
++ *   exist in the local lockspace.
++ *
++ * DLM_RELEASE_UNUSED previous value that is no longer used.
++ *
++ * DLM_RELEASE_NORMAL releases the lockspace regardless of any
++ *   locks managed in the local lockspace.
++ *
++ * DLM_RELEASE_NO_EVENT release the lockspace regardless of any
++ *   locks managed in the local lockspace, and does not submit
++ *   a leave event to the cluster manager, so other nodes will
++ *   not be notified that the node should be removed from the
++ *   list of lockspace members.
++ */
++#define DLM_RELEASE_NO_LOCKS		0
++#define DLM_RELEASE_UNUSED		1
++#define DLM_RELEASE_NORMAL		2
++#define DLM_RELEASE_NO_EVENT		3
++
+ /*
+  * dlm_release_lockspace
+  *
+  * Stop a lockspace.
++ *
++ * release_option: see DLM_RELEASE values above.
+  */
+ 
+-int dlm_release_lockspace(dlm_lockspace_t *lockspace, int force);
++int dlm_release_lockspace(dlm_lockspace_t *lockspace, int release_option);
+ 
+ /*
+  * dlm_lock
