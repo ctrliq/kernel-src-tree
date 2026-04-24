@@ -1039,7 +1039,8 @@ static void tcp_v4_timewait_ack(struct sock *sk, struct sk_buff *skb)
 			}
 
 			if (aoh)
-				key.ao_key = tcp_ao_established_key(ao_info, aoh->rnext_keyid, -1);
+				key.ao_key = tcp_ao_established_key(sk, ao_info,
+								    aoh->rnext_keyid, -1);
 		}
 	}
 	if (key.ao_key) {
