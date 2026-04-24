@@ -6354,8 +6354,10 @@ static int mediated_pmu_account_event(struct perf_event *event)
 	if (!is_include_guest_event(event))
 		return 0;
 
-	guard(mutex)(&perf_mediated_pmu_mutex);
+	if (atomic_inc_not_zero(&nr_include_guest_events))
+		return 0;
 
+	guard(mutex)(&perf_mediated_pmu_mutex);
 	if (atomic_read(&nr_mediated_pmu_vms))
 		return -EOPNOTSUPP;
 
@@ -6366,6 +6368,9 @@ static int mediated_pmu_account_event(struct perf_event *event)
 static void mediated_pmu_unaccount_event(struct perf_event *event)
 {
 	if (!is_include_guest_event(event))
+		return;
+
+	if (WARN_ON_ONCE(!atomic_read(&nr_include_guest_events)))
 		return;
 
 	atomic_dec(&nr_include_guest_events);
@@ -6383,10 +6388,10 @@ static void mediated_pmu_unaccount_event(struct perf_event *event)
  */
 int perf_create_mediated_pmu(void)
 {
-	guard(mutex)(&perf_mediated_pmu_mutex);
 	if (atomic_inc_not_zero(&nr_mediated_pmu_vms))
 		return 0;
 
+	guard(mutex)(&perf_mediated_pmu_mutex);
 	if (atomic_read(&nr_include_guest_events))
 		return -EBUSY;
 
