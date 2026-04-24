@@ -126,7 +126,7 @@ int vfio_pci_dma_buf_iommufd_map(struct dma_buf_attachment *attachment,
 	*phys = priv->phys_vec[0];
 	return 0;
 }
-EXPORT_SYMBOL_GPL_FOR_MODULES(vfio_pci_dma_buf_iommufd_map, "iommufd");
+EXPORT_SYMBOL_FOR_MODULES(vfio_pci_dma_buf_iommufd_map, "iommufd");
 
 int vfio_pci_core_fill_phys_vec(struct phys_vec *phys_vec,
 				struct vfio_region_dma_range *dma_ranges,
