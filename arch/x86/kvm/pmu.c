@@ -1303,6 +1303,7 @@ static void kvm_pmu_load_guest_pmcs(struct kvm_vcpu *vcpu)
 	struct kvm_pmu *pmu = vcpu_to_pmu(vcpu);
 	struct kvm_pmc *pmc;
 	u32 i;
+	u64 tmp;
 
 	/*
 	 * No need to zero out unexposed GP/fixed counters/selectors since RDPMC
@@ -1312,13 +1313,17 @@ static void kvm_pmu_load_guest_pmcs(struct kvm_vcpu *vcpu)
 	for (i = 0; i < pmu->nr_arch_gp_counters; i++) {
 		pmc = &pmu->gp_counters[i];
 
-		wrmsrl(gp_counter_msr(i), pmc->counter);
+		rdpmcl(i, tmp);
+		if (pmc->counter != tmp)
+			wrmsrl(gp_counter_msr(i), pmc->counter);
 		wrmsrl(gp_eventsel_msr(i), pmc->eventsel_hw);
 	}
 	for (i = 0; i < pmu->nr_arch_fixed_counters; i++) {
 		pmc = &pmu->fixed_counters[i];
 
-		wrmsrl(fixed_counter_msr(i), pmc->counter);
+		rdpmcl(INTEL_PMC_FIXED_RDPMC_BASE | i, tmp);
+		if (pmc->counter != tmp)
+			wrmsrl(fixed_counter_msr(i), pmc->counter);
 	}
 }
 
