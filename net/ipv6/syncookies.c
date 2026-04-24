@@ -142,7 +142,6 @@ struct sock *cookie_v6_check(struct sock *sk, struct sk_buff *skb)
 	__u8 rcv_wscale;
 	u32 tsoff = 0;
 	SKB_DR(reason);
-	int l3index;
 
 	if (!READ_ONCE(net->ipv4.sysctl_tcp_syncookies) ||
 	    !th->ack || th->rst)
@@ -178,8 +177,7 @@ struct sock *cookie_v6_check(struct sock *sk, struct sk_buff *skb)
 	if (!cookie_timestamp_decode(net, &tcp_opt))
 		goto out;
 
-	req = cookie_tcp_reqsk_alloc(&tcp6_request_sock_ops,
-				     &tcp_request_sock_ipv6_ops, sk, skb);
+	req = cookie_tcp_reqsk_alloc(&tcp6_request_sock_ops, sk, skb);
 	if (!req) {
 		SKB_DR_SET(reason, NO_SOCKET);
 		goto out_drop;
@@ -226,8 +224,7 @@ struct sock *cookie_v6_check(struct sock *sk, struct sk_buff *skb)
 	treq->ts_off = 0;
 	treq->txhash = net_tx_rndhash();
 
-	l3index = l3mdev_master_ifindex_by_index(net, ireq->ir_iif);
-	tcp_ao_syncookie(sk, skb, treq, AF_INET6, l3index);
+	tcp_ao_syncookie(sk, skb, req, AF_INET6);
 
 	if (IS_ENABLED(CONFIG_SMC))
 		ireq->smc_ok = 0;
