@@ -330,6 +330,7 @@ void hmac_sha224_usingrawkey(const u8 *raw_key, size_t raw_key_len,
  */
 struct sha256_ctx {
 	struct __sha256_ctx ctx;
+	bool fips_approved;
 };
 
 /**
@@ -413,6 +414,7 @@ bool sha256_finup_2x_is_optimized(void);
  */
 struct hmac_sha256_key {
 	struct __hmac_sha256_key key;
+	bool fips_approved;
 };
 
 /**
@@ -421,6 +423,7 @@ struct hmac_sha256_key {
  */
 struct hmac_sha256_ctx {
 	struct __hmac_sha256_ctx ctx;
+	bool fips_approved;
 };
 
 /**
@@ -450,6 +453,7 @@ static inline void hmac_sha256_init(struct hmac_sha256_ctx *ctx,
 				    const struct hmac_sha256_key *key)
 {
 	__hmac_sha256_init(&ctx->ctx, &key->key);
+	ctx->fips_approved = key->fips_approved;
 }
 
 /**
