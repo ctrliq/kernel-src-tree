@@ -52,6 +52,8 @@ void blk_set_stacking_limits(struct queue_limits *lim)
 	lim->max_sectors = UINT_MAX;
 	lim->max_dev_sectors = UINT_MAX;
 	lim->max_write_zeroes_sectors = UINT_MAX;
+	lim->max_hw_wzeroes_unmap_sectors = UINT_MAX;
+	lim->max_user_wzeroes_unmap_sectors = UINT_MAX;
 	lim->max_hw_zone_append_sectors = UINT_MAX;
 	lim->max_user_discard_sectors = UINT_MAX;
 	lim->atomic_write_hw_max = UINT_MAX;
@@ -432,6 +434,12 @@ int blk_validate_limits(struct queue_limits *lim)
 	if (!lim->max_segments)
 		lim->max_segments = BLK_MAX_SEGMENTS;
 
+	if (lim->max_hw_wzeroes_unmap_sectors &&
+	    lim->max_hw_wzeroes_unmap_sectors != lim->max_write_zeroes_sectors)
+		return -EINVAL;
+	lim->max_wzeroes_unmap_sectors = min(lim->max_hw_wzeroes_unmap_sectors,
+			lim->max_user_wzeroes_unmap_sectors);
+
 	lim->max_discard_sectors =
 		min(lim->max_hw_discard_sectors, lim->max_user_discard_sectors);
 
@@ -524,10 +532,11 @@ int blk_set_default_limits(struct queue_limits *lim)
 {
 	/*
 	 * Most defaults are set by capping the bounds in blk_validate_limits,
-	 * but max_user_discard_sectors is special and needs an explicit
-	 * initialization to the max value here.
+	 * but these limits are special and need an explicit initialization to
+	 * the max value here.
 	 */
 	lim->max_user_discard_sectors = UINT_MAX;
+	lim->max_user_wzeroes_unmap_sectors = UINT_MAX;
 	return blk_validate_limits(lim);
 }
 
@@ -803,6 +812,13 @@ int blk_stack_limits(struct queue_limits *t, struct queue_limits *b,
 	t->max_dev_sectors = min_not_zero(t->max_dev_sectors, b->max_dev_sectors);
 	t->max_write_zeroes_sectors = min(t->max_write_zeroes_sectors,
 					b->max_write_zeroes_sectors);
+	t->max_user_wzeroes_unmap_sectors =
+			min(t->max_user_wzeroes_unmap_sectors,
+			    b->max_user_wzeroes_unmap_sectors);
+	t->max_hw_wzeroes_unmap_sectors =
+			min(t->max_hw_wzeroes_unmap_sectors,
+			    b->max_hw_wzeroes_unmap_sectors);
+
 	t->max_hw_zone_append_sectors = min(t->max_hw_zone_append_sectors,
 					b->max_hw_zone_append_sectors);
 
