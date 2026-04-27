@@ -158,6 +158,7 @@ EXPORT_SYMBOL_GPL(sha384_init);
 void sha512_init(struct sha512_ctx *ctx)
 {
 	__sha512_init(&ctx->ctx, &sha512_iv, 0);
+	ctx->fips_approved = fips_enabled;
 }
 EXPORT_SYMBOL_GPL(sha512_init);
 
@@ -300,6 +301,9 @@ void hmac_sha512_preparekey(struct hmac_sha512_key *key,
 {
 	__hmac_sha512_preparekey(&key->key.istate, &key->key.ostate,
 				 raw_key, raw_key_len, &sha512_iv);
+	key->fips_approved = fips_enabled;
+	if (fips_enabled && raw_key_len < 112 / 8)
+		key->fips_approved = false;
 }
 EXPORT_SYMBOL_GPL(hmac_sha512_preparekey);
 
@@ -331,6 +335,9 @@ void hmac_sha512_init_usingrawkey(struct hmac_sha512_ctx *ctx,
 				 raw_key, raw_key_len, &sha512_iv);
 	ctx->ctx.sha_ctx.bytecount_lo = SHA512_BLOCK_SIZE;
 	ctx->ctx.sha_ctx.bytecount_hi = 0;
+	ctx->fips_approved = fips_enabled;
+	if (fips_enabled && raw_key_len < 112 / 8)
+		ctx->fips_approved = false;
 }
 EXPORT_SYMBOL_GPL(hmac_sha512_init_usingrawkey);
 
