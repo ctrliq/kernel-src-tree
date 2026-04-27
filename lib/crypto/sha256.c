@@ -173,6 +173,11 @@ static void __sha256_init(struct __sha256_ctx *ctx,
 void sha224_init(struct sha224_ctx *ctx)
 {
 	__sha256_init(&ctx->ctx, &sha224_iv, 0);
+#ifndef __DISABLE_EXPORTS
+	ctx->fips_approved = fips_enabled;
+#else
+	ctx->fips_approved = false;
+#endif
 }
 EXPORT_SYMBOL_GPL(sha224_init);
 
@@ -363,6 +368,9 @@ void hmac_sha224_preparekey(struct hmac_sha224_key *key,
 {
 	__hmac_sha256_preparekey(&key->key.istate, &key->key.ostate,
 				 raw_key, raw_key_len, &sha224_iv);
+	key->fips_approved = fips_enabled;
+	if (fips_enabled && raw_key_len < 112 / 8)
+		key->fips_approved = false;
 }
 EXPORT_SYMBOL_GPL(hmac_sha224_preparekey);
 
@@ -388,6 +396,9 @@ void hmac_sha224_init_usingrawkey(struct hmac_sha224_ctx *ctx,
 	__hmac_sha256_preparekey(&ctx->ctx.sha_ctx.state, &ctx->ctx.ostate,
 				 raw_key, raw_key_len, &sha224_iv);
 	ctx->ctx.sha_ctx.bytecount = SHA256_BLOCK_SIZE;
+	ctx->fips_approved = fips_enabled;
+	if (fips_enabled && raw_key_len < 112 / 8)
+		ctx->fips_approved = false;
 }
 EXPORT_SYMBOL_GPL(hmac_sha224_init_usingrawkey);
 
