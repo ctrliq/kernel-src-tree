@@ -24,6 +24,7 @@ struct sha1_state {
 	u32 state[SHA1_DIGEST_SIZE / 4];
 	u64 count;
 	u8 buffer[SHA1_BLOCK_SIZE];
+	bool fips_approved;
 };
 
 /*
@@ -51,6 +52,7 @@ struct sha1_ctx {
 	struct sha1_block_state state;
 	u64 bytecount;
 	u8 buf[SHA1_BLOCK_SIZE];
+	bool fips_approved;
 };
 
 /**
@@ -104,6 +106,7 @@ void sha1(const u8 *data, size_t len, u8 out[SHA1_DIGEST_SIZE]);
 struct hmac_sha1_key {
 	struct sha1_block_state istate;
 	struct sha1_block_state ostate;
+	bool fips_approved;
 };
 
 /**
@@ -114,6 +117,7 @@ struct hmac_sha1_key {
 struct hmac_sha1_ctx {
 	struct sha1_ctx sha_ctx;
 	struct sha1_block_state ostate;
+	bool fips_approved;
 };
 
 /**
