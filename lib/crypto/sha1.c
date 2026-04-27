@@ -164,6 +164,7 @@ void sha1_init(struct sha1_ctx *ctx)
 {
 	ctx->state = sha1_iv;
 	ctx->bytecount = 0;
+	ctx->fips_approved = fips_enabled;
 }
 EXPORT_SYMBOL_GPL(sha1_init);
 
@@ -269,6 +270,9 @@ void hmac_sha1_preparekey(struct hmac_sha1_key *key,
 {
 	__hmac_sha1_preparekey(&key->istate, &key->ostate,
 			       raw_key, raw_key_len);
+	key->fips_approved = fips_enabled;
+	if (fips_enabled && raw_key_len < 112 / 8)
+		key->fips_approved = false;
 }
 EXPORT_SYMBOL_GPL(hmac_sha1_preparekey);
 
@@ -276,6 +280,8 @@ void hmac_sha1_init(struct hmac_sha1_ctx *ctx, const struct hmac_sha1_key *key)
 {
 	ctx->sha_ctx.state = key->istate;
 	ctx->sha_ctx.bytecount = SHA1_BLOCK_SIZE;
+	ctx->sha_ctx.fips_approved = key->fips_approved;
+	ctx->fips_approved = key->fips_approved;
 	ctx->ostate = key->ostate;
 }
 EXPORT_SYMBOL_GPL(hmac_sha1_init);
@@ -286,6 +292,10 @@ void hmac_sha1_init_usingrawkey(struct hmac_sha1_ctx *ctx,
 	__hmac_sha1_preparekey(&ctx->sha_ctx.state, &ctx->ostate,
 			       raw_key, raw_key_len);
 	ctx->sha_ctx.bytecount = SHA1_BLOCK_SIZE;
+	ctx->fips_approved = fips_enabled;
+	if (fips_enabled && raw_key_len < 112 / 8)
+		ctx->fips_approved = false;
+	ctx->sha_ctx.fips_approved = ctx->fips_approved;
 }
 EXPORT_SYMBOL_GPL(hmac_sha1_init_usingrawkey);
 
