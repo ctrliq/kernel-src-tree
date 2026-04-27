@@ -26,6 +26,7 @@ struct crypto_aes_ctx {
 	u32 key_enc[AES_MAX_KEYLENGTH_U32];
 	u32 key_dec[AES_MAX_KEYLENGTH_U32];
 	u32 key_length;
+	bool fips_approved;
 };
 
 extern const u32 crypto_ft_tab[4][256] ____cacheline_aligned;
