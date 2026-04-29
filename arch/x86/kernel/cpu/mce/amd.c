@@ -662,7 +662,7 @@ static void disable_err_thresholding(struct cpuinfo_x86 *c, unsigned int bank)
 		return;
 	}
 
-	rdmsrl(MSR_K7_HWCR, hwcr);
+	rdmsrq(MSR_K7_HWCR, hwcr);
 
 	/* McStatusWrEn has to be set */
 	need_toggle = !(hwcr & BIT(18));
@@ -804,10 +804,10 @@ static void __log_error(unsigned int bank, u64 status, u64 addr, u64 misc)
 	}
 
 	if (mce_flags.smca) {
-		rdmsrl(MSR_AMD64_SMCA_MCx_IPID(bank), m.ipid);
+		rdmsrq(MSR_AMD64_SMCA_MCx_IPID(bank), m.ipid);
 
 		if (m.status & MCI_STATUS_SYNDV)
-			rdmsrl(MSR_AMD64_SMCA_MCx_SYND(bank), m.synd);
+			rdmsrq(MSR_AMD64_SMCA_MCx_SYND(bank), m.synd);
 	}
 
 	mce_log(&m);
@@ -830,12 +830,12 @@ _log_error_bank(unsigned int bank, u32 msr_stat, u32 msr_addr, u64 misc)
 {
 	u64 status, addr = 0;
 
-	rdmsrl(msr_stat, status);
+	rdmsrq(msr_stat, status);
 	if (!(status & MCI_STATUS_VAL))
 		return false;
 
 	if (status & MCI_STATUS_ADDRV)
-		rdmsrl(msr_addr, addr);
+		rdmsrq(msr_addr, addr);
 
 	__log_error(bank, status, addr, misc);
 
