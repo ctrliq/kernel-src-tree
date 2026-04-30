@@ -1102,7 +1102,7 @@ options that can be passed to Linux kernel modules at load time.
 Summary: Header files for the Linux kernel for use by glibc
 Obsoletes: glibc-kernheaders < 3.0-46
 Provides: glibc-kernheaders = 3.0-46
-Conflicts: kernel-headers
+Provides: kernel-headers = %{specversion}-%{release}
 %description headers
 Kernel-headers includes the C header files that specify the interface
 between the Linux kernel and userspace libraries and programs.  The
@@ -1113,7 +1113,6 @@ glibc package.
 %package cross-headers
 Summary: Header files for the Linux kernel for use by cross-glibc
 Provides: kernel-cross-headers = %{specversion}-%{release}
-Conflicts: kernel-cross-headers
 %description cross-headers
 Kernel-cross-headers includes the C header files that specify the interface
 between the Linux kernel and userspace libraries and programs.  The
@@ -1371,6 +1370,8 @@ This is required to use SystemTap with %{name}%{?1:-%{1}}-%{KVERREL}.\
 Summary: Development package for building kernel modules to match the %{?2:%{2} }kernel\
 Provides: %{name}%{?1:-%{1}}-devel-%{_target_cpu} = %{specversion}-%{release}\
 Provides: %{name}-devel-%{_target_cpu} = %{specversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
+Provides: kernel-devel = %{specversion}-%{release}\
+Provides: kernel-devel-%{_target_cpu} = %{specversion}-%{release}\
 Provides: kernel-devel-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
 Provides: %{name}-devel-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
 Provides: installonlypkg(kernel)\
