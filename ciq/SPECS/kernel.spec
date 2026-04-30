@@ -161,12 +161,12 @@ Summary: The Linux kernel
 #  the --with-release option overrides this setting.)
 %define debugbuildsenabled 1
 %define buildid .1.0.0
-%define specrpmversion 6.12.78
-%define specversion 6.12.78
+%define specrpmversion 6.12.85
+%define specversion 6.12.85
 %define patchversion 6.12
 %define pkgrelease 1.1.0.0
 %define kversion 6
-%define tarfile_release 6.12.78-1.1.0.0.el9_clk
+%define tarfile_release 6.12.85-1.1.el9_clk
 # This is needed to do merge window version magic
 %define patchlevel 12
 # This allows pkg_release to have configurable %%{?dist} tag
@@ -4087,8 +4087,13 @@ fi\
 #
 #
 %changelog
-* Thu Mar 26 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.12.78-1.1.0.0.el9_clk
--- Rebased changes for Linux 6.12.78 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.12.78-1)
+* Thu Apr 30 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.12.85-1.1.el9_clk
+-- Rebased changes for Linux 6.12.85 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.12.85-1)
+-- github actions: add RPM build workflow for x86_64 and aarch64 (Brett Mastbergen)
+-- spec: update branding in package descriptions and log messages (Brett Mastbergen)
+-- github actions: Trigger kernelCI on ciq-6.12.y-next branches (Brett Mastbergen)
+-- github actions: Use trigger for kernelCI (Brett Mastbergen)
+-- [CIQ] v6.12.78 - updated spec (github-actions[bot])
 -- [CIQ] v6.12.78 - rebased configs (github-actions[bot])
 -- github actions: Inherit the Kernel CI Automated workflow from main (Brett Mastbergen)
 -- [CIQ] v6.12.77 - updated spec (github-actions[bot])
@@ -4124,8 +4129,7 @@ fi\
 -- arm64: add kernel config option to lock down when in Secure Boot mode (Linn Crosetto)
 -- github actions: Make Builds on Merge Request Work (Jonathan Maple)
 -- Add CIQ configs (Jonathan Maple)
-
--- Linux 6.12.78 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.12.78)
+-- Linux 6.12.85 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.12.85)
 
 
 ###
