@@ -1605,6 +1605,10 @@ static unsigned int fib6_mtu(const struct fib6_result *res)
 
 		rcu_read_lock();
 		idev = __in6_dev_get(dev);
+		if (!idev) {
+			rcu_read_unlock();
+			return 0;
+		}
 		mtu = READ_ONCE(idev->cnf.mtu6);
 		rcu_read_unlock();
 	}
