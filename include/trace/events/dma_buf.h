@@ -21,7 +21,7 @@ DECLARE_EVENT_CLASS(dma_buf,
 	),
 
 	TP_fast_assign(
-		__assign_str(exp_name);
+		__assign_str(exp_name, dmabuf->exp_name);
 		__entry->size	= dmabuf->size;
 		__entry->ino	= dmabuf->file->f_inode->i_ino;
 	),
@@ -49,8 +49,8 @@ DECLARE_EVENT_CLASS(dma_buf_attach_dev,
 	),
 
 	TP_fast_assign(
-		__assign_str(dev_name);
-		__assign_str(exp_name);
+		__assign_str(dev_name, dev_name(dev));
+		__assign_str(exp_name, dmabuf->exp_name);
 		__entry->size		= dmabuf->size;
 		__entry->ino		= dmabuf->file->f_inode->i_ino;
 		__entry->is_dynamic	= is_dynamic;
@@ -80,7 +80,7 @@ DECLARE_EVENT_CLASS(dma_buf_fd,
 	),
 
 	TP_fast_assign(
-		__assign_str(exp_name);
+		__assign_str(exp_name, dmabuf->exp_name);
 		__entry->size	= dmabuf->size;
 		__entry->ino	= dmabuf->file->f_inode->i_ino;
 		__entry->fd	= fd;
