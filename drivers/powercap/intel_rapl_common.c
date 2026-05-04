@@ -2031,15 +2031,13 @@ end:
 	return ret;
 }
 
-int rapl_package_add_pmu(struct rapl_package *rp)
+int rapl_package_add_pmu_locked(struct rapl_package *rp)
 {
 	struct rapl_package_pmu_data *data = &rp->pmu_data;
 	int idx;
 
 	if (rp->has_pmu)
 		return -EEXIST;
-
-	guard(cpus_read_lock)();
 
 	for (idx = 0; idx < rp->nr_domains; idx++) {
 		struct rapl_domain *rd = &rp->domains[idx];
@@ -2090,16 +2088,22 @@ int rapl_package_add_pmu(struct rapl_package *rp)
 
 	return rapl_pmu_update(rp);
 }
+EXPORT_SYMBOL_GPL(rapl_package_add_pmu_locked);
+
+int rapl_package_add_pmu(struct rapl_package *rp)
+{
+	guard(cpus_read_lock)();
+
+	return rapl_package_add_pmu_locked(rp);
+}
 EXPORT_SYMBOL_GPL(rapl_package_add_pmu);
 
-void rapl_package_remove_pmu(struct rapl_package *rp)
+void rapl_package_remove_pmu_locked(struct rapl_package *rp)
 {
 	struct rapl_package *pos;
 
 	if (!rp->has_pmu)
 		return;
-
-	guard(cpus_read_lock)();
 
 	list_for_each_entry(pos, &rapl_packages, plist) {
 		/* PMU is still needed */
@@ -2109,6 +2113,14 @@ void rapl_package_remove_pmu(struct rapl_package *rp)
 
 	perf_pmu_unregister(&rapl_pmu.pmu);
 	memset(&rapl_pmu, 0, sizeof(struct rapl_pmu));
+}
+EXPORT_SYMBOL_GPL(rapl_package_remove_pmu_locked);
+
+void rapl_package_remove_pmu(struct rapl_package *rp)
+{
+	guard(cpus_read_lock)();
+
+	rapl_package_remove_pmu_locked(rp);
 }
 EXPORT_SYMBOL_GPL(rapl_package_remove_pmu);
 #endif
