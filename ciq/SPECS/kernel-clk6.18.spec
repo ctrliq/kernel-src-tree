@@ -4492,6 +4492,40 @@ fi\
 #
 #
 %changelog
+* Tue May 05 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.22-2.1.el9
+-- configs: enable legacy iptables/ip6tables support for all architectures (Brett Mastbergen)
+-- Add CONFIG_CRYPTO_FIPS_CUSTOM_VERSION=y, CONFIG_CRYPTO_FIPS_VERSION="ciq.6.18.20260531" (Jeremy Allison)
+-- Add fips_approved indicator to struct crypto_aes_ctx. (Jeremy Allison)
+-- Add fips_approved flag to SHA512 and HMAC-SHA512 structs. (Jeremy Allison)
+-- Add fips_approved flag to SHA384 and HMAC-SHA384 structs. (Jeremy Allison)
+-- Add fips_approved flag to SHA256 and HMAC-SHA256 structs. (Jeremy Allison)
+-- Add fips_approved flag to SHA224 and HMAC-SHA224 structs. (Jeremy Allison)
+-- Add fips_approved flag to SHA1 and HMAC-SHA1 structs. (Jeremy Allison)
+-- In crypto_kdf108_ctr_generate() there is no minimum length check for the digest to be generated - it must be at least 112 bits. (Jeremy Allison)
+-- dh_compute_value misses the check SP800-56Arev3, 5.6.2.1.4 which is typically implemented after dh_is_pubkey_valid. (Jeremy Allison)
+-- Change CONFIG_CRYPTO_JITTERENTROPY_OSR from 1 to 3 in all configs. (Jeremy Allison)
+-- When in fips mode, self-test errors must panic. (Jeremy Allison)
+-- When in fips mode, self-test errors must panic. (Jeremy Allison)
+-- crypto: testmgr - block Crypto API xxhash64 in FIPS mode (Jeremy Allison)
+-- btrfs: switch to library APIs for checksums (Jeremy Allison)
+-- lib/crypto: blake2b: Add BLAKE2b library functions (Jeremy Allison)
+-- byteorder: Add le64_to_cpu_array() and cpu_to_le64_array() (Eric Biggers)
+-- lib/crypto: Add FIPS self-tests for SHA-1 and SHA-2 (Eric Biggers)
+-- crypto: rng - Implement fast per-CPU DRBG instances (Sultan Alsawaf)
+-- crypto: rng - Fix priority inversions due to mutex locks (Sultan Alsawaf)
+-- crypto: rng - Convert crypto_default_rng_refcnt into an unsigned int (Sultan Alsawaf)
+-- mm/gup: introduce pin_user_pages_fast_only() (Sultan Alsawaf)
+-- crypto: drbg - Align buffers to at least a cache line (Sultan Alsawaf)
+-- In essiv_aead_setkey(), use the same logic as crypto_authenc_esn_setkey() to zeroize keys on exit. converting ws (Jason Rodriguez)
+-- SUSE: patch: crypto-ecdh-implement-FIPS-PCT.patch (Jeremy Allison)
+-- not upstream: Disable vdso getrandom when FIPS is enabled (Jeremy Allison)
+-- crypto: rng - Override drivers/char/random in FIPS mode (Jeremy Allison)
+-- random: Add hook to override device reads and getrandom(2) (Jeremy Allison)
+-- github actions: add RPM build workflow for x86_64 and aarch64 (Brett Mastbergen)
+-- spec: update branding in package descriptions and log messages (Brett Mastbergen)
+-- [CIQ] ciq_kernel-6.18.22-2 - updated spec (Brett Mastbergen)
+-- spec: Fix posttrans script to handle noarch package expansion (Brett Mastbergen)
+
 * Mon Apr 20 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.22-2.1.el9
 -- spec: Fix posttrans script to handle noarch package expansion (Brett Mastbergen)
 
