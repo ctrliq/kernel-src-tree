@@ -20,7 +20,7 @@ struct file *shmem_create_from_data(const char *name, void *data, size_t len)
 	int err;
 
 	file = shmem_file_setup(name, PAGE_ALIGN(len),
-				mk_vma_flags(VMA_NORESERVE_BIT));
+				VM_NORESERVE);
 	if (IS_ERR(file))
 		return file;
 

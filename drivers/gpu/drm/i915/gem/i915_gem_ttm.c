@@ -201,7 +201,7 @@ static int i915_ttm_tt_shmem_populate(struct ttm_device *bdev,
 		gfp_t mask;
 
 		filp = shmem_file_setup("i915-shmem-tt", size,
-					mk_vma_flags(VMA_NORESERVE_BIT));
+					VM_NORESERVE);
 		if (IS_ERR(filp))
 			return PTR_ERR(filp);
 
