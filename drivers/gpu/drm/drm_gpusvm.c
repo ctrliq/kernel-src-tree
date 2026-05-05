@@ -825,7 +825,7 @@ retry:
 		page = hmm_pfn_to_page(pfns[i]);
 		if (is_device_private_page(page) ||
 		    is_device_coherent_page(page))
-			cur = page_pgmap(page);
+			cur = page->pgmap;
 
 		if (cur == pagemap) {
 			new_state = DRM_GPUSVM_SCAN_EQUAL;
