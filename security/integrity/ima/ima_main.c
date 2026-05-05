@@ -206,7 +206,7 @@ static void ima_file_free(struct file *file)
 }
 
 static int process_measurement(struct file *file, const struct cred *cred,
-			       u32 secid, char *buf, loff_t size, int mask,
+			       struct lsm_prop *prop, char *buf, loff_t size, int mask,
 			       enum ima_hooks func,
 			       enum kernel_read_file_id read_id)
 {
@@ -233,7 +233,7 @@ static int process_measurement(struct file *file, const struct cred *cred,
 	 * bitmask based on the appraise/audit/measurement policy.
 	 * Included is the appraise submask.
 	 */
-	action = ima_get_action(file_mnt_idmap(file), inode, cred, secid,
+	action = ima_get_action(file_mnt_idmap(file), inode, cred, prop,
 				mask, func, &pcr, &template_desc, NULL,
 				&allowed_algos);
 	violation_check = ((func == FILE_CHECK || func == MMAP_CHECK ||
@@ -450,23 +450,23 @@ out:
 static int ima_file_mmap(struct file *file, unsigned long reqprot,
 			 unsigned long prot, unsigned long flags)
 {
-	u32 secid;
+	struct lsm_prop prop;
 	int ret;
 
 	if (!file)
 		return 0;
 
-	security_current_getsecid_subj(&secid);
+	security_current_getlsmprop_subj(&prop);
 
 	if (reqprot & PROT_EXEC) {
-		ret = process_measurement(file, current_cred(), secid, NULL,
+		ret = process_measurement(file, current_cred(), &prop, NULL,
 					  0, MAY_EXEC, MMAP_CHECK_REQPROT, 0);
 		if (ret)
 			return ret;
 	}
 
 	if (prot & PROT_EXEC)
-		return process_measurement(file, current_cred(), secid, NULL,
+		return process_measurement(file, current_cred(), &prop, NULL,
 					   0, MAY_EXEC, MMAP_CHECK, 0);
 
 	return 0;
@@ -495,9 +495,9 @@ static int ima_file_mprotect(struct vm_area_struct *vma, unsigned long reqprot,
 	char *pathbuf = NULL;
 	const char *pathname = NULL;
 	struct inode *inode;
+	struct lsm_prop prop;
 	int result = 0;
 	int action;
-	u32 secid;
 	int pcr;
 
 	/* Is mprotect making an mmap'ed file executable? */
@@ -505,13 +505,13 @@ static int ima_file_mprotect(struct vm_area_struct *vma, unsigned long reqprot,
 	    !(prot & PROT_EXEC) || (vma->vm_flags & VM_EXEC))
 		return 0;
 
-	security_current_getsecid_subj(&secid);
+	security_current_getlsmprop_subj(&prop);
 	inode = file_inode(vma->vm_file);
 	action = ima_get_action(file_mnt_idmap(vma->vm_file), inode,
-				current_cred(), secid, MAY_EXEC, MMAP_CHECK,
+				current_cred(), &prop, MAY_EXEC, MMAP_CHECK,
 				&pcr, &template, NULL, NULL);
 	action |= ima_get_action(file_mnt_idmap(vma->vm_file), inode,
-				 current_cred(), secid, MAY_EXEC,
+				 current_cred(), &prop, MAY_EXEC,
 				 MMAP_CHECK_REQPROT, &pcr, &template, NULL,
 				 NULL);
 
@@ -548,16 +548,16 @@ static int ima_file_mprotect(struct vm_area_struct *vma, unsigned long reqprot,
 static int ima_bprm_check(struct linux_binprm *bprm)
 {
 	int ret;
-	u32 secid;
+	struct lsm_prop prop;
 
-	security_current_getsecid_subj(&secid);
-	ret = process_measurement(bprm->file, current_cred(), secid, NULL, 0,
+	security_current_getlsmprop_subj(&prop);
+	ret = process_measurement(bprm->file, current_cred(), &prop, NULL, 0,
 				  MAY_EXEC, BPRM_CHECK, 0);
 	if (ret)
 		return ret;
 
-	security_cred_getsecid(bprm->cred, &secid);
-	return process_measurement(bprm->file, bprm->cred, secid, NULL, 0,
+	security_cred_getlsmprop(bprm->cred, &prop);
+	return process_measurement(bprm->file, bprm->cred, &prop, NULL, 0,
 				   MAY_EXEC, CREDS_CHECK, 0);
 }
 
@@ -573,10 +573,10 @@ static int ima_bprm_check(struct linux_binprm *bprm)
  */
 static int ima_file_check(struct file *file, int mask)
 {
-	u32 secid;
+	struct lsm_prop prop;
 
-	security_current_getsecid_subj(&secid);
-	return process_measurement(file, current_cred(), secid, NULL, 0,
+	security_current_getlsmprop_subj(&prop);
+	return process_measurement(file, current_cred(), &prop, NULL, 0,
 				   mask & (MAY_READ | MAY_WRITE | MAY_EXEC |
 					   MAY_APPEND), FILE_CHECK, 0);
 }
@@ -775,7 +775,7 @@ static int ima_read_file(struct file *file, enum kernel_read_file_id read_id,
 			 bool contents)
 {
 	enum ima_hooks func;
-	u32 secid;
+	struct lsm_prop prop;
 
 	/*
 	 * Do devices using pre-allocated memory run the risk of the
@@ -795,8 +795,8 @@ static int ima_read_file(struct file *file, enum kernel_read_file_id read_id,
 
 	/* Read entire file for all partial reads. */
 	func = read_idmap[read_id] ?: FILE_CHECK;
-	security_current_getsecid_subj(&secid);
-	return process_measurement(file, current_cred(), secid, NULL,
+	security_current_getlsmprop_subj(&prop);
+	return process_measurement(file, current_cred(), &prop, NULL,
 				   0, MAY_READ, func, 0);
 }
 
@@ -826,7 +826,7 @@ static int ima_post_read_file(struct file *file, char *buf, loff_t size,
 			      enum kernel_read_file_id read_id)
 {
 	enum ima_hooks func;
-	u32 secid;
+	struct lsm_prop prop;
 
 	/* permit signed certs */
 	if (!file && read_id == READING_X509_CERTIFICATE)
@@ -839,8 +839,8 @@ static int ima_post_read_file(struct file *file, char *buf, loff_t size,
 	}
 
 	func = read_idmap[read_id] ?: FILE_CHECK;
-	security_current_getsecid_subj(&secid);
-	return process_measurement(file, current_cred(), secid, buf, size,
+	security_current_getlsmprop_subj(&prop);
+	return process_measurement(file, current_cred(), &prop, buf, size,
 				   MAY_READ, func, read_id);
 }
 
@@ -975,7 +975,7 @@ int process_buffer_measurement(struct mnt_idmap *idmap,
 	int digest_hash_len = hash_digest_size[ima_hash_algo];
 	int violation = 0;
 	int action = 0;
-	u32 secid;
+	struct lsm_prop prop;
 
 	if (digest && digest_len < digest_hash_len)
 		return -EINVAL;
@@ -998,9 +998,9 @@ int process_buffer_measurement(struct mnt_idmap *idmap,
 	 * buffer measurements.
 	 */
 	if (func) {
-		security_current_getsecid_subj(&secid);
+		security_current_getlsmprop_subj(&prop);
 		action = ima_get_action(idmap, inode, current_cred(),
-					secid, 0, func, &pcr, &template,
+					&prop, 0, func, &pcr, &template,
 					func_data, NULL);
 		if (!(action & IMA_MEASURE) && !digest)
 			return -ENOENT;
