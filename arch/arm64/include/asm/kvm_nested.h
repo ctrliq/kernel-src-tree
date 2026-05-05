@@ -320,6 +320,7 @@ struct s1_walk_info {
 	bool	     		be;
 	bool	     		s2;
 	bool			pa52bit;
+	bool			ha;
 };
 
 struct s1_walk_result {
@@ -363,11 +364,15 @@ int kvm_vcpu_allocate_vncr_tlb(struct kvm_vcpu *vcpu);
 int kvm_handle_vncr_abort(struct kvm_vcpu *vcpu);
 void kvm_handle_s1e2_tlbi(struct kvm_vcpu *vcpu, u32 inst, u64 val);
 
+u16 get_asid_by_regime(struct kvm_vcpu *vcpu, enum trans_regime regime);
+
 #define vncr_fixmap(c)						\
 	({							\
 		u32 __c = (c);					\
 		BUG_ON(__c >= NR_CPUS);				\
 		(FIX_VNCR - __c);				\
 	})
+
+int __kvm_at_swap_desc(struct kvm *kvm, gpa_t ipa, u64 old, u64 new);
 
 #endif /* __ARM64_KVM_NESTED_H */
