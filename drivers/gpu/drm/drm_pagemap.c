@@ -561,7 +561,7 @@ int drm_pagemap_migrate_to_devmem(struct drm_pagemap_devmem *devmem_allocation,
 		unsigned long nr_pages = src_page ? NR_PAGES(folio_order(page_folio(src_page))) : 1;
 
 		if (src_page && is_zone_device_page(src_page)) {
-			if (page_pgmap(src_page) == pagemap)
+			if (src_page->pgmap == pagemap)
 				own_pages += nr_pages;
 		}
 
@@ -595,7 +595,7 @@ int drm_pagemap_migrate_to_devmem(struct drm_pagemap_devmem *devmem_allocation,
 		if (src_page && is_device_private_page(src_page)) {
 			struct drm_pagemap_zdd *src_zdd = src_page->zone_device_data;
 
-			if (page_pgmap(src_page) == pagemap &&
+			if (src_page->pgmap == pagemap &&
 			    !mdetails->can_migrate_same_pagemap) {
 				migrate.dst[i] = 0;
 				own_pages++;
@@ -1041,7 +1041,7 @@ static int __drm_pagemap_migrate_to_ram(struct vm_area_struct *vas,
 {
 	struct migrate_vma migrate = {
 		.vma		= vas,
-		.pgmap_owner	= page_pgmap(page)->owner,
+		.pgmap_owner	= page->pgmap->owner,
 		.flags		= MIGRATE_VMA_SELECT_DEVICE_PRIVATE |
 		MIGRATE_VMA_SELECT_DEVICE_COHERENT,
 		.fault_page	= page,
