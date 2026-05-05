@@ -5,13 +5,13 @@ TEST_INCLUDES := $(wildcard lib/py/*.py) \
 		 ../../net/lib.sh \
 
 TEST_PROGS := \
+	hds.py \
 	napi_threaded.py \
 	netcons_basic.sh \
 	ping.py \
 	queues.py \
-	stats.py \
 	shaper.py \
-	hds.py \
+	stats.py \
 # end of TEST_PROGS
 
 include ../../lib.mk
