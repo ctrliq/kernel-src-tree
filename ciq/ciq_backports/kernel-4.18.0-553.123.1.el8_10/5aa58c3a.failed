@@ -1,0 +1,145 @@
+crypto: algif_aead - snapshot IV for async AEAD requests
+
+jira KERNEL-949
+Rebuild_History Non-Buildable kernel-4.18.0-553.123.1.el8_10
+commit-author Douya Le <ldy3087146292@gmail.com>
+commit 5aa58c3a572b3e3b6c786953339f7978b845cc52
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.123.1.el8_10/5aa58c3a.failed
+
+AF_ALG AEAD AIO requests currently use the socket-wide IV buffer during
+request processing.  For async requests, later socket activity can
+update that shared state before the original request has fully
+completed, which can lead to inconsistent IV handling.
+
+Snapshot the IV into per-request storage when preparing the AEAD
+request, so in-flight operations no longer depend on mutable socket
+state.
+
+Fixes: d887c52d6ae4 ("crypto: algif_aead - overhaul memory management")
+	Cc: stable@kernel.org
+	Reported-by: Yuan Tan <yuantan098@gmail.com>
+	Reported-by: Yifan Wu <yifanwucs@gmail.com>
+	Reported-by: Juefei Pu <tomapufckgml@gmail.com>
+	Reported-by: Xin Liu <bird@lzu.edu.cn>
+Co-developed-by: Luxing Yin <tr0jan@lzu.edu.cn>
+	Signed-off-by: Luxing Yin <tr0jan@lzu.edu.cn>
+	Tested-by: Yucheng Lu <kanolyc@gmail.com>
+	Signed-off-by: Douya Le <ldy3087146292@gmail.com>
+	Signed-off-by: Ren Wei <n05ec@lzu.edu.cn>
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit 5aa58c3a572b3e3b6c786953339f7978b845cc52)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	crypto/algif_aead.c
+diff --cc crypto/algif_aead.c
+index d9946c4f70eb,cb651ab58d62..000000000000
+--- a/crypto/algif_aead.c
++++ b/crypto/algif_aead.c
+@@@ -97,13 -70,12 +97,20 @@@ static int _aead_recvmsg(struct socket 
+  	struct sock *psk = ask->parent;
+  	struct alg_sock *pask = alg_sk(psk);
+  	struct af_alg_ctx *ctx = ask->private;
+++<<<<<<< HEAD
+ +	struct aead_tfm *aeadc = pask->private;
+ +	struct crypto_aead *tfm = aeadc->aead;
+ +	struct crypto_skcipher *null_tfm = aeadc->null_tfm;
+ +	unsigned int i, as = crypto_aead_authsize(tfm);
+++=======
++ 	struct crypto_aead *tfm = pask->private;
++ 	unsigned int as = crypto_aead_authsize(tfm);
++ 	unsigned int ivsize = crypto_aead_ivsize(tfm);
+++>>>>>>> 5aa58c3a572b (crypto: algif_aead - snapshot IV for async AEAD requests)
+  	struct af_alg_async_req *areq;
+ +	struct af_alg_tsgl *tsgl, *tmp;
+  	struct scatterlist *rsgl_src, *tsgl_src = NULL;
++ 	void *iv;
+  	int err = 0;
+  	size_t used = 0;		/* [in]  TX bufs to be en/decrypted */
+  	size_t outlen = 0;		/* [out] RX bufs produced by kernel */
+@@@ -214,75 -187,13 +225,80 @@@
+  	 */
+  
+  	/* Use the RX SGL as source (and destination) for crypto op. */
+ -	rsgl_src = areq->first_rsgl.sgl.sgt.sgl;
+ +	rsgl_src = areq->first_rsgl.sgl.sg;
+ +
+ +	if (ctx->enc) {
+ +		/*
+ +		 * Encryption operation - The in-place cipher operation is
+ +		 * achieved by the following operation:
+ +		 *
+ +		 * TX SGL: AAD || PT
+ +		 *	    |	   |
+ +		 *	    | copy |
+ +		 *	    v	   v
+ +		 * RX SGL: AAD || PT || Tag
+ +		 */
+ +		err = crypto_aead_copy_sgl(null_tfm, tsgl_src,
+ +					   areq->first_rsgl.sgl.sg, processed);
+ +		if (err)
+ +			goto free;
+ +		af_alg_pull_tsgl(sk, processed, NULL, 0);
+ +	} else {
+ +		/*
+ +		 * Decryption operation - To achieve an in-place cipher
+ +		 * operation, the following  SGL structure is used:
+ +		 *
+ +		 * TX SGL: AAD || CT || Tag
+ +		 *	    |	   |	 ^
+ +		 *	    | copy |	 | Create SGL link.
+ +		 *	    v	   v	 |
+ +		 * RX SGL: AAD || CT ----+
+ +		 */
+ +
+ +		 /* Copy AAD || CT to RX SGL buffer for in-place operation. */
+ +		err = crypto_aead_copy_sgl(null_tfm, tsgl_src,
+ +					   areq->first_rsgl.sgl.sg, outlen);
+ +		if (err)
+ +			goto free;
+  
+ -	memcpy_sglist(rsgl_src, tsgl_src, ctx->aead_assoclen);
+ +		/* Create TX SGL for tag and chain it to RX SGL. */
+ +		areq->tsgl_entries = af_alg_count_tsgl(sk, processed,
+ +						       processed - as);
+ +		if (!areq->tsgl_entries)
+ +			areq->tsgl_entries = 1;
+ +		areq->tsgl = sock_kmalloc(sk, array_size(sizeof(*areq->tsgl),
+ +							 areq->tsgl_entries),
+ +					  GFP_KERNEL);
+ +		if (!areq->tsgl) {
+ +			err = -ENOMEM;
+ +			goto free;
+ +		}
+ +		sg_init_table(areq->tsgl, areq->tsgl_entries);
+ +
+ +		/* Release TX SGL, except for tag data and reassign tag data. */
+ +		af_alg_pull_tsgl(sk, processed, areq->tsgl, processed - as);
+ +
+ +		/* chain the areq TX SGL holding the tag with RX SGL */
+ +		if (usedpages) {
+ +			/* RX SGL present */
+ +			struct af_alg_sgl *sgl_prev = &areq->last_rsgl->sgl;
+ +
+ +			sg_unmark_end(sgl_prev->sg + sgl_prev->npages - 1);
+ +			sg_chain(sgl_prev->sg, sgl_prev->npages + 1,
+ +				 areq->tsgl);
+ +		} else
+ +			/* no RX SGL present (e.g. authentication only) */
+ +			rsgl_src = areq->tsgl;
+ +	}
+  
+  	/* Initialize the crypto operation */
+++<<<<<<< HEAD
+ +	aead_request_set_crypt(&areq->cra_u.aead_req, rsgl_src,
+ +			       areq->first_rsgl.sgl.sg, used, ctx->iv);
+++=======
++ 	aead_request_set_crypt(&areq->cra_u.aead_req, tsgl_src,
++ 			       areq->first_rsgl.sgl.sgt.sgl, used, iv);
+++>>>>>>> 5aa58c3a572b (crypto: algif_aead - snapshot IV for async AEAD requests)
+  	aead_request_set_ad(&areq->cra_u.aead_req, ctx->aead_assoclen);
+  	aead_request_set_tfm(&areq->cra_u.aead_req, tfm);
+  
+* Unmerged path crypto/algif_aead.c
