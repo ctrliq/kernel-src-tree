@@ -220,10 +220,10 @@ static long xe_drm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	if (xe_device_wedged(xe))
 		return -ECANCELED;
 
-	ACQUIRE(xe_pm_runtime_ioctl, pm)(xe);
-	ret = ACQUIRE_ERR(xe_pm_runtime_ioctl, &pm);
+	ret = xe_pm_runtime_get_ioctl(xe);
 	if (ret >= 0)
 		ret = drm_ioctl(file, cmd, arg);
+	xe_pm_runtime_put(xe);
 
 	return ret;
 }
@@ -238,10 +238,10 @@ static long xe_drm_compat_ioctl(struct file *file, unsigned int cmd, unsigned lo
 	if (xe_device_wedged(xe))
 		return -ECANCELED;
 
-	ACQUIRE(xe_pm_runtime_ioctl, pm)(xe);
-	ret = ACQUIRE_ERR(xe_pm_runtime_ioctl, &pm);
+	ret = xe_pm_runtime_get_ioctl(xe);
 	if (ret >= 0)
 		ret = drm_compat_ioctl(file, cmd, arg);
+	xe_pm_runtime_put(xe);
 
 	return ret;
 }
