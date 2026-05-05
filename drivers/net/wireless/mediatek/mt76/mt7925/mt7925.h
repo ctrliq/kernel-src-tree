@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: BSD-3-Clause-Clear */
 /* Copyright (C) 2023 MediaTek Inc. */
 
 #ifndef __MT7925_H
@@ -101,6 +101,12 @@ struct mt7925_uni_beacon_loss_event {
 		u8 pad[3];
 	} __packed hdr;
 	struct mt7925_beacon_loss_tlv beacon_loss;
+} __packed;
+
+struct mt7925_uni_rssi_monitor_event {
+		__le16 tag;
+		__le16 len;
+		__le32 rssi;
 } __packed;
 
 #define to_rssi(field, rxv)		((FIELD_GET(field, rxv) - 220) / 2)
@@ -370,4 +376,5 @@ int mt7925_testmode_cmd(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 int mt7925_testmode_dump(struct ieee80211_hw *hw, struct sk_buff *msg,
 			 struct netlink_callback *cb, void *data, int len);
 
+int mt7925_mcu_set_rssimonitor(struct mt792x_dev *dev, struct ieee80211_vif *vif);
 #endif
