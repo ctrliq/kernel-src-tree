@@ -438,7 +438,7 @@ static struct xe_vram_region *xe_pagemap_to_vr(struct xe_pagemap *xpagemap)
 
 static struct xe_pagemap *xe_page_to_pagemap(struct page *page)
 {
-	return container_of(page_pgmap(page), struct xe_pagemap, pagemap);
+	return container_of(page->pgmap, struct xe_pagemap, pagemap);
 }
 
 static struct xe_vram_region *xe_page_to_vr(struct page *page)
