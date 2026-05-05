@@ -1,0 +1,228 @@
+i40e: support generic devlink param "max_mac_per_vf"
+
+jira KERNEL-935
+Rebuild_History Non-Buildable kernel-5.14.0-611.54.1.el9_7
+commit-author Mohammad Heib <mheib@redhat.com>
+commit 2c031d4c772f3a9191d04d57a3403ad6a56375c7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-611.54.1.el9_7/2c031d4c.failed
+
+Currently the i40e driver enforces its own internally calculated per-VF MAC
+filter limit, derived from the number of allocated VFs and available
+hardware resources. This limit is not configurable by the administrator,
+which makes it difficult to control how many MAC addresses each VF may
+use.
+
+This patch adds support for the new generic devlink runtime parameter
+"max_mac_per_vf" which provides administrators with a way to cap the
+number of MAC addresses a VF can use:
+
+- When the parameter is set to 0 (default), the driver continues to use
+  its internally calculated limit.
+
+- When set to a non-zero value, the driver applies this value as a strict
+  cap for VFs, overriding the internal calculation.
+
+Important notes:
+
+- The configured value is a theoretical maximum. Hardware limits may
+  still prevent additional MAC addresses from being added, even if the
+  parameter allows it.
+
+- Since MAC filters are a shared hardware resource across all VFs,
+  setting a high value may cause resource contention and starve other
+  VFs.
+
+- This change gives administrators predictable and flexible control over
+  VF resource allocation, while still respecting hardware limitations.
+
+- Previous discussion about this change:
+  https://lore.kernel.org/netdev/20250805134042.2604897-2-dhill@redhat.com
+  https://lore.kernel.org/netdev/20250823094952.182181-1-mheib@redhat.com
+
+	Signed-off-by: Mohammad Heib <mheib@redhat.com>
+	Reviewed-by: Jacob Keller <jacob.e.keller@intel.com>
+	Reviewed-by: Aleksandr Loktionov <aleksandr.loktionov@intel.com>
+	Reviewed-by: Simon Horman <horms@kernel.org>
+	Tested-by: Rafal Romanowski <rafal.romanowski@intel.com>
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit 2c031d4c772f3a9191d04d57a3403ad6a56375c7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/i40e/i40e_devlink.c
+diff --cc drivers/net/ethernet/intel/i40e/i40e_devlink.c
+index ca82ad166390,bc205e3077c7..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_devlink.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_devlink.c
+@@@ -5,9 -5,40 +5,46 @@@
+  #include "i40e.h"
+  #include "i40e_devlink.h"
+  
+++<<<<<<< HEAD
+ +/* RHEL-specific opt-in to expose "phys_port_name" in sysfs to match upstream behavior. */
+ +static int rh_phys_port_name;
+ +module_param(rh_phys_port_name, int, 0644);
+++=======
++ static int i40e_max_mac_per_vf_set(struct devlink *devlink,
++ 				   u32 id,
++ 				   struct devlink_param_gset_ctx *ctx,
++ 				   struct netlink_ext_ack *extack)
++ {
++ 	struct i40e_pf *pf = devlink_priv(devlink);
++ 
++ 	if (pf->num_alloc_vfs > 0) {
++ 		NL_SET_ERR_MSG_MOD(extack,
++ 				   "Cannot change max_mac_per_vf while SR-IOV is enabled");
++ 		return -EBUSY;
++ 	}
++ 
++ 	pf->max_mac_per_vf = ctx->val.vu32;
++ 	return 0;
++ }
++ 
++ static int i40e_max_mac_per_vf_get(struct devlink *devlink,
++ 				   u32 id,
++ 				   struct devlink_param_gset_ctx *ctx)
++ {
++ 	struct i40e_pf *pf = devlink_priv(devlink);
++ 
++ 	ctx->val.vu32 = pf->max_mac_per_vf;
++ 	return 0;
++ }
++ 
++ static const struct devlink_param i40e_dl_params[] = {
++ 	DEVLINK_PARAM_GENERIC(MAX_MAC_PER_VF,
++ 			      BIT(DEVLINK_PARAM_CMODE_RUNTIME),
++ 			      i40e_max_mac_per_vf_get,
++ 			      i40e_max_mac_per_vf_set,
++ 			      NULL),
++ };
+++>>>>>>> 2c031d4c772f (i40e: support generic devlink param "max_mac_per_vf")
+  
+  static void i40e_info_get_dsn(struct i40e_pf *pf, char *buf, size_t len)
+  {
+diff --git a/Documentation/networking/devlink/i40e.rst b/Documentation/networking/devlink/i40e.rst
+index d3cb5bb5197e..51c887f0dc83 100644
+--- a/Documentation/networking/devlink/i40e.rst
++++ b/Documentation/networking/devlink/i40e.rst
+@@ -7,6 +7,40 @@ i40e devlink support
+ This document describes the devlink features implemented by the ``i40e``
+ device driver.
+ 
++Parameters
++==========
++
++.. list-table:: Generic parameters implemented
++    :widths: 5 5 90
++
++    * - Name
++      - Mode
++      - Notes
++    * - ``max_mac_per_vf``
++      - runtime
++      - Controls the maximum number of MAC addresses a VF can use
++        on i40e devices.
++
++        By default (``0``), the driver enforces its internally calculated per-VF
++        MAC filter limit, which is based on the number of allocated VFS.
++
++        If set to a non-zero value, this parameter acts as a strict cap:
++        the driver will use the user-provided value instead of its internal
++        calculation.
++
++        **Important notes:**
++
++        - This value **must be set before enabling SR-IOV**.
++          Attempting to change it while SR-IOV is enabled will return an error.
++        - MAC filters are a **shared hardware resource** across all VFs.
++          Setting a high value may cause other VFs to be starved of filters.
++        - This value is a **Administrative policy**. The hardware may return
++          errors when its absolute limit is reached, regardless of the value
++          set here.
++
++        The default value is ``0`` (internal calculation is used).
++
++
+ Info versions
+ =============
+ 
+diff --git a/drivers/net/ethernet/intel/i40e/i40e.h b/drivers/net/ethernet/intel/i40e/i40e.h
+index 75c8021ef674..c5d15f99acf9 100644
+--- a/drivers/net/ethernet/intel/i40e/i40e.h
++++ b/drivers/net/ethernet/intel/i40e/i40e.h
+@@ -573,6 +573,10 @@ struct i40e_pf {
+ 	struct i40e_vf *vf;
+ 	int num_alloc_vfs;	/* actual number of VFs allocated */
+ 	u32 vf_aq_requests;
++	/* If set to non-zero, the device uses this value
++	 * as maximum number of MAC filters per VF.
++	 */
++	u32 max_mac_per_vf;
+ 	u32 arq_overflows;	/* Not fatal, possibly indicative of problems */
+ 	struct ratelimit_state mdd_message_rate_limit;
+ 	/* DCBx/DCBNL capability for PF that indicates
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_devlink.c
+diff --git a/drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c b/drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
+index 286f4b662e99..7990848887ef 100644
+--- a/drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
+@@ -2938,33 +2938,48 @@ static inline int i40e_check_vf_permission(struct i40e_vf *vf,
+ 		if (!f)
+ 			++mac_add_cnt;
+ 	}
+-
+-	/* If this VF is not privileged, then we can't add more than a limited
+-	 * number of addresses.
++	/* Determine the maximum number of MAC addresses this VF may use.
++	 *
++	 * - For untrusted VFs: use a fixed small limit.
++	 *
++	 * - For trusted VFs: limit is calculated by dividing total MAC
++	 *  filter pool across all VFs/ports.
+ 	 *
+-	 * If this VF is trusted, it can use more resources than untrusted.
+-	 * However to ensure that every trusted VF has appropriate number of
+-	 * resources, divide whole pool of resources per port and then across
+-	 * all VFs.
++	 * - User can override this by devlink param "max_mac_per_vf".
++	 *   If set its value is used as a strict cap for both trusted and
++	 *   untrusted VFs.
++	 *   Note:
++	 *    even when overridden, this is a theoretical maximum; hardware
++	 *    may reject additional MACs if the absolute HW limit is reached.
+ 	 */
+ 	if (!vf_trusted)
+ 		mac_add_max = I40E_VC_MAX_MAC_ADDR_PER_VF;
+ 	else
+ 		mac_add_max = I40E_VC_MAX_MACVLAN_PER_TRUSTED_VF(pf->num_alloc_vfs, hw->num_ports);
+ 
++	if (pf->max_mac_per_vf > 0)
++		mac_add_max = pf->max_mac_per_vf;
++
+ 	/* VF can replace all its filters in one step, in this case mac_add_max
+ 	 * will be added as active and another mac_add_max will be in
+ 	 * a to-be-removed state. Account for that.
+ 	 */
+ 	if ((i40e_count_active_filters(vsi) + mac_add_cnt) > mac_add_max ||
+ 	    (i40e_count_all_filters(vsi) + mac_add_cnt) > 2 * mac_add_max) {
++		if (pf->max_mac_per_vf == mac_add_max && mac_add_max > 0) {
++			dev_err(&pf->pdev->dev,
++				"Cannot add more MAC addresses: VF reached its maximum allowed limit (%d)\n",
++				mac_add_max);
++				return -EPERM;
++		}
+ 		if (!vf_trusted) {
+ 			dev_err(&pf->pdev->dev,
+ 				"Cannot add more MAC addresses, VF is not trusted, switch the VF to trusted to add more functionality\n");
+ 			return -EPERM;
+ 		} else {
+ 			dev_err(&pf->pdev->dev,
+-				"Cannot add more MAC addresses, trusted VF exhausted it's resources\n");
++				"Cannot add more MAC addresses: trusted VF reached its maximum allowed limit (%d)\n",
++				mac_add_max);
+ 			return -EPERM;
+ 		}
+ 	}
