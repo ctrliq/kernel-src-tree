@@ -1,0 +1,117 @@
+nfsd: fix heap overflow in NFSv4.0 LOCK replay cache
+
+jira KERNEL-935
+cve CVE-2026-31402
+Rebuild_History Non-Buildable kernel-5.14.0-611.54.1.el9_7
+commit-author Jeff Layton <jlayton@kernel.org>
+commit 5133b61aaf437e5f25b1b396b14242a6bb0508e2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-611.54.1.el9_7/5133b61a.failed
+
+The NFSv4.0 replay cache uses a fixed 112-byte inline buffer
+(rp_ibuf[NFSD4_REPLAY_ISIZE]) to store encoded operation responses.
+This size was calculated based on OPEN responses and does not account
+for LOCK denied responses, which include the conflicting lock owner as
+a variable-length field up to 1024 bytes (NFS4_OPAQUE_LIMIT).
+
+When a LOCK operation is denied due to a conflict with an existing lock
+that has a large owner, nfsd4_encode_operation() copies the full encoded
+response into the undersized replay buffer via read_bytes_from_xdr_buf()
+with no bounds check. This results in a slab-out-of-bounds write of up
+to 944 bytes past the end of the buffer, corrupting adjacent heap memory.
+
+This can be triggered remotely by an unauthenticated attacker with two
+cooperating NFSv4.0 clients: one sets a lock with a large owner string,
+then the other requests a conflicting lock to provoke the denial.
+
+We could fix this by increasing NFSD4_REPLAY_ISIZE to allow for a full
+opaque, but that would increase the size of every stateowner, when most
+lockowners are not that large.
+
+Instead, fix this by checking the encoded response length against
+NFSD4_REPLAY_ISIZE before copying into the replay buffer. If the
+response is too large, set rp_buflen to 0 to skip caching the replay
+payload. The status is still cached, and the client already received the
+correct response on the original request.
+
+Fixes: 1da177e4c3f4 ("Linux-2.6.12-rc2")
+	Cc: stable@kernel.org
+	Reported-by: Nicholas Carlini <npc@anthropic.com>
+	Tested-by: Nicholas Carlini <npc@anthropic.com>
+	Signed-off-by: Jeff Layton <jlayton@kernel.org>
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+(cherry picked from commit 5133b61aaf437e5f25b1b396b14242a6bb0508e2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfsd/nfs4xdr.c
+diff --cc fs/nfsd/nfs4xdr.c
+index 6bf37124e389,fa16b34fae50..000000000000
+--- a/fs/nfsd/nfs4xdr.c
++++ b/fs/nfsd/nfs4xdr.c
+@@@ -5779,18 -6276,25 +5779,28 @@@ nfsd4_encode_operation(struct nfsd4_com
+  		 * bug if we had to do this on a non-idempotent op:
+  		 */
+  		warn_on_nonidempotent_op(op);
+ -		xdr_truncate_encode(xdr, op_status_offset + XDR_UNIT);
+ -	} else if (so) {
+ -		int len = xdr->buf->len - (op_status_offset + XDR_UNIT);
+ +		xdr_truncate_encode(xdr, post_err_offset);
+ +	}
+ +	if (so) {
+ +		int len = xdr->buf->len - post_err_offset;
+  
+  		so->so_replay.rp_status = op->status;
+++<<<<<<< HEAD
+ +		so->so_replay.rp_buflen = len;
+ +		read_bytes_from_xdr_buf(xdr->buf, post_err_offset,
+++=======
++ 		if (len <= NFSD4_REPLAY_ISIZE) {
++ 			so->so_replay.rp_buflen = len;
++ 			read_bytes_from_xdr_buf(xdr->buf,
++ 						op_status_offset + XDR_UNIT,
+++>>>>>>> 5133b61aaf43 (nfsd: fix heap overflow in NFSv4.0 LOCK replay cache)
+  						so->so_replay.rp_buf, len);
++ 		} else {
++ 			so->so_replay.rp_buflen = 0;
++ 		}
+  	}
+  status:
+ -	op->status = nfsd4_map_status(op->status,
+ -				      resp->cstate.minorversion);
+ -	write_bytes_to_xdr_buf(xdr->buf, op_status_offset,
+ -			       &op->status, XDR_UNIT);
+ +	*p = op->status;
+  release:
+  	if (opdesc && opdesc->op_release)
+  		opdesc->op_release(&op->u);
+* Unmerged path fs/nfsd/nfs4xdr.c
+diff --git a/fs/nfsd/state.h b/fs/nfsd/state.h
+index df345896a745..66fa4b5a3864 100644
+--- a/fs/nfsd/state.h
++++ b/fs/nfsd/state.h
+@@ -472,11 +472,18 @@ struct nfs4_client_reclaim {
+ 	struct xdr_netobj	cr_princhash;
+ };
+ 
+-/* A reasonable value for REPLAY_ISIZE was estimated as follows:  
+- * The OPEN response, typically the largest, requires 
+- *   4(status) + 8(stateid) + 20(changeinfo) + 4(rflags) +  8(verifier) + 
+- *   4(deleg. type) + 8(deleg. stateid) + 4(deleg. recall flag) + 
+- *   20(deleg. space limit) + ~32(deleg. ace) = 112 bytes 
++/*
++ * REPLAY_ISIZE is sized for an OPEN response with delegation:
++ *   4(status) + 8(stateid) + 20(changeinfo) + 4(rflags) +
++ *   8(verifier) + 4(deleg. type) + 8(deleg. stateid) +
++ *   4(deleg. recall flag) + 20(deleg. space limit) +
++ *   ~32(deleg. ace) = 112 bytes
++ *
++ * Some responses can exceed this. A LOCK denial includes the conflicting
++ * lock owner, which can be up to 1024 bytes (NFS4_OPAQUE_LIMIT). Responses
++ * larger than REPLAY_ISIZE are not cached in rp_ibuf; only rp_status is
++ * saved. Enlarging this constant increases the size of every
++ * nfs4_stateowner.
+  */
+ 
+ #define NFSD4_REPLAY_ISIZE       112 
