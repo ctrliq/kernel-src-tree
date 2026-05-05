@@ -15,7 +15,6 @@
 #include "xe_heci_gsc.h"
 #include "xe_i2c.h"
 #include "xe_mmio.h"
-#include "xe_nvm.h"
 #include "xe_pcode_api.h"
 #include "xe_vsec.h"
 
@@ -79,11 +78,6 @@
  *
  * - ``aux_info<n>`` : Some failures have additional debug information
  *
- * - ``fdo_mode`` : To allow recovery in scenarios where MEI itself fails, a new SPI Flash
- *   Descriptor Override (FDO) mode is added in v2 survivability breadcrumbs. This mode is enabled
- *   by PCODE and provides the ability to directly update the firmware via SPI Driver without
- *   any dependency on MEI. Xe KMD initializes the nvm aux driver if FDO mode is enabled.
- *
  * Runtime Survivability
  * =====================
  *
@@ -114,8 +108,6 @@ static const char * const reg_map[] = {
 	[AUX_INFO4]               = "Auxiliary Info 4",
 };
 
-#define FDO_INFO	(MAX_SCRATCH_REG + 1)
-
 struct xe_survivability_attribute {
 	struct device_attribute attr;
 	u8 index;
@@ -142,11 +134,6 @@ static void populate_survivability_info(struct xe_device *xe)
 	mmio = xe_root_tile_mmio(xe);
 	set_survivability_info(mmio, info, CAPABILITY_INFO);
 	reg_value = info[CAPABILITY_INFO];
-
-	survivability->version = REG_FIELD_GET(BREADCRUMB_VERSION, reg_value);
-	/* FDO mode is exposed only from version 2 */
-	if (survivability->version >= 2)
-		survivability->fdo_mode = REG_FIELD_GET(FDO_MODE, reg_value);
 
 	if (reg_value & HISTORY_TRACKING) {
 		set_survivability_info(mmio, info, POSTCODE_TRACE);
@@ -208,9 +195,6 @@ static ssize_t survivability_info_show(struct device *dev,
 	struct xe_survivability *survivability = &xe->survivability;
 	u32 *info = survivability->info;
 
-	if (sa->index == FDO_INFO)
-		return sysfs_emit(buff, "%s\n", str_enabled_disabled(survivability->fdo_mode));
-
 	return sysfs_emit(buff, "0x%x\n", info[sa->index]);
 }
 
@@ -228,7 +212,6 @@ static SURVIVABILITY_ATTR_RO(aux_info1, AUX_INFO1);
 static SURVIVABILITY_ATTR_RO(aux_info2, AUX_INFO2);
 static SURVIVABILITY_ATTR_RO(aux_info3, AUX_INFO3);
 static SURVIVABILITY_ATTR_RO(aux_info4, AUX_INFO4);
-static SURVIVABILITY_ATTR_RO(fdo_mode, FDO_INFO);
 
 static void xe_survivability_mode_fini(void *arg)
 {
@@ -246,13 +229,6 @@ static umode_t survivability_info_attrs_visible(struct kobject *kobj, struct att
 	struct xe_survivability *survivability = &xe->survivability;
 	u32 *info = survivability->info;
 
-	/*
-	 * Last index in survivability_info_attrs is fdo mode and is applicable only in
-	 * version 2 of survivability mode
-	 */
-	if (idx == MAX_SCRATCH_REG && survivability->version >= 2)
-		return 0400;
-
 	if (idx < MAX_SCRATCH_REG && info[idx])
 		return 0400;
 
@@ -269,7 +245,6 @@ static struct attribute *survivability_info_attrs[] = {
 	&attr_aux_info2.attr.attr,
 	&attr_aux_info3.attr.attr,
 	&attr_aux_info4.attr.attr,
-	&attr_fdo_mode.attr.attr,
 	NULL,
 };
 
@@ -319,15 +294,11 @@ static int enable_boot_survivability_mode(struct pci_dev *pdev)
 	/* Make sure xe_heci_gsc_init() and xe_i2c_probe() are aware of survivability */
 	survivability->mode = true;
 
-	xe_heci_gsc_init(xe);
+	ret = xe_heci_gsc_init(xe);
+	if (ret)
+		goto err;
 
 	xe_vsec_init(xe);
-
-	if (survivability->fdo_mode) {
-		ret = xe_nvm_init(xe);
-		if (ret)
-			goto err;
-	}
 
 	ret = xe_i2c_probe(xe);
 	if (ret)
@@ -338,7 +309,6 @@ static int enable_boot_survivability_mode(struct pci_dev *pdev)
 	return 0;
 
 err:
-	dev_err(dev, "Failed to enable Survivability Mode\n");
 	survivability->mode = false;
 	return ret;
 }
@@ -445,10 +415,8 @@ int xe_survivability_mode_boot_enable(struct xe_device *xe)
 
 	populate_survivability_info(xe);
 
-	/*
-	 * v2 supports survivability mode for critical errors
-	 */
-	if (survivability->version < 2  && survivability->boot_status == CRITICAL_FAILURE) {
+	/* Log breadcrumbs but do not enter survivability mode for Critical boot errors */
+	if (survivability->boot_status == CRITICAL_FAILURE) {
 		log_survivability_info(pdev);
 		return -ENXIO;
 	}
