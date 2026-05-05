@@ -186,5 +186,5 @@ EXPORT_SYMBOL_GPL(ttm_backup_bytes_avail);
 struct file *ttm_backup_shmem_create(loff_t size)
 {
 	return shmem_file_setup("ttm shmem backup", size,
-				EMPTY_VMA_FLAGS);
+				0);
 }
