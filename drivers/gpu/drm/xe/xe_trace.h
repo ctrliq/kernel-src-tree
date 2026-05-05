@@ -115,7 +115,7 @@ DECLARE_EVENT_CLASS(xe_exec_queue_multi_queue,
 			     ),
 
 		    TP_fast_assign(
-			   __assign_str(dev);
+			   __assign_str(dev, __dev_name_eq(q));
 			   __entry->class = q->class;
 			   __entry->logical_mask = q->logical_mask;
 			   __entry->gt_id = q->gt->info.id;
