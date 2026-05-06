@@ -595,6 +595,20 @@ static int ublk_validate_params(const struct ublk_device *ub)
 		if (p->logical_bs_shift > PAGE_SHIFT || p->logical_bs_shift < 9)
 			return -EINVAL;
 
+		/*
+		 * 256M is a reasonable upper bound for physical block size,
+		 * io_min and io_opt; it aligns with the maximum physical
+		 * block size possible in NVMe.
+		 */
+		if (p->physical_bs_shift > ilog2(SZ_256M))
+			return -EINVAL;
+
+		if (p->io_min_shift > ilog2(SZ_256M))
+			return -EINVAL;
+
+		if (p->io_opt_shift > ilog2(SZ_256M))
+			return -EINVAL;
+
 		if (p->logical_bs_shift > p->physical_bs_shift)
 			return -EINVAL;
 
@@ -3442,13 +3456,15 @@ static int ublk_ctrl_set_params(struct ublk_device *ub,
 		 */
 		ret = -EACCES;
 	} else if (copy_from_user(&ub->params, argp, ph.len)) {
+		/* zero out partial copy so no stale params survive */
+		memset(&ub->params, 0, sizeof(ub->params));
 		ret = -EFAULT;
 	} else {
 		/* clear all we don't support yet */
 		ub->params.types &= UBLK_PARAM_TYPE_ALL;
 		ret = ublk_validate_params(ub);
 		if (ret)
-			ub->params.types = 0;
+			memset(&ub->params, 0, sizeof(ub->params));
 	}
 	mutex_unlock(&ub->mutex);
 
