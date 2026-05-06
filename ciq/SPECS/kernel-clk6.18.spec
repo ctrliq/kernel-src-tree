@@ -4492,6 +4492,9 @@ fi\
 #
 #
 %changelog
+* Wed May 06 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.22-3.1.el9
+-- After lab notice, change CONFIG_CRYPTO_FIPS_NAME to: "CIQ Linux Kernel - Kernel Cryptographic API" (Jeremy Allison)
+
 * Tue May 05 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.22-2.1.el9
 -- configs: enable legacy iptables/ip6tables support for all architectures (Brett Mastbergen)
 -- Add CONFIG_CRYPTO_FIPS_CUSTOM_VERSION=y, CONFIG_CRYPTO_FIPS_VERSION="ciq.6.18.20260531" (Jeremy Allison)
