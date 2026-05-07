@@ -117,6 +117,9 @@ struct regmap {
 		    void *val_buf, size_t val_size);
 	int (*write)(void *context, const void *data, size_t count);
 
+	int (*reg_default_cb)(struct device *dev, unsigned int reg,
+			      unsigned int *val);
+
 	unsigned long read_flag_mask;
 	unsigned long write_flag_mask;
 
@@ -289,6 +292,7 @@ enum regmap_endian regmap_get_val_endian(struct device *dev,
 					 const struct regmap_bus *bus,
 					 const struct regmap_config *config);
 
+extern struct regcache_ops regcache_flat_sparse_ops;
 extern struct regcache_ops regcache_rbtree_ops;
 extern struct regcache_ops regcache_maple_ops;
 extern struct regcache_ops regcache_flat_ops;
