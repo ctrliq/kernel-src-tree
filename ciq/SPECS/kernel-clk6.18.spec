@@ -168,7 +168,7 @@ Summary: The Linux kernel
 %define debugbuildsenabled 1
 %define el_version 9
 %define kernel_major_minor 6.18
-%define kernel_patch 27
+%define kernel_patch 28
 %define buildid .1
 %define specversion %{kernel_major_minor}.%{kernel_patch}
 %define pkgrelease 1%{?buildid}
@@ -4495,8 +4495,11 @@ fi\
 #
 #
 %changelog
-* Thu May 07 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.27-1.1.el9
--- Rebased changes for Linux 6.18.27 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.27-1)
+* Fri May 08 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.28-1.1.el9
+-- Rebased changes for Linux 6.18.28 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.28-1)
+-- rxrpc: Also unshare DATA/RESPONSE packets when paged frags are present (Brett Mastbergen)
+-- generate_tarball: Also strip leading v from tags (Brett Mastbergen)
+-- [CIQ] v6.18.27 - updated spec (Brett Mastbergen)
 -- [CIQ] v6.18.27 - rebased configs (Brett Mastbergen)
 -- bundle_bindgen: add set -e, curl --fail, and SHA256 verification (Brett Mastbergen)
 -- Add generic kernel-headers and kernel-devel Provides to spec (Brett Mastbergen)
@@ -4546,7 +4549,7 @@ fi\
 -- github actions: Make Builds on Merge Request Work (Jonathan Maple)
 -- Add initial CIQ config tweaks (Brett Mastbergen)
 -- Add CIQ configs (Brett Mastbergen)
--- Linux 6.18.27 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.18.27)
+-- Linux 6.18.28 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.18.28)
 
 
 ###
