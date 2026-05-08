@@ -163,7 +163,7 @@ Summary: The Linux kernel
 %define debugbuildsenabled 1
 %define el_version 9
 %define kernel_major_minor 6.12
-%define kernel_patch 85
+%define kernel_patch 86
 %define buildid .1
 %define specversion %{kernel_major_minor}.%{kernel_patch}
 %define pkgrelease 1%{?buildid}
@@ -4202,8 +4202,23 @@ fi\
 #
 #
 %changelog
-* Thu Apr 30 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.12.85-1.1.el9_clk
--- Rebased changes for Linux 6.12.85 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.12.85-1)
+* Thu May 07 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.12.86-1.1.el9
+-- Rebased changes for Linux 6.12.86 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.12.86-1)
+-- bundle_bindgen: add set -e, curl --fail, and SHA256 verification (Brett Mastbergen)
+-- spec: fix missed kernel -> %{name} substitutions in kvm, uki-virt-addons, ipaclones (Brett Mastbergen)
+-- Add generic kernel-headers and kernel-devel Provides to spec (Brett Mastbergen)
+-- github actions: update rpm-build workflow for namespaced spec (Brett Mastbergen)
+-- spec: Fix posttrans script to handle noarch package expansion (Brett Mastbergen)
+-- Add generic kernel Provides to spec (Brett Mastbergen)
+-- kernel-clk6.12: add missing namespaced Provides, in sync with 6.18 (Brett Mastbergen)
+-- kernel-clk6.12: fix Config= to use %{name}-%{specversion} prefix, in sync with 6.18 (Brett Mastbergen)
+-- kernel-clk6.12: replace merge.py stub with functional version from 6.18 (Brett Mastbergen)
+-- Sync spec changes from 6.18 branch (Brett Mastbergen)
+-- Add +clk6.12 suffix to kernel version string (uname -r) (Jonathan Dieter)
+-- Use gzip for symvers compression to match upstream (Jonathan Dieter)
+-- Rename package to kernel-clk6.12 and add Provides/Conflicts (Brett Mastbergen)
+-- github actions: fix version mismatch for upstream v-prefixed tags in generate_tarball.sh (Brett Mastbergen)
+-- [CIQ] v6.12.85 - updated spec (Brett Mastbergen)
 -- github actions: add RPM build workflow for x86_64 and aarch64 (Brett Mastbergen)
 -- spec: update branding in package descriptions and log messages (Brett Mastbergen)
 -- github actions: Trigger kernelCI on ciq-6.12.y-next branches (Brett Mastbergen)
@@ -4244,7 +4259,7 @@ fi\
 -- arm64: add kernel config option to lock down when in Secure Boot mode (Linn Crosetto)
 -- github actions: Make Builds on Merge Request Work (Jonathan Maple)
 -- Add CIQ configs (Jonathan Maple)
--- Linux 6.12.85 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.12.85)
+-- Linux 6.12.86 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.12.86)
 
 
 ###
