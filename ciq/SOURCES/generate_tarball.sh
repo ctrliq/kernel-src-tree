@@ -36,6 +36,7 @@ if [ -z "$CURRENT_TAG" ]; then
 fi
 
 TAG_VERSION=${CURRENT_TAG/ciq_kernel-/}
+TAG_VERSION=${TAG_VERSION#v}
 GIT_VERSION=${TAG_VERSION%%-*}
 
 # Verify that git version matches spec version
