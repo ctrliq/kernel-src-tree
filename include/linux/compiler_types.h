@@ -373,8 +373,8 @@ __no_sanitize_memory
 #define __member_size(p)	__builtin_object_size(p, 1)
 #endif
 
-#ifndef asm_volatile_goto
-#define asm_volatile_goto(x...) asm goto(x)
+#ifndef asm_goto_output
+#define asm_goto_output(x...) asm goto(x)
 #endif
 
 #ifdef CONFIG_CC_HAS_ASM_INLINE
