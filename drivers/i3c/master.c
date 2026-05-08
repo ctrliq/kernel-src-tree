@@ -2232,7 +2232,7 @@ static int of_i3c_master_add_dev(struct i3c_master_controller *master,
 	u32 reg[3];
 	int ret;
 
-	if (!master || !node)
+	if (!master)
 		return -EINVAL;
 
 	ret = of_property_read_u32_array(node, "reg", reg, ARRAY_SIZE(reg));
@@ -2255,19 +2255,16 @@ static int of_populate_i3c_bus(struct i3c_master_controller *master)
 {
 	struct device *dev = &master->dev;
 	struct device_node *i3cbus_np = dev->of_node;
-	struct device_node *node;
 	int ret;
 	u32 val;
 
 	if (!i3cbus_np)
 		return 0;
 
-	for_each_available_child_of_node(i3cbus_np, node) {
+	for_each_available_child_of_node_scoped(i3cbus_np, node) {
 		ret = of_i3c_master_add_dev(master, node);
-		if (ret) {
-			of_node_put(node);
+		if (ret)
 			return ret;
-		}
 	}
 
 	/*
@@ -2325,14 +2322,10 @@ static u8 i3c_master_i2c_get_lvr(struct i2c_client *client)
 {
 	/* Fall back to no spike filters and FM bus mode. */
 	u8 lvr = I3C_LVR_I2C_INDEX(2) | I3C_LVR_I2C_FM_MODE;
+	u32 reg[3];
 
-	if (client->dev.of_node) {
-		u32 reg[3];
-
-		if (!of_property_read_u32_array(client->dev.of_node, "reg",
-						reg, ARRAY_SIZE(reg)))
-			lvr = reg[2];
-	}
+	if (!of_property_read_u32_array(client->dev.of_node, "reg", reg, ARRAY_SIZE(reg)))
+		lvr = reg[2];
 
 	return lvr;
 }
@@ -2442,7 +2435,7 @@ static int i3c_master_i2c_adapter_init(struct i3c_master_controller *master)
 	struct i2c_adapter *adap = i3c_master_to_i2c_adapter(master);
 	struct i2c_dev_desc *i2cdev;
 	struct i2c_dev_boardinfo *i2cboardinfo;
-	int ret;
+	int ret, id;
 
 	adap->dev.parent = master->dev.parent;
 	adap->owner = master->dev.parent->driver->owner;
@@ -2453,7 +2446,13 @@ static int i3c_master_i2c_adapter_init(struct i3c_master_controller *master)
 	adap->timeout = 1000;
 	adap->retries = 3;
 
-	ret = i2c_add_adapter(adap);
+	id = of_alias_get_id(master->dev.of_node, "i2c");
+	if (id >= 0) {
+		adap->nr = id;
+		ret = i2c_add_numbered_adapter(adap);
+	} else {
+		ret = i2c_add_adapter(adap);
+	}
 	if (ret)
 		return ret;
 
@@ -2760,16 +2759,17 @@ int i3c_master_register(struct i3c_master_controller *master,
 	INIT_LIST_HEAD(&master->boardinfo.i2c);
 	INIT_LIST_HEAD(&master->boardinfo.i3c);
 
-	ret = i3c_bus_init(i3cbus, master->dev.of_node);
-	if (ret)
-		return ret;
-
 	device_initialize(&master->dev);
-	dev_set_name(&master->dev, "i3c-%d", i3cbus->id);
 
 	master->dev.dma_mask = parent->dma_mask;
 	master->dev.coherent_dma_mask = parent->coherent_dma_mask;
 	master->dev.dma_parms = parent->dma_parms;
+
+	ret = i3c_bus_init(i3cbus, master->dev.of_node);
+	if (ret)
+		goto err_put_dev;
+
+	dev_set_name(&master->dev, "i3c-%d", i3cbus->id);
 
 	ret = of_populate_i3c_bus(master);
 	if (ret)
