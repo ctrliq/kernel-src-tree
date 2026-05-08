@@ -168,10 +168,10 @@ Summary: The Linux kernel
 %define debugbuildsenabled 1
 %define el_version 9
 %define kernel_major_minor 6.18
-%define kernel_patch 22
+%define kernel_patch 27
 %define buildid .1
 %define specversion %{kernel_major_minor}.%{kernel_patch}
-%define pkgrelease 2%{?buildid}
+%define pkgrelease 1%{?buildid}
 %define kversion %{lua:print((rpm.expand("%{kernel_major_minor}"):match("^(%d+)")))}
 
 %define tarfile_release %{specversion}-%{pkgrelease}.el%{el_version}
@@ -4495,11 +4495,18 @@ fi\
 #
 #
 %changelog
-* Mon Apr 20 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.22-2.1.el9
+* Thu May 07 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.27-1.1.el9
+-- Rebased changes for Linux 6.18.27 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.27-1)
+-- [CIQ] v6.18.27 - rebased configs (Brett Mastbergen)
+-- bundle_bindgen: add set -e, curl --fail, and SHA256 verification (Brett Mastbergen)
+-- Add generic kernel-headers and kernel-devel Provides to spec (Brett Mastbergen)
+-- Add generic kernel Provides to spec (Brett Mastbergen)
+-- configs: enable legacy iptables/ip6tables support for all architectures (Brett Mastbergen)
+-- github actions: add RPM build workflow for x86_64 and aarch64 (Brett Mastbergen)
+-- spec: update branding in package descriptions and log messages (Brett Mastbergen)
+-- [CIQ] ciq_kernel-6.18.22-2 - updated spec (Brett Mastbergen)
 -- spec: Fix posttrans script to handle noarch package expansion (Brett Mastbergen)
-
-* Sun Apr 12 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.18.22-1.1.el9
--- Rebased changes for Linux 6.18.22 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.22-1)
+-- [CIQ] v6.18.22 - updated spec (github-actions[bot])
 -- github actions: Trigger kernelCI on ciq-6.18.y-next branches (Brett Mastbergen)
 -- github actions: Use trigger for kernelCI (Brett Mastbergen)
 -- Update spec for ciq_kernel-6.18.21-2 (Brett Mastbergen)
@@ -4539,7 +4546,7 @@ fi\
 -- github actions: Make Builds on Merge Request Work (Jonathan Maple)
 -- Add initial CIQ config tweaks (Brett Mastbergen)
 -- Add CIQ configs (Brett Mastbergen)
--- Linux 6.18.22 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.18.22)
+-- Linux 6.18.27 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.18.27)
 
 
 ###
