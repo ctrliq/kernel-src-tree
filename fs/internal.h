@@ -341,3 +341,5 @@ void file_f_owner_release(struct file *file);
 int anon_inode_getattr(struct mnt_idmap *idmap, const struct path *path,
 		       struct kstat *stat, u32 request_mask,
 		       unsigned int query_flags);
+int anon_inode_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+		       struct iattr *attr);
