@@ -868,7 +868,7 @@ retry_pick:
 	if (!pick_ret)
 		goto hole;
 
-	if (pick_ret < 0) {
+	if (unlikely(pick_ret < 0)) {
 		struct printbuf buf = PRINTBUF;
 		bch2_bkey_val_to_text(&buf, c, k);
 
@@ -876,6 +876,18 @@ retry_pick:
 				read_pos.inode, read_pos.offset << 9,
 				"no device to read from: %s\n  %s",
 				bch2_err_str(pick_ret),
+				buf.buf);
+		printbuf_exit(&buf);
+		goto err;
+	}
+
+	if (unlikely(bch2_csum_type_is_encryption(pick.crc.csum_type)) && !c->chacha20) {
+		struct printbuf buf = PRINTBUF;
+		bch2_bkey_val_to_text(&buf, c, k);
+
+		bch_err_inum_offset_ratelimited(c,
+				read_pos.inode, read_pos.offset << 9,
+				"attempting to read encrypted data without encryption key\n  %s",
 				buf.buf);
 		printbuf_exit(&buf);
 		goto err;
