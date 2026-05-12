@@ -881,7 +881,8 @@ retry_pick:
 		goto err;
 	}
 
-	if (unlikely(bch2_csum_type_is_encryption(pick.crc.csum_type)) && !c->chacha20) {
+	if (unlikely(bch2_csum_type_is_encryption(pick.crc.csum_type)) &&
+	    !c->chacha20_key_set) {
 		struct printbuf buf = PRINTBUF;
 		bch2_bkey_val_to_text(&buf, c, k);
 
