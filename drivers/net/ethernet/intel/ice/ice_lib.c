@@ -288,7 +288,7 @@ static void ice_vsi_delete_from_hw(struct ice_vsi *vsi)
 	int status;
 
 	ice_fltr_remove_all(vsi);
-	ctxt = kzalloc_obj(*ctxt, GFP_KERNEL);
+	ctxt = kzalloc_obj(*ctxt);
 	if (!ctxt)
 		return;
 
@@ -394,7 +394,7 @@ static int ice_vsi_alloc_ring_stats(struct ice_vsi *vsi)
 		ring_stats = tx_ring_stats[i];
 
 		if (!ring_stats) {
-			ring_stats = kzalloc_obj(*ring_stats, GFP_KERNEL);
+			ring_stats = kzalloc_obj(*ring_stats);
 			if (!ring_stats)
 				goto err_out;
 
@@ -415,7 +415,7 @@ static int ice_vsi_alloc_ring_stats(struct ice_vsi *vsi)
 		ring_stats = rx_ring_stats[i];
 
 		if (!ring_stats) {
-			ring_stats = kzalloc_obj(*ring_stats, GFP_KERNEL);
+			ring_stats = kzalloc_obj(*ring_stats);
 			if (!ring_stats)
 				goto err_out;
 
@@ -531,7 +531,7 @@ static int ice_vsi_alloc_stat_arrays(struct ice_vsi *vsi)
 	/* realloc will happen in rebuild path */
 		return 0;
 
-	vsi_stat = kzalloc_obj(*vsi_stat, GFP_KERNEL);
+	vsi_stat = kzalloc_obj(*vsi_stat);
 	if (!vsi_stat)
 		return -ENOMEM;
 
@@ -1237,7 +1237,7 @@ static int ice_vsi_init(struct ice_vsi *vsi, u32 vsi_flags)
 	int ret = 0;
 
 	dev = ice_pf_to_dev(pf);
-	ctxt = kzalloc_obj(*ctxt, GFP_KERNEL);
+	ctxt = kzalloc_obj(*ctxt);
 	if (!ctxt)
 		return -ENOMEM;
 
@@ -1401,7 +1401,7 @@ static int ice_vsi_alloc_rings(struct ice_vsi *vsi)
 		struct ice_tx_ring *ring;
 
 		/* allocate with kzalloc(), free with kfree_rcu() */
-		ring = kzalloc_obj(*ring, GFP_KERNEL);
+		ring = kzalloc_obj(*ring);
 
 		if (!ring)
 			goto err_out;
@@ -1425,7 +1425,7 @@ static int ice_vsi_alloc_rings(struct ice_vsi *vsi)
 		struct ice_rx_ring *ring;
 
 		/* allocate with kzalloc(), free with kfree_rcu() */
-		ring = kzalloc_obj(*ring, GFP_KERNEL);
+		ring = kzalloc_obj(*ring);
 		if (!ring)
 			goto err_out;
 
@@ -3392,7 +3392,7 @@ int ice_vsi_cfg_tc(struct ice_vsi *vsi, u8 ena_tc)
 	vsi->tc_cfg.ena_tc = ena_tc;
 	vsi->tc_cfg.numtc = num_tc;
 
-	ctx = kzalloc_obj(*ctx, GFP_KERNEL);
+	ctx = kzalloc_obj(*ctx);
 	if (!ctx)
 		return -ENOMEM;
 
