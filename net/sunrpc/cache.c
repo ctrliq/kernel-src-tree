@@ -400,6 +400,7 @@ void sunrpc_init_cache_detail(struct cache_detail *cd)
 	spin_lock_init(&cd->hash_lock);
 	INIT_LIST_HEAD(&cd->queue);
 	spin_lock_init(&cd->queue_lock);
+	init_waitqueue_head(&cd->queue_wait);
 	spin_lock(&cache_list_lock);
 	cd->nextcheck = 0;
 	cd->entries = 0;
@@ -969,8 +970,6 @@ out:
 	return ret;
 }
 
-static DECLARE_WAIT_QUEUE_HEAD(queue_wait);
-
 static __poll_t cache_poll(struct file *filp, poll_table *wait,
 			       struct cache_detail *cd)
 {
@@ -978,7 +977,7 @@ static __poll_t cache_poll(struct file *filp, poll_table *wait,
 	struct cache_reader *rp = filp->private_data;
 	struct cache_queue *cq;
 
-	poll_wait(filp, &queue_wait, wait);
+	poll_wait(filp, &cd->queue_wait, wait);
 
 	/* alway allow write */
 	mask = EPOLLOUT | EPOLLWRNORM;
@@ -1258,7 +1257,7 @@ static int cache_pipe_upcall(struct cache_detail *detail, struct cache_head *h)
 		/* Lost a race, no longer PENDING, so don't enqueue */
 		ret = -EAGAIN;
 	spin_unlock(&detail->queue_lock);
-	wake_up(&queue_wait);
+	wake_up(&detail->queue_wait);
 	if (ret == -EAGAIN) {
 		kfree(buf);
 		kfree(crq);
