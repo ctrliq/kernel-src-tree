@@ -1,242 +1,231 @@
 # Migration package: transitions users from the old non-namespaced
 # CIQ kernel 6.12.x packages to the new kernel-clk6.12 namespace.
 #
-# Base package uses rich deps to conditionally pull in subpackages only
-# for old packages the user actually has installed. Each subpackage carries
-# the Obsoletes + Requires for its specific package.
+# Each subpackage shim carries Obsoletes (so dnf upgrade discovers it
+# automatically) and Requires (to pull in the namespaced replacement).
+# Shims intentionally have NO Provides for the old name -- the namespaced
+# packages already Provide + Conflict the old names, and adding Provides
+# here would hit those Conflicts.
 #
-# Usage: dnf install kernel-clk6.12-migrate
+# Works via: dnf upgrade (shims discovered via Obsoletes)
 
 Name:    kernel-clk6.12-migrate
 Version: 1.0
-Release: 11%{?dist}
+Release: 12%{?dist}
 Summary: Migrate non-namespaced CIQ kernel 6.12.x to kernel-clk6.12
 License: GPL-2.0-only
 BuildArch: noarch
 BuildRequires: systemd-rpm-macros
 
-# Old released versions of the non-namespaced CIQ 6.12 kernel packages
-%define old_ver1 6.12.15-3.1.0.1.rocky9
-%define old_ver2 6.12.30-1.1.0.0.el9_clk
-%define old_ver3 6.12.43-1.1.0.0.el9_clk
-%define old_ver4 6.12.63-1.1.el9_clk
-%define old_ver5 6.12.74-1.1.0.0.el9_clk
+# Version ceiling for Obsoletes: any non-namespaced CIQ 6.12 kernel older
+# than this gets obsoleted. This also catches stock Rocky/EL9 kernels
+# (5.14.x < 6.12.86), which is acceptable since this package only lives
+# in the CLK repo. Ceiling is set between the last non-namespaced release
+# (6.12.85) and the first namespaced release (6.12.87) to avoid obsoleting
+# what the namespaced kernel itself provides.
+%define obs_ceil 6.12.86
+
 
 # =============================================================================
-# Base package: always installs the new namespaced kernel. Uses rich deps
-# to conditionally pull in migration subpackages only if the user has the
-# corresponding old package installed.
-#
-# No Obsoletes here for the old kernel base meta-package. It's installonly
-# and can't be removed during the transaction if it's the running kernel.
-# The systemd cleanup service removes it (and other installonly packages)
-# on the next boot. Obsoleting it also causes dnf update failures when the
-# old repo is still enabled.
+# Base package: Obsoletes the old kernel meta-package so dnf upgrade
+# discovers this package and pulls in the namespaced kernel. The old
+# installonly packages (kernel-core, kernel-modules) can't be removed
+# during the transaction if one is the running kernel -- the systemd
+# cleanup service handles that on the next boot.
 # =============================================================================
 
-Requires: kernel-clk6.12
-
-# Conditional: pull in migration subpackages only if old package is installed
-Requires: (%{name}-headers if kernel-headers)
-Requires: (%{name}-doc if kernel-doc)
-Requires: (%{name}-cross-headers if kernel-cross-headers)
-Requires: (%{name}-tools if kernel-tools)
-Requires: (%{name}-tools-libs if kernel-tools-libs)
-Requires: (%{name}-tools-libs-devel if kernel-tools-libs-devel)
-Requires: (kernel-clk6.12-migrate-perf if perf)
-Requires: (kernel-clk6.12-migrate-python3-perf if python3-perf)
-Requires: (kernel-clk6.12-migrate-libperf if libperf)
-Requires: (kernel-clk6.12-migrate-libperf-devel if libperf-devel)
-Requires: (kernel-clk6.12-migrate-rtla if rtla)
-Requires: (kernel-clk6.12-migrate-rv if rv)
-Requires: (%{name}-devel if kernel-devel)
-Requires: (%{name}-devel-matched if kernel-devel-matched)
-Requires: (%{name}-selftests-internal if kernel-selftests-internal)
-Requires: (%{name}-ipaclones-internal if kernel-ipaclones-internal)
-Requires: (%{name}-abi-stablelists if kernel-abi-stablelists)
-Requires: (%{name}-uki-virt-addons if kernel-uki-virt-addons)
+Obsoletes: kernel < %{obs_ceil}
+# Require kernel-clk6.12-modules explicitly. This forces the actual
+# meta-package to be installed (it's the only thing that pulls in modules).
+# Without this, DNF satisfies "Requires: kernel-clk6.12" with just
+# kernel-clk6.12-core, leaving kernel-clk6.12-modules and the meta-package
+# uninstalled. That means missing non-core modules and no auto-install of
+# future kernel versions.
+Requires: kernel-clk6.12-modules
+# Set the namespaced kernel as the default boot kernel. Without this,
+# /etc/sysconfig/kernel still has DEFAULTKERNEL=kernel-core, and future
+# namespaced kernel installs won't become the default boot entry.
+Requires: kernel-clk6.12-default
 
 %description
 Migrates from the old non-namespaced CIQ kernel 6.12.x packages to the new
 kernel-clk6.12 namespace.
 
-Install this package to transition to namespaced kernel packages:
-
-    dnf install kernel-clk6.12-migrate
-
-Only packages you currently have installed will be migrated. Old installonly
+Migration happens automatically on the next "dnf upgrade". Only packages
+you currently have installed will be migrated. Old installonly
 packages (kernel-core, kernel-modules) are automatically removed by a
 cleanup service on the next reboot after migrating.
 
 # =============================================================================
-# Subpackages: each Obsoletes the old package and Requires the replacement.
-# Only pulled in by the base package's rich deps if the old package is
-# actually installed.
+# Subpackages: each Obsoletes the old package (for dnf upgrade discovery)
+# and Requires the namespaced replacement.
+#
+# NO Provides for old names -- the namespaced packages already carry
+# Provides + Conflicts for the old names. Adding Provides here would
+# trigger those Conflicts and break the transaction.
 # =============================================================================
 
 # --- kernel-headers ---
 %package headers
-Summary: Migrate kernel-headers 6.12.x to kernel-clk6.12-headers
-Obsoletes: kernel-headers <= %{old_ver5}
+Summary: Migrate kernel-headers to kernel-clk6.12-headers
+Obsoletes: kernel-headers < %{obs_ceil}
 Requires:  kernel-clk6.12-headers
-# No Provides: kernel-headers here — kernel-clk6.12-headers already provides
-# it, and adding one here would trigger its Conflicts: kernel-headers.
 
 %description headers
-Migrates kernel-headers 6.12.x to kernel-clk6.12-headers.
+Migrates kernel-headers to kernel-clk6.12-headers.
 
 # --- kernel-doc ---
 %package doc
-Summary: Migrate kernel-doc 6.12.x to kernel-clk6.12-doc
-Obsoletes: kernel-doc <= %{old_ver5}
+Summary: Migrate kernel-doc to kernel-clk6.12-doc
+Obsoletes: kernel-doc < %{obs_ceil}
 Requires:  kernel-clk6.12-doc
 
 %description doc
-Migrates kernel-doc 6.12.x to kernel-clk6.12-doc.
+Migrates kernel-doc to kernel-clk6.12-doc.
 
 # --- kernel-cross-headers ---
 %package cross-headers
-Summary: Migrate kernel-cross-headers 6.12.x to kernel-clk6.12-cross-headers
-Obsoletes: kernel-cross-headers <= %{old_ver5}
+Summary: Migrate kernel-cross-headers to kernel-clk6.12-cross-headers
+Obsoletes: kernel-cross-headers < %{obs_ceil}
 Requires:  kernel-clk6.12-cross-headers
 
 %description cross-headers
-Migrates kernel-cross-headers 6.12.x to kernel-clk6.12-cross-headers.
+Migrates kernel-cross-headers to kernel-clk6.12-cross-headers.
 
 # --- kernel-tools ---
 %package tools
-Summary: Migrate kernel-tools 6.12.x to kernel-clk6.12-tools
-Obsoletes: kernel-tools <= %{old_ver5}
+Summary: Migrate kernel-tools to kernel-clk6.12-tools
+Obsoletes: kernel-tools < %{obs_ceil}
 Requires:  kernel-clk6.12-tools
 
 %description tools
-Migrates kernel-tools 6.12.x to kernel-clk6.12-tools.
+Migrates kernel-tools to kernel-clk6.12-tools.
 
 # --- kernel-tools-libs ---
 %package tools-libs
-Summary: Migrate kernel-tools-libs 6.12.x to kernel-clk6.12-tools-libs
-Obsoletes: kernel-tools-libs <= %{old_ver5}
+Summary: Migrate kernel-tools-libs to kernel-clk6.12-tools-libs
+Obsoletes: kernel-tools-libs < %{obs_ceil}
 Requires:  kernel-clk6.12-tools-libs
 
 %description tools-libs
-Migrates kernel-tools-libs 6.12.x to kernel-clk6.12-tools-libs.
+Migrates kernel-tools-libs to kernel-clk6.12-tools-libs.
 
 # --- kernel-tools-libs-devel ---
 %package tools-libs-devel
-Summary: Migrate kernel-tools-libs-devel 6.12.x to kernel-clk6.12-tools-libs-devel
-Obsoletes: kernel-tools-libs-devel <= %{old_ver5}
+Summary: Migrate kernel-tools-libs-devel to kernel-clk6.12-tools-libs-devel
+Obsoletes: kernel-tools-libs-devel < %{obs_ceil}
 Requires:  kernel-clk6.12-tools-libs-devel
 
 %description tools-libs-devel
-Migrates kernel-tools-libs-devel 6.12.x to kernel-clk6.12-tools-libs-devel.
+Migrates kernel-tools-libs-devel to kernel-clk6.12-tools-libs-devel.
 
 # --- kernel-devel ---
 %package devel
-Summary: Migrate kernel-devel 6.12.x to kernel-clk6.12-devel
-Obsoletes: kernel-devel <= %{old_ver5}
+Summary: Migrate kernel-devel to kernel-clk6.12-devel
+Obsoletes: kernel-devel < %{obs_ceil}
 Requires:  kernel-clk6.12-devel
 
 %description devel
-Migrates kernel-devel 6.12.x to kernel-clk6.12-devel.
+Migrates kernel-devel to kernel-clk6.12-devel.
 
 # --- kernel-devel-matched ---
 %package devel-matched
-Summary: Migrate kernel-devel-matched 6.12.x to kernel-clk6.12-devel-matched
-Obsoletes: kernel-devel-matched <= %{old_ver5}
+Summary: Migrate kernel-devel-matched to kernel-clk6.12-devel-matched
+Obsoletes: kernel-devel-matched < %{obs_ceil}
 Requires:  kernel-clk6.12-devel-matched
 
 %description devel-matched
-Migrates kernel-devel-matched 6.12.x to kernel-clk6.12-devel-matched.
+Migrates kernel-devel-matched to kernel-clk6.12-devel-matched.
 
 # --- perf ---
 %package -n kernel-clk6.12-migrate-perf
-Summary: Migrate perf 6.12.x to perf-clk6.12
-Obsoletes: perf <= %{old_ver5}
+Summary: Migrate perf to perf-clk6.12
+Obsoletes: perf < %{obs_ceil}
 Requires:  perf-clk6.12
 
 %description -n kernel-clk6.12-migrate-perf
-Migrates perf 6.12.x to perf-clk6.12.
+Migrates perf to perf-clk6.12.
 
 # --- python3-perf ---
 %package -n kernel-clk6.12-migrate-python3-perf
-Summary: Migrate python3-perf 6.12.x to python3-perf-clk6.12
-Obsoletes: python3-perf <= %{old_ver5}
+Summary: Migrate python3-perf to python3-perf-clk6.12
+Obsoletes: python3-perf < %{obs_ceil}
 Requires:  python3-perf-clk6.12
 
 %description -n kernel-clk6.12-migrate-python3-perf
-Migrates python3-perf 6.12.x to python3-perf-clk6.12.
+Migrates python3-perf to python3-perf-clk6.12.
 
 # --- libperf ---
 %package -n kernel-clk6.12-migrate-libperf
-Summary: Migrate libperf 6.12.x to libperf-clk6.12
-Obsoletes: libperf <= %{old_ver5}
+Summary: Migrate libperf to libperf-clk6.12
+Obsoletes: libperf < %{obs_ceil}
 Requires:  libperf-clk6.12
 
 %description -n kernel-clk6.12-migrate-libperf
-Migrates libperf 6.12.x to libperf-clk6.12.
+Migrates libperf to libperf-clk6.12.
 
 # --- libperf-devel ---
 %package -n kernel-clk6.12-migrate-libperf-devel
-Summary: Migrate libperf-devel 6.12.x to libperf-clk6.12-devel
-Obsoletes: libperf-devel <= %{old_ver5}
+Summary: Migrate libperf-devel to libperf-clk6.12-devel
+Obsoletes: libperf-devel < %{obs_ceil}
 Requires:  libperf-clk6.12-devel
 
 %description -n kernel-clk6.12-migrate-libperf-devel
-Migrates libperf-devel 6.12.x to libperf-clk6.12-devel.
+Migrates libperf-devel to libperf-clk6.12-devel.
 
 # --- rtla ---
 %package -n kernel-clk6.12-migrate-rtla
-Summary: Migrate rtla 6.12.x to rtla-clk6.12
-Obsoletes: rtla <= %{old_ver5}
+Summary: Migrate rtla to rtla-clk6.12
+Obsoletes: rtla < %{obs_ceil}
 Requires:  rtla-clk6.12
 
 %description -n kernel-clk6.12-migrate-rtla
-Migrates rtla 6.12.x to rtla-clk6.12.
+Migrates rtla to rtla-clk6.12.
 
 # --- rv ---
 %package -n kernel-clk6.12-migrate-rv
-Summary: Migrate rv 6.12.x to rv-clk6.12
-Obsoletes: rv <= %{old_ver5}
+Summary: Migrate rv to rv-clk6.12
+Obsoletes: rv < %{obs_ceil}
 Requires:  rv-clk6.12
 
 %description -n kernel-clk6.12-migrate-rv
-Migrates rv 6.12.x to rv-clk6.12.
+Migrates rv to rv-clk6.12.
 
 # --- kernel-selftests-internal ---
 %package selftests-internal
-Summary: Migrate kernel-selftests-internal 6.12.x to kernel-clk6.12-selftests-internal
-Obsoletes: kernel-selftests-internal <= %{old_ver5}
+Summary: Migrate kernel-selftests-internal to kernel-clk6.12-selftests-internal
+Obsoletes: kernel-selftests-internal < %{obs_ceil}
 Requires:  kernel-clk6.12-selftests-internal
 
 %description selftests-internal
-Migrates kernel-selftests-internal 6.12.x to kernel-clk6.12-selftests-internal.
+Migrates kernel-selftests-internal to kernel-clk6.12-selftests-internal.
 
 # --- kernel-ipaclones-internal ---
 %package ipaclones-internal
-Summary: Migrate kernel-ipaclones-internal 6.12.x to kernel-clk6.12-ipaclones-internal
-Obsoletes: kernel-ipaclones-internal <= %{old_ver5}
+Summary: Migrate kernel-ipaclones-internal to kernel-clk6.12-ipaclones-internal
+Obsoletes: kernel-ipaclones-internal < %{obs_ceil}
 Requires:  kernel-clk6.12-ipaclones-internal
 
 %description ipaclones-internal
-Migrates kernel-ipaclones-internal 6.12.x to kernel-clk6.12-ipaclones-internal.
+Migrates kernel-ipaclones-internal to kernel-clk6.12-ipaclones-internal.
 
 # --- kernel-abi-stablelists ---
 %package abi-stablelists
-Summary: Migrate kernel-abi-stablelists 6.12.x to kernel-clk6.12-abi-stablelists
-Obsoletes: kernel-abi-stablelists <= %{old_ver5}
+Summary: Migrate kernel-abi-stablelists to kernel-clk6.12-abi-stablelists
+Obsoletes: kernel-abi-stablelists < %{obs_ceil}
 Requires:  kernel-clk6.12-abi-stablelists
 
 %description abi-stablelists
-Migrates kernel-abi-stablelists 6.12.x to kernel-clk6.12-abi-stablelists.
+Migrates kernel-abi-stablelists to kernel-clk6.12-abi-stablelists.
 
 # --- kernel-uki-virt-addons ---
 %package uki-virt-addons
-Summary: Migrate kernel-uki-virt-addons 6.12.x to kernel-clk6.12-uki-virt-addons
-Obsoletes: kernel-uki-virt-addons <= %{old_ver5}
+Summary: Migrate kernel-uki-virt-addons to kernel-clk6.12-uki-virt-addons
+Obsoletes: kernel-uki-virt-addons < %{obs_ceil}
 Requires:  kernel-clk6.12-uki-virt-addons
 
 %description uki-virt-addons
-Migrates kernel-uki-virt-addons 6.12.x to kernel-clk6.12-uki-virt-addons.
+Migrates kernel-uki-virt-addons to kernel-clk6.12-uki-virt-addons.
 
 # ===== Build =====
 
@@ -248,62 +237,57 @@ mkdir -p %{buildroot}%{_libexecdir}/kernel-clk6.12-migrate
 mkdir -p %{buildroot}%{_unitdir}
 
 # Cleanup script: removes old non-namespaced 6.12 installonly packages
-cat > %{buildroot}%{_libexecdir}/kernel-clk6.12-migrate/cleanup-old-kernels.sh << EOFSCRIPT
+cat > %{buildroot}%{_libexecdir}/kernel-clk6.12-migrate/cleanup-old-kernels.sh << 'EOFSCRIPT'
 #!/bin/bash
 # Remove old non-namespaced CIQ 6.12 installonly kernel packages.
-# Only removes specific released versions, and only if not the running kernel.
+# Dynamically finds any kernel-core-6.12.* that isn't a clk6.12 package,
+# skips the running kernel, and removes all installonly siblings.
 # Installed by kernel-clk6.12-migrate, runs once on boot via systemd.
 
-RUNNING=\$(uname -r)
-REMOVED=0
+RUNNING=$(uname -r)
 
-for ver in \
-    %{old_ver1} \
-    %{old_ver2} \
-    %{old_ver3} \
-    %{old_ver4} \
-    %{old_ver5} \
-; do
-    # Check if this version's core package is installed
-    rpm -q "kernel-core-\${ver}" &>/dev/null || continue
+# Find all non-namespaced 6.12.x kernel-core packages
+for corepkg in $(rpm -qa kernel-core | grep '^kernel-core-6\.12\.' | grep -v clk6.12 | sort); do
+    ver=$(rpm -q --qf '%%{VERSION}-%%{RELEASE}' "$corepkg" 2>/dev/null)
+    [ -z "$ver" ] && continue
     # Check if this is the running kernel
-    pkg_uname=\$(rpm -q --qf '%%{VERSION}-%%{RELEASE}.%%{ARCH}\n' "kernel-core-\${ver}" 2>/dev/null)
-    [ "\$pkg_uname" = "\$RUNNING" ] && continue
+    pkg_uname=$(rpm -q --qf '%%{VERSION}-%%{RELEASE}.%%{ARCH}\n' "$corepkg" 2>/dev/null)
+    [ "$pkg_uname" = "$RUNNING" ] && continue
     # Not the running kernel, safe to remove all installonly siblings
-    echo "Removing old non-namespaced kernel \${ver}..."
-    # Collect only packages that are actually installed
+    echo "Removing old non-namespaced kernel ${ver}..."
     TO_REMOVE=""
-    for pkg in \
-        "kernel-\${ver}" \
-        "kernel-core-\${ver}" \
-        "kernel-modules-\${ver}" \
-        "kernel-modules-core-\${ver}" \
-        "kernel-modules-extra-\${ver}" \
-        "kernel-modules-internal-\${ver}" \
-        "kernel-modules-partner-\${ver}" \
-        "kernel-devel-\${ver}" \
-        "kernel-devel-matched-\${ver}" \
-        "kernel-uki-virt-\${ver}" \
-        "kernel-uki-virt-addons-\${ver}" \
+    for name in \
+        kernel \
+        kernel-core \
+        kernel-modules \
+        kernel-modules-core \
+        kernel-modules-extra \
+        kernel-modules-internal \
+        kernel-modules-partner \
+        kernel-devel \
+        kernel-devel-matched \
+        kernel-uki-virt \
+        kernel-uki-virt-addons \
     ; do
-        rpm -q "\$pkg" &>/dev/null && TO_REMOVE="\$TO_REMOVE \$pkg"
+        rpm -q "${name}-${ver}" &>/dev/null && TO_REMOVE="$TO_REMOVE ${name}-${ver}"
     done
-    if [ -n "\$TO_REMOVE" ]; then
-        echo "Removing:\$TO_REMOVE"
-        rpm -e \$TO_REMOVE 2>&1 || { rc=\$?; echo "rpm -e failed with exit code \$rc"; }
+    if [ -n "$TO_REMOVE" ]; then
+        echo "Removing:$TO_REMOVE"
+        rpm -e $TO_REMOVE 2>&1 || { rc=$?; echo "rpm -e failed with exit code $rc"; }
     fi
-    REMOVED=1
 done
 
-# Disable the service and remove migration shim packages if cleanup is complete
-if [ "\$REMOVED" = "1" ] || ! rpm -qa | grep '^kernel-core-6\.12\.' 2>/dev/null | grep -qv clk6.12; then
+# Disable the service and remove migration shim packages only when ALL
+# non-namespaced 6.12 kernel-core packages are gone. Don't short-circuit
+# on "we removed something" -- the running kernel may have been skipped.
+if ! rpm -qa kernel-core 2>/dev/null | grep '^kernel-core-6\.12\.' | grep -qv clk6.12; then
     systemctl disable kernel-clk6.12-migrate-cleanup.service 2>/dev/null || true
     # Remove migration shim packages via rpm -e (lighter than dnf at boot).
     # Namespaced packages survive because %posttrans marked them as user-installed.
-    SHIMS=\$(rpm -qa | grep '^kernel-clk6\.12-migrate' || true)
-    if [ -n "\$SHIMS" ]; then
+    SHIMS=$(rpm -qa | grep '^kernel-clk6\.12-migrate' || true)
+    if [ -n "$SHIMS" ]; then
         echo "Removing migration shims..."
-        rpm -e \$SHIMS 2>/dev/null || true
+        rpm -e $SHIMS 2>/dev/null || true
     fi
 fi
 EOFSCRIPT
@@ -328,39 +312,74 @@ EOFUNIT
 # ===== Post-transaction =====
 
 # Mark namespaced packages as user-installed so they survive removal of
-# the migration shim packages. Runs after the entire transaction completes.
-# After this, users can safely run: dnf remove 'kernel-clk6.12-migrate*'
+# the migration shim packages. Each shim marks its own replacement.
+
 %posttrans
-# Mark namespaced packages as user-installed so they survive shim removal
+# Base package: mark core kernel packages and enable cleanup service
 for pkg in \
     kernel-clk6.12 \
     kernel-clk6.12-core \
+    kernel-clk6.12-modules \
     kernel-clk6.12-modules-core \
-    kernel-clk6.12-headers \
-    kernel-clk6.12-doc \
-    kernel-clk6.12-cross-headers \
-    kernel-clk6.12-tools \
-    kernel-clk6.12-tools-libs \
-    kernel-clk6.12-tools-libs-devel \
-    kernel-clk6.12-devel \
-    kernel-clk6.12-devel-matched \
-    perf-clk6.12 \
-    python3-perf-clk6.12 \
-    libperf-clk6.12 \
-    libperf-clk6.12-devel \
-    rtla-clk6.12 \
-    rv-clk6.12 \
-    kernel-clk6.12-selftests-internal \
-    kernel-clk6.12-ipaclones-internal \
-    kernel-clk6.12-abi-stablelists \
-    kernel-clk6.12-uki-virt-addons \
+    kernel-clk6.12-default \
 ; do
     rpm -q "$pkg" &>/dev/null && dnf mark install "$pkg" -y &>/dev/null || true
 done
-
-# Enable the cleanup service to remove old installonly packages on next boot.
-# Can't use rpm -e from %posttrans (RPM db lock held), so defer to systemd.
 systemctl enable kernel-clk6.12-migrate-cleanup.service &>/dev/null || true
+
+%posttrans headers
+rpm -q kernel-clk6.12-headers &>/dev/null && dnf mark install kernel-clk6.12-headers -y &>/dev/null || true
+
+%posttrans doc
+rpm -q kernel-clk6.12-doc &>/dev/null && dnf mark install kernel-clk6.12-doc -y &>/dev/null || true
+
+%posttrans cross-headers
+rpm -q kernel-clk6.12-cross-headers &>/dev/null && dnf mark install kernel-clk6.12-cross-headers -y &>/dev/null || true
+
+%posttrans tools
+rpm -q kernel-clk6.12-tools &>/dev/null && dnf mark install kernel-clk6.12-tools -y &>/dev/null || true
+
+%posttrans tools-libs
+rpm -q kernel-clk6.12-tools-libs &>/dev/null && dnf mark install kernel-clk6.12-tools-libs -y &>/dev/null || true
+
+%posttrans tools-libs-devel
+rpm -q kernel-clk6.12-tools-libs-devel &>/dev/null && dnf mark install kernel-clk6.12-tools-libs-devel -y &>/dev/null || true
+
+%posttrans devel
+rpm -q kernel-clk6.12-devel &>/dev/null && dnf mark install kernel-clk6.12-devel -y &>/dev/null || true
+
+%posttrans devel-matched
+rpm -q kernel-clk6.12-devel-matched &>/dev/null && dnf mark install kernel-clk6.12-devel-matched -y &>/dev/null || true
+
+%posttrans -n kernel-clk6.12-migrate-perf
+rpm -q perf-clk6.12 &>/dev/null && dnf mark install perf-clk6.12 -y &>/dev/null || true
+
+%posttrans -n kernel-clk6.12-migrate-python3-perf
+rpm -q python3-perf-clk6.12 &>/dev/null && dnf mark install python3-perf-clk6.12 -y &>/dev/null || true
+
+%posttrans -n kernel-clk6.12-migrate-libperf
+rpm -q libperf-clk6.12 &>/dev/null && dnf mark install libperf-clk6.12 -y &>/dev/null || true
+
+%posttrans -n kernel-clk6.12-migrate-libperf-devel
+rpm -q libperf-clk6.12-devel &>/dev/null && dnf mark install libperf-clk6.12-devel -y &>/dev/null || true
+
+%posttrans -n kernel-clk6.12-migrate-rtla
+rpm -q rtla-clk6.12 &>/dev/null && dnf mark install rtla-clk6.12 -y &>/dev/null || true
+
+%posttrans -n kernel-clk6.12-migrate-rv
+rpm -q rv-clk6.12 &>/dev/null && dnf mark install rv-clk6.12 -y &>/dev/null || true
+
+%posttrans selftests-internal
+rpm -q kernel-clk6.12-selftests-internal &>/dev/null && dnf mark install kernel-clk6.12-selftests-internal -y &>/dev/null || true
+
+%posttrans ipaclones-internal
+rpm -q kernel-clk6.12-ipaclones-internal &>/dev/null && dnf mark install kernel-clk6.12-ipaclones-internal -y &>/dev/null || true
+
+%posttrans abi-stablelists
+rpm -q kernel-clk6.12-abi-stablelists &>/dev/null && dnf mark install kernel-clk6.12-abi-stablelists -y &>/dev/null || true
+
+%posttrans uki-virt-addons
+rpm -q kernel-clk6.12-uki-virt-addons &>/dev/null && dnf mark install kernel-clk6.12-uki-virt-addons -y &>/dev/null || true
 
 # ===== Files =====
 
@@ -388,6 +407,16 @@ systemctl enable kernel-clk6.12-migrate-cleanup.service &>/dev/null || true
 %files uki-virt-addons
 
 %changelog
+* Mon May 12 2026 Brett Mastbergen <bmastbergen@ciq.com> - 1.0-12
+- Switch to Obsoletes < %%{obs_ceil} so dnf upgrade discovers shims
+  automatically without requiring explicit "dnf install". Shims have
+  NO Provides for old names to avoid triggering Conflicts on the
+  namespaced packages.
+- Move dnf-mark-install from single base %%posttrans to per-subpackage
+  %%posttrans so namespaced packages survive shim removal.
+- Use version ceiling (6.13) for Obsoletes instead of per-release
+  version pinning.
+
 * Tue Apr 22 2026 Brett Mastbergen <bmastbergen@ciq.com> - 1.0-11
 - Add migration subpackages for kernel-devel and kernel-devel-matched
 - Fix version list duplication: cleanup script now uses RPM macros
