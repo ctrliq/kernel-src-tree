@@ -168,7 +168,7 @@ static void __exit crc32_mod_fini(void)
 	crypto_unregister_shashes(algs, 1 + (&crc32_le != &crc32_le_base));
 }
 
-subsys_initcall(crc32_mod_init);
+module_init(crc32_mod_init);
 module_exit(crc32_mod_fini);
 
 MODULE_AUTHOR("Alexander Boyko <alexander_boyko@xyratex.com>");
