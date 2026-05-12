@@ -1605,3 +1605,132 @@ jobs:
             --body-file pr_body.md \
             --label "created-by-kernelci"
         fi
+
+  notify-slack:
+    name: Notify Slack on failure
+    runs-on: ubuntu-latest
+    # create-pr is intentionally excluded — we don't classify its result as a
+    # failure, so waiting for it would just delay the notification.
+    needs: [pre-setup, setup, build, boot, test-kselftest, test-ltp, compare-kselftest, compare-ltp]
+    if: always() && needs.pre-setup.outputs.skip_ci != 'true'
+
+    steps:
+      - name: Resolve base branch and collect failed stages
+        id: decide
+        env:
+          # pre-setup outputs may be empty if pre-setup itself failed before
+          # writing them (artifact download / checksum failure). Fall back to
+          # the workflow_run event payload, which is always populated.
+          HEAD_REF: ${{ needs.pre-setup.outputs.head_ref || github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ needs.pre-setup.outputs.head_sha || github.event.workflow_run.head_sha }}
+          BASE_REF: ${{ needs.pre-setup.outputs.base_ref }}
+          KSELFTEST_BASE: ${{ needs.compare-kselftest.outputs.base_branch }}
+          LTP_BASE: ${{ needs.compare-ltp.outputs.base_branch }}
+        run: |
+          # Whitelist must stay in sync with compare-kselftest / compare-ltp jobs
+          VALID_BASES="ciqlts9_2 ciqlts9_4 ciqlts8_6 ciqlts9_6 ciq-6.12.y ciq-6.12.y-next ciq-6.18.y ciq-6.18.y-next ciqcbr7_9"
+
+          BASE_BRANCH="$KSELFTEST_BASE"
+          [ -z "$BASE_BRANCH" ] && BASE_BRANCH="$LTP_BASE"
+          [ -z "$BASE_BRANCH" ] && BASE_BRANCH="$BASE_REF"
+          if [ -z "$BASE_BRANCH" ] && [[ "$HEAD_REF" =~ \{[^}]+\}[_-](.+) ]]; then
+            BASE_BRANCH="${BASH_REMATCH[1]}"
+          fi
+
+          # Fail closed when base branch couldn't be resolved at all (e.g.
+          # pre-setup failed before emitting outputs AND head branch name
+          # doesn't match the extraction regex). Avoids passing an empty
+          # --base-branch to the script which would error out the notify job.
+          if [ -z "$BASE_BRANCH" ]; then
+            echo "Could not resolve base branch — skipping Slack notification"
+            echo "should_notify=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          if ! echo "$VALID_BASES" | grep -wq "$BASE_BRANCH"; then
+            echo "Base '$BASE_BRANCH' not in whitelist — skipping Slack notification"
+            echo "should_notify=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          FAILED_STAGES=()
+          [ "${{ needs.pre-setup.result }}" = "failure" ]      && FAILED_STAGES+=("infra: pre-setup")
+          [ "${{ needs.setup.result }}" = "failure" ]          && FAILED_STAGES+=("infra: matrix setup")
+          [ "${{ needs.build.result }}" = "failure" ]          && FAILED_STAGES+=("build")
+          [ "${{ needs.boot.result }}" = "failure" ]           && FAILED_STAGES+=("boot")
+          [ "${{ needs.test-kselftest.result }}" = "failure" ] && FAILED_STAGES+=("kselftest execution")
+          [ "${{ needs.test-ltp.result }}" = "failure" ]       && FAILED_STAGES+=("LTP execution (infrastructure)")
+
+          [ "${{ needs.compare-kselftest.outputs.comparison_status_x86_64 }}" = "failed" ] && FAILED_STAGES+=("kselftest regression (x86_64)")
+          [ "${{ needs.compare-kselftest.outputs.comparison_status_aarch64 }}" = "failed" ] && FAILED_STAGES+=("kselftest regression (aarch64)")
+
+          # LTP regressions are intentionally NOT classified as failures: LTP
+          # runs informationally (continue-on-error in test-ltp, no PR-blocking
+          # in create-pr). Only LTP infra failures (test-ltp.result == failure
+          # above) are notified, since a crashed VM is a real CI problem.
+
+          if [ ${#FAILED_STAGES[@]} -eq 0 ]; then
+            echo "No failures detected — skipping Slack notification"
+            echo "should_notify=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Join with ", " — bash ${array[*]} only uses the first char of IFS,
+          # so set IFS to ',' and post-process the comma into ", ".
+          SUMMARY=$(IFS=','; echo "${FAILED_STAGES[*]}")
+          SUMMARY="${SUMMARY//,/, }"
+          echo "should_notify=true" >> $GITHUB_OUTPUT
+          echo "base_branch=$BASE_BRANCH" >> $GITHUB_OUTPUT
+          echo "head_ref=$HEAD_REF" >> $GITHUB_OUTPUT
+          echo "head_sha=$HEAD_SHA" >> $GITHUB_OUTPUT
+          echo "failed_summary=$SUMMARY" >> $GITHUB_OUTPUT
+
+      - name: Checkout kernel source
+        if: steps.decide.outputs.should_notify == 'true'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 1
+
+      - name: Fetch notification script from main
+        if: steps.decide.outputs.should_notify == 'true'
+        run: |
+          git fetch origin main:main
+          git checkout origin/main -- .github/scripts/notify-slack-kernelci.sh
+          chmod +x .github/scripts/notify-slack-kernelci.sh
+
+      - name: Build Slack payload
+        if: steps.decide.outputs.should_notify == 'true'
+        # Pass GHA expressions through env: instead of interpolating into the
+        # run-script directly. Env values are shell-quoted by the runner so
+        # untrusted strings (e.g. a malicious branch name reaching us via the
+        # workflow_run fallback) can't break out of their quotes.
+        env:
+          CHANNEL_ID: ${{ vars.SLACK_CHANNEL_LINUX_KERNEL }}
+          BASE_BRANCH: ${{ steps.decide.outputs.base_branch }}
+          HEAD_REF: ${{ steps.decide.outputs.head_ref }}
+          HEAD_SHA: ${{ steps.decide.outputs.head_sha }}
+          PR_NUMBER: ${{ needs.pre-setup.outputs.pr_number || '0' }}
+          IS_PR: ${{ needs.pre-setup.outputs.is_pr || 'false' }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          FAILED_STAGES: ${{ steps.decide.outputs.failed_summary }}
+        run: |
+          .github/scripts/notify-slack-kernelci.sh \
+            --channel-id "$CHANNEL_ID" \
+            --base-branch "$BASE_BRANCH" \
+            --head-ref "$HEAD_REF" \
+            --head-sha "$HEAD_SHA" \
+            --pr-number "$PR_NUMBER" \
+            --is-pr "$IS_PR" \
+            --repo "$REPO" \
+            --run-id "$RUN_ID" \
+            --failed-stages "$FAILED_STAGES" \
+            --output slack_payload.json
+
+      - name: Post to Slack
+        if: steps.decide.outputs.should_notify == 'true'
+        uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c  # v3.0.3
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.GH_BOT_SLACK_TOKEN }}
+          payload-file-path: slack_payload.json
