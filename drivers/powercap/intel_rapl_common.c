@@ -253,7 +253,7 @@ static void rapl_init_domains(struct rapl_package *rp);
 static int rapl_read_data_raw(struct rapl_domain *rd,
 			      enum rapl_primitives prim,
 			      bool xlate, u64 *data,
-			      bool atomic);
+			      bool pmu_ctx);
 static int rapl_write_data_raw(struct rapl_domain *rd,
 			       enum rapl_primitives prim,
 			       unsigned long long value);
@@ -831,7 +831,7 @@ prim_fixups(struct rapl_domain *rd, enum rapl_primitives prim)
  */
 static int rapl_read_data_raw(struct rapl_domain *rd,
 			      enum rapl_primitives prim, bool xlate, u64 *data,
-			      bool atomic)
+			      bool pmu_ctx)
 {
 	u64 value;
 	enum rapl_primitives prim_fixed = prim_fixups(rd, prim);
@@ -853,7 +853,7 @@ static int rapl_read_data_raw(struct rapl_domain *rd,
 
 	ra.mask = rpi->mask;
 
-	if (rd->rp->priv->read_raw(get_rid(rd->rp), &ra, atomic)) {
+	if (rd->rp->priv->read_raw(get_rid(rd->rp), &ra, pmu_ctx)) {
 		pr_debug("failed to read reg 0x%llx for %s:%s\n", ra.reg.val, rd->rp->name, rd->name);
 		return -EIO;
 	}
