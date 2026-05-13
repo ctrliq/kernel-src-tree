@@ -2,7 +2,10 @@
 #ifndef _LINUX_HELPER_MACROS_H_
 #define _LINUX_HELPER_MACROS_H_
 
+#include <linux/compiler_attributes.h>
 #include <linux/math.h>
+#include <linux/typecheck.h>
+#include <linux/stddef.h>
 
 #define __find_closest(x, a, as, op)					\
 ({									\
