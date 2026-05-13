@@ -113,6 +113,7 @@ int drm_gem_huge_mnt_create(struct drm_device *dev, const char *value)
 {
 	struct file_system_type *type;
 	struct fs_context *fc;
+	size_t len = 0;
 	int ret;
 
 	if (unlikely(drm_gem_get_huge_mnt(dev)))
@@ -124,10 +125,12 @@ int drm_gem_huge_mnt_create(struct drm_device *dev, const char *value)
 	fc = fs_context_for_mount(type, SB_KERNMOUNT);
 	if (IS_ERR(fc))
 		return PTR_ERR(fc);
-	ret = vfs_parse_fs_string(fc, "source", "tmpfs");
+	ret = vfs_parse_fs_string(fc, "source", "tmpfs", strlen("tmpfs"));
 	if (unlikely(ret))
 		return -ENOPARAM;
-	ret = vfs_parse_fs_string(fc, "huge", value);
+	if (value)
+		len = strlen(value);
+	ret = vfs_parse_fs_string(fc, "huge", value, len);
 	if (unlikely(ret))
 		return -ENOPARAM;
 
