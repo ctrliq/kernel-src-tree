@@ -1,6 +1,7 @@
 net_netfilter_dir=$(dirname "$(readlink -e "${BASH_SOURCE[0]}")")
 
 source "$net_netfilter_dir/../lib.sh"
+source "$net_netfilter_dir/../net_helper.sh"
 
 checktool (){
 	if ! $1 > /dev/null 2>&1; then
