@@ -46,6 +46,7 @@ TEST_PROGS := \
 	ipv6_route_update_soft_lockup.sh \
 	l2_tos_ttl_inherit.sh \
 	l2tp.sh \
+	link_netns.py \
 	msg_zerocopy.sh \
 	nat6to4.sh \
 	ndisc_unsolicited_na_test.sh \
