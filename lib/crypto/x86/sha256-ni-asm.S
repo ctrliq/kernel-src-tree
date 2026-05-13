@@ -114,7 +114,6 @@ SYM_FUNC_START(sha256_ni_transform)
 	ANNOTATE_NOENDBR	# since this is called only via static_call
 
 	shl		$6, NUM_BLKS		/*  convert to bytes */
-	jz		.Ldone_hash
 	add		DATA_PTR, NUM_BLKS	/* pointer to end of data */
 
 	/*
@@ -164,8 +163,6 @@ SYM_FUNC_START(sha256_ni_transform)
 
 	movdqu		STATE1, 0*16(STATE_PTR)
 	movdqu		STATE0, 1*16(STATE_PTR)
-
-.Ldone_hash:
 
 	RET
 SYM_FUNC_END(sha256_ni_transform)
