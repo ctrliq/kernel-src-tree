@@ -326,21 +326,25 @@ static int netkit_validate(struct nlattr *tb[], struct nlattr *data[],
 
 static struct rtnl_link_ops netkit_link_ops;
 
-static int netkit_new_link(struct net *peer_net, struct net_device *dev,
-			   struct nlattr *tb[], struct nlattr *data[],
+static int netkit_new_link(struct net_device *dev,
+			   struct rtnl_newlink_params *params,
 			   struct netlink_ext_ack *extack)
 {
-	struct nlattr *peer_tb[IFLA_MAX + 1], **tbp = tb, *attr;
+	struct nlattr *peer_tb[IFLA_MAX + 1], **tbp, *attr;
 	enum netkit_action default_prim = NETKIT_PASS;
 	enum netkit_action default_peer = NETKIT_PASS;
+	struct nlattr **data = params->data;
+	struct net *peer_net = params->net;
 	enum netkit_mode mode = NETKIT_L3;
 	unsigned char ifname_assign_type;
+	struct nlattr **tb = params->tb;
 	struct ifinfomsg *ifmp = NULL;
 	struct net_device *peer;
 	char ifname[IFNAMSIZ];
 	struct netkit *nk;
 	int err;
 
+	tbp = tb;
 	if (data) {
 		if (data[IFLA_NETKIT_MODE]) {
 			attr = data[IFLA_NETKIT_MODE];
