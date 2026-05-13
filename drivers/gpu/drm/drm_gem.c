@@ -1315,7 +1315,8 @@ unsigned long drm_gem_get_unmapped_area(struct file *filp, unsigned long uaddr,
 		obj = NULL;
 
 	if (!obj || !obj->filp || !obj->filp->f_op->get_unmapped_area)
-		ret = mm_get_unmapped_area(filp, uaddr, len, 0, flags);
+		ret = mm_get_unmapped_area(current->mm, filp, uaddr, len, 0,
+					   flags);
 	else
 		ret = obj->filp->f_op->get_unmapped_area(obj->filp, uaddr, len, 0, flags);
 
