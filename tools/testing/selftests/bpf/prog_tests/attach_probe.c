@@ -3,6 +3,7 @@
 #include "test_attach_kprobe_sleepable.skel.h"
 #include "test_attach_probe_manual.skel.h"
 #include "test_attach_probe.skel.h"
+#include "kprobe_write_ctx.skel.h"
 
 /* this is how USDT semaphore is actually defined, except volatile modifier */
 volatile unsigned short uprobe_ref_ctr __attribute__((unused)) __attribute((section(".probes")));
@@ -200,6 +201,93 @@ static void test_attach_kprobe_long_event_name(void)
 cleanup:
 	test_attach_probe_manual__destroy(skel);
 }
+
+#ifdef __x86_64__
+/* attach kprobe/kretprobe long event name testings */
+static void test_attach_kprobe_write_ctx(void)
+{
+	struct kprobe_write_ctx *skel = NULL;
+	struct bpf_link *link = NULL;
+
+	skel = kprobe_write_ctx__open_and_load();
+	if (!ASSERT_OK_PTR(skel, "kprobe_write_ctx__open_and_load"))
+		return;
+
+	link = bpf_program__attach_kprobe_opts(skel->progs.kprobe_write_ctx,
+					     "bpf_fentry_test1", NULL);
+	if (!ASSERT_ERR_PTR(link, "bpf_program__attach_kprobe_opts"))
+		bpf_link__destroy(link);
+
+	kprobe_write_ctx__destroy(skel);
+}
+
+static void test_freplace_kprobe_write_ctx(void)
+{
+	struct bpf_program *prog_kprobe, *prog_ext, *prog_fentry;
+	struct kprobe_write_ctx *skel_kprobe, *skel_ext = NULL;
+	struct bpf_link *link_kprobe = NULL, *link_ext = NULL;
+	int err, prog_fd;
+	LIBBPF_OPTS(bpf_kprobe_opts, kprobe_opts);
+	LIBBPF_OPTS(bpf_test_run_opts, topts);
+
+	skel_kprobe = kprobe_write_ctx__open();
+	if (!ASSERT_OK_PTR(skel_kprobe, "kprobe_write_ctx__open kprobe"))
+		return;
+
+	prog_kprobe = skel_kprobe->progs.kprobe_dummy;
+	bpf_program__set_autoload(prog_kprobe, true);
+
+	prog_fentry = skel_kprobe->progs.fentry;
+	bpf_program__set_autoload(prog_fentry, true);
+
+	err = kprobe_write_ctx__load(skel_kprobe);
+	if (!ASSERT_OK(err, "kprobe_write_ctx__load kprobe"))
+		goto out;
+
+	skel_ext = kprobe_write_ctx__open();
+	if (!ASSERT_OK_PTR(skel_ext, "kprobe_write_ctx__open ext"))
+		goto out;
+
+	prog_ext = skel_ext->progs.freplace_kprobe;
+	bpf_program__set_autoload(prog_ext, true);
+
+	prog_fd = bpf_program__fd(skel_kprobe->progs.kprobe_write_ctx);
+	bpf_program__set_attach_target(prog_ext, prog_fd, "kprobe_write_ctx");
+
+	err = kprobe_write_ctx__load(skel_ext);
+	if (!ASSERT_OK(err, "kprobe_write_ctx__load ext"))
+		goto out;
+
+	prog_fd = bpf_program__fd(prog_kprobe);
+	link_ext = bpf_program__attach_freplace(prog_ext, prog_fd, "kprobe_dummy");
+	ASSERT_ERR_PTR(link_ext, "bpf_program__attach_freplace link");
+	ASSERT_EQ(libbpf_get_error(link_ext), -EINVAL, "bpf_program__attach_freplace error");
+
+	link_kprobe = bpf_program__attach_kprobe_opts(prog_kprobe, "bpf_fentry_test1",
+						      &kprobe_opts);
+	if (!ASSERT_OK_PTR(link_kprobe, "bpf_program__attach_kprobe_opts"))
+		goto out;
+
+	err = bpf_prog_test_run_opts(bpf_program__fd(prog_fentry), &topts);
+	ASSERT_OK(err, "bpf_prog_test_run_opts");
+
+out:
+	bpf_link__destroy(link_ext);
+	bpf_link__destroy(link_kprobe);
+	kprobe_write_ctx__destroy(skel_ext);
+	kprobe_write_ctx__destroy(skel_kprobe);
+}
+#else
+static void test_attach_kprobe_write_ctx(void)
+{
+	test__skip();
+}
+
+static void test_freplace_kprobe_write_ctx(void)
+{
+	test__skip();
+}
+#endif
 
 static void test_attach_probe_auto(struct test_attach_probe *skel)
 {
@@ -406,6 +494,10 @@ void test_attach_probe(void)
 		test_attach_uprobe_long_event_name();
 	if (test__start_subtest("kprobe-long_name"))
 		test_attach_kprobe_long_event_name();
+	if (test__start_subtest("kprobe-write-ctx"))
+		test_attach_kprobe_write_ctx();
+	if (test__start_subtest("freplace-kprobe-write-ctx"))
+		test_freplace_kprobe_write_ctx();
 
 cleanup:
 	test_attach_probe__destroy(skel);
