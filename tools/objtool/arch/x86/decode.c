@@ -817,6 +817,9 @@ int arch_decode_hint_reg(u8 sp_reg, int *base)
 	case ORC_REG_DX:
 		*base = CFI_DX;
 		break;
+	case ORC_REG_AX:
+		*base = CFI_AX;
+		break;
 	default:
 		return -1;
 	}
