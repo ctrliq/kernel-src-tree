@@ -171,7 +171,7 @@ Summary: The Linux kernel
 %define kernel_patch 28
 %define buildid .1
 %define specversion %{kernel_major_minor}.%{kernel_patch}
-%define pkgrelease 1%{?buildid}
+%define pkgrelease 2%{?buildid}
 %define kversion %{lua:print((rpm.expand("%{kernel_major_minor}"):match("^(%d+)")))}
 
 %define tarfile_release %{specversion}-%{pkgrelease}.el%{el_version}
@@ -4495,6 +4495,9 @@ fi\
 #
 #
 %changelog
+* Thu May 14 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.28-2.1.el9
+-- net: skbuff: propagate shared-frag marker through frag-transfer helpers (Brett Mastbergen)
+
 * Fri May 08 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.28-1.1.el9
 -- Rebased changes for Linux 6.18.28 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.28-1)
 -- rxrpc: Also unshare DATA/RESPONSE packets when paged frags are present (Brett Mastbergen)
