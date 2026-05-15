@@ -24,5 +24,7 @@ struct netns_smc {
 	int				sysctl_max_conns_per_lgr;
 	int				sysctl_wmem;
 	int				sysctl_rmem;
+	unsigned int			sysctl_smcr_max_send_wr;
+	unsigned int			sysctl_smcr_max_recv_wr;
 };
 #endif
