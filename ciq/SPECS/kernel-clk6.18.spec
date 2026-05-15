@@ -168,10 +168,10 @@ Summary: The Linux kernel
 %define debugbuildsenabled 1
 %define el_version 9
 %define kernel_major_minor 6.18
-%define kernel_patch 28
+%define kernel_patch 31
 %define buildid .1
 %define specversion %{kernel_major_minor}.%{kernel_patch}
-%define pkgrelease 2%{?buildid}
+%define pkgrelease 1%{?buildid}
 %define kversion %{lua:print((rpm.expand("%{kernel_major_minor}"):match("^(%d+)")))}
 
 %define tarfile_release %{specversion}-%{pkgrelease}.el%{el_version}
@@ -4495,12 +4495,11 @@ fi\
 #
 #
 %changelog
-* Thu May 14 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.28-2.1.el9
+* Fri May 15 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.18.31-1.1.el9
+-- Rebased changes for Linux 6.18.31 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.31-1)
+-- [CIQ] ciq_kernel-6.18.28-2 - updated spec (Brett Mastbergen)
 -- net: skbuff: propagate shared-frag marker through frag-transfer helpers (Brett Mastbergen)
-
-* Fri May 08 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.28-1.1.el9
--- Rebased changes for Linux 6.18.28 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.28-1)
--- rxrpc: Also unshare DATA/RESPONSE packets when paged frags are present (Brett Mastbergen)
+-- [CIQ] v6.18.28 - updated spec (Brett Mastbergen)
 -- generate_tarball: Also strip leading v from tags (Brett Mastbergen)
 -- [CIQ] v6.18.27 - updated spec (Brett Mastbergen)
 -- [CIQ] v6.18.27 - rebased configs (Brett Mastbergen)
@@ -4552,7 +4551,7 @@ fi\
 -- github actions: Make Builds on Merge Request Work (Jonathan Maple)
 -- Add initial CIQ config tweaks (Brett Mastbergen)
 -- Add CIQ configs (Brett Mastbergen)
--- Linux 6.18.28 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.18.28)
+-- Linux 6.18.31 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.18.31)
 
 
 ###
