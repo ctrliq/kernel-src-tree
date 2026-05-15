@@ -1854,9 +1854,7 @@ EXPORT_SYMBOL(iucv_if);
 static enum cpuhp_state iucv_online;
 
 /**
- * iucv_init
- *
- * Allocates and initializes various data structures.
+ * iucv_init - Allocates and initializes various data structures.
  *
  * Returns: 0 on success, return code on failure.
  */
