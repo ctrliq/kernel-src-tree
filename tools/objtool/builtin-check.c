@@ -259,7 +259,7 @@ static void save_argv(int argc, const char **argv)
 			ERROR_GLIBC("strdup(%s)", argv[i]);
 			exit(1);
 		}
-	};
+	}
 }
 
 int make_backup(void)
