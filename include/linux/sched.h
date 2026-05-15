@@ -1581,6 +1581,8 @@ struct task_struct {
 	*/
 	RH_KABI_REPLACE_SPLIT(long rh_reserved[64],
 		int rh_kabi_dummy,   /* 0 */ /* Use this one first */
+		/* Save user-dumpable when mm goes away */
+		unsigned user_dumpable:1,
 	)
 
 	/*
