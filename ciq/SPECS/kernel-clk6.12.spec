@@ -185,11 +185,6 @@ Summary: The Linux kernel
 
 %define pkg_release %{specrelease}
 
-# Derive the OS distro version from the dist tag for the ciq-clk-kernel
-# virtual provides. .el9_6 -> 9.6, .el9_7 -> 9.7. Same spec serves both
-# OS targets; the build environment's %{?dist} picks which one.
-%define ciq_distro %(echo "%{?dist}" | sed -E 's/^\\.el([0-9]+)_([0-9]+).*/\\1.\\2/')
-
 # libexec dir is not used by the linker, so the shared object there
 # should not be exported to RPM provides
 %global __provides_exclude_from ^%{_libexecdir}/kselftests
@@ -670,7 +665,6 @@ Requires: %{name}-modules-uname-r = %{KVERREL}
 Requires: %{name}-modules-core-uname-r = %{KVERREL}
 Provides: installonlypkg(kernel)
 Provides: kernel = %{specversion}-%{pkg_release}
-Provides: ciq-clk-kernel-distro = %{ciq_distro}
 Provides: ciq-clk-kernel = %{?epoch:%{epoch}:}%{version}-%{release}
 %endif
 
@@ -4211,7 +4205,7 @@ fi\
 #
 %changelog
 * Fri May 16 2026 Jason Rodriguez <jrodriguez@ciq.com> - 6.12.87-2.2.el9
-- Add ciq-clk-kernel virtual provides (distro + EVR) and Epoch:1 bump
+- Add ciq-clk-kernel versioned virtual provide and Epoch:1 bump
 -   Epoch is harmless on 9.6 builds (no race against frozen baseos) and
 -   guarantees default-kernel selection on 9.7 against actively-published
 -   Rocky baseos kernels.
