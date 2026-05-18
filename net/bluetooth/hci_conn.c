@@ -1825,7 +1825,7 @@ static int hci_le_create_big(struct hci_conn *conn, struct bt_iso_qos *qos)
 	cp.bis.sdu = cpu_to_le16(qos->bcast.out.sdu);
 	cp.bis.latency =  cpu_to_le16(qos->bcast.out.latency);
 	cp.bis.rtn  = qos->bcast.out.rtn;
-	cp.bis.phy  = qos->bcast.out.phy;
+	cp.bis.phy  = qos->bcast.out.phys;
 	cp.bis.packing = qos->bcast.packing;
 	cp.bis.framing = qos->bcast.framing;
 	cp.bis.encryption = qos->bcast.encryption;
@@ -1843,9 +1843,13 @@ static int set_cig_params_sync(struct hci_dev *hdev, void *data)
 	u8 aux_num_cis = 0;
 	u8 cis_id;
 
+	hci_dev_lock(hdev);
+
 	conn = hci_conn_hash_lookup_cig(hdev, cig_id);
-	if (!conn)
+	if (!conn) {
+		hci_dev_unlock(hdev);
 		return 0;
+	}
 
 	qos = &conn->iso_qos;
 	pdu->cig_id = cig_id;
@@ -1875,14 +1879,16 @@ static int set_cig_params_sync(struct hci_dev *hdev, void *data)
 		cis->cis_id = cis_id;
 		cis->c_sdu  = cpu_to_le16(conn->iso_qos.ucast.out.sdu);
 		cis->p_sdu  = cpu_to_le16(conn->iso_qos.ucast.in.sdu);
-		cis->c_phy  = qos->ucast.out.phy ? qos->ucast.out.phy :
-			      qos->ucast.in.phy;
-		cis->p_phy  = qos->ucast.in.phy ? qos->ucast.in.phy :
-			      qos->ucast.out.phy;
+		cis->c_phys = qos->ucast.out.phys ? qos->ucast.out.phys :
+			      qos->ucast.in.phys;
+		cis->p_phys = qos->ucast.in.phys ? qos->ucast.in.phys :
+			      qos->ucast.out.phys;
 		cis->c_rtn  = qos->ucast.out.rtn;
 		cis->p_rtn  = qos->ucast.in.rtn;
 	}
 	pdu->num_cis = aux_num_cis;
+
+	hci_dev_unlock(hdev);
 
 	if (!pdu->num_cis)
 		return 0;
@@ -1982,8 +1988,8 @@ struct hci_conn *hci_bind_cis(struct hci_dev *hdev, bdaddr_t *dst,
 		return cis;
 
 	/* Update LINK PHYs according to QoS preference */
-	cis->le_tx_phy = qos->ucast.out.phy;
-	cis->le_rx_phy = qos->ucast.in.phy;
+	cis->le_tx_phy = qos->ucast.out.phys;
+	cis->le_rx_phy = qos->ucast.in.phys;
 
 	/* If output interval is not set use the input interval as it cannot be
 	 * 0x000000.
@@ -2096,15 +2102,15 @@ int hci_le_create_cis_pending(struct hci_dev *hdev)
 }
 
 static void hci_iso_qos_setup(struct hci_dev *hdev, struct hci_conn *conn,
-			      struct bt_iso_io_qos *qos, __u8 phy)
+			      struct bt_iso_io_qos *qos, __u8 phys)
 {
 	/* Only set MTU if PHY is enabled */
-	if (!qos->sdu && qos->phy)
+	if (!qos->sdu && qos->phys)
 		qos->sdu = conn->mtu;
 
 	/* Use the same PHY as ACL if set to any */
-	if (qos->phy == BT_ISO_PHY_ANY)
-		qos->phy = phy;
+	if (qos->phys == BT_ISO_PHY_ANY)
+		qos->phys = phys;
 
 	/* Use LE ACL connection interval if not set */
 	if (!qos->interval)
@@ -2124,7 +2130,7 @@ static int create_big_sync(struct hci_dev *hdev, void *data)
 	u32 flags = 0;
 	int err;
 
-	if (qos->bcast.out.phy == 0x02)
+	if (qos->bcast.out.phys == BIT(1))
 		flags |= MGMT_ADV_FLAG_SEC_2M;
 
 	/* Align intervals */
@@ -2233,8 +2239,7 @@ struct hci_conn *hci_bind_bis(struct hci_dev *hdev, bdaddr_t *dst, __u8 sid,
 		return conn;
 
 	/* Update LINK PHYs according to QoS preference */
-	conn->le_tx_phy = qos->bcast.out.phy;
-	conn->le_tx_phy = qos->bcast.out.phy;
+	conn->le_tx_def_phys = qos->bcast.out.phys;
 
 	/* Add Basic Announcement into Peridic Adv Data if BASE is set */
 	if (base_len && base) {
@@ -2243,7 +2248,7 @@ struct hci_conn *hci_bind_bis(struct hci_dev *hdev, bdaddr_t *dst, __u8 sid,
 	}
 
 	hci_iso_qos_setup(hdev, conn, &qos->bcast.out,
-			  conn->le_tx_phy ? conn->le_tx_phy :
+			  conn->le_tx_def_phys ? conn->le_tx_def_phys :
 			  hdev->le_tx_def_phys);
 
 	conn->iso_qos = *qos;
@@ -2363,9 +2368,11 @@ struct hci_conn *hci_connect_cis(struct hci_dev *hdev, bdaddr_t *dst,
 		return le;
 
 	hci_iso_qos_setup(hdev, le, &qos->ucast.out,
-			  le->le_tx_phy ? le->le_tx_phy : hdev->le_tx_def_phys);
+			  le->le_tx_def_phys ? le->le_tx_def_phys :
+			  hdev->le_tx_def_phys);
 	hci_iso_qos_setup(hdev, le, &qos->ucast.in,
-			  le->le_rx_phy ? le->le_rx_phy : hdev->le_rx_def_phys);
+			  le->le_rx_def_phys ? le->le_rx_def_phys :
+			  hdev->le_rx_def_phys);
 
 	cis = hci_bind_cis(hdev, dst, dst_type, qos, timeout);
 	if (IS_ERR(cis)) {
@@ -3094,7 +3101,7 @@ int hci_abort_conn(struct hci_conn *conn, u8 reason)
 	 * hci_connect_le serializes the connection attempts so only one
 	 * connection can be in BT_CONNECT at time.
 	 */
-	if (conn->state == BT_CONNECT && hdev->req_status == HCI_REQ_PEND) {
+	if (conn->state == BT_CONNECT && READ_ONCE(hdev->req_status) == HCI_REQ_PEND) {
 		switch (hci_skb_event(hdev->sent_cmd)) {
 		case HCI_EV_CONN_COMPLETE:
 		case HCI_EV_LE_CONN_COMPLETE:
