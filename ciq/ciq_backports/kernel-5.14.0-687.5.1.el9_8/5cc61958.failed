@@ -1,0 +1,226 @@
+vsock: Use container_of() to get net namespace in sysctl handlers
+
+jira KERNEL-1035
+Rebuild_History Non-Buildable kernel-5.14.0-687.5.1.el9_8
+commit-author Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+commit 5cc619583c7e735c4fb801bede671fb6f9c79425
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.5.1.el9_8/5cc61958.failed
+
+current->nsproxy is should not be accessed directly as syzbot has found
+that it could be NULL at times, causing crashes.  Fix up the af_vsock
+sysctl handlers to use container_of() to deal with the current net
+namespace instead of attempting to rely on current.
+
+This is the same type of change done in commit 7f5611cbc487 ("rds:
+sysctl: rds_tcp_{rcv,snd}buf: avoid using current->nsproxy")
+
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Reviewed-by: Bobby Eshleman <bobbyeshleman@meta.com>
+	Reviewed-by: Stefano Garzarella <sgarzare@redhat.com>
+Fixes: eafb64f40ca4 ("vsock: add netns to vsock core")
+Link: https://patch.msgid.link/2026022318-rearview-gallery-ae13@gregkh
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 5cc619583c7e735c4fb801bede671fb6f9c79425)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/vmw_vsock/af_vsock.c
+diff --cc net/vmw_vsock/af_vsock.c
+index f8085933a181,f4062c6a1944..000000000000
+--- a/net/vmw_vsock/af_vsock.c
++++ b/net/vmw_vsock/af_vsock.c
+@@@ -2526,6 -2763,188 +2526,191 @@@ static struct miscdevice vsock_device 
+  	.fops		= &vsock_device_ops,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static int __vsock_net_mode_string(const struct ctl_table *table, int write,
++ 				   void *buffer, size_t *lenp, loff_t *ppos,
++ 				   enum vsock_net_mode mode,
++ 				   enum vsock_net_mode *new_mode)
++ {
++ 	char data[VSOCK_NET_MODE_STR_MAX] = {0};
++ 	struct ctl_table tmp;
++ 	int ret;
++ 
++ 	if (!table->data || !table->maxlen || !*lenp) {
++ 		*lenp = 0;
++ 		return 0;
++ 	}
++ 
++ 	tmp = *table;
++ 	tmp.data = data;
++ 
++ 	if (!write) {
++ 		const char *p;
++ 
++ 		switch (mode) {
++ 		case VSOCK_NET_MODE_GLOBAL:
++ 			p = VSOCK_NET_MODE_STR_GLOBAL;
++ 			break;
++ 		case VSOCK_NET_MODE_LOCAL:
++ 			p = VSOCK_NET_MODE_STR_LOCAL;
++ 			break;
++ 		default:
++ 			WARN_ONCE(true, "netns has invalid vsock mode");
++ 			*lenp = 0;
++ 			return 0;
++ 		}
++ 
++ 		strscpy(data, p, sizeof(data));
++ 		tmp.maxlen = strlen(p);
++ 	}
++ 
++ 	ret = proc_dostring(&tmp, write, buffer, lenp, ppos);
++ 	if (ret || !write)
++ 		return ret;
++ 
++ 	if (*lenp >= sizeof(data))
++ 		return -EINVAL;
++ 
++ 	if (!strncmp(data, VSOCK_NET_MODE_STR_GLOBAL, sizeof(data)))
++ 		*new_mode = VSOCK_NET_MODE_GLOBAL;
++ 	else if (!strncmp(data, VSOCK_NET_MODE_STR_LOCAL, sizeof(data)))
++ 		*new_mode = VSOCK_NET_MODE_LOCAL;
++ 	else
++ 		return -EINVAL;
++ 
++ 	return 0;
++ }
++ 
++ static int vsock_net_mode_string(const struct ctl_table *table, int write,
++ 				 void *buffer, size_t *lenp, loff_t *ppos)
++ {
++ 	struct net *net;
++ 
++ 	if (write)
++ 		return -EPERM;
++ 
++ 	net = container_of(table->data, struct net, vsock.mode);
++ 
++ 	return __vsock_net_mode_string(table, write, buffer, lenp, ppos,
++ 				       vsock_net_mode(net), NULL);
++ }
++ 
++ static int vsock_net_child_mode_string(const struct ctl_table *table, int write,
++ 				       void *buffer, size_t *lenp, loff_t *ppos)
++ {
++ 	enum vsock_net_mode new_mode;
++ 	struct net *net;
++ 	int ret;
++ 
++ 	net = container_of(table->data, struct net, vsock.child_ns_mode);
++ 
++ 	ret = __vsock_net_mode_string(table, write, buffer, lenp, ppos,
++ 				      vsock_net_child_mode(net), &new_mode);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (write) {
++ 		/* Prevent a "local" namespace from escalating to "global",
++ 		 * which would give nested namespaces access to global CIDs.
++ 		 */
++ 		if (vsock_net_mode(net) == VSOCK_NET_MODE_LOCAL &&
++ 		    new_mode == VSOCK_NET_MODE_GLOBAL)
++ 			return -EPERM;
++ 
++ 		vsock_net_set_child_mode(net, new_mode);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static struct ctl_table vsock_table[] = {
++ 	{
++ 		.procname	= "ns_mode",
++ 		.data		= &init_net.vsock.mode,
++ 		.maxlen		= VSOCK_NET_MODE_STR_MAX,
++ 		.mode		= 0444,
++ 		.proc_handler	= vsock_net_mode_string
++ 	},
++ 	{
++ 		.procname	= "child_ns_mode",
++ 		.data		= &init_net.vsock.child_ns_mode,
++ 		.maxlen		= VSOCK_NET_MODE_STR_MAX,
++ 		.mode		= 0644,
++ 		.proc_handler	= vsock_net_child_mode_string
++ 	},
++ };
++ 
++ static int __net_init vsock_sysctl_register(struct net *net)
++ {
++ 	struct ctl_table *table;
++ 
++ 	if (net_eq(net, &init_net)) {
++ 		table = vsock_table;
++ 	} else {
++ 		table = kmemdup(vsock_table, sizeof(vsock_table), GFP_KERNEL);
++ 		if (!table)
++ 			goto err_alloc;
++ 
++ 		table[0].data = &net->vsock.mode;
++ 		table[1].data = &net->vsock.child_ns_mode;
++ 	}
++ 
++ 	net->vsock.sysctl_hdr = register_net_sysctl_sz(net, "net/vsock", table,
++ 						       ARRAY_SIZE(vsock_table));
++ 	if (!net->vsock.sysctl_hdr)
++ 		goto err_reg;
++ 
++ 	return 0;
++ 
++ err_reg:
++ 	if (!net_eq(net, &init_net))
++ 		kfree(table);
++ err_alloc:
++ 	return -ENOMEM;
++ }
++ 
++ static void vsock_sysctl_unregister(struct net *net)
++ {
++ 	const struct ctl_table *table;
++ 
++ 	table = net->vsock.sysctl_hdr->ctl_table_arg;
++ 	unregister_net_sysctl_table(net->vsock.sysctl_hdr);
++ 	if (!net_eq(net, &init_net))
++ 		kfree(table);
++ }
++ 
++ static void vsock_net_init(struct net *net)
++ {
++ 	if (net_eq(net, &init_net))
++ 		net->vsock.mode = VSOCK_NET_MODE_GLOBAL;
++ 	else
++ 		net->vsock.mode = vsock_net_child_mode(current->nsproxy->net_ns);
++ 
++ 	net->vsock.child_ns_mode = net->vsock.mode;
++ }
++ 
++ static __net_init int vsock_sysctl_init_net(struct net *net)
++ {
++ 	vsock_net_init(net);
++ 
++ 	if (vsock_sysctl_register(net))
++ 		return -ENOMEM;
++ 
++ 	return 0;
++ }
++ 
++ static __net_exit void vsock_sysctl_exit_net(struct net *net)
++ {
++ 	vsock_sysctl_unregister(net);
++ }
++ 
++ static struct pernet_operations vsock_sysctl_ops = {
++ 	.init = vsock_sysctl_init_net,
++ 	.exit = vsock_sysctl_exit_net,
++ };
++ 
+++>>>>>>> 5cc619583c7e (vsock: Use container_of() to get net namespace in sysctl handlers)
+  static int __init vsock_init(void)
+  {
+  	int err = 0;
+* Unmerged path net/vmw_vsock/af_vsock.c
