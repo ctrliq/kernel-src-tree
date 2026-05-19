@@ -1,0 +1,305 @@
+mshv: Add support for movable memory regions
+
+jira KERNEL-1029
+Rebuild_History Non-Buildable kernel-6.12.0-211.7.1.el10_2
+commit-author Stanislav Kinsburskii <skinsburskii@linux.microsoft.com>
+commit b9a66cd5ccbb9fade15d0e427e19470d8ad35b75
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.7.1.el10_2/b9a66cd5.failed
+
+Introduce support for movable memory regions in the Hyper-V root partition
+driver to improve memory management flexibility and enable advanced use
+cases such as dynamic memory remapping.
+
+Mirror the address space between the Linux root partition and guest VMs
+using HMM. The root partition owns the memory, while guest VMs act as
+devices with page tables managed via hypercalls. MSHV handles VP intercepts
+by invoking hmm_range_fault() and updating SLAT entries. When memory is
+reclaimed, HMM invalidates the relevant regions, prompting MSHV to clear
+SLAT entries; guest VMs will fault again on access.
+
+Integrate mmu_interval_notifier for movable regions, implement handlers for
+HMM faults and memory invalidation, and update memory region mapping logic
+to support movable regions.
+
+While MMU notifiers are commonly used in virtualization drivers, this
+implementation leverages HMM (Heterogeneous Memory Management) for its
+specialized functionality. HMM provides a framework for mirroring,
+invalidation, and fault handling, reducing boilerplate and improving
+maintainability compared to generic MMU notifiers.
+
+	Signed-off-by: Stanislav Kinsburskii <skinsburskii@linux.microsoft.com>
+	Reviewed-by: Nuno Das Neves <nunodasneves@linux.microsoft.com>
+	Signed-off-by: Wei Liu <wei.liu@kernel.org>
+(cherry picked from commit b9a66cd5ccbb9fade15d0e427e19470d8ad35b75)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/mshv_regions.c
+#	drivers/hv/mshv_root.h
+#	drivers/hv/mshv_root_main.c
+diff --cc drivers/hv/mshv_root.h
+index 0dfccfbe6123,3c1d88b36741..000000000000
+--- a/drivers/hv/mshv_root.h
++++ b/drivers/hv/mshv_root.h
+@@@ -70,18 -71,23 +71,30 @@@ do { 
+  #define vp_info(v, fmt, ...)	vp_devprintk(info, v, fmt, ##__VA_ARGS__)
+  #define vp_dbg(v, fmt, ...)	vp_devprintk(dbg, v, fmt, ##__VA_ARGS__)
+  
++ enum mshv_region_type {
++ 	MSHV_REGION_TYPE_MEM_PINNED,
++ 	MSHV_REGION_TYPE_MEM_MOVABLE,
++ 	MSHV_REGION_TYPE_MMIO
++ };
++ 
+  struct mshv_mem_region {
+  	struct hlist_node hnode;
+ -	struct kref refcount;
+  	u64 nr_pages;
+  	u64 start_gfn;
+  	u64 start_uaddr;
+  	u32 hv_map_flags;
+++<<<<<<< HEAD
+ +	struct {
+ +		u64 large_pages:  1; /* 2MiB */
+ +		u64 range_pinned: 1;
+ +		u64 reserved:	 62;
+ +	} flags;
+++=======
+++>>>>>>> b9a66cd5ccbb (mshv: Add support for movable memory regions)
+  	struct mshv_partition *partition;
++ 	enum mshv_region_type type;
++ 	struct mmu_interval_notifier mni;
++ 	struct mutex mutex;	/* protects region pages remapping */
+  	struct page *pages[];
+  };
+  
+@@@ -312,4 -320,17 +325,20 @@@ extern struct mshv_root mshv_root
+  extern enum hv_scheduler_type hv_scheduler_type;
+  extern u8 * __percpu *hv_synic_eventring_tail;
+  
+++<<<<<<< HEAD
+++=======
++ struct mshv_mem_region *mshv_region_create(u64 guest_pfn, u64 nr_pages,
++ 					   u64 uaddr, u32 flags);
++ int mshv_region_share(struct mshv_mem_region *region);
++ int mshv_region_unshare(struct mshv_mem_region *region);
++ int mshv_region_map(struct mshv_mem_region *region);
++ void mshv_region_invalidate(struct mshv_mem_region *region);
++ int mshv_region_pin(struct mshv_mem_region *region);
++ void mshv_region_put(struct mshv_mem_region *region);
++ int mshv_region_get(struct mshv_mem_region *region);
++ bool mshv_region_handle_gfn_fault(struct mshv_mem_region *region, u64 gfn);
++ void mshv_region_movable_fini(struct mshv_mem_region *region);
++ bool mshv_region_movable_init(struct mshv_mem_region *region);
++ 
+++>>>>>>> b9a66cd5ccbb (mshv: Add support for movable memory regions)
+  #endif /* _MSHV_ROOT_H_ */
+diff --cc drivers/hv/mshv_root_main.c
+index db2c0d8ce967,9cf28a3f12fe..000000000000
+--- a/drivers/hv/mshv_root_main.c
++++ b/drivers/hv/mshv_root_main.c
+@@@ -1059,131 -1143,6 +1143,134 @@@ static void mshv_async_hvcall_handler(v
+  	*status = partition->async_hypercall_status;
+  }
+  
+++<<<<<<< HEAD
+ +static int
+ +mshv_partition_region_share(struct mshv_mem_region *region)
+ +{
+ +	u32 flags = HV_MODIFY_SPA_PAGE_HOST_ACCESS_MAKE_SHARED;
+ +
+ +	if (region->flags.large_pages)
+ +		flags |= HV_MODIFY_SPA_PAGE_HOST_ACCESS_LARGE_PAGE;
+ +
+ +	return hv_call_modify_spa_host_access(region->partition->pt_id,
+ +			region->pages, region->nr_pages,
+ +			HV_MAP_GPA_READABLE | HV_MAP_GPA_WRITABLE,
+ +			flags, true);
+ +}
+ +
+ +static int
+ +mshv_partition_region_unshare(struct mshv_mem_region *region)
+ +{
+ +	u32 flags = HV_MODIFY_SPA_PAGE_HOST_ACCESS_MAKE_EXCLUSIVE;
+ +
+ +	if (region->flags.large_pages)
+ +		flags |= HV_MODIFY_SPA_PAGE_HOST_ACCESS_LARGE_PAGE;
+ +
+ +	return hv_call_modify_spa_host_access(region->partition->pt_id,
+ +			region->pages, region->nr_pages,
+ +			0,
+ +			flags, false);
+ +}
+ +
+ +static int
+ +mshv_region_remap_pages(struct mshv_mem_region *region, u32 map_flags,
+ +			u64 page_offset, u64 page_count)
+ +{
+ +	if (page_offset + page_count > region->nr_pages)
+ +		return -EINVAL;
+ +
+ +	if (region->flags.large_pages)
+ +		map_flags |= HV_MAP_GPA_LARGE_PAGE;
+ +
+ +	/* ask the hypervisor to map guest ram */
+ +	return hv_call_map_gpa_pages(region->partition->pt_id,
+ +				     region->start_gfn + page_offset,
+ +				     page_count, map_flags,
+ +				     region->pages + page_offset);
+ +}
+ +
+ +static int
+ +mshv_region_map(struct mshv_mem_region *region)
+ +{
+ +	u32 map_flags = region->hv_map_flags;
+ +
+ +	return mshv_region_remap_pages(region, map_flags,
+ +				       0, region->nr_pages);
+ +}
+ +
+ +static void
+ +mshv_region_invalidate_pages(struct mshv_mem_region *region,
+ +			     u64 page_offset, u64 page_count)
+ +{
+ +	if (region->flags.range_pinned)
+ +		unpin_user_pages(region->pages + page_offset, page_count);
+ +
+ +	memset(region->pages + page_offset, 0,
+ +	       page_count * sizeof(struct page *));
+ +}
+ +
+ +static void
+ +mshv_region_invalidate(struct mshv_mem_region *region)
+ +{
+ +	mshv_region_invalidate_pages(region, 0, region->nr_pages);
+ +}
+ +
+ +static int
+ +mshv_region_pin(struct mshv_mem_region *region)
+ +{
+ +	u64 done_count, nr_pages;
+ +	struct page **pages;
+ +	__u64 userspace_addr;
+ +	int ret;
+ +
+ +	for (done_count = 0; done_count < region->nr_pages; done_count += ret) {
+ +		pages = region->pages + done_count;
+ +		userspace_addr = region->start_uaddr +
+ +				 done_count * HV_HYP_PAGE_SIZE;
+ +		nr_pages = min(region->nr_pages - done_count,
+ +			       MSHV_PIN_PAGES_BATCH_SIZE);
+ +
+ +		/*
+ +		 * Pinning assuming 4k pages works for large pages too.
+ +		 * All page structs within the large page are returned.
+ +		 *
+ +		 * Pin requests are batched because pin_user_pages_fast
+ +		 * with the FOLL_LONGTERM flag does a large temporary
+ +		 * allocation of contiguous memory.
+ +		 */
+ +		ret = pin_user_pages_fast(userspace_addr, nr_pages,
+ +					  FOLL_WRITE | FOLL_LONGTERM,
+ +					  pages);
+ +		if (ret < 0)
+ +			goto release_pages;
+ +	}
+ +
+ +	if (PageHuge(region->pages[0]))
+ +		region->flags.large_pages = true;
+ +
+ +	return 0;
+ +
+ +release_pages:
+ +	mshv_region_invalidate_pages(region, 0, done_count);
+ +	return ret;
+ +}
+ +
+ +static struct mshv_mem_region *
+ +mshv_partition_region_by_gfn(struct mshv_partition *partition, u64 gfn)
+ +{
+ +	struct mshv_mem_region *region;
+ +
+ +	hlist_for_each_entry(region, &partition->pt_mem_regions, hnode) {
+ +		if (gfn >= region->start_gfn &&
+ +		    gfn < region->start_gfn + region->nr_pages)
+ +			return region;
+ +	}
+ +
+ +	return NULL;
+ +}
+ +
+++=======
+++>>>>>>> b9a66cd5ccbb (mshv: Add support for movable memory regions)
+  /*
+   * NB: caller checks and makes sure mem->size is page aligned
+   * Returns: 0 with regionpp updated on success, or -errno
+@@@ -1201,30 -1161,27 +1288,47 @@@ static int mshv_partition_create_region
+  		if (mem->guest_pfn + nr_pages <= rg->start_gfn ||
+  		    rg->start_gfn + rg->nr_pages <= mem->guest_pfn)
+  			continue;
+ -		spin_unlock(&partition->pt_mem_regions_lock);
+ +
+  		return -EEXIST;
+  	}
+ -	spin_unlock(&partition->pt_mem_regions_lock);
+  
+++<<<<<<< HEAD
+ +	region = vzalloc(sizeof(*region) + sizeof(struct page *) * nr_pages);
+ +	if (!region)
+ +		return -ENOMEM;
+ +
+ +	region->nr_pages = nr_pages;
+ +	region->start_gfn = mem->guest_pfn;
+ +	region->start_uaddr = mem->userspace_addr;
+ +	region->hv_map_flags = HV_MAP_GPA_READABLE | HV_MAP_GPA_ADJUSTABLE;
+ +	if (mem->flags & BIT(MSHV_SET_MEM_BIT_WRITABLE))
+ +		region->hv_map_flags |= HV_MAP_GPA_WRITABLE;
+ +	if (mem->flags & BIT(MSHV_SET_MEM_BIT_EXECUTABLE))
+ +		region->hv_map_flags |= HV_MAP_GPA_EXECUTABLE;
+++=======
++ 	rg = mshv_region_create(mem->guest_pfn, nr_pages,
++ 				mem->userspace_addr, mem->flags);
++ 	if (IS_ERR(rg))
++ 		return PTR_ERR(rg);
++ 
++ 	if (is_mmio)
++ 		rg->type = MSHV_REGION_TYPE_MMIO;
++ 	else if (mshv_partition_encrypted(partition) ||
++ 		 !mshv_region_movable_init(rg))
++ 		rg->type = MSHV_REGION_TYPE_MEM_PINNED;
++ 	else
++ 		rg->type = MSHV_REGION_TYPE_MEM_MOVABLE;
++ 
++ 	rg->partition = partition;
+++>>>>>>> b9a66cd5ccbb (mshv: Add support for movable memory regions)
+ +
+ +	/* Note: large_pages flag populated when we pin the pages */
+ +	if (!is_mmio)
+ +		region->flags.range_pinned = true;
+  
+ -	*regionpp = rg;
+ +	region->partition = partition;
+ +
+ +	*regionpp = region;
+  
+  	return 0;
+  }
+* Unmerged path drivers/hv/mshv_regions.c
+diff --git a/drivers/hv/Kconfig b/drivers/hv/Kconfig
+index c61a6953ba71..25bd4b947e0a 100644
+--- a/drivers/hv/Kconfig
++++ b/drivers/hv/Kconfig
+@@ -67,6 +67,8 @@ config MSHV_ROOT
+ 	depends on PAGE_SIZE_4KB
+ 	select EVENTFD
+ 	select VIRT_XFER_TO_GUEST_WORK
++	select HMM_MIRROR
++	select MMU_NOTIFIER
+ 	default n
+ 	help
+ 	  Select this option to enable support for booting and running as root
+* Unmerged path drivers/hv/mshv_regions.c
+* Unmerged path drivers/hv/mshv_root.h
+* Unmerged path drivers/hv/mshv_root_main.c
