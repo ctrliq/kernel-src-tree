@@ -1,0 +1,143 @@
+mshv: Add refcount and locking to mem regions
+
+jira KERNEL-1029
+Rebuild_History Non-Buildable kernel-6.12.0-211.7.1.el10_2
+commit-author Stanislav Kinsburskii <skinsburskii@linux.microsoft.com>
+commit c39dda08286f4d5ce4d114f8d5dbfdb85effbd6a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.7.1.el10_2/c39dda08.failed
+
+Introduce kref-based reference counting and spinlock protection for
+memory regions in Hyper-V partition management. This change improves
+memory region lifecycle management and ensures thread-safe access to the
+region list.
+
+Previously, the regions list was protected by the partition mutex.
+However, this approach is too heavy for frequent fault and invalidation
+operations. Finer grained locking is now used to improve efficiency and
+concurrency.
+
+This is a precursor to supporting movable memory regions. Fault and
+invalidation handling for movable regions will require safe traversal of
+the region list and holding a region reference while performing
+invalidation or fault operations.
+
+	Signed-off-by: Stanislav Kinsburskii <skinsburskii@linux.microsoft.com>
+	Signed-off-by: Wei Liu <wei.liu@kernel.org>
+(cherry picked from commit c39dda08286f4d5ce4d114f8d5dbfdb85effbd6a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/mshv_regions.c
+#	drivers/hv/mshv_root.h
+#	drivers/hv/mshv_root_main.c
+diff --cc drivers/hv/mshv_root.h
+index 0dfccfbe6123,4249534ba900..000000000000
+--- a/drivers/hv/mshv_root.h
++++ b/drivers/hv/mshv_root.h
+@@@ -312,4 -314,15 +315,18 @@@ extern struct mshv_root mshv_root
+  extern enum hv_scheduler_type hv_scheduler_type;
+  extern u8 * __percpu *hv_synic_eventring_tail;
+  
+++<<<<<<< HEAD
+++=======
++ struct mshv_mem_region *mshv_region_create(u64 guest_pfn, u64 nr_pages,
++ 					   u64 uaddr, u32 flags,
++ 					   bool is_mmio);
++ int mshv_region_share(struct mshv_mem_region *region);
++ int mshv_region_unshare(struct mshv_mem_region *region);
++ int mshv_region_map(struct mshv_mem_region *region);
++ void mshv_region_invalidate(struct mshv_mem_region *region);
++ int mshv_region_pin(struct mshv_mem_region *region);
++ void mshv_region_put(struct mshv_mem_region *region);
++ int mshv_region_get(struct mshv_mem_region *region);
++ 
+++>>>>>>> c39dda08286f (mshv: Add refcount and locking to mem regions)
+  #endif /* _MSHV_ROOT_H_ */
+diff --cc drivers/hv/mshv_root_main.c
+index db2c0d8ce967,aa1a11f4dc3e..000000000000
+--- a/drivers/hv/mshv_root_main.c
++++ b/drivers/hv/mshv_root_main.c
+@@@ -1201,30 -1091,20 +1202,31 @@@ static int mshv_partition_create_region
+  		if (mem->guest_pfn + nr_pages <= rg->start_gfn ||
+  		    rg->start_gfn + rg->nr_pages <= mem->guest_pfn)
+  			continue;
+- 
++ 		spin_unlock(&partition->pt_mem_regions_lock);
+  		return -EEXIST;
+  	}
++ 	spin_unlock(&partition->pt_mem_regions_lock);
+  
+ -	rg = mshv_region_create(mem->guest_pfn, nr_pages,
+ -				mem->userspace_addr, mem->flags,
+ -				is_mmio);
+ -	if (IS_ERR(rg))
+ -		return PTR_ERR(rg);
+ +	region = vzalloc(sizeof(*region) + sizeof(struct page *) * nr_pages);
+ +	if (!region)
+ +		return -ENOMEM;
+ +
+ +	region->nr_pages = nr_pages;
+ +	region->start_gfn = mem->guest_pfn;
+ +	region->start_uaddr = mem->userspace_addr;
+ +	region->hv_map_flags = HV_MAP_GPA_READABLE | HV_MAP_GPA_ADJUSTABLE;
+ +	if (mem->flags & BIT(MSHV_SET_MEM_BIT_WRITABLE))
+ +		region->hv_map_flags |= HV_MAP_GPA_WRITABLE;
+ +	if (mem->flags & BIT(MSHV_SET_MEM_BIT_EXECUTABLE))
+ +		region->hv_map_flags |= HV_MAP_GPA_EXECUTABLE;
+ +
+ +	/* Note: large_pages flag populated when we pin the pages */
+ +	if (!is_mmio)
+ +		region->flags.range_pinned = true;
+  
+ -	rg->partition = partition;
+ +	region->partition = partition;
+  
+ -	*regionpp = rg;
+ +	*regionpp = region;
+  
+  	return 0;
+  }
+@@@ -1403,10 -1258,16 +1410,20 @@@ mshv_unmap_user_memory(struct mshv_part
+  	/* Paranoia check */
+  	if (region->start_uaddr != mem.userspace_addr ||
+  	    region->start_gfn != mem.guest_pfn ||
+- 	    region->nr_pages != HVPFN_DOWN(mem.size))
++ 	    region->nr_pages != HVPFN_DOWN(mem.size)) {
++ 		spin_unlock(&partition->pt_mem_regions_lock);
+  		return -EINVAL;
++ 	}
+  
+++<<<<<<< HEAD
+ +	mshv_partition_destroy_region(region);
+++=======
++ 	hlist_del(&region->hnode);
++ 
++ 	spin_unlock(&partition->pt_mem_regions_lock);
++ 
++ 	mshv_region_put(region);
+++>>>>>>> c39dda08286f (mshv: Add refcount and locking to mem regions)
+  
+  	return 0;
+  }
+@@@ -1809,8 -1670,10 +1826,15 @@@ static void destroy_partition(struct ms
+  	remove_partition(partition);
+  
+  	hlist_for_each_entry_safe(region, n, &partition->pt_mem_regions,
+++<<<<<<< HEAD
+ +				  hnode)
+ +		mshv_partition_destroy_region(region);
+++=======
++ 				  hnode) {
++ 		hlist_del(&region->hnode);
++ 		mshv_region_put(region);
++ 	}
+++>>>>>>> c39dda08286f (mshv: Add refcount and locking to mem regions)
+  
+  	/* Withdraw and free all pages we deposited */
+  	hv_call_withdraw_memory(U64_MAX, NUMA_NO_NODE, partition->pt_id);
+* Unmerged path drivers/hv/mshv_regions.c
+* Unmerged path drivers/hv/mshv_regions.c
+* Unmerged path drivers/hv/mshv_root.h
+* Unmerged path drivers/hv/mshv_root_main.c
