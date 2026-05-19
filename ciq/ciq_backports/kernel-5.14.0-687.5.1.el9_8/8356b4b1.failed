@@ -1,0 +1,270 @@
+libceph: adapt ceph_x_challenge_blob hashing and msgr1 message signing
+
+jira KERNEL-1035
+Rebuild_History Non-Buildable kernel-5.14.0-687.5.1.el9_8
+commit-author Ilya Dryomov <idryomov@gmail.com>
+commit 8356b4b1103b8c970648c94bab724aa30e42d869
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.5.1.el9_8/8356b4b1.failed
+
+The existing approach where ceph_x_challenge_blob is encrypted with the
+client's secret key and then the digest derived from the ciphertext is
+used for the test doesn't work with CEPH_CRYPTO_AES256KRB5 because the
+confounder randomizes the ciphertext: the client and the server get two
+different ciphertexts and therefore two different digests.
+
+msgr1 signatures are affected the same way: a digest derived from the
+ciphertext for the message's "sigblock" is what becomes a signature and
+the two sides disagree on the expected value.
+
+For CEPH_CRYPTO_AES256KRB5 (and potential future encryption schemes),
+switch to HMAC-SHA256 function keyed in the same way as the existing
+encryption.  For CEPH_CRYPTO_AES, everything is preserved as is.
+
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit 8356b4b1103b8c970648c94bab724aa30e42d869)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ceph/auth_x.c
+#	net/ceph/crypto.c
+#	net/ceph/crypto.h
+#	net/ceph/messenger_v2.c
+diff --cc net/ceph/auth_x.c
+index 0da918d6893d,13b3df9af0ac..000000000000
+--- a/net/ceph/auth_x.c
++++ b/net/ceph/auth_x.c
+@@@ -542,10 -574,18 +548,25 @@@ static int ceph_x_build_request(struct 
+  		get_random_bytes(&auth->client_challenge, sizeof(u64));
+  		blob->client_challenge = auth->client_challenge;
+  		blob->server_challenge = cpu_to_le64(xi->server_challenge);
+++<<<<<<< HEAD
+ +		ret = ceph_x_encrypt(&xi->secret, enc_buf, CEPHX_AU_ENC_BUF_LEN,
+ +				     sizeof(*blob));
+ +		if (ret < 0)
+ +			return ret;
+++=======
++ 
++ 		if (xi->secret.type == CEPH_CRYPTO_AES) {
++ 			ret = ceph_x_encrypt(&xi->secret, 0 /* dummy */,
++ 					     enc_buf, CEPHX_AU_ENC_BUF_LEN,
++ 					     sizeof(*blob));
++ 			if (ret < 0)
++ 				return ret;
++ 		} else {
++ 			ceph_hmac_sha256(&xi->secret, blob, sizeof(*blob),
++ 					 enc_buf);
++ 			ret = SHA256_DIGEST_SIZE;
++ 		}
+++>>>>>>> 8356b4b1103b (libceph: adapt ceph_x_challenge_blob hashing and msgr1 message signing)
+  
+  		auth->struct_v = 3;  /* nautilus+ */
+  		auth->key = 0;
+@@@ -1033,12 -1089,18 +1062,27 @@@ static int calc_signature(struct ceph_x
+  		sigblock->data_len = msg->hdr.data_len;
+  		sigblock->seq_lower_word = *(__le32 *)&msg->hdr.seq;
+  
+++<<<<<<< HEAD
+ +		/* no leading len, no ceph_x_encrypt_header */
+ +		ret = ceph_crypt(&au->session_key, true, enc_buf,
+ +				 CEPHX_AU_ENC_BUF_LEN, sizeof(*sigblock),
+ +				 &ciphertext_len);
+ +		if (ret)
+ +			return ret;
+++=======
++ 		if (au->session_key.type == CEPH_CRYPTO_AES) {
++ 			int ciphertext_len; /* unused */
++ 
++ 			ret = ceph_crypt(&au->session_key, 0 /* dummy */,
++ 					 true, enc_buf, CEPHX_AU_ENC_BUF_LEN,
++ 					 sizeof(*sigblock), &ciphertext_len);
++ 			if (ret)
++ 				return ret;
++ 		} else {
++ 			ceph_hmac_sha256(&au->session_key, sigblock,
++ 					 sizeof(*sigblock), enc_buf);
++ 		}
+++>>>>>>> 8356b4b1103b (libceph: adapt ceph_x_challenge_blob hashing and msgr1 message signing)
+  
+  		*psig = penc->a ^ penc->b ^ penc->c ^ penc->d;
+  	}
+diff --cc net/ceph/crypto.c
+index 3453dc303315,b2067ea6c38a..000000000000
+--- a/net/ceph/crypto.c
++++ b/net/ceph/crypto.c
+@@@ -44,6 -83,9 +44,12 @@@ int ceph_crypto_key_prepare(struct ceph
+  		return 0; /* nothing to do */
+  	case CEPH_CRYPTO_AES:
+  		return set_aes_tfm(key);
+++<<<<<<< HEAD
+++=======
++ 	case CEPH_CRYPTO_AES256KRB5:
++ 		hmac_sha256_preparekey(&key->hmac_key, key->key, key->len);
++ 		return set_krb5_tfms(key, key_usages, key_usage_cnt);
+++>>>>>>> 8356b4b1103b (libceph: adapt ceph_x_challenge_blob hashing and msgr1 message signing)
+  	default:
+  		return -ENOTSUPP;
+  	}
+@@@ -123,12 -165,26 +129,35 @@@ int ceph_crypto_key_unarmor(struct ceph
+  
+  void ceph_crypto_key_destroy(struct ceph_crypto_key *key)
+  {
+++<<<<<<< HEAD
+ +	if (key) {
+ +		kfree_sensitive(key->key);
+ +		key->key = NULL;
+ +		if (key->tfm) {
+ +			crypto_free_sync_skcipher(key->tfm);
+ +			key->tfm = NULL;
+++=======
++ 	int i;
++ 
++ 	if (!key)
++ 		return;
++ 
++ 	kfree_sensitive(key->key);
++ 	key->key = NULL;
++ 
++ 	if (key->type == CEPH_CRYPTO_AES) {
++ 		if (key->aes_tfm) {
++ 			crypto_free_sync_skcipher(key->aes_tfm);
++ 			key->aes_tfm = NULL;
++ 		}
++ 	} else if (key->type == CEPH_CRYPTO_AES256KRB5) {
++ 		memzero_explicit(&key->hmac_key, sizeof(key->hmac_key));
++ 		for (i = 0; i < ARRAY_SIZE(key->krb5_tfms); i++) {
++ 			if (key->krb5_tfms[i]) {
++ 				crypto_free_aead(key->krb5_tfms[i]);
++ 				key->krb5_tfms[i] = NULL;
++ 			}
+++>>>>>>> 8356b4b1103b (libceph: adapt ceph_x_challenge_blob hashing and msgr1 message signing)
+  		}
+  	}
+  }
+diff --cc net/ceph/crypto.h
+index 2b8f8f68ff7a,3a2ade15abbc..000000000000
+--- a/net/ceph/crypto.h
++++ b/net/ceph/crypto.h
+@@@ -16,10 -17,19 +17,22 @@@ struct ceph_crypto_key 
+  	struct ceph_timespec created;
+  	int len;
+  	void *key;
+++<<<<<<< HEAD
+ +	struct crypto_sync_skcipher *tfm;
+++=======
++ 
++ 	union {
++ 		struct crypto_sync_skcipher *aes_tfm;
++ 		struct {
++ 			struct hmac_sha256_key hmac_key;
++ 			const struct krb5_enctype *krb5_type;
++ 			struct crypto_aead *krb5_tfms[3];
++ 		};
++ 	};
+++>>>>>>> 8356b4b1103b (libceph: adapt ceph_x_challenge_blob hashing and msgr1 message signing)
+  };
+  
+ -int ceph_crypto_key_prepare(struct ceph_crypto_key *key,
+ -			    const u32 *key_usages, int key_usage_cnt);
+ +int ceph_crypto_key_prepare(struct ceph_crypto_key *key);
+  int ceph_crypto_key_clone(struct ceph_crypto_key *dst,
+  			  const struct ceph_crypto_key *src);
+  int ceph_crypto_key_decode(struct ceph_crypto_key *key, void **p, void *end);
+diff --cc net/ceph/messenger_v2.c
+index b7440a6c7651,5ec3272cd2dd..000000000000
+--- a/net/ceph/messenger_v2.c
++++ b/net/ceph/messenger_v2.c
+@@@ -797,40 -779,26 +797,46 @@@ static int setup_crypto(struct ceph_con
+  	return 0;  /* auth_x, secure mode */
+  }
+  
+++<<<<<<< HEAD
+ +static int hmac_sha256(struct ceph_connection *con, const struct kvec *kvecs,
+ +		       int kvec_cnt, u8 *hmac)
+++=======
++ static void con_hmac_sha256(struct ceph_connection *con,
++ 			    const struct kvec *kvecs, int kvec_cnt,
++ 			    u8 hmac[SHA256_DIGEST_SIZE])
+++>>>>>>> 8356b4b1103b (libceph: adapt ceph_x_challenge_blob hashing and msgr1 message signing)
+  {
+ -	struct hmac_sha256_ctx ctx;
+ +	SHASH_DESC_ON_STACK(desc, con->v2.hmac_tfm);  /* tfm arg is ignored */
+ +	int ret;
+  	int i;
+  
+ -	dout("%s con %p hmac_key_set %d kvec_cnt %d\n", __func__, con,
+ -	     con->v2.hmac_key_set, kvec_cnt);
+ +	dout("%s con %p hmac_tfm %p kvec_cnt %d\n", __func__, con,
+ +	     con->v2.hmac_tfm, kvec_cnt);
+  
+ -	if (!con->v2.hmac_key_set) {
+ +	if (!con->v2.hmac_tfm) {
+  		memset(hmac, 0, SHA256_DIGEST_SIZE);
+ -		return;  /* auth_none */
+ +		return 0;  /* auth_none */
+  	}
+  
+ -	/* auth_x, both plain and secure modes */
+ -	hmac_sha256_init(&ctx, &con->v2.hmac_key);
+ -	for (i = 0; i < kvec_cnt; i++)
+ -		hmac_sha256_update(&ctx, kvecs[i].iov_base, kvecs[i].iov_len);
+ -	hmac_sha256_final(&ctx, hmac);
+ +	desc->tfm = con->v2.hmac_tfm;
+ +	ret = crypto_shash_init(desc);
+ +	if (ret)
+ +		goto out;
+ +
+ +	for (i = 0; i < kvec_cnt; i++) {
+ +		WARN_ON((unsigned long)kvecs[i].iov_base &
+ +			crypto_shash_alignmask(con->v2.hmac_tfm));
+ +		ret = crypto_shash_update(desc, kvecs[i].iov_base,
+ +					  kvecs[i].iov_len);
+ +		if (ret)
+ +			goto out;
+ +	}
+ +
+ +	ret = crypto_shash_final(desc, hmac);
+ +
+ +out:
+ +	shash_desc_zero(desc);
+ +	return ret;  /* auth_x, both plain and secure modes */
+  }
+  
+  static void gcm_inc_nonce(struct ceph_gcm_nonce *nonce)
+@@@ -1471,10 -1438,8 +1477,15 @@@ static int prepare_auth_signature(struc
+  	if (!buf)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	ret = hmac_sha256(con, con->v2.in_sign_kvecs, con->v2.in_sign_kvec_cnt,
+ +			  CTRL_BODY(buf));
+ +	if (ret)
+ +		return ret;
+++=======
++ 	con_hmac_sha256(con, con->v2.in_sign_kvecs, con->v2.in_sign_kvec_cnt,
++ 			CTRL_BODY(buf));
+++>>>>>>> 8356b4b1103b (libceph: adapt ceph_x_challenge_blob hashing and msgr1 message signing)
+  
+  	return prepare_control(con, FRAME_TAG_AUTH_SIGNATURE, buf,
+  			       SHA256_DIGEST_SIZE);
+@@@ -2470,10 -2436,8 +2481,15 @@@ static int process_auth_signature(struc
+  		return -EINVAL;
+  	}
+  
+++<<<<<<< HEAD
+ +	ret = hmac_sha256(con, con->v2.out_sign_kvecs,
+ +			  con->v2.out_sign_kvec_cnt, hmac);
+ +	if (ret)
+ +		return ret;
+++=======
++ 	con_hmac_sha256(con, con->v2.out_sign_kvecs, con->v2.out_sign_kvec_cnt,
++ 			hmac);
+++>>>>>>> 8356b4b1103b (libceph: adapt ceph_x_challenge_blob hashing and msgr1 message signing)
+  
+  	ceph_decode_need(&p, end, SHA256_DIGEST_SIZE, bad);
+  	if (crypto_memneq(p, hmac, SHA256_DIGEST_SIZE)) {
+* Unmerged path net/ceph/auth_x.c
+* Unmerged path net/ceph/crypto.c
+* Unmerged path net/ceph/crypto.h
+* Unmerged path net/ceph/messenger_v2.c
