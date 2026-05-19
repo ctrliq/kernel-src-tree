@@ -163,8 +163,9 @@ int crypto_register_sig(struct sig_alg *alg)
 {
 	struct crypto_alg *base = &alg->base;
 
-	if (!alg->sign)
-		alg->sign = sig_default_sign;
+	/* RHEL: disallow signing in the ALG to fix CVE-2023-6240 */
+	alg->sign = sig_default_sign;
+
 	if (!alg->verify)
 		alg->verify = sig_default_verify;
 	if (!alg->set_priv_key)

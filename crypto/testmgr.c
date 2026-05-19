@@ -4336,7 +4336,7 @@ static int test_sig_one(struct crypto_sig *tfm, const struct sig_testvec *vecs)
 	 * Don't invoke sign test (which requires a private key)
 	 * for vectors with only a public key.
 	 */
-	if (vecs->public_key_vec)
+	if (1 || vecs->public_key_vec)  /* RHEL: Disable sign tests */
 		return 0;
 
 	sig_size = crypto_sig_maxsize(tfm);
