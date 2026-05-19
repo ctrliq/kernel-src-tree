@@ -1,0 +1,189 @@
+mshv: Extend create partition ioctl to support cpu features
+
+jira KERNEL-1029
+Rebuild_History Non-Buildable kernel-6.12.0-211.7.1.el10_2
+commit-author Muminul Islam <muislam@microsoft.com>
+commit c91fe5f162f278d4aa960d06d2dbc42f9857593a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.7.1.el10_2/c91fe5f1.failed
+
+The existing mshv create partition ioctl does not provide a way to
+specify which cpu features are enabled in the guest. Instead, it
+attempts to enable all features and those that are not supported are
+silently disabled by the hypervisor.
+
+This was done to reduce unnecessary complexity and is sufficient for
+many cases. However, new scenarios require fine-grained control over
+these features.
+
+Define a new mshv_create_partition_v2 structure which supports
+passing the disabled processor and xsave feature bits through to the
+create partition hypercall directly.
+
+Introduce a new flag MSHV_PT_BIT_CPU_AND_XSAVE_FEATURES which enables
+the new structure. If unset, the original mshv_create_partition struct
+is used, with the old behavior of enabling all features.
+
+Co-developed-by: Jinank Jain <jinankjain@microsoft.com>
+	Signed-off-by: Jinank Jain <jinankjain@microsoft.com>
+	Signed-off-by: Muminul Islam <muislam@microsoft.com>
+	Signed-off-by: Nuno Das Neves <nunodasneves@linux.microsoft.com>
+	Reviewed-by: Michael Kelley <mhklinux@outlook.com>
+	Signed-off-by: Wei Liu <wei.liu@kernel.org>
+(cherry picked from commit c91fe5f162f278d4aa960d06d2dbc42f9857593a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/mshv_root_main.c
+diff --cc drivers/hv/mshv_root_main.c
+index b837a3bb2a35,45c7a5fea1cf..000000000000
+--- a/drivers/hv/mshv_root_main.c
++++ b/drivers/hv/mshv_root_main.c
+@@@ -1874,19 -1876,71 +1876,80 @@@ static long mshv_ioctl_process_pt_flags
+  	    args.pt_isolation >= MSHV_PT_ISOLATION_COUNT)
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	pr_err("using unsupported MSHV_CREATE_PARTITION ioctl\n");
+ +	add_taint(TAINT_SUPPORT_REMOVED, LOCKDEP_STILL_OK);
+ +
+ +	/* Only support EXO partitions */
+ +	creation_flags = HV_PARTITION_CREATION_FLAG_EXO_PARTITION |
+ +			 HV_PARTITION_CREATION_FLAG_INTERCEPT_MESSAGE_PAGE_ENABLED;
+++=======
++ 	disabled_procs = &cr_props->disabled_processor_features;
++ 	disabled_xsave = &cr_props->disabled_processor_xsave_features;
+++>>>>>>> c91fe5f162f2 (mshv: Extend create partition ioctl to support cpu features)
++ 
++ 	/* Check if user provided newer struct with feature fields */
++ 	if (args.pt_flags & BIT_ULL(MSHV_PT_BIT_CPU_AND_XSAVE_FEATURES)) {
++ 		if (copy_from_user(&args, user_arg, sizeof(args)))
++ 			return -EFAULT;
++ 
++ 		/* Re-validate v1 fields after second copy_from_user() */
++ 		if ((args.pt_flags & ~MSHV_PT_FLAGS_MASK) ||
++ 		    args.pt_isolation >= MSHV_PT_ISOLATION_COUNT)
++ 			return -EINVAL;
++ 
++ 		if (args.pt_num_cpu_fbanks != MSHV_NUM_CPU_FEATURES_BANKS ||
++ 		    mshv_field_nonzero(args, pt_rsvd) ||
++ 		    mshv_field_nonzero(args, pt_rsvd1))
++ 			return -EINVAL;
++ 
++ 		/*
++ 		 * Note this assumes MSHV_NUM_CPU_FEATURES_BANKS will never
++ 		 * change and equals HV_PARTITION_PROCESSOR_FEATURES_BANKS
++ 		 * (i.e. 2).
++ 		 *
++ 		 * Further banks (index >= 2) will be modifiable as 'early'
++ 		 * properties via the set partition property hypercall.
++ 		 */
++ 		for (i = 0; i < HV_PARTITION_PROCESSOR_FEATURES_BANKS; i++)
++ 			disabled_procs->as_uint64[i] = args.pt_cpu_fbanks[i];
++ 
++ #if IS_ENABLED(CONFIG_X86_64)
++ 		disabled_xsave->as_uint64 = args.pt_disabled_xsave;
++ #else
++ 		/*
++ 		 * In practice this field is ignored on arm64, but safer to
++ 		 * zero it in case it is ever used.
++ 		 */
++ 		disabled_xsave->as_uint64 = 0;
++ 
++ 		if (mshv_field_nonzero(args, pt_rsvd2))
++ 			return -EINVAL;
++ #endif
++ 	} else {
++ 		/*
++ 		 * v1 behavior: try to enable everything. The hypervisor will
++ 		 * disable features that are not supported. The banks can be
++ 		 * queried via the get partition property hypercall.
++ 		 */
++ 		for (i = 0; i < HV_PARTITION_PROCESSOR_FEATURES_BANKS; i++)
++ 			disabled_procs->as_uint64[i] = 0;
++ 
++ 		disabled_xsave->as_uint64 = 0;
++ 	}
+  
+- 	if (args.pt_flags & BIT(MSHV_PT_BIT_LAPIC))
+- 		creation_flags |= HV_PARTITION_CREATION_FLAG_LAPIC_ENABLED;
+- 	if (args.pt_flags & BIT(MSHV_PT_BIT_X2APIC))
+- 		creation_flags |= HV_PARTITION_CREATION_FLAG_X2APIC_CAPABLE;
+- 	if (args.pt_flags & BIT(MSHV_PT_BIT_GPA_SUPER_PAGES))
+- 		creation_flags |= HV_PARTITION_CREATION_FLAG_GPA_SUPER_PAGES_ENABLED;
++ 	/* Only support EXO partitions */
++ 	*pt_flags = HV_PARTITION_CREATION_FLAG_EXO_PARTITION |
++ 		    HV_PARTITION_CREATION_FLAG_INTERCEPT_MESSAGE_PAGE_ENABLED;
++ 
++ 	if (args.pt_flags & BIT_ULL(MSHV_PT_BIT_LAPIC))
++ 		*pt_flags |= HV_PARTITION_CREATION_FLAG_LAPIC_ENABLED;
++ 	if (args.pt_flags & BIT_ULL(MSHV_PT_BIT_X2APIC))
++ 		*pt_flags |= HV_PARTITION_CREATION_FLAG_X2APIC_CAPABLE;
++ 	if (args.pt_flags & BIT_ULL(MSHV_PT_BIT_GPA_SUPER_PAGES))
++ 		*pt_flags |= HV_PARTITION_CREATION_FLAG_GPA_SUPER_PAGES_ENABLED;
++ 
++ 	isol_props->as_uint64 = 0;
+  
+  	switch (args.pt_isolation) {
+  	case MSHV_PT_ISOLATION_NONE:
+* Unmerged path drivers/hv/mshv_root_main.c
+diff --git a/include/uapi/linux/mshv.h b/include/uapi/linux/mshv.h
+index 374f75e198bc..b645d17cc531 100644
+--- a/include/uapi/linux/mshv.h
++++ b/include/uapi/linux/mshv.h
+@@ -26,6 +26,7 @@ enum {
+ 	MSHV_PT_BIT_LAPIC,
+ 	MSHV_PT_BIT_X2APIC,
+ 	MSHV_PT_BIT_GPA_SUPER_PAGES,
++	MSHV_PT_BIT_CPU_AND_XSAVE_FEATURES,
+ 	MSHV_PT_BIT_COUNT,
+ };
+ 
+@@ -41,6 +42,8 @@ enum {
+  * @pt_flags: Bitmask of 1 << MSHV_PT_BIT_*
+  * @pt_isolation: MSHV_PT_ISOLATION_*
+  *
++ * This is the initial/v1 version for backward compatibility.
++ *
+  * Returns a file descriptor to act as a handle to a guest partition.
+  * At this point the partition is not yet initialized in the hypervisor.
+  * Some operations must be done with the partition in this state, e.g. setting
+@@ -52,6 +55,37 @@ struct mshv_create_partition {
+ 	__u64 pt_isolation;
+ };
+ 
++#define MSHV_NUM_CPU_FEATURES_BANKS 2
++
++/**
++ * struct mshv_create_partition_v2
++ *
++ * This is extended version of the above initial MSHV_CREATE_PARTITION
++ * ioctl and allows for following additional parameters:
++ *
++ * @pt_num_cpu_fbanks: Must be set to MSHV_NUM_CPU_FEATURES_BANKS.
++ * @pt_cpu_fbanks: Disabled processor feature banks array.
++ * @pt_disabled_xsave: Disabled xsave feature bits.
++ *
++ * pt_cpu_fbanks and pt_disabled_xsave are passed through as-is to the create
++ * partition hypercall.
++ *
++ * Returns : same as above original mshv_create_partition
++ */
++struct mshv_create_partition_v2 {
++	__u64 pt_flags;
++	__u64 pt_isolation;
++	__u16 pt_num_cpu_fbanks;
++	__u8  pt_rsvd[6];		/* MBZ */
++	__u64 pt_cpu_fbanks[MSHV_NUM_CPU_FEATURES_BANKS];
++	__u64 pt_rsvd1[2];		/* MBZ */
++#if defined(__x86_64__)
++	__u64 pt_disabled_xsave;
++#else
++	__u64 pt_rsvd2;			/* MBZ */
++#endif
++} __packed;
++
+ /* /dev/mshv */
+ #define MSHV_CREATE_PARTITION	_IOW(MSHV_IOCTL, 0x00, struct mshv_create_partition)
+ 
