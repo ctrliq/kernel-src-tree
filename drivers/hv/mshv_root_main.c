@@ -594,14 +594,99 @@ static long mshv_run_vp_with_root_scheduler(struct mshv_vp *vp)
 static_assert(sizeof(struct hv_message) <= MSHV_RUN_VP_BUF_SZ,
 	      "sizeof(struct hv_message) must not exceed MSHV_RUN_VP_BUF_SZ");
 
+static struct mshv_mem_region *
+mshv_partition_region_by_gfn(struct mshv_partition *partition, u64 gfn)
+{
+	struct mshv_mem_region *region;
+
+	hlist_for_each_entry(region, &partition->pt_mem_regions, hnode) {
+		if (gfn >= region->start_gfn &&
+		    gfn < region->start_gfn + region->nr_pages)
+			return region;
+	}
+
+	return NULL;
+}
+
+static struct mshv_mem_region *
+mshv_partition_region_by_gfn_get(struct mshv_partition *p, u64 gfn)
+{
+	struct mshv_mem_region *region;
+
+	spin_lock(&p->pt_mem_regions_lock);
+	region = mshv_partition_region_by_gfn(p, gfn);
+	if (!region || !mshv_region_get(region)) {
+		spin_unlock(&p->pt_mem_regions_lock);
+		return NULL;
+	}
+	spin_unlock(&p->pt_mem_regions_lock);
+
+	return region;
+}
+
+/**
+ * mshv_handle_gpa_intercept - Handle GPA (Guest Physical Address) intercepts.
+ * @vp: Pointer to the virtual processor structure.
+ *
+ * This function processes GPA intercepts by identifying the memory region
+ * corresponding to the intercepted GPA, aligning the page offset, and
+ * mapping the required pages. It ensures that the region is valid and
+ * handles faults efficiently by mapping multiple pages at once.
+ *
+ * Return: true if the intercept was handled successfully, false otherwise.
+ */
+static bool mshv_handle_gpa_intercept(struct mshv_vp *vp)
+{
+	struct mshv_partition *p = vp->vp_partition;
+	struct mshv_mem_region *region;
+	bool ret;
+	u64 gfn;
+#if defined(CONFIG_X86_64)
+	struct hv_x64_memory_intercept_message *msg =
+		(struct hv_x64_memory_intercept_message *)
+		vp->vp_intercept_msg_page->u.payload;
+#elif defined(CONFIG_ARM64)
+	struct hv_arm64_memory_intercept_message *msg =
+		(struct hv_arm64_memory_intercept_message *)
+		vp->vp_intercept_msg_page->u.payload;
+#endif
+
+	gfn = HVPFN_DOWN(msg->guest_physical_address);
+
+	region = mshv_partition_region_by_gfn_get(p, gfn);
+	if (!region)
+		return false;
+
+	/* Only movable memory ranges are supported for GPA intercepts */
+	if (region->type == MSHV_REGION_TYPE_MEM_MOVABLE)
+		ret = mshv_region_handle_gfn_fault(region, gfn);
+	else
+		ret = false;
+
+	mshv_region_put(region);
+
+	return ret;
+}
+
+static bool mshv_vp_handle_intercept(struct mshv_vp *vp)
+{
+	switch (vp->vp_intercept_msg_page->header.message_type) {
+	case HVMSG_GPA_INTERCEPT:
+		return mshv_handle_gpa_intercept(vp);
+	}
+	return false;
+}
+
 static long mshv_vp_ioctl_run_vp(struct mshv_vp *vp, void __user *ret_msg)
 {
 	long rc;
 
-	if (hv_scheduler_type == HV_SCHEDULER_TYPE_ROOT)
-		rc = mshv_run_vp_with_root_scheduler(vp);
-	else
-		rc = mshv_run_vp_with_hyp_scheduler(vp);
+	do {
+		if (hv_scheduler_type == HV_SCHEDULER_TYPE_ROOT)
+			rc = mshv_run_vp_with_root_scheduler(vp);
+		else
+			rc = mshv_run_vp_with_hyp_scheduler(vp);
+	} while (rc == 0 && mshv_vp_handle_intercept(vp));
 
 	if (rc)
 		return rc;
@@ -1059,131 +1144,6 @@ static void mshv_async_hvcall_handler(void *data, u64 *status)
 	*status = partition->async_hypercall_status;
 }
 
-static int
-mshv_partition_region_share(struct mshv_mem_region *region)
-{
-	u32 flags = HV_MODIFY_SPA_PAGE_HOST_ACCESS_MAKE_SHARED;
-
-	if (region->flags.large_pages)
-		flags |= HV_MODIFY_SPA_PAGE_HOST_ACCESS_LARGE_PAGE;
-
-	return hv_call_modify_spa_host_access(region->partition->pt_id,
-			region->pages, region->nr_pages,
-			HV_MAP_GPA_READABLE | HV_MAP_GPA_WRITABLE,
-			flags, true);
-}
-
-static int
-mshv_partition_region_unshare(struct mshv_mem_region *region)
-{
-	u32 flags = HV_MODIFY_SPA_PAGE_HOST_ACCESS_MAKE_EXCLUSIVE;
-
-	if (region->flags.large_pages)
-		flags |= HV_MODIFY_SPA_PAGE_HOST_ACCESS_LARGE_PAGE;
-
-	return hv_call_modify_spa_host_access(region->partition->pt_id,
-			region->pages, region->nr_pages,
-			0,
-			flags, false);
-}
-
-static int
-mshv_region_remap_pages(struct mshv_mem_region *region, u32 map_flags,
-			u64 page_offset, u64 page_count)
-{
-	if (page_offset + page_count > region->nr_pages)
-		return -EINVAL;
-
-	if (region->flags.large_pages)
-		map_flags |= HV_MAP_GPA_LARGE_PAGE;
-
-	/* ask the hypervisor to map guest ram */
-	return hv_call_map_gpa_pages(region->partition->pt_id,
-				     region->start_gfn + page_offset,
-				     page_count, map_flags,
-				     region->pages + page_offset);
-}
-
-static int
-mshv_region_map(struct mshv_mem_region *region)
-{
-	u32 map_flags = region->hv_map_flags;
-
-	return mshv_region_remap_pages(region, map_flags,
-				       0, region->nr_pages);
-}
-
-static void
-mshv_region_invalidate_pages(struct mshv_mem_region *region,
-			     u64 page_offset, u64 page_count)
-{
-	if (region->flags.range_pinned)
-		unpin_user_pages(region->pages + page_offset, page_count);
-
-	memset(region->pages + page_offset, 0,
-	       page_count * sizeof(struct page *));
-}
-
-static void
-mshv_region_invalidate(struct mshv_mem_region *region)
-{
-	mshv_region_invalidate_pages(region, 0, region->nr_pages);
-}
-
-static int
-mshv_region_pin(struct mshv_mem_region *region)
-{
-	u64 done_count, nr_pages;
-	struct page **pages;
-	__u64 userspace_addr;
-	int ret;
-
-	for (done_count = 0; done_count < region->nr_pages; done_count += ret) {
-		pages = region->pages + done_count;
-		userspace_addr = region->start_uaddr +
-				 done_count * HV_HYP_PAGE_SIZE;
-		nr_pages = min(region->nr_pages - done_count,
-			       MSHV_PIN_PAGES_BATCH_SIZE);
-
-		/*
-		 * Pinning assuming 4k pages works for large pages too.
-		 * All page structs within the large page are returned.
-		 *
-		 * Pin requests are batched because pin_user_pages_fast
-		 * with the FOLL_LONGTERM flag does a large temporary
-		 * allocation of contiguous memory.
-		 */
-		ret = pin_user_pages_fast(userspace_addr, nr_pages,
-					  FOLL_WRITE | FOLL_LONGTERM,
-					  pages);
-		if (ret < 0)
-			goto release_pages;
-	}
-
-	if (PageHuge(region->pages[0]))
-		region->flags.large_pages = true;
-
-	return 0;
-
-release_pages:
-	mshv_region_invalidate_pages(region, 0, done_count);
-	return ret;
-}
-
-static struct mshv_mem_region *
-mshv_partition_region_by_gfn(struct mshv_partition *partition, u64 gfn)
-{
-	struct mshv_mem_region *region;
-
-	hlist_for_each_entry(region, &partition->pt_mem_regions, hnode) {
-		if (gfn >= region->start_gfn &&
-		    gfn < region->start_gfn + region->nr_pages)
-			return region;
-	}
-
-	return NULL;
-}
-
 /*
  * NB: caller checks and makes sure mem->size is page aligned
  * Returns: 0 with regionpp updated on success, or -errno
@@ -1193,38 +1153,36 @@ static int mshv_partition_create_region(struct mshv_partition *partition,
 					struct mshv_mem_region **regionpp,
 					bool is_mmio)
 {
-	struct mshv_mem_region *region, *rg;
+	struct mshv_mem_region *rg;
 	u64 nr_pages = HVPFN_DOWN(mem->size);
 
 	/* Reject overlapping regions */
+	spin_lock(&partition->pt_mem_regions_lock);
 	hlist_for_each_entry(rg, &partition->pt_mem_regions, hnode) {
 		if (mem->guest_pfn + nr_pages <= rg->start_gfn ||
 		    rg->start_gfn + rg->nr_pages <= mem->guest_pfn)
 			continue;
-
+		spin_unlock(&partition->pt_mem_regions_lock);
 		return -EEXIST;
 	}
+	spin_unlock(&partition->pt_mem_regions_lock);
 
-	region = vzalloc(sizeof(*region) + sizeof(struct page *) * nr_pages);
-	if (!region)
-		return -ENOMEM;
+	rg = mshv_region_create(mem->guest_pfn, nr_pages,
+				mem->userspace_addr, mem->flags);
+	if (IS_ERR(rg))
+		return PTR_ERR(rg);
 
-	region->nr_pages = nr_pages;
-	region->start_gfn = mem->guest_pfn;
-	region->start_uaddr = mem->userspace_addr;
-	region->hv_map_flags = HV_MAP_GPA_READABLE | HV_MAP_GPA_ADJUSTABLE;
-	if (mem->flags & BIT(MSHV_SET_MEM_BIT_WRITABLE))
-		region->hv_map_flags |= HV_MAP_GPA_WRITABLE;
-	if (mem->flags & BIT(MSHV_SET_MEM_BIT_EXECUTABLE))
-		region->hv_map_flags |= HV_MAP_GPA_EXECUTABLE;
+	if (is_mmio)
+		rg->type = MSHV_REGION_TYPE_MMIO;
+	else if (mshv_partition_encrypted(partition) ||
+		 !mshv_region_movable_init(rg))
+		rg->type = MSHV_REGION_TYPE_MEM_PINNED;
+	else
+		rg->type = MSHV_REGION_TYPE_MEM_MOVABLE;
 
-	/* Note: large_pages flag populated when we pin the pages */
-	if (!is_mmio)
-		region->flags.range_pinned = true;
+	rg->partition = partition;
 
-	region->partition = partition;
-
-	*regionpp = region;
+	*regionpp = rg;
 
 	return 0;
 }
@@ -1262,7 +1220,7 @@ static int mshv_prepare_pinned_region(struct mshv_mem_region *region)
 	 * access to guest memory regions.
 	 */
 	if (mshv_partition_encrypted(partition)) {
-		ret = mshv_partition_region_unshare(region);
+		ret = mshv_region_unshare(region);
 		if (ret) {
 			pt_err(partition,
 			       "Failed to unshare memory region (guest_pfn: %llu): %d\n",
@@ -1275,7 +1233,7 @@ static int mshv_prepare_pinned_region(struct mshv_mem_region *region)
 	if (ret && mshv_partition_encrypted(partition)) {
 		int shrc;
 
-		shrc = mshv_partition_region_share(region);
+		shrc = mshv_region_share(region);
 		if (!shrc)
 			goto invalidate_region;
 
@@ -1337,53 +1295,41 @@ mshv_map_user_memory(struct mshv_partition *partition,
 	if (ret)
 		return ret;
 
-	if (is_mmio)
-		ret = hv_call_map_mmio_pages(partition->pt_id, mem.guest_pfn,
-					     mmio_pfn, HVPFN_DOWN(mem.size));
-	else
+	switch (region->type) {
+	case MSHV_REGION_TYPE_MEM_PINNED:
 		ret = mshv_prepare_pinned_region(region);
+		break;
+	case MSHV_REGION_TYPE_MEM_MOVABLE:
+		/*
+		 * For movable memory regions, remap with no access to let
+		 * the hypervisor track dirty pages, enabling pre-copy live
+		 * migration.
+		 */
+		ret = hv_call_map_gpa_pages(partition->pt_id,
+					    region->start_gfn,
+					    region->nr_pages,
+					    HV_MAP_GPA_NO_ACCESS, NULL);
+		break;
+	case MSHV_REGION_TYPE_MMIO:
+		ret = hv_call_map_mmio_pages(partition->pt_id,
+					     region->start_gfn,
+					     mmio_pfn,
+					     region->nr_pages);
+		break;
+	}
 
 	if (ret)
 		goto errout;
 
-	/* Install the new region */
+	spin_lock(&partition->pt_mem_regions_lock);
 	hlist_add_head(&region->hnode, &partition->pt_mem_regions);
+	spin_unlock(&partition->pt_mem_regions_lock);
 
 	return 0;
 
 errout:
 	vfree(region);
 	return ret;
-}
-
-static void mshv_partition_destroy_region(struct mshv_mem_region *region)
-{
-	struct mshv_partition *partition = region->partition;
-	u32 unmap_flags = 0;
-	int ret;
-
-	hlist_del(&region->hnode);
-
-	if (mshv_partition_encrypted(partition)) {
-		ret = mshv_partition_region_share(region);
-		if (ret) {
-			pt_err(partition,
-			       "Failed to regain access to memory, unpinning user pages will fail and crash the host error: %d\n",
-			       ret);
-			return;
-		}
-	}
-
-	if (region->flags.large_pages)
-		unmap_flags |= HV_UNMAP_GPA_LARGE_PAGE;
-
-	/* ignore unmap failures and continue as process may be exiting */
-	hv_call_unmap_gpa_pages(partition->pt_id, region->start_gfn,
-				region->nr_pages, unmap_flags);
-
-	mshv_region_invalidate(region);
-
-	vfree(region);
 }
 
 /* Called for unmapping both the guest ram and the mmio space */
@@ -1396,17 +1342,27 @@ mshv_unmap_user_memory(struct mshv_partition *partition,
 	if (!(mem.flags & BIT(MSHV_SET_MEM_BIT_UNMAP)))
 		return -EINVAL;
 
+	spin_lock(&partition->pt_mem_regions_lock);
+
 	region = mshv_partition_region_by_gfn(partition, mem.guest_pfn);
-	if (!region)
-		return -EINVAL;
+	if (!region) {
+		spin_unlock(&partition->pt_mem_regions_lock);
+		return -ENOENT;
+	}
 
 	/* Paranoia check */
 	if (region->start_uaddr != mem.userspace_addr ||
 	    region->start_gfn != mem.guest_pfn ||
-	    region->nr_pages != HVPFN_DOWN(mem.size))
+	    region->nr_pages != HVPFN_DOWN(mem.size)) {
+		spin_unlock(&partition->pt_mem_regions_lock);
 		return -EINVAL;
+	}
 
-	mshv_partition_destroy_region(region);
+	hlist_del(&region->hnode);
+
+	spin_unlock(&partition->pt_mem_regions_lock);
+
+	mshv_region_put(region);
 
 	return 0;
 }
@@ -1809,8 +1765,10 @@ static void destroy_partition(struct mshv_partition *partition)
 	remove_partition(partition);
 
 	hlist_for_each_entry_safe(region, n, &partition->pt_mem_regions,
-				  hnode)
-		mshv_partition_destroy_region(region);
+				  hnode) {
+		hlist_del(&region->hnode);
+		mshv_region_put(region);
+	}
 
 	/* Withdraw and free all pages we deposited */
 	hv_call_withdraw_memory(U64_MAX, NUMA_NO_NODE, partition->pt_id);
@@ -1876,19 +1834,21 @@ add_partition(struct mshv_partition *partition)
 	return 0;
 }
 
-static long
-mshv_ioctl_create_partition(void __user *user_arg, struct device *module_dev)
-{
-	struct mshv_create_partition args;
-	u64 creation_flags;
-	struct hv_partition_creation_properties creation_properties = {};
-	union hv_partition_isolation_properties isolation_properties = {};
-	struct mshv_partition *partition;
-	struct file *file;
-	int fd;
-	long ret;
+static_assert(MSHV_NUM_CPU_FEATURES_BANKS ==
+	      HV_PARTITION_PROCESSOR_FEATURES_BANKS);
 
-	if (copy_from_user(&args, user_arg, sizeof(args)))
+static long mshv_ioctl_process_pt_flags(void __user *user_arg, u64 *pt_flags,
+					struct hv_partition_creation_properties *cr_props,
+					union hv_partition_isolation_properties *isol_props)
+{
+	int i;
+	struct mshv_create_partition_v2 args;
+	union hv_partition_processor_features *disabled_procs;
+	union hv_partition_processor_xsave_features *disabled_xsave;
+
+	/* First, copy v1 struct in case user is on previous versions */
+	if (copy_from_user(&args, user_arg,
+			   sizeof(struct mshv_create_partition)))
 		return -EFAULT;
 
 	if ((args.pt_flags & ~MSHV_PT_FLAGS_MASK) ||
@@ -1898,23 +1858,97 @@ mshv_ioctl_create_partition(void __user *user_arg, struct device *module_dev)
 	pr_err("using unsupported MSHV_CREATE_PARTITION ioctl\n");
 	add_taint(TAINT_SUPPORT_REMOVED, LOCKDEP_STILL_OK);
 
-	/* Only support EXO partitions */
-	creation_flags = HV_PARTITION_CREATION_FLAG_EXO_PARTITION |
-			 HV_PARTITION_CREATION_FLAG_INTERCEPT_MESSAGE_PAGE_ENABLED;
+	disabled_procs = &cr_props->disabled_processor_features;
+	disabled_xsave = &cr_props->disabled_processor_xsave_features;
 
-	if (args.pt_flags & BIT(MSHV_PT_BIT_LAPIC))
-		creation_flags |= HV_PARTITION_CREATION_FLAG_LAPIC_ENABLED;
-	if (args.pt_flags & BIT(MSHV_PT_BIT_X2APIC))
-		creation_flags |= HV_PARTITION_CREATION_FLAG_X2APIC_CAPABLE;
-	if (args.pt_flags & BIT(MSHV_PT_BIT_GPA_SUPER_PAGES))
-		creation_flags |= HV_PARTITION_CREATION_FLAG_GPA_SUPER_PAGES_ENABLED;
+	/* Check if user provided newer struct with feature fields */
+	if (args.pt_flags & BIT_ULL(MSHV_PT_BIT_CPU_AND_XSAVE_FEATURES)) {
+		if (copy_from_user(&args, user_arg, sizeof(args)))
+			return -EFAULT;
+
+		/* Re-validate v1 fields after second copy_from_user() */
+		if ((args.pt_flags & ~MSHV_PT_FLAGS_MASK) ||
+		    args.pt_isolation >= MSHV_PT_ISOLATION_COUNT)
+			return -EINVAL;
+
+		if (args.pt_num_cpu_fbanks != MSHV_NUM_CPU_FEATURES_BANKS ||
+		    mshv_field_nonzero(args, pt_rsvd) ||
+		    mshv_field_nonzero(args, pt_rsvd1))
+			return -EINVAL;
+
+		/*
+		 * Note this assumes MSHV_NUM_CPU_FEATURES_BANKS will never
+		 * change and equals HV_PARTITION_PROCESSOR_FEATURES_BANKS
+		 * (i.e. 2).
+		 *
+		 * Further banks (index >= 2) will be modifiable as 'early'
+		 * properties via the set partition property hypercall.
+		 */
+		for (i = 0; i < HV_PARTITION_PROCESSOR_FEATURES_BANKS; i++)
+			disabled_procs->as_uint64[i] = args.pt_cpu_fbanks[i];
+
+#if IS_ENABLED(CONFIG_X86_64)
+		disabled_xsave->as_uint64 = args.pt_disabled_xsave;
+#else
+		/*
+		 * In practice this field is ignored on arm64, but safer to
+		 * zero it in case it is ever used.
+		 */
+		disabled_xsave->as_uint64 = 0;
+
+		if (mshv_field_nonzero(args, pt_rsvd2))
+			return -EINVAL;
+#endif
+	} else {
+		/*
+		 * v1 behavior: try to enable everything. The hypervisor will
+		 * disable features that are not supported. The banks can be
+		 * queried via the get partition property hypercall.
+		 */
+		for (i = 0; i < HV_PARTITION_PROCESSOR_FEATURES_BANKS; i++)
+			disabled_procs->as_uint64[i] = 0;
+
+		disabled_xsave->as_uint64 = 0;
+	}
+
+	/* Only support EXO partitions */
+	*pt_flags = HV_PARTITION_CREATION_FLAG_EXO_PARTITION |
+		    HV_PARTITION_CREATION_FLAG_INTERCEPT_MESSAGE_PAGE_ENABLED;
+
+	if (args.pt_flags & BIT_ULL(MSHV_PT_BIT_LAPIC))
+		*pt_flags |= HV_PARTITION_CREATION_FLAG_LAPIC_ENABLED;
+	if (args.pt_flags & BIT_ULL(MSHV_PT_BIT_X2APIC))
+		*pt_flags |= HV_PARTITION_CREATION_FLAG_X2APIC_CAPABLE;
+	if (args.pt_flags & BIT_ULL(MSHV_PT_BIT_GPA_SUPER_PAGES))
+		*pt_flags |= HV_PARTITION_CREATION_FLAG_GPA_SUPER_PAGES_ENABLED;
+
+	isol_props->as_uint64 = 0;
 
 	switch (args.pt_isolation) {
 	case MSHV_PT_ISOLATION_NONE:
-		isolation_properties.isolation_type =
-			HV_PARTITION_ISOLATION_TYPE_NONE;
+		isol_props->isolation_type = HV_PARTITION_ISOLATION_TYPE_NONE;
 		break;
 	}
+
+	return 0;
+}
+
+static long
+mshv_ioctl_create_partition(void __user *user_arg, struct device *module_dev)
+{
+	u64 creation_flags;
+	struct hv_partition_creation_properties creation_properties;
+	union hv_partition_isolation_properties isolation_properties;
+	struct mshv_partition *partition;
+	struct file *file;
+	int fd;
+	long ret;
+
+	ret = mshv_ioctl_process_pt_flags(user_arg, &creation_flags,
+					  &creation_properties,
+					  &isolation_properties);
+	if (ret)
+		return ret;
 
 	partition = kzalloc(sizeof(*partition), GFP_KERNEL);
 	if (!partition)
@@ -1935,6 +1969,7 @@ mshv_ioctl_create_partition(void __user *user_arg, struct device *module_dev)
 
 	INIT_HLIST_HEAD(&partition->pt_devices);
 
+	spin_lock_init(&partition->pt_mem_regions_lock);
 	INIT_HLIST_HEAD(&partition->pt_mem_regions);
 
 	mshv_eventfd_init(partition);

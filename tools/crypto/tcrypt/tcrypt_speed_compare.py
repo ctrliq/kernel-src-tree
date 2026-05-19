@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#! /usr/bin/python3 -s
 # SPDX-License-Identifier: GPL-2.0
 #
 # Copyright (C) xFusion Digital Technologies Co., Ltd., 2023

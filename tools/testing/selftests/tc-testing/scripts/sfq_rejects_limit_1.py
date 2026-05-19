@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#! /usr/bin/python3 -s
 # SPDX-License-Identifier: GPL-2.0
 #
 # Script that checks that SFQ rejects a limit of 1 at the kernel

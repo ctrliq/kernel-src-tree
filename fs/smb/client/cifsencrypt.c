@@ -77,6 +77,10 @@ int __cifs_calc_signature(struct smb_rqst *rqst,
 	if (rc < 0)
 		return rc;
 
+	rc = cifs_shash_iter(&rqst->rq_iter, iov_iter_count(&rqst->rq_iter), shash);
+	if (rc < 0)
+		return rc;
+
 	rc = crypto_shash_final(shash, signature);
 	if (rc)
 		cifs_dbg(VFS, "%s: Could not generate hash\n", __func__);

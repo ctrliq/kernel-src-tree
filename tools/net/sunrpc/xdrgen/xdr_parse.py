@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#! /usr/bin/python3 -s
 # ex: set filetype=python:
 
 """Common parsing code for xdrgen"""
