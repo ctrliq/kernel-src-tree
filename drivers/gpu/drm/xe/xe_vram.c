@@ -25,6 +25,8 @@
 #include "xe_vram.h"
 #include "xe_vram_types.h"
 
+#define BAR_SIZE_SHIFT 20
+
 static void resize_bar(struct xe_device *xe, int resno, resource_size_t size)
 {
 	struct pci_dev *pdev = to_pci_dev(xe->drm.dev);
@@ -69,23 +71,25 @@ void xe_vram_resize_bar(struct xe_device *xe)
 
 	/* set to a specific size? */
 	if (force_vram_bar_size) {
-		rebar_size = pci_rebar_bytes_to_size(force_vram_bar_size *
-						     (resource_size_t)SZ_1M);
+		u32 bar_size_bit;
 
-		if (!pci_rebar_size_supported(pdev, LMEM_BAR, rebar_size)) {
+		rebar_size = force_vram_bar_size * (resource_size_t)SZ_1M;
+
+		bar_size_bit = bar_size_mask & BIT(pci_rebar_bytes_to_size(rebar_size));
+
+		if (!bar_size_bit) {
 			drm_info(&xe->drm,
 				 "Requested size: %lluMiB is not supported by rebar sizes: 0x%x. Leaving default: %lluMiB\n",
-				 (u64)pci_rebar_size_to_bytes(rebar_size) >> 20,
-				 bar_size_mask,
-				 (u64)current_size >> 20);
+				 (u64)rebar_size >> 20, bar_size_mask, (u64)current_size >> 20);
 			return;
 		}
 
-		rebar_size = pci_rebar_size_to_bytes(rebar_size);
+		rebar_size = 1ULL << (__fls(bar_size_bit) + BAR_SIZE_SHIFT);
+
 		if (rebar_size == current_size)
 			return;
 	} else {
-		rebar_size = pci_rebar_size_to_bytes(__fls(bar_size_mask));
+		rebar_size = 1ULL << (__fls(bar_size_mask) + BAR_SIZE_SHIFT);
 
 		/* only resize if larger than current */
 		if (rebar_size <= current_size)
