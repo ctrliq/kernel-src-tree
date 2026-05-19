@@ -1,0 +1,123 @@
+mshv: handle gpa intercepts for arm64
+
+jira KERNEL-1029
+Rebuild_History Non-Buildable kernel-6.12.0-211.7.1.el10_2
+commit-author Anirudh Rayabharam (Microsoft) <anirudh@anirudhrb.com>
+commit 12ffd561d2de28825f39e15e8d22346d26b09688
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.7.1.el10_2/12ffd561.failed
+
+The mshv driver now uses movable pages for guests. For arm64 guests
+to be functional, handle gpa intercepts for arm64 too (the current
+code implements handling only for x86).
+
+Move some arch-agnostic functions out of #ifdefs so that they can be
+re-used.
+
+Fixes: b9a66cd5ccbb ("mshv: Add support for movable memory regions")
+	Signed-off-by: Anirudh Rayabharam (Microsoft) <anirudh@anirudhrb.com>
+	Signed-off-by: Wei Liu <wei.liu@kernel.org>
+(cherry picked from commit 12ffd561d2de28825f39e15e8d22346d26b09688)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/mshv_root_main.c
+diff --cc drivers/hv/mshv_root_main.c
+index ec9460342b44,681b58154d5e..000000000000
+--- a/drivers/hv/mshv_root_main.c
++++ b/drivers/hv/mshv_root_main.c
+@@@ -594,6 -597,89 +594,92 @@@ static long mshv_run_vp_with_root_sched
+  static_assert(sizeof(struct hv_message) <= MSHV_RUN_VP_BUF_SZ,
+  	      "sizeof(struct hv_message) must not exceed MSHV_RUN_VP_BUF_SZ");
+  
+++<<<<<<< HEAD
+++=======
++ static struct mshv_mem_region *
++ mshv_partition_region_by_gfn(struct mshv_partition *partition, u64 gfn)
++ {
++ 	struct mshv_mem_region *region;
++ 
++ 	hlist_for_each_entry(region, &partition->pt_mem_regions, hnode) {
++ 		if (gfn >= region->start_gfn &&
++ 		    gfn < region->start_gfn + region->nr_pages)
++ 			return region;
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ static struct mshv_mem_region *
++ mshv_partition_region_by_gfn_get(struct mshv_partition *p, u64 gfn)
++ {
++ 	struct mshv_mem_region *region;
++ 
++ 	spin_lock(&p->pt_mem_regions_lock);
++ 	region = mshv_partition_region_by_gfn(p, gfn);
++ 	if (!region || !mshv_region_get(region)) {
++ 		spin_unlock(&p->pt_mem_regions_lock);
++ 		return NULL;
++ 	}
++ 	spin_unlock(&p->pt_mem_regions_lock);
++ 
++ 	return region;
++ }
++ 
++ /**
++  * mshv_handle_gpa_intercept - Handle GPA (Guest Physical Address) intercepts.
++  * @vp: Pointer to the virtual processor structure.
++  *
++  * This function processes GPA intercepts by identifying the memory region
++  * corresponding to the intercepted GPA, aligning the page offset, and
++  * mapping the required pages. It ensures that the region is valid and
++  * handles faults efficiently by mapping multiple pages at once.
++  *
++  * Return: true if the intercept was handled successfully, false otherwise.
++  */
++ static bool mshv_handle_gpa_intercept(struct mshv_vp *vp)
++ {
++ 	struct mshv_partition *p = vp->vp_partition;
++ 	struct mshv_mem_region *region;
++ 	bool ret;
++ 	u64 gfn;
++ #if defined(CONFIG_X86_64)
++ 	struct hv_x64_memory_intercept_message *msg =
++ 		(struct hv_x64_memory_intercept_message *)
++ 		vp->vp_intercept_msg_page->u.payload;
++ #elif defined(CONFIG_ARM64)
++ 	struct hv_arm64_memory_intercept_message *msg =
++ 		(struct hv_arm64_memory_intercept_message *)
++ 		vp->vp_intercept_msg_page->u.payload;
++ #endif
++ 
++ 	gfn = HVPFN_DOWN(msg->guest_physical_address);
++ 
++ 	region = mshv_partition_region_by_gfn_get(p, gfn);
++ 	if (!region)
++ 		return false;
++ 
++ 	/* Only movable memory ranges are supported for GPA intercepts */
++ 	if (region->type == MSHV_REGION_TYPE_MEM_MOVABLE)
++ 		ret = mshv_region_handle_gfn_fault(region, gfn);
++ 	else
++ 		ret = false;
++ 
++ 	mshv_region_put(region);
++ 
++ 	return ret;
++ }
++ 
++ static bool mshv_vp_handle_intercept(struct mshv_vp *vp)
++ {
++ 	switch (vp->vp_intercept_msg_page->header.message_type) {
++ 	case HVMSG_GPA_INTERCEPT:
++ 		return mshv_handle_gpa_intercept(vp);
++ 	}
++ 	return false;
++ }
++ 
+++>>>>>>> 12ffd561d2de (mshv: handle gpa intercepts for arm64)
+  static long mshv_vp_ioctl_run_vp(struct mshv_vp *vp, void __user *ret_msg)
+  {
+  	long rc;
+* Unmerged path drivers/hv/mshv_root_main.c
