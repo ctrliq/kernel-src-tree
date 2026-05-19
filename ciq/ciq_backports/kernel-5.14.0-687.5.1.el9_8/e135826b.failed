@@ -1,0 +1,169 @@
+mm/rmap: introduce and use hugetlb_remove_rmap()
+
+jira KERNEL-1035
+Rebuild_History Non-Buildable kernel-5.14.0-687.5.1.el9_8
+commit-author David Hildenbrand <david@redhat.com>
+commit e135826b2da0cf25305086dc9ac1e91718a148e1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.5.1.el9_8/e135826b.failed
+
+hugetlb rmap handling differs quite a lot from "ordinary" rmap code.  For
+example, hugetlb currently only supports entire mappings, and treats any
+mapping as mapped using a single "logical PTE".  Let's move it out of the
+way so we can overhaul our "ordinary" rmap.  implementation/interface.
+
+Let's introduce and use hugetlb_remove_rmap() and remove the hugetlb code
+from page_remove_rmap().  This effectively removes one check on the
+small-folio path as well.
+
+Add sanity checks that we end up with the right folios in the right
+functions.
+
+Note: all possible candidates that need care are page_remove_rmap() that
+      pass compound=true.
+
+Link: https://lkml.kernel.org/r/20231220224504.646757-3-david@redhat.com
+	Signed-off-by: David Hildenbrand <david@redhat.com>
+	Reviewed-by: Yin Fengwei <fengwei.yin@intel.com>
+	Reviewed-by: Ryan Roberts <ryan.roberts@arm.com>
+	Reviewed-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+	Reviewed-by: Muchun Song <songmuchun@bytedance.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Muchun Song <muchun.song@linux.dev>
+	Cc: Peter Xu <peterx@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit e135826b2da0cf25305086dc9ac1e91718a148e1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hugetlb.c
+diff --cc mm/hugetlb.c
+index 76c4b2c9b5df,ef48ae673890..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -5522,45 -5676,9 +5522,45 @@@ void __unmap_hugepage_range(struct mmu_
+  					make_pte_marker(PTE_MARKER_UFFD_WP),
+  					sz);
+  		hugetlb_count_sub(pages_per_huge_page(h), mm);
+- 		page_remove_rmap(page, vma, true);
++ 		hugetlb_remove_rmap(page_folio(page));
+  
+ +		/*
+ +		 * Restore the reservation for anonymous page, otherwise the
+ +		 * backing page could be stolen by someone.
+ +		 * If there we are freeing a surplus, do not set the restore
+ +		 * reservation bit.
+ +		 */
+ +		if (!h->surplus_huge_pages && __vma_private_lock(vma) &&
+ +		    folio_test_anon(page_folio(page))) {
+ +			folio_set_hugetlb_restore_reserve(page_folio(page));
+ +			/* Reservation to be adjusted after the spin lock */
+ +			adjust_reservation = true;
+ +		}
+ +
+  		spin_unlock(ptl);
+ +
+ +		/*
+ +		 * Adjust the reservation for the region that will have the
+ +		 * reserve restored. Keep in mind that vma_needs_reservation() changes
+ +		 * resv->adds_in_progress if it succeeds. If this is not done,
+ +		 * do_exit() will not see it, and will keep the reservation
+ +		 * forever.
+ +		 */
+ +		if (adjust_reservation) {
+ +			int rc = vma_needs_reservation(h, vma, address);
+ +
+ +			if (rc < 0)
+ +				/* Pressumably allocate_file_region_entries failed
+ +				 * to allocate a file_region struct. Clear
+ +				 * hugetlb_restore_reserve so that global reserve
+ +				 * count will not be incremented by free_huge_folio.
+ +				 * Act as if we consumed the reservation.
+ +				 */
+ +				folio_clear_hugetlb_restore_reserve(page_folio(page));
+ +			else if (rc)
+ +				vma_add_reservation(h, vma, address);
+ +		}
+ +
+  		tlb_remove_page_size(tlb, page, huge_page_size(h));
+  		/*
+  		 * Bail out after unmapping reference page if supplied
+@@@ -5874,8 -5987,8 +5874,13 @@@ retry_avoidcopy
+  
+  		/* Break COW or unshare */
+  		huge_ptep_clear_flush(vma, haddr, ptep);
+++<<<<<<< HEAD
+ +		page_remove_rmap(&old_folio->page, vma, true);
+ +		hugepage_add_new_anon_rmap(new_folio, vma, haddr);
+++=======
++ 		hugetlb_remove_rmap(old_folio);
++ 		hugetlb_add_new_anon_rmap(new_folio, vma, haddr);
+++>>>>>>> e135826b2da0 (mm/rmap: introduce and use hugetlb_remove_rmap())
+  		if (huge_pte_uffd_wp(pte))
+  			newpte = huge_pte_mkuffd_wp(newpte);
+  		set_huge_pte_at(mm, haddr, ptep, newpte, huge_page_size(h));
+diff --git a/include/linux/rmap.h b/include/linux/rmap.h
+index 1054c1a09065..af6ff17388de 100644
+--- a/include/linux/rmap.h
++++ b/include/linux/rmap.h
+@@ -208,6 +208,13 @@ void hugepage_add_anon_rmap(struct folio *, struct vm_area_struct *,
+ void hugepage_add_new_anon_rmap(struct folio *, struct vm_area_struct *,
+ 		unsigned long address);
+ 
++static inline void hugetlb_remove_rmap(struct folio *folio)
++{
++	VM_WARN_ON_FOLIO(!folio_test_hugetlb(folio), folio);
++
++	atomic_dec(&folio->_entire_mapcount);
++}
++
+ static inline void __page_dup_rmap(struct page *page, bool compound)
+ {
+ 	if (compound) {
+* Unmerged path mm/hugetlb.c
+diff --git a/mm/rmap.c b/mm/rmap.c
+index f13983bb8c4f..80d51d80b591 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -1401,15 +1401,9 @@ void page_remove_rmap(struct page *page, struct vm_area_struct *vma,
+ 	bool last;
+ 	enum node_stat_item idx;
+ 
++	VM_WARN_ON_FOLIO(folio_test_hugetlb(folio), folio);
+ 	VM_BUG_ON_PAGE(compound && !PageHead(page), page);
+ 
+-	/* Hugetlb pages are not counted in NR_*MAPPED */
+-	if (unlikely(folio_test_hugetlb(folio))) {
+-		/* hugetlb pages are always mapped with pmds */
+-		atomic_dec(&folio->_entire_mapcount);
+-		return;
+-	}
+-
+ 	/* Is page being unmapped by PTE? Is this its last map to be removed? */
+ 	if (likely(!compound)) {
+ 		last = atomic_add_negative(-1, &page->_mapcount);
+@@ -1766,7 +1760,10 @@ static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
+ 			dec_mm_counter(mm, mm_counter_file(&folio->page));
+ 		}
+ discard:
+-		page_remove_rmap(subpage, vma, folio_test_hugetlb(folio));
++		if (unlikely(folio_test_hugetlb(folio)))
++			hugetlb_remove_rmap(folio);
++		else
++			page_remove_rmap(subpage, vma, false);
+ 		if (vma->vm_flags & VM_LOCKED)
+ 			mlock_drain_local();
+ 		folio_put(folio);
+@@ -2120,7 +2117,10 @@ static bool try_to_migrate_one(struct folio *folio, struct vm_area_struct *vma,
+ 			 */
+ 		}
+ 
+-		page_remove_rmap(subpage, vma, folio_test_hugetlb(folio));
++		if (unlikely(folio_test_hugetlb(folio)))
++			hugetlb_remove_rmap(folio);
++		else
++			page_remove_rmap(subpage, vma, false);
+ 		if (vma->vm_flags & VM_LOCKED)
+ 			mlock_drain_local();
+ 		folio_put(folio);
