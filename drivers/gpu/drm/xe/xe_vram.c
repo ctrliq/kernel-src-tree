@@ -27,11 +27,29 @@
 
 #define BAR_SIZE_SHIFT 20
 
+static void release_bars(struct pci_dev *pdev)
+{
+	struct resource *res;
+	int i;
+
+	pci_dev_for_each_resource(pdev, res, i) {
+		if (!res->parent)
+			continue;
+
+		if (!(res->flags & IORESOURCE_MEM_64))
+			continue;
+
+		pci_release_resource(pdev, i);
+	}
+}
+
 static void resize_bar(struct xe_device *xe, int resno, resource_size_t size)
 {
 	struct pci_dev *pdev = to_pci_dev(xe->drm.dev);
 	int bar_size = pci_rebar_bytes_to_size(size);
 	int ret;
+
+	release_bars(pdev);
 
 	ret = pci_resize_resource(pdev, resno, bar_size, 0);
 	if (ret) {
