@@ -1,0 +1,575 @@
+ice: dpll: Support E825-C SyncE and dynamic pin discovery
+
+jira KERNEL-1029
+Rebuild_History Non-Buildable kernel-6.12.0-211.7.1.el10_2
+commit-author Arkadiusz Kubalewski <arkadiusz.kubalewski@intel.com>
+commit ad1df4f2d591e167bc64b8a7ce6328a2735e3d58
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.7.1.el10_2/ad1df4f2.failed
+
+Implement SyncE support for the E825-C Ethernet controller using the
+DPLL subsystem. Unlike E810, the E825-C architecture relies on platform
+firmware (ACPI) to describe connections between the NIC's recovered clock
+outputs and external DPLL inputs.
+
+Implement the following mechanisms to support this architecture:
+
+1. Discovery Mechanism: The driver parses the 'dpll-pins' and 'dpll-pin names'
+   firmware properties to identify the external DPLL pins (parents)
+   corresponding to its RCLK outputs ("rclk0", "rclk1"). It uses
+   fwnode_dpll_pin_find() to locate these parent pins in the DPLL core.
+
+2. Asynchronous Registration: Since the platform DPLL driver (e.g.
+   zl3073x) may probe independently of the network driver, utilize
+   the DPLL notifier chain The driver listens for DPLL_PIN_CREATED
+   events to detect when the parent MUX pins become available, then
+   registers its own Recovered Clock (RCLK) pins as children of those
+   parents.
+
+3. Hardware Configuration: Implement the specific register access logic
+   for E825-C CGU (Clock Generation Unit) registers (R10, R11). This
+   includes configuring the bypass MUXes and clock dividers required to
+   drive SyncE signals.
+
+4. Split Initialization: Refactor `ice_dpll_init()` to separate the
+   static initialization path of E810 from the dynamic, firmware-driven
+   path required for E825-C.
+
+	Reviewed-by: Aleksandr Loktionov <aleksandr.loktionov@intel.com>
+Co-developed-by: Ivan Vecera <ivecera@redhat.com>
+	Signed-off-by: Ivan Vecera <ivecera@redhat.com>
+Co-developed-by: Grzegorz Nitka <grzegorz.nitka@intel.com>
+	Signed-off-by: Grzegorz Nitka <grzegorz.nitka@intel.com>
+	Signed-off-by: Arkadiusz Kubalewski <arkadiusz.kubalewski@intel.com>
+Link: https://patch.msgid.link/20260203174002.705176-10-ivecera@redhat.com
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+
+(cherry picked from commit ad1df4f2d591e167bc64b8a7ce6328a2735e3d58)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_dpll.c
+#	drivers/net/ethernet/intel/ice/ice_dpll.h
+diff --cc drivers/net/ethernet/intel/ice/ice_dpll.c
+index 64b7b045ecd5,baf02512d041..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_dpll.c
++++ b/drivers/net/ethernet/intel/ice/ice_dpll.c
+@@@ -2814,7 -2961,8 +2961,12 @@@ static void ice_dpll_release_pins(struc
+  	int i;
+  
+  	for (i = 0; i < count; i++)
+++<<<<<<< HEAD
+ +		dpll_pin_put(pins[i].pin, NULL);
+++=======
++ 		if (!IS_ERR_OR_NULL(pins[i].pin))
++ 			dpll_pin_put(pins[i].pin, &pins[i].tracker);
+++>>>>>>> ad1df4f2d591 (ice: dpll: Support E825-C SyncE and dynamic pin discovery)
+  }
+  
+  /**
+@@@ -2839,8 -2988,11 +2992,16 @@@ ice_dpll_get_pins(struct ice_pf *pf, st
+  	int i, ret;
+  
+  	for (i = 0; i < count; i++) {
+++<<<<<<< HEAD
+ +		pins[i].pin = dpll_pin_get(clock_id, i + start_idx, THIS_MODULE,
+ +					   &pins[i].prop, NULL);
+++=======
++ 		pin_index = start_idx;
++ 		if (start_idx != DPLL_PIN_IDX_UNSPEC)
++ 			pin_index += i;
++ 		pins[i].pin = dpll_pin_get(clock_id, pin_index, THIS_MODULE,
++ 					   &pins[i].prop, &pins[i].tracker);
+++>>>>>>> ad1df4f2d591 (ice: dpll: Support E825-C SyncE and dynamic pin discovery)
+  		if (IS_ERR(pins[i].pin)) {
+  			ret = PTR_ERR(pins[i].pin);
+  			goto release_pins;
+@@@ -3037,11 -3191,106 +3200,106 @@@ static void ice_dpll_deinit_rclk_pin(st
+  	if (WARN_ON_ONCE(!vsi || !vsi->netdev))
+  		return;
+  	dpll_netdev_pin_clear(vsi->netdev);
+ -	dpll_pin_put(rclk->pin, &rclk->tracker);
+ +	dpll_pin_put(rclk->pin, NULL);
+  }
+  
++ static bool ice_dpll_is_fwnode_pin(struct ice_dpll_pin *pin)
++ {
++ 	return !IS_ERR_OR_NULL(pin->fwnode);
++ }
++ 
++ static void ice_dpll_pin_notify_work(struct work_struct *work)
++ {
++ 	struct ice_dpll_pin_work *w = container_of(work,
++ 						   struct ice_dpll_pin_work,
++ 						   work);
++ 	struct ice_dpll_pin *pin, *parent = w->pin;
++ 	struct ice_pf *pf = parent->pf;
++ 	int ret;
++ 
++ 	wait_for_completion(&pf->dplls.dpll_init);
++ 	if (!test_bit(ICE_FLAG_DPLL, pf->flags))
++ 		goto out; /* DPLL initialization failed */
++ 
++ 	switch (w->action) {
++ 	case DPLL_PIN_CREATED:
++ 		if (!IS_ERR_OR_NULL(parent->pin)) {
++ 			/* We have already our pin registered */
++ 			goto out;
++ 		}
++ 
++ 		/* Grab reference on fwnode pin */
++ 		parent->pin = fwnode_dpll_pin_find(parent->fwnode,
++ 						   &parent->tracker);
++ 		if (IS_ERR_OR_NULL(parent->pin)) {
++ 			dev_err(ice_pf_to_dev(pf),
++ 				"Cannot get fwnode pin reference\n");
++ 			goto out;
++ 		}
++ 
++ 		/* Register rclk pin */
++ 		pin = &pf->dplls.rclk;
++ 		ret = dpll_pin_on_pin_register(parent->pin, pin->pin,
++ 					       &ice_dpll_rclk_ops, pin);
++ 		if (ret) {
++ 			dev_err(ice_pf_to_dev(pf),
++ 				"Failed to register pin: %pe\n", ERR_PTR(ret));
++ 			dpll_pin_put(parent->pin, &parent->tracker);
++ 			parent->pin = NULL;
++ 			goto out;
++ 		}
++ 		break;
++ 	case DPLL_PIN_DELETED:
++ 		if (IS_ERR_OR_NULL(parent->pin)) {
++ 			/* We have already our pin unregistered */
++ 			goto out;
++ 		}
++ 
++ 		/* Unregister rclk pin */
++ 		pin = &pf->dplls.rclk;
++ 		dpll_pin_on_pin_unregister(parent->pin, pin->pin,
++ 					   &ice_dpll_rclk_ops, pin);
++ 
++ 		/* Drop fwnode pin reference */
++ 		dpll_pin_put(parent->pin, &parent->tracker);
++ 		parent->pin = NULL;
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ out:
++ 	kfree(w);
++ }
++ 
++ static int ice_dpll_pin_notify(struct notifier_block *nb, unsigned long action,
++ 			       void *data)
++ {
++ 	struct ice_dpll_pin *pin = container_of(nb, struct ice_dpll_pin, nb);
++ 	struct dpll_pin_notifier_info *info = data;
++ 	struct ice_dpll_pin_work *work;
++ 
++ 	if (action != DPLL_PIN_CREATED && action != DPLL_PIN_DELETED)
++ 		return NOTIFY_DONE;
++ 
++ 	/* Check if the reported pin is this one */
++ 	if (pin->fwnode != info->fwnode)
++ 		return NOTIFY_DONE; /* Not this pin */
++ 
++ 	work = kzalloc(sizeof(*work), GFP_KERNEL);
++ 	if (!work)
++ 		return NOTIFY_DONE;
++ 
++ 	INIT_WORK(&work->work, ice_dpll_pin_notify_work);
++ 	work->action = action;
++ 	work->pin = pin;
++ 
++ 	queue_work(pin->pf->dplls.wq, &work->work);
++ 
++ 	return NOTIFY_OK;
++ }
++ 
+  /**
+-  * ice_dpll_init_rclk_pins - initialize recovered clock pin
++  * ice_dpll_init_pin_common - initialize pin
+   * @pf: board private structure
+   * @pin: pin to register
+   * @start_idx: on which index shall allocation start in dpll subsystem
+@@@ -3287,7 -3735,8 +3743,12 @@@ ice_dpll_init_dpll(struct ice_pf *pf, s
+  		ice_dpll_update_state(pf, d, true);
+  		ret = dpll_device_register(d->dpll, type, ops, d);
+  		if (ret) {
+++<<<<<<< HEAD
+ +			dpll_device_put(d->dpll, NULL);
+++=======
++ 			dpll_device_put(d->dpll, &d->tracker);
++ 			d->dpll = NULL;
+++>>>>>>> ad1df4f2d591 (ice: dpll: Support E825-C SyncE and dynamic pin discovery)
+  			return ret;
+  		}
+  		d->ops = ops;
+diff --cc drivers/net/ethernet/intel/ice/ice_dpll.h
+index c0da03384ce9,ae42cdea0ee1..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_dpll.h
++++ b/drivers/net/ethernet/intel/ice/ice_dpll.h
+@@@ -37,6 -44,9 +43,12 @@@ struct ice_dpll_pin_work 
+  struct ice_dpll_pin {
+  	struct dpll_pin *pin;
+  	struct ice_pf *pf;
+++<<<<<<< HEAD
+++=======
++ 	dpll_tracker tracker;
++ 	struct fwnode_handle *fwnode;
++ 	struct notifier_block nb;
+++>>>>>>> ad1df4f2d591 (ice: dpll: Support E825-C SyncE and dynamic pin discovery)
+  	u8 idx;
+  	u8 num_parents;
+  	u8 parent_idx[ICE_DPLL_RCLK_NUM_MAX];
+* Unmerged path drivers/net/ethernet/intel/ice/ice_dpll.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_dpll.h
+diff --git a/drivers/net/ethernet/intel/ice/ice_lib.c b/drivers/net/ethernet/intel/ice/ice_lib.c
+index b6dc7e9a48e1..32c2f4c315c7 100644
+--- a/drivers/net/ethernet/intel/ice/ice_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_lib.c
+@@ -3964,6 +3964,9 @@ void ice_init_feature_support(struct ice_pf *pf)
+ 		break;
+ 	}
+ 
++	if (pf->hw.mac_type == ICE_MAC_GENERIC_3K_E825)
++		ice_set_feature_support(pf, ICE_F_PHY_RCLK);
++
+ 	if (pf->hw.mac_type == ICE_MAC_E830) {
+ 		ice_set_feature_support(pf, ICE_F_MBX_LIMIT);
+ 		ice_set_feature_support(pf, ICE_F_GCS);
+diff --git a/drivers/net/ethernet/intel/ice/ice_ptp.c b/drivers/net/ethernet/intel/ice/ice_ptp.c
+index 09893b866b6b..43a1fda89351 100644
+--- a/drivers/net/ethernet/intel/ice/ice_ptp.c
++++ b/drivers/net/ethernet/intel/ice/ice_ptp.c
+@@ -1296,6 +1296,38 @@ void ice_ptp_link_change(struct ice_pf *pf, bool linkup)
+ 	if (pf->hw.reset_ongoing)
+ 		return;
+ 
++	if (hw->mac_type == ICE_MAC_GENERIC_3K_E825) {
++		int pin, err;
++
++		if (!test_bit(ICE_FLAG_DPLL, pf->flags))
++			return;
++
++		mutex_lock(&pf->dplls.lock);
++		for (pin = 0; pin < ICE_SYNCE_CLK_NUM; pin++) {
++			enum ice_synce_clk clk_pin;
++			bool active;
++			u8 port_num;
++
++			port_num = ptp_port->port_num;
++			clk_pin = (enum ice_synce_clk)pin;
++			err = ice_tspll_bypass_mux_active_e825c(hw,
++								port_num,
++								&active,
++								clk_pin);
++			if (WARN_ON_ONCE(err)) {
++				mutex_unlock(&pf->dplls.lock);
++				return;
++			}
++
++			err = ice_tspll_cfg_synce_ethdiv_e825c(hw, clk_pin);
++			if (active && WARN_ON_ONCE(err)) {
++				mutex_unlock(&pf->dplls.lock);
++				return;
++			}
++		}
++		mutex_unlock(&pf->dplls.lock);
++	}
++
+ 	switch (hw->mac_type) {
+ 	case ICE_MAC_E810:
+ 	case ICE_MAC_E830:
+diff --git a/drivers/net/ethernet/intel/ice/ice_ptp_hw.c b/drivers/net/ethernet/intel/ice/ice_ptp_hw.c
+index 35680dbe4a7f..61c0a0d93ea8 100644
+--- a/drivers/net/ethernet/intel/ice/ice_ptp_hw.c
++++ b/drivers/net/ethernet/intel/ice/ice_ptp_hw.c
+@@ -5903,7 +5903,14 @@ int ice_get_cgu_rclk_pin_info(struct ice_hw *hw, u8 *base_idx, u8 *pin_num)
+ 			*base_idx = SI_REF1P;
+ 		else
+ 			ret = -ENODEV;
+-
++		break;
++	case ICE_DEV_ID_E825C_BACKPLANE:
++	case ICE_DEV_ID_E825C_QSFP:
++	case ICE_DEV_ID_E825C_SFP:
++	case ICE_DEV_ID_E825C_SGMII:
++		*pin_num = ICE_SYNCE_CLK_NUM;
++		*base_idx = 0;
++		ret = 0;
+ 		break;
+ 	default:
+ 		ret = -ENODEV;
+diff --git a/drivers/net/ethernet/intel/ice/ice_tspll.c b/drivers/net/ethernet/intel/ice/ice_tspll.c
+index 66320a4ab86f..fd4b58eb9bc0 100644
+--- a/drivers/net/ethernet/intel/ice/ice_tspll.c
++++ b/drivers/net/ethernet/intel/ice/ice_tspll.c
+@@ -624,3 +624,220 @@ int ice_tspll_init(struct ice_hw *hw)
+ 
+ 	return err;
+ }
++
++/**
++ * ice_tspll_bypass_mux_active_e825c - check if the given port is set active
++ * @hw: Pointer to the HW struct
++ * @port: Number of the port
++ * @active: Output flag showing if port is active
++ * @output: Output pin, we have two in E825C
++ *
++ * Check if given port is selected as recovered clock source for given output.
++ *
++ * Return:
++ * * 0 - success
++ * * negative - error
++ */
++int ice_tspll_bypass_mux_active_e825c(struct ice_hw *hw, u8 port, bool *active,
++				      enum ice_synce_clk output)
++{
++	u8 active_clk;
++	u32 val;
++	int err;
++
++	switch (output) {
++	case ICE_SYNCE_CLK0:
++		err = ice_read_cgu_reg(hw, ICE_CGU_R10, &val);
++		if (err)
++			return err;
++		active_clk = FIELD_GET(ICE_CGU_R10_SYNCE_S_REF_CLK, val);
++		break;
++	case ICE_SYNCE_CLK1:
++		err = ice_read_cgu_reg(hw, ICE_CGU_R11, &val);
++		if (err)
++			return err;
++		active_clk = FIELD_GET(ICE_CGU_R11_SYNCE_S_BYP_CLK, val);
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	if (active_clk == port % hw->ptp.ports_per_phy +
++			  ICE_CGU_BYPASS_MUX_OFFSET_E825C)
++		*active = true;
++	else
++		*active = false;
++
++	return 0;
++}
++
++/**
++ * ice_tspll_cfg_bypass_mux_e825c - configure reference clock mux
++ * @hw: Pointer to the HW struct
++ * @ena: true to enable the reference, false if disable
++ * @port_num: Number of the port
++ * @output: Output pin, we have two in E825C
++ *
++ * Set reference clock source and output clock selection.
++ *
++ * Context: Called under pf->dplls.lock
++ * Return:
++ * * 0 - success
++ * * negative - error
++ */
++int ice_tspll_cfg_bypass_mux_e825c(struct ice_hw *hw, bool ena, u32 port_num,
++				   enum ice_synce_clk output)
++{
++	u8 first_mux;
++	int err;
++	u32 r10;
++
++	err = ice_read_cgu_reg(hw, ICE_CGU_R10, &r10);
++	if (err)
++		return err;
++
++	if (!ena)
++		first_mux = ICE_CGU_NET_REF_CLK0;
++	else
++		first_mux = port_num + ICE_CGU_BYPASS_MUX_OFFSET_E825C;
++
++	r10 &= ~(ICE_CGU_R10_SYNCE_DCK_RST | ICE_CGU_R10_SYNCE_DCK2_RST);
++
++	switch (output) {
++	case ICE_SYNCE_CLK0:
++		r10 &= ~(ICE_CGU_R10_SYNCE_ETHCLKO_SEL |
++			 ICE_CGU_R10_SYNCE_ETHDIV_LOAD |
++			 ICE_CGU_R10_SYNCE_S_REF_CLK);
++		r10 |= FIELD_PREP(ICE_CGU_R10_SYNCE_S_REF_CLK, first_mux);
++		r10 |= FIELD_PREP(ICE_CGU_R10_SYNCE_ETHCLKO_SEL,
++				  ICE_CGU_REF_CLK_BYP0_DIV);
++		break;
++	case ICE_SYNCE_CLK1:
++	{
++		u32 val;
++
++		err = ice_read_cgu_reg(hw, ICE_CGU_R11, &val);
++		if (err)
++			return err;
++		val &= ~ICE_CGU_R11_SYNCE_S_BYP_CLK;
++		val |= FIELD_PREP(ICE_CGU_R11_SYNCE_S_BYP_CLK, first_mux);
++		err = ice_write_cgu_reg(hw, ICE_CGU_R11, val);
++		if (err)
++			return err;
++		r10 &= ~(ICE_CGU_R10_SYNCE_CLKODIV_LOAD |
++			 ICE_CGU_R10_SYNCE_CLKO_SEL);
++		r10 |= FIELD_PREP(ICE_CGU_R10_SYNCE_CLKO_SEL,
++				  ICE_CGU_REF_CLK_BYP1_DIV);
++		break;
++	}
++	default:
++		return -EINVAL;
++	}
++
++	err = ice_write_cgu_reg(hw, ICE_CGU_R10, r10);
++	if (err)
++		return err;
++
++	return 0;
++}
++
++/**
++ * ice_tspll_get_div_e825c - get the divider for the given speed
++ * @link_speed: link speed of the port
++ * @divider: output value, calculated divider
++ *
++ * Get CGU divider value based on the link speed.
++ *
++ * Return:
++ * * 0 - success
++ * * negative - error
++ */
++static int ice_tspll_get_div_e825c(u16 link_speed, unsigned int *divider)
++{
++	switch (link_speed) {
++	case ICE_AQ_LINK_SPEED_100GB:
++	case ICE_AQ_LINK_SPEED_50GB:
++	case ICE_AQ_LINK_SPEED_25GB:
++		*divider = 10;
++		break;
++	case ICE_AQ_LINK_SPEED_40GB:
++	case ICE_AQ_LINK_SPEED_10GB:
++		*divider = 4;
++		break;
++	case ICE_AQ_LINK_SPEED_5GB:
++	case ICE_AQ_LINK_SPEED_2500MB:
++	case ICE_AQ_LINK_SPEED_1000MB:
++		*divider = 2;
++		break;
++	case ICE_AQ_LINK_SPEED_100MB:
++		*divider = 1;
++		break;
++	default:
++		return -EOPNOTSUPP;
++	}
++
++	return 0;
++}
++
++/**
++ * ice_tspll_cfg_synce_ethdiv_e825c - set the divider on the mux
++ * @hw: Pointer to the HW struct
++ * @output: Output pin, we have two in E825C
++ *
++ * Set the correct CGU divider for RCLKA or RCLKB.
++ *
++ * Context: Called under pf->dplls.lock
++ * Return:
++ * * 0 - success
++ * * negative - error
++ */
++int ice_tspll_cfg_synce_ethdiv_e825c(struct ice_hw *hw,
++				     enum ice_synce_clk output)
++{
++	unsigned int divider;
++	u16 link_speed;
++	u32 val;
++	int err;
++
++	link_speed = hw->port_info->phy.link_info.link_speed;
++	if (!link_speed)
++		return 0;
++
++	err = ice_tspll_get_div_e825c(link_speed, &divider);
++	if (err)
++		return err;
++
++	err = ice_read_cgu_reg(hw, ICE_CGU_R10, &val);
++	if (err)
++		return err;
++
++	/* programmable divider value (from 2 to 16) minus 1 for ETHCLKOUT */
++	switch (output) {
++	case ICE_SYNCE_CLK0:
++		val &= ~(ICE_CGU_R10_SYNCE_ETHDIV_M1 |
++			 ICE_CGU_R10_SYNCE_ETHDIV_LOAD);
++		val |= FIELD_PREP(ICE_CGU_R10_SYNCE_ETHDIV_M1, divider - 1);
++		err = ice_write_cgu_reg(hw, ICE_CGU_R10, val);
++		if (err)
++			return err;
++		val |= ICE_CGU_R10_SYNCE_ETHDIV_LOAD;
++		break;
++	case ICE_SYNCE_CLK1:
++		val &= ~(ICE_CGU_R10_SYNCE_CLKODIV_M1 |
++			 ICE_CGU_R10_SYNCE_CLKODIV_LOAD);
++		val |= FIELD_PREP(ICE_CGU_R10_SYNCE_CLKODIV_M1, divider - 1);
++		err = ice_write_cgu_reg(hw, ICE_CGU_R10, val);
++		if (err)
++			return err;
++		val |= ICE_CGU_R10_SYNCE_CLKODIV_LOAD;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	err = ice_write_cgu_reg(hw, ICE_CGU_R10, val);
++	if (err)
++		return err;
++
++	return 0;
++}
+diff --git a/drivers/net/ethernet/intel/ice/ice_tspll.h b/drivers/net/ethernet/intel/ice/ice_tspll.h
+index c0b1232cc07c..d650867004d1 100644
+--- a/drivers/net/ethernet/intel/ice/ice_tspll.h
++++ b/drivers/net/ethernet/intel/ice/ice_tspll.h
+@@ -21,11 +21,22 @@ struct ice_tspll_params_e82x {
+ 	u32 frac_n_div;
+ };
+ 
++#define ICE_CGU_NET_REF_CLK0		0x0
++#define ICE_CGU_REF_CLK_BYP0		0x5
++#define ICE_CGU_REF_CLK_BYP0_DIV	0x0
++#define ICE_CGU_REF_CLK_BYP1		0x4
++#define ICE_CGU_REF_CLK_BYP1_DIV	0x1
++
+ #define ICE_TSPLL_CK_REFCLKFREQ_E825		0x1F
+ #define ICE_TSPLL_NDIVRATIO_E825		5
+ #define ICE_TSPLL_FBDIV_INTGR_E825		256
+ 
+ int ice_tspll_cfg_pps_out_e825c(struct ice_hw *hw, bool enable);
+ int ice_tspll_init(struct ice_hw *hw);
+-
++int ice_tspll_bypass_mux_active_e825c(struct ice_hw *hw, u8 port, bool *active,
++				      enum ice_synce_clk output);
++int ice_tspll_cfg_bypass_mux_e825c(struct ice_hw *hw, bool ena, u32 port_num,
++				   enum ice_synce_clk output);
++int ice_tspll_cfg_synce_ethdiv_e825c(struct ice_hw *hw,
++				     enum ice_synce_clk output);
+ #endif /* _ICE_TSPLL_H_ */
+diff --git a/drivers/net/ethernet/intel/ice/ice_type.h b/drivers/net/ethernet/intel/ice/ice_type.h
+index 6a2ec8389a8f..1e82f4c40b32 100644
+--- a/drivers/net/ethernet/intel/ice/ice_type.h
++++ b/drivers/net/ethernet/intel/ice/ice_type.h
+@@ -349,6 +349,12 @@ enum ice_clk_src {
+ 	NUM_ICE_CLK_SRC
+ };
+ 
++enum ice_synce_clk {
++	ICE_SYNCE_CLK0,
++	ICE_SYNCE_CLK1,
++	ICE_SYNCE_CLK_NUM
++};
++
+ struct ice_ts_func_info {
+ 	/* Function specific info */
+ 	enum ice_tspll_freq time_ref;
