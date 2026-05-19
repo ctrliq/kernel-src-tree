@@ -10,6 +10,7 @@
 #include <linux/dpll.h>
 #include <linux/list.h>
 #include <linux/refcount.h>
+#include <linux/ref_tracker.h>
 #include "dpll_nl.h"
 
 #define DPLL_REGISTERED		XA_MARK_1
@@ -23,6 +24,7 @@
  * @type:		type of a dpll
  * @pin_refs:		stores pins registered within a dpll
  * @refcount:		refcount
+ * @refcnt_tracker:	ref_tracker directory for debugging reference leaks
  * @registration_list:	list of registered ops and priv data of dpll owners
  *
  * RHEL: The content of the structure is invisible for modules and also
@@ -38,6 +40,7 @@ struct dpll_device {
 	enum dpll_type type;
 	struct xarray pin_refs;
 	refcount_t refcount;
+	struct ref_tracker_dir refcnt_tracker;
 	struct list_head registration_list;
 };
 
@@ -53,6 +56,7 @@ struct dpll_device {
  * @ref_sync_pins:	hold references to pins for Reference SYNC feature
  * @prop:		pin properties copied from the registerer
  * @refcount:		refcount
+ * @refcnt_tracker:	ref_tracker directory for debugging reference leaks
  * @rcu:		rcu_head for kfree_rcu()
  *
  * RHEL: The content of the structure is invisible for modules and also
@@ -71,6 +75,7 @@ struct dpll_pin {
 	struct xarray ref_sync_pins;
 	struct dpll_pin_properties prop;
 	refcount_t refcount;
+	struct ref_tracker_dir refcnt_tracker;
 	struct rcu_head rcu;
 };
 
