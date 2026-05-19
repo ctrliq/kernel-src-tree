@@ -4400,8 +4400,11 @@ static int t_show(struct seq_file *m, void *v)
 			unsigned long direct;
 
 			direct = ftrace_find_rec_direct(rec->ip);
-			if (direct)
-				seq_printf(m, "\n\tdirect-->%pS", (void *)direct);
+			if (direct) {
+				seq_printf(m, "\n\tdirect%s-->%pS",
+					   ftrace_is_jmp(direct) ? "(jmp)" : "",
+					   (void *)ftrace_jmp_get(direct));
+			}
 		}
 	}
 
@@ -5892,7 +5895,8 @@ static void remove_direct_functions_hash(struct ftrace_hash *hash, unsigned long
 	for (i = 0; i < size; i++) {
 		hlist_for_each_entry(entry, &hash->buckets[i], hlist) {
 			del = __ftrace_lookup_ip(direct_functions, entry->ip);
-			if (del && del->direct == addr) {
+			if (del && ftrace_jmp_get(del->direct) ==
+				   ftrace_jmp_get(addr)) {
 				remove_hash_entry(direct_functions, del);
 				kfree(del);
 			}
