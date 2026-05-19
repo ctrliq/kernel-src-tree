@@ -1,0 +1,370 @@
+vsock: lock down child_ns_mode as write-once
+
+jira KERNEL-1035
+Rebuild_History Non-Buildable kernel-5.14.0-687.5.1.el9_8
+commit-author Bobby Eshleman <bobbyeshleman@meta.com>
+commit 102eab95f025b4d3f3a6c0a858400aca2af2fe52
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.5.1.el9_8/102eab95.failed
+
+Two administrator processes may race when setting child_ns_mode as one
+process sets child_ns_mode to "local" and then creates a namespace, but
+another process changes child_ns_mode to "global" between the write and
+the namespace creation. The first process ends up with a namespace in
+"global" mode instead of "local". While this can be detected after the
+fact by reading ns_mode and retrying, it is fragile and error-prone.
+
+Make child_ns_mode write-once so that a namespace manager can set it
+once and be sure it won't change. Writing a different value after the
+first write returns -EBUSY. This applies to all namespaces, including
+init_net, where an init process can write "local" to lock all future
+namespaces into local mode.
+
+Fixes: eafb64f40ca4 ("vsock: add netns to vsock core")
+	Suggested-by: Daan De Meyer <daan.j.demeyer@gmail.com>
+	Suggested-by: Stefano Garzarella <sgarzare@redhat.com>
+Co-developed-by: Stefano Garzarella <sgarzare@redhat.com>
+	Signed-off-by: Stefano Garzarella <sgarzare@redhat.com>
+	Signed-off-by: Bobby Eshleman <bobbyeshleman@meta.com>
+	Reviewed-by: Stefano Garzarella <sgarzare@redhat.com>
+Link: https://patch.msgid.link/20260223-vsock-ns-write-once-v3-2-c0cde6959923@meta.com
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+(cherry picked from commit 102eab95f025b4d3f3a6c0a858400aca2af2fe52)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/af_vsock.h
+#	include/net/netns/vsock.h
+#	net/vmw_vsock/af_vsock.c
+diff --cc include/net/af_vsock.h
+index 535701efc1e5,533d8e75f7bb..000000000000
+--- a/include/net/af_vsock.h
++++ b/include/net/af_vsock.h
+@@@ -248,4 -262,62 +248,65 @@@ static inline bool vsock_msgzerocopy_al
+  {
+  	return t->msgzerocopy_allow && t->msgzerocopy_allow();
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static inline enum vsock_net_mode vsock_net_mode(struct net *net)
++ {
++ 	if (!net)
++ 		return VSOCK_NET_MODE_GLOBAL;
++ 
++ 	return READ_ONCE(net->vsock.mode);
++ }
++ 
++ static inline bool vsock_net_mode_global(struct vsock_sock *vsk)
++ {
++ 	return vsock_net_mode(sock_net(sk_vsock(vsk))) == VSOCK_NET_MODE_GLOBAL;
++ }
++ 
++ static inline bool vsock_net_set_child_mode(struct net *net,
++ 					    enum vsock_net_mode mode)
++ {
++ 	int new_locked = mode + 1;
++ 	int old_locked = 0; /* unlocked */
++ 
++ 	if (try_cmpxchg(&net->vsock.child_ns_mode_locked,
++ 			&old_locked, new_locked)) {
++ 		WRITE_ONCE(net->vsock.child_ns_mode, mode);
++ 		return true;
++ 	}
++ 
++ 	return old_locked == new_locked;
++ }
++ 
++ static inline enum vsock_net_mode vsock_net_child_mode(struct net *net)
++ {
++ 	return READ_ONCE(net->vsock.child_ns_mode);
++ }
++ 
++ /* Return true if two namespaces pass the mode rules. Otherwise, return false.
++  *
++  * A NULL namespace is treated as VSOCK_NET_MODE_GLOBAL.
++  *
++  * Read more about modes in the comment header of net/vmw_vsock/af_vsock.c.
++  */
++ static inline bool vsock_net_check_mode(struct net *ns0, struct net *ns1)
++ {
++ 	enum vsock_net_mode mode0, mode1;
++ 
++ 	/* Any vsocks within the same network namespace are always reachable,
++ 	 * regardless of the mode.
++ 	 */
++ 	if (net_eq(ns0, ns1))
++ 		return true;
++ 
++ 	mode0 = vsock_net_mode(ns0);
++ 	mode1 = vsock_net_mode(ns1);
++ 
++ 	/* Different namespaces are only reachable if they are both
++ 	 * global mode.
++ 	 */
++ 	return mode0 == VSOCK_NET_MODE_GLOBAL && mode0 == mode1;
++ }
+++>>>>>>> 102eab95f025 (vsock: lock down child_ns_mode as write-once)
+  #endif /* __AF_VSOCK_H__ */
+diff --cc net/vmw_vsock/af_vsock.c
+index f8085933a181,2f7d94d682cb..000000000000
+--- a/net/vmw_vsock/af_vsock.c
++++ b/net/vmw_vsock/af_vsock.c
+@@@ -83,6 -83,56 +83,59 @@@
+   *   TCP_ESTABLISHED - connected
+   *   TCP_CLOSING - disconnecting
+   *   TCP_LISTEN - listening
+++<<<<<<< HEAD
+++=======
++  *
++  * - Namespaces in vsock support two different modes: "local" and "global".
++  *   Each mode defines how the namespace interacts with CIDs.
++  *   Each namespace exposes two sysctl files:
++  *
++  *   - /proc/sys/net/vsock/ns_mode (read-only) reports the current namespace's
++  *     mode, which is set at namespace creation and immutable thereafter.
++  *   - /proc/sys/net/vsock/child_ns_mode (write-once) controls what mode future
++  *     child namespaces will inherit when created. The initial value matches
++  *     the namespace's own ns_mode.
++  *
++  *   Changing child_ns_mode only affects newly created namespaces, not the
++  *   current namespace or existing children. A "local" namespace cannot set
++  *   child_ns_mode to "global". child_ns_mode is write-once, so that it may be
++  *   configured and locked down by a namespace manager. Writing a different
++  *   value after the first write returns -EBUSY. At namespace creation, ns_mode
++  *   is inherited from the parent's child_ns_mode.
++  *
++  *   The init_net mode is "global" and cannot be modified. The init_net
++  *   child_ns_mode is also write-once, so an init process (e.g. systemd) can
++  *   set it to "local" to ensure all new namespaces inherit local mode.
++  *
++  *   The modes affect the allocation and accessibility of CIDs as follows:
++  *
++  *   - global - access and allocation are all system-wide
++  *      - all CID allocation from global namespaces draw from the same
++  *        system-wide pool.
++  *      - if one global namespace has already allocated some CID, another
++  *        global namespace will not be able to allocate the same CID.
++  *      - global mode AF_VSOCK sockets can reach any VM or socket in any global
++  *        namespace, they are not contained to only their own namespace.
++  *      - AF_VSOCK sockets in a global mode namespace cannot reach VMs or
++  *        sockets in any local mode namespace.
++  *   - local - access and allocation are contained within the namespace
++  *     - CID allocation draws only from a private pool local only to the
++  *       namespace, and does not affect the CIDs available for allocation in any
++  *       other namespace (global or local).
++  *     - VMs in a local namespace do not collide with CIDs in any other local
++  *       namespace or any global namespace. For example, if a VM in a local mode
++  *       namespace is given CID 10, then CID 10 is still available for
++  *       allocation in any other namespace, but not in the same namespace.
++  *     - AF_VSOCK sockets in a local mode namespace can connect only to VMs or
++  *       other sockets within their own namespace.
++  *     - sockets bound to VMADDR_CID_ANY in local namespaces will never resolve
++  *       to any transport that is not compatible with local mode. There is no
++  *       error that propagates to the user (as there is for connection attempts)
++  *       because it is possible for some packet to reach this socket from
++  *       a different transport that *does* support local mode. For
++  *       example, virtio-vsock may not support local mode, but the socket
++  *       may still accept a connection from vhost-vsock which does.
+++>>>>>>> 102eab95f025 (vsock: lock down child_ns_mode as write-once)
+   */
+  
+  #include <linux/compat.h>
+@@@ -2526,6 -2767,189 +2579,192 @@@ static struct miscdevice vsock_device 
+  	.fops		= &vsock_device_ops,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static int __vsock_net_mode_string(const struct ctl_table *table, int write,
++ 				   void *buffer, size_t *lenp, loff_t *ppos,
++ 				   enum vsock_net_mode mode,
++ 				   enum vsock_net_mode *new_mode)
++ {
++ 	char data[VSOCK_NET_MODE_STR_MAX] = {0};
++ 	struct ctl_table tmp;
++ 	int ret;
++ 
++ 	if (!table->data || !table->maxlen || !*lenp) {
++ 		*lenp = 0;
++ 		return 0;
++ 	}
++ 
++ 	tmp = *table;
++ 	tmp.data = data;
++ 
++ 	if (!write) {
++ 		const char *p;
++ 
++ 		switch (mode) {
++ 		case VSOCK_NET_MODE_GLOBAL:
++ 			p = VSOCK_NET_MODE_STR_GLOBAL;
++ 			break;
++ 		case VSOCK_NET_MODE_LOCAL:
++ 			p = VSOCK_NET_MODE_STR_LOCAL;
++ 			break;
++ 		default:
++ 			WARN_ONCE(true, "netns has invalid vsock mode");
++ 			*lenp = 0;
++ 			return 0;
++ 		}
++ 
++ 		strscpy(data, p, sizeof(data));
++ 		tmp.maxlen = strlen(p);
++ 	}
++ 
++ 	ret = proc_dostring(&tmp, write, buffer, lenp, ppos);
++ 	if (ret || !write)
++ 		return ret;
++ 
++ 	if (*lenp >= sizeof(data))
++ 		return -EINVAL;
++ 
++ 	if (!strncmp(data, VSOCK_NET_MODE_STR_GLOBAL, sizeof(data)))
++ 		*new_mode = VSOCK_NET_MODE_GLOBAL;
++ 	else if (!strncmp(data, VSOCK_NET_MODE_STR_LOCAL, sizeof(data)))
++ 		*new_mode = VSOCK_NET_MODE_LOCAL;
++ 	else
++ 		return -EINVAL;
++ 
++ 	return 0;
++ }
++ 
++ static int vsock_net_mode_string(const struct ctl_table *table, int write,
++ 				 void *buffer, size_t *lenp, loff_t *ppos)
++ {
++ 	struct net *net;
++ 
++ 	if (write)
++ 		return -EPERM;
++ 
++ 	net = container_of(table->data, struct net, vsock.mode);
++ 
++ 	return __vsock_net_mode_string(table, write, buffer, lenp, ppos,
++ 				       vsock_net_mode(net), NULL);
++ }
++ 
++ static int vsock_net_child_mode_string(const struct ctl_table *table, int write,
++ 				       void *buffer, size_t *lenp, loff_t *ppos)
++ {
++ 	enum vsock_net_mode new_mode;
++ 	struct net *net;
++ 	int ret;
++ 
++ 	net = container_of(table->data, struct net, vsock.child_ns_mode);
++ 
++ 	ret = __vsock_net_mode_string(table, write, buffer, lenp, ppos,
++ 				      vsock_net_child_mode(net), &new_mode);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (write) {
++ 		/* Prevent a "local" namespace from escalating to "global",
++ 		 * which would give nested namespaces access to global CIDs.
++ 		 */
++ 		if (vsock_net_mode(net) == VSOCK_NET_MODE_LOCAL &&
++ 		    new_mode == VSOCK_NET_MODE_GLOBAL)
++ 			return -EPERM;
++ 
++ 		if (!vsock_net_set_child_mode(net, new_mode))
++ 			return -EBUSY;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static struct ctl_table vsock_table[] = {
++ 	{
++ 		.procname	= "ns_mode",
++ 		.data		= &init_net.vsock.mode,
++ 		.maxlen		= VSOCK_NET_MODE_STR_MAX,
++ 		.mode		= 0444,
++ 		.proc_handler	= vsock_net_mode_string
++ 	},
++ 	{
++ 		.procname	= "child_ns_mode",
++ 		.data		= &init_net.vsock.child_ns_mode,
++ 		.maxlen		= VSOCK_NET_MODE_STR_MAX,
++ 		.mode		= 0644,
++ 		.proc_handler	= vsock_net_child_mode_string
++ 	},
++ };
++ 
++ static int __net_init vsock_sysctl_register(struct net *net)
++ {
++ 	struct ctl_table *table;
++ 
++ 	if (net_eq(net, &init_net)) {
++ 		table = vsock_table;
++ 	} else {
++ 		table = kmemdup(vsock_table, sizeof(vsock_table), GFP_KERNEL);
++ 		if (!table)
++ 			goto err_alloc;
++ 
++ 		table[0].data = &net->vsock.mode;
++ 		table[1].data = &net->vsock.child_ns_mode;
++ 	}
++ 
++ 	net->vsock.sysctl_hdr = register_net_sysctl_sz(net, "net/vsock", table,
++ 						       ARRAY_SIZE(vsock_table));
++ 	if (!net->vsock.sysctl_hdr)
++ 		goto err_reg;
++ 
++ 	return 0;
++ 
++ err_reg:
++ 	if (!net_eq(net, &init_net))
++ 		kfree(table);
++ err_alloc:
++ 	return -ENOMEM;
++ }
++ 
++ static void vsock_sysctl_unregister(struct net *net)
++ {
++ 	const struct ctl_table *table;
++ 
++ 	table = net->vsock.sysctl_hdr->ctl_table_arg;
++ 	unregister_net_sysctl_table(net->vsock.sysctl_hdr);
++ 	if (!net_eq(net, &init_net))
++ 		kfree(table);
++ }
++ 
++ static void vsock_net_init(struct net *net)
++ {
++ 	if (net_eq(net, &init_net))
++ 		net->vsock.mode = VSOCK_NET_MODE_GLOBAL;
++ 	else
++ 		net->vsock.mode = vsock_net_child_mode(current->nsproxy->net_ns);
++ 
++ 	net->vsock.child_ns_mode = net->vsock.mode;
++ }
++ 
++ static __net_init int vsock_sysctl_init_net(struct net *net)
++ {
++ 	vsock_net_init(net);
++ 
++ 	if (vsock_sysctl_register(net))
++ 		return -ENOMEM;
++ 
++ 	return 0;
++ }
++ 
++ static __net_exit void vsock_sysctl_exit_net(struct net *net)
++ {
++ 	vsock_sysctl_unregister(net);
++ }
++ 
++ static struct pernet_operations vsock_sysctl_ops = {
++ 	.init = vsock_sysctl_init_net,
++ 	.exit = vsock_sysctl_exit_net,
++ };
++ 
+++>>>>>>> 102eab95f025 (vsock: lock down child_ns_mode as write-once)
+  static int __init vsock_init(void)
+  {
+  	int err = 0;
+* Unmerged path include/net/netns/vsock.h
+* Unmerged path include/net/af_vsock.h
+* Unmerged path include/net/netns/vsock.h
+* Unmerged path net/vmw_vsock/af_vsock.c
