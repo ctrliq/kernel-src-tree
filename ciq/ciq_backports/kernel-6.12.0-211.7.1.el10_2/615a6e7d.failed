@@ -1,0 +1,178 @@
+mshv: Cleanly shutdown root partition with MSHV
+
+jira KERNEL-1029
+Rebuild_History Non-Buildable kernel-6.12.0-211.7.1.el10_2
+commit-author Praveen K Paladugu <prapal@linux.microsoft.com>
+commit 615a6e7d83f958e7ef3bc818e818f7c6433b4c2a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.7.1.el10_2/615a6e7d.failed
+
+Root partitions running on MSHV currently attempt ACPI power-off, which
+MSHV intercepts and triggers a Machine Check Exception (MCE), leading
+to a kernel panic.
+
+Root partitions panic with a trace similar to:
+
+  [   81.306348] reboot: Power down
+  [   81.314709] mce: [Hardware Error]: CPU 0: Machine Check Exception: 4 Bank 0: b2000000c0060001
+  [   81.314711] mce: [Hardware Error]: TSC 3b8cb60a66 PPIN 11d98332458e4ea9
+  [   81.314713] mce: [Hardware Error]: PROCESSOR 0:606a6 TIME 1759339405 SOCKET 0 APIC 0 microcode ffffffff
+  [   81.314715] mce: [Hardware Error]: Run the above through 'mcelog --ascii'
+  [   81.314716] mce: [Hardware Error]: Machine check: Processor context corrupt
+  [   81.314717] Kernel panic - not syncing: Fatal machine check
+
+To avoid this, configure the sleep state in the hypervisor and invoke
+the HVCALL_ENTER_SLEEP_STATE hypercall as the final step in the shutdown
+sequence. This ensures a clean and safe shutdown of the root partition.
+
+	Signed-off-by: Praveen K Paladugu <prapal@linux.microsoft.com>
+Co-developed-by: Anatol Belski <anbelski@linux.microsoft.com>
+	Signed-off-by: Anatol Belski <anbelski@linux.microsoft.com>
+	Reviewed-by: Easwar Hariharan <easwar.hariharan@linux.microsoft.com>
+	Acked-by: Stanislav Kinsburskii <skinsburskii@linux.microsoft.com>
+	Signed-off-by: Wei Liu <wei.liu@kernel.org>
+(cherry picked from commit 615a6e7d83f958e7ef3bc818e818f7c6433b4c2a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/mshyperv.h
+#	drivers/hv/mshv_common.c
+diff --cc arch/x86/include/asm/mshyperv.h
+index 42ea9c68f8c8,eef4c3a5ba28..000000000000
+--- a/arch/x86/include/asm/mshyperv.h
++++ b/arch/x86/include/asm/mshyperv.h
+@@@ -230,6 -177,8 +230,11 @@@ int hyperv_flush_guest_mapping_range(u6
+  int hyperv_fill_flush_guest_mapping_list(
+  		struct hv_guest_mapping_flush_list *flush,
+  		u64 start_gfn, u64 end_gfn);
+++<<<<<<< HEAD
+++=======
++ void hv_sleep_notifiers_register(void);
++ void hv_machine_power_off(void);
+++>>>>>>> 615a6e7d83f9 (mshv: Cleanly shutdown root partition with MSHV)
+  
+  #ifdef CONFIG_X86_64
+  void hv_apic_init(void);
+diff --cc drivers/hv/mshv_common.c
+index aa2be51979fd,58027b23c206..000000000000
+--- a/drivers/hv/mshv_common.c
++++ b/drivers/hv/mshv_common.c
+@@@ -138,3 -141,99 +138,102 @@@ int hv_call_get_partition_property(u64 
+  	return 0;
+  }
+  EXPORT_SYMBOL_GPL(hv_call_get_partition_property);
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * Corresponding sleep states have to be initialized in order for a subsequent
++  * HVCALL_ENTER_SLEEP_STATE call to succeed. Currently only S5 state as per
++  * ACPI 6.4 chapter 7.4.2 is relevant, while S1, S2 and S3 can be supported.
++  *
++  * In order to pass proper PM values to mshv, ACPI should be initialized and
++  * should support S5 sleep state when this method is invoked.
++  */
++ static int hv_initialize_sleep_states(void)
++ {
++ 	u64 status;
++ 	unsigned long flags;
++ 	struct hv_input_set_system_property *in;
++ 	acpi_status acpi_status;
++ 	u8 sleep_type_a, sleep_type_b;
++ 
++ 	if (!acpi_sleep_state_supported(ACPI_STATE_S5)) {
++ 		pr_err("%s: S5 sleep state not supported.\n", __func__);
++ 		return -ENODEV;
++ 	}
++ 
++ 	acpi_status = acpi_get_sleep_type_data(ACPI_STATE_S5, &sleep_type_a,
++ 					       &sleep_type_b);
++ 	if (ACPI_FAILURE(acpi_status))
++ 		return -ENODEV;
++ 
++ 	local_irq_save(flags);
++ 	in = *this_cpu_ptr(hyperv_pcpu_input_arg);
++ 	memset(in, 0, sizeof(*in));
++ 
++ 	in->property_id = HV_SYSTEM_PROPERTY_SLEEP_STATE;
++ 	in->set_sleep_state_info.sleep_state = HV_SLEEP_STATE_S5;
++ 	in->set_sleep_state_info.pm1a_slp_typ = sleep_type_a;
++ 	in->set_sleep_state_info.pm1b_slp_typ = sleep_type_b;
++ 
++ 	status = hv_do_hypercall(HVCALL_SET_SYSTEM_PROPERTY, in, NULL);
++ 	local_irq_restore(flags);
++ 
++ 	if (!hv_result_success(status)) {
++ 		hv_status_err(status, "\n");
++ 		return hv_result_to_errno(status);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * This notifier initializes sleep states in mshv hypervisor which will be
++  * used during power off.
++  */
++ static int hv_reboot_notifier_handler(struct notifier_block *this,
++ 				      unsigned long code, void *another)
++ {
++ 	int ret = 0;
++ 
++ 	if (code == SYS_HALT || code == SYS_POWER_OFF)
++ 		ret = hv_initialize_sleep_states();
++ 
++ 	return ret ? NOTIFY_DONE : NOTIFY_OK;
++ }
++ 
++ static struct notifier_block hv_reboot_notifier = {
++ 	.notifier_call = hv_reboot_notifier_handler,
++ };
++ 
++ void hv_sleep_notifiers_register(void)
++ {
++ 	int ret;
++ 
++ 	ret = register_reboot_notifier(&hv_reboot_notifier);
++ 	if (ret)
++ 		pr_err("%s: cannot register reboot notifier %d\n", __func__,
++ 		       ret);
++ }
++ 
++ /*
++  * Power off the machine by entering S5 sleep state via Hyper-V hypercall.
++  * This call does not return if successful.
++  */
++ void hv_machine_power_off(void)
++ {
++ 	unsigned long flags;
++ 	struct hv_input_enter_sleep_state *in;
++ 
++ 	local_irq_save(flags);
++ 	in = *this_cpu_ptr(hyperv_pcpu_input_arg);
++ 	in->sleep_state = HV_SLEEP_STATE_S5;
++ 
++ 	(void)hv_do_hypercall(HVCALL_ENTER_SLEEP_STATE, in, NULL);
++ 	local_irq_restore(flags);
++ 
++ 	/* should never reach here */
++ 	BUG();
++ 
++ }
+++>>>>>>> 615a6e7d83f9 (mshv: Cleanly shutdown root partition with MSHV)
+* Unmerged path arch/x86/include/asm/mshyperv.h
+diff --git a/arch/x86/kernel/cpu/mshyperv.c b/arch/x86/kernel/cpu/mshyperv.c
+index f943a0426c5e..87166c9fe767 100644
+--- a/arch/x86/kernel/cpu/mshyperv.c
++++ b/arch/x86/kernel/cpu/mshyperv.c
+@@ -557,6 +557,8 @@ static void __init ms_hyperv_init_platform(void)
+ #endif
+ 
+ #if IS_ENABLED(CONFIG_HYPERV)
++	if (hv_root_partition())
++		machine_ops.power_off = hv_machine_power_off;
+ #if defined(CONFIG_KEXEC_CORE)
+ 	machine_ops.shutdown = hv_machine_shutdown;
+ #endif
+* Unmerged path drivers/hv/mshv_common.c
