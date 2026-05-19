@@ -1,0 +1,92 @@
+mm/hugetlb: add missing hugetlb_lock in __unmap_hugepage_range()
+
+jira KERNEL-1035
+Rebuild_History Non-Buildable kernel-5.14.0-687.5.1.el9_8
+commit-author Jeongjun Park <aha310510@gmail.com>
+commit 21cc2b5c5062a256ae9064442d37ebbc23f5aef7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.5.1.el9_8/21cc2b5c.failed
+
+When restoring a reservation for an anonymous page, we need to check to
+freeing a surplus.  However, __unmap_hugepage_range() causes data race
+because it reads h->surplus_huge_pages without the protection of
+hugetlb_lock.
+
+And adjust_reservation is a boolean variable that indicates whether
+reservations for anonymous pages in each folio should be restored. 
+Therefore, it should be initialized to false for each round of the loop. 
+However, this variable is not initialized to false except when defining
+the current adjust_reservation variable.
+
+This means that once adjust_reservation is set to true even once within
+the loop, reservations for anonymous pages will be restored
+unconditionally in all subsequent rounds, regardless of the folio's state.
+
+To fix this, we need to add the missing hugetlb_lock, unlock the
+page_table_lock earlier so that we don't lock the hugetlb_lock inside the
+page_table_lock lock, and initialize adjust_reservation to false on each
+round within the loop.
+
+Link: https://lkml.kernel.org/r/20250823182115.1193563-1-aha310510@gmail.com
+Fixes: df7a6d1f6405 ("mm/hugetlb: restore the reservation if needed")
+	Signed-off-by: Jeongjun Park <aha310510@gmail.com>
+	Reported-by: syzbot+417aeb05fd190f3a6da9@syzkaller.appspotmail.com
+Closes: https://syzkaller.appspot.com/bug?extid=417aeb05fd190f3a6da9
+	Reviewed-by: Sidhartha Kumar <sidhartha.kumar@oracle.com>
+	Cc: Breno Leitao <leitao@debian.org>
+	Cc: David Hildenbrand <david@redhat.com>
+	Cc: Muchun Song <muchun.song@linux.dev>
+	Cc: Oscar Salvador <osalvador@suse.de>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit 21cc2b5c5062a256ae9064442d37ebbc23f5aef7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hugetlb.c
+diff --cc mm/hugetlb.c
+index 76c4b2c9b5df,eed59cfb5d21..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -5428,10 -5849,9 +5428,10 @@@ void __unmap_hugepage_range(struct mmu_
+  	pte_t *ptep;
+  	pte_t pte;
+  	spinlock_t *ptl;
+ +	struct page *page;
+  	struct hstate *h = hstate_vma(vma);
+  	unsigned long sz = huge_page_size(h);
+- 	bool adjust_reservation = false;
++ 	bool adjust_reservation;
+  	unsigned long last_addr_mask;
+  	bool force_flush = false;
+  
+@@@ -5522,7 -5943,8 +5522,12 @@@
+  					make_pte_marker(PTE_MARKER_UFFD_WP),
+  					sz);
+  		hugetlb_count_sub(pages_per_huge_page(h), mm);
+++<<<<<<< HEAD
+ +		page_remove_rmap(page, vma, true);
+++=======
++ 		hugetlb_remove_rmap(folio);
++ 		spin_unlock(ptl);
+++>>>>>>> 21cc2b5c5062 (mm/hugetlb: add missing hugetlb_lock in __unmap_hugepage_range())
+  
+  		/*
+  		 * Restore the reservation for anonymous page, otherwise the
+@@@ -5530,9 -5952,12 +5535,12 @@@
+  		 * If there we are freeing a surplus, do not set the restore
+  		 * reservation bit.
+  		 */
++ 		adjust_reservation = false;
++ 
++ 		spin_lock_irq(&hugetlb_lock);
+  		if (!h->surplus_huge_pages && __vma_private_lock(vma) &&
+ -		    folio_test_anon(folio)) {
+ -			folio_set_hugetlb_restore_reserve(folio);
+ +		    folio_test_anon(page_folio(page))) {
+ +			folio_set_hugetlb_restore_reserve(page_folio(page));
+  			/* Reservation to be adjusted after the spin lock */
+  			adjust_reservation = true;
+  		}
+* Unmerged path mm/hugetlb.c
