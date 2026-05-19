@@ -2940,9 +2940,9 @@ int security_lock_kernel_down(const char *where, enum lockdown_reason level)
 EXPORT_SYMBOL(security_lock_kernel_down);
 
 #ifdef CONFIG_PERF_EVENTS
-int security_perf_event_open(struct perf_event_attr *attr, int type)
+int security_perf_event_open(int type)
 {
-	return call_int_hook(perf_event_open, attr, type);
+	return call_int_hook(perf_event_open, type);
 }
 
 int security_perf_event_alloc(struct perf_event *event)

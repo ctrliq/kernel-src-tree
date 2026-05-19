@@ -123,9 +123,9 @@ out:
 	return err;
 }
 
-static void krb5enc_encrypt_done(void *data, int err)
+static void krb5enc_encrypt_done(struct crypto_async_request *areq, int err)
 {
-	struct aead_request *req = data;
+	struct aead_request *req = areq->data;
 
 	krb5enc_request_complete(req, err);
 }
@@ -178,9 +178,10 @@ static void krb5enc_insert_checksum(struct aead_request *req, u8 *hash)
  * Upon completion of an asynchronous digest, transfer the hash to the checksum
  * field.
  */
-static void krb5enc_encrypt_ahash_done(void *data, int err)
+static void krb5enc_encrypt_ahash_done(struct crypto_async_request *areq,
+				       int err)
 {
-	struct aead_request *req = data;
+	struct aead_request *req = areq->data;
 	struct crypto_aead *krb5enc = crypto_aead_reqtfm(req);
 	struct aead_instance *inst = aead_alg_instance(krb5enc);
 	struct krb5enc_instance_ctx *ictx = aead_instance_ctx(inst);
@@ -260,9 +261,10 @@ static int krb5enc_verify_hash(struct aead_request *req)
 	return 0;
 }
 
-static void krb5enc_decrypt_hash_done(void *data, int err)
+static void krb5enc_decrypt_hash_done(struct crypto_async_request *areq,
+				      int err)
 {
-	struct aead_request *req = data;
+	struct aead_request *req = areq->data;
 
 	if (err)
 		return krb5enc_request_complete(req, err);
@@ -399,7 +401,7 @@ static void krb5enc_free(struct aead_instance *inst)
 static int krb5enc_create(struct crypto_template *tmpl, struct rtattr **tb)
 {
 	struct krb5enc_instance_ctx *ictx;
-	struct skcipher_alg_common *enc;
+	struct skcipher_alg *enc;
 	struct hash_alg_common *auth;
 	struct aead_instance *inst;
 	struct crypto_alg *auth_base;
@@ -432,7 +434,7 @@ static int krb5enc_create(struct crypto_template *tmpl, struct rtattr **tb)
 		pr_err("grab skcipher failed\n");
 		goto err_free_inst;
 	}
-	enc = crypto_spawn_skcipher_alg_common(&ictx->enc);
+	enc = crypto_spawn_skcipher_alg(&ictx->enc);
 
 	ictx->reqoff = 2 * auth->digestsize;
 
@@ -454,8 +456,8 @@ static int krb5enc_create(struct crypto_template *tmpl, struct rtattr **tb)
 	inst->alg.base.cra_alignmask = enc->base.cra_alignmask;
 	inst->alg.base.cra_ctxsize = sizeof(struct krb5enc_ctx);
 
-	inst->alg.ivsize = enc->ivsize;
-	inst->alg.chunksize = enc->chunksize;
+	inst->alg.ivsize = crypto_skcipher_alg_ivsize(enc);
+	inst->alg.chunksize = crypto_skcipher_alg_chunksize(enc);
 	inst->alg.maxauthsize = auth->digestsize;
 
 	inst->alg.init = krb5enc_init_tfm;
