@@ -701,6 +701,7 @@ Requires: %{name}-core-uname-r = %{KVERREL}
 Requires: %{name}-modules-uname-r = %{KVERREL}
 Requires: %{name}-modules-core-uname-r = %{KVERREL}
 Requires: ((%{name}-modules-extra-uname-r = %{KVERREL}) if %{name}-modules-extra-matched)
+Requires:       ciq-kmod
 Provides: installonlypkg(kernel)
 Provides: kernel = %{specversion}-%{pkg_release}
 %endif
@@ -2967,6 +2968,12 @@ BuildKernel() {
     mkdir -p $RPM_BUILD_ROOT/usr/src/kernels
     mv $RPM_BUILD_ROOT/lib/modules/$KernelVer/build $RPM_BUILD_ROOT/$DevelDir
 
+    # Ship %clk_version macro with kernel-devel for use by kmod specs
+    if [ -z "$Variant" ]; then
+        install -D -m 0644 /dev/null $RPM_BUILD_ROOT/usr/lib/rpm/macros.d/macros.kernel-%{pkg_suffix}
+        printf '%%clk_version %{kernel_major_minor}\n' > $RPM_BUILD_ROOT/usr/lib/rpm/macros.d/macros.kernel-%{pkg_suffix}
+    fi
+
     # This is going to create a broken link during the build, but we don't use
     # it after this point.  We need the link to actually point to something
     # when kernel-devel is installed, and a relative link doesn't work across
@@ -4397,6 +4404,7 @@ fi\
 %{expand:%%files %{?3:%{3}-}devel}\
 %defverify(not mtime)\
 /usr/src/kernels/%{KVERREL}%{?3:+%{3}}\
+%{!?3:/usr/lib/rpm/macros.d/macros.kernel-%{pkg_suffix}}\
 %{expand:%%files %{?3:%{3}-}devel-matched}\
 %{expand:%%files -f kernel-%{?3:%{3}-}modules-extra.list %{?3:%{3}-}modules-extra}\
 %{expand:%%files -f kernel-%{?3:%{3}-}modules-internal.list %{?3:%{3}-}modules-internal}\
