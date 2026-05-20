@@ -662,6 +662,7 @@ ExclusiveOS: Linux
 Requires: %{name}-core-uname-r = %{KVERREL}
 Requires: %{name}-modules-uname-r = %{KVERREL}
 Requires: %{name}-modules-core-uname-r = %{KVERREL}
+Requires: ciq-kmod
 Provides: installonlypkg(kernel)
 Provides: kernel = %{specversion}-%{pkg_release}
 %endif
@@ -2875,6 +2876,14 @@ BuildKernel() {
     mkdir -p $RPM_BUILD_ROOT/usr/src/kernels
     mv $RPM_BUILD_ROOT/lib/modules/$KernelVer/build $RPM_BUILD_ROOT/$DevelDir
 
+    # Install versioned macro file so kmod builds pick up %%clk_version.
+    # Name embeds version-release so multiple installonly devel packages coexist.
+    if [ -z "$Variant" ]; then
+        mkdir -p $RPM_BUILD_ROOT/%{_rpmmacrodir}
+        printf '\045clk_version %{kernel_major_minor}\n' \
+            > $RPM_BUILD_ROOT/%{_rpmmacrodir}/macros.kernel-%{pkg_suffix}-%{specversion}-%{pkg_release}
+    fi
+
     # This is going to create a broken link during the build, but we don't use
     # it after this point.  We need the link to actually point to something
     # when kernel-devel is installed, and a relative link doesn't work across
@@ -4096,6 +4105,7 @@ fi\
 %{expand:%%files %{?3:%{3}-}devel}\
 %defverify(not mtime)\
 /usr/src/kernels/%{KVERREL}%{?3:+%{3}}\
+%{!?3:%{_rpmmacrodir}/macros.kernel-%{pkg_suffix}-%{specversion}-%{pkg_release}}\
 %{expand:%%files %{?3:%{3}-}devel-matched}\
 %{expand:%%files -f kernel-%{?3:%{3}-}modules-extra.list %{?3:%{3}-}modules-extra}\
 %{expand:%%files -f kernel-%{?3:%{3}-}modules-internal.list %{?3:%{3}-}modules-internal}\
