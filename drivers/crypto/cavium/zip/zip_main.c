@@ -372,8 +372,10 @@ static struct pci_driver zip_driver = {
 /* Kernel Crypto Subsystem Interface */
 
 static struct scomp_alg zip_scomp_deflate = {
-	.alloc_ctx		= zip_alloc_scomp_ctx_deflate,
-	.free_ctx		= zip_free_scomp_ctx,
+	.streams		= {
+		.alloc_ctx		= zip_alloc_scomp_ctx_deflate,
+		.free_ctx		= zip_free_scomp_ctx,
+	},
 	.compress		= zip_scomp_compress,
 	.decompress		= zip_scomp_decompress,
 	.base			= {
@@ -385,8 +387,10 @@ static struct scomp_alg zip_scomp_deflate = {
 };
 
 static struct scomp_alg zip_scomp_lzs = {
-	.alloc_ctx		= zip_alloc_scomp_ctx_lzs,
-	.free_ctx		= zip_free_scomp_ctx,
+	.streams		= {
+		.alloc_ctx		= zip_alloc_scomp_ctx_lzs,
+		.free_ctx		= zip_free_scomp_ctx,
+	},
 	.compress		= zip_scomp_compress,
 	.decompress		= zip_scomp_decompress,
 	.base			= {
