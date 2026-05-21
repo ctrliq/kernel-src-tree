@@ -71,6 +71,7 @@
 
 #include <linux/uaccess.h>
 #include <asm/processor.h>
+#include <linux/mmzone.h>
 
 #ifdef CONFIG_X86
 #include <asm/nmi.h>
@@ -2368,6 +2369,16 @@ static struct ctl_table vm_table[] = {
 		.extra2		= SYSCTL_ONE,
 	},
 #endif
+	{
+		.procname       = "dr_prio_drop",
+		.data           = &sysctl_dr_prio_drop,
+		.maxlen         = sizeof(int),
+		.mode           = 0644,
+		.proc_handler   = proc_dointvec_minmax,
+		.extra1         = SYSCTL_ZERO,
+		.extra2         = SYSCTL_MAX_PRIO_DROP,
+	},
+
 	{ }
 };
 

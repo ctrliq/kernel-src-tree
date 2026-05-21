@@ -3946,6 +3946,7 @@ static inline int in_gate_area(struct mm_struct *mm, unsigned long addr)
 extern bool process_shares_mm(struct task_struct *p, struct mm_struct *mm);
 
 #ifdef CONFIG_SYSCTL
+extern int sysctl_dr_prio_drop;
 extern int sysctl_drop_caches;
 int drop_caches_sysctl_handler(struct ctl_table *, int, void *, size_t *,
 		loff_t *);
