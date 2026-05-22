@@ -188,6 +188,7 @@ static bool ip6_parse_tlv(const struct tlvtype_proc *procs,
 					 */
 					switch (curr->type) {
 					case IPV6_TLV_HAO:
+					case IPV6_TLV_JUMBO:
 						nh = skb_network_header(skb);
 						break;
 					}
