@@ -4,7 +4,8 @@
 #ifndef _MANA_H
 #define _MANA_H
 
-#include <net/net_shaper.h>
+#include <linux/rh_kabi.h>
+#include RH_KABI_HIDE_INCLUDE(<net/net_shaper.h>)
 
 #include "gdma.h"
 #include "hw_channel.h"
@@ -543,14 +544,7 @@ struct mana_port_context {
 	struct mutex vport_mutex;
 	int vport_use_count;
 
-	/* Net shaper handle*/
-	struct net_shaper_handle handle;
-
 	u16 port_idx;
-	/* Currently configured speed (mbps) */
-	u32 speed;
-	/* Maximum speed supported by the SKU (mbps) */
-	u32 max_speed;
 
 	bool port_is_up;
 	bool port_st_save; /* Saved port state */
@@ -561,6 +555,10 @@ struct mana_port_context {
 
 	/* Debugfs */
 	struct dentry *mana_port_debugfs;
+
+	RH_KABI_EXTEND(struct net_shaper_handle handle)
+	RH_KABI_EXTEND(u32 speed)
+	RH_KABI_EXTEND(u32 max_speed)
 };
 
 netdev_tx_t mana_start_xmit(struct sk_buff *skb, struct net_device *ndev);
@@ -617,9 +615,9 @@ enum mana_command_code {
 	MANA_FENCE_RQ		= 0x20006,
 	MANA_CONFIG_VPORT_RX	= 0x20007,
 	MANA_QUERY_VPORT_CONFIG	= 0x20008,
-	MANA_QUERY_LINK_CONFIG	= 0x2000A,
-	MANA_SET_BW_CLAMP	= 0x2000B,
 	MANA_QUERY_PHY_STAT     = 0x2000c,
+	RH_KABI_EXTEND_ENUM(MANA_QUERY_LINK_CONFIG = 0x2000A)
+	RH_KABI_EXTEND_ENUM(MANA_SET_BW_CLAMP = 0x2000B)
 
 	/* Privileged commands for the PF mode */
 	MANA_REGISTER_FILTER	= 0x28000,
