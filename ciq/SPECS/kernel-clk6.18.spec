@@ -171,7 +171,7 @@ Summary: The Linux kernel
 %define kernel_patch 33
 %define buildid .1
 %define specversion %{kernel_major_minor}.%{kernel_patch}
-%define pkgrelease 1%{?buildid}
+%define pkgrelease 2%{?buildid}
 %define kversion %{lua:print((rpm.expand("%{kernel_major_minor}"):match("^(%d+)")))}
 
 %define tarfile_release %{specversion}-%{pkgrelease}.el%{el_version}
@@ -4495,6 +4495,9 @@ fi\
 #
 #
 %changelog
+* Wed May 27 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.33-2.1.el9
+-- bundle_bindgen: add User-Agent header to crates.io request (Brett Mastbergen)
+
 * Tue May 26 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.18.33-1.1.el9
 -- Rebased changes for Linux 6.18.33 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.33-1)
 -- smb: client: reject userspace cifs.spnego descriptions (Shreeya Patel)
