@@ -166,7 +166,7 @@ Summary: The Linux kernel
 %define kernel_patch 89
 %define buildid .1
 %define specversion %{kernel_major_minor}.%{kernel_patch}
-%define pkgrelease 1%{?buildid}
+%define pkgrelease 2%{?buildid}
 %define kversion %{lua:print((rpm.expand("%{kernel_major_minor}"):match("^(%d+)")))}
 
 %define tarfile_release %{specversion}-%{pkgrelease}.el%{el_version}
@@ -4202,6 +4202,11 @@ fi\
 #
 #
 %changelog
+* Wed May 27 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.12.89-2.1.el9
+-- bundle_bindgen: add User-Agent header to crates.io request (Brett Mastbergen)
+-- smb: client: reject userspace cifs.spnego descriptions (Shreeya Patel)
+-- net: gro: don't merge zcopy skbs (Sabrina Dubroca)
+
 * Fri May 15 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.12.89-1.1.el9
 -- Rebased changes for Linux 6.12.89 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.12.89-1)
 -- [CIQ] v6.12.89 - rebased configs (Brett Mastbergen)
