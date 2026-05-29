@@ -580,7 +580,7 @@ static ssize_t ib_umad_write(struct file *filp, const char __user *buf,
 	}
 
 	base_version = ((struct ib_mad_hdr *)&packet->mad.data)->base_version;
-	if (check_sub_overflow(count, hdr_size(file) + hdr_len, &data_len)) {
+	if (check_sub_overflow((size_t)count, (size_t)hdr_size(file) + hdr_len, &data_len)) {
 		ret = -EINVAL;
 		goto err_ah;
 	}

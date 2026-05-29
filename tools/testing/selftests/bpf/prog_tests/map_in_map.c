@@ -33,7 +33,7 @@ static void *update_map_fn(void *data)
 	while (loop-- > 0) {
 		int fd, zero = 0;
 
-		fd = bpf_map_create(BPF_MAP_TYPE_ARRAY, NULL, 4, 4, 1, NULL);
+		fd = bpf_create_map(BPF_MAP_TYPE_ARRAY, 4, 4, 1, 0);
 		if (fd < 0) {
 			err |= 1;
 			pthread_barrier_wait(&ctx->barrier);
@@ -82,6 +82,9 @@ static void test_map_in_map_access(const char *prog_name, const char *map_name)
 	skel = access_map_in_map__open();
 	if (!ASSERT_OK_PTR(skel, "access_map_in_map open"))
 		return;
+
+	bpf_object__for_each_program(prog, skel->obj)
+		bpf_program__set_autoload(prog, false);
 
 	prog = bpf_object__find_program_by_name(skel->obj, prog_name);
 	if (!ASSERT_OK_PTR(prog, "find program"))

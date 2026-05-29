@@ -4,8 +4,6 @@
 #include <time.h>
 #include <bpf/bpf_helpers.h>
 
-#include "bpf_misc.h"
-
 struct inner_map_type {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(key_size, 4);
@@ -68,25 +66,25 @@ static int acc_map_in_map(void *outer_map)
 	return 0;
 }
 
-SEC("?kprobe/" SYS_PREFIX "sys_getpgid")
+SEC("kprobe/__x64_sys_getpgid")
 int access_map_in_array(void *ctx)
 {
 	return acc_map_in_map(&outer_array_map);
 }
 
-SEC("?fentry.s/" SYS_PREFIX "sys_getpgid")
+SEC("fentry.s/__x64_sys_getpgid")
 int sleepable_access_map_in_array(void *ctx)
 {
 	return acc_map_in_map(&outer_array_map);
 }
 
-SEC("?kprobe/" SYS_PREFIX "sys_getpgid")
+SEC("kprobe/__x64_sys_getpgid")
 int access_map_in_htab(void *ctx)
 {
 	return acc_map_in_map(&outer_htab_map);
 }
 
-SEC("?fentry.s/" SYS_PREFIX "sys_getpgid")
+SEC("fentry.s/__x64_sys_getpgid")
 int sleepable_access_map_in_htab(void *ctx)
 {
 	return acc_map_in_map(&outer_htab_map);
