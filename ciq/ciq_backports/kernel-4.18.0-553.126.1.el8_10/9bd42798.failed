@@ -1,0 +1,348 @@
+smb: client: add mid_counter_lock to protect the mid counter counter
+
+jira KERNEL-1078
+Rebuild_History Non-Buildable kernel-4.18.0-553.126.1.el8_10
+commit-author Wang Zhaolong <wangzhaolong@huaweicloud.com>
+commit 9bd42798d5bf87f56d229a27e40140df95ef743d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.126.1.el8_10/9bd42798.failed
+
+This is step 2/4 of a patch series to fix mid_q_entry memory leaks
+caused by race conditions in callback execution.
+
+Add a dedicated mid_counter_lock to protect current_mid counter,
+separating it from mid_queue_lock which protects pending_mid_q
+operations. This reduces lock contention and prepares for finer-
+grained locking in subsequent patches.
+
+Changes:
+- Add TCP_Server_Info->mid_counter_lock spinlock
+- Rename CurrentMid to current_mid for consistency
+- Use mid_counter_lock to protect current_mid access
+- Update locking documentation in cifsglob.h
+
+This separation allows mid allocation to proceed without blocking
+queue operations, improving performance under heavy load.
+
+	Signed-off-by: Wang Zhaolong <wangzhaolong@huaweicloud.com>
+	Acked-by: Enzo Matsumiya <ematsumiya@suse.de>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 9bd42798d5bf87f56d229a27e40140df95ef743d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/cifsglob.h
+#	fs/cifs/connect.c
+#	fs/cifs/smb1ops.c
+#	fs/cifs/smb2ops.c
+#	fs/cifs/transport.c
+diff --cc fs/cifs/cifsglob.h
+index a283b2dc9714,cfba226f3396..000000000000
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@@ -628,7 -732,8 +628,12 @@@ struct TCP_Server_Info 
+  #endif
+  	wait_queue_head_t response_q;
+  	wait_queue_head_t request_q; /* if more than maxmpx to srvr must block*/
+++<<<<<<< HEAD:fs/cifs/cifsglob.h
+ +	spinlock_t mid_lock;  /* protect mid queue and it's entries */
+++=======
++ 	spinlock_t mid_queue_lock;  /* protect mid queue */
++ 	spinlock_t mid_counter_lock;
+++>>>>>>> 9bd42798d5bf (smb: client: add mid_counter_lock to protect the mid counter counter):fs/smb/client/cifsglob.h
+  	struct list_head pending_mid_q;
+  	bool noblocksnd;		/* use blocking sendmsg */
+  	bool noautotune;		/* do not autotune send buf sizes */
+@@@ -1929,9 -2008,9 +1934,14 @@@ require use of the stronger protocol *
+   *				GlobalCurrentXid
+   *				GlobalTotalActiveXid
+   * TCP_Server_Info->srv_lock	(anything in struct not protected by another lock and can change)
+++<<<<<<< HEAD:fs/cifs/cifsglob.h
+ + * TCP_Server_Info->mid_lock	TCP_Server_Info->pending_mid_q	cifs_get_tcp_session
+ + *				->CurrentMid
+++=======
++  * TCP_Server_Info->mid_queue_lock	TCP_Server_Info->pending_mid_q	cifs_get_tcp_session
+++>>>>>>> 9bd42798d5bf (smb: client: add mid_counter_lock to protect the mid counter counter):fs/smb/client/cifsglob.h
+   *				(any changes in mid_q_entry fields)
++  * TCP_Server_Info->mid_counter_lock    TCP_Server_Info->current_mid    cifs_get_tcp_session
+   * TCP_Server_Info->req_lock	TCP_Server_Info->in_flight	cifs_get_tcp_session
+   *				->credits
+   *				->echo_credits
+diff --cc fs/cifs/connect.c
+index be50f9a0db24,74ad5881ee45..000000000000
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@@ -1064,7 -1242,7 +1064,11 @@@ smb2_add_credits_from_hdr(char *buffer
+  		spin_unlock(&server->req_lock);
+  		wake_up(&server->request_q);
+  
+++<<<<<<< HEAD:fs/cifs/connect.c
+ +		trace_smb3_add_credits(server->CurrentMid,
+++=======
++ 		trace_smb3_hdr_credits(server->current_mid,
+++>>>>>>> 9bd42798d5bf (smb: client: add mid_counter_lock to protect the mid counter counter):fs/smb/client/connect.c
+  				server->conn_id, server->hostname, scredits,
+  				le16_to_cpu(shdr->CreditRequest), in_flight);
+  		cifs_server_dbg(FYI, "%s: added %u credits total=%d\n",
+@@@ -1623,14 -1812,18 +1627,19 @@@ cifs_get_tcp_session(struct smb3_fs_con
+  		ctx->source_rfc1001_name, RFC1001_NAME_LEN_WITH_NULL);
+  	memcpy(tcp_ses->server_RFC1001_name,
+  		ctx->target_rfc1001_name, RFC1001_NAME_LEN_WITH_NULL);
+ -	tcp_ses->rfc1001_sessinit = ctx->rfc1001_sessinit;
+ -	tcp_ses->with_rfc1001 = false;
+  	tcp_ses->session_estab = false;
+  	tcp_ses->sequence_number = 0;
+ -	tcp_ses->channel_sequence_num = 0; /* only tracked for primary channel */
+  	tcp_ses->reconnect_instance = 1;
+  	tcp_ses->lstrp = jiffies;
+ -	tcp_ses->compression.requested = ctx->compress;
+ +	tcp_ses->compress_algorithm = cpu_to_le16(ctx->compression);
+  	spin_lock_init(&tcp_ses->req_lock);
+  	spin_lock_init(&tcp_ses->srv_lock);
+++<<<<<<< HEAD:fs/cifs/connect.c
+ +	spin_lock_init(&tcp_ses->mid_lock);
+++=======
++ 	spin_lock_init(&tcp_ses->mid_queue_lock);
++ 	spin_lock_init(&tcp_ses->mid_counter_lock);
+++>>>>>>> 9bd42798d5bf (smb: client: add mid_counter_lock to protect the mid counter counter):fs/smb/client/connect.c
+  	INIT_LIST_HEAD(&tcp_ses->tcp_ses_list);
+  	INIT_LIST_HEAD(&tcp_ses->smb_ses_list);
+  	INIT_DELAYED_WORK(&tcp_ses->echo, cifs_echo_request);
+diff --cc fs/cifs/smb1ops.c
+index e89cff722746,893a1ea8c000..000000000000
+--- a/fs/cifs/smb1ops.c
++++ b/fs/cifs/smb1ops.c
+@@@ -177,10 -169,9 +177,14 @@@ cifs_get_next_mid(struct TCP_Server_Inf
+  	__u16 last_mid, cur_mid;
+  	bool collision, reconnect = false;
+  
+++<<<<<<< HEAD:fs/cifs/smb1ops.c
+ +	spin_lock(&server->mid_lock);
+ +
+++=======
++ 	spin_lock(&server->mid_counter_lock);
+++>>>>>>> 9bd42798d5bf (smb: client: add mid_counter_lock to protect the mid counter counter):fs/smb/client/smb1ops.c
+  	/* mid is 16 bit only for CIFS/SMB */
+- 	cur_mid = (__u16)((server->CurrentMid) & 0xffff);
++ 	cur_mid = (__u16)((server->current_mid) & 0xffff);
+  	/* we do not want to loop forever */
+  	last_mid = cur_mid;
+  	cur_mid++;
+@@@ -236,7 -229,7 +242,11 @@@
+  		}
+  		cur_mid++;
+  	}
+++<<<<<<< HEAD:fs/cifs/smb1ops.c
+ +	spin_unlock(&server->mid_lock);
+++=======
++ 	spin_unlock(&server->mid_counter_lock);
+++>>>>>>> 9bd42798d5bf (smb: client: add mid_counter_lock to protect the mid counter counter):fs/smb/client/smb1ops.c
+  
+  	if (reconnect) {
+  		cifs_signal_cifsd_for_reconnect(server, false);
+diff --cc fs/cifs/smb2ops.c
+index 48e2004216ff,ebaeb2993569..000000000000
+--- a/fs/cifs/smb2ops.c
++++ b/fs/cifs/smb2ops.c
+@@@ -98,6 -91,24 +98,27 @@@ smb2_add_credits(struct TCP_Server_Inf
+  	if (*val > 65000) {
+  		*val = 65000; /* Don't get near 64K credits, avoid srv bugs */
+  		pr_warn_once("server overflowed SMB3 credits\n");
+++<<<<<<< HEAD:fs/cifs/smb2ops.c
+++=======
++ 		trace_smb3_overflow_credits(server->current_mid,
++ 					    server->conn_id, server->hostname, *val,
++ 					    add, server->in_flight);
++ 	}
++ 	if (credits->in_flight_check > 1) {
++ 		pr_warn_once("rreq R=%08x[%x] Credits not in flight\n",
++ 			     credits->rreq_debug_id, credits->rreq_debug_index);
++ 	} else {
++ 		credits->in_flight_check = 2;
++ 	}
++ 	if (WARN_ON_ONCE(server->in_flight == 0)) {
++ 		pr_warn_once("rreq R=%08x[%x] Zero in_flight\n",
++ 			     credits->rreq_debug_id, credits->rreq_debug_index);
++ 		trace_smb3_rw_credits(credits->rreq_debug_id,
++ 				      credits->rreq_debug_index,
++ 				      credits->value,
++ 				      server->credits, server->in_flight, 0,
++ 				      cifs_trace_rw_credits_zero_in_flight);
+++>>>>>>> 9bd42798d5bf (smb: client: add mid_counter_lock to protect the mid counter counter):fs/smb/client/smb2ops.c
+  	}
+  	server->in_flight--;
+  	if (server->in_flight == 0 &&
+@@@ -264,7 -288,7 +285,11 @@@ smb2_wait_mtu_credits(struct TCP_Server
+  	in_flight = server->in_flight;
+  	spin_unlock(&server->req_lock);
+  
+++<<<<<<< HEAD:fs/cifs/smb2ops.c
+ +	trace_smb3_add_credits(server->CurrentMid,
+++=======
++ 	trace_smb3_wait_credits(server->current_mid,
+++>>>>>>> 9bd42798d5bf (smb: client: add mid_counter_lock to protect the mid counter counter):fs/smb/client/smb2ops.c
+  			server->conn_id, server->hostname, scredits, -(credits->value), in_flight);
+  	cifs_dbg(FYI, "%s: removed %u credits total=%d\n",
+  			__func__, credits->value, scredits);
+@@@ -284,12 -310,19 +309,22 @@@ smb2_adjust_credits(struct TCP_Server_I
+  		return 0;
+  
+  	if (credits->value < new_val) {
+++<<<<<<< HEAD:fs/cifs/smb2ops.c
+ +		trace_smb3_too_many_credits(server->CurrentMid,
+++=======
++ 		trace_smb3_rw_credits(subreq->rreq->debug_id,
++ 				      subreq->subreq.debug_index,
++ 				      credits->value,
++ 				      server->credits, server->in_flight,
++ 				      new_val - credits->value,
++ 				      cifs_trace_rw_credits_no_adjust_up);
++ 		trace_smb3_too_many_credits(server->current_mid,
+++>>>>>>> 9bd42798d5bf (smb: client: add mid_counter_lock to protect the mid counter counter):fs/smb/client/smb2ops.c
+  				server->conn_id, server->hostname, 0, credits->value - new_val, 0);
+ -		cifs_server_dbg(VFS, "R=%x[%x] request has less credits (%d) than required (%d)",
+ -				subreq->rreq->debug_id, subreq->subreq.debug_index,
+ +		cifs_server_dbg(VFS, "request has less credits (%d) than required (%d)",
+  				credits->value, new_val);
+  
+ -		return -EOPNOTSUPP;
+ +		return -ENOTSUPP;
+  	}
+  
+  	spin_lock(&server->req_lock);
+@@@ -299,11 -332,18 +334,21 @@@
+  		in_flight = server->in_flight;
+  		spin_unlock(&server->req_lock);
+  
+++<<<<<<< HEAD:fs/cifs/smb2ops.c
+ +		trace_smb3_reconnect_detected(server->CurrentMid,
+++=======
++ 		trace_smb3_rw_credits(subreq->rreq->debug_id,
++ 				      subreq->subreq.debug_index,
++ 				      credits->value,
++ 				      server->credits, server->in_flight,
++ 				      new_val - credits->value,
++ 				      cifs_trace_rw_credits_old_session);
++ 		trace_smb3_reconnect_detected(server->current_mid,
+++>>>>>>> 9bd42798d5bf (smb: client: add mid_counter_lock to protect the mid counter counter):fs/smb/client/smb2ops.c
+  			server->conn_id, server->hostname, scredits,
+  			credits->value - new_val, in_flight);
+ -		cifs_server_dbg(VFS, "R=%x[%x] trying to return %d credits to old session\n",
+ -				subreq->rreq->debug_id, subreq->subreq.debug_index,
+ -				credits->value - new_val);
+ +		cifs_server_dbg(VFS, "trying to return %d credits to old session\n",
+ +			 credits->value - new_val);
+  		return -EAGAIN;
+  	}
+  
+@@@ -313,7 -358,7 +358,11 @@@
+  	spin_unlock(&server->req_lock);
+  	wake_up(&server->request_q);
+  
+++<<<<<<< HEAD:fs/cifs/smb2ops.c
+ +	trace_smb3_add_credits(server->CurrentMid,
+++=======
++ 	trace_smb3_adj_credits(server->current_mid,
+++>>>>>>> 9bd42798d5bf (smb: client: add mid_counter_lock to protect the mid counter counter):fs/smb/client/smb2ops.c
+  			server->conn_id, server->hostname, scredits,
+  			credits->value - new_val, in_flight);
+  	cifs_dbg(FYI, "%s: adjust added %u credits total=%d\n",
+@@@ -329,19 -374,19 +378,32 @@@ smb2_get_next_mid(struct TCP_Server_Inf
+  {
+  	__u64 mid;
+  	/* for SMB2 we need the current value */
+++<<<<<<< HEAD:fs/cifs/smb2ops.c
+ +	spin_lock(&server->mid_lock);
+ +	mid = server->CurrentMid++;
+ +	spin_unlock(&server->mid_lock);
+++=======
++ 	spin_lock(&server->mid_counter_lock);
++ 	mid = server->current_mid++;
++ 	spin_unlock(&server->mid_counter_lock);
+++>>>>>>> 9bd42798d5bf (smb: client: add mid_counter_lock to protect the mid counter counter):fs/smb/client/smb2ops.c
+  	return mid;
+  }
+  
+  static void
+  smb2_revert_current_mid(struct TCP_Server_Info *server, const unsigned int val)
+  {
+++<<<<<<< HEAD:fs/cifs/smb2ops.c
+ +	spin_lock(&server->mid_lock);
+ +	if (server->CurrentMid >= val)
+ +		server->CurrentMid -= val;
+ +	spin_unlock(&server->mid_lock);
+++=======
++ 	spin_lock(&server->mid_counter_lock);
++ 	if (server->current_mid >= val)
++ 		server->current_mid -= val;
++ 	spin_unlock(&server->mid_counter_lock);
+++>>>>>>> 9bd42798d5bf (smb: client: add mid_counter_lock to protect the mid counter counter):fs/smb/client/smb2ops.c
+  }
+  
+  static struct mid_q_entry *
+@@@ -415,13 -460,10 +477,19 @@@ smb2_negotiate(const unsigned int xid
+  {
+  	int rc;
+  
+++<<<<<<< HEAD:fs/cifs/smb2ops.c
+ +	spin_lock(&server->mid_lock);
+ +	server->CurrentMid = 0;
+ +	spin_unlock(&server->mid_lock);
+++=======
++ 	spin_lock(&server->mid_counter_lock);
++ 	server->current_mid = 0;
++ 	spin_unlock(&server->mid_counter_lock);
+++>>>>>>> 9bd42798d5bf (smb: client: add mid_counter_lock to protect the mid counter counter):fs/smb/client/smb2ops.c
+  	rc = SMB2_negotiate(xid, ses, server);
+ +	/* BB we probably don't need to retry with modern servers */
+ +	if (rc == -EAGAIN)
+ +		rc = -EHOSTDOWN;
+  	return rc;
+  }
+  
+@@@ -2562,7 -2498,7 +2630,11 @@@ smb2_is_status_pending(char *buf, struc
+  		spin_unlock(&server->req_lock);
+  		wake_up(&server->request_q);
+  
+++<<<<<<< HEAD:fs/cifs/smb2ops.c
+ +		trace_smb3_add_credits(server->CurrentMid,
+++=======
++ 		trace_smb3_pend_credits(server->current_mid,
+++>>>>>>> 9bd42798d5bf (smb: client: add mid_counter_lock to protect the mid counter counter):fs/smb/client/smb2ops.c
+  				server->conn_id, server->hostname, scredits,
+  				le16_to_cpu(shdr->CreditRequest), in_flight);
+  		cifs_dbg(FYI, "%s: status pending add %u credits total=%d\n",
+diff --cc fs/cifs/transport.c
+index 08e91443dfc7,8037accc3987..000000000000
+--- a/fs/cifs/transport.c
++++ b/fs/cifs/transport.c
+@@@ -540,7 -509,7 +540,11 @@@ wait_for_free_credits(struct TCP_Server
+  		in_flight = server->in_flight;
+  		spin_unlock(&server->req_lock);
+  
+++<<<<<<< HEAD:fs/cifs/transport.c
+ +		trace_smb3_add_credits(server->CurrentMid,
+++=======
++ 		trace_smb3_nblk_credits(server->current_mid,
+++>>>>>>> 9bd42798d5bf (smb: client: add mid_counter_lock to protect the mid counter counter):fs/smb/client/transport.c
+  				server->conn_id, server->hostname, scredits, -1, in_flight);
+  		cifs_dbg(FYI, "%s: remove %u credits total=%d\n",
+  				__func__, 1, scredits);
+@@@ -646,7 -615,7 +650,11 @@@
+  			in_flight = server->in_flight;
+  			spin_unlock(&server->req_lock);
+  
+++<<<<<<< HEAD:fs/cifs/transport.c
+ +			trace_smb3_add_credits(server->CurrentMid,
+++=======
++ 			trace_smb3_waitff_credits(server->current_mid,
+++>>>>>>> 9bd42798d5bf (smb: client: add mid_counter_lock to protect the mid counter counter):fs/smb/client/transport.c
+  					server->conn_id, server->hostname, scredits,
+  					-(num_credits), in_flight);
+  			cifs_dbg(FYI, "%s: remove %u credits total=%d\n",
+* Unmerged path fs/cifs/cifsglob.h
+* Unmerged path fs/cifs/connect.c
+* Unmerged path fs/cifs/smb1ops.c
+* Unmerged path fs/cifs/smb2ops.c
+* Unmerged path fs/cifs/transport.c
