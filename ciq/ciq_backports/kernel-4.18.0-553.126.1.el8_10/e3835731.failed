@@ -1,0 +1,355 @@
+smb: client: fix mid_q_entry memleak leak with per-mid locking
+
+jira KERNEL-1078
+Rebuild_History Non-Buildable kernel-4.18.0-553.126.1.el8_10
+commit-author Wang Zhaolong <wangzhaolong@huaweicloud.com>
+commit e3835731e169a48a2c73018d135b5c08c39ea61d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.126.1.el8_10/e3835731.failed
+
+This is step 4/4 of a patch series to fix mid_q_entry memory leaks
+caused by race conditions in callback execution.
+
+In compound_send_recv(), when wait_for_response() is interrupted by
+signals, the code attempts to cancel pending requests by changing
+their callbacks to cifs_cancelled_callback. However, there's a race
+condition between signal interruption and network response processing
+that causes both mid_q_entry and server buffer leaks:
+
+```
+User foreground process                    cifsd
+cifs_readdir
+ open_cached_dir
+  cifs_send_recv
+   compound_send_recv
+    smb2_setup_request
+     smb2_mid_entry_alloc
+      smb2_get_mid_entry
+       smb2_mid_entry_alloc
+        mempool_alloc // alloc mid
+        kref_init(&temp->refcount); // refcount = 1
+     mid[0]->callback = cifs_compound_callback;
+     mid[1]->callback = cifs_compound_last_callback;
+     smb_send_rqst
+     rc = wait_for_response
+      wait_event_state TASK_KILLABLE
+                                  cifs_demultiplex_thread
+                                    allocate_buffers
+                                      server->bigbuf = cifs_buf_get()
+                                    standard_receive3
+                                      ->find_mid()
+                                        smb2_find_mid
+                                          __smb2_find_mid
+                                           kref_get(&mid->refcount) // +1
+                                      cifs_handle_standard
+                                        handle_mid
+                                         /* bigbuf will also leak */
+                                         mid->resp_buf = server->bigbuf
+                                         server->bigbuf = NULL;
+                                         dequeue_mid
+                                     /* in for loop */
+                                    mids[0]->callback
+                                      cifs_compound_callback
+    /* Signal interrupts wait: rc = -ERESTARTSYS */
+    /* if (... || midQ[i]->mid_state == MID_RESPONSE_RECEIVED) *?
+    midQ[0]->callback = cifs_cancelled_callback;
+    cancelled_mid[i] = true;
+                                       /* The change comes too late */
+                                       mid->mid_state = MID_RESPONSE_READY
+                                    release_mid  // -1
+    /* cancelled_mid[i] == true causes mid won't be released
+       in compound_send_recv cleanup */
+    /* cifs_cancelled_callback won't executed to release mid */
+```
+
+The root cause is that there's a race between callback assignment and
+execution.
+
+Fix this by introducing per-mid locking:
+
+- Add spinlock_t mid_lock to struct mid_q_entry
+- Add mid_execute_callback() for atomic callback execution
+- Use mid_lock in cancellation paths to ensure atomicity
+
+This ensures that either the original callback or the cancellation
+callback executes atomically, preventing reference count leaks when
+requests are interrupted by signals.
+
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=220404
+Fixes: ee258d79159a ("CIFS: Move credit processing to mid callbacks for SMB3")
+	Signed-off-by: Wang Zhaolong <wangzhaolong@huaweicloud.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit e3835731e169a48a2c73018d135b5c08c39ea61d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/cifsglob.h
+#	fs/cifs/connect.c
+#	fs/cifs/transport.c
+#	fs/smb/client/cifstransport.c
+diff --cc fs/cifs/cifsglob.h
+index a283b2dc9714,1e64a4fb6af0..000000000000
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@@ -1613,9 -1729,12 +1613,15 @@@ struct mid_q_entry 
+  	void *resp_buf;		/* pointer to received SMB header */
+  	unsigned int resp_buf_size;
+  	int mid_state;	/* wish this were enum but can not pass to wait_event */
+ -	int mid_rc;		/* rc for MID_RC */
+ +	unsigned int mid_flags;
+  	__le16 command;		/* smb command code */
+  	unsigned int optype;	/* operation type */
+++<<<<<<< HEAD:fs/cifs/cifsglob.h
+++=======
++ 	spinlock_t mid_lock;
++ 	bool wait_cancelled:1;  /* Cancelled while waiting for response */
++ 	bool deleted_from_q:1;  /* Whether Mid has been dequeued frem pending_mid_q */
+++>>>>>>> e3835731e169 (smb: client: fix mid_q_entry memleak leak with per-mid locking):fs/smb/client/cifsglob.h
+  	bool large_buf:1;	/* if valid response, is pointer to large buf */
+  	bool multiRsp:1;	/* multiple trans2 responses for one request  */
+  	bool multiEnd:1;	/* both received */
+@@@ -1955,7 -2037,9 +1961,13 @@@ require use of the stronger protocol *
+   * cifsFileInfo->file_info_lock	cifsFileInfo->count		cifs_new_fileinfo
+   *				->invalidHandle			initiate_cifs_search
+   *				->oplock_break_cancelled
+++<<<<<<< HEAD:fs/cifs/cifsglob.h
+ + * cifs_aio_ctx->aio_mutex		cifs_aio_ctx			cifs_aio_ctx_alloc
+++=======
++  * mid_q_entry->mid_lock	mid_q_entry->callback           alloc_mid
++  *								smb2_mid_entry_alloc
++  *				(Any fields of mid_q_entry that will need protection)
+++>>>>>>> e3835731e169 (smb: client: fix mid_q_entry memleak leak with per-mid locking):fs/smb/client/cifsglob.h
+   ****************************************************************************/
+  
+  #ifdef DECLARE_GLOBALS_HERE
+@@@ -2213,4 -2379,26 +2225,29 @@@ static inline bool cifs_netbios_name(co
+  	return ret;
+  }
+  
+++<<<<<<< HEAD:fs/cifs/cifsglob.h
+++=======
++ /*
++  * Execute mid callback atomically - ensures callback runs exactly once
++  * and prevents sleeping in atomic context.
++  */
++ static inline void mid_execute_callback(struct mid_q_entry *mid)
++ {
++ 	void (*callback)(struct mid_q_entry *mid);
++ 
++ 	spin_lock(&mid->mid_lock);
++ 	callback = mid->callback;
++ 	mid->callback = NULL;  /* Mark as executed, */
++ 	spin_unlock(&mid->mid_lock);
++ 
++ 	if (callback)
++ 		callback(mid);
++ }
++ 
++ #define CIFS_REPARSE_SUPPORT(tcon) \
++ 	((tcon)->posix_extensions || \
++ 	 (le32_to_cpu((tcon)->fsAttrInfo.Attributes) & \
++ 	  FILE_SUPPORTS_REPARSE_POINTS))
++ 
+++>>>>>>> e3835731e169 (smb: client: fix mid_q_entry memleak leak with per-mid locking):fs/smb/client/cifsglob.h
+  #endif	/* _CIFS_GLOB_H */
+diff --cc fs/cifs/connect.c
+index be50f9a0db24,281ccbeea719..000000000000
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@@ -795,18 -857,90 +795,95 @@@ is_smb_response(struct TCP_Server_Info 
+  	case RFC1002_NEGATIVE_SESSION_RESPONSE:
+  		/*
+  		 * We get this from Windows 98 instead of an error on
+ -		 * SMB negprot response, when we have not established
+ -		 * RFC 1002 session (which means ip_rfc1001_connect()
+ -		 * was skipped). Note that same still happens with
+ -		 * Windows Server 2022 when connecting via port 139.
+ -		 * So for this case when mount option -o nonbsessinit
+ -		 * was not specified, try to reconnect with establishing
+ -		 * RFC 1002 session. If new socket establishment with
+ -		 * RFC 1002 session was successful then return to the
+ -		 * mid's caller -EAGAIN, so it can retry the request.
+ +		 * SMB negprot response.
+ +		 */
+++<<<<<<< HEAD:fs/cifs/connect.c
+ +		cifs_dbg(FYI, "RFC 1002 negative session response\n");
+ +		/* give server a second to clean up */
+ +		msleep(1000);
+ +		/*
+ +		 * Always try 445 first on reconnect since we get NACK
+ +		 * on some if we ever connected to port 139 (the NACK
+ +		 * is since we do not begin with RFC1001 session
+ +		 * initialize frame).
+  		 */
+ +		cifs_set_port((struct sockaddr *)&server->dstaddr, CIFS_PORT);
+++=======
++ 		if (!cifs_rdma_enabled(server) &&
++ 		    server->tcpStatus == CifsInNegotiate &&
++ 		    !server->with_rfc1001 &&
++ 		    server->rfc1001_sessinit != 0) {
++ 			int rc, mid_rc;
++ 			struct mid_q_entry *mid, *nmid;
++ 			LIST_HEAD(dispose_list);
++ 
++ 			cifs_dbg(FYI, "RFC 1002 negative session response during SMB Negotiate, retrying with NetBIOS session\n");
++ 
++ 			/*
++ 			 * Before reconnect, delete all pending mids for this
++ 			 * server, so reconnect would not signal connection
++ 			 * aborted error to mid's callbacks. Note that for this
++ 			 * server there should be exactly one pending mid
++ 			 * corresponding to SMB1/SMB2 Negotiate packet.
++ 			 */
++ 			spin_lock(&server->mid_queue_lock);
++ 			list_for_each_entry_safe(mid, nmid, &server->pending_mid_q, qhead) {
++ 				kref_get(&mid->refcount);
++ 				list_move(&mid->qhead, &dispose_list);
++ 				mid->deleted_from_q = true;
++ 			}
++ 			spin_unlock(&server->mid_queue_lock);
++ 
++ 			/* Now try to reconnect once with NetBIOS session. */
++ 			server->with_rfc1001 = true;
++ 			rc = cifs_reconnect_once(server);
++ 
++ 			/*
++ 			 * If reconnect was successful then indicate -EAGAIN
++ 			 * to mid's caller. If reconnect failed with -EAGAIN
++ 			 * then mask it as -EHOSTDOWN, so mid's caller would
++ 			 * know that it failed.
++ 			 */
++ 			if (rc == 0)
++ 				mid_rc = -EAGAIN;
++ 			else if (rc == -EAGAIN)
++ 				mid_rc = -EHOSTDOWN;
++ 			else
++ 				mid_rc = rc;
++ 
++ 			/*
++ 			 * After reconnect (either successful or unsuccessful)
++ 			 * deliver reconnect status to mid's caller via mid's
++ 			 * callback. Use MID_RC state which indicates that the
++ 			 * return code should be read from mid_rc member.
++ 			 */
++ 			list_for_each_entry_safe(mid, nmid, &dispose_list, qhead) {
++ 				list_del_init(&mid->qhead);
++ 				mid->mid_rc = mid_rc;
++ 				mid->mid_state = MID_RC;
++ 				mid_execute_callback(mid);
++ 				release_mid(mid);
++ 			}
++ 
++ 			/*
++ 			 * If reconnect failed then wait two seconds. In most
++ 			 * cases we were been called from the mount context and
++ 			 * delivered failure to mid's callback will stop this
++ 			 * receiver task thread and fails the mount process.
++ 			 * So wait two seconds to prevent another reconnect
++ 			 * in this task thread, which would be useless as the
++ 			 * mount context will fail at all.
++ 			 */
++ 			if (rc != 0)
++ 				msleep(2000);
++ 		} else {
++ 			cifs_server_dbg(VFS, "RFC 1002 negative session response (unexpected)\n");
++ 			cifs_reconnect(server, true);
++ 		}
++ 		break;
++ 	case RFC1002_RETARGET_SESSION_RESPONSE:
++ 		cifs_server_dbg(VFS, "RFC 1002 retarget session response (unexpected)\n");
+++>>>>>>> e3835731e169 (smb: client: fix mid_q_entry memleak leak with per-mid locking):fs/smb/client/connect.c
+  		cifs_reconnect(server, true);
+  		break;
+  	default:
+@@@ -1202,12 -1384,17 +1279,12 @@@ next_pdu
+  			if (mids[i] != NULL) {
+  				mids[i]->resp_buf_size = server->pdu_size;
+  
+ -				if (bufs[i] != NULL) {
+ -					if (server->ops->is_network_name_deleted &&
+ -					    server->ops->is_network_name_deleted(bufs[i],
+ -										 server)) {
+ -						cifs_server_dbg(FYI,
+ -								"Share deleted. Reconnect needed");
+ -					}
+ -				}
+ +				if (bufs[i] && server->ops->is_network_name_deleted)
+ +					server->ops->is_network_name_deleted(bufs[i],
+ +									server);
+  
+  				if (!mids[i]->multiRsp || mids[i]->multiEnd)
+- 					mids[i]->callback(mids[i]);
++ 					mid_execute_callback(mids[i]);
+  
+  				release_mid(mids[i]);
+  			} else if (server->ops->is_oplock_break &&
+diff --cc fs/cifs/transport.c
+index 08e91443dfc7,a61ba7f3fb86..000000000000
+--- a/fs/cifs/transport.c
++++ b/fs/cifs/transport.c
+@@@ -1237,15 -1005,14 +1237,25 @@@ compound_send_recv(const unsigned int x
+  			cifs_server_dbg(FYI, "Cancelling wait for mid %llu cmd: %d\n",
+  				 midQ[i]->mid, le16_to_cpu(midQ[i]->command));
+  			send_cancel(server, &rqst[i], midQ[i]);
+++<<<<<<< HEAD:fs/cifs/transport.c
+ +			spin_lock(&server->mid_lock);
+ +			midQ[i]->mid_flags |= MID_WAIT_CANCELLED;
+ +			if (midQ[i]->mid_state == MID_REQUEST_SUBMITTED ||
+ +			    midQ[i]->mid_state == MID_RESPONSE_RECEIVED) {
+++=======
++ 			spin_lock(&midQ[i]->mid_lock);
++ 			midQ[i]->wait_cancelled = true;
++ 			if (midQ[i]->callback) {
+++>>>>>>> e3835731e169 (smb: client: fix mid_q_entry memleak leak with per-mid locking):fs/smb/client/transport.c
+  				midQ[i]->callback = cifs_cancelled_callback;
+  				cancelled_mid[i] = true;
+  				credits[i].value = 0;
+  			}
+++<<<<<<< HEAD:fs/cifs/transport.c
+ +			spin_unlock(&server->mid_lock);
+++=======
++ 			spin_unlock(&midQ[i]->mid_lock);
+++>>>>>>> e3835731e169 (smb: client: fix mid_q_entry memleak leak with per-mid locking):fs/smb/client/transport.c
+  		}
+  	}
+  
+* Unmerged path fs/smb/client/cifstransport.c
+* Unmerged path fs/cifs/cifsglob.h
+* Unmerged path fs/cifs/connect.c
+diff --git a/fs/cifs/smb2ops.c b/fs/cifs/smb2ops.c
+index 48e2004216ff..29cbf7f21b8d 100644
+--- a/fs/cifs/smb2ops.c
++++ b/fs/cifs/smb2ops.c
+@@ -5010,7 +5010,7 @@ static void smb2_decrypt_offload(struct work_struct *work)
+ 				dw->server->ops->is_network_name_deleted(dw->buf,
+ 									 dw->server);
+ 
+-			mid->callback(mid);
++			mid_execute_callback(mid);
+ 		} else {
+ 			spin_lock(&dw->server->srv_lock);
+ 			if (dw->server->tcpStatus == CifsNeedReconnect) {
+@@ -5018,7 +5018,7 @@ static void smb2_decrypt_offload(struct work_struct *work)
+ 				mid->mid_state = MID_RETRY_NEEDED;
+ 				spin_unlock(&dw->server->mid_lock);
+ 				spin_unlock(&dw->server->srv_lock);
+-				mid->callback(mid);
++				mid_execute_callback(mid);
+ 			} else {
+ 				spin_lock(&dw->server->mid_lock);
+ 				mid->mid_state = MID_REQUEST_SUBMITTED;
+diff --git a/fs/cifs/smb2transport.c b/fs/cifs/smb2transport.c
+index 8a6d1d4e7b4e..3249c0866f38 100644
+--- a/fs/cifs/smb2transport.c
++++ b/fs/cifs/smb2transport.c
+@@ -789,6 +789,7 @@ smb2_mid_entry_alloc(const struct smb2_hdr *shdr,
+ 	temp = mempool_alloc(cifs_mid_poolp, GFP_NOFS);
+ 	memset(temp, 0, sizeof(struct mid_q_entry));
+ 	kref_init(&temp->refcount);
++	spin_lock_init(&temp->mid_lock);
+ 	temp->mid = le64_to_cpu(shdr->MessageId);
+ 	temp->credits = credits > 0 ? credits : 1;
+ 	temp->pid = current->pid;
+* Unmerged path fs/cifs/transport.c
+* Unmerged path fs/smb/client/cifstransport.c
