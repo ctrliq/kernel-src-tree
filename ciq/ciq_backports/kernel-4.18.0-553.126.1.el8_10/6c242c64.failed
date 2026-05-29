@@ -1,0 +1,243 @@
+Bluetooth: ISO: don't try to remove CIG if there are bound CIS left
+
+jira KERNEL-1078
+Rebuild_History Non-Buildable kernel-4.18.0-553.126.1.el8_10
+commit-author Pauli Virtanen <pav@iki.fi>
+commit 6c242c64a09e78349fb0a5f0a6f8076a3d7c0bb4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.126.1.el8_10/6c242c64.failed
+
+Consider existing BOUND & CONNECT state CIS to block CIG removal.
+Otherwise, under suitable timing conditions we may attempt to remove CIG
+while Create CIS is pending, which fails.
+
+Fixes: 26afbd826ee3 ("Bluetooth: Add initial implementation of CIS connections")
+	Signed-off-by: Pauli Virtanen <pav@iki.fi>
+	Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+(cherry picked from commit 6c242c64a09e78349fb0a5f0a6f8076a3d7c0bb4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bluetooth/hci_conn.c
+diff --cc net/bluetooth/hci_conn.c
+index 643ed73c83dd,1ef952bda97d..000000000000
+--- a/net/bluetooth/hci_conn.c
++++ b/net/bluetooth/hci_conn.c
+@@@ -640,6 -775,212 +640,215 @@@ static void le_conn_timeout(struct work
+  	hci_abort_conn(conn, HCI_ERROR_REMOTE_USER_TERM);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct iso_list_data {
++ 	union {
++ 		u8  cig;
++ 		u8  big;
++ 	};
++ 	union {
++ 		u8  cis;
++ 		u8  bis;
++ 		u16 sync_handle;
++ 	};
++ 	int count;
++ 	struct {
++ 		struct hci_cp_le_set_cig_params cp;
++ 		struct hci_cis_params cis[0x11];
++ 	} pdu;
++ };
++ 
++ static void bis_list(struct hci_conn *conn, void *data)
++ {
++ 	struct iso_list_data *d = data;
++ 
++ 	/* Skip if not broadcast/ANY address */
++ 	if (bacmp(&conn->dst, BDADDR_ANY))
++ 		return;
++ 
++ 	if (d->big != conn->iso_qos.bcast.big || d->bis == BT_ISO_QOS_BIS_UNSET ||
++ 	    d->bis != conn->iso_qos.bcast.bis)
++ 		return;
++ 
++ 	d->count++;
++ }
++ 
++ static void find_bis(struct hci_conn *conn, void *data)
++ {
++ 	struct iso_list_data *d = data;
++ 
++ 	/* Ignore unicast */
++ 	if (bacmp(&conn->dst, BDADDR_ANY))
++ 		return;
++ 
++ 	d->count++;
++ }
++ 
++ static int terminate_big_sync(struct hci_dev *hdev, void *data)
++ {
++ 	struct iso_list_data *d = data;
++ 
++ 	bt_dev_dbg(hdev, "big 0x%2.2x bis 0x%2.2x", d->big, d->bis);
++ 
++ 	hci_remove_ext_adv_instance_sync(hdev, d->bis, NULL);
++ 
++ 	/* Check if ISO connection is a BIS and terminate BIG if there are
++ 	 * no other connections using it.
++ 	 */
++ 	hci_conn_hash_list_state(hdev, find_bis, ISO_LINK, BT_CONNECTED, d);
++ 	if (d->count)
++ 		return 0;
++ 
++ 	return hci_le_terminate_big_sync(hdev, d->big,
++ 					 HCI_ERROR_LOCAL_HOST_TERM);
++ }
++ 
++ static void terminate_big_destroy(struct hci_dev *hdev, void *data, int err)
++ {
++ 	kfree(data);
++ }
++ 
++ static int hci_le_terminate_big(struct hci_dev *hdev, u8 big, u8 bis)
++ {
++ 	struct iso_list_data *d;
++ 	int ret;
++ 
++ 	bt_dev_dbg(hdev, "big 0x%2.2x bis 0x%2.2x", big, bis);
++ 
++ 	d = kzalloc(sizeof(*d), GFP_KERNEL);
++ 	if (!d)
++ 		return -ENOMEM;
++ 
++ 	d->big = big;
++ 	d->bis = bis;
++ 
++ 	ret = hci_cmd_sync_queue(hdev, terminate_big_sync, d,
++ 				 terminate_big_destroy);
++ 	if (ret)
++ 		kfree(d);
++ 
++ 	return ret;
++ }
++ 
++ static int big_terminate_sync(struct hci_dev *hdev, void *data)
++ {
++ 	struct iso_list_data *d = data;
++ 
++ 	bt_dev_dbg(hdev, "big 0x%2.2x sync_handle 0x%4.4x", d->big,
++ 		   d->sync_handle);
++ 
++ 	/* Check if ISO connection is a BIS and terminate BIG if there are
++ 	 * no other connections using it.
++ 	 */
++ 	hci_conn_hash_list_state(hdev, find_bis, ISO_LINK, BT_CONNECTED, d);
++ 	if (d->count)
++ 		return 0;
++ 
++ 	hci_le_big_terminate_sync(hdev, d->big);
++ 
++ 	return hci_le_pa_terminate_sync(hdev, d->sync_handle);
++ }
++ 
++ static int hci_le_big_terminate(struct hci_dev *hdev, u8 big, u16 sync_handle)
++ {
++ 	struct iso_list_data *d;
++ 	int ret;
++ 
++ 	bt_dev_dbg(hdev, "big 0x%2.2x sync_handle 0x%4.4x", big, sync_handle);
++ 
++ 	d = kzalloc(sizeof(*d), GFP_KERNEL);
++ 	if (!d)
++ 		return -ENOMEM;
++ 
++ 	d->big = big;
++ 	d->sync_handle = sync_handle;
++ 
++ 	ret = hci_cmd_sync_queue(hdev, big_terminate_sync, d,
++ 				 terminate_big_destroy);
++ 	if (ret)
++ 		kfree(d);
++ 
++ 	return ret;
++ }
++ 
++ /* Cleanup BIS connection
++  *
++  * Detects if there any BIS left connected in a BIG
++  * broadcaster: Remove advertising instance and terminate BIG.
++  * broadcaster receiver: Teminate BIG sync and terminate PA sync.
++  */
++ static void bis_cleanup(struct hci_conn *conn)
++ {
++ 	struct hci_dev *hdev = conn->hdev;
++ 
++ 	bt_dev_dbg(hdev, "conn %p", conn);
++ 
++ 	if (conn->role == HCI_ROLE_MASTER) {
++ 		if (!test_and_clear_bit(HCI_CONN_PER_ADV, &conn->flags))
++ 			return;
++ 
++ 		hci_le_terminate_big(hdev, conn->iso_qos.bcast.big,
++ 				     conn->iso_qos.bcast.bis);
++ 	} else {
++ 		hci_le_big_terminate(hdev, conn->iso_qos.bcast.big,
++ 				     conn->sync_handle);
++ 	}
++ }
++ 
++ static int remove_cig_sync(struct hci_dev *hdev, void *data)
++ {
++ 	u8 handle = PTR_ERR(data);
++ 
++ 	return hci_le_remove_cig_sync(hdev, handle);
++ }
++ 
++ static int hci_le_remove_cig(struct hci_dev *hdev, u8 handle)
++ {
++ 	bt_dev_dbg(hdev, "handle 0x%2.2x", handle);
++ 
++ 	return hci_cmd_sync_queue(hdev, remove_cig_sync, ERR_PTR(handle), NULL);
++ }
++ 
++ static void find_cis(struct hci_conn *conn, void *data)
++ {
++ 	struct iso_list_data *d = data;
++ 
++ 	/* Ignore broadcast or if CIG don't match */
++ 	if (!bacmp(&conn->dst, BDADDR_ANY) || d->cig != conn->iso_qos.ucast.cig)
++ 		return;
++ 
++ 	d->count++;
++ }
++ 
++ /* Cleanup CIS connection:
++  *
++  * Detects if there any CIS left connected in a CIG and remove it.
++  */
++ static void cis_cleanup(struct hci_conn *conn)
++ {
++ 	struct hci_dev *hdev = conn->hdev;
++ 	struct iso_list_data d;
++ 
++ 	if (conn->iso_qos.ucast.cig == BT_ISO_QOS_CIG_UNSET)
++ 		return;
++ 
++ 	memset(&d, 0, sizeof(d));
++ 	d.cig = conn->iso_qos.ucast.cig;
++ 
++ 	/* Check if ISO connection is a CIS and remove CIG if there are
++ 	 * no other connections using it.
++ 	 */
++ 	hci_conn_hash_list_state(hdev, find_cis, ISO_LINK, BT_BOUND, &d);
++ 	hci_conn_hash_list_state(hdev, find_cis, ISO_LINK, BT_CONNECT, &d);
++ 	hci_conn_hash_list_state(hdev, find_cis, ISO_LINK, BT_CONNECTED, &d);
++ 	if (d.count)
++ 		return;
++ 
++ 	hci_le_remove_cig(hdev, conn->iso_qos.ucast.cig);
++ }
++ 
+++>>>>>>> 6c242c64a09e (Bluetooth: ISO: don't try to remove CIG if there are bound CIS left)
+  struct hci_conn *hci_conn_add(struct hci_dev *hdev, int type, bdaddr_t *dst,
+  			      u8 role)
+  {
+* Unmerged path net/bluetooth/hci_conn.c
