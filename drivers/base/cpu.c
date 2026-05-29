@@ -318,7 +318,10 @@ static ssize_t nohz_full_show(struct device *dev,
 				    struct device_attribute *attr,
 				    char *buf)
 {
-	return sysfs_emit(buf, "%*pbl\n", cpumask_pr_args(tick_nohz_full_mask));
+	if (cpumask_available(tick_nohz_full_mask))
+		return sysfs_emit(buf, "%*pbl\n",
+				  cpumask_pr_args(tick_nohz_full_mask));
+	return sysfs_emit(buf, "\n");
 }
 static DEVICE_ATTR_RO(nohz_full);
 #endif
@@ -339,7 +342,7 @@ static void cpu_device_release(struct device *dev)
 	 * This is an empty function to prevent the driver core from spitting a
 	 * warning at us.  Yes, I know this is directly opposite of what the
 	 * documentation for the driver core and kobjects say, and the author
-	 * of this code has already been publically ridiculed for doing
+	 * of this code has already been publicly ridiculed for doing
 	 * something as foolish as this.  However, at this point in time, it is
 	 * the only way to handle the issue of statically allocated cpu
 	 * devices.  The different architectures will have their cpu device
