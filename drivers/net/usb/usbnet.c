@@ -1976,6 +1976,7 @@ int usbnet_resume(struct usb_interface *intf)
 			} else {
 				netif_trans_update(dev->net);
 				__skb_queue_tail(&dev->txq, skb);
+				netdev_sent_queue(dev->net, skb->len);
 			}
 		}
 
