@@ -4553,7 +4553,7 @@ static int sysctl_schedstats(const struct ctl_table *table, int write, void *buf
 #endif /* CONFIG_SCHEDSTATS */
 
 #ifdef CONFIG_SYSCTL
-static struct ctl_table sched_core_sysctls[] = {
+static const struct ctl_table sched_core_sysctls[] = {
 #ifdef CONFIG_SCHEDSTATS
 	{
 		.procname       = "sched_schedstats",

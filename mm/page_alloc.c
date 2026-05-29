@@ -6257,7 +6257,7 @@ out:
 	return ret;
 }
 
-static struct ctl_table page_alloc_sysctl_table[] = {
+static const struct ctl_table page_alloc_sysctl_table[] = {
 	{
 		.procname	= "min_free_kbytes",
 		.data		= &min_free_kbytes,

@@ -26,7 +26,6 @@
 #include <linux/sysctl.h>
 #include <linux/bitmap.h>
 #include <linux/signal.h>
-#include <linux/panic.h>
 #include <linux/printk.h>
 #include <linux/proc_fs.h>
 #include <linux/security.h>
@@ -756,49 +755,6 @@ int proc_douintvec(const struct ctl_table *table, int write, void *buffer,
 {
 	return do_proc_douintvec(table, write, buffer, lenp, ppos,
 				 do_proc_douintvec_conv, NULL);
-}
-
-/*
- * Taint values can only be increased
- * This means we can safely use a temporary.
- */
-static int proc_taint(const struct ctl_table *table, int write,
-			       void *buffer, size_t *lenp, loff_t *ppos)
-{
-	struct ctl_table t;
-	unsigned long tmptaint = get_taint();
-	int err;
-
-	if (write && !capable(CAP_SYS_ADMIN))
-		return -EPERM;
-
-	t = *table;
-	t.data = &tmptaint;
-	err = proc_doulongvec_minmax(&t, write, buffer, lenp, ppos);
-	if (err < 0)
-		return err;
-
-	if (write) {
-		int i;
-
-		/*
-		 * If we are relying on panic_on_taint not producing
-		 * false positives due to userspace input, bail out
-		 * before setting the requested taint flags.
-		 */
-		if (panic_on_taint_nousertaint && (tmptaint & panic_on_taint))
-			return -EINVAL;
-
-		/*
-		 * Poor man's atomic or. Not worth adding a primitive
-		 * to everyone's atomic.h for this
-		 */
-		for (i = 0; i < TAINT_FLAGS_COUNT; i++)
-			if ((1UL << i) & tmptaint)
-				add_taint(i, LOCKDEP_STILL_OK);
-	}
-
-	return err;
 }
 
 /**
@@ -1603,21 +1559,8 @@ int proc_do_static_key(const struct ctl_table *table, int write,
 	return ret;
 }
 
-static struct ctl_table kern_table[] = {
-	{
-		.procname	= "panic",
-		.data		= &panic_timeout,
-		.maxlen		= sizeof(int),
-		.mode		= 0644,
-		.proc_handler	= proc_dointvec,
-	},
+static const struct ctl_table kern_table[] = {
 #ifdef CONFIG_PROC_SYSCTL
-	{
-		.procname	= "tainted",
-		.maxlen 	= sizeof(long),
-		.mode		= 0644,
-		.proc_handler	= proc_taint,
-	},
 	{
 		.procname	= "sysctl_writes_strict",
 		.data		= &sysctl_writes_strict,
@@ -1807,20 +1750,6 @@ static struct ctl_table kern_table[] = {
 		.extra2		= &pid_max_max,
 	},
 	{
-		.procname	= "panic_on_oops",
-		.data		= &panic_on_oops,
-		.maxlen		= sizeof(int),
-		.mode		= 0644,
-		.proc_handler	= proc_dointvec,
-	},
-	{
-		.procname	= "panic_print",
-		.data		= &panic_print,
-		.maxlen		= sizeof(unsigned long),
-		.mode		= 0644,
-		.proc_handler	= proc_doulongvec_minmax,
-	},
-	{
 		.procname	= "ngroups_max",
 		.data		= (void *)&ngroups_max,
 		.maxlen		= sizeof (int),
@@ -1834,63 +1763,6 @@ static struct ctl_table kern_table[] = {
 		.mode		= 0444,
 		.proc_handler	= proc_dointvec,
 	},
-#if defined(CONFIG_X86_LOCAL_APIC) && defined(CONFIG_X86)
-	{
-		.procname       = "unknown_nmi_panic",
-		.data           = &unknown_nmi_panic,
-		.maxlen         = sizeof (int),
-		.mode           = 0644,
-		.proc_handler   = proc_dointvec,
-	},
-#endif
-
-#if (defined(CONFIG_X86_32) || defined(CONFIG_PARISC)) && \
-	defined(CONFIG_DEBUG_STACKOVERFLOW)
-	{
-		.procname	= "panic_on_stackoverflow",
-		.data		= &sysctl_panic_on_stackoverflow,
-		.maxlen		= sizeof(int),
-		.mode		= 0644,
-		.proc_handler	= proc_dointvec,
-	},
-#endif
-#if defined(CONFIG_X86)
-	{
-		.procname	= "panic_on_unrecovered_nmi",
-		.data		= &panic_on_unrecovered_nmi,
-		.maxlen		= sizeof(int),
-		.mode		= 0644,
-		.proc_handler	= proc_dointvec,
-	},
-	{
-		.procname	= "panic_on_io_nmi",
-		.data		= &panic_on_io_nmi,
-		.maxlen		= sizeof(int),
-		.mode		= 0644,
-		.proc_handler	= proc_dointvec,
-	},
-	{
-		.procname	= "bootloader_type",
-		.data		= &bootloader_type,
-		.maxlen		= sizeof (int),
-		.mode		= 0444,
-		.proc_handler	= proc_dointvec,
-	},
-	{
-		.procname	= "bootloader_version",
-		.data		= &bootloader_version,
-		.maxlen		= sizeof (int),
-		.mode		= 0444,
-		.proc_handler	= proc_dointvec,
-	},
-	{
-		.procname	= "io_delay_type",
-		.data		= &io_delay_type,
-		.maxlen		= sizeof(int),
-		.mode		= 0644,
-		.proc_handler	= proc_dointvec,
-	},
-#endif
 #if defined(CONFIG_MMU)
 	{
 		.procname	= "randomize_va_space",
@@ -1907,15 +1779,6 @@ static struct ctl_table kern_table[] = {
 		.maxlen		= sizeof (int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec,
-	},
-#endif
-#if	defined(CONFIG_ACPI_SLEEP) && defined(CONFIG_X86)
-	{
-		.procname	= "acpi_video_flags",
-		.data		= &acpi_realmode_flags,
-		.maxlen		= sizeof (unsigned long),
-		.mode		= 0644,
-		.proc_handler	= proc_doulongvec_minmax,
 	},
 #endif
 #ifdef CONFIG_SYSCTL_ARCH_UNALIGN_NO_WARN
@@ -1936,18 +1799,9 @@ static struct ctl_table kern_table[] = {
 		.proc_handler	= proc_dointvec,
 	},
 #endif
-	{
-		.procname	= "panic_on_warn",
-		.data		= &panic_on_warn,
-		.maxlen		= sizeof(int),
-		.mode		= 0644,
-		.proc_handler	= proc_dointvec_minmax,
-		.extra1		= SYSCTL_ZERO,
-		.extra2		= SYSCTL_ONE,
-	},
 };
 
-static struct ctl_table vm_table[] = {
+static const struct ctl_table vm_table[] = {
 	{
 		.procname	= "overcommit_memory",
 		.data		= &sysctl_overcommit_memory,

@@ -14,9 +14,11 @@ extern void release_perfctr_nmi(unsigned int);
 extern int reserve_evntsel_nmi(unsigned int);
 extern void release_evntsel_nmi(unsigned int);
 
-extern int unknown_nmi_panic;
-
 #endif /* CONFIG_X86_LOCAL_APIC */
+
+extern int unknown_nmi_panic;
+extern int panic_on_unrecovered_nmi;
+extern int panic_on_io_nmi;
 
 #define NMI_FLAG_FIRST	1
 
