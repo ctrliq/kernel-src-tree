@@ -104,4 +104,6 @@ $(OUTPUT)/test_syscall_vdso_32: thunks_32.S
 # needs to be static so that its interpreter doesn't destroy its initial
 # state.
 $(OUTPUT)/check_initial_reg_state_32: CFLAGS += -Wl,-ereal_start -static
+
+$(OUTPUT)/amx_64: EXTRA_FILES += xstate.c
 $(OUTPUT)/check_initial_reg_state_64: CFLAGS += -Wl,-ereal_start -static
