@@ -1,0 +1,183 @@
+net: skbuff: propagate shared-frag marker through frag-transfer helpers
+
+jira KERNEL-1100
+cve CVE-2026-46300
+Rebuild_History Non-Buildable kernel-5.14.0-687.12.1.el9_8
+commit-author Hyunwoo Kim <imv4bel@gmail.com>
+commit 48f6a5356a33dd78e7144ae1faef95ffc990aae0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.12.1.el9_8/48f6a535.failed
+
+Two frag-transfer helpers (__pskb_copy_fclone() and skb_shift()) fail
+to propagate the SKBFL_SHARED_FRAG bit in skb_shinfo()->flags when
+moving frags from source to destination.  __pskb_copy_fclone() defers
+the rest of the shinfo metadata to skb_copy_header() after copying
+frag descriptors, but that helper only carries over gso_{size,segs,
+type} and never touches skb_shinfo()->flags; skb_shift() moves frag
+descriptors directly and leaves flags untouched.  As a result, the
+destination skb keeps a reference to the same externally-owned or
+page-cache-backed pages while reporting skb_has_shared_frag() as
+false.
+
+The mismatch is harmful in any in-place writer that uses
+skb_has_shared_frag() to decide whether shared pages must be detoured
+through skb_cow_data().  ESP input is one such writer (esp4.c,
+esp6.c), and a single nft 'dup to <local>' rule -- or any other
+nf_dup_ipv4() / xt_TEE caller -- is enough to land a pskb_copy()'d
+skb in esp_input() with the marker stripped, letting an unprivileged
+user write into the page cache of a root-owned read-only file via
+authencesn-ESN stray writes.
+
+Set SKBFL_SHARED_FRAG on the destination whenever frag descriptors
+were actually moved from the source.  skb_copy() and skb_copy_expand()
+share skb_copy_header() too but linearize all paged data into freshly
+allocated head storage and emerge with nr_frags == 0, so
+skb_has_shared_frag() returns false on its own; they need no change.
+
+The same omission exists in skb_gro_receive() and skb_gro_receive_list().
+The former moves the incoming skb's frag descriptors into the
+accumulator's last sub-skb via two paths (a direct frag-move loop and
+the head_frag + memcpy path); the latter chains the incoming skb whole
+onto p's frag_list.  Downstream skb_segment() reads only
+skb_shinfo(p)->flags, and skb_segment_list() reuses each sub-skb's
+shinfo as the nskb -- both p and lp must carry the marker.
+
+The same omission also exists in tcp_clone_payload(), which builds an
+MTU probe skb by moving frag descriptors from skbs on sk_write_queue
+into a freshly allocated nskb.  The helper falls into the same family
+and warrants the same fix for consistency; no TCP TX-side in-place
+writer is currently known to reach a user page through this gap, but
+a future consumer depending on the marker would regress silently.
+
+The same omission exists in skb_segment(): the per-iteration flag
+merge takes only head_skb's flag, and the inner switch that rebinds
+frag_skb to list_skb on head_skb-frags exhaustion does not fold the
+new frag_skb's flag into nskb.  Fold frag_skb's flag at both sites
+so segments drawing frags from frag_list members carry the marker.
+
+Fixes: cef401de7be8 ("net: fix possible wrong checksum generation")
+Fixes: f4c50a4034e6 ("xfrm: esp: avoid in-place decrypt on shared skb frags")
+	Suggested-by: Sabrina Dubroca <sd@queasysnail.net>
+	Suggested-by: Sultan Alsawaf <sultan@kerneltoast.com>
+	Suggested-by: Ben Hutchings <ben@decadent.org.uk>
+	Suggested-by: Lin Ma <malin89@huawei.com>
+	Suggested-by: Jingguo Tan <tanjingguo@huawei.com>
+	Suggested-by: Aaron Esau <aaron1esau@gmail.com>
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Hyunwoo Kim <imv4bel@gmail.com>
+	Tested-by: Rajat Gupta <rajat.gupta@oss.qualcomm.com>
+Link: https://patch.msgid.link/ageeJfJHwgzmKXbh@v4bel
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+(cherry picked from commit 48f6a5356a33dd78e7144ae1faef95ffc990aae0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/skbuff.c
+#	net/ipv4/tcp_output.c
+diff --cc net/core/skbuff.c
+index 799c2e8f770a,44ac121cfccb..000000000000
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@@ -4032,13 -4352,8 +4032,18 @@@ onlymerged
+  
+  	skb_shinfo(tgt)->flags |= skb_shinfo(skb)->flags & SKBFL_SHARED_FRAG;
+  
+++<<<<<<< HEAD
+ +	/* Yak, is it really working this way? Some helper please? */
+ +	skb->len -= shiftlen;
+ +	skb->data_len -= shiftlen;
+ +	skb->truesize -= shiftlen;
+ +	tgt->len += shiftlen;
+ +	tgt->data_len += shiftlen;
+ +	tgt->truesize += shiftlen;
+++=======
++ 	skb_len_add(skb, -shiftlen);
++ 	skb_len_add(tgt, shiftlen);
+++>>>>>>> 48f6a5356a33 (net: skbuff: propagate shared-frag marker through frag-transfer helpers)
+  
+  	return shiftlen;
+  }
+diff --cc net/ipv4/tcp_output.c
+index 797645369a51,6e4bb411dc04..000000000000
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@@ -2321,6 -2604,73 +2321,76 @@@ static bool tcp_can_coalesce_send_queue
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int tcp_clone_payload(struct sock *sk, struct sk_buff *to,
++ 			     int probe_size)
++ {
++ 	skb_frag_t *lastfrag = NULL, *fragto = skb_shinfo(to)->frags;
++ 	int i, todo, len = 0, nr_frags = 0;
++ 	const struct sk_buff *skb;
++ 
++ 	if (!sk_wmem_schedule(sk, to->truesize + probe_size))
++ 		return -ENOMEM;
++ 
++ 	skb_queue_walk(&sk->sk_write_queue, skb) {
++ 		const skb_frag_t *fragfrom = skb_shinfo(skb)->frags;
++ 
++ 		if (skb_headlen(skb))
++ 			return -EINVAL;
++ 
++ 		for (i = 0; i < skb_shinfo(skb)->nr_frags; i++, fragfrom++) {
++ 			if (len >= probe_size)
++ 				goto commit;
++ 			todo = min_t(int, skb_frag_size(fragfrom),
++ 				     probe_size - len);
++ 			len += todo;
++ 			skb_shinfo(to)->flags |= skb_shinfo(skb)->flags & SKBFL_SHARED_FRAG;
++ 			if (lastfrag &&
++ 			    skb_frag_page(fragfrom) == skb_frag_page(lastfrag) &&
++ 			    skb_frag_off(fragfrom) == skb_frag_off(lastfrag) +
++ 						      skb_frag_size(lastfrag)) {
++ 				skb_frag_size_add(lastfrag, todo);
++ 				continue;
++ 			}
++ 			if (unlikely(nr_frags == MAX_SKB_FRAGS))
++ 				return -E2BIG;
++ 			skb_frag_page_copy(fragto, fragfrom);
++ 			skb_frag_off_copy(fragto, fragfrom);
++ 			skb_frag_size_set(fragto, todo);
++ 			nr_frags++;
++ 			lastfrag = fragto++;
++ 		}
++ 	}
++ commit:
++ 	WARN_ON_ONCE(len != probe_size);
++ 	for (i = 0; i < nr_frags; i++)
++ 		skb_frag_ref(to, i);
++ 
++ 	skb_shinfo(to)->nr_frags = nr_frags;
++ 	to->truesize += probe_size;
++ 	to->len += probe_size;
++ 	to->data_len += probe_size;
++ 	__skb_header_release(to);
++ 	return 0;
++ }
++ 
++ /* tcp_mtu_probe() and tcp_grow_skb() can both eat an skb (src) if
++  * all its payload was moved to another one (dst).
++  * Make sure to transfer tcp_flags, eor, and tstamp.
++  */
++ static void tcp_eat_one_skb(struct sock *sk,
++ 			    struct sk_buff *dst,
++ 			    struct sk_buff *src)
++ {
++ 	TCP_SKB_CB(dst)->tcp_flags |= TCP_SKB_CB(src)->tcp_flags;
++ 	TCP_SKB_CB(dst)->eor = TCP_SKB_CB(src)->eor;
++ 	tcp_skb_collapse_tstamp(dst, src);
++ 	tcp_unlink_write_queue(src, sk);
++ 	tcp_wmem_free_skb(sk, src);
++ }
++ 
+++>>>>>>> 48f6a5356a33 (net: skbuff: propagate shared-frag marker through frag-transfer helpers)
+  /* Create a new MTU probe if we are ready.
+   * MTU probe is regularly attempting to increase the path MTU by
+   * deliberately sending larger packets.  This discovers routing
+* Unmerged path net/core/skbuff.c
+* Unmerged path net/ipv4/tcp_output.c
