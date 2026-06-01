@@ -399,6 +399,20 @@ __no_sanitize_memory
 #define asm_goto_output(x...) asm volatile goto(x)
 #endif
 
+/*
+ * Determine if an attribute has been applied to a variable.
+ * Using __annotated needs to check for __annotated being available,
+ * or negative tests may fail when annotation cannot be checked. For
+ * example, see the definition of __is_cstr().
+ */
+#if __has_builtin(__builtin_has_attribute)
+#define __annotated(var, attr)	__builtin_has_attribute(var, attr)
+#endif
+
+#ifndef asm_volatile_goto
+#define asm_volatile_goto(x...) asm goto(x)
+#endif
+
 #ifdef CONFIG_CC_HAS_ASM_INLINE
 #define asm_inline asm __inline
 #else
