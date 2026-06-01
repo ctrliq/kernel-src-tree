@@ -19,6 +19,7 @@
 
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
+#include <bpf/bpf_core_read.h>
 #include "bpf_compiler.h"
 
 #pragma GCC diagnostic ignored "-Waddress-of-packed-member"
@@ -597,7 +598,8 @@ int __encap_ip6vxlan_eth(struct __sk_buff *skb)
 		return TC_ACT_OK;
 }
 
-static int decap_internal(struct __sk_buff *skb, int off, int len, char proto)
+static int decap_internal(struct __sk_buff *skb, int off, int len, char proto,
+			  __u64 ipxip_flag)
 {
 	__u64 flags = BPF_F_ADJ_ROOM_FIXED_GSO;
 	struct ipv6_opt_hdr ip6_opt_hdr;
@@ -607,10 +609,12 @@ static int decap_internal(struct __sk_buff *skb, int off, int len, char proto)
 
 	switch (proto) {
 	case IPPROTO_IPIP:
-		flags |= BPF_F_ADJ_ROOM_DECAP_L3_IPV4;
+		flags |= BPF_F_ADJ_ROOM_DECAP_L3_IPV4 |
+			 ipxip_flag;
 		break;
 	case IPPROTO_IPV6:
-		flags |= BPF_F_ADJ_ROOM_DECAP_L3_IPV6;
+		flags |= BPF_F_ADJ_ROOM_DECAP_L3_IPV6 |
+			 ipxip_flag;
 		break;
 	case NEXTHDR_DEST:
 		if (bpf_skb_load_bytes(skb, off + len, &ip6_opt_hdr,
@@ -618,10 +622,12 @@ static int decap_internal(struct __sk_buff *skb, int off, int len, char proto)
 			return TC_ACT_OK;
 		switch (ip6_opt_hdr.nexthdr) {
 		case IPPROTO_IPIP:
-			flags |= BPF_F_ADJ_ROOM_DECAP_L3_IPV4;
+			flags |= BPF_F_ADJ_ROOM_DECAP_L3_IPV4 |
+				 ipxip_flag;
 			break;
 		case IPPROTO_IPV6:
-			flags |= BPF_F_ADJ_ROOM_DECAP_L3_IPV6;
+			flags |= BPF_F_ADJ_ROOM_DECAP_L3_IPV6 |
+				 ipxip_flag;
 			break;
 		default:
 			return TC_ACT_OK;
@@ -629,6 +635,10 @@ static int decap_internal(struct __sk_buff *skb, int off, int len, char proto)
 		break;
 	case IPPROTO_GRE:
 		olen += sizeof(struct gre_hdr);
+		if (!bpf_core_enum_value_exists(enum bpf_adj_room_flags,
+						BPF_F_ADJ_ROOM_DECAP_L4_GRE))
+			return TC_ACT_SHOT;
+		flags |= BPF_F_ADJ_ROOM_DECAP_L4_GRE;
 		if (bpf_skb_load_bytes(skb, off + len, &greh, sizeof(greh)) < 0)
 			return TC_ACT_OK;
 		switch (bpf_ntohs(greh.protocol)) {
@@ -642,6 +652,10 @@ static int decap_internal(struct __sk_buff *skb, int off, int len, char proto)
 		break;
 	case IPPROTO_UDP:
 		olen += sizeof(struct udphdr);
+		if (!bpf_core_enum_value_exists(enum bpf_adj_room_flags,
+						BPF_F_ADJ_ROOM_DECAP_L4_UDP))
+			return TC_ACT_SHOT;
+		flags |= BPF_F_ADJ_ROOM_DECAP_L4_UDP;
 		if (bpf_skb_load_bytes(skb, off + len, &udph, sizeof(udph)) < 0)
 			return TC_ACT_OK;
 		switch (bpf_ntohs(udph.dest)) {
@@ -677,8 +691,13 @@ static int decap_ipv4(struct __sk_buff *skb)
 	if (iph_outer.ihl != 5)
 		return TC_ACT_OK;
 
+	if (!bpf_core_enum_value_exists(enum bpf_adj_room_flags,
+					BPF_F_ADJ_ROOM_DECAP_IPXIP4))
+		return TC_ACT_SHOT;
+
 	return decap_internal(skb, ETH_HLEN, sizeof(iph_outer),
-			      iph_outer.protocol);
+			      iph_outer.protocol,
+			      BPF_F_ADJ_ROOM_DECAP_IPXIP4);
 }
 
 static int decap_ipv6(struct __sk_buff *skb)
@@ -689,8 +708,13 @@ static int decap_ipv6(struct __sk_buff *skb)
 			       sizeof(iph_outer)) < 0)
 		return TC_ACT_OK;
 
+	if (!bpf_core_enum_value_exists(enum bpf_adj_room_flags,
+					BPF_F_ADJ_ROOM_DECAP_IPXIP6))
+		return TC_ACT_SHOT;
+
 	return decap_internal(skb, ETH_HLEN, sizeof(iph_outer),
-			      iph_outer.nexthdr);
+			      iph_outer.nexthdr,
+			      BPF_F_ADJ_ROOM_DECAP_IPXIP6);
 }
 
 SEC("decap")
