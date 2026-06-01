@@ -82,5 +82,5 @@ head-y					:= head.o
 extra-y					+= $(head-y) vmlinux.lds
 
 ifeq ($(CONFIG_DEBUG_EFI),y)
-AFLAGS_head.o += -DVMLINUX_PATH="\"$(realpath $(objtree)/vmlinux)\""
+AFLAGS_head.o += -DVMLINUX_PATH="\"$(abspath vmlinux)\""
 endif
