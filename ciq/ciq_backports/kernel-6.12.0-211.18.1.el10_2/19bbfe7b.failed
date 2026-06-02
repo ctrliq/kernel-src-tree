@@ -1,0 +1,170 @@
+fs: add S_ANON_INODE
+
+jira KERNEL-1029
+Rebuild_History Non-Buildable kernel-6.12.0-211.18.1.el10_2
+commit-author Christian Brauner <brauner@kernel.org>
+commit 19bbfe7b5fcc04d8711e8e1352acc77c1a5c3955
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.18.1.el10_2/19bbfe7b.failed
+
+This makes it easy to detect proper anonymous inodes and to ensure that
+we can detect them in codepaths such as readahead().
+
+Readahead on anonymous inodes didn't work because they didn't have a
+proper mode. Now that they have we need to retain EINVAL being returned
+otherwise LTP will fail.
+
+We also need to ensure that ioctls aren't simply fired like they are for
+regular files so things like inotify inodes continue to correctly call
+their own ioctl handlers as in [1].
+
+	Reported-by: Xilin Wu <sophon@radxa.com>
+Link: https://lore.kernel.org/3A9139D5CD543962+89831381-31b9-4392-87ec-a84a5b3507d8@radxa.com [1]
+Link: https://lore.kernel.org/7a1a7076-ff6b-4cb0-94e7-7218a0a44028@sirena.org.uk
+	Signed-off-by: Christian Brauner <brauner@kernel.org>
+(cherry picked from commit 19bbfe7b5fcc04d8711e8e1352acc77c1a5c3955)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/readahead.c
+diff --cc mm/readahead.c
+index 2dbe5993b6aa,20d36d6b055e..000000000000
+--- a/mm/readahead.c
++++ b/mm/readahead.c
+@@@ -678,29 -690,34 +678,55 @@@ EXPORT_SYMBOL_GPL(page_cache_async_ra)
+  
+  ssize_t ksys_readahead(int fd, loff_t offset, size_t count)
+  {
+++<<<<<<< HEAD
+ +	ssize_t ret;
+ +	struct fd f;
+ +
+ +	ret = -EBADF;
+ +	f = fdget(fd);
+ +	if (!fd_file(f) || !(fd_file(f)->f_mode & FMODE_READ))
+ +		goto out;
+++=======
++ 	struct file *file;
++ 	const struct inode *inode;
++ 
++ 	CLASS(fd, f)(fd);
++ 	if (fd_empty(f))
++ 		return -EBADF;
++ 
++ 	file = fd_file(f);
++ 	if (!(file->f_mode & FMODE_READ))
++ 		return -EBADF;
+++>>>>>>> 19bbfe7b5fcc (fs: add S_ANON_INODE)
+  
+  	/*
+  	 * The readahead() syscall is intended to run only on files
+  	 * that can execute readahead. If readahead is not possible
+  	 * on this file, then we must return -EINVAL.
+  	 */
+++<<<<<<< HEAD
+ +	ret = -EINVAL;
+ +	if (!fd_file(f)->f_mapping || !fd_file(f)->f_mapping->a_ops ||
+ +	    (!S_ISREG(file_inode(fd_file(f))->i_mode) &&
+ +	    !S_ISBLK(file_inode(fd_file(f))->i_mode)))
+ +		goto out;
+++=======
++ 	if (!file->f_mapping)
++ 		return -EINVAL;
++ 	if (!file->f_mapping->a_ops)
++ 		return -EINVAL;
++ 
++ 	inode = file_inode(file);
++ 	if (!S_ISREG(inode->i_mode) && !S_ISBLK(inode->i_mode))
++ 		return -EINVAL;
++ 	if (IS_ANON_FILE(inode))
++ 		return -EINVAL;
+++>>>>>>> 19bbfe7b5fcc (fs: add S_ANON_INODE)
+  
+ -	return vfs_fadvise(fd_file(f), offset, count, POSIX_FADV_WILLNEED);
+ +	ret = vfs_fadvise(fd_file(f), offset, count, POSIX_FADV_WILLNEED);
+ +out:
+ +	fdput(f);
+ +	return ret;
+  }
+  
+  SYSCALL_DEFINE3(readahead, int, fd, loff_t, offset, size_t, count)
+diff --git a/fs/ioctl.c b/fs/ioctl.c
+index 6e0c954388d4..4dbd5627af8f 100644
+--- a/fs/ioctl.c
++++ b/fs/ioctl.c
+@@ -822,7 +822,8 @@ static int do_vfs_ioctl(struct file *filp, unsigned int fd,
+ 		return ioctl_fioasync(fd, filp, argp);
+ 
+ 	case FIOQSIZE:
+-		if (S_ISDIR(inode->i_mode) || S_ISREG(inode->i_mode) ||
++		if (S_ISDIR(inode->i_mode) ||
++		    (S_ISREG(inode->i_mode) && !IS_ANON_FILE(inode)) ||
+ 		    S_ISLNK(inode->i_mode)) {
+ 			loff_t res = inode_get_bytes(inode);
+ 			return copy_to_user(argp, &res, sizeof(res)) ?
+@@ -857,7 +858,7 @@ static int do_vfs_ioctl(struct file *filp, unsigned int fd,
+ 		return ioctl_file_dedupe_range(filp, argp);
+ 
+ 	case FIONREAD:
+-		if (!S_ISREG(inode->i_mode))
++		if (!S_ISREG(inode->i_mode) || IS_ANON_FILE(inode))
+ 			return vfs_ioctl(filp, cmd, arg);
+ 
+ 		return put_user(i_size_read(inode) - filp->f_pos,
+@@ -882,7 +883,7 @@ static int do_vfs_ioctl(struct file *filp, unsigned int fd,
+ 		return ioctl_get_fs_sysfs_path(filp, argp);
+ 
+ 	default:
+-		if (S_ISREG(inode->i_mode))
++		if (S_ISREG(inode->i_mode) && !IS_ANON_FILE(inode))
+ 			return file_ioctl(filp, cmd, argp);
+ 		break;
+ 	}
+diff --git a/fs/libfs.c b/fs/libfs.c
+index 7fd661bb935f..df9a2f4472f7 100644
+--- a/fs/libfs.c
++++ b/fs/libfs.c
+@@ -1654,7 +1654,7 @@ struct inode *alloc_anon_inode(struct super_block *s)
+ 	inode->i_mode = S_IRUSR | S_IWUSR;
+ 	inode->i_uid = current_fsuid();
+ 	inode->i_gid = current_fsgid();
+-	inode->i_flags |= S_PRIVATE;
++	inode->i_flags |= S_PRIVATE | S_ANON_INODE;
+ 	simple_inode_init_ts(inode);
+ 	return inode;
+ }
+diff --git a/fs/pidfs.c b/fs/pidfs.c
+index d6c0ed79ea24..7e10fac8e623 100644
+--- a/fs/pidfs.c
++++ b/fs/pidfs.c
+@@ -804,7 +804,7 @@ static int pidfs_init_inode(struct inode *inode, void *data)
+ 	const struct pid *pid = data;
+ 
+ 	inode->i_private = data;
+-	inode->i_flags |= S_PRIVATE;
++	inode->i_flags |= S_PRIVATE | S_ANON_INODE;
+ 	inode->i_mode |= S_IRWXU;
+ 	inode->i_op = &pidfs_inode_operations;
+ 	inode->i_fop = &pidfs_file_operations;
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 106b644cee85..af426a3bd89c 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -2319,6 +2319,7 @@ struct super_operations {
+ #define S_CASEFOLD	(1 << 15) /* Casefolded file */
+ #define S_VERITY	(1 << 16) /* Verity file (using fs/verity/) */
+ #define S_KERNEL_FILE	(1 << 17) /* File is in use by the kernel (eg. fs/cachefiles) */
++#define S_ANON_INODE	(1 << 19) /* Inode is an anonymous inode */
+ 
+ /*
+  * Note that nosuid etc flags are inode-specific: setting some file-system
+@@ -2375,6 +2376,7 @@ static inline bool sb_rdonly(const struct super_block *sb) { return sb->s_flags
+ 
+ #define IS_WHITEOUT(inode)	(S_ISCHR(inode->i_mode) && \
+ 				 (inode)->i_rdev == WHITEOUT_DEV)
++#define IS_ANON_FILE(inode)	((inode)->i_flags & S_ANON_INODE)
+ 
+ static inline bool HAS_UNMAPPED_ID(struct mnt_idmap *idmap,
+ 				   struct inode *inode)
+* Unmerged path mm/readahead.c
