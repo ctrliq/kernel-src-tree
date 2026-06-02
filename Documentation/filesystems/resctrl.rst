@@ -481,7 +481,7 @@ with the following files:
 "max_threshold_occupancy":
 		Read/write file provides the largest value (in
 		bytes) at which a previously used LLC_occupancy
-		counter can be considered for re-use.
+		counter can be considered for reuse.
 
 If telemetry monitoring is available there will be a "PERF_PKG_MON" directory
 with the following files:

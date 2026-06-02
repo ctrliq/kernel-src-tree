@@ -1829,13 +1829,13 @@ int hdac_hdmi_jack_port_init(struct snd_soc_component *component,
 	char w_name[NAME_SIZE];
 	int i = 0, j, ret;
 
-	widgets = devm_kcalloc(dapm->dev, hdmi->num_ports,
+	widgets = devm_kcalloc(snd_soc_dapm_to_dev(dapm), hdmi->num_ports,
 				sizeof(*widgets), GFP_KERNEL);
 
 	if (!widgets)
 		return -ENOMEM;
 
-	route = devm_kcalloc(dapm->dev, hdmi->num_ports,
+	route = devm_kcalloc(snd_soc_dapm_to_dev(dapm), hdmi->num_ports,
 				sizeof(*route), GFP_KERNEL);
 	if (!route)
 		return -ENOMEM;
@@ -1846,7 +1846,7 @@ int hdac_hdmi_jack_port_init(struct snd_soc_component *component,
 			snprintf(w_name, sizeof(w_name), "hif%d-%d Jack",
 						pin->nid, pin->ports[j].id);
 
-			ret = hdac_hdmi_fill_widget_info(dapm->dev, &widgets[i],
+			ret = hdac_hdmi_fill_widget_info(snd_soc_dapm_to_dev(dapm), &widgets[i],
 					snd_soc_dapm_spk, NULL,
 					w_name, NULL, NULL, 0, NULL, 0);
 			if (ret < 0)
@@ -1872,12 +1872,12 @@ int hdac_hdmi_jack_port_init(struct snd_soc_component *component,
 	if (ret < 0)
 		return ret;
 
-	ret = snd_soc_dapm_new_widgets(dapm->card);
+	ret = snd_soc_dapm_new_widgets(snd_soc_dapm_to_card(dapm));
 	if (ret < 0)
 		return ret;
 
 	/* Add Jack Pin switch Kcontrol */
-	ret = create_fill_jack_kcontrols(dapm->card, hdev);
+	ret = create_fill_jack_kcontrols(snd_soc_dapm_to_card(dapm), hdev);
 
 	if (ret < 0)
 		return ret;

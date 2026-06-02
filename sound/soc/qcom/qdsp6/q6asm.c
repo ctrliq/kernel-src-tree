@@ -597,12 +597,12 @@ int q6asm_get_hw_pointer(struct audio_client *ac, unsigned int dir)
 EXPORT_SYMBOL_GPL(q6asm_get_hw_pointer);
 
 static int32_t q6asm_stream_callback(struct apr_device *adev,
-				     struct apr_resp_pkt *data,
+				     const struct apr_resp_pkt *data,
 				     int session_id)
 {
 	struct q6asm *q6asm = dev_get_drvdata(&adev->dev);
-	struct aprv2_ibasic_rsp_result_t *result;
-	struct apr_hdr *hdr = &data->hdr;
+	const struct aprv2_ibasic_rsp_result_t *result;
+	const struct apr_hdr *hdr = &data->hdr;
 	struct audio_port_data *port;
 	struct audio_client *ac;
 	uint32_t client_event = 0;
@@ -742,13 +742,13 @@ done:
 }
 
 static int q6asm_srvc_callback(struct apr_device *adev,
-			       struct apr_resp_pkt *data)
+			       const struct apr_resp_pkt *data)
 {
 	struct q6asm *q6asm = dev_get_drvdata(&adev->dev);
 	struct aprv2_ibasic_rsp_result_t *result;
 	struct audio_port_data *port;
 	struct audio_client *ac = NULL;
-	struct apr_hdr *hdr = &data->hdr;
+	const struct apr_hdr *hdr = &data->hdr;
 	struct q6asm *a;
 	uint32_t sid = 0;
 	uint32_t dir = 0;
@@ -928,6 +928,7 @@ int q6asm_open_write(struct audio_client *ac, uint32_t stream_id,
 	struct asm_stream_cmd_open_write_v3 *open;
 	struct apr_pkt *pkt;
 	int rc, pkt_size = APR_HDR_SIZE + sizeof(*open);
+
 	void *p __free(kfree) = kzalloc(pkt_size, GFP_KERNEL);
 	if (!p)
 		return -ENOMEM;
@@ -1005,6 +1006,7 @@ static int __q6asm_run(struct audio_client *ac, uint32_t stream_id,
 	struct asm_session_cmd_run_v2 *run;
 	struct apr_pkt *pkt;
 	int rc, pkt_size = APR_HDR_SIZE + sizeof(*run);
+
 	void *p __free(kfree) = kzalloc(pkt_size, GFP_ATOMIC);
 	if (!p)
 		return -ENOMEM;
@@ -1087,6 +1089,7 @@ int q6asm_media_format_block_multi_ch_pcm(struct audio_client *ac,
 	struct apr_pkt *pkt;
 	u8 *channel_mapping;
 	int pkt_size = APR_HDR_SIZE + sizeof(*fmt);
+
 	void *p __free(kfree) = kzalloc(pkt_size, GFP_KERNEL);
 	if (!p)
 		return -ENOMEM;
@@ -1125,6 +1128,7 @@ int q6asm_stream_media_format_block_flac(struct audio_client *ac,
 	struct asm_flac_fmt_blk_v2 *fmt;
 	struct apr_pkt *pkt;
 	int pkt_size = APR_HDR_SIZE + sizeof(*fmt);
+
 	void *p __free(kfree) = kzalloc(pkt_size, GFP_KERNEL);
 	if (!p)
 		return -ENOMEM;
@@ -1156,6 +1160,7 @@ int q6asm_stream_media_format_block_wma_v9(struct audio_client *ac,
 	struct asm_wmastdv9_fmt_blk_v2 *fmt;
 	struct apr_pkt *pkt;
 	int pkt_size = APR_HDR_SIZE + sizeof(*fmt);
+
 	void *p __free(kfree) = kzalloc(pkt_size, GFP_KERNEL);
 	if (!p)
 		return -ENOMEM;
@@ -1188,6 +1193,7 @@ int q6asm_stream_media_format_block_wma_v10(struct audio_client *ac,
 	struct asm_wmaprov10_fmt_blk_v2 *fmt;
 	struct apr_pkt *pkt;
 	int pkt_size = APR_HDR_SIZE + sizeof(*fmt);
+
 	void *p __free(kfree) = kzalloc(pkt_size, GFP_KERNEL);
 	if (!p)
 		return -ENOMEM;
@@ -1221,6 +1227,7 @@ int q6asm_stream_media_format_block_alac(struct audio_client *ac,
 	struct asm_alac_fmt_blk_v2 *fmt;
 	struct apr_pkt *pkt;
 	int pkt_size = APR_HDR_SIZE + sizeof(*fmt);
+
 	void *p __free(kfree) = kzalloc(pkt_size, GFP_KERNEL);
 	if (!p)
 		return -ENOMEM;
@@ -1257,6 +1264,7 @@ int q6asm_stream_media_format_block_ape(struct audio_client *ac,
 	struct asm_ape_fmt_blk_v2 *fmt;
 	struct apr_pkt *pkt;
 	int pkt_size = APR_HDR_SIZE + sizeof(*fmt);
+
 	void *p __free(kfree) = kzalloc(pkt_size, GFP_KERNEL);
 	if (!p)
 		return -ENOMEM;
@@ -1291,6 +1299,7 @@ static int q6asm_stream_remove_silence(struct audio_client *ac, uint32_t stream_
 	uint32_t *samples;
 	struct apr_pkt *pkt;
 	int rc, pkt_size = APR_HDR_SIZE + sizeof(uint32_t);
+
 	void *p __free(kfree) = kzalloc(pkt_size, GFP_ATOMIC);
 	if (!p)
 		return -ENOMEM;
@@ -1349,6 +1358,7 @@ int q6asm_enc_cfg_blk_pcm_format_support(struct audio_client *ac,
 	u8 *channel_mapping;
 	u32 frames_per_buf = 0;
 	int pkt_size = APR_HDR_SIZE + sizeof(*enc_cfg);
+
 	void *p __free(kfree) = kzalloc(pkt_size, GFP_KERNEL);
 	if (!p)
 		return -ENOMEM;
@@ -1395,6 +1405,7 @@ int q6asm_read(struct audio_client *ac, uint32_t stream_id)
 	unsigned long flags;
 	int pkt_size = APR_HDR_SIZE + sizeof(*read);
 	int rc = 0;
+
 	void *p __free(kfree) = kzalloc(pkt_size, GFP_ATOMIC);
 	if (!p)
 		return -ENOMEM;
@@ -1437,6 +1448,7 @@ static int __q6asm_open_read(struct audio_client *ac, uint32_t stream_id,
 	struct asm_stream_cmd_open_read_v3 *open;
 	struct apr_pkt *pkt;
 	int pkt_size = APR_HDR_SIZE + sizeof(*open);
+
 	void *p __free(kfree) = kzalloc(pkt_size, GFP_KERNEL);
 	if (!p)
 		return -ENOMEM;
@@ -1507,6 +1519,7 @@ int q6asm_write_async(struct audio_client *ac, uint32_t stream_id, uint32_t len,
 	struct apr_pkt *pkt;
 	int pkt_size = APR_HDR_SIZE + sizeof(*write);
 	int rc = 0;
+
 	void *p __free(kfree) = kzalloc(pkt_size, GFP_ATOMIC);
 	if (!p)
 		return -ENOMEM;
