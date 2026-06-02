@@ -168,10 +168,10 @@ Summary: The Linux kernel
 %define debugbuildsenabled 1
 %define el_version 9
 %define kernel_major_minor 6.18
-%define kernel_patch 33
+%define kernel_patch 34
 %define buildid .1
 %define specversion %{kernel_major_minor}.%{kernel_patch}
-%define pkgrelease 2%{?buildid}
+%define pkgrelease 1%{?buildid}
 %define kversion %{lua:print((rpm.expand("%{kernel_major_minor}"):match("^(%d+)")))}
 
 %define tarfile_release %{specversion}-%{pkgrelease}.el%{el_version}
@@ -4495,13 +4495,11 @@ fi\
 #
 #
 %changelog
-* Wed May 27 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.33-2.1.el9
+* Tue Jun 02 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.18.34-1.1.el9
+-- Rebased changes for Linux 6.18.34 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.34-1)
+-- [CIQ] ciq_kernel-6.18.33-2 - updated spec (Brett Mastbergen)
 -- bundle_bindgen: add User-Agent header to crates.io request (Brett Mastbergen)
-
-* Tue May 26 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.18.33-1.1.el9
--- Rebased changes for Linux 6.18.33 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.33-1)
--- smb: client: reject userspace cifs.spnego descriptions (Shreeya Patel)
--- net: gro: don't merge zcopy skbs (Sabrina Dubroca)
+-- [CIQ] v6.18.33 - updated spec (github-actions[bot])
 -- [CIQ] v6.18.31 - updated spec (github-actions[bot])
 -- [CIQ] ciq_kernel-6.18.28-2 - updated spec (Brett Mastbergen)
 -- [CIQ] v6.18.28 - updated spec (Brett Mastbergen)
@@ -4556,7 +4554,7 @@ fi\
 -- github actions: Make Builds on Merge Request Work (Jonathan Maple)
 -- Add initial CIQ config tweaks (Brett Mastbergen)
 -- Add CIQ configs (Brett Mastbergen)
--- Linux 6.18.33 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.18.33)
+-- Linux 6.18.34 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.18.34)
 
 
 ###
