@@ -33,6 +33,7 @@
 #include <linux/sprintf.h>
 #include <linux/static_call_types.h>
 #include <linux/instruction_pointer.h>
+#include <linux/util_macros.h>
 #include <linux/wordpart.h>
 
 #include <asm/byteorder.h>
