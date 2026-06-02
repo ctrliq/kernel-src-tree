@@ -366,7 +366,6 @@ struct lpfc_name {
 		} s;
 		uint8_t wwn[8];
 		uint64_t name __packed __aligned(4);
-		__be64 wwn_be __packed __aligned(4);
 	} u;
 };
 
