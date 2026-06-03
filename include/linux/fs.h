@@ -1833,6 +1833,8 @@ static inline int vfs_whiteout(struct mnt_idmap *idmap,
 struct file *vfs_tmpfile_open(struct mnt_idmap *idmap,
 			const struct path *parentpath,
 			umode_t mode, int open_flag, const struct cred *cred);
+struct file *kernel_file_open(const struct path *path, int flags,
+			      struct inode *inode, const struct cred *cred);
 
 int vfs_mkobj(struct dentry *, umode_t,
 		int (*f)(struct dentry *, umode_t, void *),
