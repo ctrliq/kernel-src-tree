@@ -21,7 +21,7 @@
 int ovl_get_write_access(struct dentry *dentry)
 {
 	struct ovl_fs *ofs = OVL_FS(dentry->d_sb);
-	return __mnt_want_write(ovl_upper_mnt(ofs));
+	return mnt_get_write_access(ovl_upper_mnt(ofs));
 }
 
 /* Get write access to upper sb - may block if upper sb is frozen */
@@ -40,7 +40,7 @@ int ovl_want_write(struct dentry *dentry)
 void ovl_put_write_access(struct dentry *dentry)
 {
 	struct ovl_fs *ofs = OVL_FS(dentry->d_sb);
-	__mnt_drop_write(ovl_upper_mnt(ofs));
+	mnt_put_write_access(ovl_upper_mnt(ofs));
 }
 
 void ovl_end_write(struct dentry *dentry)
