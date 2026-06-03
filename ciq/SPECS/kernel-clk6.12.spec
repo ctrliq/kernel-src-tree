@@ -1089,7 +1089,7 @@ AutoProv: yes\
 %package doc
 Summary: Various documentation bits found in the kernel source
 Group: Documentation
-Provides: kernel-doc = %{specversion}-%{release}
+Provides: kernel-doc = %{?epoch:%{epoch}:}%{specversion}-%{release}
 Conflicts: kernel-doc
 %description doc
 This package contains documentation files from the kernel
@@ -1104,7 +1104,7 @@ options that can be passed to Linux kernel modules at load time.
 Summary: Header files for the Linux kernel for use by glibc
 Obsoletes: glibc-kernheaders < 3.0-46
 Provides: glibc-kernheaders = 3.0-46
-Provides: kernel-headers = %{specversion}-%{release}
+Provides: kernel-headers = %{?epoch:%{epoch}:}%{specversion}-%{release}
 Conflicts: kernel-headers
 %description headers
 Kernel-headers includes the C header files that specify the interface
@@ -1115,7 +1115,7 @@ glibc package.
 
 %package cross-headers
 Summary: Header files for the Linux kernel for use by cross-glibc
-Provides: kernel-cross-headers = %{specversion}-%{release}
+Provides: kernel-cross-headers = %{?epoch:%{epoch}:}%{specversion}-%{release}
 Conflicts: kernel-cross-headers
 %description cross-headers
 Kernel-cross-headers includes the C header files that specify the interface
@@ -1127,7 +1127,7 @@ cross-glibc package.
 %package debuginfo-common-%{_target_cpu}
 Summary: Kernel source files used by %{name}-debuginfo packages
 Provides: installonlypkg(kernel)
-Provides: kernel-debuginfo-common-%{_target_cpu} = %{specversion}-%{release}
+Provides: kernel-debuginfo-common-%{_target_cpu} = %{?epoch:%{epoch}:}%{specversion}-%{release}
 Conflicts: kernel-debuginfo-common-%{_target_cpu}
 %description debuginfo-common-%{_target_cpu}
 This package is required by %{name}-debuginfo subpackages.
@@ -1136,7 +1136,7 @@ It provides the kernel source files common to all builds.
 %if %{with_perf}
 %package -n perf-%{pkg_suffix}
 Summary: Performance monitoring for the Linux kernel
-Provides: perf = %{specversion}-%{release}
+Provides: perf = %{?epoch:%{epoch}:}%{specversion}-%{release}
 Conflicts: perf
 Requires: bzip2
 %description -n perf-%{pkg_suffix}
@@ -1145,9 +1145,9 @@ of the Linux kernel.
 
 %package -n perf-%{pkg_suffix}-debuginfo
 Summary: Debug information for package perf
-Provides: perf-debuginfo = %{specversion}-%{release}
+Provides: perf-debuginfo = %{?epoch:%{epoch}:}%{specversion}-%{release}
 Conflicts: perf-debuginfo
-Requires: %{name}-debuginfo-common-%{_target_cpu} = %{specversion}-%{release}
+Requires: %{name}-debuginfo-common-%{_target_cpu} = %{?epoch:%{epoch}:}%{specversion}-%{release}
 AutoReqProv: no
 %description -n perf-%{pkg_suffix}-debuginfo
 This package provides debug information for the perf package.
@@ -1160,7 +1160,7 @@ This package provides debug information for the perf package.
 
 %package -n python3-perf-%{pkg_suffix}
 Summary: Python bindings for apps which will manipulate perf events
-Provides: python3-perf = %{specversion}-%{release}
+Provides: python3-perf = %{?epoch:%{epoch}:}%{specversion}-%{release}
 Conflicts: python3-perf
 %description -n python3-perf-%{pkg_suffix}
 The python3-perf package contains a module that permits applications
@@ -1169,9 +1169,9 @@ to manipulate perf events.
 
 %package -n python3-perf-%{pkg_suffix}-debuginfo
 Summary: Debug information for package perf python bindings
-Provides: python3-perf-debuginfo = %{specversion}-%{release}
+Provides: python3-perf-debuginfo = %{?epoch:%{epoch}:}%{specversion}-%{release}
 Conflicts: python3-perf-debuginfo
-Requires: %{name}-debuginfo-common-%{_target_cpu} = %{specversion}-%{release}
+Requires: %{name}-debuginfo-common-%{_target_cpu} = %{?epoch:%{epoch}:}%{specversion}-%{release}
 AutoReqProv: no
 %description -n python3-perf-%{pkg_suffix}-debuginfo
 This package provides debug information for the perf python bindings.
@@ -1185,26 +1185,26 @@ This package provides debug information for the perf python bindings.
 %if %{with_libperf}
 %package -n libperf-%{pkg_suffix}
 Summary: The perf library from kernel source
-Provides: libperf = %{specversion}-%{release}
+Provides: libperf = %{?epoch:%{epoch}:}%{specversion}-%{release}
 Conflicts: libperf
 %description -n libperf-%{pkg_suffix}
 This package contains the kernel source perf library.
 
 %package -n libperf-%{pkg_suffix}-devel
 Summary: Developement files for the perf library from kernel source
-Provides: libperf-devel = %{specversion}-%{release}
+Provides: libperf-devel = %{?epoch:%{epoch}:}%{specversion}-%{release}
 Conflicts: libperf-devel
-Requires: libperf-%{pkg_suffix} = %{version}-%{release}
+Requires: libperf-%{pkg_suffix} = %{?epoch:%{epoch}:}%{version}-%{release}
 %description -n libperf-%{pkg_suffix}-devel
 This package includes libraries and header files needed for development
 of applications which use perf library from kernel source.
 
 %package -n libperf-%{pkg_suffix}-debuginfo
 Summary: Debug information for package libperf
-Provides: libperf-debuginfo = %{specversion}-%{release}
+Provides: libperf-debuginfo = %{?epoch:%{epoch}:}%{specversion}-%{release}
 Conflicts: libperf-debuginfo
 Group: Development/Debug
-Requires: %{name}-debuginfo-common-%{_target_cpu} = %{version}-%{release}
+Requires: %{name}-debuginfo-common-%{_target_cpu} = %{?epoch:%{epoch}:}%{version}-%{release}
 AutoReqProv: no
 %description -n libperf-%{pkg_suffix}-debuginfo
 This package provides debug information for the libperf package.
@@ -1220,7 +1220,7 @@ This package provides debug information for the libperf package.
 %if %{with_tools}
 %package tools
 Summary: Assortment of tools for the Linux kernel
-Provides: kernel-tools = %{specversion}-%{release}
+Provides: kernel-tools = %{?epoch:%{epoch}:}%{specversion}-%{release}
 Conflicts: kernel-tools
 %ifarch %{cpupowerarchs}
 Provides:  cpupowerutils = 1:009-0.6.p1
@@ -1230,7 +1230,7 @@ Provides:  cpufrequtils = 1:009-0.6.p1
 Obsoletes: cpufreq-utils < 1:009-0.6.p1
 Obsoletes: cpufrequtils < 1:009-0.6.p1
 Obsoletes: cpuspeed < 1:1.5-16
-Requires: %{package_name}-tools-libs = %{specversion}-%{release}
+Requires: %{package_name}-tools-libs = %{?epoch:%{epoch}:}%{specversion}-%{release}
 %endif
 %define __requires_exclude ^%{_bindir}/python
 %description tools
@@ -1239,7 +1239,7 @@ and the supporting documentation.
 
 %package tools-libs
 Summary: Libraries for the kernels-tools
-Provides: kernel-tools-libs = %{specversion}-%{release}
+Provides: kernel-tools-libs = %{?epoch:%{epoch}:}%{specversion}-%{release}
 Conflicts: kernel-tools-libs
 %description tools-libs
 This package contains the libraries built from the tools/ directory
@@ -1247,14 +1247,14 @@ from the kernel source.
 
 %package tools-libs-devel
 Summary: Assortment of tools for the Linux kernel
-Provides: kernel-tools-libs-devel = %{specversion}-%{release}
+Provides: kernel-tools-libs-devel = %{?epoch:%{epoch}:}%{specversion}-%{release}
 Conflicts: kernel-tools-libs-devel
-Requires: %{package_name}-tools = %{version}-%{release}
+Requires: %{package_name}-tools = %{?epoch:%{epoch}:}%{version}-%{release}
 %ifarch %{cpupowerarchs}
 Provides:  cpupowerutils-devel = 1:009-0.6.p1
 Obsoletes: cpupowerutils-devel < 1:009-0.6.p1
 %endif
-Requires: %{package_name}-tools-libs = %{version}-%{release}
+Requires: %{package_name}-tools-libs = %{?epoch:%{epoch}:}%{version}-%{release}
 Provides: %{package_name}-tools-devel
 %description tools-libs-devel
 This package contains the development files for the tools/ directory from
@@ -1262,7 +1262,7 @@ the kernel source.
 
 %package tools-debuginfo
 Summary: Debug information for package %{package_name}-tools
-Requires: %{name}-debuginfo-common-%{_target_cpu} = %{version}-%{release}
+Requires: %{name}-debuginfo-common-%{_target_cpu} = %{?epoch:%{epoch}:}%{version}-%{release}
 AutoReqProv: no
 %description tools-debuginfo
 This package provides debug information for package %{package_name}-tools.
@@ -1275,7 +1275,7 @@ This package provides debug information for package %{package_name}-tools.
 
 %package -n rtla-%{pkg_suffix}
 Summary: Real-Time Linux Analysis tools
-Provides: rtla = %{specversion}-%{release}
+Provides: rtla = %{?epoch:%{epoch}:}%{specversion}-%{release}
 Conflicts: rtla
 Requires: libtraceevent
 Requires: libtracefs
@@ -1287,7 +1287,7 @@ about the properties and root causes of unexpected results.
 
 %package -n rv-%{pkg_suffix}
 Summary: RV: Runtime Verification
-Provides: rv = %{specversion}-%{release}
+Provides: rv = %{?epoch:%{epoch}:}%{specversion}-%{release}
 Conflicts: rv
 %description -n rv-%{pkg_suffix}
 Runtime Verification (RV) is a lightweight (yet rigorous) method that
@@ -1319,7 +1319,7 @@ remove this package first.
 
 %package selftests-internal
 Summary: Kernel samples and selftests
-Provides: kernel-selftests-internal = %{specversion}-%{release}
+Provides: kernel-selftests-internal = %{?epoch:%{epoch}:}%{specversion}-%{release}
 Conflicts: kernel-selftests-internal
 Requires: binutils, bpftool, iproute-tc, nmap-ncat, python3, fuse-libs, keyutils
 %description selftests-internal
@@ -1355,8 +1355,8 @@ Summary: gcov graph and source files for coverage data collection.\
 %define kernel_debuginfo_package() \
 %package %{?1:%{1}-}debuginfo\
 Summary: Debug information for package %{name}%{?1:-%{1}}\
-Requires: %{name}-debuginfo-common-%{_target_cpu} = %{specversion}-%{release}\
-Provides: %{name}%{?1:-%{1}}-debuginfo-%{_target_cpu} = %{specversion}-%{release}\
+Requires: %{name}-debuginfo-common-%{_target_cpu} = %{?epoch:%{epoch}:}%{specversion}-%{release}\
+Provides: %{name}%{?1:-%{1}}-debuginfo-%{_target_cpu} = %{?epoch:%{epoch}:}%{specversion}-%{release}\
 Provides: installonlypkg(kernel)\
 AutoReqProv: no\
 %description %{?1:%{1}-}debuginfo\
@@ -1372,10 +1372,10 @@ This is required to use SystemTap with %{name}%{?1:-%{1}}-%{KVERREL}.\
 %define kernel_devel_package(m) \
 %package %{?1:%{1}-}devel\
 Summary: Development package for building kernel modules to match the %{?2:%{2} }kernel\
-Provides: %{name}%{?1:-%{1}}-devel-%{_target_cpu} = %{specversion}-%{release}\
-Provides: %{name}-devel-%{_target_cpu} = %{specversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
-Provides: kernel-devel = %{specversion}-%{release}\
-Provides: kernel-devel-%{_target_cpu} = %{specversion}-%{release}\
+Provides: %{name}%{?1:-%{1}}-devel-%{_target_cpu} = %{?epoch:%{epoch}:}%{specversion}-%{release}\
+Provides: %{name}-devel-%{_target_cpu} = %{?epoch:%{epoch}:}%{specversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
+Provides: kernel-devel = %{?epoch:%{epoch}:}%{specversion}-%{release}\
+Provides: kernel-devel-%{_target_cpu} = %{?epoch:%{epoch}:}%{specversion}-%{release}\
 Provides: kernel-devel-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
 Provides: %{name}-devel-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
 Provides: installonlypkg(kernel)\
@@ -1405,8 +1405,8 @@ against the %{?2:%{2} }kernel package.\
 %define kernel_devel_matched_package(m) \
 %package %{?1:%{1}-}devel-matched\
 Summary: Meta package to install matching core and devel packages for a given %{?2:%{2} }kernel\
-Requires: %{package_name}%{?1:-%{1}}-devel = %{specversion}-%{release}\
-Requires: %{package_name}%{?1:-%{1}}-core = %{specversion}-%{release}\
+Requires: %{package_name}%{?1:-%{1}}-devel = %{?epoch:%{epoch}:}%{specversion}-%{release}\
+Requires: %{package_name}%{?1:-%{1}}-core = %{?epoch:%{epoch}:}%{specversion}-%{release}\
 %description %{?1:%{1}-}devel-matched\
 This meta package is used to install matching core and devel packages for a given %{?2:%{2} }kernel.\
 %{nil}
@@ -1431,9 +1431,9 @@ This package provides *.ipa-clones files.\
 %package %{?1:%{1}-}modules-internal\
 Summary: Extra kernel modules to match the %{?2:%{2} }kernel\
 Group: System Environment/Kernel\
-Provides: %{name}%{?1:-%{1}}-modules-internal-%{_target_cpu} = %{specversion}-%{release}\
-Provides: %{name}%{?1:-%{1}}-modules-internal-%{_target_cpu} = %{specversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
-Provides: %{name}%{?1:-%{1}}-modules-internal = %{specversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
+Provides: %{name}%{?1:-%{1}}-modules-internal-%{_target_cpu} = %{?epoch:%{epoch}:}%{specversion}-%{release}\
+Provides: %{name}%{?1:-%{1}}-modules-internal-%{_target_cpu} = %{?epoch:%{epoch}:}%{specversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
+Provides: %{name}%{?1:-%{1}}-modules-internal = %{?epoch:%{epoch}:}%{specversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
 Provides: installonlypkg(kernel-module)\
 Provides: %{name}%{?1:-%{1}}-modules-internal-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
 Requires: %{name}-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
@@ -1452,9 +1452,9 @@ This package provides kernel modules for the %{?2:%{2} }kernel package for CIQ i
 %define kernel_modules_extra_package(m) \
 %package %{?1:%{1}-}modules-extra\
 Summary: Extra kernel modules to match the %{?2:%{2} }kernel\
-Provides: %{name}%{?1:-%{1}}-modules-extra-%{_target_cpu} = %{specversion}-%{release}\
-Provides: %{name}%{?1:-%{1}}-modules-extra-%{_target_cpu} = %{specversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
-Provides: %{name}%{?1:-%{1}}-modules-extra = %{specversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
+Provides: %{name}%{?1:-%{1}}-modules-extra-%{_target_cpu} = %{?epoch:%{epoch}:}%{specversion}-%{release}\
+Provides: %{name}%{?1:-%{1}}-modules-extra-%{_target_cpu} = %{?epoch:%{epoch}:}%{specversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
+Provides: %{name}%{?1:-%{1}}-modules-extra = %{?epoch:%{epoch}:}%{specversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
 Provides: installonlypkg(kernel-module)\
 Provides: %{name}%{?1:-%{1}}-modules-extra-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
 Requires: %{name}-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
@@ -1476,9 +1476,9 @@ This package provides less commonly used kernel modules for the %{?2:%{2} }kerne
 %define kernel_modules_package(m) \
 %package %{?1:%{1}-}modules\
 Summary: kernel modules to match the %{?2:%{2}-}core kernel\
-Provides: %{name}%{?1:-%{1}}-modules-%{_target_cpu} = %{specversion}-%{release}\
-Provides: %{name}-modules-%{_target_cpu} = %{specversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
-Provides: %{name}-modules = %{specversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
+Provides: %{name}%{?1:-%{1}}-modules-%{_target_cpu} = %{?epoch:%{epoch}:}%{specversion}-%{release}\
+Provides: %{name}-modules-%{_target_cpu} = %{?epoch:%{epoch}:}%{specversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
+Provides: %{name}-modules = %{?epoch:%{epoch}:}%{specversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
 Provides: installonlypkg(kernel-module)\
 Provides: %{name}%{?1:-%{1}}-modules-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
 Requires: %{name}-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
@@ -1499,9 +1499,9 @@ This package provides commonly used kernel modules for the %{?2:%{2}-}core kerne
 %define kernel_modules_core_package(m) \
 %package %{?1:%{1}-}modules-core\
 Summary: Core kernel modules to match the %{?2:%{2}-}core kernel\
-Provides: %{name}%{?1:-%{1}}-modules-core-%{_target_cpu} = %{specversion}-%{release}\
-Provides: %{name}-modules-core-%{_target_cpu} = %{specversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
-Provides: %{name}-modules-core = %{specversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
+Provides: %{name}%{?1:-%{1}}-modules-core-%{_target_cpu} = %{?epoch:%{epoch}:}%{specversion}-%{release}\
+Provides: %{name}-modules-core-%{_target_cpu} = %{?epoch:%{epoch}:}%{specversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
+Provides: %{name}-modules-core = %{?epoch:%{epoch}:}%{specversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
 Provides: installonlypkg(kernel-module)\
 Provides: %{name}%{?1:-%{1}}-modules-core-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
 Requires: %{name}-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
@@ -1544,7 +1544,7 @@ Group: System Environment/Kernel\
 Requires: %{name}-uname-r = %{KVERREL}%{uname_suffix %{?1:%{1}}}\
 Requires: %{name}%{?1:-%{1}}-modules-core-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
 Provides: installonlypkg(kernel-module)\
-Provides: %{name}%{?1:-%{1}}-kvm-%{_target_cpu} = %{version}-%{release}\
+Provides: %{name}%{?1:-%{1}}-kvm-%{_target_cpu} = %{?epoch:%{epoch}:}%{version}-%{release}\
 AutoReq: no\
 %description -n %{name}%{?1:-%{1}}-kvm\
 This package provides KVM modules for package %{name}%{?1:-%{1}}.\
@@ -1599,7 +1599,7 @@ Requires(pre): systemd >= 254-1\
 %package %{?1:%{1}-}uki-virt-addons\
 Summary: %{variant_summary} unified kernel image addons for virtual machines\
 Provides: installonlypkg(kernel)\
-Requires: %{name}%{?1:-%{1}}-uki-virt = %{specversion}-%{release}\
+Requires: %{name}%{?1:-%{1}}-uki-virt = %{?epoch:%{epoch}:}%{specversion}-%{release}\
 %if 0%{?rhel}\
 Requires(pre): systemd >= 252-31\
 %else \
@@ -1620,9 +1620,9 @@ Requires(pre): systemd >= 254-1\
 %package %{?1:%{1}-}modules-partner\
 Summary: Extra kernel modules to match the %{?2:%{2} }kernel\
 Group: System Environment/Kernel\
-Provides: %{name}%{?1:-%{1}}-modules-partner-%{_target_cpu} = %{specversion}-%{release}\
-Provides: %{name}%{?1:-%{1}}-modules-partner-%{_target_cpu} = %{specversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
-Provides: %{name}%{?1:-%{1}}-modules-partner = %{specversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
+Provides: %{name}%{?1:-%{1}}-modules-partner-%{_target_cpu} = %{?epoch:%{epoch}:}%{specversion}-%{release}\
+Provides: %{name}%{?1:-%{1}}-modules-partner-%{_target_cpu} = %{?epoch:%{epoch}:}%{specversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
+Provides: %{name}%{?1:-%{1}}-modules-partner = %{?epoch:%{epoch}:}%{specversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
 Provides: installonlypkg(kernel-module)\
 Provides: %{name}%{?1:-%{1}}-modules-partner-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
 Requires: %{name}-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
