@@ -1,0 +1,157 @@
+# FIPS Protected Directory Check
+#
+# This workflow runs on PRs targeting ciq-*-next branches and checks
+# whether the new upstream commits (the stable release delta) touch
+# any FIPS protected directories.  If so, it posts a comment on the
+# PR alerting reviewers to involve the FIPS / Security team.
+#
+# How it works:
+#   PR base branch:  ciq-X.Y.y-next  (created from stable_X.Y.y)
+#   Old branch:      ciq-X.Y.y       (previous CIQ branch, derived by stripping "-next")
+#   merge-base(old, next)             = last common upstream commit
+#   merge-base..ciq-X.Y.y-next       = new upstream commits to check
+#
+# TODO: remove ref: clk-fips-check once kernel-src-tree-tools merges that branch
+
+name: FIPS Protected Directory Check
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - 'ciq-*-next'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  fips-check:
+    name: FIPS Directory Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Generate GitHub App token
+        id: generate_token
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
+        with:
+          client-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          repositories: |
+            kernel-src-tree
+            kernel-src-tree-tools
+
+      - name: Checkout kernel source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 1
+          token: ${{ steps.generate_token.outputs.token }}
+
+      - name: Checkout kernel-src-tree-tools
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ctrliq/kernel-src-tree-tools
+          path: kernel-src-tree-tools
+          token: ${{ steps.generate_token.outputs.token }}
+
+      - name: Install Python dependencies
+        run: pip install gitpython
+
+      - name: Fetch branches and run FIPS check
+        id: fips_check
+        env:
+          PYTHONPATH: ${{ github.workspace }}/kernel-src-tree-tools
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          OLD_BRANCH="${BASE_REF%-next}"
+          echo "Derived old branch: $OLD_BRANCH from PR base: $BASE_REF"
+
+          # Fetch both branches (full history needed for merge-base)
+          git fetch origin "$BASE_REF:refs/remotes/origin/$BASE_REF"
+          git fetch origin "$OLD_BRANCH:refs/remotes/origin/$OLD_BRANCH" 2>/dev/null || {
+            echo "::warning::Could not fetch branch $OLD_BRANCH — skipping FIPS check"
+            echo "result=skip" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          MERGE_BASE=$(git merge-base "origin/$OLD_BRANCH" "origin/$BASE_REF" 2>/dev/null) || {
+            echo "::warning::Could not compute merge-base between $OLD_BRANCH and $BASE_REF"
+            echo "result=skip" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          echo "Merge base: $MERGE_BASE"
+          echo "Checking upstream commits: $MERGE_BASE..origin/$BASE_REF"
+
+          python3 kernel-src-tree-tools/check_fips_changes.py \
+            --repo . \
+            --base-ref "$MERGE_BASE" \
+            --target-ref "origin/$BASE_REF" \
+            --fips-override 2>&1 | tee fips_report.txt
+
+          if grep -q "FIPS protected changes detected" fips_report.txt; then
+            echo "result=found" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=clean" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post or update PR comment
+        if: always()
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RESULT: ${{ steps.fips_check.outputs.result }}
+        run: |
+          MARKER="<!-- fips-protected-directory-check -->"
+          REPO="${{ github.repository }}"
+
+          # Find any existing FIPS check comment
+          EXISTING_ID=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" \
+            --jq ".[] | select(.body | contains(\"$MARKER\")) | .id" | head -1)
+
+          if [ "$RESULT" = "found" ]; then
+            REPORT=$(cat fips_report.txt)
+            BODY=$(cat <<EOF
+          $MARKER
+          ## :warning: FIPS Protected Directory Changes Detected
+
+          New upstream commits in this rebase touch FIPS protected directories.
+          Please consult the CIQ FIPS / Security team before merging.
+
+          <details>
+          <summary>Details</summary>
+
+          \`\`\`
+          $REPORT
+          \`\`\`
+
+          </details>
+          EOF
+          )
+          elif [ "$RESULT" = "clean" ]; then
+            BODY=$(cat <<EOF
+          $MARKER
+          ## :white_check_mark: FIPS Check: No Protected Directory Changes
+
+          No FIPS protected directories were modified in the new upstream commits.
+          EOF
+          )
+          else
+            BODY=$(cat <<EOF
+          $MARKER
+          ## :x: FIPS Check: Unable to Run
+
+          Could not determine the upstream delta for this PR. The FIPS protected
+          directory check was skipped. Please verify manually.
+          EOF
+          )
+          fi
+
+          if [ -n "$EXISTING_ID" ]; then
+            gh api "repos/$REPO/issues/comments/$EXISTING_ID" \
+              -X PATCH -f body="$BODY"
+            echo "Updated existing comment $EXISTING_ID"
+          else
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$BODY"
+            echo "Created new comment"
+          fi
