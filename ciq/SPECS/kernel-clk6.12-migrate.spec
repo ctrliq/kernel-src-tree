@@ -83,15 +83,6 @@ Requires:  kernel-clk6.12-doc
 %description doc
 Migrates kernel-doc to kernel-clk6.12-doc.
 
-# --- kernel-cross-headers ---
-%package cross-headers
-Summary: Migrate kernel-cross-headers to kernel-clk6.12-cross-headers
-Obsoletes: kernel-cross-headers < %{obs_ceil}
-Requires:  kernel-clk6.12-cross-headers
-
-%description cross-headers
-Migrates kernel-cross-headers to kernel-clk6.12-cross-headers.
-
 # --- kernel-tools ---
 %package tools
 Summary: Migrate kernel-tools to kernel-clk6.12-tools
@@ -200,32 +191,6 @@ Requires:  kernel-clk6.12-selftests-internal
 %description selftests-internal
 Migrates kernel-selftests-internal to kernel-clk6.12-selftests-internal.
 
-# --- kernel-ipaclones-internal ---
-%package ipaclones-internal
-Summary: Migrate kernel-ipaclones-internal to kernel-clk6.12-ipaclones-internal
-Obsoletes: kernel-ipaclones-internal < %{obs_ceil}
-Requires:  kernel-clk6.12-ipaclones-internal
-
-%description ipaclones-internal
-Migrates kernel-ipaclones-internal to kernel-clk6.12-ipaclones-internal.
-
-# --- kernel-abi-stablelists ---
-%package abi-stablelists
-Summary: Migrate kernel-abi-stablelists to kernel-clk6.12-abi-stablelists
-Obsoletes: kernel-abi-stablelists < %{obs_ceil}
-Requires:  kernel-clk6.12-abi-stablelists
-
-%description abi-stablelists
-Migrates kernel-abi-stablelists to kernel-clk6.12-abi-stablelists.
-
-# --- kernel-uki-virt-addons ---
-%package uki-virt-addons
-Summary: Migrate kernel-uki-virt-addons to kernel-clk6.12-uki-virt-addons
-Obsoletes: kernel-uki-virt-addons < %{obs_ceil}
-Requires:  kernel-clk6.12-uki-virt-addons
-
-%description uki-virt-addons
-Migrates kernel-uki-virt-addons to kernel-clk6.12-uki-virt-addons.
 
 # ===== Build =====
 
@@ -333,9 +298,6 @@ rpm -q kernel-clk6.12-headers &>/dev/null && dnf mark install kernel-clk6.12-hea
 %posttrans doc
 rpm -q kernel-clk6.12-doc &>/dev/null && dnf mark install kernel-clk6.12-doc -y &>/dev/null || true
 
-%posttrans cross-headers
-rpm -q kernel-clk6.12-cross-headers &>/dev/null && dnf mark install kernel-clk6.12-cross-headers -y &>/dev/null || true
-
 %posttrans tools
 rpm -q kernel-clk6.12-tools &>/dev/null && dnf mark install kernel-clk6.12-tools -y &>/dev/null || true
 
@@ -372,14 +334,6 @@ rpm -q rv-clk6.12 &>/dev/null && dnf mark install rv-clk6.12 -y &>/dev/null || t
 %posttrans selftests-internal
 rpm -q kernel-clk6.12-selftests-internal &>/dev/null && dnf mark install kernel-clk6.12-selftests-internal -y &>/dev/null || true
 
-%posttrans ipaclones-internal
-rpm -q kernel-clk6.12-ipaclones-internal &>/dev/null && dnf mark install kernel-clk6.12-ipaclones-internal -y &>/dev/null || true
-
-%posttrans abi-stablelists
-rpm -q kernel-clk6.12-abi-stablelists &>/dev/null && dnf mark install kernel-clk6.12-abi-stablelists -y &>/dev/null || true
-
-%posttrans uki-virt-addons
-rpm -q kernel-clk6.12-uki-virt-addons &>/dev/null && dnf mark install kernel-clk6.12-uki-virt-addons -y &>/dev/null || true
 
 # ===== Files =====
 
@@ -389,7 +343,6 @@ rpm -q kernel-clk6.12-uki-virt-addons &>/dev/null && dnf mark install kernel-clk
 
 %files headers
 %files doc
-%files cross-headers
 %files tools
 %files tools-libs
 %files tools-libs-devel
@@ -402,9 +355,6 @@ rpm -q kernel-clk6.12-uki-virt-addons &>/dev/null && dnf mark install kernel-clk
 %files -n kernel-clk6.12-migrate-rtla
 %files -n kernel-clk6.12-migrate-rv
 %files selftests-internal
-%files ipaclones-internal
-%files abi-stablelists
-%files uki-virt-addons
 
 %changelog
 * Mon May 12 2026 Brett Mastbergen <bmastbergen@ciq.com> - 1.0-12
