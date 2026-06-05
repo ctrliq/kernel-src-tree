@@ -40,7 +40,7 @@
 #define PAGE_OFFSET		_AC(CONFIG_PAGE_OFFSET, UL)
 #endif /* CONFIG_64BIT */
 
-#ifndef __ASSEMBLY__
+#ifndef __ASSEMBLER__
 
 #ifdef CONFIG_RISCV_ISA_ZICBOZ
 void clear_page(void *page);
@@ -50,8 +50,7 @@ void clear_page(void *page);
 #define copy_page(to, from)			memcpy((to), (from), PAGE_SIZE)
 
 #define clear_user_page(pgaddr, vaddr, page)	clear_page(pgaddr)
-#define copy_user_page(vto, vfrom, vaddr, topg) \
-			memcpy((vto), (vfrom), PAGE_SIZE)
+#define copy_user_page(vto, vfrom, vaddr, topg) copy_page(vto, vfrom)
 
 /*
  * Use struct definitions to apply C type checking
@@ -122,6 +121,7 @@ struct kernel_mapping {
 
 extern struct kernel_mapping kernel_map;
 extern phys_addr_t phys_ram_base;
+extern unsigned long vmemmap_start_pfn;
 
 #define is_kernel_mapping(x)	\
 	((x) >= kernel_map.virt_addr && (x) < (kernel_map.virt_addr + kernel_map.size))
@@ -201,7 +201,7 @@ static __always_inline void *pfn_to_kaddr(unsigned long pfn)
 	return __va(pfn << PAGE_SHIFT);
 }
 
-#endif /* __ASSEMBLY__ */
+#endif /* __ASSEMBLER__ */
 
 #define virt_addr_valid(vaddr)	({						\
 	unsigned long _addr = (unsigned long)vaddr;				\

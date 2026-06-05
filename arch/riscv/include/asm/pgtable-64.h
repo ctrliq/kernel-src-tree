@@ -69,6 +69,8 @@ typedef struct {
 
 #define PTRS_PER_PMD    (PAGE_SIZE / sizeof(pmd_t))
 
+#define MAX_POSSIBLE_PHYSMEM_BITS 56
+
 /*
  * rv64 PTE format:
  * | 63 | 62 61 | 60 54 | 53  10 | 9             8 | 7 | 6 | 5 | 4 | 3 | 2 | 1 | 0
@@ -184,7 +186,7 @@ static inline int pud_none(pud_t pud)
 
 static inline int pud_bad(pud_t pud)
 {
-	return !pud_present(pud);
+	return !pud_present(pud) || (pud_val(pud) & _PAGE_LEAF);
 }
 
 #define pud_leaf	pud_leaf
@@ -401,6 +403,7 @@ p4d_t *p4d_offset(pgd_t *pgd, unsigned long address);
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 static inline int pte_devmap(pte_t pte);
 static inline pte_t pmd_pte(pmd_t pmd);
+static inline pte_t pud_pte(pud_t pud);
 
 static inline int pmd_devmap(pmd_t pmd)
 {
@@ -409,7 +412,7 @@ static inline int pmd_devmap(pmd_t pmd)
 
 static inline int pud_devmap(pud_t pud)
 {
-	return 0;
+	return pte_devmap(pud_pte(pud));
 }
 
 static inline int pgd_devmap(pgd_t pgd)

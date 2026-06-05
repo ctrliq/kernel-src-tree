@@ -7,6 +7,7 @@
 #include <linux/init.h>
 #include <linux/linkage.h>
 
+#include <asm/alternative-macros.h>
 #include <asm/asm.h>
 #include <asm/csr.h>
 #include <asm/scs.h>
@@ -23,21 +24,21 @@
 	REG_S 	a0, TASK_TI_A0(tp)
 	csrr 	a0, CSR_CAUSE
 	/* Exclude IRQs */
-	blt  	a0, zero, _new_vmalloc_restore_context_a0
+	blt  	a0, zero, .Lnew_vmalloc_restore_context_a0
 
 	REG_S 	a1, TASK_TI_A1(tp)
 	/* Only check new_vmalloc if we are in page/protection fault */
 	li   	a1, EXC_LOAD_PAGE_FAULT
-	beq  	a0, a1, _new_vmalloc_kernel_address
+	beq  	a0, a1, .Lnew_vmalloc_kernel_address
 	li   	a1, EXC_STORE_PAGE_FAULT
-	beq  	a0, a1, _new_vmalloc_kernel_address
+	beq  	a0, a1, .Lnew_vmalloc_kernel_address
 	li   	a1, EXC_INST_PAGE_FAULT
-	bne  	a0, a1, _new_vmalloc_restore_context_a1
+	bne  	a0, a1, .Lnew_vmalloc_restore_context_a1
 
-_new_vmalloc_kernel_address:
+.Lnew_vmalloc_kernel_address:
 	/* Is it a kernel address? */
 	csrr 	a0, CSR_TVAL
-	bge 	a0, zero, _new_vmalloc_restore_context_a1
+	bge 	a0, zero, .Lnew_vmalloc_restore_context_a1
 
 	/* Check if a new vmalloc mapping appeared that could explain the trap */
 	REG_S	a2, TASK_TI_A2(tp)
@@ -46,7 +47,7 @@ _new_vmalloc_kernel_address:
 	 * a0 = &new_vmalloc[BIT_WORD(cpu)]
 	 * a1 = BIT_MASK(cpu)
 	 */
-	REG_L 	a2, TASK_TI_CPU(tp)
+	lw	a2, TASK_TI_CPU(tp)
 	/*
 	 * Compute the new_vmalloc element position:
 	 * (cpu / 64) * 8 = (cpu >> 6) << 3
@@ -69,7 +70,7 @@ _new_vmalloc_kernel_address:
 	/* Check the value of new_vmalloc for this cpu */
 	REG_L	a2, 0(a0)
 	and	a2, a2, a1
-	beq	a2, zero, _new_vmalloc_restore_context
+	beq	a2, zero, .Lnew_vmalloc_restore_context
 
 	/* Atomically reset the current cpu bit in new_vmalloc */
 	amoxor.d	a0, a1, (a0)
@@ -83,11 +84,11 @@ _new_vmalloc_kernel_address:
 	csrw	CSR_SCRATCH, x0
 	sret
 
-_new_vmalloc_restore_context:
+.Lnew_vmalloc_restore_context:
 	REG_L 	a2, TASK_TI_A2(tp)
-_new_vmalloc_restore_context_a1:
+.Lnew_vmalloc_restore_context_a1:
 	REG_L 	a1, TASK_TI_A1(tp)
-_new_vmalloc_restore_context_a0:
+.Lnew_vmalloc_restore_context_a0:
 	REG_L	a0, TASK_TI_A0(tp)
 .endm
 
@@ -278,6 +279,7 @@ SYM_CODE_START_NOALIGN(ret_from_exception)
 #else
 	sret
 #endif
+SYM_INNER_LABEL(ret_from_exception_end, SYM_L_GLOBAL)
 SYM_CODE_END(ret_from_exception)
 ASM_NOKPROBE(ret_from_exception)
 
@@ -440,7 +442,7 @@ SYM_DATA_START_LOCAL(excp_vect_table)
 	RISCV_PTR do_trap_ecall_s
 	RISCV_PTR do_trap_unknown
 	RISCV_PTR do_trap_ecall_m
-	/* instruciton page fault */
+	/* instruction page fault */
 	ALT_PAGE_FAULT(RISCV_PTR do_page_fault)
 	RISCV_PTR do_page_fault   /* load page fault */
 	RISCV_PTR do_trap_unknown

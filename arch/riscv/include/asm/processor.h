@@ -13,6 +13,9 @@
 #include <vdso/processor.h>
 
 #include <asm/ptrace.h>
+#include <asm/insn-def.h>
+#include <asm/alternative-macros.h>
+#include <asm/hwcap.h>
 
 #define arch_get_mmap_end(addr, len, flags)			\
 ({								\
@@ -51,8 +54,7 @@
 #define TASK_UNMAPPED_BASE	PAGE_ALIGN(TASK_SIZE / 3)
 #endif
 
-#ifndef __ASSEMBLY__
-#include <linux/cpumask.h>
+#ifndef __ASSEMBLER__
 
 struct task_struct;
 struct pt_regs;
@@ -102,6 +104,7 @@ struct thread_struct {
 	unsigned long s[12];	/* s[0]: frame pointer */
 	struct __riscv_d_ext_state fstate;
 	unsigned long bad_cause;
+	unsigned long envcfg;
 	u32 riscv_v_flags;
 	u32 vstate_ctrl;
 	struct __riscv_v_ext_state vstate;
@@ -135,6 +138,27 @@ static inline void arch_thread_struct_whitelist(unsigned long *offset,
 #define KSTK_EIP(tsk)		(task_pt_regs(tsk)->epc)
 #define KSTK_ESP(tsk)		(task_pt_regs(tsk)->sp)
 
+#define PREFETCH_ASM(x)							\
+	ALTERNATIVE(__nops(1), PREFETCH_R(x, 0), 0,			\
+		    RISCV_ISA_EXT_ZICBOP, CONFIG_RISCV_ISA_ZICBOP)
+
+#define PREFETCHW_ASM(x)						\
+	ALTERNATIVE(__nops(1), PREFETCH_W(x, 0), 0,			\
+		    RISCV_ISA_EXT_ZICBOP, CONFIG_RISCV_ISA_ZICBOP)
+
+#ifdef CONFIG_RISCV_ISA_ZICBOP
+#define ARCH_HAS_PREFETCH
+static inline void prefetch(const void *x)
+{
+	__asm__ __volatile__(PREFETCH_ASM(%0) : : "r" (x) : "memory");
+}
+
+#define ARCH_HAS_PREFETCHW
+static inline void prefetchw(const void *x)
+{
+	__asm__ __volatile__(PREFETCHW_ASM(%0) : : "r" (x) : "memory");
+}
+#endif /* CONFIG_RISCV_ISA_ZICBOP */
 
 /* Do necessary setup to start up a newly executed thread. */
 extern void start_thread(struct pt_regs *regs,
@@ -177,6 +201,14 @@ extern int set_unalign_ctl(struct task_struct *tsk, unsigned int val);
 #define RISCV_SET_ICACHE_FLUSH_CTX(arg1, arg2)	riscv_set_icache_flush_ctx(arg1, arg2)
 extern int riscv_set_icache_flush_ctx(unsigned long ctx, unsigned long per_thread);
 
-#endif /* __ASSEMBLY__ */
+#ifdef CONFIG_RISCV_ISA_SUPM
+/* PR_{SET,GET}_TAGGED_ADDR_CTRL prctl */
+long set_tagged_addr_ctrl(struct task_struct *task, unsigned long arg);
+long get_tagged_addr_ctrl(struct task_struct *task);
+#define SET_TAGGED_ADDR_CTRL(arg)	set_tagged_addr_ctrl(current, arg)
+#define GET_TAGGED_ADDR_CTRL()		get_tagged_addr_ctrl(current)
+#endif
+
+#endif /* __ASSEMBLER__ */
 
 #endif /* _ASM_RISCV_PROCESSOR_H */
