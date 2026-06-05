@@ -1476,8 +1476,8 @@ This package provides less commonly used kernel modules for the %{?2:%{2} }kerne
 %package %{?1:%{1}-}modules\
 Summary: kernel modules to match the %{?2:%{2}-}core kernel\
 Provides: %{name}%{?1:-%{1}}-modules-%{_target_cpu} = %{specversion}-%{release}\
-Provides: %{name}-modules-%{_target_cpu} = %{specversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
-Provides: %{name}-modules = %{specversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
+Provides: %{name}%{?1:-%{1}}-modules-%{_target_cpu} = %{specversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
+Provides: %{name}%{?1:-%{1}}-modules = %{specversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
 Provides: installonlypkg(kernel-module)\
 Provides: %{name}%{?1:-%{1}}-modules-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
 Requires: %{name}-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
@@ -1499,8 +1499,8 @@ This package provides commonly used kernel modules for the %{?2:%{2}-}core kerne
 %package %{?1:%{1}-}modules-core\
 Summary: Core kernel modules to match the %{?2:%{2}-}core kernel\
 Provides: %{name}%{?1:-%{1}}-modules-core-%{_target_cpu} = %{specversion}-%{release}\
-Provides: %{name}-modules-core-%{_target_cpu} = %{specversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
-Provides: %{name}-modules-core = %{specversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
+Provides: %{name}%{?1:-%{1}}-modules-core-%{_target_cpu} = %{specversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
+Provides: %{name}%{?1:-%{1}}-modules-core = %{specversion}-%{release}%{uname_suffix %{?1:+%{1}}}\
 Provides: installonlypkg(kernel-module)\
 Provides: %{name}%{?1:-%{1}}-modules-core-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
 Requires: %{name}-uname-r = %{KVERREL}%{uname_suffix %{?1:+%{1}}}\
