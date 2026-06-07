@@ -320,7 +320,6 @@ static int tegra_se_probe(struct platform_device *pdev)
 
 	ret = tegra_se_host1x_register(se);
 	if (ret) {
-		crypto_engine_stop(se->engine);
 		crypto_engine_exit(se->engine);
 		return dev_err_probe(dev, ret, "failed to init host1x params\n");
 	}
@@ -332,7 +331,6 @@ static void tegra_se_remove(struct platform_device *pdev)
 {
 	struct tegra_se *se = platform_get_drvdata(pdev);
 
-	crypto_engine_stop(se->engine);
 	crypto_engine_exit(se->engine);
 	host1x_client_unregister(&se->client);
 }
