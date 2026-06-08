@@ -601,15 +601,6 @@ out:
 	return ret;
 }
 
-static void ism_dev_release(struct device *dev)
-{
-	struct ism_dev *ism;
-
-	ism = container_of(dev, struct ism_dev, dev);
-
-	kfree(ism);
-}
-
 static void ism_dev_exit(struct ism_dev *ism)
 {
 	struct pci_dev *pdev = ism->pdev;
@@ -648,17 +639,10 @@ static int ism_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	spin_lock_init(&ism->cmd_lock);
 	dev_set_drvdata(&pdev->dev, ism);
 	ism->pdev = pdev;
-	ism->dev.parent = &pdev->dev;
-	ism->dev.release = ism_dev_release;
-	device_initialize(&ism->dev);
-	dev_set_name(&ism->dev, "%s", dev_name(&pdev->dev));
-	ret = device_add(&ism->dev);
-	if (ret)
-		goto err_dev;
 
 	ret = pci_enable_device_mem(pdev);
 	if (ret)
-		goto err;
+		goto err_dev;
 
 	ret = pci_request_mem_regions(pdev, DRV_NAME);
 	if (ret)
@@ -686,6 +670,9 @@ static int ism_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (ret)
 		goto err_dibs;
 
+	dibs->dev.parent = &pdev->dev;
+	dev_set_name(&dibs->dev, "%s", dev_name(&pdev->dev));
+
 	ret = dibs_dev_add(dibs);
 	if (ret)
 		goto err_ism;
@@ -696,16 +683,14 @@ err_ism:
 	ism_dev_exit(ism);
 err_dibs:
 	/* pairs with dibs_dev_alloc() */
-	kfree(dibs);
+	put_device(&dibs->dev);
 err_resource:
 	pci_release_mem_regions(pdev);
 err_disable:
 	pci_disable_device(pdev);
-err:
-	device_del(&ism->dev);
 err_dev:
 	dev_set_drvdata(&pdev->dev, NULL);
-	put_device(&ism->dev);
+	kfree(ism);
 
 	return ret;
 }
@@ -718,13 +703,12 @@ static void ism_remove(struct pci_dev *pdev)
 	dibs_dev_del(dibs);
 	ism_dev_exit(ism);
 	/* pairs with dibs_dev_alloc() */
-	kfree(dibs);
+	put_device(&dibs->dev);
 
 	pci_release_mem_regions(pdev);
 	pci_disable_device(pdev);
-	device_del(&ism->dev);
 	dev_set_drvdata(&pdev->dev, NULL);
-	put_device(&ism->dev);
+	kfree(ism);
 }
 
 static struct pci_driver ism_driver = {
@@ -865,13 +849,6 @@ static void smcd_get_local_gid(struct smcd_dev *smcd,
 	smcd_gid->gid_ext = 0;
 }
 
-static inline struct device *smcd_get_dev(struct smcd_dev *dev)
-{
-	struct ism_dev *ism = dev->priv;
-
-	return &ism->dev;
-}
-
 static const struct smcd_ops ism_smcd_ops = {
 	.query_remote_gid = smcd_query_rgid,
 	.register_dmb = smcd_register_dmb,
@@ -884,7 +861,6 @@ static const struct smcd_ops ism_smcd_ops = {
 	.move_data = smcd_move,
 	.supports_v2 = smcd_supports_v2,
 	.get_local_gid = smcd_get_local_gid,
-	.get_dev = smcd_get_dev,
 };
 
 const struct smcd_ops *ism_get_smcd_ops(void)
