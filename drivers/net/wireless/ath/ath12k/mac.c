@@ -13358,10 +13358,12 @@ void ath12k_mac_op_link_sta_statistics(struct ieee80211_hw *hw,
 	db2dbm = test_bit(WMI_TLV_SERVICE_HW_DB2DBM_CONVERSION_SUPPORT,
 			  ar->ab->wmi_ab.svc_map);
 
-	guard(spinlock_bh)(&ar->ab->dp->dp_lock);
+	spin_lock_bh(&ar->ab->dp->dp_lock);
 	peer = ath12k_dp_link_peer_find_by_addr(ar->ab->dp, arsta->addr);
-	if (!peer)
+	if (!peer) {
+		spin_unlock_bh(&ar->ab->dp->dp_lock);
 		return;
+	}
 
 	link_sinfo->rx_duration = peer->rx_duration;
 	link_sinfo->filled |= BIT_ULL(NL80211_STA_INFO_RX_DURATION);
@@ -13388,26 +13390,6 @@ void ath12k_mac_op_link_sta_statistics(struct ieee80211_hw *hw,
 		link_sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_BITRATE);
 	}
 
-	/* TODO: Use real NF instead of default one. */
-	signal = peer->rssi_comb;
-
-	params.pdev_id = ar->pdev->pdev_id;
-	params.vdev_id = 0;
-	params.stats_id = WMI_REQUEST_VDEV_STAT;
-
-	if (!signal &&
-	    ahsta->ahvif->vdev_type == WMI_VDEV_TYPE_STA &&
-	    !(ath12k_mac_get_fw_stats(ar, &params))) {
-		signal = arsta->rssi_beacon;
-		ath12k_fw_stats_reset(ar);
-	}
-
-	if (signal) {
-		link_sinfo->signal =
-			db2dbm ? signal : signal + ATH12K_DEFAULT_NOISE_FLOOR;
-		link_sinfo->filled |= BIT_ULL(NL80211_STA_INFO_SIGNAL);
-	}
-
 	link_sinfo->signal_avg = ewma_avg_rssi_read(&peer->avg_rssi);
 
 	if (!db2dbm)
@@ -13419,6 +13401,28 @@ void ath12k_mac_op_link_sta_statistics(struct ieee80211_hw *hw,
 	link_sinfo->tx_failed = peer->tx_retry_failed;
 	link_sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_RETRIES);
 	link_sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_FAILED);
+
+	/* TODO: Use real NF instead of default one. */
+	signal = peer->rssi_comb;
+
+	spin_unlock_bh(&ar->ab->dp->dp_lock);
+
+	if (!signal && ahsta->ahvif->vdev_type == WMI_VDEV_TYPE_STA) {
+		params.pdev_id = ath12k_mac_get_target_pdev_id(ar);
+		params.vdev_id = 0;
+		params.stats_id = WMI_REQUEST_VDEV_STAT;
+
+		if (!ath12k_mac_get_fw_stats(ar, &params)) {
+			signal = arsta->rssi_beacon;
+			ath12k_fw_stats_reset(ar);
+		}
+	}
+
+	if (signal) {
+		link_sinfo->signal =
+			db2dbm ? signal : signal + ATH12K_DEFAULT_NOISE_FLOOR;
+		link_sinfo->filled |= BIT_ULL(NL80211_STA_INFO_SIGNAL);
+	}
 }
 EXPORT_SYMBOL(ath12k_mac_op_link_sta_statistics);
 
