@@ -5,7 +5,12 @@
 #          [--kselftest-passed N --kselftest-failed N --kselftest-status TEXT]
 #          [--ltp-passed N --ltp-failed N --ltp-status TEXT]
 #          [--arch ...] --run-id ID --repo REPO --compared-against BRANCH
-#          [--ltp-details TEXT] [--commit-file FILE]
+#          [--ltp-details TEXT] [--commit-file FILE] [--ci-skipped]
+#
+# --ci-skipped produces an abbreviated PR body for pr_only-mode runs where
+# build/boot/test stages didn't execute. The build/test sections are
+# replaced with a "CI was skipped" notice. --build-time / --total-time /
+# --kselftest-* / --ltp-* args are not required (and ignored) in this mode.
 
 set -euo pipefail
 
@@ -17,6 +22,7 @@ REPO=""
 COMMIT_MESSAGE_FILE=""
 COMPARED_AGAINST=""
 LTP_DETAILS=""
+CI_SKIPPED=false
 
 CURRENT_ARCH=""
 
@@ -55,6 +61,8 @@ while [[ $# -gt 0 ]]; do
       LTP_DETAILS="$2"; shift 2 ;;
     --commit-file)
       COMMIT_MESSAGE_FILE="$2"; shift 2 ;;
+    --ci-skipped)
+      CI_SKIPPED=true; shift ;;
     *)
       echo "Error: Unknown option: $1" >&2; exit 1 ;;
   esac
@@ -70,10 +78,13 @@ if [ ! -f "$COMMIT_MESSAGE_FILE" ]; then
   exit 1
 fi
 
-for arch in "${ARCHS[@]}"; do
-  [[ -z "${ARCH_DATA[${arch}_build_time]:-}" ]] && { echo "Error: Missing --build-time for $arch" >&2; exit 1; }
-  [[ -z "${ARCH_DATA[${arch}_total_time]:-}" ]] && { echo "Error: Missing --total-time for $arch" >&2; exit 1; }
-done
+# build-time / total-time only required when build actually ran
+if [ "$CI_SKIPPED" != "true" ]; then
+  for arch in "${ARCHS[@]}"; do
+    [[ -z "${ARCH_DATA[${arch}_build_time]:-}" ]] && { echo "Error: Missing --build-time for $arch" >&2; exit 1; }
+    [[ -z "${ARCH_DATA[${arch}_total_time]:-}" ]] && { echo "Error: Missing --total-time for $arch" >&2; exit 1; }
+  done
+fi
 
 convert_time() {
   local seconds="${1%s}"
@@ -85,10 +96,14 @@ convert_time() {
 MULTIARCH=false
 [ ${#ARCHS[@]} -gt 1 ] && MULTIARCH=true
 
-for arch in "${ARCHS[@]}"; do
-  ARCH_DATA["${arch}_build_time_readable"]=$(convert_time "${ARCH_DATA[${arch}_build_time]}")
-  ARCH_DATA["${arch}_total_time_readable"]=$(convert_time "${ARCH_DATA[${arch}_total_time]}")
-done
+# Only convert build/total time when build actually ran. In CI-skipped mode
+# these values aren't set and aren't rendered.
+if [ "$CI_SKIPPED" != "true" ]; then
+  for arch in "${ARCHS[@]}"; do
+    ARCH_DATA["${arch}_build_time_readable"]=$(convert_time "${ARCH_DATA[${arch}_build_time]}")
+    ARCH_DATA["${arch}_total_time_readable"]=$(convert_time "${ARCH_DATA[${arch}_total_time]}")
+  done
+fi
 
 # Check if any arch has kselftest or LTP data
 HAS_KSELFTEST=false
@@ -98,91 +113,115 @@ for arch in "${ARCHS[@]}"; do
   [ -n "${ARCH_DATA[${arch}_ltp_passed]:-}" ] && HAS_LTP=true
 done
 
-cat << EOF
+if [ "$CI_SKIPPED" = "true" ]; then
+  cat << EOF
+## Summary
+This PR was created with CI intentionally skipped (\`-pr-only\` branch suffix).
+**No build or test results are available.** Please review the patch carefully
+before merging.
+
+## Commit Message(s)
+
+EOF
+else
+  cat << EOF
 ## Summary
 This PR has been automatically created after successful completion of all CI stages.
 
 ## Commit Message(s)
 
 EOF
+fi
 
 cat "$COMMIT_MESSAGE_FILE"
 echo ""
 
-cat << EOF
+if [ "$CI_SKIPPED" = "true" ]; then
+  cat << EOF
+
+## CI Status
+
+⚠️ **CI was skipped for this PR.** Build, boot, kselftest, and LTP stages
+did not run. The PR was created via the \`-pr-only\` branch suffix.
+
+- [View workflow run](https://github.com/${REPO}/actions/runs/${RUN_ID})
+EOF
+else
+  cat << EOF
 
 ## Test Results
 
 ### ✅ Build Stage
 EOF
 
-if [ "$MULTIARCH" = true ]; then
+  if [ "$MULTIARCH" = true ]; then
+    echo ""
+    echo "| Architecture | Build Time | Total Time |"
+    echo "|--------------|------------|------------|"
+    for arch in "${ARCHS[@]}"; do
+      echo "| ${arch} | ${ARCH_DATA[${arch}_build_time_readable]} | ${ARCH_DATA[${arch}_total_time_readable]} |"
+    done
+  else
+    ARCH1="${ARCHS[0]}"
+    echo "- Status: Passed (${ARCH1})"
+    echo "- Build Time: ${ARCH_DATA[${ARCH1}_build_time_readable]}"
+    echo "- Total Time: ${ARCH_DATA[${ARCH1}_total_time_readable]}"
+  fi
+
   echo ""
-  echo "| Architecture | Build Time | Total Time |"
-  echo "|--------------|------------|------------|"
-  for arch in "${ARCHS[@]}"; do
-    echo "| ${arch} | ${ARCH_DATA[${arch}_build_time_readable]} | ${ARCH_DATA[${arch}_total_time_readable]} |"
-  done
-else
-  ARCH1="${ARCHS[0]}"
-  echo "- Status: Passed (${ARCH1})"
-  echo "- Build Time: ${ARCH_DATA[${ARCH1}_build_time_readable]}"
-  echo "- Total Time: ${ARCH_DATA[${ARCH1}_total_time_readable]}"
-fi
+  echo "- [View build logs](https://github.com/${REPO}/actions/runs/${RUN_ID})"
 
-echo ""
-echo "- [View build logs](https://github.com/${REPO}/actions/runs/${RUN_ID})"
-
-cat << EOF
+  cat << EOF
 
 ### ✅ Boot Verification
 EOF
 
-if [ "$MULTIARCH" = true ]; then
-  echo "- Status: Passed (all architectures)"
-else
-  echo "- Status: Passed (${ARCHS[0]})"
-fi
-echo "- [View boot logs](https://github.com/${REPO}/actions/runs/${RUN_ID})"
+  if [ "$MULTIARCH" = true ]; then
+    echo "- Status: Passed (all architectures)"
+  else
+    echo "- Status: Passed (${ARCHS[0]})"
+  fi
+  echo "- [View boot logs](https://github.com/${REPO}/actions/runs/${RUN_ID})"
 
-if [ "$HAS_KSELFTEST" = true ]; then
-  cat << EOF
+  if [ "$HAS_KSELFTEST" = true ]; then
+    cat << EOF
 
 ### ✅ Kernel Selftests
 
 | Architecture | Passed | Failed | Compared Against | Status |
 |--------------|--------|--------|-----------------|--------|
 EOF
-  for arch in "${ARCHS[@]}"; do
-    passed="${ARCH_DATA[${arch}_kselftest_passed]:-N/A}"
-    failed="${ARCH_DATA[${arch}_kselftest_failed]:-N/A}"
-    status="${ARCH_DATA[${arch}_kselftest_status]:-⚠️ No baseline available}"
-    echo "| ${arch} | ${passed} | ${failed} | ${COMPARED_AGAINST:-N/A} | ${status} |"
-  done
-  echo ""
-  echo "- [View kselftest logs](https://github.com/${REPO}/actions/runs/${RUN_ID})"
-fi
+    for arch in "${ARCHS[@]}"; do
+      passed="${ARCH_DATA[${arch}_kselftest_passed]:-N/A}"
+      failed="${ARCH_DATA[${arch}_kselftest_failed]:-N/A}"
+      status="${ARCH_DATA[${arch}_kselftest_status]:-⚠️ No baseline available}"
+      echo "| ${arch} | ${passed} | ${failed} | ${COMPARED_AGAINST:-N/A} | ${status} |"
+    done
+    echo ""
+    echo "- [View kselftest logs](https://github.com/${REPO}/actions/runs/${RUN_ID})"
+  fi
 
-if [ "$HAS_LTP" = true ]; then
-  cat << EOF
+  if [ "$HAS_LTP" = true ]; then
+    cat << EOF
 
 ### ✅ LTP Results
 
 | Architecture | Passed | Failed | Compared Against | Status |
 |--------------|--------|--------|-----------------|--------|
 EOF
-  for arch in "${ARCHS[@]}"; do
-    ltp_passed="${ARCH_DATA[${arch}_ltp_passed]:-N/A}"
-    ltp_failed="${ARCH_DATA[${arch}_ltp_failed]:-N/A}"
-    ltp_status="${ARCH_DATA[${arch}_ltp_status]:-⚠️ No baseline available}"
-    echo "| ${arch} | ${ltp_passed} | ${ltp_failed} | ${COMPARED_AGAINST:-N/A} | ${ltp_status} |"
-  done
-  echo ""
-  echo "- [View LTP logs](https://github.com/${REPO}/actions/runs/${RUN_ID})"
-
-  if [ -n "$LTP_DETAILS" ]; then
+    for arch in "${ARCHS[@]}"; do
+      ltp_passed="${ARCH_DATA[${arch}_ltp_passed]:-N/A}"
+      ltp_failed="${ARCH_DATA[${arch}_ltp_failed]:-N/A}"
+      ltp_status="${ARCH_DATA[${arch}_ltp_status]:-⚠️ No baseline available}"
+      echo "| ${arch} | ${ltp_passed} | ${ltp_failed} | ${COMPARED_AGAINST:-N/A} | ${ltp_status} |"
+    done
     echo ""
-    echo "$LTP_DETAILS"
+    echo "- [View LTP logs](https://github.com/${REPO}/actions/runs/${RUN_ID})"
+
+    if [ -n "$LTP_DETAILS" ]; then
+      echo ""
+      echo "$LTP_DETAILS"
+    fi
   fi
 fi
 
