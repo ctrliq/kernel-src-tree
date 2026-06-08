@@ -83,6 +83,66 @@ jobs:
             SKIP_LTP=true
           fi
 
+          # Branch-name suffix parsing for skip directives.
+          #
+          # Suffixes (each strippable, can stack in any order):
+          #   -no-kselftest  skip kselftest execution + comparison
+          #   -no-ltp        skip LTP execution + comparison
+          #   -no-tests      skip both kselftest and LTP
+          #   -no-pr         run full pipeline but don't create the PR
+          #   -pr-only       skip build/boot/tests, only create the PR
+          #
+          # Pick source explicitly based on event:
+          #   - push event:         use PUSH_REF (github.ref_name = branch name)
+          #   - pull_request event: use HEAD_REF (github.head_ref = source branch)
+          # We can't just `${PUSH_REF:-$HEAD_REF}` because on PR events
+          # github.ref_name is the synthetic "N/merge" ref, which would cause
+          # us to look for suffixes in the wrong string.
+          #
+          # Examples:
+          #   {shreeya}_ciqlts9_2-no-ltp                       → skip LTP only
+          #   {shreeya}_ciqlts9_2-no-tests-no-pr               → skip both tests AND skip PR
+          #   {shreeya}_rlc-10/6.12.0-211.16.1.el10_2-pr-only  → just open PR, no build
+          #
+          # Strip from the end; record each flag; what's left is the base for
+          # downstream extraction. The closed vocabulary means no ambiguity.
+          PR_ONLY=false
+          NO_PR=false
+          if [[ "$IS_PR" == "true" ]]; then
+            SKIP_CI_RAW="$HEAD_REF"
+          else
+            SKIP_CI_RAW="$PUSH_REF"
+          fi
+          while :; do
+            case "$SKIP_CI_RAW" in
+              *-no-kselftest) SKIP_KSELFTESTS=true;       SKIP_CI_RAW="${SKIP_CI_RAW%-no-kselftest}" ;;
+              *-no-ltp)       SKIP_LTP=true;              SKIP_CI_RAW="${SKIP_CI_RAW%-no-ltp}" ;;
+              *-no-tests)     SKIP_KSELFTESTS=true; SKIP_LTP=true; SKIP_CI_RAW="${SKIP_CI_RAW%-no-tests}" ;;
+              *-no-pr)        NO_PR=true;                 SKIP_CI_RAW="${SKIP_CI_RAW%-no-pr}" ;;
+              *-pr-only)      PR_ONLY=true; SKIP_KSELFTESTS=true; SKIP_LTP=true; SKIP_CI_RAW="${SKIP_CI_RAW%-pr-only}" ;;
+              *) break ;;
+            esac
+          done
+
+          # Reject contradictions
+          if [ "$PR_ONLY" = "true" ] && [ "$NO_PR" = "true" ]; then
+            echo "❌ Branch name contains both -pr-only and -no-pr (contradictory)"
+            exit 1
+          fi
+
+          if [ "$PR_ONLY" = "true" ]; then
+            echo "⏭️ -pr-only suffix detected — only create-pr will run"
+          fi
+          if [ "$NO_PR" = "true" ]; then
+            echo "⏭️ -no-pr suffix detected — PR will not be created/updated"
+          fi
+
+          # The remote branch name (PUSH_REF / HEAD_REF) keeps the suffix,
+          # because `gh pr list --head ...` needs to match the actual remote
+          # branch. SKIP_CI_RAW holds the stripped form for downstream
+          # base-branch extraction; we save it as HEAD_REF_BASE in metadata.
+          HEAD_REF_BASE="$SKIP_CI_RAW"
+
           # On push events there is no PR context; BASE_REF is empty string
           # It will be deduced automatically in a later worklow
           if [[ "$IS_PR" == "false" ]]; then
@@ -164,6 +224,16 @@ jobs:
             exit 1
           fi
 
+          # Validate pr_only / no_pr - must be exactly 'true' or 'false'
+          if ! [[ "$PR_ONLY" =~ ^(true|false)$ ]]; then
+            echo "❌ Invalid pr_only value: $PR_ONLY"
+            exit 1
+          fi
+          if ! [[ "$NO_PR" =~ ^(true|false)$ ]]; then
+            echo "❌ Invalid no_pr value: $NO_PR"
+            exit 1
+          fi
+
           # Pass validated values to environment
           echo "IS_PR=$IS_PR" >> "$GITHUB_ENV"
           echo "BASE_REF=$BASE_REF" >> "$GITHUB_ENV"
@@ -173,6 +243,9 @@ jobs:
           echo "SKIP_KABI=$SKIP_KABI" >> "$GITHUB_ENV"
           echo "SKIP_KSELFTESTS=$SKIP_KSELFTESTS" >> "$GITHUB_ENV"
           echo "SKIP_LTP=$SKIP_LTP" >> "$GITHUB_ENV"
+          echo "PR_ONLY=$PR_ONLY" >> "$GITHUB_ENV"
+          echo "NO_PR=$NO_PR" >> "$GITHUB_ENV"
+          echo "HEAD_REF_BASE=$HEAD_REF_BASE" >> "$GITHUB_ENV"
 
       - name: Clone base branch
         if: github.event_name == 'pull_request'
@@ -222,6 +295,11 @@ jobs:
             echo "$SKIP_KABI" > pr_metadata/skip_kabi.txt
             echo "$SKIP_KSELFTESTS" > pr_metadata/skip_kselftests.txt
             echo "$SKIP_LTP" > pr_metadata/skip_ltp.txt
+            echo "$PR_ONLY" > pr_metadata/pr_only.txt
+            echo "$NO_PR" > pr_metadata/no_pr.txt
+            # head_ref_base is head_ref with any skip-suffix stripped, used by
+            # downstream base-branch extraction. Equals head_ref when no suffix.
+            echo "$HEAD_REF_BASE" > pr_metadata/head_ref_base.txt
             echo "$IS_PR" > pr_metadata/is_pr.txt
 
             # Create a checksum of metadata for integrity verification

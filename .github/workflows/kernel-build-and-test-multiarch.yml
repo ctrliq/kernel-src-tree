@@ -37,11 +37,14 @@ jobs:
       repository: ${{ steps.pr_metadata.outputs.repository }}
       base_ref: ${{ steps.pr_metadata.outputs.base_ref }}
       head_ref: ${{ steps.pr_metadata.outputs.head_ref }}
+      head_ref_base: ${{ steps.pr_metadata.outputs.head_ref_base }}
       head_sha: ${{ steps.pr_metadata.outputs.head_sha }}
       architectures: ${{ steps.pr_metadata.outputs.architectures }}
       skip_kabi: ${{ steps.pr_metadata.outputs.skip_kabi }}
       skip_kselftests: ${{ steps.pr_metadata.outputs.skip_kselftests }}
       skip_ltp: ${{ steps.pr_metadata.outputs.skip_ltp }}
+      pr_only: ${{ steps.pr_metadata.outputs.pr_only }}
+      no_pr: ${{ steps.pr_metadata.outputs.no_pr }}
       is_pr: ${{ steps.pr_metadata.outputs.is_pr }}
 
     steps:
@@ -100,6 +103,11 @@ jobs:
           SKIP_KABI=$(cat pr_metadata/skip_kabi.txt)
           SKIP_KSELFTESTS=$(cat pr_metadata/skip_kselftests.txt)
           SKIP_LTP=$(cat pr_metadata/skip_ltp.txt 2>/dev/null || echo "false")
+          # pr_only / no_pr / head_ref_base are newer; default for backward
+          # compatibility with metadata produced by older trigger workflow.
+          PR_ONLY=$(cat pr_metadata/pr_only.txt 2>/dev/null || echo "false")
+          NO_PR=$(cat pr_metadata/no_pr.txt 2>/dev/null || echo "false")
+          HEAD_REF_BASE=$(cat pr_metadata/head_ref_base.txt 2>/dev/null || echo "$HEAD_REF")
           IS_PR=$(cat pr_metadata/is_pr.txt)
 
           # === CRITICAL VALIDATION: Prevent command injection ===
@@ -196,6 +204,26 @@ jobs:
             exit 1
           fi
 
+          # Validate pr_only / no_pr - must be exactly 'true' or 'false'
+          if ! [[ "$PR_ONLY" =~ ^(true|false)$ ]]; then
+            echo "❌ Security: Invalid pr_only value: $PR_ONLY"
+            exit 1
+          fi
+          if ! [[ "$NO_PR" =~ ^(true|false)$ ]]; then
+            echo "❌ Security: Invalid no_pr value: $NO_PR"
+            exit 1
+          fi
+
+          # Validate head_ref_base - same constraints as head_ref
+          if ! [[ "$HEAD_REF_BASE" =~ ^[a-zA-Z0-9/_.{}-]+$ ]]; then
+            echo "❌ Security: Invalid head_ref_base value: $HEAD_REF_BASE"
+            exit 1
+          fi
+          if [ ${#HEAD_REF_BASE} -gt 255 ]; then
+            echo "❌ Security: head_ref_base too long"
+            exit 1
+          fi
+
           # === All validation passed - safe to use ===
           echo "✅ All metadata validation passed"
 
@@ -210,6 +238,9 @@ jobs:
           echo "skip_kabi=$SKIP_KABI" >> $GITHUB_OUTPUT
           echo "skip_kselftests=$SKIP_KSELFTESTS" >> $GITHUB_OUTPUT
           echo "skip_ltp=$SKIP_LTP" >> $GITHUB_OUTPUT
+          echo "pr_only=$PR_ONLY" >> $GITHUB_OUTPUT
+          echo "no_pr=$NO_PR" >> $GITHUB_OUTPUT
+          echo "head_ref_base=$HEAD_REF_BASE" >> $GITHUB_OUTPUT
           echo "is_pr=$IS_PR" >> $GITHUB_OUTPUT
 
       - name: Upload head_ref for baseline search
@@ -256,6 +287,7 @@ jobs:
     name: Build kernel (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     needs: [pre-setup, setup]
+    if: needs.pre-setup.outputs.pr_only != 'true'
 
     strategy:
       fail-fast: false
@@ -422,6 +454,7 @@ jobs:
     name: Boot verification (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     needs: [pre-setup, setup, build]
+    if: needs.pre-setup.outputs.pr_only != 'true'
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
@@ -722,15 +755,19 @@ jobs:
       env:
         GH_TOKEN: ${{ steps.generate_token_compare.outputs.token }}
         HEAD_REF: ${{ needs.pre-setup.outputs.head_ref }}
+        # head_ref_base is head_ref with any skip-suffix (-no-ltp, -pr-only, etc.)
+        # stripped. Used here for base-branch regex extraction. The PR-list
+        # query still uses HEAD_REF since that's the actual remote branch name.
+        HEAD_REF_BASE: ${{ needs.pre-setup.outputs.head_ref_base }}
         BASE_REF: ${{ needs.pre-setup.outputs.base_ref }}
         PR_NUMBER: ${{ needs.pre-setup.outputs.pr_number }}
       run: |
         # Reuse same base branch logic as compare-kselftest job
         BASE_BRANCH=""
-        BRANCH_NAME="$HEAD_REF"
+        BRANCH_NAME="$HEAD_REF_BASE"
         VALID_BASES="ciqlts9_2 ciqlts9_4 ciqlts8_6 ciqlts9_6 ciq-6.12.y ciq-6.12.y-next ciq-6.18.y ciq-6.18.y-next ciqcbr7_9"
 
-        EXISTING_PR=$(gh pr list --head "$BRANCH_NAME" --state open --json number,baseRefName --jq '.[0]' || echo "")
+        EXISTING_PR=$(gh pr list --head "$HEAD_REF" --state open --json number,baseRefName --jq '.[0]' || echo "")
         if [ -n "$EXISTING_PR" ] && [ "$EXISTING_PR" != "null" ]; then
           BASE_BRANCH=$(echo "$EXISTING_PR" | jq -r '.baseRefName')
         elif [ -n "$BASE_REF" ]; then
@@ -937,21 +974,26 @@ jobs:
       env:
         GH_TOKEN: ${{ steps.generate_token_compare.outputs.token }}
         HEAD_REF: ${{ needs.pre-setup.outputs.head_ref }}
+        # head_ref_base is head_ref with any skip-suffix stripped, used for
+        # base-branch regex extraction below. HEAD_REF (full remote name) is
+        # used for the PR-list query because that's the actual remote branch.
+        HEAD_REF_BASE: ${{ needs.pre-setup.outputs.head_ref_base }}
         BASE_REF: ${{ needs.pre-setup.outputs.base_ref }}
         PR_NUMBER: ${{ needs.pre-setup.outputs.pr_number }}
       run: |
         BASE_BRANCH=""
-        BRANCH_NAME="$HEAD_REF"
+        BRANCH_NAME="$HEAD_REF_BASE"
 
         # Define whitelist of valid base branches
         # TODO: Use a centralized place to get the base branches
         VALID_BASES="ciqlts9_2 ciqlts9_4 ciqlts8_6 ciqlts9_6 ciq-6.12.y ciq-6.12.y-next ciq-6.18.y ciq-6.18.y-next ciqcbr7_9"
 
-        echo "Current branch: $BRANCH_NAME"
+        echo "Current branch (suffix-stripped for extraction): $BRANCH_NAME"
 
-        # First, check if an open PR already exists from this head branch
-        echo "Checking for existing open PR from branch: $BRANCH_NAME"
-        EXISTING_PR=$(gh pr list --head "$BRANCH_NAME" --state open --json number,baseRefName --jq '.[0]' || echo "")
+        # First, check if an open PR already exists from this head branch.
+        # Use HEAD_REF (un-stripped) here — the PR's head matches the real remote branch.
+        echo "Checking for existing open PR from branch: $HEAD_REF"
+        EXISTING_PR=$(gh pr list --head "$HEAD_REF" --state open --json number,baseRefName --jq '.[0]' || echo "")
 
         if [ -n "$EXISTING_PR" ] && [ "$EXISTING_PR" != "null" ]; then
           # PR exists - use its existing base branch
@@ -1202,16 +1244,24 @@ jobs:
     name: Create Pull Request
     runs-on: kernel-build
     needs: [pre-setup, setup, build, boot, test-kselftest, compare-kselftest, test-ltp, compare-ltp]
-    # The (workflow_dispatch || no_pr != true) clause lets manual reruns opt
-    # out of PR creation by passing -f no_pr=true. workflow_run events (normal
-    # CI) are unaffected since inputs.no_pr is not set there. The explicit
-    # `!= true` form avoids the boolean/string coercion ambiguity that affects
-    # `!inputs.no_pr` in some GHA expression contexts.
+    # Two independent ways to skip PR creation:
+    #   - Branch suffix `-no-pr` sets needs.pre-setup.outputs.no_pr to 'true'
+    #     (parsed by the trigger workflow from the branch name).
+    #   - workflow_dispatch with `no_pr=true` input (for manual reruns).
+    #
+    # Branch suffix `-pr-only` skips build/boot/tests; we still create the
+    # PR, but build.result is 'skipped' (not 'success') so we accept that
+    # alongside the normal success case.
+    #
+    # The explicit `!= true` on the workflow_dispatch input form avoids the
+    # boolean/string coercion ambiguity that affects `!inputs.no_pr` in some
+    # GHA expression contexts.
     if: |
       always() &&
-      needs.build.result == 'success' &&
-      needs.boot.result == 'success' &&
-      (github.event_name != 'workflow_dispatch' || inputs.no_pr != true)
+      needs.pre-setup.outputs.no_pr != 'true' &&
+      (github.event_name != 'workflow_dispatch' || inputs.no_pr != true) &&
+      (needs.pre-setup.outputs.pr_only == 'true' ||
+       (needs.build.result == 'success' && needs.boot.result == 'success'))
 
     steps:
     - name: Check if branch name matches a supported pattern
@@ -1230,7 +1280,16 @@ jobs:
     - name: Check if tests passed and no regressions
       env:
         ARCHITECTURES: ${{ needs.pre-setup.outputs.architectures }}
+        PR_ONLY: ${{ needs.pre-setup.outputs.pr_only }}
       run: |
+        # In pr_only mode the test stages are intentionally skipped; the PR
+        # body produced later will explicitly note the absence of test data.
+        # Don't gate on stage results in that case.
+        if [ "$PR_ONLY" = "true" ]; then
+          echo "pr_only mode — bypassing stage-result and regression checks"
+          exit 0
+        fi
+
         # Skip PR if any required stage failed
         # test-kselftest is optional when skip_kselftests input is true
         # LTP failures/regressions are informational only - do not block PR creation
@@ -1318,29 +1377,31 @@ jobs:
         echo "has_aarch64=$HAS_AARCH64" >> $GITHUB_OUTPUT
         echo "Architectures enabled: x86_64=$HAS_X86_64, aarch64=$HAS_AARCH64"
 
+    # In pr_only mode the build/boot jobs are skipped, so no artifacts exist.
+    # Skip downloads to avoid failing on missing artifacts.
     - name: Download kernel compilation logs (x86_64)
-      if: steps.detect_arch.outputs.has_x86_64 == 'true'
+      if: steps.detect_arch.outputs.has_x86_64 == 'true' && needs.pre-setup.outputs.pr_only != 'true'
       uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
       with:
         name: kernel-compilation-logs-x86_64
         path: artifacts/build/x86_64
 
     - name: Download kernel compilation logs (aarch64)
-      if: steps.detect_arch.outputs.has_aarch64 == 'true'
+      if: steps.detect_arch.outputs.has_aarch64 == 'true' && needs.pre-setup.outputs.pr_only != 'true'
       uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
       with:
         name: kernel-compilation-logs-aarch64
         path: artifacts/build/aarch64
 
     - name: Download boot logs (x86_64)
-      if: steps.detect_arch.outputs.has_x86_64 == 'true'
+      if: steps.detect_arch.outputs.has_x86_64 == 'true' && needs.pre-setup.outputs.pr_only != 'true'
       uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
       with:
         name: boot-logs-x86_64
         path: artifacts/boot/x86_64
 
     - name: Download boot logs (aarch64)
-      if: steps.detect_arch.outputs.has_aarch64 == 'true'
+      if: steps.detect_arch.outputs.has_aarch64 == 'true' && needs.pre-setup.outputs.pr_only != 'true'
       uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
       with:
         name: boot-logs-aarch64
@@ -1390,7 +1451,16 @@ jobs:
 
     - name: Extract build timers
       id: build_info
+      env:
+        PR_ONLY: ${{ needs.pre-setup.outputs.pr_only }}
       run: |
+        # In pr_only mode the build job didn't run, so its log artifact wasn't
+        # downloaded. The script gets --ci-skipped instead of build-time args.
+        if [ "$PR_ONLY" = "true" ]; then
+          echo "pr_only mode — skipping build-timer extraction"
+          exit 0
+        fi
+
         HAS_X86="${{ steps.detect_arch.outputs.has_x86_64 }}"
         HAS_ARM="${{ steps.detect_arch.outputs.has_aarch64 }}"
 
@@ -1415,16 +1485,19 @@ jobs:
       env:
         GH_TOKEN: ${{ steps.generate_token.outputs.token }}
         HEAD_REF: ${{ needs.pre-setup.outputs.head_ref }}
+        # See compare-kselftest / compare-ltp: BASE_BRANCH extraction uses the
+        # suffix-stripped form; PR-list query uses the un-stripped remote name.
+        HEAD_REF_BASE: ${{ needs.pre-setup.outputs.head_ref_base }}
         BASE_REF: ${{ needs.pre-setup.outputs.base_ref }}
       run: |
         # Use base branch from comparison jobs if available, otherwise detect it here
         BASE_BRANCH="${{ needs.compare-kselftest.outputs.base_branch || needs.compare-ltp.outputs.base_branch }}"
 
         if [ -z "$BASE_BRANCH" ]; then
-          # Both comparison jobs were skipped — detect base branch directly
-          BRANCH_NAME="$HEAD_REF"
+          # Both comparison jobs were skipped (e.g. pr_only mode) — detect base branch directly
+          BRANCH_NAME="$HEAD_REF_BASE"
           VALID_BASES="ciqlts9_2 ciqlts9_4 ciqlts8_6 ciqlts9_6 ciq-6.12.y ciq-6.12.y-next ciq-6.18.y ciq-6.18.y-next ciqcbr7_9"
-          EXISTING_PR=$(gh pr list --head "$BRANCH_NAME" --state open --json number,baseRefName --jq '.[0]' || echo "")
+          EXISTING_PR=$(gh pr list --head "$HEAD_REF" --state open --json number,baseRefName --jq '.[0]' || echo "")
           if [ -n "$EXISTING_PR" ] && [ "$EXISTING_PR" != "null" ]; then
             BASE_BRANCH=$(echo "$EXISTING_PR" | jq -r '.baseRefName')
           elif [ -n "$BASE_REF" ]; then
@@ -1472,7 +1545,7 @@ jobs:
 
     - name: Fetch PR body script from main
       run: |
-        git fetch origin main:main
+        git fetch --depth=1 --no-tags origin main
         git checkout origin/main -- .github/scripts/create-pr-body-multiarch.sh
         chmod +x .github/scripts/create-pr-body-multiarch.sh
 
@@ -1566,13 +1639,24 @@ jobs:
           --ltp-details "$LTP_DETAILS"
         )
 
+        # In pr_only mode, tell the script to render an abbreviated body
+        # (CI-skipped notice in place of build/test sections). The
+        # build-time / total-time / kselftest-* / ltp-* args become optional
+        # and are not passed in this mode.
+        PR_ONLY="${{ needs.pre-setup.outputs.pr_only }}"
+        if [ "$PR_ONLY" = "true" ]; then
+          SCRIPT_ARGS+=(--ci-skipped)
+        fi
+
         # Add x86_64 architecture if enabled
         if [ "$HAS_X86" = "true" ]; then
-          SCRIPT_ARGS+=(
-            --arch x86_64
-            --build-time "${{ steps.build_info.outputs.build_time_x86_64 }}"
-            --total-time "${{ steps.build_info.outputs.total_time_x86_64 }}"
-          )
+          SCRIPT_ARGS+=(--arch x86_64)
+          if [ "$PR_ONLY" != "true" ]; then
+            SCRIPT_ARGS+=(
+              --build-time "${{ steps.build_info.outputs.build_time_x86_64 }}"
+              --total-time "${{ steps.build_info.outputs.total_time_x86_64 }}"
+            )
+          fi
           # Only add kselftest data if not skipped
           if [ "${{ needs.pre-setup.outputs.skip_kselftests }}" != "true" ]; then
             SCRIPT_ARGS+=(
@@ -1592,11 +1676,13 @@ jobs:
 
         # Add aarch64 architecture if enabled
         if [ "$HAS_ARM" = "true" ]; then
-          SCRIPT_ARGS+=(
-            --arch aarch64
-            --build-time "${{ steps.build_info.outputs.build_time_aarch64 }}"
-            --total-time "${{ steps.build_info.outputs.total_time_aarch64 }}"
-          )
+          SCRIPT_ARGS+=(--arch aarch64)
+          if [ "$PR_ONLY" != "true" ]; then
+            SCRIPT_ARGS+=(
+              --build-time "${{ steps.build_info.outputs.build_time_aarch64 }}"
+              --total-time "${{ steps.build_info.outputs.total_time_aarch64 }}"
+            )
+          fi
           if [ "${{ needs.pre-setup.outputs.skip_kselftests }}" != "true" ]; then
             SCRIPT_ARGS+=(
               --kselftest-passed "${{ steps.stats.outputs.passed_aarch64 }}"
@@ -1667,6 +1753,10 @@ jobs:
           # writing them (artifact download / checksum failure). Fall back to
           # the workflow_run event payload, which is always populated.
           HEAD_REF: ${{ needs.pre-setup.outputs.head_ref || github.event.workflow_run.head_branch }}
+          # head_ref_base is HEAD_REF with any skip-suffix stripped. Fall back
+          # to HEAD_REF when the metadata field is missing (old triggers / infra
+          # failure path), so legacy / non-suffixed branches still extract correctly.
+          HEAD_REF_BASE: ${{ needs.pre-setup.outputs.head_ref_base || needs.pre-setup.outputs.head_ref || github.event.workflow_run.head_branch }}
           HEAD_SHA: ${{ needs.pre-setup.outputs.head_sha || github.event.workflow_run.head_sha }}
           BASE_REF: ${{ needs.pre-setup.outputs.base_ref }}
           KSELFTEST_BASE: ${{ needs.compare-kselftest.outputs.base_branch }}
@@ -1678,7 +1768,7 @@ jobs:
           BASE_BRANCH="$KSELFTEST_BASE"
           [ -z "$BASE_BRANCH" ] && BASE_BRANCH="$LTP_BASE"
           [ -z "$BASE_BRANCH" ] && BASE_BRANCH="$BASE_REF"
-          if [ -z "$BASE_BRANCH" ] && [[ "$HEAD_REF" =~ \{[^}]+\}[_-](.+) ]]; then
+          if [ -z "$BASE_BRANCH" ] && [[ "$HEAD_REF_BASE" =~ \{[^}]+\}[_-](.+) ]]; then
             BASE_BRANCH="${BASH_REMATCH[1]}"
           fi
 
