@@ -233,7 +233,7 @@ static struct wwan_device *wwan_create_dev(struct device *parent)
 		goto done_unlock;
 	}
 
-	wwandev = kzalloc(sizeof(*wwandev), GFP_KERNEL);
+	wwandev = kzalloc_obj(*wwandev, GFP_KERNEL);
 	if (!wwandev) {
 		wwandev = ERR_PTR(-ENOMEM);
 		ida_free(&wwan_dev_ids, id);
@@ -470,7 +470,7 @@ struct wwan_port *wwan_create_port(struct device *parent,
 		goto error_wwandev_remove;
 	}
 
-	port = kzalloc(sizeof(*port), GFP_KERNEL);
+	port = kzalloc_obj(*port, GFP_KERNEL);
 	if (!port) {
 		err = -ENOMEM;
 		ida_free(&minors, minor);

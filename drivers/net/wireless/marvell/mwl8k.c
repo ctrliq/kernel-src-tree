@@ -1182,7 +1182,7 @@ static int mwl8k_rxq_init(struct ieee80211_hw *hw, int index)
 		return -ENOMEM;
 	}
 
-	rxq->buf = kcalloc(MWL8K_RX_DESCS, sizeof(*rxq->buf), GFP_KERNEL);
+	rxq->buf = kzalloc_objs(*rxq->buf, MWL8K_RX_DESCS, GFP_KERNEL);
 	if (rxq->buf == NULL) {
 		dma_free_coherent(&priv->pdev->dev, size, rxq->rxd,
 				  rxq->rxd_dma);
@@ -1474,7 +1474,7 @@ static int mwl8k_txq_init(struct ieee80211_hw *hw, int index)
 		return -ENOMEM;
 	}
 
-	txq->skb = kcalloc(MWL8K_TX_DESCS, sizeof(*txq->skb), GFP_KERNEL);
+	txq->skb = kzalloc_objs(*txq->skb, MWL8K_TX_DESCS, GFP_KERNEL);
 	if (txq->skb == NULL) {
 		dma_free_coherent(&priv->pdev->dev, size, txq->txd,
 				  txq->txd_dma);
@@ -2468,7 +2468,7 @@ static int mwl8k_cmd_get_hw_spec_sta(struct ieee80211_hw *hw)
 	int rc;
 	int i;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -2533,7 +2533,7 @@ static int mwl8k_cmd_get_hw_spec_ap(struct ieee80211_hw *hw)
 	int rc, i;
 	u32 api_version;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -2635,7 +2635,7 @@ static int mwl8k_cmd_set_hw_spec(struct ieee80211_hw *hw)
 	int rc;
 	int i;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -2749,7 +2749,7 @@ static int mwl8k_cmd_get_stat(struct ieee80211_hw *hw,
 	struct mwl8k_cmd_get_stat *cmd;
 	int rc;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -2792,7 +2792,7 @@ mwl8k_cmd_radio_control(struct ieee80211_hw *hw, bool enable, bool force)
 	if (enable == priv->radio_on && !force)
 		return 0;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -2850,7 +2850,7 @@ static int mwl8k_cmd_rf_tx_power(struct ieee80211_hw *hw, int dBm)
 	struct mwl8k_cmd_rf_tx_power *cmd;
 	int rc;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -2891,7 +2891,7 @@ static int mwl8k_cmd_tx_power(struct ieee80211_hw *hw,
 	int rc;
 	int i;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -2944,7 +2944,7 @@ mwl8k_cmd_rf_antenna(struct ieee80211_hw *hw, int antenna, int mask)
 	struct mwl8k_cmd_rf_antenna *cmd;
 	int rc;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -3001,7 +3001,7 @@ static int mwl8k_cmd_set_pre_scan(struct ieee80211_hw *hw)
 	struct mwl8k_cmd_set_pre_scan *cmd;
 	int rc;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -3034,7 +3034,7 @@ mwl8k_cmd_bbp_reg_access(struct ieee80211_hw *hw,
 	struct mwl8k_cmd_bbp_reg_access *cmd;
 	int rc;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -3070,7 +3070,7 @@ mwl8k_cmd_set_post_scan(struct ieee80211_hw *hw, const __u8 *mac)
 	struct mwl8k_cmd_set_post_scan *cmd;
 	int rc;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -3163,7 +3163,7 @@ static int mwl8k_cmd_set_rf_channel(struct ieee80211_hw *hw,
 	struct mwl8k_priv *priv = hw->priv;
 	int rc;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -3249,7 +3249,7 @@ mwl8k_cmd_set_aid(struct ieee80211_hw *hw,
 	u16 prot_mode;
 	int rc;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -3303,7 +3303,7 @@ mwl8k_cmd_set_rate(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 	struct mwl8k_cmd_set_rate *cmd;
 	int rc;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -3337,7 +3337,7 @@ static int mwl8k_cmd_finalize_join(struct ieee80211_hw *hw, void *frame,
 	int payload_len;
 	int rc;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -3375,7 +3375,7 @@ mwl8k_cmd_set_rts_threshold(struct ieee80211_hw *hw, int radio_idx,
 	struct mwl8k_cmd_set_rts_threshold *cmd;
 	int rc;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -3404,7 +3404,7 @@ static int mwl8k_cmd_set_slot(struct ieee80211_hw *hw, bool short_slot_time)
 	struct mwl8k_cmd_set_slot *cmd;
 	int rc;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -3478,7 +3478,7 @@ mwl8k_cmd_set_edca_params(struct ieee80211_hw *hw, __u8 qnum,
 	struct mwl8k_cmd_set_edca_params *cmd;
 	int rc;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -3518,7 +3518,7 @@ static int mwl8k_cmd_set_wmm_mode(struct ieee80211_hw *hw, bool enable)
 	struct mwl8k_cmd_set_wmm_mode *cmd;
 	int rc;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -3550,7 +3550,7 @@ static int mwl8k_cmd_mimo_config(struct ieee80211_hw *hw, __u8 rx, __u8 tx)
 	struct mwl8k_cmd_mimo_config *cmd;
 	int rc;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -3593,7 +3593,7 @@ static int mwl8k_cmd_use_fixed_rate_sta(struct ieee80211_hw *hw)
 	struct mwl8k_cmd_use_fixed_rate_sta *cmd;
 	int rc;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -3633,7 +3633,7 @@ mwl8k_cmd_use_fixed_rate_ap(struct ieee80211_hw *hw, int mcast, int mgmt)
 	struct mwl8k_cmd_use_fixed_rate_ap *cmd;
 	int rc;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -3662,7 +3662,7 @@ static int mwl8k_cmd_enable_sniffer(struct ieee80211_hw *hw, bool enable)
 	struct mwl8k_cmd_enable_sniffer *cmd;
 	int rc;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -3717,7 +3717,7 @@ static int mwl8k_cmd_update_mac_addr(struct ieee80211_hw *hw,
 			mac_type = MWL8K_MAC_TYPE_SECONDARY_AP;
 	}
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -3772,7 +3772,7 @@ static int mwl8k_cmd_set_rateadapt_mode(struct ieee80211_hw *hw, __u16 mode)
 	struct mwl8k_cmd_set_rate_adapt_mode *cmd;
 	int rc;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -3800,7 +3800,7 @@ static int mwl8k_cmd_get_watchdog_bitmap(struct ieee80211_hw *hw, u8 *bitmap)
 	struct mwl8k_cmd_get_watchdog_bitmap *cmd;
 	int rc;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -3889,7 +3889,7 @@ static int mwl8k_cmd_bss_start(struct ieee80211_hw *hw,
 	if (!enable && !(priv->running_bsses & (1 << mwl8k_vif->macid)))
 		return 0;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -3981,7 +3981,7 @@ mwl8k_check_ba(struct ieee80211_hw *hw, struct mwl8k_ampdu_stream *stream,
 	struct mwl8k_cmd_bastream *cmd;
 	int rc;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -4013,7 +4013,7 @@ mwl8k_create_ba(struct ieee80211_hw *hw, struct mwl8k_ampdu_stream *stream,
 	struct mwl8k_cmd_bastream *cmd;
 	int rc;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -4056,7 +4056,7 @@ static void mwl8k_destroy_ba(struct ieee80211_hw *hw,
 {
 	struct mwl8k_cmd_bastream *cmd;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return;
 
@@ -4108,7 +4108,7 @@ static int mwl8k_cmd_set_new_stn_add(struct ieee80211_hw *hw,
 	u32 rates;
 	int rc;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -4146,7 +4146,7 @@ static int mwl8k_cmd_set_new_stn_add_self(struct ieee80211_hw *hw,
 	struct mwl8k_cmd_set_new_stn *cmd;
 	int rc;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -4189,7 +4189,7 @@ static int mwl8k_cmd_set_new_stn_del(struct ieee80211_hw *hw,
 
 	spin_unlock(&priv->stream_lock);
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -4276,7 +4276,7 @@ static int mwl8k_cmd_update_encryption_enable(struct ieee80211_hw *hw,
 	struct mwl8k_cmd_update_encryption *cmd;
 	int rc;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -4345,7 +4345,7 @@ static int mwl8k_cmd_encryption_set_key(struct ieee80211_hw *hw,
 	u8 idx;
 	struct mwl8k_vif *mwl8k_vif = MWL8K_VIF(vif);
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -4402,7 +4402,7 @@ static int mwl8k_cmd_encryption_remove_key(struct ieee80211_hw *hw,
 	int rc;
 	struct mwl8k_vif *mwl8k_vif = MWL8K_VIF(vif);
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -4539,7 +4539,7 @@ static int mwl8k_cmd_update_stadb_add(struct ieee80211_hw *hw,
 	u32 rates;
 	int rc;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
@@ -4578,7 +4578,7 @@ static int mwl8k_cmd_update_stadb_del(struct ieee80211_hw *hw,
 	struct mwl8k_cmd_update_stadb *cmd;
 	int rc;
 
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	cmd = kzalloc_obj(*cmd, GFP_KERNEL);
 	if (cmd == NULL)
 		return -ENOMEM;
 
