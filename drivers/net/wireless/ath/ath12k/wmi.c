@@ -7276,8 +7276,8 @@ static void ath12k_peer_sta_kickout_event(struct ath12k_base *ab, struct sk_buff
 	struct wmi_peer_sta_kickout_arg arg = {};
 	struct ath12k_link_vif *arvif;
 	struct ieee80211_sta *sta;
+	struct ath12k_sta *ahsta;
 	struct ath12k_link_sta *arsta;
-	unsigned int link_id;
 	struct ath12k *ar;
 
 	if (ath12k_pull_peer_sta_kickout_ev(ab, skb, &arg) != 0) {
@@ -7297,34 +7297,16 @@ static void ath12k_peer_sta_kickout_event(struct ath12k_base *ab, struct sk_buff
 		goto exit;
 	}
 
-	arvif = ath12k_mac_get_arvif_by_vdev_id(ab, peer->vdev_id);
+	arvif = arsta->arvif;
 	if (!arvif) {
-		ath12k_warn(ab, "invalid vdev id in peer sta kickout ev %d",
-			    peer->vdev_id);
+		ath12k_warn(ab, "invalid arvif in peer sta kickout ev for STA %pM",
+			    arg.mac_addr);
 		goto exit;
 	}
 
 	ar = arvif->ar;
-
-	if (peer->mlo) {
-		sta = ieee80211_find_sta_by_link_addrs(ath12k_ar_to_hw(ar),
-						       arg.mac_addr,
-						       NULL, &link_id);
-		if (peer->link_id != link_id) {
-			ath12k_warn(ab,
-				    "Spurious quick kickout for MLO STA %pM with invalid link_id, peer: %d, sta: %d\n",
-				    arg.mac_addr, peer->link_id, link_id);
-			goto exit;
-		}
-	} else {
-		sta = ieee80211_find_sta_by_ifaddr(ath12k_ar_to_hw(ar),
-						   arg.mac_addr, NULL);
-	}
-	if (!sta) {
-		ath12k_warn(ab, "Spurious quick kickout for %sSTA %pM\n",
-			    peer->mlo ? "MLO " : "", arg.mac_addr);
-		goto exit;
-	}
+	ahsta = arsta->ahsta;
+	sta = ath12k_ahsta_to_sta(ahsta);
 
 	ath12k_dbg(ab, ATH12K_DBG_WMI,
 		   "peer sta kickout event %pM reason: %d rssi: %d\n",
