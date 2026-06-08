@@ -1221,6 +1221,7 @@ u32 ath12k_pci_read32(struct ath12k_base *ab, u32 offset)
 		ab_pci->pci_ops->release(ab);
 	return val;
 }
+EXPORT_SYMBOL(ath12k_pci_read32);
 
 void ath12k_pci_write32(struct ath12k_base *ab, u32 offset, u32 value)
 {
@@ -1841,6 +1842,7 @@ int ath12k_pci_register_driver(const enum ath12k_device_family device_id,
 
 	return pci_register_driver(pci_driver);
 }
+EXPORT_SYMBOL(ath12k_pci_register_driver);
 
 void ath12k_pci_unregister_driver(const enum ath12k_device_family device_id)
 {
@@ -1851,6 +1853,7 @@ void ath12k_pci_unregister_driver(const enum ath12k_device_family device_id)
 	pci_unregister_driver(&ath12k_pci_family_drivers[device_id]->driver);
 	ath12k_pci_family_drivers[device_id] = NULL;
 }
+EXPORT_SYMBOL(ath12k_pci_unregister_driver);
 
 /* firmware files */
 MODULE_FIRMWARE(ATH12K_FW_DIR "/QCN9274/hw2.0/*");
