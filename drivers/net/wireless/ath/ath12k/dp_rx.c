@@ -166,6 +166,7 @@ out:
 
 	return req_entries - num_remain;
 }
+EXPORT_SYMBOL(ath12k_dp_rx_bufs_replenish);
 
 static int ath12k_dp_rxdma_mon_buf_ring_free(struct ath12k_base *ab,
 					     struct dp_rxdma_mon_ring *rx_ring)
@@ -406,6 +407,7 @@ void ath12k_dp_reo_cmd_free(struct ath12k_dp *dp, void *ctx,
 
 	ath12k_dp_rx_tid_cleanup(dp->ab, &rx_tid->qbuf);
 }
+EXPORT_SYMBOL(ath12k_dp_reo_cmd_free);
 
 static void ath12k_dp_rx_process_reo_cmd_update_rx_queue_list(struct ath12k_dp *dp)
 {
@@ -498,6 +500,7 @@ void ath12k_dp_rx_tid_del_func(struct ath12k_dp *dp, void *ctx,
 free_desc:
 	ath12k_dp_rx_tid_cleanup(ab, &rx_tid->qbuf);
 }
+EXPORT_SYMBOL(ath12k_dp_rx_tid_del_func);
 
 static int ath12k_dp_rx_tid_delete_handler(struct ath12k_base *ab,
 					   struct ath12k_dp_rx_tid_rxq *rx_tid)
@@ -853,6 +856,7 @@ struct sk_buff *ath12k_dp_rx_get_msdu_last_buf(struct sk_buff_head *msdu_list,
 
 	return NULL;
 }
+EXPORT_SYMBOL(ath12k_dp_rx_get_msdu_last_buf);
 
 int ath12k_dp_rx_crypto_mic_len(struct ath12k_dp *dp, enum hal_encrypt_type enctype)
 {
@@ -1150,6 +1154,7 @@ void ath12k_dp_rx_h_undecap(struct ath12k_pdev_dp *dp_pdev, struct sk_buff *msdu
 		break;
 	}
 }
+EXPORT_SYMBOL(ath12k_dp_rx_h_undecap);
 
 struct ath12k_dp_link_peer *
 ath12k_dp_rx_h_find_link_peer(struct ath12k_pdev_dp *dp_pdev, struct sk_buff *msdu,
@@ -1316,6 +1321,7 @@ void ath12k_dp_rx_h_ppdu(struct ath12k_pdev_dp *dp_pdev,
 h_rate:
 	ath12k_dp_rx_h_rate(dp_pdev, rx_info);
 }
+EXPORT_SYMBOL(ath12k_dp_rx_h_ppdu);
 
 void ath12k_dp_rx_deliver_msdu(struct ath12k_pdev_dp *dp_pdev, struct napi_struct *napi,
 			       struct sk_buff *msdu,
@@ -1386,6 +1392,7 @@ void ath12k_dp_rx_deliver_msdu(struct ath12k_pdev_dp *dp_pdev, struct napi_struc
 
 	ieee80211_rx_napi(ath12k_pdev_dp_to_hw(dp_pdev), pubsta, msdu, napi);
 }
+EXPORT_SYMBOL(ath12k_dp_rx_deliver_msdu);
 
 bool ath12k_dp_rx_check_nwifi_hdr_len_valid(struct ath12k_dp *dp,
 					    struct hal_rx_desc *rx_desc,
@@ -1408,6 +1415,7 @@ bool ath12k_dp_rx_check_nwifi_hdr_len_valid(struct ath12k_dp *dp,
 	WARN_ON_ONCE(1);
 	return false;
 }
+EXPORT_SYMBOL(ath12k_dp_rx_check_nwifi_hdr_len_valid);
 
 static void ath12k_dp_rx_frag_timer(struct timer_list *timer)
 {
@@ -1507,6 +1515,7 @@ out:
 	shash_desc_zero(desc);
 	return ret;
 }
+EXPORT_SYMBOL(ath12k_dp_rx_h_michael_mic);
 
 void ath12k_dp_rx_h_undecap_frag(struct ath12k_pdev_dp *dp_pdev, struct sk_buff *msdu,
 				 enum hal_encrypt_type enctype, u32 flags)
@@ -1539,6 +1548,7 @@ void ath12k_dp_rx_h_undecap_frag(struct ath12k_pdev_dp *dp_pdev, struct sk_buff 
 		skb_pull(msdu, crypto_len);
 	}
 }
+EXPORT_SYMBOL(ath12k_dp_rx_h_undecap_frag);
 
 static int ath12k_dp_rx_h_cmp_frags(struct ath12k_base *ab,
 				    struct sk_buff *a, struct sk_buff *b)
@@ -1567,6 +1577,7 @@ void ath12k_dp_rx_h_sort_frags(struct ath12k_base *ab,
 	}
 	__skb_queue_tail(frag_list, cur_frag);
 }
+EXPORT_SYMBOL(ath12k_dp_rx_h_sort_frags);
 
 u64 ath12k_dp_rx_h_get_pn(struct ath12k_dp *dp, struct sk_buff *skb)
 {
@@ -1587,6 +1598,7 @@ u64 ath12k_dp_rx_h_get_pn(struct ath12k_dp *dp, struct sk_buff *skb)
 
 	return pn;
 }
+EXPORT_SYMBOL(ath12k_dp_rx_h_get_pn);
 
 void ath12k_dp_rx_free(struct ath12k_base *ab)
 {
