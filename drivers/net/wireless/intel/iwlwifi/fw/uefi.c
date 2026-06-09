@@ -743,6 +743,8 @@ static int iwl_uefi_load_dsm_values(struct iwl_fw_runtime *fwrt)
 		IWL_DEBUG_RADIO(fwrt, "Invalid size of DSM functions array\n");
 		goto out;
 	}
+	fwrt->dsm_revision = data->revision;
+	fwrt->dsm_source = BIOS_SOURCE_UEFI;
 
 	fwrt->dsm_funcs_valid = data->functions[DSM_FUNC_QUERY];
 
