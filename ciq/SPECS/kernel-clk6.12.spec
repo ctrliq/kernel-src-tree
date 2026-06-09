@@ -163,7 +163,7 @@ Summary: The Linux kernel
 %define debugbuildsenabled 1
 %define el_version 9
 %define kernel_major_minor 6.12
-%define kernel_patch 92
+%define kernel_patch 93
 %define buildid .1
 %define specversion %{kernel_major_minor}.%{kernel_patch}
 %define pkgrelease 1%{?buildid}
@@ -4212,8 +4212,10 @@ fi\
 #
 #
 %changelog
-* Tue Jun 02 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.12.92-1.1.el9
--- Rebased changes for Linux 6.12.92 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.12.92-1)
+* Tue Jun 09 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.12.93-1.1.el9
+-- Rebased changes for Linux 6.12.93 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.12.93-1)
+-- kernel-clk6.12: require ciq-kmod and ship %clk_version macro file (Joseph S. Tate)
+-- [CIQ] v6.12.92 - updated spec (github-actions[bot])
 -- [CIQ] ciq_kernel-6.12.89-2 - updated spec (Brett Mastbergen)
 -- bundle_bindgen: add User-Agent header to crates.io request (Brett Mastbergen)
 -- [CIQ] v6.12.89 - updated spec (Brett Mastbergen)
@@ -4276,7 +4278,7 @@ fi\
 -- arm64: add kernel config option to lock down when in Secure Boot mode (Linn Crosetto)
 -- github actions: Make Builds on Merge Request Work (Jonathan Maple)
 -- Add CIQ configs (Jonathan Maple)
--- Linux 6.12.92 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.12.92)
+-- Linux 6.12.93 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.12.93)
 
 
 ###
