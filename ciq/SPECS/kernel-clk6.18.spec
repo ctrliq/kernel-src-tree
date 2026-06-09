@@ -168,10 +168,10 @@ Summary: The Linux kernel
 %define debugbuildsenabled 1
 %define el_version 9
 %define kernel_major_minor 6.18
-%define kernel_patch 33
+%define kernel_patch 35
 %define buildid .1
 %define specversion %{kernel_major_minor}.%{kernel_patch}
-%define pkgrelease 2%{?buildid}
+%define pkgrelease 1%{?buildid}
 %define kversion %{lua:print((rpm.expand("%{kernel_major_minor}"):match("^(%d+)")))}
 
 %define tarfile_release %{specversion}-%{pkgrelease}.el%{el_version}
@@ -4505,13 +4505,42 @@ fi\
 #
 #
 %changelog
-* Wed May 27 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.33-2.1.el9
+* Tue Jun 09 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.18.35-1.1.el9
+-- Rebased changes for Linux 6.18.35 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.35-1)
+-- Restore CRYPTO_TFM_FIPS_COMPLIANCE flag as an indicator to differentiate between internal and external IV generation when AES-GCM encryption is performed. (Jeremy Allison)
+-- github actions: Add FIPS protected directory check for PRs (Brett Mastbergen)
+-- Unset CRYPTO_JITTERENTROPY_MEMSIZE_2, set CRYPTO_JITTERENTROPY_MEMSIZE_128. (Jeremy Allison)
+-- Add CONFIG_CRYPTO_FIPS_CUSTOM_VERSION=y, CONFIG_CRYPTO_FIPS_VERSION="ciq.6.18.20260531" (Jeremy Allison)
+-- Add fips_approved indicator to struct crypto_aes_ctx. (Jeremy Allison)
+-- Add fips_approved flag to SHA512 and HMAC-SHA512 structs. (Jeremy Allison)
+-- Add fips_approved flag to SHA384 and HMAC-SHA384 structs. (Jeremy Allison)
+-- Add fips_approved flag to SHA256 and HMAC-SHA256 structs. (Jeremy Allison)
+-- Add fips_approved flag to SHA224 and HMAC-SHA224 structs. (Jeremy Allison)
+-- Add fips_approved flag to SHA1 and HMAC-SHA1 structs. (Jeremy Allison)
+-- In crypto_kdf108_ctr_generate() there is no minimum length check for the digest to be generated - it must be at least 112 bits. (Jeremy Allison)
+-- dh_compute_value misses the check SP800-56Arev3, 5.6.2.1.4 which is typically implemented after dh_is_pubkey_valid. (Jeremy Allison)
+-- Change CONFIG_CRYPTO_JITTERENTROPY_OSR from 1 to 3 in all configs. (Jeremy Allison)
+-- When in fips mode, self-test errors must panic. (Jeremy Allison)
+-- When in fips mode, self-test errors must panic. (Jeremy Allison)
+-- crypto: testmgr - block Crypto API xxhash64 in FIPS mode (Jeremy Allison)
+-- btrfs: switch to library APIs for checksums (Jeremy Allison)
+-- lib/crypto: blake2b: Add BLAKE2b library functions (Jeremy Allison)
+-- byteorder: Add le64_to_cpu_array() and cpu_to_le64_array() (Eric Biggers)
+-- lib/crypto: Add FIPS self-tests for SHA-1 and SHA-2 (Eric Biggers)
+-- crypto: rng - Implement fast per-CPU DRBG instances (Sultan Alsawaf)
+-- crypto: rng - Fix priority inversions due to mutex locks (Sultan Alsawaf)
+-- crypto: rng - Convert crypto_default_rng_refcnt into an unsigned int (Sultan Alsawaf)
+-- mm/gup: introduce pin_user_pages_fast_only() (Sultan Alsawaf)
+-- crypto: drbg - Align buffers to at least a cache line (Sultan Alsawaf)
+-- crypto: essiv - Zeroize keys on exit in essiv_aead_setkey() (Jason Rodriguez)
+-- crypto: ecdh - implement FIPS PCT (Jeremy Allison)
+-- not upstream: Disable vdso getrandom when FIPS is enabled (Jeremy Allison)
+-- crypto: rng - Override drivers/char/random in FIPS mode (Jeremy Allison)
+-- random: Add hook to override device reads and getrandom(2) (Jeremy Allison)
+-- kernel-clk6.18: require ciq-kmod and ship %clk_version macro file (Joseph S. Tate)
+-- [CIQ] ciq_kernel-6.18.33-2 - updated spec (Brett Mastbergen)
 -- bundle_bindgen: add User-Agent header to crates.io request (Brett Mastbergen)
-
-* Tue May 26 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.18.33-1.1.el9
--- Rebased changes for Linux 6.18.33 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.33-1)
--- smb: client: reject userspace cifs.spnego descriptions (Shreeya Patel)
--- net: gro: don't merge zcopy skbs (Sabrina Dubroca)
+-- [CIQ] v6.18.33 - updated spec (github-actions[bot])
 -- [CIQ] v6.18.31 - updated spec (github-actions[bot])
 -- [CIQ] ciq_kernel-6.18.28-2 - updated spec (Brett Mastbergen)
 -- [CIQ] v6.18.28 - updated spec (Brett Mastbergen)
@@ -4566,7 +4595,7 @@ fi\
 -- github actions: Make Builds on Merge Request Work (Jonathan Maple)
 -- Add initial CIQ config tweaks (Brett Mastbergen)
 -- Add CIQ configs (Brett Mastbergen)
--- Linux 6.18.33 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.18.33)
+-- Linux 6.18.35 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.18.35)
 
 
 ###
