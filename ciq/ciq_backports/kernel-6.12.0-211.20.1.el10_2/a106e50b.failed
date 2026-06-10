@@ -1,0 +1,510 @@
+Bluetooth: HCI: Add support for LL Extended Feature Set
+
+jira KERNEL-1122
+Rebuild_History Non-Buildable kernel-6.12.0-211.20.1.el10_2
+commit-author Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+commit a106e50be74b0896583f4d010a69f9806e4194f4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.20.1.el10_2/a106e50b.failed
+
+This adds support for emulating LL Extended Feature Set introduced in 6.0
+that adds the following:
+
+Commands:
+
+ - HCI_LE_Read_All_Local_Supported_­Features(0x2087)(Feature:47,1)
+ - HCI_LE_Read_All_Remote_Features(0x2088)(Feature:47,2)
+
+Events:
+
+ - HCI_LE_Read_All_Remote_Features_Complete(0x2b)(Mask bit:42)
+
+	Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+(cherry picked from commit a106e50be74b0896583f4d010a69f9806e4194f4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/bluetooth/hci_sync.h
+#	net/bluetooth/hci_sync.c
+diff --cc include/net/bluetooth/hci_sync.h
+index e352a4e0ef8d,56076bbc981d..000000000000
+--- a/include/net/bluetooth/hci_sync.h
++++ b/include/net/bluetooth/hci_sync.h
+@@@ -188,3 -188,6 +188,9 @@@ int hci_le_conn_update_sync(struct hci_
+  
+  int hci_connect_pa_sync(struct hci_dev *hdev, struct hci_conn *conn);
+  int hci_connect_big_sync(struct hci_dev *hdev, struct hci_conn *conn);
+++<<<<<<< HEAD
+++=======
++ int hci_past_sync(struct hci_conn *conn, struct hci_conn *le);
++ 
++ int hci_le_read_remote_features(struct hci_conn *conn);
+++>>>>>>> a106e50be74b (Bluetooth: HCI: Add support for LL Extended Feature Set)
+diff --cc net/bluetooth/hci_sync.c
+index d181c89a7b0e,a9f5b1a68356..000000000000
+--- a/net/bluetooth/hci_sync.c
++++ b/net/bluetooth/hci_sync.c
+@@@ -7176,3 -7239,182 +7187,185 @@@ int hci_connect_big_sync(struct hci_de
+  	return hci_cmd_sync_queue_once(hdev, hci_le_big_create_sync, conn,
+  				       create_big_complete);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ struct past_data {
++ 	struct hci_conn *conn;
++ 	struct hci_conn *le;
++ };
++ 
++ static void past_complete(struct hci_dev *hdev, void *data, int err)
++ {
++ 	struct past_data *past = data;
++ 
++ 	bt_dev_dbg(hdev, "err %d", err);
++ 
++ 	kfree(past);
++ }
++ 
++ static int hci_le_past_set_info_sync(struct hci_dev *hdev, void *data)
++ {
++ 	struct past_data *past = data;
++ 	struct hci_cp_le_past_set_info cp;
++ 
++ 	hci_dev_lock(hdev);
++ 
++ 	if (!hci_conn_valid(hdev, past->conn) ||
++ 	    !hci_conn_valid(hdev, past->le)) {
++ 		hci_dev_unlock(hdev);
++ 		return -ECANCELED;
++ 	}
++ 
++ 	memset(&cp, 0, sizeof(cp));
++ 	cp.handle = cpu_to_le16(past->le->handle);
++ 	cp.adv_handle = past->conn->iso_qos.bcast.bis;
++ 
++ 	hci_dev_unlock(hdev);
++ 
++ 	return __hci_cmd_sync_status(hdev, HCI_OP_LE_PAST_SET_INFO,
++ 				     sizeof(cp), &cp, HCI_CMD_TIMEOUT);
++ }
++ 
++ static int hci_le_past_sync(struct hci_dev *hdev, void *data)
++ {
++ 	struct past_data *past = data;
++ 	struct hci_cp_le_past cp;
++ 
++ 	hci_dev_lock(hdev);
++ 
++ 	if (!hci_conn_valid(hdev, past->conn) ||
++ 	    !hci_conn_valid(hdev, past->le)) {
++ 		hci_dev_unlock(hdev);
++ 		return -ECANCELED;
++ 	}
++ 
++ 	memset(&cp, 0, sizeof(cp));
++ 	cp.handle = cpu_to_le16(past->le->handle);
++ 	cp.sync_handle = cpu_to_le16(past->conn->sync_handle);
++ 
++ 	hci_dev_unlock(hdev);
++ 
++ 	return __hci_cmd_sync_status(hdev, HCI_OP_LE_PAST,
++ 				     sizeof(cp), &cp, HCI_CMD_TIMEOUT);
++ }
++ 
++ int hci_past_sync(struct hci_conn *conn, struct hci_conn *le)
++ {
++ 	struct past_data *data;
++ 	int err;
++ 
++ 	if (conn->type != BIS_LINK && conn->type != PA_LINK)
++ 		return -EINVAL;
++ 
++ 	if (!past_sender_capable(conn->hdev))
++ 		return -EOPNOTSUPP;
++ 
++ 	data = kmalloc(sizeof(*data), GFP_KERNEL);
++ 	if (!data)
++ 		return -ENOMEM;
++ 
++ 	data->conn = conn;
++ 	data->le = le;
++ 
++ 	if (conn->role == HCI_ROLE_MASTER)
++ 		err = hci_cmd_sync_queue_once(conn->hdev,
++ 					      hci_le_past_set_info_sync, data,
++ 					      past_complete);
++ 	else
++ 		err = hci_cmd_sync_queue_once(conn->hdev, hci_le_past_sync,
++ 					      data, past_complete);
++ 
++ 	if (err)
++ 		kfree(data);
++ 
++ 	return err;
++ }
++ 
++ static void le_read_features_complete(struct hci_dev *hdev, void *data, int err)
++ {
++ 	struct hci_conn *conn = data;
++ 
++ 	bt_dev_dbg(hdev, "err %d", err);
++ 
++ 	if (err == -ECANCELED)
++ 		return;
++ 
++ 	hci_conn_drop(conn);
++ }
++ 
++ static int hci_le_read_all_remote_features_sync(struct hci_dev *hdev,
++ 						void *data)
++ {
++ 	struct hci_conn *conn = data;
++ 	struct hci_cp_le_read_all_remote_features cp;
++ 
++ 	memset(&cp, 0, sizeof(cp));
++ 	cp.handle = cpu_to_le16(conn->handle);
++ 	cp.pages = 10; /* Attempt to read all pages */
++ 
++ 	/* Wait for HCI_EVT_LE_ALL_REMOTE_FEATURES_COMPLETE event otherwise
++ 	 * hci_conn_drop may run prematurely causing a disconnection.
++ 	 */
++ 	return __hci_cmd_sync_status_sk(hdev,
++ 					HCI_OP_LE_READ_ALL_REMOTE_FEATURES,
++ 					sizeof(cp), &cp,
++ 					HCI_EVT_LE_ALL_REMOTE_FEATURES_COMPLETE,
++ 					HCI_CMD_TIMEOUT, NULL);
++ 
++ 	return __hci_cmd_sync_status(hdev, HCI_OP_LE_READ_ALL_REMOTE_FEATURES,
++ 				     sizeof(cp), &cp, HCI_CMD_TIMEOUT);
++ }
++ 
++ static int hci_le_read_remote_features_sync(struct hci_dev *hdev, void *data)
++ {
++ 	struct hci_conn *conn = data;
++ 	struct hci_cp_le_read_remote_features cp;
++ 
++ 	if (!hci_conn_valid(hdev, conn))
++ 		return -ECANCELED;
++ 
++ 	/* Check if LL Extended Feature Set is supported and
++ 	 * HCI_OP_LE_READ_ALL_REMOTE_FEATURES is supported then use that to read
++ 	 * all features.
++ 	 */
++ 	if (ll_ext_feature_capable(hdev) && hdev->commands[47] & BIT(3))
++ 		return hci_le_read_all_remote_features_sync(hdev, data);
++ 
++ 	memset(&cp, 0, sizeof(cp));
++ 	cp.handle = cpu_to_le16(conn->handle);
++ 
++ 	/* Wait for HCI_EV_LE_REMOTE_FEAT_COMPLETE event otherwise
++ 	 * hci_conn_drop may run prematurely causing a disconnection.
++ 	 */
++ 	return __hci_cmd_sync_status_sk(hdev, HCI_OP_LE_READ_REMOTE_FEATURES,
++ 					sizeof(cp), &cp,
++ 					HCI_EV_LE_REMOTE_FEAT_COMPLETE,
++ 					HCI_CMD_TIMEOUT, NULL);
++ }
++ 
++ int hci_le_read_remote_features(struct hci_conn *conn)
++ {
++ 	struct hci_dev *hdev = conn->hdev;
++ 	int err;
++ 
++ 	/* The remote features procedure is defined for central
++ 	 * role only. So only in case of an initiated connection
++ 	 * request the remote features.
++ 	 *
++ 	 * If the local controller supports peripheral-initiated features
++ 	 * exchange, then requesting the remote features in peripheral
++ 	 * role is possible. Otherwise just transition into the
++ 	 * connected state without requesting the remote features.
++ 	 */
++ 	if (conn->out || (hdev->le_features[0] & HCI_LE_PERIPHERAL_FEATURES))
++ 		err = hci_cmd_sync_queue_once(hdev,
++ 					      hci_le_read_remote_features_sync,
++ 					      hci_conn_hold(conn),
++ 					      le_read_features_complete);
++ 	else
++ 		err = -EOPNOTSUPP;
++ 
++ 	return err;
++ }
+++>>>>>>> a106e50be74b (Bluetooth: HCI: Add support for LL Extended Feature Set)
+diff --git a/include/net/bluetooth/hci.h b/include/net/bluetooth/hci.h
+index d883ad233ebc..a27cd3626b87 100644
+--- a/include/net/bluetooth/hci.h
++++ b/include/net/bluetooth/hci.h
+@@ -653,6 +653,7 @@ enum {
+ #define HCI_LE_CIS_PERIPHERAL		0x20
+ #define HCI_LE_ISO_BROADCASTER		0x40
+ #define HCI_LE_ISO_SYNC_RECEIVER	0x80
++#define HCI_LE_LL_EXT_FEATURE		0x80
+ 
+ /* Connection modes */
+ #define HCI_CM_ACTIVE	0x0000
+@@ -2255,6 +2256,19 @@ struct hci_cp_le_set_host_feature {
+ 	__u8     bit_value;
+ } __packed;
+ 
++#define HCI_OP_LE_READ_ALL_LOCAL_FEATURES	0x2087
++struct hci_rp_le_read_all_local_features {
++	__u8    status;
++	__u8    page;
++	__u8    features[248];
++} __packed;
++
++#define HCI_OP_LE_READ_ALL_REMOTE_FEATURES	0x2088
++struct hci_cp_le_read_all_remote_features {
++	__le16	 handle;
++	__u8	 pages;
++} __packed;
++
+ /* ---- HCI Events ---- */
+ struct hci_ev_status {
+ 	__u8    status;
+@@ -2937,6 +2951,15 @@ struct hci_evt_le_big_info_adv_report {
+ 	__u8    encryption;
+ } __packed;
+ 
++#define HCI_EVT_LE_ALL_REMOTE_FEATURES_COMPLETE 0x2b
++struct hci_evt_le_read_all_remote_features_complete {
++	__u8    status;
++	__le16  handle;
++	__u8    max_pages;
++	__u8    valid_pages;
++	__u8    features[248];
++} __packed;
++
+ #define HCI_EV_VENDOR			0xff
+ 
+ /* Internal events generated by Bluetooth stack */
+diff --git a/include/net/bluetooth/hci_core.h b/include/net/bluetooth/hci_core.h
+index 1bd12c303e25..6693ed4119f3 100644
+--- a/include/net/bluetooth/hci_core.h
++++ b/include/net/bluetooth/hci_core.h
+@@ -377,7 +377,7 @@ struct hci_dev {
+ 	__u8		minor_class;
+ 	__u8		max_page;
+ 	__u8		features[HCI_MAX_PAGES][8];
+-	__u8		le_features[8];
++	__u8		le_features[248];
+ 	__u8		le_accept_list_size;
+ 	__u8		le_resolv_list_size;
+ 	__u8		le_num_of_adv_sets;
+@@ -701,6 +701,7 @@ struct hci_conn {
+ 	__u8		attempt;
+ 	__u8		dev_class[3];
+ 	__u8		features[HCI_MAX_PAGES][8];
++	__u8		le_features[248];
+ 	__u16		pkt_type;
+ 	__u16		link_policy;
+ 	__u8		key_type;
+@@ -2065,6 +2066,8 @@ void hci_conn_del_sysfs(struct hci_conn *conn);
+ 	(le_enabled(dev) && past_receiver_capable(dev))
+ #define past_enabled(dev) \
+ 	(past_sender_enabled(dev) || past_receiver_enabled(dev))
++#define ll_ext_feature_capable(dev) \
++	((dev)->le_features[7] & HCI_LE_LL_EXT_FEATURE)
+ 
+ #define mws_transport_config_capable(dev) (((dev)->commands[30] & 0x08) && \
+ 	(!hci_test_quirk((dev), HCI_QUIRK_BROKEN_MWS_TRANSPORT_CONFIG)))
+* Unmerged path include/net/bluetooth/hci_sync.h
+diff --git a/net/bluetooth/hci_event.c b/net/bluetooth/hci_event.c
+index af34c9938509..9ec1ce42365e 100644
+--- a/net/bluetooth/hci_event.c
++++ b/net/bluetooth/hci_event.c
+@@ -2886,12 +2886,8 @@ static void hci_cs_le_read_remote_features(struct hci_dev *hdev, u8 status)
+ 	hci_dev_lock(hdev);
+ 
+ 	conn = hci_conn_hash_lookup_handle(hdev, __le16_to_cpu(cp->handle));
+-	if (conn) {
+-		if (conn->state == BT_CONFIG) {
+-			hci_connect_cfm(conn, status);
+-			hci_conn_drop(conn);
+-		}
+-	}
++	if (conn && conn->state == BT_CONFIG)
++		hci_connect_cfm(conn, status);
+ 
+ 	hci_dev_unlock(hdev);
+ }
+@@ -3914,11 +3910,49 @@ static u8 hci_cc_le_setup_iso_path(struct hci_dev *hdev, void *data,
+ 	return rp->status;
+ }
+ 
++static u8 hci_cc_le_read_all_local_features(struct hci_dev *hdev, void *data,
++					    struct sk_buff *skb)
++{
++	struct hci_rp_le_read_all_local_features *rp = data;
++
++	bt_dev_dbg(hdev, "status 0x%2.2x", rp->status);
++
++	if (rp->status)
++		return rp->status;
++
++	memcpy(hdev->le_features, rp->features, 248);
++
++	return rp->status;
++}
++
+ static void hci_cs_le_create_big(struct hci_dev *hdev, u8 status)
+ {
+ 	bt_dev_dbg(hdev, "status 0x%2.2x", status);
+ }
+ 
++static void hci_cs_le_read_all_remote_features(struct hci_dev *hdev, u8 status)
++{
++	struct hci_cp_le_read_remote_features *cp;
++	struct hci_conn *conn;
++
++	bt_dev_dbg(hdev, "status 0x%2.2x", status);
++
++	if (!status)
++		return;
++
++	cp = hci_sent_cmd_data(hdev, HCI_OP_LE_READ_ALL_REMOTE_FEATURES);
++	if (!cp)
++		return;
++
++	hci_dev_lock(hdev);
++
++	conn = hci_conn_hash_lookup_handle(hdev, __le16_to_cpu(cp->handle));
++	if (conn && conn->state == BT_CONFIG)
++		hci_connect_cfm(conn, status);
++
++	hci_dev_unlock(hdev);
++}
++
+ static u8 hci_cc_set_per_adv_param(struct hci_dev *hdev, void *data,
+ 				   struct sk_buff *skb)
+ {
+@@ -4170,6 +4204,9 @@ static const struct hci_cc {
+ 		  sizeof(struct hci_rp_le_set_cig_params), HCI_MAX_EVENT_SIZE),
+ 	HCI_CC(HCI_OP_LE_SETUP_ISO_PATH, hci_cc_le_setup_iso_path,
+ 	       sizeof(struct hci_rp_le_setup_iso_path)),
++	HCI_CC(HCI_OP_LE_READ_ALL_LOCAL_FEATURES,
++	       hci_cc_le_read_all_local_features,
++	       sizeof(struct hci_rp_le_read_all_local_features)),
+ };
+ 
+ static u8 hci_cc_func(struct hci_dev *hdev, const struct hci_cc *cc,
+@@ -4324,6 +4361,8 @@ static const struct hci_cs {
+ 	HCI_CS(HCI_OP_LE_EXT_CREATE_CONN, hci_cs_le_ext_create_conn),
+ 	HCI_CS(HCI_OP_LE_CREATE_CIS, hci_cs_le_create_cis),
+ 	HCI_CS(HCI_OP_LE_CREATE_BIG, hci_cs_le_create_big),
++	HCI_CS(HCI_OP_LE_READ_ALL_REMOTE_FEATURES,
++	       hci_cs_le_read_all_remote_features),
+ };
+ 
+ static void hci_cmd_status_evt(struct hci_dev *hdev, void *data,
+@@ -5644,6 +5683,7 @@ static void le_conn_complete_evt(struct hci_dev *hdev, u8 status,
+ 	struct hci_conn *conn;
+ 	struct smp_irk *irk;
+ 	u8 addr_type;
++	int err;
+ 
+ 	hci_dev_lock(hdev);
+ 
+@@ -5775,26 +5815,8 @@ static void le_conn_complete_evt(struct hci_dev *hdev, u8 status,
+ 	hci_debugfs_create_conn(conn);
+ 	hci_conn_add_sysfs(conn);
+ 
+-	/* The remote features procedure is defined for central
+-	 * role only. So only in case of an initiated connection
+-	 * request the remote features.
+-	 *
+-	 * If the local controller supports peripheral-initiated features
+-	 * exchange, then requesting the remote features in peripheral
+-	 * role is possible. Otherwise just transition into the
+-	 * connected state without requesting the remote features.
+-	 */
+-	if (conn->out ||
+-	    (hdev->le_features[0] & HCI_LE_PERIPHERAL_FEATURES)) {
+-		struct hci_cp_le_read_remote_features cp;
+-
+-		cp.handle = __cpu_to_le16(conn->handle);
+-
+-		hci_send_cmd(hdev, HCI_OP_LE_READ_REMOTE_FEATURES,
+-			     sizeof(cp), &cp);
+-
+-		hci_conn_hold(conn);
+-	} else {
++	err = hci_le_read_remote_features(conn);
++	if (err) {
+ 		conn->state = BT_CONNECTED;
+ 		hci_connect_cfm(conn, status);
+ 	}
+@@ -6608,7 +6630,6 @@ static void hci_le_remote_feat_complete_evt(struct hci_dev *hdev, void *data,
+ 
+ 			conn->state = BT_CONNECTED;
+ 			hci_connect_cfm(conn, status);
+-			hci_conn_drop(conn);
+ 		}
+ 	}
+ 
+@@ -7186,6 +7207,50 @@ static void hci_le_big_info_adv_report_evt(struct hci_dev *hdev, void *data,
+ 	hci_dev_unlock(hdev);
+ }
+ 
++static void hci_le_read_all_remote_features_evt(struct hci_dev *hdev,
++						void *data, struct sk_buff *skb)
++{
++	struct hci_evt_le_read_all_remote_features_complete *ev = data;
++	struct hci_conn *conn;
++
++	bt_dev_dbg(hdev, "status 0x%2.2x", ev->status);
++
++	hci_dev_lock(hdev);
++
++	conn = hci_conn_hash_lookup_handle(hdev, __le16_to_cpu(ev->handle));
++	if (!conn)
++		goto unlock;
++
++	if (!ev->status)
++		memcpy(conn->le_features, ev->features, 248);
++
++	if (conn->state == BT_CONFIG) {
++		__u8 status;
++
++		/* If the local controller supports peripheral-initiated
++		 * features exchange, but the remote controller does
++		 * not, then it is possible that the error code 0x1a
++		 * for unsupported remote feature gets returned.
++		 *
++		 * In this specific case, allow the connection to
++		 * transition into connected state and mark it as
++		 * successful.
++		 */
++		if (!conn->out &&
++		    ev->status == HCI_ERROR_UNSUPPORTED_REMOTE_FEATURE &&
++		    (hdev->le_features[0] & HCI_LE_PERIPHERAL_FEATURES))
++			status = 0x00;
++		else
++			status = ev->status;
++
++		conn->state = BT_CONNECTED;
++		hci_connect_cfm(conn, status);
++	}
++
++unlock:
++	hci_dev_unlock(hdev);
++}
++
+ #define HCI_LE_EV_VL(_op, _func, _min_len, _max_len) \
+ [_op] = { \
+ 	.func = _func, \
+@@ -7291,6 +7356,12 @@ static const struct hci_le_ev {
+ 		     hci_le_big_info_adv_report_evt,
+ 		     sizeof(struct hci_evt_le_big_info_adv_report),
+ 		     HCI_MAX_EVENT_SIZE),
++	/* [0x2b = HCI_EVT_LE_ALL_REMOTE_FEATURES_COMPLETE] */
++	HCI_LE_EV_VL(HCI_EVT_LE_ALL_REMOTE_FEATURES_COMPLETE,
++		     hci_le_read_all_remote_features_evt,
++		     sizeof(struct
++			    hci_evt_le_read_all_remote_features_complete),
++		     HCI_MAX_EVENT_SIZE),
+ };
+ 
+ static void hci_le_meta_evt(struct hci_dev *hdev, void *data,
+* Unmerged path net/bluetooth/hci_sync.c
