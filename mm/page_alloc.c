@@ -290,6 +290,14 @@ int user_min_free_kbytes = -1;
 static int watermark_boost_factor __read_mostly = 15000;
 static int watermark_scale_factor = 10;
 
+/*
+ * RHEL-ONLY: When set to 1, allows reclaim for __GFP_THISNODE THP allocations,
+ * restoring the behavior prior to the fix that prevents zone_reclaim_mode-like
+ * excessive reclaim on a single NUMA node when other nodes have plenty of free
+ * memory.
+ */
+static int thp_thisnode_reclaim __read_mostly = 1;
+
 /* movable_zone is the "real" zone pages in ZONE_MOVABLE are taken from */
 int movable_zone;
 EXPORT_SYMBOL(movable_zone);
@@ -4214,9 +4222,20 @@ retry:
 		 * allocations to put reclaim pressure on a single node in a
 		 * situation where other nodes might have plenty of available
 		 * memory.
+		 *
+		 * RHEL-ONLY: vm.thp_thisnode_reclaim can override this to
+		 * restore the pre-fix behavior: allow reclaim for THISNODE THP
+		 * allocations, but still fail immediately when compaction was
+		 * skipped (insufficient free base pages) or deferred (recent
+		 * compaction failures at this order).
 		 */
-		if (gfp_has_flags(gfp_mask, __GFP_NORETRY | __GFP_THISNODE))
-			goto nopage;
+		if (gfp_has_flags(gfp_mask, __GFP_NORETRY | __GFP_THISNODE)) {
+			if (!thp_thisnode_reclaim)
+				goto nopage;
+			if (compact_result == COMPACT_SKIPPED ||
+			    compact_result == COMPACT_DEFERRED)
+				goto nopage;
+		}
 
 		/*
 		 * For the initial compaction attempt we have lowered its
@@ -6213,6 +6232,15 @@ static struct ctl_table page_alloc_sysctl_table[] = {
 		.proc_handler	= sysctl_min_slab_ratio_sysctl_handler,
 		.extra1		= SYSCTL_ZERO,
 		.extra2		= SYSCTL_ONE_HUNDRED,
+	},
+	{
+		.procname	= "thp_thisnode_reclaim", //RHEL-ONLY
+		.data		= &thp_thisnode_reclaim,
+		.maxlen		= sizeof(thp_thisnode_reclaim),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
 	},
 #endif
 	{}
