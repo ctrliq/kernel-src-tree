@@ -1,0 +1,253 @@
+Bluetooth: ISO: Add support to bind to trigger PAST
+
+jira KERNEL-1122
+Rebuild_History Non-Buildable kernel-6.12.0-211.20.1.el10_2
+commit-author Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+commit d3413703d5f8b7d1e6f514f9440ed5da1bc30796
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.20.1.el10_2/d3413703.failed
+
+This makes it possible to bind to a different destination address
+after being connected (BT_CONNECTED, BT_CONNECT2) which then triggers
+PAST Sender proceedure to transfer the PA Sync to the destination
+address.
+
+	Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+(cherry picked from commit d3413703d5f8b7d1e6f514f9440ed5da1bc30796)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bluetooth/iso.c
+diff --cc net/bluetooth/iso.c
+index 3c568d3d8ac9,85fa9363b897..000000000000
+--- a/net/bluetooth/iso.c
++++ b/net/bluetooth/iso.c
+@@@ -1023,7 -1017,78 +1017,82 @@@ done
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +static int iso_sock_bind(struct socket *sock, struct sockaddr *addr,
+++=======
++ static struct hci_dev *iso_conn_get_hdev(struct iso_conn *conn)
++ {
++ 	struct hci_dev *hdev = NULL;
++ 
++ 	iso_conn_lock(conn);
++ 	if (conn->hcon)
++ 		hdev = hci_dev_hold(conn->hcon->hdev);
++ 	iso_conn_unlock(conn);
++ 
++ 	return hdev;
++ }
++ 
++ /* Must be called on the locked socket. */
++ static int iso_sock_rebind_bc(struct sock *sk, struct sockaddr_iso *sa,
++ 			      int addr_len)
++ {
++ 	struct hci_dev *hdev;
++ 	struct hci_conn *bis;
++ 	int err;
++ 
++ 	if (sk->sk_type != SOCK_SEQPACKET || !iso_pi(sk)->conn)
++ 		return -EINVAL;
++ 
++ 	/* Check if it is really a Broadcast address being requested */
++ 	if (addr_len != sizeof(*sa) + sizeof(*sa->iso_bc))
++ 		return -EINVAL;
++ 
++ 	/* Check if the address hasn't changed then perhaps only the number of
++ 	 * bis has changed.
++ 	 */
++ 	if (!bacmp(&iso_pi(sk)->dst, &sa->iso_bc->bc_bdaddr) ||
++ 	    !bacmp(&sa->iso_bc->bc_bdaddr, BDADDR_ANY))
++ 		return iso_sock_rebind_bis(sk, sa, addr_len);
++ 
++ 	/* Check if the address type is of LE type */
++ 	if (!bdaddr_type_is_le(sa->iso_bc->bc_bdaddr_type))
++ 		return -EINVAL;
++ 
++ 	hdev = iso_conn_get_hdev(iso_pi(sk)->conn);
++ 	if (!hdev)
++ 		return -EINVAL;
++ 
++ 	bis = iso_pi(sk)->conn->hcon;
++ 
++ 	/* Release the socket before lookups since that requires hci_dev_lock
++ 	 * which shall not be acquired while holding sock_lock for proper
++ 	 * ordering.
++ 	 */
++ 	release_sock(sk);
++ 	hci_dev_lock(bis->hdev);
++ 	lock_sock(sk);
++ 
++ 	if (!iso_pi(sk)->conn || iso_pi(sk)->conn->hcon != bis) {
++ 		/* raced with iso_conn_del() or iso_disconn_sock() */
++ 		err = -ENOTCONN;
++ 		goto unlock;
++ 	}
++ 
++ 	BT_DBG("sk %p %pMR type %u", sk, &sa->iso_bc->bc_bdaddr,
++ 	       sa->iso_bc->bc_bdaddr_type);
++ 
++ 	err = hci_past_bis(bis, &sa->iso_bc->bc_bdaddr,
++ 			   le_addr_type(sa->iso_bc->bc_bdaddr_type));
++ 
++ unlock:
++ 	hci_dev_unlock(hdev);
++ 	hci_dev_put(hdev);
++ 
++ 	return err;
++ }
++ 
++ static int iso_sock_bind(struct socket *sock, struct sockaddr_unsized *addr,
+++>>>>>>> d3413703d5f8 (Bluetooth: ISO: Add support to bind to trigger PAST)
+  			 int addr_len)
+  {
+  	struct sockaddr_iso *sa = (struct sockaddr_iso *)addr;
+diff --git a/include/net/bluetooth/hci_core.h b/include/net/bluetooth/hci_core.h
+index 1bd12c303e25..cec97d8824c8 100644
+--- a/include/net/bluetooth/hci_core.h
++++ b/include/net/bluetooth/hci_core.h
+@@ -1601,6 +1601,7 @@ struct hci_conn *hci_bind_cis(struct hci_dev *hdev, bdaddr_t *dst,
+ struct hci_conn *hci_bind_bis(struct hci_dev *hdev, bdaddr_t *dst, __u8 sid,
+ 			      struct bt_iso_qos *qos,
+ 			      __u8 base_len, __u8 *base, u16 timeout);
++int hci_past_bis(struct hci_conn *conn, bdaddr_t *dst, __u8 dst_type);
+ struct hci_conn *hci_connect_cis(struct hci_dev *hdev, bdaddr_t *dst,
+ 				 __u8 dst_type, struct bt_iso_qos *qos,
+ 				 u16 timeout);
+diff --git a/include/net/bluetooth/hci_sync.h b/include/net/bluetooth/hci_sync.h
+index e352a4e0ef8d..3133f40fa9f9 100644
+--- a/include/net/bluetooth/hci_sync.h
++++ b/include/net/bluetooth/hci_sync.h
+@@ -188,3 +188,4 @@ int hci_le_conn_update_sync(struct hci_dev *hdev, struct hci_conn *conn,
+ 
+ int hci_connect_pa_sync(struct hci_dev *hdev, struct hci_conn *conn);
+ int hci_connect_big_sync(struct hci_dev *hdev, struct hci_conn *conn);
++int hci_past_sync(struct hci_conn *conn, struct hci_conn *le);
+diff --git a/net/bluetooth/hci_conn.c b/net/bluetooth/hci_conn.c
+index 6fc0692abf05..4f9dc1435ccc 100644
+--- a/net/bluetooth/hci_conn.c
++++ b/net/bluetooth/hci_conn.c
+@@ -2245,6 +2245,18 @@ struct hci_conn *hci_bind_bis(struct hci_dev *hdev, bdaddr_t *dst, __u8 sid,
+ 	return conn;
+ }
+ 
++int hci_past_bis(struct hci_conn *conn, bdaddr_t *dst, __u8 dst_type)
++{
++	struct hci_conn *le;
++
++	/* Lookup existing LE connection to rebind to */
++	le = hci_conn_hash_lookup_le(conn->hdev, dst, dst_type);
++	if (!le)
++		return -EINVAL;
++
++	return hci_past_sync(conn, le);
++}
++
+ static void bis_mark_per_adv(struct hci_conn *conn, void *data)
+ {
+ 	struct iso_list_data *d = data;
+diff --git a/net/bluetooth/hci_sync.c b/net/bluetooth/hci_sync.c
+index d181c89a7b0e..7d96e68e3244 100644
+--- a/net/bluetooth/hci_sync.c
++++ b/net/bluetooth/hci_sync.c
+@@ -7176,3 +7176,95 @@ int hci_connect_big_sync(struct hci_dev *hdev, struct hci_conn *conn)
+ 	return hci_cmd_sync_queue_once(hdev, hci_le_big_create_sync, conn,
+ 				       create_big_complete);
+ }
++
++struct past_data {
++	struct hci_conn *conn;
++	struct hci_conn *le;
++};
++
++static void past_complete(struct hci_dev *hdev, void *data, int err)
++{
++	struct past_data *past = data;
++
++	bt_dev_dbg(hdev, "err %d", err);
++
++	kfree(past);
++}
++
++static int hci_le_past_set_info_sync(struct hci_dev *hdev, void *data)
++{
++	struct past_data *past = data;
++	struct hci_cp_le_past_set_info cp;
++
++	hci_dev_lock(hdev);
++
++	if (!hci_conn_valid(hdev, past->conn) ||
++	    !hci_conn_valid(hdev, past->le)) {
++		hci_dev_unlock(hdev);
++		return -ECANCELED;
++	}
++
++	memset(&cp, 0, sizeof(cp));
++	cp.handle = cpu_to_le16(past->le->handle);
++	cp.adv_handle = past->conn->iso_qos.bcast.bis;
++
++	hci_dev_unlock(hdev);
++
++	return __hci_cmd_sync_status(hdev, HCI_OP_LE_PAST_SET_INFO,
++				     sizeof(cp), &cp, HCI_CMD_TIMEOUT);
++}
++
++static int hci_le_past_sync(struct hci_dev *hdev, void *data)
++{
++	struct past_data *past = data;
++	struct hci_cp_le_past cp;
++
++	hci_dev_lock(hdev);
++
++	if (!hci_conn_valid(hdev, past->conn) ||
++	    !hci_conn_valid(hdev, past->le)) {
++		hci_dev_unlock(hdev);
++		return -ECANCELED;
++	}
++
++	memset(&cp, 0, sizeof(cp));
++	cp.handle = cpu_to_le16(past->le->handle);
++	cp.sync_handle = cpu_to_le16(past->conn->sync_handle);
++
++	hci_dev_unlock(hdev);
++
++	return __hci_cmd_sync_status(hdev, HCI_OP_LE_PAST,
++				     sizeof(cp), &cp, HCI_CMD_TIMEOUT);
++}
++
++int hci_past_sync(struct hci_conn *conn, struct hci_conn *le)
++{
++	struct past_data *data;
++	int err;
++
++	if (conn->type != BIS_LINK && conn->type != PA_LINK)
++		return -EINVAL;
++
++	if (!past_sender_capable(conn->hdev))
++		return -EOPNOTSUPP;
++
++	data = kmalloc(sizeof(*data), GFP_KERNEL);
++	if (!data)
++		return -ENOMEM;
++
++	data->conn = conn;
++	data->le = le;
++
++	if (conn->role == HCI_ROLE_MASTER)
++		err = hci_cmd_sync_queue_once(conn->hdev,
++					      hci_le_past_set_info_sync, data,
++					      past_complete);
++	else
++		err = hci_cmd_sync_queue_once(conn->hdev, hci_le_past_sync,
++					      data, past_complete);
++
++	if (err)
++		kfree(data);
++
++	return err;
++}
+* Unmerged path net/bluetooth/iso.c
