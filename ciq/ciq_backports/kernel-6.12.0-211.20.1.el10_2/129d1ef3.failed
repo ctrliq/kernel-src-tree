@@ -1,0 +1,152 @@
+Bluetooth: hci_conn: Fix using conn->le_{tx,rx}_phy as supported PHYs
+
+jira KERNEL-1122
+Rebuild_History Non-Buildable kernel-6.12.0-211.20.1.el10_2
+commit-author Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+commit 129d1ef3c5e60d51678e6359beaba85771a49e46
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.20.1.el10_2/129d1ef3.failed
+
+conn->le_{tx,rx}_phy is not actually a bitfield as it set by
+HCI_EV_LE_PHY_UPDATE_COMPLETE it is actually correspond to the current
+PHY in use not what is supported by the controller, so this introduces
+different fields (conn->le_{tx,rx}_def_phys) to track what PHYs are
+supported by the connection.
+
+Fixes: eab2404ba798 ("Bluetooth: Add BT_PHY socket option")
+	Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+(cherry picked from commit 129d1ef3c5e60d51678e6359beaba85771a49e46)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bluetooth/hci_event.c
+diff --cc net/bluetooth/hci_event.c
+index af34c9938509,58075bf72055..000000000000
+--- a/net/bluetooth/hci_event.c
++++ b/net/bluetooth/hci_event.c
+@@@ -7186,6 -7219,62 +7198,65 @@@ unlock
+  	hci_dev_unlock(hdev);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void hci_le_read_all_remote_features_evt(struct hci_dev *hdev,
++ 						void *data, struct sk_buff *skb)
++ {
++ 	struct hci_evt_le_read_all_remote_features_complete *ev = data;
++ 	struct hci_conn *conn;
++ 
++ 	bt_dev_dbg(hdev, "status 0x%2.2x", ev->status);
++ 
++ 	hci_dev_lock(hdev);
++ 
++ 	conn = hci_conn_hash_lookup_handle(hdev, __le16_to_cpu(ev->handle));
++ 	if (!conn)
++ 		goto unlock;
++ 
++ 	if (!ev->status) {
++ 		memcpy(conn->le_features, ev->features, 248);
++ 
++ 		/* Update supported PHYs */
++ 		if (!(conn->le_features[1] & HCI_LE_PHY_2M)) {
++ 			conn->le_tx_def_phys &= ~HCI_LE_SET_PHY_2M;
++ 			conn->le_rx_def_phys &= ~HCI_LE_SET_PHY_2M;
++ 		}
++ 
++ 		if (!(conn->le_features[1] & HCI_LE_PHY_CODED)) {
++ 			conn->le_tx_def_phys &= ~HCI_LE_SET_PHY_CODED;
++ 			conn->le_rx_def_phys &= ~HCI_LE_SET_PHY_CODED;
++ 		}
++ 	}
++ 
++ 	if (conn->state == BT_CONFIG) {
++ 		__u8 status;
++ 
++ 		/* If the local controller supports peripheral-initiated
++ 		 * features exchange, but the remote controller does
++ 		 * not, then it is possible that the error code 0x1a
++ 		 * for unsupported remote feature gets returned.
++ 		 *
++ 		 * In this specific case, allow the connection to
++ 		 * transition into connected state and mark it as
++ 		 * successful.
++ 		 */
++ 		if (!conn->out &&
++ 		    ev->status == HCI_ERROR_UNSUPPORTED_REMOTE_FEATURE &&
++ 		    (hdev->le_features[0] & HCI_LE_PERIPHERAL_FEATURES))
++ 			status = 0x00;
++ 		else
++ 			status = ev->status;
++ 
++ 		conn->state = BT_CONNECTED;
++ 		hci_connect_cfm(conn, status);
++ 	}
++ 
++ unlock:
++ 	hci_dev_unlock(hdev);
++ }
++ 
+++>>>>>>> 129d1ef3c5e6 (Bluetooth: hci_conn: Fix using conn->le_{tx,rx}_phy as supported PHYs)
+  #define HCI_LE_EV_VL(_op, _func, _min_len, _max_len) \
+  [_op] = { \
+  	.func = _func, \
+diff --git a/include/net/bluetooth/hci_core.h b/include/net/bluetooth/hci_core.h
+index 1bd12c303e25..81b97af280a9 100644
+--- a/include/net/bluetooth/hci_core.h
++++ b/include/net/bluetooth/hci_core.h
+@@ -728,6 +728,8 @@ struct hci_conn {
+ 	__u16		le_per_adv_data_offset;
+ 	__u8		le_adv_phy;
+ 	__u8		le_adv_sec_phy;
++	__u8		le_tx_def_phys;
++	__u8		le_rx_def_phys;
+ 	__u8		le_tx_phy;
+ 	__u8		le_rx_phy;
+ 	__s8		rssi;
+diff --git a/net/bluetooth/hci_conn.c b/net/bluetooth/hci_conn.c
+index 6fc0692abf05..9167a80bcd4b 100644
+--- a/net/bluetooth/hci_conn.c
++++ b/net/bluetooth/hci_conn.c
+@@ -996,6 +996,11 @@ static struct hci_conn *__hci_conn_add(struct hci_dev *hdev, int type, bdaddr_t
+ 		/* conn->src should reflect the local identity address */
+ 		hci_copy_identity_address(hdev, &conn->src, &conn->src_type);
+ 		conn->mtu = hdev->le_mtu ? hdev->le_mtu : hdev->acl_mtu;
++		/* Use the controller supported PHYS as default until the
++		 * remote features are resolved.
++		 */
++		conn->le_tx_def_phys = hdev->le_tx_def_phys;
++		conn->le_rx_def_phys = hdev->le_tx_def_phys;
+ 		break;
+ 	case CIS_LINK:
+ 		/* conn->src should reflect the local identity address */
+@@ -2905,22 +2910,22 @@ u32 hci_conn_get_phy(struct hci_conn *conn)
+ 		break;
+ 
+ 	case LE_LINK:
+-		if (conn->le_tx_phy & HCI_LE_SET_PHY_1M)
++		if (conn->le_tx_def_phys & HCI_LE_SET_PHY_1M)
+ 			phys |= BT_PHY_LE_1M_TX;
+ 
+-		if (conn->le_rx_phy & HCI_LE_SET_PHY_1M)
++		if (conn->le_rx_def_phys & HCI_LE_SET_PHY_1M)
+ 			phys |= BT_PHY_LE_1M_RX;
+ 
+-		if (conn->le_tx_phy & HCI_LE_SET_PHY_2M)
++		if (conn->le_tx_def_phys & HCI_LE_SET_PHY_2M)
+ 			phys |= BT_PHY_LE_2M_TX;
+ 
+-		if (conn->le_rx_phy & HCI_LE_SET_PHY_2M)
++		if (conn->le_rx_def_phys & HCI_LE_SET_PHY_2M)
+ 			phys |= BT_PHY_LE_2M_RX;
+ 
+-		if (conn->le_tx_phy & HCI_LE_SET_PHY_CODED)
++		if (conn->le_tx_def_phys & HCI_LE_SET_PHY_CODED)
+ 			phys |= BT_PHY_LE_CODED_TX;
+ 
+-		if (conn->le_rx_phy & HCI_LE_SET_PHY_CODED)
++		if (conn->le_rx_def_phys & HCI_LE_SET_PHY_CODED)
+ 			phys |= BT_PHY_LE_CODED_RX;
+ 
+ 		break;
+* Unmerged path net/bluetooth/hci_event.c
