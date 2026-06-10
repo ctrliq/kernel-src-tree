@@ -1,0 +1,219 @@
+dpll: add frequency monitoring callback ops
+
+jira KERNEL-1122
+Rebuild_History Non-Buildable kernel-6.12.0-211.20.1.el10_2
+commit-author Ivan Vecera <ivecera@redhat.com>
+commit 15ed91aa84ea7bacef3c24286d5136055b4335a8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.20.1.el10_2/15ed91aa.failed
+
+Add new callback operations for a dpll device:
+- freq_monitor_get(..) - to obtain current state of frequency monitor
+  feature from dpll device,
+- freq_monitor_set(..) - to allow feature configuration.
+
+Add new callback operation for a dpll pin:
+- measured_freq_get(..) - to obtain the measured frequency in mHz.
+
+Obtain the feature state value using the get callback and provide it to
+the user if the device driver implements callbacks. The measured_freq_get
+pin callback is only invoked when the frequency monitor is enabled.
+The freq_monitor_get device callback is required when measured_freq_get
+is provided by the driver.
+
+Execute the set callback upon user requests.
+
+	Reviewed-by: Vadim Fedorenko <vadim.fedorenko@linux.dev>
+	Signed-off-by: Ivan Vecera <ivecera@redhat.com>
+Link: https://patch.msgid.link/20260402184057.1890514-3-ivecera@redhat.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 15ed91aa84ea7bacef3c24286d5136055b4335a8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/dpll.h
+diff --cc include/linux/dpll.h
+index 8862389ed50a,b7277a8b484d..000000000000
+--- a/include/linux/dpll.h
++++ b/include/linux/dpll.h
+@@@ -54,17 -52,12 +54,26 @@@ struct dpll_device_ops 
+  	int (*phase_offset_avg_factor_get)(const struct dpll_device *dpll,
+  					   void *dpll_priv, u32 *factor,
+  					   struct netlink_ext_ack *extack);
+++<<<<<<< HEAD
+ +
+ +	RH_KABI_RESERVE(1)
+ +	RH_KABI_RESERVE(2)
+ +	RH_KABI_RESERVE(3)
+ +	RH_KABI_RESERVE(4)
+ +	RH_KABI_RESERVE(5)
+ +	RH_KABI_RESERVE(6)
+ +	RH_KABI_RESERVE(7)
+ +	RH_KABI_RESERVE(8)
+ +	RH_KABI_RESERVE(9)
+ +	RH_KABI_RESERVE(10)
+++=======
++ 	int (*freq_monitor_set)(const struct dpll_device *dpll, void *dpll_priv,
++ 				enum dpll_feature_state state,
++ 				struct netlink_ext_ack *extack);
++ 	int (*freq_monitor_get)(const struct dpll_device *dpll, void *dpll_priv,
++ 				enum dpll_feature_state *state,
++ 				struct netlink_ext_ack *extack);
+++>>>>>>> 15ed91aa84ea (dpll: add frequency monitoring callback ops)
+  };
+  
+  struct dpll_pin_ops {
+diff --git a/drivers/dpll/dpll_core.c b/drivers/dpll/dpll_core.c
+index 842f7334db4d..84e1b637b4e5 100644
+--- a/drivers/dpll/dpll_core.c
++++ b/drivers/dpll/dpll_core.c
+@@ -880,7 +880,10 @@ dpll_pin_register(struct dpll_device *dpll, struct dpll_pin *pin,
+ 
+ 	if (WARN_ON(!ops) ||
+ 	    WARN_ON(!ops->state_on_dpll_get) ||
+-	    WARN_ON(!ops->direction_get))
++	    WARN_ON(!ops->direction_get) ||
++	    WARN_ON(ops->measured_freq_get &&
++		    (!dpll_device_ops(dpll)->freq_monitor_get ||
++		     !dpll_device_ops(dpll)->freq_monitor_set)))
+ 		return -EINVAL;
+ 
+ 	mutex_lock(&dpll_lock);
+diff --git a/drivers/dpll/dpll_netlink.c b/drivers/dpll/dpll_netlink.c
+index 83cbd64abf5a..af7ce62ec55c 100644
+--- a/drivers/dpll/dpll_netlink.c
++++ b/drivers/dpll/dpll_netlink.c
+@@ -175,6 +175,26 @@ dpll_msg_add_phase_offset_monitor(struct sk_buff *msg, struct dpll_device *dpll,
+ 	return 0;
+ }
+ 
++static int
++dpll_msg_add_freq_monitor(struct sk_buff *msg, struct dpll_device *dpll,
++			  struct netlink_ext_ack *extack)
++{
++	const struct dpll_device_ops *ops = dpll_device_ops(dpll);
++	enum dpll_feature_state state;
++	int ret;
++
++	if (ops->freq_monitor_set && ops->freq_monitor_get) {
++		ret = ops->freq_monitor_get(dpll, dpll_priv(dpll),
++					    &state, extack);
++		if (ret)
++			return ret;
++		if (nla_put_u32(msg, DPLL_A_FREQUENCY_MONITOR, state))
++			return -EMSGSIZE;
++	}
++
++	return 0;
++}
++
+ static int
+ dpll_msg_add_phase_offset_avg_factor(struct sk_buff *msg,
+ 				     struct dpll_device *dpll,
+@@ -400,6 +420,38 @@ static int dpll_msg_add_ffo(struct sk_buff *msg, struct dpll_pin *pin,
+ 			    ffo);
+ }
+ 
++static int dpll_msg_add_measured_freq(struct sk_buff *msg, struct dpll_pin *pin,
++				      struct dpll_pin_ref *ref,
++				      struct netlink_ext_ack *extack)
++{
++	const struct dpll_device_ops *dev_ops = dpll_device_ops(ref->dpll);
++	const struct dpll_pin_ops *ops = dpll_pin_ops(ref);
++	struct dpll_device *dpll = ref->dpll;
++	enum dpll_feature_state state;
++	u64 measured_freq;
++	int ret;
++
++	if (!ops->measured_freq_get)
++		return 0;
++	ret = dev_ops->freq_monitor_get(dpll, dpll_priv(dpll),
++					&state, extack);
++	if (ret)
++		return ret;
++	if (state == DPLL_FEATURE_STATE_DISABLE)
++		return 0;
++	ret = ops->measured_freq_get(pin, dpll_pin_on_dpll_priv(dpll, pin),
++				    dpll, dpll_priv(dpll), &measured_freq,
++				    extack);
++	if (ret)
++		return ret;
++	if (nla_put_64bit(msg, DPLL_A_PIN_MEASURED_FREQUENCY,
++			  sizeof(measured_freq), &measured_freq,
++			  DPLL_A_PIN_PAD))
++		return -EMSGSIZE;
++
++	return 0;
++}
++
+ static int
+ dpll_msg_add_pin_freq(struct sk_buff *msg, struct dpll_pin *pin,
+ 		      struct dpll_pin_ref *ref, struct netlink_ext_ack *extack)
+@@ -670,6 +722,9 @@ dpll_cmd_pin_get_one(struct sk_buff *msg, struct dpll_pin *pin,
+ 	if (ret)
+ 		return ret;
+ 	ret = dpll_msg_add_ffo(msg, pin, ref, extack);
++	if (ret)
++		return ret;
++	ret = dpll_msg_add_measured_freq(msg, pin, ref, extack);
+ 	if (ret)
+ 		return ret;
+ 	ret = dpll_msg_add_pin_esync(msg, pin, ref, extack);
+@@ -722,6 +777,9 @@ dpll_device_get_one(struct dpll_device *dpll, struct sk_buff *msg,
+ 	if (ret)
+ 		return ret;
+ 	ret = dpll_msg_add_phase_offset_avg_factor(msg, dpll, extack);
++	if (ret)
++		return ret;
++	ret = dpll_msg_add_freq_monitor(msg, dpll, extack);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -948,6 +1006,32 @@ dpll_phase_offset_avg_factor_set(struct dpll_device *dpll, struct nlattr *a,
+ 						extack);
+ }
+ 
++static int
++dpll_freq_monitor_set(struct dpll_device *dpll, struct nlattr *a,
++		      struct netlink_ext_ack *extack)
++{
++	const struct dpll_device_ops *ops = dpll_device_ops(dpll);
++	enum dpll_feature_state state = nla_get_u32(a), old_state;
++	int ret;
++
++	if (!(ops->freq_monitor_set && ops->freq_monitor_get)) {
++		NL_SET_ERR_MSG_ATTR(extack, a,
++				    "dpll device not capable of frequency monitor");
++		return -EOPNOTSUPP;
++	}
++	ret = ops->freq_monitor_get(dpll, dpll_priv(dpll), &old_state,
++				    extack);
++	if (ret) {
++		NL_SET_ERR_MSG(extack,
++			       "unable to get current state of frequency monitor");
++		return ret;
++	}
++	if (state == old_state)
++		return 0;
++
++	return ops->freq_monitor_set(dpll, dpll_priv(dpll), state, extack);
++}
++
+ static int
+ dpll_pin_freq_set(struct dpll_pin *pin, struct nlattr *a,
+ 		  struct netlink_ext_ack *extack)
+@@ -1878,6 +1962,12 @@ dpll_set_from_nlattr(struct dpll_device *dpll, struct genl_info *info)
+ 			if (ret)
+ 				return ret;
+ 			break;
++		case DPLL_A_FREQUENCY_MONITOR:
++			ret = dpll_freq_monitor_set(dpll, a,
++						    info->extack);
++			if (ret)
++				return ret;
++			break;
+ 		}
+ 	}
+ 
+* Unmerged path include/linux/dpll.h
