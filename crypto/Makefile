@@ -147,7 +147,8 @@ obj-$(CONFIG_CRYPTO_KHAZAD) += khazad.o
 obj-$(CONFIG_CRYPTO_ANUBIS) += anubis.o
 obj-$(CONFIG_CRYPTO_SEED) += seed.o
 obj-$(CONFIG_CRYPTO_ARIA) += aria_generic.o
-obj-$(CONFIG_CRYPTO_CHACHA20) += chacha.o
+chacha_generic-y += chacha.o                        # Use old name in RHEL10
+obj-$(CONFIG_CRYPTO_CHACHA20) += chacha_generic.o
 CFLAGS_chacha.o += -DARCH=$(ARCH)
 obj-$(CONFIG_CRYPTO_POLY1305) += poly1305.o
 CFLAGS_poly1305.o += -DARCH=$(ARCH)
