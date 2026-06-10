@@ -2869,6 +2869,31 @@ static void hci_cs_le_ext_create_conn(struct hci_dev *hdev, u8 status)
 	hci_dev_unlock(hdev);
 }
 
+static void hci_cs_le_set_phy(struct hci_dev *hdev, u8 status)
+{
+	struct hci_cp_le_set_phy *cp;
+	struct hci_conn *conn;
+
+	bt_dev_dbg(hdev, "status 0x%2.2x", status);
+
+	if (status)
+		return;
+
+	cp = hci_sent_cmd_data(hdev, HCI_OP_LE_SET_PHY);
+	if (!cp)
+		return;
+
+	hci_dev_lock(hdev);
+
+	conn = hci_conn_hash_lookup_handle(hdev, __le16_to_cpu(cp->handle));
+	if (conn) {
+		conn->le_tx_def_phys = cp->tx_phys;
+		conn->le_rx_def_phys = cp->rx_phys;
+	}
+
+	hci_dev_unlock(hdev);
+}
+
 static void hci_cs_le_read_remote_features(struct hci_dev *hdev, u8 status)
 {
 	struct hci_cp_le_read_remote_features *cp;
@@ -2886,12 +2911,8 @@ static void hci_cs_le_read_remote_features(struct hci_dev *hdev, u8 status)
 	hci_dev_lock(hdev);
 
 	conn = hci_conn_hash_lookup_handle(hdev, __le16_to_cpu(cp->handle));
-	if (conn) {
-		if (conn->state == BT_CONFIG) {
-			hci_connect_cfm(conn, status);
-			hci_conn_drop(conn);
-		}
-	}
+	if (conn && conn->state == BT_CONFIG)
+		hci_connect_cfm(conn, status);
 
 	hci_dev_unlock(hdev);
 }
@@ -3914,9 +3935,47 @@ unlock:
 	return rp->status;
 }
 
+static u8 hci_cc_le_read_all_local_features(struct hci_dev *hdev, void *data,
+					    struct sk_buff *skb)
+{
+	struct hci_rp_le_read_all_local_features *rp = data;
+
+	bt_dev_dbg(hdev, "status 0x%2.2x", rp->status);
+
+	if (rp->status)
+		return rp->status;
+
+	memcpy(hdev->le_features, rp->features, 248);
+
+	return rp->status;
+}
+
 static void hci_cs_le_create_big(struct hci_dev *hdev, u8 status)
 {
 	bt_dev_dbg(hdev, "status 0x%2.2x", status);
+}
+
+static void hci_cs_le_read_all_remote_features(struct hci_dev *hdev, u8 status)
+{
+	struct hci_cp_le_read_remote_features *cp;
+	struct hci_conn *conn;
+
+	bt_dev_dbg(hdev, "status 0x%2.2x", status);
+
+	if (!status)
+		return;
+
+	cp = hci_sent_cmd_data(hdev, HCI_OP_LE_READ_ALL_REMOTE_FEATURES);
+	if (!cp)
+		return;
+
+	hci_dev_lock(hdev);
+
+	conn = hci_conn_hash_lookup_handle(hdev, __le16_to_cpu(cp->handle));
+	if (conn && conn->state == BT_CONFIG)
+		hci_connect_cfm(conn, status);
+
+	hci_dev_unlock(hdev);
 }
 
 static u8 hci_cc_set_per_adv_param(struct hci_dev *hdev, void *data,
@@ -4170,6 +4229,9 @@ static const struct hci_cc {
 		  sizeof(struct hci_rp_le_set_cig_params), HCI_MAX_EVENT_SIZE),
 	HCI_CC(HCI_OP_LE_SETUP_ISO_PATH, hci_cc_le_setup_iso_path,
 	       sizeof(struct hci_rp_le_setup_iso_path)),
+	HCI_CC(HCI_OP_LE_READ_ALL_LOCAL_FEATURES,
+	       hci_cc_le_read_all_local_features,
+	       sizeof(struct hci_rp_le_read_all_local_features)),
 };
 
 static u8 hci_cc_func(struct hci_dev *hdev, const struct hci_cc *cc,
@@ -4321,9 +4383,12 @@ static const struct hci_cs {
 	HCI_CS(HCI_OP_LE_CREATE_CONN, hci_cs_le_create_conn),
 	HCI_CS(HCI_OP_LE_READ_REMOTE_FEATURES, hci_cs_le_read_remote_features),
 	HCI_CS(HCI_OP_LE_START_ENC, hci_cs_le_start_enc),
+	HCI_CS(HCI_OP_LE_SET_PHY, hci_cs_le_set_phy),
 	HCI_CS(HCI_OP_LE_EXT_CREATE_CONN, hci_cs_le_ext_create_conn),
 	HCI_CS(HCI_OP_LE_CREATE_CIS, hci_cs_le_create_cis),
 	HCI_CS(HCI_OP_LE_CREATE_BIG, hci_cs_le_create_big),
+	HCI_CS(HCI_OP_LE_READ_ALL_REMOTE_FEATURES,
+	       hci_cs_le_read_all_remote_features),
 };
 
 static void hci_cmd_status_evt(struct hci_dev *hdev, void *data,
@@ -5644,6 +5709,7 @@ static void le_conn_complete_evt(struct hci_dev *hdev, u8 status,
 	struct hci_conn *conn;
 	struct smp_irk *irk;
 	u8 addr_type;
+	int err;
 
 	hci_dev_lock(hdev);
 
@@ -5775,26 +5841,8 @@ static void le_conn_complete_evt(struct hci_dev *hdev, u8 status,
 	hci_debugfs_create_conn(conn);
 	hci_conn_add_sysfs(conn);
 
-	/* The remote features procedure is defined for central
-	 * role only. So only in case of an initiated connection
-	 * request the remote features.
-	 *
-	 * If the local controller supports peripheral-initiated features
-	 * exchange, then requesting the remote features in peripheral
-	 * role is possible. Otherwise just transition into the
-	 * connected state without requesting the remote features.
-	 */
-	if (conn->out ||
-	    (hdev->le_features[0] & HCI_LE_PERIPHERAL_FEATURES)) {
-		struct hci_cp_le_read_remote_features cp;
-
-		cp.handle = __cpu_to_le16(conn->handle);
-
-		hci_send_cmd(hdev, HCI_OP_LE_READ_REMOTE_FEATURES,
-			     sizeof(cp), &cp);
-
-		hci_conn_hold(conn);
-	} else {
+	err = hci_le_read_remote_features(conn);
+	if (err) {
 		conn->state = BT_CONNECTED;
 		hci_connect_cfm(conn, status);
 	}
@@ -6585,8 +6633,20 @@ static void hci_le_remote_feat_complete_evt(struct hci_dev *hdev, void *data,
 
 	conn = hci_conn_hash_lookup_handle(hdev, __le16_to_cpu(ev->handle));
 	if (conn) {
-		if (!ev->status)
-			memcpy(conn->features[0], ev->features, 8);
+		if (!ev->status) {
+			memcpy(conn->le_features, ev->features, 8);
+
+			/* Update supported PHYs */
+			if (!(conn->le_features[1] & HCI_LE_PHY_2M)) {
+				conn->le_tx_def_phys &= ~HCI_LE_SET_PHY_2M;
+				conn->le_rx_def_phys &= ~HCI_LE_SET_PHY_2M;
+			}
+
+			if (!(conn->le_features[1] & HCI_LE_PHY_CODED)) {
+				conn->le_tx_def_phys &= ~HCI_LE_SET_PHY_CODED;
+				conn->le_rx_def_phys &= ~HCI_LE_SET_PHY_CODED;
+			}
+		}
 
 		if (conn->state == BT_CONFIG) {
 			__u8 status;
@@ -6608,7 +6668,6 @@ static void hci_le_remote_feat_complete_evt(struct hci_dev *hdev, void *data,
 
 			conn->state = BT_CONNECTED;
 			hci_connect_cfm(conn, status);
-			hci_conn_drop(conn);
 		}
 	}
 
@@ -7186,6 +7245,62 @@ unlock:
 	hci_dev_unlock(hdev);
 }
 
+static void hci_le_read_all_remote_features_evt(struct hci_dev *hdev,
+						void *data, struct sk_buff *skb)
+{
+	struct hci_evt_le_read_all_remote_features_complete *ev = data;
+	struct hci_conn *conn;
+
+	bt_dev_dbg(hdev, "status 0x%2.2x", ev->status);
+
+	hci_dev_lock(hdev);
+
+	conn = hci_conn_hash_lookup_handle(hdev, __le16_to_cpu(ev->handle));
+	if (!conn)
+		goto unlock;
+
+	if (!ev->status) {
+		memcpy(conn->le_features, ev->features, 248);
+
+		/* Update supported PHYs */
+		if (!(conn->le_features[1] & HCI_LE_PHY_2M)) {
+			conn->le_tx_def_phys &= ~HCI_LE_SET_PHY_2M;
+			conn->le_rx_def_phys &= ~HCI_LE_SET_PHY_2M;
+		}
+
+		if (!(conn->le_features[1] & HCI_LE_PHY_CODED)) {
+			conn->le_tx_def_phys &= ~HCI_LE_SET_PHY_CODED;
+			conn->le_rx_def_phys &= ~HCI_LE_SET_PHY_CODED;
+		}
+	}
+
+	if (conn->state == BT_CONFIG) {
+		__u8 status;
+
+		/* If the local controller supports peripheral-initiated
+		 * features exchange, but the remote controller does
+		 * not, then it is possible that the error code 0x1a
+		 * for unsupported remote feature gets returned.
+		 *
+		 * In this specific case, allow the connection to
+		 * transition into connected state and mark it as
+		 * successful.
+		 */
+		if (!conn->out &&
+		    ev->status == HCI_ERROR_UNSUPPORTED_REMOTE_FEATURE &&
+		    (hdev->le_features[0] & HCI_LE_PERIPHERAL_FEATURES))
+			status = 0x00;
+		else
+			status = ev->status;
+
+		conn->state = BT_CONNECTED;
+		hci_connect_cfm(conn, status);
+	}
+
+unlock:
+	hci_dev_unlock(hdev);
+}
+
 #define HCI_LE_EV_VL(_op, _func, _min_len, _max_len) \
 [_op] = { \
 	.func = _func, \
@@ -7290,6 +7405,12 @@ static const struct hci_le_ev {
 	HCI_LE_EV_VL(HCI_EVT_LE_BIG_INFO_ADV_REPORT,
 		     hci_le_big_info_adv_report_evt,
 		     sizeof(struct hci_evt_le_big_info_adv_report),
+		     HCI_MAX_EVENT_SIZE),
+	/* [0x2b = HCI_EVT_LE_ALL_REMOTE_FEATURES_COMPLETE] */
+	HCI_LE_EV_VL(HCI_EVT_LE_ALL_REMOTE_FEATURES_COMPLETE,
+		     hci_le_read_all_remote_features_evt,
+		     sizeof(struct
+			    hci_evt_le_read_all_remote_features_complete),
 		     HCI_MAX_EVENT_SIZE),
 };
 

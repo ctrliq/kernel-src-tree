@@ -653,6 +653,7 @@ enum {
 #define HCI_LE_CIS_PERIPHERAL		0x20
 #define HCI_LE_ISO_BROADCASTER		0x40
 #define HCI_LE_ISO_SYNC_RECEIVER	0x80
+#define HCI_LE_LL_EXT_FEATURE		0x80
 
 /* Connection modes */
 #define HCI_CM_ACTIVE	0x0000
@@ -1882,6 +1883,15 @@ struct hci_cp_le_set_default_phy {
 #define HCI_LE_SET_PHY_2M		0x02
 #define HCI_LE_SET_PHY_CODED		0x04
 
+#define HCI_OP_LE_SET_PHY		0x2032
+struct hci_cp_le_set_phy {
+	__le16  handle;
+	__u8    all_phys;
+	__u8    tx_phys;
+	__u8    rx_phys;
+	__le16   phy_opts;
+} __packed;
+
 #define HCI_OP_LE_SET_EXT_SCAN_PARAMS   0x2041
 struct hci_cp_le_set_ext_scan_params {
 	__u8    own_addr_type;
@@ -2253,6 +2263,19 @@ struct hci_rp_le_setup_iso_path {
 struct hci_cp_le_set_host_feature {
 	__u8     bit_number;
 	__u8     bit_value;
+} __packed;
+
+#define HCI_OP_LE_READ_ALL_LOCAL_FEATURES	0x2087
+struct hci_rp_le_read_all_local_features {
+	__u8    status;
+	__u8    page;
+	__u8    features[248];
+} __packed;
+
+#define HCI_OP_LE_READ_ALL_REMOTE_FEATURES	0x2088
+struct hci_cp_le_read_all_remote_features {
+	__le16	 handle;
+	__u8	 pages;
 } __packed;
 
 /* ---- HCI Events ---- */
@@ -2935,6 +2958,15 @@ struct hci_evt_le_big_info_adv_report {
 	__u8    phy;
 	__u8    framing;
 	__u8    encryption;
+} __packed;
+
+#define HCI_EVT_LE_ALL_REMOTE_FEATURES_COMPLETE 0x2b
+struct hci_evt_le_read_all_remote_features_complete {
+	__u8    status;
+	__le16  handle;
+	__u8    max_pages;
+	__u8    valid_pages;
+	__u8    features[248];
 } __packed;
 
 #define HCI_EV_VENDOR			0xff
