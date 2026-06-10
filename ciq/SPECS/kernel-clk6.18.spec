@@ -171,7 +171,7 @@ Summary: The Linux kernel
 %define kernel_patch 35
 %define buildid .1
 %define specversion %{kernel_major_minor}.%{kernel_patch}
-%define pkgrelease 1%{?buildid}
+%define pkgrelease 2%{?buildid}
 %define kversion %{lua:print((rpm.expand("%{kernel_major_minor}"):match("^(%d+)")))}
 
 %define tarfile_release %{specversion}-%{pkgrelease}.el%{el_version}
@@ -4505,6 +4505,13 @@ fi\
 #
 #
 %changelog
+* Wed Jun 10 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.35-2.1.el9
+-- arm64: errata: Mitigate TLBI errata on Microsoft Azure Cobalt 100 CPU (Brett Mastbergen)
+-- arm64: errata: Mitigate TLBI errata on NVIDIA Olympus CPU (Brett Mastbergen)
+-- arm64: errata: Mitigate TLBI errata on various Arm CPUs (Brett Mastbergen)
+-- arm64: cputype: Add C1-Premium definitions (Brett Mastbergen)
+-- arm64: cputype: Add C1-Ultra definitions (Brett Mastbergen)
+
 * Tue Jun 09 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.18.35-1.1.el9
 -- Rebased changes for Linux 6.18.35 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.35-1)
 -- Restore CRYPTO_TFM_FIPS_COMPLIANCE flag as an indicator to differentiate between internal and external IV generation when AES-GCM encryption is performed. (Jeremy Allison)
