@@ -544,7 +544,7 @@ void do_secure_storage_access(struct pt_regs *regs)
 		mmap_read_unlock(mm);
 		break;
 	case KERNEL_FAULT:
-		page = phys_to_page(addr);
+		page = virt_to_head_page((void *)addr);
 		if (unlikely(!try_get_page(page)))
 			break;
 
