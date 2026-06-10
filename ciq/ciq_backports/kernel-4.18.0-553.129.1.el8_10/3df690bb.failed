@@ -1,0 +1,203 @@
+smb: client: fix OOB reads parsing symlink error response
+
+jira KERNEL-1129
+cve CVE-2026-31613
+Rebuild_History Non-Buildable kernel-4.18.0-553.129.1.el8_10
+commit-author Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+commit 3df690bba28edec865cf7190be10708ad0ddd67e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.129.1.el8_10/3df690bb.failed
+
+When a CREATE returns STATUS_STOPPED_ON_SYMLINK, smb2_check_message()
+returns success without any length validation, leaving the symlink
+parsers as the only defense against an untrusted server.
+
+symlink_data() walks SMB 3.1.1 error contexts with the loop test "p <
+end", but reads p->ErrorId at offset 4 and p->ErrorDataLength at offset
+0.  When the server-controlled ErrorDataLength advances p to within 1-7
+bytes of end, the next iteration will read past it.  When the matching
+context is found, sym->SymLinkErrorTag is read at offset 4 from
+p->ErrorContextData with no check that the symlink header itself fits.
+
+smb2_parse_symlink_response() then bounds-checks the substitute name
+using SMB2_SYMLINK_STRUCT_SIZE as the offset of PathBuffer from
+iov_base.  That value is computed as sizeof(smb2_err_rsp) +
+sizeof(smb2_symlink_err_rsp), which is correct only when
+ErrorContextCount == 0.
+
+With at least one error context the symlink data sits 8 bytes deeper,
+and each skipped non-matching context shifts it further by 8 +
+ALIGN(ErrorDataLength, 8).  The check is too short, allowing the
+substitute name read to run past iov_len.  The out-of-bound heap bytes
+are UTF-16-decoded into the symlink target and returned to userspace via
+readlink(2).
+
+Fix this all up by making the loops test require the full context header
+to fit, rejecting sym if its header runs past end, and bound the
+substitute name against the actual position of sym->PathBuffer rather
+than a fixed offset.
+
+Because sub_offs and sub_len are 16bits, the pointer math will not
+overflow here with the new greater-than.
+
+	Cc: Ronnie Sahlberg <ronniesahlberg@gmail.com>
+	Cc: Shyam Prasad N <sprasad@microsoft.com>
+	Cc: Tom Talpey <tom@talpey.com>
+	Cc: Bharath SM <bharathsm@microsoft.com>
+	Cc: linux-cifs@vger.kernel.org
+	Cc: samba-technical@lists.samba.org
+	Cc: stable <stable@kernel.org>
+	Reviewed-by: Paulo Alcantara (Red Hat) <pc@manguebit.org>
+Assisted-by: gregkh_clanker_t1000
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 3df690bba28edec865cf7190be10708ad0ddd67e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/smb2file.c
+diff --cc fs/cifs/smb2file.c
+index 9dfd2dd612c2,b292aa94a593..000000000000
+--- a/fs/cifs/smb2file.c
++++ b/fs/cifs/smb2file.c
+@@@ -20,10 -20,132 +20,136 @@@
+  #include "cifs_unicode.h"
+  #include "fscache.h"
+  #include "smb2proto.h"
+ -#include "../common/smb2status.h"
+ -#include "../common/smbfsctl.h"
+  
+++<<<<<<< HEAD:fs/cifs/smb2file.c
+ +int
+ +smb2_open_file(const unsigned int xid, struct cifs_open_parms *oparms,
+ +	       __u32 *oplock, FILE_ALL_INFO *buf)
+++=======
++ static struct smb2_symlink_err_rsp *symlink_data(const struct kvec *iov)
++ {
++ 	struct smb2_err_rsp *err = iov->iov_base;
++ 	struct smb2_symlink_err_rsp *sym = ERR_PTR(-EINVAL);
++ 	u8 *end = (u8 *)err + iov->iov_len;
++ 	u32 len;
++ 
++ 	if (err->ErrorContextCount) {
++ 		struct smb2_error_context_rsp *p;
++ 
++ 		len = (u32)err->ErrorContextCount * (offsetof(struct smb2_error_context_rsp,
++ 							      ErrorContextData) +
++ 						     sizeof(struct smb2_symlink_err_rsp));
++ 		if (le32_to_cpu(err->ByteCount) < len || iov->iov_len < len + sizeof(*err) + 1)
++ 			return ERR_PTR(-EINVAL);
++ 
++ 		p = (struct smb2_error_context_rsp *)err->ErrorData;
++ 		while ((u8 *)p + sizeof(*p) <= end) {
++ 			if (le32_to_cpu(p->ErrorId) == SMB2_ERROR_ID_DEFAULT) {
++ 				sym = (struct smb2_symlink_err_rsp *)p->ErrorContextData;
++ 				break;
++ 			}
++ 			cifs_dbg(FYI, "%s: skipping unhandled error context: 0x%x\n",
++ 				 __func__, le32_to_cpu(p->ErrorId));
++ 
++ 			len = ALIGN(le32_to_cpu(p->ErrorDataLength), 8);
++ 			p = (struct smb2_error_context_rsp *)(p->ErrorContextData + len);
++ 		}
++ 	} else if (le32_to_cpu(err->ByteCount) >= sizeof(*sym) &&
++ 		   iov->iov_len >= SMB2_SYMLINK_STRUCT_SIZE) {
++ 		sym = (struct smb2_symlink_err_rsp *)err->ErrorData;
++ 	}
++ 
++ 	if (!IS_ERR(sym) &&
++ 	    ((u8 *)sym + sizeof(*sym) > end ||
++ 	     le32_to_cpu(sym->SymLinkErrorTag) != SYMLINK_ERROR_TAG ||
++ 	     le32_to_cpu(sym->ReparseTag) != IO_REPARSE_TAG_SYMLINK))
++ 		sym = ERR_PTR(-EINVAL);
++ 
++ 	return sym;
++ }
++ 
++ int smb2_fix_symlink_target_type(char **target, bool directory, struct cifs_sb_info *cifs_sb)
++ {
++ 	char *buf;
++ 	int len;
++ 
++ 	/*
++ 	 * POSIX server does not distinguish between symlinks to file and
++ 	 * symlink directory. So nothing is needed to fix on the client side.
++ 	 */
++ 	if (cifs_sb_flags(cifs_sb) & CIFS_MOUNT_POSIX_PATHS)
++ 		return 0;
++ 
++ 	if (!*target)
++ 		return smb_EIO(smb_eio_trace_null_pointers);
++ 
++ 	len = strlen(*target);
++ 	if (!len)
++ 		return smb_EIO1(smb_eio_trace_sym_target_len, len);
++ 
++ 	/*
++ 	 * If this is directory symlink and it does not have trailing slash then
++ 	 * append it. Trailing slash simulates Windows/SMB behavior which do not
++ 	 * allow resolving directory symlink to file.
++ 	 */
++ 	if (directory && (*target)[len-1] != '/') {
++ 		buf = krealloc(*target, len+2, GFP_KERNEL);
++ 		if (!buf)
++ 			return -ENOMEM;
++ 		buf[len] = '/';
++ 		buf[len+1] = '\0';
++ 		*target = buf;
++ 		len++;
++ 	}
++ 
++ 	/*
++ 	 * If this is a file (non-directory) symlink and it points to path name
++ 	 * with trailing slash then this is an invalid symlink because file name
++ 	 * cannot contain slash character. File name with slash is invalid on
++ 	 * both Windows and Linux systems. So return an error for such symlink.
++ 	 */
++ 	if (!directory && (*target)[len-1] == '/')
++ 		return smb_EIO(smb_eio_trace_sym_slash);
++ 
++ 	return 0;
++ }
++ 
++ int smb2_parse_symlink_response(struct cifs_sb_info *cifs_sb, const struct kvec *iov,
++ 				const char *full_path, char **path)
++ {
++ 	struct smb2_symlink_err_rsp *sym;
++ 	unsigned int sub_offs, sub_len;
++ 	unsigned int print_offs, print_len;
++ 
++ 	if (!cifs_sb || !iov || !iov->iov_base || !iov->iov_len || !path)
++ 		return -EINVAL;
++ 
++ 	sym = symlink_data(iov);
++ 	if (IS_ERR(sym))
++ 		return PTR_ERR(sym);
++ 
++ 	sub_len = le16_to_cpu(sym->SubstituteNameLength);
++ 	sub_offs = le16_to_cpu(sym->SubstituteNameOffset);
++ 	print_len = le16_to_cpu(sym->PrintNameLength);
++ 	print_offs = le16_to_cpu(sym->PrintNameOffset);
++ 
++ 	if ((char *)sym->PathBuffer + sub_offs + sub_len >
++ 		(char *)iov->iov_base + iov->iov_len ||
++ 	    (char *)sym->PathBuffer + print_offs + print_len >
++ 		(char *)iov->iov_base + iov->iov_len)
++ 		return -EINVAL;
++ 
++ 	return smb2_parse_native_symlink(path,
++ 					 (char *)sym->PathBuffer + sub_offs,
++ 					 sub_len,
++ 					 le32_to_cpu(sym->Flags) & SYMLINK_FLAG_RELATIVE,
++ 					 full_path,
++ 					 cifs_sb);
++ }
++ 
++ int smb2_open_file(const unsigned int xid, struct cifs_open_parms *oparms,
++ 		   __u32 *oplock, void *buf)
+++>>>>>>> 3df690bba28e (smb: client: fix OOB reads parsing symlink error response):fs/smb/client/smb2file.c
+  {
+  	int rc;
+  	__le16 *smb2_path;
+* Unmerged path fs/cifs/smb2file.c
