@@ -1,0 +1,410 @@
+dpll: zl3073x: implement frequency monitoring
+
+jira KERNEL-1138
+Rebuild_History Non-Buildable kernel-5.14.0-687.15.1.el9_8
+commit-author Ivan Vecera <ivecera@redhat.com>
+commit bfc923b642874ea6f94763d6060782072944ebd5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.15.1.el9_8/bfc923b6.failed
+
+Extract common measurement latch logic from zl3073x_ref_ffo_update()
+into a new zl3073x_ref_freq_meas_latch() helper and add
+zl3073x_ref_freq_meas_update() that uses it to latch and read absolute
+input reference frequencies in Hz.
+
+Add meas_freq field to struct zl3073x_ref and the corresponding
+zl3073x_ref_meas_freq_get() accessor. The measured frequencies are
+updated periodically alongside the existing FFO measurements.
+
+Add freq_monitor boolean to struct zl3073x_dpll and implement the
+freq_monitor_set/get device callbacks to enable/disable frequency
+monitoring via the DPLL netlink interface.
+
+Implement measured_freq_get pin callback for input pins that returns the
+measured input frequency in mHz.
+
+	Reviewed-by: Petr Oros <poros@redhat.com>
+	Signed-off-by: Ivan Vecera <ivecera@redhat.com>
+Link: https://patch.msgid.link/20260402184057.1890514-4-ivecera@redhat.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit bfc923b642874ea6f94763d6060782072944ebd5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/dpll/zl3073x/dpll.h
+diff --cc drivers/dpll/zl3073x/dpll.h
+index c65c798c3792,434c32a7db12..000000000000
+--- a/drivers/dpll/zl3073x/dpll.h
++++ b/drivers/dpll/zl3073x/dpll.h
+@@@ -13,10 -13,10 +13,15 @@@
+   * @list: this DPLL list entry
+   * @dev: pointer to multi-function parent device
+   * @id: DPLL index
+ + * @refsel_mode: reference selection mode
+ + * @forced_ref: selected reference in forced reference lock mode
+   * @check_count: periodic check counter
+   * @phase_monitor: is phase offset monitor enabled
+++<<<<<<< HEAD
+++=======
++  * @freq_monitor: is frequency monitor enabled
++  * @ops: DPLL device operations for this instance
+++>>>>>>> bfc923b64287 (dpll: zl3073x: implement frequency monitoring)
+   * @dpll_dev: pointer to registered DPLL device
+   * @tracker: tracking object for the acquired reference
+   * @lock_status: last saved DPLL lock status
+@@@ -27,10 -27,10 +32,15 @@@ struct zl3073x_dpll 
+  	struct list_head		list;
+  	struct zl3073x_dev		*dev;
+  	u8				id;
+ +	u8				refsel_mode;
+ +	u8				forced_ref;
+  	u8				check_count;
+  	bool				phase_monitor;
+++<<<<<<< HEAD
+++=======
++ 	bool				freq_monitor;
++ 	struct dpll_device_ops		ops;
+++>>>>>>> bfc923b64287 (dpll: zl3073x: implement frequency monitoring)
+  	struct dpll_device		*dpll_dev;
+  	dpll_tracker			tracker;
+  	enum dpll_lock_status		lock_status;
+diff --git a/drivers/dpll/zl3073x/core.c b/drivers/dpll/zl3073x/core.c
+index b8b541258001..4a3460e15d35 100644
+--- a/drivers/dpll/zl3073x/core.c
++++ b/drivers/dpll/zl3073x/core.c
+@@ -657,22 +657,21 @@ int zl3073x_ref_phase_offsets_update(struct zl3073x_dev *zldev, int channel)
+ }
+ 
+ /**
+- * zl3073x_ref_ffo_update - update reference fractional frequency offsets
++ * zl3073x_ref_freq_meas_latch - latch reference frequency measurements
+  * @zldev: pointer to zl3073x_dev structure
++ * @type: measurement type (ZL_REF_FREQ_MEAS_CTRL_*)
+  *
+- * The function asks device to update fractional frequency offsets latch
+- * registers the latest measured values, reads and stores them into
++ * The function waits for the previous measurement to finish, selects all
++ * references and requests a new measurement of the given type.
+  *
+  * Return: 0 on success, <0 on error
+  */
+ static int
+-zl3073x_ref_ffo_update(struct zl3073x_dev *zldev)
++zl3073x_ref_freq_meas_latch(struct zl3073x_dev *zldev, u8 type)
+ {
+-	int i, rc;
++	int rc;
+ 
+-	/* Per datasheet we have to wait for 'ref_freq_meas_ctrl' to be zero
+-	 * to ensure that the measured data are coherent.
+-	 */
++	/* Wait for previous measurement to finish */
+ 	rc = zl3073x_poll_zero_u8(zldev, ZL_REG_REF_FREQ_MEAS_CTRL,
+ 				  ZL_REF_FREQ_MEAS_CTRL);
+ 	if (rc)
+@@ -688,15 +687,64 @@ zl3073x_ref_ffo_update(struct zl3073x_dev *zldev)
+ 	if (rc)
+ 		return rc;
+ 
+-	/* Request frequency offset measurement */
+-	rc = zl3073x_write_u8(zldev, ZL_REG_REF_FREQ_MEAS_CTRL,
+-			      ZL_REF_FREQ_MEAS_CTRL_REF_FREQ_OFF);
++	/* Request measurement */
++	rc = zl3073x_write_u8(zldev, ZL_REG_REF_FREQ_MEAS_CTRL, type);
+ 	if (rc)
+ 		return rc;
+ 
+ 	/* Wait for finish */
+-	rc = zl3073x_poll_zero_u8(zldev, ZL_REG_REF_FREQ_MEAS_CTRL,
+-				  ZL_REF_FREQ_MEAS_CTRL);
++	return zl3073x_poll_zero_u8(zldev, ZL_REG_REF_FREQ_MEAS_CTRL,
++				    ZL_REF_FREQ_MEAS_CTRL);
++}
++
++/**
++ * zl3073x_ref_freq_meas_update - update measured input reference frequencies
++ * @zldev: pointer to zl3073x_dev structure
++ *
++ * The function asks device to latch measured input reference frequencies
++ * and stores the results in the ref state.
++ *
++ * Return: 0 on success, <0 on error
++ */
++static int
++zl3073x_ref_freq_meas_update(struct zl3073x_dev *zldev)
++{
++	int i, rc;
++
++	rc = zl3073x_ref_freq_meas_latch(zldev, ZL_REF_FREQ_MEAS_CTRL_REF_FREQ);
++	if (rc)
++		return rc;
++
++	/* Read measured frequencies in Hz (unsigned 32-bit, LSB = 1 Hz) */
++	for (i = 0; i < ZL3073X_NUM_REFS; i++) {
++		u32 value;
++
++		rc = zl3073x_read_u32(zldev, ZL_REG_REF_FREQ(i), &value);
++		if (rc)
++			return rc;
++
++		zldev->ref[i].meas_freq = value;
++	}
++
++	return 0;
++}
++
++/**
++ * zl3073x_ref_ffo_update - update reference fractional frequency offsets
++ * @zldev: pointer to zl3073x_dev structure
++ *
++ * The function asks device to latch the latest measured fractional
++ * frequency offset values, reads and stores them into the ref state.
++ *
++ * Return: 0 on success, <0 on error
++ */
++static int
++zl3073x_ref_ffo_update(struct zl3073x_dev *zldev)
++{
++	int i, rc;
++
++	rc = zl3073x_ref_freq_meas_latch(zldev,
++					 ZL_REF_FREQ_MEAS_CTRL_REF_FREQ_OFF);
+ 	if (rc)
+ 		return rc;
+ 
+@@ -736,6 +784,20 @@ zl3073x_dev_periodic_work(struct kthread_work *work)
+ 		dev_warn(zldev->dev, "Failed to update phase offsets: %pe\n",
+ 			 ERR_PTR(rc));
+ 
++	/* Update measured input reference frequencies if any DPLL has
++	 * frequency monitoring enabled.
++	 */
++	list_for_each_entry(zldpll, &zldev->dplls, list) {
++		if (zldpll->freq_monitor) {
++			rc = zl3073x_ref_freq_meas_update(zldev);
++			if (rc)
++				dev_warn(zldev->dev,
++					 "Failed to update measured frequencies: %pe\n",
++					 ERR_PTR(rc));
++			break;
++		}
++	}
++
+ 	/* Update references' fractional frequency offsets */
+ 	rc = zl3073x_ref_ffo_update(zldev);
+ 	if (rc)
+diff --git a/drivers/dpll/zl3073x/dpll.c b/drivers/dpll/zl3073x/dpll.c
+index 8ffbede117c6..ae79bedccf79 100644
+--- a/drivers/dpll/zl3073x/dpll.c
++++ b/drivers/dpll/zl3073x/dpll.c
+@@ -40,6 +40,7 @@
+  * @pin_state: last saved pin state
+  * @phase_offset: last saved pin phase offset
+  * @freq_offset: last saved fractional frequency offset
++ * @measured_freq: last saved measured frequency
+  */
+ struct zl3073x_dpll_pin {
+ 	struct list_head	list;
+@@ -56,6 +57,7 @@ struct zl3073x_dpll_pin {
+ 	enum dpll_pin_state	pin_state;
+ 	s64			phase_offset;
+ 	s64			freq_offset;
++	u32			measured_freq;
+ };
+ 
+ /*
+@@ -204,6 +206,21 @@ zl3073x_dpll_input_pin_ffo_get(const struct dpll_pin *dpll_pin, void *pin_priv,
+ 	return 0;
+ }
+ 
++static int
++zl3073x_dpll_input_pin_measured_freq_get(const struct dpll_pin *dpll_pin,
++					 void *pin_priv,
++					 const struct dpll_device *dpll,
++					 void *dpll_priv, u64 *measured_freq,
++					 struct netlink_ext_ack *extack)
++{
++	struct zl3073x_dpll_pin *pin = pin_priv;
++
++	*measured_freq = pin->measured_freq;
++	*measured_freq *= DPLL_PIN_MEASURED_FREQUENCY_DIVIDER;
++
++	return 0;
++}
++
+ static int
+ zl3073x_dpll_input_pin_frequency_get(const struct dpll_pin *dpll_pin,
+ 				     void *pin_priv,
+@@ -1320,6 +1337,35 @@ zl3073x_dpll_phase_offset_monitor_set(const struct dpll_device *dpll,
+ 	return 0;
+ }
+ 
++static int
++zl3073x_dpll_freq_monitor_get(const struct dpll_device *dpll,
++			      void *dpll_priv,
++			      enum dpll_feature_state *state,
++			      struct netlink_ext_ack *extack)
++{
++	struct zl3073x_dpll *zldpll = dpll_priv;
++
++	if (zldpll->freq_monitor)
++		*state = DPLL_FEATURE_STATE_ENABLE;
++	else
++		*state = DPLL_FEATURE_STATE_DISABLE;
++
++	return 0;
++}
++
++static int
++zl3073x_dpll_freq_monitor_set(const struct dpll_device *dpll,
++			      void *dpll_priv,
++			      enum dpll_feature_state state,
++			      struct netlink_ext_ack *extack)
++{
++	struct zl3073x_dpll *zldpll = dpll_priv;
++
++	zldpll->freq_monitor = (state == DPLL_FEATURE_STATE_ENABLE);
++
++	return 0;
++}
++
+ static const struct dpll_pin_ops zl3073x_dpll_input_pin_ops = {
+ 	.direction_get = zl3073x_dpll_pin_direction_get,
+ 	.esync_get = zl3073x_dpll_input_pin_esync_get,
+@@ -1327,6 +1373,7 @@ static const struct dpll_pin_ops zl3073x_dpll_input_pin_ops = {
+ 	.ffo_get = zl3073x_dpll_input_pin_ffo_get,
+ 	.frequency_get = zl3073x_dpll_input_pin_frequency_get,
+ 	.frequency_set = zl3073x_dpll_input_pin_frequency_set,
++	.measured_freq_get = zl3073x_dpll_input_pin_measured_freq_get,
+ 	.phase_offset_get = zl3073x_dpll_input_pin_phase_offset_get,
+ 	.phase_adjust_get = zl3073x_dpll_input_pin_phase_adjust_get,
+ 	.phase_adjust_set = zl3073x_dpll_input_pin_phase_adjust_set,
+@@ -1355,6 +1402,8 @@ static const struct dpll_device_ops zl3073x_dpll_device_ops = {
+ 	.phase_offset_avg_factor_set = zl3073x_dpll_phase_offset_avg_factor_set,
+ 	.phase_offset_monitor_get = zl3073x_dpll_phase_offset_monitor_get,
+ 	.phase_offset_monitor_set = zl3073x_dpll_phase_offset_monitor_set,
++	.freq_monitor_get = zl3073x_dpll_freq_monitor_get,
++	.freq_monitor_set = zl3073x_dpll_freq_monitor_set,
+ 	.supported_modes_get = zl3073x_dpll_supported_modes_get,
+ };
+ 
+@@ -1786,6 +1835,7 @@ zl3073x_dpll_pin_ffo_check(struct zl3073x_dpll_pin *pin)
+ 	struct zl3073x_dev *zldev = zldpll->dev;
+ 	const struct zl3073x_ref *ref;
+ 	u8 ref_id;
++	s64 ffo;
+ 
+ 	/* Get reference monitor status */
+ 	ref_id = zl3073x_input_pin_ref_get(pin->id);
+@@ -1796,10 +1846,47 @@ zl3073x_dpll_pin_ffo_check(struct zl3073x_dpll_pin *pin)
+ 		return false;
+ 
+ 	/* Compare with previous value */
+-	if (pin->freq_offset != ref->ffo) {
++	ffo = zl3073x_ref_ffo_get(ref);
++	if (pin->freq_offset != ffo) {
+ 		dev_dbg(zldev->dev, "%s freq offset changed: %lld -> %lld\n",
+-			pin->label, pin->freq_offset, ref->ffo);
+-		pin->freq_offset = ref->ffo;
++			pin->label, pin->freq_offset, ffo);
++		pin->freq_offset = ffo;
++
++		return true;
++	}
++
++	return false;
++}
++
++/**
++ * zl3073x_dpll_pin_measured_freq_check - check for pin measured frequency
++ * change
++ * @pin: pin to check
++ *
++ * Check for the given pin's measured frequency change.
++ *
++ * Return: true on measured frequency change, false otherwise
++ */
++static bool
++zl3073x_dpll_pin_measured_freq_check(struct zl3073x_dpll_pin *pin)
++{
++	struct zl3073x_dpll *zldpll = pin->dpll;
++	struct zl3073x_dev *zldev = zldpll->dev;
++	const struct zl3073x_ref *ref;
++	u8 ref_id;
++	u32 freq;
++
++	if (!zldpll->freq_monitor)
++		return false;
++
++	ref_id = zl3073x_input_pin_ref_get(pin->id);
++	ref = zl3073x_ref_state_get(zldev, ref_id);
++
++	freq = zl3073x_ref_meas_freq_get(ref);
++	if (pin->measured_freq != freq) {
++		dev_dbg(zldev->dev, "%s measured freq changed: %u -> %u\n",
++			pin->label, pin->measured_freq, freq);
++		pin->measured_freq = freq;
+ 
+ 		return true;
+ 	}
+@@ -1887,13 +1974,18 @@ zl3073x_dpll_changes_check(struct zl3073x_dpll *zldpll)
+ 			pin_changed = true;
+ 		}
+ 
+-		/* Check for phase offset and ffo change once per second */
++		/* Check for phase offset, ffo, and measured freq change
++		 * once per second.
++		 */
+ 		if (zldpll->check_count % 2 == 0) {
+ 			if (zl3073x_dpll_pin_phase_offset_check(pin))
+ 				pin_changed = true;
+ 
+ 			if (zl3073x_dpll_pin_ffo_check(pin))
+ 				pin_changed = true;
++
++			if (zl3073x_dpll_pin_measured_freq_check(pin))
++				pin_changed = true;
+ 		}
+ 
+ 		if (pin_changed)
+* Unmerged path drivers/dpll/zl3073x/dpll.h
+diff --git a/drivers/dpll/zl3073x/ref.h b/drivers/dpll/zl3073x/ref.h
+index 06d8d4d97ea2..be16be20dbc7 100644
+--- a/drivers/dpll/zl3073x/ref.h
++++ b/drivers/dpll/zl3073x/ref.h
+@@ -23,6 +23,7 @@ struct zl3073x_dev;
+  * @sync_ctrl: reference sync control
+  * @config: reference config
+  * @ffo: current fractional frequency offset
++ * @meas_freq: measured input frequency in Hz
+  * @mon_status: reference monitor status
+  */
+ struct zl3073x_ref {
+@@ -40,6 +41,7 @@ struct zl3073x_ref {
+ 	);
+ 	struct_group(stat, /* Status */
+ 		s64	ffo;
++		u32	meas_freq;
+ 		u8	mon_status;
+ 	);
+ };
+@@ -68,6 +70,18 @@ zl3073x_ref_ffo_get(const struct zl3073x_ref *ref)
+ 	return ref->ffo;
+ }
+ 
++/**
++ * zl3073x_ref_meas_freq_get - get measured input frequency
++ * @ref: pointer to ref state
++ *
++ * Return: measured input frequency in Hz
++ */
++static inline u32
++zl3073x_ref_meas_freq_get(const struct zl3073x_ref *ref)
++{
++	return ref->meas_freq;
++}
++
+ /**
+  * zl3073x_ref_freq_get - get given input reference frequency
+  * @ref: pointer to ref state
