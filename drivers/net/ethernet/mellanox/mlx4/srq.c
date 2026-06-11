@@ -205,7 +205,7 @@ int mlx4_srq_alloc(struct mlx4_dev *dev, u32 pdn, u32 cqn, u16 xrcd,
 		goto err_radix;
 
 	init_completion(&srq->free);
-	refcount_set_release(&srq->refcount, 1);
+	atomic_set_release(&srq->refcount.refs, 1);
 
 	return 0;
 
