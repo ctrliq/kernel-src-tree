@@ -1,0 +1,294 @@
+dpll: zl3073x: add reference priority to zl3073x_chan
+
+jira KERNEL-1138
+Rebuild_History Non-Buildable kernel-5.14.0-687.15.1.el9_8
+commit-author Ivan Vecera <ivecera@redhat.com>
+commit f6b075bc3ad545d1c91e181c3f8ea6193d01602f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.15.1.el9_8/f6b075bc.failed
+
+Cache the ZL_REG_DPLL_REF_PRIO registers in the zl3073x_chan cfg group.
+These mailbox-based registers store per-reference priority values
+(4 bits each, P/N packed) used for automatic reference selection.
+
+Add ref_prio[] array to struct zl3073x_chan and provide inline helpers
+zl3073x_chan_ref_prio_get(), zl3073x_chan_ref_prio_set(), and
+zl3073x_chan_ref_is_selectable() for nibble-level access and priority
+queries. Extend state_fetch and state_set with DPLL mailbox operations
+to read and write the priority registers.
+
+Replace the ad-hoc zl3073x_dpll_ref_prio_get/set functions in dpll.c
+with the cached state pattern, removing direct mailbox access from
+the DPLL layer. This also simplifies pin registration since reading
+priority from cached state cannot fail.
+
+Remove the pin->selectable flag from struct zl3073x_dpll_pin and
+derive the selectable state from the cached ref priority via
+zl3073x_chan_ref_is_selectable(), eliminating a redundant cache.
+
+Inline zl3073x_dpll_selected_ref_set() into
+zl3073x_dpll_input_pin_state_on_dpll_set(), unifying all manual and
+automatic mode paths to commit changes through a single
+zl3073x_chan_state_set() call at the end of the function.
+
+Move hardware limit constants from core.h to regs.h so that chan.h
+can reference ZL3073X_NUM_REFS for the ref_prio array size.
+
+	Signed-off-by: Ivan Vecera <ivecera@redhat.com>
+Link: https://patch.msgid.link/20260315174224.399074-6-ivecera@redhat.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit f6b075bc3ad545d1c91e181c3f8ea6193d01602f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/dpll/zl3073x/chan.c
+#	drivers/dpll/zl3073x/chan.h
+#	drivers/dpll/zl3073x/dpll.c
+diff --cc drivers/dpll/zl3073x/dpll.c
+index 8ffbede117c6,7fb851976402..000000000000
+--- a/drivers/dpll/zl3073x/dpll.c
++++ b/drivers/dpll/zl3073x/dpll.c
+@@@ -294,81 -283,6 +292,84 @@@ zl3073x_dpll_selected_ref_get(struct zl
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * zl3073x_dpll_selected_ref_set - select reference in manual mode
+ + * @zldpll: pointer to zl3073x_dpll
+ + * @ref: input reference to be selected
+ + *
+ + * Selects the given reference for the DPLL channel it should be
+ + * locked to.
+ + *
+ + * Return: 0 on success, <0 on error
+ + */
+ +static int
+ +zl3073x_dpll_selected_ref_set(struct zl3073x_dpll *zldpll, u8 ref)
+ +{
+ +	struct zl3073x_dev *zldev = zldpll->dev;
+ +	u8 mode, mode_refsel;
+ +	int rc;
+ +
+ +	mode = zldpll->refsel_mode;
+ +
+ +	switch (mode) {
+ +	case ZL_DPLL_MODE_REFSEL_MODE_REFLOCK:
+ +		/* Manual mode with ref selected */
+ +		if (ref == ZL3073X_DPLL_REF_NONE) {
+ +			switch (zldpll->lock_status) {
+ +			case DPLL_LOCK_STATUS_LOCKED_HO_ACQ:
+ +			case DPLL_LOCK_STATUS_HOLDOVER:
+ +				/* Switch to forced holdover */
+ +				mode = ZL_DPLL_MODE_REFSEL_MODE_HOLDOVER;
+ +				break;
+ +			default:
+ +				/* Switch to freerun */
+ +				mode = ZL_DPLL_MODE_REFSEL_MODE_FREERUN;
+ +				break;
+ +			}
+ +			/* Keep selected reference */
+ +			ref = zldpll->forced_ref;
+ +		} else if (ref == zldpll->forced_ref) {
+ +			/* No register update - same mode and same ref */
+ +			return 0;
+ +		}
+ +		break;
+ +	case ZL_DPLL_MODE_REFSEL_MODE_FREERUN:
+ +	case ZL_DPLL_MODE_REFSEL_MODE_HOLDOVER:
+ +		/* Manual mode without no ref */
+ +		if (ref == ZL3073X_DPLL_REF_NONE)
+ +			/* No register update - keep current mode */
+ +			return 0;
+ +
+ +		/* Switch to reflock mode and update ref selection */
+ +		mode = ZL_DPLL_MODE_REFSEL_MODE_REFLOCK;
+ +		break;
+ +	default:
+ +		/* For other modes like automatic or NCO ref cannot be selected
+ +		 * manually
+ +		 */
+ +		return -EOPNOTSUPP;
+ +	}
+ +
+ +	/* Build mode_refsel value */
+ +	mode_refsel = FIELD_PREP(ZL_DPLL_MODE_REFSEL_MODE, mode) |
+ +		      FIELD_PREP(ZL_DPLL_MODE_REFSEL_REF, ref);
+ +
+ +	/* Update dpll_mode_refsel register */
+ +	rc = zl3073x_write_u8(zldev, ZL_REG_DPLL_MODE_REFSEL(zldpll->id),
+ +			      mode_refsel);
+ +	if (rc)
+ +		return rc;
+ +
+ +	/* Store new mode and forced reference */
+ +	zldpll->refsel_mode = mode;
+ +	zldpll->forced_ref = ref;
+ +
+ +	return rc;
+ +}
+ +
+ +/**
+++=======
+++>>>>>>> f6b075bc3ad5 (dpll: zl3073x: add reference priority to zl3073x_chan)
+   * zl3073x_dpll_connected_ref_get - get currently connected reference
+   * @zldpll: pointer to zl3073x_dpll
+   * @ref: place to store selected reference
+@@@ -643,8 -467,9 +552,14 @@@ zl3073x_dpll_ref_state_get(struct zl307
+  	 * selectable and its monitor does not report any error then report
+  	 * pin as selectable.
+  	 */
+++<<<<<<< HEAD
+ +	if (zldpll->refsel_mode == ZL_DPLL_MODE_REFSEL_MODE_AUTO &&
+ +	    zl3073x_dev_ref_is_status_ok(zldev, ref) && pin->selectable) {
+++=======
++ 	if (zl3073x_chan_mode_get(chan) == ZL_DPLL_MODE_REFSEL_MODE_AUTO &&
++ 	    zl3073x_dev_ref_is_status_ok(zldev, ref) &&
++ 	    zl3073x_chan_ref_is_selectable(chan, ref)) {
+++>>>>>>> f6b075bc3ad5 (dpll: zl3073x: add reference priority to zl3073x_chan)
+  		*state = DPLL_PIN_STATE_SELECTABLE;
+  		return 0;
+  	}
+@@@ -678,31 -503,50 +593,57 @@@ zl3073x_dpll_input_pin_state_on_dpll_se
+  {
+  	struct zl3073x_dpll *zldpll = dpll_priv;
+  	struct zl3073x_dpll_pin *pin = pin_priv;
+++<<<<<<< HEAD
+ +	u8 new_ref;
+ +	int rc;
+ +
+ +	switch (zldpll->refsel_mode) {
+++=======
++ 	struct zl3073x_chan chan;
++ 	u8 mode, ref;
++ 	int rc;
++ 
++ 	chan = *zl3073x_chan_state_get(zldpll->dev, zldpll->id);
++ 	ref = zl3073x_input_pin_ref_get(pin->id);
++ 	mode = zl3073x_chan_mode_get(&chan);
++ 
++ 	switch (mode) {
+++>>>>>>> f6b075bc3ad5 (dpll: zl3073x: add reference priority to zl3073x_chan)
+  	case ZL_DPLL_MODE_REFSEL_MODE_REFLOCK:
+- 	case ZL_DPLL_MODE_REFSEL_MODE_FREERUN:
+- 	case ZL_DPLL_MODE_REFSEL_MODE_HOLDOVER:
+  		if (state == DPLL_PIN_STATE_CONNECTED) {
+  			/* Choose the pin as new selected reference */
+- 			new_ref = zl3073x_input_pin_ref_get(pin->id);
++ 			zl3073x_chan_ref_set(&chan, ref);
+  		} else if (state == DPLL_PIN_STATE_DISCONNECTED) {
+- 			/* No reference */
+- 			new_ref = ZL3073X_DPLL_REF_NONE;
++ 			/* Choose new mode based on lock status */
++ 			switch (zldpll->lock_status) {
++ 			case DPLL_LOCK_STATUS_LOCKED_HO_ACQ:
++ 			case DPLL_LOCK_STATUS_HOLDOVER:
++ 				mode = ZL_DPLL_MODE_REFSEL_MODE_HOLDOVER;
++ 				break;
++ 			default:
++ 				mode = ZL_DPLL_MODE_REFSEL_MODE_FREERUN;
++ 				break;
++ 			}
++ 			zl3073x_chan_mode_set(&chan, mode);
+  		} else {
+- 			NL_SET_ERR_MSG_MOD(extack,
+- 					   "Invalid pin state for manual mode");
+- 			return -EINVAL;
++ 			goto invalid_state;
++ 		}
++ 		break;
++ 	case ZL_DPLL_MODE_REFSEL_MODE_FREERUN:
++ 	case ZL_DPLL_MODE_REFSEL_MODE_HOLDOVER:
++ 		if (state == DPLL_PIN_STATE_CONNECTED) {
++ 			/* Choose the pin as new selected reference */
++ 			zl3073x_chan_ref_set(&chan, ref);
++ 			/* Switch to reflock mode */
++ 			zl3073x_chan_mode_set(&chan,
++ 					      ZL_DPLL_MODE_REFSEL_MODE_REFLOCK);
++ 		} else if (state != DPLL_PIN_STATE_DISCONNECTED) {
++ 			goto invalid_state;
+  		}
+- 
+- 		rc = zl3073x_dpll_selected_ref_set(zldpll, new_ref);
+  		break;
+- 
+  	case ZL_DPLL_MODE_REFSEL_MODE_AUTO:
+  		if (state == DPLL_PIN_STATE_SELECTABLE) {
+- 			if (pin->selectable)
++ 			if (zl3073x_chan_ref_is_selectable(&chan, ref))
+  				return 0; /* Pin is already selectable */
+  
+  			/* Restore pin priority in HW */
+@@@ -1268,15 -1131,11 +1208,21 @@@ zl3073x_dpll_mode_set(const struct dpll
+  		hw_mode = ZL_DPLL_MODE_REFSEL_MODE_AUTO;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* Build mode_refsel value */
+ +	mode_refsel = FIELD_PREP(ZL_DPLL_MODE_REFSEL_MODE, hw_mode);
+++=======
++ 	zl3073x_chan_mode_set(&chan, hw_mode);
++ 	if (ZL3073X_DPLL_REF_IS_VALID(ref))
++ 		zl3073x_chan_ref_set(&chan, ref);
+++>>>>>>> f6b075bc3ad5 (dpll: zl3073x: add reference priority to zl3073x_chan)
+  
+ -	rc = zl3073x_chan_state_set(zldpll->dev, zldpll->id, &chan);
+ +	if (ZL3073X_DPLL_REF_IS_VALID(ref))
+ +		mode_refsel |= FIELD_PREP(ZL_DPLL_MODE_REFSEL_REF, ref);
+ +
+ +	/* Update dpll_mode_refsel register */
+ +	rc = zl3073x_write_u8(zldpll->dev, ZL_REG_DPLL_MODE_REFSEL(zldpll->id),
+ +			      mode_refsel);
+  	if (rc) {
+  		NL_SET_ERR_MSG_MOD(extack,
+  				   "failed to set reference selection mode");
+* Unmerged path drivers/dpll/zl3073x/chan.c
+* Unmerged path drivers/dpll/zl3073x/chan.h
+* Unmerged path drivers/dpll/zl3073x/chan.c
+* Unmerged path drivers/dpll/zl3073x/chan.h
+diff --git a/drivers/dpll/zl3073x/core.h b/drivers/dpll/zl3073x/core.h
+index fd2af3c62a7d..3f5252163083 100644
+--- a/drivers/dpll/zl3073x/core.h
++++ b/drivers/dpll/zl3073x/core.h
+@@ -18,17 +18,6 @@ struct device;
+ struct regmap;
+ struct zl3073x_dpll;
+ 
+-/*
+- * Hardware limits for ZL3073x chip family
+- */
+-#define ZL3073X_MAX_CHANNELS	5
+-#define ZL3073X_NUM_REFS	10
+-#define ZL3073X_NUM_OUTS	10
+-#define ZL3073X_NUM_SYNTHS	5
+-#define ZL3073X_NUM_INPUT_PINS	ZL3073X_NUM_REFS
+-#define ZL3073X_NUM_OUTPUT_PINS	(ZL3073X_NUM_OUTS * 2)
+-#define ZL3073X_NUM_PINS	(ZL3073X_NUM_INPUT_PINS + \
+-				 ZL3073X_NUM_OUTPUT_PINS)
+ 
+ /**
+  * struct zl3073x_dev - zl3073x device
+* Unmerged path drivers/dpll/zl3073x/dpll.c
+diff --git a/drivers/dpll/zl3073x/regs.h b/drivers/dpll/zl3073x/regs.h
+index 5573d7188406..7eac46e18e4d 100644
+--- a/drivers/dpll/zl3073x/regs.h
++++ b/drivers/dpll/zl3073x/regs.h
+@@ -6,6 +6,18 @@
+ #include <linux/bitfield.h>
+ #include <linux/bits.h>
+ 
++/*
++ * Hardware limits for ZL3073x chip family
++ */
++#define ZL3073X_MAX_CHANNELS	5
++#define ZL3073X_NUM_REFS	10
++#define ZL3073X_NUM_OUTS	10
++#define ZL3073X_NUM_SYNTHS	5
++#define ZL3073X_NUM_INPUT_PINS	ZL3073X_NUM_REFS
++#define ZL3073X_NUM_OUTPUT_PINS	(ZL3073X_NUM_OUTS * 2)
++#define ZL3073X_NUM_PINS	(ZL3073X_NUM_INPUT_PINS + \
++				 ZL3073X_NUM_OUTPUT_PINS)
++
+ /*
+  * Register address structure:
+  * ===========================
