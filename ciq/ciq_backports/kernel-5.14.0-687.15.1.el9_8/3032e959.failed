@@ -1,0 +1,321 @@
+dpll: zl3073x: introduce zl3073x_chan for DPLL channel state
+
+jira KERNEL-1138
+Rebuild_History Non-Buildable kernel-5.14.0-687.15.1.el9_8
+commit-author Ivan Vecera <ivecera@redhat.com>
+commit 3032e95987fa0da656ce3a5eb454674e7cc60a12
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.15.1.el9_8/3032e959.failed
+
+Extract DPLL channel state management into a dedicated zl3073x_chan
+module, following the pattern already established by zl3073x_ref,
+zl3073x_out and zl3073x_synth.
+
+The new struct zl3073x_chan caches the raw mode_refsel register value
+in a cfg group with inline getters and setters to extract and update
+the bitfields. Three standard state management functions are provided:
+
+ - zl3073x_chan_state_fetch: read the mode_refsel register from HW
+ - zl3073x_chan_state_get: return cached channel state
+ - zl3073x_chan_state_set: write changed state to HW, skip if unchanged
+
+The channel state array chan[ZL3073X_MAX_CHANNELS] is added to struct
+zl3073x_dev. Channel state is fetched as part of
+zl3073x_dev_state_fetch, using the chip-specific channel count.
+
+The refsel_mode and forced_ref fields are removed from struct
+zl3073x_dpll and all direct register accesses in dpll.c are replaced
+with the new chan state operations.
+
+	Signed-off-by: Ivan Vecera <ivecera@redhat.com>
+Link: https://patch.msgid.link/20260315174224.399074-4-ivecera@redhat.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 3032e95987fa0da656ce3a5eb454674e7cc60a12)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/dpll/zl3073x/dpll.c
+diff --cc drivers/dpll/zl3073x/dpll.c
+index 8ffbede117c6,f56f073e57df..000000000000
+--- a/drivers/dpll/zl3073x/dpll.c
++++ b/drivers/dpll/zl3073x/dpll.c
+@@@ -1656,20 -1678,11 +1659,25 @@@ static in
+  zl3073x_dpll_device_register(struct zl3073x_dpll *zldpll)
+  {
+  	struct zl3073x_dev *zldev = zldpll->dev;
+- 	u8 dpll_mode_refsel;
+  	int rc;
+  
+++<<<<<<< HEAD
+ +	/* Read DPLL mode and forcibly selected reference */
+ +	rc = zl3073x_read_u8(zldev, ZL_REG_DPLL_MODE_REFSEL(zldpll->id),
+ +			     &dpll_mode_refsel);
+ +	if (rc)
+ +		return rc;
+ +
+ +	/* Extract mode and selected input reference */
+ +	zldpll->refsel_mode = FIELD_GET(ZL_DPLL_MODE_REFSEL_MODE,
+ +					dpll_mode_refsel);
+ +	zldpll->forced_ref = FIELD_GET(ZL_DPLL_MODE_REFSEL_REF,
+ +				       dpll_mode_refsel);
+++=======
++ 	zldpll->ops = zl3073x_dpll_device_ops;
++ 	if (zldev->info->flags & ZL3073X_FLAG_DIE_TEMP)
++ 		zldpll->ops.temp_get = zl3073x_dpll_temp_get;
+++>>>>>>> 3032e95987fa (dpll: zl3073x: introduce zl3073x_chan for DPLL channel state)
+  
+  	zldpll->dpll_dev = dpll_device_get(zldev->clock_id, zldpll->id,
+  					   THIS_MODULE, &zldpll->tracker);
+diff --git a/drivers/dpll/zl3073x/Makefile b/drivers/dpll/zl3073x/Makefile
+index bd324c7fe710..906ec3fbcc20 100644
+--- a/drivers/dpll/zl3073x/Makefile
++++ b/drivers/dpll/zl3073x/Makefile
+@@ -1,8 +1,8 @@
+ # SPDX-License-Identifier: GPL-2.0
+ 
+ obj-$(CONFIG_ZL3073X)		+= zl3073x.o
+-zl3073x-objs			:= core.o devlink.o dpll.o flash.o fw.o	\
+-				   out.o prop.o ref.o synth.o
++zl3073x-objs			:= chan.o core.o devlink.o dpll.o	\
++				   flash.o fw.o out.o prop.o ref.o synth.o
+ 
+ obj-$(CONFIG_ZL3073X_I2C)	+= zl3073x_i2c.o
+ zl3073x_i2c-objs		:= i2c.o
+diff --git a/drivers/dpll/zl3073x/chan.c b/drivers/dpll/zl3073x/chan.c
+new file mode 100644
+index 000000000000..8019b8ce7351
+--- /dev/null
++++ b/drivers/dpll/zl3073x/chan.c
+@@ -0,0 +1,79 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++#include <linux/dev_printk.h>
++#include <linux/string.h>
++#include <linux/types.h>
++
++#include "chan.h"
++#include "core.h"
++
++/**
++ * zl3073x_chan_state_fetch - fetch DPLL channel state from hardware
++ * @zldev: pointer to zl3073x_dev structure
++ * @index: DPLL channel index to fetch state for
++ *
++ * Reads the mode_refsel register for the given DPLL channel and stores
++ * the raw value for later use.
++ *
++ * Return: 0 on success, <0 on error
++ */
++int zl3073x_chan_state_fetch(struct zl3073x_dev *zldev, u8 index)
++{
++	struct zl3073x_chan *chan = &zldev->chan[index];
++	int rc;
++
++	rc = zl3073x_read_u8(zldev, ZL_REG_DPLL_MODE_REFSEL(index),
++			     &chan->mode_refsel);
++	if (rc)
++		return rc;
++
++	dev_dbg(zldev->dev, "DPLL%u mode: %u, ref: %u\n", index,
++		zl3073x_chan_mode_get(chan), zl3073x_chan_ref_get(chan));
++
++	return 0;
++}
++
++/**
++ * zl3073x_chan_state_get - get current DPLL channel state
++ * @zldev: pointer to zl3073x_dev structure
++ * @index: DPLL channel index to get state for
++ *
++ * Return: pointer to given DPLL channel state
++ */
++const struct zl3073x_chan *zl3073x_chan_state_get(struct zl3073x_dev *zldev,
++						  u8 index)
++{
++	return &zldev->chan[index];
++}
++
++/**
++ * zl3073x_chan_state_set - commit DPLL channel state changes to hardware
++ * @zldev: pointer to zl3073x_dev structure
++ * @index: DPLL channel index to set state for
++ * @chan: desired channel state
++ *
++ * Skips the HW write if the configuration is unchanged, and otherwise
++ * writes the mode_refsel register to hardware.
++ *
++ * Return: 0 on success, <0 on HW error
++ */
++int zl3073x_chan_state_set(struct zl3073x_dev *zldev, u8 index,
++			   const struct zl3073x_chan *chan)
++{
++	struct zl3073x_chan *dchan = &zldev->chan[index];
++	int rc;
++
++	/* Skip HW write if configuration hasn't changed */
++	if (!memcmp(&dchan->cfg, &chan->cfg, sizeof(chan->cfg)))
++		return 0;
++
++	rc = zl3073x_write_u8(zldev, ZL_REG_DPLL_MODE_REFSEL(index),
++			      chan->mode_refsel);
++	if (rc)
++		return rc;
++
++	/* After successful write store new state */
++	dchan->cfg = chan->cfg;
++
++	return 0;
++}
+diff --git a/drivers/dpll/zl3073x/chan.h b/drivers/dpll/zl3073x/chan.h
+new file mode 100644
+index 000000000000..3e6ffaef0c74
+--- /dev/null
++++ b/drivers/dpll/zl3073x/chan.h
+@@ -0,0 +1,74 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++#ifndef _ZL3073X_CHAN_H
++#define _ZL3073X_CHAN_H
++
++#include <linux/bitfield.h>
++#include <linux/stddef.h>
++#include <linux/types.h>
++
++#include "regs.h"
++
++struct zl3073x_dev;
++
++/**
++ * struct zl3073x_chan - DPLL channel state
++ * @mode_refsel: mode and reference selection register value
++ */
++struct zl3073x_chan {
++	struct_group(cfg,
++		u8	mode_refsel;
++	);
++};
++
++int zl3073x_chan_state_fetch(struct zl3073x_dev *zldev, u8 index);
++const struct zl3073x_chan *zl3073x_chan_state_get(struct zl3073x_dev *zldev,
++						 u8 index);
++int zl3073x_chan_state_set(struct zl3073x_dev *zldev, u8 index,
++			   const struct zl3073x_chan *chan);
++
++/**
++ * zl3073x_chan_mode_get - get DPLL channel operating mode
++ * @chan: pointer to channel state
++ *
++ * Return: reference selection mode of the given DPLL channel
++ */
++static inline u8 zl3073x_chan_mode_get(const struct zl3073x_chan *chan)
++{
++	return FIELD_GET(ZL_DPLL_MODE_REFSEL_MODE, chan->mode_refsel);
++}
++
++/**
++ * zl3073x_chan_ref_get - get manually selected reference
++ * @chan: pointer to channel state
++ *
++ * Return: reference selected in forced reference lock mode
++ */
++static inline u8 zl3073x_chan_ref_get(const struct zl3073x_chan *chan)
++{
++	return FIELD_GET(ZL_DPLL_MODE_REFSEL_REF, chan->mode_refsel);
++}
++
++/**
++ * zl3073x_chan_mode_set - set DPLL channel operating mode
++ * @chan: pointer to channel state
++ * @mode: mode to set
++ */
++static inline void zl3073x_chan_mode_set(struct zl3073x_chan *chan, u8 mode)
++{
++	chan->mode_refsel &= ~ZL_DPLL_MODE_REFSEL_MODE;
++	chan->mode_refsel |= FIELD_PREP(ZL_DPLL_MODE_REFSEL_MODE, mode);
++}
++
++/**
++ * zl3073x_chan_ref_set - set manually selected reference
++ * @chan: pointer to channel state
++ * @ref: reference to set
++ */
++static inline void zl3073x_chan_ref_set(struct zl3073x_chan *chan, u8 ref)
++{
++	chan->mode_refsel &= ~ZL_DPLL_MODE_REFSEL_REF;
++	chan->mode_refsel |= FIELD_PREP(ZL_DPLL_MODE_REFSEL_REF, ref);
++}
++
++#endif /* _ZL3073X_CHAN_H */
+diff --git a/drivers/dpll/zl3073x/core.c b/drivers/dpll/zl3073x/core.c
+index b8b541258001..eddf44aefe31 100644
+--- a/drivers/dpll/zl3073x/core.c
++++ b/drivers/dpll/zl3073x/core.c
+@@ -588,6 +588,16 @@ zl3073x_dev_state_fetch(struct zl3073x_dev *zldev)
+ 		}
+ 	}
+ 
++	for (i = 0; i < zldev->info->num_channels; i++) {
++		rc = zl3073x_chan_state_fetch(zldev, i);
++		if (rc) {
++			dev_err(zldev->dev,
++				"Failed to fetch channel state: %pe\n",
++				ERR_PTR(rc));
++			return rc;
++		}
++	}
++
+ 	return rc;
+ }
+ 
+diff --git a/drivers/dpll/zl3073x/core.h b/drivers/dpll/zl3073x/core.h
+index fd2af3c62a7d..f4f66a907b83 100644
+--- a/drivers/dpll/zl3073x/core.h
++++ b/drivers/dpll/zl3073x/core.h
+@@ -9,6 +9,7 @@
+ #include <linux/mutex.h>
+ #include <linux/types.h>
+ 
++#include "chan.h"
+ #include "out.h"
+ #include "ref.h"
+ #include "regs.h"
+@@ -39,6 +40,7 @@ struct zl3073x_dpll;
+  * @ref: array of input references' invariants
+  * @out: array of outs' invariants
+  * @synth: array of synths' invariants
++ * @chan: array of DPLL channels' state
+  * @dplls: list of DPLLs
+  * @kworker: thread for periodic work
+  * @work: periodic work
+@@ -55,6 +57,7 @@ struct zl3073x_dev {
+ 	struct zl3073x_ref	ref[ZL3073X_NUM_REFS];
+ 	struct zl3073x_out	out[ZL3073X_NUM_OUTS];
+ 	struct zl3073x_synth	synth[ZL3073X_NUM_SYNTHS];
++	struct zl3073x_chan	chan[ZL3073X_MAX_CHANNELS];
+ 
+ 	/* DPLL channels */
+ 	struct list_head	dplls;
+* Unmerged path drivers/dpll/zl3073x/dpll.c
+diff --git a/drivers/dpll/zl3073x/dpll.h b/drivers/dpll/zl3073x/dpll.h
+index c65c798c3792..bcf6b744bdb3 100644
+--- a/drivers/dpll/zl3073x/dpll.h
++++ b/drivers/dpll/zl3073x/dpll.h
+@@ -13,8 +13,6 @@
+  * @list: this DPLL list entry
+  * @dev: pointer to multi-function parent device
+  * @id: DPLL index
+- * @refsel_mode: reference selection mode
+- * @forced_ref: selected reference in forced reference lock mode
+  * @check_count: periodic check counter
+  * @phase_monitor: is phase offset monitor enabled
+  * @dpll_dev: pointer to registered DPLL device
+@@ -27,8 +25,6 @@ struct zl3073x_dpll {
+ 	struct list_head		list;
+ 	struct zl3073x_dev		*dev;
+ 	u8				id;
+-	u8				refsel_mode;
+-	u8				forced_ref;
+ 	u8				check_count;
+ 	bool				phase_monitor;
+ 	struct dpll_device		*dpll_dev;
