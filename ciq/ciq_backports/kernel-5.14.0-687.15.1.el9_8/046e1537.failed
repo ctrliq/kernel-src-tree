@@ -1,0 +1,123 @@
+net: set default rss queues num to physical cores / 2
+
+jira KERNEL-1138
+Rebuild_History Non-Buildable kernel-5.14.0-687.15.1.el9_8
+Rebuild_CHGLOG: - ice: set default rss queues num to physical cores / 2 (Michal Schmidt) [RHEL-174336]
+Rebuild_FUZZ: 96.23%
+commit-author Íñigo Huguet <ihuguet@redhat.com>
+commit 046e1537a3cf0adc68fe865b5dc9a7e731cc63b3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.15.1.el9_8/046e1537.failed
+
+Network drivers can call to netif_get_num_default_rss_queues to get the
+default number of receive queues to use. Right now, this default number
+is min(8, num_online_cpus()).
+
+Instead, as suggested by Jakub, use the number of physical cores divided
+by 2 as a way to avoid wasting CPU resources and to avoid using both CPU
+threads, but still allowing to scale for high-end processors with many
+cores.
+
+As an exception, select 2 queues for processors with 2 cores, because
+otherwise it won't take any advantage of RSS despite being SMP capable.
+
+Tested: Processor Intel Xeon E5-2620 (2 sockets, 6 cores/socket, 2
+threads/core). NIC Broadcom NetXtreme II BCM57810 (10GBps). Ran some
+tests with `perf stat iperf3 -R`, with parallelisms of 1, 8 and 24,
+getting the following results:
+- Number of queues: 6 (instead of 8)
+- Network throughput: not affected
+- CPU usage: utilized 0.05-0.12 CPUs more than before (having 24 CPUs
+  this is only 0.2-0.5% higher)
+- Reduced the number of context switches by 7-50%, being more noticeable
+  when using a higher number of parallel threads.
+
+	Suggested-by: Jakub Kicinski <kuba@kernel.org>
+	Signed-off-by: Íñigo Huguet <ihuguet@redhat.com>
+Link: https://lore.kernel.org/r/20220315091832.13873-1-ihuguet@redhat.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 046e1537a3cf0adc68fe865b5dc9a7e731cc63b3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netdevice.h
+diff --cc include/linux/netdevice.h
+index a95b5b945ad0,e01a8ce7181f..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -4152,11 -3646,33 +4152,32 @@@ static inline int netif_set_real_num_rx
+  int netif_set_real_num_queues(struct net_device *dev,
+  			      unsigned int txq, unsigned int rxq);
+  
+++<<<<<<< HEAD
+ +#define DEFAULT_MAX_NUM_RSS_QUEUES	(8)
+++=======
++ static inline struct netdev_rx_queue *
++ __netif_get_rx_queue(struct net_device *dev, unsigned int rxq)
++ {
++ 	return dev->_rx + rxq;
++ }
++ 
++ #ifdef CONFIG_SYSFS
++ static inline unsigned int get_netdev_rx_queue_index(
++ 		struct netdev_rx_queue *queue)
++ {
++ 	struct net_device *dev = queue->dev;
++ 	int index = queue - dev->_rx;
++ 
++ 	BUG_ON(index >= dev->num_rx_queues);
++ 	return index;
++ }
++ #endif
++ 
+++>>>>>>> 046e1537a3cf (net: set default rss queues num to physical cores / 2)
+  int netif_get_num_default_rss_queues(void);
+  
+ -enum skb_free_reason {
+ -	SKB_REASON_CONSUMED,
+ -	SKB_REASON_DROPPED,
+ -};
+ -
+ -void __dev_kfree_skb_irq(struct sk_buff *skb, enum skb_free_reason reason);
+ -void __dev_kfree_skb_any(struct sk_buff *skb, enum skb_free_reason reason);
+ +void dev_kfree_skb_irq_reason(struct sk_buff *skb, enum skb_drop_reason reason);
+ +void dev_kfree_skb_any_reason(struct sk_buff *skb, enum skb_drop_reason reason);
+  
+  /*
+   * It is not allowed to call kfree_skb() or consume_skb() from hardware
+* Unmerged path include/linux/netdevice.h
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 01e8bbf39be9..f8c6b74ae5a9 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -3323,13 +3323,25 @@ EXPORT_SYMBOL(netif_inherit_tso_max);
+ /**
+  * netif_get_num_default_rss_queues - default number of RSS queues
+  *
+- * This routine should set an upper limit on the number of RSS queues
+- * used by default by multiqueue devices.
++ * Default value is the number of physical cores if there are only 1 or 2, or
++ * divided by 2 if there are more.
+  */
+ int netif_get_num_default_rss_queues(void)
+ {
+-	return is_kdump_kernel() ?
+-		1 : min_t(int, DEFAULT_MAX_NUM_RSS_QUEUES, num_online_cpus());
++	cpumask_var_t cpus;
++	int cpu, count = 0;
++
++	if (unlikely(is_kdump_kernel() || !zalloc_cpumask_var(&cpus, GFP_KERNEL)))
++		return 1;
++
++	cpumask_copy(cpus, cpu_online_mask);
++	for_each_cpu(cpu, cpus) {
++		++count;
++		cpumask_andnot(cpus, cpus, topology_sibling_cpumask(cpu));
++	}
++	free_cpumask_var(cpus);
++
++	return count > 2 ? DIV_ROUND_UP(count, 2) : count;
+ }
+ EXPORT_SYMBOL(netif_get_num_default_rss_queues);
+ 
