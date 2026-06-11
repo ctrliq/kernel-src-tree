@@ -582,14 +582,20 @@ static const struct file_operations nvme_ns_head_chr_fops = {
 static int nvme_add_ns_head_cdev(struct nvme_ns_head *head)
 {
 	int ret;
+	char name[32];
 
 	head->cdev_device.parent = &head->subsys->dev;
-	ret = dev_set_name(&head->cdev_device, "ng%dn%d",
-			   head->subsys->instance, head->instance);
-	if (ret)
-		return ret;
-	ret = nvme_cdev_add(&head->cdev, &head->cdev_device,
+	snprintf(name, sizeof(name), "ng%dn%d", head->subsys->instance,
+		 head->instance);
+
+	ret = nvme_cdev_add(name, &head->cdev, &head->cdev_device,
 			    &nvme_ns_head_chr_fops, THIS_MODULE);
+	if (ret) {
+		dev_err(disk_to_dev(head->disk),
+			"Unable to create the %s device\n", name);
+	} else {
+		set_bit(NVME_NSHEAD_CDEV_LIVE, &head->flags);
+	}
 	return ret;
 }
 
@@ -1151,7 +1157,8 @@ void nvme_mpath_shutdown_disk(struct nvme_ns_head *head)
 	if (!head->disk)
 		return;
 	if (test_and_clear_bit(NVME_NSHEAD_DISK_LIVE, &head->flags)) {
-		nvme_cdev_del(&head->cdev, &head->cdev_device);
+		if (test_and_clear_bit(NVME_NSHEAD_CDEV_LIVE, &head->flags))
+			nvme_cdev_del(&head->cdev, &head->cdev_device);
 		/*
 		 * requeue I/O after NVME_NSHEAD_DISK_LIVE has been cleared
 		 * to allow multipath to fail all I/O.
