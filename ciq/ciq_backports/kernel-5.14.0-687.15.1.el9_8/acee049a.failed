@@ -1,0 +1,256 @@
+dpll: zl3073x: drop selected and simplify connected ref getter
+
+jira KERNEL-1138
+Rebuild_History Non-Buildable kernel-5.14.0-687.15.1.el9_8
+commit-author Ivan Vecera <ivecera@redhat.com>
+commit acee049a6af2a7b4baabd28f16fb53628ea6e7a5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.15.1.el9_8/acee049a.failed
+
+The HW reports the currently selected reference in the
+dpll_refsel_status register regardless of the DPLL mode. Use this to
+delete zl3073x_dpll_selected_ref_get() and have callers read the
+register directly via the cached channel state.
+
+Simplify zl3073x_dpll_connected_ref_get() to check refsel_state for
+LOCK directly and return the reference index, changing the return
+type from int to u8. The redundant ref_is_status_ok check is removed
+since the DPLL cannot be in LOCK state with a failed reference.
+
+In zl3073x_dpll_mode_set(), replace the selected_ref_get() call with
+zl3073x_chan_refsel_ref_get() to read the currently selected
+reference directly from the cached channel state.
+
+	Signed-off-by: Ivan Vecera <ivecera@redhat.com>
+Link: https://patch.msgid.link/20260315174224.399074-7-ivecera@redhat.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit acee049a6af2a7b4baabd28f16fb53628ea6e7a5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/dpll/zl3073x/dpll.c
+diff --cc drivers/dpll/zl3073x/dpll.c
+index 8ffbede117c6,a29f606318f6..000000000000
+--- a/drivers/dpll/zl3073x/dpll.c
++++ b/drivers/dpll/zl3073x/dpll.c
+@@@ -246,155 -244,26 +246,152 @@@ zl3073x_dpll_input_pin_frequency_set(co
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * zl3073x_dpll_selected_ref_get - get currently selected reference
+ + * @zldpll: pointer to zl3073x_dpll
+ + * @ref: place to store selected reference
+ + *
+ + * Check for currently selected reference the DPLL should be locked to
+ + * and stores its index to given @ref.
+ + *
+ + * Return: 0 on success, <0 on error
+ + */
+ +static int
+ +zl3073x_dpll_selected_ref_get(struct zl3073x_dpll *zldpll, u8 *ref)
+ +{
+ +	struct zl3073x_dev *zldev = zldpll->dev;
+ +	u8 state, value;
+ +	int rc;
+ +
+ +	switch (zldpll->refsel_mode) {
+ +	case ZL_DPLL_MODE_REFSEL_MODE_AUTO:
+ +		/* For automatic mode read refsel_status register */
+ +		rc = zl3073x_read_u8(zldev,
+ +				     ZL_REG_DPLL_REFSEL_STATUS(zldpll->id),
+ +				     &value);
+ +		if (rc)
+ +			return rc;
+ +
+ +		/* Extract reference state */
+ +		state = FIELD_GET(ZL_DPLL_REFSEL_STATUS_STATE, value);
+ +
+ +		/* Return the reference only if the DPLL is locked to it */
+ +		if (state == ZL_DPLL_REFSEL_STATUS_STATE_LOCK)
+ +			*ref = FIELD_GET(ZL_DPLL_REFSEL_STATUS_REFSEL, value);
+ +		else
+ +			*ref = ZL3073X_DPLL_REF_NONE;
+ +		break;
+ +	case ZL_DPLL_MODE_REFSEL_MODE_REFLOCK:
+ +		/* For manual mode return stored value */
+ +		*ref = zldpll->forced_ref;
+ +		break;
+ +	default:
+ +		/* For other modes like NCO, freerun... there is no input ref */
+ +		*ref = ZL3073X_DPLL_REF_NONE;
+ +		break;
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+ +/**
+ + * zl3073x_dpll_selected_ref_set - select reference in manual mode
+ + * @zldpll: pointer to zl3073x_dpll
+ + * @ref: input reference to be selected
+ + *
+ + * Selects the given reference for the DPLL channel it should be
+ + * locked to.
+ + *
+ + * Return: 0 on success, <0 on error
+ + */
+ +static int
+ +zl3073x_dpll_selected_ref_set(struct zl3073x_dpll *zldpll, u8 ref)
+ +{
+ +	struct zl3073x_dev *zldev = zldpll->dev;
+ +	u8 mode, mode_refsel;
+ +	int rc;
+ +
+ +	mode = zldpll->refsel_mode;
+ +
+ +	switch (mode) {
+ +	case ZL_DPLL_MODE_REFSEL_MODE_REFLOCK:
+ +		/* Manual mode with ref selected */
+ +		if (ref == ZL3073X_DPLL_REF_NONE) {
+ +			switch (zldpll->lock_status) {
+ +			case DPLL_LOCK_STATUS_LOCKED_HO_ACQ:
+ +			case DPLL_LOCK_STATUS_HOLDOVER:
+ +				/* Switch to forced holdover */
+ +				mode = ZL_DPLL_MODE_REFSEL_MODE_HOLDOVER;
+ +				break;
+ +			default:
+ +				/* Switch to freerun */
+ +				mode = ZL_DPLL_MODE_REFSEL_MODE_FREERUN;
+ +				break;
+ +			}
+ +			/* Keep selected reference */
+ +			ref = zldpll->forced_ref;
+ +		} else if (ref == zldpll->forced_ref) {
+ +			/* No register update - same mode and same ref */
+ +			return 0;
+ +		}
+ +		break;
+ +	case ZL_DPLL_MODE_REFSEL_MODE_FREERUN:
+ +	case ZL_DPLL_MODE_REFSEL_MODE_HOLDOVER:
+ +		/* Manual mode without no ref */
+ +		if (ref == ZL3073X_DPLL_REF_NONE)
+ +			/* No register update - keep current mode */
+ +			return 0;
+ +
+ +		/* Switch to reflock mode and update ref selection */
+ +		mode = ZL_DPLL_MODE_REFSEL_MODE_REFLOCK;
+ +		break;
+ +	default:
+ +		/* For other modes like automatic or NCO ref cannot be selected
+ +		 * manually
+ +		 */
+ +		return -EOPNOTSUPP;
+ +	}
+ +
+ +	/* Build mode_refsel value */
+ +	mode_refsel = FIELD_PREP(ZL_DPLL_MODE_REFSEL_MODE, mode) |
+ +		      FIELD_PREP(ZL_DPLL_MODE_REFSEL_REF, ref);
+ +
+ +	/* Update dpll_mode_refsel register */
+ +	rc = zl3073x_write_u8(zldev, ZL_REG_DPLL_MODE_REFSEL(zldpll->id),
+ +			      mode_refsel);
+ +	if (rc)
+ +		return rc;
+ +
+ +	/* Store new mode and forced reference */
+ +	zldpll->refsel_mode = mode;
+ +	zldpll->forced_ref = ref;
+ +
+ +	return rc;
+ +}
+ +
+ +/**
+++=======
+++>>>>>>> acee049a6af2 (dpll: zl3073x: drop selected and simplify connected ref getter)
+   * zl3073x_dpll_connected_ref_get - get currently connected reference
+   * @zldpll: pointer to zl3073x_dpll
+-  * @ref: place to store selected reference
+   *
+-  * Looks for currently connected the DPLL is locked to and stores its index
+-  * to given @ref.
++  * Looks for currently connected reference the DPLL is locked to.
+   *
+-  * Return: 0 on success, <0 on error
++  * Return: reference index if locked, ZL3073X_DPLL_REF_NONE otherwise
+   */
+- static int
+- zl3073x_dpll_connected_ref_get(struct zl3073x_dpll *zldpll, u8 *ref)
++ static u8
++ zl3073x_dpll_connected_ref_get(struct zl3073x_dpll *zldpll)
+  {
+- 	struct zl3073x_dev *zldev = zldpll->dev;
+- 	int rc;
++ 	const struct zl3073x_chan *chan = zl3073x_chan_state_get(zldpll->dev,
++ 								 zldpll->id);
++ 	u8 state;
+  
+- 	/* Get currently selected input reference */
+- 	rc = zl3073x_dpll_selected_ref_get(zldpll, ref);
+- 	if (rc)
+- 		return rc;
++ 	/* A reference is connected only when the DPLL is locked to it */
++ 	state = zl3073x_chan_refsel_state_get(chan);
++ 	if (state == ZL_DPLL_REFSEL_STATUS_STATE_LOCK)
++ 		return zl3073x_chan_refsel_ref_get(chan);
+  
+- 	/* If the monitor indicates an error nothing is connected */
+- 	if (ZL3073X_DPLL_REF_IS_VALID(*ref) &&
+- 	    !zl3073x_dev_ref_is_status_ok(zldev, *ref))
+- 		*ref = ZL3073X_DPLL_REF_NONE;
+- 
+- 	return 0;
++ 	return ZL3073X_DPLL_REF_NONE;
+  }
+  
+  static int
+@@@ -624,17 -398,14 +618,18 @@@ zl3073x_dpll_ref_state_get(struct zl307
+  {
+  	struct zl3073x_dpll *zldpll = pin->dpll;
+  	struct zl3073x_dev *zldev = zldpll->dev;
+++<<<<<<< HEAD
+ +	u8 ref, ref_conn;
+ +	int rc;
+++=======
++ 	const struct zl3073x_chan *chan;
++ 	u8 ref;
+++>>>>>>> acee049a6af2 (dpll: zl3073x: drop selected and simplify connected ref getter)
+  
+ -	chan = zl3073x_chan_state_get(zldev, zldpll->id);
+  	ref = zl3073x_input_pin_ref_get(pin->id);
+  
+- 	/* Get currently connected reference */
+- 	rc = zl3073x_dpll_connected_ref_get(zldpll, &ref_conn);
+- 	if (rc)
+- 		return rc;
+- 
+- 	if (ref == ref_conn) {
++ 	/* Check if the pin reference is connected */
++ 	if (ref == zl3073x_dpll_connected_ref_get(zldpll)) {
+  		*state = DPLL_PIN_STATE_CONNECTED;
+  		return 0;
+  	}
+@@@ -1220,14 -1030,12 +1215,19 @@@ zl3073x_dpll_mode_set(const struct dpll
+  		      enum dpll_mode mode, struct netlink_ext_ack *extack)
+  {
+  	struct zl3073x_dpll *zldpll = dpll_priv;
+ -	struct zl3073x_chan chan;
+ -	u8 hw_mode, ref;
+ +	u8 hw_mode, mode_refsel, ref;
+  	int rc;
+  
+++<<<<<<< HEAD
+ +	rc = zl3073x_dpll_selected_ref_get(zldpll, &ref);
+ +	if (rc) {
+ +		NL_SET_ERR_MSG_MOD(extack, "failed to get selected reference");
+ +		return rc;
+ +	}
+++=======
++ 	chan = *zl3073x_chan_state_get(zldpll->dev, zldpll->id);
++ 	ref = zl3073x_chan_refsel_ref_get(&chan);
+++>>>>>>> acee049a6af2 (dpll: zl3073x: drop selected and simplify connected ref getter)
+  
+  	if (mode == DPLL_MODE_MANUAL) {
+  		/* We are switching from automatic to manual mode:
+* Unmerged path drivers/dpll/zl3073x/dpll.c
