@@ -1,0 +1,124 @@
+netfilter: ctnetlink: ensure safe access to master conntrack
+
+jira KERNEL-1138
+cve CVE-2026-43116
+Rebuild_History Non-Buildable kernel-5.14.0-687.15.1.el9_8
+commit-author Pablo Neira Ayuso <pablo@netfilter.org>
+commit bffcaad9afdfe45d7fc777397d3b83c1e3ebffe5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.15.1.el9_8/bffcaad9.failed
+
+Holding reference on the expectation is not sufficient, the master
+conntrack object can just go away, making exp->master invalid.
+
+To access exp->master safely:
+
+- Grab the nf_conntrack_expect_lock, this gets serialized with
+  clean_from_lists() which also holds this lock when the master
+  conntrack goes away.
+
+- Hold reference on master conntrack via nf_conntrack_find_get().
+  Not so easy since the master tuple to look up for the master conntrack
+  is not available in the existing problematic paths.
+
+This patch goes for extending the nf_conntrack_expect_lock section
+to address this issue for simplicity, in the cases that are described
+below this is just slightly extending the lock section.
+
+The add expectation command already holds a reference to the master
+conntrack from ctnetlink_create_expect().
+
+However, the delete expectation command needs to grab the spinlock
+before looking up for the expectation. Expand the existing spinlock
+section to address this to cover the expectation lookup. Note that,
+the nf_ct_expect_iterate_net() calls already grabs the spinlock while
+iterating over the expectation table, which is correct.
+
+The get expectation command needs to grab the spinlock to ensure master
+conntrack does not go away. This also expands the existing spinlock
+section to cover the expectation lookup too. I needed to move the
+netlink skb allocation out of the spinlock to keep it GFP_KERNEL.
+
+For the expectation events, the IPEXP_DESTROY event is already delivered
+under the spinlock, just move the delivery of IPEXP_NEW under the
+spinlock too because the master conntrack event cache is reached through
+exp->master.
+
+While at it, add lockdep notations to help identify what codepaths need
+to grab the spinlock.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit bffcaad9afdfe45d7fc777397d3b83c1e3ebffe5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_conntrack_expect.c
+#	net/netfilter/nf_conntrack_netlink.c
+diff --cc net/netfilter/nf_conntrack_expect.c
+index ce1ac3187f1c,1cbe5f1108c2..000000000000
+--- a/net/netfilter/nf_conntrack_expect.c
++++ b/net/netfilter/nf_conntrack_expect.c
+@@@ -118,7 -119,9 +119,13 @@@ nf_ct_exp_equal(const struct nf_conntra
+  
+  bool nf_ct_remove_expect(struct nf_conntrack_expect *exp)
+  {
+++<<<<<<< HEAD
+ +	if (del_timer(&exp->timeout)) {
+++=======
++ 	lockdep_nfct_expect_lock_held();
++ 
++ 	if (timer_delete(&exp->timeout)) {
+++>>>>>>> bffcaad9afdf (netfilter: ctnetlink: ensure safe access to master conntrack)
+  		nf_ct_unlink_expect(exp);
+  		nf_ct_expect_put(exp);
+  		return true;
+diff --cc net/netfilter/nf_conntrack_netlink.c
+index 91151e5df688,89540112d165..000000000000
+--- a/net/netfilter/nf_conntrack_netlink.c
++++ b/net/netfilter/nf_conntrack_netlink.c
+@@@ -3418,8 -3452,7 +3429,12 @@@ static int ctnetlink_del_expect(struct 
+  		}
+  
+  		/* after list removal, usage count == 1 */
+++<<<<<<< HEAD
+ +		spin_lock_bh(&nf_conntrack_expect_lock);
+ +		if (del_timer(&exp->timeout)) {
+++=======
++ 		if (timer_delete(&exp->timeout)) {
+++>>>>>>> bffcaad9afdf (netfilter: ctnetlink: ensure safe access to master conntrack)
+  			nf_ct_unlink_expect_report(exp, NETLINK_CB(skb).portid,
+  						   nlmsg_report(info->nlh));
+  			nf_ct_expect_put(exp);
+diff --git a/include/net/netfilter/nf_conntrack_core.h b/include/net/netfilter/nf_conntrack_core.h
+index ff315e3ae75f..6ff83618e968 100644
+--- a/include/net/netfilter/nf_conntrack_core.h
++++ b/include/net/netfilter/nf_conntrack_core.h
+@@ -84,6 +84,11 @@ void nf_conntrack_lock(spinlock_t *lock);
+ 
+ extern spinlock_t nf_conntrack_expect_lock;
+ 
++static inline void lockdep_nfct_expect_lock_held(void)
++{
++	lockdep_assert_held(&nf_conntrack_expect_lock);
++}
++
+ /* ctnetlink code shared by both ctnetlink and nf_conntrack_bpf */
+ 
+ #if (IS_BUILTIN(CONFIG_NF_CONNTRACK) && IS_ENABLED(CONFIG_DEBUG_INFO_BTF)) || \
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index 69948e1d6974..6526bdcca580 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -237,6 +237,8 @@ void nf_ct_expect_event_report(enum ip_conntrack_expect_events event,
+ 	struct nf_ct_event_notifier *notify;
+ 	struct nf_conntrack_ecache *e;
+ 
++	lockdep_nfct_expect_lock_held();
++
+ 	rcu_read_lock();
+ 	notify = rcu_dereference(net->ct.nf_conntrack_event_cb);
+ 	if (!notify)
+* Unmerged path net/netfilter/nf_conntrack_expect.c
+* Unmerged path net/netfilter/nf_conntrack_netlink.c
