@@ -1,0 +1,119 @@
+dlm: validate length in dlm_search_rsb_tree
+
+jira KERNEL-1138
+cve CVE-2026-43125
+Rebuild_History Non-Buildable kernel-5.14.0-687.15.1.el9_8
+commit-author Ezrak1e <ezrakiez@gmail.com>
+commit 080e5563f878c64e697b89e7439d730d0daad882
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.15.1.el9_8/080e5563.failed
+
+The len parameter in dlm_dump_rsb_name() is not validated and comes
+from network messages. When it exceeds DLM_RESNAME_MAXLEN, it can
+cause out-of-bounds write in dlm_search_rsb_tree().
+
+Add length validation to prevent potential buffer overflow.
+
+	Signed-off-by: Ezrak1e <ezrakiez@gmail.com>
+	Signed-off-by: Alexander Aring <aahringo@redhat.com>
+	Signed-off-by: David Teigland <teigland@redhat.com>
+(cherry picked from commit 080e5563f878c64e697b89e7439d730d0daad882)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dlm/lock.c
+diff --cc fs/dlm/lock.c
+index fe0cf674b854,a393ecaf3442..000000000000
+--- a/fs/dlm/lock.c
++++ b/fs/dlm/lock.c
+@@@ -433,67 -622,30 +433,79 @@@ static int get_rsb_struct(struct dlm_l
+  	return 0;
+  }
+  
+ -int dlm_search_rsb_tree(struct rhashtable *rhash, const void *name, int len,
+ -			struct dlm_rsb **r_ret)
+ +static int rsb_cmp(struct dlm_rsb *r, const char *name, int nlen)
+  {
+++<<<<<<< HEAD
+ +	char maxname[DLM_RESNAME_MAXLEN];
+ +
+ +	memset(maxname, 0, DLM_RESNAME_MAXLEN);
+ +	memcpy(maxname, name, nlen);
+ +	return memcmp(r->res_name, maxname, DLM_RESNAME_MAXLEN);
+++=======
++ 	char key[DLM_RESNAME_MAXLEN] = {};
++ 	if (len > DLM_RESNAME_MAXLEN)
++ 		return -EINVAL;
++ 	memcpy(key, name, len);
++ 	*r_ret = rhashtable_lookup_fast(rhash, &key, dlm_rhash_rsb_params);
++ 	if (*r_ret)
++ 		return 0;
++ 
++ 	return -EBADR;
+++>>>>>>> 080e5563f878 (dlm: validate length in dlm_search_rsb_tree)
+  }
+  
+ -static int rsb_insert(struct dlm_rsb *rsb, struct rhashtable *rhash)
+ +int dlm_search_rsb_tree(struct rb_root *tree, char *name, int len,
+ +			struct dlm_rsb **r_ret)
+  {
+ -	int rv;
+ +	struct rb_node *node = tree->rb_node;
+ +	struct dlm_rsb *r;
+ +	int rc;
+ +
+ +	while (node) {
+ +		r = rb_entry(node, struct dlm_rsb, res_hashnode);
+ +		rc = rsb_cmp(r, name, len);
+ +		if (rc < 0)
+ +			node = node->rb_left;
+ +		else if (rc > 0)
+ +			node = node->rb_right;
+ +		else
+ +			goto found;
+ +	}
+ +	*r_ret = NULL;
+ +	return -EBADR;
+ +
+ + found:
+ +	*r_ret = r;
+ +	return 0;
+ +}
+ +
+ +static int rsb_insert(struct dlm_rsb *rsb, struct rb_root *tree)
+ +{
+ +	struct rb_node **newn = &tree->rb_node;
+ +	struct rb_node *parent = NULL;
+ +	int rc;
+  
+ -	rv = rhashtable_insert_fast(rhash, &rsb->res_node,
+ -				    dlm_rhash_rsb_params);
+ -	if (!rv)
+ -		rsb_set_flag(rsb, RSB_HASHED);
+ +	while (*newn) {
+ +		struct dlm_rsb *cur = rb_entry(*newn, struct dlm_rsb,
+ +					       res_hashnode);
+  
+ -	return rv;
+ +		parent = *newn;
+ +		rc = rsb_cmp(cur, rsb->res_name, rsb->res_length);
+ +		if (rc < 0)
+ +			newn = &parent->rb_left;
+ +		else if (rc > 0)
+ +			newn = &parent->rb_right;
+ +		else {
+ +			log_print("rsb_insert match");
+ +			dlm_dump_rsb(rsb);
+ +			dlm_dump_rsb(cur);
+ +			return -EEXIST;
+ +		}
+ +	}
+ +
+ +	rb_link_node(&rsb->res_hashnode, parent, newn);
+ +	rb_insert_color(&rsb->res_hashnode, tree);
+ +	return 0;
+  }
+  
+  /*
+* Unmerged path fs/dlm/lock.c
