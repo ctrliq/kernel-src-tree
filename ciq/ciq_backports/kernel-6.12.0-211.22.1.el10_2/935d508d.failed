@@ -1,0 +1,101 @@
+lsm: get rid of the lsm_names list and do some cleanup
+
+jira KERNEL-1156
+cve CVE-2026-46054
+Rebuild_History Non-Buildable kernel-6.12.0-211.22.1.el10_2
+commit-author Paul Moore <paul@paul-moore.com>
+commit 935d508d4d7ab9d19c603bd7eb2937249551d507
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.22.1.el10_2/935d508d.failed
+
+The LSM currently has a lot of code to maintain a list of the currently
+active LSMs in a human readable string, with the only user being the
+"/sys/kernel/security/lsm" code.  Let's drop all of that code and
+generate the string on first use and then cache it for subsequent use.
+
+	Signed-off-by: Paul Moore <paul@paul-moore.com>
+(cherry picked from commit 935d508d4d7ab9d19c603bd7eb2937249551d507)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	security/lsm_init.c
+* Unmerged path security/lsm_init.c
+diff --git a/include/linux/lsm_hooks.h b/include/linux/lsm_hooks.h
+index 090d1d3e19fe..367d878be389 100644
+--- a/include/linux/lsm_hooks.h
++++ b/include/linux/lsm_hooks.h
+@@ -168,7 +168,6 @@ struct lsm_info {
+ 		__aligned(sizeof(unsigned long))
+ 
+ /* DO NOT tamper with these variables outside of the LSM framework */
+-extern char *lsm_names;
+ extern struct lsm_static_calls_table static_calls_table __ro_after_init;
+ extern struct lsm_info __start_lsm_info[], __end_lsm_info[];
+ extern struct lsm_info __start_early_lsm_info[], __end_early_lsm_info[];
+diff --git a/security/inode.c b/security/inode.c
+index da3ab44c8e57..6f3caab37ab2 100644
+--- a/security/inode.c
++++ b/security/inode.c
+@@ -22,6 +22,8 @@
+ #include <linux/lsm_hooks.h>
+ #include <linux/magic.h>
+ 
++#include "lsm.h"
++
+ static struct vfsmount *mount;
+ static int mount_count;
+ 
+@@ -339,12 +341,49 @@ void securityfs_recursive_remove(struct dentry *dentry)
+ EXPORT_SYMBOL_GPL(securityfs_recursive_remove);
+ 
+ #ifdef CONFIG_SECURITY
++#include <linux/spinlock.h>
++
+ static struct dentry *lsm_dentry;
++
+ static ssize_t lsm_read(struct file *filp, char __user *buf, size_t count,
+ 			loff_t *ppos)
+ {
+-	return simple_read_from_buffer(buf, count, ppos, lsm_names,
+-		strlen(lsm_names));
++	int i;
++	static char *str;
++	static size_t len;
++	static DEFINE_SPINLOCK(lock);
++
++	/* NOTE: we never free or modify the string once it is set */
++
++	if (unlikely(!str || !len)) {
++		char *str_tmp;
++		size_t len_tmp = 0;
++
++		for (i = 0; i < lsm_active_cnt; i++)
++			/* the '+ 1' accounts for either a comma or a NUL */
++			len_tmp += strlen(lsm_idlist[i]->name) + 1;
++
++		str_tmp = kmalloc(len_tmp, GFP_KERNEL);
++		if (!str_tmp)
++			return -ENOMEM;
++		str_tmp[0] = '\0';
++
++		for (i = 0; i < lsm_active_cnt; i++) {
++			if (i > 0)
++				strcat(str_tmp, ",");
++			strcat(str_tmp, lsm_idlist[i]->name);
++		}
++
++		spin_lock(&lock);
++		if (!str) {
++			str = str_tmp;
++			len = len_tmp - 1;
++		} else
++			kfree(str_tmp);
++		spin_unlock(&lock);
++	}
++
++	return simple_read_from_buffer(buf, count, ppos, str, len);
+ }
+ 
+ static const struct file_operations lsm_ops = {
+* Unmerged path security/lsm_init.c
