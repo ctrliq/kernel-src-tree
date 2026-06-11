@@ -1,0 +1,694 @@
+lsm: add backing_file LSM hooks
+
+jira KERNEL-1156
+cve CVE-2026-46054
+Rebuild_History Non-Buildable kernel-6.12.0-211.22.1.el10_2
+commit-author Paul Moore <paul@paul-moore.com>
+commit 6af36aeb147a06dea47c49859cd6ca5659aeb987
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.22.1.el10_2/6af36aeb.failed
+
+Stacked filesystems such as overlayfs do not currently provide the
+necessary mechanisms for LSMs to properly enforce access controls on the
+mmap() and mprotect() operations.  In order to resolve this gap, a LSM
+security blob is being added to the backing_file struct and the following
+new LSM hooks are being created:
+
+ security_backing_file_alloc()
+ security_backing_file_free()
+ security_mmap_backing_file()
+
+The first two hooks are to manage the lifecycle of the LSM security blob
+in the backing_file struct, while the third provides a new mmap() access
+control point for the underlying backing file.  It is also expected that
+LSMs will likely want to update their security_file_mprotect() callback
+to address issues with their mprotect() controls, but that does not
+require a change to the security_file_mprotect() LSM hook.
+
+There are a three other small changes to support these new LSM hooks:
+* Pass the user file associated with a backing file down to
+alloc_empty_backing_file() so it can be included in the
+security_backing_file_alloc() hook.
+* Add getter and setter functions for the backing_file struct LSM blob
+as the backing_file struct remains private to fs/file_table.c.
+* Constify the file struct field in the LSM common_audit_data struct to
+better support LSMs that need to pass a const file struct pointer into
+the common LSM audit code.
+
+Thanks to Arnd Bergmann for identifying the missing EXPORT_SYMBOL_GPL()
+and supplying a fixup.
+
+	Cc: stable@vger.kernel.org
+	Cc: linux-fsdevel@vger.kernel.org
+	Cc: linux-unionfs@vger.kernel.org
+	Cc: linux-erofs@lists.ozlabs.org
+	Reviewed-by: Amir Goldstein <amir73il@gmail.com>
+	Reviewed-by: Serge Hallyn <serge@hallyn.com>
+	Reviewed-by: Christian Brauner <brauner@kernel.org>
+	Signed-off-by: Paul Moore <paul@paul-moore.com>
+(cherry picked from commit 6af36aeb147a06dea47c49859cd6ca5659aeb987)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/backing-file.c
+#	fs/erofs/ishare.c
+#	fs/overlayfs/dir.c
+#	fs/overlayfs/file.c
+#	include/linux/lsm_hooks.h
+#	security/lsm.h
+#	security/lsm_init.c
+#	security/security.c
+diff --cc fs/backing-file.c
+index 892361c31c3d,1f3bbfc75882..000000000000
+--- a/fs/backing-file.c
++++ b/fs/backing-file.c
+@@@ -338,12 -339,16 +341,22 @@@ int backing_file_mmap(struct file *file
+  
+  	vma_set_file(vma, file);
+  
+++<<<<<<< HEAD
+ +	old_cred = override_creds(ctx->cred);
+ +	ret = call_mmap(vma->vm_file, vma);
+ +	revert_creds(old_cred);
+++=======
++ 	scoped_with_creds(ctx->cred) {
++ 		ret = security_mmap_backing_file(vma, file, user_file);
++ 		if (ret)
++ 			return ret;
++ 
++ 		ret = vfs_mmap(vma->vm_file, vma);
++ 	}
+++>>>>>>> 6af36aeb147a (lsm: add backing_file LSM hooks)
+  
+  	if (ctx->accessed)
+ -		ctx->accessed(user_file);
+ +		ctx->accessed(ctx->user_file);
+  
+  	return ret;
+  }
+diff --cc fs/overlayfs/dir.c
+index ab65e98a1def,f2f20a611af3..000000000000
+--- a/fs/overlayfs/dir.c
++++ b/fs/overlayfs/dir.c
+@@@ -1314,30 -1368,36 +1314,40 @@@ static int ovl_create_tmpfile(struct fi
+  	int flags = file->f_flags | OVL_OPEN_FLAGS;
+  	int err;
+  
+ -	scoped_class(override_creds_ovl, original_creds, dentry->d_sb) {
+ -		scoped_class(ovl_override_creator_creds, cred, original_creds, dentry, inode, mode) {
+ -			if (IS_ERR(cred))
+ -				return PTR_ERR(cred);
+ -
+ +	old_cred = ovl_override_creds(dentry->d_sb);
+ +	err = ovl_setup_cred_for_create(dentry, inode, mode, old_cred);
+ +	if (err)
+ +		goto out_revert_creds;
+ +
+++<<<<<<< HEAD
+ +	ovl_path_upper(dentry->d_parent, &realparentpath);
+ +	realfile = backing_tmpfile_open(&file->f_path, flags, &realparentpath,
+ +					mode, current_cred());
+ +	err = PTR_ERR_OR_ZERO(realfile);
+ +	pr_debug("tmpfile/open(%pd2, 0%o) = %i\n", realparentpath.dentry, mode, err);
+ +	if (err)
+ +		goto out_revert_creds;
+++=======
++ 			ovl_path_upper(dentry->d_parent, &realparentpath);
++ 			realfile = backing_tmpfile_open(file, flags, &realparentpath,
++ 							mode, current_cred());
++ 			err = PTR_ERR_OR_ZERO(realfile);
++ 			pr_debug("tmpfile/open(%pd2, 0%o) = %i\n", realparentpath.dentry, mode, err);
++ 			if (err)
++ 				return err;
+++>>>>>>> 6af36aeb147a (lsm: add backing_file LSM hooks)
+  
+ -			of = ovl_file_alloc(realfile);
+ -			if (!of) {
+ -				fput(realfile);
+ -				return -ENOMEM;
+ -			}
+ -
+ -			/* ovl_instantiate() consumes the newdentry reference on success */
+ -			newdentry = dget(realfile->f_path.dentry);
+ -			err = ovl_instantiate(dentry, inode, newdentry, false, file);
+ -			if (!err) {
+ -				file->private_data = of;
+ -			} else {
+ -				dput(newdentry);
+ -				ovl_file_free(of);
+ -			}
+ -		}
+ +	/* ovl_instantiate() consumes the newdentry reference on success */
+ +	newdentry = dget(realfile->f_path.dentry);
+ +	err = ovl_instantiate(dentry, inode, newdentry, false, file);
+ +	if (!err) {
+ +		file->private_data = realfile;
+ +	} else {
+ +		dput(newdentry);
+ +		fput(realfile);
+  	}
+ +out_revert_creds:
+ +	revert_creds(old_cred);
+  	return err;
+  }
+  
+diff --cc fs/overlayfs/file.c
+index 4444c78e2e0c,27cc07738f33..000000000000
+--- a/fs/overlayfs/file.c
++++ b/fs/overlayfs/file.c
+@@@ -39,19 -39,19 +39,25 @@@ static struct file *ovl_open_realfile(c
+  	if (flags & O_APPEND)
+  		acc_mode |= MAY_APPEND;
+  
+ -	with_ovl_creds(inode->i_sb) {
+ -		real_idmap = mnt_idmap(realpath->mnt);
+ -		err = inode_permission(real_idmap, realinode, MAY_OPEN | acc_mode);
+ -		if (err) {
+ -			realfile = ERR_PTR(err);
+ -		} else {
+ -			if (!inode_owner_or_capable(real_idmap, realinode))
+ -				flags &= ~O_NOATIME;
+ -
+ +	old_cred = ovl_override_creds(inode->i_sb);
+ +	real_idmap = mnt_idmap(realpath->mnt);
+ +	err = inode_permission(real_idmap, realinode, MAY_OPEN | acc_mode);
+ +	if (err) {
+ +		realfile = ERR_PTR(err);
+ +	} else {
+ +		if (!inode_owner_or_capable(real_idmap, realinode))
+ +			flags &= ~O_NOATIME;
+ +
+++<<<<<<< HEAD
+ +		realfile = backing_file_open(&file->f_path, flags, realpath,
+ +					     current_cred());
+++=======
++ 			realfile = backing_file_open(file,
++ 						     flags, realpath, current_cred());
++ 		}
+++>>>>>>> 6af36aeb147a (lsm: add backing_file LSM hooks)
+  	}
+ +	revert_creds(old_cred);
+  
+  	pr_debug("open(%p[%pD2/%c], 0%o) -> (%p, 0%o)\n",
+  		 file, file, ovl_whatisit(inode, realinode), file->f_flags,
+diff --cc include/linux/lsm_hooks.h
+index 090d1d3e19fe,b4f8cad53ddb..000000000000
+--- a/include/linux/lsm_hooks.h
++++ b/include/linux/lsm_hooks.h
+@@@ -102,20 -102,24 +102,41 @@@ struct security_hook_list 
+   * Security blob size or offset data.
+   */
+  struct lsm_blob_sizes {
+++<<<<<<< HEAD
+ +	int lbs_cred;
+ +	int lbs_file;
+ +	int lbs_ib;
+ +	int lbs_inode;
+ +	int lbs_sock;
+ +	int lbs_superblock;
+ +	int lbs_ipc;
+ +	int lbs_key;
+ +	int lbs_msg_msg;
+ +	int lbs_perf_event;
+ +	int lbs_task;
+ +	int lbs_xattr_count; /* number of xattr slots in new_xattrs array */
+ +	int lbs_tun_dev;
+ +	int lbs_bdev;
+++=======
++ 	unsigned int lbs_cred;
++ 	unsigned int lbs_file;
++ 	unsigned int lbs_backing_file;
++ 	unsigned int lbs_ib;
++ 	unsigned int lbs_inode;
++ 	unsigned int lbs_sock;
++ 	unsigned int lbs_superblock;
++ 	unsigned int lbs_ipc;
++ 	unsigned int lbs_key;
++ 	unsigned int lbs_msg_msg;
++ 	unsigned int lbs_perf_event;
++ 	unsigned int lbs_task;
++ 	unsigned int lbs_xattr_count; /* num xattr slots in new_xattrs array */
++ 	unsigned int lbs_tun_dev;
++ 	unsigned int lbs_bdev;
++ 	unsigned int lbs_bpf_map;
++ 	unsigned int lbs_bpf_prog;
++ 	unsigned int lbs_bpf_token;
+++>>>>>>> 6af36aeb147a (lsm: add backing_file LSM hooks)
+  };
+  
+  /*
+diff --cc security/security.c
+index fb106d16f2ba,680113625451..000000000000
+--- a/security/security.c
++++ b/security/security.c
+@@@ -91,21 -73,35 +91,27 @@@ const char *const lockdown_reasons[LOCK
+  	[LOCKDOWN_CONFIDENTIALITY_MAX] = "confidentiality",
+  };
+  
+ -bool lsm_debug __ro_after_init;
+ +static struct kmem_cache *lsm_file_cache;
+ +static struct kmem_cache *lsm_inode_cache;
+  
+ -unsigned int lsm_active_cnt __ro_after_init;
+ -const struct lsm_id *lsm_idlist[MAX_LSM_COUNT];
+ +char *lsm_names;
+ +static struct lsm_blob_sizes blob_sizes __ro_after_init;
+  
+ -struct lsm_blob_sizes blob_sizes;
+ +/* Boot-time LSM user choice */
+ +static __initdata const char *chosen_lsm_order;
+ +static __initdata const char *chosen_major_lsm;
+  
+++<<<<<<< HEAD
+ +static __initconst const char *const builtin_lsm_order = CONFIG_LSM;
+++=======
++ struct kmem_cache *lsm_file_cache;
++ struct kmem_cache *lsm_backing_file_cache;
++ struct kmem_cache *lsm_inode_cache;
+++>>>>>>> 6af36aeb147a (lsm: add backing_file LSM hooks)
+  
+ -#define SECURITY_HOOK_ACTIVE_KEY(HOOK, IDX) security_hook_active_##HOOK##_##IDX
+ -
+ -/*
+ - * Identifier for the LSM static calls.
+ - * HOOK is an LSM hook as defined in linux/lsm_hookdefs.h
+ - * IDX is the index of the static call. 0 <= NUM < MAX_LSM_COUNT
+ - */
+ -#define LSM_STATIC_CALL(HOOK, IDX) lsm_static_call_##HOOK##_##IDX
+ -
+ -/*
+ - * Call the macro M for each LSM hook MAX_LSM_COUNT times.
+ - */
+ -#define LSM_LOOP_UNROLL(M, ...) 		\
+ -do {						\
+ -	UNROLL(MAX_LSM_COUNT, M, __VA_ARGS__)	\
+ -} while (0)
+ -
+ -#define LSM_DEFINE_UNROLL(M, ...) UNROLL(MAX_LSM_COUNT, M, __VA_ARGS__)
+ +/* Ordered list of LSMs to initialize. */
+ +static __initdata struct lsm_info *ordered_lsms[MAX_LSM_COUNT + 1];
+ +static __initdata struct lsm_info *exclusive;
+  
+  #ifdef CONFIG_HAVE_STATIC_CALL
+  #define LSM_HOOK_TRAMP(NAME, NUM) \
+@@@ -518,136 -174,30 +524,162 @@@ int __init early_security_init(void
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * security_init - initializes the security framework
+ + *
+ + * This should be called early in the kernel initialization sequence.
+ + */
+ +int __init security_init(void)
+ +{
+ +	struct lsm_info *lsm;
+ +
+ +	init_debug("legacy security=%s\n", chosen_major_lsm ? : " *unspecified*");
+ +	init_debug("  CONFIG_LSM=%s\n", builtin_lsm_order);
+ +	init_debug("boot arg lsm=%s\n", chosen_lsm_order ? : " *unspecified*");
+ +
+ +	/*
+ +	 * Append the names of the early LSM modules now that kmalloc() is
+ +	 * available
+ +	 */
+ +	for (lsm = __start_early_lsm_info; lsm < __end_early_lsm_info; lsm++) {
+ +		init_debug("  early started: %s (%s)\n", lsm->name,
+ +			   is_enabled(lsm) ? "enabled" : "disabled");
+ +		if (lsm->enabled)
+ +			lsm_append(lsm->name, &lsm_names);
+ +	}
+ +
+ +	/* Load LSMs in specified order. */
+ +	ordered_lsm_init();
+ +
+ +	return 0;
+ +}
+ +
+ +/* Save user chosen LSM */
+ +static int __init choose_major_lsm(char *str)
+ +{
+ +	chosen_major_lsm = str;
+ +	return 1;
+ +}
+ +__setup("security=", choose_major_lsm);
+ +
+ +/* Explicitly choose LSM initialization order. */
+ +static int __init choose_lsm_order(char *str)
+ +{
+ +	chosen_lsm_order = str;
+ +	return 1;
+ +}
+ +__setup("lsm=", choose_lsm_order);
+ +
+ +/* Enable LSM order debugging. */
+ +static int __init enable_debug(char *str)
+ +{
+ +	debug = true;
+ +	return 1;
+ +}
+ +__setup("lsm.debug", enable_debug);
+ +
+ +static bool match_last_lsm(const char *list, const char *lsm)
+ +{
+ +	const char *last;
+ +
+ +	if (WARN_ON(!list || !lsm))
+ +		return false;
+ +	last = strrchr(list, ',');
+ +	if (last)
+ +		/* Pass the comma, strcmp() will check for '\0' */
+ +		last++;
+ +	else
+ +		last = list;
+ +	return !strcmp(last, lsm);
+ +}
+ +
+ +static int lsm_append(const char *new, char **result)
+ +{
+ +	char *cp;
+ +
+ +	if (*result == NULL) {
+ +		*result = kstrdup(new, GFP_KERNEL);
+ +		if (*result == NULL)
+ +			return -ENOMEM;
+ +	} else {
+ +		/* Check if it is the last registered name */
+ +		if (match_last_lsm(*result, new))
+ +			return 0;
+ +		cp = kasprintf(GFP_KERNEL, "%s,%s", *result, new);
+ +		if (cp == NULL)
+ +			return -ENOMEM;
+ +		kfree(*result);
+ +		*result = cp;
+ +	}
+++=======
++  * lsm_backing_file_alloc - allocate a composite backing file blob
++  * @backing_file: the backing file
++  *
++  * Allocate the backing file blob for all the modules.
++  *
++  * Returns 0, or -ENOMEM if memory can't be allocated.
++  */
++ static int lsm_backing_file_alloc(struct file *backing_file)
++ {
++ 	void *blob;
++ 
++ 	if (!lsm_backing_file_cache) {
++ 		backing_file_set_security(backing_file, NULL);
++ 		return 0;
++ 	}
++ 
++ 	blob = kmem_cache_zalloc(lsm_backing_file_cache, GFP_KERNEL);
++ 	backing_file_set_security(backing_file, blob);
++ 	if (!blob)
++ 		return -ENOMEM;
+++>>>>>>> 6af36aeb147a (lsm: add backing_file LSM hooks)
+  	return 0;
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * security_add_hooks - Add a modules hooks to the hook lists.
+ + * @hooks: the hooks to add
+ + * @count: the number of hooks to add
+ + * @lsmid: the identification information for the security module
+ + *
+ + * Each LSM has to register its hooks with the infrastructure.
+ + */
+ +void __init security_add_hooks(struct security_hook_list *hooks, int count,
+ +			       const struct lsm_id *lsmid)
+ +{
+ +	int i;
+ +
+ +	/*
+ +	 * A security module may call security_add_hooks() more
+ +	 * than once during initialization, and LSM initialization
+ +	 * is serialized. Landlock is one such case.
+ +	 * Look at the previous entry, if there is one, for duplication.
+ +	 */
+ +	if (lsm_active_cnt == 0 || lsm_idlist[lsm_active_cnt - 1] != lsmid) {
+ +		if (lsm_active_cnt >= MAX_LSM_COUNT)
+ +			panic("%s Too many LSMs registered.\n", __func__);
+ +		lsm_idlist[lsm_active_cnt++] = lsmid;
+ +	}
+ +
+ +	for (i = 0; i < count; i++) {
+ +		hooks[i].lsmid = lsmid;
+ +		lsm_static_call_init(&hooks[i]);
+ +	}
+ +
+ +	/*
+ +	 * Don't try to append during early_security_init(), we'll come back
+ +	 * and fix this up afterwards.
+ +	 */
+ +	if (slab_is_available()) {
+ +		if (lsm_append(lsmid->name, &lsm_names) < 0)
+ +			panic("%s - Cannot get early memory.\n", __func__);
+ +	}
+ +}
+ +
+ +/**
+++=======
+++>>>>>>> 6af36aeb147a (lsm: add backing_file LSM hooks)
+   * lsm_blob_alloc - allocate a composite blob
+   * @dest: the destination for the blob
+   * @size: the size of the blob
+* Unmerged path fs/erofs/ishare.c
+* Unmerged path security/lsm.h
+* Unmerged path security/lsm_init.c
+* Unmerged path fs/backing-file.c
+* Unmerged path fs/erofs/ishare.c
+diff --git a/fs/file_table.c b/fs/file_table.c
+index 00871a913e36..cebd9725d382 100644
+--- a/fs/file_table.c
++++ b/fs/file_table.c
+@@ -51,6 +51,9 @@ struct backing_file {
+ 		struct path user_path;
+ 		freeptr_t bf_freeptr;
+ 	};
++#ifdef CONFIG_SECURITY
++	void *security;
++#endif
+ };
+ 
+ #define backing_file(f) container_of(f, struct backing_file, file)
+@@ -67,8 +70,21 @@ void backing_file_set_user_path(struct file *f, const struct path *path)
+ }
+ EXPORT_SYMBOL_GPL(backing_file_set_user_path);
+ 
++#ifdef CONFIG_SECURITY
++void *backing_file_security(const struct file *f)
++{
++	return backing_file(f)->security;
++}
++
++void backing_file_set_security(struct file *f, void *security)
++{
++	backing_file(f)->security = security;
++}
++#endif /* CONFIG_SECURITY */
++
+ static inline void backing_file_free(struct backing_file *ff)
+ {
++	security_backing_file_free(&ff->file);
+ 	path_put(&ff->user_path);
+ 	kmem_cache_free(bfilp_cachep, ff);
+ }
+@@ -283,10 +299,12 @@ struct file *alloc_empty_file_noaccount(int flags, const struct cred *cred)
+ 	return f;
+ }
+ 
+-static int init_backing_file(struct backing_file *ff)
++static int init_backing_file(struct backing_file *ff,
++			     const struct file *user_file)
+ {
+ 	memset(&ff->user_path, 0, sizeof(ff->user_path));
+-	return 0;
++	backing_file_set_security(&ff->file, NULL);
++	return security_backing_file_alloc(&ff->file, user_file);
+ }
+ 
+ /*
+@@ -296,7 +314,8 @@ static int init_backing_file(struct backing_file *ff)
+  * This is only for kernel internal use, and the allocate file must not be
+  * installed into file tables or such.
+  */
+-struct file *alloc_empty_backing_file(int flags, const struct cred *cred)
++struct file *alloc_empty_backing_file(int flags, const struct cred *cred,
++				      const struct file *user_file)
+ {
+ 	struct backing_file *ff;
+ 	int error;
+@@ -313,7 +332,7 @@ struct file *alloc_empty_backing_file(int flags, const struct cred *cred)
+ 
+ 	/* The f_mode flags must be set before fput(). */
+ 	ff->file.f_mode |= FMODE_BACKING | FMODE_NOACCOUNT;
+-	error = init_backing_file(ff);
++	error = init_backing_file(ff, user_file);
+ 	if (unlikely(error)) {
+ 		fput(&ff->file);
+ 		return ERR_PTR(error);
+diff --git a/fs/fuse/passthrough.c b/fs/fuse/passthrough.c
+index bbac547dfcb3..91a43c4939ec 100644
+--- a/fs/fuse/passthrough.c
++++ b/fs/fuse/passthrough.c
+@@ -321,7 +321,7 @@ struct fuse_backing *fuse_passthrough_open(struct file *file,
+ 		goto out;
+ 
+ 	/* Allocate backing file per fuse file to store fuse path */
+-	backing_file = backing_file_open(&file->f_path, file->f_flags,
++	backing_file = backing_file_open(file, file->f_flags,
+ 					 &fb->file->f_path, fb->cred);
+ 	err = PTR_ERR(backing_file);
+ 	if (IS_ERR(backing_file)) {
+diff --git a/fs/internal.h b/fs/internal.h
+index 67e2e164c647..049c800a3b16 100644
+--- a/fs/internal.h
++++ b/fs/internal.h
+@@ -99,7 +99,8 @@ extern void chroot_fs_refs(const struct path *, const struct path *);
+  */
+ struct file *alloc_empty_file(int flags, const struct cred *cred);
+ struct file *alloc_empty_file_noaccount(int flags, const struct cred *cred);
+-struct file *alloc_empty_backing_file(int flags, const struct cred *cred);
++struct file *alloc_empty_backing_file(int flags, const struct cred *cred,
++				      const struct file *user_file);
+ void backing_file_set_user_path(struct file *f, const struct path *path);
+ 
+ static inline void file_put_write_access(struct file *file)
+* Unmerged path fs/overlayfs/dir.c
+* Unmerged path fs/overlayfs/file.c
+diff --git a/include/linux/backing-file.h b/include/linux/backing-file.h
+index 2eed0ffb5e8f..cd18acd7ac5b 100644
+--- a/include/linux/backing-file.h
++++ b/include/linux/backing-file.h
+@@ -19,10 +19,10 @@ struct backing_file_ctx {
+ 	void (*end_write)(struct file *, loff_t, ssize_t);
+ };
+ 
+-struct file *backing_file_open(const struct path *user_path, int flags,
++struct file *backing_file_open(const struct file *user_file, int flags,
+ 			       const struct path *real_path,
+ 			       const struct cred *cred);
+-struct file *backing_tmpfile_open(const struct path *user_path, int flags,
++struct file *backing_tmpfile_open(const struct file *user_file, int flags,
+ 				  const struct path *real_parentpath,
+ 				  umode_t mode, const struct cred *cred);
+ ssize_t backing_file_read_iter(struct file *file, struct iov_iter *iter,
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index bba4c2f53abc..ab26204359f3 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -2792,6 +2792,19 @@ struct file *dentry_create(const struct path *path, int flags, umode_t mode,
+ 			   const struct cred *cred);
+ struct path *backing_file_user_path(const struct file *f);
+ 
++#ifdef CONFIG_SECURITY
++void *backing_file_security(const struct file *f);
++void backing_file_set_security(struct file *f, void *security);
++#else
++static inline void *backing_file_security(const struct file *f)
++{
++	return NULL;
++}
++static inline void backing_file_set_security(struct file *f, void *security)
++{
++}
++#endif /* CONFIG_SECURITY */
++
+ /*
+  * When mmapping a file on a stackable filesystem (e.g., overlayfs), the file
+  * stored in ->vm_file is a backing file whose f_inode is on the underlying
+diff --git a/include/linux/lsm_audit.h b/include/linux/lsm_audit.h
+index 97a8b21eb033..c0a2839253fa 100644
+--- a/include/linux/lsm_audit.h
++++ b/include/linux/lsm_audit.h
+@@ -93,7 +93,7 @@ struct common_audit_data {
+ #endif
+ 		char *kmod_name;
+ 		struct lsm_ioctlop_audit *op;
+-		struct file *file;
++		const struct file *file;
+ 		struct lsm_ibpkey_audit *ibpkey;
+ 		struct lsm_ibendport_audit *ibendport;
+ 		int reason;
+diff --git a/include/linux/lsm_hook_defs.h b/include/linux/lsm_hook_defs.h
+index af60b1b5987f..a6248728404f 100644
+--- a/include/linux/lsm_hook_defs.h
++++ b/include/linux/lsm_hook_defs.h
+@@ -188,6 +188,9 @@ LSM_HOOK(int, 0, file_permission, struct file *file, int mask)
+ LSM_HOOK(int, 0, file_alloc_security, struct file *file)
+ LSM_HOOK(void, LSM_RET_VOID, file_release, struct file *file)
+ LSM_HOOK(void, LSM_RET_VOID, file_free_security, struct file *file)
++LSM_HOOK(int, 0, backing_file_alloc, struct file *backing_file,
++	 const struct file *user_file)
++LSM_HOOK(void, LSM_RET_VOID, backing_file_free, struct file *backing_file)
+ LSM_HOOK(int, 0, file_ioctl, struct file *file, unsigned int cmd,
+ 	 unsigned long arg)
+ LSM_HOOK(int, 0, file_ioctl_compat, struct file *file, unsigned int cmd,
+@@ -195,6 +198,8 @@ LSM_HOOK(int, 0, file_ioctl_compat, struct file *file, unsigned int cmd,
+ LSM_HOOK(int, 0, mmap_addr, unsigned long addr)
+ LSM_HOOK(int, 0, mmap_file, struct file *file, unsigned long reqprot,
+ 	 unsigned long prot, unsigned long flags)
++LSM_HOOK(int, 0, mmap_backing_file, struct vm_area_struct *vma,
++	 struct file *backing_file, struct file *user_file)
+ LSM_HOOK(int, 0, file_mprotect, struct vm_area_struct *vma,
+ 	 unsigned long reqprot, unsigned long prot)
+ LSM_HOOK(int, 0, file_lock, struct file *file, unsigned int cmd)
+* Unmerged path include/linux/lsm_hooks.h
+diff --git a/include/linux/security.h b/include/linux/security.h
+index 90b2a5a1b400..497bef47e151 100644
+--- a/include/linux/security.h
++++ b/include/linux/security.h
+@@ -420,11 +420,17 @@ int security_file_permission(struct file *file, int mask);
+ int security_file_alloc(struct file *file);
+ void security_file_release(struct file *file);
+ void security_file_free(struct file *file);
++int security_backing_file_alloc(struct file *backing_file,
++				const struct file *user_file);
++void security_backing_file_free(struct file *backing_file);
+ int security_file_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
+ int security_file_ioctl_compat(struct file *file, unsigned int cmd,
+ 			       unsigned long arg);
+ int security_mmap_file(struct file *file, unsigned long prot,
+ 			unsigned long flags);
++int security_mmap_backing_file(struct vm_area_struct *vma,
++			       struct file *backing_file,
++			       struct file *user_file);
+ int security_mmap_addr(unsigned long addr);
+ int security_file_mprotect(struct vm_area_struct *vma, unsigned long reqprot,
+ 			   unsigned long prot);
+@@ -1065,6 +1071,15 @@ static inline void security_file_release(struct file *file)
+ static inline void security_file_free(struct file *file)
+ { }
+ 
++static inline int security_backing_file_alloc(struct file *backing_file,
++					      const struct file *user_file)
++{
++	return 0;
++}
++
++static inline void security_backing_file_free(struct file *backing_file)
++{ }
++
+ static inline int security_file_ioctl(struct file *file, unsigned int cmd,
+ 				      unsigned long arg)
+ {
+@@ -1084,6 +1099,13 @@ static inline int security_mmap_file(struct file *file, unsigned long prot,
+ 	return 0;
+ }
+ 
++static inline int security_mmap_backing_file(struct vm_area_struct *vma,
++					     struct file *backing_file,
++					     struct file *user_file)
++{
++	return 0;
++}
++
+ static inline int security_mmap_addr(unsigned long addr)
+ {
+ 	return cap_mmap_addr(addr);
+* Unmerged path security/lsm.h
+* Unmerged path security/lsm_init.c
+* Unmerged path security/security.c
