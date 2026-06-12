@@ -228,7 +228,41 @@ jobs:
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --global user.name "github-actions[bot]"
 
+      - name: Park open PRs on temporary branch
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -e
+
+          OPEN_PRS=$(gh pr list --repo "$REPOSITORY" --base "$TARGET_BRANCH" --state open --limit 200 --json number --jq '[.[].number | tostring] | join(" ")')
+
+          if [ -z "$OPEN_PRS" ]; then
+            echo "No open PRs targeting ${TARGET_BRANCH}"
+            exit 0
+          fi
+
+          TEMP_BRANCH="_pr_parking_${TARGET_BRANCH}_run${GITHUB_RUN_ID}"
+          echo "Parking PRs on ${TEMP_BRANCH}: ${OPEN_PRS}"
+
+          cd kernel-src-tree
+          git fetch origin "${TARGET_BRANCH}" --quiet
+          git push origin "origin/${TARGET_BRANCH}:refs/heads/${TEMP_BRANCH}"
+          echo "TEMP_BRANCH=$TEMP_BRANCH" >> $GITHUB_ENV
+
+          for pr in $OPEN_PRS; do
+            echo "Parking PR #$pr on ${TEMP_BRANCH}"
+            gh pr edit "$pr" --repo "$REPOSITORY" --base "${TEMP_BRANCH}"
+            gh pr comment "$pr" --repo "$REPOSITORY" --body-file - <<EOF || true
+:hourglass_flowing_sand: A rebase of \`${TARGET_BRANCH}\` to the latest upstream stable release is in progress. This PR has been temporarily moved to \`${TEMP_BRANCH}\` while the branch is updated.
+
+Workflow run: ${RUN_URL}
+EOF
+          done
+
       - name: Setup branch references and execute lt_rebase_merge.sh
+        id: rebase-merge
         run: |
           set -e
           cd kernel-src-tree
@@ -257,6 +291,104 @@ jobs:
           fi
 
           echo "✅ lt_rebase_merge.sh completed successfully"
+
+      - name: Restore parked PRs to new branch
+        if: always()
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+          REPOSITORY: ${{ github.repository }}
+          SCRIPT_OUTCOME: ${{ steps.rebase-merge.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$TEMP_BRANCH" ]; then
+            echo "No temp branch, nothing to restore"
+            exit 0
+          fi
+
+          if ! PARKED_PRS=$(gh pr list --repo "$REPOSITORY" --base "$TEMP_BRANCH" --state open --limit 200 --json number --jq '[.[].number | tostring] | join(" ")'); then
+            echo "❌ Failed to list PRs on ${TEMP_BRANCH}, cannot restore"
+            exit 1
+          fi
+
+          if [ -z "$PARKED_PRS" ]; then
+            echo "No PRs on ${TEMP_BRANCH}, cleaning up"
+            cd kernel-src-tree
+            git push origin --delete "${TEMP_BRANCH}" 2>/dev/null || true
+            exit 0
+          fi
+
+          if [ "$SCRIPT_OUTCOME" = "success" ]; then
+            cd kernel-src-tree
+            git fetch origin --tags --quiet 2>/dev/null || true
+            NEW_VERSION=$(git describe --tags --abbrev=0 --match='v*' "origin/${TARGET_BRANCH}" 2>/dev/null || echo "the latest upstream release")
+
+            RESTORE_FAILURES=0
+            for pr in $PARKED_PRS; do
+              echo "Retargeting PR #$pr to ${TARGET_BRANCH}"
+              if ! gh pr edit "$pr" --repo "$REPOSITORY" --base "${TARGET_BRANCH}"; then
+                echo "❌ Failed to retarget PR #$pr"
+                gh pr comment "$pr" --repo "$REPOSITORY" --body-file - <<EOF || true
+:warning: Failed to retarget this PR back to \`${TARGET_BRANCH}\` after rebase. This PR may still be on temporary branch \`${TEMP_BRANCH}\`. Please manually update the base branch.
+
+Workflow run: ${RUN_URL}
+EOF
+                RESTORE_FAILURES=$((RESTORE_FAILURES + 1))
+                continue
+              fi
+              gh pr comment "$pr" --repo "$REPOSITORY" --body-file - <<EOF || true
+:white_check_mark: \`${TARGET_BRANCH}\` has been rebased to \`${NEW_VERSION}\`. This PR has been retargeted to the updated branch. You will need to rebase your PR branch onto the new \`${TARGET_BRANCH}\`.
+
+Workflow run: ${RUN_URL}
+EOF
+            done
+
+            if [ "$RESTORE_FAILURES" -gt 0 ]; then
+              echo "⚠️ Failed to retarget $RESTORE_FAILURES PR(s), leaving ${TEMP_BRANCH} intact"
+            else
+              echo "Cleaning up temporary branch ${TEMP_BRANCH}"
+              git push origin --delete "${TEMP_BRANCH}" 2>/dev/null || true
+            fi
+          elif [ "$SCRIPT_OUTCOME" = "skipped" ]; then
+            # Script never ran — TARGET_BRANCH is intact, safe to move PRs back
+            echo "Rebase was skipped, restoring PRs to ${TARGET_BRANCH}"
+            RESTORE_FAILURES=0
+            for pr in $PARKED_PRS; do
+              echo "Restoring PR #$pr to ${TARGET_BRANCH}"
+              if ! gh pr edit "$pr" --repo "$REPOSITORY" --base "${TARGET_BRANCH}"; then
+                echo "❌ Failed to restore PR #$pr"
+                gh pr comment "$pr" --repo "$REPOSITORY" --body-file - <<EOF || true
+:warning: Failed to move this PR back to \`${TARGET_BRANCH}\`. This PR may still be on temporary branch \`${TEMP_BRANCH}\`. Please manually update the base branch.
+
+Workflow run: ${RUN_URL}
+EOF
+                RESTORE_FAILURES=$((RESTORE_FAILURES + 1))
+                continue
+              fi
+              gh pr comment "$pr" --repo "$REPOSITORY" --body-file - <<EOF || true
+:warning: The rebase of \`${TARGET_BRANCH}\` could not proceed. This PR has been moved back to \`${TARGET_BRANCH}\`. No changes were made to the branch.
+
+Workflow run: ${RUN_URL}
+EOF
+            done
+
+            if [ "$RESTORE_FAILURES" -gt 0 ]; then
+              echo "⚠️ Failed to restore $RESTORE_FAILURES PR(s), leaving ${TEMP_BRANCH} intact"
+            else
+              echo "Cleaning up temporary branch ${TEMP_BRANCH}"
+              cd kernel-src-tree
+              git push origin --delete "${TEMP_BRANCH}" 2>/dev/null || true
+            fi
+          else
+            # Script ran and failed — TARGET_BRANCH may be in unknown state, don't move PRs
+            echo "⚠️ Rebase merge failed, leaving PRs on ${TEMP_BRANCH}"
+            for pr in $PARKED_PRS; do
+              gh pr comment "$pr" --repo "$REPOSITORY" --body-file - <<EOF || true
+:warning: The rebase of \`${TARGET_BRANCH}\` failed. This PR remains on temporary branch \`${TEMP_BRANCH}\` to prevent it from being closed. The kernel team is investigating the failure.
+
+Workflow run: ${RUN_URL}
+EOF
+            done
+          fi
 
       - name: Comment on PR with result
         if: always()
