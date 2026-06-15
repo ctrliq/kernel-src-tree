@@ -228,7 +228,7 @@ static struct tasdevice_config_info *tasdevice_add_config(
 	 * these firmwares.
 	 */
 	bk_da = cfg_info->blk_data = kzalloc_objs(struct tasdev_blk_data *,
-						  cfg_info->nblocks, GFP_KERNEL);
+						  cfg_info->nblocks);
 	if (!bk_da) {
 		*status = -ENOMEM;
 		goto out;
@@ -815,7 +815,7 @@ static int fw_parse_variable_header_kernel(
 	}
 
 	tas_fmw->programs = kzalloc_objs(struct tasdevice_prog,
-					 tas_fmw->nr_programs, GFP_KERNEL);
+					 tas_fmw->nr_programs);
 	if (!tas_fmw->programs) {
 		offset = -ENOMEM;
 		goto out;
@@ -854,7 +854,7 @@ static int fw_parse_variable_header_kernel(
 	}
 
 	tas_fmw->configs = kzalloc_objs(struct tasdevice_config,
-					tas_fmw->nr_configurations, GFP_KERNEL);
+					tas_fmw->nr_configurations);
 	if (!tas_fmw->configs) {
 		offset = -ENOMEM;
 		goto out;
@@ -1356,7 +1356,7 @@ static int fw_parse_configuration_data(
 		goto out;
 	}
 	tas_fmw->configs = kzalloc_objs(struct tasdevice_config,
-					tas_fmw->nr_configurations, GFP_KERNEL);
+					tas_fmw->nr_configurations);
 	if (!tas_fmw->configs) {
 		offset = -ENOMEM;
 		goto out;
@@ -2151,8 +2151,7 @@ static int fw_parse_calibration_data(struct tasdevice_priv *tas_priv,
 	}
 
 	tas_fmw->calibrations = kzalloc_objs(struct tasdevice_calibration,
-					     tas_fmw->nr_calibrations,
-					     GFP_KERNEL);
+					     tas_fmw->nr_calibrations);
 	if (!tas_fmw->calibrations) {
 		offset = -ENOMEM;
 		goto out;
