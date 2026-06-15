@@ -713,6 +713,46 @@ static ssize_t ap_functions_show(struct device *dev,
 
 static DEVICE_ATTR_RO(ap_functions);
 
+static ssize_t driver_override_show(struct device *dev,
+				    struct device_attribute *attr,
+				    char *buf)
+{
+	guard(spinlock)(&dev->driver_override.lock);
+	return sysfs_emit(buf, "%s\n", dev->driver_override.name ?: "");
+}
+
+static ssize_t driver_override_store(struct device *dev,
+				     struct device_attribute *attr,
+				     const char *buf, size_t count)
+{
+	int rc = -EINVAL;
+	bool old_value;
+
+	if (mutex_lock_interruptible(&ap_attr_mutex))
+		return -ERESTARTSYS;
+
+	/* Do not allow driver override if apmask/aqmask is in use */
+	if (ap_apmask_aqmask_in_use)
+		goto out;
+
+	old_value = device_has_driver_override(dev);
+	rc = __device_set_driver_override(dev, buf, count);
+	if (rc)
+		goto out;
+	if (old_value && !device_has_driver_override(dev))
+		--ap_driver_override_ctr;
+	else if (!old_value && device_has_driver_override(dev))
+		++ap_driver_override_ctr;
+
+	rc = count;
+
+out:
+	mutex_unlock(&ap_attr_mutex);
+	return rc;
+}
+
+static DEVICE_ATTR_RW(driver_override);
+
 #ifdef CONFIG_AP_DEBUG
 static ssize_t states_show(struct device *dev,
 			   struct device_attribute *attr, char *buf)
@@ -825,6 +865,7 @@ static struct attribute *ap_queue_dev_attrs[] = {
 	&dev_attr_config.attr,
 	&dev_attr_chkstop.attr,
 	&dev_attr_ap_functions.attr,
+	&dev_attr_driver_override.attr,
 #ifdef CONFIG_AP_DEBUG
 	&dev_attr_states.attr,
 	&dev_attr_last_err_rc.attr,
