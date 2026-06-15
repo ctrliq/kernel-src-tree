@@ -17,6 +17,7 @@ TEST_PROGS := \
 	conntrack_reverse_clash.sh \
 	conntrack_sctp_collision.sh \
 	conntrack_tcp_unreplied.sh \
+	conntrack_clash.sh \
 	conntrack_vrf.sh \
 	ipvs.sh \
 	nf_conntrack_packetdrill.sh \
@@ -48,6 +49,7 @@ TEST_GEN_FILES = \
 	conntrack_dump_flush \
 	conntrack_reverse_clash \
 	nf_queue \
+	udpclash \
 	sctp_collision \
 # end of TEST_GEN_FILES
 
@@ -58,6 +60,7 @@ $(OUTPUT)/nf_queue: LDLIBS += $(MNL_LDLIBS)
 
 $(OUTPUT)/conntrack_dump_flush: CFLAGS += $(MNL_CFLAGS)
 $(OUTPUT)/conntrack_dump_flush: LDLIBS += $(MNL_LDLIBS)
+$(OUTPUT)/udpclash: LDLIBS += -lpthread
 
 TEST_FILES := \
 	lib.sh \

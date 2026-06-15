@@ -177,6 +177,22 @@ EOF
 	done
 }
 
+ct_udpclash()
+{
+	local ns="$1"
+	local duration="$2"
+	local now=$(date +%s)
+	local end=$((now + duration))
+
+	[ -x udpclash ] || return
+
+        while [ $now -lt $end ]; do
+		ip netns exec "$ns" timeout 30 ./udpclash 127.0.0.1 $((RANDOM%65536)) > /dev/null 2>&1
+
+		now=$(date +%s)
+	done
+}
+
 # dump to /dev/null.  We don't want dumps to cause infinite loops
 # or use-after-free even when conntrack table is altered while dumps
 # are in progress.
@@ -261,12 +277,14 @@ check_taint()
 insert_flood()
 {
 	local n="$1"
+	local timeout="$2"
 	local r=0
 
 	r=$((RANDOM%$insert_count))
 
 	ct_pingflood "$n" "$timeout" "floodresize" &
 	ct_udpflood "$n" "$timeout" &
+	ct_udpclash "$n" "$timeout" &
 
 	insert_ctnetlink "$n" "$r" &
 	ctflush "$n" "$timeout" &
@@ -285,7 +303,7 @@ test_floodresize_all()
 	read tainted_then < /proc/sys/kernel/tainted
 
 	for n in "$nsclient1" "$nsclient2";do
-		insert_flood "$n" &
+		insert_flood "$n" "$timeout" &
 	done
 
 	# resize table constantly while flood/insert/dump/flushs
