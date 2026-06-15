@@ -90,8 +90,14 @@ static struct klp_func *klp_find_func(struct klp_object *obj,
 	struct klp_func *func;
 
 	klp_for_each_func(obj, func) {
+		/*
+		 * Besides identical old_sympos, also consider old_sympos
+		 * of 0 and 1 are identical.
+		 */
 		if ((strcmp(old_func->old_name, func->old_name) == 0) &&
-		    (old_func->old_sympos == func->old_sympos)) {
+		    ((old_func->old_sympos == func->old_sympos) ||
+		     (old_func->old_sympos == 0 && func->old_sympos == 1) ||
+		     (old_func->old_sympos == 1 && func->old_sympos == 0))) {
 			return func;
 		}
 	}
@@ -1351,6 +1357,25 @@ void klp_module_going(struct module *mod)
 
 	mutex_unlock(&klp_mutex);
 }
+
+void *klp_find_section_by_name(const struct module *mod, const char *name,
+			       size_t *sec_size)
+{
+	struct klp_modinfo *info = mod->klp_info;
+
+	for (int i = 1; i < info->hdr.e_shnum; i++) {
+		Elf_Shdr *shdr = &info->sechdrs[i];
+
+		if (!strcmp(info->secstrings + shdr->sh_name, name)) {
+			*sec_size = shdr->sh_size;
+			return (void *)shdr->sh_addr;
+		}
+	}
+
+	*sec_size = 0;
+	return NULL;
+}
+EXPORT_SYMBOL_GPL(klp_find_section_by_name);
 
 static int __init klp_init(void)
 {
