@@ -14,6 +14,7 @@
 #include <objtool/util.h>
 #include <arch/special.h>
 
+#include <linux/align.h>
 #include <linux/objtool_types.h>
 #include <linux/livepatch_external.h>
 #include <linux/stringify.h>
@@ -364,11 +365,40 @@ static int correlate_symbols(struct elfs *e)
 	struct symbol *file1_sym, *file2_sym;
 	struct symbol *sym1, *sym2;
 
-	/* Correlate locals */
-	for (file1_sym = first_file_symbol(e->orig),
-	     file2_sym = first_file_symbol(e->patched); ;
-	     file1_sym = next_file_symbol(e->orig, file1_sym),
-	     file2_sym = next_file_symbol(e->patched, file2_sym)) {
+	file1_sym = first_file_symbol(e->orig);
+	file2_sym = first_file_symbol(e->patched);
+
+	/*
+	 * Correlate any locals before the first FILE symbol.  This has been
+	 * seen when LTO inexplicably strips the initramfs_data.o FILE symbol
+	 * due to the file only containing data and no code.
+	 */
+	for_each_sym(e->orig, sym1) {
+		if (sym1 == file1_sym || !is_local_sym(sym1))
+			break;
+
+		if (dont_correlate(sym1))
+			continue;
+
+		for_each_sym(e->patched, sym2) {
+			if (sym2 == file2_sym || !is_local_sym(sym2))
+				break;
+
+			if (sym2->twin || dont_correlate(sym2))
+				continue;
+
+			if (strcmp(sym1->demangled_name, sym2->demangled_name))
+				continue;
+
+			sym1->twin = sym2;
+			sym2->twin = sym1;
+			break;
+		}
+	}
+
+	/* Correlate locals after the first FILE symbol */
+	for (; ; file1_sym = next_file_symbol(e->orig, file1_sym),
+		 file2_sym = next_file_symbol(e->patched, file2_sym)) {
 
 		if (!file1_sym && file2_sym) {
 			ERROR("FILE symbol mismatch: NULL != %s", file2_sym->name);
@@ -531,7 +561,7 @@ static struct symbol *__clone_symbol(struct elf *elf, struct symbol *patched_sym
 		}
 
 		if (!is_sec_sym(patched_sym))
-			offset = sec_size(out_sec);
+			offset = ALIGN(sec_size(out_sec), out_sec->sh.sh_addralign);
 
 		if (patched_sym->len || is_sec_sym(patched_sym)) {
 			void *data = NULL;
@@ -1305,25 +1335,25 @@ static bool should_keep_special_sym(struct elf *elf, struct symbol *sym)
  * be applied after static branch/call init, resulting in code corruption.
  *
  * Validate a special section entry to avoid that.  Note that an inert
- * tracepoint is harmless enough, in that case just skip the entry and print a
- * warning.  Otherwise, return an error.
+ * tracepoint or pr_debug() is harmless enough, in that case just skip the
+ * entry and print a warning.  Otherwise, return an error.
  *
- * This is only a temporary limitation which will be fixed when livepatch adds
- * support for submodules: fully self-contained modules which are embedded in
- * the top-level livepatch module's data and which can be loaded on demand when
- * their corresponding to-be-patched module gets loaded.  Then klp relocs can
- * be retired.
+ * TODO: This is only a temporary limitation which will be fixed when livepatch
+ * adds support for submodules: fully self-contained modules which are embedded
+ * in the top-level livepatch module's data and which can be loaded on demand
+ * when their corresponding to-be-patched module gets loaded.  Then klp relocs
+ * can be retired.
  *
  * Return:
  *   -1: error: validation failed
- *    1: warning: tracepoint skipped
+ *    1: warning: disabled tracepoint or pr_debug()
  *    0: success
  */
 static int validate_special_section_klp_reloc(struct elfs *e, struct symbol *sym)
 {
 	bool static_branch = !strcmp(sym->sec->name, "__jump_table");
 	bool static_call   = !strcmp(sym->sec->name, ".static_call_sites");
-	struct symbol *code_sym = NULL;
+	const char *code_sym = NULL;
 	unsigned long code_offset = 0;
 	struct reloc *reloc;
 	int ret = 0;
@@ -1335,12 +1365,15 @@ static int validate_special_section_klp_reloc(struct elfs *e, struct symbol *sym
 		const char *sym_modname;
 		struct export *export;
 
+		if (convert_reloc_sym(e->patched, reloc))
+			continue;
+
 		/* Static branch/call keys are always STT_OBJECT */
 		if (reloc->sym->type != STT_OBJECT) {
 
 			/* Save code location which can be printed below */
 			if (reloc->sym->type == STT_FUNC && !code_sym) {
-				code_sym = reloc->sym;
+				code_sym = reloc->sym->name;
 				code_offset = reloc_addend(reloc);
 			}
 
@@ -1363,16 +1396,26 @@ static int validate_special_section_klp_reloc(struct elfs *e, struct symbol *sym
 		if (!strcmp(sym_modname, "vmlinux"))
 			continue;
 
+		if (!code_sym)
+			code_sym = "<unknown>";
+
 		if (static_branch) {
 			if (strstarts(reloc->sym->name, "__tracepoint_")) {
 				WARN("%s: disabling unsupported tracepoint %s",
-				     code_sym->name, reloc->sym->name + 13);
+				     code_sym, reloc->sym->name + 13);
+				ret = 1;
+				continue;
+			}
+
+			if (strstr(reloc->sym->name, "__UNIQUE_ID_ddebug_")) {
+				WARN("%s: disabling unsupported pr_debug()",
+				     code_sym);
 				ret = 1;
 				continue;
 			}
 
 			ERROR("%s+0x%lx: unsupported static branch key %s.  Use static_key_enabled() instead",
-			      code_sym->name, code_offset, reloc->sym->name);
+			      code_sym, code_offset, reloc->sym->name);
 			return -1;
 		}
 
@@ -1383,7 +1426,7 @@ static int validate_special_section_klp_reloc(struct elfs *e, struct symbol *sym
 		}
 
 		ERROR("%s()+0x%lx: unsupported static call key %s.  Use KLP_STATIC_CALL() instead",
-		      code_sym->name, code_offset, reloc->sym->name);
+		      code_sym, code_offset, reloc->sym->name);
 		return -1;
 	}
 
@@ -1424,9 +1467,6 @@ static int clone_special_section(struct elfs *e, struct section *patched_sec)
 static int clone_special_sections(struct elfs *e)
 {
 	struct section *patched_sec;
-
-	if (create_fake_symbols(e->patched))
-		return -1;
 
 	for_each_sec(e->patched, patched_sec) {
 		if (is_special_section(patched_sec)) {
@@ -1702,6 +1742,17 @@ int cmd_klp_diff(int argc, const char **argv)
 
 	e.out = elf_create_file(&e.orig->ehdr, argv[2]);
 	if (!e.out)
+		return -1;
+
+	/*
+	 * Special section fake symbols are needed so that individual special
+	 * section entries can be extracted by clone_special_sections().
+	 *
+	 * Note the fake symbols are also needed by clone_included_functions()
+	 * because __WARN_printf() call sites add references to bug table
+	 * entries in the calling functions.
+	 */
+	if (create_fake_symbols(e.patched))
 		return -1;
 
 	if (clone_included_functions(&e))

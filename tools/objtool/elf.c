@@ -16,16 +16,14 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
-#include <libgen.h>
 #include <ctype.h>
+#include <linux/align.h>
+#include <linux/kernel.h>
 #include <linux/interval_tree_generic.h>
+#include <linux/log2.h>
 #include <objtool/builtin.h>
 #include <objtool/elf.h>
 #include <objtool/warn.h>
-
-#define ALIGN_UP(x, align_to) (((x) + ((align_to)-1)) & ~((align_to)-1))
-#define ALIGN_UP_POW2(x) (1U << ((8 * sizeof(x)) - __builtin_clz((x) - 1U)))
-#define MAX(a, b) ((a) > (b) ? (a) : (b))
 
 static inline u32 str_hash(const char *str)
 {
@@ -172,11 +170,11 @@ static struct symbol *find_symbol_by_index(struct elf *elf, unsigned int idx)
 struct symbol *find_symbol_by_offset(struct section *sec, unsigned long offset)
 {
 	struct rb_root_cached *tree = (struct rb_root_cached *)&sec->symbol_tree;
-	struct symbol *iter;
+	struct symbol *sym;
 
-	__sym_for_each(iter, tree, offset, offset) {
-		if (iter->offset == offset && !is_sec_sym(iter))
-			return iter;
+	__sym_for_each(sym, tree, offset, offset) {
+		if (sym->offset == offset && !is_sec_sym(sym))
+			return sym->alias;
 	}
 
 	return NULL;
@@ -185,11 +183,11 @@ struct symbol *find_symbol_by_offset(struct section *sec, unsigned long offset)
 struct symbol *find_func_by_offset(struct section *sec, unsigned long offset)
 {
 	struct rb_root_cached *tree = (struct rb_root_cached *)&sec->symbol_tree;
-	struct symbol *iter;
+	struct symbol *func;
 
-	__sym_for_each(iter, tree, offset, offset) {
-		if (iter->offset == offset && is_func_sym(iter))
-			return iter;
+	__sym_for_each(func, tree, offset, offset) {
+		if (func->offset == offset && is_func_sym(func))
+			return func->alias;
 	}
 
 	return NULL;
@@ -220,7 +218,7 @@ struct symbol *find_symbol_containing(const struct section *sec, unsigned long o
 		}
 	}
 
-	return sym;
+	return sym ? sym->alias : NULL;
 }
 
 /*
@@ -266,11 +264,11 @@ int find_symbol_hole_containing(const struct section *sec, unsigned long offset)
 struct symbol *find_func_containing(struct section *sec, unsigned long offset)
 {
 	struct rb_root_cached *tree = (struct rb_root_cached *)&sec->symbol_tree;
-	struct symbol *iter;
+	struct symbol *func;
 
-	__sym_for_each(iter, tree, offset, offset) {
-		if (is_func_sym(iter))
-			return iter;
+	__sym_for_each(func, tree, offset, offset) {
+		if (is_func_sym(func))
+			return func->alias;
 	}
 
 	return NULL;
@@ -283,6 +281,23 @@ struct symbol *find_symbol_by_name(const struct elf *elf, const char *name)
 	elf_hash_for_each_possible(symbol_name, sym, name_hash, str_hash(name)) {
 		if (!strcmp(sym->name, name))
 			return sym;
+	}
+
+	return NULL;
+}
+
+/* Find local symbol with matching STT_FILE */
+static struct symbol *find_local_symbol_by_file_and_name(const struct elf *elf,
+							 struct symbol *file,
+							 const char *name)
+{
+	struct symbol *sym;
+
+	elf_hash_for_each_possible(symbol_name, sym, name_hash, str_hash(name)) {
+		if (sym->bind == STB_LOCAL && sym->file == file &&
+		    !strcmp(sym->name, name)) {
+			return sym;
+		}
 	}
 
 	return NULL;
@@ -451,7 +466,7 @@ static const char *demangle_name(struct symbol *sym)
 			str[i + 1] = '\0';
 			break;
 		}
-	};
+	}
 
 	return str;
 }
@@ -475,8 +490,8 @@ static int elf_add_symbol(struct elf *elf, struct symbol *sym)
 	sym->len = sym->sym.st_size;
 
 	__sym_for_each(iter, &sym->sec->symbol_tree, sym->offset, sym->offset) {
-		if (iter->offset == sym->offset && iter->type == sym->type &&
-		    iter->len == sym->len)
+		if (!is_undef_sym(iter) && iter->offset == sym->offset &&
+		    iter->type == sym->type && iter->len == sym->len)
 			iter->alias = sym;
 	}
 
@@ -524,7 +539,7 @@ static int elf_add_symbol(struct elf *elf, struct symbol *sym)
 static int read_symbols(struct elf *elf)
 {
 	struct section *symtab, *symtab_shndx, *sec;
-	struct symbol *sym, *pfunc;
+	struct symbol *sym, *pfunc, *file = NULL;
 	int symbols_nr, i;
 	char *coldstr;
 	Elf_Data *shndx_data = NULL;
@@ -597,6 +612,11 @@ static int read_symbols(struct elf *elf)
 
 		if (elf_add_symbol(elf, sym))
 			return -1;
+
+		if (sym->type == STT_FILE)
+			file = sym;
+		else if (sym->bind == STB_LOCAL)
+			sym->file = file;
 	}
 
 	if (opts.stats) {
@@ -626,7 +646,9 @@ static int read_symbols(struct elf *elf)
 				return -1;
 			}
 
-			pfunc = find_symbol_by_name(elf, pname);
+			pfunc = find_local_symbol_by_file_and_name(elf, sym->file, pname);
+			if (!pfunc)
+				pfunc = find_global_symbol_by_name(elf, pname);
 			free(pname);
 
 			if (!pfunc) {
@@ -634,8 +656,9 @@ static int read_symbols(struct elf *elf)
 				return -1;
 			}
 
-			sym->pfunc = pfunc;
+			sym->pfunc = pfunc->alias;
 			pfunc->cfunc = sym;
+			pfunc->alias->cfunc = sym;
 
 			/*
 			 * Unfortunately, -fnoreorder-functions puts the child
@@ -1165,7 +1188,7 @@ err:
 struct elf *elf_create_file(GElf_Ehdr *ehdr, const char *name)
 {
 	struct section *null, *symtab, *strtab, *shstrtab;
-	char *dir, *base, *tmp_name;
+	char *tmp_name;
 	struct symbol *sym;
 	struct elf *elf;
 
@@ -1179,29 +1202,13 @@ struct elf *elf_create_file(GElf_Ehdr *ehdr, const char *name)
 
 	INIT_LIST_HEAD(&elf->sections);
 
-	dir = strdup(name);
-	if (!dir) {
-		ERROR_GLIBC("strdup");
-		return NULL;
-	}
-
-	dir = dirname(dir);
-
-	base = strdup(name);
-	if (!base) {
-		ERROR_GLIBC("strdup");
-		return NULL;
-	}
-
-	base = basename(base);
-
-	tmp_name = malloc(256);
+	tmp_name = malloc(strlen(name) + 8);
 	if (!tmp_name) {
 		ERROR_GLIBC("malloc");
 		return NULL;
 	}
 
-	snprintf(tmp_name, 256, "%s/%s.XXXXXX", dir, base);
+	sprintf(tmp_name, "%s.XXXXXX", name);
 
 	elf->fd = mkstemp(tmp_name);
 	if (elf->fd == -1) {
@@ -1311,7 +1318,7 @@ unsigned int elf_add_string(struct elf *elf, struct section *strtab, const char 
 		return -1;
 	}
 
-	offset = ALIGN_UP(strtab->sh.sh_size, strtab->sh.sh_addralign);
+	offset = ALIGN(strtab->sh.sh_size, strtab->sh.sh_addralign);
 
 	if (!elf_add_data(elf, strtab, str, strlen(str) + 1))
 		return -1;
@@ -1351,9 +1358,9 @@ void *elf_add_data(struct elf *elf, struct section *sec, const void *data, size_
 		memcpy(sec->data->d_buf, data, size);
 
 	sec->data->d_size = size;
-	sec->data->d_align = 1;
+	sec->data->d_align = sec->sh.sh_addralign;
 
-	offset = ALIGN_UP(sec->sh.sh_size, sec->sh.sh_addralign);
+	offset = ALIGN(sec->sh.sh_size, sec->sh.sh_addralign);
 	sec->sh.sh_size = offset + size;
 
 	mark_sec_changed(elf, sec, true);
@@ -1477,7 +1484,7 @@ static int elf_alloc_reloc(struct elf *elf, struct section *rsec)
 	rsec->data->d_size = nr_relocs_new * elf_rela_size(elf);
 	rsec->sh.sh_size   = rsec->data->d_size;
 
-	nr_alloc = MAX(64, ALIGN_UP_POW2(nr_relocs_new));
+	nr_alloc = max(64UL, roundup_pow_of_two(nr_relocs_new));
 	if (nr_alloc <= rsec->nr_alloc_relocs)
 		return 0;
 
