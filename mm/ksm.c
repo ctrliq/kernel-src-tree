@@ -281,6 +281,9 @@ static unsigned int zero_checksum __read_mostly;
 /* Whether to merge empty (zeroed) pages with actual zero pages */
 static bool ksm_use_zero_pages __read_mostly;
 
+/* Only deduplicate zero pages */
+static bool ksm_only_zero_pages __read_mostly;
+
 /* The number of zero pages which is placed by KSM */
 atomic_long_t ksm_zero_pages = ATOMIC_LONG_INIT(0);
 
@@ -1358,7 +1361,8 @@ static int try_to_merge_with_zero_page(struct ksm_rmap_item *rmap_item,
 	 * Same checksum as an empty page. We attempt to merge it with the
 	 * appropriate zero page if the user enabled this via sysfs.
 	 */
-	if (ksm_use_zero_pages && (rmap_item->oldchecksum == zero_checksum)) {
+	if ((ksm_use_zero_pages || ksm_only_zero_pages) &&
+	    (rmap_item->oldchecksum == zero_checksum)) {
 		struct vm_area_struct *vma;
 
 		mmap_read_lock(mm);
@@ -2193,6 +2197,8 @@ static void cmp_and_merge_page(struct page *page, struct ksm_rmap_item *rmap_ite
 		}
 
 		if (!try_to_merge_with_zero_page(rmap_item, page))
+			return;
+		if (ksm_only_zero_pages)
 			return;
 	}
 
@@ -3306,6 +3312,28 @@ static ssize_t use_zero_pages_store(struct kobject *kobj,
 }
 KSM_ATTR(use_zero_pages);
 
+static ssize_t redhat_only_zero_pages_show(struct kobject *kobj,
+				   struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", ksm_only_zero_pages);
+}
+static ssize_t redhat_only_zero_pages_store(struct kobject *kobj,
+				   struct kobj_attribute *attr,
+				   const char *buf, size_t count)
+{
+	int err;
+	bool value;
+
+	err = kstrtobool(buf, &value);
+	if (err)
+		return -EINVAL;
+
+	ksm_only_zero_pages = value;
+
+	return count;
+}
+KSM_ATTR(redhat_only_zero_pages);
+
 static ssize_t max_page_sharing_show(struct kobject *kobj,
 				     struct kobj_attribute *attr, char *buf)
 {
@@ -3477,6 +3505,7 @@ static struct attribute *ksm_attrs[] = {
 	&stable_node_dups_attr.attr,
 	&stable_node_chains_prune_millisecs_attr.attr,
 	&use_zero_pages_attr.attr,
+	&redhat_only_zero_pages_attr.attr,
 	&general_profit_attr.attr,
 	NULL,
 };
