@@ -27,13 +27,13 @@ MODULE_PARM_DESC(threaded_isr_poll,
 			"Enablement of IRQ polling thread (default=true)");
 
 #if defined(writeq) && defined(CONFIG_64BIT)
-static inline void mpi3mr_writeq(__u64 b, volatile void __iomem *addr,
+static inline void mpi3mr_writeq(__u64 b, void __iomem *addr,
 	spinlock_t *write_queue_lock)
 {
 	writeq(b, addr);
 }
 #else
-static inline void mpi3mr_writeq(__u64 b, volatile void __iomem *addr,
+static inline void mpi3mr_writeq(__u64 b, void __iomem *addr,
 	spinlock_t *write_queue_lock)
 {
 	__u64 data_out = b;
