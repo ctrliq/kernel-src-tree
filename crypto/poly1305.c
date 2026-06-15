@@ -46,18 +46,12 @@ static int crypto_poly1305_update(struct shash_desc *desc,
 		dctx->keysize += bytes;
 		if (dctx->keysize < POLY1305_KEY_SIZE)
 			return 0;
-		if (arch)
-			poly1305_init(&dctx->base, dctx->key);
-		else
-			poly1305_init_generic(&dctx->base, dctx->key);
+		poly1305_init(&dctx->base, dctx->key);
 		src += bytes;
 		srclen -= bytes;
 	}
 
-	if (arch)
-		poly1305_update(&dctx->base, src, srclen);
-	else
-		poly1305_update_generic(&dctx->base, src, srclen);
+	poly1305_update(&dctx->base, src, srclen);
 
 	return 0;
 }
@@ -81,10 +75,7 @@ static int crypto_poly1305_final(struct shash_desc *desc, u8 *dst, bool arch)
 	if (unlikely(dctx->keysize != POLY1305_KEY_SIZE))
 		return -ENOKEY;
 
-	if (arch)
-		poly1305_final(&dctx->base, dst);
-	else
-		poly1305_final_generic(&dctx->base, dst);
+	poly1305_final(&dctx->base, dst);
 	memzero_explicit(&dctx->key, sizeof(dctx->key));
 	return 0;
 }
@@ -131,7 +122,9 @@ static int num_algs;
 static int __init poly1305_mod_init(void)
 {
 	/* register the arch flavours only if they differ from generic */
-	num_algs = poly1305_is_arch_optimized() ? 2 : 1;
+	// num_algs = poly1305_is_arch_optimized() ? 2 : 1;
+	/* RHEL-10 : Provide only the generic alg: */
+	num_algs = 1;
 
 	return crypto_register_shashes(poly1305_algs, num_algs);
 }
