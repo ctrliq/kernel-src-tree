@@ -150,7 +150,8 @@ obj-$(CONFIG_CRYPTO_ARIA) += aria_generic.o
 chacha_generic-y += chacha.o                        # Use old name in RHEL10
 obj-$(CONFIG_CRYPTO_CHACHA20) += chacha_generic.o
 CFLAGS_chacha.o += -DARCH=$(ARCH)
-obj-$(CONFIG_CRYPTO_POLY1305) += poly1305.o
+poly1305_generic-y += poly1305.o                    # Use old name in RHEL10
+obj-$(CONFIG_CRYPTO_POLY1305) += poly1305_generic.o
 CFLAGS_poly1305.o += -DARCH=$(ARCH)
 obj-$(CONFIG_CRYPTO_DEFLATE) += deflate.o
 obj-$(CONFIG_CRYPTO_MICHAEL_MIC) += michael_mic.o
