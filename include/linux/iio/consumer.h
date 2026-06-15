@@ -131,7 +131,8 @@ struct iio_cb_buffer;
 /**
  * iio_channel_get_all_cb() - register callback for triggered capture
  * @dev:		Pointer to client device.
- * @cb:			Callback function.
+ * @cb:			Callback function. Must be safe to call from any context
+ *			(e.g. must not sleep).
  * @private:		Private data passed to callback.
  *
  * NB right now we have no ability to mux data from multiple devices.
@@ -418,7 +419,7 @@ unsigned int iio_get_channel_ext_info_count(struct iio_channel *chan);
  * @chan:		The channel being queried.
  * @attr:		The ext_info attribute to read.
  * @buf:		Where to store the attribute value. Assumed to hold
- *			at least PAGE_SIZE bytes.
+ *			at least PAGE_SIZE bytes and to be aligned at PAGE_SIZE.
  *
  * Returns the number of bytes written to buf (perhaps w/o zero termination;
  * it need not even be a string), or an error code.
@@ -445,7 +446,7 @@ ssize_t iio_write_channel_ext_info(struct iio_channel *chan, const char *attr,
  * iio_read_channel_label() - read label for a given channel
  * @chan:		The channel being queried.
  * @buf:		Where to store the attribute value. Assumed to hold
- *			at least PAGE_SIZE bytes.
+ *			at least PAGE_SIZE bytes and to be aligned at PAGE_SIZE.
  *
  * Returns the number of bytes written to buf, or an error code.
  */

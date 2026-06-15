@@ -7,6 +7,7 @@
 #include <linux/err.h>
 #include <linux/export.h>
 #include <linux/minmax.h>
+#include <linux/mm.h>
 #include <linux/mutex.h>
 #include <linux/property.h>
 #include <linux/slab.h>
@@ -20,7 +21,7 @@
 
 struct iio_map_internal {
 	struct iio_dev *indio_dev;
-	struct iio_map *map;
+	const struct iio_map *map;
 	struct list_head l;
 };
 
@@ -42,7 +43,7 @@ static int iio_map_array_unregister_locked(struct iio_dev *indio_dev)
 	return ret;
 }
 
-int iio_map_array_register(struct iio_dev *indio_dev, struct iio_map *maps)
+int iio_map_array_register(struct iio_dev *indio_dev, const struct iio_map *maps)
 {
 	struct iio_map_internal *mapi;
 	int i = 0;
@@ -86,7 +87,8 @@ static void iio_map_array_unregister_cb(void *indio_dev)
 	iio_map_array_unregister(indio_dev);
 }
 
-int devm_iio_map_array_register(struct device *dev, struct iio_dev *indio_dev, struct iio_map *maps)
+int devm_iio_map_array_register(struct device *dev, struct iio_dev *indio_dev,
+				const struct iio_map *maps)
 {
 	int ret;
 
@@ -988,6 +990,11 @@ ssize_t iio_read_channel_ext_info(struct iio_channel *chan,
 {
 	const struct iio_chan_spec_ext_info *ext_info;
 
+	if (!buf || offset_in_page(buf)) {
+		pr_err("iio: invalid ext_info read buffer\n");
+		return -EINVAL;
+	}
+
 	ext_info = iio_lookup_ext_info(chan, attr);
 	if (!ext_info)
 		return -EINVAL;
@@ -1013,6 +1020,11 @@ EXPORT_SYMBOL_GPL(iio_write_channel_ext_info);
 
 ssize_t iio_read_channel_label(struct iio_channel *chan, char *buf)
 {
+	if (!buf || offset_in_page(buf)) {
+		pr_err("iio: invalid label read buffer\n");
+		return -EINVAL;
+	}
+
 	return do_iio_read_channel_label(chan->indio_dev, chan->channel, buf);
 }
 EXPORT_SYMBOL_GPL(iio_read_channel_label);
