@@ -1134,13 +1134,11 @@ static int acpi_video_bus_get_one_device(struct acpi_device *device, void *arg)
 	struct acpi_video_bus *video = arg;
 	struct acpi_video_device_attrib *attribute;
 	struct acpi_video_device *data;
-	unsigned long long device_id;
-	acpi_status status;
 	int device_type;
+	u64 device_id;
 
-	status = acpi_evaluate_integer(device->handle, "_ADR", NULL, &device_id);
 	/* Skip devices without _ADR instead of failing. */
-	if (ACPI_FAILURE(status))
+	if (acpi_get_local_u64_address(device->handle, &device_id))
 		goto exit;
 
 	data = kzalloc(sizeof(struct acpi_video_device), GFP_KERNEL);
@@ -1540,13 +1538,10 @@ static int acpi_video_bus_stop_devices(struct acpi_video_bus *video)
 
 static void acpi_video_bus_notify(acpi_handle handle, u32 event, void *data)
 {
-	struct acpi_device *device = data;
-	struct acpi_video_bus *video = acpi_driver_data(device);
+	struct acpi_video_bus *video = data;
+	struct acpi_device *device = video->device;
 	struct input_dev *input;
 	int keycode = 0;
-
-	if (!video || !video->input)
-		return;
 
 	input = video->input;
 
@@ -1959,8 +1954,10 @@ static void acpi_video_bus_remove_notify_handler(struct acpi_video_bus *video)
 	struct acpi_video_device *dev;
 
 	mutex_lock(&video->device_list_lock);
-	list_for_each_entry(dev, &video->video_device_list, entry)
+	list_for_each_entry(dev, &video->video_device_list, entry) {
 		acpi_video_dev_remove_notify_handler(dev);
+		cancel_delayed_work_sync(&dev->switch_brightness_work);
+	}
 	mutex_unlock(&video->device_list_lock);
 
 	acpi_video_bus_stop_devices(video);
@@ -2074,7 +2071,7 @@ static int acpi_video_bus_add(struct acpi_device *device)
 		goto err_del;
 
 	error = acpi_dev_install_notify_handler(device, ACPI_DEVICE_NOTIFY,
-						acpi_video_bus_notify, device);
+						acpi_video_bus_notify, video);
 	if (error)
 		goto err_remove;
 
@@ -2120,6 +2117,7 @@ static void acpi_video_bus_remove(struct acpi_device *device)
 
 	kfree(video->attached_array);
 	kfree(video);
+	device->driver_data = NULL;
 }
 
 static int __init is_i740(struct pci_dev *dev)

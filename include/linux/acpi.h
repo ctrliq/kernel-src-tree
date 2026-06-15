@@ -767,7 +767,6 @@ int acpi_reconfig_notifier_unregister(struct notifier_block *nb);
 int acpi_gtdt_init(struct acpi_table_header *table, int *platform_timer_count);
 int acpi_gtdt_map_ppi(int type);
 bool acpi_gtdt_c3stop(int type);
-int acpi_arch_timer_mem_init(struct arch_timer_mem *timer_mem, int *timer_count);
 #endif
 
 #ifndef ACPI_HAVE_ARCH_SET_ROOT_POINTER
@@ -1158,12 +1157,7 @@ struct acpi_s2idle_dev_ops {
 };
 int acpi_register_lps0_dev(struct acpi_s2idle_dev_ops *arg);
 void acpi_unregister_lps0_dev(struct acpi_s2idle_dev_ops *arg);
-int acpi_get_lps0_constraint(struct acpi_device *adev);
 #else /* CONFIG_SUSPEND && CONFIG_X86 */
-static inline int acpi_get_lps0_constraint(struct device *dev)
-{
-	return ACPI_STATE_UNKNOWN;
-}
 #endif /* CONFIG_SUSPEND && CONFIG_X86 */
 void arch_reserve_mem_area(acpi_physical_address addr, size_t size);
 #else
@@ -1354,9 +1348,6 @@ acpi_data_add_props(struct acpi_device_data *data, const guid_t *guid,
 int acpi_node_prop_get(const struct fwnode_handle *fwnode, const char *propname,
 		       void **valptr);
 
-struct fwnode_handle *acpi_get_next_subnode(const struct fwnode_handle *fwnode,
-					    struct fwnode_handle *child);
-
 struct acpi_probe_entry;
 typedef bool (*acpi_probe_entry_validate_subtbl)(struct acpi_subtable_header *,
 						 struct acpi_probe_entry *);
@@ -1453,13 +1444,6 @@ static inline int acpi_node_prop_get(const struct fwnode_handle *fwnode,
 				     void **valptr)
 {
 	return -ENXIO;
-}
-
-static inline struct fwnode_handle *
-acpi_get_next_subnode(const struct fwnode_handle *fwnode,
-		      struct fwnode_handle *child)
-{
-	return NULL;
 }
 
 static inline struct fwnode_handle *

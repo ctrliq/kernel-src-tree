@@ -128,7 +128,7 @@ static int isp_genpd_add_device(struct device *dev, void *data)
 	if (!pdev)
 		return -EINVAL;
 
-	if (!dev->type->name) {
+	if (!dev->type || !dev->type->name) {
 		drm_dbg(&adev->ddev, "Invalid device type to add\n");
 		goto exit;
 	}
@@ -161,7 +161,7 @@ static int isp_genpd_remove_device(struct device *dev, void *data)
 	if (!pdev)
 		return -EINVAL;
 
-	if (!dev->type->name) {
+	if (!dev->type || !dev->type->name) {
 		drm_dbg(&adev->ddev, "Invalid device type to remove\n");
 		goto exit;
 	}

@@ -2874,6 +2874,8 @@ struct acpi_ras2_patrol_scrub_parameter {
 	u32 flags;
 	u32 scrub_params_out;
 	u32 scrub_params_in;
+	u32 ext_scrub_params;
+	u8 scrub_rate_desc[256];
 };
 
 /* Masks for Flags field above */
