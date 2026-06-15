@@ -2596,7 +2596,6 @@ static int gather_surplus_pages(struct hstate *h, long delta)
 retry:
 	spin_unlock_irq(&hugetlb_lock);
 	for (i = 0; i < needed; i++) {
-		folio = NULL;
 
 		/* Prioritize current node */
 		if (node_isset(numa_mem_id(), alloc_nodemask))
