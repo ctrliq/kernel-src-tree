@@ -881,7 +881,7 @@ static void ep_remove_file(struct eventpoll *ep, struct epitem *epi,
 	free_ephead(to_free);
 }
 
-static bool ep_remove_epi(struct eventpoll *ep, struct epitem *epi)
+static void ep_remove_epi(struct eventpoll *ep, struct epitem *epi)
 {
 	lockdep_assert_held(&ep->mtx);
 
@@ -903,7 +903,6 @@ static bool ep_remove_epi(struct eventpoll *ep, struct epitem *epi)
 	kfree_rcu(epi, rcu);
 
 	percpu_counter_dec(&ep->user->epoll_watches);
-	return true;
 }
 
 /*
@@ -931,9 +930,8 @@ static void ep_remove(struct eventpoll *ep, struct epitem *epi)
 		return;
 
 	ep_remove_file(ep, epi, file);
-
-	if (ep_remove_epi(ep, epi))
-		WARN_ON_ONCE(ep_refcount_dec_and_test(ep));
+	ep_remove_epi(ep, epi);
+	WARN_ON_ONCE(ep_refcount_dec_and_test(ep));
 }
 
 static void ep_clear_and_put(struct eventpoll *ep)
@@ -1125,7 +1123,6 @@ void eventpoll_release_file(struct file *file)
 {
 	struct eventpoll *ep;
 	struct epitem *epi;
-	bool dispose;
 
 	/*
 	 * Use the 'dying' flag to prevent a concurrent ep_clear_and_put() from
@@ -1149,11 +1146,11 @@ again:
 		ep_unregister_pollwait(ep, epi);
 
 		ep_remove_file(ep, epi, file);
-		dispose = ep_remove_epi(ep, epi);
+		ep_remove_epi(ep, epi);
 
 		mutex_unlock(&ep->mtx);
 
-		if (dispose && ep_refcount_dec_and_test(ep))
+		if (ep_refcount_dec_and_test(ep))
 			ep_free(ep);
 		goto again;
 	}
