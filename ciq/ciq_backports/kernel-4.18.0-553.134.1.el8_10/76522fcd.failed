@@ -1,0 +1,388 @@
+netfilter: flowtable: strictly check for maximum number of actions
+
+jira KERNEL-1173
+cve CVE-2026-43329
+Rebuild_History Non-Buildable kernel-4.18.0-553.134.1.el8_10
+commit-author Pablo Neira Ayuso <pablo@netfilter.org>
+commit 76522fcdbc3a02b568f5d957f7e66fc194abb893
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.134.1.el8_10/76522fcd.failed
+
+The maximum number of flowtable hardware offload actions in IPv6 is:
+
+* ethernet mangling (4 payload actions, 2 for each ethernet address)
+* SNAT (4 payload actions)
+* DNAT (4 payload actions)
+* Double VLAN (4 vlan actions, 2 for popping vlan, and 2 for pushing)
+  for QinQ.
+* Redirect (1 action)
+
+Which makes 17, while the maximum is 16. But act_ct supports for tunnels
+actions too. Note that payload action operates at 32-bit word level, so
+mangling an IPv6 address takes 4 payload actions.
+
+Update flow_action_entry_next() calls to check for the maximum number of
+supported actions.
+
+While at it, rise the maximum number of actions per flow from 16 to 24
+so this works fine with IPv6 setups.
+
+Fixes: c29f74e0df7a ("netfilter: nf_flow_table: hardware offload support")
+	Reported-by: Hyunwoo Kim <imv4bel@gmail.com>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 76522fcdbc3a02b568f5d957f7e66fc194abb893)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_flow_table_offload.c
+diff --cc net/netfilter/nf_flow_table_offload.c
+index a3cc8a9021e5,93d0aa7f8fcc..000000000000
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@@ -184,12 -241,29 +191,35 @@@ static int flow_offload_eth_src(struct 
+  	u32 mask, val;
+  	u16 val16;
+  
+++<<<<<<< HEAD
+ +	dev = dev_get_by_index(net, tuple->iifidx);
+ +	if (!dev)
+ +		return -ENOENT;
+++=======
++ 	if (!entry0 || !entry1)
++ 		return -E2BIG;
++ 
++ 	this_tuple = &flow->tuplehash[dir].tuple;
++ 
++ 	switch (this_tuple->xmit_type) {
++ 	case FLOW_OFFLOAD_XMIT_DIRECT:
++ 		addr = this_tuple->out.h_source;
++ 		break;
++ 	case FLOW_OFFLOAD_XMIT_NEIGH:
++ 		other_tuple = &flow->tuplehash[!dir].tuple;
++ 		dev = dev_get_by_index(net, other_tuple->iifidx);
++ 		if (!dev)
++ 			return -ENOENT;
++ 
++ 		addr = dev->dev_addr;
++ 		break;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
+++>>>>>>> 76522fcdbc3a (netfilter: flowtable: strictly check for maximum number of actions)
+  
+  	mask = ~0xffff0000;
+ -	memcpy(&val16, addr, 2);
+ +	memcpy(&val16, dev->dev_addr, 2);
+  	val = val16 << 16;
+  	flow_offload_mangle(entry0, FLOW_ACT_MANGLE_HDR_TYPE_ETH, 4,
+  			    &val, &mask);
+@@@ -218,19 -294,34 +248,26 @@@ static int flow_offload_eth_dst(struct 
+  	u8 nud_state;
+  	u16 val16;
+  
+++<<<<<<< HEAD
+ +	dst_cache = flow->tuplehash[dir].tuple.dst_cache;
+ +	n = dst_neigh_lookup(dst_cache, daddr);
+ +	if (!n)
+ +		return -ENOENT;
+++=======
++ 	if (!entry0 || !entry1)
++ 		return -E2BIG;
++ 
++ 	this_tuple = &flow->tuplehash[dir].tuple;
+++>>>>>>> 76522fcdbc3a (netfilter: flowtable: strictly check for maximum number of actions)
+  
+ -	switch (this_tuple->xmit_type) {
+ -	case FLOW_OFFLOAD_XMIT_DIRECT:
+ -		ether_addr_copy(ha, this_tuple->out.h_dest);
+ -		break;
+ -	case FLOW_OFFLOAD_XMIT_NEIGH:
+ -		other_tuple = &flow->tuplehash[!dir].tuple;
+ -		daddr = &other_tuple->src_v4;
+ -		dst_cache = this_tuple->dst_cache;
+ -		n = dst_neigh_lookup(dst_cache, daddr);
+ -		if (!n)
+ -			return -ENOENT;
+ +	read_lock_bh(&n->lock);
+ +	nud_state = n->nud_state;
+ +	ether_addr_copy(ha, n->ha);
+ +	read_unlock_bh(&n->lock);
+  
+ -		read_lock_bh(&n->lock);
+ -		nud_state = n->nud_state;
+ -		ether_addr_copy(ha, n->ha);
+ -		read_unlock_bh(&n->lock);
+ +	if (!(nud_state & NUD_VALID)) {
+  		neigh_release(n);
+ -
+ -		if (!(nud_state & NUD_VALID))
+ -			return -ENOENT;
+ -		break;
+ -	default:
+ -		return -EOPNOTSUPP;
+ +		return -ENOENT;
+  	}
+  
+  	mask = ~0xffffffff;
+@@@ -463,29 -577,63 +524,77 @@@ static int flow_offload_ipv4_checksum(s
+  		entry->csum_flags |= TCA_CSUM_UPDATE_FLAG_UDP;
+  		break;
+  	}
++ 
++ 	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static void flow_offload_redirect(const struct flow_offload *flow,
+ +				  enum flow_offload_tuple_dir dir,
+ +				  struct nf_flow_rule *flow_rule)
+++=======
++ static int flow_offload_redirect(struct net *net,
++ 				 const struct flow_offload *flow,
++ 				 enum flow_offload_tuple_dir dir,
++ 				 struct nf_flow_rule *flow_rule)
+++>>>>>>> 76522fcdbc3a (netfilter: flowtable: strictly check for maximum number of actions)
+  {
+ -	const struct flow_offload_tuple *this_tuple, *other_tuple;
+ -	struct flow_action_entry *entry;
+ -	struct net_device *dev;
+ -	int ifindex;
+ +	struct flow_action_entry *entry = flow_action_entry_next(flow_rule);
+ +	struct rtable *rt;
+  
+++<<<<<<< HEAD
+ +	rt = (struct rtable *)flow->tuplehash[dir].tuple.dst_cache;
+ +	entry->id = FLOW_ACTION_REDIRECT;
+ +	entry->dev = rt->dst.dev;
+ +	dev_hold(rt->dst.dev);
+++=======
++ 	this_tuple = &flow->tuplehash[dir].tuple;
++ 	switch (this_tuple->xmit_type) {
++ 	case FLOW_OFFLOAD_XMIT_DIRECT:
++ 		this_tuple = &flow->tuplehash[dir].tuple;
++ 		ifindex = this_tuple->out.ifidx;
++ 		break;
++ 	case FLOW_OFFLOAD_XMIT_NEIGH:
++ 		other_tuple = &flow->tuplehash[!dir].tuple;
++ 		ifindex = other_tuple->iifidx;
++ 		break;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	dev = dev_get_by_index(net, ifindex);
++ 	if (!dev)
++ 		return -ENODEV;
++ 
++ 	entry = flow_action_entry_next(flow_rule);
++ 	if (!entry) {
++ 		dev_put(dev);
++ 		return -E2BIG;
++ 	}
++ 
++ 	entry->id = FLOW_ACTION_REDIRECT;
++ 	entry->dev = dev;
++ 
++ 	return 0;
+++>>>>>>> 76522fcdbc3a (netfilter: flowtable: strictly check for maximum number of actions)
+  }
+  
+- static void flow_offload_encap_tunnel(const struct flow_offload *flow,
+- 				      enum flow_offload_tuple_dir dir,
+- 				      struct nf_flow_rule *flow_rule)
++ static int flow_offload_encap_tunnel(const struct flow_offload *flow,
++ 				     enum flow_offload_tuple_dir dir,
++ 				     struct nf_flow_rule *flow_rule)
+  {
+ -	const struct flow_offload_tuple *this_tuple;
+  	struct flow_action_entry *entry;
+  	struct dst_entry *dst;
+  
+++<<<<<<< HEAD
+ +	dst = flow->tuplehash[dir].tuple.dst_cache;
+++=======
++ 	this_tuple = &flow->tuplehash[dir].tuple;
++ 	if (this_tuple->xmit_type == FLOW_OFFLOAD_XMIT_DIRECT)
++ 		return 0;
++ 
++ 	dst = this_tuple->dst_cache;
+++>>>>>>> 76522fcdbc3a (netfilter: flowtable: strictly check for maximum number of actions)
+  	if (dst && dst->lwtstate) {
+  		struct ip_tunnel_info *tun_info;
+  
+@@@ -496,16 -646,23 +607,26 @@@
+  			entry->tunnel = tun_info;
+  		}
+  	}
++ 
++ 	return 0;
+  }
+  
+- static void flow_offload_decap_tunnel(const struct flow_offload *flow,
+- 				      enum flow_offload_tuple_dir dir,
+- 				      struct nf_flow_rule *flow_rule)
++ static int flow_offload_decap_tunnel(const struct flow_offload *flow,
++ 				     enum flow_offload_tuple_dir dir,
++ 				     struct nf_flow_rule *flow_rule)
+  {
+ -	const struct flow_offload_tuple *other_tuple;
+  	struct flow_action_entry *entry;
+  	struct dst_entry *dst;
+  
+++<<<<<<< HEAD
+ +	dst = flow->tuplehash[!dir].tuple.dst_cache;
+++=======
++ 	other_tuple = &flow->tuplehash[!dir].tuple;
++ 	if (other_tuple->xmit_type == FLOW_OFFLOAD_XMIT_DIRECT)
++ 		return 0;
++ 
++ 	dst = other_tuple->dst_cache;
+++>>>>>>> 76522fcdbc3a (netfilter: flowtable: strictly check for maximum number of actions)
+  	if (dst && dst->lwtstate) {
+  		struct ip_tunnel_info *tun_info;
+  
+@@@ -515,32 -674,95 +638,106 @@@
+  			entry->id = FLOW_ACTION_TUNNEL_DECAP;
+  		}
+  	}
++ 
++ 	return 0;
+  }
+  
+ -static int
+ -nf_flow_rule_route_common(struct net *net, const struct flow_offload *flow,
+ -			  enum flow_offload_tuple_dir dir,
+ -			  struct nf_flow_rule *flow_rule)
+ +int nf_flow_rule_route_ipv4(struct net *net, struct flow_offload *flow,
+ +			    enum flow_offload_tuple_dir dir,
+ +			    struct nf_flow_rule *flow_rule)
+  {
+++<<<<<<< HEAD
+ +	flow_offload_decap_tunnel(flow, dir, flow_rule);
+ +	flow_offload_encap_tunnel(flow, dir, flow_rule);
+++=======
++ 	const struct flow_offload_tuple *other_tuple;
++ 	const struct flow_offload_tuple *tuple;
++ 	int i;
++ 
++ 	if (flow_offload_decap_tunnel(flow, dir, flow_rule) < 0 ||
++ 	    flow_offload_encap_tunnel(flow, dir, flow_rule) < 0)
++ 		return -1;
+++>>>>>>> 76522fcdbc3a (netfilter: flowtable: strictly check for maximum number of actions)
+  
+  	if (flow_offload_eth_src(net, flow, dir, flow_rule) < 0 ||
+  	    flow_offload_eth_dst(net, flow, dir, flow_rule) < 0)
+  		return -1;
+  
+++<<<<<<< HEAD
+++=======
++ 	tuple = &flow->tuplehash[dir].tuple;
++ 
++ 	for (i = 0; i < tuple->encap_num; i++) {
++ 		struct flow_action_entry *entry;
++ 
++ 		if (tuple->in_vlan_ingress & BIT(i))
++ 			continue;
++ 
++ 		if (tuple->encap[i].proto == htons(ETH_P_8021Q)) {
++ 			entry = flow_action_entry_next(flow_rule);
++ 			if (!entry)
++ 				return -1;
++ 			entry->id = FLOW_ACTION_VLAN_POP;
++ 		}
++ 	}
++ 
++ 	other_tuple = &flow->tuplehash[!dir].tuple;
++ 
++ 	for (i = 0; i < other_tuple->encap_num; i++) {
++ 		struct flow_action_entry *entry;
++ 
++ 		if (other_tuple->in_vlan_ingress & BIT(i))
++ 			continue;
++ 
++ 		entry = flow_action_entry_next(flow_rule);
++ 		if (!entry)
++ 			return -1;
++ 
++ 		switch (other_tuple->encap[i].proto) {
++ 		case htons(ETH_P_PPP_SES):
++ 			entry->id = FLOW_ACTION_PPPOE_PUSH;
++ 			entry->pppoe.sid = other_tuple->encap[i].id;
++ 			break;
++ 		case htons(ETH_P_8021Q):
++ 			entry->id = FLOW_ACTION_VLAN_PUSH;
++ 			entry->vlan.vid = other_tuple->encap[i].id;
++ 			entry->vlan.proto = other_tuple->encap[i].proto;
++ 			break;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ int nf_flow_rule_route_ipv4(struct net *net, struct flow_offload *flow,
++ 			    enum flow_offload_tuple_dir dir,
++ 			    struct nf_flow_rule *flow_rule)
++ {
++ 	if (nf_flow_rule_route_common(net, flow, dir, flow_rule) < 0)
++ 		return -1;
++ 
+++>>>>>>> 76522fcdbc3a (netfilter: flowtable: strictly check for maximum number of actions)
+  	if (test_bit(NF_FLOW_SNAT, &flow->flags)) {
+- 		flow_offload_ipv4_snat(net, flow, dir, flow_rule);
+- 		flow_offload_port_snat(net, flow, dir, flow_rule);
++ 		if (flow_offload_ipv4_snat(net, flow, dir, flow_rule) < 0 ||
++ 		    flow_offload_port_snat(net, flow, dir, flow_rule) < 0)
++ 			return -1;
+  	}
+  	if (test_bit(NF_FLOW_DNAT, &flow->flags)) {
+- 		flow_offload_ipv4_dnat(net, flow, dir, flow_rule);
+- 		flow_offload_port_dnat(net, flow, dir, flow_rule);
++ 		if (flow_offload_ipv4_dnat(net, flow, dir, flow_rule) < 0 ||
++ 		    flow_offload_port_dnat(net, flow, dir, flow_rule) < 0)
++ 			return -1;
+  	}
+  	if (test_bit(NF_FLOW_SNAT, &flow->flags) ||
+  	    test_bit(NF_FLOW_DNAT, &flow->flags))
+- 		flow_offload_ipv4_checksum(net, flow, flow_rule);
++ 		if (flow_offload_ipv4_checksum(net, flow, flow_rule) < 0)
++ 			return -1;
+  
+++<<<<<<< HEAD
+ +	flow_offload_redirect(flow, dir, flow_rule);
+++=======
++ 	if (flow_offload_redirect(net, flow, dir, flow_rule) < 0)
++ 		return -1;
+++>>>>>>> 76522fcdbc3a (netfilter: flowtable: strictly check for maximum number of actions)
+  
+  	return 0;
+  }
+@@@ -558,15 -776,18 +755,22 @@@ int nf_flow_rule_route_ipv6(struct net 
+  		return -1;
+  
+  	if (test_bit(NF_FLOW_SNAT, &flow->flags)) {
+- 		flow_offload_ipv6_snat(net, flow, dir, flow_rule);
+- 		flow_offload_port_snat(net, flow, dir, flow_rule);
++ 		if (flow_offload_ipv6_snat(net, flow, dir, flow_rule) < 0 ||
++ 		    flow_offload_port_snat(net, flow, dir, flow_rule) < 0)
++ 			return -1;
+  	}
+  	if (test_bit(NF_FLOW_DNAT, &flow->flags)) {
+- 		flow_offload_ipv6_dnat(net, flow, dir, flow_rule);
+- 		flow_offload_port_dnat(net, flow, dir, flow_rule);
++ 		if (flow_offload_ipv6_dnat(net, flow, dir, flow_rule) < 0 ||
++ 		    flow_offload_port_dnat(net, flow, dir, flow_rule) < 0)
++ 			return -1;
+  	}
+  
+++<<<<<<< HEAD
+ +	flow_offload_redirect(flow, dir, flow_rule);
+++=======
++ 	if (flow_offload_redirect(net, flow, dir, flow_rule) < 0)
++ 		return -1;
+++>>>>>>> 76522fcdbc3a (netfilter: flowtable: strictly check for maximum number of actions)
+  
+  	return 0;
+  }
+* Unmerged path net/netfilter/nf_flow_table_offload.c
