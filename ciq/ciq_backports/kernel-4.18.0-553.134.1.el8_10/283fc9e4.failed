@@ -1,0 +1,568 @@
+wifi: mac80211: remove station if connection prep fails
+
+jira KERNEL-1173
+cve CVE-2026-46125
+Rebuild_History Non-Buildable kernel-4.18.0-553.134.1.el8_10
+commit-author Johannes Berg <johannes.berg@intel.com>
+commit 283fc9e44ff5b5ac967439b4951b80bd4299f4e4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.134.1.el8_10/283fc9e4.failed
+
+If connection preparation fails for MLO connections, then the
+interface is completely reset to non-MLD. In this case, we must
+not keep the station since it's related to the link of the vif
+being removed. Delete an existing station. Any "new_sta" is
+already being removed, so that doesn't need changes.
+
+This fixes a use-after-free/double-free in debugfs if that's
+enabled, because a vif going from MLD (and to MLD, but that's
+not relevant here) recreates its entire debugfs.
+
+	Cc: stable@vger.kernel.org
+Fixes: 81151ce462e5 ("wifi: mac80211: support MLO authentication/association with one link")
+	Reviewed-by: Miriam Rachel Korenblit <miriam.rachel.korenblit@intel.com>
+Link: https://patch.msgid.link/20260505151533.c4e52deb06ad.Iafe56cec7de8512626169496b134bce3a6c17010@changeid
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit 283fc9e44ff5b5ac967439b4951b80bd4299f4e4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mac80211/mlme.c
+diff --cc net/mac80211/mlme.c
+index 5a4303130ef2,0a0f27836d57..000000000000
+--- a/net/mac80211/mlme.c
++++ b/net/mac80211/mlme.c
+@@@ -6433,360 -10240,205 +6433,377 @@@ void ieee80211_mgd_quiesce(struct ieee8
+  {
+  	struct ieee80211_if_managed *ifmgd = &sdata->u.mgd;
+  	u8 frame_buf[IEEE80211_DEAUTH_FRAME_LEN];
+ -	bool tx = !req->local_state_change;
+ -	struct ieee80211_prep_tx_info info = {
+ -		.subtype = IEEE80211_STYPE_DEAUTH,
+ -	};
+  
+ -	if (ifmgd->auth_data &&
+ -	    ether_addr_equal(ifmgd->auth_data->ap_addr, req->bssid)) {
+ -		sdata_info(sdata,
+ -			   "aborting authentication with %pM by local choice (Reason: %u=%s)\n",
+ -			   req->bssid, req->reason_code,
+ -			   ieee80211_get_reason_code_string(req->reason_code));
+ +	sdata_lock(sdata);
+  
+ -		info.link_id = ifmgd->auth_data->link_id;
+ -		drv_mgd_prepare_tx(sdata->local, sdata, &info);
+ -		ieee80211_send_deauth_disassoc(sdata, req->bssid, req->bssid,
+ +	if (ifmgd->auth_data || ifmgd->assoc_data) {
+ +		const u8 *ap_addr = ifmgd->auth_data ?
+ +				ifmgd->auth_data->ap_addr :
+ +				ifmgd->assoc_data->ap_addr;
+ +
+ +		/*
+ +		 * If we are trying to authenticate / associate while suspending,
+ +		 * cfg80211 won't know and won't actually abort those attempts,
+ +		 * thus we need to do that ourselves.
+ +		 */
+ +		ieee80211_send_deauth_disassoc(sdata, ap_addr, ap_addr,
+  					       IEEE80211_STYPE_DEAUTH,
+ -					       req->reason_code, tx,
+ -					       frame_buf);
+ -		ieee80211_destroy_auth_data(sdata, false);
+ -		ieee80211_report_disconnect(sdata, frame_buf,
+ -					    sizeof(frame_buf), true,
+ -					    req->reason_code, false);
+ -		drv_mgd_complete_tx(sdata->local, sdata, &info);
+ -		return 0;
+ +					       WLAN_REASON_DEAUTH_LEAVING,
+ +					       false, frame_buf);
+ +		if (ifmgd->assoc_data)
+ +			ieee80211_destroy_assoc_data(sdata, ASSOC_ABANDON);
+ +		if (ifmgd->auth_data)
+ +			ieee80211_destroy_auth_data(sdata, false);
+ +		cfg80211_tx_mlme_mgmt(sdata->dev, frame_buf,
+ +				      IEEE80211_DEAUTH_FRAME_LEN,
+ +				      false);
+  	}
+  
+ -	if (ifmgd->assoc_data &&
+ -	    ether_addr_equal(ifmgd->assoc_data->ap_addr, req->bssid)) {
+ -		sdata_info(sdata,
+ -			   "aborting association with %pM by local choice (Reason: %u=%s)\n",
+ -			   req->bssid, req->reason_code,
+ -			   ieee80211_get_reason_code_string(req->reason_code));
+ +	/* This is a bit of a hack - we should find a better and more generic
+ +	 * solution to this. Normally when suspending, cfg80211 will in fact
+ +	 * deauthenticate. However, it doesn't (and cannot) stop an ongoing
+ +	 * auth (not so important) or assoc (this is the problem) process.
+ +	 *
+ +	 * As a consequence, it can happen that we are in the process of both
+ +	 * associating and suspending, and receive an association response
+ +	 * after cfg80211 has checked if it needs to disconnect, but before
+ +	 * we actually set the flag to drop incoming frames. This will then
+ +	 * cause the workqueue flush to process the association response in
+ +	 * the suspend, resulting in a successful association just before it
+ +	 * tries to remove the interface from the driver, which now though
+ +	 * has a channel context assigned ... this results in issues.
+ +	 *
+ +	 * To work around this (for now) simply deauth here again if we're
+ +	 * now connected.
+ +	 */
+ +	if (ifmgd->associated && !sdata->local->wowlan) {
+ +		u8 bssid[ETH_ALEN];
+ +		struct cfg80211_deauth_request req = {
+ +			.reason_code = WLAN_REASON_DEAUTH_LEAVING,
+ +			.bssid = bssid,
+ +		};
+  
+ -		info.link_id = ifmgd->assoc_data->assoc_link_id;
+ -		drv_mgd_prepare_tx(sdata->local, sdata, &info);
+ -		ieee80211_send_deauth_disassoc(sdata, req->bssid, req->bssid,
+ -					       IEEE80211_STYPE_DEAUTH,
+ -					       req->reason_code, tx,
+ -					       frame_buf);
+ -		ieee80211_destroy_assoc_data(sdata, ASSOC_ABANDON);
+ -		ieee80211_report_disconnect(sdata, frame_buf,
+ -					    sizeof(frame_buf), true,
+ -					    req->reason_code, false);
+ -		drv_mgd_complete_tx(sdata->local, sdata, &info);
+ -		return 0;
+ +		memcpy(bssid, sdata->vif.cfg.ap_addr, ETH_ALEN);
+ +		ieee80211_mgd_deauth(sdata, &req);
+  	}
+  
+ -	if (ifmgd->associated &&
+ -	    ether_addr_equal(sdata->vif.cfg.ap_addr, req->bssid)) {
+ -		sdata_info(sdata,
+ -			   "deauthenticating from %pM by local choice (Reason: %u=%s)\n",
+ -			   req->bssid, req->reason_code,
+ -			   ieee80211_get_reason_code_string(req->reason_code));
+ +	sdata_unlock(sdata);
+ +}
+ +#endif
+  
+ -		ieee80211_set_disassoc(sdata, IEEE80211_STYPE_DEAUTH,
+ -				       req->reason_code, tx, frame_buf);
+ -		ieee80211_report_disconnect(sdata, frame_buf,
+ -					    sizeof(frame_buf), true,
+ -					    req->reason_code, false);
+ -		return 0;
+ +void ieee80211_sta_restart(struct ieee80211_sub_if_data *sdata)
+ +{
+ +	struct ieee80211_if_managed *ifmgd = &sdata->u.mgd;
+ +
+ +	sdata_lock(sdata);
+ +	if (!ifmgd->associated) {
+ +		sdata_unlock(sdata);
+ +		return;
+  	}
+  
+ -	return -ENOTCONN;
+ +	if (sdata->flags & IEEE80211_SDATA_DISCONNECT_RESUME) {
+ +		sdata->flags &= ~IEEE80211_SDATA_DISCONNECT_RESUME;
+ +		mlme_dbg(sdata, "driver requested disconnect after resume\n");
+ +		ieee80211_sta_connection_lost(sdata,
+ +					      WLAN_REASON_UNSPECIFIED,
+ +					      true);
+ +		sdata_unlock(sdata);
+ +		return;
+ +	}
+ +
+ +	if (sdata->flags & IEEE80211_SDATA_DISCONNECT_HW_RESTART) {
+ +		sdata->flags &= ~IEEE80211_SDATA_DISCONNECT_HW_RESTART;
+ +		mlme_dbg(sdata, "driver requested disconnect after hardware restart\n");
+ +		ieee80211_sta_connection_lost(sdata,
+ +					      WLAN_REASON_UNSPECIFIED,
+ +					      true);
+ +		sdata_unlock(sdata);
+ +		return;
+ +	}
+ +
+ +	sdata_unlock(sdata);
+  }
+  
+ -int ieee80211_mgd_disassoc(struct ieee80211_sub_if_data *sdata,
+ -			   struct cfg80211_disassoc_request *req)
+ +static void ieee80211_request_smps_mgd_work(struct work_struct *work)
+  {
+ -	u8 frame_buf[IEEE80211_DEAUTH_FRAME_LEN];
+ +	struct ieee80211_link_data *link =
+ +		container_of(work, struct ieee80211_link_data,
+ +			     u.mgd.request_smps_work);
+ +
+ +	sdata_lock(link->sdata);
+ +	__ieee80211_request_smps_mgd(link->sdata, link,
+ +				     link->u.mgd.driver_smps_mode);
+ +	sdata_unlock(link->sdata);
+ +}
+ +
+ +/* interface setup */
+ +void ieee80211_sta_setup_sdata(struct ieee80211_sub_if_data *sdata)
+ +{
+ +	struct ieee80211_if_managed *ifmgd = &sdata->u.mgd;
+ +
+ +	INIT_WORK(&ifmgd->monitor_work, ieee80211_sta_monitor_work);
+ +	INIT_WORK(&ifmgd->beacon_connection_loss_work,
+ +		  ieee80211_beacon_connection_loss_work);
+ +	INIT_WORK(&ifmgd->csa_connection_drop_work,
+ +		  ieee80211_csa_connection_drop_work);
+ +	INIT_DELAYED_WORK(&ifmgd->tdls_peer_del_work,
+ +			  ieee80211_tdls_peer_del_work);
+ +	timer_setup(&ifmgd->timer, ieee80211_sta_timer, 0);
+ +	timer_setup(&ifmgd->bcn_mon_timer, ieee80211_sta_bcn_mon_timer, 0);
+ +	timer_setup(&ifmgd->conn_mon_timer, ieee80211_sta_conn_mon_timer, 0);
+ +	INIT_DELAYED_WORK(&ifmgd->tx_tspec_wk,
+ +			  ieee80211_sta_handle_tspec_ac_params_wk);
+ +
+ +	ifmgd->flags = 0;
+ +	ifmgd->powersave = sdata->wdev.ps;
+ +	ifmgd->uapsd_queues = sdata->local->hw.uapsd_queues;
+ +	ifmgd->uapsd_max_sp_len = sdata->local->hw.uapsd_max_sp_len;
+ +	/* Setup TDLS data */
+ +	spin_lock_init(&ifmgd->teardown_lock);
+ +	ifmgd->teardown_skb = NULL;
+ +	ifmgd->orig_teardown_skb = NULL;
+ +}
+  
+ -	if (!sdata->u.mgd.associated ||
+ -	    memcmp(sdata->vif.cfg.ap_addr, req->ap_addr, ETH_ALEN))
+ -		return -ENOTCONN;
+ +void ieee80211_mgd_setup_link(struct ieee80211_link_data *link)
+ +{
+ +	struct ieee80211_sub_if_data *sdata = link->sdata;
+ +	struct ieee80211_local *local = sdata->local;
+ +	unsigned int link_id = link->link_id;
+  
+ -	sdata_info(sdata,
+ -		   "disassociating from %pM by local choice (Reason: %u=%s)\n",
+ -		   req->ap_addr, req->reason_code,
+ -		   ieee80211_get_reason_code_string(req->reason_code));
+ +	link->u.mgd.p2p_noa_index = -1;
+ +	link->u.mgd.conn_flags = 0;
+ +	link->conf->bssid = link->u.mgd.bssid;
+  
+ -	ieee80211_set_disassoc(sdata, IEEE80211_STYPE_DISASSOC,
+ -			       req->reason_code, !req->local_state_change,
+ -			       frame_buf);
+ +	INIT_WORK(&link->u.mgd.request_smps_work,
+ +		  ieee80211_request_smps_mgd_work);
+ +	if (local->hw.wiphy->features & NL80211_FEATURE_DYNAMIC_SMPS)
+ +		link->u.mgd.req_smps = IEEE80211_SMPS_AUTOMATIC;
+ +	else
+ +		link->u.mgd.req_smps = IEEE80211_SMPS_OFF;
+  
+ -	ieee80211_report_disconnect(sdata, frame_buf, sizeof(frame_buf), true,
+ -				    req->reason_code, false);
+ +	INIT_WORK(&link->u.mgd.chswitch_work, ieee80211_chswitch_work);
+ +	timer_setup(&link->u.mgd.chswitch_timer, ieee80211_chswitch_timer, 0);
+  
+ -	return 0;
+ +	if (sdata->u.mgd.assoc_data)
+ +		ether_addr_copy(link->conf->addr,
+ +				sdata->u.mgd.assoc_data->link[link_id].addr);
+ +	else if (!is_valid_ether_addr(link->conf->addr))
+ +		eth_random_addr(link->conf->addr);
+  }
+  
+ -void ieee80211_mgd_stop_link(struct ieee80211_link_data *link)
+ +/* scan finished notification */
+ +void ieee80211_mlme_notify_scan_completed(struct ieee80211_local *local)
+  {
+ -	wiphy_work_cancel(link->sdata->local->hw.wiphy,
+ -			  &link->u.mgd.request_smps_work);
+ -	wiphy_work_cancel(link->sdata->local->hw.wiphy,
+ -			  &link->u.mgd.recalc_smps);
+ -	wiphy_hrtimer_work_cancel(link->sdata->local->hw.wiphy,
+ -				  &link->u.mgd.csa.switch_work);
+ +	struct ieee80211_sub_if_data *sdata;
+ +
+ +	/* Restart STA timers */
+ +	rcu_read_lock();
+ +	list_for_each_entry_rcu(sdata, &local->interfaces, list) {
+ +		if (ieee80211_sdata_running(sdata))
+ +			ieee80211_restart_sta_timer(sdata);
+ +	}
+ +	rcu_read_unlock();
+  }
+  
+ -void ieee80211_mgd_stop(struct ieee80211_sub_if_data *sdata)
+ +static int ieee80211_prep_connection(struct ieee80211_sub_if_data *sdata,
+ +				     struct cfg80211_bss *cbss, s8 link_id,
+ +				     const u8 *ap_mld_addr, bool assoc,
+ +				     bool override)
+  {
+ +	struct ieee80211_local *local = sdata->local;
+  	struct ieee80211_if_managed *ifmgd = &sdata->u.mgd;
+ +	struct ieee80211_bss *bss = (void *)cbss->priv;
+ +	struct sta_info *new_sta = NULL;
+ +	struct ieee80211_link_data *link;
+- 	bool have_sta = false;
+++	struct sta_info *have_sta = NULL;
+ +	bool mlo;
+ +	int err;
+  
+ -	/*
+ -	 * Make sure some work items will not run after this,
+ -	 * they will not do anything but might not have been
+ -	 * cancelled when disconnecting.
+ -	 */
+ -	wiphy_work_cancel(sdata->local->hw.wiphy,
+ -			  &ifmgd->monitor_work);
+ -	wiphy_work_cancel(sdata->local->hw.wiphy,
+ -			  &ifmgd->beacon_connection_loss_work);
+ -	wiphy_work_cancel(sdata->local->hw.wiphy,
+ -			  &ifmgd->csa_connection_drop_work);
+ -	wiphy_delayed_work_cancel(sdata->local->hw.wiphy,
+ -				  &ifmgd->tdls_peer_del_work);
+ -
+ -	if (ifmgd->assoc_data)
+ -		ieee80211_destroy_assoc_data(sdata, ASSOC_TIMEOUT);
+ -	if (ifmgd->auth_data)
+ -		ieee80211_destroy_auth_data(sdata, false);
+ -	spin_lock_bh(&ifmgd->teardown_lock);
+ -	if (ifmgd->teardown_skb) {
+ -		kfree_skb(ifmgd->teardown_skb);
+ -		ifmgd->teardown_skb = NULL;
+ -		ifmgd->orig_teardown_skb = NULL;
+ +	if (link_id >= 0) {
+ +		mlo = true;
+ +		if (WARN_ON(!ap_mld_addr))
+ +			return -EINVAL;
+ +		err = ieee80211_vif_set_links(sdata, BIT(link_id));
+ +	} else {
+ +		if (WARN_ON(ap_mld_addr))
+ +			return -EINVAL;
+ +		ap_mld_addr = cbss->bssid;
+ +		err = ieee80211_vif_set_links(sdata, 0);
+ +		link_id = 0;
+ +		mlo = false;
+  	}
+ -	kfree(ifmgd->assoc_req_ies);
+ -	ifmgd->assoc_req_ies = NULL;
+ -	ifmgd->assoc_req_ies_len = 0;
+ -	spin_unlock_bh(&ifmgd->teardown_lock);
+ -	timer_delete_sync(&ifmgd->timer);
+ -}
+  
+ -void ieee80211_cqm_rssi_notify(struct ieee80211_vif *vif,
+ -			       enum nl80211_cqm_rssi_threshold_event rssi_event,
+ -			       s32 rssi_level,
+ -			       gfp_t gfp)
+ -{
+ -	struct ieee80211_sub_if_data *sdata = vif_to_sdata(vif);
+++<<<<<<< HEAD
+++=======
+++	if (assoc)
+++		have_sta = sta_info_get(sdata, ap_mld_addr);
++ 
+ -	trace_api_cqm_rssi_notify(sdata, rssi_event, rssi_level);
+++	if (mlo && !have_sta &&
+++	    WARN_ON(sdata->vif.valid_links || sdata->vif.active_links))
+++		return -EINVAL;
++ 
+ -	cfg80211_cqm_rssi_notify(sdata->dev, rssi_event, rssi_level, gfp);
+ -}
+ -EXPORT_SYMBOL(ieee80211_cqm_rssi_notify);
+++	err = ieee80211_vif_set_links(sdata, new_links, 0);
+++>>>>>>> 283fc9e44ff5 (wifi: mac80211: remove station if connection prep fails)
+ +	if (err)
+ +		return err;
+  
+ -void ieee80211_cqm_beacon_loss_notify(struct ieee80211_vif *vif, gfp_t gfp)
+ -{
+ -	struct ieee80211_sub_if_data *sdata = vif_to_sdata(vif);
+ +	link = sdata_dereference(sdata->link[link_id], sdata);
+ +	if (WARN_ON(!link)) {
+ +		err = -ENOLINK;
+ +		goto out_err;
+ +	}
+  
+ -	trace_api_cqm_beacon_loss_notify(sdata->local, sdata);
+ +	if (WARN_ON(!ifmgd->auth_data && !ifmgd->assoc_data)) {
+ +		err = -EINVAL;
+ +		goto out_err;
+ +	}
+  
+ -	cfg80211_cqm_beacon_loss_notify(sdata->dev, gfp);
+ -}
+ -EXPORT_SYMBOL(ieee80211_cqm_beacon_loss_notify);
+ +	/* If a reconfig is happening, bail out */
+ +	if (local->in_reconfig) {
+ +		err = -EBUSY;
+ +		goto out_err;
+ +	}
+  
+ -static void _ieee80211_enable_rssi_reports(struct ieee80211_sub_if_data *sdata,
+ -					    int rssi_min_thold,
+ -					    int rssi_max_thold)
+ -{
+ -	trace_api_enable_rssi_reports(sdata, rssi_min_thold, rssi_max_thold);
+ +	if (assoc) {
+ +		rcu_read_lock();
+ +		have_sta = sta_info_get(sdata, ap_mld_addr);
+ +		rcu_read_unlock();
+ +	}
+  
+ -	if (WARN_ON(sdata->vif.type != NL80211_IFTYPE_STATION))
+ -		return;
+ +	if (!have_sta) {
+ +		if (mlo)
+ +			new_sta = sta_info_alloc_with_link(sdata, ap_mld_addr,
+ +							   link_id, cbss->bssid,
+ +							   GFP_KERNEL);
+ +		else
+ +			new_sta = sta_info_alloc(sdata, ap_mld_addr, GFP_KERNEL);
+ +
+ +		if (!new_sta) {
+ +			err = -ENOMEM;
+ +			goto out_err;
+ +		}
+ +
+ +		new_sta->sta.mlo = mlo;
+ +	}
+  
+  	/*
+ -	 * Scale up threshold values before storing it, as the RSSI averaging
+ -	 * algorithm uses a scaled up value as well. Change this scaling
+ -	 * factor if the RSSI averaging algorithm changes.
+ +	 * Set up the information for the new channel before setting the
+ +	 * new channel. We can't - completely race-free - change the basic
+ +	 * rates bitmap and the channel (sband) that it refers to, but if
+ +	 * we set it up before we at least avoid calling into the driver's
+ +	 * bss_info_changed() method with invalid information (since we do
+ +	 * call that from changing the channel - only for IDLE and perhaps
+ +	 * some others, but ...).
+ +	 *
+ +	 * So to avoid that, just set up all the new information before the
+ +	 * channel, but tell the driver to apply it only afterwards, since
+ +	 * it might need the new channel for that.
+  	 */
+ -	sdata->u.mgd.rssi_min_thold = rssi_min_thold*16;
+ -	sdata->u.mgd.rssi_max_thold = rssi_max_thold*16;
+ -}
+ +	if (new_sta) {
+ +		const struct cfg80211_bss_ies *ies;
+ +		struct link_sta_info *link_sta;
+  
+ -void ieee80211_enable_rssi_reports(struct ieee80211_vif *vif,
+ -				    int rssi_min_thold,
+ -				    int rssi_max_thold)
+ -{
+ -	struct ieee80211_sub_if_data *sdata = vif_to_sdata(vif);
+ +		rcu_read_lock();
+ +		link_sta = rcu_dereference(new_sta->link[link_id]);
+ +		if (WARN_ON(!link_sta)) {
+ +			rcu_read_unlock();
+ +			sta_info_free(local, new_sta);
+ +			err = -EINVAL;
+ +			goto out_err;
+ +		}
+  
+ -	WARN_ON(rssi_min_thold == rssi_max_thold ||
+ -		rssi_min_thold > rssi_max_thold);
+ +		err = ieee80211_mgd_setup_link_sta(link, new_sta,
+ +						   link_sta, cbss);
+ +		if (err) {
+ +			rcu_read_unlock();
+ +			sta_info_free(local, new_sta);
+ +			goto out_err;
+ +		}
+  
+ -	_ieee80211_enable_rssi_reports(sdata, rssi_min_thold,
+ -				       rssi_max_thold);
+ -}
+ -EXPORT_SYMBOL(ieee80211_enable_rssi_reports);
+ +		memcpy(link->u.mgd.bssid, cbss->bssid, ETH_ALEN);
+ +
+ +		/* set timing information */
+ +		link->conf->beacon_int = cbss->beacon_interval;
+ +		ies = rcu_dereference(cbss->beacon_ies);
+ +		if (ies) {
+ +			link->conf->sync_tsf = ies->tsf;
+ +			link->conf->sync_device_ts =
+ +				bss->device_ts_beacon;
+ +
+ +			ieee80211_get_dtim(ies,
+ +					   &link->conf->sync_dtim_count,
+ +					   NULL);
+ +		} else if (!ieee80211_hw_check(&sdata->local->hw,
+ +					       TIMING_BEACON_ONLY)) {
+ +			ies = rcu_dereference(cbss->proberesp_ies);
+ +			/* must be non-NULL since beacon IEs were NULL */
+ +			link->conf->sync_tsf = ies->tsf;
+ +			link->conf->sync_device_ts =
+ +				bss->device_ts_presp;
+ +			link->conf->sync_dtim_count = 0;
+ +		} else {
+ +			link->conf->sync_tsf = 0;
+ +			link->conf->sync_device_ts = 0;
+ +			link->conf->sync_dtim_count = 0;
+ +		}
+ +		rcu_read_unlock();
+ +	}
+ +
+ +	if (new_sta || override) {
+ +		err = ieee80211_prep_channel(sdata, link, cbss,
+ +					     &link->u.mgd.conn_flags);
+ +		if (err) {
+ +			if (new_sta)
+ +				sta_info_free(local, new_sta);
+ +			goto out_err;
+ +		}
+ +	}
+ +
+ +	if (new_sta) {
+ +		/*
+ +		 * tell driver about BSSID, basic rates and timing
+ +		 * this was set up above, before setting the channel
+ +		 */
+ +		ieee80211_link_info_change_notify(sdata, link,
+ +						  BSS_CHANGED_BSSID |
+ +						  BSS_CHANGED_BASIC_RATES |
+ +						  BSS_CHANGED_BEACON_INT);
+ +
+ +		if (assoc)
+ +			sta_info_pre_move_state(new_sta, IEEE80211_STA_AUTH);
+ +
+ +		err = sta_info_insert(new_sta);
+ +		new_sta = NULL;
+ +		if (err) {
+ +			sdata_info(sdata,
+ +				   "failed to insert STA entry for the AP (error %d)\n",
+ +				   err);
+ +			goto out_err;
+ +		}
+ +	} else
+ +		WARN_ON_ONCE(!ether_addr_equal(link->u.mgd.bssid, cbss->bssid));
+ +
+ +	/* Cancel scan to ensure that nothing interferes with connection */
+ +	if (local->scanning)
+ +		ieee80211_scan_cancel(local);
+  
+ -void ieee80211_disable_rssi_reports(struct ieee80211_vif *vif)
+ -{
+ -	struct ieee80211_sub_if_data *sdata = vif_to_sdata(vif);
+ +	return 0;
+  
+ -	_ieee80211_enable_rssi_reports(sdata, 0, 0);
+ +out_err:
+++<<<<<<< HEAD
+ +	ieee80211_link_release_channel(&sdata->deflink);
+ +	ieee80211_vif_set_links(sdata, 0);
+++=======
+++	if (mlo && have_sta)
+++		WARN_ON(__sta_info_destroy(have_sta));
+++	ieee80211_vif_set_links(sdata, 0, 0);
+++>>>>>>> 283fc9e44ff5 (wifi: mac80211: remove station if connection prep fails)
+ +	return err;
+  }
+ -EXPORT_SYMBOL(ieee80211_disable_rssi_reports);
+  
+ -void ieee80211_process_ml_reconf_resp(struct ieee80211_sub_if_data *sdata,
+ -				      struct ieee80211_mgmt *mgmt, size_t len)
+ +/* config hooks */
+ +int ieee80211_mgd_auth(struct ieee80211_sub_if_data *sdata,
+ +		       struct cfg80211_auth_request *req)
+  {
+  	struct ieee80211_local *local = sdata->local;
+  	struct ieee80211_if_managed *ifmgd = &sdata->u.mgd;
+* Unmerged path net/mac80211/mlme.c
