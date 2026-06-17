@@ -1594,7 +1594,7 @@ static int snd_riptide_playback_open(struct snd_pcm_substream *substream)
 	chip->playback_substream[sub_num] = substream;
 	runtime->hw = snd_riptide_playback;
 
-	data = kzalloc_obj(struct pcmhw, GFP_KERNEL);
+	data = kzalloc_obj(struct pcmhw);
 	if (data == NULL)
 		return -ENOMEM;
 	data->paths = lbus_play_paths[sub_num];
@@ -1617,7 +1617,7 @@ static int snd_riptide_capture_open(struct snd_pcm_substream *substream)
 	chip->capture_substream = substream;
 	runtime->hw = snd_riptide_capture;
 
-	data = kzalloc_obj(struct pcmhw, GFP_KERNEL);
+	data = kzalloc_obj(struct pcmhw);
 	if (data == NULL)
 		return -ENOMEM;
 	data->paths = lbus_rec_path;
@@ -1767,7 +1767,7 @@ static int snd_riptide_initialize(struct snd_riptide *chip)
 
 	cif = chip->cif;
 	if (!cif) {
-		cif = kzalloc_obj(struct cmdif, GFP_KERNEL);
+		cif = kzalloc_obj(struct cmdif);
 		if (!cif)
 			return -ENOMEM;
 		cif->dev = chip->card->dev;
