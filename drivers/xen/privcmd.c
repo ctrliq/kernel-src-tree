@@ -950,7 +950,7 @@ static vm_fault_t privcmd_fault(struct vm_fault *vmf)
 
 static const struct vm_operations_struct privcmd_vm_ops = {
 	.close = privcmd_close,
-	.may_split = privcmd_may_split,
+	.split = privcmd_may_split,
 	.fault = privcmd_fault
 };
 
