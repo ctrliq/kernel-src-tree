@@ -925,6 +925,25 @@ static int armv8pmu_get_chain_idx(struct pmu_hw_events *cpuc,
 	return -EAGAIN;
 }
 
+static bool armv8pmu_can_use_pmccntr(struct pmu_hw_events *cpuc,
+				     struct perf_event *event)
+{
+	struct hw_perf_event *hwc = &event->hw;
+	unsigned long evtype = hwc->config_base & ARMV8_PMU_EVTYPE_EVENT;
+
+	if (evtype != ARMV8_PMUV3_PERFCTR_CPU_CYCLES)
+		return false;
+
+	/*
+	 * A CPU_CYCLES event with threshold counting cannot use PMCCNTR_EL0
+	 * since it lacks threshold support.
+	 */
+	if (armv8pmu_event_get_threshold(&event->attr))
+		return false;
+
+	return true;
+}
+
 static int armv8pmu_get_event_idx(struct pmu_hw_events *cpuc,
 				  struct perf_event *event)
 {
@@ -933,8 +952,7 @@ static int armv8pmu_get_event_idx(struct pmu_hw_events *cpuc,
 	unsigned long evtype = hwc->config_base & ARMV8_PMU_EVTYPE_EVENT;
 
 	/* Always prefer to place a cycle counter into the cycle counter. */
-	if ((evtype == ARMV8_PMUV3_PERFCTR_CPU_CYCLES) &&
-	    !armv8pmu_event_get_threshold(&event->attr)) {
+	if (armv8pmu_can_use_pmccntr(cpuc, event)) {
 		if (!test_and_set_bit(ARMV8_PMU_CYCLE_IDX, cpuc->used_mask))
 			return ARMV8_PMU_CYCLE_IDX;
 		else if (armv8pmu_event_is_64bit(event) &&
