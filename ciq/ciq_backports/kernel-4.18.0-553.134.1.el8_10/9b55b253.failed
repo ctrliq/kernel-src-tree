@@ -1,0 +1,142 @@
+mptcp: fix slab-use-after-free in __inet_lookup_established
+
+jira KERNEL-1173
+cve CVE-2026-31669
+Rebuild_History Non-Buildable kernel-4.18.0-553.134.1.el8_10
+commit-author Jiayuan Chen <jiayuan.chen@linux.dev>
+commit 9b55b253907e7431210483519c5ad711a37dafa1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.134.1.el8_10/9b55b253.failed
+
+The ehash table lookups are lockless and rely on
+SLAB_TYPESAFE_BY_RCU to guarantee socket memory stability
+during RCU read-side critical sections. Both tcp_prot and
+tcpv6_prot have their slab caches created with this flag
+via proto_register().
+
+However, MPTCP's mptcp_subflow_init() copies tcpv6_prot into
+tcpv6_prot_override during inet_init() (fs_initcall, level 5),
+before inet6_init() (module_init/device_initcall, level 6) has
+called proto_register(&tcpv6_prot). At that point,
+tcpv6_prot.slab is still NULL, so tcpv6_prot_override.slab
+remains NULL permanently.
+
+This causes MPTCP v6 subflow child sockets to be allocated via
+kmalloc (falling into kmalloc-4k) instead of the TCPv6 slab
+cache. The kmalloc-4k cache lacks SLAB_TYPESAFE_BY_RCU, so
+when these sockets are freed without SOCK_RCU_FREE (which is
+cleared for child sockets by design), the memory can be
+immediately reused. Concurrent ehash lookups under
+rcu_read_lock can then access freed memory, triggering a
+slab-use-after-free in __inet_lookup_established.
+
+Fix this by splitting the IPv6-specific initialization out of
+mptcp_subflow_init() into a new mptcp_subflow_v6_init(), called
+from mptcp_proto_v6_init() before protocol registration. This
+ensures tcpv6_prot_override.slab correctly inherits the
+SLAB_TYPESAFE_BY_RCU slab cache.
+
+Fixes: b19bc2945b40 ("mptcp: implement delegated actions")
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Jiayuan Chen <jiayuan.chen@linux.dev>
+	Reviewed-by: Matthieu Baerts (NGI0) <matttbe@kernel.org>
+Link: https://patch.msgid.link/20260406031512.189159-1-jiayuan.chen@linux.dev
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 9b55b253907e7431210483519c5ad711a37dafa1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/subflow.c
+diff --cc net/mptcp/subflow.c
+index 78a281b82433,4ff5863aa9fd..000000000000
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@@ -1765,10 -2158,39 +1765,35 @@@ void __init mptcp_subflow_init(void
+  
+  	tcp_prot_override = tcp_prot;
+  	tcp_prot_override.release_cb = tcp_release_cb_override;
+ -	tcp_prot_override.diag_destroy = tcp_abort_override;
+ -#ifdef CONFIG_BPF_SYSCALL
+ -	/* Disable sockmap processing for subflows */
+ -	tcp_prot_override.psock_update_sk_prot = NULL;
+ -#endif
+  
++ 	mptcp_diag_subflow_init(&subflow_ulp_ops);
++ 
++ 	if (tcp_register_ulp(&subflow_ulp_ops) != 0)
++ 		panic("MPTCP: failed to register subflows to ULP\n");
++ }
++ 
+  #if IS_ENABLED(CONFIG_MPTCP_IPV6)
+++<<<<<<< HEAD
+++=======
++ void __init mptcp_subflow_v6_init(void)
++ {
++ 	/* In struct mptcp_subflow_request_sock, we assume the TCP request sock
++ 	 * structures for v4 and v6 have the same size. It should not changed in
++ 	 * the future but better to make sure to be warned if it is no longer
++ 	 * the case.
++ 	 */
++ 	BUILD_BUG_ON(sizeof(struct tcp_request_sock) != sizeof(struct tcp6_request_sock));
++ 
++ 	mptcp_subflow_v6_request_sock_ops = tcp6_request_sock_ops;
++ 	mptcp_subflow_v6_request_sock_ops.slab_name = "request_sock_subflow_v6";
++ 	mptcp_subflow_v6_request_sock_ops.destructor = subflow_v6_req_destructor;
++ 
++ 	if (subflow_ops_init(&mptcp_subflow_v6_request_sock_ops) != 0)
++ 		panic("MPTCP: failed to init subflow v6 request sock ops\n");
++ 
+++>>>>>>> 9b55b253907e (mptcp: fix slab-use-after-free in __inet_lookup_established)
+  	subflow_request_sock_ipv6_ops = tcp_request_sock_ipv6_ops;
+  	subflow_request_sock_ipv6_ops.route_req = subflow_v6_route_req;
+ -	subflow_request_sock_ipv6_ops.send_synack = subflow_v6_send_synack;
+  
+  	subflow_v6_specific = ipv6_specific;
+  	subflow_v6_specific.conn_request = subflow_v6_conn_request;
+@@@ -1784,10 -2207,10 +1809,19 @@@
+  
+  	tcpv6_prot_override = tcpv6_prot;
+  	tcpv6_prot_override.release_cb = tcp_release_cb_override;
+++<<<<<<< HEAD
+ +#endif
+ +
+ +	mptcp_diag_subflow_init(&subflow_ulp_ops);
+ +
+ +	if (tcp_register_ulp(&subflow_ulp_ops) != 0)
+ +		panic("MPTCP: failed to register subflows to ULP\n");
+++=======
++ 	tcpv6_prot_override.diag_destroy = tcp_abort_override;
++ #ifdef CONFIG_BPF_SYSCALL
++ 	/* Disable sockmap processing for subflows */
++ 	tcpv6_prot_override.psock_update_sk_prot = NULL;
++ #endif
+++>>>>>>> 9b55b253907e (mptcp: fix slab-use-after-free in __inet_lookup_established)
+  }
++ #endif
+diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
+index e0120fac39ca..657dbd6b2e52 100644
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -3714,6 +3714,8 @@ int __init mptcp_proto_v6_init(void)
+ {
+ 	int err;
+ 
++	mptcp_subflow_v6_init();
++
+ 	mptcp_v6_prot = mptcp_prot;
+ 	strcpy(mptcp_v6_prot.name, "MPTCPv6");
+ 	mptcp_v6_prot.slab = NULL;
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index 842dd29137eb..13a2f1fd1fec 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -603,6 +603,7 @@ static inline void mptcp_subflow_tcp_fallback(struct sock *sk,
+ void __init mptcp_proto_init(void);
+ #if IS_ENABLED(CONFIG_MPTCP_IPV6)
+ int __init mptcp_proto_v6_init(void);
++void __init mptcp_subflow_v6_init(void);
+ #endif
+ 
+ struct sock *mptcp_sk_clone(const struct sock *sk,
+* Unmerged path net/mptcp/subflow.c
