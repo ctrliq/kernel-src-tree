@@ -8790,6 +8790,14 @@ Do not use KVM_X86_SW_PROTECTED_VM for "real" VMs, and especially not in
 production.  The behavior and effective ABI for software-protected VMs is
 unstable.
 
+8.47 KVM_CAP_S390_VSIE_ESAMODE
+------------------------------
+
+:Architectures: s390
+
+The presence of this capability indicates that the nested KVM guest can
+start in ESA mode.
+
 9. Known KVM API problems
 =========================
 
