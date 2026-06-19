@@ -450,6 +450,111 @@ jobs:
           output/last_build_image.txt
         retention-days: 7
 
+  fast-gate:
+    name: Fast pre-build gate (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    needs: [pre-setup, setup]
+    # Advisory for now: this job runs and reports pass/fail but does NOT block
+    # build/boot/test yet (no downstream `needs: fast-gate` edge). Once trusted,
+    # add `fast-gate` to the build job's needs list to make it a hard gate.
+    #
+    # Skip in pr_only mode (nothing built) and when there's no base to diff
+    # against (push with no associated PR → base_ref empty).
+    if: ${{ needs.pre-setup.outputs.pr_only != 'true' && needs.pre-setup.outputs.base_ref != '' }}
+    continue-on-error: true  # advisory phase — do not fail the overall workflow
+
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+
+    steps:
+    - name: Generate GitHub App token
+      id: generate_token
+      uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
+      with:
+        client-id: ${{ secrets.APP_ID }}
+        private-key: ${{ secrets.APP_PRIVATE_KEY }}
+        repositories: |
+          kernel-container-build
+
+    # Deep checkout: the gate walks every commit in base..head, so unlike the
+    # build job (fetch-depth: 1) we need full history.
+    - name: Checkout kernel source
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      with:
+        fetch-depth: 0
+        path: kernel-src-tree
+        ref: ${{ needs.pre-setup.outputs.pr_number != '0' && format('refs/pull/{0}/head', needs.pre-setup.outputs.pr_number) || needs.pre-setup.outputs.head_sha }}
+
+    - name: Fetch base branch for diff
+      working-directory: kernel-src-tree
+      env:
+        BASE_REF: ${{ needs.pre-setup.outputs.base_ref }}
+      run: |
+        # Bring the base branch into the local repo so base..head is resolvable.
+        git fetch --depth=200 origin "$BASE_REF:refs/remotes/origin/$BASE_REF"
+
+    - name: Checkout kernel-container-build
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      with:
+        repository: ctrliq/kernel-container-build
+        ref: main
+        path: kernel-container-build
+        token: ${{ steps.generate_token.outputs.token }}
+
+    - name: Install host dependencies
+      run: |
+        set -euxo pipefail
+        sudo apt-get update
+        sudo apt-get install -y podman
+
+    # Per-commit incremental compile inside the SAME kernel-builder container the
+    # real build compiles in — identical config (resolve_kernel_config.sh) AND
+    # toolchain, so a gate pass genuinely predicts a build pass.
+    #
+    # The image name is resolved from .container_build_image in the source tree,
+    # exactly like build_kernel.sh does (e.g. lts-9.2-kernel-builder). NOTE: this
+    # is the inner kernel-builder image (has make/gcc), NOT the outer .../builder
+    # orchestrator image (Fedora, podman/qemu only — no toolchain).
+    - name: Run per-commit compile gate inside kernel-builder container
+      env:
+        BASE_REF: ${{ needs.pre-setup.outputs.base_ref }}
+        HEAD_SHA: ${{ needs.pre-setup.outputs.head_sha }}
+        ARCH: ${{ matrix.arch }}
+      run: |
+        set -euxo pipefail
+        chmod +x kernel-container-build/container/*.sh
+
+        # Resolve the kernel-builder image the same way build_kernel.sh does.
+        if [ ! -f kernel-src-tree/.container_build_image ]; then
+          echo "::error::kernel-src-tree/.container_build_image not found — cannot determine kernel-builder image"
+          exit 1
+        fi
+        BUILD_IMG=$(cat kernel-src-tree/.container_build_image)
+        echo "Using kernel-builder image: $BUILD_IMG"
+
+        podman run --rm --pull=always \
+          --privileged \
+          -e BASE_REF="origin/$BASE_REF" \
+          -e HEAD_SHA="$HEAD_SHA" \
+          -e ARCH="$ARCH" \
+          -v "$PWD/kernel-src-tree":/src \
+          -v "$PWD/kernel-container-build/container/gate_per_commit_compile.sh":/usr/local/bin/gate_per_commit_compile.sh:ro \
+          -v "$PWD/kernel-container-build/container/resolve_kernel_config.sh":/usr/local/bin/resolve_kernel_config.sh:ro \
+          --security-opt label=disable \
+          "pulp.prod.ciq.dev/ciq/cicd/lts-images/$BUILD_IMG" \
+          bash -c 'cd /src && git config --global --add safe.directory /src && \
+            /usr/local/bin/gate_per_commit_compile.sh --base "$BASE_REF" --head "$HEAD_SHA" --arch "$ARCH"' \
+          2>&1 | tee gate-${{ matrix.arch }}.log
+
+    - name: Upload gate log
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      if: always()
+      with:
+        name: fast-gate-log-${{ matrix.arch }}
+        path: gate-${{ matrix.arch }}.log
+        retention-days: 7
+
   boot:
     name: Boot verification (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
