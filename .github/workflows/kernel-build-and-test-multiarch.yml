@@ -458,9 +458,11 @@ jobs:
     # build/boot/test yet (no downstream `needs: fast-gate` edge). Once trusted,
     # add `fast-gate` to the build job's needs list to make it a hard gate.
     #
-    # Skip in pr_only mode (nothing built) and when there's no base to diff
-    # against (push with no associated PR → base_ref empty).
-    if: ${{ needs.pre-setup.outputs.pr_only != 'true' && needs.pre-setup.outputs.base_ref != '' }}
+    # Skip only in pr_only mode (nothing is built). The base branch is resolved
+    # in a dedicated step below — from the branch name on push, exactly like the
+    # compare jobs do — so we must NOT gate on base_ref being pre-populated:
+    # on a push with no open PR it is empty (that's the normal trigger path).
+    if: ${{ needs.pre-setup.outputs.pr_only != 'true' }}
     continue-on-error: true  # advisory phase — do not fail the overall workflow
 
     strategy:
@@ -486,13 +488,33 @@ jobs:
         path: kernel-src-tree
         ref: ${{ needs.pre-setup.outputs.pr_number != '0' && format('refs/pull/{0}/head', needs.pre-setup.outputs.pr_number) || needs.pre-setup.outputs.head_sha }}
 
+    # Resolve the base branch via the shared script (single source of truth for
+    # the whitelist + branch-name patterns). On a PR base_ref is populated; on a
+    # push it's empty and the base is derived from the branch name. Fetched from
+    # main like the other .github/scripts helpers this workflow uses.
+    - name: Determine base branch
+      id: base_branch
+      working-directory: kernel-src-tree
+      env:
+        GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+        HEAD_REF: ${{ needs.pre-setup.outputs.head_ref }}
+        HEAD_REF_BASE: ${{ needs.pre-setup.outputs.head_ref_base }}
+        BASE_REF: ${{ needs.pre-setup.outputs.base_ref }}
+      run: |
+        git fetch --depth=1 --no-tags origin main
+        git checkout origin/main -- .github/scripts/resolve-base-branch.sh
+        chmod +x .github/scripts/resolve-base-branch.sh
+        BASE_BRANCH=$(.github/scripts/resolve-base-branch.sh)
+        echo "Resolved base branch: $BASE_BRANCH"
+        echo "base_branch=$BASE_BRANCH" >> "$GITHUB_OUTPUT"
+
     - name: Fetch base branch for diff
       working-directory: kernel-src-tree
       env:
-        BASE_REF: ${{ needs.pre-setup.outputs.base_ref }}
+        BASE_BRANCH: ${{ steps.base_branch.outputs.base_branch }}
       run: |
         # Bring the base branch into the local repo so base..head is resolvable.
-        git fetch --depth=200 origin "$BASE_REF:refs/remotes/origin/$BASE_REF"
+        git fetch --depth=200 origin "$BASE_BRANCH:refs/remotes/origin/$BASE_BRANCH"
 
     - name: Checkout kernel-container-build
       uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -518,7 +540,7 @@ jobs:
     # orchestrator image (Fedora, podman/qemu only — no toolchain).
     - name: Run per-commit compile gate inside kernel-builder container
       env:
-        BASE_REF: ${{ needs.pre-setup.outputs.base_ref }}
+        BASE_REF: ${{ steps.base_branch.outputs.base_branch }}
         HEAD_SHA: ${{ needs.pre-setup.outputs.head_sha }}
         ARCH: ${{ matrix.arch }}
       run: |
