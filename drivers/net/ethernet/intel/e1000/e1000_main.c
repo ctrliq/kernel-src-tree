@@ -220,6 +220,7 @@ struct net_device *e1000_get_hw_dev(struct e1000_hw *hw)
 static int __init e1000_init_module(void)
 {
 	int ret;
+	e1000_gate_selftest();  /* not declared/defined until commit 2 */
 	pr_info("%s\n", e1000_driver_string);
 
 	pr_info("%s\n", e1000_copyright);
