@@ -217,6 +217,10 @@ struct net_device *e1000_get_hw_dev(struct e1000_hw *hw)
  * e1000_init_module is the first routine called when the driver is
  * loaded. All it does is register with the PCI subsystem.
  **/
+static void e1000_gate_selftest(void)
+{
+}
+
 static int __init e1000_init_module(void)
 {
 	int ret;
