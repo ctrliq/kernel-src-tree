@@ -3,6 +3,7 @@
 
 TEST_PROGS := \
 	dev_addr_lists.sh \
+	propagation.sh \
 # end of TEST_PROGS
 
 TEST_INCLUDES := \
