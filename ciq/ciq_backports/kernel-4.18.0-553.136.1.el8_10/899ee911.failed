@@ -1,0 +1,151 @@
+net/sched: fix pedit partial COW leading to page cache corruption
+
+jira KERNEL-1189
+cve CVE-2026-46331
+Rebuild_History Non-Buildable kernel-4.18.0-553.136.1.el8_10
+commit-author Rajat Gupta <rajat.gupta@oss.qualcomm.com>
+commit 899ee91156e57784090c5565e4f31bd7dbffbc5a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.136.1.el8_10/899ee911.failed
+
+tcf_pedit_act() computes the COW range for skb_ensure_writable()
+once before the key loop using tcfp_off_max_hint, but the hint does
+not account for the runtime header offset added by typed keys. This
+can leave part of the write region un-COW'd.
+
+Fix by moving skb_ensure_writable() inside the per-key loop where
+the actual write offset is known, and add overflow checking on the
+offset arithmetic. For negative offsets (e.g. Ethernet header edits
+at ingress), use skb_cow() to COW the headroom instead. Guard
+offset_valid() against INT_MIN, where negation is undefined.
+
+Fixes: 8b796475fd78 ("net/sched: act_pedit: really ensure the skb is writable")
+	Reported-by: Yiming Qian <yimingqian591@gmail.com>
+	Reported-by: Keenan Dong <keenanat2000@gmail.com>
+	Reported-by: Han Guidong <2045gemini@gmail.com>
+	Reported-by: Zhang Cen <rollkingzzc@gmail.com>
+	Reviewed-by: Han Guidong <2045gemini@gmail.com>
+	Tested-by: Han Guidong <2045gemini@gmail.com>
+	Reviewed-by: Davide Caratti <dcaratti@redhat.com>
+	Tested-by: Davide Caratti <dcaratti@redhat.com>
+	Reviewed-by: Toke Høiland-Jørgensen <toke@redhat.com>
+	Tested-by: Toke Høiland-Jørgensen <toke@redhat.com>
+	Reviewed-by: Victor Nogueira <victor@mojatatu.com>
+	Tested-by: Victor Nogueira <victor@mojatatu.com>
+	Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Signed-off-by: Rajat Gupta <rajat.gupta@oss.qualcomm.com>
+Link: https://patch.msgid.link/20260531123221.48732-1-jhs@mojatatu.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 899ee91156e57784090c5565e4f31bd7dbffbc5a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/tc_act/tc_pedit.h
+#	net/sched/act_pedit.c
+diff --cc include/net/tc_act/tc_pedit.h
+index 83fe39931781,cb7b82f2cbc7..000000000000
+--- a/include/net/tc_act/tc_pedit.h
++++ b/include/net/tc_act/tc_pedit.h
+@@@ -14,7 -14,7 +14,11 @@@ struct tcf_pedit_key_ex 
+  struct tcf_pedit_parms {
+  	struct tc_pedit_key	*tcfp_keys;
+  	struct tcf_pedit_key_ex	*tcfp_keys_ex;
+++<<<<<<< HEAD
+ +	u32 tcfp_off_max_hint;
+++=======
++ 	int action;
+++>>>>>>> 899ee91156e5 (net/sched: fix pedit partial COW leading to page cache corruption)
+  	unsigned char tcfp_nkeys;
+  	unsigned char tcfp_flags;
+  	struct rcu_head rcu;
+diff --cc net/sched/act_pedit.c
+index 25347be34129,bd3b1da3cd63..000000000000
+--- a/net/sched/act_pedit.c
++++ b/net/sched/act_pedit.c
+@@@ -17,7 -13,12 +17,13 @@@
+  #include <linux/rtnetlink.h>
+  #include <linux/module.h>
+  #include <linux/init.h>
+ -#include <linux/ip.h>
+ -#include <linux/ipv6.h>
+  #include <linux/slab.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/overflow.h>
++ #include <linux/unaligned.h>
++ #include <net/ipv6.h>
+++>>>>>>> 899ee91156e5 (net/sched: fix pedit partial COW leading to page cache corruption)
+  #include <net/netlink.h>
+  #include <net/pkt_sched.h>
+  #include <linux/tc_act/tc_pedit.h>
+@@@ -317,20 -311,42 +314,17 @@@ static void tcf_pedit_cleanup(struct tc
+  		call_rcu(&parms->rcu, tcf_pedit_cleanup_rcu);
+  }
+  
+- static bool offset_valid(struct sk_buff *skb, int offset)
++ static bool offset_valid(struct sk_buff *skb, int offset, int len)
+  {
+- 	if (offset > 0 && offset > skb->len)
+- 		return false;
+- 
+- 	if  (offset < 0 && -offset > skb_headroom(skb))
++ 	if (offset < -(int)skb_headroom(skb))
+  		return false;
+  
+- 	return true;
++ 	return offset <= (int)skb->len - len;
+  }
+  
+ -static int pedit_l4_skb_offset(struct sk_buff *skb, int *hoffset, const int header_type)
+ -{
+ -	const int noff = skb_network_offset(skb);
+ -	int ret = -EINVAL;
+ -	struct iphdr _iph;
+ -
+ -	switch (skb->protocol) {
+ -	case htons(ETH_P_IP): {
+ -		const struct iphdr *iph = skb_header_pointer(skb, noff, sizeof(_iph), &_iph);
+ -
+ -		if (!iph)
+ -			goto out;
+ -		*hoffset = noff + iph->ihl * 4;
+ -		ret = 0;
+ -		break;
+ -	}
+ -	case htons(ETH_P_IPV6):
+ -		ret = ipv6_find_hdr(skb, hoffset, header_type, NULL, NULL) == header_type ? 0 : -EINVAL;
+ -		break;
+ -	}
+ -out:
+ -	return ret;
+ -}
+ -
+ -static int pedit_skb_hdr_offset(struct sk_buff *skb,
+ +static void pedit_skb_hdr_offset(struct sk_buff *skb,
+  				 enum pedit_header_type htype, int *hoffset)
+  {
+ -	int ret = -EINVAL;
+  	/* 'htype' is validated in the netlink parsing */
+  	switch (htype) {
+  	case TCA_PEDIT_KEY_EX_HDR_TYPE_ETH:
+@@@ -381,10 -394,12 +367,17 @@@ TC_INDIRECT_SCOPE int tcf_pedit_act(str
+  	tkey_ex = parms->tcfp_keys_ex;
+  
+  	for (i = parms->tcfp_nkeys; i > 0; i--, tkey++) {
++ 		int write_offset, write_len;
+  		int offset = tkey->off;
+  		int hoffset = 0;
+++<<<<<<< HEAD
+ +		u32 *ptr, hdata;
+ +		u32 val;
+++=======
++ 		u32 cur_val, val;
++ 		u32 *ptr;
++ 		int rc;
+++>>>>>>> 899ee91156e5 (net/sched: fix pedit partial COW leading to page cache corruption)
+  
+  		if (tkey_ex) {
+  			htype = tkey_ex->htype;
+* Unmerged path include/net/tc_act/tc_pedit.h
+* Unmerged path net/sched/act_pedit.c
