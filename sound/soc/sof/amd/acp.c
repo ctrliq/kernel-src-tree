@@ -54,9 +54,17 @@ static int smn_write(struct pci_dev *dev, u32 smn_addr, u32 data)
 static int smn_read(struct pci_dev *dev, u32 smn_addr)
 {
 	u32 data = 0;
+	int err;
 
-	pci_write_config_dword(dev, 0x60, smn_addr);
-	pci_read_config_dword(dev, 0x64, &data);
+	err = pci_write_config_dword(dev, 0x60, smn_addr);
+	if (err)
+		err = pci_read_config_dword(dev, 0x64, &data);
+
+	if (err)
+		return pcibios_err_to_errno(err);
+
+	if (PCI_POSSIBLE_ERROR(data))
+		return -ENODEV;
 
 	return data;
 }
@@ -213,10 +221,9 @@ int configure_and_run_dma(struct acp_dev_data *adata, unsigned int src_addr,
 static int psp_mbox_ready(struct acp_dev_data *adata, bool ack)
 {
 	struct snd_sof_dev *sdev = adata->dev;
-	int ret;
-	u32 data;
+	int ret, data;
 
-	ret = read_poll_timeout(smn_read, data, data & MBOX_READY_MASK, MBOX_DELAY_US,
+	ret = read_poll_timeout(smn_read, data, data > 0 && data & MBOX_READY_MASK, MBOX_DELAY_US,
 				ACP_PSP_TIMEOUT_US, false, adata->smn_dev, MP0_C2PMSG_114_REG);
 	if (!ret)
 		return 0;
@@ -239,13 +246,13 @@ static int psp_send_cmd(struct acp_dev_data *adata, int cmd)
 {
 	struct snd_sof_dev *sdev = adata->dev;
 	int ret;
-	u32 data;
+	int data;
 
 	if (!cmd)
 		return -EINVAL;
 
 	/* Get a non-zero Doorbell value from PSP */
-	ret = read_poll_timeout(smn_read, data, data, MBOX_DELAY_US, ACP_PSP_TIMEOUT_US, false,
+	ret = read_poll_timeout(smn_read, data, data > 0, MBOX_DELAY_US, ACP_PSP_TIMEOUT_US, false,
 				adata->smn_dev, MP0_C2PMSG_73_REG);
 
 	if (ret) {
