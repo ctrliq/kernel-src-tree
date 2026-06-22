@@ -50,7 +50,7 @@ int dm_blk_report_zones(struct gendisk *disk, sector_t sector,
 {
 	struct mapped_device *md = disk->private_data;
 	struct dm_table *map;
-	struct dm_table *zone_revalidate_map = md->zone_revalidate_map;
+	struct dm_table *zone_revalidate_map = READ_ONCE(md->zone_revalidate_map);
 	int srcu_idx, ret = -EIO;
 	bool put_table = false;
 
@@ -202,8 +202,6 @@ int dm_revalidate_zones(struct dm_table *t, struct request_queue *q)
 		disk->nr_zones = nr_zones;
 		return ret;
 	}
-
-	md->nr_zones = disk->nr_zones;
 
 	return 0;
 }
@@ -452,7 +450,6 @@ void dm_finalize_zone_settings(struct dm_table *t, struct queue_limits *lim)
 			set_bit(DMF_EMULATE_ZONE_APPEND, &md->flags);
 	} else {
 		clear_bit(DMF_EMULATE_ZONE_APPEND, &md->flags);
-		md->nr_zones = 0;
 		md->disk->nr_zones = 0;
 	}
 }
