@@ -41,13 +41,6 @@
 #define COMPR_CODEC_CAPS_OVERFLOW
 #endif
 
-/* TODO:
- * - add substream support for multiple devices in case of
- *	SND_DYNAMIC_MINORS is not used
- * - Multiple node representation
- *	driver should be able to register multiple nodes
- */
-
 struct snd_compr_file {
 	unsigned long caps;
 	struct snd_compr_stream stream;
@@ -1293,7 +1286,7 @@ void snd_compr_task_finished(struct snd_compr_stream *stream,
 }
 EXPORT_SYMBOL_GPL(snd_compr_task_finished);
 
-MODULE_IMPORT_NS("DMA_BUF");
+MODULE_IMPORT_NS(DMA_BUF);
 #endif /* CONFIG_SND_COMPRESS_ACCEL */
 
 static long snd_compr_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
