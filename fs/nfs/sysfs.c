@@ -12,7 +12,7 @@
 #include <linux/string.h>
 #include <linux/nfs_fs.h>
 #include <linux/rcupdate.h>
-#include <linux/lockd/lockd.h>
+#include <linux/lockd/bind.h>
 
 #include "internal.h"
 #include "nfs4_fs.h"
@@ -285,7 +285,7 @@ shutdown_store(struct kobject *kobj, struct kobj_attribute *attr,
 		shutdown_client(server->client_acl);
 
 	if (server->nlm_host)
-		shutdown_client(server->nlm_host->h_rpcclnt);
+		nlmclnt_shutdown_rpc_clnt(server->nlm_host);
 out:
 	shutdown_nfs_client(server->nfs_client);
 	return count;
@@ -293,7 +293,7 @@ out:
 
 static struct kobj_attribute nfs_sysfs_attr_shutdown = __ATTR_RW(shutdown);
 
-#if IS_ENABLED(CONFIG_NFS_V4_1)
+#if IS_ENABLED(CONFIG_NFS_V4)
 static ssize_t
 implid_domain_show(struct kobject *kobj, struct kobj_attribute *attr,
 				char *buf)
@@ -323,7 +323,7 @@ implid_name_show(struct kobject *kobj, struct kobj_attribute *attr,
 
 static struct kobj_attribute nfs_sysfs_attr_implid_name = __ATTR_RO(implid_name);
 
-#endif /* IS_ENABLED(CONFIG_NFS_V4_1) */
+#endif /* IS_ENABLED(CONFIG_NFS_V4) */
 
 #define RPC_CLIENT_NAME_SIZE 64
 
@@ -362,7 +362,7 @@ static struct kobj_type nfs_sb_ktype = {
 	.child_ns_type = nfs_netns_object_child_ns_type,
 };
 
-#if IS_ENABLED(CONFIG_NFS_V4_1)
+#if IS_ENABLED(CONFIG_NFS_V4)
 static void nfs_sysfs_add_nfsv41_server(struct nfs_server *server)
 {
 	int ret;
@@ -382,11 +382,11 @@ static void nfs_sysfs_add_nfsv41_server(struct nfs_server *server)
 		pr_warn("NFS: sysfs_create_file_ns for server-%d failed (%d)\n",
 			server->s_sysfs_id, ret);
 }
-#else /* CONFIG_NFS_V4_1 */
+#else /* CONFIG_NFS_V4 */
 static inline void nfs_sysfs_add_nfsv41_server(struct nfs_server *server)
 {
 }
-#endif /* CONFIG_NFS_V4_1 */
+#endif /* CONFIG_NFS_V4 */
 
 #if IS_ENABLED(CONFIG_NFS_LOCALIO)
 

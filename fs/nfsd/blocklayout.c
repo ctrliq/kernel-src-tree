@@ -13,6 +13,7 @@
 #include "pnfs.h"
 #include "filecache.h"
 #include "vfs.h"
+#include "trace.h"
 
 #define NFSDDBG_FACILITY	NFSDDBG_PNFS
 
@@ -88,9 +89,10 @@ nfsd4_block_proc_layoutget(struct svc_rqst *rqstp, struct inode *inode,
 		const struct svc_fh *fhp, struct nfsd4_layoutget *args)
 {
 	struct nfsd4_layout_seg *seg = &args->lg_seg;
-	struct pnfs_block_extent *bex;
-	u64 length;
-	u32 block_size = i_blocksize(inode);
+	struct pnfs_block_layout *bl;
+	struct pnfs_block_extent *first_bex, *last_bex;
+	u64 offset = seg->offset, length = seg->length;
+	u32 i, nr_extents_max, block_size = i_blocksize(inode);
 	__be32 nfserr;
 
 	if (locks_in_grace(SVC_NET(rqstp)))
@@ -103,31 +105,69 @@ nfsd4_block_proc_layoutget(struct svc_rqst *rqstp, struct inode *inode,
 	}
 
 	/*
+	 * RFC 8881, section 3.3.17:
+	 *   The layout4 data type defines a layout for a file.
+	 *
+	 * RFC 8881, section 18.43.3:
+	 *   The loga_maxcount field specifies the maximum layout size
+	 *   (in bytes) that the client can handle. If the size of the
+	 *   layout structure exceeds the size specified by maxcount,
+	 *   the metadata server will return the NFS4ERR_TOOSMALL error.
+	 */
+	nfserr = nfserr_toosmall;
+	if (args->lg_maxcount < PNFS_BLOCK_LAYOUT4_SIZE +
+				PNFS_BLOCK_EXTENT_SIZE)
+		goto out_error;
+
+	/*
+	 * Limit the maximum layout size to avoid allocating
+	 * a large buffer on the server for each layout request.
+	 */
+	nr_extents_max = (min(args->lg_maxcount, PAGE_SIZE) -
+			  PNFS_BLOCK_LAYOUT4_SIZE) / PNFS_BLOCK_EXTENT_SIZE;
+
+	/*
 	 * Some clients barf on non-zero block numbers for NONE or INVALID
 	 * layouts, so make sure to zero the whole structure.
 	 */
 	nfserr = nfserrno(-ENOMEM);
-	bex = kzalloc(sizeof(*bex), GFP_KERNEL);
-	if (!bex)
+	bl = kzalloc(struct_size(bl, extents, nr_extents_max), GFP_KERNEL);
+	if (!bl)
 		goto out_error;
-	args->lg_content = bex;
+	bl->nr_extents = nr_extents_max;
+	args->lg_content = bl;
 
-	nfserr = nfsd4_block_map_extent(inode, fhp, seg->offset, seg->length,
-			seg->iomode, args->lg_minlength, bex);
-	if (nfserr != nfs_ok)
-		goto out_error;
+	for (i = 0; i < bl->nr_extents; i++) {
+		struct pnfs_block_extent *bex = bl->extents + i;
+		u64 bex_length;
+
+		nfserr = nfsd4_block_map_extent(inode, fhp, offset, length,
+				seg->iomode, args->lg_minlength, bex);
+		if (nfserr != nfs_ok)
+			goto out_error;
+
+		bex_length = bex->len - (offset - bex->foff);
+		if (bex_length >= length) {
+			bl->nr_extents = i + 1;
+			break;
+		}
+
+		offset = bex->foff + bex->len;
+		length -= bex_length;
+	}
+
+	first_bex = bl->extents;
+	last_bex = bl->extents + bl->nr_extents - 1;
 
 	nfserr = nfserr_layoutunavailable;
-	length = bex->foff + bex->len - seg->offset;
+	length = last_bex->foff + last_bex->len - seg->offset;
 	if (length < args->lg_minlength) {
 		dprintk("pnfsd: extent smaller than minlength\n");
 		goto out_error;
 	}
 
-	seg->offset = bex->foff;
-	seg->length = bex->len;
-
-	dprintk("GET: 0x%llx:0x%llx %d\n", bex->foff, bex->len, bex->es);
+	seg->offset = first_bex->foff;
+	seg->length = last_bex->foff - first_bex->foff + last_bex->len;
 	return nfs_ok;
 
 out_error:
@@ -233,6 +273,52 @@ const struct nfsd4_layout_ops bl_layout_ops = {
 #endif /* CONFIG_NFSD_BLOCKLAYOUT */
 
 #ifdef CONFIG_NFSD_SCSILAYOUT
+
+#define NFSD_MDS_PR_FENCED	XA_MARK_0
+
+/*
+ * Clear the fence flag if the device already has an entry. This occurs
+ * when a client re-registers after a previous fence, allowing new
+ * layouts for this device.
+ *
+ * Insert only on first registration. This bounds cl_dev_fences to the
+ * count of devices this client has accessed, preventing unbounded growth.
+ */
+static inline int nfsd4_scsi_fence_insert(struct nfs4_client *clp,
+					  dev_t device)
+{
+	struct xarray *xa = &clp->cl_dev_fences;
+	int ret;
+
+	xa_lock(xa);
+	ret = __xa_insert(xa, device, XA_ZERO_ENTRY, GFP_KERNEL);
+	if (ret == -EBUSY) {
+		__xa_clear_mark(xa, device, NFSD_MDS_PR_FENCED);
+		ret = 0;
+	}
+	xa_unlock(xa);
+	clp->cl_fence_retry_warn = false;
+	return ret;
+}
+
+static inline bool nfsd4_scsi_fence_set(struct nfs4_client *clp, dev_t device)
+{
+	struct xarray *xa = &clp->cl_dev_fences;
+	bool skip;
+
+	xa_lock(xa);
+	skip = xa_get_mark(xa, device, NFSD_MDS_PR_FENCED);
+	if (!skip)
+		__xa_set_mark(xa, device, NFSD_MDS_PR_FENCED);
+	xa_unlock(xa);
+	return skip;
+}
+
+static inline void nfsd4_scsi_fence_clear(struct nfs4_client *clp, dev_t device)
+{
+	xa_clear_mark(&clp->cl_dev_fences, device, NFSD_MDS_PR_FENCED);
+}
+
 #define NFSD_MDS_PR_KEY		0x0100000000000000ULL
 
 /*
@@ -302,6 +388,10 @@ nfsd4_block_get_device_info_scsi(struct super_block *sb,
 		goto out_free_dev;
 	}
 
+	ret = nfsd4_scsi_fence_insert(clp, sb->s_bdev->bd_dev);
+	if (ret < 0)
+		goto out_free_dev;
+
 	ret = ops->pr_register(sb->s_bdev, 0, NFSD_MDS_PR_KEY, true);
 	if (ret) {
 		pr_err("pNFS: failed to register key for device %s.\n",
@@ -354,15 +444,67 @@ nfsd4_scsi_proc_layoutcommit(struct inode *inode, struct svc_rqst *rqstp,
 	return nfsd4_block_commit_blocks(inode, lcp, iomaps, nr_iomaps);
 }
 
-static void
+/*
+ * Perform the fence operation to prevent the client from accessing the
+ * block device. If a fence operation is already in progress, wait for
+ * it to complete before checking the NFSD_MDS_PR_FENCED flag. Once the
+ * operation is complete, check the flag. If NFSD_MDS_PR_FENCED is set,
+ * update the layout stateid by setting the ls_fenced flag to indicate
+ * that the client has been fenced.
+ *
+ * The cl_fence_mutex ensures that the fence operation has been fully
+ * completed, rather than just in progress, when returning from this
+ * function.
+ *
+ * Return true if client was fenced otherwise return false.
+ */
+static bool
 nfsd4_scsi_fence_client(struct nfs4_layout_stateid *ls, struct nfsd_file *file)
 {
 	struct nfs4_client *clp = ls->ls_stid.sc_client;
 	struct block_device *bdev = file->nf_file->f_path.mnt->mnt_sb->s_bdev;
+	int status;
+	bool ret;
 
-	bdev->bd_disk->fops->pr_ops->pr_preempt(bdev, NFSD_MDS_PR_KEY,
+	mutex_lock(&clp->cl_fence_mutex);
+	if (nfsd4_scsi_fence_set(clp, bdev->bd_dev)) {
+		mutex_unlock(&clp->cl_fence_mutex);
+		return true;
+	}
+
+	status = bdev->bd_disk->fops->pr_ops->pr_preempt(bdev, NFSD_MDS_PR_KEY,
 			nfsd4_scsi_pr_key(clp),
 			PR_EXCLUSIVE_ACCESS_REG_ONLY, true);
+	/*
+	 * Reset to allow retry only when the command could not have
+	 * reached the device. Negative status means a local error
+	 * (e.g., -ENOMEM) prevented the command from being sent.
+	 * PR_STS_PATH_FAILED, PR_STS_PATH_FAST_FAILED, and
+	 * PR_STS_RETRY_PATH_FAILURE indicate transport path failures
+	 * before device delivery.
+	 *
+	 * For all other errors, the command may have reached the device
+	 * and the preempt may have succeeded. Avoid resetting, since
+	 * retrying a successful preempt returns PR_STS_IOERR or
+	 * PR_STS_RESERVATION_CONFLICT, which would cause an infinite
+	 * retry loop.
+	 */
+	switch (status) {
+	case 0:
+	case PR_STS_IOERR:
+	case PR_STS_RESERVATION_CONFLICT:
+		ret = true;
+		break;
+	default:
+		/* retry-able and other errors */
+		ret = false;
+		nfsd4_scsi_fence_clear(clp, bdev->bd_dev);
+		break;
+	}
+	mutex_unlock(&clp->cl_fence_mutex);
+
+	trace_nfsd_pnfs_fence(clp, bdev->bd_disk->disk_name, status);
+	return ret;
 }
 
 const struct nfsd4_layout_ops scsi_layout_ops = {
