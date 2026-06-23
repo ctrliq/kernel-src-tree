@@ -88,6 +88,7 @@ parameters, info versions, and other features it supports.
    iosm
    ixgbe
    kvaser_pciefd
+   kvaser_usb
    mlx4
    mlx5
    mlxsw
