@@ -87,6 +87,7 @@ parameters, info versions, and other features it supports.
    ionic
    iosm
    ixgbe
+   kvaser_pciefd
    mlx4
    mlx5
    mlxsw
