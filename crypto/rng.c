@@ -442,6 +442,16 @@ static ssize_t crypto_devrandom_read_iter(struct iov_iter *iter, bool reseed)
 			uaddr = iter->ubuf + iter->iov_offset;
 			ulen = iov_iter_count(iter);
 		} else if (iter_is_iovec(iter)) {
+			/*
+			 * Skip any leading zero-length segments first, since
+			 * uaddr would otherwise point at an empty segment's
+			 * base (which may be NULL or unwritable). Advancing by
+			 * zero walks past every leading empty segment (the
+			 * iovec advance loop stops at the first non-empty one),
+			 * and there's guaranteed to be a non-empty one because
+			 * iov_iter_count() is nonzero above.
+			 */
+			iov_iter_advance(iter, 0);
 			uaddr = iter_iov_addr(iter);
 			ulen = iter_iov_len(iter);
 		} else {
