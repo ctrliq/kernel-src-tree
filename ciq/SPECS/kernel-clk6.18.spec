@@ -171,7 +171,7 @@ Summary: The Linux kernel
 %define kernel_patch 22
 %define buildid .1
 %define specversion %{kernel_major_minor}.%{kernel_patch}
-%define pkgrelease 2%{?buildid}
+%define pkgrelease 4%{?buildid}
 %define kversion %{lua:print((rpm.expand("%{kernel_major_minor}"):match("^(%d+)")))}
 
 %define tarfile_release %{specversion}-%{pkgrelease}.el%{el_version}
@@ -4492,6 +4492,17 @@ fi\
 #
 #
 %changelog
+
+* Tue Jun 23 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.22-4.1.el9
+-- Revert "mm/gup: reintroduce pin_user_pages_fast_only()" (Sultan Alsawaf)
+-- crypto: rng - Fix spurious EFAULT when the destination PTE is zapped (Sultan Alsawaf)
+-- crypto: rng - Skip leading zero-length iovec segments (Sultan Alsawaf)
+-- crypto: rng - Make the per-CPU DRBG instances permanent (Sultan Alsawaf)
+-- crypto: rng - Fix tabs vs spaces in the per-CPU DRBG code (Sultan Alsawaf)
+-- crypto: rng - Only allow the DRBG to register as "stdrng" in FIPS mode (Sultan Alsawaf)
+-- random: Restrict extrng registration to init time (Sultan Alsawaf)
+-- crypto: Kconfig - Make CRYPTO_FIPS depend on the DRBG being built-in (Sultan Alsawaf)
+
 * Wed May 06 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.22-3.1.el9
 -- After lab notice, change CONFIG_CRYPTO_FIPS_NAME to: "CIQ Linux Kernel - Kernel Cryptographic API" (Jeremy Allison)
 
