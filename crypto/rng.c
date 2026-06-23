@@ -188,24 +188,6 @@ void crypto_put_default_rng(void)
 EXPORT_SYMBOL_GPL(crypto_put_default_rng);
 
 #if defined(CONFIG_CRYPTO_RNG) || defined(CONFIG_CRYPTO_RNG_MODULE)
-#define down_read_del_pcpu_rwsem() down_read(&del_pcpu_rwsem)
-#define up_read_del_pcpu_rwsem() up_read(&del_pcpu_rwsem)
-static DECLARE_RWSEM(del_pcpu_rwsem);
-
-static void crypto_del_pcpu_rng(struct cpu_rng_inst __percpu *pcri)
-{
-	int cpu;
-
-	for_each_possible_cpu(cpu) {
-		struct cpu_rng_inst *cri = per_cpu_ptr(pcri, cpu);
-
-		if (cri->rng) {
-			crypto_free_rng(cri->rng);
-			cri->rng = NULL;
-		}
-	}
-}
-
 int crypto_del_default_rng(void)
 {
 	bool busy;
@@ -216,26 +198,10 @@ int crypto_del_default_rng(void)
 		crypto_default_rng = NULL;
 	}
 	rt_mutex_unlock(&crypto_default_rng_lock);
-	if (busy)
-		return -EBUSY;
 
-	if (!down_write_trylock(&del_pcpu_rwsem))
-		return -EBUSY;
-
-	crypto_del_pcpu_rng(&pcpu_default_rng);
-	crypto_del_pcpu_rng(&pcpu_reseed_rng);
-	up_write(&del_pcpu_rwsem);
-
-	return 0;
+	return busy ? -EBUSY : 0;
 }
 EXPORT_SYMBOL_GPL(crypto_del_default_rng);
-#else
-static inline void down_read_del_pcpu_rwsem(void)
-{
-}
-static inline void up_read_del_pcpu_rwsem(void)
-{
-}
 #endif
 
 static void rng_default_set_ent(struct crypto_rng *tfm, const u8 *data,
@@ -346,13 +312,10 @@ lock_default_rng(struct crypto_rng **rng) __acquires(&cri->lock)
 		local_lock(&pcri->lock);
 		cri = this_cpu_ptr(pcri);
 		/*
-		 * cri->rng may have transitioned from non-NULL to NULL, but
-		 * underneath down_read_del_pcpu_rwsem() it can only transition
-		 * from NULL to non-NULL. This may occur on a different CPU,
-		 * thus cri->rng must be read atomically to prevent data races;
-		 * this elides mlock by pairing with the WRITE_ONCE() in the
-		 * slow path below.
-		 *
+		 * cri->rng can only transition from NULL to non-NULL. This may
+		 * occur on a different CPU, thus cri->rng must be read
+		 * atomically to prevent data races; this elides mlock by
+		 * pairing with the WRITE_ONCE() in the slow path below.
 		 *
 		 * And if cri->rng is non-NULL, then it is good to go. To avoid
 		 * data races due to load speculation on torn cri->rng loads
@@ -490,8 +453,6 @@ static ssize_t crypto_devrandom_read_iter(struct iov_iter *iter, bool reseed)
 		}
 	}
 
-	/* Prevent rngs from getting deleted from per-CPU RNG instances */
-	down_read_del_pcpu_rwsem();
 restart:
 	/*
 	 * Pin the user page backing the current user destination address,
@@ -502,7 +463,7 @@ restart:
 	 */
 	if (user_no_reseed && pin_user_pages_fast((unsigned long)uaddr, 1,
 						  FOLL_WRITE, &upage) != 1)
-		goto up_rwsem;
+		goto exit;
 
 	cri = lock_local_rng(&rng, reseed);
 	if (IS_ERR(cri)) {
@@ -657,72 +618,41 @@ restart:
 unpin_upage:
 	if (user_no_reseed)
 		unpin_user_page(upage);
-up_rwsem:
-	up_read_del_pcpu_rwsem();
-        return ret ? ret : -EFAULT;
+exit:
+	return ret ? ret : -EFAULT;
 }
 
 static const struct random_extrng crypto_devrandom_rng = {
 	.extrng_read_iter = crypto_devrandom_read_iter
 };
 
-static void free_pcpu_inst(struct cpu_rng_inst __percpu *pcri)
+static void __init alloc_pcpu_inst(struct cpu_rng_inst __percpu *pcri)
 {
 	int cpu;
 
 	for_each_possible_cpu(cpu) {
 		struct cpu_rng_inst *cri = per_cpu_ptr(pcri, cpu);
 
-		if (cri->rng)
-			crypto_free_rng(cri->rng);
-
-		free_page((unsigned long)cri->page);
-	}
-}
-
-static int __init alloc_pcpu_inst(struct cpu_rng_inst __percpu *pcri)
-{
-	int cpu;
-
-	for_each_possible_cpu(cpu) {
-		struct cpu_rng_inst *cri = per_cpu_ptr(pcri, cpu);
-
-		cri->page = (void *)__get_free_page(GFP_KERNEL);
-		if (!cri->page)
-			goto err_page_alloc;
-
+		cri->page = (void *)__get_free_page(GFP_KERNEL | __GFP_NOFAIL);
 		local_lock_init(&cri->lock);
 	}
-
-	return 0;
-
-err_page_alloc:
-	while (cpu--)
-		free_page((unsigned long)per_cpu_ptr(pcri, cpu)->page);
-	return -ENOMEM;
 }
 
 static int __init crypto_rng_init(void)
 {
-	int ret;
-
 	if (!fips_enabled)
 		return 0;
 
-	ret = alloc_pcpu_inst(&pcpu_default_rng);
-	if (ret)
-		return ret;
-
-	ret = alloc_pcpu_inst(&pcpu_reseed_rng);
-	if (ret)
-		goto free_pcpu_default;
-
+	/*
+	 * Never fail to register the RNG override in FIPS mode because failure
+	 * would result in the system quietly booting without the FIPS-mandated
+	 * RNG installed. This would be catastrophic for FIPS compliance, hence
+	 * the RNG override setup is *not* allowed to fail.
+	 */
+	alloc_pcpu_inst(&pcpu_default_rng);
+	alloc_pcpu_inst(&pcpu_reseed_rng);
 	random_register_extrng(&crypto_devrandom_rng);
 	return 0;
-
-free_pcpu_default:
-	free_pcpu_inst(&pcpu_default_rng);
-	return ret;
 }
 
 late_initcall(crypto_rng_init);
