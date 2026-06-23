@@ -356,9 +356,9 @@ lock_default_rng(struct crypto_rng **rng) __acquires(&cri->lock)
 		 * And if cri->rng is non-NULL, then it is good to go. To avoid
 		 * data races due to load speculation on torn cri->rng loads
 		 * _after_ the NULL check, one of the following is required:
-		 *      1. smp_acquire__after_ctrl_dep() in the if-statement
-		 *      2. All cri->rng reads are performed with READ_ONCE()
-		 *      3. cri->rng is never read again outside this function
+		 * 	1. smp_acquire__after_ctrl_dep() in the if-statement
+		 * 	2. All cri->rng reads are performed with READ_ONCE()
+		 * 	3. cri->rng is never read again outside this function
 		 *
 		 * Option #3 yields the best performance, so this function
 		 * provides the rng pointer as an output for the caller to use.
@@ -443,11 +443,11 @@ lock_reseed_rng(struct crypto_rng **rng) __acquires(&cri->mlock)
 	({ (reseed) ? lock_reseed_rng(rng) : lock_default_rng(rng); })
 
 #define unlock_local_rng(cri, reseed) \
-do {                                           \
-	if (reseed)                             \
-		rt_mutex_unlock(&(cri)->mlock); \
-	else                                    \
-		local_unlock(&(cri)->lock);     \
+do {						\
+	if (reseed)				\
+		rt_mutex_unlock(&(cri)->mlock);	\
+	else					\
+		local_unlock(&(cri)->lock);	\
 } while (0)
 
 static __always_inline void
@@ -482,9 +482,9 @@ static ssize_t crypto_devrandom_read_iter(struct iov_iter *iter, bool reseed)
 			ulen = iter_iov_len(iter);
 		} else {
 			/*
-			* ITER_UBUF and ITER_IOVEC are the only user-backed
-			* iters. Bug out if a new user-backed iter appears.
-			*/
+			 * ITER_UBUF and ITER_IOVEC are the only user-backed
+			 * iters. Bug out if a new user-backed iter appears.
+			 */
 			BUG();
 		}
 	}
@@ -647,7 +647,7 @@ restart:
 			if (resched_without_lock)
 				cond_resched();
 			goto restart;
-                }
+		}
 	}
 
 	if (page_dirty_len)
