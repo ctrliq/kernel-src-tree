@@ -171,7 +171,7 @@ Summary: The Linux kernel
 %define kernel_patch 35
 %define buildid .1
 %define specversion %{kernel_major_minor}.%{kernel_patch}
-%define pkgrelease 2%{?buildid}
+%define pkgrelease 3%{?buildid}
 %define kversion %{lua:print((rpm.expand("%{kernel_major_minor}"):match("^(%d+)")))}
 
 %define tarfile_release %{specversion}-%{pkgrelease}.el%{el_version}
@@ -4505,6 +4505,17 @@ fi\
 #
 #
 %changelog
+* Tue Jun 23 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.35-3.1.el9
+-- Revert "mm/gup: reintroduce pin_user_pages_fast_only()" (Sultan Alsawaf)
+-- crypto: rng - Fix spurious EFAULT when the destination PTE is zapped (Sultan Alsawaf)
+-- crypto: rng - Skip leading zero-length iovec segments (Sultan Alsawaf)
+-- crypto: rng - Make the per-CPU DRBG instances permanent (Sultan Alsawaf)
+-- crypto: rng - Fix tabs vs spaces in the per-CPU DRBG code (Sultan Alsawaf)
+-- crypto: rng - Only allow the DRBG to register as "stdrng" in FIPS mode (Sultan Alsawaf)
+-- random: Restrict extrng registration to init time (Sultan Alsawaf)
+-- crypto: Kconfig - Make CRYPTO_FIPS depend on the DRBG being built-in (Sultan Alsawaf)
+-- github-actions: extend trigger glob to match suffix branches (Shreeya Patel)
+
 * Wed Jun 10 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.35-2.1.el9
 -- arm64: errata: Mitigate TLBI errata on Microsoft Azure Cobalt 100 CPU (Brett Mastbergen)
 -- arm64: errata: Mitigate TLBI errata on NVIDIA Olympus CPU (Brett Mastbergen)
