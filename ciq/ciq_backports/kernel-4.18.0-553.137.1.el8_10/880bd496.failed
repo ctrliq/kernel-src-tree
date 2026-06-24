@@ -1,0 +1,168 @@
+fs: prepare for adding LSM blob to backing_file
+
+jira KERNEL-1208
+cve CVE-2026-46054
+Rebuild_History Non-Buildable kernel-4.18.0-553.137.1.el8_10
+commit-author Amir Goldstein <amir73il@gmail.com>
+commit 880bd496ec72a6dcb00cb70c430ef752ba242ae7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.137.1.el8_10/880bd496.failed
+
+In preparation to adding LSM blob to backing_file struct, factor out
+helpers init_backing_file() and backing_file_free().
+
+	Cc: stable@vger.kernel.org
+	Cc: linux-fsdevel@vger.kernel.org
+	Cc: linux-unionfs@vger.kernel.org
+	Cc: linux-erofs@lists.ozlabs.org
+	Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+	Reviewed-by: Serge Hallyn <serge@hallyn.com>
+[PM: use the term "LSM blob", fix comment style to match file]
+	Signed-off-by: Paul Moore <paul@paul-moore.com>
+(cherry picked from commit 880bd496ec72a6dcb00cb70c430ef752ba242ae7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/file_table.c
+diff --cc fs/file_table.c
+index d7c5762cb8ff,3b3792903185..000000000000
+--- a/fs/file_table.c
++++ b/fs/file_table.c
+@@@ -41,20 -43,46 +41,35 @@@ static struct kmem_cache *filp_cachep _
+  
+  static struct percpu_counter nr_files __cacheline_aligned_in_smp;
+  
+ -/* Container for backing file with optional user path */
+ -struct backing_file {
+ -	struct file file;
+ -	union {
+ -		struct path user_path;
+ -		freeptr_t bf_freeptr;
+ -	};
+ -};
+ -
+ -#define backing_file(f) container_of(f, struct backing_file, file)
+ -
+ -const struct path *backing_file_user_path(const struct file *f)
+ +static void file_free_rcu(struct rcu_head *head)
+  {
+ -	return &backing_file(f)->user_path;
+ -}
+ -EXPORT_SYMBOL_GPL(backing_file_user_path);
+ +	struct file *f = container_of(head, struct file, f_u.fu_rcuhead);
+  
+ -void backing_file_set_user_path(struct file *f, const struct path *path)
+ -{
+ -	backing_file(f)->user_path = *path;
+ +	put_cred(f->f_cred);
+ +	kmem_cache_free(filp_cachep, f);
+  }
+ -EXPORT_SYMBOL_GPL(backing_file_set_user_path);
+  
++ static inline void backing_file_free(struct backing_file *ff)
++ {
++ 	path_put(&ff->user_path);
++ 	kmem_cache_free(bfilp_cachep, ff);
++ }
++ 
+  static inline void file_free(struct file *f)
+  {
+  	security_file_free(f);
+ -	if (likely(!(f->f_mode & FMODE_NOACCOUNT)))
+ +	if (!(f->f_mode & FMODE_NOACCOUNT))
+  		percpu_counter_dec(&nr_files);
+++<<<<<<< HEAD
+ +	call_rcu(&f->f_u.fu_rcuhead, file_free_rcu);
+++=======
++ 	put_cred(f->f_cred);
++ 	if (unlikely(f->f_mode & FMODE_BACKING)) {
++ 		backing_file_free(backing_file(f));
++ 	} else {
++ 		kmem_cache_free(filp_cachep, f);
++ 	}
+++>>>>>>> 880bd496ec72 (fs: prepare for adding LSM blob to backing_file)
+  }
+  
+  /*
+@@@ -177,6 -288,76 +192,79 @@@ struct file *alloc_empty_file_noaccount
+  	return f;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int init_backing_file(struct backing_file *ff)
++ {
++ 	memset(&ff->user_path, 0, sizeof(ff->user_path));
++ 	return 0;
++ }
++ 
++ /*
++  * Variant of alloc_empty_file() that allocates a backing_file container
++  * and doesn't check and modify nr_files.
++  *
++  * This is only for kernel internal use, and the allocate file must not be
++  * installed into file tables or such.
++  */
++ struct file *alloc_empty_backing_file(int flags, const struct cred *cred)
++ {
++ 	struct backing_file *ff;
++ 	int error;
++ 
++ 	ff = kmem_cache_alloc(bfilp_cachep, GFP_KERNEL);
++ 	if (unlikely(!ff))
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	error = init_file(&ff->file, flags, cred);
++ 	if (unlikely(error)) {
++ 		kmem_cache_free(bfilp_cachep, ff);
++ 		return ERR_PTR(error);
++ 	}
++ 
++ 	/* The f_mode flags must be set before fput(). */
++ 	ff->file.f_mode |= FMODE_BACKING | FMODE_NOACCOUNT;
++ 	error = init_backing_file(ff);
++ 	if (unlikely(error)) {
++ 		fput(&ff->file);
++ 		return ERR_PTR(error);
++ 	}
++ 
++ 	return &ff->file;
++ }
++ EXPORT_SYMBOL_GPL(alloc_empty_backing_file);
++ 
++ /**
++  * file_init_path - initialize a 'struct file' based on path
++  *
++  * @file: the file to set up
++  * @path: the (dentry, vfsmount) pair for the new file
++  * @fop: the 'struct file_operations' for the new file
++  */
++ static void file_init_path(struct file *file, const struct path *path,
++ 			   const struct file_operations *fop)
++ {
++ 	file->__f_path = *path;
++ 	file->f_inode = path->dentry->d_inode;
++ 	file->f_mapping = path->dentry->d_inode->i_mapping;
++ 	file->f_wb_err = filemap_sample_wb_err(file->f_mapping);
++ 	file->f_sb_err = file_sample_sb_err(file);
++ 	if (fop->llseek)
++ 		file->f_mode |= FMODE_LSEEK;
++ 	if ((file->f_mode & FMODE_READ) &&
++ 	     likely(fop->read || fop->read_iter))
++ 		file->f_mode |= FMODE_CAN_READ;
++ 	if ((file->f_mode & FMODE_WRITE) &&
++ 	     likely(fop->write || fop->write_iter))
++ 		file->f_mode |= FMODE_CAN_WRITE;
++ 	file->f_iocb_flags = iocb_flags(file);
++ 	file->f_mode |= FMODE_OPENED;
++ 	file->f_op = fop;
++ 	if ((file->f_mode & (FMODE_READ | FMODE_WRITE)) == FMODE_READ)
++ 		i_readcount_inc(path->dentry->d_inode);
++ }
++ 
+++>>>>>>> 880bd496ec72 (fs: prepare for adding LSM blob to backing_file)
+  /**
+   * alloc_file - allocate and initialize a 'struct file'
+   *
+* Unmerged path fs/file_table.c
