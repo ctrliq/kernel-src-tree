@@ -1,0 +1,298 @@
+dpll: zl3073x: report FFO as DPLL vs input reference offset
+
+jira KERNEL-1202
+Rebuild_History Non-Buildable kernel-5.14.0-687.17.1.el9_8
+commit-author Ivan Vecera <ivecera@redhat.com>
+commit 54e65df8cf18a741745645aed7ae91514d437b43
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.17.1.el9_8/54e65df8.failed
+
+Replace the per-reference frequency offset measurement (which was
+redundant with measured-frequency) with a direct read of the DPLL's
+delta frequency offset vs its tracked input reference.
+
+The new implementation uses the dpll_df_offset_x register with
+ref_ofst=1 via the dpll_df_read_x semaphore mechanism. This
+provides 2^-48 resolution (~3.5 fE) and reports the actual
+frequency difference between the DPLL and its active input.
+
+Switch supported_ffo from DPLL_FFO_PORT_RXTX_RATE to
+DPLL_FFO_PIN_DEVICE so FFO is reported only in the per-parent
+context for the active input pin.
+
+Use atomic64_t for freq_offset to prevent torn reads on 32-bit
+architectures between the periodic worker and netlink callbacks.
+
+Rewrite ffo_check to compare the cached df_offset converted to PPT
+instead of using the old per-reference measurement. Remove the
+ref_ffo_update periodic measurement and the ref ffo field since
+they are no longer needed.
+
+Changes v3 -> v4:
+- Switch to DPLL_FFO_PIN_DEVICE, remove dpll=NULL guard
+- Use atomic64_t for freq_offset (torn read on 32-bit)
+
+	Reviewed-by: Petr Oros <poros@redhat.com>
+	Signed-off-by: Ivan Vecera <ivecera@redhat.com>
+Link: https://patch.msgid.link/20260511155816.99936-3-ivecera@redhat.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 54e65df8cf18a741745645aed7ae91514d437b43)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/dpll/zl3073x/dpll.c
+diff --cc drivers/dpll/zl3073x/dpll.c
+index 2c8bd211e31e,cff85cdb9d0e..000000000000
+--- a/drivers/dpll/zl3073x/dpll.c
++++ b/drivers/dpll/zl3073x/dpll.c
+@@@ -299,7 -301,10 +300,14 @@@ zl3073x_dpll_input_pin_ffo_get(const st
+  {
+  	struct zl3073x_dpll_pin *pin = pin_priv;
+  
+++<<<<<<< HEAD
+ +	*ffo = pin->freq_offset;
+++=======
++ 	if (pin->operstate != DPLL_PIN_OPERSTATE_ACTIVE)
++ 		return -ENODATA;
++ 
++ 	ffo->ffo = atomic64_read(&pin->freq_offset);
+++>>>>>>> 54e65df8cf18 (dpll: zl3073x: report FFO as DPLL vs input reference offset)
+  
+  	return 0;
+  }
+@@@ -1274,6 -1279,7 +1282,10 @@@ zl3073x_dpll_freq_monitor_set(const str
+  }
+  
+  static const struct dpll_pin_ops zl3073x_dpll_input_pin_ops = {
+++<<<<<<< HEAD
+++=======
++ 	.supported_ffo = BIT(DPLL_FFO_PIN_DEVICE),
+++>>>>>>> 54e65df8cf18 (dpll: zl3073x: report FFO as DPLL vs input reference offset)
+  	.direction_get = zl3073x_dpll_pin_direction_get,
+  	.esync_get = zl3073x_dpll_input_pin_esync_get,
+  	.esync_set = zl3073x_dpll_input_pin_esync_set,
+diff --git a/drivers/dpll/zl3073x/chan.c b/drivers/dpll/zl3073x/chan.c
+index 2f48ca239149..2fe3c3da84bb 100644
+--- a/drivers/dpll/zl3073x/chan.c
++++ b/drivers/dpll/zl3073x/chan.c
+@@ -18,6 +18,7 @@
+ int zl3073x_chan_state_update(struct zl3073x_dev *zldev, u8 index)
+ {
+ 	struct zl3073x_chan *chan = &zldev->chan[index];
++	u64 val;
+ 	int rc;
+ 
+ 	rc = zl3073x_read_u8(zldev, ZL_REG_DPLL_MON_STATUS(index),
+@@ -25,8 +26,34 @@ int zl3073x_chan_state_update(struct zl3073x_dev *zldev, u8 index)
+ 	if (rc)
+ 		return rc;
+ 
+-	return zl3073x_read_u8(zldev, ZL_REG_DPLL_REFSEL_STATUS(index),
+-			       &chan->refsel_status);
++	rc = zl3073x_read_u8(zldev, ZL_REG_DPLL_REFSEL_STATUS(index),
++			     &chan->refsel_status);
++	if (rc)
++		return rc;
++
++	/* Read df_offset vs tracked reference */
++	rc = zl3073x_poll_zero_u8(zldev, ZL_REG_DPLL_DF_READ(index),
++				  ZL_DPLL_DF_READ_SEM);
++	if (rc)
++		return rc;
++
++	rc = zl3073x_write_u8(zldev, ZL_REG_DPLL_DF_READ(index),
++			      ZL_DPLL_DF_READ_SEM | ZL_DPLL_DF_READ_REF_OFST);
++	if (rc)
++		return rc;
++
++	rc = zl3073x_poll_zero_u8(zldev, ZL_REG_DPLL_DF_READ(index),
++				  ZL_DPLL_DF_READ_SEM);
++	if (rc)
++		return rc;
++
++	rc = zl3073x_read_u48(zldev, ZL_REG_DPLL_DF_OFFSET(index), &val);
++	if (rc)
++		return rc;
++
++	chan->df_offset = sign_extend64(val, 47);
++
++	return 0;
+ }
+ 
+ /**
+diff --git a/drivers/dpll/zl3073x/chan.h b/drivers/dpll/zl3073x/chan.h
+index 481da2133202..4353809c6912 100644
+--- a/drivers/dpll/zl3073x/chan.h
++++ b/drivers/dpll/zl3073x/chan.h
+@@ -17,6 +17,7 @@ struct zl3073x_dev;
+  * @ref_prio: reference priority registers (4 bits per ref, P/N packed)
+  * @mon_status: monitor status register value
+  * @refsel_status: reference selection status register value
++ * @df_offset: frequency offset vs tracked reference in 2^-48 steps
+  */
+ struct zl3073x_chan {
+ 	struct_group(cfg,
+@@ -26,6 +27,7 @@ struct zl3073x_chan {
+ 	struct_group(stat,
+ 		u8	mon_status;
+ 		u8	refsel_status;
++		s64	df_offset;
+ 	);
+ };
+ 
+@@ -37,6 +39,18 @@ int zl3073x_chan_state_set(struct zl3073x_dev *zldev, u8 index,
+ 
+ int zl3073x_chan_state_update(struct zl3073x_dev *zldev, u8 index);
+ 
++/**
++ * zl3073x_chan_df_offset_get - get cached df_offset vs tracked reference
++ * @chan: pointer to channel state
++ *
++ * Return: frequency offset in 2^-48 steps
++ */
++static inline s64
++zl3073x_chan_df_offset_get(const struct zl3073x_chan *chan)
++{
++	return chan->df_offset;
++}
++
+ /**
+  * zl3073x_chan_mode_get - get DPLL channel operating mode
+  * @chan: pointer to channel state
+diff --git a/drivers/dpll/zl3073x/core.c b/drivers/dpll/zl3073x/core.c
+index 024f0a27d2d7..7d2ad4b43a01 100644
+--- a/drivers/dpll/zl3073x/core.c
++++ b/drivers/dpll/zl3073x/core.c
+@@ -704,44 +704,6 @@ zl3073x_ref_freq_meas_update(struct zl3073x_dev *zldev)
+ 	return 0;
+ }
+ 
+-/**
+- * zl3073x_ref_ffo_update - update reference fractional frequency offsets
+- * @zldev: pointer to zl3073x_dev structure
+- *
+- * The function asks device to latch the latest measured fractional
+- * frequency offset values, reads and stores them into the ref state.
+- *
+- * Return: 0 on success, <0 on error
+- */
+-static int
+-zl3073x_ref_ffo_update(struct zl3073x_dev *zldev)
+-{
+-	int i, rc;
+-
+-	rc = zl3073x_ref_freq_meas_latch(zldev,
+-					 ZL_REF_FREQ_MEAS_CTRL_REF_FREQ_OFF);
+-	if (rc)
+-		return rc;
+-
+-	/* Read DPLL-to-REFx frequency offset measurements */
+-	for (i = 0; i < ZL3073X_NUM_REFS; i++) {
+-		s32 value;
+-
+-		/* Read value stored in units of 2^-32 signed */
+-		rc = zl3073x_read_u32(zldev, ZL_REG_REF_FREQ(i), &value);
+-		if (rc)
+-			return rc;
+-
+-		/* Convert to ppt
+-		 * ffo = (10^12 * value) / 2^32
+-		 * ffo = ( 5^12 * value) / 2^20
+-		 */
+-		zldev->ref[i].ffo = mul_s64_u64_shr(value, 244140625, 20);
+-	}
+-
+-	return 0;
+-}
+-
+ static void
+ zl3073x_dev_periodic_work(struct kthread_work *work)
+ {
+@@ -776,13 +738,6 @@ zl3073x_dev_periodic_work(struct kthread_work *work)
+ 		}
+ 	}
+ 
+-	/* Update references' fractional frequency offsets */
+-	rc = zl3073x_ref_ffo_update(zldev);
+-	if (rc)
+-		dev_warn(zldev->dev,
+-			 "Failed to update fractional frequency offsets: %pe\n",
+-			 ERR_PTR(rc));
+-
+ 	list_for_each_entry(zldpll, &zldev->dplls, list)
+ 		zl3073x_dpll_changes_check(zldpll);
+ 
+* Unmerged path drivers/dpll/zl3073x/dpll.c
+diff --git a/drivers/dpll/zl3073x/ref.h b/drivers/dpll/zl3073x/ref.h
+index 55e80e4f0873..e140ca3ea17d 100644
+--- a/drivers/dpll/zl3073x/ref.h
++++ b/drivers/dpll/zl3073x/ref.h
+@@ -22,7 +22,6 @@ struct zl3073x_dev;
+  * @freq_ratio_n: FEC mode divisor
+  * @sync_ctrl: reference sync control
+  * @config: reference config
+- * @ffo: current fractional frequency offset
+  * @meas_freq: measured input frequency in Hz
+  * @mon_status: reference monitor status
+  */
+@@ -40,7 +39,6 @@ struct zl3073x_ref {
+ 		u8	config;
+ 	);
+ 	struct_group(stat, /* Status */
+-		s64	ffo;
+ 		u32	meas_freq;
+ 		u8	mon_status;
+ 	);
+@@ -58,18 +56,6 @@ int zl3073x_ref_state_update(struct zl3073x_dev *zldev, u8 index);
+ 
+ int zl3073x_ref_freq_factorize(u32 freq, u16 *base, u16 *mult);
+ 
+-/**
+- * zl3073x_ref_ffo_get - get current fractional frequency offset
+- * @ref: pointer to ref state
+- *
+- * Return: the latest measured fractional frequency offset
+- */
+-static inline s64
+-zl3073x_ref_ffo_get(const struct zl3073x_ref *ref)
+-{
+-	return ref->ffo;
+-}
+-
+ /**
+  * zl3073x_ref_meas_freq_get - get measured input frequency
+  * @ref: pointer to ref state
+diff --git a/drivers/dpll/zl3073x/regs.h b/drivers/dpll/zl3073x/regs.h
+index 8015808bdf54..9578f0009528 100644
+--- a/drivers/dpll/zl3073x/regs.h
++++ b/drivers/dpll/zl3073x/regs.h
+@@ -164,6 +164,11 @@
+ #define ZL_DPLL_MODE_REFSEL_MODE_NCO		4
+ #define ZL_DPLL_MODE_REFSEL_REF			GENMASK(7, 4)
+ 
++#define ZL_REG_DPLL_DF_READ(_idx)					\
++	ZL_REG_IDX(_idx, 5, 0x28, 1, ZL3073X_MAX_CHANNELS, 1)
++#define ZL_DPLL_DF_READ_SEM			BIT(4)
++#define ZL_DPLL_DF_READ_REF_OFST		BIT(3)
++
+ #define ZL_REG_DPLL_MEAS_CTRL			ZL_REG(5, 0x50, 1)
+ #define ZL_DPLL_MEAS_CTRL_EN			BIT(0)
+ #define ZL_DPLL_MEAS_CTRL_AVG_FACTOR		GENMASK(7, 4)
+@@ -176,6 +181,16 @@
+ #define ZL_REG_DPLL_PHASE_ERR_DATA(_idx)				\
+ 	ZL_REG_IDX(_idx, 5, 0x55, 6, ZL3073X_MAX_CHANNELS, 6)
+ 
++/*******************************
++ * Register Pages 6-7, DPLL Data
++ *******************************/
++
++#define ZL_REG_DPLL_DF_OFFSET_03(_idx)					\
++	ZL_REG_IDX(_idx, 6, 0x00, 6, 4, 0x20)
++#define ZL_REG_DPLL_DF_OFFSET_4		ZL_REG(7, 0x00, 6)
++#define ZL_REG_DPLL_DF_OFFSET(_idx)					\
++	((_idx) < 4 ? ZL_REG_DPLL_DF_OFFSET_03(_idx) : ZL_REG_DPLL_DF_OFFSET_4)
++
+ /***********************************
+  * Register Page 9, Synth and Output
+  ***********************************/
