@@ -62,8 +62,8 @@ static struct file *ovl_open_realfile(const struct file *file,
 		if (!inode_owner_or_capable(realinode))
 			flags &= ~O_NOATIME;
 
-		realfile = open_with_fake_path(&file->f_path, flags, realinode,
-					       current_cred());
+		realfile = backing_file_open(file,
+					     flags, realpath, current_cred());
 	}
 	revert_creds(old_cred);
 
@@ -496,6 +496,11 @@ static int ovl_mmap(struct file *file, struct vm_area_struct *vma)
 	vma_set_file(vma, realfile);
 
 	old_cred = ovl_override_creds(file_inode(file)->i_sb);
+	ret = security_mmap_backing_file(vma, realfile, file);
+	if (ret) {
+		revert_creds(old_cred);
+		return ret;
+	}
 	ret = call_mmap(vma->vm_file, vma);
 	revert_creds(old_cred);
 	ovl_file_accessed(file);
