@@ -1,0 +1,351 @@
+fs: use backing_file container for internal files with "fake" f_path
+
+jira KERNEL-1208
+Rebuild_History Non-Buildable kernel-4.18.0-553.137.1.el8_10
+commit-author Amir Goldstein <amir73il@gmail.com>
+commit 62d53c4a1dfe347bd87ede46ffad38c9a3870338
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.137.1.el8_10/62d53c4a.failed
+
+Overlayfs uses open_with_fake_path() to allocate internal kernel files,
+with a "fake" path - whose f_path is not on the same fs as f_inode.
+
+Allocate a container struct backing_file for those internal files, that
+is used to hold the "fake" ovl path along with the real path.
+
+backing_file_real_path() can be used to access the stored real path.
+
+	Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+Message-Id: <20230615112229.2143178-5-amir73il@gmail.com>
+	Signed-off-by: Christian Brauner <brauner@kernel.org>
+(cherry picked from commit 62d53c4a1dfe347bd87ede46ffad38c9a3870338)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/open.c
+#	include/linux/fs.h
+diff --cc fs/open.c
+index de2f1a67d029,81186b277815..000000000000
+--- a/fs/open.c
++++ b/fs/open.c
+@@@ -946,23 -1074,119 +946,124 @@@ struct file *dentry_open(const struct p
+  }
+  EXPORT_SYMBOL(dentry_open);
+  
+++<<<<<<< HEAD
+ +struct file *open_with_fake_path(const struct path *path, int flags,
+ +				struct inode *inode, const struct cred *cred)
+++=======
++ /**
++  * dentry_create - Create and open a file
++  * @path: path to create
++  * @flags: O_ flags
++  * @mode: mode bits for new file
++  * @cred: credentials to use
++  *
++  * Caller must hold the parent directory's lock, and have prepared
++  * a negative dentry, placed in @path->dentry, for the new file.
++  *
++  * Caller sets @path->mnt to the vfsmount of the filesystem where
++  * the new file is to be created. The parent directory and the
++  * negative dentry must reside on the same filesystem instance.
++  *
++  * On success, returns a "struct file *". Otherwise a ERR_PTR
++  * is returned.
++  */
++ struct file *dentry_create(const struct path *path, int flags, umode_t mode,
++ 			   const struct cred *cred)
+  {
+- 	struct file *f = alloc_empty_file_noaccount(flags, cred);
+- 	if (!IS_ERR(f)) {
+- 		int error;
++ 	struct file *f;
++ 	int error;
+  
+- 		f->f_path = *path;
+- 		error = do_dentry_open(f, inode, NULL);
+- 		if (error) {
+- 			fput(f);
+- 			f = ERR_PTR(error);
+- 		}
++ 	validate_creds(cred);
++ 	f = alloc_empty_file(flags, cred);
++ 	if (IS_ERR(f))
++ 		return f;
++ 
++ 	error = vfs_create(mnt_idmap(path->mnt),
++ 			   d_inode(path->dentry->d_parent),
++ 			   path->dentry, mode, true);
++ 	if (!error)
++ 		error = vfs_open(path, f);
++ 
++ 	if (unlikely(error)) {
++ 		fput(f);
++ 		return ERR_PTR(error);
+  	}
+  	return f;
+  }
+- EXPORT_SYMBOL(open_with_fake_path);
++ EXPORT_SYMBOL(dentry_create);
++ 
++ /**
++  * kernel_file_open - open a file for kernel internal use
++  * @path:	path of the file to open
++  * @flags:	open flags
++  * @inode:	the inode
++  * @cred:	credentials for open
++  *
++  * Open a file for use by in-kernel consumers. The file is not accounted
++  * against nr_files and must not be installed into the file descriptor
++  * table.
++  *
++  * Return: Opened file on success, an error pointer on failure.
++  */
++ struct file *kernel_file_open(const struct path *path, int flags,
++ 				struct inode *inode, const struct cred *cred)
++ {
++ 	struct file *f;
++ 	int error;
++ 
++ 	f = alloc_empty_file_noaccount(flags, cred);
++ 	if (IS_ERR(f))
++ 		return f;
++ 
++ 	f->f_path = *path;
++ 	error = do_dentry_open(f, inode, NULL);
++ 	if (error) {
++ 		fput(f);
++ 		f = ERR_PTR(error);
++ 	}
++ 	return f;
++ }
++ EXPORT_SYMBOL_GPL(kernel_file_open);
++ 
++ /**
++  * backing_file_open - open a backing file for kernel internal use
++  * @path:	path of the file to open
++  * @flags:	open flags
++  * @path:	path of the backing file
++  * @cred:	credentials for open
++  *
++  * Open a backing file for a stackable filesystem (e.g., overlayfs).
++  * @path may be on the stackable filesystem and backing inode on the
++  * underlying filesystem. In this case, we want to be able to return
++  * the @real_path of the backing inode. This is done by embedding the
++  * returned file into a container structure that also stores the path of
++  * the backing inode on the underlying filesystem, which can be
++  * retrieved using backing_file_real_path().
++  */
++ struct file *backing_file_open(const struct path *path, int flags,
++ 			       const struct path *real_path,
++ 			       const struct cred *cred)
+++>>>>>>> 62d53c4a1dfe (fs: use backing_file container for internal files with "fake" f_path)
++ {
++ 	struct file *f;
++ 	int error;
++ 
++ 	f = alloc_empty_backing_file(flags, cred);
++ 	if (IS_ERR(f))
++ 		return f;
++ 
++ 	f->f_path = *path;
++ 	path_get(real_path);
++ 	*backing_file_real_path(f) = *real_path;
++ 	error = do_dentry_open(f, d_inode(real_path->dentry), NULL);
++ 	if (error) {
++ 		fput(f);
++ 		f = ERR_PTR(error);
++ 	}
++ 
++ 	return f;
++ }
++ EXPORT_SYMBOL_GPL(backing_file_open);
+  
+  #define WILL_CREATE(flags)	(flags & (O_CREAT | __O_TMPFILE))
+  #define O_PATH_FLAGS		(O_DIRECTORY | O_NOFOLLOW | O_PATH | O_CLOEXEC)
+diff --cc include/linux/fs.h
+index 7f7a0ab8527b,24e1be1c13ca..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -157,7 -158,22 +157,10 @@@ typedef int (dio_iodone_t)(struct kioc
+  #define FMODE_CAN_WRITE         ((__force fmode_t)0x40000)
+  
+  #define FMODE_OPENED		((__force fmode_t)0x80000)
+ -#define FMODE_CREATED		((__force fmode_t)0x100000)
+ -
+ -/* File is stream-like */
+ -#define FMODE_STREAM		((__force fmode_t)0x200000)
+ -
+ -/* File supports DIRECT IO */
+ -#define	FMODE_CAN_ODIRECT	((__force fmode_t)0x400000)
+ -
+ -#define	FMODE_NOREUSE		((__force fmode_t)0x800000)
+ -
+ -/* File supports non-exclusive O_DIRECT writes from multiple threads */
+ -#define FMODE_DIO_PARALLEL_WRITE	((__force fmode_t)0x1000000)
+  
++ /* File is embedded in backing_file object */
++ #define FMODE_BACKING		((__force fmode_t)0x2000000)
++ 
+  /* File was opened by fanotify and shouldn't generate fanotify events */
+  #define FMODE_NONOTIFY		((__force fmode_t)0x4000000)
+  
+@@@ -2611,11 -2347,39 +2614,45 @@@ extern long do_sys_open(int dfd, const 
+  			umode_t mode);
+  extern struct file *file_open_name(struct filename *, int, umode_t);
+  extern struct file *filp_open(const char *, int, umode_t);
+ -extern struct file *file_open_root(const struct path *,
+ +extern struct file *file_open_root(struct dentry *, struct vfsmount *,
+  				   const char *, int, umode_t);
+++<<<<<<< HEAD
+ +extern struct file * dentry_open(const struct path *, int, const struct cred *);
+ +extern struct file * open_with_fake_path(const struct path *, int,
+ +					 struct inode*, const struct cred *);
+++=======
++ static inline struct file *file_open_root_mnt(struct vfsmount *mnt,
++ 				   const char *name, int flags, umode_t mode)
++ {
++ 	return file_open_root(&(struct path){.mnt = mnt, .dentry = mnt->mnt_root},
++ 			      name, flags, mode);
++ }
++ struct file *dentry_open(const struct path *path, int flags,
++ 			 const struct cred *creds);
++ struct file *dentry_create(const struct path *path, int flags, umode_t mode,
++ 			   const struct cred *cred);
++ struct file *backing_file_open(const struct path *path, int flags,
++ 			       const struct path *real_path,
++ 			       const struct cred *cred);
++ struct path *backing_file_real_path(struct file *f);
++ 
++ /*
++  * file_real_path - get the path corresponding to f_inode
++  *
++  * When opening a backing file for a stackable filesystem (e.g.,
++  * overlayfs) f_path may be on the stackable filesystem and f_inode on
++  * the underlying filesystem.  When the path associated with f_inode is
++  * needed, this helper should be used instead of accessing f_path
++  * directly.
++ */
++ static inline const struct path *file_real_path(struct file *f)
++ {
++ 	if (unlikely(f->f_mode & FMODE_BACKING))
++ 		return backing_file_real_path(f);
++ 	return &f->f_path;
++ }
++ 
+++>>>>>>> 62d53c4a1dfe (fs: use backing_file container for internal files with "fake" f_path)
+  static inline struct file *file_clone_open(struct file *file)
+  {
+  	return dentry_open(&file->f_path, file->f_flags, file->f_cred);
+diff --git a/fs/file_table.c b/fs/file_table.c
+index d7c5762cb8ff..23b3c2ef8896 100644
+--- a/fs/file_table.c
++++ b/fs/file_table.c
+@@ -41,18 +41,40 @@ static struct kmem_cache *filp_cachep __read_mostly;
+ 
+ static struct percpu_counter nr_files __cacheline_aligned_in_smp;
+ 
++/* Container for backing file with optional real path */
++struct backing_file {
++	struct file file;
++	struct path real_path;
++};
++
++static inline struct backing_file *backing_file(struct file *f)
++{
++	return container_of(f, struct backing_file, file);
++}
++
++struct path *backing_file_real_path(struct file *f)
++{
++	return &backing_file(f)->real_path;
++}
++EXPORT_SYMBOL_GPL(backing_file_real_path);
++
+ static void file_free_rcu(struct rcu_head *head)
+ {
+ 	struct file *f = container_of(head, struct file, f_u.fu_rcuhead);
+ 
+ 	put_cred(f->f_cred);
+-	kmem_cache_free(filp_cachep, f);
++	if (unlikely(f->f_mode & FMODE_BACKING))
++		kfree(backing_file(f));
++	else
++		kmem_cache_free(filp_cachep, f);
+ }
+ 
+ static inline void file_free(struct file *f)
+ {
+ 	security_file_free(f);
+-	if (!(f->f_mode & FMODE_NOACCOUNT))
++	if (unlikely(f->f_mode & FMODE_BACKING))
++		path_put(backing_file_real_path(f));
++	if (likely(!(f->f_mode & FMODE_NOACCOUNT)))
+ 		percpu_counter_dec(&nr_files);
+ 	call_rcu(&f->f_u.fu_rcuhead, file_free_rcu);
+ }
+@@ -177,6 +199,30 @@ struct file *alloc_empty_file_noaccount(int flags, const struct cred *cred)
+ 	return f;
+ }
+ 
++/*
++ * Variant of alloc_empty_file() that allocates a backing_file container
++ * and doesn't check and modify nr_files.
++ *
++ * This is only for kernel internal use, and the allocate file must not be
++ * installed into file tables or such.
++ */
++struct file *alloc_empty_backing_file(int flags, const struct cred *cred)
++{
++	struct backing_file *ff;
++	int error;
++
++	ff = kzalloc(sizeof(struct backing_file), GFP_KERNEL);
++	if (unlikely(!ff))
++		return ERR_PTR(-ENOMEM);
++
++	error = init_file(&ff->file, flags, cred);
++	if (unlikely(error))
++		return ERR_PTR(error);
++
++	ff->file.f_mode |= FMODE_BACKING | FMODE_NOACCOUNT;
++	return &ff->file;
++}
++
+ /**
+  * alloc_file - allocate and initialize a 'struct file'
+  *
+diff --git a/fs/internal.h b/fs/internal.h
+index 7e0a769c1ff9..ef4dbeaf5245 100644
+--- a/fs/internal.h
++++ b/fs/internal.h
+@@ -116,8 +116,9 @@ extern void chroot_fs_refs(const struct path *, const struct path *);
+ /*
+  * file_table.c
+  */
+-extern struct file *alloc_empty_file(int, const struct cred *);
+-extern struct file *alloc_empty_file_noaccount(int, const struct cred *);
++struct file *alloc_empty_file(int flags, const struct cred *cred);
++struct file *alloc_empty_file_noaccount(int flags, const struct cred *cred);
++struct file *alloc_empty_backing_file(int flags, const struct cred *cred);
+ 
+ static inline void put_file_access(struct file *file)
+ {
+* Unmerged path fs/open.c
+diff --git a/fs/overlayfs/file.c b/fs/overlayfs/file.c
+index 57b81b0637b9..758d6a75312d 100644
+--- a/fs/overlayfs/file.c
++++ b/fs/overlayfs/file.c
+@@ -62,8 +62,8 @@ static struct file *ovl_open_realfile(const struct file *file,
+ 		if (!inode_owner_or_capable(realinode))
+ 			flags &= ~O_NOATIME;
+ 
+-		realfile = open_with_fake_path(&file->f_path, flags, realinode,
+-					       current_cred());
++		realfile = backing_file_open(&file->f_path, flags, realpath,
++					     current_cred());
+ 	}
+ 	revert_creds(old_cred);
+ 
+* Unmerged path include/linux/fs.h
