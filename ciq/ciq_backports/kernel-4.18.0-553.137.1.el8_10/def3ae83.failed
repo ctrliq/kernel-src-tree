@@ -1,0 +1,351 @@
+fs: store real path instead of fake path in backing file f_path
+
+jira KERNEL-1208
+Rebuild_History Non-Buildable kernel-4.18.0-553.137.1.el8_10
+commit-author Amir Goldstein <amir73il@gmail.com>
+commit def3ae83da02f87005210fa3d448c5dd37ba4105
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.137.1.el8_10/def3ae83.failed
+
+A backing file struct stores two path's, one "real" path that is referring
+to f_inode and one "fake" path, which should be displayed to users in
+/proc/<pid>/maps.
+
+There is a lot more potential code that needs to know the "real" path, then
+code that needs to know the "fake" path.
+
+Instead of code having to request the "real" path with file_real_path(),
+store the "real" path in f_path and require code that needs to know the
+"fake" path request it with file_user_path().
+Replace the file_real_path() helper with a simple const accessor f_path().
+
+After this change, file_dentry() is not expected to observe any files
+with overlayfs f_path and real f_inode, so the call to ->d_real() should
+not be needed.  Leave the ->d_real() call for now and add an assertion
+in ovl_d_real() to catch if we made wrong assumptions.
+
+	Suggested-by: Miklos Szeredi <miklos@szeredi.hu>
+Link: https://lore.kernel.org/r/CAJfpegtt48eXhhjDFA1ojcHPNKj3Go6joryCPtEFAKpocyBsnw@mail.gmail.com/
+	Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+Link: https://lore.kernel.org/r/20231009153712.1566422-4-amir73il@gmail.com
+	Signed-off-by: Christian Brauner <brauner@kernel.org>
+(cherry picked from commit def3ae83da02f87005210fa3d448c5dd37ba4105)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/file_table.c
+#	fs/internal.h
+#	fs/open.c
+#	include/linux/fs.h
+#	include/linux/fsnotify.h
+diff --cc fs/file_table.c
+index d7c5762cb8ff,fa92743ba6a9..000000000000
+--- a/fs/file_table.c
++++ b/fs/file_table.c
+@@@ -41,20 -44,47 +41,60 @@@ static struct kmem_cache *filp_cachep _
+  
+  static struct percpu_counter nr_files __cacheline_aligned_in_smp;
+  
+++<<<<<<< HEAD
+ +static void file_free_rcu(struct rcu_head *head)
+++=======
++ /* Container for backing file with optional user path */
++ struct backing_file {
++ 	struct file file;
++ 	struct path user_path;
++ };
++ 
++ static inline struct backing_file *backing_file(struct file *f)
+++>>>>>>> def3ae83da02 (fs: store real path instead of fake path in backing file f_path)
+  {
+ -	return container_of(f, struct backing_file, file);
+ -}
+ +	struct file *f = container_of(head, struct file, f_u.fu_rcuhead);
+  
+++<<<<<<< HEAD
+ +	put_cred(f->f_cred);
+ +	kmem_cache_free(filp_cachep, f);
+ +}
+++=======
++ struct path *backing_file_user_path(struct file *f)
++ {
++ 	return &backing_file(f)->user_path;
++ }
++ EXPORT_SYMBOL_GPL(backing_file_user_path);
+++>>>>>>> def3ae83da02 (fs: store real path instead of fake path in backing file f_path)
+  
+  static inline void file_free(struct file *f)
+  {
+  	security_file_free(f);
+ -	if (likely(!(f->f_mode & FMODE_NOACCOUNT)))
+ +	if (!(f->f_mode & FMODE_NOACCOUNT))
+  		percpu_counter_dec(&nr_files);
+++<<<<<<< HEAD
+ +	call_rcu(&f->f_u.fu_rcuhead, file_free_rcu);
+++=======
++ 	put_cred(f->f_cred);
++ 	if (unlikely(f->f_mode & FMODE_BACKING)) {
++ 		path_put(backing_file_user_path(f));
++ 		kfree(backing_file(f));
++ 	} else {
++ 		kmem_cache_free(filp_cachep, f);
++ 	}
++ }
++ 
++ void release_empty_file(struct file *f)
++ {
++ 	WARN_ON_ONCE(f->f_mode & (FMODE_BACKING | FMODE_OPENED));
++ 	if (atomic_long_dec_and_test(&f->f_count)) {
++ 		security_file_free(f);
++ 		put_cred(f->f_cred);
++ 		if (likely(!(f->f_mode & FMODE_NOACCOUNT)))
++ 			percpu_counter_dec(&nr_files);
++ 		kmem_cache_free(filp_cachep, f);
++ 	}
+++>>>>>>> def3ae83da02 (fs: store real path instead of fake path in backing file f_path)
+  }
+  
+  /*
+diff --cc fs/internal.h
+index 7e0a769c1ff9,58e43341aebf..000000000000
+--- a/fs/internal.h
++++ b/fs/internal.h
+@@@ -116,8 -91,18 +116,23 @@@ extern void chroot_fs_refs(const struc
+  /*
+   * file_table.c
+   */
+++<<<<<<< HEAD
+ +extern struct file *alloc_empty_file(int, const struct cred *);
+ +extern struct file *alloc_empty_file_noaccount(int, const struct cred *);
+++=======
++ struct file *alloc_empty_file(int flags, const struct cred *cred);
++ struct file *alloc_empty_file_noaccount(int flags, const struct cred *cred);
++ struct file *alloc_empty_backing_file(int flags, const struct cred *cred);
++ void release_empty_file(struct file *f);
++ 
++ static inline void file_put_write_access(struct file *file)
++ {
++ 	put_write_access(file->f_inode);
++ 	mnt_put_write_access(file->f_path.mnt);
++ 	if (unlikely(file->f_mode & FMODE_BACKING))
++ 		mnt_put_write_access(backing_file_user_path(file)->mnt);
++ }
+++>>>>>>> def3ae83da02 (fs: store real path instead of fake path in backing file f_path)
+  
+  static inline void put_file_access(struct file *file)
+  {
+diff --cc fs/open.c
+index de2f1a67d029,02dc608d40d8..000000000000
+--- a/fs/open.c
++++ b/fs/open.c
+@@@ -745,6 -870,30 +745,33 @@@ SYSCALL_DEFINE3(fchown, unsigned int, f
+  	return ksys_fchown(fd, user, group);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline int file_get_write_access(struct file *f)
++ {
++ 	int error;
++ 
++ 	error = get_write_access(f->f_inode);
++ 	if (unlikely(error))
++ 		return error;
++ 	error = mnt_get_write_access(f->f_path.mnt);
++ 	if (unlikely(error))
++ 		goto cleanup_inode;
++ 	if (unlikely(f->f_mode & FMODE_BACKING)) {
++ 		error = mnt_get_write_access(backing_file_user_path(f)->mnt);
++ 		if (unlikely(error))
++ 			goto cleanup_mnt;
++ 	}
++ 	return 0;
++ 
++ cleanup_mnt:
++ 	mnt_put_write_access(f->f_path.mnt);
++ cleanup_inode:
++ 	put_write_access(f->f_inode);
++ 	return error;
++ }
++ 
+++>>>>>>> def3ae83da02 (fs: store real path instead of fake path in backing file f_path)
+  static int do_dentry_open(struct file *f,
+  			  struct inode *inode,
+  			  int (*open)(struct inode *, struct file *))
+@@@ -962,7 -1178,45 +989,49 @@@ struct file *open_with_fake_path(const 
+  	}
+  	return f;
+  }
+++<<<<<<< HEAD
+ +EXPORT_SYMBOL(open_with_fake_path);
+++=======
++ EXPORT_SYMBOL_GPL(kernel_file_open);
++ 
++ /**
++  * backing_file_open - open a backing file for kernel internal use
++  * @user_path:	path that the user reuqested to open
++  * @flags:	open flags
++  * @real_path:	path of the backing file
++  * @cred:	credentials for open
++  *
++  * Open a backing file for a stackable filesystem (e.g., overlayfs).
++  * @user_path may be on the stackable filesystem and @real_path on the
++  * underlying filesystem.  In this case, we want to be able to return the
++  * @user_path of the stackable filesystem. This is done by embedding the
++  * returned file into a container structure that also stores the stacked
++  * file's path, which can be retrieved using backing_file_user_path().
++  */
++ struct file *backing_file_open(const struct path *user_path, int flags,
++ 			       const struct path *real_path,
++ 			       const struct cred *cred)
++ {
++ 	struct file *f;
++ 	int error;
++ 
++ 	f = alloc_empty_backing_file(flags, cred);
++ 	if (IS_ERR(f))
++ 		return f;
++ 
++ 	path_get(user_path);
++ 	*backing_file_user_path(f) = *user_path;
++ 	f->f_path = *real_path;
++ 	error = do_dentry_open(f, d_inode(real_path->dentry), NULL);
++ 	if (error) {
++ 		fput(f);
++ 		f = ERR_PTR(error);
++ 	}
++ 
++ 	return f;
++ }
++ EXPORT_SYMBOL_GPL(backing_file_open);
+++>>>>>>> def3ae83da02 (fs: store real path instead of fake path in backing file f_path)
+  
+  #define WILL_CREATE(flags)	(flags & (O_CREAT | __O_TMPFILE))
+  #define O_PATH_FLAGS		(O_DIRECTORY | O_NOFOLLOW | O_PATH | O_CLOEXEC)
+diff --cc include/linux/fs.h
+index 7f7a0ab8527b,b37dccfb4534..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -2611,11 -2480,39 +2611,45 @@@ extern long do_sys_open(int dfd, const 
+  			umode_t mode);
+  extern struct file *file_open_name(struct filename *, int, umode_t);
+  extern struct file *filp_open(const char *, int, umode_t);
+ -extern struct file *file_open_root(const struct path *,
+ +extern struct file *file_open_root(struct dentry *, struct vfsmount *,
+  				   const char *, int, umode_t);
+++<<<<<<< HEAD
+ +extern struct file * dentry_open(const struct path *, int, const struct cred *);
+ +extern struct file * open_with_fake_path(const struct path *, int,
+ +					 struct inode*, const struct cred *);
+++=======
++ static inline struct file *file_open_root_mnt(struct vfsmount *mnt,
++ 				   const char *name, int flags, umode_t mode)
++ {
++ 	return file_open_root(&(struct path){.mnt = mnt, .dentry = mnt->mnt_root},
++ 			      name, flags, mode);
++ }
++ struct file *dentry_open(const struct path *path, int flags,
++ 			 const struct cred *creds);
++ struct file *dentry_create(const struct path *path, int flags, umode_t mode,
++ 			   const struct cred *cred);
++ struct file *backing_file_open(const struct path *user_path, int flags,
++ 			       const struct path *real_path,
++ 			       const struct cred *cred);
++ struct path *backing_file_user_path(struct file *f);
++ 
++ /*
++  * file_user_path - get the path to display for memory mapped file
++  *
++  * When mmapping a file on a stackable filesystem (e.g., overlayfs), the file
++  * stored in ->vm_file is a backing file whose f_inode is on the underlying
++  * filesystem.  When the mapped file path is displayed to user (e.g. via
++  * /proc/<pid>/maps), this helper should be used to get the path to display
++  * to the user, which is the path of the fd that user has requested to map.
++  */
++ static inline const struct path *file_user_path(struct file *f)
++ {
++ 	if (unlikely(f->f_mode & FMODE_BACKING))
++ 		return backing_file_user_path(f);
++ 	return &f->f_path;
++ }
++ 
+++>>>>>>> def3ae83da02 (fs: store real path instead of fake path in backing file f_path)
+  static inline struct file *file_clone_open(struct file *file)
+  {
+  	return dentry_open(&file->f_path, file->f_flags, file->f_cred);
+diff --cc include/linux/fsnotify.h
+index 94972e8eb6d1,bcb6609b54b3..000000000000
+--- a/include/linux/fsnotify.h
++++ b/include/linux/fsnotify.h
+@@@ -41,17 -81,23 +41,29 @@@ static inline int fsnotify_parent(cons
+  }
+  
+  /*
+ - * Simple wrappers to consolidate calls to fsnotify_parent() when an event
+ - * is on a file/dentry.
+ + * Simple wrapper to consolidate calls fsnotify_parent()/fsnotify() when
+ + * an event is on a path.
+   */
+ -static inline void fsnotify_dentry(struct dentry *dentry, __u32 mask)
+ +static inline int fsnotify_path(struct inode *inode, const struct path *path,
+ +				__u32 mask)
+  {
+ -	fsnotify_parent(dentry, mask, dentry, FSNOTIFY_EVENT_DENTRY);
+ -}
+ +	int ret = fsnotify_parent(path, NULL, mask);
+  
+++<<<<<<< HEAD
+ +	if (ret)
+ +		return ret;
+ +	return fsnotify(inode, mask, path, FSNOTIFY_EVENT_PATH, NULL, 0);
+++=======
++ static inline int fsnotify_file(struct file *file, __u32 mask)
++ {
++ 	const struct path *path;
++ 
++ 	if (file->f_mode & FMODE_NONOTIFY)
++ 		return 0;
++ 
++ 	path = &file->f_path;
++ 	return fsnotify_parent(path->dentry, mask, path, FSNOTIFY_EVENT_PATH);
+++>>>>>>> def3ae83da02 (fs: store real path instead of fake path in backing file f_path)
+  }
+  
+  /* Simple call site for access decisions */
+* Unmerged path fs/file_table.c
+* Unmerged path fs/internal.h
+* Unmerged path fs/open.c
+diff --git a/fs/overlayfs/super.c b/fs/overlayfs/super.c
+index 906af4e59e9a..c9166b283bb3 100644
+--- a/fs/overlayfs/super.c
++++ b/fs/overlayfs/super.c
+@@ -84,14 +84,22 @@ static struct dentry *ovl_d_real(struct dentry *dentry,
+ {
+ 	struct dentry *real = NULL, *lower;
+ 
+-	/* It's an overlay file */
++	/*
++	 * vfs is only expected to call d_real() with NULL from d_real_inode()
++	 * and with overlay inode from file_dentry() on an overlay file.
++	 *
++	 * TODO: remove @inode argument from d_real() API, remove code in this
++	 * function that deals with non-NULL @inode and remove d_real() call
++	 * from file_dentry().
++	 */
+ 	if (inode && d_inode(dentry) == inode)
+ 		return dentry;
++	else if (inode)
++		goto bug;
+ 
+ 	if (!d_is_reg(dentry)) {
+-		if (!inode || inode == d_inode(dentry))
+-			return dentry;
+-		goto bug;
++		/* d_real_inode() is only relevant for regular files */
++		return dentry;
+ 	}
+ 
+ 	real = ovl_dentry_upper(dentry);
+* Unmerged path include/linux/fs.h
+* Unmerged path include/linux/fsnotify.h
