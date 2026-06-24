@@ -430,7 +430,7 @@ void do_secure_storage_access(struct pt_regs *regs)
 			return;
 		rc = uv_convert_from_secure(folio_to_phys(folio));
 		if (!rc)
-			clear_bit(PG_arch_1, &folio->flags.f);
+			clear_bit(PG_arch_1, &folio->flags);
 		folio_put(folio);
 		/*
 		 * There are some valid fixup types for kernel
