@@ -148,12 +148,12 @@ static void nft_ctx_init(struct nft_ctx *ctx,
 	ctx->seq	= nlh->nlmsg_seq;
 }
 
-static struct nft_trans *nft_trans_alloc_gfp(const struct nft_ctx *ctx,
-					     int msg_type, u32 size, gfp_t gfp)
+static struct nft_trans *nft_trans_alloc(const struct nft_ctx *ctx,
+					 int msg_type, u32 size)
 {
 	struct nft_trans *trans;
 
-	trans = kzalloc(sizeof(struct nft_trans) + size, gfp);
+	trans = kzalloc(sizeof(struct nft_trans) + size, GFP_KERNEL);
 	if (trans == NULL)
 		return NULL;
 
@@ -163,12 +163,6 @@ static struct nft_trans *nft_trans_alloc_gfp(const struct nft_ctx *ctx,
 	trans->ctx	= *ctx;
 
 	return trans;
-}
-
-static struct nft_trans *nft_trans_alloc(const struct nft_ctx *ctx,
-					 int msg_type, u32 size)
-{
-	return nft_trans_alloc_gfp(ctx, msg_type, size, GFP_KERNEL);
 }
 
 static void nft_trans_list_del(struct nft_trans *trans)
@@ -7136,8 +7130,8 @@ static int nft_setelem_flush(const struct nft_ctx *ctx,
 	if (!nft_set_elem_active(ext, iter->genmask))
 		return 0;
 
-	trans = nft_trans_alloc_gfp(ctx, NFT_MSG_DELSETELEM,
-				    sizeof(struct nft_trans_elem), GFP_ATOMIC);
+	trans = nft_trans_alloc(ctx, NFT_MSG_DELSETELEM,
+				sizeof(struct nft_trans_elem));
 	if (!trans)
 		return -ENOMEM;
 
@@ -7158,8 +7152,7 @@ static int __nft_set_catchall_flush(const struct nft_ctx *ctx,
 {
 	struct nft_trans *trans;
 
-	trans = nft_trans_alloc_gfp(ctx, NFT_MSG_DELSETELEM,
-				    sizeof(struct nft_trans_elem), GFP_KERNEL);
+	trans = nft_trans_alloc(ctx, NFT_MSG_DELSETELEM, sizeof(struct nft_trans_elem));
 	if (!trans)
 		return -ENOMEM;
 
