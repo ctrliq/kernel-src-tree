@@ -157,6 +157,13 @@ struct bdi_writeback {
 		struct work_struct release_work;
 		struct rcu_head rcu;
 	};
+
+	RH_KABI_EXTEND(struct work_struct switch_work) /* work used to perform
+							* inode switching to
+							* this wb */
+	RH_KABI_EXTEND(struct llist_head switch_wbs_ctxs) /* queued contexts for
+							   * writeback switching
+							   * */
 #endif
 };
 
