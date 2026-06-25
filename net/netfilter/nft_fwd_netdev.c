@@ -22,8 +22,22 @@ struct nft_fwd_netdev {
 };
 
 #define NF_RECURSION_LIMIT	2
-
 static DEFINE_PER_CPU(u8, nf_dup_skb_recursion);
+
+static bool nf_dev_xmit_recursion(void)
+{
+	return unlikely(__this_cpu_read(nf_dup_skb_recursion) > NF_RECURSION_LIMIT);
+}
+
+static void nf_dev_xmit_recursion_inc(void)
+{
+	__this_cpu_inc(nf_dup_skb_recursion);
+}
+
+static void nf_dev_xmit_recursion_dec(void)
+{
+	__this_cpu_dec(nf_dup_skb_recursion);
+}
 
 static void nft_fwd_netdev_eval(const struct nft_expr *expr,
 				struct nft_regs *regs,
@@ -147,13 +161,15 @@ static void nft_fwd_neigh_eval(const struct nft_expr *expr,
 		goto out;
 	}
 
-	if (this_cpu_read(nf_dup_skb_recursion) > NF_RECURSION_LIMIT) {
+	dev = dev_get_by_index_rcu(nft_net(pkt), oif);
+	if (!dev) {
 		verdict = NF_DROP;
 		goto out;
 	}
 
-	dev = dev_get_by_index_rcu(nft_net(pkt), oif);
-	if (dev == NULL) {
+	local_bh_disable();
+	if (nf_dev_xmit_recursion()) {
+		local_bh_enable();
 		verdict = NF_DROP;
 		goto out;
 	}
@@ -162,16 +178,18 @@ static void nft_fwd_neigh_eval(const struct nft_expr *expr,
 	if (unlikely(skb_headroom(skb) < hh_len && dev->header_ops)) {
 		skb = skb_expand_head(skb, hh_len);
 		if (!skb) {
-			verdict = NF_STOLEN;
+			local_bh_enable();
 			goto out;
 		}
 	}
 
 	skb->dev = dev;
 	skb_clear_tstamp(skb);
-	this_cpu_inc(nf_dup_skb_recursion);
+
+	nf_dev_xmit_recursion_inc();
 	neigh_xmit(neigh_table, dev, addr, skb);
-	this_cpu_dec(nf_dup_skb_recursion);
+	nf_dev_xmit_recursion_dec();
+	local_bh_enable();
 out:
 	regs->verdict.code = verdict;
 }
