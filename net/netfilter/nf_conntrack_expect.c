@@ -494,6 +494,9 @@ static inline int __nf_ct_expect_check(struct nf_conntrack_expect *expect,
 				goto out;
 			}
 		}
+	} else {
+		if (master_help->expecting[expect->class] >= NF_CT_EXPECT_MAX_CNT)
+			evict_oldest_expect(master_help, expect);
 	}
 
 	cnet = nf_ct_pernet(net);
