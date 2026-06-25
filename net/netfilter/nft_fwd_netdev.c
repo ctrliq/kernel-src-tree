@@ -21,6 +21,10 @@ struct nft_fwd_netdev {
 	u8	sreg_dev;
 };
 
+#define NF_RECURSION_LIMIT	2
+
+static DEFINE_PER_CPU(u8, nf_dup_skb_recursion);
+
 static void nft_fwd_netdev_eval(const struct nft_expr *expr,
 				struct nft_regs *regs,
 				const struct nft_pktinfo *pkt)
@@ -143,6 +147,11 @@ static void nft_fwd_neigh_eval(const struct nft_expr *expr,
 		goto out;
 	}
 
+	if (this_cpu_read(nf_dup_skb_recursion) > NF_RECURSION_LIMIT) {
+		verdict = NF_DROP;
+		goto out;
+	}
+
 	dev = dev_get_by_index_rcu(nft_net(pkt), oif);
 	if (dev == NULL) {
 		verdict = NF_DROP;
@@ -160,7 +169,9 @@ static void nft_fwd_neigh_eval(const struct nft_expr *expr,
 
 	skb->dev = dev;
 	skb_clear_tstamp(skb);
+	this_cpu_inc(nf_dup_skb_recursion);
 	neigh_xmit(neigh_table, dev, addr, skb);
+	this_cpu_dec(nf_dup_skb_recursion);
 out:
 	regs->verdict.code = verdict;
 }
