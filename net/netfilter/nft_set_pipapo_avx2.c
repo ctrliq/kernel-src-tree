@@ -1136,7 +1136,6 @@ static inline void pipapo_resmap_init_avx2(const struct nft_pipapo_match *m, uns
  * pipapo_get_avx2() - Lookup function for AVX2 implementation
  * @m:		Storage containing the set elements
  * @data:	Key data to be matched against existing elements
- * @genmask:	If set, check that element is active in given genmask
  * @tstamp:	Timestamp to check for expired elements
  *
  * For more details, see DOC: Theory of Operation in nft_set_pipapo.c.
@@ -1150,8 +1149,7 @@ static inline void pipapo_resmap_init_avx2(const struct nft_pipapo_match *m, uns
  * Return: pointer to &struct nft_pipapo_elem on match, NULL otherwise.
  */
 static struct nft_pipapo_elem *pipapo_get_avx2(const struct nft_pipapo_match *m,
-					       const u8 *data, u8 genmask,
-					       u64 tstamp)
+					       const u8 *data, u64 tstamp)
 {
 	struct nft_pipapo_scratch *scratch;
 	const struct nft_pipapo_field *f;
@@ -1235,8 +1233,7 @@ next_match:
 			struct nft_pipapo_elem *e;
 
 			e = f->mt[ret].e;
-			if (unlikely(__nft_set_elem_expired(&e->ext, tstamp) ||
-				     !nft_set_elem_active(&e->ext, genmask)))
+			if (unlikely(__nft_set_elem_expired(&e->ext, tstamp)))
 				goto next_match;
 
 			scratch->map_index = map_index;
@@ -1271,7 +1268,6 @@ nft_pipapo_avx2_lookup(const struct net *net, const struct nft_set *set,
 		       const u32 *key)
 {
 	struct nft_pipapo *priv = nft_set_priv(set);
-	u8 genmask = nft_genmask_cur(net);
 	const struct nft_pipapo_match *m;
 	const u8 *rp = (const u8 *)key;
 	const struct nft_pipapo_elem *e;
@@ -1289,7 +1285,7 @@ nft_pipapo_avx2_lookup(const struct net *net, const struct nft_set *set,
 
 	m = rcu_dereference(priv->match);
 
-	e = pipapo_get_avx2(m, rp, genmask, get_jiffies_64());
+	e = pipapo_get_avx2(m, rp, get_jiffies_64());
 	local_bh_enable();
 
 	return e ? &e->ext : NULL;
