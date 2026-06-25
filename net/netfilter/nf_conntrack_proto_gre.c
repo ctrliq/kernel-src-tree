@@ -129,6 +129,9 @@ bool nf_ct_gre_keymap_add(struct nf_conn *ct,
 	struct nf_ct_gre_keymap *km_orig, *km_repl;
 	bool ret = false;
 
+	if (!ct_pptp_info)
+		return false;
+
 	km_orig = kmalloc(sizeof(*km_orig), GFP_ATOMIC);
 	if (!km_orig)
 		return false;
@@ -184,6 +187,9 @@ void nf_ct_gre_keymap_destroy(struct nf_conn *ct)
 {
 	struct nf_ct_pptp_master *ct_pptp_info = nfct_help_data(ct);
 	enum ip_conntrack_dir dir;
+
+	if (!ct_pptp_info)
+		return;
 
 	pr_debug("entering for ct %p\n", ct);
 
