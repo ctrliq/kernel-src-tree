@@ -163,10 +163,10 @@ Summary: The Linux kernel
 %define debugbuildsenabled 1
 %define el_version 9
 %define kernel_major_minor 6.12
-%define kernel_patch 93
+%define kernel_patch 94
 %define buildid .1
 %define specversion %{kernel_major_minor}.%{kernel_patch}
-%define pkgrelease 2%{?buildid}
+%define pkgrelease 1%{?buildid}
 %define kversion %{lua:print((rpm.expand("%{kernel_major_minor}"):match("^(%d+)")))}
 
 %define tarfile_release %{specversion}-%{pkgrelease}.el%{el_version}
@@ -4212,18 +4212,16 @@ fi\
 #
 #
 %changelog
-* Wed Jun 10 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.12.93-2.1.el9
--- arm64: errata: Mitigate TLBI errata on Microsoft Azure Cobalt 100 CPU (Brett Mastbergen)
--- arm64: errata: Mitigate TLBI errata on NVIDIA Olympus CPU (Brett Mastbergen)
--- arm64: cputype: Add NVIDIA Olympus definitions (Brett Mastbergen)
--- arm64: errata: Mitigate TLBI errata on various Arm CPUs (Brett Mastbergen)
--- arm64: cputype: Add C1-Premium definitions (Brett Mastbergen)
--- arm64: cputype: Add C1-Ultra definitions (Brett Mastbergen)
--- arm64: cputype: Add C1-Pro definitions (Brett Mastbergen)
--- arm64: cputype: Add Cortex-A720AE definitions (Brett Mastbergen)
-
-* Tue Jun 09 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.12.93-1.1.el9
--- Rebased changes for Linux 6.12.93 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.12.93-1)
+* Fri Jun 26 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.12.94-1.1.el9
+-- Rebased changes for Linux 6.12.94 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.12.94-1)
+-- [CIQ] v6.12.94 - rebased configs (Brett Mastbergen)
+-- github-actions: extend trigger glob to match suffix branches (Shreeya Patel)
+-- spec: make modules Provides variant-specific for debug builds (Brett Mastbergen)
+-- migrate: drop shims for packages the CLK kernel doesn't build (Brett Mastbergen)
+-- migrate: use Obsoletes for dnf upgrade discovery, drop Provides and rich deps (Brett Mastbergen)
+-- Add migration spec for kernel -> kernel-clk6.12 namespace transition (Brett Mastbergen)
+-- [CIQ] ciq_kernel-6.12.93-2 - updated spec (Brett Mastbergen)
+-- [CIQ] v6.12.93 - updated spec (github-actions[bot])
 -- kernel-clk6.12: require ciq-kmod and ship %clk_version macro file (Joseph S. Tate)
 -- [CIQ] v6.12.92 - updated spec (github-actions[bot])
 -- [CIQ] ciq_kernel-6.12.89-2 - updated spec (Brett Mastbergen)
@@ -4288,7 +4286,7 @@ fi\
 -- arm64: add kernel config option to lock down when in Secure Boot mode (Linn Crosetto)
 -- github actions: Make Builds on Merge Request Work (Jonathan Maple)
 -- Add CIQ configs (Jonathan Maple)
--- Linux 6.12.93 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.12.93)
+-- Linux 6.12.94 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.12.94)
 
 
 ###
