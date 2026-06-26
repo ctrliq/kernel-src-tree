@@ -168,10 +168,10 @@ Summary: The Linux kernel
 %define debugbuildsenabled 1
 %define el_version 9
 %define kernel_major_minor 6.18
-%define kernel_patch 35
+%define kernel_patch 36
 %define buildid .1
 %define specversion %{kernel_major_minor}.%{kernel_patch}
-%define pkgrelease 3%{?buildid}
+%define pkgrelease 1%{?buildid}
 %define kversion %{lua:print((rpm.expand("%{kernel_major_minor}"):match("^(%d+)")))}
 
 %define tarfile_release %{specversion}-%{pkgrelease}.el%{el_version}
@@ -4505,7 +4505,10 @@ fi\
 #
 #
 %changelog
-* Tue Jun 23 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.35-3.1.el9
+* Fri Jun 26 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.36-1.1.el9
+-- Rebased changes for Linux 6.18.36 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.36-1)
+-- [CIQ] v6.18.36 - rebased configs (Brett Mastbergen)
+-- [CIQ] ciq_kernel-6.18.35-3 - updated spec (Brett Mastbergen)
 -- Revert "mm/gup: reintroduce pin_user_pages_fast_only()" (Sultan Alsawaf)
 -- crypto: rng - Fix spurious EFAULT when the destination PTE is zapped (Sultan Alsawaf)
 -- crypto: rng - Skip leading zero-length iovec segments (Sultan Alsawaf)
@@ -4515,16 +4518,8 @@ fi\
 -- random: Restrict extrng registration to init time (Sultan Alsawaf)
 -- crypto: Kconfig - Make CRYPTO_FIPS depend on the DRBG being built-in (Sultan Alsawaf)
 -- github-actions: extend trigger glob to match suffix branches (Shreeya Patel)
-
-* Wed Jun 10 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.35-2.1.el9
--- arm64: errata: Mitigate TLBI errata on Microsoft Azure Cobalt 100 CPU (Brett Mastbergen)
--- arm64: errata: Mitigate TLBI errata on NVIDIA Olympus CPU (Brett Mastbergen)
--- arm64: errata: Mitigate TLBI errata on various Arm CPUs (Brett Mastbergen)
--- arm64: cputype: Add C1-Premium definitions (Brett Mastbergen)
--- arm64: cputype: Add C1-Ultra definitions (Brett Mastbergen)
-
-* Tue Jun 09 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.18.35-1.1.el9
--- Rebased changes for Linux 6.18.35 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.35-1)
+-- [CIQ] ciq_kernel-6.18.35-2 - updated spec (Brett Mastbergen)
+-- [CIQ] v6.18.35 - updated spec (github-actions[bot])
 -- Restore CRYPTO_TFM_FIPS_COMPLIANCE flag as an indicator to differentiate between internal and external IV generation when AES-GCM encryption is performed. (Jeremy Allison)
 -- github actions: Add FIPS protected directory check for PRs (Brett Mastbergen)
 -- Unset CRYPTO_JITTERENTROPY_MEMSIZE_2, set CRYPTO_JITTERENTROPY_MEMSIZE_128. (Jeremy Allison)
@@ -4613,7 +4608,7 @@ fi\
 -- github actions: Make Builds on Merge Request Work (Jonathan Maple)
 -- Add initial CIQ config tweaks (Brett Mastbergen)
 -- Add CIQ configs (Brett Mastbergen)
--- Linux 6.18.35 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.18.35)
+-- Linux 6.18.36 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.18.36)
 
 
 ###
