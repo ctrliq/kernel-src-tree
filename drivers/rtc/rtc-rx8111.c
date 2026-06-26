@@ -300,7 +300,8 @@ static const struct rtc_class_ops rx8111_rtc_ops = {
 	.ioctl = rx8111_ioctl,
 };
 
-static int rx8111_probe(struct i2c_client *client)
+static int rx8111_probe(struct i2c_client *client,
+			const struct i2c_device_id *id)
 {
 	struct rx8111_data *data;
 	struct rtc_device *rtc;
