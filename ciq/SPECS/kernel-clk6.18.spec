@@ -1720,13 +1720,21 @@ Provides: installonlypkg(kernel)\
 Provides: %{name}-uname-r = %{KVERREL}%{uname_suffix %{?1}}\
 Requires: %{name}%{?1:-%{1}}-modules-core-uname-r = %{KVERREL}%{uname_suffix %{?1}}\
 Requires(pre): %{kernel_prereq}\
+%if 0%{?rhel}\
+Requires(pre): systemd >= 252-31\
+%else\
 Requires(pre): systemd >= 254-1\
+%endif\
 Recommends: uki-direct\
 %package %{?1:%{1}-}uki-virt-addons\
 Summary: %{variant_summary} unified kernel image addons for virtual machines\
 Provides: installonlypkg(kernel)\
 Requires: %{name}%{?1:-%{1}}-uki-virt = %{specversion}-%{release}\
+%if 0%{?rhel}\
+Requires(pre): systemd >= 252-31\
+%else\
 Requires(pre): systemd >= 254-1\
+%endif\
 %endif\
 %if %{with_gcov}\
 %{expand:%%kernel_gcov_package %{?1:%{1}}}\
