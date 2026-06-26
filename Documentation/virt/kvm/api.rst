@@ -7867,7 +7867,7 @@ where 0xff represents CPUs 0-7 in cluster 0.
 :Architectures: s390
 :Parameters: none
 
-With this capability enabled, all illegal instructions 0x0000 (2 bytes) will
+With this capability enabled, the illegal instruction 0x0000 (2 bytes) will
 be intercepted and forwarded to user space. User space can use this
 mechanism e.g. to realize 2-byte software breakpoints. The kernel will
 not inject an operating exception for these instructions, user space has
@@ -8751,6 +8751,21 @@ When this capability is enabled, KVM may exit to userspace for SEAs taken to
 EL2 resulting from a guest access. See ``KVM_EXIT_ARM_SEA`` for more
 information.
 
+7.46 KVM_CAP_S390_USER_OPEREXEC
+-------------------------------
+
+:Architectures: s390
+:Parameters: none
+
+When this capability is enabled KVM forwards all operation exceptions
+that it doesn't handle itself to user space. This also includes the
+0x0000 instructions managed by KVM_CAP_S390_USER_INSTR0. This is
+helpful if user space wants to emulate instructions which are not
+(yet) implemented in hardware.
+
+This capability can be enabled dynamically even if VCPUs were already
+created and are running.
+
 8. Other capabilities.
 ======================
 
@@ -9276,6 +9291,14 @@ vCPU was executing nested guest code when it exited.
 KVM exits with the register state of either the L1 or L2 guest
 depending on which executed at the time of an exit. Userspace must
 take care to differentiate between these cases.
+
+8.47 KVM_CAP_S390_VSIE_ESAMODE
+------------------------------
+
+:Architectures: s390
+
+The presence of this capability indicates that the nested KVM guest can
+start in ESA mode.
 
 9. Known KVM API problems
 =========================
