@@ -771,6 +771,8 @@ int ceph_atomic_open(struct inode *dir, struct dentry *dentry,
 	bool try_async = ceph_test_mount_opt(fsc, ASYNC_DIROPS);
 	int mask;
 	int err;
+	struct ceph_path_info path_info = {};
+	char *path;
 
 	dout("atomic_open %p dentry %p '%pd' %s flags %d mode 0%o\n",
 	     dir, dentry, dentry,
@@ -787,6 +789,34 @@ int ceph_atomic_open(struct inode *dir, struct dentry *dentry,
 	 * permission check. The caller will do the truncation afterward.
 	 */
 	flags &= ~O_TRUNC;
+
+	dn = d_find_alias(dir);
+	if (!dn) {
+		try_async = false;
+	} else {
+		path = ceph_mdsc_build_path(dn, &path_info, 0);
+		if (IS_ERR(path)) {
+			try_async = false;
+			err = 0;
+		} else {
+			int fmode = ceph_flags_to_mode(flags);
+
+			mask = MAY_READ;
+			if (fmode & CEPH_FILE_MODE_WR)
+				mask |= MAY_WRITE;
+			err = ceph_mds_check_access(mdsc, path, mask);
+		}
+		ceph_mdsc_free_path_info(&path_info);
+		dput(dn);
+
+		/* For none EACCES cases will let the MDS do the mds auth check */
+		if (err == -EACCES) {
+			return err;
+		} else if (err < 0) {
+			try_async = false;
+			err = 0;
+		}
+	}
 
 retry:
 	if (flags & O_CREAT) {
