@@ -1468,6 +1468,7 @@ static void mhi_pci_remove(struct pci_dev *pdev)
 	struct mhi_pci_device *mhi_pdev = pci_get_drvdata(pdev);
 	struct mhi_controller *mhi_cntrl = &mhi_pdev->mhi_cntrl;
 
+	pm_runtime_forbid(&pdev->dev);
 	pci_disable_sriov(pdev);
 
 	if (pdev->is_physfn)
