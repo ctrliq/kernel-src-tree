@@ -602,7 +602,9 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 	case KVM_CAP_S390_VCPU_RESETS:
 	case KVM_CAP_SET_GUEST_DEBUG:
 	case KVM_CAP_S390_DIAG318:
+	case KVM_CAP_S390_VSIE_ESAMODE:
 	case KVM_CAP_IRQFD_RESAMPLE:
+	case KVM_CAP_S390_USER_OPEREXEC:
 		r = 1;
 		break;
 	case KVM_CAP_SET_GUEST_DEBUG2:
@@ -913,6 +915,17 @@ int kvm_vm_ioctl_enable_cap(struct kvm *kvm, struct kvm_enable_cap *cap)
 		mutex_unlock(&kvm->lock);
 		VM_EVENT(kvm, 3, "ENABLE: CAP_S390_CPU_TOPOLOGY %s",
 			 r ? "(not available)" : "(success)");
+		break;
+	case KVM_CAP_S390_VSIE_ESAMODE:
+		VM_EVENT(kvm, 3, "%s", "ENABLE: CAP_S390_VSIE_ESAMODE");
+		kvm->arch.allow_vsie_esamode = 1;
+		r = 0;
+		break;
+	case KVM_CAP_S390_USER_OPEREXEC:
+		VM_EVENT(kvm, 3, "%s", "ENABLE: CAP_S390_USER_OPEREXEC");
+		kvm->arch.user_operexec = 1;
+		icpt_operexc_on_all_vcpus(kvm);
+		r = 0;
 		break;
 	default:
 		r = -EINVAL;
