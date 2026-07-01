@@ -4874,27 +4874,11 @@ unsigned long get_zeroed_page_noprof(gfp_t gfp_mask)
 }
 EXPORT_SYMBOL(get_zeroed_page_noprof);
 
-static void ___free_pages(struct page *page, unsigned int order,
-			  fpi_t fpi_flags)
-{
-	/* get PageHead before we drop reference */
-	int head = PageHead(page);
-	struct alloc_tag *tag = pgalloc_tag_get(page);
-
-	if (put_page_testzero(page))
-		__free_unref_page(page, order, fpi_flags);
-	else if (!head) {
-		pgalloc_tag_sub_pages(tag, (1 << order) - 1);
-		while (order-- > 0)
-			__free_unref_page(page + (1 << order), order,
-					fpi_flags);
-	}
-}
-
 /**
- * __free_pages - Free pages allocated with alloc_pages().
+ * ___free_pages - Free pages allocated with alloc_pages().
  * @page: The page pointer returned from alloc_pages().
  * @order: The order of the allocation.
+ * @fpi_flags: Free Page Internal flags.
  *
  * This function can free multi-page allocations that are not compound
  * pages.  It does not check that the @order passed in matches that of
@@ -4911,6 +4895,22 @@ static void ___free_pages(struct page *page, unsigned int order,
  * Context: May be called in interrupt context or while holding a normal
  * spinlock, but not in NMI context or while holding a raw spinlock.
  */
+static void ___free_pages(struct page *page, unsigned int order,
+			  fpi_t fpi_flags)
+{
+	/* get PageHead before we drop reference */
+	int head = PageHead(page);
+	struct alloc_tag *tag = pgalloc_tag_get(page);
+
+	if (put_page_testzero(page))
+		__free_unref_page(page, order, fpi_flags);
+	else if (!head) {
+		pgalloc_tag_sub_pages(tag, (1 << order) - 1);
+		while (order-- > 0)
+			__free_unref_page(page + (1 << order), order,
+					fpi_flags);
+	}
+}
 void __free_pages(struct page *page, unsigned int order)
 {
 	___free_pages(page, order, FPI_NONE);
