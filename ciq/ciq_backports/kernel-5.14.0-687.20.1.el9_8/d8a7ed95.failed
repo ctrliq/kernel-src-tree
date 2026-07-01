@@ -1,0 +1,189 @@
+net/mlx5e: SHAMPO, Fix header formulas for higher MTUs and 64K pages
+
+jira KERNEL-1233
+Rebuild_History Non-Buildable kernel-5.14.0-687.20.1.el9_8
+commit-author Dragos Tatulea <dtatulea@nvidia.com>
+commit d8a7ed9586c7579a99e9e2d90988c9eceeee61ff
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.20.1.el9_8/d8a7ed95.failed
+
+The MLX5E_SHAMPO_WQ_HEADER_PER_PAGE and
+MLX5E_SHAMPO_LOG_MAX_HEADER_ENTRY_SIZE macros are used directly in
+several places under the assumption that there will always be more
+headers per WQE than headers per page. However, this assumption doesn't
+hold for 64K page sizes and higher MTUs (> 4K). This can be first
+observed during header page allocation: ksm_entries will become 0 during
+alignment to MLX5E_SHAMPO_WQ_HEADER_PER_PAGE.
+
+This patch introduces 2 additional members to the mlx5e_shampo_hd struct
+which are meant to be used instead of the macrose mentioned above.
+When the number of headers per WQE goes below
+MLX5E_SHAMPO_WQ_HEADER_PER_PAGE, clamp the number of headers per
+page and expand the header size accordingly so that the headers
+for one WQE cover a full page.
+
+All the formulas are adapted to use these two new members.
+
+Fixes: 945ca432bfd0 ("net/mlx5e: SHAMPO, Drop info array")
+	Signed-off-by: Dragos Tatulea <dtatulea@nvidia.com>
+	Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+	Reviewed-by: Simon Horman <horms@kernel.org>
+Link: https://patch.msgid.link/1762238915-1027590-4-git-send-email-tariqt@nvidia.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit d8a7ed9586c7579a99e9e2d90988c9eceeee61ff)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index 4ca8a3f60edb,687cf123211d..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -678,25 -682,24 +681,36 @@@ static int mlx5e_build_shampo_hd_umr(st
+  	umr_wqe = mlx5_wq_cyc_get_wqe(&sq->wq, pi);
+  	build_ksm_umr(sq, umr_wqe, shampo->mkey_be, index, ksm_entries);
+  
+ -	for (i = 0; i < ksm_entries; i++, index++) {
+ -		struct mlx5e_frag_page *frag_page;
+ +	WARN_ON_ONCE(ksm_entries & (MLX5E_SHAMPO_WQ_HEADER_PER_PAGE - 1));
+ +	while (i < ksm_entries) {
+ +		struct mlx5e_frag_page *frag_page = mlx5e_shampo_hd_to_frag_page(rq, index);
+  		u64 addr;
+  
+++<<<<<<< HEAD
+ +		err = mlx5e_page_alloc_fragmented(rq->hd_page_pool, frag_page);
+ +		if (unlikely(err))
+ +			goto err_unmap;
+++=======
++ 		frag_page = mlx5e_shampo_hd_to_frag_page(rq, index);
++ 		header_offset = mlx5e_shampo_hd_offset(rq, index);
++ 		if (!header_offset) {
++ 			err = mlx5e_page_alloc_fragmented(rq->hd_page_pool,
++ 							  frag_page);
++ 			if (err)
++ 				goto err_unmap;
++ 		}
+++>>>>>>> d8a7ed9586c7 (net/mlx5e: SHAMPO, Fix header formulas for higher MTUs and 64K pages)
+  
+ -		addr = page_pool_get_dma_addr_netmem(frag_page->netmem);
+ -		umr_wqe->inline_ksms[i] = (struct mlx5_ksm) {
+ -			.key = cpu_to_be32(lkey),
+ -			.va  = cpu_to_be64(addr + header_offset + headroom),
+ -		};
+ +		addr = page_pool_get_dma_addr(frag_page->page);
+ +
+ +		for (int j = 0; j < MLX5E_SHAMPO_WQ_HEADER_PER_PAGE; j++) {
+ +			header_offset = mlx5e_shampo_hd_offset(index++);
+ +
+ +			umr_wqe->inline_ksms[i++] = (struct mlx5_ksm) {
+ +				.key = cpu_to_be32(lkey),
+ +				.va  = cpu_to_be64(addr + header_offset + headroom),
+ +			};
+ +		}
+  	}
+  
+  	sq->db.wqe_info[pi] = (struct mlx5e_icosq_wqe_info) {
+@@@ -712,9 -715,9 +726,9 @@@
+  	return 0;
+  
+  err_unmap:
+ -	while (--i >= 0) {
+ +	while (--i) {
+  		--index;
+- 		header_offset = mlx5e_shampo_hd_offset(index);
++ 		header_offset = mlx5e_shampo_hd_offset(rq, index);
+  		if (!header_offset) {
+  			struct mlx5e_frag_page *frag_page = mlx5e_shampo_hd_to_frag_page(rq, index);
+  
+@@@ -1219,9 -1226,10 +1233,14 @@@ static unsigned int mlx5e_lro_update_hd
+  static void *mlx5e_shampo_get_packet_hd(struct mlx5e_rq *rq, u16 header_index)
+  {
+  	struct mlx5e_frag_page *frag_page = mlx5e_shampo_hd_to_frag_page(rq, header_index);
+- 	u16 head_offset = mlx5e_shampo_hd_offset(header_index) + rq->buff.headroom;
++ 	u16 head_offset = mlx5e_shampo_hd_offset(rq, header_index);
++ 	void *addr = netmem_address(frag_page->netmem);
+  
+++<<<<<<< HEAD
+ +	return page_address(frag_page->page) + head_offset;
+++=======
++ 	return addr + head_offset + rq->buff.headroom;
+++>>>>>>> d8a7ed9586c7 (net/mlx5e: SHAMPO, Fix header formulas for higher MTUs and 64K pages)
+  }
+  
+  static void mlx5e_shampo_update_ipv4_udp_hdr(struct mlx5e_rq *rq, struct iphdr *ipv4)
+@@@ -2238,9 -2269,8 +2257,14 @@@ mlx5e_skb_from_cqe_shampo(struct mlx5e_
+  			  struct mlx5_cqe64 *cqe, u16 header_index)
+  {
+  	struct mlx5e_frag_page *frag_page = mlx5e_shampo_hd_to_frag_page(rq, header_index);
+++<<<<<<< HEAD
+ +	dma_addr_t page_dma_addr = page_pool_get_dma_addr(frag_page->page);
+ +	u16 head_offset = mlx5e_shampo_hd_offset(header_index);
+ +	dma_addr_t dma_addr = page_dma_addr + head_offset;
+++=======
++ 	u16 head_offset = mlx5e_shampo_hd_offset(rq, header_index);
++ 	struct mlx5e_shampo_hd *shampo = rq->mpwqe.shampo;
+++>>>>>>> d8a7ed9586c7 (net/mlx5e: SHAMPO, Fix header formulas for higher MTUs and 64K pages)
+  	u16 head_size = cqe->shampo.header_size;
+  	u16 rx_headroom = rq->buff.headroom;
+  	struct sk_buff *skb = NULL;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 27abcee31cd8..4a161ba99dba 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -634,7 +634,10 @@ struct mlx5e_dma_info {
+ struct mlx5e_shampo_hd {
+ 	struct mlx5e_frag_page *pages;
+ 	u32 hd_per_wq;
++	u32 hd_per_page;
+ 	u16 hd_per_wqe;
++	u8 log_hd_per_page;
++	u8 log_hd_entry_size;
+ 	unsigned long *bitmap;
+ 	u16 pi;
+ 	u16 ci;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index b8e20829fce7..123b08540791 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -794,8 +794,9 @@ static int mlx5_rq_shampo_alloc(struct mlx5_core_dev *mdev,
+ 				int node)
+ {
+ 	void *wqc = MLX5_ADDR_OF(rqc, rqp->rqc, wq);
++	u8 log_hd_per_page, log_hd_entry_size;
++	u16 hd_per_wq, hd_per_wqe;
+ 	u32 hd_pool_size;
+-	u16 hd_per_wq;
+ 	int wq_size;
+ 	int err;
+ 
+@@ -818,11 +819,24 @@ static int mlx5_rq_shampo_alloc(struct mlx5_core_dev *mdev,
+ 	if (err)
+ 		goto err_umr_mkey;
+ 
+-	rq->mpwqe.shampo->hd_per_wqe =
+-		mlx5e_shampo_hd_per_wqe(mdev, params, rqp);
++	hd_per_wqe = mlx5e_shampo_hd_per_wqe(mdev, params, rqp);
+ 	wq_size = BIT(MLX5_GET(wq, wqc, log_wq_sz));
+-	hd_pool_size = (rq->mpwqe.shampo->hd_per_wqe * wq_size) /
+-		MLX5E_SHAMPO_WQ_HEADER_PER_PAGE;
++
++	BUILD_BUG_ON(MLX5E_SHAMPO_LOG_MAX_HEADER_ENTRY_SIZE > PAGE_SHIFT);
++	if (hd_per_wqe >= MLX5E_SHAMPO_WQ_HEADER_PER_PAGE) {
++		log_hd_per_page = MLX5E_SHAMPO_LOG_WQ_HEADER_PER_PAGE;
++		log_hd_entry_size = MLX5E_SHAMPO_LOG_MAX_HEADER_ENTRY_SIZE;
++	} else {
++		log_hd_per_page = order_base_2(hd_per_wqe);
++		log_hd_entry_size = order_base_2(PAGE_SIZE / hd_per_wqe);
++	}
++
++	rq->mpwqe.shampo->hd_per_wqe = hd_per_wqe;
++	rq->mpwqe.shampo->hd_per_page = BIT(log_hd_per_page);
++	rq->mpwqe.shampo->log_hd_per_page = log_hd_per_page;
++	rq->mpwqe.shampo->log_hd_entry_size = log_hd_entry_size;
++
++	hd_pool_size = (hd_per_wqe * wq_size) >> log_hd_per_page;
+ 
+ 	if (mlx5_rq_needs_separate_hd_pool(rq)) {
+ 		/* Separate page pool for shampo headers */
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
