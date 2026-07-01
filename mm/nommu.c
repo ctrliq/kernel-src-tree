@@ -44,15 +44,11 @@
 
 void *high_memory;
 EXPORT_SYMBOL(high_memory);
-struct page *mem_map;
-unsigned long max_mapnr;
-EXPORT_SYMBOL(max_mapnr);
 unsigned long highest_memmap_pfn;
 int heap_stack_gap = 0;
 
 atomic_long_t mmap_pages_allocated;
 
-EXPORT_SYMBOL(mem_map);
 
 /* list of mapped, potentially shareable regions */
 static struct kmem_cache *vm_region_jar;
