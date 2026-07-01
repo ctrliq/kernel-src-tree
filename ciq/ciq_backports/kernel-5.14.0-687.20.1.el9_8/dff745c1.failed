@@ -1,0 +1,151 @@
+fs: move cleanup from init_file() into its callers
+
+jira KERNEL-1233
+Rebuild_History Non-Buildable kernel-5.14.0-687.20.1.el9_8
+commit-author Amir Goldstein <amir73il@gmail.com>
+commit dff745c1221a402b4921d54f292288373cff500c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.20.1.el9_8/dff745c1.failed
+
+The use of file_free_rcu() in init_file() to free the struct that was
+allocated by the caller was hacky and we got what we deserved.
+
+Let init_file() and its callers take care of cleaning up each after
+their own allocated resources on error.
+
+Fixes: 62d53c4a1dfe ("fs: use backing_file container for internal files with "fake" f_path") # mainline only
+Reported-and-tested-by: syzbot+ada42aab05cf51b00e98@syzkaller.appspotmail.com
+	Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+Message-Id: <20230701171134.239409-1-amir73il@gmail.com>
+	Signed-off-by: Christian Brauner <brauner@kernel.org>
+(cherry picked from commit dff745c1221a402b4921d54f292288373cff500c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/file_table.c
+diff --cc fs/file_table.c
+index 845c741dc518,fc7d677ff5ad..000000000000
+--- a/fs/file_table.c
++++ b/fs/file_table.c
+@@@ -143,8 -160,8 +143,13 @@@ static struct file *__alloc_file(int fl
+  	f->f_cred = get_cred(cred);
+  	error = security_file_alloc(f);
+  	if (unlikely(error)) {
+++<<<<<<< HEAD
+ +		file_free_rcu(&f->f_u.fu_rcuhead);
+ +		return ERR_PTR(error);
+++=======
++ 		put_cred(f->f_cred);
++ 		return error;
+++>>>>>>> dff745c1221a (fs: move cleanup from init_file() into its callers)
+  	}
+  
+  	atomic_long_set(&f->f_count, 1);
+@@@ -185,9 -203,17 +190,23 @@@ struct file *alloc_empty_file(int flags
+  			goto over;
+  	}
+  
+++<<<<<<< HEAD
+ +	f = __alloc_file(flags, cred);
+ +	if (!IS_ERR(f))
+ +		percpu_counter_inc(&nr_files);
+++=======
++ 	f = kmem_cache_zalloc(filp_cachep, GFP_KERNEL);
++ 	if (unlikely(!f))
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	error = init_file(f, flags, cred);
++ 	if (unlikely(error)) {
++ 		kmem_cache_free(filp_cachep, f);
++ 		return ERR_PTR(error);
++ 	}
++ 
++ 	percpu_counter_inc(&nr_files);
+++>>>>>>> dff745c1221a (fs: move cleanup from init_file() into its callers)
+  
+  	return f;
+  
+@@@ -207,41 -234,48 +226,73 @@@ over
+   */
+  struct file *alloc_empty_file_noaccount(int flags, const struct cred *cred)
+  {
+ -	struct file *f;
+ -	int error;
+ +	struct file *f = __alloc_file(flags, cred);
+  
+++<<<<<<< HEAD
+ +	if (!IS_ERR(f))
+ +		f->f_mode |= FMODE_NOACCOUNT;
+++=======
++ 	f = kmem_cache_zalloc(filp_cachep, GFP_KERNEL);
++ 	if (unlikely(!f))
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	error = init_file(f, flags, cred);
++ 	if (unlikely(error)) {
++ 		kmem_cache_free(filp_cachep, f);
++ 		return ERR_PTR(error);
++ 	}
++ 
++ 	f->f_mode |= FMODE_NOACCOUNT;
+++>>>>>>> dff745c1221a (fs: move cleanup from init_file() into its callers)
+  
+  	return f;
+  }
+  
+ -/*
+ - * Variant of alloc_empty_file() that allocates a backing_file container
+ - * and doesn't check and modify nr_files.
+ +/**
+ + * file_init_path - initialize a 'struct file' based on path
+   *
+ - * This is only for kernel internal use, and the allocate file must not be
+ - * installed into file tables or such.
+ + * @file: the file to set up
+ + * @path: the (dentry, vfsmount) pair for the new file
+ + * @fop: the 'struct file_operations' for the new file
+   */
+ -struct file *alloc_empty_backing_file(int flags, const struct cred *cred)
+ +static void file_init_path(struct file *file, const struct path *path,
+ +			   const struct file_operations *fop)
+  {
+++<<<<<<< HEAD
+ +	file->f_path = *path;
+ +	file->f_inode = path->dentry->d_inode;
+ +	file->f_mapping = path->dentry->d_inode->i_mapping;
+ +	file->f_wb_err = filemap_sample_wb_err(file->f_mapping);
+ +	file->f_sb_err = file_sample_sb_err(file);
+ +	if (fop->llseek)
+ +		file->f_mode |= FMODE_LSEEK;
+ +	if ((file->f_mode & FMODE_READ) &&
+ +	     likely(fop->read || fop->read_iter))
+ +		file->f_mode |= FMODE_CAN_READ;
+ +	if ((file->f_mode & FMODE_WRITE) &&
+ +	     likely(fop->write || fop->write_iter))
+ +		file->f_mode |= FMODE_CAN_WRITE;
+ +	file->f_mode |= FMODE_OPENED;
+ +	file->f_op = fop;
+ +	if ((file->f_mode & (FMODE_READ | FMODE_WRITE)) == FMODE_READ)
+ +		i_readcount_inc(path->dentry->d_inode);
+++=======
++ 	struct backing_file *ff;
++ 	int error;
++ 
++ 	ff = kzalloc(sizeof(struct backing_file), GFP_KERNEL);
++ 	if (unlikely(!ff))
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	error = init_file(&ff->file, flags, cred);
++ 	if (unlikely(error)) {
++ 		kfree(ff);
++ 		return ERR_PTR(error);
++ 	}
++ 
++ 	ff->file.f_mode |= FMODE_BACKING | FMODE_NOACCOUNT;
++ 	return &ff->file;
+++>>>>>>> dff745c1221a (fs: move cleanup from init_file() into its callers)
+  }
+  
+  /**
+* Unmerged path fs/file_table.c
