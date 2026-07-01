@@ -1,0 +1,123 @@
+net/mlx5e: Prepare for using multiple TX doorbells
+
+jira KERNEL-1233
+Rebuild_History Non-Buildable kernel-5.14.0-687.20.1.el9_8
+commit-author Cosmin Ratiu <cratiu@nvidia.com>
+commit 673d7ab7563e1268ac4ca62914b2b99d16219500
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.20.1.el9_8/673d7ab7.failed
+
+The driver allocates a single doorbell per device and uses
+it for all Send Queues (SQs). This can become a bottleneck due to the
+high number of concurrent MMIO accesses when ringing the same doorbell
+from many channels.
+
+This patch makes the doorbells used by channel queues configurable.
+
+mlx5e_channel_pick_doorbell() is added to select the doorbell to be used
+for a given channel, picking the default for now.
+
+When opening a channel, the selected doorbell is saved to the channel
+struct and used whenever channel-related queues are created.
+
+Finally, 'uar_page' is added to 'struct mlx5e_create_sq_param' to
+control which doorbell to use when allocating an SQ, since that can
+happen outside channel context (e.g. for PTP).
+
+	Signed-off-by: Cosmin Ratiu <cratiu@nvidia.com>
+	Reviewed-by: Dragos Tatulea <dtatulea@nvidia.com>
+	Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+	Reviewed-by: Simon Horman <horms@kernel.org>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 673d7ab7563e1268ac4ca62914b2b99d16219500)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index f90573357c93,c1491ed3db1c..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -2781,8 -2806,10 +2789,15 @@@ static int mlx5e_open_channel(struct ml
+  	c->aff_mask = irq_get_effective_affinity_mask(irq);
+  	c->lag_port = mlx5e_enumerate_lag_port(mdev, ix);
+  
+++<<<<<<< HEAD
+ +	netif_napi_add_config(netdev, &c->napi, mlx5e_napi_poll, ix);
+ +	netif_napi_set_irq(&c->napi, irq);
+++=======
++ 	mlx5e_channel_pick_doorbell(c);
++ 
++ 	netif_napi_add_config_locked(netdev, &c->napi, mlx5e_napi_poll, ix);
++ 	netif_napi_set_irq_locked(&c->napi, irq);
+++>>>>>>> 673d7ab7563e (net/mlx5e: Prepare for using multiple TX doorbells)
+  
+  	err = mlx5e_open_queues(c, params, cparam);
+  	if (unlikely(err))
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 3f306757b9e3..033c52238ed3 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -788,6 +788,7 @@ struct mlx5e_channel {
+ 	int                        vec_ix;
+ 	int                        sd_ix;
+ 	int                        cpu;
++	struct mlx5_sq_bfreg      *bfreg;
+ 	/* Sync between icosq recovery and XSK enable/disable. */
+ 	struct mutex               icosq_recovery_lock;
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/params.h b/drivers/net/ethernet/mellanox/mlx5/core/en/params.h
+index e3edf79dde5f..00617c65fe3c 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/params.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/params.h
+@@ -51,6 +51,7 @@ struct mlx5e_create_sq_param {
+ 	u32                         tisn;
+ 	u8                          tis_lst_sz;
+ 	u8                          min_inline_mode;
++	u32                         uar_page;
+ };
+ 
+ /* Striding RQ dynamic parameters */
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c b/drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c
+index 3729a41dc558..1cc962232ea8 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/ptp.c
+@@ -333,7 +333,7 @@ static int mlx5e_ptp_alloc_txqsq(struct mlx5e_ptp *c, int txq_ix,
+ 	sq->mdev      = mdev;
+ 	sq->ch_ix     = MLX5E_PTP_CHANNEL_IX;
+ 	sq->txq_ix    = txq_ix;
+-	sq->uar_map   = mdev->priv.bfreg.map;
++	sq->uar_map   = c->bfreg->map;
+ 	sq->min_inline_mode = params->tx_min_inline_mode;
+ 	sq->hw_mtu    = MLX5E_SW2HW_MTU(params, params->sw_mtu);
+ 	sq->stats     = &c->priv->ptp_stats.sq[tc];
+@@ -471,6 +471,7 @@ static int mlx5e_ptp_open_txqsq(struct mlx5e_ptp *c, u32 tisn,
+ 	csp.wq_ctrl         = &txqsq->wq_ctrl;
+ 	csp.min_inline_mode = txqsq->min_inline_mode;
+ 	csp.ts_cqe_to_dest_cqn = ptpsq->ts_cq.mcq.cqn;
++	csp.uar_page = c->bfreg->index;
+ 
+ 	err = mlx5e_create_sq_rdy(c->mdev, sqp, &csp, 0, &txqsq->sqn);
+ 	if (err)
+@@ -885,6 +886,7 @@ int mlx5e_ptp_open(struct mlx5e_priv *priv, struct mlx5e_params *params,
+ 	c->num_tc   = mlx5e_get_dcb_num_tc(params);
+ 	c->stats    = &priv->ptp_stats.ch;
+ 	c->lag_port = lag_port;
++	c->bfreg    = &mdev->priv.bfreg;
+ 
+ 	err = mlx5e_ptp_set_state(c, params);
+ 	if (err)
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/ptp.h b/drivers/net/ethernet/mellanox/mlx5/core/en/ptp.h
+index 883c044852f1..1b3c9648220b 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/ptp.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/ptp.h
+@@ -66,6 +66,7 @@ struct mlx5e_ptp {
+ 	struct mlx5_core_dev      *mdev;
+ 	struct hwtstamp_config    *tstamp;
+ 	DECLARE_BITMAP(state, MLX5E_PTP_STATE_NUM_STATES);
++	struct mlx5_sq_bfreg      *bfreg;
+ };
+ 
+ static inline bool mlx5e_use_ptpsq(struct sk_buff *skb)
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
