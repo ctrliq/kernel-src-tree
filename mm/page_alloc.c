@@ -3479,7 +3479,6 @@ try_this_zone:
 				gfp_mask, alloc_flags, ac->migratetype);
 		if (page) {
 			prep_new_page(page, order, gfp_mask, alloc_flags);
-			set_page_refcounted(page);
 
 			/*
 			 * If this is a high-order atomic allocation then check
@@ -3574,6 +3573,8 @@ __alloc_pages_cpuset_fallback(gfp_t gfp_mask, unsigned int order,
 		page = get_page_from_freelist(gfp_mask, order,
 				alloc_flags, ac);
 
+	if (page)
+		set_page_refcounted(page);
 	return page;
 }
 
@@ -3612,8 +3613,10 @@ __alloc_pages_may_oom(gfp_t gfp_mask, unsigned int order,
 	page = get_page_from_freelist((gfp_mask | __GFP_HARDWALL) &
 				      ~__GFP_DIRECT_RECLAIM, order,
 				      ALLOC_WMARK_HIGH|ALLOC_CPUSET, ac);
-	if (page)
+	if (page) {
+		set_page_refcounted(page);
 		goto out;
+	}
 
 	/* Coredumps can quickly deplete all memory reserves */
 	if (current->flags & PF_DUMPCORE)
@@ -3704,10 +3707,8 @@ __alloc_pages_direct_compact(gfp_t gfp_mask, unsigned int order,
 	count_vm_event(COMPACTSTALL);
 
 	/* Prep a captured page if available */
-	if (page) {
+	if (page)
 		prep_new_page(page, order, gfp_mask, alloc_flags);
-		set_page_refcounted(page);
-	}
 
 	/* Try get a page from the freelist if available */
 	if (!page)
@@ -3716,6 +3717,7 @@ __alloc_pages_direct_compact(gfp_t gfp_mask, unsigned int order,
 	if (page) {
 		struct zone *zone = page_zone(page);
 
+		set_page_refcounted(page);
 		zone->compact_blockskip_flush = false;
 		compaction_defer_reset(zone, order, true);
 		count_vm_event(COMPACTSUCCESS);
@@ -3974,6 +3976,7 @@ retry:
 		drained = true;
 		goto retry;
 	}
+	set_page_refcounted(page);
 out:
 	psi_memstall_leave(&pflags);
 
@@ -4294,8 +4297,10 @@ restart:
 	 * that first
 	 */
 	page = get_page_from_freelist(gfp_mask, order, alloc_flags, ac);
-	if (page)
+	if (page) {
+		set_page_refcounted(page);
 		goto got_pg;
+	}
 
 	/*
 	 * For costly allocations, try direct compaction first, as it's likely
@@ -4375,8 +4380,10 @@ retry:
 
 	/* Attempt with potentially adjusted zonelist and alloc_flags */
 	page = get_page_from_freelist(gfp_mask, order, alloc_flags, ac);
-	if (page)
+	if (page) {
+		set_page_refcounted(page);
 		goto got_pg;
+	}
 
 	/* Caller is not willing to reclaim, we can't balance anything */
 	if (!can_direct_reclaim)
@@ -4765,8 +4772,10 @@ struct page *__alloc_pages_noprof(gfp_t gfp, unsigned int order,
 
 	/* First allocation attempt */
 	page = get_page_from_freelist(alloc_gfp, order, alloc_flags, &ac);
-	if (likely(page))
+	if (likely(page)) {
+		set_page_refcounted(page);
 		goto out;
+	}
 
 	alloc_gfp = gfp;
 	ac.spread_dirty_pages = false;
