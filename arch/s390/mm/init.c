@@ -159,7 +159,6 @@ void __init arch_mm_preinit(void)
 	cpumask_set_cpu(0, mm_cpumask(&init_mm));
 
 	pv_init();
-	kfence_split_mapping();
 
 	setup_zero_pages();	/* Setup zeroed pages. */
 }
