@@ -377,7 +377,7 @@ struct mlx5e_sq_dma {
 	enum mlx5e_dma_map_type type;
 };
 
-/* Keep this enum consistent with with the corresponding strings array
+/* Keep this enum consistent with the corresponding strings array
  * declared in en/reporter_tx.c
  */
 enum {
@@ -634,7 +634,10 @@ struct mlx5e_dma_info {
 struct mlx5e_shampo_hd {
 	struct mlx5e_frag_page *pages;
 	u32 hd_per_wq;
+	u32 hd_per_page;
 	u16 hd_per_wqe;
+	u8 log_hd_per_page;
+	u8 log_hd_entry_size;
 	unsigned long *bitmap;
 	u16 pi;
 	u16 ci;
@@ -789,6 +792,7 @@ struct mlx5e_channel {
 	int                        vec_ix;
 	int                        sd_ix;
 	int                        cpu;
+	struct mlx5_sq_bfreg      *bfreg;
 	/* Sync between icosq recovery and XSK enable/disable. */
 	struct mutex               icosq_recovery_lock;
 

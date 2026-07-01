@@ -298,9 +298,9 @@ static int krb5enc_dispatch_decrypt_hash(struct aead_request *req,
 	return krb5enc_verify_hash(req);
 }
 
-static void krb5enc_decrypt_done(void *data, int err)
+static void krb5enc_decrypt_done(struct crypto_async_request *areq, int err)
 {
-	struct aead_request *req = data;
+	struct aead_request *req = areq->data;
 
 	if (err)
 		goto out;

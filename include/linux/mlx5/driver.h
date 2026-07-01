@@ -36,6 +36,7 @@
 #include <linux/kernel.h>
 #include <linux/completion.h>
 #include <linux/pci.h>
+#include <linux/pci-tph.h>
 #include <linux/irq.h>
 #include <linux/spinlock_types.h>
 #include <linux/semaphore.h>
@@ -663,6 +664,8 @@ struct mlx5e_resources {
 		u32                        pdn;
 		struct mlx5_td             td;
 		u32			   mkey;
+		struct mlx5_sq_bfreg      *bfregs;
+		unsigned int               num_bfregs;
 #define MLX5_MAX_NUM_TC 8
 		u32                        tisn[MLX5_MAX_PORTS][MLX5_MAX_NUM_TC];
 		bool			   tisn_valid;
@@ -695,7 +698,7 @@ struct mlx5_fw_tracer;
 struct mlx5_vxlan;
 struct mlx5_geneve;
 struct mlx5_hv_vhca;
-struct mlx5_thermal;
+struct mlx5_st;
 
 #define MLX5_LOG_SW_ICM_BLOCK_SIZE(dev) (MLX5_CAP_DEV_MEM(dev, log_sw_icm_alloc_granularity))
 #define MLX5_SW_ICM_BLOCK_SIZE(dev) (1 << MLX5_LOG_SW_ICM_BLOCK_SIZE(dev))
@@ -765,6 +768,7 @@ struct mlx5_core_dev {
 	u32			issi;
 	struct mlx5e_resources  mlx5e_res;
 	struct mlx5_dm          *dm;
+	struct mlx5_st          *st;
 	struct mlx5_vxlan       *vxlan;
 	struct mlx5_geneve      *geneve;
 	struct {
@@ -805,6 +809,8 @@ struct mlx5_db {
 	dma_addr_t		dma;
 	int			index;
 };
+
+#define MLX5_DEFAULT_NUM_DOORBELLS 8
 
 enum {
 	MLX5_COMP_EQ_SIZE = 1024,
@@ -1168,6 +1174,23 @@ int mlx5_dm_sw_icm_alloc(struct mlx5_core_dev *dev, enum mlx5_sw_icm_type type,
 			 phys_addr_t *addr, u32 *obj_id);
 int mlx5_dm_sw_icm_dealloc(struct mlx5_core_dev *dev, enum mlx5_sw_icm_type type,
 			   u64 length, u16 uid, phys_addr_t addr, u32 obj_id);
+
+#ifdef CONFIG_PCIE_TPH
+int mlx5_st_alloc_index(struct mlx5_core_dev *dev, enum tph_mem_type mem_type,
+			unsigned int cpu_uid, u16 *st_index);
+int mlx5_st_dealloc_index(struct mlx5_core_dev *dev, u16 st_index);
+#else
+static inline int mlx5_st_alloc_index(struct mlx5_core_dev *dev,
+				      enum tph_mem_type mem_type,
+				      unsigned int cpu_uid, u16 *st_index)
+{
+	return -EOPNOTSUPP;
+}
+static inline int mlx5_st_dealloc_index(struct mlx5_core_dev *dev, u16 st_index)
+{
+	return -EOPNOTSUPP;
+}
+#endif
 
 struct mlx5_core_dev *mlx5_vf_get_core_dev(struct pci_dev *pdev);
 void mlx5_vf_put_core_dev(struct mlx5_core_dev *mdev);

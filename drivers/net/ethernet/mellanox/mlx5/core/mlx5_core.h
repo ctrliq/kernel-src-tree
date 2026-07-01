@@ -291,6 +291,7 @@ int mlx5_register_device(struct mlx5_core_dev *dev);
 void mlx5_unregister_device(struct mlx5_core_dev *dev);
 void mlx5_dev_set_lightweight(struct mlx5_core_dev *dev);
 bool mlx5_dev_is_lightweight(struct mlx5_core_dev *dev);
+void mlx5_core_reps_aux_devs_remove(struct mlx5_core_dev *dev);
 
 void mlx5_fw_reporters_create(struct mlx5_core_dev *dev);
 int mlx5_query_mtpps(struct mlx5_core_dev *dev, u32 *mtpps, u32 mtpps_size);
@@ -300,6 +301,15 @@ int mlx5_set_mtppse(struct mlx5_core_dev *mdev, u8 pin, u8 arm, u8 mode);
 
 struct mlx5_dm *mlx5_dm_create(struct mlx5_core_dev *dev);
 void mlx5_dm_cleanup(struct mlx5_core_dev *dev);
+
+#ifdef CONFIG_PCIE_TPH
+struct mlx5_st *mlx5_st_create(struct mlx5_core_dev *dev);
+void mlx5_st_destroy(struct mlx5_core_dev *dev);
+#else
+static inline struct mlx5_st *
+mlx5_st_create(struct mlx5_core_dev *dev) { return NULL; }
+static inline void mlx5_st_destroy(struct mlx5_core_dev *dev) { return; }
+#endif
 
 void mlx5_toggle_port_link(struct mlx5_core_dev *dev);
 int mlx5_set_port_admin_status(struct mlx5_core_dev *dev,

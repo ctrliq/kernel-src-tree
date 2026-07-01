@@ -1214,7 +1214,8 @@ static int esw_add_fdb_peer_miss_rules(struct mlx5_eswitch *esw,
 	misc = MLX5_ADDR_OF(fte_match_param, spec->match_value,
 			    misc_parameters);
 
-	if (mlx5_core_is_ecpf_esw_manager(peer_dev)) {
+	if (mlx5_core_is_ecpf_esw_manager(peer_dev) &&
+	    mlx5_esw_host_functions_enabled(peer_dev)) {
 		peer_vport = mlx5_eswitch_get_vport(peer_esw, MLX5_VPORT_PF);
 		esw_set_peer_miss_rule_source_port(esw, peer_esw, spec,
 						   MLX5_VPORT_PF);
@@ -1242,10 +1243,8 @@ static int esw_add_fdb_peer_miss_rules(struct mlx5_eswitch *esw,
 
 	mlx5_esw_for_each_vf_vport(peer_esw, i, peer_vport,
 				   mlx5_core_max_vfs(peer_dev)) {
-		esw_set_peer_miss_rule_source_port(esw,
-						   peer_esw,
-						   spec, peer_vport->vport);
-
+		esw_set_peer_miss_rule_source_port(esw, peer_esw, spec,
+						   peer_vport->vport);
 		flow = mlx5_add_flow_rules(mlx5_eswitch_get_slow_fdb(esw),
 					   spec, &flow_act, &dest, 1);
 		if (IS_ERR(flow)) {
@@ -1302,7 +1301,9 @@ add_vf_flow_err:
 		mlx5_del_flow_rules(flows[peer_vport->index]);
 	}
 add_ecpf_flow_err:
-	if (mlx5_core_is_ecpf_esw_manager(peer_dev)) {
+
+	if (mlx5_core_is_ecpf_esw_manager(peer_dev) &&
+	    mlx5_esw_host_functions_enabled(peer_dev)) {
 		peer_vport = mlx5_eswitch_get_vport(peer_esw, MLX5_VPORT_PF);
 		mlx5_del_flow_rules(flows[peer_vport->index]);
 	}
@@ -1342,7 +1343,8 @@ static void esw_del_fdb_peer_miss_rules(struct mlx5_eswitch *esw,
 		mlx5_del_flow_rules(flows[peer_vport->index]);
 	}
 
-	if (mlx5_core_is_ecpf_esw_manager(peer_dev)) {
+	if (mlx5_core_is_ecpf_esw_manager(peer_dev) &&
+	    mlx5_esw_host_functions_enabled(peer_dev)) {
 		peer_vport = mlx5_eswitch_get_vport(peer_esw, MLX5_VPORT_PF);
 		mlx5_del_flow_rules(flows[peer_vport->index]);
 	}
@@ -3975,6 +3977,32 @@ static bool mlx5_devlink_switchdev_active_mode_change(struct mlx5_eswitch *esw,
 	return true;
 }
 
+#define MLX5_ESW_HOLD_TIMEOUT_MS 7000
+#define MLX5_ESW_HOLD_RETRY_DELAY_MS 500
+
+void mlx5_eswitch_safe_aux_devs_remove(struct mlx5_core_dev *dev)
+{
+	unsigned long timeout;
+	bool hold_esw = true;
+
+	/* Wait for any concurrent eswitch mode transition to complete. */
+	if (!mlx5_esw_hold(dev)) {
+		timeout = jiffies + msecs_to_jiffies(MLX5_ESW_HOLD_TIMEOUT_MS);
+		while (!mlx5_esw_hold(dev)) {
+			if (!time_before(jiffies, timeout)) {
+				hold_esw = false;
+				break;
+			}
+			msleep(MLX5_ESW_HOLD_RETRY_DELAY_MS);
+		}
+	}
+	if (hold_esw) {
+		if (mlx5_eswitch_mode(dev) == MLX5_ESWITCH_OFFLOADS)
+			mlx5_core_reps_aux_devs_remove(dev);
+		mlx5_esw_release(dev);
+	}
+}
+
 int mlx5_devlink_eswitch_mode_set(struct devlink *devlink, u16 mode,
 				  struct netlink_ext_ack *extack)
 {
@@ -4318,7 +4346,8 @@ mlx5_eswitch_vport_has_rep(const struct mlx5_eswitch *esw, u16 vport_num)
 {
 	/* Currently, only ECPF based device has representor for host PF. */
 	if (vport_num == MLX5_VPORT_PF &&
-	    !mlx5_core_is_ecpf_esw_manager(esw->dev))
+	    (!mlx5_core_is_ecpf_esw_manager(esw->dev) ||
+	     !mlx5_esw_host_functions_enabled(esw->dev)))
 		return false;
 
 	if (vport_num == MLX5_VPORT_ECPF &&
