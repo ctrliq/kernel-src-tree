@@ -281,13 +281,13 @@ int arm64_ioremap_prot_hook_register(const ioremap_prot_hook_t hook);
 #define _PAGE_IOREMAP PROT_DEVICE_nGnRE
 
 #define ioremap_wc(addr, size)	\
-	ioremap_prot((addr), (size), PROT_NORMAL_NC)
+	ioremap_prot((addr), (size), __pgprot(PROT_NORMAL_NC))
 #define ioremap_np(addr, size)	\
-	ioremap_prot((addr), (size), PROT_DEVICE_nGnRnE)
+	ioremap_prot((addr), (size), __pgprot(PROT_DEVICE_nGnRnE))
 
 
 #define ioremap_encrypted(addr, size)	\
-	ioremap_prot((addr), (size), _PAGE_KERNEL)
+	ioremap_prot((addr), (size), PAGE_KERNEL)
 
 /*
  * io{read,write}{16,32,64}be() macros
@@ -308,7 +308,7 @@ static inline void __iomem *ioremap_cache(phys_addr_t addr, size_t size)
 	if (pfn_is_map_memory(__phys_to_pfn(addr)))
 		return (void __iomem *)__phys_to_virt(addr);
 
-	return ioremap_prot(addr, size, PROT_NORMAL);
+	return ioremap_prot(addr, size, __pgprot(PROT_NORMAL));
 }
 
 /*
