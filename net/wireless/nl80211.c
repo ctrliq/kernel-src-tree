@@ -13443,6 +13443,16 @@ static int nl80211_testmode_dump(struct sk_buff *skb,
 			err = -ENOENT;
 			goto out_err;
 		}
+
+		/*
+		 * The wiphy may have moved netns between dumpit
+		 * invocations (via NL80211_CMD_SET_WIPHY_NETNS), so
+		 * re-check that it still matches the caller's netns.
+		 */
+		if (!net_eq(wiphy_net(&rdev->wiphy), sock_net(skb->sk))) {
+			err = -ENODEV;
+			goto out_err;
+		}
 	} else {
 		attrbuf = kcalloc(NUM_NL80211_ATTR, sizeof(*attrbuf),
 				  GFP_KERNEL);
@@ -17424,6 +17434,15 @@ static int nl80211_prepare_vendor_dump(struct sk_buff *skb,
 
 		if (!wiphy)
 			return -ENODEV;
+
+		/*
+		 * The wiphy may have moved netns between dumpit
+		 * invocations (via NL80211_CMD_SET_WIPHY_NETNS), so
+		 * re-check that it still matches the caller's netns.
+		 */
+		if (!net_eq(wiphy_net(wiphy), sock_net(skb->sk)))
+			return -ENODEV;
+
 		*rdev = wiphy_to_rdev(wiphy);
 		*wdev = NULL;
 
