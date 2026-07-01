@@ -165,9 +165,8 @@ SYM_CODE_START(pvh_start_xen)
 	 * the per-CPU areas are set up.
 	 */
 	movl $MSR_GS_BASE,%ecx
-	leaq INIT_PER_CPU_VAR(fixed_percpu_data)(%rip), %rdx
-	movl %edx, %eax
-	shrq $32, %rdx
+	xorl %eax, %eax
+	xorl %edx, %edx
 	wrmsr
 
 	/*
