@@ -2196,9 +2196,9 @@ struct file_operations {
 /* Treat loff_t as unsigned (e.g., /dev/mem) */
 #define FOP_UNSIGNED_OFFSET	((__force fop_flags_t)(1 << 5))
 /* Supports asynchronous lock callbacks */
-#define FOP_ASYNC_LOCK         ((__force fop_flags_t)(1 << 6))
+#define FOP_ASYNC_LOCK		((__force fop_flags_t)(1 << 6))
 /* File system supports uncached read/write buffered IO */
-#define FOP_DONTCACHE          ((__force fop_flags_t)(1 << 7))
+#define FOP_DONTCACHE		0 /* ((__force fop_flags_t)(1 << 7)) */
 
 /* Wrap a directory iterator that needs exclusive inode access */
 int wrap_directory_iterator(struct file *, struct dir_context *,
