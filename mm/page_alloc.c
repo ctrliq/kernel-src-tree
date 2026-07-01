@@ -3712,7 +3712,6 @@ __alloc_pages_direct_compact(gfp_t gfp_mask, unsigned int order,
 	if (page) {
 		struct zone *zone = page_zone(page);
 
-		set_page_refcounted(page);
 		zone->compact_blockskip_flush = false;
 		compaction_defer_reset(zone, order, true);
 		count_vm_event(COMPACTSUCCESS);
@@ -4314,8 +4313,10 @@ restart:
 						alloc_flags, ac,
 						INIT_COMPACT_PRIORITY,
 						&compact_result);
-		if (page)
+		if (page) {
+			set_page_refcounted(page);
 			goto got_pg;
+		}
 
 		/*
 		 * Checks for costly allocations with __GFP_NORETRY, which
@@ -4397,8 +4398,10 @@ retry:
 	/* Try direct compaction and then allocating */
 	page = __alloc_pages_direct_compact(gfp_mask, order, alloc_flags, ac,
 					compact_priority, &compact_result);
-	if (page)
+	if (page) {
+		set_page_refcounted(page);
 		goto got_pg;
+	}
 
 	/* Do not loop if specifically requested */
 	if (gfp_mask & __GFP_NORETRY)
