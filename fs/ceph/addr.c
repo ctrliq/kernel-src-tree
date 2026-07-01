@@ -1238,11 +1238,9 @@ bool is_write_congestion_happened(struct ceph_fs_client *fsc)
 		CONGESTION_ON_THRESH(fsc->mount_options->congestion_kb);
 }
 
-static inline
-int ceph_move_dirty_page_in_page_array(struct address_space *mapping,
-					struct writeback_control *wbc,
-					struct ceph_writeback_ctl *ceph_wbc,
-					struct page *page)
+static inline int move_dirty_folio_in_page_array(struct address_space *mapping,
+		struct writeback_control *wbc,
+		struct ceph_writeback_ctl *ceph_wbc, struct folio *folio)
 {
 	struct inode *inode = mapping->host;
 	struct ceph_fs_client *fsc = ceph_inode_to_fs_client(inode);
@@ -1252,7 +1250,7 @@ int ceph_move_dirty_page_in_page_array(struct address_space *mapping,
 	gfp_t gfp_flags = ceph_wbc->locked_pages ? GFP_NOWAIT : GFP_NOFS;
 
 	if (IS_ENCRYPTED(inode)) {
-		pages[index] = fscrypt_encrypt_pagecache_blocks(page,
+		pages[index] = fscrypt_encrypt_pagecache_blocks(&folio->page,
 								PAGE_SIZE,
 								0,
 								gfp_flags);
@@ -1269,7 +1267,7 @@ int ceph_move_dirty_page_in_page_array(struct address_space *mapping,
 			return PTR_ERR(pages[index]);
 		}
 	} else {
-		pages[index] = page;
+		pages[index] = &folio->page;
 	}
 
 	ceph_wbc->locked_pages++;
@@ -1361,8 +1359,8 @@ int ceph_process_folio_batch(struct address_space *mapping,
 
 		fsc->write_congested = is_write_congestion_happened(fsc);
 
-		rc = ceph_move_dirty_page_in_page_array(mapping, wbc,
-							ceph_wbc, &folio->page);
+		rc = move_dirty_folio_in_page_array(mapping, wbc, ceph_wbc,
+				folio);
 		if (rc) {
 			folio_redirty_for_writepage(wbc, folio);
 			folio_unlock(folio);
