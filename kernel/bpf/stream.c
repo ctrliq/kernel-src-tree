@@ -58,7 +58,7 @@ static void bpf_stream_page_free(struct bpf_stream_page *stream_page)
 	if (!stream_page)
 		return;
 	p = virt_to_page(stream_page);
-	__free_page(p);
+	free_pages_nolock(p, 0);
 }
 
 static void bpf_stream_page_get(struct bpf_stream_page *stream_page)

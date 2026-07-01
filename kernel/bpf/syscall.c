@@ -628,7 +628,7 @@ int bpf_map_alloc_pages(const struct bpf_map *map, int nid,
 			continue;
 		}
 		for (j = 0; j < i; j++)
-			__free_page(pages[j]);
+			free_pages_nolock(pages[j], 0);
 		ret = -ENOMEM;
 		break;
 	}
