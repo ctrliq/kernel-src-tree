@@ -643,10 +643,10 @@ static int ocfs2_mknod_locked(struct ocfs2_super *osb,
 				    fe_blkno, suballoc_loc, suballoc_bit);
 }
 
-static int ocfs2_mkdir(struct mnt_idmap *idmap,
-		       struct inode *dir,
-		       struct dentry *dentry,
-		       umode_t mode)
+static struct dentry *ocfs2_mkdir(struct mnt_idmap *idmap,
+				  struct inode *dir,
+				  struct dentry *dentry,
+				  umode_t mode)
 {
 	int ret;
 
@@ -656,7 +656,7 @@ static int ocfs2_mkdir(struct mnt_idmap *idmap,
 	if (ret)
 		mlog_errno(ret);
 
-	return ret;
+	return ERR_PTR(ret);
 }
 
 static int ocfs2_create(struct mnt_idmap *idmap,

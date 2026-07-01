@@ -401,10 +401,10 @@ static struct inode *dlmfs_get_inode(struct inode *parent,
  * File creation. Allocate an inode, and we're done..
  */
 /* SMP-safe */
-static int dlmfs_mkdir(struct mnt_idmap * idmap,
-		       struct inode * dir,
-		       struct dentry * dentry,
-		       umode_t mode)
+static struct dentry *dlmfs_mkdir(struct mnt_idmap * idmap,
+				  struct inode * dir,
+				  struct dentry * dentry,
+				  umode_t mode)
 {
 	int status;
 	struct inode *inode = NULL;
@@ -447,7 +447,7 @@ static int dlmfs_mkdir(struct mnt_idmap * idmap,
 bail:
 	if (status < 0)
 		iput(inode);
-	return status;
+	return ERR_PTR(status);
 }
 
 static int dlmfs_create(struct mnt_idmap *idmap,
