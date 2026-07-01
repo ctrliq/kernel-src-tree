@@ -78,11 +78,13 @@ const_pcpu_hot = pcpu_hot;
 #define BSS_DECRYPTED						\
 	. = ALIGN(PMD_SIZE);					\
 	__start_bss_decrypted = .;				\
+	__pi___start_bss_decrypted = .;				\
 	*(.bss..decrypted);					\
 	. = ALIGN(PAGE_SIZE);					\
 	__start_bss_decrypted_unused = .;			\
 	. = ALIGN(PMD_SIZE);					\
 	__end_bss_decrypted = .;				\
+	__pi___end_bss_decrypted = .;				\
 
 #else
 
@@ -127,6 +129,7 @@ SECTIONS
 	/* Text and read-only data */
 	.text :  AT(ADDR(.text) - LOAD_OFFSET) {
 		_text = .;
+		__pi__text = .;
 		_stext = .;
 		ALIGN_ENTRY_TEXT_BEGIN
 		*(.text..__x86.rethunk_untrain)
@@ -384,6 +387,7 @@ SECTIONS
 
 	. = ALIGN(PAGE_SIZE);		/* keep VO_INIT_SIZE page aligned */
 	_end = .;
+	__pi__end = .;
 
 #ifdef CONFIG_AMD_MEM_ENCRYPT
 	/*
