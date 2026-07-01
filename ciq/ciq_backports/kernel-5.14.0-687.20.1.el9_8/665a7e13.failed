@@ -1,0 +1,96 @@
+net/mlx5e: SHAMPO, Fix header mapping for 64K pages
+
+jira KERNEL-1233
+Rebuild_History Non-Buildable kernel-5.14.0-687.20.1.el9_8
+commit-author Dragos Tatulea <dtatulea@nvidia.com>
+commit 665a7e13c220bbde55531a24bd5524320648df10
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.20.1.el9_8/665a7e13.failed
+
+HW-GRO is broken on mlx5 for 64K page sizes. The patch in the fixes tag
+didn't take into account larger page sizes when doing an align down
+of max_ksm_entries. For 64K page size, max_ksm_entries is 0 which will skip
+mapping header pages via WQE UMR. This breaks header-data split
+and will result in the following syndrome:
+
+mlx5_core 0000:00:08.0 eth2: Error cqe on cqn 0x4c9, ci 0x0, qn 0x1133, opcode 0xe, syndrome 0x4, vendor syndrome 0x32
+00000000: 00 00 00 00 04 4a 00 00 00 00 00 00 20 00 93 32
+00000010: 55 00 00 00 fb cc 00 00 00 00 00 00 07 18 00 00
+00000020: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 4a
+00000030: 00 00 3b c7 93 01 32 04 00 00 00 00 00 00 bf e0
+mlx5_core 0000:00:08.0 eth2: ERR CQE on RQ: 0x1133
+
+Furthermore, the function that fills in WQE UMRs for the headers
+(mlx5e_build_shampo_hd_umr()) only supports mapping page sizes that
+fit in a single UMR WQE.
+
+This patch goes back to the old non-aligned max_ksm_entries value and it
+changes mlx5e_build_shampo_hd_umr() to support mapping a large page over
+multiple UMR WQEs.
+
+This means that mlx5e_build_shampo_hd_umr() can now leave a page only
+partially mapped. The caller, mlx5e_alloc_rx_hd_mpwqe(), ensures that
+there are enough UMR WQEs to cover complete pages by working on
+ksm_entries that are multiples of MLX5E_SHAMPO_WQ_HEADER_PER_PAGE.
+
+Fixes: 8a0ee54027b1 ("net/mlx5e: SHAMPO, Simplify UMR allocation for headers")
+	Signed-off-by: Dragos Tatulea <dtatulea@nvidia.com>
+	Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+	Reviewed-by: Simon Horman <horms@kernel.org>
+Link: https://patch.msgid.link/1762238915-1027590-2-git-send-email-tariqt@nvidia.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 665a7e13c220bbde55531a24bd5524320648df10)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index 0afdc68896c3,0c031954ca30..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -678,25 -679,24 +678,37 @@@ static int mlx5e_build_shampo_hd_umr(st
+  	umr_wqe = mlx5_wq_cyc_get_wqe(&sq->wq, pi);
+  	build_ksm_umr(sq, umr_wqe, shampo->mkey_be, index, ksm_entries);
+  
+- 	WARN_ON_ONCE(ksm_entries & (MLX5E_SHAMPO_WQ_HEADER_PER_PAGE - 1));
+- 	while (i < ksm_entries) {
+- 		struct mlx5e_frag_page *frag_page = mlx5e_shampo_hd_to_frag_page(rq, index);
++ 	for (i = 0; i < ksm_entries; i++, index++) {
++ 		struct mlx5e_frag_page *frag_page;
+  		u64 addr;
+  
+- 		err = mlx5e_page_alloc_fragmented(rq->hd_page_pool, frag_page);
+- 		if (unlikely(err))
+- 			goto err_unmap;
++ 		frag_page = mlx5e_shampo_hd_to_frag_page(rq, index);
++ 		header_offset = mlx5e_shampo_hd_offset(index);
++ 		if (!header_offset) {
++ 			err = mlx5e_page_alloc_fragmented(rq->hd_page_pool,
++ 							  frag_page);
++ 			if (err)
++ 				goto err_unmap;
++ 		}
+  
+++<<<<<<< HEAD
+ +		addr = page_pool_get_dma_addr(frag_page->page);
+ +
+ +		for (int j = 0; j < MLX5E_SHAMPO_WQ_HEADER_PER_PAGE; j++) {
+ +			header_offset = mlx5e_shampo_hd_offset(index++);
+ +
+ +			umr_wqe->inline_ksms[i++] = (struct mlx5_ksm) {
+ +				.key = cpu_to_be32(lkey),
+ +				.va  = cpu_to_be64(addr + header_offset + headroom),
+ +			};
+ +		}
+++=======
++ 		addr = page_pool_get_dma_addr_netmem(frag_page->netmem);
++ 		umr_wqe->inline_ksms[i] = (struct mlx5_ksm) {
++ 			.key = cpu_to_be32(lkey),
++ 			.va  = cpu_to_be64(addr + header_offset + headroom),
++ 		};
+++>>>>>>> 665a7e13c220 (net/mlx5e: SHAMPO, Fix header mapping for 64K pages)
+  	}
+  
+  	sq->db.wqe_info[pi] = (struct mlx5e_icosq_wqe_info) {
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
