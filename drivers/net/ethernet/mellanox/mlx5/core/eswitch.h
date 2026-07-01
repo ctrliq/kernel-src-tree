@@ -1002,7 +1002,7 @@ static inline void mlx5_eswitch_unblock_ipsec(struct mlx5_core_dev *dev) {}
 static inline bool
 mlx5_esw_vport_vhca_id(struct mlx5_eswitch *esw, u16 vportn, u16 *vhca_id)
 {
-	return -EOPNOTSUPP;
+	return false;
 }
 
 #endif /* CONFIG_MLX5_ESWITCH */
