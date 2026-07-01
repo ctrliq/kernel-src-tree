@@ -117,6 +117,11 @@ static inline void log_test_result(int result)
 	ksft_test_result_report(result, "%s\n", test_name);
 }
 
+static inline int sz2ord(size_t size)
+{
+	return __builtin_ctzll(size / getpagesize());
+}
+
 /*
  * On ppc64 this will only work with radix 2M hugepage size
  */
