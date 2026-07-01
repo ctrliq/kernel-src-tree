@@ -26,6 +26,7 @@ unsigned long stack_guard_gap = 256UL<<PAGE_SHIFT;
  * Directly import the VMA implementation here. Our vma_internal.h wrapper
  * provides userland-equivalent functionality for everything vma.c uses.
  */
+#include "../../../mm/vma_init.c"
 #include "../../../mm/vma_exec.c"
 #include "../../../mm/vma.c"
 
@@ -89,6 +90,12 @@ static int attach_vma(struct mm_struct *mm, struct vm_area_struct *vma)
 	return res;
 }
 
+static void detach_free_vma(struct vm_area_struct *vma)
+{
+	vma_mark_detached(vma);
+	vm_area_free(vma);
+}
+
 /* Helper function to allocate a VMA and link it to the tree. */
 static struct vm_area_struct *alloc_and_link_vma(struct mm_struct *mm,
 						 unsigned long start,
@@ -102,7 +109,7 @@ static struct vm_area_struct *alloc_and_link_vma(struct mm_struct *mm,
 		return NULL;
 
 	if (attach_vma(mm, vma)) {
-		vm_area_free(vma);
+		detach_free_vma(vma);
 		return NULL;
 	}
 
@@ -247,7 +254,7 @@ static int cleanup_mm(struct mm_struct *mm, struct vma_iterator *vmi)
 
 	vma_iter_set(vmi, 0);
 	for_each_vma(*vmi, vma) {
-		vm_area_free(vma);
+		detach_free_vma(vma);
 		count++;
 	}
 
@@ -317,7 +324,7 @@ static bool test_simple_merge(void)
 	ASSERT_EQ(vma->vm_pgoff, 0);
 	ASSERT_EQ(vma->vm_flags, flags);
 
-	vm_area_free(vma);
+	detach_free_vma(vma);
 	mtree_destroy(&mm.mm_mt);
 
 	return true;
@@ -359,7 +366,7 @@ static bool test_simple_modify(void)
 	ASSERT_EQ(vma->vm_end, 0x1000);
 	ASSERT_EQ(vma->vm_pgoff, 0);
 
-	vm_area_free(vma);
+	detach_free_vma(vma);
 	vma_iter_clear(&vmi);
 
 	vma = vma_next(&vmi);
@@ -368,7 +375,7 @@ static bool test_simple_modify(void)
 	ASSERT_EQ(vma->vm_end, 0x2000);
 	ASSERT_EQ(vma->vm_pgoff, 1);
 
-	vm_area_free(vma);
+	detach_free_vma(vma);
 	vma_iter_clear(&vmi);
 
 	vma = vma_next(&vmi);
@@ -377,7 +384,7 @@ static bool test_simple_modify(void)
 	ASSERT_EQ(vma->vm_end, 0x3000);
 	ASSERT_EQ(vma->vm_pgoff, 2);
 
-	vm_area_free(vma);
+	detach_free_vma(vma);
 	mtree_destroy(&mm.mm_mt);
 
 	return true;
@@ -405,7 +412,7 @@ static bool test_simple_expand(void)
 	ASSERT_EQ(vma->vm_end, 0x3000);
 	ASSERT_EQ(vma->vm_pgoff, 0);
 
-	vm_area_free(vma);
+	detach_free_vma(vma);
 	mtree_destroy(&mm.mm_mt);
 
 	return true;
@@ -426,7 +433,7 @@ static bool test_simple_shrink(void)
 	ASSERT_EQ(vma->vm_end, 0x1000);
 	ASSERT_EQ(vma->vm_pgoff, 0);
 
-	vm_area_free(vma);
+	detach_free_vma(vma);
 	mtree_destroy(&mm.mm_mt);
 
 	return true;
@@ -617,7 +624,7 @@ static bool test_merge_new(void)
 		ASSERT_EQ(vma->vm_pgoff, 0);
 		ASSERT_EQ(vma->anon_vma, &dummy_anon_vma);
 
-		vm_area_free(vma);
+		detach_free_vma(vma);
 		count++;
 	}
 
@@ -1615,6 +1622,7 @@ int main(void)
 	int num_tests = 0, num_fail = 0;
 
 	maple_tree_init();
+	vma_state_init();
 
 #define TEST(name)							\
 	do {								\

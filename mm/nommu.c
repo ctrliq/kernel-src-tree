@@ -415,7 +415,8 @@ static const struct ctl_table nommu_table[] = {
 };
 
 /*
- * initialise the percpu counter for VM and region record slabs
+ * initialise the percpu counter for VM and region record slabs, initialise VMA
+ * state.
  */
 void __init mmap_init(void)
 {
@@ -425,6 +426,7 @@ void __init mmap_init(void)
 	VM_BUG_ON(ret);
 	vm_region_jar = KMEM_CACHE(vm_region, SLAB_PANIC|SLAB_ACCOUNT);
 	register_sysctl_init("vm", nommu_table);
+	vma_state_init();
 }
 
 /*
