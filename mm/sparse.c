@@ -584,7 +584,6 @@ failed:
 		ms = __nr_to_section(pnum);
 		if (!preinited_vmemmap_section(ms))
 			ms->section_mem_map = 0;
-		ms->section_mem_map = 0;
 	}
 }
 
