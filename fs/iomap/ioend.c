@@ -239,7 +239,7 @@ new_ioend:
 	if (ioend->io_offset + ioend->io_size > end_pos)
 		ioend->io_size = end_pos - ioend->io_offset;
 
-	wbc_account_cgroup_owner(wpc->wbc, &folio->page, map_len);
+	wbc_account_cgroup_owner(wpc->wbc, folio, map_len);
 	return map_len;
 }
 EXPORT_SYMBOL_GPL(iomap_add_to_ioend);
