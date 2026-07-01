@@ -15,7 +15,6 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
-#include <sys/param.h>
 #include <malloc.h>
 #include <stdbool.h>
 #include <time.h>
@@ -424,8 +423,7 @@ err_out_unlink:
 	return -1;
 }
 
-void split_thp_in_pagecache_to_order_at(size_t fd_size, const char *fs_loc,
-		int order, int offset)
+void split_thp_in_pagecache_to_order(size_t fd_size, int order, const char *fs_loc)
 {
 	int fd;
 	char *addr;
@@ -443,12 +441,7 @@ void split_thp_in_pagecache_to_order_at(size_t fd_size, const char *fs_loc,
 		return;
 	err = 0;
 
-	if (offset == -1)
-		write_debugfs(PID_FMT, getpid(), (uint64_t)addr,
-			      (uint64_t)addr + fd_size, order);
-	else
-		write_debugfs(PID_FMT, getpid(), (uint64_t)addr,
-			      (uint64_t)addr + fd_size, order, offset);
+	write_debugfs(PID_FMT, getpid(), (uint64_t)addr, (uint64_t)addr + fd_size, order);
 
 	for (i = 0; i < fd_size; i++)
 		if (*(addr + i) != (char)i) {
@@ -467,15 +460,9 @@ out:
 	munmap(addr, fd_size);
 	close(fd);
 	unlink(testfile);
-	if (offset == -1) {
-		if (err)
-			ksft_exit_fail_msg("Split PMD-mapped pagecache folio to order %d failed\n", order);
-		ksft_test_result_pass("Split PMD-mapped pagecache folio to order %d passed\n", order);
-	} else {
-		if (err)
-			ksft_exit_fail_msg("Split PMD-mapped pagecache folio to order %d at in-folio offset %d failed\n", order, offset);
-		ksft_test_result_pass("Split PMD-mapped pagecache folio to order %d at in-folio offset %d passed\n", order, offset);
-	}
+	if (err)
+		ksft_exit_fail_msg("Split PMD-mapped pagecache folio to order %d failed\n", order);
+	ksft_test_result_pass("Split PMD-mapped pagecache folio to order %d passed\n", order);
 }
 
 int main(int argc, char **argv)
@@ -486,7 +473,6 @@ int main(int argc, char **argv)
 	char fs_loc_template[] = "/tmp/thp_fs_XXXXXX";
 	const char *fs_loc;
 	bool created_tmp;
-	int offset;
 
 	ksft_print_header();
 
@@ -498,7 +484,7 @@ int main(int argc, char **argv)
 	if (argc > 1)
 		optional_xfs_path = argv[1];
 
-	ksft_set_plan(1+8+2+9+8*4+2);
+	ksft_set_plan(1+8+2+9);
 
 	pagesize = getpagesize();
 	pageshift = ffs(pagesize) - 1;
@@ -520,13 +506,7 @@ int main(int argc, char **argv)
 	created_tmp = prepare_thp_fs(optional_xfs_path, fs_loc_template,
 			&fs_loc);
 	for (i = 8; i >= 0; i--)
-		split_thp_in_pagecache_to_order_at(fd_size, fs_loc, i, -1);
-
-	for (i = 0; i < 9; i++)
-		for (offset = 0;
-		     offset < pmd_pagesize / pagesize;
-		     offset += MAX(pmd_pagesize / pagesize / 4, 1 << i))
-			split_thp_in_pagecache_to_order_at(fd_size, fs_loc, i, offset);
+		split_thp_in_pagecache_to_order(fd_size, i, fs_loc);
 	cleanup_thp_fs(fs_loc, created_tmp);
 
 	ksft_finished();
