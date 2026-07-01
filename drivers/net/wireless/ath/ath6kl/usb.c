@@ -1112,8 +1112,6 @@ static int ath6kl_usb_probe(struct usb_interface *interface,
 	int vendor_id, product_id;
 	int ret = 0;
 
-	usb_get_dev(dev);
-
 	vendor_id = le16_to_cpu(dev->descriptor.idVendor);
 	product_id = le16_to_cpu(dev->descriptor.idProduct);
 
@@ -1131,11 +1129,8 @@ static int ath6kl_usb_probe(struct usb_interface *interface,
 		ath6kl_dbg(ATH6KL_DBG_USB, "USB 1.1 Host\n");
 
 	ar_usb = ath6kl_usb_create(interface);
-
-	if (ar_usb == NULL) {
-		ret = -ENOMEM;
-		goto err_usb_put;
-	}
+	if (ar_usb == NULL)
+		return -ENOMEM;
 
 	ar = ath6kl_core_create(&ar_usb->udev->dev);
 	if (ar == NULL) {
@@ -1164,15 +1159,12 @@ err_core_free:
 	ath6kl_core_destroy(ar);
 err_usb_destroy:
 	ath6kl_usb_destroy(ar_usb);
-err_usb_put:
-	usb_put_dev(dev);
 
 	return ret;
 }
 
 static void ath6kl_usb_remove(struct usb_interface *interface)
 {
-	usb_put_dev(interface_to_usbdev(interface));
 	ath6kl_usb_device_detached(interface);
 }
 
