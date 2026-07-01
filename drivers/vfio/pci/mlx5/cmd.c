@@ -467,7 +467,7 @@ static void free_page_list(u32 npages, struct page **page_list)
 {
 	int i;
 
-	/* Undo alloc_pages_bulk_array() */
+	/* Undo alloc_pages_bulk() */
 	for (i = npages - 1; i >= 0; i--)
 		__free_page(page_list[i]);
 
@@ -504,8 +504,8 @@ static int mlx5vf_add_pages(struct page ***page_list, unsigned int npages)
 		return -ENOMEM;
 
 	for (;;) {
-		filled = alloc_pages_bulk_array(GFP_KERNEL_ACCOUNT, npages - done,
-					        *page_list + done);
+		filled = alloc_pages_bulk(GFP_KERNEL_ACCOUNT, npages - done,
+					  *page_list + done);
 		if (!filled)
 			goto err;
 
