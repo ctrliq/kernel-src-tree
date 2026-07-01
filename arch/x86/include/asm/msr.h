@@ -340,6 +340,7 @@ int msr_clear_bit(u32 msr, u8 bit);
 #define wrmsrl_safe(msr, val) wrmsrq_safe(msr, val)
 #define rdmsrl_on_cpu(cpu, msr_no, q) rdmsrq_on_cpu(cpu, msr_no, q)
 #define native_wrmsrl(msr, val) native_wrmsrq(msr, val)
+#define rdmsrl_safe_on_cpu(cpu, msr_no, q) rdmsrq_safe_on_cpu(cpu, msr_no, q)
 
 #ifdef CONFIG_SMP
 int rdmsr_on_cpu(unsigned int cpu, u32 msr_no, u32 *l, u32 *h);
@@ -350,7 +351,7 @@ void rdmsr_on_cpus(const struct cpumask *mask, u32 msr_no, struct msr __percpu *
 void wrmsr_on_cpus(const struct cpumask *mask, u32 msr_no, struct msr __percpu *msrs);
 int rdmsr_safe_on_cpu(unsigned int cpu, u32 msr_no, u32 *l, u32 *h);
 int wrmsr_safe_on_cpu(unsigned int cpu, u32 msr_no, u32 l, u32 h);
-int rdmsrl_safe_on_cpu(unsigned int cpu, u32 msr_no, u64 *q);
+int rdmsrq_safe_on_cpu(unsigned int cpu, u32 msr_no, u64 *q);
 int wrmsrl_safe_on_cpu(unsigned int cpu, u32 msr_no, u64 q);
 int rdmsr_safe_regs_on_cpu(unsigned int cpu, u32 regs[8]);
 int wrmsr_safe_regs_on_cpu(unsigned int cpu, u32 regs[8]);
@@ -394,7 +395,7 @@ static inline int wrmsr_safe_on_cpu(unsigned int cpu, u32 msr_no, u32 l, u32 h)
 {
 	return wrmsr_safe(msr_no, l, h);
 }
-static inline int rdmsrl_safe_on_cpu(unsigned int cpu, u32 msr_no, u64 *q)
+static inline int rdmsrq_safe_on_cpu(unsigned int cpu, u32 msr_no, u64 *q)
 {
 	return rdmsrq_safe(msr_no, q);
 }
