@@ -1,0 +1,236 @@
+init/Kconfig: remove CONFIG_GCC_ASM_GOTO_OUTPUT_WORKAROUND
+
+jira KERNEL-1233
+Rebuild_History Non-Buildable kernel-5.14.0-687.20.1.el9_8
+commit-author Mark Rutland <mark.rutland@arm.com>
+commit f2f6a8e8871725035959b90bac048cde555aa0e9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.20.1.el9_8/f2f6a8e8.failed
+
+Several versions of GCC mis-compile asm goto with outputs. We try to
+workaround this, but our workaround is demonstrably incomplete and
+liable to result in subtle bugs, especially on arm64 where get_user()
+has recently been moved over to using asm goto with outputs.
+
+From discussion(s) with Linus at:
+
+  https://lore.kernel.org/linux-arm-kernel/Zpfv2tnlQ-gOLGac@J2N7QTR9R3.cambridge.arm.com/
+  https://lore.kernel.org/linux-arm-kernel/ZpfxLrJAOF2YNqCk@J2N7QTR9R3.cambridge.arm.com/
+
+... it sounds like the best thing to do for now is to remove the
+workaround and make CC_HAS_ASM_GOTO_OUTPUT depend on working compiler
+versions.
+
+The issue was originally reported to GCC by Sean Christopherson:
+
+  https://gcc.gnu.org/bugzilla/show_bug.cgi?id=113921
+
+... and Jakub Jelinek fixed this for GCC 14, with the fix backported to
+13.3.0, 12.4.0, and 11.5.0.
+
+In the kernel, we tried to workaround broken compilers in commits:
+
+  4356e9f841f7 ("work around gcc bugs with 'asm goto' with outputs")
+  68fb3ca0e408 ("update workarounds for gcc "asm goto" issue")
+
+... but the workaround of adding an empty asm("") after the asm volatile
+goto(...) demonstrably does not always avoid the problem, as can be seen
+in the following test case:
+
+| #define asm_goto_output(x...) \
+|         do { asm volatile goto(x); asm (""); } while (0)
+|
+| #define __good_or_bad(__val, __key)                                     \
+| do {                                                                    \
+|         __label__ __failed;                                             \
+|         unsigned long __tmp;                                            \
+|         asm_goto_output(                                                \
+|         "       cbnz    %[key], %l[__failed]\n"                         \
+|         "       mov     %[val], #0x900d\n"                              \
+|         : [val] "=r" (__tmp)                                            \
+|         : [key] "r" (__key)                                             \
+|         :                                                               \
+|         : __failed);                                                    \
+|         (__val) = __tmp;                                                \
+|         break;                                                          \
+| __failed:                                                               \
+|         (__val) = 0xbad;                                                \
+| } while (0)
+|
+| unsigned long get_val(unsigned long key);
+| unsigned long get_val(unsigned long key)
+| {
+|         unsigned long val = 0xbad;
+|
+|         __good_or_bad(val, key);
+|
+|         return val;
+| }
+
+GCC 13.2.0 (at -O2) compiles this to:
+
+| 	cbnz    x0, .Lfailed
+| 	mov     x0, #0x900d
+| .Lfailed:
+| 	ret
+
+GCC 14.1.0 (at -O2) compiles this to:
+
+| 	cbnz    x0, .Lfailed
+| 	mov     x0, #0x900d
+| 	ret
+| .Lfailed:
+| 	mov     x0, #0xbad
+| 	ret
+
+Note that GCC 13.2.0 erroneously omits the assignment to 'val' in the
+error path (even though this does not depend on an output of the asm
+goto). GCC 14.1.0 correctly retains the assignment.
+
+This problem can be seen within the kernel with the following test case:
+
+| #include <linux/uaccess.h>
+| #include <linux/types.h>
+|
+| noinline unsigned long test_unsafe_get_user(unsigned long __user *ptr);
+| noinline unsigned long test_unsafe_get_user(unsigned long __user *ptr)
+| {
+|         unsigned long val;
+|
+|         unsafe_get_user(val, ptr, Efault);
+|         return val;
+|
+| Efault:
+|         val = 0x900d;
+|         return val;
+| }
+
+GCC 13.2.0 (arm64 defconfig) compiles this to:
+
+|         and     x0, x0, #0xff7fffffffffffff
+|         ldtr    x0, [x0]
+| .Lextable_fixup:
+|         ret
+
+GCC 13.2.0 (x86_64 defconfig + MITIGATION_RETPOLINE=n) compiles this to:
+
+|         endbr64
+|         mov    (%rdi),%rax
+| .Lextable_fixup:
+|         ret
+
+... omitting the assignment to 'val' in the error path, and leaving
+garbage in the result register returned by the function (which happens
+to contain the faulting address in the generated code).
+
+GCC 14.1.0 (arm64 defconfig) compiles this to:
+
+|         and     x0, x0, #0xff7fffffffffffff
+|         ldtr    x0, [x0]
+|         ret
+| .Lextable_fixup:
+|         mov     x0, #0x900d                     // #36877
+|         ret
+
+GCC 14.1.0 (x86_64 defconfig + MITIGATION_RETPOLINE=n) compiles this to:
+
+|         endbr64
+|         mov    (%rdi),%rax
+|         ret
+| .Lextable_fixup:
+|         mov    $0x900d,%eax
+|         ret
+
+... retaining the expected assignment to 'val' in the error path.
+
+We don't have a complete and reasonable workaround. While placing empty
+asm("") blocks after each goto label *might* be sufficient, we don't
+know for certain, this is tedious and error-prone, and there doesn't
+seem to be a neat way to wrap this up (which is especially painful for
+cases with multiple goto labels).
+
+Avoid this issue by disabling CONFIG_CC_HAS_ASM_GOTO_OUTPUT for
+known-broken compiler versions and removing the workaround (along with
+the CONFIG_GCC_ASM_GOTO_OUTPUT_WORKAROUND config option).
+
+For the moment I've left the default implementation of asm_goto_output()
+unchanged. This should now be redundant since any compiler with the fix
+for the clobbering issue whould also have a fix for the (earlier)
+volatile issue, but it's far less churny to leave it around, which makes
+it easier to backport this patch if necessary.
+
+	Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+	Cc: Alex Coplan <alex.coplan@arm.com>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: Jakub Jelinek <jakub@gcc.gnu.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Sean Christopherson <seanjc@google.com>
+	Cc: Szabolcs Nagy <szabolcs.nagy@arm.com>
+	Cc: Will Deacon <will@kernel.org>
+	Cc: linux-arm-kernel@lists.infradead.org
+	Cc: linux-kernel@vger.kernel.org
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit f2f6a8e8871725035959b90bac048cde555aa0e9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/compiler-gcc.h
+diff --cc include/linux/compiler-gcc.h
+index 589c5f4a3bfd,f805adaa316e..000000000000
+--- a/include/linux/compiler-gcc.h
++++ b/include/linux/compiler-gcc.h
+@@@ -60,15 -53,16 +60,24 @@@
+  #define barrier_before_unreachable() asm volatile("")
+  
+  /*
+ - * Mark a position in code as unreachable.  This can be used to
+ - * suppress control flow warnings after asm blocks that transfer
+ - * control elsewhere.
+ + * GCC 'asm goto' miscompiles certain code sequences:
+ + *
+ + *   http://gcc.gnu.org/bugzilla/show_bug.cgi?id=58670
+ + *
+ + * Work it around via a compiler barrier quirk suggested by Jakub Jelinek.
+ + *
+ + * (asm goto is automatically volatile - the naming reflects this.)
+   */
+++<<<<<<< HEAD
+ +#define asm_volatile_goto(x...)	do { asm goto(x); asm (""); } while (0)
+++=======
++ #define unreachable() \
++ 	do {					\
++ 		annotate_unreachable();		\
++ 		barrier_before_unreachable();	\
++ 		__builtin_unreachable();	\
++ 	} while (0)
+++>>>>>>> f2f6a8e88717 (init/Kconfig: remove CONFIG_GCC_ASM_GOTO_OUTPUT_WORKAROUND)
+  
+  #if defined(CONFIG_ARCH_USE_BUILTIN_BSWAP)
+  #define __HAVE_BUILTIN_BSWAP32__
+* Unmerged path include/linux/compiler-gcc.h
+diff --git a/init/Kconfig b/init/Kconfig
+index f7f1675bb4db..df5a34169f22 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -70,8 +70,19 @@ config CC_CAN_LINK_STATIC
+ 	default $(success,$(srctree)/scripts/cc-can-link.sh $(CC) $(CLANG_FLAGS) $(USERCFLAGS) $(USERLDFLAGS) $(m64-flag) -static) if 64BIT
+ 	default $(success,$(srctree)/scripts/cc-can-link.sh $(CC) $(CLANG_FLAGS) $(USERCFLAGS) $(USERLDFLAGS) $(m32-flag) -static)
+ 
++# Fixed in GCC 14, 13.3, 12.4 and 11.5
++# https://gcc.gnu.org/bugzilla/show_bug.cgi?id=113921
++config GCC_ASM_GOTO_OUTPUT_BROKEN
++	bool
++	depends on CC_IS_GCC
++	default y if GCC_VERSION < 110500
++	default y if GCC_VERSION >= 120000 && GCC_VERSION < 120400
++	default y if GCC_VERSION >= 130000 && GCC_VERSION < 130300
++
+ config CC_HAS_ASM_GOTO_OUTPUT
+-	def_bool $(success,echo 'int foo(int x) { asm goto ("": "=r"(x) ::: bar); return x; bar: return 0; }' | $(CC) -x c - -c -o /dev/null)
++	def_bool y
++	depends on !GCC_ASM_GOTO_OUTPUT_BROKEN
++	depends on $(success,echo 'int foo(int x) { asm goto ("": "=r"(x) ::: bar); return x; bar: return 0; }' | $(CC) -x c - -c -o /dev/null)
+ 
+ config CC_HAS_ASM_GOTO_TIED_OUTPUT
+ 	depends on CC_HAS_ASM_GOTO_OUTPUT
