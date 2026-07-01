@@ -57,11 +57,6 @@ bool check_vmflag_io(void *addr);
 int write_sysfs(const char *file_path, unsigned long val);
 int read_sysfs(const char *file_path, unsigned long *val);
 
-static inline int sz2ord(size_t size)
-{
-	return __builtin_ctzll(size / getpagesize());
-}
-
 /*
  * On ppc64 this will only work with radix 2M hugepage size
  */
