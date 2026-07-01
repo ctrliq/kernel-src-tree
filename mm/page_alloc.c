@@ -4290,10 +4290,8 @@ restart:
 	 * that first
 	 */
 	page = get_page_from_freelist(gfp_mask, order, alloc_flags, ac);
-	if (page) {
-		set_page_refcounted(page);
+	if (page)
 		goto got_pg;
-	}
 
 	/*
 	 * For costly allocations, try direct compaction first, as it's likely
@@ -4312,10 +4310,8 @@ restart:
 						alloc_flags, ac,
 						INIT_COMPACT_PRIORITY,
 						&compact_result);
-		if (page) {
-			set_page_refcounted(page);
+		if (page)
 			goto got_pg;
-		}
 
 		/*
 		 * Checks for costly allocations with __GFP_NORETRY, which
@@ -4375,10 +4371,8 @@ retry:
 
 	/* Attempt with potentially adjusted zonelist and alloc_flags */
 	page = get_page_from_freelist(gfp_mask, order, alloc_flags, ac);
-	if (page) {
-		set_page_refcounted(page);
+	if (page)
 		goto got_pg;
-	}
 
 	/* Caller is not willing to reclaim, we can't balance anything */
 	if (!can_direct_reclaim)
@@ -4391,18 +4385,14 @@ retry:
 	/* Try direct reclaim and then allocating */
 	page = __alloc_pages_direct_reclaim(gfp_mask, order, alloc_flags, ac,
 							&did_some_progress);
-	if (page) {
-		set_page_refcounted(page);
+	if (page)
 		goto got_pg;
-	}
 
 	/* Try direct compaction and then allocating */
 	page = __alloc_pages_direct_compact(gfp_mask, order, alloc_flags, ac,
 					compact_priority, &compact_result);
-	if (page) {
-		set_page_refcounted(page);
+	if (page)
 		goto got_pg;
-	}
 
 	/* Do not loop if specifically requested */
 	if (gfp_mask & __GFP_NORETRY)
@@ -4443,10 +4433,8 @@ retry:
 
 	/* Reclaim has failed us, start killing things */
 	page = __alloc_pages_may_oom(gfp_mask, order, ac, &did_some_progress);
-	if (page) {
-		set_page_refcounted(page);
+	if (page)
 		goto got_pg;
-	}
 
 	/* Avoid allocations with no watermarks from looping endlessly */
 	if (tsk_is_oom_victim(current) &&
@@ -4490,10 +4478,8 @@ nopage:
 		 * the situation worse.
 		 */
 		page = __alloc_pages_cpuset_fallback(gfp_mask, order, ALLOC_MIN_RESERVE, ac);
-		if (page) {
-			set_page_refcounted(page);
+		if (page)
 			goto got_pg;
-		}
 
 		cond_resched();
 		goto retry;
@@ -4790,6 +4776,8 @@ struct page *__alloc_pages_noprof(gfp_t gfp, unsigned int order,
 	ac.nodemask = nodemask;
 
 	page = __alloc_pages_slowpath(alloc_gfp, order, &ac);
+	if (page)
+		set_page_refcounted(page);
 
 out:
 	if (memcg_kmem_online() && (gfp & __GFP_ACCOUNT) && page &&
