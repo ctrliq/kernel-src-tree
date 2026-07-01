@@ -936,7 +936,7 @@ static int rtw89_usb_intf_init(struct rtw89_dev *rtwdev,
 	if (!rtwusb->vendor_req_buf)
 		return -ENOMEM;
 
-	rtwusb->udev = usb_get_dev(interface_to_usbdev(intf));
+	rtwusb->udev = interface_to_usbdev(intf);
 
 	usb_set_intfdata(intf, rtwdev->hw);
 
@@ -950,7 +950,6 @@ static void rtw89_usb_intf_deinit(struct rtw89_dev *rtwdev,
 {
 	struct rtw89_usb *rtwusb = rtw89_usb_priv(rtwdev);
 
-	usb_put_dev(rtwusb->udev);
 	kfree(rtwusb->vendor_req_buf);
 	usb_set_intfdata(intf, NULL);
 }
