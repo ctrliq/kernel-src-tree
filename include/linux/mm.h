@@ -42,6 +42,7 @@ struct user_struct;
 struct pt_regs;
 struct folio_batch;
 
+void arch_mm_preinit(void);
 void mm_core_init(void);
 void init_mm_internals(void);
 
