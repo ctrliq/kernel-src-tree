@@ -64,28 +64,72 @@ static ssize_t queue_requests_show(struct gendisk *disk, char *page)
 static ssize_t
 queue_requests_store(struct gendisk *disk, const char *page, size_t count)
 {
-	unsigned long nr;
-	int ret, err;
-	unsigned int memflags;
 	struct request_queue *q = disk->queue;
-
-	if (!queue_is_mq(q))
-		return -EINVAL;
+	struct blk_mq_tag_set *set = q->tag_set;
+	struct elevator_tags *et = NULL;
+	unsigned int memflags;
+	unsigned long nr;
+	int ret;
 
 	ret = queue_var_store(&nr, page, count);
 	if (ret < 0)
 		return ret;
 
-	memflags = blk_mq_freeze_queue(q);
-	mutex_lock(&q->elevator_lock);
+	/*
+	 * Serialize updating nr_requests with concurrent queue_requests_store()
+	 * and switching elevator.
+	 *
+	 * Use trylock to avoid circular lock dependency with kernfs active
+	 * reference during concurrent disk deletion:
+	 *   update_nr_hwq_lock -> kn->active (via del_gendisk -> kobject_del)
+	 *   kn->active -> update_nr_hwq_lock (via this sysfs write path)
+	 */
+	if (!down_write_trylock(&set->update_nr_hwq_lock))
+		return -EBUSY;
+
+	if (nr == q->nr_requests)
+		goto unlock;
+
 	if (nr < BLKDEV_MIN_RQ)
 		nr = BLKDEV_MIN_RQ;
 
-	err = blk_mq_update_nr_requests(disk->queue, nr);
-	if (err)
-		ret = err;
+	/*
+	 * Switching elevator is protected by update_nr_hwq_lock:
+	 *  - read lock is held from elevator sysfs attribute;
+	 *  - write lock is held from updating nr_hw_queues;
+	 * Hence it's safe to access q->elevator here with write lock held.
+	 */
+	if (nr <= set->reserved_tags ||
+	    (q->elevator && nr > MAX_SCHED_RQ) ||
+	    (!q->elevator && nr > set->queue_depth)) {
+		ret = -EINVAL;
+		goto unlock;
+	}
+
+	if (!blk_mq_is_shared_tags(set->flags) && q->elevator &&
+	    nr > q->elevator->et->nr_requests) {
+		/*
+		 * Tags will grow, allocate memory before freezing queue to
+		 * prevent deadlock.
+		 */
+		et = blk_mq_alloc_sched_tags(set, q->nr_hw_queues, nr);
+		if (!et) {
+			ret = -ENOMEM;
+			goto unlock;
+		}
+	}
+
+	memflags = blk_mq_freeze_queue(q);
+	mutex_lock(&q->elevator_lock);
+	et = blk_mq_update_nr_requests(q, et, nr);
 	mutex_unlock(&q->elevator_lock);
 	blk_mq_unfreeze_queue(q, memflags);
+
+	if (et)
+		blk_mq_free_sched_tags(et, set);
+
+unlock:
+	up_write(&set->update_nr_hwq_lock);
 	return ret;
 }
 
