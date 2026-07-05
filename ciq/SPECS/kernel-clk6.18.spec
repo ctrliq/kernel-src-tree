@@ -168,7 +168,7 @@ Summary: The Linux kernel
 %define debugbuildsenabled 1
 %define el_version 9
 %define kernel_major_minor 6.18
-%define kernel_patch 36
+%define kernel_patch 38
 %define buildid .1
 %define specversion %{kernel_major_minor}.%{kernel_patch}
 %define pkgrelease 1%{?buildid}
@@ -4505,8 +4505,9 @@ fi\
 #
 #
 %changelog
-* Fri Jun 26 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.36-1.1.el9
--- Rebased changes for Linux 6.18.36 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.36-1)
+* Sun Jul 05 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.18.38-1.1.el9
+-- Rebased changes for Linux 6.18.38 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.38-1)
+-- [CIQ] v6.18.36 - updated spec (Brett Mastbergen)
 -- [CIQ] v6.18.36 - rebased configs (Brett Mastbergen)
 -- [CIQ] ciq_kernel-6.18.35-3 - updated spec (Brett Mastbergen)
 -- Revert "mm/gup: reintroduce pin_user_pages_fast_only()" (Sultan Alsawaf)
@@ -4608,7 +4609,7 @@ fi\
 -- github actions: Make Builds on Merge Request Work (Jonathan Maple)
 -- Add initial CIQ config tweaks (Brett Mastbergen)
 -- Add CIQ configs (Brett Mastbergen)
--- Linux 6.18.36 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.18.36)
+-- Linux 6.18.38 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.18.38)
 
 
 ###
