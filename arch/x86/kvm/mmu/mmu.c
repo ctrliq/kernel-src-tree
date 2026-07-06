@@ -188,6 +188,8 @@ static struct percpu_counter kvm_total_used_mmu_pages;
 static void mmu_spte_set(u64 *sptep, u64 spte);
 static union kvm_mmu_page_role
 kvm_mmu_calc_root_page_role(struct kvm_vcpu *vcpu);
+static int mmu_page_zap_pte(struct kvm *kvm, struct kvm_mmu_page *sp,
+			    u64 *spte, struct list_head *invalid_list);
 
 struct kvm_mmu_role_regs {
 	const unsigned long cr0;
@@ -2076,20 +2078,19 @@ static void clear_sp_write_flooding_count(u64 *spte)
 	__clear_sp_write_flooding_count(sptep_to_sp(spte));
 }
 
-static struct kvm_mmu_page *kvm_mmu_get_page(struct kvm_vcpu *vcpu,
-					     gfn_t gfn,
-					     gva_t gaddr,
-					     unsigned level,
-					     int direct,
-					     unsigned int access)
+/*
+ * Compute the role a shadow page would have if allocated for the given
+ * (gaddr, level, direct, access).  This mirrors the role derivation in
+ * kvm_mmu_get_page() so the reuse guard (see kvm_mmu_child_sp_matches())
+ * and the allocation path cannot drift.
+ */
+static union kvm_mmu_page_role
+kvm_mmu_child_role(struct kvm_vcpu *vcpu, gva_t gaddr, unsigned int level,
+		   int direct, unsigned int access)
 {
 	bool direct_mmu = vcpu->arch.mmu->direct_map;
 	union kvm_mmu_page_role role;
-	struct hlist_head *sp_list;
 	unsigned quadrant;
-	struct kvm_mmu_page *sp;
-	int collisions = 0;
-	LIST_HEAD(invalid_list);
 
 	role = vcpu->arch.mmu->mmu_role.base;
 	role.level = level;
@@ -2102,6 +2103,67 @@ static struct kvm_mmu_page *kvm_mmu_get_page(struct kvm_vcpu *vcpu,
 		quadrant &= (1 << ((PT32_PT_BITS - PT64_PT_BITS) * level)) - 1;
 		role.quadrant = quadrant;
 	}
+
+	return role;
+}
+
+/*
+ * Return true iff the present, non-large shadow-page table pointed to by
+ * @sptep can be safely reused as the child for a fault expecting a page at
+ * @gfn.
+ *
+ * Prior to the CVE-2026-46113 (unexpected GFN) fix, the fault-path walkers
+ * (__direct_map() and FNAME(fetch)) reused a present interior SPTE without
+ * re-validating that the child shadow page it references still maps the
+ * walk's expected gfn.  A guest can arrange for the referenced child SP to
+ * have a different gfn, causing rmap add/remove to compute divergent gfns
+ * and corrupting the rmap list (pte_list_remove() BUG / use-after-free).
+ * This matches upstream's kvm_mmu_get_child_sp() -EEXIST guard, which does
+ * not exist on this (pre-6.2 MMU refactor) tree, so the equivalent check is
+ * applied at each reuse site instead.
+ */
+static bool kvm_mmu_child_sp_matches(struct kvm_vcpu *vcpu, u64 *sptep,
+				     gfn_t gfn, gva_t gaddr, unsigned int level,
+				     int direct, unsigned int access)
+{
+	struct kvm_mmu_page *child;
+
+	child = to_shadow_page(*sptep & PT64_BASE_ADDR_MASK);
+	if (!child)
+		return false;
+
+	return child->gfn == gfn;
+}
+
+/*
+ * Zap a present interior SPTE whose referenced child shadow page does not
+ * match the walk's expected gfn/role, so the caller falls through to
+ * allocate (or look up) the correct child via kvm_mmu_get_page().
+ */
+static void kvm_mmu_drop_mismatched_child(struct kvm_vcpu *vcpu, u64 *sptep)
+{
+	struct kvm_mmu_page *parent_sp = sptep_to_sp(sptep);
+	LIST_HEAD(invalid_list);
+
+	mmu_page_zap_pte(vcpu->kvm, parent_sp, sptep, &invalid_list);
+	kvm_mmu_remote_flush_or_zap(vcpu->kvm, &invalid_list, true);
+}
+
+static struct kvm_mmu_page *kvm_mmu_get_page(struct kvm_vcpu *vcpu,
+					     gfn_t gfn,
+					     gva_t gaddr,
+					     unsigned level,
+					     int direct,
+					     unsigned int access)
+{
+	bool direct_mmu = vcpu->arch.mmu->direct_map;
+	union kvm_mmu_page_role role;
+	struct hlist_head *sp_list;
+	struct kvm_mmu_page *sp;
+	int collisions = 0;
+	LIST_HEAD(invalid_list);
+
+	role = kvm_mmu_child_role(vcpu, gaddr, level, direct, access);
 
 	sp_list = &vcpu->kvm->arch.mmu_page_hash[kvm_page_table_hashfn(gfn)];
 	for_each_valid_sp(vcpu->kvm, sp, sp_list) {
@@ -2998,6 +3060,18 @@ static int __direct_map(struct kvm_vcpu *vcpu, gpa_t gpa, u32 error_code,
 			break;
 
 		drop_large_spte(vcpu, it.sptep);
+
+		/*
+		 * If a present interior SPTE references a child shadow page
+		 * whose gfn/role no longer matches this walk, zap it so the
+		 * correct child is (re)allocated below.  Guards against the
+		 * CVE-2026-46113/CVE-2026-53359 rmap divergence UAF.
+		 */
+		if (is_shadow_present_pte(*it.sptep) &&
+		    !kvm_mmu_child_sp_matches(vcpu, it.sptep, base_gfn, it.addr,
+					      it.level - 1, true, ACC_ALL))
+			kvm_mmu_drop_mismatched_child(vcpu, it.sptep);
+
 		if (is_shadow_present_pte(*it.sptep))
 			continue;
 

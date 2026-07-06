@@ -661,10 +661,22 @@ static int FNAME(fetch)(struct kvm_vcpu *vcpu, gpa_t addr,
 		clear_sp_write_flooding_count(it.sptep);
 		drop_large_spte(vcpu, it.sptep);
 
+		table_gfn = gw->table_gfn[it.level - 2];
+		access = gw->pt_access[it.level - 2];
+
+		/*
+		 * If a present interior SPTE references a child shadow page
+		 * whose gfn/role no longer matches this walk, zap it so the
+		 * correct child is (re)allocated below.  Guards against the
+		 * CVE-2026-46113/CVE-2026-53359 rmap divergence UAF.
+		 */
+		if (is_shadow_present_pte(*it.sptep) &&
+		    !kvm_mmu_child_sp_matches(vcpu, it.sptep, table_gfn, addr,
+					      it.level - 1, false, access))
+			kvm_mmu_drop_mismatched_child(vcpu, it.sptep);
+
 		sp = NULL;
 		if (!is_shadow_present_pte(*it.sptep)) {
-			table_gfn = gw->table_gfn[it.level - 2];
-			access = gw->pt_access[it.level - 2];
 			sp = kvm_mmu_get_page(vcpu, table_gfn, addr,
 					      it.level-1, false, access);
 			/*
@@ -722,6 +734,17 @@ static int FNAME(fetch)(struct kvm_vcpu *vcpu, gpa_t addr,
 		validate_direct_spte(vcpu, it.sptep, direct_access);
 
 		drop_large_spte(vcpu, it.sptep);
+
+		/*
+		 * If a present interior SPTE references a child shadow page
+		 * whose gfn/role no longer matches this walk, zap it so the
+		 * correct child is (re)allocated below.  Guards against the
+		 * CVE-2026-46113/CVE-2026-53359 rmap divergence UAF.
+		 */
+		if (is_shadow_present_pte(*it.sptep) &&
+		    !kvm_mmu_child_sp_matches(vcpu, it.sptep, base_gfn, addr,
+					      it.level - 1, true, direct_access))
+			kvm_mmu_drop_mismatched_child(vcpu, it.sptep);
 
 		if (!is_shadow_present_pte(*it.sptep)) {
 			sp = kvm_mmu_get_page(vcpu, base_gfn, addr,
