@@ -2033,29 +2033,32 @@ kvm_mmu_child_role(struct kvm_vcpu *vcpu, gva_t gaddr, unsigned int level,
 /*
  * Return true iff the present, non-large shadow-page table pointed to by
  * @sptep can be safely reused as the child for a fault expecting a page at
- * @gfn.
+ * @gfn with role derived from (@gaddr, @level, @direct, @access).
  *
- * Prior to the CVE-2026-46113 (unexpected GFN) fix, the fault-path walkers
- * (__direct_map() and FNAME(fetch)) reused a present interior SPTE without
- * re-validating that the child shadow page it references still maps the
- * walk's expected gfn.  A guest can arrange for the referenced child SP to
- * have a different gfn, causing rmap add/remove to compute divergent gfns
- * and corrupting the rmap list (pte_list_remove() BUG / use-after-free).
- * This matches upstream's kvm_mmu_get_child_sp() -EEXIST guard, which does
- * not exist on this (pre-6.2 MMU refactor) tree, so the equivalent check is
+ * Prior to the CVE-2026-46113 (unexpected GFN) and CVE-2026-53359
+ * (unexpected role) fixes, the fault-path walkers (__direct_map() and
+ * FNAME(fetch)) reused a present interior SPTE without re-validating that
+ * the child shadow page it references still matches the walk's expected
+ * gfn and role.  A guest can arrange for the referenced child SP to have a
+ * different gfn/role, causing rmap add/remove to compute divergent gfns and
+ * corrupting the rmap list (pte_list_remove() BUG / use-after-free).  This
+ * matches upstream's kvm_mmu_get_child_sp() -EEXIST guard, which does not
+ * exist on this (pre-6.2 MMU refactor) tree, so the equivalent check is
  * applied at each reuse site instead.
  */
 static bool kvm_mmu_child_sp_matches(struct kvm_vcpu *vcpu, u64 *sptep,
 				     gfn_t gfn, gva_t gaddr, unsigned int level,
 				     int direct, unsigned int access)
 {
+	union kvm_mmu_page_role role;
 	struct kvm_mmu_page *child;
 
 	child = to_shadow_page(*sptep & PT64_BASE_ADDR_MASK);
 	if (!child)
 		return false;
 
-	return child->gfn == gfn;
+	role = kvm_mmu_child_role(vcpu, gaddr, level, direct, access);
+	return child->gfn == gfn && child->role.word == role.word;
 }
 
 /*
