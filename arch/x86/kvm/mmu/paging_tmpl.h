@@ -659,11 +659,11 @@ static int FNAME(fetch)(struct kvm_vcpu *vcpu, gpa_t addr,
 		gfn_t table_gfn;
 
 		clear_sp_write_flooding_count(it.sptep);
-		drop_large_spte(vcpu, it.sptep);
 
+		table_gfn = gw->table_gfn[it.level - 2];
 		sp = NULL;
-		if (!is_shadow_present_pte(*it.sptep)) {
-			table_gfn = gw->table_gfn[it.level - 2];
+		if (!kvm_mmu_child_sp_exists(it.sptep, table_gfn)) {
+			drop_large_spte(vcpu, it.sptep);
 			access = gw->pt_access[it.level - 2];
 			sp = kvm_mmu_get_page(vcpu, table_gfn, addr,
 					      it.level-1, false, access);
@@ -721,9 +721,8 @@ static int FNAME(fetch)(struct kvm_vcpu *vcpu, gpa_t addr,
 
 		validate_direct_spte(vcpu, it.sptep, direct_access);
 
-		drop_large_spte(vcpu, it.sptep);
-
-		if (!is_shadow_present_pte(*it.sptep)) {
+		if (!kvm_mmu_child_sp_exists(it.sptep, base_gfn)) {
+			drop_large_spte(vcpu, it.sptep);
 			sp = kvm_mmu_get_page(vcpu, base_gfn, addr,
 					      it.level - 1, true, direct_access);
 			link_shadow_page(vcpu, it.sptep, sp);
