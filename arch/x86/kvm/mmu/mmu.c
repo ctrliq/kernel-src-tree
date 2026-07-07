@@ -1125,28 +1125,6 @@ static void drop_spte(struct kvm *kvm, u64 *sptep)
 		rmap_remove(kvm, sptep);
 }
 
-
-static bool __drop_large_spte(struct kvm *kvm, u64 *sptep)
-{
-	if (is_large_pte(*sptep)) {
-		WARN_ON(sptep_to_sp(sptep)->role.level == PG_LEVEL_4K);
-		drop_spte(kvm, sptep);
-		return true;
-	}
-
-	return false;
-}
-
-static void drop_large_spte(struct kvm_vcpu *vcpu, u64 *sptep)
-{
-	if (__drop_large_spte(vcpu->kvm, sptep)) {
-		struct kvm_mmu_page *sp = sptep_to_sp(sptep);
-
-		kvm_flush_remote_tlbs_with_address(vcpu->kvm, sp->gfn,
-			KVM_PAGES_PER_HPAGE(sp->role.level));
-	}
-}
-
 /*
  * Write-protect on the specified @sptep, @pt_protect indicates whether
  * spte write-protection is caused by protecting shadow page table.
@@ -2237,6 +2215,33 @@ static int mmu_page_zap_pte(struct kvm *kvm, struct kvm_mmu_page *sp,
 	return 0;
 }
 
+static bool kvm_mmu_child_sp_exists(u64 *sptep, gfn_t gfn)
+{
+	struct kvm_mmu_page *child;
+
+	if (!is_shadow_present_pte(*sptep) || is_large_pte(*sptep))
+		return false;
+
+	child = to_shadow_page(*sptep & PT64_BASE_ADDR_MASK);
+	return child && child->gfn == gfn;
+}
+
+static void drop_large_spte(struct kvm_vcpu *vcpu, u64 *sptep)
+{
+	struct kvm *kvm = vcpu->kvm;
+	struct kvm_mmu_page *parent_sp;
+	LIST_HEAD(invalid_list);
+
+	if (!is_shadow_present_pte(*sptep))
+		return;
+
+	parent_sp = sptep_to_sp(sptep);
+	WARN_ON_ONCE(parent_sp->role.level == PG_LEVEL_4K);
+
+	mmu_page_zap_pte(kvm, parent_sp, sptep, &invalid_list);
+	kvm_mmu_remote_flush_or_zap(kvm, &invalid_list, true);
+}
+
 static int kvm_mmu_page_unlink_children(struct kvm *kvm,
 					struct kvm_mmu_page *sp,
 					struct list_head *invalid_list)
@@ -2945,10 +2950,10 @@ static int __direct_map(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
 		if (it.level == fault->goal_level)
 			break;
 
-		drop_large_spte(vcpu, it.sptep);
-		if (is_shadow_present_pte(*it.sptep))
+		if (kvm_mmu_child_sp_exists(it.sptep, base_gfn))
 			continue;
 
+		drop_large_spte(vcpu, it.sptep);
 		sp = kvm_mmu_get_page(vcpu, base_gfn, it.addr,
 				      it.level - 1, true, ACC_ALL);
 
