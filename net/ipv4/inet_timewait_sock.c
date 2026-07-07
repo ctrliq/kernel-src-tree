@@ -15,7 +15,7 @@
 #include <net/inet_hashtables.h>
 #include <net/inet_timewait_sock.h>
 #include <net/ip.h>
-
+#include <net/tcp.h>
 #include <net/psp.h>
 
 /**
@@ -75,7 +75,8 @@ static void inet_twsk_kill(struct inet_timewait_sock *tw)
 void inet_twsk_free(struct inet_timewait_sock *tw)
 {
 	struct module *owner = tw->tw_prot->owner;
-	twsk_destructor((struct sock *)tw);
+
+	tcp_twsk_destructor((struct sock *)tw);
 	kmem_cache_free(tw->tw_prot->twsk_prot->twsk_slab, tw);
 	module_put(owner);
 }
