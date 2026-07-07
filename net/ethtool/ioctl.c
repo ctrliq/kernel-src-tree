@@ -33,6 +33,7 @@
 #include <net/flow_offload.h>
 #include <net/netdev_lock.h>
 #include <linux/ethtool_netlink.h>
+
 #include "common.h"
 
 /* State held across locks and calls for commands which have devlink fallback */
@@ -1404,9 +1405,9 @@ static noinline_for_stack int ethtool_set_rxfh_indir(struct net_device *dev,
 
 	/* indicate whether rxfh was set to default */
 	if (user_size == 0)
-		dev->priv_flags &= ~IFF_RXFH_CONFIGURED;
+		dev->ethtool->rss_indir_user_size = 0;
 	else
-		dev->priv_flags |= IFF_RXFH_CONFIGURED;
+		dev->ethtool->rss_indir_user_size = rxfh_dev.indir_size;
 
 out_unlock:
 	mutex_unlock(&dev->ethtool->rss_lock);
@@ -1721,9 +1722,9 @@ static noinline_for_stack int ethtool_set_rxfh(struct net_device *dev,
 	if (!rxfh_dev.rss_context) {
 		/* indicate whether rxfh was set to default */
 		if (rxfh.indir_size == 0)
-			dev->priv_flags &= ~IFF_RXFH_CONFIGURED;
+			dev->ethtool->rss_indir_user_size = 0;
 		else if (rxfh.indir_size != ETH_RXFH_INDIR_NO_CHANGE)
-			dev->priv_flags |= IFF_RXFH_CONFIGURED;
+			dev->ethtool->rss_indir_user_size = dev_indir_size;
 	}
 	/* Update rss_ctx tracking */
 	if (rxfh_dev.rss_delete) {
@@ -1736,6 +1737,7 @@ static noinline_for_stack int ethtool_set_rxfh(struct net_device *dev,
 			ctx->indir_configured =
 				rxfh.indir_size &&
 				rxfh.indir_size != ETH_RXFH_INDIR_NO_CHANGE;
+			ctx->indir_user_size = dev_indir_size;
 		}
 		if (rxfh_dev.key) {
 			memcpy(ethtool_rxfh_context_key(ctx), rxfh_dev.key,
@@ -2383,7 +2385,10 @@ static int ethtool_get_strings(struct net_device *dev, void __user *useraddr)
 		return -ENOMEM;
 	WARN_ON_ONCE(!ret);
 
-	gstrings.len = ret;
+	if (gstrings.len && gstrings.len != ret)
+		gstrings.len = 0;
+	else
+		gstrings.len = ret;
 
 	if (gstrings.len) {
 		data = vzalloc(array_size(gstrings.len, ETH_GSTRING_LEN));
@@ -2509,10 +2514,13 @@ static int ethtool_get_stats(struct net_device *dev, void __user *useraddr)
 	if (copy_from_user(&stats, useraddr, sizeof(stats)))
 		return -EFAULT;
 
-	stats.n_stats = n_stats;
+	if (stats.n_stats && stats.n_stats != n_stats)
+		stats.n_stats = 0;
+	else
+		stats.n_stats = n_stats;
 
-	if (n_stats) {
-		data = vzalloc(array_size(n_stats, sizeof(u64)));
+	if (stats.n_stats) {
+		data = vzalloc(array_size(stats.n_stats, sizeof(u64)));
 		if (!data)
 			return -ENOMEM;
 		ops->get_ethtool_stats(dev, &stats, data);
@@ -2524,7 +2532,9 @@ static int ethtool_get_stats(struct net_device *dev, void __user *useraddr)
 	if (copy_to_user(useraddr, &stats, sizeof(stats)))
 		goto out;
 	useraddr += sizeof(stats);
-	if (n_stats && copy_to_user(useraddr, data, array_size(n_stats, sizeof(u64))))
+	if (stats.n_stats &&
+	    copy_to_user(useraddr, data,
+			 array_size(stats.n_stats, sizeof(u64))))
 		goto out;
 	ret = 0;
 
@@ -2560,6 +2570,10 @@ static int ethtool_get_phy_stats_phydev(struct phy_device *phydev,
 		return -EOPNOTSUPP;
 
 	n_stats = phy_ops->get_sset_count(phydev);
+	if (stats->n_stats && stats->n_stats != n_stats) {
+		stats->n_stats = 0;
+		return 0;
+	}
 
 	ret = ethtool_vzalloc_stats_array(n_stats, data);
 	if (ret)
@@ -2580,6 +2594,10 @@ static int ethtool_get_phy_stats_ethtool(struct net_device *dev,
 		return -EOPNOTSUPP;
 
 	n_stats = ops->get_sset_count(dev, ETH_SS_PHY_STATS);
+	if (stats->n_stats && stats->n_stats != n_stats) {
+		stats->n_stats = 0;
+		return 0;
+	}
 
 	ret = ethtool_vzalloc_stats_array(n_stats, data);
 	if (ret)
@@ -2616,7 +2634,9 @@ static int ethtool_get_phy_stats(struct net_device *dev, void __user *useraddr)
 	}
 
 	useraddr += sizeof(stats);
-	if (copy_to_user(useraddr, data, array_size(stats.n_stats, sizeof(u64))))
+	if (stats.n_stats &&
+	    copy_to_user(useraddr, data,
+			 array_size(stats.n_stats, sizeof(u64))))
 		ret = -EFAULT;
 
  out:
