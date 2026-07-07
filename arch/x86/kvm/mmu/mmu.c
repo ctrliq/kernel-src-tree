@@ -2053,20 +2053,13 @@ static void clear_sp_write_flooding_count(u64 *spte)
 	__clear_sp_write_flooding_count(sptep_to_sp(spte));
 }
 
-static struct kvm_mmu_page *kvm_mmu_get_page(struct kvm_vcpu *vcpu,
-					     gfn_t gfn,
-					     gva_t gaddr,
-					     unsigned level,
-					     int direct,
-					     unsigned int access)
+static union kvm_mmu_page_role
+kvm_mmu_child_role(struct kvm_vcpu *vcpu, gva_t gaddr, unsigned level,
+		   int direct, unsigned int access)
 {
 	bool direct_mmu = vcpu->arch.mmu->direct_map;
 	union kvm_mmu_page_role role;
-	struct hlist_head *sp_list;
 	unsigned quadrant;
-	struct kvm_mmu_page *sp;
-	int collisions = 0;
-	LIST_HEAD(invalid_list);
 
 	role = vcpu->arch.mmu->mmu_role.base;
 	role.level = level;
@@ -2079,6 +2072,25 @@ static struct kvm_mmu_page *kvm_mmu_get_page(struct kvm_vcpu *vcpu,
 		quadrant &= (1 << ((PT32_PT_BITS - PT64_PT_BITS) * level)) - 1;
 		role.quadrant = quadrant;
 	}
+
+	return role;
+}
+
+static struct kvm_mmu_page *kvm_mmu_get_page(struct kvm_vcpu *vcpu,
+					     gfn_t gfn,
+					     gva_t gaddr,
+					     unsigned level,
+					     int direct,
+					     unsigned int access)
+{
+	bool direct_mmu = vcpu->arch.mmu->direct_map;
+	union kvm_mmu_page_role role;
+	struct hlist_head *sp_list;
+	struct kvm_mmu_page *sp;
+	int collisions = 0;
+	LIST_HEAD(invalid_list);
+
+	role = kvm_mmu_child_role(vcpu, gaddr, level, direct, access);
 
 	sp_list = &vcpu->kvm->arch.mmu_page_hash[kvm_page_table_hashfn(gfn)];
 	for_each_valid_sp(vcpu->kvm, sp, sp_list) {
@@ -2289,15 +2301,22 @@ static int mmu_page_zap_pte(struct kvm *kvm, struct kvm_mmu_page *sp,
 	return 0;
 }
 
-static bool kvm_mmu_child_sp_exists(u64 *sptep, gfn_t gfn)
+static bool kvm_mmu_child_sp_exists(struct kvm_vcpu *vcpu, u64 *sptep,
+				    gfn_t gfn, gva_t gaddr, unsigned level,
+				    int direct, unsigned int access)
 {
+	union kvm_mmu_page_role role;
 	struct kvm_mmu_page *child;
 
 	if (!is_shadow_present_pte(*sptep) || is_large_pte(*sptep))
 		return false;
 
 	child = to_shadow_page(*sptep & PT64_BASE_ADDR_MASK);
-	return child && child->gfn == gfn;
+	if (!child)
+		return false;
+
+	role = kvm_mmu_child_role(vcpu, gaddr, level, direct, access);
+	return child->gfn == gfn && child->role.word == role.word;
 }
 
 static void drop_large_spte(struct kvm_vcpu *vcpu, u64 *sptep)
@@ -3001,7 +3020,8 @@ static int __direct_map(struct kvm_vcpu *vcpu, gpa_t gpa, u32 error_code,
 		if (it.level == level)
 			break;
 
-		if (kvm_mmu_child_sp_exists(it.sptep, base_gfn))
+		if (kvm_mmu_child_sp_exists(vcpu, it.sptep, base_gfn, it.addr,
+					    it.level - 1, true, ACC_ALL))
 			continue;
 
 		drop_large_spte(vcpu, it.sptep);
