@@ -15,6 +15,8 @@ TEST_PROGS := \
 	big_tcp.sh \
 	bind_bhash.sh \
 	bpf_offload.py \
+	bridge_stp_mode.sh \
+	bridge_vlan_dump.sh \
 	busy_poll_test.sh \
 	cmsg_ipv6.sh \
 	cmsg_so_mark.sh \
