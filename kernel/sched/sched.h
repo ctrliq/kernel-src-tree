@@ -1183,6 +1183,12 @@ struct rq {
 #ifdef CONFIG_PARAVIRT_TIME_ACCOUNTING
 	u64			prev_steal_time_rq;
 #endif
+#ifdef CONFIG_SCHED_CACHE
+	raw_spinlock_t		cpu_epoch_lock ____cacheline_aligned;
+	u64			cpu_runtime;
+	unsigned long		cpu_epoch;
+	unsigned long		cpu_epoch_next;
+#endif
 
 	/* calc_load related fields */
 	unsigned long		calc_load_update;
@@ -3426,6 +3432,14 @@ extern int preempt_dynamic_mode;
 extern int sched_dynamic_mode(const char *str);
 extern void sched_dynamic_update(int mode);
 #endif
+
+#ifdef CONFIG_SCHED_CACHE
+static inline bool sched_cache_enabled(void)
+{
+	return false;
+}
+#endif
+extern void init_sched_mm(struct task_struct *p);
 
 #ifdef CONFIG_SMP
 static inline
