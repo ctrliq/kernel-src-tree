@@ -755,6 +755,11 @@ static inline u32 per_cpu_l2c_id(unsigned int cpu)
 	return per_cpu(cpu_info.topo.l2c_id, cpu);
 }
 
+static inline u32 per_cpu_core_id(unsigned int cpu)
+{
+	return per_cpu(cpu_info.topo.core_id, cpu);
+}
+
 #ifdef CONFIG_CPU_SUP_AMD
 extern void amd_clear_divider(void);
 extern void amd_check_microcode(void);
