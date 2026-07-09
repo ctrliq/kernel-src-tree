@@ -13,6 +13,7 @@
 #include <linux/netdevice.h>
 #include <linux/notifier.h>
 #include <linux/rtnetlink.h>
+#include <net/netlink.h>
 
 #include <linux/rh_kabi.h>
 
@@ -268,7 +269,11 @@ struct dpll_pin_notifier_info {
 void dpll_netdev_pin_set(struct net_device *dev, struct dpll_pin *dpll_pin);
 void dpll_netdev_pin_clear(struct net_device *dev);
 
-size_t dpll_netdev_pin_handle_size(const struct net_device *dev);
+static inline size_t dpll_netdev_pin_handle_size(void)
+{
+	return nla_total_size(4); /* DPLL_A_PIN_ID */
+}
+
 int dpll_netdev_add_pin_handle(struct sk_buff *msg,
 			       const struct net_device *dev);
 
@@ -279,7 +284,7 @@ static inline void
 dpll_netdev_pin_set(struct net_device *dev, struct dpll_pin *dpll_pin) { }
 static inline void dpll_netdev_pin_clear(struct net_device *dev) { }
 
-static inline size_t dpll_netdev_pin_handle_size(const struct net_device *dev)
+static inline size_t dpll_netdev_pin_handle_size(void)
 {
 	return 0;
 }
