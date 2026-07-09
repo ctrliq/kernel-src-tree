@@ -213,6 +213,8 @@ Summary: The Linux kernel
 %define with_arm64_16k %{?_with_arm64_16k:    1} %{?!_with_arm64_16k:    0}
 # kernel-64k (aarch64 kernel with 64K page_size)
 %define with_arm64_64k %{?_without_arm64_64k: 0} %{?!_without_arm64_64k: 1}
+# kernel-minimal (x86_64 kernel with minimal config)
+%define with_x86_64_minimal %{?_without_x86_64_minimal: 0} %{?!_without_x86_64_minimal: 1}
 # we default reatime builds to off for fedora and on for rhel/centos/eln
 %if 0%{?fedora}
 # kernel-rt (x86_64 and aarch64 only PREEMPT_RT enabled kernel)
@@ -229,13 +231,14 @@ Summary: The Linux kernel
 %define with_automotive %{?_with_automotive:  1} %{?!_with_automotive:   0}
 
 # Supported variants
-#            with_base with_debug    with_gcov
-# up         X         X             X
-# zfcpdump   X                       X
-# arm64_16k  X         X             X
-# arm64_64k  X         X             X
-# realtime   X         X             X
-# automotive X         X             X
+#                with_base with_debug    with_gcov
+# up             X         X             X
+# zfcpdump       X                       X
+# arm64_16k      X         X             X
+# arm64_64k      X         X             X
+# x86_64_minimal X                       X
+# realtime       X         X             X
+# automotive     X         X             X
 
 # kernel-doc
 %define with_doc       %{?_without_doc:       0} %{?!_without_doc:       1}
@@ -265,6 +268,8 @@ Summary: The Linux kernel
 %define with_rtonly    %{?_with_rtonly:       1} %{?!_with_rtonly:       0}
 # Only build the automotive variant of the kernel (--with automotiveonly):
 %define with_automotiveonly %{?_with_automotiveonly:       1} %{?!_with_automotiveonly:       0}
+# Only build the minimal variant of the kernel (--with minimalonly):
+%define with_minimalonly %{?_with_minimalonly:             1} %{?!_with_minimalonly:           0}
 # Build the automotive kernel (--with automotive_build), this builds base variant with automotive config/options:
 %define with_automotive_build %{?_with_automotive_build:   1} %{?!_with_automotive_build:     0}
 # Only build the tools package
@@ -403,6 +408,7 @@ Summary: The Linux kernel
 %define with_zfcpdump 0
 %define with_arm64_16k 0
 %define with_arm64_64k 0
+%define with_x86_64_minimal 0
 %endif
 
 # if requested, only build the automotive variant of the kernel
@@ -432,6 +438,7 @@ Summary: The Linux kernel
 %define with_realtime_arm64_64k 0
 %define with_arm64_16k 0
 %define with_arm64_64k 0
+%define with_x86_64_minimal 0
 %define with_automotive 0
 %define with_cross_headers 0
 %define with_doc 0
@@ -443,6 +450,27 @@ Summary: The Linux kernel
 %define with_selftests 0
 %define with_vdso_install 0
 %define with_configchecks 0
+%endif
+
+# if requested, only build minimal kernel
+%if %{with_minimalonly}
+%define with_x86_64_minimal 1
+%define with_up 0
+%define with_debug 0
+%define with_debuginfo 0
+%define with_vdso_install 0
+%define with_perf 0
+%define with_libperf 0
+%define with_tools 0
+%define with_selftests 0
+%define with_headers 0
+%define with_efiuki 0
+%define with_zfcpdump 0
+%define with_arm64_16k 0
+%define with_arm64_64k 0
+%define with_realtime 0
+%define with_realtime_arm64_64k 0
+%define with_automotive 0
 %endif
 
 # RT and Automotive kernels are only built on x86_64 and aarch64
@@ -533,6 +561,11 @@ Summary: The Linux kernel
 %define with_realtime_arm64_64k 0
 %endif
 
+# minimal variant only for x86_64
+%ifnarch x86_64
+%define with_x86_64_minimal 0
+%endif
+
 %if 0%{?fedora}
 # This is not for Fedora
 %define with_zfcpdump 0
@@ -607,6 +640,7 @@ Summary: The Linux kernel
 %define with_zfcpdump 0
 %define with_arm64_16k 0
 %define with_arm64_64k 0
+%define with_x86_64_minimal 0
 %define with_realtime 0
 %define with_realtime_arm64_64k 0
 %define with_automotive 0
@@ -673,6 +707,11 @@ Summary: The Linux kernel
 %define with_realtime_arm64_64k_base 1
 %else
 %define with_realtime_arm64_64k_base 0
+%endif
+%if %{with_x86_64_minimal} && %{with_base}
+%define with_x86_64_minimal_base 1
+%else
+%define with_x86_64_minimal_base 0
 %endif
 
 #
@@ -1772,6 +1811,14 @@ It should only be installed when trying to gather additional information
 on kernel bugs, as some of these options impact performance noticably.
 %endif
 
+%if %{with_x86_64_minimal_base}
+%define variant_summary The Linux kernel built with a minimal configuration
+%kernel_variant_package minimal
+%description minimal-core
+The kernel package contains a variant of the x86_64 Linux kernel built with
+a minimal configuration.
+%endif
+
 %if %{with_debug} && %{with_realtime}
 %define variant_summary The Linux PREEMPT_RT kernel compiled with extra debugging enabled
 %kernel_variant_package rt-debug
@@ -1914,6 +1961,14 @@ Prebuilt 64k unified kernel image for virtual machines.
 
 %description 64k-uki-virt-addons
 Prebuilt 64k unified kernel image addons for virtual machines.
+%endif
+
+%if %{with_x86_64_minimal_base} && %{with_efiuki}
+%description minimal-uki-virt
+Prebuilt minimal unified kernel image for virtual machines.
+
+%description minimal-uki-virt-addons
+Prebuilt minimal unified kernel image addons for virtual machines.
 %endif
 
 %ifnarch noarch %{nobuildarches}
@@ -3085,6 +3140,10 @@ BuildKernel %make_target %kernel_image %{_use_vdso} 16k
 BuildKernel %make_target %kernel_image %{_use_vdso} 64k
 %endif
 
+%if %{with_x86_64_minimal_base}
+BuildKernel %make_target %kernel_image %{_use_vdso} minimal
+%endif
+
 %if %{with_realtime_base}
 BuildKernel %make_target %kernel_image %{_use_vdso} rt
 %endif
@@ -3102,7 +3161,7 @@ BuildKernel %make_target %kernel_image %{_use_vdso}
 %endif
 
 %ifnarch noarch i686 %{nobuildarches}
-%if !%{with_debug} && !%{with_zfcpdump} && !%{with_up} && !%{with_arm64_16k} && !%{with_arm64_64k} && !%{with_realtime} && !%{with_realtime_arm64_64k} && !%{with_automotive}
+%if !%{with_debug} && !%{with_zfcpdump} && !%{with_up} && !%{with_arm64_16k} && !%{with_arm64_64k} && !%{with_x86_64_minimal} && !%{with_realtime} && !%{with_realtime_arm64_64k} && !%{with_automotive}
 # If only building the user space tools, then initialize the build environment
 # and some variables so that the various userspace tools can be built.
 %{log_msg "Initialize userspace tools build environment"}
@@ -4109,6 +4168,16 @@ fi\
 %kernel_variant_preun -v 64k -u virt -e
 %endif
 
+%if %{with_x86_64_minimal_base}
+%kernel_variant_preun -v minimal -e
+%kernel_variant_post -v minimal
+%endif
+
+%if %{with_x86_64_minimal_base} && %{with_efiuki}
+%kernel_variant_posttrans -v minimal -u virt
+%kernel_variant_preun -v minimal -u virt -e
+%endif
+
 %if %{with_realtime_base}
 %kernel_variant_preun -v rt
 %kernel_variant_post -v rt -r kernel
@@ -4491,6 +4560,7 @@ fi\
 %kernel_variant_files %{_use_vdso} %{with_zfcpdump} zfcpdump
 %kernel_variant_files %{_use_vdso} %{with_arm64_16k_base} 16k
 %kernel_variant_files %{_use_vdso} %{with_arm64_64k_base} 64k
+%kernel_variant_files %{_use_vdso} %{with_x86_64_minimal_base} minimal
 %kernel_variant_files %{_use_vdso} %{with_realtime_arm64_64k_base} rt-64k
 %if %{with_realtime_arm64_64k}
 %kernel_variant_files %{_use_vdso} %{with_debug} rt-64k-debug
