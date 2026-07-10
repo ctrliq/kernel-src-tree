@@ -1,0 +1,108 @@
+eventpoll: refresh epi_fget() / ep_remove_file() comments
+
+jira KERNEL-1279
+Rebuild_History Non-Buildable kernel-5.14.0-687.24.1.el9_8
+commit-author Christian Brauner <brauner@kernel.org>
+commit a573cb40f9819c3fe81a43eb10170f8fc8eddc5e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.24.1.el9_8/a573cb40.failed
+
+Two comments drifted from the code they sit on.
+
+epi_fget()'s block comment still referenced atomic_long_inc_not_zero,
+which has been file_ref_get() for a while, and described only one of
+the function's two roles: safe dereference of epi->ffd.file under
+ep->mtx. Since commit a6dc643c6931 ("eventpoll: fix ep_remove struct
+eventpoll / struct file UAF") the refcount bump also serves as a pin
+that blocks __fput() from starting, which is what lets ep_remove()
+touch file->f_lock and file->f_ep without racing
+eventpoll_release_file(). Update the block to name both roles and the
+commit that introduced the pin role.
+
+ep_remove_file()'s one-line "See eventpoll_release() for details"
+pointed at an inline in include/linux/eventpoll.h but said nothing
+about what those details were. Replace it with a short explanation:
+we publish NULL so the eventpoll_release() fastpath can skip the slow
+path, and this is safe because every f_ep writer either holds a pin
+via epi_fget() or is __fput() itself.
+
+Comment-only; no functional change.
+
+	Signed-off-by: Christian Brauner (Amutable) <brauner@kernel.org>
+Link: https://patch.msgid.link/20260424-work-epoll-rework-v1-4-249ed00a20f3@kernel.org
+	Signed-off-by: Christian Brauner <brauner@kernel.org>
+(cherry picked from commit a573cb40f9819c3fe81a43eb10170f8fc8eddc5e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/eventpoll.c
+diff --cc fs/eventpoll.c
+index d7653c4e4c3d,1039d9737ce9..000000000000
+--- a/fs/eventpoll.c
++++ b/fs/eventpoll.c
+@@@ -706,20 -991,55 +706,59 @@@ static void ep_free(struct eventpoll *e
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * Called with &file->f_lock held,
+ + * returns with it released
+++=======
++  * Pin @epi->ffd.file for operations that require both safe dereference
++  * and exclusion from __fput().
++  *
++  * struct file uses SLAB_TYPESAFE_BY_RCU, so a freed slot can be
++  * reassigned at any time. The bare load of epi->ffd.file is safe here
++  * because the caller holds ep->mtx and eventpoll_release_file() blocks
++  * on that mutex while tearing down the epi, so the backing file
++  * allocation cannot be freed and reused under us. An rcu_read_lock()
++  * is therefore unnecessary for the load.
++  *
++  * A successful file_ref_get() additionally blocks __fput() from
++  * starting on this file: once the refcount has reached zero it cannot
++  * come back. ep_remove() relies on that to touch file->f_lock and
++  * file->f_ep without racing eventpoll_release_file() (see commit
++  * a6dc643c6931). A NULL return means __fput() is already in flight;
++  * the caller must bail without touching the file, and
++  * eventpoll_release_file() will clean the epi up from its side.
++  */
++ static struct file *epi_fget(const struct epitem *epi)
++ {
++ 	struct file *file;
++ 
++ 	file = epi->ffd.file;
++ 	if (!file_ref_get(&file->f_ref))
++ 		file = NULL;
++ 	return file;
++ }
++ 
++ /*
++  * Takes &file->f_lock; returns with it released.
+++>>>>>>> a573cb40f981 (eventpoll: refresh epi_fget() / ep_remove_file() comments)
+   */
+  static void ep_remove_file(struct eventpoll *ep, struct epitem *epi,
+  			     struct file *file)
+  {
+  	struct epitems_head *to_free = NULL;
+ -	struct hlist_head *head;
+ +	struct hlist_head *head = file->f_ep;
+  
+  	lockdep_assert_held(&ep->mtx);
+ +	lockdep_assert_held(&file->f_lock);
+  
+ -	spin_lock(&file->f_lock);
+ -	head = file->f_ep;
+  	if (hlist_is_singular_node(&epi->fllink, head)) {
+- 		/* See eventpoll_release() for details. */
++ 		/*
++ 		 * Last watcher: publish NULL so the eventpoll_release()
++ 		 * fastpath in include/linux/eventpoll.h can skip the slow
++ 		 * path on a future __fput(). Safe because every f_ep writer
++ 		 * either holds a pin on @file via epi_fget() or is __fput()
++ 		 * itself -- see the comment in eventpoll_release().
++ 		 */
+  		WRITE_ONCE(file->f_ep, NULL);
+  		if (!is_file_epoll(file)) {
+  			struct epitems_head *v;
+* Unmerged path fs/eventpoll.c
