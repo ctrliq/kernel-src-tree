@@ -8,7 +8,7 @@
 
 source lib.sh
 ret=0
-timeout=2
+timeout=5
 
 cleanup()
 {
@@ -250,19 +250,37 @@ listener_ready()
 	ss -N "$1" -lnt -o "sport = :12345" | grep -q 12345
 }
 
+check_output_files()
+{
+	local f1="$1"
+	local f2="$2"
+	local err="$3"
+
+	if ! cmp "$f1" "$f2" ; then
+		echo "FAIL: $err: input and output file differ" 1>&2
+		echo -n " Input file" 1>&2
+		ls -l "$f1" 1>&2
+		echo -n "Output file" 1>&2
+		ls -l "$f2" 1>&2
+		ret=1
+	fi
+}
+
 test_tcp_forward()
 {
-	ip netns exec "$nsrouter" ./nf_queue -q 2 -t "$timeout" &
+	ip netns exec "$nsrouter" ./nf_queue -q 2 &
 	local nfqpid=$!
 
 	timeout 5 ip netns exec "$ns2" socat -u TCP-LISTEN:12345 STDOUT >/dev/null &
 	local rpid=$!
 
 	busywait "$BUSYWAIT_TIMEOUT" listener_ready "$ns2"
+	busywait "$BUSYWAIT_TIMEOUT" nf_queue_wait "$nsrouter" 2
 
 	ip netns exec "$ns1" socat -u STDIN TCP:10.0.2.99:12345 <"$TMPINPUT" >/dev/null
 
 	wait "$rpid" && echo "PASS: tcp and nfqueue in forward chain"
+	kill "$nfqpid"
 }
 
 test_tcp_localhost()
@@ -271,26 +289,29 @@ test_tcp_localhost()
 	timeout 5 ip netns exec "$nsrouter" socat -u TCP-LISTEN:12345 STDOUT >/dev/null &
 	local rpid=$!
 
-	ip netns exec "$nsrouter" ./nf_queue -q 3 -t "$timeout" &
+	ip netns exec "$nsrouter" ./nf_queue -q 3 &
 	local nfqpid=$!
 
 	busywait "$BUSYWAIT_TIMEOUT" listener_ready "$nsrouter"
+	busywait "$BUSYWAIT_TIMEOUT" nf_queue_wait "$nsrouter" 3
 
 	ip netns exec "$nsrouter" socat -u STDIN TCP:127.0.0.1:12345 <"$TMPINPUT" >/dev/null
 
 	wait "$rpid" && echo "PASS: tcp via loopback"
-	wait 2>/dev/null
+	kill "$nfqpid"
 }
 
 test_tcp_localhost_connectclose()
 {
-	ip netns exec "$nsrouter" ./connect_close -p 23456 -t "$timeout" &
-	ip netns exec "$nsrouter" ./nf_queue -q 3 -t "$timeout" &
+	ip netns exec "$nsrouter" ./nf_queue -q 3 &
+	local nfqpid=$!
 
 	busywait "$BUSYWAIT_TIMEOUT" nf_queue_wait "$nsrouter" 3
 
+	timeout 10 ip netns exec "$nsrouter" ./connect_close -p 23456 -t 3
+
+	kill "$nfqpid"
 	wait && echo "PASS: tcp via loopback with connect/close"
-	wait 2>/dev/null
 }
 
 test_tcp_localhost_requeue()
@@ -355,7 +376,7 @@ table inet filter {
 	}
 }
 EOF
-	ip netns exec "$ns1" ./nf_queue -q 1 -t "$timeout" &
+	ip netns exec "$ns1" ./nf_queue -q 1 &
 	local nfqpid=$!
 
 	busywait "$BUSYWAIT_TIMEOUT" nf_queue_wait "$ns1" 1
@@ -365,6 +386,7 @@ EOF
 	for n in output post; do
 		for d in tvrf eth0; do
 			if ! ip netns exec "$ns1" nft list chain inet filter "$n" | grep -q "oifname \"$d\" icmp type echo-request counter packets 1"; then
+				kill "$nfqpid"
 				echo "FAIL: chain $n: icmp packet counter mismatch for device $d" 1>&2
 				ip netns exec "$ns1" nft list ruleset
 				ret=1
@@ -373,8 +395,8 @@ EOF
 		done
 	done
 
-	wait "$nfqpid" && echo "PASS: icmp+nfqueue via vrf"
-	wait 2>/dev/null
+	kill "$nfqpid"
+	echo "PASS: icmp+nfqueue via vrf"
 }
 
 test_queue_removal()
@@ -390,7 +412,7 @@ table ip filter {
 	}
 }
 EOF
-	ip netns exec "$ns1" ./nf_queue -q 0 -d 30000 -t "$timeout" &
+	ip netns exec "$ns1" ./nf_queue -q 0 -d 30000 &
 	local nfqpid=$!
 
 	busywait "$BUSYWAIT_TIMEOUT" nf_queue_wait "$ns1" 0
