@@ -2996,7 +2996,7 @@ int cifs_fiemap(struct inode *inode, struct fiemap_extent_info *fei, u64 start,
 		}
 	}
 
-	cfile = find_readable_file(cifs_i, false);
+	cfile = find_readable_file(cifs_i, FIND_ANY);
 	if (cfile == NULL)
 		return -EINVAL;
 
@@ -3049,7 +3049,7 @@ int cifs_file_set_size(const unsigned int xid, struct dentry *dentry,
 						size, false);
 		cifs_dbg(FYI, "%s: set_file_size: rc = %d\n", __func__, rc);
 	} else {
-		open_file = find_writable_file(cifsInode, FIND_WR_FSUID_ONLY);
+		open_file = find_writable_file(cifsInode, FIND_FSUID_ONLY);
 		if (open_file) {
 			tcon = tlink_tcon(open_file->tlink);
 			server = tcon->ses->server;
@@ -3218,7 +3218,7 @@ cifs_setattr_unix(struct dentry *direntry, struct iattr *attrs)
 					    open_file->fid.netfid,
 					    open_file->pid);
 	} else {
-		open_file = find_writable_file(cifsInode, FIND_WR_FSUID_ONLY);
+		open_file = find_writable_file(cifsInode, FIND_FSUID_ONLY);
 		if (open_file) {
 			pTcon = tlink_tcon(open_file->tlink);
 			rc = CIFSSMBUnixSetFileInfo(xid, pTcon, args,
