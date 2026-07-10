@@ -26,7 +26,7 @@
 
 #include <trace/events/page_pool.h>
 
-#include "dev.h"
+#include RH_KABI_HIDE_INCLUDE("dev.h")
 #include "mp_dmabuf_devmem.h"
 #include "netmem_priv.h"
 #include "page_pool_priv.h"
