@@ -706,20 +706,55 @@ static void ep_free(struct eventpoll *ep)
 }
 
 /*
- * Called with &file->f_lock held,
- * returns with it released
+ * Pin @epi->ffd.file for operations that require both safe dereference
+ * and exclusion from __fput().
+ *
+ * struct file uses SLAB_TYPESAFE_BY_RCU, so a freed slot can be
+ * reassigned at any time. The bare load of epi->ffd.file is safe here
+ * because the caller holds ep->mtx and eventpoll_release_file() blocks
+ * on that mutex while tearing down the epi, so the backing file
+ * allocation cannot be freed and reused under us. An rcu_read_lock()
+ * is therefore unnecessary for the load.
+ *
+ * A successful file_ref_get() additionally blocks __fput() from
+ * starting on this file: once the refcount has reached zero it cannot
+ * come back. ep_remove() relies on that to touch file->f_lock and
+ * file->f_ep without racing eventpoll_release_file() (see commit
+ * a6dc643c6931). A NULL return means __fput() is already in flight;
+ * the caller must bail without touching the file, and
+ * eventpoll_release_file() will clean the epi up from its side.
+ */
+static struct file *epi_fget(const struct epitem *epi)
+{
+	struct file *file;
+
+	file = epi->ffd.file;
+	if (!atomic_long_inc_not_zero(&file->f_count))
+		file = NULL;
+	return file;
+}
+
+/*
+ * Takes &file->f_lock; returns with it released.
  */
 static void ep_remove_file(struct eventpoll *ep, struct epitem *epi,
 			     struct file *file)
 {
 	struct epitems_head *to_free = NULL;
-	struct hlist_head *head = file->f_ep;
+	struct hlist_head *head;
 
 	lockdep_assert_held(&ep->mtx);
-	lockdep_assert_held(&file->f_lock);
 
+	spin_lock(&file->f_lock);
+	head = file->f_ep;
 	if (hlist_is_singular_node(&epi->fllink, head)) {
-		/* See eventpoll_release() for details. */
+		/*
+		 * Last watcher: publish NULL so the eventpoll_release()
+		 * fastpath in include/linux/eventpoll.h can skip the slow
+		 * path on a future __fput(). Safe because every f_ep writer
+		 * either holds a pin on @file via epi_fget() or is __fput()
+		 * itself -- see the comment in eventpoll_release().
+		 */
 		WRITE_ONCE(file->f_ep, NULL);
 		if (!is_file_epoll(file)) {
 			struct epitems_head *v;
@@ -778,7 +813,6 @@ static void ep_remove(struct eventpoll *ep, struct epitem *epi)
 	if (!file)
 		return;
 
-	spin_lock(&file->f_lock);
 	ep_remove_file(ep, epi, file);
 	ep_remove_epi(ep, epi);
 	WARN_ON_ONCE(ep_refcount_dec_and_test(ep));
@@ -873,34 +907,6 @@ static __poll_t __ep_eventpoll_poll(struct file *file, poll_table *wait, int dep
 	ep_done_scan(ep, &txlist);
 	mutex_unlock(&ep->mtx);
 	return res;
-}
-
-/*
- * The ffd.file pointer may be in the process of being torn down due to
- * being closed, but we may not have finished eventpoll_release() yet.
- *
- * Normally, even with the atomic_long_inc_not_zero, the file may have
- * been free'd and then gotten re-allocated to something else (since
- * files are not RCU-delayed, they are SLAB_TYPESAFE_BY_RCU).
- *
- * But for epoll, users hold the ep->mtx mutex, and as such any file in
- * the process of being free'd will block in eventpoll_release_file()
- * and thus the underlying file allocation will not be free'd, and the
- * file re-use cannot happen.
- *
- * For the same reason we can avoid a rcu_read_lock() around the
- * operation - 'ffd.file' cannot go away even if the refcount has
- * reached zero (but we must still not call out to ->poll() functions
- * etc).
- */
-static struct file *epi_fget(const struct epitem *epi)
-{
-	struct file *file;
-
-	file = epi->ffd.file;
-	if (!atomic_long_inc_not_zero(&file->f_count))
-		file = NULL;
-	return file;
 }
 
 /*
@@ -1000,7 +1006,6 @@ again:
 
 		ep_unregister_pollwait(ep, epi);
 
-		spin_lock(&file->f_lock);
 		ep_remove_file(ep, epi, file);
 		ep_remove_epi(ep, epi);
 
