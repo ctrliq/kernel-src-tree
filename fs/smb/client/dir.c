@@ -1061,9 +1061,9 @@ int cifs_tmpfile(struct mnt_idmap *idmap, struct inode *dir,
 {
 	struct dentry *dentry = file->f_path.dentry;
 	struct cifs_sb_info *cifs_sb = CIFS_SB(dir);
+	size_t namesize = CIFS_TMPNAME_LEN + 1;
 	char *path __free(kfree) = NULL, *name;
 	unsigned int oflags = file->f_flags;
-	size_t size = CIFS_TMPNAME_LEN + 1;
 	int retries = 0, max_retries = 16;
 	struct TCP_Server_Info *server;
 	struct cifs_pending_open open;
@@ -1075,6 +1075,7 @@ int cifs_tmpfile(struct mnt_idmap *idmap, struct inode *dir,
 	struct inode *inode;
 	unsigned int xid;
 	__u32 oplock;
+	int namelen;
 	int rc;
 
 	if (unlikely(cifs_forced_shutdown(cifs_sb)))
@@ -1098,7 +1099,7 @@ int cifs_tmpfile(struct mnt_idmap *idmap, struct inode *dir,
 		server->ops->new_lease_key(&fid);
 	cifs_add_pending_open(&fid, tlink, &open);
 
-	path = alloc_parent_path(dentry, size - 1);
+	path = alloc_parent_path(dentry, namesize - 1);
 	if (IS_ERR(path)) {
 		cifs_del_pending_open(&open);
 		rc = PTR_ERR(path);
@@ -1108,16 +1109,22 @@ int cifs_tmpfile(struct mnt_idmap *idmap, struct inode *dir,
 
 	name = path + strlen(path);
 	do {
-		scnprintf(name, size,
-			  CIFS_TMPNAME_PREFIX "%0*x",
-			  CIFS_TMPNAME_COUNTER_LEN,
-			  atomic_inc_return(&cifs_tmpcounter));
+		/* Append tmpfile name to @path */
+		namelen = scnprintf(name, namesize, CIFS_TMPNAME_PREFIX "%x",
+				    atomic_inc_return(&cifs_tmpcounter));
 		rc = __cifs_do_create(dir, dentry, path, xid, tlink, oflags,
 				      mode, &oplock, &fid, NULL, &inode);
 		if (!rc) {
+			rc = d_mark_tmpfile_name(file, &QSTR_LEN(name, namelen));
+			if (rc) {
+				cifs_dbg(VFS | ONCE, "%s: failed to set filename in dentry: %d\n",
+					 __func__, rc);
+				rc = -EISDIR;
+				iput(inode);
+				goto err_open;
+			}
 			set_nlink(inode, 0);
 			mark_inode_dirty(inode);
-			d_mark_tmpfile_name(file, &QSTR_LEN(name, size - 1));
 			d_instantiate(dentry, inode);
 			break;
 		}
@@ -1173,9 +1180,7 @@ char *cifs_silly_fullpath(struct dentry *dentry)
 
 	do {
 		dput(sdentry);
-		int namelen = scnprintf(name, namesize,
-					CIFS_SILLYNAME_PREFIX "%0*x",
-					CIFS_SILLYNAME_COUNTER_LEN,
+		int namelen = scnprintf(name, namesize, CIFS_SILLYNAME_PREFIX "%x",
 					atomic_inc_return(&cifs_sillycounter));
 		sdentry = lookup_one_len(name, dentry->d_parent, namelen);
 		if (IS_ERR(sdentry))
