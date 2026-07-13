@@ -110,6 +110,7 @@ struct sched_domain {
 #ifdef CONFIG_SCHED_CACHE
 	unsigned int llc_max;
 	unsigned int *llc_counts;
+	unsigned long llc_bytes;
 #endif
 
 #ifdef CONFIG_SCHEDSTATS
@@ -316,5 +317,11 @@ static inline int task_node(const struct task_struct *p)
 {
 	return cpu_to_node(task_cpu(p));
 }
+
+#ifdef CONFIG_SCHED_CACHE
+extern void sched_update_llc_bytes(unsigned int cpu);
+#else
+static inline void sched_update_llc_bytes(unsigned int cpu) { }
+#endif
 
 #endif /* _LINUX_SCHED_TOPOLOGY_H */
