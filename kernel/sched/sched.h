@@ -3455,9 +3455,11 @@ extern void sched_dynamic_update(int mode);
 #endif
 
 #ifdef CONFIG_SCHED_CACHE
+DECLARE_STATIC_KEY_FALSE(sched_cache_present);
+
 static inline bool sched_cache_enabled(void)
 {
-	return false;
+	return static_branch_unlikely(&sched_cache_present);
 }
 #endif
 
