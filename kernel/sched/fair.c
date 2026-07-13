@@ -1640,6 +1640,11 @@ void init_sched_mm(struct task_struct *p)
 
 	init_task_work(work, task_cache_work);
 	work->next = work;
+	/*
+	 * Reset new task's preference to avoid
+	 * polluting account_llc_enqueue().
+	 */
+	p->preferred_llc = -1;
 }
 
 #else /* CONFIG_SCHED_CACHE */
