@@ -941,6 +941,7 @@ static void _sched_cache_active_set(void)
 	}
 }
 
+/* used by debugfs */
 void sched_cache_active_set(void)
 {
 	cpus_read_lock();
@@ -990,12 +991,27 @@ void sched_update_llc_bytes(unsigned int cpu)
 unlock:
 	mutex_unlock(&sched_domains_mutex);
 }
+
+static void sched_cache_set(bool has_multi_llcs)
+{
+	/*
+	 * TBD: check before writing to it. sched domain rebuild
+	 * is not in the critical path, leave as-is for now.
+	 */
+	if (has_multi_llcs)
+		static_branch_enable_cpuslocked(&sched_cache_present);
+	else
+		static_branch_disable_cpuslocked(&sched_cache_present);
+
+	_sched_cache_active_set();
+}
 #else
 static bool alloc_sd_llc(const struct cpumask *cpu_map,
 			 struct s_data *d)
 {
 	return false;
 }
+static inline void sched_cache_set(bool has_multi_llcs) { }
 #endif
 
 /*
@@ -2877,7 +2893,8 @@ static void adjust_numa_imbalance(struct sched_domain *sd_llc)
  * to the individual CPUs
  */
 static int
-build_sched_domains(const struct cpumask *cpu_map, struct sched_domain_attr *attr)
+build_sched_domains(const struct cpumask *cpu_map, struct sched_domain_attr *attr,
+		    bool *multi_llcs)
 {
 	enum s_alloc alloc_state = sa_none;
 	bool has_multi_llcs = false;
@@ -3023,18 +3040,7 @@ build_sched_domains(const struct cpumask *cpu_map, struct sched_domain_attr *att
 
 	ret = 0;
 error:
-#ifdef CONFIG_SCHED_CACHE
-	/*
-	 * TBD: check before writing to it. sched domain rebuild
-	 * is not in the critical path, leave as-is for now.
-	 */
-	if (!ret && has_multi_llcs)
-		static_branch_enable_cpuslocked(&sched_cache_present);
-	else
-		static_branch_disable_cpuslocked(&sched_cache_present);
-
-	_sched_cache_active_set();
-#endif
+	*multi_llcs = has_multi_llcs;
 	__free_domain_allocs(&d, alloc_state, cpu_map);
 
 	return ret;
@@ -3097,6 +3103,7 @@ void free_sched_domains(cpumask_var_t doms[], unsigned int ndoms)
  */
 int __init sched_init_domains(const struct cpumask *cpu_map)
 {
+	bool multi_llcs;
 	int err;
 
 	zalloc_cpumask_var(&sched_domains_llc_id_allocmask, GFP_KERNEL);
@@ -3111,7 +3118,9 @@ int __init sched_init_domains(const struct cpumask *cpu_map)
 	if (!doms_cur)
 		doms_cur = &fallback_doms;
 	cpumask_and(doms_cur[0], cpu_map, housekeeping_cpumask(HK_TYPE_DOMAIN));
-	err = build_sched_domains(doms_cur[0], NULL);
+	err = build_sched_domains(doms_cur[0], NULL, &multi_llcs);
+	if (!err)
+		sched_cache_set(multi_llcs);
 
 	return err;
 }
@@ -3184,6 +3193,7 @@ void partition_sched_domains_locked(int ndoms_new, cpumask_var_t doms_new[],
 				    struct sched_domain_attr *dattr_new)
 {
 	bool __maybe_unused has_eas = false;
+	bool has_multi_llcs = false, multi_llcs;
 	int i, j, n;
 	int new_topology;
 
@@ -3244,14 +3254,41 @@ match1:
 	for (i = 0; i < ndoms_new; i++) {
 		for (j = 0; j < n && !new_topology; j++) {
 			if (cpumask_equal(doms_new[i], doms_cur[j]) &&
-			    dattrs_equal(dattr_new, i, dattr_cur, j))
+			    dattrs_equal(dattr_new, i, dattr_cur, j)) {
+				/*
+				 * Reused partition has to be taken care
+				 * of here, because there could be a corner
+				 * case that if the reused partition is skipped
+				 * and only new partition is considered, an
+				 * incorrect has_multi_llcs would be set. For
+				 * example:
+				 * If the only multi-LLC partition is reused
+				 * and a new single-LLC partition is built,
+				 * sched_cache_set(false) disables cache-aware
+				 * scheduling globally despite the reused
+				 * multi-LLC partition still being active.
+				 */
+				struct sched_domain *sd;
+				int cpu = cpumask_first(doms_cur[j]);
+
+				guard(rcu)();
+				sd = rcu_dereference(cpu_rq(cpu)->sd);
+				while (sd && sd->parent && (sd->parent->flags & SD_SHARE_LLC))
+					sd = sd->parent;
+				if (sd && (sd->flags & SD_SHARE_LLC) && sd->parent &&
+				    sd_in_multi_llcs(sd))
+					has_multi_llcs = true;
 				goto match2;
+			}
 		}
 		/* No match - add a new doms_new */
-		build_sched_domains(doms_new[i], dattr_new ? dattr_new + i : NULL);
+		build_sched_domains(doms_new[i], dattr_new ? dattr_new + i : NULL,
+				    &multi_llcs);
+		has_multi_llcs |= multi_llcs;
 match2:
 		;
 	}
+	sched_cache_set(has_multi_llcs);
 
 #if defined(CONFIG_ENERGY_MODEL) && defined(CONFIG_CPU_FREQ_GOV_SCHEDUTIL)
 	/* Build perf domains: */
