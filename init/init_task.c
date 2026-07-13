@@ -182,6 +182,7 @@ struct task_struct init_task
 #endif
 #ifdef CONFIG_SCHED_CACHE
 	.preferred_llc  = -1,
+	.pref_llc_queued  = 0,
 #endif
 #if defined(CONFIG_KASAN_GENERIC) || defined(CONFIG_KASAN_SW_TAGS)
 	.kasan_depth	= 1,
