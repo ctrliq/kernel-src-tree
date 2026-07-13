@@ -3439,6 +3439,9 @@ static inline bool sched_cache_enabled(void)
 	return false;
 }
 #endif
+
+void sched_domains_free_llc_id(int cpu);
+
 extern void init_sched_mm(struct task_struct *p);
 
 #ifdef CONFIG_SMP
