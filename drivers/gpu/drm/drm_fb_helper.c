@@ -32,7 +32,6 @@
 #include <linux/console.h>
 #include <linux/export.h>
 #include <linux/pci.h>
-#include <linux/sysrq.h>
 #include <linux/vga_switcheroo.h>
 
 #include <drm/drm_atomic.h>
@@ -77,9 +76,6 @@ MODULE_PARM_DESC(drm_leak_fbdev_smem,
 		 "Allow unsafe leaking fbdev physical smem address [default=false]");
 #endif
 
-static LIST_HEAD(kernel_fb_helper_list);
-static DEFINE_MUTEX(kernel_fb_helper_lock);
-
 /**
  * DOC: fbdev helpers
  *
@@ -116,101 +112,6 @@ static DEFINE_MUTEX(kernel_fb_helper_lock);
  * callback it will also schedule dirty_work with the damage collected from the
  * mmap page writes.
  */
-
-static void drm_fb_helper_restore_lut_atomic(struct drm_crtc *crtc)
-{
-	uint16_t *r_base, *g_base, *b_base;
-
-	if (crtc->funcs->gamma_set == NULL)
-		return;
-
-	r_base = crtc->gamma_store;
-	g_base = r_base + crtc->gamma_size;
-	b_base = g_base + crtc->gamma_size;
-
-	crtc->funcs->gamma_set(crtc, r_base, g_base, b_base,
-			       crtc->gamma_size, NULL);
-}
-
-/**
- * drm_fb_helper_debug_enter - implementation for &fb_ops.fb_debug_enter
- * @info: fbdev registered by the helper
- */
-int drm_fb_helper_debug_enter(struct fb_info *info)
-{
-	struct drm_fb_helper *helper = info->par;
-	const struct drm_crtc_helper_funcs *funcs;
-	struct drm_mode_set *mode_set;
-
-	list_for_each_entry(helper, &kernel_fb_helper_list, kernel_fb_list) {
-		mutex_lock(&helper->client.modeset_mutex);
-		drm_client_for_each_modeset(mode_set, &helper->client) {
-			if (!mode_set->crtc->enabled)
-				continue;
-
-			funcs =	mode_set->crtc->helper_private;
-			if (funcs->mode_set_base_atomic == NULL)
-				continue;
-
-			if (drm_drv_uses_atomic_modeset(mode_set->crtc->dev))
-				continue;
-
-			funcs->mode_set_base_atomic(mode_set->crtc,
-						    mode_set->fb,
-						    mode_set->x,
-						    mode_set->y,
-						    ENTER_ATOMIC_MODE_SET);
-		}
-		mutex_unlock(&helper->client.modeset_mutex);
-	}
-
-	return 0;
-}
-EXPORT_SYMBOL(drm_fb_helper_debug_enter);
-
-/**
- * drm_fb_helper_debug_leave - implementation for &fb_ops.fb_debug_leave
- * @info: fbdev registered by the helper
- */
-int drm_fb_helper_debug_leave(struct fb_info *info)
-{
-	struct drm_fb_helper *helper = info->par;
-	struct drm_client_dev *client = &helper->client;
-	struct drm_device *dev = helper->dev;
-	struct drm_crtc *crtc;
-	const struct drm_crtc_helper_funcs *funcs;
-	struct drm_mode_set *mode_set;
-	struct drm_framebuffer *fb;
-
-	mutex_lock(&client->modeset_mutex);
-	drm_client_for_each_modeset(mode_set, client) {
-		crtc = mode_set->crtc;
-		if (drm_drv_uses_atomic_modeset(crtc->dev))
-			continue;
-
-		funcs = crtc->helper_private;
-		fb = crtc->primary->fb;
-
-		if (!crtc->enabled)
-			continue;
-
-		if (!fb) {
-			drm_err(dev, "no fb to restore?\n");
-			continue;
-		}
-
-		if (funcs->mode_set_base_atomic == NULL)
-			continue;
-
-		drm_fb_helper_restore_lut_atomic(mode_set->crtc);
-		funcs->mode_set_base_atomic(mode_set->crtc, fb, crtc->x,
-					    crtc->y, LEAVE_ATOMIC_MODE_SET);
-	}
-	mutex_unlock(&client->modeset_mutex);
-
-	return 0;
-}
-EXPORT_SYMBOL(drm_fb_helper_debug_leave);
 
 static int
 __drm_fb_helper_restore_fbdev_mode_unlocked(struct drm_fb_helper *fb_helper,
@@ -268,42 +169,6 @@ int drm_fb_helper_restore_fbdev_mode_unlocked(struct drm_fb_helper *fb_helper, b
 	return __drm_fb_helper_restore_fbdev_mode_unlocked(fb_helper, force);
 }
 EXPORT_SYMBOL(drm_fb_helper_restore_fbdev_mode_unlocked);
-
-#ifdef CONFIG_MAGIC_SYSRQ
-/* emergency restore, don't bother with error reporting */
-static void drm_fb_helper_restore_work_fn(struct work_struct *ignored)
-{
-	struct drm_fb_helper *helper;
-
-	mutex_lock(&kernel_fb_helper_lock);
-	list_for_each_entry(helper, &kernel_fb_helper_list, kernel_fb_list) {
-		struct drm_device *dev = helper->dev;
-
-		if (dev->switch_power_state == DRM_SWITCH_POWER_OFF)
-			continue;
-
-		mutex_lock(&helper->lock);
-		drm_client_modeset_commit_locked(&helper->client);
-		mutex_unlock(&helper->lock);
-	}
-	mutex_unlock(&kernel_fb_helper_lock);
-}
-
-static DECLARE_WORK(drm_fb_helper_restore_work, drm_fb_helper_restore_work_fn);
-
-static void drm_fb_helper_sysrq(int dummy1)
-{
-	schedule_work(&drm_fb_helper_restore_work);
-}
-
-static const struct sysrq_key_op sysrq_drm_fb_helper_restore_op = {
-	.handler = drm_fb_helper_sysrq,
-	.help_msg = "force-fb(v)",
-	.action_msg = "Restore framebuffer console",
-};
-#else
-static const struct sysrq_key_op sysrq_drm_fb_helper_restore_op = { };
-#endif
 
 static void drm_fb_helper_dpms(struct fb_info *info, int dpms_mode)
 {
@@ -438,7 +303,6 @@ void drm_fb_helper_prepare(struct drm_device *dev, struct drm_fb_helper *helper,
 	if (!preferred_bpp)
 		preferred_bpp = 32;
 
-	INIT_LIST_HEAD(&helper->kernel_fb_list);
 	spin_lock_init(&helper->damage_lock);
 	INIT_WORK(&helper->resume_work, drm_fb_helper_resume_worker);
 	INIT_WORK(&helper->damage_work, drm_fb_helper_damage_work);
@@ -574,13 +438,6 @@ void drm_fb_helper_fini(struct drm_fb_helper *fb_helper)
 
 	drm_fb_helper_release_info(fb_helper);
 
-	mutex_lock(&kernel_fb_helper_lock);
-	if (!list_empty(&fb_helper->kernel_fb_list)) {
-		list_del(&fb_helper->kernel_fb_list);
-		if (list_empty(&kernel_fb_helper_list))
-			unregister_sysrq_key('v', &sysrq_drm_fb_helper_restore_op);
-	}
-	mutex_unlock(&kernel_fb_helper_lock);
 
 	if (!fb_helper->client.funcs)
 		drm_client_release(&fb_helper->client);
@@ -1816,12 +1673,6 @@ __drm_fb_helper_initial_config_and_unlock(struct drm_fb_helper *fb_helper)
 	drm_info(dev, "fb%d: %s frame buffer device\n",
 		 info->node, info->fix.id);
 
-	mutex_lock(&kernel_fb_helper_lock);
-	if (list_empty(&kernel_fb_helper_list))
-		register_sysrq_key('v', &sysrq_drm_fb_helper_restore_op);
-
-	list_add(&fb_helper->kernel_fb_list, &kernel_fb_helper_list);
-	mutex_unlock(&kernel_fb_helper_lock);
 
 	return 0;
 
