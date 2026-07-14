@@ -173,7 +173,7 @@ static inline void __activate_traps_hfgxtr(struct kvm_vcpu *vcpu)
 		update_fgt_traps(hctxt, vcpu, kvm, HAFGRTR_EL2);
 }
 
-#define __deactivate_fgt(htcxt, vcpu, kvm, reg)				\
+#define __deactivate_fgt(hctxt, vcpu, kvm, reg)				\
 	do {								\
 		if ((vcpu_has_nv(vcpu) && !is_hyp_ctxt(vcpu)) ||	\
 		    kvm->arch.fgu[reg_to_fgt_group_id(reg)])		\
