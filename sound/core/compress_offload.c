@@ -41,13 +41,6 @@
 #define COMPR_CODEC_CAPS_OVERFLOW
 #endif
 
-/* TODO:
- * - add substream support for multiple devices in case of
- *	SND_DYNAMIC_MINORS is not used
- * - Multiple node representation
- *	driver should be able to register multiple nodes
- */
-
 struct snd_compr_file {
 	unsigned long caps;
 	struct snd_compr_stream stream;
@@ -190,9 +183,21 @@ snd_compr_tstamp32_from_64(struct snd_compr_tstamp *tstamp32,
 static int snd_compr_update_tstamp(struct snd_compr_stream *stream,
 				   struct snd_compr_tstamp64 *tstamp)
 {
+	int ret;
+
 	if (!stream->ops->pointer)
 		return -ENOTSUPP;
-	stream->ops->pointer(stream, tstamp);
+
+	switch (stream->runtime->state) {
+	case SNDRV_PCM_STATE_OPEN:
+		return -EBADFD;
+	default:
+		break;
+	}
+
+	ret = stream->ops->pointer(stream, tstamp);
+	if (ret != 0)
+		return ret;
 	pr_debug("dsp consumed till %u total %llu bytes\n", tstamp->byte_offset,
 		 tstamp->copied_total);
 	if (stream->direction == SND_COMPRESS_PLAYBACK)
@@ -519,7 +524,7 @@ snd_compr_get_codec_caps(struct snd_compr_stream *stream, unsigned long arg)
 		return -ENXIO;
 
 	struct snd_compr_codec_caps *caps __free(kfree) =
-		kzalloc(sizeof(*caps), GFP_KERNEL);
+		kzalloc_obj(*caps);
 	if (!caps)
 		return -ENOMEM;
 
@@ -539,7 +544,7 @@ int snd_compr_malloc_pages(struct snd_compr_stream *stream, size_t size)
 
 	if (snd_BUG_ON(!(stream) || !(stream)->runtime))
 		return -EINVAL;
-	dmab = kzalloc(sizeof(*dmab), GFP_KERNEL);
+	dmab = kzalloc_obj(*dmab);
 	if (!dmab)
 		return -ENOMEM;
 	dmab->dev = stream->dma_buffer.dev;
@@ -694,7 +699,7 @@ snd_compr_get_params(struct snd_compr_stream *stream, unsigned long arg)
 		return -EBADFD;
 
 	struct snd_codec *params __free(kfree) =
-		kzalloc(sizeof(*params), GFP_KERNEL);
+		kzalloc_obj(*params);
 	if (!params)
 		return -ENOMEM;
 	retval = stream->ops->get_params(stream, params);
@@ -1066,7 +1071,7 @@ static int snd_compr_task_new(struct snd_compr_stream *stream, struct snd_compr_
 		return -EBUSY;
 	if (utask->origin_seqno != 0 || utask->input_size != 0)
 		return -EINVAL;
-	task = kzalloc(sizeof(*task), GFP_KERNEL);
+	task = kzalloc_obj(*task);
 	if (task == NULL)
 		return -ENOMEM;
 	task->seqno = utask->seqno = snd_compr_seqno_next(stream);

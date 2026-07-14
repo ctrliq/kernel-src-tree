@@ -89,6 +89,7 @@ static int dapm_up_seq[] = {
 	[snd_soc_dapm_input] = 6,
 	[snd_soc_dapm_output] = 6,
 	[snd_soc_dapm_mux] = 7,
+	[snd_soc_dapm_mux_named_ctl] = 7,
 	[snd_soc_dapm_demux] = 7,
 	[snd_soc_dapm_dac] = 8,
 	[snd_soc_dapm_switch] = 9,
@@ -140,6 +141,7 @@ static int dapm_down_seq[] = {
 	[snd_soc_dapm_micbias] = 10,
 	[snd_soc_dapm_vmid] = 10,
 	[snd_soc_dapm_mux] = 11,
+	[snd_soc_dapm_mux_named_ctl] = 11,
 	[snd_soc_dapm_demux] = 11,
 	[snd_soc_dapm_aif_in] = 12,
 	[snd_soc_dapm_aif_out] = 12,
@@ -577,6 +579,7 @@ static int dapm_check_dynamic_path(
 
 	switch (sink->id) {
 	case snd_soc_dapm_mux:
+	case snd_soc_dapm_mux_named_ctl:
 	case snd_soc_dapm_switch:
 	case snd_soc_dapm_mixer:
 	case snd_soc_dapm_mixer_named_ctl:
@@ -638,7 +641,7 @@ static int dapm_add_path(
 	if (ret)
 		return ret;
 
-	path = kzalloc(sizeof(struct snd_soc_dapm_path), GFP_KERNEL);
+	path = kzalloc_obj(struct snd_soc_dapm_path);
 	if (!path)
 		return -ENOMEM;
 
@@ -668,6 +671,7 @@ static int dapm_add_path(
 
 		switch (wsink->id) {
 		case snd_soc_dapm_mux:
+		case snd_soc_dapm_mux_named_ctl:
 			ret = dapm_connect_mux(dapm, path, control, wsink);
 			if (ret != 0)
 				goto err;
@@ -713,7 +717,7 @@ static int dapm_kcontrol_data_alloc(struct snd_soc_dapm_widget *widget,
 	const char *name;
 	int ret;
 
-	data = kzalloc(sizeof(*data), GFP_KERNEL);
+	data = kzalloc_obj(*data);
 	if (!data)
 		return -ENOMEM;
 
@@ -766,6 +770,7 @@ static int dapm_kcontrol_data_alloc(struct snd_soc_dapm_widget *widget,
 		break;
 	case snd_soc_dapm_demux:
 	case snd_soc_dapm_mux:
+	case snd_soc_dapm_mux_named_ctl:
 		e = (struct soc_enum *)kcontrol->private_value;
 
 		if (e->autodisable) {
@@ -915,6 +920,7 @@ static bool dapm_kcontrol_set_value(const struct snd_kcontrol *kcontrol,
 			break;
 		case snd_soc_dapm_demux:
 		case snd_soc_dapm_mux:
+		case snd_soc_dapm_mux_named_ctl:
 			data->widget->on_val = value >> data->widget->shift;
 			break;
 		default:
@@ -1198,6 +1204,7 @@ static int dapm_create_or_share_kcontrol(struct snd_soc_dapm_widget *w,
 				wname_in_long_name = true;
 				kcname_in_long_name = true;
 				break;
+			case snd_soc_dapm_mux_named_ctl:
 			case snd_soc_dapm_mixer_named_ctl:
 				wname_in_long_name = false;
 				kcname_in_long_name = true;
@@ -1317,6 +1324,7 @@ static int dapm_new_mux(struct snd_soc_dapm_widget *w)
 
 	switch (w->id) {
 	case snd_soc_dapm_mux:
+	case snd_soc_dapm_mux_named_ctl:
 		dir = SND_SOC_DAPM_DIR_OUT;
 		type = "mux";
 		break;
@@ -1435,7 +1443,7 @@ static int dapm_widget_list_create(struct snd_soc_dapm_widget_list **list,
 	list_for_each(it, widgets)
 		size++;
 
-	*list = kzalloc(struct_size(*list, widgets, size), GFP_KERNEL);
+	*list = kzalloc_flex(**list, widgets, size);
 	if (*list == NULL)
 		return -ENOMEM;
 
@@ -2399,6 +2407,7 @@ static const char * const dapm_type_name[] = {
 	[snd_soc_dapm_input]            = "input",
 	[snd_soc_dapm_output]           = "output",
 	[snd_soc_dapm_mux]              = "mux",
+	[snd_soc_dapm_mux_named_ctl]    = "mux_named_ctl",
 	[snd_soc_dapm_demux]            = "demux",
 	[snd_soc_dapm_mixer]            = "mixer",
 	[snd_soc_dapm_mixer_named_ctl]  = "mixer_named_ctl",
@@ -3332,9 +3341,8 @@ int snd_soc_dapm_new_widgets(struct snd_soc_card *card)
 			continue;
 
 		if (w->num_kcontrols) {
-			w->kcontrols = kcalloc(w->num_kcontrols,
-						sizeof(struct snd_kcontrol *),
-						GFP_KERNEL);
+			w->kcontrols = kzalloc_objs(struct snd_kcontrol *,
+						    w->num_kcontrols);
 			if (!w->kcontrols) {
 				snd_soc_dapm_mutex_unlock(card);
 				return -ENOMEM;
@@ -3348,6 +3356,7 @@ int snd_soc_dapm_new_widgets(struct snd_soc_card *card)
 			dapm_new_mixer(w);
 			break;
 		case snd_soc_dapm_mux:
+		case snd_soc_dapm_mux_named_ctl:
 		case snd_soc_dapm_demux:
 			dapm_new_mux(w);
 			break;
@@ -3835,6 +3844,7 @@ snd_soc_dapm_new_control_unlocked(struct snd_soc_dapm_context *dapm,
 		break;
 
 	case snd_soc_dapm_mux:
+	case snd_soc_dapm_mux_named_ctl:
 	case snd_soc_dapm_demux:
 	case snd_soc_dapm_switch:
 	case snd_soc_dapm_mixer:
@@ -3972,12 +3982,11 @@ static int dapm_dai_link_event_pre_pmu(struct snd_soc_dapm_widget *w,
 	 * stuff that increases stack usage.
 	 * So, we use kzalloc()/kfree() for params in this function.
 	 */
-	struct snd_pcm_hw_params *params __free(kfree) = kzalloc(sizeof(*params),
-								 GFP_KERNEL);
+	struct snd_pcm_hw_params *params __free(kfree) = kzalloc_obj(*params);
 	if (!params)
 		return -ENOMEM;
 
-	runtime = kzalloc(sizeof(*runtime), GFP_KERNEL);
+	runtime = kzalloc_obj(*runtime);
 	if (!runtime)
 		return -ENOMEM;
 

@@ -436,8 +436,8 @@ static int sof_ipc4_get_audio_fmt(struct snd_soc_component *scomp,
 		module_base_cfg->is_pages);
 
 	if (available_fmt->num_input_formats) {
-		in_format = kcalloc(available_fmt->num_input_formats,
-				    sizeof(*in_format), GFP_KERNEL);
+		in_format = kzalloc_objs(*in_format,
+					 available_fmt->num_input_formats);
 		if (!in_format)
 			return -ENOMEM;
 		available_fmt->input_pin_fmts = in_format;
@@ -457,8 +457,8 @@ static int sof_ipc4_get_audio_fmt(struct snd_soc_component *scomp,
 	}
 
 	if (available_fmt->num_output_formats) {
-		out_format = kcalloc(available_fmt->num_output_formats, sizeof(*out_format),
-				     GFP_KERNEL);
+		out_format = kzalloc_objs(*out_format,
+					  available_fmt->num_output_formats);
 		if (!out_format) {
 			ret = -ENOMEM;
 			goto err_in;
@@ -581,6 +581,7 @@ sof_ipc4_update_card_components_string(struct snd_sof_widget *swidget,
 	struct snd_soc_component *scomp = spcm->scomp;
 	struct snd_soc_card *card = scomp->card;
 	const char *pt_marker = "iec61937-pcm";
+	unsigned pcm_id = le32_to_cpu(spcm->pcm.pcm_id);
 
 	/*
 	 * Update the card's components list with iec61937-pcm and a list of PCM
@@ -595,21 +596,21 @@ sof_ipc4_update_card_components_string(struct snd_sof_widget *swidget,
 
 		if (strstr(card->components, pt_marker))
 			card->components = devm_kasprintf(card->dev, GFP_KERNEL,
-							  "%s,%d",
+							  "%s,%u",
 							  card->components,
-							  spcm->pcm.pcm_id);
+							  pcm_id);
 		else
 			card->components = devm_kasprintf(card->dev, GFP_KERNEL,
-							  "%s %s:%d",
+							  "%s %s:%u",
 							  card->components,
 							  pt_marker,
-							  spcm->pcm.pcm_id);
+							  pcm_id);
 
 		devm_kfree(card->dev, tmp);
 	} else {
 		card->components = devm_kasprintf(card->dev, GFP_KERNEL,
-						  "%s:%d", pt_marker,
-						  spcm->pcm.pcm_id);
+						  "%s:%u", pt_marker,
+						  pcm_id);
 	}
 
 	if (!card->components)
@@ -627,7 +628,7 @@ static int sof_ipc4_widget_setup_pcm(struct snd_sof_widget *swidget)
 	int node_type = 0;
 	int ret, dir;
 
-	ipc4_copier = kzalloc(sizeof(*ipc4_copier), GFP_KERNEL);
+	ipc4_copier = kzalloc_obj(*ipc4_copier);
 	if (!ipc4_copier)
 		return -ENOMEM;
 
@@ -688,7 +689,7 @@ static int sof_ipc4_widget_setup_pcm(struct snd_sof_widget *swidget)
 	}
 
 skip_gtw_cfg:
-	ipc4_copier->gtw_attr = kzalloc(sizeof(*ipc4_copier->gtw_attr), GFP_KERNEL);
+	ipc4_copier->gtw_attr = kzalloc_obj(*ipc4_copier->gtw_attr);
 	if (!ipc4_copier->gtw_attr) {
 		ret = -ENOMEM;
 		goto free_available_fmt;
@@ -757,7 +758,7 @@ static int sof_ipc4_widget_setup_comp_dai(struct snd_sof_widget *swidget)
 	int node_type = 0;
 	int ret;
 
-	ipc4_copier = kzalloc(sizeof(*ipc4_copier), GFP_KERNEL);
+	ipc4_copier = kzalloc_obj(*ipc4_copier);
 	if (!ipc4_copier)
 		return -ENOMEM;
 
@@ -824,7 +825,7 @@ static int sof_ipc4_widget_setup_comp_dai(struct snd_sof_widget *swidget)
 			break;
 		}
 
-		blob = kzalloc(sizeof(*blob), GFP_KERNEL);
+		blob = kzalloc_obj(*blob);
 		if (!blob) {
 			ret = -ENOMEM;
 			goto free_available_fmt;
@@ -863,7 +864,7 @@ static int sof_ipc4_widget_setup_comp_dai(struct snd_sof_widget *swidget)
 			SOF_IPC4_NODE_INDEX_INTEL_DMIC(ipc4_copier->dai_index);
 		break;
 	default:
-		ipc4_copier->gtw_attr = kzalloc(sizeof(*ipc4_copier->gtw_attr), GFP_KERNEL);
+		ipc4_copier->gtw_attr = kzalloc_obj(*ipc4_copier->gtw_attr);
 		if (!ipc4_copier->gtw_attr) {
 			ret = -ENOMEM;
 			goto free_available_fmt;
@@ -930,7 +931,7 @@ static int sof_ipc4_widget_setup_comp_pipeline(struct snd_sof_widget *swidget)
 	struct snd_sof_pipeline *spipe = swidget->spipe;
 	int ret;
 
-	pipeline = kzalloc(sizeof(*pipeline), GFP_KERNEL);
+	pipeline = kzalloc_obj(*pipeline);
 	if (!pipeline)
 		return -ENOMEM;
 
@@ -989,7 +990,7 @@ static int sof_ipc4_widget_setup_comp_pga(struct snd_sof_widget *swidget)
 	struct sof_ipc4_gain *gain;
 	int ret;
 
-	gain = kzalloc(sizeof(*gain), GFP_KERNEL);
+	gain = kzalloc_obj(*gain);
 	if (!gain)
 		return -ENOMEM;
 
@@ -1048,7 +1049,7 @@ static int sof_ipc4_widget_setup_comp_mixer(struct snd_sof_widget *swidget)
 
 	dev_dbg(scomp->dev, "Updating IPC structure for %s\n", swidget->widget->name);
 
-	mixer = kzalloc(sizeof(*mixer), GFP_KERNEL);
+	mixer = kzalloc_obj(*mixer);
 	if (!mixer)
 		return -ENOMEM;
 
@@ -1080,7 +1081,7 @@ static int sof_ipc4_widget_setup_comp_src(struct snd_sof_widget *swidget)
 
 	dev_dbg(scomp->dev, "Updating IPC structure for %s\n", swidget->widget->name);
 
-	src = kzalloc(sizeof(*src), GFP_KERNEL);
+	src = kzalloc_obj(*src);
 	if (!src)
 		return -ENOMEM;
 
@@ -1123,7 +1124,7 @@ static int sof_ipc4_widget_setup_comp_asrc(struct snd_sof_widget *swidget)
 
 	dev_dbg(scomp->dev, "Updating IPC structure for %s\n", swidget->widget->name);
 
-	asrc = kzalloc(sizeof(*asrc), GFP_KERNEL);
+	asrc = kzalloc_obj(*asrc);
 	if (!asrc)
 		return -ENOMEM;
 
@@ -1206,7 +1207,7 @@ static int sof_ipc4_widget_setup_comp_process(struct snd_sof_widget *swidget)
 	void *cfg;
 	int ret;
 
-	process = kzalloc(sizeof(*process), GFP_KERNEL);
+	process = kzalloc_obj(*process);
 	if (!process)
 		return -ENOMEM;
 

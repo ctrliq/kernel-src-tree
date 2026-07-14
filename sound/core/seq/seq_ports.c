@@ -129,7 +129,7 @@ int snd_seq_create_port(struct snd_seq_client *client, int port,
 	}
 
 	/* create a new port */
-	new_port = kzalloc(sizeof(*new_port), GFP_KERNEL);
+	new_port = kzalloc_obj(*new_port);
 	if (!new_port)
 		return -ENOMEM;	/* failure, out of memory */
 	/* init port data */
@@ -144,18 +144,21 @@ int snd_seq_create_port(struct snd_seq_client *client, int port,
 	num = max(port, 0);
 	guard(mutex)(&client->ports_mutex);
 	guard(write_lock_irq)(&client->ports_lock);
+	struct list_head *insert_before = &client->ports_list_head;
 	list_for_each_entry(p, &client->ports_list_head, list) {
 		if (p->addr.port == port) {
 			kfree(new_port);
 			return -EBUSY;
 		}
-		if (p->addr.port > num)
+		if (p->addr.port > num) {
+			insert_before = &p->list;
 			break;
+		}
 		if (port < 0) /* auto-probe mode */
 			num = p->addr.port + 1;
 	}
 	/* insert the new port */
-	list_add_tail(&new_port->list, &p->list);
+	list_add_tail(&new_port->list, insert_before);
 	client->num_ports++;
 	new_port->addr.port = num;	/* store the port number in the port */
 	sprintf(new_port->name, "port-%d", num);
@@ -572,7 +575,7 @@ int snd_seq_port_connect(struct snd_seq_client *connector,
 	bool exclusive;
 	int err;
 
-	subs = kzalloc(sizeof(*subs), GFP_KERNEL);
+	subs = kzalloc_obj(*subs);
 	if (!subs)
 		return -ENOMEM;
 
