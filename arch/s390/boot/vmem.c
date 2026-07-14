@@ -13,6 +13,7 @@
 #include "decompressor.h"
 #include "boot.h"
 
+#define INVALID_PHYS_ADDR (~(phys_addr_t)0)
 struct ctlreg __bootdata_preserved(s390_invalid_asce);
 
 #ifdef CONFIG_PROC_FS
@@ -63,13 +64,10 @@ static void kasan_populate_shadow(unsigned long kernel_start, unsigned long kern
 	pud_t pud_z = __pud(__pa(kasan_early_shadow_pmd) | _REGION3_ENTRY);
 	p4d_t p4d_z = __p4d(__pa(kasan_early_shadow_pud) | _REGION2_ENTRY);
 	unsigned long memgap_start = 0;
-	unsigned long untracked_end;
 	unsigned long start, end;
 	int i;
 
 	pte_z = __pte(__pa(kasan_early_shadow_page) | pgprot_val(PAGE_KERNEL_RO));
-	if (!machine.has_nx)
-		pte_z = clear_pte_bit(pte_z, __pgprot(_PAGE_NOEXEC));
 	crst_table_init((unsigned long *)kasan_early_shadow_p4d, p4d_val(p4d_z));
 	crst_table_init((unsigned long *)kasan_early_shadow_pud, pud_val(pud_z));
 	crst_table_init((unsigned long *)kasan_early_shadow_pmd, pmd_val(pmd_z));
@@ -93,15 +91,10 @@ static void kasan_populate_shadow(unsigned long kernel_start, unsigned long kern
 	kasan_populate(kernel_start + TEXT_OFFSET, kernel_end, POPULATE_KASAN_MAP_SHADOW);
 	kasan_populate(0, (unsigned long)__identity_va(0), POPULATE_KASAN_ZERO_SHADOW);
 	kasan_populate(AMODE31_START, AMODE31_END, POPULATE_KASAN_ZERO_SHADOW);
-	if (IS_ENABLED(CONFIG_KASAN_VMALLOC)) {
-		untracked_end = VMALLOC_START;
-		/* shallowly populate kasan shadow for vmalloc and modules */
-		kasan_populate(VMALLOC_START, MODULES_END, POPULATE_KASAN_SHALLOW);
-	} else {
-		untracked_end = MODULES_VADDR;
-	}
+	/* shallowly populate kasan shadow for vmalloc and modules */
+	kasan_populate(VMALLOC_START, MODULES_END, POPULATE_KASAN_SHALLOW);
 	/* populate kasan shadow for untracked memory */
-	kasan_populate((unsigned long)__identity_va(ident_map_size), untracked_end,
+	kasan_populate((unsigned long)__identity_va(ident_map_size), VMALLOC_START,
 		       POPULATE_KASAN_ZERO_SHADOW);
 	kasan_populate(kernel_end, _REGION1_SIZE, POPULATE_KASAN_ZERO_SHADOW);
 }
@@ -236,11 +229,12 @@ static pte_t *boot_pte_alloc(void)
 	return pte;
 }
 
-static unsigned long _pa(unsigned long addr, unsigned long size, enum populate_mode mode)
+static unsigned long resolve_pa_may_alloc(unsigned long addr, unsigned long size,
+					  enum populate_mode mode)
 {
 	switch (mode) {
 	case POPULATE_NONE:
-		return -1;
+		return INVALID_PHYS_ADDR;
 	case POPULATE_DIRECT:
 		return addr;
 	case POPULATE_LOWCORE:
@@ -258,33 +252,55 @@ static unsigned long _pa(unsigned long addr, unsigned long size, enum populate_m
 		return addr;
 #endif
 	default:
-		return -1;
+		return INVALID_PHYS_ADDR;
 	}
 }
 
-static bool large_allowed(enum populate_mode mode)
+static bool large_page_mapping_allowed(enum populate_mode mode)
 {
-	return (mode == POPULATE_DIRECT) || (mode == POPULATE_IDENTITY) || (mode == POPULATE_KERNEL);
+	switch (mode) {
+	case POPULATE_DIRECT:
+	case POPULATE_IDENTITY:
+	case POPULATE_KERNEL:
+#ifdef CONFIG_KASAN
+	case POPULATE_KASAN_MAP_SHADOW:
+#endif
+		return true;
+	default:
+		return false;
+	}
 }
 
-static bool can_large_pud(pud_t *pu_dir, unsigned long addr, unsigned long end,
-			  enum populate_mode mode)
+static unsigned long try_get_large_pud_pa(pud_t *pu_dir, unsigned long addr, unsigned long end,
+					  enum populate_mode mode)
 {
-	unsigned long size = end - addr;
+	unsigned long pa, size = end - addr;
 
-	return machine.has_edat2 && large_allowed(mode) &&
-	       IS_ALIGNED(addr, PUD_SIZE) && (size >= PUD_SIZE) &&
-	       IS_ALIGNED(_pa(addr, size, mode), PUD_SIZE);
+	if (!machine.has_edat2 || !large_page_mapping_allowed(mode) ||
+	    !IS_ALIGNED(addr, PUD_SIZE) || (size < PUD_SIZE))
+		return INVALID_PHYS_ADDR;
+
+	pa = resolve_pa_may_alloc(addr, size, mode);
+	if (!IS_ALIGNED(pa, PUD_SIZE))
+		return INVALID_PHYS_ADDR;
+
+	return pa;
 }
 
-static bool can_large_pmd(pmd_t *pm_dir, unsigned long addr, unsigned long end,
-			  enum populate_mode mode)
+static unsigned long try_get_large_pmd_pa(pmd_t *pm_dir, unsigned long addr, unsigned long end,
+					  enum populate_mode mode)
 {
-	unsigned long size = end - addr;
+	unsigned long pa, size = end - addr;
 
-	return machine.has_edat1 && large_allowed(mode) &&
-	       IS_ALIGNED(addr, PMD_SIZE) && (size >= PMD_SIZE) &&
-	       IS_ALIGNED(_pa(addr, size, mode), PMD_SIZE);
+	if (!machine.has_edat1 || !large_page_mapping_allowed(mode) ||
+	    !IS_ALIGNED(addr, PMD_SIZE) || (size < PMD_SIZE))
+		return INVALID_PHYS_ADDR;
+
+	pa = resolve_pa_may_alloc(addr, size, mode);
+	if (!IS_ALIGNED(pa, PMD_SIZE))
+		return INVALID_PHYS_ADDR;
+
+	return pa;
 }
 
 static void pgtable_pte_populate(pmd_t *pmd, unsigned long addr, unsigned long end,
@@ -298,10 +314,8 @@ static void pgtable_pte_populate(pmd_t *pmd, unsigned long addr, unsigned long e
 		if (pte_none(*pte)) {
 			if (kasan_pte_populate_zero_shadow(pte, mode))
 				continue;
-			entry = __pte(_pa(addr, PAGE_SIZE, mode));
+			entry = __pte(resolve_pa_may_alloc(addr, PAGE_SIZE, mode));
 			entry = set_pte_bit(entry, PAGE_KERNEL);
-			if (!machine.has_nx)
-				entry = clear_pte_bit(entry, __pgprot(_PAGE_NOEXEC));
 			set_pte(pte, entry);
 			pages++;
 		}
@@ -313,7 +327,7 @@ static void pgtable_pte_populate(pmd_t *pmd, unsigned long addr, unsigned long e
 static void pgtable_pmd_populate(pud_t *pud, unsigned long addr, unsigned long end,
 				 enum populate_mode mode)
 {
-	unsigned long next, pages = 0;
+	unsigned long pa, next, pages = 0;
 	pmd_t *pmd, entry;
 	pte_t *pte;
 
@@ -323,11 +337,10 @@ static void pgtable_pmd_populate(pud_t *pud, unsigned long addr, unsigned long e
 		if (pmd_none(*pmd)) {
 			if (kasan_pmd_populate_zero_shadow(pmd, addr, next, mode))
 				continue;
-			if (can_large_pmd(pmd, addr, next, mode)) {
-				entry = __pmd(_pa(addr, _SEGMENT_SIZE, mode));
+			pa = try_get_large_pmd_pa(pmd, addr, next, mode);
+			if (pa != INVALID_PHYS_ADDR) {
+				entry = __pmd(pa);
 				entry = set_pmd_bit(entry, SEGMENT_KERNEL);
-				if (!machine.has_nx)
-					entry = clear_pmd_bit(entry, __pgprot(_SEGMENT_ENTRY_NOEXEC));
 				set_pmd(pmd, entry);
 				pages++;
 				continue;
@@ -346,7 +359,7 @@ static void pgtable_pmd_populate(pud_t *pud, unsigned long addr, unsigned long e
 static void pgtable_pud_populate(p4d_t *p4d, unsigned long addr, unsigned long end,
 				 enum populate_mode mode)
 {
-	unsigned long next, pages = 0;
+	unsigned long pa, next, pages = 0;
 	pud_t *pud, entry;
 	pmd_t *pmd;
 
@@ -356,11 +369,10 @@ static void pgtable_pud_populate(p4d_t *p4d, unsigned long addr, unsigned long e
 		if (pud_none(*pud)) {
 			if (kasan_pud_populate_zero_shadow(pud, addr, next, mode))
 				continue;
-			if (can_large_pud(pud, addr, next, mode)) {
-				entry = __pud(_pa(addr, _REGION3_SIZE, mode));
+			pa = try_get_large_pud_pa(pud, addr, next, mode);
+			if (pa != INVALID_PHYS_ADDR) {
+				entry = __pud(pa);
 				entry = set_pud_bit(entry, REGION3_KERNEL);
-				if (!machine.has_nx)
-					entry = clear_pud_bit(entry, __pgprot(_REGION_ENTRY_NOEXEC));
 				set_pud(pud, entry);
 				pages++;
 				continue;

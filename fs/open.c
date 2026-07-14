@@ -914,7 +914,7 @@ static int do_dentry_open(struct file *f,
 	f->f_sb_err = file_sample_sb_err(f);
 
 	if (unlikely(f->f_flags & O_PATH)) {
-		f->f_mode = FMODE_PATH | FMODE_OPENED;
+		f->f_mode = FMODE_PATH | FMODE_OPENED | FMODE_NONOTIFY;
 		f->f_op = &empty_fops;
 		return 0;
 	}
@@ -939,6 +939,16 @@ static int do_dentry_open(struct file *f,
 	}
 
 	error = security_file_open(f);
+	if (error)
+		goto cleanup_all;
+
+	/*
+	 * Set FMODE_NONOTIFY_* bits according to existing permission watches.
+	 * If FMODE_NONOTIFY was already set for an fanotify fd, this doesn't
+	 * change anything.
+	 */
+	file_set_fsnotify_mode(f);
+	error = fsnotify_open_perm(f);
 	if (error)
 		goto cleanup_all;
 
@@ -1515,7 +1525,7 @@ static int filp_flush(struct file *filp, fl_owner_t id)
 {
 	int retval = 0;
 
-	if (CHECK_DATA_CORRUPTION(file_count(filp) == 0,
+	if (CHECK_DATA_CORRUPTION(file_count(filp) == 0, filp,
 			"VFS: Close: file count is 0 (f_op=%ps)",
 			filp->f_op)) {
 		return 0;

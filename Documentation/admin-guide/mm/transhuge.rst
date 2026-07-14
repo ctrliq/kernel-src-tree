@@ -332,6 +332,12 @@ allocation policy for the internal shmem mount by using the kernel parameter
 seven valid policies for shmem (``always``, ``within_size``, ``advise``,
 ``never``, ``deny``, and ``force``).
 
+Similarly to ``transparent_hugepage_shmem``, you can control the default
+hugepage allocation policy for the tmpfs mount by using the kernel parameter
+``transparent_hugepage_tmpfs=<policy>``, where ``<policy>`` is one of the
+four valid policies for tmpfs (``always``, ``within_size``, ``advise``,
+``never``). The tmpfs mount default policy is ``never``.
+
 In the same manner as ``thp_anon`` controls each supported anonymous THP
 size, ``thp_shmem`` controls each supported shmem THP size. ``thp_shmem``
 has the same format as ``thp_anon``, but also supports the policy
@@ -357,12 +363,16 @@ You can control hugepage allocation policy in tmpfs with mount option
 
 always
     Attempt to allocate huge pages every time we need a new page;
+    Always try PMD-sized huge pages first, and fall back to smaller-sized
+    huge pages if the PMD-sized huge page allocation fails;
 
 never
     Do not allocate huge pages;
 
 within_size
-    Only allocate huge page if it will be fully within i_size.
+    Only allocate huge page if it will be fully within i_size;
+    Always try PMD-sized huge pages first, and fall back to smaller-sized
+    huge pages if the PMD-sized huge page allocation fails;
     Also respect fadvise()/madvise() hints;
 
 advise
@@ -560,6 +570,16 @@ zswpout
 swpin
 	is incremented every time a huge page is swapped in from a non-zswap
 	swap device in one piece.
+
+swpin_fallback
+	is incremented if swapin fails to allocate or charge a huge page
+	and instead falls back to using huge pages with lower orders or
+	small pages.
+
+swpin_fallback_charge
+	is incremented if swapin fails to charge a huge page and instead
+	falls back to using  huge pages with lower orders or small pages
+	even though the allocation was successful.
 
 swpout
 	is incremented every time a huge page is swapped out to a non-zswap

@@ -225,13 +225,13 @@ within(unsigned long addr, unsigned long start, unsigned long end)
 	return addr >= start && addr < end;
 }
 
+#ifdef CONFIG_X86_64
+
 static inline int
 within_inclusive(unsigned long addr, unsigned long start, unsigned long end)
 {
 	return addr >= start && addr <= end;
 }
-
-#ifdef CONFIG_X86_64
 
 /*
  * The kernel image is mapped into two places in the virtual address space
@@ -889,7 +889,7 @@ static void __set_pmd_pte(pte_t *kpte, unsigned long address, pte_t pte)
 	/* change init_mm */
 	set_pte_atomic(kpte, pte);
 #ifdef CONFIG_X86_32
-	if (!SHARED_KERNEL_PMD) {
+	{
 		struct page *page;
 
 		list_for_each_entry(page, &pgd_list, lru) {
@@ -1296,7 +1296,7 @@ static int collapse_pmd_page(pmd_t *pmd, unsigned long addr,
 	/* Queue the page table to be freed after TLB flush */
 	list_add(&page_ptdesc(pmd_page(old_pmd))->pt_list, pgtables);
 
-	if (IS_ENABLED(CONFIG_X86_32) && !SHARED_KERNEL_PMD) {
+	if (IS_ENABLED(CONFIG_X86_32)) {
 		struct page *page;
 
 		/* Update all PGD tables to use the same large page */
@@ -2632,7 +2632,7 @@ static int __set_pages_np(struct page *page, int numpages)
 				.pgd = NULL,
 				.numpages = numpages,
 				.mask_set = __pgprot(0),
-				.mask_clr = __pgprot(_PAGE_PRESENT | _PAGE_RW),
+				.mask_clr = __pgprot(_PAGE_PRESENT | _PAGE_RW | _PAGE_DIRTY),
 				.flags = CPA_NO_CHECK_ALIAS };
 
 	/*
@@ -2719,7 +2719,7 @@ int __init kernel_map_pages_in_pgd(pgd_t *pgd, u64 pfn, unsigned long address,
 		.pgd = pgd,
 		.numpages = numpages,
 		.mask_set = __pgprot(0),
-		.mask_clr = __pgprot(~page_flags & (_PAGE_NX|_PAGE_RW)),
+		.mask_clr = __pgprot(~page_flags & (_PAGE_NX|_PAGE_RW|_PAGE_DIRTY)),
 		.flags = CPA_NO_CHECK_ALIAS,
 	};
 
@@ -2762,7 +2762,7 @@ int __init kernel_unmap_pages_in_pgd(pgd_t *pgd, unsigned long address,
 		.pgd		= pgd,
 		.numpages	= numpages,
 		.mask_set	= __pgprot(0),
-		.mask_clr	= __pgprot(_PAGE_PRESENT | _PAGE_RW),
+		.mask_clr	= __pgprot(_PAGE_PRESENT | _PAGE_RW | _PAGE_DIRTY),
 		.flags		= CPA_NO_CHECK_ALIAS,
 	};
 

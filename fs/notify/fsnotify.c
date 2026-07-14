@@ -193,7 +193,7 @@ static bool fsnotify_event_needs_parent(struct inode *inode, __u32 mnt_mask,
 	return mask & marks_mask;
 }
 
-/* Are there any inode/mount/sb objects that are interested in this event? */
+/* Are there any inode/mount/sb objects that watch for these events? */
 static inline bool fsnotify_object_watched(struct inode *inode, __u32 mnt_mask,
 					   __u32 mask)
 {
@@ -622,6 +622,67 @@ out:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(fsnotify);
+
+#ifdef CONFIG_FANOTIFY_ACCESS_PERMISSIONS
+/*
+ * At open time we check fsnotify_sb_has_priority_watchers() and set the
+ * FMODE_NONOTIFY_ mode bits accordignly.
+ * Later, fsnotify permission hooks do not check if there are permission event
+ * watches, but that there were permission event watches at open time.
+ */
+void file_set_fsnotify_mode(struct file *file)
+{
+	struct dentry *dentry = file->f_path.dentry, *parent;
+	struct super_block *sb = dentry->d_sb;
+	__u32 mnt_mask, p_mask;
+
+	/* Is it a file opened by fanotify? */
+	if (FMODE_FSNOTIFY_NONE(file->f_mode))
+		return;
+
+	/*
+	 * Permission events is a super set of pre-content events, so if there
+	 * are no permission event watchers, there are also no pre-content event
+	 * watchers and this is implied from the single FMODE_NONOTIFY_PERM bit.
+	 */
+	if (likely(!fsnotify_sb_has_priority_watchers(sb,
+						FSNOTIFY_PRIO_CONTENT))) {
+		file->f_mode |= FMODE_NONOTIFY_PERM;
+		return;
+	}
+
+	/*
+	 * If there are permission event watchers but no pre-content event
+	 * watchers, set FMODE_NONOTIFY | FMODE_NONOTIFY_PERM to indicate that.
+	 */
+	if ((!d_is_dir(dentry) && !d_is_reg(dentry)) ||
+	    likely(!fsnotify_sb_has_priority_watchers(sb,
+						FSNOTIFY_PRIO_PRE_CONTENT))) {
+		file->f_mode |= FMODE_NONOTIFY | FMODE_NONOTIFY_PERM;
+		return;
+	}
+
+	/*
+	 * OK, there are some pre-content watchers. Check if anybody is
+	 * watching for pre-content events on *this* file.
+	 */
+	mnt_mask = READ_ONCE(real_mount(file->f_path.mnt)->mnt_fsnotify_mask);
+	if (unlikely(fsnotify_object_watched(d_inode(dentry), mnt_mask,
+				     FSNOTIFY_PRE_CONTENT_EVENTS)))
+		return;
+
+	/* Is parent watching for pre-content events on this file? */
+	if (dentry->d_flags & DCACHE_FSNOTIFY_PARENT_WATCHED) {
+		parent = dget_parent(dentry);
+		p_mask = fsnotify_inode_watches_children(d_inode(parent));
+		dput(parent);
+		if (p_mask & FSNOTIFY_PRE_CONTENT_EVENTS)
+			return;
+	}
+	/* Nobody watching for pre-content events from this file */
+	file->f_mode |= FMODE_NONOTIFY | FMODE_NONOTIFY_PERM;
+}
+#endif
 
 static __init int fsnotify_init(void)
 {

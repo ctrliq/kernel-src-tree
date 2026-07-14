@@ -24,10 +24,12 @@
 /* We borrow bit 10 to store the exclusive marker in swap PTEs. */
 #define _PAGE_SWP_EXCLUSIVE	0x400
 
-#ifdef CONFIG_3_LEVEL_PGTABLES
-#include <asm/pgtable-3level.h>
-#else
+#if CONFIG_PGTABLE_LEVELS == 4
+#include <asm/pgtable-4level.h>
+#elif CONFIG_PGTABLE_LEVELS == 2
 #include <asm/pgtable-2level.h>
+#else
+#error "Unsupported number of page table levels"
 #endif
 
 extern pgd_t swapper_pg_dir[PTRS_PER_PGD];
@@ -282,21 +284,17 @@ static inline int pte_same(pte_t pte_a, pte_t pte_b)
 	return !((pte_val(pte_a) ^ pte_val(pte_b)) & ~_PAGE_NEWPAGE);
 }
 
-/*
- * Conversion functions: convert a page and protection to a page entry,
- * and a page entry and page directory to the page they refer to.
- */
-
 #define __virt_to_page(virt) phys_to_page(__pa(virt))
 #define virt_to_page(addr) __virt_to_page((const unsigned long) addr)
 
-#define mk_pte(page, pgprot) \
-	({ pte_t pte;					\
-							\
-	pte_set_val(pte, page_to_phys(page), (pgprot));	\
-	if (pte_present(pte))				\
-		pte_mknewprot(pte_mknewpage(pte));	\
-	pte;})
+static inline pte_t pfn_pte(unsigned long pfn, pgprot_t pgprot)
+{
+	pte_t pte;
+
+	pte_set_val(pte, pfn_to_phys(pfn), pgprot);
+
+	return pte;
+}
 
 static inline pte_t pte_modify(pte_t pte, pgprot_t newprot)
 {

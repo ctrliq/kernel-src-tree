@@ -210,10 +210,6 @@ static void early_init_intel(struct cpuinfo_x86 *c)
 {
 	u64 misc_enable;
 
-	if ((c->x86 == 0xf && c->x86_model >= 0x03) ||
-		(c->x86 == 0x6 && c->x86_model >= 0x0e))
-		set_cpu_cap(c, X86_FEATURE_CONSTANT_TSC);
-
 	if (c->x86 >= 6 && !cpu_has(c, X86_FEATURE_IA64))
 		c->microcode = intel_get_microcode_revision();
 	c->intel_platform_id = intel_get_platform_id();
@@ -267,10 +263,16 @@ static void early_init_intel(struct cpuinfo_x86 *c)
 	 *
 	 * It is also reliable across cores and sockets. (but not across
 	 * cabinets - we turn it off in that case explicitly.)
+	 *
+	 * Use a model-specific check for some older CPUs that have invariant
+	 * TSC but may not report it architecturally via 8000_0007.
 	 */
 	if (c->x86_power & (1 << 8)) {
 		set_cpu_cap(c, X86_FEATURE_CONSTANT_TSC);
 		set_cpu_cap(c, X86_FEATURE_NONSTOP_TSC);
+	} else if ((c->x86_vfm >= INTEL_P4_PRESCOTT && c->x86_vfm <= INTEL_P4_CEDARMILL) ||
+		   (c->x86_vfm >= INTEL_CORE_YONAH  && c->x86_vfm <= INTEL_IVYBRIDGE)) {
+		set_cpu_cap(c, X86_FEATURE_CONSTANT_TSC);
 	}
 
 	/* Penwell and Cloverview have the TSC which doesn't sleep on S3 */
@@ -299,12 +301,19 @@ static void early_init_intel(struct cpuinfo_x86 *c)
 		clear_cpu_cap(c, X86_FEATURE_PAT);
 
 	/*
-	 * If fast string is not enabled in IA32_MISC_ENABLE for any reason,
-	 * clear the fast string and enhanced fast string CPU capabilities.
+	 * Modern CPUs are generally expected to have a sane fast string
+	 * implementation. However, BIOSes typically have a knob to tweak
+	 * the architectural MISC_ENABLE.FAST_STRING enable bit.
+	 *
+	 * Adhere to the preference and program the Linux-defined fast
+	 * string flag and enhanced fast string capabilities accordingly.
 	 */
-	if (c->x86 > 6 || (c->x86 == 6 && c->x86_model >= 0xd)) {
+	if (c->x86_vfm >= INTEL_PENTIUM_M_DOTHAN) {
 		rdmsrl(MSR_IA32_MISC_ENABLE, misc_enable);
-		if (!(misc_enable & MSR_IA32_MISC_ENABLE_FAST_STRING)) {
+		if (misc_enable & MSR_IA32_MISC_ENABLE_FAST_STRING) {
+			/* X86_FEATURE_ERMS is set based on CPUID */
+			set_cpu_cap(c, X86_FEATURE_REP_GOOD);
+		} else {
 			pr_info("Disabled fast string operations\n");
 			setup_clear_cpu_cap(X86_FEATURE_REP_GOOD);
 			setup_clear_cpu_cap(X86_FEATURE_ERMS);
@@ -448,23 +457,16 @@ static void intel_workarounds(struct cpuinfo_x86 *c)
 	    (c->x86_stepping < 0x6 || c->x86_stepping == 0xb))
 		set_cpu_bug(c, X86_BUG_11AP);
 
-
 #ifdef CONFIG_X86_INTEL_USERCOPY
 	/*
-	 * Set up the preferred alignment for movsl bulk memory moves
+	 * MOVSL bulk memory moves can be slow when source and dest are not
+	 * both 8-byte aligned. PII/PIII only like MOVSL with 8-byte alignment.
+	 *
+	 * Set the preferred alignment for Pentium Pro and newer processors, as
+	 * it has only been tested on these.
 	 */
-	switch (c->x86) {
-	case 4:		/* 486: untested */
-		break;
-	case 5:		/* Old Pentia: untested */
-		break;
-	case 6:		/* PII/PIII only like movsl with 8-byte alignment */
+	if (c->x86_vfm >= INTEL_PENTIUM_PRO)
 		movsl_mask.mask = 7;
-		break;
-	case 15:	/* P4 is OK down to 8-byte alignment */
-		movsl_mask.mask = 7;
-		break;
-	}
 #endif
 
 	intel_smp_check(c);
@@ -581,8 +583,6 @@ static void init_intel(struct cpuinfo_x86 *c)
 #ifdef CONFIG_X86_64
 	if (c->x86 == 15)
 		c->x86_cache_alignment = c->x86_clflush_size * 2;
-	if (c->x86 == 6)
-		set_cpu_cap(c, X86_FEATURE_REP_GOOD);
 #else
 	/*
 	 * Names for the Pentium II/Celeron processors

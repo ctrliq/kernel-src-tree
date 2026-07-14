@@ -1366,6 +1366,13 @@ PAGE_SIZE multiple when read back.
 	monitors the limited cgroup to alleviate heavy reclaim
 	pressure.
 
+        If memory.high is opened with O_NONBLOCK then the synchronous
+        reclaim is bypassed. This is useful for admin processes that
+        need to dynamically adjust the job's memory limits without
+        expending their own CPU resources on memory reclamation. The
+        job will trigger the reclaim and/or get throttled on its
+        next charge request.
+
   memory.max
 	A read-write single value file which exists on non-root
 	cgroups.  The default is "max".
@@ -1382,6 +1389,13 @@ PAGE_SIZE multiple when read back.
 	Some kinds of allocations don't invoke the OOM killer.
 	Caller could retry them differently, return into userspace
 	as -ENOMEM or silently ignore in cases like disk readahead.
+
+        If memory.max is opened with O_NONBLOCK, then the synchronous
+        reclaim and oom-kill are bypassed. This is useful for admin
+        processes that need to dynamically adjust the job's memory limits
+        without expending their own CPU resources on memory reclamation.
+        The job will trigger the reclaim and/or oom-kill on its next
+        charge request.
 
   memory.reclaim
 	A write-only nested-keyed file which exists for all cgroups.
@@ -1414,6 +1428,9 @@ The following nested keys are defined.
 	the reclaim with that swappiness value. Note that this has the
 	same semantics as vm.swappiness applied to memcg reclaim with
 	all the existing limitations and potential future extensions.
+
+	The valid range for swappiness is [0-200, max], setting
+	swappiness=max exclusively reclaims anonymous memory.
 
   memory.peak
 	A read-write single value file which exists on non-root cgroups.
@@ -1512,7 +1529,10 @@ The following nested keys are defined.
 
 	  anon
 		Amount of memory used in anonymous mappings such as
-		brk(), sbrk(), and mmap(MAP_ANONYMOUS)
+		brk(), sbrk(), and mmap(MAP_ANONYMOUS). Note that
+		some kernel configurations might account complete larger
+		allocations (e.g., THP) if only some, but not all the
+		memory of such an allocation is mapped anymore.
 
 	  file
 		Amount of memory used to cache filesystem data,
@@ -1555,7 +1575,10 @@ The following nested keys are defined.
 		Amount of application memory swapped out to zswap.
 
 	  file_mapped
-		Amount of cached filesystem data mapped with mmap()
+		Amount of cached filesystem data mapped with mmap(). Note
+		that some kernel configurations might account complete
+		larger allocations (e.g., THP) if only some, but not
+		not all the memory of such an allocation is mapped.
 
 	  file_dirty
 		Amount of cached filesystem data that was modified but
@@ -1627,6 +1650,12 @@ The following nested keys are defined.
 	  workingset_nodereclaim
 		Number of times a shadow node has been reclaimed
 
+	  pswpin (npn)
+		Number of pages swapped into memory
+
+	  pswpout (npn)
+		Number of pages swapped out of memory
+
 	  pgscan (npn)
 		Amount of scanned pages (in an inactive LRU list)
 
@@ -1642,6 +1671,9 @@ The following nested keys are defined.
 	  pgscan_khugepaged (npn)
 		Amount of scanned pages by khugepaged  (in an inactive LRU list)
 
+	  pgscan_proactive (npn)
+		Amount of scanned pages proactively (in an inactive LRU list)
+
 	  pgsteal_kswapd (npn)
 		Amount of reclaimed pages by kswapd
 
@@ -1650,6 +1682,9 @@ The following nested keys are defined.
 
 	  pgsteal_khugepaged (npn)
 		Amount of reclaimed pages by khugepaged
+
+	  pgsteal_proactive (npn)
+		Amount of reclaimed pages proactively
 
 	  pgfault (npn)
 		Total number of page faults incurred
@@ -1727,6 +1762,9 @@ The following nested keys are defined.
 
 	  pgdemote_khugepaged
 		Number of pages demoted by khugepaged.
+
+	  pgdemote_proactive
+		Number of pages demoted by proactively.
 
 	  hugetlb
 		Amount of memory used by hugetlb pages. This metric only shows
@@ -3065,7 +3103,7 @@ Filesystem Support for Writeback
 --------------------------------
 
 A filesystem can support cgroup writeback by updating
-address_space_operations->writepage[s]() to annotate bio's using the
+address_space_operations->writepages() to annotate bio's using the
 following two functions.
 
   wbc_init_bio(@wbc, @bio)
@@ -3075,7 +3113,7 @@ following two functions.
 	a queue (device) has been associated with the bio and
 	before submission.
 
-  wbc_account_cgroup_owner(@wbc, @page, @bytes)
+  wbc_account_cgroup_owner(@wbc, @folio, @bytes)
 	Should be called for each data segment being written out.
 	While this function doesn't care exactly when it's called
 	during the writeback session, it's the easiest and most

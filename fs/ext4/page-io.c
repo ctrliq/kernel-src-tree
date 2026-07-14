@@ -450,7 +450,7 @@ submit_and_retry:
 	}
 	if (!bio_add_folio(io->io_bio, io_folio, bh->b_size, bh_offset(bh)))
 		goto submit_and_retry;
-	wbc_account_cgroup_owner(io->io_wbc, &folio->page, bh->b_size);
+	wbc_account_cgroup_owner(io->io_wbc, folio, bh->b_size);
 	io->io_next_block++;
 }
 
@@ -549,7 +549,7 @@ int ext4_bio_write_folio(struct ext4_io_submit *io, struct folio *folio,
 		if (io->io_bio)
 			gfp_flags = GFP_NOWAIT;
 	retry_encrypt:
-		bounce_page = fscrypt_encrypt_pagecache_blocks(&folio->page,
+		bounce_page = fscrypt_encrypt_pagecache_blocks(folio,
 					enc_bytes, 0, gfp_flags);
 		if (IS_ERR(bounce_page)) {
 			ret = PTR_ERR(bounce_page);

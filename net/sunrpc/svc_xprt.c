@@ -656,7 +656,7 @@ static bool svc_fill_pages(struct svc_rqst *rqstp, struct page **pages,
 	unsigned long filled, ret;
 
 	for (filled = 0; filled < npages; filled = ret) {
-		ret = alloc_pages_bulk_array(GFP_KERNEL, npages, pages);
+		ret = alloc_pages_bulk(GFP_KERNEL, npages, pages);
 		if (ret > filled)
 			/* Made progress, don't sleep yet */
 			continue;

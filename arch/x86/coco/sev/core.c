@@ -1676,9 +1676,7 @@ static void __init alloc_runtime_data(int cpu)
 		struct svsm_ca *caa;
 
 		/* Allocate the SVSM CA page if an SVSM is present */
-		caa = memblock_alloc(sizeof(*caa), PAGE_SIZE);
-		if (!caa)
-			panic("Can't allocate SVSM CA page\n");
+		caa = memblock_alloc_or_panic(sizeof(*caa), PAGE_SIZE);
 
 		per_cpu(svsm_caa, cpu) = caa;
 		per_cpu(svsm_caa_pa, cpu) = __pa(caa);
@@ -2451,7 +2449,7 @@ static __head void svsm_setup(struct cc_blob_sev_info *cc_info)
 	 * kernel was loaded (physbase), so the get the CA address using
 	 * RIP-relative addressing.
 	 */
-	pa = (u64)&RIP_REL_REF(boot_svsm_ca_page);
+	pa = (u64)rip_rel_ptr(&boot_svsm_ca_page);
 
 	/*
 	 * Switch over to the boot SVSM CA while the current CA is still

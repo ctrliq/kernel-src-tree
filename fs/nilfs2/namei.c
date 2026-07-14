@@ -213,8 +213,8 @@ static int nilfs_link(struct dentry *old_dentry, struct inode *dir,
 	return err;
 }
 
-static int nilfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
-		       struct dentry *dentry, umode_t mode)
+static struct dentry *nilfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
+				  struct dentry *dentry, umode_t mode)
 {
 	struct inode *inode;
 	struct nilfs_transaction_info ti;
@@ -222,7 +222,7 @@ static int nilfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 
 	err = nilfs_transaction_begin(dir->i_sb, &ti, 1);
 	if (err)
-		return err;
+		return ERR_PTR(err);
 
 	inc_nlink(dir);
 
@@ -253,7 +253,7 @@ out:
 	else
 		nilfs_transaction_abort(dir->i_sb);
 
-	return err;
+	return err ? ERR_PTR(err) : NULL;
 
 out_fail:
 	drop_nlink(inode);

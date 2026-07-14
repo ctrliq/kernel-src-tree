@@ -32,7 +32,7 @@
 #define TDX_SUCCESS		0ULL
 #define TDX_RND_NO_ENTROPY	0x8000020300000000ULL
 
-#ifndef __ASSEMBLY__
+#ifndef __ASSEMBLER__
 
 #include <uapi/asm/mce.h>
 #include <asm/tdx_global_metadata.h>
@@ -229,5 +229,5 @@ void tdx_cpu_flush_cache_for_kexec(void);
 static inline void tdx_cpu_flush_cache_for_kexec(void) { }
 #endif
 
-#endif /* !__ASSEMBLY__ */
+#endif /* !__ASSEMBLER__ */
 #endif /* _ASM_X86_TDX_H */

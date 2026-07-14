@@ -4,7 +4,7 @@
 
 #ifdef CONFIG_PARAVIRT
 
-#ifndef __ASSEMBLY__
+#ifndef __ASSEMBLER__
 #include <linux/types.h>
 
 #include <asm/desc_defs.h>
@@ -134,8 +134,6 @@ struct pv_mmu_ops {
 	void (*flush_tlb_multi)(const struct cpumask *cpus,
 				const struct flush_tlb_info *info);
 
-	void (*tlb_remove_table)(struct mmu_gather *tlb, void *table);
-
 	/* Hook for intercepting the destruction of an mm_struct. */
 	void (*exit_mmap)(struct mm_struct *mm);
 	void (*notify_page_enc_status_changed)(unsigned long pfn, int npages, bool enc);
@@ -192,12 +190,10 @@ struct pv_mmu_ops {
 
 	void (*set_p4d)(p4d_t *p4dp, p4d_t p4dval);
 
-#if CONFIG_PGTABLE_LEVELS >= 5
 	struct paravirt_callee_save p4d_val;
 	struct paravirt_callee_save make_p4d;
 
 	void (*set_pgd)(pgd_t *pgdp, pgd_t pgdval);
-#endif	/* CONFIG_PGTABLE_LEVELS >= 5 */
 
 	struct pv_lazy_ops lazy_mode;
 
@@ -519,7 +515,7 @@ unsigned long pv_native_read_cr2(void);
 
 #define paravirt_nop	((void *)nop_func)
 
-#endif	/* __ASSEMBLY__ */
+#endif	/* __ASSEMBLER__ */
 
 #define ALT_NOT_XEN	ALT_NOT(X86_FEATURE_XENPV)
 

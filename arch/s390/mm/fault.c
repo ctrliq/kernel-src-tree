@@ -15,7 +15,6 @@
 #include <linux/signal.h>
 #include <linux/sched.h>
 #include <linux/sched/debug.h>
-#include <linux/jump_label.h>
 #include <linux/kernel.h>
 #include <linux/errno.h>
 #include <linux/string.h>
@@ -45,16 +44,6 @@
 #include <asm/uv.h>
 #include "../kernel/entry.h"
 
-static DEFINE_STATIC_KEY_FALSE(have_store_indication);
-
-static int __init fault_init(void)
-{
-	if (test_facility(75))
-		static_branch_enable(&have_store_indication);
-	return 0;
-}
-early_initcall(fault_init);
-
 /*
  * Find out which address space caused the exception.
  */
@@ -80,7 +69,7 @@ static __always_inline bool fault_is_write(struct pt_regs *regs)
 {
 	union teid teid = { .val = regs->int_parm_long };
 
-	if (static_branch_likely(&have_store_indication))
+	if (test_facility(75))
 		return teid.fsi == TEID_FSI_STORE;
 	return false;
 }
@@ -173,6 +162,23 @@ static void dump_fault_info(struct pt_regs *regs)
 }
 
 int show_unhandled_signals = 1;
+
+static const struct ctl_table s390_fault_sysctl_table[] = {
+	{
+		.procname	= "userprocess_debug",
+		.data		= &show_unhandled_signals,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+	},
+};
+
+static int __init init_s390_fault_sysctls(void)
+{
+	register_sysctl_init("kernel", s390_fault_sysctl_table);
+	return 0;
+}
+arch_initcall(init_s390_fault_sysctls);
 
 void report_user_fault(struct pt_regs *regs, long signr, int is_mm_fault)
 {
@@ -368,6 +374,7 @@ void do_protection_exception(struct pt_regs *regs)
 	if (unlikely(!teid.b61)) {
 		if (user_mode(regs)) {
 			/* Low-address protection in user mode: cannot happen */
+			dump_fault_info(regs);
 			die(regs, "Low-address protection");
 		}
 		/*
@@ -440,6 +447,8 @@ void do_secure_storage_access(struct pt_regs *regs)
 		if (rc)
 			return handle_fault_error_nolock(regs, 0);
 	} else {
+		if (faulthandler_disabled())
+			return handle_fault_error_nolock(regs, 0);
 		mm = current->mm;
 		mmap_read_lock(mm);
 		vma = find_vma(mm, addr);

@@ -4,7 +4,7 @@
 
 #include <linux/annotate.h>
 
-#ifdef __ASSEMBLY__
+#ifdef __ASSEMBLER__
 # define __ASM_FORM(x, ...)		x,## __VA_ARGS__
 # define __ASM_FORM_RAW(x, ...)		x,## __VA_ARGS__
 # define __ASM_FORM_COMMA(x, ...)	x,## __VA_ARGS__,
@@ -115,14 +115,14 @@
 
 #endif
 
-#ifndef __ASSEMBLY__
-#ifndef __pic__
+#ifndef __ASSEMBLER__
 static __always_inline __pure void *rip_rel_ptr(void *p)
 {
 	asm("leaq %c1(%%rip), %0" : "=r"(p) : "i"(p));
 
 	return p;
 }
+#ifndef __pic__
 #define RIP_REL_REF(var)	(*(typeof(&(var)))rip_rel_ptr(&(var)))
 #else
 #define RIP_REL_REF(var)	(var)
@@ -146,7 +146,7 @@ static __always_inline __pure void *rip_rel_ptr(void *p)
 # include <asm/extable_fixup_types.h>
 
 /* Exception table entry */
-#ifdef __ASSEMBLY__
+#ifdef __ASSEMBLER__
 
 # define _ASM_EXTABLE_TYPE(from, to, type)			\
 	.pushsection "__ex_table","a" ;				\
@@ -167,7 +167,7 @@ static __always_inline __pure void *rip_rel_ptr(void *p)
 #  define _ASM_NOKPROBE(entry)
 # endif
 
-#else /* ! __ASSEMBLY__ */
+#else /* ! __ASSEMBLER__ */
 
 # define DEFINE_EXTABLE_TYPE_REG \
 	".macro extable_type_reg type:req reg:req\n"						\
@@ -226,7 +226,7 @@ static __always_inline __pure void *rip_rel_ptr(void *p)
  */
 register unsigned long current_stack_pointer asm(_ASM_SP);
 #define ASM_CALL_CONSTRAINT "+r" (current_stack_pointer)
-#endif /* __ASSEMBLY__ */
+#endif /* __ASSEMBLER__ */
 
 #define _ASM_EXTABLE(from, to)					\
 	_ASM_EXTABLE_TYPE(from, to, EX_TYPE_DEFAULT)

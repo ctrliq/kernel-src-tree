@@ -14,6 +14,7 @@
 #include <linux/errno.h>
 #include <linux/acpi.h>
 #include <linux/memblock.h>
+#include <linux/memory.h>
 #include <linux/numa.h>
 #include <linux/nodemask.h>
 #include <linux/topology.h>
@@ -82,6 +83,101 @@ int acpi_map_pxm_to_node(int pxm)
 	return node;
 }
 EXPORT_SYMBOL(acpi_map_pxm_to_node);
+
+#ifdef CONFIG_NUMA_EMU
+/*
+ * Take max_nid - 1 fake-numa nodes into account in both
+ * pxm_to_node_map()/node_to_pxm_map[] tables.
+ */
+int __init fix_pxm_node_maps(int max_nid)
+{
+	static int pxm_to_node_map_copy[MAX_PXM_DOMAINS] __initdata
+			= { [0 ... MAX_PXM_DOMAINS - 1] = NUMA_NO_NODE };
+	static int node_to_pxm_map_copy[MAX_NUMNODES] __initdata
+			= { [0 ... MAX_NUMNODES - 1] = PXM_INVAL };
+	int i, j, index = -1, count = 0;
+	nodemask_t nodes_to_enable;
+
+	if (numa_off)
+		return -1;
+
+	/* no or incomplete node/PXM mapping set, nothing to do */
+	if (srat_disabled())
+		return 0;
+
+	/* find fake nodes PXM mapping */
+	for (i = 0; i < MAX_NUMNODES; i++) {
+		if (node_to_pxm_map[i] != PXM_INVAL) {
+			for (j = 0; j <= max_nid; j++) {
+				if ((emu_nid_to_phys[j] == i) &&
+				    WARN(node_to_pxm_map_copy[j] != PXM_INVAL,
+					 "Node %d is already binded to PXM %d\n",
+					 j, node_to_pxm_map_copy[j]))
+					return -1;
+				if (emu_nid_to_phys[j] == i) {
+					node_to_pxm_map_copy[j] =
+						node_to_pxm_map[i];
+					if (j > index)
+						index = j;
+					count++;
+				}
+			}
+		}
+	}
+	if (index == -1) {
+		pr_debug("No node/PXM mapping has been set\n");
+		/* nothing more to be done */
+		return 0;
+	}
+	if (WARN(index != max_nid, "%d max nid  when expected %d\n",
+		      index, max_nid))
+		return -1;
+
+	nodes_clear(nodes_to_enable);
+
+	/* map phys nodes not used for fake nodes */
+	for (i = 0; i < MAX_NUMNODES; i++) {
+		if (node_to_pxm_map[i] != PXM_INVAL) {
+			for (j = 0; j <= max_nid; j++)
+				if (emu_nid_to_phys[j] == i)
+					break;
+			/* fake nodes PXM mapping has been done */
+			if (j <= max_nid)
+				continue;
+			/* find first hole */
+			for (j = 0;
+			     j < MAX_NUMNODES &&
+				 node_to_pxm_map_copy[j] != PXM_INVAL;
+			     j++)
+			;
+			if (WARN(j == MAX_NUMNODES,
+			    "Number of nodes exceeds MAX_NUMNODES\n"))
+				return -1;
+			node_to_pxm_map_copy[j] = node_to_pxm_map[i];
+			node_set(j, nodes_to_enable);
+			count++;
+		}
+	}
+
+	/* creating reverse mapping in pxm_to_node_map[] */
+	for (i = 0; i < MAX_NUMNODES; i++)
+		if (node_to_pxm_map_copy[i] != PXM_INVAL &&
+		    pxm_to_node_map_copy[node_to_pxm_map_copy[i]] == NUMA_NO_NODE)
+			pxm_to_node_map_copy[node_to_pxm_map_copy[i]] = i;
+
+	/* overwrite with new mapping */
+	for (i = 0; i < MAX_NUMNODES; i++) {
+		node_to_pxm_map[i] = node_to_pxm_map_copy[i];
+		pxm_to_node_map[i] = pxm_to_node_map_copy[i];
+	}
+
+	/* enable other nodes found in PXM for hotplug */
+	nodes_or(numa_nodes_parsed, nodes_to_enable, numa_nodes_parsed);
+
+	pr_debug("found %d total number of nodes\n", count);
+	return 0;
+}
+#endif
 
 static void __init
 acpi_table_print_srat_entry(struct acpi_subtable_header *header)
@@ -334,12 +430,22 @@ static int __init acpi_parse_cfmws(union acpi_subtable_headers *header,
 {
 	struct acpi_cedt_cfmws *cfmws;
 	int *fake_pxm = arg;
-	u64 start, end;
+	u64 start, end, align;
 	int node;
+	int err;
 
 	cfmws = (struct acpi_cedt_cfmws *)header;
 	start = cfmws->base_hpa;
 	end = cfmws->base_hpa + cfmws->window_size;
+
+	/* Align memblock size to CFMW regions if possible */
+	align = 1UL << __ffs(start | end);
+	if (align >= SZ_256M) {
+		err = memory_block_advise_max_size(align);
+		if (err)
+			pr_warn("CFMWS: memblock size advise failed (%d)\n", err);
+	} else
+		pr_err("CFMWS: [BIOS BUG] base/size alignment violates spec\n");
 
 	/*
 	 * The SRAT may have already described NUMA details for all,
@@ -358,7 +464,7 @@ static int __init acpi_parse_cfmws(union acpi_subtable_headers *header,
 		return -EINVAL;
 	}
 
-	if (numa_add_memblk(node, start, end) < 0) {
+	if (numa_add_reserved_memblk(node, start, end) < 0) {
 		/* CXL driver must handle the NUMA_NO_NODE case */
 		pr_warn("ACPI NUMA: Failed to add memblk for CFMWS node %d [mem %#llx-%#llx]\n",
 			node, start, end);

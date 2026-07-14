@@ -1744,7 +1744,7 @@ static bool run_delalloc_compressed(struct btrfs_inode *inode,
 			 * need full accuracy.  Just account the whole thing
 			 * against the first page.
 			 */
-			wbc_account_cgroup_owner(wbc, &locked_folio->page,
+			wbc_account_cgroup_owner(wbc, locked_folio,
 						 cur_end - start);
 			async_chunk[i].locked_folio = locked_folio;
 			locked_folio = NULL;
@@ -6823,18 +6823,18 @@ fail:
 	return err;
 }
 
-static int btrfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
-		       struct dentry *dentry, umode_t mode)
+static struct dentry *btrfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
+				  struct dentry *dentry, umode_t mode)
 {
 	struct inode *inode;
 
 	inode = new_inode(dir->i_sb);
 	if (!inode)
-		return -ENOMEM;
+		return ERR_PTR(-ENOMEM);
 	inode_init_owner(idmap, inode, dir, S_IFDIR | mode);
 	inode->i_op = &btrfs_dir_inode_operations;
 	inode->i_fop = &btrfs_dir_file_operations;
-	return btrfs_create_common(dir, dentry, inode);
+	return ERR_PTR(btrfs_create_common(dir, dentry, inode));
 }
 
 static noinline int uncompress_inline(struct btrfs_path *path,
@@ -10249,7 +10249,6 @@ out_unlock_mmap:
 	*span = bsi.highest_ppage - bsi.lowest_ppage + 1;
 	sis->max = bsi.nr_pages;
 	sis->pages = bsi.nr_pages - 1;
-	sis->highest_bit = bsi.nr_pages - 1;
 	return bsi.nr_extents;
 }
 #else
