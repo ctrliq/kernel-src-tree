@@ -725,6 +725,7 @@ static void iso_sock_destruct(struct sock *sk)
 
 	skb_queue_purge(&sk->sk_receive_queue);
 	skb_queue_purge(&sk->sk_write_queue);
+	skb_queue_purge(&sk->sk_error_queue);
 }
 
 static void iso_sock_cleanup_listen(struct sock *parent)
@@ -2302,6 +2303,7 @@ int iso_recv(struct hci_dev *hdev, u16 handle, struct sk_buff *skb, u16 flags)
 {
 	struct hci_conn *hcon;
 	struct iso_conn *conn;
+	struct skb_shared_hwtstamps *hwts;
 	__u16 pb, ts, len, sn;
 
 	hci_dev_lock(hdev);
@@ -2341,12 +2343,15 @@ int iso_recv(struct hci_dev *hdev, u16 handle, struct sk_buff *skb, u16 flags)
 		if (ts) {
 			struct hci_iso_ts_data_hdr *hdr;
 
-			/* TODO: add timestamp to the packet? */
 			hdr = skb_pull_data(skb, HCI_ISO_TS_DATA_HDR_SIZE);
 			if (!hdr) {
 				BT_ERR("Frame is too short (len %d)", skb->len);
 				goto drop;
 			}
+
+			/*  Record the timestamp to skb */
+			hwts = skb_hwtstamps(skb);
+			hwts->hwtstamp = us_to_ktime(le32_to_cpu(hdr->ts));
 
 			sn = __le16_to_cpu(hdr->sn);
 			len = __le16_to_cpu(hdr->slen);
@@ -2399,6 +2404,13 @@ int iso_recv(struct hci_dev *hdev, u16 handle, struct sk_buff *skb, u16 flags)
 		skb_copy_from_linear_data(skb, skb_put(conn->rx_skb, skb->len),
 					  skb->len);
 		conn->rx_len = len - skb->len;
+
+		/* Copy hw timestamp from skb to rx_skb if present */
+		if (ts) {
+			hwts = skb_hwtstamps(conn->rx_skb);
+			hwts->hwtstamp = skb_hwtstamps(skb)->hwtstamp;
+		}
+
 		break;
 
 	case ISO_CONT:
