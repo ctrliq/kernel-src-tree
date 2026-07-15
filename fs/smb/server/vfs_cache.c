@@ -581,7 +581,20 @@ bool ksmbd_close_disconnected_durable_delete_on_close(struct dentry *dentry)
 			if (fp->conn || !fp->is_durable ||
 			    fp->f_state != FP_INITED)
 				continue;
-			list_move_tail(&fp->node, &dispose);
+
+			/*
+			 * Claim the close before unlinking fp from m_fp_list.
+			 * refcount == 1 means only the durable lifetime ref is
+			 * left. Add a transient ref so final close can drop both.
+			 */
+			write_lock(&global_ft.lock);
+			if (atomic_read(&fp->refcount) == 1) {
+				atomic_inc(&fp->refcount);
+				__ksmbd_remove_durable_fd(fp);
+				ksmbd_mark_fp_closed(fp);
+				list_move_tail(&fp->node, &dispose);
+			}
+			write_unlock(&global_ft.lock);
 		}
 	}
 	up_write(&ci->m_lock);
@@ -589,16 +602,18 @@ bool ksmbd_close_disconnected_durable_delete_on_close(struct dentry *dentry)
 	/*
 	 * Drop our lookup reference before closing so the last __ksmbd_close_fd()
 	 * can drop m_count to zero and unlink the delete-on-close file.  The
-	 * collected handles still hold references, so ci stays valid until they
-	 * are closed below.
+	 * collected handles still hold the transient reference taken above, so
+	 * ci stays valid until they are closed below.
 	 */
 	ksmbd_inode_put(ci);
 
 	while (!list_empty(&dispose)) {
 		fp = list_first_entry(&dispose, struct ksmbd_file, node);
 		list_del_init(&fp->node);
-		__ksmbd_close_fd(NULL, fp);
-		closed = true;
+		if (atomic_sub_and_test(2, &fp->refcount)) {
+			__ksmbd_close_fd(NULL, fp);
+			closed = true;
+		}
 	}
 
 	return closed;
