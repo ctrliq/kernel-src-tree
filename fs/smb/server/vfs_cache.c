@@ -1530,7 +1530,8 @@ static bool session_fd_check(struct ksmbd_tree_connect *tcon,
 	conn = fp->conn;
 	ci = fp->f_ci;
 	down_write(&ci->m_lock);
-	list_for_each_entry_rcu(op, &ci->m_op_list, op_entry) {
+	list_for_each_entry_rcu(op, &ci->m_op_list, op_entry,
+				lockdep_is_held(&ci->m_lock)) {
 		if (op->conn != conn)
 			continue;
 		ksmbd_conn_put(op->conn);
@@ -1685,7 +1686,8 @@ int ksmbd_reopen_durable_fd(struct ksmbd_work *work, struct ksmbd_file *fp)
 
 	ci = fp->f_ci;
 	down_write(&ci->m_lock);
-	list_for_each_entry_rcu(op, &ci->m_op_list, op_entry) {
+	list_for_each_entry_rcu(op, &ci->m_op_list, op_entry,
+				lockdep_is_held(&ci->m_lock)) {
 		if (op->conn)
 			continue;
 		op->conn = ksmbd_conn_get(fp->conn);
