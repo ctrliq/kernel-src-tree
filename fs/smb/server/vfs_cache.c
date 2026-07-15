@@ -853,19 +853,24 @@ int ksmbd_close_fd_app_instance_id(char *app_instance_id)
 		return 0;
 
 	opinfo = opinfo_get(fp);
-	if (!opinfo || !opinfo->sess)
+	if (!opinfo)
 		goto out;
+
+	down_read(&fp->f_ci->m_lock);
+	if (!opinfo->conn) {
+		up_read(&fp->f_ci->m_lock);
+		goto out;
+	}
 
 	ft = &opinfo->sess->file_table;
 	write_lock(&ft->lock);
-	if (fp->f_state == FP_INITED) {
-		if (has_file_id(fp->volatile_id)) {
-			idr_remove(ft->idr, fp->volatile_id);
-			fp->volatile_id = KSMBD_NO_FID;
-		}
+	if (fp->f_state == FP_INITED && has_file_id(fp->volatile_id)) {
+		idr_remove(ft->idr, fp->volatile_id);
+		fp->volatile_id = KSMBD_NO_FID;
 		n_to_drop = ksmbd_mark_fp_closed(fp);
 	}
 	write_unlock(&ft->lock);
+	up_read(&fp->f_ci->m_lock);
 	opinfo_put(opinfo);
 	opinfo = NULL;
 
@@ -1562,6 +1567,7 @@ static bool session_fd_check(struct ksmbd_tree_connect *tcon,
 			continue;
 		ksmbd_conn_put(op->conn);
 		op->conn = NULL;
+		op->sess = NULL;
 	}
 	up_write(&ci->m_lock);
 
@@ -1717,6 +1723,7 @@ int ksmbd_reopen_durable_fd(struct ksmbd_work *work, struct ksmbd_file *fp)
 		if (op->conn)
 			continue;
 		op->conn = ksmbd_conn_get(fp->conn);
+		op->sess = work->sess;
 	}
 	up_write(&ci->m_lock);
 
