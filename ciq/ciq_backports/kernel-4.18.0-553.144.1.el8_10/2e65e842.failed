@@ -1,0 +1,176 @@
+KVM: x86/mmu: Derive shadow MMU page role from parent
+
+jira KERNEL-1335
+Rebuild_History Non-Buildable kernel-4.18.0-553.144.1.el8_10
+commit-author David Matlack <dmatlack@google.com>
+commit 2e65e842c57d72e9a573ba42bc2055b7f626ea1f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.144.1.el8_10/2e65e842.failed
+
+Instead of computing the shadow page role from scratch for every new
+page, derive most of the information from the parent shadow page.  This
+eliminates the dependency on the vCPU root role to allocate shadow page
+tables, and reduces the number of parameters to kvm_mmu_get_page().
+
+Preemptively split out the role calculation to a separate function for
+use in a following commit.
+
+Note that when calculating the MMU root role, we can take
+@role.passthrough, @role.direct, and @role.access directly from
+@vcpu->arch.mmu->root_role. Only @role.level and @role.quadrant still
+must be overridden for PAE page directories, when shadowing 32-bit
+guest page tables with PAE page tables.
+
+No functional change intended.
+
+	Reviewed-by: Peter Xu <peterx@redhat.com>
+	Signed-off-by: David Matlack <dmatlack@google.com>
+Message-Id: <20220516232138.1783324-5-dmatlack@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 2e65e842c57d72e9a573ba42bc2055b7f626ea1f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/mmu.c
+diff --cc arch/x86/kvm/mmu/mmu.c
+index 1588d5212210,fd1b479bf7fc..000000000000
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@@ -2002,32 -1993,15 +2002,33 @@@ static void clear_sp_write_flooding_cou
+  	__clear_sp_write_flooding_count(sptep_to_sp(spte));
+  }
+  
+- static struct kvm_mmu_page *kvm_mmu_get_page(struct kvm_vcpu *vcpu,
+- 					     gfn_t gfn,
+- 					     gva_t gaddr,
+- 					     unsigned level,
+- 					     bool direct,
+- 					     unsigned int access)
++ static struct kvm_mmu_page *kvm_mmu_get_page(struct kvm_vcpu *vcpu, gfn_t gfn,
++ 					     union kvm_mmu_page_role role)
+  {
+++<<<<<<< HEAD
+ +	bool direct_mmu = vcpu->arch.mmu->direct_map;
+ +	union kvm_mmu_page_role role;
+++=======
+++>>>>>>> 2e65e842c57d (KVM: x86/mmu: Derive shadow MMU page role from parent)
+  	struct hlist_head *sp_list;
+- 	unsigned quadrant;
+  	struct kvm_mmu_page *sp;
+  	int ret;
+  	int collisions = 0;
+  	LIST_HEAD(invalid_list);
+  
+++<<<<<<< HEAD
+ +	role = vcpu->arch.mmu->mmu_role.base;
+ +	role.level = level;
+ +	role.direct = direct;
+ +	role.access = access;
+ +	if (role.has_4_byte_gpte) {
+ +		quadrant = gaddr >> (PAGE_SHIFT + (PT64_PT_BITS * level));
+ +		quadrant &= (1 << ((PT32_PT_BITS - PT64_PT_BITS) * level)) - 1;
+ +		role.quadrant = quadrant;
+ +	}
+ +
+++=======
+++>>>>>>> 2e65e842c57d (KVM: x86/mmu: Derive shadow MMU page role from parent)
+  	sp_list = &vcpu->kvm->arch.mmu_page_hash[kvm_page_table_hashfn(gfn)];
+  	for_each_valid_sp(vcpu->kvm, sp, sp_list) {
+  		if (sp->gfn != gfn) {
+@@@ -2090,9 -2065,9 +2091,9 @@@ trace_get_page
+  	sp->gfn = gfn;
+  	sp->role = role;
+  	hlist_add_head(&sp->hash_link, sp_list);
+ -	if (sp_has_gptes(sp)) {
+ +	if (!direct) {
+  		account_shadowed(vcpu->kvm, sp);
+- 		if (level == PG_LEVEL_4K && kvm_vcpu_write_protect_gfn(vcpu, gfn))
++ 		if (role.level == PG_LEVEL_4K && kvm_vcpu_write_protect_gfn(vcpu, gfn))
+  			kvm_flush_remote_tlbs_with_address(vcpu->kvm, gfn, 1);
+  	}
+  	trace_kvm_mmu_get_page(sp, true);
+@@@ -3337,12 -3382,18 +3386,24 @@@ static int mmu_check_root(struct kvm_vc
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static hpa_t mmu_alloc_root(struct kvm_vcpu *vcpu, gfn_t gfn, gva_t gva,
+ +			    u8 level, bool direct)
+ +{
+++=======
++ static hpa_t mmu_alloc_root(struct kvm_vcpu *vcpu, gfn_t gfn, int quadrant,
++ 			    u8 level)
++ {
++ 	union kvm_mmu_page_role role = vcpu->arch.mmu->root_role;
+++>>>>>>> 2e65e842c57d (KVM: x86/mmu: Derive shadow MMU page role from parent)
+  	struct kvm_mmu_page *sp;
+  
+- 	sp = kvm_mmu_get_page(vcpu, gfn, gva, level, direct, ACC_ALL);
++ 	role.level = level;
++ 
++ 	if (role.has_4_byte_gpte)
++ 		role.quadrant = quadrant;
++ 
++ 	sp = kvm_mmu_get_page(vcpu, gfn, role);
+  	++sp->root_count;
+  
+  	return __pa(sp->spt);
+@@@ -3376,10 -3427,10 +3437,15 @@@ static int mmu_alloc_direct_roots(struc
+  		for (i = 0; i < 4; ++i) {
+  			WARN_ON_ONCE(IS_VALID_PAE_ROOT(mmu->pae_root[i]));
+  
+++<<<<<<< HEAD
+ +			root = mmu_alloc_root(vcpu, i << (30 - PAGE_SHIFT),
+ +					      i << 30, PT32_ROOT_LEVEL, true);
+++=======
++ 			root = mmu_alloc_root(vcpu, i << (30 - PAGE_SHIFT), i,
++ 					      PT32_ROOT_LEVEL);
+++>>>>>>> 2e65e842c57d (KVM: x86/mmu: Derive shadow MMU page role from parent)
+  			mmu->pae_root[i] = root | PT_PRESENT_MASK |
+ -					   shadow_me_value;
+ +					   shadow_me_mask;
+  		}
+  		mmu->root.hpa = __pa(mmu->pae_root);
+  	} else {
+@@@ -3546,8 -3597,7 +3612,12 @@@ static int mmu_alloc_shadow_roots(struc
+  			root_gfn = pdptrs[i] >> PAGE_SHIFT;
+  		}
+  
+++<<<<<<< HEAD
+ +		root = mmu_alloc_root(vcpu, root_gfn, i << 30,
+ +				      PT32_ROOT_LEVEL, false);
+++=======
++ 		root = mmu_alloc_root(vcpu, root_gfn, i, PT32_ROOT_LEVEL);
+++>>>>>>> 2e65e842c57d (KVM: x86/mmu: Derive shadow MMU page role from parent)
+  		mmu->pae_root[i] = root | pm_mask;
+  	}
+  
+* Unmerged path arch/x86/kvm/mmu/mmu.c
+diff --git a/arch/x86/kvm/mmu/paging_tmpl.h b/arch/x86/kvm/mmu/paging_tmpl.h
+index 3b825e60a71e..381f9c115fe7 100644
+--- a/arch/x86/kvm/mmu/paging_tmpl.h
++++ b/arch/x86/kvm/mmu/paging_tmpl.h
+@@ -680,8 +680,9 @@ static int FNAME(fetch)(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault,
+ 		if (!is_shadow_present_pte(*it.sptep)) {
+ 			table_gfn = gw->table_gfn[it.level - 2];
+ 			access = gw->pt_access[it.level - 2];
+-			sp = kvm_mmu_get_page(vcpu, table_gfn, fault->addr,
+-					      it.level-1, false, access);
++			sp = kvm_mmu_get_child_sp(vcpu, it.sptep, table_gfn,
++						  false, access);
++
+ 			/*
+ 			 * We must synchronize the pagetable before linking it
+ 			 * because the guest doesn't need to flush tlb when
+@@ -737,8 +738,8 @@ static int FNAME(fetch)(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault,
+ 		drop_large_spte(vcpu, it.sptep);
+ 
+ 		if (!is_shadow_present_pte(*it.sptep)) {
+-			sp = kvm_mmu_get_page(vcpu, base_gfn, fault->addr,
+-					      it.level - 1, true, direct_access);
++			sp = kvm_mmu_get_child_sp(vcpu, it.sptep, base_gfn,
++						  true, direct_access);
+ 			link_shadow_page(vcpu, it.sptep, sp);
+ 			if (fault->huge_page_disallowed &&
+ 			    fault->req_level >= it.level)
