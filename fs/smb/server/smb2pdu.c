@@ -2853,9 +2853,8 @@ static int parse_durable_handle_context(struct ksmbd_work *work,
 				goto out;
 			}
 
-			if (le16_to_cpu(context->DataOffset) +
-				le32_to_cpu(context->DataLength) <
-			    sizeof(struct create_durable_handle_reconnect_v2)) {
+			if (le32_to_cpu(context->DataLength) <
+			    sizeof(recon_v2->dcontext)) {
 				err = -EINVAL;
 				goto out;
 			}
@@ -2900,9 +2899,8 @@ static int parse_durable_handle_context(struct ksmbd_work *work,
 				goto out;
 			}
 
-			if (le16_to_cpu(context->DataOffset) +
-				le32_to_cpu(context->DataLength) <
-			    sizeof(create_durable_reconn_t)) {
+			if (le32_to_cpu(context->DataLength) <
+			    sizeof(recon->Data)) {
 				err = -EINVAL;
 				goto out;
 			}
@@ -2939,9 +2937,8 @@ static int parse_durable_handle_context(struct ksmbd_work *work,
 				goto out;
 			}
 
-			if (le16_to_cpu(context->DataOffset) +
-				le32_to_cpu(context->DataLength) <
-			    sizeof(struct create_durable_req_v2)) {
+			if (le32_to_cpu(context->DataLength) <
+			    sizeof(durable_v2_blob->dcontext)) {
 				err = -EINVAL;
 				goto out;
 			}
