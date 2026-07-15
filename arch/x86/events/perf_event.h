@@ -724,6 +724,12 @@ enum atom_native_id {
 	skt_native_id           = 0x3,  /* Skymont */
 };
 
+struct arch_pebs_cap {
+	u64 caps;
+	u64 counters;
+	u64 pdists;
+};
+
 struct x86_hybrid_pmu {
 	struct pmu			pmu;
 	const char			*name;
@@ -767,6 +773,8 @@ struct x86_hybrid_pmu {
 	unsigned int			late_ack	:1,
 					mid_ack		:1,
 					enabled_ack	:1;
+
+	struct arch_pebs_cap		arch_pebs_cap;
 
 	u64				pebs_data_source[PERF_PEBS_DATA_SOURCE_MAX];
 };
@@ -922,7 +930,7 @@ struct x86_pmu {
 	union perf_capabilities intel_cap;
 
 	/*
-	 * Intel DebugStore bits
+	 * Intel DebugStore and PEBS bits
 	 */
 	unsigned int	bts			:1,
 			bts_active		:1,
@@ -933,7 +941,8 @@ struct x86_pmu {
 			pebs_no_tlb		:1,
 			pebs_no_isolation	:1,
 			pebs_block		:1,
-			pebs_ept		:1;
+			pebs_ept		:1,
+			arch_pebs		:1;
 	int		pebs_record_size;
 	int		pebs_buffer_size;
 	u64		pebs_events_mask;
@@ -944,6 +953,11 @@ struct x86_pmu {
 	unsigned long	large_pebs_flags;
 	u64		rtm_abort_event;
 	u64		pebs_capable;
+
+	/*
+	 * Intel Architectural PEBS
+	 */
+	struct arch_pebs_cap arch_pebs_cap;
 
 	/*
 	 * Intel LBR
@@ -1240,7 +1254,7 @@ int x86_reserve_hardware(void);
 
 void x86_release_hardware(void);
 
-int x86_pmu_max_precise(void);
+int x86_pmu_max_precise(struct pmu *pmu);
 
 void hw_perf_lbr_event_destroy(struct perf_event *event);
 
@@ -1812,6 +1826,11 @@ static inline int intel_pmu_max_num_pebs(struct pmu *pmu)
 {
 	static_assert(MAX_PEBS_EVENTS == 32);
 	return fls((u32)hybrid(pmu, pebs_events_mask));
+}
+
+static inline bool intel_pmu_has_pebs(void)
+{
+	return x86_pmu.ds_pebs || x86_pmu.arch_pebs;
 }
 
 #else /* CONFIG_CPU_SUP_INTEL */
