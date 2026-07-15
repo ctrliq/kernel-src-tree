@@ -1109,9 +1109,10 @@ out:
 
 static int
 cifs_set_compression(const unsigned int xid, struct cifs_tcon *tcon,
-		   struct cifsFileInfo *cfile)
+		   struct cifsFileInfo *cfile, __u16 compression_state)
 {
-	return CIFSSMB_set_compression(xid, tcon, cfile->fid.netfid);
+	return CIFSSMB_set_compression(xid, tcon, cfile->fid.netfid,
+				       compression_state);
 }
 
 static int
