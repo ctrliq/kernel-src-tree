@@ -1,0 +1,262 @@
+KVM: x86: Fix shadow paging use-after-free due to unexpected GFN
+
+jira KERNEL-1335
+cve CVE-2026-46113
+Rebuild_History Non-Buildable kernel-4.18.0-553.144.1.el8_10
+commit-author Sean Christopherson <seanjc@google.com>
+commit 0cb2af2ea66ad8ff195c156ea690f11216285bdf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.144.1.el8_10/0cb2af2e.failed
+
+The shadow MMU computes GFNs for direct shadow pages using sp->gfn plus
+the SPTE index. This assumption breaks for shadow paging if the guest
+page tables are modified between VM entries (similar to commit
+aad885e77496, "KVM: x86/mmu: Drop/zap existing present SPTE even
+when creating an MMIO SPTE", 2026-03-27).  The flow is as follows:
+
+- a PDE is installed for a 2MB mapping, and a page in that area is
+  accessed.  KVM creates a kvm_mmu_page consisting of 512 4KB pages;
+  the kvm_mmu_page is marked by FNAME(fetch) as direct-mapped because
+  the guest's mapping is a huge page (and thus contiguous).
+
+- the PDE mapping is changed from outside the guest.
+
+- the guest accesses another page in the same 2MB area.  KVM installs
+  a new leaf SPTE and rmap entry; the SPTE uses the "correct" GFN
+  (i.e. based on the new mapping, as changed in the previous step) but
+  that GFN is outside of the [sp->gfn, sp->gfn + 511] range; therefore
+  the rmap entry cannot be found and removed when the kvm_mmu_page
+  is zapped.
+
+- the memslot that covers the first 2MB mapping is deleted, and the
+  kvm_mmu_page for the now-invalid GPA is zapped.  However, rmap_remove()
+  only looks at the [sp->gfn, sp->gfn + 511] range established in step 1,
+  and fails to find the rmap entry that was recorded by step 3.
+
+- any operation that causes an rmap walk for the same page accessed
+  by step 3 then walks a stale rmap and dereferences a freed kvm_mmu_page.
+  This includes dirty logging or MMU notifier invalidations (e.g., from
+  MADV_DONTNEED).
+
+The underlying issue is that KVM's walking of shadow PTEs assumes that
+if a SPTE is present when KVM wants to install a non-leaf SPTE, then the
+existing kvm_mmu_page must be for the correct gfn.  Because the only way
+for the gfn to be wrong is if KVM messed up and failed to zap a SPTE...
+which shouldn't happen, but *actually* only happens in response to a
+guest write.
+
+That bug dates back literally forever, as even the first version of KVM
+assumes that the GFN matches and walks into the "wrong" shadow page.
+However, that was only an imprecision until 2032a93d66fa ("KVM: MMU:
+Don't allocate gfns page for direct mmu pages") came along.
+
+Fix it by checking for a target gfn mismatch and zapping the existing
+SPTE.  That way the old SP and rmap entries are gone, KVM installs
+the rmap in the right location, and everyone is happy.
+
+Fixes: 2032a93d66fa ("KVM: MMU: Don't allocate gfns page for direct mmu pages")
+Fixes: 6aa8b732ca01 ("kvm: userspace interface")
+	Reported-by: Alexander Bulekov <bkov@amazon.com>
+	Reported-by: Fred Griffoul <fgriffo@amazon.co.uk>
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Link: https://patch.msgid.link/20260503201029.106481-1-pbonzini@redhat.com/
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 0cb2af2ea66ad8ff195c156ea690f11216285bdf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/mmu.c
+diff --cc arch/x86/kvm/mmu/mmu.c
+index 1588d5212210,892246204435..000000000000
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@@ -179,9 -180,10 +179,11 @@@ struct kvm_shadow_walk_iterator 
+  
+  static struct kmem_cache *pte_list_desc_cache;
+  struct kmem_cache *mmu_page_header_cache;
+ +static struct percpu_counter kvm_total_used_mmu_pages;
+  
+  static void mmu_spte_set(u64 *sptep, u64 spte);
++ static int mmu_page_zap_pte(struct kvm *kvm, struct kvm_mmu_page *sp,
++ 			    u64 *spte, struct list_head *invalid_list);
+  
+  struct kvm_mmu_role_regs {
+  	const unsigned long cr0;
+@@@ -1125,33 -1289,11 +1127,36 @@@ static void drop_spte(struct kvm *kvm, 
+  		rmap_remove(kvm, sptep);
+  }
+  
+ -/*
+ - * Write-protect on the specified @sptep, @pt_protect indicates whether
+ - * spte write-protection is caused by protecting shadow page table.
+ - *
+ - * Note: write protection is difference between dirty logging and spte
+++<<<<<<< HEAD
+ +
+ +static bool __drop_large_spte(struct kvm *kvm, u64 *sptep)
+ +{
+ +	if (is_large_pte(*sptep)) {
+ +		WARN_ON(sptep_to_sp(sptep)->role.level == PG_LEVEL_4K);
+ +		drop_spte(kvm, sptep);
+ +		return true;
+ +	}
+ +
+ +	return false;
+ +}
+ +
+ +static void drop_large_spte(struct kvm_vcpu *vcpu, u64 *sptep)
+ +{
+ +	if (__drop_large_spte(vcpu->kvm, sptep)) {
+ +		struct kvm_mmu_page *sp = sptep_to_sp(sptep);
+ +
+ +		kvm_flush_remote_tlbs_with_address(vcpu->kvm, sp->gfn,
+ +			KVM_PAGES_PER_HPAGE(sp->role.level));
+ +	}
+ +}
+ +
+++=======
+++>>>>>>> 0cb2af2ea66a (KVM: x86: Fix shadow paging use-after-free due to unexpected GFN)
+ +/*
+ + * Write-protect on the specified @sptep, @pt_protect indicates whether
+ + * spte write-protection is caused by protecting shadow page table.
+ + *
+ + * Note: write protection is difference between dirty logging and spte
+   * protection:
+   * - for dirty logging, the spte can be set to writable at anytime if
+   *   its dirty bitmap is properly set.
+@@@ -2104,6 -2361,108 +2109,82 @@@ out
+  	return sp;
+  }
+  
+ -/* Note, @vcpu may be NULL if @role.direct is true; see kvm_mmu_find_shadow_page. */
+ -static struct kvm_mmu_page *__kvm_mmu_get_shadow_page(struct kvm *kvm,
+ -						      struct kvm_vcpu *vcpu,
+ -						      struct shadow_page_caches *caches,
+ -						      gfn_t gfn,
+ -						      union kvm_mmu_page_role role)
+ -{
+ -	struct hlist_head *sp_list;
+ -	struct kvm_mmu_page *sp;
+ -	bool created = false;
+ -
+ -	/*
+ -	 * No need for memory barriers, unlike in kvm_get_mmu_page_hash(), as
+ -	 * mmu_page_hash must be set prior to creating the first shadow root,
+ -	 * i.e. reaching this point is fully serialized by slots_arch_lock.
+ -	 */
+ -	BUG_ON(!kvm->arch.mmu_page_hash);
+ -	sp_list = &kvm->arch.mmu_page_hash[kvm_page_table_hashfn(gfn)];
+ -
+ -	sp = kvm_mmu_find_shadow_page(kvm, vcpu, gfn, sp_list, role);
+ -	if (!sp) {
+ -		created = true;
+ -		sp = kvm_mmu_alloc_shadow_page(kvm, caches, gfn, sp_list, role);
+ -	}
+ -
+ -	trace_kvm_mmu_get_page(sp, created);
+ -	return sp;
+ -}
+ -
+++<<<<<<< HEAD
+++=======
++ static struct kvm_mmu_page *kvm_mmu_get_shadow_page(struct kvm_vcpu *vcpu,
++ 						    gfn_t gfn,
++ 						    union kvm_mmu_page_role role)
++ {
++ 	struct shadow_page_caches caches = {
++ 		.page_header_cache = &vcpu->arch.mmu_page_header_cache,
++ 		.shadow_page_cache = &vcpu->arch.mmu_shadow_page_cache,
++ 		.shadowed_info_cache = &vcpu->arch.mmu_shadowed_info_cache,
++ 	};
++ 
++ 	return __kvm_mmu_get_shadow_page(vcpu->kvm, vcpu, &caches, gfn, role);
++ }
++ 
++ static union kvm_mmu_page_role kvm_mmu_child_role(u64 *sptep, bool direct,
++ 						  unsigned int access)
++ {
++ 	struct kvm_mmu_page *parent_sp = sptep_to_sp(sptep);
++ 	union kvm_mmu_page_role role;
++ 
++ 	role = parent_sp->role;
++ 	role.level--;
++ 	role.access = access;
++ 	role.direct = direct;
++ 	role.passthrough = 0;
++ 
++ 	/*
++ 	 * If the guest has 4-byte PTEs then that means it's using 32-bit,
++ 	 * 2-level, non-PAE paging. KVM shadows such guests with PAE paging
++ 	 * (i.e. 8-byte PTEs). The difference in PTE size means that KVM must
++ 	 * shadow each guest page table with multiple shadow page tables, which
++ 	 * requires extra bookkeeping in the role.
++ 	 *
++ 	 * Specifically, to shadow the guest's page directory (which covers a
++ 	 * 4GiB address space), KVM uses 4 PAE page directories, each mapping
++ 	 * 1GiB of the address space. @role.quadrant encodes which quarter of
++ 	 * the address space each maps.
++ 	 *
++ 	 * To shadow the guest's page tables (which each map a 4MiB region), KVM
++ 	 * uses 2 PAE page tables, each mapping a 2MiB region. For these,
++ 	 * @role.quadrant encodes which half of the region they map.
++ 	 *
++ 	 * Concretely, a 4-byte PDE consumes bits 31:22, while an 8-byte PDE
++ 	 * consumes bits 29:21.  To consume bits 31:30, KVM's uses 4 shadow
++ 	 * PDPTEs; those 4 PAE page directories are pre-allocated and their
++ 	 * quadrant is assigned in mmu_alloc_root().   A 4-byte PTE consumes
++ 	 * bits 21:12, while an 8-byte PTE consumes bits 20:12.  To consume
++ 	 * bit 21 in the PTE (the child here), KVM propagates that bit to the
++ 	 * quadrant, i.e. sets quadrant to '0' or '1'.  The parent 8-byte PDE
++ 	 * covers bit 21 (see above), thus the quadrant is calculated from the
++ 	 * _least_ significant bit of the PDE index.
++ 	 */
++ 	if (role.has_4_byte_gpte) {
++ 		WARN_ON_ONCE(role.level != PG_LEVEL_4K);
++ 		role.quadrant = spte_index(sptep) & 1;
++ 	}
++ 
++ 	return role;
++ }
++ 
++ static struct kvm_mmu_page *kvm_mmu_get_child_sp(struct kvm_vcpu *vcpu,
++ 						 u64 *sptep, gfn_t gfn,
++ 						 bool direct, unsigned int access)
++ {
++ 	union kvm_mmu_page_role role;
++ 
++ 	if (is_shadow_present_pte(*sptep) && !is_large_pte(*sptep) &&
++ 	    spte_to_child_sp(*sptep) && spte_to_child_sp(*sptep)->gfn == gfn)
++ 		return ERR_PTR(-EEXIST);
++ 
++ 	role = kvm_mmu_child_role(sptep, direct, access);
++ 	return kvm_mmu_get_shadow_page(vcpu, gfn, role);
++ }
++ 
+++>>>>>>> 0cb2af2ea66a (KVM: x86: Fix shadow paging use-after-free due to unexpected GFN)
+  static void shadow_walk_init_using_root(struct kvm_shadow_walk_iterator *iterator,
+  					struct kvm_vcpu *vcpu, hpa_t root,
+  					u64 addr)
+@@@ -2174,6 -2534,17 +2255,20 @@@ static void link_shadow_page(struct kvm
+  
+  	BUILD_BUG_ON(VMX_EPT_WRITABLE_MASK != PT_WRITABLE_MASK);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (is_shadow_present_pte(*sptep)) {
++ 		struct kvm_mmu_page *parent_sp;
++ 		LIST_HEAD(invalid_list);
++ 
++ 		parent_sp = sptep_to_sp(sptep);
++ 		WARN_ON_ONCE(parent_sp->role.level == PG_LEVEL_4K);
++ 
++ 		mmu_page_zap_pte(kvm, parent_sp, sptep, &invalid_list);
++ 		kvm_mmu_remote_flush_or_zap(kvm, &invalid_list, true);
++ 	}
++ 
+++>>>>>>> 0cb2af2ea66a (KVM: x86: Fix shadow paging use-after-free due to unexpected GFN)
+  	spte = make_nonleaf_spte(sp->spt, sp_ad_disabled(sp));
+  
+  	mmu_spte_set(sptep, spte);
+* Unmerged path arch/x86/kvm/mmu/mmu.c
