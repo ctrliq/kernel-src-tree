@@ -1,0 +1,222 @@
+KVM: x86/mmu: pull call to drop_large_spte() into __link_shadow_page()
+
+jira KERNEL-1335
+Rebuild_History Non-Buildable kernel-4.18.0-553.144.1.el8_10
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 0cd8dc739833080aa0813cbd94d907a93e3a14c3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.144.1.el8_10/0cd8dc73.failed
+
+Before allocating a child shadow page table, all callers check
+whether the parent already points to a huge page and, if so, they
+drop that SPTE.  This is done by drop_large_spte().
+
+However, dropping the large SPTE is really only necessary before the
+sp is installed.  While the sp is returned by kvm_mmu_get_child_sp(),
+installing it happens later in __link_shadow_page().  Move the call
+there instead of having it in each and every caller.
+
+To ensure that the shadow page is not linked twice if it was present,
+do _not_ opportunistically make kvm_mmu_get_child_sp() idempotent:
+instead, return an error value if the shadow page already existed.
+This is a bit more verbose, but clearer than NULL.
+
+Finally, now that the drop_large_spte() name is not taken anymore,
+remove the two underscores in front of __drop_large_spte().
+
+	Reviewed-by: Sean Christopherson <seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 0cd8dc739833080aa0813cbd94d907a93e3a14c3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/mmu.c
+#	arch/x86/kvm/mmu/paging_tmpl.h
+diff --cc arch/x86/kvm/mmu/mmu.c
+index 1588d5212210,192cb7dc4471..000000000000
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@@ -2104,6 -2153,71 +2094,74 @@@ out
+  	return sp;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct kvm_mmu_page *kvm_mmu_get_shadow_page(struct kvm_vcpu *vcpu,
++ 						    gfn_t gfn,
++ 						    union kvm_mmu_page_role role)
++ {
++ 	struct shadow_page_caches caches = {
++ 		.page_header_cache = &vcpu->arch.mmu_page_header_cache,
++ 		.shadow_page_cache = &vcpu->arch.mmu_shadow_page_cache,
++ 		.shadowed_info_cache = &vcpu->arch.mmu_shadowed_info_cache,
++ 	};
++ 
++ 	return __kvm_mmu_get_shadow_page(vcpu->kvm, vcpu, &caches, gfn, role);
++ }
++ 
++ static union kvm_mmu_page_role kvm_mmu_child_role(u64 *sptep, bool direct, unsigned int access)
++ {
++ 	struct kvm_mmu_page *parent_sp = sptep_to_sp(sptep);
++ 	union kvm_mmu_page_role role;
++ 
++ 	role = parent_sp->role;
++ 	role.level--;
++ 	role.access = access;
++ 	role.direct = direct;
++ 	role.passthrough = 0;
++ 
++ 	/*
++ 	 * If the guest has 4-byte PTEs then that means it's using 32-bit,
++ 	 * 2-level, non-PAE paging. KVM shadows such guests with PAE paging
++ 	 * (i.e. 8-byte PTEs). The difference in PTE size means that KVM must
++ 	 * shadow each guest page table with multiple shadow page tables, which
++ 	 * requires extra bookkeeping in the role.
++ 	 *
++ 	 * Specifically, to shadow the guest's page directory (which covers a
++ 	 * 4GiB address space), KVM uses 4 PAE page directories, each mapping
++ 	 * 1GiB of the address space. @role.quadrant encodes which quarter of
++ 	 * the address space each maps.
++ 	 *
++ 	 * To shadow the guest's page tables (which each map a 4MiB region), KVM
++ 	 * uses 2 PAE page tables, each mapping a 2MiB region. For these,
++ 	 * @role.quadrant encodes which half of the region they map.
++ 	 *
++ 	 * Note, the 4 PAE page directories are pre-allocated and the quadrant
++ 	 * assigned in mmu_alloc_root(). So only page tables need to be handled
++ 	 * here.
++ 	 */
++ 	if (role.has_4_byte_gpte) {
++ 		WARN_ON_ONCE(role.level != PG_LEVEL_4K);
++ 		role.quadrant = (sptep - parent_sp->spt) % 2;
++ 	}
++ 
++ 	return role;
++ }
++ 
++ static struct kvm_mmu_page *kvm_mmu_get_child_sp(struct kvm_vcpu *vcpu,
++ 						 u64 *sptep, gfn_t gfn,
++ 						 bool direct, unsigned int access)
++ {
++ 	union kvm_mmu_page_role role;
++ 
++ 	if (is_shadow_present_pte(*sptep) && !is_large_pte(*sptep))
++ 		return ERR_PTR(-EEXIST);
++ 
++ 	role = kvm_mmu_child_role(sptep, direct, access);
++ 	return kvm_mmu_get_shadow_page(vcpu, gfn, role);
++ }
++ 
+++>>>>>>> 0cd8dc739833 (KVM: x86/mmu: pull call to drop_large_spte() into __link_shadow_page())
+  static void shadow_walk_init_using_root(struct kvm_shadow_walk_iterator *iterator,
+  					struct kvm_vcpu *vcpu, hpa_t root,
+  					u64 addr)
+@@@ -2167,8 -2281,9 +2225,14 @@@ static void shadow_walk_next(struct kvm
+  	__shadow_walk_next(iterator, *iterator->sptep);
+  }
+  
+++<<<<<<< HEAD
+ +static void link_shadow_page(struct kvm_vcpu *vcpu, u64 *sptep,
+ +			     struct kvm_mmu_page *sp)
+++=======
++ static void __link_shadow_page(struct kvm *kvm,
++ 			       struct kvm_mmu_memory_cache *cache, u64 *sptep,
++ 			       struct kvm_mmu_page *sp)
+++>>>>>>> 0cd8dc739833 (KVM: x86/mmu: pull call to drop_large_spte() into __link_shadow_page())
+  {
+  	u64 spte;
+  
+@@@ -2184,6 -2306,12 +2255,15 @@@
+  		mark_unsync(sptep);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void link_shadow_page(struct kvm_vcpu *vcpu, u64 *sptep,
++ 			     struct kvm_mmu_page *sp)
++ {
++ 	__link_shadow_page(vcpu->kvm, &vcpu->arch.mmu_pte_list_desc_cache, sptep, sp);
++ }
++ 
+++>>>>>>> 0cd8dc739833 (KVM: x86/mmu: pull call to drop_large_spte() into __link_shadow_page())
+  static void validate_direct_spte(struct kvm_vcpu *vcpu, u64 *sptep,
+  				   unsigned direct_access)
+  {
+@@@ -2945,12 -3081,9 +3025,18 @@@ static int __direct_map(struct kvm_vcp
+  		if (it.level == fault->goal_level)
+  			break;
+  
+++<<<<<<< HEAD
+ +		drop_large_spte(vcpu, it.sptep);
+ +		if (is_shadow_present_pte(*it.sptep))
+ +			continue;
+ +
+ +		sp = kvm_mmu_get_page(vcpu, base_gfn, it.addr,
+ +				      it.level - 1, true, ACC_ALL);
+++=======
++ 		sp = kvm_mmu_get_child_sp(vcpu, it.sptep, base_gfn, true, ACC_ALL);
++ 		if (sp == ERR_PTR(-EEXIST))
++ 			continue;
+++>>>>>>> 0cd8dc739833 (KVM: x86/mmu: pull call to drop_large_spte() into __link_shadow_page())
+  
+  		link_shadow_page(vcpu, it.sptep, sp);
+  		if (fault->is_tdp && fault->huge_page_disallowed &&
+diff --cc arch/x86/kvm/mmu/paging_tmpl.h
+index 3b825e60a71e,2448fa8d8438..000000000000
+--- a/arch/x86/kvm/mmu/paging_tmpl.h
++++ b/arch/x86/kvm/mmu/paging_tmpl.h
+@@@ -674,14 -648,13 +674,22 @@@ static int FNAME(fetch)(struct kvm_vcp
+  		gfn_t table_gfn;
+  
+  		clear_sp_write_flooding_count(it.sptep);
+- 		drop_large_spte(vcpu, it.sptep);
+  
+++<<<<<<< HEAD
+ +		sp = NULL;
+ +		if (!is_shadow_present_pte(*it.sptep)) {
+ +			table_gfn = gw->table_gfn[it.level - 2];
+ +			access = gw->pt_access[it.level - 2];
+ +			sp = kvm_mmu_get_page(vcpu, table_gfn, fault->addr,
+ +					      it.level-1, false, access);
+++=======
++ 		table_gfn = gw->table_gfn[it.level - 2];
++ 		access = gw->pt_access[it.level - 2];
++ 		sp = kvm_mmu_get_child_sp(vcpu, it.sptep, table_gfn,
++ 					  false, access);
++ 
++ 		if (sp != ERR_PTR(-EEXIST)) {
+++>>>>>>> 0cd8dc739833 (KVM: x86/mmu: pull call to drop_large_spte() into __link_shadow_page())
+  			/*
+  			 * We must synchronize the pagetable before linking it
+  			 * because the guest doesn't need to flush tlb when
+@@@ -734,16 -707,15 +742,26 @@@
+  
+  		validate_direct_spte(vcpu, it.sptep, direct_access);
+  
+- 		drop_large_spte(vcpu, it.sptep);
++ 		sp = kvm_mmu_get_child_sp(vcpu, it.sptep, base_gfn,
++ 					  true, direct_access);
++ 		if (sp == ERR_PTR(-EEXIST))
++ 			continue;
+  
+++<<<<<<< HEAD
+ +		if (!is_shadow_present_pte(*it.sptep)) {
+ +			sp = kvm_mmu_get_page(vcpu, base_gfn, fault->addr,
+ +					      it.level - 1, true, direct_access);
+ +			link_shadow_page(vcpu, it.sptep, sp);
+ +			if (fault->huge_page_disallowed &&
+ +			    fault->req_level >= it.level)
+ +				account_huge_nx_page(vcpu->kvm, sp);
+ +		}
+++=======
++ 		link_shadow_page(vcpu, it.sptep, sp);
++ 		if (fault->huge_page_disallowed &&
++ 		    fault->req_level >= it.level)
++ 			account_huge_nx_page(vcpu->kvm, sp);
+++>>>>>>> 0cd8dc739833 (KVM: x86/mmu: pull call to drop_large_spte() into __link_shadow_page())
+  	}
+  
+  	if (WARN_ON_ONCE(it.level != fault->goal_level))
+* Unmerged path arch/x86/kvm/mmu/mmu.c
+* Unmerged path arch/x86/kvm/mmu/paging_tmpl.h
