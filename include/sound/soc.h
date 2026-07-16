@@ -311,6 +311,12 @@ struct platform_device;
 	.info = snd_soc_info_bool_ext, \
 	.get = xhandler_get, .put = xhandler_put, \
 	.private_value = xdata }
+#define SOC_SINGLE_BOOL_EXT_ACC(xname, xdata, xhandler_get, xhandler_put, xaccess) \
+{	.iface = SNDRV_CTL_ELEM_IFACE_MIXER, .name = xname, \
+	.access = xaccess, \
+	.info = snd_soc_info_bool_ext, \
+	.get = xhandler_get, .put = xhandler_put, \
+	.private_value = xdata }
 #define SOC_ENUM_EXT(xname, xenum, xhandler_get, xhandler_put) \
 {	.iface = SNDRV_CTL_ELEM_IFACE_MIXER, .name = xname, \
 	.info = snd_soc_info_enum_double, \
@@ -421,11 +427,6 @@ struct snd_soc_jack_pin;
 #include <sound/soc-dapm.h>
 #include <sound/soc-dpcm.h>
 #include <sound/soc-topology.h>
-
-enum snd_soc_pcm_subclass {
-	SND_SOC_PCM_CLASS_PCM	= 0,
-	SND_SOC_PCM_CLASS_BE	= 1,
-};
 
 int snd_soc_register_card(struct snd_soc_card *card);
 void snd_soc_unregister_card(struct snd_soc_card *card);
@@ -988,7 +989,6 @@ struct snd_soc_card {
 
 	/* Mutex for PCM operations */
 	struct mutex pcm_mutex;
-	enum snd_soc_pcm_subclass pcm_subclass;
 
 	int (*probe)(struct snd_soc_card *card);
 	int (*late_probe)(struct snd_soc_card *card);
@@ -1014,8 +1014,6 @@ struct snd_soc_card {
 			    struct snd_soc_dai_link *link);
 	void (*remove_dai_link)(struct snd_soc_card *,
 			    struct snd_soc_dai_link *link);
-
-	long pmdown_time;
 
 	/* CPU <--> Codec DAI links  */
 	struct snd_soc_dai_link *dai_link;  /* predefined links only */
@@ -1060,9 +1058,6 @@ struct snd_soc_card {
 	struct list_head paths;
 	struct list_head dapm_list;
 	struct list_head dapm_dirty;
-
-	/* attached dynamic objects */
-	struct list_head dobj_list;
 
 	/* Generic DAPM context for the card */
 	struct snd_soc_dapm_context *dapm;
@@ -1229,7 +1224,6 @@ struct soc_mixer_control {
 	unsigned int sign_bit;
 	unsigned int invert:1;
 	unsigned int autodisable:1;
-	unsigned int sdca_q78:1;
 #ifdef CONFIG_SND_SOC_TOPOLOGY
 	struct snd_soc_dobj dobj;
 #endif
@@ -1330,15 +1324,6 @@ void snd_soc_of_parse_node_prefix(struct device_node *np,
 				   struct snd_soc_codec_conf *codec_conf,
 				   struct device_node *of_node,
 				   const char *propname);
-static inline
-void snd_soc_of_parse_audio_prefix(struct snd_soc_card *card,
-				   struct snd_soc_codec_conf *codec_conf,
-				   struct device_node *of_node,
-				   const char *propname)
-{
-	snd_soc_of_parse_node_prefix(card->dev->of_node,
-				     codec_conf, of_node, propname);
-}
 
 int snd_soc_of_parse_audio_routing(struct snd_soc_card *card,
 				   const char *propname);
@@ -1401,6 +1386,9 @@ struct snd_soc_dai *snd_soc_find_dai(
 	const struct snd_soc_dai_link_component *dlc);
 struct snd_soc_dai *snd_soc_find_dai_with_mutex(
 	const struct snd_soc_dai_link_component *dlc);
+
+void soc_pcm_set_dai_params(struct snd_soc_dai *dai,
+			    struct snd_pcm_hw_params *params);
 
 #include <sound/soc-dai.h>
 
@@ -1507,7 +1495,7 @@ static inline void _snd_soc_dapm_mutex_assert_held_d(struct snd_soc_dapm_context
  */
 static inline void _snd_soc_dpcm_mutex_lock_c(struct snd_soc_card *card)
 {
-	mutex_lock_nested(&card->pcm_mutex, card->pcm_subclass);
+	mutex_lock(&card->pcm_mutex);
 }
 
 static inline void _snd_soc_dpcm_mutex_unlock_c(struct snd_soc_card *card)
