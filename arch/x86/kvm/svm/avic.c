@@ -67,11 +67,11 @@ static_assert(__AVIC_GATAG(AVIC_VM_ID_MASK, AVIC_VCPU_IDX_MASK) == -1u);
  * enable / disable AVIC.  Because the defaults differ for APICv
  * support between VMX and SVM we cannot use module_param_named.
  */
-static bool avic;
+static bool __ro_after_init avic;
 module_param(avic, bool, 0444);
 module_param(enable_ipiv, bool, 0444);
 
-static bool force_avic;
+static bool __ro_after_init force_avic;
 module_param_unsafe(force_avic, bool, 0444);
 
 /* Note:
