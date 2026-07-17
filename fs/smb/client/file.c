@@ -488,7 +488,7 @@ int cifs_posix_open(const char *full_path, struct inode **pinode,
 
 	cifs_dbg(FYI, "posix open %s\n", full_path);
 
-	presp_data = kzalloc_obj(FILE_UNIX_BASIC_INFO, GFP_KERNEL);
+	presp_data = kzalloc_obj(FILE_UNIX_BASIC_INFO);
 	if (presp_data == NULL)
 		return -ENOMEM;
 
@@ -672,11 +672,11 @@ struct cifsFileInfo *cifs_new_fileinfo(struct cifs_fid *fid, struct file *file,
 	struct cifs_tcon *tcon = tlink_tcon(tlink);
 	struct TCP_Server_Info *server = tcon->ses->server;
 
-	cfile = kzalloc_obj(struct cifsFileInfo, GFP_KERNEL);
+	cfile = kzalloc_obj(struct cifsFileInfo);
 	if (cfile == NULL)
 		return cfile;
 
-	fdlocks = kzalloc_obj(struct cifs_fid_locks, GFP_KERNEL);
+	fdlocks = kzalloc_obj(struct cifs_fid_locks);
 	if (!fdlocks) {
 		kfree(cfile);
 		return NULL;
@@ -1457,7 +1457,7 @@ int cifs_close(struct inode *inode, struct file *file)
 	if (file->private_data != NULL) {
 		cfile = file->private_data;
 		file->private_data = NULL;
-		dclose = kmalloc_obj(struct cifs_deferred_close, GFP_KERNEL);
+		dclose = kmalloc_obj(struct cifs_deferred_close);
 		if ((cfile->status_file_deleted == false) &&
 		    (smb2_can_defer_close(inode, dclose))) {
 			if (test_and_clear_bit(NETFS_ICTX_MODIFIED_ATTR, &cinode->netfs.flags)) {
@@ -1581,7 +1581,7 @@ static struct cifsLockInfo *
 cifs_lock_init(__u64 offset, __u64 length, __u8 type, __u16 flags)
 {
 	struct cifsLockInfo *lock =
-		kmalloc_obj(struct cifsLockInfo, GFP_KERNEL);
+		kmalloc_obj(struct cifsLockInfo);
 	if (!lock)
 		return lock;
 	lock->offset = offset;
@@ -1852,7 +1852,7 @@ cifs_push_mandatory_locks(struct cifsFileInfo *cfile)
 			PAGE_SIZE);
 	max_num = (max_buf - sizeof(struct smb_hdr)) /
 						sizeof(LOCKING_ANDX_RANGE);
-	buf = kzalloc_objs(LOCKING_ANDX_RANGE, max_num, GFP_KERNEL);
+	buf = kzalloc_objs(LOCKING_ANDX_RANGE, max_num);
 	if (!buf) {
 		free_xid(xid);
 		return -ENOMEM;
@@ -1944,7 +1944,7 @@ cifs_push_posix_locks(struct cifsFileInfo *cfile)
 	 * protects locking operations of this inode.
 	 */
 	for (i = 0; i < count; i++) {
-		lck = kmalloc_obj(struct lock_to_push, GFP_KERNEL);
+		lck = kmalloc_obj(struct lock_to_push);
 		if (!lck) {
 			rc = -ENOMEM;
 			goto err_out;
@@ -2228,7 +2228,7 @@ cifs_unlock_range(struct cifsFileInfo *cfile, struct file_lock *flock,
 			PAGE_SIZE);
 	max_num = (max_buf - sizeof(struct smb_hdr)) /
 						sizeof(LOCKING_ANDX_RANGE);
-	buf = kzalloc_objs(LOCKING_ANDX_RANGE, max_num, GFP_KERNEL);
+	buf = kzalloc_objs(LOCKING_ANDX_RANGE, max_num);
 	if (!buf)
 		return -ENOMEM;
 
