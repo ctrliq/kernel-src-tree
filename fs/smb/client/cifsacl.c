@@ -867,8 +867,7 @@ static void parse_dacl(struct smb_acl *pdacl, char *end_of_acl,
 	if (num_aces > 0) {
 		umode_t denied_mode = 0;
 
-		ppace = kmalloc_array(num_aces, sizeof(struct smb_ace *),
-				      GFP_KERNEL);
+		ppace = kmalloc_objs(struct smb_ace *, num_aces, GFP_KERNEL);
 		if (!ppace)
 			return;
 
@@ -1403,8 +1402,7 @@ static int build_sec_desc(struct smb_ntsd *pntsd, struct smb_ntsd *pnntsd,
 
 		if (uid_valid(uid)) { /* chown */
 			uid_t id;
-			nowner_sid_ptr = kzalloc(sizeof(struct smb_sid),
-								GFP_KERNEL);
+			nowner_sid_ptr = kzalloc_obj(struct smb_sid, GFP_KERNEL);
 			if (!nowner_sid_ptr) {
 				rc = -ENOMEM;
 				goto chown_chgrp_exit;
@@ -1432,8 +1430,7 @@ static int build_sec_desc(struct smb_ntsd *pntsd, struct smb_ntsd *pnntsd,
 		}
 		if (gid_valid(gid)) { /* chgrp */
 			gid_t id;
-			ngroup_sid_ptr = kzalloc(sizeof(struct smb_sid),
-								GFP_KERNEL);
+			ngroup_sid_ptr = kzalloc_obj(struct smb_sid, GFP_KERNEL);
 			if (!ngroup_sid_ptr) {
 				rc = -ENOMEM;
 				goto chown_chgrp_exit;
