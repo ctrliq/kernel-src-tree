@@ -6513,9 +6513,8 @@ static int smb2_rename(struct ksmbd_work *work,
 			pr_err("failed to store stream name in xattr: %d\n",
 			       rc);
 			rc = -EINVAL;
-			goto out;
 		}
-
+		kfree(xattr_stream_name);
 		goto out;
 	}
 
