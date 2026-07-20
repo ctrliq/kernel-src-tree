@@ -1034,6 +1034,7 @@ static int watchdog_cdev_register(struct watchdog_device *wdd)
 
 	/* Fill in the data structures */
 	cdev_init(&wd_data->cdev, &watchdog_fops);
+	wd_data->cdev.owner = wdd->ops->owner;
 
 	/* Add the device */
 	err = cdev_device_add(&wd_data->cdev, &wd_data->dev);
@@ -1047,8 +1048,6 @@ static int watchdog_cdev_register(struct watchdog_device *wdd)
 		}
 		return err;
 	}
-
-	wd_data->cdev.owner = wdd->ops->owner;
 
 	/* Record time of most recent heartbeat as 'just before now'. */
 	wd_data->last_hw_keepalive = ktime_sub(ktime_get(), 1);
