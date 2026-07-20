@@ -168,10 +168,10 @@ Summary: The Linux kernel
 %define debugbuildsenabled 1
 %define el_version 9
 %define kernel_major_minor 6.18
-%define kernel_patch 38
+%define kernel_patch 39
 %define buildid .1
 %define specversion %{kernel_major_minor}.%{kernel_patch}
-%define pkgrelease 2%{?buildid}
+%define pkgrelease 1%{?buildid}
 %define kversion %{lua:print((rpm.expand("%{kernel_major_minor}"):match("^(%d+)")))}
 
 %define tarfile_release %{specversion}-%{pkgrelease}.el%{el_version}
@@ -4575,12 +4575,11 @@ fi\
 #
 #
 %changelog
-* Fri Jul 10 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.38-2.1.el9
--- futex/requeue: Revert "Prevent NULL pointer dereference in remove_waiter() on self-deadlock"" (Brett Mastbergen)
+* Mon Jul 20 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.39-1.1.el9
+-- Rebased changes for Linux 6.18.39 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.39-1)
+-- [CIQ] ciq_kernel-6.18.38-2 - updated spec (Brett Mastbergen)
 -- Add x86_64 minimal kernel variant to spec (Brett Mastbergen)
-
-* Sun Jul 05 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.18.38-1.1.el9
--- Rebased changes for Linux 6.18.38 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.38-1)
+-- [CIQ] v6.18.38 - updated spec (github-actions[bot])
 -- [CIQ] v6.18.36 - updated spec (Brett Mastbergen)
 -- [CIQ] v6.18.36 - rebased configs (Brett Mastbergen)
 -- [CIQ] ciq_kernel-6.18.35-3 - updated spec (Brett Mastbergen)
@@ -4683,7 +4682,7 @@ fi\
 -- github actions: Make Builds on Merge Request Work (Jonathan Maple)
 -- Add initial CIQ config tweaks (Brett Mastbergen)
 -- Add CIQ configs (Brett Mastbergen)
--- Linux 6.18.38 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.18.38)
+-- Linux 6.18.39 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.18.39)
 
 
 ###
