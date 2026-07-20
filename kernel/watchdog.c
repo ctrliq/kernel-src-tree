@@ -809,6 +809,7 @@ static int proc_watchdog_common(int which, struct ctl_table *table, int write,
 
 	mutex_lock(&watchdog_mutex);
 
+	old = *param;
 	if (!write) {
 		/*
 		 * On read synchronize the userspace interface. This is a
@@ -816,8 +817,8 @@ static int proc_watchdog_common(int which, struct ctl_table *table, int write,
 		 */
 		*param = (watchdog_enabled & which) != 0;
 		err = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
+		*param = old;
 	} else {
-		old = READ_ONCE(*param);
 		err = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
 		if (!err && old != READ_ONCE(*param))
 			proc_watchdog_update();
