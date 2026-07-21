@@ -171,7 +171,7 @@ Summary: The Linux kernel
 %define kernel_patch 39
 %define buildid .1
 %define specversion %{kernel_major_minor}.%{kernel_patch}
-%define pkgrelease 1%{?buildid}
+%define pkgrelease 2%{?buildid}
 %define kversion %{lua:print((rpm.expand("%{kernel_major_minor}"):match("^(%d+)")))}
 
 %define tarfile_release %{specversion}-%{pkgrelease}.el%{el_version}
@@ -4575,6 +4575,9 @@ fi\
 #
 #
 %changelog
+* Tue Jul 21 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.39-2.1.el9
+-- configs: Bump CRYPTO_FIPS_VERSION (Brett Mastbergen)
+
 * Mon Jul 20 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.39-1.1.el9
 -- Rebased changes for Linux 6.18.39 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.39-1)
 -- [CIQ] ciq_kernel-6.18.38-2 - updated spec (Brett Mastbergen)
