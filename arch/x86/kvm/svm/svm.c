@@ -470,7 +470,7 @@ static void svm_init_os_visible_workarounds(void)
 	if (!osvw_len)
 		return;
 
-	if (!boot_cpu_has(X86_FEATURE_OSVW)) {
+	if (!this_cpu_has(X86_FEATURE_OSVW)) {
 		osvw_status = osvw_len = 0;
 		return;
 	}
