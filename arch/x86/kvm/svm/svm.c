@@ -479,16 +479,18 @@ static void svm_init_os_visible_workarounds(void)
 	if (!err)
 		status = native_read_msr_safe(MSR_AMD64_OSVW_STATUS, &err);
 
+	if (err)
+		len = status = 0;
+
+	if (status == READ_ONCE(osvw_status) && len >= READ_ONCE(osvw_len))
+		return;
+
 	guard(spinlock)(&osvw_lock);
 
-	if (err) {
-		osvw_status = osvw_len = 0;
-	} else {
-		if (len < osvw_len)
-			osvw_len = len;
-		osvw_status |= status;
-		osvw_status &= (1ULL << osvw_len) - 1;
-	}
+	if (len < osvw_len)
+		osvw_len = len;
+	osvw_status |= status;
+	osvw_status &= (1ULL << osvw_len) - 1;
 }
 
 static bool __kvm_is_svm_supported(void)
