@@ -476,10 +476,94 @@ static void gve_get_ringparam(struct net_device *netdev,
 {
 	struct gve_priv *priv = netdev_priv(netdev);
 
-	cmd->rx_max_pending = priv->rx_desc_cnt;
-	cmd->tx_max_pending = priv->tx_desc_cnt;
+	cmd->rx_max_pending = priv->max_rx_desc_cnt;
+	cmd->tx_max_pending = priv->max_tx_desc_cnt;
 	cmd->rx_pending = priv->rx_desc_cnt;
 	cmd->tx_pending = priv->tx_desc_cnt;
+}
+
+static int gve_adjust_ring_sizes(struct gve_priv *priv,
+				 u16 new_tx_desc_cnt,
+				 u16 new_rx_desc_cnt)
+{
+	struct gve_tx_alloc_rings_cfg tx_alloc_cfg = {0};
+	struct gve_rx_alloc_rings_cfg rx_alloc_cfg = {0};
+	struct gve_qpls_alloc_cfg qpls_alloc_cfg = {0};
+	struct gve_qpl_config new_qpl_cfg;
+	int err;
+
+	/* get current queue configuration */
+	gve_get_curr_alloc_cfgs(priv, &qpls_alloc_cfg,
+				&tx_alloc_cfg, &rx_alloc_cfg);
+
+	/* copy over the new ring_size from ethtool */
+	tx_alloc_cfg.ring_size = new_tx_desc_cnt;
+	rx_alloc_cfg.ring_size = new_rx_desc_cnt;
+
+	/* qpl_cfg is not read-only, it contains a map that gets updated as
+	 * rings are allocated, which is why we cannot use the yet unreleased
+	 * one in priv.
+	 */
+	qpls_alloc_cfg.qpl_cfg = &new_qpl_cfg;
+	tx_alloc_cfg.qpl_cfg = &new_qpl_cfg;
+	rx_alloc_cfg.qpl_cfg = &new_qpl_cfg;
+
+	if (netif_running(priv->dev)) {
+		err = gve_adjust_config(priv, &qpls_alloc_cfg,
+					&tx_alloc_cfg, &rx_alloc_cfg);
+		if (err)
+			return err;
+	}
+
+	/* Set new ring_size for the next up */
+	priv->tx_desc_cnt = new_tx_desc_cnt;
+	priv->rx_desc_cnt = new_rx_desc_cnt;
+
+	return 0;
+}
+
+static int gve_validate_req_ring_size(struct gve_priv *priv, u16 new_tx_desc_cnt,
+				      u16 new_rx_desc_cnt)
+{
+	/* check for valid range */
+	if (new_tx_desc_cnt < priv->min_tx_desc_cnt ||
+	    new_tx_desc_cnt > priv->max_tx_desc_cnt ||
+	    new_rx_desc_cnt < priv->min_rx_desc_cnt ||
+	    new_rx_desc_cnt > priv->max_rx_desc_cnt) {
+		dev_err(&priv->pdev->dev, "Requested descriptor count out of range\n");
+		return -EINVAL;
+	}
+
+	if (!is_power_of_2(new_tx_desc_cnt) || !is_power_of_2(new_rx_desc_cnt)) {
+		dev_err(&priv->pdev->dev, "Requested descriptor count has to be a power of 2\n");
+		return -EINVAL;
+	}
+	return 0;
+}
+
+static int gve_set_ringparam(struct net_device *netdev,
+			     struct ethtool_ringparam *cmd,
+			     struct kernel_ethtool_ringparam *kernel_cmd,
+			     struct netlink_ext_ack *extack)
+{
+	struct gve_priv *priv = netdev_priv(netdev);
+	u16 new_tx_cnt, new_rx_cnt;
+
+	if (cmd->tx_pending == priv->tx_desc_cnt && cmd->rx_pending == priv->rx_desc_cnt)
+		return 0;
+
+	if (!priv->modify_ring_size_enabled) {
+		dev_err(&priv->pdev->dev, "Modify ring size is not supported.\n");
+		return -EOPNOTSUPP;
+	}
+
+	new_tx_cnt = cmd->tx_pending;
+	new_rx_cnt = cmd->rx_pending;
+
+	if (gve_validate_req_ring_size(priv, new_tx_cnt, new_rx_cnt))
+		return -EINVAL;
+
+	return gve_adjust_ring_sizes(priv, new_tx_cnt, new_rx_cnt);
 }
 
 static int gve_user_reset(struct net_device *netdev, u32 *flags)
@@ -667,6 +751,7 @@ const struct ethtool_ops gve_ethtool_ops = {
 	.get_coalesce = gve_get_coalesce,
 	.set_coalesce = gve_set_coalesce,
 	.get_ringparam = gve_get_ringparam,
+	.set_ringparam = gve_set_ringparam,
 	.reset = gve_user_reset,
 	.get_tunable = gve_get_tunable,
 	.set_tunable = gve_set_tunable,
