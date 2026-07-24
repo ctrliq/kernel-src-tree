@@ -178,7 +178,7 @@ static int gve_alloc_page_dqo(struct gve_rx_ring *rx,
 			return err;
 	} else {
 		idx = rx->dqo.next_qpl_page_idx;
-		if (idx >= gve_get_rx_pages_per_qpl_dqo(priv->rx_desc_cnt)) {
+		if (idx >= priv->rx_pages_per_qpl) {
 			net_err_ratelimited("%s: Out of QPL pages\n",
 					    priv->dev->name);
 			return -ENOMEM;
@@ -293,8 +293,8 @@ static int gve_rx_alloc_ring_dqo(struct gve_priv *priv,
 	rx->ctx.skb_tail = NULL;
 
 	rx->dqo.num_buf_states = cfg->raw_addressing ?
-		min_t(s16, S16_MAX, buffer_queue_slots * 4) :
-		gve_get_rx_pages_per_qpl_dqo(cfg->ring_size);
+		min_t(u32, S16_MAX, buffer_queue_slots * 4) :
+		min_t(u32, S16_MAX, cfg->pages_per_qpl);
 	rx->dqo.buf_states = kvcalloc(rx->dqo.num_buf_states,
 				      sizeof(rx->dqo.buf_states[0]),
 				      GFP_KERNEL);
