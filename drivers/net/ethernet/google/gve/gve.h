@@ -60,8 +60,6 @@
 
 #define GVE_GQ_TX_MIN_PKT_DESC_BYTES 182
 
-#define DQO_QPL_DEFAULT_TX_PAGES 512
-
 /* Maximum TSO size supported on DQO */
 #define GVE_DQO_TX_MAX	0x3FFFF
 
@@ -644,6 +642,7 @@ struct gve_tx_alloc_rings_cfg {
 	u16 ring_size;
 	u16 start_idx;
 	u16 num_rings;
+	u16 pages_per_qpl;
 	bool raw_addressing;
 
 	/* Allocated resources are returned here */
@@ -661,6 +660,7 @@ struct gve_rx_alloc_rings_cfg {
 	struct gve_qpl_config *qpl_cfg;
 
 	u16 ring_size;
+	u16 pages_per_qpl;
 	bool raw_addressing;
 	bool enable_header_split;
 
@@ -704,6 +704,7 @@ struct gve_priv {
 	bool modify_ring_size_enabled;
 	bool default_min_ring_size;
 	u16 tx_pages_per_qpl; /* Suggested number of pages per qpl for TX queues by NIC */
+	u16 rx_pages_per_qpl; /* Number of pages per qpl for RX queues */
 	u64 max_registered_pages;
 	u64 num_registered_pages; /* num pages registered with NIC */
 	struct bpf_prog *xdp_prog; /* XDP BPF program */
@@ -1020,14 +1021,6 @@ static inline u32 gve_tx_start_qpl_id(struct gve_priv *priv)
 static inline u32 gve_rx_start_qpl_id(const struct gve_queue_config *tx_cfg)
 {
 	return gve_get_rx_qpl_id(tx_cfg, 0);
-}
-
-static inline u32 gve_get_rx_pages_per_qpl_dqo(u32 rx_desc_cnt)
-{
-	/* For DQO, page count should be more than ring size for
-	 * out-of-order completions. Set it to two times of ring size.
-	 */
-	return 2 * rx_desc_cnt;
 }
 
 /* Returns a pointer to the next available tx qpl in the list of qpls */
