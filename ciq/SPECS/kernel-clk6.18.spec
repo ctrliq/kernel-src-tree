@@ -168,7 +168,7 @@ Summary: The Linux kernel
 %define debugbuildsenabled 1
 %define el_version 9
 %define kernel_major_minor 6.18
-%define kernel_patch 39
+%define kernel_patch 40
 %define buildid .1
 %define specversion %{kernel_major_minor}.%{kernel_patch}
 %define pkgrelease 1%{?buildid}
@@ -4575,8 +4575,10 @@ fi\
 #
 #
 %changelog
-* Mon Jul 20 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.39-1.1.el9
--- Rebased changes for Linux 6.18.39 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.39-1)
+* Fri Jul 24 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.40-1.1.el9
+-- Rebased changes for Linux 6.18.40 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.40-1)
+-- [CIQ] v6.18.40 - rebased configs (Brett Mastbergen)
+-- [CIQ] v6.18.39 - updated spec (Brett Mastbergen)
 -- [CIQ] ciq_kernel-6.18.38-2 - updated spec (Brett Mastbergen)
 -- Add x86_64 minimal kernel variant to spec (Brett Mastbergen)
 -- [CIQ] v6.18.38 - updated spec (github-actions[bot])
@@ -4682,7 +4684,7 @@ fi\
 -- github actions: Make Builds on Merge Request Work (Jonathan Maple)
 -- Add initial CIQ config tweaks (Brett Mastbergen)
 -- Add CIQ configs (Brett Mastbergen)
--- Linux 6.18.39 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.18.39)
+-- Linux 6.18.40 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.18.40)
 
 
 ###
