@@ -163,7 +163,7 @@ Summary: The Linux kernel
 %define debugbuildsenabled 1
 %define el_version 9
 %define kernel_major_minor 6.12
-%define kernel_patch 96
+%define kernel_patch 97
 %define buildid .1
 %define specversion %{kernel_major_minor}.%{kernel_patch}
 %define pkgrelease 1%{?buildid}
@@ -4212,8 +4212,9 @@ fi\
 #
 #
 %changelog
-* Sun Jul 19 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.12.96-1.1.el9
--- Rebased changes for Linux 6.12.96 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.12.96-1)
+* Fri Jul 24 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.12.97-1.1.el9
+-- Rebased changes for Linux 6.12.97 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.12.97-1)
+-- [CIQ] v6.12.96 - updated spec (github-actions[bot])
 -- [CIQ] v6.12.95 - updated spec (github-actions[bot])
 -- [CIQ] v6.12.94 - updated spec (Brett Mastbergen)
 -- [CIQ] v6.12.94 - rebased configs (Brett Mastbergen)
@@ -4288,7 +4289,7 @@ fi\
 -- arm64: add kernel config option to lock down when in Secure Boot mode (Linn Crosetto)
 -- github actions: Make Builds on Merge Request Work (Jonathan Maple)
 -- Add CIQ configs (Jonathan Maple)
--- Linux 6.12.96 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.12.96)
+-- Linux 6.12.97 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.12.97)
 
 
 ###
