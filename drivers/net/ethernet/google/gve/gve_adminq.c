@@ -774,14 +774,6 @@ static void gve_enable_supported_features(struct gve_priv *priv,
 		priv->dev->max_mtu = be16_to_cpu(dev_op_jumbo_frames->max_mtu);
 	}
 
-	/* Override pages for qpl for DQO-QPL */
-	if (dev_op_dqo_qpl) {
-		priv->tx_pages_per_qpl =
-			be16_to_cpu(dev_op_dqo_qpl->tx_pages_per_qpl);
-		if (priv->tx_pages_per_qpl == 0)
-			priv->tx_pages_per_qpl = DQO_QPL_DEFAULT_TX_PAGES;
-	}
-
 	/* Read and store ring size ranges given by device */
 	if (dev_op_modify_ring &&
 	    (supported_features_mask & GVE_SUP_MODIFY_RING_MASK)) {
