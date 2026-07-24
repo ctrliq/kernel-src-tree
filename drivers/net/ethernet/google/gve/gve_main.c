@@ -9,6 +9,7 @@
 #include <linux/etherdevice.h>
 #include <linux/filter.h>
 #include <linux/interrupt.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/sched.h>
@@ -843,6 +844,7 @@ static void gve_tx_get_curr_alloc_cfg(struct gve_priv *priv,
 	cfg->ring_size = priv->tx_desc_cnt;
 	cfg->start_idx = 0;
 	cfg->num_rings = priv->tx_cfg.num_queues + num_xdp_queues;
+	cfg->pages_per_qpl = priv->tx_pages_per_qpl;
 	cfg->tx = priv->tx;
 }
 
@@ -1114,11 +1116,13 @@ free_qpls:
 }
 
 static int gve_alloc_qpls(struct gve_priv *priv, struct gve_qpls_alloc_cfg *cfg,
+			  struct gve_tx_alloc_rings_cfg *tx_alloc_cfg,
 			  struct gve_rx_alloc_rings_cfg *rx_alloc_cfg)
 {
 	int max_queues = cfg->tx_cfg->max_queues + cfg->rx_cfg->max_queues;
-	int rx_start_id, tx_num_qpls, rx_num_qpls;
 	struct gve_queue_page_list *qpls;
+	int rx_start_id, tx_num_qpls, rx_num_qpls;
+	u32 tx_page_count, rx_page_count;
 	u32 page_count;
 	int err;
 
@@ -1138,25 +1142,50 @@ static int gve_alloc_qpls(struct gve_priv *priv, struct gve_qpls_alloc_cfg *cfg,
 		goto free_qpl_array;
 	}
 
-	/* Allocate TX QPLs */
-	page_count = priv->tx_pages_per_qpl;
-	tx_num_qpls = gve_num_tx_qpls(cfg->tx_cfg, cfg->num_xdp_queues,
-				      gve_is_qpl(priv));
+	/* Compute the number of pages per QPL. For DQO-QPL, honor the device's
+	 * max_registered_pages limit by allocating up to (tx ring_size / 2)
+	 * pages per TX QPL and up to (rx ring_size * 2) pages per RX QPL,
+	 * shrinking proportionally if the total would exceed the limit. For
+	 * GQI-QPL the RX page count keeps a 1:1 relationship with descriptors.
+	 */
+	tx_page_count = priv->tx_pages_per_qpl;
+
+	if (cfg->is_gqi) {
+		rx_page_count = rx_alloc_cfg->ring_size;
+	} else {
+		u64 ideal_tx_pages, ideal_rx_pages, max_pages, tx_pages;
+		u16 tx_num_queues = cfg->tx_cfg->num_queues;
+		u16 rx_num_queues = cfg->rx_cfg->num_queues;
+
+		ideal_tx_pages = (u64)tx_alloc_cfg->ring_size * tx_num_queues / 2;
+		ideal_rx_pages = (u64)rx_alloc_cfg->ring_size * rx_num_queues * 2;
+		max_pages = min(priv->max_registered_pages,
+				ideal_tx_pages + ideal_rx_pages);
+
+		tx_pages = div64_u64(max_pages * ideal_tx_pages,
+				     ideal_tx_pages + ideal_rx_pages);
+		tx_page_count = div_u64(tx_pages, tx_num_queues);
+		rx_page_count = div_u64(max_pages - tx_pages, rx_num_queues);
+	}
+
+	/* Store the computed per-QPL page counts for the datapath to consume */
+	tx_alloc_cfg->pages_per_qpl = tx_page_count;
+	rx_alloc_cfg->pages_per_qpl = rx_page_count;
+
+	/* Allocate TX QPLs. Derive the count from the (already xdp_prog-aware)
+	 * TX ring count in tx_alloc_cfg->num_rings so the QPL count cannot
+	 * disagree with the ring count (which would leave XDP TX rings backed
+	 * by zeroed QPL entries).
+	 */
+	page_count = tx_alloc_cfg->pages_per_qpl;
+	tx_num_qpls = gve_is_qpl(priv) ? tx_alloc_cfg->num_rings : 0;
 	err = gve_alloc_n_qpls(priv, qpls, page_count, 0, tx_num_qpls);
 	if (err)
 		goto free_qpl_map;
 
 	/* Allocate RX QPLs */
 	rx_start_id = gve_rx_start_qpl_id(cfg->tx_cfg);
-	/* For GQI_QPL number of pages allocated have 1:1 relationship with
-	 * number of descriptors. For DQO, number of pages required are
-	 * more than descriptors (because of out of order completions).
-	 * Set it to twice the number of descriptors.
-	 */
-	if (cfg->is_gqi)
-		page_count = rx_alloc_cfg->ring_size;
-	else
-		page_count = gve_get_rx_pages_per_qpl_dqo(rx_alloc_cfg->ring_size);
+	page_count = rx_alloc_cfg->pages_per_qpl;
 	rx_num_qpls = gve_num_rx_qpls(cfg->rx_cfg, gve_is_qpl(priv));
 	err = gve_alloc_n_qpls(priv, qpls, page_count, rx_start_id, rx_num_qpls);
 	if (err)
@@ -1308,7 +1337,6 @@ static void gve_qpls_get_curr_alloc_cfg(struct gve_priv *priv,
 {
 	cfg->raw_addressing = !gve_is_qpl(priv);
 	cfg->is_gqi = gve_is_gqi(priv);
-	cfg->num_xdp_queues = priv->num_xdp_queues;
 	cfg->qpl_cfg = &priv->qpl_cfg;
 	cfg->tx_cfg = &priv->tx_cfg;
 	cfg->rx_cfg = &priv->rx_cfg;
@@ -1324,6 +1352,7 @@ static void gve_rx_get_curr_alloc_cfg(struct gve_priv *priv,
 	cfg->qpls = priv->qpls;
 	cfg->qpl_cfg = &priv->qpl_cfg;
 	cfg->ring_size = priv->rx_desc_cnt;
+	cfg->pages_per_qpl = priv->rx_pages_per_qpl;
 	cfg->rx = priv->rx;
 }
 
@@ -1380,7 +1409,7 @@ static int gve_queues_mem_alloc(struct gve_priv *priv,
 {
 	int err;
 
-	err = gve_alloc_qpls(priv, qpls_alloc_cfg, rx_alloc_cfg);
+	err = gve_alloc_qpls(priv, qpls_alloc_cfg, tx_alloc_cfg, rx_alloc_cfg);
 	if (err) {
 		netif_err(priv, drv, priv->dev, "Failed to alloc QPLs\n");
 		return err;
@@ -1437,6 +1466,8 @@ static int gve_queues_start(struct gve_priv *priv,
 	priv->rx_cfg = *rx_alloc_cfg->qcfg;
 	priv->tx_desc_cnt = tx_alloc_cfg->ring_size;
 	priv->rx_desc_cnt = rx_alloc_cfg->ring_size;
+	priv->tx_pages_per_qpl = tx_alloc_cfg->pages_per_qpl;
+	priv->rx_pages_per_qpl = rx_alloc_cfg->pages_per_qpl;
 
 	if (priv->xdp_prog)
 		priv->num_xdp_queues = priv->rx_cfg.num_queues;
