@@ -13,7 +13,6 @@
 #include <ucontext.h>
 #include <sys/mman.h>
 
-#include <linux/mman.h>
 #include <linux/types.h>
 
 #include "../kselftest.h"
@@ -194,7 +193,7 @@ static inline u32 *siginfo_get_pkey_ptr(siginfo_t *si)
 static inline int kernel_has_pkeys(void)
 {
 	/* try allocating a key and see if it succeeds */
-	int ret = sys_pkey_alloc(0, PKEY_UNRESTRICTED);
+	int ret = sys_pkey_alloc(0, 0);
 	if (ret <= 0) {
 		return 0;
 	}
