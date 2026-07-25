@@ -198,13 +198,13 @@ static void nxp_sar_adc_irq_cfg(struct nxp_sar_adc *info, bool enable)
 		writel(0, NXP_SAR_ADC_IMR(info->regs));
 }
 
-static void nxp_sar_adc_wait_for(struct nxp_sar_adc *info, unsigned int cycles)
+static void nxp_sar_adc_wait_for(struct nxp_sar_adc *info, u64 cycles)
 {
 	u64 rate;
 
 	rate = clk_get_rate(info->clk);
 	if (rate)
-		ndelay(div64_u64(NSEC_PER_SEC, rate * cycles));
+		ndelay(div64_u64(NSEC_PER_SEC * cycles, rate));
 }
 
 static bool nxp_sar_adc_set_enabled(struct nxp_sar_adc *info, bool enable)
@@ -256,7 +256,8 @@ static inline void nxp_sar_adc_calibration_start(void __iomem *base)
 
 static inline int nxp_sar_adc_calibration_wait(void __iomem *base)
 {
-	u32 msr, ret;
+	u32 msr;
+	int ret;
 
 	ret = readl_poll_timeout(NXP_SAR_ADC_MSR(base), msr,
 				 !FIELD_GET(NXP_SAR_ADC_MSR_CALBUSY, msr),
@@ -349,6 +350,7 @@ static void nxp_sar_adc_isr_buffer(struct iio_dev *indio_dev)
 		ret = nxp_sar_adc_read_data(info, info->buffered_chan[i]);
 		if (ret < 0) {
 			nxp_sar_adc_read_notify(info);
+			iio_trigger_notify_done(indio_dev->trig);
 			return;
 		}
 
