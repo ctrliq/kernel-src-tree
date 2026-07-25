@@ -270,6 +270,8 @@ static void gro_complete(struct gro_node *gro, struct sk_buff *skb)
 		goto out;
 	}
 
+	/* NICs can feed encapsulated packets into GRO */
+	skb->encapsulation = 0;
 	rcu_read_lock();
 	list_for_each_entry_rcu(ptype, head, list) {
 		if (ptype->type != type || !ptype->callbacks.gro_complete)
@@ -644,6 +646,8 @@ EXPORT_SYMBOL(gro_receive_skb);
 
 static void napi_reuse_skb(struct napi_struct *napi, struct sk_buff *skb)
 {
+	struct skb_shared_info *shinfo;
+
 	if (unlikely(skb->pfmemalloc)) {
 		consume_skb(skb);
 		return;
@@ -660,8 +664,12 @@ static void napi_reuse_skb(struct napi_struct *napi, struct sk_buff *skb)
 
 	skb->encapsulation = 0;
 	skb->ip_summed = CHECKSUM_NONE;
-	skb_shinfo(skb)->gso_type = 0;
-	skb_shinfo(skb)->gso_size = 0;
+
+	shinfo = skb_shinfo(skb);
+	shinfo->gso_type = 0;
+	shinfo->gso_size = 0;
+	shinfo->hwtstamps.hwtstamp = 0;
+
 	if (unlikely(skb->slow_gro)) {
 		skb_orphan(skb);
 		skb_ext_reset(skb);
