@@ -548,7 +548,7 @@ void do_secure_storage_access(struct pt_regs *regs)
 		if (unlikely(!try_get_page(page)))
 			break;
 
-		rc = uv_convert_from_secure(addr);
+		rc = uv_convert_from_secure(page_to_phys(page));
 		if (!rc)
 			clear_bit(PG_arch_1, &page->flags);
 		put_page(page);
