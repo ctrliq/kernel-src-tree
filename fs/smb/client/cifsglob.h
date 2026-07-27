@@ -2183,8 +2183,6 @@ extern mempool_t cifs_mid_pool;
 
 /* Operations for different SMB versions */
 #ifdef CONFIG_CIFS_ALLOW_INSECURE_LEGACY
-extern struct smb_version_operations smb1_operations;
-extern struct smb_version_values smb1_values;
 extern struct smb_version_operations smb20_operations;
 extern struct smb_version_values smb20_values;
 #endif /* CONFIG_CIFS_ALLOW_INSECURE_LEGACY */
