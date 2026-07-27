@@ -26,8 +26,8 @@
 #include <linux/uaccess.h>
 #include "cifsglob.h"
 #include "cifsproto.h"
+#include "smb1proto.h"
 #include "../common/smbfsctl.h"
-#include "cifspdu.h"
 #include "cifsacl.h"
 #include "cifs_unicode.h"
 #include "cifs_debug.h"
