@@ -24,10 +24,11 @@
 #include <linux/swap.h>
 #include <linux/task_io_accounting_ops.h>
 #include <linux/uaccess.h>
-#include "cifspdu.h"
 #include "cifsglob.h"
-#include "cifsacl.h"
 #include "cifsproto.h"
+#include "../common/smbfsctl.h"
+#include "cifspdu.h"
+#include "cifsacl.h"
 #include "cifs_unicode.h"
 #include "cifs_debug.h"
 #include "fscache.h"
