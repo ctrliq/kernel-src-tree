@@ -2565,8 +2565,22 @@ static int kvm_s390_adapter_map(struct kvm *kvm, unsigned int id, __u64 addr)
 	map->addr = host_addr;
 	map->page = pin_map_page(kvm, host_addr, FOLL_LONGTERM);
 	if (!map->page) {
-		ret = -EINVAL;
-		goto out;
+		/*
+		 * Long-term pinning may fail for memory types such as file-backed
+		 * memory. Verify that short-term pinning succeeds so that the
+		 * non-atomic irqfd path can handle interrupt injection.
+		 */
+		map->page = pin_map_page(kvm, host_addr, 0);
+		if (!map->page) {
+			ret = -EINVAL;
+			goto out;
+		}
+		unpin_user_page(map->page);
+		map->page = NULL;
+		map->pinned = false;
+		/* Add an entry to preserve MAP/UNMAP symmetry. */
+	} else {
+		map->pinned = true;
 	}
 	spin_lock_irqsave(&adapter->maps_lock, flags);
 	if (adapter->nr_maps < MAX_S390_ADAPTER_MAPS) {
@@ -2577,7 +2591,7 @@ static int kvm_s390_adapter_map(struct kvm *kvm, unsigned int id, __u64 addr)
 		ret = -EINVAL;
 	}
 	spin_unlock_irqrestore(&adapter->maps_lock, flags);
-	if (ret)
+	if (ret && map->page)
 		unpin_user_page(map->page);
 out:
 	if (ret)
@@ -2591,6 +2605,7 @@ static int kvm_s390_adapter_unmap(struct kvm *kvm, unsigned int id, __u64 addr)
 	struct s390_map_info *map, *tmp, *map_to_free;
 	struct page *map_page_to_put = NULL;
 	u64 map_addr_to_mark = 0;
+	bool map_pinned = false;
 	unsigned long flags;
 	int found = 0, idx;
 
@@ -2605,6 +2620,7 @@ static int kvm_s390_adapter_unmap(struct kvm *kvm, unsigned int id, __u64 addr)
 			list_del(&map->list);
 			map_page_to_put = map->page;
 			map_addr_to_mark = map->guest_addr;
+			map_pinned = map->pinned;
 			map_to_free = map;
 			break;
 		}
@@ -2613,11 +2629,18 @@ static int kvm_s390_adapter_unmap(struct kvm *kvm, unsigned int id, __u64 addr)
 
 	if (found) {
 		kfree(map_to_free);
-		idx = srcu_read_lock(&kvm->srcu);
-		mark_page_dirty(kvm, map_addr_to_mark >> PAGE_SHIFT);
-		set_page_dirty_lock(map_page_to_put);
-		srcu_read_unlock(&kvm->srcu, idx);
-		unpin_user_page(map_page_to_put);
+		if (map_pinned) {
+			/*
+			 * Only long-term pinned pages need to be marked dirty
+			 * and released. Fallback entries exist only for
+			 * MAP/UNMAP symmetry.
+			 */
+			idx = srcu_read_lock(&kvm->srcu);
+			mark_page_dirty(kvm, map_addr_to_mark >> PAGE_SHIFT);
+			set_page_dirty_lock(map_page_to_put);
+			srcu_read_unlock(&kvm->srcu, idx);
+			unpin_user_page(map_page_to_put);
+		}
 	}
 
 	return found ? 0 : -ENOENT;
@@ -2643,11 +2666,13 @@ void kvm_s390_unmap_all_adapters(struct kvm *kvm)
 
 		list_for_each_entry_safe(map, tmp, &local_list, list) {
 			list_del(&map->list);
-			idx = srcu_read_lock(&kvm->srcu);
-			mark_page_dirty(kvm, map->guest_addr >> PAGE_SHIFT);
-			set_page_dirty_lock(map->page);
-			srcu_read_unlock(&kvm->srcu, idx);
-			unpin_user_page(map->page);
+			if (map->pinned) {
+				idx = srcu_read_lock(&kvm->srcu);
+				mark_page_dirty(kvm, map->guest_addr >> PAGE_SHIFT);
+				set_page_dirty_lock(map->page);
+				srcu_read_unlock(&kvm->srcu, idx);
+				unpin_user_page(map->page);
+			}
 			kfree(map);
 		}
 	}
@@ -2974,8 +2999,11 @@ static struct s390_map_info *get_map_info(struct s390_io_adapter *adapter,
 		return NULL;
 
 	list_for_each_entry(map, &adapter->maps, list) {
-		if (map->addr == addr)
+		if (map->addr == addr) {
+			if (!map->pinned)
+				return NULL;
 			return map;
+		}
 	}
 	return NULL;
 }
