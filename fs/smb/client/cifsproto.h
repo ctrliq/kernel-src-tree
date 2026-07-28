@@ -136,12 +136,14 @@ bool is_size_safe_to_change(struct cifsInodeInfo *cifsInode, __u64 end_of_file,
 			    bool from_readdir);
 struct cifsFileInfo *find_writable_file(struct cifsInodeInfo *cifs_inode,
 					int flags);
-int cifs_get_writable_file(struct cifsInodeInfo *cifs_inode, int flags,
-			   struct cifsFileInfo **ret_file);
+int __cifs_get_writable_file(struct cifsInodeInfo *cifs_inode,
+			     unsigned int find_flags, unsigned int open_flags,
+			     struct cifsFileInfo **ret_file);
 int cifs_get_writable_path(struct cifs_tcon *tcon, const char *name, int flags,
 			   struct cifsFileInfo **ret_file);
-struct cifsFileInfo *find_readable_file(struct cifsInodeInfo *cifs_inode,
-					bool fsuid_only);
+struct cifsFileInfo *__find_readable_file(struct cifsInodeInfo *cifs_inode,
+					  unsigned int find_flags,
+					  unsigned int open_flags);
 int cifs_get_readable_path(struct cifs_tcon *tcon, const char *name,
 			   struct cifsFileInfo **ret_file);
 int cifs_get_hardlink_path(struct cifs_tcon *tcon, struct inode *inode,
@@ -500,6 +502,22 @@ static inline void cifs_free_open_info(struct cifs_open_info_data *data)
 	kfree(data->symlink_target);
 	free_rsp_buf(data->reparse.io.buftype, data->reparse.io.iov.iov_base);
 	memset(data, 0, sizeof(*data));
+}
+
+static inline int cifs_get_writable_file(struct cifsInodeInfo *cifs_inode,
+					 unsigned int find_flags,
+					 struct cifsFileInfo **ret_file)
+{
+	find_flags &= ~FIND_OPEN_FLAGS;
+	return __cifs_get_writable_file(cifs_inode, find_flags, 0, ret_file);
+}
+
+static inline struct cifsFileInfo *
+find_readable_file(struct cifsInodeInfo *cinode, unsigned int find_flags)
+{
+	find_flags &= ~FIND_OPEN_FLAGS;
+	find_flags |= FIND_NO_PENDING_DELETE;
+	return __find_readable_file(cinode, find_flags, 0);
 }
 
 #endif			/* _CIFSPROTO_H */

@@ -634,7 +634,7 @@ int cifs_file_flush(const unsigned int xid, struct inode *inode,
 		return tcon->ses->server->ops->flush(xid, tcon,
 						     &cfile->fid);
 	}
-	rc = cifs_get_writable_file(CIFS_I(inode), FIND_WR_ANY, &cfile);
+	rc = cifs_get_writable_file(CIFS_I(inode), FIND_ANY, &cfile);
 	if (!rc) {
 		tcon = tlink_tcon(cfile->tlink);
 		rc = tcon->ses->server->ops->flush(xid, tcon, &cfile->fid);
@@ -659,7 +659,7 @@ static int cifs_do_truncate(const unsigned int xid, struct dentry *dentry)
 		return -ERESTARTSYS;
 	mapping_set_error(inode->i_mapping, rc);
 
-	cfile = find_writable_file(cinode, FIND_WR_FSUID_ONLY);
+	cfile = find_writable_file(cinode, FIND_FSUID_ONLY);
 	rc = cifs_file_flush(xid, inode, cfile);
 	if (!rc) {
 		if (cfile) {
@@ -739,32 +739,29 @@ int cifs_open(struct inode *inode, struct file *file)
 
 	/* Get the cached handle as SMB2 close is deferred */
 	if (OPEN_FMODE(file->f_flags) & FMODE_WRITE) {
-		rc = cifs_get_writable_path(tcon, full_path,
-					    FIND_WR_FSUID_ONLY |
-					    FIND_WR_NO_PENDING_DELETE,
-					    &cfile);
+		rc = __cifs_get_writable_file(CIFS_I(inode),
+					      FIND_FSUID_ONLY |
+					      FIND_NO_PENDING_DELETE |
+					      FIND_OPEN_FLAGS,
+					      file->f_flags, &cfile);
 	} else {
-		rc = cifs_get_readable_path(tcon, full_path, &cfile);
+		cfile = __find_readable_file(CIFS_I(inode),
+					     FIND_NO_PENDING_DELETE |
+					     FIND_OPEN_FLAGS,
+					     file->f_flags);
+		rc = cfile ? 0 : -ENOENT;
 	}
 	if (rc == 0) {
-		unsigned int oflags = file->f_flags & ~(O_CREAT|O_EXCL|O_TRUNC);
-		unsigned int cflags = cfile->f_flags & ~(O_CREAT|O_EXCL|O_TRUNC);
-
-		if (cifs_convert_flags(oflags, 0) == cifs_convert_flags(cflags, 0) &&
-		    (oflags & (O_SYNC|O_DIRECT)) == (cflags & (O_SYNC|O_DIRECT))) {
-			file->private_data = cfile;
-			spin_lock(&CIFS_I(inode)->deferred_lock);
-			cifs_del_deferred_close(cfile);
-			spin_unlock(&CIFS_I(inode)->deferred_lock);
-			goto use_cache;
-		}
-		_cifsFileInfo_put(cfile, true, false);
-	} else {
-		/* hard link on the defeered close file */
-		rc = cifs_get_hardlink_path(tcon, inode, file);
-		if (rc)
-			cifs_close_deferred_file(CIFS_I(inode));
+		file->private_data = cfile;
+		spin_lock(&CIFS_I(inode)->deferred_lock);
+		cifs_del_deferred_close(cfile);
+		spin_unlock(&CIFS_I(inode)->deferred_lock);
+		goto use_cache;
 	}
+	/* hard link on the deferred close file */
+	rc = cifs_get_hardlink_path(tcon, inode, file);
+	if (rc)
+		cifs_close_deferred_file(CIFS_I(inode));
 
 	if (server->oplocks)
 		oplock = REQ_OPLOCK;
@@ -2263,10 +2260,33 @@ cifs_write(struct cifsFileInfo *open_file, __u32 pid, const char *write_data,
 	return total_written;
 }
 
-struct cifsFileInfo *find_readable_file(struct cifsInodeInfo *cifs_inode,
-					bool fsuid_only)
+static bool open_flags_match(struct cifsInodeInfo *cinode,
+			     unsigned int oflags, unsigned int cflags)
+{
+	struct inode *inode = &cinode->netfs.inode;
+	int crw = 0, orw = 0;
+
+	oflags &= ~(O_CREAT | O_EXCL | O_TRUNC);
+	cflags &= ~(O_CREAT | O_EXCL | O_TRUNC);
+
+	if (cifs_fscache_enabled(inode)) {
+		if (OPEN_FMODE(cflags) & FMODE_WRITE)
+			crw = 1;
+		if (OPEN_FMODE(oflags) & FMODE_WRITE)
+			orw = 1;
+	}
+	if (cifs_convert_flags(oflags, orw) != cifs_convert_flags(cflags, crw))
+		return false;
+
+	return (oflags & (O_SYNC | O_DIRECT)) == (cflags & (O_SYNC | O_DIRECT));
+}
+
+struct cifsFileInfo *__find_readable_file(struct cifsInodeInfo *cifs_inode,
+					  unsigned int find_flags,
+					  unsigned int open_flags)
 {
 	struct cifs_sb_info *cifs_sb = CIFS_SB(cifs_inode);
+	bool fsuid_only = find_flags & FIND_FSUID_ONLY;
 	struct cifsFileInfo *open_file = NULL;
 
 	/* only filter by fsuid on multiuser mounts */
@@ -2279,6 +2299,13 @@ struct cifsFileInfo *find_readable_file(struct cifsInodeInfo *cifs_inode,
 	   have a close pending, we go through the whole list */
 	list_for_each_entry(open_file, &cifs_inode->openFileList, flist) {
 		if (fsuid_only && !uid_eq(open_file->uid, current_fsuid()))
+			continue;
+		if ((find_flags & FIND_NO_PENDING_DELETE) &&
+		    open_file->status_file_deleted)
+			continue;
+		if ((find_flags & FIND_OPEN_FLAGS) &&
+		    !open_flags_match(cifs_inode, open_flags,
+				      open_file->f_flags))
 			continue;
 		if (OPEN_FMODE(open_file->f_flags) & FMODE_READ) {
 			if ((!open_file->invalidHandle)) {
@@ -2298,17 +2325,17 @@ struct cifsFileInfo *find_readable_file(struct cifsInodeInfo *cifs_inode,
 }
 
 /* Return -EBADF if no handle is found and general rc otherwise */
-int
-cifs_get_writable_file(struct cifsInodeInfo *cifs_inode, int flags,
-		       struct cifsFileInfo **ret_file)
+int __cifs_get_writable_file(struct cifsInodeInfo *cifs_inode,
+			     unsigned int find_flags, unsigned int open_flags,
+			     struct cifsFileInfo **ret_file)
 {
 	struct cifsFileInfo *open_file, *inv_file = NULL;
 	struct cifs_sb_info *cifs_sb;
 	bool any_available = false;
 	int rc = -EBADF;
 	unsigned int refind = 0;
-	bool fsuid_only = flags & FIND_WR_FSUID_ONLY;
-	bool with_delete = flags & FIND_WR_WITH_DELETE;
+	bool fsuid_only = find_flags & FIND_FSUID_ONLY;
+	bool with_delete = find_flags & FIND_WITH_DELETE;
 	*ret_file = NULL;
 
 	/*
@@ -2342,8 +2369,12 @@ refind_writable:
 			continue;
 		if (with_delete && !(open_file->fid.access & DELETE))
 			continue;
-		if ((flags & FIND_WR_NO_PENDING_DELETE) &&
+		if ((find_flags & FIND_NO_PENDING_DELETE) &&
 		    open_file->status_file_deleted)
+			continue;
+		if ((find_flags & FIND_OPEN_FLAGS) &&
+		    !open_flags_match(cifs_inode, open_flags,
+				      open_file->f_flags))
 			continue;
 		if (OPEN_FMODE(open_file->f_flags) & FMODE_WRITE) {
 			if (!open_file->invalidHandle) {
@@ -2461,17 +2492,7 @@ cifs_get_readable_path(struct cifs_tcon *tcon, const char *name,
 		cinode = CIFS_I(d_inode(cfile->dentry));
 		spin_unlock(&tcon->open_file_lock);
 		free_dentry_path(page);
-		*ret_file = find_readable_file(cinode, 0);
-		if (*ret_file) {
-			spin_lock(&cinode->open_file_lock);
-			if ((*ret_file)->status_file_deleted) {
-				spin_unlock(&cinode->open_file_lock);
-				cifsFileInfo_put(*ret_file);
-				*ret_file = NULL;
-			} else {
-				spin_unlock(&cinode->open_file_lock);
-			}
-		}
+		*ret_file = find_readable_file(cinode, FIND_ANY);
 		return *ret_file ? 0 : -ENOENT;
 	}
 
@@ -2552,8 +2573,7 @@ cifs_writev_requeue(struct cifs_writedata *wdata)
 		wdata2->tailsz = tailsz;
 		wdata2->bytes = cur_len;
 
-		rc = cifs_get_writable_file(CIFS_I(inode), FIND_WR_ANY,
-					    &wdata2->cfile);
+		rc = cifs_get_writable_file(CIFS_I(inode), FIND_ANY, &wdata2->cfile);
 		if (!wdata2->cfile) {
 			cifs_dbg(VFS, "No writable handle to retry writepages rc=%d\n",
 				 rc);
@@ -2697,8 +2717,7 @@ static int cifs_partialpagewrite(struct page *page, unsigned from, unsigned to)
 	if (mapping->host->i_size - offset < (loff_t)to)
 		to = (unsigned)(mapping->host->i_size - offset);
 
-	rc = cifs_get_writable_file(CIFS_I(mapping->host), FIND_WR_ANY,
-				    &open_file);
+	rc = cifs_get_writable_file(CIFS_I(mapping->host), FIND_ANY, &open_file);
 	if (!rc) {
 		bytes_written = cifs_write(open_file, open_file->pid,
 					   write_data, to - from, &offset);
@@ -2939,7 +2958,7 @@ retry:
 		if (cfile)
 			cifsFileInfo_put(cfile);
 
-		rc = cifs_get_writable_file(CIFS_I(inode), FIND_WR_ANY, &cfile);
+		rc = cifs_get_writable_file(CIFS_I(inode), FIND_ANY, &cfile);
 
 		/* in case of an error store it to return later */
 		if (rc)
@@ -3233,7 +3252,7 @@ int cifs_fsync(struct file *file, loff_t start, loff_t end, int datasync)
 		}
 
 		if ((OPEN_FMODE(smbfile->f_flags) & FMODE_WRITE) == 0) {
-			smbfile = find_writable_file(CIFS_I(inode), FIND_WR_ANY);
+			smbfile = find_writable_file(CIFS_I(inode), FIND_ANY);
 			if (smbfile) {
 				rc = server->ops->flush(xid, tcon, &smbfile->fid);
 				cifsFileInfo_put(smbfile);
