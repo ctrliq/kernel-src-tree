@@ -1068,7 +1068,7 @@ static bool sve_write_supported(struct test_config *config)
 
 static bool sve_write_fpsimd_supported(struct test_config *config)
 {
-	if (!sve_supported())
+	if (!sve_supported() && !sme_supported())
 		return false;
 
 	if ((config->svcr_in & SVCR_ZA) != (config->svcr_expected & SVCR_ZA))
@@ -1227,9 +1227,6 @@ static void sve_write_fpsimd(pid_t child, struct test_config *config)
 
 	vl = vl_expected(config);
 	vq = __sve_vq_from_vl(vl);
-
-	if (!vl)
-		return;
 
 	iov.iov_len = SVE_PT_SIZE(vq, SVE_PT_REGS_FPSIMD);
 	iov.iov_base = malloc(iov.iov_len);
