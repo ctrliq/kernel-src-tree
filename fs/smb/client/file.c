@@ -2188,6 +2188,42 @@ int cifs_lock(struct file *file, int cmd, struct file_lock *flock)
 	return rc;
 }
 
+static void cifs_update_i_blocks_for_write(struct inode *inode, loff_t start,
+					     loff_t end)
+{
+	struct cifsInodeInfo *cinode = CIFS_I(inode);
+	u64 allocated_end = CIFS_INO_BYTES(inode->i_blocks);
+	u64 blocks;
+
+	if (cinode->cifsAttrs & FILE_ATTRIBUTE_SPARSE_FILE)
+		return;
+
+	/*
+	 * Grow the local estimate only across the currently known allocated
+	 * prefix. A write beyond that may leave a hole.
+	 */
+	if ((u64)start > allocated_end)
+		return;
+
+	blocks = CIFS_INO_BLOCKS(end);
+	if ((u64)inode->i_blocks < blocks)
+		inode->i_blocks = blocks;
+}
+
+static void cifs_update_i_blocks_after_write(struct kiocb *iocb,
+						ssize_t written)
+{
+	struct inode *inode = file_inode(iocb->ki_filp);
+	loff_t end = iocb->ki_pos;
+
+	if (written <= 0)
+		return;
+
+	spin_lock(&inode->i_lock);
+	cifs_update_i_blocks_for_write(inode, end - written, end);
+	spin_unlock(&inode->i_lock);
+}
+
 /*
  * update the file size (if needed) after a write. Should be called with
  * the inode->i_lock held
@@ -3164,6 +3200,7 @@ static int cifs_write_end(struct file *file, struct address_space *mapping,
 	struct inode *inode = mapping->host;
 	struct cifsFileInfo *cfile = file->private_data;
 	struct cifs_sb_info *cifs_sb = CIFS_SB(cfile->dentry->d_sb);
+	loff_t wend = pos;
 	__u32 pid;
 
 	if (cifs_sb_flags(cifs_sb) & CIFS_MOUNT_RWPIDFORWARD)
@@ -3193,30 +3230,26 @@ static int cifs_write_end(struct file *file, struct address_space *mapping,
 		/* BB check if anything else missing out of ppw
 		   such as updating last write time */
 		page_data = kmap(page);
-		rc = cifs_write(cfile, pid, page_data + offset, copied, &pos);
+		rc = cifs_write(cfile, pid, page_data + offset, copied, &wend);
 		/* if (rc < 0) should we set writebehind rc? */
 		kunmap(page);
 
 		free_xid(xid);
 	} else {
 		rc = copied;
-		pos += copied;
+		wend += copied;
 		set_page_dirty(page);
 	}
 
 	if (rc > 0) {
 		spin_lock(&inode->i_lock);
-		if (pos > inode->i_size) {
-			loff_t additional_blocks = (512 - 1 + copied) >> 9;
-
-			i_size_write(inode, pos);
-			/*
-			 * Estimate new allocation size based on the amount written.
-			 * This will be updated from server on close (and on queryinfo)
-			 */
-			inode->i_blocks = min_t(blkcnt_t, (512 - 1 + pos) >> 9,
-						inode->i_blocks + additional_blocks);
-		}
+		if (wend > inode->i_size)
+			i_size_write(inode, wend);
+		/*
+		 * Estimate new allocation size based on the amount written.
+		 * This will be updated from server on close (and on queryinfo)
+		 */
+		cifs_update_i_blocks_for_write(inode, pos, wend);
 		spin_unlock(&inode->i_lock);
 	}
 
@@ -3868,12 +3901,15 @@ static ssize_t __cifs_writev(
 	return total_written;
 }
 
-ssize_t cifs_direct_writev(struct kiocb *iocb, struct iov_iter *from)
+ssize_t cifs_direct_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct file *file = iocb->ki_filp;
+	ssize_t written;
 
 	cifs_revalidate_mapping(file->f_inode);
-	return __cifs_writev(iocb, from, true);
+	written = __cifs_writev(iocb, from, true);
+	cifs_update_i_blocks_after_write(iocb, written);
+	return written;
 }
 
 ssize_t cifs_user_writev(struct kiocb *iocb, struct iov_iter *from)
@@ -3912,6 +3948,7 @@ cifs_writev(struct kiocb *iocb, struct iov_iter *from)
 	}
 
 	rc = __generic_file_write_iter(iocb, from);
+	cifs_update_i_blocks_after_write(iocb, rc);
 
 out:
 	up_read(&cinode->lock_sem);
@@ -3942,6 +3979,7 @@ cifs_strict_writev(struct kiocb *iocb, struct iov_iter *from)
 		    (CIFS_UNIX_FCNTL_CAP & le64_to_cpu(tcon->fsUnixInfo.Capability)) &&
 		    ((cifs_sb_flags(cifs_sb) & CIFS_MOUNT_NOPOSIXBRL) == 0)) {
 			written = generic_file_write_iter(iocb, from);
+			cifs_update_i_blocks_after_write(iocb, written);
 			goto out;
 		}
 		written = cifs_writev(iocb, from);
@@ -3954,6 +3992,7 @@ cifs_strict_writev(struct kiocb *iocb, struct iov_iter *from)
 	 * these pages but not on the region from pos to ppos+len-1.
 	 */
 	written = cifs_user_writev(iocb, from);
+	cifs_update_i_blocks_after_write(iocb, written);
 	if (CIFS_CACHE_READ(cinode)) {
 		/*
 		 * We have read level caching and we have just sent a write

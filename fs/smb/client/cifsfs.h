@@ -107,6 +107,7 @@ ssize_t cifs_strict_readv(struct kiocb *iocb, struct iov_iter *to);
 ssize_t cifs_user_writev(struct kiocb *iocb, struct iov_iter *from);
 ssize_t cifs_direct_writev(struct kiocb *iocb, struct iov_iter *from);
 ssize_t cifs_strict_writev(struct kiocb *iocb, struct iov_iter *from);
+ssize_t cifs_direct_write_iter(struct kiocb *iocb, struct iov_iter *from);
 int cifs_flock(struct file *file, int cmd, struct file_lock *fl);
 int cifs_lock(struct file *file, int cmd, struct file_lock *flock);
 int cifs_fsync(struct file *file, loff_t start, loff_t end, int datasync);
