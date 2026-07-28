@@ -3046,6 +3046,25 @@ void d_genocide(struct dentry *parent)
 
 EXPORT_SYMBOL(d_genocide);
 
+void d_mark_tmpfile_name(struct file *file, const struct qstr *name)
+{
+	struct dentry *dentry = file->f_path.dentry;
+	char *dname = dentry->d_iname;
+
+	BUG_ON(dname_external(dentry));
+	BUG_ON(d_really_is_positive(dentry));
+	BUG_ON(!d_unlinked(dentry));
+	BUG_ON(name->len > DNAME_INLINE_LEN - 1);
+	spin_lock(&dentry->d_parent->d_lock);
+	spin_lock_nested(&dentry->d_lock, DENTRY_D_LOCK_NESTED);
+	dentry->d_name.len = name->len;
+	memcpy(dname, name->name, name->len);
+	dname[name->len] = '\0';
+	spin_unlock(&dentry->d_lock);
+	spin_unlock(&dentry->d_parent->d_lock);
+}
+EXPORT_SYMBOL(d_mark_tmpfile_name);
+
 void d_tmpfile(struct file *file, struct inode *inode)
 {
 	struct dentry *dentry = file->f_path.dentry;
