@@ -3046,15 +3046,18 @@ void d_genocide(struct dentry *parent)
 
 EXPORT_SYMBOL(d_genocide);
 
-void d_mark_tmpfile_name(struct file *file, const struct qstr *name)
+int d_mark_tmpfile_name(struct file *file, const struct qstr *name)
 {
 	struct dentry *dentry = file->f_path.dentry;
 	char *dname = dentry->d_iname;
 
-	BUG_ON(dname_external(dentry));
-	BUG_ON(d_really_is_positive(dentry));
-	BUG_ON(!d_unlinked(dentry));
-	BUG_ON(name->len > DNAME_INLINE_LEN - 1);
+	if (unlikely(dname_external(dentry) ||
+		     d_really_is_positive(dentry) ||
+		     !d_unlinked(dentry)))
+		return -EINVAL;
+	if (unlikely(name->len > DNAME_INLINE_LEN - 1))
+		return -ENAMETOOLONG;
+
 	spin_lock(&dentry->d_parent->d_lock);
 	spin_lock_nested(&dentry->d_lock, DENTRY_D_LOCK_NESTED);
 	dentry->d_name.len = name->len;
@@ -3062,6 +3065,7 @@ void d_mark_tmpfile_name(struct file *file, const struct qstr *name)
 	dname[name->len] = '\0';
 	spin_unlock(&dentry->d_lock);
 	spin_unlock(&dentry->d_parent->d_lock);
+	return 0;
 }
 EXPORT_SYMBOL(d_mark_tmpfile_name);
 
