@@ -883,7 +883,7 @@ static void vm_userspace_mem_region_hva_insert(struct rb_root *hva_tree,
 
 
 int __vm_set_user_memory_region(struct kvm_vm *vm, u32 slot, u32 flags,
-				u64 gpa, u64 size, void *hva)
+				gpa_t gpa, u64 size, void *hva)
 {
 	struct kvm_userspace_memory_region region = {
 		.slot = slot,
@@ -897,7 +897,7 @@ int __vm_set_user_memory_region(struct kvm_vm *vm, u32 slot, u32 flags,
 }
 
 void vm_set_user_memory_region(struct kvm_vm *vm, u32 slot, u32 flags,
-			       u64 gpa, u64 size, void *hva)
+			       gpa_t gpa, u64 size, void *hva)
 {
 	int ret = __vm_set_user_memory_region(vm, slot, flags, gpa, size, hva);
 
@@ -910,7 +910,7 @@ void vm_set_user_memory_region(struct kvm_vm *vm, u32 slot, u32 flags,
 		       "KVM selftests now require KVM_SET_USER_MEMORY_REGION2 (introduced in v6.8)")
 
 int __vm_set_user_memory_region2(struct kvm_vm *vm, u32 slot, u32 flags,
-				 u64 gpa, u64 size, void *hva,
+				 gpa_t gpa, u64 size, void *hva,
 				 u32 guest_memfd, u64 guest_memfd_offset)
 {
 	struct kvm_userspace_memory_region2 region = {
@@ -929,7 +929,7 @@ int __vm_set_user_memory_region2(struct kvm_vm *vm, u32 slot, u32 flags,
 }
 
 void vm_set_user_memory_region2(struct kvm_vm *vm, u32 slot, u32 flags,
-				u64 gpa, u64 size, void *hva,
+				gpa_t gpa, u64 size, void *hva,
 				u32 guest_memfd, u64 guest_memfd_offset)
 {
 	int ret = __vm_set_user_memory_region2(vm, slot, flags, gpa, size, hva,
@@ -942,7 +942,7 @@ void vm_set_user_memory_region2(struct kvm_vm *vm, u32 slot, u32 flags,
 
 /* FIXME: This thing needs to be ripped apart and rewritten. */
 void vm_mem_add(struct kvm_vm *vm, enum vm_mem_backing_src_type src_type,
-		u64 gpa, u32 slot, u64 npages, u32 flags,
+		gpa_t gpa, u32 slot, u64 npages, u32 flags,
 		int guest_memfd, u64 guest_memfd_offset)
 {
 	int ret;
@@ -1112,7 +1112,7 @@ void vm_mem_add(struct kvm_vm *vm, enum vm_mem_backing_src_type src_type,
 
 void vm_userspace_mem_region_add(struct kvm_vm *vm,
 				 enum vm_mem_backing_src_type src_type,
-				 u64 gpa, u32 slot, u64 npages, u32 flags)
+				 gpa_t gpa, u32 slot, u64 npages, u32 flags)
 {
 	vm_mem_add(vm, src_type, gpa, slot, npages, flags, -1, 0);
 }
@@ -1249,7 +1249,7 @@ void vm_guest_mem_fallocate(struct kvm_vm *vm, u64 base, u64 size,
 	const int mode = FALLOC_FL_KEEP_SIZE | (punch_hole ? FALLOC_FL_PUNCH_HOLE : 0);
 	struct userspace_mem_region *region;
 	u64 end = base + size;
-	u64 gpa, len;
+	gpa_t gpa, len;
 	off_t fd_offset;
 	int ret;
 
