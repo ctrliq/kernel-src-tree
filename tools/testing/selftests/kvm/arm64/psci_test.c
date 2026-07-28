@@ -52,7 +52,7 @@ static u64 psci_system_suspend(u64 entry_addr, u64 context_id)
 	return res.a0;
 }
 
-static u64 psci_features(uint32_t func_id)
+static u64 psci_features(u32 func_id)
 {
 	struct arm_smccc_res res;
 
