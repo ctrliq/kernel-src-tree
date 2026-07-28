@@ -179,7 +179,7 @@ static void __init remap_idmap_for_lpa2(void)
 	 * Don't bother with the FDT, we no longer need it after this.
 	 */
 	memset(init_idmap_pg_dir, 0,
-	       (u64)init_idmap_pg_end - (u64)init_idmap_pg_dir);
+	       (char *)init_idmap_pg_end - (char *)init_idmap_pg_dir);
 
 	create_init_idmap(init_idmap_pg_dir, mask);
 	dsb(ishst);
@@ -188,7 +188,7 @@ static void __init remap_idmap_for_lpa2(void)
 	set_ttbr0_for_lpa2((phys_addr_t)init_idmap_pg_dir);
 
 	/* wipe the temporary ID map from memory */
-	memset(init_pg_dir, 0, (u64)init_pg_end - (u64)init_pg_dir);
+	memset(init_pg_dir, 0, (char *)init_pg_end - (char *)init_pg_dir);
 }
 
 static void *__init map_fdt(phys_addr_t fdt)
@@ -243,7 +243,7 @@ asmlinkage void __init early_map_kernel(u64 boot_status, phys_addr_t fdt)
 	void *fdt_mapped = map_fdt(fdt);
 
 	/* Clear BSS and the initial page tables */
-	memset(__bss_start, 0, (u64)init_pg_end - (u64)__bss_start);
+	memset(__bss_start, 0, (char *)init_pg_end - (char *)__bss_start);
 
 	/* Parse the command line for CPU feature overrides */
 	chosen = fdt_path_offset(fdt_mapped, chosen_str);
