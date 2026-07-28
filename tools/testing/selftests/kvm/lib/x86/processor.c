@@ -1441,6 +1441,11 @@ bool sys_clocksource_is_based_on_tsc(void)
 	return ret;
 }
 
+bool kvm_arch_has_default_irqchip(void)
+{
+	return true;
+}
+
 void setup_smram(struct kvm_vm *vm, struct kvm_vcpu *vcpu,
 		 uint64_t smram_gpa,
 		 const void *smi_handler, size_t handler_size)
