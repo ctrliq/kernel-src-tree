@@ -24,9 +24,6 @@
 #undef PKEY_DISABLE_EXECUTE
 #define PKEY_DISABLE_EXECUTE	0x4
 
-#undef PKEY_UNRESTRICTED
-#define PKEY_UNRESTRICTED	0x0
-
 /* Older versions of libc do not define this */
 #ifndef SEGV_PKUERR
 #define SEGV_PKUERR	4
@@ -88,7 +85,7 @@ int pkeys_unsupported(void)
 	SKIP_IF(!hash_mmu);
 
 	/* Check if the system call is supported */
-	pkey = sys_pkey_alloc(0, PKEY_UNRESTRICTED);
+	pkey = sys_pkey_alloc(0, 0);
 	SKIP_IF(pkey < 0);
 	sys_pkey_free(pkey);
 
