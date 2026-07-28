@@ -1808,7 +1808,7 @@ static bool svdm_consume_svids(struct tcpm_port *port, const u32 *p, int cnt,
 	/*
 	 * PD3.0 Spec 6.4.4.3.2: The SVIDs are returned 2 per VDO (see Table
 	 * 6-43), and can be returned maximum 6 VDOs per response (see Figure
-	 * 6-19). If the Respondersupports 12 or more SVID then the Discover
+	 * 6-19). If the Responder supports 12 or more SVID then the Discover
 	 * SVIDs Command Shall be executed multiple times until a Discover
 	 * SVIDs VDO is returned ending either with a SVID value of 0x0000 in
 	 * the last part of the last VDO or with a VDO containing two SVIDs
@@ -7890,7 +7890,7 @@ struct tcpm_port *tcpm_register_port(struct device *dev, struct tcpc_dev *tcpc)
 	port->partner_desc.identity = &port->partner_ident;
 
 	port->role_sw = fwnode_usb_role_switch_get(tcpc->fwnode);
-	if (IS_ERR_OR_NULL(port->role_sw))
+	if (!port->role_sw)
 		port->role_sw = usb_role_switch_get(port->dev);
 	if (IS_ERR(port->role_sw)) {
 		err = PTR_ERR(port->role_sw);
