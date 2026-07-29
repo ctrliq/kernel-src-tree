@@ -1,0 +1,128 @@
+xfrm: Duplicate SPI Handling
+
+jira KERNEL-1399
+cve CVE-2025-39797
+Rebuild_History Non-Buildable kernel-5.14.0-687.31.1.el9_8
+commit-author Aakash Kumar S <saakashkumar@marvell.com>
+commit 94f39804d891cffe4ce17737d295f3b195bc7299
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.31.1.el9_8/94f39804.failed
+
+The issue originates when Strongswan initiates an XFRM_MSG_ALLOCSPI
+Netlink message, which triggers the kernel function xfrm_alloc_spi().
+This function is expected to ensure uniqueness of the Security Parameter
+Index (SPI) for inbound Security Associations (SAs). However, it can
+return success even when the requested SPI is already in use, leading
+to duplicate SPIs assigned to multiple inbound SAs, differentiated
+only by their destination addresses.
+
+This behavior causes inconsistencies during SPI lookups for inbound packets.
+Since the lookup may return an arbitrary SA among those with the same SPI,
+packet processing can fail, resulting in packet drops.
+
+According to RFC 4301 section 4.4.2 , for inbound processing a unicast SA
+is uniquely identified by the SPI and optionally protocol.
+
+Reproducing the Issue Reliably:
+To consistently reproduce the problem, restrict the available SPI range in
+charon.conf : spi_min = 0x10000000 spi_max = 0x10000002
+This limits the system to only 2 usable SPI values.
+Next, create more than 2 Child SA. each using unique pair of src/dst address.
+As soon as the 3rd Child SA is initiated, it will be assigned a duplicate
+SPI, since the SPI pool is already exhausted.
+With a narrow SPI range, the issue is consistently reproducible.
+With a broader/default range, it becomes rare and unpredictable.
+
+Current implementation:
+xfrm_spi_hash() lookup function computes hash using daddr, proto, and family.
+So if two SAs have the same SPI but different destination addresses, then
+they will:
+a. Hash into different buckets
+b. Be stored in different linked lists (byspi + h)
+c. Not be seen in the same hlist_for_each_entry_rcu() iteration.
+As a result, the lookup will result in NULL and kernel allows that Duplicate SPI
+
+Proposed Change:
+xfrm_state_lookup_spi_proto() does a truly global search - across all states,
+regardless of hash bucket and matches SPI and proto.
+
+	Signed-off-by: Aakash Kumar S <saakashkumar@marvell.com>
+	Acked-by: Herbert Xu <herbert@gondor.apana.org.au>
+	Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+(cherry picked from commit 94f39804d891cffe4ce17737d295f3b195bc7299)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/xfrm/xfrm_state.c
+diff --cc net/xfrm/xfrm_state.c
+index 93a8144d43d0,b3950234b150..000000000000
+--- a/net/xfrm/xfrm_state.c
++++ b/net/xfrm/xfrm_state.c
+@@@ -2331,39 -2590,35 +2349,57 @@@ int xfrm_alloc_spi(struct xfrm_state *x
+  
+  	err = -ENOENT;
+  
+- 	if (minspi == maxspi) {
+- 		x0 = xfrm_state_lookup(net, mark, &x->id.daddr, minspi, x->id.proto, x->props.family);
+- 		if (x0) {
+- 			NL_SET_ERR_MSG(extack, "Requested SPI is already in use");
+- 			xfrm_state_put(x0);
++ 	for (h = 0; h < range; h++) {
++ 		u32 spi = (low == high) ? low : get_random_u32_inclusive(low, high);
++ 		newspi = htonl(spi);
++ 
++ 		spin_lock_bh(&net->xfrm.xfrm_state_lock);
++ 		x0 = xfrm_state_lookup_spi_proto(net, newspi, x->id.proto);
++ 		if (!x0) {
++ 			x->id.spi = newspi;
++ 			h = xfrm_spi_hash(net, &x->id.daddr, newspi, x->id.proto, x->props.family);
++ 			XFRM_STATE_INSERT(byspi, &x->byspi, net->xfrm.state_byspi + h, x->xso.type);
++ 			spin_unlock_bh(&net->xfrm.xfrm_state_lock);
++ 			err = 0;
+  			goto unlock;
+  		}
+++<<<<<<< HEAD
+ +		newspi = minspi;
+ +	} else {
+ +		u32 spi = 0;
+ +		for (h = 0; h < high-low+1; h++) {
+ +			spi = low + prandom_u32()%(high-low+1);
+ +			x0 = xfrm_state_lookup(net, mark, &x->id.daddr, htonl(spi), x->id.proto, x->props.family);
+ +			if (x0 == NULL) {
+ +				newspi = htonl(spi);
+ +				break;
+ +			}
+ +			xfrm_state_put(x0);
+ +		}
+ +	}
+ +	if (newspi) {
+ +		spin_lock_bh(&net->xfrm.xfrm_state_lock);
+ +		x->id.spi = newspi;
+ +		h = xfrm_spi_hash(net, &x->id.daddr, x->id.spi, x->id.proto, x->props.family);
+ +		XFRM_STATE_INSERT(byspi, &x->byspi, net->xfrm.state_byspi + h,
+ +				  x->xso.type);
+++=======
++ 		xfrm_state_put(x0);
+++>>>>>>> 94f39804d891 (xfrm: Duplicate SPI Handling)
+  		spin_unlock_bh(&net->xfrm.xfrm_state_lock);
+  
+- 		err = 0;
+- 	} else {
+- 		NL_SET_ERR_MSG(extack, "No SPI available in the requested range");
++ 		if (signal_pending(current)) {
++ 			err = -ERESTARTSYS;
++ 			goto unlock;
++ 		}
++ 
++ 		if (low == high)
++ 			break;
+  	}
+  
++ 	if (err)
++ 		NL_SET_ERR_MSG(extack, "No SPI available in the requested range");
++ 
+  unlock:
+  	spin_unlock_bh(&x->lock);
+  
+* Unmerged path net/xfrm/xfrm_state.c
