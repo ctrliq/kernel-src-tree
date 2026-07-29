@@ -137,8 +137,7 @@ static int ttm_dma_tt_alloc_page_directory(struct ttm_tt *ttm)
 
 static int ttm_sg_tt_alloc_page_directory(struct ttm_tt *ttm)
 {
-	ttm->dma_address = kvcalloc(ttm->num_pages, sizeof(*ttm->dma_address),
-				    GFP_KERNEL);
+	ttm->dma_address = kvzalloc_objs(*ttm->dma_address, ttm->num_pages);
 	if (!ttm->dma_address)
 		return -ENOMEM;
 
@@ -456,7 +455,7 @@ EXPORT_SYMBOL_FOR_TESTS_ONLY(ttm_tt_unpopulate);
 /* Test the shrinker functions and dump the result */
 static int ttm_tt_debugfs_shrink_show(struct seq_file *m, void *data)
 {
-	struct ttm_operation_ctx ctx = { false, false };
+	struct ttm_operation_ctx ctx = { };
 
 	seq_printf(m, "%d\n", ttm_global_swapout(&ctx, GFP_KERNEL));
 	return 0;

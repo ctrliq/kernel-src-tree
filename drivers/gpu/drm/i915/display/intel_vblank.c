@@ -8,7 +8,6 @@
 #include <drm/drm_print.h>
 #include <drm/drm_vblank.h>
 
-#include "i915_drv.h"
 #include "intel_color.h"
 #include "intel_crtc.h"
 #include "intel_de.h"
@@ -305,31 +304,17 @@ static int __intel_get_crtc_scanline(struct intel_crtc *crtc)
  */
 #ifdef I915
 static void intel_vblank_section_enter(struct intel_display *display)
-	__acquires(i915->uncore.lock)
+	__acquires(uncore->lock)
 {
-	struct drm_i915_private *i915 = to_i915(display->drm);
-	spin_lock(&i915->uncore.lock);
+	struct intel_uncore *uncore = to_intel_uncore(display->drm);
+	spin_lock(&uncore->lock);
 }
 
 static void intel_vblank_section_exit(struct intel_display *display)
-	__releases(i915->uncore.lock)
+	__releases(uncore->lock)
 {
-	struct drm_i915_private *i915 = to_i915(display->drm);
-	spin_unlock(&i915->uncore.lock);
-}
-
-static void intel_vblank_section_enter_irqf(struct intel_display *display, unsigned long *flags)
-	__acquires(i915->uncore.lock)
-{
-	struct drm_i915_private *i915 = to_i915(display->drm);
-	spin_lock_irqsave(&i915->uncore.lock, *flags);
-}
-
-static void intel_vblank_section_exit_irqf(struct intel_display *display, unsigned long flags)
-	__releases(i915->uncore.lock)
-{
-	struct drm_i915_private *i915 = to_i915(display->drm);
-	spin_unlock_irqrestore(&i915->uncore.lock, flags);
+	struct intel_uncore *uncore = to_intel_uncore(display->drm);
+	spin_unlock(&uncore->lock);
 }
 #else
 static void intel_vblank_section_enter(struct intel_display *display)
@@ -338,17 +323,6 @@ static void intel_vblank_section_enter(struct intel_display *display)
 
 static void intel_vblank_section_exit(struct intel_display *display)
 {
-}
-
-static void intel_vblank_section_enter_irqf(struct intel_display *display, unsigned long *flags)
-{
-	*flags = 0;
-}
-
-static void intel_vblank_section_exit_irqf(struct intel_display *display, unsigned long flags)
-{
-	if (flags)
-		return;
 }
 #endif
 
@@ -386,10 +360,10 @@ static bool i915_get_crtc_scanoutpos(struct drm_crtc *_crtc,
 	 * timing critical raw register reads, potentially with
 	 * preemption disabled, so the following code must not block.
 	 */
-	intel_vblank_section_enter_irqf(display, &irqflags);
+	local_irq_save(irqflags);
+	intel_vblank_section_enter(display);
 
-	if (IS_ENABLED(CONFIG_PREEMPT_RT))
-		preempt_disable();
+	/* preempt_disable_rt() should go right here in PREEMPT_RT patchset. */
 
 	/* Get optional system timestamp before query. */
 	if (stime)
@@ -453,10 +427,10 @@ static bool i915_get_crtc_scanoutpos(struct drm_crtc *_crtc,
 	if (etime)
 		*etime = ktime_get();
 
-	if (IS_ENABLED(CONFIG_PREEMPT_RT))
-		preempt_enable();
+	/* preempt_enable_rt() should go right here in PREEMPT_RT patchset. */
 
-	intel_vblank_section_exit_irqf(display, irqflags);
+	intel_vblank_section_exit(display);
+	local_irq_restore(irqflags);
 
 	/*
 	 * While in vblank, position will be negative
@@ -494,11 +468,13 @@ int intel_get_crtc_scanline(struct intel_crtc *crtc)
 	unsigned long irqflags;
 	int position;
 
-	intel_vblank_section_enter_irqf(display, &irqflags);
+	local_irq_save(irqflags);
+	intel_vblank_section_enter(display);
 
 	position = __intel_get_crtc_scanline(crtc);
 
-	intel_vblank_section_exit_irqf(display, irqflags);
+	intel_vblank_section_exit(display);
+	local_irq_restore(irqflags);
 
 	return position;
 }
@@ -675,6 +651,34 @@ intel_pre_commit_crtc_state(struct intel_atomic_state *state,
 	return pre_commit_crtc_state(old_crtc_state, new_crtc_state);
 }
 
+static int vrr_vblank_start(const struct intel_crtc_state *crtc_state)
+{
+	bool is_push_sent = intel_vrr_is_push_sent(crtc_state);
+	int vblank_start;
+
+	if (!crtc_state->vrr.dc_balance.enable) {
+		if (is_push_sent)
+			return intel_vrr_vmin_vblank_start(crtc_state);
+		else
+			return intel_vrr_vmax_vblank_start(crtc_state);
+	}
+
+	if (is_push_sent)
+		vblank_start = intel_vrr_dcb_vmin_vblank_start_next(crtc_state);
+	else
+		vblank_start = intel_vrr_dcb_vmax_vblank_start_next(crtc_state);
+
+	if (vblank_start >= 0)
+		return vblank_start;
+
+	if (is_push_sent)
+		vblank_start = intel_vrr_dcb_vmin_vblank_start_final(crtc_state);
+	else
+		vblank_start = intel_vrr_dcb_vmax_vblank_start_final(crtc_state);
+
+	return vblank_start;
+}
+
 void intel_vblank_evade_init(const struct intel_crtc_state *old_crtc_state,
 			     const struct intel_crtc_state *new_crtc_state,
 			     struct intel_vblank_evade_ctx *evade)
@@ -701,10 +705,7 @@ void intel_vblank_evade_init(const struct intel_crtc_state *old_crtc_state,
 		drm_WARN_ON(crtc->base.dev, intel_crtc_needs_modeset(new_crtc_state) ||
 			    new_crtc_state->update_m_n || new_crtc_state->update_lrr);
 
-		if (intel_vrr_is_push_sent(crtc_state))
-			evade->vblank_start = intel_vrr_vmin_vblank_start(crtc_state);
-		else
-			evade->vblank_start = intel_vrr_vmax_vblank_start(crtc_state);
+		evade->vblank_start = vrr_vblank_start(crtc_state);
 
 		vblank_delay = crtc_state->set_context_latency;
 	} else {
