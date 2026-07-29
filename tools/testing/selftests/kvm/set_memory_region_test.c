@@ -561,7 +561,7 @@ static void test_add_overlapping_private_memory_regions(void)
 					 MEM_REGION_GPA * 2 - MEM_REGION_SIZE,
 					 MEM_REGION_SIZE * 2,
 					 0, memfd, 0);
-	TEST_ASSERT(r == -1 && errno == EEXIST, "%s",
+	TEST_ASSERT(r == -1 && errno == EEXIST,
 		    "Overlapping guest_memfd() bindings should fail with EEXIST");
 
 	/* And now the back half of the other slot. */
@@ -569,7 +569,7 @@ static void test_add_overlapping_private_memory_regions(void)
 					 MEM_REGION_GPA * 2 + MEM_REGION_SIZE,
 					 MEM_REGION_SIZE * 2,
 					 0, memfd, 0);
-	TEST_ASSERT(r == -1 && errno == EEXIST, "%s",
+	TEST_ASSERT(r == -1 && errno == EEXIST,
 		    "Overlapping guest_memfd() bindings should fail with EEXIST");
 
 	close(memfd);
