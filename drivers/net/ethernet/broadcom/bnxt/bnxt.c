@@ -58,11 +58,11 @@
 #include <net/netdev_queues.h>
 #include <net/netdev_rx_queue.h>
 #include <linux/pci-tph.h>
-
 #include <linux/bnxt/hsi.h>
+#include <linux/bnxt/ulp.h>
+
 #include "bnxt.h"
 #include "bnxt_hwrm.h"
-#include "bnxt_ulp.h"
 #include "bnxt_sriov.h"
 #include "bnxt_ethtool.h"
 #include "bnxt_dcb.h"

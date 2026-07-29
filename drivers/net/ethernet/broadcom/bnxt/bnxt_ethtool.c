@@ -26,11 +26,10 @@
 #include <linux/timecounter.h>
 #include <net/netdev_queues.h>
 #include <net/netlink.h>
-#include <net/netdev_queues.h>
 #include <linux/bnxt/hsi.h>
+#include <linux/bnxt/ulp.h>
 #include "bnxt.h"
 #include "bnxt_hwrm.h"
-#include "bnxt_ulp.h"
 #include "bnxt_xdp.h"
 #include "bnxt_ptp.h"
 #include "bnxt_ethtool.h"
