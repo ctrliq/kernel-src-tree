@@ -146,12 +146,6 @@ struct tdx_vp {
 	struct page **tdcx_pages;
 };
 
-static inline u64 mk_keyed_paddr(u16 hkid, kvm_pfn_t pfn)
-{
-	/* KeyID bits are just above the physical address bits. */
-	return PFN_PHYS(pfn) | ((u64)hkid << boot_cpu_data.x86_phys_bits);
-}
-
 void tdx_sys_disable(void);
 
 u64 tdh_vp_enter(struct tdx_vp *vp, struct tdx_module_args *args);
