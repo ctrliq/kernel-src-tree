@@ -23,6 +23,7 @@
 
 #include <pthread.h>
 
+#include "kvm_syscalls.h"
 #include "kvm_util_arch.h"
 #include "kvm_util_types.h"
 #include "sparsebit.h"
@@ -87,12 +88,19 @@ enum kvm_mem_region_type {
 	NR_MEM_REGIONS,
 };
 
+struct kvm_mmu {
+	bool pgd_created;
+	uint64_t pgd;
+	int pgtable_levels;
+
+	struct kvm_mmu_arch arch;
+};
+
 struct kvm_vm {
 	int mode;
 	unsigned long type;
 	int kvm_fd;
 	int fd;
-	unsigned int pgtable_levels;
 	unsigned int page_size;
 	unsigned int page_shift;
 	unsigned int pa_bits;
@@ -103,12 +111,17 @@ struct kvm_vm {
 	struct sparsebit *vpages_valid;
 	struct sparsebit *vpages_mapped;
 	bool has_irqchip;
-	bool pgd_created;
 	vm_paddr_t ucall_mmio_addr;
-	vm_paddr_t pgd;
 	vm_vaddr_t handlers;
 	uint32_t dirty_ring_size;
 	uint64_t gpa_tag_mask;
+
+	/*
+	 * "mmu" is the guest's stage-1, with a short name because the vast
+	 * majority of tests only care about the stage-1 MMU.
+	 */
+	struct kvm_mmu mmu;
+	struct kvm_mmu stage2_mmu;
 
 	struct kvm_vm_arch arch;
 
@@ -177,7 +190,7 @@ enum vm_guest_mode {
 	VM_MODE_P40V48_4K,
 	VM_MODE_P40V48_16K,
 	VM_MODE_P40V48_64K,
-	VM_MODE_PXXV48_4K,	/* For 48bits VA but ANY bits PA */
+	VM_MODE_PXXVYY_4K,	/* For 48-bit or 57-bit VA, depending on host support */
 	VM_MODE_P47V64_4K,
 	VM_MODE_P44V64_4K,
 	VM_MODE_P36V48_4K,
@@ -218,7 +231,7 @@ extern enum vm_guest_mode vm_mode_default;
 
 #elif defined(__x86_64__)
 
-#define VM_MODE_DEFAULT			VM_MODE_PXXV48_4K
+#define VM_MODE_DEFAULT			VM_MODE_PXXVYY_4K
 #define MIN_PAGE_SHIFT			12U
 #define ptes_per_page(page_size)	((page_size) / 8)
 
@@ -275,34 +288,6 @@ unsigned int kvm_check_cap(long cap);
 static inline bool kvm_has_cap(long cap)
 {
 	return kvm_check_cap(cap);
-}
-
-#define __KVM_SYSCALL_ERROR(_name, _ret) \
-	"%s failed, rc: %i errno: %i (%s)", (_name), (_ret), errno, strerror(errno)
-
-static inline void *__kvm_mmap(size_t size, int prot, int flags, int fd,
-			       off_t offset)
-{
-	void *mem;
-
-	mem = mmap(NULL, size, prot, flags, fd, offset);
-	TEST_ASSERT(mem != MAP_FAILED, __KVM_SYSCALL_ERROR("mmap()",
-		    (int)(unsigned long)MAP_FAILED));
-
-	return mem;
-}
-
-static inline void *kvm_mmap(size_t size, int prot, int flags, int fd)
-{
-	return __kvm_mmap(size, prot, flags, fd, 0);
-}
-
-static inline void kvm_munmap(void *mem, size_t size)
-{
-	int ret;
-
-	ret = munmap(mem, size);
-	TEST_ASSERT(!ret, __KVM_SYSCALL_ERROR("munmap()", ret));
 }
 
 /*
@@ -694,12 +679,12 @@ int __vm_set_user_memory_region2(struct kvm_vm *vm, uint32_t slot, uint32_t flag
 				 uint32_t guest_memfd, uint64_t guest_memfd_offset);
 
 void vm_userspace_mem_region_add(struct kvm_vm *vm,
-	enum vm_mem_backing_src_type src_type,
-	uint64_t guest_paddr, uint32_t slot, uint64_t npages,
-	uint32_t flags);
+				 enum vm_mem_backing_src_type src_type,
+				 uint64_t gpa, uint32_t slot, uint64_t npages,
+				 uint32_t flags);
 void vm_mem_add(struct kvm_vm *vm, enum vm_mem_backing_src_type src_type,
-		uint64_t guest_paddr, uint32_t slot, uint64_t npages,
-		uint32_t flags, int guest_memfd_fd, uint64_t guest_memfd_offset);
+		uint64_t gpa, uint32_t slot, uint64_t npages, uint32_t flags,
+		int guest_memfd_fd, uint64_t guest_memfd_offset);
 
 #ifndef vm_arch_has_protected_memory
 static inline bool vm_arch_has_protected_memory(struct kvm_vm *vm)
@@ -1225,6 +1210,7 @@ void virt_arch_pg_map(struct kvm_vm *vm, uint64_t vaddr, uint64_t paddr);
 static inline void virt_pg_map(struct kvm_vm *vm, uint64_t vaddr, uint64_t paddr)
 {
 	virt_arch_pg_map(vm, vaddr, paddr);
+	sparsebit_set(vm->vpages_mapped, vaddr >> vm->page_shift);
 }
 
 

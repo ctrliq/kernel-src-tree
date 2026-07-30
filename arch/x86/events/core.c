@@ -20,6 +20,7 @@
 #include <linux/export.h>
 #include <linux/init.h>
 #include <linux/kdebug.h>
+#include <linux/kvm_types.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/clock.h>
 #include <linux/uaccess.h>
@@ -29,6 +30,7 @@
 #include <linux/device.h>
 #include <linux/nospec.h>
 #include <linux/static_call.h>
+#include <linux/kvm_types.h>
 
 #include <asm/apic.h>
 #include <asm/stacktrace.h>
@@ -53,6 +55,8 @@ DEFINE_PER_CPU(struct cpu_hw_events, cpu_hw_events) = {
 	.enabled = 1,
 	.pmu = &pmu,
 };
+
+static DEFINE_PER_CPU(bool, guest_lvtpc_loaded);
 
 DEFINE_STATIC_KEY_FALSE(rdpmc_never_available_key);
 DEFINE_STATIC_KEY_FALSE(rdpmc_always_available_key);
@@ -722,7 +726,7 @@ struct perf_guest_switch_msr *perf_guest_get_msrs(int *nr, void *data)
 {
 	return static_call(x86_pmu_guest_get_msrs)(nr, data);
 }
-EXPORT_SYMBOL_GPL(perf_guest_get_msrs);
+EXPORT_SYMBOL_FOR_KVM(perf_guest_get_msrs);
 
 /*
  * There may be PMI landing after enabled=0. The PMI hitting could be before or
@@ -1759,12 +1763,42 @@ void perf_events_lapic_init(void)
 	apic_write(APIC_LVTPC, APIC_DM_NMI);
 }
 
+#ifdef CONFIG_PERF_GUEST_MEDIATED_PMU
+void perf_load_guest_lvtpc(u32 guest_lvtpc)
+{
+	u32 masked = guest_lvtpc & APIC_LVT_MASKED;
+
+	apic_write(APIC_LVTPC,
+		   APIC_DM_FIXED | PERF_GUEST_MEDIATED_PMI_VECTOR | masked);
+	this_cpu_write(guest_lvtpc_loaded, true);
+}
+EXPORT_SYMBOL_FOR_KVM(perf_load_guest_lvtpc);
+
+void perf_put_guest_lvtpc(void)
+{
+	this_cpu_write(guest_lvtpc_loaded, false);
+	apic_write(APIC_LVTPC, APIC_DM_NMI);
+}
+EXPORT_SYMBOL_FOR_KVM(perf_put_guest_lvtpc);
+#endif /* CONFIG_PERF_GUEST_MEDIATED_PMU */
+
 static int
 perf_event_nmi_handler(unsigned int cmd, struct pt_regs *regs)
 {
 	u64 start_clock;
 	u64 finish_clock;
 	int ret;
+
+	/*
+	 * Ignore all NMIs when the CPU's LVTPC is configured to route PMIs to
+	 * PERF_GUEST_MEDIATED_PMI_VECTOR, i.e. when an NMI time can't be due
+	 * to a PMI.  Attempting to handle a PMI while the guest's context is
+	 * loaded will generate false positives and clobber guest state.  Note,
+	 * the LVTPC is switched to/from the dedicated mediated PMI IRQ vector
+	 * while host events are quiesced.
+	 */
+	if (this_cpu_read(guest_lvtpc_loaded))
+		return NMI_DONE;
 
 	/*
 	 * All PMUs/events that share this PMI handler should make sure to
@@ -3112,13 +3146,14 @@ void perf_get_x86_pmu_capability(struct x86_pmu_capability *cap)
 	cap->version		= x86_pmu.version;
 	cap->num_counters_gp	= x86_pmu_num_counters(NULL);
 	cap->num_counters_fixed	= x86_pmu_num_counters_fixed(NULL);
-	cap->bit_width_gp	= x86_pmu.cntval_bits;
-	cap->bit_width_fixed	= x86_pmu.cntval_bits;
+	cap->bit_width_gp	= cap->num_counters_gp ? x86_pmu.cntval_bits : 0;
+	cap->bit_width_fixed	= cap->num_counters_fixed ? x86_pmu.cntval_bits : 0;
 	cap->events_mask	= (unsigned int)x86_pmu.events_maskl;
 	cap->events_mask_len	= x86_pmu.events_mask_len;
 	cap->pebs_ept		= x86_pmu.pebs_ept;
+	cap->mediated		= !!(pmu.capabilities & PERF_PMU_CAP_MEDIATED_VPMU);
 }
-EXPORT_SYMBOL_GPL(perf_get_x86_pmu_capability);
+EXPORT_SYMBOL_FOR_KVM(perf_get_x86_pmu_capability);
 
 u64 perf_get_hw_event_config(int hw_event)
 {
@@ -3129,4 +3164,4 @@ u64 perf_get_hw_event_config(int hw_event)
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(perf_get_hw_event_config);
+EXPORT_SYMBOL_FOR_KVM(perf_get_hw_event_config);

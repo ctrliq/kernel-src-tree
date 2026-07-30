@@ -103,7 +103,7 @@ int kvm_cpu_has_injectable_intr(struct kvm_vcpu *v)
 
 	return kvm_apic_has_interrupt(v) != -1; /* LAPIC */
 }
-EXPORT_SYMBOL_GPL(kvm_cpu_has_injectable_intr);
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_cpu_has_injectable_intr);
 
 /*
  * check if there is pending interrupt without
@@ -119,7 +119,7 @@ int kvm_cpu_has_interrupt(struct kvm_vcpu *v)
 
 	return kvm_apic_has_interrupt(v) != -1;	/* LAPIC */
 }
-EXPORT_SYMBOL_GPL(kvm_cpu_has_interrupt);
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_cpu_has_interrupt);
 
 /*
  * Read pending interrupt(from non-APIC source)
@@ -148,7 +148,7 @@ int kvm_cpu_get_extint(struct kvm_vcpu *v)
 	WARN_ON_ONCE(!irqchip_split(v->kvm));
 	return get_userspace_extint(v);
 }
-EXPORT_SYMBOL_GPL(kvm_cpu_get_extint);
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_cpu_get_extint);
 
 /*
  * Read pending interrupt vector and intack.
@@ -235,7 +235,7 @@ int kvm_set_msi(struct kvm_kernel_irq_routing_entry *e,
 
 	kvm_msi_to_lapic_irq(kvm, e, &irq);
 
-	return kvm_irq_delivery_to_apic(kvm, NULL, &irq, NULL);
+	return kvm_irq_delivery_to_apic(kvm, NULL, &irq);
 }
 
 int kvm_arch_set_irq_inatomic(struct kvm_kernel_irq_routing_entry *e,
@@ -258,7 +258,7 @@ int kvm_arch_set_irq_inatomic(struct kvm_kernel_irq_routing_entry *e,
 
 		kvm_msi_to_lapic_irq(kvm, e, &irq);
 
-		if (kvm_irq_delivery_to_apic_fast(kvm, NULL, &irq, &r, NULL))
+		if (kvm_irq_delivery_to_apic_fast(kvm, NULL, &irq, &r))
 			return r;
 		break;
 
@@ -353,34 +353,6 @@ int kvm_set_routing_entry(struct kvm *kvm,
 
 	return 0;
 }
-
-bool kvm_intr_is_single_vcpu(struct kvm *kvm, struct kvm_lapic_irq *irq,
-			     struct kvm_vcpu **dest_vcpu)
-{
-	int r = 0;
-	unsigned long i;
-	struct kvm_vcpu *vcpu;
-
-	if (kvm_intr_is_single_vcpu_fast(kvm, irq, dest_vcpu))
-		return true;
-
-	kvm_for_each_vcpu(i, vcpu, kvm) {
-		if (!kvm_apic_present(vcpu))
-			continue;
-
-		if (!kvm_apic_match_dest(vcpu, NULL, irq->shorthand,
-					irq->dest_id, irq->dest_mode))
-			continue;
-
-		if (++r == 2)
-			return false;
-
-		*dest_vcpu = vcpu;
-	}
-
-	return r == 1;
-}
-EXPORT_SYMBOL_GPL(kvm_intr_is_single_vcpu);
 
 void kvm_scan_ioapic_irq(struct kvm_vcpu *vcpu, u32 dest_id, u16 dest_mode,
 			 u8 vector, unsigned long *ioapic_handled_vectors)
@@ -542,7 +514,8 @@ void kvm_arch_irq_bypass_del_producer(struct irq_bypass_consumer *cons,
 	 */
 	spin_lock_irq(&kvm->irqfds.lock);
 
-	if (irqfd->irq_entry.type == KVM_IRQ_ROUTING_MSI) {
+	if (irqfd->irq_entry.type == KVM_IRQ_ROUTING_MSI ||
+	    WARN_ON_ONCE(irqfd->irq_bypass_vcpu)) {
 		ret = kvm_pi_update_irte(irqfd, NULL);
 		if (ret)
 			pr_info("irq bypass consumer (eventfd %p) unregistration fails: %d\n",
