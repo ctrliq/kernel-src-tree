@@ -1596,8 +1596,8 @@ try_split:
 		BUG_ON(folio_mapped(folio));
 		return swap_writeout(folio, wbc);
 	}
-
-	list_del_init(&info->swaplist);
+	if (!info->swapped)
+		list_del_init(&info->swaplist);
 	mutex_unlock(&shmem_swaplist_mutex);
 	if (nr_pages > 1)
 		goto try_split;
