@@ -168,7 +168,7 @@ Summary: The Linux kernel
 %define debugbuildsenabled 1
 %define el_version 9
 %define kernel_major_minor 6.18
-%define kernel_patch 40
+%define kernel_patch 41
 %define buildid .1
 %define specversion %{kernel_major_minor}.%{kernel_patch}
 %define pkgrelease 1%{?buildid}
@@ -4583,8 +4583,10 @@ fi\
 #
 #
 %changelog
-* Fri Jul 24 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.40-1.1.el9
--- Rebased changes for Linux 6.18.40 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.40-1)
+* Fri Jul 31 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.18.41-1.1.el9
+-- Rebased changes for Linux 6.18.41 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.41-1)
+-- spec: relax UKI systemd requirement to 252-31 on RHEL (Brett Mastbergen)
+-- [CIQ] v6.18.40 - updated spec (Brett Mastbergen)
 -- [CIQ] v6.18.40 - rebased configs (Brett Mastbergen)
 -- [CIQ] v6.18.39 - updated spec (Brett Mastbergen)
 -- [CIQ] ciq_kernel-6.18.38-2 - updated spec (Brett Mastbergen)
@@ -4692,7 +4694,7 @@ fi\
 -- github actions: Make Builds on Merge Request Work (Jonathan Maple)
 -- Add initial CIQ config tweaks (Brett Mastbergen)
 -- Add CIQ configs (Brett Mastbergen)
--- Linux 6.18.40 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.18.40)
+-- Linux 6.18.41 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.18.41)
 
 
 ###
