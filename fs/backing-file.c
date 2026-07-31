@@ -336,7 +336,7 @@ int backing_file_mmap(struct file *file, struct vm_area_struct *vma,
 	    WARN_ON_ONCE(ctx->user_file != vma->vm_file))
 		return -EIO;
 
-	if (!file->f_op->mmap)
+	if (!can_mmap_file(file))
 		return -ENODEV;
 
 	vma_set_file(vma, file);

@@ -2251,7 +2251,7 @@ struct inode_operations {
 } ____cacheline_aligned;
 
 /* Did the driver provide valid mmap hook configuration? */
-static inline bool file_has_valid_mmap_hooks(struct file *file)
+static inline bool can_mmap_file(struct file *file)
 {
 	bool has_mmap = file->f_op->mmap;
 	bool has_mmap_prepare = file->f_op->mmap_prepare;

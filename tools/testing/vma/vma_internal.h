@@ -1455,7 +1455,7 @@ static inline void vma_set_file(struct vm_area_struct *vma, struct file *file)
 }
 
 /* Did the driver provide valid mmap hook configuration? */
-static inline bool file_has_valid_mmap_hooks(struct file *file)
+static inline bool can_mmap_file(struct file *file)
 {
 	bool has_mmap = file->f_op->mmap;
 	bool has_mmap_prepare = file->f_op->mmap_prepare;
