@@ -122,6 +122,9 @@ static inline int sz2ord(size_t size)
 	return __builtin_ctzll(size / getpagesize());
 }
 
+void *sys_mremap(void *old_address, unsigned long old_size,
+		 unsigned long new_size, int flags, void *new_address);
+
 /*
  * On ppc64 this will only work with radix 2M hugepage size
  */
