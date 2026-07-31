@@ -1454,6 +1454,17 @@ static inline void vma_set_file(struct vm_area_struct *vma, struct file *file)
 	fput(file);
 }
 
+static inline bool shmem_file(struct file *)
+{
+	return false;
+}
+
+static inline vm_flags_t ksm_vma_flags(const struct mm_struct *, const struct file *,
+			 vm_flags_t vm_flags)
+{
+	return vm_flags;
+}
+
 /* Did the driver provide valid mmap hook configuration? */
 static inline bool can_mmap_file(struct file *file)
 {
