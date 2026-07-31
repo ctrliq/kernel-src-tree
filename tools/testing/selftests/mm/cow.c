@@ -263,8 +263,10 @@ static void do_test_cow_in_parent(char *mem, size_t size, bool do_mprotect,
 		 * fail because (a) harder to fix and (b) nobody really cares.
 		 * Flag them as expected failure for now.
 		 */
+		ksft_print_msg("Leak from parent into child\n");
 		log_test_result(KSFT_XFAIL);
 	} else {
+		ksft_print_msg("Leak from parent into child\n");
 		log_test_result(KSFT_FAIL);
 	}
 close_comm_pipes:
@@ -392,8 +394,10 @@ static void do_test_vmsplice_in_parent(char *mem, size_t size,
 		 * fail because (a) harder to fix and (b) nobody really cares.
 		 * Flag them as expected failure for now.
 		 */
+		ksft_print_msg("Leak from child into parent\n");
 		log_test_result(KSFT_XFAIL);
 	} else {
+		ksft_print_msg("Leak from child into parent\n");
 		log_test_result(KSFT_FAIL);
 	}
 close_pipe:
@@ -565,10 +569,12 @@ static void do_test_iouring(char *mem, size_t size, bool use_fork)
 	}
 
 	/* Finally, check if we read what we expected. */
-	if (!memcmp(mem, tmp, size))
+	if (!memcmp(mem, tmp, size)) {
 		log_test_result(KSFT_PASS);
-	else
+	} else {
+		ksft_print_msg("Longtom R/W pin is not reliable\n");
 		log_test_result(KSFT_FAIL);
+	}
 
 quit_child:
 	if (use_fork) {
@@ -720,10 +726,12 @@ static void do_test_ro_pin(char *mem, size_t size, enum ro_pin_test test,
 		ksft_perror("PIN_LONGTERM_TEST_READ failed");
 		log_test_result(KSFT_FAIL);
 	} else {
-		if (!memcmp(mem, tmp, size))
+		if (!memcmp(mem, tmp, size)) {
 			log_test_result(KSFT_PASS);
-		else
+		} else {
+			ksft_print_msg("Longterm R/O pin is not reliable\n");
 			log_test_result(KSFT_FAIL);
+		}
 	}
 
 	ret = ioctl(gup_fd, PIN_LONGTERM_TEST_STOP);
@@ -1412,10 +1420,12 @@ static void do_test_anon_thp_collapse(char *mem, size_t size,
 	else
 		ret = -EINVAL;
 
-	if (!ret)
+	if (!ret) {
 		log_test_result(KSFT_PASS);
-	else
+	} else {
+		ksft_print_msg("Leak from parent into child\n");
 		log_test_result(KSFT_FAIL);
+	}
 close_comm_pipes:
 	close_comm_pipes(&comm_pipes);
 }
@@ -1523,10 +1533,12 @@ static void test_cow(char *mem, const char *smem, size_t size)
 	memset(mem, 0xff, size);
 
 	/* See if we still read the old values via the other mapping. */
-	if (!memcmp(smem, old, size))
+	if (!memcmp(smem, old, size)) {
 		log_test_result(KSFT_PASS);
-	else
+	} else {
+		ksft_print_msg("Other mapping modified\n");
 		log_test_result(KSFT_FAIL);
+	}
 	free(old);
 }
 
