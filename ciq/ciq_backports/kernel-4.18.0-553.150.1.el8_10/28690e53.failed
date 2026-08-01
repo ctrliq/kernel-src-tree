@@ -1,0 +1,289 @@
+rtnetlink: Add peer_type in struct rtnl_link_ops.
+
+jira KERNEL-1421
+cve CVE-2026-31692
+Rebuild_History Non-Buildable kernel-4.18.0-553.150.1.el8_10
+commit-author Kuniyuki Iwashima <kuniyu@amazon.com>
+commit 28690e5361c05fd4ef0ca3a17d1c667cba790554
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.150.1.el8_10/28690e53.failed
+
+In ops->newlink(), veth, vxcan, and netkit call rtnl_link_get_net() with
+a net pointer, which is the first argument of ->newlink().
+
+rtnl_link_get_net() could return another netns based on IFLA_NET_NS_PID
+and IFLA_NET_NS_FD in the peer device's attributes.
+
+We want to get it and fill rtnl_nets->nets[] in advance in rtnl_newlink()
+for per-netns RTNL.
+
+All of the three get the peer netns in the same way:
+
+  1. Call rtnl_nla_parse_ifinfomsg()
+  2. Call ops->validate() (vxcan doesn't have)
+  3. Call rtnl_link_get_net_tb()
+
+Let's add a new field peer_type to struct rtnl_link_ops and prefetch
+netns in the peer ifla to add it to rtnl_nets in rtnl_newlink().
+
+	Signed-off-by: Kuniyuki Iwashima <kuniyu@amazon.com>
+	Reviewed-by: Eric Dumazet <edumazet@google.com>
+	Reviewed-by: Nikolay Aleksandrov <razor@blackwall.org>
+Link: https://patch.msgid.link/20241108004823.29419-6-kuniyu@amazon.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 28690e5361c05fd4ef0ca3a17d1c667cba790554)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/rtnetlink.h
+#	net/core/rtnetlink.c
+diff --cc include/net/rtnetlink.h
+index d601f5520fb5,bef76abcff8d..000000000000
+--- a/include/net/rtnetlink.h
++++ b/include/net/rtnetlink.h
+@@@ -36,9 -71,11 +36,10 @@@ struct rtnl_link_ops_extended_rh 
+  /**
+   *	struct rtnl_link_ops - rtnetlink link operations
+   *
+ - *	@list: Used internally, protected by link_ops_mutex and SRCU
+ - *	@srcu: Used internally
+ + *	@list: Used internally
+   *	@kind: Identifier
+   *	@netns_refund: Physical device, move to init_net on netns exit
++  *	@peer_type: Peer device specific netlink attribute number (e.g. VETH_INFO_PEER)
+   *	@maxtype: Highest device specific netlink attribute number
+   *	@policy: Netlink policy for device specific attribute validation
+   *	@validate: Optional validation function for netlink/changelink parameters
+@@@ -71,8 -109,15 +72,13 @@@ struct rtnl_link_ops 
+  	const char		*kind;
+  
+  	size_t			priv_size;
+ -	struct net_device	*(*alloc)(struct nlattr *tb[],
+ -					  const char *ifname,
+ -					  unsigned char name_assign_type,
+ -					  unsigned int num_tx_queues,
+ -					  unsigned int num_rx_queues);
+  	void			(*setup)(struct net_device *dev);
+  
+++<<<<<<< HEAD
+++=======
++ 	bool			netns_refund;
++ 	const u16		peer_type;
+++>>>>>>> 28690e5361c0 (rtnetlink: Add peer_type in struct rtnl_link_ops.)
+  	unsigned int		maxtype;
+  	const struct nla_policy	*policy;
+  	int			(*validate)(struct nlattr *tb[],
+diff --cc net/core/rtnetlink.c
+index ad6e6c159ae0,1af187a4a3f1..000000000000
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@@ -3485,6 -3775,91 +3495,94 @@@ out_unregister
+  	goto out;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int rtnl_add_peer_net(struct rtnl_nets *rtnl_nets,
++ 			     const struct rtnl_link_ops *ops,
++ 			     struct nlattr *data[],
++ 			     struct netlink_ext_ack *extack)
++ {
++ 	struct nlattr *tb[IFLA_MAX + 1];
++ 	struct net *net;
++ 	int err;
++ 
++ 	if (!data || !data[ops->peer_type])
++ 		return 0;
++ 
++ 	err = rtnl_nla_parse_ifinfomsg(tb, data[ops->peer_type], extack);
++ 	if (err < 0)
++ 		return err;
++ 
++ 	if (ops->validate) {
++ 		err = ops->validate(tb, NULL, extack);
++ 		if (err < 0)
++ 			return err;
++ 	}
++ 
++ 	net = rtnl_link_get_net_ifla(tb);
++ 	if (IS_ERR(net))
++ 		return PTR_ERR(net);
++ 	if (net)
++ 		rtnl_nets_add(rtnl_nets, net);
++ 
++ 	return 0;
++ }
++ 
++ static int __rtnl_newlink(struct sk_buff *skb, struct nlmsghdr *nlh,
++ 			  const struct rtnl_link_ops *ops,
++ 			  struct net *tgt_net, struct net *link_net,
++ 			  struct rtnl_newlink_tbs *tbs,
++ 			  struct nlattr **data,
++ 			  struct netlink_ext_ack *extack)
++ {
++ 	struct nlattr ** const tb = tbs->tb;
++ 	struct net *net = sock_net(skb->sk);
++ 	struct net_device *dev;
++ 	struct ifinfomsg *ifm;
++ 	bool link_specified;
++ 
++ 	ifm = nlmsg_data(nlh);
++ 	if (ifm->ifi_index > 0) {
++ 		link_specified = true;
++ 		dev = __dev_get_by_index(net, ifm->ifi_index);
++ 	} else if (ifm->ifi_index < 0) {
++ 		NL_SET_ERR_MSG(extack, "ifindex can't be negative");
++ 		return -EINVAL;
++ 	} else if (tb[IFLA_IFNAME] || tb[IFLA_ALT_IFNAME]) {
++ 		link_specified = true;
++ 		dev = rtnl_dev_get(net, tb);
++ 	} else {
++ 		link_specified = false;
++ 		dev = NULL;
++ 	}
++ 
++ 	if (dev)
++ 		return rtnl_changelink(skb, nlh, ops, dev, tgt_net, tbs, data, extack);
++ 
++ 	if (!(nlh->nlmsg_flags & NLM_F_CREATE)) {
++ 		/* No dev found and NLM_F_CREATE not set. Requested dev does not exist,
++ 		 * or it's for a group
++ 		*/
++ 		if (link_specified || !tb[IFLA_GROUP])
++ 			return -ENODEV;
++ 
++ 		return rtnl_group_changelink(skb, net, tgt_net,
++ 					     nla_get_u32(tb[IFLA_GROUP]),
++ 					     ifm, extack, tb);
++ 	}
++ 
++ 	if (tb[IFLA_MAP] || tb[IFLA_PROTINFO])
++ 		return -EOPNOTSUPP;
++ 
++ 	if (!ops) {
++ 		NL_SET_ERR_MSG(extack, "Unknown device type");
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	return rtnl_newlink_create(skb, ifm, ops, tgt_net, link_net, nlh, tb, data, extack);
++ }
++ 
+++>>>>>>> 28690e5361c0 (rtnetlink: Add peer_type in struct rtnl_link_ops.)
+  static int rtnl_newlink(struct sk_buff *skb, struct nlmsghdr *nlh,
+  			struct netlink_ext_ack *extack)
+  {
+@@@ -3495,7 -3875,107 +3593,111 @@@
+  	if (!tbs)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	ret = __rtnl_newlink(skb, nlh, tbs, extack);
+++=======
++ 	tb = tbs->tb;
++ 	ret = nlmsg_parse_deprecated(nlh, sizeof(struct ifinfomsg), tb,
++ 				     IFLA_MAX, ifla_policy, extack);
++ 	if (ret < 0)
++ 		goto free;
++ 
++ 	ret = rtnl_ensure_unique_netns(tb, extack, false);
++ 	if (ret < 0)
++ 		goto free;
++ 
++ 	linkinfo = tbs->linkinfo;
++ 	if (tb[IFLA_LINKINFO]) {
++ 		ret = nla_parse_nested_deprecated(linkinfo, IFLA_INFO_MAX,
++ 						  tb[IFLA_LINKINFO],
++ 						  ifla_info_policy, NULL);
++ 		if (ret < 0)
++ 			goto free;
++ 	} else {
++ 		memset(linkinfo, 0, sizeof(tbs->linkinfo));
++ 	}
++ 
++ 	if (linkinfo[IFLA_INFO_KIND]) {
++ 		char kind[MODULE_NAME_LEN];
++ 
++ 		nla_strscpy(kind, linkinfo[IFLA_INFO_KIND], sizeof(kind));
++ 		ops = rtnl_link_ops_get(kind, &ops_srcu_index);
++ #ifdef CONFIG_MODULES
++ 		if (!ops) {
++ 			__rtnl_unlock();
++ 			request_module("rtnl-link-%s", kind);
++ 			rtnl_lock();
++ 			ops = rtnl_link_ops_get(kind, &ops_srcu_index);
++ 		}
++ #endif
++ 	}
++ 
++ 	rtnl_nets_init(&rtnl_nets);
++ 
++ 	if (ops) {
++ 		if (ops->maxtype > RTNL_MAX_TYPE) {
++ 			ret = -EINVAL;
++ 			goto put_ops;
++ 		}
++ 
++ 		if (ops->maxtype && linkinfo[IFLA_INFO_DATA]) {
++ 			ret = nla_parse_nested_deprecated(tbs->attr, ops->maxtype,
++ 							  linkinfo[IFLA_INFO_DATA],
++ 							  ops->policy, extack);
++ 			if (ret < 0)
++ 				goto put_ops;
++ 
++ 			data = tbs->attr;
++ 		}
++ 
++ 		if (ops->validate) {
++ 			ret = ops->validate(tb, data, extack);
++ 			if (ret < 0)
++ 				goto put_ops;
++ 		}
++ 
++ 		if (ops->peer_type) {
++ 			ret = rtnl_add_peer_net(&rtnl_nets, ops, data, extack);
++ 			if (ret < 0)
++ 				goto put_ops;
++ 		}
++ 	}
++ 
++ 	tgt_net = rtnl_link_get_net_capable(skb, sock_net(skb->sk), tb, CAP_NET_ADMIN);
++ 	if (IS_ERR(tgt_net)) {
++ 		ret = PTR_ERR(tgt_net);
++ 		goto put_net;
++ 	}
++ 
++ 	rtnl_nets_add(&rtnl_nets, tgt_net);
++ 
++ 	if (tb[IFLA_LINK_NETNSID]) {
++ 		int id = nla_get_s32(tb[IFLA_LINK_NETNSID]);
++ 
++ 		link_net = get_net_ns_by_id(tgt_net, id);
++ 		if (!link_net) {
++ 			NL_SET_ERR_MSG(extack, "Unknown network namespace id");
++ 			ret =  -EINVAL;
++ 			goto put_net;
++ 		}
++ 
++ 		rtnl_nets_add(&rtnl_nets, link_net);
++ 
++ 		if (!netlink_ns_capable(skb, link_net->user_ns, CAP_NET_ADMIN)) {
++ 			ret = -EPERM;
++ 			goto put_net;
++ 		}
++ 	}
++ 
++ 	ret = __rtnl_newlink(skb, nlh, ops, tgt_net, link_net, tbs, data, extack);
++ 
++ put_net:
++ 	rtnl_nets_destroy(&rtnl_nets);
++ put_ops:
++ 	if (ops)
++ 		rtnl_link_ops_put(ops, ops_srcu_index);
++ free:
+++>>>>>>> 28690e5361c0 (rtnetlink: Add peer_type in struct rtnl_link_ops.)
+  	kfree(tbs);
+  	return ret;
+  }
+* Unmerged path include/net/rtnetlink.h
+* Unmerged path net/core/rtnetlink.c
