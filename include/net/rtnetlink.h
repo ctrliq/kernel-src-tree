@@ -39,6 +39,7 @@ struct rtnl_link_ops_extended_rh {
  *	@list: Used internally
  *	@kind: Identifier
  *	@netns_refund: Physical device, move to init_net on netns exit
+ *	@peer_type: Peer device specific netlink attribute number (e.g. VETH_INFO_PEER)
  *	@maxtype: Highest device specific netlink attribute number
  *	@policy: Netlink policy for device specific attribute validation
  *	@validate: Optional validation function for netlink/changelink parameters
@@ -126,7 +127,7 @@ struct rtnl_link_ops {
 							  unsigned char name_assign_type,
 							  unsigned int num_tx_queues,
 							  unsigned int num_rx_queues))
-	RH_KABI_RESERVE(3)
+	RH_KABI_USE(3, const u16 peer_type)
 	RH_KABI_RESERVE(4)
 	RH_KABI_RESERVE(5)
 	RH_KABI_RESERVE(6)
