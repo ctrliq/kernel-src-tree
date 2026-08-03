@@ -873,9 +873,6 @@ Source8010: x509.genkey.rocky
 %endif
 %endif
 
-# CIQ Kernel
-%if 0%{?pe_signing_certkeyslot:1}
-
 # CIQ Kernel will override above with CIQ certs
 %define secureboot_ca_0 %{SOURCE8001}
 %ifarch x86_64
@@ -893,9 +890,6 @@ Source8010: x509.genkey.rocky
 %define kpatch_cert %{SOURCE8007}
 %define pesign_uki_name_0 ciq_sb_uki_aarch64
 %define uki_secureboot_key_0 %{SOURCE8009}
-%endif
-
-# 0%%{?pe_signing_certkeyslot:1}
 %endif
 
 # rhel && !eln
@@ -2004,26 +1998,12 @@ done
 
 %if 0%{?rhel}
 
-%if 0%{?pe_signing_certkeyslot:1}
-
 # Add DUP and kpatch certificates to system trusted keys for Rocky Linux from CIQ
 %{log_msg "Add DUP and kpatch certificates to system trusted keys for Rocky Linux from CIQ"}
 openssl x509 -inform der -in %{driver_cert} -out ciqkerneldup1.pem
 openssl x509 -inform der -in %{kpatch_cert} -out ciqkernelkpatch1.pem
 openssl x509 -inform der -in %{SOURCE102} -out nvidiagpuoot001.pem
 cat ciqkerneldup1.pem ciqkernelkpatch1.pem nvidiagpuoot001.pem > ../certs/ciqkernel.pem
-
-%else
-
-# Add DUP and kpatch certificates to system trusted keys for RHEL
-%{log_msg "Add DUP and kpatch certificates to system trusted keys for RHEL"}
-openssl x509 -inform der -in %{SOURCE100} -out rheldup3.pem
-openssl x509 -inform der -in %{SOURCE101} -out rhelkpatch1.pem
-openssl x509 -inform der -in %{SOURCE102} -out nvidiagpuoot001.pem
-cat rheldup3.pem rhelkpatch1.pem nvidiagpuoot001.pem > ../certs/rhel.pem
-
-# 0%%{?pe_signing_certkeyslot:1}
-%endif
 
 %if %{signkernel}
 %ifarch s390x ppc64le
@@ -2038,20 +2018,9 @@ cat secureboot.pem >> ../certs/rhel.pem
 openssl x509 -inform der -in %{ima_ca_cert} -out imaca.pem
 cat imaca.pem >> ../certs/rhel.pem
 
-%if 0%{?pe_signing_certkeyslot:1}
-
 for i in *.config; do
   sed -i 's@CONFIG_SYSTEM_TRUSTED_KEYS=""@CONFIG_SYSTEM_TRUSTED_KEYS="certs/ciqkernel.pem"@' $i
 done
-
-%else
-
-for i in *.config; do
-  sed -i 's@CONFIG_SYSTEM_TRUSTED_KEYS=""@CONFIG_SYSTEM_TRUSTED_KEYS="certs/rhel.pem"@' $i
-done
-
-# 0%%{?pe_signing_certkeyslot:1}
-%endif
 
 # ifnarch noarch
 %endif
@@ -2647,7 +2616,6 @@ BuildKernel() {
         SBATsuffix="rhel"
 %endif
 
-%if 0%{?pe_uki_signing_certkeyslot:1}
         SBAT=$(cat <<- EOF
 	linux,1,CIQ,linux,$KernelVer,mailto:secureboot@ciq.com
 	linux.$SBATsuffix,1,Red Hat,linux,$KernelVer,mailto:secalert@redhat.com
@@ -2656,14 +2624,6 @@ BuildKernel() {
 	kernel-uki-virt.ciq_rocky,1,CIQ,kernel-uki-virt,$kernelVer,mailto:secureboot@ciq.com
 	EOF
 	)
-%else
-        SBAT=$(cat <<- EOF
-	linux,1,Red Hat,linux,$KernelVer,mailto:secalert@redhat.com
-	linux.$SBATsuffix,1,Red Hat,linux,$KernelVer,mailto:secalert@redhat.com
-	kernel-uki-virt.$SBATsuffix,1,Red Hat,kernel-uki-virt,$KernelVer,mailto:secalert@redhat.com
-	EOF
-	)
-%endif
 
 	KernelUnifiedImageDir="$RPM_BUILD_ROOT/lib/modules/$KernelVer"
     	KernelUnifiedImage="$KernelUnifiedImageDir/$InstallName-virt.efi"
