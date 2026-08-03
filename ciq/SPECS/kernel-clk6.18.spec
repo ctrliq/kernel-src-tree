@@ -1002,9 +1002,6 @@ Source8010: x509.genkey.rocky
 %endif
 %endif
 
-# CIQ Kernel
-%if 0%{?pe_signing_certkeyslot:1}
-
 # CIQ Kernel will override above with CIQ certs
 %define secureboot_ca_0 %{SOURCE8001}
 %ifarch x86_64
@@ -1022,9 +1019,6 @@ Source8010: x509.genkey.rocky
 %define kpatch_cert %{SOURCE8007}
 %define pesign_uki_name_0 ciq_sb_uki_aarch64
 %define uki_secureboot_key_0 %{SOURCE8009}
-%endif
-
-# 0%%{?pe_signing_certkeyslot:1}
 %endif
 
 # rhel && !eln
@@ -2182,11 +2176,9 @@ done
 %if %{signkernel}%{signmodules}
 
 %ifnarch noarch
-# Add DUP and kpatch certificates to system trusted keys for RHEL
+# Add DUP and kpatch certificates to system trusted keys
 truncate -s0 ../certs/rhel.pem
 %if 0%{?rhel}
-
-%if 0%{?pe_signing_certkeyslot:1}
 
 # Add DUP and kpatch certificates to system trusted keys for Rocky Linux from CIQ
 %{log_msg "Add DUP and kpatch certificates to system trusted keys for Rocky Linux from CIQ"}
@@ -2195,19 +2187,7 @@ openssl x509 -inform der -in %{kpatch_cert} -out ciqkernelkpatch1.pem
 openssl x509 -inform der -in %{SOURCE102} -out nvidiagpuoot001.pem
 cat ciqkerneldup1.pem ciqkernelkpatch1.pem nvidiagpuoot001.pem > ../certs/ciqkernel.pem
 
-%else
 
-%if %{rhelkeys}
-%{log_msg "Add DUP and kpatch certificates to system trusted keys for RHEL"}
-openssl x509 -inform der -in %{SOURCE100} -out rheldup3.pem
-openssl x509 -inform der -in %{SOURCE101} -out rhelkpatch1.pem
-openssl x509 -inform der -in %{SOURCE102} -out nvidiagpuoot001.pem
-cat rheldup3.pem rhelkpatch1.pem nvidiagpuoot001.pem >> ../certs/rhel.pem
-# rhelkeys
-%endif
-
-# 0%{?pe_signing_certkeyslot:1}
-%endif
 %if %{signkernel}
 %ifarch s390x ppc64le
 openssl x509 -inform der -in %{secureboot_ca_0} -out secureboot.pem
@@ -2222,11 +2202,7 @@ openssl x509 -inform der -in %{ima_ca_cert} -out imaca.pem
 cat imaca.pem >> ../certs/rhel.pem
 
 for i in *.config; do
-%if 0%{?pe_signing_certkeyslot:1}
   sed -i 's@CONFIG_SYSTEM_TRUSTED_KEYS=""@CONFIG_SYSTEM_TRUSTED_KEYS="certs/ciqkernel.pem"@' $i
-%else
-  sed -i 's@CONFIG_SYSTEM_TRUSTED_KEYS=""@CONFIG_SYSTEM_TRUSTED_KEYS="certs/rhel.pem"@' $i
-%endif
   sed -i 's@CONFIG_EFI_SBAT_FILE=""@CONFIG_EFI_SBAT_FILE="kernel.sbat"@' $i
 done
 # ifnarch noarch
