@@ -4246,22 +4246,25 @@ static int direct_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault
 	if (r != RET_PF_CONTINUE)
 		return r;
 
-	r = RET_PF_RETRY;
-
 	if (is_tdp_mmu_fault)
 		read_lock(&vcpu->kvm->mmu_lock);
 	else
 		write_lock(&vcpu->kvm->mmu_lock);
 
-	if (is_page_fault_stale(vcpu, fault, mmu_seq))
-		goto out_unlock;
-
 	if (is_tdp_mmu_fault) {
+		if (is_page_fault_stale(vcpu, fault, mmu_seq)) {
+			r = RET_PF_RETRY;
+			goto out_unlock;
+		}
 		r = kvm_tdp_mmu_map(vcpu, fault);
 	} else {
 		r = make_mmu_pages_available(vcpu);
 		if (r)
 			goto out_unlock;
+		if (is_page_fault_stale(vcpu, fault, mmu_seq)) {
+			r = RET_PF_RETRY;
+			goto out_unlock;
+		}
 		r = __direct_map(vcpu, fault);
 	}
 
