@@ -4022,9 +4022,18 @@ static int direct_page_fault(struct kvm_vcpu *vcpu, gpa_t gpa, u32 error_code,
 		r = kvm_tdp_mmu_map(vcpu, gpa, error_code, map_writable, max_level,
 				    pfn, prefault);
 	} else {
+		struct kvm_mmu_page *sp;
+
 		r = make_mmu_pages_available(vcpu);
 		if (r)
 			goto out_unlock;
+
+		sp = to_shadow_page(vcpu->arch.mmu->root_hpa);
+		if (sp && is_obsolete_sp(vcpu->kvm, sp)) {
+			r = RET_PF_RETRY;
+			goto out_unlock;
+		}
+
 		r = __direct_map(vcpu, gpa, error_code, map_writable, max_level, pfn,
 				 prefault, is_tdp);
 	}
