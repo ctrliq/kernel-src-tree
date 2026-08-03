@@ -895,6 +895,17 @@ static int FNAME(page_fault)(struct kvm_vcpu *vcpu, gpa_t addr, u32 error_code,
 	r = make_mmu_pages_available(vcpu);
 	if (r)
 		goto out_unlock;
+
+	{
+		struct kvm_mmu_page *sp;
+
+		sp = to_shadow_page(vcpu->arch.mmu->root_hpa);
+		if (sp && is_obsolete_sp(vcpu->kvm, sp)) {
+			r = RET_PF_RETRY;
+			goto out_unlock;
+		}
+	}
+
 	r = FNAME(fetch)(vcpu, addr, &walker, error_code, max_level, pfn,
 			 map_writable, prefault);
 	kvm_mmu_audit(vcpu, AUDIT_POST_PAGE_FAULT);
