@@ -90,14 +90,6 @@ struct smb_negotiate_rsp {
 	__le16 ByteCount;
 } __packed;
 
-struct filesystem_vol_info {
-	__le64 VolumeCreationTime;
-	__le32 SerialNumber;
-	__le32 VolumeLabelSize;
-	__le16 Reserved;
-	__le16 VolumeLabel[];
-} __packed;
-
 #define EXTENDED_INFO_MAGIC 0x43667364	/* Cfsd */
 #define STRING_LENGTH 28
 
@@ -143,6 +135,7 @@ struct file_id_both_directory_info {
 
 struct smb_version_ops {
 	u16 (*get_cmd_val)(struct ksmbd_work *swork);
+	void (*inc_reqs)(unsigned int cmd);
 	int (*init_rsp_hdr)(struct ksmbd_work *swork);
 	void (*set_rsp_status)(struct ksmbd_work *swork, __le32 err);
 	int (*allocate_rsp_buf)(struct ksmbd_work *work);
@@ -165,6 +158,7 @@ struct smb_version_cmds {
 
 int ksmbd_min_protocol(void);
 int ksmbd_max_protocol(void);
+const char *ksmbd_get_protocol_string(int version);
 
 int ksmbd_lookup_protocol_idx(char *str);
 

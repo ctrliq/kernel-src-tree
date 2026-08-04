@@ -22,7 +22,7 @@
 #include "cifsproto.h"
 #include "smb2proto.h"
 
-#include "compress/lz77.h"
+#include "../common/compress/lz77.h"
 #include "compress.h"
 
 /*
@@ -43,6 +43,11 @@
 struct bucket {
 	unsigned int count;
 };
+
+static inline size_t pow4(size_t n)
+{
+	return n * n * n * n;
+}
 
 /*
  * has_low_entropy() - Compute Shannon entropy of the sampled data.
@@ -65,7 +70,6 @@ static bool has_low_entropy(struct bucket *bkt, size_t slen)
 	const size_t threshold = 65, max_entropy = 8 * ilog2(16);
 	size_t i, p, p2, len, sum = 0;
 
-#define pow4(n) (n * n * n * n)
 	len = ilog2(pow4(slen));
 
 	for (i = 0; i < 256 && bkt[i].count > 0; i++) {
@@ -229,7 +233,7 @@ static bool is_compressible(const struct iov_iter *data)
 	if (has_repeated_data(sample, len))
 		goto out;
 
-	bkt = kcalloc(bkt_size, sizeof(*bkt), GFP_KERNEL);
+	bkt = kzalloc_objs(*bkt, bkt_size);
 	if (!bkt) {
 		WARN_ON_ONCE(1);
 		ret = false;
@@ -329,18 +333,14 @@ int smb_compress(struct TCP_Server_Info *server, struct smb_rqst *rq, compress_s
 		goto err_free;
 	}
 
-	/*
-	 * This is just overprovisioning, as the algorithm will error out if @dst reaches 7/8
-	 * of @slen.
-	 */
-	dlen = slen;
+	dlen = smb_lz77_compressed_alloc_size(slen);
 	dst = kvzalloc(dlen, GFP_KERNEL);
 	if (!dst) {
 		ret = -ENOMEM;
 		goto err_free;
 	}
 
-	ret = lz77_compress(src, slen, dst, &dlen);
+	ret = smb_lz77_compress(src, slen, dst, &dlen);
 	if (!ret) {
 		struct smb2_compression_hdr hdr = { 0 };
 		struct smb_rqst comp_rq = { .rq_nvec = 3, };

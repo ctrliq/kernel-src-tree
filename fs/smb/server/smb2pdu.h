@@ -23,7 +23,7 @@
 #define MAX_SMB2_HDR_SIZE 0x78 /* 4 len + 64 hdr + (2*24 wct) + 2 bct + 2 pad */
 
 #define SMB21_DEFAULT_IOSIZE	(1024 * 1024)
-#define SMB3_DEFAULT_TRANS_SIZE	(1024 * 1024)
+#define SMB3_DEFAULT_TRANS_SIZE	(4 * 1024 * 1024)
 #define SMB3_MIN_IOSIZE		(64 * 1024)
 #define SMB3_MAX_IOSIZE		(8 * 1024 * 1024)
 #define SMB3_MAX_MSGSIZE	(4 * 4096)
@@ -83,7 +83,10 @@ struct create_durable_rsp {
 	} Data;
 } __packed;
 
-/* equivalent of the contents of SMB3.1.1 POSIX open context response */
+/*
+ * See POSIX-SMB2 2.2.14.2.16
+ * Link: https://gitlab.com/samba-team/smb3-posix-spec/-/blob/master/smb3_posix_extensions.md
+ */
 struct create_posix_rsp {
 	struct create_context_hdr ccontext;
 	__u8    Name[16];
@@ -183,15 +186,6 @@ struct smb2_file_alignment_info {
 	__le32 AlignmentRequirement;
 } __packed;
 
-struct smb2_file_basic_info { /* data block encoding of response to level 18 */
-	__le64 CreationTime;	/* Beginning of FILE_BASIC_INFO equivalent */
-	__le64 LastAccessTime;
-	__le64 LastWriteTime;
-	__le64 ChangeTime;
-	__le32 Attributes;
-	__u32  Pad1;		/* End of FILE_BASIC_INFO_INFO equivalent */
-} __packed;
-
 struct smb2_file_alt_name_info {
 	__le32 FileNameLength;
 	char FileName[];
@@ -218,10 +212,6 @@ struct smb2_file_ea_info {
 	__le32 EASize;
 } __packed;
 
-struct smb2_file_alloc_info {
-	__le64 AllocationSize;
-} __packed;
-
 struct smb2_file_disposition_info {
 	__u8 DeletePending;
 } __packed;
@@ -235,9 +225,6 @@ struct smb2_file_pos_info {
 struct smb2_file_mode_info {
 	__le32 Mode;
 } __packed;
-
-#define COMPRESSION_FORMAT_NONE 0x0000
-#define COMPRESSION_FORMAT_LZNT1 0x0002
 
 struct smb2_file_comp_info {
 	__le64 CompressedFileSize;

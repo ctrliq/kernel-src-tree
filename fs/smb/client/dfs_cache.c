@@ -363,10 +363,10 @@ static struct cache_dfs_tgt *alloc_target(const char *name, int path_consumed)
 {
 	struct cache_dfs_tgt *t;
 
-	t = kmalloc(sizeof(*t), GFP_ATOMIC);
+	t = kmalloc_obj(*t, GFP_KERNEL);
 	if (!t)
 		return ERR_PTR(-ENOMEM);
-	t->name = kstrdup(name, GFP_ATOMIC);
+	t->name = kstrdup(name, GFP_KERNEL);
 	if (!t->name) {
 		kfree(t);
 		return ERR_PTR(-ENOMEM);
@@ -626,7 +626,7 @@ static int update_cache_entry_locked(struct cache_entry *ce, const struct dfs_in
 
 	target = READ_ONCE(ce->tgthint);
 	if (target) {
-		th = kstrdup(target->name, GFP_ATOMIC);
+		th = kstrdup(target->name, GFP_KERNEL);
 		if (!th)
 			return -ENOMEM;
 	}
@@ -760,11 +760,11 @@ static int setup_referral(const char *path, struct cache_entry *ce,
 
 	memset(ref, 0, sizeof(*ref));
 
-	ref->path_name = kstrdup(path, GFP_ATOMIC);
+	ref->path_name = kstrdup(path, GFP_KERNEL);
 	if (!ref->path_name)
 		return -ENOMEM;
 
-	ref->node_name = kstrdup(target, GFP_ATOMIC);
+	ref->node_name = kstrdup(target, GFP_KERNEL);
 	if (!ref->node_name) {
 		rc = -ENOMEM;
 		goto err_free_path;
@@ -796,7 +796,7 @@ static int get_targets(struct cache_entry *ce, struct dfs_cache_tgt_list *tl)
 	INIT_LIST_HEAD(head);
 
 	list_for_each_entry(t, &ce->tlist, list) {
-		it = kzalloc(sizeof(*it), GFP_ATOMIC);
+		it = kzalloc_obj(*it, GFP_ATOMIC);
 		if (!it) {
 			rc = -ENOMEM;
 			goto err_free_it;
@@ -1333,7 +1333,7 @@ int dfs_cache_remount_fs(struct cifs_sb_info *cifs_sb)
 	 * Force the use of prefix path to support failover on DFS paths that resolve to targets
 	 * that have different prefix paths.
 	 */
-	cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_USE_PREFIX_PATH;
+	atomic_or(CIFS_MOUNT_USE_PREFIX_PATH, &cifs_sb->mnt_cifs_flags);
 
 	refresh_tcon_referral(tcon, true);
 	return 0;

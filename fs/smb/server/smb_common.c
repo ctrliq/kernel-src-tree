@@ -98,6 +98,27 @@ inline int ksmbd_max_protocol(void)
 	return SMB311_PROT;
 }
 
+static const struct {
+	int version;
+	const char *string;
+} version_strings[] = {
+	{SMB2_PROT, SMB20_VERSION_STRING},
+	{SMB21_PROT, SMB21_VERSION_STRING},
+	{SMB30_PROT, SMB30_VERSION_STRING},
+	{SMB302_PROT, SMB302_VERSION_STRING},
+	{SMB311_PROT, SMB311_VERSION_STRING},
+};
+
+const char *ksmbd_get_protocol_string(int version)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(version_strings); i++) {
+		if (version_strings[i].version == version)
+			return version_strings[i].string;
+	}
+	return "";
+}
 int ksmbd_lookup_protocol_idx(char *str)
 {
 	int offt = ARRAY_SIZE(smb1_protos) - 1;
@@ -164,11 +185,6 @@ bool ksmbd_smb_request(struct ksmbd_conn *conn)
 		return false;
 
 	proto = (__le32 *)smb_get_msg(conn->request_buf);
-	if (*proto == SMB2_COMPRESSION_TRANSFORM_ID) {
-		pr_err_ratelimited("smb2 compression not support yet");
-		return false;
-	}
-
 	if (*proto != SMB1_PROTO_NUMBER &&
 	    *proto != SMB2_PROTO_NUMBER &&
 	    *proto != SMB2_TRANSFORM_PROTO_NUM)

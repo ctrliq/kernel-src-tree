@@ -117,7 +117,7 @@ static const char *path_no_prefix(struct cifs_sb_info *cifs_sb,
 	if (!*path)
 		return path;
 
-	if ((cifs_sb->mnt_cifs_flags & CIFS_MOUNT_USE_PREFIX_PATH) &&
+	if ((cifs_sb_flags(cifs_sb) & CIFS_MOUNT_USE_PREFIX_PATH) &&
 	    cifs_sb->prepath) {
 		len = strlen(cifs_sb->prepath) + 1;
 		if (unlikely(len > strlen(path)))
@@ -285,6 +285,14 @@ replay_again:
 			    &rqst[0], &oplock, &oparms, utf16_path);
 	if (rc)
 		goto oshr_free;
+
+	if (oplock != SMB2_OPLOCK_LEVEL_II) {
+		rc = -EINVAL;
+		cifs_dbg(FYI, "%s: Oplock level %d not suitable for cached directory\n",
+			 __func__, oplock);
+		goto oshr_free;
+	}
+
 	smb2_set_next_command(tcon, &rqst[0]);
 
 	memset(&qi_iov, 0, sizeof(qi_iov));
@@ -555,7 +563,7 @@ void close_all_cached_dirs(struct cifs_sb_info *cifs_sb)
 			continue;
 		spin_lock(&cfids->cfid_list_lock);
 		list_for_each_entry(cfid, &cfids->entries, entry) {
-			tmp_list = kmalloc(sizeof(*tmp_list), GFP_ATOMIC);
+			tmp_list = kmalloc_obj(*tmp_list, GFP_ATOMIC);
 			if (tmp_list == NULL) {
 				/*
 				 * If the malloc() fails, we won't drop all
@@ -592,7 +600,7 @@ done:
  * Invalidate all cached dirs when a TCON has been reset
  * due to a session loss.
  */
-void invalidate_all_cached_dirs(struct cifs_tcon *tcon)
+void invalidate_all_cached_dirs(struct cifs_tcon *tcon, bool sync)
 {
 	struct cached_fids *cfids = tcon->cfids;
 	struct cached_fid *cfid, *q;
@@ -624,7 +632,8 @@ void invalidate_all_cached_dirs(struct cifs_tcon *tcon)
 
 	/* run laundromat unconditionally now as there might have been previously queued work */
 	mod_delayed_work(cfid_put_wq, &cfids->laundromat_work, 0);
-	flush_delayed_work(&cfids->laundromat_work);
+	if (sync)
+		flush_delayed_work(&cfids->laundromat_work);
 }
 
 static void
@@ -697,7 +706,7 @@ static struct cached_fid *init_cached_dir(const char *path)
 {
 	struct cached_fid *cfid;
 
-	cfid = kzalloc(sizeof(*cfid), GFP_ATOMIC);
+	cfid = kzalloc_obj(*cfid, GFP_ATOMIC);
 	if (!cfid)
 		return NULL;
 	cfid->path = kstrdup(path, GFP_ATOMIC);
@@ -812,7 +821,7 @@ struct cached_fids *init_cached_dirs(void)
 {
 	struct cached_fids *cfids;
 
-	cfids = kzalloc(sizeof(*cfids), GFP_KERNEL);
+	cfids = kzalloc_obj(*cfids);
 	if (!cfids)
 		return NULL;
 	spin_lock_init(&cfids->cfid_list_lock);

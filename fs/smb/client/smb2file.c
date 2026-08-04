@@ -13,7 +13,6 @@
 #include <linux/pagemap.h>
 #include <asm/div64.h>
 #include "cifsfs.h"
-#include "cifspdu.h"
 #include "cifsglob.h"
 #include "cifsproto.h"
 #include "cifs_debug.h"
@@ -22,6 +21,7 @@
 #include "fscache.h"
 #include "smb2proto.h"
 #include "../common/smb2status.h"
+#include "../common/smbfsctl.h"
 
 static struct smb2_symlink_err_rsp *symlink_data(const struct kvec *iov)
 {
@@ -49,6 +49,9 @@ static struct smb2_symlink_err_rsp *symlink_data(const struct kvec *iov)
 				 __func__, le32_to_cpu(p->ErrorId));
 
 			len = ALIGN(le32_to_cpu(p->ErrorDataLength), 8);
+			if (len > end - ((u8 *)p + sizeof(*p)))
+				return ERR_PTR(-EINVAL);
+
 			p = (struct smb2_error_context_rsp *)(p->ErrorContextData + len);
 		}
 	} else if (le32_to_cpu(err->ByteCount) >= sizeof(*sym) &&
@@ -74,7 +77,7 @@ int smb2_fix_symlink_target_type(char **target, bool directory, struct cifs_sb_i
 	 * POSIX server does not distinguish between symlinks to file and
 	 * symlink directory. So nothing is needed to fix on the client side.
 	 */
-	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_POSIX_PATHS)
+	if (cifs_sb_flags(cifs_sb) & CIFS_MOUNT_POSIX_PATHS)
 		return 0;
 
 	if (!*target)
@@ -151,8 +154,6 @@ int smb2_open_file(const unsigned int xid, struct cifs_open_parms *oparms,
 	__le16 *smb2_path;
 	__u8 smb2_oplock;
 	struct cifs_open_info_data *data = buf;
-	struct smb2_file_all_info file_info = {};
-	struct smb2_file_all_info *smb2_data = data ? &file_info : NULL;
 	struct kvec err_iov = {};
 	int err_buftype = CIFS_NO_BUFFER;
 	struct cifs_fid *fid = oparms->fid;
@@ -179,14 +180,14 @@ int smb2_open_file(const unsigned int xid, struct cifs_open_parms *oparms,
 	}
 	smb2_oplock = SMB2_OPLOCK_LEVEL_BATCH;
 
-	rc = SMB2_open(xid, oparms, smb2_path, &smb2_oplock, smb2_data, NULL, &err_iov,
+	rc = SMB2_open(xid, oparms, smb2_path, &smb2_oplock, data, NULL, &err_iov,
 		       &err_buftype);
 	if (rc == -EACCES && retry_without_read_attributes) {
 		free_rsp_buf(err_buftype, err_iov.iov_base);
 		memset(&err_iov, 0, sizeof(err_iov));
 		err_buftype = CIFS_NO_BUFFER;
 		oparms->desired_access &= ~FILE_READ_ATTRIBUTES;
-		rc = SMB2_open(xid, oparms, smb2_path, &smb2_oplock, smb2_data, NULL, &err_iov,
+		rc = SMB2_open(xid, oparms, smb2_path, &smb2_oplock, data, NULL, &err_iov,
 			       &err_buftype);
 	}
 	if (rc && data) {
@@ -199,9 +200,9 @@ int smb2_open_file(const unsigned int xid, struct cifs_open_parms *oparms,
 							 oparms->path,
 							 &data->symlink_target);
 			if (!rc) {
-				memset(smb2_data, 0, sizeof(*smb2_data));
+				memset(&data->fi, 0, sizeof(data->fi));
 				oparms->create_options |= OPEN_REPARSE_POINT;
-				rc = SMB2_open(xid, oparms, smb2_path, &smb2_oplock, smb2_data,
+				rc = SMB2_open(xid, oparms, smb2_path, &smb2_oplock, data,
 					       NULL, NULL, NULL);
 				oparms->create_options &= ~OPEN_REPARSE_POINT;
 			}
@@ -235,23 +236,22 @@ int smb2_open_file(const unsigned int xid, struct cifs_open_parms *oparms,
 		rc = 0;
 	}
 
-	if (smb2_data) {
+	if (data) {
 		/* if open response does not have IndexNumber field - get it */
-		if (smb2_data->IndexNumber == 0) {
+		if (data->fi.IndexNumber == 0) {
 			rc = SMB2_get_srv_num(xid, oparms->tcon,
 				      fid->persistent_fid,
 				      fid->volatile_fid,
-				      &smb2_data->IndexNumber);
+				      &data->fi.IndexNumber);
 			if (rc) {
 				/*
 				 * let get_inode_info disable server inode
 				 * numbers
 				 */
-				smb2_data->IndexNumber = 0;
+				data->fi.IndexNumber = 0;
 				rc = 0;
 			}
 		}
-		memcpy(&data->fi, smb2_data, sizeof(data->fi));
 	}
 
 	*oplock = smb2_oplock;
@@ -285,7 +285,7 @@ smb2_unlock_range(struct cifsFileInfo *cfile, struct file_lock *flock,
 	BUILD_BUG_ON(sizeof(struct smb2_lock_element) > PAGE_SIZE);
 	max_buf = min_t(unsigned int, max_buf, PAGE_SIZE);
 	max_num = max_buf / sizeof(struct smb2_lock_element);
-	buf = kcalloc(max_num, sizeof(struct smb2_lock_element), GFP_KERNEL);
+	buf = kzalloc_objs(struct smb2_lock_element, max_num);
 	if (!buf)
 		return -ENOMEM;
 
@@ -428,7 +428,7 @@ smb2_push_mandatory_locks(struct cifsFileInfo *cfile)
 	BUILD_BUG_ON(sizeof(struct smb2_lock_element) > PAGE_SIZE);
 	max_buf = min_t(unsigned int, max_buf, PAGE_SIZE);
 	max_num = max_buf / sizeof(struct smb2_lock_element);
-	buf = kcalloc(max_num, sizeof(struct smb2_lock_element), GFP_KERNEL);
+	buf = kzalloc_objs(struct smb2_lock_element, max_num);
 	if (!buf) {
 		free_xid(xid);
 		return -ENOMEM;

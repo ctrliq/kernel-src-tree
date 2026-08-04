@@ -23,7 +23,6 @@
 #include <linux/sched/signal.h>
 #include <linux/task_io_accounting_ops.h>
 #include <linux/task_work.h>
-#include "cifspdu.h"
 #include "cifsglob.h"
 #include "cifsproto.h"
 #include "cifs_debug.h"
@@ -808,16 +807,21 @@ cifs_cancelled_callback(struct TCP_Server_Info *server, struct mid_q_entry *mid)
 }
 
 /*
- * Return a channel (master if none) of @ses that can be used to send
- * regular requests.
+ * cifs_pick_channel - pick an eligible channel for network operations
  *
- * If we are currently binding a new channel (negprot/sess.setup),
- * return the new incomplete channel.
+ * @ses: session reference
+ *
+ * Select an eligible channel (not terminating and not marked as needing
+ * reconnect), preferring the least loaded one. If no eligible channel is
+ * found, fall back to the primary channel (index 0).
+ *
+ * Return: TCP_Server_Info pointer for the chosen channel, or NULL if @ses is
+ * NULL.
  */
 struct TCP_Server_Info *cifs_pick_channel(struct cifs_ses *ses)
 {
 	uint index = 0;
-	unsigned int min_in_flight = UINT_MAX, max_in_flight = 0;
+	unsigned int min_in_flight = UINT_MAX;
 	struct TCP_Server_Info *server = NULL;
 	int i, start, cur;
 
@@ -847,13 +851,7 @@ struct TCP_Server_Info *cifs_pick_channel(struct cifs_ses *ses)
 			min_in_flight = server->in_flight;
 			index = cur;
 		}
-		if (server->in_flight > max_in_flight)
-			max_in_flight = server->in_flight;
 	}
-
-	/* if all channels are equally loaded, fall back to round-robin */
-	if (min_in_flight == max_in_flight)
-		index = (uint)start % ses->chan_count;
 
 	server = ses->chans[index].server;
 	spin_unlock(&ses->chan_lock);
@@ -1160,7 +1158,7 @@ int
 cifs_readv_receive(struct TCP_Server_Info *server, struct mid_q_entry *mid)
 {
 	int length, len;
-	unsigned int data_offset, data_len;
+	unsigned int data_offset, data_len, end_off;
 	struct cifs_io_subrequest *rdata = mid->callback_data;
 	char *buf = server->smallbuf;
 	unsigned int buflen = server->pdu_size;
@@ -1258,11 +1256,14 @@ cifs_readv_receive(struct TCP_Server_Info *server, struct mid_q_entry *mid)
 	use_rdma_mr = rdata->mr;
 #endif
 	data_len = server->ops->read_data_length(buf, use_rdma_mr);
-	if (!use_rdma_mr && (data_offset + data_len > buflen)) {
-		/* data_len is corrupt -- discard frame */
-		rdata->result = smb_EIO2(smb_eio_trace_read_rsp_malformed,
-					 data_offset + data_len, buflen);
-		return cifs_readv_discard(server, mid);
+	if (!use_rdma_mr) {
+		if (check_add_overflow(data_offset, data_len, &end_off) ||
+		    end_off > buflen) {
+			/* data_len is corrupt -- discard frame */
+			rdata->result = smb_EIO2(smb_eio_trace_read_rsp_malformed,
+						 end_off, buflen);
+			return cifs_readv_discard(server, mid);
+		}
 	}
 
 #ifdef CONFIG_CIFS_SMB_DIRECT

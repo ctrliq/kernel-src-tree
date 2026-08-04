@@ -57,6 +57,7 @@ struct qstr {
 };
 
 #define QSTR_INIT(n,l) { { { .len = l } }, .name = n }
+#define QSTR_LEN(n,l) (struct qstr)QSTR_INIT(n,l)
 
 extern const struct qstr empty_name;
 extern const struct qstr slash_name;
@@ -252,6 +253,7 @@ extern void d_invalidate(struct dentry *);
 extern struct dentry * d_make_root(struct inode *);
 
 extern void d_mark_tmpfile(struct file *, struct inode *);
+int d_mark_tmpfile_name(struct file *file, const struct qstr *name);
 extern void d_tmpfile(struct file *, struct inode *);
 
 extern struct dentry *d_find_alias(struct inode *);
