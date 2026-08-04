@@ -370,6 +370,8 @@ struct nvme_ctrl {
 	u16 mtfa;
 	u32 ctrl_config;
 	u32 queue_count;
+	u32 admin_timeout;
+	u32 io_timeout;
 
 	u64 cap;
 	u32 max_hw_sectors;
@@ -895,7 +897,7 @@ void nvme_sync_queues(struct nvme_ctrl *ctrl);
 void nvme_sync_io_queues(struct nvme_ctrl *ctrl);
 void nvme_unfreeze(struct nvme_ctrl *ctrl);
 void nvme_wait_freeze(struct nvme_ctrl *ctrl);
-int nvme_wait_freeze_timeout(struct nvme_ctrl *ctrl, long timeout);
+int nvme_wait_freeze_timeout(struct nvme_ctrl *ctrl);
 void nvme_start_freeze(struct nvme_ctrl *ctrl);
 
 static inline enum req_op nvme_req_op(struct nvme_command *cmd)
