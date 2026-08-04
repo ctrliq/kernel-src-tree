@@ -1540,6 +1540,7 @@ unsigned int ata_exec_internal(struct ata_device *dev, struct ata_taskfile *tf,
 {
 	struct ata_link *link = dev->link;
 	struct ata_port *ap = link->ap;
+	const bool owns_eh_mutex = ap->host->eh_owner == current;
 	u8 command = tf->command;
 	struct ata_queued_cmd *qc;
 	struct scatterlist sgl;
@@ -1617,11 +1618,25 @@ unsigned int ata_exec_internal(struct ata_device *dev, struct ata_taskfile *tf,
 		}
 	}
 
-	ata_eh_release(ap);
+	if (owns_eh_mutex) {
+		/*
+		 * To prevent that the compiler complains about the
+		 * ata_eh_release() call below.
+		 */
+		__acquire(&ap->host->eh_mutex);
+		ata_eh_release(ap);
+	}
 
 	rc = wait_for_completion_timeout(&wait, msecs_to_jiffies(timeout));
 
-	ata_eh_acquire(ap);
+	if (owns_eh_mutex) {
+		ata_eh_acquire(ap);
+		/*
+		 * To prevent that the compiler complains about the above
+		 * ata_eh_acquire() call.
+		 */
+		__release(&ap->host->eh_mutex);
+	}
 
 	ata_sff_flush_pio_task(ap);
 
@@ -2370,6 +2385,24 @@ static bool ata_dev_check_adapter(struct ata_device *dev,
 	}
 
 	return false;
+}
+
+bool ata_adapter_is_online(struct ata_port *ap)
+{
+	struct device *dev;
+
+	if (!ap || !ap->host)
+		return false;
+
+	dev = ap->host->dev;
+	if (!dev)
+		return false;
+
+	if (dev_is_pci(dev) &&
+	    pci_channel_offline(to_pci_dev(dev)))
+		return false;
+
+	return true;
 }
 
 static int ata_dev_config_ncq(struct ata_device *dev,
@@ -4154,6 +4187,13 @@ static const struct ata_dev_quirks_entry __ata_dev_quirks[] = {
 	{ "ST3320[68]13AS",	"SD1[5-9]",	ATA_QUIRK_NONCQ |
 						ATA_QUIRK_FIRMWARE_WARN },
 
+	/* ADATA devices with LPM issues. */
+	{ "ADATA SU680",	NULL,		ATA_QUIRK_NOLPM },
+
+	/* Seagate disks with LPM issues */
+	{ "ST1000DM010-2EP102",	NULL,		ATA_QUIRK_NOLPM },
+	{ "ST2000DM008-2FR102",	NULL,		ATA_QUIRK_NOLPM },
+
 	/* drives which fail FPDMA_AA activation (some may freeze afterwards)
 	   the ST disks also have LPM issues */
 	{ "ST1000LM024 HN-M101MBB", NULL,	ATA_QUIRK_BROKEN_FPDMA_AA |
@@ -5127,6 +5167,12 @@ void ata_qc_issue(struct ata_queued_cmd *qc)
 
 	qc->flags |= ATA_QCFLAG_ACTIVE;
 	ap->qc_active |= 1ULL << qc->tag;
+
+	/* Make sure the device is still accessible. */
+	if (!ata_adapter_is_online(ap)) {
+		qc->err_mask |= AC_ERR_HOST_BUS;
+		goto sys_err;
+	}
 
 	/*
 	 * We guarantee to LLDs that they will have at least one
