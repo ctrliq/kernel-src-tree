@@ -1,0 +1,99 @@
+net: bridge: use a stable FDB dst snapshot in RCU readers
+
+jira KERNEL-1416
+cve CVE-2026-46086
+Rebuild_History Non-Buildable kernel-6.12.0-211.40.1.el10_2
+commit-author Zhengchuan Liang <zcliangcn@gmail.com>
+commit df4601653201de21b487c3e7fffd464790cab808
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.40.1.el10_2/df460165.failed
+
+Local FDB entries can be rewritten in place by `fdb_delete_local()`, which
+updates `f->dst` to another port or to `NULL` while keeping the entry
+alive. Several bridge RCU readers inspect `f->dst`, including
+`br_fdb_fillbuf()` through the `brforward_read()` sysfs path.
+
+These readers currently load `f->dst` multiple times and can therefore
+observe inconsistent values across the check and later dereference.
+In `br_fdb_fillbuf()`, this means a concurrent local-FDB update can change
+`f->dst` after the NULL check and before the `port_no` dereference,
+leading to a NULL-ptr-deref.
+
+Fix this by taking a single `READ_ONCE()` snapshot of `f->dst` in each
+affected RCU reader and using that snapshot for the rest of the access
+sequence. Also publish the in-place `f->dst` updates in `fdb_delete_local()`
+with `WRITE_ONCE()` so the readers and writer use matching access patterns.
+
+Fixes: 960b589f86c7 ("bridge: Properly check if local fdb entry can be deleted in br_fdb_change_mac_address")
+	Cc: stable@kernel.org
+	Reported-by: Yifan Wu <yifanwucs@gmail.com>
+	Reported-by: Juefei Pu <tomapufckgml@gmail.com>
+Co-developed-by: Yuan Tan <yuantan098@gmail.com>
+	Signed-off-by: Yuan Tan <yuantan098@gmail.com>
+	Suggested-by: Xin Liu <bird@lzu.edu.cn>
+	Tested-by: Ren Wei <enjou1224z@gmail.com>
+	Signed-off-by: Zhengchuan Liang <zcliangcn@gmail.com>
+	Signed-off-by: Ren Wei <n05ec@lzu.edu.cn>
+	Reviewed-by: Ido Schimmel <idosch@nvidia.com>
+	Acked-by: Nikolay Aleksandrov <razor@blackwall.org>
+Link: https://patch.msgid.link/6570fabb85ecadb8baaf019efe856f407711c7b9.1776043229.git.zcliangcn@gmail.com
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+(cherry picked from commit df4601653201de21b487c3e7fffd464790cab808)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_fdb.c
+diff --cc net/bridge/br_fdb.c
+index d769cf3522be,6eb3ab69a514..000000000000
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@@ -1076,9 -1089,11 +1082,15 @@@ int br_fdb_dump(struct sk_buff *skb
+  
+  	rcu_read_lock();
+  	hlist_for_each_entry_rcu(f, &br->fdb_list, fdb_node) {
+++<<<<<<< HEAD
+ +		if (*idx < cb->args[2])
+++=======
++ 		const struct net_bridge_port *dst = READ_ONCE(f->dst);
++ 
++ 		if (*idx < ctx->fdb_idx)
+++>>>>>>> df4601653201 (net: bridge: use a stable FDB dst snapshot in RCU readers)
+  			goto skip;
+- 		if (filter_dev && (!f->dst || f->dst->dev != filter_dev)) {
++ 		if (filter_dev && (!dst || dst->dev != filter_dev)) {
+  			if (filter_dev != dev)
+  				goto skip;
+  			/* !f->dst is a special case for bridge
+diff --git a/net/bridge/br_arp_nd_proxy.c b/net/bridge/br_arp_nd_proxy.c
+index 1e2b51769eec..1f37b8cff032 100644
+--- a/net/bridge/br_arp_nd_proxy.c
++++ b/net/bridge/br_arp_nd_proxy.c
+@@ -202,11 +202,12 @@ void br_do_proxy_suppress_arp(struct sk_buff *skb, struct net_bridge *br,
+ 
+ 		f = br_fdb_find_rcu(br, n->ha, vid);
+ 		if (f) {
++			const struct net_bridge_port *dst = READ_ONCE(f->dst);
+ 			bool replied = false;
+ 
+ 			if ((p && (p->flags & BR_PROXYARP)) ||
+-			    (f->dst && (f->dst->flags & BR_PROXYARP_WIFI)) ||
+-			    br_is_neigh_suppress_enabled(f->dst, vid)) {
++			    (dst && (dst->flags & BR_PROXYARP_WIFI)) ||
++			    br_is_neigh_suppress_enabled(dst, vid)) {
+ 				if (!vid)
+ 					br_arp_send(br, p, skb->dev, sip, tip,
+ 						    sha, n->ha, sha, 0, 0);
+@@ -466,9 +467,10 @@ void br_do_suppress_nd(struct sk_buff *skb, struct net_bridge *br,
+ 
+ 		f = br_fdb_find_rcu(br, n->ha, vid);
+ 		if (f) {
++			const struct net_bridge_port *dst = READ_ONCE(f->dst);
+ 			bool replied = false;
+ 
+-			if (br_is_neigh_suppress_enabled(f->dst, vid)) {
++			if (br_is_neigh_suppress_enabled(dst, vid)) {
+ 				if (vid != 0)
+ 					br_nd_send(br, p, skb, n,
+ 						   skb->vlan_proto,
+* Unmerged path net/bridge/br_fdb.c
