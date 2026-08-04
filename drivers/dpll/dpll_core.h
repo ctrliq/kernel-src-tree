@@ -70,7 +70,6 @@ struct dpll_pin {
 	u32 pin_idx;
 	u64 clock_id;
 	struct module *module;
-	char module_name[MODULE_NAME_LEN];
 	struct fwnode_handle *fwnode;
 	struct xarray dpll_refs;
 	struct xarray parent_refs;
@@ -79,6 +78,7 @@ struct dpll_pin {
 	refcount_t refcount;
 	struct ref_tracker_dir refcnt_tracker;
 	struct rcu_head rcu;
+	RH_KABI_EXTEND(char module_name[MODULE_NAME_LEN])
 };
 
 /**
