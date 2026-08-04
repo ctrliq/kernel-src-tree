@@ -314,6 +314,11 @@ static int tdx_report_new_locked(struct tsm_report *report, void *data)
 	if (out_len > TDX_QUOTE_MAX_LEN)
 		return -EFBIG;
 
+	if (quote_buf->status != GET_QUOTE_SUCCESS) {
+		pr_debug("GetQuote request failed, status:%llx\n", quote_buf->status);
+		return -EIO;
+	}
+
 	buf = kvmemdup(quote_buf->data, out_len, GFP_KERNEL);
 	if (!buf)
 		return -ENOMEM;
