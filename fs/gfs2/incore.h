@@ -321,7 +321,6 @@ enum {
 	GLF_INITIAL			= 10,
 	GLF_HAVE_FROZEN_REPLY		= 11,
 	GLF_INSTANTIATE_IN_PROG		= 12, /* instantiate happening now */
-	GLF_LRU				= 13,
 	GLF_OBJECT			= 14, /* Used only for tracing */
 	GLF_BLOCKING			= 15,
 	GLF_TRY_TO_EVICT		= 17, /* iopen glocks only */
@@ -355,7 +354,7 @@ struct gfs2_glock {
 	unsigned long gl_tchange;
 	void *gl_object;
 
-	struct list_head gl_lru;
+	struct list_head gl_dead;
 	struct list_head gl_ail_list;
 	atomic_t gl_ail_count;
 	atomic_t gl_revokes;
@@ -368,6 +367,16 @@ struct gfs2_glock {
 	struct rcu_head gl_rcu;
 	struct rhash_head gl_node;
 };
+
+static inline unsigned int glock_type(const struct gfs2_glock *gl)
+{
+	return gl->gl_name.ln_type;
+}
+
+static inline u64 glock_number(const struct gfs2_glock *gl)
+{
+	return gl->gl_name.ln_number;
+}
 
 enum {
 	GIF_QD_LOCKED		= 1,
@@ -592,7 +601,6 @@ enum {
 	SDF_DEMOTE		= 5,
 	SDF_NOJOURNALID		= 6,
 	SDF_RORECOVERY		= 7, /* read only recovery */
-	SDF_SKIP_DLM_UNLOCK	= 8,
 	SDF_FORCE_AIL_FLUSH     = 9,
 	SDF_FREEZE_INITIATOR	= 10,
 	SDF_KILL		= 15,
@@ -825,6 +833,9 @@ struct gfs2_sbd {
 	struct list_head sd_ail1_list;
 	struct list_head sd_ail2_list;
 
+	/* glocks */
+	spinlock_t sd_dead_lock;
+
 	/* For quiescing the filesystem */
 	struct gfs2_holder sd_freeze_gh;
 	struct mutex sd_freeze_mutex;
@@ -840,6 +851,8 @@ struct gfs2_sbd {
 	struct dentry *debugfs_dir;    /* debugfs directory */
 };
 
+#define glock_sbd(gl) ((gl)->gl_name.ln_sbd)
+
 #define GFS2_BAD_INO 1
 
 static inline struct address_space *gfs2_aspace(struct gfs2_sbd *sdp)
@@ -854,9 +867,9 @@ static inline void gfs2_glstats_inc(struct gfs2_glock *gl, int which)
 
 static inline void gfs2_sbstats_inc(const struct gfs2_glock *gl, int which)
 {
-	const struct gfs2_sbd *sdp = gl->gl_name.ln_sbd;
+	const struct gfs2_sbd *sdp = glock_sbd(gl);
 	preempt_disable();
-	this_cpu_ptr(sdp->sd_lkstats)->lkstats[gl->gl_name.ln_type].stats[which]++;
+	this_cpu_ptr(sdp->sd_lkstats)->lkstats[glock_type(gl)].stats[which]++;
 	preempt_enable();
 }
 
