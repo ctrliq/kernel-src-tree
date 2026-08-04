@@ -1433,7 +1433,6 @@ enum kvm_mmu_type {
 };
 
 struct kvm_arch {
-	unsigned long n_used_mmu_pages;
 	unsigned long n_requested_mmu_pages;
 	unsigned long n_max_mmu_pages;
 	unsigned int indirect_shadow_pages;
@@ -1699,6 +1698,7 @@ struct kvm_vm_stat {
 	u64 mmu_recycled;
 	u64 mmu_cache_miss;
 	u64 mmu_unsync;
+	u64 mmu_shadow_pages;
 	union {
 		struct {
 			atomic64_t pages_4k;
