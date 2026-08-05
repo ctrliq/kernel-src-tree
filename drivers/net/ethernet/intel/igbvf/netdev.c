@@ -1017,8 +1017,7 @@ static void igbvf_set_interrupt_capability(struct igbvf_adapter *adapter)
 	int i;
 
 	/* we allocate 3 vectors, 1 for Tx, 1 for Rx, one for PF messages */
-	adapter->msix_entries = kcalloc(3, sizeof(struct msix_entry),
-					GFP_KERNEL);
+	adapter->msix_entries = kzalloc_objs(struct msix_entry, 3);
 	if (adapter->msix_entries) {
 		for (i = 0; i < 3; i++)
 			adapter->msix_entries[i].entry = i;
@@ -1098,11 +1097,11 @@ static int igbvf_alloc_queues(struct igbvf_adapter *adapter)
 {
 	struct net_device *netdev = adapter->netdev;
 
-	adapter->tx_ring = kzalloc(sizeof(struct igbvf_ring), GFP_KERNEL);
+	adapter->tx_ring = kzalloc_obj(struct igbvf_ring);
 	if (!adapter->tx_ring)
 		return -ENOMEM;
 
-	adapter->rx_ring = kzalloc(sizeof(struct igbvf_ring), GFP_KERNEL);
+	adapter->rx_ring = kzalloc_obj(struct igbvf_ring);
 	if (!adapter->rx_ring) {
 		kfree(adapter->tx_ring);
 		return -ENOMEM;
@@ -2938,8 +2937,8 @@ static const struct pci_error_handlers igbvf_err_handler = {
 };
 
 static const struct pci_device_id igbvf_pci_tbl[] = {
-	{ PCI_VDEVICE(INTEL, E1000_DEV_ID_82576_VF), board_vf },
-	{ PCI_VDEVICE(INTEL, E1000_DEV_ID_I350_VF), board_i350_vf },
+	{ PCI_VDEVICE(INTEL, E1000_DEV_ID_82576_VF), .driver_data = board_vf },
+	{ PCI_VDEVICE(INTEL, E1000_DEV_ID_I350_VF), .driver_data = board_i350_vf },
 	{ } /* terminate list */
 };
 MODULE_DEVICE_TABLE(pci, igbvf_pci_tbl);
