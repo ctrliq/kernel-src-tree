@@ -12,7 +12,6 @@
 #include <linux/pagemap.h>
 #include <linux/slab.h>
 #include <linux/stat.h>
-#include "cifspdu.h"
 #include "cifsglob.h"
 #include "cifsproto.h"
 #include "cifs_unicode.h"
@@ -121,7 +120,7 @@ retry:
 			 * want to clobber the existing one with the one that
 			 * the readdir code created.
 			 */
-			if (!(cifs_sb->mnt_cifs_flags & CIFS_MOUNT_SERVER_INUM))
+			if (!(cifs_sb_flags(cifs_sb) & CIFS_MOUNT_SERVER_INUM))
 				fattr->cf_uniqueid = CIFS_I(inode)->uniqueid;
 
 			/*
@@ -177,6 +176,7 @@ cifs_fill_common_info(struct cifs_fattr *fattr, struct cifs_sb_info *cifs_sb)
 	struct cifs_open_info_data data = {
 		.reparse = { .tag = fattr->cf_cifstag, },
 	};
+	unsigned int sbflags;
 
 	fattr->cf_uid = cifs_sb->ctx->linux_uid;
 	fattr->cf_gid = cifs_sb->ctx->linux_gid;
@@ -215,12 +215,12 @@ out_reparse:
 	 * may look wrong since the inodes may not have timed out by the time
 	 * "ls" does a stat() call on them.
 	 */
-	if ((cifs_sb->mnt_cifs_flags & CIFS_MOUNT_CIFS_ACL) ||
-	    (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_MODE_FROM_SID))
+	sbflags = cifs_sb_flags(cifs_sb);
+	if (sbflags & (CIFS_MOUNT_CIFS_ACL | CIFS_MOUNT_MODE_FROM_SID))
 		fattr->cf_flags |= CIFS_FATTR_NEED_REVAL;
 
-	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_UNX_EMUL &&
-	    fattr->cf_cifsattrs & ATTR_SYSTEM) {
+	if ((sbflags & CIFS_MOUNT_UNX_EMUL) &&
+	    (fattr->cf_cifsattrs & ATTR_SYSTEM)) {
 		if (fattr->cf_eof == 0)  {
 			fattr->cf_mode &= ~S_IFMT;
 			fattr->cf_mode |= S_IFIFO;
@@ -345,13 +345,14 @@ static int
 _initiate_cifs_search(const unsigned int xid, struct file *file,
 		     const char *full_path)
 {
+	struct cifs_sb_info *cifs_sb = CIFS_SB(file);
+	struct tcon_link *tlink = NULL;
+	struct TCP_Server_Info *server;
+	struct cifsFileInfo *cifsFile;
+	struct cifs_tcon *tcon;
+	unsigned int sbflags;
 	__u16 search_flags;
 	int rc = 0;
-	struct cifsFileInfo *cifsFile;
-	struct cifs_sb_info *cifs_sb = CIFS_FILE_SB(file);
-	struct tcon_link *tlink = NULL;
-	struct cifs_tcon *tcon;
-	struct TCP_Server_Info *server;
 
 	if (file->private_data == NULL) {
 		tlink = cifs_sb_tlink(cifs_sb);
@@ -385,6 +386,7 @@ _initiate_cifs_search(const unsigned int xid, struct file *file,
 	cifs_dbg(FYI, "Full path: %s start at: %lld\n", full_path, file->f_pos);
 
 ffirst_retry:
+	sbflags = cifs_sb_flags(cifs_sb);
 	/* test for Unix extensions */
 	/* but now check for them on the share/mount not on the SMB session */
 	/* if (cap_unix(tcon->ses) { */
@@ -395,7 +397,7 @@ ffirst_retry:
 	else if ((tcon->ses->capabilities &
 		  tcon->ses->server->vals->cap_nt_find) == 0) {
 		cifsFile->srch_inf.info_level = SMB_FIND_FILE_INFO_STANDARD;
-	} else if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_SERVER_INUM) {
+	} else if (sbflags & CIFS_MOUNT_SERVER_INUM) {
 		cifsFile->srch_inf.info_level = SMB_FIND_FILE_ID_FULL_DIR_INFO;
 	} else /* not srvinos - BB fixme add check for backlevel? */ {
 		cifsFile->srch_inf.info_level = SMB_FIND_FILE_FULL_DIRECTORY_INFO;
@@ -411,8 +413,7 @@ ffirst_retry:
 
 	if (rc == 0) {
 		cifsFile->invalidHandle = false;
-	} else if ((rc == -EOPNOTSUPP) &&
-		   (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_SERVER_INUM)) {
+	} else if (rc == -EOPNOTSUPP && (sbflags & CIFS_MOUNT_SERVER_INUM)) {
 		cifs_autodisable_serverino(cifs_sb);
 		goto ffirst_retry;
 	}
@@ -690,7 +691,7 @@ find_cifs_entry(const unsigned int xid, struct cifs_tcon *tcon, loff_t pos,
 	loff_t first_entry_in_buffer;
 	loff_t index_to_find = pos;
 	struct cifsFileInfo *cfile = file->private_data;
-	struct cifs_sb_info *cifs_sb = CIFS_FILE_SB(file);
+	struct cifs_sb_info *cifs_sb = CIFS_SB(file);
 	struct TCP_Server_Info *server = tcon->ses->server;
 	/* check if index in the buffer */
 
@@ -730,6 +731,8 @@ find_cifs_entry(const unsigned int xid, struct cifs_tcon *tcon, loff_t pos,
 			if (cfile->srch_inf.smallBuf)
 				cifs_small_buf_release(cfile->srch_inf.
 						ntwrk_buf_start);
+			else if (cfile->srch_inf.is_dynamic_buf)
+				kfree(cfile->srch_inf.ntwrk_buf_start);
 			else
 				cifs_buf_release(cfile->srch_inf.
 						ntwrk_buf_start);
@@ -948,13 +951,14 @@ static bool cifs_dir_emit(struct dir_context *ctx,
 static int cifs_filldir(char *find_entry, struct file *file,
 			struct dir_context *ctx,
 			char *scratch_buf, unsigned int max_len,
-			struct cached_fid *cfid)
+			char *end_of_smb, struct cached_fid *cfid)
 {
 	struct cifsFileInfo *file_info = file->private_data;
 	struct super_block *sb = file_inode(file)->i_sb;
 	struct cifs_sb_info *cifs_sb = CIFS_SB(sb);
 	struct cifs_dirent de = { NULL, };
 	struct cifs_fattr fattr;
+	unsigned int sbflags;
 	struct qstr name;
 	int rc = 0;
 
@@ -966,6 +970,11 @@ static int cifs_filldir(char *find_entry, struct file *file,
 	if (de.namelen > max_len) {
 		cifs_dbg(VFS, "bad search response length %zd past smb end\n",
 			 de.namelen);
+		return -EINVAL;
+	}
+
+	if (de.name + de.namelen > end_of_smb) {
+		cifs_dbg(VFS, "search entry name extends past end of SMB\n");
 		return -EINVAL;
 	}
 
@@ -1019,15 +1028,15 @@ static int cifs_filldir(char *find_entry, struct file *file,
 		break;
 	}
 
-	if (de.ino && (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_SERVER_INUM)) {
+	sbflags = cifs_sb_flags(cifs_sb);
+	if (de.ino && (sbflags & CIFS_MOUNT_SERVER_INUM)) {
 		fattr.cf_uniqueid = de.ino;
 	} else {
 		fattr.cf_uniqueid = iunique(sb, ROOT_I);
 		cifs_autodisable_serverino(cifs_sb);
 	}
 
-	if ((cifs_sb->mnt_cifs_flags & CIFS_MOUNT_MF_SYMLINKS) &&
-	    couldbe_mf_symlink(&fattr))
+	if ((sbflags & CIFS_MOUNT_MF_SYMLINKS) && couldbe_mf_symlink(&fattr))
 		/*
 		 * trying to get the type and mode can be slow,
 		 * so just call those regular files for now, and mark
@@ -1058,7 +1067,7 @@ int cifs_readdir(struct file *file, struct dir_context *ctx)
 	const char *full_path;
 	void *page = alloc_dentry_path();
 	struct cached_fid *cfid = NULL;
-	struct cifs_sb_info *cifs_sb = CIFS_FILE_SB(file);
+	struct cifs_sb_info *cifs_sb = CIFS_SB(file);
 
 	xid = get_xid();
 
@@ -1189,7 +1198,7 @@ int cifs_readdir(struct file *file, struct dir_context *ctx)
 		 */
 		*tmp_buf = 0;
 		rc = cifs_filldir(current_entry, file, ctx,
-				  tmp_buf, max_len, cfid);
+				  tmp_buf, max_len, end_of_smb, cfid);
 		if (rc) {
 			if (rc > 0)
 				rc = 0;

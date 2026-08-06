@@ -10,7 +10,6 @@
 #include <linux/slab.h>
 #include <linux/namei.h>
 #include "cifsfs.h"
-#include "cifspdu.h"
 #include "cifsglob.h"
 #include "cifsproto.h"
 #include "cifs_debug.h"
@@ -259,7 +258,7 @@ cifs_query_mf_symlink(unsigned int xid, struct cifs_tcon *tcon,
 	struct cifs_open_parms oparms;
 	struct cifs_io_parms io_parms = {0};
 	int buf_type = CIFS_NO_BUFFER;
-	struct cifs_open_info_data query_data;
+	struct cifs_open_info_data query_data = {};
 
 	oparms = (struct cifs_open_parms) {
 		.tcon = tcon,
@@ -345,7 +344,7 @@ smb3_query_mf_symlink(unsigned int xid, struct cifs_tcon *tcon,
 	int buf_type = CIFS_NO_BUFFER;
 	__le16 *utf16_path;
 	__u8 oplock = SMB2_OPLOCK_LEVEL_NONE;
-	struct smb2_file_all_info *pfile_info = NULL;
+	struct cifs_open_info_data data = {};
 
 	oparms = (struct cifs_open_parms) {
 		.tcon = tcon,
@@ -361,20 +360,12 @@ smb3_query_mf_symlink(unsigned int xid, struct cifs_tcon *tcon,
 	if (utf16_path == NULL)
 		return -ENOMEM;
 
-	pfile_info = kzalloc(sizeof(struct smb2_file_all_info) + PATH_MAX * 2,
-			     GFP_KERNEL);
-
-	if (pfile_info == NULL) {
-		kfree(utf16_path);
-		return  -ENOMEM;
-	}
-
-	rc = SMB2_open(xid, &oparms, utf16_path, &oplock, pfile_info, NULL,
+	rc = SMB2_open(xid, &oparms, utf16_path, &oplock, &data, NULL,
 		       NULL, NULL);
 	if (rc)
 		goto qmf_out_open_fail;
 
-	if (pfile_info->EndOfFile != cpu_to_le64(CIFS_MF_SYMLINK_FILE_SIZE)) {
+	if (data.fi.EndOfFile != cpu_to_le64(CIFS_MF_SYMLINK_FILE_SIZE)) {
 		/* it's not a symlink */
 		rc = -ENOENT; /* Is there a better rc to return? */
 		goto qmf_out;
@@ -392,7 +383,6 @@ qmf_out:
 	SMB2_close(xid, tcon, fid.persistent_fid, fid.volatile_fid);
 qmf_out_open_fail:
 	kfree(utf16_path);
-	kfree(pfile_info);
 	return rc;
 }
 
@@ -527,6 +517,7 @@ cifs_hardlink(struct dentry *old_file, struct inode *inode,
 	if (d_really_is_positive(old_file)) {
 		cifsInode = CIFS_I(d_inode(old_file));
 		if (rc == 0) {
+			clear_bit(CIFS_INO_TMPFILE, &cifsInode->flags);
 			spin_lock(&d_inode(old_file)->i_lock);
 			inc_nlink(d_inode(old_file));
 			spin_unlock(&d_inode(old_file)->i_lock);
@@ -568,14 +559,15 @@ int
 cifs_symlink(struct mnt_idmap *idmap, struct inode *inode,
 	     struct dentry *direntry, const char *symname)
 {
-	int rc = -EOPNOTSUPP;
-	unsigned int xid;
-	struct cifs_sb_info *cifs_sb = CIFS_SB(inode->i_sb);
+	struct cifs_sb_info *cifs_sb = CIFS_SB(inode);
+	struct inode *newinode = NULL;
 	struct tcon_link *tlink;
 	struct cifs_tcon *pTcon;
 	const char *full_path;
+	int rc = -EOPNOTSUPP;
+	unsigned int sbflags;
+	unsigned int xid;
 	void *page;
-	struct inode *newinode = NULL;
 
 	if (unlikely(cifs_forced_shutdown(cifs_sb)))
 		return -EIO;
@@ -604,6 +596,7 @@ cifs_symlink(struct mnt_idmap *idmap, struct inode *inode,
 	cifs_dbg(FYI, "symname is %s\n", symname);
 
 	/* BB what if DFS and this volume is on different share? BB */
+	sbflags = cifs_sb_flags(cifs_sb);
 	rc = -EOPNOTSUPP;
 	switch (cifs_symlink_type(cifs_sb)) {
 	case CIFS_SYMLINK_TYPE_UNIX:
@@ -618,14 +611,14 @@ cifs_symlink(struct mnt_idmap *idmap, struct inode *inode,
 		break;
 
 	case CIFS_SYMLINK_TYPE_MFSYMLINKS:
-		if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_MF_SYMLINKS) {
+		if (sbflags & CIFS_MOUNT_MF_SYMLINKS) {
 			rc = create_mf_symlink(xid, pTcon, cifs_sb,
 					       full_path, symname);
 		}
 		break;
 
 	case CIFS_SYMLINK_TYPE_SFU:
-		if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_UNX_EMUL) {
+		if (sbflags & CIFS_MOUNT_UNX_EMUL) {
 			rc = __cifs_sfu_make_node(xid, inode, direntry, pTcon,
 						  full_path, S_IFLNK,
 						  0, symname);
