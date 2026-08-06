@@ -1079,11 +1079,6 @@ static inline int __sev_do_init_locked(int *psp_ret)
 		return __sev_init_locked(psp_ret);
 }
 
-static void snp_set_hsave_pa(void *arg)
-{
-	wrmsrl(MSR_VM_HSAVE_PA, 0);
-}
-
 bool sev_is_snp_ciphertext_hiding_supported(void)
 {
 	struct psp_device *psp = psp_master;
@@ -1377,9 +1372,6 @@ static int __sev_snp_init_locked(int *error, unsigned int max_snp_asid)
 	}
 
 	snp_prepare();
-
-	/* SNP_INIT requires MSR_VM_HSAVE_PA to be cleared on all CPUs. */
-	on_each_cpu(snp_set_hsave_pa, NULL, 1);
 
 	/*
 	 * Starting in SNP firmware v1.52, the SNP_INIT_EX command takes a list
