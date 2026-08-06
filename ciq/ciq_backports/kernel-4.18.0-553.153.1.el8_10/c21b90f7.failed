@@ -1,0 +1,270 @@
+x86/CPU/AMD: Prevent improper isolation of shared resources in Zen2's op cache
+
+jira KERNEL-1444
+cve CVE-2025-54518
+Rebuild_History Non-Buildable kernel-4.18.0-553.153.1.el8_10
+commit-author Prathyushi Nangia <prathyushi.nangia@amd.com>
+commit c21b90f77687075115d989e53a8ec5e2bb427ab1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.153.1.el8_10/c21b90f7.failed
+
+Make sure resources are not improperly shared in the op cache and
+cause instruction corruption this way.
+
+	Signed-off-by: Prathyushi Nangia <prathyushi.nangia@amd.com>
+Co-developed-by: Borislav Petkov (AMD) <bp@alien8.de>
+	Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit c21b90f77687075115d989e53a8ec5e2bb427ab1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/msr-index.h
+#	arch/x86/kernel/cpu/amd.c
+#	tools/arch/x86/include/asm/msr-index.h
+diff --cc arch/x86/include/asm/msr-index.h
+index cf51c6cb0d2e,86554de9a3f5..000000000000
+--- a/arch/x86/include/asm/msr-index.h
++++ b/arch/x86/include/asm/msr-index.h
+@@@ -619,9 -802,19 +619,18 @@@
+  /* AMD Last Branch Record MSRs */
+  #define MSR_AMD64_LBR_SELECT			0xc000010e
+  
+++<<<<<<< HEAD
+++=======
++ /* Zen4 */
++ #define MSR_ZEN4_BP_CFG			0xc001102e
++ #define MSR_ZEN4_BP_CFG_BP_SPEC_REDUCE_BIT 4
++ #define MSR_ZEN4_BP_CFG_SHARED_BTB_FIX_BIT 5
++ #define MSR_ZEN2_BP_CFG_BUG_FIX_BIT	33
++ 
+++>>>>>>> c21b90f77687 (x86/CPU/AMD: Prevent improper isolation of shared resources in Zen2's op cache)
+  /* Fam 19h MSRs */
+ -#define MSR_F19H_UMC_PERF_CTL           0xc0010800
+ -#define MSR_F19H_UMC_PERF_CTR           0xc0010801
+ -
+ -/* Zen 2 */
+ -#define MSR_ZEN2_SPECTRAL_CHICKEN	0xc00110e3
+ -#define MSR_ZEN2_SPECTRAL_CHICKEN_BIT	1
+ +#define MSR_F19H_UMC_PERF_CTL		0xc0010800
+ +#define MSR_F19H_UMC_PERF_CTR		0xc0010801
+  
+  /* Fam 17h MSRs */
+  #define MSR_F17H_IRPERF			0xc00000e9
+diff --cc arch/x86/kernel/cpu/amd.c
+index b4e04a9fa260,2f8e8ff2d000..000000000000
+--- a/arch/x86/kernel/cpu/amd.c
++++ b/arch/x86/kernel/cpu/amd.c
+@@@ -1074,16 -974,84 +1074,91 @@@ static void zenbleed_check(struct cpuin
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void init_amd_zen2(struct cpuinfo_x86 *c)
++ {
++ 	init_spectral_chicken(c);
++ 	fix_erratum_1386(c);
++ 	zen2_zenbleed_check(c);
++ 
++ 	/* Disable RDSEED on AMD Cyan Skillfish because of an error. */
++ 	if (c->x86_model == 0x47 && c->x86_stepping == 0x0) {
++ 		clear_cpu_cap(c, X86_FEATURE_RDSEED);
++ 		msr_clear_bit(MSR_AMD64_CPUID_FN_7, 18);
++ 		pr_emerg("RDSEED is not reliable on this platform; disabling.\n");
++ 	}
++ 
++ 	/* Correct misconfigured CPUID on some clients. */
++ 	clear_cpu_cap(c, X86_FEATURE_INVLPGB);
++ 
++ 	if (!cpu_has(c, X86_FEATURE_HYPERVISOR))
++ 		msr_set_bit(MSR_ZEN4_BP_CFG, MSR_ZEN2_BP_CFG_BUG_FIX_BIT);
++ }
++ 
++ static void init_amd_zen3(struct cpuinfo_x86 *c)
++ {
++ 	if (!cpu_has(c, X86_FEATURE_HYPERVISOR)) {
++ 		/*
++ 		 * Zen3 (Fam19 model < 0x10) parts are not susceptible to
++ 		 * Branch Type Confusion, but predate the allocation of the
++ 		 * BTC_NO bit.
++ 		 */
++ 		if (!cpu_has(c, X86_FEATURE_BTC_NO))
++ 			set_cpu_cap(c, X86_FEATURE_BTC_NO);
++ 	}
++ }
++ 
++ static void init_amd_zen4(struct cpuinfo_x86 *c)
++ {
++ 	if (!cpu_has(c, X86_FEATURE_HYPERVISOR))
++ 		msr_set_bit(MSR_ZEN4_BP_CFG, MSR_ZEN4_BP_CFG_SHARED_BTB_FIX_BIT);
++ 
++ 	/*
++ 	 * These Zen4 SoCs advertise support for virtualized VMLOAD/VMSAVE
++ 	 * in some BIOS versions but they can lead to random host reboots.
++ 	 */
++ 	switch (c->x86_model) {
++ 	case 0x18 ... 0x1f:
++ 	case 0x60 ... 0x7f:
++ 		clear_cpu_cap(c, X86_FEATURE_V_VMSAVE_VMLOAD);
++ 		break;
++ 	}
++ }
++ 
++ static const struct x86_cpu_id zen5_rdseed_microcode[] = {
++ 	ZEN_MODEL_STEP_UCODE(0x1a, 0x02, 0x1, 0x0b00215a),
++ 	ZEN_MODEL_STEP_UCODE(0x1a, 0x08, 0x1, 0x0b008121),
++ 	ZEN_MODEL_STEP_UCODE(0x1a, 0x11, 0x0, 0x0b101054),
++ 	ZEN_MODEL_STEP_UCODE(0x1a, 0x24, 0x0, 0x0b204037),
++ 	ZEN_MODEL_STEP_UCODE(0x1a, 0x44, 0x0, 0x0b404035),
++ 	ZEN_MODEL_STEP_UCODE(0x1a, 0x44, 0x1, 0x0b404108),
++ 	ZEN_MODEL_STEP_UCODE(0x1a, 0x60, 0x0, 0x0b600037),
++ 	ZEN_MODEL_STEP_UCODE(0x1a, 0x68, 0x0, 0x0b608038),
++ 	ZEN_MODEL_STEP_UCODE(0x1a, 0x70, 0x0, 0x0b700037),
++ 	{},
++ };
++ 
++ static void init_amd_zen5(struct cpuinfo_x86 *c)
++ {
++ 	if (!x86_match_min_microcode_rev(zen5_rdseed_microcode)) {
++ 		clear_cpu_cap(c, X86_FEATURE_RDSEED);
++ 		msr_clear_bit(MSR_AMD64_CPUID_FN_7, 18);
++ 		pr_emerg_once("RDSEED32 is broken. Disabling the corresponding CPUID bit.\n");
++ 	}
++ }
++ 
+++>>>>>>> c21b90f77687 (x86/CPU/AMD: Prevent improper isolation of shared resources in Zen2's op cache)
+  static void init_amd(struct cpuinfo_x86 *c)
+  {
+ -	u64 vm_cr;
+ -
+  	early_init_amd(c);
+  
+ +	/*
+ +	 * Bit 31 in normal CPUID used for nonstandard 3DNow ID;
+ +	 * 3DNow is IDd by bit 31 in extended CPUID (1*32+31) anyway
+ +	 */
+ +	clear_cpu_cap(c, 0*32+31);
+ +
+  	if (c->x86 >= 0x10)
+  		set_cpu_cap(c, X86_FEATURE_REP_GOOD);
+  
+diff --cc tools/arch/x86/include/asm/msr-index.h
+index 265c3eb6970d,eff29645719b..000000000000
+--- a/tools/arch/x86/include/asm/msr-index.h
++++ b/tools/arch/x86/include/asm/msr-index.h
+@@@ -492,8 -704,107 +492,59 @@@
+  #define MSR_AMD64_SEV			0xc0010131
+  #define MSR_AMD64_SEV_ENABLED_BIT	0
+  #define MSR_AMD64_SEV_ENABLED		BIT_ULL(MSR_AMD64_SEV_ENABLED_BIT)
+ -#define MSR_AMD64_SEV_ES_ENABLED_BIT	1
+ -#define MSR_AMD64_SEV_ES_ENABLED	BIT_ULL(MSR_AMD64_SEV_ES_ENABLED_BIT)
+ -#define MSR_AMD64_SEV_SNP_ENABLED_BIT	2
+ -#define MSR_AMD64_SEV_SNP_ENABLED	BIT_ULL(MSR_AMD64_SEV_SNP_ENABLED_BIT)
+ -#define MSR_AMD64_SNP_VTOM_BIT		3
+ -#define MSR_AMD64_SNP_VTOM		BIT_ULL(MSR_AMD64_SNP_VTOM_BIT)
+ -#define MSR_AMD64_SNP_REFLECT_VC_BIT	4
+ -#define MSR_AMD64_SNP_REFLECT_VC	BIT_ULL(MSR_AMD64_SNP_REFLECT_VC_BIT)
+ -#define MSR_AMD64_SNP_RESTRICTED_INJ_BIT 5
+ -#define MSR_AMD64_SNP_RESTRICTED_INJ	BIT_ULL(MSR_AMD64_SNP_RESTRICTED_INJ_BIT)
+ -#define MSR_AMD64_SNP_ALT_INJ_BIT	6
+ -#define MSR_AMD64_SNP_ALT_INJ		BIT_ULL(MSR_AMD64_SNP_ALT_INJ_BIT)
+ -#define MSR_AMD64_SNP_DEBUG_SWAP_BIT	7
+ -#define MSR_AMD64_SNP_DEBUG_SWAP	BIT_ULL(MSR_AMD64_SNP_DEBUG_SWAP_BIT)
+ -#define MSR_AMD64_SNP_PREVENT_HOST_IBS_BIT 8
+ -#define MSR_AMD64_SNP_PREVENT_HOST_IBS	BIT_ULL(MSR_AMD64_SNP_PREVENT_HOST_IBS_BIT)
+ -#define MSR_AMD64_SNP_BTB_ISOLATION_BIT	9
+ -#define MSR_AMD64_SNP_BTB_ISOLATION	BIT_ULL(MSR_AMD64_SNP_BTB_ISOLATION_BIT)
+ -#define MSR_AMD64_SNP_VMPL_SSS_BIT	10
+ -#define MSR_AMD64_SNP_VMPL_SSS		BIT_ULL(MSR_AMD64_SNP_VMPL_SSS_BIT)
+ -#define MSR_AMD64_SNP_SECURE_TSC_BIT	11
+ -#define MSR_AMD64_SNP_SECURE_TSC	BIT_ULL(MSR_AMD64_SNP_SECURE_TSC_BIT)
+ -#define MSR_AMD64_SNP_VMGEXIT_PARAM_BIT	12
+ -#define MSR_AMD64_SNP_VMGEXIT_PARAM	BIT_ULL(MSR_AMD64_SNP_VMGEXIT_PARAM_BIT)
+ -#define MSR_AMD64_SNP_RESERVED_BIT13	BIT_ULL(13)
+ -#define MSR_AMD64_SNP_IBS_VIRT_BIT	14
+ -#define MSR_AMD64_SNP_IBS_VIRT		BIT_ULL(MSR_AMD64_SNP_IBS_VIRT_BIT)
+ -#define MSR_AMD64_SNP_RESERVED_BIT15	BIT_ULL(15)
+ -#define MSR_AMD64_SNP_VMSA_REG_PROT_BIT	16
+ -#define MSR_AMD64_SNP_VMSA_REG_PROT	BIT_ULL(MSR_AMD64_SNP_VMSA_REG_PROT_BIT)
+ -#define MSR_AMD64_SNP_SMT_PROT_BIT	17
+ -#define MSR_AMD64_SNP_SMT_PROT		BIT_ULL(MSR_AMD64_SNP_SMT_PROT_BIT)
+ -#define MSR_AMD64_SNP_SECURE_AVIC_BIT	18
+ -#define MSR_AMD64_SNP_SECURE_AVIC	BIT_ULL(MSR_AMD64_SNP_SECURE_AVIC_BIT)
+ -#define MSR_AMD64_SNP_RESERVED_BITS19_22 GENMASK_ULL(22, 19)
+ -#define MSR_AMD64_SNP_IBPB_ON_ENTRY_BIT	23
+ -#define MSR_AMD64_SNP_IBPB_ON_ENTRY	BIT_ULL(MSR_AMD64_SNP_IBPB_ON_ENTRY_BIT)
+ -#define MSR_AMD64_SNP_RESV_BIT		24
+ -#define MSR_AMD64_SNP_RESERVED_MASK	GENMASK_ULL(63, MSR_AMD64_SNP_RESV_BIT)
+ -#define MSR_AMD64_SAVIC_CONTROL		0xc0010138
+ -#define MSR_AMD64_SAVIC_EN_BIT		0
+ -#define MSR_AMD64_SAVIC_EN		BIT_ULL(MSR_AMD64_SAVIC_EN_BIT)
+ -#define MSR_AMD64_SAVIC_ALLOWEDNMI_BIT	1
+ -#define MSR_AMD64_SAVIC_ALLOWEDNMI	BIT_ULL(MSR_AMD64_SAVIC_ALLOWEDNMI_BIT)
+ -#define MSR_AMD64_RMP_BASE		0xc0010132
+ -#define MSR_AMD64_RMP_END		0xc0010133
+ -#define MSR_AMD64_RMP_CFG		0xc0010136
+ -#define MSR_AMD64_SEG_RMP_ENABLED_BIT	0
+ -#define MSR_AMD64_SEG_RMP_ENABLED	BIT_ULL(MSR_AMD64_SEG_RMP_ENABLED_BIT)
+ -#define MSR_AMD64_RMP_SEGMENT_SHIFT(x)	(((x) & GENMASK_ULL(13, 8)) >> 8)
+  
+++<<<<<<< HEAD
+ +#define MSR_AMD64_VIRT_SPEC_CTRL	0xc001011f
+++=======
++ #define MSR_SVSM_CAA			0xc001f000
++ 
++ /* AMD Collaborative Processor Performance Control MSRs */
++ #define MSR_AMD_CPPC_CAP1		0xc00102b0
++ #define MSR_AMD_CPPC_ENABLE		0xc00102b1
++ #define MSR_AMD_CPPC_CAP2		0xc00102b2
++ #define MSR_AMD_CPPC_REQ		0xc00102b3
++ #define MSR_AMD_CPPC_STATUS		0xc00102b4
++ 
++ /* Masks for use with MSR_AMD_CPPC_CAP1 */
++ #define AMD_CPPC_LOWEST_PERF_MASK	GENMASK(7, 0)
++ #define AMD_CPPC_LOWNONLIN_PERF_MASK	GENMASK(15, 8)
++ #define AMD_CPPC_NOMINAL_PERF_MASK	GENMASK(23, 16)
++ #define AMD_CPPC_HIGHEST_PERF_MASK	GENMASK(31, 24)
++ 
++ /* Masks for use with MSR_AMD_CPPC_REQ */
++ #define AMD_CPPC_MAX_PERF_MASK		GENMASK(7, 0)
++ #define AMD_CPPC_MIN_PERF_MASK		GENMASK(15, 8)
++ #define AMD_CPPC_DES_PERF_MASK		GENMASK(23, 16)
++ #define AMD_CPPC_EPP_PERF_MASK		GENMASK(31, 24)
++ 
++ /* AMD Performance Counter Global Status and Control MSRs */
++ #define MSR_AMD64_PERF_CNTR_GLOBAL_STATUS	0xc0000300
++ #define MSR_AMD64_PERF_CNTR_GLOBAL_CTL		0xc0000301
++ #define MSR_AMD64_PERF_CNTR_GLOBAL_STATUS_CLR	0xc0000302
++ #define MSR_AMD64_PERF_CNTR_GLOBAL_STATUS_SET	0xc0000303
++ 
++ /* AMD Hardware Feedback Support MSRs */
++ #define MSR_AMD_WORKLOAD_CLASS_CONFIG		0xc0000500
++ #define MSR_AMD_WORKLOAD_CLASS_ID		0xc0000501
++ #define MSR_AMD_WORKLOAD_HRST			0xc0000502
++ 
++ /* AMD Last Branch Record MSRs */
++ #define MSR_AMD64_LBR_SELECT			0xc000010e
++ 
++ /* Zen4 */
++ #define MSR_ZEN4_BP_CFG			0xc001102e
++ #define MSR_ZEN4_BP_CFG_BP_SPEC_REDUCE_BIT 4
++ #define MSR_ZEN4_BP_CFG_SHARED_BTB_FIX_BIT 5
++ #define MSR_ZEN2_BP_CFG_BUG_FIX_BIT	33
++ 
++ /* Fam 19h MSRs */
++ #define MSR_F19H_UMC_PERF_CTL           0xc0010800
++ #define MSR_F19H_UMC_PERF_CTR           0xc0010801
++ 
++ /* Zen 2 */
++ #define MSR_ZEN2_SPECTRAL_CHICKEN	0xc00110e3
++ #define MSR_ZEN2_SPECTRAL_CHICKEN_BIT	1
+++>>>>>>> c21b90f77687 (x86/CPU/AMD: Prevent improper isolation of shared resources in Zen2's op cache)
+  
+  /* Fam 17h MSRs */
+  #define MSR_F17H_IRPERF			0xc00000e9
+* Unmerged path arch/x86/include/asm/msr-index.h
+* Unmerged path arch/x86/kernel/cpu/amd.c
+* Unmerged path tools/arch/x86/include/asm/msr-index.h
