@@ -416,7 +416,6 @@ void tcp_twsk_destructor(struct sock *sk)
 	tcp_ao_destroy_sock(sk, true);
 	psp_twsk_assoc_free(inet_twsk(sk));
 }
-EXPORT_SYMBOL_GPL(tcp_twsk_destructor);
 
 void tcp_twsk_purge(struct list_head *net_exit_list)
 {
