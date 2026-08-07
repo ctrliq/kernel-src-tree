@@ -163,7 +163,7 @@ Summary: The Linux kernel
 %define debugbuildsenabled 1
 %define el_version 9
 %define kernel_major_minor 6.12
-%define kernel_patch 101
+%define kernel_patch 102
 %define buildid .1
 %define specversion %{kernel_major_minor}.%{kernel_patch}
 %define pkgrelease 1%{?buildid}
@@ -4179,8 +4179,10 @@ fi\
 #
 #
 %changelog
-* Mon Aug 03 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.12.101-1.1.el9
--- Rebased changes for Linux 6.12.101 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.12.101-1)
+* Fri Aug 07 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.12.102-1.1.el9
+-- Rebased changes for Linux 6.12.102 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.12.102-1)
+-- Spec change: kmod+kpatch certs in unsigned builds (Skip Grube)
+-- [CIQ] v6.12.101 - updated spec (github-actions[bot])
 -- [CIQ] v6.12.99 - updated spec (github-actions[bot])
 -- spec: backport --entry-type support to kernel-install preun (Brett Mastbergen)
 -- [CIQ] v6.12.98 - updated spec (github-actions[bot])
@@ -4260,7 +4262,7 @@ fi\
 -- arm64: add kernel config option to lock down when in Secure Boot mode (Linn Crosetto)
 -- github actions: Make Builds on Merge Request Work (Jonathan Maple)
 -- Add CIQ configs (Jonathan Maple)
--- Linux 6.12.101 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.12.101)
+-- Linux 6.12.102 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.12.102)
 
 
 ###
