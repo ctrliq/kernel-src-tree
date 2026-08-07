@@ -166,7 +166,6 @@ Summary: The Linux kernel
 #  to build the base kernel using the debug configuration. (Specifying
 #  the --with-release option overrides this setting.)
 %define debugbuildsenabled 1
-%define el_version 9
 %define kernel_major_minor 6.18
 %define kernel_patch 43
 %define buildid .1
@@ -174,7 +173,7 @@ Summary: The Linux kernel
 %define pkgrelease 1%{?buildid}
 %define kversion %{lua:print((rpm.expand("%{kernel_major_minor}"):match("^(%d+)")))}
 
-%define tarfile_release %{specversion}-%{pkgrelease}.el%{el_version}
+%define tarfile_release %{specversion}-%{pkgrelease}.el%{rhel}
 # This is needed to do merge window version magic
 %define patchlevel %{lua:print((rpm.expand("%{kernel_major_minor}"):match("%.(%d+)$")))}
 # This allows pkg_release to have configurable %%{?dist} tag
@@ -757,6 +756,9 @@ BuildRequires: zstd
 %endif
 BuildRequires: gcc, binutils, redhat-rpm-config, hmaccalc, bison, flex, gcc-c++
 BuildRequires: rust, rust-src, rustfmt, clippy
+%if 0%{?rhel} >= 10
+BuildRequires: bindgen-cli
+%endif
 BuildRequires: net-tools, hostname, bc, elfutils-devel
 BuildRequires: dwarves
 BuildRequires: python3
@@ -1169,8 +1171,10 @@ Source3002: Patchlist.changelog
 
 Source4000: README.rst
 
-# Bundled bindgen-cli source (not packaged in Rocky 9.6)
+# Bundled bindgen-cli source (not packaged in Rocky 9)
+%if 0%{?rhel} < 10
 Source5000: bindgen-cli.tar.gz
+%endif
 
 ## Patches needed for building this package
 
@@ -2287,8 +2291,9 @@ cp_vmlinux()
 %define build_hostldflags %{?build_ldflags}
 %endif
 
-# Build bundled bindgen and add to PATH
-%{log_msg "Build bindgen"}
+%if 0%{?rhel} < 10
+# Build bundled bindgen and add to PATH (not packaged in Rocky 9)
+%{log_msg "Build bundled bindgen"}
 BINDGEN_DIR=$RPM_BUILD_ROOT/bindgen
 BINDGEN_BUNDLE_NAME=$(basename %{SOURCE5000} .tar.gz)
 mkdir -p $BINDGEN_DIR
@@ -2297,6 +2302,9 @@ pushd $BINDGEN_DIR/$BINDGEN_BUNDLE_NAME
 cargo build --offline --frozen --release
 export PATH="$PWD/target/release:$PATH"
 popd
+%else
+%{log_msg "Using system bindgen"}
+%endif
 bindgen --version
 
 %define make %{__make} %{?cross_opts} %{?make_opts} HOSTCFLAGS="%{?build_hostcflags}" HOSTLDFLAGS="%{?build_hostldflags}"
