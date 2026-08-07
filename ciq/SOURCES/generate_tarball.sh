@@ -15,7 +15,20 @@ KERNEL_MAJOR_MINOR=$(grep '^%define kernel_major_minor' "$SPEC_FILE" | awk '{pri
 KERNEL_PATCH=$(grep '^%define kernel_patch' "$SPEC_FILE" | awk '{print $3}')
 BUILDID=$(grep '^%define buildid' "$SPEC_FILE" | awk '{print $3}')
 PKGRELEASE=$(grep '^%define pkgrelease' "$SPEC_FILE" | awk '{print $3}')
-EL_VERSION=$(grep '^%define el_version' "$SPEC_FILE" | awk '{print $3}')
+
+# el_version can be passed as first argument, or falls back to the buildroot's
+# %{rhel} macro (matching the spec's %{!?el_version: %define el_version %{rhel}}).
+if [ -n "$1" ]; then
+    EL_VERSION="$1"
+else
+    EL_VERSION=$(rpm --eval '%{rhel}' 2>/dev/null)
+    if [ -z "$EL_VERSION" ] || echo "$EL_VERSION" | grep -q '%{'; then
+        echo "Error: Could not determine el_version."
+        echo "Usage: $0 [el_version]"
+        echo "  e.g. $0 9   or   $0 10"
+        exit 1
+    fi
+fi
 
 if [ -z "$KERNEL_MAJOR_MINOR" ] || [ -z "$KERNEL_PATCH" ] || [ -z "$PKGRELEASE" ] || [ -z "$EL_VERSION" ]; then
     echo "Error: Could not extract kernel version from $SPEC_FILE"
