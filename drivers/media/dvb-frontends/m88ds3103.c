@@ -1938,10 +1938,10 @@ static void m88ds3103_remove(struct i2c_client *client)
 }
 
 static const struct i2c_device_id m88ds3103_id_table[] = {
-	{"m88ds3103",  M88DS3103_CHIPTYPE_3103},
-	{"m88rs6000",  M88DS3103_CHIPTYPE_RS6000},
-	{"m88ds3103b", M88DS3103_CHIPTYPE_3103B},
-	{}
+	{ .name = "m88ds3103", .driver_data = M88DS3103_CHIPTYPE_3103 },
+	{ .name = "m88rs6000", .driver_data = M88DS3103_CHIPTYPE_RS6000 },
+	{ .name = "m88ds3103b", .driver_data = M88DS3103_CHIPTYPE_3103B },
+	{ }
 };
 MODULE_DEVICE_TABLE(i2c, m88ds3103_id_table);
 
