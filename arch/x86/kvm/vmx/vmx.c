@@ -106,7 +106,7 @@ module_param_named(unrestricted_guest,
 bool __read_mostly enable_ept_ad_bits = 1;
 module_param_named(eptad, enable_ept_ad_bits, bool, 0444);
 
-bool __read_mostly enable_cet = 1;
+bool __read_mostly enable_cet = 0;
 module_param_named(cet, enable_cet, bool, 0444);
 
 static bool __read_mostly emulate_invalid_guest_state = true;
