@@ -89,7 +89,7 @@ static void aplic_save_states(struct aplic_priv *priv)
 	}
 }
 
-static int aplic_syscore_suspend(void *data)
+static int aplic_syscore_suspend(void)
 {
 	struct aplic_priv *priv;
 
@@ -99,7 +99,7 @@ static int aplic_syscore_suspend(void *data)
 	return 0;
 }
 
-static void aplic_syscore_resume(void *data)
+static void aplic_syscore_resume(void)
 {
 	struct aplic_priv *priv;
 
@@ -112,16 +112,12 @@ static struct syscore_ops aplic_syscore_ops = {
 	.resume = aplic_syscore_resume,
 };
 
-static struct syscore aplic_syscore = {
-	.ops = &aplic_syscore_ops,
-};
-
 static bool aplic_syscore_registered __ro_after_init;
 
 static void aplic_syscore_init(void)
 {
 	if (!aplic_syscore_registered) {
-		register_syscore(&aplic_syscore);
+		register_syscore_ops(&aplic_syscore_ops);
 		aplic_syscore_registered = true;
 	}
 }
