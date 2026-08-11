@@ -15,7 +15,7 @@ struct mmap_state {
 	unsigned long end;
 	pgoff_t pgoff;
 	unsigned long pglen;
-	unsigned long flags;
+	vm_flags_t vm_flags;
 	struct file *file;
 	pgprot_t page_prot;
 
@@ -32,9 +32,12 @@ struct mmap_state {
 	struct vma_munmap_struct vms;
 	struct ma_state mas_detach;
 	struct maple_tree mt_detach;
+
+	/* Determine if we can check KSM flags early in mmap() logic. */
+	bool check_ksm_early;
 };
 
-#define MMAP_STATE(name, mm_, vmi_, addr_, len_, pgoff_, flags_, file_) \
+#define MMAP_STATE(name, mm_, vmi_, addr_, len_, pgoff_, vm_flags_, file_) \
 	struct mmap_state name = {					\
 		.mm = mm_,						\
 		.vmi = vmi_,						\
@@ -42,9 +45,9 @@ struct mmap_state {
 		.end = (addr_) + (len_),				\
 		.pgoff = pgoff_,					\
 		.pglen = PHYS_PFN(len_),				\
-		.flags = flags_,					\
+		.vm_flags = vm_flags_,					\
 		.file = file_,						\
-		.page_prot = vm_get_page_prot(flags_),			\
+		.page_prot = vm_get_page_prot(vm_flags_),		\
 	}
 
 #define VMG_MMAP_STATE(name, map_, vma_)				\
@@ -53,7 +56,7 @@ struct mmap_state {
 		.vmi = (map_)->vmi,					\
 		.start = (map_)->addr,					\
 		.end = (map_)->end,					\
-		.flags = (map_)->flags,					\
+		.vm_flags = (map_)->vm_flags,				\
 		.pgoff = (map_)->pgoff,					\
 		.file = (map_)->file,					\
 		.prev = (map_)->prev,					\
@@ -92,7 +95,7 @@ static inline bool is_mergeable_vma(struct vma_merge_struct *vmg, bool merge_nex
 	 * the kernel to generate new VMAs when old one could be
 	 * extended instead.
 	 */
-	if ((vma->vm_flags ^ vmg->flags) & ~VM_SOFTDIRTY)
+	if ((vma->vm_flags ^ vmg->vm_flags) & ~VM_SOFTDIRTY)
 		return false;
 	if (vma->vm_file != vmg->file)
 		return false;
@@ -840,7 +843,7 @@ static __must_check struct vm_area_struct *vma_merge_existing_range(
 	 * furthermost left or right side of the VMA, then we have no chance of
 	 * merging and should abort.
 	 */
-	if (vmg->flags & VM_SPECIAL || (!left_side && !right_side))
+	if (vmg->vm_flags & VM_SPECIAL || (!left_side && !right_side))
 		return NULL;
 
 	if (left_side)
@@ -970,7 +973,7 @@ static __must_check struct vm_area_struct *vma_merge_existing_range(
 	if (err || commit_merge(vmg))
 		goto abort;
 
-	khugepaged_enter_vma(vmg->target, vmg->flags);
+	khugepaged_enter_vma(vmg->target, vmg->vm_flags);
 	vmg->state = VMA_MERGE_SUCCESS;
 	return vmg->target;
 
@@ -1052,7 +1055,7 @@ struct vm_area_struct *vma_merge_new_range(struct vma_merge_struct *vmg)
 	vmg->state = VMA_MERGE_NOMERGE;
 
 	/* Special VMAs are unmergeable, also if no prev/next. */
-	if ((vmg->flags & VM_SPECIAL) || (!prev && !next))
+	if ((vmg->vm_flags & VM_SPECIAL) || (!prev && !next))
 		return NULL;
 
 	can_merge_left = can_vma_merge_left(vmg);
@@ -1090,7 +1093,7 @@ struct vm_area_struct *vma_merge_new_range(struct vma_merge_struct *vmg)
 	 * following VMA if we have VMAs on both sides.
 	 */
 	if (vmg->target && !vma_expand(vmg)) {
-		khugepaged_enter_vma(vmg->target, vmg->flags);
+		khugepaged_enter_vma(vmg->target, vmg->vm_flags);
 		vmg->state = VMA_MERGE_SUCCESS;
 		return vmg->target;
 	}
@@ -1348,7 +1351,7 @@ static int vms_gather_munmap_vmas(struct vma_munmap_struct *vms,
 		}
 
 		/* Don't bother splitting the VMA if we can't unmap it anyway */
-		if (!can_modify_vma(vms->vma)) {
+		if (vma_is_sealed(vms->vma)) {
 			error = -EPERM;
 			goto start_split_failed;
 		}
@@ -1368,7 +1371,7 @@ static int vms_gather_munmap_vmas(struct vma_munmap_struct *vms,
 	for_each_vma_range(*(vms->vmi), next, vms->end) {
 		long nrpages;
 
-		if (!can_modify_vma(next)) {
+		if (vma_is_sealed(next)) {
 			error = -EPERM;
 			goto modify_vma_failed;
 		}
@@ -1637,27 +1640,25 @@ static struct vm_area_struct *vma_modify(struct vma_merge_struct *vmg)
 struct vm_area_struct *vma_modify_flags(
 	struct vma_iterator *vmi, struct vm_area_struct *prev,
 	struct vm_area_struct *vma, unsigned long start, unsigned long end,
-	unsigned long new_flags)
+	vm_flags_t vm_flags)
 {
 	VMG_VMA_STATE(vmg, vmi, prev, vma, start, end);
 
-	vmg.flags = new_flags;
+	vmg.vm_flags = vm_flags;
 
 	return vma_modify(&vmg);
 }
 
 struct vm_area_struct
-*vma_modify_flags_name(struct vma_iterator *vmi,
+*vma_modify_name(struct vma_iterator *vmi,
 		       struct vm_area_struct *prev,
 		       struct vm_area_struct *vma,
 		       unsigned long start,
 		       unsigned long end,
-		       unsigned long new_flags,
 		       struct anon_vma_name *new_name)
 {
 	VMG_VMA_STATE(vmg, vmi, prev, vma, start, end);
 
-	vmg.flags = new_flags;
 	vmg.anon_name = new_name;
 
 	return vma_modify(&vmg);
@@ -1682,13 +1683,13 @@ struct vm_area_struct
 		       struct vm_area_struct *prev,
 		       struct vm_area_struct *vma,
 		       unsigned long start, unsigned long end,
-		       unsigned long new_flags,
+		       vm_flags_t vm_flags,
 		       struct vm_userfaultfd_ctx new_ctx,
 		       bool give_up_on_oom)
 {
 	VMG_VMA_STATE(vmg, vmi, prev, vma, start, end);
 
-	vmg.flags = new_flags;
+	vmg.vm_flags = vm_flags;
 	vmg.uffd_ctx = new_ctx;
 	if (give_up_on_oom)
 		vmg.give_up_on_oom = true;
@@ -2322,6 +2323,11 @@ static void vms_abort_munmap_vmas(struct vma_munmap_struct *vms,
 	vms_complete_munmap_vmas(vms, mas_detach);
 }
 
+static void update_ksm_flags(struct mmap_state *map)
+{
+	map->vm_flags = ksm_vma_flags(map->mm, map->file, map->vm_flags);
+}
+
 /*
  * __mmap_prepare() - Prepare to gather any overlapping VMAs that need to be
  * unmapped once the map operation is completed, check limits, account mapping
@@ -2364,11 +2370,11 @@ static int __mmap_prepare(struct mmap_state *map, struct list_head *uf)
 	}
 
 	/* Check against address space limit. */
-	if (!may_expand_vm(map->mm, map->flags, map->pglen - vms->nr_pages))
+	if (!may_expand_vm(map->mm, map->vm_flags, map->pglen - vms->nr_pages))
 		return -ENOMEM;
 
 	/* Private writable mapping: check memory availability. */
-	if (accountable_mapping(map->file, map->flags)) {
+	if (accountable_mapping(map->file, map->vm_flags)) {
 		map->charged = map->pglen;
 		map->charged -= vms->nr_accounted;
 		if (map->charged) {
@@ -2378,7 +2384,7 @@ static int __mmap_prepare(struct mmap_state *map, struct list_head *uf)
 		}
 
 		vms->nr_accounted = 0;
-		map->flags |= VM_ACCOUNT;
+		map->vm_flags |= VM_ACCOUNT;
 	}
 
 	/*
@@ -2422,11 +2428,12 @@ static int __mmap_new_file_vma(struct mmap_state *map,
 	 * Drivers should not permit writability when previously it was
 	 * disallowed.
 	 */
-	VM_WARN_ON_ONCE(map->flags != vma->vm_flags &&
-			!(map->flags & VM_MAYWRITE) &&
+	VM_WARN_ON_ONCE(map->vm_flags != vma->vm_flags &&
+			!(map->vm_flags & VM_MAYWRITE) &&
 			(vma->vm_flags & VM_MAYWRITE));
 
-	map->flags = vma->vm_flags;
+	map->file = vma->vm_file;
+	map->vm_flags = vma->vm_flags;
 
 	return 0;
 }
@@ -2457,7 +2464,7 @@ static int __mmap_new_vma(struct mmap_state *map, struct vm_area_struct **vmap)
 
 	vma_iter_config(vmi, map->addr, map->end);
 	vma_set_range(vma, map->addr, map->end, map->pgoff);
-	vm_flags_init(vma, map->flags);
+	vm_flags_init(vma, map->vm_flags);
 	vma->vm_page_prot = map->page_prot;
 
 	if (vma_iter_prealloc(vmi, vma)) {
@@ -2467,7 +2474,7 @@ static int __mmap_new_vma(struct mmap_state *map, struct vm_area_struct **vmap)
 
 	if (map->file)
 		error = __mmap_new_file_vma(map, vma);
-	else if (map->flags & VM_SHARED)
+	else if (map->vm_flags & VM_SHARED)
 		error = shmem_zero_setup(vma);
 	else
 		vma_set_anonymous(vma);
@@ -2475,9 +2482,14 @@ static int __mmap_new_vma(struct mmap_state *map, struct vm_area_struct **vmap)
 	if (error)
 		goto free_iter_vma;
 
+	if (!map->check_ksm_early) {
+		update_ksm_flags(map);
+		vm_flags_init(vma, map->vm_flags);
+	}
+
 #ifdef CONFIG_SPARC64
 	/* TODO: Fix SPARC ADI! */
-	WARN_ON_ONCE(!arch_validate_flags(map->flags));
+	WARN_ON_ONCE(!arch_validate_flags(map->vm_flags));
 #endif
 
 	/* Lock the VMA since it is modified after insertion into VMA tree */
@@ -2491,8 +2503,7 @@ static int __mmap_new_vma(struct mmap_state *map, struct vm_area_struct **vmap)
 	 * call covers the non-merge case.
 	 */
 	if (!vma_is_anonymous(vma))
-		khugepaged_enter_vma(vma, map->flags);
-	ksm_add_vma(vma);
+		khugepaged_enter_vma(vma, map->vm_flags);
 	*vmap = vma;
 	return 0;
 
@@ -2513,7 +2524,7 @@ free_vma:
 static void __mmap_complete(struct mmap_state *map, struct vm_area_struct *vma)
 {
 	struct mm_struct *mm = map->mm;
-	unsigned long vm_flags = vma->vm_flags;
+	vm_flags_t vm_flags = vma->vm_flags;
 
 	perf_event_mmap(vma);
 
@@ -2566,7 +2577,7 @@ static int call_mmap_prepare(struct mmap_state *map)
 
 		.pgoff = map->pgoff,
 		.file = map->file,
-		.vm_flags = map->flags,
+		.vm_flags = map->vm_flags,
 		.page_prot = map->page_prot,
 	};
 
@@ -2578,7 +2589,7 @@ static int call_mmap_prepare(struct mmap_state *map)
 	/* Update fields permitted to be changed. */
 	map->pgoff = desc.pgoff;
 	map->file = desc.file;
-	map->flags = desc.vm_flags;
+	map->vm_flags = desc.vm_flags;
 	map->page_prot = desc.page_prot;
 	/* User-defined fields. */
 	map->vm_ops = desc.vm_ops;
@@ -2595,6 +2606,35 @@ static void set_vma_user_defined_fields(struct vm_area_struct *vma,
 	vma->vm_private_data = map->vm_private_data;
 }
 
+/*
+ * Are we guaranteed no driver can change state such as to preclude KSM merging?
+ * If so, let's set the KSM mergeable flag early so we don't break VMA merging.
+ */
+static bool can_set_ksm_flags_early(struct mmap_state *map)
+{
+	struct file *file = map->file;
+
+	/* Anonymous mappings have no driver which can change them. */
+	if (!file)
+		return true;
+
+	/*
+	 * If .mmap_prepare() is specified, then the driver will have already
+	 * manipulated state prior to updating KSM flags. So no need to worry
+	 * about mmap callbacks modifying VMA flags after the KSM flag has been
+	 * updated here, which could otherwise affect KSM eligibility.
+	 */
+	if (file->f_op->mmap_prepare)
+		return true;
+
+	/* shmem is safe. */
+	if (shmem_file(file))
+		return true;
+
+	/* Any other .mmap callback is not safe. */
+	return false;
+}
+
 static unsigned long __mmap_region(struct file *file, unsigned long addr,
 		unsigned long len, vm_flags_t vm_flags, unsigned long pgoff,
 		struct list_head *uf)
@@ -2606,11 +2646,16 @@ static unsigned long __mmap_region(struct file *file, unsigned long addr,
 	VMA_ITERATOR(vmi, mm, addr);
 	MMAP_STATE(map, mm, &vmi, addr, len, pgoff, vm_flags, file);
 
+	map.check_ksm_early = can_set_ksm_flags_early(&map);
+
 	error = __mmap_prepare(&map, uf);
 	if (!error && have_mmap_prepare)
 		error = call_mmap_prepare(&map);
 	if (error)
 		goto abort_munmap;
+
+	if (map.check_ksm_early)
+		update_ksm_flags(&map);
 
 	/* Attempt to merge with adjacent VMAs... */
 	if (map.prev || map.next) {
@@ -2707,14 +2752,14 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
  * @addr: The start address
  * @len: The length of the increase
  * @vma: The vma,
- * @flags: The VMA Flags
+ * @vm_flags: The VMA Flags
  *
  * Extend the brk VMA from addr to addr + len.  If the VMA is NULL or the flags
  * do not match then create a new anonymous VMA.  Eventually we may be able to
  * do some brk-specific accounting here.
  */
 int do_brk_flags(struct vma_iterator *vmi, struct vm_area_struct *vma,
-		 unsigned long addr, unsigned long len, unsigned long flags)
+		 unsigned long addr, unsigned long len, vm_flags_t vm_flags)
 {
 	struct mm_struct *mm = current->mm;
 
@@ -2722,8 +2767,9 @@ int do_brk_flags(struct vma_iterator *vmi, struct vm_area_struct *vma,
 	 * Check against address space limits by the changed size
 	 * Note: This happens *after* clearing old mappings in some code paths.
 	 */
-	flags |= VM_DATA_DEFAULT_FLAGS | VM_ACCOUNT | mm->def_flags;
-	if (!may_expand_vm(mm, flags, len >> PAGE_SHIFT))
+	vm_flags |= VM_DATA_DEFAULT_FLAGS | VM_ACCOUNT | mm->def_flags;
+	vm_flags = ksm_vma_flags(mm, NULL, vm_flags);
+	if (!may_expand_vm(mm, vm_flags, len >> PAGE_SHIFT))
 		return -ENOMEM;
 
 	if (mm->map_count > sysctl_max_map_count)
@@ -2737,7 +2783,7 @@ int do_brk_flags(struct vma_iterator *vmi, struct vm_area_struct *vma,
 	 * occur after forking, so the expand will only happen on new VMAs.
 	 */
 	if (vma && vma->vm_end == addr) {
-		VMG_STATE(vmg, mm, vmi, addr, addr + len, flags, PHYS_PFN(addr));
+		VMG_STATE(vmg, mm, vmi, addr, addr + len, vm_flags, PHYS_PFN(addr));
 
 		vmg.prev = vma;
 		/* vmi is positioned at prev, which this mode expects. */
@@ -2758,20 +2804,19 @@ int do_brk_flags(struct vma_iterator *vmi, struct vm_area_struct *vma,
 
 	vma_set_anonymous(vma);
 	vma_set_range(vma, addr, addr + len, addr >> PAGE_SHIFT);
-	vm_flags_init(vma, flags);
-	vma->vm_page_prot = vm_get_page_prot(flags);
+	vm_flags_init(vma, vm_flags);
+	vma->vm_page_prot = vm_get_page_prot(vm_flags);
 	vma_start_write(vma);
 	if (vma_iter_store_gfp(vmi, vma, GFP_KERNEL))
 		goto mas_store_fail;
 
 	mm->map_count++;
 	validate_mm(mm);
-	ksm_add_vma(vma);
 out:
 	perf_event_mmap(vma);
 	mm->total_vm += len >> PAGE_SHIFT;
 	mm->data_vm += len >> PAGE_SHIFT;
-	if (flags & VM_LOCKED)
+	if (vm_flags & VM_LOCKED)
 		mm->locked_vm += (len >> PAGE_SHIFT);
 	vm_flags_set(vma, VM_SOFTDIRTY);
 	return 0;
