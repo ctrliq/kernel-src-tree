@@ -338,7 +338,7 @@ lock_default_rng(struct crypto_rng **rng) __acquires(&cri->lock)
 		 *
 		 * Note that this task may be migrated to a different CPU now!
 		 */
-		local_unlock(&cri->lock);
+		__local_unlock(&cri->lock);
 		rt_mutex_lock(&cri->mlock);
 		if (!cri->rng) {
 			struct crypto_rng *new_rng = NULL;
@@ -411,7 +411,7 @@ do {						\
 	if (reseed)				\
 		rt_mutex_unlock(&(cri)->mlock);	\
 	else					\
-		local_unlock(&(cri)->lock);	\
+		__local_unlock(&(cri)->lock);	\
 } while (0)
 
 static __always_inline void
