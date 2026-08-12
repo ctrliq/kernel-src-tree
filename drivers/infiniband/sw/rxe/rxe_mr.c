@@ -459,7 +459,6 @@ int rxe_flush_pmem_iova(struct rxe_mr *mr, u64 iova, unsigned int length)
 
 		length -= bytes;
 		iova += bytes;
-		page_offset = 0;
 	}
 
 	return 0;
