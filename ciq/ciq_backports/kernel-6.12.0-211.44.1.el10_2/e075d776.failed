@@ -1,0 +1,977 @@
+ice: implement E825 TX ref clock control and TXC hardware sync status
+
+jira KERNEL-1473
+Rebuild_History Non-Buildable kernel-6.12.0-211.44.1.el10_2
+commit-author Grzegorz Nitka <grzegorz.nitka@intel.com>
+commit e075d7768386235f4a08d7e04d02c90ce51fd64e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.44.1.el10_2/e075d776.failed
+
+Build on the previously introduced TXC DPLL framework and implement
+full TX reference clock control and hardware-backed synchronization
+status reporting for E825 devices.
+
+E825 firmware may accept or override TX reference clock requests based
+on device-wide routing constraints and link conditions. Because the
+final selection becomes visible only after a link-up event, the driver
+splits the observation into two complementary signals:
+
+  - TXCLK pin state reflects the requested TX reference clock
+    (pf->ptp.port.tx_clk_req). After a link-up, the value is reconciled
+    against the SERDES reference selector by
+    ice_txclk_update_and_notify(); if firmware or auto-negotiation
+    selected a different clock, tx_clk_req is overwritten so that pin
+    state converges to the actual hardware selection.
+
+  - TXC DPLL lock status reflects hardware synchronization:
+      * LOCKED   when an external TX reference is in use
+      * UNLOCKED when falling back to ENET/TXCO, or when a requested
+        external reference has not (yet) been accepted by hardware.
+
+Userspace observing only pin state therefore sees user intent, while
+lock status is the authoritative indicator of whether the requested
+clock is actually selected and synchronizing. This matches the DPLL
+subsystem model where pin state describes topology and device lock
+status describes signal quality.
+
+TX reference selection topology:
+  - External references (SYNCE, EREF0) are represented as TXCLK pins
+  - The internal ENET/TXCO clock has no pin representation; when
+    selected, all TXCLK pins are reported DISCONNECTED
+
+With this change, TX reference clocks on E825 devices can be reliably
+selected, observed via standard DPLL interfaces, and monitored for
+effective synchronization through TXC DPLL lock status.
+
+	Reviewed-by: Arkadiusz Kubalewski <arkadiusz.kubalewski@intel.com>
+	Signed-off-by: Grzegorz Nitka <grzegorz.nitka@intel.com>
+Link: https://patch.msgid.link/20260607183045.1213735-14-grzegorz.nitka@intel.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit e075d7768386235f4a08d7e04d02c90ce51fd64e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_dpll.c
+#	drivers/net/ethernet/intel/ice/ice_dpll.h
+diff --cc drivers/net/ethernet/intel/ice/ice_dpll.c
+index ef23cf6648f8,462c69cc11e1..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_dpll.c
++++ b/drivers/net/ethernet/intel/ice/ice_dpll.c
+@@@ -19,6 -20,9 +20,12 @@@
+  #define ICE_DPLL_SW_PIN_INPUT_BASE_QSFP		6
+  #define ICE_DPLL_SW_PIN_OUTPUT_BASE		0
+  
+++<<<<<<< HEAD
+++=======
++ #define E825_RCLK_PARENT_0_PIN_IDX		0
++ #define E825_RCLK_PARENT_1_PIN_IDX		1
++ 
+++>>>>>>> e075d7768386 (ice: implement E825 TX ref clock control and TXC hardware sync status)
+  #define ICE_DPLL_PIN_SW_INPUT_ABS(in_idx) \
+  	(ICE_DPLL_SW_PIN_INPUT_BASE_SFP + (in_idx))
+  
+@@@ -2605,6 -2614,194 +2612,197 @@@ unlock
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * ice_dpll_txclk_work - apply a pending TX reference clock change
++  * @work: work_struct embedded in struct ice_dplls
++  *
++  * This worker executes an outstanding TX reference clock switch request
++  * that was previously queued via the DPLL TXCLK pin set callback.
++  *
++  * The worker performs only the operational part of the switch, issuing
++  * the necessary firmware commands to request a new TX reference clock
++  * selection (e.g. triggering an AN restart). It does not verify whether
++  * the requested clock was ultimately accepted by the hardware.
++  *
++  * Hardware verification, software state reconciliation, pin state
++  * notification, and TXC DPLL lock-status updates are performed later,
++  * after link-up, by ice_txclk_update_and_notify().
++  *
++  * Context:
++  *   - Runs in process context on pf->dplls.wq and may sleep.
++  *   - Serializes access to shared TXCLK state using pf->dplls.lock.
++  */
++ static void ice_dpll_txclk_work(struct work_struct *work)
++ {
++ 	struct ice_dplls *dplls =
++ 		container_of(work, struct ice_dplls, txclk_work);
++ 	struct ice_pf *pf = container_of(dplls, struct ice_pf, dplls);
++ 	struct dpll_pin *old_pin = NULL;
++ 	struct dpll_pin *new_pin = NULL;
++ 	enum ice_e825c_ref_clk clk;
++ 	bool do_switch;
++ 	int err;
++ 
++ 	mutex_lock(&pf->dplls.lock);
++ 	do_switch = pf->dplls.txclk_switch_requested;
++ 	clk = pf->ptp.port.tx_clk_req;
++ 	mutex_unlock(&pf->dplls.lock);
++ 
++ 	if (!do_switch)
++ 		return;
++ 
++ 	err = ice_txclk_set_clk(pf, clk);
++ 
++ 	mutex_lock(&pf->dplls.lock);
++ 	/* Only clear the request flag if no newer request arrived while
++ 	 * the lock was dropped. Otherwise leave it set so the re-queued
++ 	 * worker run picks up the updated tx_clk_req value.
++ 	 */
++ 	if (pf->ptp.port.tx_clk_req == clk)
++ 		pf->dplls.txclk_switch_requested = false;
++ 	if (err) {
++ 		/* Roll back the requested clock to match the current hardware
++ 		 * state so that ice_txclk_update_and_notify() does not
++ 		 * misinterpret a future link-up as a failed switch. Only roll
++ 		 * back if no newer request arrived in the meantime; otherwise
++ 		 * the re-queued worker run will apply the updated value.
++ 		 */
++ 		dev_err(ice_pf_to_dev(pf),
++ 			"TX clock switch to %u failed, err=%d; reverting\n",
++ 			clk, err);
++ 		if (pf->ptp.port.tx_clk_req == clk) {
++ 			/* Capture pins for post-unlock notification so that
++ 			 * userspace observes the requested pin flipping back
++ 			 * to DISCONNECTED and the effective pin to CONNECTED.
++ 			 */
++ 			new_pin = ice_txclk_get_pin(pf, clk);
++ 			old_pin = ice_txclk_get_pin(pf, pf->ptp.port.tx_clk);
++ 			pf->ptp.port.tx_clk_req = pf->ptp.port.tx_clk;
++ 		}
++ 	}
++ 	mutex_unlock(&pf->dplls.lock);
++ 
++ 	if (old_pin)
++ 		dpll_pin_change_ntf(old_pin);
++ 	if (new_pin)
++ 		dpll_pin_change_ntf(new_pin);
++ }
++ 
++ /**
++  * ice_dpll_txclk_state_on_dpll_set - set a state on TX clk pin
++  * @pin: pointer to a pin
++  * @pin_priv: private data pointer passed on pin registration
++  * @dpll: registered dpll pointer
++  * @dpll_priv: private data pointer passed on dpll registration
++  * @state: state to be set on pin
++  * @extack: error reporting
++  *
++  * Dpll subsystem callback, set a state of a Tx reference clock pin
++  *
++  * Context: Acquires and releases pf->dplls.lock.
++  * Return:
++  * * 0 - success
++  * * negative - failure
++  */
++ static int
++ ice_dpll_txclk_state_on_dpll_set(const struct dpll_pin *pin, void *pin_priv,
++ 				 const struct dpll_device *dpll,
++ 				 void *dpll_priv, enum dpll_pin_state state,
++ 				 struct netlink_ext_ack *extack)
++ {
++ 	struct ice_dpll_pin *p = pin_priv;
++ 	struct ice_pf *pf = p->pf;
++ 	enum ice_e825c_ref_clk new_clk;
++ 	int ret = 0;
++ 
++ 	if (ice_dpll_is_reset(pf, extack))
++ 		return -EBUSY;
++ 
++ 	if (state != DPLL_PIN_STATE_CONNECTED &&
++ 	    state != DPLL_PIN_STATE_DISCONNECTED) {
++ 		NL_SET_ERR_MSG(extack,
++ 			       "unsupported pin state for TX reference clock");
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* Check ICE_FLAG_DPLL and queue_work() under pf->dplls.lock.
++ 	 * ice_dpll_deinit() clears the flag under the same lock before
++ 	 * cancel_work_sync() and wq destruction, so a callback arriving
++ 	 * after teardown observes the cleared flag and bails out.
++ 	 */
++ 	mutex_lock(&pf->dplls.lock);
++ 	if (!test_bit(ICE_FLAG_DPLL, pf->flags)) {
++ 		ret = -ENODEV;
++ 		goto unlock;
++ 	}
++ 	if (state == DPLL_PIN_STATE_DISCONNECTED &&
++ 	    p->tx_ref_src != pf->ptp.port.tx_clk_req)
++ 		goto unlock;
++ 
++ 	new_clk = (state == DPLL_PIN_STATE_DISCONNECTED) ? ICE_REF_CLK_ENET :
++ 			p->tx_ref_src;
++ 	if (new_clk == pf->ptp.port.tx_clk_req)
++ 		goto unlock;
++ 
++ 	pf->ptp.port.tx_clk_req = new_clk;
++ 	pf->dplls.txclk_switch_requested = true;
++ 	queue_work(pf->dplls.wq, &pf->dplls.txclk_work);
++ unlock:
++ 	mutex_unlock(&pf->dplls.lock);
++ 	return ret;
++ }
++ 
++ /**
++  * ice_dpll_txclk_state_on_dpll_get - get a state of Tx clk reference pin
++  * @pin: pointer to a pin
++  * @pin_priv: private data pointer passed on pin registration
++  * @dpll: registered dpll pointer
++  * @dpll_priv: private data pointer passed on dpll registration
++  * @state: on success holds pin state on parent pin
++  * @extack: error reporting
++  *
++  * TXCLK DPLL pin state is derived and not stored explicitly.
++  *
++  * Only external TX reference clocks (SYNCE, EREF0) are modeled
++  * as DPLL pins. The internal ENET (TXCO) clock has no pin and,
++  * when selected, all TXCLK pins are reported DISCONNECTED.
++  *
++  * During a pending TXCLK switch, the requested pin may be
++  * reported as CONNECTED before hardware verification.
++  * Hardware acceptance and synchronization are reported
++  * exclusively via TXC DPLL lock-status.
++  *
++  * Context: Acquires and releases pf->dplls.lock
++  * Return:
++  * * 0 - success
++  * * negative - failure
++  */
++ static int
++ ice_dpll_txclk_state_on_dpll_get(const struct dpll_pin *pin, void *pin_priv,
++ 				 const struct dpll_device *dpll,
++ 				 void *dpll_priv,
++ 				 enum dpll_pin_state *state,
++ 				 struct netlink_ext_ack *extack)
++ {
++ 	struct ice_dpll_pin *p = pin_priv;
++ 	struct ice_pf *pf = p->pf;
++ 
++ 	if (ice_dpll_is_reset(pf, extack))
++ 		return -EBUSY;
++ 
++ 	mutex_lock(&pf->dplls.lock);
++ 	if (pf->ptp.port.tx_clk_req == p->tx_ref_src)
++ 		*state = DPLL_PIN_STATE_CONNECTED;
++ 	else
++ 		*state = DPLL_PIN_STATE_DISCONNECTED;
++ 	mutex_unlock(&pf->dplls.lock);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> e075d7768386 (ice: implement E825 TX ref clock control and TXC hardware sync status)
+  static const struct dpll_pin_ops ice_dpll_rclk_ops = {
+  	.state_on_pin_set = ice_dpll_rclk_state_on_pin_set,
+  	.state_on_pin_get = ice_dpll_rclk_state_on_pin_get,
+@@@ -3513,6 -3781,26 +3711,29 @@@ ice_dpll_deinit_fwnode_pins(struct ice_
+  	destroy_workqueue(pf->dplls.wq);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int ice_dpll_deinit_txclk_pins(struct ice_pf *pf)
++ {
++ 	struct ice_dpll_pin *synce_pin = &pf->dplls.txclks[E825_EXT_SYNCE_PIN_IDX];
++ 	struct ice_dpll *dt = &pf->dplls.txc;
++ 
++ 	ice_dpll_stop_fwnode_pin_activity(synce_pin, true);
++ 	ice_dpll_unregister_pins(dt->dpll, pf->dplls.txclks,
++ 				 &ice_dpll_txclk_ops,
++ 				 ARRAY_SIZE(pf->dplls.txclks));
++ 	ice_dpll_release_pins(&pf->dplls.txclks[E825_EXT_EREF_PIN_IDX], 1);
++ 	/* ice_dpll_release_pins() puts the pin but does not clear the slot,
++ 	 * unlike ice_dpll_release_fwnode_pin() used for SYNCE below. NULL it
++ 	 * so a late ice_txclk_get_pin() returns NULL rather than a dangling
++ 	 * pointer.
++ 	 */
++ 	pf->dplls.txclks[E825_EXT_EREF_PIN_IDX].pin = NULL;
++ 	ice_dpll_release_fwnode_pin(synce_pin);
++ 	return 0;
++ }
++ 
+++>>>>>>> e075d7768386 (ice: implement E825 TX ref clock control and TXC hardware sync status)
+  /**
+   * ice_dpll_deinit_pins - deinitialize direct pins
+   * @pf: board private structure
+@@@ -4273,8 -4670,11 +4494,14 @@@ static int ice_dpll_init_info_e825c(str
+  
+  	d->clock_id = ice_generate_clock_id(pf);
+  	d->num_inputs = ICE_SYNCE_CLK_NUM;
+++<<<<<<< HEAD
+++=======
++ 	dt->dpll_state = ice_txclk_lock_status(pf->ptp.port.tx_clk);
++ 	dt->mode = DPLL_MODE_MANUAL;
++ 	dt->dpll_idx = pf->ptp.port.port_num;
+++>>>>>>> e075d7768386 (ice: implement E825 TX ref clock control and TXC hardware sync status)
+  
+ -	d->inputs = kzalloc_objs(*d->inputs, d->num_inputs);
+ +	d->inputs = kcalloc(d->num_inputs, sizeof(*d->inputs), GFP_KERNEL);
+  	if (!d->inputs)
+  		return -ENOMEM;
+  
+diff --cc drivers/net/ethernet/intel/ice/ice_dpll.h
+index 8678575359b9,103ba3e49068..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_dpll.h
++++ b/drivers/net/ethernet/intel/ice/ice_dpll.h
+@@@ -7,6 -7,9 +7,12 @@@
+  #include "ice.h"
+  
+  #define ICE_DPLL_RCLK_NUM_MAX	4
+++<<<<<<< HEAD
+++=======
++ #define ICE_DPLL_TXCLK_NUM_MAX	2
++ #define E825_EXT_EREF_PIN_IDX	0
++ #define E825_EXT_SYNCE_PIN_IDX	1
+++>>>>>>> e075d7768386 (ice: implement E825 TX ref clock control and TXC hardware sync status)
+  
+  #define ICE_CGU_R10			0x28
+  #define ICE_CGU_R10_SYNCE_CLKO_SEL	GENMASK(8, 5)
+@@@ -124,9 -128,11 +130,10 @@@ struct ice_dpll 
+  /** ice_dplls - store info required for CCU (clock controlling unit)
+   * @kworker: periodic worker
+   * @work: periodic work
+-  * @lock: locks access to configuration of a dpll
++  * @wq: workqueue used to schedule DPLL-related deferred work
++  * @lock: protects DPLL configuration (see Locking below)
+   * @eec: pointer to EEC dpll dev
+   * @pps: pointer to PPS dpll dev
+ - * @txc: pointer to TXC dpll dev
+   * @inputs: input pins pointer
+   * @outputs: output pins pointer
+   * @rclk: recovered pins pointer
+diff --git a/drivers/net/ethernet/intel/ice/Makefile b/drivers/net/ethernet/intel/ice/Makefile
+index 38db476ab2ec..95fd0c49800f 100644
+--- a/drivers/net/ethernet/intel/ice/Makefile
++++ b/drivers/net/ethernet/intel/ice/Makefile
+@@ -54,7 +54,7 @@ ice-$(CONFIG_PCI_IOV) +=	\
+ 	ice_vf_mbx.o		\
+ 	ice_vf_vsi_vlan_ops.o	\
+ 	ice_vf_lib.o
+-ice-$(CONFIG_PTP_1588_CLOCK) += ice_ptp.o ice_ptp_hw.o ice_dpll.o ice_tspll.o ice_cpi.o
++ice-$(CONFIG_PTP_1588_CLOCK) += ice_ptp.o ice_ptp_hw.o ice_dpll.o ice_tspll.o ice_cpi.o ice_txclk.o
+ ice-$(CONFIG_DCB) += ice_dcb.o ice_dcb_nl.o ice_dcb_lib.o
+ ice-$(CONFIG_RFS_ACCEL) += ice_arfs.o
+ ice-$(CONFIG_XDP_SOCKETS) += ice_xsk.o
+diff --git a/drivers/net/ethernet/intel/ice/ice.h b/drivers/net/ethernet/intel/ice/ice.h
+index 725b130dd3a2..f72bb1aa4067 100644
+--- a/drivers/net/ethernet/intel/ice/ice.h
++++ b/drivers/net/ethernet/intel/ice/ice.h
+@@ -1155,4 +1155,16 @@ static inline struct ice_hw *ice_get_primary_hw(struct ice_pf *pf)
+ 	else
+ 		return &pf->adapter->ctrl_pf->hw;
+ }
++
++/**
++ * ice_get_ctrl_pf - Get pointer to Control PF of the adapter
++ * @pf: pointer to the current PF structure
++ *
++ * Return: A pointer to ice_pf structure which is Control PF,
++ * NULL if it's not initialized yet.
++ */
++static inline struct ice_pf *ice_get_ctrl_pf(struct ice_pf *pf)
++{
++	return !pf->adapter ? NULL : pf->adapter->ctrl_pf;
++}
+ #endif /* _ICE_H_ */
+* Unmerged path drivers/net/ethernet/intel/ice/ice_dpll.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_dpll.h
+diff --git a/drivers/net/ethernet/intel/ice/ice_ptp.c b/drivers/net/ethernet/intel/ice/ice_ptp.c
+index 65c4ad9d8250..74161207fde5 100644
+--- a/drivers/net/ethernet/intel/ice/ice_ptp.c
++++ b/drivers/net/ethernet/intel/ice/ice_ptp.c
+@@ -4,6 +4,7 @@
+ #include "ice.h"
+ #include "ice_lib.h"
+ #include "ice_trace.h"
++#include "ice_txclk.h"
+ 
+ static const char ice_pin_names[][64] = {
+ 	"SDP0",
+@@ -54,11 +55,6 @@ static const struct ice_ptp_pin_desc ice_pin_desc_dpll[] = {
+ 	{  SDP3, {  3, -1 }, { 0, 0 }},
+ };
+ 
+-static struct ice_pf *ice_get_ctrl_pf(struct ice_pf *pf)
+-{
+-	return !pf->adapter ? NULL : pf->adapter->ctrl_pf;
+-}
+-
+ static struct ice_ptp *ice_get_ctrl_ptp(struct ice_pf *pf)
+ {
+ 	struct ice_pf *ctrl_pf = ice_get_ctrl_pf(pf);
+@@ -1328,6 +1324,9 @@ void ice_ptp_link_change(struct ice_pf *pf, bool linkup)
+ 			}
+ 		}
+ 		mutex_unlock(&pf->dplls.lock);
++
++		if (linkup)
++			ice_txclk_update_and_notify(pf);
+ 	}
+ 
+ 	switch (hw->mac_type) {
+@@ -3090,6 +3089,21 @@ static int ice_ptp_setup_pf(struct ice_pf *pf)
+ 		 &pf->adapter->ports.ports);
+ 	mutex_unlock(&pf->adapter->ports.lock);
+ 
++	/* Seed the per-PHY Tx reference clock usage map for this port.
++	 * Only meaningful on E825 (other MAC types don't expose tx-clk
++	 * selection). No locking is needed because this runs during
++	 * ice_ptp_init() before pf->dplls.lock exists and before any
++	 * link event or DPLL callback can observe the map.
++	 */
++	if (pf->hw.mac_type == ICE_MAC_GENERIC_3K_E825) {
++		u8 port_num, phy;
++
++		port_num = ptp->port.port_num;
++		phy = port_num / pf->hw.ptp.ports_per_phy;
++		set_bit(port_num,
++			&ctrl_ptp->tx_refclks[phy][pf->ptp.port.tx_clk]);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -3318,6 +3332,19 @@ void ice_ptp_init(struct ice_pf *pf)
+ 			goto err_exit;
+ 	}
+ 
++	ptp->port.tx_clk = ICE_REF_CLK_ENET;
++	ptp->port.tx_clk_req = ICE_REF_CLK_ENET;
++	if (hw->mac_type == ICE_MAC_GENERIC_3K_E825) {
++		enum ice_e825c_ref_clk tx_ref_clk;
++
++		err = ice_get_serdes_ref_sel_e825c(hw, ptp->port.port_num,
++						   &tx_ref_clk);
++		if (!err) {
++			ptp->port.tx_clk = tx_ref_clk;
++			ptp->port.tx_clk_req = tx_ref_clk;
++		}
++	}
++
+ 	err = ice_ptp_setup_pf(pf);
+ 	if (err)
+ 		goto err_exit;
+diff --git a/drivers/net/ethernet/intel/ice/ice_ptp.h b/drivers/net/ethernet/intel/ice/ice_ptp.h
+index 8c44bd758a4f..c4b0da7ce20e 100644
+--- a/drivers/net/ethernet/intel/ice/ice_ptp.h
++++ b/drivers/net/ethernet/intel/ice/ice_ptp.h
+@@ -144,6 +144,8 @@ struct ice_ptp_tx {
+  * @link_up: indicates whether the link is up
+  * @tx_fifo_busy_cnt: number of times the Tx FIFO was busy
+  * @port_num: the port number this structure represents
++ * @tx_clk: currently active Tx reference clock source
++ * @tx_clk_req: requested Tx reference clock source (new target)
+  */
+ struct ice_ptp_port {
+ 	struct list_head list_node;
+@@ -153,6 +155,8 @@ struct ice_ptp_port {
+ 	bool link_up;
+ 	u8 tx_fifo_busy_cnt;
+ 	u8 port_num;
++	enum ice_e825c_ref_clk tx_clk;
++	enum ice_e825c_ref_clk tx_clk_req;
+ };
+ 
+ enum ice_ptp_tx_interrupt {
+@@ -236,6 +240,7 @@ struct ice_ptp_pin_desc {
+  * @info: structure defining PTP hardware capabilities
+  * @clock: pointer to registered PTP clock device
+  * @tstamp_config: hardware timestamping configuration
++ * @tx_refclks: bitmaps table to store the information about TX reference clocks
+  * @reset_time: kernel time after clock stop on reset
+  * @tx_hwtstamp_good: number of completed Tx timestamp requests
+  * @tx_hwtstamp_skipped: number of Tx time stamp requests skipped
+@@ -261,6 +266,7 @@ struct ice_ptp {
+ 	struct ptp_clock_info info;
+ 	struct ptp_clock *clock;
+ 	struct kernel_hwtstamp_config tstamp_config;
++	unsigned long tx_refclks[ICE_E825_MAX_PHYS][ICE_REF_CLK_MAX];
+ 	u64 reset_time;
+ 	u64 tx_hwtstamp_good;
+ 	u32 tx_hwtstamp_skipped;
+diff --git a/drivers/net/ethernet/intel/ice/ice_ptp_hw.c b/drivers/net/ethernet/intel/ice/ice_ptp_hw.c
+index 2c18e16fe053..8e5f97835954 100644
+--- a/drivers/net/ethernet/intel/ice/ice_ptp_hw.c
++++ b/drivers/net/ethernet/intel/ice/ice_ptp_hw.c
+@@ -486,6 +486,43 @@ static int ice_read_phy_eth56g(struct ice_hw *hw, u8 port, u32 addr, u32 *val)
+ 	return err;
+ }
+ 
++/**
++ * ice_get_serdes_ref_sel_e825c - Read current Tx ref clock source
++ * @hw: pointer to the HW struct
++ * @port: port number for which Tx reference clock is read
++ * @clk: Tx reference clock value (output)
++ *
++ * Return: 0 on success, other error codes when failed to read from PHY
++ */
++int ice_get_serdes_ref_sel_e825c(struct ice_hw *hw, u8 port,
++				 enum ice_e825c_ref_clk *clk)
++{
++	u8 lane = port % hw->ptp.ports_per_phy;
++	u32 serdes_rx_nt, serdes_tx_nt;
++	u32 val;
++	int ret;
++
++	ret = ice_read_phy_eth56g(hw, port,
++				  SERDES_IP_IF_LN_FLXM_GENERAL(lane, 0),
++				  &val);
++	if (ret)
++		return ret;
++
++	serdes_rx_nt = FIELD_GET(CFG_ICTL_PCS_REF_SEL_RX_NT, val);
++	serdes_tx_nt = FIELD_GET(CFG_ICTL_PCS_REF_SEL_TX_NT, val);
++
++	if (serdes_tx_nt == REF_SEL_NT_SYNCE &&
++	    serdes_rx_nt == REF_SEL_NT_SYNCE)
++		*clk = ICE_REF_CLK_SYNCE;
++	else if (serdes_tx_nt == REF_SEL_NT_EREF0 &&
++		 serdes_rx_nt == REF_SEL_NT_EREF0)
++		*clk = ICE_REF_CLK_EREF0;
++	else
++		*clk = ICE_REF_CLK_ENET;
++
++	return 0;
++}
++
+ /**
+  * ice_phy_res_address_eth56g - Calculate a PHY port register address
+  * @hw: pointer to the HW struct
+diff --git a/drivers/net/ethernet/intel/ice/ice_ptp_hw.h b/drivers/net/ethernet/intel/ice/ice_ptp_hw.h
+index 1c9e77dbc770..f0faa0244125 100644
+--- a/drivers/net/ethernet/intel/ice/ice_ptp_hw.h
++++ b/drivers/net/ethernet/intel/ice/ice_ptp_hw.h
+@@ -376,6 +376,8 @@ int ice_start_phy_timer_eth56g(struct ice_hw *hw, u8 port);
+ int ice_phy_cfg_intr_eth56g(struct ice_hw *hw, u8 port, bool ena, u8 threshold);
+ int ice_phy_cfg_ptp_1step_eth56g(struct ice_hw *hw, u8 port);
+ int ice_ptp_phy_soft_reset_eth56g(struct ice_hw *hw, u8 port);
++int ice_get_serdes_ref_sel_e825c(struct ice_hw *hw, u8 port,
++				 enum ice_e825c_ref_clk *clk);
+ 
+ #define ICE_ETH56G_NOMINAL_INCVAL	0x140000000ULL
+ #define ICE_ETH56G_NOMINAL_PCS_REF_TUS	0x100000000ULL
+@@ -788,4 +790,12 @@ static inline u64 ice_get_base_incval(struct ice_hw *hw)
+ #define PHY_PTP_1STEP_PD_DELAY_M	GENMASK(30, 1)
+ #define PHY_PTP_1STEP_PD_DLY_V_M	BIT(31)
+ 
++#define SERDES_IP_IF_LN_FLXM_GENERAL(n, m) \
++	(0x32B800 + (m) * 0x100000 + (n) * 0x8000)
++#define CFG_ICTL_PCS_REF_SEL_RX_NT		GENMASK(9, 6)
++#define CFG_ICTL_PCS_REF_SEL_TX_NT		GENMASK(28, 25)
++#define REF_SEL_NT_ENET				0
++#define REF_SEL_NT_EREF0			1
++#define REF_SEL_NT_SYNCE			2
++
+ #endif /* _ICE_PTP_HW_H_ */
+diff --git a/drivers/net/ethernet/intel/ice/ice_txclk.c b/drivers/net/ethernet/intel/ice/ice_txclk.c
+new file mode 100644
+index 000000000000..48459f971cbf
+--- /dev/null
++++ b/drivers/net/ethernet/intel/ice/ice_txclk.c
+@@ -0,0 +1,354 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (C) 2026 Intel Corporation */
++
++#include "ice.h"
++#include "ice_cpi.h"
++#include "ice_txclk.h"
++
++#define ICE_PHY0	0
++#define ICE_PHY1	1
++
++/**
++ * ice_txclk_get_pin - map TX reference clock to its DPLL pin
++ * @pf: pointer to the PF structure
++ * @ref_clk: TX reference clock selection
++ *
++ * Return the DPLL pin corresponding to a given external TX reference
++ * clock. Only external TX reference clocks (SYNCE and EREF0) are
++ * represented as DPLL pins. The internal ENET (TXCO) clock has no
++ * associated DPLL pin and therefore yields %NULL.
++ *
++ * This helper is used when emitting DPLL pin change notifications
++ * after TX reference clock transitions have been verified.
++ *
++ * Return: Pointer to the corresponding struct dpll_pin, or %NULL if
++ *         the TX reference clock has no DPLL pin representation.
++ */
++struct dpll_pin *
++ice_txclk_get_pin(struct ice_pf *pf, enum ice_e825c_ref_clk ref_clk)
++{
++	switch (ref_clk) {
++	case ICE_REF_CLK_SYNCE:
++		return pf->dplls.txclks[E825_EXT_SYNCE_PIN_IDX].pin;
++	case ICE_REF_CLK_EREF0:
++		return pf->dplls.txclks[E825_EXT_EREF_PIN_IDX].pin;
++	case ICE_REF_CLK_ENET:
++	default:
++		return NULL;
++	}
++}
++
++/**
++ * ice_txclk_enable_peer - Enable required TX reference clock on peer PHY
++ * @pf: pointer to the PF structure
++ * @clk: TX reference clock that must be enabled
++ *
++ * Some TX reference clocks on E825-class devices (SyncE and EREF0) must
++ * be enabled on both PHY complexes to allow proper routing:
++ *
++ *   - SyncE must be enabled on both PHYs when used by PHY0
++ *   - EREF0 must be enabled on both PHYs when used by PHY1
++ *
++ * If the requested clock is not yet enabled on the peer PHY, enable it.
++ * ENET does not require duplication and is ignored.
++ *
++ * Return: 0 on success or negative error code on failure.
++ */
++static int ice_txclk_enable_peer(struct ice_pf *pf, enum ice_e825c_ref_clk clk)
++{
++	struct ice_pf *ctrl_pf = ice_get_ctrl_pf(pf);
++	bool peer_clk_in_use;
++	u8 port_num, phy;
++	int err;
++
++	if (clk == ICE_REF_CLK_ENET)
++		return 0;
++
++	if (IS_ERR_OR_NULL(ctrl_pf)) {
++		dev_err(ice_pf_to_dev(pf),
++			"Can't enable tx-clk on peer: no controlling PF\n");
++		return -EINVAL;
++	}
++
++	port_num = pf->ptp.port.port_num;
++	phy = port_num / pf->hw.ptp.ports_per_phy;
++	peer_clk_in_use = true;
++
++	/* Hold ctrl_pf->dplls.lock across both the peer-usage check and
++	 * the enable AQ command so that two PFs racing to enable the same
++	 * peer-PHY clock cannot both observe peer_clk_in_use == false and
++	 * issue duplicate enables.
++	 */
++	mutex_lock(&ctrl_pf->dplls.lock);
++	if (clk == ICE_REF_CLK_SYNCE && phy == ICE_PHY0)
++		peer_clk_in_use = ice_txclk_any_port_uses(ctrl_pf,
++							  ICE_PHY1,
++							  clk);
++	else if (clk == ICE_REF_CLK_EREF0 && phy == ICE_PHY1)
++		peer_clk_in_use = ice_txclk_any_port_uses(ctrl_pf,
++							  ICE_PHY0,
++							  clk);
++
++	if ((clk == ICE_REF_CLK_SYNCE && phy == ICE_PHY0 && !peer_clk_in_use) ||
++	    (clk == ICE_REF_CLK_EREF0 && phy == ICE_PHY1 && !peer_clk_in_use)) {
++		u8 peer_phy = phy ? ICE_PHY0 : ICE_PHY1;
++
++		err = ice_cpi_ena_dis_clk_ref(&pf->hw, peer_phy, clk, true);
++		if (err) {
++			mutex_unlock(&ctrl_pf->dplls.lock);
++			dev_err(ice_pf_to_dev(pf),
++				"Failed to enable the %u TX clock for the %u PHY\n",
++				clk, peer_phy);
++			return err;
++		}
++	}
++	mutex_unlock(&ctrl_pf->dplls.lock);
++
++	return 0;
++}
++
++#define ICE_REFCLK_USER_TO_AQ_IDX(x) ((x) + 1)
++
++/**
++ * ice_txclk_set_clk - Set Tx reference clock
++ * @pf: pointer to pf structure
++ * @clk: new Tx clock
++ *
++ * Return: 0 on success, negative value otherwise.
++ */
++int ice_txclk_set_clk(struct ice_pf *pf, enum ice_e825c_ref_clk clk)
++{
++	struct ice_pf *ctrl_pf = ice_get_ctrl_pf(pf);
++	struct ice_port_info *port_info;
++	bool clk_in_use;
++	u8 port_num, phy;
++	int err;
++
++	if (pf->ptp.port.tx_clk == clk)
++		return 0;
++
++	if (IS_ERR_OR_NULL(ctrl_pf)) {
++		dev_err(ice_pf_to_dev(pf),
++			"Can't set tx-clk: no controlling PF\n");
++		return -EINVAL;
++	}
++
++	if (!test_bit(ICE_FLAG_DPLL, ctrl_pf->flags)) {
++		dev_err(ice_pf_to_dev(pf),
++			"Can't set tx-clk: ctrl PF DPLL not available\n");
++		return -EOPNOTSUPP;
++	}
++
++	port_num = pf->ptp.port.port_num;
++	phy = port_num / pf->hw.ptp.ports_per_phy;
++	port_info = pf->hw.port_info;
++
++	/* Hold ctrl_pf->dplls.lock across both the usage check and the
++	 * enable AQ command so that two PFs racing to switch to the same
++	 * (phy, clk) cannot both observe clk_in_use == false and issue
++	 * duplicate enables. The tx_refclks bitmap is updated only later
++	 * by ice_txclk_update_and_notify() after link-up, so without this
++	 * the check-then-act window is wide open.
++	 */
++	mutex_lock(&ctrl_pf->dplls.lock);
++	clk_in_use = ice_txclk_any_port_uses(ctrl_pf, phy, clk);
++	if (!clk_in_use) {
++		err = ice_cpi_ena_dis_clk_ref(&pf->hw, phy, clk, true);
++		if (err) {
++			mutex_unlock(&ctrl_pf->dplls.lock);
++			dev_err(ice_pf_to_dev(pf), "Failed to enable the %u TX clock for the %u PHY\n",
++				clk, phy);
++			return err;
++		}
++	}
++	mutex_unlock(&ctrl_pf->dplls.lock);
++
++	if (!clk_in_use) {
++		err = ice_txclk_enable_peer(pf, clk);
++		if (err)
++			return err;
++	}
++
++	/* We are ready to switch to the new TX clk. */
++	err = ice_aq_set_link_restart_an(port_info, true, NULL,
++					 ICE_REFCLK_USER_TO_AQ_IDX(clk));
++	if (err) {
++		dev_err(ice_pf_to_dev(pf),
++			"AN restart AQ command failed with err %d\n",
++			err);
++		return err;
++	}
++
++	/* Clear txclk_switch_requested only after the AN restart AQ has been
++	 * accepted by FW. Clearing earlier would race with any asynchronous
++	 * link-up event: ice_txclk_update_and_notify() would observe the
++	 * cleared flag, read the stale SERDES selector, and misinterpret the
++	 * not-yet-applied switch as a HW rejection. Only clear if no newer
++	 * request has overwritten tx_clk_req while we were dropping locks.
++	 */
++	mutex_lock(&pf->dplls.lock);
++	if (pf->ptp.port.tx_clk_req == clk)
++		pf->dplls.txclk_switch_requested = false;
++	mutex_unlock(&pf->dplls.lock);
++
++	return 0;
++}
++
++/**
++ * ice_txclk_update_and_notify - Validate TX reference clock switching
++ * @pf: pointer to PF structure
++ *
++ * After a link-up event, verify whether the previously requested TX reference
++ * clock transition actually succeeded. The SERDES reference selector reflects
++ * the effective hardware choice, which may differ from the requested clock
++ * when Auto-Negotiation or firmware applies additional policy.
++ *
++ * If the hardware-selected clock differs from the requested one, update the
++ * software state accordingly and stop further processing.
++ *
++ * When the switch is successful, update the per‑PHY usage bitmaps so that the
++ * driver knows which reference clock is currently in use by this port.
++ *
++ * This function does not initiate a clock switch; it only validates the result
++ * of a previously triggered transition and performs cleanup of unused clocks.
++ */
++void ice_txclk_update_and_notify(struct ice_pf *pf)
++{
++	struct ice_ptp_port *ptp_port = &pf->ptp.port;
++	struct ice_pf *ctrl_pf = ice_get_ctrl_pf(pf);
++	struct dpll_pin *old_pin = NULL;
++	struct dpll_pin *new_pin = NULL;
++	struct ice_hw *hw = &pf->hw;
++	enum ice_e825c_ref_clk clk;
++	bool notify_dpll = false;
++	int err;
++	u8 phy;
++
++	phy = ptp_port->port_num / hw->ptp.ports_per_phy;
++
++	/* Hold txclk_notify_rwsem for read across the entire critical
++	 * region, including the out-of-lock dpll_*_change_ntf() calls
++	 * below. ice_dpll_deinit() takes the write side to wait for all
++	 * in-flight notifications to complete before freeing pins and the
++	 * TXC DPLL device, preventing a use-after-free on rmmod.
++	 */
++	down_read(&pf->dplls.txclk_notify_rwsem);
++	mutex_lock(&pf->dplls.lock);
++	/* Bail out if DPLL subsystem is being torn down. ice_dpll_deinit()
++	 * clears ICE_FLAG_DPLL before freeing pins and the dpll device, so a
++	 * cleared flag under the lock means those objects can no longer be
++	 * safely dereferenced.
++	 */
++	if (!test_bit(ICE_FLAG_DPLL, pf->flags)) {
++		mutex_unlock(&pf->dplls.lock);
++		goto out;
++	}
++	/* If a switch is still pending, the link-up event preceded the
++	 * worker's AN restart. Hardware hasn't applied the new clock yet,
++	 * so reading the SERDES selector now would produce a false failure.
++	 * Let the worker run first; the link-up that follows the AN restart
++	 * will trigger the verification.
++	 */
++	if (pf->dplls.txclk_switch_requested) {
++		mutex_unlock(&pf->dplls.lock);
++		goto out;
++	}
++	/* no TX clock change requested */
++	if (pf->ptp.port.tx_clk == pf->ptp.port.tx_clk_req) {
++		mutex_unlock(&pf->dplls.lock);
++		goto out;
++	}
++	/* verify current Tx reference settings */
++	err = ice_get_serdes_ref_sel_e825c(hw,
++					   ptp_port->port_num,
++					   &clk);
++	if (err) {
++		mutex_unlock(&pf->dplls.lock);
++		goto out;
++	}
++
++	if (clk != pf->ptp.port.tx_clk_req) {
++		dev_warn(ice_pf_to_dev(pf),
++			 "Failed to switch tx-clk for phy %d and clk %u (current: %u)\n",
++			 phy, pf->ptp.port.tx_clk_req, clk);
++		old_pin = ice_txclk_get_pin(pf, pf->ptp.port.tx_clk_req);
++		new_pin = ice_txclk_get_pin(pf, clk);
++		pf->ptp.port.tx_clk = clk;
++		pf->ptp.port.tx_clk_req = clk;
++		/* Update the reference clock bitmap to match the hardware
++		 * clock that was actually accepted, so that
++		 * ice_txclk_any_port_uses() reflects reality even on failure.
++		 * The map is owned by ctrl_pf; take its lock per documented
++		 * order (pf->dplls.lock first, then ctrl_pf->dplls.lock) so
++		 * readers on other PFs observe a consistent snapshot.
++		 */
++		if (!IS_ERR_OR_NULL(ctrl_pf)) {
++			if (ctrl_pf != pf)
++				mutex_lock(&ctrl_pf->dplls.lock);
++			for (int i = 0; i < ICE_REF_CLK_MAX; i++) {
++				if (clk == i)
++					set_bit(ptp_port->port_num,
++						&ctrl_pf->ptp.tx_refclks[phy][i]);
++				else
++					clear_bit(ptp_port->port_num,
++						  &ctrl_pf->ptp.tx_refclks[phy][i]);
++			}
++			if (ctrl_pf != pf)
++				mutex_unlock(&ctrl_pf->dplls.lock);
++		}
++		goto err_notify;
++	}
++
++	old_pin = ice_txclk_get_pin(pf, pf->ptp.port.tx_clk);
++	pf->ptp.port.tx_clk = clk;
++	pf->ptp.port.tx_clk_req = clk;
++
++	if (IS_ERR_OR_NULL(ctrl_pf)) {
++		dev_err(ice_pf_to_dev(pf),
++			"Can't set tx-clk: no controlling PF\n");
++		goto err_notify;
++	}
++
++	/* update Tx reference clock usage map; map is owned by ctrl_pf,
++	 * take its lock per documented order so readers on other PFs see
++	 * a consistent view.
++	 */
++	if (ctrl_pf != pf)
++		mutex_lock(&ctrl_pf->dplls.lock);
++	for (int i = 0; i < ICE_REF_CLK_MAX; i++)
++		if (clk == i)
++			set_bit(ptp_port->port_num,
++				&ctrl_pf->ptp.tx_refclks[phy][i]);
++		else
++			clear_bit(ptp_port->port_num,
++				  &ctrl_pf->ptp.tx_refclks[phy][i]);
++	if (ctrl_pf != pf)
++		mutex_unlock(&ctrl_pf->dplls.lock);
++
++err_notify:
++	/* Update TXC DPLL lock status based on effective TX clk, while still
++	 * holding the lock to prevent concurrent link-up events from racing
++	 * on dpll_state.
++	 */
++	if (!IS_ERR_OR_NULL(pf->dplls.txc.dpll)) {
++		enum dpll_lock_status new_lock = ice_txclk_lock_status(clk);
++
++		if (pf->dplls.txc.dpll_state != new_lock) {
++			pf->dplls.txc.dpll_state = new_lock;
++			notify_dpll = true;
++		}
++	}
++	mutex_unlock(&pf->dplls.lock);
++
++	/* Notify TX clk pins state transition */
++	if (old_pin)
++		dpll_pin_change_ntf(old_pin);
++	if (new_pin)
++		dpll_pin_change_ntf(new_pin);
++
++	if (notify_dpll && !IS_ERR_OR_NULL(pf->dplls.txc.dpll))
++		dpll_device_change_ntf(pf->dplls.txc.dpll);
++
++out:
++	up_read(&pf->dplls.txclk_notify_rwsem);
++}
+diff --git a/drivers/net/ethernet/intel/ice/ice_txclk.h b/drivers/net/ethernet/intel/ice/ice_txclk.h
+new file mode 100644
+index 000000000000..21d97afb2afc
+--- /dev/null
++++ b/drivers/net/ethernet/intel/ice/ice_txclk.h
+@@ -0,0 +1,40 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Copyright (C) 2026 Intel Corporation */
++
++#ifndef _ICE_TXCLK_H_
++#define _ICE_TXCLK_H_
++
++/**
++ * ice_txclk_any_port_uses - check if any port on a PHY uses this TX refclk
++ * @ctrl_pf: control PF (owner of the shared tx_refclks map)
++ * @phy: PHY index
++ * @clk: TX reference clock
++ *
++ * Return: true if any bit (port) is set for this clock on this PHY
++ */
++static inline bool
++ice_txclk_any_port_uses(const struct ice_pf *ctrl_pf, u8 phy,
++			enum ice_e825c_ref_clk clk)
++{
++	return find_first_bit(&ctrl_pf->ptp.tx_refclks[phy][clk],
++			BITS_PER_LONG) < BITS_PER_LONG;
++}
++
++static inline enum dpll_lock_status
++ice_txclk_lock_status(enum ice_e825c_ref_clk clk)
++{
++	switch (clk) {
++	case ICE_REF_CLK_SYNCE:
++	case ICE_REF_CLK_EREF0:
++		return DPLL_LOCK_STATUS_LOCKED;
++	case ICE_REF_CLK_ENET:
++	default:
++		return DPLL_LOCK_STATUS_UNLOCKED;
++	}
++}
++
++int ice_txclk_set_clk(struct ice_pf *pf, enum ice_e825c_ref_clk clk);
++void ice_txclk_update_and_notify(struct ice_pf *pf);
++struct dpll_pin *ice_txclk_get_pin(struct ice_pf *pf,
++				   enum ice_e825c_ref_clk ref_clk);
++#endif /* _ICE_TXCLK_H_ */
