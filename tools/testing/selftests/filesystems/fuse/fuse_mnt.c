@@ -4,7 +4,7 @@
  * Creates a simple FUSE filesystem with a single read-write file (/test)
  */
 
-#define FUSE_USE_VERSION 26
+#define FUSE_USE_VERSION 31
 
 #include <fuse.h>
 #include <stdio.h>
@@ -20,8 +20,10 @@ static char *content;
 static size_t content_size = 0;
 static const char test_path[] = "/test";
 
-static int test_getattr(const char *path, struct stat *st)
+static int test_getattr(const char *path, struct stat *st,
+			struct fuse_file_info *fi)
 {
+	(void)fi;
 	memset(st, 0, sizeof(*st));
 
 	if (!strcmp(path, "/")) {
@@ -41,14 +43,17 @@ static int test_getattr(const char *path, struct stat *st)
 }
 
 static int test_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
-			off_t offset, struct fuse_file_info *fi)
+			off_t offset, struct fuse_file_info *fi,
+			enum fuse_readdir_flags flags)
 {
+	(void)flags;
+
 	if (strcmp(path, "/"))
 		return -ENOENT;
 
-	filler(buf, ".", NULL, 0);
-	filler(buf, "..", NULL, 0);
-	filler(buf, test_path + 1, NULL, 0);
+	filler(buf, ".", NULL, 0, 0);
+	filler(buf, "..", NULL, 0, 0);
+	filler(buf, test_path + 1, NULL, 0, 0);
 
 	return 0;
 }
@@ -107,8 +112,10 @@ static int test_write(const char *path, const char *buf, size_t size,
 	return size;
 }
 
-static int test_truncate(const char *path, off_t size)
+static int test_truncate(const char *path, off_t size,
+			 struct fuse_file_info *fi)
 {
+	(void)fi;
 	if (strcmp(path, test_path) != 0)
 		return -ENOENT;
 
