@@ -1,0 +1,153 @@
+ice: introduce TXC DPLL device and TX ref clock pin framework for E825
+
+jira KERNEL-1473
+Rebuild_History Non-Buildable kernel-6.12.0-211.44.1.el10_2
+commit-author Grzegorz Nitka <grzegorz.nitka@intel.com>
+commit 5db36ee62849eb084e345e5559c8fd5fe98159a3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.44.1.el10_2/5db36ee6.failed
+
+E825 devices provide a dedicated TX clock (TXC) domain which may be
+driven by multiple reference clock sources, including external board
+references and port-derived SyncE. To support future TX clock control
+and observability through the Linux DPLL subsystem, introduce a
+separate TXC DPLL device (of DPLL_TYPE_GENERIC) and a framework for
+representing TX reference clock inputs.
+
+This change adds a new internal DPLL pin type (TXCLK) and registers
+TX reference clock pins for E825-based devices:
+- EXT_EREF0: a board-level external electrical reference
+- SYNCE: a port-derived SyncE reference described via firmware nodes
+
+The TXC DPLL device is created and managed alongside the existing
+PPS and EEC DPLL instances. TXCLK pins are registered directly or
+deferred via a notifier when backed by fwnode-described pins.
+A per-pin attribute encodes the TX reference source associated with
+each TXCLK pin.
+
+At this stage, TXCLK pin state callbacks and TXC DPLL lock status
+reporting are implemented as placeholders. Pin state getters always
+return DISCONNECTED, and the TXC DPLL is initialized in the UNLOCKED
+state. No hardware configuration or TX reference switching is
+performed yet.
+
+This patch establishes the structural groundwork required for
+hardware-backed TX reference selection, verification, and
+synchronization status reporting, which will be implemented in
+subsequent patches.
+
+Also signal dpll_init from the fwnode pin init error path so any
+notifier worker already blocked on it can drain, avoiding a
+flush_workqueue() deadlock during teardown.
+
+	Reviewed-by: Arkadiusz Kubalewski <arkadiusz.kubalewski@intel.com>
+	Reviewed-by: Aleksandr Loktionov <aleksandr.loktionov@intel.com>
+	Signed-off-by: Grzegorz Nitka <grzegorz.nitka@intel.com>
+Link: https://patch.msgid.link/20260607183045.1213735-11-grzegorz.nitka@intel.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 5db36ee62849eb084e345e5559c8fd5fe98159a3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_dpll.c
+diff --cc drivers/net/ethernet/intel/ice/ice_dpll.c
+index 6a243b83e075,a5127a844e28..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_dpll.c
++++ b/drivers/net/ethernet/intel/ice/ice_dpll.c
+@@@ -3388,7 -3507,13 +3507,17 @@@ static int ice_dpll_pin_notify(struct n
+  	if (pin->fwnode != info->fwnode)
+  		return NOTIFY_DONE; /* Not this pin */
+  
+++<<<<<<< HEAD
+ +	work = kzalloc(sizeof(*work), GFP_KERNEL);
+++=======
++ 	/* Ignore notification which are the outcome of internal pin
++ 	 * registration/unregistration calls - synce pin case.
++ 	 */
++ 	if (info->src_clock_id == pin->pf->dplls.clock_id)
++ 		return NOTIFY_DONE;
++ 
++ 	work = kzalloc_obj(*work);
+++>>>>>>> 5db36ee62849 (ice: introduce TXC DPLL device and TX ref clock pin framework for E825)
+  	if (!work)
+  		return NOTIFY_DONE;
+  
+@@@ -4273,8 -4534,11 +4538,11 @@@ static int ice_dpll_init_info_e825c(str
+  
+  	d->clock_id = ice_generate_clock_id(pf);
+  	d->num_inputs = ICE_SYNCE_CLK_NUM;
++ 	dt->dpll_state = DPLL_LOCK_STATUS_UNLOCKED;
++ 	dt->mode = DPLL_MODE_MANUAL;
++ 	dt->dpll_idx = pf->ptp.port.port_num;
+  
+ -	d->inputs = kzalloc_objs(*d->inputs, d->num_inputs);
+ +	d->inputs = kcalloc(d->num_inputs, sizeof(*d->inputs), GFP_KERNEL);
+  	if (!d->inputs)
+  		return -ENOMEM;
+  
+* Unmerged path drivers/net/ethernet/intel/ice/ice_dpll.c
+diff --git a/drivers/net/ethernet/intel/ice/ice_dpll.h b/drivers/net/ethernet/intel/ice/ice_dpll.h
+index 8678575359b9..85e38752056d 100644
+--- a/drivers/net/ethernet/intel/ice/ice_dpll.h
++++ b/drivers/net/ethernet/intel/ice/ice_dpll.h
+@@ -7,6 +7,7 @@
+ #include "ice.h"
+ 
+ #define ICE_DPLL_RCLK_NUM_MAX	4
++#define ICE_DPLL_TXCLK_NUM_MAX	2
+ 
+ #define ICE_CGU_R10			0x28
+ #define ICE_CGU_R10_SYNCE_CLKO_SEL	GENMASK(8, 5)
+@@ -79,6 +80,7 @@ struct ice_dpll_pin {
+ 	u8 ref_sync;
+ 	bool active;
+ 	bool hidden;
++	enum ice_e825c_ref_clk tx_ref_src;
+ };
+ 
+ /** ice_dpll - store info required for DPLL control
+@@ -127,9 +129,11 @@ struct ice_dpll {
+  * @lock: locks access to configuration of a dpll
+  * @eec: pointer to EEC dpll dev
+  * @pps: pointer to PPS dpll dev
++ * @txc: pointer to TXC dpll dev
+  * @inputs: input pins pointer
+  * @outputs: output pins pointer
+  * @rclk: recovered pins pointer
++ * @txclks: TX clock reference pins pointer
+  * @num_inputs: number of input pins available on dpll
+  * @num_outputs: number of output pins available on dpll
+  * @cgu_state_acq_err_num: number of errors returned during periodic work
+@@ -147,11 +151,13 @@ struct ice_dplls {
+ 	struct completion dpll_init;
+ 	struct ice_dpll eec;
+ 	struct ice_dpll pps;
++	struct ice_dpll txc;
+ 	struct ice_dpll_pin *inputs;
+ 	struct ice_dpll_pin *outputs;
+ 	struct ice_dpll_pin sma[ICE_DPLL_PIN_SW_NUM];
+ 	struct ice_dpll_pin ufl[ICE_DPLL_PIN_SW_NUM];
+ 	struct ice_dpll_pin rclk;
++	struct ice_dpll_pin txclks[ICE_DPLL_TXCLK_NUM_MAX];
+ 	u8 num_inputs;
+ 	u8 num_outputs;
+ 	u8 sma_data;
+diff --git a/drivers/net/ethernet/intel/ice/ice_ptp_hw.h b/drivers/net/ethernet/intel/ice/ice_ptp_hw.h
+index 1c9e77dbc770..10795d023f44 100644
+--- a/drivers/net/ethernet/intel/ice/ice_ptp_hw.h
++++ b/drivers/net/ethernet/intel/ice/ice_ptp_hw.h
+@@ -265,6 +265,13 @@ struct ice_cgu_pin_desc {
+ 	struct dpll_pin_frequency *freq_supp;
+ };
+ 
++enum ice_e825c_ref_clk {
++	ICE_REF_CLK_ENET,
++	ICE_REF_CLK_SYNCE,
++	ICE_REF_CLK_EREF0,
++	ICE_REF_CLK_MAX,
++};
++
+ #define E810C_QSFP_C827_0_HANDLE 2
+ #define E810C_QSFP_C827_1_HANDLE 3
+ 
