@@ -359,4 +359,3 @@ int ice_cpi_ena_dis_clk_ref(struct ice_hw *hw, u8 phy,
 
 	return ice_cpi_set_cmd(hw, CPI_OPCODE_PHY_CLK, phy, 0, val);
 }
-
