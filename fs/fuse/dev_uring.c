@@ -200,6 +200,10 @@ static struct fuse_ring *fuse_uring_create(struct fuse_conn *fc)
 	max_payload_size = max(max_payload_size, fc->max_pages * PAGE_SIZE);
 
 	spin_lock(&fc->lock);
+	if (!fc->connected) {
+		spin_unlock(&fc->lock);
+		goto out_err;
+	}
 	if (fc->ring) {
 		/* race, another thread created the ring in the meantime */
 		spin_unlock(&fc->lock);
