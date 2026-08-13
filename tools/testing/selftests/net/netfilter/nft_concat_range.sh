@@ -2006,6 +2006,12 @@ test_bug_insert_overlap()
 {
 	local elements="1.2.3.4 . 1.2.4.1"
 
+	# This test has to be skipped, RHEL-10.2 ntentionally lacks
+	# 7711f4bb4b36 ("netfilter: nft_set_pipapo: fix range overlap detection")
+	# because this fix could cause issues with existing deployments
+	# (ruleset restore failure).
+	return ${ksft_skip}
+
 	setup veth send_"${proto}" set || return ${ksft_skip}
 
 	add "{ $elements }" || return 1
