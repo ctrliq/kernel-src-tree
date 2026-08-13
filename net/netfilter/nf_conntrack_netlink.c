@@ -241,7 +241,8 @@ static int ctnetlink_dump_helpinfo(struct sk_buff *skb,
 	if (nla_put_string(skb, CTA_HELP_NAME, helper->name))
 		goto nla_put_failure;
 
-	if (helper->to_nlattr)
+	if (rcu_access_pointer(helper->help) &&
+	    helper->to_nlattr)
 		helper->to_nlattr(skb, ct);
 
 	nla_nest_end(skb, nest_helper);
@@ -1936,6 +1937,7 @@ static int ctnetlink_change_helper(struct nf_conn *ct,
 	if (err < 0)
 		return err;
 
+	rcu_read_lock();
 	/* don't change helper of sibling connections */
 	if (ct->master) {
 		/* If we try to change the helper to the same thing twice,
@@ -1944,27 +1946,14 @@ static int ctnetlink_change_helper(struct nf_conn *ct,
 		 */
 		err = -EBUSY;
 		if (help) {
-			rcu_read_lock();
 			helper = rcu_dereference(help->helper);
 			if (helper && !strcmp(helper->name, helpname))
 				err = 0;
-			rcu_read_unlock();
 		}
-
+		rcu_read_unlock();
 		return err;
 	}
 
-	if (!strcmp(helpname, "")) {
-		if (help && help->helper) {
-			/* we had a helper before ... */
-			nf_ct_remove_expectations(ct);
-			RCU_INIT_POINTER(help->helper, NULL);
-		}
-
-		return 0;
-	}
-
-	rcu_read_lock();
 	helper = __nf_conntrack_helper_find(helpname, nf_ct_l3num(ct),
 					    nf_ct_protonum(ct));
 	if (helper == NULL) {
@@ -1975,7 +1964,8 @@ static int ctnetlink_change_helper(struct nf_conn *ct,
 	if (help) {
 		if (rcu_access_pointer(help->helper) == helper) {
 			/* update private helper data if allowed. */
-			if (helper->from_nlattr)
+			if (rcu_access_pointer(helper->help) &&
+			    helper->from_nlattr)
 				helper->from_nlattr(helpinfo, ct);
 			err = 0;
 		} else
@@ -2290,11 +2280,16 @@ ctnetlink_create_conntrack(struct net *net,
 				goto err2;
 			}
 			/* set private helper data if allowed. */
-			if (helper->from_nlattr)
+			if (rcu_access_pointer(helper->help) &&
+			    helper->from_nlattr)
 				helper->from_nlattr(helpinfo, ct);
 
 			/* disable helper auto-assignment for this entry */
 			ct->status |= IPS_HELPER;
+			if (!refcount_inc_not_zero(&helper->ct_refcnt)) {
+				err = -ENOENT;
+				goto err2;
+			}
 			RCU_INIT_POINTER(help->helper, helper);
 		}
 	}
@@ -3007,8 +3002,7 @@ static int
 ctnetlink_exp_dump_expect(struct sk_buff *skb,
 			  const struct nf_conntrack_expect *exp)
 {
-	struct nf_conn *master = exp->master;
-	long timeout = ((long)exp->timeout.expires - (long)jiffies) / HZ;
+	__s32 timeout = (__s32)(READ_ONCE(exp->timeout) - nfct_time_stamp) / HZ;
 	struct nf_conntrack_helper *helper;
 #if IS_ENABLED(CONFIG_NF_NAT)
 	struct nlattr *nest_parms;
@@ -3023,9 +3017,7 @@ ctnetlink_exp_dump_expect(struct sk_buff *skb,
 		goto nla_put_failure;
 	if (ctnetlink_exp_dump_mask(skb, &exp->tuple, &exp->mask) < 0)
 		goto nla_put_failure;
-	if (ctnetlink_exp_dump_tuple(skb,
-				 &master->tuplehash[IP_CT_DIR_ORIGINAL].tuple,
-				 CTA_EXPECT_MASTER) < 0)
+	if (ctnetlink_exp_dump_tuple(skb, &exp->master_tuple, CTA_EXPECT_MASTER) < 0)
 		goto nla_put_failure;
 
 #if IS_ENABLED(CONFIG_NF_NAT)
@@ -3038,9 +3030,9 @@ ctnetlink_exp_dump_expect(struct sk_buff *skb,
 		if (nla_put_be32(skb, CTA_EXPECT_NAT_DIR, htonl(exp->dir)))
 			goto nla_put_failure;
 
-		nat_tuple.src.l3num = nf_ct_l3num(master);
+		nat_tuple.src.l3num = exp->master_tuple.src.l3num;
 		nat_tuple.src.u3 = exp->saved_addr;
-		nat_tuple.dst.protonum = nf_ct_protonum(master);
+		nat_tuple.dst.protonum = exp->master_tuple.dst.protonum;
 		nat_tuple.src.u = exp->saved_proto;
 
 		if (ctnetlink_exp_dump_tuple(skb, &nat_tuple,
@@ -3171,10 +3163,13 @@ ctnetlink_exp_dump_table(struct sk_buff *skb, struct netlink_callback *cb)
 restart:
 		hlist_for_each_entry_rcu(exp, &nf_ct_expect_hash[cb->args[0]],
 					 hnode) {
+			if (nf_ct_exp_is_expired(exp))
+				continue;
+
 			if (l3proto && exp->tuple.src.l3num != l3proto)
 				continue;
 
-			if (!net_eq(nf_ct_net(exp->master), net))
+			if (!net_eq(nf_ct_exp_net(exp), net))
 				continue;
 
 			if (cb->args[1]) {
@@ -3449,11 +3444,8 @@ static int ctnetlink_del_expect(struct sk_buff *skb,
 		}
 
 		/* after list removal, usage count == 1 */
-		if (timer_delete(&exp->timeout)) {
-			nf_ct_unlink_expect_report(exp, NETLINK_CB(skb).portid,
-						   nlmsg_report(info->nlh));
-			nf_ct_expect_put(exp);
-		}
+		nf_ct_unlink_expect_report(exp, NETLINK_CB(skb).portid,
+					   nlmsg_report(info->nlh));
 		spin_unlock_bh(&nf_conntrack_expect_lock);
 		/* have to put what we 'get' above.
 		 * after this line usage count == 0 */
@@ -3477,14 +3469,10 @@ static int
 ctnetlink_change_expect(struct nf_conntrack_expect *x,
 			const struct nlattr * const cda[])
 {
-	if (cda[CTA_EXPECT_TIMEOUT]) {
-		if (!timer_delete(&x->timeout))
-			return -ETIME;
+	if (cda[CTA_EXPECT_TIMEOUT])
+		WRITE_ONCE(x->timeout, nfct_time_stamp +
+			   ntohl(nla_get_be32(cda[CTA_EXPECT_TIMEOUT])) * HZ);
 
-		x->timeout.expires = jiffies +
-			ntohl(nla_get_be32(cda[CTA_EXPECT_TIMEOUT])) * HZ;
-		add_timer(&x->timeout);
-	}
 	return 0;
 }
 
@@ -3562,8 +3550,6 @@ ctnetlink_alloc_expect(const struct nlattr * const cda[], struct nf_conn *ct,
 	if (cda[CTA_EXPECT_FLAGS]) {
 		exp->flags = ntohl(nla_get_be32(cda[CTA_EXPECT_FLAGS]));
 		exp->flags &= ~NF_CT_EXPECT_USERSPACE;
-	} else {
-		exp->flags = 0;
 	}
 	if (cda[CTA_EXPECT_FN]) {
 		const char *name = nla_data(cda[CTA_EXPECT_FN]);
@@ -3575,8 +3561,7 @@ ctnetlink_alloc_expect(const struct nlattr * const cda[], struct nf_conn *ct,
 			goto err_out;
 		}
 		exp->expectfn = expfn->expectfn;
-	} else
-		exp->expectfn = NULL;
+	}
 
 	exp->class = class;
 	exp->master = ct;
@@ -3586,6 +3571,7 @@ ctnetlink_alloc_expect(const struct nlattr * const cda[], struct nf_conn *ct,
 #endif
 	rcu_assign_pointer(exp->helper, helper);
 	rcu_assign_pointer(exp->assign_helper, assign_helper);
+	exp->master_tuple = ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple;
 	exp->tuple = *tuple;
 	exp->mask.src.u3 = mask->src.u3;
 	exp->mask.src.u.all = mask->src.u.all;
@@ -3595,12 +3581,6 @@ ctnetlink_alloc_expect(const struct nlattr * const cda[], struct nf_conn *ct,
 						 exp, nf_ct_l3num(ct));
 		if (err < 0)
 			goto err_out;
-#if IS_ENABLED(CONFIG_NF_NAT)
-	} else {
-		memset(&exp->saved_addr, 0, sizeof(exp->saved_addr));
-		memset(&exp->saved_proto, 0, sizeof(exp->saved_proto));
-		exp->dir = 0;
-#endif
 	}
 	return exp;
 err_out:
