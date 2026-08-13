@@ -1,0 +1,202 @@
+netfilter: nf_conntrack_gre: fix gre keymap list corruption
+
+jira KERNEL-1478
+Rebuild_History Non-Buildable kernel-6.12.0-211.47.1.el10_2
+commit-author Florian Westphal <fw@strlen.de>
+commit 47980b6dbf83961eec1c1363ea986e9c06ff8054
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.47.1.el10_2/47980b6d.failed
+
+Quoting reporter:
+  A race between GRE keymap insertion and destruction can corrupt the
+  kernel list or use a freed object. `nf_ct_gre_keymap_add()` publishes a
+  new keymap pointer before the embedded `list_head` is linked, while
+  `nf_ct_gre_keymap_destroy()` can concurrently delete and free that
+  same object. An unprivileged user can reach this through the PPTP
+  conntrack helper by racing PPTP control messages or helper teardown,
+  leading to KASAN-detectable list corruption/UAF in kernel context.
+
+ ## Root Cause Analysis
+ `exp_gre()` installs GRE expectations for a PPTP control flow and then
+  adds two GRE keymap entries [..]
+
+ The add path publishes `ct_pptp_info->keymap[dir]` before linking the
+ embedded list node [..]
+ Concurrent teardown deletes that partially initialized object.
+
+Make add/destroy symmetric: install both, destroy both while under lock.
+
+Furthermore, we should refuse to publish a new mapping in case ct is going
+away, else we may leak the allocation.
+
+The "retrans" detection is strange:  existing mapping is checked for key
+equality with the new mapping, then for "is on the list" via list walk.
+
+But I can't see how an existing keymap entry can be NOT on list.
+
+Change this to only check if we're asked to map same tuple again -- if so,
+   skip re-install, else signal failure.
+
+Last, add a bug trap for the keymap list; it has to be empty when namespace
+is going away.
+
+	Reported-by: Leo Lin <leo@depthfirst.com>
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+(cherry picked from commit 47980b6dbf83961eec1c1363ea986e9c06ff8054)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_conntrack_proto_gre.c
+diff --cc net/netfilter/nf_conntrack_proto_gre.c
+index af369e686fc5,35e22082d65a..000000000000
+--- a/net/netfilter/nf_conntrack_proto_gre.c
++++ b/net/netfilter/nf_conntrack_proto_gre.c
+@@@ -92,34 -128,56 +126,67 @@@ bool nf_ct_gre_keymap_add(struct nf_con
+  	struct net *net = nf_ct_net(ct);
+  	struct nf_gre_net *net_gre = gre_pernet(net);
+  	struct nf_ct_pptp_master *ct_pptp_info = nfct_help_data(ct);
+- 	struct nf_ct_gre_keymap **kmp, *km;
+- 
+- 	kmp = &ct_pptp_info->keymap[dir];
+- 	if (*kmp) {
+- 		/* check whether it's a retransmission */
+- 		list_for_each_entry_rcu(km, &net_gre->keymap_list, list) {
+- 			if (gre_key_cmpfn(km, t) && km == *kmp)
+- 				return 0;
+- 		}
+- 		pr_debug("trying to override keymap_%s for ct %p\n",
+- 			 dir == IP_CT_DIR_REPLY ? "reply" : "orig", ct);
+- 		return -EEXIST;
+- 	}
++ 	struct nf_ct_gre_keymap *km_orig, *km_repl;
++ 	bool ret = false;
+  
++ 	km_orig = kmalloc_obj(*km_orig, GFP_ATOMIC);
++ 	if (!km_orig)
++ 		return false;
++ 	km_repl = kmalloc_obj(*km_repl, GFP_ATOMIC);
++ 	if (!km_repl)
++ 		goto km_free;
++ 
+++<<<<<<< HEAD
+ +	km = kmalloc(sizeof(*km), GFP_ATOMIC);
+ +	if (!km)
+ +		return -ENOMEM;
+ +	memcpy(&km->tuple, t, sizeof(*t));
+ +	*kmp = km;
+ +
+ +	pr_debug("adding new entry %p: ", km);
+ +	nf_ct_dump_tuple(&km->tuple);
+++=======
++ 	memcpy(&km_orig->tuple, orig, sizeof(*orig));
++ 	memcpy(&km_repl->tuple, repl, sizeof(*repl));
+++>>>>>>> 47980b6dbf83 (netfilter: nf_conntrack_gre: fix gre keymap list corruption)
+  
+  	spin_lock_bh(&keymap_lock);
+- 	list_add_tail(&km->list, &net_gre->keymap_list);
++ 	if (nf_ct_is_dying(ct))
++ 		goto unlock_free;
++ 
++ 	switch (nf_ct_gre_km_acceptable(ct_pptp_info, orig, repl)) {
++ 	case NF_CT_GRE_KM_NEW:
++ 		break;
++ 	case NF_CT_GRE_KM_DUP:
++ 		ret = true;
++ 		goto unlock_free;
++ 	case NF_CT_GRE_KM_BAD:
++ 		pr_debug("trying to override keymap for ct %p\n", ct);
++ 		goto unlock_free;
++ 	}
++ 
++ 	if (ct_pptp_info->keymap[IP_CT_DIR_ORIGINAL] ||
++ 	    ct_pptp_info->keymap[IP_CT_DIR_REPLY])
++ 		goto unlock_free;
++ 
++ 	pr_debug("adding new entries %p,%p: ", km_orig, km_repl);
++ 	nf_ct_dump_tuple(&km_orig->tuple);
++ 	nf_ct_dump_tuple(&km_repl->tuple);
++ 
++ 	list_add_tail_rcu(&km_orig->list, &net_gre->keymap_list);
++ 	list_add_tail_rcu(&km_repl->list, &net_gre->keymap_list);
++ 	ct_pptp_info->keymap[IP_CT_DIR_ORIGINAL] = km_orig;
++ 	ct_pptp_info->keymap[IP_CT_DIR_REPLY] = km_repl;
+  	spin_unlock_bh(&keymap_lock);
+  
+- 	return 0;
++ 	return true;
++ 
++ unlock_free:
++ 	spin_unlock_bh(&keymap_lock);
++ km_free:
++ 	kfree(km_orig);
++ 	kfree(km_repl);
++ 	return ret;
+  }
+  EXPORT_SYMBOL_GPL(nf_ct_gre_keymap_add);
+  
+diff --git a/include/linux/netfilter/nf_conntrack_proto_gre.h b/include/linux/netfilter/nf_conntrack_proto_gre.h
+index 34ce5d2f37a2..4014f7891b3c 100644
+--- a/include/linux/netfilter/nf_conntrack_proto_gre.h
++++ b/include/linux/netfilter/nf_conntrack_proto_gre.h
+@@ -21,9 +21,10 @@ struct nf_ct_gre_keymap {
+ 	struct rcu_head rcu;
+ };
+ 
+-/* add new tuple->key_reply pair to keymap */
+-int nf_ct_gre_keymap_add(struct nf_conn *ct, enum ip_conntrack_dir dir,
+-			 struct nf_conntrack_tuple *t);
++/* add tuple->key_reply pairs to keymap */
++bool nf_ct_gre_keymap_add(struct nf_conn *ct,
++			  const struct nf_conntrack_tuple *orig,
++			  const struct nf_conntrack_tuple *repl);
+ 
+ /* delete keymap entries */
+ void nf_ct_gre_keymap_destroy(struct nf_conn *ct);
+diff --git a/net/netfilter/nf_conntrack_core.c b/net/netfilter/nf_conntrack_core.c
+index 02a73b2957ea..04f7a132fc83 100644
+--- a/net/netfilter/nf_conntrack_core.c
++++ b/net/netfilter/nf_conntrack_core.c
+@@ -576,6 +576,13 @@ static void destroy_gre_conntrack(struct nf_conn *ct)
+ #endif
+ }
+ 
++static void warn_on_keymap_list_leak(const struct net *net)
++{
++#ifdef CONFIG_NF_CT_PROTO_GRE
++	WARN_ON_ONCE(!list_empty(&net->ct.nf_ct_proto.gre.keymap_list));
++#endif
++}
++
+ void nf_ct_destroy(struct nf_conntrack *nfct)
+ {
+ 	struct nf_conn *ct = (struct nf_conn *)nfct;
+@@ -2525,6 +2532,7 @@ void nf_conntrack_cleanup_net_list(struct list_head *net_exit_list)
+ 	}
+ 
+ 	list_for_each_entry(net, net_exit_list, exit_list) {
++		warn_on_keymap_list_leak(net);
+ 		nf_conntrack_ecache_pernet_fini(net);
+ 		nf_conntrack_expect_pernet_fini(net);
+ 		free_percpu(net->ct.stat);
+diff --git a/net/netfilter/nf_conntrack_pptp.c b/net/netfilter/nf_conntrack_pptp.c
+index 4c679638df06..dc23e4181618 100644
+--- a/net/netfilter/nf_conntrack_pptp.c
++++ b/net/netfilter/nf_conntrack_pptp.c
+@@ -225,13 +225,9 @@ static int exp_gre(struct nf_conn *ct, __be16 callid, __be16 peer_callid)
+ 	if (nf_ct_expect_related(exp_reply, 0) != 0)
+ 		goto out_unexpect_orig;
+ 
+-	/* Add GRE keymap entries */
+-	if (nf_ct_gre_keymap_add(ct, IP_CT_DIR_ORIGINAL, &exp_orig->tuple) != 0)
++	if (!nf_ct_gre_keymap_add(ct, &exp_orig->tuple,
++				  &exp_reply->tuple))
+ 		goto out_unexpect_both;
+-	if (nf_ct_gre_keymap_add(ct, IP_CT_DIR_REPLY, &exp_reply->tuple) != 0) {
+-		nf_ct_gre_keymap_destroy(ct);
+-		goto out_unexpect_both;
+-	}
+ 	ret = 0;
+ 
+ out_put_both:
+* Unmerged path net/netfilter/nf_conntrack_proto_gre.c
