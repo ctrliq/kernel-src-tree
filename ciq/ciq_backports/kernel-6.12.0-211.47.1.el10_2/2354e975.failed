@@ -1,0 +1,159 @@
+netfilter: nf_dup_netdev: add nf_dev_xmit_recursion*() helpers and use them
+
+jira KERNEL-1478
+Rebuild_History Non-Buildable kernel-6.12.0-211.47.1.el10_2
+commit-author Pablo Neira Ayuso <pablo@netfilter.org>
+commit 2354e975932dabb06fad239f07a3b68fd1809737
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.47.1.el10_2/2354e975.failed
+
+Update nft_dup and nft_fwd to use the nf_dev_xmit_recursion() helpers.
+This patch also disables BH when transmitting the skb to address a
+possible migration to different CPU leading to imbalanced decrementation
+of the recursion counters.
+
+This is modeled after Florian Westphal's dev_xmit_recursion*() API
+available since commit 97cdcf37b57e ("net: place xmit recursion in
+softnet data") according to its current state in the tree.
+
+Fixes: 1d47b55b36d2 ("netfilter: nft_fwd_netdev: use recursion counter in neigh egress path")
+Fixes: f37ad9127039 ("netfilter: nf_dup_netdev: Move the recursion counter struct netdev_xmit")
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 2354e975932dabb06fad239f07a3b68fd1809737)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netfilter/nf_dup_netdev.h
+#	net/netfilter/nf_dup_netdev.c
+#	net/netfilter/nft_fwd_netdev.c
+diff --cc include/net/netfilter/nf_dup_netdev.h
+index b175d271aec9,f6b05bd80c3f..000000000000
+--- a/include/net/netfilter/nf_dup_netdev.h
++++ b/include/net/netfilter/nf_dup_netdev.h
+@@@ -7,6 -9,41 +7,44 @@@
+  void nf_dup_netdev_egress(const struct nft_pktinfo *pkt, int oif);
+  void nf_fwd_netdev_egress(const struct nft_pktinfo *pkt, int oif);
+  
+++<<<<<<< HEAD
+++=======
++ #define NF_RECURSION_LIMIT	2
++ 
++ #ifndef CONFIG_PREEMPT_RT
++ static inline bool nf_dev_xmit_recursion(void)
++ {
++ 	return unlikely(__this_cpu_read(softnet_data.xmit.nf_dup_skb_recursion) >
++ 			NF_RECURSION_LIMIT);
++ }
++ 
++ static inline void nf_dev_xmit_recursion_inc(void)
++ {
++ 	__this_cpu_inc(softnet_data.xmit.nf_dup_skb_recursion);
++ }
++ 
++ static inline void nf_dev_xmit_recursion_dec(void)
++ {
++ 	__this_cpu_dec(softnet_data.xmit.nf_dup_skb_recursion);
++ }
++ #else
++ static inline bool nf_dev_xmit_recursion(void)
++ {
++ 	return unlikely(current->net_xmit.nf_dup_skb_recursion > NF_RECURSION_LIMIT);
++ }
++ 
++ static inline void nf_dev_xmit_recursion_inc(void)
++ {
++ 	current->net_xmit.nf_dup_skb_recursion++;
++ }
++ 
++ static inline void nf_dev_xmit_recursion_dec(void)
++ {
++ 	current->net_xmit.nf_dup_skb_recursion--;
++ }
++ #endif
++ 
+++>>>>>>> 2354e975932d (netfilter: nf_dup_netdev: add nf_dev_xmit_recursion*() helpers and use them)
+  struct nft_offload_ctx;
+  struct nft_flow_rule;
+  
+diff --cc net/netfilter/nf_dup_netdev.c
+index a8e2425e43b0,c189716e986a..000000000000
+--- a/net/netfilter/nf_dup_netdev.c
++++ b/net/netfilter/nf_dup_netdev.c
+@@@ -20,9 -16,6 +20,12 @@@ static DEFINE_PER_CPU(u8, nf_dup_skb_re
+  static void nf_do_netdev_egress(struct sk_buff *skb, struct net_device *dev,
+  				enum nf_dev_hooks hook)
+  {
+++<<<<<<< HEAD
+ +	if (__this_cpu_read(nf_dup_skb_recursion) > NF_RECURSION_LIMIT)
+ +		goto err;
+ +
+++=======
+++>>>>>>> 2354e975932d (netfilter: nf_dup_netdev: add nf_dev_xmit_recursion*() helpers and use them)
+  	if (hook == NF_NETDEV_INGRESS && skb_mac_header_was_set(skb)) {
+  		if (skb_cow_head(skb, skb->mac_len))
+  			goto err;
+@@@ -32,9 -25,15 +35,21 @@@
+  
+  	skb->dev = dev;
+  	skb_clear_tstamp(skb);
+++<<<<<<< HEAD
+ +	__this_cpu_inc(nf_dup_skb_recursion);
+ +	dev_queue_xmit(skb);
+ +	__this_cpu_dec(nf_dup_skb_recursion);
+++=======
++ 	local_bh_disable();
++ 	if (nf_dev_xmit_recursion()) {
++ 		local_bh_enable();
++ 		goto err;
++ 	}
++ 	nf_dev_xmit_recursion_inc();
++ 	dev_queue_xmit(skb);
++ 	nf_dev_xmit_recursion_dec();
++ 	local_bh_enable();
+++>>>>>>> 2354e975932d (netfilter: nf_dup_netdev: add nf_dev_xmit_recursion*() helpers and use them)
+  	return;
+  err:
+  	kfree_skb(skb);
+diff --cc net/netfilter/nft_fwd_netdev.c
+index 08246efa7c15,a48c2f765bba..000000000000
+--- a/net/netfilter/nft_fwd_netdev.c
++++ b/net/netfilter/nft_fwd_netdev.c
+@@@ -144,7 -154,14 +144,18 @@@ static void nft_fwd_neigh_eval(const st
+  	}
+  
+  	dev = dev_get_by_index_rcu(nft_net(pkt), oif);
+++<<<<<<< HEAD
+ +	if (dev == NULL) {
+++=======
++ 	if (!dev) {
++ 		verdict = NF_DROP;
++ 		goto out;
++ 	}
++ 
++ 	local_bh_disable();
++ 	if (nf_dev_xmit_recursion()) {
++ 		local_bh_enable();
+++>>>>>>> 2354e975932d (netfilter: nf_dup_netdev: add nf_dev_xmit_recursion*() helpers and use them)
+  		verdict = NF_DROP;
+  		goto out;
+  	}
+@@@ -160,7 -177,11 +171,15 @@@
+  
+  	skb->dev = dev;
+  	skb_clear_tstamp(skb);
+++<<<<<<< HEAD
+++	neigh_xmit(neigh_table, dev, addr, skb);
+++=======
++ 
++ 	nf_dev_xmit_recursion_inc();
+  	neigh_xmit(neigh_table, dev, addr, skb);
++ 	nf_dev_xmit_recursion_dec();
++ 	local_bh_enable();
+++>>>>>>> 2354e975932d (netfilter: nf_dup_netdev: add nf_dev_xmit_recursion*() helpers and use them)
+  out:
+  	regs->verdict.code = verdict;
+  }
+* Unmerged path include/net/netfilter/nf_dup_netdev.h
+* Unmerged path net/netfilter/nf_dup_netdev.c
+* Unmerged path net/netfilter/nft_fwd_netdev.c
