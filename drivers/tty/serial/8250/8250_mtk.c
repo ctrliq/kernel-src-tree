@@ -671,7 +671,7 @@ static struct platform_driver mtk8250_platform_driver = {
 		.acpi_match_table = mtk8250_acpi_match,
 	},
 	.probe			= mtk8250_probe,
-	.remove_new		= mtk8250_remove,
+	.remove			= mtk8250_remove,
 };
 module_platform_driver(mtk8250_platform_driver);
 
