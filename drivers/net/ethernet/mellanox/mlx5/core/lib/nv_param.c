@@ -200,7 +200,8 @@ static const char *const
 
 static int
 mlx5_nv_param_devlink_cqe_compress_get(struct devlink *devlink, u32 id,
-				       struct devlink_param_gset_ctx *ctx)
+				       struct devlink_param_gset_ctx *ctx,
+				       struct netlink_ext_ack *extack)
 {
 	struct mlx5_core_dev *dev = devlink_priv(devlink);
 	u32 mnvda[MLX5_ST_SZ_DW(mnvda_reg)] = {};
@@ -224,13 +225,13 @@ mlx5_nv_param_devlink_cqe_compress_get(struct devlink *devlink, u32 id,
 
 static int
 mlx5_nv_param_devlink_cqe_compress_validate(struct devlink *devlink, u32 id,
-					    union devlink_param_value val,
+					    union devlink_param_value *val,
 					    struct netlink_ext_ack *extack)
 {
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(cqe_compress_str); i++) {
-		if (!strcmp(val.vstr, cqe_compress_str[i]))
+		if (!strcmp(val->vstr, cqe_compress_str[i]))
 			return 0;
 	}
 
@@ -302,7 +303,8 @@ static int mlx5_nv_param_read_per_host_pf_conf(struct mlx5_core_dev *dev,
 }
 
 static int mlx5_devlink_enable_sriov_get(struct devlink *devlink, u32 id,
-					 struct devlink_param_gset_ctx *ctx)
+					 struct devlink_param_gset_ctx *ctx,
+					 struct netlink_ext_ack *extack)
 {
 	struct mlx5_core_dev *dev = devlink_priv(devlink);
 	u32 mnvda[MLX5_ST_SZ_DW(mnvda_reg)] = {};
@@ -413,7 +415,8 @@ static int mlx5_devlink_enable_sriov_set(struct devlink *devlink, u32 id,
 }
 
 static int mlx5_devlink_total_vfs_get(struct devlink *devlink, u32 id,
-				      struct devlink_param_gset_ctx *ctx)
+				      struct devlink_param_gset_ctx *ctx,
+				      struct netlink_ext_ack *extack)
 {
 	struct mlx5_core_dev *dev = devlink_priv(devlink);
 	u32 mnvda[MLX5_ST_SZ_DW(mnvda_reg)] = {};
@@ -503,7 +506,7 @@ static int mlx5_devlink_total_vfs_set(struct devlink *devlink, u32 id,
 }
 
 static int mlx5_devlink_total_vfs_validate(struct devlink *devlink, u32 id,
-					   union devlink_param_value val,
+					   union devlink_param_value *val,
 					   struct netlink_ext_ack *extack)
 {
 	struct mlx5_core_dev *dev = devlink_priv(devlink);
@@ -522,7 +525,7 @@ static int mlx5_devlink_total_vfs_validate(struct devlink *devlink, u32 id,
 		return 0; /* optimistic, but set might fail later */
 
 	max = MLX5_GET(nv_global_pci_cap, data, max_vfs_per_pf);
-	if (val.vu16 > max) {
+	if (val->vu16 > max) {
 		NL_SET_ERR_MSG_FMT_MOD(extack,
 				       "Max allowed by device is %u", max);
 		return -EINVAL;

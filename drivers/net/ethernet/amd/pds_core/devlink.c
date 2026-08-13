@@ -22,7 +22,8 @@ pdsc_viftype *pdsc_dl_find_viftype_by_id(struct pdsc *pdsc,
 }
 
 int pdsc_dl_enable_get(struct devlink *dl, u32 id,
-		       struct devlink_param_gset_ctx *ctx)
+		       struct devlink_param_gset_ctx *ctx,
+		       struct netlink_ext_ack *extack)
 {
 	struct pdsc *pdsc = devlink_priv(dl);
 	struct pdsc_viftype *vt_entry;
@@ -64,7 +65,7 @@ int pdsc_dl_enable_set(struct devlink *dl, u32 id,
 }
 
 int pdsc_dl_enable_validate(struct devlink *dl, u32 id,
-			    union devlink_param_value val,
+			    union devlink_param_value *val,
 			    struct netlink_ext_ack *extack)
 {
 	struct pdsc *pdsc = devlink_priv(dl);

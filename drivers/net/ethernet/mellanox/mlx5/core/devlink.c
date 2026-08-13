@@ -461,11 +461,11 @@ void mlx5_devlink_free(struct devlink *devlink)
 }
 
 static int mlx5_devlink_enable_roce_validate(struct devlink *devlink, u32 id,
-					     union devlink_param_value val,
+					     union devlink_param_value *val,
 					     struct netlink_ext_ack *extack)
 {
 	struct mlx5_core_dev *dev = devlink_priv(devlink);
-	bool new_state = val.vbool;
+	bool new_state = val->vbool;
 
 	if (new_state && !MLX5_CAP_GEN(dev, roce) &&
 	    !(MLX5_CAP_GEN(dev, roce_rw_supported) && MLX5_CAP_GEN_MAX(dev, roce))) {
@@ -482,10 +482,10 @@ static int mlx5_devlink_enable_roce_validate(struct devlink *devlink, u32 id,
 
 #ifdef CONFIG_MLX5_ESWITCH
 static int mlx5_devlink_large_group_num_validate(struct devlink *devlink, u32 id,
-						 union devlink_param_value val,
+						 union devlink_param_value *val,
 						 struct netlink_ext_ack *extack)
 {
-	int group_num = val.vu32;
+	int group_num = val->vu32;
 
 	if (group_num < 1 || group_num > 1024) {
 		NL_SET_ERR_MSG_MOD(extack,
@@ -498,27 +498,27 @@ static int mlx5_devlink_large_group_num_validate(struct devlink *devlink, u32 id
 #endif
 
 static int mlx5_devlink_eq_depth_validate(struct devlink *devlink, u32 id,
-					  union devlink_param_value val,
+					  union devlink_param_value *val,
 					  struct netlink_ext_ack *extack)
 {
-	return (val.vu32 >= 64 && val.vu32 <= 4096) ? 0 : -EINVAL;
+	return (val->vu32 >= 64 && val->vu32 <= 4096) ? 0 : -EINVAL;
 }
 
 static int
 mlx5_devlink_hairpin_num_queues_validate(struct devlink *devlink, u32 id,
-					 union devlink_param_value val,
+					 union devlink_param_value *val,
 					 struct netlink_ext_ack *extack)
 {
-	return val.vu32 ? 0 : -EINVAL;
+	return val->vu32 ? 0 : -EINVAL;
 }
 
 static int
 mlx5_devlink_hairpin_queue_size_validate(struct devlink *devlink, u32 id,
-					 union devlink_param_value val,
+					 union devlink_param_value *val,
 					 struct netlink_ext_ack *extack)
 {
 	struct mlx5_core_dev *dev = devlink_priv(devlink);
-	u32 val32 = val.vu32;
+	u32 val32 = val->vu32;
 
 	if (!is_power_of_2(val32)) {
 		NL_SET_ERR_MSG_MOD(extack, "Value is not power of two");
@@ -550,13 +550,13 @@ static void mlx5_devlink_hairpin_params_init_values(struct devlink *devlink)
 
 	value.vu32 = link_speed64;
 	devl_param_driverinit_value_set(
-		devlink, MLX5_DEVLINK_PARAM_ID_HAIRPIN_NUM_QUEUES, value);
+		devlink, MLX5_DEVLINK_PARAM_ID_HAIRPIN_NUM_QUEUES, &value);
 
 	value.vu32 =
 		BIT(min_t(u32, 16 - MLX5_MPWRQ_MIN_LOG_STRIDE_SZ(dev),
 			  MLX5_CAP_GEN(dev, log_max_hairpin_num_packets)));
 	devl_param_driverinit_value_set(
-		devlink, MLX5_DEVLINK_PARAM_ID_HAIRPIN_QUEUE_SIZE, value);
+		devlink, MLX5_DEVLINK_PARAM_ID_HAIRPIN_QUEUE_SIZE, &value);
 }
 
 static const struct devlink_param mlx5_devlink_params[] = {
@@ -583,24 +583,24 @@ static void mlx5_devlink_set_params_init_values(struct devlink *devlink)
 	value.vbool = MLX5_CAP_GEN(dev, roce) && !mlx5_dev_is_lightweight(dev);
 	devl_param_driverinit_value_set(devlink,
 					DEVLINK_PARAM_GENERIC_ID_ENABLE_ROCE,
-					value);
+					&value);
 
 #ifdef CONFIG_MLX5_ESWITCH
 	value.vu32 = ESW_OFFLOADS_DEFAULT_NUM_GROUPS;
 	devl_param_driverinit_value_set(devlink,
 					MLX5_DEVLINK_PARAM_ID_ESW_LARGE_GROUP_NUM,
-					value);
+					&value);
 #endif
 
 	value.vu32 = MLX5_COMP_EQ_SIZE;
 	devl_param_driverinit_value_set(devlink,
 					DEVLINK_PARAM_GENERIC_ID_IO_EQ_SIZE,
-					value);
+					&value);
 
 	value.vu32 = MLX5_NUM_ASYNC_EQE;
 	devl_param_driverinit_value_set(devlink,
 					DEVLINK_PARAM_GENERIC_ID_EVENT_EQ_SIZE,
-					value);
+					&value);
 }
 
 static const struct devlink_param mlx5_devlink_eth_params[] = {
@@ -633,7 +633,7 @@ static int mlx5_devlink_eth_params_register(struct devlink *devlink)
 	value.vbool = !mlx5_dev_is_lightweight(dev);
 	devl_param_driverinit_value_set(devlink,
 					DEVLINK_PARAM_GENERIC_ID_ENABLE_ETH,
-					value);
+					&value);
 
 	mlx5_devlink_hairpin_params_init_values(devlink);
 
@@ -657,12 +657,12 @@ static void mlx5_devlink_eth_params_unregister(struct devlink *devlink)
 
 static int
 mlx5_devlink_pcie_cong_thresh_validate(struct devlink *devl, u32 id,
-				       union devlink_param_value val,
+				       union devlink_param_value *val,
 				       struct netlink_ext_ack *extack)
 {
-	if (val.vu16 > MLX5_PCIE_CONG_THRESH_MAX) {
+	if (val->vu16 > MLX5_PCIE_CONG_THRESH_MAX) {
 		NL_SET_ERR_MSG_FMT_MOD(extack, "Value %u > max supported (%u)",
-				       val.vu16, MLX5_PCIE_CONG_THRESH_MAX);
+				       val->vu16, MLX5_PCIE_CONG_THRESH_MAX);
 
 		return -EINVAL;
 	}
@@ -687,19 +687,19 @@ static void mlx5_devlink_pcie_cong_init_values(struct devlink *devlink)
 
 	value.vu16 = MLX5_PCIE_CONG_THRESH_DEF_LOW;
 	id = MLX5_DEVLINK_PARAM_ID_PCIE_CONG_IN_LOW;
-	devl_param_driverinit_value_set(devlink, id, value);
+	devl_param_driverinit_value_set(devlink, id, &value);
 
 	value.vu16 = MLX5_PCIE_CONG_THRESH_DEF_HIGH;
 	id = MLX5_DEVLINK_PARAM_ID_PCIE_CONG_IN_HIGH;
-	devl_param_driverinit_value_set(devlink, id, value);
+	devl_param_driverinit_value_set(devlink, id, &value);
 
 	value.vu16 = MLX5_PCIE_CONG_THRESH_DEF_LOW;
 	id = MLX5_DEVLINK_PARAM_ID_PCIE_CONG_OUT_LOW;
-	devl_param_driverinit_value_set(devlink, id, value);
+	devl_param_driverinit_value_set(devlink, id, &value);
 
 	value.vu16 = MLX5_PCIE_CONG_THRESH_DEF_HIGH;
 	id = MLX5_DEVLINK_PARAM_ID_PCIE_CONG_OUT_HIGH;
-	devl_param_driverinit_value_set(devlink, id, value);
+	devl_param_driverinit_value_set(devlink, id, &value);
 }
 
 static const struct devlink_param mlx5_devlink_pcie_cong_params[] = {
@@ -751,11 +751,11 @@ static void mlx5_devlink_pcie_cong_params_unregister(struct devlink *devlink)
 }
 
 static int mlx5_devlink_enable_rdma_validate(struct devlink *devlink, u32 id,
-					     union devlink_param_value val,
+					     union devlink_param_value *val,
 					     struct netlink_ext_ack *extack)
 {
 	struct mlx5_core_dev *dev = devlink_priv(devlink);
-	bool new_state = val.vbool;
+	bool new_state = val->vbool;
 
 	if (new_state && !mlx5_rdma_supported(dev))
 		return -EOPNOTSUPP;
@@ -784,7 +784,7 @@ static int mlx5_devlink_rdma_params_register(struct devlink *devlink)
 	value.vbool = !mlx5_dev_is_lightweight(dev);
 	devl_param_driverinit_value_set(devlink,
 					DEVLINK_PARAM_GENERIC_ID_ENABLE_RDMA,
-					value);
+					&value);
 	return 0;
 }
 
@@ -819,7 +819,7 @@ static int mlx5_devlink_vnet_params_register(struct devlink *devlink)
 	value.vbool = !mlx5_dev_is_lightweight(dev);
 	devl_param_driverinit_value_set(devlink,
 					DEVLINK_PARAM_GENERIC_ID_ENABLE_VNET,
-					value);
+					&value);
 	return 0;
 }
 
@@ -866,22 +866,22 @@ static void mlx5_devlink_auxdev_params_unregister(struct devlink *devlink)
 }
 
 static int mlx5_devlink_max_uc_list_validate(struct devlink *devlink, u32 id,
-					     union devlink_param_value val,
+					     union devlink_param_value *val,
 					     struct netlink_ext_ack *extack)
 {
 	struct mlx5_core_dev *dev = devlink_priv(devlink);
 
-	if (val.vu32 == 0) {
+	if (val->vu32 == 0) {
 		NL_SET_ERR_MSG_MOD(extack, "max_macs value must be greater than 0");
 		return -EINVAL;
 	}
 
-	if (!is_power_of_2(val.vu32)) {
+	if (!is_power_of_2(val->vu32)) {
 		NL_SET_ERR_MSG_MOD(extack, "Only power of 2 values are supported for max_macs");
 		return -EINVAL;
 	}
 
-	if (ilog2(val.vu32) >
+	if (ilog2(val->vu32) >
 	    MLX5_CAP_GEN_MAX(dev, log_max_current_uc_list)) {
 		NL_SET_ERR_MSG_MOD(extack, "max_macs value is out of the supported range");
 		return -EINVAL;
@@ -912,7 +912,7 @@ static int mlx5_devlink_max_uc_list_params_register(struct devlink *devlink)
 	value.vu32 = 1 << MLX5_CAP_GEN(dev, log_max_current_uc_list);
 	devl_param_driverinit_value_set(devlink,
 					DEVLINK_PARAM_GENERIC_ID_MAX_MACS,
-					value);
+					&value);
 	return 0;
 }
 
