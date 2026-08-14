@@ -124,7 +124,7 @@ static void free_tcf(struct tc_action *p)
 	if (chain)
 		tcf_chain_put_by_act(chain);
 
-	kfree_rcu(p, tcfa_rcu);
+	kfree_rcu_mightsleep(p);
 }
 
 static void offload_action_hw_count_set(struct tc_action *act,
