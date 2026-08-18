@@ -12,9 +12,17 @@
 #include <crypto/curve25519.h>
 #include <linux/module.h>
 #include <linux/init.h>
+#include <linux/fips.h>
 
 static int __init curve25519_init(void)
 {
+#ifdef CONFIG_RHEL_DIFFERENCES
+	if (fips_enabled) {
+		printk(KERN_WARNING "curve25519 is not allowed in FIPS mode!\n");
+		return -EOPNOTSUPP;
+	}
+#endif
+
 	if (IS_ENABLED(CONFIG_CRYPTO_SELFTESTS) &&
 	    WARN_ON(!curve25519_selftest()))
 		return -ENODEV;

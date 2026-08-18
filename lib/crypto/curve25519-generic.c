@@ -12,6 +12,7 @@
 #include <crypto/curve25519.h>
 #include <linux/export.h>
 #include <linux/module.h>
+#include <linux/fips.h>
 
 const u8 curve25519_null_point[CURVE25519_KEY_SIZE] __aligned(32) = { 0 };
 const u8 curve25519_base_point[CURVE25519_KEY_SIZE] __aligned(32) = { 9 };
@@ -19,6 +20,20 @@ const u8 curve25519_base_point[CURVE25519_KEY_SIZE] __aligned(32) = { 9 };
 EXPORT_SYMBOL(curve25519_null_point);
 EXPORT_SYMBOL(curve25519_base_point);
 EXPORT_SYMBOL(curve25519_generic);
+
+#ifdef CONFIG_RHEL_DIFFERENCES
+static int __init curve25519_generic_init(void)
+{
+	if (fips_enabled) {
+		printk(KERN_WARNING "curve25519 is not allowed in FIPS mode!\n");
+		return -EOPNOTSUPP;
+	}
+
+	return 0;
+}
+
+module_init(curve25519_generic_init);
+#endif
 
 MODULE_LICENSE("GPL v2");
 MODULE_DESCRIPTION("Curve25519 scalar multiplication");
