@@ -690,7 +690,9 @@ struct dl_rq {
 	/* runqueue is an rbtree, ordered by deadline */
 	struct rb_root_cached	root;
 
-	unsigned long		dl_nr_running;
+	RH_KABI_REPLACE_SPLIT(unsigned long dl_nr_running,
+	                      unsigned int  dl_nr_running,
+	                      unsigned int  dl_nr_migratory)
 
 #ifdef CONFIG_SMP
 	/*
@@ -704,7 +706,12 @@ struct dl_rq {
 		u64		next;
 	} earliest_dl;
 
-	unsigned long		dl_nr_migratory;
+	/*
+	 * Maximum available bandwidth for reclaiming by SCHED_FLAG_RECLAIM
+	 * tasks of this rq. Used in calculation of reclaimable bandwidth(GRUB).
+	 */
+	RH_KABI_REPLACE(unsigned long dl_nr_migratory,
+	                u64 max_bw)
 	int			overloaded;
 
 	/*
@@ -734,12 +741,6 @@ struct dl_rq {
 	 */
 	u64			this_bw;
 	u64			extra_bw;
-
-	/*
-	 * Maximum available bandwidth for reclaiming by SCHED_FLAG_RECLAIM
-	 * tasks of this rq. Used in calculation of reclaimable bandwidth(GRUB).
-	 */
-	u64			max_bw;
 
 	/*
 	 * Inverse of the fraction of CPU utilization that can be reclaimed
