@@ -1891,7 +1891,7 @@ static int __init init_iommu_one(struct amd_iommu *iommu, struct ivhd_header *h,
 	iommu->pci_seg = pci_seg;
 
 	raw_spin_lock_init(&iommu->lock);
-	atomic64_set(&iommu->cmd_sem_val, 0);
+	iommu->cmd_sem_val = 0;
 
 	/* Add IOMMU to internal data structures */
 	list_add_tail(&iommu->list, &amd_iommu_list);
@@ -1933,11 +1933,10 @@ static int __init init_iommu_one(struct amd_iommu *iommu, struct ivhd_header *h,
 		/* XT and GAM require GA mode. */
 		if ((h->efr_reg & (0x1 << IOMMU_EFR_GASUP_SHIFT)) == 0) {
 			amd_iommu_guest_ir = AMD_IOMMU_GUEST_IR_LEGACY;
-			break;
+		} else {
+			if (h->efr_reg & BIT(IOMMU_EFR_XTSUP_SHIFT))
+				amd_iommu_xt_mode = IRQ_REMAP_X2APIC_MODE;
 		}
-
-		if (h->efr_reg & BIT(IOMMU_EFR_XTSUP_SHIFT))
-			amd_iommu_xt_mode = IRQ_REMAP_X2APIC_MODE;
 
 		if (h->efr_attr & BIT(IOMMU_IVHD_ATTR_HATDIS_SHIFT)) {
 			pr_warn_once("Host Address Translation is not supported.\n");
@@ -3835,6 +3834,12 @@ not_found:
 	return 1;
 
 found:
+	if (early_acpihid_map_size == EARLY_MAP_SIZE) {
+		pr_err("Early ACPI HID map overflow - ignoring ivrs_acpihid%s\n",
+		       str);
+		return 1;
+	}
+
 	p = acpiid;
 	hid = strsep(&p, ":");
 	uid = p;
