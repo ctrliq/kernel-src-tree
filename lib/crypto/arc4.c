@@ -10,10 +10,18 @@
 #include <crypto/arc4.h>
 #include <linux/export.h>
 #include <linux/module.h>
+#include <linux/fips.h>
 
 int arc4_setkey(struct arc4_ctx *ctx, const u8 *in_key, unsigned int key_len)
 {
 	int i, j = 0, k = 0;
+
+#ifdef CONFIG_RHEL_DIFFERENCES
+	if (fips_enabled) {
+		WARN_ONCE(1, "ARC4 is not allowed in FIPS mode\n");
+		return -EOPNOTSUPP;
+	}
+#endif
 
 	ctx->x = 1;
 	ctx->y = 0;
@@ -43,6 +51,10 @@ void arc4_crypt(struct arc4_ctx *ctx, u8 *out, const u8 *in, unsigned int len)
 
 	if (len == 0)
 		return;
+
+#ifdef CONFIG_RHEL_DIFFERENCES
+	BUG_ON(fips_enabled);
+#endif
 
 	x = ctx->x;
 	y = ctx->y;
