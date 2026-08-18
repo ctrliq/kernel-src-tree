@@ -898,5 +898,19 @@ void des3_ede_decrypt(const struct des3_ede_ctx *dctx, u8 *dst, const u8 *src)
 }
 EXPORT_SYMBOL_GPL(des3_ede_decrypt);
 
+#ifdef CONFIG_RHEL_DIFFERENCES
+static int __init des_module_init(void)
+{
+	if (fips_enabled) {
+		printk(KERN_WARNING "DES is not allowed in FIPS mode!\n");
+		return -EOPNOTSUPP;
+	}
+
+	return 0;
+}
+
+module_init(des_module_init);
+#endif
+
 MODULE_DESCRIPTION("DES & Triple DES EDE Cipher Algorithms");
 MODULE_LICENSE("GPL");
