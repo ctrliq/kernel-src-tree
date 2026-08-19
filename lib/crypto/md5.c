@@ -12,6 +12,7 @@
 
 #include <crypto/hmac.h>
 #include <crypto/md5.h>
+#include <linux/fips.h>
 #include <linux/export.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
@@ -136,6 +137,10 @@ static void __maybe_unused md5_blocks_generic(struct md5_block_state *state,
 
 void md5_init(struct md5_ctx *ctx)
 {
+#ifdef CONFIG_RHEL_DIFFERENCES
+	BUG_ON(fips_enabled);
+#endif
+
 	ctx->state = md5_iv;
 	ctx->bytecount = 0;
 }
@@ -219,6 +224,10 @@ static void __hmac_md5_preparekey(struct md5_block_state *istate,
 		unsigned long w[MD5_BLOCK_SIZE / sizeof(unsigned long)];
 	} derived_key = { 0 };
 
+#ifdef CONFIG_RHEL_DIFFERENCES
+	BUG_ON(fips_enabled);
+#endif
+
 	if (unlikely(raw_key_len > MD5_BLOCK_SIZE))
 		md5(raw_key, raw_key_len, derived_key.b);
 	else
@@ -247,6 +256,10 @@ EXPORT_SYMBOL_GPL(hmac_md5_preparekey);
 
 void hmac_md5_init(struct hmac_md5_ctx *ctx, const struct hmac_md5_key *key)
 {
+#ifdef CONFIG_RHEL_DIFFERENCES
+	BUG_ON(fips_enabled);
+#endif
+
 	ctx->hash_ctx.state = key->istate;
 	ctx->hash_ctx.bytecount = MD5_BLOCK_SIZE;
 	ctx->ostate = key->ostate;
