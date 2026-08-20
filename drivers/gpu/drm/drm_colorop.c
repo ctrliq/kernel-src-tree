@@ -169,12 +169,8 @@ void drm_colorop_cleanup(struct drm_colorop *colorop)
 	list_del(&colorop->head);
 	config->num_colorop--;
 
-	if (colorop->state && colorop->state->data) {
-		drm_property_blob_put(colorop->state->data);
-		colorop->state->data = NULL;
-	}
-
-	kfree(colorop->state);
+	if (colorop->state)
+		drm_colorop_atomic_destroy_state(colorop, colorop->state);
 }
 EXPORT_SYMBOL(drm_colorop_cleanup);
 
@@ -325,7 +321,6 @@ int drm_plane_colorop_curve_1d_lut_init(struct drm_device *dev, struct drm_color
 
 	colorop->lut1d_interpolation_property = prop;
 	drm_object_attach_property(&colorop->base, prop, interpolation);
-	colorop->lut1d_interpolation = interpolation;
 
 	/* data */
 	ret = drm_colorop_create_data_prop(dev, colorop);
@@ -421,7 +416,6 @@ int drm_plane_colorop_3dlut_init(struct drm_device *dev, struct drm_colorop *col
 
 	colorop->lut3d_interpolation_property = prop;
 	drm_object_attach_property(&colorop->base, prop, interpolation);
-	colorop->lut3d_interpolation = interpolation;
 
 	/* data */
 	ret = drm_colorop_create_data_prop(dev, colorop);
@@ -441,8 +435,6 @@ static void __drm_atomic_helper_colorop_duplicate_state(struct drm_colorop *colo
 
 	if (state->data)
 		drm_property_blob_get(state->data);
-
-	state->bypass = true;
 }
 
 struct drm_colorop_state *
@@ -460,9 +452,23 @@ drm_atomic_helper_colorop_duplicate_state(struct drm_colorop *colorop)
 	return state;
 }
 
+/**
+ * __drm_atomic_helper_colorop_destroy_state - release colorop state
+ * @state: colorop state object to release
+ *
+ * Releases all resources stored in the colorop state without actually freeing
+ * the memory of the colorop state. This is useful for drivers that subclass the
+ * colorop state.
+ */
+static void __drm_atomic_helper_colorop_destroy_state(struct drm_colorop_state *state)
+{
+	drm_property_blob_put(state->data);
+}
+
 void drm_colorop_atomic_destroy_state(struct drm_colorop *colorop,
 				      struct drm_colorop_state *state)
 {
+	__drm_atomic_helper_colorop_destroy_state(state);
 	kfree(state);
 }
 
@@ -487,6 +493,20 @@ static void __drm_colorop_state_reset(struct drm_colorop_state *colorop_state,
 						      colorop->curve_1d_type_property,
 						      &val);
 		colorop_state->curve_1d_type = val;
+	}
+
+	if (colorop->lut1d_interpolation_property) {
+		if (!drm_object_property_get_default_value(&colorop->base,
+							   colorop->lut1d_interpolation_property,
+							   &val))
+			colorop_state->lut1d_interpolation = val;
+	}
+
+	if (colorop->lut3d_interpolation_property) {
+		if (!drm_object_property_get_default_value(&colorop->base,
+							   colorop->lut3d_interpolation_property,
+							   &val))
+			colorop_state->lut3d_interpolation = val;
 	}
 }
 
@@ -513,7 +533,9 @@ static void __drm_colorop_reset(struct drm_colorop *colorop,
 
 void drm_colorop_reset(struct drm_colorop *colorop)
 {
-	kfree(colorop->state);
+	if (colorop->state)
+		drm_colorop_atomic_destroy_state(colorop, colorop->state);
+
 	colorop->state = kzalloc_obj(*colorop->state);
 
 	if (colorop->state)
