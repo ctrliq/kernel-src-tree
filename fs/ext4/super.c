@@ -286,12 +286,14 @@ static int ext4_verify_csum_type(struct super_block *sb,
 	return es->s_checksum_type == EXT4_CRC32C_CHKSUM;
 }
 
-__le32 ext4_superblock_csum(struct ext4_super_block *es)
+__le32 ext4_superblock_csum(struct super_block *sb,
+			    struct ext4_super_block *es)
 {
+	struct ext4_sb_info *sbi = EXT4_SB(sb);
 	int offset = offsetof(struct ext4_super_block, s_checksum);
 	__u32 csum;
 
-	csum = ext4_chksum(~0, (char *)es, offset);
+	csum = ext4_chksum(sbi, ~0, (char *)es, offset);
 
 	return cpu_to_le32(csum);
 }
@@ -299,20 +301,20 @@ __le32 ext4_superblock_csum(struct ext4_super_block *es)
 static int ext4_superblock_csum_verify(struct super_block *sb,
 				       struct ext4_super_block *es)
 {
-	if (!ext4_has_feature_metadata_csum(sb))
+	if (!ext4_has_metadata_csum(sb))
 		return 1;
 
-	return es->s_checksum == ext4_superblock_csum(es);
+	return es->s_checksum == ext4_superblock_csum(sb, es);
 }
 
 void ext4_superblock_csum_set(struct super_block *sb)
 {
 	struct ext4_super_block *es = EXT4_SB(sb)->s_es;
 
-	if (!ext4_has_feature_metadata_csum(sb))
+	if (!ext4_has_metadata_csum(sb))
 		return;
 
-	es->s_checksum = ext4_superblock_csum(es);
+	es->s_checksum = ext4_superblock_csum(sb, es);
 }
 
 ext4_fsblk_t ext4_block_bitmap(struct super_block *sb,
@@ -1363,6 +1365,8 @@ static void ext4_put_super(struct super_block *sb)
 	 */
 	kobject_put(&sbi->s_kobj);
 	wait_for_completion(&sbi->s_kobj_unregister);
+	if (sbi->s_chksum_driver)
+		crypto_free_shash(sbi->s_chksum_driver);
 	kfree(sbi->s_blockgroup_lock);
 	fs_put_dax(sbi->s_daxdev, NULL);
 	fscrypt_free_dummy_policy(&sbi->s_dummy_enc_policy);
@@ -3204,19 +3208,19 @@ static __le16 ext4_group_desc_csum(struct super_block *sb, __u32 block_group,
 	__le32 le_group = cpu_to_le32(block_group);
 	struct ext4_sb_info *sbi = EXT4_SB(sb);
 
-	if (ext4_has_feature_metadata_csum(sbi->s_sb)) {
+	if (ext4_has_metadata_csum(sbi->s_sb)) {
 		/* Use new metadata_csum algorithm */
 		__u32 csum32;
 		__u16 dummy_csum = 0;
 
-		csum32 = ext4_chksum(sbi->s_csum_seed, (__u8 *)&le_group,
+		csum32 = ext4_chksum(sbi, sbi->s_csum_seed, (__u8 *)&le_group,
 				     sizeof(le_group));
-		csum32 = ext4_chksum(csum32, (__u8 *)gdp, offset);
-		csum32 = ext4_chksum(csum32, (__u8 *)&dummy_csum,
+		csum32 = ext4_chksum(sbi, csum32, (__u8 *)gdp, offset);
+		csum32 = ext4_chksum(sbi, csum32, (__u8 *)&dummy_csum,
 				     sizeof(dummy_csum));
 		offset += sizeof(dummy_csum);
 		if (offset < sbi->s_desc_size)
-			csum32 = ext4_chksum(csum32, (__u8 *)gdp + offset,
+			csum32 = ext4_chksum(sbi, csum32, (__u8 *)gdp + offset,
 					     sbi->s_desc_size - offset);
 
 		crc = csum32 & 0xFFFF;
@@ -4061,7 +4065,7 @@ static int set_journal_csum_feature_set(struct super_block *sb)
 	int compat, incompat;
 	struct ext4_sb_info *sbi = EXT4_SB(sb);
 
-	if (ext4_has_feature_metadata_csum(sb)) {
+	if (ext4_has_metadata_csum(sb)) {
 		/* journal checksum v3 */
 		compat = 0;
 		incompat = JBD2_FEATURE_INCOMPAT_CSUM_V3;
@@ -4349,7 +4353,7 @@ static void ext4_set_def_opts(struct super_block *sb,
 	if (ext4_has_feature_fast_commit(sb))
 		set_opt2(sb, JOURNAL_FAST_COMMIT);
 	/* don't forget to enable journal_csum when metadata_csum is enabled. */
-	if (ext4_has_feature_metadata_csum(sb))
+	if (ext4_has_metadata_csum(sb))
 		set_opt(sb, JOURNAL_CHECKSUM);
 
 	if ((def_mount_opts & EXT4_DEFM_JMODE) == EXT4_DEFM_JMODE_DATA)
@@ -4635,6 +4639,15 @@ static int ext4_init_metadata_csum(struct super_block *sb, struct ext4_super_blo
 	ext4_setup_csum_trigger(sb, EXT4_JTR_ORPHAN_FILE,
 				ext4_orphan_file_block_trigger);
 
+	/* Load the checksum driver */
+	sbi->s_chksum_driver = crypto_alloc_shash("crc32c", 0, 0);
+	if (IS_ERR(sbi->s_chksum_driver)) {
+		int ret = PTR_ERR(sbi->s_chksum_driver);
+		ext4_msg(sb, KERN_ERR, "Cannot load crc32c driver.");
+		sbi->s_chksum_driver = NULL;
+		return ret;
+	}
+
 	/* Check superblock checksum */
 	if (!ext4_superblock_csum_verify(sb, es)) {
 		ext4_msg(sb, KERN_ERR, "VFS: Found ext4 filesystem with "
@@ -4645,9 +4658,8 @@ static int ext4_init_metadata_csum(struct super_block *sb, struct ext4_super_blo
 	/* Precompute checksum seed for all metadata */
 	if (ext4_has_feature_csum_seed(sb))
 		sbi->s_csum_seed = le32_to_cpu(es->s_checksum_seed);
-	else if (ext4_has_feature_metadata_csum(sb) ||
-		 ext4_has_feature_ea_inode(sb))
-		sbi->s_csum_seed = ext4_chksum(~0, es->s_uuid,
+	else if (ext4_has_metadata_csum(sb) || ext4_has_feature_ea_inode(sb))
+		sbi->s_csum_seed = ext4_chksum(sbi, ~0, es->s_uuid,
 					       sizeof(es->s_uuid));
 	return 0;
 }
@@ -5693,6 +5705,9 @@ failed_mount3:
 	timer_delete_sync(&sbi->s_err_report);
 	ext4_group_desc_free(sbi);
 failed_mount:
+	if (sbi->s_chksum_driver)
+		crypto_free_shash(sbi->s_chksum_driver);
+
 #if IS_ENABLED(CONFIG_UNICODE)
 	utf8_unload(sb->s_encoding);
 #endif
@@ -5926,7 +5941,7 @@ static struct file *ext4_get_journal_blkdev(struct super_block *sb,
 
 	if ((le32_to_cpu(es->s_feature_ro_compat) &
 	     EXT4_FEATURE_RO_COMPAT_METADATA_CSUM) &&
-	    es->s_checksum != ext4_superblock_csum(es)) {
+	    es->s_checksum != ext4_superblock_csum(sb, es)) {
 		ext4_msg(sb, KERN_ERR, "external journal has corrupt superblock");
 		errno = -EFSCORRUPTED;
 		goto out_bh;
@@ -7512,5 +7527,6 @@ static void __exit ext4_exit_fs(void)
 MODULE_AUTHOR("Remy Card, Stephen Tweedie, Andrew Morton, Andreas Dilger, Theodore Ts'o and others");
 MODULE_DESCRIPTION("Fourth Extended Filesystem");
 MODULE_LICENSE("GPL");
+MODULE_SOFTDEP("pre: crc32c");
 module_init(ext4_init_fs)
 module_exit(ext4_exit_fs)

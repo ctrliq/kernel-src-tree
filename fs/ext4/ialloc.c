@@ -1284,13 +1284,14 @@ got:
 	inode->i_generation = get_random_u32();
 
 	/* Precompute checksum seed for inode metadata */
-	if (ext4_has_feature_metadata_csum(sb)) {
+	if (ext4_has_metadata_csum(sb)) {
 		__u32 csum;
 		__le32 inum = cpu_to_le32(inode->i_ino);
 		__le32 gen = cpu_to_le32(inode->i_generation);
-		csum = ext4_chksum(sbi->s_csum_seed, (__u8 *)&inum,
+		csum = ext4_chksum(sbi, sbi->s_csum_seed, (__u8 *)&inum,
 				   sizeof(inum));
-		ei->i_csum_seed = ext4_chksum(csum, (__u8 *)&gen, sizeof(gen));
+		ei->i_csum_seed = ext4_chksum(sbi, csum, (__u8 *)&gen,
+					      sizeof(gen));
 	}
 
 	ext4_clear_state_flags(ei); /* Only relevant on 32-bit archs */

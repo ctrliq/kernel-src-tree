@@ -176,7 +176,7 @@ static struct buffer_head *__ext4_read_dirblock(struct inode *inode,
 		brelse(bh);
 		return ERR_PTR(-EFSCORRUPTED);
 	}
-	if (!ext4_has_feature_metadata_csum(inode->i_sb) ||
+	if (!ext4_has_metadata_csum(inode->i_sb) ||
 	    buffer_verified(bh))
 		return bh;
 
@@ -346,10 +346,11 @@ static struct ext4_dir_entry_tail *get_dirent_tail(struct inode *inode,
 
 static __le32 ext4_dirblock_csum(struct inode *inode, void *dirent, int size)
 {
+	struct ext4_sb_info *sbi = EXT4_SB(inode->i_sb);
 	struct ext4_inode_info *ei = EXT4_I(inode);
 	__u32 csum;
 
-	csum = ext4_chksum(ei->i_csum_seed, (__u8 *)dirent, size);
+	csum = ext4_chksum(sbi, ei->i_csum_seed, (__u8 *)dirent, size);
 	return cpu_to_le32(csum);
 }
 
@@ -367,7 +368,7 @@ int ext4_dirblock_csum_verify(struct inode *inode, struct buffer_head *bh)
 {
 	struct ext4_dir_entry_tail *t;
 
-	if (!ext4_has_feature_metadata_csum(inode->i_sb))
+	if (!ext4_has_metadata_csum(inode->i_sb))
 		return 1;
 
 	t = get_dirent_tail(inode, bh);
@@ -388,7 +389,7 @@ static void ext4_dirblock_csum_set(struct inode *inode,
 {
 	struct ext4_dir_entry_tail *t;
 
-	if (!ext4_has_feature_metadata_csum(inode->i_sb))
+	if (!ext4_has_metadata_csum(inode->i_sb))
 		return;
 
 	t = get_dirent_tail(inode, bh);
@@ -441,6 +442,7 @@ static struct dx_countlimit *get_dx_countlimit(struct inode *inode,
 static __le32 ext4_dx_csum(struct inode *inode, struct ext4_dir_entry *dirent,
 			   int count_offset, int count, struct dx_tail *t)
 {
+	struct ext4_sb_info *sbi = EXT4_SB(inode->i_sb);
 	struct ext4_inode_info *ei = EXT4_I(inode);
 	__u32 csum;
 	int size;
@@ -448,9 +450,9 @@ static __le32 ext4_dx_csum(struct inode *inode, struct ext4_dir_entry *dirent,
 	int offset = offsetof(struct dx_tail, dt_checksum);
 
 	size = count_offset + (count * sizeof(struct dx_entry));
-	csum = ext4_chksum(ei->i_csum_seed, (__u8 *)dirent, size);
-	csum = ext4_chksum(csum, (__u8 *)t, offset);
-	csum = ext4_chksum(csum, (__u8 *)&dummy_csum, sizeof(dummy_csum));
+	csum = ext4_chksum(sbi, ei->i_csum_seed, (__u8 *)dirent, size);
+	csum = ext4_chksum(sbi, csum, (__u8 *)t, offset);
+	csum = ext4_chksum(sbi, csum, (__u8 *)&dummy_csum, sizeof(dummy_csum));
 
 	return cpu_to_le32(csum);
 }
@@ -462,7 +464,7 @@ static int ext4_dx_csum_verify(struct inode *inode,
 	struct dx_tail *t;
 	int count_offset, limit, count;
 
-	if (!ext4_has_feature_metadata_csum(inode->i_sb))
+	if (!ext4_has_metadata_csum(inode->i_sb))
 		return 1;
 
 	c = get_dx_countlimit(inode, dirent, &count_offset);
@@ -491,7 +493,7 @@ static void ext4_dx_csum_set(struct inode *inode, struct ext4_dir_entry *dirent)
 	struct dx_tail *t;
 	int count_offset, limit, count;
 
-	if (!ext4_has_feature_metadata_csum(inode->i_sb))
+	if (!ext4_has_metadata_csum(inode->i_sb))
 		return;
 
 	c = get_dx_countlimit(inode, dirent, &count_offset);
@@ -580,7 +582,7 @@ static inline unsigned dx_root_limit(struct inode *dir, unsigned infosize)
 			ext4_dir_rec_len(1, NULL) -
 			ext4_dir_rec_len(2, NULL) - infosize;
 
-	if (ext4_has_feature_metadata_csum(dir->i_sb))
+	if (ext4_has_metadata_csum(dir->i_sb))
 		entry_space -= sizeof(struct dx_tail);
 	return entry_space / sizeof(struct dx_entry);
 }
@@ -590,7 +592,7 @@ static inline unsigned dx_node_limit(struct inode *dir)
 	unsigned int entry_space = dir->i_sb->s_blocksize -
 			ext4_dir_rec_len(0, dir);
 
-	if (ext4_has_feature_metadata_csum(dir->i_sb))
+	if (ext4_has_metadata_csum(dir->i_sb))
 		entry_space -= sizeof(struct dx_tail);
 	return entry_space / sizeof(struct dx_entry);
 }
@@ -1044,7 +1046,7 @@ static int htree_dirblock_to_tree(struct file *dir_file,
 	struct ext4_dir_entry_2 *de, *top;
 	int err = 0, count = 0;
 	struct fscrypt_str fname_crypto_str = FSTR_INIT(NULL, 0), tmp_str;
-	int csum = ext4_has_feature_metadata_csum(dir->i_sb);
+	int csum = ext4_has_metadata_csum(dir->i_sb);
 
 	dxtrace(printk(KERN_INFO "In htree dirblock_to_tree: block %lu\n",
 							(unsigned long)block));
@@ -1288,7 +1290,7 @@ static int dx_make_map(struct inode *dir, struct buffer_head *bh,
 	struct dx_hash_info h = *hinfo;
 	int blocksize = EXT4_BLOCK_SIZE(dir->i_sb);
 
-	if (ext4_has_feature_metadata_csum(dir->i_sb))
+	if (ext4_has_metadata_csum(dir->i_sb))
 		buflen -= sizeof(struct ext4_dir_entry_tail);
 
 	while ((char *) de < base + buflen) {
@@ -1919,7 +1921,7 @@ static struct ext4_dir_entry_2 *do_split(handle_t *handle, struct inode *dir,
 	int	csum_size = 0;
 	int	err = 0, i;
 
-	if (ext4_has_feature_metadata_csum(dir->i_sb))
+	if (ext4_has_metadata_csum(dir->i_sb))
 		csum_size = sizeof(struct ext4_dir_entry_tail);
 
 	bh2 = ext4_append(handle, dir, &newblock);
@@ -2116,7 +2118,7 @@ static int add_dirent_to_buf(handle_t *handle, struct ext4_filename *fname,
 	int		csum_size = 0;
 	int		err, err2;
 
-	if (ext4_has_feature_metadata_csum(inode->i_sb))
+	if (ext4_has_metadata_csum(inode->i_sb))
 		csum_size = sizeof(struct ext4_dir_entry_tail);
 
 	if (!de) {
@@ -2225,7 +2227,7 @@ static int make_indexed_dir(handle_t *handle, struct ext4_filename *fname,
 	struct fake_dirent *fde;
 	int csum_size = 0;
 
-	if (ext4_has_feature_metadata_csum(inode->i_sb))
+	if (ext4_has_metadata_csum(inode->i_sb))
 		csum_size = sizeof(struct ext4_dir_entry_tail);
 
 	blocksize =  dir->i_sb->s_blocksize;
@@ -2369,7 +2371,7 @@ static int ext4_add_entry(handle_t *handle, struct dentry *dentry,
 	ext4_lblk_t block, blocks;
 	int	csum_size = 0;
 
-	if (ext4_has_feature_metadata_csum(inode->i_sb))
+	if (ext4_has_metadata_csum(inode->i_sb))
 		csum_size = sizeof(struct ext4_dir_entry_tail);
 
 	sb = dir->i_sb;
@@ -2400,7 +2402,7 @@ static int ext4_add_entry(handle_t *handle, struct dentry *dentry,
 		if (!retval || (retval != ERR_BAD_DX_DIR))
 			goto out;
 		/* Can we just ignore htree data? */
-		if (ext4_has_feature_metadata_csum(sb)) {
+		if (ext4_has_metadata_csum(sb)) {
 			EXT4_ERROR_INODE(dir,
 				"Directory has corrupted htree index.");
 			retval = -EFSCORRUPTED;
@@ -2714,7 +2716,7 @@ static int ext4_delete_entry(handle_t *handle,
 			return err;
 	}
 
-	if (ext4_has_feature_metadata_csum(dir->i_sb))
+	if (ext4_has_metadata_csum(dir->i_sb))
 		csum_size = sizeof(struct ext4_dir_entry_tail);
 
 	BUFFER_TRACE(bh, "get_write_access");
@@ -2923,7 +2925,7 @@ int ext4_init_dirblock(handle_t *handle, struct inode *inode,
 	size_t			blocksize = bh->b_size;
 	int			csum_size = 0, header_size;
 
-	if (ext4_has_feature_metadata_csum(inode->i_sb))
+	if (ext4_has_metadata_csum(inode->i_sb))
 		csum_size = sizeof(struct ext4_dir_entry_tail);
 
 	de->inode = cpu_to_le32(inode->i_ino);
