@@ -157,7 +157,9 @@ struct hw_perf_event {
 	union {
 		struct { /* hardware */
 			u64		config;
+			u64		config1;
 			u64		last_tag;
+			u64		dyn_constraint;
 			unsigned long	config_base;
 			unsigned long	event_base;
 			int		event_base_rdpmc;
@@ -1285,6 +1287,11 @@ static inline void perf_sample_save_callchain(struct perf_sample_data *data,
 {
 	int size = 1;
 
+	if (!(event->attr.sample_type & PERF_SAMPLE_CALLCHAIN))
+		return;
+	if (WARN_ON_ONCE(data->sample_flags & PERF_SAMPLE_CALLCHAIN))
+		return;
+
 	data->callchain = perf_callchain(event, regs);
 	size += data->callchain->nr;
 
@@ -1324,6 +1331,9 @@ static inline void perf_sample_save_brstack(struct perf_sample_data *data,
 
 	if (branch_sample_hw_index(event))
 		size += sizeof(u64);
+
+	brs->nr = min_t(u16, event->attr.sample_max_stack, brs->nr);
+
 	size += brs->nr * sizeof(struct perf_branch_entry);
 
 	/*
