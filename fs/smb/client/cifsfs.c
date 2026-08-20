@@ -439,6 +439,7 @@ cifs_alloc_inode(struct super_block *sb)
 		return NULL;
 	cifs_inode->cifsAttrs = ATTR_ARCHIVE;	/* default */
 	cifs_inode->time = 0;
+	cifs_inode->time_last_write = 0;
 	/*
 	 * Until the file is open and we have gotten oplock info back from the
 	 * server, can not assume caching of file data or metadata.
@@ -690,6 +691,8 @@ cifs_show_options(struct seq_file *s, struct dentry *root)
 		seq_puts(s, ",seal");
 	else if (tcon->ses->server->ignore_signature)
 		seq_puts(s, ",signloosely");
+	if (cifs_sb->ctx->compress)
+		seq_puts(s, ",compress");
 	if (tcon->nocase)
 		seq_puts(s, ",nocase");
 	if (tcon->nodelete)
