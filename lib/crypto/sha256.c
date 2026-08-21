@@ -11,6 +11,7 @@
 #include <crypto/hmac.h>
 #include <crypto/internal/sha2.h>
 #include <linux/export.h>
+#include <linux/fips.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/string.h>
@@ -168,6 +169,8 @@ static void __hmac_sha256_preparekey(struct sha256_block_state *istate,
 		u8 b[SHA256_BLOCK_SIZE];
 		unsigned long w[SHA256_BLOCK_SIZE / sizeof(unsigned long)];
 	} derived_key = { 0 };
+
+	BUG_ON(fips_enabled && raw_key_len < 112 / 8);
 
 	if (unlikely(raw_key_len > SHA256_BLOCK_SIZE)) {
 		if (iv == &sha224_iv)

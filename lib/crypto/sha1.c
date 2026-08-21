@@ -7,6 +7,7 @@
 #include <crypto/sha1.h>
 #include <linux/bitops.h>
 #include <linux/export.h>
+#include <linux/fips.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/string.h>
@@ -243,6 +244,8 @@ static void __hmac_sha1_preparekey(struct sha1_block_state *istate,
 		u8 b[SHA1_BLOCK_SIZE];
 		unsigned long w[SHA1_BLOCK_SIZE / sizeof(unsigned long)];
 	} derived_key = { 0 };
+
+	BUG_ON(fips_enabled && raw_key_len < 112 / 8);
 
 	if (unlikely(raw_key_len > SHA1_BLOCK_SIZE))
 		sha1(raw_key, raw_key_len, derived_key.b);
