@@ -137,5 +137,51 @@ void sha1_init(__u32 *buf)
 }
 EXPORT_SYMBOL(sha1_init);
 
+#if defined(CONFIG_CRYPTO_FIPS) && !defined(__DISABLE_EXPORTS)
+#include <linux/fips.h>
+#include <linux/init.h>
+
+static int __init sha1_mod_init(void)
+{
+	if (fips_enabled) {
+		/*
+		 * FIPS known answer test for SHA-1.
+		 * Input: NIST one-block message "abc" (pre-padded).
+		 * Expected digest: a9993e36 4706816a ba3e2571 7850c26c 9cd0d89d
+		 */
+		static const u8 fips_input[SHA1_BLOCK_SIZE] __initconst = {
+			0x61, 0x62, 0x63, 0x80, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18,
+		};
+		static const __u32 fips_digest[SHA1_DIGEST_WORDS] __initconst = {
+			0xa9993e36, 0x4706816a, 0xba3e2571,
+			0x7850c26c, 0x9cd0d89d,
+		};
+		__u32 digest[SHA1_DIGEST_WORDS];
+		__u32 workspace[SHA1_WORKSPACE_WORDS];
+
+		sha1_init(digest);
+		sha1_transform(digest, (const char *)fips_input, workspace);
+		memzero_explicit(workspace, sizeof(workspace));
+
+		if (memcmp(digest, fips_digest, sizeof(digest)) != 0)
+			panic("sha1: FIPS self-test failed\n");
+	}
+	return 0;
+}
+subsys_initcall(sha1_mod_init);
+
+static void __exit sha1_mod_exit(void)
+{
+}
+module_exit(sha1_mod_exit);
+#endif
+
 MODULE_DESCRIPTION("SHA-1 Algorithm");
 MODULE_LICENSE("GPL");
