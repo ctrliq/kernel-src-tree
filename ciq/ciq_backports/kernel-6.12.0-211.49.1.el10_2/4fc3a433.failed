@@ -1,0 +1,1574 @@
+smb: client: use atomic_t for mnt_cifs_flags
+
+jira KERNEL-1507
+Rebuild_History Non-Buildable kernel-6.12.0-211.49.1.el10_2
+commit-author Paulo Alcantara <pc@manguebit.org>
+commit 4fc3a433c13944ee5766ec5b9bf6f1eb4d29b880
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.49.1.el10_2/4fc3a433.failed
+
+Use atomic_t for cifs_sb_info::mnt_cifs_flags as it's currently
+accessed locklessly and may be changed concurrently in mount/remount
+and reconnect paths.
+
+	Signed-off-by: Paulo Alcantara (Red Hat) <pc@manguebit.org>
+	Reviewed-by: David Howells <dhowells@redhat.com>
+	Cc: linux-cifs@vger.kernel.org
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 4fc3a433c13944ee5766ec5b9bf6f1eb4d29b880)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/smb/client/cifs_unicode.h
+#	fs/smb/client/cifsfs.c
+#	fs/smb/client/cifsglob.h
+#	fs/smb/client/file.c
+#	fs/smb/client/fs_context.h
+#	fs/smb/client/inode.c
+#	fs/smb/client/smb1ops.c
+#	fs/smb/client/smb2misc.c
+#	fs/smb/client/smb2ops.c
+diff --cc fs/smb/client/cifs_unicode.h
+index 6e4b99786498,3e9cd9acf0a9..000000000000
+--- a/fs/smb/client/cifs_unicode.h
++++ b/fs/smb/client/cifs_unicode.h
+@@@ -62,12 -64,23 +63,32 @@@ int cifs_strtoUTF16(__le16 *, const cha
+  char *cifs_strndup_from_utf16(const char *src, const int maxlen,
+  			      const bool is_unicode,
+  			      const struct nls_table *codepage);
+++<<<<<<< HEAD
+ +extern int cifsConvertToUTF16(__le16 *target, const char *source, int maxlen,
+ +			      const struct nls_table *cp, int mapChars);
+ +extern int cifs_remap(struct cifs_sb_info *cifs_sb);
+ +extern __le16 *cifs_strndup_to_utf16(const char *src, const int maxlen,
+ +				     int *utf16_len, const struct nls_table *cp,
+ +				     int remap);
+++=======
++ int cifsConvertToUTF16(__le16 *target, const char *source, int srclen,
++ 		       const struct nls_table *cp, int map_chars);
++ __le16 *cifs_strndup_to_utf16(const char *src, const int maxlen,
++ 			      int *utf16_len, const struct nls_table *cp,
++ 			      int remap);
+++>>>>>>> 4fc3a433c139 (smb: client: use atomic_t for mnt_cifs_flags)
+  wchar_t cifs_toupper(wchar_t in);
+  
++ static inline int cifs_remap(const struct cifs_sb_info *cifs_sb)
++ {
++ 	unsigned int sbflags = cifs_sb_flags(cifs_sb);
++ 
++ 	if (sbflags & CIFS_MOUNT_MAP_SFM_CHR)
++ 		return SFM_MAP_UNI_RSVD;
++ 	if (sbflags & CIFS_MOUNT_MAP_SPECIAL_CHR)
++ 		return SFU_MAP_UNI_RSVD;
++ 
++ 	return NO_MAP_UNI_RSVD;
++ }
++ 
+  #endif /* _CIFS_UNICODE_H */
+diff --cc fs/smb/client/cifsfs.c
+index 5a5076a52bd0,427558404aa5..000000000000
+--- a/fs/smb/client/cifsfs.c
++++ b/fs/smb/client/cifsfs.c
+@@@ -910,11 -913,11 +914,16 @@@ static int cifs_write_inode(struct inod
+  
+  static int cifs_drop_inode(struct inode *inode)
+  {
+- 	struct cifs_sb_info *cifs_sb = CIFS_SB(inode->i_sb);
++ 	unsigned int sbflags = cifs_sb_flags(CIFS_SB(inode));
+  
+  	/* no serverino => unconditional eviction */
+++<<<<<<< HEAD
+ +	return !(cifs_sb->mnt_cifs_flags & CIFS_MOUNT_SERVER_INUM) ||
+ +		generic_drop_inode(inode);
+++=======
++ 	return !(sbflags & CIFS_MOUNT_SERVER_INUM) ||
++ 		inode_generic_drop(inode);
+++>>>>>>> 4fc3a433c139 (smb: client: use atomic_t for mnt_cifs_flags)
+  }
+  
+  static const struct super_operations cifs_super_ops = {
+diff --cc fs/smb/client/cifsglob.h
+index 458be310b892,6f9b6c72962b..000000000000
+--- a/fs/smb/client/cifsglob.h
++++ b/fs/smb/client/cifsglob.h
+@@@ -2325,4 -2345,34 +2360,37 @@@ static inline void cifs_requeue_server_
+  	queue_delayed_work(cifsiod_wq, &server->reconnect, delay * HZ);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool __cifs_cache_state_check(struct cifsInodeInfo *cinode,
++ 					    unsigned int oplock_flags,
++ 					    unsigned int sb_flags)
++ {
++ 	unsigned int sflags = cifs_sb_flags(CIFS_SB(cinode));
++ 	unsigned int oplock = READ_ONCE(cinode->oplock);
++ 
++ 	return (oplock & oplock_flags) || (sflags & sb_flags);
++ }
++ 
++ #define CIFS_CACHE_READ(cinode) \
++ 	__cifs_cache_state_check(cinode, CIFS_CACHE_READ_FLG, \
++ 				 CIFS_MOUNT_RO_CACHE)
++ #define CIFS_CACHE_HANDLE(cinode) \
++ 	__cifs_cache_state_check(cinode, CIFS_CACHE_HANDLE_FLG, 0)
++ #define CIFS_CACHE_WRITE(cinode) \
++ 	__cifs_cache_state_check(cinode, CIFS_CACHE_WRITE_FLG, \
++ 				 CIFS_MOUNT_RW_CACHE)
++ 
++ static inline void cifs_reset_oplock(struct cifsInodeInfo *cinode)
++ {
++ 	scoped_guard(spinlock, &cinode->open_file_lock)
++ 		WRITE_ONCE(cinode->oplock, 0);
++ }
++ 
++ static inline bool cifs_forced_shutdown(const struct cifs_sb_info *sbi)
++ {
++ 	return cifs_sb_flags(sbi) & CIFS_MOUNT_SHUTDOWN;
++ }
++ 
+++>>>>>>> 4fc3a433c139 (smb: client: use atomic_t for mnt_cifs_flags)
+  #endif	/* _CIFS_GLOB_H */
+diff --cc fs/smb/client/file.c
+index 0c9432fe2d79,f3ddcdf406c8..000000000000
+--- a/fs/smb/client/file.c
++++ b/fs/smb/client/file.c
+@@@ -3177,14 -3178,25 +3175,19 @@@ void cifs_oplock_break(struct work_stru
+  	tcon = tlink_tcon(tlink);
+  	server = tcon->ses->server;
+  
+++<<<<<<< HEAD
+ +	server->ops->downgrade_oplock(server, cinode, cfile->oplock_level,
+ +				      cfile->oplock_epoch, &purge_cache);
+++=======
++ 	scoped_guard(spinlock, &cinode->open_file_lock) {
++ 		unsigned int sbflags = cifs_sb_flags(cifs_sb);
+++>>>>>>> 4fc3a433c139 (smb: client: use atomic_t for mnt_cifs_flags)
+  
+ -		server->ops->downgrade_oplock(server, cinode, cfile->oplock_level,
+ -					      cfile->oplock_epoch, &purge_cache);
+ -		oplock = READ_ONCE(cinode->oplock);
+ -		cache_read = (oplock & CIFS_CACHE_READ_FLG) ||
+ -			(sbflags & CIFS_MOUNT_RO_CACHE);
+ -		cache_write = (oplock & CIFS_CACHE_WRITE_FLG) ||
+ -			(sbflags & CIFS_MOUNT_RW_CACHE);
+ -		cache_handle = oplock & CIFS_CACHE_HANDLE_FLG;
+ -	}
+ -
+ -	if (!cache_write && cache_read && cifs_has_mand_locks(cinode)) {
+ +	if (!CIFS_CACHE_WRITE(cinode) && CIFS_CACHE_READ(cinode) &&
+ +						cifs_has_mand_locks(cinode)) {
+  		cifs_dbg(FYI, "Reset oplock to None for inode=%p due to mand locks\n",
+  			 inode);
+ -		cifs_reset_oplock(cinode);
+ -		oplock = 0;
+ -		cache_read = cache_write = cache_handle = false;
+ +		cinode->oplock = 0;
+  	}
+  
+  	if (S_ISREG(inode->i_mode)) {
+diff --cc fs/smb/client/fs_context.h
+index 7af7cbbe4208,0b64fcb5d302..000000000000
+--- a/fs/smb/client/fs_context.h
++++ b/fs/smb/client/fs_context.h
+@@@ -370,9 -370,11 +370,17 @@@ static inline struct smb3_fs_context *s
+  	return fc->fs_private;
+  }
+  
+++<<<<<<< HEAD
+ +extern int smb3_fs_context_dup(struct smb3_fs_context *new_ctx, struct smb3_fs_context *ctx);
+ +extern int smb3_sync_session_ctx_passwords(struct cifs_sb_info *cifs_sb, struct cifs_ses *ses);
+ +extern void smb3_update_mnt_flags(struct cifs_sb_info *cifs_sb);
+++=======
++ int smb3_fs_context_dup(struct smb3_fs_context *new_ctx,
++ 			struct smb3_fs_context *ctx);
++ int smb3_sync_session_ctx_passwords(struct cifs_sb_info *cifs_sb,
++ 				    struct cifs_ses *ses);
++ unsigned int smb3_update_mnt_flags(struct cifs_sb_info *cifs_sb);
+++>>>>>>> 4fc3a433c139 (smb: client: use atomic_t for mnt_cifs_flags)
+  
+  /*
+   * max deferred close timeout (jiffies) - 2^30
+diff --cc fs/smb/client/inode.c
+index d149ac068cbd,3e844c55ab8a..000000000000
+--- a/fs/smb/client/inode.c
++++ b/fs/smb/client/inode.c
+@@@ -194,8 -195,8 +195,13 @@@ cifs_fattr_to_inode(struct inode *inode
+  	inode->i_gid = fattr->cf_gid;
+  
+  	/* if dynperm is set, don't clobber existing mode */
+++<<<<<<< HEAD
+ +	if (inode->i_state & I_NEW ||
+ +	    !(cifs_sb->mnt_cifs_flags & CIFS_MOUNT_DYNPERM))
+++=======
++ 	if ((inode_state_read(inode) & I_NEW) ||
++ 	    !(cifs_sb_flags(cifs_sb) & CIFS_MOUNT_DYNPERM))
+++>>>>>>> 4fc3a433c139 (smb: client: use atomic_t for mnt_cifs_flags)
+  		inode->i_mode = fattr->cf_mode;
+  
+  	cifs_i->cifsAttrs = fattr->cf_cifsattrs;
+diff --cc fs/smb/client/smb1ops.c
+index 53c77db552da,9643eca0cb70..000000000000
+--- a/fs/smb/client/smb1ops.c
++++ b/fs/smb/client/smb1ops.c
+@@@ -18,6 -18,118 +18,121 @@@
+  #include "smberr.h"
+  #include "reparse.h"
+  
+++<<<<<<< HEAD
+++=======
++ void reset_cifs_unix_caps(unsigned int xid, struct cifs_tcon *tcon,
++ 			  struct cifs_sb_info *cifs_sb, struct smb3_fs_context *ctx)
++ {
++ 	/*
++ 	 * If we are reconnecting then should we check to see if
++ 	 * any requested capabilities changed locally e.g. via
++ 	 * remount but we can not do much about it here
++ 	 * if they have (even if we could detect it by the following)
++ 	 * Perhaps we could add a backpointer to array of sb from tcon
++ 	 * or if we change to make all sb to same share the same
++ 	 * sb as NFS - then we only have one backpointer to sb.
++ 	 * What if we wanted to mount the server share twice once with
++ 	 * and once without posixacls or posix paths?
++ 	 */
++ 	__u64 saved_cap = le64_to_cpu(tcon->fsUnixInfo.Capability);
++ 
++ 	if (ctx && ctx->no_linux_ext) {
++ 		tcon->fsUnixInfo.Capability = 0;
++ 		tcon->unix_ext = 0; /* Unix Extensions disabled */
++ 		cifs_dbg(FYI, "Linux protocol extensions disabled\n");
++ 		return;
++ 	} else if (ctx)
++ 		tcon->unix_ext = 1; /* Unix Extensions supported */
++ 
++ 	if (!tcon->unix_ext) {
++ 		cifs_dbg(FYI, "Unix extensions disabled so not set on reconnect\n");
++ 		return;
++ 	}
++ 
++ 	if (!CIFSSMBQFSUnixInfo(xid, tcon)) {
++ 		__u64 cap = le64_to_cpu(tcon->fsUnixInfo.Capability);
++ 		unsigned int sbflags;
++ 
++ 		cifs_dbg(FYI, "unix caps which server supports %lld\n", cap);
++ 		/*
++ 		 * check for reconnect case in which we do not
++ 		 * want to change the mount behavior if we can avoid it
++ 		 */
++ 		if (ctx == NULL) {
++ 			/*
++ 			 * turn off POSIX ACL and PATHNAMES if not set
++ 			 * originally at mount time
++ 			 */
++ 			if ((saved_cap & CIFS_UNIX_POSIX_ACL_CAP) == 0)
++ 				cap &= ~CIFS_UNIX_POSIX_ACL_CAP;
++ 			if ((saved_cap & CIFS_UNIX_POSIX_PATHNAMES_CAP) == 0) {
++ 				if (cap & CIFS_UNIX_POSIX_PATHNAMES_CAP)
++ 					cifs_dbg(VFS, "POSIXPATH support change\n");
++ 				cap &= ~CIFS_UNIX_POSIX_PATHNAMES_CAP;
++ 			} else if ((cap & CIFS_UNIX_POSIX_PATHNAMES_CAP) == 0) {
++ 				cifs_dbg(VFS, "possible reconnect error\n");
++ 				cifs_dbg(VFS, "server disabled POSIX path support\n");
++ 			}
++ 		}
++ 
++ 		if (cap & CIFS_UNIX_TRANSPORT_ENCRYPTION_MANDATORY_CAP)
++ 			cifs_dbg(VFS, "per-share encryption not supported yet\n");
++ 
++ 		if (cifs_sb)
++ 			sbflags = cifs_sb_flags(cifs_sb);
++ 
++ 		cap &= CIFS_UNIX_CAP_MASK;
++ 		if (ctx && ctx->no_psx_acl)
++ 			cap &= ~CIFS_UNIX_POSIX_ACL_CAP;
++ 		else if (CIFS_UNIX_POSIX_ACL_CAP & cap) {
++ 			cifs_dbg(FYI, "negotiated posix acl support\n");
++ 			if (cifs_sb)
++ 				sbflags |= CIFS_MOUNT_POSIXACL;
++ 		}
++ 
++ 		if (ctx && ctx->posix_paths == 0)
++ 			cap &= ~CIFS_UNIX_POSIX_PATHNAMES_CAP;
++ 		else if (cap & CIFS_UNIX_POSIX_PATHNAMES_CAP) {
++ 			cifs_dbg(FYI, "negotiate posix pathnames\n");
++ 			if (cifs_sb)
++ 				sbflags |= CIFS_MOUNT_POSIX_PATHS;
++ 		}
++ 
++ 		if (cifs_sb)
++ 			atomic_set(&cifs_sb->mnt_cifs_flags, sbflags);
++ 
++ 		cifs_dbg(FYI, "Negotiate caps 0x%x\n", (int)cap);
++ #ifdef CONFIG_CIFS_DEBUG2
++ 		if (cap & CIFS_UNIX_FCNTL_CAP)
++ 			cifs_dbg(FYI, "FCNTL cap\n");
++ 		if (cap & CIFS_UNIX_EXTATTR_CAP)
++ 			cifs_dbg(FYI, "EXTATTR cap\n");
++ 		if (cap & CIFS_UNIX_POSIX_PATHNAMES_CAP)
++ 			cifs_dbg(FYI, "POSIX path cap\n");
++ 		if (cap & CIFS_UNIX_XATTR_CAP)
++ 			cifs_dbg(FYI, "XATTR cap\n");
++ 		if (cap & CIFS_UNIX_POSIX_ACL_CAP)
++ 			cifs_dbg(FYI, "POSIX ACL cap\n");
++ 		if (cap & CIFS_UNIX_LARGE_READ_CAP)
++ 			cifs_dbg(FYI, "very large read cap\n");
++ 		if (cap & CIFS_UNIX_LARGE_WRITE_CAP)
++ 			cifs_dbg(FYI, "very large write cap\n");
++ 		if (cap & CIFS_UNIX_TRANSPORT_ENCRYPTION_CAP)
++ 			cifs_dbg(FYI, "transport encryption cap\n");
++ 		if (cap & CIFS_UNIX_TRANSPORT_ENCRYPTION_MANDATORY_CAP)
++ 			cifs_dbg(FYI, "mandatory transport encryption cap\n");
++ #endif /* CIFS_DEBUG2 */
++ 		if (CIFSSMBSetFSUnixInfo(xid, tcon, cap)) {
++ 			if (ctx == NULL)
++ 				cifs_dbg(FYI, "resetting capabilities failed\n");
++ 			else
++ 				cifs_dbg(VFS, "Negotiating Unix capabilities with the server failed. Consider mounting with the Unix Extensions disabled if problems are found by specifying the nounix mount option.\n");
++ 
++ 		}
++ 	}
++ }
++ 
+++>>>>>>> 4fc3a433c139 (smb: client: use atomic_t for mnt_cifs_flags)
+  /*
+   * An NT cancel request header looks just like the original request except:
+   *
+@@@ -1203,12 -1148,16 +1318,19 @@@ cifs_close_dir(const unsigned int xid, 
+  	return CIFSFindClose(xid, tcon, fid->netfid);
+  }
+  
+ -static int cifs_oplock_response(struct cifs_tcon *tcon, __u64 persistent_fid,
+ -				__u64 volatile_fid, __u16 net_fid,
+ -				struct cifsInodeInfo *cinode, unsigned int oplock)
+ +static int
+ +cifs_oplock_response(struct cifs_tcon *tcon, __u64 persistent_fid,
+ +		__u64 volatile_fid, __u16 net_fid, struct cifsInodeInfo *cinode)
+  {
+++<<<<<<< HEAD
+++=======
++ 	unsigned int sbflags = cifs_sb_flags(CIFS_SB(cinode));
++ 	__u8 op;
++ 
++ 	op = !!((oplock & CIFS_CACHE_READ_FLG) || (sbflags & CIFS_MOUNT_RO_CACHE));
+++>>>>>>> 4fc3a433c139 (smb: client: use atomic_t for mnt_cifs_flags)
+  	return CIFSSMBLock(0, tcon, net_fid, current->tgid, 0, 0, 0, 0,
+ -			   LOCKING_ANDX_OPLOCK_RELEASE, false, op);
+ +			   LOCKING_ANDX_OPLOCK_RELEASE, false, CIFS_CACHE_READ(cinode) ? 1 : 0);
+  }
+  
+  static int
+diff --cc fs/smb/client/smb2misc.c
+index c394e9f20400,973fce3c959c..000000000000
+--- a/fs/smb/client/smb2misc.c
++++ b/fs/smb/client/smb2misc.c
+@@@ -479,21 -470,20 +470,24 @@@ cifs_convert_path_to_utf16(const char *
+  	} else
+  		start_of_path = from;
+  
+- 	to = cifs_strndup_to_utf16(start_of_path, PATH_MAX, &len,
+- 				   cifs_sb->local_nls, map_type);
+- 	return to;
++ 	return cifs_strndup_to_utf16(start_of_path, PATH_MAX, &len,
++ 				     cifs_sb->local_nls, cifs_remap(cifs_sb));
+  }
+  
+ -__le32 smb2_get_lease_state(struct cifsInodeInfo *cinode, unsigned int oplock)
+ +__le32
+ +smb2_get_lease_state(struct cifsInodeInfo *cinode)
+  {
+++<<<<<<< HEAD
+++=======
++ 	unsigned int sbflags = cifs_sb_flags(CIFS_SB(cinode));
+++>>>>>>> 4fc3a433c139 (smb: client: use atomic_t for mnt_cifs_flags)
+  	__le32 lease = 0;
+  
+ -	if ((oplock & CIFS_CACHE_WRITE_FLG) || (sbflags & CIFS_MOUNT_RW_CACHE))
+ +	if (CIFS_CACHE_WRITE(cinode))
+  		lease |= SMB2_LEASE_WRITE_CACHING_LE;
+ -	if (oplock & CIFS_CACHE_HANDLE_FLG)
+ +	if (CIFS_CACHE_HANDLE(cinode))
+  		lease |= SMB2_LEASE_HANDLE_CACHING_LE;
+ -	if ((oplock & CIFS_CACHE_READ_FLG) || (sbflags & CIFS_MOUNT_RO_CACHE))
+ +	if (CIFS_CACHE_READ(cinode))
+  		lease |= SMB2_LEASE_READ_CACHING_LE;
+  	return lease;
+  }
+diff --cc fs/smb/client/smb2ops.c
+index 22225d87da6a,7f2d3459cbf9..000000000000
+--- a/fs/smb/client/smb2ops.c
++++ b/fs/smb/client/smb2ops.c
+@@@ -2686,16 -2687,19 +2686,22 @@@ smb2_is_network_name_deleted(char *buf
+  	return false;
+  }
+  
+ -static int smb2_oplock_response(struct cifs_tcon *tcon, __u64 persistent_fid,
+ -				__u64 volatile_fid, __u16 net_fid,
+ -				struct cifsInodeInfo *cinode, unsigned int oplock)
+ +static int
+ +smb2_oplock_response(struct cifs_tcon *tcon, __u64 persistent_fid,
+ +		__u64 volatile_fid, __u16 net_fid, struct cifsInodeInfo *cinode)
+  {
+++<<<<<<< HEAD
+++=======
++ 	unsigned int sbflags = cifs_sb_flags(CIFS_SB(cinode));
++ 	__u8 op;
++ 
+++>>>>>>> 4fc3a433c139 (smb: client: use atomic_t for mnt_cifs_flags)
+  	if (tcon->ses->server->capabilities & SMB2_GLOBAL_CAP_LEASING)
+  		return SMB2_lease_break(0, tcon, cinode->lease_key,
+ -					smb2_get_lease_state(cinode, oplock));
+ +					smb2_get_lease_state(cinode));
+  
+ -	op = !!((oplock & CIFS_CACHE_READ_FLG) || (sbflags & CIFS_MOUNT_RO_CACHE));
+ -	return SMB2_oplock_break(0, tcon, persistent_fid, volatile_fid, op);
+ +	return SMB2_oplock_break(0, tcon, persistent_fid, volatile_fid,
+ +				 CIFS_CACHE_READ(cinode) ? 1 : 0);
+  }
+  
+  void
+diff --git a/fs/smb/client/cached_dir.c b/fs/smb/client/cached_dir.c
+index cba116e52e65..399dc0fb8ade 100644
+--- a/fs/smb/client/cached_dir.c
++++ b/fs/smb/client/cached_dir.c
+@@ -117,7 +117,7 @@ static const char *path_no_prefix(struct cifs_sb_info *cifs_sb,
+ 	if (!*path)
+ 		return path;
+ 
+-	if ((cifs_sb->mnt_cifs_flags & CIFS_MOUNT_USE_PREFIX_PATH) &&
++	if ((cifs_sb_flags(cifs_sb) & CIFS_MOUNT_USE_PREFIX_PATH) &&
+ 	    cifs_sb->prepath) {
+ 		len = strlen(cifs_sb->prepath) + 1;
+ 		if (unlikely(len > strlen(path)))
+diff --git a/fs/smb/client/cifs_fs_sb.h b/fs/smb/client/cifs_fs_sb.h
+index 5e8d163cb5f8..84e7e366b0ff 100644
+--- a/fs/smb/client/cifs_fs_sb.h
++++ b/fs/smb/client/cifs_fs_sb.h
+@@ -55,7 +55,7 @@ struct cifs_sb_info {
+ 	struct nls_table *local_nls;
+ 	struct smb3_fs_context *ctx;
+ 	atomic_t active;
+-	unsigned int mnt_cifs_flags;
++	atomic_t mnt_cifs_flags;
+ 	struct delayed_work prune_tlinks;
+ 	struct rcu_head rcu;
+ 
+diff --git a/fs/smb/client/cifs_ioctl.h b/fs/smb/client/cifs_ioctl.h
+index b51ce64fcccf..147496ac9f9f 100644
+--- a/fs/smb/client/cifs_ioctl.h
++++ b/fs/smb/client/cifs_ioctl.h
+@@ -122,11 +122,3 @@ struct smb3_notify_info {
+ #define CIFS_GOING_FLAGS_DEFAULT                0x0     /* going down */
+ #define CIFS_GOING_FLAGS_LOGFLUSH               0x1     /* flush log but not data */
+ #define CIFS_GOING_FLAGS_NOLOGFLUSH             0x2     /* don't flush log nor data */
+-
+-static inline bool cifs_forced_shutdown(struct cifs_sb_info *sbi)
+-{
+-	if (CIFS_MOUNT_SHUTDOWN & sbi->mnt_cifs_flags)
+-		return true;
+-	else
+-		return false;
+-}
+diff --git a/fs/smb/client/cifs_unicode.c b/fs/smb/client/cifs_unicode.c
+index f8659d36793f..ed931a480125 100644
+--- a/fs/smb/client/cifs_unicode.c
++++ b/fs/smb/client/cifs_unicode.c
+@@ -12,20 +12,6 @@
+ #include "cifsglob.h"
+ #include "cifs_debug.h"
+ 
+-int cifs_remap(struct cifs_sb_info *cifs_sb)
+-{
+-	int map_type;
+-
+-	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_MAP_SFM_CHR)
+-		map_type = SFM_MAP_UNI_RSVD;
+-	else if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_MAP_SPECIAL_CHR)
+-		map_type = SFU_MAP_UNI_RSVD;
+-	else
+-		map_type = NO_MAP_UNI_RSVD;
+-
+-	return map_type;
+-}
+-
+ /* Convert character using the SFU - "Services for Unix" remapping range */
+ static bool
+ convert_sfu_char(const __u16 src_char, char *target)
+* Unmerged path fs/smb/client/cifs_unicode.h
+diff --git a/fs/smb/client/cifsacl.c b/fs/smb/client/cifsacl.c
+index 7ed526d23d14..16d668ea34c1 100644
+--- a/fs/smb/client/cifsacl.c
++++ b/fs/smb/client/cifsacl.c
+@@ -357,7 +357,7 @@ sid_to_id(struct cifs_sb_info *cifs_sb, struct smb_sid *psid,
+ 				psid->num_subauth, SID_MAX_SUB_AUTHORITIES);
+ 	}
+ 
+-	if ((cifs_sb->mnt_cifs_flags & CIFS_MOUNT_UID_FROM_ACL) ||
++	if ((cifs_sb_flags(cifs_sb) & CIFS_MOUNT_UID_FROM_ACL) ||
+ 	    (cifs_sb_master_tcon(cifs_sb)->posix_extensions)) {
+ 		uint32_t unix_id;
+ 		bool is_group;
+@@ -1687,7 +1687,8 @@ id_mode_to_cifs_acl(struct inode *inode, const char *path, __u64 *pnmode,
+ 	struct smb_acl *dacl_ptr = NULL;
+ 	struct smb_ntsd *pntsd = NULL; /* acl obtained from server */
+ 	struct smb_ntsd *pnntsd = NULL; /* modified acl to be sent to server */
+-	struct cifs_sb_info *cifs_sb = CIFS_SB(inode->i_sb);
++	struct cifs_sb_info *cifs_sb = CIFS_SB(inode);
++	unsigned int sbflags;
+ 	struct tcon_link *tlink;
+ 	struct smb_version_operations *ops;
+ 	bool mode_from_sid, id_from_sid;
+@@ -1718,15 +1719,9 @@ id_mode_to_cifs_acl(struct inode *inode, const char *path, __u64 *pnmode,
+ 		return rc;
+ 	}
+ 
+-	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_MODE_FROM_SID)
+-		mode_from_sid = true;
+-	else
+-		mode_from_sid = false;
+-
+-	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_UID_FROM_ACL)
+-		id_from_sid = true;
+-	else
+-		id_from_sid = false;
++	sbflags = cifs_sb_flags(cifs_sb);
++	mode_from_sid = sbflags & CIFS_MOUNT_MODE_FROM_SID;
++	id_from_sid = sbflags & CIFS_MOUNT_UID_FROM_ACL;
+ 
+ 	/* Potentially, five new ACEs can be added to the ACL for U,G,O mapping */
+ 	if (pnmode && *pnmode != NO_CHANGE_64) { /* chmod */
+* Unmerged path fs/smb/client/cifsfs.c
+* Unmerged path fs/smb/client/cifsglob.h
+diff --git a/fs/smb/client/connect.c b/fs/smb/client/connect.c
+index 37ad111331b3..04f7ef1995be 100644
+--- a/fs/smb/client/connect.c
++++ b/fs/smb/client/connect.c
+@@ -2916,8 +2916,8 @@ compare_mount_options(struct super_block *sb, struct cifs_mnt_data *mnt_data)
+ {
+ 	struct cifs_sb_info *old = CIFS_SB(sb);
+ 	struct cifs_sb_info *new = mnt_data->cifs_sb;
+-	unsigned int oldflags = old->mnt_cifs_flags & CIFS_MOUNT_MASK;
+-	unsigned int newflags = new->mnt_cifs_flags & CIFS_MOUNT_MASK;
++	unsigned int oldflags = cifs_sb_flags(old) & CIFS_MOUNT_MASK;
++	unsigned int newflags = cifs_sb_flags(new) & CIFS_MOUNT_MASK;
+ 
+ 	if ((sb->s_flags & CIFS_MS_MASK) != (mnt_data->flags & CIFS_MS_MASK))
+ 		return 0;
+@@ -2972,9 +2972,9 @@ static int match_prepath(struct super_block *sb,
+ 	struct smb3_fs_context *ctx = mnt_data->ctx;
+ 	struct cifs_sb_info *old = CIFS_SB(sb);
+ 	struct cifs_sb_info *new = mnt_data->cifs_sb;
+-	bool old_set = (old->mnt_cifs_flags & CIFS_MOUNT_USE_PREFIX_PATH) &&
++	bool old_set = (cifs_sb_flags(old) & CIFS_MOUNT_USE_PREFIX_PATH) &&
+ 		old->prepath;
+-	bool new_set = (new->mnt_cifs_flags & CIFS_MOUNT_USE_PREFIX_PATH) &&
++	bool new_set = (cifs_sb_flags(new) & CIFS_MOUNT_USE_PREFIX_PATH) &&
+ 		new->prepath;
+ 
+ 	if (tcon->origin_fullpath &&
+@@ -3005,7 +3005,7 @@ cifs_match_super(struct super_block *sb, void *data)
+ 	cifs_sb = CIFS_SB(sb);
+ 
+ 	/* We do not want to use a superblock that has been shutdown */
+-	if (CIFS_MOUNT_SHUTDOWN & cifs_sb->mnt_cifs_flags) {
++	if (cifs_forced_shutdown(cifs_sb)) {
+ 		spin_unlock(&cifs_tcp_ses_lock);
+ 		return 0;
+ 	}
+@@ -3582,6 +3582,8 @@ void reset_cifs_unix_caps(unsigned int xid, struct cifs_tcon *tcon,
+ int cifs_setup_cifs_sb(struct cifs_sb_info *cifs_sb)
+ {
+ 	struct smb3_fs_context *ctx = cifs_sb->ctx;
++	unsigned int sbflags;
++	int rc = 0;
+ 
+ 	INIT_DELAYED_WORK(&cifs_sb->prune_tlinks, cifs_prune_tlinks);
+ 	INIT_LIST_HEAD(&cifs_sb->tcon_sb_link);
+@@ -3606,17 +3608,16 @@ int cifs_setup_cifs_sb(struct cifs_sb_info *cifs_sb)
+ 	}
+ 	ctx->local_nls = cifs_sb->local_nls;
+ 
+-	smb3_update_mnt_flags(cifs_sb);
++	sbflags = smb3_update_mnt_flags(cifs_sb);
+ 
+ 	if (ctx->direct_io)
+ 		cifs_dbg(FYI, "mounting share using direct i/o\n");
+ 	if (ctx->cache_ro) {
+ 		cifs_dbg(VFS, "mounting share with read only caching. Ensure that the share will not be modified while in use.\n");
+-		cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_RO_CACHE;
++		sbflags |= CIFS_MOUNT_RO_CACHE;
+ 	} else if (ctx->cache_rw) {
+ 		cifs_dbg(VFS, "mounting share in single client RW caching mode. Ensure that no other systems will be accessing the share.\n");
+-		cifs_sb->mnt_cifs_flags |= (CIFS_MOUNT_RO_CACHE |
+-					    CIFS_MOUNT_RW_CACHE);
++		sbflags |= CIFS_MOUNT_RO_CACHE | CIFS_MOUNT_RW_CACHE;
+ 	}
+ 
+ 	if ((ctx->cifs_acl) && (ctx->dynperm))
+@@ -3625,16 +3626,19 @@ int cifs_setup_cifs_sb(struct cifs_sb_info *cifs_sb)
+ 	if (ctx->prepath) {
+ 		cifs_sb->prepath = kstrdup(ctx->prepath, GFP_KERNEL);
+ 		if (cifs_sb->prepath == NULL)
+-			return -ENOMEM;
+-		cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_USE_PREFIX_PATH;
++			rc = -ENOMEM;
++		else
++			sbflags |= CIFS_MOUNT_USE_PREFIX_PATH;
+ 	}
+ 
+-	return 0;
++	atomic_set(&cifs_sb->mnt_cifs_flags, sbflags);
++	return rc;
+ }
+ 
+ /* Release all succeed connections */
+ void cifs_mount_put_conns(struct cifs_mount_ctx *mnt_ctx)
+ {
++	struct cifs_sb_info *cifs_sb = mnt_ctx->cifs_sb;
+ 	int rc = 0;
+ 
+ 	if (mnt_ctx->tcon)
+@@ -3646,7 +3650,7 @@ void cifs_mount_put_conns(struct cifs_mount_ctx *mnt_ctx)
+ 	mnt_ctx->ses = NULL;
+ 	mnt_ctx->tcon = NULL;
+ 	mnt_ctx->server = NULL;
+-	mnt_ctx->cifs_sb->mnt_cifs_flags &= ~CIFS_MOUNT_POSIX_PATHS;
++	atomic_andnot(CIFS_MOUNT_POSIX_PATHS, &cifs_sb->mnt_cifs_flags);
+ 	free_xid(mnt_ctx->xid);
+ }
+ 
+@@ -3700,19 +3704,23 @@ int cifs_mount_get_session(struct cifs_mount_ctx *mnt_ctx)
+ int cifs_mount_get_tcon(struct cifs_mount_ctx *mnt_ctx)
+ {
+ 	struct TCP_Server_Info *server;
++	struct cifs_tcon *tcon = NULL;
+ 	struct cifs_sb_info *cifs_sb;
+ 	struct smb3_fs_context *ctx;
+-	struct cifs_tcon *tcon = NULL;
++	unsigned int sbflags;
+ 	int rc = 0;
+ 
+-	if (WARN_ON_ONCE(!mnt_ctx || !mnt_ctx->server || !mnt_ctx->ses || !mnt_ctx->fs_ctx ||
+-			 !mnt_ctx->cifs_sb)) {
+-		rc = -EINVAL;
+-		goto out;
++	if (WARN_ON_ONCE(!mnt_ctx))
++		return -EINVAL;
++	if (WARN_ON_ONCE(!mnt_ctx->server || !mnt_ctx->ses ||
++			 !mnt_ctx->fs_ctx || !mnt_ctx->cifs_sb)) {
++		mnt_ctx->tcon = NULL;
++		return -EINVAL;
+ 	}
+ 	server = mnt_ctx->server;
+ 	ctx = mnt_ctx->fs_ctx;
+ 	cifs_sb = mnt_ctx->cifs_sb;
++	sbflags = cifs_sb_flags(cifs_sb);
+ 
+ 	/* search for existing tcon to this server share */
+ 	tcon = cifs_get_tcon(mnt_ctx->ses, ctx);
+@@ -3727,9 +3735,9 @@ int cifs_mount_get_tcon(struct cifs_mount_ctx *mnt_ctx)
+ 	 * path (i.e., do not remap / and \ and do not map any special characters)
+ 	 */
+ 	if (tcon->posix_extensions) {
+-		cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_POSIX_PATHS;
+-		cifs_sb->mnt_cifs_flags &= ~(CIFS_MOUNT_MAP_SFM_CHR |
+-					     CIFS_MOUNT_MAP_SPECIAL_CHR);
++		sbflags |= CIFS_MOUNT_POSIX_PATHS;
++		sbflags &= ~(CIFS_MOUNT_MAP_SFM_CHR |
++			     CIFS_MOUNT_MAP_SPECIAL_CHR);
+ 	}
+ 
+ #ifdef CONFIG_CIFS_ALLOW_INSECURE_LEGACY
+@@ -3756,12 +3764,11 @@ int cifs_mount_get_tcon(struct cifs_mount_ctx *mnt_ctx)
+ 	/* do not care if a following call succeed - informational */
+ 	if (!tcon->pipe && server->ops->qfs_tcon) {
+ 		server->ops->qfs_tcon(mnt_ctx->xid, tcon, cifs_sb);
+-		if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_RO_CACHE) {
++		if (sbflags & CIFS_MOUNT_RO_CACHE) {
+ 			if (tcon->fsDevInfo.DeviceCharacteristics &
+ 			    cpu_to_le32(FILE_READ_ONLY_DEVICE))
+ 				cifs_dbg(VFS, "mounted to read only share\n");
+-			else if ((cifs_sb->mnt_cifs_flags &
+-				  CIFS_MOUNT_RW_CACHE) == 0)
++			else if (!(sbflags & CIFS_MOUNT_RW_CACHE))
+ 				cifs_dbg(VFS, "read only mount of RW share\n");
+ 			/* no need to log a RW mount of a typical RW share */
+ 		}
+@@ -3773,11 +3780,12 @@ int cifs_mount_get_tcon(struct cifs_mount_ctx *mnt_ctx)
+ 	 * Inside cifs_fscache_get_super_cookie it checks
+ 	 * that we do not get super cookie twice.
+ 	 */
+-	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_FSCACHE)
++	if (sbflags & CIFS_MOUNT_FSCACHE)
+ 		cifs_fscache_get_super_cookie(tcon);
+ 
+ out:
+ 	mnt_ctx->tcon = tcon;
++	atomic_set(&cifs_sb->mnt_cifs_flags, sbflags);
+ 	return rc;
+ }
+ 
+@@ -3896,7 +3904,8 @@ int cifs_is_path_remote(struct cifs_mount_ctx *mnt_ctx)
+ 			cifs_sb, full_path, tcon->Flags & SMB_SHARE_IS_IN_DFS);
+ 		if (rc != 0) {
+ 			cifs_server_dbg(VFS, "cannot query dirs between root and final path, enabling CIFS_MOUNT_USE_PREFIX_PATH\n");
+-			cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_USE_PREFIX_PATH;
++			atomic_or(CIFS_MOUNT_USE_PREFIX_PATH,
++				  &cifs_sb->mnt_cifs_flags);
+ 			rc = 0;
+ 		}
+ 	}
+@@ -3927,7 +3936,7 @@ int cifs_mount(struct cifs_sb_info *cifs_sb, struct smb3_fs_context *ctx)
+ 	 * Force the use of prefix path to support failover on DFS paths that resolve to targets
+ 	 * that have different prefix paths.
+ 	 */
+-	cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_USE_PREFIX_PATH;
++	atomic_or(CIFS_MOUNT_USE_PREFIX_PATH, &cifs_sb->mnt_cifs_flags);
+ 	kfree(cifs_sb->prepath);
+ 	cifs_sb->prepath = ctx->prepath;
+ 	ctx->prepath = NULL;
+@@ -4547,7 +4556,7 @@ cifs_sb_tlink(struct cifs_sb_info *cifs_sb)
+ 	kuid_t fsuid = current_fsuid();
+ 	int err;
+ 
+-	if (!(cifs_sb->mnt_cifs_flags & CIFS_MOUNT_MULTIUSER))
++	if (!(cifs_sb_flags(cifs_sb) & CIFS_MOUNT_MULTIUSER))
+ 		return cifs_get_tlink(cifs_sb_master_tlink(cifs_sb));
+ 
+ 	spin_lock(&cifs_sb->tlink_tree_lock);
+diff --git a/fs/smb/client/dfs_cache.c b/fs/smb/client/dfs_cache.c
+index f2ad0ccd08a7..0daa98992938 100644
+--- a/fs/smb/client/dfs_cache.c
++++ b/fs/smb/client/dfs_cache.c
+@@ -1333,7 +1333,7 @@ int dfs_cache_remount_fs(struct cifs_sb_info *cifs_sb)
+ 	 * Force the use of prefix path to support failover on DFS paths that resolve to targets
+ 	 * that have different prefix paths.
+ 	 */
+-	cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_USE_PREFIX_PATH;
++	atomic_or(CIFS_MOUNT_USE_PREFIX_PATH, &cifs_sb->mnt_cifs_flags);
+ 
+ 	refresh_tcon_referral(tcon, true);
+ 	return 0;
+diff --git a/fs/smb/client/dir.c b/fs/smb/client/dir.c
+index 6d0583239d06..89c56b5badbb 100644
+--- a/fs/smb/client/dir.c
++++ b/fs/smb/client/dir.c
+@@ -83,10 +83,11 @@ char *__build_path_from_dentry_optional_prefix(struct dentry *direntry, void *pa
+ 					       const char *tree, int tree_len,
+ 					       bool prefix)
+ {
+-	int dfsplen;
+-	int pplen = 0;
+-	struct cifs_sb_info *cifs_sb = CIFS_SB(direntry->d_sb);
++	struct cifs_sb_info *cifs_sb = CIFS_SB(direntry);
++	unsigned int sbflags = cifs_sb_flags(cifs_sb);
+ 	char dirsep = CIFS_DIR_SEP(cifs_sb);
++	int pplen = 0;
++	int dfsplen;
+ 	char *s;
+ 
+ 	if (unlikely(!page))
+@@ -97,7 +98,7 @@ char *__build_path_from_dentry_optional_prefix(struct dentry *direntry, void *pa
+ 	else
+ 		dfsplen = 0;
+ 
+-	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_USE_PREFIX_PATH)
++	if (sbflags & CIFS_MOUNT_USE_PREFIX_PATH)
+ 		pplen = cifs_sb->prepath ? strlen(cifs_sb->prepath) + 1 : 0;
+ 
+ 	s = dentry_path_raw(direntry, page, PATH_MAX);
+@@ -124,7 +125,7 @@ char *__build_path_from_dentry_optional_prefix(struct dentry *direntry, void *pa
+ 	if (dfsplen) {
+ 		s -= dfsplen;
+ 		memcpy(s, tree, dfsplen);
+-		if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_POSIX_PATHS) {
++		if (sbflags & CIFS_MOUNT_POSIX_PATHS) {
+ 			int i;
+ 			for (i = 0; i < dfsplen; i++) {
+ 				if (s[i] == '\\')
+@@ -153,7 +154,7 @@ char *build_path_from_dentry_optional_prefix(struct dentry *direntry, void *page
+ static int
+ check_name(struct dentry *direntry, struct cifs_tcon *tcon)
+ {
+-	struct cifs_sb_info *cifs_sb = CIFS_SB(direntry->d_sb);
++	struct cifs_sb_info *cifs_sb = CIFS_SB(direntry);
+ 	int i;
+ 
+ 	if (unlikely(tcon->fsAttrInfo.MaxPathNameComponentLength &&
+@@ -161,7 +162,7 @@ check_name(struct dentry *direntry, struct cifs_tcon *tcon)
+ 		     le32_to_cpu(tcon->fsAttrInfo.MaxPathNameComponentLength)))
+ 		return -ENAMETOOLONG;
+ 
+-	if (!(cifs_sb->mnt_cifs_flags & CIFS_MOUNT_POSIX_PATHS)) {
++	if (!(cifs_sb_flags(cifs_sb) & CIFS_MOUNT_POSIX_PATHS)) {
+ 		for (i = 0; i < direntry->d_name.len; i++) {
+ 			if (direntry->d_name.name[i] == '\\') {
+ 				cifs_dbg(FYI, "Invalid file name\n");
+@@ -182,11 +183,12 @@ static int cifs_do_create(struct inode *inode, struct dentry *direntry, unsigned
+ 	int rc = -ENOENT;
+ 	int create_options = CREATE_NOT_DIR;
+ 	int desired_access;
+-	struct cifs_sb_info *cifs_sb = CIFS_SB(inode->i_sb);
++	struct cifs_sb_info *cifs_sb = CIFS_SB(inode);
+ 	struct cifs_tcon *tcon = tlink_tcon(tlink);
+ 	const char *full_path;
+ 	void *page = alloc_dentry_path();
+ 	struct inode *newinode = NULL;
++	unsigned int sbflags;
+ 	int disposition;
+ 	struct TCP_Server_Info *server = tcon->ses->server;
+ 	struct cifs_open_parms oparms;
+@@ -366,6 +368,7 @@ static int cifs_do_create(struct inode *inode, struct dentry *direntry, unsigned
+ 	 * If Open reported that we actually created a file then we now have to
+ 	 * set the mode if possible.
+ 	 */
++	sbflags = cifs_sb_flags(cifs_sb);
+ 	if ((tcon->unix_ext) && (*oplock & CIFS_CREATE_ACTION)) {
+ 		struct cifs_unix_set_info_args args = {
+ 				.mode	= mode,
+@@ -375,7 +378,7 @@ static int cifs_do_create(struct inode *inode, struct dentry *direntry, unsigned
+ 				.device	= 0,
+ 		};
+ 
+-		if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_SET_UID) {
++		if (sbflags & CIFS_MOUNT_SET_UID) {
+ 			args.uid = current_fsuid();
+ 			if (inode->i_mode & S_ISGID)
+ 				args.gid = inode->i_gid;
+@@ -412,9 +415,9 @@ static int cifs_do_create(struct inode *inode, struct dentry *direntry, unsigned
+ 			if (server->ops->set_lease_key)
+ 				server->ops->set_lease_key(newinode, fid);
+ 			if ((*oplock & CIFS_CREATE_ACTION) && S_ISREG(newinode->i_mode)) {
+-				if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_DYNPERM)
++				if (sbflags & CIFS_MOUNT_DYNPERM)
+ 					newinode->i_mode = mode;
+-				if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_SET_UID) {
++				if (sbflags & CIFS_MOUNT_SET_UID) {
+ 					newinode->i_uid = current_fsuid();
+ 					if (inode->i_mode & S_ISGID)
+ 						newinode->i_gid = inode->i_gid;
+@@ -459,18 +462,20 @@ int
+ cifs_atomic_open(struct inode *inode, struct dentry *direntry,
+ 		 struct file *file, unsigned int oflags, umode_t mode)
+ {
+-	int rc;
+-	unsigned int xid;
+-	struct tcon_link *tlink;
+-	struct cifs_tcon *tcon;
++	struct cifs_sb_info *cifs_sb = CIFS_SB(inode);
++	struct cifs_open_info_data buf = {};
+ 	struct TCP_Server_Info *server;
+-	struct cifs_fid fid = {};
++	struct cifsFileInfo *file_info;
+ 	struct cifs_pending_open open;
++	struct cifs_fid fid = {};
++	struct tcon_link *tlink;
++	struct cifs_tcon *tcon;
++	unsigned int sbflags;
++	unsigned int xid;
+ 	__u32 oplock;
+-	struct cifsFileInfo *file_info;
+-	struct cifs_open_info_data buf = {};
++	int rc;
+ 
+-	if (unlikely(cifs_forced_shutdown(CIFS_SB(inode->i_sb))))
++	if (unlikely(cifs_forced_shutdown(cifs_sb)))
+ 		return smb_EIO(smb_eio_trace_forced_shutdown);
+ 
+ 	/*
+@@ -506,7 +511,7 @@ cifs_atomic_open(struct inode *inode, struct dentry *direntry,
+ 	cifs_dbg(FYI, "parent inode = 0x%p name is: %pd and dentry = 0x%p\n",
+ 		 inode, direntry, direntry);
+ 
+-	tlink = cifs_sb_tlink(CIFS_SB(inode->i_sb));
++	tlink = cifs_sb_tlink(cifs_sb);
+ 	if (IS_ERR(tlink)) {
+ 		rc = PTR_ERR(tlink);
+ 		goto out_free_xid;
+@@ -543,13 +548,13 @@ cifs_atomic_open(struct inode *inode, struct dentry *direntry,
+ 		goto out;
+ 	}
+ 
+-	if (file->f_flags & O_DIRECT &&
+-	    CIFS_SB(inode->i_sb)->mnt_cifs_flags & CIFS_MOUNT_STRICT_IO) {
+-		if (CIFS_SB(inode->i_sb)->mnt_cifs_flags & CIFS_MOUNT_NO_BRL)
++	sbflags = cifs_sb_flags(cifs_sb);
++	if ((file->f_flags & O_DIRECT) && (sbflags & CIFS_MOUNT_STRICT_IO)) {
++		if (sbflags & CIFS_MOUNT_NO_BRL)
+ 			file->f_op = &cifs_file_direct_nobrl_ops;
+ 		else
+ 			file->f_op = &cifs_file_direct_ops;
+-		}
++	}
+ 
+ 	file_info = cifs_new_fileinfo(&fid, file, tlink, oplock, buf.symlink_target);
+ 	if (file_info == NULL) {
+* Unmerged path fs/smb/client/file.c
+diff --git a/fs/smb/client/fs_context.c b/fs/smb/client/fs_context.c
+index 287c8479c2f0..956cb7ce348f 100644
+--- a/fs/smb/client/fs_context.c
++++ b/fs/smb/client/fs_context.c
+@@ -2071,161 +2071,160 @@ smb3_cleanup_fs_context(struct smb3_fs_context *ctx)
+ 	kfree(ctx);
+ }
+ 
+-void smb3_update_mnt_flags(struct cifs_sb_info *cifs_sb)
++unsigned int smb3_update_mnt_flags(struct cifs_sb_info *cifs_sb)
+ {
++	unsigned int sbflags = cifs_sb_flags(cifs_sb);
+ 	struct smb3_fs_context *ctx = cifs_sb->ctx;
+ 
+ 	if (ctx->nodfs)
+-		cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_NO_DFS;
++		sbflags |= CIFS_MOUNT_NO_DFS;
+ 	else
+-		cifs_sb->mnt_cifs_flags &= ~CIFS_MOUNT_NO_DFS;
++		sbflags &= ~CIFS_MOUNT_NO_DFS;
+ 
+ 	if (ctx->noperm)
+-		cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_NO_PERM;
++		sbflags |= CIFS_MOUNT_NO_PERM;
+ 	else
+-		cifs_sb->mnt_cifs_flags &= ~CIFS_MOUNT_NO_PERM;
++		sbflags &= ~CIFS_MOUNT_NO_PERM;
+ 
+ 	if (ctx->setuids)
+-		cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_SET_UID;
++		sbflags |= CIFS_MOUNT_SET_UID;
+ 	else
+-		cifs_sb->mnt_cifs_flags &= ~CIFS_MOUNT_SET_UID;
++		sbflags &= ~CIFS_MOUNT_SET_UID;
+ 
+ 	if (ctx->setuidfromacl)
+-		cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_UID_FROM_ACL;
++		sbflags |= CIFS_MOUNT_UID_FROM_ACL;
+ 	else
+-		cifs_sb->mnt_cifs_flags &= ~CIFS_MOUNT_UID_FROM_ACL;
++		sbflags &= ~CIFS_MOUNT_UID_FROM_ACL;
+ 
+ 	if (ctx->server_ino)
+-		cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_SERVER_INUM;
++		sbflags |= CIFS_MOUNT_SERVER_INUM;
+ 	else
+-		cifs_sb->mnt_cifs_flags &= ~CIFS_MOUNT_SERVER_INUM;
++		sbflags &= ~CIFS_MOUNT_SERVER_INUM;
+ 
+ 	if (ctx->remap)
+-		cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_MAP_SFM_CHR;
++		sbflags |= CIFS_MOUNT_MAP_SFM_CHR;
+ 	else
+-		cifs_sb->mnt_cifs_flags &= ~CIFS_MOUNT_MAP_SFM_CHR;
++		sbflags &= ~CIFS_MOUNT_MAP_SFM_CHR;
+ 
+ 	if (ctx->sfu_remap)
+-		cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_MAP_SPECIAL_CHR;
++		sbflags |= CIFS_MOUNT_MAP_SPECIAL_CHR;
+ 	else
+-		cifs_sb->mnt_cifs_flags &= ~CIFS_MOUNT_MAP_SPECIAL_CHR;
++		sbflags &= ~CIFS_MOUNT_MAP_SPECIAL_CHR;
+ 
+ 	if (ctx->no_xattr)
+-		cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_NO_XATTR;
++		sbflags |= CIFS_MOUNT_NO_XATTR;
+ 	else
+-		cifs_sb->mnt_cifs_flags &= ~CIFS_MOUNT_NO_XATTR;
++		sbflags &= ~CIFS_MOUNT_NO_XATTR;
+ 
+ 	if (ctx->sfu_emul)
+-		cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_UNX_EMUL;
++		sbflags |= CIFS_MOUNT_UNX_EMUL;
+ 	else
+-		cifs_sb->mnt_cifs_flags &= ~CIFS_MOUNT_UNX_EMUL;
++		sbflags &= ~CIFS_MOUNT_UNX_EMUL;
+ 
+ 	if (ctx->nobrl)
+-		cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_NO_BRL;
++		sbflags |= CIFS_MOUNT_NO_BRL;
+ 	else
+-		cifs_sb->mnt_cifs_flags &= ~CIFS_MOUNT_NO_BRL;
++		sbflags &= ~CIFS_MOUNT_NO_BRL;
+ 
+ 	if (ctx->nohandlecache)
+-		cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_NO_HANDLE_CACHE;
++		sbflags |= CIFS_MOUNT_NO_HANDLE_CACHE;
+ 	else
+-		cifs_sb->mnt_cifs_flags &= ~CIFS_MOUNT_NO_HANDLE_CACHE;
++		sbflags &= ~CIFS_MOUNT_NO_HANDLE_CACHE;
+ 
+ 	if (ctx->nostrictsync)
+-		cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_NOSSYNC;
++		sbflags |= CIFS_MOUNT_NOSSYNC;
+ 	else
+-		cifs_sb->mnt_cifs_flags &= ~CIFS_MOUNT_NOSSYNC;
++		sbflags &= ~CIFS_MOUNT_NOSSYNC;
+ 
+ 	if (ctx->mand_lock)
+-		cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_NOPOSIXBRL;
++		sbflags |= CIFS_MOUNT_NOPOSIXBRL;
+ 	else
+-		cifs_sb->mnt_cifs_flags &= ~CIFS_MOUNT_NOPOSIXBRL;
++		sbflags &= ~CIFS_MOUNT_NOPOSIXBRL;
+ 
+ 	if (ctx->rwpidforward)
+-		cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_RWPIDFORWARD;
++		sbflags |= CIFS_MOUNT_RWPIDFORWARD;
+ 	else
+-		cifs_sb->mnt_cifs_flags &= ~CIFS_MOUNT_RWPIDFORWARD;
++		sbflags &= ~CIFS_MOUNT_RWPIDFORWARD;
+ 
+ 	if (ctx->mode_ace)
+-		cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_MODE_FROM_SID;
++		sbflags |= CIFS_MOUNT_MODE_FROM_SID;
+ 	else
+-		cifs_sb->mnt_cifs_flags &= ~CIFS_MOUNT_MODE_FROM_SID;
++		sbflags &= ~CIFS_MOUNT_MODE_FROM_SID;
+ 
+ 	if (ctx->cifs_acl)
+-		cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_CIFS_ACL;
++		sbflags |= CIFS_MOUNT_CIFS_ACL;
+ 	else
+-		cifs_sb->mnt_cifs_flags &= ~CIFS_MOUNT_CIFS_ACL;
++		sbflags &= ~CIFS_MOUNT_CIFS_ACL;
+ 
+ 	if (ctx->backupuid_specified)
+-		cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_CIFS_BACKUPUID;
++		sbflags |= CIFS_MOUNT_CIFS_BACKUPUID;
+ 	else
+-		cifs_sb->mnt_cifs_flags &= ~CIFS_MOUNT_CIFS_BACKUPUID;
++		sbflags &= ~CIFS_MOUNT_CIFS_BACKUPUID;
+ 
+ 	if (ctx->backupgid_specified)
+-		cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_CIFS_BACKUPGID;
++		sbflags |= CIFS_MOUNT_CIFS_BACKUPGID;
+ 	else
+-		cifs_sb->mnt_cifs_flags &= ~CIFS_MOUNT_CIFS_BACKUPGID;
++		sbflags &= ~CIFS_MOUNT_CIFS_BACKUPGID;
+ 
+ 	if (ctx->override_uid)
+-		cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_OVERR_UID;
++		sbflags |= CIFS_MOUNT_OVERR_UID;
+ 	else
+-		cifs_sb->mnt_cifs_flags &= ~CIFS_MOUNT_OVERR_UID;
++		sbflags &= ~CIFS_MOUNT_OVERR_UID;
+ 
+ 	if (ctx->override_gid)
+-		cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_OVERR_GID;
++		sbflags |= CIFS_MOUNT_OVERR_GID;
+ 	else
+-		cifs_sb->mnt_cifs_flags &= ~CIFS_MOUNT_OVERR_GID;
++		sbflags &= ~CIFS_MOUNT_OVERR_GID;
+ 
+ 	if (ctx->dynperm)
+-		cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_DYNPERM;
++		sbflags |= CIFS_MOUNT_DYNPERM;
+ 	else
+-		cifs_sb->mnt_cifs_flags &= ~CIFS_MOUNT_DYNPERM;
++		sbflags &= ~CIFS_MOUNT_DYNPERM;
+ 
+ 	if (ctx->fsc)
+-		cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_FSCACHE;
++		sbflags |= CIFS_MOUNT_FSCACHE;
+ 	else
+-		cifs_sb->mnt_cifs_flags &= ~CIFS_MOUNT_FSCACHE;
++		sbflags &= ~CIFS_MOUNT_FSCACHE;
+ 
+ 	if (ctx->multiuser)
+-		cifs_sb->mnt_cifs_flags |= (CIFS_MOUNT_MULTIUSER |
+-					    CIFS_MOUNT_NO_PERM);
++		sbflags |= CIFS_MOUNT_MULTIUSER | CIFS_MOUNT_NO_PERM;
+ 	else
+-		cifs_sb->mnt_cifs_flags &= ~CIFS_MOUNT_MULTIUSER;
++		sbflags &= ~CIFS_MOUNT_MULTIUSER;
+ 
+ 
+ 	if (ctx->strict_io)
+-		cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_STRICT_IO;
++		sbflags |= CIFS_MOUNT_STRICT_IO;
+ 	else
+-		cifs_sb->mnt_cifs_flags &= ~CIFS_MOUNT_STRICT_IO;
++		sbflags &= ~CIFS_MOUNT_STRICT_IO;
+ 
+ 	if (ctx->direct_io)
+-		cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_DIRECT_IO;
++		sbflags |= CIFS_MOUNT_DIRECT_IO;
+ 	else
+-		cifs_sb->mnt_cifs_flags &= ~CIFS_MOUNT_DIRECT_IO;
++		sbflags &= ~CIFS_MOUNT_DIRECT_IO;
+ 
+ 	if (ctx->mfsymlinks)
+-		cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_MF_SYMLINKS;
++		sbflags |= CIFS_MOUNT_MF_SYMLINKS;
+ 	else
+-		cifs_sb->mnt_cifs_flags &= ~CIFS_MOUNT_MF_SYMLINKS;
+-	if (ctx->mfsymlinks) {
+-		if (ctx->sfu_emul) {
+-			/*
+-			 * Our SFU ("Services for Unix") emulation allows now
+-			 * creating new and reading existing SFU symlinks.
+-			 * Older Linux kernel versions were not able to neither
+-			 * read existing nor create new SFU symlinks. But
+-			 * creating and reading SFU style mknod and FIFOs was
+-			 * supported for long time. When "mfsymlinks" and
+-			 * "sfu" are both enabled at the same time, it allows
+-			 * reading both types of symlinks, but will only create
+-			 * them with mfsymlinks format. This allows better
+-			 * Apple compatibility, compatibility with older Linux
+-			 * kernel clients (probably better for Samba too)
+-			 * while still recognizing old Windows style symlinks.
+-			 */
+-			cifs_dbg(VFS, "mount options mfsymlinks and sfu both enabled\n");
+-		}
+-	}
+-	cifs_sb->mnt_cifs_flags &= ~CIFS_MOUNT_SHUTDOWN;
++		sbflags &= ~CIFS_MOUNT_MF_SYMLINKS;
+ 
+-	return;
++	if (ctx->mfsymlinks && ctx->sfu_emul) {
++		/*
++		 * Our SFU ("Services for Unix") emulation allows now
++		 * creating new and reading existing SFU symlinks.
++		 * Older Linux kernel versions were not able to neither
++		 * read existing nor create new SFU symlinks. But
++		 * creating and reading SFU style mknod and FIFOs was
++		 * supported for long time. When "mfsymlinks" and
++		 * "sfu" are both enabled at the same time, it allows
++		 * reading both types of symlinks, but will only create
++		 * them with mfsymlinks format. This allows better
++		 * Apple compatibility, compatibility with older Linux
++		 * kernel clients (probably better for Samba too)
++		 * while still recognizing old Windows style symlinks.
++		 */
++		cifs_dbg(VFS, "mount options mfsymlinks and sfu both enabled\n");
++	}
++	sbflags &= ~CIFS_MOUNT_SHUTDOWN;
++	atomic_set(&cifs_sb->mnt_cifs_flags, sbflags);
++	return sbflags;
+ }
+* Unmerged path fs/smb/client/fs_context.h
+* Unmerged path fs/smb/client/inode.c
+diff --git a/fs/smb/client/ioctl.c b/fs/smb/client/ioctl.c
+index d1b153209424..8566b4a0c3b5 100644
+--- a/fs/smb/client/ioctl.c
++++ b/fs/smb/client/ioctl.c
+@@ -217,7 +217,7 @@ static int cifs_shutdown(struct super_block *sb, unsigned long arg)
+ 	 */
+ 	case CIFS_GOING_FLAGS_LOGFLUSH:
+ 	case CIFS_GOING_FLAGS_NOLOGFLUSH:
+-		sbi->mnt_cifs_flags |= CIFS_MOUNT_SHUTDOWN;
++		atomic_or(CIFS_MOUNT_SHUTDOWN, &sbi->mnt_cifs_flags);
+ 		goto shutdown_good;
+ 	default:
+ 		rc = -EINVAL;
+diff --git a/fs/smb/client/link.c b/fs/smb/client/link.c
+index 1317bbc71ef0..ad6533de58f8 100644
+--- a/fs/smb/client/link.c
++++ b/fs/smb/client/link.c
+@@ -570,14 +570,15 @@ int
+ cifs_symlink(struct mnt_idmap *idmap, struct inode *inode,
+ 	     struct dentry *direntry, const char *symname)
+ {
+-	int rc = -EOPNOTSUPP;
+-	unsigned int xid;
+-	struct cifs_sb_info *cifs_sb = CIFS_SB(inode->i_sb);
++	struct cifs_sb_info *cifs_sb = CIFS_SB(inode);
++	struct inode *newinode = NULL;
+ 	struct tcon_link *tlink;
+ 	struct cifs_tcon *pTcon;
+ 	const char *full_path;
++	int rc = -EOPNOTSUPP;
++	unsigned int sbflags;
++	unsigned int xid;
+ 	void *page;
+-	struct inode *newinode = NULL;
+ 
+ 	if (unlikely(cifs_forced_shutdown(cifs_sb)))
+ 		return smb_EIO(smb_eio_trace_forced_shutdown);
+@@ -606,6 +607,7 @@ cifs_symlink(struct mnt_idmap *idmap, struct inode *inode,
+ 	cifs_dbg(FYI, "symname is %s\n", symname);
+ 
+ 	/* BB what if DFS and this volume is on different share? BB */
++	sbflags = cifs_sb_flags(cifs_sb);
+ 	rc = -EOPNOTSUPP;
+ 	switch (cifs_symlink_type(cifs_sb)) {
+ 	case CIFS_SYMLINK_TYPE_UNIX:
+@@ -620,14 +622,14 @@ cifs_symlink(struct mnt_idmap *idmap, struct inode *inode,
+ 		break;
+ 
+ 	case CIFS_SYMLINK_TYPE_MFSYMLINKS:
+-		if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_MF_SYMLINKS) {
++		if (sbflags & CIFS_MOUNT_MF_SYMLINKS) {
+ 			rc = create_mf_symlink(xid, pTcon, cifs_sb,
+ 					       full_path, symname);
+ 		}
+ 		break;
+ 
+ 	case CIFS_SYMLINK_TYPE_SFU:
+-		if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_UNX_EMUL) {
++		if (sbflags & CIFS_MOUNT_UNX_EMUL) {
+ 			rc = __cifs_sfu_make_node(xid, inode, direntry, pTcon,
+ 						  full_path, S_IFLNK,
+ 						  0, symname);
+diff --git a/fs/smb/client/misc.c b/fs/smb/client/misc.c
+index 9529fa385938..d931aef1e8ee 100644
+--- a/fs/smb/client/misc.c
++++ b/fs/smb/client/misc.c
+@@ -567,13 +567,15 @@ dump_smb(void *buf, int smb_buf_length)
+ void
+ cifs_autodisable_serverino(struct cifs_sb_info *cifs_sb)
+ {
+-	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_SERVER_INUM) {
++	unsigned int sbflags = cifs_sb_flags(cifs_sb);
++
++	if (sbflags & CIFS_MOUNT_SERVER_INUM) {
+ 		struct cifs_tcon *tcon = NULL;
+ 
+ 		if (cifs_sb->master_tlink)
+ 			tcon = cifs_sb_master_tcon(cifs_sb);
+ 
+-		cifs_sb->mnt_cifs_flags &= ~CIFS_MOUNT_SERVER_INUM;
++		atomic_andnot(CIFS_MOUNT_SERVER_INUM, &cifs_sb->mnt_cifs_flags);
+ 		cifs_sb->mnt_cifs_serverino_autodisabled = true;
+ 		cifs_dbg(VFS, "Autodisabling the use of server inode numbers on %s\n",
+ 			 tcon ? tcon->tree_name : "new server");
+@@ -674,11 +676,13 @@ void cifs_done_oplock_break(struct cifsInodeInfo *cinode)
+ bool
+ backup_cred(struct cifs_sb_info *cifs_sb)
+ {
+-	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_CIFS_BACKUPUID) {
++	unsigned int sbflags = cifs_sb_flags(cifs_sb);
++
++	if (sbflags & CIFS_MOUNT_CIFS_BACKUPUID) {
+ 		if (uid_eq(cifs_sb->ctx->backupuid, current_fsuid()))
+ 			return true;
+ 	}
+-	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_CIFS_BACKUPGID) {
++	if (sbflags & CIFS_MOUNT_CIFS_BACKUPGID) {
+ 		if (in_group_p(cifs_sb->ctx->backupgid))
+ 			return true;
+ 	}
+@@ -1246,7 +1250,7 @@ int cifs_update_super_prepath(struct cifs_sb_info *cifs_sb, char *prefix)
+ 			convert_delimiter(cifs_sb->prepath, CIFS_DIR_SEP(cifs_sb));
+ 	}
+ 
+-	cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_USE_PREFIX_PATH;
++	atomic_or(CIFS_MOUNT_USE_PREFIX_PATH, &cifs_sb->mnt_cifs_flags);
+ 	return 0;
+ }
+ 
+@@ -1275,7 +1279,7 @@ int cifs_inval_name_dfs_link_error(const unsigned int xid,
+ 	 * look up or tcon is not DFS.
+ 	 */
+ 	if (strlen(full_path) < 2 || !cifs_sb ||
+-	    (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_NO_DFS) ||
++	    (cifs_sb_flags(cifs_sb) & CIFS_MOUNT_NO_DFS) ||
+ 	    !is_tcon_dfs(tcon))
+ 		return 0;
+ 
+diff --git a/fs/smb/client/readdir.c b/fs/smb/client/readdir.c
+index cc015bfecd9d..1e2f72a64b24 100644
+--- a/fs/smb/client/readdir.c
++++ b/fs/smb/client/readdir.c
+@@ -121,7 +121,7 @@ cifs_prime_dcache(struct dentry *parent, struct qstr *name,
+ 			 * want to clobber the existing one with the one that
+ 			 * the readdir code created.
+ 			 */
+-			if (!(cifs_sb->mnt_cifs_flags & CIFS_MOUNT_SERVER_INUM))
++			if (!(cifs_sb_flags(cifs_sb) & CIFS_MOUNT_SERVER_INUM))
+ 				fattr->cf_uniqueid = CIFS_I(inode)->uniqueid;
+ 
+ 			/*
+@@ -177,6 +177,7 @@ cifs_fill_common_info(struct cifs_fattr *fattr, struct cifs_sb_info *cifs_sb)
+ 	struct cifs_open_info_data data = {
+ 		.reparse = { .tag = fattr->cf_cifstag, },
+ 	};
++	unsigned int sbflags;
+ 
+ 	fattr->cf_uid = cifs_sb->ctx->linux_uid;
+ 	fattr->cf_gid = cifs_sb->ctx->linux_gid;
+@@ -215,12 +216,12 @@ cifs_fill_common_info(struct cifs_fattr *fattr, struct cifs_sb_info *cifs_sb)
+ 	 * may look wrong since the inodes may not have timed out by the time
+ 	 * "ls" does a stat() call on them.
+ 	 */
+-	if ((cifs_sb->mnt_cifs_flags & CIFS_MOUNT_CIFS_ACL) ||
+-	    (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_MODE_FROM_SID))
++	sbflags = cifs_sb_flags(cifs_sb);
++	if (sbflags & (CIFS_MOUNT_CIFS_ACL | CIFS_MOUNT_MODE_FROM_SID))
+ 		fattr->cf_flags |= CIFS_FATTR_NEED_REVAL;
+ 
+-	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_UNX_EMUL &&
+-	    fattr->cf_cifsattrs & ATTR_SYSTEM) {
++	if ((sbflags & CIFS_MOUNT_UNX_EMUL) &&
++	    (fattr->cf_cifsattrs & ATTR_SYSTEM)) {
+ 		if (fattr->cf_eof == 0)  {
+ 			fattr->cf_mode &= ~S_IFMT;
+ 			fattr->cf_mode |= S_IFIFO;
+@@ -345,13 +346,14 @@ static int
+ _initiate_cifs_search(const unsigned int xid, struct file *file,
+ 		     const char *full_path)
+ {
+-	__u16 search_flags;
+-	int rc = 0;
+-	struct cifsFileInfo *cifsFile;
+-	struct cifs_sb_info *cifs_sb = CIFS_FILE_SB(file);
++	struct cifs_sb_info *cifs_sb = CIFS_SB(file);
+ 	struct tcon_link *tlink = NULL;
+-	struct cifs_tcon *tcon;
+ 	struct TCP_Server_Info *server;
++	struct cifsFileInfo *cifsFile;
++	struct cifs_tcon *tcon;
++	unsigned int sbflags;
++	__u16 search_flags;
++	int rc = 0;
+ 
+ 	if (file->private_data == NULL) {
+ 		tlink = cifs_sb_tlink(cifs_sb);
+@@ -385,6 +387,7 @@ _initiate_cifs_search(const unsigned int xid, struct file *file,
+ 	cifs_dbg(FYI, "Full path: %s start at: %lld\n", full_path, file->f_pos);
+ 
+ ffirst_retry:
++	sbflags = cifs_sb_flags(cifs_sb);
+ 	/* test for Unix extensions */
+ 	/* but now check for them on the share/mount not on the SMB session */
+ 	/* if (cap_unix(tcon->ses) { */
+@@ -395,7 +398,7 @@ _initiate_cifs_search(const unsigned int xid, struct file *file,
+ 	else if ((tcon->ses->capabilities &
+ 		  tcon->ses->server->vals->cap_nt_find) == 0) {
+ 		cifsFile->srch_inf.info_level = SMB_FIND_FILE_INFO_STANDARD;
+-	} else if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_SERVER_INUM) {
++	} else if (sbflags & CIFS_MOUNT_SERVER_INUM) {
+ 		cifsFile->srch_inf.info_level = SMB_FIND_FILE_ID_FULL_DIR_INFO;
+ 	} else /* not srvinos - BB fixme add check for backlevel? */ {
+ 		cifsFile->srch_inf.info_level = SMB_FIND_FILE_FULL_DIRECTORY_INFO;
+@@ -411,8 +414,7 @@ _initiate_cifs_search(const unsigned int xid, struct file *file,
+ 
+ 	if (rc == 0) {
+ 		cifsFile->invalidHandle = false;
+-	} else if ((rc == -EOPNOTSUPP) &&
+-		   (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_SERVER_INUM)) {
++	} else if (rc == -EOPNOTSUPP && (sbflags & CIFS_MOUNT_SERVER_INUM)) {
+ 		cifs_autodisable_serverino(cifs_sb);
+ 		goto ffirst_retry;
+ 	}
+@@ -690,7 +692,7 @@ find_cifs_entry(const unsigned int xid, struct cifs_tcon *tcon, loff_t pos,
+ 	loff_t first_entry_in_buffer;
+ 	loff_t index_to_find = pos;
+ 	struct cifsFileInfo *cfile = file->private_data;
+-	struct cifs_sb_info *cifs_sb = CIFS_FILE_SB(file);
++	struct cifs_sb_info *cifs_sb = CIFS_SB(file);
+ 	struct TCP_Server_Info *server = tcon->ses->server;
+ 	/* check if index in the buffer */
+ 
+@@ -955,6 +957,7 @@ static int cifs_filldir(char *find_entry, struct file *file,
+ 	struct cifs_sb_info *cifs_sb = CIFS_SB(sb);
+ 	struct cifs_dirent de = { NULL, };
+ 	struct cifs_fattr fattr;
++	unsigned int sbflags;
+ 	struct qstr name;
+ 	int rc = 0;
+ 
+@@ -1019,15 +1022,15 @@ static int cifs_filldir(char *find_entry, struct file *file,
+ 		break;
+ 	}
+ 
+-	if (de.ino && (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_SERVER_INUM)) {
++	sbflags = cifs_sb_flags(cifs_sb);
++	if (de.ino && (sbflags & CIFS_MOUNT_SERVER_INUM)) {
+ 		fattr.cf_uniqueid = de.ino;
+ 	} else {
+ 		fattr.cf_uniqueid = iunique(sb, ROOT_I);
+ 		cifs_autodisable_serverino(cifs_sb);
+ 	}
+ 
+-	if ((cifs_sb->mnt_cifs_flags & CIFS_MOUNT_MF_SYMLINKS) &&
+-	    couldbe_mf_symlink(&fattr))
++	if ((sbflags & CIFS_MOUNT_MF_SYMLINKS) && couldbe_mf_symlink(&fattr))
+ 		/*
+ 		 * trying to get the type and mode can be slow,
+ 		 * so just call those regular files for now, and mark
+@@ -1058,7 +1061,7 @@ int cifs_readdir(struct file *file, struct dir_context *ctx)
+ 	const char *full_path;
+ 	void *page = alloc_dentry_path();
+ 	struct cached_fid *cfid = NULL;
+-	struct cifs_sb_info *cifs_sb = CIFS_FILE_SB(file);
++	struct cifs_sb_info *cifs_sb = CIFS_SB(file);
+ 
+ 	xid = get_xid();
+ 
+diff --git a/fs/smb/client/reparse.c b/fs/smb/client/reparse.c
+index ce9b923498b5..cd1e1eaee67a 100644
+--- a/fs/smb/client/reparse.c
++++ b/fs/smb/client/reparse.c
+@@ -55,17 +55,18 @@ static int create_native_symlink(const unsigned int xid, struct inode *inode,
+ 				 const char *full_path, const char *symname)
+ {
+ 	struct reparse_symlink_data_buffer *buf = NULL;
+-	struct cifs_open_info_data data = {};
+-	struct cifs_sb_info *cifs_sb = CIFS_SB(inode->i_sb);
++	struct cifs_sb_info *cifs_sb = CIFS_SB(inode);
+ 	const char *symroot = cifs_sb->ctx->symlinkroot;
++	struct cifs_open_info_data data = {};
++	char sep = CIFS_DIR_SEP(cifs_sb);
++	char *symlink_target = NULL;
++	u16 len, plen, poff, slen;
++	unsigned int sbflags;
++	__le16 *path = NULL;
+ 	struct inode *new;
++	char *sym = NULL;
+ 	struct kvec iov;
+-	__le16 *path = NULL;
+ 	bool directory;
+-	char *symlink_target = NULL;
+-	char *sym = NULL;
+-	char sep = CIFS_DIR_SEP(cifs_sb);
+-	u16 len, plen, poff, slen;
+ 	int rc = 0;
+ 
+ 	if (strlen(symname) > REPARSE_SYM_PATH_MAX)
+@@ -83,8 +84,8 @@ static int create_native_symlink(const unsigned int xid, struct inode *inode,
+ 		.symlink_target = symlink_target,
+ 	};
+ 
+-	if (!(cifs_sb->mnt_cifs_flags & CIFS_MOUNT_POSIX_PATHS) &&
+-	    symroot && symname[0] == '/') {
++	sbflags = cifs_sb_flags(cifs_sb);
++	if (!(sbflags & CIFS_MOUNT_POSIX_PATHS) && symroot && symname[0] == '/') {
+ 		/*
+ 		 * This is a request to create an absolute symlink on the server
+ 		 * which does not support POSIX paths, and expects symlink in
+@@ -164,7 +165,7 @@ static int create_native_symlink(const unsigned int xid, struct inode *inode,
+ 	 * mask these characters in NT object prefix by '_' and then change
+ 	 * them back.
+ 	 */
+-	if (!(cifs_sb->mnt_cifs_flags & CIFS_MOUNT_POSIX_PATHS) && symname[0] == '/')
++	if (!(sbflags & CIFS_MOUNT_POSIX_PATHS) && symname[0] == '/')
+ 		sym[0] = sym[1] = sym[2] = sym[5] = '_';
+ 
+ 	path = cifs_convert_path_to_utf16(sym, cifs_sb);
+@@ -173,7 +174,7 @@ static int create_native_symlink(const unsigned int xid, struct inode *inode,
+ 		goto out;
+ 	}
+ 
+-	if (!(cifs_sb->mnt_cifs_flags & CIFS_MOUNT_POSIX_PATHS) && symname[0] == '/') {
++	if (!(sbflags & CIFS_MOUNT_POSIX_PATHS) && symname[0] == '/') {
+ 		sym[0] = '\\';
+ 		sym[1] = sym[2] = '?';
+ 		sym[5] = ':';
+@@ -197,7 +198,7 @@ static int create_native_symlink(const unsigned int xid, struct inode *inode,
+ 	slen = 2 * UniStrnlen((wchar_t *)path, REPARSE_SYM_PATH_MAX);
+ 	poff = 0;
+ 	plen = slen;
+-	if (!(cifs_sb->mnt_cifs_flags & CIFS_MOUNT_POSIX_PATHS) && symname[0] == '/') {
++	if (!(sbflags & CIFS_MOUNT_POSIX_PATHS) && symname[0] == '/') {
+ 		/*
+ 		 * For absolute NT symlinks skip leading "\\??\\" in PrintName as
+ 		 * PrintName is user visible location in DOS/Win32 format (not in NT format).
+@@ -824,7 +825,7 @@ int smb2_parse_native_symlink(char **target, const char *buf, unsigned int len,
+ 		goto out;
+ 	}
+ 
+-	if (!(cifs_sb->mnt_cifs_flags & CIFS_MOUNT_POSIX_PATHS) &&
++	if (!(cifs_sb_flags(cifs_sb) & CIFS_MOUNT_POSIX_PATHS) &&
+ 	    symroot && !relative) {
+ 		/*
+ 		 * This is an absolute symlink from the server which does not
+diff --git a/fs/smb/client/reparse.h b/fs/smb/client/reparse.h
+index 19caab2fd11e..ac1c90a55b1c 100644
+--- a/fs/smb/client/reparse.h
++++ b/fs/smb/client/reparse.h
+@@ -32,7 +32,7 @@ static inline kuid_t wsl_make_kuid(struct cifs_sb_info *cifs_sb,
+ {
+ 	u32 uid = le32_to_cpu(*(__le32 *)ptr);
+ 
+-	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_OVERR_UID)
++	if (cifs_sb_flags(cifs_sb) & CIFS_MOUNT_OVERR_UID)
+ 		return cifs_sb->ctx->linux_uid;
+ 	return make_kuid(current_user_ns(), uid);
+ }
+@@ -42,7 +42,7 @@ static inline kgid_t wsl_make_kgid(struct cifs_sb_info *cifs_sb,
+ {
+ 	u32 gid = le32_to_cpu(*(__le32 *)ptr);
+ 
+-	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_OVERR_GID)
++	if (cifs_sb_flags(cifs_sb) & CIFS_MOUNT_OVERR_GID)
+ 		return cifs_sb->ctx->linux_gid;
+ 	return make_kgid(current_user_ns(), gid);
+ }
+* Unmerged path fs/smb/client/smb1ops.c
+diff --git a/fs/smb/client/smb2file.c b/fs/smb/client/smb2file.c
+index b2ddcecd00b9..067b63bc509d 100644
+--- a/fs/smb/client/smb2file.c
++++ b/fs/smb/client/smb2file.c
+@@ -74,7 +74,7 @@ int smb2_fix_symlink_target_type(char **target, bool directory, struct cifs_sb_i
+ 	 * POSIX server does not distinguish between symlinks to file and
+ 	 * symlink directory. So nothing is needed to fix on the client side.
+ 	 */
+-	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_POSIX_PATHS)
++	if (cifs_sb_flags(cifs_sb) & CIFS_MOUNT_POSIX_PATHS)
+ 		return 0;
+ 
+ 	if (!*target)
+* Unmerged path fs/smb/client/smb2misc.c
+* Unmerged path fs/smb/client/smb2ops.c
+diff --git a/fs/smb/client/smb2pdu.c b/fs/smb/client/smb2pdu.c
+index d14d8da3c6b5..f6cadb30f483 100644
+--- a/fs/smb/client/smb2pdu.c
++++ b/fs/smb/client/smb2pdu.c
+@@ -3182,22 +3182,19 @@ SMB2_open_init(struct cifs_tcon *tcon, struct TCP_Server_Info *server,
+ 	}
+ 
+ 	if ((oparms->disposition != FILE_OPEN) && (oparms->cifs_sb)) {
++		unsigned int sbflags = cifs_sb_flags(oparms->cifs_sb);
+ 		bool set_mode;
+ 		bool set_owner;
+ 
+-		if ((oparms->cifs_sb->mnt_cifs_flags & CIFS_MOUNT_MODE_FROM_SID) &&
+-		    (oparms->mode != ACL_NO_MODE))
++		if ((sbflags & CIFS_MOUNT_MODE_FROM_SID) &&
++		    oparms->mode != ACL_NO_MODE) {
+ 			set_mode = true;
+-		else {
++		} else {
+ 			set_mode = false;
+ 			oparms->mode = ACL_NO_MODE;
+ 		}
+ 
+-		if (oparms->cifs_sb->mnt_cifs_flags & CIFS_MOUNT_UID_FROM_ACL)
+-			set_owner = true;
+-		else
+-			set_owner = false;
+-
++		set_owner = sbflags & CIFS_MOUNT_UID_FROM_ACL;
+ 		if (set_owner | set_mode) {
+ 			cifs_dbg(FYI, "add sd with mode 0x%x\n", oparms->mode);
+ 			rc = add_sd_context(iov, &n_iov, oparms->mode, set_owner);
+diff --git a/fs/smb/client/xattr.c b/fs/smb/client/xattr.c
+index 6bc89c59164a..71d8edc69e64 100644
+--- a/fs/smb/client/xattr.c
++++ b/fs/smb/client/xattr.c
+@@ -150,7 +150,7 @@ static int cifs_xattr_set(const struct xattr_handler *handler,
+ 			break;
+ 		}
+ 
+-		if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_NO_XATTR)
++		if (cifs_sb_flags(cifs_sb) & CIFS_MOUNT_NO_XATTR)
+ 			goto out;
+ 
+ 		if (pTcon->ses->server->ops->set_EA) {
+@@ -310,7 +310,7 @@ static int cifs_xattr_get(const struct xattr_handler *handler,
+ 			break;
+ 		}
+ 
+-		if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_NO_XATTR)
++		if (cifs_sb_flags(cifs_sb) & CIFS_MOUNT_NO_XATTR)
+ 			goto out;
+ 
+ 		if (pTcon->ses->server->ops->query_all_EAs)
+@@ -399,7 +399,7 @@ ssize_t cifs_listxattr(struct dentry *direntry, char *data, size_t buf_size)
+ 	if (unlikely(cifs_forced_shutdown(cifs_sb)))
+ 		return smb_EIO(smb_eio_trace_forced_shutdown);
+ 
+-	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_NO_XATTR)
++	if (cifs_sb_flags(cifs_sb) & CIFS_MOUNT_NO_XATTR)
+ 		return -EOPNOTSUPP;
+ 
+ 	tlink = cifs_sb_tlink(cifs_sb);
