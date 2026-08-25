@@ -67,7 +67,7 @@ add_uncore_discovery_type(struct uncore_unit_discovery *unit)
 		return NULL;
 	}
 
-	type = kzalloc(sizeof(struct intel_uncore_discovery_type), GFP_KERNEL);
+	type = kzalloc_obj(struct intel_uncore_discovery_type, GFP_KERNEL);
 	if (!type)
 		return NULL;
 
@@ -214,7 +214,7 @@ uncore_insert_box_info(struct uncore_unit_discovery *unit,
 		return;
 	}
 
-	node = kzalloc(sizeof(*node), GFP_KERNEL);
+	node = kzalloc_obj(*node, GFP_KERNEL);
 	if (!node)
 		return;
 
@@ -748,8 +748,9 @@ intel_uncore_generic_init_uncores(enum uncore_access_type type_id, int num_extra
 	struct rb_node *node;
 	int i = 0;
 
-	uncores = kcalloc(num_discovered_types[type_id] + num_extra + 1,
-			  sizeof(struct intel_uncore_type *), GFP_KERNEL);
+	uncores = kzalloc_objs(struct intel_uncore_type *,
+			       num_discovered_types[type_id] + num_extra + 1,
+			       GFP_KERNEL);
 	if (!uncores)
 		return empty_uncore;
 
@@ -758,7 +759,7 @@ intel_uncore_generic_init_uncores(enum uncore_access_type type_id, int num_extra
 		if (type->access_type != type_id)
 			continue;
 
-		uncore = kzalloc(sizeof(struct intel_uncore_type), GFP_KERNEL);
+		uncore = kzalloc_obj(struct intel_uncore_type, GFP_KERNEL);
 		if (!uncore)
 			break;
 
