@@ -288,8 +288,10 @@ static int k1_spi_dma_one(struct spi_controller *host, struct spi_device *spi,
 
 	/* Prepare the RX descriptor */
 	rxdesc = k1_spi_dma_prep(drv_data, transfer, false);
-	if (!rxdesc)
+	if (!rxdesc) {
+		dmaengine_terminate_sync(host->dma_tx);
 		goto fallback;
+	}
 
 	/* When RX is complete we also know TX has completed */
 	rxdesc->callback = k1_spi_dma_callback;
