@@ -108,9 +108,6 @@
 /* i2c bus recover timeout: us */
 #define SPACEMIT_I2C_BUS_BUSY_TIMEOUT		100000
 
-#define SPACEMIT_I2C_MAX_STANDARD_MODE_FREQ	100000	/* Hz */
-#define SPACEMIT_I2C_MAX_FAST_MODE_FREQ		400000	/* Hz */
-
 #define SPACEMIT_SR_ERR	(SPACEMIT_SR_BED | SPACEMIT_SR_RXOV | SPACEMIT_SR_ALD)
 
 #define SPACEMIT_BUS_RESET_CLK_CNT_MAX		9
@@ -836,15 +833,15 @@ static int spacemit_i2c_probe(struct platform_device *pdev)
 	of_property_read_u32(of_node, "clock-frequency", &i2c->clock_freq);
 
 	/* For now, this driver doesn't support high-speed. */
-	if (i2c->clock_freq > SPACEMIT_I2C_MAX_STANDARD_MODE_FREQ &&
-	    i2c->clock_freq <= SPACEMIT_I2C_MAX_FAST_MODE_FREQ) {
+	if (i2c->clock_freq > I2C_MAX_STANDARD_MODE_FREQ &&
+	    i2c->clock_freq <= I2C_MAX_FAST_MODE_FREQ) {
 		i2c->mode = SPACEMIT_MODE_FAST;
-	} else if (i2c->clock_freq && i2c->clock_freq <= SPACEMIT_I2C_MAX_STANDARD_MODE_FREQ) {
+	} else if (i2c->clock_freq && i2c->clock_freq <= I2C_MAX_STANDARD_MODE_FREQ) {
 		i2c->mode = SPACEMIT_MODE_STANDARD;
 	} else {
 		dev_info(dev, "clock-frequency not set or out of range, using fast mode\n");
 		i2c->mode = SPACEMIT_MODE_FAST;
-		i2c->clock_freq = SPACEMIT_I2C_MAX_FAST_MODE_FREQ;
+		i2c->clock_freq = I2C_MAX_FAST_MODE_FREQ;
 	}
 
 	i2c->dev = &pdev->dev;
