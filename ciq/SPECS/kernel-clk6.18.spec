@@ -170,7 +170,7 @@ Summary: The Linux kernel
 %define kernel_patch 43
 %define buildid .1
 %define specversion %{kernel_major_minor}.%{kernel_patch}
-%define pkgrelease 1%{?buildid}
+%define pkgrelease 2%{?buildid}
 %define kversion %{lua:print((rpm.expand("%{kernel_major_minor}"):match("^(%d+)")))}
 
 %define tarfile_release %{specversion}-%{pkgrelease}.el%{rhel}
@@ -4567,6 +4567,20 @@ fi\
 #
 #
 %changelog
+* Wed Aug 26 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.43-2.1
+-- selftests/bpf: tc_tunnel - validate decap GSO and encapsulation state (Brett Mastbergen)
+-- bpf: Clear decap state on skb_adjust_room shrink path (Brett Mastbergen)
+-- bpf: Allow new DECAP flags and add guard rails (Brett Mastbergen)
+-- bpf: Add BPF_F_ADJ_ROOM_DECAP_* flags for tunnel decapsulation (Brett Mastbergen)
+-- bpf: Refactor masks for ADJ_ROOM flags and encap validation (Brett Mastbergen)
+-- bpf: Name the enum for BPF_FUNC_skb_adjust_room flags (Brett Mastbergen)
+-- net: Clear the dst when performing encap / decap (Brett Mastbergen)
+-- bpf: Reject redirect helpers without a bpf_net_context (Brett Mastbergen)
+-- selftests/bpf: Add tests for bpf_redirect_peer with BPF_F_EGRESS (Brett Mastbergen)
+-- bpf: Support BPF_F_EGRESS with bpf_redirect_peer (Brett Mastbergen)
+-- crypto: rng - Fix double percpu offset in local_unlock() calls (Sultan Alsawaf)
+-- spec: use %{rhel} for el version and conditionally use system bindgen (Brett Mastbergen)
+
 * Fri Aug 07 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.18.43-1.1.el9
 -- Rebased changes for Linux 6.18.43 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.43-1)
 -- Set kpatch/driver certs for all builds (Skip Grube)
