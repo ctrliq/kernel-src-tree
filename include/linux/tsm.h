@@ -7,7 +7,7 @@
 #include <linux/uuid.h>
 
 #define TSM_REPORT_INBLOB_MAX 64
-#define TSM_REPORT_OUTBLOB_MAX SZ_32K
+#define TSM_REPORT_OUTBLOB_MAX SZ_16M
 
 /*
  * Privilege level is a nested permission concept to allow confidential
