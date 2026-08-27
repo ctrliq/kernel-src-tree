@@ -1946,6 +1946,8 @@ static long mshv_ioctl_process_pt_flags(void __user *user_arg, u64 *pt_flags,
 		*pt_flags |= HV_PARTITION_CREATION_FLAG_X2APIC_CAPABLE;
 	if (args.pt_flags & BIT_ULL(MSHV_PT_BIT_GPA_SUPER_PAGES))
 		*pt_flags |= HV_PARTITION_CREATION_FLAG_GPA_SUPER_PAGES_ENABLED;
+	if (args.pt_flags & BIT(MSHV_PT_BIT_SMT_ENABLED_GUEST))
+		*pt_flags |= HV_PARTITION_CREATION_FLAG_SMT_ENABLED_GUEST;
 
 	isol_props->as_uint64 = 0;
 
