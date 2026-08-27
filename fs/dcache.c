@@ -40,7 +40,7 @@
 /*
  * Usage:
  * dcache->d_inode->i_lock protects:
- *   - i_dentry, d_u.d_alias, d_inode of aliases
+ *   - i_dentry, d_alias, d_inode of aliases
  * dcache_hash_bucket lock protects:
  *   - the dcache hash table
  * s_roots bl list spinlock protects:
@@ -55,7 +55,7 @@
  *   - d_unhashed()
  *   - d_parent and d_chilren
  *   - childrens' d_sib and d_parent
- *   - d_u.d_alias, d_inode
+ *   - d_alias, d_inode
  *
  * Ordering:
  * dentry->d_inode->i_lock
@@ -301,14 +301,14 @@ static inline struct external_name *external_name(struct dentry *dentry)
 
 static void __d_free(struct rcu_head *head)
 {
-	struct dentry *dentry = container_of(head, struct dentry, d_u.d_rcu);
+	struct dentry *dentry = container_of(head, struct dentry, d_rcu);
 
 	kmem_cache_free(dentry_cache, dentry); 
 }
 
 static void __d_free_external(struct rcu_head *head)
 {
-	struct dentry *dentry = container_of(head, struct dentry, d_u.d_rcu);
+	struct dentry *dentry = container_of(head, struct dentry, d_rcu);
 	kfree(external_name(dentry));
 	kmem_cache_free(dentry_cache, dentry);
 }
@@ -374,19 +374,19 @@ static inline void __d_clear_type_and_inode(struct dentry *dentry)
 
 static void dentry_free(struct dentry *dentry)
 {
-	WARN_ON(!hlist_unhashed(&dentry->d_u.d_alias));
+	WARN_ON(!hlist_unhashed(&dentry->d_alias));
 	if (unlikely(dname_external(dentry))) {
 		struct external_name *p = external_name(dentry);
 		if (likely(atomic_dec_and_test(&p->u.count))) {
-			call_rcu(&dentry->d_u.d_rcu, __d_free_external);
+			call_rcu(&dentry->d_rcu, __d_free_external);
 			return;
 		}
 	}
 	/* if dentry was never visible to RCU, immediate free is OK */
 	if (dentry->d_flags & DCACHE_NORCU)
-		__d_free(&dentry->d_u.d_rcu);
+		__d_free(&dentry->d_rcu);
 	else
-		call_rcu(&dentry->d_u.d_rcu, __d_free);
+		call_rcu(&dentry->d_rcu, __d_free);
 }
 
 /*
@@ -401,7 +401,7 @@ static void dentry_unlink_inode(struct dentry * dentry)
 
 	raw_write_seqcount_begin(&dentry->d_seq);
 	__d_clear_type_and_inode(dentry);
-	hlist_del_init(&dentry->d_u.d_alias);
+	hlist_del_init(&dentry->d_alias);
 	raw_write_seqcount_end(&dentry->d_seq);
 	spin_unlock(&dentry->d_lock);
 	spin_unlock(&inode->i_lock);
@@ -939,7 +939,7 @@ static struct dentry * __d_find_any_alias(struct inode *inode)
 
 	if (hlist_empty(&inode->i_dentry))
 		return NULL;
-	alias = hlist_entry(inode->i_dentry.first, struct dentry, d_u.d_alias);
+	alias = hlist_entry(inode->i_dentry.first, struct dentry, d_alias);
 	lockref_get(&alias->d_lockref);
 	return alias;
 }
@@ -1022,9 +1022,9 @@ struct dentry *d_find_alias_rcu(struct inode *inode)
 	// used without having I_FREEING set, which means no aliases left
 	if (likely(!(inode->i_state & I_FREEING) && !hlist_empty(l))) {
 		if (S_ISDIR(inode->i_mode)) {
-			de = hlist_entry(l->first, struct dentry, d_u.d_alias);
+			de = hlist_entry(l->first, struct dentry, d_alias);
 		} else {
-			hlist_for_each_entry(de, l, d_u.d_alias)
+			hlist_for_each_entry(de, l, d_alias)
 				if (!d_unhashed(de))
 					break;
 		}
@@ -1685,7 +1685,7 @@ static struct dentry *__d_alloc(struct super_block *sb, const struct qstr *name)
 	INIT_HLIST_BL_NODE(&dentry->d_hash);
 	INIT_LIST_HEAD(&dentry->d_lru);
 	INIT_HLIST_HEAD(&dentry->d_children);
-	INIT_HLIST_NODE(&dentry->d_u.d_alias);
+	INIT_HLIST_NODE(&dentry->d_alias);
 	INIT_HLIST_NODE(&dentry->d_sib);
 	d_set_d_op(dentry, dentry->d_sb->s_d_op);
 
@@ -1864,7 +1864,7 @@ static void __d_instantiate(struct dentry *dentry, struct inode *inode)
 	if ((dentry->d_flags &
 	     (DCACHE_LRU_LIST|DCACHE_SHRINK_LIST)) == DCACHE_LRU_LIST)
 		this_cpu_dec(nr_dentry_negative);
-	hlist_add_head(&dentry->d_u.d_alias, &inode->i_dentry);
+	hlist_add_head(&dentry->d_alias, &inode->i_dentry);
 	raw_write_seqcount_begin(&dentry->d_seq);
 	__d_set_inode_and_type(dentry, inode, add_flags);
 	raw_write_seqcount_end(&dentry->d_seq);
@@ -1889,7 +1889,7 @@ static void __d_instantiate(struct dentry *dentry, struct inode *inode)
  
 void d_instantiate(struct dentry *entry, struct inode * inode)
 {
-	BUG_ON(!hlist_unhashed(&entry->d_u.d_alias));
+	BUG_ON(!hlist_unhashed(&entry->d_alias));
 	if (inode) {
 		security_d_instantiate(entry, inode);
 		spin_lock(&inode->i_lock);
@@ -1907,7 +1907,7 @@ EXPORT_SYMBOL(d_instantiate);
  */
 void d_instantiate_new(struct dentry *entry, struct inode *inode)
 {
-	BUG_ON(!hlist_unhashed(&entry->d_u.d_alias));
+	BUG_ON(!hlist_unhashed(&entry->d_alias));
 	BUG_ON(!inode);
 	lockdep_annotate_inode_mutex_key(inode);
 	security_d_instantiate(entry, inode);
@@ -1969,7 +1969,7 @@ static struct dentry *__d_obtain_alias(struct inode *inode, bool disconnected)
 
 		spin_lock(&new->d_lock);
 		__d_set_inode_and_type(new, inode, add_flags);
-		hlist_add_head(&new->d_u.d_alias, &inode->i_dentry);
+		hlist_add_head(&new->d_alias, &inode->i_dentry);
 		if (!disconnected) {
 			hlist_bl_lock(&sb->s_roots);
 			hlist_bl_add_head(&new->d_hash, &sb->s_roots);
@@ -2524,7 +2524,7 @@ retry:
 	 * we unlock the chain.  All fields are stable in everything
 	 * we encounter.
 	 */
-	hlist_bl_for_each_entry(dentry, node, b, d_u.d_in_lookup_hash) {
+	hlist_bl_for_each_entry(dentry, node, b, d_in_lookup_hash) {
 		if (dentry->d_name.hash != hash)
 			continue;
 		if (dentry->d_parent != parent)
@@ -2568,7 +2568,7 @@ retry:
 	/* we can't take ->d_lock here; it's OK, though. */
 	new->d_flags |= DCACHE_PAR_LOOKUP;
 	new->d_wait = wq;
-	hlist_bl_add_head(&new->d_u.d_in_lookup_hash, b);
+	hlist_bl_add_head(&new->d_in_lookup_hash, b);
 	hlist_bl_unlock(b);
 	return new;
 mismatch:
@@ -2593,11 +2593,11 @@ static wait_queue_head_t *__d_lookup_unhash(struct dentry *dentry)
 	b = in_lookup_hash(dentry->d_parent, dentry->d_name.hash);
 	hlist_bl_lock(b);
 	dentry->d_flags &= ~DCACHE_PAR_LOOKUP;
-	__hlist_bl_del(&dentry->d_u.d_in_lookup_hash);
+	__hlist_bl_del(&dentry->d_in_lookup_hash);
 	d_wait = dentry->d_wait;
 	dentry->d_wait = NULL;
 	hlist_bl_unlock(b);
-	INIT_HLIST_NODE(&dentry->d_u.d_alias);
+	INIT_HLIST_NODE(&dentry->d_alias);
 	INIT_LIST_HEAD(&dentry->d_lru);
 	return d_wait;
 }
@@ -2625,7 +2625,7 @@ static inline void __d_add(struct dentry *dentry, struct inode *inode)
 	}
 	if (inode) {
 		unsigned add_flags = d_flags_for_inode(inode);
-		hlist_add_head(&dentry->d_u.d_alias, &inode->i_dentry);
+		hlist_add_head(&dentry->d_alias, &inode->i_dentry);
 		raw_write_seqcount_begin(&dentry->d_seq);
 		__d_set_inode_and_type(dentry, inode, add_flags);
 		raw_write_seqcount_end(&dentry->d_seq);
@@ -3075,7 +3075,7 @@ void d_tmpfile(struct file *file, struct inode *inode)
 
 	inode_dec_link_count(inode);
 	BUG_ON(dentry->d_name.name != dentry->d_iname ||
-		!hlist_unhashed(&dentry->d_u.d_alias) ||
+		!hlist_unhashed(&dentry->d_alias) ||
 		!d_unlinked(dentry));
 	spin_lock(&dentry->d_parent->d_lock);
 	spin_lock_nested(&dentry->d_lock, DENTRY_D_LOCK_NESTED);
