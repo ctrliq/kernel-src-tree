@@ -596,4 +596,8 @@ static inline struct dentry *d_next_sibling(const struct dentry *dentry)
 	return hlist_entry_safe(dentry->d_sib.next, struct dentry, d_sib);
 }
 
+/* inode->i_lock must be held over that */
+#define for_each_alias(dentry, inode) \
+	hlist_for_each_entry(dentry, &(inode)->i_dentry, d_u.d_alias)
+
 #endif	/* __LINUX_DCACHE_H */

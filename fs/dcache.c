@@ -736,7 +736,7 @@ void d_mark_dontcache(struct inode *inode)
 	struct dentry *de;
 
 	spin_lock(&inode->i_lock);
-	hlist_for_each_entry(de, &inode->i_dentry, d_u.d_alias) {
+	for_each_alias(de, inode) {
 		spin_lock(&de->d_lock);
 		de->d_flags |= DCACHE_DONTCACHE;
 		spin_unlock(&de->d_lock);
@@ -969,7 +969,7 @@ static struct dentry *__d_find_alias(struct inode *inode)
 	if (S_ISDIR(inode->i_mode))
 		return __d_find_any_alias(inode);
 
-	hlist_for_each_entry(alias, &inode->i_dentry, d_u.d_alias) {
+	for_each_alias(alias, inode) {
 		spin_lock(&alias->d_lock);
  		if (!d_unhashed(alias)) {
 			dget_dlock(alias);
@@ -1043,7 +1043,7 @@ void d_prune_aliases(struct inode *inode)
 	struct dentry *dentry;
 
 	spin_lock(&inode->i_lock);
-	hlist_for_each_entry(dentry, &inode->i_dentry, d_u.d_alias) {
+	for_each_alias(dentry, inode) {
 		spin_lock(&dentry->d_lock);
 		if (!dentry->d_lockref.count)
 			to_shrink_list(dentry, &dispose);
