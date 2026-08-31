@@ -140,7 +140,7 @@ static void __intel_pmu_lbr_enable(bool pmi)
 	if (!static_cpu_has(X86_FEATURE_ARCH_LBR) && !pmi && cpuc->lbr_sel)
 		wrmsrl(MSR_LBR_SELECT, lbr_select);
 
-	rdmsrl(MSR_IA32_DEBUGCTLMSR, debugctl);
+	rdmsrq(MSR_IA32_DEBUGCTLMSR, debugctl);
 	orig_debugctl = debugctl;
 
 	if (!static_cpu_has(X86_FEATURE_ARCH_LBR))
@@ -210,7 +210,7 @@ static inline u64 intel_pmu_lbr_tos(void)
 {
 	u64 tos;
 
-	rdmsrl(x86_pmu.lbr_tos, tos);
+	rdmsrq(x86_pmu.lbr_tos, tos);
 	return tos;
 }
 
@@ -303,7 +303,7 @@ static __always_inline u64 rdlbr_from(unsigned int idx, struct lbr_entry *lbr)
 	if (lbr)
 		return lbr->from;
 
-	rdmsrl(x86_pmu.lbr_from + idx, val);
+	rdmsrq(x86_pmu.lbr_from + idx, val);
 
 	return lbr_from_signext_quirk_rd(val);
 }
@@ -315,7 +315,7 @@ static __always_inline u64 rdlbr_to(unsigned int idx, struct lbr_entry *lbr)
 	if (lbr)
 		return lbr->to;
 
-	rdmsrl(x86_pmu.lbr_to + idx, val);
+	rdmsrq(x86_pmu.lbr_to + idx, val);
 
 	return val;
 }
@@ -327,7 +327,7 @@ static __always_inline u64 rdlbr_info(unsigned int idx, struct lbr_entry *lbr)
 	if (lbr)
 		return lbr->info;
 
-	rdmsrl(x86_pmu.lbr_info + idx, val);
+	rdmsrq(x86_pmu.lbr_info + idx, val);
 
 	return val;
 }
@@ -476,7 +476,7 @@ void intel_pmu_lbr_save(void *ctx)
 	task_ctx->tos = tos;
 
 	if (cpuc->lbr_select)
-		rdmsrl(MSR_LBR_SELECT, task_ctx->lbr_sel);
+		rdmsrq(MSR_LBR_SELECT, task_ctx->lbr_sel);
 }
 
 static void intel_pmu_arch_lbr_save(void *ctx)
@@ -753,7 +753,7 @@ void intel_pmu_lbr_read_32(struct cpu_hw_events *cpuc)
 			u64     lbr;
 		} msr_lastbranch;
 
-		rdmsrl(x86_pmu.lbr_from + lbr_idx, msr_lastbranch.lbr);
+		rdmsrq(x86_pmu.lbr_from + lbr_idx, msr_lastbranch.lbr);
 
 		perf_clear_branch_entry_bitfields(br);
 

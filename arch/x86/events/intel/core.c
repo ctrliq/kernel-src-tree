@@ -2712,7 +2712,7 @@ static inline u64 intel_pmu_get_status(void)
 {
 	u64 status;
 
-	rdmsrl(MSR_CORE_PERF_GLOBAL_STATUS, status);
+	rdmsrq(MSR_CORE_PERF_GLOBAL_STATUS, status);
 
 	return status;
 }
@@ -3240,7 +3240,7 @@ static void intel_pmu_enable_event_ext(struct perf_event *event)
 		else
 			new.thresh = ARCH_PEBS_THRESH_SINGLE;
 
-		rdmsrl(MSR_IA32_PEBS_INDEX, old.whole);
+		rdmsrq(MSR_IA32_PEBS_INDEX, old.whole);
 		if (new.thresh != old.thresh || !old.en) {
 			if (old.thresh == ARCH_PEBS_THRESH_MULTI && old.wr > 0) {
 				/*
@@ -5985,7 +5985,7 @@ static void update_pmu_cap(struct pmu *pmu)
 
 	if (!intel_pmu_broken_perf_cap()) {
 		/* Perf Metric (Bit 15) and PEBS via PT (Bit 16) are hybrid enumeration */
-		rdmsrl(MSR_IA32_PERF_CAPABILITIES, hybrid(pmu, intel_cap).capabilities);
+		rdmsrq(MSR_IA32_PERF_CAPABILITIES, hybrid(pmu, intel_cap).capabilities);
 	}
 }
 
@@ -6133,7 +6133,7 @@ static void intel_pmu_cpu_starting(int cpu)
 	if (!is_hybrid() && x86_pmu.intel_cap.perf_metrics) {
 		union perf_capabilities perf_cap;
 
-		rdmsrl(MSR_IA32_PERF_CAPABILITIES, perf_cap.capabilities);
+		rdmsrq(MSR_IA32_PERF_CAPABILITIES, perf_cap.capabilities);
 		if (!perf_cap.perf_metrics) {
 			x86_pmu.intel_cap.perf_metrics = 0;
 			x86_pmu.intel_ctrl &= ~GLOBAL_CTRL_EN_PERF_METRICS;
@@ -6545,7 +6545,7 @@ static bool check_msr(unsigned long msr, u64 mask)
 	 * matches, this is needed to detect certain hardware emulators
 	 * (qemu/kvm) that don't trap on the MSR access and always return 0s.
 	 */
-	if (rdmsrl_safe(msr, &val_old))
+	if (rdmsrq_safe(msr, &val_old))
 		return false;
 
 	/*
@@ -6557,12 +6557,12 @@ static bool check_msr(unsigned long msr, u64 mask)
 		val_tmp = lbr_from_signext_quirk_wr(val_tmp);
 
 	if (wrmsrl_safe(msr, val_tmp) ||
-	    rdmsrl_safe(msr, &val_new))
+	    rdmsrq_safe(msr, &val_new))
 		return false;
 
 	/*
 	 * Quirk only affects validation in wrmsr(), so wrmsrl()'s value
-	 * should equal rdmsrl()'s even with the quirk.
+	 * should equal rdmsrq()'s even with the quirk.
 	 */
 	if (val_new != val_tmp)
 		return false;
@@ -7629,7 +7629,7 @@ __init int intel_pmu_init(void)
 	if (boot_cpu_has(X86_FEATURE_PDCM)) {
 		u64 capabilities;
 
-		rdmsrl(MSR_IA32_PERF_CAPABILITIES, capabilities);
+		rdmsrq(MSR_IA32_PERF_CAPABILITIES, capabilities);
 		x86_pmu.intel_cap.capabilities = capabilities;
 	}
 

@@ -3235,7 +3235,7 @@ static void intel_pmu_drain_arch_pebs(struct pt_regs *iregs,
 	void *base, *at, *top;
 	u64 mask;
 
-	rdmsrl(MSR_IA32_PEBS_INDEX, index.whole);
+	rdmsrq(MSR_IA32_PEBS_INDEX, index.whole);
 
 	if (unlikely(!index.wr)) {
 		intel_pmu_pebs_event_update_no_drain(cpuc, X86_PMC_IDX_MAX);
