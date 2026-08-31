@@ -1969,9 +1969,10 @@ static int unix_dgram_sendmsg(struct socket *sock, struct msghdr *msg,
 	if (err < 0)
 		return err;
 
-	err = -EOPNOTSUPP;
-	if (msg->msg_flags&MSG_OOB)
+	if (msg->msg_flags & MSG_OOB) {
+		err = -EOPNOTSUPP;
 		goto out;
+	}
 
 	if (msg->msg_namelen) {
 		err = unix_validate_addr(sunaddr, msg->msg_namelen);
@@ -1986,10 +1987,11 @@ static int unix_dgram_sendmsg(struct socket *sock, struct msghdr *msg,
 			goto out;
 	} else {
 		sunaddr = NULL;
-		err = -ENOTCONN;
 		other = unix_peer_get(sk);
-		if (!other)
+		if (!other) {
+			err = -ENOTCONN;
 			goto out;
+		}
 	}
 
 	if ((test_bit(SOCK_PASSCRED, &sock->flags) ||
@@ -2000,9 +2002,10 @@ static int unix_dgram_sendmsg(struct socket *sock, struct msghdr *msg,
 			goto out;
 	}
 
-	err = -EMSGSIZE;
-	if (len > READ_ONCE(sk->sk_sndbuf) - 32)
+	if (len > READ_ONCE(sk->sk_sndbuf) - 32) {
+		err = -EMSGSIZE;
 		goto out;
+	}
 
 	if (len > SKB_MAX_ALLOC) {
 		data_len = min_t(size_t,
@@ -2034,9 +2037,10 @@ static int unix_dgram_sendmsg(struct socket *sock, struct msghdr *msg,
 
 restart:
 	if (!other) {
-		err = -ECONNRESET;
-		if (sunaddr == NULL)
+		if (!sunaddr) {
+			err = -ECONNRESET;
 			goto out_free;
+		}
 
 		other = unix_find_other(sock_net(sk), sunaddr, msg->msg_namelen,
 					sk->sk_type);
@@ -2056,9 +2060,11 @@ restart:
 	sk_locked = 0;
 	unix_state_lock(other);
 restart_locked:
-	err = -EPERM;
-	if (!unix_may_send(sk, other))
+
+	if (!unix_may_send(sk, other)) {
+		err = -EPERM;
 		goto out_unlock;
+	}
 
 	if (unlikely(sock_flag(other, SOCK_DEAD))) {
 		/*
@@ -2071,7 +2077,6 @@ restart_locked:
 		if (!sk_locked)
 			unix_state_lock(sk);
 
-		err = 0;
 		if (sk->sk_type == SOCK_SEQPACKET) {
 			/* We are here only when racing with unix_release_sock()
 			 * is clearing @other. Never change state to TCP_CLOSE
@@ -2099,9 +2104,10 @@ restart_locked:
 		goto restart;
 	}
 
-	err = -EPIPE;
-	if (other->sk_shutdown & RCV_SHUTDOWN)
+	if (other->sk_shutdown & RCV_SHUTDOWN) {
+		err = -EPIPE;
 		goto out_unlock;
+	}
 
 	if (sk->sk_type != SOCK_SEQPACKET) {
 		err = security_unix_may_send(sk->sk_socket, other->sk_socket);
