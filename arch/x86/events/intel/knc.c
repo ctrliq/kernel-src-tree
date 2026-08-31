@@ -161,7 +161,7 @@ static void knc_pmu_disable_all(void)
 
 	rdmsrq(MSR_KNC_IA32_PERF_GLOBAL_CTRL, val);
 	val &= ~(KNC_ENABLE_COUNTER0|KNC_ENABLE_COUNTER1);
-	wrmsrl(MSR_KNC_IA32_PERF_GLOBAL_CTRL, val);
+	wrmsrq(MSR_KNC_IA32_PERF_GLOBAL_CTRL, val);
 }
 
 static void knc_pmu_enable_all(int added)
@@ -170,7 +170,7 @@ static void knc_pmu_enable_all(int added)
 
 	rdmsrq(MSR_KNC_IA32_PERF_GLOBAL_CTRL, val);
 	val |= (KNC_ENABLE_COUNTER0|KNC_ENABLE_COUNTER1);
-	wrmsrl(MSR_KNC_IA32_PERF_GLOBAL_CTRL, val);
+	wrmsrq(MSR_KNC_IA32_PERF_GLOBAL_CTRL, val);
 }
 
 static inline void
@@ -182,7 +182,7 @@ knc_pmu_disable_event(struct perf_event *event)
 	val = hwc->config;
 	val &= ~ARCH_PERFMON_EVENTSEL_ENABLE;
 
-	(void)wrmsrl_safe(hwc->config_base + hwc->idx, val);
+	(void)wrmsrq_safe(hwc->config_base + hwc->idx, val);
 }
 
 static void knc_pmu_enable_event(struct perf_event *event)
@@ -193,7 +193,7 @@ static void knc_pmu_enable_event(struct perf_event *event)
 	val = hwc->config;
 	val |= ARCH_PERFMON_EVENTSEL_ENABLE;
 
-	(void)wrmsrl_safe(hwc->config_base + hwc->idx, val);
+	(void)wrmsrq_safe(hwc->config_base + hwc->idx, val);
 }
 
 static inline u64 knc_pmu_get_status(void)
@@ -207,7 +207,7 @@ static inline u64 knc_pmu_get_status(void)
 
 static inline void knc_pmu_ack_status(u64 ack)
 {
-	wrmsrl(MSR_KNC_IA32_PERF_GLOBAL_OVF_CONTROL, ack);
+	wrmsrq(MSR_KNC_IA32_PERF_GLOBAL_OVF_CONTROL, ack);
 }
 
 static int knc_pmu_handle_irq(struct pt_regs *regs)

@@ -1862,7 +1862,7 @@ static void intel_pmu_pebs_via_pt_enable(struct perf_event *event)
 		else
 			value = ds->pebs_event_reset[MAX_PEBS_EVENTS + idx];
 	}
-	wrmsrl(base + idx, value);
+	wrmsrq(base + idx, value);
 }
 
 static inline void intel_pmu_drain_large_pebs(struct cpu_hw_events *cpuc)
@@ -1906,7 +1906,7 @@ void intel_pmu_pebs_enable(struct perf_event *event)
 			 */
 			intel_pmu_drain_pebs_buffer();
 			adaptive_pebs_record_size_update();
-			wrmsrl(MSR_PEBS_DATA_CFG, pebs_data_cfg);
+			wrmsrq(MSR_PEBS_DATA_CFG, pebs_data_cfg);
 			cpuc->active_pebs_data_cfg = pebs_data_cfg;
 		}
 	}
@@ -1977,7 +1977,7 @@ void intel_pmu_pebs_disable(struct perf_event *event)
 	intel_pmu_pebs_via_pt_disable(event);
 
 	if (cpuc->enabled)
-		wrmsrl(MSR_IA32_PEBS_ENABLE, cpuc->pebs_enabled);
+		wrmsrq(MSR_IA32_PEBS_ENABLE, cpuc->pebs_enabled);
 }
 
 void intel_pmu_pebs_enable_all(void)
@@ -1985,7 +1985,7 @@ void intel_pmu_pebs_enable_all(void)
 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
 
 	if (cpuc->pebs_enabled)
-		wrmsrl(MSR_IA32_PEBS_ENABLE, cpuc->pebs_enabled);
+		wrmsrq(MSR_IA32_PEBS_ENABLE, cpuc->pebs_enabled);
 }
 
 void intel_pmu_pebs_disable_all(void)
@@ -3252,7 +3252,7 @@ static void intel_pmu_drain_arch_pebs(struct pt_regs *iregs,
 		index.thresh = ARCH_PEBS_THRESH_MULTI;
 	else
 		index.thresh = ARCH_PEBS_THRESH_SINGLE;
-	wrmsrl(MSR_IA32_PEBS_INDEX, index.whole);
+	wrmsrq(MSR_IA32_PEBS_INDEX, index.whole);
 
 	mask = hybrid(cpuc->pmu, arch_pebs_cap).counters & cpuc->pebs_enabled;
 
@@ -3448,5 +3448,5 @@ void perf_restore_debug_store(void)
 	if (!x86_pmu.bts && !x86_pmu.ds_pebs)
 		return;
 
-	wrmsrl(MSR_IA32_DS_AREA, (unsigned long)ds);
+	wrmsrq(MSR_IA32_DS_AREA, (unsigned long)ds);
 }
