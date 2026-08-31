@@ -5497,6 +5497,12 @@ again:
 					cd = NULL;
 			}
 			if (!cd) {
+				/*
+				 * Try to allocate context quickly before
+				 * traversing the whole thread list again.
+				 */
+				if (!attach_task_ctx_data(p, ctx_cache, true, GFP_NOWAIT))
+					continue;
 				get_task_struct(p);
 				goto alloc;
 			}
