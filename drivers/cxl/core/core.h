@@ -148,4 +148,7 @@ int cxl_set_feature(struct cxl_mailbox *cxl_mbox, const uuid_t *feat_uuid,
 		    u16 *return_code);
 #endif
 
+int cxl_ras_init(void);
+void cxl_ras_exit(void);
+
 #endif /* __CXL_CORE_H__ */
