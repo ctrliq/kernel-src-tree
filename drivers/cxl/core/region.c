@@ -10,6 +10,7 @@
 #include <linux/sort.h>
 #include <linux/idr.h>
 #include <linux/memory-tiers.h>
+#include <cxl/cxl.h>
 #include <cxlmem.h>
 #include <cxl.h>
 #include "core.h"
@@ -3586,6 +3587,35 @@ static void shutdown_notifiers(void *_cxlr)
 	unregister_node_notifier(&cxlr->node_notifier);
 	unregister_mt_adistance_algorithm(&cxlr->adist_notifier);
 }
+
+static int region_contains_resource(struct device *dev, void *data)
+{
+	struct resource *res = data;
+	struct cxl_region *cxlr;
+	struct cxl_region_params *p;
+
+	if (!is_cxl_region(dev))
+		return 0;
+
+	cxlr = to_cxl_region(dev);
+	p = &cxlr->params;
+
+	if (p->state != CXL_CONFIG_COMMIT)
+		return 0;
+
+	if (!p->res)
+		return 0;
+
+	return resource_contains(p->res, res) ? 1 : 0;
+}
+
+bool cxl_region_contains_resource(struct resource *res)
+{
+	guard(rwsem_read)(&cxl_region_rwsem);
+	return bus_for_each_dev(&cxl_bus_type, NULL, res,
+				region_contains_resource) != 0;
+}
+EXPORT_SYMBOL_GPL(cxl_region_contains_resource);
 
 static int cxl_region_can_probe(struct cxl_region *cxlr)
 {
