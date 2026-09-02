@@ -1,0 +1,228 @@
+s390: Revert support for DCACHE_WORD_ACCESS
+
+jira KERNEL-1540
+Rebuild_History Non-Buildable kernel-6.12.0-211.50.1.el10_2
+commit-author Heiko Carstens <hca@linux.ibm.com>
+commit 37540b8c287fc817bdbd0c62bb75ad6eab0e5d03
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.50.1.el10_2/37540b8c.failed
+
+load_unaligned_zeropad() reads eight bytes from unaligned addresses and may
+cross page boundaries. It handles exceptions which may happen if reading
+from the second page results in an exception.
+
+For pages which are donated to the Ultravisor for secure execution purposes
+the do_secure_storage_access() exception handler however does not handle
+such exceptions correctly. Such an exception may result in an endless
+exception loop which will never be resolved.
+
+An attempt to fix this [1] turned out to be not sufficient. For now revert
+load_unaligned_zeropad() until this problem has been resolved in a proper
+way.
+
+Note that the implementation of load_unaligned_zeropad() itself is
+correct. The revert is just a temporary workaround until there is complete
+fix for secure storage access exceptions.
+
+[1] commit b00be77302d7 ("s390/mm: Add missing secure storage access fixups for donated memory")
+
+Fixes: 802ba53eefc5 ("s390: add support for DCACHE_WORD_ACCESS")
+	Cc: stable@vger.kernel.org
+	Acked-by: Christian Borntraeger <borntraeger@linux.ibm.com>
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+	Signed-off-by: Alexander Gordeev <agordeev@linux.ibm.com>
+(cherry picked from commit 37540b8c287fc817bdbd0c62bb75ad6eab0e5d03)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/include/asm/asm-extable.h
+#	arch/s390/include/asm/word-at-a-time.h
+#	arch/s390/mm/extable.c
+diff --cc arch/s390/include/asm/asm-extable.h
+index 4a6b0a8b6412,99748c20e767..000000000000
+--- a/arch/s390/include/asm/asm-extable.h
++++ b/arch/s390/include/asm/asm-extable.h
+@@@ -9,11 -9,12 +9,17 @@@
+  #define EX_TYPE_NONE		0
+  #define EX_TYPE_FIXUP		1
+  #define EX_TYPE_BPF		2
+ -#define EX_TYPE_UA_FAULT	3
+ +#define EX_TYPE_UA_STORE	3
+ +#define EX_TYPE_UA_LOAD_MEM	4
+  #define EX_TYPE_UA_LOAD_REG	5
+  #define EX_TYPE_UA_LOAD_REGPAIR	6
+++<<<<<<< HEAD
+ +#define EX_TYPE_ZEROPAD		7
+++=======
++ #define EX_TYPE_FPC		8
++ #define EX_TYPE_UA_MVCOS_TO	9
++ #define EX_TYPE_UA_MVCOS_FROM	10
+++>>>>>>> 37540b8c287f (s390: Revert support for DCACHE_WORD_ACCESS)
+  
+  #define EX_DATA_REG_ERR_SHIFT	0
+  #define EX_DATA_REG_ERR		GENMASK(3, 0)
+@@@ -81,7 -79,13 +87,18 @@@
+  #define EX_TABLE_UA_LOAD_REGPAIR(_fault, _target, _regerr, _regzero)	\
+  	__EX_TABLE(__ex_table, _fault, _target, EX_TYPE_UA_LOAD_REGPAIR, _regerr, _regzero, 0)
+  
+++<<<<<<< HEAD
+ +#define EX_TABLE_ZEROPAD(_fault, _target, _regdata, _regaddr)		\
+ +	__EX_TABLE(__ex_table, _fault, _target, EX_TYPE_ZEROPAD, _regdata, _regaddr, 0)
+++=======
++ #define EX_TABLE_FPC(_fault, _target)					\
++ 	__EX_TABLE(__ex_table, _fault, _target, EX_TYPE_FPC, __stringify(%%r0), __stringify(%%r0), 0)
++ 
++ #define EX_TABLE_UA_MVCOS_TO(_fault, _target)				\
++ 	__EX_TABLE(__ex_table, _fault, _target, EX_TYPE_UA_MVCOS_TO, __stringify(%%r0), __stringify(%%r0), 0)
++ 
++ #define EX_TABLE_UA_MVCOS_FROM(_fault, _target)				\
++ 	__EX_TABLE(__ex_table, _fault, _target, EX_TYPE_UA_MVCOS_FROM, __stringify(%%r0), __stringify(%%r0), 0)
+++>>>>>>> 37540b8c287f (s390: Revert support for DCACHE_WORD_ACCESS)
+  
+  #endif /* __ASM_EXTABLE_H */
+diff --cc arch/s390/include/asm/word-at-a-time.h
+index 203acd6e431b,e9287036392d..000000000000
+--- a/arch/s390/include/asm/word-at-a-time.h
++++ b/arch/s390/include/asm/word-at-a-time.h
+@@@ -41,25 -40,4 +40,28 @@@ static inline unsigned long zero_bytema
+  	return ~1UL << data;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Load an unaligned word from kernel space.
+ + *
+ + * In the (very unlikely) case of the word being a page-crosser
+ + * and the next page not being mapped, take the exception and
+ + * return zeroes in the non-existing part.
+ + */
+ +static inline unsigned long load_unaligned_zeropad(const void *addr)
+ +{
+ +	unsigned long data;
+ +
+ +	asm volatile(
+ +		"0:	lg	%[data],0(%[addr])\n"
+ +		"1:	nopr	%%r7\n"
+ +		EX_TABLE_ZEROPAD(0b, 1b, %[data], %[addr])
+ +		EX_TABLE_ZEROPAD(1b, 1b, %[data], %[addr])
+ +		: [data] "=d" (data)
+ +		: [addr] "a" (addr), "m" (*(unsigned long *)addr));
+ +	return data;
+ +}
+ +
+++=======
+++>>>>>>> 37540b8c287f (s390: Revert support for DCACHE_WORD_ACCESS)
+  #endif /* _ASM_WORD_AT_A_TIME_H */
+diff --cc arch/s390/mm/extable.c
+index 0a0738a473af,063b4346742d..000000000000
+--- a/arch/s390/mm/extable.c
++++ b/arch/s390/mm/extable.c
+@@@ -61,22 -50,56 +61,74 @@@ static bool ex_handler_ua_load_reg(cons
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+ +static bool ex_handler_zeropad(const struct exception_table_entry *ex, struct pt_regs *regs)
+ +{
+ +	unsigned int reg_addr = FIELD_GET(EX_DATA_REG_ADDR, ex->data);
+ +	unsigned int reg_data = FIELD_GET(EX_DATA_REG_ERR, ex->data);
+ +	unsigned long data, addr, offset;
+ +
+ +	addr = regs->gprs[reg_addr];
+ +	offset = addr & (sizeof(unsigned long) - 1);
+ +	addr &= ~(sizeof(unsigned long) - 1);
+ +	data = *(unsigned long *)addr;
+ +	data <<= BITS_PER_BYTE * offset;
+ +	regs->gprs[reg_data] = data;
+++=======
++ static bool ex_handler_fpc(const struct exception_table_entry *ex, struct pt_regs *regs)
++ {
++ 	fpu_sfpc(0);
+++>>>>>>> 37540b8c287f (s390: Revert support for DCACHE_WORD_ACCESS)
++ 	regs->psw.addr = extable_fixup(ex);
++ 	return true;
++ }
++ 
+++<<<<<<< HEAD
+++=======
++ struct insn_ssf {
++ 	u64	opc1 : 8;
++ 	u64	r3   : 4;
++ 	u64	opc2 : 4;
++ 	u64	b1   : 4;
++ 	u64	d1   : 12;
++ 	u64	b2   : 4;
++ 	u64	d2   : 12;
++ } __packed;
++ 
++ static bool ex_handler_ua_mvcos(const struct exception_table_entry *ex,
++ 				bool from, struct pt_regs *regs)
++ {
++ 	unsigned long uaddr, remainder;
++ 	struct insn_ssf *insn;
++ 
++ 	/*
++ 	 * If the faulting user space access crossed a page boundary retry by
++ 	 * limiting the access to the first page (adjust length accordingly).
++ 	 * Then the mvcos instruction will either complete with condition code
++ 	 * zero, or generate another fault where the user space access did not
++ 	 * cross a page boundary.
++ 	 * If the faulting user space access did not cross a page boundary set
++ 	 * length to zero and retry. In this case no user space access will
++ 	 * happen, and the mvcos instruction will complete with condition code
++ 	 * zero.
++ 	 * In both cases the instruction will complete with condition code
++ 	 * zero (copying finished), and the register which contains the
++ 	 * length, indicates the number of bytes copied.
++ 	 */
+  	regs->psw.addr = extable_fixup(ex);
++ 	insn = (struct insn_ssf *)regs->psw.addr;
++ 	if (from)
++ 		uaddr = regs->gprs[insn->b2] + insn->d2;
++ 	else
++ 		uaddr = regs->gprs[insn->b1] + insn->d1;
++ 	remainder = PAGE_SIZE - (uaddr & (PAGE_SIZE - 1));
++ 	if (regs->gprs[insn->r3] <= remainder)
++ 		remainder = 0;
++ 	regs->gprs[insn->r3] = remainder;
+  	return true;
+  }
+  
+++>>>>>>> 37540b8c287f (s390: Revert support for DCACHE_WORD_ACCESS)
+  bool fixup_exception(struct pt_regs *regs)
+  {
+  	const struct exception_table_entry *ex;
+@@@ -97,8 -118,12 +149,17 @@@
+  		return ex_handler_ua_load_reg(ex, false, regs);
+  	case EX_TYPE_UA_LOAD_REGPAIR:
+  		return ex_handler_ua_load_reg(ex, true, regs);
+++<<<<<<< HEAD
+ +	case EX_TYPE_ZEROPAD:
+ +		return ex_handler_zeropad(ex, regs);
+++=======
++ 	case EX_TYPE_FPC:
++ 		return ex_handler_fpc(ex, regs);
++ 	case EX_TYPE_UA_MVCOS_TO:
++ 		return ex_handler_ua_mvcos(ex, false, regs);
++ 	case EX_TYPE_UA_MVCOS_FROM:
++ 		return ex_handler_ua_mvcos(ex, true, regs);
+++>>>>>>> 37540b8c287f (s390: Revert support for DCACHE_WORD_ACCESS)
+  	}
+  	panic("invalid exception table entry");
+  }
+diff --git a/arch/s390/Kconfig b/arch/s390/Kconfig
+index 098779c7a0f8..44bfff6c5e88 100644
+--- a/arch/s390/Kconfig
++++ b/arch/s390/Kconfig
+@@ -140,7 +140,6 @@ config S390
+ 	select ARCH_WANT_LD_ORPHAN_WARN
+ 	select BUILDTIME_TABLE_SORT
+ 	select CLONE_BACKWARDS2
+-	select DCACHE_WORD_ACCESS if !KMSAN
+ 	select DYNAMIC_FTRACE if FUNCTION_TRACER
+ 	select FUNCTION_ALIGNMENT_8B if CC_IS_GCC
+ 	select FUNCTION_ALIGNMENT_16B if !CC_IS_GCC
+* Unmerged path arch/s390/include/asm/asm-extable.h
+* Unmerged path arch/s390/include/asm/word-at-a-time.h
+* Unmerged path arch/s390/mm/extable.c
