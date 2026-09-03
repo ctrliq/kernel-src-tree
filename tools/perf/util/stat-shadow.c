@@ -343,14 +343,10 @@ void perf_stat__print_shadow_stats(struct perf_stat_config *config,
  * perf_stat__skip_metric_event - Skip the evsel in the Default metricgroup,
  *				  if it's not running or not the metric event.
  */
-bool perf_stat__skip_metric_event(struct evsel *evsel,
-				  u64 ena, u64 run)
+bool perf_stat__skip_metric_event(struct evsel *evsel)
 {
 	if (!evsel->default_metricgroup)
 		return false;
-
-	if (!ena || !run)
-		return true;
 
 	return !metricgroup__lookup(&evsel->evlist->metric_events, evsel, false);
 }
