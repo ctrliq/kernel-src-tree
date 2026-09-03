@@ -635,6 +635,7 @@ static int fuse_uring_copy_to_ring(struct fuse_ring_ent *ent,
 {
 	struct fuse_ring_queue *queue = ent->queue;
 	struct fuse_ring *ring = queue->ring;
+	struct fuse_in_header in_header;
 	int err;
 
 	err = -EIO;
@@ -656,8 +657,9 @@ static int fuse_uring_copy_to_ring(struct fuse_ring_ent *ent,
 	}
 
 	/* copy fuse_in_header */
-	err = copy_to_user(&ent->headers->in_out, &req->in.h,
-			   sizeof(req->in.h));
+	in_header = req->in.h;
+	err = copy_to_user(&ent->headers->in_out, &in_header,
+			   sizeof(in_header));
 	if (err) {
 		err = -EFAULT;
 		return err;
@@ -797,11 +799,13 @@ static void fuse_uring_commit(struct fuse_ring_ent *ent, struct fuse_req *req,
 {
 	struct fuse_ring *ring = ent->queue->ring;
 	struct fuse_conn *fc = ring->fc;
+	struct fuse_out_header out_header;
 	ssize_t err = -EFAULT;
 
-	if (copy_from_user(&req->out.h, &ent->headers->in_out,
-			   sizeof(req->out.h)))
+	if (copy_from_user(&out_header, &ent->headers->in_out,
+			   sizeof(out_header)))
 		goto out;
+	req->out.h = out_header;
 
 	err = fuse_uring_out_header_has_err(&req->out.h, req, fc);
 	if (err) {
