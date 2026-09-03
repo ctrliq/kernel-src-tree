@@ -268,7 +268,7 @@ int uncore_freq_add_entry(struct uncore_data *data, int cpu)
 		if (ret < 0)
 			goto uncore_unlock;
 
-		data->instance_id = ret;
+		data->seqnum_id = ret;
 		scnprintf(data->name, sizeof(data->name), "uncore%02d", ret);
 	} else {
 		scnprintf(data->name, sizeof(data->name), "package_%02d_die_%02d",
@@ -287,7 +287,7 @@ int uncore_freq_add_entry(struct uncore_data *data, int cpu)
 	if (ret) {
 		data->control_cpu = -1;
 		if (data->domain_id != UNCORE_DOMAIN_ID_INVALID)
-			ida_free(&intel_uncore_ida, data->instance_id);
+			ida_free(&intel_uncore_ida, data->seqnum_id);
 	} else {
 		data->valid = true;
 	}
@@ -306,7 +306,7 @@ void uncore_freq_remove_die_entry(struct uncore_data *data)
 	data->control_cpu = -1;
 	data->valid = false;
 	if (data->domain_id != UNCORE_DOMAIN_ID_INVALID)
-		ida_free(&intel_uncore_ida, data->instance_id);
+		ida_free(&intel_uncore_ida, data->seqnum_id);
 
 	mutex_unlock(&uncore_lock);
 }
