@@ -586,7 +586,7 @@ __intel_scu_ipc_register(struct device *parent,
 		goto err_unlock;
 	}
 
-	scu = kzalloc(sizeof(*scu), GFP_KERNEL);
+	scu = kzalloc_obj(*scu, GFP_KERNEL);
 	if (!scu) {
 		err = -ENOMEM;
 		goto err_unlock;
