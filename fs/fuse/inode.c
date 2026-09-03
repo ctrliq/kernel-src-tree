@@ -7,6 +7,7 @@
 */
 
 #include "fuse_i.h"
+#include "dev_uring_i.h"
 
 #include <linux/pagemap.h>
 #include <linux/slab.h>
@@ -905,7 +906,7 @@ static void fuse_iqueue_init(struct fuse_iqueue *fiq,
 	fiq->priv = priv;
 }
 
-static void fuse_pqueue_init(struct fuse_pqueue *fpq)
+void fuse_pqueue_init(struct fuse_pqueue *fpq)
 {
 	unsigned int i;
 
@@ -959,6 +960,8 @@ EXPORT_SYMBOL_GPL(fuse_conn_init);
 static void delayed_release(struct rcu_head *p)
 {
 	struct fuse_conn *fc = container_of(p, struct fuse_conn, rcu);
+
+	fuse_uring_destruct(fc);
 
 	put_user_ns(fc->user_ns);
 	fc->release(fc);
@@ -1355,6 +1358,8 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 				else
 					ok = false;
 			}
+			if (flags & FUSE_OVER_IO_URING && fuse_uring_enabled())
+				fc->io_uring = 1;
 		} else {
 			ra_pages = fc->max_read / PAGE_SIZE;
 			fc->no_lock = 1;
@@ -1413,6 +1418,9 @@ void fuse_send_init(struct fuse_mount *fm)
 		flags |= FUSE_SUBMOUNTS;
 	if (IS_ENABLED(CONFIG_FUSE_PASSTHROUGH))
 		flags |= FUSE_PASSTHROUGH;
+
+	if (fuse_uring_enabled())
+		flags |= FUSE_OVER_IO_URING;
 
 	ia->in.flags = flags;
 	ia->in.flags2 = flags >> 32;
