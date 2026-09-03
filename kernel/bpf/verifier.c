@@ -12575,7 +12575,11 @@ BTF_ID(func, bpf_dynptr_file_discard)
 BTF_ID(func, __bpf_trap)
 BTF_ID(func, bpf_task_work_schedule_signal)
 BTF_ID(func, bpf_task_work_schedule_resume)
+#ifdef CONFIG_BPF_EVENTS
 BTF_ID(func, bpf_session_is_return)
+#else
+BTF_ID_UNUSED
+#endif
 BTF_ID(func, bpf_stream_vprintk)
 BTF_ID(func, bpf_stream_print_stack)
 
