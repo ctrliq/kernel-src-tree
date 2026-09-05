@@ -1,0 +1,87 @@
+sched/rt: Skip currently executing CPU in rto_next_cpu()
+
+jira KERNEL-1552
+Rebuild_History Non-Buildable kernel-5.14.0-687.44.1.el9_8
+commit-author Chen Jinghuang <chenjinghuang2@huawei.com>
+commit 94894c9c477e53bcea052e075c53f89df3d2a33e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.44.1.el9_8/94894c9c.failed
+
+CPU0 becomes overloaded when hosting a CPU-bound RT task, a non-CPU-bound
+RT task, and a CFS task stuck in kernel space. When other CPUs switch from
+RT to non-RT tasks, RT load balancing (LB) is triggered; with
+HAVE_RT_PUSH_IPI enabled, they send IPIs to CPU0 to drive the execution
+of rto_push_irq_work_func. During push_rt_task on CPU0,
+if next_task->prio < rq->donor->prio, resched_curr() sets NEED_RESCHED
+and after the push operation completes, CPU0 calls rto_next_cpu().
+Since only CPU0 is overloaded in this scenario, rto_next_cpu() should
+ideally return -1 (no further IPI needed).
+
+However, multiple CPUs invoking tell_cpu_to_push() during LB increments
+rd->rto_loop_next. Even when rd->rto_cpu is set to -1, the mismatch between
+rd->rto_loop and rd->rto_loop_next forces rto_next_cpu() to restart its
+search from -1. With CPU0 remaining overloaded (satisfying rt_nr_migratory
+&& rt_nr_total > 1), it gets reselected, causing CPU0 to queue irq_work to
+itself and send self-IPIs repeatedly. As long as CPU0 stays overloaded and
+other CPUs run pull_rt_tasks(), it falls into an infinite self-IPI loop,
+which triggers a CPU hardlockup due to continuous self-interrupts.
+
+The trigging scenario is as follows:
+
+         cpu0                      cpu1                    cpu2
+                                pull_rt_task
+                              tell_cpu_to_push
+                 <------------irq_work_queue_on
+rto_push_irq_work_func
+       push_rt_task
+    resched_curr(rq)                                   pull_rt_task
+    rto_next_cpu                                     tell_cpu_to_push
+                      <-------------------------- atomic_inc(rto_loop_next)
+rd->rto_loop != next
+     rto_next_cpu
+   irq_work_queue_on
+rto_push_irq_work_func
+
+Fix redundant self-IPI by filtering the initiating CPU in rto_next_cpu().
+This solution has been verified to effectively eliminate spurious self-IPIs
+and prevent CPU hardlockup scenarios.
+
+Fixes: 4bdced5c9a29 ("sched/rt: Simplify the IPI based RT balancing logic")
+	Suggested-by: Steven Rostedt (Google) <rostedt@goodmis.org>
+	Suggested-by: K Prateek Nayak <kprateek.nayak@amd.com>
+	Signed-off-by: Chen Jinghuang <chenjinghuang2@huawei.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Steven Rostedt (Google) <rostedt@goodmis.org>
+	Reviewed-by: Valentin Schneider <vschneid@redhat.com>
+Link: https://patch.msgid.link/20260122012533.673768-1-chenjinghuang2@huawei.com
+(cherry picked from commit 94894c9c477e53bcea052e075c53f89df3d2a33e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/rt.c
+diff --cc kernel/sched/rt.c
+index 57448de051e0,a7680477fa6f..000000000000
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@@ -2181,11 -2130,12 +2182,19 @@@ static int rto_next_cpu(struct root_dom
+  
+  		rd->rto_cpu = cpu;
+  
+++<<<<<<< HEAD
+ +		if (cpu < nr_cpu_ids) {
+ +			if (!has_pushable_tasks(cpu_rq(cpu)))
+ +				continue;
+++=======
++ 		/* Do not send IPI to self */
++ 		if (cpu == this_cpu)
++ 			continue;
++ 
++ 		if (cpu < nr_cpu_ids)
+++>>>>>>> 94894c9c477e (sched/rt: Skip currently executing CPU in rto_next_cpu())
+  			return cpu;
+ +		}
+  
+  		rd->rto_cpu = -1;
+  
+* Unmerged path kernel/sched/rt.c
