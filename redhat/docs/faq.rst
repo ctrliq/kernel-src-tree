@@ -52,10 +52,11 @@ approval from 1 developer is generally good enough.
 
 Any patch that touches kernel code that is not going upstream will need
 reviews by Red Hat developers.  Those developers are auto-added by webhooks
-to the MR.  These patches must wrapped with "#ifndef
+to the MR.  These patches must be wrapped with "#ifdef
 CONFIG_RHEL_DIFFERENCES" if possible and be provided with a good reason why
-it is important to include despite upstream not taking it.  An approval from
+it is important to include despite upstream not taking it. An approval from
 all the assigned reviewers is necessary.
+
 
 See https://redhat.gitlab.io/centos-stream/src/kernel/documentation/ for a
 more thorough discussion.
