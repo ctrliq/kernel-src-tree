@@ -375,14 +375,12 @@ static ssize_t monitor_enable_write_data(struct file *filp, const char __user *u
 	if (retval)
 		return retval;
 
-	mutex_lock(&rv_interface_lock);
+	guard(mutex)(&rv_interface_lock);
 
 	if (val)
 		retval = rv_enable_monitor(mon);
 	else
 		retval = rv_disable_monitor(mon);
-
-	mutex_unlock(&rv_interface_lock);
 
 	return retval ? : count;
 }
@@ -570,7 +568,7 @@ static void disable_all_monitors(void)
 	struct rv_monitor *mon;
 	int enabled = 0;
 
-	mutex_lock(&rv_interface_lock);
+	guard(mutex)(&rv_interface_lock);
 
 	list_for_each_entry(mon, &rv_monitors_list, list)
 		enabled += __rv_disable_monitor(mon, false);
@@ -583,8 +581,6 @@ static void disable_all_monitors(void)
 		 */
 		tracepoint_synchronize_unregister();
 	}
-
-	mutex_unlock(&rv_interface_lock);
 }
 
 static int enabled_monitors_open(struct inode *inode, struct file *file)
@@ -625,7 +621,7 @@ static ssize_t enabled_monitors_write(struct file *filp, const char __user *user
 	if (!len)
 		return count;
 
-	mutex_lock(&rv_interface_lock);
+	guard(mutex)(&rv_interface_lock);
 
 	retval = -EINVAL;
 
@@ -646,13 +642,11 @@ static ssize_t enabled_monitors_write(struct file *filp, const char __user *user
 		else
 			retval = rv_disable_monitor(mon);
 
-		if (!retval)
-			retval = count;
-
-		break;
+		if (retval)
+			return retval;
+		return count;
 	}
 
-	mutex_unlock(&rv_interface_lock);
 	return retval;
 }
 
@@ -739,7 +733,7 @@ static ssize_t monitoring_on_write_data(struct file *filp, const char __user *us
 	if (retval)
 		return retval;
 
-	mutex_lock(&rv_interface_lock);
+	guard(mutex)(&rv_interface_lock);
 
 	if (val)
 		turn_monitoring_on_with_reset();
@@ -751,8 +745,6 @@ static ssize_t monitoring_on_write_data(struct file *filp, const char __user *us
 	 * before returning to user-space.
 	 */
 	tracepoint_synchronize_unregister();
-
-	mutex_unlock(&rv_interface_lock);
 
 	return count;
 }
@@ -787,28 +779,26 @@ int rv_register_monitor(struct rv_monitor *monitor, struct rv_monitor *parent)
 		return -EINVAL;
 	}
 
-	mutex_lock(&rv_interface_lock);
+	guard(mutex)(&rv_interface_lock);
 
 	list_for_each_entry(r, &rv_monitors_list, list) {
 		if (strcmp(monitor->name, r->name) == 0) {
 			pr_info("Monitor %s is already registered\n", monitor->name);
-			retval = -EEXIST;
-			goto out_unlock;
+			return -EEXIST;
 		}
 	}
 
 	if (parent && rv_is_nested_monitor(parent)) {
 		pr_info("Parent monitor %s is already nested, cannot nest further\n",
 			parent->name);
-		retval = -EINVAL;
-		goto out_unlock;
+		return -EINVAL;
 	}
 
 	monitor->parent = parent;
 
 	retval = create_monitor_dir(monitor, parent);
 	if (retval)
-		goto out_unlock;
+		return retval;
 
 	/* keep children close to the parent for easier visualisation */
 	if (parent)
@@ -816,9 +806,7 @@ int rv_register_monitor(struct rv_monitor *monitor, struct rv_monitor *parent)
 	else
 		list_add_tail(&monitor->list, &rv_monitors_list);
 
-out_unlock:
-	mutex_unlock(&rv_interface_lock);
-	return retval;
+	return 0;
 }
 
 /**
@@ -829,13 +817,12 @@ out_unlock:
  */
 int rv_unregister_monitor(struct rv_monitor *monitor)
 {
-	mutex_lock(&rv_interface_lock);
+	guard(mutex)(&rv_interface_lock);
 
 	rv_disable_monitor(monitor);
 	list_del(&monitor->list);
 	destroy_monitor_dir(monitor);
 
-	mutex_unlock(&rv_interface_lock);
 	return 0;
 }
 
