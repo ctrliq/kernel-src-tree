@@ -4819,6 +4819,11 @@ static int bpf_get_map_info_from_fdinfo(int fd, struct bpf_map_info *info)
 	return 0;
 }
 
+static bool map_is_created(const struct bpf_map *map)
+{
+	return map->obj->loaded || map->reused;
+}
+
 bool bpf_map__autocreate(const struct bpf_map *map)
 {
 	return map->autocreate;
@@ -4826,7 +4831,7 @@ bool bpf_map__autocreate(const struct bpf_map *map)
 
 int bpf_map__set_autocreate(struct bpf_map *map, bool autocreate)
 {
-	if (map->obj->loaded)
+	if (map_is_created(map))
 		return libbpf_err(-EBUSY);
 
 	map->autocreate = autocreate;
@@ -4920,7 +4925,7 @@ struct bpf_map *bpf_map__inner_map(struct bpf_map *map)
 
 int bpf_map__set_max_entries(struct bpf_map *map, __u32 max_entries)
 {
-	if (map->obj->loaded)
+	if (map_is_created(map))
 		return libbpf_err(-EBUSY);
 
 	map->def.max_entries = max_entries;
@@ -5183,11 +5188,6 @@ bpf_object__populate_internal_map(struct bpf_object *obj, struct bpf_map *map)
 }
 
 static void bpf_map__destroy(struct bpf_map *map);
-
-static bool map_is_created(const struct bpf_map *map)
-{
-	return map->obj->loaded || map->reused;
-}
 
 static int bpf_object__create_map(struct bpf_object *obj, struct bpf_map *map, bool is_inner)
 {
@@ -10301,7 +10301,7 @@ static int map_btf_datasec_resize(struct bpf_map *map, __u32 size)
 
 int bpf_map__set_value_size(struct bpf_map *map, __u32 size)
 {
-	if (map->obj->loaded || map->reused)
+	if (map_is_created(map))
 		return libbpf_err(-EBUSY);
 
 	if (map->mmaped) {
@@ -10347,7 +10347,7 @@ int bpf_map__set_initial_value(struct bpf_map *map,
 {
 	size_t actual_sz;
 
-	if (map->obj->loaded || map->reused)
+	if (map_is_created(map))
 		return libbpf_err(-EBUSY);
 
 	if (!map->mmaped || map->libbpf_type == LIBBPF_MAP_KCONFIG)
