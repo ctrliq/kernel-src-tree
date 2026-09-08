@@ -13,6 +13,7 @@
 #include <linux/sched/topology.h>
 #include <linux/sched/task.h>
 #include <linux/cpumask.h>
+#include <linux/cpuhplock.h>
 #include <linux/nodemask.h>
 #include <linux/mm.h>
 #include <linux/mmu_context.h>
@@ -271,6 +272,7 @@ static inline bool current_cpuset_is_being_rebound(void)
 
 static inline void rebuild_sched_domains(void)
 {
+	guard(cpus_read_lock)();
 	partition_sched_domains(1, NULL, NULL);
 }
 
