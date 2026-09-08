@@ -199,7 +199,7 @@ static u8 msr_get_epp(struct amd_cpudata *cpudata)
 	u64 value;
 	int ret;
 
-	ret = rdmsrl_on_cpu(cpudata->cpu, MSR_AMD_CPPC_REQ, &value);
+	ret = rdmsrq_on_cpu(cpudata->cpu, MSR_AMD_CPPC_REQ, &value);
 	if (ret < 0) {
 		pr_debug("Could not retrieve energy perf value (%d)\n", ret);
 		return ret;
@@ -263,7 +263,7 @@ static int msr_update_perf(struct cpufreq_policy *policy, u8 min_perf,
 		wrmsrq(MSR_AMD_CPPC_REQ, value);
 		return 0;
 	} else {
-		int ret = wrmsrl_on_cpu(cpudata->cpu, MSR_AMD_CPPC_REQ, value);
+		int ret = wrmsrq_on_cpu(cpudata->cpu, MSR_AMD_CPPC_REQ, value);
 
 		if (ret)
 			return ret;
@@ -811,7 +811,7 @@ static int amd_pstate_init_boost_support(struct amd_cpudata *cpudata)
 		goto exit_err;
 	}
 
-	ret = rdmsrl_on_cpu(cpudata->cpu, MSR_K7_HWCR, &boost_val);
+	ret = rdmsrq_on_cpu(cpudata->cpu, MSR_K7_HWCR, &boost_val);
 	if (ret) {
 		pr_err_once("failed to read initial CPU boost state!\n");
 		ret = -EIO;
