@@ -50,6 +50,7 @@ struct sugov_cpu {
 
 	unsigned long		util;
 	unsigned long		bw_min;
+	unsigned long		bw_max;
 
 	/* The field below is for single-CPU policies only: */
 #ifdef CONFIG_NO_HZ_COMMON
@@ -232,6 +233,7 @@ static void sugov_get_util(struct sugov_cpu *sg_cpu, unsigned long boost)
 	util = effective_cpu_util(sg_cpu->cpu, util, &min, &max);
 	util = max(util, boost);
 	sg_cpu->bw_min = min;
+	sg_cpu->bw_max = max;
 	sg_cpu->util = sugov_effective_cpu_perf(sg_cpu->cpu, util, min, max);
 }
 
@@ -484,7 +486,7 @@ static void sugov_update_single_perf(struct update_util_data *hook, u64 time,
 		sg_cpu->util = prev_util;
 
 	cpufreq_driver_adjust_perf(sg_policy->policy, sg_cpu->bw_min,
-				   sg_cpu->util, max_cap);
+				   sg_cpu->util, sg_cpu->bw_max, max_cap);
 
 	sg_policy->last_freq_update_time = time;
 }

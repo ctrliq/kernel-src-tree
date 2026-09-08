@@ -3243,6 +3243,7 @@ static unsigned int intel_cpufreq_fast_switch(struct cpufreq_policy *policy,
 static void intel_cpufreq_adjust_perf(struct cpufreq_policy *policy,
 				      unsigned long min_perf,
 				      unsigned long target_perf,
+				      unsigned long max_perf,
 				      unsigned long capacity)
 {
 	struct cpudata *cpu = all_cpu_data[policy->cpu];
@@ -3273,7 +3274,13 @@ static void intel_cpufreq_adjust_perf(struct cpufreq_policy *policy,
 	if (min_pstate > cpu->max_perf_ratio)
 		min_pstate = cpu->max_perf_ratio;
 
-	max_pstate = min(cap_pstate, cpu->max_perf_ratio);
+	max_pstate = cap_pstate;
+	if (max_perf < capacity)
+		max_pstate = DIV_ROUND_UP(cap_pstate * max_perf, capacity);
+
+	if (max_pstate > cpu->max_perf_ratio)
+		max_pstate = cpu->max_perf_ratio;
+
 	if (max_pstate < min_pstate)
 		max_pstate = min_pstate;
 
