@@ -1,0 +1,306 @@
+selftests: nft_queue.sh: add a parallel stress test
+
+jira KERNEL-1569
+Rebuild_History Non-Buildable kernel-6.12.0-211.52.1.el10_2
+commit-author Fernando Fernandez Mancera <fmancera@suse.de>
+commit dde1a6084c5ca9d143a562540d5453454d79ea15
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.52.1.el10_2/dde1a608.failed
+
+Introduce a new stress test to check for race conditions in the
+nfnetlink_queue subsystem, where an entry is freed while another CPU is
+concurrently walking the global rhashtable.
+
+To trigger this, `nf_queue.c` is extended with two new flags:
+  * -O (out-of-order): Buffers packet IDs and flushes them in reverse.
+  * -b (bogus verdicts): Floods the kernel with non-existent packet IDs.
+
+The bogus verdict loop forces the kernel's lookup function to perform
+full rhashtable bucket traversals (-ENOENT). Combined with reverse-order
+flushing and heavy parallel UDP/ping flooding across 8 queues, this puts
+the nfnetlink_queue code under pressure.
+
+Joint work with Florian Westphal.
+
+	Signed-off-by: Fernando Fernandez Mancera <fmancera@suse.de>
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+(cherry picked from commit dde1a6084c5ca9d143a562540d5453454d79ea15)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/net/netfilter/nf_queue.c
+#	tools/testing/selftests/net/netfilter/nft_queue.sh
+diff --cc tools/testing/selftests/net/netfilter/nf_queue.c
+index 9e56b9d47037,8bbec37f5356..000000000000
+--- a/tools/testing/selftests/net/netfilter/nf_queue.c
++++ b/tools/testing/selftests/net/netfilter/nf_queue.c
+@@@ -18,6 -18,9 +18,12 @@@
+  struct options {
+  	bool count_packets;
+  	bool gso_enabled;
+++<<<<<<< HEAD
+++=======
++ 	bool failopen;
++ 	bool out_of_order;
++ 	bool bogus_verdict;
+++>>>>>>> dde1a6084c5c (selftests: nft_queue.sh: add a parallel stress test)
+  	int verbose;
+  	unsigned int queue_num;
+  	unsigned int timeout;
+@@@ -30,7 -33,7 +36,11 @@@ static struct options opts
+  
+  static void help(const char *p)
+  {
+++<<<<<<< HEAD
+ +	printf("Usage: %s [-c|-v [-vv] ] [-t timeout] [-q queue_num] [-Qdst_queue ] [ -d ms_delay ] [-G]\n", p);
+++=======
++ 	printf("Usage: %s [-c|-v [-vv] ] [-o] [-O] [-b] [-t timeout] [-q queue_num] [-Qdst_queue ] [ -d ms_delay ] [-G]\n", p);
+++>>>>>>> dde1a6084c5c (selftests: nft_queue.sh: add a parallel stress test)
+  }
+  
+  static int parse_attr_cb(const struct nlattr *attr, void *data)
+@@@ -329,7 -364,7 +369,11 @@@ static void parse_opts(int argc, char *
+  {
+  	int c;
+  
+++<<<<<<< HEAD
+ +	while ((c = getopt(argc, argv, "chvt:q:Q:d:G")) != -1) {
+++=======
++ 	while ((c = getopt(argc, argv, "chvoObt:q:Q:d:G")) != -1) {
+++>>>>>>> dde1a6084c5c (selftests: nft_queue.sh: add a parallel stress test)
+  		switch (c) {
+  		case 'c':
+  			opts.count_packets = true;
+diff --cc tools/testing/selftests/net/netfilter/nft_queue.sh
+index 6136ceec45e0,d80390848e85..000000000000
+--- a/tools/testing/selftests/net/netfilter/nft_queue.sh
++++ b/tools/testing/selftests/net/netfilter/nft_queue.sh
+@@@ -585,6 -586,208 +586,211 @@@ EO
+  	echo "PASS: both udp receivers got one packet each"
+  }
+  
+++<<<<<<< HEAD
+++=======
++ # Make sure UDPGRO aggregated packets don't lose
++ # their skb->nfct entry when nfqueue passes the
++ # skb to userspace with software gso segmentation on.
++ test_udp_gro_ct()
++ {
++ 	local errprefix="FAIL: test_udp_gro_ct:"
++ 	local timeout=5
++ 
++ 	ip netns exec "$nsrouter" conntrack -F 2>/dev/null
++ 
++         ip netns exec "$nsrouter" nft -f /dev/stdin <<EOF
++ flush ruleset
++ table inet udpq {
++ 	# Number of packets/bytes queued to userspace
++ 	counter toqueue { }
++ 	# Number of packets/bytes reinjected from userspace with 'ct new' intact
++ 	counter fromqueue { }
++ 	# These two counters should be identical and not 0.
++ 
++ 	chain prerouting {
++ 		type filter hook prerouting priority -300; policy accept;
++ 
++ 		# userspace sends small packets, if < 1000, UDPGRO did
++ 		# not kick in, but test needs a 'new' conntrack with udpgro skb.
++ 		meta iifname veth0 meta l4proto udp meta length > 1000 accept
++ 
++ 		# don't pick up non-gso packets and don't queue them to
++ 		# userspace.
++ 		notrack
++ 	}
++ 
++         chain postrouting {
++ 		type filter hook postrouting priority 0; policy accept;
++ 
++ 		# Only queue unconfirmed fraglist gro skbs to userspace.
++ 		udp dport 12346 ct status ! confirmed counter name "toqueue" mark set 1 queue num 1
++         }
++ 
++ 	chain validate {
++ 		type filter hook postrouting priority 1; policy accept;
++ 		# ... and only count those that were reinjected with the
++ 		# skb->nfct intact.
++ 		mark 1 counter name "fromqueue"
++ 	}
++ }
++ EOF
++ 	timeout "$timeout" ip netns exec "$ns2" socat UDP-LISTEN:12346,fork,pf=ipv4 OPEN:"$TMPFILE1",trunc &
++ 	local rpid=$!
++ 
++ 	ip netns exec "$nsrouter" nice -n -19 ./nf_queue -G -c -q 1 -o -t 2 > "$TMPFILE2" &
++ 	local nfqpid=$!
++ 
++ 	ip netns exec "$nsrouter" ethtool -K "veth0" rx-udp-gro-forwarding on rx-gro-list on generic-receive-offload on
++ 
++ 	busywait "$BUSYWAIT_TIMEOUT" udp_listener_ready "$ns2" 12346
++ 	busywait "$BUSYWAIT_TIMEOUT" nf_queue_wait "$nsrouter" 1
++ 
++ 	local bs=512
++ 	local count=$(((32 * 1024 * 1024) / bs))
++ 
++ 	local nprocs=$(nproc)
++ 	[ $nprocs -gt 1 ] && nprocs=$((nprocs - 1))
++ 
++ 	dd if=/dev/zero bs="$bs" count="$count" 2>/dev/null | for i in $(seq 1 $nprocs); do
++ 		timeout "$timeout" nice -n 19 ip netns exec "$ns1" \
++ 			socat -u -b 512 STDIN UDP-DATAGRAM:10.0.2.99:12346,reuseport,bind=0.0.0.0:55221 &
++ 	done
++ 
++ 	busywait 10000 test -s "$TMPFILE1"
++ 
++ 	kill "$rpid"
++ 
++ 	wait
++ 
++ 	local p
++ 	local b
++ 	local pqueued
++ 	local bqueued
++ 
++ 	c=$(ip netns exec "$nsrouter" nft list counter inet udpq "toqueue" | grep packets)
++ 	read p pqueued b bqueued <<EOF
++ $c
++ EOF
++ 	local preinject
++ 	local breinject
++ 	c=$(ip netns exec "$nsrouter" nft list counter inet udpq "fromqueue" | grep packets)
++ 	read p preinject b breinject <<EOF
++ $c
++ EOF
++ 	ip netns exec "$nsrouter" ethtool -K "veth0" rx-udp-gro-forwarding off
++ 	ip netns exec "$nsrouter" ethtool -K "veth1" rx-udp-gro-forwarding off
++ 
++ 	if [ "$pqueued" -eq 0 ];then
++ 		# happens when gro did not build at least on aggregate
++ 		echo "SKIP: No packets were queued"
++ 		return
++ 	fi
++ 
++ 	local saw_ct_entry=0
++ 	if ip netns exec "$nsrouter" bash -c 'conntrack -L -p udp --dport 12346 2>/dev/null | wc -l | grep -q "^1"'; then
++ 		saw_ct_entry=1
++ 	else
++ 		echo "$errprefix Expected udp conntrack entry"
++ 		ip netns exec "$nsrouter" conntrack -L
++ 		ret=1
++ 	fi
++ 
++ 	if [ "$pqueued" -ge "$preinject" ] ;then
++ 		echo "$errprefix Expected software segmentation to occur, had $pqueued and $preinject"
++ 		ret=1
++ 		return
++ 	fi
++ 
++ 	# sw segmentation adds extra udp and ip headers.
++ 	local breinject_expect=$((preinject * (512 + 20 + 8)))
++ 
++ 	if [ "$breinject" -eq "$breinject_expect" ]; then
++ 		if [ "$saw_ct_entry" -eq 1 ];then
++ 			echo "PASS: fraglist gro skb passed with conntrack entry"
++ 		else
++ 			echo "$errprefix fraglist gro skb passed without conntrack entry"
++ 			ret=1
++ 		fi
++ 	else
++ 		echo "$errprefix Counter mismatch, conntrack entry dropped by nfqueue? Queued: $pqueued, $bqueued. Post-queue: $preinject, $breinject. Expected $breinject_expect"
++ 		ret=1
++ 	fi
++ 
++ 	if ! ip netns exec "$nsrouter" nft delete table inet udpq; then
++ 		echo "$errprefix: Could not delete udpq table"
++ 		ret=1
++ 	fi
++ }
++ 
++ check_tainted()
++ {
++ 	local msg="$1"
++ 
++ 	if [ "$tainted_then" -ne 0 ];then
++ 		return
++ 	fi
++ 
++ 	read tainted_now < /proc/sys/kernel/tainted
++ 	if [ "$tainted_now" -eq 0 ];then
++ 		echo "PASS: $msg"
++ 	else
++ 		echo "TAINT: $msg"
++ 		dmesg
++ 		ret=1
++ 	fi
++ }
++ 
++ test_queue_stress()
++ {
++ 	read tainted_then < /proc/sys/kernel/tainted
++ 	local i
++ 
++         ip netns exec "$nsrouter" nft -f /dev/stdin <<EOF
++ flush ruleset
++ table inet t {
++ 	chain forward {
++ 		type filter hook forward priority 0; policy accept;
++ 
++ 		queue flags bypass to numgen random mod 8
++ 	}
++ }
++ EOF
++ 	timeout "$STRESS_TEST_TIMEOUT" ip netns exec "$ns2" \
++ 		socat -u UDP-LISTEN:12345,fork,pf=ipv4 STDOUT > /dev/null &
++ 
++ 	timeout "$STRESS_TEST_TIMEOUT" ip netns exec "$ns3" \
++ 		socat -u UDP-LISTEN:12345,fork,pf=ipv4 STDOUT > /dev/null &
++ 
++ 	for i in $(seq 0 7); do
++ 		ip netns exec "$nsrouter" timeout "$STRESS_TEST_TIMEOUT" \
++ 			./nf_queue -q $i -t 2 -O -b > /dev/null &
++ 	done
++ 
++ 	ip netns exec "$ns1" timeout "$STRESS_TEST_TIMEOUT" \
++ 		ping -q -f 10.0.2.99 > /dev/null 2>&1 &
++ 	ip netns exec "$ns1" timeout "$STRESS_TEST_TIMEOUT" \
++ 		ping -q -f 10.0.3.99 > /dev/null 2>&1 &
++ 	ip netns exec "$ns1" timeout "$STRESS_TEST_TIMEOUT" \
++ 		ping -q -f "dead:2::99" > /dev/null 2>&1 &
++ 	ip netns exec "$ns1" timeout "$STRESS_TEST_TIMEOUT" \
++ 		ping -q -f "dead:3::99" > /dev/null 2>&1 &
++ 
++ 	busywait "$BUSYWAIT_TIMEOUT" udp_listener_ready "$ns2" 12345
++ 	busywait "$BUSYWAIT_TIMEOUT" udp_listener_ready "$ns3" 12345
++ 
++ 	for i in $(seq 1 4);do
++ 		ip netns exec "$ns1" timeout "$STRESS_TEST_TIMEOUT" \
++ 			socat -u STDIN UDP-DATAGRAM:10.0.2.99:12345 < /dev/zero > /dev/null &
++ 		ip netns exec "$ns1" timeout "$STRESS_TEST_TIMEOUT" \
++ 			socat -u STDIN UDP-DATAGRAM:10.0.3.99:12345 < /dev/zero > /dev/null &
++ 	done
++ 
++ 	wait
++ 
++ 	check_tainted "concurrent queueing"
++ }
++ 
+++>>>>>>> dde1a6084c5c (selftests: nft_queue.sh: add a parallel stress test)
+  test_queue_removal()
+  {
+  	read tainted_then < /proc/sys/kernel/tainted
+@@@ -663,7 -855,9 +858,13 @@@ test_tcp_localhost_connectclos
+  test_tcp_localhost_requeue
+  test_sctp_forward
+  test_sctp_output
+++<<<<<<< HEAD
+ +test_udp_ct_race
+++=======
++ test_udp_nat_race
++ test_udp_gro_ct
++ test_queue_stress
+++>>>>>>> dde1a6084c5c (selftests: nft_queue.sh: add a parallel stress test)
+  
+  # should be last, adds vrf device in ns1 and changes routes
+  test_icmp_vrf
+* Unmerged path tools/testing/selftests/net/netfilter/nf_queue.c
+* Unmerged path tools/testing/selftests/net/netfilter/nft_queue.sh
