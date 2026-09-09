@@ -4566,6 +4566,7 @@ int __dev_queue_xmit(struct sk_buff *skb, struct net_device *sb_dev)
 {
 	struct net_device *dev = skb->dev;
 	struct netdev_queue *txq = NULL;
+	enum skb_drop_reason reason;
 	struct Qdisc *q;
 	int rc = -ENOMEM;
 	bool again = false;
