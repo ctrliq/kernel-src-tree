@@ -4027,6 +4027,11 @@ static inline void init_sched_mm_cid(struct task_struct *t) { }
 DECLARE_STATIC_KEY_FALSE(sched_cache_present);
 DECLARE_STATIC_KEY_FALSE(sched_cache_active);
 extern int sysctl_sched_cache_user;
+extern unsigned int llc_aggr_tolerance;
+extern unsigned int llc_epoch_period;
+extern unsigned int llc_epoch_affinity_timeout;
+extern unsigned int llc_imb_pct;
+extern unsigned int llc_overaggr_pct;
 
 static inline bool sched_cache_enabled(void)
 {
