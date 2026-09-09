@@ -1412,6 +1412,10 @@ struct task_struct {
 	unsigned long			numa_pages_migrated;
 #endif /* CONFIG_NUMA_BALANCING */
 
+#ifdef CONFIG_SCHED_CACHE
+	struct callback_head            cache_work;
+#endif
+
 #ifdef CONFIG_RSEQ
 	struct rseq __user *rseq;
 	u32 rseq_len;
@@ -2268,6 +2272,26 @@ static __always_inline void alloc_tag_restore(struct alloc_tag *tag, struct allo
 #else
 #define alloc_tag_save(_tag)			NULL
 #define alloc_tag_restore(_tag, _old)		do {} while (0)
+#endif
+
+#ifdef CONFIG_SCHED_CACHE
+
+struct sched_cache_time {
+	u64 runtime;
+	unsigned long epoch;
+};
+
+struct sched_cache_stat {
+	struct sched_cache_time __percpu *pcpu_sched;
+	raw_spinlock_t lock;
+	unsigned long epoch;
+	int cpu;
+} ____cacheline_aligned_in_smp;
+
+#else
+
+struct sched_cache_stat { };
+
 #endif
 
 #ifndef MODULE

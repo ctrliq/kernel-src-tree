@@ -1178,6 +1178,12 @@ struct rq {
 	struct scx_rq		scx;
 	struct sched_dl_entity	ext_server;
 #endif
+#ifdef CONFIG_SCHED_CACHE
+	raw_spinlock_t		cpu_epoch_lock ____cacheline_aligned;
+	u64			cpu_runtime;
+	unsigned long		cpu_epoch;
+	unsigned long		cpu_epoch_next;
+#endif
 
 	struct sched_dl_entity	fair_server;
 
@@ -3995,6 +4001,14 @@ static inline void sched_mm_cid_migrate_to(struct rq *dst_rq, struct task_struct
 static inline void task_tick_mm_cid(struct rq *rq, struct task_struct *curr) { }
 static inline void init_sched_mm_cid(struct task_struct *t) { }
 #endif /* !CONFIG_SCHED_MM_CID */
+
+#ifdef CONFIG_SCHED_CACHE
+static inline bool sched_cache_enabled(void)
+{
+	return false;
+}
+#endif
+extern void init_sched_mm(struct task_struct *p);
 
 extern u64 avg_vruntime(struct cfs_rq *cfs_rq);
 extern int entity_eligible(struct cfs_rq *cfs_rq, struct sched_entity *se);
