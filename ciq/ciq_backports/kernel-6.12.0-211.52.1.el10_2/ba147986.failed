@@ -1,0 +1,246 @@
+selftests: netfilter: nft_queue.sh: avoid flakes on debug kernels
+
+jira KERNEL-1569
+Rebuild_History Non-Buildable kernel-6.12.0-211.52.1.el10_2
+commit-author Florian Westphal <fw@strlen.de>
+commit ba14798653bb815b4dcd116c5265a9f748bc0c7f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.52.1.el10_2/ba147986.failed
+
+Jakub reports test flakes on debug kernels:
+ FAIL: test_udp_gro_ct: Expected software segmentation to occur, had 23 and 17
+
+This test assumes that the kernels nfnetlink_queue module sees N GSO
+packets, segments them into M skbs and queues them to userspace for
+reinjection.
+
+Hence, if M >= N, no segmentation occurred.
+
+However, its possible that this happens:
+- nfnetlink_queue gets GSO packet
+- segments that into n skbs
+- userspace buffer is full, kernel drops the segmented skbs
+
+-> "toqueue" counter incremented by 1, "fromqueue" is unchanged.
+
+If this happens often enough in a single run, M >= N check triggers
+incorrectly.
+
+To solve this, allow the nf_queue.c test program to set the FAIL_OPEN
+flag so that the segmented skbs bypass the queueing step in the kernel
+if the receive buffer is full.
+
+Also, reduce number of sending socat instances, decrease their priority
+and increase nice value for the nf_queue program itself to reduce the
+probability of overruns happening in the first place.
+
+Fixes: 59ecffa3995e ("selftests: netfilter: nft_queue.sh: add udp fraglist gro test case")
+	Reported-by: Jakub Kicinski <kuba@kernel.org>
+Closes: https://lore.kernel.org/netdev/20260218184114.0b405b72@kernel.org/
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+Link: https://patch.msgid.link/20260226161920.1205-1-fw@strlen.de
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit ba14798653bb815b4dcd116c5265a9f748bc0c7f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/net/netfilter/nft_queue.sh
+diff --cc tools/testing/selftests/net/netfilter/nft_queue.sh
+index 6136ceec45e0,ea766bdc5d04..000000000000
+--- a/tools/testing/selftests/net/netfilter/nft_queue.sh
++++ b/tools/testing/selftests/net/netfilter/nft_queue.sh
+@@@ -585,6 -585,140 +585,143 @@@ EO
+  	echo "PASS: both udp receivers got one packet each"
+  }
+  
+++<<<<<<< HEAD
+++=======
++ # Make sure UDPGRO aggregated packets don't lose
++ # their skb->nfct entry when nfqueue passes the
++ # skb to userspace with software gso segmentation on.
++ test_udp_gro_ct()
++ {
++ 	local errprefix="FAIL: test_udp_gro_ct:"
++ 	local timeout=5
++ 
++ 	ip netns exec "$nsrouter" conntrack -F 2>/dev/null
++ 
++         ip netns exec "$nsrouter" nft -f /dev/stdin <<EOF
++ flush ruleset
++ table inet udpq {
++ 	# Number of packets/bytes queued to userspace
++ 	counter toqueue { }
++ 	# Number of packets/bytes reinjected from userspace with 'ct new' intact
++ 	counter fromqueue { }
++ 	# These two counters should be identical and not 0.
++ 
++ 	chain prerouting {
++ 		type filter hook prerouting priority -300; policy accept;
++ 
++ 		# userspace sends small packets, if < 1000, UDPGRO did
++ 		# not kick in, but test needs a 'new' conntrack with udpgro skb.
++ 		meta iifname veth0 meta l4proto udp meta length > 1000 accept
++ 
++ 		# don't pick up non-gso packets and don't queue them to
++ 		# userspace.
++ 		notrack
++ 	}
++ 
++         chain postrouting {
++ 		type filter hook postrouting priority 0; policy accept;
++ 
++ 		# Only queue unconfirmed fraglist gro skbs to userspace.
++ 		udp dport 12346 ct status ! confirmed counter name "toqueue" mark set 1 queue num 1
++         }
++ 
++ 	chain validate {
++ 		type filter hook postrouting priority 1; policy accept;
++ 		# ... and only count those that were reinjected with the
++ 		# skb->nfct intact.
++ 		mark 1 counter name "fromqueue"
++ 	}
++ }
++ EOF
++ 	timeout "$timeout" ip netns exec "$ns2" socat UDP-LISTEN:12346,fork,pf=ipv4 OPEN:"$TMPFILE1",trunc &
++ 	local rpid=$!
++ 
++ 	ip netns exec "$nsrouter" nice -n -19 ./nf_queue -G -c -q 1 -o -t 2 > "$TMPFILE2" &
++ 	local nfqpid=$!
++ 
++ 	ip netns exec "$nsrouter" ethtool -K "veth0" rx-udp-gro-forwarding on rx-gro-list on generic-receive-offload on
++ 
++ 	busywait "$BUSYWAIT_TIMEOUT" udp_listener_ready "$ns2" 12346
++ 	busywait "$BUSYWAIT_TIMEOUT" nf_queue_wait "$nsrouter" 1
++ 
++ 	local bs=512
++ 	local count=$(((32 * 1024 * 1024) / bs))
++ 
++ 	local nprocs=$(nproc)
++ 	[ $nprocs -gt 1 ] && nprocs=$((nprocs - 1))
++ 
++ 	dd if=/dev/zero bs="$bs" count="$count" 2>/dev/null | for i in $(seq 1 $nprocs); do
++ 		timeout "$timeout" nice -n 19 ip netns exec "$ns1" \
++ 			socat -u -b 512 STDIN UDP-DATAGRAM:10.0.2.99:12346,reuseport,bind=0.0.0.0:55221 &
++ 	done
++ 
++ 	busywait 10000 test -s "$TMPFILE1"
++ 
++ 	kill "$rpid"
++ 
++ 	wait
++ 
++ 	local p
++ 	local b
++ 	local pqueued
++ 	local bqueued
++ 
++ 	c=$(ip netns exec "$nsrouter" nft list counter inet udpq "toqueue" | grep packets)
++ 	read p pqueued b bqueued <<EOF
++ $c
++ EOF
++ 	local preinject
++ 	local breinject
++ 	c=$(ip netns exec "$nsrouter" nft list counter inet udpq "fromqueue" | grep packets)
++ 	read p preinject b breinject <<EOF
++ $c
++ EOF
++ 	ip netns exec "$nsrouter" ethtool -K "veth0" rx-udp-gro-forwarding off
++ 	ip netns exec "$nsrouter" ethtool -K "veth1" rx-udp-gro-forwarding off
++ 
++ 	if [ "$pqueued" -eq 0 ];then
++ 		# happens when gro did not build at least on aggregate
++ 		echo "SKIP: No packets were queued"
++ 		return
++ 	fi
++ 
++ 	local saw_ct_entry=0
++ 	if ip netns exec "$nsrouter" bash -c 'conntrack -L -p udp --dport 12346 2>/dev/null | wc -l | grep -q "^1"'; then
++ 		saw_ct_entry=1
++ 	else
++ 		echo "$errprefix Expected udp conntrack entry"
++ 		ip netns exec "$nsrouter" conntrack -L
++ 		ret=1
++ 	fi
++ 
++ 	if [ "$pqueued" -ge "$preinject" ] ;then
++ 		echo "$errprefix Expected software segmentation to occur, had $pqueued and $preinject"
++ 		ret=1
++ 		return
++ 	fi
++ 
++ 	# sw segmentation adds extra udp and ip headers.
++ 	local breinject_expect=$((preinject * (512 + 20 + 8)))
++ 
++ 	if [ "$breinject" -eq "$breinject_expect" ]; then
++ 		if [ "$saw_ct_entry" -eq 1 ];then
++ 			echo "PASS: fraglist gro skb passed with conntrack entry"
++ 		else
++ 			echo "$errprefix fraglist gro skb passed without conntrack entry"
++ 			ret=1
++ 		fi
++ 	else
++ 		echo "$errprefix Counter mismatch, conntrack entry dropped by nfqueue? Queued: $pqueued, $bqueued. Post-queue: $preinject, $breinject. Expected $breinject_expect"
++ 		ret=1
++ 	fi
++ 
++ 	if ! ip netns exec "$nsrouter" nft delete table inet udpq; then
++ 		echo "$errprefix: Could not delete udpq table"
++ 		ret=1
++ 	fi
++ }
++ 
+++>>>>>>> ba14798653bb (selftests: netfilter: nft_queue.sh: avoid flakes on debug kernels)
+  test_queue_removal()
+  {
+  	read tainted_then < /proc/sys/kernel/tainted
+diff --git a/tools/testing/selftests/net/netfilter/nf_queue.c b/tools/testing/selftests/net/netfilter/nf_queue.c
+index 9e56b9d47037..116c0ca0eabb 100644
+--- a/tools/testing/selftests/net/netfilter/nf_queue.c
++++ b/tools/testing/selftests/net/netfilter/nf_queue.c
+@@ -18,6 +18,7 @@
+ struct options {
+ 	bool count_packets;
+ 	bool gso_enabled;
++	bool failopen;
+ 	int verbose;
+ 	unsigned int queue_num;
+ 	unsigned int timeout;
+@@ -30,7 +31,7 @@ static struct options opts;
+ 
+ static void help(const char *p)
+ {
+-	printf("Usage: %s [-c|-v [-vv] ] [-t timeout] [-q queue_num] [-Qdst_queue ] [ -d ms_delay ] [-G]\n", p);
++	printf("Usage: %s [-c|-v [-vv] ] [-o] [-t timeout] [-q queue_num] [-Qdst_queue ] [ -d ms_delay ] [-G]\n", p);
+ }
+ 
+ static int parse_attr_cb(const struct nlattr *attr, void *data)
+@@ -236,6 +237,8 @@ struct mnl_socket *open_queue(void)
+ 
+ 	flags = opts.gso_enabled ? NFQA_CFG_F_GSO : 0;
+ 	flags |= NFQA_CFG_F_UID_GID;
++	if (opts.failopen)
++		flags |= NFQA_CFG_F_FAIL_OPEN;
+ 	mnl_attr_put_u32(nlh, NFQA_CFG_FLAGS, htonl(flags));
+ 	mnl_attr_put_u32(nlh, NFQA_CFG_MASK, htonl(flags));
+ 
+@@ -329,7 +332,7 @@ static void parse_opts(int argc, char **argv)
+ {
+ 	int c;
+ 
+-	while ((c = getopt(argc, argv, "chvt:q:Q:d:G")) != -1) {
++	while ((c = getopt(argc, argv, "chvot:q:Q:d:G")) != -1) {
+ 		switch (c) {
+ 		case 'c':
+ 			opts.count_packets = true;
+@@ -366,6 +369,9 @@ static void parse_opts(int argc, char **argv)
+ 		case 'G':
+ 			opts.gso_enabled = false;
+ 			break;
++		case 'o':
++			opts.failopen = true;
++			break;
+ 		case 'v':
+ 			opts.verbose++;
+ 			break;
+* Unmerged path tools/testing/selftests/net/netfilter/nft_queue.sh
