@@ -3735,7 +3735,7 @@ static ssize_t cgroup_max_descendants_write(struct kernfs_open_file *of,
 	if (!cgrp)
 		return -ENOENT;
 
-	cgrp->max_descendants = descendants;
+	WRITE_ONCE(cgrp->max_descendants, descendants);
 
 	cgroup_kn_unlock(of->kn);
 
@@ -3778,7 +3778,7 @@ static ssize_t cgroup_max_depth_write(struct kernfs_open_file *of,
 	if (!cgrp)
 		return -ENOENT;
 
-	cgrp->max_depth = depth;
+	WRITE_ONCE(cgrp->max_depth, depth);
 
 	cgroup_kn_unlock(of->kn);
 
