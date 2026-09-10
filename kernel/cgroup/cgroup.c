@@ -59,6 +59,7 @@
 #include <linux/sched/cputime.h>
 #include <linux/sched/deadline.h>
 #include <linux/psi.h>
+#include <linux/irq_work.h>
 #include <net/sock.h>
 
 #define CREATE_TRACE_POINTS
