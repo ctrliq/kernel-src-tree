@@ -1,0 +1,420 @@
+net_sched: make room for (struct qdisc_skb_cb)->pkt_segs
+
+jira KERNEL-1574
+cve CVE-2026-53091
+Rebuild_History Non-Buildable kernel-4.18.0-553.162.1.el8_10
+commit-author Eric Dumazet <edumazet@google.com>
+commit b2a38f6df9dab0b05858746edcbe2403f8f4e4ec
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.162.1.el8_10/b2a38f6d.failed
+
+Add a new u16 field, next to pkt_len : pkt_segs
+
+This will cache shinfo->gso_segs to speed up qdisc deqeue().
+
+Move slave_dev_queue_mapping at the end of qdisc_skb_cb,
+and move three bits from tc_skb_cb :
+- post_ct
+- post_ct_snat
+- post_ct_dnat
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+Link: https://patch.msgid.link/20251121083256.674562-2-edumazet@google.com
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+
+(cherry picked from commit b2a38f6df9dab0b05858746edcbe2403f8f4e4ec)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sch_generic.h
+#	net/core/dev.c
+#	net/sched/act_ct.c
+diff --cc include/net/sch_generic.h
+index d0fa7cfdbf29,9cd8b5d4b236..000000000000
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@@ -1019,6 -1063,34 +1022,37 @@@ static inline struct sk_buff *qdisc_deq
+  	return skb;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct tc_skb_cb {
++ 	struct qdisc_skb_cb qdisc_cb;
++ 	u32 drop_reason;
++ 
++ 	u16 zone; /* Only valid if qdisc_skb_cb(skb)->post_ct = true */
++ 	u16 mru;
++ };
++ 
++ static inline struct tc_skb_cb *tc_skb_cb(const struct sk_buff *skb)
++ {
++ 	struct tc_skb_cb *cb = (struct tc_skb_cb *)skb->cb;
++ 
++ 	BUILD_BUG_ON(sizeof(*cb) > sizeof_field(struct sk_buff, cb));
++ 	return cb;
++ }
++ 
++ static inline enum skb_drop_reason
++ tcf_get_drop_reason(const struct sk_buff *skb)
++ {
++ 	return tc_skb_cb(skb)->drop_reason;
++ }
++ 
++ static inline void tcf_set_drop_reason(const struct sk_buff *skb,
++ 				       enum skb_drop_reason reason)
++ {
++ 	tc_skb_cb(skb)->drop_reason = reason;
++ }
++ 
+++>>>>>>> b2a38f6df9da (net_sched: make room for (struct qdisc_skb_cb)->pkt_segs)
+  /* Instead of calling kfree_skb() while root qdisc lock is held,
+   * queue the skb for future freeing at end of __dev_xmit_skb()
+   */
+diff --cc net/core/dev.c
+index ff7ab74072fc,46ce6c610780..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -4108,8 -4319,224 +4108,214 @@@ void netdev_xmit_skip_txqueue(bool skip
+  	__this_cpu_write(softnet_data.xmit.skip_txqueue, skip);
+  }
+  EXPORT_SYMBOL_GPL(netdev_xmit_skip_txqueue);
+ -
+ -#else
+ -static bool netdev_xmit_txqueue_skipped(void)
+ -{
+ -	return current->net_xmit.skip_txqueue;
+ -}
+ -
+ -void netdev_xmit_skip_txqueue(bool skip)
+ -{
+ -	current->net_xmit.skip_txqueue = skip;
+ -}
+ -EXPORT_SYMBOL_GPL(netdev_xmit_skip_txqueue);
+ -#endif
+  #endif /* CONFIG_NET_EGRESS */
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_NET_XGRESS
++ static int tc_run(struct tcx_entry *entry, struct sk_buff *skb,
++ 		  enum skb_drop_reason *drop_reason)
++ {
++ 	int ret = TC_ACT_UNSPEC;
++ #ifdef CONFIG_NET_CLS_ACT
++ 	struct mini_Qdisc *miniq = rcu_dereference_bh(entry->miniq);
++ 	struct tcf_result res;
++ 
++ 	if (!miniq)
++ 		return ret;
++ 
++ 	/* Global bypass */
++ 	if (!static_branch_likely(&tcf_sw_enabled_key))
++ 		return ret;
++ 
++ 	/* Block-wise bypass */
++ 	if (tcf_block_bypass_sw(miniq->block))
++ 		return ret;
++ 
++ 	tc_skb_cb(skb)->mru = 0;
++ 	qdisc_skb_cb(skb)->post_ct = false;
++ 	tcf_set_drop_reason(skb, *drop_reason);
++ 
++ 	mini_qdisc_bstats_cpu_update(miniq, skb);
++ 	ret = tcf_classify(skb, miniq->block, miniq->filter_list, &res, false);
++ 	/* Only tcf related quirks below. */
++ 	switch (ret) {
++ 	case TC_ACT_SHOT:
++ 		*drop_reason = tcf_get_drop_reason(skb);
++ 		mini_qdisc_qstats_cpu_drop(miniq);
++ 		break;
++ 	case TC_ACT_OK:
++ 	case TC_ACT_RECLASSIFY:
++ 		skb->tc_index = TC_H_MIN(res.classid);
++ 		break;
++ 	}
++ #endif /* CONFIG_NET_CLS_ACT */
++ 	return ret;
++ }
++ 
++ static DEFINE_STATIC_KEY_FALSE(tcx_needed_key);
++ 
++ void tcx_inc(void)
++ {
++ 	static_branch_inc(&tcx_needed_key);
++ }
++ 
++ void tcx_dec(void)
++ {
++ 	static_branch_dec(&tcx_needed_key);
++ }
++ 
++ static __always_inline enum tcx_action_base
++ tcx_run(const struct bpf_mprog_entry *entry, struct sk_buff *skb,
++ 	const bool needs_mac)
++ {
++ 	const struct bpf_mprog_fp *fp;
++ 	const struct bpf_prog *prog;
++ 	int ret = TCX_NEXT;
++ 
++ 	if (needs_mac)
++ 		__skb_push(skb, skb->mac_len);
++ 	bpf_mprog_foreach_prog(entry, fp, prog) {
++ 		bpf_compute_data_pointers(skb);
++ 		ret = bpf_prog_run(prog, skb);
++ 		if (ret != TCX_NEXT)
++ 			break;
++ 	}
++ 	if (needs_mac)
++ 		__skb_pull(skb, skb->mac_len);
++ 	return tcx_action_code(skb, ret);
++ }
++ 
++ static __always_inline struct sk_buff *
++ sch_handle_ingress(struct sk_buff *skb, struct packet_type **pt_prev, int *ret,
++ 		   struct net_device *orig_dev, bool *another)
++ {
++ 	struct bpf_mprog_entry *entry = rcu_dereference_bh(skb->dev->tcx_ingress);
++ 	enum skb_drop_reason drop_reason = SKB_DROP_REASON_TC_INGRESS;
++ 	struct bpf_net_context __bpf_net_ctx, *bpf_net_ctx;
++ 	int sch_ret;
++ 
++ 	if (!entry)
++ 		return skb;
++ 
++ 	bpf_net_ctx = bpf_net_ctx_set(&__bpf_net_ctx);
++ 	if (unlikely(*pt_prev)) {
++ 		*ret = deliver_skb(skb, *pt_prev, orig_dev);
++ 		*pt_prev = NULL;
++ 	}
++ 
++ 	qdisc_skb_cb(skb)->pkt_len = skb->len;
++ 	tcx_set_ingress(skb, true);
++ 
++ 	if (static_branch_unlikely(&tcx_needed_key)) {
++ 		sch_ret = tcx_run(entry, skb, true);
++ 		if (sch_ret != TC_ACT_UNSPEC)
++ 			goto ingress_verdict;
++ 	}
++ 	sch_ret = tc_run(tcx_entry(entry), skb, &drop_reason);
++ ingress_verdict:
++ 	switch (sch_ret) {
++ 	case TC_ACT_REDIRECT:
++ 		/* skb_mac_header check was done by BPF, so we can safely
++ 		 * push the L2 header back before redirecting to another
++ 		 * netdev.
++ 		 */
++ 		__skb_push(skb, skb->mac_len);
++ 		if (skb_do_redirect(skb) == -EAGAIN) {
++ 			__skb_pull(skb, skb->mac_len);
++ 			*another = true;
++ 			break;
++ 		}
++ 		*ret = NET_RX_SUCCESS;
++ 		bpf_net_ctx_clear(bpf_net_ctx);
++ 		return NULL;
++ 	case TC_ACT_SHOT:
++ 		kfree_skb_reason(skb, drop_reason);
++ 		*ret = NET_RX_DROP;
++ 		bpf_net_ctx_clear(bpf_net_ctx);
++ 		return NULL;
++ 	/* used by tc_run */
++ 	case TC_ACT_STOLEN:
++ 	case TC_ACT_QUEUED:
++ 	case TC_ACT_TRAP:
++ 		consume_skb(skb);
++ 		fallthrough;
++ 	case TC_ACT_CONSUMED:
++ 		*ret = NET_RX_SUCCESS;
++ 		bpf_net_ctx_clear(bpf_net_ctx);
++ 		return NULL;
++ 	}
++ 	bpf_net_ctx_clear(bpf_net_ctx);
++ 
++ 	return skb;
++ }
++ 
++ static __always_inline struct sk_buff *
++ sch_handle_egress(struct sk_buff *skb, int *ret, struct net_device *dev)
++ {
++ 	struct bpf_mprog_entry *entry = rcu_dereference_bh(dev->tcx_egress);
++ 	enum skb_drop_reason drop_reason = SKB_DROP_REASON_TC_EGRESS;
++ 	struct bpf_net_context __bpf_net_ctx, *bpf_net_ctx;
++ 	int sch_ret;
++ 
++ 	if (!entry)
++ 		return skb;
++ 
++ 	bpf_net_ctx = bpf_net_ctx_set(&__bpf_net_ctx);
++ 
++ 	/* qdisc_skb_cb(skb)->pkt_len & tcx_set_ingress() was
++ 	 * already set by the caller.
++ 	 */
++ 	if (static_branch_unlikely(&tcx_needed_key)) {
++ 		sch_ret = tcx_run(entry, skb, false);
++ 		if (sch_ret != TC_ACT_UNSPEC)
++ 			goto egress_verdict;
++ 	}
++ 	sch_ret = tc_run(tcx_entry(entry), skb, &drop_reason);
++ egress_verdict:
++ 	switch (sch_ret) {
++ 	case TC_ACT_REDIRECT:
++ 		/* No need to push/pop skb's mac_header here on egress! */
++ 		skb_do_redirect(skb);
++ 		*ret = NET_XMIT_SUCCESS;
++ 		bpf_net_ctx_clear(bpf_net_ctx);
++ 		return NULL;
++ 	case TC_ACT_SHOT:
++ 		kfree_skb_reason(skb, drop_reason);
++ 		*ret = NET_XMIT_DROP;
++ 		bpf_net_ctx_clear(bpf_net_ctx);
++ 		return NULL;
++ 	/* used by tc_run */
++ 	case TC_ACT_STOLEN:
++ 	case TC_ACT_QUEUED:
++ 	case TC_ACT_TRAP:
++ 		consume_skb(skb);
++ 		fallthrough;
++ 	case TC_ACT_CONSUMED:
++ 		*ret = NET_XMIT_SUCCESS;
++ 		bpf_net_ctx_clear(bpf_net_ctx);
++ 		return NULL;
++ 	}
++ 	bpf_net_ctx_clear(bpf_net_ctx);
++ 
++ 	return skb;
++ }
++ #else
++ static __always_inline struct sk_buff *
++ sch_handle_ingress(struct sk_buff *skb, struct packet_type **pt_prev, int *ret,
++ 		   struct net_device *orig_dev, bool *another)
++ {
++ 	return skb;
++ }
++ 
++ static __always_inline struct sk_buff *
++ sch_handle_egress(struct sk_buff *skb, int *ret, struct net_device *dev)
++ {
++ 	return skb;
++ }
++ #endif /* CONFIG_NET_XGRESS */
++ 
+++>>>>>>> b2a38f6df9da (net_sched: make room for (struct qdisc_skb_cb)->pkt_segs)
+  #ifdef CONFIG_XPS
+  static int __get_xps_queue_idx(struct net_device *dev, struct sk_buff *skb,
+  			       struct xps_dev_maps *dev_maps, unsigned int tci)
+diff --cc net/sched/act_ct.c
+index 9fc42c3ba798,2b6ac7069dc1..000000000000
+--- a/net/sched/act_ct.c
++++ b/net/sched/act_ct.c
+@@@ -934,47 -938,20 +934,54 @@@ static int tcf_ct_act_nat(struct sk_buf
+  
+  	if (!(ct_action & TCA_CT_ACT_NAT))
+  		return NF_ACCEPT;
+ -	if (ct_action & TCA_CT_ACT_NAT_SRC)
+ -		action |= BIT(NF_NAT_MANIP_SRC);
+ -	if (ct_action & TCA_CT_ACT_NAT_DST)
+ -		action |= BIT(NF_NAT_MANIP_DST);
+ -
+ -	err = nf_ct_nat(skb, ct, ctinfo, &action, range, commit);
+ -	if (err != NF_ACCEPT)
+ -		return err & NF_VERDICT_MASK;
+  
+ +	/* Add NAT extension if not confirmed yet. */
+ +	if (!nf_ct_is_confirmed(ct) && !nf_ct_nat_ext_add(ct))
+ +		return NF_DROP;   /* Can't NAT. */
+ +
+++<<<<<<< HEAD
+ +	if (ctinfo != IP_CT_NEW && (ct->status & IPS_NAT_MASK) &&
+ +	    (ctinfo != IP_CT_RELATED || commit)) {
+ +		/* NAT an established or related connection like before. */
+ +		if (CTINFO2DIR(ctinfo) == IP_CT_DIR_REPLY)
+ +			/* This is the REPLY direction for a connection
+ +			 * for which NAT was applied in the forward
+ +			 * direction.  Do the reverse NAT.
+ +			 */
+ +			maniptype = ct->status & IPS_SRC_NAT
+ +				? NF_NAT_MANIP_DST : NF_NAT_MANIP_SRC;
+ +		else
+ +			maniptype = ct->status & IPS_SRC_NAT
+ +				? NF_NAT_MANIP_SRC : NF_NAT_MANIP_DST;
+ +	} else if (ct_action & TCA_CT_ACT_NAT_SRC) {
+ +		maniptype = NF_NAT_MANIP_SRC;
+ +	} else if (ct_action & TCA_CT_ACT_NAT_DST) {
+ +		maniptype = NF_NAT_MANIP_DST;
+ +	} else {
+ +		return NF_ACCEPT;
+ +	}
+++=======
++ 	if (action & BIT(NF_NAT_MANIP_SRC))
++ 		qdisc_skb_cb(skb)->post_ct_snat = 1;
++ 	if (action & BIT(NF_NAT_MANIP_DST))
++ 		qdisc_skb_cb(skb)->post_ct_dnat = 1;
+ -
+++>>>>>>> b2a38f6df9da (net_sched: make room for (struct qdisc_skb_cb)->pkt_segs)
+ +
+ +	err = ct_nat_execute(skb, ct, ctinfo, range, maniptype);
+ +	if (err == NF_ACCEPT && ct->status & IPS_DST_NAT) {
+ +		if (ct->status & IPS_SRC_NAT) {
+ +			if (maniptype == NF_NAT_MANIP_SRC)
+ +				maniptype = NF_NAT_MANIP_DST;
+ +			else
+ +				maniptype = NF_NAT_MANIP_SRC;
+ +
+ +			err = ct_nat_execute(skb, ct, ctinfo, range,
+ +					     maniptype);
+ +		} else if (CTINFO2DIR(ctinfo) == IP_CT_DIR_ORIGINAL) {
+ +			err = ct_nat_execute(skb, ct, ctinfo, NULL,
+ +					     NF_NAT_MANIP_SRC);
+ +		}
+ +	}
+  	return err;
+  #else
+  	return NF_ACCEPT;
+@@@ -1009,10 -986,10 +1016,10 @@@ TC_INDIRECT_SCOPE int tcf_ct_act(struc
+  	tcf_action_update_bstats(&c->common, skb);
+  
+  	if (clear) {
+- 		tc_skb_cb(skb)->post_ct = false;
++ 		qdisc_skb_cb(skb)->post_ct = false;
+  		ct = nf_ct_get(skb, &ctinfo);
+  		if (ct) {
+ -			nf_ct_put(ct);
+ +			nf_conntrack_put(&ct->ct_general);
+  			nf_ct_set(skb, NULL, IP_CT_UNTRACKED);
+  		}
+  
+* Unmerged path include/net/sch_generic.h
+* Unmerged path net/core/dev.c
+* Unmerged path net/sched/act_ct.c
+diff --git a/net/sched/cls_api.c b/net/sched/cls_api.c
+index ab6905cd616c..55d0ad2c6a2f 100644
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@ -1805,9 +1805,9 @@ int tcf_classify(struct sk_buff *skb,
+ 				return TC_ACT_SHOT;
+ 			ext->chain = last_executed_chain;
+ 			ext->mru = cb->mru;
+-			ext->post_ct = cb->post_ct;
+-			ext->post_ct_snat = cb->post_ct_snat;
+-			ext->post_ct_dnat = cb->post_ct_dnat;
++			ext->post_ct = qdisc_skb_cb(skb)->post_ct;
++			ext->post_ct_snat = qdisc_skb_cb(skb)->post_ct_snat;
++			ext->post_ct_dnat = qdisc_skb_cb(skb)->post_ct_dnat;
+ 			ext->zone = cb->zone;
+ 		}
+ 	}
+diff --git a/net/sched/cls_flower.c b/net/sched/cls_flower.c
+index b30b75b2264f..ddcb4d8a7460 100644
+--- a/net/sched/cls_flower.c
++++ b/net/sched/cls_flower.c
+@@ -316,7 +316,7 @@ TC_INDIRECT_SCOPE int fl_classify(struct sk_buff *skb,
+ 				  struct tcf_result *res)
+ {
+ 	struct cls_fl_head *head = rcu_dereference_bh(tp->root);
+-	bool post_ct = tc_skb_cb(skb)->post_ct;
++	bool post_ct = qdisc_skb_cb(skb)->post_ct;
+ 	u16 zone = tc_skb_cb(skb)->zone;
+ 	struct fl_flow_key skb_key;
+ 	struct fl_flow_mask *mask;
