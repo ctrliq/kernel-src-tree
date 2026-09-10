@@ -1717,15 +1717,6 @@ static const struct ctl_table kern_table[] = {
 		.extra2		= SYSCTL_MAXOLDUID,
 	},
 	{
-		.procname	= "pid_max",
-		.data		= &pid_max,
-		.maxlen		= sizeof (int),
-		.mode		= 0644,
-		.proc_handler	= proc_dointvec_minmax,
-		.extra1		= &pid_max_min,
-		.extra2		= &pid_max_max,
-	},
-	{
 		.procname	= "ngroups_max",
 		.data		= (void *)&ngroups_max,
 		.maxlen		= sizeof (int),
