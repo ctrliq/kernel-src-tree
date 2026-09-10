@@ -736,7 +736,7 @@ void __put_task_struct(struct task_struct *tsk)
 	WARN_ON(tsk == current);
 
 	io_uring_free(tsk);
-	cgroup_free(tsk);
+	cgroup_task_free(tsk);
 	task_numa_free(tsk, true);
 	security_task_free(tsk);
 	exit_creds(tsk);

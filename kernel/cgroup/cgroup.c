@@ -942,7 +942,8 @@ static void css_set_move_task(struct task_struct *task,
 		/*
 		 * We are synchronized through cgroup_threadgroup_rwsem
 		 * against PF_EXITING setting such that we can't race
-		 * against cgroup_exit()/cgroup_free() dropping the css_set.
+		 * against cgroup_task_exit()/cgroup_task_free() dropping
+		 * the css_set.
 		 */
 		WARN_ON_ONCE(task->flags & PF_EXITING);
 
@@ -6998,13 +6999,13 @@ void cgroup_post_fork(struct task_struct *child,
 }
 
 /**
- * cgroup_exit - detach cgroup from exiting task
+ * cgroup_task_exit - detach cgroup from exiting task
  * @tsk: pointer to task_struct of exiting process
  *
  * Description: Detach cgroup from @tsk.
  *
  */
-void cgroup_exit(struct task_struct *tsk)
+void cgroup_task_exit(struct task_struct *tsk)
 {
 	struct cgroup_subsys *ss;
 	struct css_set *cset;
@@ -7036,7 +7037,7 @@ void cgroup_exit(struct task_struct *tsk)
 	} while_each_subsys_mask();
 }
 
-void cgroup_release(struct task_struct *task)
+void cgroup_task_release(struct task_struct *task)
 {
 	struct cgroup_subsys *ss;
 	int ssid;
@@ -7053,7 +7054,7 @@ void cgroup_release(struct task_struct *task)
 	}
 }
 
-void cgroup_free(struct task_struct *task)
+void cgroup_task_free(struct task_struct *task)
 {
 	struct css_set *cset = task_css_set(task);
 	put_css_set(cset);
