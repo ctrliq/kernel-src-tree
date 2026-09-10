@@ -39,12 +39,15 @@ static int smbd_post_recv(
 		struct smbdirect_recv_io *response);
 
 static int smbd_post_send_empty(struct smbdirect_socket *sc);
-static int smbd_post_send_data(
-		struct smbdirect_socket *sc,
-		struct kvec *iov, int n_vec, int remaining_data_length);
+static int smbd_post_send_data(struct smbdirect_socket *sc,
+			       struct smbdirect_send_batch *batch,
+			       struct kvec *iov, int n_vec,
+			       int remaining_data_length);
 static int smbd_post_send_page(struct smbdirect_socket *sc,
-		struct page *page, unsigned long offset,
-		size_t size, int remaining_data_length);
+			       struct smbdirect_send_batch *batch,
+			       struct page *page,
+			       unsigned long offset, size_t size,
+			       int remaining_data_length);
 
 static void destroy_mr_list(struct smbdirect_socket *sc);
 static int allocate_mr_list(struct smbdirect_socket *sc);
@@ -553,11 +556,20 @@ static void send_done(struct ib_cq *cq, struct ib_wc *wc)
 	struct smbdirect_send_io *request =
 		container_of(wc->wr_cqe, struct smbdirect_send_io, cqe);
 	struct smbdirect_socket *sc = request->socket;
+	struct smbdirect_send_io *sibling, *next;
 	int lcredits = 0;
 
 	log_rdma_send(INFO, "smbdirect_send_io 0x%p completed wc->status=%s\n",
 		request, ib_wc_status_msg(wc->status));
 
+	/*
+	 * Free possible siblings and then the main send_io
+	 */
+	list_for_each_entry_safe(sibling, next, &request->sibling_list, sibling_list) {
+		list_del_init(&sibling->sibling_list);
+		smbd_free_send_io(sibling);
+		lcredits += 1;
+	}
 	/* Note this frees wc->wr_cqe, but not wc */
 	smbd_free_send_io(request);
 	lcredits += 1;
@@ -1163,7 +1175,8 @@ static int smbd_ib_post_send(struct smbdirect_socket *sc,
 
 /* Post the send request */
 static int smbd_post_send(struct smbdirect_socket *sc,
-		struct smbdirect_send_io *request)
+			  struct smbdirect_send_batch *batch,
+			  struct smbdirect_send_io *request)
 {
 	int i;
 
@@ -1179,14 +1192,93 @@ static int smbd_post_send(struct smbdirect_socket *sc,
 	}
 
 	request->cqe.done = send_done;
-
 	request->wr.next = NULL;
-	request->wr.wr_cqe = &request->cqe;
 	request->wr.sg_list = request->sge;
 	request->wr.num_sge = request->num_sge;
 	request->wr.opcode = IB_WR_SEND;
+
+	if (batch) {
+		request->wr.wr_cqe = NULL;
+		request->wr.send_flags = 0;
+		if (!list_empty(&batch->msg_list)) {
+			struct smbdirect_send_io *last;
+
+			last = list_last_entry(&batch->msg_list,
+					       struct smbdirect_send_io,
+					       sibling_list);
+			last->wr.next = &request->wr;
+		}
+		list_add_tail(&request->sibling_list, &batch->msg_list);
+		batch->wr_cnt++;
+		return 0;
+	}
+
+	request->wr.wr_cqe = &request->cqe;
 	request->wr.send_flags = IB_SEND_SIGNALED;
 	return smbd_ib_post_send(sc, &request->wr);
+}
+
+static void smbd_send_batch_init(struct smbdirect_send_batch *batch,
+				 bool need_invalidate_rkey,
+				 unsigned int remote_key)
+{
+	INIT_LIST_HEAD(&batch->msg_list);
+	batch->wr_cnt = 0;
+	batch->need_invalidate_rkey = need_invalidate_rkey;
+	batch->remote_key = remote_key;
+}
+
+static int smbd_send_batch_flush(struct smbdirect_socket *sc,
+				 struct smbdirect_send_batch *batch,
+				 bool is_last)
+{
+	struct smbdirect_send_io *first, *last;
+	int ret = 0;
+
+	if (list_empty(&batch->msg_list))
+		return 0;
+
+	first = list_first_entry(&batch->msg_list,
+				 struct smbdirect_send_io,
+				 sibling_list);
+	last = list_last_entry(&batch->msg_list,
+			       struct smbdirect_send_io,
+			       sibling_list);
+
+	if (batch->need_invalidate_rkey) {
+		first->wr.opcode = IB_WR_SEND_WITH_INV;
+		first->wr.ex.invalidate_rkey = batch->remote_key;
+		batch->need_invalidate_rkey = false;
+		batch->remote_key = 0;
+	}
+
+	last->wr.send_flags = IB_SEND_SIGNALED;
+	last->wr.wr_cqe = &last->cqe;
+
+	/*
+	 * Remove last from batch->msg_list
+	 * and splice the rest of batch->msg_list
+	 * to last->sibling_list.
+	 *
+	 * batch->msg_list is a valid empty list
+	 * at the end.
+	 */
+	list_del_init(&last->sibling_list);
+	list_splice_tail_init(&batch->msg_list, &last->sibling_list);
+	batch->wr_cnt = 0;
+
+	ret = smbd_ib_post_send(sc, &first->wr);
+	if (ret) {
+		struct smbdirect_send_io *sibling, *next;
+
+		list_for_each_entry_safe(sibling, next, &last->sibling_list, sibling_list) {
+			list_del_init(&sibling->sibling_list);
+			smbd_free_send_io(sibling);
+		}
+		smbd_free_send_io(last);
+	}
+
+	return ret;
 }
 
 static int wait_for_credits(struct smbdirect_socket *sc,
@@ -1211,16 +1303,35 @@ static int wait_for_credits(struct smbdirect_socket *sc,
 	} while (true);
 }
 
-static int wait_for_send_lcredit(struct smbdirect_socket *sc)
+static int wait_for_send_lcredit(struct smbdirect_socket *sc,
+				 struct smbdirect_send_batch *batch)
 {
+	if (batch && (atomic_read(&sc->send_io.lcredits.count) <= 1)) {
+		int ret;
+
+		ret = smbd_send_batch_flush(sc, batch, false);
+		if (ret)
+			return ret;
+	}
+
 	return wait_for_credits(sc,
 				&sc->send_io.lcredits.wait_queue,
 				&sc->send_io.lcredits.count,
 				1);
 }
 
-static int wait_for_send_credits(struct smbdirect_socket *sc)
+static int wait_for_send_credits(struct smbdirect_socket *sc,
+				 struct smbdirect_send_batch *batch)
 {
+	if (batch &&
+	    (batch->wr_cnt >= 16 || atomic_read(&sc->send_io.credits.count) <= 1)) {
+		int ret;
+
+		ret = smbd_send_batch_flush(sc, batch, false);
+		if (ret)
+			return ret;
+	}
+
 	return wait_for_credits(sc,
 				&sc->send_io.credits.wait_queue,
 				&sc->send_io.credits.count,
@@ -1228,7 +1339,9 @@ static int wait_for_send_credits(struct smbdirect_socket *sc)
 }
 
 static int smbd_post_send_sgl(struct smbdirect_socket *sc,
-	struct scatterlist *sgl, int data_length, int remaining_data_length)
+			      struct smbdirect_send_batch *batch,
+			      struct scatterlist *sgl, int data_length,
+			      int remaining_data_length)
 {
 	struct smbdirect_socket_parameters *sp = &sc->parameters;
 	int num_sgs;
@@ -1239,14 +1352,14 @@ static int smbd_post_send_sgl(struct smbdirect_socket *sc,
 	int new_credits;
 	struct scatterlist *sg;
 
-	rc = wait_for_send_lcredit(sc);
+	rc = wait_for_send_lcredit(sc, batch);
 	if (rc) {
 		log_outgoing(ERR, "disconnected not sending on wait_lcredit\n");
 		rc = -EAGAIN;
 		goto err_wait_lcredit;
 	}
 
-	rc = wait_for_send_credits(sc);
+	rc = wait_for_send_credits(sc, batch);
 	if (rc) {
 		log_outgoing(ERR, "disconnected not sending on wait_credit\n");
 		rc = -EAGAIN;
@@ -1325,7 +1438,7 @@ static int smbd_post_send_sgl(struct smbdirect_socket *sc,
 		request->num_sge++;
 	}
 
-	rc = smbd_post_send(sc, request);
+	rc = smbd_post_send(sc, batch, request);
 	if (!rc)
 		return 0;
 
@@ -1351,15 +1464,18 @@ err_wait_lcredit:
  * size: length in the page to send
  * remaining_data_length: remaining data to send in this payload
  */
-static int smbd_post_send_page(struct smbdirect_socket *sc, struct page *page,
-		unsigned long offset, size_t size, int remaining_data_length)
+static int smbd_post_send_page(struct smbdirect_socket *sc,
+			       struct smbdirect_send_batch *batch,
+			       struct page *page,
+			       unsigned long offset, size_t size,
+			       int remaining_data_length)
 {
 	struct scatterlist sgl;
 
 	sg_init_table(&sgl, 1);
 	sg_set_page(&sgl, page, size, offset);
 
-	return smbd_post_send_sgl(sc, &sgl, size, remaining_data_length);
+	return smbd_post_send_sgl(sc, batch, &sgl, size, remaining_data_length);
 }
 
 /*
@@ -1370,7 +1486,7 @@ static int smbd_post_send_page(struct smbdirect_socket *sc, struct page *page,
 static int smbd_post_send_empty(struct smbdirect_socket *sc)
 {
 	sc->statistics.send_empty++;
-	return smbd_post_send_sgl(sc, NULL, 0, 0);
+	return smbd_post_send_sgl(sc, NULL, NULL, 0, 0);
 }
 
 /*
@@ -1380,9 +1496,10 @@ static int smbd_post_send_empty(struct smbdirect_socket *sc)
  * remaining_data_length: remaining data to send following this packet
  * in segmented SMBD packet
  */
-static int smbd_post_send_data(
-	struct smbdirect_socket *sc, struct kvec *iov, int n_vec,
-	int remaining_data_length)
+static int smbd_post_send_data(struct smbdirect_socket *sc,
+			       struct smbdirect_send_batch *batch,
+			       struct kvec *iov, int n_vec,
+			       int remaining_data_length)
 {
 	int i;
 	u32 data_length = 0;
@@ -1399,7 +1516,7 @@ static int smbd_post_send_data(
 		cifs_sg_set_buf(&sgl[i], iov[i].iov_base, iov[i].iov_len);
 	}
 
-	return smbd_post_send_sgl(sc, sgl, data_length, remaining_data_length);
+	return smbd_post_send_sgl(sc, batch, sgl, data_length, remaining_data_length);
 }
 
 /*
@@ -2394,8 +2511,10 @@ int smbd_send(struct TCP_Server_Info *server,
 		sp->max_send_size - sizeof(struct smbdirect_data_transfer);
 	struct kvec *iov;
 	int rc;
+	struct smbdirect_send_batch batch;
 	struct smb_rqst *rqst;
 	int rqst_idx;
+	int error = 0;
 
 	if (sc->status != SMBDIRECT_SOCKET_CONNECTED)
 		return -EAGAIN;
@@ -2420,6 +2539,7 @@ int smbd_send(struct TCP_Server_Info *server,
 			num_rqst, remaining_data_length);
 
 	rqst_idx = 0;
+	smbd_send_batch_init(&batch, false, 0);
 	do {
 		rqst = &rqst_array[rqst_idx];
 		iov = rqst->rq_iov;
@@ -2472,9 +2592,11 @@ int smbd_send(struct TCP_Server_Info *server,
 					remaining_data_length);
 
 			start = i;
-			rc = smbd_post_send_data(sc, vecs, j, remaining_data_length);
-			if (rc)
+			rc = smbd_post_send_data(sc, &batch, vecs, j, remaining_data_length);
+			if (rc) {
+				error = rc;
 				goto done;
+			}
 		} while (remaining_vec_data_length > 0);
 
 		/* now sending pages if there are any */
@@ -2490,16 +2612,22 @@ int smbd_send(struct TCP_Server_Info *server,
 					  i, j * max_iov_size + offset, size,
 					  remaining_data_length);
 				rc = smbd_post_send_page(
-					sc, rqst->rq_pages[i],
+					sc, &batch, rqst->rq_pages[i],
 					j*max_iov_size + offset,
 					size, remaining_data_length);
-				if (rc)
+				if (rc) {
+					error = rc;
 					goto done;
+				}
 			}
 		}
 	} while (++rqst_idx < num_rqst);
 
 done:
+	rc = smbd_send_batch_flush(sc, &batch, true);
+	if (unlikely(!rc && error))
+		rc = error;
+
 	/*
 	 * As an optimization, we don't wait for individual I/O to finish
 	 * before sending the next one.
