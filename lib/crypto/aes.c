@@ -6,6 +6,7 @@
 #include <crypto/aes.h>
 #include <linux/crypto.h>
 #include <linux/export.h>
+#include <linux/fips.h>
 #include <linux/module.h>
 #include <linux/unaligned.h>
 
@@ -246,6 +247,7 @@ int aes_expandkey(struct crypto_aes_ctx *ctx, const u8 *in_key,
 	ctx->key_dec[i + 2] = ctx->key_enc[2];
 	ctx->key_dec[i + 3] = ctx->key_enc[3];
 
+	ctx->fips_approved = fips_enabled;
 	return 0;
 }
 EXPORT_SYMBOL(aes_expandkey);

@@ -17,6 +17,7 @@
 #include <linux/string.h>
 #include <linux/unaligned.h>
 #include <linux/wordpart.h>
+#include "fips.h"
 
 static const struct sha256_block_state sha224_iv = {
 	.h = {
@@ -172,12 +173,22 @@ static void __sha256_init(struct __sha256_ctx *ctx,
 void sha224_init(struct sha224_ctx *ctx)
 {
 	__sha256_init(&ctx->ctx, &sha224_iv, 0);
+#ifndef __DISABLE_EXPORTS
+	ctx->fips_approved = fips_enabled;
+#else
+	ctx->fips_approved = false;
+#endif
 }
 EXPORT_SYMBOL_GPL(sha224_init);
 
 void sha256_init(struct sha256_ctx *ctx)
 {
 	__sha256_init(&ctx->ctx, &sha256_iv, 0);
+#ifndef __DISABLE_EXPORTS
+	ctx->fips_approved = fips_enabled;
+#else
+	ctx->fips_approved = false;
+#endif
 }
 EXPORT_SYMBOL_GPL(sha256_init);
 
@@ -269,8 +280,8 @@ void sha256(const u8 *data, size_t len, u8 out[SHA256_DIGEST_SIZE])
 EXPORT_SYMBOL(sha256);
 
 /*
- * Pre-boot environment (as indicated by __DISABLE_EXPORTS being defined)
- * doesn't need either HMAC support or interleaved hashing support
+ * Pre-boot environments (as indicated by __DISABLE_EXPORTS being defined) just
+ * need the generic SHA-256 code.  Omit all other features from them.
  */
 #ifndef __DISABLE_EXPORTS
 
@@ -362,6 +373,9 @@ void hmac_sha224_preparekey(struct hmac_sha224_key *key,
 {
 	__hmac_sha256_preparekey(&key->key.istate, &key->key.ostate,
 				 raw_key, raw_key_len, &sha224_iv);
+	key->fips_approved = fips_enabled;
+	if (fips_enabled && raw_key_len < 112 / 8)
+		key->fips_approved = false;
 }
 EXPORT_SYMBOL_GPL(hmac_sha224_preparekey);
 
@@ -370,6 +384,9 @@ void hmac_sha256_preparekey(struct hmac_sha256_key *key,
 {
 	__hmac_sha256_preparekey(&key->key.istate, &key->key.ostate,
 				 raw_key, raw_key_len, &sha256_iv);
+	key->fips_approved = fips_enabled;
+	if (fips_enabled && raw_key_len < 112 / 8)
+		key->fips_approved = false;
 }
 EXPORT_SYMBOL_GPL(hmac_sha256_preparekey);
 
@@ -387,6 +404,9 @@ void hmac_sha224_init_usingrawkey(struct hmac_sha224_ctx *ctx,
 	__hmac_sha256_preparekey(&ctx->ctx.sha_ctx.state, &ctx->ctx.ostate,
 				 raw_key, raw_key_len, &sha224_iv);
 	ctx->ctx.sha_ctx.bytecount = SHA256_BLOCK_SIZE;
+	ctx->fips_approved = fips_enabled;
+	if (fips_enabled && raw_key_len < 112 / 8)
+		ctx->fips_approved = false;
 }
 EXPORT_SYMBOL_GPL(hmac_sha224_init_usingrawkey);
 
@@ -396,6 +416,9 @@ void hmac_sha256_init_usingrawkey(struct hmac_sha256_ctx *ctx,
 	__hmac_sha256_preparekey(&ctx->ctx.sha_ctx.state, &ctx->ctx.ostate,
 				 raw_key, raw_key_len, &sha256_iv);
 	ctx->ctx.sha_ctx.bytecount = SHA256_BLOCK_SIZE;
+	ctx->fips_approved = fips_enabled;
+	if (fips_enabled && raw_key_len < 112 / 8)
+		ctx->fips_approved = false;
 }
 EXPORT_SYMBOL_GPL(hmac_sha256_init_usingrawkey);
 
@@ -477,12 +500,27 @@ void hmac_sha256_usingrawkey(const u8 *raw_key, size_t raw_key_len,
 	hmac_sha256_final(&ctx, out);
 }
 EXPORT_SYMBOL_GPL(hmac_sha256_usingrawkey);
-#endif /* !__DISABLE_EXPORTS */
 
-#ifdef sha256_mod_init_arch
+#if defined(sha256_mod_init_arch) || defined(CONFIG_CRYPTO_FIPS)
 static int __init sha256_mod_init(void)
 {
+#ifdef sha256_mod_init_arch
 	sha256_mod_init_arch();
+#endif
+	if (fips_enabled) {
+		/*
+		 * FIPS cryptographic algorithm self-test.  As per the FIPS
+		 * Implementation Guidance, testing HMAC-SHA256 satisfies the
+		 * test requirement for SHA-224, SHA-256, and HMAC-SHA224 too.
+		 */
+		u8 mac[SHA256_DIGEST_SIZE];
+
+		hmac_sha256_usingrawkey(fips_test_key, sizeof(fips_test_key),
+					fips_test_data, sizeof(fips_test_data),
+					mac);
+		if (memcmp(fips_test_hmac_sha256_value, mac, sizeof(mac)) != 0)
+			panic("sha256: FIPS self-test failed\n");
+	}
 	return 0;
 }
 subsys_initcall(sha256_mod_init);
@@ -492,6 +530,8 @@ static void __exit sha256_mod_exit(void)
 }
 module_exit(sha256_mod_exit);
 #endif
+
+#endif /* !__DISABLE_EXPORTS */
 
 MODULE_DESCRIPTION("SHA-224, SHA-256, HMAC-SHA224, and HMAC-SHA256 library functions");
 MODULE_LICENSE("GPL");
