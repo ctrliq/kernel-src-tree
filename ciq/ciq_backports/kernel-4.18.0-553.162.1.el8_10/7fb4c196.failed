@@ -1,0 +1,232 @@
+net: pull headers in qdisc_pkt_len_segs_init()
+
+jira KERNEL-1574
+cve CVE-2026-53091
+Rebuild_History Non-Buildable kernel-4.18.0-553.162.1.el8_10
+commit-author Eric Dumazet <edumazet@google.com>
+commit 7fb4c19670110f052c04e1ec1d2b953b9f4f57e4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.162.1.el8_10/7fb4c196.failed
+
+Most ndo_start_xmit() methods expects headers of gso packets
+to be already in skb->head.
+
+net/core/tso.c users are particularly at risk, because tso_build_hdr()
+does a memcpy(hdr, skb->data, hdr_len);
+
+qdisc_pkt_len_segs_init() already does a dissection of gso packets.
+
+Use pskb_may_pull() instead of skb_header_pointer() to make
+sure drivers do not have to reimplement this.
+
+Some malicious packets could be fed, detect them so that we can
+drop them sooner with a new SKB_DROP_REASON_SKB_BAD_GSO drop_reason.
+
+Fixes: e876f208af18 ("net: Add a software TSO helper API")
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Reviewed-by: Joe Damato <joe@dama.to>
+Link: https://patch.msgid.link/20260403221540.3297753-3-edumazet@google.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 7fb4c19670110f052c04e1ec1d2b953b9f4f57e4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/dev.c
+diff --cc net/core/dev.c
+index 58bffa5fd7f6,5a31f9d2128c..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -3844,53 -4101,66 +3844,115 @@@ struct sk_buff *validate_xmit_skb_list(
+  }
+  EXPORT_SYMBOL_GPL(validate_xmit_skb_list);
+  
+++<<<<<<< HEAD
+ +static void qdisc_pkt_len_init(struct sk_buff *skb)
+ +{
+ +	struct skb_shared_info *shinfo = skb_shinfo(skb);
+ +
+ +	qdisc_skb_cb(skb)->pkt_len = skb->len;
+++=======
++ static enum skb_drop_reason qdisc_pkt_len_segs_init(struct sk_buff *skb)
++ {
++ 	struct skb_shared_info *shinfo = skb_shinfo(skb);
++ 	unsigned int hdr_len, tlen;
++ 	u16 gso_segs;
++ 
++ 	qdisc_skb_cb(skb)->pkt_len = skb->len;
++ 	if (!shinfo->gso_size) {
++ 		qdisc_skb_cb(skb)->pkt_segs = 1;
++ 		return SKB_NOT_DROPPED_YET;
++ 	}
++ 
++ 	qdisc_skb_cb(skb)->pkt_segs = gso_segs = shinfo->gso_segs;
+++>>>>>>> 7fb4c1967011 (net: pull headers in qdisc_pkt_len_segs_init())
+  
+  	/* To get more precise estimation of bytes sent on wire,
+  	 * we add to pkt_len the headers size of all segments
+  	 */
+++<<<<<<< HEAD
+ +	if (shinfo->gso_size && skb_transport_header_was_set(skb)) {
+ +		u16 gso_segs = shinfo->gso_segs;
+ +		unsigned int hdr_len;
+ +
+ +		/* mac layer + network layer */
+ +		if (!skb->encapsulation)
+ +			hdr_len = skb_transport_offset(skb);
+ +		else
+ +			hdr_len = skb_inner_transport_offset(skb);
+ +
+ +		/* + transport layer */
+ +		if (likely(shinfo->gso_type & (SKB_GSO_TCPV4 | SKB_GSO_TCPV6))) {
+ +			const struct tcphdr *th;
+ +			struct tcphdr _tcphdr;
+ +
+ +			th = skb_header_pointer(skb, hdr_len,
+ +						sizeof(_tcphdr), &_tcphdr);
+ +			if (likely(th))
+ +				hdr_len += __tcp_hdrlen(th);
+ +		} else if (shinfo->gso_type & SKB_GSO_UDP_L4) {
+ +			struct udphdr _udphdr;
+ +
+ +			if (skb_header_pointer(skb, hdr_len,
+ +					       sizeof(_udphdr), &_udphdr))
+ +				hdr_len += sizeof(struct udphdr);
+ +		}
+ +
+ +		if (unlikely(shinfo->gso_type & SKB_GSO_DODGY)) {
+ +			int payload = skb->len - hdr_len;
+ +
+ +			/* Malicious packet. */
+ +			if (payload <= 0)
+ +				return;
+ +			gso_segs = DIV_ROUND_UP(payload, shinfo->gso_size);
+ +			shinfo->gso_segs = gso_segs;
+ +		}
+ +		qdisc_skb_cb(skb)->pkt_len += (gso_segs - 1) * hdr_len;
+ +	}
+++=======
++ 
++ 	/* mac layer + network layer */
++ 	if (!skb->encapsulation) {
++ 		if (unlikely(!skb_transport_header_was_set(skb)))
++ 			return SKB_NOT_DROPPED_YET;
++ 		hdr_len = skb_transport_offset(skb);
++ 	} else {
++ 		hdr_len = skb_inner_transport_offset(skb);
++ 	}
++ 	/* + transport layer */
++ 	if (likely(shinfo->gso_type & (SKB_GSO_TCPV4 | SKB_GSO_TCPV6))) {
++ 		const struct tcphdr *th;
++ 
++ 		if (!pskb_may_pull(skb, hdr_len + sizeof(struct tcphdr)))
++ 			return SKB_DROP_REASON_SKB_BAD_GSO;
++ 
++ 		th = (const struct tcphdr *)(skb->data + hdr_len);
++ 		tlen = __tcp_hdrlen(th);
++ 		if (tlen < sizeof(*th))
++ 			return SKB_DROP_REASON_SKB_BAD_GSO;
++ 		hdr_len += tlen;
++ 		if (!pskb_may_pull(skb, hdr_len))
++ 			return SKB_DROP_REASON_SKB_BAD_GSO;
++ 	} else if (shinfo->gso_type & SKB_GSO_UDP_L4) {
++ 		if (!pskb_may_pull(skb, hdr_len + sizeof(struct udphdr)))
++ 			return SKB_DROP_REASON_SKB_BAD_GSO;
++ 		hdr_len += sizeof(struct udphdr);
++ 	}
++ 
++ 	/* prior pskb_may_pull() might have changed skb->head. */
++ 	shinfo = skb_shinfo(skb);
++ 	if (unlikely(shinfo->gso_type & SKB_GSO_DODGY)) {
++ 		int payload = skb->len - hdr_len;
++ 
++ 		/* Malicious packet. */
++ 		if (payload <= 0)
++ 			return SKB_DROP_REASON_SKB_BAD_GSO;
++ 		gso_segs = DIV_ROUND_UP(payload, shinfo->gso_size);
++ 		shinfo->gso_segs = gso_segs;
++ 		qdisc_skb_cb(skb)->pkt_segs = gso_segs;
++ 	}
++ 	qdisc_skb_cb(skb)->pkt_len += (gso_segs - 1) * hdr_len;
++ 	return SKB_NOT_DROPPED_YET;
+++>>>>>>> 7fb4c1967011 (net: pull headers in qdisc_pkt_len_segs_init())
+  }
+  
+  static int dev_qdisc_enqueue(struct sk_buff *skb, struct Qdisc *q,
+@@@ -4285,15 -4765,24 +4347,21 @@@ static int __dev_queue_xmit(struct sk_b
+  {
+  	struct net_device *dev = skb->dev;
+  	struct netdev_queue *txq = NULL;
+ -	enum skb_drop_reason reason;
+ -	int cpu, rc = -ENOMEM;
+ -	bool again = false;
+  	struct Qdisc *q;
+ +	int rc = -ENOMEM;
+ +	bool again = false;
+  
+  	skb_reset_mac_header(skb);
+ -	skb_assert_len(skb);
+  
+ -	if (unlikely(skb_shinfo(skb)->tx_flags &
+ -		     (SKBTX_SCHED_TSTAMP | SKBTX_BPF)))
+ -		__skb_tstamp_tx(skb, NULL, NULL, skb->sk, SCM_TSTAMP_SCHED);
+ +	if (unlikely(skb_shinfo(skb)->tx_flags & SKBTX_SCHED_TSTAMP))
+ +		__skb_tstamp_tx(skb, NULL, skb->sk, SCM_TSTAMP_SCHED);
+  
++ 	reason = qdisc_pkt_len_segs_init(skb);
++ 	if (unlikely(reason)) {
++ 		dev_core_stats_tx_dropped_inc(dev);
++ 		kfree_skb_reason(skb, reason);
++ 		return -EINVAL;
++ 	}
+  	/* Disable soft irqs for various locks below. Also
+  	 * stops preemption for RCU.
+  	 */
+@@@ -4301,13 -4790,18 +4369,18 @@@
+  
+  	skb_update_prio(skb);
+  
+++<<<<<<< HEAD
+ +	qdisc_pkt_len_init(skb);
+ +#ifdef CONFIG_NET_CLS_ACT
+ +	skb->tc_at_ingress = 0;
+ +# ifdef CONFIG_NET_EGRESS
+++=======
++ 	tcx_set_ingress(skb, false);
++ #ifdef CONFIG_NET_EGRESS
+++>>>>>>> 7fb4c1967011 (net: pull headers in qdisc_pkt_len_segs_init())
+  	if (static_branch_unlikely(&egress_needed_key)) {
+ -		if (nf_hook_egress_active()) {
+ -			skb = nf_hook_egress(skb, &rc, dev);
+ -			if (!skb)
+ -				goto out;
+ -		}
+ -
+  		netdev_xmit_skip_txqueue(false);
+  
+ -		nf_skip_egress(skb, true);
+  		skb = sch_handle_egress(skb, &rc, dev);
+  		if (!skb)
+  			goto out;
+diff --git a/include/net/dropreason-core.h b/include/net/dropreason-core.h
+index 158331308873..70d5471269a8 100644
+--- a/include/net/dropreason-core.h
++++ b/include/net/dropreason-core.h
+@@ -55,6 +55,7 @@
+ 	FN(UNHANDLED_PROTO)		\
+ 	FN(SKB_CSUM)			\
+ 	FN(SKB_GSO_SEG)			\
++	FN(SKB_BAD_GSO)			\
+ 	FN(SKB_UCOPY_FAULT)		\
+ 	FN(DEV_HDR)			\
+ 	FN(DEV_READY)			\
+@@ -256,6 +257,8 @@ enum skb_drop_reason {
+ 	SKB_DROP_REASON_SKB_CSUM,
+ 	/** @SKB_DROP_REASON_SKB_GSO_SEG: gso segmentation error */
+ 	SKB_DROP_REASON_SKB_GSO_SEG,
++	/** @SKB_DROP_REASON_SKB_BAD_GSO: malicious gso packet. */
++	SKB_DROP_REASON_SKB_BAD_GSO,
+ 	/**
+ 	 * @SKB_DROP_REASON_SKB_UCOPY_FAULT: failed to copy data from user space,
+ 	 * e.g., via zerocopy_sg_from_iter() or skb_orphan_frags_rx()
+* Unmerged path net/core/dev.c
