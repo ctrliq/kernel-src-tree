@@ -15,6 +15,7 @@
 #include <linux/page_counter.h>
 #include <linux/parser.h>
 #include <linux/refcount.h>
+#include <linux/rculist.h>
 #include <linux/slab.h>
 
 struct dmem_cgroup_region {
