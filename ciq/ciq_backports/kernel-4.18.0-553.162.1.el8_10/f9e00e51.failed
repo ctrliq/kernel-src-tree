@@ -1,0 +1,257 @@
+net: use qdisc_pkt_len_segs_init() in sch_handle_ingress()
+
+jira KERNEL-1574
+cve CVE-2026-53091
+Rebuild_History Non-Buildable kernel-4.18.0-553.162.1.el8_10
+commit-author Eric Dumazet <edumazet@google.com>
+commit f9e00e51e391d08de31ca98d9f8609a1bceec2d2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.162.1.el8_10/f9e00e51.failed
+
+sch_handle_ingress() sets qdisc_skb_cb(skb)->pkt_len.
+
+We also need to initialize qdisc_skb_cb(skb)->pkt_segs.
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+Link: https://patch.msgid.link/20251121083256.674562-5-edumazet@google.com
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+
+(cherry picked from commit f9e00e51e391d08de31ca98d9f8609a1bceec2d2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/dev.c
+diff --cc net/core/dev.c
+index 58bffa5fd7f6,e19eb4e9d77c..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -4113,8 -4327,224 +4113,214 @@@ void netdev_xmit_skip_txqueue(bool skip
+  	__this_cpu_write(softnet_data.xmit.skip_txqueue, skip);
+  }
+  EXPORT_SYMBOL_GPL(netdev_xmit_skip_txqueue);
+ -
+ -#else
+ -static bool netdev_xmit_txqueue_skipped(void)
+ -{
+ -	return current->net_xmit.skip_txqueue;
+ -}
+ -
+ -void netdev_xmit_skip_txqueue(bool skip)
+ -{
+ -	current->net_xmit.skip_txqueue = skip;
+ -}
+ -EXPORT_SYMBOL_GPL(netdev_xmit_skip_txqueue);
+ -#endif
+  #endif /* CONFIG_NET_EGRESS */
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_NET_XGRESS
++ static int tc_run(struct tcx_entry *entry, struct sk_buff *skb,
++ 		  enum skb_drop_reason *drop_reason)
++ {
++ 	int ret = TC_ACT_UNSPEC;
++ #ifdef CONFIG_NET_CLS_ACT
++ 	struct mini_Qdisc *miniq = rcu_dereference_bh(entry->miniq);
++ 	struct tcf_result res;
++ 
++ 	if (!miniq)
++ 		return ret;
++ 
++ 	/* Global bypass */
++ 	if (!static_branch_likely(&tcf_sw_enabled_key))
++ 		return ret;
++ 
++ 	/* Block-wise bypass */
++ 	if (tcf_block_bypass_sw(miniq->block))
++ 		return ret;
++ 
++ 	tc_skb_cb(skb)->mru = 0;
++ 	qdisc_skb_cb(skb)->post_ct = false;
++ 	tcf_set_drop_reason(skb, *drop_reason);
++ 
++ 	mini_qdisc_bstats_cpu_update(miniq, skb);
++ 	ret = tcf_classify(skb, miniq->block, miniq->filter_list, &res, false);
++ 	/* Only tcf related quirks below. */
++ 	switch (ret) {
++ 	case TC_ACT_SHOT:
++ 		*drop_reason = tcf_get_drop_reason(skb);
++ 		mini_qdisc_qstats_cpu_drop(miniq);
++ 		break;
++ 	case TC_ACT_OK:
++ 	case TC_ACT_RECLASSIFY:
++ 		skb->tc_index = TC_H_MIN(res.classid);
++ 		break;
++ 	}
++ #endif /* CONFIG_NET_CLS_ACT */
++ 	return ret;
++ }
++ 
++ static DEFINE_STATIC_KEY_FALSE(tcx_needed_key);
++ 
++ void tcx_inc(void)
++ {
++ 	static_branch_inc(&tcx_needed_key);
++ }
++ 
++ void tcx_dec(void)
++ {
++ 	static_branch_dec(&tcx_needed_key);
++ }
++ 
++ static __always_inline enum tcx_action_base
++ tcx_run(const struct bpf_mprog_entry *entry, struct sk_buff *skb,
++ 	const bool needs_mac)
++ {
++ 	const struct bpf_mprog_fp *fp;
++ 	const struct bpf_prog *prog;
++ 	int ret = TCX_NEXT;
++ 
++ 	if (needs_mac)
++ 		__skb_push(skb, skb->mac_len);
++ 	bpf_mprog_foreach_prog(entry, fp, prog) {
++ 		bpf_compute_data_pointers(skb);
++ 		ret = bpf_prog_run(prog, skb);
++ 		if (ret != TCX_NEXT)
++ 			break;
++ 	}
++ 	if (needs_mac)
++ 		__skb_pull(skb, skb->mac_len);
++ 	return tcx_action_code(skb, ret);
++ }
++ 
++ static __always_inline struct sk_buff *
++ sch_handle_ingress(struct sk_buff *skb, struct packet_type **pt_prev, int *ret,
++ 		   struct net_device *orig_dev, bool *another)
++ {
++ 	struct bpf_mprog_entry *entry = rcu_dereference_bh(skb->dev->tcx_ingress);
++ 	enum skb_drop_reason drop_reason = SKB_DROP_REASON_TC_INGRESS;
++ 	struct bpf_net_context __bpf_net_ctx, *bpf_net_ctx;
++ 	int sch_ret;
++ 
++ 	if (!entry)
++ 		return skb;
++ 
++ 	bpf_net_ctx = bpf_net_ctx_set(&__bpf_net_ctx);
++ 	if (unlikely(*pt_prev)) {
++ 		*ret = deliver_skb(skb, *pt_prev, orig_dev);
++ 		*pt_prev = NULL;
++ 	}
++ 
++ 	qdisc_pkt_len_segs_init(skb);
++ 	tcx_set_ingress(skb, true);
++ 
++ 	if (static_branch_unlikely(&tcx_needed_key)) {
++ 		sch_ret = tcx_run(entry, skb, true);
++ 		if (sch_ret != TC_ACT_UNSPEC)
++ 			goto ingress_verdict;
++ 	}
++ 	sch_ret = tc_run(tcx_entry(entry), skb, &drop_reason);
++ ingress_verdict:
++ 	switch (sch_ret) {
++ 	case TC_ACT_REDIRECT:
++ 		/* skb_mac_header check was done by BPF, so we can safely
++ 		 * push the L2 header back before redirecting to another
++ 		 * netdev.
++ 		 */
++ 		__skb_push(skb, skb->mac_len);
++ 		if (skb_do_redirect(skb) == -EAGAIN) {
++ 			__skb_pull(skb, skb->mac_len);
++ 			*another = true;
++ 			break;
++ 		}
++ 		*ret = NET_RX_SUCCESS;
++ 		bpf_net_ctx_clear(bpf_net_ctx);
++ 		return NULL;
++ 	case TC_ACT_SHOT:
++ 		kfree_skb_reason(skb, drop_reason);
++ 		*ret = NET_RX_DROP;
++ 		bpf_net_ctx_clear(bpf_net_ctx);
++ 		return NULL;
++ 	/* used by tc_run */
++ 	case TC_ACT_STOLEN:
++ 	case TC_ACT_QUEUED:
++ 	case TC_ACT_TRAP:
++ 		consume_skb(skb);
++ 		fallthrough;
++ 	case TC_ACT_CONSUMED:
++ 		*ret = NET_RX_SUCCESS;
++ 		bpf_net_ctx_clear(bpf_net_ctx);
++ 		return NULL;
++ 	}
++ 	bpf_net_ctx_clear(bpf_net_ctx);
++ 
++ 	return skb;
++ }
++ 
++ static __always_inline struct sk_buff *
++ sch_handle_egress(struct sk_buff *skb, int *ret, struct net_device *dev)
++ {
++ 	struct bpf_mprog_entry *entry = rcu_dereference_bh(dev->tcx_egress);
++ 	enum skb_drop_reason drop_reason = SKB_DROP_REASON_TC_EGRESS;
++ 	struct bpf_net_context __bpf_net_ctx, *bpf_net_ctx;
++ 	int sch_ret;
++ 
++ 	if (!entry)
++ 		return skb;
++ 
++ 	bpf_net_ctx = bpf_net_ctx_set(&__bpf_net_ctx);
++ 
++ 	/* qdisc_skb_cb(skb)->pkt_len & tcx_set_ingress() was
++ 	 * already set by the caller.
++ 	 */
++ 	if (static_branch_unlikely(&tcx_needed_key)) {
++ 		sch_ret = tcx_run(entry, skb, false);
++ 		if (sch_ret != TC_ACT_UNSPEC)
++ 			goto egress_verdict;
++ 	}
++ 	sch_ret = tc_run(tcx_entry(entry), skb, &drop_reason);
++ egress_verdict:
++ 	switch (sch_ret) {
++ 	case TC_ACT_REDIRECT:
++ 		/* No need to push/pop skb's mac_header here on egress! */
++ 		skb_do_redirect(skb);
++ 		*ret = NET_XMIT_SUCCESS;
++ 		bpf_net_ctx_clear(bpf_net_ctx);
++ 		return NULL;
++ 	case TC_ACT_SHOT:
++ 		kfree_skb_reason(skb, drop_reason);
++ 		*ret = NET_XMIT_DROP;
++ 		bpf_net_ctx_clear(bpf_net_ctx);
++ 		return NULL;
++ 	/* used by tc_run */
++ 	case TC_ACT_STOLEN:
++ 	case TC_ACT_QUEUED:
++ 	case TC_ACT_TRAP:
++ 		consume_skb(skb);
++ 		fallthrough;
++ 	case TC_ACT_CONSUMED:
++ 		*ret = NET_XMIT_SUCCESS;
++ 		bpf_net_ctx_clear(bpf_net_ctx);
++ 		return NULL;
++ 	}
++ 	bpf_net_ctx_clear(bpf_net_ctx);
++ 
++ 	return skb;
++ }
++ #else
++ static __always_inline struct sk_buff *
++ sch_handle_ingress(struct sk_buff *skb, struct packet_type **pt_prev, int *ret,
++ 		   struct net_device *orig_dev, bool *another)
++ {
++ 	return skb;
++ }
++ 
++ static __always_inline struct sk_buff *
++ sch_handle_egress(struct sk_buff *skb, int *ret, struct net_device *dev)
++ {
++ 	return skb;
++ }
++ #endif /* CONFIG_NET_XGRESS */
++ 
+++>>>>>>> f9e00e51e391 (net: use qdisc_pkt_len_segs_init() in sch_handle_ingress())
+  #ifdef CONFIG_XPS
+  static int __get_xps_queue_idx(struct net_device *dev, struct sk_buff *skb,
+  			       struct xps_dev_maps *dev_maps, unsigned int tci)
+* Unmerged path net/core/dev.c
