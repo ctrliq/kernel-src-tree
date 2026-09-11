@@ -1283,6 +1283,12 @@ static inline int drbg_alloc_state(struct drbg_state *drbg)
 	if (ret < 0)
 		goto err;
 
+	/*
+	 * Align to at least a cache line for better performance. This also
+	 * prevents false sharing of cache lines between different instances.
+	 */
+	ret = max(ret, L1_CACHE_BYTES - 1);
+
 	drbg->Vbuf = kmalloc(drbg_statelen(drbg) + ret, GFP_KERNEL);
 	if (!drbg->Vbuf) {
 		ret = -ENOMEM;
