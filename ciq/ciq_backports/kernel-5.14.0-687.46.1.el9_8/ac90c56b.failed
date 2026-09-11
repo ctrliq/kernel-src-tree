@@ -1,0 +1,175 @@
+mm/ksm: refactor out try_to_merge_with_zero_page()
+
+jira KERNEL-1580
+Rebuild_History Non-Buildable kernel-5.14.0-687.46.1.el9_8
+commit-author Chengming Zhou <chengming.zhou@linux.dev>
+commit ac90c56bbd734addc9bfb4567f64f1c180c64f5d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.46.1.el9_8/ac90c56b.failed
+
+Patch series "mm/ksm: cmp_and_merge_page() optimizations and cleanup", v2.
+
+This series mainly optimizes cmp_and_merge_page() to have more efficient
+separate code flow for ksm page and non-ksm anon page.
+
+- ksm page: don't need to calculate the checksum obviously.
+- anon page: don't need to search stable tree if changing fast and try
+  to merge with zero page before searching ksm page on stable tree.
+
+Please see the patch-2 for details.
+
+Patch-3 is cleanup also a little optimization for the chain()/chain_prune
+interfaces, which made the stable_tree_search()/stable_tree_insert() over
+complex.
+
+I have done simple testing using "hackbench -g 1 -l 300000" (maybe I need
+to use a better workload) on my machine, have seen a little CPU usage
+decrease of ksmd and some improvements of cmp_and_merge_page() latency:
+
+We can see the latency of cmp_and_merge_page() when handling non-ksm anon
+pages has been improved.
+
+
+This patch (of 3):
+
+In preparation for later changes, refactor out a new function called
+try_to_merge_with_zero_page(), which tries to merge with zero page.
+
+Link: https://lkml.kernel.org/r/20240621-b4-ksm-scan-optimize-v2-0-1c328aa9e30b@linux.dev
+Link: https://lkml.kernel.org/r/20240621-b4-ksm-scan-optimize-v2-1-1c328aa9e30b@linux.dev
+	Signed-off-by: Chengming Zhou <chengming.zhou@linux.dev>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: David Hildenbrand <david@redhat.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Stefan Roesch <shr@devkernel.io>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit ac90c56bbd734addc9bfb4567f64f1c180c64f5d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hugetlb.c
+diff --cc mm/hugetlb.c
+index ea4eb484368f,9691624fcb79..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -2596,17 -2666,8 +2596,22 @@@ static int gather_surplus_pages(struct 
+  retry:
+  	spin_unlock_irq(&hugetlb_lock);
+  	for (i = 0; i < needed; i++) {
+++<<<<<<< HEAD
+ +		folio = NULL;
+ +
+ +		/* Prioritize current node */
+ +		if (node_isset(numa_mem_id(), alloc_nodemask))
+ +			folio = alloc_surplus_hugetlb_folio(h, htlb_alloc_mask(h),
+ +					numa_mem_id(), NULL);
+ +
+ +		if (!folio) {
+ +			for_each_node_mask(node, alloc_nodemask) {
+ +				if (node == numa_mem_id())
+ +					continue;
+++=======
++ 		for_each_node_mask(node, cpuset_current_mems_allowed) {
++ 			if (!mbind_nodemask || node_isset(node, *mbind_nodemask)) {
+++>>>>>>> ac90c56bbd73 (mm/ksm: refactor out try_to_merge_with_zero_page())
+  				folio = alloc_surplus_hugetlb_folio(h, htlb_alloc_mask(h),
+  						node, NULL);
+  				if (folio)
+* Unmerged path mm/hugetlb.c
+diff --git a/mm/ksm.c b/mm/ksm.c
+index 9c6cd936aea6..04c58931a9b0 100644
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@ -1344,6 +1344,44 @@ static int try_to_merge_one_page(struct vm_area_struct *vma,
+ 	return err;
+ }
+ 
++/*
++ * This function returns 0 if the pages were merged or if they are
++ * no longer merging candidates (e.g., VMA stale), -EFAULT otherwise.
++ */
++static int try_to_merge_with_zero_page(struct ksm_rmap_item *rmap_item,
++				       struct page *page)
++{
++	struct mm_struct *mm = rmap_item->mm;
++	int err = -EFAULT;
++
++	/*
++	 * Same checksum as an empty page. We attempt to merge it with the
++	 * appropriate zero page if the user enabled this via sysfs.
++	 */
++	if (ksm_use_zero_pages && (rmap_item->oldchecksum == zero_checksum)) {
++		struct vm_area_struct *vma;
++
++		mmap_read_lock(mm);
++		vma = find_mergeable_vma(mm, rmap_item->address);
++		if (vma) {
++			err = try_to_merge_one_page(vma, page,
++					ZERO_PAGE(rmap_item->address));
++			trace_ksm_merge_one_page(
++				page_to_pfn(ZERO_PAGE(rmap_item->address)),
++				rmap_item, mm, err);
++		} else {
++			/*
++			 * If the vma is out of date, we do not need to
++			 * continue.
++			 */
++			err = 0;
++		}
++		mmap_read_unlock(mm);
++	}
++
++	return err;
++}
++
+ /*
+  * try_to_merge_with_ksm_page - like try_to_merge_two_pages,
+  * but no new kernel page is allocated: kpage must already be a ksm page.
+@@ -2113,7 +2151,6 @@ static void stable_tree_append(struct ksm_rmap_item *rmap_item,
+  */
+ static void cmp_and_merge_page(struct page *page, struct ksm_rmap_item *rmap_item)
+ {
+-	struct mm_struct *mm = rmap_item->mm;
+ 	struct ksm_rmap_item *tree_rmap_item;
+ 	struct page *tree_page = NULL;
+ 	struct ksm_stable_node *stable_node;
+@@ -2182,36 +2219,9 @@ static void cmp_and_merge_page(struct page *page, struct ksm_rmap_item *rmap_ite
+ 		return;
+ 	}
+ 
+-	/*
+-	 * Same checksum as an empty page. We attempt to merge it with the
+-	 * appropriate zero page if the user enabled this via sysfs.
+-	 */
+-	if (ksm_use_zero_pages && (checksum == zero_checksum)) {
+-		struct vm_area_struct *vma;
++	if (!try_to_merge_with_zero_page(rmap_item, page))
++		return;
+ 
+-		mmap_read_lock(mm);
+-		vma = find_mergeable_vma(mm, rmap_item->address);
+-		if (vma) {
+-			err = try_to_merge_one_page(vma, page,
+-					ZERO_PAGE(rmap_item->address));
+-			trace_ksm_merge_one_page(
+-				page_to_pfn(ZERO_PAGE(rmap_item->address)),
+-				rmap_item, mm, err);
+-		} else {
+-			/*
+-			 * If the vma is out of date, we do not need to
+-			 * continue.
+-			 */
+-			err = 0;
+-		}
+-		mmap_read_unlock(mm);
+-		/*
+-		 * In case of failure, the page was not really empty, so we
+-		 * need to continue. Otherwise we're done.
+-		 */
+-		if (!err)
+-			return;
+-	}
+ 	tree_rmap_item =
+ 		unstable_tree_search_insert(rmap_item, page, &tree_page);
+ 	if (tree_rmap_item) {
