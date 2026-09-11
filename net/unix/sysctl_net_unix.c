@@ -8,8 +8,9 @@
 #include <linux/mm.h>
 #include <linux/slab.h>
 #include <linux/sysctl.h>
-
 #include <net/af_unix.h>
+
+#include "af_unix.h"
 
 static struct ctl_table unix_table[] = {
 	{
