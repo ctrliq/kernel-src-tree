@@ -165,5 +165,43 @@ void sha256(const u8 *data, unsigned int len, u8 *out)
 }
 EXPORT_SYMBOL(sha256);
 
+#if defined(CONFIG_CRYPTO_FIPS) && !defined(__DISABLE_EXPORTS)
+#include <linux/fips.h>
+#include <linux/init.h>
+
+static int __init sha256_mod_init(void)
+{
+	if (fips_enabled) {
+		/*
+		 * FIPS known answer test for SHA-256.
+		 * Input: NIST one-block message "abc".
+		 * Expected digest:
+		 *   ba7816bf 8f01cfea 414140de 5dae2223
+		 *   b00361a3 96177a9c b410ff61 f20015ad
+		 */
+		static const u8 fips_input[] __initconst = { 'a', 'b', 'c' };
+		static const u8 fips_digest[SHA256_DIGEST_SIZE] __initconst = {
+			0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
+			0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+			0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
+			0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad,
+		};
+		u8 out[SHA256_DIGEST_SIZE];
+
+		sha256(fips_input, sizeof(fips_input), out);
+
+		if (memcmp(out, fips_digest, sizeof(out)) != 0)
+			panic("sha256: FIPS self-test failed\n");
+	}
+	return 0;
+}
+subsys_initcall(sha256_mod_init);
+
+static void __exit sha256_mod_exit(void)
+{
+}
+module_exit(sha256_mod_exit);
+#endif
+
 MODULE_DESCRIPTION("SHA-256 Algorithm");
 MODULE_LICENSE("GPL");
