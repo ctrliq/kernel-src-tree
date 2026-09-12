@@ -21,6 +21,7 @@
 #include <linux/swap.h>
 #include <linux/splice.h>
 #include <linux/sched.h>
+#include <linux/seq_file.h>
 
 #define CREATE_TRACE_POINTS
 #include "fuse_trace.h"
@@ -1897,6 +1898,19 @@ static int fuse_notify_resend(struct fuse_conn *fc)
 	return 0;
 }
 
+/*
+ * Increments the fuse connection epoch.  This will result of dentries from
+ * previous epochs to be invalidated.
+ *
+ * XXX optimization: add call to shrink_dcache_sb()?
+ */
+static int fuse_notify_inc_epoch(struct fuse_conn *fc)
+{
+	atomic_inc(&fc->epoch);
+
+	return 0;
+}
+
 static int fuse_notify(struct fuse_conn *fc, enum fuse_notify_code code,
 		       unsigned int size, struct fuse_copy_state *cs)
 {
@@ -1924,6 +1938,9 @@ static int fuse_notify(struct fuse_conn *fc, enum fuse_notify_code code,
 
 	case FUSE_NOTIFY_RESEND:
 		return fuse_notify_resend(fc);
+
+	case FUSE_NOTIFY_INC_EPOCH:
+		return fuse_notify_inc_epoch(fc);
 
 	default:
 		fuse_copy_finish(cs);
@@ -1999,7 +2016,7 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
 	 */
 	if (!oh.unique) {
 		err = fuse_notify(fc, oh.error, nbytes - sizeof(oh), cs);
-		goto out;
+		goto copy_finish;
 	}
 
 	err = -EINVAL;
@@ -2463,6 +2480,17 @@ static long fuse_dev_ioctl(struct file *file, unsigned int cmd,
 	}
 }
 
+#ifdef CONFIG_PROC_FS
+static void fuse_dev_show_fdinfo(struct seq_file *seq, struct file *file)
+{
+	struct fuse_dev *fud = fuse_get_dev(file);
+	if (!fud)
+		return;
+
+	seq_printf(seq, "fuse_connection:\t%u\n", fud->fc->dev);
+}
+#endif
+
 const struct file_operations fuse_dev_operations = {
 	.owner		= THIS_MODULE,
 	.open		= fuse_dev_open,
@@ -2475,6 +2503,9 @@ const struct file_operations fuse_dev_operations = {
 	.fasync		= fuse_dev_fasync,
 	.unlocked_ioctl = fuse_dev_ioctl,
 	.compat_ioctl   = compat_ptr_ioctl,
+#ifdef CONFIG_PROC_FS
+	.show_fdinfo	= fuse_dev_show_fdinfo,
+#endif
 };
 EXPORT_SYMBOL_GPL(fuse_dev_operations);
 
