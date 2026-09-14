@@ -1314,8 +1314,8 @@ void debug_dma_mapping_error(struct device *dev, dma_addr_t dma_addr)
 }
 EXPORT_SYMBOL(debug_dma_mapping_error);
 
-void debug_dma_unmap_phys(struct device *dev, dma_addr_t dma_addr,
-			  size_t size, int direction)
+void debug_dma_unmap_phys(struct device *dev, dma_addr_t dma_addr, size_t size,
+			  int direction, unsigned long attrs)
 {
 	struct dma_debug_entry ref = {
 		.type           = dma_debug_phy,
@@ -1323,6 +1323,7 @@ void debug_dma_unmap_phys(struct device *dev, dma_addr_t dma_addr,
 		.dev_addr       = dma_addr,
 		.size           = size,
 		.direction      = direction,
+		.attrs          = attrs,
 	};
 
 	if (unlikely(dma_debug_disabled()))
@@ -1388,7 +1389,7 @@ static int get_nr_mapped_entries(struct device *dev,
 }
 
 void debug_dma_unmap_sg(struct device *dev, struct scatterlist *sglist,
-			int nelems, int dir)
+			int nelems, int dir, unsigned long attrs)
 {
 	struct scatterlist *s;
 	int mapped_ents = 0, i;
@@ -1406,6 +1407,7 @@ void debug_dma_unmap_sg(struct device *dev, struct scatterlist *sglist,
 			.size           = sg_dma_len(s),
 			.direction      = dir,
 			.sg_call_ents   = nelems,
+			.attrs          = attrs,
 		};
 
 		if (mapped_ents && i >= mapped_ents)
@@ -1461,8 +1463,8 @@ void debug_dma_alloc_coherent(struct device *dev, size_t size,
 	add_dma_entry(entry);
 }
 
-void debug_dma_free_coherent(struct device *dev, size_t size,
-			 void *virt, dma_addr_t dma_addr)
+void debug_dma_free_coherent(struct device *dev, size_t size, void *virt,
+			     dma_addr_t dma_addr, unsigned long attrs)
 {
 	struct dma_debug_entry ref = {
 		.type           = dma_debug_coherent,
@@ -1470,6 +1472,7 @@ void debug_dma_free_coherent(struct device *dev, size_t size,
 		.dev_addr       = dma_addr,
 		.size           = size,
 		.direction      = DMA_BIDIRECTIONAL,
+		.attrs          = attrs,
 	};
 
 	/* handle vmalloc and linear addresses */
