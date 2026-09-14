@@ -850,6 +850,7 @@ struct bpf_verifier_env {
 	struct bpf_scc_info **scc_info;
 	u32 scc_cnt;
 	struct bpf_iarray *succ;
+	struct bpf_iarray *gotox_tmp_buf;
 };
 
 static inline struct bpf_func_info_aux *subprog_aux(struct bpf_verifier_env *env, int subprog)
@@ -1058,6 +1059,13 @@ static inline bool bpf_stack_narrow_access_ok(int off, int fill_size, int spill_
 #endif
 
 	return !(off % BPF_REG_SIZE);
+}
+
+static inline bool insn_is_gotox(struct bpf_insn *insn)
+{
+	return BPF_CLASS(insn->code) == BPF_JMP &&
+	       BPF_OP(insn->code) == BPF_JA &&
+	       BPF_SRC(insn->code) == BPF_X;
 }
 
 const char *reg_type_str(struct bpf_verifier_env *env, enum bpf_reg_type type);
