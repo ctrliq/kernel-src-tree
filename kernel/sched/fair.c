@@ -8417,7 +8417,7 @@ static inline void set_idle_cores(int cpu, int val)
 {
 	struct sched_domain_shared *sds;
 
-	sds = rcu_dereference_all(per_cpu(sd_llc_shared, cpu));
+	sds = rcu_dereference_all(per_cpu(sd_balance_shared, cpu));
 	if (sds)
 		WRITE_ONCE(sds->has_idle_cores, val);
 }
@@ -8426,7 +8426,7 @@ static inline bool test_idle_cores(int cpu)
 {
 	struct sched_domain_shared *sds;
 
-	sds = rcu_dereference_all(per_cpu(sd_llc_shared, cpu));
+	sds = rcu_dereference_all(per_cpu(sd_balance_shared, cpu));
 	if (sds)
 		return READ_ONCE(sds->has_idle_cores);
 
@@ -8435,7 +8435,7 @@ static inline bool test_idle_cores(int cpu)
 
 /*
  * Scans the local SMT mask to see if the entire core is idle, and records this
- * information in sd_llc_shared->has_idle_cores.
+ * information in sd_balance_shared->has_idle_cores.
  *
  * Since SMT siblings share all cache levels, inspecting this limited remote
  * state should be fairly cheap.
@@ -8465,7 +8465,8 @@ unlock:
 /*
  * Scan the entire LLC domain for idle cores; this dynamically switches off if
  * there are no idle cores left in the system; tracked through
- * sd_llc->shared->has_idle_cores and enabled through update_idle_core() above.
+ * sd_balance_shared->has_idle_cores and enabled through update_idle_core()
+ * above.
  */
 static int select_idle_core(struct task_struct *p, int core, struct cpumask *cpus, int *idle_cpu)
 {
@@ -8551,7 +8552,7 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool 
 	struct cpumask *cpus = this_cpu_cpumask_var_ptr(select_rq_mask);
 	int i, cpu, idle_cpu = -1, nr = INT_MAX;
 
-	if (sched_feat(SIS_UTIL)) {
+	if (sched_feat(SIS_UTIL) && sd->shared) {
 		/*
 		 * Increment because !--nr is the condition to stop scan.
 		 *
@@ -14151,7 +14152,7 @@ static void nohz_balancer_kick(struct rq *rq)
 		goto out;
 	}
 
-	sds = rcu_dereference_all(per_cpu(sd_llc_shared, cpu));
+	sds = rcu_dereference_all(per_cpu(sd_balance_shared, cpu));
 	if (sds) {
 		/*
 		 * If there is an imbalance between LLC domains (IOW we could
@@ -14179,7 +14180,11 @@ static void set_cpu_sd_state_busy(int cpu)
 	struct sched_domain *sd;
 	sd = rcu_dereference_all(per_cpu(sd_llc, cpu));
 
-	if (!sd || !sd->nohz_idle)
+	/*
+	 * sd->nohz_idle only pairs with nr_busy_cpus on sd->shared; if this
+	 * domain has no shared object there is nothing to clear or account.
+	 */
+	if (!sd || !sd->shared || !sd->nohz_idle)
 		return;
 	sd->nohz_idle = 0;
 
@@ -14204,7 +14209,8 @@ static void set_cpu_sd_state_idle(int cpu)
 	struct sched_domain *sd;
 	sd = rcu_dereference_all(per_cpu(sd_llc, cpu));
 
-	if (!sd || sd->nohz_idle)
+	/* See set_cpu_sd_state_busy(): nohz_idle is only used with sd->shared. */
+	if (!sd || !sd->shared || sd->nohz_idle)
 		return;
 	sd->nohz_idle = 1;
 
