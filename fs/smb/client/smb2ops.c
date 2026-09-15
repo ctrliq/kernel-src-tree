@@ -4623,6 +4623,11 @@ smb3_free_compound_rqst(int num_rqst, struct smb_rqst *rqst)
 	int i, j;
 
 	for (i = 0; i < num_rqst; i++) {
+		if (rqst[i].rq_iov) {
+			for (j = 0; j < rqst[i].rq_nvec; j++)
+				kfree(rqst[i].rq_iov[j].iov_base);
+			kfree(rqst[i].rq_iov);
+		}
 		if (rqst[i].rq_pages) {
 			for (j = rqst[i].rq_npages - 1; j >= 0; j--)
 				put_page(rqst[i].rq_pages[j]);
@@ -4660,8 +4665,19 @@ smb3_init_transform_rq(struct TCP_Server_Info *server, int num_rqst,
 		struct smb_rqst *new = &new_rq[i];
 
 		orig_len += smb_rqst_len(server, old);
-		new->rq_iov = old->rq_iov;
 		new->rq_nvec = old->rq_nvec;
+		new->rq_iov = kcalloc(old->rq_nvec, sizeof(struct kvec),
+				      GFP_KERNEL);
+		if (!new->rq_iov)
+			goto err_free;
+		for (j = 0; j < old->rq_nvec; j++) {
+			new->rq_iov[j].iov_len = old->rq_iov[j].iov_len;
+			new->rq_iov[j].iov_base =
+				kmemdup(old->rq_iov[j].iov_base,
+					old->rq_iov[j].iov_len, GFP_KERNEL);
+			if (!new->rq_iov[j].iov_base)
+				goto err_free;
+		}
 
 		npages = old->rq_npages;
 		if (!npages)
