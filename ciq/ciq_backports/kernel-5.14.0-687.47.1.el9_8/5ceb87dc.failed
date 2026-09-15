@@ -1,0 +1,153 @@
+selftests: netfilter: nft_queue.sh: fix spurious timeout on debug kernel
+
+jira KERNEL-1590
+Rebuild_History Non-Buildable kernel-5.14.0-687.47.1.el9_8
+commit-author Florian Westphal <fw@strlen.de>
+commit 5ceb87dc76ab269c940541ad9487cf0f3c0c793d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.47.1.el9_8/5ceb87dc.failed
+
+The sctp selftest is very slow on debug kernels.
+
+Its possible that the nf_queue listener program exits due to timeout
+before first sctp packet is processed.
+
+In this case socat hangs until script times out.
+Fix this by removing the -t option where possible and kill the test
+program once the file transfer/socat has exited.
+
+-t sets SO_RCVTIMEO, its inteded for the 'ping' part of the selftest
+where we want to make sure that packets get reinjected properly without
+skipping a second queue request.
+
+While at it, add a helper to compare the (binary) files instead of diff.
+The 'diff' part was copied from a another sub-test that compares text.
+
+Let helper dump file sizes on error so we can see the progress made.
+
+Tested on an old 2010-ish box with a debug kernel and 100 iterations.
+
+This is a followup to the earlier filesize reduction change.
+
+	Reported-by: Jakub Kicinski <kuba@kernel.org>
+Closes: https://lore.kernel.org/netdev/20240829080109.GB30766@breakpoint.cc/
+Fixes: 0a8b08c554da ("selftests: netfilter: nft_queue.sh: reduce test file size for debug build")
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+Link: https://patch.msgid.link/20240830092254.8029-1-fw@strlen.de
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+
+(cherry picked from commit 5ceb87dc76ab269c940541ad9487cf0f3c0c793d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/net/netfilter/nft_queue.sh
+diff --cc tools/testing/selftests/net/netfilter/nft_queue.sh
+index 865a573d9ff1,d66e3c4dfec6..000000000000
+--- a/tools/testing/selftests/net/netfilter/nft_queue.sh
++++ b/tools/testing/selftests/net/netfilter/nft_queue.sh
+@@@ -373,10 -381,98 +379,101 @@@ EO
+  		done
+  	done
+  
+- 	wait "$nfqpid" && echo "PASS: icmp+nfqueue via vrf"
+- 	wait 2>/dev/null
++ 	kill "$nfqpid"
++ 	echo "PASS: icmp+nfqueue via vrf"
++ }
++ 
+++<<<<<<< HEAD
+++=======
++ sctp_listener_ready()
++ {
++ 	ss -S -N "$1" -ln -o "sport = :12345" | grep -q 12345
++ }
++ 
++ check_output_files()
++ {
++ 	local f1="$1"
++ 	local f2="$2"
++ 	local err="$3"
++ 
++ 	if ! cmp "$f1" "$f2" ; then
++ 		echo "FAIL: $err: input and output file differ" 1>&2
++ 		echo -n " Input file" 1>&2
++ 		ls -l "$f1" 1>&2
++ 		echo -n "Output file" 1>&2
++ 		ls -l "$f2" 1>&2
++ 		ret=1
++ 	fi
++ }
++ 
++ test_sctp_forward()
++ {
++ 	ip netns exec "$nsrouter" nft -f /dev/stdin <<EOF
++ flush ruleset
++ table inet sctpq {
++         chain forward {
++         type filter hook forward priority 0; policy accept;
++                 sctp dport 12345 queue num 10
++         }
++ }
++ EOF
++ 	timeout 60 ip netns exec "$ns2" socat -u SCTP-LISTEN:12345 STDOUT > "$TMPFILE1" &
++ 	local rpid=$!
++ 
++ 	busywait "$BUSYWAIT_TIMEOUT" sctp_listener_ready "$ns2"
++ 
++ 	ip netns exec "$nsrouter" ./nf_queue -q 10 -G &
++ 	local nfqpid=$!
++ 
++ 	ip netns exec "$ns1" socat -u STDIN SCTP:10.0.2.99:12345 <"$TMPINPUT" >/dev/null
++ 
++ 	if ! ip netns exec "$nsrouter" nft delete table inet sctpq; then
++ 		echo "FAIL:  Could not delete sctpq table"
++ 		exit 1
++ 	fi
++ 
++ 	wait "$rpid" && echo "PASS: sctp and nfqueue in forward chain"
++ 	kill "$nfqpid"
++ 
++ 	check_output_files "$TMPINPUT" "$TMPFILE1" "sctp forward"
++ }
++ 
++ test_sctp_output()
++ {
++         ip netns exec "$ns1" nft -f /dev/stdin <<EOF
++ table inet sctpq {
++         chain output {
++         type filter hook output priority 0; policy accept;
++                 sctp dport 12345 queue num 11
++         }
++ }
++ EOF
++ 	# reduce test file size, software segmentation causes sk wmem increase.
++ 	dd conv=sparse status=none if=/dev/zero bs=1M count=$((COUNT/2)) of="$TMPINPUT"
++ 
++ 	timeout 60 ip netns exec "$ns2" socat -u SCTP-LISTEN:12345 STDOUT > "$TMPFILE1" &
++ 	local rpid=$!
++ 
++ 	busywait "$BUSYWAIT_TIMEOUT" sctp_listener_ready "$ns2"
++ 
++ 	ip netns exec "$ns1" ./nf_queue -q 11 &
++ 	local nfqpid=$!
++ 
++ 	ip netns exec "$ns1" socat -u STDIN SCTP:10.0.2.99:12345 <"$TMPINPUT" >/dev/null
++ 
++ 	if ! ip netns exec "$ns1" nft delete table inet sctpq; then
++ 		echo "FAIL:  Could not delete sctpq table"
++ 		exit 1
++ 	fi
++ 
++ 	# must wait before checking completeness of output file.
++ 	wait "$rpid" && echo "PASS: sctp and nfqueue in output chain with GSO"
++ 	kill "$nfqpid"
++ 
++ 	check_output_files "$TMPINPUT" "$TMPFILE1" "sctp output"
+  }
+  
+++>>>>>>> 5ceb87dc76ab (selftests: netfilter: nft_queue.sh: fix spurious timeout on debug kernel)
+  test_queue_removal()
+  {
+  	read tainted_then < /proc/sys/kernel/tainted
+* Unmerged path tools/testing/selftests/net/netfilter/nft_queue.sh
