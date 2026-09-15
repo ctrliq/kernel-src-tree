@@ -38,6 +38,8 @@
 
 #define MPLS_NEIGH_TABLE_UNSPEC (NEIGH_LINK_TABLE + 1)
 
+static seqcount_t mpls_platform_label_seq = SEQCNT_ZERO(mpls_platform_label_seq);
+
 static int label_limit = (1 << 20) - 1;
 static int ttl_max = 255;
 
@@ -75,16 +77,32 @@ static void rtmsg_lfib(int event, u32 label, struct mpls_route *rt,
 		       struct nlmsghdr *nlh, struct net *net, u32 portid,
 		       unsigned int nlm_flags);
 
+static struct mpls_route __rcu **mpls_platform_label_rcu(struct net *net,
+							size_t *platform_labels)
+{
+	struct mpls_route __rcu **platform_label;
+	unsigned int sequence;
+
+	do {
+		sequence = read_seqcount_begin(&mpls_platform_label_seq);
+		platform_label = rcu_dereference_rtnl(net->mpls.platform_label);
+		*platform_labels = net->mpls.platform_labels;
+	} while (read_seqcount_retry(&mpls_platform_label_seq, sequence));
+
+	return platform_label;
+}
+
 static struct mpls_route *mpls_route_input_rcu(struct net *net, unsigned index)
 {
-	struct mpls_route *rt = NULL;
+	struct mpls_route __rcu **platform_label;
+	size_t platform_labels;
 
-	if (index < net->mpls.platform_labels) {
-		struct mpls_route __rcu **platform_label =
-			rcu_dereference(net->mpls.platform_label);
-		rt = rcu_dereference(platform_label[index]);
-	}
-	return rt;
+	platform_label = mpls_platform_label_rcu(net, &platform_labels);
+
+	if (index < platform_labels)
+		return rcu_dereference_rtnl(platform_label[index]);
+
+	return NULL;
 }
 
 bool mpls_output_possible(const struct net_device *dev)
@@ -2217,8 +2235,7 @@ static int mpls_dump_routes(struct sk_buff *skb, struct netlink_callback *cb)
 	if (index < MPLS_LABEL_FIRST_UNRESERVED)
 		index = MPLS_LABEL_FIRST_UNRESERVED;
 
-	platform_label = rtnl_dereference(net->mpls.platform_label);
-	platform_labels = net->mpls.platform_labels;
+	platform_label = mpls_platform_label_rcu(net, &platform_labels);
 
 	if (filter.filter_set)
 		flags |= NLM_F_DUMP_FILTERED;
@@ -2604,8 +2621,14 @@ static int resize_platform_label_table(struct net *net, size_t limit)
 	}
 
 	/* Update the global pointers */
+	local_bh_disable();
+	preempt_disable_nested();
+	write_seqcount_begin(&mpls_platform_label_seq);
 	net->mpls.platform_labels = limit;
 	rcu_assign_pointer(net->mpls.platform_label, labels);
+	write_seqcount_end(&mpls_platform_label_seq);
+	preempt_enable_nested();
+	local_bh_enable();
 
 	rtnl_unlock();
 
