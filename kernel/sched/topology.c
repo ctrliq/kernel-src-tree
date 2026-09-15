@@ -673,6 +673,7 @@ DEFINE_PER_CPU(struct sched_domain __rcu *, sd_llc);
 DEFINE_PER_CPU(int, sd_llc_size);
 DEFINE_PER_CPU(int, sd_llc_id) = -1;
 DEFINE_PER_CPU(int, sd_share_id);
+DEFINE_PER_CPU(struct sched_domain_shared __rcu *, sd_llc_shared);
 DEFINE_PER_CPU(struct sched_domain_shared __rcu *, sd_balance_shared);
 DEFINE_PER_CPU(struct sched_domain __rcu *, sd_numa);
 DEFINE_PER_CPU(struct sched_domain __rcu *, sd_asym_packing);
@@ -688,37 +689,19 @@ static void update_top_cache_domain(int cpu)
 	int id = cpu;
 	int size = 1;
 
-	sd = lowest_flag_domain(cpu, SD_ASYM_CPUCAPACITY_FULL);
-	/*
-	 * The shared object is attached to sd_asym_cpucapacity only when the
-	 * asym domain is non-overlapping (i.e., not built from SD_NUMA).
-	 * On overlapping (NUMA) asym domains we fall back to letting the
-	 * SD_SHARE_LLC path own the shared object, so sd->shared may be NULL
-	 * here.
-	 */
-	if (sd && sd->shared)
-		sds = sd->shared;
-
-	rcu_assign_pointer(per_cpu(sd_asym_cpucapacity, cpu), sd);
-
 	sd = highest_flag_domain(cpu, SD_SHARE_LLC);
 	if (sd) {
 		id = cpumask_first(sched_domain_span(sd));
 		size = cpumask_weight(sched_domain_span(sd));
 
-		/*
-		 * If sd_asym_cpucapacity didn't claim the shared object,
-		 * sd_llc must have one linked.
-		 */
-		if (!sds) {
-			WARN_ON_ONCE(!sd->shared);
-			sds = sd->shared;
-		}
+		/* If sd_llc exists, sd_llc_shared should exist too. */
+		WARN_ON_ONCE(!sd->shared);
+		sds = sd->shared;
 	}
 
 	rcu_assign_pointer(per_cpu(sd_llc, cpu), sd);
 	per_cpu(sd_llc_size, cpu) = size;
-	rcu_assign_pointer(per_cpu(sd_balance_shared, cpu), sds);
+	rcu_assign_pointer(per_cpu(sd_llc_shared, cpu), sds);
 
 	sd = lowest_flag_domain(cpu, SD_CLUSTER);
 	if (sd)
@@ -736,6 +719,20 @@ static void update_top_cache_domain(int cpu)
 
 	sd = highest_flag_domain(cpu, SD_ASYM_PACKING);
 	rcu_assign_pointer(per_cpu(sd_asym_packing, cpu), sd);
+
+	sd = lowest_flag_domain(cpu, SD_ASYM_CPUCAPACITY_FULL);
+	/*
+	 * The shared object is attached to sd_asym_cpucapacity only when the
+	 * asym domain is non-overlapping (i.e., not built from SD_NUMA).
+	 * On overlapping (NUMA) asym domains we fall back to letting the
+	 * SD_SHARE_LLC path own the shared object, so sd->shared may be NULL
+	 * here.
+	 */
+	if (sd && sd->shared)
+		sds = sd->shared;
+
+	rcu_assign_pointer(per_cpu(sd_asym_cpucapacity, cpu), sd);
+	rcu_assign_pointer(per_cpu(sd_balance_shared, cpu), sds);
 }
 
 /*
@@ -2867,61 +2864,6 @@ static bool topology_span_sane(const struct cpumask *cpu_map)
 	return true;
 }
 
-static int __sched_domains_alloc_llc_id(void)
-{
-	int lid, max;
-
-	lockdep_assert_held(&sched_domains_mutex);
-
-	lid = cpumask_first_zero(sched_domains_llc_id_allocmask);
-	/*
-	 * llc_id space should never grow larger than the
-	 * possible number of CPUs in the system.
-	 */
-	if (lid >= nr_cpu_ids)
-		return -1;
-
-	__cpumask_set_cpu(lid, sched_domains_llc_id_allocmask);
-	max = cpumask_last(sched_domains_llc_id_allocmask);
-	if (max > max_lid)
-		max_lid = max;
-
-	return lid;
-}
-
-static void __sched_domains_free_llc_id(int cpu)
-{
-	int i, lid, max;
-
-	lockdep_assert_held(&sched_domains_mutex);
-
-	lid = per_cpu(sd_llc_id, cpu);
-	if (lid == -1 || lid >= nr_cpu_ids)
-		return;
-
-	per_cpu(sd_llc_id, cpu) = -1;
-
-	for_each_cpu(i, llc_mask(cpu)) {
-		/* An online CPU owns the llc_id. */
-		if (per_cpu(sd_llc_id, i) == lid)
-			return;
-	}
-
-	__cpumask_clear_cpu(lid, sched_domains_llc_id_allocmask);
-
-	max = cpumask_last(sched_domains_llc_id_allocmask);
-	/* shrink max lid to save memory */
-	if (max < max_lid)
-		max_lid = max;
-}
-
-void sched_domains_free_llc_id(int cpu)
-{
-	sched_domains_mutex_lock();
-	__sched_domains_free_llc_id(cpu);
-	sched_domains_mutex_unlock();
-}
-
 /*
  * Calculate an allowed NUMA imbalance such that LLCs do not get
  * imbalanced.
@@ -3038,6 +2980,61 @@ static bool claim_asym_sched_domain_shared(struct s_data *d, int cpu)
 	return true;
 }
 
+static int __sched_domains_alloc_llc_id(void)
+{
+	int lid, max;
+
+	lockdep_assert_held(&sched_domains_mutex);
+
+	lid = cpumask_first_zero(sched_domains_llc_id_allocmask);
+	/*
+	 * llc_id space should never grow larger than the
+	 * possible number of CPUs in the system.
+	 */
+	if (lid >= nr_cpu_ids)
+		return -1;
+
+	__cpumask_set_cpu(lid, sched_domains_llc_id_allocmask);
+	max = cpumask_last(sched_domains_llc_id_allocmask);
+	if (max > max_lid)
+		max_lid = max;
+
+	return lid;
+}
+
+static void __sched_domains_free_llc_id(int cpu)
+{
+	int i, lid, max;
+
+	lockdep_assert_held(&sched_domains_mutex);
+
+	lid = per_cpu(sd_llc_id, cpu);
+	if (lid == -1 || lid >= nr_cpu_ids)
+		return;
+
+	per_cpu(sd_llc_id, cpu) = -1;
+
+	for_each_cpu(i, llc_mask(cpu)) {
+		/* An online CPU owns the llc_id. */
+		if (per_cpu(sd_llc_id, i) == lid)
+			return;
+	}
+
+	__cpumask_clear_cpu(lid, sched_domains_llc_id_allocmask);
+
+	max = cpumask_last(sched_domains_llc_id_allocmask);
+	/* shrink max lid to save memory */
+	if (max < max_lid)
+		max_lid = max;
+}
+
+void sched_domains_free_llc_id(int cpu)
+{
+	sched_domains_mutex_lock();
+	__sched_domains_free_llc_id(cpu);
+	sched_domains_mutex_unlock();
+}
+
 /*
  * Build sched domains for a given set of CPUs and attach the sched domains
  * to the individual CPUs
@@ -3122,26 +3119,19 @@ build_sched_domains(const struct cpumask *cpu_map, struct sched_domain_attr *att
 	}
 
 	for_each_cpu(i, cpu_map) {
-		bool asym_claimed = false;
-
 		sd = *per_cpu_ptr(d.sd, i);
 		if (!sd)
 			continue;
 
 		if (has_asym)
-			asym_claimed = claim_asym_sched_domain_shared(&d, i);
+			claim_asym_sched_domain_shared(&d, i);
 
 		/* First, find the topmost SD_SHARE_LLC domain */
 		while (sd->parent && (sd->parent->flags & SD_SHARE_LLC))
 			sd = sd->parent;
 
 		if (sd->flags & SD_SHARE_LLC) {
-			/*
-			 * Initialize the sd->shared for SD_SHARE_LLC unless
-			 * the asym path above already claimed it.
-			 */
-			if (!asym_claimed)
-				init_sched_domain_shared(&d, sd);
+			init_sched_domain_shared(&d, sd);
 
 			/*
 			 * In presence of higher domains, adjust the
