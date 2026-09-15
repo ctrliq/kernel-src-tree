@@ -22,7 +22,6 @@ struct nf_queue_entry {
 #endif
 	struct nf_hook_state	state;
 	u16			size; /* sizeof(entry) + saved route keys */
-	u16			queue_num;
 
 	/* extra space to store route keys */
 };
