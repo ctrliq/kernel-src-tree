@@ -37,20 +37,16 @@
 #include <linux/mm.h>
 #include <linux/mutex.h>
 #include <linux/of_irq.h>
-#include <linux/platform_device.h>
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
 #include <linux/smp.h>
 #include <linux/uuid.h>
 #include <linux/xarray.h>
 
-#include <asm/virt.h>
-
 #include "common.h"
 
 #define FFA_DRIVER_VERSION	FFA_VERSION_1_2
 #define FFA_MIN_VERSION		FFA_VERSION_1_0
-#define FFA_PLATFORM_NAME	"arm-ffa"
 
 #define SENDER_ID_MASK		GENMASK(31, 16)
 #define RECEIVER_ID_MASK	GENMASK(15, 0)
@@ -122,7 +118,6 @@ struct ffa_drv_info {
 };
 
 static struct ffa_drv_info *drv_info;
-static struct platform_device *ffa_pdev;
 
 /*
  * The driver must be able to support all the versions from the earliest
@@ -1757,7 +1752,7 @@ static int ffa_setup_host_partition(int vm_id)
 	int ret;
 
 	buf.id = vm_id;
-	ffa_dev = ffa_device_register(&buf, &ffa_drv_ops, &ffa_pdev->dev);
+	ffa_dev = ffa_device_register(&buf, &ffa_drv_ops);
 	if (!ffa_dev) {
 		pr_err("%s: failed to register host partition ID 0x%x\n",
 		       __func__, vm_id);
@@ -1832,8 +1827,7 @@ static int ffa_setup_partitions(void)
 		 * provides UUID here for each partition as part of the
 		 * discovery API and the same is passed.
 		 */
-		ffa_dev = ffa_device_register(tpbuf, &ffa_drv_ops,
-					      &ffa_pdev->dev);
+		ffa_dev = ffa_device_register(tpbuf, &ffa_drv_ops);
 		if (!ffa_dev) {
 			pr_err("%s: failed to register partition ID 0x%x\n",
 			       __func__, tpbuf->id);
@@ -2109,15 +2103,11 @@ cleanup:
 	ffa_notifications_cleanup();
 }
 
-static int ffa_probe(struct platform_device *pdev)
+static int __init ffa_init(void)
 {
 	int ret;
 	u32 buf_sz;
 	size_t rxtx_min_bufsz = SZ_4K, rxtx_max_bufsz = 0, rxtx_bufsz;
-
-	if (IS_BUILTIN(CONFIG_ARM_FFA_TRANSPORT) &&
-	    is_protected_kvm_enabled() && !is_pkvm_initialized())
-		return -EPROBE_DEFER;
 
 	ret = ffa_transport_init(&invoke_ffa_fn);
 	if (ret)
@@ -2126,7 +2116,6 @@ static int ffa_probe(struct platform_device *pdev)
 	drv_info = kzalloc(sizeof(*drv_info), GFP_KERNEL);
 	if (!drv_info)
 		return -ENOMEM;
-	platform_set_drvdata(pdev, drv_info);
 
 	ret = ffa_version_check(&drv_info->version);
 	if (ret) {
@@ -2202,56 +2191,19 @@ free_pages:
 		free_pages_exact(drv_info->tx_buffer, rxtx_bufsz);
 	free_pages_exact(drv_info->rx_buffer, rxtx_bufsz);
 free_drv_info:
-	platform_set_drvdata(pdev, NULL);
 	kfree(drv_info);
-	drv_info = NULL;
 	return ret;
 }
-
-static void ffa_remove(struct platform_device *pdev)
-{
-	struct ffa_drv_info *info = platform_get_drvdata(pdev);
-
-	ffa_notifications_cleanup();
-	ffa_partitions_cleanup();
-	ffa_rxtx_unmap();
-	free_pages_exact(info->tx_buffer, info->rxtx_bufsz);
-	free_pages_exact(info->rx_buffer, info->rxtx_bufsz);
-	kfree(info);
-	platform_set_drvdata(pdev, NULL);
-	drv_info = NULL;
-}
-
-static struct platform_driver ffa_driver = {
-	.probe = ffa_probe,
-	.remove = ffa_remove,
-	.driver = {
-		.name = FFA_PLATFORM_NAME,
-	},
-};
-
-static int __init ffa_init(void)
-{
-	int ret;
-
-	ffa_pdev = platform_device_register_simple(FFA_PLATFORM_NAME,
-						   PLATFORM_DEVID_NONE,
-						   NULL, 0);
-	if (IS_ERR(ffa_pdev))
-		return PTR_ERR(ffa_pdev);
-
-	ret = platform_driver_register(&ffa_driver);
-	if (ret)
-		platform_device_unregister(ffa_pdev);
-
-	return ret;
-}
-module_init(ffa_init);
+rootfs_initcall(ffa_init);
 
 static void __exit ffa_exit(void)
 {
-	platform_device_unregister(ffa_pdev);
-	platform_driver_unregister(&ffa_driver);
+	ffa_notifications_cleanup();
+	ffa_partitions_cleanup();
+	ffa_rxtx_unmap();
+	free_pages_exact(drv_info->tx_buffer, drv_info->rxtx_bufsz);
+	free_pages_exact(drv_info->rx_buffer, drv_info->rxtx_bufsz);
+	kfree(drv_info);
 }
 module_exit(ffa_exit);
 
