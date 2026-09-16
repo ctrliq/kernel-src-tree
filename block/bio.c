@@ -1398,8 +1398,25 @@ int bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter,
 	if (iov_iter_extract_will_pin(iter))
 		bio_set_flag(bio, BIO_PAGE_PINNED);
 	do {
-		unsigned long start = (unsigned long)iter_iov_addr(iter);
-		if ((start | iter_iov_len(iter)) & mem_align_mask) {
+		/*
+		 * DMA engines typically have both memory address and length alignment
+		 * requirements, so check these against the alignment mask.  For UBUF,
+		 * IOVEC and KVEC, only the current segment will be extracted from; for
+		 * everything else we might extract from multiple segments, so we need
+		 * to check those too.
+		 */
+		if (likely(iter_is_ubuf(iter) ||
+			   iter_is_iovec(iter) ||
+			   iov_iter_is_kvec(iter))) {
+			unsigned long start = (unsigned long)iter_iov_addr(iter);
+
+			if ((start | iter_iov_len(iter)) & mem_align_mask)
+				ret = -EINVAL;
+		} else if (iov_iter_alignment(iter) & mem_align_mask) {
+			ret = -EINVAL;
+		}
+
+		if (ret == -EINVAL) {
 			/*
 			 * A misaligned vector fails the whole I/O.  Release any
 			 * pages pinned by earlier iterations before returning
@@ -1408,7 +1425,6 @@ int bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter,
 			bio_release_pages(bio, false);
 			bio_clear_flag(bio, BIO_PAGE_PINNED);
 			bio->bi_vcnt = 0;
-			ret = -EINVAL;
 		} else {
 			ret = __bio_iov_iter_get_pages(bio, iter);
 		}
