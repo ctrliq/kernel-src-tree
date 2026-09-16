@@ -4023,8 +4023,8 @@ out:
 	else
 		fprintf(stderr, "[ perf sched stats: Failed !! ]\n");
 
+	perf_session__delete(session);
 	evlist__delete(evlist);
-	close(fd);
 	return err;
 }
 
