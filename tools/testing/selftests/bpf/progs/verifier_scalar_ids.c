@@ -372,13 +372,15 @@ __naked void precision_two_ids(void)
 SEC("socket")
 __success __log_level(2)
 __flag(BPF_F_TEST_STATE_FREQ)
-/* check that r0 and r6 have different IDs after 'if',
- * collect_linked_regs() can't tie more than 6 registers for a single insn.
+/*
+ * check that r6 is unlinked after 'if', collect_linked_regs() can't tie
+ * more than 6 registers for a single insn and the register compared by
+ * the jump is not exempt from that.
  */
-__msg("8: (25) if r0 > 0x7 goto pc+0         ; R0=scalar(id=1")
+__msg("8: (25) if r6 > 0x7 goto pc+0         ; R6=scalar(smin=")
 __msg("14: (bf) r6 = r6                      ; R6=scalar(id=2")
 /* check that r{0-5} are marked precise after 'if' */
-__msg("frame0: regs=r0 stack= before 8: (25) if r0 > 0x7 goto pc+0")
+__msg("frame0: regs=r0 stack= before 8: (25) if r6 > 0x7 goto pc+0")
 __msg("frame0: parent state regs=r0,r1,r2,r3,r4,r5 stack=:")
 __naked void linked_regs_too_many_regs(void)
 {
@@ -393,8 +395,8 @@ __naked void linked_regs_too_many_regs(void)
 	"r4 = r0;"
 	"r5 = r0;"
 	"r6 = r0;"
-	/* propagate range for r{0-6} */
-	"if r0 > 7 goto +0;"
+	/* r{0-5} fill the record, r6 does not fit and is unlinked */
+	"if r6 > 7 goto +0;"
 	/* keep r{1-5} live */
 	"r1 = r1;"
 	"r2 = r2;"
