@@ -12,6 +12,7 @@
 #include <linux/bits.h>
 #include <linux/ktime.h>
 #include <linux/bitmap.h>
+#include <linux/mnt_idmapping.h>
 
 #include "super.h"
 #include "mds_client.h"
@@ -1116,6 +1117,8 @@ void ceph_mdsc_release_request(struct kref *kref)
 	kfree(req->r_path1);
 	kfree(req->r_path2);
 	put_cred(req->r_cred);
+	if (req->r_mnt_idmap)
+		mnt_idmap_put(req->r_mnt_idmap);
 	if (req->r_pagelist)
 		ceph_pagelist_release(req->r_pagelist);
 	kfree(req->r_fscrypt_auth);
@@ -1174,6 +1177,8 @@ static void __register_request(struct ceph_mds_client *mdsc,
 	insert_request(&mdsc->request_tree, req);
 
 	req->r_cred = get_current_cred();
+	if (!req->r_mnt_idmap)
+		req->r_mnt_idmap = &nop_mnt_idmap;
 
 	if (mdsc->oldest_tid == 0 && req->r_op != CEPH_MDS_OP_SETFILELOCK)
 		mdsc->oldest_tid = req->r_tid;
@@ -2904,6 +2909,29 @@ static void encode_mclientrequest_tail(void **p,
 	}
 }
 
+static inline u16 mds_supported_head_version(struct ceph_mds_session *session)
+{
+	if (!test_bit(CEPHFS_FEATURE_32BITS_RETRY_FWD, &session->s_features))
+		return 1;
+
+	if (!test_bit(CEPHFS_FEATURE_HAS_OWNER_UIDGID, &session->s_features))
+		return 2;
+
+	return CEPH_MDS_REQUEST_HEAD_VERSION;
+}
+
+static struct ceph_mds_request_head_legacy *
+find_legacy_request_head(void *p, u64 features)
+{
+	bool legacy = !(features & CEPH_FEATURE_FS_BTIME);
+	struct ceph_mds_request_head_old *ohead;
+
+	if (legacy)
+		return (struct ceph_mds_request_head_legacy *)p;
+	ohead = (struct ceph_mds_request_head_old *)p;
+	return (struct ceph_mds_request_head_legacy *)&ohead->oldest_client_tid;
+}
+
 /*
  * called under mdsc->mutex
  */
@@ -2913,8 +2941,9 @@ static struct ceph_msg *create_request_message(struct ceph_mds_session *session,
 {
 	int mds = session->s_mds;
 	struct ceph_mds_client *mdsc = session->s_mdsc;
+	struct ceph_client *cl = mdsc->fsc->client;
 	struct ceph_msg *msg;
-	struct ceph_mds_request_head_old *head;
+	struct ceph_mds_request_head_legacy *lhead;
 	struct ceph_path_info path_info1 = {0};
 	struct ceph_path_info path_info2 = {0};
 	struct dentry *old_dentry = NULL;
@@ -2923,6 +2952,9 @@ static struct ceph_msg *create_request_message(struct ceph_mds_session *session,
 	void *p, *end;
 	int ret;
 	bool legacy = !(session->s_con.peer_features & CEPH_FEATURE_FS_BTIME);
+	u16 request_head_version = mds_supported_head_version(session);
+	kuid_t caller_fsuid = req->r_cred->fsuid;
+	kgid_t caller_fsgid = req->r_cred->fsgid;
 	bool parent_locked = test_bit(CEPH_MDS_R_PARENT_LOCKED, &req->r_req_flags);
 
 	ret = set_request_path_attr(req->r_inode, req->r_dentry,
@@ -2978,7 +3010,21 @@ static struct ceph_msg *create_request_message(struct ceph_mds_session *session,
 		goto out_free2;
 	}
 
-	len = legacy ? sizeof(*head) : sizeof(struct ceph_mds_request_head);
+	/*
+	 * For old cephs without supporting the 32bit retry/fwd feature
+	 * it will copy the raw memories directly when decoding the
+	 * requests. While new cephs will decode the head depending the
+	 * version member, so we need to make sure it will be compatible
+	 * with them both.
+	 */
+	if (legacy)
+		len = sizeof(struct ceph_mds_request_head_legacy);
+	else if (request_head_version == 1)
+		len = sizeof(struct ceph_mds_request_head_old);
+	else if (request_head_version == 2)
+		len = offsetofend(struct ceph_mds_request_head, ext_num_fwd);
+	else
+		len = sizeof(struct ceph_mds_request_head);
 
 	/* filepaths */
 	len += 2 * (1 + sizeof(u32) + sizeof(u64));
@@ -3023,33 +3069,87 @@ static struct ceph_msg *create_request_message(struct ceph_mds_session *session,
 
 	msg->hdr.tid = cpu_to_le64(req->r_tid);
 
+	lhead = find_legacy_request_head(msg->front.iov_base,
+					 session->s_con.peer_features);
+
+	if ((req->r_mnt_idmap != &nop_mnt_idmap) &&
+	    !test_bit(CEPHFS_FEATURE_HAS_OWNER_UIDGID, &session->s_features)) {
+		WARN_ON_ONCE(!IS_CEPH_MDS_OP_NEWINODE(req->r_op));
+
+		if (enable_unsafe_idmap) {
+			pr_warn_once_client(cl,
+				"idmapped mount is used and CEPHFS_FEATURE_HAS_OWNER_UIDGID"
+				" is not supported by MDS. UID/GID-based restrictions may"
+				" not work properly.\n");
+
+			caller_fsuid = from_vfsuid(req->r_mnt_idmap, &init_user_ns,
+						   VFSUIDT_INIT(req->r_cred->fsuid));
+			caller_fsgid = from_vfsgid(req->r_mnt_idmap, &init_user_ns,
+						   VFSGIDT_INIT(req->r_cred->fsgid));
+		} else {
+			pr_err_ratelimited_client(cl,
+				"idmapped mount is used and CEPHFS_FEATURE_HAS_OWNER_UIDGID"
+				" is not supported by MDS. Fail request with -EIO.\n");
+
+			ret = -EIO;
+			goto out_err;
+		}
+	}
+
 	/*
-	 * The old ceph_mds_request_head didn't contain a version field, and
+	 * The ceph_mds_request_head_legacy didn't contain a version field, and
 	 * one was added when we moved the message version from 3->4.
 	 */
 	if (legacy) {
 		msg->hdr.version = cpu_to_le16(3);
-		head = msg->front.iov_base;
-		p = msg->front.iov_base + sizeof(*head);
-	} else {
-		struct ceph_mds_request_head *new_head = msg->front.iov_base;
+		p = msg->front.iov_base + sizeof(*lhead);
+	} else if (request_head_version == 1) {
+		struct ceph_mds_request_head_old *ohead = msg->front.iov_base;
+
+		msg->hdr.version = cpu_to_le16(4);
+		ohead->version = cpu_to_le16(1);
+		p = msg->front.iov_base + sizeof(*ohead);
+	} else if (request_head_version == 2) {
+		struct ceph_mds_request_head *nhead = msg->front.iov_base;
 
 		msg->hdr.version = cpu_to_le16(6);
-		new_head->version = cpu_to_le16(CEPH_MDS_REQUEST_HEAD_VERSION);
-		head = (struct ceph_mds_request_head_old *)&new_head->oldest_client_tid;
-		p = msg->front.iov_base + sizeof(*new_head);
+		nhead->version = cpu_to_le16(2);
+
+		p = msg->front.iov_base + offsetofend(struct ceph_mds_request_head, ext_num_fwd);
+	} else {
+		struct ceph_mds_request_head *nhead = msg->front.iov_base;
+		kuid_t owner_fsuid;
+		kgid_t owner_fsgid;
+
+		msg->hdr.version = cpu_to_le16(6);
+		nhead->version = cpu_to_le16(CEPH_MDS_REQUEST_HEAD_VERSION);
+		nhead->struct_len = cpu_to_le32(sizeof(struct ceph_mds_request_head));
+
+		if (IS_CEPH_MDS_OP_NEWINODE(req->r_op)) {
+			owner_fsuid = from_vfsuid(req->r_mnt_idmap, &init_user_ns,
+						VFSUIDT_INIT(req->r_cred->fsuid));
+			owner_fsgid = from_vfsgid(req->r_mnt_idmap, &init_user_ns,
+						VFSGIDT_INIT(req->r_cred->fsgid));
+			nhead->owner_uid = cpu_to_le32(from_kuid(&init_user_ns, owner_fsuid));
+			nhead->owner_gid = cpu_to_le32(from_kgid(&init_user_ns, owner_fsgid));
+		} else {
+			nhead->owner_uid = cpu_to_le32(-1);
+			nhead->owner_gid = cpu_to_le32(-1);
+		}
+
+		p = msg->front.iov_base + sizeof(*nhead);
 	}
 
 	end = msg->front.iov_base + msg->front.iov_len;
 
-	head->mdsmap_epoch = cpu_to_le32(mdsc->mdsmap->m_epoch);
-	head->op = cpu_to_le32(req->r_op);
-	head->caller_uid = cpu_to_le32(from_kuid(&init_user_ns,
-						 req->r_cred->fsuid));
-	head->caller_gid = cpu_to_le32(from_kgid(&init_user_ns,
-						 req->r_cred->fsgid));
-	head->ino = cpu_to_le64(req->r_deleg_ino);
-	head->args = req->r_args;
+	lhead->mdsmap_epoch = cpu_to_le32(mdsc->mdsmap->m_epoch);
+	lhead->op = cpu_to_le32(req->r_op);
+	lhead->caller_uid = cpu_to_le32(from_kuid(&init_user_ns,
+						  caller_fsuid));
+	lhead->caller_gid = cpu_to_le32(from_kgid(&init_user_ns,
+						  caller_fsgid));
+	lhead->ino = cpu_to_le64(req->r_deleg_ino);
+	lhead->args = req->r_args;
 
 	ceph_encode_filepath(&p, end, path_info1.vino.ino, path_info1.path);
 	ceph_encode_filepath(&p, end, path_info2.vino.ino, path_info2.path);
@@ -3091,7 +3191,7 @@ static struct ceph_msg *create_request_message(struct ceph_mds_session *session,
 		p = msg->front.iov_base + req->r_request_release_offset;
 	}
 
-	head->num_releases = cpu_to_le16(releases);
+	lhead->num_releases = cpu_to_le16(releases);
 
 	encode_mclientrequest_tail(&p, req);
 
@@ -3140,18 +3240,6 @@ static void complete_request(struct ceph_mds_client *mdsc,
 	complete_all(&req->r_completion);
 }
 
-static struct ceph_mds_request_head_old *
-find_old_request_head(void *p, u64 features)
-{
-	bool legacy = !(features & CEPH_FEATURE_FS_BTIME);
-	struct ceph_mds_request_head *new_head;
-
-	if (legacy)
-		return (struct ceph_mds_request_head_old *)p;
-	new_head = (struct ceph_mds_request_head *)p;
-	return (struct ceph_mds_request_head_old *)&new_head->oldest_client_tid;
-}
-
 /*
  * called under mdsc->mutex
  */
@@ -3161,29 +3249,28 @@ static int __prepare_send_request(struct ceph_mds_session *session,
 {
 	int mds = session->s_mds;
 	struct ceph_mds_client *mdsc = session->s_mdsc;
-	struct ceph_mds_request_head_old *rhead;
+	struct ceph_mds_request_head_legacy *lhead;
+	struct ceph_mds_request_head *nhead;
 	struct ceph_msg *msg;
-	int flags = 0, max_retry;
+	int flags = 0, old_max_retry;
+	bool old_version = !test_bit(CEPHFS_FEATURE_32BITS_RETRY_FWD,
+				     &session->s_features);
 
 	/*
-	 * The type of 'r_attempts' in kernel 'ceph_mds_request'
-	 * is 'int', while in 'ceph_mds_request_head' the type of
-	 * 'num_retry' is '__u8'. So in case the request retries
-	 *  exceeding 256 times, the MDS will receive a incorrect
-	 *  retry seq.
-	 *
-	 * In this case it's ususally a bug in MDS and continue
-	 * retrying the request makes no sense.
-	 *
-	 * In future this could be fixed in ceph code, so avoid
-	 * using the hardcode here.
+	 * Avoid inifinite retrying after overflow. The client will
+	 * increase the retry count and if the MDS is old version,
+	 * so we limit to retry at most 256 times.
 	 */
-	max_retry = sizeof_field(struct ceph_mds_request_head, num_retry);
-	max_retry = 1 << (max_retry * BITS_PER_BYTE);
-	if (req->r_attempts >= max_retry) {
-		pr_warn_ratelimited("%s request tid %llu seq overflow\n",
-				    __func__, req->r_tid);
-		return -EMULTIHOP;
+	if (req->r_attempts) {
+	       old_max_retry = sizeof_field(struct ceph_mds_request_head_old,
+					    num_retry);
+	       old_max_retry = 1 << (old_max_retry * BITS_PER_BYTE);
+	       if ((old_version && req->r_attempts >= old_max_retry) ||
+		   ((uint32_t)req->r_attempts >= U32_MAX)) {
+			pr_warn_ratelimited("%s request tid %llu seq overflow\n",
+					    __func__, req->r_tid);
+			return -EMULTIHOP;
+	       }
 	}
 
 	req->r_attempts++;
@@ -3209,20 +3296,24 @@ static int __prepare_send_request(struct ceph_mds_session *session,
 		 * d_move mangles the src name.
 		 */
 		msg = req->r_request;
-		rhead = find_old_request_head(msg->front.iov_base,
-					      session->s_con.peer_features);
+		lhead = find_legacy_request_head(msg->front.iov_base,
+						 session->s_con.peer_features);
 
-		flags = le32_to_cpu(rhead->flags);
+		flags = le32_to_cpu(lhead->flags);
 		flags |= CEPH_MDS_FLAG_REPLAY;
-		rhead->flags = cpu_to_le32(flags);
+		lhead->flags = cpu_to_le32(flags);
 
 		if (req->r_target_inode)
-			rhead->ino = cpu_to_le64(ceph_ino(req->r_target_inode));
+			lhead->ino = cpu_to_le64(ceph_ino(req->r_target_inode));
 
-		rhead->num_retry = req->r_attempts - 1;
+		lhead->num_retry = req->r_attempts - 1;
+		if (!old_version) {
+			nhead = (struct ceph_mds_request_head*)msg->front.iov_base;
+			nhead->ext_num_retry = cpu_to_le32(req->r_attempts - 1);
+		}
 
 		/* remove cap/dentry releases from message */
-		rhead->num_releases = 0;
+		lhead->num_releases = 0;
 
 		p = msg->front.iov_base + req->r_request_release_offset;
 		encode_mclientrequest_tail(&p, req);
@@ -3243,18 +3334,23 @@ static int __prepare_send_request(struct ceph_mds_session *session,
 	}
 	req->r_request = msg;
 
-	rhead = find_old_request_head(msg->front.iov_base,
-				      session->s_con.peer_features);
-	rhead->oldest_client_tid = cpu_to_le64(__get_oldest_tid(mdsc));
+	lhead = find_legacy_request_head(msg->front.iov_base,
+					 session->s_con.peer_features);
+	lhead->oldest_client_tid = cpu_to_le64(__get_oldest_tid(mdsc));
 	if (test_bit(CEPH_MDS_R_GOT_UNSAFE, &req->r_req_flags))
 		flags |= CEPH_MDS_FLAG_REPLAY;
 	if (test_bit(CEPH_MDS_R_ASYNC, &req->r_req_flags))
 		flags |= CEPH_MDS_FLAG_ASYNC;
 	if (req->r_parent)
 		flags |= CEPH_MDS_FLAG_WANT_DENTRY;
-	rhead->flags = cpu_to_le32(flags);
-	rhead->num_fwd = req->r_num_fwd;
-	rhead->num_retry = req->r_attempts - 1;
+	lhead->flags = cpu_to_le32(flags);
+	lhead->num_fwd = req->r_num_fwd;
+	lhead->num_retry = req->r_attempts - 1;
+	if (!old_version) {
+		nhead = (struct ceph_mds_request_head*)msg->front.iov_base;
+		nhead->ext_num_fwd = cpu_to_le32(req->r_num_fwd);
+		nhead->ext_num_retry = cpu_to_le32(req->r_attempts - 1);
+	}
 
 	dout(" r_parent = %p\n", req->r_parent);
 	return 0;
@@ -3913,33 +4009,21 @@ static void handle_forward(struct ceph_mds_client *mdsc,
 	if (test_bit(CEPH_MDS_R_ABORTED, &req->r_req_flags)) {
 		dout("forward tid %llu aborted, unregistering\n", tid);
 		__unregister_request(mdsc, req);
-	} else if (fwd_seq <= req->r_num_fwd) {
+	} else if (fwd_seq <= req->r_num_fwd || (uint32_t)fwd_seq >= U32_MAX) {
 		/*
-		 * The type of 'num_fwd' in ceph 'MClientRequestForward'
-		 * is 'int32_t', while in 'ceph_mds_request_head' the
-		 * type is '__u8'. So in case the request bounces between
-		 * MDSes exceeding 256 times, the client will get stuck.
+		 * Avoid inifinite retrying after overflow.
 		 *
-		 * In this case it's ususally a bug in MDS and continue
-		 * bouncing the request makes no sense.
-		 *
-		 * In future this could be fixed in ceph code, so avoid
-		 * using the hardcode here.
+		 * The MDS will increase the fwd count and in client side
+		 * if the num_fwd is less than the one saved in request
+		 * that means the MDS is an old version and overflowed of
+		 * 8 bits.
 		 */
-		int max = sizeof_field(struct ceph_mds_request_head, num_fwd);
-		max = 1 << (max * BITS_PER_BYTE);
-		if (req->r_num_fwd >= max) {
-			mutex_lock(&req->r_fill_mutex);
-			req->r_err = -EMULTIHOP;
-			set_bit(CEPH_MDS_R_ABORTED, &req->r_req_flags);
-			mutex_unlock(&req->r_fill_mutex);
-			aborted = true;
-			pr_warn_ratelimited("forward tid %llu seq overflow\n",
-					    tid);
-		} else {
-			dout("forward tid %llu to mds%d - old seq %d <= %d\n",
-			     tid, next_mds, req->r_num_fwd, fwd_seq);
-		}
+		mutex_lock(&req->r_fill_mutex);
+		req->r_err = -EMULTIHOP;
+		set_bit(CEPH_MDS_R_ABORTED, &req->r_req_flags);
+		mutex_unlock(&req->r_fill_mutex);
+		aborted = true;
+		pr_warn_ratelimited("forward tid %llu seq overflow\n", tid);
 	} else {
 		/* resend. forward race not possible; mds would drop */
 		dout("forward tid %llu to mds%d (we resend)\n", tid, next_mds);
