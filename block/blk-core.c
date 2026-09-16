@@ -457,6 +457,7 @@ struct request_queue *blk_alloc_queue(struct queue_limits *lim, int node_id)
 			 &q->q_lock_cls_key, 0);
 
 	q->nr_requests = BLKDEV_DEFAULT_RQ;
+	q->async_depth = BLKDEV_DEFAULT_RQ;
 
 	return q;
 
@@ -619,13 +620,8 @@ static inline blk_status_t blk_check_zone_append(struct request_queue *q,
 
 static void __submit_bio(struct bio *bio)
 {
-	/* If plug is not used, add new plug here to cache nsecs time. */
-	struct blk_plug plug;
-
 	if (unlikely(!blk_crypto_bio_prep(&bio)))
 		return;
-
-	blk_start_plug(&plug);
 
 	if (!bdev_test_flag(bio->bi_bdev, BD_HAS_SUBMIT_BIO)) {
 		blk_mq_submit_bio(bio);
@@ -641,8 +637,6 @@ static void __submit_bio(struct bio *bio)
 		}
 		blk_queue_exit(disk->queue);
 	}
-
-	blk_finish_plug(&plug);
 }
 
 /*
