@@ -1,0 +1,208 @@
+af_unix: Don't trigger GC from close() if unnecessary.
+
+jira KERNEL-1600
+Rebuild_History Non-Buildable kernel-6.12.0-211.55.1.el10_2
+commit-author Kuniyuki Iwashima <kuniyu@google.com>
+commit da8fc7a39be897426e1ac05aa90263abf40621b7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.55.1.el10_2/da8fc7a3.failed
+
+We have been triggering GC on every close() if there is even one
+inflight AF_UNIX socket.
+
+This is because the old GC implementation had no idea of the graph
+shape formed by SCM_RIGHTS references.
+
+The new GC knows whether there could be a cyclic reference or not,
+and we can do better.
+
+Let's not trigger GC from close() if there is no cyclic reference
+or GC is already in progress.
+
+While at it, unix_gc() is renamed to unix_schedule_gc() as it does
+not actually perform GC since commit 8b90a9f819dc ("af_unix: Run
+GC on only one CPU.").
+
+	Signed-off-by: Kuniyuki Iwashima <kuniyu@google.com>
+Link: https://patch.msgid.link/20251115020935.2643121-4-kuniyu@google.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit da8fc7a39be897426e1ac05aa90263abf40621b7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/unix/af_unix.c
+diff --cc net/unix/af_unix.c
+index b0fb57651068,4a80dac56bbd..000000000000
+--- a/net/unix/af_unix.c
++++ b/net/unix/af_unix.c
+@@@ -724,28 -733,50 +724,32 @@@ static void unix_release_sock(struct so
+  
+  	/* ---- Socket is dead now and most probably destroyed ---- */
+  
+ -	unix_schedule_gc();
+ -}
+ -
+ -struct unix_peercred {
+ -	struct pid *peer_pid;
+ -	const struct cred *peer_cred;
+ -};
+ -
+ -static inline int prepare_peercred(struct unix_peercred *peercred)
+ -{
+ -	struct pid *pid;
+ -	int err;
+ -
+ -	pid = task_tgid(current);
+ -	err = pidfs_register_pid(pid);
+ -	if (likely(!err)) {
+ -		peercred->peer_pid = get_pid(pid);
+ -		peercred->peer_cred = get_current_cred();
+ -	}
+ -	return err;
+ -}
+ -
+ -static void drop_peercred(struct unix_peercred *peercred)
+ -{
+ -	const struct cred *cred = NULL;
+ -	struct pid *pid = NULL;
+ -
+ -	might_sleep();
+ -
+ -	swap(peercred->peer_pid, pid);
+ -	swap(peercred->peer_cred, cred);
+++<<<<<<< HEAD
+ +	/*
+ +	 * Fixme: BSD difference: In BSD all sockets connected to us get
+ +	 *	  ECONNRESET and we die on the spot. In Linux we behave
+ +	 *	  like files and pipes do and wait for the last
+ +	 *	  dereference.
+ +	 *
+ +	 * Can't we simply set sock->err?
+ +	 *
+ +	 *	  What the above comment does talk about? --ANK(980817)
+ +	 */
+  
+ -	put_pid(pid);
+ -	put_cred(cred);
+ +	if (READ_ONCE(unix_tot_inflight))
+ +		unix_gc();		/* Garbage collect fds */
+++=======
+++	unix_schedule_gc();
+++>>>>>>> da8fc7a39be8 (af_unix: Don't trigger GC from close() if unnecessary.)
+  }
+  
+ -static inline void init_peercred(struct sock *sk,
+ -				 const struct unix_peercred *peercred)
+ +static void init_peercred(struct sock *sk)
+  {
+ -	sk->sk_peer_pid = peercred->peer_pid;
+ -	sk->sk_peer_cred = peercred->peer_cred;
+ +	sk->sk_peer_pid = get_pid(task_tgid(current));
+ +	sk->sk_peer_cred = get_current_cred();
+  }
+  
+ -static void update_peercred(struct sock *sk, struct unix_peercred *peercred)
+ +static void update_peercred(struct sock *sk)
+  {
+  	const struct cred *old_cred;
+  	struct pid *old_pid;
+* Unmerged path net/unix/af_unix.c
+diff --git a/net/unix/af_unix.h b/net/unix/af_unix.h
+index 59db179df9bb..0fb5b348ad94 100644
+--- a/net/unix/af_unix.h
++++ b/net/unix/af_unix.h
+@@ -24,13 +24,12 @@ struct unix_skb_parms {
+ #define UNIXCB(skb)	(*(struct unix_skb_parms *)&((skb)->cb))
+ 
+ /* GC for SCM_RIGHTS */
+-extern unsigned int unix_tot_inflight;
+ void unix_add_edges(struct scm_fp_list *fpl, struct unix_sock *receiver);
+ void unix_del_edges(struct scm_fp_list *fpl);
+ void unix_update_edges(struct unix_sock *receiver);
+ int unix_prepare_fpl(struct scm_fp_list *fpl);
+ void unix_destroy_fpl(struct scm_fp_list *fpl);
+-void unix_gc(void);
++void unix_schedule_gc(void);
+ void wait_for_unix_gc(struct scm_fp_list *fpl);
+ 
+ /* SOCK_DIAG */
+diff --git a/net/unix/garbage.c b/net/unix/garbage.c
+index 7528e2db1293..190dea73f0ab 100644
+--- a/net/unix/garbage.c
++++ b/net/unix/garbage.c
+@@ -137,7 +137,7 @@ static void unix_update_graph(struct unix_vertex *vertex)
+ 	if (!vertex)
+ 		return;
+ 
+-	unix_graph_state = UNIX_GRAPH_MAYBE_CYCLIC;
++	WRITE_ONCE(unix_graph_state, UNIX_GRAPH_MAYBE_CYCLIC);
+ }
+ 
+ static LIST_HEAD(unix_unvisited_vertices);
+@@ -200,7 +200,7 @@ static void unix_free_vertices(struct scm_fp_list *fpl)
+ }
+ 
+ static DEFINE_SPINLOCK(unix_gc_lock);
+-unsigned int unix_tot_inflight;
++static unsigned int unix_tot_inflight;
+ 
+ void unix_add_edges(struct scm_fp_list *fpl, struct unix_sock *receiver)
+ {
+@@ -540,7 +540,8 @@ static void unix_walk_scc(struct sk_buff_head *hitlist)
+ 	swap(unix_vertex_unvisited_index, unix_vertex_grouped_index);
+ 
+ 	unix_graph_cyclic_sccs = cyclic_sccs;
+-	unix_graph_state = cyclic_sccs ? UNIX_GRAPH_CYCLIC : UNIX_GRAPH_NOT_CYCLIC;
++	WRITE_ONCE(unix_graph_state,
++		   cyclic_sccs ? UNIX_GRAPH_CYCLIC : UNIX_GRAPH_NOT_CYCLIC);
+ }
+ 
+ static void unix_walk_scc_fast(struct sk_buff_head *hitlist)
+@@ -573,12 +574,13 @@ static void unix_walk_scc_fast(struct sk_buff_head *hitlist)
+ 	list_replace_init(&unix_visited_vertices, &unix_unvisited_vertices);
+ 
+ 	unix_graph_cyclic_sccs = cyclic_sccs;
+-	unix_graph_state = cyclic_sccs ? UNIX_GRAPH_CYCLIC : UNIX_GRAPH_NOT_CYCLIC;
++	WRITE_ONCE(unix_graph_state,
++		   cyclic_sccs ? UNIX_GRAPH_CYCLIC : UNIX_GRAPH_NOT_CYCLIC);
+ }
+ 
+ static bool gc_in_progress;
+ 
+-static void __unix_gc(struct work_struct *work)
++static void unix_gc(struct work_struct *work)
+ {
+ 	struct sk_buff_head hitlist;
+ 	struct sk_buff *skb;
+@@ -609,10 +611,16 @@ static void __unix_gc(struct work_struct *work)
+ 	WRITE_ONCE(gc_in_progress, false);
+ }
+ 
+-static DECLARE_WORK(unix_gc_work, __unix_gc);
++static DECLARE_WORK(unix_gc_work, unix_gc);
+ 
+-void unix_gc(void)
++void unix_schedule_gc(void)
+ {
++	if (READ_ONCE(unix_graph_state) == UNIX_GRAPH_NOT_CYCLIC)
++		return;
++
++	if (READ_ONCE(gc_in_progress))
++		return;
++
+ 	WRITE_ONCE(gc_in_progress, true);
+ 	queue_work(system_dfl_wq, &unix_gc_work);
+ }
+@@ -628,9 +636,8 @@ void wait_for_unix_gc(struct scm_fp_list *fpl)
+ 	 * Paired with the WRITE_ONCE() in unix_inflight(),
+ 	 * unix_notinflight(), and __unix_gc().
+ 	 */
+-	if (READ_ONCE(unix_tot_inflight) > UNIX_INFLIGHT_TRIGGER_GC &&
+-	    !READ_ONCE(gc_in_progress))
+-		unix_gc();
++	if (READ_ONCE(unix_tot_inflight) > UNIX_INFLIGHT_TRIGGER_GC)
++		unix_schedule_gc();
+ 
+ 	/* Penalise users who want to send AF_UNIX sockets
+ 	 * but whose sockets have not been received yet.
