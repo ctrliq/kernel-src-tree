@@ -2811,7 +2811,7 @@ add_script_opt(struct hist_browser *browser,
 	       struct popup_action *act, char **optstr,
 	       struct thread *thread, struct symbol *sym)
 {
-	int n, j;
+	int n, j, ret;
 	struct hist_entry *he;
 
 	n = add_script_opt_2(act, optstr, thread, sym, "");
@@ -2819,17 +2819,24 @@ add_script_opt(struct hist_browser *browser,
 	he = hist_browser__selected_entry(browser);
 	if (sort_order && strstr(sort_order, "time")) {
 		char tstr[128];
+		struct popup_action *time_act = act;
+		char **time_optstr = optstr;
 
-		optstr++;
-		act++;
+		if (n > 0) {
+			time_optstr++;
+			time_act++;
+		}
 		j = sprintf(tstr, " in ");
 		j += timestamp__scnprintf_usec(he->time, tstr + j,
 					       sizeof tstr - j);
 		j += sprintf(tstr + j, "-");
 		timestamp__scnprintf_usec(he->time + symbol_conf.time_quantum,
 				          tstr + j, sizeof tstr - j);
-		n += add_script_opt_2(act, optstr, thread, sym, tstr);
-		act->time = he->time;
+		ret = add_script_opt_2(time_act, time_optstr, thread, sym, tstr);
+		if (ret > 0) {
+			time_act->time = he->time;
+			n += ret;
+		}
 	}
 	return n;
 }
