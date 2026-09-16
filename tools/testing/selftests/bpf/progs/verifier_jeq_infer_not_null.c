@@ -12,6 +12,13 @@ struct {
 	__type(value, int);
 } map_xskmap SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1);
+	__type(key, int);
+	__type(value, int);
+} map_hash SEC(".maps");
+
 /* This is equivalent to the following program:
  *
  *   r6 = skb->sk;
@@ -262,6 +269,40 @@ __naked void jne_reg_reg_null_check(void)
         : __imm(bpf_map_lookup_elem),
           __imm_addr(map_xskmap)
         : __clobber_all);
+}
+
+/*
+ * The below program is explored in two paths: r6 == 0 and r6 == 1.
+ * On the first path comparison "if r0 == r6 goto 2f" should mark r6 as precise,
+ * otherwise unsafe path with r6 == 1 would be incorrectly pruned.
+ */
+SEC("socket")
+__failure
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("R0 invalid mem access 'map_value_or_null'")
+__naked void imprecise_zero_does_not_infer_map_value_non_null(void)
+{
+	asm volatile ("					\
+	call %[bpf_get_prandom_u32];			\
+	/* r6 is 0 on the path explored first, 1 on the other */\
+	r6 = 1;						\
+	if r0 == 0 goto 1f;				\
+	r6 = 0;						\
+	/* r0 = bpf_map_lookup_elem(map_hash, &0); */	\
+1:	*(u64 *)(r10 - 8) = 0;				\
+	r1 = %[map_hash] ll;				\
+	r2 = r10;					\
+	r2 += -8;					\
+	call %[bpf_map_lookup_elem];			\
+	if r0 == r6 goto 2f;				\
+	r0 = *(u8 *)(r0 + 0);				\
+2:	r0 = 0;						\
+	exit;						\
+"	:
+	: __imm(bpf_get_prandom_u32),
+	  __imm(bpf_map_lookup_elem),
+	  __imm_addr(map_hash)
+	: __clobber_all);
 }
 
 char _license[] SEC("license") = "GPL";
