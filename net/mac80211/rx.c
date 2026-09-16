@@ -3359,7 +3359,7 @@ ieee80211_rx_h_mgmt_check(struct ieee80211_rx_data *rx)
 	/* Drop non-broadcast Beacon frames */
 	if (ieee80211_is_beacon(mgmt->frame_control) &&
 	    !is_broadcast_ether_addr(mgmt->da))
-		return RX_DROP;
+		return RX_DROP_MONITOR;
 
 	if (rx->sdata->vif.type == NL80211_IFTYPE_AP &&
 	    ieee80211_is_beacon(mgmt->frame_control) &&
