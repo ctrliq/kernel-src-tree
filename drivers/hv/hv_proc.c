@@ -110,10 +110,44 @@ free_buf:
 }
 EXPORT_SYMBOL_GPL(hv_call_deposit_pages);
 
+int hv_deposit_memory_node(int node, u64 partition_id,
+			   u64 hv_status)
+{
+	u32 num_pages = 1;
+
+	switch (hv_result(hv_status)) {
+	case HV_STATUS_INSUFFICIENT_MEMORY:
+		break;
+	case HV_STATUS_INSUFFICIENT_CONTIGUOUS_MEMORY:
+		num_pages = HV_MAX_CONTIGUOUS_ALLOCATION_PAGES;
+		break;
+
+	case HV_STATUS_INSUFFICIENT_CONTIGUOUS_ROOT_MEMORY:
+		num_pages = HV_MAX_CONTIGUOUS_ALLOCATION_PAGES;
+		fallthrough;
+	case HV_STATUS_INSUFFICIENT_ROOT_MEMORY:
+		if (!hv_root_partition()) {
+			hv_status_err(hv_status, "Unexpected root memory deposit\n");
+			return -ENOMEM;
+		}
+		partition_id = HV_PARTITION_ID_SELF;
+		break;
+
+	default:
+		hv_status_err(hv_status, "Unexpected!\n");
+		return -ENOMEM;
+	}
+	return hv_call_deposit_pages(node, partition_id, num_pages);
+}
+EXPORT_SYMBOL_GPL(hv_deposit_memory_node);
+
 bool hv_result_needs_memory(u64 status)
 {
 	switch (hv_result(status)) {
 	case HV_STATUS_INSUFFICIENT_MEMORY:
+	case HV_STATUS_INSUFFICIENT_CONTIGUOUS_MEMORY:
+	case HV_STATUS_INSUFFICIENT_ROOT_MEMORY:
+	case HV_STATUS_INSUFFICIENT_CONTIGUOUS_ROOT_MEMORY:
 		return true;
 	}
 	return false;
@@ -155,7 +189,8 @@ int hv_call_add_logical_proc(int node, u32 lp_index, u32 apic_id)
 			}
 			break;
 		}
-		ret = hv_call_deposit_pages(node, hv_current_partition_id, 1);
+		ret = hv_deposit_memory_node(node, hv_current_partition_id,
+					     status);
 	} while (!ret);
 
 	return ret;
@@ -197,7 +232,7 @@ int hv_call_create_vp(int node, u64 partition_id, u32 vp_index, u32 flags)
 			}
 			break;
 		}
-		ret = hv_call_deposit_pages(node, partition_id, 1);
+		ret = hv_deposit_memory_node(node, partition_id, status);
 
 	} while (!ret);
 

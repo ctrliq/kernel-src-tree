@@ -724,19 +724,7 @@ static void unix_release_sock(struct sock *sk, int embrion)
 
 	/* ---- Socket is dead now and most probably destroyed ---- */
 
-	/*
-	 * Fixme: BSD difference: In BSD all sockets connected to us get
-	 *	  ECONNRESET and we die on the spot. In Linux we behave
-	 *	  like files and pipes do and wait for the last
-	 *	  dereference.
-	 *
-	 * Can't we simply set sock->err?
-	 *
-	 *	  What the above comment does talk about? --ANK(980817)
-	 */
-
-	if (READ_ONCE(unix_tot_inflight))
-		unix_gc();		/* Garbage collect fds */
+	unix_schedule_gc(NULL);
 }
 
 static void init_peercred(struct sock *sk)
@@ -1858,6 +1846,8 @@ static void unix_detach_fds(struct scm_cookie *scm, struct sk_buff *skb)
 static void unix_peek_fds(struct scm_cookie *scm, struct sk_buff *skb)
 {
 	scm->fp = scm_fp_dup(UNIXCB(skb).fp);
+
+	unix_peek_fpl(scm->fp);
 }
 
 static void unix_destruct_scm(struct sk_buff *skb)
@@ -1968,8 +1958,6 @@ static int unix_dgram_sendmsg(struct socket *sock, struct msghdr *msg,
 	err = scm_send(sock, msg, &scm, false);
 	if (err < 0)
 		return err;
-
-	wait_for_unix_gc(scm.fp);
 
 	err = -EOPNOTSUPP;
 	if (msg->msg_flags&MSG_OOB)
@@ -2242,8 +2230,6 @@ static int unix_stream_sendmsg(struct socket *sock, struct msghdr *msg,
 	err = scm_send(sock, msg, &scm, false);
 	if (err < 0)
 		return err;
-
-	wait_for_unix_gc(scm.fp);
 
 	if (msg->msg_flags & MSG_OOB) {
 		err = -EOPNOTSUPP;
