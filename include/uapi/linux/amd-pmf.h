@@ -42,6 +42,80 @@
 #define AMD_PMF_FEAT_DYNAMIC_POWER_SLIDER_AC	BIT(3)
 #define AMD_PMF_FEAT_DYNAMIC_POWER_SLIDER_DC	BIT(4)
 
+/**
+ * enum amd_pmf_laptop_placement - Describes the physical placement of the laptop
+ * @AMD_PMF_LP_UNKNOWN: Placement cannot be determined
+ * @AMD_PMF_ON_TABLE: Laptop is placed on a stable surface like a table or desk
+ * @AMD_PMF_ON_LAP_MOTION: Laptop is on a lap with detected motion
+ * @AMD_PMF_IN_BAG: Laptop is detected to be inside a bag or case
+ * @AMD_PMF_OUT_OF_BAG: Laptop has been removed from bag or case
+ * @AMD_PMF_LP_UNDEFINED: Placement state is undefined
+ *
+ * This enumeration represents the physical placement state of the laptop
+ * as detected by platform sensors. Used for adaptive power management
+ * and thermal policies.
+ */
+enum amd_pmf_laptop_placement {
+	AMD_PMF_LP_UNKNOWN,
+	AMD_PMF_ON_TABLE,
+	AMD_PMF_ON_LAP_MOTION,
+	AMD_PMF_IN_BAG,
+	AMD_PMF_OUT_OF_BAG,
+	AMD_PMF_LP_UNDEFINED,
+};
+
+/**
+ * enum amd_pmf_ta_slider - Trusted Application power slider positions
+ * @AMD_PMF_TA_BEST_BATTERY: Maximum battery savings, minimal performance
+ * @AMD_PMF_TA_BETTER_BATTERY: Balanced towards battery life
+ * @AMD_PMF_TA_BETTER_PERFORMANCE: Balanced towards performance
+ * @AMD_PMF_TA_BEST_PERFORMANCE: Maximum performance, higher power consumption
+ * @AMD_PMF_TA_MAX: Sentinel value indicating maximum enum value
+ *
+ * This enumeration defines the power slider positions used by the
+ * AMD PMF Trusted Application for dynamic power management decisions.
+ * These correspond to the Windows power slider UI positions.
+ */
+enum amd_pmf_ta_slider {
+	AMD_PMF_TA_BEST_BATTERY,
+	AMD_PMF_TA_BETTER_BATTERY,
+	AMD_PMF_TA_BETTER_PERFORMANCE,
+	AMD_PMF_TA_BEST_PERFORMANCE,
+	AMD_PMF_TA_MAX,
+};
+
+/**
+ * enum amd_pmf_platform_type - Describes the physical form factor orientation
+ * @AMD_PMF_PTYPE_UNKNOWN: Platform type cannot be determined
+ * @AMD_PMF_LID_CLOSE: Laptop lid is closed
+ * @AMD_PMF_CLAMSHELL: Traditional laptop mode with keyboard and screen
+ * @AMD_PMF_FLAT: Device is lying flat on a surface
+ * @AMD_PMF_TENT: Device is in tent mode (keyboard folded back, standing)
+ * @AMD_PMF_STAND: Device is propped up in stand orientation
+ * @AMD_PMF_TABLET: Device is in tablet mode with keyboard hidden
+ * @AMD_PMF_BOOK: Device is in book reading orientation
+ * @AMD_PMF_PRESENTATION: Device is in presentation mode
+ * @AMD_PMF_PULL_FWD: Screen is pulled forward towards user
+ * @AMD_PMF_PTYPE_INVALID: Invalid platform type marker
+ *
+ * This enumeration describes the current physical orientation or form
+ * factor of convertible/2-in-1 devices. Used for optimizing power and
+ * thermal management based on device posture.
+ */
+enum amd_pmf_platform_type {
+	AMD_PMF_PTYPE_UNKNOWN,
+	AMD_PMF_LID_CLOSE,
+	AMD_PMF_CLAMSHELL,
+	AMD_PMF_FLAT,
+	AMD_PMF_TENT,
+	AMD_PMF_STAND,
+	AMD_PMF_TABLET,
+	AMD_PMF_BOOK,
+	AMD_PMF_PRESENTATION,
+	AMD_PMF_PULL_FWD,
+	AMD_PMF_PTYPE_INVALID = 0xf,
+};
+
 struct amd_pmf_info {
 	__u64 size;
 

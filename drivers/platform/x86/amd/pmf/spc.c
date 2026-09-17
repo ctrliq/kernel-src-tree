@@ -10,6 +10,7 @@
  */
 
 #include <acpi/button.h>
+#include <linux/amd-pmf.h>
 #include <linux/amd-pmf-io.h>
 #include <linux/cleanup.h>
 #include <linux/power_supply.h>
@@ -20,21 +21,21 @@
 static const char *platform_type_as_str(u16 platform_type)
 {
 	switch (platform_type) {
-	case CLAMSHELL:
+	case AMD_PMF_CLAMSHELL:
 		return "CLAMSHELL";
-	case FLAT:
+	case AMD_PMF_FLAT:
 		return "FLAT";
-	case TENT:
+	case AMD_PMF_TENT:
 		return "TENT";
-	case STAND:
+	case AMD_PMF_STAND:
 		return "STAND";
-	case TABLET:
+	case AMD_PMF_TABLET:
 		return "TABLET";
-	case BOOK:
+	case AMD_PMF_BOOK:
 		return "BOOK";
-	case PRESENTATION:
+	case AMD_PMF_PRESENTATION:
 		return "PRESENTATION";
-	case PULL_FWD:
+	case AMD_PMF_PULL_FWD:
 		return "PULL_FWD";
 	default:
 		return "UNKNOWN";
@@ -44,13 +45,13 @@ static const char *platform_type_as_str(u16 platform_type)
 static const char *laptop_placement_as_str(u16 device_state)
 {
 	switch (device_state) {
-	case ON_TABLE:
+	case AMD_PMF_ON_TABLE:
 		return "ON_TABLE";
-	case ON_LAP_MOTION:
+	case AMD_PMF_ON_LAP_MOTION:
 		return "ON_LAP_MOTION";
-	case IN_BAG:
+	case AMD_PMF_IN_BAG:
 		return "IN_BAG";
-	case OUT_OF_BAG:
+	case AMD_PMF_OUT_OF_BAG:
 		return "OUT_OF_BAG";
 	default:
 		return "UNKNOWN";
@@ -60,11 +61,11 @@ static const char *laptop_placement_as_str(u16 device_state)
 static const char *ta_slider_as_str(unsigned int state)
 {
 	switch (state) {
-	case TA_BEST_PERFORMANCE:
+	case AMD_PMF_TA_BEST_PERFORMANCE:
 		return "PERFORMANCE";
-	case TA_BETTER_PERFORMANCE:
+	case AMD_PMF_TA_BETTER_PERFORMANCE:
 		return "BALANCED";
-	case TA_BEST_BATTERY:
+	case AMD_PMF_TA_BEST_BATTERY:
 		return "POWER_SAVER";
 	default:
 		return "Unknown TA Slider State";
@@ -287,14 +288,14 @@ static int amd_pmf_get_slider_info(struct amd_pmf_dev *dev, struct ta_pmf_enact_
 	switch (dev->current_profile) {
 	case PLATFORM_PROFILE_PERFORMANCE:
 	case PLATFORM_PROFILE_BALANCED_PERFORMANCE:
-		val = TA_BEST_PERFORMANCE;
+		val = AMD_PMF_TA_BEST_PERFORMANCE;
 		break;
 	case PLATFORM_PROFILE_BALANCED:
-		val = TA_BETTER_PERFORMANCE;
+		val = AMD_PMF_TA_BETTER_PERFORMANCE;
 		break;
 	case PLATFORM_PROFILE_LOW_POWER:
 	case PLATFORM_PROFILE_QUIET:
-		val = TA_BEST_BATTERY;
+		val = AMD_PMF_TA_BEST_BATTERY;
 		break;
 	default:
 		dev_err(dev->dev, "Unknown Platform Profile.\n");
