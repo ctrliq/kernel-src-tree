@@ -116,6 +116,64 @@ enum amd_pmf_platform_type {
 	AMD_PMF_PTYPE_INVALID = 0xf,
 };
 
+static inline const char *amd_pmf_get_platform_type(unsigned int platform_type)
+{
+	switch (platform_type) {
+	case AMD_PMF_CLAMSHELL:
+		return "CLAMSHELL";
+	case AMD_PMF_LID_CLOSE:
+		return "LID_CLOSE";
+	case AMD_PMF_FLAT:
+		return "FLAT";
+	case AMD_PMF_TENT:
+		return "TENT";
+	case AMD_PMF_STAND:
+		return "STAND";
+	case AMD_PMF_TABLET:
+		return "TABLET";
+	case AMD_PMF_BOOK:
+		return "BOOK";
+	case AMD_PMF_PRESENTATION:
+		return "PRESENTATION";
+	case AMD_PMF_PULL_FWD:
+		return "PULL_FWD";
+	default:
+		return "UNKNOWN";
+	}
+}
+
+static inline const char *amd_pmf_get_laptop_placement(unsigned int device_state)
+{
+	switch (device_state) {
+	case AMD_PMF_ON_TABLE:
+		return "ON_TABLE";
+	case AMD_PMF_ON_LAP_MOTION:
+		return "ON_LAP_MOTION";
+	case AMD_PMF_IN_BAG:
+		return "IN_BAG";
+	case AMD_PMF_OUT_OF_BAG:
+		return "OUT_OF_BAG";
+	default:
+		return "UNKNOWN";
+	}
+}
+
+static inline const char *amd_pmf_get_slider_position(unsigned int state)
+{
+	switch (state) {
+	case AMD_PMF_TA_BEST_PERFORMANCE:
+		return "PERFORMANCE";
+	case AMD_PMF_TA_BETTER_PERFORMANCE:
+		return "BALANCED";
+	case AMD_PMF_TA_BEST_BATTERY:
+		return "POWER_SAVER";
+	case AMD_PMF_TA_BETTER_BATTERY:
+		return "BALANCED_BATTERY";
+	default:
+		return "Unknown TA Slider State";
+	}
+}
+
 struct amd_pmf_info {
 	__u64 size;
 
