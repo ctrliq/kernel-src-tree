@@ -978,11 +978,16 @@ static void tun_poll_controller(struct net_device *dev)
 static void tun_set_headroom(struct net_device *dev, int new_hr)
 {
 	struct tun_struct *tun = netdev_priv(dev);
+	size_t max_headroom;
 
-	if (new_hr < NET_SKB_PAD)
-		new_hr = NET_SKB_PAD;
+	max_headroom = min_t(size_t, SKB_MAX_HEAD(0), U16_MAX - 1);
 
-	tun->align = new_hr;
+	if ((tun->flags & TUN_TYPE_MASK) == IFF_TAP)
+		max_headroom -= ETH_HLEN + NET_IP_ALIGN;
+	else
+		max_headroom -= 1;
+
+	tun->align = clamp_t(int, new_hr, NET_SKB_PAD, max_headroom);
 }
 
 static int tun_net_change_carrier(struct net_device *dev, bool new_carrier)
@@ -1399,7 +1404,16 @@ static ssize_t tun_get_user(struct tun_struct *tun, struct tun_file *tfile,
 	switch (tun->flags & TUN_TYPE_MASK) {
 	case IFF_TUN:
 		if (tun->flags & IFF_NO_PI) {
-			switch (skb->data[0] & 0xf0) {
+			u8 ip_version;
+
+			if (!pskb_may_pull(skb, 1)) {
+				this_cpu_inc(tun->pcpu_stats->rx_dropped);
+				kfree_skb(skb);
+				return -EINVAL;
+			}
+			ip_version = skb->data[0] & 0xf0;
+
+			switch (ip_version) {
 			case 0x40:
 				pi.proto = htons(ETH_P_IP);
 				break;
@@ -1418,6 +1432,11 @@ static ssize_t tun_get_user(struct tun_struct *tun, struct tun_file *tfile,
 		skb->dev = tun->dev;
 		break;
 	case IFF_TAP:
+		if (!pskb_may_pull(skb, ETH_HLEN)) {
+			this_cpu_inc(tun->pcpu_stats->rx_dropped);
+			kfree_skb(skb);
+			return -ENOMEM;
+		}
 		skb->protocol = eth_type_trans(skb, tun->dev);
 		break;
 	}
