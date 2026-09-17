@@ -565,7 +565,7 @@ static const struct rpc_call_ops nlm4svc_callback_ops = {
  */
 static __be32
 nlm4svc_callback(struct svc_rqst *rqstp, struct nlm_host *host, u32 proc,
-		 __be32 (*func)(struct svc_rqst *,  struct nlm_res *))
+		 __be32 (*func)(struct svc_rqst *,  struct lockd_res *))
 {
 	struct nlm_rqst	*call;
 	__be32 stat;
@@ -588,7 +588,7 @@ nlm4svc_callback(struct svc_rqst *rqstp, struct nlm_host *host, u32 proc,
 }
 
 static __be32
-__nlm4svc_proc_test_msg(struct svc_rqst *rqstp, struct nlm_res *resp)
+__nlm4svc_proc_test_msg(struct svc_rqst *rqstp, struct lockd_res *resp)
 {
 	struct nlm4_testargs_wrapper *argp = rqstp->rq_argp;
 	unsigned char type = argp->xdrgen.exclusive ? F_WRLCK : F_RDLCK;
@@ -648,7 +648,7 @@ static __be32 nlm4svc_proc_test_msg(struct svc_rqst *rqstp)
 }
 
 static __be32
-__nlm4svc_proc_lock_msg(struct svc_rqst *rqstp, struct nlm_res *resp)
+__nlm4svc_proc_lock_msg(struct svc_rqst *rqstp, struct lockd_res *resp)
 {
 	struct nlm4_lockargs_wrapper *argp = rqstp->rq_argp;
 	unsigned char type = argp->xdrgen.exclusive ? F_WRLCK : F_RDLCK;
@@ -710,7 +710,7 @@ static __be32 nlm4svc_proc_lock_msg(struct svc_rqst *rqstp)
 }
 
 static __be32
-__nlm4svc_proc_cancel_msg(struct svc_rqst *rqstp, struct nlm_res *resp)
+__nlm4svc_proc_cancel_msg(struct svc_rqst *rqstp, struct lockd_res *resp)
 {
 	struct nlm4_cancargs_wrapper *argp = rqstp->rq_argp;
 	unsigned char type = argp->xdrgen.exclusive ? F_WRLCK : F_RDLCK;
@@ -774,7 +774,7 @@ static __be32 nlm4svc_proc_cancel_msg(struct svc_rqst *rqstp)
 }
 
 static __be32
-__nlm4svc_proc_unlock_msg(struct svc_rqst *rqstp, struct nlm_res *resp)
+__nlm4svc_proc_unlock_msg(struct svc_rqst *rqstp, struct lockd_res *resp)
 {
 	struct nlm4_unlockargs_wrapper *argp = rqstp->rq_argp;
 	struct net *net = SVC_NET(rqstp);
@@ -837,7 +837,7 @@ static __be32 nlm4svc_proc_unlock_msg(struct svc_rqst *rqstp)
 }
 
 static __be32
-__nlm4svc_proc_granted_msg(struct svc_rqst *rqstp, struct nlm_res *resp)
+__nlm4svc_proc_granted_msg(struct svc_rqst *rqstp, struct lockd_res *resp)
 {
 	struct nlm4_testargs_wrapper *argp = rqstp->rq_argp;
 
