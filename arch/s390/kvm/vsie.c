@@ -957,19 +957,19 @@ static int handle_fault(struct kvm_vcpu *vcpu, struct vsie_page *vsie_page)
 {
 	int rc;
 
-	if (current->thread.gmap_int_code == PGM_PROTECTION)
+	if ((current->thread.gmap_int_code & PGM_INT_CODE_MASK) == PGM_PROTECTION)
 		/* we can directly forward all protection exceptions */
 		return inject_fault(vcpu, PGM_PROTECTION,
-				    current->thread.gmap_addr, 1);
+				    current->thread.gmap_teid.addr * PAGE_SIZE, 1);
 
 	rc = kvm_s390_shadow_fault(vcpu, vsie_page->gmap,
-				   current->thread.gmap_addr, NULL);
+				   current->thread.gmap_teid.addr * PAGE_SIZE, NULL);
 	if (rc > 0) {
 		rc = inject_fault(vcpu, rc,
-				  current->thread.gmap_addr,
-				  current->thread.gmap_write_flag);
+				  current->thread.gmap_teid.addr * PAGE_SIZE,
+				  kvm_s390_cur_gmap_fault_is_write());
 		if (rc >= 0)
-			vsie_page->fault_addr = current->thread.gmap_addr;
+			vsie_page->fault_addr = current->thread.gmap_teid.addr * PAGE_SIZE;
 	}
 	return rc;
 }
@@ -1172,10 +1172,6 @@ static int do_vsie_run(struct kvm_vcpu *vcpu, struct vsie_page *vsie_page)
 	    vcpu->arch.sie_block->fpf & FPF_BPBC)
 		set_thread_flag(TIF_ISOLATE_BP_GUEST);
 
-	local_irq_disable();
-	guest_enter_irqoff();
-	local_irq_enable();
-
 	/*
 	 * Simulate a SIE entry of the VCPU (see sie64a), so VCPU blocking
 	 * and VCPU requests also hinder the vSIE from running and lead
@@ -1183,15 +1179,17 @@ static int do_vsie_run(struct kvm_vcpu *vcpu, struct vsie_page *vsie_page)
 	 * also kick the vSIE.
 	 */
 	vcpu->arch.sie_block->prog0c |= PROG_IN_SIE;
+	current->thread.gmap_int_code = 0;
 	barrier();
-	if (!kvm_s390_vcpu_sie_inhibited(vcpu))
-		rc = sie64a(scb_s, vcpu->run->s.regs.gprs, gmap_get_enabled()->asce);
+	if (!kvm_s390_vcpu_sie_inhibited(vcpu)) {
+		local_irq_disable();
+		guest_timing_enter_irqoff();
+		rc = kvm_s390_enter_exit_sie(scb_s, vcpu->run->s.regs.gprs, vsie_page->gmap->asce);
+		guest_timing_exit_irqoff();
+		local_irq_enable();
+	}
 	barrier();
 	vcpu->arch.sie_block->prog0c &= ~PROG_IN_SIE;
-
-	local_irq_disable();
-	guest_exit_irqoff();
-	local_irq_enable();
 
 	/* restore guest state for bp isolation override */
 	if (!guest_bp_isolation)
@@ -1207,7 +1205,7 @@ static int do_vsie_run(struct kvm_vcpu *vcpu, struct vsie_page *vsie_page)
 
 	if (rc > 0)
 		rc = 0; /* we could still have an icpt */
-	else if (rc == -EFAULT)
+	else if (current->thread.gmap_int_code)
 		return handle_fault(vcpu, vsie_page);
 
 	switch (scb_s->icptcode) {
@@ -1330,10 +1328,8 @@ static int vsie_run(struct kvm_vcpu *vcpu, struct vsie_page *vsie_page)
 		if (!rc)
 			rc = map_prefix(vcpu, vsie_page);
 		if (!rc) {
-			gmap_enable(vsie_page->gmap);
 			update_intervention_requests(vsie_page);
 			rc = do_vsie_run(vcpu, vsie_page);
-			gmap_enable(vcpu->arch.gmap);
 		}
 		atomic_andnot(PROG_BLOCK_SIE, &scb_s->prog20);
 

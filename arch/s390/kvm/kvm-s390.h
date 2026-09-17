@@ -20,6 +20,8 @@
 #include <asm/processor.h>
 #include <asm/sclp.h>
 
+#define KVM_S390_UCONTROL_MEMSLOT (KVM_USER_MEM_SLOTS + 0)
+
 static inline void kvm_s390_fpu_store(struct kvm_run *run)
 {
 	fpu_stfpc(&run->s.regs.fpc);
@@ -542,6 +544,13 @@ static inline int kvm_s390_use_sca_entries(void)
 }
 void kvm_s390_reinject_machine_check(struct kvm_vcpu *vcpu,
 				     struct mcck_volatile_info *mcck_info);
+
+static inline bool kvm_s390_cur_gmap_fault_is_write(void)
+{
+	if (current->thread.gmap_int_code == PGM_PROTECTION)
+		return true;
+	return test_facility(75) && (current->thread.gmap_teid.fsi == TEID_FSI_STORE);
+}
 
 /**
  * kvm_s390_vcpu_crypto_reset_all
