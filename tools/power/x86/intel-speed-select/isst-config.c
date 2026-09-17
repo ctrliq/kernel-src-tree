@@ -16,7 +16,7 @@ struct process_cmd_struct {
 	int arg;
 };
 
-static const char *version_str = "v1.25";
+static const char *version_str = "v1.26";
 
 static const int supported_api_ver = 3;
 static struct isst_if_platform_info isst_platform_info;
@@ -81,6 +81,11 @@ struct cpu_topology {
 };
 
 static int read_only;
+
+static void print_version(void)
+{
+	fprintf(outf, "Version %s\n", version_str);
+}
 
 static void check_privilege(void)
 {
@@ -1138,6 +1143,7 @@ static int isst_fill_platform_info(void)
 	close(fd);
 
 	if (isst_platform_info.api_version > supported_api_ver) {
+		print_version();
 		printf("Incompatible API versions; Upgrade of tool is required\n");
 		exit(1);
 	}
@@ -1745,6 +1751,9 @@ static int no_turbo(void)
 	return parse_int_file(0, "/sys/devices/system/cpu/intel_pstate/no_turbo");
 }
 
+#define U32_MAX		((unsigned int)~0U)
+#define S32_MAX		((int)(U32_MAX >> 1))
+
 static void adjust_scaling_max_from_base_freq(int cpu)
 {
 	int base_freq, scaling_max_freq;
@@ -1752,7 +1761,7 @@ static void adjust_scaling_max_from_base_freq(int cpu)
 	scaling_max_freq = parse_int_file(0, "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_max_freq", cpu);
 	base_freq = get_cpufreq_base_freq(cpu);
 	if (scaling_max_freq < base_freq || no_turbo())
-		set_cpufreq_scaling_min_max(cpu, 1, base_freq);
+		set_cpufreq_scaling_min_max(cpu, 1, S32_MAX);
 }
 
 static void adjust_scaling_min_from_base_freq(int cpu)
@@ -3195,12 +3204,6 @@ static void usage(void)
 	exit(0);
 }
 
-static void print_version(void)
-{
-	fprintf(outf, "Version %s\n", version_str);
-	exit(0);
-}
-
 static void cmdline(int argc, char **argv)
 {
 	const char *pathname = "/dev/isst_interface";
@@ -3314,6 +3317,7 @@ static void cmdline(int argc, char **argv)
 			break;
 		case 'v':
 			print_version();
+			exit(0);
 			break;
 		case 'b':
 			oob_mode = 1;
