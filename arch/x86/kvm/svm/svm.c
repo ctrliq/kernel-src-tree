@@ -892,29 +892,6 @@ void svm_vcpu_init_msrpm(struct kvm_vcpu *vcpu, u32 *msrpm)
 	}
 }
 
-void svm_set_x2apic_msr_interception(struct vcpu_svm *svm, bool intercept)
-{
-	int i;
-
-	if (intercept == svm->x2avic_msrs_intercepted)
-		return;
-
-	if (!x2avic_enabled)
-		return;
-
-	for (i = 0; i < MAX_DIRECT_ACCESS_MSRS; i++) {
-		int index = direct_access_msrs[i].index;
-
-		if ((index < APIC_BASE_MSR) ||
-		    (index > APIC_BASE_MSR + 0xff))
-			continue;
-		set_msr_interception(&svm->vcpu, svm->msrpm, index,
-				     !intercept, !intercept);
-	}
-
-	svm->x2avic_msrs_intercepted = intercept;
-}
-
 void svm_vcpu_free_msrpm(u32 *msrpm)
 {
 	__free_pages(virt_to_page(msrpm), get_order(MSRPM_SIZE));
