@@ -3053,9 +3053,6 @@ static int __intel_pstate_cpu_init(struct cpufreq_policy *policy)
 	policy->cpuinfo.max_freq = READ_ONCE(global.no_turbo) ?
 			cpu->pstate.max_freq : cpu->pstate.turbo_freq;
 
-	policy->min = policy->cpuinfo.min_freq;
-	policy->max = policy->cpuinfo.max_freq;
-
 	intel_pstate_init_acpi_perf_limits(policy);
 
 	policy->fast_switch_possible = true;
@@ -3243,12 +3240,13 @@ static unsigned int intel_cpufreq_fast_switch(struct cpufreq_policy *policy,
 	return target_pstate * cpu->pstate.scaling;
 }
 
-static void intel_cpufreq_adjust_perf(unsigned int cpunum,
+static void intel_cpufreq_adjust_perf(struct cpufreq_policy *policy,
 				      unsigned long min_perf,
 				      unsigned long target_perf,
+				      unsigned long max_perf,
 				      unsigned long capacity)
 {
-	struct cpudata *cpu = all_cpu_data[cpunum];
+	struct cpudata *cpu = all_cpu_data[policy->cpu];
 	u64 hwp_cap = READ_ONCE(cpu->hwp_cap_cached);
 	int old_pstate = cpu->pstate.current_pstate;
 	int cap_pstate, min_pstate, max_pstate, target_pstate;
@@ -3276,7 +3274,13 @@ static void intel_cpufreq_adjust_perf(unsigned int cpunum,
 	if (min_pstate > cpu->max_perf_ratio)
 		min_pstate = cpu->max_perf_ratio;
 
-	max_pstate = min(cap_pstate, cpu->max_perf_ratio);
+	max_pstate = cap_pstate;
+	if (max_perf < capacity)
+		max_pstate = DIV_ROUND_UP(cap_pstate * max_perf, capacity);
+
+	if (max_pstate > cpu->max_perf_ratio)
+		max_pstate = cpu->max_perf_ratio;
+
 	if (max_pstate < min_pstate)
 		max_pstate = min_pstate;
 
