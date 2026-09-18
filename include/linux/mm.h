@@ -3002,6 +3002,11 @@ static inline pmd_t *pmd_alloc(struct mm_struct *mm, pud_t *pud, unsigned long a
 }
 #endif /* CONFIG_MMU */
 
+enum pt_flags {
+	PT_reserved = PG_reserved,
+	/* High bits are used for zone/node/section */
+};
+
 static inline struct ptdesc *virt_to_ptdesc(const void *x)
 {
 	return page_ptdesc(virt_to_page(x));
@@ -3019,7 +3024,7 @@ static inline void *ptdesc_address(const struct ptdesc *pt)
 
 static inline bool pagetable_is_reserved(struct ptdesc *pt)
 {
-	return folio_test_reserved(ptdesc_folio(pt));
+	return test_bit(PT_reserved, &pt->pt_flags.f);
 }
 
 /**
