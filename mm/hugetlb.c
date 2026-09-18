@@ -1480,8 +1480,6 @@ static struct folio *alloc_gigantic_folio(int order, gfp_t gfp_mask,
 	struct folio *folio;
 	bool retried = false;
 
-	if (nid == NUMA_NO_NODE)
-		nid = numa_mem_id();
 retry:
 	folio = hugetlb_cma_alloc_folio(order, gfp_mask, nid, nodemask);
 	if (!folio) {
@@ -1943,8 +1941,6 @@ static struct folio *alloc_buddy_hugetlb_folio(int order, gfp_t gfp_mask,
 		alloc_try_hard = false;
 	if (alloc_try_hard)
 		gfp_mask |= __GFP_RETRY_MAYFAIL;
-	if (nid == NUMA_NO_NODE)
-		nid = numa_mem_id();
 
 	folio = (struct folio *)__alloc_frozen_pages(gfp_mask, order, nid, nmask);
 
@@ -1979,6 +1975,9 @@ static struct folio *only_alloc_fresh_hugetlb_folio(struct hstate *h,
 {
 	struct folio *folio;
 	int order = huge_page_order(h);
+
+	if (nid == NUMA_NO_NODE)
+		nid = numa_mem_id();
 
 	if (order_is_gigantic(order))
 		folio = alloc_gigantic_folio(order, gfp_mask, nid, nmask);
