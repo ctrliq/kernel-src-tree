@@ -2363,7 +2363,7 @@ static inline struct scatterlist *cifs_sg_set_buf(struct scatterlist *sg,
 			buflen -= len;
 		} while (buflen);
 	} else {
-		sg_set_page(sg++, virt_to_page(addr), buflen, off);
+		sg_set_page(sg++, virt_to_page((void *)addr), buflen, off);
 	}
 	return sg;
 }
