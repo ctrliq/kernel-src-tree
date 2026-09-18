@@ -29,6 +29,8 @@
 
 #define KVM_MAX_VCPUS 255
 
+#define KVM_INTERNAL_MEM_SLOTS 1
+
 /*
  * These seem to be used for allocating ->chip in the routing table, which we
  * don't use. 1 is as small as we can get to reduce the needed memory. If we
@@ -196,6 +198,9 @@ struct kvm_vcpu_stat {
 #define PGM_REGION_FIRST_TRANS		0x39
 #define PGM_REGION_SECOND_TRANS		0x3a
 #define PGM_REGION_THIRD_TRANS		0x3b
+#define PGM_SECURE_STORAGE_ACCESS	0x3d
+#define PGM_NON_SECURE_STORAGE_ACCESS	0x3e
+#define PGM_SECURE_STORAGE_VIOLATION	0x3f
 #define PGM_MONITOR			0x40
 #define PGM_PER				0x80
 #define PGM_CRYPTO_OPERATION		0x119
@@ -416,8 +421,6 @@ struct kvm_vcpu_arch {
 	struct hrtimer    ckc_timer;
 	struct kvm_s390_pgm_info pgm;
 	struct gmap *gmap;
-	/* backup location for the currently enabled gmap when scheduled out */
-	struct gmap *enabled_gmap;
 	struct kvm_guestdbg_info_arch guestdbg;
 	unsigned long pfault_token;
 	unsigned long pfault_select;
@@ -728,6 +731,9 @@ extern char sie_exit;
 
 bool kvm_s390_pv_is_protected(struct kvm *kvm);
 bool kvm_s390_pv_cpu_is_protected(struct kvm_vcpu *vcpu);
+
+extern int kvm_s390_enter_exit_sie(struct kvm_s390_sie_block *scb,
+				   u64 *gprs, unsigned long gasce);
 
 extern int kvm_s390_gisc_register(struct kvm *kvm, u32 gisc);
 extern int kvm_s390_gisc_unregister(struct kvm *kvm, u32 gisc);
