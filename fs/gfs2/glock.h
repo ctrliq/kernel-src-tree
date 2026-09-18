@@ -237,11 +237,11 @@ void gfs2_dump_glock(struct seq_file *seq, struct gfs2_glock *gl,
 			BUG(); } } while(0)
 #define gfs2_glock_assert_warn(gl, x) do { if (unlikely(!(x))) {	\
 			gfs2_dump_glock(NULL, gl, true);		\
-			gfs2_assert_warn((gl)->gl_name.ln_sbd, (x)); } } \
+			gfs2_assert_warn(glock_sbd(gl), (x)); } } \
 	while (0)
 #define gfs2_glock_assert_withdraw(gl, x) do { if (unlikely(!(x))) {	\
 			gfs2_dump_glock(NULL, gl, true);		\
-			gfs2_assert_withdraw((gl)->gl_name.ln_sbd, (x)); } } \
+			gfs2_assert_withdraw(glock_sbd(gl), (x)); } } \
 	while (0)
 
 __printf(2, 3)
@@ -278,7 +278,7 @@ bool gfs2_queue_try_to_evict(struct gfs2_glock *gl);
 bool gfs2_queue_verify_delete(struct gfs2_glock *gl, bool later);
 void gfs2_cancel_delete_work(struct gfs2_glock *gl);
 void gfs2_flush_delete_work(struct gfs2_sbd *sdp);
-void gfs2_gl_hash_clear(struct gfs2_sbd *sdp);
+void gfs2_wait_glocks(struct gfs2_sbd *sdp);
 void gfs2_withdraw_glocks(struct gfs2_sbd *sdp);
 void gfs2_glock_thaw(struct gfs2_sbd *sdp);
 void gfs2_glock_free(struct gfs2_glock *gl);
