@@ -1,0 +1,251 @@
+gfs2: Get rid of delayed withdraws
+
+jira KERNEL-1613
+Rebuild_History Non-Buildable kernel-5.14.0-687.49.1.el9_8
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 8daf6c2b3d8ceea5559cceb8ed7e1275ee72a7be
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.49.1.el9_8/8daf6c2b.failed
+
+Now that gfs2_withdraw() is asynchronous, is can be called in any
+context and there is no more need for gfs2_withdraw_delayed() or for
+turning delayed withdraws into actual withdraws.  Remove the
+now-obsolete code.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 8daf6c2b3d8ceea5559cceb8ed7e1275ee72a7be)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/glops.c
+#	fs/gfs2/log.c
+diff --cc fs/gfs2/glops.c
+index ec316c2fd8c2,28b22cbfb507..000000000000
+--- a/fs/gfs2/glops.c
++++ b/fs/gfs2/glops.c
+@@@ -81,10 -82,7 +81,14 @@@ static void __gfs2_ail_flush(struct gfs
+  	}
+  	GLOCK_BUG_ON(gl, !fsync && atomic_read(&gl->gl_ail_count));
+  	spin_unlock(&sdp->sd_ail_lock);
+++<<<<<<< HEAD
+ +	spin_unlock(&sdp->sd_log_lock);
+ +
+ +	if (gfs2_withdrawing(sdp))
+ +		gfs2_withdraw(sdp);
+++=======
++ 	gfs2_log_unlock(sdp);
+++>>>>>>> 8daf6c2b3d8c (gfs2: Get rid of delayed withdraws)
+  }
+  
+  
+diff --cc fs/gfs2/log.c
+index 010bf18d8083,26a1baa21535..000000000000
+--- a/fs/gfs2/log.c
++++ b/fs/gfs2/log.c
+@@@ -808,12 -804,9 +808,16 @@@ void gfs2_flush_revokes(struct gfs2_sb
+  	/* number of revokes we still have room for */
+  	unsigned int max_revokes = atomic_read(&sdp->sd_log_revokes_available);
+  
+ -	gfs2_log_lock(sdp);
+ +	spin_lock(&sdp->sd_log_lock);
+  	gfs2_ail1_empty(sdp, max_revokes);
+++<<<<<<< HEAD
+ +	spin_unlock(&sdp->sd_log_lock);
+ +
+ +	if (gfs2_withdrawing(sdp))
+ +		gfs2_withdraw(sdp);
+++=======
++ 	gfs2_log_unlock(sdp);
+++>>>>>>> 8daf6c2b3d8c (gfs2: Get rid of delayed withdraws)
+  }
+  
+  /**
+@@@ -990,26 -984,10 +994,23 @@@ static void empty_ail1_list(struct gfs2
+  		if (gfs2_withdrawing_or_withdrawn(sdp))
+  			break;
+  	}
+- 
+- 	if (gfs2_withdrawing(sdp))
+- 		gfs2_withdraw(sdp);
+  }
+  
+ +static void gfs2_trans_drain_list(struct list_head *list)
+ +{
+ +	struct gfs2_bufdata *bd;
+ +
+ +	while (!list_empty(list)) {
+ +		bd = list_first_entry(list, struct gfs2_bufdata, bd_list);
+ +		list_del_init(&bd->bd_list);
+ +		if (!list_empty(&bd->bd_ail_st_list))
+ +			gfs2_remove_from_ail(bd);
+ +		kmem_cache_free(gfs2_bufdata_cachep, bd);
+ +	}
+ +}
+ +
+  /**
+ - * trans_drain - drain the buf and databuf queue for a failed transaction
+ + * gfs2_trans_drain - drain the buf and databuf queue for a failed transaction
+   * @tr: the transaction to drain
+   *
+   * When this is called, we're taking an error exit for a log write that failed
+diff --git a/fs/gfs2/glock.c b/fs/gfs2/glock.c
+index 8f8267f09ce5..646dd3c0a8f0 100644
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@ -761,7 +761,7 @@ __acquires(&gl->gl_lockref.lock)
+ 	 * then it's okay to tell dlm to unlock it.
+ 	 */
+ 	if (unlikely(sdp->sd_log_error) && !gfs2_withdrawing_or_withdrawn(sdp))
+-		gfs2_withdraw_delayed(sdp);
++		gfs2_withdraw(sdp);
+ 	if (glock_blocked_by_withdraw(gl) &&
+ 	    (target != LM_ST_UNLOCKED ||
+ 	     test_bit(SDF_WITHDRAW_RECOVERY, &sdp->sd_flags))) {
+* Unmerged path fs/gfs2/glops.c
+diff --git a/fs/gfs2/incore.h b/fs/gfs2/incore.h
+index 02928f678662..f38d7aee1f0d 100644
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@ -600,7 +600,6 @@ enum {
+ 	SDF_SKIP_DLM_UNLOCK	= 8,
+ 	SDF_FORCE_AIL_FLUSH     = 9,
+ 	SDF_FREEZE_INITIATOR	= 10,
+-	SDF_WITHDRAWING		= 11, /* Will withdraw eventually */
+ 	SDF_WITHDRAW_IN_PROG	= 12, /* Withdraw is in progress */
+ 	SDF_REMOTE_WITHDRAW	= 13, /* Performing remote recovery */
+ 	SDF_WITHDRAW_RECOVERY	= 14, /* Wait for journal recovery when we are
+* Unmerged path fs/gfs2/log.c
+diff --git a/fs/gfs2/lops.c b/fs/gfs2/lops.c
+index 36d6bee183a2..3d17cae58abe 100644
+--- a/fs/gfs2/lops.c
++++ b/fs/gfs2/lops.c
+@@ -212,7 +212,7 @@ static void gfs2_end_log_write(struct bio *bio)
+ 		if (!cmpxchg(&sdp->sd_log_error, 0, err))
+ 			fs_err(sdp, "Error %d writing to journal, jid=%u\n",
+ 			       err, sdp->sd_jdesc->jd_jid);
+-		gfs2_withdraw_delayed(sdp);
++		gfs2_withdraw(sdp);
+ 		/* prevent more writes to the journal */
+ 		clear_bit(SDF_JOURNAL_LIVE, &sdp->sd_flags);
+ 		wake_up(&sdp->sd_logd_waitq);
+diff --git a/fs/gfs2/sys.c b/fs/gfs2/sys.c
+index 072b81e9b940..f195053c1384 100644
+--- a/fs/gfs2/sys.c
++++ b/fs/gfs2/sys.c
+@@ -84,7 +84,6 @@ static ssize_t status_show(struct gfs2_sbd *sdp, char *buf)
+ 		     "Force AIL Flush:          %d\n"
+ 		     "FS Freeze Initiator:      %d\n"
+ 		     "FS Frozen:                %d\n"
+-		     "Withdrawing:              %d\n"
+ 		     "Withdraw In Prog:         %d\n"
+ 		     "Remote Withdraw:          %d\n"
+ 		     "Withdraw Recovery:        %d\n"
+@@ -114,7 +113,6 @@ static ssize_t status_show(struct gfs2_sbd *sdp, char *buf)
+ 		     test_bit(SDF_FORCE_AIL_FLUSH, &f),
+ 		     test_bit(SDF_FREEZE_INITIATOR, &f),
+ 		     test_bit(SDF_FROZEN, &f),
+-		     test_bit(SDF_WITHDRAWING, &f),
+ 		     test_bit(SDF_WITHDRAW_IN_PROG, &f),
+ 		     test_bit(SDF_REMOTE_WITHDRAW, &f),
+ 		     test_bit(SDF_WITHDRAW_RECOVERY, &f),
+diff --git a/fs/gfs2/util.c b/fs/gfs2/util.c
+index 2a4f9235b2d0..6db7cfdeb7c2 100644
+--- a/fs/gfs2/util.c
++++ b/fs/gfs2/util.c
+@@ -364,8 +364,7 @@ void gfs2_withdraw(struct gfs2_sbd *sdp)
+  */
+ 
+ void gfs2_assert_withdraw_i(struct gfs2_sbd *sdp, char *assertion,
+-			    const char *function, char *file, unsigned int line,
+-			    bool delayed)
++			    const char *function, char *file, unsigned int line)
+ {
+ 	if (gfs2_withdrawing_or_withdrawn(sdp))
+ 		return;
+@@ -375,17 +374,7 @@ void gfs2_assert_withdraw_i(struct gfs2_sbd *sdp, char *assertion,
+ 	       "function = %s, file = %s, line = %u\n",
+ 	       assertion, function, file, line);
+ 
+-	/*
+-	 * If errors=panic was specified on mount, it won't help to delay the
+-	 * withdraw.
+-	 */
+-	if (sdp->sd_args.ar_errors == GFS2_ERRORS_PANIC)
+-		delayed = false;
+-
+-	if (delayed)
+-		gfs2_withdraw_delayed(sdp);
+-	else
+-		gfs2_withdraw(sdp);
++	gfs2_withdraw(sdp);
+ 	dump_stack();
+ }
+ 
+diff --git a/fs/gfs2/util.h b/fs/gfs2/util.h
+index 7260c9a6d197..b4f99df1dc1c 100644
+--- a/fs/gfs2/util.h
++++ b/fs/gfs2/util.h
+@@ -37,24 +37,14 @@ do { \
+ 
+ 
+ void gfs2_assert_withdraw_i(struct gfs2_sbd *sdp, char *assertion,
+-			    const char *function, char *file, unsigned int line,
+-			    bool delayed);
++			    const char *function, char *file, unsigned int line);
+ 
+ #define gfs2_assert_withdraw(sdp, assertion) \
+ 	({ \
+ 		bool _bool = (assertion); \
+ 		if (unlikely(!_bool)) \
+ 			gfs2_assert_withdraw_i((sdp), #assertion, \
+-					__func__, __FILE__, __LINE__, false); \
+-		!_bool; \
+-	})
+-
+-#define gfs2_assert_withdraw_delayed(sdp, assertion) \
+-	({ \
+-		bool _bool = (assertion); \
+-		if (unlikely(!_bool)) \
+-			gfs2_assert_withdraw_i((sdp), #assertion, \
+-					__func__, __FILE__, __LINE__, true); \
++					__func__, __FILE__, __LINE__); \
+ 		!_bool; \
+ 	})
+ 
+@@ -192,15 +182,6 @@ static inline unsigned int gfs2_tune_get_i(struct gfs2_tune *gt,
+ 	return x;
+ }
+ 
+-/**
+- * gfs2_withdraw_delayed - withdraw as soon as possible without deadlocks
+- * @sdp: the superblock
+- */
+-static inline void gfs2_withdraw_delayed(struct gfs2_sbd *sdp)
+-{
+-	set_bit(SDF_WITHDRAWING, &sdp->sd_flags);
+-}
+-
+ /**
+  * gfs2_withdrawing_or_withdrawn - test whether the file system is withdrawing
+  *                                 or withdrawn
+@@ -208,18 +189,7 @@ static inline void gfs2_withdraw_delayed(struct gfs2_sbd *sdp)
+  */
+ static inline bool gfs2_withdrawing_or_withdrawn(struct gfs2_sbd *sdp)
+ {
+-	return unlikely(test_bit(SDF_WITHDRAWN, &sdp->sd_flags) ||
+-			test_bit(SDF_WITHDRAWING, &sdp->sd_flags));
+-}
+-
+-/**
+- * gfs2_withdrawing - check if a withdraw is pending
+- * @sdp: the superblock
+- */
+-static inline bool gfs2_withdrawing(struct gfs2_sbd *sdp)
+-{
+-	return unlikely(test_bit(SDF_WITHDRAWING, &sdp->sd_flags) &&
+-			!test_bit(SDF_WITHDRAWN, &sdp->sd_flags));
++	return unlikely(test_bit(SDF_WITHDRAWN, &sdp->sd_flags));
+ }
+ 
+ static inline bool gfs2_withdraw_in_prog(struct gfs2_sbd *sdp)
