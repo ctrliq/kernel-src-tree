@@ -441,9 +441,34 @@ early_initcall(save_builtin_microcode);
 void __init load_ucode_intel_bsp(struct early_load_data *ed)
 {
 	struct ucode_cpu_info uci;
+	unsigned int cpuid_1_eax;
+	struct microcode_intel *mc;
 
-	uci.mc = get_microcode_blob(&uci, false);
+	mc = uci.mc = get_microcode_blob(&uci, false);
 	ed->old_rev = uci.cpu_sig.rev;
+
+	/*
+	 * RHEL Only
+	 * ---------
+	 * Block early loading of microcode version 0x1000423 on Intel Granite
+	 * Rapids X (family 6, model 0xad) with a stepping of 1 to avoid system
+	 * lockup on boot.
+	 *
+	 * Since boot_cpu_data has not been set up yet, native_cpuid_eax(1)
+	 * is used to retrieve the EAX value of cpuid leaf 1 with the following
+	 * relevant bits:
+	 * - Bits 3–0: Stepping
+	 * - Bits 7–4: Model number
+	 * - Bits 11–8: Family code
+	 * - Bits 19–16: Extended model ID
+	 * So mask = 0xf0fff, matching value = 0xa06d1
+	 */
+	cpuid_1_eax = native_cpuid_eax(1);
+	if ((cpuid_1_eax & 0xf0fff) == 0xa06d1 && mc &&
+	    mc->hdr.rev == 0x1000423) {
+		pr_err_once("Please use a newer version of microcode as 0x1000423 may cause system lockup.\n");
+		return;
+	}
 
 	if (uci.mc && apply_microcode_early(&uci) == UCODE_UPDATED) {
 		ucode_patch_va = UCODE_BSP_LOADED;
