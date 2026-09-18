@@ -5760,6 +5760,7 @@ EXPORT_SYMBOL(__kmalloc_noprof);
 void *kmalloc_nolock_noprof(size_t size, gfp_t gfp_flags, int node)
 {
 	gfp_t alloc_gfp = __GFP_NOWARN | __GFP_NOMEMALLOC | gfp_flags;
+	size_t orig_size = size;
 	struct kmem_cache *s;
 	bool can_retry = true;
 	void *ret = ERR_PTR(-EBUSY);
@@ -5815,7 +5816,7 @@ retry:
 	 * In this case fast path with __update_cpu_freelist_fast() is not safe.
 	 */
 	if (!in_nmi() || !local_lock_is_locked(&s->cpu_slab->lock))
-		ret = __slab_alloc_node(s, alloc_gfp, node, _RET_IP_, size);
+		ret = __slab_alloc_node(s, alloc_gfp, node, _RET_IP_, orig_size);
 
 	if (PTR_ERR(ret) == -EBUSY) {
 		if (can_retry) {
@@ -5835,9 +5836,9 @@ retry:
 
 	maybe_wipe_obj_freeptr(s, ret);
 	slab_post_alloc_hook(s, NULL, alloc_gfp, 1, &ret,
-			     slab_want_init_on_alloc(alloc_gfp, s), size);
+			     slab_want_init_on_alloc(alloc_gfp, s), orig_size);
 
-	ret = kasan_kmalloc(s, ret, size, alloc_gfp);
+	ret = kasan_kmalloc(s, ret, orig_size, alloc_gfp);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(kmalloc_nolock_noprof);
