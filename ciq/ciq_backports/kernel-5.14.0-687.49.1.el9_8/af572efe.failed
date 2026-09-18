@@ -1,0 +1,263 @@
+Revert "gfs2: Allow some glocks to be used during withdraw"
+
+jira KERNEL-1613
+Rebuild_History Non-Buildable kernel-5.14.0-687.49.1.el9_8
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit af572efef10a5fcfe686a413e53ad6a2bdd24603
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.49.1.el9_8/af572efe.failed
+
+The current withdraw code duplicates the journal recovery code gfs2
+already has for dealing with node failures, and it does so poorly.  That
+code was added because when releasing a lockspace, we didn't have a way
+to indicate that the lockspace needs recovery.  We now do have this
+feature, so the current withdraw code can be removed almost entirely.
+This is one of several steps towards that.
+
+Reverts commit a72d2401f54b ("gfs2: Allow some glocks to be used during
+withdraw").
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit af572efef10a5fcfe686a413e53ad6a2bdd24603)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/glock.c
+#	fs/gfs2/glops.c
+diff --cc fs/gfs2/glock.c
+index 6c79eef58c8b,d78535dd76f2..000000000000
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@@ -139,33 -137,6 +139,36 @@@ static void gfs2_glock_dealloc(struct r
+  		kmem_cache_free(gfs2_glock_cachep, gl);
+  }
+  
+++<<<<<<< HEAD
+ +/**
+ + * glock_blocked_by_withdraw - determine if we can still use a glock
+ + * @gl: the glock
+ + *
+ + * We need to allow some glocks to be enqueued, dequeued, promoted, and demoted
+ + * when we're withdrawn. For example, to maintain metadata integrity, we should
+ + * disallow the use of inode and rgrp glocks when withdrawn. Other glocks like
+ + * the iopen or freeze glock may be safely used because none of their
+ + * metadata goes through the journal. So in general, we should disallow all
+ + * glocks that are journaled, and allow all the others. One exception is:
+ + * we need to allow our active journal to be promoted and demoted so others
+ + * may recover it and we can reacquire it when they're done.
+ + */
+ +static bool glock_blocked_by_withdraw(struct gfs2_glock *gl)
+ +{
+ +	struct gfs2_sbd *sdp = gl->gl_name.ln_sbd;
+ +
+ +	if (!gfs2_withdrawing_or_withdrawn(sdp))
+ +		return false;
+ +	if (gl->gl_ops->go_flags & GLOF_NONDISK)
+ +		return false;
+ +	if (!sdp->sd_jdesc ||
+ +	    gl->gl_name.ln_number == sdp->sd_jdesc->jd_no_addr)
+ +		return false;
+ +	return true;
+ +}
+ +
+++=======
+++>>>>>>> af572efef10a (Revert "gfs2: Allow some glocks to be used during withdraw")
+  static void __gfs2_glock_free(struct gfs2_glock *gl)
+  {
+  	rhashtable_remove_fast(&gl_hash_table, &gl->gl_node, ht_parms);
+@@@ -738,52 -698,25 +741,74 @@@ __acquires(&gl->gl_lockref.lock
+  	spin_lock(&gl->gl_lockref.lock);
+  
+  skip_inval:
+++<<<<<<< HEAD
+ +	/*
+ +	 * Check for an error encountered since we called go_sync and go_inval.
+ +	 * If so, we can't withdraw from the glock code because the withdraw
+ +	 * code itself uses glocks (see function signal_our_withdraw) to
+ +	 * change the mount to read-only. Most importantly, we must not call
+ +	 * dlm to unlock the glock until the journal is in a known good state
+ +	 * (after journal replay) otherwise other nodes may use the object
+ +	 * (rgrp or dinode) and then later, journal replay will corrupt the
+ +	 * file system. The best we can do here is wait for the logd daemon
+ +	 * to see sd_log_error and withdraw, and in the meantime, requeue the
+ +	 * work for later.
+ +	 *
+ +	 * We make a special exception for some system glocks, such as the
+ +	 * system statfs inode glock, which needs to be granted before the
+ +	 * gfs2_quotad daemon can exit, and that exit needs to finish before
+ +	 * we can unmount the withdrawn file system.
+ +	 *
+ +	 * However, if we're just unlocking the lock (say, for unmount, when
+ +	 * gfs2_gl_hash_clear calls clear_glock) and recovery is complete
+ +	 * then it's okay to tell dlm to unlock it.
+ +	 */
+ +	if (unlikely(sdp->sd_log_error) && !gfs2_withdrawing_or_withdrawn(sdp))
+ +		gfs2_withdraw_delayed(sdp);
+ +	if (glock_blocked_by_withdraw(gl) &&
+ +	    (target != LM_ST_UNLOCKED ||
+ +	     test_bit(SDF_WITHDRAW_RECOVERY, &sdp->sd_flags))) {
+ +		if (!is_system_glock(gl)) {
+ +			request_demote(gl, LM_ST_UNLOCKED, 0, false);
+ +			/*
+ +			 * Ordinarily, we would call dlm and its callback would call
+ +			 * finish_xmote, which would call state_change() to the new state.
+ +			 * Since we withdrew, we won't call dlm, so call state_change
+ +			 * manually, but to the UNLOCKED state we desire.
+ +			 */
+ +			state_change(gl, LM_ST_UNLOCKED);
+ +			/*
+ +			 * We skip telling dlm to do the locking, so we won't get a
+ +			 * reply that would otherwise clear GLF_LOCK. So we clear it here.
+ +			 */
+ +			if (!test_bit(GLF_CANCELING, &gl->gl_flags))
+ +				clear_bit(GLF_LOCK, &gl->gl_flags);
+ +			clear_bit(GLF_DEMOTE_IN_PROGRESS, &gl->gl_flags);
+ +			gl->gl_lockref.count++;
+ +			gfs2_glock_queue_work(gl, GL_GLOCK_DFT_HOLD);
+ +			return;
+ +		}
+++=======
++ 	if (gfs2_withdrawn(sdp) && target != LM_ST_UNLOCKED) {
++ 		request_demote(gl, LM_ST_UNLOCKED, 0, false);
++ 		/*
++ 		 * Ordinarily, we would call dlm and its callback would call
++ 		 * finish_xmote, which would call state_change() to the new state.
++ 		 * Since we withdrew, we won't call dlm, so call state_change
++ 		 * manually, but to the UNLOCKED state we desire.
++ 		 */
++ 		state_change(gl, LM_ST_UNLOCKED);
++ 		/*
++ 		 * We skip telling dlm to do the locking, so we won't get a
++ 		 * reply that would otherwise clear GLF_LOCK. So we clear it here.
++ 		 */
++ 		if (!test_bit(GLF_CANCELING, &gl->gl_flags))
++ 			clear_bit(GLF_LOCK, &gl->gl_flags);
++ 		clear_bit(GLF_DEMOTE_IN_PROGRESS, &gl->gl_flags);
++ 		gl->gl_lockref.count++;
++ 		gfs2_glock_queue_work(gl, GL_GLOCK_DFT_HOLD);
++ 		return;
+++>>>>>>> af572efef10a (Revert "gfs2: Allow some glocks to be used during withdraw")
+  	}
+  
+  	if (ls->ls_ops->lm_lock) {
+diff --cc fs/gfs2/glops.c
+index 17608fb7fd60,6714bd3f7fac..000000000000
+--- a/fs/gfs2/glops.c
++++ b/fs/gfs2/glops.c
+@@@ -627,58 -636,8 +627,57 @@@ static void iopen_go_callback(struct gf
+  	}
+  }
+  
+ +/**
+ + * nondisk_go_callback - used to signal when a node did a withdraw
+ + * @gl: the nondisk glock
+ + * @remote: true if this came from a different cluster node
+ + *
+ + */
+ +static void nondisk_go_callback(struct gfs2_glock *gl, bool remote)
+ +{
+ +	struct gfs2_sbd *sdp = gl->gl_name.ln_sbd;
+ +
+ +	/* Ignore the callback unless it's from another node, and it's the
+ +	   live lock. */
+ +	if (!remote || gl->gl_name.ln_number != GFS2_LIVE_LOCK)
+ +		return;
+ +
+ +	/* First order of business is to cancel the demote request. We don't
+ +	 * really want to demote a nondisk glock. At best it's just to inform
+ +	 * us of another node's withdraw. We'll keep it in SH mode. */
+ +	clear_bit(GLF_DEMOTE, &gl->gl_flags);
+ +	clear_bit(GLF_PENDING_DEMOTE, &gl->gl_flags);
+ +
+ +	/* Ignore the unlock if we're withdrawn, unmounting, or in recovery. */
+ +	if (test_bit(SDF_NORECOVERY, &sdp->sd_flags) ||
+ +	    test_bit(SDF_WITHDRAWN, &sdp->sd_flags) ||
+ +	    test_bit(SDF_REMOTE_WITHDRAW, &sdp->sd_flags))
+ +		return;
+ +
+ +	/* We only care when a node wants us to unlock, because that means
+ +	 * they want a journal recovered. */
+ +	if (gl->gl_demote_state != LM_ST_UNLOCKED)
+ +		return;
+ +
+ +	if (sdp->sd_args.ar_spectator) {
+ +		fs_warn(sdp, "Spectator node cannot recover journals.\n");
+ +		return;
+ +	}
+ +
+ +	fs_warn(sdp, "Some node has withdrawn; checking for recovery.\n");
+ +	set_bit(SDF_REMOTE_WITHDRAW, &sdp->sd_flags);
+ +	/*
+ +	 * We can't call remote_withdraw directly here or gfs2_recover_journal
+ +	 * because this is called from the glock unlock function and the
+ +	 * remote_withdraw needs to enqueue and dequeue the same "live" glock
+ +	 * we were called from. So we queue it to the control work queue in
+ +	 * lock_dlm.
+ +	 */
+ +	queue_delayed_work(gfs2_control_wq, &sdp->sd_control_work, 0);
+ +}
+ +
+  const struct gfs2_glock_operations gfs2_meta_glops = {
+  	.go_type = LM_TYPE_META,
+- 	.go_flags = GLOF_NONDISK,
+  };
+  
+  const struct gfs2_glock_operations gfs2_inode_glops = {
+@@@ -722,8 -678,6 +718,11 @@@ const struct gfs2_glock_operations gfs2
+  
+  const struct gfs2_glock_operations gfs2_nondisk_glops = {
+  	.go_type = LM_TYPE_NONDISK,
+++<<<<<<< HEAD
+ +	.go_flags = GLOF_NONDISK,
+ +	.go_callback = nondisk_go_callback,
+++=======
+++>>>>>>> af572efef10a (Revert "gfs2: Allow some glocks to be used during withdraw")
+  };
+  
+  const struct gfs2_glock_operations gfs2_quota_glops = {
+* Unmerged path fs/gfs2/glock.c
+* Unmerged path fs/gfs2/glops.c
+diff --git a/fs/gfs2/incore.h b/fs/gfs2/incore.h
+index 72f77a91c943..13b5de0e2696 100644
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@ -228,7 +228,6 @@ struct gfs2_glock_operations {
+ 	const unsigned long go_flags;
+ #define GLOF_ASPACE 1 /* address space attached */
+ #define GLOF_LVB    2 /* Lock Value Block attached */
+-#define GLOF_NONDISK   8 /* not I/O related */
+ };
+ 
+ enum {
+@@ -519,8 +518,6 @@ struct gfs2_jdesc {
+ 
+ 	struct list_head jd_revoke_list;
+ 	unsigned int jd_replay_tail;
+-
+-	u64 jd_no_addr;
+ };
+ 
+ struct gfs2_statfs_change_host {
+diff --git a/fs/gfs2/ops_fstype.c b/fs/gfs2/ops_fstype.c
+index 9e40cd7b1754..c45cd573418c 100644
+--- a/fs/gfs2/ops_fstype.c
++++ b/fs/gfs2/ops_fstype.c
+@@ -567,8 +567,6 @@ static int gfs2_jindex_hold(struct gfs2_sbd *sdp, struct gfs2_holder *ji_gh)
+ 	mutex_lock(&sdp->sd_jindex_mutex);
+ 
+ 	for (;;) {
+-		struct gfs2_inode *jip;
+-
+ 		error = gfs2_glock_nq_init(dip->i_gl, LM_ST_SHARED, 0, ji_gh);
+ 		if (error)
+ 			break;
+@@ -609,8 +607,6 @@ static int gfs2_jindex_hold(struct gfs2_sbd *sdp, struct gfs2_holder *ji_gh)
+ 		d_mark_dontcache(jd->jd_inode);
+ 		spin_lock(&sdp->sd_jindex_spin);
+ 		jd->jd_jid = sdp->sd_journals++;
+-		jip = GFS2_I(jd->jd_inode);
+-		jd->jd_no_addr = jip->i_no_addr;
+ 		list_add_tail(&jd->jd_list, &sdp->sd_jindex_list);
+ 		spin_unlock(&sdp->sd_jindex_spin);
+ 	}
