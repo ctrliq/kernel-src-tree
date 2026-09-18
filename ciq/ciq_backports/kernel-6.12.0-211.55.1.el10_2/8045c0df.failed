@@ -1,0 +1,130 @@
+xfrm: Fix dev use-after-free in xfrm async resumption
+
+jira KERNEL-1600
+cve CVE-2026-31663
+Rebuild_History Non-Buildable kernel-6.12.0-211.55.1.el10_2
+commit-author Dong Chenchen <dongchenchen2@huawei.com>
+commit 8045c0df98d4f14c54e5cb875f1c9c0ce89fe4ff
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.55.1.el10_2/8045c0df.failed
+
+xfrm async resumption hold skb->dev refcnt until after transport_finish.
+However, xfrm_rcv_cb may modify skb->dev to tunnel dev without taking
+device reference, such as vti_rcv_cb. The subsequent async resumption
+will decrement the tunnel device's reference count, which lead to uaf
+of tunnel dev and refcnt leak of orig dev as below:
+
+unregister_netdevice: waiting for vti1 to become free. Usage count = -2
+
+Stash the original skb->dev to fix refcnt imbalance. The new skb->dev set
+by xfrm_rcv_cb can race with device teardown. Extend rcu protection over
+xfrm_rcv_cb and transport_finish to prevent races.
+
+Fixes: 1c428b038400 ("xfrm: hold dev ref until after transport_finish NF_HOOK")
+	Reported-by: Xu Chunxiao <xuchunxiao3@huawei.com>
+	Signed-off-by: Dong Chenchen <dongchenchen2@huawei.com>
+	Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+(cherry picked from commit 8045c0df98d4f14c54e5cb875f1c9c0ce89fe4ff)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/xfrm/xfrm_input.c
+diff --cc net/xfrm/xfrm_input.c
+index f2557d108cb4,eecab337bd0a..000000000000
+--- a/net/xfrm/xfrm_input.c
++++ b/net/xfrm/xfrm_input.c
+@@@ -627,31 -649,26 +628,47 @@@ lock
+  			goto drop_unlock;
+  		}
+  
+ +		spin_unlock(&x->lock);
+ +
+  		if (xfrm_tunnel_check(skb, x, family)) {
+  			XFRM_INC_STATS(net, LINUX_MIB_XFRMINSTATEMODEERROR);
+ -			goto drop_unlock;
+ +			goto drop;
+  		}
+  
+++<<<<<<< HEAD
+ +		seq_hi = htonl(xfrm_replay_seqhi(x, seq));
+ +
+ +		XFRM_SKB_CB(skb)->seq.input.low = seq;
+ +		XFRM_SKB_CB(skb)->seq.input.hi = seq_hi;
+ +
+ +		if (crypto_done) {
+ +			nexthdr = x->type_offload->input_tail(x, skb);
+ +		} else {
+ +			dev_hold(skb->dev);
+ +
+ +			nexthdr = x->type->input(x, skb);
+ +			if (nexthdr == -EINPROGRESS)
+++=======
++ 		if (!crypto_done) {
++ 			spin_unlock(&x->lock);
++ 			dev_hold(dev);
++ 
++ 			nexthdr = x->type->input(x, skb);
++ 			if (nexthdr == -EINPROGRESS) {
++ 				if (async)
++ 					dev_put(dev);
+++>>>>>>> 8045c0df98d4 (xfrm: Fix dev use-after-free in xfrm async resumption)
+  				return 0;
+ -			}
+  
+++<<<<<<< HEAD
+ +			dev_put(skb->dev);
+++=======
++ 			dev_put(dev);
++ 			spin_lock(&x->lock);
+++>>>>>>> 8045c0df98d4 (xfrm: Fix dev use-after-free in xfrm async resumption)
+  		}
+  resume:
+ +		spin_lock(&x->lock);
+  		if (nexthdr < 0) {
+  			if (nexthdr == -EBADMSG) {
+  				xfrm_audit_state_icvfail(x, skb,
+@@@ -680,7 -697,12 +697,16 @@@
+  
+  		XFRM_MODE_SKB_CB(skb)->protocol = nexthdr;
+  
+++<<<<<<< HEAD
+ +		if (xfrm_inner_mode_input(x, skb)) {
+++=======
++ 		err = xfrm_inner_mode_input(x, skb);
++ 		if (err == -EINPROGRESS) {
++ 			if (async)
++ 				dev_put(dev);
++ 			return 0;
++ 		} else if (err) {
+++>>>>>>> 8045c0df98d4 (xfrm: Fix dev use-after-free in xfrm async resumption)
+  			XFRM_INC_STATS(net, LINUX_MIB_XFRMINSTATEMODEERROR);
+  			goto drop;
+  		}
+@@@ -717,7 -742,10 +746,13 @@@
+  			sp->olen = 0;
+  		if (skb_valid_dst(skb))
+  			skb_dst_drop(skb);
+++<<<<<<< HEAD
+++=======
++ 		if (async)
++ 			dev_put(dev);
+++>>>>>>> 8045c0df98d4 (xfrm: Fix dev use-after-free in xfrm async resumption)
+  		gro_cells_receive(&gro_cells, skb);
++ 		rcu_read_unlock();
+  		return 0;
+  	} else {
+  		xo = xfrm_offload(skb);
+@@@ -746,6 -774,8 +781,11 @@@
+  drop_unlock:
+  	spin_unlock(&x->lock);
+  drop:
+++<<<<<<< HEAD
+++=======
++ 	if (async)
++ 		dev_put(dev);
+++>>>>>>> 8045c0df98d4 (xfrm: Fix dev use-after-free in xfrm async resumption)
+  	xfrm_rcv_cb(skb, family, x && x->type ? x->type->proto : nexthdr, -1);
+  	kfree_skb(skb);
+  	return 0;
+* Unmerged path net/xfrm/xfrm_input.c

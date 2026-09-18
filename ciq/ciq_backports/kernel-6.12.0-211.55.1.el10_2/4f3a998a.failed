@@ -1,0 +1,180 @@
+drm/xe: Open-code GGTT MMIO access protection
+
+jira KERNEL-1600
+cve CVE-2026-23466
+Rebuild_History Non-Buildable kernel-6.12.0-211.55.1.el10_2
+commit-author Matthew Brost <matthew.brost@intel.com>
+commit 4f3a998a173b4325c2efd90bdadc6ccd3ad9a431
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.55.1.el10_2/4f3a998a.failed
+
+GGTT MMIO access is currently protected by hotplug (drm_dev_enter),
+which works correctly when the driver loads successfully and is later
+unbound or unloaded. However, if driver load fails, this protection is
+insufficient because drm_dev_unplug() is never called.
+
+Additionally, devm release functions cannot guarantee that all BOs with
+GGTT mappings are destroyed before the GGTT MMIO region is removed, as
+some BOs may be freed asynchronously by worker threads.
+
+To address this, introduce an open-coded flag, protected by the GGTT
+lock, that guards GGTT MMIO access. The flag is cleared during the
+dev_fini_ggtt devm release function to ensure MMIO access is disabled
+once teardown begins.
+
+	Cc: stable@vger.kernel.org
+Fixes: 919bb54e989c ("drm/xe: Fix missing runtime outer protection for ggtt_remove_node")
+	Reviewed-by: Zhanjun Dong <zhanjun.dong@intel.com>
+	Signed-off-by: Matthew Brost <matthew.brost@intel.com>
+Link: https://patch.msgid.link/20260310225039.1320161-8-zhanjun.dong@intel.com
+(cherry picked from commit 4f3a998a173b4325c2efd90bdadc6ccd3ad9a431)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/xe/xe_ggtt.c
+diff --cc drivers/gpu/drm/xe/xe_ggtt.c
+index 5edc0cad47e2,21071b64b09d..000000000000
+--- a/drivers/gpu/drm/xe/xe_ggtt.c
++++ b/drivers/gpu/drm/xe/xe_ggtt.c
+@@@ -67,6 -66,83 +67,86 @@@
+   * give us the correct placement for free.
+   */
+  
+++<<<<<<< HEAD
+++=======
++ #define XE_GGTT_FLAGS_64K	BIT(0)
++ #define XE_GGTT_FLAGS_ONLINE	BIT(1)
++ 
++ /**
++  * struct xe_ggtt_node - A node in GGTT.
++  *
++  * This struct is allocated with xe_ggtt_insert_node(,_transform) or xe_ggtt_insert_bo(,_at).
++  * It will be deallocated using xe_ggtt_node_remove().
++  */
++ struct xe_ggtt_node {
++ 	/** @ggtt: Back pointer to xe_ggtt where this region will be inserted at */
++ 	struct xe_ggtt *ggtt;
++ 	/** @base: A drm_mm_node */
++ 	struct drm_mm_node base;
++ 	/** @delayed_removal_work: The work struct for the delayed removal */
++ 	struct work_struct delayed_removal_work;
++ 	/** @invalidate_on_remove: If it needs invalidation upon removal */
++ 	bool invalidate_on_remove;
++ };
++ 
++ /**
++  * struct xe_ggtt_pt_ops - GGTT Page table operations
++  * Which can vary from platform to platform.
++  */
++ struct xe_ggtt_pt_ops {
++ 	/** @pte_encode_flags: Encode PTE flags for a given BO */
++ 	u64 (*pte_encode_flags)(struct xe_bo *bo, u16 pat_index);
++ 
++ 	/** @ggtt_set_pte: Directly write into GGTT's PTE */
++ 	xe_ggtt_set_pte_fn ggtt_set_pte;
++ 
++ 	/** @ggtt_get_pte: Directly read from GGTT's PTE */
++ 	u64 (*ggtt_get_pte)(struct xe_ggtt *ggtt, u64 addr);
++ };
++ 
++ /**
++  * struct xe_ggtt - Main GGTT struct
++  *
++  * In general, each tile can contains its own Global Graphics Translation Table
++  * (GGTT) instance.
++  */
++ struct xe_ggtt {
++ 	/** @tile: Back pointer to tile where this GGTT belongs */
++ 	struct xe_tile *tile;
++         /** @start: Start offset of GGTT */
++ 	u64 start;
++ 	/** @size: Total usable size of this GGTT */
++ 	u64 size;
++ 
++ #define XE_GGTT_FLAGS_64K BIT(0)
++ 	/**
++ 	 * @flags: Flags for this GGTT
++ 	 * Acceptable flags:
++ 	 * - %XE_GGTT_FLAGS_64K - if PTE size is 64K. Otherwise, regular is 4K.
++ 	 * - %XE_GGTT_FLAGS_ONLINE - is GGTT online, protected by ggtt->lock
++ 	 *   after init
++ 	 */
++ 	unsigned int flags;
++ 	/** @scratch: Internal object allocation used as a scratch page */
++ 	struct xe_bo *scratch;
++ 	/** @lock: Mutex lock to protect GGTT data */
++ 	struct mutex lock;
++ 	/**
++ 	 *  @gsm: The iomem pointer to the actual location of the translation
++ 	 * table located in the GSM for easy PTE manipulation
++ 	 */
++ 	u64 __iomem *gsm;
++ 	/** @pt_ops: Page Table operations per platform */
++ 	const struct xe_ggtt_pt_ops *pt_ops;
++ 	/** @mm: The memory manager used to manage individual GGTT allocations */
++ 	struct drm_mm mm;
++ 	/** @access_count: counts GGTT writes */
++ 	unsigned int access_count;
++ 	/** @wq: Dedicated unordered work queue to process node removals */
++ 	struct workqueue_struct *wq;
++ };
++ 
+++>>>>>>> 4f3a998a173b (drm/xe: Open-code GGTT MMIO access protection)
+  static u64 xelp_ggtt_pte_flags(struct xe_bo *bo, u16 pat_index)
+  {
+  	u64 pte = XE_PAGE_PRESENT;
+@@@ -301,17 -444,8 +383,22 @@@ int xe_ggtt_init_early(struct xe_ggtt *
+  	if (err)
+  		return err;
+  
+++<<<<<<< HEAD
+ +	err = devm_add_action_or_reset(xe->drm.dev, dev_fini_ggtt, ggtt);
+ +	if (err)
+ +		return err;
+ +
+ +	if (IS_SRIOV_VF(xe)) {
+ +		err = xe_tile_sriov_vf_prepare_ggtt(ggtt->tile);
+ +		if (err)
+ +			return err;
+ +	}
+ +
+ +	return 0;
+++=======
++ 	ggtt->flags |= XE_GGTT_FLAGS_ONLINE;
++ 	return devm_add_action_or_reset(xe->drm.dev, dev_fini_ggtt, ggtt);
+++>>>>>>> 4f3a998a173b (drm/xe: Open-code GGTT MMIO access protection)
+  }
+  ALLOW_ERROR_INJECTION(xe_ggtt_init_early, ERRNO); /* See xe_pci_probe() */
+  
+@@@ -334,15 -468,17 +421,12 @@@ static void xe_ggtt_initial_clear(struc
+  static void ggtt_node_remove(struct xe_ggtt_node *node)
+  {
+  	struct xe_ggtt *ggtt = node->ggtt;
+- 	struct xe_device *xe = tile_to_xe(ggtt->tile);
+  	bool bound;
+- 	int idx;
+- 
+- 	bound = drm_dev_enter(&xe->drm, &idx);
+  
+  	mutex_lock(&ggtt->lock);
++ 	bound = ggtt->flags & XE_GGTT_FLAGS_ONLINE;
+  	if (bound)
+ -		xe_ggtt_clear(ggtt, xe_ggtt_node_addr(node), xe_ggtt_node_size(node));
+ +		xe_ggtt_clear(ggtt, node->base.start, node->base.size);
+  	drm_mm_remove_node(&node->base);
+  	node->base.size = 0;
+  	mutex_unlock(&ggtt->lock);
+@@@ -353,10 -489,8 +437,8 @@@
+  	if (node->invalidate_on_remove)
+  		xe_ggtt_invalidate(ggtt);
+  
+- 	drm_dev_exit(idx);
+- 
+  free_node:
+ -	ggtt_node_fini(node);
+ +	xe_ggtt_node_fini(node);
+  }
+  
+  static void ggtt_node_remove_work_func(struct work_struct *work)
+* Unmerged path drivers/gpu/drm/xe/xe_ggtt.c

@@ -1,0 +1,122 @@
+af_unix: Don't call wait_for_unix_gc() on every sendmsg().
+
+jira KERNEL-1600
+Rebuild_History Non-Buildable kernel-6.12.0-211.55.1.el10_2
+commit-author Kuniyuki Iwashima <kuniyu@google.com>
+commit 384900542dc85f3aac7918fea8e7ef62141e3ea6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.55.1.el10_2/38490054.failed
+
+We have been calling wait_for_unix_gc() on every sendmsg() in case
+there are too many inflight AF_UNIX sockets.
+
+This is also because the old GC implementation had poor knowledge
+of the inflight sockets and had to suspect every sendmsg().
+
+This was improved by commit d9f21b361333 ("af_unix: Try to run GC
+async."), but we do not even need to call wait_for_unix_gc() if the
+process is not sending AF_UNIX sockets.
+
+The wait_for_unix_gc() call only helps when a malicious process
+continues to create cyclic references, and we can detect that
+in a better place and slow it down.
+
+Let's move wait_for_unix_gc() to unix_prepare_fpl() that is called
+only when AF_UNIX socket fd is passed via SCM_RIGHTS.
+
+	Signed-off-by: Kuniyuki Iwashima <kuniyu@google.com>
+Link: https://patch.msgid.link/20251115020935.2643121-5-kuniyu@google.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 384900542dc85f3aac7918fea8e7ef62141e3ea6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/unix/af_unix.c
+#	net/unix/af_unix.h
+diff --cc net/unix/af_unix.c
+index b0fb57651068,34952242bd81..000000000000
+--- a/net/unix/af_unix.c
++++ b/net/unix/af_unix.c
+@@@ -1969,14 -2098,13 +1969,19 @@@ static int unix_dgram_sendmsg(struct so
+  	if (err < 0)
+  		return err;
+  
+++<<<<<<< HEAD
+ +	wait_for_unix_gc(scm.fp);
+ +
+ +	err = -EOPNOTSUPP;
+ +	if (msg->msg_flags&MSG_OOB)
+++=======
++ 	if (msg->msg_flags & MSG_OOB) {
++ 		err = -EOPNOTSUPP;
+++>>>>>>> 384900542dc8 (af_unix: Don't call wait_for_unix_gc() on every sendmsg().)
+  		goto out;
+ -	}
+  
+  	if (msg->msg_namelen) {
+ -		err = unix_validate_addr(msg->msg_name, msg->msg_namelen);
+ +		err = unix_validate_addr(sunaddr, msg->msg_namelen);
+  		if (err)
+  			goto out;
+  
+diff --cc net/unix/af_unix.h
+index 59db179df9bb,2f1bfe3217c1..000000000000
+--- a/net/unix/af_unix.h
++++ b/net/unix/af_unix.h
+@@@ -30,8 -29,7 +30,12 @@@ void unix_del_edges(struct scm_fp_list 
+  void unix_update_edges(struct unix_sock *receiver);
+  int unix_prepare_fpl(struct scm_fp_list *fpl);
+  void unix_destroy_fpl(struct scm_fp_list *fpl);
+++<<<<<<< HEAD
+ +void unix_gc(void);
+ +void wait_for_unix_gc(struct scm_fp_list *fpl);
+++=======
++ void unix_schedule_gc(void);
+++>>>>>>> 384900542dc8 (af_unix: Don't call wait_for_unix_gc() on every sendmsg().)
+  
+  /* SOCK_DIAG */
+  long unix_inq_len(struct sock *sk);
+* Unmerged path net/unix/af_unix.c
+* Unmerged path net/unix/af_unix.h
+diff --git a/net/unix/garbage.c b/net/unix/garbage.c
+index 7528e2db1293..d86cb0fc0179 100644
+--- a/net/unix/garbage.c
++++ b/net/unix/garbage.c
+@@ -282,6 +282,8 @@ void unix_update_edges(struct unix_sock *receiver)
+ 	}
+ }
+ 
++static void wait_for_unix_gc(struct scm_fp_list *fpl);
++
+ int unix_prepare_fpl(struct scm_fp_list *fpl)
+ {
+ 	struct unix_vertex *vertex;
+@@ -303,6 +305,8 @@ int unix_prepare_fpl(struct scm_fp_list *fpl)
+ 	if (!fpl->edges)
+ 		goto err;
+ 
++	wait_for_unix_gc(fpl);
++
+ 	return 0;
+ 
+ err:
+@@ -620,7 +624,7 @@ void unix_gc(void)
+ #define UNIX_INFLIGHT_TRIGGER_GC 16000
+ #define UNIX_INFLIGHT_SANE_USER (SCM_MAX_FD * 8)
+ 
+-void wait_for_unix_gc(struct scm_fp_list *fpl)
++static void wait_for_unix_gc(struct scm_fp_list *fpl)
+ {
+ 	/* If number of inflight sockets is insane,
+ 	 * force a garbage collect right now.
+@@ -635,8 +639,7 @@ void wait_for_unix_gc(struct scm_fp_list *fpl)
+ 	/* Penalise users who want to send AF_UNIX sockets
+ 	 * but whose sockets have not been received yet.
+ 	 */
+-	if (!fpl || !fpl->count_unix ||
+-	    READ_ONCE(fpl->user->unix_inflight) < UNIX_INFLIGHT_SANE_USER)
++	if (READ_ONCE(fpl->user->unix_inflight) < UNIX_INFLIGHT_SANE_USER)
+ 		return;
+ 
+ 	if (READ_ONCE(gc_in_progress))

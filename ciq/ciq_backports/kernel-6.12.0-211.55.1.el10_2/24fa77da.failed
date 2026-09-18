@@ -1,0 +1,194 @@
+af_unix: Consolidate unix_schedule_gc() and wait_for_unix_gc().
+
+jira KERNEL-1600
+Rebuild_History Non-Buildable kernel-6.12.0-211.55.1.el10_2
+commit-author Kuniyuki Iwashima <kuniyu@google.com>
+commit 24fa77dad25c2f55cc4615c09df2201ef72c66f4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.55.1.el10_2/24fa77da.failed
+
+unix_schedule_gc() and wait_for_unix_gc() share some code.
+
+Let's consolidate the two.
+
+	Signed-off-by: Kuniyuki Iwashima <kuniyu@google.com>
+Link: https://patch.msgid.link/20251115020935.2643121-8-kuniyu@google.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 24fa77dad25c2f55cc4615c09df2201ef72c66f4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/unix/af_unix.c
+#	net/unix/af_unix.h
+#	net/unix/garbage.c
+diff --cc net/unix/af_unix.c
+index b0fb57651068,e518116f8171..000000000000
+--- a/net/unix/af_unix.c
++++ b/net/unix/af_unix.c
+@@@ -724,28 -733,50 +724,32 @@@ static void unix_release_sock(struct so
+  
+  	/* ---- Socket is dead now and most probably destroyed ---- */
+  
+ -	unix_schedule_gc(NULL);
+ -}
+ -
+ -struct unix_peercred {
+ -	struct pid *peer_pid;
+ -	const struct cred *peer_cred;
+ -};
+ -
+ -static inline int prepare_peercred(struct unix_peercred *peercred)
+ -{
+ -	struct pid *pid;
+ -	int err;
+ -
+ -	pid = task_tgid(current);
+ -	err = pidfs_register_pid(pid);
+ -	if (likely(!err)) {
+ -		peercred->peer_pid = get_pid(pid);
+ -		peercred->peer_cred = get_current_cred();
+ -	}
+ -	return err;
+ -}
+ -
+ -static void drop_peercred(struct unix_peercred *peercred)
+ -{
+ -	const struct cred *cred = NULL;
+ -	struct pid *pid = NULL;
+ -
+ -	might_sleep();
+ -
+ -	swap(peercred->peer_pid, pid);
+ -	swap(peercred->peer_cred, cred);
+++<<<<<<< HEAD
+ +	/*
+ +	 * Fixme: BSD difference: In BSD all sockets connected to us get
+ +	 *	  ECONNRESET and we die on the spot. In Linux we behave
+ +	 *	  like files and pipes do and wait for the last
+ +	 *	  dereference.
+ +	 *
+ +	 * Can't we simply set sock->err?
+ +	 *
+ +	 *	  What the above comment does talk about? --ANK(980817)
+ +	 */
+  
+ -	put_pid(pid);
+ -	put_cred(cred);
+ +	if (READ_ONCE(unix_tot_inflight))
+ +		unix_gc();		/* Garbage collect fds */
+++=======
+++	unix_schedule_gc(NULL);
+++>>>>>>> 24fa77dad25c (af_unix: Consolidate unix_schedule_gc() and wait_for_unix_gc().)
+  }
+  
+ -static inline void init_peercred(struct sock *sk,
+ -				 const struct unix_peercred *peercred)
+ +static void init_peercred(struct sock *sk)
+  {
+ -	sk->sk_peer_pid = peercred->peer_pid;
+ -	sk->sk_peer_cred = peercred->peer_cred;
+ +	sk->sk_peer_pid = get_pid(task_tgid(current));
+ +	sk->sk_peer_cred = get_current_cred();
+  }
+  
+ -static void update_peercred(struct sock *sk, struct unix_peercred *peercred)
+ +static void update_peercred(struct sock *sk)
+  {
+  	const struct cred *old_cred;
+  	struct pid *old_pid;
+diff --cc net/unix/af_unix.h
+index 59db179df9bb,c4f1b2da363d..000000000000
+--- a/net/unix/af_unix.h
++++ b/net/unix/af_unix.h
+@@@ -30,8 -29,7 +30,12 @@@ void unix_del_edges(struct scm_fp_list 
+  void unix_update_edges(struct unix_sock *receiver);
+  int unix_prepare_fpl(struct scm_fp_list *fpl);
+  void unix_destroy_fpl(struct scm_fp_list *fpl);
+++<<<<<<< HEAD
+ +void unix_gc(void);
+ +void wait_for_unix_gc(struct scm_fp_list *fpl);
+++=======
++ void unix_schedule_gc(struct user_struct *user);
+++>>>>>>> 24fa77dad25c (af_unix: Consolidate unix_schedule_gc() and wait_for_unix_gc().)
+  
+  /* SOCK_DIAG */
+  long unix_inq_len(struct sock *sk);
+diff --cc net/unix/garbage.c
+index 7528e2db1293,78323d43e63e..000000000000
+--- a/net/unix/garbage.c
++++ b/net/unix/garbage.c
+@@@ -303,6 -300,8 +303,11 @@@ int unix_prepare_fpl(struct scm_fp_lis
+  	if (!fpl->edges)
+  		goto err;
+  
+++<<<<<<< HEAD
+++=======
++ 	unix_schedule_gc(fpl->user);
++ 
+++>>>>>>> 24fa77dad25c (af_unix: Consolidate unix_schedule_gc() and wait_for_unix_gc().)
+  	return 0;
+  
+  err:
+@@@ -609,36 -610,27 +614,55 @@@ skip_gc
+  	WRITE_ONCE(gc_in_progress, false);
+  }
+  
+ -static DECLARE_WORK(unix_gc_work, unix_gc);
+ +static DECLARE_WORK(unix_gc_work, __unix_gc);
+  
+++<<<<<<< HEAD
+ +void unix_gc(void)
+ +{
+ +	WRITE_ONCE(gc_in_progress, true);
+ +	queue_work(system_dfl_wq, &unix_gc_work);
+ +}
+ +
+ +#define UNIX_INFLIGHT_TRIGGER_GC 16000
+ +#define UNIX_INFLIGHT_SANE_USER (SCM_MAX_FD * 8)
+ +
+ +void wait_for_unix_gc(struct scm_fp_list *fpl)
+++=======
++ #define UNIX_INFLIGHT_SANE_USER		(SCM_MAX_FD * 8)
++ 
++ void unix_schedule_gc(struct user_struct *user)
+++>>>>>>> 24fa77dad25c (af_unix: Consolidate unix_schedule_gc() and wait_for_unix_gc().)
+  {
+ -	if (READ_ONCE(unix_graph_state) == UNIX_GRAPH_NOT_CYCLIC)
+ -		return;
+ +	/* If number of inflight sockets is insane,
+ +	 * force a garbage collect right now.
+ +	 *
+ +	 * Paired with the WRITE_ONCE() in unix_inflight(),
+ +	 * unix_notinflight(), and __unix_gc().
+ +	 */
+ +	if (READ_ONCE(unix_tot_inflight) > UNIX_INFLIGHT_TRIGGER_GC &&
+ +	    !READ_ONCE(gc_in_progress))
+ +		unix_gc();
+  
+  	/* Penalise users who want to send AF_UNIX sockets
+  	 * but whose sockets have not been received yet.
+  	 */
+++<<<<<<< HEAD
+ +	if (!fpl || !fpl->count_unix ||
+ +	    READ_ONCE(fpl->user->unix_inflight) < UNIX_INFLIGHT_SANE_USER)
+ +		return;
+ +
+ +	if (READ_ONCE(gc_in_progress))
+++=======
++ 	if (user &&
++ 	    READ_ONCE(user->unix_inflight) < UNIX_INFLIGHT_SANE_USER)
++ 		return;
++ 
++ 	if (!READ_ONCE(gc_in_progress)) {
++ 		WRITE_ONCE(gc_in_progress, true);
++ 		queue_work(system_dfl_wq, &unix_gc_work);
++ 	}
++ 
++ 	if (user && READ_ONCE(unix_graph_cyclic_sccs))
+++>>>>>>> 24fa77dad25c (af_unix: Consolidate unix_schedule_gc() and wait_for_unix_gc().)
+  		flush_work(&unix_gc_work);
+  }
+* Unmerged path net/unix/af_unix.c
+* Unmerged path net/unix/af_unix.h
+* Unmerged path net/unix/garbage.c

@@ -1,0 +1,137 @@
+mshv: Add support for integrated scheduler
+
+jira KERNEL-1600
+Rebuild_History Non-Buildable kernel-6.12.0-211.55.1.el10_2
+commit-author Stanislav Kinsburskii <skinsburskii@linux.microsoft.com>
+commit 4bef6b28bab8697b4f9255c375da2b6b6943a969
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.55.1.el10_2/4bef6b28.failed
+
+Query the hypervisor for integrated scheduler support and use it if
+configured.
+
+Microsoft Hypervisor originally provided two schedulers: root and core. The
+root scheduler allows the root partition to schedule guest vCPUs across
+physical cores, supporting both time slicing and CPU affinity (e.g., via
+cgroups). In contrast, the core scheduler delegates vCPU-to-physical-core
+scheduling entirely to the hypervisor.
+
+Direct virtualization introduces a new privileged guest partition type - L1
+Virtual Host (L1VH) — which can create child partitions from its own
+resources. These child partitions are effectively siblings, scheduled by
+the hypervisor's core scheduler. This prevents the L1VH parent from setting
+affinity or time slicing for its own processes or guest VPs. While cgroups,
+CFS, and cpuset controllers can still be used, their effectiveness is
+unpredictable, as the core scheduler swaps vCPUs according to its own logic
+(typically round-robin across all allocated physical CPUs). As a result,
+the system may appear to "steal" time from the L1VH and its children.
+
+To address this, Microsoft Hypervisor introduces the integrated scheduler.
+This allows an L1VH partition to schedule its own vCPUs and those of its
+guests across its "physical" cores, effectively emulating root scheduler
+behavior within the L1VH, while retaining core scheduler behavior for the
+rest of the system.
+
+The integrated scheduler is controlled by the root partition and gated by
+the vmm_enable_integrated_scheduler capability bit. If set, the hypervisor
+supports the integrated scheduler. The L1VH partition must then check if it
+is enabled by querying the corresponding extended partition property. If
+this property is true, the L1VH partition must use the root scheduler
+logic; otherwise, it must use the core scheduler. This requirement makes
+reading VMM capabilities in L1VH partition a requirement too.
+
+	Signed-off-by: Andreea Pintilie <anpintil@microsoft.com>
+	Signed-off-by: Stanislav Kinsburskii <skinsburskii@linux.microsoft.com>
+	Reviewed-by: Michael Kelley <mhklinux@outlook.com>
+	Signed-off-by: Wei Liu <wei.liu@kernel.org>
+(cherry picked from commit 4bef6b28bab8697b4f9255c375da2b6b6943a969)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/mshv_root_main.c
+diff --cc drivers/hv/mshv_root_main.c
+index d0f5350e4b65,c6ec88884728..000000000000
+--- a/drivers/hv/mshv_root_main.c
++++ b/drivers/hv/mshv_root_main.c
+@@@ -2330,11 -2340,17 +2343,20 @@@ static int __init mshv_parent_partition
+  	if (ret)
+  		goto remove_cpu_state;
+  
+- 	mshv_init_vmm_caps(dev);
++ 	ret = root_scheduler_init(dev);
++ 	if (ret)
++ 		goto exit_partition;
++ 
+++<<<<<<< HEAD
+++=======
++ 	ret = mshv_debugfs_init();
++ 	if (ret)
++ 		goto deinit_root_scheduler;
+  
+++>>>>>>> 4bef6b28bab8 (mshv: Add support for integrated scheduler)
+  	ret = mshv_irqfd_wq_init();
+  	if (ret)
+ -		goto exit_debugfs;
+ +		goto exit_partition;
+  
+  	spin_lock_init(&mshv_root.pt_ht_lock);
+  	hash_init(mshv_root.pt_htable);
+@@@ -2343,6 -2359,10 +2365,13 @@@
+  
+  	return 0;
+  
+++<<<<<<< HEAD
+++=======
++ exit_debugfs:
++ 	mshv_debugfs_exit();
++ deinit_root_scheduler:
++ 	root_scheduler_deinit();
+++>>>>>>> 4bef6b28bab8 (mshv: Add support for integrated scheduler)
+  exit_partition:
+  	if (hv_root_partition())
+  		mshv_root_partition_exit();
+@@@ -2359,8 -2379,10 +2388,9 @@@ static void __exit mshv_parent_partitio
+  {
+  	hv_setup_mshv_handler(NULL);
+  	mshv_port_table_fini();
+ -	mshv_debugfs_exit();
+  	misc_deregister(&mshv_dev);
+  	mshv_irqfd_wq_cleanup();
++ 	root_scheduler_deinit();
+  	if (hv_root_partition())
+  		mshv_root_partition_exit();
+  	cpuhp_remove_state(mshv_cpuhp_online);
+* Unmerged path drivers/hv/mshv_root_main.c
+diff --git a/include/hyperv/hvhdk_mini.h b/include/hyperv/hvhdk_mini.h
+index 2eaad33c7e11..a88ad75bd9ba 100644
+--- a/include/hyperv/hvhdk_mini.h
++++ b/include/hyperv/hvhdk_mini.h
+@@ -87,6 +87,9 @@ enum hv_partition_property_code {
+ 	HV_PARTITION_PROPERTY_PRIVILEGE_FLAGS			= 0x00010000,
+ 	HV_PARTITION_PROPERTY_SYNTHETIC_PROC_FEATURES		= 0x00010001,
+ 
++	/* Integrated scheduling properties */
++	HV_PARTITION_PROPERTY_INTEGRATED_SCHEDULER_ENABLED	= 0x00020005,
++
+ 	/* Resource properties */
+ 	HV_PARTITION_PROPERTY_GPA_PAGE_ACCESS_TRACKING		= 0x00050005,
+ 	HV_PARTITION_PROPERTY_UNIMPLEMENTED_MSR_ACTION		= 0x00050017,
+@@ -102,7 +105,7 @@ enum hv_partition_property_code {
+ };
+ 
+ #define HV_PARTITION_VMM_CAPABILITIES_BANK_COUNT		1
+-#define HV_PARTITION_VMM_CAPABILITIES_RESERVED_BITFIELD_COUNT	59
++#define HV_PARTITION_VMM_CAPABILITIES_RESERVED_BITFIELD_COUNT	57
+ 
+ struct hv_partition_property_vmm_capabilities {
+ 	u16 bank_count;
+@@ -119,6 +122,8 @@ struct hv_partition_property_vmm_capabilities {
+ 			u64 reservedbit3: 1;
+ #endif
+ 			u64 assignable_synthetic_proc_features: 1;
++			u64 reservedbit5: 1;
++			u64 vmm_enable_integrated_scheduler : 1;
+ 			u64 reserved0: HV_PARTITION_VMM_CAPABILITIES_RESERVED_BITFIELD_COUNT;
+ 		} __packed;
+ 	};
