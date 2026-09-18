@@ -2313,7 +2313,7 @@ static int nfs4_lookup_revalidate(struct dentry *dentry, unsigned int flags)
 			nfs4_do_lookup_revalidate);
 }
 
-#endif /* CONFIG_NFSV4 */
+#endif /* CONFIG_NFS_V4 */
 
 int nfs_atomic_open_v23(struct inode *dir, struct dentry *dentry,
 			struct file *file, unsigned int open_flags,
