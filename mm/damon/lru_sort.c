@@ -349,6 +349,10 @@ static int damon_lru_sort_enabled_store(const char *val,
 	if (!damon_initialized())
 		goto set_param_out;
 
+	/* damon_modules_new_paddr_ctx_target() in the init function failed. */
+	if (!ctx)
+		return -ENOMEM;
+
 	err = damon_lru_sort_turn(enable);
 	if (err)
 		return err;
