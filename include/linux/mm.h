@@ -2166,7 +2166,7 @@ static inline unsigned long folio_nr_pages(const struct folio *folio)
  */
 static inline unsigned long compound_nr(const struct page *page)
 {
-	struct folio *folio = (struct folio *)page;
+	const struct folio *folio = (struct folio *)page;
 
 	if (!test_bit(PG_head, &folio->flags.f))
 		return 1;
@@ -3134,21 +3134,26 @@ static inline bool ptlock_init(struct ptdesc *ptdesc) { return true; }
 static inline void ptlock_free(struct ptdesc *ptdesc) {}
 #endif /* defined(CONFIG_SPLIT_PTE_PTLOCKS) */
 
+static inline unsigned long ptdesc_nr_pages(const struct ptdesc *ptdesc)
+{
+	return compound_nr(ptdesc_page(ptdesc));
+}
+
 static inline void __pagetable_ctor(struct ptdesc *ptdesc)
 {
-	struct folio *folio = ptdesc_folio(ptdesc);
+	pg_data_t *pgdat = NODE_DATA(memdesc_nid(ptdesc->pt_flags));
 
-	__folio_set_pgtable(folio);
-	lruvec_stat_add_folio(folio, NR_PAGETABLE);
+	__SetPageTable(ptdesc_page(ptdesc));
+	mod_node_page_state(pgdat, NR_PAGETABLE, ptdesc_nr_pages(ptdesc));
 }
 
 static inline void pagetable_dtor(struct ptdesc *ptdesc)
 {
-	struct folio *folio = ptdesc_folio(ptdesc);
+	pg_data_t *pgdat = NODE_DATA(memdesc_nid(ptdesc->pt_flags));
 
 	ptlock_free(ptdesc);
-	__folio_clear_pgtable(folio);
-	lruvec_stat_sub_folio(folio, NR_PAGETABLE);
+	__ClearPageTable(ptdesc_page(ptdesc));
+	mod_node_page_state(pgdat, NR_PAGETABLE, -ptdesc_nr_pages(ptdesc));
 }
 
 static inline void pagetable_dtor_free(struct ptdesc *ptdesc)
