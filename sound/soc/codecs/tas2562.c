@@ -475,6 +475,9 @@ static int tas2562_volume_control_put(struct snd_kcontrol *kcontrol,
 	int ret, index;
 	u32 reg_val;
 
+	if (tas2562->volume_lvl == ucontrol->value.integer.value[0])
+		return 0;
+
 	index = ucontrol->value.integer.value[0] / 2;
 	if (index < 0 || index >= ARRAY_SIZE(float_vol_db_lookup))
 		return -EINVAL;
@@ -506,7 +509,7 @@ static int tas2562_volume_control_put(struct snd_kcontrol *kcontrol,
 
 	tas2562->volume_lvl = ucontrol->value.integer.value[0];
 
-	return 0;
+	return 1;
 }
 
 /* Digital Volume Control. From 0 dB to -110 dB in 1 dB steps */
