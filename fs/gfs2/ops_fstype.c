@@ -397,7 +397,7 @@ static int init_locking(struct gfs2_sbd *sdp, struct gfs2_holder *mount_gh,
 	error = gfs2_glock_nq_num(sdp,
 				  GFS2_MOUNT_LOCK, &gfs2_nondisk_glops,
 				  LM_ST_EXCLUSIVE,
-				  LM_FLAG_NOEXP | GL_NOCACHE | GL_NOPID,
+				  LM_FLAG_RECOVER | GL_NOCACHE | GL_NOPID,
 				  mount_gh);
 	if (error) {
 		fs_err(sdp, "can't acquire mount glock: %d\n", error);
@@ -407,7 +407,7 @@ static int init_locking(struct gfs2_sbd *sdp, struct gfs2_holder *mount_gh,
 	error = gfs2_glock_nq_num(sdp,
 				  GFS2_LIVE_LOCK, &gfs2_nondisk_glops,
 				  LM_ST_SHARED,
-				  LM_FLAG_NOEXP | GL_EXACT | GL_NOPID,
+				  LM_FLAG_RECOVER | GL_EXACT | GL_NOPID,
 				  &sdp->sd_live_gh);
 	if (error) {
 		fs_err(sdp, "can't acquire live glock: %d\n", error);
@@ -772,7 +772,8 @@ static int init_journal(struct gfs2_sbd *sdp, int undo)
 		error = gfs2_glock_nq_num(sdp, sdp->sd_lockstruct.ls_jid,
 					  &gfs2_journal_glops,
 					  LM_ST_EXCLUSIVE,
-					  LM_FLAG_NOEXP | GL_NOCACHE | GL_NOPID,
+					  LM_FLAG_RECOVER |
+					  GL_NOCACHE | GL_NOPID,
 					  &sdp->sd_journal_gh);
 		if (error) {
 			fs_err(sdp, "can't acquire journal glock: %d\n", error);
@@ -782,7 +783,7 @@ static int init_journal(struct gfs2_sbd *sdp, int undo)
 		ip = GFS2_I(sdp->sd_jdesc->jd_inode);
 		sdp->sd_jinode_gl = ip->i_gl;
 		error = gfs2_glock_nq_init(ip->i_gl, LM_ST_SHARED,
-					   LM_FLAG_NOEXP | GL_EXACT |
+					   LM_FLAG_RECOVER | GL_EXACT |
 					   GL_NOCACHE | GL_NOPID,
 					   &sdp->sd_jinode_gh);
 		if (error) {
