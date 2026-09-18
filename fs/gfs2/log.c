@@ -71,7 +71,7 @@ unsigned int gfs2_struct2blk(struct gfs2_sbd *sdp, unsigned int nstruct)
  *
  */
 
-void gfs2_remove_from_ail(struct gfs2_bufdata *bd)
+static void gfs2_remove_from_ail(struct gfs2_bufdata *bd)
 {
 	bd->bd_tr = NULL;
 	list_del_init(&bd->bd_ail_st_list);
@@ -121,13 +121,11 @@ __acquires(&sdp->sd_ail_lock)
 					  &tr->tr_ail2_list);
 				continue;
 			}
-			if (!cmpxchg(&sdp->sd_log_error, 0, -EIO)) {
+			if (!cmpxchg(&sdp->sd_log_error, 0, -EIO))
 				gfs2_io_error_bh(sdp, bh);
-				gfs2_withdraw_delayed(sdp);
-			}
 		}
 
-		if (gfs2_withdrawing_or_withdrawn(sdp)) {
+		if (gfs2_withdrawn(sdp)) {
 			gfs2_remove_from_ail(bd);
 			continue;
 		}
@@ -328,10 +326,8 @@ static int gfs2_ail1_empty_one(struct gfs2_sbd *sdp, struct gfs2_trans *tr,
 			continue;
 		}
 		if (!buffer_uptodate(bh) &&
-		    !cmpxchg(&sdp->sd_log_error, 0, -EIO)) {
+		    !cmpxchg(&sdp->sd_log_error, 0, -EIO))
 			gfs2_io_error_bh(sdp, bh);
-			gfs2_withdraw_delayed(sdp);
-		}
 		/*
 		 * If we have space for revokes and the bd is no longer on any
 		 * buf list, we can just add a revoke for it immediately and
@@ -808,12 +804,9 @@ void gfs2_flush_revokes(struct gfs2_sbd *sdp)
 	/* number of revokes we still have room for */
 	unsigned int max_revokes = atomic_read(&sdp->sd_log_revokes_available);
 
-	gfs2_log_lock(sdp);
+	spin_lock(&sdp->sd_log_lock);
 	gfs2_ail1_empty(sdp, max_revokes);
-	gfs2_log_unlock(sdp);
-
-	if (gfs2_withdrawing(sdp))
-		gfs2_withdraw(sdp);
+	spin_unlock(&sdp->sd_log_lock);
 }
 
 /**
@@ -841,7 +834,7 @@ void gfs2_write_log_header(struct gfs2_sbd *sdp, struct gfs2_jdesc *jd,
 	struct super_block *sb = sdp->sd_vfs;
 	u64 dblock;
 
-	if (gfs2_withdrawing_or_withdrawn(sdp))
+	if (gfs2_withdrawn(sdp))
 		return;
 
 	page = mempool_alloc(gfs2_page_pool, GFP_NOIO);
@@ -914,8 +907,9 @@ void gfs2_write_log_header(struct gfs2_sbd *sdp, struct gfs2_jdesc *jd,
 static void log_write_header(struct gfs2_sbd *sdp, u32 flags)
 {
 	blk_opf_t op_flags = REQ_PREFLUSH | REQ_FUA | REQ_META | REQ_SYNC;
+	struct super_block *sb = sdp->sd_vfs;
 
-	gfs2_assert_withdraw(sdp, !test_bit(SDF_FROZEN, &sdp->sd_flags));
+	gfs2_assert_withdraw(sdp, sb->s_writers.frozen != SB_FREEZE_COMPLETE);
 
 	if (test_bit(SDF_NOBARRIERS, &sdp->sd_flags)) {
 		gfs2_ordered_wait(sdp);
@@ -987,46 +981,73 @@ static void empty_ail1_list(struct gfs2_sbd *sdp)
 		gfs2_ail1_wait(sdp);
 		empty = gfs2_ail1_empty(sdp, 0);
 
-		if (gfs2_withdrawing_or_withdrawn(sdp))
+		if (gfs2_withdrawn(sdp))
 			break;
 	}
+}
 
-	if (gfs2_withdrawing(sdp))
-		gfs2_withdraw(sdp);
+static void gfs2_trans_drain_list(struct list_head *list)
+{
+	struct gfs2_bufdata *bd;
+
+	while (!list_empty(list)) {
+		bd = list_first_entry(list, struct gfs2_bufdata, bd_list);
+		list_del_init(&bd->bd_list);
+		if (!list_empty(&bd->bd_ail_st_list))
+			gfs2_remove_from_ail(bd);
+		kmem_cache_free(gfs2_bufdata_cachep, bd);
+	}
 }
 
 /**
- * trans_drain - drain the buf and databuf queue for a failed transaction
+ * gfs2_trans_drain - drain the buf and databuf queue for a failed transaction
  * @tr: the transaction to drain
  *
  * When this is called, we're taking an error exit for a log write that failed
  * but since we bypassed the after_commit functions, we need to remove the
  * items from the buf and databuf queue.
  */
-static void trans_drain(struct gfs2_trans *tr)
+static void gfs2_trans_drain(struct gfs2_trans *tr)
 {
-	struct gfs2_bufdata *bd;
-	struct list_head *head;
-
 	if (!tr)
 		return;
+	gfs2_trans_drain_list(&tr->tr_buf);
+	gfs2_trans_drain_list(&tr->tr_databuf);
+}
 
-	head = &tr->tr_buf;
-	while (!list_empty(head)) {
-		bd = list_first_entry(head, struct gfs2_bufdata, bd_list);
+void gfs2_remove_from_journal(struct buffer_head *bh, int meta)
+{
+	struct address_space *mapping = bh->b_folio->mapping;
+	struct gfs2_sbd *sdp = gfs2_mapping2sbd(mapping);
+	struct gfs2_bufdata *bd = bh->b_private;
+	struct gfs2_trans *tr = current->journal_info;
+	int was_pinned = 0;
+
+	if (test_clear_buffer_pinned(bh)) {
+		trace_gfs2_pin(bd, 0);
+		atomic_dec(&sdp->sd_log_pinned);
 		list_del_init(&bd->bd_list);
-		if (!list_empty(&bd->bd_ail_st_list))
-			gfs2_remove_from_ail(bd);
-		kmem_cache_free(gfs2_bufdata_cachep, bd);
+		if (meta == REMOVE_META)
+			tr->tr_num_buf_rm++;
+		else
+			tr->tr_num_databuf_rm++;
+		set_bit(TR_TOUCHED, &tr->tr_flags);
+		was_pinned = 1;
+		brelse(bh);
 	}
-	head = &tr->tr_databuf;
-	while (!list_empty(head)) {
-		bd = list_first_entry(head, struct gfs2_bufdata, bd_list);
-		list_del_init(&bd->bd_list);
-		if (!list_empty(&bd->bd_ail_st_list))
+	if (bd) {
+		if (bd->bd_tr) {
+			gfs2_trans_add_revoke(sdp, bd);
+		} else if (was_pinned) {
+			bh->b_private = NULL;
+			kmem_cache_free(gfs2_bufdata_cachep, bd);
+		} else if (!list_empty(&bd->bd_ail_st_list) &&
+			   !list_empty(&bd->bd_ail_gl_list)) {
 			gfs2_remove_from_ail(bd);
-		kmem_cache_free(gfs2_bufdata_cachep, bd);
+		}
 	}
+	clear_buffer_dirty(bh);
+	clear_buffer_uptodate(bh);
 }
 
 /**
@@ -1053,7 +1074,7 @@ repeat:
 	 * Do this check while holding the log_flush_lock to prevent new
 	 * buffers from being added to the ail via gfs2_pin()
 	 */
-	if (gfs2_withdrawing_or_withdrawn(sdp) ||
+	if (gfs2_withdrawn(sdp) ||
 	    !test_bit(SDF_JOURNAL_LIVE, &sdp->sd_flags))
 		goto out;
 
@@ -1074,7 +1095,7 @@ repeat:
 			sdp->sd_log_tr = NULL;
 			tr->tr_first = first_log_head;
 			if (unlikely(frozen)) {
-				if (gfs2_assert_withdraw_delayed(sdp,
+				if (gfs2_assert_withdraw(sdp,
 				       !tr->tr_num_buf_new && !tr->tr_num_databuf_new))
 					goto out_withdraw;
 			}
@@ -1099,18 +1120,18 @@ repeat:
 		clear_bit(SDF_JOURNAL_LIVE, &sdp->sd_flags);
 
 	if (unlikely(frozen))
-		if (gfs2_assert_withdraw_delayed(sdp, !reserved_revokes))
+		if (gfs2_assert_withdraw(sdp, !reserved_revokes))
 			goto out_withdraw;
 
 	gfs2_ordered_write(sdp);
-	if (gfs2_withdrawing_or_withdrawn(sdp))
+	if (gfs2_withdrawn(sdp))
 		goto out_withdraw;
 	lops_before_commit(sdp, tr);
-	if (gfs2_withdrawing_or_withdrawn(sdp))
+	if (gfs2_withdrawn(sdp))
 		goto out_withdraw;
 	if (sdp->sd_jdesc)
 		gfs2_log_submit_bio(&sdp->sd_jdesc->jd_log_bio, REQ_OP_WRITE);
-	if (gfs2_withdrawing_or_withdrawn(sdp))
+	if (gfs2_withdrawn(sdp))
 		goto out_withdraw;
 
 	if (sdp->sd_log_head != sdp->sd_log_flush_head) {
@@ -1118,11 +1139,11 @@ repeat:
 	} else if (sdp->sd_log_tail != sdp->sd_log_flush_tail && !sdp->sd_log_idle) {
 		log_write_header(sdp, flags);
 	}
-	if (gfs2_withdrawing_or_withdrawn(sdp))
+	if (gfs2_withdrawn(sdp))
 		goto out_withdraw;
 	lops_after_commit(sdp, tr);
 
-	gfs2_log_lock(sdp);
+	spin_lock(&sdp->sd_log_lock);
 	sdp->sd_log_blks_reserved = 0;
 
 	spin_lock(&sdp->sd_ail_lock);
@@ -1131,12 +1152,12 @@ repeat:
 		tr = NULL;
 	}
 	spin_unlock(&sdp->sd_ail_lock);
-	gfs2_log_unlock(sdp);
+	spin_unlock(&sdp->sd_log_lock);
 
 	if (!(flags & GFS2_LOG_HEAD_FLUSH_NORMAL)) {
 		if (!sdp->sd_log_idle) {
 			empty_ail1_list(sdp);
-			if (gfs2_withdrawing_or_withdrawn(sdp))
+			if (gfs2_withdrawn(sdp))
 				goto out_withdraw;
 			log_write_header(sdp, flags);
 		}
@@ -1154,18 +1175,16 @@ out_end:
 		reserved_blocks += (reserved_revokes - sdp->sd_ldptrs) / sdp->sd_inptrs;
 out:
 	if (used_blocks != reserved_blocks) {
-		gfs2_assert_withdraw_delayed(sdp, used_blocks < reserved_blocks);
+		gfs2_assert_withdraw(sdp, used_blocks < reserved_blocks);
 		gfs2_log_release(sdp, reserved_blocks - used_blocks);
 	}
 	up_write(&sdp->sd_log_flush_lock);
 	gfs2_trans_free(sdp, tr);
-	if (gfs2_withdrawing(sdp))
-		gfs2_withdraw(sdp);
 	trace_gfs2_log_flush(sdp, 0, flags);
 	return;
 
 out_withdraw:
-	trans_drain(tr);
+	gfs2_trans_drain(tr);
 	/**
 	 * If the tr_list is empty, we're withdrawing during a log
 	 * flush that targets a transaction, but the transaction was
@@ -1214,7 +1233,7 @@ static void log_refund(struct gfs2_sbd *sdp, struct gfs2_trans *tr)
 	unsigned int unused;
 	unsigned int maxres;
 
-	gfs2_log_lock(sdp);
+	spin_lock(&sdp->sd_log_lock);
 
 	if (sdp->sd_log_tr) {
 		gfs2_merge_trans(sdp, tr);
@@ -1232,7 +1251,7 @@ static void log_refund(struct gfs2_sbd *sdp, struct gfs2_trans *tr)
 		gfs2_log_release(sdp, unused);
 	sdp->sd_log_blks_reserved = reserved;
 
-	gfs2_log_unlock(sdp);
+	spin_unlock(&sdp->sd_log_lock);
 }
 
 /**
@@ -1308,19 +1327,8 @@ int gfs2_logd(void *data)
 	unsigned long t = 1;
 
 	while (!kthread_should_stop()) {
-		if (gfs2_withdrawing_or_withdrawn(sdp))
+		if (gfs2_withdrawn(sdp))
 			break;
-
-		/* Check for errors writing to the journal */
-		if (sdp->sd_log_error) {
-			gfs2_lm(sdp,
-				"GFS2: fsid=%s: error %d: "
-				"withdrawing the file system to "
-				"prevent further damage.\n",
-				sdp->sd_fsname, sdp->sd_log_error);
-			gfs2_withdraw(sdp);
-			break;
-		}
 
 		if (gfs2_jrnl_flush_reqd(sdp) || t == 0) {
 			gfs2_ail1_empty(sdp, 0);
@@ -1344,14 +1352,10 @@ int gfs2_logd(void *data)
 				test_bit(SDF_FORCE_AIL_FLUSH, &sdp->sd_flags) ||
 				gfs2_ail_flush_reqd(sdp) ||
 				gfs2_jrnl_flush_reqd(sdp) ||
-				sdp->sd_log_error ||
-				gfs2_withdrawing_or_withdrawn(sdp) ||
+				gfs2_withdrawn(sdp) ||
 				kthread_should_stop(),
 				t);
 	}
-
-	if (gfs2_withdrawing(sdp))
-		gfs2_withdraw(sdp);
 
 	return 0;
 }

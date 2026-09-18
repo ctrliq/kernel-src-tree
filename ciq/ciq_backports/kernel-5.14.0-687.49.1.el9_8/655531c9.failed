@@ -1,0 +1,79 @@
+Revert "gfs2: fix infinite loop when checking ail item count before go_inval"
+
+jira KERNEL-1613
+Rebuild_History Non-Buildable kernel-5.14.0-687.49.1.el9_8
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 655531c95be333cb979fb58f6825ddae40455c13
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.49.1.el9_8/655531c9.failed
+
+The current withdraw code duplicates the journal recovery code gfs2
+already has for dealing with node failures, and it does so poorly.  That
+code was added because when releasing a lockspace, we didn't have a way
+to indicate that the lockspace needs recovery.  We now do have this
+feature, so the current withdraw code can be removed almost entirely.
+This is one of several steps towards that.
+
+Reverts commit 33dbd1e41a1d ("gfs2: fix infinite loop when checking ail
+item count before go_inval").
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 655531c95be333cb979fb58f6825ddae40455c13)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/glock.c
+diff --cc fs/gfs2/glock.c
+index 6c79eef58c8b,2f790fe90f3b..000000000000
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@@ -719,22 -678,8 +719,25 @@@ __acquires(&gl->gl_lockref.lock
+  		goto skip_inval;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (target == LM_ST_UNLOCKED || target == LM_ST_DEFERRED) {
+ +		/*
+ +		 * The call to go_sync should have cleared out the ail list.
+ +		 * If there are still items, we have a problem. We ought to
+ +		 * withdraw, but we can't because the withdraw code also uses
+ +		 * glocks. Warn about the error, dump the glock, then fall
+ +		 * through and wait for logd to do the withdraw for us.
+ +		 */
+ +		if ((atomic_read(&gl->gl_ail_count) != 0) &&
+ +		    (!cmpxchg(&sdp->sd_log_error, 0, -EIO))) {
+ +			gfs2_glock_assert_warn(gl,
+ +					       !atomic_read(&gl->gl_ail_count));
+ +			gfs2_dump_glock(NULL, gl, true);
+ +		}
+++=======
++ 	if (target == LM_ST_UNLOCKED || target == LM_ST_DEFERRED)
+++>>>>>>> 655531c95be3 (Revert "gfs2: fix infinite loop when checking ail item count before go_inval")
+  		glops->go_inval(gl, target == LM_ST_DEFERRED ? 0 : DIO_METADATA);
+- 	}
+  	spin_lock(&gl->gl_lockref.lock);
+  
+  skip_inval:
+* Unmerged path fs/gfs2/glock.c
+diff --git a/fs/gfs2/glops.c b/fs/gfs2/glops.c
+index 17608fb7fd60..aa34e011a940 100644
+--- a/fs/gfs2/glops.c
++++ b/fs/gfs2/glops.c
+@@ -233,6 +233,7 @@ static void rgrp_go_inval(struct gfs2_glock *gl, int flags)
+ 	end = PAGE_ALIGN((rgd->rd_addr + rgd->rd_length) * bsize) - 1;
+ 	gfs2_rgrp_brelse(rgd);
+ 	WARN_ON_ONCE(!(flags & DIO_METADATA));
++	gfs2_assert_withdraw(sdp, !atomic_read(&gl->gl_ail_count));
+ 	truncate_inode_pages_range(mapping, start, end);
+ 	set_bit(GLF_INSTANTIATE_NEEDED, &gl->gl_flags);
+ }
+@@ -358,6 +359,8 @@ static void inode_go_inval(struct gfs2_glock *gl, int flags)
+ {
+ 	struct gfs2_inode *ip = gfs2_glock2inode(gl);
+ 
++	gfs2_assert_withdraw(gl->gl_name.ln_sbd, !atomic_read(&gl->gl_ail_count));
++
+ 	if (flags & DIO_METADATA) {
+ 		struct address_space *mapping = gfs2_glock2aspace(gl);
+ 		truncate_inode_pages(mapping, 0);

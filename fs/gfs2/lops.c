@@ -49,7 +49,7 @@ void gfs2_pin(struct gfs2_sbd *sdp, struct buffer_head *bh)
 	if (test_set_buffer_pinned(bh))
 		gfs2_assert_withdraw(sdp, 0);
 	if (!buffer_uptodate(bh))
-		gfs2_io_error_bh_wd(sdp, bh);
+		gfs2_io_error_bh(sdp, bh);
 	bd = bh->b_private;
 	/* If this buffer is in the AIL and it has already been written
 	 * to in-place disk block, remove it from the AIL.
@@ -65,15 +65,15 @@ void gfs2_pin(struct gfs2_sbd *sdp, struct buffer_head *bh)
 
 static bool buffer_is_rgrp(const struct gfs2_bufdata *bd)
 {
-	return bd->bd_gl->gl_name.ln_type == LM_TYPE_RGRP;
+	return glock_type(bd->bd_gl) == LM_TYPE_RGRP;
 }
 
 static void maybe_release_space(struct gfs2_bufdata *bd)
 {
 	struct gfs2_glock *gl = bd->bd_gl;
-	struct gfs2_sbd *sdp = gl->gl_name.ln_sbd;
+	struct gfs2_sbd *sdp = glock_sbd(gl);
 	struct gfs2_rgrpd *rgd = gfs2_glock2rgrp(gl);
-	unsigned int index = bd->bd_bh->b_blocknr - gl->gl_name.ln_number;
+	unsigned int index = bd->bd_bh->b_blocknr - glock_number(gl);
 	struct gfs2_bitmap *bi = rgd->rd_bits + index;
 
 	rgrp_lock_local(rgd);
@@ -207,13 +207,12 @@ static void gfs2_end_log_write(struct bio *bio)
 	struct bvec_iter_all iter_all;
 
 	if (bio->bi_status) {
-		if (!cmpxchg(&sdp->sd_log_error, 0, (int)bio->bi_status))
+		int err = blk_status_to_errno(bio->bi_status);
+
+		if (!cmpxchg(&sdp->sd_log_error, 0, err))
 			fs_err(sdp, "Error %d writing to journal, jid=%u\n",
-			       bio->bi_status, sdp->sd_jdesc->jd_jid);
-		gfs2_withdraw_delayed(sdp);
-		/* prevent more writes to the journal */
-		clear_bit(SDF_JOURNAL_LIVE, &sdp->sd_flags);
-		wake_up(&sdp->sd_logd_waitq);
+			       err, sdp->sd_jdesc->jd_jid);
+		gfs2_withdraw(sdp);
 	}
 
 	bio_for_each_segment_all(bvec, bio, iter_all) {
@@ -656,19 +655,19 @@ static void gfs2_before_commit(struct gfs2_sbd *sdp, unsigned int limit,
 	unsigned n;
 	__be64 *ptr;
 
-	gfs2_log_lock(sdp);
+	spin_lock(&sdp->sd_log_lock);
 	list_sort(NULL, blist, blocknr_cmp);
 	bd1 = bd2 = list_prepare_entry(bd1, blist, bd_list);
 	while(total) {
 		num = total;
 		if (total > limit)
 			num = limit;
-		gfs2_log_unlock(sdp);
+		spin_unlock(&sdp->sd_log_lock);
 		page = gfs2_get_log_desc(sdp,
 					 is_databuf ? GFS2_LOG_DESC_JDATA :
 					 GFS2_LOG_DESC_METADATA, num + 1, num);
 		ld = page_address(page);
-		gfs2_log_lock(sdp);
+		spin_lock(&sdp->sd_log_lock);
 		ptr = (__be64 *)(ld + 1);
 
 		n = 0;
@@ -682,14 +681,14 @@ static void gfs2_before_commit(struct gfs2_sbd *sdp, unsigned int limit,
 				break;
 		}
 
-		gfs2_log_unlock(sdp);
+		spin_unlock(&sdp->sd_log_lock);
 		gfs2_log_write_page(sdp, page);
-		gfs2_log_lock(sdp);
+		spin_lock(&sdp->sd_log_lock);
 
 		n = 0;
 		list_for_each_entry_continue(bd2, blist, bd_list) {
 			get_bh(bd2->bd_bh);
-			gfs2_log_unlock(sdp);
+			spin_unlock(&sdp->sd_log_lock);
 			lock_buffer(bd2->bd_bh);
 
 			if (buffer_escaped(bd2->bd_bh)) {
@@ -708,7 +707,7 @@ static void gfs2_before_commit(struct gfs2_sbd *sdp, unsigned int limit,
 			} else {
 				gfs2_log_write_bh(sdp, bd2->bd_bh);
 			}
-			gfs2_log_lock(sdp);
+			spin_lock(&sdp->sd_log_lock);
 			if (++n >= num)
 				break;
 		}
@@ -716,7 +715,7 @@ static void gfs2_before_commit(struct gfs2_sbd *sdp, unsigned int limit,
 		BUG_ON(total < num);
 		total -= num;
 	}
-	gfs2_log_unlock(sdp);
+	spin_unlock(&sdp->sd_log_lock);
 }
 
 static void buf_lo_before_commit(struct gfs2_sbd *sdp, struct gfs2_trans *tr)

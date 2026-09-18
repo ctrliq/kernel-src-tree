@@ -1,0 +1,157 @@
+Revert "gfs2: Force withdraw to replay journals and wait for it to finish" (1/6)
+
+jira KERNEL-1613
+Rebuild_History Non-Buildable kernel-5.14.0-687.49.1.el9_8
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 20b44ddbbb0712db15c6946eb94a9e240c1ba271
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.49.1.el9_8/20b44ddb.failed
+
+The current withdraw code duplicates the journal recovery code gfs2
+already has for dealing with node failures, and it does so poorly.  That
+code was added because when releasing a lockspace, we didn't have a way
+to indicate that the lockspace needs recovery.  We now do have this
+feature, so the current withdraw code can be removed almost entirely.
+This is one of several steps towards that.
+
+Reverts parts of commit 601ef0d52e96 ("gfs2: Force withdraw to replay
+journals and wait for it to finish").
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 20b44ddbbb0712db15c6946eb94a9e240c1ba271)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/glock.c
+diff --cc fs/gfs2/glock.c
+index e224c0ef9659,a3abf418446b..000000000000
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@@ -760,11 -757,7 +760,15 @@@ skip_inval
+  	 * gfs2_gl_hash_clear calls clear_glock) and recovery is complete
+  	 * then it's okay to tell dlm to unlock it.
+  	 */
+++<<<<<<< HEAD
+ +	if (unlikely(sdp->sd_log_error) && !gfs2_withdrawing_or_withdrawn(sdp))
+ +		gfs2_withdraw_delayed(sdp);
+ +	if (glock_blocked_by_withdraw(gl) &&
+ +	    (target != LM_ST_UNLOCKED ||
+ +	     test_bit(SDF_WITHDRAW_RECOVERY, &sdp->sd_flags))) {
+++=======
++ 	if (glock_blocked_by_withdraw(gl) && target != LM_ST_UNLOCKED) {
+++>>>>>>> 20b44ddbbb07 (Revert "gfs2: Force withdraw to replay journals and wait for it to finish" (1/6))
+  		if (!is_system_glock(gl)) {
+  			request_demote(gl, LM_ST_UNLOCKED, 0, false);
+  			/*
+@@@ -1666,9 -1646,7 +1670,8 @@@ static void __gfs2_glock_dq(struct gfs2
+  void gfs2_glock_dq(struct gfs2_holder *gh)
+  {
+  	struct gfs2_glock *gl = gh->gh_gl;
+- 	struct gfs2_sbd *sdp = gl->gl_name.ln_sbd;
+  
+ +again:
+  	spin_lock(&gl->gl_lockref.lock);
+  	if (!gfs2_holder_queued(gh)) {
+  		/*
+* Unmerged path fs/gfs2/glock.c
+diff --git a/fs/gfs2/incore.h b/fs/gfs2/incore.h
+index 02928f678662..eed62e7e877e 100644
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@ -603,8 +603,6 @@ enum {
+ 	SDF_WITHDRAWING		= 11, /* Will withdraw eventually */
+ 	SDF_WITHDRAW_IN_PROG	= 12, /* Withdraw is in progress */
+ 	SDF_REMOTE_WITHDRAW	= 13, /* Performing remote recovery */
+-	SDF_WITHDRAW_RECOVERY	= 14, /* Wait for journal recovery when we are
+-					 withdrawing */
+ 	SDF_KILL		= 15,
+ 	SDF_EVICTING		= 16,
+ 	SDF_FROZEN		= 17,
+@@ -763,7 +761,6 @@ struct gfs2_sbd {
+ 	struct gfs2_jdesc *sd_jdesc;
+ 	struct gfs2_holder sd_journal_gh;
+ 	struct gfs2_holder sd_jinode_gh;
+-	struct gfs2_glock *sd_jinode_gl;
+ 
+ 	struct gfs2_holder sd_sc_gh;
+ 	struct buffer_head *sd_sc_bh;
+@@ -848,7 +845,6 @@ struct gfs2_sbd {
+ 
+ 	unsigned long sd_last_warning;
+ 	struct dentry *debugfs_dir;    /* debugfs directory */
+-	unsigned long sd_glock_dqs_held;
+ };
+ 
+ #define GFS2_BAD_INO 1
+diff --git a/fs/gfs2/ops_fstype.c b/fs/gfs2/ops_fstype.c
+index 6391ab5ce0b9..31560e245843 100644
+--- a/fs/gfs2/ops_fstype.c
++++ b/fs/gfs2/ops_fstype.c
+@@ -781,7 +781,6 @@ static int init_journal(struct gfs2_sbd *sdp, int undo)
+ 		}
+ 
+ 		ip = GFS2_I(sdp->sd_jdesc->jd_inode);
+-		sdp->sd_jinode_gl = ip->i_gl;
+ 		error = gfs2_glock_nq_init(ip->i_gl, LM_ST_SHARED,
+ 					   LM_FLAG_RECOVER | GL_EXACT |
+ 					   GL_NOCACHE | GL_NOPID,
+diff --git a/fs/gfs2/sys.c b/fs/gfs2/sys.c
+index 2103b098315f..ba5954b687a9 100644
+--- a/fs/gfs2/sys.c
++++ b/fs/gfs2/sys.c
+@@ -87,7 +87,6 @@ static ssize_t status_show(struct gfs2_sbd *sdp, char *buf)
+ 		     "Withdrawing:              %d\n"
+ 		     "Withdraw In Prog:         %d\n"
+ 		     "Remote Withdraw:          %d\n"
+-		     "Withdraw Recovery:        %d\n"
+ 		     "Killing:                  %d\n"
+ 		     "sd_log_error:             %d\n"
+ 		     "sd_log_flush_lock:        %d\n"
+@@ -117,7 +116,6 @@ static ssize_t status_show(struct gfs2_sbd *sdp, char *buf)
+ 		     test_bit(SDF_WITHDRAWING, &f),
+ 		     test_bit(SDF_WITHDRAW_IN_PROG, &f),
+ 		     test_bit(SDF_REMOTE_WITHDRAW, &f),
+-		     test_bit(SDF_WITHDRAW_RECOVERY, &f),
+ 		     test_bit(SDF_KILL, &f),
+ 		     sdp->sd_log_error,
+ 		     rwsem_is_locked(&sdp->sd_log_flush_lock),
+diff --git a/fs/gfs2/util.c b/fs/gfs2/util.c
+index 58ec0928a879..bb49ad62686c 100644
+--- a/fs/gfs2/util.c
++++ b/fs/gfs2/util.c
+@@ -134,8 +134,6 @@ static void signal_our_withdraw(struct gfs2_sbd *sdp)
+ 	i_gl = ip->i_gl;
+ 	no_formal_ino = ip->i_no_formal_ino;
+ 
+-	/* Prevent any glock dq until withdraw recovery is complete */
+-	set_bit(SDF_WITHDRAW_RECOVERY, &sdp->sd_flags);
+ 	/*
+ 	 * Don't tell dlm we're bailing until we have no more buffers in the
+ 	 * wind. If journal had an IO error, the log code should just purge
+@@ -173,7 +171,6 @@ static void signal_our_withdraw(struct gfs2_sbd *sdp)
+ 	if (sdp->sd_lockstruct.ls_ops->lm_lock == NULL) { /* lock_nolock */
+ 		if (!ret)
+ 			ret = -EIO;
+-		clear_bit(SDF_WITHDRAW_RECOVERY, &sdp->sd_flags);
+ 		goto skip_recovery;
+ 	}
+ 	/*
+@@ -233,7 +230,6 @@ static void signal_our_withdraw(struct gfs2_sbd *sdp)
+ 	ret = gfs2_glock_nq(&sdp->sd_live_gh);
+ 
+ 	gfs2_glock_put(live_gl); /* drop extra reference we acquired */
+-	clear_bit(SDF_WITHDRAW_RECOVERY, &sdp->sd_flags);
+ 
+ 	/*
+ 	 * If we actually got the "live" lock in EX mode, there are no other
+@@ -288,9 +284,6 @@ static void signal_our_withdraw(struct gfs2_sbd *sdp)
+ 	else
+ 		fs_warn(sdp, "Journal recovery skipped for jid %d until next "
+ 			"mount.\n", sdp->sd_lockstruct.ls_jid);
+-	fs_warn(sdp, "Glock dequeues delayed: %lu\n", sdp->sd_glock_dqs_held);
+-	sdp->sd_glock_dqs_held = 0;
+-	wake_up_bit(&sdp->sd_flags, SDF_WITHDRAW_RECOVERY);
+ }
+ 
+ void gfs2_lm(struct gfs2_sbd *sdp, const char *fmt, ...)

@@ -1,0 +1,217 @@
+gfs2: Clean up properly during a withdraw
+
+jira KERNEL-1613
+Rebuild_History Non-Buildable kernel-5.14.0-687.49.1.el9_8
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 0e10da69d1671109b2ae5ed3eed6aa44b5ee64bc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.49.1.el9_8/0e10da69.failed
+
+During a withdraw, we don't want to write out any more data than we have
+to, so in do_xmote(), skip the ->go_sync() glock operation.  We still
+want to keep calling ->go_inval() to discard any cached data or
+metadata, whether clean or dirty.
+
+We do still allow glocks to transition into state LM_ST_UNLOCKED.  This
+has the desired side effect of calling ->go_inval() and invalidating the
+glock caches.
+
+Function gfs2_withdraw_glocks() is already used for dequeuing any
+left-over waiters.  We still want that to happen, but additionally, we
+want all glocks to be unlocked.
+
+Finally, we change function do_promote() to refuse any further
+promotions.
+
+This commit cleans up the leftovers of commit 86934198eefa ("gfs2: Clear
+flags when withdraw prevents xmote").
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 0e10da69d1671109b2ae5ed3eed6aa44b5ee64bc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/glock.c
+diff --cc fs/gfs2/glock.c
+index 4e911a93b7d0,267b442b4c09..000000000000
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@@ -696,8 -659,19 +701,24 @@@ __acquires(&gl->gl_lockref.lock
+  	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	if (target != LM_ST_UNLOCKED && glock_blocked_by_withdraw(gl))
+ +		goto skip_inval;
+++=======
++ 	/*
++ 	 * When a filesystem is withdrawing, the remaining cluster nodes will
++ 	 * take care of recovering the withdrawing node's journal.  We only
++ 	 * need to make sure that once we trigger remote recovery, we won't
++ 	 * write to the shared block device anymore.  This means that here,
++ 	 *
++ 	 * - no new writes to the filesystem must be triggered (->go_sync()).
++ 	 *
++ 	 * - any cached data should be discarded by calling ->go_inval(), dirty
++ 	 *   or not and journaled or unjournaled.
++ 	 *
++ 	 * - no more dlm locking operations should be issued (->lm_lock()).
++ 	 */
+++>>>>>>> 0e10da69d167 (gfs2: Clean up properly during a withdraw)
+  
+  	GLOCK_BUG_ON(gl, gl->gl_state == target);
+  	GLOCK_BUG_ON(gl, gl->gl_state == gl->gl_target);
+@@@ -705,85 -680,26 +727,101 @@@
+  		goto skip_inval;
+  
+  	spin_unlock(&gl->gl_lockref.lock);
+++<<<<<<< HEAD
+ +	ret = glops->go_sync(gl);
+ +	/* If we had a problem syncing (due to io errors or whatever,
+ +	 * we should not invalidate the metadata or tell dlm to
+ +	 * release the glock to other nodes.
+ +	 */
+ +	if (ret) {
+ +		if (cmpxchg(&sdp->sd_log_error, 0, ret)) {
+ +			fs_err(sdp, "Error %d syncing glock\n", ret);
+ +			gfs2_dump_glock(NULL, gl, true);
+++=======
++ 	if (!gfs2_withdrawn(sdp)) {
++ 		ret = glops->go_sync(gl);
++ 		if (ret) {
++ 			if (cmpxchg(&sdp->sd_log_error, 0, ret)) {
++ 				fs_err(sdp, "Error %d syncing glock\n", ret);
++ 				gfs2_dump_glock(NULL, gl, true);
++ 				gfs2_withdraw(sdp);
++ 			}
+++>>>>>>> 0e10da69d167 (gfs2: Clean up properly during a withdraw)
+  		}
+- 		spin_lock(&gl->gl_lockref.lock);
+- 		goto skip_inval;
+  	}
+  
+ -	if (target == LM_ST_UNLOCKED || target == LM_ST_DEFERRED)
+ +	if (target == LM_ST_UNLOCKED || target == LM_ST_DEFERRED) {
+ +		/*
+ +		 * The call to go_sync should have cleared out the ail list.
+ +		 * If there are still items, we have a problem. We ought to
+ +		 * withdraw, but we can't because the withdraw code also uses
+ +		 * glocks. Warn about the error, dump the glock, then fall
+ +		 * through and wait for logd to do the withdraw for us.
+ +		 */
+ +		if ((atomic_read(&gl->gl_ail_count) != 0) &&
+ +		    (!cmpxchg(&sdp->sd_log_error, 0, -EIO))) {
+ +			gfs2_glock_assert_warn(gl,
+ +					       !atomic_read(&gl->gl_ail_count));
+ +			gfs2_dump_glock(NULL, gl, true);
+ +		}
+  		glops->go_inval(gl, target == LM_ST_DEFERRED ? 0 : DIO_METADATA);
+ +	}
+  	spin_lock(&gl->gl_lockref.lock);
+  
+  skip_inval:
+++<<<<<<< HEAD
+ +	/*
+ +	 * Check for an error encountered since we called go_sync and go_inval.
+ +	 * If so, we can't withdraw from the glock code because the withdraw
+ +	 * code itself uses glocks (see function signal_our_withdraw) to
+ +	 * change the mount to read-only. Most importantly, we must not call
+ +	 * dlm to unlock the glock until the journal is in a known good state
+ +	 * (after journal replay) otherwise other nodes may use the object
+ +	 * (rgrp or dinode) and then later, journal replay will corrupt the
+ +	 * file system. The best we can do here is wait for the logd daemon
+ +	 * to see sd_log_error and withdraw, and in the meantime, requeue the
+ +	 * work for later.
+ +	 *
+ +	 * We make a special exception for some system glocks, such as the
+ +	 * system statfs inode glock, which needs to be granted before the
+ +	 * gfs2_quotad daemon can exit, and that exit needs to finish before
+ +	 * we can unmount the withdrawn file system.
+ +	 *
+ +	 * However, if we're just unlocking the lock (say, for unmount, when
+ +	 * gfs2_gl_hash_clear calls clear_glock) and recovery is complete
+ +	 * then it's okay to tell dlm to unlock it.
+ +	 */
+ +	if (unlikely(sdp->sd_log_error) && !gfs2_withdrawing_or_withdrawn(sdp))
+ +		gfs2_withdraw_delayed(sdp);
+ +	if (glock_blocked_by_withdraw(gl) &&
+ +	    (target != LM_ST_UNLOCKED ||
+ +	     test_bit(SDF_WITHDRAW_RECOVERY, &sdp->sd_flags))) {
+ +		if (!is_system_glock(gl)) {
+ +			request_demote(gl, LM_ST_UNLOCKED, 0, false);
+ +			/*
+ +			 * Ordinarily, we would call dlm and its callback would call
+ +			 * finish_xmote, which would call state_change() to the new state.
+ +			 * Since we withdrew, we won't call dlm, so call state_change
+ +			 * manually, but to the UNLOCKED state we desire.
+ +			 */
+ +			state_change(gl, LM_ST_UNLOCKED);
+ +			/*
+ +			 * We skip telling dlm to do the locking, so we won't get a
+ +			 * reply that would otherwise clear GLF_LOCK. So we clear it here.
+ +			 */
+ +			if (!test_bit(GLF_CANCELING, &gl->gl_flags))
+ +				clear_bit(GLF_LOCK, &gl->gl_flags);
+ +			clear_bit(GLF_DEMOTE_IN_PROGRESS, &gl->gl_flags);
+ +			gl->gl_lockref.count++;
+ +			gfs2_glock_queue_work(gl, GL_GLOCK_DFT_HOLD);
+ +			return;
+ +		}
+++=======
++ 	if (gfs2_withdrawn(sdp)) {
++ 		if (target != LM_ST_UNLOCKED)
++ 			target = LM_OUT_ERROR;
++ 		goto out;
+++>>>>>>> 0e10da69d167 (gfs2: Clean up properly during a withdraw)
+  	}
+  
+  	if (ls->ls_ops->lm_lock) {
+@@@ -801,16 -713,20 +839,19 @@@
+  			gl->gl_lockref.count++;
+  			return;
+  		}
+ -		clear_bit(GLF_PENDING_REPLY, &gl->gl_flags);
+  
+- 		if (ret == -ENODEV && gl->gl_target == LM_ST_UNLOCKED &&
+- 		    target == LM_ST_UNLOCKED) {
++ 		if (ret == -ENODEV) {
+  			/*
+  			 * The lockspace has been released and the lock has
+  			 * been unlocked implicitly.
+  			 */
++ 			if (target != LM_ST_UNLOCKED) {
++ 				target = LM_OUT_ERROR;
++ 				goto out;
++ 			}
+  		} else {
+  			fs_err(sdp, "lm_lock ret %d\n", ret);
+ -			GLOCK_BUG_ON(gl, !gfs2_withdrawn(sdp));
+ +			GLOCK_BUG_ON(gl, !gfs2_withdrawing_or_withdrawn(sdp));
+  			return;
+  		}
+  	}
+@@@ -2205,9 -2083,17 +2247,22 @@@ static void dump_glock_func(struct gfs2
+  static void withdraw_glock(struct gfs2_glock *gl)
+  {
+  	spin_lock(&gl->gl_lockref.lock);
+++<<<<<<< HEAD
+ +	if (!__lockref_is_dead(&gl->gl_lockref) &&
+ +	    glock_blocked_by_withdraw(gl))
+++=======
++ 	if (!__lockref_is_dead(&gl->gl_lockref)) {
++ 		/*
++ 		 * We don't want to write back any more dirty data.  Unlock the
++ 		 * remaining inode and resource group glocks; this will cause
++ 		 * their ->go_inval() hooks to toss out all the remaining
++ 		 * cached data, dirty or not.
++ 		 */
++ 		if (gl->gl_ops->go_inval && gl->gl_state != LM_ST_UNLOCKED)
++ 			request_demote(gl, LM_ST_UNLOCKED, 0, false);
+++>>>>>>> 0e10da69d167 (gfs2: Clean up properly during a withdraw)
+  		do_error(gl, LM_OUT_ERROR); /* remove pending waiters */
++ 	}
+  	spin_unlock(&gl->gl_lockref.lock);
+  }
+  
+* Unmerged path fs/gfs2/glock.c
