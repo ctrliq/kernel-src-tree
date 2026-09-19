@@ -33,16 +33,16 @@
  */
 #include <linux/compat.h>
 #include <linux/debugfs.h>
-#include <linux/jhash.h>
-#include <linux/pagemap.h>
-#include <linux/gfp.h>
-#include <linux/vmalloc.h>
-#include <linux/memblock.h>
 #include <linux/fault-inject.h>
-#include <linux/slab.h>
-#include <linux/prctl.h>
+#include <linux/gfp.h>
+#include <linux/jhash.h>
+#include <linux/memblock.h>
 #include <linux/mempolicy.h>
 #include <linux/mmap_lock.h>
+#include <linux/pagemap.h>
+#include <linux/prctl.h>
+#include <linux/slab.h>
+#include <linux/vmalloc.h>
 
 #include "futex.h"
 #include "../locking/rtmutex_common.h"
@@ -783,7 +783,7 @@ void wait_for_owner_exiting(int ret, struct task_struct *exiting)
 	if (WARN_ON_ONCE(ret == -EBUSY && !exiting))
 		return;
 
-	mutex_lock(&exiting->futex_exit_mutex);
+	mutex_lock(&exiting->futex.exit_mutex);
 	/*
 	 * No point in doing state checking here. If the waiter got here
 	 * while the task was in exec()->exec_futex_release() then it can
@@ -792,7 +792,7 @@ void wait_for_owner_exiting(int ret, struct task_struct *exiting)
 	 * already. Highly unlikely and not a problem. Just one more round
 	 * through the futex maze.
 	 */
-	mutex_unlock(&exiting->futex_exit_mutex);
+	mutex_unlock(&exiting->futex.exit_mutex);
 
 	put_task_struct(exiting);
 }
@@ -1002,7 +1002,7 @@ retry:
 	 *
 	 * In both cases the following conditions are met:
 	 *
-	 *	1) task->robust_list->list_op_pending != NULL
+	 *	1) task->futex.robust_list->list_op_pending != NULL
 	 *	   @pending_op == true
 	 *	2) The owner part of user space futex value == 0
 	 *	3) Regular futex: @pi == false
@@ -1107,7 +1107,7 @@ static inline int fetch_robust_entry(struct robust_list __user **entry,
  */
 static void exit_robust_list(struct task_struct *curr)
 {
-	struct robust_list_head __user *head = curr->robust_list;
+	struct robust_list_head __user *head = curr->futex.robust_list;
 	struct robust_list __user *entry, *next_entry, *pending;
 	unsigned int limit = ROBUST_LIST_LIMIT, pi, pip;
 	unsigned int next_pi;
@@ -1201,7 +1201,7 @@ compat_fetch_robust_entry(compat_uptr_t *uentry, struct robust_list __user **ent
  */
 static void compat_exit_robust_list(struct task_struct *curr)
 {
-	struct compat_robust_list_head __user *head = curr->compat_robust_list;
+	struct compat_robust_list_head __user *head = curr->futex.compat_robust_list;
 	struct robust_list __user *entry, *next_entry, *pending;
 	unsigned int limit = ROBUST_LIST_LIMIT, pi, pip;
 	unsigned int next_pi;
@@ -1277,7 +1277,7 @@ static void compat_exit_robust_list(struct task_struct *curr)
  */
 static void exit_pi_state_list(struct task_struct *curr)
 {
-	struct list_head *next, *head = &curr->pi_state_list;
+	struct list_head *next, *head = &curr->futex.pi_state_list;
 	struct futex_pi_state *pi_state;
 	union futex_key key = FUTEX_KEY_INIT;
 
@@ -1362,19 +1362,19 @@ static inline void exit_pi_state_list(struct task_struct *curr) { }
 
 static void futex_cleanup(struct task_struct *tsk)
 {
-	if (unlikely(tsk->robust_list)) {
+	if (unlikely(tsk->futex.robust_list)) {
 		exit_robust_list(tsk);
-		tsk->robust_list = NULL;
+		tsk->futex.robust_list = NULL;
 	}
 
 #ifdef CONFIG_COMPAT
-	if (unlikely(tsk->compat_robust_list)) {
+	if (unlikely(tsk->futex.compat_robust_list)) {
 		compat_exit_robust_list(tsk);
-		tsk->compat_robust_list = NULL;
+		tsk->futex.compat_robust_list = NULL;
 	}
 #endif
 
-	if (unlikely(!list_empty(&tsk->pi_state_list)))
+	if (unlikely(!list_empty(&tsk->futex.pi_state_list)))
 		exit_pi_state_list(tsk);
 }
 
@@ -1398,9 +1398,9 @@ static void futex_cleanup(struct task_struct *tsk)
 void futex_exit_recursive(struct task_struct *tsk)
 {
 	/* If the state is FUTEX_STATE_EXITING then futex_exit_mutex is held */
-	if (tsk->futex_state == FUTEX_STATE_EXITING)
-		mutex_unlock(&tsk->futex_exit_mutex);
-	tsk->futex_state = FUTEX_STATE_DEAD;
+	if (tsk->futex.state == FUTEX_STATE_EXITING)
+		mutex_unlock(&tsk->futex.exit_mutex);
+	tsk->futex.state = FUTEX_STATE_DEAD;
 }
 
 static void futex_cleanup_begin(struct task_struct *tsk)
@@ -1411,7 +1411,7 @@ static void futex_cleanup_begin(struct task_struct *tsk)
 	 * tsk->futex_exit_mutex when it observes FUTEX_STATE_EXITING in
 	 * attach_to_pi_owner().
 	 */
-	mutex_lock(&tsk->futex_exit_mutex);
+	mutex_lock(&tsk->futex.exit_mutex);
 
 	/*
 	 * Switch the state to FUTEX_STATE_EXITING under tsk->pi_lock.
@@ -1425,7 +1425,7 @@ static void futex_cleanup_begin(struct task_struct *tsk)
 	 * be observed in exit_pi_state_list().
 	 */
 	raw_spin_lock_irq(&tsk->pi_lock);
-	tsk->futex_state = FUTEX_STATE_EXITING;
+	tsk->futex.state = FUTEX_STATE_EXITING;
 	raw_spin_unlock_irq(&tsk->pi_lock);
 }
 
@@ -1435,12 +1435,12 @@ static void futex_cleanup_end(struct task_struct *tsk, int state)
 	 * Lockless store. The only side effect is that an observer might
 	 * take another loop until it becomes visible.
 	 */
-	tsk->futex_state = state;
+	tsk->futex.state = state;
 	/*
 	 * Drop the exit protection. This unblocks waiters which observed
 	 * FUTEX_STATE_EXITING to reevaluate the state.
 	 */
-	mutex_unlock(&tsk->futex_exit_mutex);
+	mutex_unlock(&tsk->futex.exit_mutex);
 }
 
 void futex_exec_release(struct task_struct *tsk)
