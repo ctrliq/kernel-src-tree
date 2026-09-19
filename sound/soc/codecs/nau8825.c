@@ -2930,11 +2930,6 @@ static int nau8825_i2c_probe(struct i2c_client *i2c)
 		&nau8825_dai, 1);
 }
 
-static int nau8825_i2c_remove(struct i2c_client *client)
-{
-	return 0;
-}
-
 static const struct i2c_device_id nau8825_i2c_ids[] = {
 	{ "nau8825" },
 	{ }
@@ -2964,7 +2959,6 @@ static struct i2c_driver nau8825_driver = {
 		.acpi_match_table = ACPI_PTR(nau8825_acpi_match),
 	},
 	.probe_new = nau8825_i2c_probe,
-	.remove = nau8825_i2c_remove,
 	.id_table = nau8825_i2c_ids,
 };
 module_i2c_driver(nau8825_driver);
