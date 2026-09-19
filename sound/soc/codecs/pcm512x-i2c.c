@@ -36,12 +36,12 @@ static int pcm512x_i2c_remove(struct i2c_client *i2c)
 }
 
 static const struct i2c_device_id pcm512x_i2c_id[] = {
-	{ "pcm5121", },
-	{ "pcm5122", },
-	{ "pcm5141", },
-	{ "pcm5142", },
-	{ "tas5754", },
-	{ "tas5756", },
+	{ .name = "pcm5121" },
+	{ .name = "pcm5122" },
+	{ .name = "pcm5141" },
+	{ .name = "pcm5142" },
+	{ .name = "tas5754" },
+	{ .name = "tas5756" },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, pcm512x_i2c_id);
