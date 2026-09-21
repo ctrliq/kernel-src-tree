@@ -6619,23 +6619,24 @@ static void nft_unregister_flowtable_hook(struct net *net,
 }
 
 static void nft_unregister_flowtable_net_hooks(struct net *net,
-					       struct nft_flowtable *flowtable)
+					       struct list_head *hook_list)
 {
 	struct nft_hook *hook;
 
-	list_for_each_entry(hook, &flowtable->hook_list, list)
+	list_for_each_entry(hook, hook_list, list)
 		nf_unregister_net_hook(net, &hook->ops);
 }
 
 static int nft_register_flowtable_net_hooks(struct net *net,
 					    struct nft_table *table,
+					    struct list_head *hook_list,
 					    struct nft_flowtable *flowtable)
 {
 	struct nft_hook *hook, *hook2, *next;
 	struct nft_flowtable *ft;
 	int err, i = 0;
 
-	list_for_each_entry(hook, &flowtable->hook_list, list) {
+	list_for_each_entry(hook, hook_list, list) {
 		list_for_each_entry(ft, &table->flowtables, list) {
 			list_for_each_entry(hook2, &ft->hook_list, list) {
 				if (hook->ops.dev == hook2->ops.dev &&
@@ -6666,7 +6667,7 @@ static int nft_register_flowtable_net_hooks(struct net *net,
 	return 0;
 
 err_unregister_net_hooks:
-	list_for_each_entry_safe(hook, next, &flowtable->hook_list, list) {
+	list_for_each_entry_safe(hook, next, hook_list, list) {
 		if (i-- <= 0)
 			break;
 
@@ -6770,7 +6771,9 @@ static int nf_tables_newflowtable(struct net *net, struct sock *nlsk,
 	flowtable->data.priority = flowtable_hook.priority;
 	flowtable->hooknum = flowtable_hook.num;
 
-	err = nft_register_flowtable_net_hooks(ctx.net, table, flowtable);
+	err = nft_register_flowtable_net_hooks(ctx.net, table,
+					       &flowtable->hook_list,
+					       flowtable);
 	if (err < 0) {
 		list_for_each_entry_safe(hook, next, &flowtable->hook_list, list) {
 			list_del_rcu(&hook->list);
@@ -7942,7 +7945,7 @@ static int nf_tables_commit(struct net *net, struct sk_buff *skb)
 						   nft_trans_flowtable(trans),
 						   NFT_MSG_DELFLOWTABLE);
 			nft_unregister_flowtable_net_hooks(net,
-					nft_trans_flowtable(trans));
+					&nft_trans_flowtable(trans)->hook_list);
 			break;
 		}
 	}
@@ -8112,7 +8115,7 @@ static int __nf_tables_abort(struct net *net, enum nfnl_abort_action action)
 			trans->ctx.table->use--;
 			list_del_rcu(&nft_trans_flowtable(trans)->list);
 			nft_unregister_flowtable_net_hooks(net,
-					nft_trans_flowtable(trans));
+					&nft_trans_flowtable(trans)->hook_list);
 			break;
 		case NFT_MSG_DELFLOWTABLE:
 			trans->ctx.table->use++;
