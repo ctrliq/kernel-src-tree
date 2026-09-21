@@ -270,7 +270,7 @@ nfsd4_create_file(struct svc_rqst *rqstp, struct svc_fh *fhp,
 		.na_iattr	= iap,
 		.na_seclabel	= &open->op_label,
 	};
-	struct dentry *parent, *child;
+	struct dentry *parent, *child = ERR_PTR(-EINVAL);
 	__u32 v_mtime, v_atime;
 	struct inode *inode;
 	__be32 status;
@@ -294,10 +294,14 @@ nfsd4_create_file(struct svc_rqst *rqstp, struct svc_fh *fhp,
 	if (open->op_acl) {
 		if (open->op_dpacl || open->op_pacl) {
 			status = nfserr_inval;
-			goto out_write;
+			goto out;
 		}
-		if (is_create_with_attrs(open))
-			nfsd4_acl_to_attr(NF4REG, open->op_acl, &attrs);
+		if (is_create_with_attrs(open)) {
+			status = nfsd4_acl_to_attr(NF4REG, open->op_acl,
+						   &attrs);
+			if (status)
+				goto out;
+		}
 	} else if (is_create_with_attrs(open)) {
 		/* The dpacl and pacl will get released by nfsd_attrs_free(). */
 		attrs.na_dpacl = open->op_dpacl;
@@ -427,7 +431,6 @@ out:
 	nfsd_attrs_free(&attrs);
 	if (child && !IS_ERR(child))
 		dput(child);
-out_write:
 	fh_drop_write(fhp);
 	return status;
 }
