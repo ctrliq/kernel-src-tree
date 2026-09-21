@@ -14,6 +14,7 @@
 
 #include <linux/sched.h>
 #include <linux/mm_types.h>
+#include <linux/cpufeature.h>
 #include <linux/page-flags.h>
 #include <linux/radix-tree.h>
 #include <linux/atomic.h>
@@ -645,18 +646,6 @@ static inline int mm_uses_skeys(struct mm_struct *mm)
 		return 1;
 #endif
 	return 0;
-}
-
-static inline void csp(unsigned int *ptr, unsigned int old, unsigned int new)
-{
-	union register_pair r1 = { .even = old, .odd = new, };
-	unsigned long address = (unsigned long)ptr | 1;
-
-	asm volatile(
-		"	csp	%[r1],%[address]"
-		: [r1] "+&d" (r1.pair), "+m" (*ptr)
-		: [address] "d" (address)
-		: "cc");
 }
 
 /**
@@ -1338,7 +1327,7 @@ static inline void flush_tlb_fix_spurious_fault(struct vm_area_struct *vma,
 	 * PTE does not have _PAGE_PROTECT set, to avoid unnecessary overhead.
 	 * A local RDP can be used to do the flush.
 	 */
-	if (MACHINE_HAS_RDP && !(pte_val(*ptep) & _PAGE_PROTECT))
+	if (cpu_has_rdp() && !(pte_val(*ptep) & _PAGE_PROTECT))
 		__ptep_rdp(address, ptep, 1);
 }
 #define flush_tlb_fix_spurious_fault flush_tlb_fix_spurious_fault
@@ -1353,7 +1342,7 @@ static inline int ptep_set_access_flags(struct vm_area_struct *vma,
 {
 	if (pte_same(*ptep, entry))
 		return 0;
-	if (MACHINE_HAS_RDP && !mm_has_pgste(vma->vm_mm) && pte_allow_rdp(*ptep, entry))
+	if (cpu_has_rdp() && !mm_has_pgste(vma->vm_mm) && pte_allow_rdp(*ptep, entry))
 		ptep_reset_dat_prot(vma->vm_mm, addr, ptep, entry);
 	else
 		ptep_xchg_direct(vma->vm_mm, addr, ptep, entry);
@@ -1393,7 +1382,6 @@ int set_pgste_bits(struct mm_struct *mm, unsigned long addr,
 int get_pgste(struct mm_struct *mm, unsigned long hva, unsigned long *pgstep);
 int pgste_perform_essa(struct mm_struct *mm, unsigned long hva, int orc,
 			unsigned long *oldpte, unsigned long *oldpgste);
-void gmap_pmdp_csp(struct mm_struct *mm, unsigned long vmaddr);
 void gmap_pmdp_invalidate(struct mm_struct *mm, unsigned long vmaddr);
 void gmap_pmdp_idte_local(struct mm_struct *mm, unsigned long vmaddr);
 void gmap_pmdp_idte_global(struct mm_struct *mm, unsigned long vmaddr);
@@ -1686,10 +1674,10 @@ static inline pmd_t mk_pmd_phys(unsigned long physpage, pgprot_t pgprot)
 
 #endif /* CONFIG_TRANSPARENT_HUGEPAGE || CONFIG_HUGETLB_PAGE */
 
-static inline void __pmdp_csp(pmd_t *pmdp)
+static inline void __pmdp_cspg(pmd_t *pmdp)
 {
-	csp((unsigned int *)pmdp + 1, pmd_val(*pmdp),
-	    pmd_val(*pmdp) | _SEGMENT_ENTRY_INVALID);
+	cspg((unsigned long *)pmdp, pmd_val(*pmdp),
+	     pmd_val(*pmdp) | _SEGMENT_ENTRY_INVALID);
 }
 
 #define IDTE_GLOBAL	0

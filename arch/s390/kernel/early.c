@@ -8,6 +8,7 @@
 #define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
 
 #include <linux/sched/debug.h>
+#include <linux/cpufeature.h>
 #include <linux/compiler.h>
 #include <linux/init.h>
 #include <linux/errno.h>
@@ -167,9 +168,8 @@ static __init void setup_topology(void)
 {
 	int max_mnest;
 
-	if (!test_facility(11))
+	if (!cpu_has_topology())
 		return;
-	get_lowcore()->machine_flags |= MACHINE_FLAG_TOPOLOGY;
 	for (max_mnest = 6; max_mnest > 1; max_mnest--) {
 		if (stsi(&sysinfo_page, 15, 1, max_mnest) == 0)
 			break;
@@ -243,20 +243,14 @@ static __init void detect_machine_facilities(void)
 	}
 	if (test_facility(78))
 		get_lowcore()->machine_flags |= MACHINE_FLAG_EDAT2;
-	if (test_facility(3))
-		get_lowcore()->machine_flags |= MACHINE_FLAG_IDTE;
 	if (test_facility(50) && test_facility(73)) {
 		get_lowcore()->machine_flags |= MACHINE_FLAG_TE;
 		system_ctl_set_bit(0, CR0_TRANSACTIONAL_EXECUTION_BIT);
 	}
-	if (test_facility(51))
-		get_lowcore()->machine_flags |= MACHINE_FLAG_TLB_LC;
 	if (test_facility(129))
 		system_ctl_set_bit(0, CR0_VECTOR_BIT);
 	if (test_facility(130))
 		get_lowcore()->machine_flags |= MACHINE_FLAG_NX;
-	if (test_facility(133))
-		get_lowcore()->machine_flags |= MACHINE_FLAG_GS;
 	if (test_facility(139) && (tod_clock_base.tod >> 63)) {
 		/* Enabled signed clock comparator comparisons */
 		get_lowcore()->machine_flags |= MACHINE_FLAG_SCC;
@@ -267,10 +261,6 @@ static __init void detect_machine_facilities(void)
 		get_lowcore()->machine_flags |= MACHINE_FLAG_PCI_MIO;
 		/* the control bit is set during PCI initialization */
 	}
-	if (test_facility(194))
-		get_lowcore()->machine_flags |= MACHINE_FLAG_RDP;
-	if (test_facility(85))
-		get_lowcore()->machine_flags |= MACHINE_FLAG_SEQ_INSN;
 }
 
 static inline void save_vector_registers(void)
