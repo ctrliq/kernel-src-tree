@@ -185,7 +185,11 @@ free_pgd:
 
 bool pkvm_hyp_vm_is_created(struct kvm *kvm)
 {
-	return READ_ONCE(kvm->arch.pkvm.is_created);
+	/*
+	 * Serialised by config_lock/slots_lock, or by VM lifecycle at
+	 * teardown, so a plain read suffices.
+	 */
+	return kvm->arch.pkvm.is_created;
 }
 
 int pkvm_create_hyp_vm(struct kvm *kvm)
