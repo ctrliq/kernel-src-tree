@@ -5770,6 +5770,12 @@ int kvm_finalize_sys_regs(struct kvm_vcpu *vcpu)
 
 	guard(mutex)(&kvm->arch.config_lock);
 
+	if (vcpu_has_nv(vcpu)) {
+		int ret = kvm_init_nv_sysregs(vcpu);
+		if (ret)
+			return ret;
+	}
+
 	if (kvm_vm_has_ran_once(kvm))
 		return 0;
 
@@ -5816,12 +5822,6 @@ int kvm_finalize_sys_regs(struct kvm_vcpu *vcpu)
 		 * problem for GICv5-based guests in the future.
 		 */
 		kvm_vgic_finalize_idregs(kvm);
-	}
-
-	if (vcpu_has_nv(vcpu)) {
-		int ret = kvm_init_nv_sysregs(vcpu);
-		if (ret)
-			return ret;
 	}
 
 	return 0;
