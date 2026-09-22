@@ -2,6 +2,7 @@
 #include <linux/objtool.h>
 #include <linux/module.h>
 #include <linux/sort.h>
+#include <linux/bpf.h>
 #include <asm/ptrace.h>
 #include <asm/stacktrace.h>
 #include <asm/unwind.h>
@@ -169,6 +170,25 @@ static struct orc_entry *orc_ftrace_find(unsigned long ip)
 }
 #endif
 
+/* Fake frame pointer entry -- used as a fallback for generated code */
+static struct orc_entry orc_fp_entry = {
+	.type		= ORC_TYPE_CALL,
+	.sp_reg		= ORC_REG_BP,
+	.sp_offset	= 16,
+	.bp_reg		= ORC_REG_PREV_SP,
+	.bp_offset	= -16,
+};
+
+static struct orc_entry *orc_bpf_find(unsigned long ip)
+{
+#ifdef CONFIG_BPF_JIT
+	if (bpf_has_frame_pointer(ip))
+		return &orc_fp_entry;
+#endif
+
+	return NULL;
+}
+
 /*
  * If we crash with IP==0, the last successfully executed instruction
  * was probably an indirect function call with a NULL function pointer,
@@ -181,15 +201,6 @@ static struct orc_entry null_orc_entry = {
 	.sp_reg = ORC_REG_SP,
 	.bp_reg = ORC_REG_UNDEFINED,
 	.type = ORC_TYPE_CALL
-};
-
-/* Fake frame pointer entry -- used as a fallback for generated code */
-static struct orc_entry orc_fp_entry = {
-	.type		= ORC_TYPE_CALL,
-	.sp_reg		= ORC_REG_BP,
-	.sp_offset	= 16,
-	.bp_reg		= ORC_REG_PREV_SP,
-	.bp_offset	= -16,
 };
 
 static struct orc_entry *orc_find(unsigned long ip)
@@ -232,6 +243,11 @@ static struct orc_entry *orc_find(unsigned long ip)
 
 	/* Module lookup: */
 	orc = orc_module_find(ip);
+	if (orc)
+		return orc;
+
+	/* BPF lookup: */
+	orc = orc_bpf_find(ip);
 	if (orc)
 		return orc;
 
@@ -492,9 +508,8 @@ bool unwind_next_frame(struct unwind_state *state)
 	if (!orc) {
 		/*
 		 * As a fallback, try to assume this code uses a frame pointer.
-		 * This is useful for generated code, like BPF, which ORC
-		 * doesn't know about.  This is just a guess, so the rest of
-		 * the unwind is no longer considered reliable.
+		 * This is just a guess, so the rest of the unwind is no longer
+		 * considered reliable.
 		 */
 		orc = &orc_fp_entry;
 		state->error = true;

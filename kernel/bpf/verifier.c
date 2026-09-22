@@ -536,6 +536,22 @@ static bool is_async_callback_calling_insn(struct bpf_insn *insn)
 	       (bpf_pseudo_kfunc_call(insn) && is_async_callback_calling_kfunc(insn->imm));
 }
 
+static bool is_async_cb_sleepable(struct bpf_verifier_env *env, struct bpf_insn *insn)
+{
+	/* bpf_timer callbacks are never sleepable. */
+	if (bpf_helper_call(insn) && insn->imm == BPF_FUNC_timer_set_callback)
+		return false;
+
+	/* bpf_wq and bpf_task_work callbacks are always sleepable. */
+	if (bpf_pseudo_kfunc_call(insn) && insn->off == 0 &&
+	    is_bpf_wq_set_callback_impl_kfunc(insn->imm))
+		return true;
+	
+	verbose(env, "verifier bug: unhandled async callback in is_async_cb_sleepable\n");
+	WARN_ONCE(1, "verifier bug: unhandled async callback in is_async_cb_sleepable\n");
+	return false;
+}
+
 static bool is_may_goto_insn(struct bpf_insn *insn)
 {
 	return insn->code == (BPF_JMP | BPF_JCOND) && insn->src_reg == BPF_MAY_GOTO;
@@ -5436,8 +5452,7 @@ bad_type:
 
 static bool in_sleepable(struct bpf_verifier_env *env)
 {
-	return env->prog->sleepable ||
-	       (env->cur_state && env->cur_state->in_sleepable);
+	return env->cur_state->in_sleepable;
 }
 
 /* The non-sleepable programs and sleepable programs with explicit bpf_rcu_read_lock()
@@ -7750,34 +7765,63 @@ static int process_spin_lock(struct bpf_verifier_env *env, int regno,
 	return 0;
 }
 
-static int process_timer_func(struct bpf_verifier_env *env, int regno,
-			      struct bpf_call_arg_meta *meta)
+/* Check if @regno is a pointer to a specific field in a map value */
+static int check_map_field_pointer(struct bpf_verifier_env *env, u32 regno,
+				   enum btf_field_type field_type)
 {
 	struct bpf_reg_state *regs = cur_regs(env), *reg = &regs[regno];
 	bool is_const = tnum_is_const(reg->var_off);
 	struct bpf_map *map = reg->map_ptr;
 	u64 val = reg->var_off.value;
+	const char *struct_name = btf_field_type_name(field_type);
+	int field_off = -1;
 
 	if (!is_const) {
 		verbose(env,
-			"R%d doesn't have constant offset. bpf_timer has to be at the constant offset\n",
-			regno);
+			"R%d doesn't have constant offset. %s has to be at the constant offset\n",
+			regno, struct_name);
 		return -EINVAL;
 	}
 	if (!map->btf) {
-		verbose(env, "map '%s' has to have BTF in order to use bpf_timer\n",
-			map->name);
+		verbose(env, "map '%s' has to have BTF in order to use %s\n", map->name,
+			struct_name);
 		return -EINVAL;
 	}
-	if (!btf_record_has_field(map->record, BPF_TIMER)) {
-		verbose(env, "map '%s' has no valid bpf_timer\n", map->name);
+	if (!btf_record_has_field(map->record, field_type)) {
+		verbose(env, "map '%s' has no valid %s\n", map->name, struct_name);
 		return -EINVAL;
 	}
-	if (map->record->timer_off != val + reg->off) {
-		verbose(env, "off %lld doesn't point to 'struct bpf_timer' that is at %d\n",
-			val + reg->off, map->record->timer_off);
+	switch (field_type) {
+	case BPF_TIMER:
+		field_off = map->record->timer_off;
+		break;
+	case BPF_WORKQUEUE:
+		field_off = map->record->wq_off;
+		break;
+	default:
+		verbose(env, "verifier bug: unsupported BTF field type: %s\n", struct_name);
+		WARN_ONCE(1, "verifier bug: unsupported BTF field type: %s\n", struct_name);
 		return -EINVAL;
 	}
+	if (field_off != val + reg->off) {
+		verbose(env, "off %lld doesn't point to 'struct %s' that is at %d\n",
+			val + reg->off, struct_name, field_off);
+		return -EINVAL;
+	}
+	return 0;
+}
+
+static int process_timer_func(struct bpf_verifier_env *env, int regno,
+			      struct bpf_call_arg_meta *meta)
+{
+	struct bpf_reg_state *regs = cur_regs(env), *reg = &regs[regno];
+	struct bpf_map *map = reg->map_ptr;
+	int err;
+
+	err = check_map_field_pointer(env, regno, BPF_TIMER);
+	if (err)
+		return err;
+
 	if (meta->map_ptr) {
 		verbose(env, "verifier bug. Two map pointers in a timer helper\n");
 		return -EFAULT;
@@ -7796,13 +7840,18 @@ static int process_wq_func(struct bpf_verifier_env *env, int regno,
 {
 	struct bpf_reg_state *regs = cur_regs(env), *reg = &regs[regno];
 	struct bpf_map *map = reg->map_ptr;
-	u64 val = reg->var_off.value;
+	int err;
 
-	if (map->record->wq_off != val + reg->off) {
-		verbose(env, "off %lld doesn't point to 'struct bpf_wq' that is at %d\n",
-			val + reg->off, map->record->wq_off);
-		return -EINVAL;
+	err = check_map_field_pointer(env, regno, BPF_WORKQUEUE);
+	if (err)
+		return err;
+
+	if (meta->map.ptr) {
+		verbose(env, "verifier bug: Two map pointers in a bpf_wq helper");
+		WARN_ONCE(1, "verifier bug: Two map pointers in a bpf_wq helper");
+		return -EFAULT;
 	}
+
 	meta->map.uid = reg->map_uid;
 	meta->map.ptr = map;
 	return 0;
@@ -9760,7 +9809,7 @@ static int push_callback_call(struct bpf_verifier_env *env, struct bpf_insn *ins
 		env->subprog_info[subprog].is_async_cb = true;
 		async_cb = push_async_cb(env, env->subprog_info[subprog].start,
 					 insn_idx, subprog,
-					 is_bpf_wq_set_callback_impl_kfunc(insn->imm));
+					 is_async_cb_sleepable(env, insn));
 		if (!async_cb)
 			return -EFAULT;
 		callee = async_cb->frame[0];
@@ -10483,6 +10532,14 @@ static int get_helper_proto(struct bpf_verifier_env *env, int func_id,
 	return *ptr && (*ptr)->func ? 0 : -EINVAL;
 }
 
+/* Check if we're in a sleepable context. */
+static inline bool in_sleepable_context(struct bpf_verifier_env *env)
+{
+	return !env->cur_state->active_rcu_lock &&
+	       !env->cur_state->active_preempt_lock &&
+	       in_sleepable(env);
+}
+
 static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			     int *insn_idx_p)
 {
@@ -10551,9 +10608,6 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 				func_id_name(func_id), func_id);
 			return -EINVAL;
 		}
-
-		if (in_sleepable(env) && is_storage_get_function(func_id))
-			env->insn_aux_data[insn_idx].storage_get_func_atomic = true;
 	}
 
 	if (env->cur_state->active_preempt_lock) {
@@ -10562,10 +10616,11 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 				func_id_name(func_id), func_id);
 			return -EINVAL;
 		}
-
-		if (in_sleepable(env) && is_storage_get_function(func_id))
-			env->insn_aux_data[insn_idx].storage_get_func_atomic = true;
 	}
+
+	/* Track non-sleepable context for helpers. */
+	if (!in_sleepable_context(env))
+		env->insn_aux_data[insn_idx].non_sleepable = true;
 
 	meta.func_id = func_id;
 	/* check args */
@@ -12537,6 +12592,10 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		verbose(env, "program must be sleepable to call sleepable kfunc %s\n", func_name);
 		return -EACCES;
 	}
+
+	/* Track non-sleepable context for kfuncs, same as for helpers. */
+	if (!in_sleepable_context(env))
+		insn_aux->non_sleepable = true;
 
 	/* Check the arguments */
 	err = check_kfunc_args(env, &meta, insn_idx);
@@ -14767,6 +14826,30 @@ static int is_scalar_branch_taken(struct bpf_reg_state *reg1, struct bpf_reg_sta
 	s64 smin2 = is_jmp32 ? (s64)reg2->s32_min_value : reg2->smin_value;
 	s64 smax2 = is_jmp32 ? (s64)reg2->s32_max_value : reg2->smax_value;
 
+	if (reg1 == reg2) {
+		switch (opcode) {
+		case BPF_JGE:
+		case BPF_JLE:
+		case BPF_JSGE:
+		case BPF_JSLE:
+		case BPF_JEQ:
+			return 1;
+		case BPF_JGT:
+		case BPF_JLT:
+		case BPF_JSGT:
+		case BPF_JSLT:
+		case BPF_JNE:
+			return 0;
+		case BPF_JSET:
+			if (tnum_is_const(t1))
+				return t1.value != 0;
+			else
+				return (smin1 <= 0 && smax1 >= 0) ? -1 : 1;
+		default:
+			return -1;
+		}
+	}
+
 	switch (opcode) {
 	case BPF_JEQ:
 		/* constants, umin/umax and smin/smax checks would be
@@ -15207,6 +15290,13 @@ static int reg_set_min_max(struct bpf_verifier_env *env,
 	 * the same object, but we don't bother with that).
 	 */
 	if (false_reg1->type != SCALAR_VALUE || false_reg2->type != SCALAR_VALUE)
+		return 0;
+
+	/* We compute branch direction for same SCALAR_VALUE registers in
+	 * is_scalar_branch_taken(). For unknown branch directions (e.g., BPF_JSET)
+	 * on the same registers, we don't need to adjust the min/max values.
+	 */
+	if (false_reg1 == false_reg2)
 		return 0;
 
 	/* fallthrough (FALSE) branch */
@@ -21036,8 +21126,7 @@ static int do_misc_fixups(struct bpf_verifier_env *env)
 		}
 
 		if (is_storage_get_function(insn->imm)) {
-			if (!in_sleepable(env) ||
-			    env->insn_aux_data[i + delta].storage_get_func_atomic)
+			if (env->insn_aux_data[i + delta].non_sleepable)
 				insn_buf[0] = BPF_MOV64_IMM(BPF_REG_5, (__force __s32)GFP_ATOMIC);
 			else
 				insn_buf[0] = BPF_MOV64_IMM(BPF_REG_5, (__force __s32)GFP_KERNEL);
@@ -21683,6 +21772,7 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
 	state->curframe = 0;
 	state->speculative = false;
 	state->branches = 1;
+	state->in_sleepable = env->prog->sleepable;
 	state->frame[0] = kzalloc(sizeof(struct bpf_func_state), GFP_KERNEL);
 	if (!state->frame[0]) {
 		kfree(state);
