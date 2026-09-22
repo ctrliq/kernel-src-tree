@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * Copyright (c) 2022 Meta Platforms, Inc. and affiliates.
- * Copyright (c) 2022 Tejun Heo <tj@kernel.org>
- * Copyright (c) 2022 David Vernet <dvernet@meta.com>
+ * Copyright (c) 2025 Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2025 Tejun Heo <tj@kernel.org>
  */
 #include <stdio.h>
 #include <unistd.h>
@@ -11,16 +10,15 @@
 #include <libgen.h>
 #include <bpf/bpf.h>
 #include <scx/common.h>
-#include "scx_simple.bpf.skel.h"
+#include "scx_cpu0.bpf.skel.h"
 
 const char help_fmt[] =
-"A simple sched_ext scheduler.\n"
+"A cpu0 sched_ext scheduler.\n"
 "\n"
 "See the top-level comment in .bpf.c for more details.\n"
 "\n"
-"Usage: %s [-f] [-v]\n"
+"Usage: %s [-v]\n"
 "\n"
-"  -f            Use FIFO scheduling instead of weighted vtime scheduling\n"
 "  -v            Print libbpf debug messages\n"
 "  -h            Display this help and exit\n";
 
@@ -34,12 +32,12 @@ static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va
 	return vfprintf(stderr, format, args);
 }
 
-static void sigint_handler(int simple)
+static void sigint_handler(int sig)
 {
 	exit_req = 1;
 }
 
-static void read_stats(struct scx_simple *skel, __u64 *stats)
+static void read_stats(struct scx_cpu0 *skel, __u64 *stats)
 {
 	int nr_cpus = libbpf_num_possible_cpus();
 	assert(nr_cpus > 0);
@@ -62,7 +60,7 @@ static void read_stats(struct scx_simple *skel, __u64 *stats)
 
 int main(int argc, char **argv)
 {
-	struct scx_simple *skel;
+	struct scx_cpu0 *skel;
 	struct bpf_link *link;
 	__u32 opt;
 	__u64 ecode;
@@ -71,13 +69,12 @@ int main(int argc, char **argv)
 	signal(SIGINT, sigint_handler);
 	signal(SIGTERM, sigint_handler);
 restart:
-	skel = SCX_OPS_OPEN(simple_ops, scx_simple);
+	skel = SCX_OPS_OPEN(cpu0_ops, scx_cpu0);
 
-	while ((opt = getopt(argc, argv, "fvh")) != -1) {
+	skel->rodata->nr_cpus = libbpf_num_possible_cpus();
+
+	while ((opt = getopt(argc, argv, "vh")) != -1) {
 		switch (opt) {
-		case 'f':
-			skel->rodata->fifo_sched = true;
-			break;
 		case 'v':
 			verbose = true;
 			break;
@@ -87,21 +84,21 @@ restart:
 		}
 	}
 
-	SCX_OPS_LOAD(skel, simple_ops, scx_simple, uei);
-	link = SCX_OPS_ATTACH(skel, simple_ops, scx_simple);
+	SCX_OPS_LOAD(skel, cpu0_ops, scx_cpu0, uei);
+	link = SCX_OPS_ATTACH(skel, cpu0_ops, scx_cpu0);
 
 	while (!exit_req && !UEI_EXITED(skel, uei)) {
 		__u64 stats[2];
 
 		read_stats(skel, stats);
-		printf("local=%llu global=%llu\n", stats[0], stats[1]);
+		printf("local=%llu cpu0=%llu\n", stats[0], stats[1]);
 		fflush(stdout);
 		sleep(1);
 	}
 
 	bpf_link__destroy(link);
 	ecode = UEI_REPORT(skel, uei);
-	scx_simple__destroy(skel);
+	scx_cpu0__destroy(skel);
 
 	if (UEI_ECODE_RESTART(ecode))
 		goto restart;
