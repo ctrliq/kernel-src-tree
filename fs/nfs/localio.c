@@ -52,7 +52,6 @@ struct nfs_local_fsync_ctx {
 	struct nfsd_file	*localio;
 	struct nfs_commit_data	*data;
 	struct work_struct	work;
-	struct completion	*done;
 };
 
 static bool localio_enabled __read_mostly = false;
@@ -1105,8 +1104,6 @@ nfs_local_fsync_work(struct work_struct *work)
 	status = nfs_local_run_commit(nfs_to->nfsd_file_file(ctx->localio),
 				      ctx->data);
 	nfs_local_commit_done(ctx->data, status);
-	if (ctx->done != NULL)
-		complete(ctx->done);
 	nfs_local_fsync_ctx_free(ctx);
 
 	current->flags = old_flags;
@@ -1122,14 +1119,13 @@ nfs_local_fsync_ctx_alloc(struct nfs_commit_data *data,
 		ctx->localio = localio;
 		ctx->data = data;
 		INIT_WORK(&ctx->work, nfs_local_fsync_work);
-		ctx->done = NULL;
 	}
 	return ctx;
 }
 
 int nfs_local_commit(struct nfsd_file *localio,
 		     struct nfs_commit_data *data,
-		     const struct rpc_call_ops *call_ops, int how)
+		     const struct rpc_call_ops *call_ops)
 {
 	struct nfs_local_fsync_ctx *ctx;
 
@@ -1141,14 +1137,7 @@ int nfs_local_commit(struct nfsd_file *localio,
 	}
 
 	nfs_local_init_commit(data, call_ops);
-
-	if (how & FLUSH_SYNC) {
-		DECLARE_COMPLETION_ONSTACK(done);
-		ctx->done = &done;
-		queue_work(nfslocaliod_workqueue, &ctx->work);
-		wait_for_completion(&done);
-	} else
-		queue_work(nfslocaliod_workqueue, &ctx->work);
+	queue_work(nfslocaliod_workqueue, &ctx->work);
 
 	return 0;
 }
