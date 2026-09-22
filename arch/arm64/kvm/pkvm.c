@@ -230,13 +230,6 @@ int pkvm_init_host_vm(struct kvm *kvm, unsigned long type)
 	int ret;
 	bool protected = type & KVM_VM_TYPE_ARM_PROTECTED;
 
-	if (pkvm_hyp_vm_is_created(kvm))
-		return -EINVAL;
-
-	/* VM is already reserved, no need to proceed. */
-	if (kvm->arch.pkvm.handle)
-		return 0;
-
 	/* Reserve the VM in hyp and obtain a hyp handle for the VM. */
 	ret = kvm_call_hyp_nvhe(__pkvm_reserve_vm);
 	if (ret < 0)
