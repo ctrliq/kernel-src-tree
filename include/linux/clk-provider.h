@@ -623,6 +623,24 @@ struct clk *clk_register_gate(struct device *dev, const char *name,
 			       NULL, (flags), (reg), (bit_idx),		      \
 			       (clk_gate_flags), (lock))
 /**
+ * devm_clk_hw_register_gate_parent_hw - register a gate clock with the clock
+ * framework
+ * @dev: device that is registering this clock
+ * @name: name of this clock
+ * @parent_hw: pointer to parent clk
+ * @flags: framework-specific flags for this clock
+ * @reg: register address to control gating of this clock
+ * @bit_idx: which bit in the register controls gating of this clock
+ * @clk_gate_flags: gate-specific flags for this clock
+ * @lock: shared register lock for this clock
+ */
+#define devm_clk_hw_register_gate_parent_hw(dev, name, parent_hw, flags,      \
+					    reg, bit_idx, clk_gate_flags,     \
+					    lock)			      \
+	__devm_clk_hw_register_gate((dev), NULL, (name), NULL, (parent_hw),   \
+				    NULL, (flags), (reg), (bit_idx),	      \
+				    (clk_gate_flags), (lock))
+/**
  * devm_clk_hw_register_gate_parent_data - register a gate clock with the
  * clock framework
  * @dev: device that is registering this clock
@@ -924,6 +942,26 @@ struct clk *clk_register_divider_table(struct device *dev, const char *name,
 				       (parent_hw), NULL, (flags), (reg),     \
 				       (shift), (width), (clk_divider_flags), \
 				       NULL, (lock))
+/**
+ * devm_clk_hw_register_divider_parent_data - register a divider clock with the
+ * clock framework
+ * @dev: device registering this clock
+ * @name: name of this clock
+ * @parent_data: parent clk data
+ * @flags: framework-specific flags
+ * @reg: register address to adjust divider
+ * @shift: number of bits to shift the bitfield
+ * @width: width of the bitfield
+ * @clk_divider_flags: divider-specific flags for this clock
+ * @lock: shared register lock for this clock
+ */
+#define devm_clk_hw_register_divider_parent_data(dev, name, parent_data,       \
+						 flags, reg, shift, width,     \
+						 clk_divider_flags, lock)      \
+	__devm_clk_hw_register_divider((dev), NULL, (name), NULL, NULL,	       \
+				       (parent_data), (flags), (reg), (shift), \
+				       (width), (clk_divider_flags), NULL,     \
+				       (lock))
 /**
  * devm_clk_hw_register_divider_table - register a table based divider clock
  * with the clock framework (devres variant)
