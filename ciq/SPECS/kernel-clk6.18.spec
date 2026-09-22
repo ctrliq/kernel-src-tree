@@ -167,7 +167,7 @@ Summary: The Linux kernel
 #  the --with-release option overrides this setting.)
 %define debugbuildsenabled 1
 %define kernel_major_minor 6.18
-%define kernel_patch 52
+%define kernel_patch 53
 %define buildid .1
 %define specversion %{kernel_major_minor}.%{kernel_patch}
 %define pkgrelease 1%{?buildid}
@@ -4567,8 +4567,10 @@ fi\
 #
 #
 %changelog
-* Tue Sep 15 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.18.52-1.1
--- Rebased changes for Linux 6.18.52 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.52-1)
+* Tue Sep 22 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.53-1.1
+-- Rebased changes for Linux 6.18.53 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.53-1)
+-- [CIQ] v6.18.53 - rebased configs (Brett Mastbergen)
+-- [CIQ] v6.18.52 - updated spec (github-actions[bot])
 -- [CIQ] v6.18.50 - updated spec (github-actions[bot])
 -- [CIQ] v6.18.49 - updated spec (github-actions[bot])
 -- [CIQ] v6.18.48 - updated spec (Brett Mastbergen)
@@ -4581,7 +4583,6 @@ fi\
 -- bpf: Refactor masks for ADJ_ROOM flags and encap validation (Brett Mastbergen)
 -- bpf: Name the enum for BPF_FUNC_skb_adjust_room flags (Brett Mastbergen)
 -- net: Clear the dst when performing encap / decap (Brett Mastbergen)
--- bpf: Reject redirect helpers without a bpf_net_context (Brett Mastbergen)
 -- selftests/bpf: Add tests for bpf_redirect_peer with BPF_F_EGRESS (Brett Mastbergen)
 -- bpf: Support BPF_F_EGRESS with bpf_redirect_peer (Brett Mastbergen)
 -- crypto: rng - Fix double percpu offset in local_unlock() calls (Sultan Alsawaf)
@@ -4699,7 +4700,7 @@ fi\
 -- github actions: Make Builds on Merge Request Work (Jonathan Maple)
 -- Add initial CIQ config tweaks (Brett Mastbergen)
 -- Add CIQ configs (Brett Mastbergen)
--- Linux 6.18.52 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.18.52)
+-- Linux 6.18.53 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.18.53)
 
 
 ###
