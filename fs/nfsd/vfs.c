@@ -42,6 +42,7 @@
 #endif /* CONFIG_NFSD_V4 */
 
 #include "nfsd.h"
+#include "netns.h"
 #include "stats.h"
 #include "vfs.h"
 #include "filecache.h"
