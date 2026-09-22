@@ -7284,9 +7284,15 @@ static bool sched_idle_cfs_rq(struct cfs_rq *cfs_rq)
 }
 
 #ifdef CONFIG_SMP
-static int sched_idle_cpu(int cpu)
+static int choose_sched_idle_rq(struct rq *rq, struct task_struct *p)
 {
-	return sched_idle_rq(cpu_rq(cpu));
+	return sched_idle_rq(rq) && !task_has_idle_policy(p);
+}
+
+static int choose_idle_cpu(int cpu, struct task_struct *p)
+{
+	return available_idle_cpu(cpu) ||
+	       choose_sched_idle_rq(cpu_rq(cpu), p);
 }
 #endif
 
@@ -7718,7 +7724,7 @@ sched_balance_find_dst_group_cpu(struct sched_group *group, struct task_struct *
 		if (!sched_core_cookie_match(rq, p))
 			continue;
 
-		if (sched_idle_cpu(i))
+		if (choose_sched_idle_rq(rq, p))
 			return i;
 
 		if (available_idle_cpu(i)) {
@@ -7809,8 +7815,7 @@ static inline int sched_balance_find_dst_cpu(struct sched_domain *sd, struct tas
 
 static inline int __select_idle_cpu(int cpu, struct task_struct *p)
 {
-	if ((available_idle_cpu(cpu) || sched_idle_cpu(cpu)) &&
-	    sched_cpu_cookie_match(cpu_rq(cpu), p))
+	if (choose_idle_cpu(cpu, p) && sched_cpu_cookie_match(cpu_rq(cpu), p))
 		return cpu;
 
 	return -1;
@@ -7883,7 +7888,8 @@ static int select_idle_core(struct task_struct *p, int core, struct cpumask *cpu
 		if (!available_idle_cpu(cpu)) {
 			idle = false;
 			if (*idle_cpu == -1) {
-				if (sched_idle_cpu(cpu) && cpumask_test_cpu(cpu, cpus)) {
+				if (choose_sched_idle_rq(cpu_rq(cpu), p) &&
+				    cpumask_test_cpu(cpu, cpus)) {
 					*idle_cpu = cpu;
 					break;
 				}
@@ -7918,7 +7924,7 @@ static int select_idle_smt(struct task_struct *p, struct sched_domain *sd, int t
 		 */
 		if (!cpumask_test_cpu(cpu, sched_domain_span(sd)))
 			continue;
-		if (available_idle_cpu(cpu) || sched_idle_cpu(cpu))
+		if (choose_idle_cpu(cpu, p))
 			return cpu;
 	}
 
@@ -8100,7 +8106,7 @@ select_idle_capacity(struct task_struct *p, struct sched_domain *sd, int target)
 		bool preferred_core = !has_idle_core || is_core_idle(cpu);
 		unsigned long cpu_cap = capacity_of(cpu);
 
-		if (!available_idle_cpu(cpu) && !sched_idle_cpu(cpu))
+		if (!choose_idle_cpu(cpu, p))
 			continue;
 
 		fits = util_fits_cpu(task_util, util_min, util_max, cpu);
@@ -8224,7 +8230,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	 */
 	lockdep_assert_irqs_disabled();
 
-	if ((available_idle_cpu(target) || sched_idle_cpu(target)) &&
+	if (choose_idle_cpu(target, p) &&
 	    asym_fits_cpu(task_util, util_min, util_max, target))
 		return target;
 
@@ -8232,7 +8238,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	 * If the previous CPU is cache affine and idle, don't be stupid:
 	 */
 	if (prev != target && cpus_share_cache(prev, target) &&
-	    (available_idle_cpu(prev) || sched_idle_cpu(prev)) &&
+	    choose_idle_cpu(prev, p) &&
 	    asym_fits_cpu(task_util, util_min, util_max, prev)) {
 
 		if (!static_branch_unlikely(&sched_cluster_active) ||
@@ -8264,7 +8270,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	if (recent_used_cpu != prev &&
 	    recent_used_cpu != target &&
 	    cpus_share_cache(recent_used_cpu, target) &&
-	    (available_idle_cpu(recent_used_cpu) || sched_idle_cpu(recent_used_cpu)) &&
+	    choose_idle_cpu(recent_used_cpu, p) &&
 	    cpumask_test_cpu(recent_used_cpu, p->cpus_ptr) &&
 	    asym_fits_cpu(task_util, util_min, util_max, recent_used_cpu)) {
 
@@ -13194,7 +13200,7 @@ static void sched_balance_domains(struct rq *rq, enum cpu_idle_type idle)
 {
 	int continue_balancing = 1;
 	int cpu = rq->cpu;
-	int busy = idle != CPU_IDLE && !sched_idle_cpu(cpu);
+	int busy = idle != CPU_IDLE && !sched_idle_rq(rq);
 	unsigned long interval;
 	struct sched_domain *sd;
 	/* Earliest time when we have to do rebalance again */
@@ -13232,7 +13238,7 @@ static void sched_balance_domains(struct rq *rq, enum cpu_idle_type idle)
 				 * state even if we migrated tasks. Update it.
 				 */
 				idle = idle_cpu(cpu);
-				busy = !idle && !sched_idle_cpu(cpu);
+				busy = !idle && !sched_idle_rq(rq);
 			}
 			sd->last_balance = jiffies;
 			interval = get_sd_balance_interval(sd, busy);
