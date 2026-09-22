@@ -367,6 +367,7 @@ static int skcipher_accept_parent_nokey(void *private, struct sock *sk)
 	ctx->more = 0;
 	ctx->merge = 0;
 	ctx->enc = 0;
+	ctx->write = 0;
 	crypto_init_wait(&ctx->wait);
 
 	ask->private = ctx;
