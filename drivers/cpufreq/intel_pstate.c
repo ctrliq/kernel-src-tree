@@ -979,12 +979,10 @@ static int hybrid_get_cost(struct device *dev, unsigned long freq,
 	 * capacity.  Similarly, P-cores start to be populated when E-cores are
 	 * utilized above 60% of the capacity.
 	 */
-	if (hybrid_get_cpu_type(dev->id) == INTEL_CPU_TYPE_ATOM) {
-		if (hybrid_has_l3(dev->id)) /* E-core */
-			*cost += 1;
-	} else { /* P-core */
+	if (hybrid_get_cpu_type(dev->id) == INTEL_CPU_TYPE_CORE) /* P-core */
 		*cost += 2;
-	}
+	else if (hybrid_has_l3(dev->id)) /* E-core */
+		*cost += 1;
 
 	return 0;
 }
