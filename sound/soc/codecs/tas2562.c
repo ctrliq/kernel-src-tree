@@ -747,6 +747,8 @@ static int tas2562_probe(struct i2c_client *client)
 	data->client = client;
 	data->dev = &client->dev;
 	data->model_id = (uintptr_t)i2c_get_match_data(client);
+	/* Register default is 0x40400000, this is closest */
+	data->volume_lvl = (ARRAY_SIZE(float_vol_db_lookup) - 1) * 2;
 
 	tas2562_parse_dt(data);
 
