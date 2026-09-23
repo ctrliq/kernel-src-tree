@@ -299,7 +299,6 @@ struct pstate_funcs {
 static struct pstate_funcs pstate_funcs __read_mostly;
 
 static bool hwp_active __ro_after_init;
-static int hwp_mode_bdw __ro_after_init;
 static bool per_cpu_limits __ro_after_init;
 static bool hwp_forced __ro_after_init;
 static bool hwp_boost __read_mostly;
@@ -2323,7 +2322,7 @@ static void intel_pstate_get_cpu_pstates(struct cpudata *cpu)
 	cpu->pstate.min_pstate = pstate_funcs.get_min(cpu->cpu);
 	cpu->pstate.perf_ctl_scaling = perf_ctl_scaling;
 
-	if (hwp_active && !hwp_mode_bdw) {
+	if (hwp_active) {
 		__intel_pstate_get_hwp_cap(cpu);
 
 		if (pstate_funcs.get_cpu_scaling) {
@@ -3813,7 +3812,6 @@ static int __init intel_pstate_init(void)
 
 		if (!no_hwp) {
 			hwp_active = true;
-			hwp_mode_bdw = id->driver_data;
 			intel_pstate.attr = hwp_cpufreq_attrs;
 			intel_cpufreq.attr = hwp_cpufreq_attrs;
 			intel_cpufreq.flags |= CPUFREQ_NEED_UPDATE_LIMITS;
@@ -3821,7 +3819,8 @@ static int __init intel_pstate_init(void)
 			if (!default_driver)
 				default_driver = &intel_pstate;
 
-			pstate_funcs.get_cpu_scaling = hwp_get_cpu_scaling;
+			if (!id->driver_data)
+				pstate_funcs.get_cpu_scaling = hwp_get_cpu_scaling;
 
 			goto hwp_cpu_matched;
 		}
