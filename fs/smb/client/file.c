@@ -2978,13 +2978,18 @@ static int
 wdata_send_pages(struct cifs_writedata *wdata, unsigned int nr_pages,
 		 struct address_space *mapping, struct writeback_control *wbc)
 {
+	loff_t i_size = i_size_read(mapping->host);
 	int rc;
 
 	wdata->sync_mode = wbc->sync_mode;
 	wdata->nr_pages = nr_pages;
 	wdata->offset = page_offset(wdata->pages[0]);
 	wdata->pagesz = PAGE_SIZE;
-	wdata->tailsz = min(i_size_read(mapping->host) -
+
+	if (unlikely(i_size <= page_offset(wdata->pages[nr_pages - 1])))
+		return -EAGAIN;
+
+	wdata->tailsz = min(i_size -
 			page_offset(wdata->pages[nr_pages - 1]),
 			(loff_t)PAGE_SIZE);
 	wdata->bytes = ((nr_pages - 1) * PAGE_SIZE) + wdata->tailsz;
