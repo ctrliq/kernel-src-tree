@@ -1174,9 +1174,6 @@ struct scarlett2_device_info {
 	/* which sets of configuration parameters the device uses */
 	const struct scarlett2_config_set_entry *config_sets;
 
-	/* minimum firmware version required */
-	u16 min_firmware_version;
-
 	/* has a downloadable device map */
 	u8 has_devmap;
 
@@ -1905,7 +1902,6 @@ static const struct scarlett2_device_info vocaster_one_info = {
 		{ 1769, &scarlett2_config_set_vocaster },
 		{ }
 	},
-	.min_firmware_version = 1769,
 	.has_devmap = 1,
 
 	.phantom_count = 1,
@@ -1952,7 +1948,6 @@ static const struct scarlett2_device_info vocaster_two_info = {
 		{ 1769, &scarlett2_config_set_vocaster },
 		{ }
 	},
-	.min_firmware_version = 1769,
 	.has_devmap = 1,
 
 	.phantom_count = 2,
@@ -2000,7 +1995,6 @@ static const struct scarlett2_device_info solo_gen4_info = {
 		{ 2115, &scarlett2_config_set_gen4_solo },
 		{ }
 	},
-	.min_firmware_version = 2115,
 	.has_devmap = 1,
 
 	.level_input_count = 1,
@@ -2059,7 +2053,6 @@ static const struct scarlett2_device_info s2i2_gen4_info = {
 		{ 2417, &scarlett2_config_set_gen4_2i2_2417 },
 		{ }
 	},
-	.min_firmware_version = 2115,
 	.has_devmap = 1,
 
 	.level_input_count = 2,
@@ -2117,7 +2110,6 @@ static const struct scarlett2_device_info s4i4_gen4_info = {
 		{ 2089, &scarlett2_config_set_gen4_4i4 },
 		{ }
 	},
-	.min_firmware_version = 2089,
 	.has_devmap = 1,
 
 	.level_input_count = 2,
@@ -3424,7 +3416,8 @@ static int scarlett2_min_firmware_version_ctl_get(
 	struct usb_mixer_elem_info *elem = kctl->private_data;
 	struct scarlett2_data *private = elem->head.mixer->private_data;
 
-	ucontrol->value.integer.value[0] = private->info->min_firmware_version;
+	ucontrol->value.integer.value[0] =
+		private->info->config_sets[0].from_firmware_version;
 
 	return 0;
 }
@@ -8653,6 +8646,7 @@ static int scarlett2_read_configs(struct usb_mixer_interface *mixer)
 {
 	struct scarlett2_data *private = mixer->private_data;
 	const struct scarlett2_device_info *info = private->info;
+	u16 min_firmware_version = info->config_sets[0].from_firmware_version;
 	int err, i;
 
 	if (scarlett2_has_config_item(private, SCARLETT2_CONFIG_MSD_SWITCH)) {
@@ -8663,13 +8657,13 @@ static int scarlett2_read_configs(struct usb_mixer_interface *mixer)
 			return err;
 	}
 
-	if (private->firmware_version < info->min_firmware_version) {
+	if (private->firmware_version < min_firmware_version) {
 		usb_audio_err(mixer->chip,
 			      "Focusrite %s firmware version %d is too old; "
 			      "need %d",
 			      private->series_name,
 			      private->firmware_version,
-			      info->min_firmware_version);
+			      min_firmware_version);
 		return 0;
 	}
 
@@ -8853,6 +8847,7 @@ static int snd_scarlett2_controls_create(
 	const struct scarlett2_device_entry *entry)
 {
 	struct scarlett2_data *private;
+	u16 min_firmware_version;
 	int err;
 
 	/* Initialise private data */
@@ -8861,6 +8856,8 @@ static int snd_scarlett2_controls_create(
 		return err;
 
 	private = mixer->private_data;
+	min_firmware_version =
+		private->info->config_sets[0].from_firmware_version;
 
 	/* Send proprietary USB initialisation sequence */
 	err = scarlett2_usb_init(mixer);
@@ -8903,7 +8900,7 @@ static int snd_scarlett2_controls_create(
 	 * old, don't create any other controls
 	 */
 	if (private->msd_switch ||
-	    private->firmware_version < private->info->min_firmware_version)
+	    private->firmware_version < min_firmware_version)
 		return 0;
 
 	/* Create the analogue output controls */
