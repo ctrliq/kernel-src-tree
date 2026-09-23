@@ -586,11 +586,6 @@ static void intel_pstate_hybrid_hwp_adjust(struct cpudata *cpu)
 
 	hwp_is_hybrid = true;
 
-	cpu->pstate.turbo_freq = rounddown(cpu->pstate.turbo_pstate * scaling,
-					   perf_ctl_scaling);
-	cpu->pstate.max_freq = rounddown(cpu->pstate.max_pstate * scaling,
-					 perf_ctl_scaling);
-
 	freq = perf_ctl_max_phys * perf_ctl_scaling;
 	cpu->pstate.max_pstate_physical = intel_pstate_freq_to_hwp(cpu, freq);
 
@@ -1182,6 +1177,22 @@ static bool hybrid_clear_max_perf_cpu(void)
 	return ret;
 }
 
+static void intel_pstate_update_freq_limits(struct cpudata *cpu)
+{
+	int scaling = cpu->pstate.scaling;
+	unsigned int turbo_freq = cpu->pstate.turbo_pstate * scaling;
+	unsigned int max_freq = cpu->pstate.max_pstate * scaling;
+	int perf_ctl_scaling = cpu->pstate.perf_ctl_scaling;
+
+	if (scaling != perf_ctl_scaling) {
+		turbo_freq = rounddown(turbo_freq, perf_ctl_scaling);
+		max_freq = rounddown(max_freq, perf_ctl_scaling);
+	}
+
+	cpu->pstate.turbo_freq = turbo_freq;
+	cpu->pstate.max_freq = max_freq;
+}
+
 static void __intel_pstate_get_hwp_cap(struct cpudata *cpu)
 {
 	u64 cap;
@@ -1194,20 +1205,8 @@ static void __intel_pstate_get_hwp_cap(struct cpudata *cpu)
 
 static void intel_pstate_get_hwp_cap(struct cpudata *cpu)
 {
-	int scaling = cpu->pstate.scaling;
-
 	__intel_pstate_get_hwp_cap(cpu);
-
-	cpu->pstate.max_freq = cpu->pstate.max_pstate * scaling;
-	cpu->pstate.turbo_freq = cpu->pstate.turbo_pstate * scaling;
-	if (scaling != cpu->pstate.perf_ctl_scaling) {
-		int perf_ctl_scaling = cpu->pstate.perf_ctl_scaling;
-
-		cpu->pstate.max_freq = rounddown(cpu->pstate.max_freq,
-						 perf_ctl_scaling);
-		cpu->pstate.turbo_freq = rounddown(cpu->pstate.turbo_freq,
-						   perf_ctl_scaling);
-	}
+	intel_pstate_update_freq_limits(cpu);
 }
 
 static void hybrid_update_capacity(struct cpudata *cpu)
@@ -2328,6 +2327,7 @@ static void intel_pstate_get_cpu_pstates(struct cpudata *cpu)
 		if (pstate_funcs.get_cpu_scaling) {
 			cpu->pstate.scaling = pstate_funcs.get_cpu_scaling(cpu->cpu);
 			intel_pstate_hybrid_hwp_adjust(cpu);
+			intel_pstate_update_freq_limits(cpu);
 		} else {
 			cpu->pstate.scaling = perf_ctl_scaling;
 		}
