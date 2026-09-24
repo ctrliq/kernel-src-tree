@@ -705,7 +705,9 @@ dpll_cmd_pin_get_one(struct sk_buff *msg, struct dpll_pin *pin,
 	struct dpll_pin_ref *ref;
 	int ret;
 
-	ref = dpll_xa_ref_dpll_first(&pin->dpll_refs);
+	ref = dpll_pin_own_dpll_ref_first(pin);
+	if (!ref)
+		ref = dpll_xa_ref_dpll_first(&pin->dpll_refs);
 	ASSERT_NOT_NULL(ref);
 
 	ret = dpll_msg_add_pin_handle(msg, pin);
@@ -1096,12 +1098,19 @@ dpll_pin_freq_set(struct dpll_pin *pin, struct nlattr *a,
 
 	xa_for_each(&pin->dpll_refs, i, ref) {
 		ops = dpll_pin_ops(ref);
-		if (!ops->frequency_set || !ops->frequency_get) {
-			NL_SET_ERR_MSG(extack, "frequency set not supported by the device");
+		if ((!ops->frequency_set || !ops->frequency_get) &&
+		    ref->dpll->module == pin->module &&
+		    ref->dpll->clock_id == pin->clock_id) {
+			NL_SET_ERR_MSG(extack,
+				       "frequency set not supported by the device");
 			return -EOPNOTSUPP;
 		}
 	}
-	ref = dpll_xa_ref_dpll_first(&pin->dpll_refs);
+	ref = dpll_pin_own_dpll_ref_first(pin);
+	if (!ref) {
+		NL_SET_ERR_MSG(extack, "pin owner dpll not found");
+		return -ENODEV;
+	}
 	ops = dpll_pin_ops(ref);
 	dpll = ref->dpll;
 	ret = ops->frequency_get(pin, dpll_pin_on_dpll_priv(dpll, pin), dpll,
@@ -1115,6 +1124,8 @@ dpll_pin_freq_set(struct dpll_pin *pin, struct nlattr *a,
 
 	xa_for_each(&pin->dpll_refs, i, ref) {
 		ops = dpll_pin_ops(ref);
+		if (!ops->frequency_set)
+			continue;
 		dpll = ref->dpll;
 		ret = ops->frequency_set(pin, dpll_pin_on_dpll_priv(dpll, pin),
 					 dpll, dpll_priv(dpll), freq, extack);
@@ -1134,6 +1145,8 @@ rollback:
 		if (ref == failed)
 			break;
 		ops = dpll_pin_ops(ref);
+		if (!ops->frequency_set)
+			continue;
 		dpll = ref->dpll;
 		if (ops->frequency_set(pin, dpll_pin_on_dpll_priv(dpll, pin),
 				       dpll, dpll_priv(dpll), old_freq, extack))
@@ -1157,13 +1170,19 @@ dpll_pin_esync_set(struct dpll_pin *pin, struct nlattr *a,
 
 	xa_for_each(&pin->dpll_refs, i, ref) {
 		ops = dpll_pin_ops(ref);
-		if (!ops->esync_set || !ops->esync_get) {
+		if ((!ops->esync_set || !ops->esync_get) &&
+		    ref->dpll->module == pin->module &&
+		    ref->dpll->clock_id == pin->clock_id) {
 			NL_SET_ERR_MSG(extack,
 				       "embedded sync feature is not supported by this device");
 			return -EOPNOTSUPP;
 		}
 	}
-	ref = dpll_xa_ref_dpll_first(&pin->dpll_refs);
+	ref = dpll_pin_own_dpll_ref_first(pin);
+	if (!ref) {
+		NL_SET_ERR_MSG(extack, "pin owner dpll not found");
+		return -ENODEV;
+	}
 	ops = dpll_pin_ops(ref);
 	dpll = ref->dpll;
 	ret = ops->esync_get(pin, dpll_pin_on_dpll_priv(dpll, pin), dpll,
@@ -1187,6 +1206,8 @@ dpll_pin_esync_set(struct dpll_pin *pin, struct nlattr *a,
 		void *pin_dpll_priv;
 
 		ops = dpll_pin_ops(ref);
+		if (!ops->esync_set)
+			continue;
 		dpll = ref->dpll;
 		pin_dpll_priv = dpll_pin_on_dpll_priv(dpll, pin);
 		ret = ops->esync_set(pin, pin_dpll_priv, dpll, dpll_priv(dpll),
@@ -1210,6 +1231,8 @@ rollback:
 		if (ref == failed)
 			break;
 		ops = dpll_pin_ops(ref);
+		if (!ops->esync_set)
+			continue;
 		dpll = ref->dpll;
 		pin_dpll_priv = dpll_pin_on_dpll_priv(dpll, pin);
 		if (ops->esync_set(pin, pin_dpll_priv, dpll, dpll_priv(dpll),
@@ -1244,8 +1267,11 @@ dpll_pin_ref_sync_state_set(struct dpll_pin *pin,
 		NL_SET_ERR_MSG(extack, "reference sync pin not available");
 		return -EINVAL;
 	}
-	ref = dpll_xa_ref_dpll_first(&pin->dpll_refs);
-	ASSERT_NOT_NULL(ref);
+	ref = dpll_pin_own_dpll_ref_first(pin);
+	if (!ref) {
+		NL_SET_ERR_MSG(extack, "pin owner dpll not found");
+		return -ENODEV;
+	}
 	ops = dpll_pin_ops(ref);
 	if (!ops->ref_sync_set || !ops->ref_sync_get) {
 		NL_SET_ERR_MSG(extack, "reference sync not supported by this pin");
@@ -1264,6 +1290,8 @@ dpll_pin_ref_sync_state_set(struct dpll_pin *pin,
 		return 0;
 	xa_for_each(&pin->dpll_refs, i, ref) {
 		ops = dpll_pin_ops(ref);
+		if (!ops->ref_sync_set)
+			continue;
 		dpll = ref->dpll;
 		ret = ops->ref_sync_set(pin, dpll_pin_on_dpll_priv(dpll, pin),
 					ref_sync_pin,
@@ -1286,6 +1314,8 @@ rollback:
 		if (ref == failed)
 			break;
 		ops = dpll_pin_ops(ref);
+		if (!ops->ref_sync_set)
+			continue;
 		dpll = ref->dpll;
 		if (ops->ref_sync_set(pin, dpll_pin_on_dpll_priv(dpll, pin),
 				      ref_sync_pin,
@@ -1477,12 +1507,18 @@ dpll_pin_phase_adj_set(struct dpll_pin *pin, struct nlattr *phase_adj_attr,
 
 	xa_for_each(&pin->dpll_refs, i, ref) {
 		ops = dpll_pin_ops(ref);
-		if (!ops->phase_adjust_set || !ops->phase_adjust_get) {
+		if ((!ops->phase_adjust_set || !ops->phase_adjust_get) &&
+		    ref->dpll->module == pin->module &&
+		    ref->dpll->clock_id == pin->clock_id) {
 			NL_SET_ERR_MSG(extack, "phase adjust not supported");
 			return -EOPNOTSUPP;
 		}
 	}
-	ref = dpll_xa_ref_dpll_first(&pin->dpll_refs);
+	ref = dpll_pin_own_dpll_ref_first(pin);
+	if (!ref) {
+		NL_SET_ERR_MSG(extack, "pin owner dpll not found");
+		return -ENODEV;
+	}
 	ops = dpll_pin_ops(ref);
 	dpll = ref->dpll;
 	ret = ops->phase_adjust_get(pin, dpll_pin_on_dpll_priv(dpll, pin),
@@ -1497,6 +1533,8 @@ dpll_pin_phase_adj_set(struct dpll_pin *pin, struct nlattr *phase_adj_attr,
 
 	xa_for_each(&pin->dpll_refs, i, ref) {
 		ops = dpll_pin_ops(ref);
+		if (!ops->phase_adjust_set)
+			continue;
 		dpll = ref->dpll;
 		ret = ops->phase_adjust_set(pin,
 					    dpll_pin_on_dpll_priv(dpll, pin),
@@ -1519,6 +1557,8 @@ rollback:
 		if (ref == failed)
 			break;
 		ops = dpll_pin_ops(ref);
+		if (!ops->phase_adjust_set)
+			continue;
 		dpll = ref->dpll;
 		if (ops->phase_adjust_set(pin, dpll_pin_on_dpll_priv(dpll, pin),
 					  dpll, dpll_priv(dpll), old_phase_adj,
