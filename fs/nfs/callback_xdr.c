@@ -420,7 +420,7 @@ static __be32 decode_cb_sequence_args(struct svc_rqst *rqstp,
 	if (args->csa_nrclists) {
 		args->csa_rclists = kmalloc_array(args->csa_nrclists,
 						  sizeof(*args->csa_rclists),
-						  GFP_KERNEL);
+						  GFP_KERNEL | __GFP_ZERO);
 		if (unlikely(args->csa_rclists == NULL))
 			return htonl(NFS4ERR_RESOURCE);
 
