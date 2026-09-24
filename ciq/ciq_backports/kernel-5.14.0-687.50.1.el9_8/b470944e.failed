@@ -1,0 +1,130 @@
+ice: remove ice_q_stats struct and use struct_group
+
+jira KERNEL-1636
+Rebuild_History Non-Buildable kernel-5.14.0-687.50.1.el9_8
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit b470944ee6e8f51c1d561899c045286b6c416b46
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.50.1.el9_8/b470944e.failed
+
+The ice_qp_reset_stats function resets the stats for all rings on a VSI. It
+currently behaves differently for Tx and Rx rings. For Rx rings, it only
+clears the rx_stats which do not include the pkt and byte counts. For Tx
+rings and XDP rings, it clears only the pkt and byte counts.
+
+We could add extra memset calls to cover both the stats and relevant
+tx/rx stats fields. Instead, lets convert stats into a struct_group which
+contains both the pkts and bytes fields as well as the Tx or Rx stats, and
+remove the ice_q_stats structure entirely.
+
+The only remaining user of ice_q_stats is the ice_q_stats_len function in
+ice_ethtool.c, which just counts the number of fields. Replace this with a
+simple multiplication by 2. I find this to be simpler to reason about than
+relying on knowing the layout of the ice_q_stats structure.
+
+Now that the stats field of the ice_ring_stats covers all of the statistic
+values, the ice_qp_reset_stats function will properly zero out all of the
+fields.
+
+	Reviewed-by: Aleksandr Loktionov <aleksandr.loktionov@intel.com>
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Reviewed-by: Simon Horman <horms@kernel.org>
+	Tested-by: Rinitha S <sx.rinitha@intel.com> (A Contingent worker at Intel)
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit b470944ee6e8f51c1d561899c045286b6c416b46)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_txrx.h
+diff --cc drivers/net/ethernet/intel/ice/ice_txrx.h
+index 70f40a5ec33f,d5ad76b25f16..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_txrx.h
++++ b/drivers/net/ethernet/intel/ice/ice_txrx.h
+@@@ -197,20 -129,6 +197,23 @@@ struct ice_tx_offload_params 
+  	u8 header_len;
+  };
+  
+++<<<<<<< HEAD
+ +struct ice_rx_buf {
+ +	dma_addr_t dma;
+ +	struct page *page;
+ +	unsigned int page_offset;
+ +	unsigned int pgcnt;
+ +	unsigned int pagecnt_bias;
+ +	bool has_data;
+ +};
+ +
+ +struct ice_q_stats {
+ +	u64 pkts;
+ +	u64 bytes;
+ +};
+ +
+++=======
+++>>>>>>> b470944ee6e8 (ice: remove ice_q_stats struct and use struct_group)
+  struct ice_txq_stats {
+  	u64 restart_q;
+  	u64 tx_busy;
+diff --git a/drivers/net/ethernet/intel/ice/ice_base.c b/drivers/net/ethernet/intel/ice/ice_base.c
+index 2d35a278c555..155760689f8a 100644
+--- a/drivers/net/ethernet/intel/ice/ice_base.c
++++ b/drivers/net/ethernet/intel/ice/ice_base.c
+@@ -1396,8 +1396,8 @@ static void ice_qp_reset_stats(struct ice_vsi *vsi, u16 q_idx)
+ 	if (!vsi_stat)
+ 		return;
+ 
+-	memset(&vsi_stat->rx_ring_stats[q_idx]->rx_stats, 0,
+-	       sizeof(vsi_stat->rx_ring_stats[q_idx]->rx_stats));
++	memset(&vsi_stat->rx_ring_stats[q_idx]->stats, 0,
++	       sizeof(vsi_stat->rx_ring_stats[q_idx]->stats));
+ 	memset(&vsi_stat->tx_ring_stats[q_idx]->stats, 0,
+ 	       sizeof(vsi_stat->tx_ring_stats[q_idx]->stats));
+ 	if (vsi->xdp_rings)
+diff --git a/drivers/net/ethernet/intel/ice/ice_ethtool.c b/drivers/net/ethernet/intel/ice/ice_ethtool.c
+index db6adaa034cc..fc77ceb58f69 100644
+--- a/drivers/net/ethernet/intel/ice/ice_ethtool.c
++++ b/drivers/net/ethernet/intel/ice/ice_ethtool.c
+@@ -32,8 +32,8 @@ static int ice_q_stats_len(struct net_device *netdev)
+ {
+ 	struct ice_netdev_priv *np = netdev_priv(netdev);
+ 
+-	return ((np->vsi->alloc_txq + np->vsi->alloc_rxq) *
+-		(sizeof(struct ice_q_stats) / sizeof(u64)));
++	/* One packets and one bytes count per queue */
++	return ((np->vsi->alloc_txq + np->vsi->alloc_rxq) * 2);
+ }
+ 
+ #define ICE_PF_STATS_LEN	ARRAY_SIZE(ice_gstrings_pf_stats)
+diff --git a/drivers/net/ethernet/intel/ice/ice_lib.c b/drivers/net/ethernet/intel/ice/ice_lib.c
+index 60b32b4683ca..ccd06c009ba1 100644
+--- a/drivers/net/ethernet/intel/ice/ice_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_lib.c
+@@ -3444,7 +3444,8 @@ int ice_vsi_cfg_tc(struct ice_vsi *vsi, u8 ena_tc)
+  *
+  * This function assumes that caller has acquired a u64_stats_sync lock.
+  */
+-static void ice_update_ring_stats(struct ice_q_stats *stats, u64 pkts, u64 bytes)
++static void ice_update_ring_stats(struct ice_ring_stats *stats,
++				  u64 pkts, u64 bytes)
+ {
+ 	stats->bytes += bytes;
+ 	stats->pkts += pkts;
+@@ -3459,7 +3460,7 @@ static void ice_update_ring_stats(struct ice_q_stats *stats, u64 pkts, u64 bytes
+ void ice_update_tx_ring_stats(struct ice_tx_ring *tx_ring, u64 pkts, u64 bytes)
+ {
+ 	u64_stats_update_begin(&tx_ring->ring_stats->syncp);
+-	ice_update_ring_stats(&tx_ring->ring_stats->stats, pkts, bytes);
++	ice_update_ring_stats(tx_ring->ring_stats, pkts, bytes);
+ 	u64_stats_update_end(&tx_ring->ring_stats->syncp);
+ }
+ 
+@@ -3472,7 +3473,7 @@ void ice_update_tx_ring_stats(struct ice_tx_ring *tx_ring, u64 pkts, u64 bytes)
+ void ice_update_rx_ring_stats(struct ice_rx_ring *rx_ring, u64 pkts, u64 bytes)
+ {
+ 	u64_stats_update_begin(&rx_ring->ring_stats->syncp);
+-	ice_update_ring_stats(&rx_ring->ring_stats->stats, pkts, bytes);
++	ice_update_ring_stats(rx_ring->ring_stats, pkts, bytes);
+ 	u64_stats_update_end(&rx_ring->ring_stats->syncp);
+ }
+ 
+* Unmerged path drivers/net/ethernet/intel/ice/ice_txrx.h
