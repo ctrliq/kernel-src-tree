@@ -1,0 +1,280 @@
+netfilter: nft_set_pipapo: use 0 genmask for packetpath lookups
+
+jira KERNEL-1646
+Rebuild_History Non-Buildable kernel-5.14.0-687.51.1.el9_8
+commit-author Florian Westphal <fw@strlen.de>
+commit 4dbac7db17f1e973fbbd6aea07a00181cd4cd162
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.51.1.el9_8/4dbac7db.failed
+
+In commit c4eaca2e1052 ("netfilter: nft_set_pipapo: don't check genbit from
+packetpath lookups") I replaced genmask_cur() with NFT_GENMASK_ANY, but
+this change has no effect in the pipapo set type.
+
+New entries are unreachable from the active copy, so NFT_GENMASK_ANY has
+same result as genmask_cur():
+
+current-gen elements are disabled and the new-generation
+elements cannot be found.
+
+Tests did not catch this incomplete fix because the change also dropped
+the genmask test from the AVX2 version of the algorithm, so test only
+fails if host cpu lacks AVX2 support.
+
+Use genmask test only from the control plane (inserts, deletions, ..).
+
+Packet path has to skip the check, use of 0 is enough for this because
+ext->genmask has a the relevant bit set when the element is INACTIVE
+in that generation: using a 0 genmask thus makes nft_set_elem_active()
+always return true.
+
+Fix the comment and replace NFT_GENMASK_ANY with 0.
+
+Fixes: c4eaca2e1052 ("netfilter: nft_set_pipapo: don't check genbit from packetpath lookups")
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+(cherry picked from commit 4dbac7db17f1e973fbbd6aea07a00181cd4cd162)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nft_set_pipapo.c
+#	net/netfilter/nft_set_pipapo_avx2.c
+diff --cc net/netfilter/nft_set_pipapo.c
+index 5a2984c5ef6d,112fe46788b6..000000000000
+--- a/net/netfilter/nft_set_pipapo.c
++++ b/net/netfilter/nft_set_pipapo.c
+@@@ -519,84 -523,63 +519,124 @@@ out
+   */
+  static struct nft_pipapo_elem *pipapo_get(const struct nft_pipapo_match *m,
+  					  const u8 *data, u8 genmask,
+ -					  u64 tstamp)
+ +					  u64 tstamp, gfp_t gfp)
+  {
+ -	struct nft_pipapo_elem *e;
+ +	struct nft_pipapo_elem *ret = ERR_PTR(-ENOENT);
+ +	unsigned long *res_map, *fill_map = NULL;
+ +	const struct nft_pipapo_field *f;
+ +	int i;
+  
+ -	local_bh_disable();
+ +	if (m->bsize_max == 0)
+ +		return ret;
+  
+ -#if defined(CONFIG_X86_64) && !defined(CONFIG_UML)
+ -	if (boot_cpu_has(X86_FEATURE_AVX2) && irq_fpu_usable()) {
+ -		e = pipapo_get_avx2(m, data, genmask, tstamp);
+ -		local_bh_enable();
+ -		return e;
+ +	res_map = kmalloc_array(m->bsize_max, sizeof(*res_map), gfp);
+ +	if (!res_map) {
+ +		ret = ERR_PTR(-ENOMEM);
+ +		goto out;
+ +	}
+ +
+++<<<<<<< HEAD
+ +	fill_map = kcalloc(m->bsize_max, sizeof(*res_map), gfp);
+ +	if (!fill_map) {
+ +		ret = ERR_PTR(-ENOMEM);
+ +		goto out;
+  	}
+ -#endif
+ -	e = pipapo_get_slow(m, data, genmask, tstamp);
+ -	local_bh_enable();
+ -	return e;
+ -}
+  
+ +	pipapo_resmap_init(m, res_map);
+++=======
++ /**
++  * nft_pipapo_lookup() - Dataplane fronted for main lookup function
++  * @net:	Network namespace
++  * @set:	nftables API set representation
++  * @key:	pointer to nft registers containing key data
++  *
++  * This function is called from the data path.  It will search for
++  * an element matching the given key in the current active copy.
++  * Unlike other set types, this uses 0 instead of nft_genmask_cur().
++  *
++  * This is because new (future) elements are not reachable from
++  * priv->match, they get added to priv->clone instead.
++  * When the commit phase flips the generation bitmask, the
++  * 'now old' entries are skipped but without the 'now current'
++  * elements becoming visible. Using nft_genmask_cur() thus creates
++  * inconsistent state: matching old entries get skipped but thew
++  * newly matching entries are unreachable.
++  *
++  * GENMASK_ANY doesn't work for the same reason: old-gen entries get
++  * skipped, new-gen entries are only reachable from priv->clone.
++  *
++  * nft_pipapo_commit swaps ->clone and ->match shortly after the
++  * genbit flip.  As ->clone doesn't contain the old entries in the first
++  * place, lookup will only find the now-current ones.
++  *
++  * Return: ntables API extension pointer or NULL if no match.
++  */
++ const struct nft_set_ext *
++ nft_pipapo_lookup(const struct net *net, const struct nft_set *set,
++ 		  const u32 *key)
++ {
++ 	struct nft_pipapo *priv = nft_set_priv(set);
++ 	const struct nft_pipapo_match *m;
++ 	const struct nft_pipapo_elem *e;
++ 
++ 	m = rcu_dereference(priv->match);
++ 	e = pipapo_get_slow(m, (const u8 *)key, 0, get_jiffies_64());
+++>>>>>>> 4dbac7db17f1 (netfilter: nft_set_pipapo: use 0 genmask for packetpath lookups)
+ +
+ +	nft_pipapo_for_each_field(f, i, m) {
+ +		bool last = i == m->field_count - 1;
+ +		int b;
+ +
+ +		/* For each bit group: select lookup table bucket depending on
+ +		 * packet bytes value, then AND bucket value
+ +		 */
+ +		if (f->bb == 8)
+ +			pipapo_and_field_buckets_8bit(f, res_map, data);
+ +		else if (f->bb == 4)
+ +			pipapo_and_field_buckets_4bit(f, res_map, data);
+ +		else
+ +			BUG();
+ +
+ +		data += f->groups / NFT_PIPAPO_GROUPS_PER_BYTE(f);
+ +
+ +		/* Now populate the bitmap for the next field, unless this is
+ +		 * the last field, in which case return the matched 'ext'
+ +		 * pointer if any.
+ +		 *
+ +		 * Now res_map contains the matching bitmap, and fill_map is the
+ +		 * bitmap for the next field.
+ +		 */
+ +next_match:
+ +		b = pipapo_refill(res_map, f->bsize, f->rules, fill_map, f->mt,
+ +				  last);
+ +		if (b < 0)
+ +			goto out;
+ +
+ +		if (last) {
+ +			if (__nft_set_elem_expired(&f->mt[b].e->ext, tstamp))
+ +				goto next_match;
+ +			if ((genmask &&
+ +			     !nft_set_elem_active(&f->mt[b].e->ext, genmask)))
+ +				goto next_match;
+ +
+ +			ret = f->mt[b].e;
+ +			goto out;
+ +		}
+ +
+ +		data += NFT_PIPAPO_GROUPS_PADDING(f);
+  
+ -	return e ? &e->ext : NULL;
+ +		/* Swap bitmap indices: fill_map will be the initial bitmap for
+ +		 * the next field (i.e. the new res_map), and res_map is
+ +		 * guaranteed to be all-zeroes at this point, ready to be filled
+ +		 * according to the next mapping table.
+ +		 */
+ +		swap(res_map, fill_map);
+ +	}
+ +
+ +out:
+ +	kfree(fill_map);
+ +	kfree(res_map);
+ +	return ret;
+  }
+  
+  /**
+diff --cc net/netfilter/nft_set_pipapo_avx2.c
+index fe91f62cc4fb,e72fd045d037..000000000000
+--- a/net/netfilter/nft_set_pipapo_avx2.c
++++ b/net/netfilter/nft_set_pipapo_avx2.c
+@@@ -1243,29 -1226,74 +1243,72 @@@ next_match
+  
+  #undef NFT_SET_PIPAPO_AVX2_LOOKUP
+  
+ -		if (ret < 0) {
+ -			scratch->map_index = map_index;
+ -			kernel_fpu_end();
+ -			__local_unlock_nested_bh(&scratch->bh_lock);
+ -			return NULL;
+ -		}
+ +		if (ret < 0)
+ +			goto out;
+  
+  		if (last) {
+ -			struct nft_pipapo_elem *e;
+ +			const struct nft_set_ext *e = &f->mt[ret].e->ext;
+  
+ -			e = f->mt[ret].e;
+ -			if (unlikely(__nft_set_elem_expired(&e->ext, tstamp) ||
+ -				     !nft_set_elem_active(&e->ext, genmask)))
+ +			if (unlikely(nft_set_elem_expired(e) ||
+ +				     !nft_set_elem_active(e, genmask)))
+  				goto next_match;
+  
+ -			scratch->map_index = map_index;
+ -			kernel_fpu_end();
+ -			__local_unlock_nested_bh(&scratch->bh_lock);
+ -			return e;
+ +			ext = e;
+ +			goto out;
+  		}
+  
+ -		map_index = !map_index;
+  		swap(res, fill);
+ -		data += NFT_PIPAPO_GROUPS_PADDED_SIZE(f);
+ +		rp += NFT_PIPAPO_GROUPS_PADDED_SIZE(f);
+  	}
+  
+ +out:
+ +	if (i % 2)
+ +		scratch->map_index = !map_index;
+  	kernel_fpu_end();
+++<<<<<<< HEAD
+++=======
++ 	__local_unlock_nested_bh(&scratch->bh_lock);
++ 	return NULL;
++ }
++ 
++ /**
++  * nft_pipapo_avx2_lookup() - Dataplane frontend for AVX2 implementation
++  * @net:	Network namespace
++  * @set:	nftables API set representation
++  * @key:	nftables API element representation containing key data
++  *
++  * This function is called from the data path.  It will search for
++  * an element matching the given key in the current active copy using
++  * the AVX2 routines if the FPU is usable or fall back to the generic
++  * implementation of the algorithm otherwise.
++  *
++  * Return: nftables API extension pointer or NULL if no match.
++  */
++ const struct nft_set_ext *
++ nft_pipapo_avx2_lookup(const struct net *net, const struct nft_set *set,
++ 		       const u32 *key)
++ {
++ 	struct nft_pipapo *priv = nft_set_priv(set);
++ 	const struct nft_pipapo_match *m;
++ 	const u8 *rp = (const u8 *)key;
++ 	const struct nft_pipapo_elem *e;
++ 
++ 	local_bh_disable();
++ 
++ 	if (unlikely(!irq_fpu_usable())) {
++ 		const struct nft_set_ext *ext;
++ 
++ 		ext = nft_pipapo_lookup(net, set, key);
++ 
++ 		local_bh_enable();
++ 		return ext;
++ 	}
++ 
++ 	m = rcu_dereference(priv->match);
++ 
++ 	e = pipapo_get_avx2(m, rp, 0, get_jiffies_64());
+++>>>>>>> 4dbac7db17f1 (netfilter: nft_set_pipapo: use 0 genmask for packetpath lookups)
+  	local_bh_enable();
+  
+ -	return e ? &e->ext : NULL;
+ +	return ext;
+  }
+* Unmerged path net/netfilter/nft_set_pipapo.c
+* Unmerged path net/netfilter/nft_set_pipapo_avx2.c
