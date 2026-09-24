@@ -51,7 +51,8 @@ static void nft_fib_netdev_eval(const struct nft_expr *expr,
 }
 
 static int nft_fib_netdev_validate(const struct nft_ctx *ctx,
-				   const struct nft_expr *expr)
+				   const struct nft_expr *expr,
+				   const struct nft_data **data)
 {
 	const struct nft_fib *priv = nft_expr_priv(expr);
 	unsigned int hooks;

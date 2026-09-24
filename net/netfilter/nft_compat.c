@@ -400,7 +400,8 @@ static int nft_target_validate(const struct nft_ctx *ctx,
 }
 
 static int nft_target_bridge_validate(const struct nft_ctx *ctx,
-				      const struct nft_expr *expr)
+				      const struct nft_expr *expr,
+				      const struct nft_data **data)
 {
 	struct xt_target *target = expr->ops->data;
 
@@ -412,7 +413,7 @@ static int nft_target_bridge_validate(const struct nft_ctx *ctx,
 	if (target->family != NFPROTO_BRIDGE)
 		return -ENOENT;
 
-	return nft_target_validate(ctx, expr);
+	return nft_target_validate(ctx, expr, data);
 }
 
 static void __nft_match_eval(const struct nft_expr *expr,
@@ -562,7 +563,7 @@ nft_match_large_init(const struct nft_ctx *ctx, const struct nft_expr *expr,
 	struct xt_match *m = expr->ops->data;
 	int ret;
 
-	priv->info = kmalloc(XT_ALIGN(m->matchsize), GFP_KERNEL);
+	priv->info = kmalloc(XT_ALIGN(m->matchsize), GFP_KERNEL_ACCOUNT);
 	if (!priv->info)
 		return -ENOMEM;
 
@@ -847,7 +848,7 @@ nft_match_select_ops(const struct nft_ctx *ctx,
 		goto err;
 	}
 
-	ops = kzalloc(sizeof(struct nft_expr_ops), GFP_KERNEL);
+	ops = kzalloc(sizeof(struct nft_expr_ops), GFP_KERNEL_ACCOUNT);
 	if (!ops) {
 		err = -ENOMEM;
 		goto err;
@@ -936,7 +937,7 @@ nft_target_select_ops(const struct nft_ctx *ctx,
 		goto err;
 	}
 
-	ops = kzalloc(sizeof(struct nft_expr_ops), GFP_KERNEL);
+	ops = kzalloc(sizeof(struct nft_expr_ops), GFP_KERNEL_ACCOUNT);
 	if (!ops) {
 		err = -ENOMEM;
 		goto err;
