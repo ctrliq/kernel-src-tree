@@ -1,0 +1,347 @@
+ice: shorten ring stat names and add accessors
+
+jira KERNEL-1636
+Rebuild_History Non-Buildable kernel-5.14.0-687.50.1.el9_8
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit 4c58c7152c090cdb68cc9ff97ee84df2bb5db911
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.50.1.el9_8/4c58c715.failed
+
+The ice Tx/Rx hotpath has a few statistics counters for tracking unexpected
+events. These values are stored as u64 but are not accumulated using the
+u64_stats API. This could result in load/tear stores on some architectures.
+Even some 64-bit architectures could have issues since the fields are not
+read or written using ACCESS_ONCE or READ_ONCE.
+
+A following change is going to refactor the stats accumulator code to use
+the u64_stats API for all of these stats, and to use u64_stats_read and
+u64_stats_inc properly to prevent load/store tears on all architectures.
+
+Using u64_stats_inc and the syncp pointer is slightly verbose and would be
+duplicated in a number of places in the Tx and Rx hot path. Add accessor
+macros for the cases where only a single stat value is touched at once. To
+keep lines short, also shorten the stats names and convert ice_txq_stats
+and ice_rxq_stats to struct_group.
+
+This will ease the transition to properly using the u64_stats API in the
+following change.
+
+	Reviewed-by: Aleksandr Loktionov <aleksandr.loktionov@intel.com>
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Reviewed-by: Simon Horman <horms@kernel.org>
+	Tested-by: Rinitha S <sx.rinitha@intel.com> (A Contingent worker at Intel)
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit 4c58c7152c090cdb68cc9ff97ee84df2bb5db911)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_txrx.c
+#	drivers/net/ethernet/intel/ice/ice_txrx.h
+#	drivers/net/ethernet/intel/ice/ice_xsk.c
+diff --cc drivers/net/ethernet/intel/ice/ice_txrx.c
+index f18a0e224f2d,eea83b26b094..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_txrx.c
++++ b/drivers/net/ethernet/intel/ice/ice_txrx.c
+@@@ -892,26 -843,36 +892,51 @@@ bool ice_alloc_rx_bufs(struct ice_rx_ri
+  
+  	/* get the Rx descriptor and buffer based on next_to_use */
+  	rx_desc = ICE_RX_DESC(rx_ring, ntu);
+ +	bi = &rx_ring->rx_buf[ntu];
+  
+  	do {
+++<<<<<<< HEAD
+ +		/* if we fail here, we have work remaining */
+ +		if (!ice_alloc_mapped_page(rx_ring, bi))
+++=======
++ 		dma_addr_t addr;
++ 
++ 		addr = libeth_rx_alloc(&fq, ntu);
++ 		if (addr == DMA_MAPPING_ERROR) {
++ 			ice_stats_inc(rx_ring->ring_stats, rx_page_failed);
+++>>>>>>> 4c58c7152c09 (ice: shorten ring stat names and add accessors)
+  			break;
+ -		}
+ +
+ +		/* sync the buffer for use by the device */
+ +		dma_sync_single_range_for_device(rx_ring->dev, bi->dma,
+ +						 bi->page_offset,
+ +						 rx_ring->rx_buf_len,
+ +						 DMA_FROM_DEVICE);
+  
+  		/* Refresh the desc even if buffer_addrs didn't change
+  		 * because each write-back erases this info.
+  		 */
+ -		rx_desc->read.pkt_addr = cpu_to_le64(addr);
+ +		rx_desc->read.pkt_addr = cpu_to_le64(bi->dma + bi->page_offset);
+  
+++<<<<<<< HEAD
+++=======
++ 		if (!hdr_fq.pp)
++ 			goto next;
++ 
++ 		addr = libeth_rx_alloc(&hdr_fq, ntu);
++ 		if (addr == DMA_MAPPING_ERROR) {
++ 			ice_stats_inc(rx_ring->ring_stats, rx_page_failed);
++ 
++ 			libeth_rx_recycle_slow(fq.fqes[ntu].netmem);
++ 			break;
++ 		}
++ 
++ 		rx_desc->read.hdr_addr = cpu_to_le64(addr);
++ 
++ next:
+++>>>>>>> 4c58c7152c09 (ice: shorten ring stat names and add accessors)
+  		rx_desc++;
+ +		bi++;
+  		ntu++;
+  		if (unlikely(ntu == rx_ring->count)) {
+  			rx_desc = ICE_RX_DESC(rx_ring, 0);
+@@@ -1451,32 -1029,23 +1476,37 @@@ static int ice_clean_rx_irq(struct ice_
+  		xdp_verdict = ice_run_xdp(rx_ring, xdp, xdp_prog, xdp_ring, rx_desc);
+  		if (xdp_verdict == ICE_XDP_PASS)
+  			goto construct_skb;
+ -
+ -		if (xdp_verdict & (ICE_XDP_TX | ICE_XDP_REDIR))
+ -			xdp_xmit |= xdp_verdict;
+ -		total_rx_bytes += xdp_get_buff_len(&xdp->base);
+ +		total_rx_bytes += xdp_get_buff_len(xdp);
+  		total_rx_pkts++;
+  
+ -		xdp->data = NULL;
+ -		continue;
+ +		ice_put_rx_mbuf(rx_ring, xdp, ntc, xdp_verdict);
+ +		xdp_xmit |= xdp_verdict & (ICE_XDP_TX | ICE_XDP_REDIR);
+  
+ +		continue;
+  construct_skb:
+ -		skb = xdp_build_skb_from_buff(&xdp->base);
+ -		xdp->data = NULL;
+ -
+ +		if (likely(ice_ring_uses_build_skb(rx_ring)))
+ +			skb = ice_build_skb(rx_ring, xdp);
+ +		else
+ +			skb = ice_construct_skb(rx_ring, xdp);
+  		/* exit if we failed to retrieve a buffer */
+  		if (!skb) {
+++<<<<<<< HEAD
+ +			rx_ring->ring_stats->rx_stats.alloc_buf_failed++;
+ +			xdp_verdict = ICE_XDP_CONSUMED;
+ +		}
+ +		ice_put_rx_mbuf(rx_ring, xdp, ntc, xdp_verdict);
+ +
+ +		if (!skb)
+ +			break;
+ +
+ +		stat_err_bits = BIT(ICE_RX_FLEX_DESC_STATUS0_RXE_S);
+ +		if (unlikely(ice_test_staterr(rx_desc->wb.status_error0,
+ +					      stat_err_bits))) {
+ +			dev_kfree_skb_any(skb);
+++=======
++ 			libeth_xdp_return_buff_slow(xdp);
++ 			ice_stats_inc(rx_ring->ring_stats, rx_buf_failed);
+++>>>>>>> 4c58c7152c09 (ice: shorten ring stat names and add accessors)
+  			continue;
+  		}
+  
+diff --cc drivers/net/ethernet/intel/ice/ice_txrx.h
+index 70f40a5ec33f,e7e4991c0934..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_txrx.h
++++ b/drivers/net/ethernet/intel/ice/ice_txrx.h
+@@@ -197,43 -129,57 +197,95 @@@ struct ice_tx_offload_params 
+  	u8 header_len;
+  };
+  
+++<<<<<<< HEAD
+ +struct ice_rx_buf {
+ +	dma_addr_t dma;
+ +	struct page *page;
+ +	unsigned int page_offset;
+ +	unsigned int pgcnt;
+ +	unsigned int pagecnt_bias;
+ +	bool has_data;
+ +};
+ +
+ +struct ice_q_stats {
+ +	u64 pkts;
+ +	u64 bytes;
+ +};
+ +
+ +struct ice_txq_stats {
+ +	u64 restart_q;
+ +	u64 tx_busy;
+ +	u64 tx_linearize;
+ +	int prev_pkt; /* negative if no pending Tx descriptors */
+ +};
+ +
+ +struct ice_rxq_stats {
+ +	u64 non_eop_descs;
+ +	u64 alloc_page_failed;
+ +	u64 alloc_buf_failed;
+ +};
+ +
+++=======
+++>>>>>>> 4c58c7152c09 (ice: shorten ring stat names and add accessors)
+  struct ice_ring_stats {
+  	struct rcu_head rcu;	/* to avoid race on free */
+ +	struct ice_q_stats stats;
+  	struct u64_stats_sync syncp;
+++<<<<<<< HEAD
+ +	union {
+ +		struct ice_txq_stats tx_stats;
+ +		struct ice_rxq_stats rx_stats;
+ +	};
+++=======
++ 	struct_group(stats,
++ 		u64 pkts;
++ 		u64 bytes;
++ 		union {
++ 			struct_group(tx,
++ 				u64 tx_restart_q;
++ 				u64 tx_busy;
++ 				u64 tx_linearize;
++ 				/* negative if no pending Tx descriptors */
++ 				int prev_pkt;
++ 			);
++ 			struct_group(rx,
++ 				u64 rx_non_eop_descs;
++ 				u64 rx_page_failed;
++ 				u64 rx_buf_failed;
++ 			);
++ 		};
++ 	);
+++>>>>>>> 4c58c7152c09 (ice: shorten ring stat names and add accessors)
+  };
+  
++ /**
++  * ice_stats_read - Read a single ring stat value
++  * @stats: pointer to ring_stats structure for a queue
++  * @member: the ice_ring_stats member to read
++  *
++  * Shorthand for reading a single 64-bit stat value from struct
++  * ice_ring_stats.
++  *
++  * Return: the value of the requested stat.
++  */
++ #define ice_stats_read(stats, member) ({				\
++ 	struct ice_ring_stats *__stats = (stats);			\
++ 	__stats->member;						\
++ })
++ 
++ /**
++  * ice_stats_inc - Increment a single ring stat value
++  * @stats: pointer to the ring_stats structure for a queue
++  * @member: the ice_ring_stats member to increment
++  *
++  * Shorthand for incrementing a single 64-bit stat value in struct
++  * ice_ring_stats.
++  */
++ #define ice_stats_inc(stats, member) do {				\
++ 	struct ice_ring_stats *__stats = (stats);			\
++ 	__stats->member++;						\
++ } while (0)
++ 
+  enum ice_ring_state_t {
+  	ICE_TX_XPS_INIT_DONE,
+  	ICE_TX_NBITS,
+diff --cc drivers/net/ethernet/intel/ice/ice_xsk.c
+index 042d4e528752,953e68ed0f9a..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_xsk.c
++++ b/drivers/net/ethernet/intel/ice/ice_xsk.c
+@@@ -785,10 -654,13 +785,18 @@@ int ice_clean_rx_irq_zc(struct ice_rx_r
+  
+  construct_skb:
+  		/* XDP_PASS path */
+ -		skb = xdp_build_skb_from_zc(first);
+ +		skb = ice_construct_skb_zc(rx_ring, first);
+  		if (!skb) {
+++<<<<<<< HEAD
+ +			rx_ring->ring_stats->rx_stats.alloc_buf_failed++;
+ +			break;
+++=======
++ 			xsk_buff_free(first);
++ 			first = NULL;
++ 
++ 			ice_stats_inc(rx_ring->ring_stats, rx_buf_failed);
++ 			continue;
+++>>>>>>> 4c58c7152c09 (ice: shorten ring stat names and add accessors)
+  		}
+  
+  		first = NULL;
+diff --git a/drivers/net/ethernet/intel/ice/ice_main.c b/drivers/net/ethernet/intel/ice/ice_main.c
+index 5f4c598f48c9..419ceac0977f 100644
+--- a/drivers/net/ethernet/intel/ice/ice_main.c
++++ b/drivers/net/ethernet/intel/ice/ice_main.c
+@@ -161,8 +161,8 @@ static void ice_check_for_hang_subtask(struct ice_pf *pf)
+ 			 * prev_pkt would be negative if there was no
+ 			 * pending work.
+ 			 */
+-			packets = ring_stats->stats.pkts & INT_MAX;
+-			if (ring_stats->tx_stats.prev_pkt == packets) {
++			packets = ice_stats_read(ring_stats, pkts) & INT_MAX;
++			if (ring_stats->tx.prev_pkt == packets) {
+ 				/* Trigger sw interrupt to revive the queue */
+ 				ice_trigger_sw_intr(hw, tx_ring->q_vector);
+ 				continue;
+@@ -172,7 +172,7 @@ static void ice_check_for_hang_subtask(struct ice_pf *pf)
+ 			 * to ice_get_tx_pending()
+ 			 */
+ 			smp_rmb();
+-			ring_stats->tx_stats.prev_pkt =
++			ring_stats->tx.prev_pkt =
+ 			    ice_get_tx_pending(tx_ring) ? packets : -1;
+ 		}
+ 	}
+@@ -6904,9 +6904,9 @@ ice_update_vsi_tx_ring_stats(struct ice_vsi *vsi,
+ 		ice_fetch_u64_stats_per_ring(ring->ring_stats, &pkts, &bytes);
+ 		vsi_stats->tx_packets += pkts;
+ 		vsi_stats->tx_bytes += bytes;
+-		vsi->tx_restart += ring->ring_stats->tx_stats.restart_q;
+-		vsi->tx_busy += ring->ring_stats->tx_stats.tx_busy;
+-		vsi->tx_linearize += ring->ring_stats->tx_stats.tx_linearize;
++		vsi->tx_restart += ring->ring_stats->tx_restart_q;
++		vsi->tx_busy += ring->ring_stats->tx_busy;
++		vsi->tx_linearize += ring->ring_stats->tx_linearize;
+ 	}
+ }
+ 
+@@ -6948,8 +6948,8 @@ static void ice_update_vsi_ring_stats(struct ice_vsi *vsi)
+ 		ice_fetch_u64_stats_per_ring(ring_stats, &pkts, &bytes);
+ 		vsi_stats->rx_packets += pkts;
+ 		vsi_stats->rx_bytes += bytes;
+-		vsi->rx_buf_failed += ring_stats->rx_stats.alloc_buf_failed;
+-		vsi->rx_page_failed += ring_stats->rx_stats.alloc_page_failed;
++		vsi->rx_buf_failed += ring_stats->rx_buf_failed;
++		vsi->rx_page_failed += ring_stats->rx_page_failed;
+ 	}
+ 
+ 	/* update XDP Tx rings counters */
+* Unmerged path drivers/net/ethernet/intel/ice/ice_txrx.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_txrx.h
+diff --git a/drivers/net/ethernet/intel/ice/ice_txrx_lib.c b/drivers/net/ethernet/intel/ice/ice_txrx_lib.c
+index 45cfaabc41cb..ca643ed8a1a6 100644
+--- a/drivers/net/ethernet/intel/ice/ice_txrx_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_txrx_lib.c
+@@ -469,7 +469,7 @@ int __ice_xmit_xdp_ring(struct xdp_buff *xdp, struct ice_tx_ring *xdp_ring,
+ 	return ICE_XDP_CONSUMED;
+ 
+ busy:
+-	xdp_ring->ring_stats->tx_stats.tx_busy++;
++	ice_stats_inc(xdp_ring->ring_stats, tx_busy);
+ 
+ 	return ICE_XDP_CONSUMED;
+ }
+diff --git a/drivers/net/ethernet/intel/ice/ice_txrx_lib.h b/drivers/net/ethernet/intel/ice/ice_txrx_lib.h
+index 99717730f21a..e92c6a4f2e85 100644
+--- a/drivers/net/ethernet/intel/ice/ice_txrx_lib.h
++++ b/drivers/net/ethernet/intel/ice/ice_txrx_lib.h
+@@ -38,7 +38,7 @@ ice_is_non_eop(const struct ice_rx_ring *rx_ring,
+ 	if (likely(ice_test_staterr(rx_desc->wb.status_error0, ICE_RXD_EOF)))
+ 		return false;
+ 
+-	rx_ring->ring_stats->rx_stats.non_eop_descs++;
++	ice_stats_inc(rx_ring->ring_stats, rx_non_eop_descs);
+ 
+ 	return true;
+ }
+* Unmerged path drivers/net/ethernet/intel/ice/ice_xsk.c
