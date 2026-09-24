@@ -50,7 +50,6 @@ struct dpll_device {
  * @pin_idx:		index of a pin given by dev driver
  * @clock_id:		clock_id of creator
  * @module:		module of creator
- * @module_name:	module name of creator
  * @fwnode:		optional reference to firmware node
  * @dpll_refs:		hold referencees to dplls pin was registered with
  * @parent_refs:	hold references to parent pins pin was registered with
@@ -59,6 +58,7 @@ struct dpll_device {
  * @refcount:		refcount
  * @refcnt_tracker:	ref_tracker directory for debugging reference leaks
  * @rcu:		rcu_head for kfree_rcu()
+ * @module_name:	module name of creator
  *
  * RHEL: The content of the structure is invisible for modules and also
  * all its instances are allocated by DPLL core so it is safe to modify this
@@ -70,7 +70,6 @@ struct dpll_pin {
 	u32 pin_idx;
 	u64 clock_id;
 	struct module *module;
-	char module_name[MODULE_NAME_LEN];
 	struct fwnode_handle *fwnode;
 	struct xarray dpll_refs;
 	struct xarray parent_refs;
@@ -79,6 +78,7 @@ struct dpll_pin {
 	refcount_t refcount;
 	struct ref_tracker_dir refcnt_tracker;
 	struct rcu_head rcu;
+	RH_KABI_EXTEND(char module_name[MODULE_NAME_LEN])
 };
 
 /**
