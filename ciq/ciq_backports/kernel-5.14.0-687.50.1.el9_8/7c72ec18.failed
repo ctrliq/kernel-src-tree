@@ -1,0 +1,264 @@
+ice: fix race condition in TX timestamp ring cleanup
+
+jira KERNEL-1636
+cve CVE-2026-53008
+Rebuild_History Non-Buildable kernel-5.14.0-687.50.1.el9_8
+commit-author Keita Morisaki <kmta1236@gmail.com>
+commit 7c72ec18c2a4111204c2e915f8e4f6d849ce9398
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.50.1.el9_8/7c72ec18.failed
+
+Fix a race condition between ice_free_tx_tstamp_ring() and ice_tx_map()
+that can cause a NULL pointer dereference.
+
+ice_free_tx_tstamp_ring currently clears the ICE_TX_FLAGS_TXTIME flag
+after NULLing the tstamp_ring. This could allow a concurrent ice_tx_map
+call on another CPU to dereference the tstamp_ring, which could lead to
+a NULL pointer dereference.
+
+  CPU A:ice_free_tx_tstamp_ring() | CPU B:ice_tx_map()
+  --------------------------------|---------------------------------
+  tx_ring->tstamp_ring = NULL     |
+                                  | ice_is_txtime_cfg() -> true
+                                  | tstamp_ring = tx_ring->tstamp_ring
+                                  | tstamp_ring->count  // NULL deref!
+  flags &= ~ICE_TX_FLAGS_TXTIME   |
+
+Fix by:
+1. Reordering ice_free_tx_tstamp_ring() to clear the flag before
+   NULLing the pointer, with smp_wmb() to ensure proper ordering.
+2. Adding smp_rmb() in ice_tx_map() after the flag check to order the
+   flag read before the pointer read, using READ_ONCE() for the
+   pointer, and adding a NULL check as a safety net.
+3. Converting tx_ring->flags from u8 to DECLARE_BITMAP() and using
+   atomic bitops (set_bit(), clear_bit(), test_bit()) for all flag
+   operations throughout the driver:
+   - ICE_TX_RING_FLAGS_XDP
+   - ICE_TX_RING_FLAGS_VLAN_L2TAG1
+   - ICE_TX_RING_FLAGS_VLAN_L2TAG2
+   - ICE_TX_RING_FLAGS_TXTIME
+
+Fixes: ccde82e909467 ("ice: add E830 Earliest TxTime First Offload support")
+	Signed-off-by: Keita Morisaki <kmta1236@gmail.com>
+	Reviewed-by: Aleksandr Loktionov <aleksandr.loktionov@intel.com>
+	Tested-by: Rinitha S <sx.rinitha@intel.com>
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+Link: https://patch.msgid.link/20260416-iwl-net-submission-2026-04-14-v2-7-686c33c9828d@intel.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 7c72ec18c2a4111204c2e915f8e4f6d849ce9398)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_txrx.h
+diff --cc drivers/net/ethernet/intel/ice/ice_txrx.h
+index 70f40a5ec33f,5e517f219379..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_txrx.h
++++ b/drivers/net/ethernet/intel/ice/ice_txrx.h
+@@@ -393,51 -355,46 +401,83 @@@ struct ice_tx_ring 
+  	struct ice_q_vector *q_vector;	/* Backreference to associated vector */
+  	struct net_device *netdev;	/* netdev ring maps to */
+  	struct ice_vsi *vsi;		/* Backreference to associated VSI */
+ -
+ +	/* CL2 - 2nd cacheline starts here */
+ +	dma_addr_t dma;			/* physical address of ring */
+ +	struct xsk_buff_pool *xsk_pool;
+ +	u16 next_to_use;
+ +	u16 next_to_clean;
+ +	u16 q_handle;			/* Queue handle per TC */
+ +	u16 reg_idx;			/* HW register index of the ring */
+  	u16 count;			/* Number of descriptors */
+  	u16 q_index;			/* Queue number of ring */
+++<<<<<<< HEAD
+ +	u16 xdp_tx_active;
+ +	/* stats structs */
+ +	struct ice_ring_stats *ring_stats;
+ +	/* CL3 - 3rd cacheline starts here */
+ +	struct rcu_head rcu;		/* to avoid race on free */
+ +	DECLARE_BITMAP(xps_state, ICE_TX_NBITS);	/* XPS Config State */
+ +	struct ice_channel *ch;
+ +	struct ice_ptp_tx *tx_tstamps;
+ +	spinlock_t tx_lock;
+ +	u32 txq_teid;			/* Added Tx queue TEID */
+ +	/* CL4 - 4th cacheline starts here */
+ +	struct ice_tstamp_ring *tstamp_ring;
+ +#define ICE_TX_FLAGS_RING_XDP		BIT(0)
+ +#define ICE_TX_FLAGS_RING_VLAN_L2TAG1	BIT(1)
+ +#define ICE_TX_FLAGS_RING_VLAN_L2TAG2	BIT(2)
+ +#define ICE_TX_FLAGS_TXTIME		BIT(3)
+ +	u8 flags;
+++=======
++ 
++ 	DECLARE_BITMAP(flags, ICE_TX_RING_FLAGS_NBITS);
++ 
++ 	struct xsk_buff_pool *xsk_pool;
++ 
++ 	/* stats structs */
++ 	struct ice_ring_stats *ring_stats;
++ 	struct ice_tx_ring *next;	/* pointer to next ring in q_vector */
++ 
++ 	struct ice_tstamp_ring *tstamp_ring;
++ 	struct ice_ptp_tx *tx_tstamps;
++ 	__cacheline_group_end_aligned(read_mostly);
++ 
++ 	__cacheline_group_begin_aligned(read_write);
++ 	u16 next_to_use;
++ 	u16 next_to_clean;
++ 
++ 	u16 xdp_tx_active;
++ 	spinlock_t tx_lock;
++ 	__cacheline_group_end_aligned(read_write);
++ 
++ 	__cacheline_group_begin_aligned(cold);
++ 	struct rcu_head rcu;		/* to avoid race on free */
++ 	DECLARE_BITMAP(xps_state, ICE_TX_NBITS);	/* XPS Config State */
++ 	struct ice_channel *ch;
++ 
++ 	dma_addr_t dma;			/* physical address of ring */
++ 	u16 q_handle;			/* Queue handle per TC */
++ 	u16 reg_idx;			/* HW register index of the ring */
+++>>>>>>> 7c72ec18c2a4 (ice: fix race condition in TX timestamp ring cleanup)
+  	u8 dcb_tc;			/* Traffic class of ring */
+ -
+  	u16 quanta_prof_id;
+ -	u32 txq_teid;			/* Added Tx queue TEID */
+ -	__cacheline_group_end_aligned(cold);
+  } ____cacheline_internodealigned_in_smp;
+  
+ +static inline bool ice_ring_uses_build_skb(struct ice_rx_ring *ring)
+ +{
+ +	return !!(ring->flags & ICE_RX_FLAGS_RING_BUILD_SKB);
+ +}
+ +
+ +static inline void ice_set_ring_build_skb_ena(struct ice_rx_ring *ring)
+ +{
+ +	ring->flags |= ICE_RX_FLAGS_RING_BUILD_SKB;
+ +}
+ +
+ +static inline void ice_clear_ring_build_skb_ena(struct ice_rx_ring *ring)
+ +{
+ +	ring->flags &= ~ICE_RX_FLAGS_RING_BUILD_SKB;
+ +}
+ +
+  static inline bool ice_ring_ch_enabled(struct ice_tx_ring *ring)
+  {
+  	return !!ring->ch;
+diff --git a/drivers/net/ethernet/intel/ice/ice.h b/drivers/net/ethernet/intel/ice/ice.h
+index 2a47b718d716..7f3ca7bfdbe4 100644
+--- a/drivers/net/ethernet/intel/ice/ice.h
++++ b/drivers/net/ethernet/intel/ice/ice.h
+@@ -751,7 +751,7 @@ static inline bool ice_is_xdp_ena_vsi(struct ice_vsi *vsi)
+ 
+ static inline void ice_set_ring_xdp(struct ice_tx_ring *ring)
+ {
+-	ring->flags |= ICE_TX_FLAGS_RING_XDP;
++	set_bit(ICE_TX_RING_FLAGS_XDP, ring->flags);
+ }
+ 
+ /**
+@@ -776,7 +776,7 @@ static inline bool ice_is_txtime_ena(const struct ice_tx_ring *ring)
+  */
+ static inline bool ice_is_txtime_cfg(const struct ice_tx_ring *ring)
+ {
+-	return !!(ring->flags & ICE_TX_FLAGS_TXTIME);
++	return test_bit(ICE_TX_RING_FLAGS_TXTIME, ring->flags);
+ }
+ 
+ /**
+diff --git a/drivers/net/ethernet/intel/ice/ice_dcb_lib.c b/drivers/net/ethernet/intel/ice/ice_dcb_lib.c
+index 9fc8681cc58e..bd74344271f3 100644
+--- a/drivers/net/ethernet/intel/ice/ice_dcb_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_dcb_lib.c
+@@ -943,7 +943,7 @@ ice_tx_prepare_vlan_flags_dcb(struct ice_tx_ring *tx_ring,
+ 		/* if this is not already set it means a VLAN 0 + priority needs
+ 		 * to be offloaded
+ 		 */
+-		if (tx_ring->flags & ICE_TX_FLAGS_RING_VLAN_L2TAG2)
++		if (test_bit(ICE_TX_RING_FLAGS_VLAN_L2TAG2, tx_ring->flags))
+ 			first->tx_flags |= ICE_TX_FLAGS_HW_OUTER_SINGLE_VLAN;
+ 		else
+ 			first->tx_flags |= ICE_TX_FLAGS_HW_VLAN;
+diff --git a/drivers/net/ethernet/intel/ice/ice_lib.c b/drivers/net/ethernet/intel/ice/ice_lib.c
+index 657bd5a2ebf1..f6c31ff75018 100644
+--- a/drivers/net/ethernet/intel/ice/ice_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_lib.c
+@@ -1417,9 +1417,9 @@ static int ice_vsi_alloc_rings(struct ice_vsi *vsi)
+ 		ring->count = vsi->num_tx_desc;
+ 		ring->txq_teid = ICE_INVAL_TEID;
+ 		if (dvm_ena)
+-			ring->flags |= ICE_TX_FLAGS_RING_VLAN_L2TAG2;
++			set_bit(ICE_TX_RING_FLAGS_VLAN_L2TAG2, ring->flags);
+ 		else
+-			ring->flags |= ICE_TX_FLAGS_RING_VLAN_L2TAG1;
++			set_bit(ICE_TX_RING_FLAGS_VLAN_L2TAG1, ring->flags);
+ 		WRITE_ONCE(vsi->tx_rings[i], ring);
+ 	}
+ 
+diff --git a/drivers/net/ethernet/intel/ice/ice_txrx.c b/drivers/net/ethernet/intel/ice/ice_txrx.c
+index f18a0e224f2d..62bfc5155c81 100644
+--- a/drivers/net/ethernet/intel/ice/ice_txrx.c
++++ b/drivers/net/ethernet/intel/ice/ice_txrx.c
+@@ -188,9 +188,10 @@ void ice_free_tstamp_ring(struct ice_tx_ring *tx_ring)
+ void ice_free_tx_tstamp_ring(struct ice_tx_ring *tx_ring)
+ {
+ 	ice_free_tstamp_ring(tx_ring);
++	clear_bit(ICE_TX_RING_FLAGS_TXTIME, tx_ring->flags);
++	smp_wmb();	/* order flag clear before pointer NULL */
+ 	kfree_rcu(tx_ring->tstamp_ring, rcu);
+-	tx_ring->tstamp_ring = NULL;
+-	tx_ring->flags &= ~ICE_TX_FLAGS_TXTIME;
++	WRITE_ONCE(tx_ring->tstamp_ring, NULL);
+ }
+ 
+ /**
+@@ -403,7 +404,7 @@ static int ice_alloc_tstamp_ring(struct ice_tx_ring *tx_ring)
+ 	tx_ring->tstamp_ring = tstamp_ring;
+ 	tstamp_ring->desc = NULL;
+ 	tstamp_ring->count = ice_calc_ts_ring_count(tx_ring);
+-	tx_ring->flags |= ICE_TX_FLAGS_TXTIME;
++	set_bit(ICE_TX_RING_FLAGS_TXTIME, tx_ring->flags);
+ 	return 0;
+ }
+ 
+@@ -1953,13 +1954,20 @@ ice_tx_map(struct ice_tx_ring *tx_ring, struct ice_tx_buf *first,
+ 		return;
+ 
+ 	if (ice_is_txtime_cfg(tx_ring)) {
+-		struct ice_tstamp_ring *tstamp_ring = tx_ring->tstamp_ring;
+-		u32 tstamp_count = tstamp_ring->count;
+-		u32 j = tstamp_ring->next_to_use;
++		struct ice_tstamp_ring *tstamp_ring;
++		u32 tstamp_count, j;
+ 		struct ice_ts_desc *ts_desc;
+ 		struct timespec64 ts;
+ 		u32 tstamp;
+ 
++		smp_rmb();	/* order flag read before pointer read */
++		tstamp_ring = READ_ONCE(tx_ring->tstamp_ring);
++		if (unlikely(!tstamp_ring))
++			goto ring_kick;
++
++		tstamp_count = tstamp_ring->count;
++		j = tstamp_ring->next_to_use;
++
+ 		ts = ktime_to_timespec64(first->skb->tstamp);
+ 		tstamp = ts.tv_nsec >> ICE_TXTIME_CTX_RESOLUTION_128NS;
+ 
+@@ -1987,6 +1995,7 @@ ice_tx_map(struct ice_tx_ring *tx_ring, struct ice_tx_buf *first,
+ 		tstamp_ring->next_to_use = j;
+ 		writel_relaxed(j, tstamp_ring->tail);
+ 	} else {
++ring_kick:
+ 		writel_relaxed(i, tx_ring->tail);
+ 	}
+ 	return;
+@@ -2246,7 +2255,7 @@ ice_tx_prepare_vlan_flags(struct ice_tx_ring *tx_ring, struct ice_tx_buf *first)
+ 	 */
+ 	if (skb_vlan_tag_present(skb)) {
+ 		first->vid = skb_vlan_tag_get(skb);
+-		if (tx_ring->flags & ICE_TX_FLAGS_RING_VLAN_L2TAG2)
++		if (test_bit(ICE_TX_RING_FLAGS_VLAN_L2TAG2, tx_ring->flags))
+ 			first->tx_flags |= ICE_TX_FLAGS_HW_OUTER_SINGLE_VLAN;
+ 		else
+ 			first->tx_flags |= ICE_TX_FLAGS_HW_VLAN;
+* Unmerged path drivers/net/ethernet/intel/ice/ice_txrx.h
