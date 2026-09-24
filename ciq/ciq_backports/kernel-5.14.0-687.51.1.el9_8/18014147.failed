@@ -1,0 +1,141 @@
+netfilter: nf_tables: fix dst corruption in same register operation
+
+jira KERNEL-1646
+cve CVE-2026-64006
+Rebuild_History Non-Buildable kernel-5.14.0-687.51.1.el9_8
+commit-author Fernando Fernandez Mancera <fmancera@suse.de>
+commit 18014147d3ee7831dce53fe65d7fc8d428b02552
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.51.1.el9_8/18014147.failed
+
+For lshift and rshift, the shift operations are performed in a loop over
+32-bit words. The loop calculates the shifted value and write it to dst,
+and then immediately reads from src to calculate the carry for the next
+iteration. Because src and dst could point to the same memory location,
+the carry is incorrectly calculated using the newly modified dst value
+instead of the original src value.
+
+Adding a temporary local variable to cache the original value before
+writing to dst and using it for the carry calculation solves the
+problem. In addition, partial overlap is rejected from control plane for
+all kind of operations including byteorder. This was tested with the
+following bytecode:
+
+table test_table ip flags 0 use 1 handle 1
+ip test_table test_chain use 3 type filter hook input prio 0 policy accept packets 0 bytes 0 flags 1
+ip test_table test_chain 2
+  [ immediate reg 1 0x44332211 0x88776655 ]
+  [ bitwise reg 1 = ( reg 1 << 0x08000000 ) ]
+  [ cmp eq reg 1 0x66443322 0x00887766 ]
+  [ counter pkts 0 bytes 0 ]
+ip test_table test_chain 4 3
+  [ immediate reg 1 0x44332211 0x88776655 ]
+  [ bitwise reg 1 = ( reg 1 << 0x08000000 ) ]
+  [ cmp eq reg 1 0x55443322 0x00887766 ]
+  [ counter pkts 21794 bytes 1917798 ]
+
+Fixes: 567d746b55bc ("netfilter: bitwise: add support for shifts.")
+	Acked-by: Jeremy Sowden <jeremy@azazel.net>
+	Signed-off-by: Fernando Fernandez Mancera <fmancera@suse.de>
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+(cherry picked from commit 18014147d3ee7831dce53fe65d7fc8d428b02552)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nft_bitwise.c
+diff --cc net/netfilter/nft_bitwise.c
+index 5bb2c61b6782,785b8e9731d1..000000000000
+--- a/net/netfilter/nft_bitwise.c
++++ b/net/netfilter/nft_bitwise.c
+@@@ -157,6 -209,44 +161,47 @@@ static int nft_bitwise_init_shift(struc
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int nft_bitwise_init_bool(const struct nft_ctx *ctx,
++ 				 struct nft_bitwise *priv,
++ 				 const struct nlattr *const tb[])
++ {
++ 	int err;
++ 
++ 	if (tb[NFTA_BITWISE_MASK] ||
++ 	    tb[NFTA_BITWISE_XOR])
++ 		return -EINVAL;
++ 
++ 	if ((!tb[NFTA_BITWISE_DATA] && !tb[NFTA_BITWISE_SREG2]) ||
++ 	    (tb[NFTA_BITWISE_DATA] && tb[NFTA_BITWISE_SREG2]))
++ 		return -EINVAL;
++ 
++ 	if (tb[NFTA_BITWISE_DATA]) {
++ 		struct nft_data_desc desc = {
++ 			.type	= NFT_DATA_VALUE,
++ 			.size	= sizeof(priv->data),
++ 			.len	= priv->len,
++ 		};
++ 
++ 		err = nft_data_init(NULL, &priv->data, &desc,
++ 				    tb[NFTA_BITWISE_DATA]);
++ 		if (err < 0)
++ 			return err;
++ 	} else {
++ 		err = nft_parse_register_load(ctx, tb[NFTA_BITWISE_SREG2],
++ 					      &priv->sreg2, priv->len);
++ 		if (err < 0)
++ 			return err;
++ 
++ 		if (nft_reg_overlap(priv->sreg2, priv->dreg, priv->len))
++ 			return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 18014147d3ee (netfilter: nf_tables: fix dst corruption in same register operation)
+  static int nft_bitwise_init(const struct nft_ctx *ctx,
+  			    const struct nft_expr *expr,
+  			    const struct nlattr * const tb[])
+diff --git a/include/net/netfilter/nf_tables.h b/include/net/netfilter/nf_tables.h
+index 42205219754b..cce5577d79be 100644
+--- a/include/net/netfilter/nf_tables.h
++++ b/include/net/netfilter/nf_tables.h
+@@ -175,6 +175,13 @@ static inline u64 nft_reg_load64(const u32 *sreg)
+ 	return get_unaligned((u64 *)sreg);
+ }
+ 
++static inline bool nft_reg_overlap(u8 src, u8 dst, u32 len)
++{
++	unsigned int n = DIV_ROUND_UP(len, sizeof(u32));
++
++	return src != dst && src < dst + n && dst < src + n;
++}
++
+ static inline void nft_data_copy(u32 *dst, const struct nft_data *src,
+ 				 unsigned int len)
+ {
+* Unmerged path net/netfilter/nft_bitwise.c
+diff --git a/net/netfilter/nft_byteorder.c b/net/netfilter/nft_byteorder.c
+index 0ef3ec0ed841..1c805b94dd21 100644
+--- a/net/netfilter/nft_byteorder.c
++++ b/net/netfilter/nft_byteorder.c
+@@ -144,9 +144,16 @@ static int nft_byteorder_init(const struct nft_ctx *ctx,
+ 	if (err < 0)
+ 		return err;
+ 
+-	return nft_parse_register_store(ctx, tb[NFTA_BYTEORDER_DREG],
+-					&priv->dreg, NULL, NFT_DATA_VALUE,
+-					priv->len);
++	err = nft_parse_register_store(ctx, tb[NFTA_BYTEORDER_DREG],
++				       &priv->dreg, NULL, NFT_DATA_VALUE,
++				       priv->len);
++	if (err < 0)
++		return err;
++
++	if (nft_reg_overlap(priv->sreg, priv->dreg, priv->len))
++		return -EINVAL;
++
++	return 0;
+ }
+ 
+ static int nft_byteorder_dump(struct sk_buff *skb,
