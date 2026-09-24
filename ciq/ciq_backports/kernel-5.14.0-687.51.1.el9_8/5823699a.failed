@@ -1,0 +1,181 @@
+netfilter: nft_set_pipapo_avx2: fix skip of expired entries
+
+jira KERNEL-1646
+Rebuild_History Non-Buildable kernel-5.14.0-687.51.1.el9_8
+commit-author Florian Westphal <fw@strlen.de>
+commit 5823699a11cf3c05d751b473c66920d2d3cac0a5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.51.1.el9_8/5823699a.failed
+
+KASAN reports following splat:
+BUG: KASAN: slab-out-of-bounds in pipapo_get_avx2+0x941/0x25d0
+Read of size 1 at addr ffff88814c561be0 by task nft/3944
+Call Trace:
+ pipapo_get_avx2+0x941/0x25d0
+ nft_pipapo_insert+0x440/0x11b0
+ nf_tables_newsetelem+0x220a/0x3a00
+ ..
+
+This bisects to commit 84c1da7b38d9 ("netfilter: nft_set_pipapo: use AVX2
+algorithm for insertions too").
+
+However, that change merely uncovers this bug.
+
+When we find a match but that match has expired or timed out, the AVX2
+implementation restarts the full match loop.
+
+At that point, the pointer to the key data has already been changed and
+points to the keys last field.
+This will then result in out-of-bounds read once its incremented again
+for the next field.
+
+The restart logic in AVX2 is different compared to the plain C
+implementation, but both should follow the same logic.
+
+The C implementation just calls pipapo_refill() again do check the next
+entry.  Do the same in the AVX2 implementation.
+
+Note that with this change, due to implementation differences of
+pipapo_refill vs. nft_pipapo_avx2_refill, the refill call will return
+the same element again. Then, on the next call, it will move to the next
+entry as expected.  This is because avx2_refill doesn't clear the bitmap
+in the 'last' conditional.  This is harmless. Expired/timed out elements
+are also not expected to be frequent.
+
+selftest is added in a followup commit.
+
+Fixes: 7400b063969b ("nft_set_pipapo: Introduce AVX2-based lookup implementation")
+	Reviewed-by: Stefano Brivio <sbrivio@redhat.com>
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+(cherry picked from commit 5823699a11cf3c05d751b473c66920d2d3cac0a5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nft_set_pipapo_avx2.c
+diff --cc net/netfilter/nft_set_pipapo_avx2.c
+index fe91f62cc4fb,7ff90325c97f..000000000000
+--- a/net/netfilter/nft_set_pipapo_avx2.c
++++ b/net/netfilter/nft_set_pipapo_avx2.c
+@@@ -1180,23 -1177,8 +1180,22 @@@ nft_pipapo_avx2_lookup(const struct ne
+  	 */
+  	kernel_fpu_begin_mask(0);
+  
+ +	scratch = *raw_cpu_ptr(m->scratch);
+ +	if (unlikely(!scratch)) {
+ +		kernel_fpu_end();
+ +		local_bh_enable();
+ +		return NULL;
+ +	}
+ +
+ +	map_index = scratch->map_index;
+ +
+ +	res  = scratch->map + (map_index ? m->bsize_max : 0);
+ +	fill = scratch->map + (map_index ? 0 : m->bsize_max);
+ +
+ +	pipapo_resmap_init_avx2(m, res);
+ +
+  	nft_pipapo_avx2_prepare();
+  
+- next_match:
+  	nft_pipapo_for_each_field(f, i, m) {
+  		bool last = i == m->field_count - 1, first = !i;
+  		int ret = 0;
+@@@ -1243,29 -1225,78 +1242,48 @@@
+  
+  #undef NFT_SET_PIPAPO_AVX2_LOOKUP
+  
+++<<<<<<< HEAD
+ +		if (ret < 0)
+ +			goto out;
+++=======
++ next_match:
++ 		if (ret < 0) {
++ 			scratch->map_index = map_index;
++ 			kernel_fpu_end();
++ 			__local_unlock_nested_bh(&scratch->bh_lock);
++ 			return NULL;
++ 		}
+++>>>>>>> 5823699a11cf (netfilter: nft_set_pipapo_avx2: fix skip of expired entries)
+  
+  		if (last) {
+ -			struct nft_pipapo_elem *e;
+ +			const struct nft_set_ext *e = &f->mt[ret].e->ext;
+  
+++<<<<<<< HEAD
+ +			if (unlikely(nft_set_elem_expired(e) ||
+ +				     !nft_set_elem_active(e, genmask)))
+++=======
++ 			e = f->mt[ret].e;
++ 			if (unlikely(__nft_set_elem_expired(&e->ext, tstamp) ||
++ 				     !nft_set_elem_active(&e->ext, genmask))) {
++ 				ret = pipapo_refill(res, f->bsize, f->rules,
++ 						    fill, f->mt, last);
+++>>>>>>> 5823699a11cf (netfilter: nft_set_pipapo_avx2: fix skip of expired entries)
+  				goto next_match;
++ 			}
+  
+ -			scratch->map_index = map_index;
+ -			kernel_fpu_end();
+ -			__local_unlock_nested_bh(&scratch->bh_lock);
+ -			return e;
+ +			ext = e;
+ +			goto out;
+  		}
+  
+ -		map_index = !map_index;
+  		swap(res, fill);
+ -		data += NFT_PIPAPO_GROUPS_PADDED_SIZE(f);
+ +		rp += NFT_PIPAPO_GROUPS_PADDED_SIZE(f);
+  	}
+  
+ +out:
+ +	if (i % 2)
+ +		scratch->map_index = !map_index;
+  	kernel_fpu_end();
+ -	__local_unlock_nested_bh(&scratch->bh_lock);
+ -	return NULL;
+ -}
+ -
+ -/**
+ - * nft_pipapo_avx2_lookup() - Dataplane frontend for AVX2 implementation
+ - * @net:	Network namespace
+ - * @set:	nftables API set representation
+ - * @key:	nftables API element representation containing key data
+ - *
+ - * This function is called from the data path.  It will search for
+ - * an element matching the given key in the current active copy using
+ - * the AVX2 routines if the FPU is usable or fall back to the generic
+ - * implementation of the algorithm otherwise.
+ - *
+ - * Return: nftables API extension pointer or NULL if no match.
+ - */
+ -const struct nft_set_ext *
+ -nft_pipapo_avx2_lookup(const struct net *net, const struct nft_set *set,
+ -		       const u32 *key)
+ -{
+ -	struct nft_pipapo *priv = nft_set_priv(set);
+ -	const struct nft_pipapo_match *m;
+ -	const u8 *rp = (const u8 *)key;
+ -	const struct nft_pipapo_elem *e;
+ -
+ -	local_bh_disable();
+ -
+ -	if (unlikely(!irq_fpu_usable())) {
+ -		const struct nft_set_ext *ext;
+ -
+ -		ext = nft_pipapo_lookup(net, set, key);
+ -
+ -		local_bh_enable();
+ -		return ext;
+ -	}
+ -
+ -	m = rcu_dereference(priv->match);
+ -
+ -	e = pipapo_get_avx2(m, rp, 0, get_jiffies_64());
+  	local_bh_enable();
+  
+ -	return e ? &e->ext : NULL;
+ +	return ext;
+  }
+* Unmerged path net/netfilter/nft_set_pipapo_avx2.c
