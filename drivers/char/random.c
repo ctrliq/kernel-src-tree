@@ -1412,8 +1412,10 @@ SYSCALL_DEFINE3(getrandom, char __user *, ubuf, size_t, len, unsigned int, flags
 
 	if (rng) {
 		ret = import_single_range(READ, ubuf, len, &iov, &iter);
-		if (unlikely(ret))
+		if (unlikely(ret)) {
+			module_put(rng->owner);
 			return ret;
+		}
 		ret = rng->extrng_read_iter(&iter, !!(flags & GRND_RANDOM));
 		module_put(rng->owner);
 		return ret;
