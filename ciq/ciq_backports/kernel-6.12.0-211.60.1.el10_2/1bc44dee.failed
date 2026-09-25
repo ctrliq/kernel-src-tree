@@ -1,0 +1,96 @@
+drm/amdgpu: do not use amdgpu_bo_gpu_offset_no_check individually
+
+jira KERNEL-1651
+cve CVE-2026-46311
+Rebuild_History Non-Buildable kernel-6.12.0-211.60.1.el10_2
+commit-author Saleemkhan Jamadar <saleemkhan083@gmail.com>
+commit 1bc44dee2647b720065b71d57e594f70ea52fb3e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.60.1.el10_2/1bc44dee.failed
+
+This should not be used indiviually, use amdgpu_bo_gpu_offset
+with bo reserved.
+
+v3 - unpin bo in queue destroy (Christian)
+v2 - pin bo so that offset returned won't change after unlock (Christian)
+
+	Signed-off-by: Saleemkhan Jamadar <saleemkhan083@gmail.com>
+	Suggested-by: Christian König <christian.koenig@amd.com>
+	Reviewed-by: Christian König <christian.koenig@amd.com>
+	Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+(cherry picked from commit 1bc44dee2647b720065b71d57e594f70ea52fb3e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/amd/amdgpu/amdgpu_userq.c
+diff --cc drivers/gpu/drm/amd/amdgpu/amdgpu_userq.c
+index 79c7fa0a9ff7,c5dd5815056c..000000000000
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_userq.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_userq.c
+@@@ -400,6 -587,14 +400,17 @@@ amdgpu_userq_destroy(struct drm_file *f
+  	}
+  	amdgpu_bo_unref(&queue->db_obj.obj);
+  
+++<<<<<<< HEAD
+++=======
++ 	r = amdgpu_bo_reserve(queue->wptr_obj.obj, true);
++ 	if (!r) {
++ 		amdgpu_bo_unpin(queue->wptr_obj.obj);
++ 		amdgpu_bo_unreserve(queue->wptr_obj.obj);
++ 	}
++ 	amdgpu_bo_unref(&queue->wptr_obj.obj);
++ 
++ 	atomic_dec(&uq_mgr->userq_count[queue->queue_type]);
+++>>>>>>> 1bc44dee2647 (drm/amdgpu: do not use amdgpu_bo_gpu_offset_no_check individually)
+  #if defined(CONFIG_DEBUG_FS)
+  	debugfs_remove_recursive(queue->debugfs_queue);
+  #endif
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_doorbell_mgr.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_doorbell_mgr.c
+index 3040437d99c2..bc7858567321 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_doorbell_mgr.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_doorbell_mgr.c
+@@ -129,7 +129,7 @@ uint32_t amdgpu_doorbell_index_on_bar(struct amdgpu_device *adev,
+ {
+ 	int db_bo_offset;
+ 
+-	db_bo_offset = amdgpu_bo_gpu_offset_no_check(db_bo);
++	db_bo_offset = amdgpu_bo_gpu_offset(db_bo);
+ 
+ 	/* doorbell index is 32 bit but doorbell's size can be 32 bit
+ 	 * or 64 bit, so *db_size(in byte)/4 for alignment.
+* Unmerged path drivers/gpu/drm/amd/amdgpu/amdgpu_userq.c
+diff --git a/drivers/gpu/drm/amd/amdgpu/mes_userqueue.c b/drivers/gpu/drm/amd/amdgpu/mes_userqueue.c
+index f5aa83ff57f3..c3c4d31c5a62 100644
+--- a/drivers/gpu/drm/amd/amdgpu/mes_userqueue.c
++++ b/drivers/gpu/drm/amd/amdgpu/mes_userqueue.c
+@@ -93,8 +93,28 @@ mes_userq_create_wptr_mapping(struct amdgpu_userq_mgr *uq_mgr,
+ 		return ret;
+ 	}
+ 
+-	queue->wptr_obj.gpu_addr = amdgpu_bo_gpu_offset_no_check(wptr_obj->obj);
++	ret = amdgpu_bo_reserve(wptr_obj->obj, true);
++	if (ret) {
++		DRM_ERROR("Failed to reserve wptr bo\n");
++		return ret;
++	}
++
++	/* TODO use eviction fence instead of pinning. */
++	ret = amdgpu_bo_pin(wptr_obj->obj, AMDGPU_GEM_DOMAIN_GTT);
++	if (ret) {
++		drm_file_err(uq_mgr->file, "[Usermode queues] Failed to pin wptr bo\n");
++		goto unresv_bo;
++	}
++
++	queue->wptr_obj.gpu_addr = amdgpu_bo_gpu_offset(wptr_obj->obj);
++	amdgpu_bo_unreserve(wptr_obj->obj);
++
+ 	return 0;
++
++unresv_bo:
++	amdgpu_bo_unreserve(wptr_obj->obj);
++	return ret;
++
+ }
+ 
+ static int convert_to_mes_priority(int priority)
