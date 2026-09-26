@@ -1,0 +1,241 @@
+netfilter: nf_tables: use list_del_rcu for netlink hooks
+
+jira KERNEL-1646
+cve CVE-2026-46324
+Rebuild_History Non-Buildable kernel-5.14.0-687.51.1.el9_8
+commit-author Florian Westphal <fw@strlen.de>
+commit f3224ee463f8f6f6ced7dcdf6081add4f8128527
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.51.1.el9_8/f3224ee4.failed
+
+nft_netdev_unregister_hooks and __nft_unregister_flowtable_net_hooks need
+to use list_del_rcu(), this list can be walked by concurrent dumpers.
+
+Add a new helper and use it consistently.
+
+Fixes: f9a43007d3f7 ("netfilter: nf_tables: double hook unregistration in netns path")
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit f3224ee463f8f6f6ced7dcdf6081add4f8128527)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_tables_api.c
+diff --cc net/netfilter/nf_tables_api.c
+index 2c8921ae4a05,07e151245765..000000000000
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@@ -300,18 -346,52 +300,62 @@@ err_register
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void nft_netdev_hook_free_ops(struct nft_hook *hook)
++ {
++ 	struct nf_hook_ops *ops, *next;
++ 
++ 	list_for_each_entry_safe(ops, next, &hook->ops_list, list) {
++ 		list_del(&ops->list);
++ 		kfree(ops);
++ 	}
++ }
++ 
++ static void nft_netdev_hook_free(struct nft_hook *hook)
++ {
++ 	nft_netdev_hook_free_ops(hook);
++ 	kfree(hook);
++ }
++ 
++ static void __nft_netdev_hook_free_rcu(struct rcu_head *rcu)
++ {
++ 	struct nft_hook *hook = container_of(rcu, struct nft_hook, rcu);
++ 
++ 	nft_netdev_hook_free(hook);
++ }
++ 
++ static void nft_netdev_hook_free_rcu(struct nft_hook *hook)
++ {
++ 	call_rcu(&hook->rcu, __nft_netdev_hook_free_rcu);
++ }
++ 
++ static void nft_netdev_hook_unlink_free_rcu(struct nft_hook *hook)
++ {
++ 	list_del_rcu(&hook->list);
++ 	nft_netdev_hook_free_rcu(hook);
++ }
++ 
+++>>>>>>> f3224ee463f8 (netfilter: nf_tables: use list_del_rcu for netlink hooks)
+  static void nft_netdev_unregister_hooks(struct net *net,
+  					struct list_head *hook_list,
+  					bool release_netdev)
+  {
+  	struct nft_hook *hook, *next;
+ -	struct nf_hook_ops *ops;
+  
+  	list_for_each_entry_safe(hook, next, hook_list, list) {
+++<<<<<<< HEAD
+ +		nf_unregister_net_hook(net, &hook->ops);
+ +		if (release_netdev) {
+ +			list_del(&hook->list);
+ +			kfree_rcu(hook, rcu);
+ +		}
+++=======
++ 		list_for_each_entry(ops, &hook->ops_list, list)
++ 			nf_unregister_net_hook(net, ops);
++ 		if (release_netdev)
++ 			nft_netdev_hook_unlink_free_rcu(hook);
+++>>>>>>> f3224ee463f8 (netfilter: nf_tables: use list_del_rcu for netlink hooks)
+  	}
+  }
+  
+@@@ -2030,12 -2273,10 +2074,17 @@@ void nf_tables_chain_destroy(struct nft
+  	if (nft_is_base_chain(chain)) {
+  		struct nft_base_chain *basechain = nft_base_chain(chain);
+  
+ -		if (nft_base_chain_netdev(table->family, basechain->ops.hooknum)) {
+ +		if (nft_base_chain_netdev(ctx->family, basechain->ops.hooknum)) {
+  			list_for_each_entry_safe(hook, next,
+++<<<<<<< HEAD
+ +						 &basechain->hook_list, list) {
+ +				list_del_rcu(&hook->list);
+ +				kfree_rcu(hook, rcu);
+ +			}
+++=======
++ 						 &basechain->hook_list, list)
++ 				nft_netdev_hook_unlink_free_rcu(hook);
+++>>>>>>> f3224ee463f8 (netfilter: nf_tables: use list_del_rcu for netlink hooks)
+  		}
+  		module_put(basechain->type->owner);
+  		if (rcu_access_pointer(basechain->stats)) {
+@@@ -2622,9 -2958,31 +2671,26 @@@ static int nf_tables_updchain(struct nf
+  	nft_trans_commit_list_add_tail(ctx->net, trans);
+  
+  	return 0;
+ -
+ -err_trans:
+ +err:
+  	free_percpu(stats);
+  	kfree(trans);
+++<<<<<<< HEAD
+++=======
++ err_hooks:
++ 	if (nla[NFTA_CHAIN_HOOK]) {
++ 		list_for_each_entry_safe(h, next, &hook.list, list) {
++ 			if (unregister) {
++ 				list_for_each_entry(ops, &h->ops_list, list)
++ 					nf_unregister_net_hook(ctx->net, ops);
++ 			}
++ 			/* hook.list is on stack, no need for list_del_rcu() */
++ 			list_del(&h->list);
++ 			nft_netdev_hook_free_rcu(h);
++ 		}
++ 		module_put(hook.type->owner);
++ 	}
++ 
+++>>>>>>> f3224ee463f8 (netfilter: nf_tables: use list_del_rcu for netlink hooks)
+  	return err;
+  }
+  
+@@@ -8134,15 -8850,13 +8200,22 @@@ static void __nft_unregister_flowtable_
+  					         bool release_netdev)
+  {
+  	struct nft_hook *hook, *next;
+ -	struct nf_hook_ops *ops;
+  
+  	list_for_each_entry_safe(hook, next, hook_list, list) {
+++<<<<<<< HEAD
+ +		nf_unregister_net_hook(net, &hook->ops);
+ +		flowtable->data.type->setup(&flowtable->data, hook->ops.dev,
+ +					    FLOW_BLOCK_UNBIND);
+ +		if (release_netdev) {
+ +			list_del(&hook->list);
+ +			kfree_rcu(hook, rcu);
+ +		}
+++=======
++ 		list_for_each_entry(ops, &hook->ops_list, list)
++ 			nft_unregister_flowtable_ops(net, flowtable, ops);
++ 		if (release_netdev)
++ 			nft_netdev_hook_unlink_free_rcu(hook);
+++>>>>>>> f3224ee463f8 (netfilter: nf_tables: use list_del_rcu for netlink hooks)
+  	}
+  }
+  
+@@@ -8194,12 -8921,13 +8267,18 @@@ static int nft_register_flowtable_net_h
+  
+  err_unregister_net_hooks:
+  	list_for_each_entry_safe(hook, next, hook_list, list) {
+ -		list_for_each_entry(ops, &hook->ops_list, list) {
+ -			if (i-- <= 0)
+ -				break;
+ +		if (i-- <= 0)
+ +			break;
+  
+++<<<<<<< HEAD
+ +		nft_unregister_flowtable_hook(net, flowtable, hook);
+ +		list_del_rcu(&hook->list);
+ +		kfree_rcu(hook, rcu);
+++=======
++ 			nft_unregister_flowtable_ops(net, flowtable, ops);
++ 		}
++ 		nft_netdev_hook_unlink_free_rcu(hook);
+++>>>>>>> f3224ee463f8 (netfilter: nf_tables: use list_del_rcu for netlink hooks)
+  	}
+  
+  	return err;
+@@@ -8209,10 -8937,8 +8288,15 @@@ static void nft_flowtable_hooks_destroy
+  {
+  	struct nft_hook *hook, *next;
+  
+++<<<<<<< HEAD
+ +	list_for_each_entry_safe(hook, next, hook_list, list) {
+ +		list_del_rcu(&hook->list);
+ +		kfree_rcu(hook, rcu);
+ +	}
+++=======
++ 	list_for_each_entry_safe(hook, next, hook_list, list)
++ 		nft_netdev_hook_unlink_free_rcu(hook);
+++>>>>>>> f3224ee463f8 (netfilter: nf_tables: use list_del_rcu for netlink hooks)
+  }
+  
+  static int nft_flowtable_update(struct nft_ctx *ctx, const struct nlmsghdr *nlh,
+@@@ -8293,10 -9021,12 +8377,19 @@@
+  
+  err_flowtable_update_hook:
+  	list_for_each_entry_safe(hook, next, &flowtable_hook.list, list) {
+++<<<<<<< HEAD
+ +		if (unregister)
+ +			nft_unregister_flowtable_hook(ctx->net, flowtable, hook);
+ +		list_del_rcu(&hook->list);
+ +		kfree_rcu(hook, rcu);
+++=======
++ 		if (unregister) {
++ 			list_for_each_entry(ops, &hook->ops_list, list)
++ 				nft_unregister_flowtable_ops(ctx->net,
++ 							     flowtable, ops);
++ 		}
++ 		nft_netdev_hook_unlink_free_rcu(hook);
+++>>>>>>> f3224ee463f8 (netfilter: nf_tables: use list_del_rcu for netlink hooks)
+  	}
+  
+  	return err;
+@@@ -8790,13 -9532,8 +8883,15 @@@ err
+  
+  static void nf_tables_flowtable_destroy(struct nft_flowtable *flowtable)
+  {
+- 	struct nft_hook *hook, *next;
+- 
+  	flowtable->data.type->free(&flowtable->data);
+++<<<<<<< HEAD
+ +	list_for_each_entry_safe(hook, next, &flowtable->hook_list, list) {
+ +		list_del_rcu(&hook->list);
+ +		kfree_rcu(hook, rcu);
+ +	}
+++=======
++ 	nft_hooks_destroy(&flowtable->hook_list);
+++>>>>>>> f3224ee463f8 (netfilter: nf_tables: use list_del_rcu for netlink hooks)
+  	kfree(flowtable->name);
+  	module_put(flowtable->data.type->owner);
+  	kfree(flowtable);
+* Unmerged path net/netfilter/nf_tables_api.c

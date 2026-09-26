@@ -1,0 +1,111 @@
+netfilter: nf_tables: do not defer rule destruction via call_rcu
+
+jira KERNEL-1646
+cve CVE-2024-56655
+Rebuild_History Non-Buildable kernel-5.14.0-687.51.1.el9_8
+commit-author Florian Westphal <fw@strlen.de>
+commit b04df3da1b5c6f6dc7cdccc37941740c078c4043
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.51.1.el9_8/b04df3da.failed
+
+nf_tables_chain_destroy can sleep, it can't be used from call_rcu
+callbacks.
+
+Moreover, nf_tables_rule_release() is only safe for error unwinding,
+while transaction mutex is held and the to-be-desroyed rule was not
+exposed to either dataplane or dumps, as it deactives+frees without
+the required synchronize_rcu() in-between.
+
+nft_rule_expr_deactivate() callbacks will change ->use counters
+of other chains/sets, see e.g. nft_lookup .deactivate callback, these
+must be serialized via transaction mutex.
+
+Also add a few lockdep asserts to make this more explicit.
+
+Calling synchronize_rcu() isn't ideal, but fixing this without is hard
+and way more intrusive.  As-is, we can get:
+
+WARNING: .. net/netfilter/nf_tables_api.c:5515 nft_set_destroy+0x..
+Workqueue: events nf_tables_trans_destroy_work
+RIP: 0010:nft_set_destroy+0x3fe/0x5c0
+Call Trace:
+ <TASK>
+ nf_tables_trans_destroy_work+0x6b7/0xad0
+ process_one_work+0x64a/0xce0
+ worker_thread+0x613/0x10d0
+
+In case the synchronize_rcu becomes an issue, we can explore alternatives.
+
+One way would be to allocate nft_trans_rule objects + one nft_trans_chain
+object, deactivate the rules + the chain and then defer the freeing to the
+nft destroy workqueue.  We'd still need to keep the synchronize_rcu path as
+a fallback to handle -ENOMEM corner cases though.
+
+	Reported-by: syzbot+b26935466701e56cfdc2@syzkaller.appspotmail.com
+Closes: https://lore.kernel.org/all/67478d92.050a0220.253251.0062.GAE@google.com/T/
+Fixes: c03d278fdf35 ("netfilter: nf_tables: wait for rcu grace period on net_device removal")
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit b04df3da1b5c6f6dc7cdccc37941740c078c4043)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_tables_api.c
+diff --cc net/netfilter/nf_tables_api.c
+index 6308130a4a21,0b9f1e8dfe49..000000000000
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@@ -10876,19 -11692,39 +10881,49 @@@ int __nft_release_basechain(struct nft_
+  {
+  	struct nft_rule *rule, *nr;
+  
+++<<<<<<< HEAD
+ +	if (WARN_ON(!nft_is_base_chain(ctx->chain)))
+++=======
++ 	list_for_each_entry_safe(rule, nr, &ctx->chain->rules, list) {
++ 		list_del(&rule->list);
++ 		nf_tables_rule_release(ctx, rule);
++ 	}
++ 	nf_tables_chain_destroy(ctx->chain);
++ }
++ 
++ int __nft_release_basechain(struct nft_ctx *ctx)
++ {
++ 	struct nft_rule *rule;
++ 
++ 	if (WARN_ON_ONCE(!nft_is_base_chain(ctx->chain)))
+++>>>>>>> b04df3da1b5c (netfilter: nf_tables: do not defer rule destruction via call_rcu)
+  		return 0;
+  
+  	nf_tables_unregister_hook(ctx->net, ctx->chain->table, ctx->chain);
+ -	list_for_each_entry(rule, &ctx->chain->rules, list)
+ +	list_for_each_entry_safe(rule, nr, &ctx->chain->rules, list) {
+ +		list_del(&rule->list);
+  		nft_use_dec(&ctx->chain->use);
+ -
+ +		nf_tables_rule_release(ctx, rule);
+ +	}
+  	nft_chain_del(ctx->chain);
+  	nft_use_dec(&ctx->table->use);
+++<<<<<<< HEAD
+ +	nf_tables_chain_destroy(ctx);
+++=======
++ 
++ 	if (!maybe_get_net(ctx->net)) {
++ 		__nft_release_basechain_now(ctx);
++ 		return 0;
++ 	}
+++>>>>>>> b04df3da1b5c (netfilter: nf_tables: do not defer rule destruction via call_rcu)
++ 
++ 	/* wait for ruleset dumps to complete.  Owning chain is no longer in
++ 	 * lists, so new dumps can't find any of these rules anymore.
++ 	 */
++ 	synchronize_rcu();
+  
++ 	__nft_release_basechain_now(ctx);
++ 	put_net(ctx->net);
+  	return 0;
+  }
+  EXPORT_SYMBOL_GPL(__nft_release_basechain);
+* Unmerged path net/netfilter/nf_tables_api.c

@@ -1,0 +1,295 @@
+ice: convert all ring stats to u64_stats_t
+
+jira KERNEL-1646
+Rebuild_History Non-Buildable kernel-5.14.0-687.50.1.el9_8
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit b38a418db3660d3c9b36bbeb54cbffe096123573
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.50.1.el9_8/b38a418d.failed
+
+After several cleanups, the ice driver is now finally ready to convert all
+Tx and Rx ring stats to the u64_stats_t and proper use of the u64 stats
+APIs.
+
+The final remaining part to cleanup is the VSI stats accumulation logic in
+ice_update_vsi_ring_stats().
+
+Refactor the function and its helpers so that all stat values (and not
+just pkts and bytes) use the u64_stats APIs. The
+ice_fetch_u64_(tx|rx)_stats functions read the stat values using
+u64_stats_read and then copy them into local ice_vsi_(tx|rx)_stats
+structures. This does require making a new struct with the stat fields as
+u64.
+
+The ice_update_vsi_(tx|rx)_ring_stats functions call the fetch functions
+per ring and accumulate the result into one copy of the struct. This
+accumulated total is then used to update the relevant VSI fields.
+
+Since these are relatively small, the contents are all stored on the stack
+rather than allocating and freeing memory.
+
+Once the accumulator side is updated, the helper ice_stats_read and
+ice_stats_inc and other related helper functions all easily translate to
+use of u64_stats_read and u64_stats_inc. This completes the refactor and
+ensures that all stats accesses now make proper use of the API.
+
+	Reviewed-by: Aleksandr Loktionov <aleksandr.loktionov@intel.com>
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Reviewed-by: Simon Horman <horms@kernel.org>
+	Tested-by: Rinitha S <sx.rinitha@intel.com> (A Contingent worker at Intel)
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit b38a418db3660d3c9b36bbeb54cbffe096123573)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_lib.c
+#	drivers/net/ethernet/intel/ice/ice_main.c
+#	drivers/net/ethernet/intel/ice/ice_txrx.h
+diff --cc drivers/net/ethernet/intel/ice/ice_lib.c
+index 657bd5a2ebf1,17d92ba65128..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_lib.c
+@@@ -3437,20 -3433,6 +3437,23 @@@ out
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * ice_update_ring_stats - Update ring statistics
+ + * @stats: stats to be updated
+ + * @pkts: number of processed packets
+ + * @bytes: number of processed bytes
+ + *
+ + * This function assumes that caller has acquired a u64_stats_sync lock.
+ + */
+ +static void ice_update_ring_stats(struct ice_q_stats *stats, u64 pkts, u64 bytes)
+ +{
+ +	stats->bytes += bytes;
+ +	stats->pkts += pkts;
+ +}
+ +
+ +/**
+++=======
+++>>>>>>> b38a418db366 (ice: convert all ring stats to u64_stats_t)
+   * ice_update_tx_ring_stats - Update Tx ring specific counters
+   * @tx_ring: ring to update
+   * @pkts: number of processed packets
+@@@ -3459,7 -3441,8 +3462,12 @@@
+  void ice_update_tx_ring_stats(struct ice_tx_ring *tx_ring, u64 pkts, u64 bytes)
+  {
+  	u64_stats_update_begin(&tx_ring->ring_stats->syncp);
+++<<<<<<< HEAD
+ +	ice_update_ring_stats(&tx_ring->ring_stats->stats, pkts, bytes);
+++=======
++ 	u64_stats_add(&tx_ring->ring_stats->pkts, pkts);
++ 	u64_stats_add(&tx_ring->ring_stats->bytes, bytes);
+++>>>>>>> b38a418db366 (ice: convert all ring stats to u64_stats_t)
+  	u64_stats_update_end(&tx_ring->ring_stats->syncp);
+  }
+  
+@@@ -3472,7 -3455,8 +3480,12 @@@
+  void ice_update_rx_ring_stats(struct ice_rx_ring *rx_ring, u64 pkts, u64 bytes)
+  {
+  	u64_stats_update_begin(&rx_ring->ring_stats->syncp);
+++<<<<<<< HEAD
+ +	ice_update_ring_stats(&rx_ring->ring_stats->stats, pkts, bytes);
+++=======
++ 	u64_stats_add(&rx_ring->ring_stats->pkts, pkts);
++ 	u64_stats_add(&rx_ring->ring_stats->bytes, bytes);
+++>>>>>>> b38a418db366 (ice: convert all ring stats to u64_stats_t)
+  	u64_stats_update_end(&rx_ring->ring_stats->syncp);
+  }
+  
+diff --cc drivers/net/ethernet/intel/ice/ice_main.c
+index 5f4c598f48c9,79d97a902470..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_main.c
++++ b/drivers/net/ethernet/intel/ice/ice_main.c
+@@@ -6901,12 -6909,45 +6946,54 @@@ static void ice_update_vsi_tx_ring_stat
+  		ring = READ_ONCE(rings[i]);
+  		if (!ring || !ring->ring_stats)
+  			continue;
+++<<<<<<< HEAD
+ +		ice_fetch_u64_stats_per_ring(ring->ring_stats, &pkts, &bytes);
+ +		vsi_stats->tx_packets += pkts;
+ +		vsi_stats->tx_bytes += bytes;
+ +		vsi->tx_restart += ring->ring_stats->tx_stats.restart_q;
+ +		vsi->tx_busy += ring->ring_stats->tx_stats.tx_busy;
+ +		vsi->tx_linearize += ring->ring_stats->tx_stats.tx_linearize;
+++=======
++ 
++ 		ice_fetch_u64_tx_stats(ring, &copy);
++ 
++ 		vsi_stats->pkts += copy.pkts;
++ 		vsi_stats->bytes += copy.bytes;
++ 		vsi_stats->tx_restart_q += copy.tx_restart_q;
++ 		vsi_stats->tx_busy += copy.tx_busy;
++ 		vsi_stats->tx_linearize += copy.tx_linearize;
++ 	}
++ }
++ 
++ /**
++  * ice_update_vsi_rx_ring_stats - Update VSI Rx ring stats counters
++  * @vsi: the VSI to be updated
++  * @vsi_stats: accumulated stats for this VSI
++  * @rings: rings to work on
++  * @count: number of rings
++  */
++ static void ice_update_vsi_rx_ring_stats(struct ice_vsi *vsi,
++ 					 struct ice_vsi_rx_stats *vsi_stats,
++ 					 struct ice_rx_ring **rings, u16 count)
++ {
++ 	struct ice_vsi_rx_stats copy = {};
++ 	u16 i;
++ 
++ 	for (i = 0; i < count; i++) {
++ 		struct ice_rx_ring *ring;
++ 
++ 		ring = READ_ONCE(rings[i]);
++ 		if (!ring || !ring->ring_stats)
++ 			continue;
++ 
++ 		ice_fetch_u64_rx_stats(ring, &copy);
++ 
++ 		vsi_stats->pkts += copy.pkts;
++ 		vsi_stats->bytes += copy.bytes;
++ 		vsi_stats->rx_non_eop_descs += copy.rx_non_eop_descs;
++ 		vsi_stats->rx_page_failed += copy.rx_page_failed;
++ 		vsi_stats->rx_buf_failed += copy.rx_buf_failed;
+++>>>>>>> b38a418db366 (ice: convert all ring stats to u64_stats_t)
+  	}
+  }
+  
+@@@ -6940,17 -6969,8 +7015,22 @@@ static void ice_update_vsi_ring_stats(s
+  				     vsi->num_txq);
+  
+  	/* update Rx rings counters */
+++<<<<<<< HEAD
+ +	ice_for_each_rxq(vsi, i) {
+ +		struct ice_rx_ring *ring = READ_ONCE(vsi->rx_rings[i]);
+ +		struct ice_ring_stats *ring_stats;
+ +
+ +		ring_stats = ring->ring_stats;
+ +		ice_fetch_u64_stats_per_ring(ring_stats, &pkts, &bytes);
+ +		vsi_stats->rx_packets += pkts;
+ +		vsi_stats->rx_bytes += bytes;
+ +		vsi->rx_buf_failed += ring_stats->rx_stats.alloc_buf_failed;
+ +		vsi->rx_page_failed += ring_stats->rx_stats.alloc_page_failed;
+ +	}
+++=======
++ 	ice_update_vsi_rx_ring_stats(vsi, &rx_stats, vsi->rx_rings,
++ 				     vsi->num_rxq);
+++>>>>>>> b38a418db366 (ice: convert all ring stats to u64_stats_t)
+  
+  	/* update XDP Tx rings counters */
+  	if (ice_is_xdp_ena_vsi(vsi))
+diff --cc drivers/net/ethernet/intel/ice/ice_txrx.h
+index 70f40a5ec33f,c51b1e60f717..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_txrx.h
++++ b/drivers/net/ethernet/intel/ice/ice_txrx.h
+@@@ -197,42 -129,64 +197,103 @@@ struct ice_tx_offload_params 
+  	u8 header_len;
+  };
+  
+++<<<<<<< HEAD
+ +struct ice_rx_buf {
+ +	dma_addr_t dma;
+ +	struct page *page;
+ +	unsigned int page_offset;
+ +	unsigned int pgcnt;
+ +	unsigned int pagecnt_bias;
+ +	bool has_data;
+ +};
+ +
+ +struct ice_q_stats {
+ +	u64 pkts;
+ +	u64 bytes;
+ +};
+ +
+ +struct ice_txq_stats {
+ +	u64 restart_q;
+ +	u64 tx_busy;
+ +	u64 tx_linearize;
+ +	int prev_pkt; /* negative if no pending Tx descriptors */
+ +};
+ +
+ +struct ice_rxq_stats {
+ +	u64 non_eop_descs;
+ +	u64 alloc_page_failed;
+ +	u64 alloc_buf_failed;
+ +};
+ +
+ +struct ice_ring_stats {
+ +	struct rcu_head rcu;	/* to avoid race on free */
+ +	struct ice_q_stats stats;
+ +	struct u64_stats_sync syncp;
+ +	union {
+ +		struct ice_txq_stats tx_stats;
+ +		struct ice_rxq_stats rx_stats;
+ +	};
+ +};
+++=======
++ struct ice_ring_stats {
++ 	struct rcu_head rcu;	/* to avoid race on free */
++ 	struct u64_stats_sync syncp;
++ 	struct_group(stats,
++ 		u64_stats_t pkts;
++ 		u64_stats_t bytes;
++ 		union {
++ 			struct_group(tx,
++ 				u64_stats_t tx_restart_q;
++ 				u64_stats_t tx_busy;
++ 				u64_stats_t tx_linearize;
++ 				/* negative if no pending Tx descriptors */
++ 				int prev_pkt;
++ 			);
++ 			struct_group(rx,
++ 				u64_stats_t rx_non_eop_descs;
++ 				u64_stats_t rx_page_failed;
++ 				u64_stats_t rx_buf_failed;
++ 			);
++ 		};
++ 	);
++ };
++ 
++ /**
++  * ice_stats_read - Read a single ring stat value
++  * @stats: pointer to ring_stats structure for a queue
++  * @member: the ice_ring_stats member to read
++  *
++  * Shorthand for reading a single 64-bit stat value from struct
++  * ice_ring_stats.
++  *
++  * Return: the value of the requested stat.
++  */
++ #define ice_stats_read(stats, member) ({				\
++ 	struct ice_ring_stats *__stats = (stats);			\
++ 	unsigned int start;						\
++ 	u64 val;							\
++ 	do {								\
++ 		start = u64_stats_fetch_begin(&__stats->syncp);		\
++ 		val = u64_stats_read(&__stats->member);			\
++ 	} while (u64_stats_fetch_retry(&__stats->syncp, start));	\
++ 	val;								\
++ })
++ 
++ /**
++  * ice_stats_inc - Increment a single ring stat value
++  * @stats: pointer to the ring_stats structure for a queue
++  * @member: the ice_ring_stats member to increment
++  *
++  * Shorthand for incrementing a single 64-bit stat value in struct
++  * ice_ring_stats.
++  */
++ #define ice_stats_inc(stats, member) do {				\
++ 	struct ice_ring_stats *__stats = (stats);			\
++ 	u64_stats_update_begin(&__stats->syncp);			\
++ 	u64_stats_inc(&__stats->member);				\
++ 	u64_stats_update_end(&__stats->syncp);				\
++ } while (0)
+++>>>>>>> b38a418db366 (ice: convert all ring stats to u64_stats_t)
+  
+  enum ice_ring_state_t {
+  	ICE_TX_XPS_INIT_DONE,
+* Unmerged path drivers/net/ethernet/intel/ice/ice_lib.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_main.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_txrx.h

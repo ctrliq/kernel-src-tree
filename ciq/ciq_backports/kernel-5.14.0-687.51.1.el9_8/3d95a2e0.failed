@@ -1,0 +1,327 @@
+netfilter: nf_tables: all transaction allocations can now sleep
+
+jira KERNEL-1646
+Rebuild_History Non-Buildable kernel-5.14.0-687.51.1.el9_8
+commit-author Florian Westphal <fw@strlen.de>
+commit 3d95a2e016abab29ccb6f384576b2038e544a5a8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.51.1.el9_8/3d95a2e0.failed
+
+Now that nft_setelem_flush is not called with rcu read lock held or
+disabled softinterrupts anymore this can now use GFP_KERNEL too.
+
+This is the last atomic allocation of transaction elements, so remove
+all gfp_t arguments and the wrapper function.
+
+This makes attempts to delete large sets much more reliable, before
+this was prone to transient memory allocation failures.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+(cherry picked from commit 3d95a2e016abab29ccb6f384576b2038e544a5a8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_tables_api.c
+diff --cc net/netfilter/nf_tables_api.c
+index 283cf07e8650,54519b3d2868..000000000000
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@@ -146,14 -147,16 +146,18 @@@ static void nft_ctx_init(struct nft_ct
+  	ctx->report	= nlmsg_report(nlh);
+  	ctx->flags	= nlh->nlmsg_flags;
+  	ctx->seq	= nlh->nlmsg_seq;
+ -
+ -	bitmap_zero(ctx->reg_inited, NFT_REG32_NUM);
+  }
+  
+- static struct nft_trans *nft_trans_alloc_gfp(const struct nft_ctx *ctx,
+- 					     int msg_type, u32 size, gfp_t gfp)
++ static struct nft_trans *nft_trans_alloc(const struct nft_ctx *ctx,
++ 					 int msg_type, u32 size)
+  {
+  	struct nft_trans *trans;
+  
+++<<<<<<< HEAD
+ +	trans = kzalloc(sizeof(struct nft_trans) + size, gfp);
+++=======
++ 	trans = kzalloc(size, GFP_KERNEL);
+++>>>>>>> 3d95a2e016ab (netfilter: nf_tables: all transaction allocations can now sleep)
+  	if (trans == NULL)
+  		return NULL;
+  
+@@@ -165,10 -172,15 +169,22 @@@
+  	return trans;
+  }
+  
+++<<<<<<< HEAD
+ +static struct nft_trans *nft_trans_alloc(const struct nft_ctx *ctx,
+ +					 int msg_type, u32 size)
+ +{
+ +	return nft_trans_alloc_gfp(ctx, msg_type, size, GFP_KERNEL);
+++=======
++ static struct nft_trans_binding *nft_trans_get_binding(struct nft_trans *trans)
++ {
++ 	switch (trans->msg_type) {
++ 	case NFT_MSG_NEWCHAIN:
++ 	case NFT_MSG_NEWSET:
++ 		return container_of(trans, struct nft_trans_binding, nft_trans);
++ 	}
++ 
++ 	return NULL;
+++>>>>>>> 3d95a2e016ab (netfilter: nf_tables: all transaction allocations can now sleep)
+  }
+  
+  static void nft_trans_list_del(struct nft_trans *trans)
+@@@ -369,6 -421,87 +385,90 @@@ static void nf_tables_unregister_hook(s
+  	return __nf_tables_unregister_hook(net, table, chain, false);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool nft_trans_collapse_set_elem_allowed(const struct nft_trans_elem *a, const struct nft_trans_elem *b)
++ {
++ 	/* NB: the ->bound equality check is defensive, at this time we only merge
++ 	 * a new nft_trans_elem transaction request with the transaction tail
++ 	 * element, but a->bound != b->bound would imply a NEWRULE transaction
++ 	 * is queued in-between.
++ 	 *
++ 	 * The set check is mandatory, the NFT_MAX_SET_NELEMS check prevents
++ 	 * huge krealloc() requests.
++ 	 */
++ 	return a->set == b->set && a->bound == b->bound && a->nelems < NFT_MAX_SET_NELEMS;
++ }
++ 
++ static bool nft_trans_collapse_set_elem(struct nftables_pernet *nft_net,
++ 					struct nft_trans_elem *tail,
++ 					struct nft_trans_elem *trans)
++ {
++ 	unsigned int nelems, old_nelems = tail->nelems;
++ 	struct nft_trans_elem *new_trans;
++ 
++ 	if (!nft_trans_collapse_set_elem_allowed(tail, trans))
++ 		return false;
++ 
++ 	/* "cannot happen", at this time userspace element add
++ 	 * requests always allocate a new transaction element.
++ 	 *
++ 	 * This serves as a reminder to adjust the list_add_tail
++ 	 * logic below in case this ever changes.
++ 	 */
++ 	if (WARN_ON_ONCE(trans->nelems != 1))
++ 		return false;
++ 
++ 	if (check_add_overflow(old_nelems, trans->nelems, &nelems))
++ 		return false;
++ 
++ 	/* krealloc might free tail which invalidates list pointers */
++ 	list_del_init(&tail->nft_trans.list);
++ 
++ 	new_trans = krealloc(tail, struct_size(tail, elems, nelems),
++ 			     GFP_KERNEL);
++ 	if (!new_trans) {
++ 		list_add_tail(&tail->nft_trans.list,
++ 			      &nft_net->commit_list);
++ 		return false;
++ 	}
++ 
++ 	/*
++ 	 * new_trans->nft_trans.list contains garbage, but
++ 	 * list_add_tail() doesn't care.
++ 	 */
++ 	new_trans->nelems = nelems;
++ 	new_trans->elems[old_nelems] = trans->elems[0];
++ 	list_add_tail(&new_trans->nft_trans.list, &nft_net->commit_list);
++ 
++ 	return true;
++ }
++ 
++ static bool nft_trans_try_collapse(struct nftables_pernet *nft_net,
++ 				   struct nft_trans *trans)
++ {
++ 	struct nft_trans *tail;
++ 
++ 	if (list_empty(&nft_net->commit_list))
++ 		return false;
++ 
++ 	tail = list_last_entry(&nft_net->commit_list, struct nft_trans, list);
++ 
++ 	if (tail->msg_type != trans->msg_type)
++ 		return false;
++ 
++ 	switch (trans->msg_type) {
++ 	case NFT_MSG_NEWSETELEM:
++ 	case NFT_MSG_DELSETELEM:
++ 		return nft_trans_collapse_set_elem(nft_net,
++ 						   nft_trans_container_elem(tail),
++ 						   nft_trans_container_elem(trans));
++ 	}
++ 
++ 	return false;
++ }
++ 
+++>>>>>>> 3d95a2e016ab (netfilter: nf_tables: all transaction allocations can now sleep)
+  static void nft_trans_commit_list_add_tail(struct net *net, struct nft_trans *trans)
+  {
+  	struct nftables_pernet *nft_net = nft_pernet(net);
+@@@ -387,11 -527,24 +487,27 @@@
+  	case NFT_MSG_NEWCHAIN:
+  		if (!nft_trans_chain_update(trans) &&
+  		    nft_chain_binding(nft_trans_chain(trans)))
+ -			list_add_tail(&binding->binding_list, &nft_net->binding_list);
+ +			list_add_tail(&trans->binding_list, &nft_net->binding_list);
+  		break;
+  	}
+ -}
+  
+++<<<<<<< HEAD
+ +	list_add_tail(&trans->list, &nft_net->commit_list);
+++=======
++ static void nft_trans_commit_list_add_elem(struct net *net, struct nft_trans *trans)
++ {
++ 	struct nftables_pernet *nft_net = nft_pernet(net);
++ 
++ 	WARN_ON_ONCE(trans->msg_type != NFT_MSG_NEWSETELEM &&
++ 		     trans->msg_type != NFT_MSG_DELSETELEM);
++ 
++ 	if (nft_trans_try_collapse(nft_net, trans)) {
++ 		kfree(trans);
++ 		return;
++ 	}
++ 
++ 	nft_trans_commit_list_add_tail(net, trans);
+++>>>>>>> 3d95a2e016ab (netfilter: nf_tables: all transaction allocations can now sleep)
+  }
+  
+  static int nft_trans_table_add(struct nft_ctx *ctx, int msg_type)
+@@@ -6816,8 -7512,40 +6932,43 @@@ static int nft_add_set_elem(struct nft_
+  			     nft_set_ext_exists(ext2, NFT_SET_EXT_OBJREF) &&
+  			     *nft_set_ext_obj(ext) != *nft_set_ext_obj(ext2)))
+  				goto err_element_clash;
+ -			else if (!(nlmsg_flags & NLM_F_EXCL)) {
+ +			else if (!(nlmsg_flags & NLM_F_EXCL))
+  				err = 0;
+++<<<<<<< HEAD
+++=======
++ 				if (nft_set_ext_exists(ext2, NFT_SET_EXT_TIMEOUT)) {
++ 					struct nft_elem_update update = { };
++ 
++ 					if (timeout != nft_set_ext_timeout(ext2)->timeout) {
++ 						update.timeout = timeout;
++ 						if (expiration == 0)
++ 							expiration = timeout;
++ 
++ 						update.flags |= NFT_TRANS_UPD_TIMEOUT;
++ 					}
++ 					if (expiration) {
++ 						update.expiration = expiration;
++ 						update.flags |= NFT_TRANS_UPD_EXPIRATION;
++ 					}
++ 
++ 					if (update.flags) {
++ 						struct nft_trans_one_elem *ue;
++ 
++ 						ue = &nft_trans_container_elem(trans)->elems[0];
++ 
++ 						ue->update = kmemdup(&update, sizeof(update), GFP_KERNEL);
++ 						if (!ue->update) {
++ 							err = -ENOMEM;
++ 							goto err_element_clash;
++ 						}
++ 
++ 						ue->priv = elem_priv;
++ 						nft_trans_commit_list_add_elem(ctx->net, trans);
++ 						goto err_elem_free;
++ 					}
++ 				}
++ 			}
+++>>>>>>> 3d95a2e016ab (netfilter: nf_tables: all transaction allocations can now sleep)
+  		} else if (err == -ENOTEMPTY) {
+  			/* ENOTEMPTY reports overlapping between this element
+  			 * and an existing one.
+@@@ -6827,14 -7555,17 +6978,19 @@@
+  		goto err_element_clash;
+  	}
+  
+ -	if (!(flags & NFT_SET_ELEM_CATCHALL)) {
+ -		unsigned int max = nft_set_maxsize(set);
+ -
+ -		if (!atomic_add_unless(&set->nelems, 1, max)) {
+ -			err = -ENFILE;
+ -			goto err_set_full;
+ -		}
+ +	if (!(flags & NFT_SET_ELEM_CATCHALL) && set->size &&
+ +	    !atomic_add_unless(&set->nelems, 1, set->size + set->ndeact)) {
+ +		err = -ENFILE;
+ +		goto err_set_full;
+  	}
+  
+++<<<<<<< HEAD
+ +	nft_trans_elem_priv(trans) = elem.priv;
+ +	nft_trans_commit_list_add_tail(ctx->net, trans);
+++=======
++ 	nft_trans_container_elem(trans)->elems[0].priv = elem.priv;
++ 	nft_trans_commit_list_add_elem(ctx->net, trans);
+++>>>>>>> 3d95a2e016ab (netfilter: nf_tables: all transaction allocations can now sleep)
+  	return 0;
+  
+  err_set_full:
+@@@ -7051,8 -7830,8 +7207,13 @@@ static int nft_del_setelem(struct nft_c
+  
+  	nft_setelem_data_deactivate(ctx->net, set, elem.priv);
+  
+++<<<<<<< HEAD
+ +	nft_trans_elem_priv(trans) = elem.priv;
+ +	nft_trans_commit_list_add_tail(ctx->net, trans);
+++=======
++ 	nft_trans_container_elem(trans)->elems[0].priv = elem.priv;
++ 	nft_trans_commit_list_add_elem(ctx->net, trans);
+++>>>>>>> 3d95a2e016ab (netfilter: nf_tables: all transaction allocations can now sleep)
+  	return 0;
+  
+  fail_ops:
+@@@ -7077,8 -7856,8 +7238,13 @@@ static int nft_setelem_flush(const stru
+  	if (!nft_set_elem_active(ext, iter->genmask))
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	trans = nft_trans_alloc_gfp(ctx, NFT_MSG_DELSETELEM,
+ +				    sizeof(struct nft_trans_elem), GFP_ATOMIC);
+++=======
++ 	trans = nft_trans_alloc(ctx, NFT_MSG_DELSETELEM,
++ 				struct_size_t(struct nft_trans_elem, elems, 1));
+++>>>>>>> 3d95a2e016ab (netfilter: nf_tables: all transaction allocations can now sleep)
+  	if (!trans)
+  		return -ENOMEM;
+  
+@@@ -7087,8 -7866,9 +7253,14 @@@
+  
+  	nft_setelem_data_deactivate(ctx->net, set, elem_priv);
+  	nft_trans_elem_set(trans) = set;
+++<<<<<<< HEAD
+ +	nft_trans_elem_priv(trans) = elem_priv;
+ +	nft_trans_commit_list_add_tail(ctx->net, trans);
+++=======
++ 	nft_trans_container_elem(trans)->nelems = 1;
++ 	nft_trans_container_elem(trans)->elems[0].priv = elem_priv;
++ 	nft_trans_commit_list_add_elem(ctx->net, trans);
+++>>>>>>> 3d95a2e016ab (netfilter: nf_tables: all transaction allocations can now sleep)
+  
+  	return 0;
+  }
+@@@ -7105,9 -7884,8 +7277,14 @@@ static int __nft_set_catchall_flush(con
+  		return -ENOMEM;
+  
+  	nft_setelem_data_deactivate(ctx->net, set, elem_priv);
+++<<<<<<< HEAD
+ +	nft_trans_elem_set(trans) = set;
+ +	nft_trans_elem_priv(trans) = elem_priv;
+ +	nft_trans_commit_list_add_tail(ctx->net, trans);
+++=======
++ 	nft_trans_container_elem(trans)->elems[0].priv = elem_priv;
++ 	nft_trans_commit_list_add_elem(ctx->net, trans);
+++>>>>>>> 3d95a2e016ab (netfilter: nf_tables: all transaction allocations can now sleep)
+  
+  	return 0;
+  }
+* Unmerged path net/netfilter/nf_tables_api.c
