@@ -17,6 +17,7 @@
 #include <linux/string.h>
 #include <linux/unaligned.h>
 #include <linux/wordpart.h>
+#include "fips.h"
 
 static const struct sha512_block_state sha384_iv = {
 	.h = {
@@ -150,12 +151,14 @@ static void __sha512_init(struct __sha512_ctx *ctx,
 void sha384_init(struct sha384_ctx *ctx)
 {
 	__sha512_init(&ctx->ctx, &sha384_iv, 0);
+	ctx->fips_approved = fips_enabled;
 }
 EXPORT_SYMBOL_GPL(sha384_init);
 
 void sha512_init(struct sha512_ctx *ctx)
 {
 	__sha512_init(&ctx->ctx, &sha512_iv, 0);
+	ctx->fips_approved = fips_enabled;
 }
 EXPORT_SYMBOL_GPL(sha512_init);
 
@@ -287,6 +290,9 @@ void hmac_sha384_preparekey(struct hmac_sha384_key *key,
 {
 	__hmac_sha512_preparekey(&key->key.istate, &key->key.ostate,
 				 raw_key, raw_key_len, &sha384_iv);
+	key->fips_approved = fips_enabled;
+	if (fips_enabled && raw_key_len < 112 / 8)
+		key->fips_approved = false;
 }
 EXPORT_SYMBOL_GPL(hmac_sha384_preparekey);
 
@@ -295,6 +301,9 @@ void hmac_sha512_preparekey(struct hmac_sha512_key *key,
 {
 	__hmac_sha512_preparekey(&key->key.istate, &key->key.ostate,
 				 raw_key, raw_key_len, &sha512_iv);
+	key->fips_approved = fips_enabled;
+	if (fips_enabled && raw_key_len < 112 / 8)
+		key->fips_approved = false;
 }
 EXPORT_SYMBOL_GPL(hmac_sha512_preparekey);
 
@@ -313,6 +322,9 @@ void hmac_sha384_init_usingrawkey(struct hmac_sha384_ctx *ctx,
 				 raw_key, raw_key_len, &sha384_iv);
 	ctx->ctx.sha_ctx.bytecount_lo = SHA512_BLOCK_SIZE;
 	ctx->ctx.sha_ctx.bytecount_hi = 0;
+	ctx->fips_approved = fips_enabled;
+	if (fips_enabled && raw_key_len < 112 / 8)
+		ctx->fips_approved = false;
 }
 EXPORT_SYMBOL_GPL(hmac_sha384_init_usingrawkey);
 
@@ -323,6 +335,9 @@ void hmac_sha512_init_usingrawkey(struct hmac_sha512_ctx *ctx,
 				 raw_key, raw_key_len, &sha512_iv);
 	ctx->ctx.sha_ctx.bytecount_lo = SHA512_BLOCK_SIZE;
 	ctx->ctx.sha_ctx.bytecount_hi = 0;
+	ctx->fips_approved = fips_enabled;
+	if (fips_enabled && raw_key_len < 112 / 8)
+		ctx->fips_approved = false;
 }
 EXPORT_SYMBOL_GPL(hmac_sha512_init_usingrawkey);
 
@@ -405,10 +420,26 @@ void hmac_sha512_usingrawkey(const u8 *raw_key, size_t raw_key_len,
 }
 EXPORT_SYMBOL_GPL(hmac_sha512_usingrawkey);
 
-#ifdef sha512_mod_init_arch
+#if defined(sha512_mod_init_arch) || defined(CONFIG_CRYPTO_FIPS)
 static int __init sha512_mod_init(void)
 {
+#ifdef sha512_mod_init_arch
 	sha512_mod_init_arch();
+#endif
+	if (fips_enabled) {
+		/*
+		 * FIPS cryptographic algorithm self-test.  As per the FIPS
+		 * Implementation Guidance, testing HMAC-SHA512 satisfies the
+		 * test requirement for SHA-384, SHA-512, and HMAC-SHA384 too.
+		 */
+		u8 mac[SHA512_DIGEST_SIZE];
+
+		hmac_sha512_usingrawkey(fips_test_key, sizeof(fips_test_key),
+					fips_test_data, sizeof(fips_test_data),
+					mac);
+		if (memcmp(fips_test_hmac_sha512_value, mac, sizeof(mac)) != 0)
+			panic("sha512: FIPS self-test failed\n");
+	}
 	return 0;
 }
 subsys_initcall(sha512_mod_init);
