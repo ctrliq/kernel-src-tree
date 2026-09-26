@@ -1,0 +1,104 @@
+smb: client: avoid double-free in smbd_free_send_io() after smbd_send_batch_flush()
+
+jira KERNEL-1677
+Rebuild_History Non-Buildable kernel-5.14.0-687.52.1.el9_8
+commit-author Stefan Metzmacher <metze@samba.org>
+commit 27b7c3e916218b5eb2ee350211140e961bfc49be
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.52.1.el9_8/27b7c3e9.failed
+
+smbd_send_batch_flush() already calls smbd_free_send_io(),
+so we should not call it again after smbd_post_send()
+moved it to the batch list.
+
+	Reported-by: Ruikai Peng <ruikai@pwno.io>
+Closes: https://lore.kernel.org/linux-cifs/CAFD3drNOSJ05y3A+jNXSDxW-2w09KHQ0DivhxQ_pcc7immVVOQ@mail.gmail.com/
+Fixes: 21538121efe6 ("smb: client: make use of smbdirect_socket.send_io.bcredits")
+	Cc: stable@kernel.org
+	Cc: Steve French <smfrench@gmail.com>
+	Cc: Tom Talpey <tom@talpey.com>
+	Cc: Long Li <longli@microsoft.com>
+	Cc: Ruikai Peng <ruikai@pwno.io>
+	Cc: Sergey Senozhatsky <senozhatsky@chromium.org>
+	Cc: linux-cifs@vger.kernel.org
+	Cc: samba-technical@lists.samba.org
+	Cc: security@kernel.org
+	Acked-by: Paulo Alcantara (Red Hat) <pc@manguebit.org>
+	Acked-by: Namjae Jeon <linkinjeon@kernel.org>
+	Signed-off-by: Stefan Metzmacher <metze@samba.org>
+	Tested-by: Ruikai Peng <ruikai@pwno.io>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 27b7c3e916218b5eb2ee350211140e961bfc49be)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/smb/client/smbdirect.c
+diff --cc fs/smb/client/smbdirect.c
+index 3d6f9a549b6e,461658105013..000000000000
+--- a/fs/smb/client/smbdirect.c
++++ b/fs/smb/client/smbdirect.c
+@@@ -1231,42 -1549,27 +1231,61 @@@ wait_credit
+  		     le32_to_cpu(packet->data_length),
+  		     le32_to_cpu(packet->remaining_data_length));
+  
+++<<<<<<< HEAD
+ +	/* Fill in the packet data payload */
+ +	num_sgs = sgl ? sg_nents(sgl) : 0;
+ +	for_each_sg(sgl, sg, num_sgs, i) {
+ +		request->sge[i+1].addr =
+ +			ib_dma_map_page(sc->ib.dev, sg_page(sg),
+ +			       sg->offset, sg->length, DMA_TO_DEVICE);
+ +		if (ib_dma_mapping_error(
+ +				sc->ib.dev, request->sge[i+1].addr)) {
+ +			rc = -EIO;
+ +			request->sge[i+1].addr = 0;
+ +			goto err_dma;
+ +		}
+ +		request->sge[i+1].length = sg->length;
+ +		request->sge[i+1].lkey = sc->ib.pd->local_dma_lkey;
+ +		request->num_sge++;
+++=======
++ 	rc = smbd_post_send(sc, batch, request);
++ 	if (!rc) {
++ 		/*
++ 		 * From here request is moved to batch
++ 		 * and we should not free it explicitly.
++ 		 */
++ 
++ 		if (batch != &_batch)
++ 			return 0;
++ 
++ 		rc = smbd_send_batch_flush(sc, batch, true);
++ 		if (!rc)
++ 			return 0;
++ 
++ 		goto err_flush;
+++>>>>>>> 27b7c3e91621 (smb: client: avoid double-free in smbd_free_send_io() after smbd_send_batch_flush())
+  	}
+  
+ +	/*
+ +	 * Now that we got a local and a remote credit
+ +	 * we add us as pending
+ +	 */
+ +	atomic_inc(&sc->send_io.pending.count);
+ +
+ +	rc = smbd_post_send(sc, request);
+ +	if (!rc)
+ +		return 0;
+ +
+  err_dma:
+ -	smbd_free_send_io(request);
+ +	for (i = 0; i < request->num_sge; i++)
+ +		if (request->sge[i].addr)
+ +			ib_dma_unmap_single(sc->ib.dev,
+ +					    request->sge[i].addr,
+ +					    request->sge[i].length,
+ +					    DMA_TO_DEVICE);
+ +	mempool_free(request, sc->send_io.mem.pool);
+  
++ err_flush:
+  err_alloc:
+  	atomic_inc(&sc->send_io.credits.count);
+  	wake_up(&sc->send_io.credits.wait_queue);
+* Unmerged path fs/smb/client/smbdirect.c
