@@ -1171,6 +1171,7 @@ static int do_vsie_run(struct kvm_vcpu *vcpu, struct vsie_page *vsie_page)
 {
 	struct kvm_s390_sie_block *scb_s = &vsie_page->scb_s;
 	struct kvm_s390_sie_block *scb_o = vsie_page->scb_o;
+	unsigned long sie_return = SIE64_RETURN_NORMAL;
 	int guest_bp_isolation;
 	int rc = 0;
 
@@ -1201,12 +1202,23 @@ static int do_vsie_run(struct kvm_vcpu *vcpu, struct vsie_page *vsie_page)
 	current->thread.gmap_int_code = 0;
 	barrier();
 	if (!kvm_s390_vcpu_sie_inhibited(vcpu)) {
+xfer_to_guest_mode_check:
 		local_irq_disable();
+		xfer_to_guest_mode_prepare();
+		if (xfer_to_guest_mode_work_pending()) {
+			local_irq_enable();
+			rc = kvm_xfer_to_guest_mode_handle_work(vcpu);
+			if (rc)
+				goto skip_sie;
+			goto xfer_to_guest_mode_check;
+		}
 		guest_timing_enter_irqoff();
-		rc = kvm_s390_enter_exit_sie(scb_s, vcpu->run->s.regs.gprs, vsie_page->gmap->asce);
+		sie_return = kvm_s390_enter_exit_sie(scb_s, vcpu->run->s.regs.gprs, vsie_page->gmap->asce);
 		guest_timing_exit_irqoff();
 		local_irq_enable();
 	}
+
+skip_sie:
 	barrier();
 	vcpu->arch.sie_block->prog0c &= ~PROG_IN_SIE;
 
@@ -1216,11 +1228,12 @@ static int do_vsie_run(struct kvm_vcpu *vcpu, struct vsie_page *vsie_page)
 
 	kvm_vcpu_srcu_read_lock(vcpu);
 
-	if (rc == -EINTR) {
-		VCPU_EVENT(vcpu, 3, "%s", "machine check");
+	if (sie_return == SIE64_RETURN_MCCK) {
 		kvm_s390_reinject_machine_check(vcpu, &vsie_page->mcck_info);
 		return 0;
 	}
+
+	WARN_ON_ONCE(sie_return != SIE64_RETURN_NORMAL);
 
 	if (rc > 0)
 		rc = 0; /* we could still have an icpt */
@@ -1366,13 +1379,11 @@ static int vsie_run(struct kvm_vcpu *vcpu, struct vsie_page *vsie_page)
 		 * but rewind the PSW to re-enter SIE once that's completed
 		 * instead of passing a "no action" intercept to the guest.
 		 */
-		if (signal_pending(current) ||
-		    kvm_s390_vcpu_has_irq(vcpu, 0) ||
+		if (kvm_s390_vcpu_has_irq(vcpu, 0) ||
 		    kvm_s390_vcpu_sie_inhibited(vcpu)) {
 			kvm_s390_rewind_psw(vcpu, 4);
 			break;
 		}
-		cond_resched();
 	}
 
 	if (rc == -EFAULT) {
@@ -1504,8 +1515,7 @@ int kvm_s390_handle_vsie(struct kvm_vcpu *vcpu)
 	if (unlikely(scb_addr & 0x1ffUL))
 		return kvm_s390_inject_program_int(vcpu, PGM_SPECIFICATION);
 
-	if (signal_pending(current) || kvm_s390_vcpu_has_irq(vcpu, 0) ||
-	    kvm_s390_vcpu_sie_inhibited(vcpu)) {
+	if (kvm_s390_vcpu_has_irq(vcpu, 0) || kvm_s390_vcpu_sie_inhibited(vcpu)) {
 		kvm_s390_rewind_psw(vcpu, 4);
 		return 0;
 	}
