@@ -59,10 +59,11 @@ int main(void)
 	OFFSET(__SF_EMPTY, stack_frame, empty[0]);
 	OFFSET(__SF_SIE_CONTROL, stack_frame, sie_control_block);
 	OFFSET(__SF_SIE_SAVEAREA, stack_frame, sie_savearea);
-	OFFSET(__SF_SIE_REASON, stack_frame, sie_reason);
+	OFFSET(__SF_SIE_RETURN, stack_frame, sie_return);
 	OFFSET(__SF_SIE_FLAGS, stack_frame, sie_flags);
 	OFFSET(__SF_SIE_CONTROL_PHYS, stack_frame, sie_control_block_phys);
 	OFFSET(__SF_SIE_GUEST_ASCE, stack_frame, sie_guest_asce);
+	OFFSET(__SF_SIE_IRQ, stack_frame, sie_irq);
 	DEFINE(STACK_FRAME_OVERHEAD, sizeof(struct stack_frame));
 	BLANK();
 	OFFSET(__SFUSER_BACKCHAIN, stack_frame_user, back_chain);
@@ -75,7 +76,7 @@ int main(void)
 	OFFSET(__LC_EXT_CPU_ADDR, lowcore, ext_cpu_addr);
 	OFFSET(__LC_EXT_INT_CODE, lowcore, ext_int_code);
 	OFFSET(__LC_PGM_ILC, lowcore, pgm_ilc);
-	OFFSET(__LC_PGM_INT_CODE, lowcore, pgm_code);
+	OFFSET(__LC_PGM_CODE, lowcore, pgm_code);
 	OFFSET(__LC_DATA_EXC_CODE, lowcore, data_exc_code);
 	OFFSET(__LC_MON_CLASS_NR, lowcore, mon_class_num);
 	OFFSET(__LC_PER_CODE, lowcore, per_code);
