@@ -1,0 +1,178 @@
+perf: Reject exited events as group leaders
+
+jira KERNEL-1683
+cve CVE-2026-74753
+Rebuild_History Non-Buildable kernel-4.18.0-553.169.1.el8_10
+commit-author Kyle Zeng <kylebot@openai.com>
+commit fa091f46c3833fb22384f10eade2b4e1e1d0b278
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.169.1.el8_10/fa091f46.failed
+
+perf_event_remove_on_exec() sets remove-on-exec events to the EXIT state
+and detaches their group relationships.  The event's file descriptor can
+remain open, however, and perf_event_open() currently accepts that event
+as a group leader because its early validation rejects only REVOKED and
+DEAD events.
+
+A new sibling can consequently be linked to the detached leader.  When
+the leader is closed, perf_group_detach() observes that its
+PERF_ATTACH_GROUP bit is already clear and skips the new sibling.  The
+sibling then retains a group_leader pointer to the freed event.
+
+Reject group leaders in the EXIT state.  Perform the check while holding
+the shared context mutex so that an exec in the target task cannot detach
+the leader between validation and group attachment.
+
+[peterz: make the earlier test fully consistent]
+Fixes: 037a3c43edfb ("perf/core: Detach event groups during remove_on_exec")
+Assisted-by: Codex:gpt-5.6-sol
+	Signed-off-by: Kyle Zeng <kylebot@openai.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://patch.msgid.link/20260806205655.75722-1-kylebot@openai.com
+(cherry picked from commit fa091f46c3833fb22384f10eade2b4e1e1d0b278)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/events/core.c
+diff --cc kernel/events/core.c
+index 5203229b89a4,bd25e1998faf..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -12072,11 -13960,22 +12072,20 @@@ SYSCALL_DEFINE5(perf_event_open
+  	if (event_fd < 0)
+  		return event_fd;
+  
+ -	/*
+ -	 * Event creation should be under SRCU, see perf_pmu_unregister().
+ -	 */
+ -	guard(srcu)(&pmus_srcu);
+ -
+ -	CLASS(fd, group)(group_fd);     // group_fd == -1 => empty
+  	if (group_fd != -1) {
+ -		if (!is_perf_file(group)) {
+ -			err = -EBADF;
+ +		err = perf_fget_light(group_fd, &group);
+ +		if (err)
+  			goto err_fd;
+++<<<<<<< HEAD
+ +		group_leader = group.file->private_data;
+++=======
++ 		}
++ 		group_leader = fd_file(group)->private_data;
++ 		if (group_leader->state <= PERF_EVENT_STATE_EXIT) {
++ 			err = -ENODEV;
++ 			goto err_fd;
++ 		}
+++>>>>>>> fa091f46c383 (perf: Reject exited events as group leaders)
+  		if (flags & PERF_FLAG_FD_OUTPUT)
+  			output_event = group_leader;
+  		if (flags & PERF_FLAG_FD_NO_GROUP)
+@@@ -12323,9 -14075,102 +12332,105 @@@ not_move_group
+  		}
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (group_leader) {
++ 		err = -EINVAL;
++ 
++ 		/*
++ 		 * Do not allow a recursive hierarchy (this new sibling
++ 		 * becoming part of another group-sibling):
++ 		 */
++ 		if (group_leader->group_leader != group_leader)
++ 			goto err_locked;
++ 
++ 		/* All events in a group should have the same clock */
++ 		if (group_leader->clock != event->clock)
++ 			goto err_locked;
++ 
++ 		/*
++ 		 * Make sure we're both events for the same CPU;
++ 		 * grouping events for different CPUs is broken; since
++ 		 * you can never concurrently schedule them anyhow.
++ 		 */
++ 		if (group_leader->cpu != event->cpu)
++ 			goto err_locked;
++ 
++ 		/*
++ 		 * Make sure we're both on the same context; either task or cpu.
++ 		 */
++ 		if (group_leader->ctx != ctx)
++ 			goto err_locked;
++ 
++ 		/* Recheck under ctx::mutex to serialize against remove-on-exec. */
++ 		if (group_leader->state <= PERF_EVENT_STATE_EXIT) {
++ 			err = -ENODEV;
++ 			goto err_locked;
++ 		}
++ 
++ 		/*
++ 		 * Only a group leader can be exclusive or pinned
++ 		 */
++ 		if (attr.exclusive || attr.pinned)
++ 			goto err_locked;
++ 
++ 		if (is_software_event(event) &&
++ 		    !in_software_context(group_leader)) {
++ 			/*
++ 			 * If the event is a sw event, but the group_leader
++ 			 * is on hw context.
++ 			 *
++ 			 * Allow the addition of software events to hw
++ 			 * groups, this is safe because software events
++ 			 * never fail to schedule.
++ 			 *
++ 			 * Note the comment that goes with struct
++ 			 * perf_event_pmu_context.
++ 			 */
++ 			pmu = group_leader->pmu_ctx->pmu;
++ 		} else if (!is_software_event(event)) {
++ 			if (is_software_event(group_leader) &&
++ 			    (group_leader->group_caps & PERF_EV_CAP_SOFTWARE)) {
++ 				/*
++ 				 * In case the group is a pure software group, and we
++ 				 * try to add a hardware event, move the whole group to
++ 				 * the hardware context.
++ 				 */
++ 				move_group = 1;
++ 			}
++ 
++ 			/* Don't allow group of multiple hw events from different pmus */
++ 			if (!in_software_context(group_leader) &&
++ 			    group_leader->pmu_ctx->pmu != pmu)
++ 				goto err_locked;
++ 		}
++ 	}
++ 
++ 	/*
++ 	 * Now that we're certain of the pmu; find the pmu_ctx.
++ 	 */
++ 	pmu_ctx = find_get_pmu_context(pmu, ctx, event);
++ 	if (IS_ERR(pmu_ctx)) {
++ 		err = PTR_ERR(pmu_ctx);
++ 		goto err_locked;
++ 	}
++ 	event->pmu_ctx = pmu_ctx;
++ 
++ 	if (output_event) {
++ 		err = perf_event_set_output(event, output_event);
++ 		if (err)
++ 			goto err_context;
++ 	}
++ 
++ 	if (!perf_event_validate_size(event)) {
++ 		err = -E2BIG;
++ 		goto err_context;
++ 	}
++ 
+++>>>>>>> fa091f46c383 (perf: Reject exited events as group leaders)
+  	if (perf_need_aux_event(event) && !perf_get_aux_event(event, group_leader)) {
+  		err = -EINVAL;
+ -		goto err_context;
+ +		goto err_locked;
+  	}
+  
+  	/*
+* Unmerged path kernel/events/core.c
