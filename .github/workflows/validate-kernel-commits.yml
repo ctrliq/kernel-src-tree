@@ -20,7 +20,6 @@ jobs:
           BASE_REF: ${{ github.base_ref }}
           HEAD_REF: ${{ github.head_ref }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_COMMITS: ${{ github.event.pull_request.commits }}
         run: |
           # Validate base branch name (alphanumeric, dots, slashes, dashes, underscores, curly braces)
           # Note: hyphen must be at end of character class or escaped to be literal
@@ -52,31 +51,25 @@ jobs:
             exit 1
           fi
 
-          # Validate commits count is numeric
-          if ! [[ "$PR_COMMITS" =~ ^[0-9]+$ ]]; then
-            echo "❌ Invalid commits count: $PR_COMMITS"
-            exit 1
-          fi
-
           # Pass validated values to environment
           echo "BASE_REF=$BASE_REF" >> "$GITHUB_ENV"
           echo "HEAD_REF=$HEAD_REF" >> "$GITHUB_ENV"
           echo "PR_NUMBER=$PR_NUMBER" >> "$GITHUB_ENV"
-          echo "PR_COMMITS=$PR_COMMITS" >> "$GITHUB_ENV"
 
       - name: Clone base branch
         env:
           BASE_CLONE_URL: ${{ github.event.pull_request.base.repo.clone_url }}
         run: |
-          # Use environment variables to prevent injection
-          git clone --depth=1 --no-checkout "$BASE_CLONE_URL" -b "$BASE_REF" .
+          # Tree mode requires complete history; skip unrelated branches and tags
+          git clone --single-branch --no-tags --no-checkout \
+            "$BASE_CLONE_URL" -b "$BASE_REF" .
 
       - name: Fetch PR branch
         env:
           HEAD_CLONE_URL: ${{ github.event.pull_request.head.repo.clone_url }}
         run: |
           # Use environment variables to prevent command injection
-          git fetch --depth=$((PR_COMMITS + 1)) "$HEAD_CLONE_URL" "$HEAD_REF"
+          git fetch --no-tags "$HEAD_CLONE_URL" "$HEAD_REF"
           HEAD_SHA=$(git rev-parse FETCH_HEAD)
 
           # Validate SHA format (40 hex characters)
@@ -96,23 +89,7 @@ jobs:
 
       - name: Fetch upstream mainline branch
         run: |
-          # Determine the kernel version tag, since it is the most recent common
-          # ancestor between the base branch and the upstream mainline branch
-          MAKEFILE=$(git show "$BASE_REF":Makefile)
-          VERSION=$(grep -m1 -Po '(?<=^VERSION = )\d+' <<< "$MAKEFILE")
-          PATCHLEVEL=$(grep -m1 -Po '(?<=^PATCHLEVEL = )\d+' <<< "$MAKEFILE")
-
-          # Validate VERSION and PATCHLEVEL are numeric
-          if ! [[ "$VERSION" =~ ^[0-9]+$ ]] || ! [[ "$PATCHLEVEL" =~ ^[0-9]+$ ]]; then
-            echo "❌ Invalid kernel version: $VERSION.$PATCHLEVEL"
-            exit 1
-          fi
-
-          # Fetch upstream mainline branch without tags, fetching only history
-          # that is newer than this kernel version tag. This reduces the amount
-          # of commits cloned knowing that there's no need to check any commits
-          # for Fixes commits older than what the base branch already contains
-          git fetch --no-tags --shallow-exclude="v$VERSION.$PATCHLEVEL" origin kernel-mainline
+          git fetch --no-tags origin kernel-mainline
           MAINLINE_SHA=$(git rev-parse FETCH_HEAD)
 
           # Validate SHA format
@@ -181,78 +158,170 @@ jobs:
 
           set -e  # Re-enable exit on error
 
-      - name: Install build dependencies for patchutils
+      - name: Install build dependencies for diffofdiffs
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential autoconf automake libtool gnulib
+          sudo apt-get install -y build-essential cmake pkg-config python3 zlib1g-dev
 
-      - name: Clone and build custom patchutils
+      - name: Checkout libgit2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          repository: libgit2/libgit2
+          ref: 0060d9cf5666f015b1067129bd874c6cc4c9c7ac  # v1.9.1
+          path: libgit2
+
+      - name: Checkout diffofdiffs
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          repository: ctrliq/diffofdiffs
+          ref: 30c0b453c330e19bf5c597587ee47424e22258cc  # v1.0.0
+          path: diffofdiffs
+
+      - name: Checkout report tools
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          repository: ctrliq/kernel-src-tree
+          # The caller's kernel branch doesn't contain the report tools
+          ref: main
+          path: workflow-tools
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Build diffofdiffs
         run: |
-          # Security: Pin to specific commit to prevent supply chain attacks
-          EXPECTED_COMMIT="df4b62b49b4aceaecf9df7b5c4139aecf8498fa6"
+          # Tree comparisons need libgit2 1.9.1 or newer, which the runner's
+          # distribution may not provide. Keep this build in a private prefix.
+          PREFIX="$RUNNER_TEMP/diffofdiffs-deps"
+          cmake -S libgit2 -B libgit2/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DBUILD_TESTS=OFF -DBUILD_CLI=OFF \
+            -DUSE_SSH=OFF -DUSE_HTTPS=OFF -DREGEX_BACKEND=builtin
+          cmake --build libgit2/build --parallel "$(nproc)"
+          cmake --install libgit2/build
+          make -C diffofdiffs -j"$(nproc)" \
+            CPPFLAGS="-I$PREFIX/include" \
+            LDFLAGS="-L$PREFIX/lib -Wl,-rpath,$PREFIX/lib"
 
-          # Clone repository at the specific commit we want
-          git clone https://github.com/kerneltoast/patchutils.git --depth=1 --revision="$EXPECTED_COMMIT"
-          cd patchutils
-
-          # Verify we're on the expected commit
-          ACTUAL_COMMIT=$(git rev-parse HEAD)
-          if [ "$ACTUAL_COMMIT" != "$EXPECTED_COMMIT" ]; then
-            echo "❌ Security: Commit mismatch!"
-            echo "Expected: $EXPECTED_COMMIT"
-            echo "Actual: $ACTUAL_COMMIT"
-            exit 1
-          fi
-
-          # Build patchutils
-          ./bootstrap
-          ./configure
-          make -j$(nproc)
-
-          # Verify the binary was created
-          if [ ! -x src/interdiff ]; then
-            echo "❌ Failed to build interdiff binary"
-            exit 1
-          fi
-
-      - name: Run interdiff check
-        id: interdiff
-        working-directory: kernel-src-tree-tools
+      - name: Compare backports with diffofdiffs
+        id: diffofdiffs
+        continue-on-error: true
+        shell: python
         run: |
-          set +e  # Don't exit on error, we want to capture the output
-          set -o pipefail  # Capture exit code from python script, not tee
-          python3 run_interdiff.py \
-            --repo .. \
-            --pr_branch "$HEAD_SHA" \
-            --base_branch "$BASE_REF" \
-            --markdown \
-            --interdiff ../patchutils/src/interdiff | tee ../interdiff_result.txt
-          EXIT_CODE=$?
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
 
-          # Check if the script failed
-          if [ $EXIT_CODE -ne 0 ]; then
-            echo "❌ Interdiff check failed with exit code $EXIT_CODE"
-            exit $EXIT_CODE
+          sys.path.insert(0, "workflow-tools/.github/scripts")
+          from diffofdiffs_report import write_report
+
+          def git_output(*args):
+              return subprocess.run(
+                  ["git", *args], check=True, text=True,
+                  stdout=subprocess.PIPE,
+              ).stdout
+
+          def prepare_upstream(ref):
+              try:
+                  return git_output("rev-parse", "--verify", ref + "^{commit}").strip()
+              except subprocess.CalledProcessError:
+                  git_output("fetch", "--no-tags", "origin", ref)
+                  return git_output("rev-parse", "--verify", ref + "^{commit}").strip()
+
+          reports = Path("diffofdiffs-reports")
+          reports.mkdir()
+          commits = git_output(
+              "rev-list", "--reverse",
+              f"{os.environ['BASE_REF']}..{os.environ['HEAD_SHA']}", "--",
+          ).splitlines()
+          results = []
+          html_reports = []
+          failed = False
+          compared = 0
+
+          for backport in commits:
+              message = git_output("show", "-s", "--format=%B", backport)
+              reference = re.search(r"^commit\s+([0-9a-fA-F]{12,40})", message, re.MULTILINE)
+              if not reference:
+                  continue
+              upstream = reference[1]
+              report = reports / f"{backport}.html"
+              compared += 1
+              try:
+                  upstream = prepare_upstream(upstream)
+                  subprocess.run([
+                      "diffofdiffs/diffofdiffs", "--html", "--backport-labels",
+                      "--git-tree=.", "-o", str(report), backport, upstream,
+                  ], check=True)
+
+                  # A successful comparison returns zero even when it differs.
+                  # Only a nonempty report identifies a finding.
+                  if not report.is_file() or report.stat().st_size == 0:
+                      report.unlink(missing_ok=True)
+                      continue
+                  html_reports.append({
+                      "backport": backport,
+                      "subject": message.splitlines()[0],
+                      "html": report.read_text(encoding="utf-8", errors="replace"),
+                  })
+                  results.append(
+                      f"- Report {len(html_reports)}: backport `{backport[:12]}` "
+                      f"vs upstream `{upstream[:12]}`"
+                  )
+              except (subprocess.CalledProcessError, OSError) as error:
+                  report.unlink(missing_ok=True)
+                  print(f"{backport}: {error}", file=sys.stderr)
+                  results.append(
+                      f"- Backport `{backport[:12]}` vs upstream `{upstream[:12]}`: "
+                      "**comparison failed**; see the workflow log."
+                  )
+                  failed = True
+
+          if html_reports:
+              write_report(html_reports, "backport-comparisons.html")
+
+          if results:
+              Path("diffofdiffs_result.txt").write_text(
+                  "## Backport comparisons\n\n" + "\n".join(results) + "\n",
+                  encoding="utf-8",
+              )
+          else:
+              message = f"Compared {compared} backports; no differences found.\n"
+              print(message, end="")
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+                  summary.write(message)
+          sys.exit(failed)
+
+      - name: Upload diffofdiffs HTML report
+        id: diffofdiffs_reports
+        if: always() && steps.diffofdiffs.outcome != 'skipped'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          path: backport-comparisons.html
+          archive: false
+          if-no-files-found: ignore
+          retention-days: 90
+
+      - name: Write comparison summary
+        if: always() && steps.diffofdiffs.outcome != 'skipped'
+        env:
+          REPORTS_URL: ${{ steps.diffofdiffs_reports.outputs.artifact-url }}
+        run: |
+          if [ -n "$REPORTS_URL" ]; then
+            {
+              printf '[View backport comparisons](%s)\n\n' "$REPORTS_URL"
+              printf 'GitHub sign-in required; retained for up to 90 days.\n\n'
+              cat diffofdiffs_result.txt
+            } > diffofdiffs_summary.txt
+            mv diffofdiffs_summary.txt diffofdiffs_result.txt
           fi
 
-          # Check for differences:
-          # 1. Verify the success message exists
-          # 2. If it exists, check if there are any OTHER lines (which would indicate differences)
-          # 3. If success message doesn't exist, that's also a difference
-          if grep -q "All backported commits match their upstream counterparts." ../interdiff_result.txt; then
-            # Success message found, check if there are any other lines
-            LINE_COUNT=$(wc -l < ../interdiff_result.txt)
-            if [ "$LINE_COUNT" -gt 1 ]; then
-              echo "has_differences=true" >> $GITHUB_OUTPUT
-            else
-              echo "has_differences=false" >> $GITHUB_OUTPUT
-            fi
-          else
-            # Success message not found, there must be differences
-            echo "has_differences=true" >> $GITHUB_OUTPUT
+          if [ -s diffofdiffs_result.txt ]; then
+            cat diffofdiffs_result.txt >> "$GITHUB_STEP_SUMMARY"
           fi
-
-          set -e  # Re-enable exit on error
 
       - name: Save PR metadata for comment workflow
         env:
@@ -278,6 +347,10 @@ jobs:
           name: check-results
           path: |
             ckc_result.txt
-            interdiff_result.txt
+            diffofdiffs_result.txt
             pr_metadata/
           retention-days: 3  # Increased from 1 (then 3) to prevent premature deletion and support manual follow-ups
+
+      - name: Fail on comparison errors
+        if: always() && steps.diffofdiffs.outcome == 'failure'
+        run: exit 1
