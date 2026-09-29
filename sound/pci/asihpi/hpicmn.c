@@ -647,17 +647,11 @@ void hpi_cmn_control_cache_sync_to_msg(struct hpi_control_cache *p_cache,
 struct hpi_control_cache *hpi_alloc_control_cache(const u32 control_count,
 	const u32 size_in_bytes, u8 *p_dsp_control_buffer)
 {
-	struct hpi_control_cache *p_cache =
-		kmalloc(sizeof(*p_cache), GFP_KERNEL);
+	struct hpi_control_cache *p_cache;
+
+	p_cache = kzalloc_flex(*p_cache, p_info, control_count);
 	if (!p_cache)
 		return NULL;
-
-	p_cache->p_info =
-		kcalloc(control_count, sizeof(*p_cache->p_info), GFP_KERNEL);
-	if (!p_cache->p_info) {
-		kfree(p_cache);
-		return NULL;
-	}
 
 	p_cache->cache_size_in_bytes = size_in_bytes;
 	p_cache->control_count = control_count;
@@ -668,10 +662,7 @@ struct hpi_control_cache *hpi_alloc_control_cache(const u32 control_count,
 
 void hpi_free_control_cache(struct hpi_control_cache *p_cache)
 {
-	if (p_cache) {
-		kfree(p_cache->p_info);
-		kfree(p_cache);
-	}
+	kfree(p_cache);
 }
 
 static void subsys_message(struct hpi_message *phm, struct hpi_response *phr)
