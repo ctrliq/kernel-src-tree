@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: GPL-2.0-only
 import unittest
 
-from diffofdiffs_comment import MAX_LENGTH, MARKER, escape, render_comment
+from diffofdiffs_comment import (MAX_LENGTH, MARKER, TITLE, escape,
+                                 render_comment)
 
 REPO = "https://github.com/octo/kernel"
 RUN = f"{REPO}/actions/runs/7"
@@ -38,16 +39,13 @@ class CommentTests(unittest.TestCase):
         body, post = render(results)
         self.assertTrue(post)
         self.assertEqual(body, f"""{MARKER}
-### 2 of 5 backports differ from upstream
+## 🔍 Diffofdiffs: 2 of 5 backports differ from upstream
 
-Review the differences in the **[diffofdiffs report.]({REPORT})** Backports \
-often differ because of conflict fixes or context changes, so a difference \
-alone isn't a bug or a failed check.
+**[View the diffofdiffs report.]({REPORT})**
 
-*Publicly accessible; sign in with any GitHub account. Expires 2026-12-29 at \
-01:47 UTC.*
+*Open to anyone signed in to GitHub. Report expires 2026-12-29 01:47 UTC.*
 
-| Report | Subject | Backport | Upstream |
+| # | Subject | Backport | Upstream |
 | ---: | --- | --- | --- |
 | 1 | nbd: fix incomplete validation of ioctl arg | \
 [`{"2" * 12}`]({REPO}/pull/12/commits/{"2" * 40}) | \
@@ -55,26 +53,19 @@ alone isn't a bug or a failed check.
 | 2 | scsi: ses: Fix desc\\_ptr accesses | \
 [`{"4" * 12}`]({REPO}/pull/12/commits/{"4" * 40}) | \
 [`{"e" * 12}`]({REPO}/commit/{"e" * 40}) |
-
-*The other 3 backports match upstream.*
 """)
 
     def test_singular_and_complete_wording(self):
         body, _ = render([result(1, "differs")])
-        self.assertIn("### The backport differs from upstream\n", body)
-        self.assertIn("Review the difference in the", body)
-        self.assertNotIn("The other", body)
+        self.assertIn(f"{TITLE} 1 backport differs from upstream\n", body)
 
         body, _ = render([result(1, "differs"), *[result(n, "matches")
                                                   for n in (2, 3)]])
-        self.assertIn("### 1 of 3 backports differs from upstream\n", body)
-        self.assertIn("*The other 2 backports match upstream.*", body)
-
-        body, _ = render([result(1, "differs"), result(2, "matches")])
-        self.assertIn("*The other backport matches upstream.*", body)
+        self.assertIn(f"{TITLE} 1 of 3 backports differs from upstream\n",
+                      body)
 
         body, _ = render([result(n, "differs") for n in (1, 2, 3)])
-        self.assertIn("### All 3 backports differ from upstream\n", body)
+        self.assertIn(f"{TITLE} All 3 backports differ from upstream\n", body)
 
     def test_differences_with_failures(self):
         results = [
@@ -84,21 +75,19 @@ alone isn't a bug or a failed check.
         ]
         body, post = render(results)
         self.assertTrue(post)
-        self.assertIn("### 1 of 3 backports differs from upstream, "
+        self.assertIn(f"{TITLE} 1 of 3 backports differs from upstream, "
                       "1 couldn't be compared\n", body)
-        self.assertIn(f"**[diffofdiffs report.]({REPORT})**", body)
-        self.assertIn(f"""*The other backport matches upstream.*
+        self.assertIn(f"**[View the diffofdiffs report.]({REPORT})**", body)
+        self.assertTrue(body.endswith(f"""|
 
 > [!WARNING]
-> **1 backport couldn't be compared with upstream**, so it hasn't been \
-checked.
+> **1 backport couldn't be compared.** Errors are in the \
+[workflow run log]({RUN}).
 >
 > - [`{"2" * 12}`]({REPO}/pull/12/commits/{"2" * 40}) subsystem: Change 2 \
 (upstream [`{"c" * 12}`]({REPO}/commit/{"c" * 40})): diffofdiffs exited with \
 status 2
->
-> Error details are in the [workflow run log]({RUN}).
-""", body)
+"""))
 
     def test_failures_without_report(self):
         results = [
@@ -110,63 +99,61 @@ status 2
         body, post = render(results, report_url=None)
         self.assertTrue(post)
         self.assertEqual(body, f"""{MARKER}
-### 2 of 3 backports couldn't be compared with upstream
+{TITLE} 2 of 3 backports couldn't be compared with upstream
 
-These comparisons didn't finish, so the backports below haven't been \
-checked. The other backport matches upstream.
+Errors are in the [workflow run log]({RUN}).
 
 - [`{"1" * 12}`]({REPO}/pull/12/commits/{"1" * 40}) subsystem: Change 1 \
 (upstream `{"b" * 12}`): couldn't fetch the upstream commit
 - [`{"3" * 12}`]({REPO}/pull/12/commits/{"3" * 40}) subsystem: Change 3 \
 (upstream [`{"d" * 12}`]({REPO}/commit/{"d" * 40})): diffofdiffs exited with \
 status 2
-
-Error details are in the [workflow run log]({RUN}).
 """)
         self.assertNotIn("differ", body)
 
         body, _ = render([result(n, "failed", error="failed")
                           for n in (1, 2)], report_url=None)
-        self.assertIn("### None of the 2 backports could be compared with "
-                      "upstream\n", body)
-        self.assertNotIn("The other", body)
+        self.assertIn(f"{TITLE} None of the 2 backports could be compared "
+                      "with upstream\n", body)
 
         body, _ = render([result(1, "failed", error="failed")],
                          report_url=None)
-        self.assertIn("### The backport couldn't be compared with upstream\n",
-                      body)
-        self.assertIn("This comparison didn't finish, so the backport below "
-                      "hasn't been checked.\n", body)
+        self.assertIn(f"{TITLE} 1 backport couldn't be compared with "
+                      "upstream\n", body)
 
     def test_matches_only_replace_earlier_comments(self):
         body, post = render([result(n, "matches") for n in (1, 2)],
                             report_url=None)
         self.assertFalse(post)
         self.assertEqual(body, f"""{MARKER}
-### All 2 backports now match upstream
-
-The latest run found no differences or comparison failures.
+{TITLE} All 2 backports now match upstream
 """)
+
+        body, post = render([result(1, "matches")], report_url=None)
+        self.assertFalse(post)
+        self.assertIn(f"{TITLE} 1 backport now matches upstream\n", body)
 
         body, post = render([], report_url=None)
         self.assertFalse(post)
-        self.assertTrue(body.startswith(f"{MARKER}\n### No backports to "
-                                        "compare\n"))
+        self.assertEqual(body, f"""{MARKER}
+{TITLE} No backports to compare
+
+No commits in this PR reference an upstream commit.
+""")
 
     def test_access_details(self):
         body, _ = render([result(1, "differs")], public=False,
                          expires_at="2026-12-28T20:47:20-05:00")
-        self.assertIn("*Sign in with a GitHub account that can access this "
-                      "repository. Expires 2026-12-29 at 01:47 UTC.*", body)
+        self.assertIn("*Open to anyone with access to this repository. "
+                      "Report expires 2026-12-29 01:47 UTC.*", body)
 
         body, _ = render([result(1, "differs")], expires_at=None)
-        self.assertIn("*Publicly accessible; sign in with any GitHub "
-                      "account.*", body)
+        self.assertIn("*Open to anyone signed in to GitHub.*", body)
 
         body, _ = render([result(1, "differs")], report_url=None)
-        self.assertIn("The diffofdiffs report couldn't be uploaded. Details "
-                      f"are in the [workflow run log]({RUN}).", body)
-        self.assertNotIn("sign in", body)
+        self.assertIn("The diffofdiffs report couldn't be uploaded. See the "
+                      f"[workflow run log]({RUN}).", body)
+        self.assertNotIn("Open to", body)
 
     def test_escapes_subjects(self):
         subject = r"a|b `c` *d* _e_ [f](g) <img src=x> $x$ ~s~ &amp; \ "
@@ -186,11 +173,11 @@ The latest run found no differences or comparison failures.
 
         body, _ = render([result(n, "differs") for n in range(1, 10)])
         self.assertIn("<details>\n<summary>9 backports with differences"
-                      "</summary>\n\n| Report |", body)
+                      "</summary>\n\n| # |", body)
         self.assertIn("| 9 | subsystem: Change 9 |", body)
         self.assertIn("|\n\n</details>\n", body)
         # The report link stays outside the collapsed section
-        self.assertLess(body.index("[diffofdiffs report.]"),
+        self.assertLess(body.index("[View the diffofdiffs report.]"),
                         body.index("<details>"))
 
     def test_stays_within_comment_limit(self):
@@ -202,9 +189,9 @@ The latest run found no differences or comparison failures.
         self.assertLessEqual(len(body), MAX_LENGTH)
         self.assertRegex(body, r"\| \.\.\. \| \d+ more in the report \| \| \|")
         self.assertRegex(body, r"> - \d+ more in the workflow run log")
-        self.assertIn("### 1000 of 2000 backports differ from upstream, "
+        self.assertIn(f"{TITLE} 1000 of 2000 backports differ from upstream, "
                       "1000 couldn't be compared\n", body)
-        self.assertIn("> Error details are in the", body)
+        self.assertIn("> **1000 backports couldn't be compared.**", body)
 
     def test_preserves_order_and_numbering(self):
         results = [result(n, "differs" if n % 2 else "matches")

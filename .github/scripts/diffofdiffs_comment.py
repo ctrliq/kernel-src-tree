@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import re
 
 MARKER = "<!-- diffofdiffs-comment -->"
+TITLE = "## 🔍 Diffofdiffs:"
 
 # Collapse longer tables so the result and report link stay in view
 INLINE_ROWS = 8
@@ -35,7 +36,7 @@ def _count(number, singular, plural):
 def _heading(total, differs, failures):
     if differs:
         if total == 1:
-            heading = "The backport differs from upstream"
+            heading = "1 backport differs from upstream"
         elif differs == total:
             heading = f"All {total} backports differ from upstream"
         else:
@@ -45,7 +46,7 @@ def _heading(total, differs, failures):
             heading += f", {failures} couldn't be compared"
         return heading
     if total == 1:
-        return "The backport couldn't be compared with upstream"
+        return "1 backport couldn't be compared with upstream"
     if failures == total:
         return f"None of the {total} backports could be compared with upstream"
     return (f"{failures} of {total} backports couldn't be compared with "
@@ -71,19 +72,16 @@ def render_comment(results, *, repo_url, pr_number, run_url, report_url=None,
     differs = [result for result in results if result["status"] == "differs"]
     failures = [result for result in results if result["status"] == "failed"]
     total = len(results)
-    matches = total - len(differs) - len(failures)
 
     # Without anything to review, only replace an earlier comment
     if not total:
-        return (f"{MARKER}\n### No backports to compare\n\n"
-                "The latest run found no commits that reference an upstream "
-                "commit.\n", False)
+        return (f"{MARKER}\n{TITLE} No backports to compare\n\n"
+                "No commits in this PR reference an upstream commit.\n",
+                False)
     if not differs and not failures:
-        heading = ("The backport now matches upstream" if total == 1 else
+        heading = ("1 backport now matches upstream" if total == 1 else
                    f"All {total} backports now match upstream")
-        return (f"{MARKER}\n### {heading}\n\n"
-                "The latest run found no differences or comparison "
-                "failures.\n", False)
+        return f"{MARKER}\n{TITLE} {heading}\n", False
 
     def link(sha, url):
         return f"[`{sha[:12]}`]({url})"
@@ -99,45 +97,25 @@ def render_comment(results, *, repo_url, pr_number, run_url, report_url=None,
             return f"`{result['reference'][:12]}`"
         return link(sha, f"{repo_url}/commit/{sha}")
 
-    matching = ""
-    if matches == 1:
-        matching = "The other backport matches upstream."
-    elif matches:
-        matching = f"The other {matches} backports match upstream."
-
-    head = [MARKER, f"### {_heading(total, len(differs), len(failures))}", ""]
+    run_log = f"[workflow run log]({run_url})"
+    head = [MARKER, f"{TITLE} {_heading(total, len(differs), len(failures))}",
+            ""]
     if differs and report_url:
-        noun = "difference" if len(differs) == 1 else "differences"
         if public:
-            access = "Publicly accessible; sign in with any GitHub account."
+            access = "Open to anyone signed in to GitHub."
         else:
-            access = ("Sign in with a GitHub account that can access this "
-                      "repository.")
+            access = "Open to anyone with access to this repository."
         if expires_at:
             expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
             access += expiry.astimezone(timezone.utc).strftime(
-                " Expires %Y-%m-%d at %H:%M UTC.")
-        head += [
-            f"Review the {noun} in the "
-            f"**[diffofdiffs report.]({report_url})** "
-            "Backports often differ because of conflict fixes or context "
-            "changes, so a difference alone isn't a bug or a failed check.",
-            "",
-            f"*{access}*",
-            "",
-        ]
+                " Report expires %Y-%m-%d %H:%M UTC.")
+        head += [f"**[View the diffofdiffs report.]({report_url})**", "",
+                 f"*{access}*", ""]
     elif differs:
-        head += [
-            "The diffofdiffs report couldn't be uploaded. Details are in the "
-            f"[workflow run log]({run_url}).",
-            "",
-        ]
-    elif len(failures) == 1:
-        head += ["This comparison didn't finish, so the backport below "
-                 f"hasn't been checked. {matching}".rstrip(), ""]
+        head += ["The diffofdiffs report couldn't be uploaded. See the "
+                 f"{run_log}.", ""]
     else:
-        head += ["These comparisons didn't finish, so the backports below "
-                 f"haven't been checked. {matching}".rstrip(), ""]
+        head += [f"Errors are in the {run_log}.", ""]
 
     # Quote the failures when they follow differences, to set them apart
     prefix = "> " if differs else ""
@@ -155,7 +133,7 @@ def render_comment(results, *, repo_url, pr_number, run_url, report_url=None,
     def assemble(rows, failure_lines):
         lines = list(head)
         if differs:
-            table = ["| Report | Subject | Backport | Upstream |",
+            table = ["| # | Subject | Backport | Upstream |",
                      "| ---: | --- | --- | --- |", *rows]
             if len(differs) > INLINE_ROWS:
                 summary = _count(len(differs), "backport", "backports")
@@ -163,28 +141,18 @@ def render_comment(results, *, repo_url, pr_number, run_url, report_url=None,
                          f"<summary>{summary} with differences</summary>", "",
                          *table, "", "</details>"]
             lines += [*table, ""]
-            if matching:
-                lines += [f"*{matching}*", ""]
         if failures and differs:
             failed = _count(len(failures), "backport", "backports")
-            checked = "it hasn't" if len(failures) == 1 else "they haven't"
             lines += [
                 "> [!WARNING]",
-                f"> **{failed} couldn't be compared with upstream**, so "
-                f"{checked} been checked.",
+                f"> **{failed} couldn't be compared.** Errors are in the "
+                f"{run_log}.",
                 ">",
                 *failure_lines,
-                ">",
-                f"> Error details are in the [workflow run log]({run_url}).",
                 "",
             ]
         elif failures:
-            lines += [
-                *failure_lines,
-                "",
-                f"Error details are in the [workflow run log]({run_url}).",
-                "",
-            ]
+            lines += [*failure_lines, ""]
         return "\n".join(lines)
 
     budget = MAX_LENGTH - len(assemble([], []))
