@@ -42,8 +42,11 @@ if [[ -n "$CHANGELOG_EXCLUDE_REFS_PATTERN" ]]; then
     mapfile -t exclude_cl_commits < <(git log HEAD ^"${UPSTREAM}" ^"${lasttag}" --format=%H \
         --topo-order --merges --grep="$CHANGELOG_EXCLUDE_REFS_PATTERN")
     for commit in "${exclude_cl_commits[@]}"; do
-        echo "Ignoring commits reachable from: $(git log -1 --oneline "$commit")"
-        commits_to_exclude+=("^$commit")
+        echo "Ignoring commits merged by: $(git log -1 --oneline "$commit")"
+        # Exclude the merged branch (second parent), not the merge itself,
+        # which would also exclude its first parent, i.e. everything already
+        # in main before the merge.
+        commits_to_exclude+=("^$commit^2")
     done
 fi
 
@@ -52,10 +55,11 @@ if [[ -n "$RESOLVES_EXCLUDE_REFS_PATTERN" ]]; then
         --topo-order --merges --grep="$RESOLVES_EXCLUDE_REFS_PATTERN")
     if [[ "${#exclude_res_commits[@]}" -gt 0 ]]; then
         for commit in "${exclude_res_commits[@]}"; do
-            echo "Ignoring issues in commits reachable from: $(git log -1 --oneline "$commit")"
+            echo "Ignoring issues in commits merged by: $(git log -1 --oneline "$commit")"
         done
+        # Walk only the merged branches (second parents), see above.
         issues_to_exclude=$(git log --topo-order --no-merges -z "$GIT_FORMAT" \
-            "${exclude_res_commits[@]}" ^"${lasttag}" -- ':!/redhat/rhdocs' |
+            "${exclude_res_commits[@]/%/^2}" ^"${lasttag}" -- ':!/redhat/rhdocs' |
             "${0%/*}"/genlog.py | sed -n 's/^Resolves: //p' | sed 's/,//g')
     fi
 fi
