@@ -75,6 +75,7 @@ struct asoc_sdw_codec_info codec_info_list[] = {
 	{
 		.vendor_id = 0x0102,
 		.part_id = 0x0000, /* TAS2783A */
+		.name_prefix = "tas2783",
 		.dais = {
 			{
 				.direction = {true, true},
@@ -676,6 +677,7 @@ struct asoc_sdw_codec_info codec_info_list[] = {
 	{
 		.vendor_id = 0x01fa,
 		.part_id = 0x3563,
+		.name_prefix = "AMP",
 		.dais = {
 			{
 				.direction = {true, false},
