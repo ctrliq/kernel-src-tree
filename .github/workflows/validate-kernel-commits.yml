@@ -210,6 +210,7 @@ jobs:
         continue-on-error: true
         shell: python
         run: |
+          import json
           import os
           from pathlib import Path
           import re
@@ -245,71 +246,63 @@ jobs:
               f"{os.environ['BASE_REF']}..{os.environ['HEAD_SHA']}", "--",
           ).splitlines()
           results = []
-          errors = []
           html_reports = []
-          failed = False
-          compared = 0
 
           for backport in commits:
               message = git_output("show", "-s", "--format=%B", backport)
               reference = re.search(r"^commit\s+([0-9a-fA-F]{12,40})", message, re.MULTILINE)
               if not reference:
                   continue
-              upstream = reference[1]
+              # Anything that doesn't finish its comparison counts as failed
+              result = {
+                  "backport": backport,
+                  "reference": reference[1],
+                  "subject": message.splitlines()[0],
+                  "status": "failed",
+              }
+              results.append(result)
               report = reports / f"{backport}.html"
-              compared += 1
               try:
-                  upstream = prepare_upstream(upstream)
+                  result["upstream"] = prepare_upstream(reference[1])
+              except subprocess.CalledProcessError as error:
+                  print(f"{backport}: {error}", file=sys.stderr)
+                  result["error"] = "couldn't fetch the upstream commit"
+                  continue
+              try:
                   subprocess.run([
                       "diffofdiffs/diffofdiffs", "--html", "--backport-labels",
-                      "--git-tree=.", "-o", str(report), backport, upstream,
+                      "--git-tree=.", "-o", str(report), backport,
+                      result["upstream"],
                   ], check=True)
 
                   # A successful comparison returns zero even when it differs.
                   # Only a nonempty report identifies a finding.
                   if not report.is_file() or report.stat().st_size == 0:
                       report.unlink(missing_ok=True)
+                      result["status"] = "matches"
                       continue
                   html_reports.append({
                       "backport": backport,
-                      "subject": message.splitlines()[0],
+                      "subject": result["subject"],
                       "html": report.read_text(encoding="utf-8", errors="replace"),
                   })
-                  results.append(
-                      f"| {len(html_reports)} | `{backport[:12]}` | `{upstream[:12]}` |"
-                  )
-              except (subprocess.CalledProcessError, OSError) as error:
+                  result["status"] = "differs"
+              except subprocess.CalledProcessError as error:
                   report.unlink(missing_ok=True)
                   print(f"{backport}: {error}", file=sys.stderr)
-                  errors.append(
-                      f"- Backport `{backport[:12]}` vs upstream `{upstream[:12]}`: "
-                      "**comparison failed**; see the workflow log."
-                  )
-                  failed = True
+                  result["error"] = f"diffofdiffs exited with status {error.returncode}"
+              except OSError as error:
+                  report.unlink(missing_ok=True)
+                  print(f"{backport}: {error}", file=sys.stderr)
+                  result["error"] = "the comparison couldn't be completed"
 
+          # Record the results first so a report failure still gets a comment
+          Path("diffofdiffs_results.json").write_text(
+              json.dumps(results), encoding="utf-8",
+          )
           if html_reports:
               write_report(html_reports, "backport-comparisons.html")
-
-          if results or errors:
-              sections = []
-              if results:
-                  sections.append(
-                      "### Backports with differences\n\n"
-                      "| Report | Backport commit | Upstream commit |\n"
-                      "| --- | --- | --- |\n" + "\n".join(results)
-                  )
-              if errors:
-                  sections.append("### Failed comparisons\n\n" + "\n".join(errors))
-              Path("diffofdiffs_result.txt").write_text(
-                  "\n\n".join(sections) + "\n",
-                  encoding="utf-8",
-              )
-          else:
-              message = f"Compared {compared} backports; no differences found.\n"
-              print(message, end="")
-              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
-                  summary.write(message)
-          sys.exit(failed)
+          sys.exit(any(result["status"] == "failed" for result in results))
 
       - name: Upload diffofdiffs HTML report
         id: diffofdiffs_reports
@@ -323,26 +316,58 @@ jobs:
 
       - name: Write comparison summary
         if: always() && steps.diffofdiffs.outcome != 'skipped'
+        shell: python
         env:
-          REPORTS_URL: ${{ steps.diffofdiffs_reports.outputs.artifact-url }}
+          GH_TOKEN: ${{ github.token }}
+          REPORT_ID: ${{ steps.diffofdiffs_reports.outputs.artifact-id }}
+          REPORT_URL: ${{ steps.diffofdiffs_reports.outputs.artifact-url }}
+          REPOSITORY_PRIVATE: ${{ github.event.repository.private }}
         run: |
-          if [ -s diffofdiffs_result.txt ]; then
-            {
-              printf '## Backport comparison results\n\n'
-              if [ -s backport-comparisons.html ]; then
-                printf 'diffofdiffs found differences between the backported and upstream changes.\n\n'
-              fi
-              if [ -n "$REPORTS_URL" ]; then
-                printf '**[Click here to view the comparisons](%s)**\n\n' "$REPORTS_URL"
-              fi
-              cat diffofdiffs_result.txt
-              if [ -n "$REPORTS_URL" ]; then
-                printf '\n_GitHub sign-in required; report retained for up to 90 days._\n'
-              fi
-            } > diffofdiffs_summary.txt
-            mv diffofdiffs_summary.txt diffofdiffs_result.txt
-            cat diffofdiffs_result.txt >> "$GITHUB_STEP_SUMMARY"
-          fi
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          sys.path.insert(0, "workflow-tools/.github/scripts")
+          from diffofdiffs_comment import render_comment
+
+          results = Path("diffofdiffs_results.json")
+          if not results.is_file():
+              sys.exit()
+          results = json.loads(results.read_text(encoding="utf-8"))
+          repository = os.environ["GITHUB_REPOSITORY"]
+          repo_url = f"{os.environ['GITHUB_SERVER_URL']}/{repository}"
+
+          # The retention period starts before the upload finishes, so ask
+          # for the artifact's actual expiry rather than computing it.
+          expires_at = None
+          if os.environ["REPORT_ID"]:
+              try:
+                  expires_at = subprocess.run([
+                      "gh", "api",
+                      f"repos/{repository}/actions/artifacts/{os.environ['REPORT_ID']}",
+                      "--jq", ".expires_at // empty",
+                  ], check=True, text=True, stdout=subprocess.PIPE).stdout.strip() or None
+              except subprocess.CalledProcessError:
+                  print("::warning::Couldn't look up the report's expiry date")
+
+          body, post = render_comment(
+              results, repo_url=repo_url, pr_number=os.environ["PR_NUMBER"],
+              run_url=f"{repo_url}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+              report_url=os.environ["REPORT_URL"] or None,
+              expires_at=expires_at,
+              public=os.environ["REPOSITORY_PRIVATE"] != "true",
+          )
+          if post:
+              Path("diffofdiffs_result.txt").write_text(body, encoding="utf-8")
+          else:
+              # Only replace an earlier comment, since nothing needs review
+              Path("diffofdiffs_cleared.txt").write_text(body, encoding="utf-8")
+              body = f"Compared {len(results)} backports; no differences found.\n"
+          print(body, end="")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write(body)
 
       - name: Save PR metadata for comment workflow
         env:
@@ -368,6 +393,7 @@ jobs:
           name: check-results
           path: |
             diffofdiffs_result.txt
+            diffofdiffs_cleared.txt
             pr_metadata/
           retention-days: 3  # Increased from 1 (then 3) to prevent premature deletion and support manual follow-ups
 

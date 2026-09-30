@@ -150,14 +150,16 @@ jobs:
             echo "✅ ckc_result.txt validated (size: $FILE_SIZE bytes)"
           fi
 
-          if [ -f diffofdiffs_result.txt ]; then
-            FILE_SIZE=$(stat -c%s diffofdiffs_result.txt 2>/dev/null)
-            if [ "$FILE_SIZE" -gt 1048576 ]; then  # 1MB limit
-              echo "❌ Security: diffofdiffs_result.txt file too large: $FILE_SIZE bytes"
-              exit 1
+          for FILE in diffofdiffs_result.txt diffofdiffs_cleared.txt; do
+            if [ -f "$FILE" ]; then
+              FILE_SIZE=$(stat -c%s "$FILE" 2>/dev/null)
+              if [ "$FILE_SIZE" -gt 1048576 ]; then  # 1MB limit
+                echo "❌ Security: $FILE file too large: $FILE_SIZE bytes"
+                exit 1
+              fi
+              echo "✅ $FILE validated (size: $FILE_SIZE bytes)"
             fi
-            echo "✅ diffofdiffs_result.txt validated (size: $FILE_SIZE bytes)"
-          fi
+          done
 
       # - name: Comment on PR if check-kernel-commits issues found
       #   if: hashFiles('ckc_result.txt') != ''
@@ -185,22 +187,57 @@ jobs:
 
       #     echo "✅ Posted check-kernel-commits comment to PR #$PR_NUMBER"
 
-      - name: Comment on PR with diffofdiffs reports
-        if: hashFiles('diffofdiffs_result.txt') != ''
+      - name: Comment on PR with diffofdiffs results
+        if: hashFiles('diffofdiffs_result.txt', 'diffofdiffs_cleared.txt') != ''
         env:
           GH_TOKEN: ${{ github.token }}
+          MARKER: '<!-- diffofdiffs-comment -->'
           PR_NUMBER: ${{ steps.pr_metadata.outputs.pr_number }}
           REPOSITORY: ${{ steps.pr_metadata.outputs.repository }}
         run: |
-          # Post comment using environment variables (prevents injection)
-          if ! gh pr comment "$PR_NUMBER" \
-            --body-file diffofdiffs_result.txt \
-            --repo "$REPOSITORY"; then
-            echo "❌ Failed to post diffofdiffs comment to PR"
+          set -o pipefail
+
+          # A cleared result only replaces an earlier comment that no longer
+          # applies, since there's nothing new to review.
+          if [ -f diffofdiffs_result.txt ]; then
+            BODY=diffofdiffs_result.txt
+          else
+            BODY=diffofdiffs_cleared.txt
+          fi
+          if [ "$(head -n 1 "$BODY")" != "$MARKER" ]; then
+            echo "❌ $BODY doesn't start with the diffofdiffs comment marker"
             exit 1
           fi
 
-          echo "✅ Posted diffofdiffs comment to PR #$PR_NUMBER"
+          # Keep one comment per PR, and only edit this workflow's comments
+          if ! COMMENT_ID=$(gh api --paginate \
+            "repos/$REPOSITORY/issues/$PR_NUMBER/comments" \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith(env.MARKER))) | .id' |
+            tail -n 1); then
+            echo "❌ Failed to look up earlier diffofdiffs comments"
+            exit 1
+          fi
+
+          # Post comment using environment variables (prevents injection)
+          if [ -n "$COMMENT_ID" ]; then
+            if ! URL=$(gh api --method PATCH \
+              "repos/$REPOSITORY/issues/comments/$COMMENT_ID" \
+              -F body=@"$BODY" --jq .html_url); then
+              echo "❌ Failed to update diffofdiffs comment on PR"
+              exit 1
+            fi
+            echo "✅ Updated diffofdiffs comment: $URL"
+          elif [ "$BODY" = diffofdiffs_result.txt ]; then
+            if ! URL=$(gh api --method POST \
+              "repos/$REPOSITORY/issues/$PR_NUMBER/comments" \
+              -F body=@"$BODY" --jq .html_url); then
+              echo "❌ Failed to post diffofdiffs comment to PR"
+              exit 1
+            fi
+            echo "✅ Posted diffofdiffs comment: $URL"
+          else
+            echo "✅ No earlier diffofdiffs comment to update on PR #$PR_NUMBER"
+          fi
 
       # - name: Checkout PR head for JIRA check
       #   env:
