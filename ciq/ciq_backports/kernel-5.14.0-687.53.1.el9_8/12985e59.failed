@@ -1,0 +1,366 @@
+RDMA/rxe: Fix iova-to-va conversion for MR page sizes != PAGE_SIZE
+
+jira KERNEL-1690
+cve CVE-2026-46325
+Rebuild_History Non-Buildable kernel-5.14.0-687.53.1.el9_8
+commit-author Li Zhijian <lizhijian@fujitsu.com>
+commit 12985e5915a0b8354796efadaaeb201eed115377
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.53.1.el9_8/12985e59.failed
+
+The current implementation incorrectly handles memory regions (MRs) with
+page sizes different from the system PAGE_SIZE. The core issue is that
+rxe_set_page() is called with mr->page_size step increments, but the
+page_list stores individual struct page pointers, each representing
+PAGE_SIZE of memory.
+
+ib_sg_to_page() has ensured that when i>=1 either
+a) SG[i-1].dma_end and SG[i].dma_addr are contiguous
+or
+b) SG[i-1].dma_end and SG[i].dma_addr are mr->page_size aligned.
+
+This leads to incorrect iova-to-va conversion in scenarios:
+
+1) page_size < PAGE_SIZE (e.g., MR: 4K, system: 64K):
+   ibmr->iova = 0x181800
+   sg[0]: dma_addr=0x181800, len=0x800
+   sg[1]: dma_addr=0x173000, len=0x1000
+
+   Access iova = 0x181800 + 0x810 = 0x182010
+   Expected VA: 0x173010 (second SG, offset 0x10)
+   Before fix:
+     - index = (0x182010 >> 12) - (0x181800 >> 12) = 1
+     - page_offset = 0x182010 & 0xFFF = 0x10
+     - xarray[1] stores system page base 0x170000
+     - Resulting VA: 0x170000 + 0x10 = 0x170010 (wrong)
+
+2) page_size > PAGE_SIZE (e.g., MR: 64K, system: 4K):
+   ibmr->iova = 0x18f800
+   sg[0]: dma_addr=0x18f800, len=0x800
+   sg[1]: dma_addr=0x170000, len=0x1000
+
+   Access iova = 0x18f800 + 0x810 = 0x190010
+   Expected VA: 0x170010 (second SG, offset 0x10)
+   Before fix:
+     - index = (0x190010 >> 16) - (0x18f800 >> 16) = 1
+     - page_offset = 0x190010 & 0xFFFF = 0x10
+     - xarray[1] stores system page for dma_addr 0x170000
+     - Resulting VA: system page of 0x170000 + 0x10 = 0x170010 (wrong)
+
+Yi Zhang reported a kernel panic[1] years ago related to this defect.
+
+Solution:
+1. Replace xarray with pre-allocated rxe_mr_page array for sequential
+   indexing (all MR page indices are contiguous)
+2. Each rxe_mr_page stores both struct page* and offset within the
+   system page
+3. Handle MR page_size != PAGE_SIZE relationships:
+   - page_size > PAGE_SIZE: Split MR pages into multiple system pages
+   - page_size <= PAGE_SIZE: Store offset within system page
+4. Add boundary checks and compatibility validation
+
+This ensures correct iova-to-va conversion regardless of MR page size
+and system PAGE_SIZE relationship, while improving performance through
+array-based sequential access.
+
+Tests on 4K and 64K PAGE_SIZE hosts:
+- rdma-core/pytests
+  $ ./build/bin/run_tests.py  --dev eth0_rxe
+- blktest:
+  $ TIMEOUT=30 QUICK_RUN=1 USE_RXE=1 NVMET_TRTYPES=rdma ./check nvme srp rnbd
+
+[1] https://lore.kernel.org/all/CAHj4cs9XRqE25jyVw9rj9YugffLn5+f=1znaBEnu1usLOciD+g@mail.gmail.com/T/
+
+Fixes: 592627ccbdff ("RDMA/rxe: Replace rxe_map and rxe_phys_buf by xarray")
+	Signed-off-by: Li Zhijian <lizhijian@fujitsu.com>
+Link: https://patch.msgid.link/20260116032753.2574363-1-lizhijian@fujitsu.com
+	Signed-off-by: Leon Romanovsky <leon@kernel.org>
+(cherry picked from commit 12985e5915a0b8354796efadaaeb201eed115377)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/sw/rxe/rxe_mr.c
+diff --cc drivers/infiniband/sw/rxe/rxe_mr.c
+index 4a44057d38e4,c71ab780e379..000000000000
+--- a/drivers/infiniband/sw/rxe/rxe_mr.c
++++ b/drivers/infiniband/sw/rxe/rxe_mr.c
+@@@ -69,14 -72,46 +69,50 @@@ void rxe_mr_init_dma(int access, struc
+  	mr->ibmr.type = IB_MR_TYPE_DMA;
+  }
+  
++ /*
++  * Convert iova to page_info index. The page_info stores pages of size
++  * PAGE_SIZE, but MRs can have different page sizes. This function
++  * handles the conversion for all cases:
++  *
++  * 1. mr->page_size > PAGE_SIZE:
++  *    The MR's iova may not be aligned to mr->page_size. We use the
++  *    aligned base (iova & page_mask) as reference, then calculate
++  *    which PAGE_SIZE sub-page the iova falls into.
++  *
++  * 2. mr->page_size <= PAGE_SIZE:
++  *    Use simple shift arithmetic since each page_info entry corresponds
++  *    to one or more MR pages.
++  */
+  static unsigned long rxe_mr_iova_to_index(struct rxe_mr *mr, u64 iova)
+  {
+- 	return (iova >> mr->page_shift) - (mr->ibmr.iova >> mr->page_shift);
++ 	int idx;
++ 
++ 	if (mr_page_size(mr) > PAGE_SIZE)
++ 		idx = (iova - (mr->ibmr.iova & mr->page_mask)) >> PAGE_SHIFT;
++ 	else
++ 		idx = (iova >> mr->page_shift) -
++ 			(mr->ibmr.iova >> mr->page_shift);
++ 
++ 	WARN_ON(idx >= mr->nbuf);
++ 	return idx;
+  }
+  
++ /*
++  * Convert iova to offset within the page_info entry.
++  *
++  * For mr_page_size > PAGE_SIZE, the offset is within the system page.
++  * For mr_page_size <= PAGE_SIZE, the offset is within the MR page size.
++  */
+  static unsigned long rxe_mr_iova_to_page_offset(struct rxe_mr *mr, u64 iova)
+  {
+++<<<<<<< HEAD
+ +    return iova & (PAGE_SIZE - 1);
+++=======
++ 	if (mr_page_size(mr) > PAGE_SIZE)
++ 		return iova & (PAGE_SIZE - 1);
++ 	else
++ 		return iova & (mr_page_size(mr) - 1);
+++>>>>>>> 12985e5915a0 (RDMA/rxe: Fix iova-to-va conversion for MR page sizes != PAGE_SIZE)
+  }
+  
+  static bool is_pmem_page(struct page *pg)
+@@@ -99,31 -135,62 +136,62 @@@ static int rxe_mr_fill_pages_from_sgt(s
+  	if (!__sg_page_iter_next(&sg_iter))
+  		return 0;
+  
+- 	do {
+- 		xas_lock(&xas);
+- 		while (true) {
+- 			page = sg_page_iter_page(&sg_iter);
+- 
+- 			if (persistent && !is_pmem_page(page)) {
+- 				rxe_dbg_mr(mr, "Page can't be persistent\n");
+- 				xas_set_err(&xas, -EINVAL);
+- 				break;
+- 			}
++ 	while (true) {
++ 		page = sg_page_iter_page(&sg_iter);
+  
+- 			xas_store(&xas, page);
+- 			if (xas_error(&xas))
+- 				break;
+- 			xas_next(&xas);
+- 			if (!__sg_page_iter_next(&sg_iter))
+- 				break;
++ 		if (persistent && !is_pmem_page(page)) {
++ 			rxe_dbg_mr(mr, "Page can't be persistent\n");
++ 			return -EINVAL;
+  		}
+- 		xas_unlock(&xas);
+- 	} while (xas_nomem(&xas, GFP_KERNEL));
+  
+- 	return xas_error(&xas);
++ 		mr->page_info[mr->nbuf].page = page;
++ 		mr->page_info[mr->nbuf].offset = 0;
++ 		mr->nbuf++;
++ 
++ 		if (!__sg_page_iter_next(&sg_iter))
++ 			break;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int __alloc_mr_page_info(struct rxe_mr *mr, int num_pages)
++ {
++ 	mr->page_info = kcalloc(num_pages, sizeof(struct rxe_mr_page),
++ 				GFP_KERNEL);
++ 	if (!mr->page_info)
++ 		return -ENOMEM;
++ 
++ 	mr->max_allowed_buf = num_pages;
++ 	mr->nbuf = 0;
++ 
++ 	return 0;
++ }
++ 
++ static int alloc_mr_page_info(struct rxe_mr *mr, int num_pages)
++ {
++ 	int ret;
++ 
++ 	WARN_ON(mr->num_buf);
++ 	ret = __alloc_mr_page_info(mr, num_pages);
++ 	if (ret)
++ 		return ret;
++ 
++ 	mr->num_buf = num_pages;
++ 
++ 	return 0;
++ }
++ 
++ static void free_mr_page_info(struct rxe_mr *mr)
++ {
++ 	if (!mr->page_info)
++ 		return;
++ 
++ 	kfree(mr->page_info);
++ 	mr->page_info = NULL;
+  }
+  
+ -int rxe_mr_init_user(struct rxe_dev *rxe, u64 start, u64 length,
+ +int rxe_mr_init_user(struct rxe_dev *rxe, u64 start, u64 length, u64 iova,
+  		     int access, struct rxe_mr *mr)
+  {
+  	struct ib_umem *umem;
+@@@ -140,14 -205,13 +206,18 @@@
+  		return PTR_ERR(umem);
+  	}
+  
+++<<<<<<< HEAD
+ +	mr->page_shift = PAGE_SHIFT;
+ +	mr->page_mask = PAGE_SIZE - 1;
+++=======
++ 	err = alloc_mr_page_info(mr, ib_umem_num_pages(umem));
++ 	if (err)
++ 		goto err2;
+++>>>>>>> 12985e5915a0 (RDMA/rxe: Fix iova-to-va conversion for MR page sizes != PAGE_SIZE)
+  
+  	err = rxe_mr_fill_pages_from_sgt(mr, &umem->sgt_append.sgt);
+- 	if (err) {
+- 		ib_umem_release(umem);
+- 		return err;
+- 	}
++ 	if (err)
++ 		goto err1;
+  
+  	mr->umem = umem;
+  	mr->ibmr.type = IB_MR_TYPE_USER;
+@@@ -232,17 -289,38 +295,42 @@@ int rxe_map_mr_sg(struct ib_mr *ibmr, s
+  		  int sg_nents, unsigned int *sg_offset)
+  {
+  	struct rxe_mr *mr = to_rmr(ibmr);
+ -	unsigned int page_size = mr_page_size(mr);
+ +	int n;
+  
++ 	/*
++ 	 * Ensure page_size and PAGE_SIZE are compatible for mapping.
++ 	 * We require one to be a multiple of the other for correct
++ 	 * iova-to-page conversion.
++ 	 */
++ 	if (!IS_ALIGNED(page_size, PAGE_SIZE) &&
++ 	    !IS_ALIGNED(PAGE_SIZE, page_size)) {
++ 		rxe_dbg_mr(mr, "MR page size %u must be compatible with PAGE_SIZE %lu\n",
++ 			   page_size, PAGE_SIZE);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (mr_page_size(mr) > PAGE_SIZE) {
++ 		/* resize page_info if needed */
++ 		u32 map_mr_pages = (page_size >> PAGE_SHIFT) * mr->num_buf;
++ 
++ 		if (map_mr_pages > mr->max_allowed_buf) {
++ 			rxe_dbg_mr(mr, "requested pages %u exceed max %u\n",
++ 				   map_mr_pages, mr->max_allowed_buf);
++ 			free_mr_page_info(mr);
++ 			if (__alloc_mr_page_info(mr, map_mr_pages))
++ 				return -ENOMEM;
++ 		}
++ 	}
++ 
+  	mr->nbuf = 0;
+ -	mr->page_shift = ilog2(page_size);
+ -	mr->page_mask = ~((u64)page_size - 1);
+  
+ -	return ib_sg_to_pages(ibmr, sgl, sg_nents, sg_offset, rxe_set_page);
+ +	n = ib_sg_to_pages(ibmr, sgl, sg_nents, sg_offset, rxe_set_page);
+ +
+ +	mr->page_shift = ilog2(ibmr->page_size);
+ +	mr->page_mask = ibmr->page_size - 1;
+ +	mr->offset = ibmr->iova & mr->page_mask;
+ +
+ +	return n;
+  }
+  
+  static int rxe_mr_copy_xarray(struct rxe_mr *mr, u64 iova, void *addr,
+@@@ -424,11 -505,8 +512,8 @@@ err1
+  	return err;
+  }
+  
+ -static int rxe_mr_flush_pmem_iova(struct rxe_mr *mr, u64 iova, unsigned int length)
+ +int rxe_flush_pmem_iova(struct rxe_mr *mr, u64 iova, unsigned int length)
+  {
+- 	unsigned int page_offset;
+- 	unsigned long index;
+- 	struct page *page;
+  	unsigned int bytes;
+  	int err;
+  	u8 *va;
+@@@ -448,15 -516,17 +533,27 @@@
+  		return err;
+  
+  	while (length > 0) {
+++<<<<<<< HEAD
+ +		index = rxe_mr_iova_to_index(mr, iova);
+ +		page = xa_load(&mr->page_list, index);
+ +		page_offset = rxe_mr_iova_to_page_offset(mr, iova);
+ +		if (!page)
+ +			return -EFAULT;
+ +		bytes = min_t(unsigned int, length,
+ +				mr_page_size(mr) - page_offset);
+++=======
++ 		unsigned long index = rxe_mr_iova_to_index(mr, iova);
++ 		struct rxe_mr_page *info = &mr->page_info[index];
++ 		unsigned int page_offset = rxe_mr_iova_to_page_offset(mr, iova);
+++>>>>>>> 12985e5915a0 (RDMA/rxe: Fix iova-to-va conversion for MR page sizes != PAGE_SIZE)
+  
+- 		va = kmap_local_page(page);
++ 		if (!info->page)
++ 			return -EFAULT;
++ 
++ 		page_offset += info->offset;
++ 		bytes = min_t(unsigned int, length, PAGE_SIZE - page_offset);
++ 
++ 		va = kmap_local_page(info->page);
+  		arch_wb_cache_pmem(va + page_offset, bytes);
+  		kunmap_local(va);
+  
+* Unmerged path drivers/infiniband/sw/rxe/rxe_mr.c
+diff --git a/drivers/infiniband/sw/rxe/rxe_verbs.h b/drivers/infiniband/sw/rxe/rxe_verbs.h
+index f1424d315acd..0dc6afd23ece 100644
+--- a/drivers/infiniband/sw/rxe/rxe_verbs.h
++++ b/drivers/infiniband/sw/rxe/rxe_verbs.h
+@@ -297,6 +297,11 @@ static inline int rkey_is_mw(u32 rkey)
+ 	return (index >= RXE_MIN_MW_INDEX) && (index <= RXE_MAX_MW_INDEX);
+ }
+ 
++struct rxe_mr_page {
++	struct page		*page;
++	unsigned int		offset; /* offset in system page */
++};
++
+ struct rxe_mr {
+ 	struct rxe_pool_elem	elem;
+ 	struct ib_mr		ibmr;
+@@ -313,10 +318,13 @@ struct rxe_mr {
+ 	unsigned int		page_shift;
+ 	u64			page_mask;
+ 
++	/* size of page_info when mr allocated */
+ 	u32			num_buf;
++	/* real size of page_info */
++	u32			max_allowed_buf;
+ 	u32			nbuf;
+ 
+-	struct xarray		page_list;
++	struct rxe_mr_page	*page_info;
+ };
+ 
+ static inline unsigned int mr_page_size(struct rxe_mr *mr)
