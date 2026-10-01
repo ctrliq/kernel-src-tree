@@ -29,6 +29,7 @@
  *		_N,_P	- other mobile parts
  *		_H	- premium mobile parts
  *		_S	- other client parts
+ *		_R	- ruggedized for harsh environment
  *
  *		Historical OPTDIFFs:
  *
@@ -205,6 +206,7 @@
 #define INTEL_FAM6_ARROWLAKE		0xC6
 
 #define INTEL_PANTHERLAKE_L		IFM(6, 0xCC)
+#define INTEL_PANTHERLAKE_R		IFM(6, 0xE5) /* Cougar Cove / Darkmont */
 
 #define INTEL_WILDCATLAKE_L		IFM(6, 0xD5)
 
