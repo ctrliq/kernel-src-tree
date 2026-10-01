@@ -762,7 +762,8 @@ sources-rh: $(TARBALL) $(KABI_TARBALL) $(KABIDW_TARBALL) generate-testpatch-tmp 
 		kabi/check-kabi \
 		configs/$(SPECPACKAGE_NAME)-*.config \
 		configs/partial*.config \
-		scripts/gating/gating.fmf \
+		scripts/gating/gating.yaml \
+		scripts/gating/plans.fmf \
 		scripts/filtermods.py \
 		scripts/mod/mod-denylist.sh \
 		scripts/mod/mod-sign.sh \

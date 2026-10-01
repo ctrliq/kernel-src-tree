@@ -25,12 +25,10 @@ echo "*.bz2" >> .gitignore
 # expand the srpm into the tree
 rpm2cpio "$SRPM" | cpio -idmv
 
-# set up TMT/FMF tree for gating: gating.fmf is shipped as a flat Source
-# in the SRPM but needs directory structure for tmt plan discovery
-if [ -f gating.fmf ]; then
-	mkdir -p .fmf plans
+# set up TMT/FMF tree for gating
+if [ -f plans.fmf ]; then
+	mkdir -p .fmf
 	echo 1 > .fmf/version
-	cp gating.fmf plans/main.fmf
 fi
 
 git add -A
