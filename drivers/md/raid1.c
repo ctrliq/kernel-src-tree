@@ -1486,6 +1486,7 @@ static bool raid1_write_request(struct mddev *mddev, struct bio *bio,
 	unsigned long flags;
 	int first_clone;
 	bool write_behind = false;
+	bool atomic = bio->bi_opf & REQ_ATOMIC;
 	bool is_discard = op_is_discard(bio->bi_opf);
 	sector_t sector = bio->bi_iter.bi_sector;
 
@@ -1532,6 +1533,8 @@ static bool raid1_write_request(struct mddev *mddev, struct bio *bio,
 		 */
 		if (!is_discard && rdev && test_bit(WriteMostly, &rdev->flags))
 			write_behind = true;
+		if (atomic && max_sectors > BIO_MAX_VECS * (PAGE_SIZE >> 9))
+			write_behind = false;
 
 		r1_bio->bios[i] = NULL;
 		if (!rdev || test_bit(Faulty, &rdev->flags))
@@ -1557,19 +1560,6 @@ static bool raid1_write_request(struct mddev *mddev, struct bio *bio,
 			if (is_bad) {
 				int good_sectors;
 
-				/*
-				 * We cannot atomically write this, so just
-				 * error in that case. It could be possible to
-				 * atomically write other mirrors, but the
-				 * complexity of supporting that is not worth
-				 * the benefit.
-				 */
-				if (bio->bi_opf & REQ_ATOMIC) {
-					bio->bi_status = BLK_STS_NOTSUPP;
-					bio_endio(bio);
-					goto err_dec_pending;
-				}
-
 				good_sectors = first_bad - sector;
 				if (good_sectors < max_sectors)
 					max_sectors = good_sectors;
@@ -1590,6 +1580,11 @@ static bool raid1_write_request(struct mddev *mddev, struct bio *bio,
 		max_sectors = min_t(int, max_sectors,
 				    BIO_MAX_VECS * (PAGE_SIZE >> 9));
 	if (max_sectors < bio_sectors(bio)) {
+		if (atomic) {
+			bio_io_error(bio);
+			goto err_dec_pending;
+		}
+
 		bio = bio_submit_split_bioset(bio, max_sectors,
 					      &conf->bio_split);
 		if (!bio)
@@ -3182,6 +3177,7 @@ static int raid1_set_limits(struct mddev *mddev)
 	md_init_stacking_limits(&lim);
 	lim.max_write_zeroes_sectors = 0;
 	lim.max_hw_wzeroes_unmap_sectors = 0;
+	lim.chunk_sectors = BARRIER_UNIT_SECTOR_SIZE;
 	lim.logical_block_size = mddev->logical_block_size;
 	lim.features |= BLK_FEAT_ATOMIC_WRITES;
 	lim.features |= BLK_FEAT_PCI_P2PDMA;
