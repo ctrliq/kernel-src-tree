@@ -1016,32 +1016,22 @@ static bool wait_barrier_nolock(struct r10conf *conf)
 	return false;
 }
 
-static bool wait_barrier(struct r10conf *conf, bool nowait)
+static void wait_barrier(struct r10conf *conf)
 {
-	bool ret = true;
-
 	if (wait_barrier_nolock(conf))
-		return true;
+		return;
 
 	write_seqlock_irq(&conf->resync_lock);
 	if (conf->barrier) {
-		/* Return false when nowait flag is set */
-		if (nowait) {
-			ret = false;
-		} else {
-			conf->nr_waiting++;
-			mddev_add_trace_msg(conf->mddev, "raid10 wait barrier");
-			wait_event_barrier(conf, stop_waiting_barrier(conf));
-			conf->nr_waiting--;
-		}
+		conf->nr_waiting++;
+		mddev_add_trace_msg(conf->mddev, "raid10 wait barrier");
+		wait_event_barrier(conf, stop_waiting_barrier(conf));
+		conf->nr_waiting--;
 		if (!conf->nr_waiting)
 			wake_up(&conf->wait_barrier);
 	}
-	/* Only increment nr_pending when we wait */
-	if (ret)
-		atomic_inc(&conf->nr_pending);
+	atomic_inc(&conf->nr_pending);
 	write_sequnlock_irq(&conf->resync_lock);
-	return ret;
 }
 
 static void allow_barrier(struct r10conf *conf)
@@ -1133,30 +1123,22 @@ static void raid10_unplug(struct blk_plug_cb *cb, bool from_schedule)
  * currently.
  * 2. If IO spans the reshape position.  Need to wait for reshape to pass.
  */
-static bool regular_request_wait(struct mddev *mddev, struct r10conf *conf,
+static void regular_request_wait(struct mddev *mddev, struct r10conf *conf,
 				 struct bio *bio, sector_t sectors)
 {
-	/* Bail out if REQ_NOWAIT is set for the bio */
-	if (!wait_barrier(conf, bio->bi_opf & REQ_NOWAIT)) {
-		bio_wouldblock_error(bio);
-		return false;
-	}
+	wait_barrier(conf);
+
 	while (test_bit(MD_RECOVERY_RESHAPE, &mddev->recovery) &&
 	    bio->bi_iter.bi_sector < conf->reshape_progress &&
 	    bio->bi_iter.bi_sector + sectors > conf->reshape_progress) {
 		allow_barrier(conf);
-		if (bio->bi_opf & REQ_NOWAIT) {
-			bio_wouldblock_error(bio);
-			return false;
-		}
 		mddev_add_trace_msg(conf->mddev, "raid10 wait reshape");
 		wait_event(conf->wait_barrier,
 			   conf->reshape_progress <= bio->bi_iter.bi_sector ||
 			   conf->reshape_progress >= bio->bi_iter.bi_sector +
 			   sectors);
-		wait_barrier(conf, false);
+		wait_barrier(conf);
 	}
-	return true;
 }
 
 static void raid10_read_request(struct mddev *mddev, struct bio *bio,
@@ -1205,10 +1187,7 @@ static void raid10_read_request(struct mddev *mddev, struct bio *bio,
 		}
 	}
 
-	if (!regular_request_wait(mddev, conf, bio, r10_bio->sectors)) {
-		free_r10bio(r10_bio);
-		return;
-	}
+	regular_request_wait(mddev, conf, bio, r10_bio->sectors);
 
 	rdev = read_balance(conf, r10_bio, &max_sectors);
 	if (!rdev) {
@@ -1229,7 +1208,7 @@ static void raid10_read_request(struct mddev *mddev, struct bio *bio,
 		allow_barrier(conf);
 		bio = bio_submit_split_bioset(bio, max_sectors,
 					      &conf->bio_split);
-		wait_barrier(conf, false);
+		wait_barrier(conf);
 		if (!bio) {
 			set_bit(R10BIO_Returned, &r10_bio->state);
 			goto err_handle;
@@ -1245,7 +1224,6 @@ static void raid10_read_request(struct mddev *mddev, struct bio *bio,
 		r10_bio->master_bio = bio;
 	}
 	read_bio = bio_alloc_clone(rdev->bdev, bio, gfp, &mddev->bio_set);
-	read_bio->bi_opf &= ~REQ_NOWAIT;
 
 	r10_bio->devs[slot].bio = read_bio;
 	r10_bio->devs[slot].rdev = rdev;
@@ -1279,7 +1257,6 @@ static void raid10_write_one_disk(struct mddev *mddev, struct r10bio *r10_bio,
 			     conf->mirrors[devnum].rdev;
 
 	mbio = bio_alloc_clone(rdev->bdev, bio, GFP_NOIO, &mddev->bio_set);
-	mbio->bi_opf &= ~REQ_NOWAIT;
 	if (replacement)
 		r10_bio->devs[n_copy].repl_bio = mbio;
 	else
@@ -1358,7 +1335,7 @@ retry_wait:
 			"raid10 %s wait rdev %d blocked",
 			__func__, blocked_rdev->raid_disk);
 		md_wait_for_blocked_rdev(blocked_rdev, mddev);
-		wait_barrier(conf, false);
+		wait_barrier(conf);
 		goto retry_wait;
 	}
 }
@@ -1376,28 +1353,14 @@ static bool raid10_write_request(struct mddev *mddev, struct bio *bio,
 	     mddev->cluster_ops->area_resyncing(mddev, WRITE,
 						bio->bi_iter.bi_sector,
 						bio_end_sector(bio)))) {
-		DEFINE_WAIT(w);
-		/* Bail out if REQ_NOWAIT is set for the bio */
-		if (bio->bi_opf & REQ_NOWAIT) {
-			bio_wouldblock_error(bio);
-			return false;
-		}
-		for (;;) {
-			prepare_to_wait(&conf->wait_barrier,
-					&w, TASK_IDLE);
-			if (!mddev->cluster_ops->area_resyncing(mddev, WRITE,
-				 bio->bi_iter.bi_sector, bio_end_sector(bio)))
-				break;
-			schedule();
-		}
-		finish_wait(&conf->wait_barrier, &w);
+		wait_event_idle(conf->wait_barrier,
+				!mddev->cluster_ops->area_resyncing(mddev, WRITE,
+								    bio->bi_iter.bi_sector,
+								    bio_end_sector(bio)));
 	}
 
 	sectors = r10_bio->sectors;
-	if (!regular_request_wait(mddev, conf, bio, sectors)) {
-		free_r10bio(r10_bio);
-		return false;
-	}
+	regular_request_wait(mddev, conf, bio, sectors);
 
 	if (test_bit(MD_RECOVERY_RESHAPE, &mddev->recovery) &&
 	    (mddev->reshape_backwards
@@ -1410,11 +1373,6 @@ static bool raid10_write_request(struct mddev *mddev, struct bio *bio,
 		set_mask_bits(&mddev->sb_flags, 0,
 			      BIT(MD_SB_CHANGE_DEVS) | BIT(MD_SB_CHANGE_PENDING));
 		md_wakeup_thread(mddev->thread);
-		if (bio->bi_opf & REQ_NOWAIT) {
-			allow_barrier(conf);
-			bio_wouldblock_error(bio);
-			return false;
-		}
 		mddev_add_trace_msg(conf->mddev,
 			"raid10 wait reshape metadata");
 		wait_event(mddev->sb_wait,
@@ -1502,7 +1460,7 @@ static bool raid10_write_request(struct mddev *mddev, struct bio *bio,
 		allow_barrier(conf);
 		bio = bio_submit_split_bioset(bio, r10_bio->sectors,
 					      &conf->bio_split);
-		wait_barrier(conf, false);
+		wait_barrier(conf);
 		if (!bio) {
 			set_bit(R10BIO_Returned, &r10_bio->state);
 			goto err_handle;
@@ -1647,11 +1605,7 @@ static int raid10_handle_discard(struct mddev *mddev, struct bio *bio)
 	if (test_bit(MD_RECOVERY_RESHAPE, &mddev->recovery))
 		return -EAGAIN;
 
-	if (!wait_barrier(conf, bio->bi_opf & REQ_NOWAIT)) {
-		bio_wouldblock_error(bio);
-		md_write_end(mddev);
-		return 0;
-	}
+	wait_barrier(conf);
 
 	/*
 	 * Check reshape again to avoid reshape happens after checking
@@ -1702,7 +1656,7 @@ static int raid10_handle_discard(struct mddev *mddev, struct bio *bio)
 		allow_barrier(conf);
 		/* Resend the fist split part */
 		submit_bio_noacct(split);
-		wait_barrier(conf, false);
+		wait_barrier(conf);
 	}
 	div_u64_rem(bio_end, stripe_size, &remainder);
 	if (remainder) {
@@ -1722,7 +1676,7 @@ static int raid10_handle_discard(struct mddev *mddev, struct bio *bio)
 		/* Resend the second split part */
 		submit_bio_noacct(bio);
 		bio = split;
-		wait_barrier(conf, false);
+		wait_barrier(conf);
 	}
 
 	bio_start = bio->bi_iter.bi_sector;
@@ -1880,7 +1834,7 @@ retry_discard:
 		end_disk_offset += geo->stride;
 		atomic_inc(&first_r10bio->remaining);
 		raid_end_discard_bio(r10_bio);
-		wait_barrier(conf, false);
+		wait_barrier(conf);
 		goto retry_discard;
 	}
 
@@ -2089,7 +2043,7 @@ static void print_conf(struct r10conf *conf)
 
 static void close_sync(struct r10conf *conf)
 {
-	wait_barrier(conf, false);
+	wait_barrier(conf);
 	allow_barrier(conf);
 
 	mempool_exit(&conf->r10buf_pool);
@@ -4738,7 +4692,7 @@ static sector_t reshape_request(struct mddev *mddev, sector_t sector_nr,
 	if (need_flush ||
 	    time_after(jiffies, conf->reshape_checkpoint + 10*HZ)) {
 		/* Need to update reshape_position in metadata */
-		wait_barrier(conf, false);
+		wait_barrier(conf);
 		mddev->reshape_position = conf->reshape_progress;
 		if (mddev->reshape_backwards)
 			mddev->curr_resync_completed = raid10_size(mddev, 0, 0)
