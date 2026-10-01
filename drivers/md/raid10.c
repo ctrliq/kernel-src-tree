@@ -1896,6 +1896,7 @@ static bool raid10_make_request(struct mddev *mddev, struct bio *bio)
 {
 	struct r10conf *conf = mddev->private;
 	sector_t chunk_mask = (conf->geo.chunk_mask & conf->prev.chunk_mask);
+	const int rw = bio_data_dir(bio);
 	int chunk_sects = chunk_mask + 1;
 	int sectors = bio_sectors(bio);
 
@@ -1921,6 +1922,15 @@ static bool raid10_make_request(struct mddev *mddev, struct bio *bio)
 		sectors = chunk_sects -
 			(bio->bi_iter.bi_sector &
 			 (chunk_sects - 1));
+
+	bio = mddev_bio_split_at_reshape_offset(mddev, bio, &sectors,
+						&conf->bio_split);
+	if (!bio) {
+		if (rw == WRITE)
+			md_write_end(mddev);
+		return true;
+	}
+
 	if (!__make_request(mddev, bio, sectors))
 		md_write_end(mddev);
 
