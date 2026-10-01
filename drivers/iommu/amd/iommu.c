@@ -376,7 +376,7 @@ static struct iommu_dev_data *alloc_dev_data(struct amd_iommu *iommu, u16 devid)
 	struct iommu_dev_data *dev_data;
 	struct amd_iommu_pci_seg *pci_seg = iommu->pci_seg;
 
-	dev_data = kzalloc(sizeof(*dev_data), GFP_KERNEL);
+	dev_data = kzalloc_obj(*dev_data, GFP_KERNEL);
 	if (!dev_data)
 		return NULL;
 
@@ -2284,7 +2284,7 @@ static int pdom_attach_iommu(struct amd_iommu *iommu,
 		goto out_unlock;
 	}
 
-	pdom_iommu_info = kzalloc(sizeof(*pdom_iommu_info), GFP_ATOMIC);
+	pdom_iommu_info = kzalloc_obj(*pdom_iommu_info, GFP_ATOMIC);
 	if (!pdom_iommu_info) {
 		ret = -ENOMEM;
 		goto out_unlock;
@@ -2554,7 +2554,7 @@ struct protection_domain *protection_domain_alloc(void)
 	struct protection_domain *domain;
 	int domid;
 
-	domain = kzalloc(sizeof(*domain), GFP_KERNEL);
+	domain = kzalloc_obj(*domain, GFP_KERNEL);
 	if (!domain)
 		return NULL;
 
@@ -3190,26 +3190,44 @@ const struct iommu_ops amd_iommu_ops = {
 static struct irq_chip amd_ir_chip;
 static DEFINE_SPINLOCK(iommu_table_lock);
 
+static int iommu_flush_dev_irt(struct pci_dev *unused, u16 devid, void *data)
+{
+	int ret;
+	struct iommu_cmd cmd;
+	struct amd_iommu *iommu = data;
+
+	build_inv_irt(&cmd, devid);
+	ret = __iommu_queue_command_sync(iommu, &cmd, true);
+	return ret;
+}
+
 static void iommu_flush_irt_and_complete(struct amd_iommu *iommu, u16 devid)
 {
 	int ret;
 	u64 data;
 	unsigned long flags;
-	struct iommu_cmd cmd, cmd2;
+	struct iommu_cmd cmd;
+	struct pci_dev *pdev = NULL;
+	struct iommu_dev_data *dev_data = search_dev_data(iommu, devid);
 
 	if (iommu->irtcachedis_enabled)
 		return;
 
-	build_inv_irt(&cmd, devid);
+	if (dev_data && dev_data->dev && dev_is_pci(dev_data->dev))
+		pdev = to_pci_dev(dev_data->dev);
 
 	raw_spin_lock_irqsave(&iommu->lock, flags);
 	data = get_cmdsem_val(iommu);
-	build_completion_wait(&cmd2, iommu, data);
+	build_completion_wait(&cmd, iommu, data);
 
-	ret = __iommu_queue_command_sync(iommu, &cmd, true);
+	if (pdev)
+		ret = pci_for_each_dma_alias(pdev, iommu_flush_dev_irt, iommu);
+	else
+		ret = iommu_flush_dev_irt(NULL, devid, iommu);
 	if (ret)
 		goto out_err;
-	ret = __iommu_queue_command_sync(iommu, &cmd2, false);
+
+	ret = __iommu_queue_command_sync(iommu, &cmd, false);
 	if (ret)
 		goto out_err;
 	raw_spin_unlock_irqrestore(&iommu->lock, flags);
@@ -3272,7 +3290,7 @@ static struct irq_remap_table *__alloc_irq_table(int nid, size_t size)
 {
 	struct irq_remap_table *table;
 
-	table = kzalloc(sizeof(*table), GFP_KERNEL);
+	table = kzalloc_obj(*table, GFP_KERNEL);
 	if (!table)
 		return NULL;
 
@@ -3823,15 +3841,14 @@ static int irq_remapping_alloc(struct irq_domain *domain, unsigned int virq,
 		}
 
 		ret = -ENOMEM;
-		data = kzalloc(sizeof(*data), GFP_KERNEL);
+		data = kzalloc_obj(*data, GFP_KERNEL);
 		if (!data)
 			goto out_free_data;
 
 		if (!AMD_IOMMU_GUEST_IR_GA(amd_iommu_guest_ir))
-			data->entry = kzalloc(sizeof(union irte), GFP_KERNEL);
+			data->entry = kzalloc_obj(union irte, GFP_KERNEL);
 		else
-			data->entry = kzalloc(sizeof(struct irte_ga),
-						     GFP_KERNEL);
+			data->entry = kzalloc_obj(struct irte_ga, GFP_KERNEL);
 		if (!data->entry) {
 			kfree(data);
 			goto out_free_data;

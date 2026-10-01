@@ -150,7 +150,7 @@ int iommufd_viommu_report_event(struct iommufd_viommu *viommu,
 	}
 
 	/* Pre-allocate to avoid GFP_ATOMIC; use GFP_NOWAIT to avoid sleeping */
-	vevent = kzalloc(struct_size(vevent, event_data, data_len), GFP_NOWAIT);
+	vevent = kzalloc_flex(*vevent, event_data, data_len, GFP_NOWAIT);
 	if (!vevent) {
 		spin_lock(&veventq->common.lock);
 		vevent = &veventq->lost_events_header;
@@ -205,7 +205,7 @@ iommufd_sw_msi_get_map(struct iommufd_ctx *ictx, phys_addr_t msi_addr,
 	    BITS_PER_BYTE * sizeof_field(struct iommufd_sw_msi_maps, bitmap))
 		return ERR_PTR(-EOVERFLOW);
 
-	cur = kzalloc(sizeof(*cur), GFP_KERNEL);
+	cur = kzalloc_obj(*cur, GFP_KERNEL);
 	if (!cur)
 		return ERR_PTR(-ENOMEM);
 

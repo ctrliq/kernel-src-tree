@@ -700,7 +700,7 @@ static void iommu_set_root_entry(struct intel_iommu *iommu)
 		addr |= DMA_RTADDR_SMT;
 
 	raw_spin_lock_irqsave(&iommu->register_lock, flag);
-	dmar_writeq(iommu->reg + DMAR_RTADDR_REG, addr);
+	writeq(addr, iommu->reg + DMAR_RTADDR_REG);
 
 	writel(iommu->gcmd | DMA_GCMD_SRTP, iommu->reg + DMAR_GCMD_REG);
 
@@ -768,11 +768,11 @@ static void __iommu_flush_context(struct intel_iommu *iommu,
 	val |= DMA_CCMD_ICC;
 
 	raw_spin_lock_irqsave(&iommu->register_lock, flag);
-	dmar_writeq(iommu->reg + DMAR_CCMD_REG, val);
+	writeq(val, iommu->reg + DMAR_CCMD_REG);
 
 	/* Make sure hardware complete it */
 	IOMMU_WAIT_OP(iommu, DMAR_CCMD_REG,
-		dmar_readq, (!(val & DMA_CCMD_ICC)), val);
+		readq, (!(val & DMA_CCMD_ICC)), val);
 
 	raw_spin_unlock_irqrestore(&iommu->register_lock, flag);
 }
@@ -809,12 +809,12 @@ void __iommu_flush_iotlb(struct intel_iommu *iommu, u16 did, u64 addr,
 	raw_spin_lock_irqsave(&iommu->register_lock, flag);
 	/* Note: Only uses first TLB reg currently */
 	if (val_iva)
-		dmar_writeq(iommu->reg + tlb_offset, val_iva);
-	dmar_writeq(iommu->reg + tlb_offset + 8, val);
+		writeq(val_iva, iommu->reg + tlb_offset);
+	writeq(val, iommu->reg + tlb_offset + 8);
 
 	/* Make sure hardware complete it */
 	IOMMU_WAIT_OP(iommu, tlb_offset + 8,
-		dmar_readq, (!(val & DMA_TLB_IVT)), val);
+		readq, (!(val & DMA_TLB_IVT)), val);
 
 	raw_spin_unlock_irqrestore(&iommu->register_lock, flag);
 
@@ -1033,7 +1033,7 @@ int domain_attach_iommu(struct dmar_domain *domain, struct intel_iommu *iommu)
 	if (domain->domain.type == IOMMU_DOMAIN_SVA)
 		return 0;
 
-	info = kzalloc(sizeof(*info), GFP_KERNEL);
+	info = kzalloc_obj(*info, GFP_KERNEL);
 	if (!info)
 		return -ENOMEM;
 
@@ -1538,7 +1538,7 @@ static int copy_translation_tables(struct intel_iommu *iommu)
 	int bus, ret;
 	bool new_ext, ext;
 
-	rtaddr_reg = dmar_readq(iommu->reg + DMAR_RTADDR_REG);
+	rtaddr_reg = readq(iommu->reg + DMAR_RTADDR_REG);
 	ext        = !!(rtaddr_reg & DMA_RTADDR_SMT);
 	new_ext    = !!sm_supported(iommu);
 
@@ -1927,7 +1927,7 @@ int __init dmar_parse_one_rmrr(struct acpi_dmar_header *header, void *arg)
 		add_taint(TAINT_FIRMWARE_WORKAROUND, LOCKDEP_STILL_OK);
 	}
 
-	rmrru = kzalloc(sizeof(*rmrru), GFP_KERNEL);
+	rmrru = kzalloc_obj(*rmrru, GFP_KERNEL);
 	if (!rmrru)
 		goto out;
 
@@ -2780,7 +2780,7 @@ static struct dmar_domain *paging_domain_alloc(void)
 {
 	struct dmar_domain *domain;
 
-	domain = kzalloc(sizeof(*domain), GFP_KERNEL);
+	domain = kzalloc_obj(*domain, GFP_KERNEL);
 	if (!domain)
 		return ERR_PTR(-ENOMEM);
 
@@ -3239,7 +3239,7 @@ static struct iommu_device *intel_iommu_probe_device(struct device *dev)
 	if (!iommu || !iommu->iommu.ops)
 		return ERR_PTR(-ENODEV);
 
-	info = kzalloc(sizeof(*info), GFP_KERNEL);
+	info = kzalloc_obj(*info, GFP_KERNEL);
 	if (!info)
 		return ERR_PTR(-ENOMEM);
 
@@ -3580,7 +3580,7 @@ domain_add_dev_pasid(struct iommu_domain *domain,
 	unsigned long flags;
 	int ret;
 
-	dev_pasid = kzalloc(sizeof(*dev_pasid), GFP_KERNEL);
+	dev_pasid = kzalloc_obj(*dev_pasid, GFP_KERNEL);
 	if (!dev_pasid)
 		return ERR_PTR(-ENOMEM);
 
@@ -3621,9 +3621,6 @@ static int intel_iommu_set_dev_pasid(struct iommu_domain *domain,
 
 	if (!pasid_supported(iommu) || dev_is_real_dma_subdevice(dev))
 		return -EOPNOTSUPP;
-
-	if (domain->dirty_ops)
-		return -EINVAL;
 
 	if (context_copied(iommu, info->bus, info->devfn))
 		return -EBUSY;
@@ -3676,7 +3673,7 @@ static void *intel_iommu_hw_info(struct device *dev, u32 *length,
 	    *type != IOMMU_HW_INFO_TYPE_INTEL_VTD)
 		return ERR_PTR(-EOPNOTSUPP);
 
-	vtd = kzalloc(sizeof(*vtd), GFP_KERNEL);
+	vtd = kzalloc_obj(*vtd, GFP_KERNEL);
 	if (!vtd)
 		return ERR_PTR(-ENOMEM);
 
@@ -3688,18 +3685,26 @@ static void *intel_iommu_hw_info(struct device *dev, u32 *length,
 	return vtd;
 }
 
-/*
- * Set dirty tracking for the device list of a domain. The caller must
- * hold the domain->lock when calling it.
- */
-static int device_set_dirty_tracking(struct list_head *devices, bool enable)
+/* Set dirty tracking for the devices that the domain has been attached. */
+static int domain_set_dirty_tracking(struct dmar_domain *domain, bool enable)
 {
 	struct device_domain_info *info;
+	struct dev_pasid_info *dev_pasid;
 	int ret = 0;
 
-	list_for_each_entry(info, devices, link) {
+	lockdep_assert_held(&domain->lock);
+
+	list_for_each_entry(info, &domain->devices, link) {
 		ret = intel_pasid_setup_dirty_tracking(info->iommu, info->dev,
 						       IOMMU_NO_PASID, enable);
+		if (ret)
+			return ret;
+	}
+
+	list_for_each_entry(dev_pasid, &domain->dev_pasids, link_domain) {
+		info = dev_iommu_priv_get(dev_pasid->dev);
+		ret = intel_pasid_setup_dirty_tracking(info->iommu, info->dev,
+						       dev_pasid->pasid, enable);
 		if (ret)
 			break;
 	}
@@ -3717,7 +3722,7 @@ static int parent_domain_set_dirty_tracking(struct dmar_domain *domain,
 	spin_lock(&domain->s1_lock);
 	list_for_each_entry(s1_domain, &domain->s1_domains, s2_link) {
 		spin_lock_irqsave(&s1_domain->lock, flags);
-		ret = device_set_dirty_tracking(&s1_domain->devices, enable);
+		ret = domain_set_dirty_tracking(s1_domain, enable);
 		spin_unlock_irqrestore(&s1_domain->lock, flags);
 		if (ret)
 			goto err_unwind;
@@ -3728,8 +3733,7 @@ static int parent_domain_set_dirty_tracking(struct dmar_domain *domain,
 err_unwind:
 	list_for_each_entry(s1_domain, &domain->s1_domains, s2_link) {
 		spin_lock_irqsave(&s1_domain->lock, flags);
-		device_set_dirty_tracking(&s1_domain->devices,
-					  domain->dirty_tracking);
+		domain_set_dirty_tracking(s1_domain, domain->dirty_tracking);
 		spin_unlock_irqrestore(&s1_domain->lock, flags);
 	}
 	spin_unlock(&domain->s1_lock);
@@ -3746,7 +3750,7 @@ static int intel_iommu_set_dirty_tracking(struct iommu_domain *domain,
 	if (dmar_domain->dirty_tracking == enable)
 		goto out_unlock;
 
-	ret = device_set_dirty_tracking(&dmar_domain->devices, enable);
+	ret = domain_set_dirty_tracking(dmar_domain, enable);
 	if (ret)
 		goto err_unwind;
 
@@ -3763,8 +3767,7 @@ out_unlock:
 	return 0;
 
 err_unwind:
-	device_set_dirty_tracking(&dmar_domain->devices,
-				  dmar_domain->dirty_tracking);
+	domain_set_dirty_tracking(dmar_domain, dmar_domain->dirty_tracking);
 	spin_unlock(&dmar_domain->lock);
 	return ret;
 }
@@ -4192,7 +4195,7 @@ int ecmd_submit_sync(struct intel_iommu *iommu, u8 ecmd, u64 oa, u64 ob)
 
 	raw_spin_lock_irqsave(&iommu->register_lock, flags);
 
-	res = dmar_readq(iommu->reg + DMAR_ECRSP_REG);
+	res = readq(iommu->reg + DMAR_ECRSP_REG);
 	if (res & DMA_ECMD_ECRSP_IP) {
 		ret = -EBUSY;
 		goto err;
@@ -4205,10 +4208,10 @@ int ecmd_submit_sync(struct intel_iommu *iommu, u8 ecmd, u64 oa, u64 ob)
 	 * - It's not invoked in any critical path. The extra MMIO
 	 *   write doesn't bring any performance concerns.
 	 */
-	dmar_writeq(iommu->reg + DMAR_ECEO_REG, ob);
-	dmar_writeq(iommu->reg + DMAR_ECMD_REG, ecmd | (oa << DMA_ECMD_OA_SHIFT));
+	writeq(ob, iommu->reg + DMAR_ECEO_REG);
+	writeq(ecmd | (oa << DMA_ECMD_OA_SHIFT), iommu->reg + DMAR_ECMD_REG);
 
-	IOMMU_WAIT_OP(iommu, DMAR_ECRSP_REG, dmar_readq,
+	IOMMU_WAIT_OP(iommu, DMAR_ECRSP_REG, readq,
 		      !(res & DMA_ECMD_ECRSP_IP), res);
 
 	if (res & DMA_ECMD_ECRSP_IP) {

@@ -422,7 +422,7 @@ static int iommu_load_old_irte(struct intel_iommu *iommu)
 	u64 irta;
 
 	/* Check whether the old ir-table has the same size as ours */
-	irta = dmar_readq(iommu->reg + DMAR_IRTA_REG);
+	irta = readq(iommu->reg + DMAR_IRTA_REG);
 	if ((irta & INTR_REMAP_TABLE_REG_SIZE_MASK)
 	     != INTR_REMAP_TABLE_REG_SIZE)
 		return -EINVAL;
@@ -465,8 +465,8 @@ static void iommu_set_irq_remapping(struct intel_iommu *iommu, int mode)
 
 	raw_spin_lock_irqsave(&iommu->register_lock, flags);
 
-	dmar_writeq(iommu->reg + DMAR_IRTA_REG,
-		    (addr) | IR_X2APIC_MODE(mode) | INTR_REMAP_TABLE_REG_SIZE);
+	writeq((addr) | IR_X2APIC_MODE(mode) | INTR_REMAP_TABLE_REG_SIZE,
+	       iommu->reg + DMAR_IRTA_REG);
 
 	/* Set interrupt-remapping table pointer */
 	writel(iommu->gcmd | DMA_GCMD_SIRTP, iommu->reg + DMAR_GCMD_REG);
@@ -533,7 +533,7 @@ static int intel_setup_irq_remapping(struct intel_iommu *iommu)
 	if (iommu->ir_table)
 		return 0;
 
-	ir_table = kzalloc(sizeof(struct ir_table), GFP_KERNEL);
+	ir_table = kzalloc_obj(struct ir_table, GFP_KERNEL);
 	if (!ir_table)
 		return -ENOMEM;
 
@@ -1426,7 +1426,7 @@ static int intel_irq_remapping_alloc(struct irq_domain *domain,
 		return ret;
 
 	ret = -ENOMEM;
-	data = kzalloc(sizeof(*data), GFP_KERNEL);
+	data = kzalloc_obj(*data, GFP_KERNEL);
 	if (!data)
 		goto out_free_parent;
 
@@ -1448,7 +1448,7 @@ static int intel_irq_remapping_alloc(struct irq_domain *domain,
 		}
 
 		if (i > 0) {
-			ird = kzalloc(sizeof(*ird), GFP_KERNEL);
+			ird = kzalloc_obj(*ird, GFP_KERNEL);
 			if (!ird)
 				goto out_free_data;
 			/* Initialize the common data */
