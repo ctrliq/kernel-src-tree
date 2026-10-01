@@ -1474,7 +1474,7 @@ __naked void sub64_full_overflow(void)
 SEC("socket")
 __description("64-bit subtration, partial overflow, result in unbounded reg")
 __success __log_level(2)
-__msg("3: (1f) r3 -= r2 {{.*}} R3_w=scalar()")
+__msg("3: (1f) r3 -= r2 {{.*}} R3_w=scalar(id=1-1)")
 __retval(0)
 __naked void sub64_partial_overflow(void)
 {
