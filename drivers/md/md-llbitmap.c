@@ -1959,6 +1959,21 @@ static void llbitmap_reshape_map_range(struct llbitmap *llbitmap,
 	range->end = range->offset + range->sectors;
 }
 
+/*
+ * RHEL-10 lacks mul_u64_u64_div_u64_roundup(). Open-code the rounded-up
+ * 128-bit multiply/divide using mul_u64_u64_div_u64(): the remainder
+ * (a*b - q*d) is smaller than the divisor and so fits in u64 even though the
+ * full product does not, so wrapping 64-bit arithmetic recovers it.
+ */
+static u64 llbitmap_mul_div_roundup(u64 a, u64 b, u64 d)
+{
+	u64 q = mul_u64_u64_div_u64(a, b, d);
+
+	if (a * b - q * d)
+		q++;
+	return q;
+}
+
 static bool llbitmap_reshape_src_range(const struct llbitmap_reshape_range *old,
 				       const struct llbitmap_reshape_range *new,
 				       const struct llbitmap_reshape_range *dst,
@@ -1971,8 +1986,8 @@ static bool llbitmap_reshape_src_range(const struct llbitmap_reshape_range *old,
 		mul_u64_u64_div_u64(dst->start - new->offset,
 				    old->sectors, new->sectors);
 	src->end = old->offset +
-		mul_u64_u64_div_u64_roundup(dst->end - new->offset,
-					    old->sectors, new->sectors);
+		llbitmap_mul_div_roundup(dst->end - new->offset,
+					 old->sectors, new->sectors);
 	if (src->end > old->end)
 		src->end = old->end;
 	src->offset = src->start;
