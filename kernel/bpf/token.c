@@ -173,7 +173,7 @@ int bpf_token_create(union bpf_attr *attr)
 		return PTR_ERR(file);
 	}
 
-	token = kzalloc(sizeof(*token), GFP_USER);
+	token = kzalloc_obj(*token, GFP_USER);
 	if (!token) {
 		err = -ENOMEM;
 		goto out_file;
