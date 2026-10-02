@@ -5,3 +5,6 @@
 
 obj-$(CONFIG_SMBFS) += cifs_arc4.o
 obj-$(CONFIG_SMBFS) += cifs_md4.o
+obj-$(CONFIG_SMBFS) += smb_compress.o
+
+smb_compress-y := compress/lz77.o
