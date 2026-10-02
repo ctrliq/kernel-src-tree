@@ -1067,4 +1067,9 @@ static int __init init_ima(void)
 	return error;
 }
 
-late_initcall(init_ima);	/* Start IMA after the TPM is available */
+/* Start IMA after the TPM is available */
+#ifndef CONFIG_IMA_INIT_LATE_SYNC
+late_initcall(init_ima);
+#else
+late_initcall_sync(init_ima);
+#endif
