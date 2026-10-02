@@ -23,12 +23,6 @@
 #define TRACEFS_PIPE	"/sys/kernel/tracing/trace_pipe"
 #define DEBUGFS_PIPE	"/sys/kernel/debug/tracing/trace_pipe"
 
-struct ksyms {
-	struct ksym *syms;
-	size_t sym_cap;
-	size_t sym_cnt;
-};
-
 static struct ksyms *ksyms;
 static pthread_mutex_t ksyms_mutex = PTHREAD_MUTEX_INITIALIZER;
 

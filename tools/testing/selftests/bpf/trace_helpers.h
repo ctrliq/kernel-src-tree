@@ -11,7 +11,12 @@ struct ksym {
 	long addr;
 	char *name;
 };
-struct ksyms;
+
+struct ksyms {
+	struct ksym *syms;
+	size_t sym_cap;
+	size_t sym_cnt;
+};
 
 typedef int (*ksym_cmp_t)(const void *p1, const void *p2);
 typedef int (*ksym_search_cmp_t)(const void *p1, const struct ksym *p2);
