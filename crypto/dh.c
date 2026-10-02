@@ -479,6 +479,60 @@ out_err:
 	return ERR_PTR(err);
 }
 
+/*
+ * SP800-56Ar3, sec. 5.6.2.1.2: obtain owner assurance that an externally
+ * provided private key is within the valid range 1 <= key <= q - 1, with
+ * q = (p - 1) / 2 for the safe-prime groups.
+ *
+ * The upper bound is q - 1 rather than this implementation's generation
+ * bound of 2^N - 1 (see dh_safe_prime_gen_privkey()): per SP800-56Ar3
+ * sec. 5.6.1.1.1 a compliant generator may pick any N up to log2(q) + 1,
+ * so an externally generated key can legitimately be as large as q - 1.
+ * q - 1 is also the only bound derivable from the group alone.
+ */
+static int dh_safe_prime_check_privkey(const struct dh_safe_prime *safe_prime,
+				       const struct dh *params)
+{
+	MPI x, p, q;
+	int ret;
+
+	x = mpi_read_raw_data(params->key, params->key_size);
+	if (!x)
+		return -EINVAL;
+
+	p = mpi_read_raw_data(safe_prime->p, safe_prime->p_size);
+	if (!p) {
+		ret = -EINVAL;
+		goto out_free_x;
+	}
+
+	q = mpi_alloc(mpi_get_nlimbs(p));
+	if (!q) {
+		ret = -ENOMEM;
+		goto out_free_p;
+	}
+
+	/*
+	 * p is an odd (safe) prime, so (p - 1) / 2 == p >> 1; no need to
+	 * explicitly subtract one before shifting, cf. dh_is_pubkey_valid().
+	 */
+	ret = mpi_rshift(q, p, 1);
+	if (ret)
+		goto out_free_q;
+
+	/* Reject key < 1 (i.e. key == 0) or key > q - 1 (i.e. key >= q). */
+	if (mpi_cmp_ui(x, 1) < 0 || mpi_cmp(x, q) >= 0)
+		ret = -EINVAL;
+
+out_free_q:
+	mpi_free(q);
+out_free_p:
+	mpi_free(p);
+out_free_x:
+	mpi_free(x);
+	return ret;
+}
+
 static int dh_safe_prime_set_secret(struct crypto_kpp *tfm, const void *buffer,
 				    unsigned int len)
 {
@@ -509,6 +563,15 @@ static int dh_safe_prime_set_secret(struct crypto_kpp *tfm, const void *buffer,
 		if (IS_ERR(key))
 			return PTR_ERR(key);
 		params.key = key;
+	} else if (fips_enabled) {
+		/*
+		 * A locally generated key is in range by construction; an
+		 * externally provided one must be validated per
+		 * SP800-56Ar3 sec. 5.6.2.1.2.
+		 */
+		err = dh_safe_prime_check_privkey(inst_ctx->safe_prime, &params);
+		if (err)
+			return err;
 	}
 
 	buf_size = crypto_dh_key_len(&params);
