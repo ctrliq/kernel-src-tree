@@ -532,7 +532,8 @@ static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
 	 *                          low
 	 *
 	 * Stack args 6-8 are passed in x5-x7, args 9+ at [SP].
-	 * Incoming args 9+ are at [FP + 16], [FP + 24], ...
+	 * Incoming args 9+ are at [A64_FP + 16], [A64_FP + 24], ...
+	 * (above the saved FP/LR pair pushed in the callee prologue).
 	 */
 
 	/* bpf function may be invoked by 3 instruction types:
@@ -1218,11 +1219,12 @@ static void emit_stack_arg_store_imm(s32 imm, s16 bpf_off, const u8 tmp, struct 
 {
 	int idx = -bpf_off / sizeof(u64) - 1;
 
-	emit_a64_mov_i(1, tmp, imm, ctx);
-	if (idx < NR_STACK_ARG_REGS)
-		emit(A64_MOV(1, stack_arg_reg[idx], tmp), ctx);
-	else
+	if (idx < NR_STACK_ARG_REGS) {
+		emit_a64_mov_i(1, stack_arg_reg[idx], imm, ctx);
+	} else {
+		emit_a64_mov_i(1, tmp, imm, ctx);
 		emit(A64_STR64I(tmp, A64_SP, (idx - NR_STACK_ARG_REGS) * sizeof(u64)), ctx);
+	}
 }
 
 /* JITs an eBPF instruction.
