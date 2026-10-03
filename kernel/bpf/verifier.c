@@ -3199,11 +3199,6 @@ static int check_reg_arg(struct bpf_verifier_env *env, u32 regno,
 	return __check_reg_arg(env, state->regs, regno, t);
 }
 
-static int insn_stack_access_flags(int frameno, int spi)
-{
-	return INSN_F_STACK_ACCESS | (spi << INSN_F_SPI_SHIFT) | frameno;
-}
-
 static void mark_indirect_target(struct bpf_verifier_env *env, int idx)
 {
 	env->insn_aux_data[idx].indirect_target = true;
@@ -3523,7 +3518,8 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 	int i, slot = -off - 1, spi = slot / BPF_REG_SIZE, err;
 	struct bpf_insn *insn = &env->prog->insnsi[insn_idx];
 	struct bpf_reg_state *reg = NULL;
-	int insn_flags = insn_stack_access_flags(state->frameno, spi);
+	int insn_flags = INSN_F_STACK_ACCESS;
+	int hist_spi = spi, hist_frame = state->frameno;
 
 	/* caller checked that off % size == 0 and -MAX_BPF_STACK <= off < 0,
 	 * so it's aligned access and [off, off + size) are within stack limits
@@ -3619,7 +3615,8 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 	}
 
 	if (insn_flags)
-		return bpf_push_jmp_history(env, env->cur_state, insn_flags, 0);
+		return bpf_push_jmp_history(env, env->cur_state, insn_flags,
+					    hist_spi, hist_frame, 0);
 	return 0;
 }
 
@@ -3815,7 +3812,8 @@ static int check_stack_read_fixed_off(struct bpf_verifier_env *env,
 	int i, slot = -off - 1, spi = slot / BPF_REG_SIZE;
 	struct bpf_reg_state *reg;
 	u8 *stype, type;
-	int insn_flags = insn_stack_access_flags(reg_state->frameno, spi);
+	int insn_flags = INSN_F_STACK_ACCESS;
+	int hist_spi = spi, hist_frame = reg_state->frameno;
 
 	stype = reg_state->stack[spi].slot_type;
 	reg = &reg_state->stack[spi].spilled_ptr;
@@ -3946,7 +3944,8 @@ static int check_stack_read_fixed_off(struct bpf_verifier_env *env,
 		insn_flags = 0; /* we are not restoring spilled register */
 	}
 	if (insn_flags)
-		return bpf_push_jmp_history(env, env->cur_state, insn_flags, 0);
+		return bpf_push_jmp_history(env, env->cur_state, insn_flags,
+					    hist_spi, hist_frame, 0);
 	return 0;
 }
 
@@ -15875,7 +15874,7 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 	}
 
 	if (insn_flags) {
-		err = bpf_push_jmp_history(env, this_branch, insn_flags, 0);
+		err = bpf_push_jmp_history(env, this_branch, insn_flags, 0, 0, 0);
 		if (err)
 			return err;
 	}
@@ -15945,7 +15944,7 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 	 * if parent state is created.
 	 */
 	if (linked_regs.cnt > 1) {
-		err = bpf_push_jmp_history(env, this_branch, 0, linked_regs_pack(&linked_regs));
+		err = bpf_push_jmp_history(env, this_branch, 0, 0, 0, linked_regs_pack(&linked_regs));
 		if (err)
 			return err;
 	}
@@ -17289,7 +17288,7 @@ static int do_check(struct bpf_verifier_env *env)
 		}
 
 		if (bpf_is_jmp_point(env, env->insn_idx)) {
-			err = bpf_push_jmp_history(env, state, 0, 0);
+			err = bpf_push_jmp_history(env, state, 0, 0, 0, 0);
 			if (err)
 				return err;
 		}
