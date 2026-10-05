@@ -323,6 +323,8 @@ smb2_calc_signature(struct smb_rqst *rqst, struct TCP_Server_Info *server,
 	if (!rc)
 		memcpy(shdr->Signature, sigptr, SMB2_SIGNATURE_SIZE);
 
+	memzero_explicit(key, sizeof(key));
+
 out:
 	if (allocate_crypto)
 		cifs_free_hash(&shash);
@@ -406,6 +408,7 @@ static int generate_key(struct cifs_ses *ses, struct kvec label,
 	}
 
 	memcpy(key, hashptr, key_size);
+	memzero_explicit(prfhash, sizeof(prfhash));
 
 smb3signkey_ret:
 	return rc;
@@ -625,6 +628,7 @@ smb3_calc_signature(struct smb_rqst *rqst, struct TCP_Server_Info *server,
 	memset(shdr->Signature, 0x0, SMB2_SIGNATURE_SIZE);
 
 	rc = crypto_shash_setkey(shash->tfm, key, SMB2_CMACAES_SIZE);
+	memzero_explicit(key, sizeof(key));
 	if (rc) {
 		cifs_server_dbg(VFS, "%s: Could not set key for cmac aes\n", __func__);
 		goto out;
