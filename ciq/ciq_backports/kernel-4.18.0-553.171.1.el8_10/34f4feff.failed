@@ -1,0 +1,255 @@
+s390/vfio_ccw: Selectively expand io_mutex
+
+jira KERNEL-1718
+Rebuild_History Non-Buildable kernel-4.18.0-553.171.1.el8_10
+commit-author Eric Farman <farman@linux.ibm.com>
+commit 34f4feff3e90bd09308fad0974e97113b23b812a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.171.1.el8_10/34f4feff.failed
+
+The io_mutex was defined to serialize the io_regions, but then has
+also sort of been associated with the I/O themselves because of
+the close relationship they share.
+
+With the handful of races that are possible, the choices are either to:
+ A) expand the scope of io_mutex to close these remaining windows, or
+ B) reduce the scope of io_mutex to just io_region, and introduce a new
+    lock mechanism for the remaining I/O resources
+
+This patch implements A, since B brings with it a lot more interactions
+that would need to be tracked and kept in a correct hierarchy. It also
+takes advantage of the workqueue element for cp_free() that now gets
+called out of fsm_notoper(), which could be invoked out of an interrupt
+context and thus cannot acquire a mutex itself.
+
+Fixes: 4f76617378ee ("vfio-ccw: protect the I/O region")
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Eric Farman <farman@linux.ibm.com>
+	Reviewed-by: Matthew Rosato <mjrosato@linux.ibm.com>
+	Signed-off-by: Christian Borntraeger <borntraeger@linux.ibm.com>
+(cherry picked from commit 34f4feff3e90bd09308fad0974e97113b23b812a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/cio/vfio_ccw_chp.c
+#	drivers/s390/cio/vfio_ccw_cp.c
+#	drivers/s390/cio/vfio_ccw_drv.c
+#	drivers/s390/cio/vfio_ccw_fsm.c
+diff --cc drivers/s390/cio/vfio_ccw_chp.c
+index a646fc81c872,9269b54f5cfd..000000000000
+--- a/drivers/s390/cio/vfio_ccw_chp.c
++++ b/drivers/s390/cio/vfio_ccw_chp.c
+@@@ -94,7 -105,12 +95,16 @@@ static ssize_t vfio_ccw_crw_region_read
+  	if (crw)
+  		list_del(&crw->next);
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&private->io_mutex);
+++=======
++ 	if (i >= private->num_regions) {
++ 		ret = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	i = array_index_nospec(i, private->num_regions);
+++>>>>>>> 34f4feff3e90 (s390/vfio_ccw: Selectively expand io_mutex)
+  	region = private->region[i].data;
+  
+  	if (crw)
+diff --cc drivers/s390/cio/vfio_ccw_cp.c
+index 254239411a85,58722c4baa25..000000000000
+--- a/drivers/s390/cio/vfio_ccw_cp.c
++++ b/drivers/s390/cio/vfio_ccw_cp.c
+@@@ -944,19 -975,25 +944,29 @@@ void cp_update_scsw(struct channel_prog
+   * If the @iova is currently pinned for the ccw chain, return true;
+   * else return false.
+   */
+ -bool cp_iova_pinned(struct channel_program *cp, u64 iova, u64 length)
+ +bool cp_iova_pinned(struct channel_program *cp, u64 iova)
+  {
++ 	struct vfio_ccw_private *private =
++ 		container_of(cp, struct vfio_ccw_private, cp);
+  	struct ccwchain *chain;
+  	int i;
+  
+  	if (!cp->initialized)
+  		return false;
+  
++ 	mutex_lock(&private->io_mutex);
+  	list_for_each_entry(chain, &cp->ccwchain_list, next) {
+  		for (i = 0; i < chain->ch_len; i++)
+++<<<<<<< HEAD
+ +			if (pfn_array_iova_pinned(chain->ch_pa + i, iova))
+++=======
++ 			if (page_array_iova_pinned(&chain->ch_pa[i], iova, length)) {
++ 				mutex_unlock(&private->io_mutex);
+++>>>>>>> 34f4feff3e90 (s390/vfio_ccw: Selectively expand io_mutex)
+  				return true;
++ 			}
+  	}
++ 	mutex_unlock(&private->io_mutex);
+  
+  	return false;
+  }
+diff --cc drivers/s390/cio/vfio_ccw_drv.c
+index eea4123da5e2,757ff5b2556e..000000000000
+--- a/drivers/s390/cio/vfio_ccw_drv.c
++++ b/drivers/s390/cio/vfio_ccw_drv.c
+@@@ -92,30 -91,49 +92,45 @@@ static void vfio_ccw_sch_io_todo(struc
+  
+  	is_final = !(scsw_actl(&irb->scsw) &
+  		     (SCSW_ACTL_DEVACT | SCSW_ACTL_SCHACT));
++ 	mutex_lock(&private->io_mutex);
+  	if (scsw_is_solicited(&irb->scsw)) {
+  		cp_update_scsw(&private->cp, &irb->scsw);
+ -		if (is_final && private->state == VFIO_CCW_STATE_CP_PENDING) {
+ +		if (is_final && private->state == VFIO_CCW_STATE_CP_PENDING)
+  			cp_free(&private->cp);
+ -			cp_is_finished = true;
+ -		}
+  	}
+- 	mutex_lock(&private->io_mutex);
+  	memcpy(private->io_region->irb_area, irb, sizeof(*irb));
+- 	mutex_unlock(&private->io_mutex);
+  
+ -	/*
+ -	 * Reset to IDLE only if processing of a channel program
+ -	 * has finished. Do not overwrite a possible processing
+ -	 * state if the interrupt was unsolicited, or if the final
+ -	 * interrupt was for HSCH or CSCH.
+ -	 */
+ -	if (cp_is_finished)
+ +	if (private->mdev && is_final)
+  		private->state = VFIO_CCW_STATE_IDLE;
++ 	mutex_unlock(&private->io_mutex);
+  
+  	if (private->io_trigger)
+ -		eventfd_signal(private->io_trigger);
+ +		eventfd_signal(private->io_trigger, 1);
+  }
+  
+ -void vfio_ccw_crw_todo(struct work_struct *work)
+ +static void vfio_ccw_crw_todo(struct work_struct *work)
+  {
+  	struct vfio_ccw_private *private;
+  
+  	private = container_of(work, struct vfio_ccw_private, crw_work);
+  
+  	if (!list_empty(&private->crw) && private->crw_trigger)
+++<<<<<<< HEAD
+ +		eventfd_signal(private->crw_trigger, 1);
+++=======
++ 		eventfd_signal(private->crw_trigger);
++ }
++ 
++ void vfio_ccw_notoper_todo(struct work_struct *work)
++ {
++ 	struct vfio_ccw_private *private;
++ 
++ 	private = container_of(work, struct vfio_ccw_private, notoper_work);
++ 
++ 	mutex_lock(&private->io_mutex);
++ 	cp_free(&private->cp);
++ 	mutex_unlock(&private->io_mutex);
+++>>>>>>> 34f4feff3e90 (s390/vfio_ccw: Selectively expand io_mutex)
+  }
+  
+  /*
+diff --cc drivers/s390/cio/vfio_ccw_fsm.c
+index 1f11a8382807,5fd94e9d5c61..000000000000
+--- a/drivers/s390/cio/vfio_ccw_fsm.c
++++ b/drivers/s390/cio/vfio_ccw_fsm.c
+@@@ -170,6 -169,9 +170,12 @@@ static void fsm_notoper(struct vfio_ccw
+  	 */
+  	css_sched_sch_todo(sch, SCH_TODO_UNREG);
+  	private->state = VFIO_CCW_STATE_NOT_OPER;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* This routine could be called from IRQ context, so defer */
++ 	queue_work(vfio_ccw_work_q, &private->notoper_work);
+++>>>>>>> 34f4feff3e90 (s390/vfio_ccw: Selectively expand io_mutex)
+  }
+  
+  /*
+@@@ -366,6 -370,58 +372,61 @@@ static void fsm_irq(struct vfio_ccw_pri
+  		complete(private->completion);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void fsm_open(struct vfio_ccw_private *private,
++ 		     enum vfio_ccw_event event)
++ {
++ 	struct subchannel *sch = to_subchannel(private->vdev.dev->parent);
++ 	int ret;
++ 
++ 	spin_lock_irq(&sch->lock);
++ 	sch->isc = VFIO_CCW_ISC;
++ 	ret = cio_enable_subchannel(sch, (u32)virt_to_phys(sch));
++ 	if (ret)
++ 		goto err_unlock;
++ 
++ 	private->state = VFIO_CCW_STATE_IDLE;
++ 	spin_unlock_irq(&sch->lock);
++ 	return;
++ 
++ err_unlock:
++ 	spin_unlock_irq(&sch->lock);
++ 	vfio_ccw_fsm_event(private, VFIO_CCW_EVENT_NOT_OPER);
++ }
++ 
++ static void fsm_close(struct vfio_ccw_private *private,
++ 		      enum vfio_ccw_event event)
++ {
++ 	struct subchannel *sch = to_subchannel(private->vdev.dev->parent);
++ 	int ret;
++ 
++ 	spin_lock_irq(&sch->lock);
++ 
++ 	if (!sch->schib.pmcw.ena)
++ 		goto err_unlock;
++ 
++ 	ret = cio_disable_subchannel(sch);
++ 	if (ret == -EBUSY)
++ 		ret = vfio_ccw_sch_quiesce(sch);
++ 	if (ret)
++ 		goto err_unlock;
++ 
++ 	private->state = VFIO_CCW_STATE_STANDBY;
++ 	spin_unlock_irq(&sch->lock);
++ 
++ 	mutex_lock(&private->io_mutex);
++ 	cp_free(&private->cp);
++ 	mutex_unlock(&private->io_mutex);
++ 
++ 	return;
++ 
++ err_unlock:
++ 	spin_unlock_irq(&sch->lock);
++ 	vfio_ccw_fsm_event(private, VFIO_CCW_EVENT_NOT_OPER);
++ }
++ 
+++>>>>>>> 34f4feff3e90 (s390/vfio_ccw: Selectively expand io_mutex)
+  /*
+   * Device statemachine
+   */
+* Unmerged path drivers/s390/cio/vfio_ccw_chp.c
+* Unmerged path drivers/s390/cio/vfio_ccw_cp.c
+* Unmerged path drivers/s390/cio/vfio_ccw_drv.c
+* Unmerged path drivers/s390/cio/vfio_ccw_fsm.c
+diff --git a/drivers/s390/cio/vfio_ccw_private.h b/drivers/s390/cio/vfio_ccw_private.h
+index b2c762eb42b9..9b13b41e3a9c 100644
+--- a/drivers/s390/cio/vfio_ccw_private.h
++++ b/drivers/s390/cio/vfio_ccw_private.h
+@@ -74,7 +74,8 @@ struct vfio_ccw_crw {
+  * @mdev: pointer to the mediated device
+  * @nb: notifier for vfio events
+  * @io_region: MMIO region to input/output I/O arguments/results
+- * @io_mutex: protect against concurrent update of I/O regions
++ * @io_mutex: protect against concurrent update of I/O resources
++ *            and @cp lifecycle
+  * @region: additional regions for other subchannel operations
+  * @cmd_region: MMIO region for asynchronous I/O commands other than START
+  * @schib_region: MMIO region for SCHIB information
