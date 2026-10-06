@@ -1,0 +1,504 @@
+s390/vfio_ccw: Implement a crw lock
+
+jira KERNEL-1718
+Rebuild_History Non-Buildable kernel-4.18.0-553.171.1.el8_10
+commit-author Eric Farman <farman@linux.ibm.com>
+commit 16b0798024c0e9117e395829ddbbe70981c79d9c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.171.1.el8_10/16b07980.failed
+
+Unlike the channel_program struct, which covers synchronous I/O
+submissions and asynchronous interrupts, the CRW region relies
+exclusively on asynchronous events coming from hardware.
+
+Implement a lock to manage the list of those payloads, to ensure
+they are read cohesively.
+
+Fixes: 3f02cb2fd9d2 ("vfio-ccw: Wire up the CRW irq and CRW region")
+	Cc: stable@vger.kernel.org
+	Reviewed-by: Matthew Rosato <mjrosato@linux.ibm.com>
+	Reviewed-by: Farhan Ali <alifm@linux.ibm.com>
+	Signed-off-by: Eric Farman <farman@linux.ibm.com>
+	Signed-off-by: Christian Borntraeger <borntraeger@linux.ibm.com>
+(cherry picked from commit 16b0798024c0e9117e395829ddbbe70981c79d9c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/cio/vfio_ccw_chp.c
+#	drivers/s390/cio/vfio_ccw_drv.c
+#	drivers/s390/cio/vfio_ccw_ops.c
+diff --cc drivers/s390/cio/vfio_ccw_chp.c
+index a646fc81c872,7708eb4d6de0..000000000000
+--- a/drivers/s390/cio/vfio_ccw_chp.c
++++ b/drivers/s390/cio/vfio_ccw_chp.c
+@@@ -88,15 -99,25 +89,35 @@@ static ssize_t vfio_ccw_crw_region_read
+  	if (pos + count > sizeof(*region))
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	crw = list_first_entry_or_null(&private->crw,
+ +				       struct vfio_ccw_crw, next);
+ +
+ +	if (crw)
+ +		list_del(&crw->next);
+ +
+ +	mutex_lock(&private->io_mutex);
+++=======
++ 	mutex_lock(&private->io_mutex);
++ 	if (i >= private->num_regions) {
++ 		ret = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	i = array_index_nospec(i, private->num_regions);
+++>>>>>>> 16b0798024c0 (s390/vfio_ccw: Implement a crw lock)
+  	region = private->region[i].data;
+  
++ 	spin_lock_irqsave(&private->crw_lock, flags);
++ 	crw = list_first_entry_or_null(&private->crw,
++ 				       struct vfio_ccw_crw, next);
++ 
++ 	if (crw)
++ 		list_del(&crw->next);
++ 
++ 	/* Drop CRW lock while copying to userspace */
++ 	spin_unlock_irqrestore(&private->crw_lock, flags);
++ 
+  	if (crw)
+  		memcpy(&region->crw, &crw->crw, sizeof(region->crw));
+  
+@@@ -106,14 -127,16 +127,26 @@@
+  		ret = count;
+  
+  	region->crw = 0;
+++<<<<<<< HEAD
+ +
+ +	mutex_unlock(&private->io_mutex);
+ +
+++=======
+++>>>>>>> 16b0798024c0 (s390/vfio_ccw: Implement a crw lock)
+  	kfree(crw);
+  
+  	/* Notify the guest if more CRWs are on our queue */
++ 	spin_lock_irqsave(&private->crw_lock, flags);
+  	if (!list_empty(&private->crw) && private->crw_trigger)
+++<<<<<<< HEAD
+ +		eventfd_signal(private->crw_trigger, 1);
+++=======
++ 		eventfd_signal(private->crw_trigger);
++ 	spin_unlock_irqrestore(&private->crw_lock, flags);
++ 
++ out:
++ 	mutex_unlock(&private->io_mutex);
+++>>>>>>> 16b0798024c0 (s390/vfio_ccw: Implement a crw lock)
+  
+  	return ret;
+  }
+diff --cc drivers/s390/cio/vfio_ccw_drv.c
+index eea4123da5e2,ab6b518cc353..000000000000
+--- a/drivers/s390/cio/vfio_ccw_drv.c
++++ b/drivers/s390/cio/vfio_ccw_drv.c
+@@@ -92,30 -91,52 +92,48 @@@ static void vfio_ccw_sch_io_todo(struc
+  
+  	is_final = !(scsw_actl(&irb->scsw) &
+  		     (SCSW_ACTL_DEVACT | SCSW_ACTL_SCHACT));
+ -	mutex_lock(&private->io_mutex);
+  	if (scsw_is_solicited(&irb->scsw)) {
+  		cp_update_scsw(&private->cp, &irb->scsw);
+ -		if (is_final && private->state == VFIO_CCW_STATE_CP_PENDING) {
+ +		if (is_final && private->state == VFIO_CCW_STATE_CP_PENDING)
+  			cp_free(&private->cp);
+ -			cp_is_finished = true;
+ -		}
+  	}
+ +	mutex_lock(&private->io_mutex);
+  	memcpy(private->io_region->irb_area, irb, sizeof(*irb));
+ +	mutex_unlock(&private->io_mutex);
+  
+ -	/*
+ -	 * Reset to IDLE only if processing of a channel program
+ -	 * has finished. Do not overwrite a possible processing
+ -	 * state if the interrupt was unsolicited, or if the final
+ -	 * interrupt was for HSCH or CSCH.
+ -	 */
+ -	if (cp_is_finished)
+ +	if (private->mdev && is_final)
+  		private->state = VFIO_CCW_STATE_IDLE;
+ -	mutex_unlock(&private->io_mutex);
+  
+  	if (private->io_trigger)
+ -		eventfd_signal(private->io_trigger);
+ +		eventfd_signal(private->io_trigger, 1);
+  }
+  
+ -void vfio_ccw_crw_todo(struct work_struct *work)
+ +static void vfio_ccw_crw_todo(struct work_struct *work)
+  {
+  	struct vfio_ccw_private *private;
++ 	unsigned long flags;
+  
+  	private = container_of(work, struct vfio_ccw_private, crw_work);
+  
++ 	spin_lock_irqsave(&private->crw_lock, flags);
+  	if (!list_empty(&private->crw) && private->crw_trigger)
+++<<<<<<< HEAD
+ +		eventfd_signal(private->crw_trigger, 1);
+++=======
++ 		eventfd_signal(private->crw_trigger);
++ 	spin_unlock_irqrestore(&private->crw_lock, flags);
++ }
++ 
++ void vfio_ccw_notoper_todo(struct work_struct *work)
++ {
++ 	struct vfio_ccw_private *private;
++ 
++ 	private = container_of(work, struct vfio_ccw_private, notoper_work);
++ 
++ 	mutex_lock(&private->io_mutex);
++ 	cp_free(&private->cp);
++ 	mutex_unlock(&private->io_mutex);
+++>>>>>>> 16b0798024c0 (s390/vfio_ccw: Implement a crw lock)
+  }
+  
+  /*
+diff --cc drivers/s390/cio/vfio_ccw_ops.c
+index bee98d0c629f,5ce91285c7d5..000000000000
+--- a/drivers/s390/cio/vfio_ccw_ops.c
++++ b/drivers/s390/cio/vfio_ccw_ops.c
+@@@ -17,156 -16,181 +17,253 @@@
+  
+  #include "vfio_ccw_private.h"
+  
+ -static const struct vfio_device_ops vfio_ccw_dev_ops;
+ -
+ -static int vfio_ccw_mdev_reset(struct vfio_ccw_private *private)
+ +static int vfio_ccw_mdev_reset(struct mdev_device *mdev)
+  {
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * If the FSM state is seen as Not Operational after closing
++ 	 * and re-opening the mdev, return an error.
++ 	 */
++ 	vfio_ccw_fsm_event(private, VFIO_CCW_EVENT_CLOSE);
++ 	vfio_ccw_fsm_event(private, VFIO_CCW_EVENT_OPEN);
++ 	if (private->state == VFIO_CCW_STATE_NOT_OPER)
++ 		return -EINVAL;
++ 
++ 	return 0;
++ }
++ 
++ static void vfio_ccw_dma_unmap(struct vfio_device *vdev, u64 iova, u64 length)
++ {
++ 	struct vfio_ccw_private *private =
++ 		container_of(vdev, struct vfio_ccw_private, vdev);
++ 
++ 	/* Drivers MUST unpin pages in response to an invalidation. */
++ 	if (!cp_iova_pinned(&private->cp, iova, length))
++ 		return;
++ 
++ 	vfio_ccw_mdev_reset(private);
++ }
++ 
++ static int vfio_ccw_mdev_init_dev(struct vfio_device *vdev)
++ {
++ 	struct vfio_ccw_private *private =
++ 		container_of(vdev, struct vfio_ccw_private, vdev);
++ 
++ 	mutex_init(&private->io_mutex);
++ 	private->state = VFIO_CCW_STATE_STANDBY;
++ 	INIT_LIST_HEAD(&private->crw);
++ 	INIT_WORK(&private->io_work, vfio_ccw_sch_io_todo);
++ 	INIT_WORK(&private->crw_work, vfio_ccw_crw_todo);
++ 	INIT_WORK(&private->notoper_work, vfio_ccw_notoper_todo);
++ 	spin_lock_init(&private->crw_lock);
++ 
++ 	private->cp.guest_cp = kzalloc_objs(struct ccw1, CCWCHAIN_LEN_MAX);
++ 	if (!private->cp.guest_cp)
++ 		goto out_free_private;
++ 
++ 	private->io_region = kmem_cache_zalloc(vfio_ccw_io_region,
++ 					       GFP_KERNEL | GFP_DMA);
++ 	if (!private->io_region)
++ 		goto out_free_cp;
++ 
++ 	private->cmd_region = kmem_cache_zalloc(vfio_ccw_cmd_region,
++ 						GFP_KERNEL | GFP_DMA);
++ 	if (!private->cmd_region)
++ 		goto out_free_io;
++ 
++ 	private->schib_region = kmem_cache_zalloc(vfio_ccw_schib_region,
++ 						  GFP_KERNEL | GFP_DMA);
++ 	if (!private->schib_region)
++ 		goto out_free_cmd;
++ 
++ 	private->crw_region = kmem_cache_zalloc(vfio_ccw_crw_region,
++ 						GFP_KERNEL | GFP_DMA);
++ 	if (!private->crw_region)
++ 		goto out_free_schib;
++ 
++ 	return 0;
++ 
++ out_free_schib:
++ 	kmem_cache_free(vfio_ccw_schib_region, private->schib_region);
++ out_free_cmd:
++ 	kmem_cache_free(vfio_ccw_cmd_region, private->cmd_region);
++ out_free_io:
++ 	kmem_cache_free(vfio_ccw_io_region, private->io_region);
++ out_free_cp:
++ 	kfree(private->cp.guest_cp);
++ out_free_private:
++ 	mutex_destroy(&private->io_mutex);
++ 	return -ENOMEM;
++ }
++ 
++ static int vfio_ccw_mdev_probe(struct mdev_device *mdev)
++ {
++ 	struct subchannel *sch = to_subchannel(mdev->dev.parent);
++ 	struct vfio_ccw_parent *parent = dev_get_drvdata(&sch->dev);
+++>>>>>>> 16b0798024c0 (s390/vfio_ccw: Implement a crw lock)
+  	struct vfio_ccw_private *private;
+ +	struct subchannel *sch;
+  	int ret;
+  
+ -	private = vfio_alloc_device(vfio_ccw_private, vdev, &mdev->dev,
+ -				    &vfio_ccw_dev_ops);
+ -	if (IS_ERR(private))
+ -		return PTR_ERR(private);
+ -
+ -	dev_set_drvdata(&parent->dev, private);
+ -
+ -	VFIO_CCW_MSG_EVENT(2, "sch %x.%x.%04x: create\n",
+ -			   sch->schid.cssid,
+ -			   sch->schid.ssid,
+ -			   sch->schid.sch_no);
+ -
+ -	ret = vfio_register_emulated_iommu_dev(&private->vdev);
+ +	private = dev_get_drvdata(mdev_parent_dev(mdev));
+ +	sch = private->sch;
+ +	/*
+ +	 * TODO:
+ +	 * In the cureent stage, some things like "no I/O running" and "no
+ +	 * interrupt pending" are clear, but we are not sure what other state
+ +	 * we need to care about.
+ +	 * There are still a lot more instructions need to be handled. We
+ +	 * should come back here later.
+ +	 */
+ +	ret = vfio_ccw_sch_quiesce(sch);
+  	if (ret)
+ -		goto err_put_vdev;
+ -	dev_set_drvdata(&mdev->dev, private);
+ -	return 0;
+ +		return ret;
+ +
+ +	ret = cio_enable_subchannel(sch, (u32)(unsigned long)sch);
+ +	if (!ret)
+ +		private->state = VFIO_CCW_STATE_IDLE;
+  
+ -err_put_vdev:
+ -	dev_set_drvdata(&parent->dev, NULL);
+ -	vfio_put_device(&private->vdev);
+  	return ret;
+  }
+  
+ -static void vfio_ccw_mdev_release_dev(struct vfio_device *vdev)
+ +static int vfio_ccw_mdev_notifier(struct notifier_block *nb,
+ +				  unsigned long action,
+ +				  void *data)
+  {
+  	struct vfio_ccw_private *private =
+++<<<<<<< HEAD
+ +		container_of(nb, struct vfio_ccw_private, nb);
+++=======
++ 		container_of(vdev, struct vfio_ccw_private, vdev);
++ 	struct vfio_ccw_crw *crw, *temp;
++ 	unsigned long flags;
+++>>>>>>> 16b0798024c0 (s390/vfio_ccw: Implement a crw lock)
+  
+  	/*
+ -	 * Ensure these work items are fully drained, so none can
+ -	 * fire after being released.
+ -	 *
+ -	 * notoper_work should have nothing to do here, because only
+ -	 * open devices could have channel_program resources in use
+ -	 * and those would be released during close. Nevertheless,
+ -	 * call flush here as well to be certain anything that was
+ -	 * allocated is freed.
+ +	 * Vendor drivers MUST unpin pages in response to an
+ +	 * invalidation.
+  	 */
+ -	cancel_work_sync(&private->io_work);
+ -	cancel_work_sync(&private->crw_work);
+ -	flush_work(&private->notoper_work);
+ +	if (action == VFIO_IOMMU_NOTIFY_DMA_UNMAP) {
+ +		struct vfio_iommu_type1_dma_unmap *unmap = data;
+ +
+++<<<<<<< HEAD
+ +		if (!cp_iova_pinned(&private->cp, unmap->iova))
+ +			return NOTIFY_OK;
+ +
+ +		if (vfio_ccw_mdev_reset(private->mdev))
+ +			return NOTIFY_BAD;
+  
+ +		cp_free(&private->cp);
+ +		return NOTIFY_OK;
+++=======
++ 	spin_lock_irqsave(&private->crw_lock, flags);
++ 	list_for_each_entry_safe(crw, temp, &private->crw, next) {
++ 		list_del(&crw->next);
++ 		kfree(crw);
+++>>>>>>> 16b0798024c0 (s390/vfio_ccw: Implement a crw lock)
+  	}
++ 	spin_unlock_irqrestore(&private->crw_lock, flags);
+  
+ -	kmem_cache_free(vfio_ccw_crw_region, private->crw_region);
+ -	kmem_cache_free(vfio_ccw_schib_region, private->schib_region);
+ -	kmem_cache_free(vfio_ccw_cmd_region, private->cmd_region);
+ -	kmem_cache_free(vfio_ccw_io_region, private->io_region);
+ -	kfree(private->cp.guest_cp);
+ -	mutex_destroy(&private->io_mutex);
+ +	return NOTIFY_DONE;
+  }
+  
+ -static void vfio_ccw_mdev_remove(struct mdev_device *mdev)
+ +static ssize_t name_show(struct kobject *kobj, struct device *dev, char *buf)
+  {
+ -	struct subchannel *sch = to_subchannel(mdev->dev.parent);
+ -	struct vfio_ccw_parent *parent = dev_get_drvdata(&sch->dev);
+ -	struct vfio_ccw_private *private = dev_get_drvdata(&parent->dev);
+ +	return sprintf(buf, "I/O subchannel (Non-QDIO)\n");
+ +}
+ +static MDEV_TYPE_ATTR_RO(name);
+ +
+ +static ssize_t device_api_show(struct kobject *kobj, struct device *dev,
+ +			       char *buf)
+ +{
+ +	return sprintf(buf, "%s\n", VFIO_DEVICE_API_CCW_STRING);
+ +}
+ +static MDEV_TYPE_ATTR_RO(device_api);
+ +
+ +static ssize_t available_instances_show(struct kobject *kobj,
+ +					struct device *dev, char *buf)
+ +{
+ +	struct vfio_ccw_private *private = dev_get_drvdata(dev);
+ +
+ +	return sprintf(buf, "%d\n", atomic_read(&private->avail));
+ +}
+ +static MDEV_TYPE_ATTR_RO(available_instances);
+ +
+ +static struct attribute *mdev_types_attrs[] = {
+ +	&mdev_type_attr_name.attr,
+ +	&mdev_type_attr_device_api.attr,
+ +	&mdev_type_attr_available_instances.attr,
+ +	NULL,
+ +};
+ +
+ +static struct attribute_group mdev_type_group = {
+ +	.name  = "io",
+ +	.attrs = mdev_types_attrs,
+ +};
+ +
+ +static struct attribute_group *mdev_type_groups[] = {
+ +	&mdev_type_group,
+ +	NULL,
+ +};
+ +
+ +static int vfio_ccw_mdev_create(struct kobject *kobj, struct mdev_device *mdev)
+ +{
+ +	struct vfio_ccw_private *private =
+ +		dev_get_drvdata(mdev_parent_dev(mdev));
+ +
+ +	if (private->state == VFIO_CCW_STATE_NOT_OPER)
+ +		return -ENODEV;
+ +
+ +	if (atomic_dec_if_positive(&private->avail) < 0)
+ +		return -EPERM;
+  
+ -	VFIO_CCW_MSG_EVENT(2, "sch %x.%x.%04x: remove\n",
+ -			   sch->schid.cssid,
+ -			   sch->schid.ssid,
+ -			   sch->schid.sch_no);
+ +	private->mdev = mdev;
+ +	private->state = VFIO_CCW_STATE_IDLE;
+  
+ -	vfio_unregister_group_dev(&private->vdev);
+ +	VFIO_CCW_MSG_EVENT(2, "mdev %pUl, sch %x.%x.%04x: create\n",
+ +			   mdev_uuid_p(mdev), private->sch->schid.cssid,
+ +			   private->sch->schid.ssid,
+ +			   private->sch->schid.sch_no);
+  
+ -	dev_set_drvdata(&parent->dev, NULL);
+ -	vfio_put_device(&private->vdev);
+ +	return 0;
+  }
+  
+ -static int vfio_ccw_mdev_open_device(struct vfio_device *vdev)
+ +static int vfio_ccw_mdev_remove(struct mdev_device *mdev)
+  {
+  	struct vfio_ccw_private *private =
+ -		container_of(vdev, struct vfio_ccw_private, vdev);
+ +		dev_get_drvdata(mdev_parent_dev(mdev));
+ +
+ +	VFIO_CCW_MSG_EVENT(2, "mdev %pUl, sch %x.%x.%04x: remove\n",
+ +			   mdev_uuid_p(mdev), private->sch->schid.cssid,
+ +			   private->sch->schid.ssid,
+ +			   private->sch->schid.sch_no);
+ +
+ +	if ((private->state != VFIO_CCW_STATE_NOT_OPER) &&
+ +	    (private->state != VFIO_CCW_STATE_STANDBY)) {
+ +		if (!vfio_ccw_sch_quiesce(private->sch))
+ +			private->state = VFIO_CCW_STATE_STANDBY;
+ +		/* The state will be NOT_OPER on error. */
+ +	}
+ +
+ +	cp_free(&private->cp);
+ +	private->mdev = NULL;
+ +	atomic_inc(&private->avail);
+ +
+ +	return 0;
+ +}
+ +
+ +static int vfio_ccw_mdev_open(struct mdev_device *mdev)
+ +{
+ +	struct vfio_ccw_private *private =
+ +		dev_get_drvdata(mdev_parent_dev(mdev));
+ +	unsigned long events = VFIO_IOMMU_NOTIFY_DMA_UNMAP;
+  	int ret;
+  
+ -	/* Device cannot simply be opened again from this state */
+ -	if (private->state == VFIO_CCW_STATE_NOT_OPER)
+ -		return -EINVAL;
+ +	private->nb.notifier_call = vfio_ccw_mdev_notifier;
+  
+ -	ret = vfio_ccw_register_async_dev_regions(private);
+ +	ret = vfio_register_notifier(mdev_dev(mdev), VFIO_IOMMU_NOTIFY,
+ +				     &events, &private->nb);
+  	if (ret)
+  		return ret;
+  
+* Unmerged path drivers/s390/cio/vfio_ccw_chp.c
+* Unmerged path drivers/s390/cio/vfio_ccw_drv.c
+* Unmerged path drivers/s390/cio/vfio_ccw_ops.c
+diff --git a/drivers/s390/cio/vfio_ccw_private.h b/drivers/s390/cio/vfio_ccw_private.h
+index b2c762eb42b9..b4d4bd15d055 100644
+--- a/drivers/s390/cio/vfio_ccw_private.h
++++ b/drivers/s390/cio/vfio_ccw_private.h
+@@ -83,6 +83,8 @@ struct vfio_ccw_crw {
+  * @cp: channel program for the current I/O operation
+  * @irb: irb info received from interrupt
+  * @scsw: scsw info
++ * @crw_lock: serialization of CRW list information
++ * @crw: list of Channel Report Word elements
+  * @io_trigger: eventfd ctx for signaling userspace I/O results
+  * @crw_trigger: eventfd ctx for signaling userspace CRW information
+  * @req_trigger: eventfd ctx for signaling userspace to return device
+@@ -107,6 +109,8 @@ struct vfio_ccw_private {
+ 	struct channel_program	cp;
+ 	struct irb		irb;
+ 	union scsw		scsw;
++
++	spinlock_t		crw_lock;
+ 	struct list_head	crw;
+ 
+ 	struct eventfd_ctx	*io_trigger;
