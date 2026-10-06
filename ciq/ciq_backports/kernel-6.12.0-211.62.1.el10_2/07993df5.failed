@@ -1,0 +1,345 @@
+gve: Update QPL page registration logic
+
+jira KERNEL-1712
+Rebuild_History Non-Buildable kernel-6.12.0-211.62.1.el10_2
+commit-author Matt Olson <maolson@google.com>
+commit 07993df560917357610e0625a9a2e7531c3211fc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.62.1.el10_2/07993df5.failed
+
+For DQO, change QPL page registration logic to be more flexible to honor
+the "max_registered_pages" parameter from the gVNIC device.
+
+Previously the number of RX pages per QPL was hardcoded to twice the
+ring size, and the number of TX pages per QPL was dictated by the device
+in the DQO-QPL device option. Now [in DQO-QPL mode], the driver will
+ignore the "tx_pages_per_qpl" parameter indicated in the DQO-QPL device
+option and instead allocate up to (tx_queue_length / 2) pages per TX QPL
+and up to (rx_queue_length * 2) pages per RX QPL while keeping the total
+number of pages under the "max_registered_pages".
+
+Merge DQO and GQI QPL page calculation logic into a unified
+gve_update_num_qpl_pages function. Add rx_pages_per_qpl to the priv
+struct for consumption by both DQO and GQI.
+
+	Signed-off-by: Matt Olson <maolson@google.com>
+	Signed-off-by: Max Yuan <maxyuan@google.com>
+	Reviewed-by: Jordan Rhee <jordanrhee@google.com>
+	Reviewed-by: Harshitha Ramamurthy <hramamurthy@google.com>
+	Reviewed-by: Willem de Bruijn <willemb@google.com>
+	Reviewed-by: Praveen Kaligineedi <pkaligineedi@google.com>
+	Signed-off-by: Joshua Washington <joshwash@google.com>
+Link: https://patch.msgid.link/20260225182342.1049816-2-joshwash@google.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 07993df560917357610e0625a9a2e7531c3211fc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/google/gve/gve.h
+#	drivers/net/ethernet/google/gve/gve_main.c
+#	drivers/net/ethernet/google/gve/gve_rx_dqo.c
+diff --cc drivers/net/ethernet/google/gve/gve.h
+index 05bb046210bd,1d66d3834f7e..000000000000
+--- a/drivers/net/ethernet/google/gve/gve.h
++++ b/drivers/net/ethernet/google/gve/gve.h
+@@@ -696,11 -708,12 +694,18 @@@ struct gve_ptype_lut 
+  
+  /* Parameters for allocating resources for tx queues */
+  struct gve_tx_alloc_rings_cfg {
+++<<<<<<< HEAD
+ +	struct gve_queue_config *qcfg;
+++=======
++ 	struct gve_tx_queue_config *qcfg;
++ 	u16 pages_per_qpl;
++ 
++ 	u16 num_xdp_rings;
+++>>>>>>> 07993df56091 (gve: Update QPL page registration logic)
+  
+  	u16 ring_size;
+ +	u16 start_idx;
+ +	u16 num_rings;
+  	bool raw_addressing;
+  
+  	/* Allocated resources are returned here */
+@@@ -710,8 -723,9 +715,14 @@@
+  /* Parameters for allocating resources for rx queues */
+  struct gve_rx_alloc_rings_cfg {
+  	/* tx config is also needed to determine QPL ids */
+++<<<<<<< HEAD
+ +	struct gve_queue_config *qcfg;
+ +	struct gve_queue_config *qcfg_tx;
+++=======
++ 	struct gve_rx_queue_config *qcfg_rx;
++ 	struct gve_tx_queue_config *qcfg_tx;
++ 	u16 pages_per_qpl;
+++>>>>>>> 07993df56091 (gve: Update QPL page registration logic)
+  
+  	u16 ring_size;
+  	u16 packet_buffer_size;
+diff --cc drivers/net/ethernet/google/gve/gve_main.c
+index c6cf4d439370,c654cf503c1a..000000000000
+--- a/drivers/net/ethernet/google/gve/gve_main.c
++++ b/drivers/net/ethernet/google/gve/gve_main.c
+@@@ -1006,8 -967,8 +1007,13 @@@ static void gve_tx_get_curr_alloc_cfg(s
+  	cfg->qcfg = &priv->tx_cfg;
+  	cfg->raw_addressing = !gve_is_qpl(priv);
+  	cfg->ring_size = priv->tx_desc_cnt;
+++<<<<<<< HEAD
+ +	cfg->start_idx = 0;
+ +	cfg->num_rings = priv->tx_cfg.num_queues + num_xdp_queues;
+++=======
++ 	cfg->pages_per_qpl = priv->tx_pages_per_qpl;
++ 	cfg->num_xdp_rings = cfg->qcfg->num_xdp_queues;
+++>>>>>>> 07993df56091 (gve: Update QPL page registration logic)
+  	cfg->tx = priv->tx;
+  }
+  
+@@@ -1039,26 -999,38 +1045,61 @@@ static void gve_tx_start_rings(struct g
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static int gve_alloc_xdp_rings(struct gve_priv *priv)
+ +{
+ +	struct gve_tx_alloc_rings_cfg cfg = {0};
+ +	int err = 0;
+ +
+ +	if (!priv->num_xdp_queues)
+ +		return 0;
+ +
+ +	gve_tx_get_curr_alloc_cfg(priv, &cfg);
+ +	cfg.start_idx = gve_xdp_tx_start_queue_id(priv);
+ +	cfg.num_rings = priv->num_xdp_queues;
+ +
+ +	err = gve_tx_alloc_rings_gqi(priv, &cfg);
+ +	if (err)
+ +		return err;
+ +
+ +	gve_tx_start_rings(priv, cfg.start_idx, cfg.num_rings);
+ +	init_xdp_sync_stats(priv);
+ +
+ +	return 0;
+++=======
++ void gve_update_num_qpl_pages(struct gve_priv *priv,
++ 			      struct gve_rx_alloc_rings_cfg *rx_alloc_cfg,
++ 			      struct gve_tx_alloc_rings_cfg *tx_alloc_cfg)
++ {
++ 	u64 ideal_tx_pages, ideal_rx_pages;
++ 	u16 tx_num_queues, rx_num_queues;
++ 	u64 max_pages, tx_pages;
++ 
++ 	if (priv->queue_format == GVE_GQI_QPL_FORMAT) {
++ 		rx_alloc_cfg->pages_per_qpl = rx_alloc_cfg->ring_size;
++ 	} else if (priv->queue_format == GVE_DQO_QPL_FORMAT) {
++ 		/*
++ 		 * We want 2 pages per RX descriptor and half a page per TX
++ 		 * descriptor, which means the fraction ideal_tx_pages /
++ 		 * (ideal_tx_pages + ideal_rx_pages) of the pages we allocate
++ 		 * should be for TX. Shrink proportionally as necessary to avoid
++ 		 * allocating more than max_registered_pages total pages.
++ 		 */
++ 		tx_num_queues = tx_alloc_cfg->qcfg->num_queues;
++ 		rx_num_queues = rx_alloc_cfg->qcfg_rx->num_queues;
++ 
++ 		ideal_tx_pages = tx_alloc_cfg->ring_size * tx_num_queues / 2;
++ 		ideal_rx_pages = rx_alloc_cfg->ring_size * rx_num_queues * 2;
++ 		max_pages = min(priv->max_registered_pages,
++ 				ideal_tx_pages + ideal_rx_pages);
++ 
++ 		tx_pages = div64_u64(max_pages * ideal_tx_pages,
++ 				     ideal_tx_pages + ideal_rx_pages);
++ 		tx_alloc_cfg->pages_per_qpl = div_u64(tx_pages, tx_num_queues);
++ 		rx_alloc_cfg->pages_per_qpl = div_u64(max_pages - tx_pages,
++ 						      rx_num_queues);
++ 	}
+++>>>>>>> 07993df56091 (gve: Update QPL page registration logic)
+  }
+  
+  static int gve_queues_mem_alloc(struct gve_priv *priv,
+@@@ -1361,10 -1331,10 +1404,15 @@@ static void gve_rx_get_curr_alloc_cfg(s
+  	cfg->raw_addressing = !gve_is_qpl(priv);
+  	cfg->enable_header_split = priv->header_split_enabled;
+  	cfg->ring_size = priv->rx_desc_cnt;
+++<<<<<<< HEAD
+ +	cfg->packet_buffer_size = gve_is_gqi(priv) ?
+ +				  GVE_DEFAULT_RX_BUFFER_SIZE :
+ +				  priv->data_buffer_size_dqo;
+++=======
++ 	cfg->pages_per_qpl = priv->rx_pages_per_qpl;
++ 	cfg->packet_buffer_size = priv->rx_cfg.packet_buffer_size;
+++>>>>>>> 07993df56091 (gve: Update QPL page registration logic)
+  	cfg->rx = priv->rx;
+ -	cfg->xdp = !!cfg->qcfg_tx->num_xdp_queues;
+  }
+  
+  void gve_get_curr_alloc_cfgs(struct gve_priv *priv,
+@@@ -1437,17 -1407,15 +1485,19 @@@ static int gve_queues_start(struct gve_
+  
+  	/* Record new configs into priv */
+  	priv->tx_cfg = *tx_alloc_cfg->qcfg;
+ -	priv->tx_cfg.num_xdp_queues = tx_alloc_cfg->num_xdp_rings;
+ -	priv->rx_cfg = *rx_alloc_cfg->qcfg_rx;
+ +	priv->rx_cfg = *rx_alloc_cfg->qcfg;
+  	priv->tx_desc_cnt = tx_alloc_cfg->ring_size;
+  	priv->rx_desc_cnt = rx_alloc_cfg->ring_size;
++ 	priv->tx_pages_per_qpl = tx_alloc_cfg->pages_per_qpl;
++ 	priv->rx_pages_per_qpl = rx_alloc_cfg->pages_per_qpl;
+  
+ -	gve_tx_start_rings(priv, gve_num_tx_queues(priv));
+ -	gve_rx_start_rings(priv, rx_alloc_cfg->qcfg_rx->num_queues);
+ +	if (priv->xdp_prog)
+ +		priv->num_xdp_queues = priv->rx_cfg.num_queues;
+ +	else
+ +		priv->num_xdp_queues = 0;
+ +
+ +	gve_tx_start_rings(priv, 0, tx_alloc_cfg->num_rings);
+ +	gve_rx_start_rings(priv, rx_alloc_cfg->qcfg->num_queues);
+  	gve_init_sync_stats(priv);
+  
+  	err = netif_set_real_num_tx_queues(dev, priv->tx_cfg.num_queues);
+diff --cc drivers/net/ethernet/google/gve/gve_rx_dqo.c
+index c6f44c94cf82,3b10139941ea..000000000000
+--- a/drivers/net/ethernet/google/gve/gve_rx_dqo.c
++++ b/drivers/net/ethernet/google/gve/gve_rx_dqo.c
+@@@ -225,12 -229,26 +224,19 @@@ int gve_rx_alloc_ring_dqo(struct gve_pr
+  	memset(rx, 0, sizeof(*rx));
+  	rx->gve = priv;
+  	rx->q_num = idx;
+ -	rx->packet_buffer_size = cfg->packet_buffer_size;
+ -
+ -	if (cfg->xdp) {
+ -		rx->packet_buffer_truesize = GVE_XDP_RX_BUFFER_SIZE_DQO;
+ -		rx->rx_headroom = XDP_PACKET_HEADROOM;
+ -	} else {
+ -		rx->packet_buffer_truesize = rx->packet_buffer_size;
+ -		rx->rx_headroom = 0;
+ -	}
+ -
+ -	/* struct gve_xdp_buff is overlaid on struct xdp_buff_xsk and utilizes
+ -	 * the 24 byte field cb to store gve specific data.
+ -	 */
+ -	XSK_CHECK_PRIV_TYPE(struct gve_xdp_buff);
+  
+  	rx->dqo.num_buf_states = cfg->raw_addressing ? buffer_queue_slots :
+++<<<<<<< HEAD
+ +		gve_get_rx_pages_per_qpl_dqo(cfg->ring_size);
+ +	rx->dqo.buf_states = kvcalloc(rx->dqo.num_buf_states,
+ +				      sizeof(rx->dqo.buf_states[0]),
+ +				      GFP_KERNEL);
+++=======
++ 		cfg->pages_per_qpl;
++ 	rx->dqo.buf_states = kvcalloc_node(rx->dqo.num_buf_states,
++ 					   sizeof(rx->dqo.buf_states[0]),
++ 					   GFP_KERNEL, priv->numa_node);
+++>>>>>>> 07993df56091 (gve: Update QPL page registration logic)
+  	if (!rx->dqo.buf_states)
+  		return -ENOMEM;
+  
+* Unmerged path drivers/net/ethernet/google/gve/gve.h
+diff --git a/drivers/net/ethernet/google/gve/gve_adminq.c b/drivers/net/ethernet/google/gve/gve_adminq.c
+index 4c7817f9c0dc..c17eacf156df 100644
+--- a/drivers/net/ethernet/google/gve/gve_adminq.c
++++ b/drivers/net/ethernet/google/gve/gve_adminq.c
+@@ -972,14 +972,6 @@ static void gve_enable_supported_features(struct gve_priv *priv,
+ 		priv->dev->max_mtu = be16_to_cpu(dev_op_jumbo_frames->max_mtu);
+ 	}
+ 
+-	/* Override pages for qpl for DQO-QPL */
+-	if (dev_op_dqo_qpl) {
+-		priv->tx_pages_per_qpl =
+-			be16_to_cpu(dev_op_dqo_qpl->tx_pages_per_qpl);
+-		if (priv->tx_pages_per_qpl == 0)
+-			priv->tx_pages_per_qpl = DQO_QPL_DEFAULT_TX_PAGES;
+-	}
+-
+ 	if (dev_op_buffer_sizes &&
+ 	    (supported_features_mask & GVE_SUP_BUFFER_SIZES_MASK)) {
+ 		priv->max_rx_buffer_size =
+diff --git a/drivers/net/ethernet/google/gve/gve_buffer_mgmt_dqo.c b/drivers/net/ethernet/google/gve/gve_buffer_mgmt_dqo.c
+index af84cb88f828..91fb4ba50d34 100644
+--- a/drivers/net/ethernet/google/gve/gve_buffer_mgmt_dqo.c
++++ b/drivers/net/ethernet/google/gve/gve_buffer_mgmt_dqo.c
+@@ -128,7 +128,7 @@ int gve_alloc_qpl_page_dqo(struct gve_rx_ring *rx,
+ 	u32 idx;
+ 
+ 	idx = rx->dqo.next_qpl_page_idx;
+-	if (idx >= gve_get_rx_pages_per_qpl_dqo(priv->rx_desc_cnt)) {
++	if (idx >= priv->rx_pages_per_qpl) {
+ 		net_err_ratelimited("%s: Out of QPL pages\n",
+ 				    priv->dev->name);
+ 		return -ENOMEM;
+* Unmerged path drivers/net/ethernet/google/gve/gve_main.c
+diff --git a/drivers/net/ethernet/google/gve/gve_rx.c b/drivers/net/ethernet/google/gve/gve_rx.c
+index 9e7f3b0ca447..789670fb008a 100644
+--- a/drivers/net/ethernet/google/gve/gve_rx.c
++++ b/drivers/net/ethernet/google/gve/gve_rx.c
+@@ -277,7 +277,6 @@ int gve_rx_alloc_ring_gqi(struct gve_priv *priv,
+ 	struct device *hdev = &priv->pdev->dev;
+ 	u32 slots = cfg->ring_size;
+ 	int filled_pages;
+-	int qpl_page_cnt;
+ 	u32 qpl_id = 0;
+ 	size_t bytes;
+ 	int err;
+@@ -314,10 +313,8 @@ int gve_rx_alloc_ring_gqi(struct gve_priv *priv,
+ 
+ 	if (!rx->data.raw_addressing) {
+ 		qpl_id = gve_get_rx_qpl_id(cfg->qcfg_tx, rx->q_num);
+-		qpl_page_cnt = cfg->ring_size;
+-
+ 		rx->data.qpl = gve_alloc_queue_page_list(priv, qpl_id,
+-							 qpl_page_cnt);
++							 cfg->pages_per_qpl);
+ 		if (!rx->data.qpl) {
+ 			err = -ENOMEM;
+ 			goto abort_with_copy_pool;
+* Unmerged path drivers/net/ethernet/google/gve/gve_rx_dqo.c
+diff --git a/drivers/net/ethernet/google/gve/gve_tx.c b/drivers/net/ethernet/google/gve/gve_tx.c
+index 78699ea11f4b..e035455e97ca 100644
+--- a/drivers/net/ethernet/google/gve/gve_tx.c
++++ b/drivers/net/ethernet/google/gve/gve_tx.c
+@@ -264,7 +264,6 @@ static int gve_tx_alloc_ring_gqi(struct gve_priv *priv,
+ 				 int idx)
+ {
+ 	struct device *hdev = &priv->pdev->dev;
+-	int qpl_page_cnt;
+ 	u32 qpl_id = 0;
+ 	size_t bytes;
+ 
+@@ -291,10 +290,8 @@ static int gve_tx_alloc_ring_gqi(struct gve_priv *priv,
+ 	tx->dev = hdev;
+ 	if (!tx->raw_addressing) {
+ 		qpl_id = gve_tx_qpl_id(priv, tx->q_num);
+-		qpl_page_cnt = priv->tx_pages_per_qpl;
+-
+ 		tx->tx_fifo.qpl = gve_alloc_queue_page_list(priv, qpl_id,
+-							    qpl_page_cnt);
++							    cfg->pages_per_qpl);
+ 		if (!tx->tx_fifo.qpl)
+ 			goto abort_with_desc;
+ 
+diff --git a/drivers/net/ethernet/google/gve/gve_tx_dqo.c b/drivers/net/ethernet/google/gve/gve_tx_dqo.c
+index 576ba092ef92..06d90defd302 100644
+--- a/drivers/net/ethernet/google/gve/gve_tx_dqo.c
++++ b/drivers/net/ethernet/google/gve/gve_tx_dqo.c
+@@ -302,7 +302,6 @@ static int gve_tx_alloc_ring_dqo(struct gve_priv *priv,
+ {
+ 	struct device *hdev = &priv->pdev->dev;
+ 	int num_pending_packets;
+-	int qpl_page_cnt;
+ 	size_t bytes;
+ 	u32 qpl_id;
+ 	int i;
+@@ -384,10 +383,9 @@ static int gve_tx_alloc_ring_dqo(struct gve_priv *priv,
+ 
+ 	if (!cfg->raw_addressing) {
+ 		qpl_id = gve_tx_qpl_id(priv, tx->q_num);
+-		qpl_page_cnt = priv->tx_pages_per_qpl;
+ 
+ 		tx->dqo.qpl = gve_alloc_queue_page_list(priv, qpl_id,
+-							qpl_page_cnt);
++							cfg->pages_per_qpl);
+ 		if (!tx->dqo.qpl)
+ 			goto err;
+ 
