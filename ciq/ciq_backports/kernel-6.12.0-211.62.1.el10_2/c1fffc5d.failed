@@ -1,0 +1,364 @@
+gve: implement DQO RX datapath and control path for AF_XDP zero-copy
+
+jira KERNEL-1712
+Rebuild_History Non-Buildable kernel-6.12.0-211.62.1.el10_2
+commit-author Joshua Washington <joshwash@google.com>
+commit c1fffc5d66a7147d557736c2341a511e0896d9ff
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.62.1.el10_2/c1fffc5d.failed
+
+Add the RX datapath for AF_XDP zero-copy for DQ RDA. The RX path is
+quite similar to that of the normal XDP case. Parallel methods are
+introduced to properly handle XSKs instead of normal driver buffers.
+
+To properly support posting from XSKs, queues are destroyed and
+recreated, as the driver was initially making use of page pool buffers
+instead of the XSK pool memory.
+
+Expose support for AF_XDP zero-copy, as the TX and RX datapaths both
+exist.
+
+	Reviewed-by: Willem de Bruijn <willemb@google.com>
+	Signed-off-by: Praveen Kaligineedi <pkaligineedi@google.com>
+	Signed-off-by: Joshua Washington <joshwash@google.com>
+	Signed-off-by: Jeroen de Borst <jeroendb@google.com>
+Link: https://patch.msgid.link/20250717152839.973004-6-jeroendb@google.com
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+
+(cherry picked from commit c1fffc5d66a7147d557736c2341a511e0896d9ff)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/google/gve/gve_main.c
+diff --cc drivers/net/ethernet/google/gve/gve_main.c
+index f5bac06581ae,6ea306947417..000000000000
+--- a/drivers/net/ethernet/google/gve/gve_main.c
++++ b/drivers/net/ethernet/google/gve/gve_main.c
+@@@ -1722,30 -1609,25 +1722,52 @@@ static int gve_xsk_pool_enable(struct n
+  	if (!priv->xdp_prog || !netif_running(dev))
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	rx = &priv->rx[qid];
+ +	napi = &priv->ntfy_blocks[rx->ntfy_id].napi;
+ +	err = xdp_rxq_info_reg(&rx->xsk_rxq, dev, qid, napi->napi_id);
+ +	if (err)
+ +		goto err;
+ +
+ +	err = xdp_rxq_info_reg_mem_model(&rx->xsk_rxq,
+ +					 MEM_TYPE_XSK_BUFF_POOL, NULL);
+ +	if (err)
+ +		goto err;
+ +
+ +	xsk_pool_set_rxq_info(pool, &rx->xsk_rxq);
+ +	rx->xsk_pool = pool;
+ +
+ +	tx_qid = gve_xdp_tx_queue_id(priv, qid);
+ +	priv->tx[tx_qid].xsk_pool = pool;
+ +
+ +	return 0;
+ +err:
+ +	if (xdp_rxq_info_is_reg(&rx->xsk_rxq))
+ +		xdp_rxq_info_unreg(&rx->xsk_rxq);
+ +
+ +	xsk_pool_dma_unmap(pool,
+ +			   DMA_ATTR_SKIP_CPU_SYNC | DMA_ATTR_WEAK_ORDERING);
+++=======
++ 	err = gve_reg_xsk_pool(priv, dev, pool, qid);
++ 	if (err)
++ 		goto err_xsk_pool_dma_mapped;
++ 
++ 	/* Stop and start RDA queues to repost buffers. */
++ 	if (!gve_is_qpl(priv)) {
++ 		err = gve_configure_rings_xdp(priv, priv->rx_cfg.num_queues);
++ 		if (err)
++ 			goto err_xsk_pool_registered;
++ 	}
++ 	return 0;
++ 
++ err_xsk_pool_registered:
++ 	gve_unreg_xsk_pool(priv, qid);
++ err_xsk_pool_dma_mapped:
++ 	clear_bit(qid, priv->xsk_pools);
++ 	xsk_pool_dma_unmap(pool,
++ 			   DMA_ATTR_SKIP_CPU_SYNC |
++ 			   DMA_ATTR_WEAK_ORDERING);
+++>>>>>>> c1fffc5d66a7 (gve: implement DQO RX datapath and control path for AF_XDP zero-copy)
+  	return err;
+  }
+  
+@@@ -1757,19 -1639,29 +1779,27 @@@ static int gve_xsk_pool_disable(struct 
+  	struct napi_struct *napi_tx;
+  	struct xsk_buff_pool *pool;
+  	int tx_qid;
++ 	int err;
+  
+ +	pool = xsk_get_pool_from_qid(dev, qid);
+ +	if (!pool)
+ +		return -EINVAL;
+  	if (qid >= priv->rx_cfg.num_queues)
+  		return -EINVAL;
+  
+ -	clear_bit(qid, priv->xsk_pools);
+ -
+ -	pool = xsk_get_pool_from_qid(dev, qid);
+ -	if (pool)
+ -		xsk_pool_dma_unmap(pool,
+ -				   DMA_ATTR_SKIP_CPU_SYNC |
+ -				   DMA_ATTR_WEAK_ORDERING);
+ -
+ -	if (!netif_running(dev) || !priv->tx_cfg.num_xdp_queues)
+ -		return 0;
+ +	/* If XDP prog is not installed or interface is down, unmap DMA and
+ +	 * return.
+ +	 */
+ +	if (!priv->xdp_prog || !netif_running(dev))
+ +		goto done;
+  
++ 	/* Stop and start RDA queues to repost buffers. */
++ 	if (!gve_is_qpl(priv) && priv->xdp_prog) {
++ 		err = gve_configure_rings_xdp(priv, priv->rx_cfg.num_queues);
++ 		if (err)
++ 			return err;
++ 	}
++ 
+  	napi_rx = &priv->ntfy_blocks[priv->rx[qid].ntfy_id].napi;
+  	napi_disable(napi_rx); /* make sure current rx poll is done */
+  
+@@@ -1783,16 -1673,15 +1813,18 @@@
+  	smp_mb(); /* Make sure it is visible to the workers on datapath */
+  
+  	napi_enable(napi_rx);
+- 	if (gve_rx_work_pending(&priv->rx[qid]))
+- 		napi_schedule(napi_rx);
+- 
+  	napi_enable(napi_tx);
+- 	if (gve_tx_clean_pending(priv, &priv->tx[tx_qid]))
+- 		napi_schedule(napi_tx);
++ 	if (gve_is_gqi(priv)) {
++ 		if (gve_rx_work_pending(&priv->rx[qid]))
++ 			napi_schedule(napi_rx);
++ 
++ 		if (gve_tx_clean_pending(priv, &priv->tx[tx_qid]))
++ 			napi_schedule(napi_tx);
++ 	}
+  
+ +done:
+ +	xsk_pool_dma_unmap(pool,
+ +			   DMA_ATTR_SKIP_CPU_SYNC | DMA_ATTR_WEAK_ORDERING);
+  	return 0;
+  }
+  
+diff --git a/drivers/net/ethernet/google/gve/gve.h b/drivers/net/ethernet/google/gve/gve.h
+index a27751722198..593103441bb5 100644
+--- a/drivers/net/ethernet/google/gve/gve.h
++++ b/drivers/net/ethernet/google/gve/gve.h
+@@ -188,6 +188,9 @@ struct gve_rx_buf_state_dqo {
+ 	/* The page posted to HW. */
+ 	struct gve_rx_slot_page_info page_info;
+ 
++	/* XSK buffer */
++	struct xdp_buff *xsk_buff;
++
+ 	/* The DMA address corresponding to `page_info`. */
+ 	dma_addr_t addr;
+ 
+diff --git a/drivers/net/ethernet/google/gve/gve_buffer_mgmt_dqo.c b/drivers/net/ethernet/google/gve/gve_buffer_mgmt_dqo.c
+index af84cb88f828..876aff4e4b09 100644
+--- a/drivers/net/ethernet/google/gve/gve_buffer_mgmt_dqo.c
++++ b/drivers/net/ethernet/google/gve/gve_buffer_mgmt_dqo.c
+@@ -4,6 +4,7 @@
+  * Copyright (C) 2015-2024 Google, Inc.
+  */
+ 
++#include <net/xdp_sock_drv.h>
+ #include "gve.h"
+ #include "gve_utils.h"
+ 
+@@ -29,6 +30,10 @@ struct gve_rx_buf_state_dqo *gve_alloc_buf_state(struct gve_rx_ring *rx)
+ 	/* Point buf_state to itself to mark it as allocated */
+ 	buf_state->next = buffer_id;
+ 
++	/* Clear the buffer pointers */
++	buf_state->page_info.page = NULL;
++	buf_state->xsk_buff = NULL;
++
+ 	return buf_state;
+ }
+ 
+@@ -282,7 +287,24 @@ int gve_alloc_buffer(struct gve_rx_ring *rx, struct gve_rx_desc_dqo *desc)
+ {
+ 	struct gve_rx_buf_state_dqo *buf_state;
+ 
+-	if (rx->dqo.page_pool) {
++	if (rx->xsk_pool) {
++		buf_state = gve_alloc_buf_state(rx);
++		if (unlikely(!buf_state))
++			return -ENOMEM;
++
++		buf_state->xsk_buff = xsk_buff_alloc(rx->xsk_pool);
++		if (unlikely(!buf_state->xsk_buff)) {
++			xsk_set_rx_need_wakeup(rx->xsk_pool);
++			gve_free_buf_state(rx, buf_state);
++			return -ENOMEM;
++		}
++		/* Allocated xsk buffer. Clear wakeup in case it was set. */
++		xsk_clear_rx_need_wakeup(rx->xsk_pool);
++		desc->buf_id = cpu_to_le16(buf_state - rx->dqo.buf_states);
++		desc->buf_addr =
++			cpu_to_le64(xsk_buff_xdp_get_dma(buf_state->xsk_buff));
++		return 0;
++	} else if (rx->dqo.page_pool) {
+ 		buf_state = gve_alloc_buf_state(rx);
+ 		if (WARN_ON_ONCE(!buf_state))
+ 			return -ENOMEM;
+* Unmerged path drivers/net/ethernet/google/gve/gve_main.c
+diff --git a/drivers/net/ethernet/google/gve/gve_rx_dqo.c b/drivers/net/ethernet/google/gve/gve_rx_dqo.c
+index 5cacb2d5d953..32dc88a5ca3b 100644
+--- a/drivers/net/ethernet/google/gve/gve_rx_dqo.c
++++ b/drivers/net/ethernet/google/gve/gve_rx_dqo.c
+@@ -16,6 +16,7 @@
+ #include <net/ip6_checksum.h>
+ #include <net/ipv6.h>
+ #include <net/tcp.h>
++#include <net/xdp_sock_drv.h>
+ 
+ static void gve_rx_free_hdr_bufs(struct gve_priv *priv, struct gve_rx_ring *rx)
+ {
+@@ -149,6 +150,10 @@ void gve_rx_free_ring_dqo(struct gve_priv *priv, struct gve_rx_ring *rx,
+ 			gve_free_to_page_pool(rx, bs, false);
+ 		else
+ 			gve_free_qpl_page_dqo(bs);
++		if (gve_buf_state_is_allocated(rx, bs) && bs->xsk_buff) {
++			xsk_buff_free(bs->xsk_buff);
++			bs->xsk_buff = NULL;
++		}
+ 	}
+ 
+ 	if (rx->dqo.qpl) {
+@@ -570,8 +575,11 @@ static int gve_xdp_tx_dqo(struct gve_priv *priv, struct gve_rx_ring *rx,
+ 	int err;
+ 
+ 	xdpf = xdp_convert_buff_to_frame(xdp);
+-	if (unlikely(!xdpf))
++	if (unlikely(!xdpf)) {
++		if (rx->xsk_pool)
++			xsk_buff_free(xdp);
+ 		return -ENOSPC;
++	}
+ 
+ 	tx_qid = gve_xdp_tx_queue_id(priv, rx->q_num);
+ 	tx = &priv->tx[tx_qid];
+@@ -582,6 +590,41 @@ static int gve_xdp_tx_dqo(struct gve_priv *priv, struct gve_rx_ring *rx,
+ 	return err;
+ }
+ 
++static void gve_xsk_done_dqo(struct gve_priv *priv, struct gve_rx_ring *rx,
++			     struct xdp_buff *xdp, struct bpf_prog *xprog,
++			     int xdp_act)
++{
++	switch (xdp_act) {
++	case XDP_ABORTED:
++	case XDP_DROP:
++	default:
++		xsk_buff_free(xdp);
++		break;
++	case XDP_TX:
++		if (unlikely(gve_xdp_tx_dqo(priv, rx, xdp)))
++			goto err;
++		break;
++	case XDP_REDIRECT:
++		if (unlikely(xdp_do_redirect(priv->dev, xdp, xprog)))
++			goto err;
++		break;
++	}
++
++	u64_stats_update_begin(&rx->statss);
++	if ((u32)xdp_act < GVE_XDP_ACTIONS)
++		rx->xdp_actions[xdp_act]++;
++	u64_stats_update_end(&rx->statss);
++	return;
++
++err:
++	u64_stats_update_begin(&rx->statss);
++	if (xdp_act == XDP_TX)
++		rx->xdp_tx_errors++;
++	if (xdp_act == XDP_REDIRECT)
++		rx->xdp_redirect_errors++;
++	u64_stats_update_end(&rx->statss);
++}
++
+ static void gve_xdp_done_dqo(struct gve_priv *priv, struct gve_rx_ring *rx,
+ 			     struct xdp_buff *xdp, struct bpf_prog *xprog,
+ 			     int xdp_act,
+@@ -623,6 +666,48 @@ static void gve_xdp_done_dqo(struct gve_priv *priv, struct gve_rx_ring *rx,
+ 	return;
+ }
+ 
++static int gve_rx_xsk_dqo(struct napi_struct *napi, struct gve_rx_ring *rx,
++			  struct gve_rx_buf_state_dqo *buf_state, int buf_len,
++			  struct bpf_prog *xprog)
++{
++	struct xdp_buff *xdp = buf_state->xsk_buff;
++	struct gve_priv *priv = rx->gve;
++	int xdp_act;
++
++	xdp->data_end = xdp->data + buf_len;
++	xsk_buff_dma_sync_for_cpu(xdp);
++
++	if (xprog) {
++		xdp_act = bpf_prog_run_xdp(xprog, xdp);
++		buf_len = xdp->data_end - xdp->data;
++		if (xdp_act != XDP_PASS) {
++			gve_xsk_done_dqo(priv, rx, xdp, xprog, xdp_act);
++			gve_free_buf_state(rx, buf_state);
++			return 0;
++		}
++	}
++
++	/* Copy the data to skb */
++	rx->ctx.skb_head = gve_rx_copy_data(priv->dev, napi,
++					    xdp->data, buf_len);
++	if (unlikely(!rx->ctx.skb_head)) {
++		xsk_buff_free(xdp);
++		gve_free_buf_state(rx, buf_state);
++		return -ENOMEM;
++	}
++	rx->ctx.skb_tail = rx->ctx.skb_head;
++
++	/* Free XSK buffer and Buffer state */
++	xsk_buff_free(xdp);
++	gve_free_buf_state(rx, buf_state);
++
++	/* Update Stats */
++	u64_stats_update_begin(&rx->statss);
++	rx->xdp_actions[XDP_PASS]++;
++	u64_stats_update_end(&rx->statss);
++	return 0;
++}
++
+ /* Returns 0 if descriptor is completed successfully.
+  * Returns -EINVAL if descriptor is invalid.
+  * Returns -ENOMEM if data cannot be copied to skb.
+@@ -661,7 +746,11 @@ static int gve_rx_dqo(struct napi_struct *napi, struct gve_rx_ring *rx,
+ 	buf_len = compl_desc->packet_len;
+ 	hdr_len = compl_desc->header_len;
+ 
+-	/* Page might have not been used for a while and was likely last written
++	xprog = READ_ONCE(priv->xdp_prog);
++	if (buf_state->xsk_buff)
++		return gve_rx_xsk_dqo(napi, rx, buf_state, buf_len, xprog);
++
++	/* Page might have not been used for awhile and was likely last written
+ 	 * by a different thread.
+ 	 */
+ 	if (rx->dqo.page_pool) {
+@@ -710,7 +799,6 @@ static int gve_rx_dqo(struct napi_struct *napi, struct gve_rx_ring *rx,
+ 		return 0;
+ 	}
+ 
+-	xprog = READ_ONCE(priv->xdp_prog);
+ 	if (xprog) {
+ 		struct xdp_buff xdp;
+ 		void *old_data;
