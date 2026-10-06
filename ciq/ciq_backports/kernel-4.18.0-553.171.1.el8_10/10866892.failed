@@ -1,0 +1,159 @@
+gfs2: Move gfs2_remove_from_journal to log.c
+
+jira KERNEL-1718
+cve CVE-2026-53049
+Rebuild_History Non-Buildable kernel-4.18.0-553.171.1.el8_10
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 10866892c79159168459289a1288df4163e94d67
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.171.1.el8_10/10866892.failed
+
+Move gfs2_remove_from_journal() from meta_io.c to log.c and fix a minor
+indentation glitch.
+
+With that, gfs2_remove_from_ail() is now only used inside log.c, so it
+can be made static.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 10866892c79159168459289a1288df4163e94d67)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/log.h
+#	fs/gfs2/meta_io.c
+diff --cc fs/gfs2/log.h
+index bc9444504029,10beda62427c..000000000000
+--- a/fs/gfs2/log.h
++++ b/fs/gfs2/log.h
+@@@ -50,7 -46,8 +49,12 @@@ void gfs2_log_reserve(struct gfs2_sbd *
+  		      unsigned int *extra_revokes);
+  void gfs2_write_log_header(struct gfs2_sbd *sdp, struct gfs2_jdesc *jd,
+  			   u64 seq, u32 tail, u32 lblock, u32 flags,
+++<<<<<<< HEAD
+ +			   int op_flags);
+++=======
++ 			   blk_opf_t op_flags);
++ void gfs2_remove_from_journal(struct buffer_head *bh, int meta);
+++>>>>>>> 10866892c791 (gfs2: Move gfs2_remove_from_journal to log.c)
+  void gfs2_log_flush(struct gfs2_sbd *sdp, struct gfs2_glock *gl,
+  		    u32 type);
+  void gfs2_log_commit(struct gfs2_sbd *sdp, struct gfs2_trans *trans);
+diff --cc fs/gfs2/meta_io.c
+index 83b6f0e454b3,d407dd476e72..000000000000
+--- a/fs/gfs2/meta_io.c
++++ b/fs/gfs2/meta_io.c
+@@@ -333,41 -338,6 +333,44 @@@ int gfs2_meta_wait(struct gfs2_sbd *sdp
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +void gfs2_remove_from_journal(struct buffer_head *bh, int meta)
+ +{
+ +	struct address_space *mapping = bh->b_page->mapping;
+ +	struct gfs2_sbd *sdp = gfs2_mapping2sbd(mapping);
+ +	struct gfs2_bufdata *bd = bh->b_private;
+ +	struct gfs2_trans *tr = current->journal_info;
+ +	int was_pinned = 0;
+ +
+ +	if (test_clear_buffer_pinned(bh)) {
+ +		trace_gfs2_pin(bd, 0);
+ +		atomic_dec(&sdp->sd_log_pinned);
+ +		list_del_init(&bd->bd_list);
+ +		if (meta == REMOVE_META)
+ +			tr->tr_num_buf_rm++;
+ +		else
+ +			tr->tr_num_databuf_rm++;
+ +		set_bit(TR_TOUCHED, &tr->tr_flags);
+ +		was_pinned = 1;
+ +		brelse(bh);
+ +	}
+ +	if (bd) {
+ +		if (bd->bd_tr) {
+ +			gfs2_trans_add_revoke(sdp, bd);
+ +		} else if (was_pinned) {
+ +			bh->b_private = NULL;
+ +			kmem_cache_free(gfs2_bufdata_cachep, bd);
+ +		} else if (!list_empty(&bd->bd_ail_st_list) &&
+ +					!list_empty(&bd->bd_ail_gl_list)) {
+ +			gfs2_remove_from_ail(bd);
+ +		}
+ +	}
+ +	clear_buffer_dirty(bh);
+ +	clear_buffer_uptodate(bh);
+ +}
+ +
+++=======
+++>>>>>>> 10866892c791 (gfs2: Move gfs2_remove_from_journal to log.c)
+  /**
+   * gfs2_ail1_wipe - remove deleted/freed buffers from the ail1 list
+   * @sdp: superblock
+diff --git a/fs/gfs2/log.c b/fs/gfs2/log.c
+index 8a74ee365b34..434f9e1c1acc 100644
+--- a/fs/gfs2/log.c
++++ b/fs/gfs2/log.c
+@@ -75,7 +75,7 @@ unsigned int gfs2_struct2blk(struct gfs2_sbd *sdp, unsigned int nstruct)
+  *
+  */
+ 
+-void gfs2_remove_from_ail(struct gfs2_bufdata *bd)
++static void gfs2_remove_from_ail(struct gfs2_bufdata *bd)
+ {
+ 	bd->bd_tr = NULL;
+ 	list_del_init(&bd->bd_ail_st_list);
+@@ -963,6 +963,41 @@ static void trans_drain(struct gfs2_trans *tr)
+ 	}
+ }
+ 
++void gfs2_remove_from_journal(struct buffer_head *bh, int meta)
++{
++	struct address_space *mapping = bh->b_folio->mapping;
++	struct gfs2_sbd *sdp = gfs2_mapping2sbd(mapping);
++	struct gfs2_bufdata *bd = bh->b_private;
++	struct gfs2_trans *tr = current->journal_info;
++	int was_pinned = 0;
++
++	if (test_clear_buffer_pinned(bh)) {
++		trace_gfs2_pin(bd, 0);
++		atomic_dec(&sdp->sd_log_pinned);
++		list_del_init(&bd->bd_list);
++		if (meta == REMOVE_META)
++			tr->tr_num_buf_rm++;
++		else
++			tr->tr_num_databuf_rm++;
++		set_bit(TR_TOUCHED, &tr->tr_flags);
++		was_pinned = 1;
++		brelse(bh);
++	}
++	if (bd) {
++		if (bd->bd_tr) {
++			gfs2_trans_add_revoke(sdp, bd);
++		} else if (was_pinned) {
++			bh->b_private = NULL;
++			kmem_cache_free(gfs2_bufdata_cachep, bd);
++		} else if (!list_empty(&bd->bd_ail_st_list) &&
++			   !list_empty(&bd->bd_ail_gl_list)) {
++			gfs2_remove_from_ail(bd);
++		}
++	}
++	clear_buffer_dirty(bh);
++	clear_buffer_uptodate(bh);
++}
++
+ /**
+  * gfs2_log_flush - flush incore transaction(s)
+  * @sdp: the filesystem
+* Unmerged path fs/gfs2/log.h
+* Unmerged path fs/gfs2/meta_io.c
+diff --git a/fs/gfs2/meta_io.h b/fs/gfs2/meta_io.h
+index bb592a912aa8..9856ae456d21 100644
+--- a/fs/gfs2/meta_io.h
++++ b/fs/gfs2/meta_io.h
+@@ -62,7 +62,6 @@ enum {
+ 	REMOVE_META = 1,
+ };
+ 
+-void gfs2_remove_from_journal(struct buffer_head *bh, int meta);
+ void gfs2_journal_wipe(struct gfs2_inode *ip, u64 bstart, u32 blen);
+ int gfs2_meta_buffer(struct gfs2_inode *ip, u32 mtype, u64 num,
+ 		     struct buffer_head **bhp);
