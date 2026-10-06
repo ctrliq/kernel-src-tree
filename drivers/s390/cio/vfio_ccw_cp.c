@@ -16,6 +16,7 @@
 #include <asm/idals.h>
 
 #include "vfio_ccw_cp.h"
+#include "vfio_ccw_private.h"
 
 struct pfn_array {
 	/* Starting guest physical I/O address. */
@@ -235,6 +236,7 @@ static long copy_from_iova(struct device *mdev,
 }
 
 #define idal_is_2k(_cp) (!(_cp)->orb.cmd.c64 || (_cp)->orb.cmd.i2k)
+#define get_idaw_size(_cp) ((_cp)->orb.cmd.c64 ? sizeof(u64) : sizeof(u32))
 
 /*
  * Helpers to operate ccwchain.
@@ -476,7 +478,7 @@ static int ccwchain_loop_tic(struct ccwchain *chain, struct channel_program *cp)
 	return 0;
 }
 
-static int ccwchain_build_ccws(dma32_t cda, struct channel_program *cp)
+static int ccwchain_build_ccws(u32 cda, struct channel_program *cp)
 {
 	struct ccwchain *chain, *temp;
 	int ret;
@@ -517,7 +519,8 @@ static unsigned long *get_guest_idal(struct ccw1 *ccw,
 {
 	unsigned long *idaws;
 	unsigned int *idaws_f1;
-	int idal_len = idaw_nr * sizeof(*idaws);
+	u64 first_idaw;
+	int idal_len = idaw_nr * get_idaw_size(cp);
 	int idaw_size = idal_is_2k(cp) ? PAGE_SIZE / 2 : PAGE_SIZE;
 	int idaw_mask = ~(idaw_size - 1);
 	int i, ret;
@@ -532,6 +535,18 @@ static unsigned long *get_guest_idal(struct ccw1 *ccw,
 		if (ret) {
 			kfree(idaws);
 			return ERR_PTR(ret);
+		}
+
+		idaws_f1 = (unsigned int *)idaws;
+		if (cp->orb.cmd.c64)
+			first_idaw = idaws[0];
+		else
+			first_idaw = idaws_f1[0];
+
+		/* Unexpected mismatch from earlier read */
+		if (first_idaw != cp->guest_iova) {
+			kfree(idaws);
+			return ERR_PTR(-EINVAL);
 		}
 	} else {
 		/* Fabricate an IDAL based off CCW data address */
@@ -568,7 +583,7 @@ static int ccw_count_idaws(struct ccw1 *ccw,
 			   struct channel_program *cp)
 {
 	u64 iova;
-	int size = cp->orb.cmd.c64 ? sizeof(u64) : sizeof(u32);
+	int size = get_idaw_size(cp);
 	int ret;
 	int bytes = 1;
 
@@ -591,6 +606,9 @@ static int ccw_count_idaws(struct ccw1 *ccw,
 	} else {
 		iova = ccw->cda;
 	}
+
+	/* Save the read address for later */
+	cp->guest_iova = iova;
 
 	/* Format-1 IDAWs operate on 2K each */
 	if (!cp->orb.cmd.c64)
@@ -946,17 +964,23 @@ void cp_update_scsw(struct channel_program *cp, union scsw *scsw)
  */
 bool cp_iova_pinned(struct channel_program *cp, u64 iova)
 {
+	struct vfio_ccw_private *private =
+		container_of(cp, struct vfio_ccw_private, cp);
 	struct ccwchain *chain;
 	int i;
 
 	if (!cp->initialized)
 		return false;
 
+	mutex_lock(&private->io_mutex);
 	list_for_each_entry(chain, &cp->ccwchain_list, next) {
 		for (i = 0; i < chain->ch_len; i++)
-			if (pfn_array_iova_pinned(chain->ch_pa + i, iova))
+			if (pfn_array_iova_pinned(chain->ch_pa + i, iova)) {
+				mutex_unlock(&private->io_mutex);
 				return true;
+			}
 	}
+	mutex_unlock(&private->io_mutex);
 
 	return false;
 }

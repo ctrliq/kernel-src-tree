@@ -401,7 +401,7 @@ void bnxt_re_synchronize_nq(struct bnxt_qplib_nq *nq)
 	int budget = nq->budget;
 
 	nq->budget = nq->hwq.max_elements;
-	bnxt_qplib_service_nq(&nq->nq_tasklet);
+	bnxt_qplib_service_nq((unsigned long)nq);
 	nq->budget = budget;
 }
 

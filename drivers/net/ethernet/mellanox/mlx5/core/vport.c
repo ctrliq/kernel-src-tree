@@ -265,7 +265,7 @@ static int mlx5_vport_max_mac_list_size(struct mlx5_core_dev *dev, u16 vport,
 	if (!query_ctx)
 		return -ENOMEM;
 
-	ret = mlx5_vport_get_other_func_general_cap(dev, vport, query_ctx);
+	ret = mlx5_vport_get_other_func_cap(dev, vport, query_ctx);
 	if (ret)
 		goto out;
 
