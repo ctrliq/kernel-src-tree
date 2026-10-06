@@ -1,0 +1,246 @@
+gve: keep registry of zc xsk pools in netdev_priv
+
+jira KERNEL-1712
+Rebuild_History Non-Buildable kernel-6.12.0-211.62.1.el10_2
+commit-author Joshua Washington <joshwash@google.com>
+commit 652fe13b1fd841528442c22170a3c9030c17822d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.62.1.el10_2/652fe13b.failed
+
+Relying on xsk_get_pool_from_qid for getting whether zero copy is
+enabled on a queue is erroneous, as an XSK pool is registered in
+xp_assign_dev whether AF_XDP zero-copy is enabled or not. This becomes
+problematic when queues are restarted in copy mode, as all RX queues
+with XSKs will register a pool, causing the driver to exercise the
+zero-copy codepath.
+
+This patch adds a bitmap to keep track of which queues have zero-copy
+enabled.
+
+	Reviewed-by: Willem de Bruijn <willemb@google.com>
+	Signed-off-by: Joshua Washington <joshwash@google.com>
+	Signed-off-by: Jeroen de Borst <jeroendb@google.com>
+Link: https://patch.msgid.link/20250717152839.973004-4-jeroendb@google.com
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+
+(cherry picked from commit 652fe13b1fd841528442c22170a3c9030c17822d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/google/gve/gve.h
+#	drivers/net/ethernet/google/gve/gve_main.c
+diff --cc drivers/net/ethernet/google/gve/gve.h
+index 11792125b717,9925c08e595e..000000000000
+--- a/drivers/net/ethernet/google/gve/gve.h
++++ b/drivers/net/ethernet/google/gve/gve.h
+@@@ -786,10 -800,11 +786,18 @@@ struct gve_priv 
+  	u32 rx_copybreak; /* copy packets smaller than this */
+  	u16 default_num_queues; /* default num queues to set up */
+  
+++<<<<<<< HEAD
+ +	u16 num_xdp_queues;
+ +	struct gve_queue_config tx_cfg;
+ +	struct gve_queue_config rx_cfg;
+ +	u32 num_ntfy_blks; /* spilt between TX and RX so must be even */
+++=======
++ 	struct gve_tx_queue_config tx_cfg;
++ 	struct gve_rx_queue_config rx_cfg;
++ 	unsigned long *xsk_pools; /* bitmap of RX queues with XSK pools */
++ 	u32 num_ntfy_blks; /* split between TX and RX so must be even */
++ 	int numa_node;
+++>>>>>>> 652fe13b1fd8 (gve: keep registry of zc xsk pools in netdev_priv)
+  
+  	struct gve_registers __iomem *reg_bar0; /* see gve_register.h */
+  	__be32 __iomem *db_bar2; /* "array" of doorbells */
+diff --cc drivers/net/ethernet/google/gve/gve_main.c
+index 240de2b7b443,d5953f5d1895..000000000000
+--- a/drivers/net/ethernet/google/gve/gve_main.c
++++ b/drivers/net/ethernet/google/gve/gve_main.c
+@@@ -1256,6 -1159,71 +1257,74 @@@ static int gve_reset_recovery(struct gv
+  static void gve_turndown(struct gve_priv *priv);
+  static void gve_turnup(struct gve_priv *priv);
+  
+++<<<<<<< HEAD
+++=======
++ static void gve_unreg_xsk_pool(struct gve_priv *priv, u16 qid)
++ {
++ 	struct gve_rx_ring *rx;
++ 
++ 	if (!priv->rx)
++ 		return;
++ 
++ 	rx = &priv->rx[qid];
++ 	rx->xsk_pool = NULL;
++ 	if (xdp_rxq_info_is_reg(&rx->xdp_rxq))
++ 		xdp_rxq_info_unreg_mem_model(&rx->xdp_rxq);
++ 
++ 	if (!priv->tx)
++ 		return;
++ 	priv->tx[gve_xdp_tx_queue_id(priv, qid)].xsk_pool = NULL;
++ }
++ 
++ static int gve_reg_xsk_pool(struct gve_priv *priv, struct net_device *dev,
++ 			    struct xsk_buff_pool *pool, u16 qid)
++ {
++ 	struct gve_rx_ring *rx;
++ 	u16 tx_qid;
++ 	int err;
++ 
++ 	rx = &priv->rx[qid];
++ 	err = xdp_rxq_info_reg_mem_model(&rx->xdp_rxq,
++ 					 MEM_TYPE_XSK_BUFF_POOL, pool);
++ 	if (err) {
++ 		gve_unreg_xsk_pool(priv, qid);
++ 		return err;
++ 	}
++ 
++ 	rx->xsk_pool = pool;
++ 
++ 	tx_qid = gve_xdp_tx_queue_id(priv, qid);
++ 	priv->tx[tx_qid].xsk_pool = pool;
++ 
++ 	return 0;
++ }
++ 
++ static void gve_unreg_xdp_info(struct gve_priv *priv)
++ {
++ 	int i;
++ 
++ 	if (!priv->tx_cfg.num_xdp_queues || !priv->rx)
++ 		return;
++ 
++ 	for (i = 0; i < priv->rx_cfg.num_queues; i++) {
++ 		struct gve_rx_ring *rx = &priv->rx[i];
++ 
++ 		if (xdp_rxq_info_is_reg(&rx->xdp_rxq))
++ 			xdp_rxq_info_unreg(&rx->xdp_rxq);
++ 
++ 		gve_unreg_xsk_pool(priv, i);
++ 	}
++ }
++ 
++ static struct xsk_buff_pool *gve_get_xsk_pool(struct gve_priv *priv, int qid)
++ {
++ 	if (!test_bit(qid, priv->xsk_pools))
++ 		return NULL;
++ 
++ 	return xsk_get_pool_from_qid(priv->dev, qid);
++ }
++ 
+++>>>>>>> 652fe13b1fd8 (gve: keep registry of zc xsk pools in netdev_priv)
+  static int gve_reg_xdp_info(struct gve_priv *priv, struct net_device *dev)
+  {
+  	struct napi_struct *napi;
+@@@ -1275,28 -1244,20 +1344,43 @@@
+  				       napi->napi_id);
+  		if (err)
+  			goto err;
+++<<<<<<< HEAD
+ +		err = xdp_rxq_info_reg_mem_model(&rx->xdp_rxq,
+ +						 MEM_TYPE_PAGE_SHARED, NULL);
+++=======
++ 
++ 		xsk_pool = gve_get_xsk_pool(priv, i);
++ 		if (xsk_pool)
++ 			err = gve_reg_xsk_pool(priv, dev, xsk_pool, i);
++ 		else if (gve_is_qpl(priv))
++ 			err = xdp_rxq_info_reg_mem_model(&rx->xdp_rxq,
++ 							 MEM_TYPE_PAGE_SHARED,
++ 							 NULL);
++ 		else
++ 			err = xdp_rxq_info_reg_mem_model(&rx->xdp_rxq,
++ 							 MEM_TYPE_PAGE_POOL,
++ 							 rx->dqo.page_pool);
+++>>>>>>> 652fe13b1fd8 (gve: keep registry of zc xsk pools in netdev_priv)
+  		if (err)
+  			goto err;
+ +		rx->xsk_pool = xsk_get_pool_from_qid(dev, i);
+ +		if (rx->xsk_pool) {
+ +			err = xdp_rxq_info_reg(&rx->xsk_rxq, dev, i,
+ +					       napi->napi_id);
+ +			if (err)
+ +				goto err;
+ +			err = xdp_rxq_info_reg_mem_model(&rx->xsk_rxq,
+ +							 MEM_TYPE_XSK_BUFF_POOL, NULL);
+ +			if (err)
+ +				goto err;
+ +			xsk_pool_set_rxq_info(rx->xsk_pool,
+ +					      &rx->xsk_rxq);
+ +		}
+ +	}
+ +
+ +	for (i = 0; i < priv->num_xdp_queues; i++) {
+ +		tx_qid = gve_xdp_tx_queue_id(priv, i);
+ +		priv->tx[tx_qid].xsk_pool = xsk_get_pool_from_qid(dev, i);
+  	}
+  	return 0;
+  
+@@@ -1716,30 -1603,14 +1802,40 @@@ static int gve_xsk_pool_enable(struct n
+  	if (!priv->xdp_prog || !netif_running(dev))
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	rx = &priv->rx[qid];
+ +	napi = &priv->ntfy_blocks[rx->ntfy_id].napi;
+ +	err = xdp_rxq_info_reg(&rx->xsk_rxq, dev, qid, napi->napi_id);
+ +	if (err)
+ +		goto err;
+++=======
++ 	err = gve_reg_xsk_pool(priv, dev, pool, qid);
++ 	if (err) {
++ 		clear_bit(qid, priv->xsk_pools);
++ 		xsk_pool_dma_unmap(pool,
++ 				   DMA_ATTR_SKIP_CPU_SYNC |
++ 				   DMA_ATTR_WEAK_ORDERING);
++ 	}
+++>>>>>>> 652fe13b1fd8 (gve: keep registry of zc xsk pools in netdev_priv)
+ +
+ +	err = xdp_rxq_info_reg_mem_model(&rx->xsk_rxq,
+ +					 MEM_TYPE_XSK_BUFF_POOL, NULL);
+ +	if (err)
+ +		goto err;
+ +
+ +	xsk_pool_set_rxq_info(pool, &rx->xsk_rxq);
+ +	rx->xsk_pool = pool;
+ +
+ +	tx_qid = gve_xdp_tx_queue_id(priv, qid);
+ +	priv->tx[tx_qid].xsk_pool = pool;
+ +
+ +	return 0;
+ +err:
+ +	if (xdp_rxq_info_is_reg(&rx->xsk_rxq))
+ +		xdp_rxq_info_unreg(&rx->xsk_rxq);
+  
+ +	xsk_pool_dma_unmap(pool,
+ +			   DMA_ATTR_SKIP_CPU_SYNC | DMA_ATTR_WEAK_ORDERING);
+  	return err;
+  }
+  
+@@@ -1758,11 -1626,16 +1854,24 @@@ static int gve_xsk_pool_disable(struct 
+  	if (qid >= priv->rx_cfg.num_queues)
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	/* If XDP prog is not installed or interface is down, unmap DMA and
+ +	 * return.
+ +	 */
+ +	if (!priv->xdp_prog || !netif_running(dev))
+ +		goto done;
+++=======
++ 	clear_bit(qid, priv->xsk_pools);
++ 
++ 	pool = xsk_get_pool_from_qid(dev, qid);
++ 	if (pool)
++ 		xsk_pool_dma_unmap(pool,
++ 				   DMA_ATTR_SKIP_CPU_SYNC |
++ 				   DMA_ATTR_WEAK_ORDERING);
++ 
++ 	if (!netif_running(dev) || !priv->tx_cfg.num_xdp_queues)
++ 		return 0;
+++>>>>>>> 652fe13b1fd8 (gve: keep registry of zc xsk pools in netdev_priv)
+  
+  	napi_rx = &priv->ntfy_blocks[priv->rx[qid].ntfy_id].napi;
+  	napi_disable(napi_rx); /* make sure current rx poll is done */
+* Unmerged path drivers/net/ethernet/google/gve/gve.h
+* Unmerged path drivers/net/ethernet/google/gve/gve_main.c
