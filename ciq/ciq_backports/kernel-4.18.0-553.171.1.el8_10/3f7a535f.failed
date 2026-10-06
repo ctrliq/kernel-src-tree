@@ -1,0 +1,197 @@
+ipvs: ensure inner headers in ICMP errors are in headroom
+
+jira KERNEL-1718
+Rebuild_History Non-Buildable kernel-4.18.0-553.171.1.el8_10
+commit-author Julian Anastasov <ja@ssi.bg>
+commit 3f7a535ff0fa627a0132803e4c2f903ceffcbc1c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.171.1.el8_10/3f7a535f.failed
+
+Sashiko points out that after stripping the outer headers
+with pskb_pull() we should ensure the inner IP headers
+in ICMP errors from tunnels are present in the skb headroom
+for functions like ipv4_update_pmtu(), icmp_send() and
+IP_VS_DBG().
+
+Also, add more checks for the length of the inner headers.
+
+Fixes: f2edb9f7706d ("ipvs: implement passive PMTUD for IPIP packets")
+Link: https://sashiko.dev/#/patchset/20260702073430.67680-1-zhaoyz24%40mails.tsinghua.edu.cn
+	Signed-off-by: Julian Anastasov <ja@ssi.bg>
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+(cherry picked from commit 3f7a535ff0fa627a0132803e4c2f903ceffcbc1c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/ipvs/ip_vs_core.c
+diff --cc net/netfilter/ipvs/ip_vs_core.c
+index fdbf7425ad0a,35cbe821c259..000000000000
+--- a/net/netfilter/ipvs/ip_vs_core.c
++++ b/net/netfilter/ipvs/ip_vs_core.c
+@@@ -1561,7 -1764,11 +1561,15 @@@ ip_vs_in_icmp(struct netns_ipvs *ipvs, 
+  	struct ip_vs_protocol *pp;
+  	struct ip_vs_proto_data *pd;
+  	unsigned int offset, offset2, ihl, verdict;
+++<<<<<<< HEAD
+ +	bool ipip, new_cp = false;
+++=======
++ 	bool tunnel, new_cp = false;
++ 	union nf_inet_addr *raddr;
++ 	char *outer_proto = "IPIP";
++ 	unsigned int hlen_ipip;
++ 	int ulen = 0;
+++>>>>>>> 3f7a535ff0fa (ipvs: ensure inner headers in ICMP errors are in headroom)
+  
+  	*related = 1;
+  
+@@@ -1598,22 -1805,61 +1606,70 @@@
+  	/* Now find the contained IP header */
+  	offset += sizeof(_icmph);
+  	cih = skb_header_pointer(skb, offset, sizeof(_ciph), &_ciph);
+- 	if (cih == NULL)
++ 	if (!(cih && cih->version == 4 && cih->ihl >= 5))
+  		return NF_ACCEPT; /* The packet looks wrong, ignore */
+++<<<<<<< HEAD
+++=======
++ 	raddr = (union nf_inet_addr *)&cih->daddr;
++ 	hlen_ipip = cih->ihl * 4;
+++>>>>>>> 3f7a535ff0fa (ipvs: ensure inner headers in ICMP errors are in headroom)
+  
+ -	/* Special case for errors for IPIP/UDP/GRE tunnel packets */
+ -	tunnel = false;
+ +	/* Special case for errors for IPIP packets */
+ +	ipip = false;
+  	if (cih->protocol == IPPROTO_IPIP) {
+ -		struct ip_vs_dest *dest;
+ -
+  		if (unlikely(cih->frag_off & htons(IP_OFFSET)))
+  			return NF_ACCEPT;
+  		/* Error for our IPIP must arrive at LOCAL_IN */
+  		if (!(skb_rtable(skb)->rt_flags & RTCF_LOCAL))
+  			return NF_ACCEPT;
+++<<<<<<< HEAD
+ +		offset += cih->ihl * 4;
+++=======
++ 		dest = ip_vs_find_tunnel(ipvs, AF_INET, raddr, 0);
++ 		/* Only for known tunnel */
++ 		if (!dest || dest->tun_type != IP_VS_CONN_F_TUNNEL_TYPE_IPIP)
++ 			return NF_ACCEPT;
++ 		offset += hlen_ipip;
+++>>>>>>> 3f7a535ff0fa (ipvs: ensure inner headers in ICMP errors are in headroom)
+  		cih = skb_header_pointer(skb, offset, sizeof(_ciph), &_ciph);
+- 		if (cih == NULL)
++ 		if (!(cih && cih->version == 4 && cih->ihl >= 5))
+  			return NF_ACCEPT; /* The packet looks wrong, ignore */
+++<<<<<<< HEAD
+ +		ipip = true;
+++=======
++ 		tunnel = true;
++ 	} else if ((cih->protocol == IPPROTO_UDP ||	/* Can be UDP encap */
++ 		    cih->protocol == IPPROTO_GRE) &&	/* Can be GRE encap */
++ 		   /* Error for our tunnel must arrive at LOCAL_IN */
++ 		   (skb_rtable(skb)->rt_flags & RTCF_LOCAL)) {
++ 		__u8 iproto;
++ 
++ 		/* Non-first fragment has no UDP/GRE header */
++ 		if (unlikely(cih->frag_off & htons(IP_OFFSET)))
++ 			return NF_ACCEPT;
++ 		offset2 = offset + hlen_ipip;
++ 		if (cih->protocol == IPPROTO_UDP) {
++ 			ulen = ipvs_udp_decap(ipvs, skb, offset2, AF_INET,
++ 					      raddr, &iproto);
++ 			outer_proto = "UDP";
++ 		} else {
++ 			ulen = ipvs_gre_decap(ipvs, skb, offset2, AF_INET,
++ 					      raddr, &iproto);
++ 			outer_proto = "GRE";
++ 		}
++ 		if (ulen > 0) {
++ 			/* Skip IP and UDP/GRE tunnel headers */
++ 			offset = offset2 + ulen;
++ 			/* Now we should be at the original IP header */
++ 			cih = skb_header_pointer(skb, offset, sizeof(_ciph),
++ 						 &_ciph);
++ 			if (cih && cih->version == 4 && cih->ihl >= 5 &&
++ 			    iproto == IPPROTO_IPIP)
++ 				tunnel = true;
++ 			else
++ 				return NF_ACCEPT;
++ 		}
+++>>>>>>> 3f7a535ff0fa (ipvs: ensure inner headers in ICMP errors are in headroom)
+  	}
+  
+  	pd = ip_vs_proto_data_get(ipvs, cih->protocol);
+@@@ -1659,7 -1906,8 +1715,12 @@@
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (ipip) {
+++=======
++ 	if (tunnel) {
++ 		unsigned int hlen_orig = cih->ihl * 4;
+++>>>>>>> 3f7a535ff0fa (ipvs: ensure inner headers in ICMP errors are in headroom)
+  		__be32 info = ic->un.gateway;
+  		__u8 type = ic->type;
+  		__u8 code = ic->code;
+@@@ -1671,18 -1919,21 +1732,28 @@@
+  			u32 mtu = ntohs(ic->un.frag.mtu);
+  			__be16 frag_off = cih->frag_off;
+  
+ -			/* Strip outer IP and ICMP, go to IPIP/UDP/GRE header */
+ +			/* Strip outer IP and ICMP, go to IPIP header */
+  			if (pskb_pull(skb, ihl + sizeof(_icmph)) == NULL)
+ -				goto ignore_tunnel;
+ +				goto ignore_ipip;
+  			offset2 -= ihl + sizeof(_icmph);
+  			skb_reset_network_header(skb);
+++<<<<<<< HEAD
+ +			IP_VS_DBG(12, "ICMP for IPIP %pI4->%pI4: mtu=%u\n",
+ +				&ip_hdr(skb)->saddr, &ip_hdr(skb)->daddr, mtu);
+ +			ipv4_update_pmtu(skb, ipvs->net,
+ +					 mtu, 0, 0, 0, 0);
+++=======
++ 			/* Ensure the IP header is present in headroom */
++ 			if (!pskb_may_pull(skb, hlen_ipip))
++ 				goto ignore_tunnel;
++ 			IP_VS_DBG(12, "ICMP for %s %pI4->%pI4: mtu=%u\n",
++ 				  outer_proto, &ip_hdr(skb)->saddr,
++ 				  &ip_hdr(skb)->daddr, mtu);
++ 			ipv4_update_pmtu(skb, ipvs->net, mtu, 0, 0);
+++>>>>>>> 3f7a535ff0fa (ipvs: ensure inner headers in ICMP errors are in headroom)
+  			/* Client uses PMTUD? */
+  			if (!(frag_off & htons(IP_DF)))
+ -				goto ignore_tunnel;
+ +				goto ignore_ipip;
+  			/* Prefer the resulting PMTU */
+  			if (dest) {
+  				struct ip_vs_dest_dst *dest_dst;
+@@@ -1691,16 -1942,19 +1762,24 @@@
+  				if (dest_dst)
+  					mtu = dst_mtu(dest_dst->dst_cache);
+  			}
+++<<<<<<< HEAD
+ +			if (mtu > 68 + sizeof(struct iphdr))
+ +				mtu -= sizeof(struct iphdr);
+++=======
++ 			if (mtu > 68 + hlen_ipip + ulen)
++ 				mtu -= hlen_ipip + ulen;
+++>>>>>>> 3f7a535ff0fa (ipvs: ensure inner headers in ICMP errors are in headroom)
+  			info = htonl(mtu);
+  		}
+ -		/* Strip outer IP, ICMP and IPIP/UDP/GRE, go to IP header of
+ +		/* Strip outer IP, ICMP and IPIP, go to IP header of
+  		 * original request.
+  		 */
+  		if (pskb_pull(skb, offset2) == NULL)
+ -			goto ignore_tunnel;
+ +			goto ignore_ipip;
+  		skb_reset_network_header(skb);
++ 		/* Ensure the IP header is present in headroom */
++ 		if (!pskb_may_pull(skb, hlen_orig))
++ 			goto ignore_tunnel;
+  		IP_VS_DBG(12, "Sending ICMP for %pI4->%pI4: t=%u, c=%u, i=%u\n",
+  			&ip_hdr(skb)->saddr, &ip_hdr(skb)->daddr,
+  			type, code, ntohl(info));
+* Unmerged path net/netfilter/ipvs/ip_vs_core.c
