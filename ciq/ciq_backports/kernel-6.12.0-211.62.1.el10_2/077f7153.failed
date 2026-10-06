@@ -1,0 +1,157 @@
+gve: merge xdp and xsk registration
+
+jira KERNEL-1712
+Rebuild_History Non-Buildable kernel-6.12.0-211.62.1.el10_2
+commit-author Joshua Washington <joshwash@google.com>
+commit 077f7153fd2582874b0dec8c8fcd687677d0f4cc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.62.1.el10_2/077f7153.failed
+
+The existence of both of these xdp_rxq and xsk_rxq is redundant. xdp_rxq
+can be used in both the zero-copy mode and the copy mode case. XSK pool
+memory model registration is prioritized over normal memory model
+registration to ensure that memory model registration happens only once
+per queue.
+
+	Reviewed-by: Willem de Bruijn <willemb@google.com>
+	Signed-off-by: Joshua Washington <joshwash@google.com>
+	Signed-off-by: Jeroen de Borst <jeroendb@google.com>
+Link: https://patch.msgid.link/20250717152839.973004-3-jeroendb@google.com
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+
+(cherry picked from commit 077f7153fd2582874b0dec8c8fcd687677d0f4cc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/google/gve/gve_main.c
+diff --cc drivers/net/ethernet/google/gve/gve_main.c
+index 240de2b7b443,cf8e1abdfa8e..000000000000
+--- a/drivers/net/ethernet/google/gve/gve_main.c
++++ b/drivers/net/ethernet/google/gve/gve_main.c
+@@@ -1256,6 -1158,63 +1256,66 @@@ static int gve_reset_recovery(struct gv
+  static void gve_turndown(struct gve_priv *priv);
+  static void gve_turnup(struct gve_priv *priv);
+  
+++<<<<<<< HEAD
+++=======
++ static void gve_unreg_xsk_pool(struct gve_priv *priv, u16 qid)
++ {
++ 	struct gve_rx_ring *rx;
++ 
++ 	if (!priv->rx)
++ 		return;
++ 
++ 	rx = &priv->rx[qid];
++ 	rx->xsk_pool = NULL;
++ 	if (xdp_rxq_info_is_reg(&rx->xdp_rxq))
++ 		xdp_rxq_info_unreg_mem_model(&rx->xdp_rxq);
++ 
++ 	if (!priv->tx)
++ 		return;
++ 	priv->tx[gve_xdp_tx_queue_id(priv, qid)].xsk_pool = NULL;
++ }
++ 
++ static int gve_reg_xsk_pool(struct gve_priv *priv, struct net_device *dev,
++ 			    struct xsk_buff_pool *pool, u16 qid)
++ {
++ 	struct gve_rx_ring *rx;
++ 	u16 tx_qid;
++ 	int err;
++ 
++ 	rx = &priv->rx[qid];
++ 	err = xdp_rxq_info_reg_mem_model(&rx->xdp_rxq,
++ 					 MEM_TYPE_XSK_BUFF_POOL, pool);
++ 	if (err) {
++ 		gve_unreg_xsk_pool(priv, qid);
++ 		return err;
++ 	}
++ 
++ 	rx->xsk_pool = pool;
++ 
++ 	tx_qid = gve_xdp_tx_queue_id(priv, qid);
++ 	priv->tx[tx_qid].xsk_pool = pool;
++ 
++ 	return 0;
++ }
++ 
++ static void gve_unreg_xdp_info(struct gve_priv *priv)
++ {
++ 	int i;
++ 
++ 	if (!priv->tx_cfg.num_xdp_queues || !priv->rx)
++ 		return;
++ 
++ 	for (i = 0; i < priv->rx_cfg.num_queues; i++) {
++ 		struct gve_rx_ring *rx = &priv->rx[i];
++ 
++ 		if (xdp_rxq_info_is_reg(&rx->xdp_rxq))
++ 			xdp_rxq_info_unreg(&rx->xdp_rxq);
++ 
++ 		gve_unreg_xsk_pool(priv, i);
++ 	}
++ }
++ 
+++>>>>>>> 077f7153fd25 (gve: merge xdp and xsk registration)
+  static int gve_reg_xdp_info(struct gve_priv *priv, struct net_device *dev)
+  {
+  	struct napi_struct *napi;
+@@@ -1275,28 -1235,20 +1337,45 @@@
+  				       napi->napi_id);
+  		if (err)
+  			goto err;
+++<<<<<<< HEAD
+ +		err = xdp_rxq_info_reg_mem_model(&rx->xdp_rxq,
+ +						 MEM_TYPE_PAGE_SHARED, NULL);
+ +		if (err)
+ +			goto err;
+ +		rx->xsk_pool = xsk_get_pool_from_qid(dev, i);
+ +		if (rx->xsk_pool) {
+ +			err = xdp_rxq_info_reg(&rx->xsk_rxq, dev, i,
+ +					       napi->napi_id);
+ +			if (err)
+ +				goto err;
+ +			err = xdp_rxq_info_reg_mem_model(&rx->xsk_rxq,
+ +							 MEM_TYPE_XSK_BUFF_POOL, NULL);
+ +			if (err)
+ +				goto err;
+ +			xsk_pool_set_rxq_info(rx->xsk_pool,
+ +					      &rx->xsk_rxq);
+ +		}
+ +	}
+ +
+ +	for (i = 0; i < priv->num_xdp_queues; i++) {
+ +		tx_qid = gve_xdp_tx_queue_id(priv, i);
+ +		priv->tx[tx_qid].xsk_pool = xsk_get_pool_from_qid(dev, i);
+++=======
++ 
++ 		xsk_pool = xsk_get_pool_from_qid(dev, i);
++ 		if (xsk_pool)
++ 			err = gve_reg_xsk_pool(priv, dev, xsk_pool, i);
++ 		else if (gve_is_qpl(priv))
++ 			err = xdp_rxq_info_reg_mem_model(&rx->xdp_rxq,
++ 							 MEM_TYPE_PAGE_SHARED,
++ 							 NULL);
++ 		else
++ 			err = xdp_rxq_info_reg_mem_model(&rx->xdp_rxq,
++ 							 MEM_TYPE_PAGE_POOL,
++ 							 rx->dqo.page_pool);
++ 		if (err)
++ 			goto err;
+++>>>>>>> 077f7153fd25 (gve: merge xdp and xsk registration)
+  	}
+  	return 0;
+  
+diff --git a/drivers/net/ethernet/google/gve/gve.h b/drivers/net/ethernet/google/gve/gve.h
+index 11792125b717..36f8e6823567 100644
+--- a/drivers/net/ethernet/google/gve/gve.h
++++ b/drivers/net/ethernet/google/gve/gve.h
+@@ -325,7 +325,6 @@ struct gve_rx_ring {
+ 
+ 	/* XDP stuff */
+ 	struct xdp_rxq_info xdp_rxq;
+-	struct xdp_rxq_info xsk_rxq;
+ 	struct xsk_buff_pool *xsk_pool;
+ 	struct page_frag_cache page_cache; /* Page cache to allocate XDP frames */
+ };
+* Unmerged path drivers/net/ethernet/google/gve/gve_main.c
