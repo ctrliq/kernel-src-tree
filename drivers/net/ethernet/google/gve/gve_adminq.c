@@ -651,7 +651,7 @@ static int gve_adminq_execute_extended_cmd(struct gve_priv *priv, u32 opcode,
 
 /* The device specifies that the management vector can either be the first irq
  * or the last irq. ntfy_blk_msix_base_idx indicates the first irq assigned to
- * the ntfy blks. It if is 0 then the management vector is last, if it is 1 then
+ * the ntfy blks. If it is 0 then the management vector is last, if it is 1 then
  * the management vector is first.
  *
  * gve arranges the msix vectors so that the management vector is last.
@@ -763,6 +763,7 @@ static void gve_adminq_get_create_rx_queue_cmd(struct gve_priv *priv,
 		.ntfy_id = cpu_to_be32(rx->ntfy_id),
 		.queue_resources_addr = cpu_to_be64(rx->q_resources_bus),
 		.rx_ring_size = cpu_to_be16(priv->rx_desc_cnt),
+		.packet_buffer_size = cpu_to_be16(rx->packet_buffer_size),
 	};
 
 	if (gve_is_gqi(priv)) {
@@ -775,7 +776,6 @@ static void gve_adminq_get_create_rx_queue_cmd(struct gve_priv *priv,
 			cpu_to_be64(rx->data.data_bus);
 		cmd->create_rx_queue.index = cpu_to_be32(queue_index);
 		cmd->create_rx_queue.queue_page_list_id = cpu_to_be32(qpl_id);
-		cmd->create_rx_queue.packet_buffer_size = cpu_to_be16(rx->packet_buffer_size);
 	} else {
 		u32 qpl_id = 0;
 
@@ -788,12 +788,10 @@ static void gve_adminq_get_create_rx_queue_cmd(struct gve_priv *priv,
 			cpu_to_be64(rx->dqo.complq.bus);
 		cmd->create_rx_queue.rx_data_ring_addr =
 			cpu_to_be64(rx->dqo.bufq.bus);
-		cmd->create_rx_queue.packet_buffer_size =
-			cpu_to_be16(priv->data_buffer_size_dqo);
 		cmd->create_rx_queue.rx_buff_ring_size =
 			cpu_to_be16(priv->rx_desc_cnt);
 		cmd->create_rx_queue.enable_rsc =
-			!!(priv->dev->features & NETIF_F_LRO);
+			!!(priv->dev->features & NETIF_F_GRO_HW);
 		if (priv->header_split_enabled)
 			cmd->create_rx_queue.header_buffer_size =
 				cpu_to_be16(priv->header_buf_size);
@@ -972,14 +970,6 @@ static void gve_enable_supported_features(struct gve_priv *priv,
 		priv->dev->max_mtu = be16_to_cpu(dev_op_jumbo_frames->max_mtu);
 	}
 
-	/* Override pages for qpl for DQO-QPL */
-	if (dev_op_dqo_qpl) {
-		priv->tx_pages_per_qpl =
-			be16_to_cpu(dev_op_dqo_qpl->tx_pages_per_qpl);
-		if (priv->tx_pages_per_qpl == 0)
-			priv->tx_pages_per_qpl = DQO_QPL_DEFAULT_TX_PAGES;
-	}
-
 	if (dev_op_buffer_sizes &&
 	    (supported_features_mask & GVE_SUP_BUFFER_SIZES_MASK)) {
 		priv->max_rx_buffer_size =
@@ -1127,9 +1117,13 @@ int gve_adminq_describe_device(struct gve_priv *priv)
 
 	gve_set_default_rss_sizes(priv);
 
-	/* DQO supports LRO. */
-	if (!gve_is_gqi(priv))
-		priv->dev->hw_features |= NETIF_F_LRO;
+	/* DQO supports HW-GRO and UDP_GSO */
+	if (gve_is_dqo(priv)) {
+		u64 additional_features = NETIF_F_GRO_HW | NETIF_F_GSO_UDP_L4;
+
+		priv->dev->hw_features |= additional_features;
+		priv->dev->features |= additional_features;
+	}
 
 	priv->max_registered_pages =
 				be64_to_cpu(descriptor->max_registered_pages);

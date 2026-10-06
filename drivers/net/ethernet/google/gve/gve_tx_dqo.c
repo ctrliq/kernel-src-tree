@@ -167,6 +167,25 @@ gve_free_pending_packet(struct gve_tx_ring *tx,
 	}
 }
 
+static void gve_unmap_packet(struct device *dev,
+			     struct gve_tx_pending_packet_dqo *pkt)
+{
+	int i;
+
+	if (!pkt->num_bufs)
+		return;
+
+	/* SKB linear portion is guaranteed to be mapped */
+	dma_unmap_single(dev, dma_unmap_addr(pkt, dma[0]),
+			 dma_unmap_len(pkt, len[0]), DMA_TO_DEVICE);
+	for (i = 1; i < pkt->num_bufs; i++) {
+		dma_unmap_page(dev, dma_unmap_addr(pkt, dma[i]),
+			       dma_unmap_len(pkt, len[i]),
+			       DMA_TO_DEVICE);
+	}
+	pkt->num_bufs = 0;
+}
+
 /* gve_tx_free_desc - Cleans up all pending tx requests and buffers.
  */
 static void gve_tx_clean_pending_packets(struct gve_tx_ring *tx)
@@ -176,21 +195,12 @@ static void gve_tx_clean_pending_packets(struct gve_tx_ring *tx)
 	for (i = 0; i < tx->dqo.num_pending_packets; i++) {
 		struct gve_tx_pending_packet_dqo *cur_state =
 			&tx->dqo.pending_packets[i];
-		int j;
 
-		for (j = 0; j < cur_state->num_bufs; j++) {
-			if (j == 0) {
-				dma_unmap_single(tx->dev,
-					dma_unmap_addr(cur_state, dma[j]),
-					dma_unmap_len(cur_state, len[j]),
-					DMA_TO_DEVICE);
-			} else {
-				dma_unmap_page(tx->dev,
-					dma_unmap_addr(cur_state, dma[j]),
-					dma_unmap_len(cur_state, len[j]),
-					DMA_TO_DEVICE);
-			}
-		}
+		if (tx->dqo.qpl)
+			gve_free_tx_qpl_bufs(tx, cur_state);
+		else
+			gve_unmap_packet(tx->dev, cur_state);
+
 		if (cur_state->skb) {
 			dev_consume_skb_any(cur_state->skb);
 			cur_state->skb = NULL;
@@ -302,7 +312,6 @@ static int gve_tx_alloc_ring_dqo(struct gve_priv *priv,
 {
 	struct device *hdev = &priv->pdev->dev;
 	int num_pending_packets;
-	int qpl_page_cnt;
 	size_t bytes;
 	u32 qpl_id;
 	int i;
@@ -384,10 +393,9 @@ static int gve_tx_alloc_ring_dqo(struct gve_priv *priv,
 
 	if (!cfg->raw_addressing) {
 		qpl_id = gve_tx_qpl_id(priv, tx->q_num);
-		qpl_page_cnt = priv->tx_pages_per_qpl;
 
 		tx->dqo.qpl = gve_alloc_queue_page_list(priv, qpl_id,
-							qpl_page_cnt);
+							cfg->pages_per_qpl);
 		if (!tx->dqo.qpl)
 			goto err;
 
@@ -406,27 +414,23 @@ int gve_tx_alloc_rings_dqo(struct gve_priv *priv,
 			   struct gve_tx_alloc_rings_cfg *cfg)
 {
 	struct gve_tx_ring *tx = cfg->tx;
+	int total_queues;
 	int err = 0;
 	int i, j;
 
-	if (cfg->start_idx + cfg->num_rings > cfg->qcfg->max_queues) {
+	total_queues = cfg->qcfg->num_queues + cfg->num_xdp_rings;
+	if (total_queues > cfg->qcfg->max_queues) {
 		netif_err(priv, drv, priv->dev,
 			  "Cannot alloc more than the max num of Tx rings\n");
 		return -EINVAL;
 	}
 
-	if (cfg->start_idx == 0) {
-		tx = kvcalloc(cfg->qcfg->max_queues, sizeof(struct gve_tx_ring),
-			      GFP_KERNEL);
-		if (!tx)
-			return -ENOMEM;
-	} else if (!tx) {
-		netif_err(priv, drv, priv->dev,
-			  "Cannot alloc tx rings from a nonzero start idx without tx array\n");
-		return -EINVAL;
-	}
+	tx = kvcalloc(cfg->qcfg->max_queues, sizeof(struct gve_tx_ring),
+		      GFP_KERNEL);
+	if (!tx)
+		return -ENOMEM;
 
-	for (i = cfg->start_idx; i < cfg->start_idx + cfg->num_rings; i++) {
+	for (i = 0; i < total_queues; i++) {
 		err = gve_tx_alloc_ring_dqo(priv, cfg, &tx[i], i);
 		if (err) {
 			netif_err(priv, drv, priv->dev,
@@ -442,8 +446,7 @@ int gve_tx_alloc_rings_dqo(struct gve_priv *priv,
 err:
 	for (j = 0; j < i; j++)
 		gve_tx_free_ring_dqo(priv, &tx[j], cfg);
-	if (cfg->start_idx == 0)
-		kvfree(tx);
+	kvfree(tx);
 	return err;
 }
 
@@ -456,13 +459,11 @@ void gve_tx_free_rings_dqo(struct gve_priv *priv,
 	if (!tx)
 		return;
 
-	for (i = cfg->start_idx; i < cfg->start_idx + cfg->num_rings; i++)
+	for (i = 0; i < cfg->qcfg->num_queues + cfg->qcfg->num_xdp_queues; i++)
 		gve_tx_free_ring_dqo(priv, &tx[i], cfg);
 
-	if (cfg->start_idx == 0) {
-		kvfree(tx);
-		cfg->tx = NULL;
-	}
+	kvfree(tx);
+	cfg->tx = NULL;
 }
 
 /* Returns the number of slots available in the ring */
@@ -572,9 +573,11 @@ static void gve_tx_fill_pkt_desc_dqo(struct gve_tx_ring *tx, u32 *desc_idx,
  */
 static int gve_prep_tso(struct sk_buff *skb)
 {
+	struct skb_shared_info *shinfo = skb_shinfo(skb);
+	u32 paylen, l4_start;
 	struct tcphdr *tcp;
+	struct udphdr *udp;
 	int header_len;
-	u32 paylen;
 	int err;
 
 	/* Note: HW requires MSS (gso_size) to be <= 9728 and the total length
@@ -585,21 +588,34 @@ static int gve_prep_tso(struct sk_buff *skb)
 	 * - Kernel will not produce a TSO larger than 64k
 	 */
 
-	if (unlikely(skb_shinfo(skb)->gso_size < GVE_TX_MIN_TSO_MSS_DQO))
+	if (unlikely(shinfo->gso_size < GVE_TX_MIN_TSO_MSS_DQO))
 		return -1;
-
-	if (!(skb_shinfo(skb)->gso_type & (SKB_GSO_TCPV4 | SKB_GSO_TCPV6)))
-		return -EINVAL;
 
 	/* Needed because we will modify header. */
 	err = skb_cow_head(skb, 0);
 	if (err < 0)
 		return err;
 
-	tcp = tcp_hdr(skb);
-	paylen = skb->len - skb_transport_offset(skb);
-	csum_replace_by_diff(&tcp->check, (__force __wsum)htonl(paylen));
-	header_len = skb_tcp_all_headers(skb);
+	l4_start = skb_transport_offset(skb);
+	paylen = skb->len - l4_start;
+
+	switch (shinfo->gso_type) {
+	case SKB_GSO_TCPV4:
+	case SKB_GSO_TCPV6:
+		tcp = tcp_hdr(skb);
+		csum_replace_by_diff(&tcp->check,
+				     (__force __wsum)htonl(paylen));
+		header_len = skb_tcp_all_headers(skb);
+		break;
+	case SKB_GSO_UDP_L4:
+		udp = udp_hdr(skb);
+		csum_replace_by_diff(&udp->check,
+				     (__force __wsum)htonl(paylen));
+		header_len = sizeof(struct udphdr) + l4_start;
+		break;
+	default:
+		return -EINVAL;
+	}
 
 	if (unlikely(header_len > GVE_TX_MAX_HDR_SIZE_DQO))
 		return -EINVAL;
@@ -1164,21 +1180,6 @@ static void remove_from_list(struct gve_tx_ring *tx,
 	} else {
 		tx->dqo.pending_packets[next_index].prev = prev_index;
 	}
-}
-
-static void gve_unmap_packet(struct device *dev,
-			     struct gve_tx_pending_packet_dqo *pkt)
-{
-	int i;
-
-	/* SKB linear portion is guaranteed to be mapped */
-	dma_unmap_single(dev, dma_unmap_addr(pkt, dma[0]),
-			 dma_unmap_len(pkt, len[0]), DMA_TO_DEVICE);
-	for (i = 1; i < pkt->num_bufs; i++) {
-		dma_unmap_page(dev, dma_unmap_addr(pkt, dma[i]),
-			       dma_unmap_len(pkt, len[i]), DMA_TO_DEVICE);
-	}
-	pkt->num_bufs = 0;
 }
 
 /* Completion types and expected behavior:

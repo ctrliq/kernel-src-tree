@@ -503,8 +503,8 @@ static int gve_set_channels(struct net_device *netdev,
 			    struct ethtool_channels *cmd)
 {
 	struct gve_priv *priv = netdev_priv(netdev);
-	struct gve_queue_config new_tx_cfg = priv->tx_cfg;
-	struct gve_queue_config new_rx_cfg = priv->rx_cfg;
+	struct gve_tx_queue_config new_tx_cfg = priv->tx_cfg;
+	struct gve_rx_queue_config new_rx_cfg = priv->rx_cfg;
 	struct ethtool_channels old_settings;
 	int new_tx = cmd->tx_count;
 	int new_rx = cmd->rx_count;
@@ -519,10 +519,17 @@ static int gve_set_channels(struct net_device *netdev,
 	if (!new_rx || !new_tx)
 		return -EINVAL;
 
-	if (priv->num_xdp_queues &&
-	    (new_tx != new_rx || (2 * new_tx > priv->tx_cfg.max_queues))) {
-		dev_err(&priv->pdev->dev, "XDP load failed: The number of configured RX queues should be equal to the number of configured TX queues and the number of configured RX/TX queues should be less than or equal to half the maximum number of RX/TX queues");
-		return -EINVAL;
+	if (priv->xdp_prog) {
+		if (new_tx != new_rx ||
+		    (2 * new_tx > priv->tx_cfg.max_queues)) {
+			dev_err(&priv->pdev->dev, "The number of configured RX queues should be equal to the number of configured TX queues and the number of configured RX/TX queues should be less than or equal to half the maximum number of RX/TX queues when XDP program is installed");
+			return -EINVAL;
+		}
+
+		/* One XDP TX queue per RX queue. */
+		new_tx_cfg.num_xdp_queues = new_rx;
+	} else {
+		new_tx_cfg.num_xdp_queues = 0;
 	}
 
 	if (new_rx != priv->rx_cfg.num_queues &&
@@ -546,6 +553,8 @@ static void gve_get_ringparam(struct net_device *netdev,
 	cmd->tx_max_pending = priv->max_tx_desc_cnt;
 	cmd->rx_pending = priv->rx_desc_cnt;
 	cmd->tx_pending = priv->tx_desc_cnt;
+
+	kernel_cmd->rx_buf_len = priv->rx_cfg.packet_buffer_size;
 
 	if (!gve_header_split_supported(priv))
 		kernel_cmd->tcp_data_split = ETHTOOL_TCP_DATA_SPLIT_UNKNOWN;
@@ -607,6 +616,12 @@ static int gve_set_ringparam(struct net_device *netdev,
 	int err;
 
 	gve_get_curr_alloc_cfgs(priv, &tx_alloc_cfg, &rx_alloc_cfg);
+
+	err = gve_set_rx_buf_len_config(priv, kernel_cmd->rx_buf_len, extack,
+					&rx_alloc_cfg);
+	if (err)
+		return err;
+
 	err = gve_set_hsplit_config(priv, kernel_cmd->tcp_data_split,
 				    &rx_alloc_cfg);
 	if (err)
@@ -623,9 +638,9 @@ static int gve_set_ringparam(struct net_device *netdev,
 			return err;
 	} else {
 		/* Set ring params for the next up */
-		priv->header_split_enabled = rx_alloc_cfg.enable_header_split;
 		priv->rx_cfg.packet_buffer_size =
 			rx_alloc_cfg.packet_buffer_size;
+		priv->header_split_enabled = rx_alloc_cfg.enable_header_split;
 		priv->tx_desc_cnt = tx_alloc_cfg.ring_size;
 		priv->rx_desc_cnt = rx_alloc_cfg.ring_size;
 	}
@@ -668,8 +683,7 @@ static int gve_set_tunable(struct net_device *netdev,
 	switch (etuna->id) {
 	case ETHTOOL_RX_COPYBREAK:
 	{
-		u32 max_copybreak = gve_is_gqi(priv) ?
-			GVE_DEFAULT_RX_BUFFER_SIZE : priv->data_buffer_size_dqo;
+		u32 max_copybreak = priv->rx_cfg.packet_buffer_size;
 
 		len = *(u32 *)value;
 		if (len > max_copybreak)
@@ -687,7 +701,7 @@ static u32 gve_get_priv_flags(struct net_device *netdev)
 	struct gve_priv *priv = netdev_priv(netdev);
 	u32 ret_flags = 0;
 
-	/* Only 1 flag exists currently: report-stats (BIT(O)), so set that flag. */
+	/* Only 1 flag exists currently: report-stats (BIT(0)), so set that flag. */
 	if (priv->ethtool_flags & BIT(0))
 		ret_flags |= BIT(0);
 	return ret_flags;
@@ -969,7 +983,8 @@ static int gve_get_ts_info(struct net_device *netdev,
 
 const struct ethtool_ops gve_ethtool_ops = {
 	.supported_coalesce_params = ETHTOOL_COALESCE_USECS,
-	.supported_ring_params = ETHTOOL_RING_USE_TCP_DATA_SPLIT,
+	.supported_ring_params = ETHTOOL_RING_USE_TCP_DATA_SPLIT |
+				 ETHTOOL_RING_USE_RX_BUF_LEN,
 	.get_drvinfo = gve_get_drvinfo,
 	.get_strings = gve_get_strings,
 	.get_sset_count = gve_get_sset_count,

@@ -16,6 +16,7 @@
 #include <net/ip6_checksum.h>
 #include <net/ipv6.h>
 #include <net/tcp.h>
+#include <net/xdp_sock_drv.h>
 
 static void gve_rx_starvation_timer(struct timer_list *t)
 {
@@ -162,6 +163,10 @@ void gve_rx_free_ring_dqo(struct gve_priv *priv, struct gve_rx_ring *rx,
 			gve_free_to_page_pool(rx, bs, false);
 		else
 			gve_free_qpl_page_dqo(bs);
+		if (gve_buf_state_is_allocated(rx, bs) && bs->xsk_buff) {
+			xsk_buff_free(bs->xsk_buff);
+			bs->xsk_buff = NULL;
+		}
 	}
 
 	if (rx->dqo.qpl) {
@@ -228,7 +233,6 @@ int gve_rx_alloc_ring_dqo(struct gve_priv *priv,
 {
 	struct device *hdev = &priv->pdev->dev;
 	struct page_pool *pool;
-	int qpl_page_cnt;
 	size_t size;
 	u32 qpl_id;
 
@@ -240,12 +244,26 @@ int gve_rx_alloc_ring_dqo(struct gve_priv *priv,
 	memset(rx, 0, sizeof(*rx));
 	rx->gve = priv;
 	rx->q_num = idx;
+	rx->packet_buffer_size = cfg->packet_buffer_size;
+
+	if (cfg->xdp) {
+		rx->packet_buffer_truesize = GVE_XDP_RX_BUFFER_SIZE_DQO;
+		rx->rx_headroom = XDP_PACKET_HEADROOM;
+	} else {
+		rx->packet_buffer_truesize = rx->packet_buffer_size;
+		rx->rx_headroom = 0;
+	}
+
+	/* struct gve_xdp_buff is overlaid on struct xdp_buff_xsk and utilizes
+	 * the 24 byte field cb to store gve specific data.
+	 */
+	XSK_CHECK_PRIV_TYPE(struct gve_xdp_buff);
 
 	rx->dqo.num_buf_states = cfg->raw_addressing ? buffer_queue_slots :
-		gve_get_rx_pages_per_qpl_dqo(cfg->ring_size);
-	rx->dqo.buf_states = kvcalloc(rx->dqo.num_buf_states,
-				      sizeof(rx->dqo.buf_states[0]),
-				      GFP_KERNEL);
+		cfg->pages_per_qpl;
+	rx->dqo.buf_states = kvcalloc_node(rx->dqo.num_buf_states,
+					   sizeof(rx->dqo.buf_states[0]),
+					   GFP_KERNEL, priv->numa_node);
 	if (!rx->dqo.buf_states)
 		return -ENOMEM;
 
@@ -270,17 +288,16 @@ int gve_rx_alloc_ring_dqo(struct gve_priv *priv,
 		goto err;
 
 	if (cfg->raw_addressing) {
-		pool = gve_rx_create_page_pool(priv, rx);
+		pool = gve_rx_create_page_pool(priv, rx, cfg->xdp);
 		if (IS_ERR(pool))
 			goto err;
 
 		rx->dqo.page_pool = pool;
 	} else {
 		qpl_id = gve_get_rx_qpl_id(cfg->qcfg_tx, rx->q_num);
-		qpl_page_cnt = gve_get_rx_pages_per_qpl_dqo(cfg->ring_size);
 
 		rx->dqo.qpl = gve_alloc_queue_page_list(priv, qpl_id,
-							qpl_page_cnt);
+							cfg->pages_per_qpl);
 		if (!rx->dqo.qpl)
 			goto err;
 		rx->dqo.next_qpl_page_idx = 0;
@@ -316,12 +333,12 @@ int gve_rx_alloc_rings_dqo(struct gve_priv *priv,
 	int err;
 	int i;
 
-	rx = kvcalloc(cfg->qcfg->max_queues, sizeof(struct gve_rx_ring),
+	rx = kvcalloc(cfg->qcfg_rx->max_queues, sizeof(struct gve_rx_ring),
 		      GFP_KERNEL);
 	if (!rx)
 		return -ENOMEM;
 
-	for (i = 0; i < cfg->qcfg->num_queues; i++) {
+	for (i = 0; i < cfg->qcfg_rx->num_queues; i++) {
 		err = gve_rx_alloc_ring_dqo(priv, cfg, &rx[i], i);
 		if (err) {
 			netif_err(priv, drv, priv->dev,
@@ -350,7 +367,7 @@ void gve_rx_free_rings_dqo(struct gve_priv *priv,
 	if (!rx)
 		return;
 
-	for (i = 0; i < cfg->qcfg->num_queues;  i++)
+	for (i = 0; i < cfg->qcfg_rx->num_queues;  i++)
 		gve_rx_free_ring_dqo(priv, &rx[i], cfg);
 
 	kvfree(rx);
@@ -542,7 +559,7 @@ static int gve_rx_copy_ondemand(struct gve_rx_ring *rx,
 				struct gve_rx_buf_state_dqo *buf_state,
 				u16 buf_len)
 {
-	struct page *page = alloc_page(GFP_ATOMIC);
+	struct page *page = alloc_pages_node(rx->gve->numa_node, GFP_ATOMIC, 0);
 	int num_frags;
 
 	if (!page)
@@ -571,14 +588,15 @@ static void gve_skb_add_rx_frag(struct gve_rx_ring *rx,
 	if (rx->dqo.page_pool) {
 		skb_add_rx_frag_netmem(rx->ctx.skb_tail, num_frags,
 				       buf_state->page_info.netmem,
-				       buf_state->page_info.page_offset,
-				       buf_len,
+				       buf_state->page_info.page_offset +
+				       buf_state->page_info.pad, buf_len,
 				       buf_state->page_info.buf_size);
 	} else {
 		skb_add_rx_frag(rx->ctx.skb_tail, num_frags,
 				buf_state->page_info.page,
-				buf_state->page_info.page_offset,
-				buf_len, buf_state->page_info.buf_size);
+				buf_state->page_info.page_offset +
+				buf_state->page_info.pad, buf_len,
+				buf_state->page_info.buf_size);
 	}
 }
 
@@ -633,8 +651,11 @@ static int gve_xdp_tx_dqo(struct gve_priv *priv, struct gve_rx_ring *rx,
 	int err;
 
 	xdpf = xdp_convert_buff_to_frame(xdp);
-	if (unlikely(!xdpf))
+	if (unlikely(!xdpf)) {
+		if (rx->xsk_pool)
+			xsk_buff_free(xdp);
 		return -ENOSPC;
+	}
 
 	tx_qid = gve_xdp_tx_queue_id(priv, rx->q_num);
 	tx = &priv->tx[tx_qid];
@@ -643,6 +664,41 @@ static int gve_xdp_tx_dqo(struct gve_priv *priv, struct gve_rx_ring *rx,
 	spin_unlock(&tx->dqo_tx.xdp_lock);
 
 	return err;
+}
+
+static void gve_xsk_done_dqo(struct gve_priv *priv, struct gve_rx_ring *rx,
+			     struct xdp_buff *xdp, struct bpf_prog *xprog,
+			     int xdp_act)
+{
+	switch (xdp_act) {
+	case XDP_ABORTED:
+	case XDP_DROP:
+	default:
+		xsk_buff_free(xdp);
+		break;
+	case XDP_TX:
+		if (unlikely(gve_xdp_tx_dqo(priv, rx, xdp)))
+			goto err;
+		break;
+	case XDP_REDIRECT:
+		if (unlikely(xdp_do_redirect(priv->dev, xdp, xprog)))
+			goto err;
+		break;
+	}
+
+	u64_stats_update_begin(&rx->statss);
+	if ((u32)xdp_act < GVE_XDP_ACTIONS)
+		rx->xdp_actions[xdp_act]++;
+	u64_stats_update_end(&rx->statss);
+	return;
+
+err:
+	u64_stats_update_begin(&rx->statss);
+	if (xdp_act == XDP_TX)
+		rx->xdp_tx_errors++;
+	if (xdp_act == XDP_REDIRECT)
+		rx->xdp_redirect_errors++;
+	u64_stats_update_end(&rx->statss);
 }
 
 static void gve_xdp_done_dqo(struct gve_priv *priv, struct gve_rx_ring *rx,
@@ -686,6 +742,55 @@ err:
 	return;
 }
 
+static int gve_rx_xsk_dqo(struct napi_struct *napi, struct gve_rx_ring *rx,
+			  const struct gve_rx_compl_desc_dqo *compl_desc,
+			  struct gve_rx_buf_state_dqo *buf_state,
+			  struct bpf_prog *xprog)
+{
+	struct xdp_buff *xdp = buf_state->xsk_buff;
+	int buf_len = compl_desc->packet_len;
+	struct gve_priv *priv = rx->gve;
+	struct gve_xdp_buff *gve_xdp;
+	int xdp_act;
+
+	xdp->data_end = xdp->data + buf_len;
+	xsk_buff_dma_sync_for_cpu(xdp);
+
+	gve_xdp = (void *)xdp;
+	gve_xdp->gve = priv;
+	gve_xdp->compl_desc = compl_desc;
+
+	if (xprog) {
+		xdp_act = bpf_prog_run_xdp(xprog, xdp);
+		buf_len = xdp->data_end - xdp->data;
+		if (xdp_act != XDP_PASS) {
+			gve_xsk_done_dqo(priv, rx, xdp, xprog, xdp_act);
+			gve_free_buf_state(rx, buf_state);
+			return 0;
+		}
+	}
+
+	/* Copy the data to skb */
+	rx->ctx.skb_head = gve_rx_copy_data(priv->dev, napi,
+					    xdp->data, buf_len);
+	if (unlikely(!rx->ctx.skb_head)) {
+		xsk_buff_free(xdp);
+		gve_free_buf_state(rx, buf_state);
+		return -ENOMEM;
+	}
+	rx->ctx.skb_tail = rx->ctx.skb_head;
+
+	/* Free XSK buffer and Buffer state */
+	xsk_buff_free(xdp);
+	gve_free_buf_state(rx, buf_state);
+
+	/* Update Stats */
+	u64_stats_update_begin(&rx->statss);
+	rx->xdp_actions[XDP_PASS]++;
+	u64_stats_update_end(&rx->statss);
+	return 0;
+}
+
 /* Returns 0 if descriptor is completed successfully.
  * Returns -EINVAL if descriptor is invalid.
  * Returns -ENOMEM if data cannot be copied to skb.
@@ -724,7 +829,11 @@ static int gve_rx_dqo(struct napi_struct *napi, struct gve_rx_ring *rx,
 	buf_len = compl_desc->packet_len;
 	hdr_len = compl_desc->header_len;
 
-	/* Page might have not been used for a while and was likely last written
+	xprog = READ_ONCE(priv->xdp_prog);
+	if (buf_state->xsk_buff)
+		return gve_rx_xsk_dqo(napi, rx, compl_desc, buf_state, xprog);
+
+	/* Page might have not been used for awhile and was likely last written
 	 * by a different thread.
 	 */
 	if (rx->dqo.page_pool) {
@@ -764,7 +873,8 @@ static int gve_rx_dqo(struct napi_struct *napi, struct gve_rx_ring *rx,
 
 	/* Sync the portion of dma buffer for CPU to read. */
 	dma_sync_single_range_for_cpu(&priv->pdev->dev, buf_state->addr,
-				      buf_state->page_info.page_offset,
+				      buf_state->page_info.page_offset +
+				      buf_state->page_info.pad,
 				      buf_len, DMA_FROM_DEVICE);
 
 	/* Append to current skb if one exists. */
@@ -776,7 +886,6 @@ static int gve_rx_dqo(struct napi_struct *napi, struct gve_rx_ring *rx,
 		return 0;
 	}
 
-	xprog = READ_ONCE(priv->xdp_prog);
 	if (xprog) {
 		struct gve_xdp_buff gve_xdp;
 		void *old_data;
