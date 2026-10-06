@@ -1,0 +1,104 @@
+NFSD: Force all NFSv4.2 COPY requests to be synchronous
+
+jira KERNEL-1718
+Rebuild_History Non-Buildable kernel-4.18.0-553.171.1.el8_10
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 8d915bbf39266bb66082c1e4980e123883f19830
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.171.1.el8_10/8d915bbf.failed
+
+We've discovered that delivering a CB_OFFLOAD operation can be
+unreliable in some pretty unremarkable situations. Examples
+include:
+
+ - The server dropped the connection because it lost a forechannel
+   NFSv4 request and wishes to force the client to retransmit
+ - The GSS sequence number window under-flowed
+ - A network partition occurred
+
+When that happens, all pending callback operations, including
+CB_OFFLOAD, are lost. NFSD does not retransmit them.
+
+Moreover, the Linux NFS client does not yet support sending an
+OFFLOAD_STATUS operation to probe whether an asynchronous COPY
+operation has finished. Thus, on Linux NFS clients, when a
+CB_OFFLOAD is lost, asynchronous COPY can hang until manually
+interrupted.
+
+I've tried a couple of remedies, but so far the side-effects are
+worse than the disease and they have had to be reverted. So
+temporarily force COPY operations to be synchronous so that the use
+of CB_OFFLOAD is avoided entirely. This is a fix that can easily be
+backported to LTS kernels. I am working on client patches that
+introduce an implementation of OFFLOAD_STATUS.
+
+Note that NFSD arbitrarily limits the size of a copy_file_range
+to 4MB to avoid indefinitely blocking an nfsd thread. A short
+COPY result is returned in that case, and the client can present
+a fresh COPY request for the remainder.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+(cherry picked from commit 8d915bbf39266bb66082c1e4980e123883f19830)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfsd/nfs4proc.c
+diff --cc fs/nfsd/nfs4proc.c
+index 6168bca26a86,46bd20fe5c0f..000000000000
+--- a/fs/nfsd/nfs4proc.c
++++ b/fs/nfsd/nfs4proc.c
+@@@ -1272,22 -1807,37 +1272,51 @@@ nfsd4_copy(struct svc_rqst *rqstp, stru
+  	__be32 status;
+  	struct nfsd4_copy *async_copy = NULL;
+  
+++<<<<<<< HEAD
+ +	/* RHEL8 only: deferring inter-copy support to RHEL9 */
+ +	if (!copy->cp_intra) {
+ +		status = nfserr_notsupp;
+ +		goto out;
+++=======
++ 	/*
++ 	 * Currently, async COPY is not reliable. Force all COPY
++ 	 * requests to be synchronous to avoid client application
++ 	 * hangs waiting for COPY completion.
++ 	 */
++ 	nfsd4_copy_set_sync(copy, true);
++ 
++ 	copy->cp_clp = cstate->clp;
++ 	if (nfsd4_ssc_is_inter(copy)) {
++ 		trace_nfsd_copy_inter(copy);
++ 		if (!inter_copy_offload_enable || nfsd4_copy_is_sync(copy)) {
++ 			status = nfserr_notsupp;
++ 			goto out;
++ 		}
++ 		status = nfsd4_setup_inter_ssc(rqstp, cstate, copy);
++ 		if (status) {
++ 			trace_nfsd_copy_done(copy, status);
++ 			return nfserr_offload_denied;
++ 		}
++ 	} else {
++ 		trace_nfsd_copy_intra(copy);
++ 		status = nfsd4_setup_intra_ssc(rqstp, cstate, copy);
++ 		if (status) {
++ 			trace_nfsd_copy_done(copy, status);
++ 			return status;
++ 		}
+++>>>>>>> 8d915bbf3926 (NFSD: Force all NFSv4.2 COPY requests to be synchronous)
+  	}
+  
+ +	status = nfsd4_verify_copy(rqstp, cstate, &copy->cp_src_stateid,
+ +				   &copy->file_src, &copy->cp_dst_stateid,
+ +				   &copy->file_dst);
+ +	if (status)
+ +		goto out;
+ +
+ +	copy->cp_clp = cstate->clp;
+  	memcpy(&copy->fh, &cstate->current_fh.fh_handle,
+  		sizeof(struct knfsd_fh));
+ -	if (nfsd4_copy_is_async(copy)) {
+ +	if (!copy->cp_synchronous) {
+  		struct nfsd_net *nn = net_generic(SVC_NET(rqstp), nfsd_net_id);
+  
+  		status = nfserrno(-ENOMEM);
+* Unmerged path fs/nfsd/nfs4proc.c
