@@ -1,0 +1,188 @@
+gve: Add Rx HWTS metadata to AF_XDP ZC mode
+
+jira KERNEL-1712
+Rebuild_History Non-Buildable kernel-6.12.0-211.62.1.el10_2
+commit-author Tim Hostetler <thostet@google.com>
+commit 1b42e07af1ee65d10ee72f90d6fbd02a9b53208c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.62.1.el10_2/1b42e07a.failed
+
+By overlaying the struct gve_xdp_buff on top of the struct xdp_buff_xsk
+that AF_XDP utilizes, the driver records the 32 bit timestamp via the
+completion descriptor and the cached 64 bit NIC timestamp via gve_priv.
+
+The driver's implementation of xmo_rx_timestamp extends the timestamp to
+the full and up to date 64 bit timestamp and returns it to the user.
+
+gve_rx_xsk_dqo is modified to accept a pointer to the completion
+descriptor and no longer takes a buf_len explicitly as it can be pulled
+out of the descriptor.
+
+With this patch gve now supports bpf_xdp_metadata_rx_timestamp.
+
+	Signed-off-by: Tim Hostetler <thostet@google.com>
+	Reviewed-by: Willem de Bruijn <willemb@google.com>
+	Reviewed-by: Harshitha Ramamurthy <hramamurthy@google.com>
+	Signed-off-by: Joshua Washington <joshwash@google.com>
+Link: https://patch.msgid.link/20251114211146.292068-5-joshwash@google.com
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+
+(cherry picked from commit 1b42e07af1ee65d10ee72f90d6fbd02a9b53208c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/google/gve/gve_rx_dqo.c
+diff --cc drivers/net/ethernet/google/gve/gve_rx_dqo.c
+index 6cbbd89d9c4f,f1bd8f5d5732..000000000000
+--- a/drivers/net/ethernet/google/gve/gve_rx_dqo.c
++++ b/drivers/net/ethernet/google/gve/gve_rx_dqo.c
+@@@ -225,12 -230,26 +225,17 @@@ int gve_rx_alloc_ring_dqo(struct gve_pr
+  	memset(rx, 0, sizeof(*rx));
+  	rx->gve = priv;
+  	rx->q_num = idx;
+ -	rx->packet_buffer_size = cfg->packet_buffer_size;
+ -
+ -	if (cfg->xdp) {
+ -		rx->packet_buffer_truesize = GVE_XDP_RX_BUFFER_SIZE_DQO;
+ -		rx->rx_headroom = XDP_PACKET_HEADROOM;
+ -	} else {
+ -		rx->packet_buffer_truesize = rx->packet_buffer_size;
+ -		rx->rx_headroom = 0;
+ -	}
+  
++ 	/* struct gve_xdp_buff is overlaid on struct xdp_buff_xsk and utilizes
++ 	 * the 24 byte field cb to store gve specific data.
++ 	 */
++ 	XSK_CHECK_PRIV_TYPE(struct gve_xdp_buff);
++ 
+  	rx->dqo.num_buf_states = cfg->raw_addressing ? buffer_queue_slots :
+  		gve_get_rx_pages_per_qpl_dqo(cfg->ring_size);
+ -	rx->dqo.buf_states = kvcalloc_node(rx->dqo.num_buf_states,
+ -					   sizeof(rx->dqo.buf_states[0]),
+ -					   GFP_KERNEL, priv->numa_node);
+ +	rx->dqo.buf_states = kvcalloc(rx->dqo.num_buf_states,
+ +				      sizeof(rx->dqo.buf_states[0]),
+ +				      GFP_KERNEL);
+  	if (!rx->dqo.buf_states)
+  		return -ENOMEM;
+  
+@@@ -647,6 -705,73 +652,76 @@@ err
+  	return;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int gve_rx_xsk_dqo(struct napi_struct *napi, struct gve_rx_ring *rx,
++ 			  const struct gve_rx_compl_desc_dqo *compl_desc,
++ 			  struct gve_rx_buf_state_dqo *buf_state,
++ 			  struct bpf_prog *xprog)
++ {
++ 	struct xdp_buff *xdp = buf_state->xsk_buff;
++ 	int buf_len = compl_desc->packet_len;
++ 	struct gve_priv *priv = rx->gve;
++ 	struct gve_xdp_buff *gve_xdp;
++ 	int xdp_act;
++ 
++ 	xdp->data_end = xdp->data + buf_len;
++ 	xsk_buff_dma_sync_for_cpu(xdp);
++ 
++ 	gve_xdp = (void *)xdp;
++ 	gve_xdp->gve = priv;
++ 	gve_xdp->compl_desc = compl_desc;
++ 
++ 	if (xprog) {
++ 		xdp_act = bpf_prog_run_xdp(xprog, xdp);
++ 		buf_len = xdp->data_end - xdp->data;
++ 		if (xdp_act != XDP_PASS) {
++ 			gve_xsk_done_dqo(priv, rx, xdp, xprog, xdp_act);
++ 			gve_free_buf_state(rx, buf_state);
++ 			return 0;
++ 		}
++ 	}
++ 
++ 	/* Copy the data to skb */
++ 	rx->ctx.skb_head = gve_rx_copy_data(priv->dev, napi,
++ 					    xdp->data, buf_len);
++ 	if (unlikely(!rx->ctx.skb_head)) {
++ 		xsk_buff_free(xdp);
++ 		gve_free_buf_state(rx, buf_state);
++ 		return -ENOMEM;
++ 	}
++ 	rx->ctx.skb_tail = rx->ctx.skb_head;
++ 
++ 	/* Free XSK buffer and Buffer state */
++ 	xsk_buff_free(xdp);
++ 	gve_free_buf_state(rx, buf_state);
++ 
++ 	/* Update Stats */
++ 	u64_stats_update_begin(&rx->statss);
++ 	rx->xdp_actions[XDP_PASS]++;
++ 	u64_stats_update_end(&rx->statss);
++ 	return 0;
++ }
++ 
++ static void gve_dma_sync(struct gve_priv *priv, struct gve_rx_ring *rx,
++ 			 struct gve_rx_buf_state_dqo *buf_state, u16 buf_len)
++ {
++ 	struct gve_rx_slot_page_info *page_info = &buf_state->page_info;
++ 
++ 	if (rx->dqo.page_pool) {
++ 		page_pool_dma_sync_netmem_for_cpu(rx->dqo.page_pool,
++ 						  page_info->netmem,
++ 						  page_info->page_offset,
++ 						  buf_len);
++ 	} else {
++ 		dma_sync_single_range_for_cpu(&priv->pdev->dev, buf_state->addr,
++ 					      page_info->page_offset +
++ 					      page_info->pad,
++ 					      buf_len, DMA_FROM_DEVICE);
++ 	}
++ }
++ 
+++>>>>>>> 1b42e07af1ee (gve: Add Rx HWTS metadata to AF_XDP ZC mode)
+  /* Returns 0 if descriptor is completed successfully.
+   * Returns -EINVAL if descriptor is invalid.
+   * Returns -ENOMEM if data cannot be copied to skb.
+@@@ -685,7 -810,11 +760,15 @@@ static int gve_rx_dqo(struct napi_struc
+  	buf_len = compl_desc->packet_len;
+  	hdr_len = compl_desc->header_len;
+  
+++<<<<<<< HEAD
+ +	/* Page might have not been used for a while and was likely last written
+++=======
++ 	xprog = READ_ONCE(priv->xdp_prog);
++ 	if (buf_state->xsk_buff)
++ 		return gve_rx_xsk_dqo(napi, rx, compl_desc, buf_state, xprog);
++ 
++ 	/* Page might have not been used for awhile and was likely last written
+++>>>>>>> 1b42e07af1ee (gve: Add Rx HWTS metadata to AF_XDP ZC mode)
+  	 * by a different thread.
+  	 */
+  	if (rx->dqo.page_pool) {
+diff --git a/drivers/net/ethernet/google/gve/gve_main.c b/drivers/net/ethernet/google/gve/gve_main.c
+index 682ebfc7f192..c40d73f49bf8 100644
+--- a/drivers/net/ethernet/google/gve/gve_main.c
++++ b/drivers/net/ethernet/google/gve/gve_main.c
+@@ -2407,6 +2407,10 @@ static void gve_set_netdev_xdp_features(struct gve_priv *priv)
+ 	xdp_set_features_flag_locked(priv->dev, xdp_features);
+ }
+ 
++static const struct xdp_metadata_ops gve_xdp_metadata_ops = {
++	.xmo_rx_timestamp	= gve_xdp_rx_timestamp,
++};
++
+ static int gve_init_priv(struct gve_priv *priv, bool skip_describe_device)
+ {
+ 	int num_ntfy;
+@@ -2494,6 +2498,9 @@ static int gve_init_priv(struct gve_priv *priv, bool skip_describe_device)
+ 
+ setup_device:
+ 	gve_set_netdev_xdp_features(priv);
++	if (!gve_is_gqi(priv))
++		priv->dev->xdp_metadata_ops = &gve_xdp_metadata_ops;
++
+ 	err = gve_setup_device_resources(priv);
+ 	if (!err)
+ 		return 0;
+* Unmerged path drivers/net/ethernet/google/gve/gve_rx_dqo.c
