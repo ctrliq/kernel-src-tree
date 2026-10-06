@@ -44,7 +44,7 @@ noinstr void pentium_machine_check(struct pt_regs *regs)
 /* Set up machine check reporting for processors with Intel style MCE: */
 void intel_p5_mcheck_init(struct cpuinfo_x86 *c)
 {
-	u64 q;
+	u64 __maybe_unused q;
 
 	/* Default P5 to off as its often misconnected: */
 	if (!mce_p5_enabled)
