@@ -1,0 +1,206 @@
+gve: update XDP allocation path support RX buffer posting
+
+jira KERNEL-1712
+Rebuild_History Non-Buildable kernel-6.12.0-211.62.1.el10_2
+commit-author Joshua Washington <joshwash@google.com>
+commit 346fb86ddd862012bde63cf20c0ac8bc94000ef4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.62.1.el10_2/346fb86d.failed
+
+In order to support installing an XDP program on DQ, RX buffers need to
+be reposted using 4K buffers, which is larger than the default packet
+buffer size of 2K. This is needed to accommodate the extra head and tail
+that accompanies the data portion of an XDP buffer. Continuing to use 2K
+buffers would mean that the packet buffer size for the NIC would have to
+be restricted to 2048 - 320 - 256 = 1472B. However, this is problematic
+for two reasons: first, 1472 is not a packet buffer size accepted by
+GVE; second, at least 1474B of buffer space is needed to accommodate an
+MTU of 1460, which is the default on GCP. As such, we allocate 4K
+buffers, and post a 2K section of those 4K buffers (offset relative to
+the XDP headroom) to the NIC for DMA to avoid a potential extra copy.
+Because the GQ-QPL datapath requires copies regardless, this change was
+not needed to support XDP in that case.
+
+To capture this subtlety, a new field, packet_buffer_truesize, has been
+added to the rx ring struct to represent size of the allocated buffer,
+while packet_buffer_size has been left to represent the portion of the
+buffer posted to the NIC.
+
+	Reviewed-by: Willem de Bruijn <willemb@google.com>
+	Signed-off-by: Praveen Kaligineedi <pkaligineedi@google.com>
+	Signed-off-by: Joshua Washington <joshwash@google.com>
+	Signed-off-by: Harshitha Ramamurthy <hramamurthy@google.com>
+Link: https://patch.msgid.link/20250321002910.1343422-6-hramamurthy@google.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 346fb86ddd862012bde63cf20c0ac8bc94000ef4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/google/gve/gve.h
+#	drivers/net/ethernet/google/gve/gve_buffer_mgmt_dqo.c
+#	drivers/net/ethernet/google/gve/gve_main.c
+diff --cc drivers/net/ethernet/google/gve/gve.h
+index 2064e592dfdd,2fab38c8ee78..000000000000
+--- a/drivers/net/ethernet/google/gve/gve.h
++++ b/drivers/net/ethernet/google/gve/gve.h
+@@@ -227,6 -229,11 +229,14 @@@ struct gve_rx_cnts 
+  /* Contains datapath state used to represent an RX queue. */
+  struct gve_rx_ring {
+  	struct gve_priv *gve;
+++<<<<<<< HEAD
+++=======
++ 
++ 	u16 packet_buffer_size;		/* Size of buffer posted to NIC */
++ 	u16 packet_buffer_truesize;	/* Total size of RX buffer */
++ 	u16 rx_headroom;
++ 
+++>>>>>>> 346fb86ddd86 (gve: update XDP allocation path support RX buffer posting)
+  	union {
+  		/* GQI fields */
+  		struct {
+diff --cc drivers/net/ethernet/google/gve/gve_buffer_mgmt_dqo.c
+index af84cb88f828,a71883e1d920..000000000000
+--- a/drivers/net/ethernet/google/gve/gve_buffer_mgmt_dqo.c
++++ b/drivers/net/ethernet/google/gve/gve_buffer_mgmt_dqo.c
+@@@ -139,7 -139,8 +139,12 @@@ int gve_alloc_qpl_page_dqo(struct gve_r
+  	buf_state->page_info.page_offset = 0;
+  	buf_state->page_info.page_address =
+  		page_address(buf_state->page_info.page);
+++<<<<<<< HEAD
+ +	buf_state->page_info.buf_size = priv->data_buffer_size_dqo;
+++=======
++ 	buf_state->page_info.buf_size = rx->packet_buffer_truesize;
++ 	buf_state->page_info.pad = rx->rx_headroom;
+++>>>>>>> 346fb86ddd86 (gve: update XDP allocation path support RX buffer posting)
+  	buf_state->last_single_ref_offset = 0;
+  
+  	/* The page already has 1 ref. */
+@@@ -162,7 -163,7 +167,11 @@@ void gve_free_qpl_page_dqo(struct gve_r
+  void gve_try_recycle_buf(struct gve_priv *priv, struct gve_rx_ring *rx,
+  			 struct gve_rx_buf_state_dqo *buf_state)
+  {
+++<<<<<<< HEAD
+ +	const u16 data_buffer_size = priv->data_buffer_size_dqo;
+++=======
++ 	const u16 data_buffer_size = rx->packet_buffer_truesize;
+++>>>>>>> 346fb86ddd86 (gve: update XDP allocation path support RX buffer posting)
+  	int pagecount;
+  
+  	/* Can't reuse if we only fit one buffer per page */
+@@@ -217,10 -218,9 +226,14 @@@ void gve_free_to_page_pool(struct gve_r
+  static int gve_alloc_from_page_pool(struct gve_rx_ring *rx,
+  				    struct gve_rx_buf_state_dqo *buf_state)
+  {
+ +	struct gve_priv *priv = rx->gve;
+  	netmem_ref netmem;
+  
+++<<<<<<< HEAD
+ +	buf_state->page_info.buf_size = priv->data_buffer_size_dqo;
+++=======
++ 	buf_state->page_info.buf_size = rx->packet_buffer_truesize;
+++>>>>>>> 346fb86ddd86 (gve: update XDP allocation path support RX buffer posting)
+  	netmem = page_pool_alloc_netmem(rx->dqo.page_pool,
+  					&buf_state->page_info.page_offset,
+  					&buf_state->page_info.buf_size,
+diff --cc drivers/net/ethernet/google/gve/gve_main.c
+index 03caceeb985f,cb2f9978f45e..000000000000
+--- a/drivers/net/ethernet/google/gve/gve_main.c
++++ b/drivers/net/ethernet/google/gve/gve_main.c
+@@@ -1340,10 -1230,9 +1346,11 @@@ static void gve_rx_get_curr_alloc_cfg(s
+  	cfg->raw_addressing = !gve_is_qpl(priv);
+  	cfg->enable_header_split = priv->header_split_enabled;
+  	cfg->ring_size = priv->rx_desc_cnt;
+ -	cfg->packet_buffer_size = priv->rx_cfg.packet_buffer_size;
+ +	cfg->packet_buffer_size = gve_is_gqi(priv) ?
+ +				  GVE_DEFAULT_RX_BUFFER_SIZE :
+ +				  priv->data_buffer_size_dqo;
+  	cfg->rx = priv->rx;
++ 	cfg->xdp = !!cfg->qcfg_tx->num_xdp_queues;
+  }
+  
+  void gve_get_curr_alloc_cfgs(struct gve_priv *priv,
+@@@ -1624,6 -1459,19 +1631,22 @@@ static void gve_handle_link_status(stru
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int gve_configure_rings_xdp(struct gve_priv *priv,
++ 				   u16 num_xdp_rings)
++ {
++ 	struct gve_tx_alloc_rings_cfg tx_alloc_cfg = {0};
++ 	struct gve_rx_alloc_rings_cfg rx_alloc_cfg = {0};
++ 
++ 	gve_get_curr_alloc_cfgs(priv, &tx_alloc_cfg, &rx_alloc_cfg);
++ 	tx_alloc_cfg.num_xdp_rings = num_xdp_rings;
++ 
++ 	rx_alloc_cfg.xdp = !!num_xdp_rings;
++ 	return gve_adjust_config(priv, &tx_alloc_cfg, &rx_alloc_cfg);
++ }
++ 
+++>>>>>>> 346fb86ddd86 (gve: update XDP allocation path support RX buffer posting)
+  static int gve_set_xdp(struct gve_priv *priv, struct bpf_prog *prog,
+  		       struct netlink_ext_ack *extack)
+  {
+* Unmerged path drivers/net/ethernet/google/gve/gve.h
+* Unmerged path drivers/net/ethernet/google/gve/gve_buffer_mgmt_dqo.c
+* Unmerged path drivers/net/ethernet/google/gve/gve_main.c
+diff --git a/drivers/net/ethernet/google/gve/gve_rx_dqo.c b/drivers/net/ethernet/google/gve/gve_rx_dqo.c
+index 4367c3aac698..e9685793be78 100644
+--- a/drivers/net/ethernet/google/gve/gve_rx_dqo.c
++++ b/drivers/net/ethernet/google/gve/gve_rx_dqo.c
+@@ -225,6 +225,14 @@ int gve_rx_alloc_ring_dqo(struct gve_priv *priv,
+ 	rx->gve = priv;
+ 	rx->q_num = idx;
+ 
++	if (cfg->xdp) {
++		rx->packet_buffer_truesize = GVE_XDP_RX_BUFFER_SIZE_DQO;
++		rx->rx_headroom = XDP_PACKET_HEADROOM;
++	} else {
++		rx->packet_buffer_truesize = rx->packet_buffer_size;
++		rx->rx_headroom = 0;
++	}
++
+ 	rx->dqo.num_buf_states = cfg->raw_addressing ? buffer_queue_slots :
+ 		gve_get_rx_pages_per_qpl_dqo(cfg->ring_size);
+ 	rx->dqo.buf_states = kvcalloc(rx->dqo.num_buf_states,
+@@ -254,7 +262,7 @@ int gve_rx_alloc_ring_dqo(struct gve_priv *priv,
+ 		goto err;
+ 
+ 	if (cfg->raw_addressing) {
+-		pool = gve_rx_create_page_pool(priv, rx);
++		pool = gve_rx_create_page_pool(priv, rx, cfg->xdp);
+ 		if (IS_ERR(pool))
+ 			goto err;
+ 
+@@ -484,14 +492,15 @@ static void gve_skb_add_rx_frag(struct gve_rx_ring *rx,
+ 	if (rx->dqo.page_pool) {
+ 		skb_add_rx_frag_netmem(rx->ctx.skb_tail, num_frags,
+ 				       buf_state->page_info.netmem,
+-				       buf_state->page_info.page_offset,
+-				       buf_len,
++				       buf_state->page_info.page_offset +
++				       buf_state->page_info.pad, buf_len,
+ 				       buf_state->page_info.buf_size);
+ 	} else {
+ 		skb_add_rx_frag(rx->ctx.skb_tail, num_frags,
+ 				buf_state->page_info.page,
+-				buf_state->page_info.page_offset,
+-				buf_len, buf_state->page_info.buf_size);
++				buf_state->page_info.page_offset +
++				buf_state->page_info.pad, buf_len,
++				buf_state->page_info.buf_size);
+ 	}
+ }
+ 
+@@ -611,7 +620,8 @@ static int gve_rx_dqo(struct napi_struct *napi, struct gve_rx_ring *rx,
+ 
+ 	/* Sync the portion of dma buffer for CPU to read. */
+ 	dma_sync_single_range_for_cpu(&priv->pdev->dev, buf_state->addr,
+-				      buf_state->page_info.page_offset,
++				      buf_state->page_info.page_offset +
++				      buf_state->page_info.pad,
+ 				      buf_len, DMA_FROM_DEVICE);
+ 
+ 	/* Append to current skb if one exists. */
