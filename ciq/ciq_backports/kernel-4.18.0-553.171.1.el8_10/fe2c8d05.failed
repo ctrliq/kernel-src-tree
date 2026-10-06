@@ -1,0 +1,182 @@
+gfs2: add some missing log locking
+
+jira KERNEL-1718
+cve CVE-2026-53049
+Rebuild_History Non-Buildable kernel-4.18.0-553.171.1.el8_10
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit fe2c8d051150b90b3ccb85f89e3b1d636cb88ec8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.171.1.el8_10/fe2c8d05.failed
+
+Function gfs2_logd() calls the log flushing functions gfs2_ail1_start(),
+gfs2_ail1_wait(), and gfs2_ail1_empty() without holding sdp->sd_log_flush_lock,
+but these functions require exclusion against concurrent transactions.
+
+To fix that, add a non-locking __gfs2_log_flush() function.  Then, in
+gfs2_logd(), take sdp->sd_log_flush_lock before calling the above mentioned log
+flushing functions and __gfs2_log_flush().
+
+Fixes: 5e4c7632aae1c ("gfs2: Issue revokes more intelligently")
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit fe2c8d051150b90b3ccb85f89e3b1d636cb88ec8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/log.c
+diff --cc fs/gfs2/log.c
+index 8a74ee365b34,a96f9b9331e8..000000000000
+--- a/fs/gfs2/log.c
++++ b/fs/gfs2/log.c
+@@@ -964,8 -997,64 +964,69 @@@ static void trans_drain(struct gfs2_tra
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * gfs2_log_flush - flush incore transaction(s)
+ + * @sdp: the filesystem
+++=======
++  * gfs2_trans_drain - drain the buf and databuf queue for a failed transaction
++  * @tr: the transaction to drain
++  *
++  * When this is called, we're taking an error exit for a log write that failed
++  * but since we bypassed the after_commit functions, we need to remove the
++  * items from the buf and databuf queue.
++  */
++ static void gfs2_trans_drain(struct gfs2_trans *tr)
++ {
++ 	if (!tr)
++ 		return;
++ 	gfs2_trans_drain_list(&tr->tr_buf);
++ 	gfs2_trans_drain_list(&tr->tr_databuf);
++ }
++ 
++ void gfs2_remove_from_journal(struct buffer_head *bh, int meta)
++ {
++ 	struct address_space *mapping = bh->b_folio->mapping;
++ 	struct gfs2_sbd *sdp = gfs2_mapping2sbd(mapping);
++ 	struct gfs2_bufdata *bd = bh->b_private;
++ 	struct gfs2_trans *tr = current->journal_info;
++ 	int was_pinned = 0;
++ 
++ 	if (test_clear_buffer_pinned(bh)) {
++ 		trace_gfs2_pin(bd, 0);
++ 		atomic_dec(&sdp->sd_log_pinned);
++ 		list_del_init(&bd->bd_list);
++ 		if (tr) {
++ 			if (meta == REMOVE_META)
++ 				tr->tr_num_buf_rm++;
++ 			else
++ 				tr->tr_num_databuf_rm++;
++ 			set_bit(TR_TOUCHED, &tr->tr_flags);
++ 		}
++ 		was_pinned = 1;
++ 		brelse(bh);
++ 	}
++ 	if (bd) {
++ 		if (bd->bd_tr) {
++ 			if (tr)
++ 				gfs2_trans_add_revoke(sdp, bd);
++ 			else
++ 				 gfs2_remove_from_ail(bd);
++ 		} else if (was_pinned) {
++ 			bh->b_private = NULL;
++ 			kmem_cache_free(gfs2_bufdata_cachep, bd);
++ 		} else if (!list_empty(&bd->bd_ail_st_list) &&
++ 			   !list_empty(&bd->bd_ail_gl_list)) {
++ 			gfs2_remove_from_ail(bd);
++ 		}
++ 	}
++ 	clear_buffer_dirty(bh);
++ 	clear_buffer_uptodate(bh);
++ }
++ 
++ /**
++  * __gfs2_log_flush - flush incore transaction(s)
++  * @sdp: The filesystem
+++>>>>>>> fe2c8d051150 (gfs2: add some missing log locking)
+   * @gl: The glock structure to flush.  If NULL, flush the whole incore log
+   * @flags: The log header flags: GFS2_LOG_HEAD_FLUSH_* and debug flags
+   *
+@@@ -1092,13 -1177,10 +1153,12 @@@ out_end
+  		reserved_blocks += (reserved_revokes - sdp->sd_ldptrs) / sdp->sd_inptrs;
+  out:
+  	if (used_blocks != reserved_blocks) {
+ -		gfs2_assert_withdraw(sdp, used_blocks < reserved_blocks);
+ +		gfs2_assert_withdraw_delayed(sdp, used_blocks < reserved_blocks);
+  		gfs2_log_release(sdp, reserved_blocks - used_blocks);
+  	}
+- 	up_write(&sdp->sd_log_flush_lock);
+  	gfs2_trans_free(sdp, tr);
+ +	if (gfs2_withdrawing(sdp))
+ +		gfs2_withdraw(sdp);
+  	trace_gfs2_log_flush(sdp, 0, flags);
+  	return;
+  
+@@@ -1118,9 -1200,16 +1178,16 @@@ out_withdraw
+  	goto out_end;
+  }
+  
++ void gfs2_log_flush(struct gfs2_sbd *sdp, struct gfs2_glock *gl, u32 flags)
++ {
++ 	down_write(&sdp->sd_log_flush_lock);
++ 	__gfs2_log_flush(sdp, gl, flags);
++ 	up_write(&sdp->sd_log_flush_lock);
++ }
++ 
+  /**
+   * gfs2_merge_trans - Merge a new transaction into a cached transaction
+ - * @sdp: the filesystem
+ + * @old: Original transaction to be expanded
+   * @new: New transaction to be merged
+   */
+  
+@@@ -1247,32 -1331,25 +1314,42 @@@ int gfs2_logd(void *data
+  {
+  	struct gfs2_sbd *sdp = data;
+  	unsigned long t = 1;
+ +	DEFINE_WAIT(wait);
+  
+ -	set_freezable();
+  	while (!kthread_should_stop()) {
+ -		if (gfs2_withdrawn(sdp))
+ -			break;
+ +
+ +		if (gfs2_withdrawn(sdp)) {
+ +			msleep_interruptible(HZ);
+ +			continue;
+ +		}
+ +		/* Check for errors writing to the journal */
+ +		if (sdp->sd_log_error) {
+ +			gfs2_lm(sdp,
+ +				"GFS2: fsid=%s: error %d: "
+ +				"withdrawing the file system to "
+ +				"prevent further damage.\n",
+ +				sdp->sd_fsname, sdp->sd_log_error);
+ +			gfs2_withdraw(sdp);
+ +			continue;
+ +		}
+  
+  		if (gfs2_jrnl_flush_reqd(sdp) || t == 0) {
++ 			down_write(&sdp->sd_log_flush_lock);
+  			gfs2_ail1_empty(sdp, 0);
+- 			gfs2_log_flush(sdp, NULL, GFS2_LOG_HEAD_FLUSH_NORMAL |
+- 						  GFS2_LFC_LOGD_JFLUSH_REQD);
++ 			__gfs2_log_flush(sdp, NULL,
++ 					 GFS2_LOG_HEAD_FLUSH_NORMAL |
++ 					 GFS2_LFC_LOGD_JFLUSH_REQD);
++ 			up_write(&sdp->sd_log_flush_lock);
+  		}
+  
+++<<<<<<< HEAD
+ +		if (gfs2_ail_flush_reqd(sdp)) {
+++=======
++ 		if (test_bit(SDF_FORCE_AIL_FLUSH, &sdp->sd_flags) ||
++ 		    gfs2_ail_flush_reqd(sdp)) {
++ 			clear_bit(SDF_FORCE_AIL_FLUSH, &sdp->sd_flags);
++ 			down_write(&sdp->sd_log_flush_lock);
+++>>>>>>> fe2c8d051150 (gfs2: add some missing log locking)
+  			gfs2_ail1_start(sdp);
+  			gfs2_ail1_wait(sdp);
+  			gfs2_ail1_empty(sdp, 0);
+* Unmerged path fs/gfs2/log.c
