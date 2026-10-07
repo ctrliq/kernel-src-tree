@@ -373,38 +373,36 @@ SEC("socket")
 __success __log_level(2)
 __flag(BPF_F_TEST_STATE_FREQ)
 /*
- * check that r6 is unlinked after 'if', collect_linked_regs() can't tie
- * more than 6 registers for a single insn and the register compared by
+ * check that r5 is unlinked after 'if', collect_linked_regs() can't tie
+ * more than 5 registers for a single insn and the register compared by
  * the jump is not exempt from that.
  */
-__msg("8: (25) if r6 > 0x7 goto pc+0         ; R6=scalar(smin=")
-__msg("14: (bf) r6 = r6                      ; R6=scalar(id=2")
-/* check that r{0-5} are marked precise after 'if' */
-__msg("frame0: regs=r0 stack= before 8: (25) if r6 > 0x7 goto pc+0")
-__msg("frame0: parent state regs=r0,r1,r2,r3,r4,r5 stack=:")
+__msg("7: (25) if r5 > 0x7 goto pc+0         ; R5=scalar(smin=")
+__msg("12: (bf) r5 = r5                      ; R5=scalar(id=2")
+/* check that r{0-4} are marked precise after 'if' */
+__msg("frame0: regs=r0 stack= before 7: (25) if r5 > 0x7 goto pc+0")
+__msg("frame0: parent state regs=r0,r1,r2,r3,r4 stack=:")
 __naked void linked_regs_too_many_regs(void)
 {
 	asm volatile (
 	/* r0 = random number up to 0xff */
 	"call %[bpf_ktime_get_ns];"
 	"r0 &= 0xff;"
-	/* tie r{0-6} IDs */
+	/* tie r{0-5} IDs */
 	"r1 = r0;"
 	"r2 = r0;"
 	"r3 = r0;"
 	"r4 = r0;"
 	"r5 = r0;"
-	"r6 = r0;"
-	/* r{0-5} fill the record, r6 does not fit and is unlinked */
-	"if r6 > 7 goto +0;"
-	/* keep r{1-5} live */
+	/* r{0-4} fill the record, r5 does not fit and is unlinked */
+	"if r5 > 7 goto +0;"
+	/* keep r{1-4} live */
 	"r1 = r1;"
 	"r2 = r2;"
 	"r3 = r3;"
 	"r4 = r4;"
+	/* make r5 appear in the log */
 	"r5 = r5;"
-	/* make r6 appear in the log */
-	"r6 = r6;"
 	/* force r0 to be precise,
 	 * this would cause r{0-4} to be precise because of shared IDs
 	 */
