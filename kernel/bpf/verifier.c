@@ -20003,13 +20003,13 @@ err_unlock:
 	if (!is_priv)
 		mutex_unlock(&bpf_verifier_lock);
 	bpf_free_subprog_jts(env);
-	vfree(env->insn_aux_data);
 err_free_env:
 	bpf_stack_liveness_free(env);
 	kvfree(env->cfg.insn_postorder);
 	kvfree(env->scc_info);
 	kvfree(env->succ);
 	kvfree(env->gotox_tmp_buf);
+	vfree(env->insn_aux_data);
 	kvfree(env);
 	return ret;
 }
