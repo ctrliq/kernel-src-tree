@@ -409,38 +409,6 @@ static inline u32 spacemit_get_drive_strength_mA(enum spacemit_pin_io_type type,
 	}
 }
 
-static int spacemit_pctrl_check_power(struct pinctrl_dev *pctldev,
-				      struct device_node *dn,
-				      struct spacemit_pin_mux_config *pinmuxs,
-				      int num_pins, const char *grpname)
-{
-	struct spacemit_pinctrl *pctrl = pinctrl_dev_get_drvdata(pctldev);
-	struct device *dev = pctrl->dev;
-	enum spacemit_pin_io_type type;
-	u32 power = 0, i;
-
-	of_property_read_u32(dn, "power-source", &power);
-
-	for (i = 0; i < num_pins; i++) {
-		type = spacemit_to_pin_io_type(pinmuxs[i].pin);
-
-		if (type != IO_TYPE_EXTERNAL)
-			continue;
-
-		switch (power) {
-		case PIN_POWER_STATE_1V8:
-		case PIN_POWER_STATE_3V3:
-			break;
-		default:
-			dev_err(dev, "group %s has unsupported power\n",
-				grpname);
-			return -ENOTSUPP;
-		}
-	}
-
-	return 0;
-}
-
 static void spacemit_set_io_pwr_domain(struct spacemit_pinctrl *pctrl,
 				      const struct spacemit_pin *spin,
 				      const enum spacemit_pin_io_type type)
@@ -548,11 +516,6 @@ static int spacemit_pctrl_dt_node_to_map(struct pinctrl_dev *pctldev,
 				return dev_err_probe(dev, -ENODEV, "failed to get pin %d\n", pins[i]);
 		}
 
-		ret = spacemit_pctrl_check_power(pctldev, child, pinmuxs,
-						 npins, grpname);
-		if (ret < 0)
-			return ret;
-
 		map[nmaps].type = PIN_MAP_TYPE_MUX_GROUP;
 		map[nmaps].data.mux.function = np->name;
 		map[nmaps].data.mux.group = grpname;
@@ -658,13 +621,14 @@ static int spacemit_pinconf_get(struct pinctrl_dev *pctldev,
 				unsigned int pin, unsigned long *config)
 {
 	struct spacemit_pinctrl *pctrl = pinctrl_dev_get_drvdata(pctldev);
+	const struct spacemit_pin *spin = spacemit_get_pin(pctrl, pin);
 	int param = pinconf_to_config_param(*config);
 	u32 value, arg = 0;
 
-	if (!pin)
+	if (!spin)
 		return -EINVAL;
 
-	value = readl(spacemit_pin_to_reg(pctrl, pin));
+	value = readl(spacemit_pin_to_reg(pctrl, spin->pin));
 
 	switch (param) {
 	case PIN_CONFIG_SLEW_RATE:
@@ -777,9 +741,8 @@ static int spacemit_pinconf_generate_config(struct spacemit_pinctrl *pctrl,
 				return -EINVAL;
 			}
 		} else {
-			v &= ~PAD_SLEW_RATE;
 			slew_rate = slew_rate > 1 ? (slew_rate - 2) : 0;
-			v |= FIELD_PREP(PAD_SLEW_RATE, slew_rate);
+			FIELD_MODIFY(PAD_SLEW_RATE, &v, slew_rate);
 		}
 	}
 
@@ -844,6 +807,11 @@ static int spacemit_pinconf_group_set(struct pinctrl_dev *pctldev,
 					       configs, num_configs, &value);
 	if (ret)
 		return ret;
+
+	for (i = 0; i < group->grp.npins; i++) {
+		if (!spacemit_get_pin(pctrl, group->grp.pins[i]))
+			return -EINVAL;
+	}
 
 	for (i = 0; i < group->grp.npins; i++)
 		spacemit_pin_set_config(pctrl, group->grp.pins[i], value);
