@@ -1,0 +1,105 @@
+packet: use consistent hard_header_len in TX_RING send path
+
+jira KERNEL-1725
+Rebuild_History Non-Buildable kernel-4.18.0-553.172.1.el8_10
+commit-author Qihang Tang <q.h.hack.winter@gmail.com>
+commit 21b5953e7494c16a42e6cd8cf110e18d13ae4a6b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.172.1.el8_10/21b5953e.failed
+
+tpacket_snd() reads dev->hard_header_len independently for skb
+allocation and header construction in tpacket_fill_skb(). Concurrent
+netdevice reconfiguration can therefore make the reserved headroom
+smaller than the amount later pushed, or make copylen - hard_header_len
+negative.
+
+Snapshot hard_header_len once before processing ring frames and use it
+for the frame limit, headroom allocation, copy length, and skb
+construction. Pass the snapshot to tpacket_fill_skb().
+
+The separate SOCK_DGRAM consistency problem between hard_header_len and
+header_ops->create is not addressed here.
+
+Fixes: 69e3c75f4d54 ("net: TX_RING and packet mmap")
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Qihang Tang <q.h.hack.winter@gmail.com>
+	Reviewed-by: Willem de Bruijn <willemb@google.com>
+Link: https://patch.msgid.link/20260805125729.19220-4-q.h.hack.winter@gmail.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 21b5953e7494c16a42e6cd8cf110e18d13ae4a6b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/packet/af_packet.c
+diff --cc net/packet/af_packet.c
+index 7b72f79ca2a7,435756877aba..000000000000
+--- a/net/packet/af_packet.c
++++ b/net/packet/af_packet.c
+@@@ -2644,7 -2751,8 +2645,12 @@@ static int tpacket_snd(struct packet_so
+  	void *data;
+  	int len_sum = 0;
+  	int status = TP_STATUS_AVAILABLE;
+++<<<<<<< HEAD
+ +	int hlen, tlen, copylen = 0;
+++=======
++ 	int hard_header_len, hlen, tlen, copylen = 0;
++ 	long timeo;
+++>>>>>>> 21b5953e7494 (packet: use consistent hard_header_len in TX_RING send path)
+  
+  	mutex_lock(&po->pg_vec_lock);
+  
+@@@ -2709,24 -2837,28 +2716,24 @@@
+  			goto tpacket_error;
+  
+  		status = TP_STATUS_SEND_REQUEST;
+- 		hlen = LL_RESERVED_SPACE(dev);
++ 		hlen = LL_RESERVED_SPACE_EX(dev, hard_header_len);
+  		tlen = dev->needed_tailroom;
+ -		if (vnet_hdr_sz) {
+ -			data += vnet_hdr_sz;
+ -			tp_len -= vnet_hdr_sz;
+ -			if (tp_len < 0) {
+ -				tp_len = -EINVAL;
+ -				goto tpacket_error;
+ -			}
+ -			memcpy(&vnet_hdr, data - vnet_hdr_sz, sizeof(vnet_hdr));
+ -			if (__packet_snd_vnet_parse(&vnet_hdr, tp_len)) {
+ +		if (po->has_vnet_hdr) {
+ +			vnet_hdr = data;
+ +			data += sizeof(*vnet_hdr);
+ +			tp_len -= sizeof(*vnet_hdr);
+ +			if (tp_len < 0 ||
+ +			    __packet_snd_vnet_parse(vnet_hdr, tp_len)) {
+  				tp_len = -EINVAL;
+  				goto tpacket_error;
+  			}
+  			copylen = __virtio16_to_cpu(vio_le(),
+ -						    vnet_hdr.hdr_len);
+ -			has_vnet_hdr = true;
+ +						    vnet_hdr->hdr_len);
+  		}
+- 		copylen = max_t(int, copylen, dev->hard_header_len);
++ 		copylen = max_t(int, copylen, hard_header_len);
+  		skb = sock_alloc_send_skb(&po->sk,
+  				hlen + tlen + sizeof(struct sockaddr_ll) +
+- 				(copylen - dev->hard_header_len),
++ 				(copylen - hard_header_len),
+  				!need_wait, &err);
+  
+  		if (unlikely(skb == NULL)) {
+@@@ -2736,10 -2868,11 +2743,11 @@@
+  			goto out_status;
+  		}
+  		tp_len = tpacket_fill_skb(po, skb, ph, dev, data, tp_len, proto,
+- 					  addr, hlen, copylen, &sockc);
++ 					  addr, hlen, copylen, hard_header_len,
++ 					  &sockc);
+  		if (likely(tp_len >= 0) &&
+  		    tp_len > dev->mtu + reserve &&
+ -		    !vnet_hdr_sz &&
+ +		    !po->has_vnet_hdr &&
+  		    !packet_extra_vlan_len_allowed(dev, skb))
+  			tp_len = -EMSGSIZE;
+  
+* Unmerged path net/packet/af_packet.c
