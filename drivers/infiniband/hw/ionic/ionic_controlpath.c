@@ -508,6 +508,7 @@ static int ionic_build_hdr(struct ionic_ibdev *dev,
 {
 	const struct ib_global_route *grh;
 	enum rdma_network_type net;
+	u8 smac[ETH_ALEN];
 	u16 vlan;
 	int rc;
 
@@ -518,7 +519,7 @@ static int ionic_build_hdr(struct ionic_ibdev *dev,
 
 	grh = rdma_ah_read_grh(attr);
 
-	rc = rdma_read_gid_l2_fields(grh->sgid_attr, &vlan, &hdr->eth.smac_h[0]);
+	rc = rdma_read_gid_l2_fields(grh->sgid_attr, &vlan, smac);
 	if (rc)
 		return rc;
 
@@ -536,6 +537,7 @@ static int ionic_build_hdr(struct ionic_ibdev *dev,
 	if (rc)
 		return rc;
 
+	ether_addr_copy(hdr->eth.smac_h, smac);
 	ether_addr_copy(hdr->eth.dmac_h, attr->roce.dmac);
 
 	if (net == RDMA_NETWORK_IPV4) {
@@ -1218,7 +1220,7 @@ int ionic_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
 		rdma_udata_to_drv_context(udata, struct ionic_ctx, ibctx);
 	struct ionic_vcq *vcq = to_ionic_vcq(ibcq);
 	struct ionic_tbl_buf buf = {};
-	struct ionic_cq_resp resp;
+	struct ionic_cq_resp resp = {};
 	struct ionic_cq_req req;
 	int udma_idx = 0, rc;
 
@@ -2537,6 +2539,23 @@ static bool ionic_qp_cur_state_is_ok(enum ib_qp_state q_state,
 	return false;
 }
 
+static bool ionic_is_modify_ok(enum ib_qp_attr_mask ext_mask,
+			       enum ib_qp_type type, enum ib_qp_state cur,
+			       enum ib_qp_state next)
+{
+	if (!ext_mask)
+		return true;
+
+	if (ext_mask & ~IB_QP_RATE_LIMIT)
+		return false;
+
+	/* Rate limit is only supported for RC QPs during specific transitions */
+	return type == IB_QPT_RC &&
+	       ((cur == IB_QPS_INIT && next == IB_QPS_RTR) ||
+		(cur == IB_QPS_RTR && next == IB_QPS_RTS) ||
+		(cur == IB_QPS_RTS && next == IB_QPS_RTS));
+}
+
 static int ionic_check_modify_qp(struct ionic_qp *qp, struct ib_qp_attr *attr,
 				 int mask)
 {
@@ -2549,7 +2568,9 @@ static int ionic_check_modify_qp(struct ionic_qp *qp, struct ib_qp_attr *attr,
 	    !ionic_qp_cur_state_is_ok(qp->state, attr->cur_qp_state))
 		return -EINVAL;
 
-	if (!ib_modify_qp_is_ok(cur_state, next_state, qp->ibqp.qp_type, mask))
+	if (!ib_modify_qp_is_ok(cur_state, next_state, qp->ibqp.qp_type, mask) ||
+	    !ionic_is_modify_ok(mask & ~IB_QP_ATTR_STANDARD_BITS,
+				qp->ibqp.qp_type, cur_state, next_state))
 		return -EINVAL;
 
 	/* unprivileged qp not allowed privileged qkey */
