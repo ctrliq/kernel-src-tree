@@ -4016,6 +4016,47 @@ static struct pid *pidfd_to_pid(const struct file *file)
 	(PIDFD_SIGNAL_THREAD | PIDFD_SIGNAL_THREAD_GROUP | \
 	 PIDFD_SIGNAL_PROCESS_GROUP)
 
+static int do_pidfd_send_signal(struct pid *pid, int sig, enum pid_type type,
+				siginfo_t __user *info, unsigned int flags)
+{
+	kernel_siginfo_t kinfo;
+
+	switch (flags) {
+	case PIDFD_SIGNAL_THREAD:
+		type = PIDTYPE_PID;
+		break;
+	case PIDFD_SIGNAL_THREAD_GROUP:
+		type = PIDTYPE_TGID;
+		break;
+	case PIDFD_SIGNAL_PROCESS_GROUP:
+		type = PIDTYPE_PGID;
+		break;
+	}
+
+	if (info) {
+		int ret;
+
+		ret = copy_siginfo_from_user_any(&kinfo, info);
+		if (unlikely(ret))
+			return ret;
+
+		if (unlikely(sig != kinfo.si_signo))
+			return -EINVAL;
+
+		/* Only allow sending arbitrary signals to yourself. */
+		if ((task_pid(current) != pid || type > PIDTYPE_TGID) &&
+		    (kinfo.si_code >= 0 || kinfo.si_code == SI_TKILL))
+			return -EPERM;
+	} else {
+		prepare_kill_siginfo(sig, &kinfo, type);
+	}
+
+	if (type == PIDTYPE_PGID)
+		return kill_pgrp_info(sig, &kinfo, pid);
+
+	return kill_pid_info_type(sig, &kinfo, pid, type);
+}
+
 /**
  * sys_pidfd_send_signal - Signal a process through a pidfd
  * @pidfd:  file descriptor of the process
@@ -4033,11 +4074,9 @@ static struct pid *pidfd_to_pid(const struct file *file)
 SYSCALL_DEFINE4(pidfd_send_signal, int, pidfd, int, sig,
 		siginfo_t __user *, info, unsigned int, flags)
 {
-	int ret;
-	struct fd f;
 	struct pid *pid;
-	kernel_siginfo_t kinfo;
 	enum pid_type type;
+	int ret;
 
 	/* Enforce flags be set to 0 until we add an extension. */
 	if (flags & ~PIDFD_SEND_SIGNAL_FLAGS)
@@ -4047,64 +4086,41 @@ SYSCALL_DEFINE4(pidfd_send_signal, int, pidfd, int, sig,
 	if (hweight32(flags & PIDFD_SEND_SIGNAL_FLAGS) > 1)
 		return -EINVAL;
 
-	f = fdget(pidfd);
-	if (!fd_file(f))
-		return -EBADF;
+	switch (pidfd) {
+	case PIDFD_SELF_THREAD:
+		pid = get_task_pid(current, PIDTYPE_PID);
+		type = PIDTYPE_PID;
+		break;
+	case PIDFD_SELF_THREAD_GROUP:
+		pid = get_task_pid(current, PIDTYPE_TGID);
+		type = PIDTYPE_TGID;
+		break;
+	default: {
+		CLASS(fd, f)(pidfd);
+		if (fd_empty(f))
+			return -EBADF;
 
-	/* Is this a pidfd? */
-	pid = pidfd_to_pid(fd_file(f));
-	if (IS_ERR(pid)) {
-		ret = PTR_ERR(pid);
-		goto err;
-	}
+		/* Is this a pidfd? */
+		pid = pidfd_to_pid(fd_file(f));
+		if (IS_ERR(pid))
+			return PTR_ERR(pid);
 
-	ret = -EINVAL;
-	if (!access_pidfd_pidns(pid))
-		goto err;
+		if (!access_pidfd_pidns(pid))
+			return -EINVAL;
 
-	switch (flags) {
-	case 0:
 		/* Infer scope from the type of pidfd. */
 		if (fd_file(f)->f_flags & PIDFD_THREAD)
 			type = PIDTYPE_PID;
 		else
 			type = PIDTYPE_TGID;
-		break;
-	case PIDFD_SIGNAL_THREAD:
-		type = PIDTYPE_PID;
-		break;
-	case PIDFD_SIGNAL_THREAD_GROUP:
-		type = PIDTYPE_TGID;
-		break;
-	case PIDFD_SIGNAL_PROCESS_GROUP:
-		type = PIDTYPE_PGID;
-		break;
+
+		return do_pidfd_send_signal(pid, sig, type, info, flags);
+	}
 	}
 
-	if (info) {
-		ret = copy_siginfo_from_user_any(&kinfo, info);
-		if (unlikely(ret))
-			goto err;
+	ret = do_pidfd_send_signal(pid, sig, type, info, flags);
+	put_pid(pid);
 
-		ret = -EINVAL;
-		if (unlikely(sig != kinfo.si_signo))
-			goto err;
-
-		/* Only allow sending arbitrary signals to yourself. */
-		ret = -EPERM;
-		if ((task_pid(current) != pid || type > PIDTYPE_TGID) &&
-		    (kinfo.si_code >= 0 || kinfo.si_code == SI_TKILL))
-			goto err;
-	} else {
-		prepare_kill_siginfo(sig, &kinfo, type);
-	}
-
-	if (type == PIDTYPE_PGID)
-		ret = kill_pgrp_info(sig, &kinfo, pid);
-	else
-		ret = kill_pid_info_type(sig, &kinfo, pid, type);
-err:
-	fdput(f);
 	return ret;
 }
 

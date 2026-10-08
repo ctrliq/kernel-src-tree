@@ -347,7 +347,7 @@ int backing_file_mmap(struct file *file, struct vm_area_struct *vma,
 		revert_creds(old_cred);
 		return ret;
 	}
-	ret = call_mmap(vma->vm_file, vma);
+	ret = vfs_mmap(vma->vm_file, vma);
 	revert_creds(old_cred);
 
 	if (ctx->accessed)

@@ -1290,6 +1290,7 @@ const char * const vmstat_text[] = {
 	[I(NR_HUGETLB)]				= "nr_hugetlb",
 #endif
 	[I(NR_BALLOON_PAGES)]			= "nr_balloon_pages",
+	[I(NR_KERNEL_FILE_PAGES)]		= "nr_kernel_file_pages",
 #undef I
 
 	/* system-wide enum vm_stat_item counters */
@@ -1620,7 +1621,7 @@ static void pagetypeinfo_showfree_print(struct seq_file *m,
 	}
 }
 
-/* Print out the free pages at each order for each migatetype */
+/* Print out the free pages at each order for each migratetype */
 static void pagetypeinfo_showfree(struct seq_file *m, void *arg)
 {
 	int order;
@@ -1847,7 +1848,7 @@ static void zoneinfo_show_print(struct seq_file *m, pg_data_t *pgdat,
 	seq_printf(m,
 		   "\n  node_unreclaimable:  %u"
 		   "\n  start_pfn:           %lu",
-		   pgdat->kswapd_failures >= MAX_RECLAIM_RETRIES,
+		   atomic_read(&pgdat->kswapd_failures) >= MAX_RECLAIM_RETRIES,
 		   zone->zone_start_pfn);
 	seq_putc(m, '\n');
 }

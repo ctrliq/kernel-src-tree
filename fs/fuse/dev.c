@@ -823,7 +823,7 @@ static int fuse_check_folio(struct folio *folio)
 {
 	if (folio_mapped(folio) ||
 	    folio->mapping != NULL ||
-	    (folio->flags & PAGE_FLAGS_CHECK_AT_PREP &
+	    (folio->flags.f & PAGE_FLAGS_CHECK_AT_PREP &
 	     ~(1 << PG_locked |
 	       1 << PG_referenced |
 	       1 << PG_lru |
@@ -1457,7 +1457,7 @@ static ssize_t fuse_dev_splice_read(struct file *in, loff_t *ppos,
 	if (ret < 0)
 		goto out;
 
-	if (pipe_occupancy(pipe->head, pipe->tail) + cs.nr_segs > pipe->max_usage) {
+	if (pipe_buf_usage(pipe) + cs.nr_segs > pipe->max_usage) {
 		ret = -EIO;
 		goto out;
 	}

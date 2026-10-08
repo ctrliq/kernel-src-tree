@@ -320,16 +320,17 @@ void node_get_allowed_targets(pg_data_t *pgdat, nodemask_t *targets)
 /**
  * next_demotion_node() - Get the next node in the demotion path
  * @node: The starting node to lookup the next node
+ * @allowed_mask: The pointer to allowed node mask
  *
  * Return: node id for next memory node in the demotion path hierarchy
  * from @node; NUMA_NO_NODE if @node is terminal.  This does not keep
  * @node online or guarantee that it *continues* to be the next demotion
  * target.
  */
-int next_demotion_node(int node)
+int next_demotion_node(int node, const nodemask_t *allowed_mask)
 {
 	struct demotion_nodes *nd;
-	int target;
+	nodemask_t mask;
 
 	if (!node_demotion)
 		return NUMA_NO_NODE;
@@ -344,6 +345,10 @@ int next_demotion_node(int node)
 	 * node_demotion[] reads need to be consistent.
 	 */
 	rcu_read_lock();
+	/* Filter out nodes that are not in allowed_mask. */
+	nodes_and(mask, nd->preferred, *allowed_mask);
+	rcu_read_unlock();
+
 	/*
 	 * If there are multiple target nodes, just select one
 	 * target node randomly.
@@ -356,10 +361,16 @@ int next_demotion_node(int node)
 	 * caching issue, which seems more complicated. So selecting
 	 * target node randomly seems better until now.
 	 */
-	target = node_random(&nd->preferred);
-	rcu_read_unlock();
+	if (!nodes_empty(mask))
+		return node_random(&mask);
 
-	return target;
+	/*
+	 * Preferred nodes are not in allowed_mask. Flip bits in
+	 * allowed_mask as used node mask. Then, use it to get the
+	 * closest demotion target.
+	 */
+	nodes_complement(mask, *allowed_mask);
+	return find_next_best_node(node, &mask);
 }
 
 static void disable_all_demotion_targets(void)
@@ -648,7 +659,7 @@ void clear_node_memory_type(int node, struct memory_dev_type *memtype)
 	if (node_memory_types[node].memtype == memtype || !memtype)
 		node_memory_types[node].map_count--;
 	/*
-	 * If we umapped all the attached devices to this node,
+	 * If we unmapped all the attached devices to this node,
 	 * clear the node memory type.
 	 */
 	if (!node_memory_types[node].map_count) {
@@ -942,10 +953,22 @@ static ssize_t demotion_enabled_store(struct kobject *kobj,
 				      const char *buf, size_t count)
 {
 	ssize_t ret;
+	bool before = numa_demotion_enabled;
 
 	ret = kstrtobool(buf, &numa_demotion_enabled);
 	if (ret)
 		return ret;
+
+	/*
+	 * Reset kswapd_failures statistics. They may no longer be
+	 * valid since the policy for kswapd has changed.
+	 */
+	if (before == false && numa_demotion_enabled == true) {
+		struct pglist_data *pgdat;
+
+		for_each_online_pgdat(pgdat)
+			atomic_set(&pgdat->kswapd_failures, 0);
+	}
 
 	return count;
 }

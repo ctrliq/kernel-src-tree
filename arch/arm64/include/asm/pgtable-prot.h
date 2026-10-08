@@ -25,6 +25,8 @@
  */
 #define PTE_PRESENT_INVALID	(PTE_NG)		 /* only when !PTE_VALID */
 
+#define PTE_PRESENT_VALID_KERNEL (PTE_VALID | PTE_MAYBE_NG)
+
 #ifdef CONFIG_HAVE_ARCH_USERFAULTFD_WP
 #define PTE_UFFD_WP		(_AT(pteval_t, 1) << 58) /* uffd-wp tracking */
 #define PTE_SWP_UFFD_WP		(_AT(pteval_t, 1) << 3)	 /* only for swp ptes */
@@ -163,9 +165,6 @@ static inline bool __pure lpa2_is_enabled(void)
 
 #define _PAGE_GCS	(_PAGE_DEFAULT | PTE_NG | PTE_UXN | PTE_WRITE | PTE_USER)
 #define _PAGE_GCS_RO	(_PAGE_DEFAULT | PTE_NG | PTE_UXN | PTE_USER)
-
-#define PAGE_GCS	__pgprot(_PAGE_GCS)
-#define PAGE_GCS_RO	__pgprot(_PAGE_GCS_RO)
 
 #define PIE_E0	( \
 	PIRx_ELx_PERM_PREP(pte_pi_index(_PAGE_GCS),           PIE_GCS)  | \
