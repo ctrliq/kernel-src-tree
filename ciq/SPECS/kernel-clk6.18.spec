@@ -739,7 +739,12 @@ Requires: %{name}-core-uname-r = %{KVERREL}
 Requires: %{name}-modules-uname-r = %{KVERREL}
 Requires: %{name}-modules-core-uname-r = %{KVERREL}
 Requires: ((%{name}-modules-extra-uname-r = %{KVERREL}) if %{name}-modules-extra-matched)
+# ciq-kmod is a synthetic provide of the patched el9 kmod (xz-compressed symvers
+# in weak-modules). EL10's stock kmod already handles xz and zstd symvers and
+# nothing there provides it. Only el9 ships the patched kmod, so only require it there.
+%if 0%{?rhel} == 9
 Requires: ciq-kmod
+%endif
 Provides: installonlypkg(kernel)
 Provides: kernel = %{specversion}-%{pkg_release}
 %endif
