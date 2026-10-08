@@ -1,0 +1,184 @@
+svcrdma: Reject inline replies that overflow the pull-up buffer
+
+jira KERNEL-1725
+cve CVE-2026-89530
+Rebuild_History Non-Buildable kernel-4.18.0-553.172.1.el8_10
+commit-author Chuck Lever <cel@kernel.org>
+commit 0fbe20dfe74b783d255bf389a6ea77aa25dc7860
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.172.1.el8_10/0fbe20df.failed
+
+An RPC-over-RDMA client can request a reply, such as an NFS READ
+payload, without providing a Write list or a Reply chunk to carry
+it. When such a reply needs more scatter/gather entries than the
+device's Send Queue supports, svc_rdma_pull_up_needed() selects
+pull-up and svc_rdma_pull_up_reply_msg() linearizes the whole
+reply into sctxt->sc_xprt_buf. That buffer is only sc_max_req_size
+bytes, while the reply on this path is bounded only by the client's
+request, so svc_rdma_xb_linearize() copies past the end of the
+buffer and corrupts adjacent slab memory. The oversized length is
+then stored in sc_sges[0].length and posted, so the device also
+reads beyond the mapped region.
+
+The SGE-exhaustion branch is the only pull-up path that can exceed
+the buffer: the threshold branch pulls up only replies smaller
+than RPCRDMA_PULLUP_THRESH, and replies that fit the device's SGE
+budget are sent directly without linearization. Make
+svc_rdma_pull_up_needed() report -E2BIG when the reply it would
+pull up cannot fit sc_max_req_size, and fail the request with
+ERR_CHUNK as RFC 8166 Section 4.5.3 directs rather than dropping
+the connection.
+
+The helper no longer answers a simple yes/no question: it now
+reports pull-up, no pull-up, or -E2BIG for a reply too large to
+linearize. Rename svc_rdma_pull_up_needed() to
+svc_rdma_check_pull_up() so its name no longer implies a boolean
+predicate.
+
+Fixes: e248aa7be86e ("svcrdma: Remove max_sge check at connect time")
+	Cc: stable@vger.kernel.org
+	Reported-by: Chris Mason <clm@meta.com>
+Assisted-by: kres:claude-opus-4-7
+Link: https://patch.msgid.link/20260623014728.826032-1-cel@kernel.org
+	Signed-off-by: Chuck Lever <cel@kernel.org>
+(cherry picked from commit 0fbe20dfe74b783d255bf389a6ea77aa25dc7860)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/svc_rdma_sendto.c
+diff --cc net/sunrpc/xprtrdma/svc_rdma_sendto.c
+index 22a871e6fe4d,c09659b17351..000000000000
+--- a/net/sunrpc/xprtrdma/svc_rdma_sendto.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_sendto.c
+@@@ -645,20 -825,21 +645,28 @@@ static int svc_rdma_xb_count_sges(cons
+  }
+  
+  /**
+-  * svc_rdma_pull_up_needed - Determine whether to use pull-up
++  * svc_rdma_check_pull_up - Determine whether to use pull-up
+   * @rdma: controlling transport
+   * @sctxt: send_ctxt for the Send WR
+ - * @write_pcl: Write chunk list provided by client
+ + * @rctxt: Write and Reply chunks provided by client
+   * @xdr: xdr_buf containing RPC message to transmit
+   *
+   * Returns:
+-  *   %true if pull-up must be used
+-  *   %false otherwise
++  *   %1 if pull-up must be used
++  *   %0 if pull-up is not needed
++  *   %-E2BIG if the reply is too large to be pulled up
+   */
+++<<<<<<< HEAD
+ +static bool svc_rdma_pull_up_needed(const struct svcxprt_rdma *rdma,
+ +				    const struct svc_rdma_send_ctxt *sctxt,
+ +				    const struct svc_rdma_recv_ctxt *rctxt,
+ +				    const struct xdr_buf *xdr)
+++=======
++ static int svc_rdma_check_pull_up(const struct svcxprt_rdma *rdma,
++ 				   const struct svc_rdma_send_ctxt *sctxt,
++ 				   const struct svc_rdma_pcl *write_pcl,
++ 				   const struct xdr_buf *xdr)
+++>>>>>>> 0fbe20dfe74b (svcrdma: Reject inline replies that overflow the pull-up buffer)
+  {
+  	/* Resources needed for the transport header */
+  	struct svc_rdma_pullup_data args = {
+@@@ -667,14 -848,25 +675,25 @@@
+  	};
+  	int ret;
+  
+ -	ret = pcl_process_nonpayloads(write_pcl, xdr,
+ +	ret = pcl_process_nonpayloads(&rctxt->rc_write_pcl, xdr,
+  				      svc_rdma_xb_count_sges, &args);
+  	if (ret < 0)
+- 		return false;
++ 		return 0;
+  
+  	if (args.pd_length < RPCRDMA_PULLUP_THRESH)
+- 		return true;
+- 	return args.pd_num_sges >= rdma->sc_max_send_sges;
++ 		return 1;
++ 	if (args.pd_num_sges < rdma->sc_max_send_sges)
++ 		return 0;
++ 
++ 	/*
++ 	 * The reply has too many SGEs to Send inline, so it has to be
++ 	 * linearized into sc_xprt_buf. That buffer holds only
++ 	 * sc_max_req_size bytes, so a larger reply cannot be pulled up.
++ 	 * RFC 8166 Section 4.5.3 requires responding with ERR_CHUNK.
++ 	 */
++ 	if (args.pd_length > rdma->sc_max_req_size)
++ 		return -E2BIG;
++ 	return 1;
+  }
+  
+  /**
+@@@ -792,10 -988,13 +813,18 @@@ int svc_rdma_map_reply_msg(struct svcxp
+  	/* For pull-up, svc_rdma_send() will sync the transport header.
+  	 * No additional DMA mapping is necessary.
+  	 */
+++<<<<<<< HEAD
+ +	if (svc_rdma_pull_up_needed(rdma, sctxt, rctxt, xdr))
+ +		return svc_rdma_pull_up_reply_msg(rdma, sctxt, rctxt, xdr);
+++=======
++ 	ret = svc_rdma_check_pull_up(rdma, sctxt, write_pcl, xdr);
++ 	if (ret < 0)
++ 		return ret;
++ 	if (ret)
++ 		return svc_rdma_pull_up_reply_msg(rdma, sctxt, write_pcl, xdr);
+++>>>>>>> 0fbe20dfe74b (svcrdma: Reject inline replies that overflow the pull-up buffer)
+  
+ -	return pcl_process_nonpayloads(write_pcl, xdr,
+ +	return pcl_process_nonpayloads(&rctxt->rc_write_pcl, xdr,
+  				       svc_rdma_xb_dma_map, &args);
+  }
+  
+@@@ -953,10 -1169,19 +982,24 @@@ int svc_rdma_sendto(struct svc_rqst *rq
+  	if (!p)
+  		goto put_ctxt;
+  
+ -	ret = svc_rdma_prepare_write_list(rdma, rctxt, sctxt, &rqstp->rq_res);
+ +	ret = svc_rdma_send_reply_chunk(rdma, rctxt, &rqstp->rq_res);
+  	if (ret < 0)
+++<<<<<<< HEAD
+ +		goto reply_chunk;
+ +	rc_size = ret;
+++=======
++ 		goto put_ctxt;
++ 
++ 	rc_size = 0;
++ 	if (!pcl_is_empty(&rctxt->rc_reply_pcl)) {
++ 		ret = svc_rdma_prepare_reply_chunk(rdma, &rctxt->rc_write_pcl,
++ 						   &rctxt->rc_reply_pcl, sctxt,
++ 						   &rqstp->rq_res);
++ 		if (ret < 0)
++ 			goto send_err;
++ 		rc_size = ret;
++ 	}
+++>>>>>>> 0fbe20dfe74b (svcrdma: Reject inline replies that overflow the pull-up buffer)
+  
+  	*p++ = *rdma_argp;
+  	*p++ = *(rdma_argp + 1);
+@@@ -975,15 -1200,10 +1018,19 @@@
+  
+  	ret = svc_rdma_send_reply_msg(rdma, sctxt, rctxt, rqstp);
+  	if (ret < 0)
+++<<<<<<< HEAD
+ +		goto put_ctxt;
+ +
+ +	/* Prevent svc_xprt_release() from releasing the page backing
+ +	 * rq_res.head[0].iov_base. It's no longer being accessed by
+ +	 * the I/O device. */
+ +	rqstp->rq_respages++;
+++=======
++ 		goto send_err;
+++>>>>>>> 0fbe20dfe74b (svcrdma: Reject inline replies that overflow the pull-up buffer)
+  	return 0;
+  
+- reply_chunk:
++ send_err:
+  	if (ret != -E2BIG && ret != -EINVAL)
+  		goto put_ctxt;
+  
+* Unmerged path net/sunrpc/xprtrdma/svc_rdma_sendto.c
