@@ -1,0 +1,110 @@
+packet: use consistent hard_header_len in non-ring send paths
+
+jira KERNEL-1725
+cve CVE-2026-74582
+Rebuild_History Non-Buildable kernel-4.18.0-553.172.1.el8_10
+commit-author Qihang Tang <q.h.hack.winter@gmail.com>
+commit 03390aa32e669cc4ecd7d34108e2e1afc13d689d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.172.1.el8_10/03390aa3.failed
+
+packet_snd() reads dev->hard_header_len multiple times while allocating
+and constructing an skb. Device reconfiguration can change this value
+concurrently, for example through bonding device type changes.
+
+For SOCK_RAW, packet_snd() can save a larger value in reserve and later
+allocate headroom using a smaller value. Moving skb->data back by reserve
+then places it before skb->head, and the following copy from userspace can
+attempt an out-of-bounds write.
+
+packet_sendmsg_spkt() has the same issue because it calculates its
+reservation and header offset from separate reads before dropping the RCU
+read lock to allocate the skb.
+
+Add LL_RESERVED_SPACE_EX() for callers that already saved a header length.
+Read hard_header_len once in packet_snd() and use it for allocation and
+construction. In packet_sendmsg_spkt(), preserve the allocation-time value
+through the device lookup retry.
+
+The separate SOCK_DGRAM consistency problem between hard_header_len and
+header_ops->create is not addressed here.
+
+Fixes: b84bbaf7a6c8 ("packet: in packet_snd start writing at link layer allocation")
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Qihang Tang <q.h.hack.winter@gmail.com>
+	Reviewed-by: Willem de Bruijn <willemb@google.com>
+Link: https://patch.msgid.link/20260805125729.19220-3-q.h.hack.winter@gmail.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 03390aa32e669cc4ecd7d34108e2e1afc13d689d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netdevice.h
+#	net/packet/af_packet.c
+diff --cc include/linux/netdevice.h
+index cef072e7cfbb,8840b126979f..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -284,10 -300,14 +284,18 @@@ struct hh_cache 
+   * We could use other alignment values, but we must maintain the
+   * relationship HH alignment <= LL alignment.
+   */
+++<<<<<<< HEAD
+ +#define LL_RESERVED_SPACE(dev) \
+ +	((((dev)->hard_header_len+(dev)->needed_headroom)&~(HH_DATA_MOD - 1)) + HH_DATA_MOD)
+++=======
++ #define LL_RESERVED_SPACE_EX(dev, hlen) \
++ 	((((hlen) + READ_ONCE((dev)->needed_headroom)) \
++ 	  & ~(HH_DATA_MOD - 1)) + HH_DATA_MOD)
++ #define LL_RESERVED_SPACE(dev) \
++ 	LL_RESERVED_SPACE_EX(dev, (dev)->hard_header_len)
+++>>>>>>> 03390aa32e66 (packet: use consistent hard_header_len in non-ring send paths)
+  #define LL_RESERVED_SPACE_EXTRA(dev,extra) \
+ -	((((dev)->hard_header_len + READ_ONCE((dev)->needed_headroom) + (extra)) \
+ -	  & ~(HH_DATA_MOD - 1)) + HH_DATA_MOD)
+ +	((((dev)->hard_header_len+(dev)->needed_headroom+(extra))&~(HH_DATA_MOD - 1)) + HH_DATA_MOD)
+  
+  struct header_ops {
+  	int	(*create) (struct sk_buff *skb, struct net_device *dev,
+diff --cc net/packet/af_packet.c
+index 7b72f79ca2a7,b7af45c809e4..000000000000
+--- a/net/packet/af_packet.c
++++ b/net/packet/af_packet.c
+@@@ -2848,8 -2973,8 +2853,13 @@@ static int packet_snd(struct socket *so
+  	struct virtio_net_hdr vnet_hdr = { 0 };
+  	int offset = 0;
+  	struct packet_sock *po = pkt_sk(sk);
+++<<<<<<< HEAD
+ +	bool has_vnet_hdr = false;
+ +	int hlen, tlen, linear;
+++=======
++ 	int vnet_hdr_sz = READ_ONCE(po->vnet_hdr_sz);
++ 	int hard_header_len, hlen, tlen, linear;
+++>>>>>>> 03390aa32e66 (packet: use consistent hard_header_len in non-ring send paths)
+  	int extra_len = 0;
+  
+  	/*
+@@@ -2886,13 -3014,13 +2896,20 @@@
+  			goto out_unlock;
+  	}
+  
++ 	hard_header_len = READ_ONCE(dev->hard_header_len);
+  	if (sock->type == SOCK_RAW)
+++<<<<<<< HEAD
+ +		reserve = dev->hard_header_len;
+ +	if (po->has_vnet_hdr) {
+ +		err = packet_snd_vnet_parse(msg, &len, &vnet_hdr);
+++=======
++ 		reserve = hard_header_len;
++ 	if (vnet_hdr_sz) {
++ 		err = packet_snd_vnet_parse(msg, &len, &vnet_hdr, vnet_hdr_sz);
+++>>>>>>> 03390aa32e66 (packet: use consistent hard_header_len in non-ring send paths)
+  		if (err)
+  			goto out_unlock;
+ +		has_vnet_hdr = true;
+  	}
+  
+  	if (unlikely(sock_flag(sk, SOCK_NOFCS))) {
+* Unmerged path include/linux/netdevice.h
+* Unmerged path net/packet/af_packet.c
