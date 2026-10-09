@@ -1,0 +1,130 @@
+nfsd: fix UAF in async copy cancel and shutdown
+
+jira KERNEL-1736
+cve CVE-2026-89675
+Rebuild_History Non-Buildable kernel-6.12.0-211.64.1.el10_2
+commit-author Jeff Layton <jlayton@kernel.org>
+commit 62c0f6eaf050bb9284c1f9cac6ed1770092e6b95
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.64.1.el10_2/62c0f6ea.failed
+
+An async copy could be freed or used after free while a teardown caller
+(OFFLOAD_CANCEL, nfsd4_shutdown_copy, nfsd4_cancel_copy_by_sb) raced the
+copy kthread:
+
+  - find_async_copy() bumped copy->refcount but left the copy on
+    clp->async_copies, so the reaper's cleanup_async_copy() could run
+    release_copy_files() concurrently with a cancel/shutdown caller. Both
+    put and NULL nf_src/nf_dst without a common lock, double-putting the
+    nfsd_file and freeing it early.
+
+  - nfsd4_do_async_copy() set NFSD4_COPY_F_STOPPED before its final uses
+    of the copy (nfsd_update_cmtime_attr() on copy->nf_dst,
+    nfsd4_send_cb_offload()). nfsd4_stop_copy() treats a set STOPPED bit
+    as "kthread done, skip kthread_stop()", so a teardown caller ran
+    release_copy_files() -- which puts and NULLs nf_dst -- while the
+    kthread still dereferenced it (NULL/UAF).
+
+  - copy->copy_task was never pinned. The one-shot kthread self-reaps on
+    return, so kthread_stop()'s get_task_struct() could touch a freed
+    task_struct.
+
+  - co_cb is embedded in the copy, but nfsd4_send_cb_offload() held a
+    reference only on the client, so a concurrent teardown could free
+    the copy while the CB_OFFLOAD callback was in flight.
+
+Fix the teardown lifetime as a whole:
+
+  - find_async_copy() unlinks the copy (clear cp_clp, list_del_init)
+    under async_lock; the cancel, shutdown, and sb-cancel paths drop the
+    list-membership reference via nfs4_put_copy() after nfsd4_stop_copy().
+    Drop the now-redundant list_del fixup from cleanup_async_copy().
+
+  - Because unlinking hides the copy from the reaper, its
+    cleanup_async_copy() can no longer remove the copy's s2s_cp_stateids
+    entry; the cancel/shutdown/sb-cancel paths now call
+    nfs4_free_copy_state() themselves (while cp_clp is still valid) so
+    the entry does not dangle at freed memory for the laundromat and
+    manage_cpntf_state() to dereference.
+
+  - Give the kthread its own reference, taken in nfsd4_copy() before
+    wake_up_process() and dropped at the end of nfsd4_do_async_copy();
+    call wake_up_process() before list_add().
+
+  - Pin the task_struct with get_task_struct() in nfsd4_copy(), released
+    in nfs4_put_copy(), so kthread_stop() is safe whenever the kthread
+    exits. Set NFSD4_COPY_F_STOPPED only in nfsd4_stop_copy(), which now
+    always kthread_stop()s before release_copy_files(); completion is
+    still reported via NFSD4_COPY_F_COMPLETED, so
+    nfsd4_has_active_async_copies() is unaffected. Each teardown caller
+    removes the copy from clp->async_copies first, so kthread_stop() runs
+    exactly once.
+
+  - Take a copy reference in nfsd4_send_cb_offload(), dropped in
+    nfsd4_cb_offload_release(). The kthread still holds its own reference
+    there, so the refcount_inc() cannot race the final free.
+
+  - Read cp_clp with smp_load_acquire() to pair with the unordered
+    set_bit()/clear_bit() writers (Documentation/atomic_bitops.rst).
+
+Fixes: e0639dc5805a ("NFSD introduce async copy feature")
+	Cc: stable@vger.kernel.org
+Fixes: ac0514f4d198 ("NFSD: Add a laundromat reaper for async copy state")
+Assisted-by: Claude:claude-opus-4-8
+	Signed-off-by: Jeff Layton <jlayton@kernel.org>
+Link: https://patch.msgid.link/20260710-nfsd-testing-v3-2-a0ff7db6aa3e@kernel.org
+	Signed-off-by: Chuck Lever <cel@kernel.org>
+(cherry picked from commit 62c0f6eaf050bb9284c1f9cac6ed1770092e6b95)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfsd/nfs4proc.c
+diff --cc fs/nfsd/nfs4proc.c
+index e8c695e7fce6,b2f1a9bc9202..000000000000
+--- a/fs/nfsd/nfs4proc.c
++++ b/fs/nfsd/nfs4proc.c
+@@@ -2048,14 -2169,20 +2067,21 @@@ static int nfsd4_do_async_copy(void *da
+  do_callback:
+  	if (!test_bit(NFSD4_COPY_F_CB_ERROR, &copy->cp_flags))
+  		copy->nfserr = nfserr;
+- 	/* The kthread exits forthwith. Ensure that a subsequent
+- 	 * OFFLOAD_CANCEL won't try to kill it again. */
+- 	set_bit(NFSD4_COPY_F_STOPPED, &copy->cp_flags);
+- 
++ 	/*
++ 	 * Don't set NFSD4_COPY_F_STOPPED here: it tells a teardown caller it
++ 	 * may skip kthread_stop(), which would then release nf_dst and the
++ 	 * client while still in use. Only nfsd4_stop_copy() sets it, after
++ 	 * joining.
++ 	 */
+  	set_bit(NFSD4_COPY_F_COMPLETED, &copy->cp_flags);
+  	trace_nfsd_copy_async_done(copy);
+ -	atomic_dec(&copy->cp_nn->pending_async_copies);
+ -	if (copy->cp_res.wr_bytes_written > 0 && copy->attr_update)
+ -		nfsd_update_cmtime_attr(copy->nf_dst->nf_file, 0);
+  	nfsd4_send_cb_offload(copy);
+++<<<<<<< HEAD
+ +	atomic_dec(&copy->cp_nn->pending_async_copies);
+++=======
++ 	/* Drop the kthread's reference (taken in nfsd4_copy()); copy may be freed after this. */
++ 	nfs4_put_copy(copy);
+++>>>>>>> 62c0f6eaf050 (nfsd: fix UAF in async copy cancel and shutdown)
+  	return 0;
+  }
+  
+@@@ -2096,7 -2221,9 +2122,13 @@@ nfsd4_copy(struct svc_rqst *rqstp, stru
+  	memcpy(&copy->fh, &cstate->current_fh.fh_handle,
+  		sizeof(struct knfsd_fh));
+  	if (nfsd4_copy_is_async(copy)) {
+++<<<<<<< HEAD
+ +		async_copy = kzalloc(sizeof(struct nfsd4_copy), GFP_KERNEL);
+++=======
++ 		struct task_struct *task;
++ 
++ 		async_copy = kzalloc_obj(struct nfsd4_copy);
+++>>>>>>> 62c0f6eaf050 (nfsd: fix UAF in async copy cancel and shutdown)
+  		if (!async_copy)
+  			goto out_err;
+  		async_copy->cp_nn = nn;
+* Unmerged path fs/nfsd/nfs4proc.c

@@ -1,0 +1,392 @@
+futex: Optimize futex hash bucket access patterns
+
+jira KERNEL-1736
+Rebuild_History Non-Buildable kernel-6.12.0-211.64.1.el10_2
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit a734d9fca84e1d4fa0cb442ef5f84c88f8212d32
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.64.1.el10_2/a734d9fc.failed
+
+Breno reported significant c2c HITM in a futex hash heavy workload.
+
+It turns out that the hash bucket to private hash table reverse pointer
+(futex_hash_bucket::priv) was to blame. Notably when the hash buckets are
+heavily contended, the: 'fph = bh->priv;' load in futex_hash() will typically
+miss and consequently become quite expensive.
+
+Since this load in particular is quite superfluous, removing it is fairly
+straight forward. However, removing it does not in fact achieve anything much.
+The pain moves to the next user, notably: futex_hash_put().
+
+Therefore rework the whole private hash refcounting to avoid needing this back
+pointer (and removing it). Instead of passing around 'struct futex_hash_bucket
+*hb', pass around a new structure that contains it and the related 'struct
+futex_private_hash *fph' pointer in tandem.
+
+Funnily this turns out to remove more code than it adds and significantly
+improves futex hash performance (as measured by 'perf bench futex hash'):
+
+SKL dual socket 112 threads:
+
+		  Baseline        Patched
+  shared (16k)    1571857         1641435         + 4.4%
+  autosize (512)   646390          903371         +39.7%
+  -b 256           464395          587014         +26.4%
+  -b 512           715687          995943         +39.2%
+  -b 1024          995085         1396328         +40.3%
+  -b 2048         1293114         1668395         +29.0%
+  -b 4096         2124438         2240228         + 5.5%
+
+Zen3 dual socket 256 threads:
+
+                  Baseline        Patched
+  shared  (16k)   1275840         1381279         + 8.2%
+  autosize (512)  1252745         1482179         +18.3%
+  -b 256           856274          955455         +11.5%
+  -b 512          1267490         1544010         +21.8%
+  -b 1024         1424013         1625424         +14.1%
+  -b 2048         1505181         1669342         +10.9%
+  -b 4096         1465993         1688932         +15.2%
+
+AMD EPYC 9D64 (Zen4, single socket) 176 threads:
+
+                       Baseline       Patched      Delta
+  shared (16k)         1,230,599      1,368,655    +11.2%
+  autosize (1024)      1,285,440      1,556,946    +21.1%
+  -b 256               1,341,471      1,520,303    +13.3%
+  -b 512               1,438,330      1,599,319    +11.2%
+  -b 1024              1,443,772      1,622,493    +12.4%
+  -b 2048              1,472,108      1,643,975    +11.7%
+  -b 4096              1,333,098      1,570,897    +17.8%
+
+	Reported-by: Breno Leitao <leitao@debian.org>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Tested-by: Breno Leitao <leitao@debian.org>
+	Tested-by: Thomas Gleixner <tglx@kernel.org>
+Link: https://patch.msgid.link/20260610135510.GB1430057@noisy.programming.kicks-ass.net
+(cherry picked from commit a734d9fca84e1d4fa0cb442ef5f84c88f8212d32)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/futex/core.c
+diff --cc kernel/futex/core.c
+index fe1c5ef41ac7,179b26e9c934..000000000000
+--- a/kernel/futex/core.c
++++ b/kernel/futex/core.c
+@@@ -183,17 -152,9 +149,21 @@@ __futex_hash_private(union futex_key *k
+  {
+  	u32 hash;
+  
+++<<<<<<< HEAD
+ +	if (!futex_key_is_private(key))
+ +		return NULL;
+ +
+ +	if (!fph)
+ +		fph = rcu_dereference(key->private.mm->futex_phash);
+ +	if (!fph || !fph->hash_mask)
+ +		return NULL;
+ +
+ +	hash = jhash2((void *)&key->private.address,
+ +		      sizeof(key->private.address) / 4,
+++=======
++ 	hash = jhash2((void *)&key->private.address, sizeof(key->private.address) / 4,
+++>>>>>>> a734d9fca84e (futex: Optimize futex hash bucket access patterns)
+  		      key->both.offset);
+ -
+  	return &fph->queues[hash & fph->hash_mask];
+  }
+  
+@@@ -412,21 -365,24 +375,29 @@@ static int futex_mpol(struct mm_struct 
+   * global hash is returned.
+   */
+  static struct futex_hash_bucket *
+++<<<<<<< HEAD
+ +__futex_hash(union futex_key *key, struct futex_private_hash *fph)
+++=======
++ __futex_hash(union futex_key *key, struct futex_private_hash *fph, struct futex_private_hash **fph_p)
+++>>>>>>> a734d9fca84e (futex: Optimize futex hash bucket access patterns)
+  {
+  	int node = key->both.node;
+  	u32 hash;
+  
+- 	if (node == FUTEX_NO_NODE) {
+- 		struct futex_hash_bucket *hb;
+- 
+- 		hb = __futex_hash_private(key, fph);
+- 		if (hb)
+- 			return hb;
++ #ifdef CONFIG_FUTEX_PRIVATE_HASH
++ 	if (node == FUTEX_NO_NODE && futex_key_is_private(key)) {
++ 		if (!fph)
++ 			fph = rcu_dereference(key->private.mm->futex.phash.hash);
++ 		if (fph && fph->hash_mask) {
++ 			if (fph_p)
++ 				*fph_p = fph;
++ 			return __futex_hash_private(key, fph);
++ 		}
+  	}
++ #endif
+  
+ -	hash = jhash2((u32 *)key, offsetof(typeof(*key), both.offset) / sizeof(u32),
+ +	hash = jhash2((u32 *)key,
+ +		      offsetof(typeof(*key), both.offset) / sizeof(u32),
+  		      key->both.offset);
+  
+  	if (node == FUTEX_NO_NODE) {
+* Unmerged path kernel/futex/core.c
+diff --git a/kernel/futex/futex.h b/kernel/futex/futex.h
+index 2cd57096c38e..17893fe1ce40 100644
+--- a/kernel/futex/futex.h
++++ b/kernel/futex/futex.h
+@@ -126,6 +126,15 @@ static inline bool should_fail_futex(bool fshared)
+ }
+ #endif
+ 
++static inline bool futex_key_is_private(union futex_key *key)
++{
++	/*
++	 * Relies on get_futex_key() to set either bit for shared
++	 * futexes -- see comment with union futex_key.
++	 */
++	return !(key->both.offset & (FUT_OFF_INODE | FUT_OFF_MMSHARED));
++}
++
+ /*
+  * Hash buckets are shared by all the futex_keys that hash to the same
+  * location.  Each key may have multiple futex_q structures, one for each task
+@@ -135,7 +144,6 @@ struct futex_hash_bucket {
+ 	atomic_t waiters;
+ 	spinlock_t lock;
+ 	struct plist_head chain;
+-	struct futex_private_hash *priv;
+ } ____cacheline_aligned_in_smp;
+ 
+ /*
+@@ -175,7 +183,7 @@ typedef void (futex_wake_fn)(struct wake_q_head *wake_q, struct futex_q *q);
+  * @requeue_pi_key:	the requeue_pi target futex key
+  * @bitset:		bitset for the optional bitmasked wakeup
+  * @requeue_state:	State field for futex_requeue_pi()
+- * @drop_hb_ref:	Waiter should drop the extra hash bucket reference if true
++ * @drop_fph:		Waiter should drop the extra private hash reference when set
+  * @requeue_wait:	RCU wait for futex_requeue_pi() (RT only)
+  *
+  * We use this hashed waitqueue, instead of a normal wait_queue_entry_t, so
+@@ -202,7 +210,7 @@ struct futex_q {
+ 	union futex_key *requeue_pi_key;
+ 	u32 bitset;
+ 	atomic_t requeue_state;
+-	bool drop_hb_ref;
++	struct futex_private_hash *drop_fph;
+ #ifdef CONFIG_PREEMPT_RT
+ 	struct rcuwait requeue_wait;
+ #endif
+@@ -222,28 +230,29 @@ extern struct hrtimer_sleeper *
+ futex_setup_timer(ktime_t *time, struct hrtimer_sleeper *timeout,
+ 		  int flags, u64 range_ns);
+ 
+-extern struct futex_hash_bucket *futex_hash(union futex_key *key);
+-#ifdef CONFIG_FUTEX_PRIVATE_HASH
+-extern void futex_hash_get(struct futex_hash_bucket *hb);
+-extern void futex_hash_put(struct futex_hash_bucket *hb);
++struct futex_bucket_ref {
++	struct futex_hash_bucket *hb;
++	struct futex_private_hash *fph;
++};
+ 
+-extern struct futex_private_hash *futex_private_hash(void);
++#ifdef CONFIG_FUTEX_PRIVATE_HASH
++extern struct futex_private_hash *futex_private_hash(struct mm_struct *mm);
+ extern void futex_private_hash_put(struct futex_private_hash *fph);
+ 
+ #else /* !CONFIG_FUTEX_PRIVATE_HASH */
+-static inline void futex_hash_get(struct futex_hash_bucket *hb) { }
+-static inline void futex_hash_put(struct futex_hash_bucket *hb) { }
+-static inline struct futex_private_hash *futex_private_hash(void) { return NULL; }
++static inline struct futex_private_hash *futex_private_hash(struct mm_struct *mm) { return NULL; }
+ static inline void futex_private_hash_put(struct futex_private_hash *fph) { }
+ #endif
+ 
+-DEFINE_CLASS(hb, struct futex_hash_bucket *,
+-	     if (_T) futex_hash_put(_T),
++extern struct futex_bucket_ref futex_hash(union futex_key *key);
++
++DEFINE_CLASS(hbr, struct futex_bucket_ref,
++	     if (_T.fph) futex_private_hash_put(_T.fph),
+ 	     futex_hash(key), union futex_key *key);
+ 
+ DEFINE_CLASS(private_hash, struct futex_private_hash *,
+ 	     if (_T) futex_private_hash_put(_T),
+-	     futex_private_hash(), void);
++	     futex_private_hash(mm), struct mm_struct *mm);
+ 
+ /**
+  * futex_match - Check whether two futex keys are equal
+diff --git a/kernel/futex/pi.c b/kernel/futex/pi.c
+index 64cb87d3a73e..59f36849b52b 100644
+--- a/kernel/futex/pi.c
++++ b/kernel/futex/pi.c
+@@ -940,7 +940,8 @@ int futex_lock_pi(u32 __user *uaddr, unsigned int flags, ktime_t *time, int tryl
+ 
+ retry_private:
+ 	if (1) {
+-		CLASS(hb, hb)(&q.key);
++		CLASS(hbr, hbr)(&q.key);
++		auto hb = hbr.hb;
+ 
+ 		futex_q_lock(&q, hb);
+ 
+@@ -1003,7 +1004,7 @@ int futex_lock_pi(u32 __user *uaddr, unsigned int flags, ktime_t *time, int tryl
+ 		 * the thread, performing resize, will block on hb->lock during
+ 		 * the requeue.
+ 		 */
+-		futex_hash_put(no_free_ptr(hb));
++		futex_private_hash_put(no_free_ptr(hbr.fph));
+ 		/*
+ 		 * Must be done before we enqueue the waiter, here is unfortunately
+ 		 * under the hb lock, but that *should* work because it does nothing.
+@@ -1093,11 +1094,9 @@ int futex_lock_pi(u32 __user *uaddr, unsigned int flags, ktime_t *time, int tryl
+ 
+ 		futex_unqueue_pi(&q);
+ 		spin_unlock(q.lock_ptr);
+-		if (q.drop_hb_ref) {
+-			CLASS(hb, hb)(&q.key);
+-			/* Additional reference from futex_unlock_pi() */
+-			futex_hash_put(hb);
+-		}
++
++		/* Additional reference from futex_unlock_pi() */
++		futex_private_hash_put(q.drop_fph);
+ 		goto out;
+ 
+ out_unlock_put_key:
+@@ -1153,7 +1152,8 @@ int futex_unlock_pi(u32 __user *uaddr, unsigned int flags)
+ 	if (ret)
+ 		return ret;
+ 
+-	CLASS(hb, hb)(&key);
++	CLASS(hbr, hbr)(&key);
++	auto hb = hbr.hb;
+ 	spin_lock(&hb->lock);
+ retry_hb:
+ 
+@@ -1210,8 +1210,9 @@ int futex_unlock_pi(u32 __user *uaddr, unsigned int flags)
+ 			 * Acquire a reference for the leaving waiter to ensure
+ 			 * valid futex_q::lock_ptr.
+ 			 */
+-			futex_hash_get(hb);
+-			top_waiter->drop_hb_ref = true;
++			if (futex_key_is_private(&key))
++				top_waiter->drop_fph = futex_private_hash(key.private.mm);
++
+ 			__futex_unqueue(top_waiter);
+ 			raw_spin_unlock_irq(&pi_state->pi_mutex.wait_lock);
+ 			goto retry_hb;
+diff --git a/kernel/futex/requeue.c b/kernel/futex/requeue.c
+index b597cb3d17fc..79823ad13683 100644
+--- a/kernel/futex/requeue.c
++++ b/kernel/futex/requeue.c
+@@ -241,8 +241,8 @@ void requeue_pi_wake_futex(struct futex_q *q, union futex_key *key,
+ 	 * Acquire a reference for the waiter to ensure valid
+ 	 * futex_q::lock_ptr.
+ 	 */
+-	futex_hash_get(hb);
+-	q->drop_hb_ref = true;
++	if (futex_key_is_private(key))
++		q->drop_fph = futex_private_hash(key->private.mm);
+ 	q->lock_ptr = &hb->lock;
+ 	task = READ_ONCE(q->task);
+ 
+@@ -459,8 +459,10 @@ int futex_requeue(u32 __user *uaddr1, unsigned int flags1,
+ 
+ retry_private:
+ 	if (1) {
+-		CLASS(hb, hb1)(&key1);
+-		CLASS(hb, hb2)(&key2);
++		CLASS(hbr, hbr1)(&key1);
++		CLASS(hbr, hbr2)(&key2);
++		auto hb1 = hbr1.hb;
++		auto hb2 = hbr2.hb;
+ 
+ 		futex_hb_waiters_inc(hb2);
+ 		double_lock_hb(hb1, hb2);
+@@ -832,7 +834,8 @@ int futex_wait_requeue_pi(u32 __user *uaddr, unsigned int flags,
+ 	switch (futex_requeue_pi_wakeup_sync(&q)) {
+ 	case Q_REQUEUE_PI_IGNORE:
+ 		{
+-			CLASS(hb, hb)(&q.key);
++			CLASS(hbr, hbr)(&q.key);
++			auto hb = hbr.hb;
+ 			/* The waiter is still on uaddr1 */
+ 			spin_lock(&hb->lock);
+ 			ret = handle_early_requeue_pi_wakeup(hb, &q, to);
+@@ -902,11 +905,8 @@ int futex_wait_requeue_pi(u32 __user *uaddr, unsigned int flags,
+ 	default:
+ 		BUG();
+ 	}
+-	if (q.drop_hb_ref) {
+-		CLASS(hb, hb)(&q.key);
+-		/* Additional reference from requeue_pi_wake_futex() */
+-		futex_hash_put(hb);
+-	}
++	/* Additional reference from requeue_pi_wake_futex() */
++	futex_private_hash_put(q.drop_fph);
+ 
+ out:
+ 	if (to) {
+diff --git a/kernel/futex/waitwake.c b/kernel/futex/waitwake.c
+index 7a35bfdb5fc7..a2ae4ead133a 100644
+--- a/kernel/futex/waitwake.c
++++ b/kernel/futex/waitwake.c
+@@ -169,7 +169,8 @@ int futex_wake(u32 __user *uaddr, unsigned int flags, int nr_wake, u32 bitset)
+ 	if ((flags & FLAGS_STRICT) && !nr_wake)
+ 		return 0;
+ 
+-	CLASS(hb, hb)(&key);
++	CLASS(hbr, hbr)(&key);
++	auto hb = hbr.hb;
+ 
+ 	/* Make sure we really have tasks to wakeup */
+ 	if (!futex_hb_waiters_pending(hb))
+@@ -267,8 +268,10 @@ int futex_wake_op(u32 __user *uaddr1, unsigned int flags, u32 __user *uaddr2,
+ 
+ retry_private:
+ 	if (1) {
+-		CLASS(hb, hb1)(&key1);
+-		CLASS(hb, hb2)(&key2);
++		CLASS(hbr, hbr1)(&key1);
++		CLASS(hbr, hbr2)(&key2);
++		auto hb1 = hbr1.hb;
++		auto hb2 = hbr2.hb;
+ 
+ 		double_lock_hb(hb1, hb2);
+ 		op_ret = futex_atomic_op_inuser(op, uaddr2);
+@@ -410,7 +413,7 @@ int futex_wait_multiple_setup(struct futex_vector *vs, int count, int *woken)
+ 	 * Make sure to have a reference on the private_hash such that we
+ 	 * don't block on rehash after changing the task state below.
+ 	 */
+-	guard(private_hash)();
++	guard(private_hash)(current->mm);
+ 
+ 	/*
+ 	 * Enqueuing multiple futexes is tricky, because we need to enqueue
+@@ -447,7 +450,8 @@ int futex_wait_multiple_setup(struct futex_vector *vs, int count, int *woken)
+ 		u32 val = vs[i].w.val;
+ 
+ 		if (1) {
+-			CLASS(hb, hb)(&q->key);
++			CLASS(hbr, hbr)(&q->key);
++			auto hb = hbr.hb;
+ 
+ 			futex_q_lock(q, hb);
+ 			ret = futex_get_value_locked(&uval, uaddr);
+@@ -621,7 +625,8 @@ int futex_wait_setup(u32 __user *uaddr, u32 val, unsigned int flags,
+ 
+ retry_private:
+ 	if (1) {
+-		CLASS(hb, hb)(&q->key);
++		CLASS(hbr, hbr)(&q->key);
++		auto hb = hbr.hb;
+ 
+ 		futex_q_lock(q, hb);
+ 
