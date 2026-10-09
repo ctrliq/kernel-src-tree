@@ -207,3 +207,89 @@ jobs:
             ckc_result.txt
             pr_metadata/
           retention-days: 3  # Increased from 1 (then 3) to prevent premature deletion and support manual follow-ups
+
+
+  compare-backports:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      pull-requests: read
+
+    steps:
+      - name: Check out the workflow scripts
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          # Kernel branches call this workflow from main, so take the scripts
+          # from the commit that defines this job rather than from the PR
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          sparse-checkout: .github/scripts
+          path: workflow-scripts
+          persist-credentials: false
+
+      - name: Check out libgit2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          repository: libgit2/libgit2
+          ref: 0060d9cf5666f015b1067129bd874c6cc4c9c7ac  # v1.9.1
+          path: libgit2
+          persist-credentials: false
+
+      - name: Check out diffofdiffs
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          repository: ctrliq/diffofdiffs
+          ref: 0ee3188313eb76722387b81d8852da207926ff77  # v1.1.0
+          path: diffofdiffs
+          persist-credentials: false
+
+      - name: Build diffofdiffs
+        run: |
+          # diffofdiffs needs libgit2 1.9.1 or newer, which Ubuntu 24.04
+          # doesn't package
+          PREFIX="$RUNNER_TEMP/libgit2"
+          cmake -S libgit2 -B libgit2/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DBUILD_TESTS=OFF -DBUILD_CLI=OFF \
+            -DUSE_SSH=OFF -DUSE_HTTPS=OFF \
+            -DREGEX_BACKEND=builtin -DUSE_BUNDLED_ZLIB=ON
+          cmake --build libgit2/build --parallel "$(nproc)"
+          cmake --install libgit2/build
+          make -C diffofdiffs -j"$(nproc)" \
+            CPPFLAGS="-I$PREFIX/include" \
+            LDFLAGS="-L$PREFIX/lib -Wl,-rpath,$PREFIX/lib"
+
+      - name: Compare backports with their upstream commits
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_COMMITS: ${{ github.event.pull_request.commits }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_CLONE_URL: ${{ github.event.pull_request.head.repo.clone_url }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          DIFFOFDIFFS: ${{ github.workspace }}/diffofdiffs/diffofdiffs
+          OUTPUT_DIR: ${{ github.workspace }}/comparisons
+        run: python3 -I workflow-scripts/.github/scripts/diffofdiffs-compare.py
+
+      - name: Upload the HTML report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          # An unarchived upload keeps the file name as the artifact name and
+          # lets GitHub show the report in the browser
+          path: comparisons/diffofdiffs-report-${{ github.run_attempt }}.html
+          archive: false
+          if-no-files-found: ignore
+          retention-days: 90
+
+      - name: Upload the comparison results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: diffofdiffs-results-${{ github.run_attempt }}
+          path: comparisons/comparisons.json
+          if-no-files-found: error
+          retention-days: 3
