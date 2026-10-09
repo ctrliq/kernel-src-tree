@@ -1,0 +1,186 @@
+KVM: SVM: Move x2AVIC MSR interception helper to avic.c
+
+jira KERNEL-1731
+cve CVE-2026-74516
+Rebuild_History Non-Buildable kernel-5.14.0-687.56.1.el9_8
+commit-author Sean Christopherson <seanjc@google.com>
+commit eb44ea6a7aace13becd8d99905284ad272b3bd98
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.56.1.el9_8/eb44ea6a.failed
+
+Move svm_set_x2apic_msr_interception() to avic.c as it's only relevant
+when x2AVIC is enabled/supported and only called by AVIC code.  In
+addition to scoping AVIC code to avic.c, this will allow burying the
+global x2avic_enabled variable in avic.
+
+Opportunistically rename the helper to explicitly scope it to "avic".
+
+No functional change intended.
+
+	Reviewed-by: Naveen N Rao (AMD) <naveen@kernel.org>
+	Tested-by: Naveen N Rao (AMD) <naveen@kernel.org>
+Link: https://lore.kernel.org/r/20250919215934.1590410-3-seanjc@google.com
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+(cherry picked from commit eb44ea6a7aace13becd8d99905284ad272b3bd98)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm/avic.c
+#	arch/x86/kvm/svm/svm.c
+diff --cc arch/x86/kvm/svm/avic.c
+index 65fd245a9953,478a18208a76..000000000000
+--- a/arch/x86/kvm/svm/avic.c
++++ b/arch/x86/kvm/svm/avic.c
+@@@ -74,13 -79,56 +74,66 @@@ static bool next_vm_id_wrapped = 0
+  static DEFINE_SPINLOCK(svm_vm_data_hash_lock);
+  bool x2avic_enabled;
+  
+++<<<<<<< HEAD
+ +/*
+ + * This is a wrapper of struct amd_iommu_ir_data.
+ + */
+ +struct amd_svm_iommu_ir {
+ +	struct list_head node;	/* Used by SVM for per-vcpu ir_list */
+ +	void *data;		/* Storing pointer to struct amd_ir_data */
+ +};
+++=======
++ 
++ static void avic_set_x2apic_msr_interception(struct vcpu_svm *svm,
++ 					     bool intercept)
++ {
++ 	static const u32 x2avic_passthrough_msrs[] = {
++ 		X2APIC_MSR(APIC_ID),
++ 		X2APIC_MSR(APIC_LVR),
++ 		X2APIC_MSR(APIC_TASKPRI),
++ 		X2APIC_MSR(APIC_ARBPRI),
++ 		X2APIC_MSR(APIC_PROCPRI),
++ 		X2APIC_MSR(APIC_EOI),
++ 		X2APIC_MSR(APIC_RRR),
++ 		X2APIC_MSR(APIC_LDR),
++ 		X2APIC_MSR(APIC_DFR),
++ 		X2APIC_MSR(APIC_SPIV),
++ 		X2APIC_MSR(APIC_ISR),
++ 		X2APIC_MSR(APIC_TMR),
++ 		X2APIC_MSR(APIC_IRR),
++ 		X2APIC_MSR(APIC_ESR),
++ 		X2APIC_MSR(APIC_ICR),
++ 		X2APIC_MSR(APIC_ICR2),
++ 
++ 		/*
++ 		 * Note!  Always intercept LVTT, as TSC-deadline timer mode
++ 		 * isn't virtualized by hardware, and the CPU will generate a
++ 		 * #GP instead of a #VMEXIT.
++ 		 */
++ 		X2APIC_MSR(APIC_LVTTHMR),
++ 		X2APIC_MSR(APIC_LVTPC),
++ 		X2APIC_MSR(APIC_LVT0),
++ 		X2APIC_MSR(APIC_LVT1),
++ 		X2APIC_MSR(APIC_LVTERR),
++ 		X2APIC_MSR(APIC_TMICT),
++ 		X2APIC_MSR(APIC_TMCCT),
++ 		X2APIC_MSR(APIC_TDCR),
++ 	};
++ 	int i;
++ 
++ 	if (intercept == svm->x2avic_msrs_intercepted)
++ 		return;
++ 
++ 	if (!x2avic_enabled)
++ 		return;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(x2avic_passthrough_msrs); i++)
++ 		svm_set_intercept_for_msr(&svm->vcpu, x2avic_passthrough_msrs[i],
++ 					  MSR_TYPE_RW, intercept);
++ 
++ 	svm->x2avic_msrs_intercepted = intercept;
++ }
+++>>>>>>> eb44ea6a7aac (KVM: SVM: Move x2AVIC MSR interception helper to avic.c)
+  
+  static void avic_activate_vmcb(struct vcpu_svm *svm)
+  {
+diff --cc arch/x86/kvm/svm/svm.c
+index 94a91f698a6d,44032c78aab0..000000000000
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@@ -875,47 -701,30 +875,51 @@@ u32 *svm_vcpu_alloc_msrpm(void
+  	if (!pages)
+  		return NULL;
+  
+ -	/*
+ -	 * Set all bits in the permissions map so that all MSR and I/O accesses
+ -	 * are intercepted by default.
+ -	 */
+ -	pm = page_address(pages);
+ -	memset(pm, 0xff, PAGE_SIZE * (1 << order));
+ +	msrpm = page_address(pages);
+ +	memset(msrpm, 0xff, PAGE_SIZE * (1 << order));
+ +
+ +	return msrpm;
+ +}
+ +
+ +void svm_vcpu_init_msrpm(struct kvm_vcpu *vcpu, u32 *msrpm)
+ +{
+ +	int i;
+  
+ -	return pm;
+ +	for (i = 0; direct_access_msrs[i].index != MSR_INVALID; i++) {
+ +		if (!direct_access_msrs[i].always)
+ +			continue;
+ +		set_msr_interception(vcpu, msrpm, direct_access_msrs[i].index, 1, 1);
+ +	}
+  }
+  
+ -static void svm_recalc_lbr_msr_intercepts(struct kvm_vcpu *vcpu)
+++<<<<<<< HEAD
+ +void svm_set_x2apic_msr_interception(struct vcpu_svm *svm, bool intercept)
+  {
+ -	bool intercept = !(to_svm(vcpu)->vmcb->control.virt_ext & LBR_CTL_ENABLE_MASK);
+ +	int i;
+  
+ -	svm_set_intercept_for_msr(vcpu, MSR_IA32_LASTBRANCHFROMIP, MSR_TYPE_RW, intercept);
+ -	svm_set_intercept_for_msr(vcpu, MSR_IA32_LASTBRANCHTOIP, MSR_TYPE_RW, intercept);
+ -	svm_set_intercept_for_msr(vcpu, MSR_IA32_LASTINTFROMIP, MSR_TYPE_RW, intercept);
+ -	svm_set_intercept_for_msr(vcpu, MSR_IA32_LASTINTTOIP, MSR_TYPE_RW, intercept);
+ +	if (intercept == svm->x2avic_msrs_intercepted)
+ +		return;
+  
+ -	if (sev_es_guest(vcpu->kvm))
+ -		svm_set_intercept_for_msr(vcpu, MSR_IA32_DEBUGCTLMSR, MSR_TYPE_RW, intercept);
+ +	if (!x2avic_enabled)
+ +		return;
+ +
+ +	for (i = 0; i < MAX_DIRECT_ACCESS_MSRS; i++) {
+ +		int index = direct_access_msrs[i].index;
+ +
+ +		if ((index < APIC_BASE_MSR) ||
+ +		    (index > APIC_BASE_MSR + 0xff))
+ +			continue;
+ +		set_msr_interception(&svm->vcpu, svm->msrpm, index,
+ +				     !intercept, !intercept);
+ +	}
+ +
+ +	svm->x2avic_msrs_intercepted = intercept;
+  }
+  
+ +void svm_vcpu_free_msrpm(u32 *msrpm)
+++=======
++ void svm_vcpu_free_msrpm(void *msrpm)
+++>>>>>>> eb44ea6a7aac (KVM: SVM: Move x2AVIC MSR interception helper to avic.c)
+  {
+  	__free_pages(virt_to_page(msrpm), get_order(MSRPM_SIZE));
+  }
+* Unmerged path arch/x86/kvm/svm/avic.c
+* Unmerged path arch/x86/kvm/svm/svm.c
+diff --git a/arch/x86/kvm/svm/svm.h b/arch/x86/kvm/svm/svm.h
+index 63a49a97f4e2..e7ec795cbe8b 100644
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@ -602,7 +602,6 @@ void svm_set_gif(struct vcpu_svm *svm, bool value);
+ int svm_invoke_exit_handler(struct kvm_vcpu *vcpu, u64 exit_code);
+ void set_msr_interception(struct kvm_vcpu *vcpu, u32 *msrpm, u32 msr,
+ 			  int read, int write);
+-void svm_set_x2apic_msr_interception(struct vcpu_svm *svm, bool disable);
+ void svm_complete_interrupt_delivery(struct kvm_vcpu *vcpu, int delivery_mode,
+ 				     int trig_mode, int vec);
+ 
