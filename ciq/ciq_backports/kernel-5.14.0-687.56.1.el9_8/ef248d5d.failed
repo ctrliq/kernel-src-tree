@@ -1,0 +1,69 @@
+nvme: add missing SRCU grace period in error path
+
+jira KERNEL-1731
+cve CVE-2026-89972
+Rebuild_History Non-Buildable kernel-5.14.0-687.56.1.el9_8
+commit-author Tristan Madani <tristan@talencesecurity.com>
+commit ef248d5de4469fb6bbaf8dbe0c4c47800080d648
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.56.1.el9_8/ef248d5d.failed
+
+nvme_alloc_ns() error path at out_unlink_ns removes ns from the
+namespace head siblings list with list_del_rcu(&ns->siblings) but
+does not wait for SRCU readers before freeing the namespace struct.
+Multipath code iterates the head->list under srcu_read_lock() in
+nvme_find_path() and nvme_mpath_revalidate_paths(), so a concurrent
+reader can still hold a reference to ns when kfree(ns) runs.
+
+The normal removal path in nvme_ns_remove() correctly calls
+synchronize_srcu(&ns->head->srcu) after list_del_rcu() to wait for
+in-progress readers. Add the same grace period in the error path.
+
+Fixes: ed754e5deeb1 ("nvme: track shared namespaces")
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Tristan Madani <tristan@talencesecurity.com>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Reviewed-by: John Garry <john.g.garry@oracle.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Keith Busch <kbusch@kernel.org>
+(cherry picked from commit ef248d5de4469fb6bbaf8dbe0c4c47800080d648)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+diff --cc drivers/nvme/host/core.c
+index 4e593ed81125,9739ce38b73a..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -4186,9 -4331,25 +4186,17 @@@ static void nvme_alloc_ns(struct nvme_c
+   out_unlink_ns:
+  	mutex_lock(&ctrl->subsys->lock);
+  	list_del_rcu(&ns->siblings);
+ -	if (list_empty(&ns->head->list)) {
+ +	if (list_empty(&ns->head->list))
+  		list_del_init(&ns->head->entry);
+ -		/*
+ -		 * If multipath is not configured, we still create a namespace
+ -		 * head (nshead), but head->disk is not initialized in that
+ -		 * case.  As a result, only a single reference to nshead is held
+ -		 * (via kref_init()) when it is created. Therefore, ensure that
+ -		 * we do not release the reference to nshead twice if head->disk
+ -		 * is not present.
+ -		 */
+ -		if (ns->head->disk)
+ -			last_path = true;
+ -	}
+  	mutex_unlock(&ctrl->subsys->lock);
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* guarantee not available in head->list */
++ 	synchronize_srcu(&ns->head->srcu);
++ 	if (last_path)
++ 		nvme_put_ns_head(ns->head);
+++>>>>>>> ef248d5de446 (nvme: add missing SRCU grace period in error path)
+  	nvme_put_ns_head(ns->head);
+   out_cleanup_disk:
+  	put_disk(disk);
+* Unmerged path drivers/nvme/host/core.c

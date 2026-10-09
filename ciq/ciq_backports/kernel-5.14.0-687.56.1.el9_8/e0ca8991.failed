@@ -1,0 +1,399 @@
+sched: Make class_schedulers avoid pushing current, and get rid of proxy_tag_curr()
+
+jira KERNEL-1731
+Rebuild_History Non-Buildable kernel-5.14.0-687.56.1.el9_8
+Rebuild_CHGLOG: - sched: Make class_schedulers avoid pushing current, and get rid of proxy_tag_curr() [partial] (Herton R. Krzesinski) [RHEL-256279]
+Rebuild_FUZZ: 94.32%
+commit-author John Stultz <jstultz@google.com>
+commit e0ca8991b2de6c9dfe6fcd8a0364951b2bd56797
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.56.1.el9_8/e0ca8991.failed
+
+With proxy-execution, the scheduler selects the donor, but for
+blocked donors, we end up running the lock owner.
+
+This caused some complexity, because the class schedulers make
+sure to remove the task they pick from their pushable task
+lists, which prevents the donor from being migrated, but there
+wasn't then anything to prevent rq->curr from being migrated
+if rq->curr != rq->donor.
+
+This was sort of hacked around by calling proxy_tag_curr() on
+the rq->curr task if we were running something other then the
+donor. proxy_tag_curr() did a dequeue/enqueue pair on the
+rq->curr task, allowing the class schedulers to remove it from
+their pushable list.
+
+The dequeue/enqueue pair was wasteful, and additonally K Prateek
+highlighted that we didn't properly undo things when we stopped
+proxying, leaving the lock owner off the pushable list.
+
+After some alternative approaches were considered, Peter
+suggested just having the RT/DL classes just avoid migrating
+when task_on_cpu().
+
+So rework pick_next_pushable_dl_task() and the rt
+pick_next_pushable_task() functions so that they skip over the
+first pushable task if it is on_cpu.
+
+Then just drop all of the proxy_tag_curr() logic.
+
+Fixes: be39617e38e0 ("sched: Fix proxy/current (push,pull)ability")
+Closes: https://lore.kernel.org/lkml/e735cae0-2cc9-4bae-b761-fcb082ed3e94@amd.com/
+	Reported-by: K Prateek Nayak <kprateek.nayak@amd.com>
+	Suggested-by: Peter Zijlstra <peterz@infradead.org>
+	Signed-off-by: John Stultz <jstultz@google.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://patch.msgid.link/20260324191337.1841376-2-jstultz@google.com
+(cherry picked from commit e0ca8991b2de6c9dfe6fcd8a0364951b2bd56797)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/core.c
+#	kernel/sched/deadline.c
+diff --cc kernel/sched/core.c
+index f54c4a887e5e,29741685762d..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -6405,19 -6471,236 +6405,245 @@@ pick_next_task(struct rq *rq, struct ta
+   * Constants for the sched_mode argument of __schedule().
+   *
+   * The mode argument allows RT enabled kernels to differentiate a
+ - * preemption from blocking on an 'sleeping' spin/rwlock.
+ + * preemption from blocking on an 'sleeping' spin/rwlock. Note that
+ + * SM_MASK_PREEMPT for !RT has all bits set, which allows the compiler to
+ + * optimize the AND operation out and just check for zero.
+   */
+ -#define SM_IDLE			(-1)
+ -#define SM_NONE			0
+ -#define SM_PREEMPT		1
+ -#define SM_RTLOCK_WAIT		2
+ +#define SM_NONE			0x0
+ +#define SM_PREEMPT		0x1
+ +#define SM_RTLOCK_WAIT		0x2
+  
+++<<<<<<< HEAD
+ +#ifndef CONFIG_PREEMPT_RT
+ +# define SM_MASK_PREEMPT	(~0U)
+ +#else
+ +# define SM_MASK_PREEMPT	SM_PREEMPT
+ +#endif
+++=======
++ /*
++  * Helper function for __schedule()
++  *
++  * Tries to deactivate the task, unless the should_block arg
++  * is false or if a signal is pending. In the case a signal
++  * is pending, marks the task's __state as RUNNING (and clear
++  * blocked_on).
++  */
++ static bool try_to_block_task(struct rq *rq, struct task_struct *p,
++ 			      unsigned long *task_state_p, bool should_block)
++ {
++ 	unsigned long task_state = *task_state_p;
++ 	int flags = DEQUEUE_NOCLOCK;
++ 
++ 	if (signal_pending_state(task_state, p)) {
++ 		WRITE_ONCE(p->__state, TASK_RUNNING);
++ 		*task_state_p = TASK_RUNNING;
++ 		return false;
++ 	}
++ 
++ 	/*
++ 	 * We check should_block after signal_pending because we
++ 	 * will want to wake the task in that case. But if
++ 	 * should_block is false, its likely due to the task being
++ 	 * blocked on a mutex, and we want to keep it on the runqueue
++ 	 * to be selectable for proxy-execution.
++ 	 */
++ 	if (!should_block)
++ 		return false;
++ 
++ 	p->sched_contributes_to_load =
++ 		(task_state & TASK_UNINTERRUPTIBLE) &&
++ 		!(task_state & TASK_NOLOAD) &&
++ 		!(task_state & TASK_FROZEN);
++ 
++ 	if (unlikely(is_special_task_state(task_state)))
++ 		flags |= DEQUEUE_SPECIAL;
++ 
++ 	/*
++ 	 * __schedule()			ttwu()
++ 	 *   prev_state = prev->state;    if (p->on_rq && ...)
++ 	 *   if (prev_state)		    goto out;
++ 	 *     p->on_rq = 0;		  smp_acquire__after_ctrl_dep();
++ 	 *				  p->state = TASK_WAKING
++ 	 *
++ 	 * Where __schedule() and ttwu() have matching control dependencies.
++ 	 *
++ 	 * After this, schedule() must not care about p->state any more.
++ 	 */
++ 	block_task(rq, p, flags);
++ 	return true;
++ }
++ 
++ #ifdef CONFIG_SCHED_PROXY_EXEC
++ static inline struct task_struct *proxy_resched_idle(struct rq *rq)
++ {
++ 	put_prev_set_next_task(rq, rq->donor, rq->idle);
++ 	rq_set_donor(rq, rq->idle);
++ 	set_tsk_need_resched(rq->idle);
++ 	return rq->idle;
++ }
++ 
++ static bool __proxy_deactivate(struct rq *rq, struct task_struct *donor)
++ {
++ 	unsigned long state = READ_ONCE(donor->__state);
++ 
++ 	/* Don't deactivate if the state has been changed to TASK_RUNNING */
++ 	if (state == TASK_RUNNING)
++ 		return false;
++ 	/*
++ 	 * Because we got donor from pick_next_task(), it is *crucial*
++ 	 * that we call proxy_resched_idle() before we deactivate it.
++ 	 * As once we deactivate donor, donor->on_rq is set to zero,
++ 	 * which allows ttwu() to immediately try to wake the task on
++ 	 * another rq. So we cannot use *any* references to donor
++ 	 * after that point. So things like cfs_rq->curr or rq->donor
++ 	 * need to be changed from next *before* we deactivate.
++ 	 */
++ 	proxy_resched_idle(rq);
++ 	return try_to_block_task(rq, donor, &state, true);
++ }
++ 
++ static struct task_struct *proxy_deactivate(struct rq *rq, struct task_struct *donor)
++ {
++ 	if (!__proxy_deactivate(rq, donor)) {
++ 		/*
++ 		 * XXX: For now, if deactivation failed, set donor
++ 		 * as unblocked, as we aren't doing proxy-migrations
++ 		 * yet (more logic will be needed then).
++ 		 */
++ 		donor->blocked_on = NULL;
++ 	}
++ 	return NULL;
++ }
++ 
++ /*
++  * Find runnable lock owner to proxy for mutex blocked donor
++  *
++  * Follow the blocked-on relation:
++  *   task->blocked_on -> mutex->owner -> task...
++  *
++  * Lock order:
++  *
++  *   p->pi_lock
++  *     rq->lock
++  *       mutex->wait_lock
++  *
++  * Returns the task that is going to be used as execution context (the one
++  * that is actually going to be run on cpu_of(rq)).
++  */
++ static struct task_struct *
++ find_proxy_task(struct rq *rq, struct task_struct *donor, struct rq_flags *rf)
++ {
++ 	struct task_struct *owner = NULL;
++ 	int this_cpu = cpu_of(rq);
++ 	struct task_struct *p;
++ 	struct mutex *mutex;
++ 
++ 	/* Follow blocked_on chain. */
++ 	for (p = donor; task_is_blocked(p); p = owner) {
++ 		mutex = p->blocked_on;
++ 		/* Something changed in the chain, so pick again */
++ 		if (!mutex)
++ 			return NULL;
++ 		/*
++ 		 * By taking mutex->wait_lock we hold off concurrent mutex_unlock()
++ 		 * and ensure @owner sticks around.
++ 		 */
++ 		guard(raw_spinlock)(&mutex->wait_lock);
++ 
++ 		/* Check again that p is blocked with wait_lock held */
++ 		if (mutex != __get_task_blocked_on(p)) {
++ 			/*
++ 			 * Something changed in the blocked_on chain and
++ 			 * we don't know if only at this level. So, let's
++ 			 * just bail out completely and let __schedule()
++ 			 * figure things out (pick_again loop).
++ 			 */
++ 			return NULL;
++ 		}
++ 
++ 		owner = __mutex_owner(mutex);
++ 		if (!owner) {
++ 			__clear_task_blocked_on(p, mutex);
++ 			return p;
++ 		}
++ 
++ 		if (!READ_ONCE(owner->on_rq) || owner->se.sched_delayed) {
++ 			/* XXX Don't handle blocked owners/delayed dequeue yet */
++ 			return proxy_deactivate(rq, donor);
++ 		}
++ 
++ 		if (task_cpu(owner) != this_cpu) {
++ 			/* XXX Don't handle migrations yet */
++ 			return proxy_deactivate(rq, donor);
++ 		}
++ 
++ 		if (task_on_rq_migrating(owner)) {
++ 			/*
++ 			 * One of the chain of mutex owners is currently migrating to this
++ 			 * CPU, but has not yet been enqueued because we are holding the
++ 			 * rq lock. As a simple solution, just schedule rq->idle to give
++ 			 * the migration a chance to complete. Much like the migrate_task
++ 			 * case we should end up back in find_proxy_task(), this time
++ 			 * hopefully with all relevant tasks already enqueued.
++ 			 */
++ 			return proxy_resched_idle(rq);
++ 		}
++ 
++ 		/*
++ 		 * Its possible to race where after we check owner->on_rq
++ 		 * but before we check (owner_cpu != this_cpu) that the
++ 		 * task on another cpu was migrated back to this cpu. In
++ 		 * that case it could slip by our  checks. So double check
++ 		 * we are still on this cpu and not migrating. If we get
++ 		 * inconsistent results, try again.
++ 		 */
++ 		if (!task_on_rq_queued(owner) || task_cpu(owner) != this_cpu)
++ 			return NULL;
++ 
++ 		if (owner == p) {
++ 			/*
++ 			 * It's possible we interleave with mutex_unlock like:
++ 			 *
++ 			 *				lock(&rq->lock);
++ 			 *				  find_proxy_task()
++ 			 * mutex_unlock()
++ 			 *   lock(&wait_lock);
++ 			 *   donor(owner) = current->blocked_donor;
++ 			 *   unlock(&wait_lock);
++ 			 *
++ 			 *   wake_up_q();
++ 			 *     ...
++ 			 *       ttwu_runnable()
++ 			 *         __task_rq_lock()
++ 			 *				  lock(&wait_lock);
++ 			 *				  owner == p
++ 			 *
++ 			 * Which leaves us to finish the ttwu_runnable() and make it go.
++ 			 *
++ 			 * So schedule rq->idle so that ttwu_runnable() can get the rq
++ 			 * lock and mark owner as running.
++ 			 */
++ 			return proxy_resched_idle(rq);
++ 		}
++ 		/*
++ 		 * OK, now we're absolutely sure @owner is on this
++ 		 * rq, therefore holding @rq->lock is sufficient to
++ 		 * guarantee its existence, as per ttwu_remote().
++ 		 */
++ 	}
++ 
++ 	WARN_ON_ONCE(owner && !owner->on_rq);
++ 	return owner;
++ }
++ #else /* SCHED_PROXY_EXEC */
++ static struct task_struct *
++ find_proxy_task(struct rq *rq, struct task_struct *donor, struct rq_flags *rf)
++ {
++ 	WARN_ONCE(1, "This should never be called in the !SCHED_PROXY_EXEC case\n");
++ 	return donor;
++ }
++ #endif /* SCHED_PROXY_EXEC */
+++>>>>>>> e0ca8991b2de (sched: Make class_schedulers avoid pushing current, and get rid of proxy_tag_curr())
+  
+  /*
+   * __schedule() is the main scheduler function.
+@@@ -6561,6 -6853,7 +6787,10 @@@ static void __sched notrace __schedule(
+  		 * changes to task_struct made by pick_next_task().
+  		 */
+  		RCU_INIT_POINTER(rq->curr, next);
+++<<<<<<< HEAD
+++=======
++ 
+++>>>>>>> e0ca8991b2de (sched: Make class_schedulers avoid pushing current, and get rid of proxy_tag_curr())
+  		/*
+  		 * The membarrier system call requires each architecture
+  		 * to have a full memory barrier after updating
+diff --cc kernel/sched/deadline.c
+index 111afb0cb34e,27359a1e995f..000000000000
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@@ -2313,6 -2803,39 +2313,42 @@@ static int find_later_rq(struct task_st
+  	return -1;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct task_struct *pick_next_pushable_dl_task(struct rq *rq)
++ {
++ 	struct task_struct *i, *p = NULL;
++ 	struct rb_node *next_node;
++ 
++ 	if (!has_pushable_dl_tasks(rq))
++ 		return NULL;
++ 
++ 	next_node = rb_first_cached(&rq->dl.pushable_dl_tasks_root);
++ 	while (next_node) {
++ 		i = __node_2_pdl(next_node);
++ 		/* make sure task isn't on_cpu (possible with proxy-exec) */
++ 		if (!task_on_cpu(rq, i)) {
++ 			p = i;
++ 			break;
++ 		}
++ 
++ 		next_node = rb_next(next_node);
++ 	}
++ 
++ 	if (!p)
++ 		return NULL;
++ 
++ 	WARN_ON_ONCE(rq->cpu != task_cpu(p));
++ 	WARN_ON_ONCE(task_current(rq, p));
++ 	WARN_ON_ONCE(p->nr_cpus_allowed <= 1);
++ 
++ 	WARN_ON_ONCE(!task_on_rq_queued(p));
++ 	WARN_ON_ONCE(!dl_task(p));
++ 
++ 	return p;
++ }
++ 
+++>>>>>>> e0ca8991b2de (sched: Make class_schedulers avoid pushing current, and get rid of proxy_tag_curr())
+  /* Locks the rq it finds */
+  static struct rq *find_lock_later_rq(struct task_struct *task, struct rq *rq)
+  {
+* Unmerged path kernel/sched/core.c
+* Unmerged path kernel/sched/deadline.c
+diff --git a/kernel/sched/rt.c b/kernel/sched/rt.c
+index 5cdb0fc6d599..894b611fef4e 100644
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@ -1906,13 +1906,22 @@ static int find_lowest_rq(struct task_struct *task)
+ 
+ static struct task_struct *pick_next_pushable_task(struct rq *rq)
+ {
+-	struct task_struct *p;
++	struct plist_head *head = &rq->rt.pushable_tasks;
++	struct task_struct *i, *p = NULL;
+ 
+ 	if (!has_pushable_tasks(rq))
+ 		return NULL;
+ 
+-	p = plist_first_entry(&rq->rt.pushable_tasks,
+-			      struct task_struct, pushable_tasks);
++	plist_for_each_entry(i, head, pushable_tasks) {
++		/* make sure task isn't on_cpu (possible with proxy-exec) */
++		if (!task_on_cpu(rq, i)) {
++			p = i;
++			break;
++		}
++	}
++
++	if (!p)
++		return NULL;
+ 
+ 	BUG_ON(rq->cpu != task_cpu(p));
+ 	BUG_ON(task_current(rq, p));
