@@ -167,7 +167,7 @@ Summary: The Linux kernel
 #  the --with-release option overrides this setting.)
 %define debugbuildsenabled 1
 %define kernel_major_minor 6.18
-%define kernel_patch 55
+%define kernel_patch 56
 %define buildid .1
 %define specversion %{kernel_major_minor}.%{kernel_patch}
 %define pkgrelease 1%{?buildid}
@@ -4572,8 +4572,11 @@ fi\
 #
 #
 %changelog
-* Sun Oct 04 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.18.55-1.1
--- Rebased changes for Linux 6.18.55 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.55-1)
+* Mon Oct 12 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.18.56-1.1
+-- Rebased changes for Linux 6.18.56 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.56-1)
+-- configs: Enable LIVEPATCH (Brett Mastbergen)
+-- kernel-clk6.18: only require ciq-kmod on el9 (Joseph S. Tate)
+-- [CIQ] v6.18.55 - updated spec (github-actions[bot])
 -- [CIQ] v6.18.54 - updated spec (github-actions[bot])
 -- [CIQ] v6.18.53 - updated spec (Brett Mastbergen)
 -- [CIQ] v6.18.53 - rebased configs (Brett Mastbergen)
@@ -4707,7 +4710,7 @@ fi\
 -- github actions: Make Builds on Merge Request Work (Jonathan Maple)
 -- Add initial CIQ config tweaks (Brett Mastbergen)
 -- Add CIQ configs (Brett Mastbergen)
--- Linux 6.18.55 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.18.55)
+-- Linux 6.18.56 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.18.56)
 
 
 ###
