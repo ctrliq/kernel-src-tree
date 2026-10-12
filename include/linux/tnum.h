@@ -40,6 +40,8 @@ struct tnum tnum_arshift(struct tnum a, u8 min_shift, u8 insn_bitness);
 struct tnum tnum_add(struct tnum a, struct tnum b);
 /* Subtract two tnums, return @a - @b */
 struct tnum tnum_sub(struct tnum a, struct tnum b);
+/* Neg of a tnum, return  0 - @a */
+struct tnum tnum_neg(struct tnum a);
 /* Bitwise-AND, return @a & @b */
 struct tnum tnum_and(struct tnum a, struct tnum b);
 /* Bitwise-OR, return @a | @b */
@@ -54,6 +56,11 @@ struct tnum tnum_intersect(struct tnum a, struct tnum b);
 
 /* Return @a with all but the lowest @size bytes cleared */
 struct tnum tnum_cast(struct tnum a, u8 size);
+
+/* Swap the bytes of a tnum */
+struct tnum tnum_bswap16(struct tnum a);
+struct tnum tnum_bswap32(struct tnum a);
+struct tnum tnum_bswap64(struct tnum a);
 
 /* Returns true if @a is a known constant */
 static inline bool tnum_is_const(struct tnum a)
