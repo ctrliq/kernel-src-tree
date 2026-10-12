@@ -73,3 +73,7 @@ EXPORT_SYMBOL(arc4_crypt);
 
 MODULE_DESCRIPTION("ARC4 Cipher Algorithm");
 MODULE_LICENSE("GPL");
+
+#ifdef CONFIG_RHEL_DIFFERENCES
+MODULE_ALIAS("cifs_arc4");
+#endif
