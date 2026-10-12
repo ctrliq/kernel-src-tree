@@ -15,13 +15,11 @@
 #include <asm/kvm_nested.h>
 #include <asm/esr.h>
 
-static void pend_sync_exception(struct kvm_vcpu *vcpu)
+static unsigned int exception_target_el(struct kvm_vcpu *vcpu)
 {
 	/* If not nesting, EL1 is the only possible exception target */
-	if (likely(!vcpu_has_nv(vcpu))) {
-		kvm_pend_exception(vcpu, EXCEPT_AA64_EL1_SYNC);
-		return;
-	}
+	if (likely(!vcpu_has_nv(vcpu)))
+		return PSR_MODE_EL1h;
 
 	/*
 	 * With NV, we need to pick between EL1 and EL2. Note that we
@@ -32,26 +30,39 @@ static void pend_sync_exception(struct kvm_vcpu *vcpu)
 	switch(*vcpu_cpsr(vcpu) & PSR_MODE_MASK) {
 	case PSR_MODE_EL2h:
 	case PSR_MODE_EL2t:
-		kvm_pend_exception(vcpu, EXCEPT_AA64_EL2_SYNC);
-		break;
+		return PSR_MODE_EL2h;
 	case PSR_MODE_EL1h:
 	case PSR_MODE_EL1t:
-		kvm_pend_exception(vcpu, EXCEPT_AA64_EL1_SYNC);
-		break;
+		return PSR_MODE_EL1h;
 	case PSR_MODE_EL0t:
-		if (vcpu_el2_tge_is_set(vcpu))
-			kvm_pend_exception(vcpu, EXCEPT_AA64_EL2_SYNC);
-		else
-			kvm_pend_exception(vcpu, EXCEPT_AA64_EL1_SYNC);
-		break;
+		return vcpu_el2_tge_is_set(vcpu) ? PSR_MODE_EL2h : PSR_MODE_EL1h;
 	default:
 		BUG();
 	}
 }
 
-static bool match_target_el(struct kvm_vcpu *vcpu, unsigned long target)
+static enum vcpu_sysreg exception_esr_elx(struct kvm_vcpu *vcpu)
 {
-	return (vcpu_get_flag(vcpu, EXCEPT_MASK) == target);
+	if (exception_target_el(vcpu) == PSR_MODE_EL2h)
+		return ESR_EL2;
+
+	return ESR_EL1;
+}
+
+static enum vcpu_sysreg exception_far_elx(struct kvm_vcpu *vcpu)
+{
+	if (exception_target_el(vcpu) == PSR_MODE_EL2h)
+		return FAR_EL2;
+
+	return FAR_EL1;
+}
+
+static void pend_sync_exception(struct kvm_vcpu *vcpu)
+{
+	if (exception_target_el(vcpu) == PSR_MODE_EL1h)
+		kvm_pend_exception(vcpu, EXCEPT_AA64_EL1_SYNC);
+	else
+		kvm_pend_exception(vcpu, EXCEPT_AA64_EL2_SYNC);
 }
 
 static void inject_abt64(struct kvm_vcpu *vcpu, bool is_iabt, unsigned long addr)
@@ -63,11 +74,10 @@ static void inject_abt64(struct kvm_vcpu *vcpu, bool is_iabt, unsigned long addr
 	pend_sync_exception(vcpu);
 
 	/*
-	 * Build an {i,d}abort, depending on the level and the
-	 * instruction set. Report an external synchronous abort.
+	 * Build an {i,d}abort, depending on the level.
+	 * Report an external synchronous abort.
 	 */
-	if (kvm_vcpu_trap_il_is32bit(vcpu))
-		esr |= ESR_ELx_IL;
+	esr |= ESR_ELx_IL;
 
 	/*
 	 * Here, the guest runs in AArch64 mode when in EL1. If we get
@@ -83,32 +93,21 @@ static void inject_abt64(struct kvm_vcpu *vcpu, bool is_iabt, unsigned long addr
 
 	esr |= ESR_ELx_FSC_EXTABT;
 
-	if (match_target_el(vcpu, unpack_vcpu_flag(EXCEPT_AA64_EL1_SYNC))) {
-		vcpu_write_sys_reg(vcpu, addr, FAR_EL1);
-		vcpu_write_sys_reg(vcpu, esr, ESR_EL1);
-	} else {
-		vcpu_write_sys_reg(vcpu, addr, FAR_EL2);
-		vcpu_write_sys_reg(vcpu, esr, ESR_EL2);
-	}
+	vcpu_write_sys_reg(vcpu, addr, exception_far_elx(vcpu));
+	vcpu_write_sys_reg(vcpu, esr, exception_esr_elx(vcpu));
+}
+
+void kvm_inject_sync(struct kvm_vcpu *vcpu, u64 esr)
+{
+	pend_sync_exception(vcpu);
+	vcpu_write_sys_reg(vcpu, esr, exception_esr_elx(vcpu));
 }
 
 static void inject_undef64(struct kvm_vcpu *vcpu)
 {
-	u64 esr = (ESR_ELx_EC_UNKNOWN << ESR_ELx_EC_SHIFT);
+	u64 esr = (ESR_ELx_EC_UNKNOWN << ESR_ELx_EC_SHIFT) | ESR_ELx_IL;
 
-	pend_sync_exception(vcpu);
-
-	/*
-	 * Build an unknown exception, depending on the instruction
-	 * set.
-	 */
-	if (kvm_vcpu_trap_il_is32bit(vcpu))
-		esr |= ESR_ELx_IL;
-
-	if (match_target_el(vcpu, unpack_vcpu_flag(EXCEPT_AA64_EL1_SYNC)))
-		vcpu_write_sys_reg(vcpu, esr, ESR_EL1);
-	else
-		vcpu_write_sys_reg(vcpu, esr, ESR_EL2);
+	kvm_inject_sync(vcpu, esr);
 }
 
 #define DFSR_FSC_EXTABT_LPAE	0x10
@@ -210,9 +209,9 @@ void kvm_inject_size_fault(struct kvm_vcpu *vcpu)
 	    !(vcpu_read_sys_reg(vcpu, TCR_EL1) & TTBCR_EAE))
 		return;
 
-	esr = vcpu_read_sys_reg(vcpu, ESR_EL1);
+	esr = vcpu_read_sys_reg(vcpu, exception_esr_elx(vcpu));
 	esr &= ~GENMASK_ULL(5, 0);
-	vcpu_write_sys_reg(vcpu, esr, ESR_EL1);
+	vcpu_write_sys_reg(vcpu, esr, exception_esr_elx(vcpu));
 }
 
 /**
