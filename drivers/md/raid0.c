@@ -14,6 +14,7 @@
 #include <linux/seq_file.h>
 #include <linux/module.h>
 #include <linux/slab.h>
+#include <linux/string_choices.h>
 #include <trace/events/block.h>
 #include "md.h"
 #include "raid0.h"
@@ -43,7 +44,7 @@ static void dump_zones(struct mddev *mddev)
 	int raid_disks = conf->strip_zone[0].nb_dev;
 	pr_debug("md: RAID0 configuration for %s - %d zone%s\n",
 		 mdname(mddev),
-		 conf->nr_strip_zones, conf->nr_strip_zones==1?"":"s");
+		 conf->nr_strip_zones, str_plural(conf->nr_strip_zones));
 	for (j = 0; j < conf->nr_strip_zones; j++) {
 		char line[200];
 		int len = 0;
@@ -143,15 +144,15 @@ static int create_strip_zones(struct mddev *mddev, struct r0conf **private_conf)
 	}
 
 	err = -ENOMEM;
-	conf->strip_zone = kcalloc(conf->nr_strip_zones,
-				   sizeof(struct strip_zone),
-				   GFP_KERNEL);
+	conf->strip_zone = kvcalloc(conf->nr_strip_zones,
+				    sizeof(struct strip_zone),
+				    GFP_KERNEL);
 	if (!conf->strip_zone)
 		goto abort;
-	conf->devlist = kzalloc(array3_size(sizeof(struct md_rdev *),
-					    conf->nr_strip_zones,
-					    mddev->raid_disks),
-				GFP_KERNEL);
+	conf->devlist = kvzalloc(array3_size(sizeof(struct md_rdev *),
+					     conf->nr_strip_zones,
+					     mddev->raid_disks),
+				 GFP_KERNEL);
 	if (!conf->devlist)
 		goto abort;
 
@@ -293,8 +294,8 @@ static int create_strip_zones(struct mddev *mddev, struct r0conf **private_conf)
 
 	return 0;
 abort:
-	kfree(conf->strip_zone);
-	kfree(conf->devlist);
+	kvfree(conf->strip_zone);
+	kvfree(conf->devlist);
 	kfree(conf);
 	*private_conf = ERR_PTR(err);
 	return err;
@@ -375,8 +376,8 @@ static void raid0_free(struct mddev *mddev, void *priv)
 {
 	struct r0conf *conf = priv;
 
-	kfree(conf->strip_zone);
-	kfree(conf->devlist);
+	kvfree(conf->strip_zone);
+	kvfree(conf->devlist);
 	kfree(conf);
 }
 
@@ -386,6 +387,7 @@ static int raid0_set_limits(struct mddev *mddev)
 	int err;
 
 	md_init_stacking_limits(&lim);
+	lim.features |= BLK_FEAT_NOWAIT;
 	lim.max_hw_sectors = mddev->chunk_sectors;
 	lim.max_write_zeroes_sectors = mddev->chunk_sectors;
 	lim.max_hw_wzeroes_unmap_sectors = mddev->chunk_sectors;
@@ -394,6 +396,7 @@ static int raid0_set_limits(struct mddev *mddev)
 	lim.io_opt = lim.io_min * mddev->raid_disks;
 	lim.chunk_sectors = mddev->chunk_sectors;
 	lim.features |= BLK_FEAT_ATOMIC_WRITES;
+	lim.features |= BLK_FEAT_PCI_P2PDMA;
 	err = mddev_stack_rdev_limits(mddev, &lim, MDDEV_STACK_INTEGRITY);
 	if (err)
 		return err;
