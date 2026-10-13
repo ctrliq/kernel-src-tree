@@ -160,7 +160,7 @@ static void test_skmsg_helpers_with_link(enum bpf_map_type map_type)
 	/* Fail since bpf_link for the same prog type has been created. */
 	link2 = bpf_program__attach_sockmap(prog_clone, map);
 	if (!ASSERT_ERR_PTR(link2, "bpf_program__attach_sockmap")) {
-		bpf_link__detach(link2);
+		bpf_link__destroy(link2);
 		goto out;
 	}
 
@@ -186,7 +186,7 @@ static void test_skmsg_helpers_with_link(enum bpf_map_type map_type)
 	if (!ASSERT_OK(err, "bpf_link_update"))
 		goto out;
 out:
-	bpf_link__detach(link);
+	bpf_link__destroy(link);
 	test_skmsg_load_helpers__destroy(skel);
 }
 
@@ -373,7 +373,7 @@ static void test_sockmap_skb_verdict_attach_with_link(void)
 	if (!ASSERT_OK_PTR(link, "bpf_program__attach_sockmap"))
 		goto out;
 
-	bpf_link__detach(link);
+	bpf_link__destroy(link);
 
 	err = bpf_prog_attach(bpf_program__fd(prog), map, BPF_SK_SKB_STREAM_VERDICT, 0);
 	if (!ASSERT_OK(err, "bpf_prog_attach"))
@@ -382,7 +382,7 @@ static void test_sockmap_skb_verdict_attach_with_link(void)
 	/* Fail since attaching with the same prog/map has been done. */
 	link = bpf_program__attach_sockmap(prog, map);
 	if (!ASSERT_ERR_PTR(link, "bpf_program__attach_sockmap"))
-		bpf_link__detach(link);
+		bpf_link__destroy(link);
 
 	err = bpf_prog_detach2(bpf_program__fd(prog), map, BPF_SK_SKB_STREAM_VERDICT);
 	if (!ASSERT_OK(err, "bpf_prog_detach2"))
@@ -695,13 +695,13 @@ static void test_sockmap_skb_verdict_peek_with_link(void)
 	test_sockmap_skb_verdict_peek_helper(map);
 	ASSERT_EQ(pass->bss->clone_called, 1, "clone_called");
 out:
-	bpf_link__detach(link);
+	bpf_link__destroy(link);
 	test_sockmap_pass_prog__destroy(pass);
 }
 
 static void test_sockmap_unconnected_unix(void)
 {
-	int err, map, stream = 0, dgram = 0, zero = 0;
+	int err, map, stream = -1, dgram = -1, zero = 0;
 	struct test_sockmap_pass_prog *skel;
 
 	skel = test_sockmap_pass_prog__open_and_load();
@@ -712,22 +712,22 @@ static void test_sockmap_unconnected_unix(void)
 
 	stream = xsocket(AF_UNIX, SOCK_STREAM, 0);
 	if (stream < 0)
-		return;
+		goto out;
 
 	dgram = xsocket(AF_UNIX, SOCK_DGRAM, 0);
-	if (dgram < 0) {
-		close(stream);
-		return;
-	}
+	if (dgram < 0)
+		goto out;
 
 	err = bpf_map_update_elem(map, &zero, &stream, BPF_ANY);
-	ASSERT_ERR(err, "bpf_map_update_elem(stream)");
+	if (!ASSERT_ERR(err, "bpf_map_update_elem(stream)"))
+		goto out;
 
 	err = bpf_map_update_elem(map, &zero, &dgram, BPF_ANY);
 	ASSERT_OK(err, "bpf_map_update_elem(dgram)");
-
+out:
 	close(stream);
 	close(dgram);
+	test_sockmap_pass_prog__destroy(skel);
 }
 
 static void test_sockmap_many_socket(void)
