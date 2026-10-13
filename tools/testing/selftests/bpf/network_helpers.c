@@ -479,6 +479,19 @@ int make_netns(const char *name)
 	if (r)
 		return r;
 
+	r = asprintf(&cmd, "ip netns exec %s sysctl net.mptcp.enabled=1", name);
+	if (r < 0) {
+		log_err("Failed to malloc cmd for setting net.mptcp.enabled");
+		remove_netns(name);
+		return -1;
+	}
+
+	r = system(cmd);
+	free(cmd);
+
+	if (r)
+		return r;
+
 	r = asprintf(&cmd, "ip -n %s link set lo up", name);
 	if (r < 0) {
 		log_err("Failed to malloc cmd for setting up lo");

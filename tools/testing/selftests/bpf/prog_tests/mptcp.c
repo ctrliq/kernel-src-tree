@@ -68,6 +68,7 @@ static struct nstoken *create_netns(void)
 {
 	SYS(fail, "ip netns add %s", NS_TEST);
 	SYS(fail, "ip -net %s link set dev lo up", NS_TEST);
+	SYS(fail, "ip netns exec %s sysctl net.mptcp.enabled=1", NS_TEST);
 
 	return open_netns(NS_TEST);
 fail:
