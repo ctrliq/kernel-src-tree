@@ -1245,7 +1245,7 @@ static int evict_process_queues_cpsch(struct device_queue_manager *dqm,
 	 * HWS does this automatically, MES does not.
 	 */
 	if (dqm->dev->kfd->shared_resources.enable_mes)
-		kfd_flush_tlb(pdd);
+		kfd_flush_tlb(pdd, TLB_FLUSH_HEAVYWEIGHT);
 
 	if (!dqm->dev->kfd->shared_resources.enable_mes) {
 		pdd->last_evict_timestamp = get_jiffies_64();
@@ -3481,7 +3481,7 @@ int suspend_queues(struct kfd_process *p,
 			if (total_suspended) {
 				amdgpu_amdkfd_debug_mem_fence(dqm->dev->adev);
 				/* Heavy-weight TLB flush after MES suspends queues */
-				kfd_flush_tlb(pdd);
+				kfd_flush_tlb(pdd, TLB_FLUSH_HEAVYWEIGHT);
 			}
 			continue;
 		}
