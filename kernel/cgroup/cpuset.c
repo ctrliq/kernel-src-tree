@@ -3140,20 +3140,12 @@ static int cpuset_can_attach(struct cgroup_taskset *tset)
 	bool setsched_check;
 	int ret;
 
-	/* used later by cpuset_attach() */
-	attach_ctx.old_cs = task_cs(cgroup_taskset_first(tset, &css));
-	oldcs = attach_ctx.old_cs;
-	cs = css_cs(css);
-
+	cs = oldcs = NULL;
 	mutex_lock(&cpuset_mutex);
+	attach_ctx.old_cs = NULL;	/* Used later in cpuset_attach_task() */
 	attach_ctx.cpus_updated = false;
 	attach_ctx.mems_updated = false;
 	attach_ctx.many_dest_cs = false;
-
-	/* Check to see if task is allowed in the cpuset */
-	ret = cpuset_can_attach_check(cs, oldcs, &setsched_check);
-	if (ret)
-		goto out_unlock;
 
 	/*
 	 * The attach_ctx.old_cs is used mainly by cpuset_migrate_mm() to get
@@ -3171,20 +3163,32 @@ static int cpuset_can_attach(struct cgroup_taskset *tset)
 	 * of child cpusets must always be a subset of the parent. So no real
 	 * page migration will be necessary no matter which child cpuset is
 	 * selected as attach_ctx.old_cs.
+	 *
+	 * For a v2 threaded subtree where cpuset isn't enabled in some of the
+	 * cgroups, it is possible that oldcs == cs for some of the tasks.
+	 * In this case, we can skip checking on those tasks as there is no
+	 * actual migration wrt cpuset.
 	 */
 	cgroup_taskset_for_each(task, css, tset) {
 		struct cpuset *new_cs = css_cs(css);
 		struct cpuset *new_oldcs = task_cs(task);
 
 		if ((new_oldcs != oldcs) || (new_cs != cs)) {
-			if (new_cs != cs)
+			if (cs && (new_cs != cs))
 				attach_ctx.many_dest_cs = true;
 			cs = new_cs;
 			oldcs = new_oldcs;
+			if (oldcs == cs)
+				continue;
+			if (!attach_ctx.old_cs)
+				attach_ctx.old_cs = oldcs;
 			ret = cpuset_can_attach_check(cs, oldcs, &setsched_check);
 			if (ret)
 				goto out_unlock;
 		}
+
+		if (oldcs == cs)
+			continue;
 
 		ret = task_can_attach(task);
 		if (ret)
@@ -3326,6 +3330,14 @@ static void cpuset_attach(struct cgroup_taskset *tset)
 	mutex_lock(&cpuset_mutex);
 	attach_ctx.task_work_queued = false;
 	guarantee_online_mems(cs, &attach_ctx.nodemask_to);
+
+	/*
+	 * attach_ctx.old_cs can only be NULL if no task is actually migrating.
+	 * This is highly unlikely. If it happens at all, we can skip task
+	 * iteration and setting old_mems_allowed.
+	 */
+	if (unlikely(!attach_ctx.old_cs))
+		goto out;
 
 	/*
 	 * In the default hierarchy, enabling cpuset in the child cgroups
