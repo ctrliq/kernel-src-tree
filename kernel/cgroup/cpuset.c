@@ -362,6 +362,8 @@ static DECLARE_WAIT_QUEUE_HEAD(cpuset_attach_wq);
  */
 static struct {
 	int in_progress;
+	struct cpuset *old_cs;	/* Source cpuset */
+	nodemask_t nodemask_to;
 } attach_ctx;
 
 /*
@@ -3021,8 +3023,6 @@ out:
 	return 0;
 }
 
-static struct cpuset *cpuset_attach_old_cs;
-
 /*
  * Check to see if a cpuset can accept a new task
  * For v1, cpus_allowed and mems_allowed can't be empty.
@@ -3054,8 +3054,8 @@ static int cpuset_can_attach(struct cgroup_taskset *tset)
 	int cpu, ret;
 
 	/* used later by cpuset_attach() */
-	cpuset_attach_old_cs = task_cs(cgroup_taskset_first(tset, &css));
-	oldcs = cpuset_attach_old_cs;
+	attach_ctx.old_cs = task_cs(cgroup_taskset_first(tset, &css));
+	oldcs = attach_ctx.old_cs;
 	cs = css_cs(css);
 
 	mutex_lock(&cpuset_mutex);
@@ -3158,7 +3158,6 @@ static void cpuset_cancel_attach(struct cgroup_taskset *tset)
  * allocate from cpuset_init().
  */
 static cpumask_var_t cpus_attach;
-static nodemask_t cpuset_attach_nodemask_to;
 
 static void cpuset_attach_task(struct cpuset *cs, struct task_struct *task)
 {
@@ -3175,7 +3174,7 @@ static void cpuset_attach_task(struct cpuset *cs, struct task_struct *task)
 	 */
 	WARN_ON_ONCE(set_cpus_allowed_ptr(task, cpus_attach));
 
-	cpuset_change_task_nodemask(task, &cpuset_attach_nodemask_to);
+	cpuset_change_task_nodemask(task, &attach_ctx.nodemask_to);
 	cpuset1_update_task_spread_flags(cs, task);
 }
 
@@ -3185,7 +3184,7 @@ static void cpuset_attach(struct cgroup_taskset *tset)
 	struct task_struct *leader;
 	struct cgroup_subsys_state *css;
 	struct cpuset *cs;
-	struct cpuset *oldcs = cpuset_attach_old_cs;
+	struct cpuset *oldcs = attach_ctx.old_cs;
 	bool cpus_updated, mems_updated;
 	bool queue_task_work = false;
 
@@ -3197,7 +3196,7 @@ static void cpuset_attach(struct cgroup_taskset *tset)
 	cpus_updated = !cpumask_equal(cs->effective_cpus,
 				      oldcs->effective_cpus);
 	mems_updated = !nodes_equal(cs->effective_mems, oldcs->effective_mems);
-	guarantee_online_mems(cs, &cpuset_attach_nodemask_to);
+	guarantee_online_mems(cs, &attach_ctx.nodemask_to);
 
 	/*
 	 * In the default hierarchy, enabling cpuset in the child cgroups
@@ -3236,7 +3235,7 @@ static void cpuset_attach(struct cgroup_taskset *tset)
 			 */
 			if (is_memory_migrate(cs)) {
 				cpuset_migrate_mm(mm, &oldcs->old_mems_allowed,
-						  &cpuset_attach_nodemask_to);
+						  &attach_ctx.nodemask_to);
 				queue_task_work = true;
 			} else
 				mmput(mm);
@@ -3246,7 +3245,7 @@ static void cpuset_attach(struct cgroup_taskset *tset)
 out:
 	if (queue_task_work)
 		schedule_flush_migrate_mm();
-	cs->old_mems_allowed = cpuset_attach_nodemask_to;
+	cs->old_mems_allowed = attach_ctx.nodemask_to;
 
 	if (cs->nr_migrate_dl_tasks) {
 		atomic_add(cs->nr_migrate_dl_tasks, &cs->nr_deadline_tasks);
@@ -3699,7 +3698,7 @@ static void cpuset_fork(struct task_struct *task)
 
 	/* CLONE_INTO_CGROUP */
 	mutex_lock(&cpuset_mutex);
-	guarantee_online_mems(cs, &cpuset_attach_nodemask_to);
+	guarantee_online_mems(cs, &attach_ctx.nodemask_to);
 	cpuset_attach_task(cs, task);
 
 	dec_attach_in_progress_locked();
