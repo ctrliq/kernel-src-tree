@@ -37,6 +37,7 @@
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 #include <linux/task_work.h>
+#include <linux/llist.h>
 
 DEFINE_STATIC_KEY_FALSE(cpusets_pre_enable_key);
 DEFINE_STATIC_KEY_FALSE(cpusets_enabled_key);
@@ -368,6 +369,7 @@ static struct {
 	struct cpuset *old_cs;	/* Source cpuset */
 	nodemask_t nodemask_to;
 } attach_ctx;
+static LLIST_HEAD(src_cs_head);
 
 /*
  * Wait if task attach is in progress until it is done and then acquire
@@ -615,6 +617,7 @@ static struct cpuset *dup_or_alloc_cpuset(struct cpuset *cs)
 		return NULL;
 
 	trial->dl_bw_cpu = -1;
+	init_llist_node(&trial->attach_node);
 
 	/* Setup cpumask pointer array */
 	cpumask_var_t *pmask[4] = {
@@ -3038,6 +3041,8 @@ out:
 static int cpuset_can_attach_check(struct cpuset *cs, struct cpuset *oldcs,
 				   bool *psetsched)
 {
+	bool cpus_updated, mems_updated;
+
 	if (cpumask_empty(cs->effective_cpus) ||
 	   (!is_in_v2_mode() && nodes_empty(cs->mems_allowed)))
 		return -ENOSPC;
@@ -3045,14 +3050,23 @@ static int cpuset_can_attach_check(struct cpuset *cs, struct cpuset *oldcs,
 	if (!oldcs)
 		return 0;
 
+	if (!llist_on_list(&oldcs->attach_node))
+		llist_add(&oldcs->attach_node, &src_cs_head);
+
+	cpus_updated = !cpumask_equal(cs->effective_cpus, oldcs->effective_cpus);
+	mems_updated = !nodes_equal(cs->effective_mems, oldcs->effective_mems);
+
+	if (cpus_updated)
+		attach_ctx.cpus_updated = true;
+	if (mems_updated)
+		attach_ctx.mems_updated = true;
+
 	/*
-	 * Skip rights over task setsched check in v2 when nothing changes,
-	 * migration permission derives from hierarchy ownership in
-	 * cgroup_procs_write_permission()).
+	 * Skip rights over task setsched check in v2 when nothing changes for
+	 * the current oldcs/cs pair, migration permission derives from
+	 * hierarchy ownership in cgroup_procs_write_permission()).
 	 */
-	*psetsched = !cpuset_v2() ||
-		!cpumask_equal(cs->effective_cpus, oldcs->effective_cpus) ||
-		!nodes_equal(cs->effective_mems, oldcs->effective_mems);
+	*psetsched = !cpuset_v2() || cpus_updated || mems_updated;
 
 	/*
 	 * A v1 cpuset with tasks will have no CPU left only when CPU hotplug
@@ -3093,6 +3107,25 @@ static void reset_migrate_dl_data(struct cpuset *cs)
 	cs->dl_bw_cpu = -1;
 }
 
+/*
+ * Clear and optionally apply (@cancel is false) the attach related data in the
+ * source cpusets.
+ */
+static void clear_attach_data(struct llist_head *head, bool cancel)
+{
+	struct cpuset *cs, *next;
+	struct llist_node *lnode = __llist_del_all(head);
+
+	llist_for_each_entry_safe(cs, next, lnode, attach_node) {
+		init_llist_node(&cs->attach_node);
+		if (cs->nr_migrate_dl_tasks) {
+			if (!cancel)
+				atomic_add(cs->nr_migrate_dl_tasks, &cs->nr_deadline_tasks);
+			cs->nr_migrate_dl_tasks = 0;
+		}
+	}
+}
+
 /* Called by cgroups to determine if a cpuset is usable; cpuset_mutex held */
 static int cpuset_can_attach(struct cgroup_taskset *tset)
 {
@@ -3108,6 +3141,8 @@ static int cpuset_can_attach(struct cgroup_taskset *tset)
 	cs = css_cs(css);
 
 	mutex_lock(&cpuset_mutex);
+	attach_ctx.cpus_updated = false;
+	attach_ctx.mems_updated = false;
 
 	/* Check to see if task is allowed in the cpuset */
 	ret = cpuset_can_attach_check(cs, oldcs, &setsched_check);
@@ -3132,6 +3167,15 @@ static int cpuset_can_attach(struct cgroup_taskset *tset)
 	 * selected as attach_ctx.old_cs.
 	 */
 	cgroup_taskset_for_each(task, css, tset) {
+		struct cpuset *new_oldcs = task_cs(task);
+
+		if (new_oldcs != oldcs) {
+			oldcs = new_oldcs;
+			ret = cpuset_can_attach_check(cs, oldcs, &setsched_check);
+			if (ret)
+				goto out_unlock;
+		}
+
 		ret = task_can_attach(task);
 		if (ret)
 			goto out_unlock;
@@ -3153,6 +3197,7 @@ static int cpuset_can_attach(struct cgroup_taskset *tset)
 			 * contribute to sum_migrate_dl_bw.
 			 */
 			cs->nr_migrate_dl_tasks++;
+			oldcs->nr_migrate_dl_tasks--;
 			if (dl_task_needs_bw_move(task, cs->effective_cpus))
 				cs->sum_migrate_dl_bw += task->dl.dl_bw;
 		}
@@ -3161,10 +3206,12 @@ static int cpuset_can_attach(struct cgroup_taskset *tset)
 	ret = cpuset_reserve_dl_bw(cs);
 
 out_unlock:
-	if (ret)
-		reset_migrate_dl_data(cs);
-	else
+	if (ret) {
+		reset_migrate_dl_data(cs); /* Destination cpuset only */
+		clear_attach_data(&src_cs_head, true);
+	} else {
 		attach_ctx.in_progress++;
+	}
 
 	mutex_unlock(&cpuset_mutex);
 	return ret;
@@ -3180,6 +3227,7 @@ static void cpuset_cancel_attach(struct cgroup_taskset *tset)
 
 	mutex_lock(&cpuset_mutex);
 	dec_attach_in_progress_locked();
+	clear_attach_data(&src_cs_head, true);
 
 	if (cs->dl_bw_cpu >= 0)
 		dl_bw_free(cs->dl_bw_cpu, cs->sum_migrate_dl_bw);
@@ -3256,7 +3304,6 @@ static void cpuset_attach(struct cgroup_taskset *tset)
 	struct task_struct *task;
 	struct cgroup_subsys_state *css;
 	struct cpuset *cs;
-	struct cpuset *oldcs = attach_ctx.old_cs;
 
 	cgroup_taskset_first(tset, &css);
 	cs = css_cs(css);
@@ -3264,9 +3311,6 @@ static void cpuset_attach(struct cgroup_taskset *tset)
 	lockdep_assert_cpus_held();	/* see cgroup_attach_lock() */
 	mutex_lock(&cpuset_mutex);
 	attach_ctx.task_work_queued = false;
-
-	attach_ctx.cpus_updated = !cpumask_equal(cs->effective_cpus, oldcs->effective_cpus);
-	attach_ctx.mems_updated = !nodes_equal(cs->effective_mems, oldcs->effective_mems);
 	guarantee_online_mems(cs, &attach_ctx.nodemask_to);
 
 	/*
@@ -3288,10 +3332,10 @@ out:
 
 	if (cs->nr_migrate_dl_tasks) {
 		atomic_add(cs->nr_migrate_dl_tasks, &cs->nr_deadline_tasks);
-		atomic_sub(cs->nr_migrate_dl_tasks, &oldcs->nr_deadline_tasks);
 		reset_migrate_dl_data(cs);
 	}
 
+	clear_attach_data(&src_cs_head, false);
 	dec_attach_in_progress_locked();
 
 	mutex_unlock(&cpuset_mutex);
@@ -3798,6 +3842,7 @@ int __init cpuset_init(void)
 	cpumask_setall(top_cpuset.effective_xcpus);
 	cpumask_setall(top_cpuset.exclusive_cpus);
 	nodes_setall(top_cpuset.effective_mems);
+	init_llist_node(&top_cpuset.attach_node);
 
 	cpuset1_init(&top_cpuset);
 

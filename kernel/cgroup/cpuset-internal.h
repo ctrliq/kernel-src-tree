@@ -145,6 +145,11 @@ struct cpuset {
 	 */
 	nodemask_t old_mems_allowed;
 
+	/*
+	 * For linking impacted cpusets during an attach operation.
+	 */
+	struct llist_node attach_node;
+
 	/* partition root state */
 	int partition_root_state;
 
