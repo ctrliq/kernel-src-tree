@@ -251,7 +251,7 @@ static int cpu_set_equal(cpu_set_t *dst, unsigned long mask)
 	CPU_ZERO(&expected);
 	assert(sizeof(mask) < CPU_SETSIZE);
 
-	for (int cpu = 0; cpu < sizeof(mask); ++cpu)
+	for (int cpu = 0; cpu < sizeof(mask) * 8; ++cpu)
 		if ((1UL << cpu) & mask)
 			CPU_SET(cpu, &expected);
 
@@ -260,8 +260,6 @@ static int cpu_set_equal(cpu_set_t *dst, unsigned long mask)
 
 enum test_phase {
 	AFFINITY_SETUP,
-	AFFINITY_THREAD_A_READY,
-	AFFINITY_THREADS_READY,
 	AFFINITY_CONTROLLER_DISABLED,
 	AFFINITY_COMPLETE,
 	AFFINITY_ERROR
@@ -271,7 +269,7 @@ struct thread_args {
 	const char *cgroup;
 	cpu_set_t *affinity_before;
 	cpu_set_t *affinity_after;
-	enum test_phase ready_phase;
+	int affinity_before_ready;
 };
 
 static pthread_mutex_t test_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -289,8 +287,7 @@ static void *affinity_thread_fn(void *arg)
 		goto fail;
 
 	pthread_mutex_lock(&test_mutex);
-	if (test_phase < args->ready_phase)
-		test_phase = args->ready_phase;
+	args->affinity_before_ready = 1;
 	pthread_cond_broadcast(&test_cond);
 
 	while (test_phase < AFFINITY_CONTROLLER_DISABLED)
@@ -361,18 +358,20 @@ static int test_cpuset_affinity_on_controller_disable(const char *root)
 		goto cleanup;
 
 	/* Now enable cpuset controller in parent */
-	if (cg_write(parent, "cgroup.subtree_control", "+cpuset")) {
-		ret = KSFT_SKIP;
-		goto cleanup;
-	}
+	if (cg_write(parent, "cgroup.subtree_control", "+cpuset"))
+		goto skip;
 
-	/* Set CPU affinity constraints */
+	/*
+	 * Set CPU affinity constraints
+	 * Skip the test if the setting of "cpuset.cpus" fails as the test
+	 * system may not have CPU 1.
+	 */
 	if (cg_write(parent, "cpuset.cpus", "0-1"))
-		goto cleanup;
+		goto skip;
 	if (cg_write(child_a, "cpuset.cpus", "0-1"))
-		goto cleanup;
+		goto skip;
 	if (cg_write(child_b, "cpuset.cpus", "1"))
-		goto cleanup;
+		goto skip;
 
 	/* Move group leader (main thread) to child A */
 	if (cg_enter_current(child_a))
@@ -385,7 +384,7 @@ static int test_cpuset_affinity_on_controller_disable(const char *root)
 		.cgroup = child_a,
 		.affinity_before = &affinity_a_before,
 		.affinity_after = &affinity_a_after,
-		.ready_phase = AFFINITY_THREAD_A_READY,
+		.affinity_before_ready = 0,
 	};
 	if (pthread_create(&thread_a, NULL, affinity_thread_fn, &args_a))
 		goto cleanup;
@@ -395,14 +394,15 @@ static int test_cpuset_affinity_on_controller_disable(const char *root)
 		.cgroup = child_b,
 		.affinity_before = &affinity_b_before,
 		.affinity_after = &affinity_b_after,
-		.ready_phase = AFFINITY_THREADS_READY,
+		.affinity_before_ready = 0,
 	};
 	if (pthread_create(&thread_b, NULL, affinity_thread_fn, &args_b))
 		goto cleanup_threads;
 	thread_b_created = 1;
 
 	pthread_mutex_lock(&test_mutex);
-	while (test_phase < AFFINITY_THREADS_READY)
+	while ((test_phase < AFFINITY_ERROR) &&
+	       (args_a.affinity_before_ready + args_b.affinity_before_ready < 2))
 		pthread_cond_wait(&test_cond, &test_mutex);
 
 	/* If a thread failed during setup, bail out */
@@ -447,6 +447,10 @@ static int test_cpuset_affinity_on_controller_disable(const char *root)
 	}
 
 	ret = KSFT_PASS;
+	goto cleanup;
+
+skip:
+	ret = KSFT_SKIP;
 	goto cleanup;
 
 cleanup_threads:
