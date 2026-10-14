@@ -16,6 +16,7 @@
 #include <linux/slab.h>
 #include <linux/refcount.h>
 #include <linux/sockptr.h>
+#include <linux/rh_kabi.h>
 
 #include <net/sock.h>
 #include <net/dst.h>
@@ -208,7 +209,7 @@ struct xfrm_state {
 
 	/* Data for encapsulator */
 	struct xfrm_encap_tmpl	*encap;
-	struct sock __rcu	*encap_sk;
+	RH_KABI_DEPRECATE(struct sock __rcu *, encap_sk)
 
 	/* Data for care-of address */
 	xfrm_address_t	*coaddr;
