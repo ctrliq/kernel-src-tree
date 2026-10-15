@@ -1,4 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
+#ifndef _ASM_X86_AMD_IBS_H
+#define _ASM_X86_AMD_IBS_H
+
 /*
  * From PPR Vol 1 for AMD Family 19h Model 01h B1
  * 55898 Rev 0.35 - Feb 5, 2021
@@ -96,7 +99,9 @@ union ibs_op_data2 {
 			rmt_node:1,	/* 4: destination node */
 			cache_hit_st:1,	/* 5: cache hit state */
 			data_src_hi:2,	/* 6-7: data source high */
-			reserved1:56;	/* 8-63: reserved */
+			strm_st:1,	/* 8: streaming store */
+			rmt_socket:1,   /* 9: remote socket */
+			reserved1:54;   /* 10-63: reserved */
 	};
 };
 
@@ -151,3 +156,5 @@ struct perf_ibs_data {
 	};
 	u64		regs[MSR_AMD64_IBS_REG_COUNT_MAX];
 };
+
+#endif /* _ASM_X86_AMD_IBS_H */

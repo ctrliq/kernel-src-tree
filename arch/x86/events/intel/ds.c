@@ -1291,18 +1291,21 @@ struct event_constraint intel_glm_pebs_event_constraints[] = {
 struct event_constraint intel_grt_pebs_event_constraints[] = {
 	/* Allow all events as PEBS with no flags */
 	INTEL_HYBRID_LAT_CONSTRAINT(0x5d0, 0x3),
-	INTEL_HYBRID_LAT_CONSTRAINT(0x6d0, 0xf),
+	INTEL_HYBRID_LAT_CONSTRAINT(0x6d0, 0x3f),
 	EVENT_CONSTRAINT_END
 };
 
-struct event_constraint intel_arw_pebs_event_constraints[] = {
+struct event_constraint intel_cmt_pebs_event_constraints[] = {
+	/* Allow all events as PEBS with no flags */
+	INTEL_HYBRID_LAT_CONSTRAINT(0x5d0, 0x3),
+	INTEL_HYBRID_LAT_CONSTRAINT(0x6d0, 0xff),
+	EVENT_CONSTRAINT_END
+};
+
+struct event_constraint intel_dkt_pebs_event_constraints[] = {
 	/* Allow all events as PEBS with no flags */
 	INTEL_HYBRID_LAT_CONSTRAINT(0x5d0, 0xff),
 	INTEL_HYBRID_LAT_CONSTRAINT(0x6d0, 0xff),
-	INTEL_FLAGS_UEVENT_CONSTRAINT(0x01d4, 0x1),
-	INTEL_FLAGS_UEVENT_CONSTRAINT(0x02d4, 0x2),
-	INTEL_FLAGS_UEVENT_CONSTRAINT(0x04d4, 0x4),
-	INTEL_FLAGS_UEVENT_CONSTRAINT(0x08d4, 0x8),
 	EVENT_CONSTRAINT_END
 };
 
@@ -1499,6 +1502,13 @@ struct event_constraint intel_lnc_pebs_event_constraints[] = {
 	INTEL_FLAGS_UEVENT_CONSTRAINT(0x100, 0x100000000ULL),	/* INST_RETIRED.PREC_DIST */
 	INTEL_FLAGS_UEVENT_CONSTRAINT(0x0400, 0x800000000ULL),
 
+	INTEL_FLAGS_UEVENT_CONSTRAINT(0x012a, 0x1),		/* OCR.* events */
+	INTEL_FLAGS_UEVENT_CONSTRAINT(0x012b, 0x1),		/* OCR.* events */
+
+	INTEL_FLAGS_UEVENT_CONSTRAINT(0x04a4, 0x1),		/* TOPDOWN.BAD_SPEC_SLOTS */
+	INTEL_FLAGS_UEVENT_CONSTRAINT(0x08a4, 0x1),		/* TOPDOWN.BR_MISPREDICT_SLOTS */
+	INTEL_FLAGS_UEVENT_CONSTRAINT(0x10a4, 0x8),		/* TOPDOWN.MEMORY_BOUND_SLOTS */
+
 	INTEL_HYBRID_LDLAT_CONSTRAINT(0x1cd, 0x3fc),
 	INTEL_HYBRID_STLAT_CONSTRAINT(0x2cd, 0x3),
 	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_LD(0x11d0, 0xf),	/* MEM_INST_RETIRED.STLB_MISS_LOADS */
@@ -1508,6 +1518,7 @@ struct event_constraint intel_lnc_pebs_event_constraints[] = {
 	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_ST(0x42d0, 0xf),	/* MEM_INST_RETIRED.SPLIT_STORES */
 	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_LD(0x81d0, 0xf),	/* MEM_INST_RETIRED.ALL_LOADS */
 	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_ST(0x82d0, 0xf),	/* MEM_INST_RETIRED.ALL_STORES */
+	INTEL_FLAGS_UEVENT_CONSTRAINT(0x87d0, 0x3ff),		/* MEM_INST_RETIRED.ANY */
 
 	INTEL_FLAGS_EVENT_CONSTRAINT_DATALA_LD_RANGE(0xd1, 0xd4, 0xf),
 
@@ -1862,7 +1873,7 @@ static void intel_pmu_pebs_via_pt_enable(struct perf_event *event)
 		else
 			value = ds->pebs_event_reset[MAX_PEBS_EVENTS + idx];
 	}
-	wrmsrl(base + idx, value);
+	wrmsrq(base + idx, value);
 }
 
 static inline void intel_pmu_drain_large_pebs(struct cpu_hw_events *cpuc)
@@ -1906,7 +1917,7 @@ void intel_pmu_pebs_enable(struct perf_event *event)
 			 */
 			intel_pmu_drain_pebs_buffer();
 			adaptive_pebs_record_size_update();
-			wrmsrl(MSR_PEBS_DATA_CFG, pebs_data_cfg);
+			wrmsrq(MSR_PEBS_DATA_CFG, pebs_data_cfg);
 			cpuc->active_pebs_data_cfg = pebs_data_cfg;
 		}
 	}
@@ -1977,7 +1988,7 @@ void intel_pmu_pebs_disable(struct perf_event *event)
 	intel_pmu_pebs_via_pt_disable(event);
 
 	if (cpuc->enabled)
-		wrmsrl(MSR_IA32_PEBS_ENABLE, cpuc->pebs_enabled);
+		wrmsrq(MSR_IA32_PEBS_ENABLE, cpuc->pebs_enabled);
 }
 
 void intel_pmu_pebs_enable_all(void)
@@ -1985,7 +1996,7 @@ void intel_pmu_pebs_enable_all(void)
 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
 
 	if (cpuc->pebs_enabled)
-		wrmsrl(MSR_IA32_PEBS_ENABLE, cpuc->pebs_enabled);
+		wrmsrq(MSR_IA32_PEBS_ENABLE, cpuc->pebs_enabled);
 }
 
 void intel_pmu_pebs_disable_all(void)
@@ -3235,7 +3246,7 @@ static void intel_pmu_drain_arch_pebs(struct pt_regs *iregs,
 	void *base, *at, *top;
 	u64 mask;
 
-	rdmsrl(MSR_IA32_PEBS_INDEX, index.whole);
+	rdmsrq(MSR_IA32_PEBS_INDEX, index.whole);
 
 	if (unlikely(!index.wr)) {
 		intel_pmu_pebs_event_update_no_drain(cpuc, X86_PMC_IDX_MAX);
@@ -3252,7 +3263,7 @@ static void intel_pmu_drain_arch_pebs(struct pt_regs *iregs,
 		index.thresh = ARCH_PEBS_THRESH_MULTI;
 	else
 		index.thresh = ARCH_PEBS_THRESH_SINGLE;
-	wrmsrl(MSR_IA32_PEBS_INDEX, index.whole);
+	wrmsrq(MSR_IA32_PEBS_INDEX, index.whole);
 
 	mask = hybrid(cpuc->pmu, arch_pebs_cap).counters & cpuc->pebs_enabled;
 
@@ -3448,5 +3459,5 @@ void perf_restore_debug_store(void)
 	if (!x86_pmu.bts && !x86_pmu.ds_pebs)
 		return;
 
-	wrmsrl(MSR_IA32_DS_AREA, (unsigned long)ds);
+	wrmsrq(MSR_IA32_DS_AREA, (unsigned long)ds);
 }

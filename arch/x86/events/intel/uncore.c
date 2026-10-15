@@ -82,6 +82,25 @@ int uncore_device_to_die(struct pci_dev *dev)
 	return -1;
 }
 
+/*
+ * Using cpus_read_lock() to ensure cpu is not going down between
+ * looking at cpu_online_mask.
+ *
+ * The lock must be held by the caller.
+ */
+int uncore_die_to_cpu(int die)
+{
+	int res = -1, cpu;
+
+	for_each_online_cpu(cpu) {
+		if (topology_logical_die_id(cpu) == die) {
+			res = cpu;
+			break;
+		}
+	}
+	return res;
+}
+
 static void uncore_free_pcibus_map(void)
 {
 	struct pci2phy_map *map, *tmp;
@@ -107,7 +126,7 @@ lookup:
 
 	if (!alloc) {
 		raw_spin_unlock(&pci2phy_map_lock);
-		alloc = kmalloc(sizeof(struct pci2phy_map), GFP_KERNEL);
+		alloc = kmalloc_obj(struct pci2phy_map);
 		raw_spin_lock(&pci2phy_map_lock);
 
 		if (!alloc)
@@ -151,7 +170,7 @@ u64 uncore_msr_read_counter(struct intel_uncore_box *box, struct perf_event *eve
 {
 	u64 count;
 
-	rdmsrl(event->hw.event_base, count);
+	rdmsrq(event->hw.event_base, count);
 
 	return count;
 }
@@ -990,7 +1009,7 @@ static int __init uncore_type_init(struct intel_uncore_type *type)
 	size_t size;
 	int i, j;
 
-	pmus = kcalloc(type->num_boxes, sizeof(*pmus), GFP_KERNEL);
+	pmus = kzalloc_objs(*pmus, type->num_boxes);
 	if (!pmus)
 		return -ENOMEM;
 
@@ -1016,8 +1035,7 @@ static int __init uncore_type_init(struct intel_uncore_type *type)
 		} *attr_group;
 		for (i = 0; type->event_descs[i].attr.attr.name; i++);
 
-		attr_group = kzalloc(struct_size(attr_group, attrs, i + 1),
-								GFP_KERNEL);
+		attr_group = kzalloc_flex(*attr_group, attrs, i + 1);
 		if (!attr_group)
 			goto err;
 
@@ -1697,7 +1715,7 @@ err:
 	return ret;
 }
 
-static int uncore_mmio_global_init(u64 ctl)
+static int uncore_mmio_global_init(int die, u64 ctl)
 {
 	void __iomem *io_addr;
 
@@ -1710,6 +1728,16 @@ static int uncore_mmio_global_init(u64 ctl)
 
 	iounmap(io_addr);
 	return 0;
+}
+
+static int uncore_msr_global_init(int die, u64 msr)
+{
+	int cpu = uncore_die_to_cpu(die);
+
+	if (cpu == -1)
+		return -ENODEV;
+
+	return wrmsr_on_cpu(cpu, msr, 0, 0);
 }
 
 static const struct uncore_plat_init nhm_uncore_init __initconst = {
@@ -1852,6 +1880,7 @@ static const struct uncore_plat_init gnr_uncore_init __initconst = {
 	.domain[0].base_is_pci = true,
 	.domain[0].discovery_base = UNCORE_DISCOVERY_TABLE_DEVICE,
 	.domain[0].units_ignore = gnr_uncore_units_ignore,
+	.domain[0].global_init = uncore_msr_global_init,
 };
 
 static const struct uncore_plat_init dmr_uncore_init __initconst = {

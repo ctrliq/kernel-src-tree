@@ -187,7 +187,7 @@ void amd_brs_reset(void)
 	/*
 	 * Mark first entry as poisoned
 	 */
-	wrmsrl(brs_to(0), BRS_POISON);
+	wrmsrq(brs_to(0), BRS_POISON);
 }
 
 int __init amd_brs_init(void)
@@ -259,13 +259,13 @@ void amd_brs_disable_all(void)
 		amd_brs_disable();
 }
 
-static bool amd_brs_match_plm(struct perf_event *event, u64 to)
+static bool amd_brs_match_plm(struct perf_event *event, u64 from, u64 to)
 {
 	int type = event->attr.branch_sample_type;
 	int plm_k = PERF_SAMPLE_BRANCH_KERNEL | PERF_SAMPLE_BRANCH_HV;
 	int plm_u = PERF_SAMPLE_BRANCH_USER;
 
-	if (!(type & plm_k) && kernel_ip(to))
+	if (!(type & plm_k) && (kernel_ip(to) || kernel_ip(from)))
 		return 0;
 
 	if (!(type & plm_u) && !kernel_ip(to))
@@ -325,7 +325,7 @@ void amd_brs_drain(void)
 		u32 brs_idx = tos - i;
 		u64 from, to;
 
-		rdmsrl(brs_to(brs_idx), to);
+		rdmsrq(brs_to(brs_idx), to);
 
 		/* Entry does not belong to us (as marked by kernel) */
 		if (to == BRS_POISON)
@@ -338,10 +338,10 @@ void amd_brs_drain(void)
 		 */
 		to = (u64)(((s64)to << shift) >> shift);
 
-		if (!amd_brs_match_plm(event, to))
-			continue;
+		rdmsrq(brs_from(brs_idx), from);
 
-		rdmsrl(brs_from(brs_idx), from);
+		if (!amd_brs_match_plm(event, from, to))
+			continue;
 
 		perf_clear_branch_entry_bitfields(br+nr);
 
@@ -371,7 +371,7 @@ static void amd_brs_poison_buffer(void)
 	idx = amd_brs_get_tos(&cfg);
 
 	/* Poison target of entry */
-	wrmsrl(brs_to(idx), BRS_POISON);
+	wrmsrq(brs_to(idx), BRS_POISON);
 }
 
 /*

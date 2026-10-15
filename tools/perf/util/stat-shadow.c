@@ -13,7 +13,6 @@
 #include "metricgroup.h"
 #include "cgroup.h"
 #include "units.h"
-#include <linux/zalloc.h>
 #include "iostat.h"
 #include "util/hashmap.h"
 #include "tool_pmu.h"
@@ -54,6 +53,7 @@ static int prepare_metric(struct perf_stat_config *config,
 
 	for (i = 0; metric_events[i]; i++) {
 		int source_count = 0, tool_aggr_idx;
+		int aggr_nr = 1;
 		bool is_tool_time =
 			tool_pmu__is_time_event(config, metric_events[i], &tool_aggr_idx);
 		struct perf_stat_evsel *ps = metric_events[i]->stats;
@@ -90,6 +90,7 @@ static int prepare_metric(struct perf_stat_config *config,
 			 */
 			val = NAN;
 			source_count = 0;
+			aggr_nr = 0;
 		} else {
 			struct perf_stat_aggr *aggr =
 				&ps->aggr[is_tool_time ? tool_aggr_idx : aggr_idx];
@@ -97,6 +98,7 @@ static int prepare_metric(struct perf_stat_config *config,
 			if (aggr->counts.run == 0) {
 				val = NAN;
 				source_count = 0;
+				aggr_nr = 0;
 			} else {
 				val = aggr->counts.val;
 				if (is_tool_time) {
@@ -105,13 +107,14 @@ static int prepare_metric(struct perf_stat_config *config,
 				}
 				if (!source_count)
 					source_count = evsel__source_count(metric_events[i]);
+				aggr_nr = aggr->nr ?: 1;
 			}
 		}
 		n = strdup(evsel__metric_id(metric_events[i]));
 		if (!n)
 			return -ENOMEM;
 
-		expr__add_id_val_source_count(pctx, n, val, source_count);
+		expr__add_id_val_source_count_aggr_nr(pctx, n, val, source_count, aggr_nr);
 	}
 
 	for (int j = 0; metric_refs && metric_refs[j].metric_name; j++) {
@@ -343,14 +346,10 @@ void perf_stat__print_shadow_stats(struct perf_stat_config *config,
  * perf_stat__skip_metric_event - Skip the evsel in the Default metricgroup,
  *				  if it's not running or not the metric event.
  */
-bool perf_stat__skip_metric_event(struct evsel *evsel,
-				  u64 ena, u64 run)
+bool perf_stat__skip_metric_event(struct evsel *evsel)
 {
 	if (!evsel->default_metricgroup)
 		return false;
-
-	if (!ena || !run)
-		return true;
 
 	return !metricgroup__lookup(&evsel->evlist->metric_events, evsel, false);
 }
