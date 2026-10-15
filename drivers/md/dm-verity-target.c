@@ -454,7 +454,7 @@ static int verity_verify_io(struct dm_verity_io *io)
 		iter = &io->iter;
 
 	for (b = 0; b < io->n_blocks;
-	     b++, bio_advance_iter(bio, iter, block_size)) {
+	     b++, bio_advance_iter_single(bio, iter, block_size)) {
 		int r;
 		sector_t cur_block = io->block + b;
 		bool is_zero;
