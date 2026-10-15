@@ -1040,43 +1040,86 @@ noinstr time64_t __ktime_get_real_seconds(void)
 }
 
 /**
- * ktime_get_snapshot - snapshots the realtime/monotonic raw clocks with counter
- * @systime_snapshot:	pointer to struct receiving the system time snapshot
+ * ktime_get_snapshot_id -  Simultaneously snapshot a given clock ID with
+ *			    CLOCK_MONOTONIC_RAW and the underlying
+ *			    clocksource counter value.
+ * @clock_id:		The clock ID to snapshot
+ * @systime_snapshot:	Pointer to struct receiving the system time snapshot
  */
-void ktime_get_snapshot(struct system_time_snapshot *systime_snapshot)
+void ktime_get_snapshot_id(clockid_t clock_id, struct system_time_snapshot *systime_snapshot)
 {
-	struct timekeeper *tk = &tk_core.timekeeper;
+	ktime_t base_raw, base_sys, offs_sys, *offs, offs_zero = 0;
+	u64 nsec_raw, nsec_sys, now;
+	struct timekeeper *tk;
+	struct tk_data *tkd;
 	unsigned int seq;
-	ktime_t base_raw;
 	ktime_t base_real;
 	ktime_t base_boot;
-	u64 nsec_raw;
-	u64 nsec_real;
-	u64 now;
 
-	WARN_ON_ONCE(timekeeping_suspended);
+	/* Invalidate the snapshot for all failure cases */
+	systime_snapshot->valid = false;
+
+	if (WARN_ON_ONCE(timekeeping_suspended))
+		return;
+
+	switch (clock_id) {
+	case CLOCK_REALTIME:
+		tkd = &tk_core;
+		offs = &tk_core.timekeeper.offs_real;
+		break;
+	/* Map RAW to MONOTONIC so the loop below is trivial */
+	case CLOCK_MONOTONIC_RAW:
+	case CLOCK_MONOTONIC:
+		tkd = &tk_core;
+		offs = &offs_zero;
+		break;
+	case CLOCK_BOOTTIME:
+		tkd = &tk_core;
+		offs = &tk_core.timekeeper.offs_boot;
+		break;
+	default:
+		WARN_ON_ONCE(1);
+		return;
+	}
+
+	tk = &tkd->timekeeper;
 
 	do {
-		seq = read_seqcount_begin(&tk_core.seq);
+		seq = read_seqcount_begin(&tkd->seq);
+
 		now = tk_clock_read(&tk->tkr_mono);
 		systime_snapshot->cs_id = tk->tkr_mono.clock->id;
 		systime_snapshot->cs_was_changed_seq = tk->cs_was_changed_seq;
 		systime_snapshot->clock_was_set_seq = tk->clock_was_set_seq;
-		base_real = ktime_add(tk->tkr_mono.base,
-				      tk_core.timekeeper.offs_real);
-		base_boot = ktime_add(tk->tkr_mono.base,
-				      tk_core.timekeeper.offs_boot);
+
+		base_sys = tk->tkr_mono.base;
+		offs_sys = *offs;
 		base_raw = tk->tkr_raw.base;
-		nsec_real = timekeeping_cycles_to_ns(&tk->tkr_mono, now);
-		nsec_raw  = timekeeping_cycles_to_ns(&tk->tkr_raw, now);
-	} while (read_seqcount_retry(&tk_core.seq, seq));
+
+		/* Kept around until the callers are fixed up */
+		base_real = ktime_add(base_sys, tk_core.timekeeper.offs_real);
+		base_boot = ktime_add(base_sys, tk_core.timekeeper.offs_boot);
+
+		nsec_sys = timekeeping_cycles_to_ns(&tk->tkr_mono, now);
+		nsec_raw = timekeeping_cycles_to_ns(&tk->tkr_raw, now);
+	} while (read_seqcount_retry(&tkd->seq, seq));
 
 	systime_snapshot->cycles = now;
-	systime_snapshot->real = ktime_add_ns(base_real, nsec_real);
-	systime_snapshot->boot = ktime_add_ns(base_boot, nsec_real);
-	systime_snapshot->raw = ktime_add_ns(base_raw, nsec_raw);
+	systime_snapshot->systime = ktime_add_ns(base_sys, offs_sys + nsec_sys);
+	systime_snapshot->real = ktime_add_ns(base_real, nsec_sys);
+	systime_snapshot->boot = ktime_add_ns(base_boot, nsec_sys);
+	systime_snapshot->monoraw = ktime_add_ns(base_raw, nsec_raw);
+
+	/*
+	 * Special case for PTP. Just transfer the raw time into sys,
+	 * so the call sites can consistently use snap::systime.
+	 */
+	if (clock_id == CLOCK_MONOTONIC_RAW)
+		systime_snapshot->systime = systime_snapshot->monoraw;
+	/* Tell the consumer that this snapshot is valid */
+	systime_snapshot->valid = true;
 }
-EXPORT_SYMBOL_GPL(ktime_get_snapshot);
+EXPORT_SYMBOL_GPL(ktime_get_snapshot_id);
 
 /* Scale base by mult/div checking for overflow */
 static int scale64_check_overflow(u64 mult, u64 div, u64 *base)
@@ -1137,7 +1180,7 @@ static int adjust_historical_crosststamp(struct system_time_snapshot *history,
 	 *	partial_history_cycles / total_history_cycles
 	 */
 	corr_raw = (u64)ktime_to_ns(
-		ktime_sub(ts->sys_monoraw, history->raw));
+		ktime_sub(ts->sys_monoraw, history->monoraw));
 	ret = scale64_check_overflow(partial_history_cycles,
 				     total_history_cycles, &corr_raw);
 	if (ret)
@@ -1155,7 +1198,7 @@ static int adjust_historical_crosststamp(struct system_time_snapshot *history,
 			(corr_raw, tk->tkr_mono.mult, tk->tkr_raw.mult);
 	} else {
 		corr_real = (u64)ktime_to_ns(
-			ktime_sub(ts->sys_realtime, history->real));
+			ktime_sub(ts->sys_realtime, history->systime));
 		ret = scale64_check_overflow(partial_history_cycles,
 					     total_history_cycles, &corr_real);
 		if (ret)
@@ -1164,8 +1207,8 @@ static int adjust_historical_crosststamp(struct system_time_snapshot *history,
 
 	/* Fixup monotonic raw and real time time values */
 	if (interp_forward) {
-		ts->sys_monoraw = ktime_add_ns(history->raw, corr_raw);
-		ts->sys_realtime = ktime_add_ns(history->real, corr_real);
+		ts->sys_monoraw = ktime_add_ns(history->monoraw, corr_raw);
+		ts->sys_realtime = ktime_add_ns(history->systime, corr_real);
 	} else {
 		ts->sys_monoraw = ktime_sub_ns(ts->sys_monoraw, corr_raw);
 		ts->sys_realtime = ktime_sub_ns(ts->sys_realtime, corr_real);
