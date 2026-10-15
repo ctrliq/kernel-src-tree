@@ -198,6 +198,17 @@ static void put_client_renew(struct nfs4_client *clp)
 	spin_unlock(&nn->client_lock);
 }
 
+static void put_client_no_renew(struct nfs4_client *clp)
+{
+	struct nfsd_net *nn = net_generic(clp->net, nfsd_net_id);
+
+	if (!atomic_dec_and_lock(&clp->cl_rpc_users, &nn->client_lock))
+		return;
+	if (is_client_expired(clp))
+		wake_up_all(&expiry_wq);
+	spin_unlock(&nn->client_lock);
+}
+
 static __be32 nfsd4_get_session_locked(struct nfsd4_session *ses)
 {
 	__be32 status;
@@ -289,7 +300,7 @@ nbl_client(struct nfsd4_blocked_lock *nbl)
 {
 	struct nfs4_lockowner *lo;
 
-	lo = (struct nfs4_lockowner *)nbl->nbl_lock.c.flc_owner;
+	lo = (struct nfs4_lockowner *)nbl->nbl_lock.fl_owner;
 	return lo->lo_owner.so_client;
 }
 
