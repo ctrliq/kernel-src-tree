@@ -1,0 +1,142 @@
+wifi: mac80211: defer link RX stats percpu free to RCU
+
+jira KERNEL-1755
+cve CVE-2026-68409
+Rebuild_History Non-Buildable kernel-4.18.0-553.173.1.el8_10
+commit-author Maoyi Xie <maoyixie.tju@gmail.com>
+commit aa2eb62525188269cdd402a583b9a8ed94657ff0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.173.1.el8_10/aa2eb625.failed
+
+sta_remove_link() frees a removed MLO link's RX stats percpu buffer right
+away, but defers only the link container to RCU:
+
+	sta_info_free_link(&alloc->info);
+	kfree_rcu(alloc, rcu_head);
+
+The RX fast path reads link_sta under rcu_read_lock and writes the percpu
+stats. A reader that resolved link_sta before the removal keeps the
+pointer. The container stays alive from the kfree_rcu, so the read still
+works. But the percpu block it points to is already freed. This needs
+uses_rss. That is when pcpu_rx_stats exists.
+
+The full STA teardown frees the deflink stats only after
+synchronize_net(). The link removal path had no such barrier. The race is
+hard to win in practice, but the free should still wait for RCU.
+
+Free the link together with its data from a single RCU callback, so the
+percpu block is reclaimed only after readers drain.
+
+Fixes: c71420db653a ("wifi: mac80211: RCU-ify link STA pointers")
+Link: https://lore.kernel.org/r/20260626080158.3589711-1-maoyixie.tju@gmail.com
+	Suggested-by: Johannes Berg <johannes@sipsolutions.net>
+Co-developed-by: Kaixuan Li <kaixuan.li@ntu.edu.sg>
+	Signed-off-by: Kaixuan Li <kaixuan.li@ntu.edu.sg>
+	Signed-off-by: Maoyi Xie <maoyixie.tju@gmail.com>
+Link: https://patch.msgid.link/20260627083028.3826810-1-maoyixie.tju@gmail.com
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit aa2eb62525188269cdd402a583b9a8ed94657ff0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mac80211/sta_info.c
+diff --cc net/mac80211/sta_info.c
+index 2520ee8c3b27,22eba0e6e54c..000000000000
+--- a/net/mac80211/sta_info.c
++++ b/net/mac80211/sta_info.c
+@@@ -349,6 -355,71 +349,74 @@@ static void sta_info_free_link(struct l
+  	free_percpu(link_sta->pcpu_rx_stats);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void sta_link_free_rcu(struct rcu_head *head)
++ {
++ 	struct sta_link_alloc *alloc =
++ 		container_of(head, struct sta_link_alloc, rcu_head);
++ 
++ 	sta_info_free_link(&alloc->info);
++ 	kfree(alloc);
++ }
++ 
++ static void sta_accumulate_removed_link_stats(struct sta_info *sta, int link_id)
++ {
++ 	struct link_sta_info *link_sta = wiphy_dereference(sta->local->hw.wiphy,
++ 							   sta->link[link_id]);
++ 	struct ieee80211_link_data *link;
++ 	unsigned int start;
++ 	int ac, tid;
++ 	u64 value;
++ 	u32 thr;
++ 
++ 	for (ac = 0; ac < IEEE80211_NUM_ACS; ac++) {
++ 		sta->rem_link_stats.tx_packets +=
++ 			link_sta->tx_stats.packets[ac];
++ 		sta->rem_link_stats.tx_bytes += link_sta->tx_stats.bytes[ac];
++ 	}
++ 
++ 	do {
++ 		start = u64_stats_fetch_begin(&link_sta->rx_stats.syncp);
++ 		value = u64_stats_read(&link_sta->rx_stats.bytes);
++ 	} while (u64_stats_fetch_retry(&link_sta->rx_stats.syncp, start));
++ 
++ 	sta->rem_link_stats.rx_packets += link_sta->rx_stats.packets;
++ 	sta->rem_link_stats.rx_bytes += value;
++ 	sta->rem_link_stats.tx_retries += link_sta->status_stats.retry_count;
++ 	sta->rem_link_stats.tx_failed += link_sta->status_stats.retry_failed;
++ 	sta->rem_link_stats.rx_dropped_misc += link_sta->rx_stats.dropped;
++ 
++ 	thr = sta_get_expected_throughput(sta);
++ 	if (thr != 0)
++ 		sta->rem_link_stats.expected_throughput += thr;
++ 
++ 	for (tid = 0; tid < IEEE80211_NUM_TIDS; tid++) {
++ 		do {
++ 			start = u64_stats_fetch_begin(&link_sta->rx_stats.syncp);
++ 			value = u64_stats_read(&link_sta->rx_stats.msdu[tid]);
++ 		} while (u64_stats_fetch_retry(&link_sta->rx_stats.syncp,
++ 					       start));
++ 
++ 		sta->rem_link_stats.pertid_stats.rx_msdu += value;
++ 		sta->rem_link_stats.pertid_stats.tx_msdu +=
++ 			link_sta->tx_stats.msdu[tid];
++ 		sta->rem_link_stats.pertid_stats.tx_msdu_retries +=
++ 			link_sta->status_stats.msdu_retries[tid];
++ 		sta->rem_link_stats.pertid_stats.tx_msdu_failed +=
++ 			link_sta->status_stats.msdu_failed[tid];
++ 	}
++ 
++ 	if (sta->sdata->vif.type == NL80211_IFTYPE_STATION) {
++ 		link = wiphy_dereference(sta->sdata->local->hw.wiphy,
++ 					 sta->sdata->link[link_id]);
++ 		if (link)
++ 			sta->rem_link_stats.beacon_loss_count +=
++ 				link->u.mgd.beacon_loss_count;
++ 	}
++ }
++ 
+++>>>>>>> aa2eb6252518 (wifi: mac80211: defer link RX stats percpu free to RCU)
+  static void sta_remove_link(struct sta_info *sta, unsigned int link_id,
+  			    bool unhash)
+  {
+@@@ -371,12 -442,14 +439,10 @@@
+  		alloc = container_of(link_sta, typeof(*alloc), info);
+  
+  	sta->sta.valid_links &= ~BIT(link_id);
+ -
+ -	/* store removed link info for accumulated stats consistency */
+ -	sta_accumulate_removed_link_stats(sta, link_id);
+ -
+  	RCU_INIT_POINTER(sta->link[link_id], NULL);
+  	RCU_INIT_POINTER(sta->sta.link[link_id], NULL);
+- 	if (alloc) {
+- 		sta_info_free_link(&alloc->info);
+- 		kfree_rcu(alloc, rcu_head);
+- 	}
++ 	if (alloc)
++ 		call_rcu(&alloc->rcu_head, sta_link_free_rcu);
+  
+  	ieee80211_sta_recalc_aggregates(&sta->sta);
+  }
+* Unmerged path net/mac80211/sta_info.c
