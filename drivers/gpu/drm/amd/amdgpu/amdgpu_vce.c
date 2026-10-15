@@ -817,6 +817,7 @@ int amdgpu_vce_ring_parse_cs(struct amdgpu_cs_parser *p,
 	for (idx = 0; idx < ib->length_dw;) {
 		uint32_t len = amdgpu_ib_get_value(ib, idx);
 		uint32_t cmd = amdgpu_ib_get_value(ib, idx + 1);
+		uint32_t width, height;
 
 		switch (cmd) {
 		case 0x00000001: /* session */
@@ -847,7 +848,6 @@ int amdgpu_vce_ring_parse_cs(struct amdgpu_cs_parser *p,
 				goto out;
 			}
 
-			uint32_t width, height;
 			width = amdgpu_ib_get_value(ib, idx + 8);
 			height = amdgpu_ib_get_value(ib, idx + 10);
 
