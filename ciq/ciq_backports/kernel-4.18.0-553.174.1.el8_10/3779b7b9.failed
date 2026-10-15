@@ -1,0 +1,262 @@
+svcrdma: Validate Read chunk positions before reconstruction
+
+jira KERNEL-1755
+cve CVE-2026-89526
+Rebuild_History Non-Buildable kernel-4.18.0-553.174.1.el8_10
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 3779b7b9e7d1c8ba4738f9d327de3b0288cefe9b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.174.1.el8_10/3779b7b9.failed
+
+The RPC/RDMA Read chunk position field is supplied by the remote
+client and stored verbatim in the parsed chunk list.
+xdr_count_read_segments() checks only 4-byte alignment; it never
+compares the position against the received inline body length.
+
+In the single-chunk path, svc_rdma_read_complete_one() splits the
+head and tail kvecs at ch_position. A position past the inline
+body underflows the tail length, exposing adjacent slab memory to
+the upper XDR decoder.
+
+In the multi-chunk path, svc_rdma_read_multiple_chunks() computes
+gap lengths between chunks as unsigned subtractions from
+ch_position. Overlapping Read chunks cause these subtractions to
+underflow. A final position past the inline body likewise
+underflows the trailing gap length. svc_rdma_copy_inline_range()
+then copies past the receive buffer into request pages that are
+returned to the client through the Reply channel.
+
+Bound inline-range copies in svc_rdma_copy_inline_range() against
+the decoded inline RPC body saved in rc_saved_arg. Reject a
+single Read chunk positioned beyond that body, and reject
+multi-chunk lists where accumulated read bytes exceed the next
+chunk's position. Apply the same position and overlap checks in
+the call-chunk interleaving path.
+
+Fixes: d96962e6d0e2 ("svcrdma: Use the new parsed chunk list when pulling Read chunks")
+	Cc: stable@vger.kernel.org
+	Acked-by: Jeff Layton <jlayton@kernel.org>
+Link: https://patch.msgid.link/20260526-rpc-kernel-bugs-v1-1-e251306ccca9@oracle.com
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+(cherry picked from commit 3779b7b9e7d1c8ba4738f9d327de3b0288cefe9b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/svc_rdma_rw.c
+diff --cc net/sunrpc/xprtrdma/svc_rdma_rw.c
+index 11cf7c646644,8dae418d15b4..000000000000
+--- a/net/sunrpc/xprtrdma/svc_rdma_rw.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_rw.c
+@@@ -785,8 -845,9 +785,14 @@@ static int svc_rdma_build_read_chunk(st
+  
+  /**
+   * svc_rdma_copy_inline_range - Copy part of the inline content into pages
+++<<<<<<< HEAD
+ + * @info: context for RDMA Reads
+ + * @offset: offset into the Receive buffer of region to copy
+++=======
++  * @rqstp: RPC transaction context
++  * @head: context for ongoing I/O
++  * @offset: offset into the inline content of region to copy
+++>>>>>>> 3779b7b9e7d1 (svcrdma: Validate Read chunk positions before reconstruction)
+   * @remaining: length of region to copy
+   *
+   * Take a page at a time from rqstp->rq_pages and copy the inline
+@@@ -802,12 -864,14 +808,23 @@@ static int svc_rdma_copy_inline_range(s
+  				      unsigned int offset,
+  				      unsigned int remaining)
+  {
+++<<<<<<< HEAD
+ +	struct svc_rdma_recv_ctxt *head = info->ri_readctxt;
+ +	unsigned char *dst, *src = head->rc_recv_buf;
+ +	struct svc_rqst *rqstp = info->ri_rqst;
+ +	unsigned int page_no, numpages;
+ +
+ +	numpages = PAGE_ALIGN(info->ri_pageoff + remaining) >> PAGE_SHIFT;
+++=======
++ 	unsigned char *dst, *src = head->rc_saved_arg.head[0].iov_base;
++ 	unsigned int inline_len = head->rc_saved_arg.head[0].iov_len;
++ 	unsigned int page_no, numpages;
++ 
++ 	if (offset > inline_len || remaining > inline_len - offset)
++ 		return -EINVAL;
++ 
++ 	numpages = PAGE_ALIGN(head->rc_pageoff + remaining) >> PAGE_SHIFT;
+++>>>>>>> 3779b7b9e7d1 (svcrdma: Validate Read chunk positions before reconstruction)
+  	for (page_no = 0; page_no < numpages; page_no++) {
+  		unsigned int page_len;
+  
+@@@ -847,15 -915,16 +864,16 @@@
+   *   %-ENOTCONN: posting failed (connection is lost),
+   *   %-EIO: rdma_rw initialization failed (DMA mapping, etc).
+   */
+ -static noinline int
+ -svc_rdma_read_multiple_chunks(struct svc_rqst *rqstp,
+ -			      struct svc_rdma_recv_ctxt *head)
+ +static noinline int svc_rdma_read_multiple_chunks(struct svc_rdma_read_info *info)
+  {
+ +	struct svc_rdma_recv_ctxt *head = info->ri_readctxt;
+  	const struct svc_rdma_pcl *pcl = &head->rc_read_pcl;
+ +	struct xdr_buf *buf = &info->ri_rqst->rq_arg;
+  	struct svc_rdma_chunk *chunk, *next;
+- 	unsigned int start, length;
++ 	unsigned int inline_len, start, length;
+  	int ret;
+  
++ 	inline_len = head->rc_saved_arg.head[0].iov_len;
+  	start = 0;
+  	chunk = pcl_first_chunk(pcl);
+  	length = chunk->ch_position;
+@@@ -873,26 -942,19 +891,40 @@@
+  			break;
+  
+  		start += length;
+++<<<<<<< HEAD
+ +		length = next->ch_position - info->ri_totalbytes;
+ +		ret = svc_rdma_copy_inline_range(info, start, length);
+++=======
++ 		if (head->rc_readbytes > next->ch_position)
++ 			return -EINVAL;
++ 		length = next->ch_position - head->rc_readbytes;
++ 		ret = svc_rdma_copy_inline_range(rqstp, head, start, length);
+++>>>>>>> 3779b7b9e7d1 (svcrdma: Validate Read chunk positions before reconstruction)
+  		if (ret < 0)
+  			return ret;
+  	}
+  
+  	start += length;
+++<<<<<<< HEAD
+ +	length = head->rc_byte_len - start;
+ +	ret = svc_rdma_copy_inline_range(info, start, length);
+ +	if (ret < 0)
+ +		return ret;
+ +
+ +	buf->len += info->ri_totalbytes;
+ +	buf->buflen += info->ri_totalbytes;
+ +
+ +	buf->head[0].iov_base = page_address(info->ri_rqst->rq_pages[0]);
+ +	buf->head[0].iov_len = min_t(size_t, PAGE_SIZE, info->ri_totalbytes);
+ +	buf->pages = &info->ri_rqst->rq_pages[1];
+ +	buf->page_len = info->ri_totalbytes - buf->head[0].iov_len;
+ +	return 0;
+++=======
++ 	if (start > inline_len)
++ 		return -EINVAL;
++ 	length = inline_len - start;
++ 	return svc_rdma_copy_inline_range(rqstp, head, start, length);
+++>>>>>>> 3779b7b9e7d1 (svcrdma: Validate Read chunk positions before reconstruction)
+  }
+  
+  /**
+@@@ -912,45 -975,15 +944,54 @@@
+   *   %-ENOTCONN: posting failed (connection is lost),
+   *   %-EIO: rdma_rw initialization failed (DMA mapping, etc).
+   */
+ -static int svc_rdma_read_data_item(struct svc_rqst *rqstp,
+ -				   struct svc_rdma_recv_ctxt *head)
+ +static int svc_rdma_read_data_item(struct svc_rdma_read_info *info)
+  {
+++<<<<<<< HEAD
+ +	struct svc_rdma_recv_ctxt *head = info->ri_readctxt;
+ +	struct xdr_buf *buf = &info->ri_rqst->rq_arg;
+ +	struct svc_rdma_chunk *chunk;
+ +	unsigned int length;
+ +	int ret;
+ +
+ +	chunk = pcl_first_chunk(&head->rc_read_pcl);
+ +	ret = svc_rdma_build_read_chunk(info, chunk);
+ +	if (ret < 0)
+ +		goto out;
+ +
+ +	/* Split the Receive buffer between the head and tail
+ +	 * buffers at Read chunk's position. XDR roundup of the
+ +	 * chunk is not included in either the pagelist or in
+ +	 * the tail.
+ +	 */
+ +	buf->tail[0].iov_base = buf->head[0].iov_base + chunk->ch_position;
+ +	buf->tail[0].iov_len = buf->head[0].iov_len - chunk->ch_position;
+ +	buf->head[0].iov_len = chunk->ch_position;
+ +
+ +	/* Read chunk may need XDR roundup (see RFC 8166, s. 3.4.5.2).
+ +	 *
+ +	 * If the client already rounded up the chunk length, the
+ +	 * length does not change. Otherwise, the length of the page
+ +	 * list is increased to include XDR round-up.
+ +	 *
+ +	 * Currently these chunks always start at page offset 0,
+ +	 * thus the rounded-up length never crosses a page boundary.
+ +	 */
+ +	buf->pages = &info->ri_rqst->rq_pages[0];
+ +	length = xdr_align_size(chunk->ch_length);
+ +	buf->page_len = length;
+ +	buf->len += length;
+ +	buf->buflen += length;
+ +
+ +out:
+ +	return ret;
+++=======
++ 	struct svc_rdma_chunk *chunk = pcl_first_chunk(&head->rc_read_pcl);
++ 
++ 	if (chunk->ch_position > head->rc_saved_arg.head[0].iov_len)
++ 		return -EINVAL;
++ 
++ 	return svc_rdma_build_read_chunk(rqstp, head, chunk);
+++>>>>>>> 3779b7b9e7d1 (svcrdma: Validate Read chunk positions before reconstruction)
+  }
+  
+  /**
+@@@ -1020,12 -1056,16 +1061,15 @@@ static int svc_rdma_read_call_chunk(str
+  	int ret;
+  
+  	if (pcl_is_empty(pcl))
+ -		return svc_rdma_build_read_chunk(rqstp, head, call_chunk);
+ +		return svc_rdma_build_read_chunk(info, call_chunk);
+  
++ 	call_len = call_chunk->ch_length;
+  	start = 0;
+  	chunk = pcl_first_chunk(pcl);
++ 	if (chunk->ch_position > call_len)
++ 		return -EINVAL;
+  	length = chunk->ch_position;
+ -	ret = svc_rdma_read_chunk_range(rqstp, head, call_chunk,
+ -					start, length);
+ +	ret = svc_rdma_read_chunk_range(info, call_chunk, start, length);
+  	if (ret < 0)
+  		return ret;
+  
+@@@ -1039,16 -1079,23 +1083,33 @@@
+  			break;
+  
+  		start += length;
+++<<<<<<< HEAD
+ +		length = next->ch_position - info->ri_totalbytes;
+ +		ret = svc_rdma_read_chunk_range(info, call_chunk,
+++=======
++ 		if (next->ch_position > call_len)
++ 			return -EINVAL;
++ 		if (head->rc_readbytes > next->ch_position)
++ 			return -EINVAL;
++ 		length = next->ch_position - head->rc_readbytes;
++ 		ret = svc_rdma_read_chunk_range(rqstp, head, call_chunk,
+++>>>>>>> 3779b7b9e7d1 (svcrdma: Validate Read chunk positions before reconstruction)
+  						start, length);
+  		if (ret < 0)
+  			return ret;
+  	}
+  
+  	start += length;
+++<<<<<<< HEAD
+ +	length = call_chunk->ch_length - start;
+ +	return svc_rdma_read_chunk_range(info, call_chunk, start, length);
+++=======
++ 	if (start > call_len)
++ 		return -EINVAL;
++ 	length = call_len - start;
++ 	return svc_rdma_read_chunk_range(rqstp, head, call_chunk,
++ 					 start, length);
+++>>>>>>> 3779b7b9e7d1 (svcrdma: Validate Read chunk positions before reconstruction)
+  }
+  
+  /**
+* Unmerged path net/sunrpc/xprtrdma/svc_rdma_rw.c
