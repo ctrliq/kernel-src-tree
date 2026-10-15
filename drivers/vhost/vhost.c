@@ -1437,7 +1437,7 @@ long vhost_vring_ioctl(struct vhost_dev *d, unsigned int ioctl, void __user *arg
 		BUILD_BUG_ON(__alignof__ *vq->used > VRING_USED_ALIGN_SIZE);
 		if ((a.avail_user_addr & (VRING_AVAIL_ALIGN_SIZE - 1)) ||
 		    (a.used_user_addr & (VRING_USED_ALIGN_SIZE - 1)) ||
-		    (a.log_guest_addr & (sizeof(u64) - 1))) {
+		    (a.log_guest_addr & (VRING_USED_ALIGN_SIZE - 1))) {
 			r = -EINVAL;
 			break;
 		}
