@@ -54,10 +54,8 @@ struct hash_cell {
 };
 
 struct vers_iter {
-	size_t param_size;
 	struct dm_target_versions *vers, *old_vers;
 	char *end;
-	uint32_t flags;
 };
 
 
@@ -771,41 +769,38 @@ static int list_devices(struct file *filp, struct dm_ioctl *param, size_t param_
 	return 0;
 }
 
-static void list_version_get_needed(struct target_type *tt, void *needed_param)
-{
-	size_t *needed = needed_param;
-
-	*needed += sizeof(struct dm_target_versions);
-	*needed += strlen(tt->name) + 1;
-	*needed += ALIGN_MASK;
-}
-
 static void list_version_get_info(struct target_type *tt, void *param)
 {
 	struct vers_iter *info = param;
+	struct dm_target_versions *vers = info->vers;
+	size_t name_len = strlen(tt->name);
 
-	/* Check space - it might have changed since the first iteration */
-	if ((char *)info->vers + sizeof(struct dm_target_versions) + strlen(tt->name) + 1 > info->end) {
-		info->flags = DM_BUFFER_FULL_FLAG;
+	if (!vers)
+		return;
+
+	info->old_vers = vers;
+	info->vers = align_ptr((void *)(info->vers + 1) + name_len + 1);
+
+	/* Check space */
+	if ((char *)info->vers > info->end) {
+		info->vers = NULL;
 		return;
 	}
 
-	if (info->old_vers)
-		info->old_vers->next = (uint32_t) ((void *)info->vers - (void *)info->old_vers);
+	/* Zero padding and terminate vers->name[] */
+	((u64 *)info->vers)[-1] = 0;
 
-	info->vers->version[0] = tt->version[0];
-	info->vers->version[1] = tt->version[1];
-	info->vers->version[2] = tt->version[2];
-	info->vers->next = 0;
-	strcpy(info->vers->name, tt->name);
+	vers->next = (char *)info->vers - (char *)vers;
 
-	info->old_vers = info->vers;
-	info->vers = align_ptr((void *)(info->vers + 1) + strlen(tt->name) + 1);
+	vers->version[0] = tt->version[0];
+	vers->version[1] = tt->version[1];
+	vers->version[2] = tt->version[2];
+	memcpy(vers->name, tt->name, name_len);
 }
 
 static int __list_versions(struct dm_ioctl *param, size_t param_size, const char *name)
 {
-	size_t len, needed = 0;
+	size_t len;
 	struct dm_target_versions *vers;
 	struct vers_iter iter_info;
 	struct target_type *tt = NULL;
@@ -817,40 +812,30 @@ static int __list_versions(struct dm_ioctl *param, size_t param_size, const char
 	}
 
 	/*
-	 * Loop through all the devices working out how much
-	 * space we need.
-	 */
-	if (!tt)
-		dm_target_iterate(list_version_get_needed, &needed);
-	else
-		list_version_get_needed(tt, &needed);
-
-	/*
 	 * Grab our output buffer.
 	 */
 	vers = get_result_buffer(param, param_size, &len);
-	if (len < needed) {
-		param->flags |= DM_BUFFER_FULL_FLAG;
-		goto out;
-	}
-	param->data_size = param->data_start + needed;
 
-	iter_info.param_size = param_size;
 	iter_info.old_vers = NULL;
 	iter_info.vers = vers;
-	iter_info.flags = 0;
-	iter_info.end = (char *)vers + needed;
+	iter_info.end = (char *)vers + len;
 
 	/*
-	 * Now loop through filling out the names & versions.
+	 * Loop through filling out the names & versions.
 	 */
 	if (!tt)
 		dm_target_iterate(list_version_get_info, &iter_info);
 	else
 		list_version_get_info(tt, &iter_info);
-	param->flags |= iter_info.flags;
 
- out:
+	if (iter_info.vers) {
+		if (iter_info.old_vers)
+			iter_info.old_vers->next = 0;
+		param->data_size = param->data_start + ((char *)iter_info.vers - (char *)vers);
+	} else {
+		param->flags |= DM_BUFFER_FULL_FLAG;
+	}
+
 	if (tt)
 		dm_put_target_type(tt);
 	return 0;
