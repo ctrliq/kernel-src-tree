@@ -3039,7 +3039,7 @@ static void do_journal_write(struct dm_integrity_c *ic, unsigned int write_start
 				r = dm_integrity_rw_tag(ic, journal_entry_tag(ic, je2), &metadata_block, &metadata_offset,
 							ic->tag_size, TAG_WRITE);
 				if (unlikely(r))
-					dm_integrity_io_error(ic, "reading tags", r);
+					dm_integrity_io_error(ic, "writing tags", r);
 			}
 
 			atomic_inc(&comp.in_flight);
