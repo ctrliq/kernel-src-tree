@@ -1,0 +1,91 @@
+net/smc: carry oversized SMC-Rv2 LLC messages in the queue entry
+
+jira KERNEL-1761
+cve CVE-2026-80985
+Rebuild_History Non-Buildable kernel-5.14.0-687.58.1.el9_8
+commit-author Yehyeong Lee <yhlee@isslab.korea.ac.kr>
+commit 8d3c1ab82c11d4fadebf817a825fd221b3e197ea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.58.1.el9_8/8d3c1ab8.failed
+
+smc_llc_rmt_delete_rkey() and smc_llc_save_add_link_rkeys() read the part
+of a v2 message that does not fit into the 44-byte union smc_llc_msg, and
+both bound themselves by the size of the buffer it landed in, not by what
+arrived. On a link with a shared v2 receive buffer a 44-byte
+DELETE_RKEY_V2 declaring 255 rkeys reaches rkey[9..254] in whatever an
+earlier message left in lgr->wr_rx_buf_v2, and passes each of them to
+smc_rtoken_delete(). One of those 255 matched a registered rtoken and
+deleted it. An ADD_LINK on such a link installs up to 255 rtokens from
+the same bytes.
+
+Copy the tail into the queue entry, so its length is the length of the
+message that arrived, and declare the rkeys that fit inline as a member of
+the union instead of reaching them through a cast. The same
+DELETE_RKEY_V2 now processes the 9 rkeys it carries. The copy is limited
+to the longest tail the two functions can read, so the peer does not pick
+the size of the entry.
+
+The bound the previous patch placed on links without a shared v2 receive
+buffer is no longer needed.
+
+Fixes: 27ef6a9981fe ("net/smc: support SMC-R V2 for rdma devices with max_recv_sge equals to 1")
+	Cc: stable@vger.kernel.org
+	Suggested-by: D. Wythe <alibuda@linux.alibaba.com>
+	Reviewed-by: Sidraya Jayagond <sidraya@linux.ibm.com>
+	Signed-off-by: Yehyeong Lee <yhlee@isslab.korea.ac.kr>
+Link: https://patch.msgid.link/20260819023306.644849-4-yhlee@isslab.korea.ac.kr
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 8d3c1ab82c11d4fadebf817a825fd221b3e197ea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/smc/smc_llc.c
+diff --cc net/smc/smc_llc.c
+index 0d11a207b09b,c9ccd8480369..000000000000
+--- a/net/smc/smc_llc.c
++++ b/net/smc/smc_llc.c
+@@@ -2085,10 -2123,21 +2119,25 @@@ static void smc_llc_enqueue(struct smc_
+  	struct smc_link_group *lgr = link->lgr;
+  	struct smc_llc_qentry *qentry;
+  	unsigned long flags;
++ 	u16 body_len = 0;
+  
+++<<<<<<< HEAD
+ +	qentry = kmalloc(sizeof(*qentry), GFP_ATOMIC);
+++=======
++ 	/* V2 messages can be longer than the inline union smc_llc_msg. Carry
++ 	 * the remainder in the qentry itself, so that its lifetime and its
++ 	 * length match the message the peer actually sent.
++ 	 */
++ 	if (lgr->smc_version == SMC_V2 && byte_len > SMC_WR_TX_SIZE)
++ 		body_len = min_t(u32, byte_len, SMC_WR_BUF_V2_SIZE) -
++ 			   SMC_WR_TX_SIZE;
++ 	body_len = min_t(u32, body_len, smc_llc_max_body_len(llc));
++ 
++ 	qentry = kmalloc_flex(*qentry, body, body_len, GFP_ATOMIC);
+++>>>>>>> 8d3c1ab82c11 (net/smc: carry oversized SMC-Rv2 LLC messages in the queue entry)
+  	if (!qentry)
+  		return;
++ 	qentry->body_len = body_len;
+  	qentry->link = link;
+  	INIT_LIST_HEAD(&qentry->list);
+  	memcpy(&qentry->msg, llc, sizeof(union smc_llc_msg));
+* Unmerged path net/smc/smc_llc.c
+diff --git a/net/smc/smc_wr.c b/net/smc/smc_wr.c
+index b04a21b8c511..4624817137be 100644
+--- a/net/smc/smc_wr.c
++++ b/net/smc/smc_wr.c
+@@ -602,9 +602,9 @@ static void smc_wr_init_sge(struct smc_link *lnk)
+ 
+ 	/* With SMC-Rv2 there can be messages larger than SMC_WR_TX_SIZE.
+ 	 * Each ib_recv_wr gets 2 sges, the second one is a spillover buffer
+-	 * and the same buffer for all sges. When a larger message arrived then
+-	 * the content of the first small sge is copied to the beginning of
+-	 * the larger spillover buffer, allowing easy data mapping.
++	 * and the same buffer for all sges. The spillover sge starts at
++	 * SMC_WR_TX_SIZE, so the leading bytes of that buffer are never
++	 * written.
+ 	 */
+ 	for (i = 0; i < lnk->wr_rx_cnt; i++) {
+ 		int x = i * lnk->wr_rx_sge_cnt;
