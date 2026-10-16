@@ -4635,6 +4635,7 @@ retest_commit_id:
 	if (!ic->journal_tree) {
 		*error = "Could not allocate memory for journal tree";
 		r = -ENOMEM;
+		goto bad;
 	}
 bad:
 	kfree(crypt_data);
