@@ -2781,7 +2781,8 @@ static void integrity_bio_wait(struct work_struct *w)
 		switch (r) {
 			case DM_MAPIO_KILL:
 				bio->bi_status = BLK_STS_IOERR;
-				fallthrough;
+				bio_endio(bio);
+				return;
 			case DM_MAPIO_REMAPPED:
 				submit_bio_noacct(bio);
 				fallthrough;
