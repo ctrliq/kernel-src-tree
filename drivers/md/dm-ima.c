@@ -161,15 +161,6 @@ static int dm_ima_alloc_and_copy_capacity_str(struct mapped_device *md, char **c
 }
 
 /*
- * Initialize/reset the dm ima related data structure variables.
- */
-void dm_ima_reset_data(struct mapped_device *md)
-{
-	memset(&(md->ima), 0, sizeof(md->ima));
-	md->ima.dm_version_str_len = strlen(DM_IMA_VERSION_STR);
-}
-
-/*
  * Build up the IMA data for each target, and finally measure.
  */
 void dm_ima_measure_on_table_load(struct dm_table *table, unsigned int status_flags)
@@ -223,8 +214,8 @@ void dm_ima_measure_on_table_load(struct dm_table *table, unsigned int status_fl
 	if (r)
 		goto error;
 
-	memcpy(ima_buf + l, DM_IMA_VERSION_STR, table->md->ima.dm_version_str_len);
-	l += table->md->ima.dm_version_str_len;
+	memcpy(ima_buf + l, DM_IMA_VERSION_STR, strlen(DM_IMA_VERSION_STR));
+	l += strlen(DM_IMA_VERSION_STR);
 
 	device_data_buf_len = strlen(device_data_buf);
 	memcpy(ima_buf + l, device_data_buf, device_data_buf_len);
@@ -281,8 +272,8 @@ void dm_ima_measure_on_table_load(struct dm_table *table, unsigned int status_fl
 			 * prefix, so that multiple records from the same "dm_table_load" for
 			 * a given device can be linked together.
 			 */
-			memcpy(ima_buf + l, DM_IMA_VERSION_STR, table->md->ima.dm_version_str_len);
-			l += table->md->ima.dm_version_str_len;
+			memcpy(ima_buf + l, DM_IMA_VERSION_STR, strlen(DM_IMA_VERSION_STR));
+			l += strlen(DM_IMA_VERSION_STR);
 
 			memcpy(ima_buf + l, device_data_buf, device_data_buf_len);
 			l += device_data_buf_len;
@@ -382,8 +373,8 @@ void dm_ima_measure_on_device_resume(struct mapped_device *md, bool swap)
 	if (capacity_len < 0)
 		goto error;
 
-	memcpy(device_table_data + l, DM_IMA_VERSION_STR, md->ima.dm_version_str_len);
-	l += md->ima.dm_version_str_len;
+	memcpy(device_table_data + l, DM_IMA_VERSION_STR, strlen(DM_IMA_VERSION_STR));
+	l += strlen(DM_IMA_VERSION_STR);
 
 	if (swap) {
 		if (md->ima.active_table.hash != md->ima.inactive_table.hash)
@@ -493,8 +484,8 @@ void dm_ima_measure_on_device_remove(struct mapped_device *md, bool remove_all)
 		goto exit;
 	}
 
-	memcpy(device_table_data + l, DM_IMA_VERSION_STR, md->ima.dm_version_str_len);
-	l += md->ima.dm_version_str_len;
+	memcpy(device_table_data + l, DM_IMA_VERSION_STR, strlen(DM_IMA_VERSION_STR));
+	l += strlen(DM_IMA_VERSION_STR);
 
 	if (md->ima.active_table.device_metadata) {
 		memcpy(device_table_data + l, device_active_str, device_active_len);
@@ -584,7 +575,8 @@ exit:
 	if (md->ima.active_table.hash != md->ima.inactive_table.hash)
 		kfree(md->ima.inactive_table.hash);
 
-	dm_ima_reset_data(md);
+	memset(&md->ima.active_table, 0, sizeof(md->ima.active_table));
+	memset(&md->ima.inactive_table, 0, sizeof(md->ima.inactive_table));
 
 	kfree(dev_name);
 	kfree(dev_uuid);
@@ -611,8 +603,8 @@ void dm_ima_measure_on_table_clear(struct mapped_device *md, bool new_map)
 	if (capacity_len < 0)
 		goto error1;
 
-	memcpy(device_table_data + l, DM_IMA_VERSION_STR, md->ima.dm_version_str_len);
-	l += md->ima.dm_version_str_len;
+	memcpy(device_table_data + l, DM_IMA_VERSION_STR, strlen(DM_IMA_VERSION_STR));
+	l += strlen(DM_IMA_VERSION_STR);
 
 	if (md->ima.inactive_table.device_metadata_len &&
 	    md->ima.inactive_table.hash_len) {

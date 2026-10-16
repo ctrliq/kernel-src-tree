@@ -2544,8 +2544,6 @@ int dm_create(int minor, struct mapped_device **result)
 	if (!md)
 		return -ENXIO;
 
-	dm_ima_reset_data(md);
-
 	*result = md;
 	return 0;
 }
