@@ -1,0 +1,131 @@
+netfilter: nfnetlink_queue: do shared-unconfirmed check before segmentation
+
+jira KERNEL-1766
+cve CVE-2026-45859
+Rebuild_History Non-Buildable kernel-6.12.0-211.66.1.el10_2
+commit-author Florian Westphal <fw@strlen.de>
+commit 207b3ebacb6113acaaec0d171d5307032c690004
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.66.1.el10_2/207b3eba.failed
+
+Ulrich reports a regression with nfqueue:
+
+If an application did not set the 'F_GSO' capability flag and a gso
+packet with an unconfirmed nf_conn entry is received all packets are
+now dropped instead of queued, because the check happens after
+skb_gso_segment().  In that case, we did have exclusive ownership
+of the skb and its associated conntrack entry.  The elevated use
+count is due to skb_clone happening via skb_gso_segment().
+
+Move the check so that its peformed vs. the aggregated packet.
+
+Then, annotate the individual segments except the first one so we
+can do a 2nd check at reinject time.
+
+For the normal case, where userspace does in-order reinjects, this avoids
+packet drops: first reinjected segment continues traversal and confirms
+entry, remaining segments observe the confirmed entry.
+
+While at it, simplify nf_ct_drop_unconfirmed(): We only care about
+unconfirmed entries with a refcnt > 1, there is no need to special-case
+dying entries.
+
+This only happens with UDP.  With TCP, the only unconfirmed packet will
+be the TCP SYN, those aren't aggregated by GRO.
+
+Next patch adds a udpgro test case to cover this scenario.
+
+	Reported-by: Ulrich Weber <ulrich.weber@gmail.com>
+Fixes: 7d8dc1c7be8d ("netfilter: nf_queue: drop packets with cloned unconfirmed conntracks")
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+(cherry picked from commit 207b3ebacb6113acaaec0d171d5307032c690004)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nfnetlink_queue.c
+diff --cc net/netfilter/nfnetlink_queue.c
+index 3e244c4db0f5,f1c8049861a6..000000000000
+--- a/net/netfilter/nfnetlink_queue.c
++++ b/net/netfilter/nfnetlink_queue.c
+@@@ -398,38 -435,32 +398,67 @@@ next_hook
+  	nf_queue_entry_free(entry);
+  }
+  
+++<<<<<<< HEAD
+ +static bool nf_bridge_port_valid(const struct net_device *dev)
+ +{
+ +	if (!dev)
+ +		return true;
+ +
+ +	return netif_is_bridge_port(dev);
+ +}
+ +
+ +/* queued skbs leave rcu protection.  We bump device refcount so that
+ + * the device cannot go away.  However, while packet was out the port
+ + * could have been removed from the bridge.
+ + *
+ + * Ensure in+outdev are still part of a bridge at reinject time.
+ + *
+ + * The device rx_handler_data could even be pointing at data that is
+ + * not a net_bridge_port structure.
+ + */
+ +static bool nf_bridge_ports_valid(const struct nf_queue_entry *entry)
+ +{
+ +#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+ +	if (!nf_bridge_port_valid(entry->physin) ||
+ +	    !nf_bridge_port_valid(entry->physout))
+ +		return false;
+ +#endif
+ +	if (entry->state.pf != PF_BRIDGE)
+ +		return true;
+ +
+ +	if (!nf_bridge_port_valid(entry->state.in) ||
+ +	    !nf_bridge_port_valid(entry->state.out))
+ +		return false;
+ +
+ +	return true;
+++=======
++ /* return true if the entry has an unconfirmed conntrack attached that isn't owned by us
++  * exclusively.
++  */
++ static bool nf_ct_drop_unconfirmed(const struct nf_queue_entry *entry, bool *is_unconfirmed)
++ {
++ #if IS_ENABLED(CONFIG_NF_CONNTRACK)
++ 	struct nf_conn *ct = (void *)skb_nfct(entry->skb);
++ 
++ 	if (!ct || nf_ct_is_confirmed(ct))
++ 		return false;
++ 
++ 	if (is_unconfirmed)
++ 		*is_unconfirmed = true;
++ 
++ 	/* in some cases skb_clone() can occur after initial conntrack
++ 	 * pickup, but conntrack assumes exclusive skb->_nfct ownership for
++ 	 * unconfirmed entries.
++ 	 *
++ 	 * This happens for br_netfilter and with ip multicast routing.
++ 	 * This can't be solved with serialization here because one clone
++ 	 * could have been queued for local delivery or could be transmitted
++ 	 * in parallel on another CPU.
++ 	 */
++ 	return refcount_read(&ct->ct_general.use) > 1;
++ #endif
++ 	return false;
+++>>>>>>> 207b3ebacb61 (netfilter: nfnetlink_queue: do shared-unconfirmed check before segmentation)
+  }
+  
+  static void nfqnl_reinject(struct nf_queue_entry *entry, unsigned int verdict)
+diff --git a/include/net/netfilter/nf_queue.h b/include/net/netfilter/nf_queue.h
+index 6a4ef3383794..fc3e81c07364 100644
+--- a/include/net/netfilter/nf_queue.h
++++ b/include/net/netfilter/nf_queue.h
+@@ -23,6 +23,7 @@ struct nf_queue_entry {
+ 	struct net_device	*physout;
+ #endif
+ 	struct nf_hook_state	state;
++	bool			nf_ct_is_unconfirmed;
+ 	u16			size; /* sizeof(entry) + saved route keys */
+ 
+ 	/* extra space to store route keys */
+* Unmerged path net/netfilter/nfnetlink_queue.c
