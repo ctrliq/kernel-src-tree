@@ -2269,12 +2269,9 @@ static long dm_compat_ctl_ioctl(struct file *file, uint command, ulong u)
 
 static int dm_open(struct inode *inode, struct file *filp)
 {
-	int r;
 	struct dm_file *priv;
 
-	r = nonseekable_open(inode, filp);
-	if (unlikely(r))
-		return r;
+	nonseekable_open(inode, filp);
 
 	priv = filp->private_data = kmalloc(sizeof(struct dm_file), GFP_KERNEL);
 	if (!priv)
