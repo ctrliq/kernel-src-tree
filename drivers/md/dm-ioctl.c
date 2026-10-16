@@ -692,79 +692,72 @@ static int list_devices(struct file *filp, struct dm_ioctl *param, size_t param_
 {
 	struct rb_node *n;
 	struct hash_cell *hc;
-	size_t len, needed = 0;
-	struct gendisk *disk;
-	struct dm_name_list *orig_nl, *nl, *old_nl = NULL;
+	size_t len;
+	struct dm_name_list *nl, *old_nl = NULL;
+	void *result_start, *result_limit;
 	uint32_t *event_nr;
-
-	down_write(&_hash_lock);
-
-	/*
-	 * Loop through all the devices working out how much
-	 * space we need.
-	 */
-	for (n = rb_first(&name_rb_tree); n; n = rb_next(n)) {
-		hc = container_of(n, struct hash_cell, name_node);
-		if (!filter_device(hc, param->name, param->uuid))
-			continue;
-		needed += align_val(offsetof(struct dm_name_list, name) + strlen(hc->name) + 1);
-		needed += align_val(sizeof(uint32_t) * 2);
-		if (param->flags & DM_UUID_FLAG && hc->uuid)
-			needed += align_val(strlen(hc->uuid) + 1);
-	}
 
 	/*
 	 * Grab our output buffer.
 	 */
-	nl = orig_nl = get_result_buffer(param, param_size, &len);
-	if (len < needed || len < sizeof(nl->dev)) {
-		param->flags |= DM_BUFFER_FULL_FLAG;
-		goto out;
-	}
-	param->data_size = param->data_start + needed;
+	nl = result_start = get_result_buffer(param, param_size, &len);
+	result_limit = result_start + len;
 
-	nl->dev = 0;	/* Flags no data */
+	if (len >= sizeof(*nl))
+		nl->dev = 0;	/* Flags no data */
+
+	down_write(&_hash_lock);
 
 	/*
-	 * Now loop through filling out the names.
+	 * Loop through filling out the names.
 	 */
 	for (n = rb_first(&name_rb_tree); n; n = rb_next(n)) {
-		void *uuid_ptr;
+		void *next_nl;
 
 		hc = container_of(n, struct hash_cell, name_node);
 		if (!filter_device(hc, param->name, param->uuid))
 			continue;
-		if (old_nl)
-			old_nl->next = (uint32_t) ((void *) nl -
-						   (void *) old_nl);
-		disk = dm_disk(hc->md);
-		nl->dev = huge_encode_dev(disk_devt(disk));
-		nl->next = 0;
-		strcpy(nl->name, hc->name);
 
-		old_nl = nl;
-		event_nr = align_ptr(nl->name + strlen(hc->name) + 1);
+		len = strlen(hc->name);
+		event_nr = align_ptr(nl->name + len + 1);
+		next_nl = event_nr + 2;
+		if (next_nl > result_limit)
+			break;
+
+		((u64 *)event_nr)[-1] = 0;
+		memcpy(nl->name, hc->name, len);
+
+		nl->dev = huge_encode_dev(disk_devt(dm_disk(hc->md)));
+
 		event_nr[0] = dm_get_event_nr(hc->md);
 		event_nr[1] = 0;
-		uuid_ptr = align_ptr(event_nr + 2);
+
 		if (param->flags & DM_UUID_FLAG) {
 			if (hc->uuid) {
+				len = strlen(hc->uuid);
+				next_nl = align_ptr(next_nl + len + 1);
+				if (next_nl > result_limit)
+					break;
 				event_nr[1] |= DM_NAME_LIST_FLAG_HAS_UUID;
-				strcpy(uuid_ptr, hc->uuid);
-				uuid_ptr = align_ptr(uuid_ptr + strlen(hc->uuid) + 1);
+				((u64 *)next_nl)[-1] = 0;
+				memcpy(event_nr + 2, hc->uuid, len);
 			} else {
 				event_nr[1] |= DM_NAME_LIST_FLAG_DOESNT_HAVE_UUID;
 			}
 		}
-		nl = uuid_ptr;
+		nl->next = next_nl - (void *)nl;
+		old_nl = nl;
+		nl = next_nl;
 	}
-	/*
-	 * If mismatch happens, security may be compromised due to buffer
-	 * overflow, so it's better to crash.
-	 */
-	BUG_ON((char *)nl - (char *)orig_nl != needed);
 
- out:
+	if (old_nl)
+		old_nl->next = 0;
+
+	if (n)
+		param->flags |= DM_BUFFER_FULL_FLAG;
+	else
+		param->data_size = param->data_start + ((void *)nl - result_start);
+
 	up_write(&_hash_lock);
 	return 0;
 }
