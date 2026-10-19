@@ -20,9 +20,6 @@
 #include <linux/dma-map-ops.h>
 #include <linux/crash_dump.h>
 #include <linux/hugetlb.h>
-#ifdef CONFIG_RELOCATABLE
-#include <linux/elf.h>
-#endif
 #include <linux/kfence.h>
 #include <linux/execmem.h>
 
@@ -30,6 +27,7 @@
 #include <asm/fixmap.h>
 #include <asm/io.h>
 #include <asm/kasan.h>
+#include <asm/module.h>
 #include <asm/numa.h>
 #include <asm/pgtable.h>
 #include <asm/sections.h>
@@ -326,7 +324,7 @@ extern unsigned long __rela_dyn_start, __rela_dyn_end;
 
 static void __init relocate_kernel(void)
 {
-	Elf64_Rela *rela = (Elf64_Rela *)&__rela_dyn_start;
+	Elf_Rela *rela = (Elf_Rela *)&__rela_dyn_start;
 	/*
 	 * This holds the offset between the linked virtual address and the
 	 * relocated virtual address.
@@ -338,9 +336,9 @@ static void __init relocate_kernel(void)
 	 */
 	uintptr_t va_kernel_link_pa_offset = KERNEL_LINK_ADDR - kernel_map.phys_addr;
 
-	for ( ; rela < (Elf64_Rela *)&__rela_dyn_end; rela++) {
-		Elf64_Addr addr = (rela->r_offset - va_kernel_link_pa_offset);
-		Elf64_Addr relocated_addr = rela->r_addend;
+	for ( ; rela < (Elf_Rela *)&__rela_dyn_end; rela++) {
+		Elf_Addr addr = (rela->r_offset - va_kernel_link_pa_offset);
+		Elf_Addr relocated_addr = rela->r_addend;
 
 		if (rela->r_info != R_RISCV_RELATIVE)
 			continue;
@@ -354,7 +352,7 @@ static void __init relocate_kernel(void)
 		if (relocated_addr >= KERNEL_LINK_ADDR)
 			relocated_addr += reloc_offset;
 
-		*(Elf64_Addr *)addr = relocated_addr;
+		*(Elf_Addr *)addr = relocated_addr;
 	}
 }
 #endif /* CONFIG_RELOCATABLE */
@@ -1178,7 +1176,8 @@ asmlinkage void __init setup_vm(uintptr_t dtb_pa)
 	 * makes the kernel cross over a PUD_SIZE boundary, raise a bug
 	 * since a part of the kernel would not get mapped.
 	 */
-	BUG_ON(PUD_SIZE - (kernel_map.virt_addr & (PUD_SIZE - 1)) < kernel_map.size);
+	if (IS_ENABLED(CONFIG_64BIT))
+		BUG_ON(PUD_SIZE - (kernel_map.virt_addr & (PUD_SIZE - 1)) < kernel_map.size);
 	relocate_kernel();
 #endif
 
