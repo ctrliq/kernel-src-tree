@@ -3906,6 +3906,12 @@ static inline bool skb_is_gso_v6(const struct sk_buff *skb)
 	return skb_shinfo(skb)->gso_type & SKB_GSO_TCPV6;
 }
 
+/* Note: Should be called only if skb_is_gso(skb) is true */
+static inline bool skb_is_gso_sctp(const struct sk_buff *skb)
+{
+	return skb_shinfo(skb)->gso_type & SKB_GSO_SCTP;
+}
+
 void __skb_warn_lro_forwarding(const struct sk_buff *skb);
 
 static inline bool skb_warn_if_lro(const struct sk_buff *skb)
@@ -4021,6 +4027,11 @@ static inline __wsum lco_csum(struct sk_buff *skb)
 	 * adjustment filled in by caller) and return result.
 	 */
 	return csum_partial(l4_hdr, csum_start - l4_hdr, partial);
+}
+
+static inline bool skb_csum_is_sctp(struct sk_buff *skb)
+{
+	return skb->csum_not_inet;
 }
 
 #endif	/* __KERNEL__ */
