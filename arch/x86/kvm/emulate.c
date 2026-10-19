@@ -20,7 +20,7 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/kvm_host.h>
-#include "kvm_cache_regs.h"
+#include "regs.h"
 #include "kvm_emulate.h"
 #include <linux/stringify.h>
 #include <asm/debugreg.h>
@@ -540,8 +540,9 @@ static int emulate_exception(struct x86_emulate_ctxt *ctxt, int vec,
 	return X86EMUL_PROPAGATE_FAULT;
 }
 
-static int emulate_db(struct x86_emulate_ctxt *ctxt)
+static int emulate_db(struct x86_emulate_ctxt *ctxt, unsigned long dr6)
 {
+	ctxt->exception.dr6 = dr6;
 	return emulate_exception(ctxt, DB_VECTOR, 0, false);
 }
 
@@ -1297,12 +1298,25 @@ static int read_emulated(struct x86_emulate_ctxt *ctxt,
 	int rc;
 	struct read_cache *mc = &ctxt->mem_read;
 
+	/*
+	 * If the read gets a cache hit, simply copy the value from the cache.
+	 * A "hit" here means that there is unused data in the cache, i.e. when
+	 * re-emulating an instruction to complete a userspace exit, KVM relies
+	 * on "no decode" to ensure the instruction is re-emulated in the same
+	 * sequence, so that multiple reads are fulfilled in the correct order.
+	 */
 	if (mc->pos < mc->end)
 		goto read_cached;
 
 	if (KVM_EMULATOR_BUG_ON((mc->end + size) >= sizeof(mc->data), ctxt))
 		return X86EMUL_UNHANDLEABLE;
 
+	/*
+	 * Route all reads to the cache.  This allows @dest to be an on-stack
+	 * variable without triggering use-after-free if KVM needs to exit to
+	 * userspace to handle an MMIO read (the MMIO fragment will point at
+	 * the current location in the cache).
+	 */
 	rc = ctxt->ops->read_emulated(ctxt, addr, mc->data + mc->end, size,
 				      &ctxt->exception);
 	if (rc != X86EMUL_CONTINUE)
@@ -3580,13 +3594,9 @@ static int em_sti(struct x86_emulate_ctxt *ctxt)
 static int em_cpuid(struct x86_emulate_ctxt *ctxt)
 {
 	u32 eax, ebx, ecx, edx;
-	u64 msr = 0;
 
-	ctxt->ops->get_msr(ctxt, MSR_MISC_FEATURES_ENABLES, &msr);
-	if (msr & MSR_MISC_FEATURES_ENABLES_CPUID_FAULT &&
-	    ctxt->ops->cpl(ctxt)) {
+	if (!ctxt->ops->is_cpuid_allowed(ctxt))
 		return emulate_gp(ctxt, 0);
-	}
 
 	eax = reg_read(ctxt, VCPU_REGS_RAX);
 	ecx = reg_read(ctxt, VCPU_REGS_RCX);
@@ -3708,7 +3718,7 @@ static inline size_t fxstate_size(struct x86_emulate_ctxt *ctxt)
  */
 static int em_fxsave(struct x86_emulate_ctxt *ctxt)
 {
-	struct fxregs_state fx_state;
+	struct fxregs_state fx_state = {};
 	int rc;
 
 	rc = check_fxsr(ctxt);
@@ -3738,7 +3748,7 @@ static int em_fxsave(struct x86_emulate_ctxt *ctxt)
 static noinline int fxregs_fixup(struct fxregs_state *fx_state,
 				 const size_t used_size)
 {
-	struct fxregs_state fx_tmp;
+	struct fxregs_state fx_tmp = {};
 	int rc;
 
 	rc = asm_safe("fxsave %[fx]", , [fx] "+m"(fx_tmp));
@@ -3834,15 +3844,8 @@ static int check_dr_read(struct x86_emulate_ctxt *ctxt)
 	if ((cr4 & X86_CR4_DE) && (dr == 4 || dr == 5))
 		return emulate_ud(ctxt);
 
-	if (ctxt->ops->get_dr(ctxt, 7) & DR7_GD) {
-		ulong dr6;
-
-		dr6 = ctxt->ops->get_dr(ctxt, 6);
-		dr6 &= ~DR_TRAP_BITS;
-		dr6 |= DR6_BD | DR6_ACTIVE_LOW;
-		ctxt->ops->set_dr(ctxt, 6, dr6);
-		return emulate_db(ctxt);
-	}
+	if (ctxt->ops->get_effective_dr7(ctxt) & DR7_GD)
+		return emulate_db(ctxt, DR6_BD);
 
 	return X86EMUL_CONTINUE;
 }
@@ -3874,8 +3877,7 @@ static int check_svme_pa(struct x86_emulate_ctxt *ctxt)
 {
 	u64 rax = reg_read(ctxt, VCPU_REGS_RAX);
 
-	/* Valid physical address? */
-	if (rax & 0xffff000000000000ULL)
+	if (!ctxt->ops->page_address_valid(ctxt, rax))
 		return emulate_gp(ctxt, 0);
 
 	return check_svme(ctxt);

@@ -14,7 +14,7 @@
 
 #define DEFAULT_RISCV_GUEST_STACK_VADDR_MIN	0xac0000
 
-static vm_vaddr_t exception_handlers;
+static gva_t exception_handlers;
 
 bool __vcpu_has_ext(struct kvm_vcpu *vcpu, uint64_t ext)
 {
@@ -44,14 +44,14 @@ static uint64_t pte_index_mask[] = {
 	PGTBL_L3_INDEX_MASK,
 };
 
-static uint32_t pte_index_shift[] = {
+static u32 pte_index_shift[] = {
 	PGTBL_L0_INDEX_SHIFT,
 	PGTBL_L1_INDEX_SHIFT,
 	PGTBL_L2_INDEX_SHIFT,
 	PGTBL_L3_INDEX_SHIFT,
 };
 
-static uint64_t pte_index(struct kvm_vm *vm, vm_vaddr_t gva, int level)
+static uint64_t pte_index(struct kvm_vm *vm, gva_t gva, int level)
 {
 	TEST_ASSERT(level > -1,
 		"Negative page table level (%d) not possible", level);
@@ -74,26 +74,25 @@ void virt_arch_pgd_alloc(struct kvm_vm *vm)
 	vm->mmu.pgd_created = true;
 }
 
-void virt_arch_pg_map(struct kvm_vm *vm, uint64_t vaddr, uint64_t paddr)
+void virt_arch_pg_map(struct kvm_vm *vm, gva_t gva, gpa_t gpa)
 {
 	uint64_t *ptep, next_ppn;
 	int level = vm->mmu.pgtable_levels - 1;
 
-	TEST_ASSERT((vaddr % vm->page_size) == 0,
+	TEST_ASSERT((gva % vm->page_size) == 0,
 		"Virtual address not on page boundary,\n"
-		"  vaddr: 0x%lx vm->page_size: 0x%x", vaddr, vm->page_size);
-	TEST_ASSERT(sparsebit_is_set(vm->vpages_valid,
-		(vaddr >> vm->page_shift)),
-		"Invalid virtual address, vaddr: 0x%lx", vaddr);
-	TEST_ASSERT((paddr % vm->page_size) == 0,
+		"  gva: 0x%lx vm->page_size: 0x%x", gva, vm->page_size);
+	TEST_ASSERT(sparsebit_is_set(vm->vpages_valid, (gva >> vm->page_shift)),
+		    "Invalid virtual address, gva: 0x%lx", gva);
+	TEST_ASSERT((gpa % vm->page_size) == 0,
 		"Physical address not on page boundary,\n"
-		"  paddr: 0x%lx vm->page_size: 0x%x", paddr, vm->page_size);
-	TEST_ASSERT((paddr >> vm->page_shift) <= vm->max_gfn,
+		"  gpa: 0x%lx vm->page_size: 0x%x", gpa, vm->page_size);
+	TEST_ASSERT((gpa >> vm->page_shift) <= vm->max_gfn,
 		"Physical address beyond maximum supported,\n"
-		"  paddr: 0x%lx vm->max_gfn: 0x%lx vm->page_size: 0x%x",
-		paddr, vm->max_gfn, vm->page_size);
+		"  gpa: 0x%lx vm->max_gfn: 0x%lx vm->page_size: 0x%x",
+		gpa, vm->max_gfn, vm->page_size);
 
-	ptep = addr_gpa2hva(vm, vm->mmu.pgd) + pte_index(vm, vaddr, level) * 8;
+	ptep = addr_gpa2hva(vm, vm->mmu.pgd) + pte_index(vm, gva, level) * 8;
 	if (!*ptep) {
 		next_ppn = vm_alloc_page_table(vm) >> PGTBL_PAGE_SIZE_SHIFT;
 		*ptep = (next_ppn << PGTBL_PTE_ADDR_SHIFT) |
@@ -103,7 +102,7 @@ void virt_arch_pg_map(struct kvm_vm *vm, uint64_t vaddr, uint64_t paddr)
 
 	while (level > -1) {
 		ptep = addr_gpa2hva(vm, pte_addr(vm, *ptep)) +
-		       pte_index(vm, vaddr, level) * 8;
+		       pte_index(vm, gva, level) * 8;
 		if (!*ptep && level > 0) {
 			next_ppn = vm_alloc_page_table(vm) >>
 				   PGTBL_PAGE_SIZE_SHIFT;
@@ -113,12 +112,12 @@ void virt_arch_pg_map(struct kvm_vm *vm, uint64_t vaddr, uint64_t paddr)
 		level--;
 	}
 
-	paddr = paddr >> PGTBL_PAGE_SIZE_SHIFT;
-	*ptep = (paddr << PGTBL_PTE_ADDR_SHIFT) |
+	gpa = gpa >> PGTBL_PAGE_SIZE_SHIFT;
+	*ptep = (gpa << PGTBL_PTE_ADDR_SHIFT) |
 		PGTBL_PTE_PERM_MASK | PGTBL_PTE_VALID_MASK;
 }
 
-vm_paddr_t addr_arch_gva2gpa(struct kvm_vm *vm, vm_vaddr_t gva)
+gpa_t addr_arch_gva2gpa(struct kvm_vm *vm, gva_t gva)
 {
 	uint64_t *ptep;
 	int level = vm->mmu.pgtable_levels - 1;
@@ -291,20 +290,20 @@ void vcpu_arch_set_entry_point(struct kvm_vcpu *vcpu, void *guest_code)
 	vcpu_set_reg(vcpu, RISCV_CORE_REG(regs.pc), (unsigned long)guest_code);
 }
 
-struct kvm_vcpu *vm_arch_vcpu_add(struct kvm_vm *vm, uint32_t vcpu_id)
+struct kvm_vcpu *vm_arch_vcpu_add(struct kvm_vm *vm, u32 vcpu_id)
 {
 	int r;
 	size_t stack_size;
-	unsigned long stack_vaddr;
+	unsigned long stack_gva;
 	unsigned long current_gp = 0;
 	struct kvm_mp_state mps;
 	struct kvm_vcpu *vcpu;
 
 	stack_size = vm->page_size == 4096 ? DEFAULT_STACK_PGS * vm->page_size :
 					     vm->page_size;
-	stack_vaddr = __vm_vaddr_alloc(vm, stack_size,
-				       DEFAULT_RISCV_GUEST_STACK_VADDR_MIN,
-				       MEM_REGION_DATA);
+	stack_gva = __vm_alloc(vm, stack_size,
+			       DEFAULT_RISCV_GUEST_STACK_VADDR_MIN,
+			       MEM_REGION_DATA);
 
 	vcpu = __vm_vcpu_add(vm, vcpu_id);
 	riscv_vcpu_mmu_setup(vcpu);
@@ -324,7 +323,7 @@ struct kvm_vcpu *vm_arch_vcpu_add(struct kvm_vm *vm, uint32_t vcpu_id)
 	vcpu_set_reg(vcpu, RISCV_CORE_REG(regs.gp), current_gp);
 
 	/* Setup stack pointer and program counter of guest */
-	vcpu_set_reg(vcpu, RISCV_CORE_REG(regs.sp), stack_vaddr + stack_size);
+	vcpu_set_reg(vcpu, RISCV_CORE_REG(regs.sp), stack_gva + stack_size);
 
 	/* Setup sscratch for guest_get_vcpuid() */
 	vcpu_set_reg(vcpu, RISCV_GENERAL_CSR_REG(sscratch), vcpu_id);
@@ -429,10 +428,10 @@ void vcpu_init_vector_tables(struct kvm_vcpu *vcpu)
 
 void vm_init_vector_tables(struct kvm_vm *vm)
 {
-	vm->handlers = __vm_vaddr_alloc(vm, sizeof(struct handlers),
-				   vm->page_size, MEM_REGION_DATA);
+	vm->handlers = __vm_alloc(vm, sizeof(struct handlers), vm->page_size,
+				  MEM_REGION_DATA);
 
-	*(vm_vaddr_t *)addr_gva2hva(vm, (vm_vaddr_t)(&exception_handlers)) = vm->handlers;
+	*(gva_t *)addr_gva2hva(vm, (gva_t)(&exception_handlers)) = vm->handlers;
 }
 
 void vm_install_exception_handler(struct kvm_vm *vm, int vector, exception_handler_fn handler)
@@ -450,7 +449,7 @@ void vm_install_interrupt_handler(struct kvm_vm *vm, exception_handler_fn handle
 	handlers->exception_handlers[1][0] = handler;
 }
 
-uint32_t guest_get_vcpuid(void)
+u32 guest_get_vcpuid(void)
 {
 	return csr_read(CSR_SSCRATCH);
 }

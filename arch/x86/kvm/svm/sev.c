@@ -51,18 +51,18 @@
 #define SNP_GUEST_VMM_ERR_GENERIC       (~0U)
 
 /* enable/disable SEV support */
-static bool sev_enabled = true;
+static bool __ro_after_init sev_enabled = true;
 module_param_named(sev, sev_enabled, bool, 0444);
 
 /* enable/disable SEV-ES support */
-static bool sev_es_enabled = true;
+static bool __ro_after_init sev_es_enabled = true;
 module_param_named(sev_es, sev_es_enabled, bool, 0444);
 
 /* enable/disable SEV-SNP support */
-static bool sev_snp_enabled = true;
+static bool __ro_after_init sev_snp_enabled = true;
 module_param_named(sev_snp, sev_snp_enabled, bool, 0444);
 
-static unsigned int nr_ciphertext_hiding_asids;
+static unsigned int __ro_after_init nr_ciphertext_hiding_asids;
 module_param_named(ciphertext_hiding_asids, nr_ciphertext_hiding_asids, uint, 0444);
 
 #define AP_RESET_HOLD_NONE		0
@@ -95,6 +95,8 @@ static u64 sev_supported_vmsa_features __ro_after_init;
 static u8 sev_enc_bit;
 static DECLARE_RWSEM(sev_deactivate_lock);
 static DEFINE_MUTEX(sev_bitmap_lock);
+/* Protects kvm_sev_info's enc_context_owner, mirror_vms and mirror_entry.  */
+static DEFINE_MUTEX(sev_mirror_lock);
 unsigned int max_sev_asid;
 static unsigned int min_sev_asid;
 static unsigned int max_sev_es_asid;
@@ -105,6 +107,45 @@ static unsigned long sev_me_mask;
 static unsigned int nr_asids;
 static unsigned long *sev_asid_bitmap;
 static unsigned long *sev_reclaim_asid_bitmap;
+
+static __always_inline void kvm_lockdep_assert_sev_lock_held(struct kvm *kvm)
+{
+#ifdef CONFIG_PROVE_LOCKING
+	/*
+	 * Querying SEV+ support is safe if there are no other references, i.e.
+	 * if concurrent initialization of SEV+ is impossible.
+	 */
+	if (!refcount_read(&kvm->users_count))
+		return;
+
+	/*
+	 * Querying SEV+ support from vCPU context is always safe, as vCPUs can
+	 * only be created after SEV+ is initialized (and KVM disallows all SEV
+	 * sub-ioctls while vCPU creation is in-progress).
+	 */
+	if (kvm_get_running_vcpu())
+		return;
+
+	lockdep_assert_held(&kvm->lock);
+#endif
+}
+
+static bool sev_guest(struct kvm *kvm)
+{
+	kvm_lockdep_assert_sev_lock_held(kvm);
+	return ____sev_guest(kvm);
+}
+static bool sev_es_guest(struct kvm *kvm)
+{
+	kvm_lockdep_assert_sev_lock_held(kvm);
+	return ____sev_es_guest(kvm);
+}
+
+static bool sev_snp_guest(struct kvm *kvm)
+{
+	kvm_lockdep_assert_sev_lock_held(kvm);
+	return ____sev_snp_guest(kvm);
+}
 
 static int snp_decommission_context(struct kvm *kvm);
 
@@ -197,6 +238,28 @@ static void sev_misc_cg_uncharge(struct kvm_sev_info *sev)
 	misc_cg_uncharge(type, sev->misc_cg, 1);
 }
 
+static unsigned int sev_alloc_asid(unsigned int min_asid, unsigned int max_asid)
+{
+	unsigned int asid;
+	bool retry = true;
+
+	guard(mutex)(&sev_bitmap_lock);
+
+again:
+	asid = find_next_zero_bit(sev_asid_bitmap, max_asid + 1, min_asid);
+	if (asid > max_asid) {
+		if (retry && __sev_recycle_asids(min_asid, max_asid)) {
+			retry = false;
+			goto again;
+		}
+
+		return asid;
+	}
+
+	__set_bit(asid, sev_asid_bitmap);
+	return asid;
+}
+
 static int sev_asid_new(struct kvm_sev_info *sev, unsigned long vm_type)
 {
 	/*
@@ -204,7 +267,6 @@ static int sev_asid_new(struct kvm_sev_info *sev, unsigned long vm_type)
 	 * SEV-ES-enabled guest can use from 1 to min_sev_asid - 1.
 	 */
 	unsigned int min_asid, max_asid, asid;
-	bool retry = true;
 	int ret;
 
 	if (vm_type == KVM_X86_SNP_VM) {
@@ -228,37 +290,24 @@ static int sev_asid_new(struct kvm_sev_info *sev, unsigned long vm_type)
 	if (min_asid > max_asid)
 		return -ENOTTY;
 
-	WARN_ON(sev->misc_cg);
+	WARN_ON_ONCE(sev->misc_cg);
 	sev->misc_cg = get_current_misc_cg();
 	ret = sev_misc_cg_try_charge(sev);
-	if (ret) {
-		put_misc_cg(sev->misc_cg);
-		sev->misc_cg = NULL;
-		return ret;
-	}
+	if (ret)
+		goto e_put_cg;
 
-	mutex_lock(&sev_bitmap_lock);
-
-again:
-	asid = find_next_zero_bit(sev_asid_bitmap, max_asid + 1, min_asid);
+	asid = sev_alloc_asid(min_asid, max_asid);
 	if (asid > max_asid) {
-		if (retry && __sev_recycle_asids(min_asid, max_asid)) {
-			retry = false;
-			goto again;
-		}
-		mutex_unlock(&sev_bitmap_lock);
 		ret = -EBUSY;
 		goto e_uncharge;
 	}
 
-	__set_bit(asid, sev_asid_bitmap);
-
-	mutex_unlock(&sev_bitmap_lock);
-
 	sev->asid = asid;
 	return 0;
+
 e_uncharge:
 	sev_misc_cg_uncharge(sev);
+e_put_cg:
 	put_misc_cg(sev->misc_cg);
 	sev->misc_cg = NULL;
 	return ret;
@@ -677,16 +726,49 @@ e_free_dh:
 	return ret;
 }
 
+static int sev_check_pin_count(struct kvm *kvm, unsigned long npages)
+{
+	unsigned long total_npages, lock_limit;
+
+	total_npages = to_kvm_sev_info(kvm)->pages_locked + npages;
+	if (total_npages > totalram_pages())
+		return -EINVAL;
+
+	lock_limit = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT;
+	if (total_npages > lock_limit && !capable(CAP_IPC_LOCK)) {
+		pr_err_ratelimited("SEV: %lu total pages would exceed the lock limit of %lu.\n",
+				   total_npages, lock_limit);
+		return -ENOMEM;
+	}
+
+	return 0;
+}
+
+static int sev_pin_user_pages(struct kvm *kvm, unsigned long addr, int npages,
+			      unsigned int gup_flags, struct page **pages)
+{
+	int npinned;
+
+	lockdep_assert_held(&kvm->lock);
+
+	npinned = pin_user_pages_fast(addr, npages, gup_flags, pages);
+	if (npinned != npages) {
+		if (npinned > 0)
+			unpin_user_pages(pages, npinned);
+		pr_err_ratelimited("SEV: Failure locking %u pages.\n", npages);
+		return -ENOMEM;
+	}
+
+	to_kvm_sev_info(kvm)->pages_locked += npages;
+	return 0;
+}
+
 static struct page **sev_pin_memory(struct kvm *kvm, unsigned long uaddr,
 				    unsigned long ulen, unsigned long *n,
 				    unsigned int flags)
 {
-	struct kvm_sev_info *sev = to_kvm_sev_info(kvm);
-	unsigned long npages, size;
-	int npinned;
-	unsigned long locked, lock_limit;
+	unsigned long npages;
 	struct page **pages;
-	unsigned long first, last;
 	int ret;
 
 	lockdep_assert_held(&kvm->lock);
@@ -694,50 +776,37 @@ static struct page **sev_pin_memory(struct kvm *kvm, unsigned long uaddr,
 	if (ulen == 0 || uaddr + ulen < uaddr)
 		return ERR_PTR(-EINVAL);
 
-	/* Calculate number of pages. */
-	first = (uaddr & PAGE_MASK) >> PAGE_SHIFT;
-	last = ((uaddr + ulen - 1) & PAGE_MASK) >> PAGE_SHIFT;
-	npages = (last - first + 1);
-
-	locked = sev->pages_locked + npages;
-	lock_limit = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT;
-	if (locked > lock_limit && !capable(CAP_IPC_LOCK)) {
-		pr_err("SEV: %lu locked pages exceed the lock limit of %lu.\n", locked, lock_limit);
-		return ERR_PTR(-ENOMEM);
-	}
-
-	if (WARN_ON_ONCE(npages > INT_MAX))
+	/*
+	 * Calculate the number of pages that need to be pinned to cover the
+	 * entire range.  Note!  This isn't simply PFN_DOWN(ulen), as KVM
+	 * doesn't require the incoming address+size to be page aligned!
+	 */
+	npages = PFN_DOWN(uaddr + ulen - 1) - PFN_DOWN(uaddr) + 1;
+	if (npages > INT_MAX)
 		return ERR_PTR(-EINVAL);
 
-	/* Avoid using vmalloc for smaller buffers. */
-	size = npages * sizeof(struct page *);
-	if (size > PAGE_SIZE)
-		pages = __vmalloc(size, GFP_KERNEL_ACCOUNT);
-	else
-		pages = kmalloc(size, GFP_KERNEL_ACCOUNT);
+	ret = sev_check_pin_count(kvm, npages);
+	if (ret)
+		return ERR_PTR(ret);
 
+	/*
+	 * Don't WARN if the kernel (rightly) thinks the total size is absurd,
+	 * i.e. rely on the kernel to reject outrageous range sizes.  The above
+	 * check on the number of pages is purely to avoid truncation as
+	 * pin_user_pages_fast() takes the number of pages as a 32-bit int.
+	 */
+	pages = kvzalloc_objs(*pages, npages, GFP_KERNEL_ACCOUNT | __GFP_NOWARN);
 	if (!pages)
 		return ERR_PTR(-ENOMEM);
 
-	/* Pin the user virtual address. */
-	npinned = pin_user_pages_fast(uaddr, npages, flags, pages);
-	if (npinned != npages) {
-		pr_err("SEV: Failure locking %lu pages.\n", npages);
-		ret = -ENOMEM;
-		goto err;
+	ret = sev_pin_user_pages(kvm, uaddr, npages, flags, pages);
+	if (ret) {
+		kvfree(pages);
+		return ERR_PTR(ret);
 	}
 
 	*n = npages;
-	sev->pages_locked = locked;
-
 	return pages;
-
-err:
-	if (npinned > 0)
-		unpin_user_pages(pages, npinned);
-
-	kvfree(pages);
-	return ERR_PTR(ret);
 }
 
 static void sev_unpin_memory(struct kvm *kvm, struct page **pages,
@@ -746,6 +815,29 @@ static void sev_unpin_memory(struct kvm *kvm, struct page **pages,
 	unpin_user_pages(pages, npages);
 	kvfree(pages);
 	to_kvm_sev_info(kvm)->pages_locked -= npages;
+}
+
+static struct page *sev_pin_page(struct kvm *kvm, unsigned long addr,
+				 unsigned int flags)
+{
+	struct page *page;
+	int r;
+
+	r = sev_check_pin_count(kvm, 1);
+	if (r)
+		return ERR_PTR(r);
+
+	r = sev_pin_user_pages(kvm, addr, 1, flags, &page);
+	if (r)
+		return ERR_PTR(r);
+
+	return page;
+}
+
+static void sev_unpin_page(struct kvm *kvm, struct page *page)
+{
+	unpin_user_pages(&page, 1);
+	to_kvm_sev_info(kvm)->pages_locked -= 1;
 }
 
 static void sev_clflush_pages(struct page *pages[], unsigned long npages)
@@ -886,6 +978,11 @@ static int sev_es_sync_vmsa(struct vcpu_svm *svm)
 	u8 *d;
 	int i;
 
+	lockdep_assert_held(&vcpu->mutex);
+
+	if (vcpu->arch.guest_state_protected)
+		return -EINVAL;
+
 	/* Check some debug related fields before encrypting the VMSA */
 	if (svm->vcpu.guest_debug || (svm->vmcb->save.dr7 & ~DR7_FIXED_1))
 		return -EINVAL;
@@ -917,7 +1014,7 @@ static int sev_es_sync_vmsa(struct vcpu_svm *svm)
 	save->r14 = svm->vcpu.arch.regs[VCPU_REGS_R14];
 	save->r15 = svm->vcpu.arch.regs[VCPU_REGS_R15];
 #endif
-	save->rip = svm->vcpu.arch.regs[VCPU_REGS_RIP];
+	save->rip = svm->vcpu.arch.rip;
 
 	/* Sync some non-GPR registers before encrypting */
 	save->xcr0 = svm->vcpu.arch.xcr0;
@@ -1031,19 +1128,21 @@ static int sev_launch_update_vmsa(struct kvm *kvm, struct kvm_sev_cmd *argp)
 	if (!sev_es_guest(kvm))
 		return -ENOTTY;
 
+	if (kvm_is_vcpu_creation_in_progress(kvm))
+		return -EBUSY;
+
+	ret = kvm_lock_all_vcpus(kvm);
+	if (ret)
+		return ret;
+
 	kvm_for_each_vcpu(i, vcpu, kvm) {
-		ret = mutex_lock_killable(&vcpu->mutex);
-		if (ret)
-			return ret;
-
 		ret = __sev_launch_update_vmsa(kvm, vcpu, &argp->error);
-
-		mutex_unlock(&vcpu->mutex);
 		if (ret)
-			return ret;
+			break;
 	}
 
-	return 0;
+	kvm_unlock_all_vcpus(kvm);
+	return ret;
 }
 
 static int sev_launch_measure(struct kvm *kvm, struct kvm_sev_cmd *argp)
@@ -1144,160 +1243,134 @@ static int sev_guest_status(struct kvm *kvm, struct kvm_sev_cmd *argp)
 	return ret;
 }
 
-static int __sev_issue_dbg_cmd(struct kvm *kvm, unsigned long src,
-			       unsigned long dst, int size,
-			       int *error, bool enc)
+static int sev_issue_dbg_cmd(struct kvm *kvm, unsigned long src_pa,
+			     unsigned long dst_pa, unsigned int size,
+			     unsigned int ioctl, int *error)
 {
-	struct sev_data_dbg data;
+	int cmd = ioctl == KVM_SEV_DBG_DECRYPT ? SEV_CMD_DBG_DECRYPT :
+						 SEV_CMD_DBG_ENCRYPT;
+	struct sev_data_dbg data = {
+		.handle = to_kvm_sev_info(kvm)->handle,
+		.dst_addr = dst_pa,
+		.src_addr = src_pa,
+		.len = size,
+	};
 
-	data.reserved = 0;
-	data.handle = to_kvm_sev_info(kvm)->handle;
-	data.dst_addr = dst;
-	data.src_addr = src;
-	data.len = size;
-
-	return sev_issue_cmd(kvm,
-			     enc ? SEV_CMD_DBG_ENCRYPT : SEV_CMD_DBG_DECRYPT,
-			     &data, error);
+	return sev_issue_cmd(kvm, cmd, &data, error);
 }
 
-static int __sev_dbg_decrypt(struct kvm *kvm, unsigned long src_paddr,
-			     unsigned long dst_paddr, int sz, int *err)
+static void *sev_dbg_crypt_slow_alloc(struct page *page, unsigned long __va,
+				      unsigned int len, unsigned long *pa,
+				      unsigned int *nr_bytes)
 {
-	int offset;
+	unsigned long va = ALIGN_DOWN(__va, 16);
+
+	/* The number of bytes to {de,en}crypt must be 16-byte aligned. */
+	*nr_bytes = round_up(len, 16);
 
 	/*
-	 * Its safe to read more than we are asked, caller should ensure that
-	 * destination has enough space.
+	 * Increase the number of bytes to {de,en}crypt by one chunk (16 bytes)
+	 * if the aligned address and length doesn't cover the unaligned range,
+	 * e.g. if the address is unaligned _and_ the access will split a chunk
+	 * at the tail.
 	 */
-	offset = src_paddr & 15;
-	src_paddr = round_down(src_paddr, 16);
-	sz = round_up(sz + offset, 16);
+	if (va + *nr_bytes < __va + len)
+		*nr_bytes += 16;
 
-	return __sev_issue_dbg_cmd(kvm, src_paddr, dst_paddr, sz, err, false);
-}
-
-static int __sev_dbg_decrypt_user(struct kvm *kvm, unsigned long paddr,
-				  void __user *dst_uaddr,
-				  unsigned long dst_paddr,
-				  int size, int *err)
-{
-	struct page *tpage = NULL;
-	int ret, offset;
-
-	/* if inputs are not 16-byte then use intermediate buffer */
-	if (!IS_ALIGNED(dst_paddr, 16) ||
-	    !IS_ALIGNED(paddr,     16) ||
-	    !IS_ALIGNED(size,      16)) {
-		tpage = (void *)alloc_page(GFP_KERNEL_ACCOUNT | __GFP_ZERO);
-		if (!tpage)
-			return -ENOMEM;
-
-		dst_paddr = __sme_page_pa(tpage);
-	}
-
-	ret = __sev_dbg_decrypt(kvm, paddr, dst_paddr, size, err);
-	if (ret)
-		goto e_free;
-
-	if (tpage) {
-		offset = paddr & 15;
-		if (copy_to_user(dst_uaddr, page_address(tpage) + offset, size))
-			ret = -EFAULT;
-	}
-
-e_free:
-	if (tpage)
-		__free_page(tpage);
-
-	return ret;
-}
-
-static int __sev_dbg_encrypt_user(struct kvm *kvm, unsigned long paddr,
-				  void __user *vaddr,
-				  unsigned long dst_paddr,
-				  void __user *dst_vaddr,
-				  int size, int *error)
-{
-	struct page *src_tpage = NULL;
-	struct page *dst_tpage = NULL;
-	int ret, len = size;
-
-	/* If source buffer is not aligned then use an intermediate buffer */
-	if (!IS_ALIGNED((unsigned long)vaddr, 16)) {
-		src_tpage = alloc_page(GFP_KERNEL_ACCOUNT);
-		if (!src_tpage)
-			return -ENOMEM;
-
-		if (copy_from_user(page_address(src_tpage), vaddr, size)) {
-			__free_page(src_tpage);
-			return -EFAULT;
-		}
-
-		paddr = __sme_page_pa(src_tpage);
-	}
+	*pa = __sme_page_pa(page) + (va & ~PAGE_MASK);
 
 	/*
-	 *  If destination buffer or length is not aligned then do read-modify-write:
-	 *   - decrypt destination in an intermediate buffer
-	 *   - copy the source buffer in an intermediate buffer
-	 *   - use the intermediate buffer as source buffer
+	 * Sanity check that the new access won't split a page.  This should
+	 * never happen; just pretend the allocation failed.
 	 */
-	if (!IS_ALIGNED((unsigned long)dst_vaddr, 16) || !IS_ALIGNED(size, 16)) {
-		int dst_offset;
+	if (WARN_ON_ONCE((*pa & PAGE_MASK) != ((*pa + *nr_bytes - 1) & PAGE_MASK)))
+		return NULL;
 
-		dst_tpage = alloc_page(GFP_KERNEL_ACCOUNT);
-		if (!dst_tpage) {
-			ret = -ENOMEM;
-			goto e_free;
-		}
+	/*
+	 * If SNP is enabled, i.e. the RMP is active, allocate a full page to
+	 * prevent concurrent accesses to the page.  As required by firmware,
+	 * the PSP driver updates the RMP to temporarily transfer ownership of
+	 * the page to Firmware while the {DE,EN}CRYPT operation is in-progress,
+	 * and so concurrent software accesses to the page will encounter
+	 * seemingly spurious RMP #PF violations
+	 */
+	if (cc_platform_has(CC_ATTR_HOST_SEV_SNP))
+		return (void *)__get_free_page(GFP_KERNEL);
 
-		ret = __sev_dbg_decrypt(kvm, dst_paddr,
-					__sme_page_pa(dst_tpage), size, error);
-		if (ret)
-			goto e_free;
-
-		/*
-		 *  If source is kernel buffer then use memcpy() otherwise
-		 *  copy_from_user().
-		 */
-		dst_offset = dst_paddr & 15;
-
-		if (src_tpage)
-			memcpy(page_address(dst_tpage) + dst_offset,
-			       page_address(src_tpage), size);
-		else {
-			if (copy_from_user(page_address(dst_tpage) + dst_offset,
-					   vaddr, size)) {
-				ret = -EFAULT;
-				goto e_free;
-			}
-		}
-
-		paddr = __sme_page_pa(dst_tpage);
-		dst_paddr = round_down(dst_paddr, 16);
-		len = round_up(size, 16);
-	}
-
-	ret = __sev_issue_dbg_cmd(kvm, paddr, dst_paddr, len, error, true);
-
-e_free:
-	if (src_tpage)
-		__free_page(src_tpage);
-	if (dst_tpage)
-		__free_page(dst_tpage);
-	return ret;
+	return kmalloc(*nr_bytes, GFP_KERNEL);
 }
 
-static int sev_dbg_crypt(struct kvm *kvm, struct kvm_sev_cmd *argp, bool dec)
+static void sev_dbg_crypt_slow_free(void *buf)
 {
-	unsigned long vaddr, vaddr_end, next_vaddr;
-	unsigned long dst_vaddr;
-	struct page **src_p, **dst_p;
+	if (cc_platform_has(CC_ATTR_HOST_SEV_SNP))
+		free_page((unsigned long)buf);
+	else
+		kfree(buf);
+}
+
+static int sev_dbg_decrypt_slow(struct kvm *kvm, unsigned long src,
+				struct page *src_p, unsigned long dst,
+				unsigned int len, int *err)
+{
+	unsigned int nr_bytes;
+	unsigned long src_pa;
+	void *buf;
+	int r;
+
+	buf = sev_dbg_crypt_slow_alloc(src_p, src, len, &src_pa, &nr_bytes);
+	if (!buf)
+		return -ENOMEM;
+
+	r = sev_issue_dbg_cmd(kvm, src_pa, __sme_set(__pa(buf)),
+			      nr_bytes, KVM_SEV_DBG_DECRYPT, err);
+	if (r)
+		goto out;
+
+	if (copy_to_user((void __user *)dst, buf + (src & 15), len))
+		r = -EFAULT;
+out:
+	sev_dbg_crypt_slow_free(buf);
+	return r;
+}
+
+static int sev_dbg_encrypt_slow(struct kvm *kvm, unsigned long src,
+				unsigned long dst, struct page *dst_p,
+				unsigned int len, int *err)
+{
+	unsigned int nr_bytes;
+	unsigned long dst_pa;
+	void *buf;
+	int r;
+
+	/* Decrypt the _destination_ to do a RMW on plaintext. */
+	buf = sev_dbg_crypt_slow_alloc(dst_p, dst, len, &dst_pa, &nr_bytes);
+	if (!buf)
+		return -ENOMEM;
+
+	r = sev_issue_dbg_cmd(kvm, dst_pa, __sme_set(__pa(buf)),
+			      nr_bytes, KVM_SEV_DBG_DECRYPT, err);
+	if (r)
+		goto out;
+
+	/*
+	 * Copy from the source into the intermediate buffer, and then
+	 * re-encrypt the buffer into the destination.
+	 */
+	if (copy_from_user(buf + (dst & 15), (void __user *)src, len))
+		r = -EFAULT;
+	else
+		r = sev_issue_dbg_cmd(kvm, __sme_set(__pa(buf)), dst_pa,
+				      nr_bytes, KVM_SEV_DBG_ENCRYPT, err);
+out:
+	sev_dbg_crypt_slow_free(buf);
+	return r;
+}
+
+static int sev_dbg_crypt(struct kvm *kvm, struct kvm_sev_cmd *argp,
+			 unsigned int cmd)
+{
 	struct kvm_sev_dbg debug;
-	unsigned long n;
-	unsigned int size;
-	int ret;
+	unsigned int i, len;
 
 	if (!sev_guest(kvm))
 		return -ENOTTY;
@@ -1305,27 +1378,38 @@ static int sev_dbg_crypt(struct kvm *kvm, struct kvm_sev_cmd *argp, bool dec)
 	if (copy_from_user(&debug, u64_to_user_ptr(argp->data), sizeof(debug)))
 		return -EFAULT;
 
-	if (!debug.len || debug.src_uaddr + debug.len < debug.src_uaddr)
-		return -EINVAL;
-	if (!debug.dst_uaddr)
+	if (!debug.len || !debug.src_uaddr || !debug.dst_uaddr)
 		return -EINVAL;
 
-	vaddr = debug.src_uaddr;
-	size = debug.len;
-	vaddr_end = vaddr + size;
-	dst_vaddr = debug.dst_uaddr;
+	if (debug.src_uaddr + debug.len < debug.src_uaddr ||
+	    debug.dst_uaddr + debug.len < debug.dst_uaddr)
+		return -EINVAL;
 
-	for (; vaddr < vaddr_end; vaddr = next_vaddr) {
-		int len, s_off, d_off;
+	for (i = 0; i < debug.len; i += len) {
+		unsigned long src = debug.src_uaddr + i;
+		unsigned long dst = debug.dst_uaddr + i;
+		unsigned long s_off = src & ~PAGE_MASK;
+		unsigned long d_off = dst & ~PAGE_MASK;
+		struct page *src_p, *dst_p;
+		int ret;
 
-		/* lock userspace source and destination page */
-		src_p = sev_pin_memory(kvm, vaddr & PAGE_MASK, PAGE_SIZE, &n, 0);
+		/*
+		 * Copy as many remaining bytes as possible while staying in a
+		 * single page for both the source and destination.
+		 */
+		len = min3(debug.len - i, PAGE_SIZE - s_off, PAGE_SIZE - d_off);
+
+		/*
+		 * Pin the source and destination pages; firmware operates on
+		 * physical addresses.
+		 */
+		src_p = sev_pin_page(kvm, src & PAGE_MASK, 0);
 		if (IS_ERR(src_p))
 			return PTR_ERR(src_p);
 
-		dst_p = sev_pin_memory(kvm, dst_vaddr & PAGE_MASK, PAGE_SIZE, &n, FOLL_WRITE);
+		dst_p = sev_pin_page(kvm, dst & PAGE_MASK, FOLL_WRITE);
 		if (IS_ERR(dst_p)) {
-			sev_unpin_memory(kvm, src_p, n);
+			sev_unpin_page(kvm, src_p);
 			return PTR_ERR(dst_p);
 		}
 
@@ -1334,43 +1418,28 @@ static int sev_dbg_crypt(struct kvm *kvm, struct kvm_sev_cmd *argp, bool dec)
 		 * the pages; flush the destination too so that future accesses do not
 		 * see stale data.
 		 */
-		sev_clflush_pages(src_p, 1);
-		sev_clflush_pages(dst_p, 1);
+		sev_clflush_pages(&src_p, 1);
+		sev_clflush_pages(&dst_p, 1);
 
-		/*
-		 * Since user buffer may not be page aligned, calculate the
-		 * offset within the page.
-		 */
-		s_off = vaddr & ~PAGE_MASK;
-		d_off = dst_vaddr & ~PAGE_MASK;
-		len = min_t(size_t, (PAGE_SIZE - s_off), size);
-
-		if (dec)
-			ret = __sev_dbg_decrypt_user(kvm,
-						     __sme_page_pa(src_p[0]) + s_off,
-						     (void __user *)dst_vaddr,
-						     __sme_page_pa(dst_p[0]) + d_off,
-						     len, &argp->error);
+		if (IS_ALIGNED(src, 16) && IS_ALIGNED(dst, 16) && IS_ALIGNED(len, 16))
+			ret = sev_issue_dbg_cmd(kvm,
+						__sme_page_pa(src_p) + s_off,
+						__sme_page_pa(dst_p) + d_off,
+						len, cmd, &argp->error);
+		else if (cmd == KVM_SEV_DBG_DECRYPT)
+			ret = sev_dbg_decrypt_slow(kvm, src, src_p, dst,
+						   len, &argp->error);
 		else
-			ret = __sev_dbg_encrypt_user(kvm,
-						     __sme_page_pa(src_p[0]) + s_off,
-						     (void __user *)vaddr,
-						     __sme_page_pa(dst_p[0]) + d_off,
-						     (void __user *)dst_vaddr,
-						     len, &argp->error);
+			ret = sev_dbg_encrypt_slow(kvm, src, dst, dst_p,
+						   len, &argp->error);
 
-		sev_unpin_memory(kvm, src_p, n);
-		sev_unpin_memory(kvm, dst_p, n);
+		sev_unpin_page(kvm, src_p);
+		sev_unpin_page(kvm, dst_p);
 
 		if (ret)
-			goto err;
-
-		next_vaddr = vaddr + len;
-		dst_vaddr = dst_vaddr + len;
-		size -= len;
+			return ret;
 	}
-err:
-	return ret;
+	return 0;
 }
 
 static int sev_launch_secret(struct kvm *kvm, struct kvm_sev_cmd *argp)
@@ -1643,8 +1712,7 @@ static int sev_send_update_data(struct kvm *kvm, struct kvm_sev_cmd *argp)
 	struct sev_data_send_update_data data;
 	struct kvm_sev_send_update_data params;
 	void *hdr, *trans_data;
-	struct page **guest_page;
-	unsigned long n;
+	struct page *guest_page;
 	int ret, offset;
 
 	if (!sev_guest(kvm))
@@ -1668,8 +1736,7 @@ static int sev_send_update_data(struct kvm *kvm, struct kvm_sev_cmd *argp)
 		return -EINVAL;
 
 	/* Pin guest memory */
-	guest_page = sev_pin_memory(kvm, params.guest_uaddr & PAGE_MASK,
-				    PAGE_SIZE, &n, 0);
+	guest_page = sev_pin_page(kvm, params.guest_uaddr & PAGE_MASK, 0);
 	if (IS_ERR(guest_page))
 		return PTR_ERR(guest_page);
 
@@ -1690,7 +1757,7 @@ static int sev_send_update_data(struct kvm *kvm, struct kvm_sev_cmd *argp)
 	data.trans_len = params.trans_len;
 
 	/* The SEND_UPDATE_DATA command requires C-bit to be always set. */
-	data.guest_address = (page_to_pfn(guest_page[0]) << PAGE_SHIFT) + offset;
+	data.guest_address = page_to_phys(guest_page) + offset;
 	data.guest_address |= sev_me_mask;
 	data.guest_len = params.guest_len;
 	data.handle = to_kvm_sev_info(kvm)->handle;
@@ -1717,8 +1784,7 @@ e_free_trans_data:
 e_free_hdr:
 	kfree(hdr);
 e_unpin:
-	sev_unpin_memory(kvm, guest_page, n);
-
+	sev_unpin_page(kvm, guest_page);
 	return ret;
 }
 
@@ -1823,8 +1889,7 @@ static int sev_receive_update_data(struct kvm *kvm, struct kvm_sev_cmd *argp)
 	struct kvm_sev_receive_update_data params;
 	struct sev_data_receive_update_data data;
 	void *hdr = NULL, *trans = NULL;
-	struct page **guest_page;
-	unsigned long n;
+	struct page *guest_page;
 	int ret, offset;
 
 	if (!sev_guest(kvm))
@@ -1861,8 +1926,7 @@ static int sev_receive_update_data(struct kvm *kvm, struct kvm_sev_cmd *argp)
 	data.trans_len = params.trans_len;
 
 	/* Pin guest memory */
-	guest_page = sev_pin_memory(kvm, params.guest_uaddr & PAGE_MASK,
-				    PAGE_SIZE, &n, FOLL_WRITE);
+	guest_page = sev_pin_page(kvm, params.guest_uaddr & PAGE_MASK, FOLL_WRITE);
 	if (IS_ERR(guest_page)) {
 		ret = PTR_ERR(guest_page);
 		goto e_free_trans;
@@ -1873,10 +1937,10 @@ static int sev_receive_update_data(struct kvm *kvm, struct kvm_sev_cmd *argp)
 	 * encrypts the written data with the guest's key, and the cache may
 	 * contain dirty, unencrypted data.
 	 */
-	sev_clflush_pages(guest_page, n);
+	sev_clflush_pages(&guest_page, 1);
 
 	/* The RECEIVE_UPDATE_DATA command requires C-bit to be always set. */
-	data.guest_address = (page_to_pfn(guest_page[0]) << PAGE_SHIFT) + offset;
+	data.guest_address = page_to_phys(guest_page) + offset;
 	data.guest_address |= sev_me_mask;
 	data.guest_len = params.guest_len;
 	data.handle = to_kvm_sev_info(kvm)->handle;
@@ -1884,7 +1948,7 @@ static int sev_receive_update_data(struct kvm *kvm, struct kvm_sev_cmd *argp)
 	ret = sev_issue_cmd(kvm, SEV_CMD_RECEIVE_UPDATE_DATA, &data,
 				&argp->error);
 
-	sev_unpin_memory(kvm, guest_page, n);
+	sev_unpin_page(kvm, guest_page);
 
 e_free_trans:
 	kfree(trans);
@@ -1978,7 +2042,6 @@ static void sev_migrate_from(struct kvm *dst_kvm, struct kvm *src_kvm)
 	dst->asid = src->asid;
 	dst->handle = src->handle;
 	dst->pages_locked = src->pages_locked;
-	dst->enc_context_owner = src->enc_context_owner;
 	dst->es_active = src->es_active;
 	dst->vmsa_features = src->vmsa_features;
 
@@ -1986,10 +2049,11 @@ static void sev_migrate_from(struct kvm *dst_kvm, struct kvm *src_kvm)
 	src->active = false;
 	src->handle = 0;
 	src->pages_locked = 0;
-	src->enc_context_owner = NULL;
 	src->es_active = false;
 
 	list_cut_before(&dst->regions_list, &src->regions_list, &src->regions_list);
+
+	mutex_lock(&sev_mirror_lock);
 
 	/*
 	 * If this VM has mirrors, "transfer" each mirror's refcount of the
@@ -2007,12 +2071,15 @@ static void sev_migrate_from(struct kvm *dst_kvm, struct kvm *src_kvm)
 	 * If this VM is a mirror, remove the old mirror from the owners list
 	 * and add the new mirror to the list.
 	 */
-	if (is_mirroring_enc_context(dst_kvm)) {
-		struct kvm_sev_info *owner_sev_info = to_kvm_sev_info(dst->enc_context_owner);
+	if (is_mirroring_enc_context(src_kvm)) {
+		struct kvm_sev_info *owner_sev_info = to_kvm_sev_info(src->enc_context_owner);
 
+		dst->enc_context_owner = src->enc_context_owner;
+		src->enc_context_owner = NULL;
 		list_del(&src->mirror_entry);
 		list_add_tail(&dst->mirror_entry, &owner_sev_info->mirror_vms);
 	}
+	mutex_unlock(&sev_mirror_lock);
 
 	kvm_for_each_vcpu(i, dst_vcpu, dst_kvm) {
 		dst_svm = to_svm(dst_vcpu);
@@ -2051,8 +2118,8 @@ static int sev_check_source_vcpus(struct kvm *dst, struct kvm *src)
 	struct kvm_vcpu *src_vcpu;
 	unsigned long i;
 
-	if (src->created_vcpus != atomic_read(&src->online_vcpus) ||
-	    dst->created_vcpus != atomic_read(&dst->online_vcpus))
+	if (kvm_is_vcpu_creation_in_progress(src) ||
+	    kvm_is_vcpu_creation_in_progress(dst))
 		return -EBUSY;
 
 	if (!sev_es_guest(src))
@@ -2091,8 +2158,9 @@ int sev_vm_move_enc_context_from(struct kvm *kvm, unsigned int source_fd)
 	if (ret)
 		goto out_fput;
 
+	/* Do not allow SNP VM migration until additional state transfer is implemented  */
 	if (kvm->arch.vm_type != source_kvm->arch.vm_type ||
-	    sev_guest(kvm) || !sev_guest(source_kvm)) {
+	    sev_guest(kvm) || !sev_guest(source_kvm) || sev_snp_guest(source_kvm)) {
 		ret = -EINVAL;
 		goto out_unlock;
 	}
@@ -2312,8 +2380,8 @@ static int sev_gmem_post_populate(struct kvm *kvm, gfn_t gfn, kvm_pfn_t pfn,
 
 		memcpy(dst_vaddr, src_vaddr, PAGE_SIZE);
 
-		kunmap_local(src_vaddr);
 		kunmap_local(dst_vaddr);
+		kunmap_local(src_vaddr);
 	}
 
 	ret = rmp_make_private(pfn, gfn << PAGE_SHIFT, PG_LEVEL_4K,
@@ -2347,9 +2415,10 @@ static int sev_gmem_post_populate(struct kvm *kvm, gfn_t gfn, kvm_pfn_t pfn,
 		void *dst_vaddr = kmap_local_pfn(pfn);
 
 		memcpy(src_vaddr, dst_vaddr, PAGE_SIZE);
+		set_page_dirty(src_page);
 
-		kunmap_local(src_vaddr);
 		kunmap_local(dst_vaddr);
+		kunmap_local(src_vaddr);
 	}
 
 out:
@@ -2367,7 +2436,6 @@ static int snp_launch_update(struct kvm *kvm, struct kvm_sev_cmd *argp)
 	struct kvm_memory_slot *memslot;
 	long npages, count;
 	void __user *src;
-	int ret = 0;
 
 	if (!sev_snp_guest(kvm) || !sev->snp_context)
 		return -EINVAL;
@@ -2412,39 +2480,34 @@ static int snp_launch_update(struct kvm *kvm, struct kvm_sev_cmd *argp)
 	 * initial expected state and better guard against unexpected
 	 * situations.
 	 */
-	mutex_lock(&kvm->slots_lock);
+	guard(mutex)(&kvm->slots_lock);
 
 	memslot = gfn_to_memslot(kvm, params.gfn_start);
-	if (!kvm_slot_has_gmem(memslot)) {
-		ret = -EINVAL;
-		goto out;
-	}
+	if (!kvm_slot_has_gmem(memslot))
+		return -EINVAL;
 
 	sev_populate_args.sev_fd = argp->sev_fd;
 	sev_populate_args.type = params.type;
 
 	count = kvm_gmem_populate(kvm, params.gfn_start, src, npages,
+				  params.type == KVM_SEV_SNP_PAGE_TYPE_CPUID,
 				  sev_gmem_post_populate, &sev_populate_args);
 	if (count < 0) {
 		argp->error = sev_populate_args.fw_error;
 		pr_debug("%s: kvm_gmem_populate failed, ret %ld (fw_error %d)\n",
 			 __func__, count, argp->error);
-		ret = -EIO;
-	} else {
-		params.gfn_start += count;
-		params.len -= count * PAGE_SIZE;
-		if (params.type != KVM_SEV_SNP_PAGE_TYPE_ZERO)
-			params.uaddr += count * PAGE_SIZE;
-
-		ret = 0;
-		if (copy_to_user(u64_to_user_ptr(argp->data), &params, sizeof(params)))
-			ret = -EFAULT;
+		return -EIO;
 	}
 
-out:
-	mutex_unlock(&kvm->slots_lock);
+	params.gfn_start += count;
+	params.len -= count * PAGE_SIZE;
+	if (params.type != KVM_SEV_SNP_PAGE_TYPE_ZERO)
+		params.uaddr += count * PAGE_SIZE;
 
-	return ret;
+	if (copy_to_user(u64_to_user_ptr(argp->data), &params, sizeof(params)))
+		return -EFAULT;
+
+	return 0;
 }
 
 static int snp_launch_update_vmsa(struct kvm *kvm, struct kvm_sev_cmd *argp)
@@ -2455,6 +2518,13 @@ static int snp_launch_update_vmsa(struct kvm *kvm, struct kvm_sev_cmd *argp)
 	unsigned long i;
 	int ret;
 
+	if (kvm_is_vcpu_creation_in_progress(kvm))
+		return -EBUSY;
+
+	ret = kvm_lock_all_vcpus(kvm);
+	if (ret)
+		return ret;
+
 	data.gctx_paddr = __psp_pa(sev->snp_context);
 	data.page_type = SNP_PAGE_TYPE_VMSA;
 
@@ -2464,12 +2534,12 @@ static int snp_launch_update_vmsa(struct kvm *kvm, struct kvm_sev_cmd *argp)
 
 		ret = sev_es_sync_vmsa(svm);
 		if (ret)
-			return ret;
+			goto out;
 
 		/* Transition the VMSA page to a firmware state. */
 		ret = rmp_make_private(pfn, INITIAL_VMSA_GPA, PG_LEVEL_4K, sev->asid, true);
 		if (ret)
-			return ret;
+			goto out;
 
 		/* Issue the SNP command to encrypt the VMSA */
 		data.address = __sme_pa(svm->sev_es.vmsa);
@@ -2478,7 +2548,7 @@ static int snp_launch_update_vmsa(struct kvm *kvm, struct kvm_sev_cmd *argp)
 		if (ret) {
 			snp_page_reclaim(kvm, pfn);
 
-			return ret;
+			goto out;
 		}
 
 		svm->vcpu.arch.guest_state_protected = true;
@@ -2492,7 +2562,9 @@ static int snp_launch_update_vmsa(struct kvm *kvm, struct kvm_sev_cmd *argp)
 		svm_enable_lbrv(vcpu);
 	}
 
-	return 0;
+out:
+	kvm_unlock_all_vcpus(kvm);
+	return ret;
 }
 
 static int snp_launch_finish(struct kvm *kvm, struct kvm_sev_cmd *argp)
@@ -2520,7 +2592,7 @@ static int snp_launch_finish(struct kvm *kvm, struct kvm_sev_cmd *argp)
 	if (ret)
 		return ret;
 
-	data = kzalloc(sizeof(*data), GFP_KERNEL_ACCOUNT);
+	data = kzalloc_obj(*data, GFP_KERNEL_ACCOUNT);
 	if (!data)
 		return -ENOMEM;
 
@@ -2595,30 +2667,24 @@ int sev_mem_enc_ioctl(struct kvm *kvm, void __user *argp)
 	if (copy_from_user(&sev_cmd, argp, sizeof(struct kvm_sev_cmd)))
 		return -EFAULT;
 
-	mutex_lock(&kvm->lock);
+	guard(mutex)(&kvm->lock);
 
 	/* Only the enc_context_owner handles some memory enc operations. */
 	if (is_mirroring_enc_context(kvm) &&
-	    !is_cmd_allowed_from_mirror(sev_cmd.id)) {
-		r = -EINVAL;
-		goto out;
-	}
+	    !is_cmd_allowed_from_mirror(sev_cmd.id))
+		return -EINVAL;
 
 	/*
 	 * Once KVM_SEV_INIT2 initializes a KVM instance as an SNP guest, only
 	 * allow the use of SNP-specific commands.
 	 */
-	if (sev_snp_guest(kvm) && sev_cmd.id < KVM_SEV_SNP_LAUNCH_START) {
-		r = -EPERM;
-		goto out;
-	}
+	if (sev_snp_guest(kvm) && sev_cmd.id < KVM_SEV_SNP_LAUNCH_START)
+		return -EPERM;
 
 	switch (sev_cmd.id) {
 	case KVM_SEV_ES_INIT:
-		if (!sev_es_enabled) {
-			r = -ENOTTY;
-			goto out;
-		}
+		if (!sev_es_enabled)
+			return -ENOTTY;
 		fallthrough;
 	case KVM_SEV_INIT:
 		r = sev_guest_init(kvm, &sev_cmd);
@@ -2645,10 +2711,8 @@ int sev_mem_enc_ioctl(struct kvm *kvm, void __user *argp)
 		r = sev_guest_status(kvm, &sev_cmd);
 		break;
 	case KVM_SEV_DBG_DECRYPT:
-		r = sev_dbg_crypt(kvm, &sev_cmd, true);
-		break;
 	case KVM_SEV_DBG_ENCRYPT:
-		r = sev_dbg_crypt(kvm, &sev_cmd, false);
+		r = sev_dbg_crypt(kvm, &sev_cmd, sev_cmd.id);
 		break;
 	case KVM_SEV_LAUNCH_SECRET:
 		r = sev_launch_secret(kvm, &sev_cmd);
@@ -2690,15 +2754,12 @@ int sev_mem_enc_ioctl(struct kvm *kvm, void __user *argp)
 		r = snp_enable_certs(kvm);
 		break;
 	default:
-		r = -EINVAL;
-		goto out;
+		return -EINVAL;
 	}
 
 	if (copy_to_user(argp, &sev_cmd, sizeof(struct kvm_sev_cmd)))
 		r = -EFAULT;
 
-out:
-	mutex_unlock(&kvm->lock);
 	return r;
 }
 
@@ -2709,6 +2770,8 @@ int sev_mem_enc_register_region(struct kvm *kvm,
 	struct enc_region *region;
 	int ret = 0;
 
+	guard(mutex)(&kvm->lock);
+
 	if (!sev_guest(kvm))
 		return -ENOTTY;
 
@@ -2716,19 +2779,14 @@ int sev_mem_enc_register_region(struct kvm *kvm,
 	if (is_mirroring_enc_context(kvm))
 		return -EINVAL;
 
-	if (range->addr > ULONG_MAX || range->size > ULONG_MAX)
-		return -EINVAL;
-
-	region = kzalloc(sizeof(*region), GFP_KERNEL_ACCOUNT);
+	region = kzalloc_obj(*region, GFP_KERNEL_ACCOUNT);
 	if (!region)
 		return -ENOMEM;
 
-	mutex_lock(&kvm->lock);
 	region->pages = sev_pin_memory(kvm, range->addr, range->size, &region->npages,
 				       FOLL_WRITE | FOLL_LONGTERM);
 	if (IS_ERR(region->pages)) {
 		ret = PTR_ERR(region->pages);
-		mutex_unlock(&kvm->lock);
 		goto e_free;
 	}
 
@@ -2746,8 +2804,6 @@ int sev_mem_enc_register_region(struct kvm *kvm,
 	region->size = range->size;
 
 	list_add_tail(&region->list, &sev->regions_list);
-	mutex_unlock(&kvm->lock);
-
 	return ret;
 
 e_free:
@@ -2783,35 +2839,25 @@ int sev_mem_enc_unregister_region(struct kvm *kvm,
 				  struct kvm_enc_region *range)
 {
 	struct enc_region *region;
-	int ret;
 
 	/* If kvm is mirroring encryption context it isn't responsible for it */
 	if (is_mirroring_enc_context(kvm))
 		return -EINVAL;
 
-	mutex_lock(&kvm->lock);
+	guard(mutex)(&kvm->lock);
 
-	if (!sev_guest(kvm)) {
-		ret = -ENOTTY;
-		goto failed;
-	}
+	if (!sev_guest(kvm))
+		return -ENOTTY;
 
 	region = find_enc_region(kvm, range);
-	if (!region) {
-		ret = -EINVAL;
-		goto failed;
-	}
+	if (!region)
+		return -EINVAL;
 
 	sev_writeback_caches(kvm);
 
 	__unregister_enc_region_locked(kvm, region);
 
-	mutex_unlock(&kvm->lock);
 	return 0;
-
-failed:
-	mutex_unlock(&kvm->lock);
-	return ret;
 }
 
 int sev_vm_copy_enc_context_from(struct kvm *kvm, unsigned int source_fd)
@@ -2839,8 +2885,9 @@ int sev_vm_copy_enc_context_from(struct kvm *kvm, unsigned int source_fd)
 	 * disallow out-of-band SEV/SEV-ES init if the target is already an
 	 * SEV guest, or if vCPUs have been created.  KVM relies on vCPUs being
 	 * created after SEV/SEV-ES initialization, e.g. to init intercepts.
+	 * Also do not allow SNP VM mirroring until additional state transfer is implemented.
 	 */
-	if (sev_guest(kvm) || !sev_guest(source_kvm) ||
+	if (sev_guest(kvm) || !sev_guest(source_kvm) || sev_snp_guest(source_kvm) ||
 	    is_mirroring_enc_context(source_kvm) || kvm->created_vcpus) {
 		ret = -EINVAL;
 		goto e_unlock;
@@ -2857,11 +2904,14 @@ int sev_vm_copy_enc_context_from(struct kvm *kvm, unsigned int source_fd)
 	 * disappear until we're done with it
 	 */
 	source_sev = to_kvm_sev_info(source_kvm);
-	kvm_get_kvm(source_kvm);
-	list_add_tail(&mirror_sev->mirror_entry, &source_sev->mirror_vms);
 
 	/* Set enc_context_owner and copy its encryption context over */
+	mutex_lock(&sev_mirror_lock);
+	kvm_get_kvm(source_kvm);
+	list_add_tail(&mirror_sev->mirror_entry, &source_sev->mirror_vms);
 	mirror_sev->enc_context_owner = source_kvm;
+	mutex_unlock(&sev_mirror_lock);
+
 	mirror_sev->active = true;
 	mirror_sev->asid = source_sev->asid;
 	mirror_sev->fd = source_sev->fd;
@@ -2910,6 +2960,28 @@ static int snp_decommission_context(struct kvm *kvm)
 	return 0;
 }
 
+void sev_vm_init(struct kvm *kvm)
+{
+	switch (kvm->arch.vm_type) {
+	case KVM_X86_DEFAULT_VM:
+	case KVM_X86_SW_PROTECTED_VM:
+		break;
+	case KVM_X86_SNP_VM:
+		kvm->arch.has_private_mem = true;
+		fallthrough;
+	case KVM_X86_SEV_ES_VM:
+		kvm->arch.has_protected_state = true;
+		fallthrough;
+	case KVM_X86_SEV_VM:
+		kvm->arch.pre_fault_allowed = !kvm->arch.has_private_mem;
+		to_kvm_sev_info(kvm)->need_init = true;
+		break;
+	default:
+		WARN_ONCE(1, "Unsupported VM type %u", kvm->arch.vm_type);
+		break;
+	}
+}
+
 void sev_vm_destroy(struct kvm *kvm)
 {
 	struct kvm_sev_info *sev = to_kvm_sev_info(kvm);
@@ -2929,11 +3001,19 @@ void sev_vm_destroy(struct kvm *kvm)
 	 * Note, mirror VMs don't support registering encrypted regions.
 	 */
 	if (is_mirroring_enc_context(kvm)) {
-		struct kvm *owner_kvm = sev->enc_context_owner;
+		struct kvm *owner_kvm;
 
-		mutex_lock(&owner_kvm->lock);
+		mutex_lock(&sev_mirror_lock);
+		owner_kvm = sev->enc_context_owner;
 		list_del(&sev->mirror_entry);
-		mutex_unlock(&owner_kvm->lock);
+		sev->enc_context_owner = NULL;
+
+		/*
+		 * The reference to owner_kvm cannot move after sev_mirror_lock is
+		 * released.  Release it before kvm_put_kvm() so that owner_kvm is
+		 * never destroyed inside sev_mirror_lock.
+		 */
+		mutex_unlock(&sev_mirror_lock);
 		kvm_put_kvm(owner_kvm);
 		return;
 	}
@@ -2969,18 +3049,14 @@ void sev_vm_destroy(struct kvm *kvm)
 
 void __init sev_set_cpu_caps(void)
 {
-	if (sev_enabled) {
+	if (sev_enabled)
 		kvm_cpu_cap_set(X86_FEATURE_SEV);
-		kvm_caps.supported_vm_types |= BIT(KVM_X86_SEV_VM);
-	}
-	if (sev_es_enabled) {
+
+	if (sev_es_enabled)
 		kvm_cpu_cap_set(X86_FEATURE_SEV_ES);
-		kvm_caps.supported_vm_types |= BIT(KVM_X86_SEV_ES_VM);
-	}
-	if (sev_snp_enabled) {
+
+	if (sev_snp_enabled)
 		kvm_cpu_cap_set(X86_FEATURE_SEV_SNP);
-		kvm_caps.supported_vm_types |= BIT(KVM_X86_SNP_VM);
-	}
 }
 
 static bool is_sev_snp_initialized(void)
@@ -3010,6 +3086,11 @@ out:
 	return initialized;
 }
 
+static const char * __init sev_str_feature_state(bool is_supported, bool is_usable)
+{
+	return is_supported ? is_usable ? "enabled" : "unusable" : "disabled";
+}
+
 void __init sev_hardware_setup(void)
 {
 	unsigned int eax, ebx, ecx, edx, sev_asid_count, sev_es_asid_count;
@@ -3017,6 +3098,7 @@ void __init sev_hardware_setup(void)
 	bool sev_snp_supported = false;
 	bool sev_es_supported = false;
 	bool sev_supported = false;
+	u32 vm_types = 0;
 
 	if (!sev_enabled || !npt_enabled || !nrips)
 		goto out;
@@ -3031,6 +3113,16 @@ void __init sev_hardware_setup(void)
 	if (!boot_cpu_has(X86_FEATURE_SEV) ||
 	    WARN_ON_ONCE(!boot_cpu_has(X86_FEATURE_DECODEASSISTS)) ||
 	    WARN_ON_ONCE(!boot_cpu_has(X86_FEATURE_FLUSHBYASID)))
+		goto out;
+
+	/*
+	 * The kernel's initcall infrastructure lacks the ability to express
+	 * dependencies between initcalls, whereas the modules infrastructure
+	 * automatically handles dependencies via symbol loading.  Ensure the
+	 * PSP SEV driver is initialized before proceeding if KVM is built-in,
+	 * as the dependency isn't handled by the initcall infrastructure.
+	 */
+	if (IS_BUILTIN(CONFIG_KVM_AMD) && sev_module_init())
 		goto out;
 
 	/* Retrieve SEV CPUID information */
@@ -3140,21 +3232,27 @@ out:
 		}
 	}
 
+	if (sev_supported && min_sev_asid <= max_sev_asid)
+		vm_types |= BIT(KVM_X86_SEV_VM);
+	if (sev_es_supported && min_sev_es_asid <= max_sev_es_asid)
+		vm_types |= BIT(KVM_X86_SEV_ES_VM);
+	if (sev_snp_supported)
+		vm_types |= BIT(KVM_X86_SNP_VM);
+	vm_types &= sev_firmware_supported_vm_types();
+
+	kvm_caps.supported_vm_types |= vm_types;
+
 	if (boot_cpu_has(X86_FEATURE_SEV))
 		pr_info("SEV %s (ASIDs %u - %u)\n",
-			sev_supported ? min_sev_asid <= max_sev_asid ? "enabled" :
-								       "unusable" :
-								       "disabled",
+			sev_str_feature_state(sev_supported, vm_types & BIT(KVM_X86_SEV_VM)),
 			min_sev_asid, max_sev_asid);
 	if (boot_cpu_has(X86_FEATURE_SEV_ES))
 		pr_info("SEV-ES %s (ASIDs %u - %u)\n",
-			sev_es_supported ? min_sev_es_asid <= max_sev_es_asid ? "enabled" :
-										"unusable" :
-										"disabled",
+			sev_str_feature_state(sev_es_supported, vm_types & BIT(KVM_X86_SEV_ES_VM)),
 			min_sev_es_asid, max_sev_es_asid);
 	if (boot_cpu_has(X86_FEATURE_SEV_SNP))
 		pr_info("SEV-SNP %s (ASIDs %u - %u)\n",
-			str_enabled_disabled(sev_snp_supported),
+			sev_str_feature_state(sev_snp_supported, vm_types & BIT(KVM_X86_SNP_VM)),
 			min_snp_asid, max_snp_asid);
 
 	sev_enabled = sev_supported;
@@ -3246,42 +3344,17 @@ void sev_guest_memory_reclaimed(struct kvm *kvm)
 	 * With SNP+gmem, private/encrypted memory is unreachable via the
 	 * hva-based mmu notifiers, i.e. these events are explicitly scoped to
 	 * shared pages, where there's no need to flush caches.
+	 *
+	 * Checking for SEV+ outside of kvm->lock is safe as __sev_guest_init()
+	 * can only be done before vCPUs are created, caches can be incoherent
+	 * if and only if a vCPU was run, and either this task will see the VM
+	 * as being SEV+ or the vCPU won't be to access the memory (because of
+	 * the in-progress invalidation).
 	 */
-	if (!sev_guest(kvm) || sev_snp_guest(kvm))
+	if (!____sev_guest(kvm) || ____sev_snp_guest(kvm))
 		return;
 
 	sev_writeback_caches(kvm);
-}
-
-void sev_free_vcpu(struct kvm_vcpu *vcpu)
-{
-	struct vcpu_svm *svm;
-
-	if (!sev_es_guest(vcpu->kvm))
-		return;
-
-	svm = to_svm(vcpu);
-
-	/*
-	 * If it's an SNP guest, then the VMSA was marked in the RMP table as
-	 * a guest-owned page. Transition the page to hypervisor state before
-	 * releasing it back to the system.
-	 */
-	if (sev_snp_guest(vcpu->kvm)) {
-		u64 pfn = __pa(svm->sev_es.vmsa) >> PAGE_SHIFT;
-
-		if (kvm_rmp_make_shared(vcpu->kvm, pfn, PG_LEVEL_4K))
-			goto skip_vmsa_free;
-	}
-
-	if (vcpu->arch.guest_state_protected)
-		sev_flush_encrypted_page(vcpu, svm->sev_es.vmsa);
-
-	__free_page(virt_to_page(svm->sev_es.vmsa));
-
-skip_vmsa_free:
-	if (svm->sev_es.ghcb_sa_free)
-		kvfree(svm->sev_es.ghcb_sa);
 }
 
 static void dump_ghcb(struct vcpu_svm *svm)
@@ -3381,146 +3454,75 @@ static void sev_es_sync_from_ghcb(struct vcpu_svm *svm)
 	memset(ghcb->save.valid_bitmap, 0, sizeof(ghcb->save.valid_bitmap));
 }
 
-static int sev_es_validate_vmgexit(struct vcpu_svm *svm)
+static bool sev_es_are_required_ghcb_fields_valid(struct vcpu_svm *svm)
 {
 	struct vmcb_control_area *control = &svm->vmcb->control;
 	struct kvm_vcpu *vcpu = &svm->vcpu;
-	u64 reason;
-
-	/* Only GHCB Usage code 0 is supported */
-	if (svm->sev_es.ghcb->ghcb_usage) {
-		reason = GHCB_ERR_INVALID_USAGE;
-		goto vmgexit_err;
-	}
-
-	reason = GHCB_ERR_MISSING_INPUT;
 
 	if (!kvm_ghcb_sw_exit_code_is_valid(svm) ||
 	    !kvm_ghcb_sw_exit_info_1_is_valid(svm) ||
 	    !kvm_ghcb_sw_exit_info_2_is_valid(svm))
-		goto vmgexit_err;
+		return false;
 
 	switch (control->exit_code) {
-	case SVM_EXIT_READ_DR7:
-		break;
 	case SVM_EXIT_WRITE_DR7:
-		if (!kvm_ghcb_rax_is_valid(svm))
-			goto vmgexit_err;
-		break;
-	case SVM_EXIT_RDTSC:
-		break;
+		return kvm_ghcb_rax_is_valid(svm);
 	case SVM_EXIT_RDPMC:
-		if (!kvm_ghcb_rcx_is_valid(svm))
-			goto vmgexit_err;
-		break;
+		return kvm_ghcb_rcx_is_valid(svm);
 	case SVM_EXIT_CPUID:
 		if (!kvm_ghcb_rax_is_valid(svm) ||
 		    !kvm_ghcb_rcx_is_valid(svm))
-			goto vmgexit_err;
-		if (vcpu->arch.regs[VCPU_REGS_RAX] == 0xd)
-			if (!kvm_ghcb_xcr0_is_valid(svm))
-				goto vmgexit_err;
-		break;
-	case SVM_EXIT_INVD:
-		break;
+			return false;
+
+		return vcpu->arch.regs[VCPU_REGS_RAX] != 0xd ||
+		       kvm_ghcb_xcr0_is_valid(svm);
 	case SVM_EXIT_IOIO:
-		if (control->exit_info_1 & SVM_IOIO_STR_MASK) {
-			if (!kvm_ghcb_sw_scratch_is_valid(svm))
-				goto vmgexit_err;
-		} else {
-			if (!(control->exit_info_1 & SVM_IOIO_TYPE_MASK))
-				if (!kvm_ghcb_rax_is_valid(svm))
-					goto vmgexit_err;
-		}
-		break;
+		if (control->exit_info_1 & SVM_IOIO_STR_MASK)
+			return kvm_ghcb_sw_scratch_is_valid(svm);
+
+		if (!(control->exit_info_1 & SVM_IOIO_TYPE_MASK))
+			return kvm_ghcb_rax_is_valid(svm);
+
+		return true;
 	case SVM_EXIT_MSR:
 		if (!kvm_ghcb_rcx_is_valid(svm))
-			goto vmgexit_err;
-		if (control->exit_info_1) {
-			if (!kvm_ghcb_rax_is_valid(svm) ||
-			    !kvm_ghcb_rdx_is_valid(svm))
-				goto vmgexit_err;
-		}
-		break;
+			return false;
+
+		return !control->exit_info_1 ||
+		       (kvm_ghcb_rax_is_valid(svm) && kvm_ghcb_rdx_is_valid(svm));
 	case SVM_EXIT_VMMCALL:
-		if (!kvm_ghcb_rax_is_valid(svm) ||
-		    !kvm_ghcb_cpl_is_valid(svm))
-			goto vmgexit_err;
-		break;
-	case SVM_EXIT_RDTSCP:
-		break;
-	case SVM_EXIT_WBINVD:
-		break;
+		return kvm_ghcb_rax_is_valid(svm) && kvm_ghcb_cpl_is_valid(svm);
 	case SVM_EXIT_MONITOR:
-		if (!kvm_ghcb_rax_is_valid(svm) ||
-		    !kvm_ghcb_rcx_is_valid(svm) ||
-		    !kvm_ghcb_rdx_is_valid(svm))
-			goto vmgexit_err;
-		break;
+		return kvm_ghcb_rax_is_valid(svm) &&
+		       kvm_ghcb_rcx_is_valid(svm) &&
+		       kvm_ghcb_rdx_is_valid(svm);
 	case SVM_EXIT_MWAIT:
-		if (!kvm_ghcb_rax_is_valid(svm) ||
-		    !kvm_ghcb_rcx_is_valid(svm))
-			goto vmgexit_err;
+		return kvm_ghcb_rax_is_valid(svm) && kvm_ghcb_rcx_is_valid(svm);
+	case SVM_VMGEXIT_AP_CREATION:
+		return kvm_ghcb_rax_is_valid(svm) ||
+		       lower_32_bits(control->exit_info_1) == SVM_VMGEXIT_AP_DESTROY;
 		break;
 	case SVM_VMGEXIT_MMIO_READ:
 	case SVM_VMGEXIT_MMIO_WRITE:
-		if (!kvm_ghcb_sw_scratch_is_valid(svm))
-			goto vmgexit_err;
-		break;
-	case SVM_VMGEXIT_AP_CREATION:
-		if (!sev_snp_guest(vcpu->kvm))
-			goto vmgexit_err;
-		if (lower_32_bits(control->exit_info_1) != SVM_VMGEXIT_AP_DESTROY)
-			if (!kvm_ghcb_rax_is_valid(svm))
-				goto vmgexit_err;
-		break;
-	case SVM_VMGEXIT_NMI_COMPLETE:
-	case SVM_VMGEXIT_AP_HLT_LOOP:
-	case SVM_VMGEXIT_AP_JUMP_TABLE:
-	case SVM_VMGEXIT_UNSUPPORTED_EVENT:
-	case SVM_VMGEXIT_HV_FEATURES:
-	case SVM_VMGEXIT_TERM_REQUEST:
-		break;
 	case SVM_VMGEXIT_PSC:
-		if (!sev_snp_guest(vcpu->kvm) || !kvm_ghcb_sw_scratch_is_valid(svm))
-			goto vmgexit_err;
-		break;
-	case SVM_VMGEXIT_GUEST_REQUEST:
-	case SVM_VMGEXIT_EXT_GUEST_REQUEST:
-		if (!sev_snp_guest(vcpu->kvm) ||
-		    !PAGE_ALIGNED(control->exit_info_1) ||
-		    !PAGE_ALIGNED(control->exit_info_2) ||
-		    control->exit_info_1 == control->exit_info_2)
-			goto vmgexit_err;
-		break;
+		return kvm_ghcb_sw_scratch_is_valid(svm);
 	default:
-		reason = GHCB_ERR_INVALID_EVENT;
-		goto vmgexit_err;
+		return true;
+	}
+}
+
+static void __sev_es_unmap_ghcb(struct vcpu_svm *svm)
+{
+	if (svm->sev_es.ghcb_sa_free) {
+		kvfree(svm->sev_es.ghcb_sa);
+		svm->sev_es.ghcb_sa = NULL;
+		svm->sev_es.ghcb_sa_free = false;
 	}
 
-	return 0;
-
-vmgexit_err:
-	/*
-	 * Print the exit code even though it may not be marked valid as it
-	 * could help with debugging.
-	 */
-	if (reason == GHCB_ERR_INVALID_USAGE) {
-		vcpu_unimpl(vcpu, "vmgexit: ghcb usage %#x is not valid\n",
-			    svm->sev_es.ghcb->ghcb_usage);
-	} else if (reason == GHCB_ERR_INVALID_EVENT) {
-		vcpu_unimpl(vcpu, "vmgexit: exit code %#llx is not valid\n",
-			    control->exit_code);
-	} else {
-		vcpu_unimpl(vcpu, "vmgexit: exit code %#llx input is not valid\n",
-			    control->exit_code);
-		dump_ghcb(svm);
+	if (svm->sev_es.ghcb) {
+		kvm_vcpu_unmap(&svm->vcpu, &svm->sev_es.ghcb_map);
+		svm->sev_es.ghcb = NULL;
 	}
-
-	svm_vmgexit_bad_input(svm, reason);
-
-	/* Resume the guest to "return" the error code. */
-	return 1;
 }
 
 void sev_es_unmap_ghcb(struct vcpu_svm *svm)
@@ -3531,37 +3533,58 @@ void sev_es_unmap_ghcb(struct vcpu_svm *svm)
 	if (!svm->sev_es.ghcb)
 		return;
 
-	if (svm->sev_es.ghcb_sa_free) {
-		/*
-		 * The scratch area lives outside the GHCB, so there is a
-		 * buffer that, depending on the operation performed, may
-		 * need to be synced, then freed.
-		 */
-		if (svm->sev_es.ghcb_sa_sync) {
-			kvm_write_guest(svm->vcpu.kvm,
-					svm->sev_es.sw_scratch,
-					svm->sev_es.ghcb_sa,
-					svm->sev_es.ghcb_sa_len);
-			svm->sev_es.ghcb_sa_sync = false;
-		}
-
-		kvfree(svm->sev_es.ghcb_sa);
-		svm->sev_es.ghcb_sa = NULL;
-		svm->sev_es.ghcb_sa_free = false;
+	/*
+	 * If the scratch area lives outside the GHCB, there's a buffer that,
+	 * depending on the operation performed, may need to be synced.
+	 */
+	if (svm->sev_es.ghcb_sa_sync) {
+		kvm_write_guest(svm->vcpu.kvm, svm->sev_es.sw_scratch,
+				svm->sev_es.ghcb_sa, svm->sev_es.ghcb_sa_len);
+		svm->sev_es.ghcb_sa_sync = false;
 	}
 
 	trace_kvm_vmgexit_exit(svm->vcpu.vcpu_id, svm->sev_es.ghcb);
 
 	sev_es_sync_to_ghcb(svm);
 
-	kvm_vcpu_unmap(&svm->vcpu, &svm->sev_es.ghcb_map);
-	svm->sev_es.ghcb = NULL;
+	__sev_es_unmap_ghcb(svm);
+}
+
+void sev_free_vcpu(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_svm *svm;
+
+	if (!is_sev_es_guest(vcpu))
+		return;
+
+	svm = to_svm(vcpu);
+
+	/*
+	 * If it's an SNP guest, then the VMSA was marked in the RMP table as
+	 * a guest-owned page. Transition the page to hypervisor state before
+	 * releasing it back to the system.
+	 */
+	if (is_sev_snp_guest(vcpu)) {
+		u64 pfn = __pa(svm->sev_es.vmsa) >> PAGE_SHIFT;
+
+		if (kvm_rmp_make_shared(vcpu->kvm, pfn, PG_LEVEL_4K))
+			goto skip_vmsa_free;
+	}
+
+	if (vcpu->arch.guest_state_protected)
+		sev_flush_encrypted_page(vcpu, svm->sev_es.vmsa);
+
+	__free_page(virt_to_page(svm->sev_es.vmsa));
+
+skip_vmsa_free:
+	__sev_es_unmap_ghcb(svm);
 }
 
 int pre_sev_run(struct vcpu_svm *svm, int cpu)
 {
 	struct svm_cpu_data *sd = per_cpu_ptr(&svm_data, cpu);
-	struct kvm *kvm = svm->vcpu.kvm;
+	struct kvm_vcpu *vcpu = &svm->vcpu;
+	struct kvm *kvm = vcpu->kvm;
 	unsigned int asid = sev_get_asid(kvm);
 
 	/*
@@ -3569,7 +3592,7 @@ int pre_sev_run(struct vcpu_svm *svm, int cpu)
 	 * VMSA, e.g. if userspace forces the vCPU to be RUNNABLE after an SNP
 	 * AP Destroy event.
 	 */
-	if (sev_es_guest(kvm) && !VALID_PAGE(svm->vmcb->control.vmsa_pa))
+	if (is_sev_es_guest(vcpu) && !VALID_PAGE(svm->vmcb->control.vmsa_pa))
 		return -EINVAL;
 
 	/*
@@ -3601,12 +3624,15 @@ int pre_sev_run(struct vcpu_svm *svm, int cpu)
 }
 
 #define GHCB_SCRATCH_AREA_LIMIT		(16ULL * PAGE_SIZE)
-static int setup_vmgexit_scratch(struct vcpu_svm *svm, bool sync, u64 len)
+static int setup_vmgexit_scratch(struct vcpu_svm *svm, bool sync, u64 min_len)
 {
 	struct vmcb_control_area *control = &svm->vmcb->control;
 	u64 ghcb_scratch_beg, ghcb_scratch_end;
 	u64 scratch_gpa_beg, scratch_gpa_end;
 	void *scratch_va;
+
+	if (WARN_ON_ONCE(!min_len))
+		goto e_scratch;
 
 	scratch_gpa_beg = svm->sev_es.sw_scratch;
 	if (!scratch_gpa_beg) {
@@ -3614,12 +3640,14 @@ static int setup_vmgexit_scratch(struct vcpu_svm *svm, bool sync, u64 len)
 		goto e_scratch;
 	}
 
-	scratch_gpa_end = scratch_gpa_beg + len;
+	scratch_gpa_end = scratch_gpa_beg + min_len;
 	if (scratch_gpa_end < scratch_gpa_beg) {
 		pr_err("vmgexit: scratch length (%#llx) not valid for scratch address (%#llx)\n",
-		       len, scratch_gpa_beg);
+		       min_len, scratch_gpa_beg);
 		goto e_scratch;
 	}
+
+	WARN_ON_ONCE(svm->sev_es.ghcb_sa_sync || svm->sev_es.ghcb_sa_free);
 
 	if ((scratch_gpa_beg & PAGE_MASK) == control->ghcb_gpa) {
 		/* Scratch area begins within GHCB */
@@ -3641,21 +3669,29 @@ static int setup_vmgexit_scratch(struct vcpu_svm *svm, bool sync, u64 len)
 
 		scratch_va = (void *)svm->sev_es.ghcb;
 		scratch_va += (scratch_gpa_beg - control->ghcb_gpa);
+
+		svm->sev_es.ghcb_sa_sync = false;
+		svm->sev_es.ghcb_sa_free = false;
+		svm->sev_es.ghcb_sa_len = ghcb_scratch_end - scratch_gpa_beg;
 	} else {
+		/* GHCB v2 requires the scratch area to be within the GHCB. */
+		if (to_kvm_sev_info(svm->vcpu.kvm)->ghcb_version >= 2)
+			goto e_scratch;
+
 		/*
 		 * The guest memory must be read into a kernel buffer, so
 		 * limit the size
 		 */
-		if (len > GHCB_SCRATCH_AREA_LIMIT) {
+		if (min_len > GHCB_SCRATCH_AREA_LIMIT) {
 			pr_err("vmgexit: scratch area exceeds KVM limits (%#llx requested, %#llx limit)\n",
-			       len, GHCB_SCRATCH_AREA_LIMIT);
+			       min_len, GHCB_SCRATCH_AREA_LIMIT);
 			goto e_scratch;
 		}
-		scratch_va = kvzalloc(len, GFP_KERNEL_ACCOUNT);
+		scratch_va = kvzalloc(min_len, GFP_KERNEL_ACCOUNT);
 		if (!scratch_va)
 			return -ENOMEM;
 
-		if (kvm_read_guest(svm->vcpu.kvm, scratch_gpa_beg, scratch_va, len)) {
+		if (kvm_read_guest(svm->vcpu.kvm, scratch_gpa_beg, scratch_va, min_len)) {
 			/* Unable to copy scratch area from guest */
 			pr_err("vmgexit: kvm_read_guest for scratch area failed\n");
 
@@ -3671,11 +3707,10 @@ static int setup_vmgexit_scratch(struct vcpu_svm *svm, bool sync, u64 len)
 		 */
 		svm->sev_es.ghcb_sa_sync = sync;
 		svm->sev_es.ghcb_sa_free = true;
+		svm->sev_es.ghcb_sa_len = min_len;
 	}
 
 	svm->sev_es.ghcb_sa = scratch_va;
-	svm->sev_es.ghcb_sa_len = len;
-
 	return 0;
 
 e_scratch:
@@ -3720,9 +3755,13 @@ static int snp_rmptable_psmash(kvm_pfn_t pfn)
 
 static int snp_complete_psc_msr(struct kvm_vcpu *vcpu)
 {
+	u64 hypercall_ret = READ_ONCE(vcpu->run->hypercall.ret);
 	struct vcpu_svm *svm = to_svm(vcpu);
 
-	if (vcpu->run->hypercall.ret)
+	if (!kvm_is_valid_map_gpa_range_ret(hypercall_ret))
+		return -EINVAL;
+
+	if (hypercall_ret)
 		set_ghcb_msr(svm, GHCB_MSR_PSC_RESP_ERROR);
 	else
 		set_ghcb_msr(svm, GHCB_MSR_PSC_RESP);
@@ -3772,13 +3811,11 @@ struct psc_buffer {
 	struct psc_entry entries[];
 } __packed;
 
-static int snp_begin_psc(struct vcpu_svm *svm, struct psc_buffer *psc);
+static int snp_do_psc(struct vcpu_svm *svm);
 
 static void snp_complete_psc(struct vcpu_svm *svm, u64 psc_ret)
 {
-	svm->sev_es.psc_inflight = 0;
-	svm->sev_es.psc_idx = 0;
-	svm->sev_es.psc_2m = false;
+	memset(&svm->sev_es.psc, 0, sizeof(svm->sev_es.psc));
 
 	/*
 	 * PSC requests always get a "no action" response in SW_EXITINFO1, with
@@ -3791,9 +3828,8 @@ static void snp_complete_psc(struct vcpu_svm *svm, u64 psc_ret)
 
 static void __snp_complete_one_psc(struct vcpu_svm *svm)
 {
-	struct psc_buffer *psc = svm->sev_es.ghcb_sa;
-	struct psc_entry *entries = psc->entries;
-	struct psc_hdr *hdr = &psc->hdr;
+	struct vcpu_sev_es_state *sev_es = &svm->sev_es;
+	struct psc_buffer *guest_psc = sev_es->ghcb_sa;
 	__u16 idx;
 
 	/*
@@ -3801,22 +3837,26 @@ static void __snp_complete_one_psc(struct vcpu_svm *svm)
 	 * corresponding entries in the guest's PSC buffer and zero out the
 	 * count of in-flight PSC entries.
 	 */
-	for (idx = svm->sev_es.psc_idx; svm->sev_es.psc_inflight;
-	     svm->sev_es.psc_inflight--, idx++) {
-		struct psc_entry *entry = &entries[idx];
+	for (idx = sev_es->psc.cur_idx; sev_es->psc.batch_size;
+	     sev_es->psc.batch_size--, idx++) {
+		struct psc_entry entry = READ_ONCE(guest_psc->entries[idx]);
 
-		entry->cur_page = entry->pagesize ? 512 : 1;
+		guest_psc->entries[idx].cur_page = entry.pagesize ? 512 : 1;
 	}
 
-	hdr->cur_entry = idx;
+	sev_es->psc.cur_idx = idx;
+	guest_psc->hdr.cur_entry = idx;
 }
 
 static int snp_complete_one_psc(struct kvm_vcpu *vcpu)
 {
+	u64 hypercall_ret = READ_ONCE(vcpu->run->hypercall.ret);
 	struct vcpu_svm *svm = to_svm(vcpu);
-	struct psc_buffer *psc = svm->sev_es.ghcb_sa;
 
-	if (vcpu->run->hypercall.ret) {
+	if (!kvm_is_valid_map_gpa_range_ret(hypercall_ret))
+		return -EINVAL;
+
+	if (hypercall_ret) {
 		snp_complete_psc(svm, VMGEXIT_PSC_ERROR_GENERIC);
 		return 1; /* resume guest */
 	}
@@ -3824,48 +3864,30 @@ static int snp_complete_one_psc(struct kvm_vcpu *vcpu)
 	__snp_complete_one_psc(svm);
 
 	/* Handle the next range (if any). */
-	return snp_begin_psc(svm, psc);
+	return snp_do_psc(svm);
 }
 
-static int snp_begin_psc(struct vcpu_svm *svm, struct psc_buffer *psc)
+static int snp_do_psc(struct vcpu_svm *svm)
 {
-	struct psc_entry *entries = psc->entries;
+	struct vcpu_sev_es_state *sev_es = &svm->sev_es;
+	struct psc_buffer *guest_psc = sev_es->ghcb_sa;
 	struct kvm_vcpu *vcpu = &svm->vcpu;
-	struct psc_hdr *hdr = &psc->hdr;
 	struct psc_entry entry_start;
-	u16 idx, idx_start, idx_end;
 	int npages;
 	bool huge;
 	u64 gfn;
-
-	if (!user_exit_on_hypercall(vcpu->kvm, KVM_HC_MAP_GPA_RANGE)) {
-		snp_complete_psc(svm, VMGEXIT_PSC_ERROR_GENERIC);
-		return 1;
-	}
+	u16 idx;
 
 next_range:
 	/* There should be no other PSCs in-flight at this point. */
-	if (WARN_ON_ONCE(svm->sev_es.psc_inflight)) {
+	if (WARN_ON_ONCE(svm->sev_es.psc.batch_size)) {
 		snp_complete_psc(svm, VMGEXIT_PSC_ERROR_GENERIC);
-		return 1;
-	}
-
-	/*
-	 * The PSC descriptor buffer can be modified by a misbehaved guest after
-	 * validation, so take care to only use validated copies of values used
-	 * for things like array indexing.
-	 */
-	idx_start = hdr->cur_entry;
-	idx_end = hdr->end_entry;
-
-	if (idx_end >= VMGEXIT_PSC_MAX_COUNT) {
-		snp_complete_psc(svm, VMGEXIT_PSC_ERROR_INVALID_HDR);
 		return 1;
 	}
 
 	/* Find the start of the next range which needs processing. */
-	for (idx = idx_start; idx <= idx_end; idx++, hdr->cur_entry++) {
-		entry_start = entries[idx];
+	for (idx = sev_es->psc.cur_idx; idx <= sev_es->psc.end_idx; idx++) {
+		entry_start = READ_ONCE(guest_psc->entries[idx]);
 
 		gfn = entry_start.gfn;
 		huge = entry_start.pagesize;
@@ -3891,32 +3913,40 @@ next_range:
 
 		if (npages)
 			break;
+
+		/*
+		 * Increment the guest-visible index to communicate the current
+		 * entry back to the guest, e.g. in case of failure.  No need
+		 * for READ_ONCE() as KVM doesn't consume the field, i.e. a
+		 * misbehaving guest can only break itself.
+		 */
+		guest_psc->hdr.cur_entry++;
 	}
 
-	if (idx > idx_end) {
+	if (idx > sev_es->psc.end_idx) {
 		/* Nothing more to process. */
 		snp_complete_psc(svm, 0);
 		return 1;
 	}
 
-	svm->sev_es.psc_2m = huge;
-	svm->sev_es.psc_idx = idx;
-	svm->sev_es.psc_inflight = 1;
+	sev_es->psc.is_2m = huge;
+	sev_es->psc.cur_idx = idx;
+	sev_es->psc.batch_size = 1;
 
 	/*
 	 * Find all subsequent PSC entries that contain adjacent GPA
 	 * ranges/operations and can be combined into a single
 	 * KVM_HC_MAP_GPA_RANGE exit.
 	 */
-	while (++idx <= idx_end) {
-		struct psc_entry entry = entries[idx];
+	while (++idx <= sev_es->psc.end_idx) {
+		struct psc_entry entry = READ_ONCE(guest_psc->entries[idx]);
 
 		if (entry.operation != entry_start.operation ||
 		    entry.gfn != entry_start.gfn + npages ||
 		    entry.cur_page || !!entry.pagesize != huge)
 			break;
 
-		svm->sev_es.psc_inflight++;
+		sev_es->psc.batch_size++;
 		npages += huge ? 512 : 1;
 	}
 
@@ -3956,6 +3986,46 @@ next_range:
 	}
 
 	BUG();
+}
+
+static int snp_begin_psc(struct vcpu_svm *svm)
+{
+	struct vcpu_sev_es_state *sev_es = &svm->sev_es;
+	struct psc_buffer *guest_psc = sev_es->ghcb_sa;
+	u16 max_nr_entries;
+
+	if (!user_exit_on_hypercall(svm->vcpu.kvm, KVM_HC_MAP_GPA_RANGE)) {
+		snp_complete_psc(svm, VMGEXIT_PSC_ERROR_GENERIC);
+		return 1;
+	}
+
+	/*
+	 * GHCB v2 requires the scratch area to reside within the GHCB itself,
+	 * and PSC requests are only supported for GHCB v2+.  Thus it should be
+	 * impossible to exceed the max PSC entry count (which is derived from
+	 * the size of the shared GHCB buffer).
+	 */
+	max_nr_entries = (sev_es->ghcb_sa_len - sizeof(struct psc_hdr)) /
+			 sizeof(struct psc_entry);
+	if (WARN_ON_ONCE(max_nr_entries > VMGEXIT_PSC_MAX_COUNT)) {
+		snp_complete_psc(svm, VMGEXIT_PSC_ERROR_GENERIC);
+		return 1;
+	}
+
+	/*
+	 * The PSC descriptor buffer can be modified by a misbehaved guest after
+	 * validation, so take care to only use validated copies of values used
+	 * for things like array indexing.
+	 */
+	sev_es->psc.cur_idx = READ_ONCE(guest_psc->hdr.cur_entry);
+	sev_es->psc.end_idx = READ_ONCE(guest_psc->hdr.end_entry);
+
+	if (sev_es->psc.end_idx >= max_nr_entries) {
+		snp_complete_psc(svm, VMGEXIT_PSC_ERROR_INVALID_HDR);
+		return 1;
+	}
+
+	return snp_do_psc(svm);
 }
 
 /*
@@ -4115,15 +4185,13 @@ static int snp_handle_guest_req(struct vcpu_svm *svm, gpa_t req_gpa, gpa_t resp_
 	sev_ret_code fw_err = 0;
 	int ret;
 
-	if (!sev_snp_guest(kvm))
+	if (!is_sev_snp_guest(&svm->vcpu))
 		return -EINVAL;
 
-	mutex_lock(&sev->guest_req_mutex);
+	guard(mutex)(&sev->guest_req_mutex);
 
-	if (kvm_read_guest(kvm, req_gpa, sev->guest_req_buf, PAGE_SIZE)) {
-		ret = -EIO;
-		goto out_unlock;
-	}
+	if (kvm_read_guest(kvm, req_gpa, sev->guest_req_buf, PAGE_SIZE))
+		return -EIO;
 
 	data.gctx_paddr = __psp_pa(sev->snp_context);
 	data.req_paddr = __psp_pa(sev->guest_req_buf);
@@ -4136,21 +4204,16 @@ static int snp_handle_guest_req(struct vcpu_svm *svm, gpa_t req_gpa, gpa_t resp_
 	 */
 	ret = sev_issue_cmd(kvm, SEV_CMD_SNP_GUEST_REQUEST, &data, &fw_err);
 	if (ret && !fw_err)
-		goto out_unlock;
+		return ret;
 
-	if (kvm_write_guest(kvm, resp_gpa, sev->guest_resp_buf, PAGE_SIZE)) {
-		ret = -EIO;
-		goto out_unlock;
-	}
+	if (kvm_write_guest(kvm, resp_gpa, sev->guest_resp_buf, PAGE_SIZE))
+		return -EIO;
 
 	/* No action is requested *from KVM* if there was a firmware error. */
 	svm_vmgexit_no_action(svm, SNP_GUEST_ERR(0, fw_err));
 
-	ret = 1; /* resume guest */
-
-out_unlock:
-	mutex_unlock(&sev->guest_req_mutex);
-	return ret;
+	/* resume guest */
+	return 1;
 }
 
 static int snp_req_certs_err(struct vcpu_svm *svm, u32 vmm_error)
@@ -4185,10 +4248,12 @@ static int snp_complete_req_certs(struct kvm_vcpu *vcpu)
 
 static int snp_handle_ext_guest_req(struct vcpu_svm *svm, gpa_t req_gpa, gpa_t resp_gpa)
 {
-	struct kvm *kvm = svm->vcpu.kvm;
+	struct kvm_vcpu *vcpu = &svm->vcpu;
+	struct kvm *kvm = vcpu->kvm;
+
 	u8 msg_type;
 
-	if (!sev_snp_guest(kvm))
+	if (!is_sev_snp_guest(vcpu))
 		return -EINVAL;
 
 	if (kvm_read_guest(kvm, req_gpa + offsetof(struct snp_guest_msg_hdr, msg_type),
@@ -4207,7 +4272,6 @@ static int snp_handle_ext_guest_req(struct vcpu_svm *svm, gpa_t req_gpa, gpa_t r
 	 */
 	if (msg_type == SNP_MSG_REPORT_REQ) {
 		struct kvm_sev_info *sev = &to_kvm_svm(kvm)->sev_info;
-		struct kvm_vcpu *vcpu = &svm->vcpu;
 		u64 data_npages;
 		gpa_t data_gpa;
 
@@ -4324,7 +4388,7 @@ static int sev_handle_vmgexit_msr_protocol(struct vcpu_svm *svm)
 				  GHCB_MSR_INFO_MASK, GHCB_MSR_INFO_POS);
 		break;
 	case GHCB_MSR_PREF_GPA_REQ:
-		if (!sev_snp_guest(vcpu->kvm))
+		if (!is_sev_snp_guest(vcpu))
 			goto out_terminate;
 
 		set_ghcb_msr_bits(svm, GHCB_MSR_PREF_GPA_NONE, GHCB_MSR_GPA_VALUE_MASK,
@@ -4335,7 +4399,7 @@ static int sev_handle_vmgexit_msr_protocol(struct vcpu_svm *svm)
 	case GHCB_MSR_REG_GPA_REQ: {
 		u64 gfn;
 
-		if (!sev_snp_guest(vcpu->kvm))
+		if (!is_sev_snp_guest(vcpu))
 			goto out_terminate;
 
 		gfn = get_ghcb_msr_bits(svm, GHCB_MSR_GPA_VALUE_MASK,
@@ -4350,7 +4414,7 @@ static int sev_handle_vmgexit_msr_protocol(struct vcpu_svm *svm)
 		break;
 	}
 	case GHCB_MSR_PSC_REQ:
-		if (!sev_snp_guest(vcpu->kvm))
+		if (!is_sev_snp_guest(vcpu))
 			goto out_terminate;
 
 		ret = snp_begin_psc_msr(svm, control->ghcb_gpa);
@@ -4388,12 +4452,24 @@ out_terminate:
 	return 0;
 }
 
+static bool is_snp_only_vmgexit(u64 exit_code)
+{
+	switch (exit_code) {
+	case SVM_VMGEXIT_AP_CREATION:
+	case SVM_VMGEXIT_GUEST_REQUEST:
+	case SVM_VMGEXIT_EXT_GUEST_REQUEST:
+	case SVM_VMGEXIT_PSC:
+		return true;
+	default:
+		return false;
+	}
+}
+
 int sev_handle_vmgexit(struct kvm_vcpu *vcpu)
 {
 	struct vcpu_svm *svm = to_svm(vcpu);
 	struct vmcb_control_area *control = &svm->vmcb->control;
 	u64 ghcb_gpa;
-	int ret;
 
 	/* Validate the GHCB */
 	ghcb_gpa = control->ghcb_gpa;
@@ -4423,48 +4499,91 @@ int sev_handle_vmgexit(struct kvm_vcpu *vcpu)
 	sev_es_sync_from_ghcb(svm);
 
 	/* SEV-SNP guest requires that the GHCB GPA must be registered */
-	if (sev_snp_guest(svm->vcpu.kvm) && !ghcb_gpa_is_registered(svm, ghcb_gpa)) {
-		vcpu_unimpl(&svm->vcpu, "vmgexit: GHCB GPA [%#llx] is not registered.\n", ghcb_gpa);
-		return -EINVAL;
+	if (is_sev_snp_guest(vcpu) &&
+	    !ghcb_gpa_is_registered(svm, control->ghcb_gpa)) {
+		vcpu_unimpl(vcpu, "vmgexit: GHCB GPA [%#llx] is not registered.\n",
+			    control->ghcb_gpa);
+		svm_vmgexit_bad_input(svm, GHCB_ERR_NOT_REGISTERED);
+		return 1;
 	}
 
-	ret = sev_es_validate_vmgexit(svm);
-	if (ret)
-		return ret;
+	/* Only GHCB Usage code 0 is supported */
+	if (svm->sev_es.ghcb->ghcb_usage) {
+		vcpu_unimpl(vcpu, "vmgexit: ghcb usage %#x is not valid\n",
+			    svm->sev_es.ghcb->ghcb_usage);
+		svm_vmgexit_bad_input(svm, GHCB_ERR_INVALID_USAGE);
+		return 1;
+	}
+
+	if (is_snp_only_vmgexit(control->exit_code) && !is_sev_snp_guest(vcpu)) {
+		vcpu_unimpl(vcpu, "vmgexit: exit code %#llx is SNP-only\n",
+			    control->exit_code);
+		svm_vmgexit_bad_input(svm, GHCB_ERR_INVALID_EVENT);
+		return 1;
+	}
+
+	if (!sev_es_are_required_ghcb_fields_valid(svm)) {
+		/*
+		 * Print the exit code even though it may not be marked valid
+		 * as it could help with debugging.
+		 */
+		vcpu_unimpl(vcpu, "vmgexit: exit code %#llx input is not valid\n",
+			    control->exit_code);
+		dump_ghcb(svm);
+		svm_vmgexit_bad_input(svm, GHCB_ERR_MISSING_INPUT);
+		return 1;
+	}
 
 	svm_vmgexit_success(svm, 0);
 
 	switch (control->exit_code) {
+	case SVM_EXIT_IOIO:
+		if (!((control->exit_info_1 & SVM_IOIO_SIZE_MASK) >> SVM_IOIO_SIZE_SHIFT))
+			return 1;
+
+		fallthrough;
+	case SVM_EXIT_READ_DR7:
+	case SVM_EXIT_WRITE_DR7:
+	case SVM_EXIT_RDTSC:
+	case SVM_EXIT_RDTSCP:
+	case SVM_EXIT_RDPMC:
+	case SVM_EXIT_CPUID:
+	case SVM_EXIT_INVD:
+	case SVM_EXIT_MSR:
+	case SVM_EXIT_VMMCALL:
+	case SVM_EXIT_WBINVD:
+	case SVM_EXIT_MONITOR:
+	case SVM_EXIT_MWAIT:
+		return svm_invoke_exit_handler(vcpu, control->exit_code);
 	case SVM_VMGEXIT_MMIO_READ:
-		ret = setup_vmgexit_scratch(svm, true, control->exit_info_2);
-		if (ret)
-			break;
+	case SVM_VMGEXIT_MMIO_WRITE: {
+		bool is_write = control->exit_code == SVM_VMGEXIT_MMIO_WRITE;
+		u64 len = control->exit_info_2;
+		int r;
 
-		ret = kvm_sev_es_mmio_read(vcpu,
-					   control->exit_info_1,
-					   control->exit_info_2,
-					   svm->sev_es.ghcb_sa);
-		break;
-	case SVM_VMGEXIT_MMIO_WRITE:
-		ret = setup_vmgexit_scratch(svm, false, control->exit_info_2);
-		if (ret)
-			break;
+		if (!len)
+			return 1;
 
-		ret = kvm_sev_es_mmio_write(vcpu,
-					    control->exit_info_1,
-					    control->exit_info_2,
-					    svm->sev_es.ghcb_sa);
-		break;
+		if (to_kvm_sev_info(vcpu->kvm)->ghcb_version >= 2 && len > 8) {
+			svm_vmgexit_bad_input(svm, GHCB_ERR_INVALID_INPUT);
+			return 1;
+		}
+
+		r = setup_vmgexit_scratch(svm, !is_write, len);
+		if (r)
+			return r;
+
+		return kvm_sev_es_mmio(vcpu, is_write, control->exit_info_1, len,
+				       svm->sev_es.ghcb_sa);
+	}
 	case SVM_VMGEXIT_NMI_COMPLETE:
 		++vcpu->stat.nmi_window_exits;
 		svm->nmi_masked = false;
 		kvm_make_request(KVM_REQ_EVENT, vcpu);
-		ret = 1;
-		break;
+		return 1;
 	case SVM_VMGEXIT_AP_HLT_LOOP:
 		svm->sev_es.ap_reset_hold_type = AP_RESET_HOLD_NAE_EVENT;
-		ret = kvm_emulate_ap_reset_hold(vcpu);
-		break;
+		return kvm_emulate_ap_reset_hold(vcpu);
 	case SVM_VMGEXIT_AP_JUMP_TABLE: {
 		struct kvm_sev_info *sev = to_kvm_sev_info(vcpu->kvm);
 
@@ -4482,14 +4601,11 @@ int sev_handle_vmgexit(struct kvm_vcpu *vcpu)
 			       control->exit_info_1);
 			svm_vmgexit_bad_input(svm, GHCB_ERR_INVALID_INPUT);
 		}
-
-		ret = 1;
-		break;
+		return 1;
 	}
 	case SVM_VMGEXIT_HV_FEATURES:
 		svm_vmgexit_success(svm, GHCB_HV_FT_SUPPORTED);
-		ret = 1;
-		break;
+		return 1;
 	case SVM_VMGEXIT_TERM_REQUEST:
 		pr_info("SEV-ES guest requested termination: reason %#llx info %#llx\n",
 			control->exit_info_1, control->exit_info_2);
@@ -4497,39 +4613,53 @@ int sev_handle_vmgexit(struct kvm_vcpu *vcpu)
 		vcpu->run->system_event.type = KVM_SYSTEM_EVENT_SEV_TERM;
 		vcpu->run->system_event.ndata = 1;
 		vcpu->run->system_event.data[0] = control->ghcb_gpa;
-		break;
-	case SVM_VMGEXIT_PSC:
-		ret = setup_vmgexit_scratch(svm, true, control->exit_info_2);
-		if (ret)
-			break;
+		return 0;
+	case SVM_VMGEXIT_PSC: {
+		int r;
 
-		ret = snp_begin_psc(svm, svm->sev_es.ghcb_sa);
-		break;
+		r = setup_vmgexit_scratch(svm, true, sizeof(struct psc_hdr));
+		if (r)
+			return r;
+
+		return snp_begin_psc(svm);
+	}
 	case SVM_VMGEXIT_AP_CREATION:
-		ret = sev_snp_ap_creation(svm);
-		if (ret) {
+		if (sev_snp_ap_creation(svm))
 			svm_vmgexit_bad_input(svm, GHCB_ERR_INVALID_INPUT);
+		return 1;
+	case SVM_VMGEXIT_GUEST_REQUEST:
+	case SVM_VMGEXIT_EXT_GUEST_REQUEST:
+		if (!PAGE_ALIGNED(control->exit_info_1) ||
+		    !PAGE_ALIGNED(control->exit_info_2) ||
+		    control->exit_info_1 == control->exit_info_2) {
+			svm_vmgexit_bad_input(svm, GHCB_ERR_INVALID_INPUT);
+			return 1;
 		}
 
-		ret = 1;
-		break;
-	case SVM_VMGEXIT_GUEST_REQUEST:
-		ret = snp_handle_guest_req(svm, control->exit_info_1, control->exit_info_2);
-		break;
-	case SVM_VMGEXIT_EXT_GUEST_REQUEST:
-		ret = snp_handle_ext_guest_req(svm, control->exit_info_1, control->exit_info_2);
-		break;
+		if (control->exit_code == SVM_VMGEXIT_GUEST_REQUEST)
+			return snp_handle_guest_req(svm, control->exit_info_1,
+						    control->exit_info_2);
+
+		return snp_handle_ext_guest_req(svm, control->exit_info_1,
+						control->exit_info_2);
 	case SVM_VMGEXIT_UNSUPPORTED_EVENT:
+		/*
+		 * Note, the _guest_ is reporting an unsupported #VC, i.e. this
+		 * isn't the same thing as KVM getting an unsupported #VMGEXIT.
+		 */
 		vcpu_unimpl(vcpu,
 			    "vmgexit: unsupported event - exit_info_1=%#llx, exit_info_2=%#llx\n",
 			    control->exit_info_1, control->exit_info_2);
-		ret = -EINVAL;
-		break;
+		return -EINVAL;
 	default:
-		ret = svm_invoke_exit_handler(vcpu, control->exit_code);
+		vcpu_unimpl(vcpu, "vmgexit: exit code %#llx is not valid\n",
+			    control->exit_code);
+		svm_vmgexit_bad_input(svm, GHCB_ERR_INVALID_EVENT);
+		return 1;
 	}
 
-	return ret;
+	KVM_BUG_ON(1, vcpu->kvm);
+	return -EIO;
 }
 
 int sev_es_string_io(struct vcpu_svm *svm, int size, unsigned int port, int in)
@@ -4544,6 +4674,9 @@ int sev_es_string_io(struct vcpu_svm *svm, int size, unsigned int port, int in)
 	count = svm->vmcb->control.exit_info_2;
 	if (unlikely(check_mul_overflow(count, size, &bytes)))
 		return -EINVAL;
+
+	if (!bytes)
+		return 1;
 
 	r = setup_vmgexit_scratch(svm, in, bytes);
 	if (r)
@@ -4601,7 +4734,7 @@ static void sev_es_init_vmcb(struct vcpu_svm *svm, bool init_event)
 	struct kvm_sev_info *sev = to_kvm_sev_info(svm->vcpu.kvm);
 	struct vmcb *vmcb = svm->vmcb01.ptr;
 
-	svm->vmcb->control.nested_ctl |= SVM_NESTED_CTL_SEV_ES_ENABLE;
+	svm->vmcb->control.misc_ctl |= SVM_MISC_ENABLE_SEV_ES;
 
 	/*
 	 * An SEV-ES guest requires a VMSA area that is a separate from the
@@ -4641,7 +4774,7 @@ static void sev_es_init_vmcb(struct vcpu_svm *svm, bool init_event)
 	if (!sev_vcpu_has_debug_swap(svm)) {
 		vmcb_set_intercept(&vmcb->control, INTERCEPT_DR7_READ);
 		vmcb_set_intercept(&vmcb->control, INTERCEPT_DR7_WRITE);
-		recalc_intercepts(svm);
+		svm_mark_intercepts_dirty(svm);
 	} else {
 		/*
 		 * Disable #DB intercept iff DebugSwap is enabled.  KVM doesn't
@@ -4672,7 +4805,7 @@ void sev_init_vmcb(struct vcpu_svm *svm, bool init_event)
 {
 	struct kvm_vcpu *vcpu = &svm->vcpu;
 
-	svm->vmcb->control.nested_ctl |= SVM_NESTED_CTL_SEV_ENABLE;
+	svm->vmcb->control.misc_ctl |= SVM_MISC_ENABLE_SEV;
 	clr_exception_intercept(svm, UD_VECTOR);
 
 	/*
@@ -4681,10 +4814,10 @@ void sev_init_vmcb(struct vcpu_svm *svm, bool init_event)
 	 */
 	clr_exception_intercept(svm, GP_VECTOR);
 
-	if (init_event && sev_snp_guest(vcpu->kvm))
+	if (init_event && is_sev_snp_guest(vcpu))
 		sev_snp_init_protected_guest_state(vcpu);
 
-	if (sev_es_guest(vcpu->kvm))
+	if (is_sev_es_guest(vcpu))
 		sev_es_init_vmcb(svm, init_event);
 }
 
@@ -4695,7 +4828,7 @@ int sev_vcpu_create(struct kvm_vcpu *vcpu)
 
 	mutex_init(&svm->sev_es.snp_vmsa_mutex);
 
-	if (!sev_es_guest(vcpu->kvm))
+	if (!is_sev_es_guest(vcpu))
 		return 0;
 
 	/*
@@ -4715,8 +4848,6 @@ int sev_vcpu_create(struct kvm_vcpu *vcpu)
 
 void sev_es_prepare_switch_to_guest(struct vcpu_svm *svm, struct sev_es_save_area *hostsa)
 {
-	struct kvm *kvm = svm->vcpu.kvm;
-
 	/*
 	 * All host state for SEV-ES guests is categorized into three swap types
 	 * based on how it is handled by hardware during a world switch:
@@ -4755,7 +4886,8 @@ void sev_es_prepare_switch_to_guest(struct vcpu_svm *svm, struct sev_es_save_are
 	 * loaded with the correct values *if* the CPU writes the MSRs.
 	 */
 	if (sev_vcpu_has_debug_swap(svm) ||
-	    (sev_snp_guest(kvm) && cpu_feature_enabled(X86_FEATURE_DEBUG_SWAP))) {
+	    (cpu_feature_enabled(X86_FEATURE_DEBUG_SWAP) &&
+	     is_sev_snp_guest(&svm->vcpu))) {
 		hostsa->dr0_addr_mask = amd_get_dr_addr_mask(0);
 		hostsa->dr1_addr_mask = amd_get_dr_addr_mask(1);
 		hostsa->dr2_addr_mask = amd_get_dr_addr_mask(2);
@@ -5119,7 +5251,7 @@ struct vmcb_save_area *sev_decrypt_vmsa(struct kvm_vcpu *vcpu)
 	int error = 0;
 	int ret;
 
-	if (!sev_es_guest(vcpu->kvm))
+	if (!is_sev_es_guest(vcpu))
 		return NULL;
 
 	/*
@@ -5132,7 +5264,7 @@ struct vmcb_save_area *sev_decrypt_vmsa(struct kvm_vcpu *vcpu)
 	sev = to_kvm_sev_info(vcpu->kvm);
 
 	/* Check if the SEV policy allows debugging */
-	if (sev_snp_guest(vcpu->kvm)) {
+	if (is_sev_snp_guest(vcpu)) {
 		if (!(sev->policy & SNP_POLICY_MASK_DEBUG))
 			return NULL;
 	} else {
@@ -5140,7 +5272,7 @@ struct vmcb_save_area *sev_decrypt_vmsa(struct kvm_vcpu *vcpu)
 			return NULL;
 	}
 
-	if (sev_snp_guest(vcpu->kvm)) {
+	if (is_sev_snp_guest(vcpu)) {
 		struct sev_data_snp_dbg dbg = {0};
 
 		vmsa = snp_alloc_firmware_page(__GFP_ZERO);

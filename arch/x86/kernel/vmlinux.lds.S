@@ -66,7 +66,18 @@ const_pcpu_hot = pcpu_hot;
 
 #define ALIGN_ENTRY_TEXT_BEGIN	. = ALIGN(PMD_SIZE);
 #define ALIGN_ENTRY_TEXT_END	. = ALIGN(PMD_SIZE);
+#else
 
+#define X86_ALIGN_RODATA_BEGIN
+#define X86_ALIGN_RODATA_END					\
+		. = ALIGN(PAGE_SIZE);				\
+		__end_rodata_aligned = .;
+
+#define ALIGN_ENTRY_TEXT_BEGIN
+#define ALIGN_ENTRY_TEXT_END
+#endif
+
+#ifdef CONFIG_AMD_MEM_ENCRYPT
 /*
  * This section contains data which will be mapped as decrypted. Memory
  * encryption operates on a page basis. Make this section PMD-aligned
@@ -87,17 +98,9 @@ const_pcpu_hot = pcpu_hot;
 	__pi___end_bss_decrypted = .;				\
 
 #else
-
-#define X86_ALIGN_RODATA_BEGIN
-#define X86_ALIGN_RODATA_END					\
-		. = ALIGN(PAGE_SIZE);				\
-		__end_rodata_aligned = .;
-
-#define ALIGN_ENTRY_TEXT_BEGIN
-#define ALIGN_ENTRY_TEXT_END
 #define BSS_DECRYPTED
-
 #endif
+
 #if defined(CONFIG_X86_64) && defined(CONFIG_KEXEC_CORE)
 #define KEXEC_RELOCATE_KERNEL					\
 	. = ALIGN(0x100);					\
@@ -145,8 +148,6 @@ SECTIONS
 #endif
 		ALIGN_ENTRY_TEXT_END
 
-		/* bootstrapping code */
-		HEAD_TEXT
 		TEXT_TEXT
 		SCHED_TEXT
 		LOCK_TEXT
@@ -221,6 +222,8 @@ SECTIONS
 	 */
 	.altinstr_aux : AT(ADDR(.altinstr_aux) - LOAD_OFFSET) {
 		*(.altinstr_aux)
+		. = ALIGN(PAGE_SIZE);
+		__inittext_end = .;
 	}
 
 	INIT_DATA_SECTION(16)
@@ -528,3 +531,5 @@ xen_elfnote_entry_value =
 xen_elfnote_phys32_entry_value =
 	ABSOLUTE(xen_elfnote_phys32_entry) + ABSOLUTE(pvh_start_xen - LOAD_OFFSET);
 #endif
+
+#include "../boot/startup/exports.h"

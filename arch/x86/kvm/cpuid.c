@@ -11,7 +11,7 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/kvm_host.h>
-#include "linux/lockdep.h"
+#include <linux/lockdep.h>
 #include <linux/export.h>
 #include <linux/vmalloc.h>
 #include <linux/uaccess.h>
@@ -602,7 +602,7 @@ int kvm_vcpu_ioctl_set_cpuid(struct kvm_vcpu *vcpu,
 		if (IS_ERR(e))
 			return PTR_ERR(e);
 
-		e2 = kvmalloc_array(cpuid->nent, sizeof(*e2), GFP_KERNEL_ACCOUNT);
+		e2 = kvmalloc_objs(*e2, cpuid->nent, GFP_KERNEL_ACCOUNT);
 		if (!e2) {
 			r = -ENOMEM;
 			goto out_free_cpuid;
@@ -1246,11 +1246,12 @@ void kvm_initialize_cpu_caps(void)
 		F(NULL_SEL_CLR_BASE),
 		/* UpperAddressIgnore */
 		F(AUTOIBRS),
-		F(PREFETCHI),
 		EMULATED_F(NO_SMM_CTL_MSR),
 		/* PrefetchCtlMsr */
-		/* GpOnUserCpuid */
+		EMULATED_F(GP_ON_USER_CPUID),
 		/* EPSF */
+		F(PREFETCHI),
+		F(AVX512_BMM),
 		F(ERAPS),
 		SYNTHESIZED_F(SBPB),
 		SYNTHESIZED_F(IBPB_BRTYPE),
@@ -1994,7 +1995,7 @@ int kvm_dev_ioctl_get_cpuid(struct kvm_cpuid2 *cpuid,
 	if (sanity_check_entries(entries, cpuid->nent, type))
 		return -EINVAL;
 
-	array.entries = kvcalloc(cpuid->nent, sizeof(struct kvm_cpuid_entry2), GFP_KERNEL);
+	array.entries = kvzalloc_objs(struct kvm_cpuid_entry2, cpuid->nent);
 	if (!array.entries)
 		return -ENOMEM;
 
@@ -2160,16 +2161,18 @@ int kvm_emulate_cpuid(struct kvm_vcpu *vcpu)
 {
 	u32 eax, ebx, ecx, edx;
 
-	if (cpuid_fault_enabled(vcpu) && !kvm_require_cpl(vcpu, 0))
+	if (!kvm_is_cpuid_allowed(vcpu)) {
+		kvm_queue_exception_e(vcpu, GP_VECTOR, 0);
 		return 1;
+	}
 
-	eax = kvm_rax_read(vcpu);
-	ecx = kvm_rcx_read(vcpu);
+	eax = kvm_eax_read(vcpu);
+	ecx = kvm_ecx_read(vcpu);
 	kvm_cpuid(vcpu, &eax, &ebx, &ecx, &edx, false);
-	kvm_rax_write(vcpu, eax);
-	kvm_rbx_write(vcpu, ebx);
-	kvm_rcx_write(vcpu, ecx);
-	kvm_rdx_write(vcpu, edx);
+	kvm_eax_write(vcpu, eax);
+	kvm_ebx_write(vcpu, ebx);
+	kvm_ecx_write(vcpu, ecx);
+	kvm_edx_write(vcpu, edx);
 	return kvm_skip_emulated_instruction(vcpu);
 }
 EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_emulate_cpuid);

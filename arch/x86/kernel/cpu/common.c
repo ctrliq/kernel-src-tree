@@ -70,6 +70,7 @@
 #include <asm/traps.h>
 #include <asm/sev.h>
 #include <asm/tdx.h>
+#include <asm/virt.h>
 #include <asm/posted_intr.h>
 #include <asm/runtime-const.h>
 
@@ -411,7 +412,20 @@ out:
 
 /* These bits should not change their value after CPU init is finished. */
 static const unsigned long cr4_pinned_mask = X86_CR4_SMEP | X86_CR4_SMAP | X86_CR4_UMIP |
-					     X86_CR4_FSGSBASE | X86_CR4_CET | X86_CR4_FRED;
+					     X86_CR4_FSGSBASE | X86_CR4_CET;
+
+/*
+ * The CR pinning protects against ROP on the 'mov %reg, %CRn' instruction(s).
+ * Since you can ROP directly to these instructions (barring shadow stack),
+ * any protection must follow immediately and unconditionally after that.
+ *
+ * Specifically, the CR[04] write functions below will have the value
+ * validation controlled by the @cr_pinning static_branch which is
+ * __ro_after_init, just like the cr4_pinned_bits value.
+ *
+ * Once set, an attacker will have to defeat page-tables to get around these
+ * restrictions. Which is a much bigger ask than 'simple' ROP.
+ */
 static DEFINE_STATIC_KEY_FALSE_RO(cr_pinning);
 static unsigned long cr4_pinned_bits __ro_after_init;
 
@@ -2083,6 +2097,7 @@ static __init void identify_boot_cpu(void)
 	cpu_detect_tlb(&boot_cpu_data);
 	setup_cr_pinning();
 
+	x86_virt_init();
 	tsx_init();
 	tdx_init();
 	lkgs_init();
