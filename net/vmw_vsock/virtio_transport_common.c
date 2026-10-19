@@ -78,8 +78,7 @@ static int virtio_transport_fill_skb(struct sk_buff *skb,
 {
 	if (zcopy)
 		return __zerocopy_sg_from_iter(info->msg, NULL, skb,
-					       &info->msg->msg_iter,
-					       len);
+					       &info->msg->msg_iter, len, NULL);
 
 	return memcpy_from_msg(skb_put(skb, len), info->msg, len);
 }
@@ -362,7 +361,7 @@ static int virtio_transport_send_pkt_info(struct vsock_sock *vsk,
 
 			if (!uarg) {
 				uarg = msg_zerocopy_realloc(sk_vsock(vsk),
-							    pkt_len, NULL);
+							    pkt_len, NULL, false);
 				if (!uarg) {
 					virtio_transport_put_credit(vvs, pkt_len);
 					return -ENOMEM;
