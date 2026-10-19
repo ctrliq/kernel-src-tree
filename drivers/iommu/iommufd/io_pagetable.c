@@ -1513,7 +1513,7 @@ int iopt_table_enforce_dev_resv_regions(struct io_pagetable *iopt,
 		return -EINVAL;
 
 	down_write(&iopt->iova_rwsem);
-	/* FIXME: drivers allocate memory but there is no failure propogated */
+	/* FIXME: drivers allocate memory but there is no failure propagated */
 	iommu_get_resv_regions(dev, &resv_regions);
 
 	list_for_each_entry(resv, &resv_regions, list) {

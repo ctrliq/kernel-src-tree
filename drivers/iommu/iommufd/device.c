@@ -989,7 +989,7 @@ out_put_pt_obj:
  * iommufd_device_attach - Connect a device/pasid to an iommu_domain
  * @idev: device to attach
  * @pasid: pasid to attach
- * @pt_id: Input a IOMMUFD_OBJ_IOAS, or IOMMUFD_OBJ_HWPT_PAGING
+ * @pt_id: Input an IOMMUFD_OBJ_IOAS, or IOMMUFD_OBJ_HWPT_PAGING
  *         Output the IOMMUFD_OBJ_HWPT_PAGING ID
  *
  * This connects the device/pasid to an iommu_domain, either automatically
@@ -1022,7 +1022,7 @@ EXPORT_SYMBOL_NS_GPL(iommufd_device_attach, "IOMMUFD");
  * iommufd_device_replace - Change the device/pasid's iommu_domain
  * @idev: device to change
  * @pasid: pasid to change
- * @pt_id: Input a IOMMUFD_OBJ_IOAS, or IOMMUFD_OBJ_HWPT_PAGING
+ * @pt_id: Input an IOMMUFD_OBJ_IOAS, or IOMMUFD_OBJ_HWPT_PAGING
  *         Output the IOMMUFD_OBJ_HWPT_PAGING ID
  *
  * This is the same as::
@@ -1044,7 +1044,7 @@ int iommufd_device_replace(struct iommufd_device *idev, ioasid_t pasid,
 EXPORT_SYMBOL_NS_GPL(iommufd_device_replace, "IOMMUFD");
 
 /**
- * iommufd_device_detach - Disconnect a device/device to an iommu_domain
+ * iommufd_device_detach - Disconnect a device/pasid from an iommu_domain
  * @idev: device to detach
  * @pasid: pasid to detach
  *
