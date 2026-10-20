@@ -1,0 +1,155 @@
+gfs2: Asynchronous withdraw
+
+jira KERNEL-1773
+Rebuild_History Non-Buildable kernel-4.18.0-553.176.1.el8_10
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 9c4a3de6cd5b46aa743c460b86eb58fe5f93daec
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.176.1.el8_10/9c4a3de6.failed
+
+So far, withdraws are carried out in the context of the calling task.
+When another task tries to withdraw while a withdraw is already
+underway, that task blocks as well.  Change that to carry out withdraws
+asynchronously in workqueue context and don't block the task triggering
+the withdraw anymore.
+
+Fixes: syzbot+6b156e132970e550194c@syzkaller.appspotmail.com
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 9c4a3de6cd5b46aa743c460b86eb58fe5f93daec)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/super.c
+#	fs/gfs2/util.c
+diff --cc fs/gfs2/super.c
+index c74b3d154d4f,ea9084e871a8..000000000000
+--- a/fs/gfs2/super.c
++++ b/fs/gfs2/super.c
+@@@ -622,12 -594,16 +622,17 @@@ restart
+  	}
+  	spin_unlock(&sdp->sd_jindex_spin);
+  
+ -	if (!sb_rdonly(sb))
+ +	if (!sb_rdonly(sb)) {
+  		gfs2_make_fs_ro(sdp);
+ -	else {
+ -		if (gfs2_withdrawing_or_withdrawn(sdp))
+ -			gfs2_destroy_threads(sdp);
+ -
+ -		gfs2_quota_cleanup(sdp);
+  	}
+++<<<<<<< HEAD
+ +	if (gfs2_withdrawn(sdp))
+ +		gfs2_quota_cleanup(sdp);
+ +	WARN_ON(gfs2_withdrawing(sdp));
+++=======
++ 
++ 	flush_work(&sdp->sd_withdraw_work);
+++>>>>>>> 9c4a3de6cd5b (gfs2: Asynchronous withdraw)
+  
+  	/*  At this point, we're through modifying the disk  */
+  
+diff --cc fs/gfs2/util.c
+index f3c05996480d,c454bea101de..000000000000
+--- a/fs/gfs2/util.c
++++ b/fs/gfs2/util.c
+@@@ -327,41 -338,21 +348,53 @@@ void gfs2_withdraw(struct gfs2_sbd *sdp
+  	if (sdp->sd_args.ar_errors == GFS2_ERRORS_WITHDRAW) {
+  		unsigned long old = READ_ONCE(sdp->sd_flags), new;
+  
+++<<<<<<< HEAD
+ +		for (;;) {
+ +			unsigned long ret;
+ +
+ +			if (old & BIT(SDF_WITHDRAWN)) {
+ +				wait_on_bit(&sdp->sd_flags,
+ +					    SDF_WITHDRAW_IN_PROG,
+ +					    TASK_UNINTERRUPTIBLE);
+++=======
++ 		do {
++ 			if (old & BIT(SDF_WITHDRAWN))
+++>>>>>>> 9c4a3de6cd5b (gfs2: Asynchronous withdraw)
+  				return;
+- 			}
+  			new = old | BIT(SDF_WITHDRAWN) | BIT(SDF_WITHDRAW_IN_PROG);
+ -		} while (unlikely(!try_cmpxchg(&sdp->sd_flags, &old, new)));
+ +			ret = cmpxchg(&sdp->sd_flags, old, new);
+ +			if (ret == old)
+ +				break;
+ +			old = ret;
+ +		}
+ +
+++<<<<<<< HEAD
+ +		fs_err(sdp, "about to withdraw this file system\n");
+ +		BUG_ON(sdp->sd_args.ar_debug);
+ +
+ +		signal_our_withdraw(sdp);
+ +
+ +		kobject_uevent(&sdp->sd_kobj, KOBJ_OFFLINE);
+  
+ +		if (!strcmp(sdp->sd_lockstruct.ls_ops->lm_proto_name, "lock_dlm"))
+ +			wait_for_completion(&sdp->sd_wdack);
+ +
+ +		if (lm->lm_unmount) {
+ +			fs_err(sdp, "telling LM to unmount\n");
+ +			lm->lm_unmount(sdp);
+ +		}
+ +		fs_err(sdp, "File system withdrawn\n");
+++=======
+++>>>>>>> 9c4a3de6cd5b (gfs2: Asynchronous withdraw)
+  		dump_stack();
+- 		clear_bit(SDF_WITHDRAW_IN_PROG, &sdp->sd_flags);
+- 		smp_mb__after_atomic();
+- 		wake_up_bit(&sdp->sd_flags, SDF_WITHDRAW_IN_PROG);
++ 		/*
++ 		 * There is no need to withdraw when the superblock hasn't been
++ 		 * fully initialized, yet.
++ 		 */
++ 		if (!(sdp->sd_vfs->s_flags & SB_BORN))
++ 			return;
++ 		fs_err(sdp, "about to withdraw this file system\n");
++ 		schedule_work(&sdp->sd_withdraw_work);
+  	}
+  
+  	if (sdp->sd_args.ar_errors == GFS2_ERRORS_PANIC)
+diff --git a/fs/gfs2/incore.h b/fs/gfs2/incore.h
+index ab08ee9f43ad..19058cca27ce 100644
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@ -725,6 +725,7 @@ struct gfs2_sbd {
+ 	struct gfs2_glock *sd_rename_gl;
+ 	struct gfs2_glock *sd_freeze_gl;
+ 	struct work_struct sd_freeze_work;
++	struct work_struct sd_withdraw_work;
+ 	wait_queue_head_t sd_kill_wait;
+ 	wait_queue_head_t sd_async_glock_wait;
+ 	atomic_t sd_glock_disposal;
+diff --git a/fs/gfs2/ops_fstype.c b/fs/gfs2/ops_fstype.c
+index cc25f07c2640..468dea775ced 100644
+--- a/fs/gfs2/ops_fstype.c
++++ b/fs/gfs2/ops_fstype.c
+@@ -1198,6 +1198,8 @@ static int gfs2_fill_super(struct super_block *sb, struct fs_context *fc)
+ 	if (error)
+ 		goto fail_debug;
+ 
++	INIT_WORK(&sdp->sd_withdraw_work, gfs2_withdraw_func);
++
+ 	error = init_locking(sdp, &mount_gh, DO);
+ 	if (error)
+ 		goto fail_lm;
+* Unmerged path fs/gfs2/super.c
+* Unmerged path fs/gfs2/util.c
+diff --git a/fs/gfs2/util.h b/fs/gfs2/util.h
+index 6e423a24aa9e..60f29bf5b39a 100644
+--- a/fs/gfs2/util.h
++++ b/fs/gfs2/util.h
+@@ -230,6 +230,8 @@ gfs2_tune_get_i(&(sdp)->sd_tune, &(sdp)->sd_tune.field)
+ 
+ __printf(2, 3)
+ void gfs2_lm(struct gfs2_sbd *sdp, const char *fmt, ...);
++
++void gfs2_withdraw_func(struct work_struct *work);
+ void gfs2_withdraw(struct gfs2_sbd *sdp);
+ 
+ #endif /* __UTIL_DOT_H__ */
