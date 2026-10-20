@@ -1,0 +1,364 @@
+gfs2: New gfs2_withdraw_helper
+
+jira KERNEL-1773
+Rebuild_History Non-Buildable kernel-4.18.0-553.176.1.el8_10
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit bbbf1529ea9b85072e58c164a9a5d82554ffa941
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.176.1.el8_10/bbbf1529.failed
+
+Currently, when a gfs2 filesystem is withdrawn, an "offline" uevent is
+triggered that invokes gfs2-util's gfs2_withdraw_helper script.  The
+purpose of this script is to deactivate the filesystem's block device so
+that it can be withdrawn immediately, even before all the filesystem's
+caches have been discarded.  The script provided by gfs2-utils never did
+anything useful, and there was no way for it to report back its status
+to the kernel.
+
+To fix that, extend the gfs2_withdraw_helper mechanism so that the
+script can report one of the following results by writing the
+corresponding value into "/sys$DEVPATH/lock_module/withdraw":
+
+ 0 - The shared block device has been marked inactive.  Future write
+     operations will fail.
+
+ 1 - The shared block device may still be active and carry out
+     write operations.
+
+If the "offline" uevent isn't reacted upon within the timeout configured
+in /sys$DEVPATH/tune/withdraw_helper_timeout (default 5 seconds), the
+event handler is assumed to have failed.
+
+In addition, add an additional "errors=deactivate" mount option.
+
+With these changes, if fatal errors are detected on a gfs2 filesystem
+and the filesystem is mounted with the "errors=panic" option, the kernel
+will panic immediately.  Otherwise, an attempt will be made to
+deactivate the underlying block device.  If successful, the kernel will
+release all cluster-wide locks immediately so that the rest of the
+cluster can continue.  If unsuccessful, the kernel will either panic
+("errors=deactivate"), or it will purge all filesystem I/O before
+releasing all cluster-wide locks ("errors=withdraw").
+
+Note that the gfs2_withdraw_helper script still needs to be fixed to
+take advantage of these improvements.  It could be changed to use a
+mechanism like LVM Persistent Reservations.  "dmsetup suspend" is not a
+suitable mechanism as it infinitely postpones I/O operations, which may
+prevent withdraw from completing.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit bbbf1529ea9b85072e58c164a9a5d82554ffa941)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/util.c
+diff --cc fs/gfs2/util.c
+index b79e16246358,ff63070ed6de..000000000000
+--- a/fs/gfs2/util.c
++++ b/fs/gfs2/util.c
+@@@ -309,49 -171,104 +309,137 @@@ void gfs2_lm(struct gfs2_sbd *sdp, cons
+  	va_end(args);
+  }
+  
+++<<<<<<< HEAD
+ +void gfs2_withdraw(struct gfs2_sbd *sdp)
+++=======
++ /**
++  * gfs2_offline_uevent - run gfs2_withdraw_helper
++  * @sdp: The GFS2 superblock
++  */
++ static bool gfs2_offline_uevent(struct gfs2_sbd *sdp)
++ {
++ 	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
++ 	long timeout;
++ 
++ 	/* Skip protocol "lock_nolock" which doesn't require shared storage. */
++ 	if (!ls->ls_ops->lm_lock)
++ 		return false;
++ 
++ 	/*
++ 	 * The gfs2_withdraw_helper replies by writing one of the following
++ 	 * status codes to "/sys$DEVPATH/lock_module/withdraw":
++ 	 *
++ 	 * 0 - The shared block device has been marked inactive.  Future write
++ 	 *     operations will fail.
++ 	 *
++ 	 * 1 - The shared block device may still be active and carry out
++ 	 *     write operations.
++ 	 *
++ 	 * If the "offline" uevent isn't reacted upon in time, the event
++ 	 * handler is assumed to have failed.
++ 	 */
++ 
++ 	sdp->sd_withdraw_helper_status = -1;
++ 	kobject_uevent(&sdp->sd_kobj, KOBJ_OFFLINE);
++ 	timeout = gfs2_tune_get(sdp, gt_withdraw_helper_timeout) * HZ;
++ 	wait_for_completion_timeout(&sdp->sd_withdraw_helper, timeout);
++ 	if (sdp->sd_withdraw_helper_status == -1) {
++ 		fs_err(sdp, "%s timed out\n", "gfs2_withdraw_helper");
++ 	} else {
++ 		fs_err(sdp, "%s %s with status %d\n",
++ 		       "gfs2_withdraw_helper",
++ 		       sdp->sd_withdraw_helper_status == 0 ?
++ 		       "succeeded" : "failed",
++ 		       sdp->sd_withdraw_helper_status);
++ 	}
++ 	return sdp->sd_withdraw_helper_status == 0;
++ }
++ 
++ void gfs2_withdraw_func(struct work_struct *work)
+++>>>>>>> bbbf1529ea9b (gfs2: New gfs2_withdraw_helper)
+  {
+ -	struct gfs2_sbd *sdp = container_of(work, struct gfs2_sbd, sd_withdraw_work);
+  	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
+  	const struct lm_lockops *lm = ls->ls_ops;
++ 	bool device_inactive;
+  
+++<<<<<<< HEAD
+ +	if (sdp->sd_args.ar_errors == GFS2_ERRORS_WITHDRAW) {
+ +		unsigned long old = READ_ONCE(sdp->sd_flags), new;
+ +
+ +		for (;;) {
+ +			unsigned long ret;
+ +
+ +			if (old & BIT(SDF_WITHDRAWN)) {
+ +				wait_on_bit(&sdp->sd_flags,
+ +					    SDF_WITHDRAW_IN_PROG,
+ +					    TASK_UNINTERRUPTIBLE);
+ +				return;
+ +			}
+ +			new = old | BIT(SDF_WITHDRAWN) | BIT(SDF_WITHDRAW_IN_PROG);
+ +			ret = cmpxchg(&sdp->sd_flags, old, new);
+ +			if (ret == old)
+ +				break;
+ +			old = ret;
+ +		}
+++=======
++ 	if (test_bit(SDF_KILL, &sdp->sd_flags))
++ 		return;
++ 
++ 	BUG_ON(sdp->sd_args.ar_debug);
++ 
++ 	/*
++ 	 * Try to deactivate the shared block device so that no more I/O will
++ 	 * go through.  If successful, we can immediately trigger remote
++ 	 * recovery.  Otherwise, we must first empty out all our local caches.
++ 	 */
++ 
++ 	device_inactive = gfs2_offline_uevent(sdp);
++ 
++ 	if (sdp->sd_args.ar_errors == GFS2_ERRORS_DEACTIVATE && !device_inactive)
++ 		panic("GFS2: fsid=%s: panic requested\n", sdp->sd_fsname);
++ 
++ 	if (lm->lm_unmount) {
++ 		if (device_inactive) {
++ 			lm->lm_unmount(sdp, false);
++ 			do_withdraw(sdp);
++ 		} else {
++ 			do_withdraw(sdp);
++ 			lm->lm_unmount(sdp, false);
++ 		}
++ 	} else {
++ 		do_withdraw(sdp);
++ 	}
++ 
++ 	fs_err(sdp, "file system withdrawn\n");
++ }
++ 
++ void gfs2_withdraw(struct gfs2_sbd *sdp)
++ {
++ 	if (sdp->sd_args.ar_errors == GFS2_ERRORS_WITHDRAW ||
++ 	    sdp->sd_args.ar_errors == GFS2_ERRORS_DEACTIVATE) {
++ 		if (test_and_set_bit(SDF_WITHDRAWN, &sdp->sd_flags))
++ 			return;
+++>>>>>>> bbbf1529ea9b (gfs2: New gfs2_withdraw_helper)
+  
+ -		dump_stack();
+ -		/*
+ -		 * There is no need to withdraw when the superblock hasn't been
+ -		 * fully initialized, yet.
+ -		 */
+ -		if (!(sdp->sd_vfs->s_flags & SB_BORN))
+ -			return;
+  		fs_err(sdp, "about to withdraw this file system\n");
+ -		schedule_work(&sdp->sd_withdraw_work);
+ -		return;
+ +		BUG_ON(sdp->sd_args.ar_debug);
+ +
+ +		signal_our_withdraw(sdp);
+ +
+ +		kobject_uevent(&sdp->sd_kobj, KOBJ_OFFLINE);
+ +
+ +		if (!strcmp(sdp->sd_lockstruct.ls_ops->lm_proto_name, "lock_dlm"))
+ +			wait_for_completion(&sdp->sd_wdack);
+ +
+ +		if (lm->lm_unmount) {
+ +			fs_err(sdp, "telling LM to unmount\n");
+ +			lm->lm_unmount(sdp);
+ +		}
+ +		fs_err(sdp, "File system withdrawn\n");
+ +		dump_stack();
+ +		clear_bit(SDF_WITHDRAW_IN_PROG, &sdp->sd_flags);
+ +		smp_mb__after_atomic();
+ +		wake_up_bit(&sdp->sd_flags, SDF_WITHDRAW_IN_PROG);
+  	}
+  
+  	if (sdp->sd_args.ar_errors == GFS2_ERRORS_PANIC)
+diff --git a/fs/gfs2/incore.h b/fs/gfs2/incore.h
+index 445946dcd461..f03ed0471f3c 100644
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@ -550,8 +550,7 @@ struct gfs2_statfs_change_host {
+ 
+ #define GFS2_ERRORS_DEFAULT     GFS2_ERRORS_WITHDRAW
+ #define GFS2_ERRORS_WITHDRAW    0
+-#define GFS2_ERRORS_CONTINUE    1 /* place holder for future feature */
+-#define GFS2_ERRORS_RO          2 /* place holder for future feature */
++#define GFS2_ERRORS_DEACTIVATE  1
+ #define GFS2_ERRORS_PANIC       3
+ 
+ struct gfs2_args {
+@@ -567,7 +566,7 @@ struct gfs2_args {
+ 	unsigned int ar_data:2;			/* ordered/writeback */
+ 	unsigned int ar_meta:1;			/* mount metafs */
+ 	unsigned int ar_discard:1;		/* discard requests */
+-	unsigned int ar_errors:2;               /* errors=withdraw | panic */
++	unsigned int ar_errors:2;               /* errors=withdraw | deactivate | panic */
+ 	unsigned int ar_nobarrier:1;            /* do not send barriers */
+ 	unsigned int ar_rgrplvb:1;		/* use lvbs for rgrp info */
+ 	unsigned int ar_loccookie:1;		/* use location based readdir
+@@ -592,6 +591,7 @@ struct gfs2_tune {
+ 	unsigned int gt_complain_secs;
+ 	unsigned int gt_statfs_quantum;
+ 	unsigned int gt_statfs_slow;
++	unsigned int gt_withdraw_helper_timeout;
+ };
+ 
+ enum {
+@@ -727,7 +727,8 @@ struct gfs2_sbd {
+ 	wait_queue_head_t sd_async_glock_wait;
+ 	atomic_t sd_glock_disposal;
+ 	struct completion sd_locking_init;
+-	struct completion sd_wdack;
++	struct completion sd_withdraw_helper;
++	int sd_withdraw_helper_status;
+ 	struct delayed_work sd_control_work;
+ 
+ 	/* Inode Stuff */
+diff --git a/fs/gfs2/ops_fstype.c b/fs/gfs2/ops_fstype.c
+index 0b89614c4cbc..3d4c6746b6b1 100644
+--- a/fs/gfs2/ops_fstype.c
++++ b/fs/gfs2/ops_fstype.c
+@@ -62,6 +62,7 @@ static void gfs2_tune_init(struct gfs2_tune *gt)
+ 	gt->gt_new_files_jdata = 0;
+ 	gt->gt_max_readahead = BIT(18);
+ 	gt->gt_complain_secs = 10;
++	gt->gt_withdraw_helper_timeout = 5;
+ }
+ 
+ void free_sbd(struct gfs2_sbd *sdp)
+@@ -94,7 +95,7 @@ static struct gfs2_sbd *init_sbd(struct super_block *sb)
+ 	init_waitqueue_head(&sdp->sd_async_glock_wait);
+ 	atomic_set(&sdp->sd_glock_disposal, 0);
+ 	init_completion(&sdp->sd_locking_init);
+-	init_completion(&sdp->sd_wdack);
++	init_completion(&sdp->sd_withdraw_helper);
+ 	spin_lock_init(&sdp->sd_statfs_spin);
+ 
+ 	spin_lock_init(&sdp->sd_rindex_spin);
+@@ -1385,12 +1386,14 @@ static const struct constant_table gfs2_param_data[] = {
+ };
+ 
+ enum opt_errors {
+-	Opt_errors_withdraw = GFS2_ERRORS_WITHDRAW,
+-	Opt_errors_panic    = GFS2_ERRORS_PANIC,
++	Opt_errors_withdraw   = GFS2_ERRORS_WITHDRAW,
++	Opt_errors_deactivate = GFS2_ERRORS_DEACTIVATE,
++	Opt_errors_panic      = GFS2_ERRORS_PANIC,
+ };
+ 
+ static const struct constant_table gfs2_param_errors[] = {
+ 	{"withdraw",   Opt_errors_withdraw },
++	{"deactivate", Opt_errors_deactivate },
+ 	{"panic",      Opt_errors_panic },
+ 	{}
+ };
+diff --git a/fs/gfs2/super.c b/fs/gfs2/super.c
+index c74b3d154d4f..4fa22cecac1d 100644
+--- a/fs/gfs2/super.c
++++ b/fs/gfs2/super.c
+@@ -1173,6 +1173,9 @@ static int gfs2_show_options(struct seq_file *s, struct dentry *root)
+ 		case GFS2_ERRORS_WITHDRAW:
+ 			state = "withdraw";
+ 			break;
++		case GFS2_ERRORS_DEACTIVATE:
++			state = "deactivate";
++			break;
+ 		case GFS2_ERRORS_PANIC:
+ 			state = "panic";
+ 			break;
+diff --git a/fs/gfs2/sys.c b/fs/gfs2/sys.c
+index 9f82c4c581ce..c8eabb8045d9 100644
+--- a/fs/gfs2/sys.c
++++ b/fs/gfs2/sys.c
+@@ -429,26 +429,20 @@ static ssize_t block_store(struct gfs2_sbd *sdp, const char *buf, size_t len)
+ 	return len;
+ }
+ 
+-static ssize_t wdack_show(struct gfs2_sbd *sdp, char *buf)
+-{
+-	int val = completion_done(&sdp->sd_wdack) ? 1 : 0;
+-
+-	return sprintf(buf, "%d\n", val);
+-}
+-
+-static ssize_t wdack_store(struct gfs2_sbd *sdp, const char *buf, size_t len)
++static ssize_t withdraw_helper_status_store(struct gfs2_sbd *sdp,
++					    const char *buf,
++					    size_t len)
+ {
+ 	int ret, val;
+ 
+ 	ret = kstrtoint(buf, 0, &val);
+ 	if (ret)
+ 		return ret;
+-
+-	if ((val == 1) &&
+-	    !strcmp(sdp->sd_lockstruct.ls_ops->lm_proto_name, "lock_dlm"))
+-		complete(&sdp->sd_wdack);
+-	else
++	if (val < 0 || val > 1)
+ 		return -EINVAL;
++
++	sdp->sd_withdraw_helper_status = val;
++	complete(&sdp->sd_withdraw_helper);
+ 	return len;
+ }
+ 
+@@ -595,7 +589,7 @@ static struct gfs2_attr gdlm_attr_##_name = __ATTR(_name,_mode,_show,_store)
+ 
+ GDLM_ATTR(proto_name,		0444, proto_name_show,		NULL);
+ GDLM_ATTR(block,		0644, block_show,		block_store);
+-GDLM_ATTR(withdraw,		0644, wdack_show,		wdack_store);
++GDLM_ATTR(withdraw,		0200, NULL,			withdraw_helper_status_store);
+ GDLM_ATTR(jid,			0644, jid_show,			jid_store);
+ GDLM_ATTR(first,		0644, lkfirst_show,		lkfirst_store);
+ GDLM_ATTR(first_done,		0444, first_done_show,		NULL);
+@@ -694,6 +688,7 @@ TUNE_ATTR(statfs_slow, 0);
+ TUNE_ATTR(new_files_jdata, 0);
+ TUNE_ATTR(statfs_quantum, 1);
+ TUNE_ATTR_3(quota_scale, quota_scale_show, quota_scale_store);
++TUNE_ATTR(withdraw_helper_timeout, 1);
+ 
+ static struct attribute *tune_attrs[] = {
+ 	&tune_attr_quota_warn_period.attr,
+@@ -704,6 +699,7 @@ static struct attribute *tune_attrs[] = {
+ 	&tune_attr_statfs_quantum.attr,
+ 	&tune_attr_quota_scale.attr,
+ 	&tune_attr_new_files_jdata.attr,
++	&tune_attr_withdraw_helper_timeout.attr,
+ 	NULL,
+ };
+ 
+* Unmerged path fs/gfs2/util.c
