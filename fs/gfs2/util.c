@@ -380,8 +380,8 @@ void gfs2_assert_withdraw_i(struct gfs2_sbd *sdp, char *assertion,
 		return;
 
 	fs_err(sdp,
-	       "fatal: assertion \"%s\" failed\n"
-	       "   function = %s, file = %s, line = %u\n",
+	       "fatal: assertion \"%s\" failed - "
+	       "function = %s, file = %s, line = %u\n",
 	       assertion, function, file, line);
 
 	/*
@@ -411,7 +411,8 @@ void gfs2_assert_warn_i(struct gfs2_sbd *sdp, char *assertion,
 		return;
 
 	if (sdp->sd_args.ar_errors == GFS2_ERRORS_WITHDRAW)
-		fs_warn(sdp, "warning: assertion \"%s\" failed at function = %s, file = %s, line = %u\n",
+		fs_warn(sdp, "warning: assertion \"%s\" failed - "
+			"function = %s, file = %s, line = %u\n",
 			assertion, function, file, line);
 
 	if (sdp->sd_args.ar_debug)
@@ -420,10 +421,10 @@ void gfs2_assert_warn_i(struct gfs2_sbd *sdp, char *assertion,
 		dump_stack();
 
 	if (sdp->sd_args.ar_errors == GFS2_ERRORS_PANIC)
-		panic("GFS2: fsid=%s: warning: assertion \"%s\" failed\n"
-		      "GFS2: fsid=%s:   function = %s, file = %s, line = %u\n",
+		panic("GFS2: fsid=%s: warning: assertion \"%s\" failed - "
+		      "function = %s, file = %s, line = %u\n",
 		      sdp->sd_fsname, assertion,
-		      sdp->sd_fsname, function, file, line);
+		      function, file, line);
 
 	sdp->sd_last_warning = jiffies;
 }
@@ -436,7 +437,8 @@ void gfs2_consist_i(struct gfs2_sbd *sdp, const char *function,
 		    char *file, unsigned int line)
 {
 	gfs2_lm(sdp,
-		"fatal: filesystem consistency error - function = %s, file = %s, line = %u\n",
+		"fatal: filesystem consistency error - "
+		"function = %s, file = %s, line = %u\n",
 		function, file, line);
 	gfs2_withdraw(sdp);
 }
@@ -451,9 +453,9 @@ void gfs2_consist_inode_i(struct gfs2_inode *ip,
 	struct gfs2_sbd *sdp = GFS2_SB(&ip->i_inode);
 
 	gfs2_lm(sdp,
-		"fatal: filesystem consistency error\n"
-		"  inode = %llu %llu\n"
-		"  function = %s, file = %s, line = %u\n",
+		"fatal: filesystem consistency error - "
+		"inode = %llu %llu, "
+		"function = %s, file = %s, line = %u\n",
 		(unsigned long long)ip->i_no_formal_ino,
 		(unsigned long long)ip->i_no_addr,
 		function, file, line);
@@ -473,9 +475,9 @@ void gfs2_consist_rgrpd_i(struct gfs2_rgrpd *rgd,
 	sprintf(fs_id_buf, "fsid=%s: ", sdp->sd_fsname);
 	gfs2_rgrp_dump(NULL, rgd, fs_id_buf);
 	gfs2_lm(sdp,
-		"fatal: filesystem consistency error\n"
-		"  RG = %llu\n"
-		"  function = %s, file = %s, line = %u\n",
+		"fatal: filesystem consistency error - "
+		"RG = %llu, "
+		"function = %s, file = %s, line = %u\n",
 		(unsigned long long)rgd->rd_addr,
 		function, file, line);
 	gfs2_withdraw(sdp);
@@ -492,9 +494,9 @@ int gfs2_meta_check_ii(struct gfs2_sbd *sdp, struct buffer_head *bh,
 		       unsigned int line)
 {
 	gfs2_lm(sdp,
-		"fatal: invalid metadata block\n"
-		"  bh = %llu (%s)\n"
-		"  function = %s, file = %s, line = %u\n",
+		"fatal: invalid metadata block - "
+		"bh = %llu (%s), "
+		"function = %s, file = %s, line = %u\n",
 		(unsigned long long)bh->b_blocknr, type,
 		function, file, line);
 	gfs2_withdraw(sdp);
@@ -512,9 +514,9 @@ int gfs2_metatype_check_ii(struct gfs2_sbd *sdp, struct buffer_head *bh,
 			   char *file, unsigned int line)
 {
 	gfs2_lm(sdp,
-		"fatal: invalid metadata block\n"
-		"  bh = %llu (type: exp=%u, found=%u)\n"
-		"  function = %s, file = %s, line = %u\n",
+		"fatal: invalid metadata block - "
+		"bh = %llu (type: exp=%u, found=%u), "
+		"function = %s, file = %s, line = %u\n",
 		(unsigned long long)bh->b_blocknr, type, t,
 		function, file, line);
 	gfs2_withdraw(sdp);
@@ -531,8 +533,8 @@ int gfs2_io_error_i(struct gfs2_sbd *sdp, const char *function, char *file,
 		    unsigned int line)
 {
 	gfs2_lm(sdp,
-		"fatal: I/O error\n"
-		"  function = %s, file = %s, line = %u\n",
+		"fatal: I/O error - "
+		"function = %s, file = %s, line = %u\n",
 		function, file, line);
 	gfs2_withdraw(sdp);
 	return -1;
@@ -550,9 +552,9 @@ void gfs2_io_error_bh_i(struct gfs2_sbd *sdp, struct buffer_head *bh,
 	if (gfs2_withdrawn(sdp))
 		return;
 
-	fs_err(sdp, "fatal: I/O error\n"
-	       "  block = %llu\n"
-	       "  function = %s, file = %s, line = %u\n",
+	fs_err(sdp, "fatal: I/O error - "
+	       "block = %llu, "
+	       "function = %s, file = %s, line = %u\n",
 	       (unsigned long long)bh->b_blocknr, function, file, line);
 	if (withdraw)
 		gfs2_withdraw(sdp);
