@@ -179,6 +179,7 @@ struct net_devmem_dmabuf_binding *
 net_devmem_bind_dmabuf(struct net_device *dev,
 		       enum dma_data_direction direction,
 		       unsigned int dmabuf_fd, struct netdev_nl_sock *priv,
+		       const struct sock *nl_sk,
 		       struct netlink_ext_ack *extack)
 {
 	struct net_devmem_dmabuf_binding *binding;
@@ -201,6 +202,8 @@ net_devmem_bind_dmabuf(struct net_device *dev,
 	}
 
 	binding->dev = dev;
+	write_pnet(&binding->net, sock_net(nl_sk));
+	binding->uid = nl_sk->sk_uid;
 	xa_init_flags(&binding->bound_rxqs, XA_FLAGS_ALLOC);
 
 	refcount_set(&binding->ref, 1);
@@ -368,7 +371,9 @@ struct net_devmem_dmabuf_binding *net_devmem_get_binding(struct sock *sk,
 	int err = 0;
 
 	binding = net_devmem_lookup_dmabuf(dmabuf_id);
-	if (!binding || !binding->tx_vec) {
+	if (!binding || !binding->tx_vec ||
+	    !net_eq(sock_net(sk), read_pnet(&binding->net)) ||
+	    !uid_eq(sk->sk_uid, binding->uid)) {
 		err = -EINVAL;
 		goto out_err;
 	}
