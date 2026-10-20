@@ -363,9 +363,15 @@ static void i2c_register_spd(struct i2c_adapter *adap, bool write_disabled)
 		return;
 	}
 
+	/*
+	 * Memory types could be found at section 7.18.2 (Memory Device — Type), table 78
+	 * https://www.dmtf.org/sites/default/files/standards/documents/DSP0134_3.6.0.pdf
+	 */
 	switch (common_mem_type) {
+	case 0x12:	/* DDR */
 	case 0x13:	/* DDR2 */
 	case 0x18:	/* DDR3 */
+	case 0x1B:	/* LPDDR */
 	case 0x1C:	/* LPDDR2 */
 	case 0x1D:	/* LPDDR3 */
 		name = "spd";
