@@ -216,6 +216,8 @@ enum node_stat_item {
 	PGPROMOTE_SUCCESS,	/* promote successfully */
 	PGPROMOTE_CANDIDATE,	/* candidate pages to promote */
 #endif
+	NR_GPU_ACTIVE,	/* Pages assigned to GPU objects */
+	NR_GPU_RECLAIM,	/* Pages in shrinkable GPU pools */
 	NR_VM_NODE_STAT_ITEMS
 };
 

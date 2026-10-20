@@ -1248,6 +1248,8 @@ const char * const vmstat_text[] = {
 	"pgpromote_success",
 	"pgpromote_candidate",
 #endif
+	"nr_gpu_active",
+	"nr_gpu_reclaim",
 
 	/* enum writeback_stat_item counters */
 	"nr_dirty_threshold",
