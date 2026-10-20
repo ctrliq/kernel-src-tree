@@ -1,0 +1,117 @@
+gfs2: introduce new gfs2_glock_assert_withdraw
+
+jira KERNEL-1773
+Rebuild_History Non-Buildable kernel-4.18.0-553.176.1.el8_10
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit ea4e61c7f46d33fdf17580a925e47cc83570d658
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.176.1.el8_10/ea4e61c7.failed
+
+Before this patch, asserts based on glocks did not print the glock with
+the error. This patch introduces a new macro, gfs2_glock_assert_withdraw
+which first prints the glock, then takes the assert.
+
+This also changes a few glock asserts to the new macro.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit ea4e61c7f46d33fdf17580a925e47cc83570d658)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/glock.c
+diff --cc fs/gfs2/glock.c
+index 3a2c524fb00c,64541d8bf9ad..000000000000
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@@ -166,8 -160,11 +166,14 @@@ static bool glock_blocked_by_withdraw(s
+  	return true;
+  }
+  
+ -void gfs2_glock_free(struct gfs2_glock *gl)
+ +static void __gfs2_glock_free(struct gfs2_glock *gl)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct gfs2_sbd *sdp = gl->gl_name.ln_sbd;
++ 
++ 	gfs2_glock_assert_withdraw(gl, atomic_read(&gl->gl_revokes) == 0);
+++>>>>>>> ea4e61c7f46d (gfs2: introduce new gfs2_glock_assert_withdraw)
+  	rhashtable_remove_fast(&gl_hash_table, &gl->gl_node, ht_parms);
+  	smp_mb();
+  	wake_up_glock(gl);
+@@@ -2224,30 -1821,28 +2231,47 @@@ void gfs2_gl_dq_holders(struct gfs2_sb
+  
+  void gfs2_gl_hash_clear(struct gfs2_sbd *sdp)
+  {
+ +	unsigned long start = jiffies;
+ +	bool timed_out = false;
+ +
+  	set_bit(SDF_SKIP_DLM_UNLOCK, &sdp->sd_flags);
+ -	flush_workqueue(glock_workqueue);
+ +	flush_workqueue(sdp->sd_glock_wq);
+  	glock_hash_walk(clear_glock, sdp);
+ -	flush_workqueue(glock_workqueue);
+ -	wait_event_timeout(sdp->sd_glock_wait,
+ -			   atomic_read(&sdp->sd_glock_disposal) == 0,
+ -			   HZ * 600);
+ +	flush_workqueue(sdp->sd_glock_wq);
+ +	while (!timed_out) {
+ +		wait_event_timeout(sdp->sd_kill_wait,
+ +				   !atomic_read(&sdp->sd_glock_disposal),
+ +				   HZ * 60);
+ +		if (!atomic_read(&sdp->sd_glock_disposal))
+ +			break;
+ +		timed_out = time_after(jiffies, start + (HZ * 600));
+ +		fs_warn(sdp, "%u glocks left after %u seconds%s\n",
+ +			atomic_read(&sdp->sd_glock_disposal),
+ +			jiffies_to_msecs(jiffies - start) / 1000,
+ +			timed_out ? ":" : "; still waiting");
+ +	}
+ +	gfs2_lm_unmount(sdp);
+ +	gfs2_free_dead_glocks(sdp);
+  	glock_hash_walk(dump_glock_func, sdp);
+++<<<<<<< HEAD
+ +	destroy_workqueue(sdp->sd_glock_wq);
+ +	sdp->sd_glock_wq = NULL;
+++=======
++ }
++ 
++ void gfs2_glock_finish_truncate(struct gfs2_inode *ip)
++ {
++ 	struct gfs2_glock *gl = ip->i_gl;
++ 	int ret;
++ 
++ 	ret = gfs2_truncatei_resume(ip);
++ 	gfs2_glock_assert_withdraw(gl, ret == 0);
++ 
++ 	spin_lock(&gl->gl_lockref.lock);
++ 	clear_bit(GLF_LOCK, &gl->gl_flags);
++ 	run_queue(gl, 1);
++ 	spin_unlock(&gl->gl_lockref.lock);
+++>>>>>>> ea4e61c7f46d (gfs2: introduce new gfs2_glock_assert_withdraw)
+  }
+  
+  static const char *state2str(unsigned state)
+* Unmerged path fs/gfs2/glock.c
+diff --git a/fs/gfs2/glock.h b/fs/gfs2/glock.h
+index f9262c2ccb9a..8521ad05bc6e 100644
+--- a/fs/gfs2/glock.h
++++ b/fs/gfs2/glock.h
+@@ -230,6 +230,15 @@ void gfs2_dump_glock(struct seq_file *seq, struct gfs2_glock *gl,
+ #define GLOCK_BUG_ON(gl,x) do { if (unlikely(x)) {		\
+ 			gfs2_dump_glock(NULL, gl, true);	\
+ 			BUG(); } } while(0)
++#define gfs2_glock_assert_warn(gl, x) do { if (unlikely(!(x))) {	\
++			gfs2_dump_glock(NULL, gl, true);		\
++			gfs2_assert_warn((gl)->gl_name.ln_sbd, (x)); } } \
++	while (0)
++#define gfs2_glock_assert_withdraw(gl, x) do { if (unlikely(!(x))) {	\
++			gfs2_dump_glock(NULL, gl, true);		\
++			gfs2_assert_withdraw((gl)->gl_name.ln_sbd, (x)); } } \
++	while (0)
++
+ extern __printf(2, 3)
+ void gfs2_print_dbg(struct seq_file *seq, const char *fmt, ...);
+ 
