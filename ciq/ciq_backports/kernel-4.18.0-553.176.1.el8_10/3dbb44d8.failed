@@ -1,0 +1,186 @@
+sctp: validate cookie AUTH state before use
+
+jira KERNEL-1773
+cve CVE-2026-74752
+Rebuild_History Non-Buildable kernel-4.18.0-553.176.1.el8_10
+commit-author Jérémy Jean <Jeremy.Jean@oss.cyber.gouv.fr>
+commit 3dbb44d88b1e94dd31fe43588af7437b34b44d56
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.176.1.el8_10/3dbb44d8.failed
+
+When cookie authentication is disabled, COOKIE_ECHO restores fixed-size
+AUTH fields directly from peer-controlled cookie bytes.  A forged RANDOM
+length, HMAC list, or CHUNKS list can then reach association consumers
+with lengths or identifiers that were never validated against the local
+backing arrays.
+
+A forged RANDOM length can cause out-of-bounds reads during key-vector
+construction.  A forged HMAC identifier also caused a 32-byte write past
+a zero-length AUTH chunk, providing a primitive for a local privilege
+escalation chain.
+
+Validate the cookie's RANDOM, HMACS, and CHUNKS parameters at the cookie
+trust boundary before copying them into the association.  Reject invalid
+types, malformed lengths, unsupported HMAC identifiers, HMAC lists
+without SHA1, and forbidden chunk ids.
+
+Fixes: bbd0d59809f9 ("[SCTP]: Implement the receive and verification of AUTH chunk")
+Fixes: 1f485649f529 ("[SCTP]: Implement SCTP-AUTH internals")
+	Signed-off-by: Jérémy Jean <Jeremy.Jean@oss.cyber.gouv.fr>
+	Acked-by: Xin Long <lucien.xin@gmail.com>
+Link: https://patch.msgid.link/20260804200042.2412009-1-Jeremy.Jean@oss.cyber.gouv.fr
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 3dbb44d88b1e94dd31fe43588af7437b34b44d56)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sctp/auth.h
+diff --cc include/net/sctp/auth.h
+index 039900580c54,74b3790e2a3d..000000000000
+--- a/include/net/sctp/auth.h
++++ b/include/net/sctp/auth.h
+@@@ -37,16 -22,12 +37,20 @@@ struct sctp_endpoint
+  struct sctp_association;
+  struct sctp_authkey;
+  struct sctp_hmacalgo;
+++<<<<<<< HEAD
+ +struct crypto_shash;
+++=======
++ struct sctp_cookie;
+++>>>>>>> 3dbb44d88b1e (sctp: validate cookie AUTH state before use)
+  
+ -/* Defines an HMAC algorithm supported by SCTP chunk authentication */
+ +/*
+ + * Define a generic struct that will hold all the info
+ + * necessary for an HMAC transform
+ + */
+  struct sctp_hmac {
+ -	__u16 hmac_id;		/* one of SCTP_AUTH_HMAC_ID_* */
+ -	__u16 hmac_len;		/* length of the HMAC value in bytes */
+ +	__u16 hmac_id;		/* one of the above ids */
+ +	char *hmac_name;	/* name for loading */
+ +	__u16 hmac_len;		/* length of the signature */
+  };
+  
+  /* This is generic structure that containst authentication bytes used
+@@@ -92,10 -73,11 +96,18 @@@ struct sctp_shared_key *sctp_auth_get_s
+  int sctp_auth_asoc_copy_shkeys(const struct sctp_endpoint *ep,
+  				struct sctp_association *asoc,
+  				gfp_t gfp);
+++<<<<<<< HEAD
+ +int sctp_auth_init_hmacs(struct sctp_endpoint *ep, gfp_t gfp);
+ +void sctp_auth_destroy_hmacs(struct crypto_shash *auth_hmacs[]);
+ +struct sctp_hmac *sctp_auth_get_hmac(__u16 hmac_id);
+ +struct sctp_hmac *sctp_auth_asoc_get_hmac(const struct sctp_association *asoc);
+++=======
++ bool sctp_auth_verify_cookie_params(const struct sctp_endpoint *ep,
++ 				    const struct sctp_cookie *cookie);
++ const struct sctp_hmac *sctp_auth_get_hmac(__u16 hmac_id);
++ const struct sctp_hmac *
++ sctp_auth_asoc_get_hmac(const struct sctp_association *asoc);
+++>>>>>>> 3dbb44d88b1e (sctp: validate cookie AUTH state before use)
+  void sctp_auth_asoc_set_default_hmac(struct sctp_association *asoc,
+  				     struct sctp_hmac_algo_param *hmacs);
+  int sctp_auth_asoc_verify_hmac_id(const struct sctp_association *asoc,
+* Unmerged path include/net/sctp/auth.h
+diff --git a/net/sctp/auth.c b/net/sctp/auth.c
+index a6b49399c53b..c3741a4a7134 100644
+--- a/net/sctp/auth.c
++++ b/net/sctp/auth.c
+@@ -391,6 +391,81 @@ int sctp_auth_asoc_copy_shkeys(const struct sctp_endpoint *ep,
+ 	return -ENOMEM;
+ }
+ 
++static bool sctp_auth_chunk_id_forbidden(__u8 chunk_id)
++{
++	switch (chunk_id) {
++	case SCTP_CID_INIT:
++	case SCTP_CID_INIT_ACK:
++	case SCTP_CID_SHUTDOWN_COMPLETE:
++	case SCTP_CID_AUTH:
++		return true;
++	default:
++		return false;
++	}
++}
++
++/* Verify AUTH parameters copied from a state cookie before they are restored
++ * into an association.  When cookie authentication is disabled these fields
++ * are peer-controlled, so they must satisfy the same constraints as locally
++ * generated AUTH parameters.
++ */
++bool sctp_auth_verify_cookie_params(const struct sctp_endpoint *ep,
++				    const struct sctp_cookie *cookie)
++{
++	const struct sctp_paramhdr *random;
++	const struct sctp_hmac_algo_param *hmacs;
++	const struct sctp_chunks_param *chunks;
++	u16 hmacs_len, chunks_len;
++	u16 n_hmacs, n_chunks, i;
++	bool has_sha1 = false;
++
++	if (sctp_sk(ep->base.sk)->cookie_auth_enable || !ep->auth_enable)
++		return true;
++
++	random = (const struct sctp_paramhdr *)cookie->auth_random;
++	if (random->type != SCTP_PARAM_RANDOM ||
++	    ntohs(random->length) != sizeof(*random) + SCTP_AUTH_RANDOM_LENGTH)
++		return false;
++
++	hmacs = (const struct sctp_hmac_algo_param *)cookie->auth_hmacs;
++	hmacs_len = ntohs(hmacs->param_hdr.length);
++	if (hmacs->param_hdr.type != SCTP_PARAM_HMAC_ALGO ||
++	    hmacs_len < sizeof(struct sctp_paramhdr) +
++			sizeof(hmacs->hmac_ids[0]) ||
++	    hmacs_len > sizeof(cookie->auth_hmacs) ||
++	    (hmacs_len - sizeof(struct sctp_paramhdr)) %
++			sizeof(hmacs->hmac_ids[0]))
++		return false;
++
++	n_hmacs = (hmacs_len - sizeof(struct sctp_paramhdr)) /
++		  sizeof(hmacs->hmac_ids[0]);
++	for (i = 0; i < n_hmacs; i++) {
++		u16 hmac_id = ntohs(hmacs->hmac_ids[i]);
++
++		if (!sctp_hmac_supported(hmac_id))
++			return false;
++		if (hmac_id == SCTP_AUTH_HMAC_ID_SHA1)
++			has_sha1 = true;
++	}
++	if (!has_sha1)
++		return false;
++
++	chunks = (const struct sctp_chunks_param *)cookie->auth_chunks;
++	chunks_len = ntohs(chunks->param_hdr.length);
++	if (chunks->param_hdr.type != SCTP_PARAM_CHUNKS ||
++	    chunks_len < sizeof(struct sctp_paramhdr) ||
++	    chunks_len > sizeof(cookie->auth_chunks))
++		return false;
++
++	n_chunks = chunks_len - sizeof(struct sctp_paramhdr);
++	for (i = 0; i < n_chunks; i++) {
++		if (sctp_auth_chunk_id_forbidden(chunks->chunks[i]))
++			return false;
++	}
++
++	return true;
++}
++
+ 
+ /* Public interface to create the association shared key.
+  * See code above for the algorithm.
+diff --git a/net/sctp/sm_make_chunk.c b/net/sctp/sm_make_chunk.c
+index 1fe99943e633..cd502d12811e 100644
+--- a/net/sctp/sm_make_chunk.c
++++ b/net/sctp/sm_make_chunk.c
+@@ -1901,6 +1901,9 @@ struct sctp_association *sctp_unpack_cookie(
+ 	/* Set up our peer's port number.  */
+ 	retval->peer.port = ntohs(chunk->sctp_hdr->source);
+ 
++	if (!sctp_auth_verify_cookie_params(ep, bear_cookie))
++		goto malformed;
++
+ 	/* Populate the association from the cookie.  */
+ 	memcpy(&retval->c, bear_cookie, sizeof(*bear_cookie));
+ 
