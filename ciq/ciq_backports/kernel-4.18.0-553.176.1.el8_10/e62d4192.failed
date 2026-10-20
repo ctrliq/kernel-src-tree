@@ -1,0 +1,113 @@
+perf: Fix addr_filter_ranges lifetime
+
+jira KERNEL-1773
+cve CVE-2026-93817
+Rebuild_History Non-Buildable kernel-4.18.0-553.176.1.el8_10
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit e62d4192e593630f355094adc467058a05bdc935
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.176.1.el8_10/e62d4192.failed
+
+Lee Jia Jie reported that since event::addr_filter_ranges is used
+under RCU, it should be RCU freed.
+
+	Reported-by: Lee Jia Jie <jiajie.lee@starlabs.sg>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+(cherry picked from commit e62d4192e593630f355094adc467058a05bdc935)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/events/core.c
+diff --cc kernel/events/core.c
+index aa4016017465,c3a84c7bcaeb..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -4987,16 -5739,78 +4988,82 @@@ static bool exclusive_event_installable
+  	return true;
+  }
+  
+ -static void perf_free_addr_filters(struct perf_event *event);
+ +static void perf_addr_filters_splice(struct perf_event *event,
+ +				       struct list_head *head);
+  
+++<<<<<<< HEAD
+++=======
++ /* vs perf_event_alloc() error */
++ static void __free_event(struct perf_event *event)
++ {
++ 	struct pmu *pmu = event->pmu;
++ 
++ 	security_perf_event_free(event);
++ 
++ 	if (event->attach_state & PERF_ATTACH_CALLCHAIN)
++ 		put_callchain_buffers();
++ 
++ 	if (event->attach_state & PERF_ATTACH_EXCLUSIVE)
++ 		exclusive_event_destroy(event);
++ 
++ 	if (is_cgroup_event(event))
++ 		perf_detach_cgroup(event);
++ 
++ 	if (event->attach_state & PERF_ATTACH_TASK_DATA)
++ 		detach_perf_ctx_data(event);
++ 
++ 	if (event->destroy)
++ 		event->destroy(event);
++ 
++ 	/*
++ 	 * Must be after ->destroy(), due to uprobe_perf_close() using
++ 	 * hw.target.
++ 	 */
++ 	if (event->hw.target)
++ 		put_task_struct(event->hw.target);
++ 
++ 	if (event->pmu_ctx) {
++ 		/*
++ 		 * put_pmu_ctx() needs an event->ctx reference, because of
++ 		 * epc->ctx.
++ 		 */
++ 		WARN_ON_ONCE(!pmu);
++ 		WARN_ON_ONCE(!event->ctx);
++ 		WARN_ON_ONCE(event->pmu_ctx->ctx != event->ctx);
++ 		put_pmu_ctx(event->pmu_ctx);
++ 	}
++ 
++ 	/*
++ 	 * perf_event_free_task() relies on put_ctx() being 'last', in
++ 	 * particular all task references must be cleaned up.
++ 	 */
++ 	if (event->ctx)
++ 		put_ctx(event->ctx);
++ 
++ 	if (pmu) {
++ 		module_put(pmu->module);
++ 		scoped_guard (spinlock, &pmu->events_lock) {
++ 			list_del(&event->pmu_list);
++ 			wake_up_var(pmu);
++ 		}
++ 	}
++ 
++ 	call_rcu(&event->rcu_head, free_event_rcu);
++ }
++ 
++ static void mediated_pmu_unaccount_event(struct perf_event *event);
++ 
++ DEFINE_FREE(__free_event, struct perf_event *, if (_T) __free_event(_T))
++ 
++ /* vs perf_event_alloc() success */
+++>>>>>>> e62d4192e593 (perf: Fix addr_filter_ranges lifetime)
+  static void _free_event(struct perf_event *event)
+  {
+ -	irq_work_sync(&event->pending_irq);
+ -	irq_work_sync(&event->pending_disable_irq);
+ +	irq_work_sync(&event->pending);
+  
+  	unaccount_event(event);
+ -	mediated_pmu_unaccount_event(event);
+ +
+ +	security_perf_event_free(event);
+  
+  	if (event->rb) {
+  		/*
+* Unmerged path kernel/events/core.c
