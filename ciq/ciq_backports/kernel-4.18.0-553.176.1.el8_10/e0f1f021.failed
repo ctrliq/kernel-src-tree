@@ -1,0 +1,140 @@
+gfs2: Lift withdraw check out of gfs2_ail1_empty
+
+jira KERNEL-1773
+Rebuild_History Non-Buildable kernel-4.18.0-553.176.1.el8_10
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit e0f1f021782d6a2e719a451218554a8198c77120
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.176.1.el8_10/e0f1f021.failed
+
+Lift the check for the SDF_WITHDRAWING flag out of gfs2_ail1_empty() and
+into its callers.  This is needed so that gfs2_flush_revokes() can drop
+the sd_log_lock spinlock before triggering a withdraw if necessary.
+
+Instead of checking for the SDF_WITHDRAWING flag, use
+gfs2_withdrawing().  Also, the low-level code triggering the delayed
+withdraw reports when there is a problem, so there is no need to report
+that again.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit e0f1f021782d6a2e719a451218554a8198c77120)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/log.c
+diff --cc fs/gfs2/log.c
+index 260289efbaaf,fdef6bc77c54..000000000000
+--- a/fs/gfs2/log.c
++++ b/fs/gfs2/log.c
+@@@ -334,15 -370,10 +334,19 @@@ static int gfs2_ail1_empty(struct gfs2_
+  			oldest_tr = 0;
+  	}
+  	gfs2_log_update_flush_tail(sdp);
+ -	empty = list_empty(&sdp->sd_ail1_list);
+ +	ret = list_empty(&sdp->sd_ail1_list);
+  	spin_unlock(&sdp->sd_ail_lock);
+  
+++<<<<<<< HEAD
+ +	if (test_bit(SDF_WITHDRAWING, &sdp->sd_flags)) {
+ +		gfs2_lm(sdp, "fatal: I/O error(s)\n");
+ +		gfs2_withdraw(sdp);
+ +	}
+ +
+ +	return ret;
+++=======
++ 	return empty;
+++>>>>>>> e0f1f021782d (gfs2: Lift withdraw check out of gfs2_ail1_empty)
+  }
+  
+  static void gfs2_ail1_wait(struct gfs2_sbd *sdp)
+@@@ -773,9 -807,12 +777,16 @@@ void gfs2_flush_revokes(struct gfs2_sb
+  	/* number of revokes we still have room for */
+  	unsigned int max_revokes = atomic_read(&sdp->sd_log_revokes_available);
+  
+ -	gfs2_log_lock(sdp);
+ +	spin_lock(&sdp->sd_log_lock);
+  	gfs2_ail1_empty(sdp, max_revokes);
+++<<<<<<< HEAD
+ +	spin_unlock(&sdp->sd_log_lock);
+++=======
++ 	gfs2_log_unlock(sdp);
++ 
++ 	if (gfs2_withdrawing(sdp))
++ 		gfs2_withdraw(sdp);
+++>>>>>>> e0f1f021782d (gfs2: Lift withdraw check out of gfs2_ail1_empty)
+  }
+  
+  /**
+@@@ -930,7 -967,35 +941,39 @@@ void gfs2_ail_drain(struct gfs2_sbd *sd
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * drain_bd - drain the buf and databuf queue for a failed transaction
+++=======
++  * empty_ail1_list - try to start IO and empty the ail1 list
++  * @sdp: Pointer to GFS2 superblock
++  */
++ static void empty_ail1_list(struct gfs2_sbd *sdp)
++ {
++ 	unsigned long start = jiffies;
++ 	bool empty = false;
++ 
++ 	while (!empty) {
++ 		if (time_after(jiffies, start + (HZ * 600))) {
++ 			fs_err(sdp, "Error: In %s for 10 minutes! t=%d\n",
++ 			       __func__, current->journal_info ? 1 : 0);
++ 			dump_ail_list(sdp);
++ 			return;
++ 		}
++ 		gfs2_ail1_start(sdp);
++ 		gfs2_ail1_wait(sdp);
++ 		empty = gfs2_ail1_empty(sdp, 0);
++ 
++ 		if (gfs2_withdrawing_or_withdrawn(sdp))
++ 			break;
++ 	}
++ 
++ 	if (gfs2_withdrawing(sdp))
++ 		gfs2_withdraw(sdp);
++ }
++ 
++ /**
++  * trans_drain - drain the buf and databuf queue for a failed transaction
+++>>>>>>> e0f1f021782d (gfs2: Lift withdraw check out of gfs2_ail1_empty)
+   * @tr: the transaction to drain
+   *
+   * When this is called, we're taking an error exit for a log write that failed
+@@@ -1331,19 -1338,19 +1374,22 @@@ int gfs2_logd(void *data
+  
+  		try_to_freeze();
+  
+ -		t = wait_event_interruptible_timeout(sdp->sd_logd_waitq,
+ -				test_bit(SDF_FORCE_AIL_FLUSH, &sdp->sd_flags) ||
+ -				gfs2_ail_flush_reqd(sdp) ||
+ -				gfs2_jrnl_flush_reqd(sdp) ||
+ -				sdp->sd_log_error ||
+ -				gfs2_withdrawing_or_withdrawn(sdp) ||
+ -				kthread_should_stop(),
+ -				t);
+ +		do {
+ +			prepare_to_wait(&sdp->sd_logd_waitq, &wait,
+ +					TASK_INTERRUPTIBLE);
+ +			if (!gfs2_ail_flush_reqd(sdp) &&
+ +			    !gfs2_jrnl_flush_reqd(sdp) &&
+ +			    !kthread_should_stop())
+ +				t = schedule_timeout(t);
+ +		} while(t && !gfs2_ail_flush_reqd(sdp) &&
+ +			!gfs2_jrnl_flush_reqd(sdp) &&
+ +			!kthread_should_stop());
+ +		finish_wait(&sdp->sd_logd_waitq, &wait);
+  	}
+  
++ 	if (gfs2_withdrawing(sdp))
++ 		gfs2_withdraw(sdp);
++ 
+  	return 0;
+  }
+  
+* Unmerged path fs/gfs2/log.c
