@@ -1,0 +1,197 @@
+gfs2: Mark the remaining process-independent glock holders as GL_NOPID
+
+jira KERNEL-1773
+Rebuild_History Non-Buildable kernel-4.18.0-553.176.1.el8_10
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit ebdc416c9c0bed245d6cda92ae2a98483e513051
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.176.1.el8_10/ebdc416c.failed
+
+Add the GL_NOPID flag for the remaining glock holders which are not
+associated with the current process.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit ebdc416c9c0bed245d6cda92ae2a98483e513051)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/inode.c
+#	fs/gfs2/util.c
+diff --cc fs/gfs2/inode.c
+index 2b581c59fab9,e211ed8636b5..000000000000
+--- a/fs/gfs2/inode.c
++++ b/fs/gfs2/inode.c
+@@@ -144,17 -141,10 +144,21 @@@ struct inode *gfs2_inode_lookup(struct 
+  		if (unlikely(error))
+  			goto fail;
+  
+ -		if (blktype != GFS2_BLKST_UNLINKED)
+ +		/*
+ +		 * The only caller that sets @blktype to GFS2_BLKST_UNLINKED is
+ +		 * delete_work_func().  Make sure not to cancel the delete work
+ +		 * from within itself here.
+ +		 */
+ +		if (blktype == GFS2_BLKST_UNLINKED)
+ +			extra_flags |= LM_FLAG_TRY;
+ +		else
+  			gfs2_cancel_delete_work(io_gl);
+  		error = gfs2_glock_nq_init(io_gl, LM_ST_SHARED,
+++<<<<<<< HEAD
+ +					   GL_EXACT | extra_flags,
+++=======
++ 					   GL_EXACT | GL_NOPID,
+++>>>>>>> ebdc416c9c0b (gfs2: Mark the remaining process-independent glock holders as GL_NOPID)
+  					   &ip->i_iopen_gh);
+  		gfs2_glock_put(io_gl);
+  		if (unlikely(error))
+@@@ -811,18 -715,14 +815,19 @@@ static int gfs2_create_inode(struct ino
+  
+  	error = gfs2_glock_get(sdp, ip->i_no_addr, &gfs2_iopen_glops, CREATE, &io_gl);
+  	if (error)
+ -		goto fail_free_inode;
+ +		goto fail_dealloc_inode;
+  	gfs2_cancel_delete_work(io_gl);
+ +	io_gl->gl_no_formal_ino = ip->i_no_formal_ino;
+  
+ +retry:
+  	error = insert_inode_locked4(inode, ip->i_no_addr, iget_test, &ip->i_no_addr);
+ -	BUG_ON(error);
+ +	if (error == -EBUSY)
+ +		goto retry;
+ +	if (error)
+ +		goto fail_gunlock2;
+  
+- 	error = gfs2_glock_nq_init(io_gl, LM_ST_SHARED, GL_EXACT, &ip->i_iopen_gh);
++ 	error = gfs2_glock_nq_init(io_gl, LM_ST_SHARED, GL_EXACT | GL_NOPID,
++ 				   &ip->i_iopen_gh);
+  	if (error)
+  		goto fail_gunlock2;
+  
+diff --cc fs/gfs2/util.c
+index c6f664d59556,95d733dd3c25..000000000000
+--- a/fs/gfs2/util.c
++++ b/fs/gfs2/util.c
+@@@ -242,23 -235,32 +243,36 @@@ static void signal_our_withdraw(struct 
+  	 */
+  	ret = gfs2_glock_nq(&sdp->sd_live_gh);
+  
+ +	gfs2_glock_put(live_gl); /* drop extra reference we acquired */
+ +	clear_bit(SDF_WITHDRAW_RECOVERY, &sdp->sd_flags);
+ +
+  	/*
+  	 * If we actually got the "live" lock in EX mode, there are no other
+ -	 * nodes available to replay our journal. So we try to replay it
+ -	 * ourselves. We hold the "live" glock to prevent other mounters
+ -	 * during recovery, then just dequeue it and reacquire it in our
+ -	 * normal SH mode. Just in case the problem that caused us to
+ -	 * withdraw prevents us from recovering our journal (e.g. io errors
+ -	 * and such) we still check if the journal is clean before proceeding
+ -	 * but we may wait forever until another mounter does the recovery.
+ +	 * nodes available to replay our journal.
+  	 */
+  	if (ret == 0) {
+++<<<<<<< HEAD
+ +		fs_warn(sdp, "No other mounters found.\n");
+ +		/*
+ +		 * We are about to release the lockspace.  By keeping live_gl
+ +		 * locked here, we ensure that the next mounter coming along
+ +		 * will be a "first" mounter which will perform recovery.
+ +		 */
+ +		goto skip_recovery;
+++=======
++ 		fs_warn(sdp, "No other mounters found. Trying to recover our "
++ 			"own journal jid %d.\n", sdp->sd_lockstruct.ls_jid);
++ 		if (gfs2_recover_journal(sdp->sd_jdesc, 1))
++ 			fs_warn(sdp, "Unable to recover our journal jid %d.\n",
++ 				sdp->sd_lockstruct.ls_jid);
++ 		gfs2_glock_dq_wait(&sdp->sd_live_gh);
++ 		gfs2_holder_reinit(LM_ST_SHARED,
++ 				   LM_FLAG_NOEXP | GL_EXACT | GL_NOPID,
++ 				   &sdp->sd_live_gh);
++ 		gfs2_glock_nq(&sdp->sd_live_gh);
+++>>>>>>> ebdc416c9c0b (gfs2: Mark the remaining process-independent glock holders as GL_NOPID)
+  	}
+  
+ -	gfs2_glock_queue_put(live_gl); /* drop extra reference we acquired */
+ -	clear_bit(SDF_WITHDRAW_RECOVERY, &sdp->sd_flags);
+ -
+  	/*
+  	 * At this point our journal is evicted, so we need to get a new inode
+  	 * for it. Once done, we need to call gfs2_find_jhead which
+* Unmerged path fs/gfs2/inode.c
+diff --git a/fs/gfs2/ops_fstype.c b/fs/gfs2/ops_fstype.c
+index 0b89614c4cbc..e52fa600a2cd 100644
+--- a/fs/gfs2/ops_fstype.c
++++ b/fs/gfs2/ops_fstype.c
+@@ -395,7 +395,8 @@ static int init_locking(struct gfs2_sbd *sdp, struct gfs2_holder *mount_gh,
+ 
+ 	error = gfs2_glock_nq_num(sdp,
+ 				  GFS2_MOUNT_LOCK, &gfs2_nondisk_glops,
+-				  LM_ST_EXCLUSIVE, LM_FLAG_NOEXP | GL_NOCACHE,
++				  LM_ST_EXCLUSIVE,
++				  LM_FLAG_NOEXP | GL_NOCACHE | GL_NOPID,
+ 				  mount_gh);
+ 	if (error) {
+ 		fs_err(sdp, "can't acquire mount glock: %d\n", error);
+@@ -405,7 +406,7 @@ static int init_locking(struct gfs2_sbd *sdp, struct gfs2_holder *mount_gh,
+ 	error = gfs2_glock_nq_num(sdp,
+ 				  GFS2_LIVE_LOCK, &gfs2_nondisk_glops,
+ 				  LM_ST_SHARED,
+-				  LM_FLAG_NOEXP | GL_EXACT,
++				  LM_FLAG_NOEXP | GL_EXACT | GL_NOPID,
+ 				  &sdp->sd_live_gh);
+ 	if (error) {
+ 		fs_err(sdp, "can't acquire live glock: %d\n", error);
+@@ -667,7 +668,7 @@ static int init_statfs(struct gfs2_sbd *sdp)
+ 	iput(pn);
+ 	pn = NULL;
+ 	ip = GFS2_I(sdp->sd_sc_inode);
+-	error = gfs2_glock_nq_init(ip->i_gl, LM_ST_EXCLUSIVE, 0,
++	error = gfs2_glock_nq_init(ip->i_gl, LM_ST_EXCLUSIVE, GL_NOPID,
+ 				   &sdp->sd_sc_gh);
+ 	if (error) {
+ 		fs_err(sdp, "can't lock local \"sc\" file: %d\n", error);
+@@ -747,7 +748,7 @@ static int init_journal(struct gfs2_sbd *sdp, int undo)
+ 		error = gfs2_glock_nq_num(sdp, sdp->sd_lockstruct.ls_jid,
+ 					  &gfs2_journal_glops,
+ 					  LM_ST_EXCLUSIVE,
+-					  LM_FLAG_NOEXP | GL_NOCACHE,
++					  LM_FLAG_NOEXP | GL_NOCACHE | GL_NOPID,
+ 					  &sdp->sd_journal_gh);
+ 		if (error) {
+ 			fs_err(sdp, "can't acquire journal glock: %d\n", error);
+@@ -757,7 +758,8 @@ static int init_journal(struct gfs2_sbd *sdp, int undo)
+ 		ip = GFS2_I(sdp->sd_jdesc->jd_inode);
+ 		sdp->sd_jinode_gl = ip->i_gl;
+ 		error = gfs2_glock_nq_init(ip->i_gl, LM_ST_SHARED,
+-					   LM_FLAG_NOEXP | GL_EXACT | GL_NOCACHE,
++					   LM_FLAG_NOEXP | GL_EXACT |
++					   GL_NOCACHE | GL_NOPID,
+ 					   &sdp->sd_jinode_gh);
+ 		if (error) {
+ 			fs_err(sdp, "can't acquire journal inode glock: %d\n",
+@@ -928,7 +930,7 @@ static int init_per_node(struct gfs2_sbd *sdp, int undo)
+ 	pn = NULL;
+ 
+ 	ip = GFS2_I(sdp->sd_qc_inode);
+-	error = gfs2_glock_nq_init(ip->i_gl, LM_ST_EXCLUSIVE, 0,
++	error = gfs2_glock_nq_init(ip->i_gl, LM_ST_EXCLUSIVE, GL_NOPID,
+ 				   &sdp->sd_qc_gh);
+ 	if (error) {
+ 		fs_err(sdp, "can't lock local \"qc\" file: %d\n", error);
+diff --git a/fs/gfs2/super.c b/fs/gfs2/super.c
+index c74b3d154d4f..ee66890c8243 100644
+--- a/fs/gfs2/super.c
++++ b/fs/gfs2/super.c
+@@ -377,7 +377,8 @@ static int gfs2_lock_fs_check_clean(struct gfs2_sbd *sdp)
+ 	gfs2_freeze_unlock(&sdp->sd_freeze_gh);
+ 
+ 	error = gfs2_glock_nq_init(sdp->sd_freeze_gl, LM_ST_EXCLUSIVE,
+-				   LM_FLAG_NOEXP, &sdp->sd_freeze_gh);
++				   LM_FLAG_NOEXP | GL_NOPID,
++				   &sdp->sd_freeze_gh);
+ 	if (error)
+ 		goto relock_shared;
+ 
+* Unmerged path fs/gfs2/util.c
