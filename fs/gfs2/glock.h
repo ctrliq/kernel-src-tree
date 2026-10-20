@@ -61,10 +61,10 @@ enum {
  * LM_FLAG_TRY_1CB
  * Send one blocking callback if TRY is set and the lock is not granted.
  *
- * LM_FLAG_NOEXP
+ * LM_FLAG_RECOVER
  * GFS sets this flag on lock requests it makes while doing journal recovery.
- * These special requests should not be blocked due to the recovery like
- * ordinary locks would be.
+ * While ordinary requests are blocked until the end of recovery, requests
+ * with this flag set do proceed.
  *
  * LM_FLAG_ANY
  * A SHARED request may also be granted in DEFERRED, or a DEFERRED request may
@@ -83,7 +83,7 @@ enum {
 
 #define LM_FLAG_TRY		0x0001
 #define LM_FLAG_TRY_1CB		0x0002
-#define LM_FLAG_NOEXP		0x0004
+#define LM_FLAG_RECOVER		0x0004
 #define LM_FLAG_ANY		0x0008
 #define LM_FLAG_NODE_SCOPE	0x0020
 #define GL_ASYNC		0x0040
@@ -138,7 +138,7 @@ struct lm_lockops {
 	void (*lm_first_done) (struct gfs2_sbd *sdp);
 	void (*lm_recovery_result) (struct gfs2_sbd *sdp, unsigned int jid,
 				    unsigned int result);
-	void (*lm_unmount) (struct gfs2_sbd *sdp);
+	void (*lm_unmount) (struct gfs2_sbd *sdp, bool clean);
 	void (*lm_withdraw) (struct gfs2_sbd *sdp);
 	void (*lm_put_lock) (struct gfs2_glock *gl);
 	int (*lm_lock) (struct gfs2_glock *gl, unsigned int req_state,
@@ -230,6 +230,15 @@ void gfs2_dump_glock(struct seq_file *seq, struct gfs2_glock *gl,
 #define GLOCK_BUG_ON(gl,x) do { if (unlikely(x)) {		\
 			gfs2_dump_glock(NULL, gl, true);	\
 			BUG(); } } while(0)
+#define gfs2_glock_assert_warn(gl, x) do { if (unlikely(!(x))) {	\
+			gfs2_dump_glock(NULL, gl, true);		\
+			gfs2_assert_warn((gl)->gl_name.ln_sbd, (x)); } } \
+	while (0)
+#define gfs2_glock_assert_withdraw(gl, x) do { if (unlikely(!(x))) {	\
+			gfs2_dump_glock(NULL, gl, true);		\
+			gfs2_assert_withdraw((gl)->gl_name.ln_sbd, (x)); } } \
+	while (0)
+
 extern __printf(2, 3)
 void gfs2_print_dbg(struct seq_file *seq, const char *fmt, ...);
 
