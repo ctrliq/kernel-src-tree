@@ -1,0 +1,106 @@
+gfs2: Fix freeze consistency check in log_write_header
+
+jira KERNEL-1773
+Rebuild_History Non-Buildable kernel-4.18.0-553.176.1.el8_10
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit e345b87b0b0444d1c644b0ea15cfb50e88f10b55
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.176.1.el8_10/e345b87b.failed
+
+Functions gfs2_freeze_super() and gfs2_thaw_super() are using the
+SDF_FROZEN flag to indicate when the filesystem is frozen, synchronized
+by sd_freeze_mutex.  However, this doesn't prevent writes from happening
+between the point of calling thaw_super() and the point where the
+SDF_FROZEN flag is cleared, so the following assert can trigger in
+log_write_header():
+
+    gfs2_assert_withdraw(sdp, !test_bit(SDF_FROZEN, &sdp->sd_flags));
+
+Fix that by checking for sb->s_writers.frozen != SB_FREEZE_COMPLETE in
+log_write_header() instead.  To make sure that the filesystem-specific
+part of freezing happens before sb->s_writers.frozen is set to
+SB_FREEZE_COMPLETE, move that code from gfs2_freeze_locally() into
+gfs2_freeze_fs() and hook that up to the .freeze_fs operation.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit e345b87b0b0444d1c644b0ea15cfb50e88f10b55)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/log.c
+#	fs/gfs2/super.c
+diff --cc fs/gfs2/log.c
+index 260289efbaaf,8cddf955ebc0..000000000000
+--- a/fs/gfs2/log.c
++++ b/fs/gfs2/log.c
+@@@ -875,9 -912,10 +875,14 @@@ void gfs2_write_log_header(struct gfs2_
+  
+  static void log_write_header(struct gfs2_sbd *sdp, u32 flags)
+  {
+++<<<<<<< HEAD
+ +	int op_flags = REQ_PREFLUSH | REQ_FUA | REQ_META | REQ_SYNC;
+++=======
++ 	blk_opf_t op_flags = REQ_PREFLUSH | REQ_FUA | REQ_META | REQ_SYNC;
++ 	struct super_block *sb = sdp->sd_vfs;
+++>>>>>>> e345b87b0b04 (gfs2: Fix freeze consistency check in log_write_header)
+  
+- 	gfs2_assert_withdraw(sdp, !test_bit(SDF_FROZEN, &sdp->sd_flags));
++ 	gfs2_assert_withdraw(sdp, sb->s_writers.frozen != SB_FREEZE_COMPLETE);
+  
+  	if (test_bit(SDF_NOBARRIERS, &sdp->sd_flags)) {
+  		gfs2_ordered_wait(sdp);
+diff --cc fs/gfs2/super.c
+index c74b3d154d4f,e5f79466340d..000000000000
+--- a/fs/gfs2/super.c
++++ b/fs/gfs2/super.c
+@@@ -684,26 -673,6 +684,29 @@@ static int gfs2_sync_fs(struct super_bl
+  	return sdp->sd_log_error;
+  }
+  
+++<<<<<<< HEAD
+ +static int gfs2_freeze_locally(struct gfs2_sbd *sdp)
+ +{
+ +	struct super_block *sb = sdp->sd_vfs;
+ +	int error;
+ +
+ +	error = freeze_super(sb);
+ +	if (error)
+ +		return error;
+ +
+ +	if (test_bit(SDF_JOURNAL_LIVE, &sdp->sd_flags)) {
+ +		gfs2_log_flush(sdp, NULL, GFS2_LOG_HEAD_FLUSH_FREEZE |
+ +			       GFS2_LFC_FREEZE_GO_SYNC);
+ +		if (gfs2_withdrawn(sdp)) {
+ +			thaw_super(sb);
+ +			return -EIO;
+ +		}
+ +	}
+ +	return 0;
+ +}
+ +
+++=======
+++>>>>>>> e345b87b0b04 (gfs2: Fix freeze consistency check in log_write_header)
+  static int gfs2_do_thaw(struct gfs2_sbd *sdp)
+  {
+  	struct super_block *sb = sdp->sd_vfs;
+@@@ -768,12 -737,13 +771,12 @@@ static int gfs2_freeze_super(struct sup
+  
+  	if (!mutex_trylock(&sdp->sd_freeze_mutex))
+  		return -EBUSY;
+ -	if (test_bit(SDF_FROZEN, &sdp->sd_flags)) {
+ -		mutex_unlock(&sdp->sd_freeze_mutex);
+ -		return -EBUSY;
+ -	}
+ +	error = -EBUSY;
+ +	if (test_bit(SDF_FROZEN, &sdp->sd_flags))
+ +		goto out;
+  
+  	for (;;) {
+- 		error = gfs2_freeze_locally(sdp);
++ 		error = freeze_super(sb, FREEZE_HOLDER_USERSPACE);
+  		if (error) {
+  			fs_info(sdp, "GFS2: couldn't freeze filesystem: %d\n",
+  				error);
+* Unmerged path fs/gfs2/log.c
+* Unmerged path fs/gfs2/super.c
