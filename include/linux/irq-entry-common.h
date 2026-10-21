@@ -239,7 +239,7 @@ static __always_inline void __exit_to_user_mode_validate(void)
 static __always_inline void exit_to_user_mode_prepare_legacy(struct pt_regs *regs)
 {
 	__exit_to_user_mode_prepare(regs);
-	rseq_exit_to_user_mode();
+	rseq_exit_to_user_mode_legacy();
 	__exit_to_user_mode_validate();
 }
 
@@ -253,7 +253,7 @@ static __always_inline void exit_to_user_mode_prepare_legacy(struct pt_regs *reg
 static __always_inline void syscall_exit_to_user_mode_prepare(struct pt_regs *regs)
 {
 	__exit_to_user_mode_prepare(regs);
-	rseq_exit_to_user_mode();
+	rseq_syscall_exit_to_user_mode();
 	__exit_to_user_mode_validate();
 }
 
@@ -267,7 +267,7 @@ static __always_inline void syscall_exit_to_user_mode_prepare(struct pt_regs *re
 static __always_inline void irqentry_exit_to_user_mode_prepare(struct pt_regs *regs)
 {
 	__exit_to_user_mode_prepare(regs);
-	rseq_exit_to_user_mode();
+	rseq_irqentry_exit_to_user_mode();
 	__exit_to_user_mode_validate();
 }
 
