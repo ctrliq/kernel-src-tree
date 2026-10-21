@@ -3196,7 +3196,6 @@ void exit_signals(struct task_struct *tsk)
 	cgroup_threadgroup_change_begin(tsk);
 
 	scoped_guard(spinlock_irq, &tsk->sighand->siglock) {
-		sched_mm_cid_exit_signals(tsk);
 		tsk->flags |= PF_EXITING;
 
 		sigqueue_dequeue_pending(&tsk->pending, &sigq_list);
