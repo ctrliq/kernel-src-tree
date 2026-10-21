@@ -195,7 +195,7 @@ static void nf_flow_tuple_encap(struct nf_flowtable_ctx *ctx,
 		if (ctx->tun.proto == IPPROTO_IPIP) {
 			tuple->tun.dst_v4.s_addr = iph->daddr;
 			tuple->tun.src_v4.s_addr = iph->saddr;
-			tuple->tun.l3_proto = IPPROTO_IPIP;
+			tuple->tun.inner_proto = IPPROTO_IPIP;
 		}
 		break;
 	case htons(ETH_P_IPV6):
@@ -203,7 +203,7 @@ static void nf_flow_tuple_encap(struct nf_flowtable_ctx *ctx,
 		if (ctx->tun.proto == IPPROTO_IPV6) {
 			tuple->tun.dst_v6 = ip6h->daddr;
 			tuple->tun.src_v6 = ip6h->saddr;
-			tuple->tun.l3_proto = IPPROTO_IPV6;
+			tuple->tun.inner_proto = IPPROTO_IPV6;
 		}
 		break;
 	default:
@@ -610,7 +610,7 @@ static int nf_flow_tunnel_ipip_push(struct net *net, struct sk_buff *skb,
 	iph->version	= 4;
 	iph->ihl	= sizeof(*iph) >> 2;
 	iph->frag_off	= ip_mtu_locked(&rt->dst) ? 0 : frag_off;
-	iph->protocol	= tuple->tun.l3_proto;
+	iph->protocol	= tuple->tun.inner_proto;
 	iph->tos	= tos;
 	iph->daddr	= tuple->tun.src_v4.s_addr;
 	iph->saddr	= tuple->tun.dst_v4.s_addr;
