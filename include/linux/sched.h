@@ -1416,14 +1416,7 @@ struct task_struct {
 #endif
 
 	struct rseq_data		rseq;
-
-#ifdef CONFIG_SCHED_MM_CID
-	int				mm_cid;		/* Current cid in mm */
-	int				last_mm_cid;	/* Most recent cid in mm */
-	int				migrate_from_cpu;
-	int				mm_cid_active;	/* Whether cid bitmap is active */
-	struct callback_head		cid_work;
-#endif
+	struct sched_mm_cid		mm_cid;
 
 	struct tlbflush_unmap_batch	tlb_ubc;
 
@@ -2263,7 +2256,7 @@ void sched_mm_cid_fork(struct task_struct *t);
 void sched_mm_cid_exit_signals(struct task_struct *t);
 static inline int task_mm_cid(struct task_struct *t)
 {
-	return t->mm_cid;
+	return t->mm_cid.cid;
 }
 #else
 static inline void sched_mm_cid_before_execve(struct task_struct *t) { }
