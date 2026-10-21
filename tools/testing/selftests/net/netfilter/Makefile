@@ -33,6 +33,8 @@ TEST_PROGS += vxlan_mtu_frag.sh
 
 TEST_PROGS_EXTENDED = nft_concat_range_perf.sh
 
+TEST_GEN_PROGS = conntrack_dump_flush
+
 TEST_GEN_FILES = audit_logread
 TEST_GEN_FILES += connect_close nf_queue
 TEST_GEN_FILES += sctp_collision
@@ -41,6 +43,9 @@ include ../../lib.mk
 
 $(OUTPUT)/nf_queue: CFLAGS += $(MNL_CFLAGS)
 $(OUTPUT)/nf_queue: LDLIBS += $(MNL_LDLIBS)
+
+$(OUTPUT)/conntrack_dump_flush: CFLAGS += $(MNL_CFLAGS)
+$(OUTPUT)/conntrack_dump_flush: LDLIBS += $(MNL_LDLIBS)
 
 TEST_FILES := lib.sh
 
