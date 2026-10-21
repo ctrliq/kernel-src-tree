@@ -14,6 +14,12 @@
 
 #include "../dmaengine.h"
 
+struct ioat_sysfs_entry {
+	struct attribute attr;
+	ssize_t (*show)(struct dma_chan *, char *);
+	ssize_t (*store)(struct dma_chan *, const char *, size_t);
+};
+
 static ssize_t cap_show(struct dma_chan *c, char *page)
 {
 	struct dma_device *dma = c->device;
@@ -26,7 +32,7 @@ static ssize_t cap_show(struct dma_chan *c, char *page)
 		       dma_has_cap(DMA_INTERRUPT, dma->cap_mask) ? " intr" : "");
 
 }
-struct ioat_sysfs_entry ioat_cap_attr = __ATTR_RO(cap);
+static struct ioat_sysfs_entry ioat_cap_attr = __ATTR_RO(cap);
 
 static ssize_t version_show(struct dma_chan *c, char *page)
 {
@@ -36,7 +42,7 @@ static ssize_t version_show(struct dma_chan *c, char *page)
 	return sprintf(page, "%d.%d\n",
 		       ioat_dma->version >> 4, ioat_dma->version & 0xf);
 }
-struct ioat_sysfs_entry ioat_version_attr = __ATTR_RO(version);
+static struct ioat_sysfs_entry ioat_version_attr = __ATTR_RO(version);
 
 static ssize_t
 ioat_attr_show(struct kobject *kobj, struct attribute *attr, char *page)
@@ -67,7 +73,7 @@ const char *page, size_t count)
 	return entry->store(&ioat_chan->dma_chan, page, count);
 }
 
-const struct sysfs_ops ioat_sysfs_ops = {
+static const struct sysfs_ops ioat_sysfs_ops = {
 	.show	= ioat_attr_show,
 	.store  = ioat_attr_store,
 };

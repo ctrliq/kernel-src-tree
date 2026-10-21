@@ -140,12 +140,6 @@ struct ioatdma_chan {
 	int prev_intr_coalesce;
 };
 
-struct ioat_sysfs_entry {
-	struct attribute attr;
-	ssize_t (*show)(struct dma_chan *, char *);
-	ssize_t (*store)(struct dma_chan *, const char *, size_t);
-};
-
 /**
  * struct ioat_sed_ent - wrapper around super extended hardware descriptor
  * @hw: hardware SED
@@ -195,9 +189,6 @@ struct ioat_ring_ent {
 	struct ioat_sed_ent *sed;
 };
 
-extern const struct sysfs_ops ioat_sysfs_ops;
-extern struct ioat_sysfs_entry ioat_version_attr;
-extern struct ioat_sysfs_entry ioat_cap_attr;
 extern int ioat_pending_level;
 extern struct kobj_type ioat_ktype;
 extern struct kmem_cache *ioat_cache;
