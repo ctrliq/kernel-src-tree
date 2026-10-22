@@ -59,16 +59,17 @@ void snd_seq_timer_delete(struct snd_seq_timer **tmr)
 {
 	struct snd_seq_timer *t = *tmr;
 	struct snd_timer_instance *ti;
+	unsigned long flags;
 
 	if (t == NULL) {
 		pr_debug("ALSA: seq: snd_seq_timer_delete() called with NULL timer\n");
 		return;
 	}
 
-	scoped_guard(spinlock_irq, &t->lock) {
-		ti = t->timeri;
-		t->timeri = NULL;
-	}
+	spin_lock_irqsave(&t->lock, flags);
+	ti = t->timeri;
+	t->timeri = NULL;
+	spin_unlock_irqrestore(&t->lock, flags);
 	if (ti) {
 		snd_timer_close(ti);
 		snd_timer_instance_free(ti);
