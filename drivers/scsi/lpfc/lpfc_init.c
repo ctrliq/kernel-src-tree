@@ -22,7 +22,6 @@
  *******************************************************************/
 
 #include <linux/blkdev.h>
-#include <linux/crc32.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/idr.h>
@@ -5645,7 +5644,8 @@ lpfc_cgn_update_stat(struct lpfc_hba *phba, uint32_t dtag)
 		cp->cgn_stat_npm = value;
 	}
 
-	value = lpfc_cgn_calc_crc32(cp, LPFC_CGN_INFO_SZ);
+	value = lpfc_cgn_calc_crc32(cp, LPFC_CGN_INFO_SZ,
+				    LPFC_CGN_CRC32_SEED);
 	cp->cgn_info_crc = cpu_to_le32(value);
 }
 
@@ -5907,7 +5907,8 @@ lpfc_cmf_stats_timer(struct hrtimer *timer)
 	cp->cgn_warn_freq = cpu_to_le16(value);
 	cp->cgn_alarm_freq = cpu_to_le16(value);
 
-	lvalue = lpfc_cgn_calc_crc32(cp, LPFC_CGN_INFO_SZ);
+	lvalue = lpfc_cgn_calc_crc32(cp, LPFC_CGN_INFO_SZ,
+				     LPFC_CGN_CRC32_SEED);
 	cp->cgn_info_crc = cpu_to_le32(lvalue);
 
 	hrtimer_forward_now(timer, ktime_set(0, LPFC_SEC_MIN * NSEC_PER_SEC));
@@ -7130,7 +7131,8 @@ lpfc_cgn_params_parse(struct lpfc_hba *phba,
 			cp->cgn_info_level0 = phba->cgn_p.cgn_param_level0;
 			cp->cgn_info_level1 = phba->cgn_p.cgn_param_level1;
 			cp->cgn_info_level2 = phba->cgn_p.cgn_param_level2;
-			crc = lpfc_cgn_calc_crc32(cp, LPFC_CGN_INFO_SZ);
+			crc = lpfc_cgn_calc_crc32(cp, LPFC_CGN_INFO_SZ,
+						  LPFC_CGN_CRC32_SEED);
 			cp->cgn_info_crc = cpu_to_le32(crc);
 		}
 		spin_unlock_irq(&phba->hbalock);
@@ -13533,14 +13535,54 @@ lpfc_sli4_hba_unset(struct lpfc_hba *phba)
 	lpfc_free_iocb_list(phba);
 }
 
+static uint32_t
+lpfc_cgn_crc32(uint32_t crc, u8 byte)
+{
+	uint32_t msb = 0;
+	uint32_t bit;
+
+	for (bit = 0; bit < 8; bit++) {
+		msb = (crc >> 31) & 1;
+		crc <<= 1;
+
+		if (msb ^ (byte & 1)) {
+			crc ^= LPFC_CGN_CRC32_MAGIC_NUMBER;
+			crc |= 1;
+		}
+		byte >>= 1;
+	}
+	return crc;
+}
+
+static uint32_t
+lpfc_cgn_reverse_bits(uint32_t wd)
+{
+	uint32_t result = 0;
+	uint32_t i;
+
+	for (i = 0; i < 32; i++) {
+		result <<= 1;
+		result |= (1 & (wd >> i));
+	}
+	return result;
+}
+
 /*
  * The routine corresponds with the algorithm the HBA firmware
  * uses to validate the data integrity.
  */
 uint32_t
-lpfc_cgn_calc_crc32(const void *data, size_t size)
+lpfc_cgn_calc_crc32(void *ptr, uint32_t byteLen, uint32_t crc)
 {
-	return ~crc32c(~0, data, size);
+	uint32_t  i;
+	uint32_t result;
+	uint8_t  *data = (uint8_t *)ptr;
+
+	for (i = 0; i < byteLen; ++i)
+		crc = lpfc_cgn_crc32(crc, data[i]);
+
+	result = ~lpfc_cgn_reverse_bits(crc);
+	return result;
 }
 
 void
@@ -13589,7 +13631,7 @@ lpfc_init_congestion_buf(struct lpfc_hba *phba)
 
 	cp->cgn_warn_freq = cpu_to_le16(LPFC_FPIN_INIT_FREQ);
 	cp->cgn_alarm_freq = cpu_to_le16(LPFC_FPIN_INIT_FREQ);
-	crc = lpfc_cgn_calc_crc32(cp, LPFC_CGN_INFO_SZ);
+	crc = lpfc_cgn_calc_crc32(cp, LPFC_CGN_INFO_SZ, LPFC_CGN_CRC32_SEED);
 	cp->cgn_info_crc = cpu_to_le32(crc);
 
 	phba->cgn_evt_timestamp = jiffies +
@@ -13612,7 +13654,7 @@ lpfc_init_congestion_stat(struct lpfc_hba *phba)
 	memset(&cp->cgn_stat, 0, sizeof(cp->cgn_stat));
 
 	lpfc_cgn_update_tstamp(phba, &cp->stat_start);
-	crc = lpfc_cgn_calc_crc32(cp, LPFC_CGN_INFO_SZ);
+	crc = lpfc_cgn_calc_crc32(cp, LPFC_CGN_INFO_SZ, LPFC_CGN_CRC32_SEED);
 	cp->cgn_info_crc = cpu_to_le32(crc);
 }
 

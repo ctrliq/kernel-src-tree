@@ -10308,8 +10308,10 @@ cleanup:
 						cpu_to_le16(value);
 					cp->cgn_warn_freq =
 						cpu_to_le16(value);
-					crc = lpfc_cgn_calc_crc32(
-						cp, LPFC_CGN_INFO_SZ);
+					crc = lpfc_cgn_calc_crc32
+						(cp,
+						LPFC_CGN_INFO_SZ,
+						LPFC_CGN_CRC32_SEED);
 					cp->cgn_info_crc = cpu_to_le32(crc);
 				}
 
