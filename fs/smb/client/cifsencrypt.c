@@ -177,6 +177,7 @@ static int calc_ntlmv2_hash(struct cifs_ses *ses, char *ntlmv2_hash,
 	E_md4hash(ses->password, nt_hash, nls_cp);
 
 	rc = crypto_shash_setkey(hmacmd5->tfm, nt_hash, CIFS_NTHASH_SIZE);
+	memzero_explicit(nt_hash, sizeof(nt_hash));
 	if (rc) {
 		cifs_dbg(VFS, "%s: Could not set NT hash as a key, rc=%d\n", __func__, rc);
 		return rc;
@@ -460,6 +461,7 @@ setup_ntlmv2_rsp(struct cifs_ses *ses, const struct nls_table *nls_cp)
 		cifs_dbg(VFS, "%s: Could not generate MD5 hash, rc=%d\n", __func__, rc);
 unlock:
 	cifs_server_unlock(ses->server);
+	memzero_explicit(ntlmv2_hash, sizeof(ntlmv2_hash));
 	cifs_free_hash(&hmacmd5);
 setup_ntlmv2_rsp_ret:
 	kfree_sensitive(tiblob);
@@ -481,7 +483,7 @@ calc_seckey(struct cifs_ses *ses)
 	ctx_arc4 = kmalloc(sizeof(*ctx_arc4), GFP_KERNEL);
 	if (!ctx_arc4) {
 		cifs_dbg(VFS, "Could not allocate arc4 context\n");
-		return -ENOMEM;
+		goto out_nomem;
 	}
 
 	cifs_arc4_setkey(ctx_arc4, ses->auth_key.response, CIFS_SESS_KEY_SIZE);
@@ -496,6 +498,10 @@ calc_seckey(struct cifs_ses *ses)
 	memzero_explicit(sec_key, CIFS_SESS_KEY_SIZE);
 	kfree_sensitive(ctx_arc4);
 	return 0;
+
+out_nomem:
+	memzero_explicit(sec_key, sizeof(sec_key));
+	return -ENOMEM;
 }
 
 void
