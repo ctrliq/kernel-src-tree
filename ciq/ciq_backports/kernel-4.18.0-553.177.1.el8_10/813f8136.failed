@@ -1,0 +1,248 @@
+xfs: bounds-check buffer log item's dirty bitmap
+
+jira KERNEL-1789
+cve CVE-2026-80536
+Rebuild_History Non-Buildable kernel-4.18.0-553.177.1.el8_10
+commit-author Ibrahim Hashimov <security@auditcode.ai>
+commit 813f8136a2ce1fee266d02a7df73db6e8a541604
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.177.1.el8_10/813f8136.failed
+
+xlog_recover_do_reg_buffer() replays each dirty region described by a
+buffer log item's bitmap into the buffer read for that item:
+
+	memcpy(xfs_buf_offset(bp, (uint)bit << XFS_BLF_SHIFT),
+		item->ri_buf[i].iov_base,
+		nbits << XFS_BLF_SHIFT);
+
+The destination offset (bit/nbits, from the logged dirty bitmap) and the
+buffer size (from the logged blf_len) are both attacker-controlled and
+otherwise unrelated, yet the only thing bounding the copy is an ASSERT(),
+which compiles away on production kernels. A crafted image logging a
+small blf_len together with a bitmap bit past the end of that buffer
+drives the memcpy() past the buffer's allocation, corrupting adjacent
+kernel heap during mount-time log recovery. This is reachable by anyone
+who can get a crafted image mounted -- the malicious-filesystem threat
+model XFS already guards against elsewhere.
+
+Turn the ASSERT() into a real XFS_IS_CORRUPT() check that aborts recovery
+of the buffer with -EFSCORRUPTED, consistent with the validate-and-fail
+idiom already used in xlog_recover_do_inode_buffer() and
+xfs_dquot_item_recover.c. xlog_recover_do_reg_buffer() therefore becomes
+STATIC int and its three callers propagate the error.
+
+Found and confirmed with KASAN on a CONFIG_XFS_DEBUG=n build: the crafted
+image trips a slab-out-of-bounds write before this change and fails
+recovery cleanly with -EFSCORRUPTED after it.
+
+Fixes: 1da177e4c3f4 ("Linux-2.6.12-rc2")
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Ibrahim Hashimov <security@auditcode.ai>
+	Reviewed-by: "Darrick J. Wong" <djwong@kernel.org>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Signed-off-by: Carlos Maiolino <cem@kernel.org>
+(cherry picked from commit 813f8136a2ce1fee266d02a7df73db6e8a541604)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_buf_item_recover.c
+diff --cc fs/xfs/xfs_buf_item_recover.c
+index e8eeaf00544b,240deb3f7827..000000000000
+--- a/fs/xfs/xfs_buf_item_recover.c
++++ b/fs/xfs/xfs_buf_item_recover.c
+@@@ -458,10 -487,26 +458,33 @@@ xlog_recover_do_reg_buffer
+  		nbits = xfs_contig_bits(buf_f->blf_data_map,
+  					buf_f->blf_map_size, bit);
+  		ASSERT(nbits > 0);
+++<<<<<<< HEAD
+ +		ASSERT(item->ri_buf[i].i_addr != NULL);
+ +		ASSERT(item->ri_buf[i].i_len % XFS_BLF_CHUNK == 0);
+ +		ASSERT(BBTOB(bp->b_length) >=
+ +		       ((uint)bit << XFS_BLF_SHIFT) + (nbits << XFS_BLF_SHIFT));
+++=======
++ 		ASSERT(item->ri_buf[i].iov_base != NULL);
++ 		ASSERT(item->ri_buf[i].iov_len % XFS_BLF_CHUNK == 0);
++ 		/*
++ 		 * The bitmap is only trustworthy to the extent that it
++ 		 * describes a region that actually fits inside the buffer we
++ 		 * read in based on the (attacker-controlled) blf_len.  Do not
++ 		 * rely on an ASSERT() for this -- it compiles away entirely on
++ 		 * non-DEBUG kernels, which is exactly where this matters, so
++ 		 * validate it for real and abort recovery of this buffer rather
++ 		 * than copying past the end of it.
++ 		 */
++ 		if (XFS_IS_CORRUPT(mp, BBTOB(bp->b_length) <
++ 				((uint)bit << XFS_BLF_SHIFT) +
++ 				(nbits << XFS_BLF_SHIFT))) {
++ 			xfs_alert(mp,
++ 	"Bad buffer log item dirty bitmap (bit %d, nbits %d) for %d-byte buffer at daddr 0x%llx.",
++ 				bit, nbits, BBTOB(bp->b_length),
++ 				xfs_buf_daddr(bp));
++ 			return -EFSCORRUPTED;
++ 		}
+++>>>>>>> 813f8136a2ce (xfs: bounds-check buffer log item's dirty bitmap)
+  
+  		/*
+  		 * The dirty regions logged in the buffer, even though
+@@@ -676,6 -725,102 +703,105 @@@ xlog_recover_do_inode_buffer
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Update the in-memory superblock and perag structures from the primary SB
++  * buffer.
++  *
++  * This is required because transactions running after growfs may require the
++  * updated values to be set in a previous fully commit transaction.
++  */
++ static int
++ xlog_recover_do_primary_sb_buffer(
++ 	struct xfs_mount		*mp,
++ 	struct xlog_recover_item	*item,
++ 	struct xfs_buf			*bp,
++ 	struct xfs_buf_log_format	*buf_f,
++ 	xfs_lsn_t			current_lsn)
++ {
++ 	struct xfs_dsb			*dsb = bp->b_addr;
++ 	xfs_agnumber_t			orig_agcount = mp->m_sb.sb_agcount;
++ 	xfs_rgnumber_t			orig_rgcount = mp->m_sb.sb_rgcount;
++ 	int				error;
++ 
++ 	error = xlog_recover_do_reg_buffer(mp, item, bp, buf_f, current_lsn);
++ 	if (error)
++ 		return error;
++ 
++ 	if (orig_agcount == 0) {
++ 		xfs_alert(mp, "Trying to grow file system without AGs");
++ 		return -EFSCORRUPTED;
++ 	}
++ 
++ 	/*
++ 	 * Update the in-core super block from the freshly recovered on-disk one.
++ 	 */
++ 	xfs_sb_from_disk(&mp->m_sb, dsb);
++ 
++ 	/*
++ 	 * Grow can change the device size.  Mirror that into the buftarg.
++ 	 */
++ 	mp->m_ddev_targp->bt_nr_sectors =
++ 		XFS_FSB_TO_BB(mp, mp->m_sb.sb_dblocks);
++ 	if (mp->m_rtdev_targp && mp->m_rtdev_targp != mp->m_ddev_targp) {
++ 		mp->m_rtdev_targp->bt_nr_sectors =
++ 			XFS_FSB_TO_BB(mp, mp->m_sb.sb_rblocks);
++ 	}
++ 
++ 	if (mp->m_sb.sb_agcount < orig_agcount) {
++ 		xfs_alert(mp, "Shrinking AG count in log recovery not supported");
++ 		return -EFSCORRUPTED;
++ 	}
++ 	if (mp->m_sb.sb_rgcount < orig_rgcount) {
++ 		xfs_warn(mp,
++  "Shrinking rtgroup count in log recovery not supported");
++ 		return -EFSCORRUPTED;
++ 	}
++ 
++ 	/*
++ 	 * If the last AG was grown or shrunk, we also need to update the
++ 	 * length in the in-core perag structure and values depending on it.
++ 	 */
++ 	error = xfs_update_last_ag_size(mp, orig_agcount);
++ 	if (error)
++ 		return error;
++ 
++ 	/*
++ 	 * If the last rtgroup was grown or shrunk, we also need to update the
++ 	 * length in the in-core rtgroup structure and values depending on it.
++ 	 * Ignore this on any filesystem with zero rtgroups.
++ 	 */
++ 	if (orig_rgcount > 0) {
++ 		error = xfs_update_last_rtgroup_size(mp, orig_rgcount);
++ 		if (error)
++ 			return error;
++ 	}
++ 
++ 	/*
++ 	 * Initialize the new perags, and also update various block and inode
++ 	 * allocator setting based off the number of AGs or total blocks.
++ 	 * Because of the latter this also needs to happen if the agcount did
++ 	 * not change.
++ 	 */
++ 	error = xfs_initialize_perag(mp, orig_agcount, mp->m_sb.sb_agcount,
++ 			mp->m_sb.sb_dblocks, &mp->m_maxagi);
++ 	if (error) {
++ 		xfs_warn(mp, "Failed recovery per-ag init: %d", error);
++ 		return error;
++ 	}
++ 	mp->m_alloc_set_aside = xfs_alloc_set_aside(mp);
++ 
++ 	error = xfs_initialize_rtgroups(mp, orig_rgcount, mp->m_sb.sb_rgcount,
++ 			mp->m_sb.sb_rextents);
++ 	if (error) {
++ 		xfs_warn(mp, "Failed recovery rtgroup init: %d", error);
++ 		return error;
++ 	}
++ 	return 0;
++ }
++ 
++ /*
+++>>>>>>> 813f8136a2ce (xfs: bounds-check buffer log item's dirty bitmap)
+   * V5 filesystems know the age of the buffer on disk being recovered. We can
+   * have newer objects on disk than we are replaying, and so for these cases we
+   * don't want to replay the current change as that will make the buffer contents
+@@@ -953,15 -1103,45 +1079,39 @@@ xlog_recover_buf_commit_pass2
+  			goto out_release;
+  	} else if (buf_f->blf_flags &
+  		  (XFS_BLF_UDQUOT_BUF|XFS_BLF_PDQUOT_BUF|XFS_BLF_GDQUOT_BUF)) {
+- 		bool	dirty;
+- 
+- 		dirty = xlog_recover_do_dquot_buffer(mp, log, item, bp, buf_f);
+- 		if (!dirty)
++ 		error = xlog_recover_do_dquot_buffer(mp, log, item, bp, buf_f);
++ 		if (error <= 0)
+  			goto out_release;
+++<<<<<<< HEAD
+++=======
++ 		/* write dirty buffer */
++ 		error = 0;
++ 	} else if ((xfs_blft_from_flags(buf_f) & XFS_BLFT_SB_BUF) &&
++ 			xfs_buf_daddr(bp) == 0) {
++ 		error = xlog_recover_do_primary_sb_buffer(mp, item, bp, buf_f,
++ 				current_lsn);
++ 		if (error)
++ 			goto out_writebuf;
++ 
++ 		/* Update the rt superblock if we have one. */
++ 		if (xfs_has_rtsb(mp) && mp->m_rtsb_bp) {
++ 			struct xfs_buf	*rtsb_bp = mp->m_rtsb_bp;
++ 
++ 			xfs_buf_lock(rtsb_bp);
++ 			xfs_buf_hold(rtsb_bp);
++ 			xfs_update_rtsb(rtsb_bp, bp);
++ 			rtsb_bp->b_flags |= _XBF_LOGRECOVERY;
++ 			xfs_buf_delwri_queue(rtsb_bp, buffer_list);
++ 			xfs_buf_relse(rtsb_bp);
++ 		}
+++>>>>>>> 813f8136a2ce (xfs: bounds-check buffer log item's dirty bitmap)
+  	} else {
+- 		xlog_recover_do_reg_buffer(mp, item, bp, buf_f, current_lsn);
++ 		error = xlog_recover_do_reg_buffer(mp, item, bp, buf_f,
++ 						   current_lsn);
++ 		if (error)
++ 			goto out_release;
+  	}
+  
+ -	/*
+ -	 * Buffer held by buf log item during 'normal' buffer recovery must
+ -	 * be committed through buffer I/O submission path to ensure proper
+ -	 * release. When error occurs during sb buffer recovery, log shutdown
+ -	 * will be done before submitting buffer list so that buffers can be
+ -	 * released correctly through ioend failure path.
+ -	 */
+ -out_writebuf:
+ -
+  	/*
+  	 * Perform delayed write on the buffer.  Asynchronous writes will be
+  	 * slower when taking into account all the buffers to be flushed.
+* Unmerged path fs/xfs/xfs_buf_item_recover.c
