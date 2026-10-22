@@ -264,6 +264,16 @@ static void test_hashmap_percpu(unsigned int task, void *data)
 	close(fd);
 }
 
+#define MAP_RETRIES 20
+
+static bool can_retry(int err)
+{
+	return (err == EAGAIN || err == EBUSY ||
+		((err == ENOMEM || err == E2BIG) &&
+		 map_opts.map_flags == BPF_F_NO_PREALLOC));
+}
+
+
 #define VALUE_SIZE 3
 static int helper_fill_hashmap(int max_entries)
 {
@@ -278,10 +288,11 @@ static int helper_fill_hashmap(int max_entries)
 
 	for (i = 0; i < max_entries; i++) {
 		key = i; value[0] = key;
-		ret = bpf_map_update_elem(fd, &key, value, BPF_NOEXIST);
+		ret = map_update_retriable(fd, &key, value, BPF_NOEXIST,
+					   MAP_RETRIES, can_retry);
 		CHECK(ret != 0,
 		      "can't update hashmap",
-		      "err: %s\n", strerror(ret));
+		      "err: %s\n", strerror(-ret));
 	}
 
 	return fd;
@@ -1396,14 +1407,8 @@ static void test_map_stress(void)
 #define DO_UPDATE 1
 #define DO_DELETE 0
 
-#define MAP_RETRIES 20
 #define MAX_DELAY_US 50000
 #define MIN_DELAY_RANGE_US 5000
-
-static bool retry_for_again_or_busy(int err)
-{
-	return (err == EAGAIN || err == EBUSY);
-}
 
 int map_update_retriable(int map_fd, const void *key, const void *value, int flags, int attempts,
 			 retry_for_error_fn need_retry)
@@ -1455,12 +1460,12 @@ static void test_update_delete(unsigned int fn, void *data)
 
 		if (do_update) {
 			err = map_update_retriable(fd, &key, &value, BPF_NOEXIST, MAP_RETRIES,
-						   retry_for_again_or_busy);
+						   can_retry);
 			if (err)
 				printf("error %d %d\n", err, errno);
 			assert(err == 0);
 			err = map_update_retriable(fd, &key, &value, BPF_EXIST, MAP_RETRIES,
-						   retry_for_again_or_busy);
+						   can_retry);
 			if (err)
 				printf("error %d %d\n", err, errno);
 			assert(err == 0);
