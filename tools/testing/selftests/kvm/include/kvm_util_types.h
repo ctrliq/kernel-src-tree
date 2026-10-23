@@ -19,4 +19,6 @@
 typedef u64 gpa_t; /* Virtual Machine (Guest) physical address */
 typedef u64 gva_t; /* Virtual Machine (Guest) virtual address */
 
+#define INVALID_GPA (~(uint64_t)0)
+
 #endif /* SELFTEST_KVM_UTIL_TYPES_H */
