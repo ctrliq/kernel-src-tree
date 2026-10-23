@@ -1165,6 +1165,11 @@ struct btf_func_model {
 	u8 arg_flags[MAX_BPF_FUNC_ARGS];
 };
 
+static inline u32 btf_func_model_arg_slots(const struct btf_func_model *m, u32 arg)
+{
+	return (m->arg_size[arg] + sizeof(u64) - 1) / sizeof(u64);
+}
+
 /* Restore arguments before returning from trampoline to let original function
  * continue executing. This flag is used for fentry progs when there are no
  * fexit progs.
