@@ -2566,6 +2566,11 @@ static inline void sock_tx_timestamp(const struct sock *sk, __u16 tsflags,
 		*tx_flags |= SKBTX_WIFI_STATUS;
 }
 
+static inline bool sk_is_tcp(const struct sock *sk)
+{
+	return sk->sk_type == SOCK_STREAM && sk->sk_protocol == IPPROTO_TCP;
+}
+
 /**
  * sk_eat_skb - Release a skb if it is no longer needed
  * @sk: socket to eat this skb from
