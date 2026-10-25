@@ -1,0 +1,188 @@
+writeback: fix race between cgroup_writeback_umount() and inode_switch_wbs()
+
+jira KERNEL-1812
+cve CVE-2026-64378
+Rebuild_History Non-Buildable kernel-4.18.0-553.178.1.el8_10
+commit-author Baokun Li <libaokun@linux.alibaba.com>
+commit cba38ec4cbd3a7b8b942a8d52531a05be8a9ff0d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.178.1.el8_10/cba38ec4.failed
+
+When a container exits, the following BUG_ON() is occasionally triggered:
+
+==================================================================
+ VFS: Busy inodes after unmount of sdb (ext4)
+ ------------[ cut here ]------------
+ kernel BUG at fs/super.c:695!
+ CPU: 3 PID: 6 Comm: containerd-shim Tainted: G OE K 6.6 #1
+ pstate: 63400009 (nZCv daif +PAN -UAO +TCO +DIT -SSBS BTYPE=--)
+ pc : generic_shutdown_super+0xf0/0x100
+ lr : generic_shutdown_super+0xf0/0x100
+ Call trace:
+  generic_shutdown_super+0xf0/0x100
+  kill_block_super+0x20/0x48
+  ext4_kill_sb+0x28/0x60
+  deactivate_locked_super+0x54/0x130
+  deactivate_super+0x84/0xa0
+  cleanup_mnt+0xa4/0x140
+  __cleanup_mnt+0x18/0x28
+  task_work_run+0x78/0xe0
+  do_notify_resume+0x204/0x240
+==================================================================
+
+The root cause is a race between cgroup_writeback_umount() and
+inode_switch_wbs()/cleanup_offline_cgwb(). There is a window between
+inode_prepare_wbs_switch() returning true and the subsequent
+wb_queue_isw() call. Following is the process that triggers the issue:
+
+      CPU A (umount)           |          CPU B (writeback)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                                 inode_switch_wbs/cleanup_offline_cgwb
+                                  atomic_inc(&isw_nr_in_flight)
+                                  inode_prepare_wbs_switch
+                                   -> passes SB_ACTIVE check
+                                   __iget(inode)
+ generic_shutdown_super
+  sb->s_flags &= ~SB_ACTIVE
+  cgroup_writeback_umount(sb)
+   smp_mb()
+   atomic_read(&isw_nr_in_flight)
+   rcu_barrier()
+    -> no pending RCU callbacks
+   flush_workqueue(isw_wq)
+    -> nothing queued, returns
+  evict_inodes(sb)
+   -> Inode skipped as isw still holds a ref.
+  sop->put_super(sb)
+   /* destroys percpu counters */
+  -> VFS: Busy inodes after unmount!
+                                  wb_queue_isw()
+                                   queue_work(isw_wq, ...)
+                                  /* later in work function */
+                                  inode_switch_wbs_work_fn
+                                   process_inode_switch_wbs
+                                    iput() -> evict
+                                     percpu_counter_dec() // UAF!
+
+Fix this by extending the RCU read-side critical section in
+inode_switch_wbs() and cleanup_offline_cgwb() to cover from
+inode_prepare_wbs_switch() through wb_queue_isw().  Since there is
+no sleep in this window, rcu_read_lock() can be used.  Then add a
+synchronize_rcu() in cgroup_writeback_umount() before the existing
+rcu_barrier(), so that all in-flight switchers that have passed the
+SB_ACTIVE check have completed queue_work() before flush_workqueue()
+is called.
+
+The existing rcu_barrier() is intentionally retained so this fix can
+be backported unchanged to stable kernels (5.10.y, 6.6.y, ...) that
+still queue switches via queue_rcu_work(). It is a no-op on current
+mainline (since commit e1b849cfa6b6 ("writeback: Avoid contention on
+wb->list_lock when switching inodes")) and is removed in a follow-up
+patch.
+
+Fixes: a1a0e23e4903 ("writeback: flush inode cgroup wb switches instead of pinning super_block")
+	Cc: stable@vger.kernel.org
+	Suggested-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/all/mxnjq2l6guusfchvauxr3v7c4bwjasybxlleqbbh4efloeqspz@iqylk76ohufz
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Baokun Li <libaokun@linux.alibaba.com>
+Link: https://patch.msgid.link/20260521095016.2791354-2-libaokun@linux.alibaba.com
+	Acked-by: Tejun Heo <tj@kernel.org>
+	Signed-off-by: Christian Brauner (Amutable) <brauner@kernel.org>
+(cherry picked from commit cba38ec4cbd3a7b8b942a8d52531a05be8a9ff0d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/fs-writeback.c
+diff --cc fs/fs-writeback.c
+index 61459dca306c,6766de9f9d75..000000000000
+--- a/fs/fs-writeback.c
++++ b/fs/fs-writeback.c
+@@@ -591,20 -686,16 +598,27 @@@ static void inode_switch_wbs(struct ino
+  
+  	isw->inodes[0] = inode;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * In addition to synchronizing among switchers, I_WB_SWITCH tells
+ +	 * the RCU protected stat update paths to grab the i_page
+ +	 * lock so that stat transfer can synchronize against them.
+ +	 * Let's continue after I_WB_SWITCH is guaranteed to be visible.
+ +	 */
+ +	INIT_RCU_WORK(&isw->work, inode_switch_wbs_work_fn);
+ +	queue_rcu_work(isw_wq, &isw->work);
+++=======
++ 	trace_inode_switch_wbs_queue(inode->i_wb, new_wb, 1);
++ 	wb_queue_isw(new_wb, isw);
++ 	rcu_read_unlock();
+++>>>>>>> cba38ec4cbd3 (writeback: fix race between cgroup_writeback_umount() and inode_switch_wbs())
+  	return;
+  
+  out_free:
++ 	rcu_read_unlock();
+  	atomic_dec(&isw_nr_in_flight);
+ -	if (new_wb)
+ -		wb_put(new_wb);
+ +	if (isw->new_wb)
+ +		wb_put(isw->new_wb);
+  	kfree(isw);
+  }
+  
+@@@ -650,14 -742,22 +664,22 @@@ bool cleanup_offline_cgwb(struct bdi_wr
+  
+  	for (memcg_css = wb->memcg_css->parent; memcg_css;
+  	     memcg_css = memcg_css->parent) {
+ -		new_wb = wb_get_create(wb->bdi, memcg_css, GFP_KERNEL);
+ -		if (new_wb)
+ +		isw->new_wb = wb_get_create(wb->bdi, memcg_css, GFP_KERNEL);
+ +		if (isw->new_wb)
+  			break;
+  	}
+ -	if (unlikely(!new_wb))
+ -		new_wb = &wb->bdi->wb; /* wb_get() is noop for bdi's wb */
+ +	if (unlikely(!isw->new_wb))
+ +		isw->new_wb = &wb->bdi->wb; /* wb_get() is noop for bdi's wb */
+  
+  	nr = 0;
++ 	/*
++ 	 * Paired with synchronize_rcu() in cgroup_writeback_umount().
++ 	 * Holding rcu_read_lock across the SB_ACTIVE check, the inode grab
++ 	 * and wb_queue_isw() ensures synchronize_rcu() cannot return until
++ 	 * the work is queued, so the subsequent flush_workqueue() will wait
++ 	 * for the switch.
++ 	 */
++ 	rcu_read_lock();
+  	spin_lock(&wb->list_lock);
+  	/*
+  	 * In addition to the inodes that have completed writeback, also switch
+@@@ -674,20 -775,16 +696,27 @@@
+  
+  	/* no attached inodes? bail out */
+  	if (nr == 0) {
++ 		rcu_read_unlock();
+  		atomic_dec(&isw_nr_in_flight);
+ -		wb_put(new_wb);
+ +		wb_put(isw->new_wb);
+  		kfree(isw);
+  		return restart;
+  	}
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * In addition to synchronizing among switchers, I_WB_SWITCH tells
+ +	 * the RCU protected stat update paths to grab the i_page
+ +	 * lock so that stat transfer can synchronize against them.
+ +	 * Let's continue after I_WB_SWITCH is guaranteed to be visible.
+ +	 */
+ +	INIT_RCU_WORK(&isw->work, inode_switch_wbs_work_fn);
+ +	queue_rcu_work(isw_wq, &isw->work);
+++=======
++ 	trace_inode_switch_wbs_queue(wb, new_wb, nr);
++ 	wb_queue_isw(new_wb, isw);
++ 	rcu_read_unlock();
+++>>>>>>> cba38ec4cbd3 (writeback: fix race between cgroup_writeback_umount() and inode_switch_wbs())
+  
+  	return restart;
+  }
+* Unmerged path fs/fs-writeback.c
