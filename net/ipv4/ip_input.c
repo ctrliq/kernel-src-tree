@@ -323,7 +323,7 @@ static int ip_rcv_finish_core(struct net *net, struct sock *sk,
 
 	if (ip_can_use_hint(skb, iph, hint)) {
 		drop_reason = ip_route_use_hint(skb, iph->daddr, iph->saddr,
-						iph->tos, dev, hint);
+						ip4h_dscp(iph), dev, hint);
 		if (unlikely(drop_reason))
 			goto drop_error;
 	}

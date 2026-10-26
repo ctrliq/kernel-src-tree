@@ -208,7 +208,7 @@ ip_route_input_noref(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 		     dscp_t dscp, struct net_device *dev);
 enum skb_drop_reason
 ip_route_use_hint(struct sk_buff *skb, __be32 daddr, __be32 saddr,
-		  u8 tos, struct net_device *dev,
+		  dscp_t dscp, struct net_device *dev,
 		  const struct sk_buff *hint);
 
 static inline enum skb_drop_reason

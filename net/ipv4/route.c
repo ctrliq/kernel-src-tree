@@ -2164,7 +2164,7 @@ ip_mkroute_input(struct sk_buff *skb, struct fib_result *res,
  */
 enum skb_drop_reason
 ip_route_use_hint(struct sk_buff *skb, __be32 daddr, __be32 saddr,
-		  u8 tos, struct net_device *dev,
+		  dscp_t dscp, struct net_device *dev,
 		  const struct sk_buff *hint)
 {
 	enum skb_drop_reason reason = SKB_DROP_REASON_NOT_SPECIFIED;
@@ -2194,8 +2194,8 @@ ip_route_use_hint(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 	if (rt->rt_type != RTN_LOCAL)
 		goto skip_validate_source;
 
-	tos &= INET_DSCP_MASK;
-	reason = fib_validate_source_reason(skb, saddr, daddr, tos, 0, dev,
+	reason = fib_validate_source_reason(skb, saddr, daddr,
+					    inet_dscp_to_dsfield(dscp), 0, dev,
 					    in_dev, &tag);
 	if (reason)
 		goto martian_source;
