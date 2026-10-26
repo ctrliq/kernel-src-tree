@@ -2237,7 +2237,7 @@ static struct net_device *ip_rt_get_dev(struct net *net,
 
 static enum skb_drop_reason
 ip_route_input_slow(struct sk_buff *skb, __be32 daddr, __be32 saddr,
-		    u8 tos, struct net_device *dev,
+		    dscp_t dscp, struct net_device *dev,
 		    struct fib_result *res)
 {
 	enum skb_drop_reason reason = SKB_DROP_REASON_NOT_SPECIFIED;
@@ -2313,7 +2313,7 @@ ip_route_input_slow(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 	fl4.flowi4_oif = 0;
 	fl4.flowi4_iif = dev->ifindex;
 	fl4.flowi4_mark = skb->mark;
-	fl4.flowi4_tos = tos;
+	fl4.flowi4_tos = inet_dscp_to_dsfield(dscp);
 	fl4.flowi4_scope = RT_SCOPE_UNIVERSE;
 	fl4.flowi4_flags = 0;
 	fl4.daddr = daddr;
@@ -2347,7 +2347,8 @@ ip_route_input_slow(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 
 	err = -EINVAL;
 	if (res->type == RTN_LOCAL) {
-		reason = fib_validate_source_reason(skb, saddr, daddr, tos,
+		reason = fib_validate_source_reason(skb, saddr, daddr,
+						    inet_dscp_to_dsfield(dscp),
 						    0, dev, in_dev, &itag);
 		if (reason)
 			goto martian_source;
@@ -2364,8 +2365,8 @@ ip_route_input_slow(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 	}
 
 make_route:
-	reason = ip_mkroute_input(skb, res, in_dev, daddr, saddr, tos,
-				  flkeys);
+	reason = ip_mkroute_input(skb, res, in_dev, daddr, saddr,
+				  inet_dscp_to_dsfield(dscp), flkeys);
 
 out:
 	return reason;
@@ -2377,8 +2378,9 @@ brd_input:
 	}
 
 	if (!ipv4_is_zeronet(saddr)) {
-		reason = fib_validate_source_reason(skb, saddr, 0, tos, 0,
-						    dev, in_dev, &itag);
+		reason = fib_validate_source_reason(skb, saddr, 0,
+						    inet_dscp_to_dsfield(dscp),
+						    0, dev, in_dev, &itag);
 		if (reason)
 			goto martian_source;
 	}
@@ -2517,8 +2519,7 @@ ip_route_input_rcu(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 		return reason;
 	}
 
-	return ip_route_input_slow(skb, daddr, saddr,
-				   inet_dscp_to_dsfield(dscp), dev, res);
+	return ip_route_input_slow(skb, daddr, saddr, dscp, dev, res);
 }
 
 enum skb_drop_reason ip_route_input_noref(struct sk_buff *skb, __be32 daddr,
