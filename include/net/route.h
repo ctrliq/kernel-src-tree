@@ -212,13 +212,14 @@ ip_route_use_hint(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 		  const struct sk_buff *hint);
 
 static inline enum skb_drop_reason
-ip_route_input(struct sk_buff *skb, __be32 dst, __be32 src, u8 tos,
-	       struct net_device *devin)
+ip_route_input(struct sk_buff *skb, __be32 dst, __be32 src,
+				 dscp_t dscp, struct net_device *devin)
 {
 	enum skb_drop_reason reason;
 
 	rcu_read_lock();
-	reason = ip_route_input_noref(skb, dst, src, tos, devin);
+	reason = ip_route_input_noref(skb, dst, src, inet_dscp_to_dsfield(dscp),
+				      devin);
 	if (!reason) {
 		skb_dst_force(skb);
 		if (!skb_dst(skb))
