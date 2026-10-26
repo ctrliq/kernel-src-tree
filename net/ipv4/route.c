@@ -2143,7 +2143,7 @@ int fib_multipath_hash(const struct net *net, const struct flowi4 *fl4,
 static enum skb_drop_reason
 ip_mkroute_input(struct sk_buff *skb, struct fib_result *res,
 		 struct in_device *in_dev, __be32 daddr,
-		 __be32 saddr, u32 tos, struct flow_keys *hkeys)
+		 __be32 saddr, dscp_t dscp, struct flow_keys *hkeys)
 {
 #ifdef CONFIG_IP_ROUTE_MULTIPATH
 	if (res->fi && fib_info_num_path(res->fi) > 1) {
@@ -2155,7 +2155,8 @@ ip_mkroute_input(struct sk_buff *skb, struct fib_result *res,
 #endif
 
 	/* create a routing cache entry */
-	return __mkroute_input(skb, res, in_dev, daddr, saddr, tos);
+	return __mkroute_input(skb, res, in_dev, daddr, saddr,
+			       inet_dscp_to_dsfield(dscp));
 }
 
 /* Implements all the saddr-related checks as ip_route_input_slow(),
@@ -2365,8 +2366,7 @@ ip_route_input_slow(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 	}
 
 make_route:
-	reason = ip_mkroute_input(skb, res, in_dev, daddr, saddr,
-				  inet_dscp_to_dsfield(dscp), flkeys);
+	reason = ip_mkroute_input(skb, res, in_dev, daddr, saddr, dscp, flkeys);
 
 out:
 	return reason;
