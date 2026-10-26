@@ -201,7 +201,7 @@ static inline struct rtable *ip_route_output_gre(struct net *net, struct flowi4 
 
 enum skb_drop_reason
 ip_mc_validate_source(struct sk_buff *skb, __be32 daddr, __be32 saddr,
-		      u8 tos, struct net_device *dev,
+		      dscp_t dscp, struct net_device *dev,
 		      struct in_device *in_dev, u32 *itag);
 enum skb_drop_reason
 ip_route_input_noref(struct sk_buff *skb, __be32 daddr, __be32 saddr,
