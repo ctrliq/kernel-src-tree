@@ -168,8 +168,8 @@ static void ip_expire(struct timer_list *t)
 
 	/* skb has no dst, perform route lookup again */
 	iph = ip_hdr(head);
-	reason = ip_route_input_noref(head, iph->daddr, iph->saddr,
-				      iph->tos, head->dev);
+	reason = ip_route_input_noref(head, iph->daddr, iph->saddr, ip4h_dscp(iph),
+				      head->dev);
 	if (reason)
 		goto out;
 

@@ -205,7 +205,7 @@ ip_mc_validate_source(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 		      struct in_device *in_dev, u32 *itag);
 enum skb_drop_reason
 ip_route_input_noref(struct sk_buff *skb, __be32 daddr, __be32 saddr,
-		     u8 tos, struct net_device *dev);
+		     dscp_t dscp, struct net_device *dev);
 enum skb_drop_reason
 ip_route_use_hint(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 		  u8 tos, struct net_device *dev,
@@ -218,8 +218,7 @@ ip_route_input(struct sk_buff *skb, __be32 dst, __be32 src,
 	enum skb_drop_reason reason;
 
 	rcu_read_lock();
-	reason = ip_route_input_noref(skb, dst, src, inet_dscp_to_dsfield(dscp),
-				      devin);
+	reason = ip_route_input_noref(skb, dst, src, dscp, devin);
 	if (!reason) {
 		skb_dst_force(skb);
 		if (!skb_dst(skb))
