@@ -1,0 +1,83 @@
+perf: Fix use-after-free when perf mmap() revival races with the last munmap()
+
+jira KERNEL-1812
+cve CVE-2026-89791
+Rebuild_History Non-Buildable kernel-6.12.0-211.68.1.el10_2
+Rebuild_CHGLOG: - Fix use-after-free when perf mmap() revival races with the last munmap() (Vratislav Bendel) [RHEL-270808] {CVE-2026-89791}
+Rebuild_FUZZ: 96.00%
+commit-author Yilin Zhang <yilinzhang@moonshot.ai>
+commit 58a8108bc73de0740d5b88150465d6690ea5f85f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-211.68.1.el10_2/58a8108b.failed
+
+perf_mmap_close() drops rb->mmap_count *without* holding
+event->mmap_mutex (the refcount_dec_and_test() right before the
+refcount_dec_and_mutex_lock() of event->mmap_count). A concurrent
+perf_mmap_rb() can slot its entire "revival" path into that window
+(perf_mmap holds event->mmap_mutex for its whole duration, including
+rb_alloc):
+
+  munmap side (perf_mmap_close)          mmap side (perf_mmap_rb)
+  -----------------------------------    --------------------------------
+  rb->mmap_count 1 -> 0   (no lock)      (holds event->mmap_mutex)
+                                         inc_not_zero(rb->mmap_count) fails
+                                         ring_buffer_attach(event, NULL)
+                                         rb_alloc() + attach new rb
+                                         refcount_set(&event->mmap_count, 1)
+  lock; event->mmap_count 1 -> 0
+  ring_buffer_attach(event, NULL)
+  ring_buffer_put() -> frees the *new* rb
+
+The revival's refcount_set(&event->mmap_count, 1) is an invisible
+1 -> 1 write: the close frees the just-revived buffer although the
+other process still has it mapped -- a page-level use-after-free
+allowing local privilege escalation to root by any unprivileged user
+(default kernel.perf_event_paranoid=2).
+
+Swap the order of the two counter updates: event->mmap_count is
+dropped first via refcount_dec_and_mutex_lock(), so its 1 -> 0
+transition and the ring_buffer_attach() stay serialized with
+perf_mmap(). rb->mmap_count == 0 then implies every event using the
+buffer is detached already, so the result of the rb->mmap_count drop
+can gate the remaining teardown directly and detach_rest is no longer
+needed.
+
+An earlier fix for this race from Kyle Zeng and David Lee takes
+event->mmap_mutex around both counter updates [0]; here the not-last
+close stays lockless.
+
+Fixes: 59741451b49c ("perf: Identify the 0->1 transition for event::mmap_count")
+	Reported-by: Kimi Security Team <bug-report@moonshot.ai>
+	Suggested-by: Peter Zijlstra <peterz@infradead.org>
+Co-developed-by: Weiming Shi <shiweiming@moonshot.ai>
+	Signed-off-by: Weiming Shi <shiweiming@moonshot.ai>
+	Signed-off-by: Yilin Zhang <yilinzhang@moonshot.ai>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lore.kernel.org/linux-perf-users/20260804060931.711308-1-david.lee@trailofbits.com/ [0]
+	Cc: <stable@vger.kernel.org>
+	Cc: stable@vger.kernel.org # 6.18+
+Link: https://patch.msgid.link/20260831162155.1437652-1-yilinzhang@moonshot.ai
+(cherry picked from commit 58a8108bc73de0740d5b88150465d6690ea5f85f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/events/core.c
+diff --cc kernel/events/core.c
+index 84909e04c81d,f02780529b43..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -6759,9 -7029,6 +6759,12 @@@ static void perf_mmap_close(struct vm_a
+  	mapped_f unmapped = get_mapped(event, event_unmapped);
+  	struct perf_buffer *rb = ring_buffer_get(event);
+  	struct user_struct *mmap_user = rb->mmap_user;
+++<<<<<<< HEAD
+ +	int mmap_locked = rb->mmap_locked;
+ +	unsigned long size = perf_data_size(rb);
+ +	bool detach_rest = false;
+++=======
+++>>>>>>> 58a8108bc73d (perf: Fix use-after-free when perf mmap() revival races with the last munmap())
+  
+  	/* FIXIES vs perf_pmu_unregister() */
+  	if (unmapped)
+* Unmerged path kernel/events/core.c
