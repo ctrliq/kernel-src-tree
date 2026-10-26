@@ -2468,7 +2468,7 @@ martian_source:
 /* called with rcu_read_lock held */
 static enum skb_drop_reason
 ip_route_input_rcu(struct sk_buff *skb, __be32 daddr, __be32 saddr,
-		   u8 tos, struct net_device *dev,
+		   dscp_t dscp, struct net_device *dev,
 		   struct fib_result *res)
 {
 	/* Multicast recognition logic is moved from route cache to here.
@@ -2510,13 +2510,15 @@ ip_route_input_rcu(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 		     IN_DEV_MFORWARD(in_dev))
 #endif
 		   ) {
-			reason = ip_route_input_mc(skb, daddr, saddr, tos,
+			reason = ip_route_input_mc(skb, daddr, saddr,
+					           inet_dscp_to_dsfield(dscp),
 						   dev, our);
 		}
 		return reason;
 	}
 
-	return ip_route_input_slow(skb, daddr, saddr, tos, dev, res);
+	return ip_route_input_slow(skb, daddr, saddr,
+				   inet_dscp_to_dsfield(dscp), dev, res);
 }
 
 enum skb_drop_reason ip_route_input_noref(struct sk_buff *skb, __be32 daddr,
@@ -2527,8 +2529,7 @@ enum skb_drop_reason ip_route_input_noref(struct sk_buff *skb, __be32 daddr,
 	struct fib_result res;
 
 	rcu_read_lock();
-	reason = ip_route_input_rcu(skb, daddr, saddr, inet_dscp_to_dsfield(dscp),
-		                    dev, &res);
+	reason = ip_route_input_rcu(skb, daddr, saddr, dscp, dev, &res);
 	rcu_read_unlock();
 
 	return reason;
@@ -3342,7 +3343,7 @@ static int inet_rtm_getroute(struct sk_buff *in_skb, struct nlmsghdr *nlh,
 		skb->dev	= dev;
 		skb->mark	= mark;
 		err = ip_route_input_rcu(skb, dst, src,
-					 rtm->rtm_tos & INET_DSCP_MASK,
+					 inet_dsfield_to_dscp(rtm->rtm_tos),
 					 dev, &res) ? -EINVAL : 0;
 
 		rt = skb_rtable(skb);
