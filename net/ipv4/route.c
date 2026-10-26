@@ -1711,9 +1711,8 @@ ip_mc_validate_source(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 		    ip_hdr(skb)->protocol != IPPROTO_IGMP)
 			return SKB_DROP_REASON_IP_INVALID_SOURCE;
 	} else {
-		reason = fib_validate_source_reason(skb, saddr, 0,
-						    inet_dscp_to_dsfield(dscp),
-						    0, dev, in_dev, itag);
+		reason = fib_validate_source_reason(skb, saddr, 0, dscp, 0, dev,
+						    in_dev, itag);
 		if (reason)
 			return reason;
 	}
@@ -1813,8 +1812,8 @@ __mkroute_input(struct sk_buff *skb, const struct fib_result *res,
 		return reason;
 	}
 
-	err = fib_validate_source(skb, saddr, daddr, inet_dscp_to_dsfield(dscp),
-				  FIB_RES_OIF(*res), in_dev->dev, in_dev, &itag);
+	err = fib_validate_source(skb, saddr, daddr, dscp, FIB_RES_OIF(*res),
+				  in_dev->dev, in_dev, &itag);
 	if (err < 0) {
 		reason = -err;
 		ip_handle_martian_source(in_dev->dev, in_dev, skb, daddr,
@@ -2195,8 +2194,7 @@ ip_route_use_hint(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 	if (rt->rt_type != RTN_LOCAL)
 		goto skip_validate_source;
 
-	reason = fib_validate_source_reason(skb, saddr, daddr,
-					    inet_dscp_to_dsfield(dscp), 0, dev,
+	reason = fib_validate_source_reason(skb, saddr, daddr, dscp, 0, dev,
 					    in_dev, &tag);
 	if (reason)
 		goto martian_source;
@@ -2348,9 +2346,8 @@ ip_route_input_slow(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 
 	err = -EINVAL;
 	if (res->type == RTN_LOCAL) {
-		reason = fib_validate_source_reason(skb, saddr, daddr,
-						    inet_dscp_to_dsfield(dscp),
-						    0, dev, in_dev, &itag);
+		reason = fib_validate_source_reason(skb, saddr, daddr, dscp, 0,
+						    dev, in_dev, &itag);
 		if (reason)
 			goto martian_source;
 		goto local_input;
@@ -2378,9 +2375,8 @@ brd_input:
 	}
 
 	if (!ipv4_is_zeronet(saddr)) {
-		reason = fib_validate_source_reason(skb, saddr, 0,
-						    inet_dscp_to_dsfield(dscp),
-						    0, dev, in_dev, &itag);
+		reason = fib_validate_source_reason(skb, saddr, 0, dscp, 0, dev,
+						    in_dev, &itag);
 		if (reason)
 			goto martian_source;
 	}
