@@ -845,7 +845,13 @@ int bpf_bprintf_prepare(const char *fmt, u32 fmt_size, const u64 *raw_args,
 		data->buf = buffers->buf;
 
 	for (i = 0; i < fmt_size; i++) {
-		if ((!isprint(fmt[i]) && !isspace(fmt[i])) || !isascii(fmt[i])) {
+		unsigned char c = fmt[i];
+
+		/*
+		 * Permit bytes >= 0x80 in plain text so UTF-8 literals can pass
+		 * through unchanged, while still rejecting ASCII control bytes.
+		 */
+		if (isascii(c) && !isprint(c) && !isspace(c)) {
 			err = -EINVAL;
 			goto out;
 		}
@@ -867,6 +873,15 @@ int bpf_bprintf_prepare(const char *fmt, u32 fmt_size, const u64 *raw_args,
 		 * always access fmt[i + 1], in the worst case it will be a 0
 		 */
 		i++;
+		c = fmt[i];
+		/*
+		 * The format parser below only understands ASCII conversion
+		 * specifiers and modifiers, so reject non-ASCII after '%'.
+		 */
+		if (!isascii(c)) {
+			err = -EINVAL;
+			goto out;
+		}
 
 		/* skip optional "[0 +-][num]" width formatting field */
 		while (fmt[i] == '0' || fmt[i] == '+'  || fmt[i] == '-' ||
@@ -2231,9 +2246,20 @@ void bpf_rb_root_free(const struct btf_field *field, void *rb_root,
 
 __bpf_kfunc_start_defs();
 
-__bpf_kfunc void *bpf_obj_new_impl(u64 local_type_id__k, void *meta__ign)
+/**
+ * bpf_obj_new() - allocate an object described by program BTF
+ * @local_type_id__k: type ID in program BTF
+ * @meta: verifier-supplied struct metadata
+ *
+ * Allocate an object of the type identified by @local_type_id__k and
+ * initialize its special fields. BPF programs can use
+ * bpf_core_type_id_local() to provide @local_type_id__k. The verifier
+ * rewrites @meta; BPF programs do not set it.
+ *
+ * Return: Pointer to the allocated object, or %NULL on failure.
+ */
+__bpf_kfunc void *bpf_obj_new(u64 local_type_id__k, struct btf_struct_meta *meta)
 {
-	struct btf_struct_meta *meta = meta__ign;
 	u64 size = local_type_id__k;
 	void *p;
 
@@ -2242,15 +2268,37 @@ __bpf_kfunc void *bpf_obj_new_impl(u64 local_type_id__k, void *meta__ign)
 		return NULL;
 	if (meta)
 		bpf_obj_init(meta->record, p);
+
 	return p;
+}
+
+__bpf_kfunc void *bpf_obj_new_impl(u64 local_type_id__k, void *meta__ign)
+{
+	return bpf_obj_new(local_type_id__k, meta__ign);
+}
+
+/**
+ * bpf_percpu_obj_new() - allocate a percpu object described by program BTF
+ * @local_type_id__k: type ID in program BTF
+ * @meta: verifier-supplied struct metadata
+ *
+ * Allocate a percpu object of the type identified by @local_type_id__k. BPF
+ * programs can use bpf_core_type_id_local() to provide @local_type_id__k.
+ * The verifier rewrites @meta; BPF programs do not set it.
+ *
+ * Return: Pointer to the allocated percpu object, or %NULL on failure.
+ */
+__bpf_kfunc void *bpf_percpu_obj_new(u64 local_type_id__k, struct btf_struct_meta *meta)
+{
+	u64 size = local_type_id__k;
+
+	/* The verifier has ensured that meta must be NULL */
+	return bpf_mem_alloc(&bpf_global_percpu_ma, size);
 }
 
 __bpf_kfunc void *bpf_percpu_obj_new_impl(u64 local_type_id__k, void *meta__ign)
 {
-	u64 size = local_type_id__k;
-
-	/* The verifier has ensured that meta__ign must be NULL */
-	return bpf_mem_alloc(&bpf_global_percpu_ma, size);
+	return bpf_percpu_obj_new(local_type_id__k, meta__ign);
 }
 
 /* Must be called under migrate_disable(), as required by bpf_mem_free */
@@ -2276,23 +2324,56 @@ void __bpf_obj_drop_impl(void *p, const struct btf_record *rec, bool percpu)
 	bpf_mem_free_rcu(ma, p);
 }
 
-__bpf_kfunc void bpf_obj_drop_impl(void *p__alloc, void *meta__ign)
+/**
+ * bpf_obj_drop() - drop a previously allocated object
+ * @p__alloc: object to free
+ * @meta: verifier-supplied struct metadata
+ *
+ * Destroy special fields in @p__alloc as needed and free the object. The
+ * verifier rewrites @meta; BPF programs do not set it.
+ */
+__bpf_kfunc void bpf_obj_drop(void *p__alloc, struct btf_struct_meta *meta)
 {
-	struct btf_struct_meta *meta = meta__ign;
 	void *p = p__alloc;
 
 	__bpf_obj_drop_impl(p, meta ? meta->record : NULL, false);
 }
 
-__bpf_kfunc void bpf_percpu_obj_drop_impl(void *p__alloc, void *meta__ign)
+__bpf_kfunc void bpf_obj_drop_impl(void *p__alloc, void *meta__ign)
 {
-	/* The verifier has ensured that meta__ign must be NULL */
+	return bpf_obj_drop(p__alloc, meta__ign);
+}
+
+/**
+ * bpf_percpu_obj_drop() - drop a previously allocated percpu object
+ * @p__alloc: percpu object to free
+ * @meta: verifier-supplied struct metadata
+ *
+ * Free @p__alloc. The verifier rewrites @meta; BPF programs do not set it.
+ */
+__bpf_kfunc void bpf_percpu_obj_drop(void *p__alloc, struct btf_struct_meta *meta)
+{
+	/* The verifier has ensured that meta must be NULL */
 	bpf_mem_free_rcu(&bpf_global_percpu_ma, p__alloc);
 }
 
-__bpf_kfunc void *bpf_refcount_acquire_impl(void *p__refcounted_kptr, void *meta__ign)
+__bpf_kfunc void bpf_percpu_obj_drop_impl(void *p__alloc, void *meta__ign)
 {
-	struct btf_struct_meta *meta = meta__ign;
+	bpf_percpu_obj_drop(p__alloc, meta__ign);
+}
+
+/**
+ * bpf_refcount_acquire() - turn a local kptr into an owning reference
+ * @p__refcounted_kptr: non-owning local kptr
+ * @meta: verifier-supplied struct metadata
+ *
+ * Increment the refcount for @p__refcounted_kptr. The verifier rewrites
+ * @meta; BPF programs do not set it.
+ *
+ * Return: Owning reference to @p__refcounted_kptr, or %NULL on failure.
+ */
+__bpf_kfunc void *bpf_refcount_acquire(void *p__refcounted_kptr, struct btf_struct_meta *meta)
+{
 	struct bpf_refcount *ref;
 
 	/* Could just cast directly to refcount_t *, but need some code using
@@ -2306,6 +2387,11 @@ __bpf_kfunc void *bpf_refcount_acquire_impl(void *p__refcounted_kptr, void *meta
 	 * in verifier.c
 	 */
 	return (void *)p__refcounted_kptr;
+}
+
+__bpf_kfunc void *bpf_refcount_acquire_impl(void *p__refcounted_kptr, void *meta__ign)
+{
+	return bpf_refcount_acquire(p__refcounted_kptr, meta__ign);
 }
 
 static int __bpf_list_add(struct bpf_list_node_kern *node,
@@ -2335,24 +2421,62 @@ static int __bpf_list_add(struct bpf_list_node_kern *node,
 	return 0;
 }
 
+/**
+ * bpf_list_push_front() - add a node to the front of a BPF linked list
+ * @head: list head
+ * @node: node to insert
+ * @meta: verifier-supplied struct metadata
+ * @off: verifier-supplied offset of @node within the containing object
+ *
+ * Insert @node at the front of @head. The verifier rewrites @meta and @off;
+ * BPF programs do not set them.
+ *
+ * Return: 0 on success, or %-EINVAL if @node is already linked.
+ */
+__bpf_kfunc int bpf_list_push_front(struct bpf_list_head *head,
+				    struct bpf_list_node *node,
+				    struct btf_struct_meta *meta,
+				    u64 off)
+{
+	struct bpf_list_node_kern *n = (void *)node;
+
+	return __bpf_list_add(n, head, false, meta ? meta->record : NULL, off);
+}
+
 __bpf_kfunc int bpf_list_push_front_impl(struct bpf_list_head *head,
 					 struct bpf_list_node *node,
 					 void *meta__ign, u64 off)
 {
-	struct bpf_list_node_kern *n = (void *)node;
-	struct btf_struct_meta *meta = meta__ign;
+	return bpf_list_push_front(head, node, meta__ign, off);
+}
 
-	return __bpf_list_add(n, head, false, meta ? meta->record : NULL, off);
+/**
+ * bpf_list_push_back() - add a node to the back of a BPF linked list
+ * @head: list head
+ * @node: node to insert
+ * @meta: verifier-supplied struct metadata
+ * @off: verifier-supplied offset of @node within the containing object
+ *
+ * Insert @node at the back of @head. The verifier rewrites @meta and @off;
+ * BPF programs do not set them.
+ *
+ * Return: 0 on success, or %-EINVAL if @node is already linked.
+ */
+__bpf_kfunc int bpf_list_push_back(struct bpf_list_head *head,
+				   struct bpf_list_node *node,
+				   struct btf_struct_meta *meta,
+				   u64 off)
+{
+	struct bpf_list_node_kern *n = (void *)node;
+
+	return __bpf_list_add(n, head, true, meta ? meta->record : NULL, off);
 }
 
 __bpf_kfunc int bpf_list_push_back_impl(struct bpf_list_head *head,
 					struct bpf_list_node *node,
 					void *meta__ign, u64 off)
 {
-	struct bpf_list_node_kern *n = (void *)node;
-	struct btf_struct_meta *meta = meta__ign;
-
-	return __bpf_list_add(n, head, true, meta ? meta->record : NULL, off);
+	return bpf_list_push_back(head, node, meta__ign, off);
 }
 
 static struct bpf_list_node *__bpf_list_del(struct bpf_list_head *head, bool tail)
@@ -2464,14 +2588,35 @@ static int __bpf_rbtree_add(struct bpf_rb_root *root,
 	return 0;
 }
 
+/**
+ * bpf_rbtree_add() - add a node to a BPF rbtree
+ * @root: tree root
+ * @node: node to insert
+ * @less: comparator used to order nodes
+ * @meta: verifier-supplied struct metadata
+ * @off: verifier-supplied offset of @node within the containing object
+ *
+ * Insert @node into @root using @less. The verifier rewrites @meta and @off;
+ * BPF programs do not set them.
+ *
+ * Return: 0 on success, or %-EINVAL if @node is already linked in a tree.
+ */
+__bpf_kfunc int bpf_rbtree_add(struct bpf_rb_root *root,
+			       struct bpf_rb_node *node,
+			       bool (less)(struct bpf_rb_node *a, const struct bpf_rb_node *b),
+			       struct btf_struct_meta *meta,
+			       u64 off)
+{
+	struct bpf_rb_node_kern *n = (void *)node;
+
+	return __bpf_rbtree_add(root, n, (void *)less, meta ? meta->record : NULL, off);
+}
+
 __bpf_kfunc int bpf_rbtree_add_impl(struct bpf_rb_root *root, struct bpf_rb_node *node,
 				    bool (less)(struct bpf_rb_node *a, const struct bpf_rb_node *b),
 				    void *meta__ign, u64 off)
 {
-	struct btf_struct_meta *meta = meta__ign;
-	struct bpf_rb_node_kern *n = (void *)node;
-
-	return __bpf_rbtree_add(root, n, (void *)less, meta ? meta->record : NULL, off);
+	return bpf_rbtree_add(root, node, less, meta__ign, off);
 }
 
 __bpf_kfunc struct bpf_rb_node *bpf_rbtree_first(struct bpf_rb_root *root)
@@ -3915,7 +4060,7 @@ __bpf_kfunc struct bpf_key *bpf_lookup_user_key(s32 serial, u64 flags)
 	if (IS_ERR(key_ref))
 		return NULL;
 
-	bkey = kmalloc(sizeof(*bkey), GFP_KERNEL);
+	bkey = kmalloc_obj(*bkey, GFP_KERNEL);
 	if (!bkey) {
 		key_put(key_ref_to_ptr(key_ref));
 		return NULL;
@@ -3955,7 +4100,7 @@ __bpf_kfunc struct bpf_key *bpf_lookup_system_key(u64 id)
 	if (system_keyring_id_check(id) < 0)
 		return NULL;
 
-	bkey = kmalloc(sizeof(*bkey), GFP_ATOMIC);
+	bkey = kmalloc_obj(*bkey, GFP_ATOMIC);
 	if (!bkey)
 		return NULL;
 
@@ -4018,8 +4163,13 @@ __bpf_kfunc int bpf_verify_pkcs7_signature(struct bpf_dynptr *data_p,
 
 	data_len = __bpf_dynptr_size(data_ptr);
 	data = __bpf_dynptr_data(data_ptr, data_len);
+	if (!data)
+		return -EINVAL;
+
 	sig_len = __bpf_dynptr_size(sig_ptr);
 	sig = __bpf_dynptr_data(sig_ptr, sig_len);
+	if (!sig)
+		return -EINVAL;
 
 	return verify_pkcs7_signature(data, data_len, sig, sig_len,
 				      trusted_keyring->key,
@@ -4411,12 +4561,19 @@ BTF_KFUNCS_START(generic_btf_ids)
 #ifdef CONFIG_CRASH_DUMP
 BTF_ID_FLAGS(func, crash_kexec, KF_DESTRUCTIVE)
 #endif
+BTF_ID_FLAGS(func, bpf_obj_new, KF_ACQUIRE | KF_RET_NULL | KF_IMPLICIT_ARGS)
 BTF_ID_FLAGS(func, bpf_obj_new_impl, KF_ACQUIRE | KF_RET_NULL)
+BTF_ID_FLAGS(func, bpf_percpu_obj_new, KF_ACQUIRE | KF_RET_NULL | KF_IMPLICIT_ARGS)
 BTF_ID_FLAGS(func, bpf_percpu_obj_new_impl, KF_ACQUIRE | KF_RET_NULL)
+BTF_ID_FLAGS(func, bpf_obj_drop, KF_RELEASE | KF_IMPLICIT_ARGS)
 BTF_ID_FLAGS(func, bpf_obj_drop_impl, KF_RELEASE)
+BTF_ID_FLAGS(func, bpf_percpu_obj_drop, KF_RELEASE | KF_IMPLICIT_ARGS)
 BTF_ID_FLAGS(func, bpf_percpu_obj_drop_impl, KF_RELEASE)
+BTF_ID_FLAGS(func, bpf_refcount_acquire, KF_ACQUIRE | KF_RET_NULL | KF_RCU | KF_IMPLICIT_ARGS)
 BTF_ID_FLAGS(func, bpf_refcount_acquire_impl, KF_ACQUIRE | KF_RET_NULL | KF_RCU)
+BTF_ID_FLAGS(func, bpf_list_push_front, KF_IMPLICIT_ARGS)
 BTF_ID_FLAGS(func, bpf_list_push_front_impl)
+BTF_ID_FLAGS(func, bpf_list_push_back, KF_IMPLICIT_ARGS)
 BTF_ID_FLAGS(func, bpf_list_push_back_impl)
 BTF_ID_FLAGS(func, bpf_list_pop_front, KF_ACQUIRE | KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_list_pop_back, KF_ACQUIRE | KF_RET_NULL)
@@ -4425,6 +4582,7 @@ BTF_ID_FLAGS(func, bpf_list_back, KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_task_acquire, KF_ACQUIRE | KF_RCU | KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_task_release, KF_RELEASE)
 BTF_ID_FLAGS(func, bpf_rbtree_remove, KF_ACQUIRE | KF_RET_NULL)
+BTF_ID_FLAGS(func, bpf_rbtree_add, KF_IMPLICIT_ARGS)
 BTF_ID_FLAGS(func, bpf_rbtree_add_impl)
 BTF_ID_FLAGS(func, bpf_rbtree_first, KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_rbtree_root, KF_RET_NULL)

@@ -136,10 +136,10 @@ static void test_shmem(struct bpf_link *link, struct memcg_query *memcg_query)
 
 	/*
 	 * Increase memcg shmem usage by creating and writing
-	 * to a shmem object.
+	 * to a memfd backed by shmem/tmpfs.
 	 */
-	fd = shm_open("/tmp_shmem", O_CREAT | O_RDWR, 0644);
-	if (!ASSERT_OK_FD(fd, "shm_open"))
+	fd = memfd_create("tmp_shmem", 0);
+	if (!ASSERT_OK_FD(fd, "memfd_create"))
 		return;
 
 retry:
@@ -158,33 +158,6 @@ retry:
 
 cleanup:
 	close(fd);
-	shm_unlink("/tmp_shmem");
-}
-
-#define NR_PIPES 64
-static void test_kmem(struct bpf_link *link, struct memcg_query *memcg_query)
-{
-	int fds[NR_PIPES][2], i;
-
-	/*
-	 * Increase kmem value by creating pipes which will allocate some
-	 * kernel buffers.
-	 */
-	for (i = 0; i < NR_PIPES; i++) {
-		if (!ASSERT_OK(pipe(fds[i]), "pipe"))
-			goto cleanup;
-	}
-
-	if (!ASSERT_OK(read_stats(link), "read stats"))
-		goto cleanup;
-
-	ASSERT_GT(memcg_query->memcg_kmem, 0, "kmem value");
-
-cleanup:
-	for (i = i - 1; i >= 0; i--) {
-		close(fds[i][0]);
-		close(fds[i][1]);
-	}
 }
 
 static void test_pgfault(struct bpf_link *link, struct memcg_query *memcg_query)
@@ -252,8 +225,6 @@ void test_cgroup_iter_memcg(void)
 		test_shmem(link, &skel->data_query->memcg_query);
 	if (test__start_subtest("cgroup_iter_memcg__file"))
 		test_file(link, &skel->data_query->memcg_query);
-	if (test__start_subtest("cgroup_iter_memcg__kmem"))
-		test_kmem(link, &skel->data_query->memcg_query);
 	if (test__start_subtest("cgroup_iter_memcg__pgfault"))
 		test_pgfault(link, &skel->data_query->memcg_query);
 

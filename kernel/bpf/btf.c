@@ -270,6 +270,7 @@ struct btf {
 	struct btf_id_dtor_kfunc_tab *dtor_kfunc_tab;
 	struct btf_struct_metas *struct_meta_tab;
 	struct btf_struct_ops_tab *struct_ops_tab;
+	struct btf_layout *layout;
 
 	/* split BTF support */
 	struct btf *base_btf;
@@ -1707,6 +1708,11 @@ static void btf_verifier_log_hdr(struct btf_verifier_env *env,
 	__btf_verifier_log(log, "type_len: %u\n", hdr->type_len);
 	__btf_verifier_log(log, "str_off: %u\n", hdr->str_off);
 	__btf_verifier_log(log, "str_len: %u\n", hdr->str_len);
+	if (hdr->hdr_len >= sizeof(struct btf_header) &&
+	    btf_data_size >= hdr->hdr_len) {
+		__btf_verifier_log(log, "layout_off: %u\n", hdr->layout_off);
+		__btf_verifier_log(log, "layout_len: %u\n", hdr->layout_len);
+	}
 	__btf_verifier_log(log, "btf_total_size: %u\n", btf_data_size);
 }
 
@@ -1729,8 +1735,8 @@ static int btf_add_type(struct btf_verifier_env *env, struct btf_type *t)
 		new_size = min_t(u32, BTF_MAX_TYPE,
 				 btf->types_size + expand_by);
 
-		new_types = kvcalloc(new_size, sizeof(*new_types),
-				     GFP_KERNEL | __GFP_NOWARN);
+		new_types = kvzalloc_objs(*new_types, new_size,
+					  GFP_KERNEL | __GFP_NOWARN);
 		if (!new_types)
 			return -ENOMEM;
 
@@ -4081,7 +4087,7 @@ struct btf_record *btf_parse_fields(const struct btf *btf, const struct btf_type
 	/* This needs to be kzalloc to zero out padding and unused fields, see
 	 * comment in btf_record_equal.
 	 */
-	rec = kzalloc(struct_size(rec, fields, cnt), GFP_KERNEL_ACCOUNT | __GFP_NOWARN);
+	rec = kzalloc_flex(*rec, fields, cnt, GFP_KERNEL_ACCOUNT | __GFP_NOWARN);
 	if (!rec)
 		return ERR_PTR(-ENOMEM);
 
@@ -5526,7 +5532,8 @@ static int btf_parse_str_sec(struct btf_verifier_env *env)
 	start = btf->nohdr_data + hdr->str_off;
 	end = start + hdr->str_len;
 
-	if (end != btf->data + btf->data_size) {
+	if (hdr->hdr_len < sizeof(struct btf_header) &&
+	    end != btf->data + btf->data_size) {
 		btf_verifier_log(env, "String section is not at the end");
 		return -EINVAL;
 	}
@@ -5547,9 +5554,46 @@ static int btf_parse_str_sec(struct btf_verifier_env *env)
 	return 0;
 }
 
+static int btf_parse_layout_sec(struct btf_verifier_env *env)
+{
+	const struct btf_header *hdr = &env->btf->hdr;
+	struct btf *btf = env->btf;
+	void *start, *end;
+
+	if (hdr->hdr_len < sizeof(struct btf_header) ||
+	    hdr->layout_len == 0)
+		return 0;
+
+	/* Layout section must align to 4 bytes */
+	if (hdr->layout_off & (sizeof(u32) - 1)) {
+		btf_verifier_log(env, "Unaligned layout_off");
+		return -EINVAL;
+	}
+	start = btf->nohdr_data + hdr->layout_off;
+	end = start + hdr->layout_len;
+
+	if (hdr->layout_len < sizeof(struct btf_layout)) {
+		btf_verifier_log(env, "Layout section is too small");
+		return -EINVAL;
+	}
+	if (hdr->layout_len % sizeof(struct btf_layout) != 0) {
+		btf_verifier_log(env, "layout_len is not multiple of %zu",
+				 sizeof(struct btf_layout));
+		return -EINVAL;
+	}
+	if (end > btf->data + btf->data_size) {
+		btf_verifier_log(env, "Layout section is too big");
+		return -EINVAL;
+	}
+	btf->layout = start;
+
+	return 0;
+}
+
 static const size_t btf_sec_info_offset[] = {
 	offsetof(struct btf_header, type_off),
 	offsetof(struct btf_header, str_off),
+	offsetof(struct btf_header, layout_off)
 };
 
 static int btf_sec_info_cmp(const void *a, const void *b)
@@ -5565,24 +5609,28 @@ static int btf_check_sec_info(struct btf_verifier_env *env,
 {
 	struct btf_sec_info secs[ARRAY_SIZE(btf_sec_info_offset)];
 	u32 total, expected_total, i;
+	u32 nr_secs = ARRAY_SIZE(btf_sec_info_offset);
 	const struct btf_header *hdr;
 	const struct btf *btf;
 
 	btf = env->btf;
 	hdr = &btf->hdr;
 
+	if (hdr->hdr_len < sizeof(struct btf_header) || hdr->layout_len == 0)
+		nr_secs--;
+
 	/* Populate the secs from hdr */
-	for (i = 0; i < ARRAY_SIZE(btf_sec_info_offset); i++)
+	for (i = 0; i < nr_secs; i++)
 		secs[i] = *(struct btf_sec_info *)((void *)hdr +
 						   btf_sec_info_offset[i]);
 
-	sort(secs, ARRAY_SIZE(btf_sec_info_offset),
+	sort(secs, nr_secs,
 	     sizeof(struct btf_sec_info), btf_sec_info_cmp, NULL);
 
 	/* Check for gaps and overlap among sections */
 	total = 0;
 	expected_total = btf_data_size - hdr->hdr_len;
-	for (i = 0; i < ARRAY_SIZE(btf_sec_info_offset); i++) {
+	for (i = 0; i < nr_secs; i++) {
 		if (expected_total < secs[i].off) {
 			btf_verifier_log(env, "Invalid section offset");
 			return -EINVAL;
@@ -5696,7 +5744,7 @@ btf_parse_struct_metas(struct bpf_verifier_log *log, struct btf *btf)
 	BUILD_BUG_ON(offsetof(struct btf_id_set, cnt) != 0);
 	BUILD_BUG_ON(sizeof(struct btf_id_set) != sizeof(u32));
 
-	aof = kmalloc(sizeof(*aof), GFP_KERNEL | __GFP_NOWARN);
+	aof = kmalloc_obj(*aof, GFP_KERNEL | __GFP_NOWARN);
 	if (!aof)
 		return ERR_PTR(-ENOMEM);
 	aof->cnt = 0;
@@ -5894,7 +5942,7 @@ static struct btf *btf_parse(const union bpf_attr *attr, bpfptr_t uattr, u32 uat
 	if (attr->btf_size > BTF_MAX_SIZE)
 		return ERR_PTR(-E2BIG);
 
-	env = kzalloc(sizeof(*env), GFP_KERNEL | __GFP_NOWARN);
+	env = kzalloc_obj(*env, GFP_KERNEL | __GFP_NOWARN);
 	if (!env)
 		return ERR_PTR(-ENOMEM);
 
@@ -5906,7 +5954,7 @@ static struct btf *btf_parse(const union bpf_attr *attr, bpfptr_t uattr, u32 uat
 	if (err)
 		goto errout_free;
 
-	btf = kzalloc(sizeof(*btf), GFP_KERNEL | __GFP_NOWARN);
+	btf = kzalloc_obj(*btf, GFP_KERNEL | __GFP_NOWARN);
 	if (!btf) {
 		err = -ENOMEM;
 		goto errout;
@@ -5935,6 +5983,10 @@ static struct btf *btf_parse(const union bpf_attr *attr, bpfptr_t uattr, u32 uat
 	btf->nohdr_data = btf->data + btf->hdr.hdr_len;
 
 	err = btf_parse_str_sec(env);
+	if (err)
+		goto errout;
+
+	err = btf_parse_layout_sec(env);
 	if (err)
 		goto errout;
 
@@ -6323,7 +6375,7 @@ static struct btf *btf_parse_base(struct btf_verifier_env *env, const char *name
 	if (!IS_ENABLED(CONFIG_DEBUG_INFO_BTF))
 		return ERR_PTR(-ENOENT);
 
-	btf = kzalloc(sizeof(*btf), GFP_KERNEL | __GFP_NOWARN);
+	btf = kzalloc_obj(*btf, GFP_KERNEL | __GFP_NOWARN);
 	if (!btf) {
 		err = -ENOMEM;
 		goto errout;
@@ -6374,7 +6426,7 @@ struct btf *btf_parse_vmlinux(void)
 	struct btf *btf;
 	int err;
 
-	env = kzalloc(sizeof(*env), GFP_KERNEL | __GFP_NOWARN);
+	env = kzalloc_obj(*env, GFP_KERNEL | __GFP_NOWARN);
 	if (!env)
 		return ERR_PTR(-ENOMEM);
 
@@ -6424,7 +6476,7 @@ static struct btf *btf_parse_module(const char *module_name, const void *data,
 	if (!vmlinux_btf)
 		return ERR_PTR(-EINVAL);
 
-	env = kzalloc(sizeof(*env), GFP_KERNEL | __GFP_NOWARN);
+	env = kzalloc_obj(*env, GFP_KERNEL | __GFP_NOWARN);
 	if (!env)
 		return ERR_PTR(-ENOMEM);
 
@@ -6441,7 +6493,7 @@ static struct btf *btf_parse_module(const char *module_name, const void *data,
 		base_btf = vmlinux_btf;
 	}
 
-	btf = kzalloc(sizeof(*btf), GFP_KERNEL | __GFP_NOWARN);
+	btf = kzalloc_obj(*btf, GFP_KERNEL | __GFP_NOWARN);
 	if (!btf) {
 		err = -ENOMEM;
 		goto errout;
@@ -6515,13 +6567,6 @@ struct btf *bpf_prog_get_target_btf(const struct bpf_prog *prog)
 		return tgt_prog->aux->btf;
 	else
 		return prog->aux->attach_btf;
-}
-
-static bool is_void_or_int_ptr(struct btf *btf, const struct btf_type *t)
-{
-	/* skip modifiers */
-	t = btf_type_skip_modifiers(btf, t->type, NULL);
-	return btf_type_is_void(t) || btf_type_is_int(t);
 }
 
 u32 btf_ctx_arg_idx(struct btf *btf, const struct btf_type *func_proto,
@@ -6911,10 +6956,14 @@ bool btf_ctx_access(int off, int size, enum bpf_access_type type,
 	}
 
 	/*
-	 * If it's a pointer to void, it's the same as scalar from the verifier
-	 * safety POV. Either way, no futher pointer walking is allowed.
+	 * If it's a single or multilevel pointer, except a pointer
+	 * to a structure, it's the same as scalar from the verifier
+	 * safety POV. Multilevel pointers to structures are treated as
+	 * scalars. The verifier lacks the context to infer the size of
+	 * their target memory regions. Either way, no further pointer
+	 * walking is allowed.
 	 */
-	if (is_void_or_int_ptr(btf, t))
+	if (!btf_type_is_struct_ptr(btf, t))
 		return true;
 
 	/* this is a pointer to another type */
@@ -7844,15 +7893,16 @@ int btf_prepare_func_args(struct bpf_verifier_env *env, int subprog)
 			tname, nargs, MAX_BPF_FUNC_REG_ARGS);
 		return -EINVAL;
 	}
-	/* check that function returns int, exception cb also requires this */
+	/* check that function is void or returns int, exception cb also requires this */
 	t = btf_type_by_id(btf, t->type);
 	while (btf_type_is_modifier(t))
 		t = btf_type_by_id(btf, t->type);
-	if (!btf_type_is_int(t) && !btf_is_any_enum(t)) {
+	if (!btf_type_is_void(t) && !btf_type_is_int(t) && !btf_is_any_enum(t)) {
 		if (!is_global)
 			return -EINVAL;
 		bpf_log(log,
-			"Global function %s() doesn't return scalar. Only those are supported.\n",
+			"Global function %s() return value not void or scalar. "
+			"Only those are supported.\n",
 			tname);
 		return -EINVAL;
 	}
@@ -8314,7 +8364,7 @@ static int btf_module_notify(struct notifier_block *nb, unsigned long op,
 
 	switch (op) {
 	case MODULE_STATE_COMING:
-		btf_mod = kzalloc(sizeof(*btf_mod), GFP_KERNEL);
+		btf_mod = kzalloc_obj(*btf_mod, GFP_KERNEL);
 		if (!btf_mod) {
 			err = -ENOMEM;
 			goto out;
@@ -8349,7 +8399,7 @@ static int btf_module_notify(struct notifier_block *nb, unsigned long op,
 		if (IS_ENABLED(CONFIG_SYSFS)) {
 			struct bin_attribute *attr;
 
-			attr = kzalloc(sizeof(*attr), GFP_KERNEL);
+			attr = kzalloc_obj(*attr, GFP_KERNEL);
 			if (!attr)
 				goto out;
 
@@ -8704,7 +8754,7 @@ static int btf_populate_kfunc_set(struct btf *btf, enum btf_kfunc_hook hook,
 	}
 
 	if (!tab) {
-		tab = kzalloc(sizeof(*tab), GFP_KERNEL | __GFP_NOWARN);
+		tab = kzalloc_obj(*tab, GFP_KERNEL | __GFP_NOWARN);
 		if (!tab)
 			return -ENOMEM;
 		btf->kfunc_set_tab = tab;
@@ -9483,7 +9533,7 @@ int bpf_core_apply(struct bpf_core_ctx *ctx, const struct bpf_core_relo *relo,
 	/* ~4k of temp memory necessary to convert LLVM spec like "0:1:0:5"
 	 * into arrays of btf_ids of struct fields and array indices.
 	 */
-	specs = kcalloc(3, sizeof(*specs), GFP_KERNEL_ACCOUNT);
+	specs = kzalloc_objs(*specs, 3, GFP_KERNEL_ACCOUNT);
 	if (!specs)
 		return -ENOMEM;
 
@@ -9508,7 +9558,8 @@ int bpf_core_apply(struct bpf_core_ctx *ctx, const struct bpf_core_relo *relo,
 			goto out;
 		}
 		if (cc->cnt) {
-			cands.cands = kcalloc(cc->cnt, sizeof(*cands.cands), GFP_KERNEL_ACCOUNT);
+			cands.cands = kzalloc_objs(*cands.cands, cc->cnt,
+						   GFP_KERNEL_ACCOUNT);
 			if (!cands.cands) {
 				err = -ENOMEM;
 				goto out;
@@ -9660,7 +9711,7 @@ btf_add_struct_ops(struct btf *btf, struct bpf_struct_ops *st_ops,
 
 	tab = btf->struct_ops_tab;
 	if (!tab) {
-		tab = kzalloc(struct_size(tab, ops, 4), GFP_KERNEL);
+		tab = kzalloc_flex(*tab, ops, 4, GFP_KERNEL);
 		if (!tab)
 			return -ENOMEM;
 		tab->capacity = 4;
@@ -9749,7 +9800,7 @@ int __register_bpf_struct_ops(struct bpf_struct_ops *st_ops)
 	if (IS_ERR(btf))
 		return PTR_ERR(btf);
 
-	log = kzalloc(sizeof(*log), GFP_KERNEL | __GFP_NOWARN);
+	log = kzalloc_obj(*log, GFP_KERNEL | __GFP_NOWARN);
 	if (!log) {
 		err = -ENOMEM;
 		goto errout;

@@ -62,7 +62,7 @@ out:
 	arena_list__destroy(skel);
 }
 
-void test_arena_list(void)
+void serial_test_arena_list(void)
 {
 	if (test__start_subtest("arena_list_1"))
 		test_arena_list_add_del(1);

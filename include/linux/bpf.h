@@ -1002,6 +1002,7 @@ enum bpf_reg_type {
 	PTR_TO_ARENA,
 	PTR_TO_BUF,		 /* reg points to a read/write buffer */
 	PTR_TO_FUNC,		 /* reg points to a bpf program function */
+	PTR_TO_INSN,		 /* reg points to a bpf program instruction */
 	CONST_PTR_TO_DYNPTR,	 /* reg points to a const struct bpf_dynptr */
 	__BPF_REG_TYPE_MAX,
 
@@ -1524,6 +1525,8 @@ bool bpf_has_frame_pointer(unsigned long ip);
 int bpf_jit_charge_modmem(u32 size);
 void bpf_jit_uncharge_modmem(u32 size);
 bool bpf_prog_has_trampoline(const struct bpf_prog *prog);
+bool bpf_insn_is_indirect_target(const struct bpf_verifier_env *env, const struct bpf_prog *prog,
+				 int insn_idx);
 #else
 static inline int bpf_trampoline_link_prog(struct bpf_tramp_link *link,
 					   struct bpf_trampoline *tr,
@@ -1757,8 +1760,9 @@ struct bpf_prog_aux {
 
 struct bpf_prog {
 	u16			pages;		/* Number of allocated pages */
-	u16			jited:1,	/* Is our filter JIT'ed? */
+	u32			jited:1,	/* Is our filter JIT'ed? */
 				jit_requested:1,/* archs need to JIT the prog */
+				jit_required:1,	/* program strictly requires JIT compiler */
 				gpl_compatible:1, /* Is filter GPL compatible? */
 				cb_access:1,	/* Is control block accessed? */
 				dst_needed:1,	/* Do we need dst entry? */
@@ -2282,7 +2286,7 @@ static inline bool bpf_map_flags_access_ok(u32 access_flags)
 
 static inline struct bpf_map_owner *bpf_map_owner_alloc(struct bpf_map *map)
 {
-	return kzalloc(sizeof(*map->owner), GFP_ATOMIC);
+	return kzalloc_obj(*map->owner, GFP_ATOMIC);
 }
 
 static inline void bpf_map_owner_free(struct bpf_map *map)
@@ -2348,18 +2352,13 @@ struct bpf_prog_array {
 	struct bpf_prog_array_item items[];
 };
 
-struct bpf_empty_prog_array {
-	struct bpf_prog_array hdr;
-	struct bpf_prog *null_prog;
-};
-
 /* to avoid allocating empty bpf_prog_array for cgroups that
  * don't have bpf program attached use one global 'bpf_empty_prog_array'
  * It will not be modified the caller of bpf_prog_array_alloc()
  * (since caller requested prog_cnt == 0)
  * that pointer should be 'freed' by bpf_prog_array_free()
  */
-extern struct bpf_empty_prog_array bpf_empty_prog_array;
+extern struct bpf_prog_array bpf_empty_prog_array;
 
 struct bpf_prog_array *bpf_prog_array_alloc(u32 prog_cnt, gfp_t flags);
 void bpf_prog_array_free(struct bpf_prog_array *progs);
@@ -2880,7 +2879,13 @@ int bpf_check_uarg_tail_zero(bpfptr_t uaddr, size_t expected_size,
 int bpf_check(struct bpf_prog **fp, union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size);
 
 #ifndef CONFIG_BPF_JIT_ALWAYS_ON
-void bpf_patch_call_args(struct bpf_insn *insn, u32 stack_depth);
+int bpf_patch_call_args(struct bpf_insn *insn, u32 stack_depth);
+s32 bpf_call_args_imm(s16 idx);
+#else
+static inline s32 bpf_call_args_imm(s16 idx)
+{
+	return 0;
+}
 #endif
 
 struct btf *bpf_get_btf_vmlinux(void);
@@ -2996,7 +3001,6 @@ const struct bpf_func_proto *bpf_base_func_proto(enum bpf_func_id func_id,
 						 const struct bpf_prog *prog);
 void bpf_task_storage_free(struct task_struct *task);
 void bpf_cgrp_storage_free(struct cgroup *cgroup);
-bool bpf_prog_has_kfunc_call(const struct bpf_prog *prog);
 const struct btf_func_model *
 bpf_jit_find_kfunc_model(const struct bpf_prog *prog,
 			 const struct bpf_insn *insn);
@@ -3279,11 +3283,6 @@ static inline void bpf_task_storage_free(struct task_struct *task)
 {
 }
 
-static inline bool bpf_prog_has_kfunc_call(const struct bpf_prog *prog)
-{
-	return false;
-}
-
 static inline const struct btf_func_model *
 bpf_jit_find_kfunc_model(const struct bpf_prog *prog,
 			 const struct bpf_insn *insn)
@@ -3394,6 +3393,7 @@ int bpf_dev_bound_kfunc_check(struct bpf_verifier_log *log,
 void *bpf_dev_bound_resolve_kfunc(struct bpf_prog *prog, u32 func_id);
 int bpf_prog_dev_bound_init(struct bpf_prog *prog, union bpf_attr *attr);
 int bpf_prog_dev_bound_inherit(struct bpf_prog *new_prog, struct bpf_prog *old_prog);
+void bpf_prog_dev_bound_moved(struct bpf_prog *prog);
 void bpf_dev_bound_netdev_unregister(struct net_device *dev);
 
 static inline bool bpf_prog_is_dev_bound(const struct bpf_prog_aux *aux)
@@ -3453,6 +3453,10 @@ static inline int bpf_prog_dev_bound_inherit(struct bpf_prog *new_prog,
 					     struct bpf_prog *old_prog)
 {
 	return -EOPNOTSUPP;
+}
+
+static inline void bpf_prog_dev_bound_moved(struct bpf_prog *prog)
+{
 }
 
 static inline void bpf_dev_bound_netdev_unregister(struct net_device *dev)
@@ -3905,6 +3909,9 @@ static inline bool bpf_is_subprog(const struct bpf_prog *prog)
 	return prog->aux->func_idx != 0;
 }
 
+const struct bpf_line_info *bpf_find_linfo(const struct bpf_prog *prog, u32 insn_off);
+void bpf_get_linfo_file_line(struct btf *btf, const struct bpf_line_info *linfo,
+			     const char **filep, const char **linep, int *nump);
 int bpf_prog_get_file_line(struct bpf_prog *prog, unsigned long ip, const char **filep,
 			   const char **linep, int *nump);
 struct bpf_prog *bpf_prog_find_from_stack(void);
@@ -3912,7 +3919,7 @@ struct bpf_prog *bpf_prog_find_from_stack(void);
 int bpf_insn_array_init(struct bpf_map *map, const struct bpf_prog *prog);
 int bpf_insn_array_ready(struct bpf_map *map);
 void bpf_insn_array_release(struct bpf_map *map);
-void bpf_insn_array_adjust(struct bpf_map *map, u32 off, u32 len);
+void bpf_insn_array_adjust(struct bpf_map *map, u32 first, u32 len);
 void bpf_insn_array_adjust_after_remove(struct bpf_map *map, u32 off, u32 len);
 
 #ifdef CONFIG_BPF_SYSCALL

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Converted from tools/testing/selftests/bpf/verifier/direct_packet_access.c */
 
+#include <linux/if_ether.h>
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
 #include "bpf_misc.h"
@@ -411,7 +412,7 @@ l0_%=:	r0 = 0;						\
 
 SEC("tc")
 __description("direct packet access: test17 (pruning, alignment)")
-__failure __msg("misaligned packet access off 2+0+15+-4 size 4")
+__failure __msg("misaligned packet access off 2+15+-4 size 4")
 __flag(BPF_F_STRICT_ALIGNMENT)
 __naked void packet_access_test17_pruning_alignment(void)
 {
@@ -568,7 +569,7 @@ l0_%=:	r0 = 0;						\
 
 SEC("tc")
 __description("direct packet access: test23 (x += pkt_ptr, 4)")
-__failure __msg("invalid access to packet, off=0 size=8, R5(id=3,off=0,r=0)")
+__failure __msg("invalid access to packet, off=31 size=8, R5(id=3,off=31,r=0)")
 __flag(BPF_F_ANY_ALIGNMENT)
 __naked void test23_x_pkt_ptr_4(void)
 {
@@ -796,6 +797,67 @@ l0_%=:	/* exit(0) */					\
 "	:
 	: __imm(bpf_ktime_get_ns),
 	  __imm_const(__sk_buff_data, offsetof(struct __sk_buff, data)),
+	  __imm_const(__sk_buff_data_end, offsetof(struct __sk_buff, data_end))
+	: __clobber_all);
+}
+
+SEC("tc")
+__description("direct packet access: pkt_range cleared after sub with known scalar")
+__failure __msg("invalid access to packet")
+__naked void pkt_range_clear_after_sub(void)
+{
+	asm volatile ("					\
+	r9 = *(u32*)(r1 + %[__sk_buff_data]);		\
+	r8 = *(u32*)(r1 + %[__sk_buff_data_end]);	\
+	r9 += 256;					\
+	if r9 >= r8 goto l0_%=;				\
+	r0 = 0;						\
+	exit;						\
+l0_%=:	/* r9 has AT_PKT_END (pkt + 256 >= pkt_end) */	\
+	r9 -= 256;					\
+	/*						\
+	 * AT_PKT_END must not survive the arithmetic.	\
+	 * is_pkt_ptr_branch_taken must validate both	\
+	 * branches when visiting the next condition.	\
+	 */						\
+	if r9 < r8 goto l1_%=;				\
+	r0 = 0;						\
+	exit;						\
+l1_%=:	r0 = *(u8*)(r9 + 0);				\
+	r0 = 0;						\
+	exit;						\
+"	:
+	: __imm_const(__sk_buff_data, offsetof(struct __sk_buff, data)),
+	  __imm_const(__sk_buff_data_end, offsetof(struct __sk_buff, data_end))
+	: __clobber_all);
+}
+
+SEC("tc")
+__description("direct packet access: pkt_range cleared after add with known scalar")
+__failure __msg("invalid access to packet")
+__naked void pkt_range_clear_after_add(void)
+{
+	asm volatile ("					\
+	r9 = *(u32*)(r1 + %[__sk_buff_data]);		\
+	r8 = *(u32*)(r1 + %[__sk_buff_data_end]);	\
+	r9 += 256;					\
+	if r9 >= r8 goto l0_%=;				\
+	r0 = 0;						\
+	exit;						\
+l0_%=:	/* r9 has AT_PKT_END (pkt + 256 >= pkt_end) */	\
+	r9 += -256;					\
+	/*						\
+	 * Same as sub, but goes through BPF_ADD path.	\
+	 * AT_PKT_END must not survive the arithmetic.	\
+	 */						\
+	if r9 < r8 goto l1_%=;				\
+	r0 = 0;						\
+	exit;						\
+l1_%=:	r0 = *(u8*)(r9 + 0);				\
+	r0 = 0;						\
+	exit;						\
+"	:
+	: __imm_const(__sk_buff_data, offsetof(struct __sk_buff, data)),
 	  __imm_const(__sk_buff_data_end, offsetof(struct __sk_buff, data_end))
 	: __clobber_all);
 }

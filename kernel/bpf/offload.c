@@ -72,7 +72,7 @@ static int __bpf_offload_dev_netdev_register(struct bpf_offload_dev *offdev,
 	struct bpf_offload_netdev *ondev;
 	int err;
 
-	ondev = kzalloc(sizeof(*ondev), GFP_KERNEL);
+	ondev = kzalloc_obj(*ondev, GFP_KERNEL);
 	if (!ondev)
 		return -ENOMEM;
 
@@ -94,6 +94,22 @@ static int __bpf_offload_dev_netdev_register(struct bpf_offload_dev *offdev,
 err_free:
 	kfree(ondev);
 	return err;
+}
+
+/*
+ * @prog takes the place of a copy that the caller is about to free. Nothing
+ * keeps the netdev while a program is loaded: once the lock is dropped, no
+ * unregistration is left that has got the old copy from offload->prog.
+ */
+void bpf_prog_dev_bound_moved(struct bpf_prog *prog)
+{
+	if (!bpf_prog_is_dev_bound(prog->aux))
+		return;
+
+	down_read(&bpf_devs_lock);
+	if (prog->aux->offload)
+		prog->aux->offload->prog = prog;
+	up_read(&bpf_devs_lock);
 }
 
 static void __bpf_prog_offload_destroy(struct bpf_prog *prog)
@@ -182,7 +198,7 @@ static int __bpf_prog_dev_bound_init(struct bpf_prog *prog, struct net_device *n
 	struct bpf_prog_offload *offload;
 	int err;
 
-	offload = kzalloc(sizeof(*offload), GFP_USER);
+	offload = kzalloc_obj(*offload, GFP_USER);
 	if (!offload)
 		return -ENOMEM;
 
@@ -435,9 +451,8 @@ static struct ns_common *bpf_prog_offload_info_fill_ns(void *private_data)
 
 	if (aux->offload) {
 		args->info->ifindex = aux->offload->netdev->ifindex;
-		net = dev_net(aux->offload->netdev);
-		get_net(net);
-		ns = &net->ns;
+		net = maybe_get_net(dev_net(aux->offload->netdev));
+		ns = net ? &net->ns : NULL;
 	} else {
 		args->info->ifindex = 0;
 		ns = NULL;
@@ -647,9 +662,8 @@ static struct ns_common *bpf_map_offload_info_fill_ns(void *private_data)
 
 	if (args->offmap->netdev) {
 		args->info->ifindex = args->offmap->netdev->ifindex;
-		net = dev_net(args->offmap->netdev);
-		get_net(net);
-		ns = &net->ns;
+		net = maybe_get_net(dev_net(args->offmap->netdev));
+		ns = net ? &net->ns : NULL;
 	} else {
 		args->info->ifindex = 0;
 		ns = NULL;
@@ -777,7 +791,7 @@ bpf_offload_dev_create(const struct bpf_prog_offload_ops *ops, void *priv)
 {
 	struct bpf_offload_dev *offdev;
 
-	offdev = kzalloc(sizeof(*offdev), GFP_KERNEL);
+	offdev = kzalloc_obj(*offdev, GFP_KERNEL);
 	if (!offdev)
 		return ERR_PTR(-ENOMEM);
 

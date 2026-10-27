@@ -41,6 +41,8 @@ LIBELF_LIBS	:= $(shell $(PKG_CONFIG) libelf --libs 2>/dev/null || echo -lelf)
 
 SKIP_DOCS	?=
 SKIP_LLVM	?=
+SKIP_LIBBFD	?=
+SKIP_CRYPTO	?=
 
 ifeq ($(srctree),)
 srctree := $(patsubst %/,%,$(dir $(CURDIR)))
@@ -122,14 +124,13 @@ TEST_PROGS := test_kmod.sh \
 	test_tc_edt.sh \
 	test_xdping.sh \
 	test_bpftool_build.sh \
-	test_bpftool.sh \
 	test_doc_build.sh \
 	test_xsk.sh \
 	test_xdp_features.sh
 
 TEST_PROGS_EXTENDED := \
 	ima_setup.sh verify_sig_setup.sh \
-	test_xdp_vlan.sh test_bpftool.py
+	test_xdp_vlan.sh
 
 TEST_KMODS := bpf_testmod.ko bpf_test_no_cfi.ko bpf_test_modorder_x.ko \
 	bpf_test_modorder_y.ko bpf_test_rqspinlock.ko
@@ -348,6 +349,9 @@ $(DEFAULT_BPFTOOL): $(wildcard $(BPFTOOLDIR)/*.[ch] $(BPFTOOLDIR)/Makefile)    \
 		    OUTPUT=$(HOST_BUILD_DIR)/bpftool/			       \
 		    LIBBPF_OUTPUT=$(HOST_BUILD_DIR)/libbpf/		       \
 		    LIBBPF_DESTDIR=$(HOST_SCRATCH_DIR)/			       \
+		    SKIP_LLVM=$(SKIP_LLVM)				       \
+		    SKIP_LIBBFD=$(SKIP_LIBBFD)				       \
+		    SKIP_CRYPTO=$(SKIP_CRYPTO)				       \
 		    prefix= DESTDIR=$(HOST_SCRATCH_DIR)/ install-bin
 
 ifneq ($(CROSS_COMPILE),)
@@ -360,6 +364,9 @@ $(CROSS_BPFTOOL): $(wildcard $(BPFTOOLDIR)/*.[ch] $(BPFTOOLDIR)/Makefile)	\
 		    OUTPUT=$(BUILD_DIR)/bpftool/				\
 		    LIBBPF_OUTPUT=$(BUILD_DIR)/libbpf/				\
 		    LIBBPF_DESTDIR=$(SCRATCH_DIR)/				\
+		    SKIP_LLVM=$(SKIP_LLVM)					\
+		    SKIP_LIBBFD=$(SKIP_LIBBFD)					\
+		    SKIP_CRYPTO=$(SKIP_CRYPTO)					\
 		    prefix= DESTDIR=$(SCRATCH_DIR)/ install-bin
 endif
 
@@ -750,6 +757,7 @@ TRUNNER_EXTRA_SOURCES := test_progs.c		\
 			 btf_helpers.c		\
 			 cap_helpers.c		\
 			 unpriv_helpers.c 	\
+			 sysctl_helpers.c	\
 			 netlink_helpers.c	\
 			 jit_disasm_helpers.c	\
 			 io_helpers.c		\

@@ -385,4 +385,28 @@ int kptr_xchg_possibly_null(struct __sk_buff *ctx)
 	return 0;
 }
 
+SEC("?tc")
+/*
+ * A compiler with BPF_ST folds the constant into a store-immediate, which the
+ * verifier rejects on a different path (and with a different message) than the
+ * BPF_STX form.
+ */
+#ifdef __BPF_FEATURE_ST
+__failure __msg("BPF_ST imm must be 0 when storing to kptr at off=8")
+#else
+__failure __msg("invalid kptr access, R")
+#endif
+int reject_scalar_store_to_kptr(struct __sk_buff *ctx)
+{
+	struct map_value *v;
+	int key = 0;
+
+	v = bpf_map_lookup_elem(&array_map, &key);
+	if (!v)
+		return 0;
+
+	*(volatile u64 *)&v->unref_ptr = 0xBADC0DE;
+	return 0;
+}
+
 char _license[] SEC("license") = "GPL";

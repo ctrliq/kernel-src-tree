@@ -2842,7 +2842,7 @@ static int bpf_prog_verify_signature(struct bpf_prog *prog, union bpf_attr *attr
 	sig = kvmemdup_bpfptr(usig, attr->signature_size);
 	if (IS_ERR(sig)) {
 		bpf_key_put(key);
-		return -ENOMEM;
+		return PTR_ERR(sig);
 	}
 
 	bpf_dynptr_init(&sig_ptr, sig, BPF_DYNPTR_TYPE_LOCAL, 0,
@@ -3097,10 +3097,6 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 
 	/* run eBPF verifier */
 	err = bpf_check(&prog, attr, uattr, uattr_size);
-	if (err < 0)
-		goto free_used_maps;
-
-	prog = bpf_prog_select_runtime(prog, &err);
 	if (err < 0)
 		goto free_used_maps;
 
@@ -3643,7 +3639,7 @@ static int bpf_tracing_prog_attach(struct bpf_prog *prog,
 	if (prog->expected_attach_type == BPF_TRACE_FSESSION) {
 		struct bpf_fsession_link *fslink;
 
-		fslink = kzalloc(sizeof(*fslink), GFP_USER);
+		fslink = kzalloc_obj(*fslink, GFP_USER);
 		if (fslink) {
 			bpf_link_init(&fslink->fexit.link, BPF_LINK_TYPE_TRACING,
 				      &bpf_tracing_link_lops, prog, attach_type);
@@ -3653,7 +3649,7 @@ static int bpf_tracing_prog_attach(struct bpf_prog *prog,
 			link = NULL;
 		}
 	} else {
-		link = kzalloc(sizeof(*link), GFP_USER);
+		link = kzalloc_obj(*link, GFP_USER);
 	}
 	if (!link) {
 		err = -ENOMEM;
@@ -4210,7 +4206,7 @@ static int bpf_perf_link_attach(const union bpf_attr *attr, struct bpf_prog *pro
 	if (IS_ERR(perf_file))
 		return PTR_ERR(perf_file);
 
-	link = kzalloc(sizeof(*link), GFP_USER);
+	link = kzalloc_obj(*link, GFP_USER);
 	if (!link) {
 		err = -ENOMEM;
 		goto out_put_file;
@@ -4288,7 +4284,7 @@ static int bpf_raw_tp_link_attach(struct bpf_prog *prog,
 	if (!btp)
 		return -ENOENT;
 
-	link = kzalloc(sizeof(*link), GFP_USER);
+	link = kzalloc_obj(*link, GFP_USER);
 	if (!link) {
 		err = -ENOMEM;
 		goto out_put_btp;
@@ -4923,6 +4919,29 @@ out:
 	return map;
 }
 
+static void prepare_dump_pseudo_call(struct bpf_insn *insn)
+{
+	s32 call_off = insn->imm;
+
+	/*
+	 * BPF_CALL_ARGS only exists for interpreter fallback.
+	 * 1. For interpreter (BPF_CALL_ARGS): insn->off is the index of
+	 *    interpreters_args array, so here using bpf_call_args_imm()
+	 *    to get the real address offset.
+	 * 2. For JIT (BPF_CALL): insn->off is the subprog id.
+	 */
+	if (insn->code == (BPF_JMP | BPF_CALL_ARGS))
+		insn->imm = bpf_call_args_imm(insn->off);
+	else
+		insn->imm = insn->off;
+
+	/* Avoid dumping a truncated and misleading pc-relative offset. */
+	if (call_off > S16_MAX || call_off < S16_MIN)
+		insn->off = 0;
+	else
+		insn->off = call_off;
+}
+
 static struct bpf_insn *bpf_insn_prepare_dump(const struct bpf_prog *prog,
 					      const struct cred *f_cred)
 {
@@ -4948,6 +4967,9 @@ static struct bpf_insn *bpf_insn_prepare_dump(const struct bpf_prog *prog,
 		}
 		if (code == (BPF_JMP | BPF_CALL) ||
 		    code == (BPF_JMP | BPF_CALL_ARGS)) {
+			/* Restore the legacy xlated dump layout. */
+			if (insns[i].src_reg == BPF_PSEUDO_CALL)
+				prepare_dump_pseudo_call(&insns[i]);
 			if (code == (BPF_JMP | BPF_CALL_ARGS))
 				insns[i].code = BPF_JMP | BPF_CALL;
 			if (!bpf_dump_raw_ok(f_cred))
@@ -6100,9 +6122,8 @@ static int bpf_prog_bind_map(union bpf_attr *attr)
 			goto out_unlock;
 		}
 
-	used_maps_new = kmalloc_array(prog->aux->used_map_cnt + 1,
-				      sizeof(used_maps_new[0]),
-				      GFP_KERNEL);
+	used_maps_new = kmalloc_objs(used_maps_new[0],
+				     prog->aux->used_map_cnt + 1, GFP_KERNEL);
 	if (!used_maps_new) {
 		ret = -ENOMEM;
 		goto out_unlock;
@@ -6373,8 +6394,7 @@ static bool syscall_prog_is_valid_access(int off, int size,
 {
 	if (off < 0 || off >= U16_MAX)
 		return false;
-	if (off % size != 0)
-		return false;
+	/* No alignment requirements for syscall ctx accesses. */
 	return true;
 }
 

@@ -229,7 +229,7 @@ static int remember_vma(struct bpf_arena *arena, struct vm_area_struct *vma)
 {
 	struct vma_list *vml;
 
-	vml = kmalloc(sizeof(*vml), GFP_KERNEL);
+	vml = kmalloc_obj(*vml, GFP_KERNEL);
 	if (!vml)
 		return -ENOMEM;
 	refcount_set(&vml->mmap_count, 1);
@@ -244,6 +244,16 @@ static void arena_vm_open(struct vm_area_struct *vma)
 	struct vma_list *vml = vma->vm_private_data;
 
 	refcount_inc(&vml->mmap_count);
+}
+
+static int arena_vm_may_split(struct vm_area_struct *vma, unsigned long addr)
+{
+	return -EINVAL;
+}
+
+static int arena_vm_mremap(struct vm_area_struct *vma)
+{
+	return -EINVAL;
 }
 
 static void arena_vm_close(struct vm_area_struct *vma)
@@ -307,6 +317,8 @@ out:
 
 static const struct vm_operations_struct arena_vm_ops = {
 	.open		= arena_vm_open,
+	.may_split	= arena_vm_may_split,
+	.mremap		= arena_vm_mremap,
 	.close		= arena_vm_close,
 	.fault          = arena_vm_fault,
 };
@@ -376,10 +388,11 @@ static int arena_map_mmap(struct bpf_map *map, struct vm_area_struct *vma)
 	arena->user_vm_end = vma->vm_end;
 	/*
 	 * bpf_map_mmap() checks that it's being mmaped as VM_SHARED and
-	 * clears VM_MAYEXEC. Set VM_DONTEXPAND as well to avoid
-	 * potential change of user_vm_start.
+	 * clears VM_MAYEXEC. Set VM_DONTEXPAND to avoid potential change
+	 * of user_vm_start. Set VM_DONTCOPY to prevent arena VMA from
+	 * being copied into the child process on fork.
 	 */
-	vm_flags_set(vma, VM_DONTEXPAND);
+	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTCOPY);
 	vma->vm_ops = &arena_vm_ops;
 	return 0;
 }
@@ -388,7 +401,7 @@ static int arena_map_direct_value_addr(const struct bpf_map *map, u64 *imm, u32 
 {
 	struct bpf_arena *arena = container_of(map, struct bpf_arena, map);
 
-	if ((u64)off > arena->user_vm_end - arena->user_vm_start)
+	if ((u64)off >= arena->user_vm_end - arena->user_vm_start)
 		return -ERANGE;
 	*imm = (unsigned long)arena->user_vm_start;
 	return 0;
@@ -432,6 +445,10 @@ static long arena_alloc_pages(struct bpf_arena *arena, long uaddr, long page_cnt
 	long pgoff = 0;
 	u32 uaddr32;
 	int ret, i;
+
+	if (node_id != NUMA_NO_NODE &&
+	    ((unsigned int)node_id >= nr_node_ids || !node_online(node_id)))
+		return 0;
 
 	if (page_cnt > page_cnt_max)
 		return 0;
