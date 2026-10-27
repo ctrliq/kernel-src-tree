@@ -217,17 +217,13 @@ static void gicv5_hwirq_eoi(u32 hwirq_id, u8 hwirq_type)
 	       FIELD_PREP(GICV5_GIC_CDDI_TYPE_MASK, hwirq_type);
 
 	gic_insn(cddi, CDDI);
-
-	gic_insn(0, CDEOI);
 }
 
 static void gicv5_ppi_irq_eoi(struct irq_data *d)
 {
 	/* Skip deactivate for forwarded PPI interrupts */
-	if (irqd_is_forwarded_to_vcpu(d)) {
-		gic_insn(0, CDEOI);
+	if (irqd_is_forwarded_to_vcpu(d))
 		return;
-	}
 
 	gicv5_hwirq_eoi(d->hwirq, GICV5_HWIRQ_TYPE_PPI);
 }
@@ -510,6 +506,23 @@ static bool gicv5_ppi_irq_is_level(irq_hw_number_t hwirq)
 	return !!(read_ppi_sysreg_s(hwirq, PPI_HM) & bit);
 }
 
+static int gicv5_ppi_irq_set_type(struct irq_data *d, unsigned int type)
+{
+	/*
+	 * GICv5's PPIs do not have a configurable trigger or handling
+	 * mode. Check that the attempt to set a type matches what the
+	 * hardware reports in the HMR, and error on a mismatch.
+	 */
+
+	if (type & IRQ_TYPE_EDGE_BOTH && gicv5_ppi_irq_is_level(d->hwirq))
+		return -EINVAL;
+
+	if (type & IRQ_TYPE_LEVEL_MASK && !gicv5_ppi_irq_is_level(d->hwirq))
+		return -EINVAL;
+
+	return 0;
+}
+
 static int gicv5_ppi_irq_set_vcpu_affinity(struct irq_data *d, void *vcpu)
 {
 	if (vcpu)
@@ -525,6 +538,7 @@ static const struct irq_chip gicv5_ppi_irq_chip = {
 	.irq_mask		= gicv5_ppi_irq_mask,
 	.irq_unmask		= gicv5_ppi_irq_unmask,
 	.irq_eoi		= gicv5_ppi_irq_eoi,
+	.irq_set_type		= gicv5_ppi_irq_set_type,
 	.irq_get_irqchip_state	= gicv5_ppi_irq_get_irqchip_state,
 	.irq_set_irqchip_state	= gicv5_ppi_irq_set_irqchip_state,
 	.irq_set_vcpu_affinity	= gicv5_ppi_irq_set_vcpu_affinity,
@@ -907,6 +921,13 @@ static void __exception_irq_entry gicv5_handle_irq(struct pt_regs *regs)
 	 * instructions in the IRQ handler using an ISB.
 	 */
 	isb();
+
+	/*
+	 * Ensure that we can receive the next interrupts in the event that we
+	 * have a long running handler or directly enter a guest by doing the
+	 * priority drop immediately.
+	 */
+	gic_insn(0, CDEOI);
 
 	hwirq = FIELD_GET(GICV5_HWIRQ_INTID, ia);
 

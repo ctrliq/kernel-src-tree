@@ -310,14 +310,8 @@ struct pkvm_hyp_vm *get_pkvm_hyp_vm(pkvm_handle_t handle)
 
 	hyp_spin_lock(&vm_table_lock);
 	hyp_vm = get_vm_by_handle(handle);
-	if (!hyp_vm)
-		goto unlock;
-
-	if (hyp_vm->kvm.arch.pkvm.is_dying)
-		hyp_vm = NULL;
-	else
+	if (hyp_vm)
 		hyp_page_ref_inc(hyp_virt_to_page(hyp_vm));
-unlock:
 	hyp_spin_unlock(&vm_table_lock);
 
 	return hyp_vm;
@@ -439,7 +433,6 @@ static void init_pkvm_hyp_vm(struct kvm *host_kvm, struct pkvm_hyp_vm *hyp_vm,
 	hyp_vm->host_kvm = host_kvm;
 	hyp_vm->kvm.created_vcpus = nr_vcpus;
 	hyp_vm->kvm.arch.pkvm.is_protected = READ_ONCE(host_kvm->arch.pkvm.is_protected);
-	hyp_vm->kvm.arch.pkvm.is_created = true;
 	hyp_vm->kvm.arch.flags = 0;
 	pkvm_init_features_from_host(hyp_vm, host_kvm);
 
@@ -534,6 +527,20 @@ static int init_pkvm_hyp_vcpu(struct pkvm_hyp_vcpu *hyp_vcpu,
 	hyp_vcpu->vcpu.arch.hw_mmu = &hyp_vm->kvm.arch.mmu;
 	hyp_vcpu->vcpu.arch.cflags = READ_ONCE(host_vcpu->arch.cflags);
 	hyp_vcpu->vcpu.arch.mp_state.mp_state = KVM_MP_STATE_STOPPED;
+
+	if (!pkvm_hyp_vcpu_is_protected(hyp_vcpu)) {
+		/*
+		 * Timer offsets are pointing to the untrusted KVM copy,
+		 * which is pinned in __pkvm_init_vm() for the VM life time.
+		 * It is worth noting that hyp_vm->host_kvm points to an EL2
+		 * linear map address and timer_get_offset() will use
+		 * kern_hyp_va() which is safe as it is idempotent.
+		 */
+		vcpu_vtimer(&hyp_vcpu->vcpu)->offset.vm_offset =
+			&hyp_vm->host_kvm->arch.timer_data.voffset;
+		vcpu_ptimer(&hyp_vcpu->vcpu)->offset.vm_offset =
+			&hyp_vm->host_kvm->arch.timer_data.poffset;
+	}
 
 	ret = pkvm_vcpu_init_sysregs(hyp_vcpu);
 	if (ret)
@@ -758,16 +765,30 @@ static struct pkvm_hyp_vcpu selftest_vcpu = {
 struct pkvm_hyp_vcpu *init_selftest_vm(void *virt)
 {
 	struct hyp_page *p = hyp_virt_to_page(virt);
+	unsigned long min_pages, seeded = 0;
 	int i;
 
 	selftest_vm.kvm.arch.mmu.vtcr = host_mmu.arch.mmu.vtcr;
 	WARN_ON(kvm_guest_prepare_stage2(&selftest_vm, virt));
 
+	/*
+	 * Mirror pkvm_refill_memcache() for the share/donate pre-checks;
+	 * the selftest invokes those functions directly and would
+	 * otherwise see an empty memcache.
+	 */
+	min_pages = kvm_mmu_cache_min_pages(&selftest_vm.kvm.arch.mmu);
+
 	for (i = 0; i < pkvm_selftest_pages(); i++) {
 		if (p[i].refcount)
 			continue;
 		p[i].refcount = 1;
-		hyp_put_page(&selftest_vm.pool, hyp_page_to_virt(&p[i]));
+		if (seeded < min_pages) {
+			push_hyp_memcache(&selftest_vcpu.vcpu.arch.pkvm_memcache,
+					  hyp_page_to_virt(&p[i]), hyp_virt_to_phys);
+			seeded++;
+		} else {
+			hyp_put_page(&selftest_vm.pool, hyp_page_to_virt(&p[i]));
+		}
 	}
 
 	selftest_vm.kvm.arch.pkvm.handle = __pkvm_reserve_vm();
@@ -938,16 +959,30 @@ teardown_donated_memory(struct kvm_hyp_memcache *mc, void *addr, size_t size)
 
 int __pkvm_reclaim_dying_guest_page(pkvm_handle_t handle, u64 gfn)
 {
-	struct pkvm_hyp_vm *hyp_vm;
+	struct pkvm_hyp_vm *hyp_vm = get_pkvm_hyp_vm(handle);
 	int ret = -EINVAL;
 
-	hyp_spin_lock(&vm_table_lock);
-	hyp_vm = get_vm_by_handle(handle);
-	if (hyp_vm && hyp_vm->kvm.arch.pkvm.is_dying)
-		ret = __pkvm_host_reclaim_page_guest(gfn, hyp_vm);
-	hyp_spin_unlock(&vm_table_lock);
+	if (!hyp_vm)
+		return ret;
 
+	if (hyp_vm->kvm.arch.pkvm.is_dying)
+		ret = __pkvm_host_reclaim_page_guest(gfn, hyp_vm);
+
+	put_pkvm_hyp_vm(hyp_vm);
 	return ret;
+}
+
+static struct pkvm_hyp_vm *get_pkvm_unref_hyp_vm_locked(pkvm_handle_t handle)
+{
+	struct pkvm_hyp_vm *hyp_vm;
+
+	hyp_assert_lock_held(&vm_table_lock);
+
+	hyp_vm = get_vm_by_handle(handle);
+	if (!hyp_vm || hyp_page_count(hyp_vm))
+		return NULL;
+
+	return hyp_vm;
 }
 
 int __pkvm_start_teardown_vm(pkvm_handle_t handle)
@@ -956,14 +991,8 @@ int __pkvm_start_teardown_vm(pkvm_handle_t handle)
 	int ret = 0;
 
 	hyp_spin_lock(&vm_table_lock);
-	hyp_vm = get_vm_by_handle(handle);
-	if (!hyp_vm) {
-		ret = -ENOENT;
-		goto unlock;
-	} else if (WARN_ON(hyp_page_count(hyp_vm))) {
-		ret = -EBUSY;
-		goto unlock;
-	} else if (hyp_vm->kvm.arch.pkvm.is_dying) {
+	hyp_vm = get_pkvm_unref_hyp_vm_locked(handle);
+	if (!hyp_vm || hyp_vm->kvm.arch.pkvm.is_dying) {
 		ret = -EINVAL;
 		goto unlock;
 	}
@@ -985,12 +1014,9 @@ int __pkvm_finalize_teardown_vm(pkvm_handle_t handle)
 	int err;
 
 	hyp_spin_lock(&vm_table_lock);
-	hyp_vm = get_vm_by_handle(handle);
-	if (!hyp_vm) {
-		err = -ENOENT;
-		goto err_unlock;
-	} else if (!hyp_vm->kvm.arch.pkvm.is_dying) {
-		err = -EBUSY;
+	hyp_vm = get_pkvm_unref_hyp_vm_locked(handle);
+	if (!hyp_vm || !hyp_vm->kvm.arch.pkvm.is_dying) {
+		err = -EINVAL;
 		goto err_unlock;
 	}
 
