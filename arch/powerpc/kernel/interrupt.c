@@ -170,6 +170,7 @@ again:
 		goto again;
 	}
 
+	kuap_user_restore(regs);
 	ret = current_thread_info()->exit_flags & _TIF_RESTOREALL;
 	current_thread_info()->exit_flags &= ~_TIF_RESTOREALL;
 	regs->exit_result |= ret;
