@@ -1,0 +1,132 @@
+smb/client: fix incorrect nlink returned by fstat()
+
+jira KERNEL-1825
+Rebuild_History Non-Buildable kernel-5.14.0-687.61.1.el9_8
+commit-author ChenXiaoSong <chenxiaosong@kylinos.cn>
+commit 9dd1964ac59d293c3684e71b4bbcd10e28f04bb4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.61.1.el9_8/9dd1964a.failed
+
+Reproducer:
+
+  1. mount -t cifs //${server_ip}/export /mnt
+  2. touch /mnt/file1; ln /mnt/file1 /mnt/file2; ln /mnt/file1 /mnt/file3
+  3. C program: int fd = open("/mnt/file1", O_RDONLY);
+  4. C program: struct stat stbuf; fstat(fd, &stbuf);
+                stbuf.st_nlink is always 1, should be 3
+
+Setting `unknown_nlink` to true in `SMB2_open()` triggers the
+`CIFS_FATTR_UNKNOWN_NLINK` flag in `cifs_open_info_to_fattr()`,
+which safely preserves the existing i_nlink in
+`cifs_nlink_fattr_to_inode()`.
+
+See the detailed procedure below:
+
+  path_openat
+    open_last_lookups
+      lookup_open
+        atomic_open
+          cifs_atomic_open // dir->i_op->atomic_open
+            cifs_lookup
+              cifs_get_inode_info
+                cifs_get_fattr
+                  smb2_query_path_info // server->ops->query_path_info
+                    smb2_compound_op
+                      SMB2_open_init
+                      case SMB2_OP_QUERY_INFO
+                      SMB2_query_info_init(FILE_ALL_INFORMATION,)
+                  cifs_open_info_to_fattr
+                    fattr->cf_nlink = le32_to_cpu(info->NumberOfLinks)
+                update_inode_info
+                  cifs_iget
+                    cifs_fattr_to_inode
+                      cifs_nlink_fattr_to_inode
+                        set_nlink(inode, fattr->cf_nlink)
+    do_open
+      vfs_open
+        do_dentry_open
+          cifs_open
+            cifs_nt_open
+              smb2_open_file // server->ops->open
+                SMB2_open
+                  buf->unknown_nlink = true
+              cifs_get_inode_info
+                cifs_get_fattr
+                  cifs_open_info_to_fattr
+                    if (data->unknown_nlink) // true
+                    fattr->cf_flags |= CIFS_FATTR_UNKNOWN_NLINK
+                update_inode_info
+                  cifs_fattr_to_inode
+                    cifs_nlink_fattr_to_inode
+                      if (fattr->cf_flags & CIFS_FATTR_UNKNOWN_NLINK) // true
+                      return // do not modify nlink
+
+	Signed-off-by: ChenXiaoSong <chenxiaosong@kylinos.cn>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 9dd1964ac59d293c3684e71b4bbcd10e28f04bb4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/smb/client/smb2pdu.c
+diff --cc fs/smb/client/smb2pdu.c
+index 16800bae64e0,8f83ab377db1..000000000000
+--- a/fs/smb/client/smb2pdu.c
++++ b/fs/smb/client/smb2pdu.c
+@@@ -3295,16 -3371,17 +3295,30 @@@ replay_again
+  	oparms->fid->mid = le64_to_cpu(rsp->hdr.MessageId);
+  #endif /* CIFS_DEBUG2 */
+  
+++<<<<<<< HEAD
+ +	if (buf) {
+ +		buf->CreationTime = rsp->CreationTime;
+ +		buf->LastAccessTime = rsp->LastAccessTime;
+ +		buf->LastWriteTime = rsp->LastWriteTime;
+ +		buf->ChangeTime = rsp->ChangeTime;
+ +		buf->AllocationSize = rsp->AllocationSize;
+ +		buf->EndOfFile = rsp->EndofFile;
+ +		buf->Attributes = rsp->FileAttributes;
+ +		buf->NumberOfLinks = cpu_to_le32(1);
+ +		buf->DeletePending = 0; /* successful open = not delete pending */
+++=======
++ 	if (file_info) {
++ 		file_info->CreationTime = rsp->CreationTime;
++ 		file_info->LastAccessTime = rsp->LastAccessTime;
++ 		file_info->LastWriteTime = rsp->LastWriteTime;
++ 		file_info->ChangeTime = rsp->ChangeTime;
++ 		file_info->AllocationSize = rsp->AllocationSize;
++ 		file_info->EndOfFile = rsp->EndofFile;
++ 		file_info->Attributes = rsp->FileAttributes;
++ 		file_info->NumberOfLinks = cpu_to_le32(1);
++ 		buf->unknown_nlink = true;
++ 		file_info->DeletePending = 0; /* successful open = not delete pending */
+++>>>>>>> 9dd1964ac59d (smb/client: fix incorrect nlink returned by fstat())
+  	}
+  
+  
+diff --git a/fs/smb/client/cifsglob.h b/fs/smb/client/cifsglob.h
+index d617e052b9ad..3bd7c66d3264 100644
+--- a/fs/smb/client/cifsglob.h
++++ b/fs/smb/client/cifsglob.h
+@@ -257,6 +257,7 @@ struct cifs_open_info_data {
+ 	bool adjust_tz;
+ 	bool reparse_point;
+ 	bool contains_posix_file_info;
++	bool unknown_nlink;
+ 	struct {
+ 		/* ioctl response buffer */
+ 		struct {
+diff --git a/fs/smb/client/inode.c b/fs/smb/client/inode.c
+index 72e0be12e5ed..10bb976dbde0 100644
+--- a/fs/smb/client/inode.c
++++ b/fs/smb/client/inode.c
+@@ -881,6 +881,8 @@ static void cifs_open_info_to_fattr(struct cifs_fattr *fattr,
+ 	struct cifs_tcon *tcon = cifs_sb_master_tcon(cifs_sb);
+ 
+ 	memset(fattr, 0, sizeof(*fattr));
++	if (data->unknown_nlink)
++		fattr->cf_flags |= CIFS_FATTR_UNKNOWN_NLINK;
+ 	fattr->cf_cifsattrs = le32_to_cpu(info->Attributes);
+ 	if (info->DeletePending)
+ 		fattr->cf_flags |= CIFS_FATTR_DELETE_PENDING;
+* Unmerged path fs/smb/client/smb2pdu.c
