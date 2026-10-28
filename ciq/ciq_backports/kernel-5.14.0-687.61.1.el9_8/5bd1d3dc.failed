@@ -1,0 +1,434 @@
+smb/client: refresh allocation after EOF-extending fallocate
+
+jira KERNEL-1825
+Rebuild_History Non-Buildable kernel-5.14.0-687.61.1.el9_8
+commit-author Huiwen He <hehuiwen@kylinos.cn>
+commit 5bd1d3dcc25a51663b3878cbc506e16be15af354
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.61.1.el9_8/5bd1d3dc.failed
+
+Before this change, xfstests generic/496 was not supported on ksmbd:
+
+        generic/496 ... [not run] fallocated swap not supported here
+
+ksmbd handles SetEOF as truncate, so EOF extension alone does not
+allocate backing blocks. A fallocated swapfile can therefore still
+look sparse to swapon.
+
+Request allocation for EOF-extending fallocate ranges that can be
+represented by FILE_ALLOCATION_INFORMATION, and refresh the allocation
+state afterwards.
+
+With this change, xfstests generic/496 and generic/701 pass on ksmbd.
+
+However, Samba "strict allocate = no" now exposes the real generic/701
+failure: the old pass came from inflated local i_blocks, not from
+server allocation. generic/213 also fails in that case because an
+oversized allocation request may not return ENOSPC.
+
+	Signed-off-by: Huiwen He <hehuiwen@kylinos.cn>
+	Reviewed-by: ChenXiaoSong <chenxiaosong@kylinos.cn>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 5bd1d3dcc25a51663b3878cbc506e16be15af354)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/smb/client/smb2ops.c
+#	fs/smb/client/smb2proto.h
+#	fs/smb/common/fscc.h
+#	fs/smb/server/smb2pdu.h
+diff --cc fs/smb/client/smb2ops.c
+index 851f751578e6,05f2ab6d345a..000000000000
+--- a/fs/smb/client/smb2ops.c
++++ b/fs/smb/client/smb2ops.c
+@@@ -3716,12 -3788,49 +3716,55 @@@ static long smb3_simple_falloc(struct f
+  			smb2_set_sparse(xid, tcon, cfile, inode, false);
+  
+  		new_eof = off + len;
++ 
++ 		qrc = SMB2_query_info(xid, tcon,
++ 				      cfile->fid.persistent_fid,
++ 				      cfile->fid.volatile_fid, &file_inf);
++ 		if (qrc == 0)
++ 			asize = le64_to_cpu(file_inf.AllocationSize);
++ 
++ 		/*
++ 		 * FILE_ALLOCATION_INFORMATION can only describe allocation up to
++ 		 * new_eof. Some servers may accept it without allocating blocks,
++ 		 * so refresh AllocationSize before updating i_blocks.
++ 		 */
++ 		if (off == 0 || off == old_eof) {
++ 			if (qrc || asize < new_eof) {
++ 				rc = SMB2_set_allocation(xid, tcon,
++ 							 cfile->fid.persistent_fid,
++ 							 cfile->fid.volatile_fid,
++ 							 cfile->pid, new_eof);
++ 				if (rc)
++ 					goto out;
++ 			}
++ 		}
++ 
+  		rc = SMB2_set_eof(xid, tcon, cfile->fid.persistent_fid,
+  				  cfile->fid.volatile_fid, cfile->pid, new_eof);
+++<<<<<<< HEAD
+ +		if (rc == 0) {
+ +			netfs_resize_file(&cifsi->netfs, new_eof);
+ +			cifs_setsize(inode, new_eof);
+++=======
++ 		if (rc)
++ 			goto out;
++ 
++ 		netfs_resize_file(&cifsi->netfs, new_eof, true);
++ 		cifs_setsize(inode, new_eof);
++ 
++ 		qrc = SMB2_query_info(xid, tcon,
++ 				      cfile->fid.persistent_fid,
++ 				      cfile->fid.volatile_fid, &file_inf);
++ 		spin_lock(&inode->i_lock);
++ 		if (qrc == 0) {
++ 			asize = le64_to_cpu(file_inf.AllocationSize);
++ 			if (asize >= new_eof)
++ 				inode->i_blocks = CIFS_INO_BLOCKS(asize);
++ 		} else {
++ 			cifsi->time = 0;
+++>>>>>>> 5bd1d3dcc25a (smb/client: refresh allocation after EOF-extending fallocate)
+  		}
++ 		spin_unlock(&inode->i_lock);
+  		goto out;
+  	}
+  
+diff --cc fs/smb/client/smb2proto.h
+index 483a94d23fe1,2e9f70096825..000000000000
+--- a/fs/smb/client/smb2proto.h
++++ b/fs/smb/client/smb2proto.h
+@@@ -134,147 -126,130 +134,180 @@@ extern bool smb2_should_replay(struct c
+   * SMB2 Worker functions - most of protocol specific implementation details
+   * are contained within these calls.
+   */
+ -int SMB2_negotiate(const unsigned int xid, struct cifs_ses *ses,
+ -		   struct TCP_Server_Info *server);
+ -int SMB2_sess_setup(const unsigned int xid, struct cifs_ses *ses,
+ -		    struct TCP_Server_Info *server,
+ -		    const struct nls_table *nls_cp);
+ -int SMB2_logoff(const unsigned int xid, struct cifs_ses *ses);
+ -int SMB2_tcon(const unsigned int xid, struct cifs_ses *ses, const char *tree,
+ -	      struct cifs_tcon *tcon, const struct nls_table *cp);
+ -int SMB2_tdis(const unsigned int xid, struct cifs_tcon *tcon);
+ -int SMB2_open(const unsigned int xid, struct cifs_open_parms *oparms,
+ -	      __le16 *path, __u8 *oplock, struct cifs_open_info_data *buf,
+ -	      struct create_posix_rsp *posix, struct kvec *err_iov,
+ -	      int *buftype);
+ -int SMB2_open_init(struct cifs_tcon *tcon, struct TCP_Server_Info *server,
+ -		   struct smb_rqst *rqst, __u8 *oplock,
+ -		   struct cifs_open_parms *oparms, __le16 *path);
+ -void SMB2_open_free(struct smb_rqst *rqst);
+ -int SMB2_ioctl(const unsigned int xid, struct cifs_tcon *tcon,
+ -	       u64 persistent_fid, u64 volatile_fid, u32 opcode, char *in_data,
+ -	       u32 indatalen, u32 max_out_data_len, char **out_data,
+ -	       u32 *plen /* returned data len */);
+ -int SMB2_ioctl_init(struct cifs_tcon *tcon, struct TCP_Server_Info *server,
+ -		    struct smb_rqst *rqst, u64 persistent_fid,
+ -		    u64 volatile_fid, u32 opcode, char *in_data, u32 indatalen,
+ -		    __u32 max_response_size);
+ -void SMB2_ioctl_free(struct smb_rqst *rqst);
+ -int SMB2_change_notify(const unsigned int xid, struct cifs_tcon *tcon,
+ -		       u64 persistent_fid, u64 volatile_fid, bool watch_tree,
+ -		       u32 completion_filter, u32 max_out_data_len,
+ -		       char **out_data, u32 *plen /* returned data len */);
+ +extern int SMB2_negotiate(const unsigned int xid,
+ +			  struct cifs_ses *ses,
+ +			  struct TCP_Server_Info *server);
+ +extern int SMB2_sess_setup(const unsigned int xid, struct cifs_ses *ses,
+ +			   struct TCP_Server_Info *server,
+ +			   const struct nls_table *nls_cp);
+ +extern int SMB2_logoff(const unsigned int xid, struct cifs_ses *ses);
+ +extern int SMB2_tcon(const unsigned int xid, struct cifs_ses *ses,
+ +		     const char *tree, struct cifs_tcon *tcon,
+ +		     const struct nls_table *);
+ +extern int SMB2_tdis(const unsigned int xid, struct cifs_tcon *tcon);
+ +extern int SMB2_open(const unsigned int xid, struct cifs_open_parms *oparms,
+ +		     __le16 *path, __u8 *oplock,
+ +		     struct smb2_file_all_info *buf,
+ +		     struct create_posix_rsp *posix,
+ +		     struct kvec *err_iov, int *resp_buftype);
+ +extern int SMB2_open_init(struct cifs_tcon *tcon,
+ +			  struct TCP_Server_Info *server,
+ +			  struct smb_rqst *rqst,
+ +			  __u8 *oplock, struct cifs_open_parms *oparms,
+ +			  __le16 *path);
+ +extern void SMB2_open_free(struct smb_rqst *rqst);
+ +extern int SMB2_ioctl(const unsigned int xid, struct cifs_tcon *tcon,
+ +		     u64 persistent_fid, u64 volatile_fid, u32 opcode,
+ +		     char *in_data, u32 indatalen, u32 maxoutlen,
+ +		     char **out_data, u32 *plen /* returned data len */);
+ +extern int SMB2_ioctl_init(struct cifs_tcon *tcon,
+ +			   struct TCP_Server_Info *server,
+ +			   struct smb_rqst *rqst,
+ +			   u64 persistent_fid, u64 volatile_fid, u32 opcode,
+ +			   char *in_data, u32 indatalen,
+ +			   __u32 max_response_size);
+ +extern void SMB2_ioctl_free(struct smb_rqst *rqst);
+ +extern int SMB2_change_notify(const unsigned int xid, struct cifs_tcon *tcon,
+ +			u64 persistent_fid, u64 volatile_fid, bool watch_tree,
+ +			u32 completion_filter, u32 max_out_data_len,
+ +			char **out_data, u32 *plen /* returned data len */);
+  
+ -int __SMB2_close(const unsigned int xid, struct cifs_tcon *tcon,
+ -		 u64 persistent_fid, u64 volatile_fid,
+ -		 struct smb2_file_network_open_info *pbuf);
+ -int SMB2_close(const unsigned int xid, struct cifs_tcon *tcon,
+ -	       u64 persistent_fid, u64 volatile_fid);
+ -int SMB2_close_init(struct cifs_tcon *tcon, struct TCP_Server_Info *server,
+ -		    struct smb_rqst *rqst, u64 persistent_fid,
+ -		    u64 volatile_fid, bool query_attrs);
+ -void SMB2_close_free(struct smb_rqst *rqst);
+ -int SMB2_flush(const unsigned int xid, struct cifs_tcon *tcon,
+ -	       u64 persistent_fid, u64 volatile_fid);
+ -int SMB2_flush_init(const unsigned int xid, struct smb_rqst *rqst,
+ -		    struct cifs_tcon *tcon, struct TCP_Server_Info *server,
+ -		    u64 persistent_fid, u64 volatile_fid);
+ -void SMB2_flush_free(struct smb_rqst *rqst);
+ -int SMB2_query_info(const unsigned int xid, struct cifs_tcon *tcon,
+ -		    u64 persistent_fid, u64 volatile_fid,
+ -		    struct smb2_file_all_info *data);
+ -int SMB2_query_info_init(struct cifs_tcon *tcon,
+ -			 struct TCP_Server_Info *server, struct smb_rqst *rqst,
+ -			 u64 persistent_fid, u64 volatile_fid, u8 info_class,
+ -			 u8 info_type, u32 additional_info, size_t output_len,
+ -			 size_t input_len, void *input);
+ -void SMB2_query_info_free(struct smb_rqst *rqst);
+ -int SMB2_query_acl(const unsigned int xid, struct cifs_tcon *tcon,
+ -		   u64 persistent_fid, u64 volatile_fid, void **data,
+ -		   u32 *plen, u32 extra_info);
+ -int SMB2_get_srv_num(const unsigned int xid, struct cifs_tcon *tcon,
+ -		     u64 persistent_fid, u64 volatile_fid, __le64 *uniqueid);
+ -int smb2_async_readv(struct cifs_io_subrequest *rdata);
+ -int SMB2_read(const unsigned int xid, struct cifs_io_parms *io_parms,
+ -	      unsigned int *nbytes, char **buf, int *buf_type);
+ -void smb2_async_writev(struct cifs_io_subrequest *wdata);
+ -int SMB2_write(const unsigned int xid, struct cifs_io_parms *io_parms,
+ -	       unsigned int *nbytes, struct kvec *iov, int n_vec);
+ -int SMB2_echo(struct TCP_Server_Info *server);
+ -int SMB2_query_directory(const unsigned int xid, struct cifs_tcon *tcon,
+ -			 u64 persistent_fid, u64 volatile_fid, int index,
+ -			 struct cifs_search_info *srch_inf);
+ -int SMB2_query_directory_init(const unsigned int xid, struct cifs_tcon *tcon,
+ +extern int __SMB2_close(const unsigned int xid, struct cifs_tcon *tcon,
+ +			u64 persistent_fid, u64 volatile_fid,
+ +			struct smb2_file_network_open_info *pbuf);
+ +extern int SMB2_close(const unsigned int xid, struct cifs_tcon *tcon,
+ +		      u64 persistent_file_id, u64 volatile_file_id);
+ +extern int SMB2_close_init(struct cifs_tcon *tcon,
+ +			   struct TCP_Server_Info *server,
+ +			   struct smb_rqst *rqst,
+ +			   u64 persistent_fid, u64 volatile_fid,
+ +			   bool query_attrs);
+ +extern void SMB2_close_free(struct smb_rqst *rqst);
+ +extern int SMB2_flush(const unsigned int xid, struct cifs_tcon *tcon,
+ +		      u64 persistent_file_id, u64 volatile_file_id);
+ +extern int SMB2_flush_init(const unsigned int xid, struct smb_rqst *rqst,
+ +			   struct cifs_tcon *tcon,
+ +			   struct TCP_Server_Info *server,
+ +			   u64 persistent_file_id, u64 volatile_file_id);
+ +extern void SMB2_flush_free(struct smb_rqst *rqst);
+ +extern int SMB311_posix_query_info(const unsigned int xid, struct cifs_tcon *tcon,
+ +		u64 persistent_fid, u64 volatile_fid, struct smb311_posix_qinfo *data, u32 *plen);
+ +extern int SMB2_query_info(const unsigned int xid, struct cifs_tcon *tcon,
+ +			   u64 persistent_file_id, u64 volatile_file_id,
+ +			   struct smb2_file_all_info *data);
+ +extern int SMB2_query_info_init(struct cifs_tcon *tcon,
+ +				struct TCP_Server_Info *server,
+ +				struct smb_rqst *rqst,
+ +				u64 persistent_fid, u64 volatile_fid,
+ +				u8 info_class, u8 info_type,
+ +				u32 additional_info, size_t output_len,
+ +				size_t input_len, void *input);
+ +extern void SMB2_query_info_free(struct smb_rqst *rqst);
+ +extern int SMB2_query_acl(const unsigned int xid, struct cifs_tcon *tcon,
+ +			  u64 persistent_file_id, u64 volatile_file_id,
+ +			  void **data, unsigned int *plen, u32 info);
+ +extern int SMB2_get_srv_num(const unsigned int xid, struct cifs_tcon *tcon,
+ +			    u64 persistent_fid, u64 volatile_fid,
+ +			    __le64 *uniqueid);
+ +extern int smb2_async_readv(struct cifs_readdata *rdata);
+ +extern int SMB2_read(const unsigned int xid, struct cifs_io_parms *io_parms,
+ +		     unsigned int *nbytes, char **buf, int *buf_type);
+ +extern int smb2_async_writev(struct cifs_writedata *wdata,
+ +			     void (*release)(struct kref *kref));
+ +extern int SMB2_write(const unsigned int xid, struct cifs_io_parms *io_parms,
+ +		      unsigned int *nbytes, struct kvec *iov, int n_vec);
+ +extern int SMB2_echo(struct TCP_Server_Info *server);
+ +extern int SMB2_query_directory(const unsigned int xid, struct cifs_tcon *tcon,
+ +				u64 persistent_fid, u64 volatile_fid, int index,
+ +				struct cifs_search_info *srch_inf);
+ +extern int SMB2_query_directory_init(unsigned int xid, struct cifs_tcon *tcon,
+ +				     struct TCP_Server_Info *server,
+ +				     struct smb_rqst *rqst,
+ +				     u64 persistent_fid, u64 volatile_fid,
+ +				     int index, int info_level);
+ +extern void SMB2_query_directory_free(struct smb_rqst *rqst);
+ +extern int SMB2_set_eof(const unsigned int xid, struct cifs_tcon *tcon,
+ +			u64 persistent_fid, u64 volatile_fid, u32 pid,
+ +			loff_t new_eof);
+ +extern int SMB2_set_info_init(struct cifs_tcon *tcon,
+  			      struct TCP_Server_Info *server,
+++<<<<<<< HEAD
+ +			      struct smb_rqst *rqst,
+ +			      u64 persistent_fid, u64 volatile_fid, u32 pid,
+ +			      u8 info_class, u8 info_type, u32 additional_info,
+ +			      void **data, unsigned int *size);
+ +extern void SMB2_set_info_free(struct smb_rqst *rqst);
+ +extern int SMB2_set_acl(const unsigned int xid, struct cifs_tcon *tcon,
+ +			u64 persistent_fid, u64 volatile_fid,
+ +			struct smb_ntsd *pnntsd, int pacllen, int aclflag);
+ +extern int SMB2_set_ea(const unsigned int xid, struct cifs_tcon *tcon,
+ +		       u64 persistent_fid, u64 volatile_fid,
+ +		       struct smb2_file_full_ea_info *buf, int len);
+ +extern int SMB2_set_compression(const unsigned int xid, struct cifs_tcon *tcon,
+ +				u64 persistent_fid, u64 volatile_fid);
+ +extern int SMB2_oplock_break(const unsigned int xid, struct cifs_tcon *tcon,
+ +			     const u64 persistent_fid, const u64 volatile_fid,
+ +			     const __u8 oplock_level);
+ +extern int smb2_handle_cancelled_close(struct cifs_tcon *tcon,
+ +				       __u64 persistent_fid,
+ +				       __u64 volatile_fid);
+ +extern int smb2_handle_cancelled_mid(struct mid_q_entry *mid, struct TCP_Server_Info *server);
+++=======
++ 			      struct smb_rqst *rqst, u64 persistent_fid,
++ 			      u64 volatile_fid, int index, int info_level);
++ void SMB2_query_directory_free(struct smb_rqst *rqst);
++ int SMB2_set_eof(const unsigned int xid, struct cifs_tcon *tcon,
++ 		 u64 persistent_fid, u64 volatile_fid, u32 pid,
++ 		 loff_t new_eof);
++ int SMB2_set_allocation(const unsigned int xid, struct cifs_tcon *tcon,
++ 			u64 persistent_fid, u64 volatile_fid, u32 pid,
++ 			loff_t allocation_size);
++ int SMB2_set_info_init(struct cifs_tcon *tcon, struct TCP_Server_Info *server,
++ 		       struct smb_rqst *rqst, u64 persistent_fid,
++ 		       u64 volatile_fid, u32 pid, u8 info_class, u8 info_type,
++ 		       u32 additional_info, void **data, unsigned int *size);
++ void SMB2_set_info_free(struct smb_rqst *rqst);
++ int SMB2_set_acl(const unsigned int xid, struct cifs_tcon *tcon,
++ 		 u64 persistent_fid, u64 volatile_fid, struct smb_ntsd *pnntsd,
++ 		 int pacllen, int aclflag);
++ int SMB2_set_ea(const unsigned int xid, struct cifs_tcon *tcon,
++ 		u64 persistent_fid, u64 volatile_fid,
++ 		struct smb2_file_full_ea_info *buf, int len);
++ int SMB2_set_compression(const unsigned int xid, struct cifs_tcon *tcon,
++ 			 u64 persistent_fid, u64 volatile_fid,
++ 			 __u16 compression_state);
++ int SMB2_oplock_break(const unsigned int xid, struct cifs_tcon *tcon,
++ 		      const u64 persistent_fid, const u64 volatile_fid,
++ 		      __u8 oplock_level);
++ int smb2_handle_cancelled_close(struct cifs_tcon *tcon, __u64 persistent_fid,
++ 				__u64 volatile_fid);
++ int smb2_handle_cancelled_mid(struct mid_q_entry *mid,
++ 			      struct TCP_Server_Info *server);
+++>>>>>>> 5bd1d3dcc25a (smb/client: refresh allocation after EOF-extending fallocate)
+  void smb2_cancelled_close_fid(struct work_struct *work);
+ -int SMB311_posix_qfs_info(const unsigned int xid, struct cifs_tcon *tcon,
+ -			  u64 persistent_fid, u64 volatile_fid,
+ -			  struct kstatfs *fsdata);
+ -int SMB2_QFS_attr(const unsigned int xid, struct cifs_tcon *tcon,
+ -		  u64 persistent_fid, u64 volatile_fid, int level);
+ -int SMB2_lock(const unsigned int xid, struct cifs_tcon *tcon,
+ -	      const __u64 persist_fid, const __u64 volatile_fid,
+ -	      const __u32 pid, const __u64 length, const __u64 offset,
+ -	      const __u32 lock_flags, const bool wait);
+ -int smb2_lockv(const unsigned int xid, struct cifs_tcon *tcon,
+ -	       const __u64 persist_fid, const __u64 volatile_fid,
+ -	       const __u32 pid, const __u32 num_lock,
+ -	       struct smb2_lock_element *buf);
+ -int SMB2_lease_break(const unsigned int xid, struct cifs_tcon *tcon,
+ -		     __u8 *lease_key, const __le32 lease_state);
+ -int smb3_validate_negotiate(const unsigned int xid, struct cifs_tcon *tcon);
+ +extern int SMB311_posix_qfs_info(const unsigned int xid, struct cifs_tcon *tcon,
+ +			 u64 persistent_file_id, u64 volatile_file_id,
+ +			 struct kstatfs *FSData);
+ +extern int SMB2_QFS_attr(const unsigned int xid, struct cifs_tcon *tcon,
+ +			 u64 persistent_file_id, u64 volatile_file_id, int lvl);
+ +extern int SMB2_lock(const unsigned int xid, struct cifs_tcon *tcon,
+ +		     const __u64 persist_fid, const __u64 volatile_fid,
+ +		     const __u32 pid, const __u64 length, const __u64 offset,
+ +		     const __u32 lockFlags, const bool wait);
+ +extern int smb2_lockv(const unsigned int xid, struct cifs_tcon *tcon,
+ +		      const __u64 persist_fid, const __u64 volatile_fid,
+ +		      const __u32 pid, const __u32 num_lock,
+ +		      struct smb2_lock_element *buf);
+ +extern int SMB2_lease_break(const unsigned int xid, struct cifs_tcon *tcon,
+ +			    __u8 *lease_key, const __le32 lease_state);
+ +extern int smb3_validate_negotiate(const unsigned int, struct cifs_tcon *);
+  
+ -enum securityEnum smb2_select_sectype(struct TCP_Server_Info *server,
+ -				      enum securityEnum requested);
+ -int smb2_parse_contexts(struct TCP_Server_Info *server, struct kvec *rsp_iov,
+ -			__u16 *epoch, char *lease_key, __u8 *oplock,
+ +extern enum securityEnum smb2_select_sectype(struct TCP_Server_Info *,
+ +					enum securityEnum);
+ +int smb2_parse_contexts(struct TCP_Server_Info *server,
+ +			struct kvec *rsp_iov,
+ +			__u16 *epoch,
+ +			char *lease_key, __u8 *oplock,
+  			struct smb2_file_all_info *buf,
+  			struct create_posix_rsp *posix);
+  
+diff --cc fs/smb/common/fscc.h
+index 0123f34db1e8,941db5a95564..000000000000
+--- a/fs/smb/common/fscc.h
++++ b/fs/smb/common/fscc.h
+@@@ -47,6 -279,16 +47,19 @@@ typedef struct 
+  } __packed FILE_DIRECTORY_INFO;   /* level 0x101 FF resp data */
+  
+  /* See MS-FSCC 2.4.14 */
+++<<<<<<< HEAD
+++=======
++ struct smb2_file_eof_info { /* encoding of request for level 10 */
++ 	__le64 EndOfFile; /* new end of file value */
++ } __packed; /* level 20 Set */
++ 
++ /* See MS-FSCC 2.4.4 */
++ struct smb2_file_alloc_info { /* encoding of request for level 19 */
++ 	__le64 AllocationSize;
++ } __packed;
++ 
++ /* See MS-FSCC 2.4.15 */
+++>>>>>>> 5bd1d3dcc25a (smb/client: refresh allocation after EOF-extending fallocate)
+  typedef struct {
+  	__le32 NextEntryOffset;
+  	__u32 FileIndex;
+* Unmerged path fs/smb/server/smb2pdu.h
+* Unmerged path fs/smb/client/smb2ops.c
+diff --git a/fs/smb/client/smb2pdu.c b/fs/smb/client/smb2pdu.c
+index 16800bae64e0..665e47785b29 100644
+--- a/fs/smb/client/smb2pdu.c
++++ b/fs/smb/client/smb2pdu.c
+@@ -5701,6 +5701,25 @@ SMB2_set_eof(const unsigned int xid, struct cifs_tcon *tcon, u64 persistent_fid,
+ 			0, 1, &data, &size);
+ }
+ 
++int
++SMB2_set_allocation(const unsigned int xid, struct cifs_tcon *tcon,
++		    u64 persistent_fid, u64 volatile_fid, u32 pid,
++		    loff_t allocation_size)
++{
++	struct smb2_file_alloc_info info;
++	void *data;
++	unsigned int size;
++
++	info.AllocationSize = cpu_to_le64(allocation_size);
++
++	data = &info;
++	size = sizeof(struct smb2_file_alloc_info);
++
++	return send_set_info(xid, tcon, persistent_fid, volatile_fid,
++			pid, FILE_ALLOCATION_INFORMATION, SMB2_O_INFO_FILE,
++			0, 1, &data, &size);
++}
++
+ int
+ SMB2_set_acl(const unsigned int xid, struct cifs_tcon *tcon,
+ 		u64 persistent_fid, u64 volatile_fid,
+* Unmerged path fs/smb/client/smb2proto.h
+* Unmerged path fs/smb/common/fscc.h
+* Unmerged path fs/smb/server/smb2pdu.h
