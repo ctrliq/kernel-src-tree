@@ -1,0 +1,2945 @@
+smb: client: fix open handle lookup in cifs_open()
+
+jira KERNEL-1825
+Rebuild_History Non-Buildable kernel-5.14.0-687.61.1.el9_8
+commit-author Paulo Alcantara <pc@manguebit.org>
+commit 40e75e42f49ca54b4ff41f3edb94f5ef0299140c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.61.1.el9_8/40e75e42.failed
+
+When looking up open handles to be re-used in cifs_open(), calling
+cifs_get_{writable,readable}_path() is wrong as it will look up for
+the first matching open handle, and if @file->f_flags doesn't match,
+it will ignore the remaining open handles in
+cifsInodeInfo::openFileList that might potentially match
+@file->f_flags.
+
+For writable and readable handles, fix this by calling
+__cifs_get_writable_file() and __find_readable_file(), respectively,
+with FIND_OPEN_FLAGS set.
+
+With the patch, the following program ends up with two opens instead
+of three sent over the wire.
+
+```
+  #define _GNU_SOURCE
+  #include <unistd.h>
+  #include <string.h>
+  #include <fcntl.h>
+
+  int main(int argc, char *argv[])
+  {
+          int fd;
+
+          fd = open("/mnt/1/foo", O_CREAT | O_WRONLY | O_TRUNC, 0664);
+          close(fd);
+          fd = open("/mnt/1/foo", O_DIRECT | O_WRONLY);
+          close(fd);
+          fd = open("/mnt/1/foo", O_WRONLY);
+          close(fd);
+          fd = open("/mnt/1/foo", O_DIRECT | O_WRONLY);
+          close(fd);
+          return 0;
+  }
+```
+
+```
+$ mount.cifs //srv/share /mnt/1 -o ...
+$ gcc test.c && ./a.out
+```
+
+	Signed-off-by: Paulo Alcantara (Red Hat) <pc@manguebit.org>
+	Reviewed-by: ChenXiaoSong <chenxiaosong@kylinos.cn>
+	Cc: David Howells <dhowells@redhat.com>
+	Cc: linux-cifs@vger.kernel.org
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 40e75e42f49ca54b4ff41f3edb94f5ef0299140c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/smb/client/cifsproto.h
+#	fs/smb/client/file.c
+diff --cc fs/smb/client/cifsproto.h
+index f3d11217b10d,884bfa1cf0b4..000000000000
+--- a/fs/smb/client/cifsproto.h
++++ b/fs/smb/client/cifsproto.h
+@@@ -137,69 -123,49 +137,97 @@@ send_cancel(struct cifs_ses *ses, struc
+  		server->ops->send_cancel(ses, server, rqst, mid, xid) : 0;
+  }
+  
+ -int wait_for_response(struct TCP_Server_Info *server, struct mid_q_entry *mid);
+ +int wait_for_response(struct TCP_Server_Info *server, struct mid_q_entry *midQ);
+ +extern int SendReceive2(const unsigned int /* xid */ , struct cifs_ses *,
+ +			struct kvec *, int /* nvec to send */,
+ +			int * /* type of buf returned */, const int flags,
+ +			struct kvec * /* resp vec */);
+  
+  void smb2_query_server_interfaces(struct work_struct *work);
+++<<<<<<< HEAD
+ +void
+ +cifs_signal_cifsd_for_reconnect(struct TCP_Server_Info *server,
+ +				      bool all_channels);
+ +void
+ +cifs_mark_tcp_ses_conns_for_reconnect(struct TCP_Server_Info *server,
+ +				      bool mark_smb_session);
+ +extern int cifs_reconnect(struct TCP_Server_Info *server,
+ +			  bool mark_smb_session);
+ +int checkSMB(char *buf, unsigned int pdu_len, unsigned int len,
+ +	     struct TCP_Server_Info *srvr);
+ +extern bool is_valid_oplock_break(char *, struct TCP_Server_Info *);
+ +extern bool backup_cred(struct cifs_sb_info *);
+ +extern bool is_size_safe_to_change(struct cifsInodeInfo *cifsInode, __u64 eof,
+ +				   bool from_readdir);
+ +extern struct cifsFileInfo *find_writable_file(struct cifsInodeInfo *, int);
+ +extern int cifs_get_writable_file(struct cifsInodeInfo *cifs_inode,
+ +				  int flags,
+ +				  struct cifsFileInfo **ret_file);
+ +extern int cifs_get_writable_path(struct cifs_tcon *tcon, const char *name,
+ +				  int flags,
+ +				  struct cifsFileInfo **ret_file);
+ +extern struct cifsFileInfo *find_readable_file(struct cifsInodeInfo *, bool);
+ +extern int cifs_get_readable_path(struct cifs_tcon *tcon, const char *name,
+ +				  struct cifsFileInfo **ret_file);
+ +extern int cifs_get_hardlink_path(struct cifs_tcon *tcon, struct inode *inode,
+ +				  struct file *file);
+ +extern unsigned int smbCalcSize(void *buf);
+ +extern int decode_negTokenInit(unsigned char *security_blob, int length,
+++=======
++ void cifs_signal_cifsd_for_reconnect(struct TCP_Server_Info *server,
++ 				     bool all_channels);
++ void cifs_mark_tcp_ses_conns_for_reconnect(struct TCP_Server_Info *server,
++ 					   bool mark_smb_session);
++ int cifs_reconnect(struct TCP_Server_Info *server, bool mark_smb_session);
++ bool backup_cred(struct cifs_sb_info *cifs_sb);
++ bool is_size_safe_to_change(struct cifsInodeInfo *cifsInode, __u64 end_of_file,
++ 			    bool from_readdir);
++ void cifs_write_subrequest_terminated(struct cifs_io_subrequest *wdata,
++ 				      ssize_t result);
++ struct cifsFileInfo *find_writable_file(struct cifsInodeInfo *cifs_inode,
++ 					int flags);
++ int __cifs_get_writable_file(struct cifsInodeInfo *cifs_inode,
++ 			     unsigned int find_flags, unsigned int open_flags,
++ 			     struct cifsFileInfo **ret_file);
++ int cifs_get_writable_path(struct cifs_tcon *tcon, const char *name, int flags,
++ 			   struct cifsFileInfo **ret_file);
++ struct cifsFileInfo *__find_readable_file(struct cifsInodeInfo *cifs_inode,
++ 					  unsigned int find_flags,
++ 					  unsigned int open_flags);
++ int cifs_get_readable_path(struct cifs_tcon *tcon, const char *name,
++ 			   struct cifsFileInfo **ret_file);
++ int cifs_get_hardlink_path(struct cifs_tcon *tcon, struct inode *inode,
++ 			   struct file *file);
++ int decode_negTokenInit(unsigned char *security_blob, int length,
+++>>>>>>> 40e75e42f49c (smb: client: fix open handle lookup in cifs_open())
+  			struct TCP_Server_Info *server);
+ -int cifs_convert_address(struct sockaddr *dst, const char *src, int len);
+ -void cifs_set_port(struct sockaddr *addr, const unsigned short int port);
+ -struct timespec64 cifs_NTtimeToUnix(__le64 ntutc);
+ -u64 cifs_UnixTimeToNT(struct timespec64 t);
+ -struct timespec64 cnvrtDosUnixTm(__le16 le_date, __le16 le_time, int offset);
+ -void cifs_set_oplock_level(struct cifsInodeInfo *cinode, __u32 oplock);
+ -int cifs_get_writer(struct cifsInodeInfo *cinode);
+ -void cifs_put_writer(struct cifsInodeInfo *cinode);
+ -void cifs_done_oplock_break(struct cifsInodeInfo *cinode);
+ -int cifs_unlock_range(struct cifsFileInfo *cfile, struct file_lock *flock,
+ -		      unsigned int xid);
+ -int cifs_push_mandatory_locks(struct cifsFileInfo *cfile);
+ -
+ -void cifs_down_write(struct rw_semaphore *sem);
+ +extern int cifs_convert_address(struct sockaddr *dst, const char *src, int len);
+ +extern void cifs_set_port(struct sockaddr *addr, const unsigned short int port);
+ +extern int map_smb_to_linux_error(char *buf, bool logErr);
+ +extern int map_and_check_smb_error(struct TCP_Server_Info *server,
+ +				   struct mid_q_entry *mid, bool logErr);
+ +unsigned int header_assemble(struct smb_hdr *buffer, char smb_command,
+ +			     const struct cifs_tcon *treeCon, int word_count
+ +			     /* length of fixed section word count in two byte units  */);
+ +extern int small_smb_init_no_tc(const int smb_cmd, const int wct,
+ +				struct cifs_ses *ses,
+ +				void **request_buf);
+ +extern int CIFS_SessSetup(const unsigned int xid, struct cifs_ses *ses,
+ +			  struct TCP_Server_Info *server,
+ +			  const struct nls_table *nls_cp);
+ +extern struct timespec64 cifs_NTtimeToUnix(__le64 utc_nanoseconds_since_1601);
+ +extern u64 cifs_UnixTimeToNT(struct timespec64);
+ +extern struct timespec64 cnvrtDosUnixTm(__le16 le_date, __le16 le_time,
+ +				      int offset);
+ +extern void cifs_set_oplock_level(struct cifsInodeInfo *cinode, __u32 oplock);
+ +extern int cifs_get_writer(struct cifsInodeInfo *cinode);
+ +extern void cifs_put_writer(struct cifsInodeInfo *cinode);
+ +extern void cifs_done_oplock_break(struct cifsInodeInfo *cinode);
+ +extern int cifs_unlock_range(struct cifsFileInfo *cfile,
+ +			     struct file_lock *flock, const unsigned int xid);
+ +extern int cifs_push_mandatory_locks(struct cifsFileInfo *cfile);
+ +
+ +extern void cifs_down_write(struct rw_semaphore *sem);
+  struct cifsFileInfo *cifs_new_fileinfo(struct cifs_fid *fid, struct file *file,
+  				       struct tcon_link *tlink, __u32 oplock,
+  				       const char *symlink_target);
+@@@ -792,4 -492,126 +820,129 @@@ static inline void cifs_free_open_info(
+  	memset(data, 0, sizeof(*data));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline int smb_EIO(enum smb_eio_trace trace)
++ {
++ 	trace_smb3_eio(trace, 0, 0);
++ 	return -EIO;
++ }
++ 
++ static inline int smb_EIO1(enum smb_eio_trace trace, unsigned long info)
++ {
++ 	trace_smb3_eio(trace, info, 0);
++ 	return -EIO;
++ }
++ 
++ static inline int smb_EIO2(enum smb_eio_trace trace, unsigned long info, unsigned long info2)
++ {
++ 	trace_smb3_eio(trace, info, info2);
++ 	return -EIO;
++ }
++ 
++ static inline int cifs_get_num_sgs(const struct smb_rqst *rqst,
++ 				   int num_rqst,
++ 				   const u8 *sig)
++ {
++ 	unsigned int len, skip;
++ 	unsigned int nents = 0;
++ 	unsigned long addr;
++ 	size_t data_size;
++ 	int i, j;
++ 
++ 	/*
++ 	 * The first rqst has a transform header where the first 20 bytes are
++ 	 * not part of the encrypted blob.
++ 	 */
++ 	skip = 20;
++ 
++ 	/* Assumes the first rqst has a transform header as the first iov.
++ 	 * I.e.
++ 	 * rqst[0].rq_iov[0]  is transform header
++ 	 * rqst[0].rq_iov[1+] data to be encrypted/decrypted
++ 	 * rqst[1+].rq_iov[0+] data to be encrypted/decrypted
++ 	 */
++ 	for (i = 0; i < num_rqst; i++) {
++ 		data_size = iov_iter_count(&rqst[i].rq_iter);
++ 
++ 		/* We really don't want a mixture of pinned and unpinned pages
++ 		 * in the sglist.  It's hard to keep track of which is what.
++ 		 * Instead, we convert to a BVEC-type iterator higher up.
++ 		 */
++ 		if (data_size &&
++ 		    WARN_ON_ONCE(user_backed_iter(&rqst[i].rq_iter)))
++ 			return smb_EIO(smb_eio_trace_user_iter);
++ 
++ 		/* We also don't want to have any extra refs or pins to clean
++ 		 * up in the sglist.
++ 		 */
++ 		if (data_size &&
++ 		    WARN_ON_ONCE(iov_iter_extract_will_pin(&rqst[i].rq_iter)))
++ 			return smb_EIO(smb_eio_trace_extract_will_pin);
++ 
++ 		for (j = 0; j < rqst[i].rq_nvec; j++) {
++ 			struct kvec *iov = &rqst[i].rq_iov[j];
++ 
++ 			addr = (unsigned long)iov->iov_base + skip;
++ 			if (is_vmalloc_or_module_addr((void *)addr)) {
++ 				len = iov->iov_len - skip;
++ 				nents += DIV_ROUND_UP(offset_in_page(addr) + len,
++ 						      PAGE_SIZE);
++ 			} else {
++ 				nents++;
++ 			}
++ 			skip = 0;
++ 		}
++ 		if (data_size)
++ 			nents += iov_iter_npages(&rqst[i].rq_iter, INT_MAX);
++ 	}
++ 	nents += DIV_ROUND_UP(offset_in_page(sig) + SMB2_SIGNATURE_SIZE, PAGE_SIZE);
++ 	return nents;
++ }
++ 
++ /* We can not use the normal sg_set_buf() as we will sometimes pass a
++  * stack object as buf.
++  */
++ static inline void cifs_sg_set_buf(struct sg_table *sgtable,
++ 				   const void *buf,
++ 				   unsigned int buflen)
++ {
++ 	unsigned long addr = (unsigned long)buf;
++ 	unsigned int off = offset_in_page(addr);
++ 
++ 	addr &= PAGE_MASK;
++ 	if (is_vmalloc_or_module_addr((void *)addr)) {
++ 		do {
++ 			unsigned int len = min_t(unsigned int, buflen, PAGE_SIZE - off);
++ 
++ 			sg_set_page(&sgtable->sgl[sgtable->nents++],
++ 				    vmalloc_to_page((void *)addr), len, off);
++ 
++ 			off = 0;
++ 			addr += PAGE_SIZE;
++ 			buflen -= len;
++ 		} while (buflen);
++ 	} else {
++ 		sg_set_page(&sgtable->sgl[sgtable->nents++],
++ 			    virt_to_page((void *)addr), buflen, off);
++ 	}
++ }
++ 
++ static inline int cifs_get_writable_file(struct cifsInodeInfo *cifs_inode,
++ 					 unsigned int find_flags,
++ 					 struct cifsFileInfo **ret_file)
++ {
++ 	find_flags &= ~FIND_OPEN_FLAGS;
++ 	return __cifs_get_writable_file(cifs_inode, find_flags, 0, ret_file);
++ }
++ 
++ static inline struct cifsFileInfo *
++ find_readable_file(struct cifsInodeInfo *cinode, unsigned int find_flags)
++ {
++ 	find_flags &= ~FIND_OPEN_FLAGS;
++ 	find_flags |= FIND_NO_PENDING_DELETE;
++ 	return __find_readable_file(cinode, find_flags, 0);
++ }
++ 
+++>>>>>>> 40e75e42f49c (smb: client: fix open handle lookup in cifs_open())
+  #endif			/* _CIFSPROTO_H */
+diff --cc fs/smb/client/file.c
+index ae2966a7c87a,27f61fe7e4e2..000000000000
+--- a/fs/smb/client/file.c
++++ b/fs/smb/client/file.c
+@@@ -36,6 -36,331 +36,334 @@@
+  #include "fs_context.h"
+  #include "cifs_ioctl.h"
+  #include "cached_dir.h"
+++<<<<<<< HEAD
+++=======
++ #include <trace/events/netfs.h>
++ 
++ static int cifs_reopen_file(struct cifsFileInfo *cfile, bool can_flush);
++ 
++ /*
++  * Prepare a subrequest to upload to the server.  We need to allocate credits
++  * so that we know the maximum amount of data that we can include in it.
++  */
++ static void cifs_prepare_write(struct netfs_io_subrequest *subreq)
++ {
++ 	struct cifs_io_subrequest *wdata =
++ 		container_of(subreq, struct cifs_io_subrequest, subreq);
++ 	struct cifs_io_request *req = wdata->req;
++ 	struct netfs_io_stream *stream = &req->rreq.io_streams[subreq->stream_nr];
++ 	struct TCP_Server_Info *server;
++ 	struct cifsFileInfo *open_file = req->cfile;
++ 	struct cifs_sb_info *cifs_sb = CIFS_SB(wdata->rreq->inode->i_sb);
++ 	size_t wsize = req->rreq.wsize;
++ 	int rc;
++ 
++ 	if (!wdata->have_xid) {
++ 		wdata->xid = get_xid();
++ 		wdata->have_xid = true;
++ 	}
++ 
++ 	server = cifs_pick_channel(tlink_tcon(open_file->tlink)->ses);
++ 	wdata->server = server;
++ 
++ 	if (cifs_sb->ctx->wsize == 0)
++ 		cifs_negotiate_wsize(server, cifs_sb->ctx,
++ 				     tlink_tcon(req->cfile->tlink));
++ 
++ retry:
++ 	if (open_file->invalidHandle) {
++ 		rc = cifs_reopen_file(open_file, false);
++ 		if (rc < 0) {
++ 			if (rc == -EAGAIN)
++ 				goto retry;
++ 			subreq->error = rc;
++ 			return netfs_prepare_write_failed(subreq);
++ 		}
++ 	}
++ 
++ 	rc = server->ops->wait_mtu_credits(server, wsize, &stream->sreq_max_len,
++ 					   &wdata->credits);
++ 	if (rc < 0) {
++ 		subreq->error = rc;
++ 		return netfs_prepare_write_failed(subreq);
++ 	}
++ 
++ 	wdata->credits.rreq_debug_id = subreq->rreq->debug_id;
++ 	wdata->credits.rreq_debug_index = subreq->debug_index;
++ 	wdata->credits.in_flight_check = 1;
++ 	trace_smb3_rw_credits(wdata->rreq->debug_id,
++ 			      wdata->subreq.debug_index,
++ 			      wdata->credits.value,
++ 			      server->credits, server->in_flight,
++ 			      wdata->credits.value,
++ 			      cifs_trace_rw_credits_write_prepare);
++ 
++ #ifdef CONFIG_CIFS_SMB_DIRECT
++ 	if (server->smbd_conn) {
++ 		const struct smbdirect_socket_parameters *sp =
++ 			smbd_get_parameters(server->smbd_conn);
++ 
++ 		stream->sreq_max_segs = sp->max_frmr_depth;
++ 	}
++ #endif
++ }
++ 
++ /*
++  * Issue a subrequest to upload to the server.
++  */
++ static void cifs_issue_write(struct netfs_io_subrequest *subreq)
++ {
++ 	struct cifs_io_subrequest *wdata =
++ 		container_of(subreq, struct cifs_io_subrequest, subreq);
++ 	struct cifs_sb_info *sbi = CIFS_SB(subreq->rreq->inode->i_sb);
++ 	int rc;
++ 
++ 	if (cifs_forced_shutdown(sbi)) {
++ 		rc = smb_EIO(smb_eio_trace_forced_shutdown);
++ 		goto fail;
++ 	}
++ 
++ 	rc = adjust_credits(wdata->server, wdata, cifs_trace_rw_credits_issue_write_adjust);
++ 	if (rc)
++ 		goto fail;
++ 
++ 	rc = -EAGAIN;
++ 	if (wdata->req->cfile->invalidHandle)
++ 		goto fail;
++ 
++ 	wdata->server->ops->async_writev(wdata);
++ out:
++ 	return;
++ 
++ fail:
++ 	if (rc == -EAGAIN)
++ 		trace_netfs_sreq(subreq, netfs_sreq_trace_retry);
++ 	else
++ 		trace_netfs_sreq(subreq, netfs_sreq_trace_fail);
++ 	add_credits_and_wake_if(wdata->server, &wdata->credits, 0);
++ 	cifs_write_subrequest_terminated(wdata, rc);
++ 	goto out;
++ }
++ 
++ static void cifs_netfs_invalidate_cache(struct netfs_io_request *wreq)
++ {
++ 	cifs_invalidate_cache(wreq->inode, 0);
++ }
++ 
++ /*
++  * Negotiate the size of a read operation on behalf of the netfs library.
++  */
++ static int cifs_prepare_read(struct netfs_io_subrequest *subreq)
++ {
++ 	struct netfs_io_request *rreq = subreq->rreq;
++ 	struct cifs_io_subrequest *rdata = container_of(subreq, struct cifs_io_subrequest, subreq);
++ 	struct cifs_io_request *req = container_of(subreq->rreq, struct cifs_io_request, rreq);
++ 	struct TCP_Server_Info *server;
++ 	struct cifs_sb_info *cifs_sb = CIFS_SB(rreq->inode->i_sb);
++ 	size_t size;
++ 	int rc = 0;
++ 
++ 	if (!rdata->have_xid) {
++ 		rdata->xid = get_xid();
++ 		rdata->have_xid = true;
++ 	}
++ 
++ 	server = cifs_pick_channel(tlink_tcon(req->cfile->tlink)->ses);
++ 	rdata->server = server;
++ 
++ 	if (cifs_sb->ctx->rsize == 0)
++ 		cifs_negotiate_rsize(server, cifs_sb->ctx,
++ 				     tlink_tcon(req->cfile->tlink));
++ 
++ 	rc = server->ops->wait_mtu_credits(server, cifs_sb->ctx->rsize,
++ 					   &size, &rdata->credits);
++ 	if (rc)
++ 		return rc;
++ 
++ 	rreq->io_streams[0].sreq_max_len = size;
++ 
++ 	rdata->credits.in_flight_check = 1;
++ 	rdata->credits.rreq_debug_id = rreq->debug_id;
++ 	rdata->credits.rreq_debug_index = subreq->debug_index;
++ 
++ 	trace_smb3_rw_credits(rdata->rreq->debug_id,
++ 			      rdata->subreq.debug_index,
++ 			      rdata->credits.value,
++ 			      server->credits, server->in_flight, 0,
++ 			      cifs_trace_rw_credits_read_submit);
++ 
++ #ifdef CONFIG_CIFS_SMB_DIRECT
++ 	if (server->smbd_conn) {
++ 		const struct smbdirect_socket_parameters *sp =
++ 			smbd_get_parameters(server->smbd_conn);
++ 
++ 		rreq->io_streams[0].sreq_max_segs = sp->max_frmr_depth;
++ 	}
++ #endif
++ 	return 0;
++ }
++ 
++ /*
++  * Issue a read operation on behalf of the netfs helper functions.  We're asked
++  * to make a read of a certain size at a point in the file.  We are permitted
++  * to only read a portion of that, but as long as we read something, the netfs
++  * helper will call us again so that we can issue another read.
++  */
++ static void cifs_issue_read(struct netfs_io_subrequest *subreq)
++ {
++ 	struct netfs_io_request *rreq = subreq->rreq;
++ 	struct cifs_io_subrequest *rdata = container_of(subreq, struct cifs_io_subrequest, subreq);
++ 	struct cifs_io_request *req = container_of(subreq->rreq, struct cifs_io_request, rreq);
++ 	struct TCP_Server_Info *server = rdata->server;
++ 	int rc = 0;
++ 
++ 	cifs_dbg(FYI, "%s: op=%08x[%x] mapping=%p len=%zu/%zu\n",
++ 		 __func__, rreq->debug_id, subreq->debug_index, rreq->mapping,
++ 		 subreq->transferred, subreq->len);
++ 
++ 	rc = adjust_credits(server, rdata, cifs_trace_rw_credits_issue_read_adjust);
++ 	if (rc)
++ 		goto failed;
++ 
++ 	if (req->cfile->invalidHandle) {
++ 		do {
++ 			rc = cifs_reopen_file(req->cfile, true);
++ 		} while (rc == -EAGAIN);
++ 		if (rc)
++ 			goto failed;
++ 	}
++ 
++ 	if (subreq->rreq->origin != NETFS_UNBUFFERED_READ &&
++ 	    subreq->rreq->origin != NETFS_DIO_READ)
++ 		__set_bit(NETFS_SREQ_CLEAR_TAIL, &subreq->flags);
++ 
++ 	trace_netfs_sreq(subreq, netfs_sreq_trace_submit);
++ 	rc = rdata->server->ops->async_readv(rdata);
++ 	if (rc)
++ 		goto failed;
++ 	return;
++ 
++ failed:
++ 	subreq->error = rc;
++ 	netfs_read_subreq_terminated(subreq);
++ }
++ 
++ /*
++  * Writeback calls this when it finds a folio that needs uploading.  This isn't
++  * called if writeback only has copy-to-cache to deal with.
++  */
++ static void cifs_begin_writeback(struct netfs_io_request *wreq)
++ {
++ 	struct cifs_io_request *req = container_of(wreq, struct cifs_io_request, rreq);
++ 	int ret;
++ 
++ 	ret = cifs_get_writable_file(CIFS_I(wreq->inode), FIND_ANY, &req->cfile);
++ 	if (ret) {
++ 		cifs_dbg(VFS, "No writable handle in writepages ret=%d\n", ret);
++ 		return;
++ 	}
++ 
++ 	wreq->io_streams[0].avail = true;
++ }
++ 
++ /*
++  * Initialise a request.
++  */
++ static int cifs_init_request(struct netfs_io_request *rreq, struct file *file)
++ {
++ 	struct cifs_io_request *req = container_of(rreq, struct cifs_io_request, rreq);
++ 	struct cifs_sb_info *cifs_sb = CIFS_SB(rreq->inode);
++ 	struct cifsFileInfo *open_file = NULL;
++ 
++ 	rreq->rsize = cifs_sb->ctx->rsize;
++ 	rreq->wsize = cifs_sb->ctx->wsize;
++ 	req->pid = current->tgid; // Ummm...  This may be a workqueue
++ 
++ 	if (file) {
++ 		open_file = file->private_data;
++ 		rreq->netfs_priv = file->private_data;
++ 		req->cfile = cifsFileInfo_get(open_file);
++ 		if (cifs_sb_flags(cifs_sb) & CIFS_MOUNT_RWPIDFORWARD)
++ 			req->pid = req->cfile->pid;
++ 	} else if (rreq->origin != NETFS_WRITEBACK) {
++ 		WARN_ON_ONCE(1);
++ 		return smb_EIO1(smb_eio_trace_not_netfs_writeback, rreq->origin);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * Completion of a request operation.
++  */
++ static void cifs_rreq_done(struct netfs_io_request *rreq)
++ {
++ 	struct timespec64 atime, mtime;
++ 	struct inode *inode = rreq->inode;
++ 
++ 	/* we do not want atime to be less than mtime, it broke some apps */
++ 	atime = inode_set_atime_to_ts(inode, current_time(inode));
++ 	mtime = inode_get_mtime(inode);
++ 	if (timespec64_compare(&atime, &mtime))
++ 		inode_set_atime_to_ts(inode, inode_get_mtime(inode));
++ }
++ 
++ static void cifs_free_request(struct netfs_io_request *rreq)
++ {
++ 	struct cifs_io_request *req = container_of(rreq, struct cifs_io_request, rreq);
++ 
++ 	if (req->cfile)
++ 		cifsFileInfo_put(req->cfile);
++ }
++ 
++ static void cifs_free_subrequest(struct netfs_io_subrequest *subreq)
++ {
++ 	struct cifs_io_subrequest *rdata =
++ 		container_of(subreq, struct cifs_io_subrequest, subreq);
++ 	int rc = subreq->error;
++ 
++ 	if (rdata->subreq.source == NETFS_DOWNLOAD_FROM_SERVER) {
++ #ifdef CONFIG_CIFS_SMB_DIRECT
++ 		if (rdata->mr) {
++ 			smbd_deregister_mr(rdata->mr);
++ 			rdata->mr = NULL;
++ 		}
++ #endif
++ 	}
++ 
++ 	if (rdata->credits.value != 0) {
++ 		trace_smb3_rw_credits(rdata->rreq->debug_id,
++ 				      rdata->subreq.debug_index,
++ 				      rdata->credits.value,
++ 				      rdata->server ? rdata->server->credits : 0,
++ 				      rdata->server ? rdata->server->in_flight : 0,
++ 				      -rdata->credits.value,
++ 				      cifs_trace_rw_credits_free_subreq);
++ 		if (rdata->server)
++ 			add_credits_and_wake_if(rdata->server, &rdata->credits, 0);
++ 		else
++ 			rdata->credits.value = 0;
++ 	}
++ 
++ 	if (rdata->have_xid)
++ 		free_xid(rdata->xid);
++ }
++ 
++ const struct netfs_request_ops cifs_req_ops = {
++ 	.request_pool		= &cifs_io_request_pool,
++ 	.subrequest_pool	= &cifs_io_subrequest_pool,
++ 	.init_request		= cifs_init_request,
++ 	.free_request		= cifs_free_request,
++ 	.free_subrequest	= cifs_free_subrequest,
++ 	.prepare_read		= cifs_prepare_read,
++ 	.issue_read		= cifs_issue_read,
++ 	.done			= cifs_rreq_done,
++ 	.begin_writeback	= cifs_begin_writeback,
++ 	.prepare_write		= cifs_prepare_write,
++ 	.issue_write		= cifs_issue_write,
++ 	.invalidate_cache	= cifs_netfs_invalidate_cache,
++ };
+++>>>>>>> 40e75e42f49c (smb: client: fix open handle lookup in cifs_open())
+  
+  /*
+   * Mark as invalid, all open files on tree connections since they
+@@@ -2175,108 -2489,53 +2500,131 @@@ int cifs_lock(struct file *file, int cm
+  	return rc;
+  }
+  
+ -void cifs_write_subrequest_terminated(struct cifs_io_subrequest *wdata, ssize_t result)
+ +/*
+ + * update the file size (if needed) after a write. Should be called with
+ + * the inode->i_lock held
+ + */
+ +void
+ +cifs_update_eof(struct cifsInodeInfo *cifsi, loff_t offset,
+ +		      unsigned int bytes_written)
+ +{
+ +	loff_t end_of_write = offset + bytes_written;
+ +
+ +	if (end_of_write > cifsi->netfs.remote_i_size)
+ +		netfs_resize_file(&cifsi->netfs, end_of_write);
+ +}
+ +
+ +static ssize_t
+ +cifs_write(struct cifsFileInfo *open_file, __u32 pid, const char *write_data,
+ +	   size_t write_size, loff_t *offset)
+  {
+ -	struct netfs_io_request *wreq = wdata->rreq;
+ -	struct netfs_inode *ictx = netfs_inode(wreq->inode);
+ -	loff_t wrend;
+ +	int rc = 0;
+ +	unsigned int bytes_written = 0;
+ +	unsigned int total_written;
+ +	struct cifs_tcon *tcon;
+ +	struct TCP_Server_Info *server;
+ +	unsigned int xid;
+ +	struct dentry *dentry = open_file->dentry;
+ +	struct cifsInodeInfo *cifsi = CIFS_I(d_inode(dentry));
+ +	struct cifs_io_parms io_parms = {0};
+ +
+ +	cifs_dbg(FYI, "write %zd bytes to offset %lld of %pd\n",
+ +		 write_size, *offset, dentry);
+ +
+ +	tcon = tlink_tcon(open_file->tlink);
+ +	server = tcon->ses->server;
+ +
+ +	if (!server->ops->sync_write)
+ +		return -ENOSYS;
+  
+ -	if (result > 0) {
+ -		wrend = wdata->subreq.start + wdata->subreq.transferred + result;
+ +	xid = get_xid();
+ +
+ +	for (total_written = 0; write_size > total_written;
+ +	     total_written += bytes_written) {
+ +		rc = -EAGAIN;
+ +		while (rc == -EAGAIN) {
+ +			struct kvec iov[2];
+ +			unsigned int len;
+ +
+ +			if (open_file->invalidHandle) {
+ +				/* we could deadlock if we called
+ +				   filemap_fdatawait from here so tell
+ +				   reopen_file not to flush data to
+ +				   server now */
+ +				rc = cifs_reopen_file(open_file, false);
+ +				if (rc != 0)
+ +					break;
+ +			}
+  
+ -		if (wrend > ictx->zero_point &&
+ -		    (wdata->rreq->origin == NETFS_UNBUFFERED_WRITE ||
+ -		     wdata->rreq->origin == NETFS_DIO_WRITE))
+ -			ictx->zero_point = wrend;
+ -		if (wrend > ictx->remote_i_size)
+ -			netfs_resize_file(ictx, wrend, true);
+ +			len = min(server->ops->wp_retry_size(d_inode(dentry)),
+ +				  (unsigned int)write_size - total_written);
+ +			/* iov[0] is reserved for smb header */
+ +			iov[1].iov_base = (char *)write_data + total_written;
+ +			iov[1].iov_len = len;
+ +			io_parms.pid = pid;
+ +			io_parms.tcon = tcon;
+ +			io_parms.offset = *offset;
+ +			io_parms.length = len;
+ +			rc = server->ops->sync_write(xid, &open_file->fid,
+ +					&io_parms, &bytes_written, iov, 1);
+ +		}
+ +		if (rc || (bytes_written == 0)) {
+ +			if (total_written)
+ +				break;
+ +			else {
+ +				free_xid(xid);
+ +				return rc;
+ +			}
+ +		} else {
+ +			spin_lock(&d_inode(dentry)->i_lock);
+ +			cifs_update_eof(cifsi, *offset, bytes_written);
+ +			spin_unlock(&d_inode(dentry)->i_lock);
+ +			*offset += bytes_written;
+ +		}
+  	}
+  
+ -	netfs_write_subrequest_terminated(&wdata->subreq, result);
+ +	cifs_stats_bytes_written(tcon, total_written);
+ +
+ +	if (total_written > 0) {
+ +		spin_lock(&d_inode(dentry)->i_lock);
+ +		if (*offset > d_inode(dentry)->i_size) {
+ +			i_size_write(d_inode(dentry), *offset);
+ +			d_inode(dentry)->i_blocks = (512 - 1 + *offset) >> 9;
+ +		}
+ +		spin_unlock(&d_inode(dentry)->i_lock);
+ +	}
+ +	mark_inode_dirty_sync(d_inode(dentry));
+ +	free_xid(xid);
+ +	return total_written;
+  }
+  
+- struct cifsFileInfo *find_readable_file(struct cifsInodeInfo *cifs_inode,
+- 					bool fsuid_only)
++ static bool open_flags_match(struct cifsInodeInfo *cinode,
++ 			     unsigned int oflags, unsigned int cflags)
++ {
++ 	struct inode *inode = &cinode->netfs.inode;
++ 	int crw = 0, orw = 0;
++ 
++ 	oflags &= ~(O_CREAT | O_EXCL | O_TRUNC);
++ 	cflags &= ~(O_CREAT | O_EXCL | O_TRUNC);
++ 
++ 	if (cifs_fscache_enabled(inode)) {
++ 		if (OPEN_FMODE(cflags) & FMODE_WRITE)
++ 			crw = 1;
++ 		if (OPEN_FMODE(oflags) & FMODE_WRITE)
++ 			orw = 1;
++ 	}
++ 	if (cifs_convert_flags(oflags, orw) != cifs_convert_flags(cflags, crw))
++ 		return false;
++ 
++ 	return (oflags & (O_SYNC | O_DIRECT)) == (cflags & (O_SYNC | O_DIRECT));
++ }
++ 
++ struct cifsFileInfo *__find_readable_file(struct cifsInodeInfo *cifs_inode,
++ 					  unsigned int find_flags,
++ 					  unsigned int open_flags)
+  {
+  	struct cifs_sb_info *cifs_sb = CIFS_SB(cifs_inode);
++ 	bool fsuid_only = find_flags & FIND_FSUID_ONLY;
+  	struct cifsFileInfo *open_file = NULL;
+  
+  	/* only filter by fsuid on multiuser mounts */
+@@@ -2731,1861 -2892,105 +3080,1861 @@@ static int cifs_partialpagewrite(struc
+  	return rc;
+  }
+  
+ -ssize_t
+ -cifs_strict_writev(struct kiocb *iocb, struct iov_iter *from)
+ +static struct cifs_writedata *
+ +wdata_alloc_and_fillpages(pgoff_t tofind, struct address_space *mapping,
+ +			  pgoff_t end, pgoff_t *index,
+ +			  unsigned int *found_pages)
+  {
+ -	struct inode *inode = file_inode(iocb->ki_filp);
+ -	struct cifsInodeInfo *cinode = CIFS_I(inode);
+ -	struct cifs_sb_info *cifs_sb = CIFS_SB(inode);
+ -	struct cifsFileInfo *cfile = (struct cifsFileInfo *)
+ -						iocb->ki_filp->private_data;
+ -	struct cifs_tcon *tcon = tlink_tcon(cfile->tlink);
+ -	ssize_t written;
+ -
+ -	written = cifs_get_writer(cinode);
+ -	if (written)
+ -		return written;
+ +	struct cifs_writedata *wdata;
+ +	struct folio_batch fbatch;
+ +	unsigned int i, idx, p, nr;
+ +	wdata = cifs_writedata_alloc((unsigned int)tofind,
+ +				     cifs_writev_complete);
+ +	if (!wdata)
+ +		return NULL;
+  
+ -	if (CIFS_CACHE_WRITE(cinode)) {
+ -		if (cap_unix(tcon->ses) &&
+ -		    (CIFS_UNIX_FCNTL_CAP & le64_to_cpu(tcon->fsUnixInfo.Capability)) &&
+ -		    ((cifs_sb_flags(cifs_sb) & CIFS_MOUNT_NOPOSIXBRL) == 0)) {
+ -			written = netfs_file_write_iter(iocb, from);
+ +	folio_batch_init(&fbatch);
+ +	*found_pages = 0;
+ +
+ +again:
+ +	nr = filemap_get_folios_tag(mapping, index, end,
+ +				PAGECACHE_TAG_DIRTY, &fbatch);
+ +	if (!nr)
+ +		goto out; /* No dirty pages left in the range */
+ +
+ +	for (i = 0; i < nr; i++) {
+ +		struct folio *folio = fbatch.folios[i];
+ +
+ +		idx = 0;
+ +		p = folio_nr_pages(folio);
+ +add_more:
+ +		wdata->pages[*found_pages] = folio_page(folio, idx);
+ +		folio_get(folio);
+ +		if (++*found_pages == tofind) {
+ +			folio_batch_release(&fbatch);
+  			goto out;
+  		}
+ -		written = cifs_writev(iocb, from);
+ -		goto out;
+ -	}
+ -	/*
+ -	 * For non-oplocked files in strict cache mode we need to write the data
+ -	 * to the server exactly from the pos to pos+len-1 rather than flush all
+ -	 * affected pages because it may cause a error with mandatory locks on
+ -	 * these pages but not on the region from pos to ppos+len-1.
+ -	 */
+ -	written = netfs_file_write_iter(iocb, from);
+ -	if (CIFS_CACHE_READ(cinode)) {
+ -		/*
+ -		 * We have read level caching and we have just sent a write
+ -		 * request to the server thus making data in the cache stale.
+ -		 * Zap the cache and set oplock/lease level to NONE to avoid
+ -		 * reading stale data from the cache. All subsequent read
+ -		 * operations will read new data from the server.
+ -		 */
+ -		cifs_zap_mapping(inode);
+ -		cifs_dbg(FYI, "Set Oplock/Lease to NONE for inode=%p after write\n",
+ -			 inode);
+ -		cifs_reset_oplock(cinode);
+ +		if (++idx < p)
+ +			goto add_more;
+  	}
+ +	folio_batch_release(&fbatch);
+ +	goto again;
+  out:
+ -	cifs_put_writer(cinode);
+ -	return written;
+ +	return wdata;
+  }
+  
+ -ssize_t cifs_loose_read_iter(struct kiocb *iocb, struct iov_iter *iter)
+ +static unsigned int
+ +wdata_prepare_pages(struct cifs_writedata *wdata, unsigned int found_pages,
+ +		    struct address_space *mapping,
+ +		    struct writeback_control *wbc,
+ +		    pgoff_t end, pgoff_t *index, pgoff_t *next, bool *done)
+  {
+ -	ssize_t rc;
+ -	struct inode *inode = file_inode(iocb->ki_filp);
+ +	unsigned int nr_pages = 0, i;
+ +	struct page *page;
+  
+ -	if (iocb->ki_flags & IOCB_DIRECT)
+ -		return netfs_unbuffered_read_iter(iocb, iter);
+ +	for (i = 0; i < found_pages; i++) {
+ +		page = wdata->pages[i];
+ +		/*
+ +		 * At this point we hold neither the i_pages lock nor the
+ +		 * page lock: the page may be truncated or invalidated
+ +		 * (changing page->mapping to NULL), or even swizzled
+ +		 * back from swapper_space to tmpfs file mapping
+ +		 */
+  
+ -	rc = cifs_revalidate_mapping(inode);
+ -	if (rc)
+ -		return rc;
+ +relock_recheck:
+ +		if (nr_pages == 0)
+ +			lock_page(page);
+ +		else if (!trylock_page(page))
+ +			break;
+  
+ -	return netfs_file_read_iter(iocb, iter);
+ -}
+ +		if (unlikely(page->mapping != mapping)) {
+ +			unlock_page(page);
+ +			break;
+ +		}
+  
+ -ssize_t cifs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
+ -{
+ -	struct inode *inode = file_inode(iocb->ki_filp);
+ -	struct cifsInodeInfo *cinode = CIFS_I(inode);
+ -	ssize_t written;
+ -	int rc;
+ +		if (!wbc->range_cyclic && page->index > end) {
+ +			*done = true;
+ +			unlock_page(page);
+ +			break;
+ +		}
+  
+ -	if (iocb->ki_filp->f_flags & O_DIRECT) {
+ -		written = netfs_unbuffered_write_iter(iocb, from);
+ -		if (written > 0 && CIFS_CACHE_READ(cinode)) {
+ -			cifs_zap_mapping(inode);
+ -			cifs_dbg(FYI,
+ -				 "Set no oplock for inode=%p after a write operation\n",
+ -				 inode);
+ -			cifs_reset_oplock(cinode);
+ +		if (*next && (page->index != *next)) {
+ +			/* Not next consecutive page */
+ +			unlock_page(page);
+ +			break;
+  		}
+ -		return written;
+ -	}
+  
+ -	written = cifs_get_writer(cinode);
+ -	if (written)
+ -		return written;
+ +		if (PageWriteback(page)) {
+ +			unlock_page(page);
+ +			if (wbc->sync_mode != WB_SYNC_NONE) {
+ +				wait_on_page_writeback(page);
+ +				goto relock_recheck;
+ +			}
+ +			break;
+ +		}
+  
+ -	written = netfs_file_write_iter(iocb, from);
+ +		if (!clear_page_dirty_for_io(page)) {
+ +			unlock_page(page);
+ +			break;
+ +		}
+  
+ -	if (!CIFS_CACHE_WRITE(CIFS_I(inode))) {
+ -		rc = filemap_fdatawrite(inode->i_mapping);
+ -		if (rc)
+ -			cifs_dbg(FYI, "cifs_file_write_iter: %d rc on %p inode\n",
+ -				 rc, inode);
+ +		/*
+ +		 * This actually clears the dirty bit in the radix tree.
+ +		 * See cifs_writepage() for more commentary.
+ +		 */
+ +		set_page_writeback(page);
+ +		if (page_offset(page) >= i_size_read(mapping->host)) {
+ +			*done = true;
+ +			unlock_page(page);
+ +			end_page_writeback(page);
+ +			break;
+ +		}
+ +
+ +		wdata->pages[i] = page;
+ +		*next = page->index + 1;
+ +		++nr_pages;
+  	}
+  
+ -	cifs_put_writer(cinode);
+ -	return written;
+ +	/* reset index to refind any pages skipped */
+ +	if (nr_pages == 0)
+ +		*index = wdata->pages[0]->index + 1;
+ +
+ +	/* put any pages we aren't going to use */
+ +	for (i = nr_pages; i < found_pages; i++) {
+ +		put_page(wdata->pages[i]);
+ +		wdata->pages[i] = NULL;
+ +	}
+ +
+ +	return nr_pages;
+ +}
+ +
+ +static int
+ +wdata_send_pages(struct cifs_writedata *wdata, unsigned int nr_pages,
+ +		 struct address_space *mapping, struct writeback_control *wbc)
+ +{
+ +	int rc;
+ +
+ +	wdata->sync_mode = wbc->sync_mode;
+ +	wdata->nr_pages = nr_pages;
+ +	wdata->offset = page_offset(wdata->pages[0]);
+ +	wdata->pagesz = PAGE_SIZE;
+ +	wdata->tailsz = min(i_size_read(mapping->host) -
+ +			page_offset(wdata->pages[nr_pages - 1]),
+ +			(loff_t)PAGE_SIZE);
+ +	wdata->bytes = ((nr_pages - 1) * PAGE_SIZE) + wdata->tailsz;
+ +	wdata->pid = wdata->cfile->pid;
+ +
+ +	rc = adjust_credits(wdata->server, &wdata->credits, wdata->bytes);
+ +	if (rc)
+ +		return rc;
+ +
+ +	if (wdata->cfile->invalidHandle)
+ +		rc = -EAGAIN;
+ +	else
+ +		rc = wdata->server->ops->async_writev(wdata,
+ +						      cifs_writedata_release);
+ +
+ +	return rc;
+ +}
+ +
+ +static int
+ +cifs_writepage_locked(struct page *page, struct writeback_control *wbc);
+ +
+ +static int cifs_write_one_page(struct folio *folio,
+ +		struct writeback_control *wbc, void *data)
+ +{
+ +	struct address_space *mapping = data;
+ +	int ret;
+ +
+ +	ret = cifs_writepage_locked(&folio->page, wbc);
+ +	folio_unlock(folio);
+ +	mapping_set_error(mapping, ret);
+ +	return ret;
+ +}
+ +
+ +static int cifs_writepages(struct address_space *mapping,
+ +			   struct writeback_control *wbc)
+ +{
+ +	struct inode *inode = mapping->host;
+ +	struct cifs_sb_info *cifs_sb = CIFS_SB(inode->i_sb);
+ +	struct TCP_Server_Info *server;
+ +	bool done = false, scanned = false, range_whole = false;
+ +	pgoff_t end, index;
+ +	struct cifs_writedata *wdata;
+ +	struct cifsFileInfo *cfile = NULL;
+ +	int rc = 0;
+ +	int saved_rc = 0;
+ +	unsigned int xid;
+ +
+ +	/*
+ +	 * If wsize is smaller than the page cache size, default to writing
+ +	 * one page at a time.
+ +	 */
+ +	if (cifs_sb->ctx->wsize < PAGE_SIZE)
+ +		return write_cache_pages(mapping, wbc, cifs_write_one_page,
+ +				mapping);
+ +
+ +	xid = get_xid();
+ +	if (wbc->range_cyclic) {
+ +		index = mapping->writeback_index; /* Start from prev offset */
+ +		end = -1;
+ +	} else {
+ +		index = wbc->range_start >> PAGE_SHIFT;
+ +		end = wbc->range_end >> PAGE_SHIFT;
+ +		if (wbc->range_start == 0 && wbc->range_end == LLONG_MAX)
+ +			range_whole = true;
+ +		scanned = true;
+ +	}
+ +	server = cifs_pick_channel(cifs_sb_master_tcon(cifs_sb)->ses);
+ +
+ +retry:
+ +	while (!done && index <= end) {
+ +		unsigned int i, nr_pages, found_pages, wsize;
+ +		pgoff_t next = 0, tofind, saved_index = index;
+ +		struct cifs_credits credits_on_stack;
+ +		struct cifs_credits *credits = &credits_on_stack;
+ +		int get_file_rc = 0;
+ +
+ +		if (cfile)
+ +			cifsFileInfo_put(cfile);
+ +
+ +		rc = cifs_get_writable_file(CIFS_I(inode), FIND_WR_ANY, &cfile);
+ +
+ +		/* in case of an error store it to return later */
+ +		if (rc)
+ +			get_file_rc = rc;
+ +
+ +		if (cifs_sb->ctx->wsize == 0)
+ +			cifs_negotiate_wsize(server, cifs_sb->ctx,
+ +					     cifs_sb_master_tcon(cifs_sb));
+ +
+ +		rc = server->ops->wait_mtu_credits(server, cifs_sb->ctx->wsize,
+ +						   &wsize, credits);
+ +		if (rc != 0) {
+ +			done = true;
+ +			break;
+ +		}
+ +
+ +		tofind = min((wsize / PAGE_SIZE) - 1, end - index) + 1;
+ +
+ +		wdata = wdata_alloc_and_fillpages(tofind, mapping, end, &index,
+ +						  &found_pages);
+ +		if (!wdata) {
+ +			rc = -ENOMEM;
+ +			done = true;
+ +			add_credits_and_wake_if(server, credits, 0);
+ +			break;
+ +		}
+ +
+ +		if (found_pages == 0) {
+ +			kref_put(&wdata->refcount, cifs_writedata_release);
+ +			add_credits_and_wake_if(server, credits, 0);
+ +			break;
+ +		}
+ +
+ +		nr_pages = wdata_prepare_pages(wdata, found_pages, mapping, wbc,
+ +					       end, &index, &next, &done);
+ +
+ +		/* nothing to write? */
+ +		if (nr_pages == 0) {
+ +			kref_put(&wdata->refcount, cifs_writedata_release);
+ +			add_credits_and_wake_if(server, credits, 0);
+ +			continue;
+ +		}
+ +
+ +		wdata->credits = credits_on_stack;
+ +		wdata->cfile = cfile;
+ +		wdata->server = server;
+ +		cfile = NULL;
+ +
+ +		if (!wdata->cfile) {
+ +			cifs_dbg(VFS, "No writable handle in writepages rc=%d\n",
+ +				 get_file_rc);
+ +			if (is_retryable_error(get_file_rc))
+ +				rc = get_file_rc;
+ +			else
+ +				rc = -EBADF;
+ +		} else
+ +			rc = wdata_send_pages(wdata, nr_pages, mapping, wbc);
+ +
+ +		for (i = 0; i < nr_pages; ++i)
+ +			unlock_page(wdata->pages[i]);
+ +
+ +		/* send failure -- clean up the mess */
+ +		if (rc != 0) {
+ +			add_credits_and_wake_if(server, &wdata->credits, 0);
+ +			for (i = 0; i < nr_pages; ++i) {
+ +				if (is_retryable_error(rc))
+ +					redirty_page_for_writepage(wbc,
+ +							   wdata->pages[i]);
+ +				else
+ +					SetPageError(wdata->pages[i]);
+ +				end_page_writeback(wdata->pages[i]);
+ +				put_page(wdata->pages[i]);
+ +			}
+ +			if (!is_retryable_error(rc))
+ +				mapping_set_error(mapping, rc);
+ +		}
+ +		kref_put(&wdata->refcount, cifs_writedata_release);
+ +
+ +		if (wbc->sync_mode == WB_SYNC_ALL && rc == -EAGAIN) {
+ +			index = saved_index;
+ +			continue;
+ +		}
+ +
+ +		/* Return immediately if we received a signal during writing */
+ +		if (is_interrupt_error(rc)) {
+ +			done = true;
+ +			break;
+ +		}
+ +
+ +		if (rc != 0 && saved_rc == 0)
+ +			saved_rc = rc;
+ +
+ +		wbc->nr_to_write -= nr_pages;
+ +		if (wbc->nr_to_write <= 0)
+ +			done = true;
+ +
+ +		index = next;
+ +	}
+ +
+ +	if (!scanned && !done) {
+ +		/*
+ +		 * We hit the last page and there is more work to be done: wrap
+ +		 * back to the start of the file
+ +		 */
+ +		scanned = true;
+ +		index = 0;
+ +		goto retry;
+ +	}
+ +
+ +	if (saved_rc != 0)
+ +		rc = saved_rc;
+ +
+ +	if (wbc->range_cyclic || (range_whole && wbc->nr_to_write > 0))
+ +		mapping->writeback_index = index;
+ +
+ +	if (cfile)
+ +		cifsFileInfo_put(cfile);
+ +	free_xid(xid);
+ +	/* Indication to update ctime and mtime as close is deferred */
+ +	set_bit(CIFS_INO_MODIFIED_ATTR, &CIFS_I(inode)->flags);
+ +	return rc;
+ +}
+ +
+ +static int
+ +cifs_writepage_locked(struct page *page, struct writeback_control *wbc)
+ +{
+ +	int rc;
+ +	unsigned int xid;
+ +
+ +	xid = get_xid();
+ +/* BB add check for wbc flags */
+ +	get_page(page);
+ +	if (!PageUptodate(page))
+ +		cifs_dbg(FYI, "ppw - page not up to date\n");
+ +
+ +	/*
+ +	 * Set the "writeback" flag, and clear "dirty" in the radix tree.
+ +	 *
+ +	 * A writepage() implementation always needs to do either this,
+ +	 * or re-dirty the page with "redirty_page_for_writepage()" in
+ +	 * the case of a failure.
+ +	 *
+ +	 * Just unlocking the page will cause the radix tree tag-bits
+ +	 * to fail to update with the state of the page correctly.
+ +	 */
+ +	set_page_writeback(page);
+ +retry_write:
+ +	rc = cifs_partialpagewrite(page, 0, PAGE_SIZE);
+ +	if (is_retryable_error(rc)) {
+ +		if (wbc->sync_mode == WB_SYNC_ALL && rc == -EAGAIN)
+ +			goto retry_write;
+ +		redirty_page_for_writepage(wbc, page);
+ +	} else if (rc != 0) {
+ +		SetPageError(page);
+ +		mapping_set_error(page->mapping, rc);
+ +	} else {
+ +		SetPageUptodate(page);
+ +	}
+ +	end_page_writeback(page);
+ +	put_page(page);
+ +	free_xid(xid);
+ +	return rc;
+ +}
+ +
+ +static int cifs_write_end(struct file *file, struct address_space *mapping,
+ +			loff_t pos, unsigned len, unsigned copied,
+ +			struct page *page, void *fsdata)
+ +{
+ +	int rc;
+ +	struct inode *inode = mapping->host;
+ +	struct cifsFileInfo *cfile = file->private_data;
+ +	struct cifs_sb_info *cifs_sb = CIFS_SB(cfile->dentry);
+ +	__u32 pid;
+ +
+ +	if (cifs_sb_flags(cifs_sb) & CIFS_MOUNT_RWPIDFORWARD)
+ +		pid = cfile->pid;
+ +	else
+ +		pid = current->tgid;
+ +
+ +	cifs_dbg(FYI, "write_end for page %p from pos %lld with %d bytes\n",
+ +		 page, pos, copied);
+ +
+ +	if (PageChecked(page)) {
+ +		if (copied == len)
+ +			SetPageUptodate(page);
+ +		ClearPageChecked(page);
+ +	} else if (!PageUptodate(page) && copied == PAGE_SIZE)
+ +		SetPageUptodate(page);
+ +
+ +	if (!PageUptodate(page)) {
+ +		char *page_data;
+ +		unsigned offset = pos & (PAGE_SIZE - 1);
+ +		unsigned int xid;
+ +
+ +		xid = get_xid();
+ +		/* this is probably better than directly calling
+ +		   partialpage_write since in this function the file handle is
+ +		   known which we might as well	leverage */
+ +		/* BB check if anything else missing out of ppw
+ +		   such as updating last write time */
+ +		page_data = kmap(page);
+ +		rc = cifs_write(cfile, pid, page_data + offset, copied, &pos);
+ +		/* if (rc < 0) should we set writebehind rc? */
+ +		kunmap(page);
+ +
+ +		free_xid(xid);
+ +	} else {
+ +		rc = copied;
+ +		pos += copied;
+ +		set_page_dirty(page);
+ +	}
+ +
+ +	if (rc > 0) {
+ +		spin_lock(&inode->i_lock);
+ +		if (pos > inode->i_size) {
+ +			loff_t additional_blocks = (512 - 1 + copied) >> 9;
+ +
+ +			i_size_write(inode, pos);
+ +			/*
+ +			 * Estimate new allocation size based on the amount written.
+ +			 * This will be updated from server on close (and on queryinfo)
+ +			 */
+ +			inode->i_blocks = min_t(blkcnt_t, (512 - 1 + pos) >> 9,
+ +						inode->i_blocks + additional_blocks);
+ +		}
+ +		spin_unlock(&inode->i_lock);
+ +	}
+ +
+ +	unlock_page(page);
+ +	put_page(page);
+ +	/* Indication to update ctime and mtime as close is deferred */
+ +	set_bit(CIFS_INO_MODIFIED_ATTR, &CIFS_I(inode)->flags);
+ +
+ +	return rc;
+ +}
+ +
+ +int cifs_strict_fsync(struct file *file, loff_t start, loff_t end,
+ +		      int datasync)
+ +{
+ +	struct cifsFileInfo *smbfile = file->private_data;
+ +	struct inode *inode = file_inode(file);
+ +	unsigned int xid;
+ +	int rc;
+ +
+ +	rc = file_write_and_wait_range(file, start, end);
+ +	if (rc) {
+ +		trace_cifs_fsync_err(inode->i_ino, rc);
+ +		return rc;
+ +	}
+ +
+ +	cifs_dbg(FYI, "%s: name=%pD datasync=0x%x\n", __func__, file, datasync);
+ +
+ +	if (!CIFS_CACHE_READ(CIFS_I(inode))) {
+ +		rc = cifs_zap_mapping(inode);
+ +		cifs_dbg(FYI, "%s: invalidate mapping: rc = %d\n", __func__, rc);
+ +	}
+ +
+ +	xid = get_xid();
+ +	rc = cifs_file_flush(xid, inode, smbfile);
+ +	free_xid(xid);
+ +	return rc;
+ +}
+ +
+ +int cifs_fsync(struct file *file, loff_t start, loff_t end, int datasync)
+ +{
+ +	unsigned int xid;
+ +	int rc = 0;
+ +	struct cifs_tcon *tcon;
+ +	struct TCP_Server_Info *server;
+ +	struct cifsFileInfo *smbfile = file->private_data;
+ +	struct inode *inode = file_inode(file);
+ +	struct cifs_sb_info *cifs_sb = CIFS_SB(file);
+ +
+ +	rc = file_write_and_wait_range(file, start, end);
+ +	if (rc) {
+ +		trace_cifs_fsync_err(file_inode(file)->i_ino, rc);
+ +		return rc;
+ +	}
+ +
+ +	xid = get_xid();
+ +
+ +	cifs_dbg(FYI, "Sync file - name: %pD datasync: 0x%x\n",
+ +		 file, datasync);
+ +
+ +	tcon = tlink_tcon(smbfile->tlink);
+ +	if (!(cifs_sb_flags(cifs_sb) & CIFS_MOUNT_NOSSYNC)) {
+ +		server = tcon->ses->server;
+ +		if (server->ops->flush == NULL) {
+ +			rc = -ENOSYS;
+ +			goto fsync_exit;
+ +		}
+ +
+ +		if ((OPEN_FMODE(smbfile->f_flags) & FMODE_WRITE) == 0) {
+- 			smbfile = find_writable_file(CIFS_I(inode), FIND_WR_ANY);
+++			smbfile = find_writable_file(CIFS_I(inode), FIND_ANY);
+ +			if (smbfile) {
+ +				rc = server->ops->flush(xid, tcon, &smbfile->fid);
+ +				cifsFileInfo_put(smbfile);
+ +			} else
+ +				cifs_dbg(FYI, "ignore fsync for file not open for write\n");
+ +		} else
+ +			rc = server->ops->flush(xid, tcon, &smbfile->fid);
+ +	}
+ +
+ +fsync_exit:
+ +	free_xid(xid);
+ +	return rc;
+ +}
+ +
+ +/*
+ + * As file closes, flush all cached write data for this inode checking
+ + * for write behind errors.
+ + */
+ +int cifs_flush(struct file *file, fl_owner_t id)
+ +{
+ +	struct inode *inode = file_inode(file);
+ +	int rc = 0;
+ +
+ +	if (file->f_mode & FMODE_WRITE)
+ +		rc = filemap_write_and_wait(inode->i_mapping);
+ +
+ +	cifs_dbg(FYI, "Flush inode %p file %p rc %d\n", inode, file, rc);
+ +	if (rc) {
+ +		/* get more nuanced writeback errors */
+ +		rc = filemap_check_wb_err(file->f_mapping, 0);
+ +		trace_cifs_flush_err(inode->i_ino, rc);
+ +	}
+ +	return rc;
+ +}
+ +
+ +static int
+ +cifs_write_allocate_pages(struct page **pages, unsigned long num_pages)
+ +{
+ +	int rc = 0;
+ +	unsigned long i;
+ +
+ +	for (i = 0; i < num_pages; i++) {
+ +		pages[i] = alloc_page(GFP_KERNEL|__GFP_HIGHMEM);
+ +		if (!pages[i]) {
+ +			/*
+ +			 * save number of pages we have already allocated and
+ +			 * return with ENOMEM error
+ +			 */
+ +			num_pages = i;
+ +			rc = -ENOMEM;
+ +			break;
+ +		}
+ +	}
+ +
+ +	if (rc) {
+ +		for (i = 0; i < num_pages; i++)
+ +			put_page(pages[i]);
+ +	}
+ +	return rc;
+ +}
+ +
+ +static inline
+ +size_t get_numpages(const size_t wsize, const size_t len, size_t *cur_len)
+ +{
+ +	size_t num_pages;
+ +	size_t clen;
+ +
+ +	clen = min_t(const size_t, len, wsize);
+ +	num_pages = DIV_ROUND_UP(clen, PAGE_SIZE);
+ +
+ +	if (cur_len)
+ +		*cur_len = clen;
+ +
+ +	return num_pages;
+ +}
+ +
+ +static void
+ +cifs_uncached_writedata_release(struct kref *refcount)
+ +{
+ +	int i;
+ +	struct cifs_writedata *wdata = container_of(refcount,
+ +					struct cifs_writedata, refcount);
+ +
+ +	kref_put(&wdata->ctx->refcount, cifs_aio_ctx_release);
+ +	for (i = 0; i < wdata->nr_pages; i++)
+ +		put_page(wdata->pages[i]);
+ +	cifs_writedata_release(refcount);
+ +}
+ +
+ +static void collect_uncached_write_data(struct cifs_aio_ctx *ctx);
+ +
+ +static void
+ +cifs_uncached_writev_complete(struct work_struct *work)
+ +{
+ +	struct cifs_writedata *wdata = container_of(work,
+ +					struct cifs_writedata, work);
+ +	struct inode *inode = d_inode(wdata->cfile->dentry);
+ +	struct cifsInodeInfo *cifsi = CIFS_I(inode);
+ +
+ +	spin_lock(&inode->i_lock);
+ +	cifs_update_eof(cifsi, wdata->offset, wdata->bytes);
+ +	if (cifsi->netfs.remote_i_size > inode->i_size)
+ +		i_size_write(inode, cifsi->netfs.remote_i_size);
+ +	spin_unlock(&inode->i_lock);
+ +
+ +	complete(&wdata->done);
+ +	collect_uncached_write_data(wdata->ctx);
+ +	/* the below call can possibly free the last ref to aio ctx */
+ +	kref_put(&wdata->refcount, cifs_uncached_writedata_release);
+ +}
+ +
+ +static int
+ +wdata_fill_from_iovec(struct cifs_writedata *wdata, struct iov_iter *from,
+ +		      size_t *len, unsigned long *num_pages)
+ +{
+ +	size_t save_len, copied, bytes, cur_len = *len;
+ +	unsigned long i, nr_pages = *num_pages;
+ +
+ +	save_len = cur_len;
+ +	for (i = 0; i < nr_pages; i++) {
+ +		bytes = min_t(const size_t, cur_len, PAGE_SIZE);
+ +		copied = copy_page_from_iter(wdata->pages[i], 0, bytes, from);
+ +		cur_len -= copied;
+ +		/*
+ +		 * If we didn't copy as much as we expected, then that
+ +		 * may mean we trod into an unmapped area. Stop copying
+ +		 * at that point. On the next pass through the big
+ +		 * loop, we'll likely end up getting a zero-length
+ +		 * write and bailing out of it.
+ +		 */
+ +		if (copied < bytes)
+ +			break;
+ +	}
+ +	cur_len = save_len - cur_len;
+ +	*len = cur_len;
+ +
+ +	/*
+ +	 * If we have no data to send, then that probably means that
+ +	 * the copy above failed altogether. That's most likely because
+ +	 * the address in the iovec was bogus. Return -EFAULT and let
+ +	 * the caller free anything we allocated and bail out.
+ +	 */
+ +	if (!cur_len)
+ +		return -EFAULT;
+ +
+ +	/*
+ +	 * i + 1 now represents the number of pages we actually used in
+ +	 * the copy phase above.
+ +	 */
+ +	*num_pages = i + 1;
+ +	return 0;
+ +}
+ +
+ +static int
+ +cifs_resend_wdata(struct cifs_writedata *wdata, struct list_head *wdata_list,
+ +	struct cifs_aio_ctx *ctx)
+ +{
+ +	unsigned int wsize;
+ +	struct cifs_credits credits;
+ +	int rc;
+ +	struct TCP_Server_Info *server = wdata->server;
+ +
+ +	do {
+ +		if (wdata->cfile->invalidHandle) {
+ +			rc = cifs_reopen_file(wdata->cfile, false);
+ +			if (rc == -EAGAIN)
+ +				continue;
+ +			else if (rc)
+ +				break;
+ +		}
+ +
+ +
+ +		/*
+ +		 * Wait for credits to resend this wdata.
+ +		 * Note: we are attempting to resend the whole wdata not in
+ +		 * segments
+ +		 */
+ +		do {
+ +			rc = server->ops->wait_mtu_credits(server, wdata->bytes,
+ +						&wsize, &credits);
+ +			if (rc)
+ +				goto fail;
+ +
+ +			if (wsize < wdata->bytes) {
+ +				add_credits_and_wake_if(server, &credits, 0);
+ +				msleep(1000);
+ +			}
+ +		} while (wsize < wdata->bytes);
+ +		wdata->credits = credits;
+ +
+ +		rc = adjust_credits(server, &wdata->credits, wdata->bytes);
+ +
+ +		if (!rc) {
+ +			if (wdata->cfile->invalidHandle)
+ +				rc = -EAGAIN;
+ +			else {
+ +				wdata->replay = true;
+ +#ifdef CONFIG_CIFS_SMB_DIRECT
+ +				if (wdata->mr) {
+ +					wdata->mr->need_invalidate = true;
+ +					smbd_deregister_mr(wdata->mr);
+ +					wdata->mr = NULL;
+ +				}
+ +#endif
+ +				rc = server->ops->async_writev(wdata,
+ +					cifs_uncached_writedata_release);
+ +			}
+ +		}
+ +
+ +		/* If the write was successfully sent, we are done */
+ +		if (!rc) {
+ +			list_add_tail(&wdata->list, wdata_list);
+ +			return 0;
+ +		}
+ +
+ +		/* Roll back credits and retry if needed */
+ +		add_credits_and_wake_if(server, &wdata->credits, 0);
+ +	} while (rc == -EAGAIN);
+ +
+ +fail:
+ +	kref_put(&wdata->refcount, cifs_uncached_writedata_release);
+ +	return rc;
+ +}
+ +
+ +static int
+ +cifs_write_from_iter(loff_t offset, size_t len, struct iov_iter *from,
+ +		     struct cifsFileInfo *open_file,
+ +		     struct cifs_sb_info *cifs_sb, struct list_head *wdata_list,
+ +		     struct cifs_aio_ctx *ctx)
+ +{
+ +	int rc = 0;
+ +	size_t cur_len;
+ +	unsigned long nr_pages, num_pages, i;
+ +	struct cifs_writedata *wdata;
+ +	struct iov_iter saved_from = *from;
+ +	loff_t saved_offset = offset;
+ +	pid_t pid;
+ +	struct TCP_Server_Info *server;
+ +	struct page **pagevec;
+ +	size_t start;
+ +	unsigned int xid;
+ +
+ +	if (cifs_sb_flags(cifs_sb) & CIFS_MOUNT_RWPIDFORWARD)
+ +		pid = open_file->pid;
+ +	else
+ +		pid = current->tgid;
+ +
+ +	server = cifs_pick_channel(tlink_tcon(open_file->tlink)->ses);
+ +	xid = get_xid();
+ +
+ +	do {
+ +		unsigned int wsize;
+ +		struct cifs_credits credits_on_stack;
+ +		struct cifs_credits *credits = &credits_on_stack;
+ +
+ +		if (open_file->invalidHandle) {
+ +			rc = cifs_reopen_file(open_file, false);
+ +			if (rc == -EAGAIN)
+ +				continue;
+ +			else if (rc)
+ +				break;
+ +		}
+ +
+ +		if (cifs_sb->ctx->wsize == 0)
+ +			cifs_negotiate_wsize(server, cifs_sb->ctx,
+ +					     tlink_tcon(open_file->tlink));
+ +
+ +		rc = server->ops->wait_mtu_credits(server, cifs_sb->ctx->wsize,
+ +						   &wsize, credits);
+ +		if (rc)
+ +			break;
+ +
+ +		cur_len = min_t(const size_t, len, wsize);
+ +
+ +		if (ctx->direct_io) {
+ +			ssize_t result;
+ +
+ +			result = iov_iter_get_pages_alloc2(
+ +				from, &pagevec, cur_len, &start);
+ +			if (result < 0) {
+ +				cifs_dbg(VFS,
+ +					 "direct_writev couldn't get user pages (rc=%zd) iter type %d iov_offset %zd count %zd\n",
+ +					 result, iov_iter_type(from),
+ +					 from->iov_offset, from->count);
+ +				dump_stack();
+ +
+ +				rc = result;
+ +				add_credits_and_wake_if(server, credits, 0);
+ +				break;
+ +			}
+ +			cur_len = (size_t)result;
+ +
+ +			nr_pages =
+ +				(cur_len + start + PAGE_SIZE - 1) / PAGE_SIZE;
+ +
+ +			wdata = cifs_writedata_direct_alloc(pagevec,
+ +					     cifs_uncached_writev_complete);
+ +			if (!wdata) {
+ +				rc = -ENOMEM;
+ +				for (i = 0; i < nr_pages; i++)
+ +					put_page(pagevec[i]);
+ +				kvfree(pagevec);
+ +				add_credits_and_wake_if(server, credits, 0);
+ +				break;
+ +			}
+ +
+ +
+ +			wdata->page_offset = start;
+ +			wdata->tailsz =
+ +				nr_pages > 1 ?
+ +					cur_len - (PAGE_SIZE - start) -
+ +					(nr_pages - 2) * PAGE_SIZE :
+ +					cur_len;
+ +		} else {
+ +			nr_pages = get_numpages(wsize, len, &cur_len);
+ +			wdata = cifs_writedata_alloc(nr_pages,
+ +					     cifs_uncached_writev_complete);
+ +			if (!wdata) {
+ +				rc = -ENOMEM;
+ +				add_credits_and_wake_if(server, credits, 0);
+ +				break;
+ +			}
+ +
+ +			rc = cifs_write_allocate_pages(wdata->pages, nr_pages);
+ +			if (rc) {
+ +				kvfree(wdata->pages);
+ +				kfree(wdata);
+ +				add_credits_and_wake_if(server, credits, 0);
+ +				break;
+ +			}
+ +
+ +			num_pages = nr_pages;
+ +			rc = wdata_fill_from_iovec(
+ +				wdata, from, &cur_len, &num_pages);
+ +			if (rc) {
+ +				for (i = 0; i < nr_pages; i++)
+ +					put_page(wdata->pages[i]);
+ +				kvfree(wdata->pages);
+ +				kfree(wdata);
+ +				add_credits_and_wake_if(server, credits, 0);
+ +				break;
+ +			}
+ +
+ +			/*
+ +			 * Bring nr_pages down to the number of pages we
+ +			 * actually used, and free any pages that we didn't use.
+ +			 */
+ +			for ( ; nr_pages > num_pages; nr_pages--)
+ +				put_page(wdata->pages[nr_pages - 1]);
+ +
+ +			wdata->tailsz = cur_len - ((nr_pages - 1) * PAGE_SIZE);
+ +		}
+ +
+ +		wdata->sync_mode = WB_SYNC_ALL;
+ +		wdata->nr_pages = nr_pages;
+ +		wdata->offset = (__u64)offset;
+ +		wdata->cfile = cifsFileInfo_get(open_file);
+ +		wdata->server = server;
+ +		wdata->pid = pid;
+ +		wdata->bytes = cur_len;
+ +		wdata->pagesz = PAGE_SIZE;
+ +		wdata->credits = credits_on_stack;
+ +		wdata->ctx = ctx;
+ +		kref_get(&ctx->refcount);
+ +
+ +		rc = adjust_credits(server, &wdata->credits, wdata->bytes);
+ +
+ +		if (!rc) {
+ +			if (wdata->cfile->invalidHandle)
+ +				rc = -EAGAIN;
+ +			else
+ +				rc = server->ops->async_writev(wdata,
+ +					cifs_uncached_writedata_release);
+ +		}
+ +
+ +		if (rc) {
+ +			add_credits_and_wake_if(server, &wdata->credits, 0);
+ +			kref_put(&wdata->refcount,
+ +				 cifs_uncached_writedata_release);
+ +			if (rc == -EAGAIN) {
+ +				*from = saved_from;
+ +				iov_iter_advance(from, offset - saved_offset);
+ +				continue;
+ +			}
+ +			break;
+ +		}
+ +
+ +		list_add_tail(&wdata->list, wdata_list);
+ +		offset += cur_len;
+ +		len -= cur_len;
+ +	} while (len > 0);
+ +
+ +	free_xid(xid);
+ +	return rc;
+ +}
+ +
+ +static void collect_uncached_write_data(struct cifs_aio_ctx *ctx)
+ +{
+ +	struct cifs_writedata *wdata, *tmp;
+ +	struct cifs_tcon *tcon;
+ +	struct cifs_sb_info *cifs_sb;
+ +	struct dentry *dentry = ctx->cfile->dentry;
+ +	ssize_t rc;
+ +
+ +	tcon = tlink_tcon(ctx->cfile->tlink);
+ +	cifs_sb = CIFS_SB(dentry->d_sb);
+ +
+ +	mutex_lock(&ctx->aio_mutex);
+ +
+ +	if (list_empty(&ctx->list)) {
+ +		mutex_unlock(&ctx->aio_mutex);
+ +		return;
+ +	}
+ +
+ +	rc = ctx->rc;
+ +	/*
+ +	 * Wait for and collect replies for any successful sends in order of
+ +	 * increasing offset. Once an error is hit, then return without waiting
+ +	 * for any more replies.
+ +	 */
+ +restart_loop:
+ +	list_for_each_entry_safe(wdata, tmp, &ctx->list, list) {
+ +		if (!rc) {
+ +			if (!try_wait_for_completion(&wdata->done)) {
+ +				mutex_unlock(&ctx->aio_mutex);
+ +				return;
+ +			}
+ +
+ +			if (wdata->result)
+ +				rc = wdata->result;
+ +			else
+ +				ctx->total_len += wdata->bytes;
+ +
+ +			/* resend call if it's a retryable error */
+ +			if (rc == -EAGAIN) {
+ +				struct list_head tmp_list;
+ +				struct iov_iter tmp_from = ctx->iter;
+ +
+ +				INIT_LIST_HEAD(&tmp_list);
+ +				list_del_init(&wdata->list);
+ +
+ +				if (ctx->direct_io)
+ +					rc = cifs_resend_wdata(
+ +						wdata, &tmp_list, ctx);
+ +				else {
+ +					iov_iter_advance(&tmp_from,
+ +						 wdata->offset - ctx->pos);
+ +
+ +					rc = cifs_write_from_iter(wdata->offset,
+ +						wdata->bytes, &tmp_from,
+ +						ctx->cfile, cifs_sb, &tmp_list,
+ +						ctx);
+ +
+ +					kref_put(&wdata->refcount,
+ +						cifs_uncached_writedata_release);
+ +				}
+ +
+ +				list_splice(&tmp_list, &ctx->list);
+ +				goto restart_loop;
+ +			}
+ +		}
+ +		list_del_init(&wdata->list);
+ +		kref_put(&wdata->refcount, cifs_uncached_writedata_release);
+ +	}
+ +
+ +	cifs_stats_bytes_written(tcon, ctx->total_len);
+ +	set_bit(CIFS_INO_INVALID_MAPPING, &CIFS_I(dentry->d_inode)->flags);
+ +
+ +	ctx->rc = (rc == 0) ? ctx->total_len : rc;
+ +
+ +	mutex_unlock(&ctx->aio_mutex);
+ +
+ +	if (ctx->iocb && ctx->iocb->ki_complete)
+ +		ctx->iocb->ki_complete(ctx->iocb, ctx->rc);
+ +	else
+ +		complete(&ctx->done);
+ +}
+ +
+ +static ssize_t __cifs_writev(
+ +	struct kiocb *iocb, struct iov_iter *from, bool direct)
+ +{
+ +	struct file *file = iocb->ki_filp;
+ +	ssize_t total_written = 0;
+ +	struct cifsFileInfo *cfile;
+ +	struct cifs_tcon *tcon;
+ +	struct cifs_sb_info *cifs_sb;
+ +	struct cifs_aio_ctx *ctx;
+ +	struct iov_iter saved_from = *from;
+ +	size_t len = iov_iter_count(from);
+ +	int rc;
+ +
+ +	/*
+ +	 * iov_iter_get_pages_alloc doesn't work with ITER_KVEC.
+ +	 * In this case, fall back to non-direct write function.
+ +	 * this could be improved by getting pages directly in ITER_KVEC
+ +	 */
+ +	if (direct && iov_iter_is_kvec(from)) {
+ +		cifs_dbg(FYI, "use non-direct cifs_writev for kvec I/O\n");
+ +		direct = false;
+ +	}
+ +
+ +	rc = generic_write_checks(iocb, from);
+ +	if (rc <= 0)
+ +		return rc;
+ +
+ +	cifs_sb = CIFS_SB(file);
+ +	cfile = file->private_data;
+ +	tcon = tlink_tcon(cfile->tlink);
+ +
+ +	if (!tcon->ses->server->ops->async_writev)
+ +		return -ENOSYS;
+ +
+ +	ctx = cifs_aio_ctx_alloc();
+ +	if (!ctx)
+ +		return -ENOMEM;
+ +
+ +	ctx->cfile = cifsFileInfo_get(cfile);
+ +
+ +	if (!is_sync_kiocb(iocb))
+ +		ctx->iocb = iocb;
+ +
+ +	ctx->pos = iocb->ki_pos;
+ +
+ +	if (direct) {
+ +		ctx->direct_io = true;
+ +		ctx->iter = *from;
+ +		ctx->len = len;
+ +	} else {
+ +		rc = setup_aio_ctx_iter(ctx, from, ITER_SOURCE);
+ +		if (rc) {
+ +			kref_put(&ctx->refcount, cifs_aio_ctx_release);
+ +			return rc;
+ +		}
+ +	}
+ +
+ +	/* grab a lock here due to read response handlers can access ctx */
+ +	mutex_lock(&ctx->aio_mutex);
+ +
+ +	rc = cifs_write_from_iter(iocb->ki_pos, ctx->len, &saved_from,
+ +				  cfile, cifs_sb, &ctx->list, ctx);
+ +
+ +	/*
+ +	 * If at least one write was successfully sent, then discard any rc
+ +	 * value from the later writes. If the other write succeeds, then
+ +	 * we'll end up returning whatever was written. If it fails, then
+ +	 * we'll get a new rc value from that.
+ +	 */
+ +	if (!list_empty(&ctx->list))
+ +		rc = 0;
+ +
+ +	mutex_unlock(&ctx->aio_mutex);
+ +
+ +	if (rc) {
+ +		kref_put(&ctx->refcount, cifs_aio_ctx_release);
+ +		return rc;
+ +	}
+ +
+ +	if (!is_sync_kiocb(iocb)) {
+ +		kref_put(&ctx->refcount, cifs_aio_ctx_release);
+ +		return -EIOCBQUEUED;
+ +	}
+ +
+ +	rc = wait_for_completion_killable(&ctx->done);
+ +	if (rc) {
+ +		mutex_lock(&ctx->aio_mutex);
+ +		ctx->rc = rc = -EINTR;
+ +		total_written = ctx->total_len;
+ +		mutex_unlock(&ctx->aio_mutex);
+ +	} else {
+ +		rc = ctx->rc;
+ +		total_written = ctx->total_len;
+ +	}
+ +
+ +	kref_put(&ctx->refcount, cifs_aio_ctx_release);
+ +
+ +	if (unlikely(!total_written))
+ +		return rc;
+ +
+ +	iocb->ki_pos += total_written;
+ +	return total_written;
+ +}
+ +
+ +ssize_t cifs_direct_writev(struct kiocb *iocb, struct iov_iter *from)
+ +{
+ +	struct file *file = iocb->ki_filp;
+ +
+ +	cifs_revalidate_mapping(file->f_inode);
+ +	return __cifs_writev(iocb, from, true);
+ +}
+ +
+ +ssize_t cifs_user_writev(struct kiocb *iocb, struct iov_iter *from)
+ +{
+ +	return __cifs_writev(iocb, from, false);
+ +}
+ +
+ +static ssize_t
+ +cifs_writev(struct kiocb *iocb, struct iov_iter *from)
+ +{
+ +	struct file *file = iocb->ki_filp;
+ +	struct cifsFileInfo *cfile = (struct cifsFileInfo *)file->private_data;
+ +	struct inode *inode = file->f_mapping->host;
+ +	struct cifsInodeInfo *cinode = CIFS_I(inode);
+ +	struct TCP_Server_Info *server = tlink_tcon(cfile->tlink)->ses->server;
+ +	struct cifs_sb_info *cifs_sb = CIFS_SB(inode);
+ +	ssize_t rc;
+ +
+ +	inode_lock(inode);
+ +	/*
+ +	 * We need to hold the sem to be sure nobody modifies lock list
+ +	 * with a brlock that prevents writing.
+ +	 */
+ +	down_read(&cinode->lock_sem);
+ +
+ +	rc = generic_write_checks(iocb, from);
+ +	if (rc <= 0)
+ +		goto out;
+ +
+ +	if ((cifs_sb_flags(cifs_sb) & CIFS_MOUNT_NOPOSIXBRL) &&
+ +	    (cifs_find_lock_conflict(cfile, iocb->ki_pos, iov_iter_count(from),
+ +				     server->vals->exclusive_lock_type, 0,
+ +				     NULL, CIFS_WRITE_OP))) {
+ +		rc = -EACCES;
+ +		goto out;
+ +	}
+ +
+ +	rc = __generic_file_write_iter(iocb, from);
+ +
+ +out:
+ +	up_read(&cinode->lock_sem);
+ +	inode_unlock(inode);
+ +
+ +	if (rc > 0)
+ +		rc = generic_write_sync(iocb, rc);
+ +	return rc;
+ +}
+ +
+ +ssize_t
+ +cifs_strict_writev(struct kiocb *iocb, struct iov_iter *from)
+ +{
+ +	struct inode *inode = file_inode(iocb->ki_filp);
+ +	struct cifsInodeInfo *cinode = CIFS_I(inode);
+ +	struct cifs_sb_info *cifs_sb = CIFS_SB(inode);
+ +	struct cifsFileInfo *cfile = (struct cifsFileInfo *)
+ +						iocb->ki_filp->private_data;
+ +	struct cifs_tcon *tcon = tlink_tcon(cfile->tlink);
+ +	ssize_t written;
+ +
+ +	written = cifs_get_writer(cinode);
+ +	if (written)
+ +		return written;
+ +
+ +	if (CIFS_CACHE_WRITE(cinode)) {
+ +		if (cap_unix(tcon->ses) &&
+ +		(CIFS_UNIX_FCNTL_CAP & le64_to_cpu(tcon->fsUnixInfo.Capability))
+ +		    && ((cifs_sb_flags(cifs_sb) & CIFS_MOUNT_NOPOSIXBRL) == 0)) {
+ +			written = generic_file_write_iter(iocb, from);
+ +			goto out;
+ +		}
+ +		written = cifs_writev(iocb, from);
+ +		goto out;
+ +	}
+ +	/*
+ +	 * For non-oplocked files in strict cache mode we need to write the data
+ +	 * to the server exactly from the pos to pos+len-1 rather than flush all
+ +	 * affected pages because it may cause a error with mandatory locks on
+ +	 * these pages but not on the region from pos to ppos+len-1.
+ +	 */
+ +	written = cifs_user_writev(iocb, from);
+ +	if (CIFS_CACHE_READ(cinode)) {
+ +		/*
+ +		 * We have read level caching and we have just sent a write
+ +		 * request to the server thus making data in the cache stale.
+ +		 * Zap the cache and set oplock/lease level to NONE to avoid
+ +		 * reading stale data from the cache. All subsequent read
+ +		 * operations will read new data from the server.
+ +		 */
+ +		cifs_zap_mapping(inode);
+ +		cifs_dbg(FYI, "Set Oplock/Lease to NONE for inode=%p after write\n",
+ +			 inode);
+ +		cifs_reset_oplock(cinode);
+ +	}
+ +out:
+ +	cifs_put_writer(cinode);
+ +	return written;
+ +}
+ +
+ +static struct cifs_readdata *
+ +cifs_readdata_direct_alloc(struct page **pages, work_func_t complete)
+ +{
+ +	struct cifs_readdata *rdata;
+ +
+ +	rdata = kzalloc(sizeof(*rdata), GFP_KERNEL);
+ +	if (rdata != NULL) {
+ +		rdata->pages = pages;
+ +		kref_init(&rdata->refcount);
+ +		INIT_LIST_HEAD(&rdata->list);
+ +		init_completion(&rdata->done);
+ +		INIT_WORK(&rdata->work, complete);
+ +	}
+ +
+ +	return rdata;
+ +}
+ +
+ +static struct cifs_readdata *
+ +cifs_readdata_alloc(unsigned int nr_pages, work_func_t complete)
+ +{
+ +	struct page **pages =
+ +		kcalloc(nr_pages, sizeof(struct page *), GFP_KERNEL);
+ +	struct cifs_readdata *ret = NULL;
+ +
+ +	if (pages) {
+ +		ret = cifs_readdata_direct_alloc(pages, complete);
+ +		if (!ret)
+ +			kfree(pages);
+ +	}
+ +
+ +	return ret;
+ +}
+ +
+ +void
+ +cifs_readdata_release(struct kref *refcount)
+ +{
+ +	struct cifs_readdata *rdata = container_of(refcount,
+ +					struct cifs_readdata, refcount);
+ +#ifdef CONFIG_CIFS_SMB_DIRECT
+ +	if (rdata->mr) {
+ +		smbd_deregister_mr(rdata->mr);
+ +		rdata->mr = NULL;
+ +	}
+ +#endif
+ +	if (rdata->cfile)
+ +		cifsFileInfo_put(rdata->cfile);
+ +
+ +	kvfree(rdata->pages);
+ +	kfree(rdata);
+ +}
+ +
+ +static int
+ +cifs_read_allocate_pages(struct cifs_readdata *rdata, unsigned int nr_pages)
+ +{
+ +	int rc = 0;
+ +	struct page *page;
+ +	unsigned int i;
+ +
+ +	for (i = 0; i < nr_pages; i++) {
+ +		page = alloc_page(GFP_KERNEL|__GFP_HIGHMEM);
+ +		if (!page) {
+ +			rc = -ENOMEM;
+ +			break;
+ +		}
+ +		rdata->pages[i] = page;
+ +	}
+ +
+ +	if (rc) {
+ +		unsigned int nr_page_failed = i;
+ +
+ +		for (i = 0; i < nr_page_failed; i++) {
+ +			put_page(rdata->pages[i]);
+ +			rdata->pages[i] = NULL;
+ +		}
+ +	}
+ +	return rc;
+ +}
+ +
+ +static void
+ +cifs_uncached_readdata_release(struct kref *refcount)
+ +{
+ +	struct cifs_readdata *rdata = container_of(refcount,
+ +					struct cifs_readdata, refcount);
+ +	unsigned int i;
+ +
+ +	kref_put(&rdata->ctx->refcount, cifs_aio_ctx_release);
+ +	for (i = 0; i < rdata->nr_pages; i++) {
+ +		put_page(rdata->pages[i]);
+ +	}
+ +	cifs_readdata_release(refcount);
+ +}
+ +
+ +/**
+ + * cifs_readdata_to_iov - copy data from pages in response to an iovec
+ + * @rdata:	the readdata response with list of pages holding data
+ + * @iter:	destination for our data
+ + *
+ + * This function copies data from a list of pages in a readdata response into
+ + * an array of iovecs. It will first calculate where the data should go
+ + * based on the info in the readdata and then copy the data into that spot.
+ + */
+ +static int
+ +cifs_readdata_to_iov(struct cifs_readdata *rdata, struct iov_iter *iter)
+ +{
+ +	size_t remaining = rdata->got_bytes;
+ +	unsigned int i;
+ +
+ +	for (i = 0; i < rdata->nr_pages; i++) {
+ +		struct page *page = rdata->pages[i];
+ +		size_t copy = min_t(size_t, remaining, PAGE_SIZE);
+ +		size_t written;
+ +
+ +		if (unlikely(iov_iter_is_pipe(iter))) {
+ +			void *addr = kmap_atomic(page);
+ +
+ +			written = copy_to_iter(addr, copy, iter);
+ +			kunmap_atomic(addr);
+ +		} else
+ +			written = copy_page_to_iter(page, 0, copy, iter);
+ +		remaining -= written;
+ +		if (written < copy && iov_iter_count(iter) > 0)
+ +			break;
+ +	}
+ +	return remaining ? -EFAULT : 0;
+ +}
+ +
+ +static void collect_uncached_read_data(struct cifs_aio_ctx *ctx);
+ +
+ +static void
+ +cifs_uncached_readv_complete(struct work_struct *work)
+ +{
+ +	struct cifs_readdata *rdata = container_of(work,
+ +						struct cifs_readdata, work);
+ +
+ +	complete(&rdata->done);
+ +	collect_uncached_read_data(rdata->ctx);
+ +	/* the below call can possibly free the last ref to aio ctx */
+ +	kref_put(&rdata->refcount, cifs_uncached_readdata_release);
+ +}
+ +
+ +static int
+ +uncached_fill_pages(struct TCP_Server_Info *server,
+ +		    struct cifs_readdata *rdata, struct iov_iter *iter,
+ +		    unsigned int len)
+ +{
+ +	int result = 0;
+ +	unsigned int i;
+ +	unsigned int nr_pages = rdata->nr_pages;
+ +	unsigned int page_offset = rdata->page_offset;
+ +
+ +	rdata->got_bytes = 0;
+ +	rdata->tailsz = PAGE_SIZE;
+ +	for (i = 0; i < nr_pages; i++) {
+ +		struct page *page = rdata->pages[i];
+ +		size_t n;
+ +		unsigned int segment_size = rdata->pagesz;
+ +
+ +		if (i == 0)
+ +			segment_size -= page_offset;
+ +		else
+ +			page_offset = 0;
+ +
+ +
+ +		if (len <= 0) {
+ +			/* no need to hold page hostage */
+ +			rdata->pages[i] = NULL;
+ +			rdata->nr_pages--;
+ +			put_page(page);
+ +			continue;
+ +		}
+ +
+ +		n = len;
+ +		if (len >= segment_size)
+ +			/* enough data to fill the page */
+ +			n = segment_size;
+ +		else
+ +			rdata->tailsz = len;
+ +		len -= n;
+ +
+ +		if (iter)
+ +			result = copy_page_from_iter(
+ +					page, page_offset, n, iter);
+ +#ifdef CONFIG_CIFS_SMB_DIRECT
+ +		else if (rdata->mr)
+ +			result = n;
+ +#endif
+ +		else
+ +			result = cifs_read_page_from_socket(
+ +					server, page, page_offset, n);
+ +		if (result < 0)
+ +			break;
+ +
+ +		rdata->got_bytes += result;
+ +	}
+ +
+ +	return result != -ECONNABORTED && rdata->got_bytes > 0 ?
+ +						rdata->got_bytes : result;
+ +}
+ +
+ +static int
+ +cifs_uncached_read_into_pages(struct TCP_Server_Info *server,
+ +			      struct cifs_readdata *rdata, unsigned int len)
+ +{
+ +	return uncached_fill_pages(server, rdata, NULL, len);
+ +}
+ +
+ +static int
+ +cifs_uncached_copy_into_pages(struct TCP_Server_Info *server,
+ +			      struct cifs_readdata *rdata,
+ +			      struct iov_iter *iter)
+ +{
+ +	return uncached_fill_pages(server, rdata, iter, iter->count);
+ +}
+ +
+ +static int cifs_resend_rdata(struct cifs_readdata *rdata,
+ +			struct list_head *rdata_list,
+ +			struct cifs_aio_ctx *ctx)
+ +{
+ +	unsigned int rsize;
+ +	struct cifs_credits credits;
+ +	int rc;
+ +	struct TCP_Server_Info *server;
+ +
+ +	/* XXX: should we pick a new channel here? */
+ +	server = rdata->server;
+ +
+ +	do {
+ +		if (rdata->cfile->invalidHandle) {
+ +			rc = cifs_reopen_file(rdata->cfile, true);
+ +			if (rc == -EAGAIN)
+ +				continue;
+ +			else if (rc)
+ +				break;
+ +		}
+ +
+ +		/*
+ +		 * Wait for credits to resend this rdata.
+ +		 * Note: we are attempting to resend the whole rdata not in
+ +		 * segments
+ +		 */
+ +		do {
+ +			rc = server->ops->wait_mtu_credits(server, rdata->bytes,
+ +						&rsize, &credits);
+ +
+ +			if (rc)
+ +				goto fail;
+ +
+ +			if (rsize < rdata->bytes) {
+ +				add_credits_and_wake_if(server, &credits, 0);
+ +				msleep(1000);
+ +			}
+ +		} while (rsize < rdata->bytes);
+ +		rdata->credits = credits;
+ +
+ +		rc = adjust_credits(server, &rdata->credits, rdata->bytes);
+ +		if (!rc) {
+ +			if (rdata->cfile->invalidHandle)
+ +				rc = -EAGAIN;
+ +			else {
+ +#ifdef CONFIG_CIFS_SMB_DIRECT
+ +				if (rdata->mr) {
+ +					rdata->mr->need_invalidate = true;
+ +					smbd_deregister_mr(rdata->mr);
+ +					rdata->mr = NULL;
+ +				}
+ +#endif
+ +				rc = server->ops->async_readv(rdata);
+ +			}
+ +		}
+ +
+ +		/* If the read was successfully sent, we are done */
+ +		if (!rc) {
+ +			/* Add to aio pending list */
+ +			list_add_tail(&rdata->list, rdata_list);
+ +			return 0;
+ +		}
+ +
+ +		/* Roll back credits and retry if needed */
+ +		add_credits_and_wake_if(server, &rdata->credits, 0);
+ +	} while (rc == -EAGAIN);
+ +
+ +fail:
+ +	kref_put(&rdata->refcount, cifs_uncached_readdata_release);
+ +	return rc;
+ +}
+ +
+ +static int
+ +cifs_send_async_read(loff_t offset, size_t len, struct cifsFileInfo *open_file,
+ +		     struct cifs_sb_info *cifs_sb, struct list_head *rdata_list,
+ +		     struct cifs_aio_ctx *ctx)
+ +{
+ +	struct cifs_readdata *rdata;
+ +	unsigned int npages, rsize;
+ +	struct cifs_credits credits_on_stack;
+ +	struct cifs_credits *credits = &credits_on_stack;
+ +	size_t cur_len;
+ +	int rc;
+ +	pid_t pid;
+ +	struct TCP_Server_Info *server;
+ +	struct page **pagevec;
+ +	size_t start;
+ +	struct iov_iter direct_iov = ctx->iter;
+ +
+ +	server = cifs_pick_channel(tlink_tcon(open_file->tlink)->ses);
+ +
+ +	if (cifs_sb_flags(cifs_sb) & CIFS_MOUNT_RWPIDFORWARD)
+ +		pid = open_file->pid;
+ +	else
+ +		pid = current->tgid;
+ +
+ +	if (ctx->direct_io)
+ +		iov_iter_advance(&direct_iov, offset - ctx->pos);
+ +
+ +	do {
+ +		if (open_file->invalidHandle) {
+ +			rc = cifs_reopen_file(open_file, true);
+ +			if (rc == -EAGAIN)
+ +				continue;
+ +			else if (rc)
+ +				break;
+ +		}
+ +
+ +		if (cifs_sb->ctx->rsize == 0)
+ +			cifs_negotiate_rsize(server, cifs_sb->ctx,
+ +					     tlink_tcon(open_file->tlink));
+ +
+ +		rc = server->ops->wait_mtu_credits(server, cifs_sb->ctx->rsize,
+ +						   &rsize, credits);
+ +		if (rc)
+ +			break;
+ +
+ +		cur_len = min_t(const size_t, len, rsize);
+ +
+ +		if (ctx->direct_io) {
+ +			ssize_t result;
+ +
+ +			result = iov_iter_get_pages_alloc2(
+ +					&direct_iov, &pagevec,
+ +					cur_len, &start);
+ +			if (result < 0) {
+ +				cifs_dbg(VFS,
+ +					 "Couldn't get user pages (rc=%zd) iter type %d iov_offset %zd count %zd\n",
+ +					 result, iov_iter_type(&direct_iov),
+ +					 direct_iov.iov_offset,
+ +					 direct_iov.count);
+ +				dump_stack();
+ +
+ +				rc = result;
+ +				add_credits_and_wake_if(server, credits, 0);
+ +				break;
+ +			}
+ +			cur_len = (size_t)result;
+ +
+ +			rdata = cifs_readdata_direct_alloc(
+ +					pagevec, cifs_uncached_readv_complete);
+ +			if (!rdata) {
+ +				add_credits_and_wake_if(server, credits, 0);
+ +				rc = -ENOMEM;
+ +				break;
+ +			}
+ +
+ +			npages = (cur_len + start + PAGE_SIZE-1) / PAGE_SIZE;
+ +			rdata->page_offset = start;
+ +			rdata->tailsz = npages > 1 ?
+ +				cur_len-(PAGE_SIZE-start)-(npages-2)*PAGE_SIZE :
+ +				cur_len;
+ +
+ +		} else {
+ +
+ +			npages = DIV_ROUND_UP(cur_len, PAGE_SIZE);
+ +			/* allocate a readdata struct */
+ +			rdata = cifs_readdata_alloc(npages,
+ +					    cifs_uncached_readv_complete);
+ +			if (!rdata) {
+ +				add_credits_and_wake_if(server, credits, 0);
+ +				rc = -ENOMEM;
+ +				break;
+ +			}
+ +
+ +			rc = cifs_read_allocate_pages(rdata, npages);
+ +			if (rc) {
+ +				kvfree(rdata->pages);
+ +				kfree(rdata);
+ +				add_credits_and_wake_if(server, credits, 0);
+ +				break;
+ +			}
+ +
+ +			rdata->tailsz = PAGE_SIZE;
+ +		}
+ +
+ +		rdata->server = server;
+ +		rdata->cfile = cifsFileInfo_get(open_file);
+ +		rdata->nr_pages = npages;
+ +		rdata->offset = offset;
+ +		rdata->bytes = cur_len;
+ +		rdata->pid = pid;
+ +		rdata->pagesz = PAGE_SIZE;
+ +		rdata->read_into_pages = cifs_uncached_read_into_pages;
+ +		rdata->copy_into_pages = cifs_uncached_copy_into_pages;
+ +		rdata->credits = credits_on_stack;
+ +		rdata->ctx = ctx;
+ +		kref_get(&ctx->refcount);
+ +
+ +		rc = adjust_credits(server, &rdata->credits, rdata->bytes);
+ +
+ +		if (!rc) {
+ +			if (rdata->cfile->invalidHandle)
+ +				rc = -EAGAIN;
+ +			else
+ +				rc = server->ops->async_readv(rdata);
+ +		}
+ +
+ +		if (rc) {
+ +			add_credits_and_wake_if(server, &rdata->credits, 0);
+ +			kref_put(&rdata->refcount,
+ +				cifs_uncached_readdata_release);
+ +			if (rc == -EAGAIN) {
+ +				iov_iter_revert(&direct_iov, cur_len);
+ +				continue;
+ +			}
+ +			break;
+ +		}
+ +
+ +		list_add_tail(&rdata->list, rdata_list);
+ +		offset += cur_len;
+ +		len -= cur_len;
+ +	} while (len > 0);
+ +
+ +	return rc;
+ +}
+ +
+ +static void
+ +collect_uncached_read_data(struct cifs_aio_ctx *ctx)
+ +{
+ +	struct cifs_readdata *rdata, *tmp;
+ +	struct iov_iter *to = &ctx->iter;
+ +	struct cifs_sb_info *cifs_sb;
+ +	int rc;
+ +
+ +	cifs_sb = CIFS_SB(ctx->cfile->dentry->d_sb);
+ +
+ +	mutex_lock(&ctx->aio_mutex);
+ +
+ +	if (list_empty(&ctx->list)) {
+ +		mutex_unlock(&ctx->aio_mutex);
+ +		return;
+ +	}
+ +
+ +	rc = ctx->rc;
+ +	/* the loop below should proceed in the order of increasing offsets */
+ +again:
+ +	list_for_each_entry_safe(rdata, tmp, &ctx->list, list) {
+ +		if (!rc) {
+ +			if (!try_wait_for_completion(&rdata->done)) {
+ +				mutex_unlock(&ctx->aio_mutex);
+ +				return;
+ +			}
+ +
+ +			if (rdata->result == -EAGAIN) {
+ +				/* resend call if it's a retryable error */
+ +				struct list_head tmp_list;
+ +				unsigned int got_bytes = rdata->got_bytes;
+ +
+ +				list_del_init(&rdata->list);
+ +				INIT_LIST_HEAD(&tmp_list);
+ +
+ +				/*
+ +				 * Got a part of data and then reconnect has
+ +				 * happened -- fill the buffer and continue
+ +				 * reading.
+ +				 */
+ +				if (got_bytes && got_bytes < rdata->bytes) {
+ +					rc = 0;
+ +					if (!ctx->direct_io)
+ +						rc = cifs_readdata_to_iov(rdata, to);
+ +					if (rc) {
+ +						kref_put(&rdata->refcount,
+ +							cifs_uncached_readdata_release);
+ +						continue;
+ +					}
+ +				}
+ +
+ +				if (ctx->direct_io) {
+ +					/*
+ +					 * Re-use rdata as this is a
+ +					 * direct I/O
+ +					 */
+ +					rc = cifs_resend_rdata(
+ +						rdata,
+ +						&tmp_list, ctx);
+ +				} else {
+ +					rc = cifs_send_async_read(
+ +						rdata->offset + got_bytes,
+ +						rdata->bytes - got_bytes,
+ +						rdata->cfile, cifs_sb,
+ +						&tmp_list, ctx);
+ +
+ +					kref_put(&rdata->refcount,
+ +						cifs_uncached_readdata_release);
+ +				}
+ +
+ +				list_splice(&tmp_list, &ctx->list);
+ +
+ +				goto again;
+ +			} else if (rdata->result)
+ +				rc = rdata->result;
+ +			else if (!ctx->direct_io)
+ +				rc = cifs_readdata_to_iov(rdata, to);
+ +
+ +			/* if there was a short read -- discard anything left */
+ +			if (rdata->got_bytes && rdata->got_bytes < rdata->bytes)
+ +				rc = -ENODATA;
+ +
+ +			ctx->total_len += rdata->got_bytes;
+ +		}
+ +		list_del_init(&rdata->list);
+ +		kref_put(&rdata->refcount, cifs_uncached_readdata_release);
+ +	}
+ +
+ +	if (!ctx->direct_io)
+ +		ctx->total_len = ctx->len - iov_iter_count(to);
+ +
+ +	/* mask nodata case */
+ +	if (rc == -ENODATA)
+ +		rc = 0;
+ +
+ +	ctx->rc = (rc == 0) ? (ssize_t)ctx->total_len : rc;
+ +
+ +	mutex_unlock(&ctx->aio_mutex);
+ +
+ +	if (ctx->iocb && ctx->iocb->ki_complete)
+ +		ctx->iocb->ki_complete(ctx->iocb, ctx->rc);
+ +	else
+ +		complete(&ctx->done);
+ +}
+ +
+ +static ssize_t __cifs_readv(
+ +	struct kiocb *iocb, struct iov_iter *to, bool direct)
+ +{
+ +	size_t len;
+ +	struct file *file = iocb->ki_filp;
+ +	struct cifs_sb_info *cifs_sb;
+ +	struct cifsFileInfo *cfile;
+ +	struct cifs_tcon *tcon;
+ +	ssize_t rc, total_read = 0;
+ +	loff_t offset = iocb->ki_pos;
+ +	struct cifs_aio_ctx *ctx;
+ +
+ +	/*
+ +	 * iov_iter_get_pages_alloc() doesn't work with ITER_KVEC,
+ +	 * fall back to data copy read path
+ +	 * this could be improved by getting pages directly in ITER_KVEC
+ +	 */
+ +	if (direct && iov_iter_is_kvec(to)) {
+ +		cifs_dbg(FYI, "use non-direct cifs_user_readv for kvec I/O\n");
+ +		direct = false;
+ +	}
+ +
+ +	len = iov_iter_count(to);
+ +	if (!len)
+ +		return 0;
+ +
+ +	cifs_sb = CIFS_SB(file);
+ +	cfile = file->private_data;
+ +	tcon = tlink_tcon(cfile->tlink);
+ +
+ +	if (!tcon->ses->server->ops->async_readv)
+ +		return -ENOSYS;
+ +
+ +	if ((file->f_flags & O_ACCMODE) == O_WRONLY)
+ +		cifs_dbg(FYI, "attempting read on write only file instance\n");
+ +
+ +	ctx = cifs_aio_ctx_alloc();
+ +	if (!ctx)
+ +		return -ENOMEM;
+ +
+ +	ctx->cfile = cifsFileInfo_get(cfile);
+ +
+ +	if (!is_sync_kiocb(iocb))
+ +		ctx->iocb = iocb;
+ +
+ +	if (user_backed_iter(to))
+ +		ctx->should_dirty = true;
+ +
+ +	if (direct) {
+ +		ctx->pos = offset;
+ +		ctx->direct_io = true;
+ +		ctx->iter = *to;
+ +		ctx->len = len;
+ +	} else {
+ +		rc = setup_aio_ctx_iter(ctx, to, ITER_DEST);
+ +		if (rc) {
+ +			kref_put(&ctx->refcount, cifs_aio_ctx_release);
+ +			return rc;
+ +		}
+ +		len = ctx->len;
+ +	}
+ +
+ +	if (direct) {
+ +		rc = filemap_write_and_wait_range(file->f_inode->i_mapping,
+ +						  offset, offset + len - 1);
+ +		if (rc) {
+ +			kref_put(&ctx->refcount, cifs_aio_ctx_release);
+ +			return -EAGAIN;
+ +		}
+ +	}
+ +
+ +	/* grab a lock here due to read response handlers can access ctx */
+ +	mutex_lock(&ctx->aio_mutex);
+ +
+ +	rc = cifs_send_async_read(offset, len, cfile, cifs_sb, &ctx->list, ctx);
+ +
+ +	/* if at least one read request send succeeded, then reset rc */
+ +	if (!list_empty(&ctx->list))
+ +		rc = 0;
+ +
+ +	mutex_unlock(&ctx->aio_mutex);
+ +
+ +	if (rc) {
+ +		kref_put(&ctx->refcount, cifs_aio_ctx_release);
+ +		return rc;
+ +	}
+ +
+ +	if (!is_sync_kiocb(iocb)) {
+ +		kref_put(&ctx->refcount, cifs_aio_ctx_release);
+ +		return -EIOCBQUEUED;
+ +	}
+ +
+ +	rc = wait_for_completion_killable(&ctx->done);
+ +	if (rc) {
+ +		mutex_lock(&ctx->aio_mutex);
+ +		ctx->rc = rc = -EINTR;
+ +		total_read = ctx->total_len;
+ +		mutex_unlock(&ctx->aio_mutex);
+ +	} else {
+ +		rc = ctx->rc;
+ +		total_read = ctx->total_len;
+ +	}
+ +
+ +	kref_put(&ctx->refcount, cifs_aio_ctx_release);
+ +
+ +	if (total_read) {
+ +		iocb->ki_pos += total_read;
+ +		return total_read;
+ +	}
+ +	return rc;
+ +}
+ +
+ +ssize_t cifs_direct_readv(struct kiocb *iocb, struct iov_iter *to)
+ +{
+ +	return __cifs_readv(iocb, to, true);
+ +}
+ +
+ +ssize_t cifs_user_readv(struct kiocb *iocb, struct iov_iter *to)
+ +{
+ +	return __cifs_readv(iocb, to, false);
+  }
+  
+  ssize_t
+diff --git a/fs/smb/client/cifsacl.c b/fs/smb/client/cifsacl.c
+index e75cf6840f15..58d30e5b301d 100644
+--- a/fs/smb/client/cifsacl.c
++++ b/fs/smb/client/cifsacl.c
+@@ -1562,7 +1562,7 @@ struct smb_ntsd *get_cifs_acl(struct cifs_sb_info *cifs_sb,
+ 	struct cifsFileInfo *open_file = NULL;
+ 
+ 	if (inode)
+-		open_file = find_readable_file(CIFS_I(inode), true);
++		open_file = find_readable_file(CIFS_I(inode), FIND_FSUID_ONLY);
+ 	if (!open_file)
+ 		return get_cifs_acl_by_path(cifs_sb, path, pacllen, info);
+ 
+diff --git a/fs/smb/client/cifsfs.c b/fs/smb/client/cifsfs.c
+index 8a46e0d13a03..a31296faaf85 100644
+--- a/fs/smb/client/cifsfs.c
++++ b/fs/smb/client/cifsfs.c
+@@ -1318,7 +1318,7 @@ static int cifs_precopy_set_eof(struct inode *src_inode, struct cifsInodeInfo *s
+ 	struct cifsFileInfo *writeable_srcfile;
+ 	int rc = -EINVAL;
+ 
+-	writeable_srcfile = find_writable_file(src_cifsi, FIND_WR_FSUID_ONLY);
++	writeable_srcfile = find_writable_file(src_cifsi, FIND_FSUID_ONLY);
+ 	if (writeable_srcfile) {
+ 		if (src_tcon->ses->server->ops->set_file_size)
+ 			rc = src_tcon->ses->server->ops->set_file_size(
+diff --git a/fs/smb/client/cifsglob.h b/fs/smb/client/cifsglob.h
+index d617e052b9ad..c0617ae174dd 100644
+--- a/fs/smb/client/cifsglob.h
++++ b/fs/smb/client/cifsglob.h
+@@ -1952,12 +1952,12 @@ static inline bool is_replayable_error(int error)
+ }
+ 
+ 
+-/* cifs_get_writable_file() flags */
+-enum cifs_writable_file_flags {
+-	FIND_WR_ANY			= 0U,
+-	FIND_WR_FSUID_ONLY		= (1U << 0),
+-	FIND_WR_WITH_DELETE		= (1U << 1),
+-	FIND_WR_NO_PENDING_DELETE	= (1U << 2),
++enum cifs_find_flags {
++	FIND_ANY		= 0U,
++	FIND_FSUID_ONLY		= (1U << 0),
++	FIND_WITH_DELETE	= (1U << 1),
++	FIND_NO_PENDING_DELETE	= (1U << 2),
++	FIND_OPEN_FLAGS		= (1U << 3),
+ };
+ 
+ #define   MID_FREE 0
+* Unmerged path fs/smb/client/cifsproto.h
+* Unmerged path fs/smb/client/file.c
+diff --git a/fs/smb/client/inode.c b/fs/smb/client/inode.c
+index 3a718e0e675f..fc71af1e554a 100644
+--- a/fs/smb/client/inode.c
++++ b/fs/smb/client/inode.c
+@@ -2994,7 +2994,7 @@ int cifs_fiemap(struct inode *inode, struct fiemap_extent_info *fei, u64 start,
+ 		}
+ 	}
+ 
+-	cfile = find_readable_file(cifs_i, false);
++	cfile = find_readable_file(cifs_i, FIND_ANY);
+ 	if (cfile == NULL)
+ 		return -EINVAL;
+ 
+@@ -3046,7 +3046,7 @@ int cifs_file_set_size(const unsigned int xid, struct dentry *dentry,
+ 						size, false);
+ 		cifs_dbg(FYI, "%s: set_file_size: rc = %d\n", __func__, rc);
+ 	} else {
+-		open_file = find_writable_file(cifsInode, FIND_WR_FSUID_ONLY);
++		open_file = find_writable_file(cifsInode, FIND_FSUID_ONLY);
+ 		if (open_file) {
+ 			tcon = tlink_tcon(open_file->tlink);
+ 			server = tcon->ses->server;
+@@ -3230,7 +3230,7 @@ cifs_setattr_unix(struct dentry *direntry, struct iattr *attrs)
+ 					    open_file->fid.netfid,
+ 					    open_file->pid);
+ 	} else {
+-		open_file = find_writable_file(cifsInode, FIND_WR_FSUID_ONLY);
++		open_file = find_writable_file(cifsInode, FIND_FSUID_ONLY);
+ 		if (open_file) {
+ 			pTcon = tlink_tcon(open_file->tlink);
+ 			rc = CIFSSMBUnixSetFileInfo(xid, pTcon, args,
+diff --git a/fs/smb/client/smb1ops.c b/fs/smb/client/smb1ops.c
+index 40f30f8fe20b..890f92d19173 100644
+--- a/fs/smb/client/smb1ops.c
++++ b/fs/smb/client/smb1ops.c
+@@ -1040,7 +1040,7 @@ smb_set_file_info(struct inode *inode, const char *full_path,
+ 	struct cifs_tcon *tcon;
+ 
+ 	/* if the file is already open for write, just use that fileid */
+-	open_file = find_writable_file(cinode, FIND_WR_FSUID_ONLY);
++	open_file = find_writable_file(cinode, FIND_FSUID_ONLY);
+ 
+ 	if (open_file) {
+ 		fid.netfid = open_file->fid.netfid;
+diff --git a/fs/smb/client/smb2inode.c b/fs/smb/client/smb2inode.c
+index f3c1ed362726..cb161ea66cf1 100644
+--- a/fs/smb/client/smb2inode.c
++++ b/fs/smb/client/smb2inode.c
+@@ -1148,7 +1148,7 @@ smb2_mkdir_setinfo(struct inode *inode, const char *name,
+ 	cifs_i = CIFS_I(inode);
+ 	dosattrs = cifs_i->cifsAttrs | ATTR_READONLY;
+ 	data.Attributes = cpu_to_le32(dosattrs);
+-	cifs_get_writable_path(tcon, name, FIND_WR_ANY, &cfile);
++	cifs_get_writable_path(tcon, name, FIND_ANY, &cfile);
+ 	oparms = CIFS_OPARMS(cifs_sb, tcon, name, FILE_WRITE_ATTRIBUTES,
+ 			     FILE_CREATE, CREATE_NOT_FILE, ACL_NO_MODE);
+ 	tmprc = smb2_compound_op(xid, tcon, cifs_sb, name,
+@@ -1325,14 +1325,13 @@ int smb2_rename_path(const unsigned int xid,
+ 	__u32 co = file_create_options(source_dentry);
+ 
+ 	drop_cached_dir_by_name(xid, tcon, from_name, cifs_sb);
+-	cifs_get_writable_path(tcon, from_name, FIND_WR_WITH_DELETE, &cfile);
++	cifs_get_writable_path(tcon, from_name, FIND_WITH_DELETE, &cfile);
+ 
+ 	int rc = smb2_set_path_attr(xid, tcon, from_name, to_name, cifs_sb,
+ 				  co, DELETE, SMB2_OP_RENAME, cfile, source_dentry);
+ 	if (rc == -EINVAL) {
+ 		cifs_dbg(FYI, "invalid lease key, resending request without lease");
+-		cifs_get_writable_path(tcon, from_name,
+-				       FIND_WR_WITH_DELETE, &cfile);
++		cifs_get_writable_path(tcon, from_name, FIND_WITH_DELETE, &cfile);
+ 		rc = smb2_set_path_attr(xid, tcon, from_name, to_name, cifs_sb,
+ 				  co, DELETE, SMB2_OP_RENAME, cfile, NULL);
+ 	}
+@@ -1366,7 +1365,7 @@ smb2_set_path_size(const unsigned int xid, struct cifs_tcon *tcon,
+ 
+ 	in_iov.iov_base = &eof;
+ 	in_iov.iov_len = sizeof(eof);
+-	cifs_get_writable_path(tcon, full_path, FIND_WR_ANY, &cfile);
++	cifs_get_writable_path(tcon, full_path, FIND_ANY, &cfile);
+ 
+ 	oparms = CIFS_OPARMS(cifs_sb, tcon, full_path, FILE_WRITE_DATA,
+ 			     FILE_OPEN, 0, ACL_NO_MODE);
+@@ -1376,7 +1375,7 @@ smb2_set_path_size(const unsigned int xid, struct cifs_tcon *tcon,
+ 			      cfile, NULL, NULL, dentry);
+ 	if (rc == -EINVAL) {
+ 		cifs_dbg(FYI, "invalid lease key, resending request without lease");
+-		cifs_get_writable_path(tcon, full_path, FIND_WR_ANY, &cfile);
++		cifs_get_writable_path(tcon, full_path, FIND_ANY, &cfile);
+ 		rc = smb2_compound_op(xid, tcon, cifs_sb,
+ 				      full_path, &oparms, &in_iov,
+ 				      &(int){SMB2_OP_SET_EOF}, 1,
+@@ -1406,7 +1405,7 @@ smb2_set_file_info(struct inode *inode, const char *full_path,
+ 	    (buf->LastWriteTime == 0) && (buf->ChangeTime == 0)) {
+ 		if (buf->Attributes == 0)
+ 			goto out; /* would be a no op, no sense sending this */
+-		cifs_get_writable_path(tcon, full_path, FIND_WR_ANY, &cfile);
++		cifs_get_writable_path(tcon, full_path, FIND_ANY, &cfile);
+ 	}
+ 
+ 	oparms = CIFS_OPARMS(cifs_sb, tcon, full_path, FILE_WRITE_ATTRIBUTES,
+@@ -1465,7 +1464,7 @@ struct inode *smb2_create_reparse_inode(struct cifs_open_info_data *data,
+ 
+ 	if (tcon->posix_extensions) {
+ 		cmds[1] = SMB2_OP_POSIX_QUERY_INFO;
+-		cifs_get_writable_path(tcon, full_path, FIND_WR_ANY, &cfile);
++		cifs_get_writable_path(tcon, full_path, FIND_ANY, &cfile);
+ 		rc = smb2_compound_op(xid, tcon, cifs_sb, full_path, &oparms,
+ 				      in_iov, cmds, 2, cfile, out_iov, out_buftype, NULL);
+ 		if (!rc) {
+@@ -1474,7 +1473,7 @@ struct inode *smb2_create_reparse_inode(struct cifs_open_info_data *data,
+ 		}
+ 	} else {
+ 		cmds[1] = SMB2_OP_QUERY_INFO;
+-		cifs_get_writable_path(tcon, full_path, FIND_WR_ANY, &cfile);
++		cifs_get_writable_path(tcon, full_path, FIND_ANY, &cfile);
+ 		rc = smb2_compound_op(xid, tcon, cifs_sb, full_path, &oparms,
+ 				      in_iov, cmds, 2, cfile, out_iov, out_buftype, NULL);
+ 		if (!rc) {
+@@ -1625,13 +1624,12 @@ int smb2_rename_pending_delete(const char *full_path,
+ 	iov[1].iov_base = utf16_path;
+ 	iov[1].iov_len = sizeof(*utf16_path) * UniStrlen((wchar_t *)utf16_path);
+ 
+-	cifs_get_writable_path(tcon, full_path, FIND_WR_WITH_DELETE, &cfile);
++	cifs_get_writable_path(tcon, full_path, FIND_WITH_DELETE, &cfile);
+ 	rc = smb2_compound_op(xid, tcon, cifs_sb, full_path, &oparms, iov,
+ 			      cmds, num_cmds, cfile, NULL, NULL, dentry);
+ 	if (rc == -EINVAL) {
+ 		cifs_dbg(FYI, "invalid lease key, resending request without lease\n");
+-		cifs_get_writable_path(tcon, full_path,
+-				       FIND_WR_WITH_DELETE, &cfile);
++		cifs_get_writable_path(tcon, full_path, FIND_WITH_DELETE, &cfile);
+ 		rc = smb2_compound_op(xid, tcon, cifs_sb, full_path, &oparms, iov,
+ 				      cmds, num_cmds, cfile, NULL, NULL, NULL);
+ 	}
+diff --git a/fs/smb/client/smb2ops.c b/fs/smb/client/smb2ops.c
+index dd9bfe98eeb0..deef03809316 100644
+--- a/fs/smb/client/smb2ops.c
++++ b/fs/smb/client/smb2ops.c
+@@ -3291,7 +3291,7 @@ get_smb2_acl(struct cifs_sb_info *cifs_sb,
+ 	struct cifsFileInfo *open_file = NULL;
+ 
+ 	if (inode && !(info & SACL_SECINFO))
+-		open_file = find_readable_file(CIFS_I(inode), true);
++		open_file = find_readable_file(CIFS_I(inode), FIND_FSUID_ONLY);
+ 	if (!open_file || (info & SACL_SECINFO))
+ 		return get_smb2_acl_by_path(cifs_sb, path, pacllen, info);
+ 
+@@ -3838,7 +3838,7 @@ static loff_t smb3_llseek(struct file *file, struct cifs_tcon *tcon, loff_t offs
+ 	 * some servers (Windows2016) will not reflect recent writes in
+ 	 * QUERY_ALLOCATED_RANGES until SMB2_flush is called.
+ 	 */
+-	wrcfile = find_writable_file(cifsi, FIND_WR_ANY);
++	wrcfile = find_writable_file(cifsi, FIND_ANY);
+ 	if (wrcfile) {
+ 		filemap_write_and_wait(inode->i_mapping);
+ 		smb2_flush_file(xid, tcon, &wrcfile->fid);
