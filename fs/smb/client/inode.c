@@ -3013,6 +3013,8 @@ void cifs_setsize(struct inode *inode, loff_t offset)
 	i_size_write(inode, offset);
 	spin_unlock(&inode->i_lock);
 	inode_set_mtime_to_ts(inode, inode_set_ctime_current(inode));
+	if (offset > old_size)
+		pagecache_isize_extended(inode, old_size, offset);
 	truncate_pagecache(inode, offset);
 }
 
