@@ -1,0 +1,76 @@
+smb/client: do not account EOF extension as allocation
+
+jira KERNEL-1825
+Rebuild_History Non-Buildable kernel-5.14.0-687.61.1.el9_8
+commit-author Huiwen He <hehuiwen@kylinos.cn>
+commit 99cd0a6eeb6c20fc6b914e7ce192c6b08e1ef906
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.61.1.el9_8/99cd0a6e.failed
+
+cifs_setsize() updates the local inode size after SetEOF succeeds. It also
+used the new EOF as a local i_blocks estimate, but extending EOF does not
+prove that the intervening range was allocated.
+
+For example, after writing 1 MiB and then extending EOF to 10 MiB, the
+client can report the file as fully allocated even though the server still
+reports a much smaller AllocationSize:
+
+        $ dd if=/dev/zero of=test bs=1M count=1
+        $ truncate -s 10M test && stat -c 'size=%s blocks=%b' test
+        $ stat --cached=never -c 'size=%s blocks=%b' test
+
+        client stat:                    size=10485760 blocks=20480
+        server stat:                    size=10485760 blocks=2056
+        client stat after revalidation: size=10485760 blocks=2056
+
+A later attribute revalidation may correct i_blocks, but callers such as
+xfstests generic/495 invoke swapon immediately after truncate. The swapfile
+hole check can therefore observe the inflated local i_blocks value and
+accept a sparse file.
+
+Do not grow i_blocks from cifs_setsize() on EOF extension.  Only clamp it
+on shrink; allocation growth must come from write completion or from
+server-reported AllocationSize.
+
+With this change, EOF extension no longer makes a sparse file appear
+fully allocated before the next attribute revalidation, and xfstests
+generic/495 no longer accepts it through the inflated local i_blocks value.
+
+	Signed-off-by: Huiwen He <hehuiwen@kylinos.cn>
+	Reviewed-by: ChenXiaoSong <chenxiaosong@kylinos.cn>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 99cd0a6eeb6c20fc6b914e7ce192c6b08e1ef906)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/smb/client/inode.c
+diff --cc fs/smb/client/inode.c
+index 3a718e0e675f,1dbcfd163ff0..000000000000
+--- a/fs/smb/client/inode.c
++++ b/fs/smb/client/inode.c
+@@@ -3010,8 -3038,20 +3010,23 @@@ int cifs_fiemap(struct inode *inode, st
+  
+  void cifs_setsize(struct inode *inode, loff_t offset)
+  {
++ 	loff_t old_size;
++ 	u64 blocks = CIFS_INO_BLOCKS(offset);
++ 
+  	spin_lock(&inode->i_lock);
++ 	old_size = i_size_read(inode);
+  	i_size_write(inode, offset);
+++<<<<<<< HEAD
+++=======
++ 
++ 	/*
++ 	 * Extending EOF does not allocate the intervening range. Only clamp
++ 	 * i_blocks on shrink; allocation growth comes from writes or from the
++ 	 * server-reported AllocationSize.
++ 	 */
++ 	if (offset < old_size && (u64)inode->i_blocks > blocks)
++ 		inode->i_blocks = blocks;
+++>>>>>>> 99cd0a6eeb6c (smb/client: do not account EOF extension as allocation)
+  	spin_unlock(&inode->i_lock);
+  	inode_set_mtime_to_ts(inode, inode_set_ctime_current(inode));
+  	truncate_pagecache(inode, offset);
+* Unmerged path fs/smb/client/inode.c
