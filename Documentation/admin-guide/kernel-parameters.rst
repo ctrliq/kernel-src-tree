@@ -158,6 +158,7 @@ parameter is applicable::
 	SCSI	Appropriate SCSI support is enabled.
 			A lot of drivers have their options described inside
 			the Documentation/scsi/ sub-directory.
+        SDW     SoundWire support is enabled.
 	SECURITY Different security models are enabled.
 	SELINUX SELinux support is enabled.
 	APPARMOR AppArmor support is enabled.

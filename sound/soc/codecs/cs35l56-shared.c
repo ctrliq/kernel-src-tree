@@ -353,6 +353,17 @@ static const struct cs35l56_fw_reg cs35l56_fw_reg = {
 	.posture_number = CS35L56_MAIN_POSTURE_NUMBER,
 };
 
+static const struct cs35l56_fw_reg cs35l56_b2_fw_reg = {
+	.fw_ver = CS35L56_DSP1_FW_VER,
+	.halo_state = CS35L56_B2_DSP1_HALO_STATE,
+	.pm_cur_stat = CS35L56_B2_DSP1_PM_CUR_STATE,
+	.prot_sts = CS35L56_PROTECTION_STATUS,
+	.transducer_actual_ps = CS35L56_TRANSDUCER_ACTUAL_PS,
+	.user_mute = CS35L56_MAIN_RENDER_USER_MUTE,
+	.user_volume = CS35L56_MAIN_RENDER_USER_VOLUME,
+	.posture_number = CS35L56_MAIN_POSTURE_NUMBER,
+};
+
 static const struct cs35l56_fw_reg cs35l63_fw_reg = {
 	.fw_ver = CS35L63_DSP1_FW_VER,
 	.halo_state = CS35L63_DSP1_HALO_STATE,
@@ -368,7 +379,14 @@ static void cs35l56_set_fw_reg_table(struct cs35l56_base *cs35l56_base)
 {
 	switch (cs35l56_base->type) {
 	default:
-		cs35l56_base->fw_reg = &cs35l56_fw_reg;
+		switch (cs35l56_base->rev) {
+		case 0xb0:
+			cs35l56_base->fw_reg = &cs35l56_fw_reg;
+			break;
+		default:
+			cs35l56_base->fw_reg = &cs35l56_b2_fw_reg;
+			break;
+		}
 		break;
 	case 0x63:
 		cs35l56_base->fw_reg = &cs35l63_fw_reg;
@@ -536,6 +554,11 @@ static const struct reg_sequence cs35l56_system_reset_seq[] = {
 	REG_SEQ0(CS35L56_DSP_VIRTUAL1_MBOX_1, CS35L56_MBOX_CMD_SYSTEM_RESET),
 };
 
+static const struct reg_sequence cs35l56_b2_system_reset_seq[] = {
+	REG_SEQ0(CS35L56_B2_DSP1_HALO_STATE, 0),
+	REG_SEQ0(CS35L56_DSP_VIRTUAL1_MBOX_1, CS35L56_MBOX_CMD_SYSTEM_RESET),
+};
+
 static const struct reg_sequence cs35l63_system_reset_seq[] = {
 	REG_SEQ0(CS35L63_DSP1_HALO_STATE, 0),
 	REG_SEQ0(CS35L56_DSP_VIRTUAL1_MBOX_1, CS35L56_MBOX_CMD_SYSTEM_RESET),
@@ -558,9 +581,18 @@ void cs35l56_system_reset(struct cs35l56_base *cs35l56_base, bool is_soundwire)
 	case 0x54:
 	case 0x56:
 	case 0x57:
-		regmap_multi_reg_write_bypassed(cs35l56_base->regmap,
-						cs35l56_system_reset_seq,
-						ARRAY_SIZE(cs35l56_system_reset_seq));
+		switch (cs35l56_base->rev) {
+		case 0xb0:
+			regmap_multi_reg_write_bypassed(cs35l56_base->regmap,
+							cs35l56_system_reset_seq,
+							ARRAY_SIZE(cs35l56_system_reset_seq));
+			break;
+		default:
+			regmap_multi_reg_write_bypassed(cs35l56_base->regmap,
+							cs35l56_b2_system_reset_seq,
+							ARRAY_SIZE(cs35l56_b2_system_reset_seq));
+			break;
+		}
 		break;
 	case 0x63:
 		regmap_multi_reg_write_bypassed(cs35l56_base->regmap,
@@ -1850,6 +1882,7 @@ EXPORT_SYMBOL_NS_GPL(cs35l56_regmap_spi, SND_SOC_CS35L56_SHARED);
 
 const struct regmap_config cs35l56_regmap_sdw = {
 	.reg_bits = 32,
+	.reg_base = 0x8000,
 	.val_bits = 32,
 	.reg_stride = 4,
 	.reg_format_endian = REGMAP_ENDIAN_LITTLE,
@@ -1885,6 +1918,7 @@ const struct regmap_config cs35l63_regmap_sdw = {
 	.reg_bits = 32,
 	.val_bits = 32,
 	.reg_stride = 4,
+	.reg_base = 0x8000,
 	.reg_format_endian = REGMAP_ENDIAN_LITTLE,
 	.val_format_endian = REGMAP_ENDIAN_BIG,
 	.max_register = CS35L56_DSP1_PMEM_5114,

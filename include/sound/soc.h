@@ -431,7 +431,7 @@ struct snd_soc_jack_pin;
 int snd_soc_register_card(struct snd_soc_card *card);
 void snd_soc_unregister_card(struct snd_soc_card *card);
 int devm_snd_soc_register_card(struct device *dev, struct snd_soc_card *card);
-int devm_snd_soc_register_deferrable_card(struct device *dev, struct snd_soc_card *card);
+#define devm_snd_soc_register_deferrable_card(d, c) devm_snd_soc_register_card(d, c)
 #ifdef CONFIG_PM_SLEEP
 int snd_soc_suspend(struct device *dev);
 int snd_soc_resume(struct device *dev);
@@ -466,6 +466,7 @@ struct snd_soc_component *snd_soc_lookup_component_nolocked(struct device *dev,
 							    const char *driver_name);
 struct snd_soc_component *snd_soc_lookup_component(struct device *dev,
 						   const char *driver_name);
+struct snd_soc_component *snd_soc_lookup_component_by_name(const char *component_name);
 
 int soc_new_pcm(struct snd_soc_pcm_runtime *rtd);
 #ifdef CONFIG_SND_SOC_COMPRESS
@@ -964,9 +965,6 @@ struct snd_soc_card {
 	const char *long_name;
 	const char *driver_name;
 	const char *components;
-#ifdef CONFIG_DMI
-	char dmi_longname[80];
-#endif /* CONFIG_DMI */
 
 #ifdef CONFIG_PCI
 	/*
@@ -1045,10 +1043,14 @@ struct snd_soc_card {
 	int num_dapm_widgets;
 	const struct snd_soc_dapm_route *dapm_routes;
 	int num_dapm_routes;
+	const char **ignore_suspend_widgets;
+	int num_ignore_suspend_widgets;
 	const struct snd_soc_dapm_widget *of_dapm_widgets;
 	int num_of_dapm_widgets;
 	const struct snd_soc_dapm_route *of_dapm_routes;
 	int num_of_dapm_routes;
+	const char **of_ignore_suspend_widgets;
+	int num_of_ignore_suspend_widgets;
 
 	/* lists of probed devices belonging to this card */
 	struct list_head component_dev_list;
@@ -1069,8 +1071,6 @@ struct snd_soc_card {
 #ifdef CONFIG_PM_SLEEP
 	struct work_struct deferred_resume_work;
 #endif
-	u32 pop_time;
-
 	/* bit field */
 	unsigned int instantiated:1;
 	unsigned int topology_shortname_created:1;
@@ -1328,6 +1328,7 @@ void snd_soc_of_parse_node_prefix(struct device_node *np,
 int snd_soc_of_parse_audio_routing(struct snd_soc_card *card,
 				   const char *propname);
 int snd_soc_of_parse_aux_devs(struct snd_soc_card *card, const char *propname);
+int snd_soc_of_parse_ignore_suspend_widgets(struct snd_soc_card *card, const char *propname);
 
 unsigned int snd_soc_daifmt_clock_provider_flipped(unsigned int dai_fmt);
 unsigned int snd_soc_daifmt_clock_provider_from_bitmap(unsigned int bit_frame);

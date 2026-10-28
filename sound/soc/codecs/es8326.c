@@ -1349,8 +1349,8 @@ static int es8326_i2c_remove(struct i2c_client *i2c)
 }
 
 static const struct i2c_device_id es8326_i2c_id[] = {
-	{"es8326" },
-	{}
+	{ .name = "es8326" },
+	{ }
 };
 MODULE_DEVICE_TABLE(i2c, es8326_i2c_id);
 
