@@ -151,11 +151,12 @@ extern long __copy_user_nocache(void *dst, const void __user *src, unsigned size
 extern long __copy_user_flushcache(void *dst, const void __user *src, unsigned size);
 
 static inline int
-__copy_from_user_inatomic_nocache(void *dst, const void __user *src,
+copy_from_user_inatomic_nontemporal(void *dst, const void __user *src,
 				  unsigned size)
 {
 	long ret;
 	kasan_check_write(dst, size);
+	src = mask_user_address(src);
 	stac();
 	ret = __copy_user_nocache(dst, src, size);
 	clac();
