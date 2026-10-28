@@ -1,0 +1,175 @@
+smb/client: decode reparse metadata using its payload type
+
+jira KERNEL-1825
+Rebuild_History Non-Buildable kernel-5.14.0-687.61.1.el9_8
+commit-author Ze Tan <tanze@kylinos.cn>
+commit 43549eb84266c424ee6c004f149574e2ae4b6515
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.61.1.el9_8/43549eb8.failed
+
+cifs_open_info_data stores FILE_ALL_INFORMATION and SMB3 POSIX query
+information in a union. reparse_info_to_fattr() selects a union member
+from the mount mode, while several directory checks always read
+fi.Attributes.
+
+The metadata can instead come from an SMB2 CREATE response on a POSIX
+mount, or from a POSIX query while processing a reparse point. In those
+cases the mount mode and hard-coded fi accesses select the wrong union
+member.
+
+See the procedures below:
+
+  cifs_nt_open
+    smb2_open_file
+      SMB2_open
+        data->fi = SMB2 CREATE response
+        data->contains_posix_file_info = false
+    cifs_get_inode_info
+      reparse_info_to_fattr
+        if (tcon->posix_extensions) // true
+          smb311_posix_info_to_fattr
+            data->posix_fi // wrong union member
+
+  smb311_posix_get_fattr
+    smb2_query_path_info
+      smb2_compound_op
+        data->posix_fi = SMB3 POSIX query response
+        data->contains_posix_file_info = true
+    reparse_info_to_fattr
+      data->fi.Attributes // wrong union member
+
+Add a common DOS attribute accessor and use contains_posix_file_info
+both for attribute reads and for the final fattr conversion.
+
+	Signed-off-by: Ze Tan <tanze@kylinos.cn>
+	Signed-off-by: Namjae Jeon <linkinjeon@kernel.org>
+	Signed-off-by: Paulo Alcantara <pc@manguebit.org>
+(cherry picked from commit 43549eb84266c424ee6c004f149574e2ae4b6515)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/smb/client/smb2inode.c
+diff --cc fs/smb/client/smb2inode.c
+index 7a3a89cf2a81,bcaa44814b71..000000000000
+--- a/fs/smb/client/smb2inode.c
++++ b/fs/smb/client/smb2inode.c
+@@@ -23,7 -22,9 +23,8 @@@
+  #include "smb2glob.h"
+  #include "smb2proto.h"
+  #include "cached_dir.h"
++ #include "reparse.h"
+  #include "../common/smb2status.h"
+ -#include "../common/smbfsctl.h"
+  
+  static struct reparse_data_buffer *reparse_buf_ptr(struct kvec *iov)
+  {
+@@@ -1091,8 -1000,16 +1092,21 @@@ int smb2_query_path_info(const unsigne
+  				rc = -EOPNOTSUPP;
+  		}
+  
+++<<<<<<< HEAD
+ +		if (data->reparse.tag == IO_REPARSE_TAG_SYMLINK && !rc) {
+ +			bool directory = le32_to_cpu(data->fi.Attributes) & ATTR_DIRECTORY;
+++=======
++ 		/*
++ 		 * If the symlink was already parsed in create response then it is needed to fix
++ 		 * its type now (after the second call with OPEN_REPARSE_POINT which filled the
++ 		 * metadata attributes). If the symlink was not parsed in create response then
++ 		 * the data->symlink_target was not filled yet and then the type will be fixed
++ 		 * later after data->symlink_target is filled.
++ 		 */
++ 		if (data->reparse.tag == IO_REPARSE_TAG_SYMLINK && !rc && data->symlink_target) {
++ 			bool directory = cifs_open_data_attrs(data) & ATTR_DIRECTORY;
++ 
+++>>>>>>> 43549eb84266 (smb/client: decode reparse metadata using its payload type)
+  			rc = smb2_fix_symlink_target_type(&data->symlink_target, directory, cifs_sb);
+  		}
+  		break;
+diff --git a/fs/smb/client/inode.c b/fs/smb/client/inode.c
+index e862a675636d..556d9ad0a5f2 100644
+--- a/fs/smb/client/inode.c
++++ b/fs/smb/client/inode.c
+@@ -1183,7 +1183,7 @@ static int reparse_info_to_fattr(struct cifs_open_info_data *data,
+ 		break;
+ 	case IO_REPARSE_TAG_INTERNAL:
+ 		rc = 0;
+-		if (le32_to_cpu(data->fi.Attributes) & ATTR_DIRECTORY) {
++		if (cifs_open_data_attrs(data) & ATTR_DIRECTORY) {
+ 			cifs_create_junction_fattr(fattr, sb);
+ 			goto out;
+ 		}
+@@ -1207,7 +1207,7 @@ static int reparse_info_to_fattr(struct cifs_open_info_data *data,
+ 			 */
+ 			if (rc == -EOPNOTSUPP &&
+ 			    IS_REPARSE_TAG_NAME_SURROGATE(data->reparse.tag) &&
+-			    (le32_to_cpu(data->fi.Attributes) & ATTR_DIRECTORY)) {
++			    (cifs_open_data_attrs(data) & ATTR_DIRECTORY)) {
+ 				rc = 0;
+ 				cifs_create_junction_fattr(fattr, sb);
+ 				goto out;
+@@ -1225,13 +1225,14 @@ static int reparse_info_to_fattr(struct cifs_open_info_data *data,
+ 		}
+ 
+ 		if (data->reparse.tag == IO_REPARSE_TAG_SYMLINK && !rc) {
+-			bool directory = le32_to_cpu(data->fi.Attributes) & ATTR_DIRECTORY;
++			bool directory = cifs_open_data_attrs(data) & ATTR_DIRECTORY;
++
+ 			rc = smb2_fix_symlink_target_type(&data->symlink_target, directory, cifs_sb);
+ 		}
+ 		break;
+ 	}
+ 
+-	if (tcon->posix_extensions)
++	if (data->contains_posix_file_info)
+ 		smb311_posix_info_to_fattr(fattr, data, sb);
+ 	else
+ 		cifs_open_info_to_fattr(fattr, data, sb);
+diff --git a/fs/smb/client/reparse.h b/fs/smb/client/reparse.h
+index ac1c90a55b1c..81ed2c5296a1 100644
+--- a/fs/smb/client/reparse.h
++++ b/fs/smb/client/reparse.h
+@@ -97,15 +97,21 @@ static inline bool reparse_inode_match(struct inode *inode,
+ 		timespec64_equal(&ctime, &fattr->cf_ctime);
+ }
+ 
++static inline u32 cifs_open_data_attrs(const struct cifs_open_info_data *data)
++{
++	if (data->contains_posix_file_info)
++		return le32_to_cpu(data->posix_fi.DosAttributes);
++
++	return le32_to_cpu(data->fi.Attributes);
++}
++
+ static inline bool cifs_open_data_reparse(struct cifs_open_info_data *data)
+ {
+-	u32 attrs;
+-	bool ret;
++	u32 attrs = cifs_open_data_attrs(data);
+ 
+ 	if (data->contains_posix_file_info) {
+ 		struct smb311_posix_qinfo *fi = &data->posix_fi;
+ 
+-		attrs = le32_to_cpu(fi->DosAttributes);
+ 		if (data->reparse_point) {
+ 			attrs |= ATTR_REPARSE_POINT;
+ 			fi->DosAttributes = cpu_to_le32(attrs);
+@@ -114,16 +120,13 @@ static inline bool cifs_open_data_reparse(struct cifs_open_info_data *data)
+ 	} else {
+ 		struct smb2_file_all_info *fi = &data->fi;
+ 
+-		attrs = le32_to_cpu(fi->Attributes);
+ 		if (data->reparse_point) {
+ 			attrs |= ATTR_REPARSE_POINT;
+ 			fi->Attributes = cpu_to_le32(attrs);
+ 		}
+ 	}
+ 
+-	ret = attrs & ATTR_REPARSE_POINT;
+-
+-	return ret;
++	return attrs & ATTR_REPARSE_POINT;
+ }
+ 
+ bool cifs_reparse_point_to_fattr(struct cifs_sb_info *cifs_sb,
+* Unmerged path fs/smb/client/smb2inode.c
