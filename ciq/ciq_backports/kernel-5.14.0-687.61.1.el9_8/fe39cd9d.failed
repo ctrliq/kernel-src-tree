@@ -1,0 +1,74 @@
+cifs: don't update i_size in cifs_do_truncate without a cached handle
+
+jira KERNEL-1825
+Rebuild_History Non-Buildable kernel-5.14.0-687.61.1.el9_8
+commit-author Frank Sorenson <sorenson@redhat.com>
+commit fe39cd9d48f2346605f3746e0cc19e89d5f373eb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.61.1.el9_8/fe39cd9d.failed
+
+If find_writable_file() returns null, cifs_file_flush will return
+0 without issuing set_file_size, and the outer 'if (!rc)' block
+will set i_size to 0 before telling the server to truncate.  If
+the cifs_open() then fails, the inode will have size 0, while
+the server file is unchanged.
+
+Move the netfs_resize_file() and cifs_setsize() into the 'if
+(cfile)', so they only run after a successful set_file_size.
+
+In the no-handle else branch, evict stale pages with
+truncate_inode_pages before the O_TRUNC open to dispose of old
+cache pages, and let the open response set the i_size.
+
+Fixes: 110fee6b9bb5 ("smb: client: fix missing timestamp updates with O_TRUNC")
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Frank Sorenson <sorenson@redhat.com>
+	Acked-by: David Howells <dhowells@redhat.com>
+	Signed-off-by: Paulo Alcantara <pc@manguebit.org>
+(cherry picked from commit fe39cd9d48f2346605f3746e0cc19e89d5f373eb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/smb/client/file.c
+diff --cc fs/smb/client/file.c
+index ae2966a7c87a,100acc76e9be..000000000000
+--- a/fs/smb/client/file.c
++++ b/fs/smb/client/file.c
+@@@ -676,11 -1012,27 +676,35 @@@ static int cifs_do_truncate(const unsig
+  			server = tcon->ses->server;
+  			rc = server->ops->set_file_size(xid, tcon,
+  							cfile, 0, false);
+++<<<<<<< HEAD
+ +		}
+ +		if (!rc) {
+ +			netfs_resize_file(&cinode->netfs, 0);
+ +			cifs_setsize(inode, 0);
+ +			inode->i_blocks = 0;
+++=======
++ 			if (!rc) {
++ 				inode_lock(inode);
++ 				filemap_invalidate_lock(inode->i_mapping);
++ 				netfs_resize_file(&cinode->netfs, 0, true);
++ 				cifs_setsize(inode, 0);
++ 				filemap_invalidate_unlock(inode->i_mapping);
++ 				inode_unlock(inode);
++ 				cifs_invalidate_cache(inode, 0);
++ 			}
++ 		} else {
++ 			/*
++ 			 * No cached handle; evict stale pages so they can't
++ 			 * be served after the file is later extended; let
++ 			 * the server's O_TRUNC open response set the i_size
++ 			 */
++ 			inode_lock(inode);
++ 			filemap_invalidate_lock(inode->i_mapping);
++ 			truncate_inode_pages(inode->i_mapping, 0);
++ 			filemap_invalidate_unlock(inode->i_mapping);
++ 			inode_unlock(inode);
++ 			cifs_invalidate_cache(inode, 0);
+++>>>>>>> fe39cd9d48f2 (cifs: don't update i_size in cifs_do_truncate without a cached handle)
+  		}
+  	}
+  	if (cfile)
+* Unmerged path fs/smb/client/file.c
