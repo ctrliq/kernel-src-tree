@@ -1,0 +1,80 @@
+fuse: fix page stealing
+
+jira KERNEL-1825
+cve CVE-2026-53388
+Rebuild_History Non-Buildable kernel-5.14.0-687.61.1.el9_8
+commit-author Miklos Szeredi <mszeredi@redhat.com>
+commit 712a951025c0667ff00b25afc360f74e639dfabe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.61.1.el9_8/712a9510.failed
+
+It is possible to trigger a crash by splicing anon pipe bufs to the fuse
+device.
+
+The reason for this is that anon_pipe_buf_release() will reuse buf->page if
+the refcount is 1, but that page might have already been stolen and its
+flags modified (e.g. PG_lru added).
+
+This happens in the unlikely case of fuse_dev_splice_write() getting around
+to calling pipe_buf_release() after a page has been stolen, added to the
+page cache and removed from the page cache.
+
+Fix by calling pipe_buf_release() right after the page was inserted into
+the page cache.  In this case the page has an elevated refcount so any
+release function will know that the page isn't reusable.
+
+	Reported-by: Frank Dinoff <fdinoff@google.com>
+Link: https://lore.kernel.org/r/CAAmZXrsGg2xsP1CK+cbuEMumtrqdvD-NKnWzhNcvn71RV3c1yw@mail.gmail.com/
+Fixes: dd3bb14f44a6 ("fuse: support splice() writing to fuse device")
+	Cc: <stable@vger.kernel.org> # v2.6.35
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit 712a951025c0667ff00b25afc360f74e639dfabe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/fuse/dev.c
+diff --cc fs/fuse/dev.c
+index 54721a88a9d0,79f7eda49e06..000000000000
+--- a/fs/fuse/dev.c
++++ b/fs/fuse/dev.c
+@@@ -830,22 -836,27 +830,32 @@@ static int fuse_try_move_page(struct fu
+  	 * This is a new and locked page, it shouldn't be mapped or
+  	 * have any special flags on it
+  	 */
+ -	if (WARN_ON(page_mapped(oldpage)))
+ +	if (WARN_ON(folio_mapped(oldfolio)))
+  		goto out_fallback_unlock;
+ -	if (WARN_ON(page_has_private(oldpage)))
+ +	if (WARN_ON(folio_has_private(oldfolio)))
+  		goto out_fallback_unlock;
+ -	if (WARN_ON(PageDirty(oldpage) || PageWriteback(oldpage)))
+ +	if (WARN_ON(folio_test_dirty(oldfolio) ||
+ +				folio_test_writeback(oldfolio)))
+  		goto out_fallback_unlock;
+ -	if (WARN_ON(PageMlocked(oldpage)))
+ +	if (WARN_ON(folio_test_mlocked(oldfolio)))
+  		goto out_fallback_unlock;
+  
+ -	replace_page_cache_page(oldpage, newpage);
+ +	replace_page_cache_folio(oldfolio, newfolio);
+  
+++<<<<<<< HEAD
+ +	folio_get(newfolio);
+++=======
++ 	/*
++ 	 * Release while we have extra ref on stolen page.  Otherwise
++ 	 * anon_pipe_buf_release() might think the page can be reused.
++ 	 */
++ 	pipe_buf_release(cs->pipe, buf);
++ 
++ 	get_page(newpage);
+++>>>>>>> 712a951025c0 (fuse: fix page stealing)
+  
+  	if (!(buf->flags & PIPE_BUF_FLAG_LRU))
+ -		lru_cache_add(newpage);
+ +		folio_add_lru(newfolio);
+  
+  	err = 0;
+  	spin_lock(&cs->req->waitq.lock);
+* Unmerged path fs/fuse/dev.c
