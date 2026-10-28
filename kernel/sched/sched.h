@@ -2571,7 +2571,7 @@ static inline void idle_set_state(struct rq *rq,
 
 static inline struct cpuidle_state *idle_get_state(struct rq *rq)
 {
-	SCHED_WARN_ON(!rcu_read_lock_held());
+	lockdep_assert(rcu_read_lock_any_held());
 
 	return rq->idle_state;
 }
