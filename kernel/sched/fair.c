@@ -9803,6 +9803,8 @@ static inline bool task_misfits_asym_cpu(struct lb_env *env, struct task_struct 
 	return false;
 }
 
+static inline bool sched_asym(struct sched_domain *sd, int dst_cpu, int src_cpu);
+
 /*
  * Check if task p can migrate from source LLC to
  * destination LLC in terms of cache aware load balance.
@@ -9825,6 +9827,10 @@ static enum llc_mig can_migrate_llc_task(struct lb_env *env,
 
 	cpu = READ_ONCE(grp->cpu);
 	if (cpu < 0 || cpus_share_cache(src_cpu, dst_cpu))
+		return mig_unrestricted;
+
+	/* Prioritize asym packing to idle core over cache awareness */
+	if (env->idle && sched_asym(env->sd, dst_cpu, src_cpu))
 		return mig_unrestricted;
 
 	/* skip cache aware load balance for too many threads */
@@ -11033,7 +11039,10 @@ static inline bool llc_balance(struct lb_env *env, struct sg_lb_stats *sgs,
 
 	/*
 <<<<<<< HEAD
+<<<<<<< HEAD
 =======
+=======
+>>>>>>> 26d6082 (sched/cache: Honor asym packing over cache aware scheduling on hybrid systems)
 	 * On asym packing domains, if the destination CPU
 	 * has higher priority than all CPUs in the source group,
 	 * prioritize asym packing.
@@ -11042,6 +11051,7 @@ static inline bool llc_balance(struct lb_env *env, struct sg_lb_stats *sgs,
 		return false;
 
 	/*
+<<<<<<< HEAD
 	 * On asymmetric domains, group_misfit_task_load
 	 * should be prioritized to move tasks to CPU that fit them
 	 * over aggregating tasks to their preferred LLC.
@@ -11052,6 +11062,8 @@ static inline bool llc_balance(struct lb_env *env, struct sg_lb_stats *sgs,
 
 	/*
 >>>>>>> e1f4b5f7da4d (sched/fair: Avoid creating misfits during cache-aware balancing)
+=======
+>>>>>>> 26d6082 (sched/cache: Honor asym packing over cache aware scheduling on hybrid systems)
 	 * Skip cache aware tagging if nr_balanced_failed is sufficiently high.
 	 * Threshold of cache_nice_tries is set to 1 higher than nr_balance_failed
 	 * to avoid excessive task migration at the same time.
@@ -12430,11 +12442,11 @@ static int need_active_balance(struct lb_env *env)
 {
 	struct sched_domain *sd = env->sd;
 
-	if (alb_break_llc(env))
-		return 0;
-
 	if (asym_active_balance(env))
 		return 1;
+
+	if (alb_break_llc(env))
+		return 0;
 
 	if (imbalanced_active_balance(env))
 		return 1;
