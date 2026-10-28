@@ -1,0 +1,147 @@
+smb: client: fix generic/694 due to wrong ->i_blocks
+
+jira KERNEL-1825
+Rebuild_History Non-Buildable kernel-5.14.0-687.61.1.el9_8
+commit-author Paulo Alcantara <pc@manguebit.org>
+commit 23b5df09c27aec13962b30d32a4167ebdd043f8e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.61.1.el9_8/23b5df09.failed
+
+When updating ->i_size, make sure to always update ->i_blocks as well
+until we query new allocation size from the server.
+
+generic/694 was failing because smb3_simple_falloc() was missing the
+update of ->i_blocks after calling cifs_setsize().  So, fix this by
+updating ->i_blocks directly in cifs_setsize(), so all places that
+call it doesn't need to worry about updating ->i_blocks later.
+
+	Reported-by: Shyam Prasad N <sprasad@microsoft.com>
+Closes: https://lore.kernel.org/r/CANT5p=rqgRwaADB=b_PhJkqXjtfq3SFv41SSTXSVEHnuh871pA@mail.gmail.com
+	Signed-off-by: Paulo Alcantara (Red Hat) <pc@manguebit.org>
+	Cc: David Howells <dhowells@redhat.com>
+	Cc: linux-cifs@vger.kernel.org
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 23b5df09c27aec13962b30d32a4167ebdd043f8e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/smb/client/inode.c
+#	fs/smb/client/smb2ops.c
+diff --cc fs/smb/client/inode.c
+index 3a718e0e675f,888f9e35f14b..000000000000
+--- a/fs/smb/client/inode.c
++++ b/fs/smb/client/inode.c
+@@@ -202,15 -219,7 +202,19 @@@ cifs_fattr_to_inode(struct inode *inode
+  	 */
+  	if (is_size_safe_to_change(cifs_i, fattr->cf_eof, from_readdir)) {
+  		i_size_write(inode, fattr->cf_eof);
+++<<<<<<< HEAD
+ +
+ +		/*
+ +		 * i_blocks is not related to (i_size / i_blksize),
+ +		 * but instead 512 byte (2**9) size is required for
+ +		 * calculating num blocks.
+ +		 */
+ +		inode->i_blocks = (512 - 1 + fattr->cf_bytes) >> 9;
+ +	} else if (from_readdir && i_size_read(inode) != fattr->cf_eof) {
+ +		cifs_i->time = 0;
+++=======
++ 		inode->i_blocks = CIFS_INO_BLOCKS(fattr->cf_bytes);
+++>>>>>>> 23b5df09c27a (smb: client: fix generic/694 due to wrong ->i_blocks)
+  	}
+  
+  	if (S_ISLNK(fattr->cf_mode) && fattr->cf_symlink_target) {
+@@@ -3081,16 -3084,8 +3090,8 @@@ int cifs_file_set_size(const unsigned i
+  
+  set_size_out:
+  	if (rc == 0) {
+ -		netfs_resize_file(&cifsInode->netfs, size, true);
+ +		netfs_resize_file(&cifsInode->netfs, size);
+  		cifs_setsize(inode, size);
+- 		/*
+- 		 * i_blocks is not related to (i_size / i_blksize), but instead
+- 		 * 512 byte (2**9) size is required for calculating num blocks.
+- 		 * Until we can query the server for actual allocation size,
+- 		 * this is best estimate we have for blocks allocated for a file
+- 		 * Number of blocks must be rounded up so size 1 is not 0 blocks
+- 		 */
+- 		inode->i_blocks = (512 - 1 + size) >> 9;
+  	}
+  
+  	return rc;
+diff --cc fs/smb/client/smb2ops.c
+index dd9bfe98eeb0,509fcea28a42..000000000000
+--- a/fs/smb/client/smb2ops.c
++++ b/fs/smb/client/smb2ops.c
+@@@ -1467,16 -1518,12 +1468,11 @@@ smb2_close_getattr(const unsigned int x
+  		inode_set_ctime_to_ts(inode,
+  				      cifs_NTtimeToUnix(file_inf.ChangeTime));
+  	if (file_inf.LastAccessTime)
+ -		inode_set_atime_to_ts(inode,
+ -				      cifs_NTtimeToUnix(file_inf.LastAccessTime));
+ +		inode->i_atime = cifs_NTtimeToUnix(file_inf.LastAccessTime);
+  
+- 	/*
+- 	 * i_blocks is not related to (i_size / i_blksize),
+- 	 * but instead 512 byte (2**9) size is required for
+- 	 * calculating num blocks.
+- 	 */
+- 	if (le64_to_cpu(file_inf.AllocationSize) > 4096)
+- 		inode->i_blocks =
+- 			(512 - 1 + le64_to_cpu(file_inf.AllocationSize)) >> 9;
++ 	asize = le64_to_cpu(file_inf.AllocationSize);
++ 	if (asize > 4096)
++ 		inode->i_blocks = CIFS_INO_BLOCKS(asize);
+  
+  	/* End of file and Attributes should not have to be updated on close */
+  	spin_unlock(&inode->i_lock);
+@@@ -2143,15 -2200,7 +2139,19 @@@ smb2_duplicate_extents(const unsigned i
+  		rc = smb2_set_file_size(xid, tcon, trgtfile, dest_off + len, false);
+  		if (rc)
+  			goto duplicate_extents_out;
+++<<<<<<< HEAD
+ +
+ +		/*
+ +		 * Although also could set plausible allocation size (i_blocks)
+ +		 * here in addition to setting the file size, in reflink
+ +		 * it is likely that the target file is sparse. Its allocation
+ +		 * size will be queried on next revalidate, but it is important
+ +		 * to make sure that file's cached size is updated immediately
+ +		 */
+ +		netfs_resize_file(netfs_inode(inode), dest_off + len);
+++=======
++ 		netfs_resize_file(netfs_inode(inode), dest_off + len, true);
+++>>>>>>> 23b5df09c27a (smb: client: fix generic/694 due to wrong ->i_blocks)
+  		cifs_setsize(inode, dest_off + len);
+  	}
+  	rc = SMB2_ioctl(xid, tcon, trgtfile->fid.persistent_fid,
+diff --git a/fs/smb/client/cifsglob.h b/fs/smb/client/cifsglob.h
+index d617e052b9ad..41431e58bfe9 100644
+--- a/fs/smb/client/cifsglob.h
++++ b/fs/smb/client/cifsglob.h
+@@ -2521,4 +2521,10 @@ static inline int cifs_open_create_options(unsigned int oflags, int opts)
+ 	return opts;
+ }
+ 
++/*
++ * The number of blocks is not related to (i_size / i_blksize), but instead
++ * 512 byte (2**9) size is required for calculating num blocks.
++ */
++#define CIFS_INO_BLOCKS(size) DIV_ROUND_UP_ULL((u64)(size), 512)
++
+ #endif	/* _CIFS_GLOB_H */
+diff --git a/fs/smb/client/file.c b/fs/smb/client/file.c
+index ae2966a7c87a..063a859cf9e5 100644
+--- a/fs/smb/client/file.c
++++ b/fs/smb/client/file.c
+@@ -680,7 +680,6 @@ static int cifs_do_truncate(const unsigned int xid, struct dentry *dentry)
+ 		if (!rc) {
+ 			netfs_resize_file(&cinode->netfs, 0);
+ 			cifs_setsize(inode, 0);
+-			inode->i_blocks = 0;
+ 		}
+ 	}
+ 	if (cfile)
+* Unmerged path fs/smb/client/inode.c
+* Unmerged path fs/smb/client/smb2ops.c
