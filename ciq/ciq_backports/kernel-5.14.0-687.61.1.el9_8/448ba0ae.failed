@@ -1,0 +1,140 @@
+smb/client: invalidate fscache for fallocate range operations
+
+jira KERNEL-1825
+cve CVE-2026-98124
+Rebuild_History Non-Buildable kernel-5.14.0-687.61.1.el9_8
+Rebuild_CHGLOG: - smb: client: invalidate fscache for fallocate range operations (Paulo Alcantara) [RHEL-257205] {CVE-2026-98124}
+Rebuild_FUZZ: 97.56%
+commit-author Huiwen He <hehuiwen@kylinos.cn>
+commit 448ba0ae65ca61064183564d2983c9aa59bd6ba7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.61.1.el9_8/448ba0ae.failed
+
+smb3_zero_range(), smb3_punch_hole(), smb3_insert_range(), and
+smb3_collapse_range() modify file contents through server-side range
+operations. These operations discard the affected page cache, but leave
+the FS-Cache cookie valid, so a later read may return data cached before
+the range operation.
+
+Fix this by invalidating FS-Cache after outstanding I/O has completed
+and before modifying the file on the server.
+
+Run the following as root on a CIFS mount with fsc enabled and an active
+CacheFiles backend:
+
+        bash -c '
+                MNT=/mnt/cifs
+                FILE="$MNT/repro"
+
+                # Generate four 1 MiB random blocks: [A][B][C][D].
+                dd if=/dev/urandom of=/tmp/src bs=1M count=4 status=none
+
+                # Expected contents after zeroing B: [A][zero][C][D].
+                cp /tmp/src /tmp/expected
+                dd if=/dev/zero of=/tmp/expected bs=1M seek=1 count=1 \
+                        conv=notrunc status=none
+                cp /tmp/src "$FILE"
+
+                # Populate FS-Cache, then discard the page cache.
+                sync
+                echo 1 > /proc/sys/vm/drop_caches
+                cat "$FILE" > /dev/null
+                sync
+                echo 1 > /proc/sys/vm/drop_caches
+
+                fallocate --zero-range -o 1M -l 1M "$FILE"
+
+                if cmp -s /tmp/expected "$FILE"; then
+                        echo "readback: OK"
+                else
+                        echo "readback: STALE DATA"
+                fi
+        '
+
+Before this change, the readback differs from /tmp/expected:
+
+        readback: STALE DATA
+
+After this change, it matches:
+
+        readback: OK
+
+Fixes: 30175628bf7f ("[SMB3] Enable fallocate -z support for SMB3 mounts")
+Fixes: 31742c5a3317 ("enable fallocate punch hole ("fallocate -p") for SMB3")
+Fixes: 5476b5dd82c8 ("cifs: add support for FALLOC_FL_COLLAPSE_RANGE")
+Fixes: 7fe6fe95b936 ("cifs: add FALLOC_FL_INSERT_RANGE support")
+	Signed-off-by: Huiwen He <hehuiwen@kylinos.cn>
+	Suggested-by: Namjae Jeon <linkinjeon@kernel.org>
+	Reviewed-by: ChenXiaoSong <chenxiaosong@kylinos.cn>
+	Reviewed-by: Namjae Jeon <linkinjeon@kernel.org>
+	Signed-off-by: Paulo Alcantara <pc@manguebit.org>
+(cherry picked from commit 448ba0ae65ca61064183564d2983c9aa59bd6ba7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/smb/client/smb2ops.c
+diff --cc fs/smb/client/smb2ops.c
+index 89b69d7c0ae0,cb4fd09f996e..000000000000
+--- a/fs/smb/client/smb2ops.c
++++ b/fs/smb/client/smb2ops.c
+@@@ -3553,6 -3623,9 +3556,12 @@@ static long smb3_punch_hole(struct fil
+  	 * caches first, otherwise the data may be inconsistent with the server.
+  	 */
+  	truncate_pagecache_range(inode, offset, offset + len - 1);
+++<<<<<<< HEAD
+++=======
++ 	netfs_wait_for_outstanding_io(inode);
++ 	fscache_invalidate(cifs_inode_cookie(inode), NULL,
++ 			   i_size_read(inode), 0);
+++>>>>>>> 448ba0ae65ca (smb/client: invalidate fscache for fallocate range operations)
+  
+  	cifs_dbg(FYI, "Offset %lld len %lld\n", offset, len);
+  
+@@@ -3924,7 -4037,17 +3933,21 @@@ static long smb3_collapse_range(struct 
+  	if (rc < 0)
+  		goto out_2;
+  
+++<<<<<<< HEAD
+ +	truncate_pagecache_range(inode, off, old_eof);
+++=======
++ 	netfs_wait_for_outstanding_io(inode);
++ 	/*
++ 	 * Invalidate cached folios from the page containing off to EOF before
++ 	 * moving data on the server, so subsequent reads do not see stale data.
++ 	 */
++ 	truncate_pagecache_range(inode, round_down(off, PAGE_SIZE), -1);
++ 	fscache_invalidate(cifs_inode_cookie(inode), NULL, old_eof, 0);
++ 
++ 	spin_lock(&inode->i_lock);
++ 	netfs_write_zero_point(inode, old_eof);
++ 	spin_unlock(&inode->i_lock);
+++>>>>>>> 448ba0ae65ca (smb/client: invalidate fscache for fallocate range operations)
+  
+  	rc = __smb2_copychunk_range(xid, cfile, cfile, off + len,
+  				    old_eof - off - len, off);
+@@@ -3981,10 -4107,18 +4004,20 @@@ static long smb3_insert_range(struct fi
+  		goto out;
+  
+  	filemap_invalidate_lock(inode->i_mapping);
+ -	rc = filemap_write_and_wait_range(inode->i_mapping,
+ -					  round_down(off, PAGE_SIZE),
+ -					  old_eof - 1);
+ +	rc = filemap_write_and_wait_range(inode->i_mapping, off, new_eof - 1);
+  	if (rc < 0)
+  		goto out_2;
+++<<<<<<< HEAD
+ +	truncate_pagecache_range(inode, off, old_eof);
+++=======
++ 	netfs_wait_for_outstanding_io(inode);
++ 	/*
++ 	 * Invalidate cached folios from the page containing off to EOF before
++ 	 * moving data on the server, so subsequent reads do not see stale data.
++ 	 */
++ 	truncate_pagecache_range(inode, round_down(off, PAGE_SIZE), -1);
++ 	fscache_invalidate(cifs_inode_cookie(inode), NULL, old_eof, 0);
+++>>>>>>> 448ba0ae65ca (smb/client: invalidate fscache for fallocate range operations)
+  
+  	rc = SMB2_set_eof(xid, tcon, cfile->fid.persistent_fid,
+  			  cfile->fid.volatile_fid, cfile->pid, new_eof);
+* Unmerged path fs/smb/client/smb2ops.c
