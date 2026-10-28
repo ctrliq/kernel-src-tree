@@ -1,0 +1,142 @@
+smb/client: preserve open info type across compound queries
+
+jira KERNEL-1825
+Rebuild_History Non-Buildable kernel-5.14.0-687.61.1.el9_8
+commit-author Ze Tan <tanze@kylinos.cn>
+commit 9437f2113b60a5a8593aa4b41b6f6632f5cabcfd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.61.1.el9_8/9437f211.failed
+
+contains_posix_file_info describes the metadata stored in the
+fi/posix_fi union. GET_REPARSE and QUERY_WSL_EA do not update that
+union, so clearing the flag while processing those responses can make
+POSIX metadata look like FILE_ALL_INFORMATION.
+
+Set the flag when CREATE or a validated query response actually
+populates the union, and leave it unchanged for auxiliary compound
+operations. This also avoids changing the type when a query fails
+before copying any metadata.
+
+The issue can be reproduced against a Samba server with SMB3 UNIX
+extensions enabled:
+
+  mount -t cifs //<server>/<share> /mnt/cifs \
+        -o vers=3.1.1,posix,reparse=nfs,actimeo=0
+  mkfifo /mnt/cifs/test-fifo
+  umount /mnt/cifs
+  mount -t cifs //<server>/<share> /mnt/cifs \
+        -o vers=3.1.1,posix,reparse=nfs,actimeo=0
+  stat -c '%F %s' /mnt/cifs/test-fifo
+
+Before this change, stat reports "fifo 1024" although the server-side
+EOF is zero. After this change, it reports "fifo 0".
+
+Fixes: 9df23801c83d ("smb311: failure to open files of length 1040 when mounting with SMB3.1.1 POSIX extensions")
+	Signed-off-by: Ze Tan <tanze@kylinos.cn>
+	Signed-off-by: Namjae Jeon <linkinjeon@kernel.org>
+	Signed-off-by: Paulo Alcantara <pc@manguebit.org>
+(cherry picked from commit 9437f2113b60a5a8593aa4b41b6f6632f5cabcfd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/smb/client/smb2pdu.c
+diff --cc fs/smb/client/smb2pdu.c
+index 16800bae64e0,dea05aeb53a1..000000000000
+--- a/fs/smb/client/smb2pdu.c
++++ b/fs/smb/client/smb2pdu.c
+@@@ -3295,16 -3371,18 +3295,31 @@@ replay_again
+  	oparms->fid->mid = le64_to_cpu(rsp->hdr.MessageId);
+  #endif /* CIFS_DEBUG2 */
+  
+++<<<<<<< HEAD
+ +	if (buf) {
+ +		buf->CreationTime = rsp->CreationTime;
+ +		buf->LastAccessTime = rsp->LastAccessTime;
+ +		buf->LastWriteTime = rsp->LastWriteTime;
+ +		buf->ChangeTime = rsp->ChangeTime;
+ +		buf->AllocationSize = rsp->AllocationSize;
+ +		buf->EndOfFile = rsp->EndofFile;
+ +		buf->Attributes = rsp->FileAttributes;
+ +		buf->NumberOfLinks = cpu_to_le32(1);
+ +		buf->DeletePending = 0; /* successful open = not delete pending */
+++=======
++ 	if (file_info) {
++ 		buf->contains_posix_file_info = false;
++ 		file_info->CreationTime = rsp->CreationTime;
++ 		file_info->LastAccessTime = rsp->LastAccessTime;
++ 		file_info->LastWriteTime = rsp->LastWriteTime;
++ 		file_info->ChangeTime = rsp->ChangeTime;
++ 		file_info->AllocationSize = rsp->AllocationSize;
++ 		file_info->EndOfFile = rsp->EndofFile;
++ 		file_info->Attributes = rsp->FileAttributes;
++ 		file_info->NumberOfLinks = cpu_to_le32(1);
++ 		buf->unknown_nlink = true;
++ 		file_info->DeletePending = 0; /* successful open = not delete pending */
+++>>>>>>> 9437f2113b60 (smb/client: preserve open info type across compound queries)
+  	}
+  
+  
+diff --git a/fs/smb/client/smb2inode.c b/fs/smb/client/smb2inode.c
+index 7a3a89cf2a81..526860bd80a3 100644
+--- a/fs/smb/client/smb2inode.c
++++ b/fs/smb/client/smb2inode.c
+@@ -677,6 +677,7 @@ static int smb2_compound_op(const unsigned int xid, struct cifs_tcon *tcon,
+ 		idata->fi.Attributes = create_rsp->FileAttributes;
+ 		idata->fi.AllocationSize = create_rsp->AllocationSize;
+ 		idata->fi.EndOfFile = create_rsp->EndofFile;
++		idata->contains_posix_file_info = false;
+ 		if (le32_to_cpu(idata->fi.NumberOfLinks) == 0)
+ 			idata->fi.NumberOfLinks = cpu_to_le32(1); /* dummy value */
+ 		idata->unknown_nlink = true;
+@@ -700,7 +701,6 @@ static int smb2_compound_op(const unsigned int xid, struct cifs_tcon *tcon,
+ 		switch (cmds[i]) {
+ 		case SMB2_OP_QUERY_INFO:
+ 			idata = in_iov[i].iov_base;
+-			idata->contains_posix_file_info = false;
+ 			if (rc == 0 && cfile && cfile->symlink_target) {
+ 				idata->symlink_target = kstrdup(cfile->symlink_target, GFP_KERNEL);
+ 				if (!idata->symlink_target)
+@@ -713,6 +713,8 @@ static int smb2_compound_op(const unsigned int xid, struct cifs_tcon *tcon,
+ 					le16_to_cpu(qi_rsp->OutputBufferOffset),
+ 					le32_to_cpu(qi_rsp->OutputBufferLength),
+ 					&rsp_iov[i + 1], sizeof(idata->fi), (char *)&idata->fi);
++				if (!rc)
++					idata->contains_posix_file_info = false;
+ 			}
+ 			SMB2_query_info_free(&rqst[num_rqst++]);
+ 			if (rc)
+@@ -724,7 +726,6 @@ static int smb2_compound_op(const unsigned int xid, struct cifs_tcon *tcon,
+ 			break;
+ 		case SMB2_OP_POSIX_QUERY_INFO:
+ 			idata = in_iov[i].iov_base;
+-			idata->contains_posix_file_info = true;
+ 			if (rc == 0 && cfile && cfile->symlink_target) {
+ 				idata->symlink_target = kstrdup(cfile->symlink_target, GFP_KERNEL);
+ 				if (!idata->symlink_target)
+@@ -738,6 +739,8 @@ static int smb2_compound_op(const unsigned int xid, struct cifs_tcon *tcon,
+ 					le32_to_cpu(qi_rsp->OutputBufferLength),
+ 					&rsp_iov[i + 1], sizeof(idata->posix_fi) /* add SIDs */,
+ 					(char *)&idata->posix_fi);
++				if (!rc)
++					idata->contains_posix_file_info = true;
+ 			}
+ 			if (rc == 0)
+ 				rc = parse_posix_sids(idata, &rsp_iov[i + 1]);
+@@ -809,7 +812,6 @@ static int smb2_compound_op(const unsigned int xid, struct cifs_tcon *tcon,
+ 				idata = in_iov[i].iov_base;
+ 				idata->reparse.io.iov = *iov;
+ 				idata->reparse.io.buftype = resp_buftype[i + 1];
+-				idata->contains_posix_file_info = false; /* BB VERIFY */
+ 				rbuf = reparse_buf_ptr(iov);
+ 				if (IS_ERR(rbuf)) {
+ 					rc = PTR_ERR(rbuf);
+@@ -831,7 +833,6 @@ static int smb2_compound_op(const unsigned int xid, struct cifs_tcon *tcon,
+ 		case SMB2_OP_QUERY_WSL_EA:
+ 			if (!rc) {
+ 				idata = in_iov[i].iov_base;
+-				idata->contains_posix_file_info = false;
+ 				qi_rsp = rsp_iov[i + 1].iov_base;
+ 				data[0] = (u8 *)qi_rsp + le16_to_cpu(qi_rsp->OutputBufferOffset);
+ 				size[0] = le32_to_cpu(qi_rsp->OutputBufferLength);
+* Unmerged path fs/smb/client/smb2pdu.c
