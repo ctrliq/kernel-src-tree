@@ -257,6 +257,7 @@ struct cifs_open_info_data {
 	bool adjust_tz;
 	bool reparse_point;
 	bool contains_posix_file_info;
+	bool unknown_nlink;
 	struct {
 		/* ioctl response buffer */
 		struct {
@@ -1952,12 +1953,12 @@ static inline bool is_replayable_error(int error)
 }
 
 
-/* cifs_get_writable_file() flags */
-enum cifs_writable_file_flags {
-	FIND_WR_ANY			= 0U,
-	FIND_WR_FSUID_ONLY		= (1U << 0),
-	FIND_WR_WITH_DELETE		= (1U << 1),
-	FIND_WR_NO_PENDING_DELETE	= (1U << 2),
+enum cifs_find_flags {
+	FIND_ANY		= 0U,
+	FIND_FSUID_ONLY		= (1U << 0),
+	FIND_WITH_DELETE	= (1U << 1),
+	FIND_NO_PENDING_DELETE	= (1U << 2),
+	FIND_OPEN_FLAGS		= (1U << 3),
 };
 
 #define   MID_FREE 0
@@ -2520,5 +2521,14 @@ static inline int cifs_open_create_options(unsigned int oflags, int opts)
 		opts |= CREATE_NO_BUFFER;
 	return opts;
 }
+
+/*
+ * inode->i_blocks is counted in 512-byte units, independent of
+ * inode->i_blksize.
+ */
+#define CIFS_INO_BLOCK_SIZE 512ULL
+#define CIFS_INO_BLOCKS(size) \
+	DIV_ROUND_UP_ULL((u64)(size), CIFS_INO_BLOCK_SIZE)
+#define CIFS_INO_BYTES(blocks) ((u64)(blocks) * CIFS_INO_BLOCK_SIZE)
 
 #endif	/* _CIFS_GLOB_H */

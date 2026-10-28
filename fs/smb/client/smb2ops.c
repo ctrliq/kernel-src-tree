@@ -1459,6 +1459,7 @@ smb2_close_getattr(const unsigned int xid, struct cifs_tcon *tcon,
 {
 	struct smb2_file_network_open_info file_inf;
 	struct inode *inode;
+	u64 asize;
 	int rc;
 
 	rc = __SMB2_close(xid, tcon, cfile->fid.persistent_fid,
@@ -1480,14 +1481,9 @@ smb2_close_getattr(const unsigned int xid, struct cifs_tcon *tcon,
 	if (file_inf.LastAccessTime)
 		inode->i_atime = cifs_NTtimeToUnix(file_inf.LastAccessTime);
 
-	/*
-	 * i_blocks is not related to (i_size / i_blksize),
-	 * but instead 512 byte (2**9) size is required for
-	 * calculating num blocks.
-	 */
-	if (le64_to_cpu(file_inf.AllocationSize) > 4096)
-		inode->i_blocks =
-			(512 - 1 + le64_to_cpu(file_inf.AllocationSize)) >> 9;
+	asize = le64_to_cpu(file_inf.AllocationSize);
+	if (asize > 4096)
+		inode->i_blocks = CIFS_INO_BLOCKS(asize);
 
 	/* End of file and Attributes should not have to be updated on close */
 	spin_unlock(&inode->i_lock);
@@ -1859,15 +1855,6 @@ __smb2_copychunk_range(const unsigned int xid,
 	 *   delta < L:
 	 *     delta >= C:    copy backwards using C
 	 *     delta < C:     copy backwards with chunks limited to delta
-	 *
-	 * Copying backwards prevents one chunk from overwriting data needed by
-	 * a later chunk. Limiting the chunk size to delta prevents an individual
-	 * chunk from overlapping itself.
-	 * This limit can be removed once all supported servers handle overlapping
-	 * descriptors safely.
-	 *
-	 * A small right shift over a large range may therefore require many
-	 * chunks.
 	 */
 	if (src_file == dst_file && dst_off > src_off) {
 		u64 delta = dst_off - src_off;
@@ -1878,11 +1865,6 @@ __smb2_copychunk_range(const unsigned int xid,
 		}
 	}
 
-	/*
-	 * A backward copy walks the offsets down from the end of the range.
-	 * Do this once, outside the retry loop, so a retry does not move the
-	 * offsets again.
-	 */
 	if (reverse) {
 		src_off += len;
 		dst_off += len;
@@ -1990,8 +1972,8 @@ retry:
 			}
 
 			/*
-			 * A successful COPYCHUNK should copy every descriptor (MS-SMB2
-			 * 3.3.5.15.6). Reject a short backward copy because the rewind
+			 * A successful COPYCHUNK should copy every descriptor.
+			 * Reject a short backward copy because the rewind
 			 * below only supports forward copying.
 			 */
 			if (unlikely(reverse && bytes_written < copy_bytes)) {
@@ -2237,16 +2219,7 @@ smb2_duplicate_extents(const unsigned int xid,
 		rc = smb2_set_file_size(xid, tcon, trgtfile, dest_off + len, false);
 		if (rc)
 			goto duplicate_extents_out;
-
-		/*
-		 * Although also could set plausible allocation size (i_blocks)
-		 * here in addition to setting the file size, in reflink
-		 * it is likely that the target file is sparse. Its allocation
-		 * size will be queried on next revalidate, but it is important
-		 * to make sure that file's cached size is updated immediately
-		 */
-		netfs_resize_file(netfs_inode(inode), dest_off + len);
-		cifs_setsize(inode, dest_off + len);
+		cifs_resize_file_locked(inode, dest_off + len);
 	}
 	rc = SMB2_ioctl(xid, tcon, trgtfile->fid.persistent_fid,
 			trgtfile->fid.volatile_fid,
@@ -3414,7 +3387,7 @@ get_smb2_acl(struct cifs_sb_info *cifs_sb,
 	struct cifsFileInfo *open_file = NULL;
 
 	if (inode && !(info & SACL_SECINFO))
-		open_file = find_readable_file(CIFS_I(inode), true);
+		open_file = find_readable_file(CIFS_I(inode), FIND_FSUID_ONLY);
 	if (!open_file || (info & SACL_SECINFO))
 		return get_smb2_acl_by_path(cifs_sb, path, pacllen, info);
 
@@ -3489,6 +3462,9 @@ static long smb3_zero_range(struct file *file, struct cifs_tcon *tcon,
 	if (keep_size == false && !CIFS_CACHE_READ(cifsi))
 		goto zero_range_exit;
 
+	fscache_invalidate(cifs_inode_cookie(inode), NULL,
+			   i_size_read(inode), 0);
+
 	rc = smb3_zero_data(file, tcon, offset, len, xid);
 	if (rc < 0)
 		goto zero_range_exit;
@@ -3553,6 +3529,8 @@ static long smb3_punch_hole(struct file *file, struct cifs_tcon *tcon,
 	 * caches first, otherwise the data may be inconsistent with the server.
 	 */
 	truncate_pagecache_range(inode, offset, offset + len - 1);
+	fscache_invalidate(cifs_inode_cookie(inode), NULL,
+			   i_size_read(inode), 0);
 
 	cifs_dbg(FYI, "Offset %lld len %lld\n", offset, len);
 
@@ -3792,8 +3770,7 @@ static long smb3_simple_falloc(struct file *file, struct cifs_tcon *tcon,
 			}
 
 			new_eof = off + len;
-			netfs_resize_file(&cifsi->netfs, new_eof, true);
-			cifs_setsize(inode, new_eof);
+			cifs_resize_file_locked(inode, new_eof);
 
 			qrc = SMB2_query_info(xid, tcon,
 					      cfile->fid.persistent_fid,
@@ -3813,12 +3790,48 @@ static long smb3_simple_falloc(struct file *file, struct cifs_tcon *tcon,
 			smb2_set_sparse(xid, tcon, cfile, inode, false);
 
 		new_eof = off + len;
+
+		qrc = SMB2_query_info(xid, tcon,
+				      cfile->fid.persistent_fid,
+				      cfile->fid.volatile_fid, &file_inf);
+		if (qrc == 0)
+			asize = le64_to_cpu(file_inf.AllocationSize);
+
+		/*
+		 * FILE_ALLOCATION_INFORMATION can only describe allocation up to
+		 * new_eof. Some servers may accept it without allocating blocks,
+		 * so refresh AllocationSize before updating i_blocks.
+		 */
+		if (off == 0 || off == old_eof) {
+			if (qrc || asize < new_eof) {
+				rc = SMB2_set_allocation(xid, tcon,
+							 cfile->fid.persistent_fid,
+							 cfile->fid.volatile_fid,
+							 cfile->pid, new_eof);
+				if (rc)
+					goto out;
+			}
+		}
+
 		rc = SMB2_set_eof(xid, tcon, cfile->fid.persistent_fid,
 				  cfile->fid.volatile_fid, cfile->pid, new_eof);
-		if (rc == 0) {
-			netfs_resize_file(&cifsi->netfs, new_eof);
-			cifs_setsize(inode, new_eof);
+		if (rc)
+			goto out;
+
+		cifs_resize_file_locked(inode, new_eof);
+
+		qrc = SMB2_query_info(xid, tcon,
+				      cfile->fid.persistent_fid,
+				      cfile->fid.volatile_fid, &file_inf);
+		spin_lock(&inode->i_lock);
+		if (qrc == 0) {
+			asize = le64_to_cpu(file_inf.AllocationSize);
+			if (asize >= new_eof)
+				inode->i_blocks = CIFS_INO_BLOCKS(asize);
+		} else {
+			cifsi->time = 0;
 		}
+		spin_unlock(&inode->i_lock);
 		goto out;
 	}
 
@@ -3920,11 +3933,14 @@ static long smb3_collapse_range(struct file *file, struct cifs_tcon *tcon,
 	}
 
 	filemap_invalidate_lock(inode->i_mapping);
-	rc = filemap_write_and_wait_range(inode->i_mapping, off, old_eof - 1);
+	rc = filemap_write_and_wait_range(inode->i_mapping,
+					  round_down(off, PAGE_SIZE),
+					  old_eof - 1);
 	if (rc < 0)
 		goto out_2;
 
-	truncate_pagecache_range(inode, off, old_eof);
+	truncate_pagecache_range(inode, round_down(off, PAGE_SIZE), -1);
+	fscache_invalidate(cifs_inode_cookie(inode), NULL, old_eof, 0);
 
 	rc = __smb2_copychunk_range(xid, cfile, cfile, off + len,
 				    old_eof - off - len, off);
@@ -3981,10 +3997,13 @@ static long smb3_insert_range(struct file *file, struct cifs_tcon *tcon,
 		goto out;
 
 	filemap_invalidate_lock(inode->i_mapping);
-	rc = filemap_write_and_wait_range(inode->i_mapping, off, new_eof - 1);
+	rc = filemap_write_and_wait_range(inode->i_mapping,
+					  round_down(off, PAGE_SIZE),
+					  old_eof - 1);
 	if (rc < 0)
 		goto out_2;
-	truncate_pagecache_range(inode, off, old_eof);
+	truncate_pagecache_range(inode, round_down(off, PAGE_SIZE), -1);
+	fscache_invalidate(cifs_inode_cookie(inode), NULL, old_eof, 0);
 
 	rc = SMB2_set_eof(xid, tcon, cfile->fid.persistent_fid,
 			  cfile->fid.volatile_fid, cfile->pid, new_eof);
@@ -4043,7 +4062,7 @@ static loff_t smb3_llseek(struct file *file, struct cifs_tcon *tcon, loff_t offs
 	 * some servers (Windows2016) will not reflect recent writes in
 	 * QUERY_ALLOCATED_RANGES until SMB2_flush is called.
 	 */
-	wrcfile = find_writable_file(cifsi, FIND_WR_ANY);
+	wrcfile = find_writable_file(cifsi, FIND_ANY);
 	if (wrcfile) {
 		filemap_write_and_wait(inode->i_mapping);
 		smb2_flush_file(xid, tcon, &wrcfile->fid);
@@ -4669,6 +4688,11 @@ smb3_free_compound_rqst(int num_rqst, struct smb_rqst *rqst)
 	int i, j;
 
 	for (i = 0; i < num_rqst; i++) {
+		if (rqst[i].rq_iov) {
+			for (j = 0; j < rqst[i].rq_nvec; j++)
+				kfree(rqst[i].rq_iov[j].iov_base);
+			kfree(rqst[i].rq_iov);
+		}
 		if (rqst[i].rq_pages) {
 			for (j = rqst[i].rq_npages - 1; j >= 0; j--)
 				put_page(rqst[i].rq_pages[j]);
@@ -4706,8 +4730,19 @@ smb3_init_transform_rq(struct TCP_Server_Info *server, int num_rqst,
 		struct smb_rqst *new = &new_rq[i];
 
 		orig_len += smb_rqst_len(server, old);
-		new->rq_iov = old->rq_iov;
 		new->rq_nvec = old->rq_nvec;
+		new->rq_iov = kcalloc(old->rq_nvec, sizeof(struct kvec),
+				      GFP_KERNEL);
+		if (!new->rq_iov)
+			goto err_free;
+		for (j = 0; j < old->rq_nvec; j++) {
+			new->rq_iov[j].iov_len = old->rq_iov[j].iov_len;
+			new->rq_iov[j].iov_base =
+				kmemdup(old->rq_iov[j].iov_base,
+					old->rq_iov[j].iov_len, GFP_KERNEL);
+			if (!new->rq_iov[j].iov_base)
+				goto err_free;
+		}
 
 		npages = old->rq_npages;
 		if (!npages)
