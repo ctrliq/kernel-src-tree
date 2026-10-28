@@ -1,0 +1,117 @@
+net/handshake: Take a long-lived file reference at submit
+
+jira KERNEL-1825
+cve CVE-2026-64523
+Rebuild_History Non-Buildable kernel-5.14.0-687.61.1.el9_8
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 09dba37eee70d0596e26645015f1aa95a9848e9d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-687.61.1.el9_8/09dba37e.failed
+
+handshake_nl_accept_doit() needs the file pointer backing
+req->hr_sk->sk_socket to survive the window between
+handshake_req_next() and the subsequent FD_PREPARE() and get_file().
+The submit-side sock_hold() does not provide that.  sk_refcnt keeps
+struct sock alive, but struct socket is owned by sock->file: when
+the consumer fputs the last file reference, sock_release() tears
+the socket down regardless of any sock_hold.
+
+Add an hr_file pointer to struct handshake_req and acquire an
+explicit reference on sock->file during handshake_req_submit().
+handshake_complete() and handshake_req_cancel() release the
+reference on the completion-bit-winning path.
+
+The submit error path must also release the file reference, but
+after rhashtable insertion a concurrent handshake_req_cancel() can
+discover the request and race the error path.  Gate the error-path
+cleanup -- sk_destruct restoration, fput, and request destruction
+-- with test_and_set_bit(HANDSHAKE_F_REQ_COMPLETED), the same
+serialization handshake_complete() and handshake_req_cancel()
+already use.  When cancel has already claimed ownership, the submit
+error path returns without touching the request; socket teardown
+handles final destruction.
+
+The accept-side dereferences are not yet retargeted; that change
+comes in the next patch.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+Link: https://patch.msgid.link/20260525-handshake-file-pin-v3-4-66c616906ead@oracle.com
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+(cherry picked from commit 09dba37eee70d0596e26645015f1aa95a9848e9d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/handshake/request.c
+diff --cc net/handshake/request.c
+index 94d5cef3e048,da064511ab86..000000000000
+--- a/net/handshake/request.c
++++ b/net/handshake/request.c
+@@@ -13,7 -13,7 +13,11 @@@
+  #include <linux/module.h>
+  #include <linux/skbuff.h>
+  #include <linux/inet.h>
+++<<<<<<< HEAD
+ +#include <linux/fdtable.h>
+++=======
++ #include <linux/file.h>
+++>>>>>>> 09dba37eee70 (net/handshake: Take a long-lived file reference at submit)
+  #include <linux/rhashtable.h>
+  
+  #include <net/sock.h>
+@@@ -275,10 -294,15 +298,15 @@@ int handshake_req_submit(struct socket 
+  	return 0;
+  
+  out_unlock:
+ -	spin_unlock_bh(&hn->hn_lock);
+ +	spin_unlock(&hn->hn_lock);
+  out_err:
+  	trace_handshake_submit_err(net, req, req->hr_sk, ret);
+- 	handshake_req_destroy(req);
++ 	if (!test_and_set_bit(HANDSHAKE_F_REQ_COMPLETED, &req->hr_flags)) {
++ 		/* Restore original destructor so socket teardown still runs. */
++ 		req->hr_sk->sk_destruct = req->hr_odestruct;
++ 		fput(req->hr_file);
++ 		handshake_req_destroy(req);
++ 	}
+  	return ret;
+  }
+  EXPORT_SYMBOL(handshake_req_submit);
+diff --git a/net/handshake/handshake.h b/net/handshake/handshake.h
+index a48163765a7a..d35f677d7f3e 100644
+--- a/net/handshake/handshake.h
++++ b/net/handshake/handshake.h
+@@ -24,6 +24,7 @@ enum hn_flags_bits {
+ 	HANDSHAKE_F_NET_DRAINING,
+ };
+ 
++struct file;
+ struct handshake_proto;
+ 
+ /* One handshake request */
+@@ -32,6 +33,7 @@ struct handshake_req {
+ 	struct rhash_head		hr_rhash;
+ 	unsigned long			hr_flags;
+ 	const struct handshake_proto	*hr_proto;
++	struct file			*hr_file;
+ 	struct sock			*hr_sk;
+ 	void				(*hr_odestruct)(struct sock *sk);
+ 
+diff --git a/net/handshake/netlink.c b/net/handshake/netlink.c
+index 89637e732866..260ab2b1b9e8 100644
+--- a/net/handshake/netlink.c
++++ b/net/handshake/netlink.c
+@@ -211,12 +211,6 @@ static void __net_exit handshake_net_exit(struct net *net)
+ 	while (!list_empty(&requests)) {
+ 		req = list_first_entry(&requests, struct handshake_req, hr_list);
+ 		list_del(&req->hr_list);
+-
+-		/*
+-		 * Requests on this list have not yet been
+-		 * accepted, so they do not have an fd to put.
+-		 */
+-
+ 		handshake_complete(req, -ETIMEDOUT, NULL);
+ 	}
+ }
+* Unmerged path net/handshake/request.c
