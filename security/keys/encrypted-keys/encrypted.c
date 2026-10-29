@@ -21,6 +21,7 @@
 #include <linux/parser.h>
 #include <linux/string.h>
 #include <linux/err.h>
+#include <linux/overflow.h>
 #include <keys/user-type.h>
 #include <keys/trusted-type.h>
 #include <keys/encrypted-type.h>
@@ -614,7 +615,9 @@ static struct encrypted_key_payload *encrypted_key_alloc(struct key *key,
 							 const char *datalen)
 {
 	struct encrypted_key_payload *epayload = NULL;
+	size_t tmp_len;
 	unsigned short datablob_len;
+	unsigned short payload_totallen;
 	unsigned short decrypted_datalen;
 	unsigned short payload_datalen;
 	unsigned int encrypted_datalen;
@@ -649,16 +652,22 @@ static struct encrypted_key_payload *encrypted_key_alloc(struct key *key,
 
 	encrypted_datalen = roundup(decrypted_datalen, blksize);
 
-	datablob_len = format_len + 1 + strlen(master_desc) + 1
+	tmp_len = format_len + 1 + strlen(master_desc) + 1
 	    + strlen(datalen) + 1 + ivsize + 1 + encrypted_datalen;
+	if (tmp_len > type_max(typeof(epayload->datablob_len)))
+		return ERR_PTR(-EINVAL);
+	datablob_len = tmp_len;
 
-	ret = key_payload_reserve(key, payload_datalen + datablob_len
-				  + HASH_SIZE + 1);
+	tmp_len = (size_t)payload_datalen + datablob_len + HASH_SIZE + 1;
+	if (tmp_len > type_max(typeof(epayload->payload_datalen)))
+		return ERR_PTR(-EINVAL);
+	payload_totallen = tmp_len;
+
+	ret = key_payload_reserve(key, payload_totallen);
 	if (ret < 0)
 		return ERR_PTR(ret);
 
-	epayload = kzalloc(sizeof(*epayload) + payload_datalen +
-			   datablob_len + HASH_SIZE + 1, GFP_KERNEL);
+	epayload = kzalloc(sizeof(*epayload) + payload_totallen, GFP_KERNEL);
 	if (!epayload)
 		return ERR_PTR(-ENOMEM);
 
