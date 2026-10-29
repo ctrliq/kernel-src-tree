@@ -1939,12 +1939,8 @@ static int drbg_kcapi_random(struct crypto_rng *tfm,
 	}
 
 	err = drbg_generate_long(drbg, dst, dlen, addtl,
-				 (crypto_tfm_get_flags(crypto_rng_tfm(tfm)) &
-				  CRYPTO_TFM_REQ_NEED_RESEED) ==
+				 crypto_tfm_get_flags(crypto_rng_tfm(tfm)) &
 				 CRYPTO_TFM_REQ_NEED_RESEED);
-
-	crypto_tfm_clear_flags(crypto_rng_tfm(tfm),
-			       CRYPTO_TFM_REQ_NEED_RESEED);
 
 	return err;
 }
