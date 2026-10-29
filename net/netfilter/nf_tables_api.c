@@ -2398,8 +2398,10 @@ static int nf_tables_addchain(struct nft_ctx *ctx, u8 family, u8 genmask,
 	rcu_assign_pointer(chain->rules_gen_1, rules);
 
 	err = nf_tables_register_hook(net, table, chain);
-	if (err < 0)
+	if (err < 0) {
+		synchronize_rcu();
 		goto err_destroy_chain;
+	}
 
 	if (!nft_use_inc(&table->use)) {
 		err = -EMFILE;
@@ -2428,6 +2430,7 @@ err_unregister_hook:
 	nft_use_dec_restore(&table->use);
 err_use:
 	nf_tables_unregister_hook(net, table, chain);
+	synchronize_rcu();
 err_destroy_chain:
 	nf_tables_chain_destroy(ctx);
 
