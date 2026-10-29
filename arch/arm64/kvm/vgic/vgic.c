@@ -676,7 +676,7 @@ retry:
 		 * This interrupt looks like it has to be migrated,
 		 * make sure it is kept alive while locks are dropped.
 		 */
-		vgic_get_irq_ref(irq);
+		vgic_get_irq_kref(irq);
 
 		raw_spin_unlock(&irq->irq_lock);
 		raw_spin_unlock(&vgic_cpu->ap_list_lock);
@@ -721,7 +721,7 @@ retry:
 		raw_spin_unlock(&vcpuB->arch.vgic_cpu.ap_list_lock);
 		raw_spin_unlock(&vcpuA->arch.vgic_cpu.ap_list_lock);
 
-		deleted_lpis |= vgic_put_irq_norelease(vcpu->kvm, irq);
+		vgic_put_irq(vcpu->kvm, irq);
 
 		if (target_vcpu_needs_kick) {
 			kvm_make_request(KVM_REQ_IRQ_PENDING, target_vcpu);
