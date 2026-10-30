@@ -6641,7 +6641,7 @@ static int scsi_debug_sdev_configure(struct scsi_device *sdp,
 	if (sdebug_ptype == TYPE_TAPE) {
 		if (!devip->tape_blocks[0]) {
 			devip->tape_blocks[0] =
-				kcalloc(TAPE_UNITS, sizeof(struct tape_block),
+				kcalloc(TAPE_UNITS + 1, sizeof(struct tape_block),
 					GFP_KERNEL);
 			if (!devip->tape_blocks[0])
 				return 1;
