@@ -706,7 +706,6 @@ static int tcf_ct_handle_fragments(struct net *net, struct sk_buff *skb,
 	if (err || !frag)
 		return err;
 
-	skb_get(skb);
 	mru = tc_skb_cb(skb)->mru;
 
 	if (family == NFPROTO_IPV4) {
@@ -716,41 +715,36 @@ static int tcf_ct_handle_fragments(struct net *net, struct sk_buff *skb,
 		local_bh_disable();
 		err = ip_defrag(net, skb, user);
 		local_bh_enable();
-		if (err && err != -EINPROGRESS)
+		if (err)
 			return err;
 
-		if (!err) {
-			*defrag = true;
-			mru = IPCB(skb)->frag_max_size;
-		}
+		mru = IPCB(skb)->frag_max_size;
 	} else { /* NFPROTO_IPV6 */
 #if IS_ENABLED(CONFIG_NF_DEFRAG_IPV6)
 		enum ip6_defrag_users user = IP6_DEFRAG_CONNTRACK_IN + zone;
 
 		memset(IP6CB(skb), 0, sizeof(struct inet6_skb_parm));
 		err = nf_ct_frag6_gather(net, skb, user);
-		if (err && err != -EINPROGRESS)
-			goto out_free;
-
-		if (!err) {
-			*defrag = true;
-			mru = IP6CB(skb)->frag_max_size;
+		if (err) {
+			if (err != -EINPROGRESS)
+				kfree_skb(skb);
+			return err;
 		}
+
+		mru = IP6CB(skb)->frag_max_size;
 #else
-		err = -EOPNOTSUPP;
-		goto out_free;
+		kfree_skb(skb);
+		return -EPFNOSUPPORT;
 #endif
 	}
 
-	if (err != -EINPROGRESS)
-		tc_skb_cb(skb)->mru = mru;
+	*defrag = true;
+	tc_skb_cb(skb)->mru = mru;
+
 	skb_clear_hash(skb);
 	skb->ignore_df = 1;
-	return err;
 
-out_free:
-	kfree_skb(skb);
-	return err;
+	return 0;
 }
 
 static void tcf_ct_params_free(struct rcu_head *head)
@@ -988,12 +982,8 @@ static int tcf_ct_act(struct sk_buff *skb, const struct tc_action *a,
 	nh_ofs = skb_network_offset(skb);
 	skb_pull_rcsum(skb, nh_ofs);
 	err = tcf_ct_handle_fragments(net, skb, family, p->zone, &defrag);
-	if (err == -EINPROGRESS) {
-		retval = TC_ACT_STOLEN;
-		goto out_clear;
-	}
 	if (err)
-		goto drop;
+		goto out_frag;
 
 	err = tcf_ct_skb_network_trim(skb, family);
 	if (err)
@@ -1059,6 +1049,11 @@ out_clear:
 	if (defrag)
 		qdisc_skb_cb(skb)->pkt_len = skb->len;
 	return retval;
+
+out_frag:
+	if (err != -EINPROGRESS)
+		tcf_action_inc_drop_qstats(&c->common);
+	return TC_ACT_CONSUMED;
 
 drop:
 	tcf_action_inc_drop_qstats(&c->common);
