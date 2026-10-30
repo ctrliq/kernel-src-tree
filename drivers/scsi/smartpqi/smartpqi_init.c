@@ -6063,7 +6063,8 @@ static bool pqi_is_parity_write_stream(struct pqi_ctrl_info *ctrl_info,
 	return false;
 }
 
-static int pqi_scsi_queue_command(struct Scsi_Host *shost, struct scsi_cmnd *scmd)
+static enum scsi_qc_status pqi_scsi_queue_command(struct Scsi_Host *shost,
+						  struct scsi_cmnd *scmd)
 {
 	int rc;
 	struct pqi_ctrl_info *ctrl_info;
