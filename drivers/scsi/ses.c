@@ -42,9 +42,8 @@ static bool ses_page2_supported(struct enclosure_device *edev)
 	return (ses_dev->page2 != NULL);
 }
 
-static int ses_probe(struct device *dev)
+static int ses_probe(struct scsi_device *sdev)
 {
-	struct scsi_device *sdev = to_scsi_device(dev);
 	int err = -ENODEV;
 
 	if (sdev->type != TYPE_ENCLOSURE)
@@ -846,11 +845,6 @@ page2_not_supported:
 	return err;
 }
 
-static int ses_remove(struct device *dev)
-{
-	return 0;
-}
-
 static void ses_intf_remove_component(struct scsi_device *sdev)
 {
 	struct enclosure_device *edev, *prev = NULL;
@@ -905,10 +899,9 @@ static struct class_interface ses_interface = {
 };
 
 static struct scsi_driver ses_template = {
+	.probe = ses_probe,
 	.gendrv = {
 		.name		= "ses",
-		.probe		= ses_probe,
-		.remove		= ses_remove,
 	},
 };
 
