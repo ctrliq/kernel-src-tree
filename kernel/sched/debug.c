@@ -238,16 +238,17 @@ static ssize_t sched_dynamic_write(struct file *filp, const char __user *ubuf,
 
 static int sched_dynamic_show(struct seq_file *m, void *v)
 {
+	int mode = READ_ONCE(preempt_dynamic_mode);
 	static const char * preempt_modes[] = {
 		"none", "voluntary", "full"
 	};
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(preempt_modes); i++) {
-		if (preempt_dynamic_mode == i)
+		if (mode == i)
 			seq_puts(m, "(");
 		seq_puts(m, preempt_modes[i]);
-		if (preempt_dynamic_mode == i)
+		if (mode == i)
 			seq_puts(m, ")");
 
 		seq_puts(m, " ");
