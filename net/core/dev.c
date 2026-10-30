@@ -3911,8 +3911,10 @@ sch_handle_egress(struct sk_buff *skb, int *ret, struct net_device *dev)
 	case TC_ACT_STOLEN:
 	case TC_ACT_QUEUED:
 	case TC_ACT_TRAP:
-		*ret = NET_XMIT_SUCCESS;
 		consume_skb(skb);
+		fallthrough;
+	case TC_ACT_CONSUMED:
+		*ret = NET_XMIT_SUCCESS;
 		return NULL;
 	case TC_ACT_REDIRECT:
 		/* No need to push/pop skb's mac_header here on egress! */
