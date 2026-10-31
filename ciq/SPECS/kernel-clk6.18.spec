@@ -167,10 +167,10 @@ Summary: The Linux kernel
 #  the --with-release option overrides this setting.)
 %define debugbuildsenabled 1
 %define kernel_major_minor 6.18
-%define kernel_patch 59
+%define kernel_patch 60
 %define buildid .1
 %define specversion %{kernel_major_minor}.%{kernel_patch}
-%define pkgrelease 2%{?buildid}
+%define pkgrelease 1%{?buildid}
 %define kversion %{lua:print((rpm.expand("%{kernel_major_minor}"):match("^(%d+)")))}
 
 %define tarfile_release %{specversion}-%{pkgrelease}.el%{rhel}
@@ -4572,12 +4572,12 @@ fi\
 #
 #
 %changelog
-* Fri Oct 30 2026 Brett Mastbergen <bmastbergen@ciq.com> - 6.18.59-2.1
+* Sat Oct 31 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.18.60-1.1
+-- Rebased changes for Linux 6.18.60 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.60-1)
+-- [CIQ] ciq_kernel-6.18.59-2 - updated spec (Brett Mastbergen)
 -- configs: minimal: Disable X86_KERNEL_IBT (Brett Mastbergen)
 -- configs: minimal: Sync with full x86 config (Brett Mastbergen)
-
-* Tue Oct 27 2026 github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com> - 6.18.59-1.1
--- Rebased changes for Linux 6.18.59 (https://github.com/ctrliq/kernel-src-tree/releases/tag/ciq_kernel-6.18.59-1)
+-- [CIQ] v6.18.59 - updated spec (github-actions[bot])
 -- [CIQ] v6.18.58 - updated spec (github-actions[bot])
 -- [CIQ] v6.18.57 - updated spec (github-actions[bot])
 -- [CIQ] v6.18.56 - updated spec (github-actions[bot])
@@ -4717,7 +4717,7 @@ fi\
 -- github actions: Make Builds on Merge Request Work (Jonathan Maple)
 -- Add initial CIQ config tweaks (Brett Mastbergen)
 -- Add CIQ configs (Brett Mastbergen)
--- Linux 6.18.59 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.18.59)
+-- Linux 6.18.60 (https://cdn.kernel.org/pub/linux/kernel/v6.x/ChangeLog-6.18.60)
 
 
 ###
