@@ -12,6 +12,7 @@
 #include <linux/string.h>
 #include <linux/unaligned.h>
 #include <linux/wordpart.h>
+#include "fips.h"
 
 static const struct sha1_block_state sha1_iv = {
 	.h = { SHA1_H0, SHA1_H1, SHA1_H2, SHA1_H3, SHA1_H4 },
@@ -163,6 +164,7 @@ void sha1_init(struct sha1_ctx *ctx)
 {
 	ctx->state = sha1_iv;
 	ctx->bytecount = 0;
+	ctx->fips_approved = fips_enabled;
 }
 EXPORT_SYMBOL_GPL(sha1_init);
 
@@ -268,6 +270,9 @@ void hmac_sha1_preparekey(struct hmac_sha1_key *key,
 {
 	__hmac_sha1_preparekey(&key->istate, &key->ostate,
 			       raw_key, raw_key_len);
+	key->fips_approved = fips_enabled;
+	if (fips_enabled && raw_key_len < 112 / 8)
+		key->fips_approved = false;
 }
 EXPORT_SYMBOL_GPL(hmac_sha1_preparekey);
 
@@ -275,6 +280,8 @@ void hmac_sha1_init(struct hmac_sha1_ctx *ctx, const struct hmac_sha1_key *key)
 {
 	ctx->sha_ctx.state = key->istate;
 	ctx->sha_ctx.bytecount = SHA1_BLOCK_SIZE;
+	ctx->sha_ctx.fips_approved = key->fips_approved;
+	ctx->fips_approved = key->fips_approved;
 	ctx->ostate = key->ostate;
 }
 EXPORT_SYMBOL_GPL(hmac_sha1_init);
@@ -285,6 +292,10 @@ void hmac_sha1_init_usingrawkey(struct hmac_sha1_ctx *ctx,
 	__hmac_sha1_preparekey(&ctx->sha_ctx.state, &ctx->ostate,
 			       raw_key, raw_key_len);
 	ctx->sha_ctx.bytecount = SHA1_BLOCK_SIZE;
+	ctx->fips_approved = fips_enabled;
+	if (fips_enabled && raw_key_len < 112 / 8)
+		ctx->fips_approved = false;
+	ctx->sha_ctx.fips_approved = ctx->fips_approved;
 }
 EXPORT_SYMBOL_GPL(hmac_sha1_init_usingrawkey);
 
@@ -330,10 +341,26 @@ void hmac_sha1_usingrawkey(const u8 *raw_key, size_t raw_key_len,
 }
 EXPORT_SYMBOL_GPL(hmac_sha1_usingrawkey);
 
-#ifdef sha1_mod_init_arch
+#if defined(sha1_mod_init_arch) || defined(CONFIG_CRYPTO_FIPS)
 static int __init sha1_mod_init(void)
 {
+#ifdef sha1_mod_init_arch
 	sha1_mod_init_arch();
+#endif
+	if (fips_enabled) {
+		/*
+		 * FIPS cryptographic algorithm self-test.  As per the FIPS
+		 * Implementation Guidance, testing HMAC-SHA1 satisfies the test
+		 * requirement for SHA-1 too.
+		 */
+		u8 mac[SHA1_DIGEST_SIZE];
+
+		hmac_sha1_usingrawkey(fips_test_key, sizeof(fips_test_key),
+				      fips_test_data, sizeof(fips_test_data),
+				      mac);
+		if (memcmp(fips_test_hmac_sha1_value, mac, sizeof(mac)) != 0)
+			panic("sha1: FIPS self-test failed\n");
+	}
 	return 0;
 }
 subsys_initcall(sha1_mod_init);
