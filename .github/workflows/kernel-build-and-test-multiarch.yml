@@ -23,6 +23,11 @@ permissions:
   packages: read
   pull-requests: write
 
+env:
+  # Allow list of base branches for {user}_BASE-style branch names.
+  # Also used by notify-slack to decide which bases get failure notifications.
+  VALID_BASES: "ciqcbr7_9 ciqlts8_6 ciqlts9_2 ciqlts9_4 ciqlts9_6 ciq-6.12.y ciq-6.12.y-next ciq-6.18.y ciq-6.18.y-next"
+
 jobs:
   pre-setup:
     runs-on: ubuntu-latest
@@ -46,6 +51,7 @@ jobs:
       pr_only: ${{ steps.pr_metadata.outputs.pr_only }}
       no_pr: ${{ steps.pr_metadata.outputs.no_pr }}
       is_pr: ${{ steps.pr_metadata.outputs.is_pr }}
+      base_branch: ${{ steps.base_branch.outputs.base_branch }}
 
     steps:
       - name: Download check results
@@ -242,6 +248,49 @@ jobs:
           echo "no_pr=$NO_PR" >> $GITHUB_OUTPUT
           echo "head_ref_base=$HEAD_REF_BASE" >> $GITHUB_OUTPUT
           echo "is_pr=$IS_PR" >> $GITHUB_OUTPUT
+
+      # Resolved once here and shared through needs.pre-setup.outputs.base_branch.
+      # Empty if no base could be found; each job decides whether that's fatal.
+      - name: Determine base branch
+        id: base_branch
+        if: steps.pr_metadata.outputs.skip_ci != 'true'
+        env:
+          # head_ref_base is head_ref with any skip-suffix (-no-ltp, -pr-only, etc.)
+          # stripped, used for matching the branch name.
+          HEAD_REF_BASE: ${{ steps.pr_metadata.outputs.head_ref_base }}
+          # Set by the trigger workflow from the PR event, or from the open PR on a push.
+          BASE_REF: ${{ steps.pr_metadata.outputs.base_ref }}
+        run: |
+          BASE_BRANCH=""
+          BRANCH_NAME="$HEAD_REF_BASE"
+
+          # Use the PR's base_ref, then the branch name.
+          # Supported branch name patterns (both need the {user} prefix):
+          #   1. RLC pattern  : {user}_rlc-N/VERSION
+          #      e.g. {shreeya}_rlc-10/6.12.0-124.2.1.el10_1
+          #      Base branch  : rlc-N/VERSION (no allow list check)
+          #   2. Legacy pattern: {user}_BASE or {user}-BASE
+          #      e.g. {shreeya}_ciqlts9_2
+          #      Base branch  : BASE (must be in VALID_BASES)
+          if [ -n "$BASE_REF" ]; then
+            BASE_BRANCH="$BASE_REF"
+            echo "Using PR base branch: $BASE_BRANCH"
+          elif [[ "$BRANCH_NAME" =~ ^\{[^}]+\}_(rlc-[0-9]+/.+)$ ]]; then
+            BASE_BRANCH="${BASH_REMATCH[1]}"
+            echo "Detected RLC branch pattern, base branch: $BASE_BRANCH"
+          elif [[ "$BRANCH_NAME" =~ \{[^}]+\}[_-](.+) ]]; then
+            EXTRACTED_BASE="${BASH_REMATCH[1]}"
+            if echo "$VALID_BASES" | grep -wq "$EXTRACTED_BASE"; then
+              BASE_BRANCH="$EXTRACTED_BASE"
+            fi
+          fi
+
+          if [ -n "$BASE_BRANCH" ]; then
+            echo "Base branch: $BASE_BRANCH"
+          else
+            echo "::warning::Could not determine base branch from '$BRANCH_NAME'"
+          fi
+          echo "base_branch=$BASE_BRANCH" >> $GITHUB_OUTPUT
 
       - name: Upload head_ref for baseline search
         if: steps.pr_metadata.outputs.skip_ci != 'true'
@@ -692,7 +741,6 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
     outputs:
-      base_branch: ${{ steps.base_branch.outputs.base_branch }}
       comparison_status_x86_64: ${{ matrix.arch == 'x86_64' && steps.ltp_comparison.outputs.comparison_status || '' }}
       comparison_status_aarch64: ${{ matrix.arch == 'aarch64' && steps.ltp_comparison.outputs.comparison_status || '' }}
       regressions_x86_64: ${{ matrix.arch == 'x86_64' && steps.ltp_comparison.outputs.regressions || '' }}
@@ -750,46 +798,13 @@ jobs:
         name: ltp-logs-${{ matrix.arch }}
         path: output-current
 
-    - name: Determine base branch
-      id: base_branch
-      env:
-        GH_TOKEN: ${{ steps.generate_token_compare.outputs.token }}
-        HEAD_REF: ${{ needs.pre-setup.outputs.head_ref }}
-        # head_ref_base is head_ref with any skip-suffix (-no-ltp, -pr-only, etc.)
-        # stripped. Used here for base-branch regex extraction. The PR-list
-        # query still uses HEAD_REF since that's the actual remote branch name.
-        HEAD_REF_BASE: ${{ needs.pre-setup.outputs.head_ref_base }}
-        BASE_REF: ${{ needs.pre-setup.outputs.base_ref }}
-        PR_NUMBER: ${{ needs.pre-setup.outputs.pr_number }}
-      run: |
-        # Reuse same base branch logic as compare-kselftest job
-        BASE_BRANCH=""
-        BRANCH_NAME="$HEAD_REF_BASE"
-        VALID_BASES="ciqlts9_2 ciqlts9_4 ciqlts8_6 ciqlts9_6 ciq-6.12.y ciq-6.12.y-next ciq-6.18.y ciq-6.18.y-next ciqcbr7_9"
-
-        EXISTING_PR=$(gh pr list --head "$HEAD_REF" --state open --json number,baseRefName --jq '.[0]' || echo "")
-        if [ -n "$EXISTING_PR" ] && [ "$EXISTING_PR" != "null" ]; then
-          BASE_BRANCH=$(echo "$EXISTING_PR" | jq -r '.baseRefName')
-        elif [ -n "$BASE_REF" ]; then
-          BASE_BRANCH="$BASE_REF"
-        elif [[ "$BRANCH_NAME" =~ ^\{[^}]+\}_(rlc-[0-9]+/.+)$ ]]; then
-          BASE_BRANCH="${BASH_REMATCH[1]}"
-        elif [[ "$BRANCH_NAME" =~ \{[^}]+\}[_-](.+) ]]; then
-          EXTRACTED_BASE="${BASH_REMATCH[1]}"
-          if echo "$VALID_BASES" | grep -wq "$EXTRACTED_BASE"; then
-            BASE_BRANCH="$EXTRACTED_BASE"
-          fi
-        fi
-
-        echo "base_branch=$BASE_BRANCH" >> $GITHUB_OUTPUT
-
     - name: Download baseline LTP results from last merged PR
-      if: steps.base_branch.outputs.base_branch != ''
+      if: needs.pre-setup.outputs.base_branch != ''
       env:
         GH_TOKEN: ${{ steps.generate_token_compare.outputs.token }}
       run: |
         set +e
-        BASE_BRANCH="${{ steps.base_branch.outputs.base_branch }}"
+        BASE_BRANCH="${{ needs.pre-setup.outputs.base_branch }}"
         CURRENT_RUN_ID="${{ github.run_id }}"
 
         SUCCESSFUL_RUNS=$(gh run list \
@@ -932,7 +947,6 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
     outputs:
-      base_branch: ${{ steps.base_branch.outputs.base_branch }}
       comparison_status_x86_64: ${{ matrix.arch == 'x86_64' && steps.comparison.outputs.comparison_status || '' }}
       comparison_status_aarch64: ${{ matrix.arch == 'aarch64' && steps.comparison.outputs.comparison_status || '' }}
 
@@ -969,94 +983,26 @@ jobs:
           kernel-src-tree
           kernel-container-build
 
-    - name: Determine base branch for comparison
-      id: base_branch
+    - name: Check base branch for comparison
       env:
-        GH_TOKEN: ${{ steps.generate_token_compare.outputs.token }}
-        HEAD_REF: ${{ needs.pre-setup.outputs.head_ref }}
-        # head_ref_base is head_ref with any skip-suffix stripped, used for
-        # base-branch regex extraction below. HEAD_REF (full remote name) is
-        # used for the PR-list query because that's the actual remote branch.
+        BASE_BRANCH: ${{ needs.pre-setup.outputs.base_branch }}
         HEAD_REF_BASE: ${{ needs.pre-setup.outputs.head_ref_base }}
-        BASE_REF: ${{ needs.pre-setup.outputs.base_ref }}
-        PR_NUMBER: ${{ needs.pre-setup.outputs.pr_number }}
       run: |
-        BASE_BRANCH=""
-        BRANCH_NAME="$HEAD_REF_BASE"
-
-        # Define whitelist of valid base branches
-        # TODO: Use a centralized place to get the base branches
-        VALID_BASES="ciqlts9_2 ciqlts9_4 ciqlts8_6 ciqlts9_6 ciq-6.12.y ciq-6.12.y-next ciq-6.18.y ciq-6.18.y-next ciqcbr7_9"
-
-        echo "Current branch (suffix-stripped for extraction): $BRANCH_NAME"
-
-        # First, check if an open PR already exists from this head branch.
-        # Use HEAD_REF (un-stripped) here — the PR's head matches the real remote branch.
-        echo "Checking for existing open PR from branch: $HEAD_REF"
-        EXISTING_PR=$(gh pr list --head "$HEAD_REF" --state open --json number,baseRefName --jq '.[0]' || echo "")
-
-        if [ -n "$EXISTING_PR" ] && [ "$EXISTING_PR" != "null" ]; then
-          # PR exists - use its existing base branch
-          BASE_BRANCH=$(echo "$EXISTING_PR" | jq -r '.baseRefName')
-          PR_NUMBER=$(echo "$EXISTING_PR" | jq -r '.number')
-          echo "Found existing PR #$PR_NUMBER, using existing base: $BASE_BRANCH"
-        elif [ -n "$BASE_REF" ]; then
-          # Use the base branch from pr_metadata
-          BASE_BRANCH="$BASE_REF"
-          echo "Using PR base branch: $BASE_BRANCH"
-        else
-          # Extract base branch from branch name.
-          # Two supported patterns (both require curly-brace {USER} prefix):
-          #
-          #   1. RLC pattern  : {user}_rlc-N/VERSION
-          #      e.g. {shreeya}_rlc-10/6.12.0-124.2.1.el10_1
-          #      Base branch  : rlc-N/VERSION  (everything after the first '_')
-          #      No whitelist validation — the version string is the base.
-          #
-          #   2. Legacy pattern: {user}_BASE  or  {user}-BASE
-          #      e.g. {shreeya}_ciqlts9_2
-          #      Base branch  : BASE  (must be in VALID_BASES whitelist)
-
-          if [[ "$BRANCH_NAME" =~ ^\{[^}]+\}_(rlc-[0-9]+/.+)$ ]]; then
-            # RLC pattern: base is rlc-N/VERSION
-            BASE_BRANCH="${BASH_REMATCH[1]}"
-            echo "Detected RLC branch pattern, base branch: $BASE_BRANCH"
-          elif [[ "$BRANCH_NAME" =~ \{[^}]+\}[_-](.+) ]]; then
-            # Legacy pattern: validate against whitelist
-            EXTRACTED_BASE="${BASH_REMATCH[1]}"
-            echo "Extracted base branch from branch name: $EXTRACTED_BASE"
-
-            if echo "$VALID_BASES" | grep -wq "$EXTRACTED_BASE"; then
-              BASE_BRANCH="$EXTRACTED_BASE"
-              echo "Base branch validated: $BASE_BRANCH"
-            else
-              echo "::error::Extracted base '$EXTRACTED_BASE' is not in whitelist: $VALID_BASES"
-              echo "::error::Valid base branches are: $VALID_BASES"
-              exit 1
-            fi
-          else
-            echo "::error::Branch name does not match any known pattern"
-            echo "::error::  Legacy pattern : {user}_BASE or {user}-BASE  (BASE must be one of: $VALID_BASES)"
-            echo "::error::  RLC pattern    : {user}_rlc-N/VERSION  (e.g. {user}_rlc-10/6.12.0-124.2.1.el10_1)"
-            exit 1
-          fi
-        fi
-
         if [ -z "$BASE_BRANCH" ]; then
-          echo "::error::Could not determine base branch"
+          echo "::error::Could not determine base branch from '$HEAD_REF_BASE'"
+          echo "::error::  Legacy pattern : {user}_BASE or {user}-BASE  (BASE must be one of: $VALID_BASES)"
+          echo "::error::  RLC pattern    : {user}_rlc-N/VERSION  (e.g. {user}_rlc-10/6.12.0-124.2.1.el10_1)"
           exit 1
         fi
-
-        echo "base_branch=$BASE_BRANCH" >> $GITHUB_OUTPUT
         echo "Base branch for comparison: $BASE_BRANCH"
 
     - name: Download baseline kselftest logs from last merged PR targeting same base
-      if: ${{ needs.pre-setup.outputs.skip_kselftests == 'false' && steps.base_branch.outputs.base_branch != '' }}
+      if: ${{ needs.pre-setup.outputs.skip_kselftests == 'false' && needs.pre-setup.outputs.base_branch != '' }}
       env:
         GH_TOKEN: ${{ steps.generate_token_compare.outputs.token }}
       run: |
         set +e  # Don't exit on error, we handle it with continue-on-error
-        BASE_BRANCH="${{ steps.base_branch.outputs.base_branch }}"
+        BASE_BRANCH="${{ needs.pre-setup.outputs.base_branch }}"
         CURRENT_RUN_ID="${{ github.run_id }}"
 
         echo "Searching for baseline from last merged PR targeting base branch: $BASE_BRANCH"
@@ -1177,7 +1123,7 @@ jobs:
       if: ${{ needs.pre-setup.outputs.skip_kselftests == 'false' }}
       run: |
         # Check if we have a base branch to compare against
-        if [ -z "${{ steps.base_branch.outputs.base_branch }}" ]; then
+        if [ -z "${{ needs.pre-setup.outputs.base_branch }}" ]; then
           echo "::warning::No base branch found for comparison"
           echo "::warning::Kselftest comparison will be skipped"
           echo "comparison_status=skipped" >> $GITHUB_OUTPUT
@@ -1199,7 +1145,7 @@ jobs:
           AFTER_FAIL=$(grep -a '^not ok' output-current/kselftests-*.log | wc -l || echo "0")
 
           echo "### Kselftest Comparison (${{ matrix.arch }})"
-          echo "Baseline (from $BASELINE_SOURCE targeting ${{ steps.base_branch.outputs.base_branch }}): $BEFORE_PASS passing, $BEFORE_FAIL failing"
+          echo "Baseline (from $BASELINE_SOURCE targeting ${{ needs.pre-setup.outputs.base_branch }}): $BEFORE_PASS passing, $BEFORE_FAIL failing"
           echo "Current (${{ needs.pre-setup.outputs.head_ref }}): $AFTER_PASS passing, $AFTER_FAIL failing"
 
           # Calculate differences
@@ -1233,11 +1179,11 @@ jobs:
             echo "comparison_message=Baseline: $BEFORE_PASS passing, $BEFORE_FAIL failing | Current: $AFTER_PASS passing, $AFTER_FAIL failing" >> $GITHUB_OUTPUT
           fi
         else
-          echo "::warning::No baseline test results found for branch ${{ steps.base_branch.outputs.base_branch }}"
+          echo "::warning::No baseline test results found for branch ${{ needs.pre-setup.outputs.base_branch }}"
           echo "::notice::Cannot compare against base branch - artifacts may not exist or have expired (7-day retention)"
           echo "::notice::Skipping comparison - PR will still be created with warning"
           echo "comparison_status=skipped" >> $GITHUB_OUTPUT
-          echo "comparison_message=No baseline results available from ${{ steps.base_branch.outputs.base_branch }}" >> $GITHUB_OUTPUT
+          echo "comparison_message=No baseline results available from ${{ needs.pre-setup.outputs.base_branch }}" >> $GITHUB_OUTPUT
         fi
 
   create-pr:
@@ -1349,7 +1295,7 @@ jobs:
 
     - name: Fetch base branch for commit comparison
       run: |
-        BASE_BRANCH="${{ needs.compare-kselftest.outputs.base_branch || needs.compare-ltp.outputs.base_branch }}"
+        BASE_BRANCH="${{ needs.pre-setup.outputs.base_branch }}"
         if [ -n "$BASE_BRANCH" ]; then
           # Fetch base branch with enough history to find common ancestor
           git fetch --depth=200 origin "$BASE_BRANCH:refs/remotes/origin/$BASE_BRANCH" || true
@@ -1483,35 +1429,8 @@ jobs:
     - name: Get commit information
       id: commit_msg
       env:
-        GH_TOKEN: ${{ steps.generate_token.outputs.token }}
-        HEAD_REF: ${{ needs.pre-setup.outputs.head_ref }}
-        # See compare-kselftest / compare-ltp: BASE_BRANCH extraction uses the
-        # suffix-stripped form; PR-list query uses the un-stripped remote name.
-        HEAD_REF_BASE: ${{ needs.pre-setup.outputs.head_ref_base }}
-        BASE_REF: ${{ needs.pre-setup.outputs.base_ref }}
+        BASE_BRANCH: ${{ needs.pre-setup.outputs.base_branch }}
       run: |
-        # Use base branch from comparison jobs if available, otherwise detect it here
-        BASE_BRANCH="${{ needs.compare-kselftest.outputs.base_branch || needs.compare-ltp.outputs.base_branch }}"
-
-        if [ -z "$BASE_BRANCH" ]; then
-          # Both comparison jobs were skipped (e.g. pr_only mode) — detect base branch directly
-          BRANCH_NAME="$HEAD_REF_BASE"
-          VALID_BASES="ciqlts9_2 ciqlts9_4 ciqlts8_6 ciqlts9_6 ciq-6.12.y ciq-6.12.y-next ciq-6.18.y ciq-6.18.y-next ciqcbr7_9"
-          EXISTING_PR=$(gh pr list --head "$HEAD_REF" --state open --json number,baseRefName --jq '.[0]' || echo "")
-          if [ -n "$EXISTING_PR" ] && [ "$EXISTING_PR" != "null" ]; then
-            BASE_BRANCH=$(echo "$EXISTING_PR" | jq -r '.baseRefName')
-          elif [ -n "$BASE_REF" ]; then
-            BASE_BRANCH="$BASE_REF"
-          elif [[ "$BRANCH_NAME" =~ ^\{[^}]+\}_(rlc-[0-9]+/.+)$ ]]; then
-            BASE_BRANCH="${BASH_REMATCH[1]}"
-          elif [[ "$BRANCH_NAME" =~ \{[^}]+\}[_-](.+) ]]; then
-            EXTRACTED_BASE="${BASH_REMATCH[1]}"
-            if echo "$VALID_BASES" | grep -wq "$EXTRACTED_BASE"; then
-              BASE_BRANCH="$EXTRACTED_BASE"
-            fi
-          fi
-        fi
-
         if [ -z "$BASE_BRANCH" ]; then
           echo "::error::Could not determine base branch"
           exit 1
@@ -1759,15 +1678,11 @@ jobs:
           HEAD_REF_BASE: ${{ needs.pre-setup.outputs.head_ref_base || needs.pre-setup.outputs.head_ref || github.event.workflow_run.head_branch }}
           HEAD_SHA: ${{ needs.pre-setup.outputs.head_sha || github.event.workflow_run.head_sha }}
           BASE_REF: ${{ needs.pre-setup.outputs.base_ref }}
-          KSELFTEST_BASE: ${{ needs.compare-kselftest.outputs.base_branch }}
-          LTP_BASE: ${{ needs.compare-ltp.outputs.base_branch }}
+          RESOLVED_BASE: ${{ needs.pre-setup.outputs.base_branch }}
         run: |
-          # Whitelist must stay in sync with compare-kselftest / compare-ltp jobs
-          VALID_BASES="ciqlts9_2 ciqlts9_4 ciqlts8_6 ciqlts9_6 ciq-6.12.y ciq-6.12.y-next ciq-6.18.y ciq-6.18.y-next ciqcbr7_9"
-
-          BASE_BRANCH="$KSELFTEST_BASE"
-          [ -z "$BASE_BRANCH" ] && BASE_BRANCH="$LTP_BASE"
+          BASE_BRANCH="$RESOLVED_BASE"
           [ -z "$BASE_BRANCH" ] && BASE_BRANCH="$BASE_REF"
+          # Fallback for when pre-setup didn't resolve the base (e.g. it failed)
           if [ -z "$BASE_BRANCH" ] && [[ "$HEAD_REF_BASE" =~ \{[^}]+\}[_-](.+) ]]; then
             BASE_BRANCH="${BASH_REMATCH[1]}"
           fi
