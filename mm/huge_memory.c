@@ -4100,7 +4100,7 @@ static int __folio_split(struct folio *folio, unsigned int new_order,
 		expected_refs = folio_expected_ref_count(folio) + 1;
 		folio_ref_unfreeze(folio, expected_refs);
 
-		unlock_page_lruvec(lruvec);
+		lruvec_unlock(lruvec);
 
 		if (ci)
 			swap_cluster_unlock(ci);
