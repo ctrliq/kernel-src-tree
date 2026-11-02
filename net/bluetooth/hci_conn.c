@@ -955,6 +955,8 @@ struct hci_conn *hci_conn_add(struct hci_dev *hdev, int type, bdaddr_t *dst,
 	INIT_DELAYED_WORK(&conn->le_conn_timeout, le_conn_timeout);
 	INIT_WORK(&conn->le_scan_cleanup, le_scan_cleanup);
 
+	spin_lock_init(&conn->proto_lock);
+
 	atomic_set(&conn->refcnt, 0);
 
 	hci_dev_hold(hdev);
