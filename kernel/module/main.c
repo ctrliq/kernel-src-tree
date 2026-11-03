@@ -172,6 +172,30 @@ static inline void add_taint_module(struct module *mod, unsigned flag,
 }
 
 /*
+ * Like strncmp(), except s/-/_/g as per scripts/Makefile.lib:name-fix-token rule.
+ */
+static int mod_strncmp(const char *str_a, const char *str_b, size_t n)
+{
+	for (int i = 0; i < n; i++) {
+		char a = str_a[i];
+		char b = str_b[i];
+		int d;
+
+		if (a == '-') a = '_';
+		if (b == '-') b = '_';
+
+		d = a - b;
+		if (d)
+			return d;
+
+		if (!a)
+			break;
+	}
+
+	return 0;
+}
+
+/*
  * A thread that wants to hold a reference to a module only while it
  * is running can call this to safely exit.
  */
@@ -1065,12 +1089,44 @@ static char *get_modinfo(const struct load_info *info, const char *tag)
 	return get_next_modinfo(info, tag, NULL);
 }
 
+/**
+ * verify_module_namespace() - does @modname have access to this symbol's @namespace
+ * @namespace: export symbol namespace
+ * @modname: module name
+ *
+ * If @namespace is prefixed with "module:" to indicate it is a module namespace
+ * then test if @modname matches any of the comma separated patterns.
+ *
+ * The patterns only support tail-glob.
+ */
 static bool verify_module_namespace(const char *namespace, const char *modname)
 {
+	size_t len, modlen = strlen(modname);
 	const char *prefix = "module:";
+	const char *sep;
+	bool glob;
 
-	return strstarts(namespace, prefix) &&
-	       !strcmp(namespace + strlen(prefix), modname);
+	if (!strstarts(namespace, prefix))
+		return false;
+
+	for (namespace += strlen(prefix); *namespace; namespace = sep) {
+		sep = strchrnul(namespace, ',');
+		len = sep - namespace;
+
+		glob = false;
+		if (sep[-1] == '*') {
+			len--;
+			glob = true;
+		}
+
+		if (*sep)
+			sep++;
+
+		if (mod_strncmp(namespace, modname, len) == 0 && (glob || len == modlen))
+			return true;
+	}
+
+	return false;
 }
 
 static int verify_namespace_is_imported(const struct load_info *info,
