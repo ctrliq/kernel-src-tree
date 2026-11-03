@@ -33,6 +33,7 @@
  */
 #include <lib/test_hmm_uapi.h>
 #include <mm/gup_test.h>
+#include <mm/vm_util.h>
 
 struct hmm_buffer {
 	void		*ptr;
@@ -545,7 +546,7 @@ TEST_F(hmm, anon_write_child)
 
 	for (migrate = 0; migrate < 2; ++migrate) {
 		for (use_thp = 0; use_thp < 2; ++use_thp) {
-			npages = ALIGN(use_thp ? TWOMEG : HMM_BUFFER_SIZE,
+			npages = ALIGN(use_thp ? read_pmd_pagesize() : HMM_BUFFER_SIZE,
 				       self->page_size) >> self->page_shift;
 			ASSERT_NE(npages, 0);
 			size = npages << self->page_shift;
@@ -725,7 +726,7 @@ TEST_F(hmm, anon_write_huge)
 	int *ptr;
 	int ret;
 
-	size = 2 * TWOMEG;
+	size = 2 * read_pmd_pagesize();
 
 	buffer = malloc(sizeof(*buffer));
 	ASSERT_NE(buffer, NULL);
@@ -741,7 +742,7 @@ TEST_F(hmm, anon_write_huge)
 			   buffer->fd, 0);
 	ASSERT_NE(buffer->ptr, MAP_FAILED);
 
-	size = TWOMEG;
+	size /= 2;
 	npages = size >> self->page_shift;
 	map = (void *)ALIGN((uintptr_t)buffer->ptr, size);
 	ret = madvise(map, size, MADV_HUGEPAGE);
@@ -768,54 +769,6 @@ TEST_F(hmm, anon_write_huge)
 }
 
 /*
- * Read numeric data from raw and tagged kernel status files.  Used to read
- * /proc and /sys data (without a tag) and from /proc/meminfo (with a tag).
- */
-static long file_read_ulong(char *file, const char *tag)
-{
-	int fd;
-	char buf[2048];
-	int len;
-	char *p, *q;
-	long val;
-
-	fd = open(file, O_RDONLY);
-	if (fd < 0) {
-		/* Error opening the file */
-		return -1;
-	}
-
-	len = read(fd, buf, sizeof(buf));
-	close(fd);
-	if (len < 0) {
-		/* Error in reading the file */
-		return -1;
-	}
-	if (len == sizeof(buf)) {
-		/* Error file is too large */
-		return -1;
-	}
-	buf[len] = '\0';
-
-	/* Search for a tag if provided */
-	if (tag) {
-		p = strstr(buf, tag);
-		if (!p)
-			return -1; /* looks like the line we want isn't there */
-		p += strlen(tag);
-	} else
-		p = buf;
-
-	val = strtol(p, &q, 0);
-	if (*q != ' ') {
-		/* Error parsing the file */
-		return -1;
-	}
-
-	return val;
-}
-
-/*
  * Write huge TLBFS page.
  */
 TEST_F(hmm, anon_write_hugetlbfs)
@@ -823,15 +776,13 @@ TEST_F(hmm, anon_write_hugetlbfs)
 	struct hmm_buffer *buffer;
 	unsigned long npages;
 	unsigned long size;
-	unsigned long default_hsize;
+	unsigned long default_hsize = default_huge_page_size();
 	unsigned long i;
 	int *ptr;
 	int ret;
 
-	default_hsize = file_read_ulong("/proc/meminfo", "Hugepagesize:");
-	if (default_hsize < 0 || default_hsize*1024 < default_hsize)
+	if (!default_hsize)
 		SKIP(return, "Huge page size could not be determined");
-	default_hsize = default_hsize*1024; /* KB to B */
 
 	size = ALIGN(TWOMEG, default_hsize);
 	npages = size >> self->page_shift;
@@ -1603,7 +1554,7 @@ TEST_F(hmm, compound)
 	struct hmm_buffer *buffer;
 	unsigned long npages;
 	unsigned long size;
-	unsigned long default_hsize;
+	unsigned long default_hsize = default_huge_page_size();
 	int *ptr;
 	unsigned char *m;
 	int ret;
@@ -1611,10 +1562,8 @@ TEST_F(hmm, compound)
 
 	/* Skip test if we can't allocate a hugetlbfs page. */
 
-	default_hsize = file_read_ulong("/proc/meminfo", "Hugepagesize:");
-	if (default_hsize < 0 || default_hsize*1024 < default_hsize)
+	if (!default_hsize)
 		SKIP(return, "Huge page size could not be determined");
-	default_hsize = default_hsize*1024; /* KB to B */
 
 	size = ALIGN(TWOMEG, default_hsize);
 	npages = size >> self->page_shift;
@@ -2103,7 +2052,7 @@ TEST_F(hmm, migrate_anon_huge_empty)
 	int *ptr;
 	int ret;
 
-	size = TWOMEG;
+	size = read_pmd_pagesize();
 
 	buffer = malloc(sizeof(*buffer));
 	ASSERT_NE(buffer, NULL);
@@ -2155,7 +2104,7 @@ TEST_F(hmm, migrate_anon_huge_zero)
 	int ret;
 	int val;
 
-	size = TWOMEG;
+	size = read_pmd_pagesize();
 
 	buffer = malloc(sizeof(*buffer));
 	ASSERT_NE(buffer, NULL);
@@ -2218,7 +2167,7 @@ TEST_F(hmm, migrate_anon_huge_free)
 	int *ptr;
 	int ret;
 
-	size = TWOMEG;
+	size = read_pmd_pagesize();
 
 	buffer = malloc(sizeof(*buffer));
 	ASSERT_NE(buffer, NULL);
@@ -2277,7 +2226,7 @@ TEST_F(hmm, migrate_anon_huge_fault)
 	int *ptr;
 	int ret;
 
-	size = TWOMEG;
+	size = read_pmd_pagesize();
 
 	buffer = malloc(sizeof(*buffer));
 	ASSERT_NE(buffer, NULL);
@@ -2329,7 +2278,7 @@ TEST_F(hmm, migrate_partial_unmap_fault)
 {
 	struct hmm_buffer *buffer;
 	unsigned long npages;
-	unsigned long size = TWOMEG;
+	unsigned long size = read_pmd_pagesize();
 	unsigned long i;
 	void *old_ptr;
 	void *map;
@@ -2395,7 +2344,7 @@ TEST_F(hmm, migrate_remap_fault)
 {
 	struct hmm_buffer *buffer;
 	unsigned long npages;
-	unsigned long size = TWOMEG;
+	unsigned long size = read_pmd_pagesize();
 	unsigned long i;
 	void *old_ptr, *new_ptr = NULL;
 	void *map;
@@ -2495,7 +2444,7 @@ TEST_F(hmm, migrate_anon_huge_err)
 	int *ptr;
 	int ret;
 
-	size = TWOMEG;
+	size = read_pmd_pagesize();
 
 	buffer = malloc(sizeof(*buffer));
 	ASSERT_NE(buffer, NULL);
@@ -2590,7 +2539,7 @@ TEST_F(hmm, migrate_anon_huge_zero_err)
 	int *ptr;
 	int ret;
 
-	size = TWOMEG;
+	size = read_pmd_pagesize();
 
 	buffer = malloc(sizeof(*buffer));
 	ASSERT_NE(buffer, NULL);
