@@ -165,8 +165,17 @@ static int transport_add_class_device(struct attribute_container *cont,
 			goto err_del;
 	}
 
+	if (tcont->encryption) {
+		error = sysfs_create_group(&classdev->kobj, tcont->encryption);
+		if (error)
+			goto err_del_statistics;
+	}
+
 	return 0;
 
+err_del_statistics:
+	if (tcont->statistics)
+		sysfs_remove_group(&classdev->kobj, tcont->statistics);
 err_del:
 	attribute_container_class_device_del(classdev);
 err_remove:
@@ -240,6 +249,8 @@ static int transport_remove_classdev(struct attribute_container *cont,
 	if (tclass->remove != anon_transport_dummy_function) {
 		if (tcont->statistics)
 			sysfs_remove_group(&classdev->kobj, tcont->statistics);
+		if (tcont->encryption)
+			sysfs_remove_group(&classdev->kobj, tcont->encryption);
 		attribute_container_class_device_del(classdev);
 	}
 

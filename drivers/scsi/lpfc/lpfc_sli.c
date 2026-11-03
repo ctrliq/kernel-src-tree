@@ -1,7 +1,7 @@
 /*******************************************************************
  * This file is part of the Emulex Linux Device Driver for         *
  * Fibre Channel Host Bus Adapters.                                *
- * Copyright (C) 2017-2025 Broadcom. All Rights Reserved. The term *
+ * Copyright (C) 2017-2026 Broadcom. All Rights Reserved. The term *
  * “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.     *
  * Copyright (C) 2004-2016 Emulex.  All rights reserved.           *
  * EMULEX and SLI are trademarks of Emulex.                        *
@@ -25,6 +25,7 @@
 #include <linux/pci.h>
 #include <linux/interrupt.h>
 #include <linux/delay.h>
+#include <linux/seq_buf.h>
 #include <linux/slab.h>
 #include <linux/lockdep.h>
 #include <linux/dmi.h>
@@ -136,14 +137,11 @@ void lpfc_wqe_cmd_template(void)
 	bf_set(wqe_dbde, &wqe->fcp_iread.wqe_com, 0);
 	bf_set(wqe_wqes, &wqe->fcp_iread.wqe_com, 1);
 
-	/* Word 11 - pbde is variable */
+	/* Word 11 */
 	bf_set(wqe_cmd_type, &wqe->fcp_iread.wqe_com, COMMAND_DATA_IN);
 	bf_set(wqe_cqid, &wqe->fcp_iread.wqe_com, LPFC_WQE_CQ_ID_DEFAULT);
-	bf_set(wqe_pbde, &wqe->fcp_iread.wqe_com, 0);
 
 	/* Word 12 - is zero */
-
-	/* Word 13, 14, 15 - PBDE is variable */
 
 	/* IWRITE template */
 	wqe = &lpfc_iwrite_cmd_template;
@@ -176,14 +174,11 @@ void lpfc_wqe_cmd_template(void)
 	bf_set(wqe_dbde, &wqe->fcp_iwrite.wqe_com, 0);
 	bf_set(wqe_wqes, &wqe->fcp_iwrite.wqe_com, 1);
 
-	/* Word 11 - pbde is variable */
+	/* Word 11 */
 	bf_set(wqe_cmd_type, &wqe->fcp_iwrite.wqe_com, COMMAND_DATA_OUT);
 	bf_set(wqe_cqid, &wqe->fcp_iwrite.wqe_com, LPFC_WQE_CQ_ID_DEFAULT);
-	bf_set(wqe_pbde, &wqe->fcp_iwrite.wqe_com, 0);
 
 	/* Word 12 - is zero */
-
-	/* Word 13, 14, 15 - PBDE is variable */
 
 	/* ICMND template */
 	wqe = &lpfc_icmnd_cmd_template;
@@ -217,7 +212,6 @@ void lpfc_wqe_cmd_template(void)
 	/* Word 11 */
 	bf_set(wqe_cmd_type, &wqe->fcp_icmd.wqe_com, COMMAND_DATA_IN);
 	bf_set(wqe_cqid, &wqe->fcp_icmd.wqe_com, LPFC_WQE_CQ_ID_DEFAULT);
-	bf_set(wqe_pbde, &wqe->fcp_icmd.wqe_com, 0);
 
 	/* Word 12, 13, 14, 15 - is zero */
 }
@@ -4566,59 +4560,41 @@ void
 lpfc_sli_abort_iocb_ring(struct lpfc_hba *phba, struct lpfc_sli_ring *pring)
 {
 	LIST_HEAD(tx_completions);
-	LIST_HEAD(txcmplq_completions);
+	spinlock_t *plock;		/* for transmit queue access */
 	struct lpfc_iocbq *iocb, *next_iocb;
 	int offline;
 
-	if (pring->ringno == LPFC_ELS_RING) {
+	if (phba->sli_rev >= LPFC_SLI_REV4)
+		plock = &pring->ring_lock;
+	else
+		plock = &phba->hbalock;
+
+	if (pring->ringno == LPFC_ELS_RING)
 		lpfc_fabric_abort_hba(phba);
-	}
+
 	offline = pci_channel_offline(phba->pcidev);
 
-	/* Error everything on txq and txcmplq
-	 * First do the txq.
-	 */
-	if (phba->sli_rev >= LPFC_SLI_REV4) {
-		spin_lock_irq(&pring->ring_lock);
-		list_splice_init(&pring->txq, &tx_completions);
-		pring->txq_cnt = 0;
-
-		if (offline) {
-			list_splice_init(&pring->txcmplq,
-					 &txcmplq_completions);
-		} else {
-			/* Next issue ABTS for everything on the txcmplq */
-			list_for_each_entry_safe(iocb, next_iocb,
-						 &pring->txcmplq, list)
-				lpfc_sli_issue_abort_iotag(phba, pring,
-							   iocb, NULL);
-		}
-		spin_unlock_irq(&pring->ring_lock);
-	} else {
-		spin_lock_irq(&phba->hbalock);
-		list_splice_init(&pring->txq, &tx_completions);
-		pring->txq_cnt = 0;
-
-		if (offline) {
-			list_splice_init(&pring->txcmplq, &txcmplq_completions);
-		} else {
-			/* Next issue ABTS for everything on the txcmplq */
-			list_for_each_entry_safe(iocb, next_iocb,
-						 &pring->txcmplq, list)
-				lpfc_sli_issue_abort_iotag(phba, pring,
-							   iocb, NULL);
-		}
-		spin_unlock_irq(&phba->hbalock);
-	}
+	/* Cancel everything on txq */
+	spin_lock_irq(plock);
+	list_splice_init(&pring->txq, &tx_completions);
+	pring->txq_cnt = 0;
 
 	if (offline) {
-		/* Cancel all the IOCBs from the completions list */
-		lpfc_sli_cancel_iocbs(phba, &txcmplq_completions,
-				      IOSTAT_LOCAL_REJECT, IOERR_SLI_ABORTED);
+		/* Cancel everything on txcmplq */
+		list_for_each_entry_safe(iocb, next_iocb, &pring->txcmplq, list)
+			iocb->cmd_flag &= ~LPFC_IO_ON_TXCMPLQ;
+		list_splice_init(&pring->txcmplq, &tx_completions);
+		pring->txcmplq_cnt = 0;
 	} else {
-		/* Make sure HBA is alive */
-		lpfc_issue_hb_tmo(phba);
+		/* Issue ABTS for everything on the txcmplq */
+		list_for_each_entry_safe(iocb, next_iocb, &pring->txcmplq, list)
+			lpfc_sli_issue_abort_iotag(phba, pring, iocb, NULL);
 	}
+	spin_unlock_irq(plock);
+
+	if (!offline)
+		lpfc_issue_hb_tmo(phba);
+
 	/* Cancel all the IOCBs from the completions list */
 	lpfc_sli_cancel_iocbs(phba, &tx_completions, IOSTAT_LOCAL_REJECT,
 			      IOERR_SLI_ABORTED);
@@ -8130,17 +8106,18 @@ u32 lpfc_rx_monitor_report(struct lpfc_hba *phba,
 	u32 cnt = 0;
 	char tmp[DBG_LOG_STR_SZ] = {0};
 	bool log_to_kmsg = (!buf || !buf_len) ? true : false;
+	struct seq_buf s;
 
 	if (!log_to_kmsg) {
 		/* clear the buffer to be sure */
 		memset(buf, 0, buf_len);
 
-		scnprintf(buf, buf_len, "\t%-16s%-16s%-16s%-16s%-8s%-8s%-8s"
-					"%-8s%-8s%-8s%-16s\n",
-					"MaxBPI", "Tot_Data_CMF",
-					"Tot_Data_Cmd", "Tot_Data_Cmpl",
-					"Lat(us)", "Avg_IO", "Max_IO", "Bsy",
-					"IO_cnt", "Info", "BWutil(ms)");
+		seq_buf_init(&s, buf, buf_len);
+		seq_buf_printf(&s, "\t%-16s%-16s%-16s%-16s%-8s%-8s%-8s%-8s%-8s%-8s%-16s\n",
+			       "MaxBPI", "Tot_Data_CMF",
+			       "Tot_Data_Cmd", "Tot_Data_Cmpl",
+			       "Lat(us)", "Avg_IO", "Max_IO", "Bsy",
+			       "IO_cnt", "Info", "BWutil(ms)");
 	}
 
 	/* Needs to be _irq because record is called from timer interrupt
@@ -8152,24 +8129,27 @@ u32 lpfc_rx_monitor_report(struct lpfc_hba *phba,
 
 		/* Read out this entry's data. */
 		if (!log_to_kmsg) {
-			/* If !log_to_kmsg, then store to buf. */
+			/*
+			 * Drop a record whole if it does not fit, without
+			 * consuming its ring entry.
+			 */
 			scnprintf(tmp, sizeof(tmp),
-				  "%03d:\t%-16llu%-16llu%-16llu%-16llu%-8llu"
-				  "%-8llu%-8llu%-8u%-8u%-8u%u(%u)\n",
-				  *head_idx, entry->max_bytes_per_interval,
-				  entry->cmf_bytes, entry->total_bytes,
-				  entry->rcv_bytes, entry->avg_io_latency,
-				  entry->avg_io_size, entry->max_read_cnt,
+				  "%03d:\t%-16llu%-16llu%-16llu%-16llu%-8llu%-8llu%-8llu%-8u%-8u%-8u%u(%u)\n",
+				  *head_idx,
+				  entry->max_bytes_per_interval,
+				  entry->cmf_bytes,
+				  entry->total_bytes,
+				  entry->rcv_bytes,
+				  entry->avg_io_latency,
+				  entry->avg_io_size,
+				  entry->max_read_cnt,
 				  entry->cmf_busy, entry->io_cnt,
-				  entry->cmf_info, entry->timer_utilization,
+				  entry->cmf_info,
+				  entry->timer_utilization,
 				  entry->timer_interval);
 
-			/* Check for buffer overflow */
-			if ((strlen(buf) + strlen(tmp)) >= buf_len)
+			if (seq_buf_puts(&s, tmp) < 0)
 				break;
-
-			/* Append entry's data to buffer */
-			strlcat(buf, tmp, buf_len);
 		} else {
 			lpfc_printf_log(phba, KERN_INFO, LOG_CGN_MGMT,
 					"4410 %02u: MBPI %llu Xmit %llu "
@@ -8745,14 +8725,6 @@ lpfc_sli4_hba_setup(struct lpfc_hba *phba)
 		lpfc_printf_log(phba, KERN_WARNING, LOG_MBOX | LOG_SLI,
 				"0378 No support for fcpi mode.\n");
 		ftr_rsp++;
-	}
-
-	/* Performance Hints are ONLY for FCoE */
-	if (test_bit(HBA_FCOE_MODE, &phba->hba_flag)) {
-		if (bf_get(lpfc_mbx_rq_ftr_rsp_perfh, &mqe->un.req_ftrs))
-			phba->sli3_options |= LPFC_SLI4_PERFH_ENABLED;
-		else
-			phba->sli3_options &= ~LPFC_SLI4_PERFH_ENABLED;
 	}
 
 	/*
@@ -12759,8 +12731,12 @@ lpfc_sli_sum_iocb(struct lpfc_vport *vport, uint16_t tgt_id, uint64_t lun_id,
 
 		if (!iocbq || iocbq->vport != vport)
 			continue;
-		if (!(iocbq->cmd_flag & LPFC_IO_FCP) ||
-		    !(iocbq->cmd_flag & LPFC_IO_ON_TXCMPLQ))
+		/* Only count FCP i/o */
+		if (!(iocbq->cmd_flag & LPFC_IO_FCP))
+			continue;
+		/* Count i/o whilst LLDD retains an interest in the scsi_cmnd */
+		if (!(iocbq->cmd_flag &
+				(LPFC_IO_ON_TXCMPLQ | LPFC_DRIVER_ABORTED)))
 			continue;
 
 		/* Include counting outstanding aborts */
@@ -14358,13 +14334,15 @@ lpfc_sli4_sp_handle_mbox_event(struct lpfc_hba *phba, struct lpfc_mcqe *mcqe)
 	/* Get the reference to the active mbox command */
 	spin_lock_irqsave(&phba->hbalock, iflags);
 	pmb = phba->sli.mbox_active;
+	spin_unlock_irqrestore(&phba->hbalock, iflags);
 	if (unlikely(!pmb)) {
 		lpfc_printf_log(phba, KERN_ERR, LOG_TRACE_EVENT,
-				"1832 No pending MBOX command to handle\n");
-		spin_unlock_irqrestore(&phba->hbalock, iflags);
+				"1832 No pending MBOX command to handle, "
+				"mcqe: x%08x x%08x x%08x x%08x\n",
+				mcqe->word0, mcqe->mcqe_tag0,
+				mcqe->mcqe_tag1, mcqe->trailer);
 		goto out_no_mqe_complete;
 	}
-	spin_unlock_irqrestore(&phba->hbalock, iflags);
 	mqe = &pmb->u.mqe;
 	pmbox = (MAILBOX_t *)&pmb->u.mqe;
 	mbox = phba->mbox;
@@ -14739,11 +14717,22 @@ lpfc_sli4_sp_handle_rcqe(struct lpfc_hba *phba, struct lpfc_rcqe *rcqe)
 					atomic_read(&tgtp->rcv_fcp_cmd_out),
 					atomic_read(&tgtp->xmt_fcp_release));
 		}
+		hrq->RQ_discard_frm++;
 		fallthrough;
-
 	case FC_STATUS_INSUFF_BUF_NEED_BUF:
+		/* Unexpected event - bump the counter for support. */
 		hrq->RQ_no_posted_buf++;
-		/* Post more buffers if possible */
+
+		lpfc_log_msg(phba, KERN_WARNING,
+			     LOG_ELS | LOG_DISCOVERY | LOG_SLI,
+			     "6423 RQE completion Status x%x, needed x%x "
+			     "discarded x%x\n", status,
+			     hrq->RQ_no_posted_buf - hrq->RQ_discard_frm,
+			     hrq->RQ_discard_frm);
+
+		/* For SLI3, post more buffers if possible. No action for SLI4.
+		 * SLI4 is reposting immediately after processing the RQE.
+		 */
 		set_bit(HBA_POST_RECEIVE_BUFFER, &phba->hba_flag);
 		workposted = true;
 		break;
@@ -15980,6 +15969,32 @@ lpfc_dual_chute_pci_bar_map(struct lpfc_hba *phba, uint16_t pci_barset)
 	return NULL;
 }
 
+static __maybe_unused void __iomem *
+lpfc_dpp_wc_map(struct lpfc_hba *phba, uint8_t dpp_barset)
+{
+
+	/* DPP region is supposed to cover 64-bit BAR2 */
+	if (dpp_barset != WQ_PCI_BAR_4_AND_5) {
+		lpfc_log_msg(phba, KERN_WARNING, LOG_INIT,
+			     "3273 dpp_barset x%x != WQ_PCI_BAR_4_AND_5\n",
+			     dpp_barset);
+		return NULL;
+	}
+
+	if (!phba->sli4_hba.dpp_regs_memmap_wc_p) {
+		void __iomem *dpp_map;
+
+		dpp_map = ioremap_wc(phba->pci_bar2_map,
+				     pci_resource_len(phba->pcidev,
+						      PCI_64BIT_BAR4));
+
+		if (dpp_map)
+			phba->sli4_hba.dpp_regs_memmap_wc_p = dpp_map;
+	}
+
+	return phba->sli4_hba.dpp_regs_memmap_wc_p;
+}
+
 /**
  * lpfc_modify_hba_eq_delay - Modify Delay Multiplier on EQs
  * @phba: HBA structure that EQs are on.
@@ -16943,9 +16958,6 @@ lpfc_wq_create(struct lpfc_hba *phba, struct lpfc_queue *wq,
 	uint8_t dpp_barset;
 	uint32_t dpp_offset;
 	uint8_t wq_create_version;
-#ifdef CONFIG_X86
-	unsigned long pg_addr;
-#endif
 
 	/* sanity check on queue memory */
 	if (!wq || !cq)
@@ -17131,14 +17143,15 @@ lpfc_wq_create(struct lpfc_hba *phba, struct lpfc_queue *wq,
 
 #ifdef CONFIG_X86
 			/* Enable combined writes for DPP aperture */
-			pg_addr = (unsigned long)(wq->dpp_regaddr) & PAGE_MASK;
-			rc = set_memory_wc(pg_addr, 1);
-			if (rc) {
+			bar_memmap_p = lpfc_dpp_wc_map(phba, dpp_barset);
+			if (!bar_memmap_p) {
 				lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
 					"3272 Cannot setup Combined "
 					"Write on WQ[%d] - disable DPP\n",
 					wq->queue_id);
 				phba->cfg_enable_dpp = 0;
+			} else {
+				wq->dpp_regaddr = bar_memmap_p + dpp_offset;
 			}
 #else
 			phba->cfg_enable_dpp = 0;
@@ -20431,62 +20444,36 @@ lpfc_check_next_fcf_pri_level(struct lpfc_hba *phba)
 uint16_t
 lpfc_sli4_fcf_rr_next_index_get(struct lpfc_hba *phba)
 {
-	uint16_t next_fcf_index;
+	uint16_t next;
 
-initial_priority:
-	/* Search start from next bit of currently registered FCF index */
-	next_fcf_index = phba->fcf.current_rec.fcf_indx;
+	do {
+		for_each_set_bit_wrap(next, phba->fcf.fcf_rr_bmask,
+				LPFC_SLI4_FCF_TBL_INDX_MAX, phba->fcf.current_rec.fcf_indx) {
+			if (next == phba->fcf.current_rec.fcf_indx)
+				continue;
 
-next_priority:
-	/* Determine the next fcf index to check */
-	next_fcf_index = (next_fcf_index + 1) % LPFC_SLI4_FCF_TBL_INDX_MAX;
-	next_fcf_index = find_next_bit(phba->fcf.fcf_rr_bmask,
-				       LPFC_SLI4_FCF_TBL_INDX_MAX,
-				       next_fcf_index);
+			if (!(phba->fcf.fcf_pri[next].fcf_rec.flag & LPFC_FCF_FLOGI_FAILED)) {
+				lpfc_printf_log(phba, KERN_INFO, LOG_FIP,
+					"2845 Get next roundrobin failover FCF (x%x)\n", next);
+				return next;
+			}
 
-	/* Wrap around condition on phba->fcf.fcf_rr_bmask */
-	if (next_fcf_index >= LPFC_SLI4_FCF_TBL_INDX_MAX) {
-		/*
-		 * If we have wrapped then we need to clear the bits that
-		 * have been tested so that we can detect when we should
-		 * change the priority level.
-		 */
-		next_fcf_index = find_first_bit(phba->fcf.fcf_rr_bmask,
-					       LPFC_SLI4_FCF_TBL_INDX_MAX);
-	}
+			if (list_is_singular(&phba->fcf.fcf_pri_list))
+				return LPFC_FCOE_FCF_NEXT_NONE;
+		}
 
-
-	/* Check roundrobin failover list empty condition */
-	if (next_fcf_index >= LPFC_SLI4_FCF_TBL_INDX_MAX ||
-		next_fcf_index == phba->fcf.current_rec.fcf_indx) {
 		/*
 		 * If next fcf index is not found check if there are lower
 		 * Priority level fcf's in the fcf_priority list.
 		 * Set up the rr_bmask with all of the avaiable fcf bits
 		 * at that level and continue the selection process.
 		 */
-		if (lpfc_check_next_fcf_pri_level(phba))
-			goto initial_priority;
-		lpfc_printf_log(phba, KERN_WARNING, LOG_FIP,
-				"2844 No roundrobin failover FCF available\n");
+	} while (lpfc_check_next_fcf_pri_level(phba));
 
-		return LPFC_FCOE_FCF_NEXT_NONE;
-	}
+	lpfc_printf_log(phba, KERN_WARNING, LOG_FIP,
+			"2844 No roundrobin failover FCF available\n");
 
-	if (next_fcf_index < LPFC_SLI4_FCF_TBL_INDX_MAX &&
-		phba->fcf.fcf_pri[next_fcf_index].fcf_rec.flag &
-		LPFC_FCF_FLOGI_FAILED) {
-		if (list_is_singular(&phba->fcf.fcf_pri_list))
-			return LPFC_FCOE_FCF_NEXT_NONE;
-
-		goto next_priority;
-	}
-
-	lpfc_printf_log(phba, KERN_INFO, LOG_FIP,
-			"2845 Get next roundrobin failover FCF (x%x)\n",
-			next_fcf_index);
-
-	return next_fcf_index;
+	return LPFC_FCOE_FCF_NEXT_NONE;
 }
 
 /**
