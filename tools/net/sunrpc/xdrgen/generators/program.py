@@ -38,6 +38,8 @@ def emit_version_declarations(
     arguments = dict.fromkeys([])
     for procedure in version.procedures:
         if procedure.name not in excluded_apis:
+            if procedure.argument.type_name == "void":
+                continue
             arguments[procedure.argument.type_name] = None
     if len(arguments) > 0:
         print("")
@@ -48,6 +50,8 @@ def emit_version_declarations(
     results = dict.fromkeys([])
     for procedure in version.procedures:
         if procedure.name not in excluded_apis:
+            if procedure.result.type_name == "void":
+                continue
             results[procedure.result.type_name] = None
     if len(results) > 0:
         print("")
@@ -63,6 +67,8 @@ def emit_version_argument_decoders(
     arguments = dict.fromkeys([])
     for procedure in version.procedures:
         if procedure.name not in excluded_apis:
+            if procedure.argument.type_name == "void":
+                continue
             arguments[procedure.argument.type_name] = None
 
     template = environment.get_template("decoder/argument.j2")
@@ -105,6 +111,8 @@ def emit_version_result_encoders(
     results = dict.fromkeys([])
     for procedure in version.procedures:
         if procedure.name not in excluded_apis:
+            if procedure.result.type_name == "void":
+                continue
             results[procedure.result.type_name] = None
 
     template = environment.get_template("encoder/result.j2")
@@ -127,6 +135,9 @@ class XdrProgramGenerator(SourceGenerator):
 
         for version in node.versions:
             emit_version_definitions(self.environment, program, version)
+
+        template = self.environment.get_template("definition/program.j2")
+        print(template.render(name=raw_name, value=node.number))
 
     def emit_declaration(self, node: _RpcProgram) -> None:
         """Emit a declaration pair for each of an RPC programs's procedures"""
