@@ -13,10 +13,6 @@ import sys
 # CommitTags and parse_commit() in kmt and genlog.py should match
 class CommitTags:
     tag_patterns = {
-        'Bugzilla': [
-            r'(\d{4,8})\s*$',
-            r'https?://bugzilla\.redhat\.com/(?:show_bug\.cgi\?id=)?(\d{4,8})',
-        ],
         'JIRA': [r'https://(?:issues\.redhat\.com|redhat\.atlassian\.net)/(?:browse|projects/RHEL/issues)/(RHEL-\d{1,8})'],
         'CVE': [r'(CVE-\d{4}-\d{4,7})'],
         'MR': [r'(.*)'],
@@ -24,7 +20,6 @@ class CommitTags:
         'Patchwork-id': [r'(.*)'],
         'Patchwork-instance': [r'(.*)'],
     }
-    tag_patterns['Y-Bugzilla'] = tag_patterns['Bugzilla']
     tag_patterns['Y-JIRA'] = tag_patterns['JIRA']
     tag_patterns['O-JIRA'] = tag_patterns['JIRA']
 
@@ -56,7 +51,7 @@ class CommitTags:
 
     def get_changelog_str(self):
         chnglog = []
-        tickets = sorted(self.tag_dict['Bugzilla']) + sorted(self.tag_dict['JIRA'])
+        tickets = sorted(self.tag_dict['JIRA'])
         if tickets:
             chnglog.append('[' + ' '.join(tickets) + ']')
         if self.tag_dict['CVE']:
@@ -64,12 +59,7 @@ class CommitTags:
         return ' '.join(chnglog)
 
     def get_resolved_tickets(self):
-        ret = set()
-        for ticket in sorted(self.tag_dict['Bugzilla']) + sorted(self.tag_dict['JIRA']):
-            if ticket.isnumeric():
-                ticket = 'rhbz#' + ticket
-            ret.add(ticket)
-        return ret
+        return set(sorted(self.tag_dict['JIRA']))
 
 
 def parse_commit(commit):
