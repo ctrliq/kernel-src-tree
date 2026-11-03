@@ -11,6 +11,7 @@
 #include <linux/module.h>
 #include <linux/uaccess.h>
 #include <linux/kvm_host.h>
+#include <asm/kvm_mmu.h>
 
 const struct kvm_stats_desc kvm_vm_stats_desc[] = {
 	KVM_GENERIC_VM_STATS()
@@ -31,13 +32,13 @@ int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
 {
 	int r;
 
-	r = kvm_riscv_gstage_alloc_pgd(kvm);
+	r = kvm_riscv_mmu_alloc_pgd(kvm);
 	if (r)
 		return r;
 
 	r = kvm_riscv_gstage_vmid_init(kvm);
 	if (r) {
-		kvm_riscv_gstage_free_pgd(kvm);
+		kvm_riscv_mmu_free_pgd(kvm);
 		return r;
 	}
 
@@ -199,7 +200,10 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 		r = KVM_USER_MEM_SLOTS;
 		break;
 	case KVM_CAP_VM_GPA_BITS:
-		r = kvm_riscv_gstage_gpa_bits();
+		if (!kvm)
+			r = kvm_riscv_gstage_gpa_bits(kvm_riscv_gstage_max_pgd_levels);
+		else
+			r = kvm_riscv_gstage_gpa_bits(kvm->arch.pgd_levels);
 		break;
 	default:
 		r = 0;
@@ -207,6 +211,59 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 	}
 
 	return r;
+}
+
+int kvm_vm_ioctl_enable_cap(struct kvm *kvm, struct kvm_enable_cap *cap)
+{
+	if (cap->flags)
+		return -EINVAL;
+
+	switch (cap->cap) {
+	case KVM_CAP_RISCV_MP_STATE_RESET:
+		kvm->arch.mp_state_reset = true;
+		return 0;
+	case KVM_CAP_VM_GPA_BITS: {
+		unsigned long gpa_bits = cap->args[0];
+		unsigned long new_levels;
+		int r = 0;
+
+		/* Decide target pgd levels from requested gpa_bits */
+#ifdef CONFIG_64BIT
+		if (gpa_bits <= 41)
+			new_levels = 3;        /* Sv39x4 */
+		else if (gpa_bits <= 50)
+			new_levels = 4;        /* Sv48x4 */
+		else if (gpa_bits <= 59)
+			new_levels = 5;        /* Sv57x4 */
+		else
+			return -EINVAL;
+#else
+		/* 32-bit: only Sv32x4*/
+		if (gpa_bits <= 34)
+			new_levels = 2;
+		else
+			return -EINVAL;
+#endif
+		if (new_levels > kvm_riscv_gstage_max_pgd_levels)
+			return -EINVAL;
+
+		/* Follow KVM's lock ordering: kvm->lock -> kvm->slots_lock. */
+		mutex_lock(&kvm->lock);
+		mutex_lock(&kvm->slots_lock);
+
+		if (kvm->created_vcpus || !kvm_are_all_memslots_empty(kvm))
+			r = -EBUSY;
+		else
+			kvm->arch.pgd_levels = new_levels;
+
+		mutex_unlock(&kvm->slots_lock);
+		mutex_unlock(&kvm->lock);
+
+		return r;
+	}
+	default:
+		return -EINVAL;
+	}
 }
 
 int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)

@@ -75,16 +75,13 @@ static struct resource *standard_resources;
 static int __init add_resource(struct resource *parent,
 				struct resource *res)
 {
-	int ret = 0;
+	int ret;
 
 	ret = insert_resource(parent, res);
-	if (ret < 0) {
-		pr_err("Failed to add a %s resource at %llx\n",
-			res->name, (unsigned long long) res->start);
-		return ret;
-	}
+	if (ret < 0)
+		pr_err("Failed to add resource %s %pR\n", res->name, res);
 
-	return 1;
+	return ret;
 }
 
 static int __init add_kernel_resources(void)
@@ -272,11 +269,6 @@ static void __init parse_dtb(void)
 	} else {
 		pr_err("No DTB passed to the kernel\n");
 	}
-
-#ifdef CONFIG_CMDLINE_FORCE
-	strscpy(boot_command_line, CONFIG_CMDLINE, COMMAND_LINE_SIZE);
-	pr_info("Forcing kernel command line to: %s\n", boot_command_line);
-#endif
 }
 
 #if defined(CONFIG_RISCV_COMBO_SPINLOCKS)
@@ -295,6 +287,7 @@ static void __init riscv_spinlock_init(void)
 
 	if (IS_ENABLED(CONFIG_RISCV_ISA_ZABHA) &&
 	    IS_ENABLED(CONFIG_RISCV_ISA_ZACAS) &&
+	    IS_ENABLED(CONFIG_TOOLCHAIN_HAS_ZACAS) &&
 	    riscv_isa_extension_available(NULL, ZABHA) &&
 	    riscv_isa_extension_available(NULL, ZACAS)) {
 		using_ext = "using Zabha";
@@ -375,6 +368,8 @@ void __init setup_arch(char **cmdline_p)
 
 	if (!IS_ENABLED(CONFIG_RISCV_ISA_ZBB) || !riscv_isa_extension_available(NULL, ZBB))
 		static_branch_disable(&efficient_ffs_key);
+
+	riscv_clear_hypervisor_csr();
 }
 
 bool arch_cpu_is_hotpluggable(int cpu)
