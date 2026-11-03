@@ -302,9 +302,15 @@ int __init evm_init_secfs(void)
 {
 	int error = 0;
 
-	evm_dir = securityfs_create_dir("evm", integrity_dir);
-	if (!evm_dir || IS_ERR(evm_dir))
+	error = integrity_fs_init();
+	if (error < 0)
 		return -EFAULT;
+
+	evm_dir = securityfs_create_dir("evm", integrity_dir);
+	if (!evm_dir || IS_ERR(evm_dir)) {
+		error = -EFAULT;
+		goto out;
+	}
 
 	evm_init_tpm = securityfs_create_file("evm", 0660,
 					      evm_dir, NULL, &evm_key_ops);
@@ -330,5 +336,6 @@ out:
 	securityfs_remove(evm_symlink);
 	securityfs_remove(evm_init_tpm);
 	securityfs_remove(evm_dir);
+	integrity_fs_fini();
 	return error;
 }
