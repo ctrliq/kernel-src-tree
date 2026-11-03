@@ -2002,7 +2002,7 @@ static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
 		if (likely(pte_present(pteval))) {
 			pfn = pte_pfn(pteval);
 		} else {
-			pfn = swp_offset_pfn(pte_to_swp_entry(pteval));
+			pfn = softleaf_to_pfn(pte_to_swp_entry(pteval));
 			VM_WARN_ON_FOLIO(folio_test_hugetlb(folio), folio);
 		}
 
@@ -2406,7 +2406,7 @@ static bool try_to_migrate_one(struct folio *folio, struct vm_area_struct *vma,
 		if (likely(pte_present(pteval))) {
 			pfn = pte_pfn(pteval);
 		} else {
-			pfn = swp_offset_pfn(pte_to_swp_entry(pteval));
+			pfn = softleaf_to_pfn(pte_to_swp_entry(pteval));
 			VM_WARN_ON_FOLIO(folio_test_hugetlb(folio), folio);
 		}
 
@@ -2489,8 +2489,11 @@ static bool try_to_migrate_one(struct folio *folio, struct vm_area_struct *vma,
 				folio_mark_dirty(folio);
 			writable = pte_write(pteval);
 		} else {
+			const softleaf_t entry = softleaf_from_pte(pteval);
+
 			pte_clear(mm, address, pvmw.pte);
-			writable = is_writable_device_private_entry(pte_to_swp_entry(pteval));
+
+			writable = softleaf_is_device_private_write(entry);
 		}
 
 		VM_WARN_ON_FOLIO(writable && folio_test_anon(folio) &&
