@@ -7618,7 +7618,7 @@ static int check_helper_mem_access(struct bpf_verifier_env *env, int regno,
 				zero_size_allowed, ACCESS_HELPER, meta);
 	case PTR_TO_BTF_ID:
 		return check_ptr_to_btf_access(env, regs, regno, reg->off,
-					       access_size, BPF_READ, -1);
+					       access_size, access_type, -1);
 	case PTR_TO_CTX:
 		/* in case the function doesn't know how to access the context,
 		 * (because we are in a program of type SYSCALL for example), we
