@@ -48,6 +48,8 @@ void bpf_lsm_find_cgroup_shim(const struct bpf_prog *prog, bpf_func_t *bpf_func)
 
 int bpf_lsm_get_retval_range(const struct bpf_prog *prog,
 			     struct bpf_retval_range *range);
+bool bpf_lsm_hook_returns_errno(u32 btf_id);
+
 #else /* !CONFIG_BPF_LSM */
 
 static inline bool bpf_lsm_is_sleepable_hook(u32 btf_id)
@@ -85,6 +87,11 @@ static inline int bpf_lsm_get_retval_range(const struct bpf_prog *prog,
 					   struct bpf_retval_range *range)
 {
 	return -EOPNOTSUPP;
+}
+
+static inline bool bpf_lsm_hook_returns_errno(u32 btf_id)
+{
+	return true;
 }
 #endif /* CONFIG_BPF_LSM */
 
