@@ -38,6 +38,8 @@ extern unsigned int		nlm_debug;
 do {									\
 	ifdebug(fac)							\
 		printk(KERN_DEFAULT fmt, ##__VA_ARGS__);		\
+	else								\
+		no_printk(fmt, ##__VA_ARGS__);				\
 } while (0)
 
 # define dfprintk_cont(fac, fmt, ...)					\
@@ -52,7 +54,8 @@ do {									\
 		rcu_read_lock();					\
 		printk(KERN_DEFAULT fmt, ##__VA_ARGS__);		\
 		rcu_read_unlock();					\
-	}								\
+	} else								\
+		no_printk(fmt, ##__VA_ARGS__);				\
 } while (0)
 
 # define dfprintk_rcu_cont(fac, fmt, ...)				\
@@ -67,9 +70,9 @@ do {									\
 # define RPC_IFDEBUG(x)		x
 #else
 # define ifdebug(fac)		if (0)
-# define dfprintk(fac, fmt, ...)	do {} while (0)
+# define dfprintk(fac, fmt, ...)	no_printk(fmt, ##__VA_ARGS__)
 # define dfprintk_cont(fac, fmt, ...)	do {} while (0)
-# define dfprintk_rcu(fac, fmt, ...)	do {} while (0)
+# define dfprintk_rcu(fac, fmt, ...)	no_printk(fmt, ##__VA_ARGS__)
 # define RPC_IFDEBUG(x)
 #endif
 
