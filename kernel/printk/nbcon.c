@@ -1529,7 +1529,7 @@ static int __init printk_setup_threads(void)
 	console_list_unlock();
 	return 0;
 }
-early_initcall(printk_setup_threads);
+subsys_initcall(printk_setup_threads);
 
 /**
  * nbcon_alloc - Allocate buffers needed by the nbcon console
