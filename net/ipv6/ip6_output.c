@@ -115,6 +115,8 @@ static int ip6_finish_output2(struct net *net, struct sock *sk, struct sk_buff *
 
 		if (res < 0 || res == LWTUNNEL_XMIT_DONE)
 			return res;
+		hdr = ipv6_hdr(skb);
+		daddr = &hdr->daddr;
 	}
 
 	nexthop = rt6_nexthop((struct rt6_info *)dst, daddr);
