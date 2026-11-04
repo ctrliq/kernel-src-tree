@@ -31,19 +31,11 @@
  */
 #define __TLBI_0(op, arg) asm (ARM64_ASM_PREAMBLE			       \
 			       "tlbi " #op "\n"				       \
-		   ALTERNATIVE("nop\n			nop",		       \
-			       "dsb ish\n		tlbi " #op,	       \
-			       ARM64_WORKAROUND_REPEAT_TLBI,		       \
-			       CONFIG_ARM64_WORKAROUND_REPEAT_TLBI)	       \
 			    : : )
 
 #define __TLBI_1(op, arg) asm (ARM64_ASM_PREAMBLE			       \
-			       "tlbi " #op ", %0\n"			       \
-		   ALTERNATIVE("nop\n			nop",		       \
-			       "dsb ish\n		tlbi " #op ", %0",     \
-			       ARM64_WORKAROUND_REPEAT_TLBI,		       \
-			       CONFIG_ARM64_WORKAROUND_REPEAT_TLBI)	       \
-			    : : "r" (arg))
+			       "tlbi " #op ", %x0\n"			       \
+			    : : "rZ" (arg))
 
 #define __TLBI_N(op, arg, n, ...) __TLBI_##n(op, arg)
 
@@ -181,6 +173,34 @@ static inline unsigned long get_trans_granule(void)
 		(__pages >> (5 * (scale) + 1)) - 1;			\
 	})
 
+#define __repeat_tlbi_sync(op, arg...)						\
+do {										\
+	if (!alternative_has_cap_unlikely(ARM64_WORKAROUND_REPEAT_TLBI))	\
+		break;								\
+	__tlbi(op, ##arg);							\
+	dsb(ish);								\
+} while (0)
+
+/*
+ * Complete broadcast TLB maintenance issued by the host which invalidates
+ * stage 1 information in the host's own translation regime.
+ */
+static inline void __tlbi_sync_s1ish(void)
+{
+	dsb(ish);
+	__repeat_tlbi_sync(vale1is, 0);
+}
+
+/*
+ * Complete broadcast TLB maintenance issued by hyp code which invalidates
+ * stage 1 translation information in any translation regime.
+ */
+static inline void __tlbi_sync_s1ish_hyp(void)
+{
+	dsb(ish);
+	__repeat_tlbi_sync(vale2is, 0);
+}
+
 /*
  *	TLB Invalidation
  *	================
@@ -266,7 +286,7 @@ static inline void flush_tlb_all(void)
 {
 	dsb(ishst);
 	__tlbi(vmalle1is);
-	dsb(ish);
+	__tlbi_sync_s1ish();
 	isb();
 }
 
@@ -278,7 +298,7 @@ static inline void flush_tlb_mm(struct mm_struct *mm)
 	asid = __TLBI_VADDR(0, ASID(mm));
 	__tlbi(aside1is, asid);
 	__tlbi_user(aside1is, asid);
-	dsb(ish);
+	__tlbi_sync_s1ish();
 	mmu_notifier_arch_invalidate_secondary_tlbs(mm, 0, -1UL);
 }
 
@@ -305,20 +325,11 @@ static inline void flush_tlb_page(struct vm_area_struct *vma,
 				  unsigned long uaddr)
 {
 	flush_tlb_page_nosync(vma, uaddr);
-	dsb(ish);
+	__tlbi_sync_s1ish();
 }
 
 static inline bool arch_tlbbatch_should_defer(struct mm_struct *mm)
 {
-	/*
-	 * TLB flush deferral is not required on systems which are affected by
-	 * ARM64_WORKAROUND_REPEAT_TLBI, as __tlbi()/__tlbi_user() implementation
-	 * will have two consecutive TLBI instructions with a dsb(ish) in between
-	 * defeating the purpose (i.e save overall 'dsb ish' cost).
-	 */
-	if (alternative_has_cap_unlikely(ARM64_WORKAROUND_REPEAT_TLBI))
-		return false;
-
 	return true;
 }
 
@@ -351,7 +362,7 @@ static inline void arch_flush_tlb_batched_pending(struct mm_struct *mm)
  */
 static inline void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch)
 {
-	dsb(ish);
+	__tlbi_sync_s1ish();
 }
 
 /*
@@ -433,7 +444,24 @@ do {									\
 #define __flush_s2_tlb_range_op(op, start, pages, stride, tlb_level) \
 	__flush_tlb_range_op(op, start, pages, stride, 0, tlb_level, false, kvm_lpa2_is_enabled());
 
-static inline void __flush_tlb_range(struct vm_area_struct *vma,
+static inline bool __flush_tlb_range_limit_excess(unsigned long start,
+		unsigned long end, unsigned long pages, unsigned long stride)
+{
+	/*
+	 * When the system does not support TLB range based flush
+	 * operation, (MAX_DVM_OPS - 1) pages can be handled. But
+	 * with TLB range based operation, MAX_TLBI_RANGE_PAGES
+	 * pages can be handled.
+	 */
+	if ((!system_supports_tlb_range() &&
+	     (end - start) >= (MAX_DVM_OPS * stride)) ||
+	    pages > MAX_TLBI_RANGE_PAGES)
+		return true;
+
+	return false;
+}
+
+static inline void __flush_tlb_range_nosync(struct vm_area_struct *vma,
 				     unsigned long start, unsigned long end,
 				     unsigned long stride, bool last_level,
 				     int tlb_level)
@@ -444,15 +472,7 @@ static inline void __flush_tlb_range(struct vm_area_struct *vma,
 	end = round_up(end, stride);
 	pages = (end - start) >> PAGE_SHIFT;
 
-	/*
-	 * When not uses TLB range ops, we can handle up to
-	 * (MAX_DVM_OPS - 1) pages;
-	 * When uses TLB range ops, we can handle up to
-	 * MAX_TLBI_RANGE_PAGES pages.
-	 */
-	if ((!system_supports_tlb_range() &&
-	     (end - start) >= (MAX_DVM_OPS * stride)) ||
-	    pages > MAX_TLBI_RANGE_PAGES) {
+	if (__flush_tlb_range_limit_excess(start, end, pages, stride)) {
 		flush_tlb_mm(vma->vm_mm);
 		return;
 	}
@@ -467,8 +487,17 @@ static inline void __flush_tlb_range(struct vm_area_struct *vma,
 		__flush_tlb_range_op(vae1is, start, pages, stride, asid,
 				     tlb_level, true, lpa2_is_enabled());
 
-	dsb(ish);
 	mmu_notifier_arch_invalidate_secondary_tlbs(vma->vm_mm, start, end);
+}
+
+static inline void __flush_tlb_range(struct vm_area_struct *vma,
+				     unsigned long start, unsigned long end,
+				     unsigned long stride, bool last_level,
+				     int tlb_level)
+{
+	__flush_tlb_range_nosync(vma, start, end, stride,
+				 last_level, tlb_level);
+	__tlbi_sync_s1ish();
 }
 
 static inline void flush_tlb_range(struct vm_area_struct *vma,
@@ -485,20 +514,22 @@ static inline void flush_tlb_range(struct vm_area_struct *vma,
 
 static inline void flush_tlb_kernel_range(unsigned long start, unsigned long end)
 {
-	unsigned long addr;
+	const unsigned long stride = PAGE_SIZE;
+	unsigned long pages;
 
-	if ((end - start) > (MAX_DVM_OPS * PAGE_SIZE)) {
+	start = round_down(start, stride);
+	end = round_up(end, stride);
+	pages = (end - start) >> PAGE_SHIFT;
+
+	if (__flush_tlb_range_limit_excess(start, end, pages, stride)) {
 		flush_tlb_all();
 		return;
 	}
 
-	start = __TLBI_VADDR(start, 0);
-	end = __TLBI_VADDR(end, 0);
-
 	dsb(ishst);
-	for (addr = start; addr < end; addr += 1 << (PAGE_SHIFT - 12))
-		__tlbi(vaale1is, addr);
-	dsb(ish);
+	__flush_tlb_range_op(vaale1is, start, pages, stride, 0,
+			     TLBI_TTL_UNKNOWN, false, lpa2_is_enabled());
+	__tlbi_sync_s1ish();
 	isb();
 }
 
@@ -512,7 +543,7 @@ static inline void __flush_tlb_kernel_pgtable(unsigned long kaddr)
 
 	dsb(ishst);
 	__tlbi(vaae1is, addr);
-	dsb(ish);
+	__tlbi_sync_s1ish();
 	isb();
 }
 #endif
