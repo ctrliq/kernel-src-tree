@@ -992,8 +992,8 @@ static void damos_set_effective_quota(struct damos_quota *quota)
 	}
 
 	if (quota->total_charged_ns)
-		throughput = quota->total_charged_sz * 1000000 /
-			quota->total_charged_ns;
+		throughput = mult_frac(quota->total_charged_sz, 1000000,
+						quota->total_charged_ns);
 	else
 		throughput = PAGE_SIZE * 1024;
 	esz = throughput * quota->ms;
@@ -1015,7 +1015,8 @@ static void damos_adjust_quota(struct damon_ctx *c, struct damos *s)
 		return;
 
 	/* New charge window starts */
-	if (time_after_eq(jiffies, quota->charged_from +
+	if (!time_in_range_open(jiffies, quota->charged_from,
+				quota->charged_from +
 				msecs_to_jiffies(quota->reset_interval))) {
 		if (quota->esz && quota->charged_sz >= quota->esz)
 			s->stat.qt_exceeds++;
@@ -1474,7 +1475,7 @@ static int walk_system_ram(struct resource *res, void *arg)
 
 	if (a->end - a->start < resource_size(res)) {
 		a->start = res->start;
-		a->end = res->end;
+		a->end = res->end + 1;
 	}
 	return 0;
 }
