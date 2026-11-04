@@ -29,6 +29,7 @@ all_files := \
 		compiler.h \
 		crt.h \
 		ctype.h \
+		elf.h \
 		errno.h \
 		limits.h \
 		nolibc.h \
