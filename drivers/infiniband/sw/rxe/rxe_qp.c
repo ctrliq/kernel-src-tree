@@ -595,7 +595,7 @@ int rxe_qp_from_attr(struct rxe_qp *qp, struct ib_qp_attr *attr, int mask,
 		 * rd_atomic array, so rxe_receiver() cannot race the free/
 		 * realloc.
 		 */
-		rxe_disable_task(&qp->recv_task);
+		rxe_disable_task(&qp->resp.task);
 		free_rd_atomic_resources(qp);
 		qp->attr.max_dest_rd_atomic = max_dest_rd_atomic;
 		err = alloc_rd_atomic_resources(qp, max_dest_rd_atomic);
@@ -606,7 +606,7 @@ int rxe_qp_from_attr(struct rxe_qp *qp, struct ib_qp_attr *attr, int mask,
 		 */
 		if (err)
 			return err;
-		rxe_enable_task(&qp->recv_task);
+		rxe_enable_task(&qp->resp.task);
 	}
 
 	if (mask & IB_QP_CUR_STATE)
