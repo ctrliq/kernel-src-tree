@@ -1,0 +1,121 @@
+ublk: fix use-after-free in ublk_cancel_cmd()
+
+jira KERNEL-1864
+Rebuild_History Non-Buildable kernel-6.12.0-264.5.1.el10_3
+commit-author Ming Lei <tom.leiming@gmail.com>
+commit f7700a4415afb3ac1767a556094e4ef8bd440e41
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-264.5.1.el10_3/f7700a44.failed
+
+When ublk_reset_ch_dev() clears io->cmd via ublk_queue_reinit()
+concurrently with ublk_cancel_cmd(), ublk_cancel_cmd() can read a
+stale pointer and pass it to io_uring_cmd_done(), causing a
+use-after-free.
+
+Fix by synchronizing the two paths with ubq->cancel_lock:
+
+- ublk_cancel_cmd(): read and clear io->cmd under cancel_lock,
+  then call io_uring_cmd_done() on the saved local copy outside
+  the lock.
+
+- ublk_reset_ch_dev(): hold cancel_lock across ublk_queue_reinit()
+  so that io->cmd and io->flags are cleared atomically with respect
+  to ublk_cancel_cmd().
+
+Fixes: 216c8f5ef0f2 ("ublk: replace monitor with cancelable uring_cmd")
+	Signed-off-by: Ming Lei <tom.leiming@gmail.com>
+Link: https://patch.msgid.link/20260508123746.242018-1-tom.leiming@gmail.com
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit f7700a4415afb3ac1767a556094e4ef8bd440e41)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/ublk_drv.c
+diff --cc drivers/block/ublk_drv.c
+index a192a96d6dac,6d13f1481de0..000000000000
+--- a/drivers/block/ublk_drv.c
++++ b/drivers/block/ublk_drv.c
+@@@ -1911,12 -2782,75 +1918,80 @@@ static void ublk_cancel_cmd(struct ublk
+  
+  	spin_lock(&ubq->cancel_lock);
+  	done = !!(io->flags & UBLK_IO_FLAG_CANCELED);
+- 	if (!done)
++ 	if (!done) {
+  		io->flags |= UBLK_IO_FLAG_CANCELED;
++ 		cmd = io->cmd;
++ 		io->cmd = NULL;
++ 	}
+  	spin_unlock(&ubq->cancel_lock);
+  
+++<<<<<<< HEAD
+ +	if (!done)
+ +		io_uring_cmd_done(io->cmd, UBLK_IO_RES_ABORT, 0, issue_flags);
+++=======
++ 	if (!done && cmd)
++ 		io_uring_cmd_done(cmd, UBLK_IO_RES_ABORT, issue_flags);
++ }
++ 
++ /*
++  * Cancel a batch fetch command if it hasn't been claimed by another path.
++  *
++  * An fcmd can only be cancelled if:
++  * 1. It's not the active_fcmd (which is currently being processed)
++  * 2. It's still on the list (!list_empty check) - once removed from the list,
++  *    the fcmd is considered claimed and will be freed by whoever removed it
++  *
++  * Use list_del_init() so subsequent list_empty() checks work correctly.
++  */
++ static void ublk_batch_cancel_cmd(struct ublk_queue *ubq,
++ 				  struct ublk_batch_fetch_cmd *fcmd,
++ 				  unsigned int issue_flags)
++ {
++ 	bool done;
++ 
++ 	spin_lock(&ubq->evts_lock);
++ 	done = (READ_ONCE(ubq->active_fcmd) != fcmd) && !list_empty(&fcmd->node);
++ 	if (done)
++ 		list_del_init(&fcmd->node);
++ 	spin_unlock(&ubq->evts_lock);
++ 
++ 	if (done) {
++ 		io_uring_cmd_done(fcmd->cmd, UBLK_IO_RES_ABORT, issue_flags);
++ 		ublk_batch_free_fcmd(fcmd);
++ 	}
++ }
++ 
++ static void ublk_batch_cancel_queue(struct ublk_queue *ubq)
++ {
++ 	struct ublk_batch_fetch_cmd *fcmd;
++ 	LIST_HEAD(fcmd_list);
++ 
++ 	spin_lock(&ubq->evts_lock);
++ 	ubq->force_abort = true;
++ 	list_splice_init(&ubq->fcmd_head, &fcmd_list);
++ 	fcmd = READ_ONCE(ubq->active_fcmd);
++ 	if (fcmd)
++ 		list_move(&fcmd->node, &ubq->fcmd_head);
++ 	spin_unlock(&ubq->evts_lock);
++ 
++ 	while (!list_empty(&fcmd_list)) {
++ 		fcmd = list_first_entry(&fcmd_list,
++ 				struct ublk_batch_fetch_cmd, node);
++ 		ublk_batch_cancel_cmd(ubq, fcmd, IO_URING_F_UNLOCKED);
++ 	}
++ }
++ 
++ static void ublk_batch_cancel_fn(struct io_uring_cmd *cmd,
++ 				 unsigned int issue_flags)
++ {
++ 	struct ublk_uring_cmd_pdu *pdu = ublk_get_uring_cmd_pdu(cmd);
++ 	struct ublk_batch_fetch_cmd *fcmd = pdu->fcmd;
++ 	struct ublk_queue *ubq = pdu->ubq;
++ 
++ 	ublk_start_cancel(ubq->dev);
++ 
++ 	ublk_batch_cancel_cmd(ubq, fcmd, issue_flags);
+++>>>>>>> f7700a4415af (ublk: fix use-after-free in ublk_cancel_cmd())
+  }
+  
+  /*
+* Unmerged path drivers/block/ublk_drv.c
