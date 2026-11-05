@@ -457,6 +457,7 @@ struct request_queue *blk_alloc_queue(struct queue_limits *lim, int node_id)
 			 &q->q_lock_cls_key, 0);
 
 	q->nr_requests = BLKDEV_DEFAULT_RQ;
+	q->async_depth = BLKDEV_DEFAULT_RQ;
 
 	return q;
 
