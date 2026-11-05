@@ -4,6 +4,7 @@
 #define _NET_SHAPER_H_
 
 #include <linux/types.h>
+#include <linux/rh_kabi.h>
 
 #include <uapi/linux/net_shaper.h>
 
@@ -53,7 +54,7 @@ struct net_shaper {
 
 	/* private: */
 	u32 leaves; /* accounted only for NODE scope */
-	bool valid;
+	RH_KABI_FILL_HOLE(bool valid)
 	struct rcu_head rcu;
 };
 
