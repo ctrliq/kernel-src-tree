@@ -1,0 +1,297 @@
+KVM: s390: Fall back to short-term pinning in MAP ioctl
+
+jira KERNEL-1864
+Rebuild_History Non-Buildable kernel-6.12.0-264.7.1.el10_3
+commit-author Jaehoon Kim <jhkim@linux.ibm.com>
+commit 9972befc3e34ff8b6847198c84f11bfc312dde40
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-264.7.1.el10_3/9972befc.failed
+
+FOLL_LONGTERM pinning fails for some memory types, such as file-backed
+guest memory. As a result, kvm_s390_adapter_map() returns -EINVAL and
+irqfd adapter registration fails even though interrupt delivery could
+still work via the existing non-atomic path.
+
+When FOLL_LONGTERM pinning fails, verify that the page is accessible
+using a short-term pin instead. If the short-term pin succeeds, unpin
+the page and add a map entry with pinned=false to preserve MAP/UNMAP
+symmetry. The non-atomic irqfd path already performs short-term pinning
+for interrupt delivery, so this restores the previous behavior for
+memory that cannot be pinned long-term.
+
+get_map_info() is updated to return NULL for unpinned entries so that
+the atomic irqfd fast path falls back to the non-atomic path.
+kvm_s390_adapter_unmap() and kvm_s390_unmap_all_adapters() skip dirty
+marking and unpin for unpinned entries.
+
+Update Documentation/virt/kvm/devices/s390_flic.rst to reflect the
+new MAP/UNMAP behavior.
+
+Fixes: c9a568838086 ("KVM: s390: Add map/unmap ioctl and clean mappings post-guest")
+	Signed-off-by: Jaehoon Kim <jhkim@linux.ibm.com>
+	Reviewed-by: Douglas Freimuth <freimuth@linux.ibm.com>
+	Reviewed-by: Matthew Rosato <mjrosato@linux.ibm.com>
+	Signed-off-by: Christian Borntraeger <borntraeger@linux.ibm.com>
+(cherry picked from commit 9972befc3e34ff8b6847198c84f11bfc312dde40)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kvm/interrupt.c
+diff --cc arch/s390/kvm/interrupt.c
+index a0cddf596412,7514d9e2403c..000000000000
+--- a/arch/s390/kvm/interrupt.c
++++ b/arch/s390/kvm/interrupt.c
+@@@ -2452,6 -2473,166 +2452,169 @@@ int kvm_s390_mask_adapter(struct kvm *k
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct page *pin_map_page(struct kvm *kvm, u64 uaddr,
++ 				 unsigned int gup_flags)
++ {
++ 	struct mm_struct *mm = kvm->mm;
++ 	struct page *page = NULL;
++ 	int locked = 1;
++ 
++ 	if (mmget_not_zero(mm)) {
++ 		mmap_read_lock(mm);
++ 		pin_user_pages_remote(mm, uaddr, 1, FOLL_WRITE | gup_flags,
++ 				      &page, &locked);
++ 		if (locked)
++ 			mmap_read_unlock(mm);
++ 		mmput(mm);
++ 	}
++ 
++ 	return page;
++ }
++ 
++ static int kvm_s390_adapter_map(struct kvm *kvm, unsigned int id, __u64 addr)
++ {
++ 	struct s390_io_adapter *adapter = get_io_adapter(kvm, id);
++ 	struct s390_map_info *map;
++ 	unsigned long flags;
++ 	__u64 host_addr;
++ 	int ret, idx;
++ 
++ 	if (!adapter || !addr)
++ 		return -EINVAL;
++ 
++ 	map = kzalloc_obj(*map, GFP_KERNEL_ACCOUNT);
++ 	if (!map)
++ 		return -ENOMEM;
++ 
++ 	INIT_LIST_HEAD(&map->list);
++ 	idx = srcu_read_lock(&kvm->srcu);
++ 	host_addr = gpa_to_hva(kvm, addr);
++ 	if (kvm_is_error_hva(host_addr)) {
++ 		srcu_read_unlock(&kvm->srcu, idx);
++ 		ret = -EFAULT;
++ 		goto out;
++ 	}
++ 	srcu_read_unlock(&kvm->srcu, idx);
++ 	map->guest_addr = addr;
++ 	map->addr = host_addr;
++ 	map->page = pin_map_page(kvm, host_addr, FOLL_LONGTERM);
++ 	if (!map->page) {
++ 		/*
++ 		 * Long-term pinning may fail for memory types such as file-backed
++ 		 * memory. Verify that short-term pinning succeeds so that the
++ 		 * non-atomic irqfd path can handle interrupt injection.
++ 		 */
++ 		map->page = pin_map_page(kvm, host_addr, 0);
++ 		if (!map->page) {
++ 			ret = -EINVAL;
++ 			goto out;
++ 		}
++ 		unpin_user_page(map->page);
++ 		map->page = NULL;
++ 		map->pinned = false;
++ 		/* Add an entry to preserve MAP/UNMAP symmetry. */
++ 	} else {
++ 		map->pinned = true;
++ 	}
++ 	spin_lock_irqsave(&adapter->maps_lock, flags);
++ 	if (adapter->nr_maps < MAX_S390_ADAPTER_MAPS) {
++ 		list_add_tail(&map->list, &adapter->maps);
++ 		adapter->nr_maps++;
++ 		ret = 0;
++ 	} else {
++ 		ret = -EINVAL;
++ 	}
++ 	spin_unlock_irqrestore(&adapter->maps_lock, flags);
++ 	if (ret && map->page)
++ 		unpin_user_page(map->page);
++ out:
++ 	if (ret)
++ 		kfree(map);
++ 	return ret;
++ }
++ 
++ static int kvm_s390_adapter_unmap(struct kvm *kvm, unsigned int id, __u64 addr)
++ {
++ 	struct s390_io_adapter *adapter = get_io_adapter(kvm, id);
++ 	struct s390_map_info *map, *tmp, *map_to_free;
++ 	struct page *map_page_to_put = NULL;
++ 	u64 map_addr_to_mark = 0;
++ 	bool map_pinned = false;
++ 	unsigned long flags;
++ 	int found = 0, idx;
++ 
++ 	if (!adapter || !addr)
++ 		return -EINVAL;
++ 
++ 	spin_lock_irqsave(&adapter->maps_lock, flags);
++ 	list_for_each_entry_safe(map, tmp, &adapter->maps, list) {
++ 		if (map->guest_addr == addr) {
++ 			found = 1;
++ 			adapter->nr_maps--;
++ 			list_del(&map->list);
++ 			map_page_to_put = map->page;
++ 			map_addr_to_mark = map->guest_addr;
++ 			map_pinned = map->pinned;
++ 			map_to_free = map;
++ 			break;
++ 		}
++ 	}
++ 	spin_unlock_irqrestore(&adapter->maps_lock, flags);
++ 
++ 	if (found) {
++ 		kfree(map_to_free);
++ 		if (map_pinned) {
++ 			/*
++ 			 * Only long-term pinned pages need to be marked dirty
++ 			 * and released. Fallback entries exist only for
++ 			 * MAP/UNMAP symmetry.
++ 			 */
++ 			idx = srcu_read_lock(&kvm->srcu);
++ 			mark_page_dirty(kvm, map_addr_to_mark >> PAGE_SHIFT);
++ 			set_page_dirty_lock(map_page_to_put);
++ 			srcu_read_unlock(&kvm->srcu, idx);
++ 			unpin_user_page(map_page_to_put);
++ 		}
++ 	}
++ 
++ 	return found ? 0 : -ENOENT;
++ }
++ 
++ void kvm_s390_unmap_all_adapters(struct kvm *kvm)
++ {
++ 	struct s390_map_info *map, *tmp;
++ 	unsigned long flags;
++ 	int i, idx;
++ 
++ 	for (i = 0; i < MAX_S390_IO_ADAPTERS; i++) {
++ 		struct s390_io_adapter *adapter = kvm->arch.adapters[i];
++ 		LIST_HEAD(local_list);
++ 
++ 		if (!adapter)
++ 			continue;
++ 
++ 		spin_lock_irqsave(&adapter->maps_lock, flags);
++ 		list_splice_init(&adapter->maps, &local_list);
++ 		adapter->nr_maps = 0;
++ 		spin_unlock_irqrestore(&adapter->maps_lock, flags);
++ 
++ 		list_for_each_entry_safe(map, tmp, &local_list, list) {
++ 			list_del(&map->list);
++ 			if (map->pinned) {
++ 				idx = srcu_read_lock(&kvm->srcu);
++ 				mark_page_dirty(kvm, map->guest_addr >> PAGE_SHIFT);
++ 				set_page_dirty_lock(map->page);
++ 				srcu_read_unlock(&kvm->srcu, idx);
++ 				unpin_user_page(map->page);
++ 			}
++ 			kfree(map);
++ 		}
++ 	}
++ }
++ 
+++>>>>>>> 9972befc3e34 (KVM: s390: Fall back to short-term pinning in MAP ioctl)
+  void kvm_s390_destroy_adapters(struct kvm *kvm)
+  {
+  	int i;
+@@@ -2732,22 -2945,22 +2895,34 @@@ static unsigned long get_ind_bit(__u64 
+  	return swap ? (bit ^ (BITS_PER_LONG - 1)) : bit;
+  }
+  
+ -static struct s390_map_info *get_map_info(struct s390_io_adapter *adapter,
+ -					  u64 addr)
+ +static struct page *get_map_page(struct kvm *kvm, u64 uaddr)
+  {
+ -	struct s390_map_info *map;
+ +	struct mm_struct *mm = kvm->mm;
+ +	struct page *page = NULL;
+ +	int locked = 1;
+  
+++<<<<<<< HEAD
+ +	if (mmget_not_zero(mm)) {
+ +		mmap_read_lock(mm);
+ +		get_user_pages_remote(mm, uaddr, 1, FOLL_WRITE,
+ +				      &page, &locked);
+ +		if (locked)
+ +			mmap_read_unlock(mm);
+ +		mmput(mm);
+++=======
++ 	if (!adapter)
++ 		return NULL;
++ 
++ 	list_for_each_entry(map, &adapter->maps, list) {
++ 		if (map->addr == addr) {
++ 			if (!map->pinned)
++ 				return NULL;
++ 			return map;
++ 		}
+++>>>>>>> 9972befc3e34 (KVM: s390: Fall back to short-term pinning in MAP ioctl)
+  	}
+ -	return NULL;
+ +
+ +	return page;
+  }
+  
+  static int adapter_indicators_set(struct kvm *kvm,
+diff --git a/Documentation/virt/kvm/devices/s390_flic.rst b/Documentation/virt/kvm/devices/s390_flic.rst
+index b784f8016748..983c858b444a 100644
+--- a/Documentation/virt/kvm/devices/s390_flic.rst
++++ b/Documentation/virt/kvm/devices/s390_flic.rst
+@@ -112,9 +112,20 @@ Groups:
+       mask or unmask the adapter, as specified in mask
+ 
+     KVM_S390_IO_ADAPTER_MAP
+-      This is now a no-op. The mapping is purely done by the irq route.
++      Map an adapter indicator or summary page for long-term pinning so that
++      interrupt injection can be performed in atomic context. If long-term
++      pinning is not possible (e.g. file-backed memory), the page is verified
++      via a short-term pin and the ioctl returns success; interrupt injection
++      will use the non-atomic irqfd path with short-term pinning on each
++      interrupt. In Secure Execution mode this is a no-op and the ioctl
++      returns success.
++
+     KVM_S390_IO_ADAPTER_UNMAP
+-      This is now a no-op. The mapping is purely done by the irq route.
++      Unmap a previously mapped adapter indicator or summary page and release
++      the long-term pin. If the page was not long-term pinned (e.g. file-backed
++      memory), the map entry is removed and success is returned; if no prior
++      map entry exists, -ENOENT is returned. In Secure Execution mode this is
++      a no-op and the ioctl returns success.
+ 
+   KVM_DEV_FLIC_AISM
+     modify the adapter-interruption-suppression mode for a given isc if the
+diff --git a/arch/s390/include/asm/kvm_host.h b/arch/s390/include/asm/kvm_host.h
+index ada0f0233733..c2a64c7cee25 100644
+--- a/arch/s390/include/asm/kvm_host.h
++++ b/arch/s390/include/asm/kvm_host.h
+@@ -468,6 +468,11 @@ struct s390_map_info {
+ 	__u64 guest_addr;
+ 	__u64 addr;
+ 	struct page *page;
++	/*
++	 * True if the page is long-term pinned. False if long-term pinning
++	 * failed and this entry exists only to preserve MAP/UNMAP symmetry.
++	 */
++	bool pinned;
+ };
+ 
+ struct s390_io_adapter {
+* Unmerged path arch/s390/kvm/interrupt.c
