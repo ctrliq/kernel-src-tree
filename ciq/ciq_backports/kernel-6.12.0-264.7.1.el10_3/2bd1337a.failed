@@ -1,0 +1,111 @@
+KVM: s390: Use generic VIRT_XFER_TO_GUEST_WORK functions
+
+jira KERNEL-1864
+Rebuild_History Non-Buildable kernel-6.12.0-264.7.1.el10_3
+commit-author Andrew Donnellan <ajd@linux.ibm.com>
+commit 2bd1337a1295e012e60008ee21a64375e5234e12
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-264.7.1.el10_3/2bd1337a.failed
+
+Switch to using the generic infrastructure to check for and handle pending
+work before transitioning into guest mode.
+
+xfer_to_guest_mode_handle_work() does a few more things than the current
+code does when deciding whether or not to exit the __vcpu_run() loop. The
+exittime tests from kvm-unit-tests, in my tests, were within a few percent
+compared to before this series, which is within noise tolerance.
+
+Co-developed-by: Heiko Carstens <hca@linux.ibm.com>
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+	Signed-off-by: Andrew Donnellan <ajd@linux.ibm.com>
+	Acked-by: Janosch Frank <frankja@linux.ibm.com>
+[frankja@linux.ibm.com: Removed semicolon]
+	Signed-off-by: Janosch Frank <frankja@linux.ibm.com>
+(cherry picked from commit 2bd1337a1295e012e60008ee21a64375e5234e12)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kvm/kvm-s390.c
+diff --cc arch/s390/kvm/kvm-s390.c
+index 9697570c1ca5,d31155e371df..000000000000
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@@ -14,6 -14,8 +14,11 @@@
+  #define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
+  
+  #include <linux/compiler.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/entry-virt.h>
++ #include <linux/export.h>
+++>>>>>>> 2bd1337a1295 (KVM: s390: Use generic VIRT_XFER_TO_GUEST_WORK functions)
+  #include <linux/err.h>
+  #include <linux/fs.h>
+  #include <linux/hrtimer.h>
+diff --git a/arch/s390/kvm/Kconfig b/arch/s390/kvm/Kconfig
+index 96d16028e8b7..f4ec8c1ce214 100644
+--- a/arch/s390/kvm/Kconfig
++++ b/arch/s390/kvm/Kconfig
+@@ -29,6 +29,7 @@ config KVM
+ 	select HAVE_KVM_NO_POLL
+ 	select KVM_VFIO
+ 	select MMU_NOTIFIER
++	select VIRT_XFER_TO_GUEST_WORK
+ 	help
+ 	  Support hosting paravirtualized guest machines using the SIE
+ 	  virtualization capability on the mainframe. This should work
+* Unmerged path arch/s390/kvm/kvm-s390.c
+diff --git a/arch/s390/kvm/vsie.c b/arch/s390/kvm/vsie.c
+index 9c5e1c323106..e8f08daf3eb8 100644
+--- a/arch/s390/kvm/vsie.c
++++ b/arch/s390/kvm/vsie.c
+@@ -1201,12 +1201,23 @@ static int do_vsie_run(struct kvm_vcpu *vcpu, struct vsie_page *vsie_page)
+ 	current->thread.gmap_int_code = 0;
+ 	barrier();
+ 	if (!kvm_s390_vcpu_sie_inhibited(vcpu)) {
++xfer_to_guest_mode_check:
+ 		local_irq_disable();
++		xfer_to_guest_mode_prepare();
++		if (xfer_to_guest_mode_work_pending()) {
++			local_irq_enable();
++			rc = kvm_xfer_to_guest_mode_handle_work(vcpu);
++			if (rc)
++				goto skip_sie;
++			goto xfer_to_guest_mode_check;
++		}
+ 		guest_timing_enter_irqoff();
+ 		rc = kvm_s390_enter_exit_sie(scb_s, vcpu->run->s.regs.gprs, vsie_page->gmap->asce);
+ 		guest_timing_exit_irqoff();
+ 		local_irq_enable();
+ 	}
++
++skip_sie:
+ 	barrier();
+ 	vcpu->arch.sie_block->prog0c &= ~PROG_IN_SIE;
+ 
+@@ -1366,13 +1377,11 @@ static int vsie_run(struct kvm_vcpu *vcpu, struct vsie_page *vsie_page)
+ 		 * but rewind the PSW to re-enter SIE once that's completed
+ 		 * instead of passing a "no action" intercept to the guest.
+ 		 */
+-		if (signal_pending(current) ||
+-		    kvm_s390_vcpu_has_irq(vcpu, 0) ||
++		if (kvm_s390_vcpu_has_irq(vcpu, 0) ||
+ 		    kvm_s390_vcpu_sie_inhibited(vcpu)) {
+ 			kvm_s390_rewind_psw(vcpu, 4);
+ 			break;
+ 		}
+-		cond_resched();
+ 	}
+ 
+ 	if (rc == -EFAULT) {
+@@ -1504,8 +1513,7 @@ int kvm_s390_handle_vsie(struct kvm_vcpu *vcpu)
+ 	if (unlikely(scb_addr & 0x1ffUL))
+ 		return kvm_s390_inject_program_int(vcpu, PGM_SPECIFICATION);
+ 
+-	if (signal_pending(current) || kvm_s390_vcpu_has_irq(vcpu, 0) ||
+-	    kvm_s390_vcpu_sie_inhibited(vcpu)) {
++	if (kvm_s390_vcpu_has_irq(vcpu, 0) || kvm_s390_vcpu_sie_inhibited(vcpu)) {
+ 		kvm_s390_rewind_psw(vcpu, 4);
+ 		return 0;
+ 	}
