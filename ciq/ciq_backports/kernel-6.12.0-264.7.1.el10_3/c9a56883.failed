@@ -1,0 +1,127 @@
+KVM: s390: Add map/unmap ioctl and clean mappings post-guest
+
+jira KERNEL-1864
+Rebuild_History Non-Buildable kernel-6.12.0-264.7.1.el10_3
+commit-author Douglas Freimuth <freimuth@linux.ibm.com>
+commit c9a5688380865b968f7aef6534de632857ab5be0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-264.7.1.el10_3/c9a56883.failed
+
+s390 needs map/unmap ioctls, which map the adapter set
+indicator pages, so the pages can be accessed when interrupts are
+disabled. The mappings are cleaned up when the guest is removed.
+pin_user_pages_remote is used for both the ioctl as well
+as the pin-on-demand logic in adapter_indicators_set().
+
+Map/Unmap ioctls are fenced in order to avoid the longterm pinning
+in Secure Execution environments. In Secure Execution
+environments the path of execution available before this patch is followed.
+
+Statistical counters to count map/unmap functions for adapter indicator
+pages are added. The counters can be used to analyze
+map/unmap functions in non-Secure Execution environments and similarly
+can be used to analyze Secure Execution environments where the counters
+will not be incremented as the adapter indicator pages are not mapped.
+
+	Reviewed-by: Matthew Rosato <mjrosato@linux.ibm.com>
+	Signed-off-by: Douglas Freimuth <freimuth@linux.ibm.com>
+	Acked-by: Claudio Imbrenda <imbrenda@linux.ibm.com>
+	Signed-off-by: Claudio Imbrenda <imbrenda@linux.ibm.com>
+Message-ID: <20260604192755.203143-2-freimuth@linux.ibm.com>
+(cherry picked from commit c9a5688380865b968f7aef6534de632857ab5be0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kvm/interrupt.c
+diff --cc arch/s390/kvm/interrupt.c
+index a0cddf596412,d11dea4cb0d3..000000000000
+--- a/arch/s390/kvm/interrupt.c
++++ b/arch/s390/kvm/interrupt.c
+@@@ -2421,13 -2426,19 +2425,28 @@@ static int register_io_adapter(struct k
+  	adapter_info.id = array_index_nospec(adapter_info.id,
+  					     MAX_S390_IO_ADAPTERS);
+  
+++<<<<<<< HEAD
+ +	if (dev->kvm->arch.adapters[adapter_info.id] != NULL)
+ +		return -EINVAL;
+ +
+ +	adapter = kzalloc(sizeof(*adapter), GFP_KERNEL_ACCOUNT);
+ +	if (!adapter)
+ +		return -ENOMEM;
+++=======
++ 	if (dev->kvm->arch.adapters[adapter_info.id] != NULL) {
++ 		rc = -EINVAL;
++ 		goto out;
++ 	}
++ 	adapter = kzalloc_obj(*adapter, GFP_KERNEL_ACCOUNT);
++ 	if (!adapter) {
++ 		rc = -ENOMEM;
++ 		goto out;
++ 	}
+++>>>>>>> c9a568838086 (KVM: s390: Add map/unmap ioctl and clean mappings post-guest)
+  
++ 	INIT_LIST_HEAD(&adapter->maps);
++ 	spin_lock_init(&adapter->maps_lock);
++ 	adapter->nr_maps = 0;
+  	adapter->id = adapter_info.id;
+  	adapter->isc = adapter_info.isc;
+  	adapter->maskable = adapter_info.maskable;
+diff --git a/arch/s390/include/asm/kvm_host.h b/arch/s390/include/asm/kvm_host.h
+index ada0f0233733..343a0d7984c5 100644
+--- a/arch/s390/include/asm/kvm_host.h
++++ b/arch/s390/include/asm/kvm_host.h
+@@ -446,6 +446,8 @@ struct kvm_vcpu_arch {
+ struct kvm_vm_stat {
+ 	struct kvm_vm_stat_generic generic;
+ 	u64 inject_io;
++	u64 io_390_adapter_map;
++	u64 io_390_adapter_unmap;
+ 	u64 inject_float_mchk;
+ 	u64 inject_pfault_done;
+ 	u64 inject_service_signal;
+@@ -477,6 +479,9 @@ struct s390_io_adapter {
+ 	bool masked;
+ 	bool swap;
+ 	bool suppressible;
++	spinlock_t maps_lock;
++	struct list_head maps;
++	unsigned int nr_maps;
+ };
+ 
+ #define MAX_S390_IO_ADAPTERS ((MAX_ISC + 1) * 8)
+* Unmerged path arch/s390/kvm/interrupt.c
+diff --git a/arch/s390/kvm/kvm-s390.c b/arch/s390/kvm/kvm-s390.c
+index 7900674cf5e3..f022427a5b28 100644
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@ -64,6 +64,8 @@
+ const struct kvm_stats_desc kvm_vm_stats_desc[] = {
+ 	KVM_GENERIC_VM_STATS(),
+ 	STATS_DESC_COUNTER(VM, inject_io),
++	STATS_DESC_COUNTER(VM, io_390_adapter_map),
++	STATS_DESC_COUNTER(VM, io_390_adapter_unmap),
+ 	STATS_DESC_COUNTER(VM, inject_float_mchk),
+ 	STATS_DESC_COUNTER(VM, inject_pfault_done),
+ 	STATS_DESC_COUNTER(VM, inject_service_signal),
+@@ -2673,6 +2675,7 @@ static int kvm_s390_handle_pv(struct kvm *kvm, struct kvm_pv_cmd *cmd)
+ 		if (kvm_s390_pv_is_protected(kvm))
+ 			break;
+ 
++		kvm_s390_unmap_all_adapters(kvm);
+ 		mmap_write_lock(kvm->mm);
+ 		r = gmap_helper_disable_cow_sharing();
+ 		mmap_write_unlock(kvm->mm);
+diff --git a/arch/s390/kvm/kvm-s390.h b/arch/s390/kvm/kvm-s390.h
+index 963ab12d9b40..9272eaecec37 100644
+--- a/arch/s390/kvm/kvm-s390.h
++++ b/arch/s390/kvm/kvm-s390.h
+@@ -561,6 +561,8 @@ void kvm_s390_gisa_disable(struct kvm *kvm);
+ void kvm_s390_gisa_enable(struct kvm *kvm);
+ int __init kvm_s390_gib_init(u8 nisc);
+ void kvm_s390_gib_destroy(void);
++void kvm_s390_unmap_all_adapters(struct kvm *kvm);
++
+ 
+ /* implemented in guestdbg.c */
+ void kvm_s390_backup_guest_per_regs(struct kvm_vcpu *vcpu);
