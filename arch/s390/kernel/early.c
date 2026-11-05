@@ -243,8 +243,6 @@ static __init void detect_machine_facilities(void)
 	}
 	if (test_facility(78))
 		get_lowcore()->machine_flags |= MACHINE_FLAG_EDAT2;
-	if (test_facility(3))
-		get_lowcore()->machine_flags |= MACHINE_FLAG_IDTE;
 	if (test_facility(50) && test_facility(73)) {
 		get_lowcore()->machine_flags |= MACHINE_FLAG_TE;
 		system_ctl_set_bit(0, CR0_TRANSACTIONAL_EXECUTION_BIT);
@@ -253,8 +251,6 @@ static __init void detect_machine_facilities(void)
 		system_ctl_set_bit(0, CR0_VECTOR_BIT);
 	if (test_facility(130))
 		get_lowcore()->machine_flags |= MACHINE_FLAG_NX;
-	if (test_facility(133))
-		get_lowcore()->machine_flags |= MACHINE_FLAG_GS;
 	if (test_facility(139) && (tod_clock_base.tod >> 63)) {
 		/* Enabled signed clock comparator comparisons */
 		get_lowcore()->machine_flags |= MACHINE_FLAG_SCC;
@@ -265,8 +261,6 @@ static __init void detect_machine_facilities(void)
 		get_lowcore()->machine_flags |= MACHINE_FLAG_PCI_MIO;
 		/* the control bit is set during PCI initialization */
 	}
-	if (test_facility(194))
-		get_lowcore()->machine_flags |= MACHINE_FLAG_RDP;
 }
 
 static inline void save_vector_registers(void)

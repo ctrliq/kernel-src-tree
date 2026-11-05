@@ -434,6 +434,7 @@ static int iomap_dio_bio_iter(struct iomap_iter *iter, struct iomap_dio *dio)
 		bio->bi_end_io = iomap_dio_bio_end_io;
 
 		ret = bio_iov_iter_get_pages(bio, dio->submit.iter,
+				bdev_dma_alignment(iomap->bdev),
 				bdev_logical_block_size(iomap->bdev) - 1);
 		if (unlikely(ret)) {
 			/*
