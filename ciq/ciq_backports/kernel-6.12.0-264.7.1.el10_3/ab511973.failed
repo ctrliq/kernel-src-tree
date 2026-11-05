@@ -1,0 +1,176 @@
+KVM: s390: vsie: Avoid injecting machine check on signal
+
+jira KERNEL-1864
+Rebuild_History Non-Buildable kernel-6.12.0-264.7.1.el10_3
+commit-author Christian Borntraeger <borntraeger@linux.ibm.com>
+commit ab5119735e984f6b724ef1b699c01479949ed1de
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-264.7.1.el10_3/ab511973.failed
+
+The recent XFER_TO_GUEST_WORK change resulted in a situation, where the
+vsie code would interpret a signal during work as a machine check during
+SIE as both use the EINTR return code.
+The exit_reason of the sie64a function has nothing to do with the
+kvm_run exit_reason. Rename it and define a specific code for machine
+checks instead of abusing -EINTR.
+rename exit_reason into sie_return to avoid the naming conflict
+and change the code flow in vsie.c to have a separate variable for rc
+and sie_return.
+
+Fixes: 2bd1337a1295e ("KVM: s390: Use generic VIRT_XFER_TO_GUEST_WORK functions")
+	Signed-off-by: Christian Borntraeger <borntraeger@linux.ibm.com>
+	Reviewed-by: Heiko Carstens <hca@linux.ibm.com>
+	Reviewed-by: Claudio Imbrenda <imbrenda@linux.ibm.com>
+(cherry picked from commit ab5119735e984f6b724ef1b699c01479949ed1de)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kvm/kvm-s390.c
+#	arch/s390/kvm/vsie.c
+diff --cc arch/s390/kvm/kvm-s390.c
+index 7900674cf5e3,ebcb0ef8835e..000000000000
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@@ -5006,9 -4710,18 +5007,15 @@@ static int __vcpu_run(struct kvm_vcpu *
+  		guest_timing_enter_irqoff();
+  		__disable_cpu_timer_accounting(vcpu);
+  
+++<<<<<<< HEAD
+ +		exit_reason = kvm_s390_enter_exit_sie(vcpu->arch.sie_block,
+ +						      vcpu->run->s.regs.gprs,
+ +						      vcpu->arch.gmap->asce);
+++=======
++ 		sie_return = kvm_s390_enter_exit_sie(vcpu->arch.sie_block,
++ 						     vcpu->run->s.regs.gprs,
++ 						     vcpu->arch.gmap->asce.val);
+++>>>>>>> ab5119735e98 (KVM: s390: vsie: Avoid injecting machine check on signal)
+  
+  		__enable_cpu_timer_accounting(vcpu);
+  		guest_timing_exit_irqoff();
+@@@ -5031,10 -4744,13 +5038,19 @@@
+  		}
+  		kvm_vcpu_srcu_read_lock(vcpu);
+  
+++<<<<<<< HEAD
+ +		rc = vcpu_post_run(vcpu, exit_reason);
+ +	} while (!signal_pending(current) && !guestdbg_exit_pending(vcpu) && !rc);
+++=======
++ 		rc = vcpu_post_run(vcpu, sie_return);
++ 		if (rc || guestdbg_exit_pending(vcpu)) {
++ 			kvm_vcpu_srcu_read_unlock(vcpu);
++ 			break;
++ 		}
++ 	}
+++>>>>>>> ab5119735e98 (KVM: s390: vsie: Avoid injecting machine check on signal)
+  
+ +	kvm_vcpu_srcu_read_unlock(vcpu);
+  	return rc;
+  }
+  
+diff --cc arch/s390/kvm/vsie.c
+index cf0305db4866,0330829b4046..000000000000
+--- a/arch/s390/kvm/vsie.c
++++ b/arch/s390/kvm/vsie.c
+@@@ -1201,9 -1153,18 +1202,13 @@@ static int do_vsie_run(struct kvm_vcpu 
+  	current->thread.gmap_int_code = 0;
+  	barrier();
+  	if (!kvm_s390_vcpu_sie_inhibited(vcpu)) {
+ -xfer_to_guest_mode_check:
+  		local_irq_disable();
+ -		xfer_to_guest_mode_prepare();
+ -		if (xfer_to_guest_mode_work_pending()) {
+ -			local_irq_enable();
+ -			rc = kvm_xfer_to_guest_mode_handle_work(vcpu);
+ -			if (rc)
+ -				goto skip_sie;
+ -			goto xfer_to_guest_mode_check;
+ -		}
+  		guest_timing_enter_irqoff();
+++<<<<<<< HEAD
+ +		rc = kvm_s390_enter_exit_sie(scb_s, vcpu->run->s.regs.gprs, vsie_page->gmap->asce);
+++=======
++ 		sie_return = kvm_s390_enter_exit_sie(scb_s, vcpu->run->s.regs.gprs, sg->asce.val);
+++>>>>>>> ab5119735e98 (KVM: s390: vsie: Avoid injecting machine check on signal)
+  		guest_timing_exit_irqoff();
+  		local_irq_enable();
+  	}
+diff --git a/arch/s390/include/asm/kvm_host.h b/arch/s390/include/asm/kvm_host.h
+index ada0f0233733..d48e0e259393 100644
+--- a/arch/s390/include/asm/kvm_host.h
++++ b/arch/s390/include/asm/kvm_host.h
+@@ -704,6 +704,9 @@ void kvm_arch_crypto_clear_masks(struct kvm *kvm);
+ void kvm_arch_crypto_set_masks(struct kvm *kvm, unsigned long *apm,
+ 			       unsigned long *aqm, unsigned long *adm);
+ 
++#define SIE64_RETURN_NORMAL	0
++#define SIE64_RETURN_MCCK	1
++
+ int __sie64a(phys_addr_t sie_block_phys, struct kvm_s390_sie_block *sie_block, u64 *rsa,
+ 	     unsigned long gasce);
+ 
+diff --git a/arch/s390/include/asm/stacktrace.h b/arch/s390/include/asm/stacktrace.h
+index 704885ec5c32..2315b49bbc38 100644
+--- a/arch/s390/include/asm/stacktrace.h
++++ b/arch/s390/include/asm/stacktrace.h
+@@ -62,7 +62,7 @@ struct stack_frame {
+ 		struct {
+ 			unsigned long sie_control_block;
+ 			unsigned long sie_savearea;
+-			unsigned long sie_reason;
++			unsigned long sie_return;
+ 			unsigned long sie_flags;
+ 			unsigned long sie_control_block_phys;
+ 			unsigned long sie_guest_asce;
+diff --git a/arch/s390/kernel/asm-offsets.c b/arch/s390/kernel/asm-offsets.c
+index 2df185f3a155..3b28c0dab0e3 100644
+--- a/arch/s390/kernel/asm-offsets.c
++++ b/arch/s390/kernel/asm-offsets.c
+@@ -59,7 +59,7 @@ int main(void)
+ 	OFFSET(__SF_EMPTY, stack_frame, empty[0]);
+ 	OFFSET(__SF_SIE_CONTROL, stack_frame, sie_control_block);
+ 	OFFSET(__SF_SIE_SAVEAREA, stack_frame, sie_savearea);
+-	OFFSET(__SF_SIE_REASON, stack_frame, sie_reason);
++	OFFSET(__SF_SIE_RETURN, stack_frame, sie_return);
+ 	OFFSET(__SF_SIE_FLAGS, stack_frame, sie_flags);
+ 	OFFSET(__SF_SIE_CONTROL_PHYS, stack_frame, sie_control_block_phys);
+ 	OFFSET(__SF_SIE_GUEST_ASCE, stack_frame, sie_guest_asce);
+diff --git a/arch/s390/kernel/entry.S b/arch/s390/kernel/entry.S
+index 6fec0cfd22b7..ff9652a68e19 100644
+--- a/arch/s390/kernel/entry.S
++++ b/arch/s390/kernel/entry.S
+@@ -184,7 +184,7 @@ SYM_FUNC_START(__sie64a)
+ 	stg	%r3,__SF_SIE_CONTROL(%r15)	# ...and virtual addresses
+ 	stg	%r4,__SF_SIE_SAVEAREA(%r15)	# save guest register save area
+ 	stg	%r5,__SF_SIE_GUEST_ASCE(%r15)	# save guest asce
+-	xc	__SF_SIE_REASON(8,%r15),__SF_SIE_REASON(%r15) # reason code = 0
++	xc	__SF_SIE_RETURN(8,%r15),__SF_SIE_RETURN(%r15) # return code = 0
+ 	mvc	__SF_SIE_FLAGS(8,%r15),__TI_flags(%r14) # copy thread flags
+ 	lmg	%r0,%r13,0(%r4)			# load guest gprs 0-13
+ 	mvi	__TI_sie(%r14),1
+@@ -221,7 +221,7 @@ SYM_INNER_LABEL(sie_exit, SYM_L_GLOBAL)
+ 	xgr	%r4,%r4
+ 	xgr	%r5,%r5
+ 	lmg	%r6,%r14,__SF_GPRS(%r15)	# restore kernel registers
+-	lg	%r2,__SF_SIE_REASON(%r15)	# return exit reason code
++	lg	%r2,__SF_SIE_RETURN(%r15)	# return sie return code
+ 	BR_EX	%r14
+ SYM_FUNC_END(__sie64a)
+ EXPORT_SYMBOL(__sie64a)
+diff --git a/arch/s390/kernel/nmi.c b/arch/s390/kernel/nmi.c
+index fbd218b6fc8e..3de675e03023 100644
+--- a/arch/s390/kernel/nmi.c
++++ b/arch/s390/kernel/nmi.c
+@@ -423,8 +423,8 @@ void notrace s390_do_machine_check(struct pt_regs *regs)
+ 	mcck_dam_code = (mci.val & MCIC_SUBCLASS_MASK);
+ 	if (test_cpu_flag(CIF_MCCK_GUEST) &&
+ 	(mcck_dam_code & MCCK_CODE_NO_GUEST) != mcck_dam_code) {
+-		/* Set exit reason code for host's later handling */
+-		*((long *)(regs->gprs[15] + __SF_SIE_REASON)) = -EINTR;
++		/* Set sie return code for host's later handling */
++		((struct stack_frame *)regs->gprs[15])->sie_return = SIE64_RETURN_MCCK;
+ 	}
+ 	clear_cpu_flag(CIF_MCCK_GUEST);
+ 
+* Unmerged path arch/s390/kvm/kvm-s390.c
+* Unmerged path arch/s390/kvm/vsie.c
