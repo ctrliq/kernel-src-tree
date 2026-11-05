@@ -1,0 +1,220 @@
+smb: client: bound dirent name against end of SMB response in cifs_filldir
+
+jira KERNEL-1848
+cve CVE-2026-93787
+Rebuild_History Non-Buildable kernel-4.18.0-553.182.1.el8_10
+commit-author Jay Vadayath <jay@artiphishell.com>
+commit f8cf09a53a0dc1da298e9dd0ba5f21710cf119d6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-553.182.1.el8_10/f8cf09a5.failed
+
+cifs_filldir() copies the entry name out of an SMB1 TRANS2_FIND_FIRST /
+FIND_NEXT response using a length (de.namelen) supplied by the server.
+The kmalloc'd SMB response buffer is bounded, but nothing checks that
+de.name + de.namelen still lies inside that buffer before the eventual
+filldir64() -> verify_dirent_name() -> memchr() reads namelen bytes.
+
+A hostile SMB1 server that returns an oversized FileNameLength in a
+directory entry therefore causes memchr() to read past the end of the
+response slab buffer. Reachable from any user who can list a directory
+on a CIFS mount served by an attacker-controlled server (getdents64()
+on the mounted directory):
+
+  BUG: KASAN: slab-out-of-bounds in memchr+0x71/0x80
+  Read of size 1 at addr ffff88800e0640cc by task poc/115
+  Call Trace:
+   dump_stack_lvl+0x64/0x80
+   print_report+0xce/0x620
+   kasan_report+0xec/0x120
+   memchr+0x71/0x80
+   filldir64+0x4c/0x6a0
+   cifs_filldir.constprop.0+0x9bb/0x1e00
+   cifs_readdir+0x2101/0x3380
+   iterate_dir+0x19c/0x520
+   __x64_sys_getdents64+0x126/0x210
+   do_syscall_64+0x107/0x5a0
+   entry_SYSCALL_64_after_hwframe+0x77/0x7f
+
+Pass the end-of-response pointer down to cifs_filldir() and reject
+entries whose name would extend past that boundary.
+
+This bug was discovered by Artiphishell's vTriage pipeline, which
+generated a userspace reproducer (an emulated hostile SMB1 server plus
+a getdents64() client) that reliably triggers the KASAN report on an
+unpatched kernel. The fix below was drafted with the Claude coding
+assistant; a userspace reproducer is available on request.
+
+Assisted-by: Claude:claude-opus-4-7
+	Signed-off-by: Jay Vadayath <jay@artiphishell.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit f8cf09a53a0dc1da298e9dd0ba5f21710cf119d6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/readdir.c
+diff --cc fs/cifs/readdir.c
+index 6d17a60b9d55,32a75afca8f5..000000000000
+--- a/fs/cifs/readdir.c
++++ b/fs/cifs/readdir.c
+@@@ -839,9 -817,142 +839,15 @@@ find_cifs_entry(const unsigned int xid
+  	return rc;
+  }
+  
+ -static bool emit_cached_dirents(struct cached_dirents *cde,
+ -				struct dir_context *ctx)
+ -{
+ -	struct cached_dirent *dirent;
+ -	bool rc;
+ -
+ -	list_for_each_entry(dirent, &cde->entries, entry) {
+ -		/*
+ -		 * Skip all early entries prior to the current lseek()
+ -		 * position.
+ -		 */
+ -		if (ctx->pos > dirent->pos)
+ -			continue;
+ -		/*
+ -		 * We recorded the current ->pos value for the dirent
+ -		 * when we stored it in the cache.
+ -		 * However, this sequence of ->pos values may have holes
+ -		 * in it, for example dot-dirs returned from the server
+ -		 * are suppressed.
+ -		 * Handle this by forcing ctx->pos to be the same as the
+ -		 * ->pos of the current dirent we emit from the cache.
+ -		 * This means that when we emit these entries from the cache
+ -		 * we now emit them with the same ->pos value as in the
+ -		 * initial scan.
+ -		 */
+ -		ctx->pos = dirent->pos;
+ -		rc = dir_emit(ctx, dirent->name, dirent->namelen,
+ -			      dirent->fattr.cf_uniqueid,
+ -			      dirent->fattr.cf_dtype);
+ -		if (!rc)
+ -			return rc;
+ -		ctx->pos++;
+ -	}
+ -	return true;
+ -}
+ -
+ -static void update_cached_dirents_count(struct cached_dirents *cde,
+ -					struct file *file)
+ -{
+ -	if (cde->file != file)
+ -		return;
+ -	if (cde->is_valid || cde->is_failed)
+ -		return;
+ -
+ -	cde->pos++;
+ -}
+ -
+ -static void finished_cached_dirents_count(struct cached_dirents *cde,
+ -					struct dir_context *ctx, struct file *file)
+ -{
+ -	if (cde->file != file)
+ -		return;
+ -	if (cde->is_valid || cde->is_failed)
+ -		return;
+ -	if (ctx->pos != cde->pos)
+ -		return;
+ -
+ -	cde->is_valid = 1;
+ -}
+ -
+ -static bool add_cached_dirent(struct cached_dirents *cde,
+ -			      struct dir_context *ctx, const char *name,
+ -			      int namelen, struct cifs_fattr *fattr,
+ -			      struct file *file)
+ -{
+ -	struct cached_dirent *de;
+ -
+ -	if (cde->file != file)
+ -		return false;
+ -	if (cde->is_valid || cde->is_failed)
+ -		return false;
+ -	if (ctx->pos != cde->pos) {
+ -		cde->is_failed = 1;
+ -		return false;
+ -	}
+ -	de = kzalloc_obj(*de, GFP_ATOMIC);
+ -	if (de == NULL) {
+ -		cde->is_failed = 1;
+ -		return false;
+ -	}
+ -	de->namelen = namelen;
+ -	de->name = kstrndup(name, namelen, GFP_ATOMIC);
+ -	if (de->name == NULL) {
+ -		kfree(de);
+ -		cde->is_failed = 1;
+ -		return false;
+ -	}
+ -	de->pos = ctx->pos;
+ -
+ -	memcpy(&de->fattr, fattr, sizeof(struct cifs_fattr));
+ -
+ -	list_add_tail(&de->entry, &cde->entries);
+ -	/* update accounting */
+ -	cde->entries_count++;
+ -	cde->bytes_used += sizeof(*de) + (size_t)namelen + 1;
+ -	return true;
+ -}
+ -
+ -static bool cifs_dir_emit(struct dir_context *ctx,
+ -			  const char *name, int namelen,
+ -			  struct cifs_fattr *fattr,
+ -			  struct cached_fid *cfid,
+ -			  struct file *file)
+ -{
+ -	size_t delta_bytes = 0;
+ -	bool rc, added = false;
+ -	ino_t ino = cifs_uniqueid_to_ino_t(fattr->cf_uniqueid);
+ -
+ -	rc = dir_emit(ctx, name, namelen, ino, fattr->cf_dtype);
+ -	if (!rc)
+ -		return rc;
+ -
+ -	if (cfid) {
+ -		/* Cost of this entry */
+ -		delta_bytes = sizeof(struct cached_dirent) + (size_t)namelen + 1;
+ -
+ -		mutex_lock(&cfid->dirents.de_mutex);
+ -		added = add_cached_dirent(&cfid->dirents, ctx, name, namelen,
+ -					  fattr, file);
+ -		mutex_unlock(&cfid->dirents.de_mutex);
+ -
+ -		if (added) {
+ -			/* per-tcon then global for consistency with free path */
+ -			atomic64_add((long long)delta_bytes, &cfid->cfids->total_dirents_bytes);
+ -			atomic_long_inc(&cfid->cfids->total_dirents_entries);
+ -			atomic64_add((long long)delta_bytes, &cifs_dircache_bytes_used);
+ -		}
+ -	}
+ -
+ -	return rc;
+ -}
+ -
+  static int cifs_filldir(char *find_entry, struct file *file,
+++<<<<<<< HEAD:fs/cifs/readdir.c
+ +		struct dir_context *ctx,
+ +		char *scratch_buf, unsigned int max_len)
+++=======
++ 			struct dir_context *ctx,
++ 			char *scratch_buf, unsigned int max_len,
++ 			char *end_of_smb, struct cached_fid *cfid)
+++>>>>>>> f8cf09a53a0d (smb: client: bound dirent name against end of SMB response in cifs_filldir):fs/smb/client/readdir.c
+  {
+  	struct cifsFileInfo *file_info = file->private_data;
+  	struct super_block *sb = file_inode(file)->i_sb;
+@@@ -1026,7 -1199,7 +1037,11 @@@ int cifs_readdir(struct file *file, str
+  		 */
+  		*tmp_buf = 0;
+  		rc = cifs_filldir(current_entry, file, ctx,
+++<<<<<<< HEAD:fs/cifs/readdir.c
+ +				  tmp_buf, max_len);
+++=======
++ 				  tmp_buf, max_len, end_of_smb, cfid);
+++>>>>>>> f8cf09a53a0d (smb: client: bound dirent name against end of SMB response in cifs_filldir):fs/smb/client/readdir.c
+  		if (rc) {
+  			if (rc > 0)
+  				rc = 0;
+* Unmerged path fs/cifs/readdir.c
