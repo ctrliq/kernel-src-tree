@@ -1,0 +1,168 @@
+x86/bugs: Make Safe-RET robust against interrupt injection
+
+jira KERNEL-1864
+cve CVE-2026-68480
+Rebuild_History Non-Buildable kernel-6.12.0-264.7.1.el10_3
+commit-author Borislav Petkov (AMD) <bp@alien8.de>
+commit 7e7f81cf6f5ca3311e526308f55d7c54d3ba71f9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-264.7.1.el10_3/7e7f81cf.failed
+
+An attacker injecting interrupts while the Safe-RET mitigation executes
+on machines affected by SRSO can neutralize the safe return sequence,
+potentially leading to data leakage through speculative execution.
+
+Fixup register state as if the Safe-RET sequence executed successfully
+by "emulating" it, in a manner of speaking, and avoid executing a RET
+instruction after returning from the interrupt.
+
+Co-developed-by: David Kaplan <David.Kaplan@amd.com>
+	Signed-off-by: David Kaplan <David.Kaplan@amd.com>
+	Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+(cherry picked from commit 7e7f81cf6f5ca3311e526308f55d7c54d3ba71f9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/nospec-branch.h
+diff --cc arch/x86/include/asm/nospec-branch.h
+index d2818f4f6eed,2ea6591bc7b9..000000000000
+--- a/arch/x86/include/asm/nospec-branch.h
++++ b/arch/x86/include/asm/nospec-branch.h
+@@@ -12,7 -12,7 +12,11 @@@
+  #include <asm/msr-index.h>
+  #include <asm/unwind_hints.h>
+  #include <asm/percpu.h>
+++<<<<<<< HEAD
+ +#include <asm/current.h>
+++=======
++ #include <asm/ptrace-abi.h>
+++>>>>>>> 7e7f81cf6f5c (x86/bugs: Make Safe-RET robust against interrupt injection)
+  
+  /*
+   * Call depth tracking for Intel SKL CPUs to address the RSB underflow
+diff --git a/arch/x86/entry/entry_64.S b/arch/x86/entry/entry_64.S
+index b03f2ad68bc6..e17b9e64dbee 100644
+--- a/arch/x86/entry/entry_64.S
++++ b/arch/x86/entry/entry_64.S
+@@ -936,6 +936,8 @@ SYM_CODE_START(paranoid_entry)
+ 	IBRS_ENTER save_reg=%r15
+ 	UNTRAIN_RET_FROM_CALL
+ 
++	HANDLE_INTR_SAFERET 8(%rsp)
++
+ 	RET
+ SYM_CODE_END(paranoid_entry)
+ 
+@@ -1038,6 +1040,11 @@ SYM_CODE_START(error_entry)
+ 	movl	%ecx, %eax			/* zero extend */
+ 	cmpq	%rax, RIP+8(%rsp)
+ 	je	.Lbstep_iret
++
++	VALIDATE_UNRET_END
++
++	HANDLE_INTR_SAFERET 8(%rsp)
++
+ 	cmpq	$.Lgs_change, RIP+8(%rsp)
+ 	jne	.Lerror_entry_done_lfence
+ 
+@@ -1056,7 +1063,6 @@ SYM_CODE_START(error_entry)
+ 	FENCE_SWAPGS_KERNEL_ENTRY
+ 	CALL_DEPTH_ACCOUNT
+ 	leaq	8(%rsp), %rax			/* return pt_regs pointer */
+-	VALIDATE_UNRET_END
+ 	RET
+ 
+ .Lbstep_iret:
+* Unmerged path arch/x86/include/asm/nospec-branch.h
+diff --git a/arch/x86/kernel/cpu/bugs.c b/arch/x86/kernel/cpu/bugs.c
+index 659fad265518..6a97350362b0 100644
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@ -3788,3 +3788,42 @@ void __warn_thunk(void)
+ {
+ 	WARN_ONCE(1, "Unpatched return thunk in use. This should not happen!\n");
+ }
++
++#ifdef CONFIG_MITIGATION_SRSO
++/*
++ * Called during exception/interrupt entry if interrupted during the
++ * safe-RET sequence.  The safe-RET sequence consists of 3 instructions:
++ *
++ *	CALL
++ *	LEA 8(%RSP), %RSP
++ *	RET
++ *
++ * An interrupt after the CALL or after the LEA could potentially lead
++ * to branch predictor poisoning and results in the sequence not being
++ * able to be safely resumed.
++ *
++ * Therefore, modify the regs state as if the remaining part of the
++ * safe-RET sequence executed so the interrupt returns back to the
++ * desired return target, instead of the to the safe-RET sequence.
++ */
++void noinstr handle_interrupted_saferet(struct pt_regs *regs)
++{
++	unsigned long rip = regs->ip;
++
++	if (rip == (unsigned long) srso_safe_ret ||
++	    rip == (unsigned long) srso_alias_safe_ret) {
++	    /* Modify stack pointer as if LEA executed: */
++	    regs->sp += 8;
++	}
++
++	/*
++	 * Adjust registers as if RET executed:
++	 *
++	 * 1. Read the return address off the stack and into rIP:
++	 */
++	regs->ip = *(unsigned long *)(regs->sp);
++
++	/* 2. Pop rIP off the stack: */
++	regs->sp += 8;
++}
++#endif /* CONFIG_MITIGATION_SRSO */
+diff --git a/arch/x86/lib/retpoline.S b/arch/x86/lib/retpoline.S
+index 8f84d6cdf529..cb8149271c85 100644
+--- a/arch/x86/lib/retpoline.S
++++ b/arch/x86/lib/retpoline.S
+@@ -169,10 +169,24 @@ __EXPORT_THUNK(srso_alias_untrain_ret)
+ 
+ 	.pushsection .text..__x86.rethunk_safe
+ SYM_CODE_START_NOALIGN(srso_alias_safe_ret)
++
++	/*
++	 * Tell objtool that those are not function pointers referenced by
++	 * __HANDLE_INTR_SAFERET(). Below too.
++	 */
++	ANNOTATE_NOENDBR
++
++	/*
++	 * Safe-RET sequence. If you need to change it, adjust
++	 * handle_interrupted_saferet() too.
++	 */
+ 	lea 8(%_ASM_SP), %_ASM_SP
+ 	UNWIND_HINT_FUNC
++
++	ANNOTATE_NOENDBR
+ 	ANNOTATE_UNRET_SAFE
+ 	ret
++	/* End of Safe-RET sequence */
+ 	int3
+ SYM_FUNC_END(srso_alias_safe_ret)
+ 
+@@ -207,8 +221,14 @@ SYM_CODE_START_LOCAL_NOALIGN(srso_untrain_ret)
+  * the stack.
+  */
+ SYM_INNER_LABEL(srso_safe_ret, SYM_L_GLOBAL)
++	/*
++	 * Safe-RET sequence. If you need to change it, adjust
++	 * handle_interrupted_saferet() too.
++	 */
+ 	lea 8(%_ASM_SP), %_ASM_SP
+ 	ret
++	/* End of Safe-RET sequence */
++
+ 	int3
+ 	int3
+ 	/* end of movabs */
