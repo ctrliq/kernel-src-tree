@@ -1,0 +1,389 @@
+block: add a bio_endio_status helper
+
+jira KERNEL-1864
+Rebuild_History Non-Buildable kernel-6.12.0-264.7.1.el10_3
+commit-author Christoph Hellwig <hch@lst.de>
+commit a7d8eaee7fafe2e2c58aef9579bdef778c144029
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-264.7.1.el10_3/a7d8eaee.failed
+
+Add a helper that sets bi_status and call bio_endio() as that is a very
+common pattern and convert the core block code over to it.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Keith Busch <kbusch@kernel.org>
+	Reviewed-by: Md Haris Iqbal <haris.iqbal@linux.dev>
+	Reviewed-by: Damien Le Moal <dlemoal@kernel.org>
+	Reviewed-by: Hannes Reinecke <hare@kernel.org>
+Link: https://patch.msgid.link/20260528084632.2505277-1-hch@lst.de
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit a7d8eaee7fafe2e2c58aef9579bdef778c144029)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-crypto-fallback.c
+#	block/blk-crypto.c
+diff --cc block/blk-crypto-fallback.c
+index 86b27f96051a,8b04d9205b8d..000000000000
+--- a/block/blk-crypto-fallback.c
++++ b/block/blk-crypto-fallback.c
+@@@ -341,69 -310,80 +341,94 @@@ static bool blk_crypto_fallback_encrypt
+  			src.offset += data_unit_size;
+  			dst.offset += data_unit_size;
+  		}
+ -
+ -		bio_advance_iter_single(src_bio, &src_bio->bi_iter,
+ -				src_bv.bv_len);
+ -		if (!src_bio->bi_iter.bi_size)
+ -			break;
+ -
+ -		if (enc_idx == nr_enc_pages) {
+ -			/*
+ -			 * For each additional encrypted bio submitted,
+ -			 * increment the source bio's remaining count.  Each
+ -			 * encrypted bio's completion handler calls bio_endio on
+ -			 * the source bio, so this keeps the source bio from
+ -			 * completing until the last encrypted bio does.
+ -			 */
+ -			bio_inc_remaining(src_bio);
+ -			submit_bio(enc_bio);
+ -			goto new_bio;
+ -		}
+  	}
+  
+ -	submit_bio(enc_bio);
+ -	return;
+ -
+ -out_free_enc_bio:
+ -	/*
+ -	 * Add the remaining pages to the bio so that the normal completion path
+ -	 * in blk_crypto_fallback_encrypt_endio frees them.  The exact data
+ -	 * layout does not matter for that, so don't bother iterating the source
+ -	 * bio.
+ -	 */
+ -	for (; enc_idx < nr_enc_pages; enc_idx++)
+ -		__bio_add_page(enc_bio, enc_pages[enc_idx], PAGE_SIZE, 0);
+ -	bio_endio(enc_bio);
+ -}
+ -
+ +	enc_bio->bi_private = src_bio;
+ +	enc_bio->bi_end_io = blk_crypto_fallback_encrypt_endio;
+ +	*bio_ptr = enc_bio;
+ +	ret = true;
+ +
+ +	enc_bio = NULL;
+ +	goto out_free_ciph_req;
+ +
+++<<<<<<< HEAD
+ +out_free_bounce_pages:
+ +	while (i > 0)
+ +		mempool_free(enc_bio->bi_io_vec[--i].bv_page,
+ +			     blk_crypto_bounce_page_pool);
+ +out_free_ciph_req:
+ +	skcipher_request_free(ciph_req);
+ +out_release_keyslot:
+++=======
++ /*
++  * The crypto API fallback's encryption routine.
++  *
++  * Allocate one or more bios for encryption, encrypt the input bio using the
++  * crypto API, and submit the encrypted bios.  Sets bio->bi_status and
++  * completes the source bio on error
++  */
++ static void blk_crypto_fallback_encrypt_bio(struct bio *src_bio)
++ {
++ 	struct bio_crypt_ctx *bc = src_bio->bi_crypt_context;
++ 	struct blk_crypto_keyslot *slot;
++ 	blk_status_t status;
++ 
++ 	status = blk_crypto_get_keyslot(blk_crypto_fallback_profile,
++ 					bc->bc_key, &slot);
++ 	if (status != BLK_STS_OK) {
++ 		bio_endio_status(src_bio, status);
++ 		return;
++ 	}
++ 	__blk_crypto_fallback_encrypt_bio(src_bio,
++ 			blk_crypto_fallback_tfm(slot));
+++>>>>>>> a7d8eaee7faf (block: add a bio_endio_status helper)
+  	blk_crypto_put_keyslot(slot);
+ +out_put_enc_bio:
+ +	if (enc_bio)
+ +		bio_uninit(enc_bio);
+ +	kfree(enc_bio);
+ +	return ret;
+  }
+  
+ -static blk_status_t __blk_crypto_fallback_decrypt_bio(struct bio *bio,
+ -		struct bio_crypt_ctx *bc, struct bvec_iter iter,
+ -		struct crypto_sync_skcipher *tfm)
+ +/*
+ + * The crypto API fallback's main decryption routine.
+ + * Decrypts input bio in place, and calls bio_endio on the bio.
+ + */
+ +static void blk_crypto_fallback_decrypt_bio(struct work_struct *work)
+  {
+ -	SYNC_SKCIPHER_REQUEST_ON_STACK(ciph_req, tfm);
+ +	struct bio_fallback_crypt_ctx *f_ctx =
+ +		container_of(work, struct bio_fallback_crypt_ctx, work);
+ +	struct bio *bio = f_ctx->bio;
+ +	struct bio_crypt_ctx *bc = &f_ctx->crypt_ctx;
+ +	struct blk_crypto_keyslot *slot;
+ +	struct skcipher_request *ciph_req = NULL;
+ +	DECLARE_CRYPTO_WAIT(wait);
+  	u64 curr_dun[BLK_CRYPTO_DUN_ARRAY_SIZE];
+  	union blk_crypto_iv iv;
+  	struct scatterlist sg;
+  	struct bio_vec bv;
+ +	struct bvec_iter iter;
+  	const int data_unit_size = bc->bc_key->crypto_cfg.data_unit_size;
+  	unsigned int i;
+ +	blk_status_t blk_st;
+  
+ -	skcipher_request_set_callback(ciph_req,
+ -			CRYPTO_TFM_REQ_MAY_BACKLOG | CRYPTO_TFM_REQ_MAY_SLEEP,
+ -			NULL, NULL);
+ +	/*
+ +	 * Get a blk-crypto-fallback keyslot that contains a crypto_skcipher for
+ +	 * this bio's algorithm and key.
+ +	 */
+ +	blk_st = blk_crypto_get_keyslot(blk_crypto_fallback_profile,
+ +					bc->bc_key, &slot);
+ +	if (blk_st != BLK_STS_OK) {
+ +		bio->bi_status = blk_st;
+ +		goto out_no_keyslot;
+ +	}
+ +
+++<<<<<<< HEAD
+ +	/* and then allocate an skcipher_request for it */
+ +	if (!blk_crypto_fallback_alloc_cipher_req(slot, &ciph_req, &wait)) {
+ +		bio->bi_status = BLK_STS_RESOURCE;
+ +		goto out;
+ +	}
+  
+  	memcpy(curr_dun, bc->bc_dun, sizeof(curr_dun));
+  	sg_init_table(&sg, 1);
+@@@ -429,12 -409,34 +454,15 @@@
+  		}
+  	}
+  
+ -	return BLK_STS_OK;
+ -}
+ -
+ -/*
+ - * The crypto API fallback's main decryption routine.
+ - *
+ - * Decrypts input bio in place, and calls bio_endio on the bio.
+ - */
+ -static void blk_crypto_fallback_decrypt_bio(struct work_struct *work)
+ -{
+ -	struct bio_fallback_crypt_ctx *f_ctx =
+ -		container_of(work, struct bio_fallback_crypt_ctx, work);
+ -	struct bio *bio = f_ctx->bio;
+ -	struct bio_crypt_ctx *bc = &f_ctx->crypt_ctx;
+ -	struct blk_crypto_keyslot *slot;
+ -	blk_status_t status;
+ -
+ -	status = blk_crypto_get_keyslot(blk_crypto_fallback_profile,
+ -					bc->bc_key, &slot);
+ -	if (status == BLK_STS_OK) {
+ -		status = __blk_crypto_fallback_decrypt_bio(bio, bc,
+ -				f_ctx->crypt_iter,
+ -				blk_crypto_fallback_tfm(slot));
+ -		blk_crypto_put_keyslot(slot);
+ -	}
+ +out:
+ +	skcipher_request_free(ciph_req);
+ +	blk_crypto_put_keyslot(slot);
+ +out_no_keyslot:
+  	mempool_free(f_ctx, bio_fallback_crypt_ctx_pool);
+ -
+ +	bio_endio(bio);
+++=======
++ 	bio_endio_status(bio, status);
+++>>>>>>> a7d8eaee7faf (block: add a bio_endio_status helper)
+  }
+  
+  /**
+@@@ -498,7 -497,7 +526,11 @@@ bool blk_crypto_fallback_bio_prep(struc
+  
+  	if (!__blk_crypto_cfg_supported(blk_crypto_fallback_profile,
+  					&bc->bc_key->crypto_cfg)) {
+++<<<<<<< HEAD
+ +		bio->bi_status = BLK_STS_NOTSUPP;
+++=======
++ 		bio_endio_status(bio, BLK_STS_NOTSUPP);
+++>>>>>>> a7d8eaee7faf (block: add a bio_endio_status helper)
+  		return false;
+  	}
+  
+diff --cc block/blk-crypto.c
+index 3e7bf1974cbd,165c9d2cce07..000000000000
+--- a/block/blk-crypto.c
++++ b/block/blk-crypto.c
+@@@ -297,18 -260,22 +297,32 @@@ bool __blk_crypto_bio_prep(struct bio *
+  	}
+  
+  	/*
+ -	 * If the device does not natively support the encryption context, try to use
+ -	 * the fallback if available.
+ +	 * Success if device supports the encryption context, or if we succeeded
+ +	 * in falling back to the crypto API.
+  	 */
+++<<<<<<< HEAD
+ +	if (blk_crypto_config_supported_natively(bio->bi_bdev,
+ +						 &bc_key->crypto_cfg))
+ +		return true;
+ +	if (blk_crypto_fallback_bio_prep(bio_ptr))
+ +		return true;
+ +fail:
+ +	bio_endio(*bio_ptr);
+ +	return false;
+++=======
++ 	if (!blk_crypto_config_supported_natively(bdev, &bc_key->crypto_cfg)) {
++ 		if (!IS_ENABLED(CONFIG_BLK_INLINE_ENCRYPTION_FALLBACK)) {
++ 			pr_warn_once("%pg: crypto API fallback disabled; failing request.\n",
++ 				bdev);
++ 			bio_endio_status(bio, BLK_STS_NOTSUPP);
++ 			return false;
++ 		}
++ 		return blk_crypto_fallback_bio_prep(bio);
++ 	}
++ 
++ 	return true;
+++>>>>>>> a7d8eaee7faf (block: add a bio_endio_status helper)
+  }
+ -EXPORT_SYMBOL_GPL(__blk_crypto_submit_bio);
+  
+  int __blk_crypto_rq_bio_prep(struct request *rq, struct bio *bio,
+  			     gfp_t gfp_mask)
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 9a1f90600671..7504d61a0f93 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -629,12 +629,10 @@ static void __submit_bio(struct bio *bio)
+ 		struct gendisk *disk = bio->bi_bdev->bd_disk;
+ 	
+ 		if ((bio->bi_opf & REQ_POLLED) &&
+-		    !(disk->queue->limits.features & BLK_FEAT_POLL)) {
+-			bio->bi_status = BLK_STS_NOTSUPP;
+-			bio_endio(bio);
+-		} else {
++		    !(disk->queue->limits.features & BLK_FEAT_POLL))
++			bio_endio_status(bio, BLK_STS_NOTSUPP);
++		else
+ 			disk->fops->submit_bio(bio);
+-		}
+ 		blk_queue_exit(disk->queue);
+ 	}
+ }
+@@ -870,8 +868,7 @@ void submit_bio_noacct(struct bio *bio)
+ not_supported:
+ 	status = BLK_STS_NOTSUPP;
+ end_io:
+-	bio->bi_status = status;
+-	bio_endio(bio);
++	bio_endio_status(bio, status);
+ }
+ EXPORT_SYMBOL(submit_bio_noacct);
+ 
+* Unmerged path block/blk-crypto-fallback.c
+* Unmerged path block/blk-crypto.c
+diff --git a/block/blk-merge.c b/block/blk-merge.c
+index d3115d7469df..2a02038167b0 100644
+--- a/block/blk-merge.c
++++ b/block/blk-merge.c
+@@ -122,8 +122,7 @@ struct bio *bio_submit_split_bioset(struct bio *bio, unsigned int split_sectors,
+ 	struct bio *split = bio_split(bio, split_sectors, GFP_NOIO, bs);
+ 
+ 	if (IS_ERR(split)) {
+-		bio->bi_status = errno_to_blk_status(PTR_ERR(split));
+-		bio_endio(bio);
++		bio_endio_status(bio, errno_to_blk_status(PTR_ERR(split)));
+ 		return NULL;
+ 	}
+ 
+@@ -143,8 +142,7 @@ EXPORT_SYMBOL_GPL(bio_submit_split_bioset);
+ static struct bio *bio_submit_split(struct bio *bio, int split_sectors)
+ {
+ 	if (unlikely(split_sectors < 0)) {
+-		bio->bi_status = errno_to_blk_status(split_sectors);
+-		bio_endio(bio);
++		bio_endio_status(bio, errno_to_blk_status(split_sectors));
+ 		return NULL;
+ 	}
+ 
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 2987d7b97207..4b25505b6fbd 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -3171,8 +3171,7 @@ void blk_mq_submit_bio(struct bio *bio)
+ 	}
+ 
+ 	if ((bio->bi_opf & REQ_POLLED) && !blk_mq_can_poll(q)) {
+-		bio->bi_status = BLK_STS_NOTSUPP;
+-		bio_endio(bio);
++		bio_endio_status(bio, BLK_STS_NOTSUPP);
+ 		goto queue_exit;
+ 	}
+ 
+@@ -3215,8 +3214,7 @@ void blk_mq_submit_bio(struct bio *bio)
+ 
+ 	ret = blk_crypto_rq_get_keyslot(rq);
+ 	if (ret != BLK_STS_OK) {
+-		bio->bi_status = ret;
+-		bio_endio(bio);
++		bio_endio_status(bio, ret);
+ 		blk_mq_free_request(rq);
+ 		return;
+ 	}
+diff --git a/block/fops.c b/block/fops.c
+index 224472e5621c..59e5fa3db683 100644
+--- a/block/fops.c
++++ b/block/fops.c
+@@ -219,8 +219,7 @@ static ssize_t __blkdev_direct_IO(struct kiocb *iocb, struct iov_iter *iter,
+ 
+ 		ret = blkdev_iov_iter_get_pages(bio, iter, bdev);
+ 		if (unlikely(ret)) {
+-			bio->bi_status = BLK_STS_IOERR;
+-			bio_endio(bio);
++			bio_endio_status(bio, BLK_STS_IOERR);
+ 			break;
+ 		}
+ 		if (iocb->ki_flags & IOCB_NOWAIT) {
+diff --git a/include/linux/bio.h b/include/linux/bio.h
+index ef504963d131..dddd40c2bcd4 100644
+--- a/include/linux/bio.h
++++ b/include/linux/bio.h
+@@ -378,16 +378,27 @@ void submit_bio(struct bio *bio);
+ 
+ extern void bio_endio(struct bio *);
+ 
+-static inline void bio_io_error(struct bio *bio)
++/**
++ * bio_endio_status - end I/O on a bio with a specific status
++ * @bio:	bio
++ * @status:	status to set
++ *
++ * Set @bio->bi_status to @status and call bio_endio().
++ **/
++static inline void bio_endio_status(struct bio *bio, blk_status_t status)
+ {
+-	bio->bi_status = BLK_STS_IOERR;
++	bio->bi_status = status;
+ 	bio_endio(bio);
+ }
+ 
++static inline void bio_io_error(struct bio *bio)
++{
++	bio_endio_status(bio, BLK_STS_IOERR);
++}
++
+ static inline void bio_wouldblock_error(struct bio *bio)
+ {
+-	bio->bi_status = BLK_STS_AGAIN;
+-	bio_endio(bio);
++	bio_endio_status(bio, BLK_STS_AGAIN);
+ }
+ 
+ /*
