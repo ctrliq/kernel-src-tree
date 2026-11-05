@@ -23,5 +23,6 @@ enum {
 int cpu_have_feature(unsigned int nr);
 
 #define cpu_has_seq_insn()	test_facility(85)
+#define cpu_has_tlb_lc()	test_facility(51)
 
 #endif /* __ASM_S390_CPUFEATURE_H */
