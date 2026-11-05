@@ -1,0 +1,241 @@
+KVM: s390: Introducing kvm_arch_set_irq_inatomic fast inject
+
+jira KERNEL-1864
+Rebuild_History Non-Buildable kernel-6.12.0-264.7.1.el10_3
+commit-author Douglas Freimuth <freimuth@linux.ibm.com>
+commit a868b30492c59f398359b7891293bbde8d126a51
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-6.12.0-264.7.1.el10_3/a868b304.failed
+
+s390 needs a fast path for irq injection, and along those lines we
+introduce kvm_arch_set_irq_inatomic. Instead of placing all interrupts on
+the global work queue as it does today, this patch provides a fast path for
+irq injection.
+
+The inatomic fast path cannot lose control since it is running with
+interrupts disabled. This meant making the following changes that exist on
+the slow path today. First, the adapter_indicators page needs to be mapped
+since it is accessed with interrupts disabled, so we added map/unmap
+functions. Second, access to shared resources between the fast and slow
+paths needed to be changed from mutex and semaphores to spin_lock's.
+Finally, the memory allocation on the slow path utilizes GFP_KERNEL_ACCOUNT
+but we had to implement the fast path with GFP_ATOMIC allocation. Each of
+these enhancements were required to prevent blocking on the fast inject
+path.
+
+Fencing of Fast Inject in Secure Execution environments is enabled in the
+patch series by not mapping adapter indicator pages. In Secure Execution
+environments the path of execution available before this patch is followed.
+
+Statistical counters have been added to enable analysis of irq injection on
+the fast path and slow path including io_390_inatomic, io_flic_inject_airq,
+io_set_adapter_int and io_390_inatomic_no_inject. The no inject counter
+captures adapter masked, coalesced and suppressed interrupts.
+
+	Reviewed-by: Matthew Rosato <mjrosato@linux.ibm.com>
+	Signed-off-by: Douglas Freimuth <freimuth@linux.ibm.com>
+	Acked-by: Claudio Imbrenda <imbrenda@linux.ibm.com>
+	Signed-off-by: Claudio Imbrenda <imbrenda@linux.ibm.com>
+Message-ID: <20260604192755.203143-4-freimuth@linux.ibm.com>
+(cherry picked from commit a868b30492c59f398359b7891293bbde8d126a51)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/include/asm/kvm_host.h
+#	arch/s390/kvm/interrupt.c
+#	arch/s390/kvm/kvm-s390.c
+diff --cc arch/s390/include/asm/kvm_host.h
+index ada0f0233733,eaa34c5bd3c1..000000000000
+--- a/arch/s390/include/asm/kvm_host.h
++++ b/arch/s390/include/asm/kvm_host.h
+@@@ -446,6 -448,12 +446,15 @@@ struct kvm_vcpu_arch 
+  struct kvm_vm_stat {
+  	struct kvm_vm_stat_generic generic;
+  	u64 inject_io;
+++<<<<<<< HEAD
+++=======
++ 	u64 io_390_adapter_map;
++ 	u64 io_390_adapter_unmap;
++ 	u64 io_390_inatomic;
++ 	u64 io_flic_inject_airq;
++ 	u64 io_set_adapter_int;
++ 	u64 io_390_inatomic_no_inject;
+++>>>>>>> a868b30492c5 (KVM: s390: Introducing kvm_arch_set_irq_inatomic fast inject)
+  	u64 inject_float_mchk;
+  	u64 inject_pfault_done;
+  	u64 inject_service_signal;
+diff --cc arch/s390/kvm/interrupt.c
+index a0cddf596412,51ea576bb445..000000000000
+--- a/arch/s390/kvm/interrupt.c
++++ b/arch/s390/kvm/interrupt.c
+@@@ -1965,15 -1978,10 +1977,17 @@@ static int __inject_vm(struct kvm *kvm
+  }
+  
+  int kvm_s390_inject_vm(struct kvm *kvm,
+- 		       struct kvm_s390_interrupt *s390int)
++ 		       struct kvm_s390_interrupt *s390int, struct kvm_s390_interrupt_info *inti)
+  {
+- 	struct kvm_s390_interrupt_info *inti;
+  	int rc;
+  
+++<<<<<<< HEAD
+ +	inti = kzalloc(sizeof(*inti), GFP_KERNEL_ACCOUNT);
+ +	if (!inti)
+ +		return -ENOMEM;
+ +
+++=======
+++>>>>>>> a868b30492c5 (KVM: s390: Introducing kvm_arch_set_irq_inatomic fast inject)
+  	inti->type = s390int->type;
+  	switch (inti->type) {
+  	case KVM_S390_INT_VIRTIO:
+@@@ -2756,35 -2941,60 +2791,85 @@@ static int adapter_indicators_set(struc
+  {
+  	unsigned long bit;
+  	int summary_set, idx;
+ -	struct s390_map_info *ind_info, *summary_info;
+ -	void *map;
+  	struct page *ind_page, *summary_page;
+ -	unsigned long flags;
+ +	void *map;
+  
+++<<<<<<< HEAD
+ +	ind_page = get_map_page(kvm, adapter_int->ind_addr);
+ +	if (!ind_page)
+ +		return -1;
+ +	summary_page = get_map_page(kvm, adapter_int->summary_addr);
+ +	if (!summary_page) {
+ +		put_page(ind_page);
+ +		return -1;
+++=======
++ 	ind_page = NULL;
++ 
++ 	spin_lock_irqsave(&adapter->maps_lock, flags);
++ 	ind_info = get_map_info(adapter, adapter_int->ind_addr);
++ 	if (!ind_info) {
++ 		spin_unlock_irqrestore(&adapter->maps_lock, flags);
++ 		ind_page = pin_map_page(kvm, adapter_int->ind_addr, 0);
++ 		if (!ind_page)
++ 			return -1;
++ 		idx = srcu_read_lock(&kvm->srcu);
++ 		map = page_address(ind_page);
++ 		bit = get_ind_bit(adapter_int->ind_addr,
++ 				  adapter_int->ind_offset, adapter->swap);
++ 		set_bit(bit, map);
++ 		mark_page_dirty(kvm, adapter_int->ind_gaddr >> PAGE_SHIFT);
++ 		set_page_dirty_lock(ind_page);
++ 		srcu_read_unlock(&kvm->srcu, idx);
++ 		unpin_user_page(ind_page);
++ 	} else {
++ 		map = page_address(ind_info->page);
++ 		bit = get_ind_bit(ind_info->addr, adapter_int->ind_offset, adapter->swap);
++ 		set_bit(bit, map);
++ 		spin_unlock_irqrestore(&adapter->maps_lock, flags);
++ 	}
++ 
++ 	spin_lock_irqsave(&adapter->maps_lock, flags);
++ 	summary_info = get_map_info(adapter, adapter_int->summary_addr);
++ 	if (!summary_info) {
++ 		spin_unlock_irqrestore(&adapter->maps_lock, flags);
++ 		summary_page = pin_map_page(kvm, adapter_int->summary_addr, 0);
++ 		if (WARN_ON_ONCE(!summary_page))
++ 			return -1;
++ 		idx = srcu_read_lock(&kvm->srcu);
++ 		map = page_address(summary_page);
++ 		bit = get_ind_bit(adapter_int->summary_addr,
++ 				  adapter_int->summary_offset, adapter->swap);
++ 		summary_set = test_and_set_bit(bit, map);
++ 		mark_page_dirty(kvm, adapter_int->summary_gaddr >> PAGE_SHIFT);
++ 		set_page_dirty_lock(summary_page);
++ 		srcu_read_unlock(&kvm->srcu, idx);
++ 		unpin_user_page(summary_page);
++ 	} else {
++ 		map = page_address(summary_info->page);
++ 		bit = get_ind_bit(summary_info->addr, adapter_int->summary_offset,
++ 				  adapter->swap);
++ 		summary_set = test_and_set_bit(bit, map);
++ 		spin_unlock_irqrestore(&adapter->maps_lock, flags);
+++>>>>>>> a868b30492c5 (KVM: s390: Introducing kvm_arch_set_irq_inatomic fast inject)
+  	}
+  
+ +	idx = srcu_read_lock(&kvm->srcu);
+ +	map = page_address(ind_page);
+ +	bit = get_ind_bit(adapter_int->ind_addr,
+ +			  adapter_int->ind_offset, adapter->swap);
+ +	set_bit(bit, map);
+ +	mark_page_dirty(kvm, adapter_int->ind_gaddr >> PAGE_SHIFT);
+ +	set_page_dirty_lock(ind_page);
+ +	map = page_address(summary_page);
+ +	bit = get_ind_bit(adapter_int->summary_addr,
+ +			  adapter_int->summary_offset, adapter->swap);
+ +	summary_set = test_and_set_bit(bit, map);
+ +	mark_page_dirty(kvm, adapter_int->summary_gaddr >> PAGE_SHIFT);
+ +	set_page_dirty_lock(summary_page);
+ +	srcu_read_unlock(&kvm->srcu, idx);
+ +
+ +	put_page(ind_page);
+ +	put_page(summary_page);
+  	return summary_set ? 0 : 1;
+  }
+  
+diff --cc arch/s390/kvm/kvm-s390.c
+index 7900674cf5e3,80b4bc497494..000000000000
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@@ -64,6 -68,12 +64,15 @@@
+  const struct kvm_stats_desc kvm_vm_stats_desc[] = {
+  	KVM_GENERIC_VM_STATS(),
+  	STATS_DESC_COUNTER(VM, inject_io),
+++<<<<<<< HEAD
+++=======
++ 	STATS_DESC_COUNTER(VM, io_390_adapter_map),
++ 	STATS_DESC_COUNTER(VM, io_390_adapter_unmap),
++ 	STATS_DESC_COUNTER(VM, io_390_inatomic),
++ 	STATS_DESC_COUNTER(VM, io_flic_inject_airq),
++ 	STATS_DESC_COUNTER(VM, io_set_adapter_int),
++ 	STATS_DESC_COUNTER(VM, io_390_inatomic_no_inject),
+++>>>>>>> a868b30492c5 (KVM: s390: Introducing kvm_arch_set_irq_inatomic fast inject)
+  	STATS_DESC_COUNTER(VM, inject_float_mchk),
+  	STATS_DESC_COUNTER(VM, inject_pfault_done),
+  	STATS_DESC_COUNTER(VM, inject_service_signal),
+* Unmerged path arch/s390/include/asm/kvm_host.h
+diff --git a/arch/s390/kvm/intercept.c b/arch/s390/kvm/intercept.c
+index 420ae62977e2..21a35ae69643 100644
+--- a/arch/s390/kvm/intercept.c
++++ b/arch/s390/kvm/intercept.c
+@@ -510,8 +510,9 @@ static int handle_pv_spx(struct kvm_vcpu *vcpu)
+ static int handle_pv_sclp(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_s390_float_interrupt *fi = &vcpu->kvm->arch.float_int;
++	unsigned long flags;
+ 
+-	spin_lock(&fi->lock);
++	spin_lock_irqsave(&fi->lock, flags);
+ 	/*
+ 	 * 2 cases:
+ 	 * a: an sccb answering interrupt was already pending or in flight.
+@@ -527,7 +528,7 @@ static int handle_pv_sclp(struct kvm_vcpu *vcpu)
+ 	fi->srv_signal.ext_params |= 0x43000;
+ 	set_bit(IRQ_PEND_EXT_SERVICE, &fi->pending_irqs);
+ 	clear_bit(IRQ_PEND_EXT_SERVICE, &fi->masked_irqs);
+-	spin_unlock(&fi->lock);
++	spin_unlock_irqrestore(&fi->lock, flags);
+ 	return 0;
+ }
+ 
+* Unmerged path arch/s390/kvm/interrupt.c
+* Unmerged path arch/s390/kvm/kvm-s390.c
+diff --git a/arch/s390/kvm/kvm-s390.h b/arch/s390/kvm/kvm-s390.h
+index 963ab12d9b40..bc202c6cdded 100644
+--- a/arch/s390/kvm/kvm-s390.h
++++ b/arch/s390/kvm/kvm-s390.h
+@@ -368,7 +368,8 @@ int __must_check kvm_s390_deliver_pending_interrupts(struct kvm_vcpu *vcpu);
+ void kvm_s390_clear_local_irqs(struct kvm_vcpu *vcpu);
+ void kvm_s390_clear_float_irqs(struct kvm *kvm);
+ int __must_check kvm_s390_inject_vm(struct kvm *kvm,
+-				    struct kvm_s390_interrupt *s390int);
++				    struct kvm_s390_interrupt *s390int,
++				    struct kvm_s390_interrupt_info *inti);
+ int __must_check kvm_s390_inject_vcpu(struct kvm_vcpu *vcpu,
+ 				      struct kvm_s390_irq *irq);
+ static inline int kvm_s390_inject_prog_irq(struct kvm_vcpu *vcpu,
