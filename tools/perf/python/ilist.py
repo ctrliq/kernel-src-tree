@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#! /usr/bin/python3 -s
 # SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
 """Interactive perf list."""
 

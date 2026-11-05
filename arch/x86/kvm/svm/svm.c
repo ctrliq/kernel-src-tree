@@ -4072,13 +4072,6 @@ static void svm_flush_tlb_all(struct kvm_vcpu *vcpu)
 	svm_flush_tlb_asid(vcpu);
 }
 
-static void svm_flush_tlb_guest(struct kvm_vcpu *vcpu)
-{
-	kvm_register_mark_dirty(vcpu, VCPU_EXREG_ERAPS);
-
-	svm_flush_tlb_asid(vcpu);
-}
-
 static void svm_flush_tlb_gva(struct kvm_vcpu *vcpu, gva_t gva, bool *full)
 {
 	struct vcpu_svm *svm = to_svm(vcpu);
@@ -4094,9 +4087,16 @@ static void svm_flush_tlb_gva(struct kvm_vcpu *vcpu, gva_t gva, bool *full)
 		return;
 	}
 
-	svm_flush_tlb_guest(vcpu);
+	svm_flush_tlb_asid(vcpu);
 	if (full)
 		*full = true;
+}
+
+static void svm_flush_tlb_guest(struct kvm_vcpu *vcpu)
+{
+	kvm_register_mark_dirty(vcpu, VCPU_EXREG_ERAPS);
+
+	svm_flush_tlb_asid(vcpu);
 }
 
 static inline void sync_cr8_to_lapic(struct kvm_vcpu *vcpu)

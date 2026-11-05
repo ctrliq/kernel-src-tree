@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#! /usr/bin/python3 -s
 #
 # Copyright (C) 2022 Roman Gushchin <roman.gushchin@linux.dev>
 # Copyright (C) 2022 Meta

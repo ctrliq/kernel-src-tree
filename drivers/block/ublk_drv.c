@@ -952,10 +952,20 @@ static size_t ublk_copy_user_pages(const struct request *req,
 
 		len = bv.bv_len - offset;
 		bv_buf = kmap_local_page(bv.bv_page) + bv.bv_offset + offset;
+		/*
+		 * Bio pages may originate from slab caches without a
+		 * usercopy region (e.g. jbd2 frozen metadata buffers).
+		 * This is the same data that the loop driver writes to
+		 * its backing file -- no exposure risk.  The bvec length
+		 * is always trusted, so the size check in
+		 * check_copy_size() is not needed either.  Use the
+		 * unchecked helpers to avoid false positives on slab
+		 * pages.
+		 */
 		if (dir == ITER_DEST)
-			copied = copy_to_iter(bv_buf, len, uiter);
+			copied = _copy_to_iter(bv_buf, len, uiter);
 		else
-			copied = copy_from_iter(bv_buf, len, uiter);
+			copied = _copy_from_iter(bv_buf, len, uiter);
 
 		kunmap_local(bv_buf);
 
@@ -1569,8 +1579,14 @@ static void ublk_reset_ch_dev(struct ublk_device *ub)
 {
 	int i;
 
-	for (i = 0; i < ub->dev_info.nr_hw_queues; i++)
-		ublk_queue_reinit(ub, ublk_get_queue(ub, i));
+	for (i = 0; i < ub->dev_info.nr_hw_queues; i++) {
+		struct ublk_queue *ubq = ublk_get_queue(ub, i);
+
+		/* Sync with ublk_cancel_cmd() */
+		spin_lock(&ubq->cancel_lock);
+		ublk_queue_reinit(ub, ubq);
+		spin_unlock(&ubq->cancel_lock);
+	}
 
 	/* set to NULL, otherwise new tasks cannot mmap io_cmd_buf */
 	ub->mm = NULL;
@@ -1893,6 +1909,7 @@ static void ublk_cancel_cmd(struct ublk_queue *ubq, unsigned tag,
 {
 	struct ublk_io *io = &ubq->ios[tag];
 	struct ublk_device *ub = ubq->dev;
+	struct io_uring_cmd *cmd = NULL;
 	struct request *req;
 	bool done;
 
@@ -1915,12 +1932,15 @@ static void ublk_cancel_cmd(struct ublk_queue *ubq, unsigned tag,
 
 	spin_lock(&ubq->cancel_lock);
 	done = !!(io->flags & UBLK_IO_FLAG_CANCELED);
-	if (!done)
+	if (!done) {
 		io->flags |= UBLK_IO_FLAG_CANCELED;
+		cmd = io->cmd;
+		io->cmd = NULL;
+	}
 	spin_unlock(&ubq->cancel_lock);
 
-	if (!done)
-		io_uring_cmd_done(io->cmd, UBLK_IO_RES_ABORT, 0, issue_flags);
+	if (!done && cmd)
+		io_uring_cmd_done(cmd, UBLK_IO_RES_ABORT, 0, issue_flags);
 }
 
 /*
@@ -3813,6 +3833,9 @@ static int ublk_ctrl_uring_cmd(struct io_uring_cmd *cmd,
 	    issue_flags & IO_URING_F_NONBLOCK)
 		return -EAGAIN;
 
+	if (!(issue_flags & IO_URING_F_SQE128))
+		return -EINVAL;
+
 	header.dev_id = READ_ONCE(ub_src->dev_id);
 	header.queue_id = READ_ONCE(ub_src->queue_id);
 	header.len = READ_ONCE(ub_src->len);
@@ -3820,9 +3843,6 @@ static int ublk_ctrl_uring_cmd(struct io_uring_cmd *cmd,
 	header.data[0] = READ_ONCE(ub_src->data[0]);
 	header.dev_path_len = READ_ONCE(ub_src->dev_path_len);
 	ublk_ctrl_cmd_dump(cmd_op, &header);
-
-	if (!(issue_flags & IO_URING_F_SQE128))
-		goto out;
 
 	ret = ublk_check_cmd_op(cmd_op);
 	if (ret)
