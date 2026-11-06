@@ -451,7 +451,7 @@ void fib6_select_path(const struct net *net, struct fib6_result *res,
 		const struct fib6_nh *nh = sibling->fib6_nh;
 		int nh_upper_bound;
 
-		if (!READ_ONCE(first->fib6_nsiblings))
+		if (!READ_ONCE(match->fib6_nsiblings))
 			break;
 
 		nh_upper_bound = atomic_read(&nh->fib_nh_upper_bound);
@@ -6830,9 +6830,11 @@ int __init ip6_route_init(void)
 out:
 	return ret;
 
+#if IS_BUILTIN(CONFIG_IPV6)
 #if defined(CONFIG_BPF_SYSCALL) && defined(CONFIG_PROC_FS)
 out_register_notifier:
 	unregister_netdevice_notifier(&ip6_route_dev_notifier);
+#endif
 #endif
 out_register_late_subsys:
 	rtnl_unregister_all(PF_INET6);
