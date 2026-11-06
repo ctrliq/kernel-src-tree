@@ -1,0 +1,324 @@
+s390/alternatives: Rework to allow for callbacks
+
+jira KERNEL-1869
+Rebuild_History Non-Buildable kernel-5.14.0-741.7.1.el9_9
+commit-author Heiko Carstens <hca@linux.ibm.com>
+commit b3e0c5f734f934dab1cfdef669e3baa165a0cbfe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-741.7.1.el9_9/b3e0c5f7.failed
+
+Rework alternatives to allow for callbacks. With this every
+alternative entry has additional data encoded:
+
+- When (aka context) an alternative is supposed to be applied
+
+- The type of an alternative, which allows for type specific handling
+  and callbacks
+
+- Extra type specific payload (patch information), which can be passed
+  to callbacks in order to decide if an alternative should be applied
+  or not
+
+With this only the "late" context is implemented, which means there is
+no change to the previous behaviour. All code is just converted to the
+more generic new infrastructure.
+
+	Reviewed-by: Alexander Gordeev <agordeev@linux.ibm.com>
+	Tested-by: Sven Schnelle <svens@linux.ibm.com>
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+	Signed-off-by: Vasily Gorbik <gor@linux.ibm.com>
+(cherry picked from commit b3e0c5f734f934dab1cfdef669e3baa165a0cbfe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kernel/alternative.c
+diff --cc arch/s390/kernel/alternative.c
+index a21c8800070f,ecabdff89bce..000000000000
+--- a/arch/s390/kernel/alternative.c
++++ b/arch/s390/kernel/alternative.c
+@@@ -1,24 -1,14 +1,29 @@@
+  // SPDX-License-Identifier: GPL-2.0
+- #include <linux/module.h>
++ 
++ #include <linux/uaccess.h>
+  #include <asm/alternative.h>
+  #include <asm/facility.h>
+- #include <asm/nospec-branch.h>
+  
+++<<<<<<< HEAD
+ +static int __initdata_or_module alt_instr_disabled;
+ +
+ +static int __init disable_alternative_instructions(char *str)
+ +{
+ +	alt_instr_disabled = 1;
+ +	return 0;
+ +}
+ +
+ +early_param("noaltinstr", disable_alternative_instructions);
+ +
+ +static void __init_or_module __apply_alternatives(struct alt_instr *start,
+ +						  struct alt_instr *end)
+++=======
++ void __apply_alternatives(struct alt_instr *start, struct alt_instr *end, unsigned int ctx)
+++>>>>>>> b3e0c5f734f9 (s390/alternatives: Rework to allow for callbacks)
+  {
+- 	struct alt_instr *a;
+  	u8 *instr, *replacement;
++ 	struct alt_instr *a;
++ 	bool replace;
+  
+  	/*
+  	 * The scan order should be from start to end. A later scanned
+@@@ -30,19 -31,3 +46,19 @@@
+  		s390_kernel_write(instr, replacement, a->instrlen);
+  	}
+  }
+++<<<<<<< HEAD
+ +
+ +void __init_or_module apply_alternatives(struct alt_instr *start,
+ +					 struct alt_instr *end)
+ +{
+ +	if (!alt_instr_disabled)
+ +		__apply_alternatives(start, end);
+ +}
+ +
+ +extern struct alt_instr __alt_instructions[], __alt_instructions_end[];
+ +void __init apply_alternative_instructions(void)
+ +{
+ +	apply_alternatives(__alt_instructions, __alt_instructions_end);
+ +}
+++=======
+++>>>>>>> b3e0c5f734f9 (s390/alternatives: Rework to allow for callbacks)
+diff --git a/arch/s390/include/asm/alternative.h b/arch/s390/include/asm/alternative.h
+index 16de33750d6c..5b931070be16 100644
+--- a/arch/s390/include/asm/alternative.h
++++ b/arch/s390/include/asm/alternative.h
+@@ -2,6 +2,44 @@
+ #ifndef _ASM_S390_ALTERNATIVE_H
+ #define _ASM_S390_ALTERNATIVE_H
+ 
++/*
++ * Each alternative comes with a 32 bit feature field:
++ *	union {
++ *		u32 feature;
++ *		struct {
++ *			u32 ctx	 : 4;
++ *			u32 type : 8;
++ *			u32 data : 20;
++ *		};
++ *	}
++ *
++ * @ctx is a bitfield, where only one bit must be set. Each bit defines
++ * in which context an alternative is supposed to be applied to the
++ * kernel image:
++ *
++ * - from the decompressor before the kernel itself is executed
++ * - from early kernel code from within the kernel
++ *
++ * @type is a number which defines the type and with that the type
++ * specific alternative patching.
++ *
++ * @data is additional type specific information which defines if an
++ * alternative should be applied.
++ */
++
++#define ALT_CTX_LATE		1
++#define ALT_CTX_ALL		ALT_CTX_LATE
++
++#define ALT_TYPE_FACILITY	0
++
++#define ALT_DATA_SHIFT		0
++#define ALT_TYPE_SHIFT		20
++#define ALT_CTX_SHIFT		28
++
++#define ALT_FACILITY(facility)		(ALT_CTX_LATE << ALT_CTX_SHIFT		| \
++					 ALT_TYPE_FACILITY << ALT_TYPE_SHIFT	| \
++					 (facility) << ALT_DATA_SHIFT)
++
+ #ifndef __ASSEMBLY__
+ 
+ #include <linux/types.h>
+@@ -11,12 +49,30 @@
+ struct alt_instr {
+ 	s32 instr_offset;	/* original instruction */
+ 	s32 repl_offset;	/* offset to replacement instruction */
+-	u16 feature;		/* feature required for replacement */
++	union {
++		u32 feature;	/* feature required for replacement */
++		struct {
++			u32 ctx	 : 4;  /* context */
++			u32 type : 8;  /* type of alternative */
++			u32 data : 20; /* patching information */
++		};
++	};
+ 	u8  instrlen;		/* length of original instruction */
+ } __packed;
+ 
+-void apply_alternative_instructions(void);
+-void apply_alternatives(struct alt_instr *start, struct alt_instr *end);
++extern struct alt_instr __alt_instructions[], __alt_instructions_end[];
++
++void __apply_alternatives(struct alt_instr *start, struct alt_instr *end, unsigned int ctx);
++
++static inline void apply_alternative_instructions(void)
++{
++	__apply_alternatives(__alt_instructions, __alt_instructions_end, ALT_CTX_LATE);
++}
++
++static inline void apply_alternatives(struct alt_instr *start, struct alt_instr *end)
++{
++	__apply_alternatives(start, end, ALT_CTX_ALL);
++}
+ 
+ /*
+  * +---------------------------------+
+@@ -51,7 +107,7 @@ void apply_alternatives(struct alt_instr *start, struct alt_instr *end);
+ #define ALTINSTR_ENTRY(feature, num)					\
+ 	"\t.long 661b - .\n"			/* old instruction */	\
+ 	"\t.long " b_altinstr(num)"b - .\n"	/* alt instruction */	\
+-	"\t.word " __stringify(feature) "\n"	/* feature	   */	\
++	"\t.long " __stringify(feature) "\n"	/* feature	   */	\
+ 	"\t.byte " oldinstr_len "\n"		/* instruction len */	\
+ 	"\t.org . - (" oldinstr_len ") & 1\n"				\
+ 	"\t.org . - (" oldinstr_len ") + (" altinstr_len(num) ")\n"	\
+@@ -127,7 +183,7 @@ void apply_alternatives(struct alt_instr *start, struct alt_instr *end);
+ .macro alt_entry orig_start, orig_end, alt_start, alt_end, feature
+ 	.long	\orig_start - .
+ 	.long	\alt_start - .
+-	.word	\feature
++	.long	\feature
+ 	.byte	\orig_end - \orig_start
+ 	.org	. - ( \orig_end - \orig_start ) & 1
+ 	.org	. - ( \orig_end - \orig_start ) + ( \alt_end - \alt_start )
+diff --git a/arch/s390/include/asm/processor.h b/arch/s390/include/asm/processor.h
+index c87cf2b8e81a..d0e5b9a6ef2e 100644
+--- a/arch/s390/include/asm/processor.h
++++ b/arch/s390/include/asm/processor.h
+@@ -405,7 +405,7 @@ static __always_inline bool regs_irqs_disabled(struct pt_regs *regs)
+ 
+ static __always_inline void bpon(void)
+ {
+-	asm volatile(ALTERNATIVE("nop", ".insn	rrf,0xb2e80000,0,0,13,0", 82));
++	asm volatile(ALTERNATIVE("nop", ".insn	rrf,0xb2e80000,0,0,13,0", ALT_FACILITY(82)));
+ }
+ 
+ #endif /* __ASSEMBLY__ */
+diff --git a/arch/s390/include/asm/spinlock.h b/arch/s390/include/asm/spinlock.h
+index 3e43c90ff135..77d5e804af93 100644
+--- a/arch/s390/include/asm/spinlock.h
++++ b/arch/s390/include/asm/spinlock.h
+@@ -79,7 +79,7 @@ static inline void arch_spin_unlock(arch_spinlock_t *lp)
+ 	typecheck(int, lp->lock);
+ 	kcsan_release();
+ 	asm_inline volatile(
+-		ALTERNATIVE("nop", ".insn rre,0xb2fa0000,7,0", 49) /* NIAI 7 */
++		ALTERNATIVE("nop", ".insn rre,0xb2fa0000,7,0", ALT_FACILITY(49)) /* NIAI 7 */
+ 		"	sth	%1,%0\n"
+ 		: "=R" (((unsigned short *) &lp->lock)[1])
+ 		: "d" (0) : "cc", "memory");
+* Unmerged path arch/s390/kernel/alternative.c
+diff --git a/arch/s390/kernel/entry.S b/arch/s390/kernel/entry.S
+index 187e8bb48036..d52dc3953285 100644
+--- a/arch/s390/kernel/entry.S
++++ b/arch/s390/kernel/entry.S
+@@ -32,19 +32,19 @@
+ _LPP_OFFSET	= __LC_LPP
+ 
+ 	.macro STBEAR address
+-	ALTERNATIVE "nop", ".insn s,0xb2010000,\address", 193
++	ALTERNATIVE "nop", ".insn s,0xb2010000,\address", ALT_FACILITY(193)
+ 	.endm
+ 
+ 	.macro LBEAR address
+-	ALTERNATIVE "nop", ".insn s,0xb2000000,\address", 193
++	ALTERNATIVE "nop", ".insn s,0xb2000000,\address", ALT_FACILITY(193)
+ 	.endm
+ 
+ 	.macro LPSWEY address,lpswe
+-	ALTERNATIVE "b \lpswe; nopr", ".insn siy,0xeb0000000071,\address,0", 193
++	ALTERNATIVE "b \lpswe; nopr", ".insn siy,0xeb0000000071,\address,0", ALT_FACILITY(193)
+ 	.endm
+ 
+ 	.macro MBEAR reg
+-	ALTERNATIVE "brcl 0,0", __stringify(mvc __PT_LAST_BREAK(8,\reg),__LC_LAST_BREAK), 193
++	ALTERNATIVE "brcl 0,0", __stringify(mvc __PT_LAST_BREAK(8,\reg),__LC_LAST_BREAK), ALT_FACILITY(193)
+ 	.endm
+ 
+ 	.macro	CHECK_STACK savearea
+@@ -100,22 +100,22 @@ _LPP_OFFSET	= __LC_LPP
+ 	.endm
+ 
+ 	.macro BPOFF
+-	ALTERNATIVE "nop", ".insn rrf,0xb2e80000,0,0,12,0", 82
++	ALTERNATIVE "nop", ".insn rrf,0xb2e80000,0,0,12,0", ALT_FACILITY(82)
+ 	.endm
+ 
+ 	.macro BPON
+-	ALTERNATIVE "nop", ".insn rrf,0xb2e80000,0,0,13,0", 82
++	ALTERNATIVE "nop", ".insn rrf,0xb2e80000,0,0,13,0", ALT_FACILITY(82)
+ 	.endm
+ 
+ 	.macro BPENTER tif_ptr,tif_mask
+ 	ALTERNATIVE "TSTMSK \tif_ptr,\tif_mask; jz .+8; .insn rrf,0xb2e80000,0,0,13,0", \
+-		    "j .+12; nop; nop", 82
++		    "j .+12; nop; nop", ALT_FACILITY(82)
+ 	.endm
+ 
+ 	.macro BPEXIT tif_ptr,tif_mask
+ 	TSTMSK	\tif_ptr,\tif_mask
+ 	ALTERNATIVE "jz .+8;  .insn rrf,0xb2e80000,0,0,12,0", \
+-		    "jnz .+8; .insn rrf,0xb2e80000,0,0,13,0", 82
++		    "jnz .+8; .insn rrf,0xb2e80000,0,0,13,0", ALT_FACILITY(82)
+ 	.endm
+ 
+ #if IS_ENABLED(CONFIG_KVM)
+@@ -169,7 +169,7 @@ SYM_FUNC_START(__switch_to_asm)
+ 	aghi	%r3,__TASK_pid
+ 	mvc	__LC_CURRENT_PID(4,%r0),0(%r3)	# store pid of next
+ 	lmg	%r6,%r15,__SF_GPRS(%r15)	# load gprs of next task
+-	ALTERNATIVE "nop", "lpp _LPP_OFFSET", 40
++	ALTERNATIVE "nop", "lpp _LPP_OFFSET", ALT_FACILITY(40)
+ 	BR_EX	%r14
+ SYM_FUNC_END(__switch_to_asm)
+ 
+@@ -522,7 +522,7 @@ SYM_CODE_START(mcck_int_handler)
+ 	jno	0f
+ 	BPON
+ 	stpt	__LC_EXIT_TIMER
+-0:	ALTERNATIVE "nop", __stringify(lghi %r12,__LC_LAST_BREAK_SAVE_AREA),193
++0:	ALTERNATIVE "nop", __stringify(lghi %r12,__LC_LAST_BREAK_SAVE_AREA), ALT_FACILITY(193)
+ 	LBEAR	0(%r12)
+ 	lmg	%r11,%r15,__PT_R11(%r11)
+ 	LPSWEY	__LC_RETURN_MCCK_PSW,__LC_RETURN_MCCK_LPSWE
+@@ -558,7 +558,7 @@ SYM_CODE_START(mcck_int_handler)
+ SYM_CODE_END(mcck_int_handler)
+ 
+ SYM_CODE_START(restart_int_handler)
+-	ALTERNATIVE "nop", "lpp _LPP_OFFSET", 40
++	ALTERNATIVE "nop", "lpp _LPP_OFFSET", ALT_FACILITY(40)
+ 	stg	%r15,__LC_SAVE_AREA_RESTART
+ 	TSTMSK	__LC_RESTART_FLAGS,RESTART_FLAG_CTLREGS,4
+ 	jz	0f
+diff --git a/arch/s390/lib/spinlock.c b/arch/s390/lib/spinlock.c
+index 0c9a73a18826..9f86ad8fa8b4 100644
+--- a/arch/s390/lib/spinlock.c
++++ b/arch/s390/lib/spinlock.c
+@@ -75,7 +75,7 @@ static inline int arch_load_niai4(int *lock)
+ 	int owner;
+ 
+ 	asm_inline volatile(
+-		ALTERNATIVE("nop", ".insn rre,0xb2fa0000,4,0", 49) /* NIAI 4 */
++		ALTERNATIVE("nop", ".insn rre,0xb2fa0000,4,0", ALT_FACILITY(49)) /* NIAI 4 */
+ 		"	l	%0,%1\n"
+ 		: "=d" (owner) : "Q" (*lock) : "memory");
+ 	return owner;
+@@ -86,7 +86,7 @@ static inline int arch_cmpxchg_niai8(int *lock, int old, int new)
+ 	int expected = old;
+ 
+ 	asm_inline volatile(
+-		ALTERNATIVE("nop", ".insn rre,0xb2fa0000,8,0", 49) /* NIAI 8 */
++		ALTERNATIVE("nop", ".insn rre,0xb2fa0000,8,0", ALT_FACILITY(49)) /* NIAI 8 */
+ 		"	cs	%0,%3,%1\n"
+ 		: "=d" (old), "=Q" (*lock)
+ 		: "0" (old), "d" (new), "Q" (*lock)
