@@ -1,0 +1,157 @@
+s390/uv: Convert uv_destroy_owned_page() to uv_destroy_(folio|pte)()
+
+jira KERNEL-1869
+Rebuild_History Non-Buildable kernel-5.14.0-741.7.1.el9_9
+commit-author David Hildenbrand <david@redhat.com>
+commit 7063150650d828ad3ca77b06531b37bb1aed82b6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-741.7.1.el9_9/70631506.failed
+
+Let's have the following variants for destroying pages:
+
+(1) uv_destroy(): Like uv_pin_shared() and uv_convert_from_secure(),
+"low level" helper that operates on paddr and doesn't mess with folios.
+
+(2) uv_destroy_folio(): Consumes a folio to which we hold a reference.
+
+(3) uv_destroy_pte(): Consumes a PTE that holds a reference through the
+mapping.
+
+Unfortunately we need uv_destroy_pte(), because pfn_folio() and
+friends are not available in pgtable.h.
+
+	Reviewed-by: Claudio Imbrenda <imbrenda@linux.ibm.com>
+	Signed-off-by: David Hildenbrand <david@redhat.com>
+Link: https://lore.kernel.org/r/20240508182955.358628-8-david@redhat.com
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+	Signed-off-by: Alexander Gordeev <agordeev@linux.ibm.com>
+(cherry picked from commit 7063150650d828ad3ca77b06531b37bb1aed82b6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/include/asm/uv.h
+#	arch/s390/kernel/uv.c
+diff --cc arch/s390/include/asm/uv.h
+index 354d8eb2acb5,a1bef30066ef..000000000000
+--- a/arch/s390/include/asm/uv.h
++++ b/arch/s390/include/asm/uv.h
+@@@ -630,11 -483,35 +630,43 @@@ static inline int is_prot_virt_host(voi
+  int uv_pin_shared(unsigned long paddr);
+  int gmap_make_secure(struct gmap *gmap, unsigned long gaddr, void *uvcb);
+  int gmap_destroy_page(struct gmap *gmap, unsigned long gaddr);
+++<<<<<<< HEAD
+ +int uv_destroy_owned_page(unsigned long paddr);
+ +int uv_convert_from_secure(unsigned long paddr);
+++=======
++ int uv_destroy_folio(struct folio *folio);
++ int uv_destroy_pte(pte_t pte);
+++>>>>>>> 7063150650d8 (s390/uv: Convert uv_destroy_owned_page() to uv_destroy_(folio|pte)())
+  int uv_convert_owned_from_secure(unsigned long paddr);
+  int gmap_convert_to_secure(struct gmap *gmap, unsigned long gaddr);
+  
+  void setup_uv(void);
+++<<<<<<< HEAD
+++=======
++ #else
++ #define is_prot_virt_host() 0
++ static inline void setup_uv(void) {}
++ 
++ static inline int uv_pin_shared(unsigned long paddr)
++ {
++ 	return 0;
++ }
++ 
++ static inline int uv_destroy_folio(struct folio *folio)
++ {
++ 	return 0;
++ }
++ 
++ static inline int uv_destroy_pte(pte_t pte)
++ {
++ 	return 0;
++ }
++ 
++ static inline int uv_convert_owned_from_secure(unsigned long paddr)
++ {
++ 	return 0;
++ }
++ #endif
+++>>>>>>> 7063150650d8 (s390/uv: Convert uv_destroy_owned_page() to uv_destroy_(folio|pte)())
+  
+  #endif /* _ASM_S390_UV_H */
+diff --cc arch/s390/kernel/uv.c
+index acbb4ffb87e4,61c1ce51c883..000000000000
+--- a/arch/s390/kernel/uv.c
++++ b/arch/s390/kernel/uv.c
+@@@ -141,18 -131,21 +141,29 @@@ static int uv_destroy(unsigned long pad
+  }
+  
+  /*
+-  * The caller must already hold a reference to the page
++  * The caller must already hold a reference to the folio
+   */
+- int uv_destroy_owned_page(unsigned long paddr)
++ int uv_destroy_folio(struct folio *folio)
+  {
+++<<<<<<< HEAD
+ +	struct page *page = phys_to_page(paddr);
+ +	int rc;
+ +
+ +	get_page(page);
+ +	rc = uv_destroy_page(paddr);
+++=======
++ 	int rc;
++ 
++ 	/* See gmap_make_secure(): large folios cannot be secure */
++ 	if (unlikely(folio_test_large(folio)))
++ 		return 0;
++ 
++ 	folio_get(folio);
++ 	rc = uv_destroy(folio_to_phys(folio));
+++>>>>>>> 7063150650d8 (s390/uv: Convert uv_destroy_owned_page() to uv_destroy_(folio|pte)())
+  	if (!rc)
+ -		clear_bit(PG_arch_1, &folio->flags);
+ -	folio_put(folio);
+ +		clear_bit(PG_arch_1, &page->flags);
+ +	put_page(page);
+  	return rc;
+  }
+  
+diff --git a/arch/s390/include/asm/pgtable.h b/arch/s390/include/asm/pgtable.h
+index d3f0fcb1decf..3d7876bbd2ec 100644
+--- a/arch/s390/include/asm/pgtable.h
++++ b/arch/s390/include/asm/pgtable.h
+@@ -1244,7 +1244,7 @@ static inline pte_t ptep_get_and_clear_full(struct mm_struct *mm,
+ 	 * The notifier should have destroyed all protected vCPUs at this
+ 	 * point, so the destroy should be successful.
+ 	 */
+-	if (full && !uv_destroy_owned_page(pte_val(res) & PAGE_MASK))
++	if (full && !uv_destroy_pte(res))
+ 		return res;
+ 	/*
+ 	 * If something went wrong and the page could not be destroyed, or
+* Unmerged path arch/s390/include/asm/uv.h
+* Unmerged path arch/s390/kernel/uv.c
+diff --git a/arch/s390/mm/gmap.c b/arch/s390/mm/gmap.c
+index 7bc050c187b8..388bad28e36e 100644
+--- a/arch/s390/mm/gmap.c
++++ b/arch/s390/mm/gmap.c
+@@ -2900,13 +2900,15 @@ static const struct mm_walk_ops gather_pages_ops = {
+  */
+ void s390_uv_destroy_pfns(unsigned long count, unsigned long *pfns)
+ {
++	struct folio *folio;
+ 	unsigned long i;
+ 
+ 	for (i = 0; i < count; i++) {
++		folio = pfn_folio(pfns[i]);
+ 		/* we always have an extra reference */
+-		uv_destroy_owned_page(pfn_to_phys(pfns[i]));
++		uv_destroy_folio(folio);
+ 		/* get rid of the extra reference */
+-		put_page(pfn_to_page(pfns[i]));
++		folio_put(folio);
+ 		cond_resched();
+ 	}
+ }
