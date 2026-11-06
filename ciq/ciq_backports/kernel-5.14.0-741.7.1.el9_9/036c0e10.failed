@@ -1,0 +1,155 @@
+s390/uv: Convert PG_arch_1 users to only work on small folios
+
+jira KERNEL-1869
+Rebuild_History Non-Buildable kernel-5.14.0-741.7.1.el9_9
+commit-author David Hildenbrand <david@redhat.com>
+commit 036c0e104bd2cf45304a3795fd8ec985ea01bfe8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-741.7.1.el9_9/036c0e10.failed
+
+Now that make_folio_secure() may only set PG_arch_1 for small folios,
+let's convert relevant remaining UV code to only work on (small) folios
+and simply reject large folios early. This way, we'll never end up
+touching PG_arch_1 on tail pages of a large folio in UV code.
+
+The folio_get()/folio_put() for functions that are documented to already
+hold a folio reference look weird; likely they are required to make
+concurrent gmap_make_secure() back off because the caller might only hold
+an implicit reference due to the page mapping. So leave that alone for now.
+
+	Reviewed-by: Claudio Imbrenda <imbrenda@linux.ibm.com>
+	Signed-off-by: David Hildenbrand <david@redhat.com>
+Link: https://lore.kernel.org/r/20240508182955.358628-5-david@redhat.com
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+	Signed-off-by: Alexander Gordeev <agordeev@linux.ibm.com>
+(cherry picked from commit 036c0e104bd2cf45304a3795fd8ec985ea01bfe8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/include/asm/page.h
+diff --cc arch/s390/include/asm/page.h
+index 6d237e54ec53,ecbf4b626f46..000000000000
+--- a/arch/s390/include/asm/page.h
++++ b/arch/s390/include/asm/page.h
+@@@ -251,8 -246,21 +251,26 @@@ static inline unsigned long __phys_addr
+  #define phys_to_pfn(phys)	((phys) >> PAGE_SHIFT)
+  #define pfn_to_phys(pfn)	((pfn) << PAGE_SHIFT)
+  
+++<<<<<<< HEAD
+ +#define pfn_to_virt(pfn)	__va(pfn_to_phys(pfn))
+ +#define virt_to_pfn(kaddr)	(phys_to_pfn(__pa(kaddr)))
+++=======
++ #define phys_to_page(phys)	pfn_to_page(phys_to_pfn(phys))
++ #define phys_to_folio(phys)	page_folio(phys_to_page(phys))
++ #define page_to_phys(page)	pfn_to_phys(page_to_pfn(page))
++ #define folio_to_phys(page)	pfn_to_phys(folio_pfn(folio))
++ 
++ static inline void *pfn_to_virt(unsigned long pfn)
++ {
++ 	return __va(pfn_to_phys(pfn));
++ }
++ 
++ static inline unsigned long virt_to_pfn(const void *kaddr)
++ {
++ 	return phys_to_pfn(__pa(kaddr));
++ }
++ 
+++>>>>>>> 036c0e104bd2 (s390/uv: Convert PG_arch_1 users to only work on small folios)
+  #define pfn_to_kaddr(pfn)	pfn_to_virt(pfn)
+  
+  #define virt_to_page(kaddr)	pfn_to_page(virt_to_pfn(kaddr))
+* Unmerged path arch/s390/include/asm/page.h
+diff --git a/arch/s390/kernel/uv.c b/arch/s390/kernel/uv.c
+index acbb4ffb87e4..def168151431 100644
+--- a/arch/s390/kernel/uv.c
++++ b/arch/s390/kernel/uv.c
+@@ -145,14 +145,18 @@ static int uv_destroy_page(unsigned long paddr)
+  */
+ int uv_destroy_owned_page(unsigned long paddr)
+ {
+-	struct page *page = phys_to_page(paddr);
++	struct folio *folio = phys_to_folio(paddr);
+ 	int rc;
+ 
+-	get_page(page);
++	/* See gmap_make_secure(): large folios cannot be secure */
++	if (unlikely(folio_test_large(folio)))
++		return 0;
++
++	folio_get(folio);
+ 	rc = uv_destroy_page(paddr);
+ 	if (!rc)
+-		clear_bit(PG_arch_1, &page->flags);
+-	put_page(page);
++		clear_bit(PG_arch_1, &folio->flags);
++	folio_put(folio);
+ 	return rc;
+ }
+ 
+@@ -180,14 +184,18 @@ int uv_convert_from_secure(unsigned long paddr)
+  */
+ int uv_convert_owned_from_secure(unsigned long paddr)
+ {
+-	struct page *page = phys_to_page(paddr);
++	struct folio *folio = phys_to_folio(paddr);
+ 	int rc;
+ 
+-	get_page(page);
++	/* See gmap_make_secure(): large folios cannot be secure */
++	if (unlikely(folio_test_large(folio)))
++		return 0;
++
++	folio_get(folio);
+ 	rc = uv_convert_from_secure(paddr);
+ 	if (!rc)
+-		clear_bit(PG_arch_1, &page->flags);
+-	put_page(page);
++		clear_bit(PG_arch_1, &folio->flags);
++	folio_put(folio);
+ 	return rc;
+ }
+ 
+@@ -489,33 +497,34 @@ EXPORT_SYMBOL_GPL(gmap_destroy_page);
+  */
+ int arch_make_page_accessible(struct page *page)
+ {
++	struct folio *folio = page_folio(page);
+ 	int rc = 0;
+ 
+-	/* Hugepage cannot be protected, so nothing to do */
+-	if (PageHuge(page))
++	/* See gmap_make_secure(): large folios cannot be secure */
++	if (unlikely(folio_test_large(folio)))
+ 		return 0;
+ 
+ 	/*
+ 	 * PG_arch_1 is used in 3 places:
+ 	 * 1. for kernel page tables during early boot
+ 	 * 2. for storage keys of huge pages and KVM
+-	 * 3. As an indication that this page might be secure. This can
++	 * 3. As an indication that this small folio might be secure. This can
+ 	 *    overindicate, e.g. we set the bit before calling
+ 	 *    convert_to_secure.
+ 	 * As secure pages are never huge, all 3 variants can co-exists.
+ 	 */
+-	if (!test_bit(PG_arch_1, &page->flags))
++	if (!test_bit(PG_arch_1, &folio->flags))
+ 		return 0;
+ 
+-	rc = uv_pin_shared(page_to_phys(page));
++	rc = uv_pin_shared(folio_to_phys(folio));
+ 	if (!rc) {
+-		clear_bit(PG_arch_1, &page->flags);
++		clear_bit(PG_arch_1, &folio->flags);
+ 		return 0;
+ 	}
+ 
+-	rc = uv_convert_from_secure(page_to_phys(page));
++	rc = uv_convert_from_secure(folio_to_phys(folio));
+ 	if (!rc) {
+-		clear_bit(PG_arch_1, &page->flags);
++		clear_bit(PG_arch_1, &folio->flags);
+ 		return 0;
+ 	}
+ 
