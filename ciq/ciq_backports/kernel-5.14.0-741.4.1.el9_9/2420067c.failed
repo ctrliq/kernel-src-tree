@@ -1,0 +1,306 @@
+struct dentry: make ->d_u anonymous
+
+jira KERNEL-1869
+Rebuild_History Non-Buildable kernel-5.14.0-741.4.1.el9_9
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit 2420067cecacb1d1bf6dc39294d0c9f04066ff98
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-741.4.1.el9_9/2420067c.failed
+
+Making ->d_rcu and (then) ->d_child overlapping dates back to
+2006; anon unions support had been added to gcc only in 4.6
+(2011) and the minimal gcc version hadn't been bumped to that
+until 4.19 (2018).
+
+These days there's no reason not to keep that union named.
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 2420067cecacb1d1bf6dc39294d0c9f04066ff98)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dcache.c
+#	fs/nfs/dir.c
+#	include/linux/dcache.h
+diff --cc fs/dcache.c
+index e7916b6186f0,4378eb8a00bb..000000000000
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@@ -374,11 -428,11 +374,16 @@@ static inline void __d_clear_type_and_i
+  
+  static void dentry_free(struct dentry *dentry)
+  {
+- 	WARN_ON(!hlist_unhashed(&dentry->d_u.d_alias));
++ 	WARN_ON(!hlist_unhashed(&dentry->d_alias));
+  	if (unlikely(dname_external(dentry))) {
+  		struct external_name *p = external_name(dentry);
+++<<<<<<< HEAD
+ +		if (likely(atomic_dec_and_test(&p->u.count))) {
+ +			call_rcu(&dentry->d_u.d_rcu, __d_free_external);
+++=======
++ 		if (likely(atomic_dec_and_test(&p->count))) {
++ 			call_rcu(&dentry->d_rcu, __d_free_external);
+++>>>>>>> 2420067cecac (struct dentry: make ->d_u anonymous)
+  			return;
+  		}
+  	}
+@@@ -1020,11 -1091,11 +1025,11 @@@ struct dentry *d_find_alias_rcu(struct 
+  	spin_lock(&inode->i_lock);
+  	// ->i_dentry and ->i_rcu are colocated, but the latter won't be
+  	// used without having I_FREEING set, which means no aliases left
+ -	if (likely(!(inode_state_read(inode) & I_FREEING) && !hlist_empty(l))) {
+ +	if (likely(!(inode->i_state & I_FREEING) && !hlist_empty(l))) {
+  		if (S_ISDIR(inode->i_mode)) {
+- 			de = hlist_entry(l->first, struct dentry, d_u.d_alias);
++ 			de = hlist_entry(l->first, struct dentry, d_alias);
+  		} else {
+- 			hlist_for_each_entry(de, l, d_u.d_alias)
++ 			hlist_for_each_entry(de, l, d_alias)
+  				if (!d_unhashed(de))
+  					break;
+  		}
+@@@ -1685,9 -1787,8 +1690,9 @@@ static struct dentry *__d_alloc(struct 
+  	INIT_HLIST_BL_NODE(&dentry->d_hash);
+  	INIT_LIST_HEAD(&dentry->d_lru);
+  	INIT_HLIST_HEAD(&dentry->d_children);
+- 	INIT_HLIST_NODE(&dentry->d_u.d_alias);
++ 	INIT_HLIST_NODE(&dentry->d_alias);
+  	INIT_HLIST_NODE(&dentry->d_sib);
+ +	d_set_d_op(dentry, dentry->d_sb->s_d_op);
+  
+  	if (dentry->d_op && dentry->d_op->d_init) {
+  		err = dentry->d_op->d_init(dentry);
+@@@ -2565,10 -2699,8 +2570,10 @@@ retry
+  		return dentry;
+  	}
+  	rcu_read_unlock();
+ +	/* we can't take ->d_lock here; it's OK, though. */
+ +	new->d_flags |= DCACHE_PAR_LOOKUP;
+  	new->d_wait = wq;
+- 	hlist_bl_add_head(&new->d_u.d_in_lookup_hash, b);
++ 	hlist_bl_add_head(&new->d_in_lookup_hash, b);
+  	hlist_bl_unlock(b);
+  	return new;
+  mismatch:
+@@@ -2623,9 -2756,11 +2628,9 @@@ static inline void __d_add(struct dentr
+  		n = start_dir_add(dir);
+  		d_wait = __d_lookup_unhash(dentry);
+  	}
+ -	if (unlikely(ops))
+ -		d_set_d_op(dentry, ops);
+  	if (inode) {
+  		unsigned add_flags = d_flags_for_inode(inode);
+- 		hlist_add_head(&dentry->d_u.d_alias, &inode->i_dentry);
++ 		hlist_add_head(&dentry->d_alias, &inode->i_dentry);
+  		raw_write_seqcount_begin(&dentry->d_seq);
+  		__d_set_inode_and_type(dentry, inode, add_flags);
+  		raw_write_seqcount_end(&dentry->d_seq);
+@@@ -2658,6 -2793,24 +2663,27 @@@ void d_add(struct dentry *entry, struc
+  }
+  EXPORT_SYMBOL(d_add);
+  
+++<<<<<<< HEAD
+++=======
++ struct dentry *d_make_persistent(struct dentry *dentry, struct inode *inode)
++ {
++ 	WARN_ON(!hlist_unhashed(&dentry->d_alias));
++ 	WARN_ON(!inode);
++ 	security_d_instantiate(dentry, inode);
++ 	spin_lock(&inode->i_lock);
++ 	spin_lock(&dentry->d_lock);
++ 	__d_instantiate(dentry, inode);
++ 	dentry->d_flags |= DCACHE_PERSISTENT;
++ 	dget_dlock(dentry);
++ 	if (d_unhashed(dentry))
++ 		__d_rehash(dentry);
++ 	spin_unlock(&dentry->d_lock);
++ 	spin_unlock(&inode->i_lock);
++ 	return dentry;
++ }
++ EXPORT_SYMBOL(d_make_persistent);
++ 
+++>>>>>>> 2420067cecac (struct dentry: make ->d_u anonymous)
+  static void swap_names(struct dentry *dentry, struct dentry *target)
+  {
+  	if (unlikely(dname_external(target))) {
+@@@ -3024,50 -3180,21 +3050,56 @@@ bool is_subdir(struct dentry *new_dentr
+  }
+  EXPORT_SYMBOL(is_subdir);
+  
+ -void d_mark_tmpfile(struct file *file, struct inode *inode)
+ +static enum d_walk_ret d_genocide_kill(void *data, struct dentry *dentry)
+ +{
+ +	struct dentry *root = data;
+ +	if (dentry != root) {
+ +		if (d_unhashed(dentry) || !dentry->d_inode)
+ +			return D_WALK_SKIP;
+ +
+ +		if (!(dentry->d_flags & DCACHE_GENOCIDE)) {
+ +			dentry->d_flags |= DCACHE_GENOCIDE;
+ +			dentry->d_lockref.count--;
+ +		}
+ +	}
+ +	return D_WALK_CONTINUE;
+ +}
+ +
+ +void d_genocide(struct dentry *parent)
+ +{
+ +	d_walk(parent, parent, d_genocide_kill);
+ +}
+ +
+ +EXPORT_SYMBOL(d_genocide);
+ +
+ +int d_mark_tmpfile_name(struct file *file, const struct qstr *name)
+  {
+  	struct dentry *dentry = file->f_path.dentry;
+ +	char *dname = dentry->d_iname;
+ +
+ +	if (unlikely(dname_external(dentry) ||
+ +		     d_really_is_positive(dentry) ||
+ +		     !d_unlinked(dentry)))
+ +		return -EINVAL;
+ +	if (unlikely(name->len > DNAME_INLINE_LEN - 1))
+ +		return -ENAMETOOLONG;
+  
+++<<<<<<< HEAD
+++=======
++ 	BUG_ON(dname_external(dentry) ||
++ 		!hlist_unhashed(&dentry->d_alias) ||
++ 		!d_unlinked(dentry));
+++>>>>>>> 2420067cecac (struct dentry: make ->d_u anonymous)
+  	spin_lock(&dentry->d_parent->d_lock);
+  	spin_lock_nested(&dentry->d_lock, DENTRY_D_LOCK_NESTED);
+ -	dentry->__d_name.len = sprintf(dentry->d_shortname.string, "#%llu",
+ -				(unsigned long long)inode->i_ino);
+ +	dentry->d_name.len = name->len;
+ +	memcpy(dname, name->name, name->len);
+ +	dname[name->len] = '\0';
+  	spin_unlock(&dentry->d_lock);
+  	spin_unlock(&dentry->d_parent->d_lock);
+ +	return 0;
+  }
+ -EXPORT_SYMBOL(d_mark_tmpfile);
+ +EXPORT_SYMBOL(d_mark_tmpfile_name);
+  
+  void d_tmpfile(struct file *file, struct inode *inode)
+  {
+diff --cc fs/nfs/dir.c
+index 215679f0d42a,f2f1b036f2f1..000000000000
+--- a/fs/nfs/dir.c
++++ b/fs/nfs/dir.c
+@@@ -1466,6 -1466,49 +1466,52 @@@ void nfs_set_verifier(struct dentry *de
+  EXPORT_SYMBOL_GPL(nfs_set_verifier);
+  
+  #if IS_ENABLED(CONFIG_NFS_V4)
+++<<<<<<< HEAD
+++=======
++ static void nfs_clear_verifier_file(struct inode *inode)
++ {
++ 	struct dentry *alias;
++ 	struct inode *dir;
++ 
++ 	for_each_alias(alias, inode) {
++ 		spin_lock(&alias->d_lock);
++ 		dir = d_inode_rcu(alias->d_parent);
++ 		if (!dir ||
++ 		    !NFS_PROTO(dir)->have_delegation(dir, FMODE_READ, 0))
++ 			nfs_unset_verifier_delegated(&alias->d_time);
++ 		spin_unlock(&alias->d_lock);
++ 	}
++ }
++ 
++ static void nfs_clear_verifier_directory(struct inode *dir)
++ {
++ 	struct dentry *this_parent;
++ 	struct dentry *dentry;
++ 	struct inode *inode;
++ 
++ 	if (hlist_empty(&dir->i_dentry))
++ 		return;
++ 	this_parent =
++ 		hlist_entry(dir->i_dentry.first, struct dentry, d_alias);
++ 
++ 	spin_lock(&this_parent->d_lock);
++ 	nfs_unset_verifier_delegated(&this_parent->d_time);
++ 	dentry = d_first_child(this_parent);
++ 	hlist_for_each_entry_from(dentry, d_sib) {
++ 		if (unlikely(dentry->d_flags & DCACHE_DENTRY_CURSOR))
++ 			continue;
++ 		inode = d_inode_rcu(dentry);
++ 		if (inode &&
++ 		    NFS_PROTO(inode)->have_delegation(inode, FMODE_READ, 0))
++ 			continue;
++ 		spin_lock_nested(&dentry->d_lock, DENTRY_D_LOCK_NESTED);
++ 		nfs_unset_verifier_delegated(&dentry->d_time);
++ 		spin_unlock(&dentry->d_lock);
++ 	}
++ 	spin_unlock(&this_parent->d_lock);
++ }
++ 
+++>>>>>>> 2420067cecac (struct dentry: make ->d_u anonymous)
+  /**
+   * nfs_clear_verifier_delegated - clear the dir verifier delegation tag
+   * @inode: pointer to inode
+diff --cc include/linux/dcache.h
+index 333bdcbc480a,f939d2ed10a3..000000000000
+--- a/include/linux/dcache.h
++++ b/include/linux/dcache.h
+@@@ -596,4 -611,12 +596,15 @@@ static inline struct dentry *d_next_sib
+  	return hlist_entry_safe(dentry->d_sib.next, struct dentry, d_sib);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void set_default_d_op(struct super_block *, const struct dentry_operations *);
++ struct dentry *d_make_persistent(struct dentry *, struct inode *);
++ void d_make_discardable(struct dentry *dentry);
++ 
++ /* inode->i_lock must be held over that */
++ #define for_each_alias(dentry, inode) \
++ 	hlist_for_each_entry(dentry, &(inode)->i_dentry, d_alias)
++ 
+++>>>>>>> 2420067cecac (struct dentry: make ->d_u anonymous)
+  #endif	/* __LINUX_DCACHE_H */
+diff --git a/fs/ceph/mds_client.c b/fs/ceph/mds_client.c
+index 0e47dc8b7994..7bec087e2f68 100644
+--- a/fs/ceph/mds_client.c
++++ b/fs/ceph/mds_client.c
+@@ -4432,7 +4432,7 @@ static struct dentry* d_find_primary(struct inode *inode)
+ 		goto out_unlock;
+ 
+ 	if (S_ISDIR(inode->i_mode)) {
+-		alias = hlist_entry(inode->i_dentry.first, struct dentry, d_u.d_alias);
++		alias = hlist_entry(inode->i_dentry.first, struct dentry, d_alias);
+ 		if (!IS_ROOT(alias))
+ 			dn = dget(alias);
+ 		goto out_unlock;
+* Unmerged path fs/dcache.c
+diff --git a/fs/inode.c b/fs/inode.c
+index fc484773431b..e8f7765c473a 100644
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@ -590,7 +590,7 @@ void dump_mapping(const struct address_space *mapping)
+ 		return;
+ 	}
+ 
+-	dentry_ptr = container_of(dentry_first, struct dentry, d_u.d_alias);
++	dentry_ptr = container_of(dentry_first, struct dentry, d_alias);
+ 	if (get_kernel_nofault(dentry, dentry_ptr) ||
+ 	    !dentry.d_parent || !dentry.d_name.name) {
+ 		pr_warn("aops:%ps ino:%lx invalid dentry:%px\n",
+* Unmerged path fs/nfs/dir.c
+diff --git a/fs/nfs/getroot.c b/fs/nfs/getroot.c
+index 11ff2b2e060f..7f785eaa2751 100644
+--- a/fs/nfs/getroot.c
++++ b/fs/nfs/getroot.c
+@@ -54,7 +54,7 @@ static int nfs_superblock_set_dummy_root(struct super_block *sb, struct inode *i
+ 		 */
+ 		spin_lock(&d_inode(sb->s_root)->i_lock);
+ 		spin_lock(&sb->s_root->d_lock);
+-		hlist_del_init(&sb->s_root->d_u.d_alias);
++		hlist_del_init(&sb->s_root->d_alias);
+ 		spin_unlock(&sb->s_root->d_lock);
+ 		spin_unlock(&d_inode(sb->s_root)->i_lock);
+ 	}
+* Unmerged path include/linux/dcache.h
