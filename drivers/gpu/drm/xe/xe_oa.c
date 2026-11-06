@@ -1675,7 +1675,7 @@ static int xe_oa_mmap(struct file *file, struct vm_area_struct *vma)
 	int ret = xe_observation_paranoid_check();
 	struct xe_bo *bo = stream->oa_buffer.bo;
 	unsigned long start = vma->vm_start;
-	int i, ret;
+	int i;
 
 	if (ret) {
 		drm_dbg(&stream->oa->xe->drm, "Insufficient privilege to map OA buffer\n");
