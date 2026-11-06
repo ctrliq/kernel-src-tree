@@ -1,0 +1,184 @@
+s390: Move CIF flags to struct pcpu
+
+jira KERNEL-1869
+Rebuild_History Non-Buildable kernel-5.14.0-741.7.1.el9_9
+commit-author Sven Schnelle <svens@linux.ibm.com>
+commit d3604ffba1521f59f312be3f19999084dddef446
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-741.7.1.el9_9/d3604ffb.failed
+
+To allow testing flags for offline CPUs, move the CIF flags
+to struct pcpu. To avoid having to calculate the array index
+for each access, add a pointer to the pcpu member for the current
+cpu to lowcore.
+
+	Reviewed-by: Heiko Carstens <hca@linux.ibm.com>
+	Signed-off-by: Sven Schnelle <svens@linux.ibm.com>
+	Signed-off-by: Vasily Gorbik <gor@linux.ibm.com>
+(cherry picked from commit d3604ffba1521f59f312be3f19999084dddef446)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kernel/smp.c
+diff --cc arch/s390/kernel/smp.c
+index 00faab07593c,fbba37ec53cf..000000000000
+--- a/arch/s390/kernel/smp.c
++++ b/arch/s390/kernel/smp.c
+@@@ -74,17 -74,8 +74,20 @@@ enum 
+  	CPU_STATE_CONFIGURED,
+  };
+  
+++<<<<<<< HEAD
+ +struct pcpu {
+ +	unsigned long ec_mask;		/* bit mask for ec_xxx functions */
+ +	unsigned long ec_clk;		/* sigp timestamp for ec_xxx */
+ +	unsigned long capacity;		/* cpu capacity for scheduler */
+ +	signed char state;		/* physical cpu state */
+ +	signed char polarization;	/* physical polarization */
+ +	u16 address;			/* physical cpu address */
+ +};
+ +
+++=======
+++>>>>>>> d3604ffba152 (s390: Move CIF flags to struct pcpu)
+  static u8 boot_core_type;
+- static DEFINE_PER_CPU(struct pcpu, pcpu_devices);
++ DEFINE_PER_CPU(struct pcpu, pcpu_devices);
+  /*
+   * Pointer to the pcpu area of the boot CPU. This is required when a restart
+   * interrupt is triggered on an offline CPU. For that case accessing percpu
+@@@ -980,12 -953,14 +985,15 @@@ void __init smp_prepare_cpus(unsigned i
+  
+  void __init smp_prepare_boot_cpu(void)
+  {
++ 	struct lowcore *lc = get_lowcore();
++ 
+  	WARN_ON(!cpu_present(0) || !cpu_online(0));
++ 	lc->percpu_offset = __per_cpu_offset[0];
+  	ipl_pcpu = per_cpu_ptr(&pcpu_devices, 0);
+  	ipl_pcpu->state = CPU_STATE_CONFIGURED;
+- 	get_lowcore()->percpu_offset = __per_cpu_offset[0];
++ 	lc->pcpu = (unsigned long)ipl_pcpu;
+  	smp_cpu_set_polarization(0, POLARIZATION_UNKNOWN);
+ +	smp_cpu_set_capacity(0, CPU_CAPACITY_HIGH);
+  }
+  
+  void __init smp_setup_processor_id(void)
+diff --git a/arch/s390/include/asm/lowcore.h b/arch/s390/include/asm/lowcore.h
+index 94f954250ae0..08d24e38fe3c 100644
+--- a/arch/s390/include/asm/lowcore.h
++++ b/arch/s390/include/asm/lowcore.h
+@@ -97,8 +97,7 @@ struct lowcore {
+ 	__u64	save_area_async[8];		/* 0x0240 */
+ 	__u64	save_area_restart[1];		/* 0x0280 */
+ 
+-	/* CPU flags. */
+-	__u64	cpu_flags;			/* 0x0288 */
++	__u64	pcpu;				/* 0x0288 */
+ 
+ 	/* Return psws. */
+ 	psw_t	return_psw;			/* 0x0290 */
+diff --git a/arch/s390/include/asm/processor.h b/arch/s390/include/asm/processor.h
+index c87cf2b8e81a..5debb12614ad 100644
+--- a/arch/s390/include/asm/processor.h
++++ b/arch/s390/include/asm/processor.h
+@@ -42,21 +42,37 @@
+ #include <asm/irqflags.h>
+ #include <asm/alternative.h>
+ 
++struct pcpu {
++	unsigned long ec_mask;		/* bit mask for ec_xxx functions */
++	unsigned long ec_clk;		/* sigp timestamp for ec_xxx */
++	unsigned long flags;		/* per CPU flags */
++	signed char state;		/* physical cpu state */
++	signed char polarization;	/* physical polarization */
++	u16 address;			/* physical cpu address */
++};
++
++DECLARE_PER_CPU(struct pcpu, pcpu_devices);
++
+ typedef long (*sys_call_ptr_t)(struct pt_regs *regs);
+ 
++static __always_inline struct pcpu *this_pcpu(void)
++{
++	return (struct pcpu *)(get_lowcore()->pcpu);
++}
++
+ static __always_inline void set_cpu_flag(int flag)
+ {
+-	get_lowcore()->cpu_flags |= (1UL << flag);
++	this_pcpu()->flags |= (1UL << flag);
+ }
+ 
+ static __always_inline void clear_cpu_flag(int flag)
+ {
+-	get_lowcore()->cpu_flags &= ~(1UL << flag);
++	this_pcpu()->flags &= ~(1UL << flag);
+ }
+ 
+ static __always_inline bool test_cpu_flag(int flag)
+ {
+-	return get_lowcore()->cpu_flags & (1UL << flag);
++	return this_pcpu()->flags & (1UL << flag);
+ }
+ 
+ static __always_inline bool test_and_set_cpu_flag(int flag)
+@@ -81,9 +97,7 @@ static __always_inline bool test_and_clear_cpu_flag(int flag)
+  */
+ static __always_inline bool test_cpu_flag_of(int flag, int cpu)
+ {
+-	struct lowcore *lc = lowcore_ptr[cpu];
+-
+-	return lc->cpu_flags & (1UL << flag);
++	return per_cpu(pcpu_devices, cpu).flags & (1UL << flag);
+ }
+ 
+ #define arch_needs_cpu() test_cpu_flag(CIF_NOHZ_DELAY)
+diff --git a/arch/s390/kernel/asm-offsets.c b/arch/s390/kernel/asm-offsets.c
+index 45b0c1c3daaf..c14d636abc7a 100644
+--- a/arch/s390/kernel/asm-offsets.c
++++ b/arch/s390/kernel/asm-offsets.c
+@@ -114,7 +114,7 @@ int main(void)
+ 	OFFSET(__LC_SAVE_AREA_SYNC, lowcore, save_area_sync);
+ 	OFFSET(__LC_SAVE_AREA_ASYNC, lowcore, save_area_async);
+ 	OFFSET(__LC_SAVE_AREA_RESTART, lowcore, save_area_restart);
+-	OFFSET(__LC_CPU_FLAGS, lowcore, cpu_flags);
++	OFFSET(__LC_PCPU, lowcore, pcpu);
+ 	OFFSET(__LC_RETURN_PSW, lowcore, return_psw);
+ 	OFFSET(__LC_RETURN_MCCK_PSW, lowcore, return_mcck_psw);
+ 	OFFSET(__LC_SYS_ENTER_TIMER, lowcore, sys_enter_timer);
+@@ -186,5 +186,7 @@ int main(void)
+ #endif
+ 	OFFSET(__FTRACE_REGS_PT_REGS, ftrace_regs, regs);
+ 	DEFINE(__FTRACE_REGS_SIZE, sizeof(struct ftrace_regs));
++
++	OFFSET(__PCPU_FLAGS, pcpu, flags);
+ 	return 0;
+ }
+diff --git a/arch/s390/kernel/entry.S b/arch/s390/kernel/entry.S
+index 207bbb899274..6653c854a046 100644
+--- a/arch/s390/kernel/entry.S
++++ b/arch/s390/kernel/entry.S
+@@ -487,7 +487,8 @@ SYM_CODE_START(mcck_int_handler)
+ 	clgrjl	%r9,%r14, 4f
+ 	larl	%r14,.Lsie_leave
+ 	clgrjhe	%r9,%r14, 4f
+-	oi	__LC_CPU_FLAGS+7, _CIF_MCCK_GUEST
++	lg	%r10,__LC_PCPU
++	oi	__PCPU_FLAGS+7(%r10), _CIF_MCCK_GUEST
+ 4:	BPENTER	__SF_SIE_FLAGS(%r15),_TIF_ISOLATE_BP_GUEST
+ 	SIEEXIT __SF_SIE_CONTROL(%r15)
+ #endif
+diff --git a/arch/s390/kernel/setup.c b/arch/s390/kernel/setup.c
+index 093b2031f600..6464ebe87311 100644
+--- a/arch/s390/kernel/setup.c
++++ b/arch/s390/kernel/setup.c
+@@ -407,6 +407,7 @@ static void __init setup_lowcore(void)
+ 		panic("%s: Failed to allocate %zu bytes align=%zx\n",
+ 		      __func__, sizeof(*lc), sizeof(*lc));
+ 
++	lc->pcpu = (unsigned long)per_cpu_ptr(&pcpu_devices, 0);
+ 	lc->restart_psw.mask = PSW_KERNEL_BITS & ~PSW_MASK_DAT;
+ 	lc->restart_psw.addr = __pa(restart_int_handler);
+ 	lc->external_new_psw.mask = PSW_KERNEL_BITS;
+* Unmerged path arch/s390/kernel/smp.c
