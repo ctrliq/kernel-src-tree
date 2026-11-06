@@ -1,0 +1,165 @@
+af_unix: Fix UAF read of tail->len in unix_stream_data_wait()
+
+jira KERNEL-1869
+cve CVE-2026-64109
+Rebuild_History Non-Buildable kernel-5.14.0-741.7.1.el9_9
+commit-author Jann Horn <jannh@google.com>
+commit be309f8eae8b474a4a617eaae01324da996fc719
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-741.7.1.el9_9/be309f8e.failed
+
+unix_stream_data_wait() does skb_peek_tail(&sk->sk_receive_queue) without
+holding any lock that prevents SKBs on that queue from being dequeued and
+freed.
+This has been the case since commit 79f632c71bea ("unix/stream: fix
+peeking with an offset larger than data in queue").
+The first consequence of this is that the pointer comparison
+`tail != last` can be false even if `last` semantically refers to an
+already-freed SKB while `tail` is a new SKB allocated at the same address;
+which can cause unix_stream_data_wait() to wrongly keep blocking after new
+data has arrived, but only in a weird scenario where a peeking recv() and
+a normal recv() on the same socket are racing, which is probably not a
+real problem.
+
+But since commit 2b514574f7e8 ("net: af_unix: implement splice for stream
+af_unix sockets"), `tail` is actually dereferenced, which can cause UAF in
+the following race scenario (where test_setup() runs single-threaded,
+and afterwards, test_thread1() and test_thread2() run concurrently in
+two threads:
+```
+static int socks[2];
+void test_setup(void) {
+  socketpair(AF_UNIX, SOCK_STREAM, 0, socks);
+  send(socks[1], "A", 1, 0);
+  int peekoff = 1;
+  setsockopt(socks[0], SOL_SOCKET, SO_PEEK_OFF, &peekoff, sizeof(peekoff));
+}
+void test_thread1(void) {
+  char dummy;
+  recv(socks[0], &dummy, 1, MSG_PEEK);
+}
+void test_thread2(void) {
+  char dummy;
+  recv(socks[0], &dummy, 1, 0);
+  shutdown(socks[1], SHUT_WR);
+}
+```
+
+when racing like this:
+```
+thread1                       thread2
+unix_stream_read_generic
+  mutex_lock(&u->iolock)
+  skb_peek(&sk->sk_receive_queue)
+  skb_peek_next(skb, &sk->sk_receive_queue)
+  mutex_unlock(&u->iolock)
+                              unix_stream_read_generic
+                                unix_state_lock(sk)
+                                skb_peek(&sk->sk_receive_queue)
+                                unix_state_unlock(sk)
+  unix_stream_data_wait
+    unix_state_lock(sk)
+    tail = skb_peek_tail(&sk->sk_receive_queue)
+                                spin_lock(&sk->sk_receive_queue.lock)
+                                __skb_unlink(skb, &sk->sk_receive_queue)
+                                spin_unlock(&sk->sk_receive_queue.lock)
+                                consume_skb(skb) [frees the SKB]
+    `tail != last`: false
+    `tail`: true
+    `tail->len != last_len` ***UAF***
+```
+
+Fix the UAF by removing the read of tail->len; checking tail->len would
+only make sense if SKBs in the receive queue of a UNIX socket could grow,
+which can no longer happen.
+
+Kuniyuki explained:
+
+> When commit 869e7c62486e ("net: af_unix: implement stream sendpage
+> support") added sendpage() support, data could be appended to the last
+> skb in the receiver's queue.
+>
+> That's why we needed to check if the length of the last skb was changed
+> while waiting for new data in unix_stream_data_wait().
+>
+> However, commit a0dbf5f818f9 ("af_unix: Support MSG_SPLICE_PAGES") and
+> commit 57d44a354a43 ("unix: Convert unix_stream_sendpage() to use
+> MSG_SPLICE_PAGES") refactored sendmsg(), and now data is always added
+> to a new skb.
+
+That means this fix is not suitable for kernels before 6.5.
+
+Fixes: 2b514574f7e8 ("net: af_unix: implement splice for stream af_unix sockets")
+	Cc: stable@vger.kernel.org # 6.5.x
+	Signed-off-by: Jann Horn <jannh@google.com>
+	Reviewed-by: Kuniyuki Iwashima <kuniyu@google.com>
+Link: https://patch.msgid.link/20260518-b4-unix-recv-wait-hotfix-v2-1-83e29ce8ad31@google.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit be309f8eae8b474a4a617eaae01324da996fc719)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/unix/af_unix.c
+diff --cc net/unix/af_unix.c
+index d6f685b63889,dc71ed79be4a..000000000000
+--- a/net/unix/af_unix.c
++++ b/net/unix/af_unix.c
+@@@ -2509,22 -2911,22 +2507,26 @@@ static int unix_stream_read_skb(struct 
+  static int unix_stream_read_generic(struct unix_stream_read_state *state,
+  				    bool freezable)
+  {
+ -	int noblock = state->flags & MSG_DONTWAIT;
+ +	struct scm_cookie scm;
+++<<<<<<< HEAD
+  	struct socket *sock = state->socket;
+ -	struct msghdr *msg = state->msg;
+  	struct sock *sk = sock->sk;
+ -	size_t size = state->size;
+ -	int flags = state->flags;
+ -	bool check_creds = false;
+ -	struct scm_cookie scm;
+ +	struct unix_sock *u = unix_sk(sk);
+++=======
++ 	struct unix_sock *u;
+++>>>>>>> be309f8eae8b (af_unix: Fix UAF read of tail->len in unix_stream_data_wait())
+  	int copied = 0;
+ +	int flags = state->flags;
+ +	int noblock = flags & MSG_DONTWAIT;
+ +	bool check_creds = false;
+ +	int target;
+  	int err = 0;
+  	long timeo;
+ -	int target;
+  	int skip;
+ +	size_t size = state->size;
+ +	unsigned int last_len;
+  
+ -	if (unlikely(READ_ONCE(sk->sk_state) != TCP_ESTABLISHED)) {
+ +	if (unlikely(sk->sk_state != TCP_ESTABLISHED)) {
+  		err = -EINVAL;
+  		goto out;
+  	}
+@@@ -2558,8 -2964,17 +2560,12 @@@ redo
+  			goto unlock;
+  		}
+  		last = skb = skb_peek(&sk->sk_receive_queue);
+++<<<<<<< HEAD
+ +		last_len = last ? last->len : 0;
+++=======
++ 
+++>>>>>>> be309f8eae8b (af_unix: Fix UAF read of tail->len in unix_stream_data_wait())
+  again:
+ -#if IS_ENABLED(CONFIG_AF_UNIX_OOB)
+ -		if (skb) {
+ -			skb = manage_oob(skb, sk, flags, copied);
+ -			if (!skb && copied) {
+ -				unix_state_unlock(sk);
+ -				break;
+ -			}
+ -		}
+ -#endif
+  		if (skb == NULL) {
+  			if (copied >= target)
+  				goto unlock;
+* Unmerged path net/unix/af_unix.c
