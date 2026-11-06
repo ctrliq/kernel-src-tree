@@ -1,0 +1,497 @@
+s390/mm/fault: Handle guest-related program interrupts in KVM
+
+jira KERNEL-1869
+Rebuild_History Non-Buildable kernel-5.14.0-741.7.1.el9_9
+commit-author Claudio Imbrenda <imbrenda@linux.ibm.com>
+commit 05066cafa925159c790904f39ddb17cfa0e96f35
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-741.7.1.el9_9/05066caf.failed
+
+Any program interrupt that happens in the host during the execution of
+a KVM guest will now short circuit the fault handler and return to KVM
+immediately. Guest fault handling (including pfault) will happen
+entirely inside KVM.
+
+When sie64a() returns zero, current->thread.gmap_int_code will contain
+the program interrupt number that caused the exit, or zero if the exit
+was not caused by a host program interrupt.
+
+KVM will now take care of handling all guest faults in vcpu_post_run().
+
+Since gmap faults will not be visible by the rest of the kernel, remove
+GMAP_FAULT, the linux fault handlers for secure execution faults, the
+exception table entries for the sie instruction, the nop padding after
+the sie instruction, and all other references to guest faults from the
+s390 code.
+
+	Signed-off-by: Claudio Imbrenda <imbrenda@linux.ibm.com>
+Co-developed-by: Heiko Carstens <hca@linux.ibm.com>
+Link: https://lore.kernel.org/r/20241022120601.167009-6-imbrenda@linux.ibm.com
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+(cherry picked from commit 05066cafa925159c790904f39ddb17cfa0e96f35)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kernel/entry.S
+#	arch/s390/mm/fault.c
+diff --cc arch/s390/kernel/entry.S
+index e64f61ec06f2,1ff13239d4e5..000000000000
+--- a/arch/s390/kernel/entry.S
++++ b/arch/s390/kernel/entry.S
+@@@ -318,41 -303,41 +298,61 @@@ SYM_CODE_END(ret_from_fork
+   */
+  
+  SYM_CODE_START(pgm_check_handler)
+ -	STMG_LC	%r8,%r15,__LC_SAVE_AREA
+ -	GET_LC	%r13
+ -	stpt	__LC_SYS_ENTER_TIMER(%r13)
+ +	stpt	__LC_SYS_ENTER_TIMER
+  	BPOFF
+++<<<<<<< HEAD
+ +	stmg	%r8,%r15,__LC_SAVE_AREA_SYNC
+ +	lgr	%r10,%r15
+ +	lmg	%r8,%r9,__LC_PGM_OLD_PSW
+++=======
++ 	lmg	%r8,%r9,__LC_PGM_OLD_PSW(%r13)
++ 	xgr	%r10,%r10
+++>>>>>>> 05066cafa925 (s390/mm/fault: Handle guest-related program interrupts in KVM)
+  	tmhh	%r8,0x0001		# coming from user space?
+  	jno	.Lpgm_skip_asce
+ -	lctlg	%c1,%c1,__LC_KERNEL_ASCE(%r13)
+ +	lctlg	%c1,%c1,__LC_KERNEL_ASCE
+  	j	3f			# -> fault in user space
+  .Lpgm_skip_asce:
+++<<<<<<< HEAD
+++=======
++ #if IS_ENABLED(CONFIG_KVM)
++ 	lg	%r11,__LC_CURRENT(%r13)
++ 	tm	__TI_sie(%r11),0xff
++ 	jz	1f
++ 	BPENTER	__SF_SIE_FLAGS(%r15),_TIF_ISOLATE_BP_GUEST
++ 	SIEEXIT __SF_SIE_CONTROL(%r15),%r13
++ 	lghi	%r10,_PIF_GUEST_FAULT
++ #endif
+++>>>>>>> 05066cafa925 (s390/mm/fault: Handle guest-related program interrupts in KVM)
+  1:	tmhh	%r8,0x4000		# PER bit set in old PSW ?
+  	jnz	2f			# -> enabled, can't be a double fault
+ -	tm	__LC_PGM_ILC+3(%r13),0x80	# check for per exception
+ +	tm	__LC_PGM_ILC+3,0x80	# check for per exception
+  	jnz	.Lpgm_svcper		# -> single stepped svc
+ -2:	CHECK_STACK __LC_SAVE_AREA,%r13
+ +2:	CHECK_STACK __LC_SAVE_AREA_SYNC,%r0
+  	aghi	%r15,-(STACK_FRAME_OVERHEAD + __PT_SIZE)
+  	# CHECK_VMAP_STACK branches to stack_overflow or 4f
+ -	CHECK_VMAP_STACK __LC_SAVE_AREA,%r13,4f
+ -3:	lg	%r15,__LC_KERNEL_STACK(%r13)
+ +	CHECK_VMAP_STACK __LC_SAVE_AREA_SYNC,%r0,4f
+ +3:	lg	%r15,__LC_KERNEL_STACK
+  4:	la	%r11,STACK_FRAME_OVERHEAD(%r15)
+++<<<<<<< HEAD
+ +	xc	__PT_FLAGS(8,%r11),__PT_FLAGS(%r11)
+++=======
++ 	stg	%r10,__PT_FLAGS(%r11)
+++>>>>>>> 05066cafa925 (s390/mm/fault: Handle guest-related program interrupts in KVM)
+  	xc	__SF_BACKCHAIN(8,%r15),__SF_BACKCHAIN(%r15)
+  	stmg	%r0,%r7,__PT_R0(%r11)
+ -	mvc	__PT_R8(64,%r11),__LC_SAVE_AREA(%r13)
+ -	mvc	__PT_LAST_BREAK(8,%r11),__LC_PGM_LAST_BREAK(%r13)
+ -	stmg	%r8,%r9,__PT_PSW(%r11)
+ +	mvc	__PT_R8(64,%r11),__LC_SAVE_AREA_SYNC
+ +	mvc	__PT_LAST_BREAK(8,%r11),__LC_PGM_LAST_BREAK
+ +	stctg	%c1,%c1,__PT_CR1(%r11)
+ +#if IS_ENABLED(CONFIG_KVM)
+ +	ltg	%r12,__LC_GMAP
+ +	jz	5f
+ +	clc	__GMAP_ASCE(8,%r12), __PT_CR1(%r11)
+ +	jne	5f
+ +	BPENTER	__SF_SIE_FLAGS(%r10),_TIF_ISOLATE_BP_GUEST
+ +	SIEEXIT __SF_SIE_CONTROL(%r10),%r0
+ +#endif
+ +5:	stmg	%r8,%r9,__PT_PSW(%r11)
+  	# clear user controlled registers to prevent speculative use
+  	xgr	%r0,%r0
+  	xgr	%r1,%r1
+diff --cc arch/s390/mm/fault.c
+index 6b1305f29290,e48910b0b816..000000000000
+--- a/arch/s390/mm/fault.c
++++ b/arch/s390/mm/fault.c
+@@@ -72,11 -71,6 +71,14 @@@ static enum fault_type get_fault_type(s
+  	if (likely(teid.as == PSW_BITS_AS_PRIMARY)) {
+  		if (user_mode(regs))
+  			return USER_FAULT;
+++<<<<<<< HEAD
+ +		if (!IS_ENABLED(CONFIG_PGSTE))
+ +			return KERNEL_FAULT;
+ +		gmap = (struct gmap *)get_lowcore()->gmap;
+ +		if (gmap && gmap->asce == regs->cr1)
+ +			return GMAP_FAULT;
+++=======
+++>>>>>>> 05066cafa925 (s390/mm/fault: Handle guest-related program interrupts in KVM)
+  		return KERNEL_FAULT;
+  	}
+  	if (teid.as == PSW_BITS_AS_SECONDARY)
+@@@ -185,10 -179,6 +187,13 @@@ static void dump_fault_info(struct pt_r
+  		asce = get_lowcore()->user_asce.val;
+  		pr_cont("user ");
+  		break;
+++<<<<<<< HEAD
+ +	case GMAP_FAULT:
+ +		asce = ((struct gmap *)get_lowcore()->gmap)->asce;
+ +		pr_cont("gmap ");
+ +		break;
+++=======
+++>>>>>>> 05066cafa925 (s390/mm/fault: Handle guest-related program interrupts in KVM)
+  	case KERNEL_FAULT:
+  		asce = get_lowcore()->kernel_asce.val;
+  		pr_cont("kernel ");
+@@@ -490,9 -440,9 +453,13 @@@ void do_secure_storage_access(struct pt
+  	union teid teid = { .val = regs->int_parm_long };
+  	unsigned long addr = get_fault_address(regs);
+  	struct vm_area_struct *vma;
+ -	struct folio_walk fw;
+  	struct mm_struct *mm;
+++<<<<<<< HEAD
+ +	struct page *page;
+ +	struct gmap *gmap;
+++=======
++ 	struct folio *folio;
+++>>>>>>> 05066cafa925 (s390/mm/fault: Handle guest-related program interrupts in KVM)
+  	int rc;
+  
+  	/*
+diff --git a/arch/s390/include/asm/kvm_host.h b/arch/s390/include/asm/kvm_host.h
+index 2458778eb766..6bb3a8dadb99 100644
+--- a/arch/s390/include/asm/kvm_host.h
++++ b/arch/s390/include/asm/kvm_host.h
+@@ -196,6 +196,9 @@ struct kvm_vcpu_stat {
+ #define PGM_REGION_FIRST_TRANS		0x39
+ #define PGM_REGION_SECOND_TRANS		0x3a
+ #define PGM_REGION_THIRD_TRANS		0x3b
++#define PGM_SECURE_STORAGE_ACCESS	0x3d
++#define PGM_NON_SECURE_STORAGE_ACCESS	0x3e
++#define PGM_SECURE_STORAGE_VIOLATION	0x3f
+ #define PGM_MONITOR			0x40
+ #define PGM_PER				0x80
+ #define PGM_CRYPTO_OPERATION		0x119
+diff --git a/arch/s390/include/asm/processor.h b/arch/s390/include/asm/processor.h
+index 0881294f3b54..fb952586a3a1 100644
+--- a/arch/s390/include/asm/processor.h
++++ b/arch/s390/include/asm/processor.h
+@@ -39,6 +39,7 @@
+ #include <asm/runtime_instr.h>
+ #include <asm/irqflags.h>
+ #include <asm/alternative.h>
++#include <asm/fault.h>
+ 
+ typedef long (*sys_call_ptr_t)(struct pt_regs *regs);
+ 
+@@ -172,10 +173,8 @@ struct thread_struct {
+ 	unsigned long hardirq_timer;		/* task cputime in hardirq context */
+ 	unsigned long softirq_timer;		/* task cputime in softirq context */
+ 	const sys_call_ptr_t *sys_call_table;	/* system call table address */
+-	unsigned long gmap_addr;		/* address of last gmap fault. */
+-	unsigned int gmap_write_flag;		/* gmap fault write indication */
++	union teid gmap_teid;			/* address and flags of last gmap fault */
+ 	unsigned int gmap_int_code;		/* int code of last gmap fault */
+-	unsigned int gmap_pfault;		/* signal of a pending guest pfault */
+ 	int ufpu_flags;				/* user fpu flags */
+ 	int kfpu_flags;				/* kernel fpu flags */
+ 
+* Unmerged path arch/s390/kernel/entry.S
+diff --git a/arch/s390/kernel/traps.c b/arch/s390/kernel/traps.c
+index a7c211a3a0c9..04816c21d4db 100644
+--- a/arch/s390/kernel/traps.c
++++ b/arch/s390/kernel/traps.c
+@@ -30,6 +30,7 @@
+ #include <asm/asm-extable.h>
+ #include <asm/vtime.h>
+ #include <asm/fpu.h>
++#include <asm/fault.h>
+ #include "entry.h"
+ 
+ static inline void __user *get_trap_ip(struct pt_regs *regs)
+@@ -311,9 +312,24 @@ void noinstr __do_pgm_check(struct pt_regs *regs)
+ 	struct lowcore *lc = get_lowcore();
+ 	irqentry_state_t state;
+ 	unsigned int trapnr;
++	union teid teid;
+ 
++	teid.val = lc->trans_exc_code;
+ 	regs->int_code = lc->pgm_int_code;
+-	regs->int_parm_long = lc->trans_exc_code;
++	regs->int_parm_long = teid.val;
++
++	/*
++	 * In case of a guest fault, short-circuit the fault handler and return.
++	 * This way the sie64a() function will return 0; fault address and
++	 * other relevant bits are saved in current->thread.gmap_teid, and
++	 * the fault number in current->thread.gmap_int_code. KVM will be
++	 * able to use this information to handle the fault.
++	 */
++	if (test_pt_regs_flag(regs, PIF_GUEST_FAULT)) {
++		current->thread.gmap_teid.val = regs->int_parm_long;
++		current->thread.gmap_int_code = regs->int_code & 0xffff;
++		return;
++	}
+ 
+ 	state = irqentry_enter(regs);
+ 
+@@ -402,8 +418,8 @@ static void (*pgm_check_table[128])(struct pt_regs *regs) = {
+ 	[0x3b]		= do_dat_exception,
+ 	[0x3c]		= default_trap_handler,
+ 	[0x3d]		= do_secure_storage_access,
+-	[0x3e]		= do_non_secure_storage_access,
+-	[0x3f]		= do_secure_storage_violation,
++	[0x3e]		= default_trap_handler,
++	[0x3f]		= default_trap_handler,
+ 	[0x40]		= monitor_event_exception,
+ 	[0x41 ... 0x7f] = default_trap_handler,
+ };
+@@ -414,5 +430,3 @@ static void (*pgm_check_table[128])(struct pt_regs *regs) = {
+ 	__stringify(default_trap_handler))
+ 
+ COND_TRAP(do_secure_storage_access);
+-COND_TRAP(do_non_secure_storage_access);
+-COND_TRAP(do_secure_storage_violation);
+diff --git a/arch/s390/kvm/kvm-s390.c b/arch/s390/kvm/kvm-s390.c
+index a5f98b1d62eb..4382a25c6942 100644
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@ -4719,12 +4719,11 @@ static bool kvm_arch_setup_async_pf(struct kvm_vcpu *vcpu)
+ 	if (!vcpu->arch.gmap->pfault_enabled)
+ 		return false;
+ 
+-	hva = gfn_to_hva(vcpu->kvm, gpa_to_gfn(current->thread.gmap_addr));
+-	hva += current->thread.gmap_addr & ~PAGE_MASK;
++	hva = gfn_to_hva(vcpu->kvm, current->thread.gmap_teid.addr);
+ 	if (read_guest_real(vcpu, vcpu->arch.pfault_token, &arch.pfault_token, 8))
+ 		return false;
+ 
+-	return kvm_setup_async_pf(vcpu, current->thread.gmap_addr, hva, &arch);
++	return kvm_setup_async_pf(vcpu, current->thread.gmap_teid.addr * PAGE_SIZE, hva, &arch);
+ }
+ 
+ static int vcpu_pre_run(struct kvm_vcpu *vcpu)
+@@ -4762,6 +4761,7 @@ static int vcpu_pre_run(struct kvm_vcpu *vcpu)
+ 	clear_bit(vcpu->vcpu_idx, vcpu->kvm->arch.gisa_int.kicked_mask);
+ 
+ 	vcpu->arch.sie_block->icptcode = 0;
++	current->thread.gmap_int_code = 0;
+ 	cpuflags = atomic_read(&vcpu->arch.sie_block->cpuflags);
+ 	VCPU_EVENT(vcpu, 6, "entering sie flags %x", cpuflags);
+ 	trace_kvm_s390_sie_enter(vcpu, cpuflags);
+@@ -4769,7 +4769,7 @@ static int vcpu_pre_run(struct kvm_vcpu *vcpu)
+ 	return 0;
+ }
+ 
+-static int vcpu_post_run_fault_in_sie(struct kvm_vcpu *vcpu)
++static int vcpu_post_run_addressing_exception(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_s390_pgm_info pgm_info = {
+ 		.code = PGM_ADDRESSING,
+@@ -4805,10 +4805,106 @@ static int vcpu_post_run_fault_in_sie(struct kvm_vcpu *vcpu)
+ 	return kvm_s390_inject_prog_irq(vcpu, &pgm_info);
+ }
+ 
++static int vcpu_post_run_handle_fault(struct kvm_vcpu *vcpu)
++{
++	unsigned long gaddr;
++	unsigned int flags;
++	int rc = 0;
++
++	gaddr = current->thread.gmap_teid.addr * PAGE_SIZE;
++	if (kvm_s390_cur_gmap_fault_is_write())
++		flags = FAULT_FLAG_WRITE;
++
++	switch (current->thread.gmap_int_code) {
++	case 0:
++		vcpu->stat.exit_null++;
++		break;
++	case PGM_NON_SECURE_STORAGE_ACCESS:
++		KVM_BUG(current->thread.gmap_teid.as != PSW_BITS_AS_PRIMARY, vcpu->kvm,
++			"Unexpected program interrupt 0x%x, TEID 0x%016lx",
++			current->thread.gmap_int_code, current->thread.gmap_teid.val);
++		/*
++		 * This is normal operation; a page belonging to a protected
++		 * guest has not been imported yet. Try to import the page into
++		 * the protected guest.
++		 */
++		if (gmap_convert_to_secure(vcpu->arch.gmap, gaddr) == -EINVAL)
++			send_sig(SIGSEGV, current, 0);
++		break;
++	case PGM_SECURE_STORAGE_ACCESS:
++	case PGM_SECURE_STORAGE_VIOLATION:
++		KVM_BUG(current->thread.gmap_teid.as != PSW_BITS_AS_PRIMARY, vcpu->kvm,
++			"Unexpected program interrupt 0x%x, TEID 0x%016lx",
++			current->thread.gmap_int_code, current->thread.gmap_teid.val);
++		/*
++		 * This can happen after a reboot with asynchronous teardown;
++		 * the new guest (normal or protected) will run on top of the
++		 * previous protected guest. The old pages need to be destroyed
++		 * so the new guest can use them.
++		 */
++		if (gmap_destroy_page(vcpu->arch.gmap, gaddr)) {
++			/*
++			 * Either KVM messed up the secure guest mapping or the
++			 * same page is mapped into multiple secure guests.
++			 *
++			 * This exception is only triggered when a guest 2 is
++			 * running and can therefore never occur in kernel
++			 * context.
++			 */
++			pr_warn_ratelimited("Secure storage violation (%x) in task: %s, pid %d\n",
++					    current->thread.gmap_int_code, current->comm,
++					    current->pid);
++			send_sig(SIGSEGV, current, 0);
++		}
++		break;
++	case PGM_PROTECTION:
++	case PGM_SEGMENT_TRANSLATION:
++	case PGM_PAGE_TRANSLATION:
++	case PGM_ASCE_TYPE:
++	case PGM_REGION_FIRST_TRANS:
++	case PGM_REGION_SECOND_TRANS:
++	case PGM_REGION_THIRD_TRANS:
++		KVM_BUG(current->thread.gmap_teid.as != PSW_BITS_AS_PRIMARY, vcpu->kvm,
++			"Unexpected program interrupt 0x%x, TEID 0x%016lx",
++			current->thread.gmap_int_code, current->thread.gmap_teid.val);
++		if (vcpu->arch.gmap->pfault_enabled) {
++			rc = gmap_fault(vcpu->arch.gmap, gaddr, flags | FAULT_FLAG_RETRY_NOWAIT);
++			if (rc == -EFAULT)
++				return vcpu_post_run_addressing_exception(vcpu);
++			if (rc == -EAGAIN) {
++				trace_kvm_s390_major_guest_pfault(vcpu);
++				if (kvm_arch_setup_async_pf(vcpu))
++					return 0;
++				vcpu->stat.pfault_sync++;
++			} else {
++				return rc;
++			}
++		}
++		rc = gmap_fault(vcpu->arch.gmap, gaddr, flags);
++		if (rc == -EFAULT) {
++			if (kvm_is_ucontrol(vcpu->kvm)) {
++				vcpu->run->exit_reason = KVM_EXIT_S390_UCONTROL;
++				vcpu->run->s390_ucontrol.trans_exc_code = gaddr;
++				vcpu->run->s390_ucontrol.pgm_code = 0x10;
++				return -EREMOTE;
++			}
++			return vcpu_post_run_addressing_exception(vcpu);
++		}
++		break;
++	default:
++		KVM_BUG(1, vcpu->kvm, "Unexpected program interrupt 0x%x, TEID 0x%016lx",
++			current->thread.gmap_int_code, current->thread.gmap_teid.val);
++		send_sig(SIGSEGV, current, 0);
++		break;
++	}
++	return rc;
++}
++
+ static int vcpu_post_run(struct kvm_vcpu *vcpu, int exit_reason)
+ {
+ 	struct mcck_volatile_info *mcck_info;
+ 	struct sie_page *sie_page;
++	int rc;
+ 
+ 	VCPU_EVENT(vcpu, 6, "exit sie icptcode %d",
+ 		   vcpu->arch.sie_block->icptcode);
+@@ -4830,7 +4926,7 @@ static int vcpu_post_run(struct kvm_vcpu *vcpu, int exit_reason)
+ 	}
+ 
+ 	if (vcpu->arch.sie_block->icptcode > 0) {
+-		int rc = kvm_handle_sie_intercept(vcpu);
++		rc = kvm_handle_sie_intercept(vcpu);
+ 
+ 		if (rc != -EOPNOTSUPP)
+ 			return rc;
+@@ -4839,24 +4935,9 @@ static int vcpu_post_run(struct kvm_vcpu *vcpu, int exit_reason)
+ 		vcpu->run->s390_sieic.ipa = vcpu->arch.sie_block->ipa;
+ 		vcpu->run->s390_sieic.ipb = vcpu->arch.sie_block->ipb;
+ 		return -EREMOTE;
+-	} else if (exit_reason != -EFAULT) {
+-		vcpu->stat.exit_null++;
+-		return 0;
+-	} else if (kvm_is_ucontrol(vcpu->kvm)) {
+-		vcpu->run->exit_reason = KVM_EXIT_S390_UCONTROL;
+-		vcpu->run->s390_ucontrol.trans_exc_code =
+-						current->thread.gmap_addr;
+-		vcpu->run->s390_ucontrol.pgm_code = 0x10;
+-		return -EREMOTE;
+-	} else if (current->thread.gmap_pfault) {
+-		trace_kvm_s390_major_guest_pfault(vcpu);
+-		current->thread.gmap_pfault = 0;
+-		if (kvm_arch_setup_async_pf(vcpu))
+-			return 0;
+-		vcpu->stat.pfault_sync++;
+-		return gmap_fault(vcpu->arch.gmap, current->thread.gmap_addr, FAULT_FLAG_WRITE);
+ 	}
+-	return vcpu_post_run_fault_in_sie(vcpu);
++
++	return vcpu_post_run_handle_fault(vcpu);
+ }
+ 
+ #define PSW_INT_MASK (PSW_MASK_EXT | PSW_MASK_IO | PSW_MASK_MCHECK)
+diff --git a/arch/s390/kvm/kvm-s390.h b/arch/s390/kvm/kvm-s390.h
+index cfa4db60153d..aefea656d35d 100644
+--- a/arch/s390/kvm/kvm-s390.h
++++ b/arch/s390/kvm/kvm-s390.h
+@@ -543,6 +543,13 @@ static inline int kvm_s390_use_sca_entries(void)
+ void kvm_s390_reinject_machine_check(struct kvm_vcpu *vcpu,
+ 				     struct mcck_volatile_info *mcck_info);
+ 
++static inline bool kvm_s390_cur_gmap_fault_is_write(void)
++{
++	if (current->thread.gmap_int_code == PGM_PROTECTION)
++		return true;
++	return test_facility(75) && (current->thread.gmap_teid.fsi == TEID_FSI_STORE);
++}
++
+ /**
+  * kvm_s390_vcpu_crypto_reset_all
+  *
+diff --git a/arch/s390/kvm/vsie.c b/arch/s390/kvm/vsie.c
+index b1c28ca6438f..4294875d6b3d 100644
+--- a/arch/s390/kvm/vsie.c
++++ b/arch/s390/kvm/vsie.c
+@@ -960,16 +960,16 @@ static int handle_fault(struct kvm_vcpu *vcpu, struct vsie_page *vsie_page)
+ 	if (current->thread.gmap_int_code == PGM_PROTECTION)
+ 		/* we can directly forward all protection exceptions */
+ 		return inject_fault(vcpu, PGM_PROTECTION,
+-				    current->thread.gmap_addr, 1);
++				    current->thread.gmap_teid.addr * PAGE_SIZE, 1);
+ 
+ 	rc = kvm_s390_shadow_fault(vcpu, vsie_page->gmap,
+-				   current->thread.gmap_addr, NULL);
++				   current->thread.gmap_teid.addr * PAGE_SIZE, NULL);
+ 	if (rc > 0) {
+ 		rc = inject_fault(vcpu, rc,
+-				  current->thread.gmap_addr,
+-				  current->thread.gmap_write_flag);
++				  current->thread.gmap_teid.addr * PAGE_SIZE,
++				  kvm_s390_cur_gmap_fault_is_write());
+ 		if (rc >= 0)
+-			vsie_page->fault_addr = current->thread.gmap_addr;
++			vsie_page->fault_addr = current->thread.gmap_teid.addr * PAGE_SIZE;
+ 	}
+ 	return rc;
+ }
+@@ -1183,6 +1183,7 @@ static int do_vsie_run(struct kvm_vcpu *vcpu, struct vsie_page *vsie_page)
+ 	 * also kick the vSIE.
+ 	 */
+ 	vcpu->arch.sie_block->prog0c |= PROG_IN_SIE;
++	current->thread.gmap_int_code = 0;
+ 	barrier();
+ 	if (!kvm_s390_vcpu_sie_inhibited(vcpu))
+ 		rc = sie64a(scb_s, vcpu->run->s.regs.gprs, gmap_get_enabled()->asce);
+@@ -1207,7 +1208,7 @@ static int do_vsie_run(struct kvm_vcpu *vcpu, struct vsie_page *vsie_page)
+ 
+ 	if (rc > 0)
+ 		rc = 0; /* we could still have an icpt */
+-	else if (rc == -EFAULT)
++	else if (current->thread.gmap_int_code)
+ 		return handle_fault(vcpu, vsie_page);
+ 
+ 	switch (scb_s->icptcode) {
+* Unmerged path arch/s390/mm/fault.c
