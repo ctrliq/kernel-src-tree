@@ -762,7 +762,7 @@ int cxl_cper_register_prot_err_work(struct work_struct *work)
 	cxl_cper_prot_err_work = work;
 	return 0;
 }
-EXPORT_SYMBOL_NS_GPL(cxl_cper_register_prot_err_work, "CXL");
+EXPORT_SYMBOL_NS_GPL(cxl_cper_register_prot_err_work, CXL);
 
 int cxl_cper_unregister_prot_err_work(struct work_struct *work)
 {
@@ -773,13 +773,13 @@ int cxl_cper_unregister_prot_err_work(struct work_struct *work)
 	cxl_cper_prot_err_work = NULL;
 	return 0;
 }
-EXPORT_SYMBOL_NS_GPL(cxl_cper_unregister_prot_err_work, "CXL");
+EXPORT_SYMBOL_NS_GPL(cxl_cper_unregister_prot_err_work, CXL);
 
 int cxl_cper_prot_err_kfifo_get(struct cxl_cper_prot_err_work_data *wd)
 {
 	return kfifo_get(&cxl_cper_prot_err_fifo, wd);
 }
-EXPORT_SYMBOL_NS_GPL(cxl_cper_prot_err_kfifo_get, "CXL");
+EXPORT_SYMBOL_NS_GPL(cxl_cper_prot_err_kfifo_get, CXL);
 
 /* Room for 8 entries for each of the 4 event log queues */
 #define CXL_CPER_FIFO_DEPTH 32

@@ -8,6 +8,7 @@
  *    Copyright (C) 1995  Linus Torvalds
  */
 
+#include <linux/cpufeature.h>
 #include <linux/signal.h>
 #include <linux/sched.h>
 #include <linux/kernel.h>
@@ -55,6 +56,15 @@ pgd_t swapper_pg_dir[PTRS_PER_PGD] __section(".bss..swapper_pg_dir");
 pgd_t invalid_pg_dir[PTRS_PER_PGD] __section(".bss..invalid_pg_dir");
 
 struct ctlreg __bootdata_preserved(s390_invalid_asce);
+
+unsigned long __bootdata_preserved(page_noexec_mask);
+EXPORT_SYMBOL(page_noexec_mask);
+
+unsigned long __bootdata_preserved(segment_noexec_mask);
+EXPORT_SYMBOL(segment_noexec_mask);
+
+unsigned long __bootdata_preserved(region_noexec_mask);
+EXPORT_SYMBOL(region_noexec_mask);
 
 unsigned long empty_zero_page, zero_page_mask;
 EXPORT_SYMBOL(empty_zero_page);
@@ -107,7 +117,7 @@ void mark_rodata_ro(void)
 {
 	unsigned long size = __end_ro_after_init - __start_ro_after_init;
 
-	if (MACHINE_HAS_NX)
+	if (cpu_has_nx())
 		system_ctl_set_bit(0, CR0_INSTRUCTION_EXEC_PROTECTION_BIT);
 	__set_memory_ro(__start_ro_after_init, __end_ro_after_init);
 	pr_info("Write protected read-only-after-init data: %luk\n", size >> 10);

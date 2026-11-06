@@ -8,6 +8,7 @@
  *		 Janosch Frank <frankja@linux.vnet.ibm.com>
  */
 
+#include <linux/cpufeature.h>
 #include <linux/kernel.h>
 #include <linux/pagewalk.h>
 #include <linux/swap.h>
@@ -128,7 +129,7 @@ EXPORT_SYMBOL_GPL(gmap_create);
 
 static void gmap_flush_tlb(struct gmap *gmap)
 {
-	if (MACHINE_HAS_IDTE)
+	if (cpu_has_idte())
 		__tlb_flush_idte(gmap->asce);
 	else
 		__tlb_flush_global();
@@ -2353,7 +2354,7 @@ static void gmap_pmdp_xchg(struct gmap *gmap, pmd_t *pmdp, pmd_t new,
 	if (MACHINE_HAS_TLB_GUEST)
 		__pmdp_idte(gaddr, (pmd_t *)pmdp, IDTE_GUEST_ASCE, gmap->asce,
 			    IDTE_GLOBAL);
-	else if (MACHINE_HAS_IDTE)
+	else if (cpu_has_idte())
 		__pmdp_idte(gaddr, (pmd_t *)pmdp, 0, 0, IDTE_GLOBAL);
 	else
 		__pmdp_csp(pmdp);
@@ -2436,7 +2437,7 @@ void gmap_pmdp_idte_local(struct mm_struct *mm, unsigned long vmaddr)
 			if (MACHINE_HAS_TLB_GUEST)
 				__pmdp_idte(gaddr, pmdp, IDTE_GUEST_ASCE,
 					    gmap->asce, IDTE_LOCAL);
-			else if (MACHINE_HAS_IDTE)
+			else if (cpu_has_idte())
 				__pmdp_idte(gaddr, pmdp, 0, 0, IDTE_LOCAL);
 			*entry = _SEGMENT_ENTRY_EMPTY;
 		}
@@ -2472,7 +2473,7 @@ void gmap_pmdp_idte_global(struct mm_struct *mm, unsigned long vmaddr)
 			if (MACHINE_HAS_TLB_GUEST)
 				__pmdp_idte(gaddr, pmdp, IDTE_GUEST_ASCE,
 					    gmap->asce, IDTE_GLOBAL);
-			else if (MACHINE_HAS_IDTE)
+			else if (cpu_has_idte())
 				__pmdp_idte(gaddr, pmdp, 0, 0, IDTE_GLOBAL);
 			else
 				__pmdp_csp(pmdp);
@@ -2870,13 +2871,15 @@ static const struct mm_walk_ops gather_pages_ops = {
  */
 void s390_uv_destroy_pfns(unsigned long count, unsigned long *pfns)
 {
+	struct folio *folio;
 	unsigned long i;
 
 	for (i = 0; i < count; i++) {
+		folio = pfn_folio(pfns[i]);
 		/* we always have an extra reference */
-		uv_destroy_owned_page(pfn_to_phys(pfns[i]));
+		uv_destroy_folio(folio);
 		/* get rid of the extra reference */
-		put_page(pfn_to_page(pfns[i]));
+		folio_put(folio);
 		cond_resched();
 	}
 }

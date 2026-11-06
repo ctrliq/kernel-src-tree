@@ -169,8 +169,8 @@ int rvu_mbox_handler_lmtst_tbl_setup(struct rvu *rvu,
 		 */
 		if (is_vf(req->hdr.pcifunc) &&
 		    (!is_pf_func_valid(rvu, req->base_pcifunc) ||
-		     rvu_get_pf(rvu->pdev, req->hdr.pcifunc) !=
-		     rvu_get_pf(rvu->pdev, req->base_pcifunc)))
+		     rvu_get_pf(req->hdr.pcifunc) !=
+		     rvu_get_pf(req->base_pcifunc)))
 			return -EPERM;
 
 		/* Calculating the LMT table index equivalent to primary

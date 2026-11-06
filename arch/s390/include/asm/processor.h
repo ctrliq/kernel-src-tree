@@ -39,22 +39,40 @@
 #include <asm/runtime_instr.h>
 #include <asm/irqflags.h>
 #include <asm/alternative.h>
+#include <asm/fault.h>
+
+struct pcpu {
+	unsigned long ec_mask;		/* bit mask for ec_xxx functions */
+	unsigned long ec_clk;		/* sigp timestamp for ec_xxx */
+	unsigned long flags;		/* per CPU flags */
+	unsigned long capacity;		/* cpu capacity for scheduler */
+	signed char state;		/* physical cpu state */
+	signed char polarization;	/* physical polarization */
+	u16 address;			/* physical cpu address */
+};
+
+DECLARE_PER_CPU(struct pcpu, pcpu_devices);
 
 typedef long (*sys_call_ptr_t)(struct pt_regs *regs);
 
+static __always_inline struct pcpu *this_pcpu(void)
+{
+	return (struct pcpu *)(get_lowcore()->pcpu);
+}
+
 static __always_inline void set_cpu_flag(int flag)
 {
-	get_lowcore()->cpu_flags |= (1UL << flag);
+	this_pcpu()->flags |= (1UL << flag);
 }
 
 static __always_inline void clear_cpu_flag(int flag)
 {
-	get_lowcore()->cpu_flags &= ~(1UL << flag);
+	this_pcpu()->flags &= ~(1UL << flag);
 }
 
 static __always_inline bool test_cpu_flag(int flag)
 {
-	return get_lowcore()->cpu_flags & (1UL << flag);
+	return this_pcpu()->flags & (1UL << flag);
 }
 
 static __always_inline bool test_and_set_cpu_flag(int flag)
@@ -79,9 +97,7 @@ static __always_inline bool test_and_clear_cpu_flag(int flag)
  */
 static __always_inline bool test_cpu_flag_of(int flag, int cpu)
 {
-	struct lowcore *lc = lowcore_ptr[cpu];
-
-	return lc->cpu_flags & (1UL << flag);
+	return per_cpu(pcpu_devices, cpu).flags & (1UL << flag);
 }
 
 #define arch_needs_cpu() test_cpu_flag(CIF_NOHZ_DELAY)
@@ -172,10 +188,8 @@ struct thread_struct {
 	unsigned long hardirq_timer;		/* task cputime in hardirq context */
 	unsigned long softirq_timer;		/* task cputime in softirq context */
 	const sys_call_ptr_t *sys_call_table;	/* system call table address */
-	unsigned long gmap_addr;		/* address of last gmap fault. */
-	unsigned int gmap_write_flag;		/* gmap fault write indication */
+	union teid gmap_teid;			/* address and flags of last gmap fault */
 	unsigned int gmap_int_code;		/* int code of last gmap fault */
-	unsigned int gmap_pfault;		/* signal of a pending guest pfault */
 	int ufpu_flags;				/* user fpu flags */
 	int kfpu_flags;				/* kernel fpu flags */
 
@@ -403,7 +417,7 @@ static __always_inline bool regs_irqs_disabled(struct pt_regs *regs)
 
 static __always_inline void bpon(void)
 {
-	asm volatile(ALTERNATIVE("nop", ".insn	rrf,0xb2e80000,0,0,13,0", 82));
+	asm volatile(ALTERNATIVE("nop", ".insn	rrf,0xb2e80000,0,0,13,0", ALT_SPEC(82)));
 }
 
 #endif /* __ASSEMBLY__ */

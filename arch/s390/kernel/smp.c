@@ -18,6 +18,7 @@
 #define KMSG_COMPONENT "cpu"
 #define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
 
+#include <linux/cpufeature.h>
 #include <linux/workqueue.h>
 #include <linux/memblock.h>
 #include <linux/export.h>
@@ -74,17 +75,8 @@ enum {
 	CPU_STATE_CONFIGURED,
 };
 
-struct pcpu {
-	unsigned long ec_mask;		/* bit mask for ec_xxx functions */
-	unsigned long ec_clk;		/* sigp timestamp for ec_xxx */
-	unsigned long capacity;		/* cpu capacity for scheduler */
-	signed char state;		/* physical cpu state */
-	signed char polarization;	/* physical polarization */
-	u16 address;			/* physical cpu address */
-};
-
 static u8 boot_core_type;
-static DEFINE_PER_CPU(struct pcpu, pcpu_devices);
+DEFINE_PER_CPU(struct pcpu, pcpu_devices);
 /*
  * Pointer to the pcpu area of the boot CPU. This is required when a restart
  * interrupt is triggered on an offline CPU. For that case accessing percpu
@@ -265,6 +257,7 @@ static void pcpu_prepare_secondary(struct pcpu *pcpu, int cpu)
 	cpumask_set_cpu(cpu, &init_mm.context.cpu_attach_mask);
 	cpumask_set_cpu(cpu, mm_cpumask(&init_mm));
 	lc->cpu_nr = cpu;
+	lc->pcpu = (unsigned long)pcpu;
 	lc->restart_flags = RESTART_FLAG_CTLREGS;
 	lc->spinlock_lockval = arch_spin_lockval(cpu);
 	lc->spinlock_index = 0;
@@ -569,10 +562,10 @@ int smp_store_status(int cpu)
 	if (__pcpu_sigp_relax(pcpu->address, SIGP_STORE_STATUS_AT_ADDRESS,
 			      pa) != SIGP_CC_ORDER_CODE_ACCEPTED)
 		return -EIO;
-	if (!cpu_has_vx() && !MACHINE_HAS_GS)
+	if (!cpu_has_vx() && !cpu_has_gs())
 		return 0;
 	pa = lc->mcesad & MCESA_ORIGIN_MASK;
-	if (MACHINE_HAS_GS)
+	if (cpu_has_gs())
 		pa |= lc->mcesad & MCESA_LC_MASK;
 	if (__pcpu_sigp_relax(pcpu->address, SIGP_STORE_ADDITIONAL_STATUS,
 			      pa) != SIGP_CC_ORDER_CODE_ACCEPTED)
@@ -681,12 +674,12 @@ int smp_cpu_get_polarization(int cpu)
 
 void smp_cpu_set_capacity(int cpu, unsigned long val)
 {
-	pcpu_devices[cpu].capacity = val;
+	per_cpu(pcpu_devices, cpu).capacity = val;
 }
 
 unsigned long smp_cpu_get_capacity(int cpu)
 {
-	return pcpu_devices[cpu].capacity;
+	return per_cpu(pcpu_devices, cpu).capacity;
 }
 
 void smp_set_core_capacity(int cpu, unsigned long val)
@@ -945,6 +938,7 @@ void __cpu_die(unsigned int cpu)
 	pcpu_free_lowcore(pcpu, cpu);
 	cpumask_clear_cpu(cpu, mm_cpumask(&init_mm));
 	cpumask_clear_cpu(cpu, &init_mm.context.cpu_attach_mask);
+	pcpu->flags = 0;
 }
 
 void __noreturn cpu_die(void)
@@ -980,10 +974,13 @@ void __init smp_prepare_cpus(unsigned int max_cpus)
 
 void __init smp_prepare_boot_cpu(void)
 {
+	struct lowcore *lc = get_lowcore();
+
 	WARN_ON(!cpu_present(0) || !cpu_online(0));
+	lc->percpu_offset = __per_cpu_offset[0];
 	ipl_pcpu = per_cpu_ptr(&pcpu_devices, 0);
 	ipl_pcpu->state = CPU_STATE_CONFIGURED;
-	get_lowcore()->percpu_offset = __per_cpu_offset[0];
+	lc->pcpu = (unsigned long)ipl_pcpu;
 	smp_cpu_set_polarization(0, POLARIZATION_UNKNOWN);
 	smp_cpu_set_capacity(0, CPU_CAPACITY_HIGH);
 }
