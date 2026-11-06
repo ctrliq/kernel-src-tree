@@ -1,0 +1,429 @@
+s390/mm: Simplify noexec page protection handling
+
+jira KERNEL-1869
+Rebuild_History Non-Buildable kernel-5.14.0-741.7.1.el9_9
+commit-author Heiko Carstens <hca@linux.ibm.com>
+commit f8107a8be0b2e92798ded4aff45e3a94b763ce61
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-741.7.1.el9_9/f8107a8b.failed
+
+By default page protection definitions like PAGE_RX have the _PAGE_NOEXEC
+bit set. For older machines without the instruction execution protection
+facility this bit is not allowed to be used in page table entries, and
+therefore must be removed.
+
+This is done at a couple of page table walkers, but also at some but not
+all page table modification functions like ptep_modify_prot_commit(). Avoid
+all of this and change the page, segment and region3 protection definitions
+so that the noexec bit is masked out automatically if the instruction
+execution-protection facility is not available. This is similar to what
+also various other architectures do which had to solve the same problem.
+
+	Reviewed-by: Gerald Schaefer <gerald.schaefer@linux.ibm.com>
+	Acked-by: Alexander Gordeev <agordeev@linux.ibm.com>
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+	Signed-off-by: Alexander Gordeev <agordeev@linux.ibm.com>
+(cherry picked from commit f8107a8be0b2e92798ded4aff45e3a94b763ce61)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/boot/startup.c
+diff --cc arch/s390/boot/startup.c
+index e9b9d980cc19,e00aed22d0d4..000000000000
+--- a/arch/s390/boot/startup.c
++++ b/arch/s390/boot/startup.c
+@@@ -30,6 -30,10 +30,13 @@@ unsigned long __bootdata_preserved(vmem
+  unsigned long __bootdata_preserved(MODULES_VADDR);
+  unsigned long __bootdata_preserved(MODULES_END);
+  unsigned long __bootdata_preserved(max_mappable);
+++<<<<<<< HEAD
+++=======
++ unsigned long __bootdata_preserved(page_noexec_mask);
++ unsigned long __bootdata_preserved(segment_noexec_mask);
++ unsigned long __bootdata_preserved(region_noexec_mask);
++ int __bootdata_preserved(relocate_lowcore);
+++>>>>>>> f8107a8be0b2 (s390/mm: Simplify noexec page protection handling)
+  
+  u64 __bootdata_preserved(stfle_fac_list[16]);
+  struct oldmem_data __bootdata_preserved(oldmem_data);
+diff --git a/arch/s390/boot/boot.h b/arch/s390/boot/boot.h
+index 18027fdc92b0..f37fb1661592 100644
+--- a/arch/s390/boot/boot.h
++++ b/arch/s390/boot/boot.h
+@@ -13,7 +13,6 @@
+ struct machine_info {
+ 	unsigned char has_edat1 : 1;
+ 	unsigned char has_edat2 : 1;
+-	unsigned char has_nx : 1;
+ };
+ 
+ struct vmlinux_info {
+* Unmerged path arch/s390/boot/startup.c
+diff --git a/arch/s390/boot/vmem.c b/arch/s390/boot/vmem.c
+index 7c6194383fc0..3bebdf2fd6cb 100644
+--- a/arch/s390/boot/vmem.c
++++ b/arch/s390/boot/vmem.c
+@@ -68,8 +68,6 @@ static void kasan_populate_shadow(unsigned long kernel_start, unsigned long kern
+ 	int i;
+ 
+ 	pte_z = __pte(__pa(kasan_early_shadow_page) | pgprot_val(PAGE_KERNEL_RO));
+-	if (!machine.has_nx)
+-		pte_z = clear_pte_bit(pte_z, __pgprot(_PAGE_NOEXEC));
+ 	crst_table_init((unsigned long *)kasan_early_shadow_p4d, p4d_val(p4d_z));
+ 	crst_table_init((unsigned long *)kasan_early_shadow_pud, pud_val(pud_z));
+ 	crst_table_init((unsigned long *)kasan_early_shadow_pmd, pmd_val(pmd_z));
+@@ -321,8 +319,6 @@ static void pgtable_pte_populate(pmd_t *pmd, unsigned long addr, unsigned long e
+ 				continue;
+ 			entry = __pte(resolve_pa_may_alloc(addr, PAGE_SIZE, mode));
+ 			entry = set_pte_bit(entry, PAGE_KERNEL);
+-			if (!machine.has_nx)
+-				entry = clear_pte_bit(entry, __pgprot(_PAGE_NOEXEC));
+ 			set_pte(pte, entry);
+ 			pages++;
+ 		}
+@@ -348,8 +344,6 @@ static void pgtable_pmd_populate(pud_t *pud, unsigned long addr, unsigned long e
+ 			if (pa != INVALID_PHYS_ADDR) {
+ 				entry = __pmd(pa);
+ 				entry = set_pmd_bit(entry, SEGMENT_KERNEL);
+-				if (!machine.has_nx)
+-					entry = clear_pmd_bit(entry, __pgprot(_SEGMENT_ENTRY_NOEXEC));
+ 				set_pmd(pmd, entry);
+ 				pages++;
+ 				continue;
+@@ -382,8 +376,6 @@ static void pgtable_pud_populate(p4d_t *p4d, unsigned long addr, unsigned long e
+ 			if (pa != INVALID_PHYS_ADDR) {
+ 				entry = __pud(pa);
+ 				entry = set_pud_bit(entry, REGION3_KERNEL);
+-				if (!machine.has_nx)
+-					entry = clear_pud_bit(entry, __pgprot(_REGION_ENTRY_NOEXEC));
+ 				set_pud(pud, entry);
+ 				pages++;
+ 				continue;
+diff --git a/arch/s390/include/asm/pgtable.h b/arch/s390/include/asm/pgtable.h
+index 1b2dba8d7a44..5d8cf3456eba 100644
+--- a/arch/s390/include/asm/pgtable.h
++++ b/arch/s390/include/asm/pgtable.h
+@@ -113,6 +113,8 @@ static inline int is_module_addr(void *addr)
+ #define KASLR_LEN	0UL
+ #endif
+ 
++void setup_protection_map(void);
++
+ /*
+  * A 64 bit pagetable entry of S390 has following format:
+  * |			 PFRA			      |0IPC|  OS  |
+@@ -431,76 +433,107 @@ static inline int is_module_addr(void *addr)
+ /*
+  * Page protection definitions.
+  */
+-#define PAGE_NONE	__pgprot(_PAGE_PRESENT | _PAGE_INVALID | _PAGE_PROTECT)
+-#define PAGE_RO		__pgprot(_PAGE_PRESENT | _PAGE_READ | \
++#define __PAGE_NONE		(_PAGE_PRESENT | _PAGE_INVALID | _PAGE_PROTECT)
++#define __PAGE_RO		(_PAGE_PRESENT | _PAGE_READ | \
+ 				 _PAGE_NOEXEC  | _PAGE_INVALID | _PAGE_PROTECT)
+-#define PAGE_RX		__pgprot(_PAGE_PRESENT | _PAGE_READ | \
++#define __PAGE_RX		(_PAGE_PRESENT | _PAGE_READ | \
+ 				 _PAGE_INVALID | _PAGE_PROTECT)
+-#define PAGE_RW		__pgprot(_PAGE_PRESENT | _PAGE_READ | _PAGE_WRITE | \
++#define __PAGE_RW		(_PAGE_PRESENT | _PAGE_READ | _PAGE_WRITE | \
+ 				 _PAGE_NOEXEC  | _PAGE_INVALID | _PAGE_PROTECT)
+-#define PAGE_RWX	__pgprot(_PAGE_PRESENT | _PAGE_READ | _PAGE_WRITE | \
++#define __PAGE_RWX		(_PAGE_PRESENT | _PAGE_READ | _PAGE_WRITE | \
+ 				 _PAGE_INVALID | _PAGE_PROTECT)
+-
+-#define PAGE_SHARED	__pgprot(_PAGE_PRESENT | _PAGE_READ | _PAGE_WRITE | \
++#define __PAGE_SHARED		(_PAGE_PRESENT | _PAGE_READ | _PAGE_WRITE | \
+ 				 _PAGE_YOUNG | _PAGE_DIRTY | _PAGE_NOEXEC)
+-#define PAGE_KERNEL	__pgprot(_PAGE_PRESENT | _PAGE_READ | _PAGE_WRITE | \
++#define __PAGE_KERNEL		(_PAGE_PRESENT | _PAGE_READ | _PAGE_WRITE | \
+ 				 _PAGE_YOUNG | _PAGE_DIRTY | _PAGE_NOEXEC)
+-#define PAGE_KERNEL_RO	__pgprot(_PAGE_PRESENT | _PAGE_READ | _PAGE_YOUNG | \
++#define __PAGE_KERNEL_RO	(_PAGE_PRESENT | _PAGE_READ | _PAGE_YOUNG | \
+ 				 _PAGE_PROTECT | _PAGE_NOEXEC)
+ 
++extern unsigned long page_noexec_mask;
++
++#define __pgprot_page_mask(x)	__pgprot((x) & page_noexec_mask)
++
++#define PAGE_NONE		__pgprot_page_mask(__PAGE_NONE)
++#define PAGE_RO			__pgprot_page_mask(__PAGE_RO)
++#define PAGE_RX			__pgprot_page_mask(__PAGE_RX)
++#define PAGE_RW			__pgprot_page_mask(__PAGE_RW)
++#define PAGE_RWX		__pgprot_page_mask(__PAGE_RWX)
++#define PAGE_SHARED		__pgprot_page_mask(__PAGE_SHARED)
++#define PAGE_KERNEL		__pgprot_page_mask(__PAGE_KERNEL)
++#define PAGE_KERNEL_RO		__pgprot_page_mask(__PAGE_KERNEL_RO)
++
+ /*
+  * Segment entry (large page) protection definitions.
+  */
+-#define SEGMENT_NONE	__pgprot(_SEGMENT_ENTRY_PRESENT | \
++#define __SEGMENT_NONE		(_SEGMENT_ENTRY_PRESENT | \
+ 				 _SEGMENT_ENTRY_INVALID | \
+ 				 _SEGMENT_ENTRY_PROTECT)
+-#define SEGMENT_RO	__pgprot(_SEGMENT_ENTRY_PRESENT | \
++#define __SEGMENT_RO		(_SEGMENT_ENTRY_PRESENT | \
+ 				 _SEGMENT_ENTRY_PROTECT | \
+ 				 _SEGMENT_ENTRY_READ | \
+ 				 _SEGMENT_ENTRY_NOEXEC)
+-#define SEGMENT_RX	__pgprot(_SEGMENT_ENTRY_PRESENT | \
++#define __SEGMENT_RX		(_SEGMENT_ENTRY_PRESENT | \
+ 				 _SEGMENT_ENTRY_PROTECT | \
+ 				 _SEGMENT_ENTRY_READ)
+-#define SEGMENT_RW	__pgprot(_SEGMENT_ENTRY_PRESENT | \
++#define __SEGMENT_RW		(_SEGMENT_ENTRY_PRESENT | \
+ 				 _SEGMENT_ENTRY_READ | \
+ 				 _SEGMENT_ENTRY_WRITE | \
+ 				 _SEGMENT_ENTRY_NOEXEC)
+-#define SEGMENT_RWX	__pgprot(_SEGMENT_ENTRY_PRESENT | \
++#define __SEGMENT_RWX		(_SEGMENT_ENTRY_PRESENT | \
+ 				 _SEGMENT_ENTRY_READ | \
+ 				 _SEGMENT_ENTRY_WRITE)
+-#define SEGMENT_KERNEL	__pgprot(_SEGMENT_ENTRY |	\
++#define __SEGMENT_KERNEL	(_SEGMENT_ENTRY |	\
+ 				 _SEGMENT_ENTRY_LARGE |	\
+ 				 _SEGMENT_ENTRY_READ |	\
+ 				 _SEGMENT_ENTRY_WRITE | \
+ 				 _SEGMENT_ENTRY_YOUNG | \
+ 				 _SEGMENT_ENTRY_DIRTY | \
+ 				 _SEGMENT_ENTRY_NOEXEC)
+-#define SEGMENT_KERNEL_RO __pgprot(_SEGMENT_ENTRY |	\
++#define __SEGMENT_KERNEL_RO	(_SEGMENT_ENTRY |	\
+ 				 _SEGMENT_ENTRY_LARGE |	\
+ 				 _SEGMENT_ENTRY_READ |	\
+ 				 _SEGMENT_ENTRY_YOUNG |	\
+ 				 _SEGMENT_ENTRY_PROTECT | \
+ 				 _SEGMENT_ENTRY_NOEXEC)
+ 
++extern unsigned long segment_noexec_mask;
++
++#define __pgprot_segment_mask(x) __pgprot((x) & segment_noexec_mask)
++
++#define SEGMENT_NONE		__pgprot_segment_mask(__SEGMENT_NONE)
++#define SEGMENT_RO		__pgprot_segment_mask(__SEGMENT_RO)
++#define SEGMENT_RX		__pgprot_segment_mask(__SEGMENT_RX)
++#define SEGMENT_RW		__pgprot_segment_mask(__SEGMENT_RW)
++#define SEGMENT_RWX		__pgprot_segment_mask(__SEGMENT_RWX)
++#define SEGMENT_KERNEL		__pgprot_segment_mask(__SEGMENT_KERNEL)
++#define SEGMENT_KERNEL_RO	__pgprot_segment_mask(__SEGMENT_KERNEL_RO)
++
+ /*
+  * Region3 entry (large page) protection definitions.
+  */
+ 
+-#define REGION3_KERNEL	__pgprot(_REGION_ENTRY_TYPE_R3 | \
++#define __REGION3_KERNEL	(_REGION_ENTRY_TYPE_R3 | \
+ 				 _REGION3_ENTRY_PRESENT | \
+-				 _REGION3_ENTRY_LARGE |	 \
+-				 _REGION3_ENTRY_READ |	 \
+-				 _REGION3_ENTRY_WRITE |	 \
+-				 _REGION3_ENTRY_YOUNG |	 \
++				 _REGION3_ENTRY_LARGE | \
++				 _REGION3_ENTRY_READ | \
++				 _REGION3_ENTRY_WRITE | \
++				 _REGION3_ENTRY_YOUNG | \
+ 				 _REGION3_ENTRY_DIRTY | \
+ 				 _REGION_ENTRY_NOEXEC)
+-#define REGION3_KERNEL_RO __pgprot(_REGION_ENTRY_TYPE_R3 | \
+-				   _REGION3_ENTRY_PRESENT | \
+-				   _REGION3_ENTRY_LARGE |  \
+-				   _REGION3_ENTRY_READ |   \
+-				   _REGION3_ENTRY_YOUNG |  \
+-				   _REGION_ENTRY_PROTECT | \
+-				   _REGION_ENTRY_NOEXEC)
++#define __REGION3_KERNEL_RO	(_REGION_ENTRY_TYPE_R3 | \
++				 _REGION3_ENTRY_PRESENT | \
++				 _REGION3_ENTRY_LARGE | \
++				 _REGION3_ENTRY_READ | \
++				 _REGION3_ENTRY_YOUNG | \
++				 _REGION_ENTRY_PROTECT | \
++				 _REGION_ENTRY_NOEXEC)
++
++extern unsigned long region_noexec_mask;
++
++#define __pgprot_region_mask(x)	__pgprot((x) & region_noexec_mask)
++
++#define REGION3_KERNEL		__pgprot_region_mask(__REGION3_KERNEL)
++#define REGION3_KERNEL_RO	__pgprot_region_mask(__REGION3_KERNEL_RO)
+ 
+ static inline bool mm_p4d_folded(struct mm_struct *mm)
+ {
+@@ -1380,8 +1413,6 @@ static inline pte_t mk_pte_phys(unsigned long physpage, pgprot_t pgprot)
+ 	pte_t __pte;
+ 
+ 	__pte = __pte(physpage | pgprot_val(pgprot));
+-	if (!MACHINE_HAS_NX)
+-		__pte = clear_pte_bit(__pte, __pgprot(_PAGE_NOEXEC));
+ 	return pte_mkyoung(__pte);
+ }
+ 
+@@ -1748,8 +1779,6 @@ static inline int pmdp_clear_flush_young(struct vm_area_struct *vma,
+ static inline void set_pmd_at(struct mm_struct *mm, unsigned long addr,
+ 			      pmd_t *pmdp, pmd_t entry)
+ {
+-	if (!MACHINE_HAS_NX)
+-		entry = clear_pmd_bit(entry, __pgprot(_SEGMENT_ENTRY_NOEXEC));
+ 	set_pmd(pmdp, entry);
+ }
+ 
+diff --git a/arch/s390/kernel/setup.c b/arch/s390/kernel/setup.c
+index 093b2031f600..711b367ecf3a 100644
+--- a/arch/s390/kernel/setup.c
++++ b/arch/s390/kernel/setup.c
+@@ -984,6 +984,7 @@ void __init setup_arch(char **cmdline_p)
+ 	if (test_facility(193))
+ 		static_branch_enable(&cpu_has_bear);
+ 
++	setup_protection_map();
+ 	/*
+ 	 * Create kernel page tables.
+ 	 */
+diff --git a/arch/s390/mm/init.c b/arch/s390/mm/init.c
+index 77bf7b539653..5edf133c7696 100644
+--- a/arch/s390/mm/init.c
++++ b/arch/s390/mm/init.c
+@@ -56,6 +56,15 @@ pgd_t invalid_pg_dir[PTRS_PER_PGD] __section(".bss..invalid_pg_dir");
+ 
+ struct ctlreg __bootdata_preserved(s390_invalid_asce);
+ 
++unsigned long __bootdata_preserved(page_noexec_mask);
++EXPORT_SYMBOL(page_noexec_mask);
++
++unsigned long __bootdata_preserved(segment_noexec_mask);
++EXPORT_SYMBOL(segment_noexec_mask);
++
++unsigned long __bootdata_preserved(region_noexec_mask);
++EXPORT_SYMBOL(region_noexec_mask);
++
+ unsigned long empty_zero_page, zero_page_mask;
+ EXPORT_SYMBOL(empty_zero_page);
+ EXPORT_SYMBOL(zero_page_mask);
+diff --git a/arch/s390/mm/mmap.c b/arch/s390/mm/mmap.c
+index 96efa061ce01..46c964a828e5 100644
+--- a/arch/s390/mm/mmap.c
++++ b/arch/s390/mm/mmap.c
+@@ -191,22 +191,28 @@ void arch_pick_mmap_layout(struct mm_struct *mm, struct rlimit *rlim_stack)
+ 	}
+ }
+ 
+-static const pgprot_t protection_map[16] = {
+-	[VM_NONE]					= PAGE_NONE,
+-	[VM_READ]					= PAGE_RO,
+-	[VM_WRITE]					= PAGE_RO,
+-	[VM_WRITE | VM_READ]				= PAGE_RO,
+-	[VM_EXEC]					= PAGE_RX,
+-	[VM_EXEC | VM_READ]				= PAGE_RX,
+-	[VM_EXEC | VM_WRITE]				= PAGE_RX,
+-	[VM_EXEC | VM_WRITE | VM_READ]			= PAGE_RX,
+-	[VM_SHARED]					= PAGE_NONE,
+-	[VM_SHARED | VM_READ]				= PAGE_RO,
+-	[VM_SHARED | VM_WRITE]				= PAGE_RW,
+-	[VM_SHARED | VM_WRITE | VM_READ]		= PAGE_RW,
+-	[VM_SHARED | VM_EXEC]				= PAGE_RX,
+-	[VM_SHARED | VM_EXEC | VM_READ]			= PAGE_RX,
+-	[VM_SHARED | VM_EXEC | VM_WRITE]		= PAGE_RWX,
+-	[VM_SHARED | VM_EXEC | VM_WRITE | VM_READ]	= PAGE_RWX
+-};
++static pgprot_t protection_map[16] __ro_after_init;
++
++void __init setup_protection_map(void)
++{
++	pgprot_t *pm = protection_map;
++
++	pm[VM_NONE]					= PAGE_NONE;
++	pm[VM_READ]					= PAGE_RO;
++	pm[VM_WRITE]					= PAGE_RO;
++	pm[VM_WRITE | VM_READ]				= PAGE_RO;
++	pm[VM_EXEC]					= PAGE_RX;
++	pm[VM_EXEC | VM_READ]				= PAGE_RX;
++	pm[VM_EXEC | VM_WRITE]				= PAGE_RX;
++	pm[VM_EXEC | VM_WRITE | VM_READ]		= PAGE_RX;
++	pm[VM_SHARED]					= PAGE_NONE;
++	pm[VM_SHARED | VM_READ]				= PAGE_RO;
++	pm[VM_SHARED | VM_WRITE]			= PAGE_RW;
++	pm[VM_SHARED | VM_WRITE | VM_READ]		= PAGE_RW;
++	pm[VM_SHARED | VM_EXEC]				= PAGE_RX;
++	pm[VM_SHARED | VM_EXEC | VM_READ]		= PAGE_RX;
++	pm[VM_SHARED | VM_EXEC | VM_WRITE]		= PAGE_RWX;
++	pm[VM_SHARED | VM_EXEC | VM_WRITE | VM_READ]	= PAGE_RWX;
++}
++
+ DECLARE_VM_GET_PAGE_PROT
+diff --git a/arch/s390/mm/pageattr.c b/arch/s390/mm/pageattr.c
+index aec9eb16b6f7..b923f2c42307 100644
+--- a/arch/s390/mm/pageattr.c
++++ b/arch/s390/mm/pageattr.c
+@@ -108,8 +108,6 @@ static int walk_pte_level(pmd_t *pmdp, unsigned long addr, unsigned long end,
+ 		} else if (flags & SET_MEMORY_DEF) {
+ 			new = __pte(pte_val(new) & PAGE_MASK);
+ 			new = set_pte_bit(new, PAGE_KERNEL);
+-			if (!MACHINE_HAS_NX)
+-				new = clear_pte_bit(new, __pgprot(_PAGE_NOEXEC));
+ 		}
+ 		pgt_set((unsigned long *)ptep, pte_val(new), addr, CRDTE_DTT_PAGE);
+ 		ptep++;
+@@ -166,8 +164,6 @@ static void modify_pmd_page(pmd_t *pmdp, unsigned long addr,
+ 	} else if (flags & SET_MEMORY_DEF) {
+ 		new = __pmd(pmd_val(new) & PMD_MASK);
+ 		new = set_pmd_bit(new, SEGMENT_KERNEL);
+-		if (!MACHINE_HAS_NX)
+-			new = clear_pmd_bit(new, __pgprot(_SEGMENT_ENTRY_NOEXEC));
+ 	}
+ 	pgt_set((unsigned long *)pmdp, pmd_val(new), addr, CRDTE_DTT_SEGMENT);
+ }
+@@ -255,8 +251,6 @@ static void modify_pud_page(pud_t *pudp, unsigned long addr,
+ 	} else if (flags & SET_MEMORY_DEF) {
+ 		new = __pud(pud_val(new) & PUD_MASK);
+ 		new = set_pud_bit(new, REGION3_KERNEL);
+-		if (!MACHINE_HAS_NX)
+-			new = clear_pud_bit(new, __pgprot(_REGION_ENTRY_NOEXEC));
+ 	}
+ 	pgt_set((unsigned long *)pudp, pud_val(new), addr, CRDTE_DTT_REGION3);
+ }
+diff --git a/arch/s390/mm/pgtable.c b/arch/s390/mm/pgtable.c
+index 6cfded9d0e57..32f72484cfa6 100644
+--- a/arch/s390/mm/pgtable.c
++++ b/arch/s390/mm/pgtable.c
+@@ -360,8 +360,6 @@ void ptep_modify_prot_commit(struct vm_area_struct *vma, unsigned long addr,
+ 	pgste_t pgste;
+ 	struct mm_struct *mm = vma->vm_mm;
+ 
+-	if (!MACHINE_HAS_NX)
+-		pte = clear_pte_bit(pte, __pgprot(_PAGE_NOEXEC));
+ 	if (mm_has_pgste(mm)) {
+ 		pgste = pgste_get(ptep);
+ 		pgste_set_key(ptep, pgste, pte, mm);
+diff --git a/arch/s390/mm/vmem.c b/arch/s390/mm/vmem.c
+index e1010e574bba..a35940fb2dd5 100644
+--- a/arch/s390/mm/vmem.c
++++ b/arch/s390/mm/vmem.c
+@@ -171,9 +171,6 @@ static int __ref modify_pte_table(pmd_t *pmd, unsigned long addr,
+ 	pte_t *pte;
+ 
+ 	prot = pgprot_val(PAGE_KERNEL);
+-	if (!MACHINE_HAS_NX)
+-		prot &= ~_PAGE_NOEXEC;
+-
+ 	pte = pte_offset_kernel(pmd, addr);
+ 	for (; addr < end; addr += PAGE_SIZE, pte++) {
+ 		if (!add) {
+@@ -230,9 +227,6 @@ static int __ref modify_pmd_table(pud_t *pud, unsigned long addr,
+ 	pte_t *pte;
+ 
+ 	prot = pgprot_val(SEGMENT_KERNEL);
+-	if (!MACHINE_HAS_NX)
+-		prot &= ~_SEGMENT_ENTRY_NOEXEC;
+-
+ 	pmd = pmd_offset(pud, addr);
+ 	for (; addr < end; addr = next, pmd++) {
+ 		next = pmd_addr_end(addr, end);
+@@ -324,8 +318,6 @@ static int modify_pud_table(p4d_t *p4d, unsigned long addr, unsigned long end,
+ 	pmd_t *pmd;
+ 
+ 	prot = pgprot_val(REGION3_KERNEL);
+-	if (!MACHINE_HAS_NX)
+-		prot &= ~_REGION_ENTRY_NOEXEC;
+ 	pud = pud_offset(p4d, addr);
+ 	for (; addr < end; addr = next, pud++) {
+ 		next = pud_addr_end(addr, end);
