@@ -1,0 +1,142 @@
+perf/core: out-of-line and export perf_allow_cpu/tracepoint()
+
+jira KERNEL-1869
+Rebuild_History Non-Buildable kernel-5.14.0-741.9.1.el9_9
+commit-author John Hubbard <jhubbard@nvidia.com>
+commit d32bf877c0c3ebc345b444cbe009b3f44f9f8073
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-5.14.0-741.9.1.el9_9/d32bf877.failed
+
+These helpers are static inline in <linux/perf_event.h> and reach
+into sysctl_perf_event_paranoid and security_perf_event_open(),
+neither of which is itself exported. The perf_allow_* trio is
+therefore asymmetric: built-in callers can use any of the three, but
+modular code can only call perf_allow_kernel().
+
+Move both bodies into kernel/events/core.c next to perf_allow_kernel()
+and export them with EXPORT_SYMBOL_GPL, following the shape of
+commit 5e9629d0ae97 ("drivers/perf: arm_spe: Use perf_allow_kernel()
+for permissions"). Existing in-tree callers live in built-in arch and
+tracing code, so the change is invisible to them.
+
+Provide !CONFIG_PERF_EVENTS stubs that fall back to perfmon_capable(),
+so the helpers stay callable when perf is compiled out.
+
+	Signed-off-by: John Hubbard <jhubbard@nvidia.com>
+	Reviewed-by: Ashutosh Dixit <ashutosh.dixit@intel.com>
+Link: https://patch.msgid.link/20260527225507.2044027-2-ashutosh.dixit@intel.com
+	Signed-off-by: Ashutosh Dixit <ashutosh.dixit@intel.com>
+(cherry picked from commit d32bf877c0c3ebc345b444cbe009b3f44f9f8073)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/perf_event.h
+diff --cc include/linux/perf_event.h
+index 3a804a78a65b,5842552294c1..000000000000
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@@ -1667,23 -1790,9 +1667,29 @@@ static inline int perf_is_paranoid(void
+  	return sysctl_perf_event_paranoid > -1;
+  }
+  
+++<<<<<<< HEAD
+ +int perf_allow_kernel(void);
+ +
+ +static inline int perf_allow_cpu(void)
+ +{
+ +	if (sysctl_perf_event_paranoid > 0 && !perfmon_capable())
+ +		return -EACCES;
+ +
+ +	return security_perf_event_open(PERF_SECURITY_CPU);
+ +}
+ +
+ +static inline int perf_allow_tracepoint(void)
+ +{
+ +	if (sysctl_perf_event_paranoid > -1 && !perfmon_capable())
+ +		return -EPERM;
+ +
+ +	return security_perf_event_open(PERF_SECURITY_TRACEPOINT);
+ +}
+++=======
++ extern int perf_allow_kernel(void);
++ extern int perf_allow_cpu(void);
++ extern int perf_allow_tracepoint(void);
+++>>>>>>> d32bf877c0c3 (perf/core: out-of-line and export perf_allow_cpu/tracepoint())
+  
+  extern int perf_exclude_event(struct perf_event *event, struct pt_regs *regs);
+  
+@@@ -1869,19 -2002,27 +1875,43 @@@ static inline void perf_event_disable(s
+  static inline int __perf_event_disable(void *info)			{ return -1; }
+  static inline void perf_event_task_tick(void)				{ }
+  static inline int perf_event_release_kernel(struct perf_event *event)	{ return 0; }
+++<<<<<<< HEAD
+ +static inline int perf_event_period(struct perf_event *event, u64 value)
+ +{
+ +	return -EINVAL;
+ +}
+ +static inline u64 perf_event_pause(struct perf_event *event, bool reset)
+ +{
+ +	return 0;
+ +}
+ +static inline int perf_exclude_event(struct perf_event *event, struct pt_regs *regs)
+ +{
+ +	return 0;
+ +}
+ +#endif
+++=======
++ static inline int
++ perf_event_period(struct perf_event *event, u64 value)			{ return -EINVAL; }
++ static inline u64
++ perf_event_pause(struct perf_event *event, bool reset)			{ return 0; }
++ static inline int
++ perf_exclude_event(struct perf_event *event, struct pt_regs *regs)	{ return 0; }
++ 
++ static inline int perf_allow_kernel(void)
++ {
++ 	return perfmon_capable() ? 0 : -EACCES;
++ }
++ static inline int perf_allow_cpu(void)
++ {
++ 	return perfmon_capable() ? 0 : -EACCES;
++ }
++ static inline int perf_allow_tracepoint(void)
++ {
++ 	return perfmon_capable() ? 0 : -EPERM;
++ }
++ 
++ #endif /* !CONFIG_PERF_EVENTS */
+++>>>>>>> d32bf877c0c3 (perf/core: out-of-line and export perf_allow_cpu/tracepoint())
+  
+  #if defined(CONFIG_PERF_EVENTS) && defined(CONFIG_CPU_SUP_INTEL)
+  extern void perf_restore_debug_store(void);
+* Unmerged path include/linux/perf_event.h
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index 5065087dd236..9d042b17e61e 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -13615,6 +13615,24 @@ int perf_allow_kernel(void)
+ }
+ EXPORT_SYMBOL_GPL(perf_allow_kernel);
+ 
++int perf_allow_cpu(void)
++{
++	if (sysctl_perf_event_paranoid > 0 && !perfmon_capable())
++		return -EACCES;
++
++	return security_perf_event_open(PERF_SECURITY_CPU);
++}
++EXPORT_SYMBOL_GPL(perf_allow_cpu);
++
++int perf_allow_tracepoint(void)
++{
++	if (sysctl_perf_event_paranoid > -1 && !perfmon_capable())
++		return -EPERM;
++
++	return security_perf_event_open(PERF_SECURITY_TRACEPOINT);
++}
++EXPORT_SYMBOL_GPL(perf_allow_tracepoint);
++
+ /*
+  * Inherit an event from parent task to child task.
+  *
